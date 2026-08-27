@@ -21,7 +21,7 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, hsla, point, px, relative, rgba, rgb, size, App, AvailableSpace, Bounds,
+    actions, div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
     Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
@@ -935,28 +935,18 @@ impl TextInput {
 
 // Render 实现（供作为子元素使用时直接 `.child(input.clone())`）。
 impl Render for TextInput {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus_handle.is_focused(window);
-        let border_color: gpui::Hsla = if focused {
-            gpui::blue()
-        } else {
-            rgb(0xd1d5db).into()
-        };
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut el = div()
             .flex()
             .id("text-input")
             .key_context("TextInput")
-            .min_h(px(36.))
+            .w_full()
+            .min_w(px(0.))
+            .min_h(px(24.))
             .cursor(CursorStyle::IBeam)
             .track_focus(&self.focus_handle.clone())
             .text_size(px(14.))
             .line_height(relative(1.4))
-            .border_1()
-            .border_color(border_color)
-            .rounded_md()
-            .px_2()
-            .py_1()
             .child(TextElement { input: cx.entity() });
 
         // 鼠标交互（点击定位 / 拖选 / 拖滚动条）
@@ -1133,6 +1123,9 @@ impl Element for TextElement {
         let input = self.input.clone();
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        // 允许收缩到小于内容宽度（flex 默认 min-width:auto 会按内容 min-content 把
+        // 长行顶到超宽），这样在限定宽度容器内文本才会自动换行、边框不会变长。
+        style.min_size.width = relative(0.).into();
         let layout_id = window.request_measured_layout(style, move |known, available, window, cx| {
             // 换行宽度：拿不到已知宽度时，用父级给的定义宽度
             let wrap_width = known.width.or(match available.width {
@@ -1223,8 +1216,9 @@ impl Element for TextElement {
             // 选区高亮：把选区与该行的各个换行片段求交，分别画半透明蓝色矩形
             if !selected_range.is_empty() && i < line_ranges.len() {
                 let r = &line_ranges[i];
-                let sel_start = selected_range.start.max(r.start) - r.start;
-                let sel_end = selected_range.end.min(r.end) - r.start;
+                // 先夹到本行区间内，避免选区起始/终点落在别的行时减法下溢
+                let sel_start = selected_range.start.max(r.start).min(r.end) - r.start;
+                let sel_end = selected_range.end.max(r.start).min(r.end) - r.start;
                 if sel_end > sel_start {
                     let uw = &wl.unwrapped_layout;
                     // 依次枚举各换行片段（字节区间）

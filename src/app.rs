@@ -14,9 +14,13 @@ use std::time::Duration;
 
 use gpui::{
     div, px, rgb, white, App, AppContext, Context, CursorStyle, ElementId, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window,
 };
+
+/// 输入框最大可视高度（像素）。行数超过后输入框内部滚动，不再把主窗口撑高。
+/// 可在这里调节（设置）输入框高度上限。
+const INPUT_MAX_HEIGHT: Pixels = px(150.);
 
 use super::backend::DifyClient;
 use super::markdown::{render_markdown, MarkdownTheme};
@@ -434,16 +438,23 @@ impl ChatApp {
             .gap_2()
             .child(
                 div()
+                    .id("input-field")
                     .flex_1()
+                    .min_w(px(0.))
                     .min_h(px(40.))
+                    .max_h(INPUT_MAX_HEIGHT)
+                    .overflow_y_scroll()
+                    .track_scroll(&self.input.read(cx).scroll_handle.clone())
                     .border_1()
                     .border_color(rgb(0xd1d5db))
                     .rounded_lg()
                     .bg(white())
-                    .px_3()
-                    .py_2()
+                    .px_2()
+                    .py_1()
                     .text_size(px(14.))
                     .cursor(CursorStyle::IBeam)
+                    .track_focus(&self.input.read(cx).focus_handle.clone())
+                    .focus(|this| this.border_color(gpui::blue()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this: &mut ChatApp, _ev, window, _cx| {
