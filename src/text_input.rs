@@ -157,6 +157,8 @@ pub struct TextInput {
     /// 滚动条拖拽状态
     is_dragging_scrollbar: bool,
     scrollbar_grab_offset: f32,
+    /// 是否处于"按住鼠标拖选"状态（仅在按下左键后为 true，移动不应改变选区）
+    is_selecting: bool,
     /// 与本控件联动的滚动句柄（由外层滚动容器注入）
     pub scroll_handle: ScrollHandle,
 
@@ -200,6 +202,7 @@ impl TextInput {
             history: History::new(),
             is_dragging_scrollbar: false,
             scrollbar_grab_offset: 0.,
+            is_selecting: false,
             scroll_handle: ScrollHandle::new(),
             last_layout: None,
             last_shaped_content: None,
@@ -797,15 +800,19 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle.clone());
+        self.is_selecting = true;
         // 取布局数据的屏幕坐标与滚动句柄，把点击位置映射到内容偏移
         let offset = self.index_for_mouse_position(event.position);
-        self.selected_range = offset..offset;
-        self.selection_reversed = false;
+        // 按住 Shift 点击 → 从原光标扩展到点击处；否则把光标移到点击处
+        if event.modifiers.shift {
+            self.select_to(offset, cx);
+        } else {
+            self.move_to(offset, cx);
+        }
         // 若点中了滚动条区域的 x 范围（右缘 12px），进入拖拽模式
         if let Some((track, _, _, _, _)) = self.scrollbar_geometry() {
             if event.position.x >= track.origin.x {
                 self.is_dragging_scrollbar = true;
-                // 记录按住滑块时的抓握偏差（0..1 对应滑块行程）
                 self.scrollbar_grab_offset = self.scrollbar_thumb_fraction(event.position.y);
             }
         }
@@ -830,11 +837,12 @@ impl TextInput {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.is_dragging_scrollbar = false;
+        self.is_selecting = false;
         self.commit();
         cx.notify();
     }
 
-    /// 鼠标拖动：更新选区活动端或拖拽滚动条。
+    /// 鼠标拖动：仅当按住左键时才更新选区活动端；否则拖拽滚动条。
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_dragging_scrollbar {
             // 把鼠标 y 换算成滚动进度再设置滚动位置
@@ -849,15 +857,11 @@ impl TextInput {
             }
             return;
         }
-        // 拖动选择：把活动端更新到鼠标位置（连续选区）
-        if self.pending.is_none() {
-            self.pending = Some(HistoryItem {
-                text: String::new(),
-                range: self.selected_range.start..self.selected_range.start,
-            });
+        // 只有处于"拖选"状态才跟随鼠标扩展选区（参考官方 examples/input.rs）
+        if self.is_selecting {
+            let offset = self.index_for_mouse_position(event.position);
+            self.select_to(offset, cx);
         }
-        let offset = self.index_for_mouse_position(event.position);
-        self.select_to(offset, cx);
     }
 
     // ==================== 命中测试 ====================
@@ -872,6 +876,13 @@ impl TextInput {
         let Some(bounds) = &self.last_bounds else {
             return 0;
         };
+        // 超出文本区上下边界时分别折到开头/结尾（参考官方 examples/input.rs）
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return self.content.len();
+        }
         let Some(lines) = &self.last_layout else {
             return 0;
         };
@@ -1309,22 +1320,18 @@ impl Element for TextElement {
 }
 
 impl EntityInputHandler for TextInput {
-    /// IME 取某段内容的文本（区间为 UTF-16）。
+    /// IME 取某段内容的文本（区间为 UTF-16），并回填实际区间。
     fn text_for_range(
         &mut self,
-        range: Range<usize>,
-        adjusted_range: &mut Option<Range<usize>>,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let start = self.offset_to_utf8(range.start);
-        let end = self.offset_to_utf8(range.end);
-        if start <= end && end <= self.content.len() {
-            *adjusted_range = None;
-            Some(self.content[start..end].to_string())
-        } else {
-            None
-        }
+        let range = self.range_from_utf16(&range_utf16);
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.content[range].to_string())
     }
 
     /// 当前选区（UTF-16 表示）。
@@ -1334,17 +1341,15 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let start = self.offset_to_utf16(self.selected_range.start);
-        let end = self.offset_to_utf16(self.selected_range.end);
         Some(UTF16Selection {
-            range: start..end,
+            range: self.range_to_utf16(&self.selected_range),
             reversed: self.selection_reversed,
         })
     }
 
-    /// IME 上屏中的临时区间。
+    /// IME 组合中的临时区间（以 UTF-16 返回，与官方 examples/input.rs 一致）。
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.clone()
+        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
     }
 
     /// 取消 IME 临时标记。
@@ -1409,58 +1414,62 @@ impl EntityInputHandler for TextInput {
         Some(self.offset_to_utf16(line_start + utf8))
     }
 
-    /// 系统请求替换某段区间（IME 组合确认/输入）。区间为 UTF-16。
+    /// 系统请求替换某段区间（IME 输入 / 组合确认）。区间为 UTF-16。
+    ///
+    /// 区间解析顺序与官方 `examples/input.rs` 一致：
+    /// 显式区间 > 当前组合（`marked_range`）> 当前选区。
     fn replace_text_in_range(
         &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        window: &mut Window,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = range.map(|r| self.offset_to_utf8(r.start)..self.offset_to_utf8(r.end));
-        TextInput::replace_text_in_range(self, range, text, window, cx);
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        self.content = SharedString::from(
+            self.content[..range.start].to_owned() + new_text + &self.content[range.end..],
+        );
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range = None;
+        self.selection_reversed = false;
         self.scroll_cursor_into_view(cx);
         cx.notify();
     }
 
-    /// 替换文本并标记临时区间（IME 组合候选直接上屏并选中）。
+    /// 替换文本并标记临时区间（IME 组合候选实时上屏并选中）。
     fn replace_and_mark_text_in_range(
         &mut self,
-        range: Option<Range<usize>>,
+        range_utf16: Option<Range<usize>>,
         new_text: &str,
-        new_selected_range: Option<Range<usize>>,
-        window: &mut Window,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut range = range.map(|r| self.offset_to_utf8(r.start)..self.offset_to_utf8(r.end));
-        // IME 噪音清理：组合"刚开始"（此前尚未有 marked 区间，且平台没有给出明确区间）
-        // 时，光标前若残留一段纯 ASCII（英文/拼音按键常被 IMM 以 WM_CHAR 提前插入，
-        // 例如 "nn'n'"），应视为被组合吸收的输入先清掉——否则会出现 "nn'n'你是谁"
-        // 这种前缀垃圾，且与后面真正输入的 ASCII 冲突。
-        if self.marked_range.is_none() && range.is_none() && !new_text.is_empty() {
-            let cursor = self.cursor_offset().min(self.content.len());
-            let prefix = self.content[..cursor].to_string();
-            let is_pinyin_noise = !prefix.is_empty()
-                && prefix.chars().count() <= 32
-                && prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '\'' || c == ' ');
-            if is_pinyin_noise {
-                range = Some(0..cursor);
-            }
-        }
-        TextInput::replace_text_in_range(self, range, new_text, window, cx);
-        let reversed = new_selected_range
+        let range = range_utf16
             .as_ref()
-            .map(|s| s.start > s.end)
-            .unwrap_or(false);
-        if let Some(sel) = new_selected_range {
-            let sel = sel.start.min(sel.end)..sel.start.max(sel.end);
-            self.marked_range = Some(sel.clone());
-            self.selected_range = sel;
-            self.selection_reversed = reversed;
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        self.content = SharedString::from(
+            self.content[..range.start].to_owned() + new_text + &self.content[range.end..],
+        );
+        if !new_text.is_empty() {
+            self.marked_range = Some(range.start..range.start + new_text.len());
+        } else {
+            self.marked_range = None;
         }
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .map(|nr| nr.start + range.start..nr.end + range.start)
+            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+        self.selection_reversed = false;
         self.scroll_cursor_into_view(cx);
         cx.notify();
     }
@@ -1479,6 +1488,11 @@ impl TextInput {
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
         let (s, e) = self.utf16_range_to_utf8(range_utf16.clone());
         s..e
+    }
+
+    /// 把 UTF-8 区间换算成 UTF-16 区间（IME 回传用）。
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
     }
 }
 
