@@ -12,6 +12,7 @@
 mod app;
 mod backend;
 mod markdown;
+mod scrollbar;
 mod text_input;
 
 use gpui::{

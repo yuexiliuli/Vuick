@@ -645,7 +645,8 @@ impl ChatApp {
             .overflow_y_scroll()
             .track_scroll(&self.messages_scroll)
             .px_4()
-            .py_3();
+            .py_3()
+            .min_w(px(0.));
         if empty {
             scroll = scroll.child(self.render_empty_state(cx));
         } else {
@@ -657,7 +658,14 @@ impl ChatApp {
                 scroll = scroll.child(self.render_stream());
             }
         }
-        scroll
+        // 消息区 + 美化滚动条（并列一行，滚动条占据最右 12px 窄列）
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h(px(0.))
+            .child(scroll)
+            .child(super::scrollbar::Scrollbar::new(self.messages_scroll.clone()))
     }
 }
 

@@ -22,10 +22,10 @@ use std::ops::Range;
 
 use gpui::{
     actions, div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
-    Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Styled, Style, TextAlign, TextRun, UTF16Selection, WrappedLine,
+    Context, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, SharedString, Styled, Style, TextAlign, TextRun, UTF16Selection, WrappedLine,
     InteractiveElement, ScrollHandle, Window, WrapBoundary,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -1296,19 +1296,28 @@ impl Element for TextElement {
         });
 
         // 自绘常驻滚动条：轨道 + 滑块。GPUI 0.2.2 的系统 overlay 滚动条在
-        // Windows 上会自动隐藏等同不可见，所以自己画。
+        // Windows 上会自动隐藏等同不可见，所以自己画（圆角、半透明美化版）。
         let geometry = self.input.read(cx).scrollbar_geometry();
         if let Some((track, thumb, _scroll_down, _content_h, _viewport_h)) = geometry {
-            let track_quad = fill(track, rgba(0x88888822));
-            window.paint_quad(track_quad);
-            // 拖拽中滑块颜色加深，给用户反馈
+            // 轨道：极淡圆角底
+            window.paint_quad(
+                fill(track, rgba(0x93a0aa1f)).corner_radii(Corners::all(px(3.))),
+            );
+            // 滑块：居中的 6px 圆角半透明条，拖拽中加深
+            let thumb_w = px(6.);
+            let thumb_x = track.origin.x + (track.size.width - thumb_w) / 2.;
+            let thumb_center = Bounds::new(
+                point(thumb_x, thumb.origin.y),
+                size(thumb_w, thumb.size.height),
+            );
             let thumb_color = if self.input.read(cx).is_dragging_scrollbar {
-                rgba(0x555555aa)
+                rgba(0x3b82f6c0)
             } else {
-                rgba(0x77777766)
+                rgba(0x64748b96)
             };
-            let thumb_quad = fill(thumb, thumb_color);
-            window.paint_quad(thumb_quad);
+            window.paint_quad(
+                fill(thumb_center, thumb_color).corner_radii(Corners::all(px(3.))),
+            );
         }
     }
 }
