@@ -470,16 +470,51 @@ fn flush_table(blocks: &mut Vec<Block>, table_buf: &mut Vec<String>) {
 
 // ==================== 渲染为 GPUI 元素 ====================
 
-fn spans_to_styled(
-    text: &str,
-    spans: &[Span],
-    theme: &MarkdownTheme,
-    force_bold: bool,
-) -> SpannedText {
+/// 与 GPUI `LineWrapper::is_word_char` 保持一致：这些字符是"单词字符"，
+/// GPUI 排版时**不会**在它们中间换行（空格/标点/中文等都会产生断点）。
+fn is_unbroken_word_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        // Latin-1 补充 + Latin Extended A/B
+        || matches!(c, '\u{00C0}'..='\u{024F}')
+        // 西里尔
+        || matches!(c, '\u{0400}'..='\u{04FF}')
+        // 常见特殊字符：`a-b` `var_name` `3.14` `@mention` `#hash` `a=1` 等
+        || matches!(c, '-' | '_' | '.' | '\'' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':')
+}
+
+/// 连续"单词字符"达到该长度后开始考虑插入断点（约 20 个字符 ≈ 140px）
+const UNBROKEN_LIMIT: usize = 20;
+/// 超过限制后每 N 个"单词字符"插入一个断点
+const UNBROKEN_STEP: usize = 14;
+
+/// 在"不可断"的超长连续片段里插入零宽空格（U+200B），让长 URL / 长串也能换行。
+///
+/// 背景：GPUI 只在空格/标点/中文等"断点"处换行，纯单词字符的长串没有断点，
+/// 会整体溢出窗口（这与"有空格的行能换行、没空格的行不能换行"的现象一致）。
+/// U+200B 是零宽、不可见的合法换行机会，插入后 GPUI 即可在字符级断开。
+pub fn break_long_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 4);
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if is_unbroken_word_char(ch) {
+            run += 1;
+            out.push(ch);
+            if run > UNBROKEN_LIMIT && run % UNBROKEN_STEP == 0 {
+                out.push('\u{200b}');
+            }
+        } else {
+            run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn spans_to_styled(spans: &[Span], theme: &MarkdownTheme, force_bold: bool) -> SpannedText {
     let base = font(".SystemUIFont");
     let mono = font(theme.mono_family.clone());
     let mut runs: Vec<TextRun> = Vec::new();
-    let mut total = 0usize;
+    let mut text = String::new();
     for sp in spans {
         let mut f = base.clone();
         if sp.code {
@@ -493,8 +528,10 @@ fn spans_to_styled(
         if sp.italic {
             f = f.italic();
         }
+        // 超长不可断片段插入零宽空格，让长词也能换行
+        let seg = break_long_runs(sp.text.as_str());
         let run = TextRun {
-            len: sp.text.len(),
+            len: seg.len(),
             font: f,
             color: if sp.code {
                 theme.code_text
@@ -526,12 +563,11 @@ fn spans_to_styled(
                 None
             },
         };
-        total += sp.text.len();
+        text.push_str(&seg);
         runs.push(run);
     }
-    debug_assert_eq!(total, text.len());
     SpannedText {
-        text: SharedString::from(text.to_owned()),
+        text: SharedString::from(text),
         runs,
     }
 }
@@ -553,8 +589,7 @@ fn render_spans_line(spans: &[Span], theme: &MarkdownTheme) -> StyledText {
 
 /// 渲染一行行内片段，可整体强制加粗（用于表头单元格）。
 fn render_spans_line_weighted(spans: &[Span], theme: &MarkdownTheme, force_bold: bool) -> StyledText {
-    let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-    spans_to_styled(&text, spans, theme, force_bold).into_element()
+    spans_to_styled(spans, theme, force_bold).into_element()
 }
 
 fn render_block(
@@ -567,7 +602,7 @@ fn render_block(
 ) -> AnyElement {
     match block {
         Block::Paragraph(lines) => {
-            let mut d = div();
+            let mut d = div().min_w(px(0.));
             for line in lines {
                 d = d.child(render_spans_line(line, theme));
             }
@@ -580,11 +615,11 @@ fn render_block(
                 3 => px(16.),
                 _ => px(15.),
             };
-            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-            let st = spans_to_styled(&text, spans, theme, false).into_element();
+            let st = spans_to_styled(spans, theme, false).into_element();
             div()
                 .mb_2()
                 .mt_1()
+                .min_w(px(0.))
                 .text_size(size)
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme.heading)
@@ -592,12 +627,13 @@ fn render_block(
                 .into_any_element()
         }
         Block::Code(code) => {
-            let mut child = div();
+            let mut child = div().min_w(px(0.));
             for line in code.split('\n') {
+                let broken = break_long_runs(line);
                 let st = SpannedText {
-                    text: SharedString::from(line.to_owned()),
+                    text: SharedString::from(broken.clone()),
                     runs: vec![TextRun {
-                        len: line.len(),
+                        len: broken.len(),
                         font: font(theme.mono_family.clone()),
                         color: theme.code_text,
                         background_color: None,
@@ -617,31 +653,34 @@ fn render_block(
                 .into_any_element()
         }
         Block::List { ordered, items } => {
-            let mut d = div().mb_2();
+            let mut d = div().mb_2().min_w(px(0.));
             for (i, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("{}. ", i + 1)
                 } else {
                     "• ".to_string()
                 };
-                let mut row = div().flex().flex_row();
+                let mut row = div().flex().flex_row().min_w(px(0.));
                 row = row.child(
-                    div().child(
-                        SpannedText {
-                            text: SharedString::from(marker.to_owned()),
-                            runs: vec![TextRun {
-                                len: marker.len(),
-                                font: font(".SystemUIFont"),
-                                color: theme.text,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            }],
-                        }
-                        .into_element(),
-                    ),
+                    div()
+                        .min_w(px(0.))
+                        .child(
+                            SpannedText {
+                                text: SharedString::from(marker.to_owned()),
+                                runs: vec![TextRun {
+                                    len: marker.len(),
+                                    font: font(".SystemUIFont"),
+                                    color: theme.text,
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }],
+                            }
+                            .into_element(),
+                        ),
                 );
-                row = row.child(render_spans_line(item, theme));
+                // 条目文本放进可收缩容器，超长不可断片段靠 break_long_runs 换行
+                row = row.child(div().flex_1().min_w(px(0.)).child(render_spans_line(item, theme)));
                 d = d.child(row);
             }
             d.into_any_element()
@@ -665,8 +704,7 @@ fn render_block(
                             .chain(rows.iter())
                             .filter_map(|r| r.get(c))
                         {
-                            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-                            let st = spans_to_styled(&text, spans, theme, false);
+                            let st = spans_to_styled(spans, theme, false);
                             let lw = wnd
                                 .text_system()
                                 .shape_line(st.text, font_size, &st.runs, None)
@@ -848,6 +886,7 @@ pub fn render_markdown_with_options(
     div()
         .flex()
         .flex_col()
+        .min_w(px(0.))
         .text_color(theme.text)
         .children(children)
 }
@@ -871,8 +910,8 @@ mod tests {
     fn header_force_bold_uses_run_font() {
         let spans = parse_inline("列 A");
         let theme = MarkdownTheme::light();
-        let bold = spans_to_styled("列 A", &spans, &theme, true);
-        let normal = spans_to_styled("列 A", &spans, &theme, false);
+        let bold = spans_to_styled(&spans, &theme, true);
+        let normal = spans_to_styled(&spans, &theme, false);
         assert!(
             bold.runs[0].font.weight == FontWeight::BOLD,
             "表头 run 应为加粗字重"
@@ -920,6 +959,30 @@ mod tests {
 
     /// 横向滚动模式下，超宽表格必须真实溢出容器（handle.max_offset.width>0），
     /// 底部横向滚动条才会出现；否则说明表格被容器宽度钳制、没有横向滚动。
+    /// 超长不可断片段（长 URL/长串）插入零宽空格以便换行；普通文本不受影响。
+    #[test]
+    fn break_long_runs_only_splits_long_unbroken_runs() {
+        // 普通句子（含空格/标点/中文，本身有断点）→ 原样保留
+        assert_eq!(break_long_runs("你好，这是普通句子，带 空格。"), "你好，这是普通句子，带 空格。");
+        // 短单词 → 不插入
+        assert_eq!(break_long_runs("short"), "short");
+        // 60 个连续字母 → 在 28/42/56 处插入 3 个零宽空格
+        let long = "a".repeat(60);
+        let broken = break_long_runs(&long);
+        assert_eq!(
+            broken.chars().filter(|&c| c == '\u{200b}').count(),
+            3,
+            "60 个连续字母应插入 3 个断点：{broken:?}"
+        );
+        // 带斜杠/点号的 URL：只在超长单段里插入
+        let url = format!("https://example.com/{}", "b".repeat(60));
+        let broken_url = break_long_runs(&url);
+        assert!(
+            broken_url.chars().filter(|&c| c == '\u{200b}').count() >= 1,
+            "长地址段应插入断点：{broken_url:?}"
+        );
+    }
+
     #[gpui::test]
     async fn scroll_table_overflows_wide_container(cx: &mut gpui::TestAppContext) {
         struct WideHost {

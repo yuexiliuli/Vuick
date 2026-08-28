@@ -23,7 +23,7 @@ use gpui::{
 const INPUT_MAX_HEIGHT: Pixels = px(150.);
 
 use super::backend::DifyClient;
-use super::markdown::{render_markdown_with_options, TableMode, MarkdownTheme};
+use super::markdown::{break_long_runs, render_markdown_with_options, TableMode, MarkdownTheme};
 use super::scrollbar::TableScrollState;
 use super::input::{TextArea, TextInputEvent};
 
@@ -512,13 +512,14 @@ impl ChatApp {
     fn question_bubble(&self, question: &str) -> impl IntoElement {
         div()
             .max_w(px(560.))
+            .min_w(px(0.))
             .bg(rgb(0x2563eb))
             .px_3()
             .py_2()
             .rounded_lg()
             .text_color(white())
             .text_size(px(14.))
-            .child(SharedString::from(question.to_owned()))
+            .child(SharedString::from(break_long_runs(question)))
     }
 
     fn render_turn(
@@ -561,9 +562,10 @@ impl ChatApp {
                         .border_color(rgb(0xe5e7eb))
                         .rounded_md()
                         .p_3()
+                        .min_w(px(0.))
                         .text_size(px(12.5))
                         .text_color(rgb(0x4b5563))
-                        .child(SharedString::from(turn.thinking.clone())),
+                        .child(SharedString::from(break_long_runs(&turn.thinking))),
                 );
             }
         }
@@ -601,9 +603,10 @@ impl ChatApp {
                         .border_color(rgb(0xd1d5db))
                         .rounded_md()
                         .p_2()
+                        .min_w(px(0.))
                         .text_size(px(12.5))
                         .text_color(rgb(0x6b7280))
-                        .child(SharedString::from(st.thinking.clone())),
+                        .child(SharedString::from(break_long_runs(&st.thinking))),
                 );
             } else {
                 block = block.child(
