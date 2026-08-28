@@ -49,6 +49,16 @@ actions!(
         SelectAll,
         Home,
         End,
+        MoveToPreviousWordBoundary,
+        MoveToNextWordBoundary,
+        SelectToPreviousWordBoundary,
+        SelectToNextWordBoundary,
+        DeleteWordBackward,
+        DeleteWordForward,
+        MoveToBeginningOfDocument,
+        MoveToEndOfDocument,
+        SelectToBeginningOfDocument,
+        SelectToEndOfDocument,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -123,6 +133,113 @@ impl History {
     }
 }
 
+// ==================== 词/字素边界（自由函数，便于单测） ====================
+
+/// 把可能落在字符中间的字节偏移修正到 ≤ 它的最近字符边界。
+/// （真实调用方传来的都是字素边界，这里只为防御非边界输入。）
+fn floor_char_boundary_safe(text: &str, offset: usize) -> usize {
+    let mut i = offset.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// 上一个字素边界（UTF-8 字节偏移）。
+fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let offset = floor_char_boundary_safe(text, offset);
+    if offset == 0 {
+        return 0;
+    }
+    text[..offset]
+        .grapheme_indices(true)
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// 下一个字素边界（UTF-8 字节偏移）。
+fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = floor_char_boundary_safe(text, offset);
+    if offset >= text.len() {
+        return text.len();
+    }
+    text[offset..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map(|(i, _)| offset + i)
+        .unwrap_or(text.len())
+}
+
+/// `offset` 处（必须落在字素边界上）的字素是否被视为"词字符"。
+///
+/// 词字符 = Unicode 字母/数字（含中文等 CJK）+ 下划线；空白与标点都不是，
+/// 所以"中文词语"也会被当作一个词（参考 Zed/gpui-todos 的词边界语义）。
+fn is_word_char(text: &str, offset: usize) -> bool {
+    let offset = floor_char_boundary_safe(text, offset);
+    if offset >= text.len() {
+        return false;
+    }
+    let end = next_grapheme_boundary(text, offset);
+    text[offset..end]
+        .chars()
+        .next()
+        .map(|c| c.is_alphanumeric() || c == '_')
+        .unwrap_or(false)
+}
+
+/// 上一个"词起点"（Ctrl+← / 双击选词左边界）。
+///
+/// - 光标在词中时 → 回到当前词首；
+/// - 光标在空白/标点处时 → 跨过空白找到上一个词并回到其词首。
+fn previous_word_boundary_in(text: &str, offset: usize) -> usize {
+    let mut i = floor_char_boundary_safe(text, offset.min(text.len()));
+    if i == 0 {
+        return 0;
+    }
+    // 若当前位置不是词字符（空白/标点），先向左走到词内（或 0）
+    if !is_word_char(text, i) {
+        while i > 0 && !is_word_char(text, i) {
+            i = previous_grapheme_boundary(text, i);
+        }
+    }
+    // 现在 `i` 落在某词字符上（或 0）。回退到词首：仅当"前一个字符也是词字符"
+    // 时才左移——这样能停在词的首字符上，而不是越过它（避免 off-by-one）。
+    while i > 0 {
+        let prev = previous_grapheme_boundary(text, i);
+        if prev == i || !is_word_char(text, prev) {
+            break;
+        }
+        i = prev;
+    }
+    i
+}
+
+/// 下一个"词起点/词尾"（Ctrl+→ / 双击选词右边界）。
+///
+/// - 光标在词中时 → 跳到当前词尾；
+/// - 光标在空白/标点处时 → 跨过空白跳到下一个词首。
+fn next_word_boundary_in(text: &str, offset: usize) -> usize {
+    let mut i = floor_char_boundary_safe(text, offset.min(text.len()));
+    let len = text.len();
+    if i >= len {
+        return len;
+    }
+    if is_word_char(text, i) {
+        while i < len && is_word_char(text, i) {
+            i = next_grapheme_boundary(text, i);
+        }
+        return i;
+    }
+    while i < len && !is_word_char(text, i) {
+        i = next_grapheme_boundary(text, i);
+    }
+    i
+}
+
 pub struct TextInput {
     /// 焦点句柄（决定键盘事件是否发给本控件）
     pub focus_handle: FocusHandle,
@@ -156,7 +273,8 @@ pub struct TextInput {
 
     /// 滚动条拖拽状态
     is_dragging_scrollbar: bool,
-    scrollbar_grab_offset: f32,
+    /// 按下滚动条滑块时，鼠标相对滑块顶部的偏移（像素），拖动时滑块不跳
+    scrollbar_grab_offset: Pixels,
     /// 是否处于"按住鼠标拖选"状态（仅在按下左键后为 true，移动不应改变选区）
     is_selecting: bool,
     /// 与本控件联动的滚动句柄（由外层滚动容器注入）
@@ -201,7 +319,7 @@ impl TextInput {
             pending: None,
             history: History::new(),
             is_dragging_scrollbar: false,
-            scrollbar_grab_offset: 0.,
+            scrollbar_grab_offset: px(0.),
             is_selecting: false,
             scroll_handle: ScrollHandle::new(),
             last_layout: None,
@@ -239,22 +357,97 @@ impl TextInput {
 
     /// 当前字符位置之前一个字素边界（跳过 ASCII 空白与中文标点组合）。
     pub fn previous_boundary(&self, offset: usize) -> usize {
-        if offset <= 0 {
-            return 0;
-        }
-        self.content[..offset].grapheme_indices(true).next_back().map(|(i, _)| i).unwrap_or(0)
+        previous_grapheme_boundary(self.content.as_ref(), offset)
     }
 
     /// 之后一个字素边界。
     pub fn next_boundary(&self, offset: usize) -> usize {
-        if offset >= self.content.len() {
-            return self.content.len();
+        next_grapheme_boundary(self.content.as_ref(), offset)
+    }
+
+    /// `offset` 处（必须落在字素边界上）的字素是否被视为"词字符"。
+    fn is_word_char_at(&self, offset: usize) -> bool {
+        is_word_char(self.content.as_ref(), offset)
+    }
+
+    /// 上一个"词起点"（Ctrl+← / 双击选词左边界）。
+    pub fn previous_word_boundary(&self, offset: usize) -> usize {
+        previous_word_boundary_in(self.content.as_ref(), offset)
+    }
+
+    /// 下一个"词起点/词尾"（Ctrl+→ / 双击选词右边界）。
+    pub fn next_word_boundary(&self, offset: usize) -> usize {
+        next_word_boundary_in(self.content.as_ref(), offset)
+    }
+
+    /// 由"可视行号 + 该列 x"确定行区间起点（供双击选行等）。
+    fn line_range_at(&self, offset: usize) -> Range<usize> {
+        let (line, _) = self.line_col(offset.min(self.content.len()));
+        let ranges = self.line_ranges();
+        ranges.get(line).cloned().unwrap_or(0..0)
+    }
+
+    /// 计算内容偏移对应的"可视坐标"：`(逻辑行号, 该逻辑行内的可视行号, 该可视行内的 x)`。
+    ///
+    /// 换行排版下，一个逻辑行（`\n` 分隔）可能被拆成多个可视行；↑/↓ 应逐"可视行"
+    /// 移动并尽量保持同一列，而不是整段逻辑行跳跃（长行换行后体验更合理）。
+    fn visual_row_for_offset(&self, offset: usize) -> (usize, usize, Pixels) {
+        let Some(lines) = &self.last_layout else {
+            return (0, 0, px(0.));
+        };
+        let (line, rel) = self.line_col(offset.min(self.content.len()));
+        let Some(wl) = lines.get(line) else {
+            return (line, 0, px(0.));
+        };
+        let pos = wl
+            .position_for_index(rel.min(wl.len()), self.last_line_height)
+            .unwrap_or_default();
+        let row = if self.last_line_height > px(0.) {
+            (pos.y / self.last_line_height) as usize
+        } else {
+            0
+        };
+        (line, row, pos.x)
+    }
+
+    /// 由"可视坐标"反查内容偏移：在指定逻辑行的第 `row` 个可视行里找第一个
+    /// x（相对该片断起点）不小于 `x` 的索引。`row` 越界时取该逻辑行最后一个可视行。
+    fn offset_for_visual_position(&self, line: usize, row: usize, x: Pixels) -> usize {
+        let Some(lines) = &self.last_layout else {
+            return 0;
+        };
+        let ranges = self.line_ranges();
+        let Some(wl) = lines.get(line) else {
+            return 0;
+        };
+        let line_start = ranges[line].start;
+        let uw = &wl.unwrapped_layout;
+        // 枚举该逻辑行的换行片断（字节区间），第 k 个片断 = 第 k 个可视行
+        let mut segs: Vec<(usize, usize)> = Vec::new();
+        let mut seg_start = 0usize;
+        for b in wl.wrap_boundaries() {
+            let seg_end = boundary_byte(wl, b);
+            segs.push((seg_start, seg_end));
+            seg_start = seg_end;
         }
-        self.content[offset..]
-            .grapheme_indices(true)
-            .nth(1)
-            .map(|(i, _)| offset + i)
-            .unwrap_or(self.content.len())
+        segs.push((seg_start, wl.len()));
+        let (s, e) = if segs.is_empty() {
+            (0usize, wl.len())
+        } else {
+            segs[row.min(segs.len() - 1)]
+        };
+        // 在片断内找第一个相对 x >= 目标 x 的字节索引；都小于目标则停在该片断末尾
+        let x0 = uw.x_for_index(s);
+        let mut best = e;
+        for idx in s..=e {
+            let xr = uw.x_for_index(idx) - x0;
+            if xr >= x {
+                best = idx;
+                break;
+            }
+            best = idx;
+        }
+        line_start + best
     }
 
     // ==================== 选区 ====================
@@ -384,28 +577,30 @@ impl TextInput {
         cx.notify();
     }
 
-    /// 生成首尾都不含空格/换行的"词选区"（双击选词用）。
-    #[allow(dead_code)]
+    /// 生成"词选区"（双击选词用）。以 `offset` 为中心向两侧扩展到最近的词边界；
+    /// 若 `offset` 落在空白/标点上（附近无词），返回空区间（不选）。
     fn word_range(&self, offset: usize) -> Range<usize> {
-        let mut start = offset;
-        let mut end = offset;
-        while start > 0 {
-            let prev = self.previous_boundary(start);
-            let ch = &self.content[prev..self.next_boundary(prev)];
-            if ch == " " || ch == "\n" || ch == "\t" || ch == "，" || ch == "。" {
-                break;
-            }
-            start = prev;
+        if self.content.is_empty() {
+            return 0..0;
         }
-        while end < self.content.len() {
-            let ch = &self.content[end..self.next_boundary(end)];
-            if ch == " " || ch == "\n" || ch == "\t" || ch == "，" || ch == "。" {
-                break;
-            }
+        let o = offset.min(self.content.len());
+        // 点击必须落在某个词字符上（允许正好落在词尾：左侧仍是词字符）
+        let on_word = self.is_word_char_at(o)
+            || (o > 0 && self.previous_boundary(o) < o && self.is_word_char_at(self.previous_boundary(o)));
+        if !on_word {
+            return o..o;
+        }
+        let mut start = o;
+        while start > 0 && self.is_word_char_at(start) {
+            start = self.previous_boundary(start);
+        }
+        let mut end = o;
+        while end < self.content.len() && self.is_word_char_at(end) {
             end = self.next_boundary(end);
         }
         start..end
     }
+
 
     /// 把当前 pending 快照压入撤销栈（在手势结束时调用）。
     fn commit(&mut self) {
@@ -475,25 +670,33 @@ impl TextInput {
         }
     }
 
-    /// 上移光标（多行才生效；保持同一列位置尽可能一致）。
+    /// 上移光标（按**可视行**移动：长行换行后也逐行上移，并尽量保持同一列）。
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, col) = self.line_col(self.cursor_offset());
-        if line > 0 {
-            let target_col = col;
-            let prev_line = self.line_ranges()[line - 1].clone();
-            let new_offset = prev_line.start + target_col.min(prev_line.end - prev_line.start);
-            self.move_to(new_offset, cx);
+        let (line, row, x) = self.visual_row_for_offset(self.cursor_offset());
+        if row > 0 {
+            self.move_to(self.offset_for_visual_position(line, row - 1, x), cx);
+        } else if line > 0 {
+            // 上一逻辑行的最后一个可视行，保持同一列 x
+            self.move_to(self.offset_for_visual_position(line - 1, usize::MAX, x), cx);
         }
     }
 
-    /// 下移光标。
+    /// 下移光标（按**可视行**移动）。
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, col) = self.line_col(self.cursor_offset());
-        let ranges = self.line_ranges();
-        if line + 1 < ranges.len() {
-            let next_line = ranges[line + 1].clone();
-            let new_offset = next_line.start + col.min(next_line.end - next_line.start);
-            self.move_to(new_offset, cx);
+        let (line, row, x) = self.visual_row_for_offset(self.cursor_offset());
+        let line_rows = self
+            .last_layout
+            .as_ref()
+            .and_then(|lines| lines.get(line))
+            .map(|wl| wl.wrap_boundaries().len() + 1)
+            .unwrap_or(1);
+        if row + 1 < line_rows {
+            self.move_to(self.offset_for_visual_position(line, row + 1, x), cx);
+        } else if let Some(lines) = &self.last_layout {
+            if line + 1 < lines.len() {
+                // 下一逻辑行的第一个可视行，保持同一列 x
+                self.move_to(self.offset_for_visual_position(line + 1, 0, x), cx);
+            }
         }
     }
 
@@ -752,24 +955,31 @@ impl TextInput {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
-    /// Shift+↑：把选区扩展到上一行同一列（多行时才有效）。
+    /// Shift+↑：把选区扩展到上一可视行同一列。
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, col) = self.line_col(self.cursor_offset());
-        if line > 0 {
-            let prev = self.line_ranges()[line - 1].clone();
-            let target = prev.start + col.min(prev.end - prev.start);
-            self.select_to(target, cx);
+        let (line, row, x) = self.visual_row_for_offset(self.cursor_offset());
+        if row > 0 {
+            self.select_to(self.offset_for_visual_position(line, row - 1, x), cx);
+        } else if line > 0 {
+            self.select_to(self.offset_for_visual_position(line - 1, usize::MAX, x), cx);
         }
     }
 
-    /// Shift+↓：把选区扩展到下一行同一列。
+    /// Shift+↓：把选区扩展到下一可视行同一列。
     fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, col) = self.line_col(self.cursor_offset());
-        let ranges = self.line_ranges();
-        if line + 1 < ranges.len() {
-            let next = ranges[line + 1].clone();
-            let target = next.start + col.min(next.end - next.start);
-            self.select_to(target, cx);
+        let (line, row, x) = self.visual_row_for_offset(self.cursor_offset());
+        let line_rows = self
+            .last_layout
+            .as_ref()
+            .and_then(|lines| lines.get(line))
+            .map(|wl| wl.wrap_boundaries().len() + 1)
+            .unwrap_or(1);
+        if row + 1 < line_rows {
+            self.select_to(self.offset_for_visual_position(line, row + 1, x), cx);
+        } else if let Some(lines) = &self.last_layout {
+            if line + 1 < lines.len() {
+                self.select_to(self.offset_for_visual_position(line + 1, 0, x), cx);
+            }
         }
     }
 
@@ -787,6 +997,110 @@ impl TextInput {
         self.move_to(end, cx);
     }
 
+    // ==================== 词级导航 / 文档级导航（参照 Zed/编辑器输入框） ====================
+
+    /// Ctrl+←：光标跳到上一个词起点。
+    fn move_to_previous_word_boundary(
+        &mut self,
+        _: &MoveToPreviousWordBoundary,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+
+    /// Ctrl+→：光标跳到下一个词边界。
+    fn move_to_next_word_boundary(
+        &mut self,
+        _: &MoveToNextWordBoundary,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+
+    /// Ctrl+Shift+←：把选区扩展到上一个词起点。
+    fn select_to_previous_word_boundary(
+        &mut self,
+        _: &SelectToPreviousWordBoundary,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.previous_word_boundary(self.cursor_offset()), cx);
+    }
+
+    /// Ctrl+Shift+→：把选区扩展到下一个词边界。
+    fn select_to_next_word_boundary(
+        &mut self,
+        _: &SelectToNextWordBoundary,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.next_word_boundary(self.cursor_offset()), cx);
+    }
+
+    /// Ctrl+Backspace：删除光标前一个词（有选区时删除选区）。
+    fn delete_word_backward(&mut self, _: &DeleteWordBackward, window: &mut Window, cx: &mut Context<Self>) {
+        let range = if self.selected_range.is_empty() {
+            let start = self.previous_word_boundary(self.cursor_offset());
+            start..self.cursor_offset()
+        } else {
+            self.selected_range.clone()
+        };
+        self.delete_range(Some(range), window, cx);
+    }
+
+    /// Ctrl+Delete：删除光标后一个词。
+    fn delete_word_forward(&mut self, _: &DeleteWordForward, window: &mut Window, cx: &mut Context<Self>) {
+        let range = if self.selected_range.is_empty() {
+            let end = self.next_word_boundary(self.cursor_offset());
+            self.cursor_offset()..end
+        } else {
+            self.selected_range.clone()
+        };
+        self.delete_range(Some(range), window, cx);
+    }
+
+    /// Ctrl+Home：光标移到文档开头。
+    fn move_to_beginning_of_document(
+        &mut self,
+        _: &MoveToBeginningOfDocument,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to(0, cx);
+    }
+
+    /// Ctrl+End：光标移到文档结尾。
+    fn move_to_end_of_document(
+        &mut self,
+        _: &MoveToEndOfDocument,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    /// Ctrl+Shift+Home：把选区扩展到文档开头。
+    fn select_to_beginning_of_document(
+        &mut self,
+        _: &SelectToBeginningOfDocument,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    /// Ctrl+Shift+End：把选区扩展到文档结尾。
+    fn select_to_end_of_document(
+        &mut self,
+        _: &SelectToEndOfDocument,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn select_all_action(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.select_all(cx);
     }
@@ -800,39 +1114,39 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle.clone());
-        self.is_selecting = true;
-        // 取布局数据的屏幕坐标与滚动句柄，把点击位置映射到内容偏移
-        let offset = self.index_for_mouse_position(event.position);
-        // 按住 Shift 点击 → 从原光标扩展到点击处；否则把光标移到点击处
-        if event.modifiers.shift {
-            self.select_to(offset, cx);
-        } else {
-            self.move_to(offset, cx);
-        }
-        // 若点中了滚动条区域的 x 范围（右缘 12px），进入拖拽模式
-        if let Some((track, _, _, _, _)) = self.scrollbar_geometry() {
+
+        // 若点中了滚动条轨道区域（元素右缘 12px），进入滚动条拖拽**而不移动光标**
+        if let Some((track, thumb, _, _, _)) = self.scrollbar_geometry() {
             if event.position.x >= track.origin.x {
                 self.is_dragging_scrollbar = true;
-                self.scrollbar_grab_offset = self.scrollbar_thumb_fraction(event.position.y);
+                // 记录按下点相对滑块顶部的偏移：拖动时滑块跟随鼠标但不"跳到"按下位置
+                self.scrollbar_grab_offset = (event.position.y - thumb.origin.y).max(px(0.));
+                cx.notify();
+                return;
+            }
+        }
+
+        self.is_selecting = true;
+        // 取布局数据的屏幕坐标，把点击位置映射到内容偏移
+        let offset = self.index_for_mouse_position(event.position);
+        if event.modifiers.shift {
+            // Shift+点击：从原光标扩展到点击处
+            self.select_to(offset, cx);
+        } else {
+            // 普通单击定位；双击选词；三击及以上选行（参照 Zed / gpui-todos 输入框）
+            match event.click_count {
+                0 | 1 => self.move_to(offset, cx),
+                2 => {
+                    let w = self.word_range(offset);
+                    self.select_range(w, cx);
+                }
+                _ => {
+                    let l = self.line_range_at(offset);
+                    self.select_range(l, cx);
+                }
             }
         }
         cx.notify();
-    }
-
-    /// 当前鼠标 y 相对视口顶部的滚动进度（用于拖拽滚动条）。
-    fn scrollbar_thumb_fraction(&self, y: Pixels) -> f32 {
-        let viewport = self.scroll_handle.bounds();
-        let viewport_h = viewport.size.height;
-        if viewport_h <= px(0.) {
-            return 0.;
-        }
-        let content_h = self.wrapped_content_height().max(self.last_line_height);
-        let max_scroll = (content_h - viewport_h).max(px(0.));
-        if max_scroll <= px(0.) {
-            return 0.;
-        }
-        let _ = y;
-        0. // 粗略占位；真正拖拽时由 on_mouse_move 换算
     }
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -845,15 +1159,15 @@ impl TextInput {
     /// 鼠标拖动：仅当按住左键时才更新选区活动端；否则拖拽滚动条。
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_dragging_scrollbar {
-            // 把鼠标 y 换算成滚动进度再设置滚动位置
-            let viewport = self.scroll_handle.bounds();
-            let viewport_h = viewport.size.height;
-            let content_h = self.wrapped_content_height().max(self.last_line_height);
-            let max_scroll = (content_h - viewport_h).max(px(0.));
-            if viewport_h > px(0.) && max_scroll > px(0.) {
-                let frac = ((event.position.y - viewport.top()) / viewport_h)
-                    .clamp(0., 1.) as f32;
-                self.set_scroll_fraction(frac, cx);
+            // 用"按下时记录的抓取偏移"把鼠标 y 换算成滚动进度，滑块严格跟随鼠标
+            if let Some((_track, thumb, _, _, viewport_h)) = self.scrollbar_geometry() {
+                let slide = viewport_h - thumb.size.height;
+                if slide > px(0.) {
+                    let rel =
+                        (event.position.y - self.scroll_handle.bounds().top()) - self.scrollbar_grab_offset;
+                    let frac = (rel / slide).clamp(0., 1.) as f32;
+                    self.set_scroll_fraction(frac, cx);
+                }
             }
             return;
         }
@@ -949,10 +1263,11 @@ impl Render for TextInput {
             .line_height(relative(1.4))
             .child(TextElement { input: cx.entity() });
 
-        // 鼠标交互（点击定位 / 拖选 / 拖滚动条）
+        // 鼠标交互（点击定位 / 拖选 / 拖滚动条；拖出控件外松手也要收尾）
         el = el
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move));
 
         // 焦点时的键盘动作（键位本身在 main.rs 里全局注册）
@@ -970,6 +1285,16 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_all_action))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::move_to_previous_word_boundary))
+            .on_action(cx.listener(Self::move_to_next_word_boundary))
+            .on_action(cx.listener(Self::select_to_previous_word_boundary))
+            .on_action(cx.listener(Self::select_to_next_word_boundary))
+            .on_action(cx.listener(Self::delete_word_backward))
+            .on_action(cx.listener(Self::delete_word_forward))
+            .on_action(cx.listener(Self::move_to_beginning_of_document))
+            .on_action(cx.listener(Self::move_to_end_of_document))
+            .on_action(cx.listener(Self::select_to_beginning_of_document))
+            .on_action(cx.listener(Self::select_to_end_of_document))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
@@ -1043,7 +1368,10 @@ fn shape_and_cache(
     let content = input.read(cx).content.clone();
     let placeholder = input.read(cx).placeholder.clone();
 
-    // 空内容时绘制占位文本（半透明灰色），否则绘制真实内容
+    // 空内容时绘制占位文本（半透明灰色），否则绘制真实内容。
+    // 文本整体用**单个 TextRun**（与官方 StyledText 一致），避免按逻辑行切分 run
+    // 时在中文等多字节字符上与 DirectWrite 的字体回退分段产生错位（会引发
+    // "not a char boundary" 崩溃 / 行内容不显示）。
     let (text, runs) = if content.is_empty() {
         let run = TextRun {
             len: placeholder.len(),
@@ -1055,20 +1383,15 @@ fn shape_and_cache(
         };
         (placeholder, vec![run])
     } else {
-        let runs = input
-            .read(cx)
-            .line_ranges()
-            .into_iter()
-            .map(|r| TextRun {
-                len: r.end - r.start,
-                font: style.font(),
-                color: style.color,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            })
-            .collect::<Vec<_>>();
-        (content.clone(), runs)
+        let run = TextRun {
+            len: content.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        (content.clone(), vec![run])
     };
 
     let lines = window
@@ -1132,7 +1455,35 @@ impl Element for TextElement {
                 AvailableSpace::Definite(x) => Some(x),
                 _ => None,
             });
-            let (content_w, content_h) = shape_and_cache(&input, wrap_width, window, cx);
+            // 关键：量布局阶段 `window.line_height()` 是设备像素（×DPI），而绘制阶段是
+            // 逻辑像素（两者可差 1.3 倍）。若在 measure 里重新 shape 并用设备像素行高算高度，
+            // 布局高度会永远大于文字实际高度 → 底部空白随行数增多。
+            // 因此优先复用 **prepaint 已用逻辑行高 shape 好的缓存**，仅在无缓存或宽度不匹配时
+            // 才现场 shape 兜底（首帧/中间测量用）。
+            let cached_size = {
+                let e = input.read(cx);
+                if let (Some(lines), cw, lh) = (&e.last_layout, e.last_wrap_width, e.last_line_height) {
+                    if cw == wrap_width && lh > px(0.) {
+                        let cwpx = lines
+                            .iter()
+                            .map(|wl| wl.width())
+                            .fold(px(0.), |a, b| a.max(b));
+                        let chpx = lines
+                            .iter()
+                            .map(|wl| lh * (wl.wrap_boundaries().len() as f32 + 1.))
+                            .fold(px(0.), |a, b| a + b);
+                        Some((cwpx, chpx))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            let (content_w, content_h) = match cached_size {
+                Some((cw, ch)) => (cw, ch),
+                None => shape_and_cache(&input, wrap_width, window, cx),
+            };
             let width = wrap_width.unwrap_or(content_w);
             size(width, content_h)
         });
@@ -1190,11 +1541,12 @@ impl Element for TextElement {
         );
 
         let line_height = window.line_height();
-        let (line_ranges, selected_range, cursor_offset) = {
+        let (line_ranges, selected_range, marked_range, cursor_offset) = {
             let input = self.input.read(cx);
             (
                 input.line_ranges(),
                 input.selected_range.clone(),
+                input.marked_range.clone(),
                 input.cursor_offset(),
             )
         };
@@ -1246,6 +1598,52 @@ impl Element for TextElement {
                                 rgba(0x3311ff30),
                             );
                             window.paint_quad(quad);
+                        }
+                    }
+                }
+            }
+
+            // IME 组合态下划线：在组合文本（`marked_range`）下方画一条蓝色细线，
+            // 让中文/日文等 IME 候选仍在上屏前的拼写区间一目了然（参照 Zed 编辑器输入框）。
+            if is_focused {
+                if let Some(mr) = &marked_range {
+                    if !mr.is_empty() && i < line_ranges.len() {
+                        let r = &line_ranges[i];
+                        let ms = mr.start.max(r.start).min(r.end) - r.start;
+                        let me = mr.end.max(r.start).min(r.end) - r.start;
+                        if me > ms {
+                            let uw = &wl.unwrapped_layout;
+                            let mut segs = Vec::new();
+                            let mut seg_start = 0usize;
+                            for b in wl.wrap_boundaries() {
+                                let seg_end = boundary_byte(wl, b);
+                                segs.push((seg_start, seg_end));
+                                seg_start = seg_end;
+                            }
+                            segs.push((seg_start, wl.len()));
+                            for (seg_s, seg_e) in segs {
+                                let a = ms.max(seg_s);
+                                let b = me.min(seg_e);
+                                if b > a {
+                                    let seg_x0 = uw.x_for_index(seg_s);
+                                    let x0 = uw.x_for_index(a) - seg_x0;
+                                    let x1 = uw.x_for_index(b) - seg_x0;
+                                    let quad = fill(
+                                        Bounds::from_corners(
+                                            point(
+                                                bounds.left() + x0,
+                                                y + line_height - px(2.5),
+                                            ),
+                                            point(
+                                                bounds.left() + x1,
+                                                y + line_height - px(1.),
+                                            ),
+                                        ),
+                                        rgba(0x2563ebcc),
+                                    );
+                                    window.paint_quad(quad);
+                                }
+                            }
                         }
                     }
                 }
@@ -1524,5 +1922,61 @@ mod tests {
         });
         // 在"b"之后做新编辑，会丢弃被撤销的部分，redo 应彻底失效
         assert!(h.redo().is_none());
+    }
+
+    #[test]
+    fn word_boundary_ascii() {
+        let s = "hello world"; // 0..5=hello, 6..11=world
+        assert_eq!(previous_word_boundary_in(s, 0), 0);
+        assert_eq!(previous_word_boundary_in(s, 2), 0); // 词中
+        assert_eq!(previous_word_boundary_in(s, 5), 0); // 空白处 → 前一个词 "hello"
+        assert_eq!(previous_word_boundary_in(s, 6), 6); // "world" 词首（词字符，原地）
+        assert_eq!(previous_word_boundary_in(s, 8), 6); // 词中
+        assert_eq!(previous_word_boundary_in(s, 11), 6); // 文末
+
+        assert_eq!(next_word_boundary_in(s, 0), 5);
+        assert_eq!(next_word_boundary_in(s, 2), 5);
+        assert_eq!(next_word_boundary_in(s, 5), 6);
+        assert_eq!(next_word_boundary_in(s, 6), 11);
+        assert_eq!(next_word_boundary_in(s, 8), 11);
+        assert_eq!(next_word_boundary_in(s, 11), 11);
+    }
+
+    #[test]
+    fn word_boundary_punctuation() {
+        let s = "abc,def"; // ',' 不是词字符
+        assert_eq!(previous_word_boundary_in(s, 7), 4); // "def" 起点
+        assert_eq!(previous_word_boundary_in(s, 4), 4);
+        assert_eq!(previous_word_boundary_in(s, 3), 0); // 逗号处 → "abc" 起点
+        assert_eq!(next_word_boundary_in(s, 0), 3); // "abc" 终点
+        assert_eq!(next_word_boundary_in(s, 3), 4); // 逗号 → "def" 起点
+        assert_eq!(next_word_boundary_in(s, 7), 7);
+    }
+
+    #[test]
+    fn word_boundary_cjk() {
+        let s = "你好 世界"; // 你0..3 好3..6, ' '6, 世7..10 界10..13
+        assert_eq!(previous_word_boundary_in(s, 4), 0);
+        assert_eq!(previous_word_boundary_in(s, 6), 0); // 空白→"你好"起点
+        assert_eq!(previous_word_boundary_in(s, 10), 7); // "世界"起点
+        assert_eq!(previous_word_boundary_in(s, 13), 7);
+
+        assert_eq!(next_word_boundary_in(s, 0), 6); // "你好"终点
+        assert_eq!(next_word_boundary_in(s, 6), 7); // 空白→"世界"起点
+        assert_eq!(next_word_boundary_in(s, 7), 13);
+    }
+
+    #[test]
+    fn grapheme_boundary_dance() {
+        let s = "a🏳️‍🌈b"; // 旗帜 emoji 是复合字素
+        let b1 = next_grapheme_boundary(s, 0); // 'a' 之后
+        assert_eq!(&s[0..b1], "a");
+        let b2 = next_grapheme_boundary(s, b1); // 旗帜之后
+        assert_eq!(&s[b1..b2], "🏳️‍🌈");
+        let b3 = next_grapheme_boundary(s, b2); // 'b' 之后
+        assert_eq!(&s[b2..b3], "b");
+        assert_eq!(next_grapheme_boundary(s, b3), b3);
+        assert_eq!(previous_grapheme_boundary(s, b1), 0);
+        assert_eq!(previous_grapheme_boundary(s, b2), b1);
     }
 }
