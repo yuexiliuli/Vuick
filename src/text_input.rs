@@ -1354,6 +1354,48 @@ fn boundary_byte(wl: &WrappedLine, b: &WrapBoundary) -> usize {
         .unwrap_or(wl.len())
 }
 
+/// 计算某逻辑行内、行内字节区间 `[sel_start, sel_end)` 的选区（或下划线）矩形。
+///
+/// 返回的矩形**相对该逻辑行的可视原点 (0,0)**：换行后第 k 个片段画在第 k 个可视行，
+/// 因此 `y = line_height * k`，`x` 为该片段内的偏移。绘制时只需再加上行原点与
+/// `bounds.left()`。
+///
+/// ⚠️ 必须逐片段按行号下移 y：GPUI 的 `paint_line` 在遇到换行边界时执行
+/// `glyph_origin.y += line_height`（见 gpui `text_system/line.rs`）来堆叠片段，
+/// 若高亮矩形不跟着下移，就会全部叠在第一可视行上（历史显示 bug：
+/// Ctrl+A / 鼠标拖选跨多行时只有第一行显示高亮，实际选区是正确的）。
+fn selection_rects_in_line(
+    wl: &WrappedLine,
+    line_height: Pixels,
+    sel_start: usize,
+    sel_end: usize,
+) -> Vec<Bounds<Pixels>> {
+    let uw = &wl.unwrapped_layout;
+    // 依次枚举各换行片段（行内字节区间）
+    let mut segs: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    for b in wl.wrap_boundaries() {
+        let seg_end = boundary_byte(wl, b);
+        segs.push((seg_start, seg_end));
+        seg_start = seg_end;
+    }
+    segs.push((seg_start, wl.len()));
+
+    let mut rects = Vec::new();
+    for (row, (seg_s, seg_e)) in segs.iter().enumerate() {
+        let a = sel_start.max(*seg_s);
+        let b = sel_end.min(*seg_e);
+        if b > a {
+            let seg_x0 = uw.x_for_index(*seg_s);
+            let x0 = uw.x_for_index(a) - seg_x0;
+            let x1 = uw.x_for_index(b) - seg_x0;
+            let y0 = line_height * row as f32;
+            rects.push(Bounds::from_corners(point(x0, y0), point(x1, y0 + line_height)));
+        }
+    }
+    rects
+}
+
 /// 用指定换行宽度 shape 当前内容并缓存到实体里，返回内容可视 (宽, 高)。
 fn shape_and_cache(
     input: &Entity<TextInput>,
@@ -1578,41 +1620,24 @@ impl Element for TextElement {
         for (i, wl) in lines.iter().enumerate() {
             let y = bounds.top() + offsets[i];
 
-            // 选区高亮：把选区与该行的各个换行片段求交，分别画半透明蓝色矩形
+            // 选区高亮：把选区与该行的各个换行片段求交，逐可视行画半透明蓝色矩形
             if !selected_range.is_empty() && i < line_ranges.len() {
                 let r = &line_ranges[i];
                 // 先夹到本行区间内，避免选区起始/终点落在别的行时减法下溢
                 let sel_start = selected_range.start.max(r.start).min(r.end) - r.start;
                 let sel_end = selected_range.end.max(r.start).min(r.end) - r.start;
-                if sel_end > sel_start {
-                    let uw = &wl.unwrapped_layout;
-                    // 依次枚举各换行片段（字节区间）
-                    let mut segs = Vec::new();
-                    let mut seg_start = 0usize;
-                    for b in wl.wrap_boundaries() {
-                        let seg_end = boundary_byte(wl, b);
-                        segs.push((seg_start, seg_end));
-                        seg_start = seg_end;
-                    }
-                    segs.push((seg_start, wl.len()));
-                    for (seg_s, seg_e) in segs {
-                        let a = sel_start.max(seg_s);
-                        let b = sel_end.min(seg_e);
-                        if b > a {
-                            // 视觉 x = 行内 x - 本片段起始 x
-                            let seg_x0 = uw.x_for_index(seg_s);
-                            let x0 = uw.x_for_index(a) - seg_x0;
-                            let x1 = uw.x_for_index(b) - seg_x0;
-                            let quad = fill(
-                                Bounds::from_corners(
-                                    point(bounds.left() + x0, y),
-                                    point(bounds.left() + x1, y + line_height),
-                                ),
-                                rgba(0x3311ff30),
-                            );
-                            window.paint_quad(quad);
-                        }
-                    }
+                for rect in selection_rects_in_line(wl, line_height, sel_start, sel_end) {
+                    let quad = fill(
+                        Bounds::from_corners(
+                            point(bounds.left() + rect.origin.x, y + rect.origin.y),
+                            point(
+                                bounds.left() + rect.origin.x + rect.size.width,
+                                y + rect.origin.y + rect.size.height,
+                            ),
+                        ),
+                        rgba(0x3311ff30),
+                    );
+                    window.paint_quad(quad);
                 }
             }
 
@@ -1624,39 +1649,22 @@ impl Element for TextElement {
                         let r = &line_ranges[i];
                         let ms = mr.start.max(r.start).min(r.end) - r.start;
                         let me = mr.end.max(r.start).min(r.end) - r.start;
-                        if me > ms {
-                            let uw = &wl.unwrapped_layout;
-                            let mut segs = Vec::new();
-                            let mut seg_start = 0usize;
-                            for b in wl.wrap_boundaries() {
-                                let seg_end = boundary_byte(wl, b);
-                                segs.push((seg_start, seg_end));
-                                seg_start = seg_end;
-                            }
-                            segs.push((seg_start, wl.len()));
-                            for (seg_s, seg_e) in segs {
-                                let a = ms.max(seg_s);
-                                let b = me.min(seg_e);
-                                if b > a {
-                                    let seg_x0 = uw.x_for_index(seg_s);
-                                    let x0 = uw.x_for_index(a) - seg_x0;
-                                    let x1 = uw.x_for_index(b) - seg_x0;
-                                    let quad = fill(
-                                        Bounds::from_corners(
-                                            point(
-                                                bounds.left() + x0,
-                                                y + line_height - px(2.5),
-                                            ),
-                                            point(
-                                                bounds.left() + x1,
-                                                y + line_height - px(1.),
-                                            ),
-                                        ),
-                                        rgba(0x2563ebcc),
-                                    );
-                                    window.paint_quad(quad);
-                                }
-                            }
+                        for rect in selection_rects_in_line(wl, line_height, ms, me) {
+                            // 下划线同样要跟随换行片段逐可视行下移（rect.origin.y 已是行内偏移）
+                            let quad = fill(
+                                Bounds::from_corners(
+                                    point(
+                                        bounds.left() + rect.origin.x,
+                                        y + rect.origin.y + line_height - px(2.5),
+                                    ),
+                                    point(
+                                        bounds.left() + rect.origin.x + rect.size.width,
+                                        y + rect.origin.y + line_height - px(1.),
+                                    ),
+                                ),
+                                rgba(0x2563ebcc),
+                            );
+                            window.paint_quad(quad);
                         }
                     }
                 }
@@ -2042,5 +2050,62 @@ mod tests {
             Some(content_h),
             "布局高度必须等于绘制内容高度（当前存在底部空白：bounds={bounds_h:?} vs content={content_h:?}, wrap={wrap_w:?})"
         );
+    }
+
+    // ---- 回归：Ctrl+A / 鼠标拖选在换行后，每个可视行都要有高亮矩形 ----
+    #[gpui::test]
+    async fn wrapped_selection_highlights_each_visual_row(cx: &mut gpui::TestAppContext) {
+        // 两段超长连续文本（自动换行成多可视行）——对应报告里的 Ctrl+A / 鼠标全选
+        let long = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地玄黄宇宙洪荒";
+        let content = format!("{long}{long}\n{long}{long}");
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            TextInput::new(
+                cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(content),
+                true,
+            )
+        });
+        cx.simulate_resize(size(px(300.), px(400.)));
+        cx.run_until_parked();
+
+        let (lh, per_line) = cx.update(|_window, cx| {
+            let t = view.read(cx);
+            let lh = t.last_line_height;
+            let lines = t.last_layout.clone().unwrap_or_default();
+            let data: Vec<(usize, Vec<Pixels>)> = lines
+                .iter()
+                .map(|wl| {
+                    // 模拟 Ctrl+A 整行全选：每个换行片段都应产生一个高亮矩形
+                    let rects = selection_rects_in_line(wl, lh, 0, wl.len());
+                    (
+                        rects.len(),
+                        rects.iter().map(|r| r.origin.y).collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            (lh, data)
+        });
+
+        assert!(lh > px(0.));
+        assert!(per_line.len() >= 2, "应有两段逻辑行");
+        for (line_idx, (count, ys)) in per_line.iter().enumerate() {
+            assert!(
+                *count >= 2,
+                "第 {line_idx} 行在每个换行片段上都应有高亮矩形（历史 bug：全部叠在第一行）"
+            );
+            // 高亮矩形必须逐可视行下移 line_height（与 GPUI paint_line 堆叠片段一致）
+            assert!(
+                (ys[0] - px(0.)).abs() < px(0.5),
+                "第 {line_idx} 行首个高亮应在顶行，实际 {ys:?}"
+            );
+            for idx in 1..ys.len() {
+                let diff = ys[idx] - ys[idx - 1];
+                assert!(
+                    (diff - lh).abs() < px(0.5),
+                    "第 {line_idx} 行高亮应逐行下移 lh：ys={ys:?}"
+                );
+            }
+        }
     }
 }
