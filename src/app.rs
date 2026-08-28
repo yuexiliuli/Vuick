@@ -23,7 +23,8 @@ use gpui::{
 const INPUT_MAX_HEIGHT: Pixels = px(150.);
 
 use super::backend::DifyClient;
-use super::markdown::{render_markdown, MarkdownTheme};
+use super::markdown::{render_markdown_with_options, TableMode, MarkdownTheme};
+use super::scrollbar::TableScrollState;
 use super::input::{TextArea, TextInputEvent};
 
 /// 后台流式线程发往主线程的事件。
@@ -49,6 +50,8 @@ struct StreamState {
     question: String,
     thinking: String,
     answer: String,
+    /// 流式中表格的横向滚动（跨增量保持横向位置与拖拽状态）
+    table_scroll: TableScrollState,
 }
 
 pub struct ChatApp {
@@ -65,6 +68,10 @@ pub struct ChatApp {
     status_ok: bool,
     /// 消息区滚动句柄
     messages_scroll: gpui::ScrollHandle,
+    /// 表格超宽的处理方式（"自动换行" / "横向滚动"）
+    table_mode: TableMode,
+    /// 每个历史轮次各自的表格横向滚动状态（与 `messages` 对齐）
+    table_scrolls: Vec<TableScrollState>,
     /// 订阅（保持有效）
     _subscription: Option<Subscription>,
     focus_handle: FocusHandle,
@@ -104,6 +111,8 @@ impl ChatApp {
             status: SharedString::from("正在连接..."),
             status_ok: false,
             messages_scroll: gpui::ScrollHandle::new(),
+            table_mode: TableMode::Wrap,
+            table_scrolls: Vec::new(),
             _subscription: None,
             focus_handle,
         };
@@ -169,6 +178,7 @@ impl ChatApp {
             return;
         }
         self.messages.clear();
+        self.table_scrolls.clear();
         self.status = SharedString::from("已清空对话");
         self.status_ok = true;
         let client = self.client.clone();
@@ -264,6 +274,7 @@ impl ChatApp {
             question,
             thinking: String::new(),
             answer: String::new(),
+            table_scroll: TableScrollState::new(),
         });
         self.status = SharedString::from("正在深度思考...");
         self.status_ok = false;
@@ -302,6 +313,8 @@ impl ChatApp {
                 answer,
                 thinking_open: false,
             });
+            // 表格横向滚动句柄与 messages 对齐（流式阶段的句柄随之转入历史轮次）
+            self.table_scrolls.push(st.table_scroll);
         }
         self.messages_scroll.scroll_to_bottom();
     }
@@ -339,6 +352,37 @@ impl ChatApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this: &mut ChatApp, _ev, _window, cx| this.clear(cx)),
+            );
+
+        // 表格超宽处理方式切换：自动换行 / 横向滚动
+        let table_toggle = div()
+            .id("table-mode-toggle")
+            .px_3()
+            .h(px(30.))
+            .rounded_md()
+            .bg(white())
+            .border_1()
+            .border_color(rgb(0xd1d5db))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(12.))
+            .text_color(rgb(0x1f2328))
+            .cursor(CursorStyle::PointingHand)
+            .child(if self.table_mode == TableMode::Wrap {
+                "表格: 换行"
+            } else {
+                "表格: 滚动"
+            })
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut ChatApp, _ev, _window, cx| {
+                    this.table_mode = match this.table_mode {
+                        TableMode::Wrap => TableMode::Scroll,
+                        TableMode::Scroll => TableMode::Wrap,
+                    };
+                    cx.notify();
+                }),
             );
 
         div()
@@ -392,6 +436,7 @@ impl ChatApp {
                                 self.status.to_string()
                             }),
                     )
+                    .child(table_toggle)
                     .child(clear_btn),
             )
     }
@@ -476,7 +521,12 @@ impl ChatApp {
             .child(SharedString::from(question.to_owned()))
     }
 
-    fn render_turn(&mut self, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_turn(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let turn = &self.messages[index];
         let mut answer_block = div();
         if !turn.thinking.is_empty() {
@@ -519,7 +569,13 @@ impl ChatApp {
         }
         answer_block = answer_block
             .mt_2()
-            .child(render_markdown(&turn.answer));
+            .child(render_markdown_with_options(
+                &turn.answer,
+                &MarkdownTheme::light(),
+                self.table_mode,
+                self.table_scrolls.get(index),
+                Some(window),
+            ));
 
         div()
             .mb_4()
@@ -532,7 +588,7 @@ impl ChatApp {
             .child(answer_block)
     }
 
-    fn render_stream(&self) -> impl IntoElement {
+    fn render_stream(&self, window: &mut Window) -> impl IntoElement {
         if let Some(st) = &self.stream {
             let mut block = div().mt_2();
             if !st.thinking.is_empty() {
@@ -558,11 +614,17 @@ impl ChatApp {
                         .child("正在深度思考..."),
                 );
             }
-            block = block.child(render_markdown(if st.answer.is_empty() {
-                " "
-            } else {
-                &st.answer
-            }));
+            block = block.child(render_markdown_with_options(
+                if st.answer.is_empty() {
+                    " "
+                } else {
+                    &st.answer
+                },
+                &MarkdownTheme::light(),
+                self.table_mode,
+                Some(&st.table_scroll),
+                Some(window),
+            ));
             div()
                 .mb_4()
                 .child(
@@ -635,7 +697,11 @@ impl ChatApp {
             .child(sample)
     }
 
-    fn render_messages(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_messages(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let empty = self.messages.is_empty() && self.stream.is_none();
         let mut scroll = div()
             .id("messages")
@@ -649,11 +715,11 @@ impl ChatApp {
             scroll = scroll.child(self.render_empty_state(cx));
         } else {
             for i in 0..self.messages.len() {
-                scroll = scroll.child(self.render_turn(i, cx));
+                scroll = scroll.child(self.render_turn(i, window, cx));
             }
             if let Some(st) = &self.stream {
                 let _ = st;
-                scroll = scroll.child(self.render_stream());
+                scroll = scroll.child(self.render_stream(window));
             }
         }
         // 消息区 + 美化滚动条（并列一行，滚动条占据最右 12px 窄列）
@@ -668,7 +734,7 @@ impl ChatApp {
 }
 
 impl Render for ChatApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _theme = MarkdownTheme::light();
         div()
             .flex()
@@ -677,7 +743,7 @@ impl Render for ChatApp {
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
             .child(self.render_header(cx))
-            .child(self.render_messages(cx))
+            .child(self.render_messages(window, cx))
             .child(self.render_input_bar(cx))
     }
 }

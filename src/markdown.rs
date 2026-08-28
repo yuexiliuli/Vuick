@@ -7,9 +7,25 @@
 //! 渲染结果是一个 `Div`，可直接作为 `.child(...)` 使用。
 
 use gpui::{
-    div, font, px, rgb, rgba, AnyElement, Div, FontWeight, Hsla, IntoElement, ParentElement,
-    SharedString, Styled, StyledText, TextRun, UnderlineStyle,
+    div, font, px, rgb, rgba, AnyElement, Div, ElementId, FontWeight, Hsla, IntoElement,
+    InteractiveElement, ParentElement, Pixels, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, StyledText, TextRun, UnderlineStyle, Window,
 };
+use super::scrollbar::{horizontal_scrollbar, TableScrollState};
+
+/// 表格超宽时的处理方式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableMode {
+    /// 列按可用宽度等分，单元格内文本自动换行（不出现横向滚动）。
+    Wrap,
+    /// 列取内容自然宽度（各列等宽对齐），超出可用宽度时出现**可拖拽的横向滚动条**。
+    Scroll,
+}
+
+/// 单元格左右内边距（px_2 = 8px*2）——列宽测量时补上，避免文字顶到边框
+const CELL_H_PAD: Pixels = px(16.);
+/// 单元格左边框宽度（列宽测量时补上）
+const CELL_BORDER: Pixels = px(1.);
 
 /// 渲染配色（可整体定制明/暗主题）。
 pub struct MarkdownTheme {
@@ -527,7 +543,14 @@ fn render_spans_line(spans: &[Span], theme: &MarkdownTheme) -> StyledText {
     spans_to_styled(&text, spans, theme).into_element()
 }
 
-fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
+fn render_block(
+    block: &Block,
+    theme: &MarkdownTheme,
+    mode: TableMode,
+    scroll: Option<&TableScrollState>,
+    window: Option<&mut Window>,
+    table_idx: &mut usize,
+) -> AnyElement {
     match block {
         Block::Paragraph(lines) => {
             let mut d = div();
@@ -610,16 +633,47 @@ fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
             d.into_any_element()
         }
         Block::Table { headers, rows } => {
-            // 用真正的"网格"渲染：每行一个 flex 行，每个单元格 flex_1 等宽，
-            // 单元格内文本自动换行，避免整行拼成一个超长字符串导致横向溢出。
             let ncols = headers.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+            if ncols == 0 {
+                return div().into_any_element();
+            }
+
+            // 横向滚动模式：先量出每一列的最大内容宽度（含 padding + 边框），
+            // 全列单元格统一用该宽度 → 各列分割线严格对齐（Scroll 模式列宽不再按行各异）。
+            let mut col_widths: Vec<Pixels> = vec![px(0.); ncols];
+            if mode == TableMode::Scroll {
+                let mut window = window;
+                if let Some(wnd) = window.as_deref_mut() {
+                    let font_size = px(13.);
+                    for c in 0..ncols {
+                        let mut m = px(0.);
+                        for spans in std::iter::once(headers)
+                            .chain(rows.iter())
+                            .filter_map(|r| r.get(c))
+                        {
+                            let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+                            let st = spans_to_styled(&text, spans, theme);
+                            let lw = wnd
+                                .text_system()
+                                .shape_line(st.text, font_size, &st.runs, None)
+                                .width;
+                            let w = lw + CELL_H_PAD + CELL_BORDER;
+                            if w > m {
+                                m = w;
+                            }
+                        }
+                        col_widths[c] = m;
+                    }
+                }
+            }
+
+            // 单元格：统一 padding/字号/颜色；c>0 的列加左侧分割线（网格线）；表头加浅色底
             let render_cell = |c: usize,
                                row: &Vec<Vec<Span>>,
                                header: bool,
                                theme: &MarkdownTheme|
              -> Div {
                 let mut cell = div()
-                    .flex_1()
                     .px_2()
                     .py_1()
                     .text_size(px(13.))
@@ -627,11 +681,29 @@ fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
                 if header {
                     cell = cell.font_weight(FontWeight::SEMIBOLD).bg(theme.table_bg);
                 }
+                // 每一列之间画一条竖直分割线，让各列文字有齐平的参考线
+                if c > 0 {
+                    cell = cell.border_l_1().border_color(theme.blockquote_border);
+                }
+                match mode {
+                    TableMode::Wrap => {
+                        // 等宽列：flex_1 平分可用宽度，min_w(0) 允许收缩，文本自动换行
+                        cell = cell.flex_1().min_w(px(0.));
+                    }
+                    TableMode::Scroll => {
+                        // 列宽取自测量值（全列一致 → 对齐），nowrap 保证单行、表宽=内容宽
+                        cell = cell
+                            .w(col_widths[c])
+                            .flex_shrink_0()
+                            .whitespace_nowrap();
+                    }
+                }
                 if let Some(spans) = row.get(c) {
                     cell = cell.child(render_spans_line(spans, theme));
                 }
                 cell
             };
+
             let header_row = div()
                 .flex()
                 .flex_row()
@@ -647,7 +719,8 @@ fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
                         .children((0..ncols).map(|c| render_cell(c, row, false, theme)))
                 })
                 .collect();
-            div()
+            // 表格本体：外框 + 表头 + 数据行（网格线齐平）
+            let table_body = div()
                 .mt_1()
                 .mb_2()
                 .rounded_md()
@@ -655,8 +728,49 @@ fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
                 .border_color(theme.blockquote_border)
                 .overflow_hidden()
                 .child(header_row)
-                .children(data_rows)
-                .into_any_element()
+                .children(data_rows);
+
+            match mode {
+                TableMode::Wrap => table_body.into_any_element(),
+                TableMode::Scroll => {
+                    // 横向滚动：滚动容器用 flex 行（块级会把子元素钳制到容器宽，导致
+                    // 无法横向溢出），表格本体 flex_shrink_0 保持内容自然宽度，超宽时滚动。
+                    let state = scroll.cloned().unwrap_or_default();
+                    let handle = state.handle.clone();
+                    // stateful 需要一个全局（按父级作用域隔离）唯一的 id，按本消息内的
+                    // 表格序号生成，保证跨帧状态（横向位置）稳定
+                    let idx = *table_idx;
+                    *table_idx += 1;
+                    let scroller = div()
+                        .id(ElementId::Name(SharedString::from(format!("md-tbl-scroll-{idx}"))))
+                        .mt_1()
+                        .flex()
+                        .flex_row()
+                        .overflow_x_scroll()
+                        .track_scroll(&handle)
+                        // 滚轮消费：表格可横向滚动时，把滚轮定死在本表格（GPUI 内置横向
+                        // 滚动会先把它映射成横向滚动），并阻止向父级（消息区）冒泡，
+                        // 否则页面会跟着上下滚动；表格不可滚动时放行让页面正常滚动。
+                        .on_scroll_wheel({
+                            let handle = handle.clone();
+                            move |_event: &ScrollWheelEvent, _window, cx| {
+                                if handle.max_offset().width > px(0.) {
+                                    cx.stop_propagation();
+                                }
+                            }
+                        })
+                        .child(table_body.flex_shrink_0());
+                    div()
+                        .mt_0()
+                        .mb_2()
+                        .child(scroller)
+                        .child(horizontal_scrollbar(
+                            &state,
+                            ElementId::Name(SharedString::from(format!("md-tbl-hsb-{idx}"))),
+                        ))
+                        .into_any_element()
+                }
+            }
         }
         Block::Quote(spans) => div()
             .mt_1()
@@ -677,15 +791,38 @@ fn render_block(block: &Block, theme: &MarkdownTheme) -> AnyElement {
     }
 }
 
-/// 渲染为轻量 Markdown 的入口（用亮色主题）。
+/// 渲染为轻量 Markdown 的入口（用亮色主题；表格默认"自动换行"模式）。
+#[allow(dead_code)]
 pub fn render_markdown(md: &str) -> Div {
-    render_markdown_themed(md, &MarkdownTheme::light())
+    render_markdown_with_options(md, &MarkdownTheme::light(), TableMode::Wrap, None, None)
 }
 
 /// 使用自定义主题渲染 Markdown。
+#[allow(dead_code)]
 pub fn render_markdown_themed(md: &str, theme: &MarkdownTheme) -> Div {
+    render_markdown_with_options(md, theme, TableMode::Wrap, None, None)
+}
+
+/// 渲染 Markdown，并指定表格超宽时的处理方式。
+///
+/// - `scroll`：`TableMode::Scroll` 时提供表格的横向滚动（句柄 + 拖拽状态，调用方
+///   需为同一篇内容保存一个 [`TableScrollState`]，跨帧保持横向位置与拖拽）；
+/// - `window`：Scroll 模式下用量文本实际宽度来统一列宽（保证各列分割线对齐）；
+///   其它模式可传 `None`。
+pub fn render_markdown_with_options(
+    md: &str,
+    theme: &MarkdownTheme,
+    mode: TableMode,
+    scroll: Option<&TableScrollState>,
+    window: Option<&mut Window>,
+) -> Div {
     let blocks = parse_markdown(md);
-    let children: Vec<AnyElement> = blocks.iter().map(|b| render_block(b, theme)).collect();
+    let mut table_idx = 0usize;
+    let mut window = window;
+    let children: Vec<AnyElement> = blocks
+        .iter()
+        .map(|b| render_block(b, theme, mode, scroll, window.as_deref_mut(), &mut table_idx))
+        .collect();
     div()
         .flex()
         .flex_col()
@@ -739,5 +876,63 @@ mod tests {
             }
             other => panic!("应解析为表格: {other:?}"),
         }
+    }
+
+    /// 横向滚动模式下，超宽表格必须真实溢出容器（handle.max_offset.width>0），
+    /// 底部横向滚动条才会出现；否则说明表格被容器宽度钳制、没有横向滚动。
+    #[gpui::test]
+    async fn scroll_table_overflows_wide_container(cx: &mut gpui::TestAppContext) {
+        struct WideHost {
+            state: TableScrollState,
+        }
+        impl gpui::Render for WideHost {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let long: String = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(12);
+                let md = format!("| 列A | 很长的列B |\n| --- | --- |\n| 值 | {long} |");
+                div()
+                    .h(px(200.))
+                    .w(px(400.))
+                    .bg(gpui::rgb(0xffffff))
+                    .child(render_markdown_with_options(
+                        &md,
+                        &MarkdownTheme::light(),
+                        TableMode::Scroll,
+                        Some(&self.state),
+                        Some(window),
+                    ))
+            }
+        }
+
+        let (view, cx) = cx.add_window_view(|_window, _cx| WideHost {
+            state: TableScrollState::new(),
+        });
+        cx.simulate_resize(gpui::size(px(500.), px(400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let max_w = cx.update(|_window, cx| view.read(cx).state.handle.max_offset().width);
+        assert!(
+            max_w > px(0.),
+            "横向滚动模式下超宽表格应可横向滚动：max_offset.width={max_w:?}"
+        );
+        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值
+        let (bar_left, bar_bottom, viewport_w) = cx.update(|_window, cx| {
+            let b = view.read(cx).state.handle.bounds();
+            (b.left(), b.bottom(), b.size.width)
+        });
+        cx.simulate_click(
+            gpui::point(bar_left + viewport_w * 0.7, bar_bottom + px(6.)),
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let offset_x = cx.update(|_window, cx| view.read(cx).state.handle.offset().x);
+        assert!(
+            offset_x < px(-1.),
+            "点击横向滚动条应能把表格向右滚动：offset.x={offset_x:?}"
+        );
     }
 }
