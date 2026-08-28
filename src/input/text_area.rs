@@ -20,6 +20,7 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
@@ -77,8 +78,28 @@ pub struct TextArea {
     pub last_shaped_content: Option<SharedString>,
     /// 为 `last_layout` 缓存的换行宽度；宽度变化需重新排版
     pub last_wrap_width: Option<Pixels>,
+    /// **增量排版缓存**：每个"逻辑行"一个可直接复用的 [`WrappedLine`]（Arc 共享）。
+    ///
+    /// 上千行时，整文档重排（`shape_text` 全量）每敲一个字符都要走一遍 GPUI 的
+    /// 逐行 process_line（拆串/克隆/哈希），无论行是否变化都是 O(总行数) 的昂贵操作。
+    /// 这里按"前缀/后缀文本不变 → 直接复用 Arc，仅中间变更的行重新 shape"做增量，
+    /// 让打字/IME 只付出 O(变更行) 的排版代价（参照 Zed 编辑器的行级增量布局）。
+    line_cache: Option<LineCache>,
+    /// 为 `last_layout` 缓存的内容逻辑行区间（当前文本坐标系），供 `line_ranges()`
+    /// 复用，避免每次绘制/命中测试再对全文做一次 O(总字节) 的扫描切分。
+    cached_line_ranges: Option<Vec<Range<usize>>>,
+    /// （仅测试）最近一次排版实际重新 shape 的行数：用于验证"中段打字只重排少数行"。
+    #[cfg(test)]
+    pub reshaped_lines: usize,
     /// 绘制阶段记录的本控件布局边界（用于坐标换算）
     pub last_bounds: Option<Bounds<Pixels>>,
+    /// 规范排版字号（由 prepaint 相位记录）。
+    ///
+    /// 量布局相位里 `window.text_style()` 可能拿不到元素继承的 text_size（返回默认字号，
+    /// 而 prepaint 相位是正确的继承字号）——若两相位用不同字号排同样的内容，换行产生的
+    /// 可视行数会不同，导致"布局槽位高度 ≠ 绘制内容高度"（历史'底部空白'回归）。
+    /// 因此 measure 相位一律沿用 prepaint 记录的规范字号来排，保证两相位行数一致。
+    canonical_font_size: Option<Pixels>,
     /// 最后记录的行高（像素）
     pub last_line_height: Pixels,
     /// 每个逻辑行在其内容区内的可视 y 原点（相对 bounds.top()，未加滚动偏移）
@@ -120,7 +141,12 @@ impl TextArea {
             last_layout: None,
             last_shaped_content: None,
             last_wrap_width: None,
+            line_cache: None,
+            cached_line_ranges: None,
+            #[cfg(test)]
+            reshaped_lines: 0,
             last_bounds: None,
+            canonical_font_size: None,
             last_line_height: px(0.),
             last_visual_offsets: Vec::new(),
             last_content_height: px(0.),
@@ -515,22 +541,13 @@ impl TextArea {
     /// 获取当前内容的逻辑行字节区间列表（按 `\n` 切分）。
     /// 空内容也返回一个 `[0..0]`。
     pub fn line_ranges(&self) -> Vec<Range<usize>> {
-        let text = &self.content;
-        let mut ranges = Vec::new();
-        let mut start = 0;
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                ranges.push(start..i);
-                start = i + 1;
+        // 排版后复用缓存的切分结果（拖拽/点击/绘制每次调用都省一次全文扫描）
+        if let (Some(ranges), Some(shaped)) = (&self.cached_line_ranges, &self.last_shaped_content) {
+            if shaped == &self.content && !ranges.is_empty() {
+                return ranges.clone();
             }
         }
-        if start <= text.len() {
-            ranges.push(start..text.len());
-        }
-        if ranges.is_empty() {
-            ranges.push(0..0);
-        }
-        ranges
+        split_line_ranges(&self.content)
     }
 
     /// 行数（以逻辑行计，含换行展开前）。
@@ -1159,15 +1176,70 @@ impl gpui::EventEmitter<TextInputEvent> for TextArea {}
 
 // ==================== 工具函数 ====================
 
+/// 每个"逻辑行"一个换行排版的可复用缓存（供增量重排使用）。
+struct LineCache {
+    /// 与 `lines` 对齐的逻辑行字节区间（在该缓存对应的内容字符串坐标系里）
+    ranges: Vec<Range<usize>>,
+    /// 每"逻辑行"的 `WrappedLine`（Arc 共享，可整行复用）
+    lines: Vec<Arc<WrappedLine>>,
+    /// 排版时的源文本（内容或占位符），用于判断行级文本是否变化
+    content: SharedString,
+    /// 排版时的字号；字号变化 → 布局全部失效，必须全量重排
+    font_size: Pixels,
+    /// 排版时的换行宽度；宽度变化 → 布局全部失效
+    wrap_width: Option<Pixels>,
+}
+
+/// 把一个字符串按 `\n` 切分成逻辑行字节区间（空串也返回一个 `[0..0]`）。
+fn split_line_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            ranges.push(start..i);
+            start = i + 1;
+        }
+    }
+    if start <= text.len() {
+        ranges.push(start..text.len());
+    }
+    if ranges.is_empty() {
+        ranges.push(0..0);
+    }
+    ranges
+}
+
 /// 用指定换行宽度 shape 当前内容并缓存到实体里，返回内容可视 (宽, 高)。
+///
+/// **增量优化**：默认只对"文本发生变化的中段行"重新 shape——
+/// 先用前缀/后缀逐行比对，未变化的行直接复用缓存的 `Arc<WrappedLine>`；
+/// 只有中间变更的行才调用 GPUI 的 `shape_text`。上千行文档里打字/IME 的耗时
+/// 从 O(总行数) 降到 O(变更行数)（参照 Zed 编辑器的行级增量布局）。
+///
+/// `manage_cache`：只有 **prepaint 相位**（字体/行高/宽度为逻辑度量，真正绘制的对象）
+/// 才允许取走并更新 `line_cache`；**measure 相位**（量布局，字号等是设备像素度量）只
+/// 当帧量尺寸用，禁止改动缓存——否则 measure/prepaint 两个相位用不同字号交替写缓存，
+/// 会让增量判定永远 `font_eq=false`、每次输入都全量重建。
 fn shape_and_cache(
     input: &Entity<TextArea>,
     wrap_width: Option<Pixels>,
     window: &mut Window,
     cx: &mut App,
+    manage_cache: bool,
 ) -> (Pixels, Pixels) {
     let style = window.text_style();
-    let font_size = style.font_size.to_pixels(window.rem_size());
+    // 规范字号：prepaint 相位用自己的（正确继承的）字号；measure 相位沿用 prepaint 记录
+    // 的规范字号（量布局阶段 window.text_style() 可能拿不到继承的 text_size，直接用会与
+    // 绘制阶段的行数不一致 → 布局槽位高 ≠ 绘制内容高）。
+    let computed_font = style.font_size.to_pixels(window.rem_size());
+    let font_size = if manage_cache {
+        computed_font
+    } else {
+        input
+            .read(cx)
+            .canonical_font_size
+            .unwrap_or(computed_font)
+    };
     // 行高：**优先复用上一次 paint 阶段记录的逻辑行高**。
     // 历史 bug：在"量布局（request_measured_layout）"阶段调用 `window.line_height()`
     // 会返回放大了的（设备像素）行高；若在 measure 里用它 shape 并缓存，内容可视
@@ -1187,7 +1259,7 @@ fn shape_and_cache(
     // 空内容时绘制占位文本（半透明灰色），否则绘制真实内容。
     // 文本整体用**单个 TextRun**，避免按逻辑行切分 run 时在中文等多字节字符上
     // 与 DirectWrite 的字体回退分段产生错位（会引发 "not a char boundary" 崩溃）。
-    let (text, runs) = if content.is_empty() {
+    let (text, run) = if content.is_empty() {
         let run = TextRun {
             len: placeholder.len(),
             font: style.font(),
@@ -1196,7 +1268,7 @@ fn shape_and_cache(
             underline: None,
             strikethrough: None,
         };
-        (placeholder, vec![run])
+        (placeholder, run)
     } else {
         let run = TextRun {
             len: content.len(),
@@ -1206,26 +1278,133 @@ fn shape_and_cache(
             underline: None,
             strikethrough: None,
         };
-        (content.clone(), vec![run])
+        (content.clone(), run)
     };
 
-    let lines = window
-        .text_system()
-        .shape_text(text, font_size, &runs, wrap_width, None)
-        .unwrap_or_default()
-        .into_vec();
+    let new_ranges = split_line_ranges(&text);
+
+    // 取走旧缓存；仅 prepaint（manage_cache）才会走增量复用。
+    // 可复用的前提是"字号、换行宽度都没变"——内容允许变化（这正是要走增量 diff 的场景）。
+    let old_cache = if manage_cache {
+        input.update(cx, |i, _| i.line_cache.take())
+    } else {
+        None
+    };
+    let incremental_ok = manage_cache
+        && old_cache
+            .as_ref()
+            .is_some_and(|c| c.wrap_width == wrap_width && c.font_size == font_size);
+
+    let mut wrapped: Vec<Arc<WrappedLine>> = Vec::with_capacity(new_ranges.len());
+    // （仅测试）本轮实际重新 shape 的行数
+    #[cfg(test)]
+    let mut reshaped = 0usize;
+    if let Some(old) = old_cache.as_ref().filter(|_| incremental_ok) {
+        debug_assert_eq!(old.ranges.len(), old.lines.len());
+        // 1) 前缀匹配：从头部逐行比对，文本相同则复用
+        let mut keep = 0;
+        while keep < old.lines.len()
+            && keep < new_ranges.len()
+            && text[new_ranges[keep].clone()] == old.content[old.ranges[keep].clone()]
+        {
+            keep += 1;
+        }
+        // 2) 后缀匹配：从尾部逐行比对，文本相同则复用（编辑只影响中段）
+        let mut old_end = old.lines.len();
+        let mut new_end = new_ranges.len();
+        while old_end > keep
+            && new_end > keep
+            && text[new_ranges[new_end - 1].clone()]
+                == old.content[old.ranges[old_end - 1].clone()]
+        {
+            old_end -= 1;
+            new_end -= 1;
+        }
+        // 前缀行复用旧的排版 Arc
+        for j in 0..keep {
+            wrapped.push(old.lines[j].clone());
+        }
+        // 中段 [keep..new_end) 才真正重新 shape
+        for j in keep..new_end {
+            #[cfg(test)]
+            {
+                reshaped += 1;
+            }
+            let r = &new_ranges[j];
+            let line_text = SharedString::from(text[r.clone()].to_owned());
+            let line_run = TextRun {
+                len: r.end - r.start,
+                font: style.font(),
+                color: run.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_text(line_text, font_size, std::slice::from_ref(&line_run), wrap_width, None)
+                .unwrap_or_default();
+            wrapped.push(Arc::new(shaped.into_iter().next().unwrap_or_default()));
+        }
+        // 后缀行复用旧的排版 Arc（新行 [new_end..) 逐一对回旧行 [old_end..)）
+        for j in new_end..new_ranges.len() {
+            let old_idx = old_end + (j - new_end);
+            wrapped.push(old.lines[old_idx].clone());
+        }
+        debug_assert_eq!(wrapped.len(), new_ranges.len());
+    } else {
+        // 首次排版或字号/宽度变化：全量逐行 shape（每行仍是 GPUI 行级缓存内单次查找）
+        for r in &new_ranges {
+            #[cfg(test)]
+            {
+                reshaped += 1;
+            }
+            let line_text = SharedString::from(text[r.clone()].to_owned());
+            let line_run = TextRun {
+                len: r.end - r.start,
+                font: style.font(),
+                color: run.color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped = window
+                .text_system()
+                .shape_text(line_text, font_size, std::slice::from_ref(&line_run), wrap_width, None)
+                .unwrap_or_default();
+            wrapped.push(Arc::new(shaped.into_iter().next().unwrap_or_default()));
+        }
+        debug_assert_eq!(wrapped.len(), new_ranges.len());
+    }
 
     let (mut content_w, mut content_h) = (px(0.), px(0.));
-    for wl in &lines {
+    for wl in &wrapped {
         content_w = content_w.max(wl.width());
         content_h += line_height * (wl.wrap_boundaries().len() as f32 + 1.);
     }
-
     input.update(cx, |input, _| {
-        input.last_layout = Some(lines);
+        // 供绘制/命中测试消费的 `Vec<WrappedLine>` 只是便宜的浅克隆（Arc+SharedString）
+        input.last_layout = Some(wrapped.iter().map(|w| (**w).clone()).collect());
+        // 只有 prepaint 相位（manage_cache）才拥有并更新增量缓存
+        if manage_cache {
+            input.line_cache = Some(LineCache {
+                ranges: new_ranges,
+                lines: wrapped,
+                content: text,
+                font_size,
+                wrap_width,
+            });
+            input.cached_line_ranges = input.line_cache.as_ref().map(|c| c.ranges.clone());
+            input.canonical_font_size = Some(font_size);
+        }
         input.last_shaped_content = Some(content);
         input.last_wrap_width = wrap_width;
         input.last_line_height = line_height;
+        input.last_content_height = content_h;
+        #[cfg(test)]
+        {
+            input.reshaped_lines = reshaped;
+        }
     });
 
     (content_w, content_h)
@@ -1277,16 +1456,21 @@ impl Element for TextElement {
         // 长行顶到超宽），这样在限定宽度容器内文本才会自动换行、边框不会变长。
         style.min_size.width = relative(0.).into();
         let layout_id = window.request_measured_layout(style, move |known, available, window, cx| {
-            // 换行宽度：拿不到已知宽度时，用父级给的定义宽度
-            let wrap_width = known.width.or(match available.width {
-                AvailableSpace::Definite(x) => Some(x),
-                _ => None,
-            });
+            // 换行宽度：拿不到已知宽度时，用父级给的定义宽度；
+            // 若父级是"无界"查询（None，measure 相位常见），则沿用上一次真实排版宽度
+            // （避免把 prepaint 维护的规范换行布局当成无效而全量重建）。
+            let wrap_width = known
+                .width
+                .or(match available.width {
+                    AvailableSpace::Definite(x) => Some(x),
+                    _ => None,
+                })
+                .or(input.read(cx).last_wrap_width);
             // 关键：量布局阶段 `window.line_height()` 是设备像素（×DPI），而绘制阶段是
             // 逻辑像素（两者可差 1.3 倍）。若在 measure 里重新 shape 并用设备像素行高算高度，
             // 布局高度会永远大于文字实际高度 → 底部空白随行数增多。
-            // 因此优先复用 **prepaint 已用逻辑行高 shape 好的缓存**，仅在无缓存或宽度不匹配时
-            // 才现场 shape 兜底（首帧/中间测量用）。
+            // 因此在排版缓存与本次宽度一致时直接复用其几何；宽度真正变化（resize 等）时
+            // 才现场 shape 兜底（保证布局槽位高度与绘制内容一致，避免"底部空白"回归）。
             let cached_size = {
                 let e = input.read(cx);
                 if let (Some(lines), cw, lh) = (&e.last_layout, e.last_wrap_width, e.last_line_height) {
@@ -1309,7 +1493,8 @@ impl Element for TextElement {
             };
             let (content_w, content_h) = match cached_size {
                 Some((cw, ch)) => (cw, ch),
-                None => shape_and_cache(&input, wrap_width, window, cx),
+                // 量布局相位：只量尺寸，不接管增量缓存（缓存归 prepaint 维护）
+                None => shape_and_cache(&input, wrap_width, window, cx, false),
             };
             let width = wrap_width.unwrap_or(content_w);
             size(width, content_h)
@@ -1330,15 +1515,23 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> PrepaintState {
         let wrap_width = Some(bounds.size.width);
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let needs_reshape = {
             let input = self.input.read(cx);
+            // 增量缓存虽然只归 prepaint 维护，但 measure 相位（量布局）可能已把
+            // last_layout 更新到别的宽度/字号；此时缓存与"要绘制的内容"不一致，必须重建。
+            let cache_ok = input
+                .line_cache
+                .as_ref()
+                .map_or(false, |c| c.wrap_width == wrap_width && c.font_size == font_size);
             input.last_layout.is_none()
                 || input.last_shaped_content.as_ref() != Some(&input.content)
                 || input.last_wrap_width != wrap_width
                 || input.last_line_height != window.line_height()
+                || !cache_ok
         };
         if needs_reshape {
-            shape_and_cache(&self.input, wrap_width, window, cx);
+            shape_and_cache(&self.input, wrap_width, window, cx, true);
         }
         // 把缓存的行布局"取走"交给 paint（paint 结束后会再存回去）
         let lines = self
@@ -2053,5 +2246,85 @@ mod tests {
             (800..11000).contains(&cursor),
             "光标应落在所见滚动位置附近，实际 cursor={cursor}"
         );
+    }
+
+    // ---- 回归：上千行文档里在中段打字，增量排版应只重排"受影响的少数行"，
+    //      而不是整文档重排（否则每敲一个字符都是 O(总行数) 的耗时）----
+    #[gpui::test]
+    async fn typing_in_large_document_only_reshapes_few_lines(cx: &mut gpui::TestAppContext) {
+        let lines_n = 2000;
+        let content = (0..lines_n)
+            .map(|i| format!("第{i}行 一段用于压测的文本 fill-fill-fill xyz xyz xyz"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            TextArea::new(
+                cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(content.clone()),
+                true,
+            )
+        });
+        cx.simulate_resize(size(px(300.), px(400.)));
+        // 先把首帧排版稳定下来（首帧必然全量，之后的增量应以复用为主）
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 光标移到内容中段再输入一个字符：swap 的前缀/后缀行应当能整行复用
+        let mid = content.len() / 2;
+        view.update(cx, |t, cx| {
+            t.move_to(mid, cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (stable, _) = cx.update(|_window, cx| {
+            let before = view.read(cx).reshaped_lines;
+            (before, 0)
+        });
+        // 无编辑的若干帧内不应再做任何重排（避免 measure/prepaint 相位抖动触发整文档重建）
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let stable2 = cx.update(|_window, cx| view.read(cx).reshaped_lines);
+        // 在中段插入一个字符（与打字完全同一条代码路径：replace → notify → 重排）
+        cx.update(|window, cx| {
+            view.update(cx, |t, tc| {
+                t.replace_text_in_range(Some(mid..mid), "x", window, tc)
+            });
+        });
+        // 显式触发一次绘制（测试里 notify 不会自动重绘，需要 window.draw 驱动排版管线）
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        let after_typing = cx.update(|_window, cx| view.read(cx).reshaped_lines);
+        let (len_probe, cursor_probe) = cx.update(|_window, cx| {
+            let t = view.read(cx);
+            (t.content.len(), t.cursor_offset())
+        });
+
+        eprintln!(
+            "large-doc: stable={stable} stable2={stable2} after_typing={after_typing} lines={lines_n} len={len_probe} cursor={cursor_probe} mid={mid}"
+        );
+
+        assert_eq!(
+            stable, stable2,
+            "无编辑的帧不应触发重排（相位抖动导致整文档全量重建）：stable={stable} stable2={stable2}"
+        );
+        // 中段打字只应重排极少的行（通常 1~2 行）；若退化为整文档重排会≈lines_n
+        assert!(
+            after_typing < 8,
+            "中段打字应只重排少量行（增量缓存），实际 reshaped={after_typing}（共 {lines_n} 行；回退到整文档重排会≈{lines_n}）"
+        );
+        // 内容正确性：'x' 确实插入到了光标处
+        let (len_after, cursor) = cx.update(|_window, cx| {
+            let t = view.read(cx);
+            (t.content.len(), t.cursor_offset())
+        });
+        assert_eq!(len_after, content.len() + 1, "打字后内容只多一个字符");
+        assert_eq!(cursor, content.len() / 2 + 1, "光标应停在刚插入的字符之后");
     }
 }
