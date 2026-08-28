@@ -18,6 +18,7 @@
 //! 内部使用 [`gpui::WrappedLine`]（`shape_text` 产出）实现换行排版：
 //! 每个"逻辑行"（以 `\n` 分隔）会在宽度不足时被拆成多个"可视行"。
 
+use std::cell::RefCell;
 use std::ops::Range;
 
 use gpui::{
@@ -84,6 +85,10 @@ pub struct TextArea {
     pub last_visual_offsets: Vec<Pixels>,
     /// 全部内容的可视高度（含换行展开，像素）
     pub last_content_height: Pixels,
+    /// 滚动容器内容区顶部到文本内容顶部的几何偏移 pad（恒定，与滚动平移无关）。
+    /// 缓存后用于把"视口/鼠标"换算成"内容坐标"，彻底摆脱 paint bounds 是否被
+    /// 滚动平移的两可状态（历史疑难 bug：滚动后点击跳回顶部/错选）。
+    content_pad: RefCell<Option<Pixels>>,
 }
 
 impl TextArea {
@@ -119,6 +124,7 @@ impl TextArea {
             last_line_height: px(0.),
             last_visual_offsets: Vec::new(),
             last_content_height: px(0.),
+            content_pad: RefCell::new(None),
         }
     }
 
@@ -547,41 +553,81 @@ impl TextArea {
     }
 
     /// 把光标滚动到可见区域（若光标所在可视行在视口外，则滚到最近可见位置）。
+    ///
+    /// 全用**内容坐标**：视口顶 = 已向下滚动量 `ls`，视口底 = `ls + 视口高`。
+    /// 不读 paint bounds（避免其是否含滚动平移的两可性）。
     fn scroll_cursor_into_view(&self, _cx: &mut Context<Self>) {
-        let Some(bounds) = &self.last_bounds else {
-            return;
-        };
         let lh = self.last_line_height;
         if lh == px(0.) {
             return;
         }
-        let ranges = self.line_ranges();
-        let (line_idx, _) = self.line_col(self.cursor_offset());
-        let offsets = self.visual_offsets();
-        let line_off = if line_idx < offsets.len() {
-            offsets[line_idx]
-        } else {
-            px(0.)
-        };
-        let ls = (-self.scroll_handle.offset().y).max(px(0.));
         let viewport_h = self.scroll_handle.bounds().size.height;
         if viewport_h <= px(0.) {
             return;
         }
-        // 光标行上缘相对内容区
-        let ly = bounds.top() + line_off - ls;
-        if ly < bounds.top() {
-            // 上面不可见 → 滚上去
-            let new_scroll = (ls - (bounds.top() - ly)).max(px(0.));
-            self.scroll_handle
-                .set_offset(point(px(0.), -new_scroll));
-        } else if ly + lh > bounds.top() + viewport_h {
-            // 下面不可见 → 滚下去
-            let new_scroll = ls + (ly + lh - (bounds.top() + viewport_h));
-            self.scroll_handle
-                .set_offset(point(px(0.), -new_scroll));
+        let ls = self.scrolled();
+        let offsets = self.visual_offsets();
+        // 光标所在"可视行"的顶部：逻辑行顶 + 该行内换行后的可视行偏移。
+        // ⚠️ 只取逻辑行顶会忽略换行展开——单行超长文本只有一个逻辑行、行顶恒 0，
+        // 点击下方的可视行后这里永远判定"光标在上方"→ 视角跳回开头（历史 bug）。
+        let (line_idx, rel) = self.line_col(self.cursor_offset());
+        let line_top = offsets.get(line_idx).copied().unwrap_or(px(0.))
+            + self
+                .last_layout
+                .as_ref()
+                .and_then(|ls| ls.get(line_idx))
+                .and_then(|wl| {
+                    wl.position_for_index(rel.min(wl.len()), lh)
+                        .map(|p| p.y)
+                })
+                .unwrap_or(px(0.));
+        if line_top < ls {
+            // 光标在上方 → 上滚，使光标行顶贴住视口顶
+            let new_ls = line_top.max(px(0.));
+            self.scroll_handle.set_offset(point(px(0.), -new_ls));
+        } else if line_top + lh > ls + viewport_h {
+            // 光标在下方 → 下滚，使光标行底贴住视口底
+            let new_ls = (line_top + lh - viewport_h).max(px(0.));
+            self.scroll_handle.set_offset(point(px(0.), -new_ls));
         }
-        let _ = ranges;
+    }
+
+    /// 文本内容区顶部（内容 y=0）当前在屏幕上的 y。
+    ///
+    /// `content_top_screen = viewport.top() + pad`，其中 `pad`（滚动容器内容区顶部 →
+    /// 文本内容顶部的几何偏移，即外层容器的内边距）是常量，只在"未滚动"时用
+    /// `last_bounds.top() - viewport.top()` 测一次并缓存。
+    ///
+    /// 之后命中测试/滚动一律只用"容器视口 + 缓存 pad + 滚动量"，不再读 paint 的
+    /// `last_bounds.top()`——彻底摆脱"bounds 是否被滚动平移"的两可状态（历史疑难 bug：
+    /// 滚动后点击跳回顶部 / 误选 / 换行错位，且在不同环境下表现相反）。
+    fn content_top_screen(&self) -> Pixels {
+        let viewport_top = self.scroll_handle.bounds().top();
+        let pad = {
+            let cached = *self.content_pad.borrow();
+            match cached {
+                Some(p) => p,
+                None => {
+                    // 仅未滚动时测量可靠（平移量为 0，bounds 无论是否平移都一致）
+                    let p = if self.scroll_handle.offset().y >= px(0.) {
+                        self.last_bounds
+                            .as_ref()
+                            .map(|b| b.top() - viewport_top)
+                            .unwrap_or(px(0.))
+                    } else {
+                        px(0.)
+                    };
+                    *self.content_pad.borrow_mut() = Some(p);
+                    p
+                }
+            }
+        };
+        viewport_top + pad
+    }
+
+    /// 已向下滚动的量（>0）。
+    fn scrolled(&self) -> Pixels {
+        (-self.scroll_handle.offset().y).max(px(0.))
     }
 
     /// 每个逻辑行在其内容区内的可视 y 原点（相对 bounds.top()，未加滚动偏移）。
@@ -612,24 +658,21 @@ impl TextArea {
     }
 
     /// 根据屏幕坐标 y 判断点击落在哪个"逻辑行"（含换行展开）。
+    ///
+    /// 全部换算都在"内容坐标"（视口 + pad + 滚动量）里进行，详见
+    /// [`Self::content_top_screen`] 的坐标约定；不依赖 paint bounds 是否被平移。
     fn line_index_at_y(&self, position: Point<Pixels>) -> usize {
-        let Some(bounds) = &self.last_bounds else {
-            return 0;
-        };
-        let line_height = self.last_line_height;
-        if line_height == px(0.) {
+        if self.last_line_height == px(0.) {
             return 0;
         }
-        // `last_bounds` 来自 draw 回调，那里的 bounds 已被滚动容器的
-        // `element_offset` 平移过（即 bounds.top() 就是内容原点在屏幕上的 y）。
-        let y = position.y - bounds.top();
+        let content_y = (position.y - self.content_top_screen()) + self.scrolled();
         let lines = self.last_layout.as_ref();
         let mut acc = px(0.);
         let mut idx = 0;
         if let Some(lines) = lines {
             for (i, wl) in lines.iter().enumerate() {
-                let h = line_height * (wl.wrap_boundaries().len() as f32 + 1.);
-                if y < acc + h {
+                let h = self.last_line_height * (wl.wrap_boundaries().len() as f32 + 1.);
+                if content_y < acc + h {
                     return i;
                 }
                 acc += h;
@@ -977,27 +1020,27 @@ impl TextArea {
         if self.content.is_empty() {
             return 0;
         }
-        let Some(bounds) = &self.last_bounds else {
-            return 0;
-        };
-        // 超出文本区上下边界时分别折到开头/结尾（参考官方 examples/input.rs）
-        if position.y < bounds.top() {
-            return 0;
-        }
-        if position.y > bounds.bottom() {
-            return self.content.len();
-        }
         let Some(lines) = &self.last_layout else {
             return 0;
         };
         if lines.is_empty() {
             return 0;
         }
+        // 内容坐标 = 屏幕坐标 − 内容顶部 + 已向下滚动量（见 content_top_screen 约定）
+        let content_y = (position.y - self.content_top_screen()) + self.scrolled();
+        // 超出内容区上下边界时分别折到开头/结尾
+        if content_y < px(0.) {
+            return 0;
+        }
+        if content_y > self.wrapped_content_height() {
+            return self.content.len();
+        }
         let line_idx = self.line_index_at_y(position);
         let line = &lines[line_idx];
         let offsets = self.visual_offsets();
-        let y_in_line = position.y - (bounds.top() + offsets[line_idx]);
-        let point_in_line = gpui::point(position.x - bounds.left(), y_in_line);
+        let y_in_line = content_y - offsets[line_idx];
+        let x0 = self.last_bounds.as_ref().map(|b| b.left()).unwrap_or(px(0.));
+        let point_in_line = gpui::point(position.x - x0, y_in_line);
         let utf8 = match line
             .closest_index_for_position(point_in_line, self.last_line_height)
         {
@@ -1450,6 +1493,11 @@ impl Element for TextElement {
 
         // 把本次绘制所需的布局数据存回控件（paint 结束后保留给下一帧用量布局/命中测试用）
         self.input.update(cx, |input, _cx| {
+            // 趁"未滚动"时预热 pad 缓存（见 content_top_screen），让后续滚动后的
+            // 命中测试从一开始就精确，无需等用户到顶再点击。
+            if input.scroll_handle.offset().y >= px(0.) {
+                let _ = input.content_top_screen();
+            }
             input.last_layout = Some(lines);
             input.last_bounds = Some(bounds);
             input.last_line_height = line_height;
@@ -1539,11 +1587,12 @@ impl EntityInputHandler for TextArea {
         let offsets = self.visual_offsets();
         // 起点在该行换行布局内的像素位置（x、y 均相对该行可视区域）
         let pos = lines[start_line].position_for_index(range.start - r.start, line_height)?;
-        // y 需要叠加滚动偏移（bounds 来自滚动容器，坐标已平移）
+        // 内容 → 屏幕：y = 内容顶部（含滚动平移，见 content_top_screen）+ 内容坐标
+        let content_top = self.content_top_screen();
         Some(Bounds::new(
             point(
                 bounds.left() + pos.x,
-                bounds.top() + offsets[start_line] + pos.y + self.scroll_handle.offset().y,
+                content_top + offsets[start_line] + pos.y,
             ),
             size(px(2.), line_height),
         ))
@@ -1568,8 +1617,11 @@ impl EntityInputHandler for TextArea {
         let line_idx = self.line_index_at_y(point);
         let line = &lines[line_idx];
         let offsets = self.visual_offsets();
-        let y_in_line = point.y - (bounds.top() + offsets[line_idx]);
-        let point_in_line = gpui::point(point.x - bounds.left(), y_in_line);
+        // 内容坐标 = 屏幕坐标 − 内容顶部 + 已向下滚动量（与 index_for_mouse_position 一致）
+        let content_y = (point.y - self.content_top_screen()) + self.scrolled();
+        let y_in_line = content_y - offsets[line_idx];
+        let x0 = bounds.left();
+        let point_in_line = gpui::point(point.x - x0, y_in_line);
         let utf8 = match line.index_for_position(point_in_line, self.last_line_height) {
             Ok(i) => i,
             Err(i) => i,
@@ -1664,6 +1716,7 @@ impl TextArea {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext, StatefulInteractiveElement};
 
     #[test]
     fn history_undo_redo() {
@@ -1850,5 +1903,119 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- 复现：**单行**超长连续文本（无 \n，自动换行成多可视行）滚动后点击下方，
+    //      视角不应跳回开头（scroll_cursor_into_view 须按"可视行"而非"逻辑行顶"算）。
+    #[gpui::test]
+    async fn single_wrapped_line_click_stays_in_place(cx: &mut gpui::TestAppContext) {
+        let long: String = std::iter::repeat('x').take(4000).collect();
+        let (view, cx) = cx.add_window_view(|_window, cx| ScrolledHost::new(cx, long.into()));
+        // 滚到内容中部
+        view.update(cx, |host, cx| {
+            host.ta.update(cx, |t, _| {
+                t.scroll_handle.set_offset(point(px(0.), px(-900.)))
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 点视口中部偏下（对应的内容应在"滚动后所见"的中部，绝不近文首）
+        cx.simulate_click(point(px(10.), px(160.)), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let (cursor, scroll_after, content_h) = view.update(cx, |host, cx| {
+            let t = host.ta.read(cx);
+            (
+                t.cursor_offset(),
+                t.scroll_handle.offset().y,
+                t.last_content_height,
+            )
+        });
+        eprintln!(
+            "single-line: cursor={cursor} scroll_after={scroll_after:?} content_h={content_h:?}"
+        );
+        // 视角不得跳回开头（单行内容 1 个逻辑行，行顶恒 0，旧逻辑必然滚回顶部）
+        assert!(
+            scroll_after < px(-400.),
+            "单行滚动后点击，视角不应跳回开头：scroll_after={scroll_after:?}"
+        );
+        // 光标应落在大段内容中部（而非文首）
+        assert!(
+            cursor > 800,
+            "光标应落在所见滚动位置，实际 cursor={cursor}（修复前跳回 0）"
+        );
+    }
+
+    struct ScrolledHost {
+        ta: Entity<TextArea>,
+    }
+
+    impl ScrolledHost {
+        fn new(cx: &mut Context<Self>, content: SharedString) -> Self {
+            Self {
+                ta: cx.new(|cx| TextArea::new(cx.focus_handle(), "".into(), content, true)),
+            }
+        }
+    }
+
+    impl Render for ScrolledHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let handle = self.ta.read(cx).scroll_handle.clone();
+            div()
+                .id("scrolled-host")
+                .h(px(200.))
+                .w(px(300.))
+                .overflow_y_scroll()
+                .track_scroll(&handle)
+                .child(self.ta.clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn scrolled_click_stays_at_visible_position(cx: &mut gpui::TestAppContext) {
+        let long: String = std::iter::repeat('x').take(120).collect();
+        let content = (0..100)
+            .map(|_| long.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (view, cx) = cx.add_window_view(|_window, cx| ScrolledHost::new(cx, content.into()));
+        // 先滚动到内容中部以下，并跑多帧让滚动平移稳定落位（模拟真实 app 的稳态）
+        view.update(cx, |host, cx| {
+            host.ta.update(cx, |t, _| {
+                t.scroll_handle.set_offset(point(px(0.), px(-600.)))
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 视口高 200px：点击 y≈150px 处（滚动后所见的内容）
+        cx.simulate_click(point(px(10.), px(150.)), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        let (cursor, scroll_after, bounds_top_opt, content_h) = view.update(cx, |host, cx| {
+            let t = host.ta.read(cx);
+            (
+                t.cursor_offset(),
+                t.scroll_handle.offset().y,
+                t.last_bounds.as_ref().map(|b| b.top()),
+                t.last_content_height,
+            )
+        });
+        eprintln!(
+            "cursor={cursor} scroll_after={scroll_after:?} bounds_top={bounds_top_opt:?} content_h={content_h:?}"
+        );
+        // 视角不得跳回顶部（滚动偏移应基本保持）
+        assert!(
+            scroll_after < px(-400.),
+            "点击后视角不应跳回顶部：scroll_after={scroll_after:?}（修复前会跳到 -80 附近）"
+        );
+        // 光标应落在"滚动后可见的"内容里（而非文档开头；修复前错位到 cursor=227）
+        assert!(
+            (800..11000).contains(&cursor),
+            "光标应落在所见滚动位置附近，实际 cursor={cursor}"
+        );
     }
 }
