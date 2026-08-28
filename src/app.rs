@@ -883,12 +883,22 @@ impl Render for ChatApp {
         let _theme = MarkdownTheme::light();
         // Ctrl+C：输入框聚焦时由 TextArea 处理；否则复制回答区的当前选区（markdown 源码）
         let view = cx.entity();
+        // 鼠标在任意处松开都要清掉选择锚点：防止松开落在文本空隙时锚点残留，
+        // 导致之后只移动鼠标也会拉长选区（"不跟手"的一种表现）
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
+            .on_mouse_up(MouseButton::Left, cx.listener(move |this: &mut ChatApp, _ev, _window, _cx| {
+                for s in this.selections.iter() {
+                    *s.anchor.borrow_mut() = None;
+                }
+                if let Some(st) = &this.stream {
+                    *st.selection.anchor.borrow_mut() = None;
+                }
+            }))
             .on_action(move |action: &input::Copy, window, cx| {
                 let _ = view.update(cx, |this, cx| {
                     this.copy_answer_selection(action, window, cx)

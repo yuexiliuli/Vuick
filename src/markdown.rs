@@ -11,7 +11,7 @@ use gpui::{
     Element, ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement,
     InteractiveElement, LayoutId, MouseButton, ParentElement, Pixels, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, StyledText, Style, TextRun, UnderlineStyle,
-    Window,
+    Window, WrappedLine,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -624,45 +624,60 @@ impl SelectCtx {
     }
 }
 
-/// 一个文本叶子的排版缓存
-#[derive(Clone, Copy, Default)]
+/// 一个文本叶子的排版缓存（跨帧复用：同一宽度/字号下不再重复 shape/几何计算）。
+///
+/// 这是拖选"跟手"的关键：拖动时布局不变，measure/prepaint/paint 全部走缓存，
+/// 每帧只更新叶子在窗口中的坐标；只有宽度/字号真正变化才重新排一次。
+#[derive(Clone, Default)]
 pub struct LeafCache {
-    pub rows: usize,
-    pub line_height: Pixels,
+    /// 排版时的文本（内容变了必须重新排，防旧缓存画出旧文本）
+    pub text: SharedString,
     pub font_size: Pixels,
+    pub line_height: Pixels,
+    pub wrap: Pixels,
+    pub rows: usize,
+    /// 最近一次排版的单行结果（绘制直接复用，避免每帧再次 shape）
+    pub shaped: Option<WrappedLine>,
 }
 
-/// 一个文本叶子的屏上几何（命中测试用）
+impl LeafCache {
+    /// 宽度、字号、文本都一致才算"可用"，否则需要重新 shape。
+    fn matches(&self, wrap: Pixels, font_size: Pixels, text: &str) -> bool {
+        self.shaped.is_some()
+            && self.wrap == wrap
+            && self.font_size == font_size
+            && self.text.as_ref() == text
+    }
+}
+
+/// 一个文本叶子的屏上几何（命中测试用）。
+///
+/// 直接持有排版结果（`WrappedLine`，Arc 浅克隆），命中与高亮都走 GPUI 精确的
+/// `index_for_position`/`position_for_index`：`x` 超过行尾时返回结束索引，因此
+/// **行尾最后一个字也能被选中**；换行后各行坐标也按行内相对计算，天然正确。
 #[derive(Clone, Default)]
 pub struct LeafGeom {
     pub left: Pixels,
     pub top: Pixels,
     pub line_height: Pixels,
-    /// 每个可视行：(行顶相对叶子 y, 行内字符边界 [(叶子内字符偏移, x 相对叶子左缘)])
-    pub rows: Vec<(Pixels, Vec<(usize, Pixels)>)>,
+    /// 该叶子的文本（命中后用 byte→char 换算）
+    pub text: SharedString,
+    /// 最近一次排版结果（没有则退化为 0）
+    pub layout: Option<WrappedLine>,
 }
 
 impl LeafGeom {
-    /// 把窗口坐标 → 叶子内字符偏移。
+    /// 把窗口坐标 → 叶子内**字符偏移**（含行尾：落在最后一个字之后返回 len）。
     pub fn char_at(&self, point: &gpui::Point<Pixels>) -> usize {
-        let rel_y = point.y - self.top;
-        let rel_x = point.x - self.left;
-        let row_ix = if self.line_height > px(0.) {
-            ((rel_y / self.line_height).floor() as usize).clamp(0, self.rows.len().saturating_sub(1))
-        } else {
-            0
+        let Some(wl) = &self.layout else {
+            return 0;
         };
-        let xs = &self.rows.get(row_ix).map(|r| &r.1).cloned().unwrap_or_default();
-        // 最近的前置字符边界
-        let mut idx = 0usize;
-        for (c, x) in xs {
-            if *x <= rel_x {
-                idx = *c;
-            } else {
-                break;
-            }
-        }
-        idx
+        let rel = gpui::point(point.x - self.left, point.y - self.top);
+        let byte = match wl.index_for_position(rel, self.line_height) {
+            Ok(b) => b,
+            Err(b) => b,
+        };
+        char_at_byte(&self.text, byte)
     }
 }
 
@@ -842,21 +857,23 @@ impl Element for SelectText {
                 gpui::AvailableSpace::Definite(x) => Some(x),
                 _ => None,
             });
-            let (rows, lh, font_size) = {
-                let cache = ctx.cache.borrow().get(&start).copied();
-                if let Some(c) = cache {
-                    (c.rows, c.line_height, c.font_size)
-                } else {
+            let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+            // 命中缓存（宽度+字号一致）→ 不重新 shape，直接用上次的行数/行高
+            let cached = {
+                let c = ctx.cache.borrow();
+                c.get(&start)
+                    .filter(|lc| lc.matches(wrap_width.unwrap_or(px(0.)), font_size, &text))
+                    .map(|lc| (lc.rows, lc.line_height))
+            };
+            let (rows, lh) = match cached {
+                Some((r, l)) => (r, l),
+                None => {
                     // 首帧兜底：现场 shape（行高用与绘制一致的逻辑值，避免底部空白）
-                    let style = window.text_style();
-                    let font_size = style.font_size.to_pixels(window.rem_size());
-                    let lh = window.line_height();
                     let rows = shape_rows(&text, font_size, &runs, wrap_width, window);
-                    (rows, lh, font_size)
+                    (rows, window.line_height())
                 }
             };
             let w = wrap_width.unwrap_or(px(0.));
-            let _ = font_size;
             size(w, lh * rows as f32)
         });
         (layout_id, ())
@@ -875,51 +892,67 @@ impl Element for SelectText {
         let font_size = window.text_style().font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
         let wrap = bounds.size.width;
-        let rows = shape_rows(&self.data.text, font_size, &self.data.runs, Some(wrap), window);
+        let text = &self.data.text;
+        let runs = &self.data.runs;
+
+        // 布局没变：只更新屏上坐标（滚动时上下移动），跳过 shape 与几何计算
+        {
+            let c = self.ctx.cache.borrow_mut();
+            let reuse = c.get(&start).filter(|lc| lc.matches(wrap, font_size, text.as_ref()));
+            if let Some(lc) = reuse {
+                let lh = lc.line_height;
+                let mut g = self.ctx.geom.borrow_mut();
+                if let Some(gm) = g.get_mut(&start) {
+                    gm.left = bounds.left();
+                    gm.top = bounds.top();
+                } else {
+                    g.insert(
+                        start,
+                        LeafGeom {
+                            left: bounds.left(),
+                            top: bounds.top(),
+                            line_height: lh,
+                            text: text.clone(),
+                            layout: lc.shaped.clone(),
+                        },
+                    );
+                }
+                let _ = cx;
+                return;
+            }
+        }
+
+        // 需要重新 shape（宽度/字号变化或首帧）：排一次并缓存 WrappedLine + 几何
+        let shaped = window
+            .text_system()
+            .shape_text(text.clone(), font_size, runs, Some(wrap), None)
+            .ok()
+            .and_then(|v| v.into_iter().next());
+        let rows_count = shaped
+            .as_ref()
+            .map(|wl| wl.wrap_boundaries().len() + 1)
+            .unwrap_or(1);
         self.ctx.cache.borrow_mut().insert(
             start,
             LeafCache {
-                rows,
-                line_height,
+                text: text.clone(),
                 font_size,
+                line_height,
+                wrap,
+                rows: rows_count,
+                shaped: shaped.clone(),
             },
         );
-        // 屏上几何：每可视行的字符边界 x（基于 glyph 位置）
-        let mut geom = LeafGeom {
-            left: bounds.left(),
-            top: bounds.top(),
-            line_height,
-            rows: Vec::new(),
-        };
-        if let Some(wl) = window
-            .text_system()
-            .shape_text(self.data.text.clone(), font_size, &self.data.runs, Some(wrap), None)
-            .ok()
-            .and_then(|v| v.into_iter().next())
-        {
-            let boundaries = wl.wrap_boundaries();
-            let glyphs: Vec<(usize, Pixels)> = wl
-                .unwrapped_layout
-                .runs
-                .iter()
-                .flat_map(|r| r.glyphs.iter())
-                .map(|g| (char_at_byte(&self.data.text, g.index), g.position.x))
-                .collect();
-            for row in 0..rows {
-                let (start_g, end_g) = (
-                    if row == 0 {
-                        0
-                    } else {
-                        boundaries.get(row - 1).map(|b| b.glyph_ix).unwrap_or(glyphs.len())
-                    },
-                    boundaries.get(row).map(|b| b.glyph_ix).unwrap_or(glyphs.len()),
-                );
-                let xs: Vec<(usize, Pixels)> = glyphs[start_g.min(glyphs.len())..end_g.min(glyphs.len())].to_vec();
-                geom.rows.push((line_height * row as f32, xs));
-            }
-        }
-        let _ = cx;
-        self.ctx.geom.borrow_mut().insert(start, geom);
+        self.ctx.geom.borrow_mut().insert(
+            start,
+            LeafGeom {
+                left: bounds.left(),
+                top: bounds.top(),
+                line_height,
+                text: text.clone(),
+                layout: shaped,
+            },
+        );
     }
 
     fn paint(
@@ -934,11 +967,8 @@ impl Element for SelectText {
     ) {
         let start = self.data.stream_start;
         let len = self.data.char_len();
-        // 选区重叠
-        let sel = {
-            let s = self.ctx.selection.borrow();
-            s.clone()
-        };
+        // 选区重叠（流内 → 叶子内）
+        let sel = self.ctx.selection.borrow().clone();
         let (local_start, local_end) = match sel {
             Some(r) => (
                 r.start.saturating_sub(start).min(len),
@@ -946,56 +976,112 @@ impl Element for SelectText {
             ),
             None => (0, 0),
         };
-        // 高亮
+        // 高亮：按可视行切片，x 用 GPUI `position_for_index`（行内相对、自动处理行尾）
         if local_start < local_end {
             if let Some(geom) = self.ctx.geom.borrow().get(&start).cloned() {
-                for (y, xs) in &geom.rows {
-                    let Some((_, x0p)) = xs.iter().rev().find(|(c, _)| *c <= local_start) else {
-                        continue;
-                    };
-                    let x0 = *x0p;
-                    // 该行结束 x：最后一个不晚于 local_end 的边界，否则行尾
-                    let x1 = xs
-                        .iter()
-                        .rev()
-                        .find(|(c, _)| *c <= local_end)
-                        .map(|(_, x)| *x)
-                        .unwrap_or(x0 + px(200.));
-                    if x1 > x0 {
-                        window.paint_quad(
-                            gpui::fill(
-                                Bounds::new(
-                                    point(bounds.left() + x0, bounds.top() + *y),
-                                    size(x1 - x0, geom.line_height),
-                                ),
-                                rgba(0x93c5fd80),
-                            )
-                            .corner_radii(px(1.)),
-                        );
+                if let Some(wl) = &geom.layout {
+                    let lh = geom.line_height;
+                    let text = geom.text.clone();
+                    let bl = byte_for_char(&text, local_start);
+                    let br = byte_for_char(&text, local_end);
+                    let boundaries = wl.wrap_boundaries();
+                    let rows_count = boundaries.len() + 1;
+                    for r in 0..rows_count {
+                        let rs = if r == 0 {
+                            0
+                        } else {
+                            boundary_byte(wl, r - 1)
+                        };
+                        let re = if r == rows_count - 1 {
+                            wl.len()
+                        } else {
+                            boundary_byte(wl, r)
+                        };
+                        if bl < re && br > rs {
+                            let x0 = if bl <= rs {
+                                px(0.)
+                            } else {
+                                wl.position_for_index(bl, lh).map(|p| p.x).unwrap_or_default()
+                            };
+                            let x1 = if br >= re {
+                                wl.position_for_index(re, lh).map(|p| p.x).unwrap_or_default()
+                            } else {
+                                wl.position_for_index(br, lh).map(|p| p.x).unwrap_or_default()
+                            };
+                            if x1 > x0 {
+                                window.paint_quad(
+                                    gpui::fill(
+                                        Bounds::new(
+                                            point(geom.left + x0, geom.top + lh * r as f32),
+                                            size(x1 - x0, lh),
+                                        ),
+                                        rgba(0x93c5fd80),
+                                    )
+                                    .corner_radii(px(1.)),
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
-        // 文本
-        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-        let line_height = window.line_height();
-        let wrap = bounds.size.width;
-        if let Ok(lines) = window
-            .text_system()
-            .shape_text(self.data.text.clone(), font_size, &self.data.runs, Some(wrap), None)
-        {
-            if let Some(wl) = lines.into_iter().next() {
-                let _ = wl.paint(
-                    bounds.origin,
-                    line_height,
-                    gpui::TextAlign::Left,
-                    Some(bounds),
-                    window,
-                    cx,
-                );
+        // 文本：复用缓存里的 WrappedLine，不再每帧 shape
+        let (shaped, line_height) = {
+            let c = self.ctx.cache.borrow();
+            match c.get(&start) {
+                Some(lc) if lc.shaped.is_some() => (lc.shaped.clone(), lc.line_height),
+                _ => {
+                    let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+                    (
+                        window
+                            .text_system()
+                            .shape_text(
+                                self.data.text.clone(),
+                                font_size,
+                                &self.data.runs,
+                                Some(bounds.size.width),
+                                None,
+                            )
+                            .ok()
+                            .and_then(|v| v.into_iter().next()),
+                        window.line_height(),
+                    )
+                }
             }
+        };
+        if let Some(wl) = shaped {
+            let _ = wl.paint(
+                bounds.origin,
+                line_height,
+                gpui::TextAlign::Left,
+                Some(bounds),
+                window,
+                cx,
+            );
         }
     }
+}
+
+/// 第 i 条 wrap 边界处的**字节偏移**（下一行的起始字节）。
+fn boundary_byte(wl: &WrappedLine, i: usize) -> usize {
+    wl.wrap_boundaries()
+        .get(i)
+        .map(|b| {
+            wl.unwrapped_layout.runs[b.run_ix]
+                .glyphs
+                .get(b.glyph_ix)
+                .map(|g| g.index)
+                .unwrap_or(wl.len())
+        })
+        .unwrap_or(wl.len())
+}
+
+/// 字符偏移 → 字节偏移
+fn byte_for_char(text: &str, char_idx: usize) -> usize {
+    text.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len())
 }
 
 /// 字节偏移 → 字符偏移
@@ -1596,6 +1682,61 @@ mod tests {
         // 只选第一个"粗"的后半→实际选"粗"（0..1）：完整选粗 span → **粗**
         let only_bold = selected_markdown(md, &(0..1));
         assert_eq!(only_bold, "**粗**");
+    }
+
+    /// 行尾最后一个字也要能被选中/复制：命中测试在点击位置超过行尾时返回叶子长度，
+    /// 前后缀也不会丢字。用真实 GPUI 排版验证 `index_for_position` 语义。
+    #[gpui::test]
+    async fn leaf_hit_test_covers_line_end_char(cx: &mut gpui::TestAppContext) {
+        struct Probe;
+        impl gpui::Render for Probe {
+            fn render(
+                &mut self,
+                window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                let text = "SD-WAN组网建设";
+                let runs = vec![TextRun {
+                    len: text.len(),
+                    font: font(".SystemUIFont"),
+                    color: rgb(0x000000).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                let wl = window
+                    .text_system()
+                    .shape_text(text.into(), px(16.), &runs, Some(px(400.)), None)
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                let geom = LeafGeom {
+                    left: px(0.),
+                    top: px(0.),
+                    line_height: window.line_height(),
+                    text: text.into(),
+                    layout: Some(wl),
+                };
+                let len = text.chars().count();
+                // 点击远超行尾 → 结尾（len）
+                assert_eq!(
+                    geom.char_at(&gpui::point(px(1000.), px(1.))),
+                    len,
+                    "行尾最后一个字必须可选"
+                );
+                // 点击超出左缘 → 开头
+                assert_eq!(geom.char_at(&gpui::point(px(-1.), px(1.))), 0);
+                // 点击中段 → 落在范围内
+                let mid = geom.char_at(&gpui::point(px(30.), px(1.)));
+                assert!(mid > 0 && mid <= len);
+                div().id("probe")
+            }
+        }
+        let _view = cx.add_window_view(|_w, _c| Probe);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
     }
 
     /// 底部横向滚动条才会出现；否则说明表格被容器宽度钳制、没有横向滚动。
