@@ -7,10 +7,16 @@
 //! 渲染结果是一个 `Div`，可直接作为 `.child(...)` 使用。
 
 use gpui::{
-    div, font, px, rgb, rgba, AnyElement, Div, ElementId, FontWeight, Hsla, IntoElement,
-    InteractiveElement, ParentElement, Pixels, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, TextRun, UnderlineStyle, Window,
+    div, font, point, relative, size, px, rgb, rgba, AnyElement, App, Bounds, CursorStyle, Div,
+    Element, ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement,
+    InteractiveElement, LayoutId, MouseButton, ParentElement, Pixels, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, Style, TextRun, UnderlineStyle,
+    Window,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::rc::Rc;
 use super::scrollbar::{horizontal_scrollbar, TableScrollState};
 
 /// 表格超宽时的处理方式。
@@ -583,6 +589,513 @@ impl SpannedText {
     }
 }
 
+// ==================== 文本选择（鼠标拖选 + Ctrl+C 复制 markdown 源码） ====================
+
+/// 一条回答的选区共享状态（元素每帧重建，状态经 Rc 长期保留）。
+///
+/// 选区的坐标是"文本流"内的字符偏移——把整条回答按渲染顺序拼成一段文本，
+/// 每个文本叶子占其中一段；这样拖住跨过多个标题/段落/代码行也能连续选中，
+/// 而复制时再按各叶子的 markdown 标记还原成源码。
+pub struct SelectCtx {
+    /// 本条回答的标识（用于 Ctrl+C 定位）
+    pub turn: u64,
+    /// 点击回答区时把焦点移交到这里（根视图），使 Ctrl+C 走"复制选区"而非输入框
+    pub focus: gpui::FocusHandle,
+    /// 选择锚点（文本流字符偏移）
+    pub anchor: Rc<RefCell<Option<usize>>>,
+    /// 当前选区 [start, end)
+    pub selection: Rc<RefCell<Option<Range<usize>>>>,
+    /// 各文本叶子的排版缓存（stream_start -> 行数/行高/宽度），供 measure 复用逻辑行高
+    pub cache: Rc<RefCell<HashMap<usize, LeafCache>>>,
+    /// 各文本叶子最近一帧绘制时的屏上几何（供鼠标命中测试）
+    pub geom: Rc<RefCell<HashMap<usize, LeafGeom>>>,
+}
+
+impl SelectCtx {
+    pub fn new(turn: u64, focus: gpui::FocusHandle) -> Self {
+        Self {
+            turn,
+            focus,
+            anchor: Rc::new(RefCell::new(None)),
+            selection: Rc::new(RefCell::new(None)),
+            cache: Rc::new(RefCell::new(HashMap::new())),
+            geom: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+}
+
+/// 一个文本叶子的排版缓存
+#[derive(Clone, Copy, Default)]
+pub struct LeafCache {
+    pub rows: usize,
+    pub line_height: Pixels,
+    pub font_size: Pixels,
+}
+
+/// 一个文本叶子的屏上几何（命中测试用）
+#[derive(Clone, Default)]
+pub struct LeafGeom {
+    pub left: Pixels,
+    pub top: Pixels,
+    pub line_height: Pixels,
+    /// 每个可视行：(行顶相对叶子 y, 行内字符边界 [(叶子内字符偏移, x 相对叶子左缘)])
+    pub rows: Vec<(Pixels, Vec<(usize, Pixels)>)>,
+}
+
+impl LeafGeom {
+    /// 把窗口坐标 → 叶子内字符偏移。
+    pub fn char_at(&self, point: &gpui::Point<Pixels>) -> usize {
+        let rel_y = point.y - self.top;
+        let rel_x = point.x - self.left;
+        let row_ix = if self.line_height > px(0.) {
+            ((rel_y / self.line_height).floor() as usize).clamp(0, self.rows.len().saturating_sub(1))
+        } else {
+            0
+        };
+        let xs = &self.rows.get(row_ix).map(|r| &r.1).cloned().unwrap_or_default();
+        // 最近的前置字符边界
+        let mut idx = 0usize;
+        for (c, x) in xs {
+            if *x <= rel_x {
+                idx = *c;
+            } else {
+                break;
+            }
+        }
+        idx
+    }
+}
+
+/// 把一条回答的选区（文本流内偏移）还原成保留 markdown 格式的源码。
+///
+/// **字符级裁剪**：选中跨多个叶子时按渲染顺序以换行拼接；叶子内逐 span 裁剪——
+/// 一整段 span 被完整选中才还原其标记（`**加粗**`/`` `code` ``），只选中的一部分
+/// 输出纯文本子串，避免出现 `**半截**`。
+pub fn selected_markdown(md: &str, selection: &Range<usize>) -> String {
+    let blocks = parse_markdown(md);
+    let mut out = String::new();
+    let mut stream = 0usize;
+    for_each_text_leaf(&blocks, |spans| {
+        let len = spans.iter().map(|s| s.text.chars().count()).sum::<usize>();
+        let end_at = stream + len;
+        let (s, e) = (selection.start.max(stream), selection.end.min(end_at));
+        if s < e {
+            let (ls, le) = (s - stream, e - stream);
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            // 叶子内按 span 逐个裁剪
+            let mut si = 0usize;
+            for sp in spans {
+                let sp_len = sp.text.chars().count();
+                let se = si + sp_len;
+                let (os, oe) = (ls.max(si), le.min(se));
+                if os < oe {
+                    let sub: String = sp
+                        .text
+                        .chars()
+                        .skip(os - si)
+                        .take(oe - os)
+                        .collect();
+                    if os == si && oe == se {
+                        // 整段 span 完整选中 → 还原标记
+                        out.push_str(&span_markdown(sp, &sub));
+                    } else {
+                        out.push_str(&sub);
+                    }
+                }
+                si = se;
+            }
+        }
+        stream = end_at;
+    });
+    // 流里的断行零宽空格（break_long_runs 为代码/长词换行插入）不属于内容，剔除
+    out.replace('\u{200b}', "")
+}
+
+/// 单个片段 → markdown 源码（`text` 为最终要写入的内容）。
+fn span_markdown(sp: &Span, text: &str) -> String {
+    if sp.code {
+        format!("`{}`", text)
+    } else if sp.link || sp.bold || sp.italic || sp.strike {
+        let (left, right) = if sp.bold {
+            ("**", "**")
+        } else if sp.italic {
+            ("*", "*")
+        } else if sp.strike {
+            ("~~", "~~")
+        } else {
+            ("", "")
+        };
+        format!("{left}{text}{right}")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// 按渲染顺序遍历一条回答的每个文本叶子（顺序 = 文本流顺序）。
+fn for_each_text_leaf(blocks: &[Block], mut f: impl FnMut(&[Span])) {
+    for block in blocks {
+        match block {
+            Block::Paragraph(lines) => {
+                for line in lines {
+                    f(line);
+                }
+            }
+            Block::Heading { spans, .. } => f(spans),
+            Block::Code(code) => {
+                for line in code.split('\n') {
+                    // 与渲染端一致：代码行经 break_long_runs 插零宽断行点（否则流偏移错位）
+                    f(&[Span {
+                        text: break_long_runs(line),
+                        bold: false,
+                        italic: false,
+                        strike: false,
+                        code: false,
+                        link: false,
+                    }]);
+                }
+            }
+            Block::List { items, .. } => {
+                for item in items {
+                    f(item);
+                }
+            }
+            Block::Table { headers, rows } => {
+                for cell in headers {
+                    f(cell);
+                }
+                for row in rows {
+                    for cell in row {
+                        f(cell);
+                    }
+                }
+            }
+            Block::Quote(_) | Block::Hr => {}
+        }
+    }
+}
+
+/// 可选择的单行富文本叶子。
+///
+/// 布局/绘制与 `StyledText` 等价：量布局时用"逻辑行高"（`text_style.line_height`，
+/// 与绘制阶段一致）统一，先 shape 出可视行数再报尺寸；prepaint 排一次(更新几何供
+/// 命中测试)，paint 画选区高亮 + 文本。
+struct SelectText {
+    data: SelectLeafData,
+    ctx: Rc<SelectCtx>,
+}
+
+/// 叶子数据：文本 + 运行 + 在该条回答文本流中的起始字符偏移。
+struct SelectLeafData {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    stream_start: usize,
+}
+
+impl SelectLeafData {
+    fn char_len(&self) -> usize {
+        self.text.chars().count()
+    }
+}
+
+impl SelectText {
+    fn new(data: SelectLeafData, ctx: Rc<SelectCtx>) -> Self {
+        Self { data, ctx }
+    }
+}
+
+impl IntoElement for SelectText {
+    type Element = SelectText;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for SelectText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.min_size.width = relative(0.).into();
+        let start = self.data.stream_start;
+        let text = self.data.text.clone();
+        let runs = self.data.runs.clone();
+        let ctx = self.ctx.clone();
+        let layout_id = window.request_measured_layout(style, move |known, available, window, _cx| {
+            let wrap_width = known.width.or(match available.width {
+                gpui::AvailableSpace::Definite(x) => Some(x),
+                _ => None,
+            });
+            let (rows, lh, font_size) = {
+                let cache = ctx.cache.borrow().get(&start).copied();
+                if let Some(c) = cache {
+                    (c.rows, c.line_height, c.font_size)
+                } else {
+                    // 首帧兜底：现场 shape（行高用与绘制一致的逻辑值，避免底部空白）
+                    let style = window.text_style();
+                    let font_size = style.font_size.to_pixels(window.rem_size());
+                    let lh = window.line_height();
+                    let rows = shape_rows(&text, font_size, &runs, wrap_width, window);
+                    (rows, lh, font_size)
+                }
+            };
+            let w = wrap_width.unwrap_or(px(0.));
+            let _ = font_size;
+            size(w, lh * rows as f32)
+        });
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let start = self.data.stream_start;
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let wrap = bounds.size.width;
+        let rows = shape_rows(&self.data.text, font_size, &self.data.runs, Some(wrap), window);
+        self.ctx.cache.borrow_mut().insert(
+            start,
+            LeafCache {
+                rows,
+                line_height,
+                font_size,
+            },
+        );
+        // 屏上几何：每可视行的字符边界 x（基于 glyph 位置）
+        let mut geom = LeafGeom {
+            left: bounds.left(),
+            top: bounds.top(),
+            line_height,
+            rows: Vec::new(),
+        };
+        if let Some(wl) = window
+            .text_system()
+            .shape_text(self.data.text.clone(), font_size, &self.data.runs, Some(wrap), None)
+            .ok()
+            .and_then(|v| v.into_iter().next())
+        {
+            let boundaries = wl.wrap_boundaries();
+            let glyphs: Vec<(usize, Pixels)> = wl
+                .unwrapped_layout
+                .runs
+                .iter()
+                .flat_map(|r| r.glyphs.iter())
+                .map(|g| (char_at_byte(&self.data.text, g.index), g.position.x))
+                .collect();
+            for row in 0..rows {
+                let (start_g, end_g) = (
+                    if row == 0 {
+                        0
+                    } else {
+                        boundaries.get(row - 1).map(|b| b.glyph_ix).unwrap_or(glyphs.len())
+                    },
+                    boundaries.get(row).map(|b| b.glyph_ix).unwrap_or(glyphs.len()),
+                );
+                let xs: Vec<(usize, Pixels)> = glyphs[start_g.min(glyphs.len())..end_g.min(glyphs.len())].to_vec();
+                geom.rows.push((line_height * row as f32, xs));
+            }
+        }
+        let _ = cx;
+        self.ctx.geom.borrow_mut().insert(start, geom);
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut (),
+        _prepaint: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let start = self.data.stream_start;
+        let len = self.data.char_len();
+        // 选区重叠
+        let sel = {
+            let s = self.ctx.selection.borrow();
+            s.clone()
+        };
+        let (local_start, local_end) = match sel {
+            Some(r) => (
+                r.start.saturating_sub(start).min(len),
+                r.end.saturating_sub(start).min(len),
+            ),
+            None => (0, 0),
+        };
+        // 高亮
+        if local_start < local_end {
+            if let Some(geom) = self.ctx.geom.borrow().get(&start).cloned() {
+                for (y, xs) in &geom.rows {
+                    let Some((_, x0p)) = xs.iter().rev().find(|(c, _)| *c <= local_start) else {
+                        continue;
+                    };
+                    let x0 = *x0p;
+                    // 该行结束 x：最后一个不晚于 local_end 的边界，否则行尾
+                    let x1 = xs
+                        .iter()
+                        .rev()
+                        .find(|(c, _)| *c <= local_end)
+                        .map(|(_, x)| *x)
+                        .unwrap_or(x0 + px(200.));
+                    if x1 > x0 {
+                        window.paint_quad(
+                            gpui::fill(
+                                Bounds::new(
+                                    point(bounds.left() + x0, bounds.top() + *y),
+                                    size(x1 - x0, geom.line_height),
+                                ),
+                                rgba(0x93c5fd80),
+                            )
+                            .corner_radii(px(1.)),
+                        );
+                    }
+                }
+            }
+        }
+        // 文本
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let line_height = window.line_height();
+        let wrap = bounds.size.width;
+        if let Ok(lines) = window
+            .text_system()
+            .shape_text(self.data.text.clone(), font_size, &self.data.runs, Some(wrap), None)
+        {
+            if let Some(wl) = lines.into_iter().next() {
+                let _ = wl.paint(
+                    bounds.origin,
+                    line_height,
+                    gpui::TextAlign::Left,
+                    Some(bounds),
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+}
+
+/// 字节偏移 → 字符偏移
+fn char_at_byte(text: &str, byte: usize) -> usize {
+    text[..byte.min(text.len())].chars().count()
+}
+
+/// 单逻辑行 shape 返回可视行数
+fn shape_rows(
+    text: &str,
+    font_size: Pixels,
+    runs: &[TextRun],
+    wrap_width: Option<Pixels>,
+    window: &mut Window,
+) -> usize {
+    window
+        .text_system()
+        .shape_text(SharedString::from(text.to_owned()), font_size, runs, wrap_width, None)
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|wl| wl.wrap_boundaries().len() + 1)
+        .unwrap_or(1)
+}
+
+/// 一个片段序列的字符总数
+/// 生成一个可选中的文本叶子：内部是 [`SelectText`] 自绘元素，外层是一个带命中
+/// 测试与拖选的状态化 div。选区写入共享的 `ctx`（文本流内偏移）。
+fn render_selectable_spans(
+    spans: &[Span],
+    theme: &MarkdownTheme,
+    force_bold: bool,
+    sel: &Rc<SelectCtx>,
+    stream: &mut usize,
+) -> impl IntoElement {
+    let data = SelectLeafData {
+        text: SharedString::from(spans.iter().map(|s| s.text.as_str()).collect::<String>()),
+        runs: spans_to_styled(spans, theme, force_bold).runs,
+        stream_start: *stream,
+    };
+    let len = data.char_len();
+    *stream += len;
+
+    let ctx = sel.clone();
+    let start = data.stream_start;
+    let id = ElementId::Name(SharedString::from(format!("sel-{}-{}", sel.turn, start)));
+
+    div()
+        .id(id)
+        .min_w(px(0.))
+        .cursor(CursorStyle::IBeam)
+        .on_mouse_down(MouseButton::Left, {
+            let ctx = ctx.clone();
+            move |ev, window, _cx| {
+                // 把键盘焦点移交根视图：之后 Ctrl+C 由"复制选区"处理，而非输入框
+                window.focus(&ctx.focus);
+                let Some(g) = ctx.geom.borrow().get(&start).cloned() else {
+                    return;
+                };
+                let idx = g.char_at(&ev.position);
+                let global = start + idx;
+                let changed = *ctx.selection.borrow() != Some(global..global);
+                *ctx.anchor.borrow_mut() = Some(global);
+                *ctx.selection.borrow_mut() = Some(global..global);
+                if changed {
+                    window.refresh();
+                }
+            }
+        })
+        .on_mouse_move(
+            {
+                let ctx = ctx.clone();
+                move |ev, window, _cx| {
+                    let Some(anchor) = *ctx.anchor.borrow() else {
+                        return;
+                    };
+                    let Some(g) = ctx.geom.borrow().get(&start).cloned() else {
+                        return;
+                    };
+                    let idx = g.char_at(&ev.position);
+                    let cur = start + idx;
+                    let (a, b) = (anchor.min(cur), anchor.max(cur));
+                    let changed = *ctx.selection.borrow() != Some(a..b);
+                    if changed {
+                        *ctx.selection.borrow_mut() = Some(a..b);
+                        // 拖动过程中立即重绘，让选区高亮实时跟随鼠标
+                        window.refresh();
+                    }
+                }
+            },
+        )
+        .on_mouse_up(MouseButton::Left, {
+            let ctx = ctx.clone();
+            move |_ev, _window, _cx| {
+                *ctx.anchor.borrow_mut() = None;
+            }
+        })
+        .child(SelectText::new(data, ctx))
+}
+
+
 fn render_spans_line(spans: &[Span], theme: &MarkdownTheme) -> StyledText {
     render_spans_line_weighted(spans, theme, false)
 }
@@ -598,13 +1111,19 @@ fn render_block(
     mode: TableMode,
     scroll: Option<&TableScrollState>,
     window: Option<&mut Window>,
+    sel: Option<&Rc<SelectCtx>>,
+    stream: &mut usize,
     table_idx: &mut usize,
 ) -> AnyElement {
     match block {
         Block::Paragraph(lines) => {
             let mut d = div().min_w(px(0.));
             for line in lines {
-                d = d.child(render_spans_line(line, theme));
+                if let Some(sel) = sel {
+                    d = d.child(render_selectable_spans(line, theme, false, sel, stream));
+                } else {
+                    d = d.child(render_spans_line(line, theme));
+                }
             }
             d.mb_2().into_any_element()
         }
@@ -615,7 +1134,11 @@ fn render_block(
                 3 => px(16.),
                 _ => px(15.),
             };
-            let st = spans_to_styled(spans, theme, false).into_element();
+            let st = if let Some(sel) = sel {
+                render_selectable_spans(spans, theme, false, sel, stream).into_any_element()
+            } else {
+                spans_to_styled(spans, theme, false).into_element().into_any_element()
+            };
             div()
                 .mb_2()
                 .mt_1()
@@ -630,18 +1153,31 @@ fn render_block(
             let mut child = div().min_w(px(0.));
             for line in code.split('\n') {
                 let broken = break_long_runs(line);
-                let st = SpannedText {
-                    text: SharedString::from(broken.clone()),
-                    runs: vec![TextRun {
-                        len: broken.len(),
-                        font: font(theme.mono_family.clone()),
-                        color: theme.code_text,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                };
-                child = child.child(st.into_element());
+                if let Some(sel) = sel {
+                    // 代码行也纳入可选（同一文本流）
+                    let fake = &[Span {
+                        text: broken.clone(),
+                        bold: false,
+                        italic: false,
+                        strike: false,
+                        code: false,
+                        link: false,
+                    }];
+                    child = child.child(render_selectable_spans(fake, theme, false, sel, stream));
+                } else {
+                    let st = SpannedText {
+                        text: SharedString::from(broken.clone()),
+                        runs: vec![TextRun {
+                            len: broken.len(),
+                            font: font(theme.mono_family.clone()),
+                            color: theme.code_text,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                    };
+                    child = child.child(st.into_element());
+                }
             }
             child
                 .bg(rgb(0x0f172a))
@@ -680,7 +1216,16 @@ fn render_block(
                         ),
                 );
                 // 条目文本放进可收缩容器，超长不可断片段靠 break_long_runs 换行
-                row = row.child(div().flex_1().min_w(px(0.)).child(render_spans_line(item, theme)));
+                if let Some(sel) = sel {
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(render_selectable_spans(item, theme, false, sel, stream)),
+                    );
+                } else {
+                    row = row.child(div().flex_1().min_w(px(0.)).child(render_spans_line(item, theme)));
+                }
                 d = d.child(row);
             }
             d.into_any_element()
@@ -723,10 +1268,11 @@ fn render_block(
             }
 
             // 单元格：统一 padding/字号/颜色；c>0 的列加左侧分割线（网格线）；表头加浅色底
-            let render_cell = |c: usize,
-                               row: &Vec<Vec<Span>>,
-                               header: bool,
-                               theme: &MarkdownTheme|
+            // （捕获 sel/stream 使其为 FnMut）
+            let mut render_cell = |c: usize,
+                                   row: &Vec<Vec<Span>>,
+                                   header: bool,
+                                   theme: &MarkdownTheme|
              -> Div {
                 let mut cell = div()
                     .px_2()
@@ -754,8 +1300,11 @@ fn render_block(
                     }
                 }
                 if let Some(spans) = row.get(c) {
-                    // 表头：强行使 run 加粗（仅 div.font_weight 不会级联进带显式 font 的 run）
-                    if header {
+                    let force = header;
+                    if let Some(sel) = sel {
+                        cell = cell.child(render_selectable_spans(spans, theme, force, sel, stream));
+                    } else if force {
+                        // 表头：强行使 run 加粗（仅 div.font_weight 不会级联进带显式 font 的 run）
                         cell = cell.child(render_spans_line_weighted(spans, theme, true));
                     } else {
                         cell = cell.child(render_spans_line(spans, theme));
@@ -851,16 +1400,17 @@ fn render_block(
     }
 }
 
+/// 把 Markdown 源文本还原成便于复制/粘贴的**纯文本**（去标记语法，保留结构）：
 /// 渲染为轻量 Markdown 的入口（用亮色主题；表格默认"自动换行"模式）。
 #[allow(dead_code)]
 pub fn render_markdown(md: &str) -> Div {
-    render_markdown_with_options(md, &MarkdownTheme::light(), TableMode::Wrap, None, None)
+    render_markdown_with_options(md, &MarkdownTheme::light(), TableMode::Wrap, None, None, None)
 }
 
 /// 使用自定义主题渲染 Markdown。
 #[allow(dead_code)]
 pub fn render_markdown_themed(md: &str, theme: &MarkdownTheme) -> Div {
-    render_markdown_with_options(md, theme, TableMode::Wrap, None, None)
+    render_markdown_with_options(md, theme, TableMode::Wrap, None, None, None)
 }
 
 /// 渲染 Markdown，并指定表格超宽时的处理方式。
@@ -875,13 +1425,26 @@ pub fn render_markdown_with_options(
     mode: TableMode,
     scroll: Option<&TableScrollState>,
     window: Option<&mut Window>,
+    sel: Option<&Rc<SelectCtx>>,
 ) -> Div {
     let blocks = parse_markdown(md);
     let mut table_idx = 0usize;
+    let mut stream = 0usize;
     let mut window = window;
     let children: Vec<AnyElement> = blocks
         .iter()
-        .map(|b| render_block(b, theme, mode, scroll, window.as_deref_mut(), &mut table_idx))
+        .map(|b| {
+            render_block(
+                b,
+                theme,
+                mode,
+                scroll,
+                window.as_deref_mut(),
+                sel,
+                &mut stream,
+                &mut table_idx,
+            )
+        })
         .collect();
     div()
         .flex()
@@ -957,8 +1520,6 @@ mod tests {
         }
     }
 
-    /// 横向滚动模式下，超宽表格必须真实溢出容器（handle.max_offset.width>0），
-    /// 底部横向滚动条才会出现；否则说明表格被容器宽度钳制、没有横向滚动。
     /// 超长不可断片段（长 URL/长串）插入零宽空格以便换行；普通文本不受影响。
     #[test]
     fn break_long_runs_only_splits_long_unbroken_runs() {
@@ -983,6 +1544,61 @@ mod tests {
         );
     }
 
+    /// 横向滚动模式下，超宽表格必须真实溢出容器（handle.max_offset.width>0），
+    /// 选区复制：整篇选中时按叶还原标记（加粗/行内代码），跨块以换行拼接。
+    #[test]
+    fn selected_markdown_preserves_markup() {
+        let md = "# 标题\n\n**加粗** 和 `code`\n\n- 甲\n- 乙";
+        let blocks = parse_markdown(md);
+        let mut total = 0usize;
+        for_each_text_leaf(&blocks, |spans| {
+            total += spans.iter().map(|s| s.text.chars().count()).sum::<usize>();
+        });
+        let out = selected_markdown(md, &(0..total));
+        assert!(out.contains("**加粗**"), "加粗标记要保留: {out}");
+        assert!(out.contains("`code`"), "行内 code 标记要保留: {out}");
+        assert!(out.contains("标题"));
+        assert!(out.contains("甲"));
+        assert!(out.contains("乙"));
+    }
+
+    /// 选区只覆盖部分片段：按片段裁剪，未被选中的片段不进入结果。
+    #[test]
+    fn selected_markdown_partial_selection() {
+        let md = "一二三\n\n**甲**乙";
+        let out = selected_markdown(md, &(0..3));
+        assert!(out.contains("一二三"));
+        assert!(!out.contains("甲"), "选中只在一段时不应带出后面的片段: {out}");
+    }
+
+    /// 字符级裁剪：只选中加粗串的一部分时，不还原 `**`（避免半截标记）。
+    #[test]
+    fn selected_markdown_char_precision() {
+        // "**加粗加粗**" -> 叶子文本流 = "加粗加粗"（4 个字符）
+        let md = "**加粗加粗**";
+        // 选中间"粗加"（字符 1..3）
+        let out = selected_markdown(md, &(1..3));
+        assert_eq!(out, "粗加", "部分选中应只复制所选子串: {out}");
+        assert!(!out.contains("**"));
+        assert!(!out.contains("加粗加粗"));
+        // 整段全选 → 还原标记
+        let whole = selected_markdown(md, &(0..4));
+        assert_eq!(whole, "**加粗加粗**");
+    }
+
+    /// 跨多个 span：完整选中的 span 保留标记，部分选中的只取纯文本。
+    #[test]
+    fn selected_markdown_mixed_spans() {
+        let md = "**粗**加";
+        // 选"粗加"（字符 0..2）：粗 span 完整 → **粗**；加 span 完整 → 加
+        let out = selected_markdown(md, &(0..2));
+        assert_eq!(out, "**粗**加");
+        // 只选第一个"粗"的后半→实际选"粗"（0..1）：完整选粗 span → **粗**
+        let only_bold = selected_markdown(md, &(0..1));
+        assert_eq!(only_bold, "**粗**");
+    }
+
+    /// 底部横向滚动条才会出现；否则说明表格被容器宽度钳制、没有横向滚动。
     #[gpui::test]
     async fn scroll_table_overflows_wide_container(cx: &mut gpui::TestAppContext) {
         struct WideHost {
@@ -1006,6 +1622,7 @@ mod tests {
                         TableMode::Scroll,
                         Some(&self.state),
                         Some(window),
+                        None,
                     ))
             }
         }

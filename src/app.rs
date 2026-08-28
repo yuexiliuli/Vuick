@@ -1,4 +1,4 @@
-//! 应用主视图 `ChatApp`：AI 文档问答聊天界面。
+﻿//! 应用主视图 `ChatApp`：AI 文档问答聊天界面。
 //!
 //! 布局（自上而下）：
 //! - 顶部标题栏：标题 + 徽标 + 状态文字 + "清空"按钮
@@ -9,6 +9,7 @@
 //! 网络逻辑全部放到后台线程（[`backend::DifyClient`]），通过 `mpsc` + 轮询
 //! 把流式增量推回主线程渲染。
 
+use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::Duration;
 
@@ -23,9 +24,9 @@ use gpui::{
 const INPUT_MAX_HEIGHT: Pixels = px(150.);
 
 use super::backend::DifyClient;
-use super::markdown::{break_long_runs, render_markdown_with_options, TableMode, MarkdownTheme};
+use super::markdown::{break_long_runs, render_markdown_with_options, selected_markdown, SelectCtx, TableMode, MarkdownTheme};
 use super::scrollbar::TableScrollState;
-use super::input::{TextArea, TextInputEvent};
+use super::input::{self, TextArea, TextInputEvent};
 
 /// 后台流式线程发往主线程的事件。
 enum StreamEvent {
@@ -52,6 +53,15 @@ struct StreamState {
     answer: String,
     /// 流式中表格的横向滚动（跨增量保持横向位置与拖拽状态）
     table_scroll: TableScrollState,
+    /// 流式回答的选区状态
+    selection: Rc<SelectCtx>,
+}
+
+/// "复制"按钮的目标：某条回答 / 某条思考。
+#[derive(Clone, Copy)]
+enum CopyTarget {
+    Answer(usize),
+    Thinking(usize),
 }
 
 pub struct ChatApp {
@@ -72,6 +82,10 @@ pub struct ChatApp {
     table_mode: TableMode,
     /// 每个历史轮次各自的表格横向滚动状态（与 `messages` 对齐）
     table_scrolls: Vec<TableScrollState>,
+    /// 每个历史轮次的回答选区状态（与 `messages` 对齐）
+    selections: Vec<Rc<SelectCtx>>,
+    /// 回答/轮次的自增编号（保证选区 id 跨轮唯一）
+    next_turn: u64,
     /// 订阅（保持有效）
     _subscription: Option<Subscription>,
     focus_handle: FocusHandle,
@@ -113,6 +127,8 @@ impl ChatApp {
             messages_scroll: gpui::ScrollHandle::new(),
             table_mode: TableMode::Wrap,
             table_scrolls: Vec::new(),
+            selections: Vec::new(),
+            next_turn: 0,
             _subscription: None,
             focus_handle,
         };
@@ -172,6 +188,28 @@ impl ChatApp {
         window.focus(&self.input.read(cx).focus_handle.clone());
     }
 
+    /// 把某条历史回答的 **markdown 源码** 写入剪贴板（按钮/右键共用），并提示"已复制"。
+    fn copy_turn_answer(&mut self, index: usize, window: &mut Window, cx: &mut App) {
+        let Some(text) = self.messages.get(index).map(|t| t.answer.clone()) else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = SharedString::from("已复制（markdown）");
+        self.status_ok = true;
+        window.refresh();
+    }
+
+    /// 把某条历史思考的纯文本写入剪贴板。
+    fn copy_turn_thinking(&mut self, index: usize, window: &mut Window, cx: &mut App) {
+        let Some(text) = self.messages.get(index).map(|t| t.thinking.clone()) else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        self.status = SharedString::from("已复制思考");
+        self.status_ok = true;
+        window.refresh();
+    }
+
     /// 清空会话。
     fn clear(&mut self, cx: &mut Context<Self>) {
         if self.stream.is_some() {
@@ -179,6 +217,7 @@ impl ChatApp {
         }
         self.messages.clear();
         self.table_scrolls.clear();
+        self.selections.clear();
         self.status = SharedString::from("已清空对话");
         self.status_ok = true;
         let client = self.client.clone();
@@ -270,11 +309,15 @@ impl ChatApp {
     }
 
     fn busy_begin(&mut self, question: String, cx: &mut Context<Self>) {
+        let turn = self.next_turn;
+        self.next_turn += 1;
+        let selection = Rc::new(SelectCtx::new(turn, self.focus_handle.clone()));
         self.stream = Some(StreamState {
             question,
             thinking: String::new(),
             answer: String::new(),
             table_scroll: TableScrollState::new(),
+            selection,
         });
         self.status = SharedString::from("正在深度思考...");
         self.status_ok = false;
@@ -315,8 +358,43 @@ impl ChatApp {
             });
             // 表格横向滚动句柄与 messages 对齐（流式阶段的句柄随之转入历史轮次）
             self.table_scrolls.push(st.table_scroll);
+            self.selections.push(st.selection);
         }
         self.messages_scroll.scroll_to_bottom();
+    }
+
+    /// Ctrl+C：把"当前所选"的 markdown 源码写入剪贴板。
+    ///
+    /// 输入框聚焦时（`input::Copy` 交由 TextArea 处理）自动让位。选区为空时
+    /// 兜底复制最新一条回答的 markdown 源码。
+    fn copy_answer_selection(&mut self, _: &input::Copy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.input.read(cx).focus_handle.clone().is_focused(window) {
+            return;
+        }
+        // 找最后一条带非空选区的历史回答
+        for i in (0..self.selections.len()).rev() {
+            let Some(turn) = self.messages.get(i) else {
+                continue;
+            };
+            let sel = self.selections[i].selection.borrow().clone();
+            if let Some(sel) = sel {
+                let copied = selected_markdown(&turn.answer, &sel);
+                if !copied.is_empty() {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied));
+                    self.status = SharedString::from("已复制所选（markdown）");
+                    self.status_ok = true;
+                    window.refresh();
+                    return;
+                }
+            }
+        }
+        // 兜底：最新一条回答的完整 markdown
+        if let Some(turn) = self.messages.last() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(turn.answer.clone()));
+            self.status = SharedString::from("已复制最新回答（markdown）");
+            self.status_ok = true;
+            window.refresh();
+        }
     }
 
     // ==================== 渲染 ====================
@@ -529,7 +607,17 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let turn = &self.messages[index];
-        let mut answer_block = div();
+        // 回答区容器：右键（次级鼠标键）整条复制到剪贴板
+        let mut answer_block = div()
+            .id(ElementId::Name(SharedString::from(format!("answer-{index}"))))
+            .min_w(px(0.))
+            .on_mouse_down(MouseButton::Right, {
+                let target = CopyTarget::Answer(index);
+                cx.listener(move |this: &mut ChatApp, _ev, window, cx| match target {
+                    CopyTarget::Answer(i) => this.copy_turn_answer(i, window, cx),
+                    CopyTarget::Thinking(i) => this.copy_turn_thinking(i, window, cx),
+                })
+            });
         if !turn.thinking.is_empty() {
             let open = turn.thinking_open;
             let toggle = div()
@@ -553,7 +641,21 @@ impl ChatApp {
                         cx.notify();
                     }),
                 );
-            answer_block = answer_block.child(toggle);
+            // 思考折叠行右侧带"复制"按钮
+            answer_block = answer_block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(toggle)
+                    .child(ChatApp::copy_button(
+                        cx,
+                        ElementId::Name(SharedString::from(format!("copy-thinking-{index}"))),
+                        "复制",
+                        CopyTarget::Thinking(index),
+                    )),
+            );
             if open {
                 answer_block = answer_block.child(
                     div()
@@ -569,15 +671,29 @@ impl ChatApp {
                 );
             }
         }
-        answer_block = answer_block
-            .mt_2()
-            .child(render_markdown_with_options(
-                &turn.answer,
-                &MarkdownTheme::light(),
-                self.table_mode,
-                self.table_scrolls.get(index),
-                Some(window),
-            ));
+        // 回答右上角：复制按钮
+        answer_block = answer_block.child(
+            div()
+                .flex()
+                .flex_row()
+                .justify_end()
+                .mt_2()
+                .mb_0()
+                .child(ChatApp::copy_button(
+                    cx,
+                    ElementId::Name(SharedString::from(format!("copy-answer-{index}"))),
+                    "⧉ 复制回答",
+                    CopyTarget::Answer(index),
+                )),
+        );
+        answer_block = answer_block.child(render_markdown_with_options(
+            &turn.answer,
+            &MarkdownTheme::light(),
+            self.table_mode,
+            self.table_scrolls.get(index),
+            Some(window),
+            self.selections.get(index),
+        ));
 
         div()
             .mb_4()
@@ -588,6 +704,31 @@ impl ChatApp {
                     .child(self.question_bubble(&turn.question)),
             )
             .child(answer_block)
+    }
+
+    /// 回答右上角：复制按钮
+    fn copy_button(
+        cx: &mut Context<ChatApp>,
+        id: ElementId,
+        label: &str,
+        target: CopyTarget,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .px_2()
+            .py_0()
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(rgb(0x9ca3af))
+            .hover(|this| this.text_color(rgb(0x2563eb)))
+            .cursor(CursorStyle::PointingHand)
+            .child(SharedString::from(label.to_owned()))
+            .on_mouse_up(MouseButton::Left, {
+                cx.listener(move |this: &mut ChatApp, _ev, window, cx| match target {
+                    CopyTarget::Answer(i) => this.copy_turn_answer(i, window, cx),
+                    CopyTarget::Thinking(i) => this.copy_turn_thinking(i, window, cx),
+                })
+            })
     }
 
     fn render_stream(&self, window: &mut Window) -> impl IntoElement {
@@ -627,6 +768,7 @@ impl ChatApp {
                 self.table_mode,
                 Some(&st.table_scroll),
                 Some(window),
+                Some(&st.selection),
             ));
             div()
                 .mb_4()
@@ -739,14 +881,22 @@ impl ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _theme = MarkdownTheme::light();
+        // Ctrl+C：输入框聚焦时由 TextArea 处理；否则复制回答区的当前选区（markdown 源码）
+        let view = cx.entity();
         div()
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
+            .on_action(move |action: &input::Copy, window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.copy_answer_selection(action, window, cx)
+                });
+            })
             .child(self.render_header(cx))
             .child(self.render_messages(window, cx))
             .child(self.render_input_bar(cx))
     }
 }
+
