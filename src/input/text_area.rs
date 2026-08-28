@@ -1,4 +1,4 @@
-//! 一个基于 GPUI 的最小多行文本输入控件（TextInput）。
+//! 一个基于 GPUI 的最小多行文本输入控件（TextArea）。
 //!
 //! 它照着官方 `input.rs` 示例扩展出来的，额外支持：
 //! - 多行内容（`allow_newlines` 控制是否允许换行）；开启 `submit_on_enter` 后
@@ -12,7 +12,7 @@
 //! - **长行自动换行**（按可用宽度 wrap，命中测试/光标定位均按换行后的可视行处理）。
 //!
 //! 对外暴露两种用法：
-//! 1. [`TextInput`] 实现 [`Render`]，可作为普通子元素放进界面；
+//! 1. [`TextArea`] 实现 [`Render`]，可作为普通子元素放进界面；
 //! 2. [`TextElement`] 是真正负责排版（shaping）与绘制的底层 `Element`。
 //!
 //! 内部使用 [`gpui::WrappedLine`]（`shape_text` 产出）实现换行排版：
@@ -21,226 +21,16 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
+    div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
     Context, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, SharedString, Styled, Style, TextAlign, TextRun, UTF16Selection, WrappedLine,
-    InteractiveElement, ScrollHandle, Window, WrapBoundary,
+    InteractiveElement, ScrollHandle, Window,
 };
-use unicode_segmentation::UnicodeSegmentation;
+use crate::input::shared::*;
 
-// `actions!` 宏一次性声明一组"动作类型"，每个动作都是零大小的结构体；
-// 之后通过 `KeyBinding` + `on_action` 把键盘输入路由到对应的处理函数。
-// 例如按"←"触发 `Left` 动作，进而调用 `TextInput::left`。
-actions!(
-    text_input,
-    [
-        Backspace,
-        Delete,
-        Left,
-        Right,
-        Up,
-        Down,
-        SelectLeft,
-        SelectRight,
-        SelectUp,
-        SelectDown,
-        SelectAll,
-        Home,
-        End,
-        MoveToPreviousWordBoundary,
-        MoveToNextWordBoundary,
-        SelectToPreviousWordBoundary,
-        SelectToNextWordBoundary,
-        DeleteWordBackward,
-        DeleteWordForward,
-        MoveToBeginningOfDocument,
-        MoveToEndOfDocument,
-        SelectToBeginningOfDocument,
-        SelectToEndOfDocument,
-        ShowCharacterPalette,
-        Paste,
-        Cut,
-        Copy,
-        Enter,
-        ShiftEnter,
-        Undo,
-        Redo,
-        Quit,
-    ]
-);
-
-/// 文本输入控件对外发出的事件（用于把"回车提交"通知给父级）。
-pub struct TextInputEvent;
-
-/// 撤销/重做的历史记录单元。
-#[derive(Clone)]
-pub struct HistoryItem {
-    pub text: String,
-    pub range: Range<usize>,
-}
-
-/// 撤销/重做栈。
-#[derive(Clone)]
-pub struct History {
-    items: Vec<HistoryItem>,
-    /// 当前状态在栈中的位置；`-1` 表示尚未记录任何快照。
-    index: i64,
-}
-
-impl Default for History {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            index: -1,
-        }
-    }
-}
-
-impl History {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_index(&self) -> i64 {
-        self.index
-    }
-
-    /// 记录一次快照，覆盖被撤销掉（但在同一分支）的旧历史。
-    pub fn push(&mut self, item: HistoryItem) {
-        self.items.truncate((self.index + 1).max(0) as usize);
-        self.items.push(item);
-        self.index += 1;
-    }
-
-    pub fn undo(&mut self) -> Option<&HistoryItem> {
-        if self.index >= 0 {
-            let item = self.items.get(self.index as usize);
-            self.index -= 1;
-            return item;
-        }
-        None
-    }
-
-    pub fn redo(&mut self) -> Option<&HistoryItem> {
-        if self.index + 1 < self.items.len() as i64 {
-            self.index += 1;
-            return self.items.get(self.index as usize);
-        }
-        None
-    }
-}
-
-// ==================== 词/字素边界（自由函数，便于单测） ====================
-
-/// 把可能落在字符中间的字节偏移修正到 ≤ 它的最近字符边界。
-/// （真实调用方传来的都是字素边界，这里只为防御非边界输入。）
-fn floor_char_boundary_safe(text: &str, offset: usize) -> usize {
-    let mut i = offset.min(text.len());
-    while i > 0 && !text.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-/// 上一个字素边界（UTF-8 字节偏移）。
-fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
-    if text.is_empty() {
-        return 0;
-    }
-    let offset = floor_char_boundary_safe(text, offset);
-    if offset == 0 {
-        return 0;
-    }
-    text[..offset]
-        .grapheme_indices(true)
-        .next_back()
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
-
-/// 下一个字素边界（UTF-8 字节偏移）。
-fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
-    let offset = floor_char_boundary_safe(text, offset);
-    if offset >= text.len() {
-        return text.len();
-    }
-    text[offset..]
-        .grapheme_indices(true)
-        .nth(1)
-        .map(|(i, _)| offset + i)
-        .unwrap_or(text.len())
-}
-
-/// `offset` 处（必须落在字素边界上）的字素是否被视为"词字符"。
-///
-/// 词字符 = Unicode 字母/数字（含中文等 CJK）+ 下划线；空白与标点都不是，
-/// 所以"中文词语"也会被当作一个词（参考 Zed/gpui-todos 的词边界语义）。
-fn is_word_char(text: &str, offset: usize) -> bool {
-    let offset = floor_char_boundary_safe(text, offset);
-    if offset >= text.len() {
-        return false;
-    }
-    let end = next_grapheme_boundary(text, offset);
-    text[offset..end]
-        .chars()
-        .next()
-        .map(|c| c.is_alphanumeric() || c == '_')
-        .unwrap_or(false)
-}
-
-/// 上一个"词起点"（Ctrl+← / 双击选词左边界）。
-///
-/// - 光标在词中时 → 回到当前词首；
-/// - 光标在空白/标点处时 → 跨过空白找到上一个词并回到其词首。
-fn previous_word_boundary_in(text: &str, offset: usize) -> usize {
-    let mut i = floor_char_boundary_safe(text, offset.min(text.len()));
-    if i == 0 {
-        return 0;
-    }
-    // 若当前位置不是词字符（空白/标点），先向左走到词内（或 0）
-    if !is_word_char(text, i) {
-        while i > 0 && !is_word_char(text, i) {
-            i = previous_grapheme_boundary(text, i);
-        }
-    }
-    // 现在 `i` 落在某词字符上（或 0）。回退到词首：仅当"前一个字符也是词字符"
-    // 时才左移——这样能停在词的首字符上，而不是越过它（避免 off-by-one）。
-    while i > 0 {
-        let prev = previous_grapheme_boundary(text, i);
-        if prev == i || !is_word_char(text, prev) {
-            break;
-        }
-        i = prev;
-    }
-    i
-}
-
-/// 下一个"词起点/词尾"（Ctrl+→ / 双击选词右边界）。
-///
-/// - 光标在词中时 → 跳到当前词尾；
-/// - 光标在空白/标点处时 → 跨过空白跳到下一个词首。
-fn next_word_boundary_in(text: &str, offset: usize) -> usize {
-    let mut i = floor_char_boundary_safe(text, offset.min(text.len()));
-    let len = text.len();
-    if i >= len {
-        return len;
-    }
-    if is_word_char(text, i) {
-        while i < len && is_word_char(text, i) {
-            i = next_grapheme_boundary(text, i);
-        }
-        return i;
-    }
-    while i < len && !is_word_char(text, i) {
-        i = next_grapheme_boundary(text, i);
-    }
-    i
-}
-
-pub struct TextInput {
+pub struct TextArea {
     /// 焦点句柄（决定键盘事件是否发给本控件）
     pub focus_handle: FocusHandle,
 
@@ -296,10 +86,10 @@ pub struct TextInput {
     pub last_content_height: Pixels,
 }
 
-impl TextInput {
+impl TextArea {
     /// 创建一个文本输入框实体（在 App 上下文中以 `cx.new(...)` 包装使用）。
     ///
-    /// 注意 `cx.new` 要求 `TextInput: 'static`，本类型满足。
+    /// 注意 `cx.new` 要求 `TextArea: 'static`，本类型满足。
     pub fn new(
         focus_handle: FocusHandle,
         placeholder: SharedString,
@@ -856,8 +646,8 @@ impl TextInput {
     ///
     /// 注意：轨道水平锚定在**元素自身的右缘**（`last_bounds.right()`），而不是
     /// 滚动容器的右缘——容器有 `p_2` 内边距，若锚到容器右缘，滑块会画在内边距
-    /// 区域，落在 TextInput 命中区之外，导致鼠标按下拖不到（见历史 bug）。
-    /// 锚在元素右缘即内容区右缘，滚动条仍响应 TextInput 的鼠标事件。
+    /// 区域，落在 TextArea 命中区之外，导致鼠标按下拖不到（见历史 bug）。
+    /// 锚在元素右缘即内容区右缘，滚动条仍响应 TextArea 的鼠标事件。
     /// 垂直方向锚定在视口上（`scroll_handle.bounds().top()`，固定屏幕位置），
     /// 这样内容滚动时轨道/滑块保持不动。
     pub fn scrollbar_geometry(
@@ -1248,12 +1038,12 @@ impl TextInput {
 }
 
 // Render 实现（供作为子元素使用时直接 `.child(input.clone())`）。
-impl Render for TextInput {
+impl Render for TextArea {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut el = div()
             .flex()
             .id("text-input")
-            .key_context("TextInput")
+            .key_context("TextArea")
             .w_full()
             .min_w(px(0.))
             .min_h(px(24.))
@@ -1298,10 +1088,10 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(|this: &mut TextInput, _ev: &Undo, window, cx| {
+            .on_action(cx.listener(|this: &mut TextArea, _ev: &Undo, window, cx| {
                 this.undo(window, cx)
             }))
-            .on_action(cx.listener(|this: &mut TextInput, _ev: &Redo, window, cx| {
+            .on_action(cx.listener(|this: &mut TextArea, _ev: &Redo, window, cx| {
                 this.redo(window, cx)
             }));
         if self.allow_newlines {
@@ -1313,92 +1103,19 @@ impl Render for TextInput {
     }
 }
 
-impl Focusable for TextInput {
+impl Focusable for TextArea {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
 
-impl gpui::EventEmitter<TextInputEvent> for TextInput {}
+impl gpui::EventEmitter<TextInputEvent> for TextArea {}
 
 // ==================== 工具函数 ====================
 
-/// 工具函数：给定行区间列表与偏移量，判断该偏移位于第几行。
-pub fn line_index_for_offset(ranges: &[Range<usize>], offset: usize) -> usize {
-    let mut idx = 0;
-    for (i, r) in ranges.iter().enumerate() {
-        if r.start <= offset && offset <= r.end {
-            idx = i;
-        }
-    }
-    idx
-}
-
-/// 底层文本绘制元素：持有 [`TextInput`] 的实体句柄，
-/// 由 GPUI 的 `Element` 协议驱动完成"量布局→预排版→绘制"三步。
-pub struct TextElement {
-    pub input: Entity<TextInput>,
-}
-
-/// 预排版阶段传给 `paint` 的中间产物（每"逻辑行"一个换行布局）。
-pub struct PrepaintState {
-    pub lines: Vec<WrappedLine>,
-}
-
-/// 换行边界 -> 该边界对应的 UTF-8 字节偏移（行内）。
-fn boundary_byte(wl: &WrappedLine, b: &WrapBoundary) -> usize {
-    let run = &wl.unwrapped_layout.runs[b.run_ix];
-    run.glyphs
-        .get(b.glyph_ix)
-        .map(|g| g.index)
-        .unwrap_or(wl.len())
-}
-
-/// 计算某逻辑行内、行内字节区间 `[sel_start, sel_end)` 的选区（或下划线）矩形。
-///
-/// 返回的矩形**相对该逻辑行的可视原点 (0,0)**：换行后第 k 个片段画在第 k 个可视行，
-/// 因此 `y = line_height * k`，`x` 为该片段内的偏移。绘制时只需再加上行原点与
-/// `bounds.left()`。
-///
-/// ⚠️ 必须逐片段按行号下移 y：GPUI 的 `paint_line` 在遇到换行边界时执行
-/// `glyph_origin.y += line_height`（见 gpui `text_system/line.rs`）来堆叠片段，
-/// 若高亮矩形不跟着下移，就会全部叠在第一可视行上（历史显示 bug：
-/// Ctrl+A / 鼠标拖选跨多行时只有第一行显示高亮，实际选区是正确的）。
-fn selection_rects_in_line(
-    wl: &WrappedLine,
-    line_height: Pixels,
-    sel_start: usize,
-    sel_end: usize,
-) -> Vec<Bounds<Pixels>> {
-    let uw = &wl.unwrapped_layout;
-    // 依次枚举各换行片段（行内字节区间）
-    let mut segs: Vec<(usize, usize)> = Vec::new();
-    let mut seg_start = 0usize;
-    for b in wl.wrap_boundaries() {
-        let seg_end = boundary_byte(wl, b);
-        segs.push((seg_start, seg_end));
-        seg_start = seg_end;
-    }
-    segs.push((seg_start, wl.len()));
-
-    let mut rects = Vec::new();
-    for (row, (seg_s, seg_e)) in segs.iter().enumerate() {
-        let a = sel_start.max(*seg_s);
-        let b = sel_end.min(*seg_e);
-        if b > a {
-            let seg_x0 = uw.x_for_index(*seg_s);
-            let x0 = uw.x_for_index(a) - seg_x0;
-            let x1 = uw.x_for_index(b) - seg_x0;
-            let y0 = line_height * row as f32;
-            rects.push(Bounds::from_corners(point(x0, y0), point(x1, y0 + line_height)));
-        }
-    }
-    rects
-}
-
 /// 用指定换行宽度 shape 当前内容并缓存到实体里，返回内容可视 (宽, 高)。
 fn shape_and_cache(
-    input: &Entity<TextInput>,
+    input: &Entity<TextArea>,
     wrap_width: Option<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -1407,10 +1124,8 @@ fn shape_and_cache(
     let font_size = style.font_size.to_pixels(window.rem_size());
     // 行高：**优先复用上一次 paint 阶段记录的逻辑行高**。
     // 历史 bug：在"量布局（request_measured_layout）"阶段调用 `window.line_height()`
-    // 会返回放大了的（设备像素）行高（本机约 26px vs 绘制阶段 20px）；若在 measure 里
-    // 用它 shape 并缓存，内容可视高度会永远大于绘制区域 → 换行行数越多，底部空白越多，
-    // 且那一段空白无法输入（点击会定位到文末而非所见位置）。
-    // 只有尚未有任何绘制（首帧）时才用 window.line_height() 兜底。
+    // 会返回放大了的（设备像素）行高；若在 measure 里用它 shape 并缓存，内容可视
+    // 高度会永远大于绘制区域 → 换行行数越多底部空白越多、且空白处无法输入。
     let line_height = {
         let stored = input.read(cx).last_line_height;
         if stored > px(0.) {
@@ -1424,9 +1139,8 @@ fn shape_and_cache(
     let placeholder = input.read(cx).placeholder.clone();
 
     // 空内容时绘制占位文本（半透明灰色），否则绘制真实内容。
-    // 文本整体用**单个 TextRun**（与官方 StyledText 一致），避免按逻辑行切分 run
-    // 时在中文等多字节字符上与 DirectWrite 的字体回退分段产生错位（会引发
-    // "not a char boundary" 崩溃 / 行内容不显示）。
+    // 文本整体用**单个 TextRun**，避免按逻辑行切分 run 时在中文等多字节字符上
+    // 与 DirectWrite 的字体回退分段产生错位（会引发 "not a char boundary" 崩溃）。
     let (text, runs) = if content.is_empty() {
         let run = TextRun {
             len: placeholder.len(),
@@ -1470,6 +1184,18 @@ fn shape_and_cache(
 
     (content_w, content_h)
 }
+
+/// 底层文本绘制元素：持有 [`TextArea`] 的实体句柄，
+/// 由 GPUI 的 `Element` 协议驱动完成"量布局→预排版→绘制"三步。
+pub struct TextElement {
+    pub input: Entity<TextArea>,
+}
+
+/// 预排版阶段传给 `paint` 的中间产物（每"逻辑行"一个换行布局）。
+pub struct PrepaintState {
+    pub lines: Vec<WrappedLine>,
+}
+
 
 impl gpui::IntoElement for TextElement {
     type Element = Self;
@@ -1617,8 +1343,25 @@ impl Element for TextElement {
             total_content_h += line_height * (wl.wrap_boundaries().len() as f32 + 1.);
         }
 
+        // 性能优化：上千行时只绘制视口里**可见**的逻辑行。offsets / total_content_h
+        // 仍按全量计算（供命中测试与滚动条用，开销只是浮点加法）；这里直接跳过
+        // 视口外的行，避免每帧对成千上万行做 shape 后的 paint（这是多行卡顿的主因）。
+        let (scroll_y, viewport_h) = {
+            let handle = self.input.read(cx).scroll_handle.clone();
+            let viewport = handle.bounds();
+            ((-handle.offset().y).max(px(0.)), viewport.size.height)
+        };
+        let (view_top, view_bottom) = (scroll_y, scroll_y + viewport_h);
+        // 视口为空（尚未布局）时退化为全量绘制
+        let do_clip = viewport_h > px(0.);
+
         for (i, wl) in lines.iter().enumerate() {
-            let y = bounds.top() + offsets[i];
+            let row_h = line_height * (wl.wrap_boundaries().len() as f32 + 1.);
+            let line_top = offsets[i];
+            if do_clip && (line_top + row_h < view_top || line_top > view_bottom) {
+                continue;
+            }
+            let y = bounds.top() + line_top;
 
             // 选区高亮：把选区与该行的各个换行片段求交，逐可视行画半透明蓝色矩形
             if !selected_range.is_empty() && i < line_ranges.len() {
@@ -1741,7 +1484,7 @@ impl Element for TextElement {
     }
 }
 
-impl EntityInputHandler for TextInput {
+impl EntityInputHandler for TextArea {
     /// IME 取某段内容的文本（区间为 UTF-16），并回填实际区间。
     fn text_for_range(
         &mut self,
@@ -1897,7 +1640,7 @@ impl EntityInputHandler for TextInput {
     }
 }
 
-impl TextInput {
+impl TextArea {
     /// 把 UTF-16 区间换算成 UTF-8 区间。
     fn utf16_range_to_utf8(&self, range_utf16: Range<usize>) -> (usize, usize) {
         (
@@ -2011,7 +1754,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let (view, cx) = cx.add_window_view(|_window, cx| {
-            TextInput::new(
+            TextArea::new(
                 cx.focus_handle(),
                 SharedString::from(""),
                 SharedString::from(content),
@@ -2059,7 +1802,7 @@ mod tests {
         let long = "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午未申酉戌亥天地玄黄宇宙洪荒";
         let content = format!("{long}{long}\n{long}{long}");
         let (view, cx) = cx.add_window_view(|_window, cx| {
-            TextInput::new(
+            TextArea::new(
                 cx.focus_handle(),
                 SharedString::from(""),
                 SharedString::from(content),

@@ -24,7 +24,7 @@ const INPUT_MAX_HEIGHT: Pixels = px(150.);
 
 use super::backend::DifyClient;
 use super::markdown::{render_markdown, MarkdownTheme};
-use super::text_input::{TextInput, TextInputEvent};
+use super::input::{TextArea, TextInputEvent};
 
 /// 后台流式线程发往主线程的事件。
 enum StreamEvent {
@@ -53,7 +53,7 @@ struct StreamState {
 
 pub struct ChatApp {
     /// 问题输入框
-    pub input: gpui::Entity<TextInput>,
+    pub input: gpui::Entity<TextArea>,
     /// Dify 客户端（可克隆到后台线程）
     client: DifyClient,
     /// 历史轮次
@@ -87,7 +87,7 @@ impl ChatApp {
         let focus_handle = cx.focus_handle();
         let input_focus = cx.focus_handle();
         let input = cx.new(|_cx| {
-            TextInput::new(
+            TextArea::new(
                 input_focus,
                 SharedString::from("输入问题，Enter 发送，Shift+Enter 换行"),
                 SharedString::from(""),
