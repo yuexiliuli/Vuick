@@ -338,6 +338,7 @@ impl TextArea {
         let _ = window;
         // IME: 光标、选区基于 UTF-16。这里 `text` 是系统给的"已上屏"内容，
         // 我们按 UTF-16 长度回算光标即可（我们的存储是 UTF-8，见 `replace` 上方说明）。
+        cx.emit(TextEditEvent);
         cx.notify();
     }
 
@@ -442,6 +443,7 @@ impl TextArea {
             self.selected_range = item.range.start..item.range.start;
             self.selection_reversed = false;
             self.scroll_cursor_into_view(cx);
+            cx.emit(TextEditEvent);
             cx.notify();
         }
         let _ = window;
@@ -458,6 +460,7 @@ impl TextArea {
             self.selected_range = item.range.end..item.range.end;
             self.selection_reversed = false;
             self.scroll_cursor_into_view(cx);
+            cx.emit(TextEditEvent);
             cx.notify();
         }
         let _ = window;
@@ -1173,6 +1176,7 @@ impl Focusable for TextArea {
 }
 
 impl gpui::EventEmitter<TextInputEvent> for TextArea {}
+impl gpui::EventEmitter<TextEditEvent> for TextArea {}
 
 // ==================== 工具函数 ====================
 
@@ -1851,6 +1855,7 @@ impl EntityInputHandler for TextArea {
         self.marked_range = None;
         self.selection_reversed = false;
         self.scroll_cursor_into_view(cx);
+        cx.emit(TextEditEvent);
         cx.notify();
     }
 
@@ -1884,6 +1889,7 @@ impl EntityInputHandler for TextArea {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
         self.scroll_cursor_into_view(cx);
+        cx.emit(TextEditEvent);
         cx.notify();
     }
 }

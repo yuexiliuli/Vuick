@@ -52,6 +52,12 @@ actions!(
 /// 文本输入控件对外发出的"提交"事件（例如聊天输入框的"回车发送"）。
 pub struct TextInputEvent;
 
+/// 文本输入控件内容发生**编辑**的事件（打字/粘贴/删除/撤销/重做/IME 上屏等）。
+///
+/// 供外层持有者（如编辑器应用）监听，以便实时刷新"未保存/脏标记"等依赖内容变更的状态。
+#[derive(Clone, Copy, Debug)]
+pub struct TextEditEvent;
+
 /// 撤销/重做的历史记录单元。
 #[derive(Clone)]
 pub struct HistoryItem {
