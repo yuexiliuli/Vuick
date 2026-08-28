@@ -8,36 +8,66 @@
 //! 所有函数都是**阻塞**的，调用方应放到后台线程执行，避免卡住 GPUI 主线程。
 
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-// ==================== 敏感常量（编译期混淆，二进制中不以明文出现） ====================
+// ==================== 后端配置（敏感信息在 assets/config.json，不硬编码进源码） ====================
 
-fn api_base() -> String {
-    obfstr::obfstr!("REDACTED_API_BASE").to_string()
+/// 后端配置项（API 地址、密钥、URL 路径、工作流字段名等）。
+///
+/// 数据来自**编译期嵌入**的 `assets/config.json`（与 `doc.bin` 的 `DOC_ENC` 同款
+/// `include_*!` 编译期嵌入，运行时不读磁盘；该目录已被 .gitignore 忽略，密钥不外泄）。
+#[derive(Deserialize)]
+pub struct BackendConfig {
+    pub api_base: String,
+    pub api_key: String,
+    pub default_user: String,
+    pub url_upload: String,
+    pub url_chat: String,
+    pub field_getsecret: String,
+    pub field_file_type: String,
+    pub field_file_transfer: String,
 }
-fn api_key() -> String {
-    obfstr::obfstr!("REDACTED_DIFY_KEY").to_string()
+
+/// 编译期嵌入的后端配置（同 `DOC_ENC`：构建时把 `assets/config.json` 打进可执行文件）
+static BACKEND_CONFIG_JSON: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/config.json"));
+
+/// 加载并缓存后端配置（首次访问解析一次，进程内复用一个 `&'static` 实例）。
+fn backend_config() -> &'static BackendConfig {
+    static CFG: OnceLock<BackendConfig> = OnceLock::new();
+    CFG.get_or_init(|| {
+        serde_json::from_str(BACKEND_CONFIG_JSON)
+            .expect("解析 assets/config.json 失败，请检查配置项与 JSON 格式")
+    })
 }
-fn default_user() -> String {
-    obfstr::obfstr!("tauri-chat-user").to_string()
+
+fn api_base() -> &'static str {
+    &backend_config().api_base
 }
-fn url_upload() -> String {
-    obfstr::obfstr!("/files/upload").to_string()
+fn api_key() -> &'static str {
+    &backend_config().api_key
 }
-fn url_chat() -> String {
-    obfstr::obfstr!("/chat-messages").to_string()
+fn default_user() -> &'static str {
+    &backend_config().default_user
 }
-fn input_getsecret() -> String {
-    obfstr::obfstr!("getsecret").to_string()
+fn url_upload() -> &'static str {
+    &backend_config().url_upload
 }
-fn file_type_doc() -> String {
-    obfstr::obfstr!("document").to_string()
+fn url_chat() -> &'static str {
+    &backend_config().url_chat
 }
-fn file_transfer() -> String {
-    obfstr::obfstr!("local_file").to_string()
+fn input_getsecret() -> &'static str {
+    &backend_config().field_getsecret
+}
+fn file_type_doc() -> &'static str {
+    &backend_config().field_file_type
+}
+fn file_transfer() -> &'static str {
+    &backend_config().field_file_transfer
 }
 
 // =====================================================================================
@@ -310,7 +340,7 @@ fn chat_stream(
     body.insert("inputs".into(), Value::Object(inputs));
     body.insert("query".into(), Value::String(question.to_string()));
     body.insert("response_mode".into(), Value::String("streaming".into()));
-    body.insert("user".into(), Value::String(default_user()));
+    body.insert("user".into(), Value::String(default_user().into()));
     if let Some(cid) = conversation_id {
         body.insert("conversation_id".into(), Value::String(cid.to_string()));
     }
@@ -670,6 +700,16 @@ fn strip_thinking_label(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_loads_non_empty() {
+        // 冒烟：assets/config.json 能被解析，且关键配置项非空/结构合理
+        let c = backend_config();
+        assert!(!c.api_base.is_empty() && c.api_base.starts_with("http"), "api_base={:?}", c.api_base);
+        assert!(!c.api_key.is_empty(), "api_key 不应为空");
+        assert!(c.url_upload.starts_with('/'), "url_upload={:?}", c.url_upload);
+        assert!(c.url_chat.starts_with('/'), "url_chat={:?}", c.url_chat);
+    }
 
     #[test]
     fn split_thinking_with_tags() {
