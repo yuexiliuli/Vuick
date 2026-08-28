@@ -11,7 +11,7 @@
 
 use std::rc::Rc;
 use std::sync::mpsc::{self, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, px, rgb, white, App, AppContext, Context, CursorStyle, ElementId, FocusHandle, Focusable,
@@ -86,6 +86,10 @@ pub struct ChatApp {
     selections: Vec<Rc<SelectCtx>>,
     /// 回答/轮次的自增编号（保证选区 id 跨轮唯一）
     next_turn: u64,
+    /// FPS 调试覆盖层（`CHAT_FPS=1` 开启）
+    fps_on: bool,
+    fps_last: Option<Instant>,
+    fps_ema: f32,
     /// 订阅（保持有效）
     _subscription: Option<Subscription>,
     focus_handle: FocusHandle,
@@ -129,6 +133,11 @@ impl ChatApp {
             table_scrolls: Vec::new(),
             selections: Vec::new(),
             next_turn: 0,
+            fps_on: std::env::var("CHAT_FPS")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(false),
+            fps_last: None,
+            fps_ema: 0.0,
             _subscription: None,
             focus_handle,
         };
@@ -881,11 +890,48 @@ impl ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _theme = MarkdownTheme::light();
+        // FPS 调试：每帧时间戳算瞬时帧率（EMA 平滑）；开启时持续出帧以便统计（含空闲）
+        if self.fps_on {
+            let now = Instant::now();
+            if let Some(last) = self.fps_last {
+                let dt = now.duration_since(last).as_secs_f32().max(1e-5);
+                let inst = 1.0 / dt;
+                self.fps_ema = if self.fps_ema <= 0.0 {
+                    inst
+                } else {
+                    self.fps_ema * 0.9 + inst * 0.1
+                };
+            }
+            self.fps_last = Some(now);
+            window.request_animation_frame();
+        }
         // Ctrl+C：输入框聚焦时由 TextArea 处理；否则复制回答区的当前选区（markdown 源码）
         let view = cx.entity();
         // 鼠标在任意处松开都要清掉选择锚点：防止松开落在文本空隙时锚点残留，
         // 导致之后只移动鼠标也会拉长选区（"不跟手"的一种表现）
-        div()
+        let fps_overlay = if self.fps_on {
+            let ema = self.fps_ema;
+            let ms = if ema > 0.0 { 1000.0 / ema } else { 0.0 };
+            Some(
+                div()
+                    .absolute()
+                    .top_2()
+                    .left_2()
+                    .px_1()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(rgb(0xffffff))
+                    .border_1()
+                    .border_color(rgb(0xd1d5db))
+                    .text_size(px(11.))
+                    .text_color(rgb(0x374151))
+                    .child(format!("{ema:.0} fps · {ms:.1} ms/帧")),
+            )
+        } else {
+            None
+        };
+        let root = div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -906,7 +952,12 @@ impl Render for ChatApp {
             })
             .child(self.render_header(cx))
             .child(self.render_messages(window, cx))
-            .child(self.render_input_bar(cx))
+            .child(self.render_input_bar(cx));
+        if let Some(overlay) = fps_overlay {
+            root.child(overlay)
+        } else {
+            root
+        }
     }
 }
 
