@@ -1089,7 +1089,10 @@ impl Render for TextArea {
             .key_context("TextArea")
             .w_full()
             .min_w(px(0.))
-            .min_h(px(24.))
+            .min_h(px(40.))
+            // 垂直居中子元素：内容不足一行（占位符/空态，容器高=min_h）时文字垂直居中；
+            // 多行时容器高=内容高，居中自动失效，不影响换行/滚动布局。
+            .items_center()
             .cursor(CursorStyle::IBeam)
             .track_focus(&self.focus_handle.clone())
             .text_size(px(14.))
@@ -1795,6 +1798,39 @@ mod tests {
         assert_eq!(next_grapheme_boundary(s, b3), b3);
         assert_eq!(previous_grapheme_boundary(s, b1), 0);
         assert_eq!(previous_grapheme_boundary(s, b2), b1);
+    }
+
+    // ---- 回归：空态占位符要在 min_h 盒子里垂直居中（不能用外层滚动容器 justify/items，
+    //      那会破坏超高内容的滚动；盒子高度由 TextArea 自身 min_h 决定并内部居中） ----
+    #[gpui::test]
+    async fn empty_placeholder_vertically_centered(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            TextArea::new(
+                cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(""),
+                true,
+            )
+        });
+        cx.simulate_resize(size(px(300.), px(400.)));
+        cx.run_until_parked();
+
+        let (top, h, content_h) = cx.update(|_window, cx| {
+            let t = view.read(cx);
+            let b = t.last_bounds.expect("空态也应有 last_bounds");
+            (b.top(), b.size.height, t.last_content_height)
+        });
+        // 占位符只占一行（约 line_height，绝非 40px 整盒）
+        assert!(
+            h < px(40.),
+            "占位符应是单行高而不是整盒高：h={h:?} content_h={content_h:?}"
+        );
+        // 单行在 40px 盒内垂直居中：留白 (40-h)/2，上下对称
+        let delta = (top - (px(40.) - h) / 2.0).abs();
+        assert!(
+            delta < px(1.),
+            "占位符应垂直居中：top={top:?} line_h={h:?} 期望留白 (40-{h:?})/2，偏移 {delta:?}"
+        );
     }
 
     // ---- 回归：换行后底部不应出现空白（历史 bug：布局高度>绘制高度，随行数增长） ----
