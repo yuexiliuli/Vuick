@@ -45,6 +45,7 @@ actions!(
         Undo,
         Redo,
         Quit,
+        Save,
     ]
 );
 

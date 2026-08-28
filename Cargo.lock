@@ -2282,7 +2282,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpui-ai-chat"
+name = "gpui-editor"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",

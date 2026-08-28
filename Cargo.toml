@@ -1,7 +1,7 @@
 [package]
-name = "gpui-ai-chat"
+name = "gpui-editor"
 version = "0.1.0"
-description = "基于 GPUI 的 AI 文档问答聊天工具"
+description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 edition = "2021"
 
 [dependencies]

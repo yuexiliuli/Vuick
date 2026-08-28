@@ -69,7 +69,7 @@ impl MarkdownTheme {
 
 /// 行内样式片段
 #[derive(Clone, Debug)]
-struct Span {
+pub(crate) struct Span {
     text: String,
     bold: bool,
     italic: bool,
@@ -79,8 +79,8 @@ struct Span {
 }
 
 /// 块级元素
-#[derive(Debug)]
-enum Block {
+#[derive(Clone, Debug)]
+pub(crate) enum Block {
     Paragraph(Vec<Vec<Span>>), // 每行一个 Vec<Span>
     Heading { level: usize, spans: Vec<Span> },
     Code(String),
@@ -252,7 +252,7 @@ fn find_link_end(v: &[char], start: usize) -> Option<usize> {
 
 // ==================== 块级解析（对齐原 markdown.ts 的 renderMarkdown） ====================
 
-fn parse_markdown(src: &str) -> Vec<Block> {
+pub(crate) fn parse_markdown(src: &str) -> Vec<Block> {
     let src = src.replace("\r\n", "\n");
     let lines: Vec<&str> = src.split('\n').collect();
     let mut blocks: Vec<Block> = Vec::new();
@@ -612,6 +612,7 @@ pub struct SelectCtx {
 }
 
 impl SelectCtx {
+    #[allow(dead_code)]
     pub fn new(turn: u64, focus: gpui::FocusHandle) -> Self {
         Self {
             turn,
@@ -686,6 +687,7 @@ impl LeafGeom {
 /// **字符级裁剪**：选中跨多个叶子时按渲染顺序以换行拼接；叶子内逐 span 裁剪——
 /// 一整段 span 被完整选中才还原其标记（`**加粗**`/`` `code` ``），只选中的一部分
 /// 输出纯文本子串，避免出现 `**半截**`。
+#[allow(dead_code)]
 pub fn selected_markdown(md: &str, selection: &Range<usize>) -> String {
     let blocks = parse_markdown(md);
     let mut out = String::new();
@@ -729,6 +731,7 @@ pub fn selected_markdown(md: &str, selection: &Range<usize>) -> String {
 }
 
 /// 单个片段 → markdown 源码（`text` 为最终要写入的内容）。
+#[allow(dead_code)]
 fn span_markdown(sp: &Span, text: &str) -> String {
     if sp.code {
         format!("`{}`", text)
@@ -749,6 +752,7 @@ fn span_markdown(sp: &Span, text: &str) -> String {
 }
 
 /// 按渲染顺序遍历一条回答的每个文本叶子（顺序 = 文本流顺序）。
+#[allow(dead_code)]
 fn for_each_text_leaf(blocks: &[Block], mut f: impl FnMut(&[Span])) {
     for block in blocks {
         match block {
@@ -1499,21 +1503,18 @@ pub fn render_markdown_themed(md: &str, theme: &MarkdownTheme) -> Div {
     render_markdown_with_options(md, theme, TableMode::Wrap, None, None, None)
 }
 
-/// 渲染 Markdown，并指定表格超宽时的处理方式。
+/// 渲染已解析的块列表为 GPUI 元素（不含解析步骤，供调用方复用缓存的 `Vec<Block>`）。
 ///
-/// - `scroll`：`TableMode::Scroll` 时提供表格的横向滚动（句柄 + 拖拽状态，调用方
-///   需为同一篇内容保存一个 [`TableScrollState`]，跨帧保持横向位置与拖拽）；
-/// - `window`：Scroll 模式下用量文本实际宽度来统一列宽（保证各列分割线对齐）；
-///   其它模式可传 `None`。
-pub fn render_markdown_with_options(
-    md: &str,
+/// 与 [`render_markdown_with_options`] 的渲染逻辑完全一致，只是块列表由调用方提供，
+/// 避免每次重渲染都重复解析（大文档实时预览时按内容缓存 `Vec<Block>` 可显著降耗）。
+pub(crate) fn render_markdown_blocks(
+    blocks: &[Block],
     theme: &MarkdownTheme,
     mode: TableMode,
     scroll: Option<&TableScrollState>,
     window: Option<&mut Window>,
     sel: Option<&Rc<SelectCtx>>,
 ) -> Div {
-    let blocks = parse_markdown(md);
     let mut table_idx = 0usize;
     let mut stream = 0usize;
     let mut window = window;
@@ -1538,6 +1539,24 @@ pub fn render_markdown_with_options(
         .min_w(px(0.))
         .text_color(theme.text)
         .children(children)
+}
+
+/// 渲染 Markdown，并指定表格超宽时的处理方式。
+///
+/// - `scroll`：`TableMode::Scroll` 时提供表格的横向滚动（句柄 + 拖拽状态，调用方
+///   需为同一篇内容保存一个 [`TableScrollState`]，跨帧保持横向位置与拖拽）；
+/// - `window`：Scroll 模式下用量文本实际宽度来统一列宽（保证各列分割线对齐）；
+///   其它模式可传 `None`。
+pub fn render_markdown_with_options(
+    md: &str,
+    theme: &MarkdownTheme,
+    mode: TableMode,
+    scroll: Option<&TableScrollState>,
+    window: Option<&mut Window>,
+    sel: Option<&Rc<SelectCtx>>,
+) -> Div {
+    let blocks = parse_markdown(md);
+    render_markdown_blocks(&blocks, theme, mode, scroll, window, sel)
 }
 
 #[cfg(test)]
