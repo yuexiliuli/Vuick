@@ -1363,7 +1363,20 @@ fn shape_and_cache(
 ) -> (Pixels, Pixels) {
     let style = window.text_style();
     let font_size = style.font_size.to_pixels(window.rem_size());
-    let line_height = window.line_height();
+    // 行高：**优先复用上一次 paint 阶段记录的逻辑行高**。
+    // 历史 bug：在"量布局（request_measured_layout）"阶段调用 `window.line_height()`
+    // 会返回放大了的（设备像素）行高（本机约 26px vs 绘制阶段 20px）；若在 measure 里
+    // 用它 shape 并缓存，内容可视高度会永远大于绘制区域 → 换行行数越多，底部空白越多，
+    // 且那一段空白无法输入（点击会定位到文末而非所见位置）。
+    // 只有尚未有任何绘制（首帧）时才用 window.line_height() 兜底。
+    let line_height = {
+        let stored = input.read(cx).last_line_height;
+        if stored > px(0.) {
+            stored
+        } else {
+            window.line_height()
+        }
+    };
 
     let content = input.read(cx).content.clone();
     let placeholder = input.read(cx).placeholder.clone();
@@ -1978,5 +1991,56 @@ mod tests {
         assert_eq!(next_grapheme_boundary(s, b3), b3);
         assert_eq!(previous_grapheme_boundary(s, b1), 0);
         assert_eq!(previous_grapheme_boundary(s, b2), b1);
+    }
+
+    // ---- 回归：换行后底部不应出现空白（历史 bug：布局高度>绘制高度，随行数增长） ----
+    #[gpui::test]
+    async fn wrapped_layout_matches_painted_height(cx: &mut gpui::TestAppContext) {
+        let long_line =
+            "这行文字很长很长用于测试自动换行，在有限宽度内应当拆成多个可视行，abcdefghijklmnopqrstuvwxyz 0123456789";
+        let content = (0..12)
+            .map(|i| format!("{i}:{long_line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            TextInput::new(
+                cx.focus_handle(),
+                SharedString::from(""),
+                SharedString::from(content),
+                true,
+            )
+        });
+
+        // 有限宽度 → 强制自动换行成多个可视行
+        cx.simulate_resize(size(px(300.), px(400.)));
+        cx.run_until_parked();
+
+        // 再跑几帧（输入字符触发重排），确保高度已自愈为与绘制一致
+        for _ in 0..3 {
+            cx.simulate_input("x");
+            cx.run_until_parked();
+        }
+
+        let (bounds_h, content_h, visual_lines, wrap_w) = cx.update(|_window, cx| {
+            let t = view.read(cx);
+            let visual_lines: usize = t
+                .last_layout
+                .as_ref()
+                .map(|ls| ls.iter().map(|w| w.wrap_boundaries().len() + 1).sum())
+                .unwrap_or(0);
+            (
+                t.last_bounds.map(|b| b.size.height),
+                t.last_content_height,
+                visual_lines,
+                t.last_wrap_width,
+            )
+        });
+
+        assert!(visual_lines > 12, "换行应产生多于逻辑行的可视行，实际 {visual_lines}");
+        assert_eq!(
+            bounds_h,
+            Some(content_h),
+            "布局高度必须等于绘制内容高度（当前存在底部空白：bounds={bounds_h:?} vs content={content_h:?}, wrap={wrap_w:?})"
+        );
     }
 }
