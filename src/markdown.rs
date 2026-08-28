@@ -26,6 +26,8 @@ pub enum TableMode {
 const CELL_H_PAD: Pixels = px(16.);
 /// 单元格左边框宽度（列宽测量时补上）
 const CELL_BORDER: Pixels = px(1.);
+/// 表头加粗比普通字稍宽的测量缓冲（Scroll 模式列宽按普通字重测量）
+const CELL_HEADER_BOLD_BUFFER: Pixels = px(2.);
 
 /// 渲染配色（可整体定制明/暗主题）。
 pub struct MarkdownTheme {
@@ -468,7 +470,12 @@ fn flush_table(blocks: &mut Vec<Block>, table_buf: &mut Vec<String>) {
 
 // ==================== 渲染为 GPUI 元素 ====================
 
-fn spans_to_styled(text: &str, spans: &[Span], theme: &MarkdownTheme) -> SpannedText {
+fn spans_to_styled(
+    text: &str,
+    spans: &[Span],
+    theme: &MarkdownTheme,
+    force_bold: bool,
+) -> SpannedText {
     let base = font(".SystemUIFont");
     let mono = font(theme.mono_family.clone());
     let mut runs: Vec<TextRun> = Vec::new();
@@ -478,7 +485,9 @@ fn spans_to_styled(text: &str, spans: &[Span], theme: &MarkdownTheme) -> Spanned
         if sp.code {
             f = mono.clone();
         }
-        if sp.bold {
+        // 注意：必须设置在 run 的字体上才生效——设在外层 div 的 font_weight
+        // 不会级联进带显式 font 的 TextRun（这就是此前"表头加粗没效果"的原因）。
+        if sp.bold || force_bold {
             f = f.bold();
         }
         if sp.italic {
@@ -539,8 +548,13 @@ impl SpannedText {
 }
 
 fn render_spans_line(spans: &[Span], theme: &MarkdownTheme) -> StyledText {
+    render_spans_line_weighted(spans, theme, false)
+}
+
+/// 渲染一行行内片段，可整体强制加粗（用于表头单元格）。
+fn render_spans_line_weighted(spans: &[Span], theme: &MarkdownTheme, force_bold: bool) -> StyledText {
     let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-    spans_to_styled(&text, spans, theme).into_element()
+    spans_to_styled(&text, spans, theme, force_bold).into_element()
 }
 
 fn render_block(
@@ -567,7 +581,7 @@ fn render_block(
                 _ => px(15.),
             };
             let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-            let st = spans_to_styled(&text, spans, theme).into_element();
+            let st = spans_to_styled(&text, spans, theme, false).into_element();
             div()
                 .mb_2()
                 .mt_1()
@@ -652,12 +666,15 @@ fn render_block(
                             .filter_map(|r| r.get(c))
                         {
                             let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-                            let st = spans_to_styled(&text, spans, theme);
+                            let st = spans_to_styled(&text, spans, theme, false);
                             let lw = wnd
                                 .text_system()
                                 .shape_line(st.text, font_size, &st.runs, None)
                                 .width;
-                            let w = lw + CELL_H_PAD + CELL_BORDER;
+                            let w = lw
+                                + CELL_H_PAD
+                                + CELL_BORDER
+                                + CELL_HEADER_BOLD_BUFFER;
                             if w > m {
                                 m = w;
                             }
@@ -679,7 +696,7 @@ fn render_block(
                     .text_size(px(13.))
                     .text_color(theme.table_text);
                 if header {
-                    cell = cell.font_weight(FontWeight::SEMIBOLD).bg(theme.table_bg);
+                    cell = cell.font_weight(FontWeight::BOLD).bg(theme.table_bg);
                 }
                 // 每一列之间画一条竖直分割线，让各列文字有齐平的参考线
                 if c > 0 {
@@ -699,7 +716,12 @@ fn render_block(
                     }
                 }
                 if let Some(spans) = row.get(c) {
-                    cell = cell.child(render_spans_line(spans, theme));
+                    // 表头：强行使 run 加粗（仅 div.font_weight 不会级联进带显式 font 的 run）
+                    if header {
+                        cell = cell.child(render_spans_line_weighted(spans, theme, true));
+                    } else {
+                        cell = cell.child(render_spans_line(spans, theme));
+                    }
                 }
                 cell
             };
@@ -841,6 +863,24 @@ mod tests {
         assert_eq!(text, "前 加粗 后 code 尾");
         assert!(s.iter().any(|x| x.bold));
         assert!(s.iter().any(|x| x.code));
+    }
+
+    /// 表头整体强制加粗要作用在 TextRun 的字体上（祖先 div 的 font_weight
+    /// 不会级联进带显式 font 的 run——修复"表头加粗没效果"）。
+    #[test]
+    fn header_force_bold_uses_run_font() {
+        let spans = parse_inline("列 A");
+        let theme = MarkdownTheme::light();
+        let bold = spans_to_styled("列 A", &spans, &theme, true);
+        let normal = spans_to_styled("列 A", &spans, &theme, false);
+        assert!(
+            bold.runs[0].font.weight == FontWeight::BOLD,
+            "表头 run 应为加粗字重"
+        );
+        assert!(
+            normal.runs[0].font.weight == FontWeight::NORMAL,
+            "普通单元格 run 不应加粗"
+        );
     }
 
     #[test]
