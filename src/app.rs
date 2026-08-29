@@ -1014,9 +1014,12 @@ impl EditorApp {
     }
 
     /// 行号槽：absolute 覆盖在编辑区左缘，作为滚动容器的子元素会随内容一起平移。
-    /// 槽高度 = 整篇内容（含上下 py_2 内边距），所以可见行号永远落在槽内、不会被
-    /// `overflow_hidden` 裁掉（修复"超过约 30 行后不显示行号"）；行号用**内容坐标**
-    /// （py_2(8px) + 居中偏移 + 行偏移）摆放，与正文同帧对齐、随正文一起滚。
+    /// 行号用**内容坐标**（py_2(8px) + 居中偏移 + 行偏移）摆放，与正文同帧对齐、随正文一起滚。
+    ///
+    /// 性能：上千行时**绝不**为每一行都创建 DOM 元素（否则每次重渲染/输入都会实例化上千个
+    /// div，是卡顿主因）。这里按当前滚动偏移 + 视口高度算出可见行区间，只渲染该区间内的行号
+    /// （上下各多画一行避免边缘闪现），与 gpui-component `uniform_list` 的 `track_scroll` 区间
+    /// 虚拟渲染思路一致。
     fn render_line_gutter(
         &mut self,
         editor: &gpui::Entity<TextArea>,
@@ -1031,16 +1034,31 @@ impl EditorApp {
         // TextArea 在内容不足一行（或很短）时会在 `min_h(40)` 盒子里垂直居中
         let center_offset = ((px(40.) - ed.last_content_height) / 2.0).max(px(0.));
 
+        // 可见内容区间（内容坐标系）：视口顶部 = -scroll_y，底部 = viewport_h - scroll_y。
+        // scroll_y 向下滚动为负；viewport_h 取不到（尚未布局）时退化为全量渲染。
+        let scroll_y = ed.scroll_handle.offset().y;
+        let viewport_h = ed.scroll_handle.bounds().size.height;
+        let virtualize = viewport_h > px(0.);
+        let view_top = -scroll_y;
+        let view_bottom = viewport_h - scroll_y;
+        let margin = lh; // 上下各多画一行，避免滚动时边缘行号闪现
+
         let mut numbers: Vec<gpui::Div> = Vec::new();
         for i in 0..lines {
             let top = offsets.get(i).copied().unwrap_or(px(0.));
             let bottom = offsets.get(i + 1).copied().unwrap_or(total);
             let row_h = (bottom - top).max(lh);
+            let line_top = px(8.) + center_offset + top;
+            let line_bottom = px(8.) + center_offset + bottom;
+            // 虚拟渲染：仅当该行落在视口内（含余量）才创建元素
+            if virtualize && (line_bottom + margin < view_top || line_top - margin > view_bottom) {
+                continue;
+            }
             numbers.push(
                 div()
                     .debug_selector(move || format!("gutter-line-{}", i + 1))
                     .absolute()
-                    .top(px(8.) + center_offset + top)
+                    .top(line_top)
                     .h(row_h)
                     .w_full()
                     .flex()
@@ -1710,5 +1728,40 @@ mod tests {
             "当前选中的文件不是 .md 时，选项卡栏不应显示眼睛图标"
         );
         let _ = std::fs::remove_file(&dir2);
+    }
+
+    /// 行号槽必须虚拟渲染：上千行时，远离视口的行号不应被实例化成元素
+    /// （否则每次重渲染/输入都会创建上千个 div，导致卡顿）。
+    #[gpui::test]
+    async fn gutter_virtualizes_offscreen_lines(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 写入 1000 行
+        let editor = cx.update(|_w, cx| {
+            view.read(cx).tabs[view.read(cx).active_tab].editor.clone()
+        });
+        let text = (0..1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.insert_text_at_cursor(&text, window, cx);
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        // 未滚动时：首行行号应存在；远离视口的行号不应被实例化（虚拟渲染）
+        let first = cx.debug_bounds("gutter-line-1");
+        let far = cx.debug_bounds("gutter-line-500");
+        assert!(first.is_some(), "首行行号应存在");
+        assert!(
+            far.is_none(),
+            "远离视口的行号不应被实例化为元素（虚拟渲染，避免上千元素卡顿）"
+        );
     }
 }
