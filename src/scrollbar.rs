@@ -104,7 +104,8 @@ pub fn horizontal_scrollbar(
     let mut el = div()
         .id(id)
         .relative()
-        .h(BAR_W + GAP_RIGHT * 2.)
+        // 行高比垂直滚动条更薄（仅 BAR_W + GAP_RIGHT ≈ 9px），贴着容器底部浮一层
+        .h(BAR_W + GAP_RIGHT)
         .w_full()
         .cursor(CursorStyle::PointingHand);
 
@@ -114,21 +115,21 @@ pub fn horizontal_scrollbar(
                 div()
                     .absolute()
                     .left(GAP_RIGHT)
-                    .top(GAP_RIGHT)
+                    .top(px(1.))
                     .w(bar_w)
-                    .h(BAR_W)
+                    .h(BAR_W - px(2.))
                     .rounded(THUMB_RADIUS)
-                    .bg(rgba(0x93a0aa1f)),
+                    .bg(rgba(0x93a0aa0d)),
             )
             .child(
                 div()
                     .absolute()
                     .left(thumb_x)
-                    .top(GAP_RIGHT)
+                    .top(px(1.))
                     .w(thumb_w)
-                    .h(BAR_W)
+                    .h(BAR_W - px(2.))
                     .rounded(THUMB_RADIUS)
-                    .bg(rgba(0x64748b96)),
+                    .bg(rgba(0x64748b5c)),
             );
     }
 

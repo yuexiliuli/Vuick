@@ -23,7 +23,7 @@ use gpui::{
 };
 
 use super::markdown::{parse_markdown, render_markdown_blocks, Block, MarkdownTheme, TableMode};
-use super::scrollbar::{Scrollbar, TableScrollState};
+use super::scrollbar::{horizontal_scrollbar, Scrollbar, TableScrollState};
 use super::input::{self, FileDropped, TextArea, TextEditEvent};
 
 /// 编辑区背景色（亮色）。
@@ -80,6 +80,8 @@ pub struct EditorApp {
     preview_scroll: gpui::ScrollHandle,
     /// 预览表格横向滚动状态
     preview_table: TableScrollState,
+    /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
+    tab_bar_hscroll: TableScrollState,
     /// 顶部状态文字与是否"正常"
     status: SharedString,
     status_ok: bool,
@@ -120,6 +122,7 @@ impl EditorApp {
             active_tab: 0,
             preview_scroll: gpui::ScrollHandle::new(),
             preview_table: TableScrollState::new(),
+            tab_bar_hscroll: TableScrollState::new(),
             status: SharedString::from("就绪"),
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
@@ -833,6 +836,7 @@ impl EditorApp {
                     .flex()
                     .items_center()
                     .gap_1()
+                    .flex_shrink()
                     .rounded_md()
                     .bg(if is_active { rgb(0xffffff) } else { rgba(0x00000000) })
                     .border_1()
@@ -924,16 +928,30 @@ impl EditorApp {
             None
         };
 
-        // 选项卡栏右侧：先用 flex_1 把后续内容推到最右侧，再按需放入眼睛图标
+        // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
         let mut right: Vec<gpui::AnyElement> = Vec::new();
-        right.push(div().flex_1().min_w(px(0.)).into_any_element());
         if let Some(eye) = eye {
             right.push(eye);
         }
 
+        // 横向滚动条只在标签超宽时出现：半透明、贴着标签底部、浮在上方（不额外占高度）
+        let mut hscroll_overlay: Vec<gpui::AnyElement> = Vec::new();
+        if self.tab_bar_hscroll.handle.max_offset().width > px(0.) {
+            hscroll_overlay.push(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .right(px(0.))
+                    .bottom(px(0.))
+                    .h(px(1.))
+                    .child(horizontal_scrollbar(&self.tab_bar_hscroll, "tab-bar-hscroll"))
+                    .into_any_element(),
+            );
+        }
+
         div()
             .id("tab-bar")
-            .h(px(34.))
+            .relative()
             .w_full()
             .px_2()
             .py_1()
@@ -943,7 +961,30 @@ impl EditorApp {
             .bg(rgb(0xf3f4f6))
             .border_b_1()
             .border_color(rgb(0xe5e7eb))
-            .children(tabs)
+            // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
+            // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变原 34px 高度。
+            .child(
+                div()
+                    .id("tab-bar-scroll")
+                    .relative()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h(px(26.))
+                    .child(
+                        div()
+                            .id("tab-bar-tabs")
+                            .w_full()
+                            .h_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.tab_bar_hscroll.handle)
+                            .children(tabs),
+                    )
+                    .children(hscroll_overlay),
+            )
             .child(add)
             .children(right)
     }
@@ -1762,6 +1803,31 @@ mod tests {
         assert!(
             far.is_none(),
             "远离视口的行号不应被实例化为元素（虚拟渲染，避免上千元素卡顿）"
+        );
+    }
+
+    /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
+    #[gpui::test]
+    async fn tab_bar_scrolls_when_tabs_overflow(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(400.), px(400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 连续新建大量选项卡，总宽超过一屏
+        for _ in 0..30 {
+            cx.update(|window, cx| view.update(cx, |app, cx| app.new_tab(window, cx)));
+            for _ in 0..2 {
+                cx.run_until_parked();
+            }
+        }
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let max_w = cx.update(|_w, cx| view.read(cx).tab_bar_hscroll.handle.max_offset().width);
+        assert!(
+            max_w > px(0.),
+            "选项卡过多时选项卡栏应可横向滚动（横向滚动条出现）：max_offset={max_w:?}"
         );
     }
 }
