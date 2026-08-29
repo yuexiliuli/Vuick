@@ -969,6 +969,20 @@ impl EditorApp {
             .border_color(rgb(0xe5e7eb))
             .rounded_md()
             .overflow_hidden()
+            // 行号槽背景：钉在视口左缘的固定覆盖层（editor-area 不滚动），始终覆盖可见行的
+            // 左侧；行号本身由 editor-scroll 内的 gutter 绘制并随正文滚动， painting 顺序在其上。
+            .child(
+                div()
+                    .id("editor-gutter-bg")
+                    .absolute()
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .w(GUTTER_W)
+                    .bg(rgb(0xfafafa))
+                    .border_r_1()
+                    .border_color(rgb(0xe5e7eb)),
+            )
             .child(
                 // 滚动容器：`h_full w_full` 撑满编辑区（视口）；正文包装层是普通块子元素
                 // （随容器平移），其显式高度 = 正文内容高度，确保内容超高时可滚。
@@ -999,8 +1013,10 @@ impl EditorApp {
             )
     }
 
-    /// 行号槽：absolute 覆盖在编辑区左缘。行号是滚动容器的子元素，会随容器一起平移，
-    /// 因此行号用**内容坐标**（`py_2(8px) + 居中偏移 + 行偏移`）摆放即可，与正文同帧对齐。
+    /// 行号槽：absolute 覆盖在编辑区左缘，作为滚动容器的子元素会随内容一起平移。
+    /// 槽高度 = 整篇内容（含上下 py_2 内边距），所以可见行号永远落在槽内、不会被
+    /// `overflow_hidden` 裁掉（修复"超过约 30 行后不显示行号"）；行号用**内容坐标**
+    /// （py_2(8px) + 居中偏移 + 行偏移）摆放，与正文同帧对齐、随正文一起滚。
     fn render_line_gutter(
         &mut self,
         editor: &gpui::Entity<TextArea>,
@@ -1040,15 +1056,15 @@ impl EditorApp {
         div()
             .id("editor-gutter")
             .debug_selector(|| "editor-gutter".into())
+            // 仅承载行号（透明、不裁切）；背景由 editor-area 内的 editor-gutter-bg 固定覆盖。
+            // 槽高 = 视口；行号是滚动容器的子元素（随内容一起平移），用内容坐标摆放。
+            // 不裁切（无 overflow_hidden）：超过视口的行号由 editor-scroll 自行裁掉，否则
+            // 会被本槽视口高度裁掉（"超过约 30 行后不显示行号"）。
             .absolute()
             .top(px(0.))
             .bottom(px(0.))
             .left(px(0.))
             .w(GUTTER_W)
-            .overflow_hidden()
-            .border_r_1()
-            .border_color(rgb(0xe5e7eb))
-            .bg(rgb(0xfafafa))
             .font_family("Consolas")
             .children(numbers)
     }
