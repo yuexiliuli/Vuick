@@ -419,6 +419,23 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
+    /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
+    /// 会先激活该选项卡，再翻转其 `preview_on`，并重置预览滚动状态。
+    fn toggle_preview_for_tab(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.activate_tab(idx, window, cx);
+        if let Some(tab) = self.tabs.get_mut(idx) {
+            tab.preview_on = !tab.preview_on;
+        }
+        self.preview_scroll = gpui::ScrollHandle::new();
+        self.preview_table = TableScrollState::new();
+        cx.notify();
+    }
+
     fn is_markdown_path(p: &Path) -> bool {
         p.extension()
             .and_then(|e| e.to_str())
@@ -858,6 +875,62 @@ impl EditorApp {
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| this.new_tab(window, cx)),
             );
 
+        // 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
+        // 时才显示，点击切换当前选项卡的 Markdown 预览（与「查看 → 预览」一致）。
+        // 用纯 div 画出（椭圆外框 + 中心瞳孔），避免依赖 emoji 字体；蓝色=已开，灰色=已关。
+        let active_is_md = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.file_path.as_ref())
+            .map(|p| Self::is_markdown_path(p))
+            .unwrap_or(false);
+
+        let eye = if active_is_md {
+            let on = self.show_preview();
+            let eye_color = if on { rgb(0x4338ca) } else { rgb(0x9ca3af) };
+            Some(
+                div()
+                    .id("tab-bar-eye")
+                    .debug_selector(|| "tab-bar-eye".into())
+                    .w(px(22.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor(CursorStyle::PointingHand)
+                    .child(
+                        div()
+                            .w(px(16.))
+                            .h(px(10.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(eye_color)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(div().w(px(5.)).h(px(5.)).rounded_full().bg(eye_color)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                            let idx = this.active_tab;
+                            this.toggle_preview_for_tab(idx, window, cx);
+                        }),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        // 选项卡栏右侧：先用 flex_1 把后续内容推到最右侧，再按需放入眼睛图标
+        let mut right: Vec<gpui::AnyElement> = Vec::new();
+        right.push(div().flex_1().min_w(px(0.)).into_any_element());
+        if let Some(eye) = eye {
+            right.push(eye);
+        }
+
         div()
             .id("tab-bar")
             .h(px(34.))
@@ -872,6 +945,7 @@ impl EditorApp {
             .border_color(rgb(0xe5e7eb))
             .children(tabs)
             .child(add)
+            .children(right)
     }
 
     // ==================== 编辑区 / 行号槽 ====================
@@ -1563,5 +1637,62 @@ mod tests {
         });
         assert_eq!(font, DEFAULT_FONT_SIZE + 2.0);
         assert!(preview, "预览开关打开后 show_preview 应为 true（不依赖 .md 扩展名）");
+    }
+
+    /// 当前选中的文件是 .md 时，选项卡栏最右侧出现眼睛图标，点击切换预览；非 .md 文件不出现。
+    #[gpui::test]
+    async fn md_tab_bar_shows_eye_and_toggles_preview(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 打开 .md 文件（当前选中的就是它）：选项卡栏最右侧应显示眼睛，并自动开启预览
+        let dir = std::env::temp_dir().join("gpui-editor-eye-test.md");
+        std::fs::write(&dir, "# 标题\n").unwrap();
+        view.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), cx));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let eye_before = cx.debug_bounds("tab-bar-eye");
+        let preview_before = cx.update(|_w, cx| view.read(cx).show_preview());
+        assert!(
+            eye_before.is_some(),
+            "当前选中 .md 文件时，选项卡栏最右侧应显示眼睛图标"
+        );
+        assert!(preview_before, "打开 .md 文件应自动开启预览");
+
+        // 点击眼睛：应关闭当前选项卡的预览（当前仍是 .md，眼睛保持显示，仅变关闭态）
+        cx.update(|window, cx| {
+            view.update(cx, |app, cx| app.toggle_preview_for_tab(0, window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let preview_off = cx.update(|_w, cx| view.read(cx).show_preview());
+        let eye_still = cx.debug_bounds("tab-bar-eye").is_some();
+        assert!(!preview_off, "点击眼睛后预览应关闭");
+        assert!(eye_still, "当前仍是 .md 文件，眼睛图标应保持显示");
+        let _ = std::fs::remove_file(&dir);
+
+        // 另起一个窗口：打开非 .md 文件，选项卡栏最右侧不应出现眼睛（该窗口从未渲染过眼睛）
+        let (view2, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir2 = std::env::temp_dir().join("gpui-editor-eye-test.txt");
+        std::fs::write(&dir2, "plain").unwrap();
+        view2.update(cx, |app, cx| app.open_file(dir2.to_str().unwrap(), cx));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let eye_txt = cx.debug_bounds("tab-bar-eye");
+        assert!(
+            eye_txt.is_none(),
+            "当前选中的文件不是 .md 时，选项卡栏不应显示眼睛图标"
+        );
+        let _ = std::fs::remove_file(&dir2);
     }
 }
