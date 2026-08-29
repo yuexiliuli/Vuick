@@ -18,6 +18,7 @@
 //! 内部使用 [`gpui::WrappedLine`]（`shape_text` 产出）实现换行排版：
 //! 每个"逻辑行"（以 `\n` 分隔）会在宽度不足时被拆成多个"可视行"。
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::sync::Arc;
@@ -25,10 +26,10 @@ use std::sync::Arc;
 use gpui::{
     div, fill, hsla, point, px, relative, rgba, size, App, AvailableSpace, Bounds,
     Context, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, SharedString, Styled, Style, TextAlign, TextRun, UTF16Selection, WrappedLine,
-    InteractiveElement, ScrollHandle, Window,
+    EntityInputHandler, ExternalPaths, FocusHandle, Focusable, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, SharedString, Styled, Style, TextAlign, TextRun,
+    UTF16Selection, WrappedLine, InteractiveElement, ScrollHandle, Window,
 };
 use crate::input::shared::*;
 
@@ -152,12 +153,6 @@ impl TextArea {
             last_content_height: px(0.),
             content_pad: RefCell::new(None),
         }
-    }
-
-    /// 开启"回车即提交"模式（聊天输入框用）。
-    pub fn with_submit_on_enter(mut self) -> Self {
-        self.submit_on_enter = true;
-        self
     }
 
     /// 光标位置（选区终点；向后选择时是起点）。
@@ -1126,6 +1121,18 @@ impl Render for TextArea {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move));
 
+        // 外部文件拖放到本控件：把路径作为事件发出，由持有者决定如何打开。
+        // 注意：GPUI 的 on_drop 只派发给"鼠标悬停"的元素（受 BlockMouse 边界限制），
+        // 根视图在编辑区上方不会被判定为 hovered，因此拖放处理必须挂在顶层控件上。
+        el = el
+            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
+            .on_drop(cx.listener(|_this: &mut TextArea, paths: &Arc<ExternalPaths>, _w, cx| {
+                if let Some(p) = paths.paths().first() {
+                    cx.emit(FileDropped(p.clone()));
+                    cx.notify();
+                }
+            }));
+
         // 焦点时的键盘动作（键位本身在 main.rs 里全局注册）
         el = el
             .on_action(cx.listener(Self::backspace))
@@ -1177,6 +1184,7 @@ impl Focusable for TextArea {
 
 impl gpui::EventEmitter<TextInputEvent> for TextArea {}
 impl gpui::EventEmitter<TextEditEvent> for TextArea {}
+impl gpui::EventEmitter<FileDropped> for TextArea {}
 
 // ==================== 工具函数 ====================
 

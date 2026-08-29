@@ -3,6 +3,7 @@
 //! [`crate::input::text_box`]（单行）复用，避免两处各自维护一份。
 
 use std::ops::Range;
+use std::path::PathBuf;
 
 use gpui::{actions, Bounds, Pixels};
 use unicode_segmentation::UnicodeSegmentation;
@@ -63,6 +64,12 @@ pub struct TextInputEvent;
 /// 供外层持有者（如编辑器应用）监听，以便实时刷新"未保存/脏标记"等依赖内容变更的状态。
 #[derive(Clone, Copy, Debug)]
 pub struct TextEditEvent;
+
+/// 用户把外部文件**拖放到**文本输入控件上时发出的事件（携带被拖入的文件路径）。
+///
+/// 由控件在 `on_drop` 回调里发出，外层持有者订阅后据此打开文件。
+#[derive(Clone, Debug)]
+pub struct FileDropped(pub PathBuf);
 
 /// 撤销/重做的历史记录单元。
 #[derive(Clone)]

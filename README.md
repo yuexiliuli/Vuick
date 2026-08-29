@@ -1,14 +1,18 @@
 # gpui-editor
 
-基于 **Rust + GPUI 0.2.2** 原生实现的文本 / 代码 / Markdown 编辑器。
-界面为"菜单栏 + 工具栏 + 编辑区 + 可选 Markdown 预览区 + 状态栏"布局。
+基于 **Rust + GPUI 0.2.2** 原生实现的文本 / 代码 / Markdown 编辑器（多文件选项卡）。
+界面为"菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览区 + 状态栏"布局。
 
 ## 功能特性
 
-- **文件编辑**：打开本地文本 / 代码 / Markdown 文件，Enter 换行，Ctrl+S 保存；打开后路径自动回填到路径框。
-- **打开文件方式**：路径框输入回车 / 点"打开"、菜单「文件 → 打开」、命令行参数，或**直接从资源管理器拖拽文件到窗口**（GPUI `ExternalPaths` 拖放）。
+- **多文件选项卡**（`app.rs::render_tab_bar`）：「文件 → 新建 / `Ctrl+N` / 工具栏 +」新建选项卡，内容彼此独立；点击切换，点 × 关闭；**关闭未保存的选项卡时弹出原生确认框**（保存 / 不保存 / 取消），最后一个选项卡关闭退化为空白页。
+- **系统文件对话框**（`rfd` 原生对话框，无需手动输入路径）：
+  - **打开**：`Ctrl+O` / 菜单「文件 → 打开」弹出系统"打开文件"对话框；
+  - **保存**：`Ctrl+S` 直接保存到当前文件；未命名时弹出"保存文件"对话框（即另存为）；
+  - **另存为**：菜单「文件 → 另存为」弹出系统保存对话框。
+- **拖放打开**：从资源管理器把文件拖到**编辑区 / 预览区 / 窗口空白处**直接打开（拖放处理挂在被悬停的顶层控件上，`TextArea` 发出 `FileDropped` 事件）。
 - **菜单栏**（`app.rs::render_menu_bar`）：文件（新建 / 打开 / 保存 / 另存为 / 退出）、编辑（撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选）、查看（预览开关 / 字号调节）、帮助；下拉面板带悬停高亮，点击空白关闭。
-- **Markdown 实时预览**：打开 `.md` 文件自动启用；预览开关对任意内容生效（在未命名缓冲区直接写 Markdown 也能预览）。长文档可滚动。
+- **Markdown 实时预览**：打开 `.md` 文件自动启用；预览开关对任意内容生效（在未命名缓冲区直接写 Markdown 也能预览）。长文档可滚动，预览区也可接收文件拖放。
 - **Markdown 渲染**（`markdown.rs`，移植自前端 `markdown.ts`）：
   - 段落、标题、行内 `code` / 加粗 / 斜体 / 删除线 / 链接、围栏代码块、有序/无序列表、表格、引用、分割线；
   - 表头加粗真正作用到 TextRun 字体；长不可断片段（长 URL/长串）自动插入零宽空格换行，不再溢出窗口。
@@ -19,7 +23,7 @@
 - **编辑可用性增强**：
   - **行号槽**：编辑区左侧行号与正文在**同一滚动容器**内同步平移、逐行对齐（含短内容垂直居中补偿，`app.rs::render_line_gutter`）；
   - **状态栏**：文件名 + 未保存「● 脏标记」+ 语言徽标，实时 **Ln / Col**、行数、字数，以及**字号 −/+ 调节**（`app.rs::render_status_bar`）；
-  - 标题栏展示当前文件名（含脏标记），编辑后立即置脏、保存/打开后清除。
+  - 每个选项卡独立展示脏标记（●），编辑后立即置脏、保存/打开后清除。
 - **美化滚动条**（`scrollbar.rs`）：编辑区自绘垂直滚动条；表格横向滚动条。
 
 ## 技术栈
@@ -27,8 +31,7 @@
 | 类别 | 选型 |
 | --- | --- |
 | 语言 / UI | Rust · GPUI `0.2.2`（无 webview，原生窗口） |
-| 后端 HTTP | `reqwest` blocking / json / multipart |
-| 序列化 | `serde` / `serde_json` |
+| 文件对话框 | `rfd`（系统原生打开 / 保存对话框） |
 | 文本处理 | `regex` · `unicode-segmentation` |
 | 加解密 | `aes-gcm` · `hex` |
 | 测试 | GPUI `test-support`（`cargo test`） |
@@ -38,10 +41,8 @@
 ```
 src/
 ├── main.rs                     # 入口：初始化应用、注册键盘快捷键、打开主窗口
-├── app.rs                      # 主视图 ChatApp：标题栏/消息区/输入栏布局，历史轮次与
-│                               #   流式状态管理，复制(按钮/右键/Ctrl+C)、空态、清空会话
-├── backend.rs                  # Dify 后端客户端：解密上传文档、流式对话(SSE)、会话维护
-│                               #   配置从 assets/config.json 编译期嵌入（BackendConfig）
+├── app.rs                      # 主视图 EditorApp：菜单栏/选项卡栏/编辑区/预览区/状态栏，
+│                               #   选项卡管理、系统文件对话框(rfd)、拖放打开、脏标记
 ├── markdown.rs                 # Markdown → GPUI 元素树渲染 + 文本选择子系统
 │                               #   · 解析(parse_markdown/行内 spans)、渲染(表格双模式 断行)
 │                               #   · 选择(SeclectCtx/SelectText 自绘叶子)：拖选高亮、
@@ -49,12 +50,9 @@ src/
 ├── scrollbar.rs                # 自绘滚动条：垂直(Sceollbar) + 表格横向(horizontal_scrollbar)
 └── input/
     ├── mod.rs                  # 模块导出与默认动作集
-    ├── shared.rs               # 共享工具：词边界、选区矩形等纯函数 + actions! 动作声明
-    ├── text_area.rs            # 多行输入控件（TextArea，行级增量排版/输入法/选择/滚动）
+    ├── shared.rs               # 共享工具：词边界、选区矩形等纯函数 + actions! 动作声明 + 事件
+    ├── text_area.rs            # 多行输入控件（TextArea，行级增量排版/输入法/选择/滚动/拖放）
     └── text_box.rs             # 单行输入预留组件
-assets/
-├── config.json                 # 后端敏感配置（gitignore，编译期嵌入，勿提交）
-└── doc.bin                     # 默认加密文档（编译期嵌入，启动时解密上传）
 ```
 
 ### 核心机制说明
@@ -68,9 +66,9 @@ assets/
 
 | 按键 | 作用 |
 | --- | --- |
-| `Ctrl+S` | 保存 |
-| `Ctrl+N` | 新建文件 |
-| `Ctrl+O` | 打开文件（聚焦路径框） |
+| `Ctrl+S` | 保存（未命名时弹保存对话框） |
+| `Ctrl+N` | 新建选项卡 |
+| `Ctrl+O` | 打开文件（系统对话框） |
 | `Ctrl+P` | 预览开关 |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 增大 / 减小 / 重置字号 |
 | `Enter` | 换行（编辑区） |
@@ -92,30 +90,6 @@ cargo build --release
 # 全量测试（含文本域、Markdown、滚动、选区等回归）
 cargo test
 ```
-
-> 说明：`assets/config.json` 被 `.gitignore` 忽略。克隆后需要自行准备该文件（字段见下）与 `assets/doc.bin`（可选加密默认文档），否则 `include_str!` 编译会失败。
-
-## 配置
-
-`assets/config.json` 编译期嵌入，字段（`BackendConfig`）：
-
-```jsonc
-{
-  "api_base":      "https://<dify-host>/v1",   // Dify API 根地址
-  "api_key":       "app-xxxx",                 // 应用密钥
-  "default_user":  "anonymous",                // 默认用户
-  "url_upload":    "/files/upload",            // 文档上传路径
-  "url_chat":      "/chat-messages",           // 对话接口
-  "field_getsecret": "...",                    // 解密密钥来源字段
-  "field_file_type": "pdf",                    // 默认文档类型
-  "field_file_transfer": "..."                 // 上传文件字段名
-}
-```
-
-## 安全备注
-
-- 密钥只外置到 `assets/config.json`（不入库），但**客户端内嵌密钥结构性不安全**：`strings` 可在可执行文件中直接挖出明文。生产环境应改为"客户端不带密钥、经自有代理转发鉴权"的方案，并定期轮换。
-- 该说明同样适用于解密上传的默认文档（`doc.bin`）——解密所需密钥存在于客户端，文档内容可被提取。
 
 ## 已知限制与后续方向
 
