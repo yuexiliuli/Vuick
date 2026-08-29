@@ -46,6 +46,12 @@ actions!(
         Redo,
         Quit,
         Save,
+        NewFile,
+        OpenFile,
+        TogglePreview,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
     ]
 );
 

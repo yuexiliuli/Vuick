@@ -1,20 +1,25 @@
 ﻿//! 应用主视图 `EditorApp`：文本 / 代码 / Markdown 编辑器。
 //!
 //! 布局（自上而下）：
-//! - 顶部标题栏：标题 + 文件路径输入框 + "打开" / "保存" 按钮 + "预览"开关
+//! - 菜单栏：文件 / 编辑 / 查看 / 帮助，点击弹出下拉菜单（[`EditorApp::render_menu_bar`]）
+//! - 工具栏：标题 + 文件路径输入框 + "打开" / "保存" 按钮 + "预览"开关
 //! - 编辑区：多行文本编辑器（[`input::TextArea`]），可编辑任意文本 / 代码文件
-//! - 预览区（仅 Markdown 且开启预览时）：右侧分屏实时渲染 Markdown（复用 [`markdown`]）
+//! - 预览区（开启预览时）：右侧分屏实时渲染 Markdown（复用 [`markdown`]）
+//! - 状态栏：文件名 / 脏标记 / 语言徽标 / 行列 / 行数 / 字数 / 字号调节
 //!
-//! 打开文件：在路径框输入路径后回车 / 点"打开"，或用命令行参数传入路径。
+//! 打开文件：路径框输入回车 / 点"打开"、菜单"文件→打开"、命令行参数、或将文件
+//! 拖拽到窗口上（[`gpui::ExternalPaths`] 拖放）。
 //! 保存文件：`Ctrl+S`（未指定路径时会聚焦路径框提示先填写）。
 
+use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui::{
-    div, px, rgb, white, App, AppContext, Context, CursorStyle, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Window,
+    div, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
 };
 
 use super::markdown::{parse_markdown, render_markdown_blocks, Block, MarkdownTheme, TableMode};
@@ -30,6 +35,21 @@ const FONT_MIN: f32 = 10.0;
 const FONT_MAX: f32 = 28.0;
 /// 行号槽宽度。
 const GUTTER_W: Pixels = px(46.);
+/// 菜单栏高度。
+const MENU_BAR_H: Pixels = px(26.);
+/// 菜单项宽度。
+const MENU_ITEM_W: Pixels = px(56.);
+/// 下拉菜单面板宽度。
+const MENU_PANEL_W: Pixels = px(220.);
+
+/// 顶部菜单标识。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuId {
+    File,
+    Edit,
+    View,
+    Help,
+}
 
 pub struct EditorApp {
     /// 主编辑区
@@ -42,7 +62,7 @@ pub struct EditorApp {
     preview_scroll: gpui::ScrollHandle,
     /// 预览表格横向滚动状态
     preview_table: TableScrollState,
-    /// 是否显示预览（仅对 Markdown 生效）
+    /// 是否显示预览（对任意文本生效，内容按 Markdown 渲染）
     preview_on: bool,
     /// 预览区 Markdown 解析缓存（内容不变时复用，避免每帧重新解析大文档）
     md_cache: Option<(SharedString, Vec<Block>)>,
@@ -53,6 +73,10 @@ pub struct EditorApp {
     dirty: bool,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
+    /// 当前展开的下拉菜单（None = 无）
+    open_menu: Option<MenuId>,
+    /// 下拉菜单中当前悬停的条目（用于高亮）
+    menu_hover: Option<(MenuId, usize)>,
     focus_handle: FocusHandle,
     /// 订阅（保持有效）
     _subscriptions: Vec<Subscription>,
@@ -113,6 +137,8 @@ impl EditorApp {
             status_ok: true,
             dirty: false,
             font_size: DEFAULT_FONT_SIZE,
+            open_menu: None,
+            menu_hover: None,
             focus_handle,
             _subscriptions: Vec::new(),
         };
@@ -216,14 +242,6 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 当前文件是否为 Markdown（按扩展名）。
-    fn is_markdown(&self) -> bool {
-        self.file_path
-            .as_ref()
-            .map(|p| Self::is_markdown_path(p))
-            .unwrap_or(false)
-    }
-
     fn is_markdown_path(p: &Path) -> bool {
         p.extension()
             .and_then(|e| e.to_str())
@@ -231,9 +249,10 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
-    /// 是否展示预览：开启预览且为 Markdown。
+    /// 是否展示预览：预览开关打开即展示（内容一律按 Markdown 渲染，
+    /// 不再要求文件扩展名为 .md，方便在未命名缓冲区里直接写 Markdown）。
     fn show_preview(&self) -> bool {
-        self.preview_on && self.is_markdown()
+        self.preview_on
     }
 
     /// 当前打开文件的显示名（无文件时为"未命名"）。
@@ -283,6 +302,332 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 新建文件：清空编辑区与路径，重置状态。
+    fn new_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |ed, cx| {
+            ed.content = SharedString::from("");
+            ed.selected_range = 0..0;
+            ed.scroll_handle.set_offset(gpui::point(px(0.), px(0.)));
+            cx.notify();
+        });
+        self.file_path = None;
+        self.dirty = false;
+        self.md_cache = None;
+        self.preview_on = false;
+        self.status = SharedString::from("新建文件");
+        self.status_ok = true;
+        window.focus(&self.editor.read(cx).focus_handle.clone());
+        cx.notify();
+    }
+
+    /// 打开文件：聚焦路径输入框（无原生文件对话框时的手动路径入口）。
+    fn open_file_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = SharedString::from("在路径框输入文件路径后回车，或将文件拖入窗口");
+        self.status_ok = true;
+        window.focus(&self.path.read(cx).focus_handle.clone());
+        cx.notify();
+    }
+
+    /// 关闭所有下拉菜单。
+    fn close_menus(&mut self, cx: &mut Context<Self>) {
+        if self.open_menu.is_some() {
+            self.open_menu = None;
+            self.menu_hover = None;
+            cx.notify();
+        }
+    }
+
+    /// 切换指定下拉菜单的展开状态。
+    fn toggle_menu(&mut self, id: MenuId, cx: &mut Context<Self>) {
+        self.open_menu = if self.open_menu == Some(id) { None } else { Some(id) };
+        self.menu_hover = None;
+        cx.notify();
+    }
+
+    /// 菜单栏中各按钮的水平偏移（与布局一致：px_1 内边距 + 等宽按钮 + gap_1）。
+    fn menu_button_left(id: MenuId) -> Pixels {
+        let idx = match id {
+            MenuId::File => 0,
+            MenuId::Edit => 1,
+            MenuId::View => 2,
+            MenuId::Help => 3,
+        };
+        px(4.) + (MENU_ITEM_W + px(4.)) * idx as f32
+    }
+
+    /// 顶部菜单栏：文件 / 编辑 / 查看 / 帮助。
+    fn render_menu_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.open_menu;
+        let make_button = |id: MenuId, label: &'static str, cx: &mut Context<Self>| {
+            let is_open = open == Some(id);
+            div()
+                .id(SharedString::from(format!("menu-btn-{id:?}")))
+                .w(MENU_ITEM_W)
+                .h(MENU_BAR_H)
+                .flex()
+                .items_center()
+                .px_2()
+                .rounded_md()
+                .bg(if is_open {
+                    rgb(0xe5e7eb)
+                } else {
+                    rgba(0x00000000)
+                })
+                .text_size(px(13.))
+                .font_weight(if is_open {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::NORMAL
+                })
+                .text_color(rgb(0x111827))
+                .cursor(CursorStyle::PointingHand)
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                        this.toggle_menu(id, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+        };
+        let file_btn = make_button(MenuId::File, "文件", cx);
+        let edit_btn = make_button(MenuId::Edit, "编辑", cx);
+        let view_btn = make_button(MenuId::View, "查看", cx);
+        let help_btn = make_button(MenuId::Help, "帮助", cx);
+
+        div()
+            .id("menu-bar")
+            .h(MENU_BAR_H)
+            .w_full()
+            .px_1()
+            .flex()
+            .items_center()
+            .gap_1()
+            .bg(rgb(0xf3f4f6))
+            .border_b_1()
+            .border_color(rgb(0xe5e7eb))
+            .child(file_btn)
+            .child(edit_btn)
+            .child(view_btn)
+            .child(help_btn)
+    }
+
+    /// 菜单项分组：`(标签, 快捷键提示, 点击行为)`。
+    fn menu_definitions(&self) -> Vec<(MenuId, &'static str, Vec<(&'static str, &'static str)>)> {
+        vec![
+            (
+                MenuId::File,
+                "文件",
+                vec![
+                    ("新建", "Ctrl+N"),
+                    ("打开文件…", "Ctrl+O"),
+                    ("保存", "Ctrl+S"),
+                    ("另存为…", ""),
+                    ("—", ""),
+                    ("退出", "Ctrl+Q"),
+                ],
+            ),
+            (
+                MenuId::Edit,
+                "编辑",
+                vec![
+                    ("撤销", "Ctrl+Z"),
+                    ("重做", "Ctrl+Y"),
+                    ("—", ""),
+                    ("剪切", "Ctrl+X"),
+                    ("复制", "Ctrl+C"),
+                    ("粘贴", "Ctrl+V"),
+                    ("—", ""),
+                    ("全选", "Ctrl+A"),
+                ],
+            ),
+            (
+                MenuId::View,
+                "查看",
+                vec![
+                    ("预览", "Ctrl+P"),
+                    ("—", ""),
+                    ("增大字号", "Ctrl+="),
+                    ("减小字号", "Ctrl+-"),
+                    ("重置字号", "Ctrl+0"),
+                ],
+            ),
+            (
+                MenuId::Help,
+                "帮助",
+                vec![("关于", "")],
+            ),
+        ]
+    }
+
+    /// 下拉菜单面板（作为根布局最后一层、绝对定位绘制，覆盖在编辑区之上）。
+    fn render_menu_dropdown(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(menu) = self.open_menu else {
+            return div().into_any_element();
+        };
+        let left = Self::menu_button_left(menu);
+        let hover = self.menu_hover;
+        let weak = cx.weak_entity();
+        let items = self
+            .menu_definitions()
+            .into_iter()
+            .find(|(id, _, _)| *id == menu)
+            .map(|(_, _, items)| items)
+            .unwrap_or_default();
+
+        let mut panel_children: Vec<gpui::AnyElement> = Vec::new();
+        for (idx, (label, shortcut)) in items.iter().enumerate() {
+            // 分隔线
+            if *label == "—" {
+                panel_children.push(
+                    div()
+                        .my_1()
+                        .h(px(1.))
+                        .bg(rgb(0xe5e7eb))
+                        .into_any_element(),
+                );
+                continue;
+            }
+            let is_hover = hover == Some((menu, idx));
+            let weak = weak.clone();
+            panel_children.push(
+                div()
+                    .id(SharedString::from(format!("menu-item-{menu:?}-{idx}")))
+                    .h(px(30.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .bg(if is_hover {
+                        rgb(0xeef2ff)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .rounded_md()
+                    .text_size(px(13.))
+                    .text_color(rgb(0x111827))
+                    .cursor(CursorStyle::PointingHand)
+                    .child(*label)
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(0x9ca3af))
+                            .child(shortcut.to_string()),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                            this.dispatch_menu_action(menu, idx, window, cx);
+                            this.close_menus(cx);
+                        }),
+                    )
+                    .on_hover({
+                        let weak = weak.clone();
+                        move |hovered: &bool, _w, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                if *hovered {
+                                    this.menu_hover = Some((menu, idx));
+                                } else if this.menu_hover == Some((menu, idx)) {
+                                    this.menu_hover = None;
+                                }
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id("menu-overlay")
+            .absolute()
+            .inset_0()
+            // 空白处点击：让事件冒泡到根视图关闭菜单，同时挡住下层编辑器
+            .on_mouse_down(MouseButton::Left, |_ev, _w, _cx| {})
+            .child(
+                div()
+                    .absolute()
+                    .left(left)
+                    .top(MENU_BAR_H + px(2.))
+                    .w(MENU_PANEL_W)
+                    .bg(white())
+                    .border_1()
+                    .border_color(rgb(0xe5e7eb))
+                    .rounded_md()
+                    .shadow_lg()
+                    .py_1()
+                    .px_1()
+                    .flex()
+                    .flex_col()
+                    .children(panel_children),
+            )
+            .into_any_element()
+    }
+
+    /// 下拉菜单条目 → 具体操作。
+    fn dispatch_menu_action(
+        &mut self,
+        menu: MenuId,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let defs = self.menu_definitions();
+        let Some(items) = defs.iter().find(|(id, _, _)| *id == menu).map(|(_, _, i)| i) else {
+            return;
+        };
+        let Some(&(label, _)) = items.get(idx) else {
+            return;
+        };
+        let _ = label;
+        match menu {
+            MenuId::File => match idx {
+                0 => self.new_file(window, cx),
+                1 => self.open_file_prompt(window, cx),
+                2 => self.save(window, cx),
+                3 => self.save_as(window, cx),
+                5 => cx.quit(),
+                _ => {}
+            },
+            MenuId::Edit => match idx {
+                0 => window.dispatch_action(Box::new(input::Undo), cx),
+                1 => window.dispatch_action(Box::new(input::Redo), cx),
+                3 => window.dispatch_action(Box::new(input::Cut), cx),
+                4 => window.dispatch_action(Box::new(input::Copy), cx),
+                5 => window.dispatch_action(Box::new(input::Paste), cx),
+                7 => window.dispatch_action(Box::new(input::SelectAll), cx),
+                _ => {}
+            },
+            MenuId::View => match idx {
+                0 => {
+                    self.preview_on = !self.preview_on;
+                    cx.notify();
+                }
+                2 => self.change_font_size(1.0, cx),
+                3 => self.change_font_size(-1.0, cx),
+                4 => {
+                    self.font_size = DEFAULT_FONT_SIZE;
+                    cx.notify();
+                }
+                _ => {}
+            },
+            MenuId::Help => {
+                self.status = SharedString::from("GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2");
+                self.status_ok = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// 另存为：无原生文件对话框，引导用户在路径框输入新路径后保存。
+    fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.status = SharedString::from("请在路径框输入新路径，然后按 Ctrl+S 或点“保存”");
+        self.status_ok = false;
+        window.focus(&self.path.read(cx).focus_handle.clone());
+        cx.notify();
+    }
+
     // ==================== 渲染 ====================
 
     fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -292,7 +637,7 @@ impl EditorApp {
             rgb(0xd97706)
         };
 
-        // 打开按钮
+        // 打开按钮：路径框有内容则直接打开，否则聚焦路径框引导输入
         let open_btn = div()
             .id("open-btn")
             .px_3()
@@ -308,10 +653,12 @@ impl EditorApp {
             .child("打开")
             .on_mouse_up(MouseButton::Left, {
                 let path = self.path.clone();
-                cx.listener(move |this: &mut EditorApp, _ev, _window, cx| {
+                cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                     let p = path.read(cx).content.to_string();
                     if !p.trim().is_empty() {
                         this.open_file(&p, cx);
+                    } else {
+                        this.open_file_prompt(window, cx);
                     }
                 })
             });
@@ -374,6 +721,7 @@ impl EditorApp {
             .bg(white())
             .border_b_1()
             .border_color(rgb(0xe5e7eb))
+            .shadow_sm()
             .flex()
             .items_center()
             .justify_between()
@@ -471,47 +819,55 @@ impl EditorApp {
             .border_color(rgb(0xe5e7eb))
             .rounded_md()
             .overflow_hidden()
-            .child(self.render_line_gutter(&handle, cx))
             .child(
+                // 编辑区滚动容器：行号槽 + 编辑器作为普通流子元素，共用同一个句柄
+                // 一起平移，行号与正文永远不会被 clamping / scroll-to-active 拆散。
                 div()
                     .id("editor-scroll")
                     .flex_1()
                     .min_w(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&handle)
-                    .px_3()
+                    .flex()
+                    .flex_row()
                     .py_2()
-                    .font_family("Consolas")
-                    .text_size(px(self.font_size))
-                    .line_height(gpui::relative(1.5))
-                    .child(self.editor.clone()),
+                    .child(self.render_line_gutter(cx))
+                    .child(
+                        div()
+                            .id("editor-text-wrap")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .px_3()
+                            .font_family("Consolas")
+                            .text_size(px(self.font_size))
+                            .line_height(gpui::relative(1.5))
+                            .child(self.editor.clone()),
+                    ),
             )
     }
 
-    /// 行号槽：与编辑区共用同一个滚动句柄，随内容同步滚动，行号严格对齐正文。
-    fn render_line_gutter(&mut self, handle: &gpui::ScrollHandle, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 行号槽：普通流布局逐行堆叠行号，随外层滚动容器与正文同步平移。
+    ///
+    /// 顶部内边距补上 TextArea 在短内容（`min_h(40)` 盒子垂直居中）时的偏移，
+    /// 否则行号会比正文"偏上"。
+    fn render_line_gutter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let ed = self.editor.read(cx);
         let lh = ed.last_line_height;
         let offsets = ed.last_visual_offsets.clone();
         let total = ed.last_content_height;
         let lines = ed.last_layout.as_ref().map(|l| l.len()).unwrap_or(0);
-        let scroll_y = (-handle.offset().y).max(px(0.));
-        let viewport_h = handle.bounds().size.height;
-        let mono = "Consolas".to_string();
 
-        // 只渲染与视口相交的逻辑行，避免超大文档每帧生成上万个 div
+        // TextArea 在内容不足一行（或很短）时会在 `min_h(40)` 盒子里垂直居中
+        let center_offset = ((px(40.) - ed.last_content_height) / 2.0).max(px(0.));
+
         let mut numbers: Vec<gpui::Div> = Vec::new();
         for i in 0..lines {
             let top = offsets.get(i).copied().unwrap_or(px(0.));
             let bottom = offsets.get(i + 1).copied().unwrap_or(total);
-            if bottom <= scroll_y || top > scroll_y + viewport_h {
-                continue;
-            }
             let row_h = (bottom - top).max(lh);
             numbers.push(
                 div()
-                    .absolute()
-                    .top(top)
+                    .debug_selector(move || format!("gutter-line-{}", i + 1))
                     .h(row_h)
                     .w_full()
                     .flex()
@@ -526,16 +882,14 @@ impl EditorApp {
 
         div()
             .id("editor-gutter")
-            .relative()
             .w(GUTTER_W)
             .flex_shrink_0()
-            .py_2()
-            .overflow_y_scroll()
-            .track_scroll(handle)
+            .pt(center_offset)
+            .pb_2()
             .border_r_1()
             .border_color(rgb(0xe5e7eb))
             .bg(rgb(0xfafafa))
-            .font_family(mono)
+            .font_family("Consolas")
             .children(numbers)
     }
 
@@ -707,6 +1061,7 @@ impl EditorApp {
                     .id("preview-pane")
                     .flex_1()
                     .min_w(px(0.))
+                    .overflow_y_scroll()
                     .track_scroll(&self.preview_scroll)
                     .bg(rgb(0xf8f9fa))
                     .px_4()
@@ -756,11 +1111,190 @@ impl Render for EditorApp {
             .size_full()
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
+            // 任意空白处点击 → 关闭已展开的下拉菜单
+            .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
+                this.close_menus(cx)
+            }))
+            // 从资源管理器拖入文件 → 直接打开
+            .can_drop(|drag: &dyn Any, _w, _c| {
+                drag.downcast_ref::<Arc<ExternalPaths>>().is_some()
+            })
+            .on_drop(cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, _w, cx| {
+                if let Some(p) = paths.paths().first() {
+                    this.open_file(&p.to_string_lossy(), cx);
+                }
+            }))
             .on_action(cx.listener(|this: &mut EditorApp, _: &input::Save, window, cx| {
                 this.save(window, cx)
             }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::NewFile, window, cx| {
+                this.new_file(window, cx)
+            }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::OpenFile, window, cx| {
+                this.open_file_prompt(window, cx)
+            }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::TogglePreview, _w, cx| {
+                this.preview_on = !this.preview_on;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::IncreaseFontSize, _w, cx| {
+                this.change_font_size(1.0, cx)
+            }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::DecreaseFontSize, _w, cx| {
+                this.change_font_size(-1.0, cx)
+            }))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::ResetFontSize, _w, cx| {
+                this.font_size = DEFAULT_FONT_SIZE;
+                cx.notify();
+            }))
+            .child(self.render_menu_bar(cx))
             .child(self.render_header(cx))
             .child(body)
             .child(self.render_status_bar(cx))
+            // 下拉菜单覆盖层放在最后一层，保证绘制在编辑区之上
+            .child(self.render_menu_dropdown(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    /// 行号槽对齐：单行短内容（TextArea 垂直居中）与多行滚动后，行号都应与正文对齐。
+    #[gpui::test]
+    async fn gutter_numbers_align_with_text(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 单行短内容（触发 TextArea 垂直居中，正是行号"偏上"的历史场景）
+        view.update(cx, |app, cx| {
+            app.editor.update(cx, |ed, cx| {
+                ed.content = "hello world".into();
+                ed.selected_range = 11..11;
+                cx.notify();
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 行号 1 顶部应等于编辑区文本元素顶部（last_bounds 已含居中偏移）
+        let gutter_top = cx.debug_bounds("gutter-line-1").map(|b| b.top());
+        let text_top = cx.update(|_w, cx| {
+            view.read(cx).editor.read(cx).last_bounds.map(|b| b.top())
+        });
+        let (gutter_top, text_top) = (gutter_top.unwrap(), text_top.unwrap());
+        assert!(
+            (gutter_top - text_top).abs() < px(1.),
+            "单行内容行号应对齐正文首行：gutter={gutter_top:?} text={text_top:?}"
+        );
+
+        // 多行内容 + 滚动：行号应随正文同步平移
+        view.update(cx, |app, cx| {
+            let content = (0..30)
+                .map(|i| format!("第{i}行内容 xyz"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            app.editor.update(cx, |ed, cx| {
+                ed.content = content.into();
+                ed.selected_range = 0..0;
+                cx.notify();
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let handle = cx.update(|_w, cx| view.read(cx).editor.read(cx).scroll_handle.clone());
+        handle.set_offset(gpui::point(px(0.), px(-120.)));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (offset_after, text_top, offsets) = cx.update(|_w, cx| {
+            let ed = view.read(cx).editor.read(cx);
+            (
+                ed.scroll_handle.offset(),
+                ed.last_bounds.map(|b| b.top()),
+                ed.last_visual_offsets.clone(),
+            )
+        });
+        let _ = offset_after;
+        let gutter_10 = cx.debug_bounds("gutter-line-10").map(|b| b.top());
+        let expected = text_top.unwrap() + offsets[9];
+        assert!(
+            (gutter_10.unwrap() - expected).abs() < px(1.),
+            "滚动后第 10 行行号应对齐正文：gutter={gutter_10:?} expected={expected:?}"
+        );
+    }
+
+    /// 冒烟测试：完整渲染整棵 UI 树（菜单栏/工具栏/编辑区/状态栏），
+    /// 展开下拉菜单并打开一个临时文件，确保渲染管线无 panic。
+    #[gpui::test]
+    async fn renders_and_opens_menu(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        // 展开"文件"菜单并渲染（覆盖 render_menu_dropdown 全路径）
+        view.update(cx, |app, cx| {
+            app.toggle_menu(MenuId::File, cx);
+            app.toggle_menu(MenuId::View, cx);
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        view.update(cx, |app, cx| app.close_menus(cx));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 打开一个真实文件，内容进入编辑区，再渲染（覆盖 open_file 路径）
+        let dir = std::env::temp_dir().join("gpui-editor-test.md");
+        std::fs::write(&dir, "# 标题\n\n**加粗** 正文 `code`\n").unwrap();
+        view.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), cx));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (content, preview) = cx.update(|_w, cx| {
+            let app = view.read(cx);
+            (
+                app.editor.read(cx).content.to_string(),
+                app.show_preview(),
+            )
+        });
+        assert!(content.contains("标题"), "打开文件后编辑区应有内容: {content}");
+        assert!(preview, "打开 .md 文件应自动开启预览");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 冒烟测试：字号调节 / 预览开关等纯状态操作正常。
+    #[gpui::test]
+    async fn font_and_preview_toggles(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        view.update(cx, |app, cx| {
+            app.change_font_size(3.0, cx);
+            app.change_font_size(-1.0, cx);
+            app.preview_on = true;
+            cx.notify();
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (font, preview) = cx.update(|_w, cx| {
+            let app = view.read(cx);
+            (app.font_size, app.show_preview())
+        });
+        assert_eq!(font, DEFAULT_FONT_SIZE + 2.0);
+        assert!(preview, "预览开关打开后 show_preview 应为 true（不依赖 .md 扩展名）");
     }
 }

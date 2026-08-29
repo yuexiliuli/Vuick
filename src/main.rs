@@ -69,6 +69,13 @@ fn main() {
             KeyBinding::new("ctrl-enter", input::ShiftEnter, None),
             // 保存文件
             KeyBinding::new("ctrl-s", input::Save, None),
+            // 应用级命令（新建 / 打开 / 预览 / 字号）
+            KeyBinding::new("ctrl-n", input::NewFile, None),
+            KeyBinding::new("ctrl-o", input::OpenFile, None),
+            KeyBinding::new("ctrl-p", input::TogglePreview, None),
+            KeyBinding::new("ctrl-=", input::IncreaseFontSize, None),
+            KeyBinding::new("ctrl--", input::DecreaseFontSize, None),
+            KeyBinding::new("ctrl-0", input::ResetFontSize, None),
         ]);
 
         let window = cx
