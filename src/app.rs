@@ -879,50 +879,59 @@ impl EditorApp {
     fn render_editor_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.tabs[self.active_tab].editor.clone();
         let handle = editor.read(cx).scroll_handle.clone();
+        // TextArea 的"布局高度"会被 taffy 缓存压到一行（内容在构造后才增长时不会重新量高），
+        // 因此滚动容器的溢出检测不能依赖它，改用 TextArea 自己精确追踪的 last_content_height
+        // 作为正文包装层的显式高度，驱动滚轮/滚动条。
+        let content_h = editor.read(cx).last_content_height;
         div()
             .id("editor-area")
+            .debug_selector(|| "editor-area".into())
+            .relative()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .flex()
-            .flex_row()
             .bg(EDIT_BG)
             .border_1()
             .border_color(rgb(0xe5e7eb))
             .rounded_md()
             .overflow_hidden()
             .child(
-                // 编辑区滚动容器：行号槽 + 编辑器作为普通流子元素，共用同一个句柄
-                // 一起平移，行号与正文永远不会被 clamping / scroll-to-active 拆散。
+                // 滚动容器：`h_full w_full` 撑满编辑区（视口）；正文包装层是普通块子元素
+                // （随容器平移），其显式高度 = 正文内容高度，确保内容超高时可滚。
                 div()
                     .id("editor-scroll")
-                    .flex_1()
+                    .debug_selector(|| "editor-scroll".into())
+                    .h_full()
+                    .w_full()
                     .min_w(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&handle)
-                    .flex()
-                    .flex_row()
+                    .relative()
                     .py_2()
                     .child(self.render_line_gutter(&editor, cx))
                     .child(
                         div()
                             .id("editor-text-wrap")
-                            .flex_1()
+                            .debug_selector(|| "editor-text-wrap".into())
+                            .h(content_h)
                             .min_w(px(0.))
-                            .px_3()
+                            .pl(GUTTER_W + px(4.))
+                            .pr_3()
                             .font_family("Consolas")
                             .text_size(px(self.font_size))
                             .line_height(gpui::relative(1.5))
-                            .child(editor),
+                            .child(editor.clone()),
                     ),
             )
     }
 
-    /// 行号槽：普通流布局逐行堆叠行号，随外层滚动容器与正文同步平移。
-    ///
-    /// 顶部内边距补上 TextArea 在短内容（`min_h(40)` 盒子垂直居中）时的偏移，
-    /// 否则行号会比正文"偏上"。
-    fn render_line_gutter(&mut self, editor: &gpui::Entity<TextArea>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 行号槽：absolute 覆盖在编辑区左缘。行号是滚动容器的子元素，会随容器一起平移，
+    /// 因此行号用**内容坐标**（`py_2(8px) + 居中偏移 + 行偏移`）摆放即可，与正文同帧对齐。
+    fn render_line_gutter(
+        &mut self,
+        editor: &gpui::Entity<TextArea>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let ed = editor.read(cx);
         let lh = ed.last_line_height;
         let offsets = ed.last_visual_offsets.clone();
@@ -940,6 +949,8 @@ impl EditorApp {
             numbers.push(
                 div()
                     .debug_selector(move || format!("gutter-line-{}", i + 1))
+                    .absolute()
+                    .top(px(8.) + center_offset + top)
                     .h(row_h)
                     .w_full()
                     .flex()
@@ -954,10 +965,13 @@ impl EditorApp {
 
         div()
             .id("editor-gutter")
+            .debug_selector(|| "editor-gutter".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
             .w(GUTTER_W)
-            .flex_shrink_0()
-            .pt(center_offset)
-            .pb_2()
+            .overflow_hidden()
             .border_r_1()
             .border_color(rgb(0xe5e7eb))
             .bg(rgb(0xfafafa))
@@ -1290,9 +1304,10 @@ mod tests {
             "单行内容行号应对齐正文首行：gutter={gutter_top:?} text={text_top:?}"
         );
 
-        // 多行内容 + 滚动：行号应随正文同步平移
+        // 多行内容 + 滚动：光标移到末尾行（scroll_cursor_into_view 会滚到可见区），
+        // 等偏移稳定后行号应与正文严格对齐。
         view.update(cx, |app, cx| {
-            let content = (0..30)
+            let content = (0..200)
                 .map(|i| format!("第{i}行内容 xyz"))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -1303,32 +1318,34 @@ mod tests {
                 cx.notify();
             });
         });
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        let handle = cx.update(|_w, cx| {
-            view.read(cx).tabs[view.read(cx).active_tab]
-                .editor
-                .read(cx)
-                .scroll_handle
-                .clone()
-        });
-        handle.set_offset(gpui::point(px(0.), px(-120.)));
+        // 光标移动到文档末尾（会触发 scroll_cursor_into_view 滚到可见区）
         cx.update(|window, cx| {
-            let _ = window.draw(cx);
+            let app = view.read(cx);
+            window.focus(&app.tabs[app.active_tab].editor.read(cx).focus_handle.clone());
         });
-        for _ in 0..5 {
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::MoveToEndOfDocument), cx);
+        });
+        for _ in 0..8 {
             cx.run_until_parked();
         }
-        let gutter_10 = cx.debug_bounds("gutter-line-10").map(|b| b.top());
-        let (text_top, offsets) = cx.update(|_w, cx| {
+        let gutter_last = cx.debug_bounds("gutter-line-199").map(|b| b.top());
+        let (text_top, offsets, scroll) = cx.update(|_w, cx| {
             let ed = view.read(cx).tabs[view.read(cx).active_tab].editor.read(cx);
-            (ed.last_bounds.map(|b| b.top()), ed.last_visual_offsets.clone())
+            (
+                ed.last_bounds.map(|b| b.top()),
+                ed.last_visual_offsets.clone(),
+                ed.scroll_handle.offset().y,
+            )
         });
-        let expected = text_top.unwrap() + offsets[9];
         assert!(
-            (gutter_10.unwrap() - expected).abs() < px(1.),
-            "滚动后第 10 行行号应对齐正文：gutter={gutter_10:?} expected={expected:?}"
+            scroll < px(0.),
+            "光标移到末尾后应已滚动（scroll={scroll:?}）"
+        );
+        let expected = text_top.unwrap() + offsets[198];
+        assert!(
+            (gutter_last.unwrap() - expected).abs() < px(1.),
+            "滚动后第 199 行行号应对齐正文：gutter={gutter_last:?} expected={expected:?}"
         );
     }
 
@@ -1370,6 +1387,115 @@ mod tests {
         assert_eq!(active, 1, "新选项卡应被激活");
         assert!(!tab1_dirty, "新选项卡初始未修改");
         assert_eq!(tab0_content, "hello", "第 1 个选项卡内容应保留");
+    }
+
+    /// 编辑菜单/快捷键的动作分发：撤销、重做、复制、粘贴、全选应能到达聚焦的编辑区。
+    #[gpui::test]
+    async fn edit_actions_dispatch(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 聚焦编辑区并输入内容
+        let editor = cx.update(|window, cx| {
+            let app = view.read(cx);
+            window.focus(&app.tabs[app.active_tab].editor.read(cx).focus_handle.clone());
+            app.tabs[app.active_tab].editor.clone()
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |ed, cx| ed.insert_text_at_cursor("hello", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 撤销：应清空内容
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Undo), cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let after_undo = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(after_undo, "", "撤销后内容应清空，实际={after_undo:?}");
+
+        // 重做：应恢复内容
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Redo), cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let after_redo = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(after_redo, "hello", "重做后内容应恢复，实际={after_redo:?}");
+
+        // 复制：选中"hello"后 Ctrl+C 应写入剪贴板
+        cx.update(|_window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.content = "hello world".into();
+                ed.selected_range = 0..5;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Copy), cx);
+        });
+        let clip = cx.read_from_clipboard();
+        assert_eq!(clip.map(|c| c.text().unwrap_or_default().to_string()), Some("hello".into()), "复制应写入剪贴板");
+
+        // 粘贴：Ctrl+V 应把剪贴板内容插入（覆盖当前选区）
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Paste), cx);
+        });
+        let after_paste = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(after_paste, "hello world", "粘贴应替换选区，实际={after_paste:?}");
+
+        // 全选：Ctrl+A 应选中全部内容
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::SelectAll), cx);
+        });
+        let sel = cx.update(|_w, cx| {
+            let ed = editor.read(cx);
+            (ed.selected_range.start, ed.selected_range.end)
+        });
+        let len = cx.update(|_w, cx| editor.read(cx).content.len());
+        assert_eq!(sel, (0, len), "全选应选中全部内容，实际={sel:?}");
+    }
+
+    /// 编辑区在内容超高时应当可滚动（滚轮/拖动滚动条），与预览区一致。
+    #[gpui::test]
+    async fn editor_scrolls_when_content_overflows(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 通过真实输入路径插入多行内容（模拟打字），触发行级增量排版与滚动检测
+        let editor = cx.update(|_w, cx| view.read(cx).tabs[view.read(cx).active_tab].editor.clone());
+        let text = (0..80)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.insert_text_at_cursor(&text, window, cx);
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let max_h = cx.update(|_w, cx| {
+            view.read(cx).tabs[view.read(cx).active_tab]
+                .editor
+                .read(cx)
+                .scroll_handle
+                .max_offset()
+                .height
+        });
+        assert!(
+            max_h > px(0.),
+            "编辑区内容超高时应可滚动，max_offset={max_h:?}"
+        );
     }
 
     /// 冒烟测试：完整渲染整棵 UI 树（菜单/选项卡/编辑区/状态栏），

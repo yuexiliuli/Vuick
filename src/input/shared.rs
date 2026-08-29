@@ -72,10 +72,18 @@ pub struct TextEditEvent;
 pub struct FileDropped(pub PathBuf);
 
 /// 撤销/重做的历史记录单元。
+///
+/// 一次编辑 = 在 `range`（修改前内容中的位置）处把 `old_text` 替换为 `new_text`：
+/// - 撤销：把 `range.start..range.start+new_text.len()`（修改后内容中的区域）替换回 `old_text`；
+/// - 重做：把 `range` 替换为 `new_text`。
 #[derive(Clone)]
 pub struct HistoryItem {
-    pub text: String,
+    /// 修改在"修改前"内容中的位置
     pub range: Range<usize>,
+    /// 被替换掉的原文（撤销时恢复）
+    pub old_text: String,
+    /// 写入的新文本（重做时恢复）
+    pub new_text: String,
 }
 
 /// 撤销/重做栈。

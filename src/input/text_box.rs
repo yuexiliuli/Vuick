@@ -42,8 +42,6 @@ pub struct TextBox {
     marked_range: Option<Range<usize>>,
     /// Enter 是否发出提交事件
     pub submit_on_enter: bool,
-    /// 单次编辑前的快照（用于合并一次手势的多步编辑为一条历史）
-    pending: Option<HistoryItem>,
     /// 撤销/重做栈
     history: History,
     /// 是否处于"按住鼠标拖选"状态
@@ -75,7 +73,6 @@ impl TextBox {
             selection_reversed: false,
             marked_range: None,
             submit_on_enter: false,
-            pending: None,
             history: History::new(),
             is_selecting: false,
             last_bounds: None,
@@ -172,29 +169,16 @@ impl TextBox {
 
     // ------------------------------------------------------------ 编辑操作
 
-    /// 记录一次编辑前的快照（用于撤销合并）。
-    fn begin_edit(&mut self, cx: &mut Context<Self>) {
-        if self.pending.is_none() {
-            self.pending = Some(HistoryItem {
-                text: self.content.to_string(),
-                range: self.selected_range.clone(),
-            });
-        }
-        cx.notify();
-    }
-
-    /// 结束一次编辑手势，把快照压入历史栈。
-    fn commit(&mut self) {
-        if let Some(item) = self.pending.take() {
-            self.history.push(item);
-        }
-    }
-
-    /// 替换 `[start, end)` 为 `new_text`；单行会剔除换行。
+    /// 替换 `[start, end)` 为 `new_text`；单行会剔除换行。每次编辑都记录撤销快照。
     fn replace_in_range(&mut self, range: Range<usize>, new_text: &str) {
         let s = self.content.as_ref();
         let range = range.start.min(s.len())..range.end.min(s.len());
         let new_text = new_text.replace("\r\n", " ").replace(['\n', '\r'], " ");
+        self.history.push(HistoryItem {
+            range: range.clone(),
+            old_text: s[range.clone()].to_string(),
+            new_text: new_text.clone(),
+        });
         self.content = SharedString::from(format!(
             "{}{}{}",
             &s[..range.start],
@@ -207,18 +191,14 @@ impl TextBox {
         self.marked_range = None;
     }
 
-    /// 通用删除入口（记录历史快照）。
+    /// 通用删除入口。
     fn delete_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        self.begin_edit(cx);
         self.replace_in_range(range, "");
         cx.notify();
     }
 
-    /// 键入/IME 替换入口（若为一段连续键入，合并为一条历史）。
+    /// 键入/IME 替换入口。
     fn typed_replace(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
-        if self.pending.is_none() {
-            self.begin_edit(cx);
-        }
         self.replace_in_range(range, new_text);
         cx.notify();
     }
@@ -338,19 +318,22 @@ impl TextBox {
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(clipboard) = cx.read_from_clipboard() {
             let text = clipboard.text().unwrap_or_default();
-            self.begin_edit(cx);
             self.replace_in_range(self.selected_range.clone(), &text);
-            self.commit();
             cx.notify();
         }
     }
 
     fn undo(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = self.history.undo() {
-            self.content = SharedString::from(item.text.clone());
+            let item = item.clone();
+            let mut new = self.content.to_string();
+            let start = item.range.start;
+            let end = start + item.new_text.len();
+            new.replace_range(start.min(new.len())..end.min(new.len()), &item.old_text);
+            self.content = SharedString::from(new);
             let len = self.content.len();
-            let range = item.range.start.min(len)..item.range.end.min(len);
-            self.selected_range = range;
+            let pos = item.range.start.min(len);
+            self.selected_range = pos..pos;
             self.selection_reversed = false;
         }
         cx.notify();
@@ -358,10 +341,13 @@ impl TextBox {
 
     fn redo(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = self.history.redo() {
-            self.content = SharedString::from(item.text.clone());
-            let len = self.content.len();
-            let range = item.range.start.min(len)..item.range.end.min(len);
-            self.selected_range = range;
+            let item = item.clone();
+            let mut new = self.content.to_string();
+            let r = item.range.start.min(new.len())..item.range.end.min(new.len());
+            new.replace_range(r, &item.new_text);
+            self.content = SharedString::from(new);
+            let pos = (item.range.start + item.new_text.len()).min(self.content.len());
+            self.selected_range = pos..pos;
             self.selection_reversed = false;
         }
         cx.notify();
@@ -396,7 +382,6 @@ impl TextBox {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.is_selecting = false;
-        self.commit();
         cx.notify();
     }
 
@@ -528,9 +513,6 @@ impl EntityInputHandler for TextBox {
             .map(|r| range_from_utf16(self.content.as_ref(), r))
             .or(self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
-        if self.pending.is_none() {
-            self.begin_edit(cx);
-        }
         self.replace_in_range(range.clone(), new_text);
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());

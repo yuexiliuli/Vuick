@@ -58,9 +58,6 @@ pub struct TextArea {
     /// 需要换行时按 Shift+Enter。
     pub submit_on_enter: bool,
 
-    /// 记录单次标记/替换操作前的快照，用于手势开始时 push 历史
-    pending: Option<HistoryItem>,
-
     /// 撤销/重做栈
     history: History,
 
@@ -133,7 +130,6 @@ impl TextArea {
             marked_range: None,
             allow_newlines,
             submit_on_enter: false,
-            pending: None,
             history: History::new(),
             is_dragging_scrollbar: false,
             scrollbar_grab_offset: px(0.),
@@ -313,18 +309,17 @@ impl TextArea {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 记录撤销快照（只记录即将被替换掉的内容）
         let range = match range {
             Some(r) => r,
             None => self.selected_range.clone(),
         };
         let old = self.content.to_string();
-        if self.pending.is_none() {
-            self.pending = Some(HistoryItem {
-                text: old[range.clone()].to_string(),
-                range: range.start..range.start, // 恢复时把光标放在这段开头
-            });
-        }
+        // 每次编辑都记录一个撤销快照（撤销/重做都能正确恢复双向文本）
+        self.history.push(HistoryItem {
+            range: range.clone(),
+            old_text: old[range.clone()].to_string(),
+            new_text: text.to_string(),
+        });
         let mut new = old;
         new.replace_range(range.clone(), text);
         self.content = SharedString::from(new);
@@ -420,20 +415,15 @@ impl TextArea {
     }
 
 
-    /// 把当前 pending 快照压入撤销栈（在手势结束时调用）。
-    fn commit(&mut self) {
-        if let Some(item) = self.pending.take() {
-            self.history.push(item);
-        }
-    }
-
-    /// 撤销：回退到上一个快照。
+    /// 撤销：回退到上一个编辑。`new_text` 位于 `range.start..range.start+new_text.len()`，
+    /// 撤销即把这段恢复为 `old_text`。
     fn undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = self.history.undo() {
             let item = item.clone();
-            let old = self.content.to_string();
-            let mut new = old;
-            new.replace_range(item.range.clone(), &item.text);
+            let mut new = self.content.to_string();
+            let start = item.range.start;
+            let end = start + item.new_text.len();
+            new.replace_range(start..end, &item.old_text);
             self.content = SharedString::from(new);
             self.selected_range = item.range.start..item.range.start;
             self.selection_reversed = false;
@@ -444,15 +434,15 @@ impl TextArea {
         let _ = window;
     }
 
-    /// 重做：应用下一个快照。
+    /// 重做：应用下一个编辑，即把 `range` 处的 `old_text` 重新替换为 `new_text`。
     fn redo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = self.history.redo() {
             let item = item.clone();
-            let old = self.content.to_string();
-            let mut new = old;
-            new.replace_range(item.range.clone(), &item.text);
+            let mut new = self.content.to_string();
+            new.replace_range(item.range.clone(), &item.new_text);
             self.content = SharedString::from(new);
-            self.selected_range = item.range.end..item.range.end;
+            let cursor = item.range.start + item.new_text.len();
+            self.selected_range = cursor..cursor;
             self.selection_reversed = false;
             self.scroll_cursor_into_view(cx);
             cx.emit(TextEditEvent);
@@ -1000,7 +990,6 @@ impl TextArea {
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.is_dragging_scrollbar = false;
         self.is_selecting = false;
-        self.commit();
         cx.notify();
     }
 
@@ -1928,24 +1917,48 @@ mod tests {
     use super::*;
     use gpui::{AppContext, StatefulInteractiveElement};
 
+    #[gpui::test]
+    async fn undo_after_keyboard_typing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let focus = cx.focus_handle();
+            TextArea::new(focus, "".into(), "".into(), true)
+        });
+        cx.update(|window, cx| {
+            window.focus(&view.read(cx).focus_handle.clone());
+        });
+        // 键盘输入（不触发鼠标事件）
+        cx.update(|window, cx| {
+            view.update(cx, |ed, cx| ed.insert_text_at_cursor("hello", window, cx));
+        });
+        // 直接调用撤销
+        cx.update(|window, cx| {
+            view.update(cx, |ed, cx| ed.undo(window, cx));
+        });
+        let content = cx.update(|_w, cx| view.read(cx).content.to_string());
+        assert_eq!(content, "", "键盘输入后撤销应生效，实际={content:?}");
+    }
+
     #[test]
     fn history_undo_redo() {
         let mut h = History::new();
         h.push(HistoryItem {
-            text: "a".into(),
             range: 0..1,
+            old_text: "".into(),
+            new_text: "a".into(),
         });
         h.push(HistoryItem {
-            text: "b".into(),
             range: 1..2,
+            old_text: "".into(),
+            new_text: "b".into(),
         });
-        assert_eq!(h.undo().unwrap().text, "b");
-        assert_eq!(h.undo().unwrap().text, "a");
+        assert_eq!(h.undo().unwrap().new_text, "b");
+        assert_eq!(h.undo().unwrap().new_text, "a");
         assert!(h.undo().is_none());
-        assert_eq!(h.redo().unwrap().text, "a");
+        assert_eq!(h.redo().unwrap().new_text, "a");
         h.push(HistoryItem {
-            text: "c".into(),
             range: 2..3,
+            old_text: "".into(),
+            new_text: "c".into(),
         });
         // 在"b"之后做新编辑，会丢弃被撤销的部分，redo 应彻底失效
         assert!(h.redo().is_none());
