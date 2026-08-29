@@ -943,7 +943,7 @@ impl EditorApp {
                     .left(px(0.))
                     .right(px(0.))
                     .bottom(px(0.))
-                    .h(px(1.))
+                    .h(px(0.))
                     .child(horizontal_scrollbar(&self.tab_bar_hscroll, "tab-bar-hscroll"))
                     .into_any_element(),
             );
