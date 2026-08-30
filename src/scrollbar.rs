@@ -1,31 +1,23 @@
-//! 美化滚动条：跟随 [`ScrollHandle`] 的自绘垂直/横向滚动条。
-//!
-//! - [`Scrollbar`]：垂直（消息区右侧）。
-//! - [`horizontal_scrollbar`]：横向（表格超宽时表格下方），支持**拖拽滑块**。
+//! 美化横向滚动条：跟随 [`ScrollHandle`] 的自绘滚动条。
 //!
 //! 用法：放在滚动容器旁边/下方（同宽高），例如：
 //! ```ignore
 //! div().flex().flex_row().flex_1()
 //!     .child(scroll_container)      // .overflow_y_scroll().track_scroll(&handle)
-//!     .child(Scrollbar::new(handle))
+//!     .child(horizontal_scrollbar(&state, "scrollbar"))
 //! ```
 //! 内容不超高/超宽时不显示；仅在可滚动时画一条淡轨道 + 圆角半透明滑块。
 
 use gpui::{
-    div, point, px, rgba, size, App, Bounds, Corners, CursorStyle, Element, ElementId,
-    GlobalElementId, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseButton,
-    ParentElement, Pixels, ScrollHandle, Style, Styled, Window,
+    div, point, px, rgba, CursorStyle, ElementId, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, ScrollHandle, Styled,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// 滑块宽度 / 高度
-const BAR_W: Pixels = px(6.);
-/// 滑块圆角半径
-const THUMB_RADIUS: Pixels = px(3.);
 /// 滑块距边缘间距
 const GAP_RIGHT: Pixels = px(3.);
-/// 滑块最小尺寸（太小不好看/不好点）
+/// 滑块最小尺寸
 const THUMB_MIN: Pixels = px(26.);
 
 /// 横向滚动条的共享状态：滚动句柄 + 拖拽抓取偏移（跨帧保留，元素每帧重建也不丢）。
@@ -179,190 +171,4 @@ pub fn horizontal_scrollbar(
         });
 
     el
-}
-
-/// 滑块最小高度（太小不好看/不好点）
-const THUMB_MIN_H: Pixels = px(26.);
-
-pub struct Scrollbar {
-    handle: ScrollHandle,
-}
-
-impl Scrollbar {
-    pub fn new(handle: ScrollHandle) -> Self {
-        Self { handle }
-    }
-}
-
-impl gpui::IntoElement for Scrollbar {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for Scrollbar {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, ()) {
-        // 宽度固定，高度交给 flex（所在行默认 stretch → 与滚动容器同高）
-        let mut style = Style::default();
-        style.size.width = (BAR_W + GAP_RIGHT * 2.).into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
-        _window: &mut Window,
-        _cx: &mut App,
-    ) {
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
-        _prepaint: &mut (),
-        window: &mut Window,
-        _cx: &mut App,
-    ) {
-        let handle = &self.handle;
-        let viewport = handle.bounds();
-        let viewport_h = viewport.size.height;
-        if viewport_h <= px(0.) {
-            return;
-        }
-        let content_h = viewport_h + handle.max_offset().y;
-        if content_h <= viewport_h + px(1.) {
-            return; // 内容不超高，无需滚动条
-        }
-
-        // 滚动进度（0..1）
-        let scroll_down = (-handle.offset().y).max(px(0.));
-        let max_scroll = (content_h - viewport_h).max(px(0.));
-        let frac = if max_scroll > px(0.) {
-            (scroll_down / max_scroll).clamp(0., 1.)
-        } else {
-            0.
-        };
-
-        // 轨道：左移出 GAP_RIGHT，一条非常淡的圆角底
-        let track_x = bounds.left() + GAP_RIGHT;
-        let track = Bounds::new(
-            point(track_x, bounds.top()),
-            size(BAR_W, bounds.size.height),
-        );
-        window.paint_quad(
-            gpui::fill(track, rgba(0x93a0aa1f)).corner_radii(Corners::all(THUMB_RADIUS)),
-        );
-
-        // 滑块（圆角、半透明）
-        let thumb_h = (bounds.size.height * (viewport_h / content_h)).max(THUMB_MIN_H);
-        let travel = (bounds.size.height - thumb_h).max(px(0.));
-        let thumb_y = bounds.top() + travel * frac;
-        let thumb = Bounds::new(point(track_x, thumb_y), size(BAR_W, thumb_h));
-        window.paint_quad(
-            gpui::fill(thumb, rgba(0x64748b96)).corner_radii(Corners::all(THUMB_RADIUS)),
-        );
-    }
-}
-
-/// 美化**横向**滚动条：跟随 [`ScrollHandle`] 的自绘滚动条（放在横向滚动容器下方）。
-///
-/// 用法：横向滚动容器 `.overflow_x_scroll().track_scroll(&handle)` 的子级/兄弟级
-/// 均可；本组件占一行高度，内容没横向溢出时不显示。
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::{
-        div, px, rgb, size, Context, InteractiveElement, IntoElement, ParentElement, Render,
-        SharedString, StatefulInteractiveElement, Styled, Window,
-    };
-
-    /// 复刻 `app.rs::render_messages` 的结构（行包装 + 可滚动消息列 + 右侧滚动条），
-    /// 验证：消息内容超高时 `max_offset > 0`、可滚动到底（滚动条会随之出现）。
-    struct MessagesHost {
-        handle: ScrollHandle,
-    }
-
-    impl Render for MessagesHost {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let handle = self.handle.clone();
-            let mut scroll = div()
-                .id("messages")
-                .flex_1()
-                .overflow_y_scroll()
-                .track_scroll(&handle)
-                .px_4()
-                .py_3()
-                .min_w(px(0.));
-            for i in 0..40 {
-                scroll = scroll.child(
-                    div()
-                        .h(px(40.))
-                        .mb_2()
-                        .bg(rgb(0xe5e7eb))
-                        .child(SharedString::from(format!("消息 {i}"))),
-                );
-            }
-            // 复刻 app 的消息区：外层行给固定高度（app 中由 flex_col+flex_1 撑出的剩余高度），
-            // 内部滚动列超高时溢出并可滚动
-            div()
-                .h(px(300.))
-                .w(px(500.))
-                .flex()
-                .flex_row()
-                .child(scroll)
-                .child(Scrollbar::new(handle))
-        }
-    }
-
-    #[gpui::test]
-    async fn messages_scrollbar_engages_on_overflow(cx: &mut gpui::TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_window, _cx| MessagesHost {
-            handle: ScrollHandle::new(),
-        });
-        cx.simulate_resize(size(px(500.), px(300.)));
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let (max_h, _) = cx.update(|_window, cx| {
-            let host = view.read(cx);
-            (host.handle.max_offset().y, host.handle.bounds())
-        });
-        assert!(
-            max_h > px(0.),
-            "消息内容超高时应可滚动（滚动条出现）：max_offset={max_h:?}"
-        );
-        // 滚动到底后偏移应从 0 变化为负的 max_offset
-        let h = cx.update(|_window, cx| view.read(cx).handle.clone());
-        h.scroll_to_bottom();
-        cx.update(|window, cx| {
-            let _ = window.draw(cx);
-        });
-        cx.run_until_parked();
-        let bottom = cx.update(|_window, cx| view.read(cx).handle.offset().y);
-        assert!(bottom < px(-1.), "应可滚到底部：offset={bottom:?}");
-    }
 }

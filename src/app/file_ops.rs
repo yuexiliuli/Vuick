@@ -36,7 +36,6 @@ impl EditorApp {
                     tab.preview_on = true;
                 }
                 self.preview_scroll = gpui::ScrollHandle::new();
-                self.preview_table = TableScrollState::new();
                 self.status = SharedString::from(format!("已打开：{}", p.display()));
                 self.status_ok = true;
                 cx.notify();

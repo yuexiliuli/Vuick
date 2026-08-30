@@ -69,6 +69,5 @@ impl EditorApp {
                             .selection_format(gpui_component::text::SelectionFormat::Source),
                     ),
             )
-            .child(Scrollbar::new(self.preview_scroll.clone()))
     }
 }

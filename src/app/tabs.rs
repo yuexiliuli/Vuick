@@ -1,6 +1,7 @@
 //! tabs.
 
 use super::*;
+use crate::scrollbar::horizontal_scrollbar;
 use gpui_component::button::ButtonVariants as _;
 
 impl EditorApp {
@@ -54,7 +55,6 @@ impl EditorApp {
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
         self.preview_scroll = gpui::ScrollHandle::new();
-        self.preview_table = TableScrollState::new();
         idx
     }
 
@@ -73,7 +73,6 @@ impl EditorApp {
         }
         self.active_tab = idx;
         self.preview_scroll = gpui::ScrollHandle::new();
-        self.preview_table = TableScrollState::new();
         self.menu_hover = None;
         let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
@@ -133,7 +132,6 @@ impl EditorApp {
             tab.cursor_col = 0;
             tab.preview_on = false;
             self.preview_scroll = gpui::ScrollHandle::new();
-            self.preview_table = TableScrollState::new();
             let focus = tab.editor.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
             self.status = SharedString::from("已关闭");

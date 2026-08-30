@@ -3,7 +3,7 @@
 //!
 //! 模块结构：
 //! - [`app`]：主视图 `EditorApp`（菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）
-//! - [`markdown`]：Markdown → GPUI 元素渲染
+//! - `gpui_component::text::TextView`：Markdown 解析、排版与选择
 //! - [`scrollbar`]：自绘滚动条（选项卡栏 / 预览区用）
 //! - [`actions`]：应用级动作类型
 //!
@@ -16,7 +16,6 @@
 
 mod actions;
 mod app;
-mod markdown;
 mod scrollbar;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};

@@ -33,7 +33,7 @@ use gpui::{
 use gpui_component::input::{Editor, EditorState, InputEvent, TabSize};
 
 use crate::actions::*;
-use crate::scrollbar::{horizontal_scrollbar, Scrollbar, TableScrollState};
+use crate::scrollbar::TableScrollState;
 
 /// 编辑区背景色（亮色）。
 const EDIT_BG: gpui::Hsla = white();
@@ -91,8 +91,6 @@ pub struct EditorApp {
     active_tab: usize,
     /// 预览区滚动句柄（切换选项卡时重置）
     preview_scroll: gpui::ScrollHandle,
-    /// 预览表格横向滚动状态
-    preview_table: TableScrollState,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
     tab_bar_hscroll: TableScrollState,
     /// 顶部状态文字与是否"正常"
@@ -127,7 +125,6 @@ impl EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
             preview_scroll: gpui::ScrollHandle::new(),
-            preview_table: TableScrollState::new(),
             tab_bar_hscroll: TableScrollState::new(),
             status: SharedString::from("就绪"),
             status_ok: true,
@@ -184,7 +181,6 @@ impl EditorApp {
             tab.preview_on = !tab.preview_on;
         }
         self.preview_scroll = gpui::ScrollHandle::new();
-        self.preview_table = TableScrollState::new();
         cx.notify();
     }
 
@@ -367,7 +363,6 @@ impl Render for EditorApp {
                     if let Some(tab) = this.tabs.get_mut(this.active_tab) {
                         tab.preview_on = !tab.preview_on;
                         this.preview_scroll = gpui::ScrollHandle::new();
-                        this.preview_table = TableScrollState::new();
                     }
                     cx.notify();
                 }),

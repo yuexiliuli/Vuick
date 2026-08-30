@@ -251,7 +251,6 @@ impl EditorApp {
                     if let Some(tab) = self.tabs.get_mut(self.active_tab) {
                         tab.preview_on = !tab.preview_on;
                         self.preview_scroll = gpui::ScrollHandle::new();
-                        self.preview_table = TableScrollState::new();
                     }
                     cx.notify();
                 }

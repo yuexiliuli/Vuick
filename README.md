@@ -13,18 +13,13 @@
 - **拖放打开**：从资源管理器把文件拖到**编辑区 / 预览区 / 窗口空白处**直接打开。
 - **菜单栏**（`app.rs::render_menu_bar`）：文件（新建 / 打开 / 保存 / 另存为 / 退出）、编辑（撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选）、查看（预览开关 / 字号调节）、帮助；下拉面板带悬停高亮，点击空白关闭。
 - **Markdown 实时预览**：打开 `.md` 文件自动启用；预览开关对任意内容生效（在未命名缓冲区直接写 Markdown 也能预览）。长文档可滚动，预览区也可接收文件拖放。
-- **Markdown 渲染**（`markdown.rs`，移植自前端 `markdown.ts`）：
-  - 段落、标题、行内 `code` / 加粗 / 斜体 / 删除线 / 链接、围栏代码块、有序/无序列表、表格、引用、分割线；
-  - 表头加粗真正作用到 TextRun 字体；长不可断片段（长 URL/长串）自动插入零宽空格换行，不再溢出窗口。
-- **内容选择与复制**（GPUI 0.2.2 无内置静态文本选择，为自研实现）：
-  - 鼠标**拖选**正文，选区**实时高亮**（跨段落/标题/列表/代码/表格连续选中）；
-  - `Ctrl+C` / 右键复制所选内容。
+- **Markdown 预览与选择**：使用 `gpui-component::text::TextView`，统一提供 Markdown 解析、代码块、表格、链接、文本选择和 Markdown 源码复制。
 - **代码编辑器**：使用 `gpui-component` 的 `InputState::code_editor`，提供语法高亮、行号、缩进参考线、搜索、撤销/重做与滚动；粘贴时会统一 Windows CRLF 为 LF。
 - **编辑可用性增强**：
   - **撤销/重做**：由 `gpui-component` 代码编辑器维护编辑历史；`Ctrl+Z` / `Ctrl+Y` 与「编辑」菜单均可用；
   - **状态栏**：文件名 + 未保存「● 脏标记」+ 语言徽标，实时 **Ln / Col**、行数、字数，以及**字号 −/+ 调节**（`app.rs::render_status_bar`）；
   - 每个选项卡独立展示脏标记（●），编辑后立即置脏、保存/打开后清除。
-- **美化滚动条**（`scrollbar.rs`）：编辑区自绘垂直滚动条；表格横向滚动条。
+- **美化滚动条**（`scrollbar.rs`）：选项卡栏横向滚动条。
 
 ## 技术栈
 
@@ -41,20 +36,14 @@
 ```
 src/
 ├── main.rs                     # 入口：初始化应用、注册键盘快捷键、打开主窗口
-├── app.rs                      # 主视图 EditorApp：菜单栏/选项卡栏/编辑区/预览区/状态栏，
-│                               #   选项卡管理、系统文件对话框(rfd)、拖放打开、脏标记
-├── markdown.rs                 # Markdown → GPUI 元素树渲染 + 文本选择子系统
-│                               #   · 解析(parse_markdown/行内 spans)、渲染(表格双模式 断行)
-│                               #   · 选择(SeclectCtx/SelectText 自绘叶子)：拖选高亮、
-│                               #     命中测试(行尾也算)、选区→markdown 源码还原
-└── scrollbar.rs                # 自绘滚动条：垂直(Scrollbar) + 表格横向(horizontal_scrollbar)
+├── app/                        # 主视图及按功能拆分的菜单、选项卡、文件、面板和状态栏
+└── scrollbar.rs                # 选项卡栏横向滚动条
 ```
 
 ### 核心机制说明
 
 - **代码编辑器**：`gpui-component` 维护 ropey 文本、语法高亮、行号和输入法交互；应用层仅保存文件元数据、预览缓存和状态栏统计。
-- **表格横向滚动**（`markdown.rs` + `scrollbar.rs`）：列宽用 `text_system.shape_line` 实测统一；滚动容器为 flex 行 + `track_scroll`，超宽时表格可横向溢出，滚动条为可拖拽 div 组件；滚轮在可滚动时 `stop_propagation()` 防止联动页面。
-- **文本选择**：每条回答一个 `SelectCtx`（跨帧共享），文本"流"坐标贯穿整条回答；每个文本叶子是自绘 `SelectText`（用 GPUI 精确的 `index_for_position`/`position_for_index` 做命中与高亮，天然支持行尾与换行）；排版结果跨帧缓存，拖动时每帧只更新坐标，保证跟手。
+- **Markdown 缓存**：每个选项卡持有一个 `TextViewState`，内容变化时通过 `set_text` 更新，由组件内部异步解析并缓存排版结果。
 - **流式渲染**：后台线程 `mpsc` 推流，主线程 10ms 轮询刷新；表格横向位置/选区在流式阶段与结束后的历史轮次间平滑迁移。
 
 ## 快捷键
@@ -82,12 +71,11 @@ cargo run
 # 发布
 cargo build --release
 
-# 全量测试（含文本域、Markdown、滚动、选区等回归）
+# 全量测试
 cargo test
 ```
 
 ## 已知限制与后续方向
 
 - 内容区拖选是整条回答维度的文本选择；图表/图片等富媒体尚未支持选择。
-- GPUI 0.2.2 无内置静态文本选择组件，当前为自研方案；后续可参考 gpui-component `TextView SelectionFormat::Source` 思路扩展（如"复制纯文本"切换、双击选词）。
-- 长聊天下若仍感觉拖动略重，可引入"渲染计划缓存"：把每轮 `parse_markdown` + 叶子样式数据按回答文本缓存，帧循环只重建元素树。
+- Markdown 预览的复杂样式和插件扩展由 `gpui-component::text::TextView` 统一维护。
