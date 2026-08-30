@@ -1560,6 +1560,90 @@ mod tests {
         );
     }
 
+    /// 仅含编辑器的极简宿主：窗口中只有 gpui-component 的代码编辑器，
+    /// 没有菜单栏/选项卡/状态栏/预览等任何外围代码。
+    struct BareEditor {
+        editor: Entity<InputState>,
+    }
+
+    impl Render for BareEditor {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(Input::new(&self.editor).h_full())
+        }
+    }
+
+    /// 隔离测试：窗口里只有代码编辑器（无任何外围布局干扰）。
+    /// 连续粘贴长文本与带换行文本，验证内容层不丢字、不凭空造换行——
+    /// 即“整行消失”从内容层看与外围布局无关。
+    #[gpui::test]
+    async fn minimal_editor_paste_integrity(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<InputState>>>> =
+            std::rc::Rc::default();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| {
+                gpui_component::input::InputState::new(window, cx)
+                    .code_editor("rust")
+                    .line_number(true)
+            });
+            *holder.borrow_mut() = Some(editor.clone());
+            let view = cx.new(|cx| BareEditor { editor });
+            gpui_component::Root::new(view, window, cx)
+        });
+        let _ = root;
+        let editor = holder.borrow().clone().unwrap();
+
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            window.focus(&editor.read(cx).focus_handle(cx));
+        });
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+
+        // 1) 无换行大段文本连续粘贴：内容不丢、不产生换行（仍是单个逻辑行）
+        let chunk = "Option<Vec<WrappedLine>>".repeat(200);
+        let expected = chunk.len() * 5;
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(chunk));
+        for _ in 0..5 {
+            cx.dispatch_action(gpui_component::input::Paste);
+            cx.run_until_parked();
+        }
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let value = cx.update(|_w, cx| editor.read(cx).value().to_string());
+        assert_eq!(
+            value.len(),
+            expected,
+            "长文本反复粘贴不得丢字：实际长度={} 期望={expected}",
+            value.len()
+        );
+        assert_eq!(
+            value.matches('\n').count(),
+            0,
+            "无换行剪贴板不应产生换行"
+        );
+
+        // 2) 带尾随换行的行连续粘贴：应形成多行且内容完整
+        let line = "use std::sync::Arc;\n";
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(line.to_string()));
+        for _ in 0..4 {
+            cx.dispatch_action(gpui_component::input::Paste);
+            cx.run_until_parked();
+        }
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let value2 = cx.update(|_w, cx| editor.read(cx).value().to_string());
+        assert_eq!(value2.matches('\n').count(), 4, "带换行行重复粘贴应有 4 个换行");
+        assert_eq!(value2.lines().count(), 4, "应形成 4 个逻辑行");
+    }
+
     /// 冒烟测试：完整渲染整棵 UI 树（菜单/选项卡/编辑区/状态栏），
     /// 展开下拉菜单并打开一个临时文件，确保渲染管线无 panic。
     #[gpui::test]
