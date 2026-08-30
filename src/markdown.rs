@@ -1799,13 +1799,14 @@ mod tests {
             max_w > px(0.),
             "横向滚动模式下超宽表格应可横向滚动：max_offset.width={max_w:?}"
         );
-        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值
+        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值。
+        // 滚动条是贴在滚动容器底部的高 3px 细条，点击点必须落在 [bottom, bottom+3px] 内。
         let (bar_left, bar_bottom, viewport_w) = cx.update(|_window, cx| {
             let b = view.read(cx).state.handle.bounds();
             (b.left(), b.bottom(), b.size.width)
         });
         cx.simulate_click(
-            gpui::point(bar_left + viewport_w * 0.7, bar_bottom + px(6.)),
+            gpui::point(bar_left + viewport_w * 0.7, bar_bottom + px(1.5)),
             gpui::Modifiers::default(),
         );
         cx.run_until_parked();

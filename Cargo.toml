@@ -14,6 +14,8 @@ reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 aes-gcm = "0.10"
 hex = "0.4"
 rfd = "0.17"
+gpui-component = { version = "0.5.1", features = ["tree-sitter-languages"] }
+gpui-component-assets = "0.5.1"
 
 [dev-dependencies]
 gpui = { version = "0.2.2", features = ["test-support"] }
