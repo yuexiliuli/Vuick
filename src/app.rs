@@ -1,18 +1,14 @@
-﻿//! 应用主视图 `EditorApp`：文本 / 代码 / Markdown 编辑器（多文件选项卡）。
+//! 应用主视图 `EditorApp`：文本 / 代码 / Markdown 编辑器（多文件选项卡）。
 //!
 //! 布局（自上而下）：
 //! - 菜单栏：文件 / 编辑 / 查看 / 帮助，点击弹出下拉菜单（[`EditorApp::render_menu_bar`]）
 //! - 选项卡栏：每个文件一个选项卡，可新建（+）、切换、关闭（未保存时弹窗提示保存）
-//! - 编辑区：**gpui-component 的 `Input`（CodeEditor 模式）**，内置语法高亮、
-//!   行号、缩进参考线、搜索面板、撤销重做与滚动（替换原先自研 `TextArea`）
+//! - 编辑区：多行文本编辑器（[`input::TextArea`]），可编辑任意文本 / 代码文件
 //! - 预览区（开启预览时）：右侧分屏实时渲染 Markdown（复用 [`markdown`]）
 //! - 状态栏：文件名 / 脏标记 / 语言徽标 / 行列 / 行数 / 字数 / 字号调节
 //!
 //! 打开 / 保存 / 另存为均调用**系统原生文件对话框**（`rfd`），无需手动输入路径；
 //! 也支持把文件从资源管理器拖拽到窗口/编辑区打开。
-//!
-//! 文本编辑动作（backspace/ctrl-v/undo…）由 gpui-component 的 `Input` 在 `Input`
-//! 键上下文中自行处理，这里只订阅其 `InputEvent::Change` 刷新状态栏与脏标记。
 
 use std::any::Any;
 use std::fs;
@@ -20,15 +16,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PromptLevel,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
+    div, point, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
+    PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    VisualContext, Window,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
 
-use crate::actions::*;
-use crate::markdown::{parse_markdown, render_markdown_blocks, Block, MarkdownTheme, TableMode};
-use crate::scrollbar::{horizontal_scrollbar, Scrollbar, TableScrollState};
+use super::input::{self, FileDropped, TextArea, TextEditEvent};
+use super::markdown::{parse_markdown, render_markdown_blocks, Block, MarkdownTheme, TableMode};
+use super::scrollbar::{horizontal_scrollbar, Scrollbar, TableScrollState};
 
 /// 编辑区背景色（亮色）。
 const EDIT_BG: gpui::Hsla = white();
@@ -37,6 +33,8 @@ const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// 字号调节范围（px）。
 const FONT_MIN: f32 = 10.0;
 const FONT_MAX: f32 = 28.0;
+/// 行号槽宽度。
+const GUTTER_W: Pixels = px(46.);
 /// 菜单栏高度。
 const MENU_BAR_H: Pixels = px(26.);
 /// 菜单项宽度。
@@ -53,30 +51,24 @@ enum MenuId {
     Help,
 }
 
-/// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
+/// 一个文件选项卡：独立持有编辑区实体、文件路径与脏标记。
 struct EditorTab {
-    /// 本选项卡的编辑区（gpui-component `InputState`，CodeEditor 模式）
-    editor: gpui::Entity<InputState>,
+    /// 本选项卡的编辑区
+    editor: gpui::Entity<TextArea>,
     /// 当前文件路径（None = 未命名）
     file_path: Option<PathBuf>,
     /// 内容自上次打开/保存后是否被修改
     dirty: bool,
-    /// 当前内容的镜像缓存（在 `InputEvent::Change` 时同步，避免每帧克隆 Rope）
-    content: SharedString,
-    /// 行数缓存
-    line_count: usize,
-    /// 字数缓存
-    char_count: usize,
-    /// 光标行（0 基）
-    cursor_row: usize,
-    /// 光标列（0 基）
-    cursor_col: usize,
     /// 预览区 Markdown 解析缓存（内容不变时复用）
     md_cache: Option<(SharedString, Vec<Block>)>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
-    /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
+    /// 监听编辑事件 → 置脏（保持有效）
     _edit_sub: Subscription,
+    /// 监听文件拖放 → 打开文件（保持有效）
+    _drop_sub: Subscription,
+    /// 观察编辑区 → 状态栏/预览实时刷新（保持有效）
+    _observe_sub: Subscription,
 }
 
 pub struct EditorApp {
@@ -109,9 +101,21 @@ impl Focusable for EditorApp {
 }
 
 impl EditorApp {
-    /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
-    /// `gpui_component::Root` 包裹）。
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+    /// 创建并注册 `EditorApp` 实体（在 App 上下文中使用）。
+    pub fn build(cx: &mut App) -> gpui::Entity<EditorApp> {
+        cx.new(|cx| Self::new(cx))
+    }
+
+    /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦）。
+    pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.tabs
+            .get(self.active_tab)
+            .map(|t| t.editor.read(cx).focus_handle.clone())
+            .unwrap_or_else(|| self.focus_handle.clone())
+    }
+
+    /// 构造（测试也可复用）：初始创建一个空白选项卡。
+    pub fn new(cx: &mut Context<Self>) -> EditorApp {
         let focus_handle = cx.focus_handle();
         let mut app = EditorApp {
             tabs: Vec::new(),
@@ -126,7 +130,7 @@ impl EditorApp {
             menu_hover: None,
             focus_handle,
         };
-        app.make_tab(window, cx);
+        app.make_tab(cx);
 
         // 命令行参数：第一个参数作为初始打开文件
         let mut args = std::env::args_os();
@@ -134,66 +138,54 @@ impl EditorApp {
         if let Some(first) = args.next() {
             let p = PathBuf::from(&first);
             if p.is_file() {
-                app.open_file(&p.to_string_lossy(), window, cx);
+                app.open_file(&p.to_string_lossy(), cx);
             }
         }
         app
     }
 
-    /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦）。
-    pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
-        self.tabs
-            .get(self.active_tab)
-            .map(|t| t.editor.read(cx).focus_handle(cx))
-            .unwrap_or_else(|| self.focus_handle.clone())
-    }
-
     // ==================== 选项卡管理 ====================
 
     /// 新建一个空白选项卡并设为激活。返回其下标。
-    fn make_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        let editor = cx.new(|cx| {
-            gpui_component::input::InputState::new(window, cx)
-                .code_editor("text")
-                .line_number(true)
+    fn make_tab(&mut self, cx: &mut Context<Self>) -> usize {
+        let focus = cx.focus_handle();
+        let editor = cx.new(|_cx| {
+            TextArea::new(
+                focus,
+                SharedString::from("在此输入文本，或用菜单/拖放打开文件…"),
+                SharedString::from(""),
+                true,
+            )
         });
 
-        // 编辑内容被修改 → 置脏 + 同步内容/行列缓存
+        // 编辑内容被修改 → 置脏
         let ed = editor.clone();
-        let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &InputEvent, cx| {
+        let edit_sub = cx.subscribe(&ed, |this, emitter, _: &TextEditEvent, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
-                match ev {
-                    InputEvent::Change => {
-                        let state = tab.editor.read(cx);
-                        let value = state.value();
-                        tab.content = value.clone();
-                        tab.line_count = value.lines().count().max(1);
-                        tab.char_count = value.chars().count();
-                        let pos = state.cursor_position();
-                        tab.cursor_row = pos.line as usize;
-                        tab.cursor_col = pos.character as usize;
-                        if !tab.dirty {
-                            tab.dirty = true;
-                        }
-                        cx.notify();
-                    }
-                    _ => {}
+                if !tab.dirty {
+                    tab.dirty = true;
+                    cx.notify();
                 }
             }
         });
+        // 文件拖放到编辑区 → 打开该文件
+        let drop_sub = cx.subscribe(&ed, |this, emitter, ev: &FileDropped, cx| {
+            if let Some(idx) = this.tabs.iter().position(|t| t.editor == emitter) {
+                this.open_file_in_tab(idx, &ev.0.to_string_lossy(), cx);
+            }
+        });
+        // 观察编辑区：光标移动/内容变更都刷新应用（状态栏行列、实时预览）
+        let observe_sub = cx.observe(&ed, |_this, _ed, cx| cx.notify());
 
         self.tabs.push(EditorTab {
             editor,
             file_path: None,
             dirty: false,
-            content: SharedString::default(),
-            line_count: 1,
-            char_count: 0,
-            cursor_row: 0,
-            cursor_col: 0,
             md_cache: None,
             preview_on: false,
             _edit_sub: edit_sub,
+            _drop_sub: drop_sub,
+            _observe_sub: observe_sub,
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
@@ -204,8 +196,8 @@ impl EditorApp {
 
     /// 新建文件（新增选项卡）。
     fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.make_tab(window, cx);
-        window.focus(&self.tabs[idx].editor.read(cx).focus_handle(cx));
+        let idx = self.make_tab(cx);
+        window.focus(&self.tabs[idx].editor.read(cx).focus_handle.clone());
         self.status = SharedString::from("新建文件");
         self.status_ok = true;
         cx.notify();
@@ -220,7 +212,7 @@ impl EditorApp {
         self.preview_scroll = gpui::ScrollHandle::new();
         self.preview_table = TableScrollState::new();
         self.menu_hover = None;
-        window.focus(&self.tabs[idx].editor.read(cx).focus_handle(cx));
+        window.focus(&self.tabs[idx].editor.read(cx).focus_handle.clone());
         cx.notify();
     }
 
@@ -242,19 +234,21 @@ impl EditorApp {
             &["保存", "不保存", "cancel"],
             cx,
         );
-        window.spawn(cx, async move |cx| {
-            // oneshot 通道被取消视为"取消"
-            let idx_ans = answer.await.unwrap_or(2);
-            let _ = cx.update_window_entity(&entity, |this, window, cx| match idx_ans {
-                0 => {
-                    if this.save_tab(idx, cx) {
-                        this.remove_tab(idx, window, cx);
+        window
+            .spawn(cx, async move |cx| {
+                // oneshot 通道被取消视为"取消"
+                let idx_ans = answer.await.unwrap_or(2);
+                let _ = cx.update_window_entity(&entity, |this, window, cx| match idx_ans {
+                    0 => {
+                        if this.save_tab(idx, cx) {
+                            this.remove_tab(idx, window, cx);
+                        }
                     }
-                }
-                1 => this.remove_tab(idx, window, cx),
-                _ => {}
-            });
-        }).detach();
+                    1 => this.remove_tab(idx, window, cx),
+                    _ => {}
+                });
+            })
+            .detach();
     }
 
     /// 真正移除选项卡。最后一个选项卡退化为"重置为空白"。
@@ -265,20 +259,18 @@ impl EditorApp {
         if self.tabs.len() == 1 {
             let tab = &mut self.tabs[0];
             tab.editor.update(cx, |ed, cx| {
-                ed.set_value("", window, cx);
+                ed.content = SharedString::from("");
+                ed.selected_range = 0..0;
+                ed.scroll_handle.set_offset(point(px(0.), px(0.)));
+                cx.notify();
             });
             tab.file_path = None;
             tab.dirty = false;
-            tab.content = SharedString::default();
-            tab.line_count = 1;
-            tab.char_count = 0;
-            tab.cursor_row = 0;
-            tab.cursor_col = 0;
             tab.md_cache = None;
             tab.preview_on = false;
             self.preview_scroll = gpui::ScrollHandle::new();
             self.preview_table = TableScrollState::new();
-            window.focus(&tab.editor.read(cx).focus_handle(cx));
+            window.focus(&tab.editor.read(cx).focus_handle.clone());
             self.status = SharedString::from("已关闭");
             self.status_ok = true;
             cx.notify();
@@ -296,32 +288,21 @@ impl EditorApp {
     // ==================== 文件操作（系统对话框） ====================
 
     /// 打开文件到指定选项卡。
-    fn open_file_in_tab(
-        &mut self,
-        idx: usize,
-        path: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_file_in_tab(&mut self, idx: usize, path: &str, cx: &mut Context<Self>) {
         let p = PathBuf::from(path.trim());
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
         match fs::read_to_string(&p) {
             Ok(text) => {
-                let lang = Self::language_id(&p);
-                let lines = text.lines().count().max(1);
-                let chars = text.chars().count();
+                let len = text.len();
                 tab.editor.update(cx, |ed, cx| {
-                    ed.set_value(text.clone(), window, cx);
-                    ed.set_highlighter(lang, cx);
+                    ed.content = SharedString::from(text);
+                    ed.selected_range = len..len;
+                    ed.scroll_handle.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
                 });
                 tab.file_path = Some(p.clone());
-                tab.content = SharedString::from(text);
-                tab.line_count = lines;
-                tab.char_count = chars;
-                tab.cursor_row = 0;
-                tab.cursor_col = 0;
                 tab.md_cache = None;
                 tab.dirty = false;
                 if Self::is_markdown_path(&p) {
@@ -342,17 +323,17 @@ impl EditorApp {
     }
 
     /// 打开文件（到当前激活选项卡）。
-    fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_in_tab(self.active_tab, path, window, cx);
+    fn open_file(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.open_file_in_tab(self.active_tab, path, cx);
     }
 
     /// 打开：系统原生"选择文件"对话框。
-    fn open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_dialog(&mut self, cx: &mut Context<Self>) {
         let Some(path) = rfd::FileDialog::new().set_title("打开文件").pick_file() else {
             return;
         };
         let idx = self.active_tab;
-        self.open_file_in_tab(idx, &path.to_string_lossy(), window, cx);
+        self.open_file_in_tab(idx, &path.to_string_lossy(), cx);
     }
 
     /// 保存指定选项卡。无路径时转入"另存为"。
@@ -364,7 +345,7 @@ impl EditorApp {
         let Some(p) = tab.file_path.clone() else {
             return self.save_tab_as(idx, cx);
         };
-        let text = tab.editor.read(cx).value().to_string();
+        let text = tab.editor.read(cx).content.to_string();
         match fs::write(&p, text) {
             Ok(()) => {
                 self.tabs[idx].dirty = false;
@@ -394,7 +375,7 @@ impl EditorApp {
         let Some(tab) = self.tabs.get(idx) else {
             return false;
         };
-        let text = tab.editor.read(cx).value().to_string();
+        let text = tab.editor.read(cx).content.to_string();
         match fs::write(&file, text) {
             Ok(()) => {
                 self.tabs[idx].file_path = Some(file.clone());
@@ -445,12 +426,7 @@ impl EditorApp {
 
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
     /// 会先激活该选项卡，再翻转其 `preview_on`，并重置预览滚动状态。
-    fn toggle_preview_for_tab(
-        &mut self,
-        idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
         if let Some(tab) = self.tabs.get_mut(idx) {
             tab.preview_on = !tab.preview_on;
@@ -463,36 +439,8 @@ impl EditorApp {
     fn is_markdown_path(p: &Path) -> bool {
         p.extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .map(|e| e.eq_ignore_ascii_case("md"))
             .unwrap_or(false)
-    }
-
-    /// 按扩展名推断 gpui-component 语法高亮的语言名（未知扩展名回退 "text"）。
-    fn language_id(p: &Path) -> &'static str {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .unwrap_or_default();
-        match ext.as_str() {
-            "md" | "markdown" => "markdown",
-            "rs" => "rust",
-            "toml" => "toml",
-            "json" => "json",
-            "py" => "python",
-            "js" | "jsx" => "javascript",
-            "ts" | "tsx" => "typescript",
-            "html" | "htm" => "html",
-            "css" | "scss" => "css",
-            "c" | "h" => "c",
-            "cpp" | "cc" | "hpp" => "cpp",
-            "go" => "go",
-            "java" => "java",
-            "sh" | "bash" => "bash",
-            "yaml" | "yml" => "yaml",
-            "sql" => "sql",
-            _ => "text",
-        }
     }
 
     /// 当前文件显示名（无文件时为"未命名"）。
@@ -558,7 +506,11 @@ impl EditorApp {
 
     /// 切换指定下拉菜单的展开状态。
     fn toggle_menu(&mut self, id: MenuId, cx: &mut Context<Self>) {
-        self.open_menu = if self.open_menu == Some(id) { None } else { Some(id) };
+        self.open_menu = if self.open_menu == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
         self.menu_hover = None;
         cx.notify();
     }
@@ -673,11 +625,7 @@ impl EditorApp {
                     ("重置字号", "Ctrl+0"),
                 ],
             ),
-            (
-                MenuId::Help,
-                "帮助",
-                vec![("关于", "")],
-            ),
+            (MenuId::Help, "帮助", vec![("关于", "")]),
         ]
     }
 
@@ -700,9 +648,7 @@ impl EditorApp {
         for (idx, (label, shortcut)) in items.iter().enumerate() {
             // 分隔线
             if *label == "—" {
-                panel_children.push(
-                    div().my_1().h(px(1.)).bg(rgb(0xe5e7eb)).into_any_element(),
-                );
+                panel_children.push(div().my_1().h(px(1.)).bg(rgb(0xe5e7eb)).into_any_element());
                 continue;
             }
             let is_hover = hover == Some((menu, idx));
@@ -791,7 +737,11 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let defs = self.menu_definitions();
-        let Some(items) = defs.iter().find(|(id, _, _)| *id == menu).map(|(_, _, i)| i) else {
+        let Some(items) = defs
+            .iter()
+            .find(|(id, _, _)| *id == menu)
+            .map(|(_, _, i)| i)
+        else {
             return;
         };
         if items.get(idx).is_none() {
@@ -800,19 +750,19 @@ impl EditorApp {
         match menu {
             MenuId::File => match idx {
                 0 => self.new_tab(window, cx),
-                1 => self.open_dialog(window, cx),
+                1 => self.open_dialog(cx),
                 2 => self.save(cx),
                 3 => self.save_as(cx),
                 5 => cx.quit(),
                 _ => {}
             },
             MenuId::Edit => match idx {
-                0 => window.dispatch_action(Box::new(gpui_component::input::Undo), cx),
-                1 => window.dispatch_action(Box::new(gpui_component::input::Redo), cx),
-                3 => window.dispatch_action(Box::new(gpui_component::input::Cut), cx),
-                4 => window.dispatch_action(Box::new(gpui_component::input::Copy), cx),
-                5 => window.dispatch_action(Box::new(gpui_component::input::Paste), cx),
-                7 => window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx),
+                0 => window.dispatch_action(Box::new(input::Undo), cx),
+                1 => window.dispatch_action(Box::new(input::Redo), cx),
+                3 => window.dispatch_action(Box::new(input::Cut), cx),
+                4 => window.dispatch_action(Box::new(input::Copy), cx),
+                5 => window.dispatch_action(Box::new(input::Paste), cx),
+                7 => window.dispatch_action(Box::new(input::SelectAll), cx),
                 _ => {}
             },
             MenuId::View => match idx {
@@ -833,7 +783,7 @@ impl EditorApp {
                 _ => {}
             },
             MenuId::Help => {
-                self.status = SharedString::from("GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2 + gpui-component");
+                self.status = SharedString::from("GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2");
                 self.status_ok = true;
                 cx.notify();
             }
@@ -887,7 +837,11 @@ impl EditorApp {
                     .gap_1()
                     .flex_shrink()
                     .rounded_md()
-                    .bg(if is_active { rgb(0xffffff) } else { rgba(0x00000000) })
+                    .bg(if is_active {
+                        rgb(0xffffff)
+                    } else {
+                        rgba(0x00000000)
+                    })
                     .border_1()
                     .border_color(if is_active {
                         rgb(0xd1d5db)
@@ -993,7 +947,10 @@ impl EditorApp {
                     .right(px(0.))
                     .bottom(px(0.))
                     .h(px(0.))
-                    .child(horizontal_scrollbar(&self.tab_bar_hscroll, "tab-bar-hscroll"))
+                    .child(horizontal_scrollbar(
+                        &self.tab_bar_hscroll,
+                        "tab-bar-hscroll",
+                    ))
                     .into_any_element(),
             );
         }
@@ -1038,12 +995,15 @@ impl EditorApp {
             .children(right)
     }
 
-    // ==================== 编辑区 ====================
+    // ==================== 编辑区 / 行号槽 ====================
 
-    /// 编辑区：gpui-component 的 `Input`（CodeEditor 模式）撑满面板，
-    /// 自身负责行号槽、语法高亮、垂直滚动与搜索面板。
     fn render_editor_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.tabs[self.active_tab].editor.clone();
+        let handle = editor.read(cx).scroll_handle.clone();
+        // TextArea 的"布局高度"会被 taffy 缓存压到一行（内容在构造后才增长时不会重新量高），
+        // 因此滚动容器的溢出检测不能依赖它，改用 TextArea 自己精确追踪的 last_content_height
+        // 作为正文包装层的显式高度，驱动滚轮/滚动条。
+        let content_h = editor.read(cx).last_content_height;
         div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
@@ -1056,31 +1016,140 @@ impl EditorApp {
             .border_color(rgb(0xe5e7eb))
             .rounded_md()
             .overflow_hidden()
-            // 文字样式会沿元素树继承，`Input` 的代码编辑器随字号重新排版
-            .text_size(px(self.font_size))
-            // 从资源管理器拖入文件 → 打开（Input 本身不接收拖放）
-            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
-            .on_drop(cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                if let Some(p) = paths.paths().first() {
-                    this.open_file(&p.to_string_lossy(), window, cx);
-                }
-            }))
-            .child(Input::new(&editor).h_full().bordered(false))
+            // 行号槽背景：钉在视口左缘的固定覆盖层（editor-area 不滚动），始终覆盖可见行的
+            // 左侧；行号本身由 editor-scroll 内的 gutter 绘制并随正文滚动， painting 顺序在其上。
+            .child(
+                div()
+                    .id("editor-gutter-bg")
+                    .absolute()
+                    .top(px(0.))
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .w(GUTTER_W)
+                    .bg(rgb(0xfafafa))
+                    .border_r_1()
+                    .border_color(rgb(0xe5e7eb)),
+            )
+            .child(
+                // 滚动容器：`h_full w_full` 撑满编辑区（视口）；正文包装层是普通块子元素
+                // （随容器平移），其显式高度 = 正文内容高度，确保内容超高时可滚。
+                div()
+                    .id("editor-scroll")
+                    .debug_selector(|| "editor-scroll".into())
+                    .h_full()
+                    .w_full()
+                    .min_w(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&handle)
+                    .relative()
+                    .py_2()
+                    .child(self.render_line_gutter(&editor, cx))
+                    .child(
+                        div()
+                            .id("editor-text-wrap")
+                            .debug_selector(|| "editor-text-wrap".into())
+                            .h(content_h)
+                            .min_w(px(0.))
+                            .pl(GUTTER_W + px(4.))
+                            .pr_3()
+                            .font_family("Consolas")
+                            .text_size(px(self.font_size))
+                            .line_height(gpui::relative(1.5))
+                            .child(editor.clone()),
+                    ),
+            )
+    }
+
+    /// 行号槽：absolute 覆盖在编辑区左缘，作为滚动容器的子元素会随内容一起平移。
+    /// 行号用**内容坐标**（py_2(8px) + 居中偏移 + 行偏移）摆放，与正文同帧对齐、随正文一起滚。
+    ///
+    /// 性能：上千行时**绝不**为每一行都创建 DOM 元素（否则每次重渲染/输入都会实例化上千个
+    /// div，是卡顿主因）。这里按当前滚动偏移 + 视口高度算出可见行区间，只渲染该区间内的行号
+    /// （上下各多画一行避免边缘闪现），与编辑区滚动范围的虚拟渲染思路一致。
+    fn render_line_gutter(
+        &mut self,
+        editor: &gpui::Entity<TextArea>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let ed = editor.read(cx);
+        let lh = ed.last_line_height;
+        let offsets = ed.last_visual_offsets.clone();
+        let total = ed.last_content_height;
+        let lines = ed.last_layout.as_ref().map(|l| l.len()).unwrap_or(0);
+
+        // TextArea 在内容不足一行（或很短）时会在 `min_h(40)` 盒子里垂直居中
+        let center_offset = ((px(40.) - ed.last_content_height) / 2.0).max(px(0.));
+
+        // 可见内容区间（内容坐标系）：视口顶部 = -scroll_y，底部 = viewport_h - scroll_y。
+        // scroll_y 向下滚动为负；viewport_h 取不到（尚未布局）时退化为全量渲染。
+        let scroll_y = ed.scroll_handle.offset().y;
+        let viewport_h = ed.scroll_handle.bounds().size.height;
+        let virtualize = viewport_h > px(0.);
+        let view_top = -scroll_y;
+        let view_bottom = viewport_h - scroll_y;
+        let margin = lh; // 上下各多画一行，避免滚动时边缘行号闪现
+
+        let mut numbers: Vec<gpui::Div> = Vec::new();
+        for i in 0..lines {
+            let top = offsets.get(i).copied().unwrap_or(px(0.));
+            let bottom = offsets.get(i + 1).copied().unwrap_or(total);
+            let row_h = (bottom - top).max(lh);
+            let line_top = px(8.) + center_offset + top;
+            let line_bottom = px(8.) + center_offset + bottom;
+            // 虚拟渲染：仅当该行落在视口内（含余量）才创建元素
+            if virtualize && (line_bottom + margin < view_top || line_top - margin > view_bottom) {
+                continue;
+            }
+            numbers.push(
+                div()
+                    .debug_selector(move || format!("gutter-line-{}", i + 1))
+                    .absolute()
+                    .top(line_top)
+                    .h(row_h)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .pr_2()
+                    .text_size(px(12.))
+                    .text_color(rgb(0x9ca3af))
+                    .child(format!("{}", i + 1)),
+            );
+        }
+
+        div()
+            .id("editor-gutter")
+            .debug_selector(|| "editor-gutter".into())
+            // 仅承载行号（透明、不裁切）；背景由 editor-area 内的 editor-gutter-bg 固定覆盖。
+            // 槽高 = 视口；行号是滚动容器的子元素（随内容一起平移），用内容坐标摆放。
+            // 不裁切（无 overflow_hidden）：超过视口的行号由 editor-scroll 自行裁掉，否则
+            // 会被本槽视口高度裁掉（"超过约 30 行后不显示行号"）。
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .w(GUTTER_W)
+            .font_family("Consolas")
+            .children(numbers)
     }
 
     // ==================== 预览区 ====================
 
-    fn render_preview_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // 实时预览：内容不变时复用上一次解析出的块列表，避免每帧重复解析大文档
         let tab = &self.tabs[self.active_tab];
-        let md = tab.content.clone();
+        let md = tab.editor.read(cx).content.clone();
         let blocks = match &tab.md_cache {
             Some((cached_md, cached_blocks)) if *cached_md == md => cached_blocks.clone(),
             _ => {
                 let parsed = parse_markdown(&md);
                 let parsed_clone = parsed.clone();
                 let t = &mut self.tabs[self.active_tab];
-                t.md_cache = Some((md, parsed_clone));
+                t.md_cache = Some((md.clone(), parsed_clone));
                 parsed
             }
         };
@@ -1091,11 +1160,13 @@ impl EditorApp {
             .min_w(px(0.))
             // 预览区也可接收文件拖放
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
-            .on_drop(cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                if let Some(p) = paths.paths().first() {
-                    this.open_file(&p.to_string_lossy(), window, cx);
-                }
-            }))
+            .on_drop(
+                cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, _w, cx| {
+                    if let Some(p) = paths.paths().first() {
+                        this.open_file(&p.to_string_lossy(), cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .id("preview-pane")
@@ -1123,14 +1194,25 @@ impl EditorApp {
 
     /// 底部状态栏：文件名/语言/脏标记 + 行列/行数/字数 + 字号调节。
     fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab = self.tabs.get(self.active_tab);
-        let (ln, col) = tab
-            .map(|t| (t.cursor_row + 1, t.cursor_col + 1))
-            .unwrap_or((1, 1));
-        let (line_count, char_count) = tab
-            .map(|t| (t.line_count, t.char_count))
-            .unwrap_or((0, 0));
-        let dirty = tab.map(|t| t.dirty).unwrap_or(false);
+        let ed = self.tabs.get(self.active_tab).map(|t| t.editor.clone());
+        let (ln, col) = if let Some(ed) = &ed {
+            let e = ed.read(cx);
+            let (l, c) = e.line_col(e.cursor_offset());
+            (l + 1, c)
+        } else {
+            (1, 0)
+        };
+        let (line_count, char_count) = if let Some(ed) = &ed {
+            let e = ed.read(cx);
+            (e.line_ranges().len(), e.content.chars().count())
+        } else {
+            (0, 0)
+        };
+        let dirty = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.dirty)
+            .unwrap_or(false);
         let language = self.language_label().to_string();
 
         // 左侧：文件名 + 脏标记 + 语言徽标
@@ -1150,11 +1232,7 @@ impl EditorApp {
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(if dirty {
-                                rgb(0xdc2626)
-                            } else {
-                                rgb(0x9ca3af)
-                            })
+                            .text_color(if dirty { rgb(0xdc2626) } else { rgb(0x9ca3af) })
                             .child(if dirty { "●" } else { "" }),
                     )
                     .child(
@@ -1231,9 +1309,10 @@ impl EditorApp {
             .text_color(rgb(0x374151))
             .cursor(CursorStyle::PointingHand)
             .child("−")
-            .on_mouse_up(MouseButton::Left, cx.listener(|this: &mut EditorApp, _e, _w, cx| {
-                this.change_font_size(-1.0, cx)
-            }));
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _e, _w, cx| this.change_font_size(-1.0, cx)),
+            );
         let plus = div()
             .id("font-plus")
             .w(px(22.))
@@ -1247,9 +1326,10 @@ impl EditorApp {
             .text_color(rgb(0x374151))
             .cursor(CursorStyle::PointingHand)
             .child("+")
-            .on_mouse_up(MouseButton::Left, cx.listener(|this: &mut EditorApp, _e, _w, cx| {
-                this.change_font_size(1.0, cx)
-            }));
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _e, _w, cx| this.change_font_size(1.0, cx)),
+            );
         div()
             .flex()
             .flex_row()
@@ -1300,49 +1380,56 @@ impl Render for EditorApp {
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
             // 任意空白处点击 → 关闭已展开的下拉菜单
-            .on_mouse_down(MouseButton::Left, cx.listener(|this: &mut EditorApp, _ev, _w, cx| {
-                this.close_menus(cx)
-            }))
-            // 从资源管理器拖入文件到非编辑区 → 直接打开（编辑区由 Input 的父面板处理）
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, _w, cx| this.close_menus(cx)),
+            )
+            // 从资源管理器拖入文件到非编辑区 → 直接打开（编辑区由 TextArea 自己处理）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
-            .on_drop(cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                if let Some(p) = paths.paths().first() {
-                    this.open_file(&p.to_string_lossy(), window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &Save, _w, cx| {
-                this.save(cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &SaveAs, _w, cx| {
-                this.save_as(cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &NewFile, window, cx| {
-                this.new_tab(window, cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &OpenFile, window, cx| {
-                this.open_dialog(window, cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &CloseTab, window, cx| {
-                this.close_tab(this.active_tab, window, cx);
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &TogglePreview, _w, cx| {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.preview_on = !tab.preview_on;
-                    this.preview_scroll = gpui::ScrollHandle::new();
-                    this.preview_table = TableScrollState::new();
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &IncreaseFontSize, _w, cx| {
-                this.change_font_size(1.0, cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &DecreaseFontSize, _w, cx| {
-                this.change_font_size(-1.0, cx)
-            }))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &ResetFontSize, _w, cx| {
-                this.font_size = DEFAULT_FONT_SIZE;
-                cx.notify();
-            }))
+            .on_drop(
+                cx.listener(|this: &mut EditorApp, paths: &Arc<ExternalPaths>, _w, cx| {
+                    if let Some(p) = paths.paths().first() {
+                        this.open_file(&p.to_string_lossy(), cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(|this: &mut EditorApp, _: &input::Save, _w, cx| this.save(cx)))
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &input::NewFile, window, cx| {
+                    this.new_tab(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &input::OpenFile, _w, cx| {
+                    this.open_dialog(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &input::TogglePreview, _w, cx| {
+                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                        tab.preview_on = !tab.preview_on;
+                        this.preview_scroll = gpui::ScrollHandle::new();
+                        this.preview_table = TableScrollState::new();
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_action(cx.listener(
+                |this: &mut EditorApp, _: &input::IncreaseFontSize, _w, cx| {
+                    this.change_font_size(1.0, cx)
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut EditorApp, _: &input::DecreaseFontSize, _w, cx| {
+                    this.change_font_size(-1.0, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &input::ResetFontSize, _w, cx| {
+                    this.font_size = DEFAULT_FONT_SIZE;
+                    cx.notify();
+                }),
+            )
             .child(self.render_menu_bar(cx))
             .child(self.render_tab_bar(cx))
             .child(body)
@@ -1355,315 +1442,276 @@ impl Render for EditorApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
+    use gpui::TestAppContext;
 
-    /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
-    fn init_test(cx: &mut TestAppContext) {
-        cx.update(|cx| gpui_component::init(cx));
-    }
-
-    /// 创建一个以 `gpui_component::Root` 为窗口根视图的编辑应用，
-    /// 返回视图实体与该窗口的 `VisualTestContext`（后续用其驱动渲染/事件）。
-    fn add_app(cx: &mut TestAppContext) -> (Entity<EditorApp>, &mut VisualTestContext) {
-        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<EditorApp>>>> =
-            std::rc::Rc::default();
-        let (root, cx) = cx.add_window_view(|window, cx| {
-            let app = cx.new(|cx| EditorApp::new(window, cx));
-            *holder.borrow_mut() = Some(app.clone());
-            gpui_component::Root::new(app, window, cx)
+    /// 行号槽对齐：单行短内容（TextArea 垂直居中）与多行滚动后，行号都应与正文对齐。
+    #[gpui::test]
+    async fn gutter_numbers_align_with_text(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 单行短内容（触发 TextArea 垂直居中，正是行号"偏上"的历史场景）
+        view.update(cx, |app, cx| {
+            let ed = app.tabs[app.active_tab].editor.clone();
+            ed.update(cx, |ed, cx| {
+                ed.content = "hello world".into();
+                ed.selected_range = 11..11;
+                cx.notify();
+            });
         });
-        let _ = root;
-        let app = holder.borrow().clone().unwrap();
-        (app, cx)
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 行号 1 顶部应等于编辑区文本元素顶部（last_bounds 已含居中偏移）
+        let gutter_top = cx.debug_bounds("gutter-line-1").map(|b| b.top());
+        let text_top = cx.update(|_w, cx| {
+            view.read(cx).tabs[view.read(cx).active_tab]
+                .editor
+                .read(cx)
+                .last_bounds
+                .map(|b| b.top())
+        });
+        let (gutter_top, text_top) = (gutter_top.unwrap(), text_top.unwrap());
+        assert!(
+            (gutter_top - text_top).abs() < px(1.),
+            "单行内容行号应对齐正文首行：gutter={gutter_top:?} text={text_top:?}"
+        );
+
+        // 多行内容 + 滚动：光标移到末尾行（scroll_cursor_into_view 会滚到可见区），
+        // 等偏移稳定后行号应与正文严格对齐。
+        view.update(cx, |app, cx| {
+            let content = (0..200)
+                .map(|i| format!("第{i}行内容 xyz"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ed = app.tabs[app.active_tab].editor.clone();
+            ed.update(cx, |ed, cx| {
+                ed.content = content.into();
+                ed.selected_range = 0..0;
+                cx.notify();
+            });
+        });
+        // 光标移动到文档末尾（会触发 scroll_cursor_into_view 滚到可见区）
+        cx.update(|window, cx| {
+            let app = view.read(cx);
+            window.focus(
+                &app.tabs[app.active_tab]
+                    .editor
+                    .read(cx)
+                    .focus_handle
+                    .clone(),
+            );
+        });
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::MoveToEndOfDocument), cx);
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let gutter_last = cx.debug_bounds("gutter-line-199").map(|b| b.top());
+        let (text_top, offsets, scroll) = cx.update(|_w, cx| {
+            let ed = view.read(cx).tabs[view.read(cx).active_tab].editor.read(cx);
+            (
+                ed.last_bounds.map(|b| b.top()),
+                ed.last_visual_offsets.clone(),
+                ed.scroll_handle.offset().y,
+            )
+        });
+        assert!(
+            scroll < px(0.),
+            "光标移到末尾后应已滚动（scroll={scroll:?}）"
+        );
+        let expected = text_top.unwrap() + offsets[198];
+        assert!(
+            (gutter_last.unwrap() - expected).abs() < px(1.),
+            "滚动后第 199 行行号应对齐正文：gutter={gutter_last:?} expected={expected:?}"
+        );
     }
 
     /// 选项卡：新建文件产生新选项卡，内容彼此独立，且脏标记正确。
     #[gpui::test]
     async fn tabs_are_independent(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
         // 第 1 个选项卡输入内容
-        let editor0 = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
-        cx.update(|window, cx| {
-            editor0.update(cx, |state, cx| state.set_value("hello", window, cx));
+        let editor0 = cx.update(|_w, cx| view.read(cx).tabs[0].editor.clone());
+        editor0.update(cx, |ed, cx| {
+            ed.content = "hello".into();
+            ed.selected_range = 5..5;
+            cx.notify();
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
         // 新建选项卡
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.new_tab(window, cx));
+            view.update(cx, |app, cx| app.new_tab(window, cx));
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let (count, active, tab1_dirty, tab0_content) = cx.update(|_w, cx| {
-            let a = app.read(cx);
+            let app = view.read(cx);
             (
-                a.tabs.len(),
-                a.active_tab,
-                a.tabs[a.active_tab].dirty,
-                a.tabs[0].editor.read(cx).value(),
+                app.tabs.len(),
+                app.active_tab,
+                app.tabs[app.active_tab].dirty,
+                app.tabs[0].editor.read(cx).content.to_string(),
             )
         });
         assert_eq!(count, 2, "新建后应有 2 个选项卡");
         assert_eq!(active, 1, "新选项卡应被激活");
         assert!(!tab1_dirty, "新选项卡初始未修改");
-        assert_eq!(tab0_content.to_string(), "hello", "第 1 个选项卡内容应保留");
+        assert_eq!(tab0_content, "hello", "第 1 个选项卡内容应保留");
     }
 
-    /// 编辑菜单/快捷键的动作：撤销、重做、粘贴、全选应能到达聚焦的编辑区。
+    /// 编辑菜单/快捷键的动作分发：撤销、重做、复制、粘贴、全选应能到达聚焦的编辑区。
     #[gpui::test]
     async fn edit_actions_dispatch(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
         // 聚焦编辑区并输入内容
         let editor = cx.update(|window, cx| {
-            window.focus(&app.read(cx).editor_focus_handle(cx));
-            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
+            let app = view.read(cx);
+            window.focus(
+                &app.tabs[app.active_tab]
+                    .editor
+                    .read(cx)
+                    .focus_handle
+                    .clone(),
+            );
+            app.tabs[app.active_tab].editor.clone()
         });
         cx.update(|window, cx| {
-            editor.update(cx, |state, cx| state.set_value("hello", window, cx));
+            editor.update(cx, |ed, cx| ed.insert_text_at_cursor("hello", window, cx));
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
-
-        // 粘贴：写入剪贴板后 Ctrl+V 应把内容插入（这是历史上出现“整行消失”的路径）
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("world".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        // 撤销：应清空内容
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Undo), cx);
+        });
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let after_paste = cx.update(|_w, cx| editor.read(cx).value().to_string());
+        let after_undo = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(after_undo, "", "撤销后内容应清空，实际={after_undo:?}");
+
+        // 重做：应恢复内容
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Redo), cx);
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let after_redo = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(after_redo, "hello", "重做后内容应恢复，实际={after_redo:?}");
+
+        // 复制：选中"hello"后 Ctrl+C 应写入剪贴板
+        cx.update(|_window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.content = "hello world".into();
+                ed.selected_range = 0..5;
+                cx.notify();
+            });
+        });
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Copy), cx);
+        });
+        let clip = cx.read_from_clipboard();
         assert_eq!(
-            after_paste, "worldhello",
-            "粘贴应在光标处插入（set_value 后光标回到开头），实际={after_paste:?}"
+            clip.map(|c| c.text().unwrap_or_default().to_string()),
+            Some("hello".into()),
+            "复制应写入剪贴板"
         );
 
-        // 撤销：应撤销粘贴 → 回到插入前（set_value 不进撤销栈，撤销对象是粘贴）
-        cx.dispatch_action(gpui_component::input::Undo);
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let after_undo = cx.update(|_w, cx| editor.read(cx).value().to_string());
-        assert_eq!(after_undo, "hello", "撤销粘贴后应回到插入前，实际={after_undo:?}");
-
-        // 重做：应恢复粘贴
-        cx.dispatch_action(gpui_component::input::Redo);
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let after_redo = cx.update(|_w, cx| editor.read(cx).value().to_string());
-        assert_eq!(after_redo, "worldhello", "重做后内容应恢复，实际={after_redo:?}");
+        // 粘贴：Ctrl+V 应把剪贴板内容插入（覆盖当前选区）
+        cx.update(|window, cx| {
+            window.dispatch_action(Box::new(input::Paste), cx);
+        });
+        let after_paste = cx.update(|_w, cx| editor.read(cx).content.to_string());
+        assert_eq!(
+            after_paste, "hello world",
+            "粘贴应替换选区，实际={after_paste:?}"
+        );
 
         // 全选：Ctrl+A 应选中全部内容
-        cx.dispatch_action(gpui_component::input::SelectAll);
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let sel = cx.update(|window, cx| {
-            editor.update(cx, |state, cx| {
-                state.selected_text_range(false, window, cx)
-            })
-        });
-        let sel = sel.expect("全选后应有选区");
-        assert_eq!(sel.range.start, 0, "全选应从文档开头开始");
-        assert!(sel.range.end > 0, "全选应覆盖全部内容，实际={:?}", sel.range);
-    }
-
-    /// 回归测试：历史上“在一行反复粘贴同一段文本后整行消失”的复现场景。
-    /// gpui-component 的 CodeEditor 以 ropey 存储文本、独立换行管线排版，
-    /// 反复粘贴大段内容时内容不应丢失、镜像缓存与输入区保持一致。
-    #[gpui::test]
-    async fn repeated_pastes_keep_content(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
-        cx.simulate_resize(gpui::size(px(980.), px(720.)));
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let editor = cx.update(|window, cx| {
-            window.focus(&app.read(cx).editor_focus_handle(cx));
-            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
-        });
-
-        let chunk = "Option<Vec<WrappedLine>>";
-        let text = chunk.repeat(300);
-        let expected_len = text.len() * 4;
-
-        // 连续粘贴多次（历史上的触发路径）
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-        for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
-            cx.run_until_parked();
-        }
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-
-        // 内容与镜像缓存一致、不丢失不错乱
-        let (value, cached, dirty) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            let tab = &a.tabs[a.active_tab];
-            (
-                editor.read(cx).value().to_string(),
-                tab.content.to_string(),
-                tab.dirty,
-            )
-        });
-        assert_eq!(
-            value.len(),
-            expected_len,
-            "反复粘贴后内容不得丢失，实际长度={} 期望={expected_len}",
-            value.len()
-        );
-        assert!(value.contains(chunk), "内容应仍包含原文片段");
-        assert_eq!(cached, value, "镜像缓存应等于编辑区内容");
-        assert!(dirty, "粘贴后应置脏");
-
-        // 纯文本剪贴板不会凭空引入换行：仍是单个逻辑行（软换行是排版行为，不改文本）
-        assert_eq!(
-            value.matches('\n').count(),
-            0,
-            "无换行的剪贴板反复粘贴不应产生换行，实际={value:?}"
-        );
-
-        // 真实场景：从源码/聊天处复制的行通常自带尾随换行，粘贴多次应变成多行且不丢失
-        let chunk_line = "use std::sync::Arc;\n";
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(chunk_line.to_string()));
-        for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
-            cx.run_until_parked();
-        }
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let value2 = cx.update(|_w, cx| editor.read(cx).value().to_string());
-        assert_eq!(
-            value2.matches('\n').count(),
-            4,
-            "带尾随换行的行重复粘贴 4 次应有 4 个换行，实际={value2:?}"
-        );
-        assert_eq!(value2.lines().count(), 4, "应形成 4 个逻辑行");
-        assert!(
-            value2.contains("Arc;\nuse std::sync::Arc;"),
-            "多行内容应完整保留，实际={value2:?}"
-        );
-    }
-
-    /// 仅含编辑器的极简宿主：窗口中只有 gpui-component 的代码编辑器，
-    /// 没有菜单栏/选项卡/状态栏/预览等任何外围代码。
-    struct BareEditor {
-        editor: Entity<InputState>,
-    }
-
-    impl Render for BareEditor {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(Input::new(&self.editor).h_full())
-        }
-    }
-
-    /// 隔离测试：窗口里只有代码编辑器（无任何外围布局干扰）。
-    /// 连续粘贴长文本与带换行文本，验证内容层不丢字、不凭空造换行——
-    /// 即“整行消失”从内容层看与外围布局无关。
-    #[gpui::test]
-    async fn minimal_editor_paste_integrity(cx: &mut TestAppContext) {
-        init_test(cx);
-
-        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<InputState>>>> =
-            std::rc::Rc::default();
-        let (root, cx) = cx.add_window_view(|window, cx| {
-            let editor = cx.new(|cx| {
-                gpui_component::input::InputState::new(window, cx)
-                    .code_editor("rust")
-                    .line_number(true)
-            });
-            *holder.borrow_mut() = Some(editor.clone());
-            let view = cx.new(|cx| BareEditor { editor });
-            gpui_component::Root::new(view, window, cx)
-        });
-        let _ = root;
-        let editor = holder.borrow().clone().unwrap();
-
-        cx.simulate_resize(gpui::size(px(980.), px(720.)));
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
         cx.update(|window, cx| {
-            window.focus(&editor.read(cx).focus_handle(cx));
+            window.dispatch_action(Box::new(input::SelectAll), cx);
         });
-        for _ in 0..2 {
-            cx.run_until_parked();
-        }
+        let sel = cx.update(|_w, cx| {
+            let ed = editor.read(cx);
+            (ed.selected_range.start, ed.selected_range.end)
+        });
+        let len = cx.update(|_w, cx| editor.read(cx).content.len());
+        assert_eq!(sel, (0, len), "全选应选中全部内容，实际={sel:?}");
+    }
 
-        // 1) 无换行大段文本连续粘贴：内容不丢、不产生换行（仍是单个逻辑行）
-        let chunk = "Option<Vec<WrappedLine>>".repeat(200);
-        let expected = chunk.len() * 5;
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(chunk));
-        for _ in 0..5 {
-            cx.dispatch_action(gpui_component::input::Paste);
-            cx.run_until_parked();
-        }
+    /// 编辑区在内容超高时应当可滚动（滚轮/拖动滚动条），与预览区一致。
+    #[gpui::test]
+    async fn editor_scrolls_when_content_overflows(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let value = cx.update(|_w, cx| editor.read(cx).value().to_string());
-        assert_eq!(
-            value.len(),
-            expected,
-            "长文本反复粘贴不得丢字：实际长度={} 期望={expected}",
-            value.len()
-        );
-        assert_eq!(
-            value.matches('\n').count(),
-            0,
-            "无换行剪贴板不应产生换行"
-        );
-
-        // 2) 带尾随换行的行连续粘贴：应形成多行且内容完整
-        let line = "use std::sync::Arc;\n";
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string(line.to_string()));
-        for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
+        // 通过真实输入路径插入多行内容（模拟打字），触发行级增量排版与滚动检测
+        let editor =
+            cx.update(|_w, cx| view.read(cx).tabs[view.read(cx).active_tab].editor.clone());
+        let text = (0..80)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.insert_text_at_cursor(&text, window, cx);
+            });
+        });
+        for _ in 0..6 {
             cx.run_until_parked();
         }
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let value2 = cx.update(|_w, cx| editor.read(cx).value().to_string());
-        assert_eq!(value2.matches('\n').count(), 4, "带换行行重复粘贴应有 4 个换行");
-        assert_eq!(value2.lines().count(), 4, "应形成 4 个逻辑行");
+        let max_h = cx.update(|_w, cx| {
+            view.read(cx).tabs[view.read(cx).active_tab]
+                .editor
+                .read(cx)
+                .scroll_handle
+                .max_offset()
+                .height
+        });
+        assert!(
+            max_h > px(0.),
+            "编辑区内容超高时应可滚动，max_offset={max_h:?}"
+        );
     }
 
     /// 冒烟测试：完整渲染整棵 UI 树（菜单/选项卡/编辑区/状态栏），
     /// 展开下拉菜单并打开一个临时文件，确保渲染管线无 panic。
     #[gpui::test]
     async fn renders_and_opens_menu(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..5 {
             cx.run_until_parked();
         }
 
         // 展开"文件"菜单并渲染（覆盖 render_menu_dropdown 全路径）
-        app.update(cx, |app, cx| {
+        view.update(cx, |app, cx| {
             app.toggle_menu(MenuId::File, cx);
             app.toggle_menu(MenuId::View, cx);
         });
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        app.update(cx, |app, cx| app.close_menus(cx));
+        view.update(cx, |app, cx| app.close_menus(cx));
         for _ in 0..3 {
             cx.run_until_parked();
         }
@@ -1671,19 +1719,21 @@ mod tests {
         // 打开一个真实文件，内容进入编辑区，再渲染（覆盖 open_file 路径）
         let dir = std::env::temp_dir().join("gpui-editor-test.md");
         std::fs::write(&dir, "# 标题\n\n**加粗** 正文 `code`\n").unwrap();
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.open_file(dir.to_str().unwrap(), window, cx);
-            });
-        });
+        view.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), cx));
         for _ in 0..5 {
             cx.run_until_parked();
         }
         let (content, preview) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            (a.tabs[a.active_tab].content.to_string(), a.show_preview())
+            let app = view.read(cx);
+            (
+                app.tabs[app.active_tab].editor.read(cx).content.to_string(),
+                app.show_preview(),
+            )
         });
-        assert!(content.contains("标题"), "打开文件后编辑区应有内容: {content}");
+        assert!(
+            content.contains("标题"),
+            "打开文件后编辑区应有内容: {content}"
+        );
         assert!(preview, "打开 .md 文件应自动开启预览");
         let _ = std::fs::remove_file(&dir);
     }
@@ -1691,13 +1741,12 @@ mod tests {
     /// 字号调节 / 预览开关等纯状态操作正常。
     #[gpui::test]
     async fn font_and_preview_toggles(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        app.update(cx, |app, cx| {
+        view.update(cx, |app, cx| {
             app.change_font_size(3.0, cx);
             app.change_font_size(-1.0, cx);
             app.tabs[app.active_tab].preview_on = true;
@@ -1707,18 +1756,20 @@ mod tests {
             cx.run_until_parked();
         }
         let (font, preview) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            (a.font_size, a.show_preview())
+            let app = view.read(cx);
+            (app.font_size, app.show_preview())
         });
         assert_eq!(font, DEFAULT_FONT_SIZE + 2.0);
-        assert!(preview, "预览开关打开后 show_preview 应为 true（不依赖 .md 扩展名）");
+        assert!(
+            preview,
+            "预览开关打开后 show_preview 应为 true（不依赖 .md 扩展名）"
+        );
     }
 
     /// 当前选中的文件是 .md 时，选项卡栏最右侧出现眼睛图标，点击切换预览；非 .md 文件不出现。
     #[gpui::test]
     async fn md_tab_bar_shows_eye_and_toggles_preview(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
@@ -1727,68 +1778,96 @@ mod tests {
         // 打开 .md 文件（当前选中的就是它）：选项卡栏最右侧应显示眼睛，并自动开启预览
         let dir = std::env::temp_dir().join("gpui-editor-eye-test.md");
         std::fs::write(&dir, "# 标题\n").unwrap();
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
-        });
+        view.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), cx));
         for _ in 0..5 {
             cx.run_until_parked();
         }
         let eye_before = cx.debug_bounds("tab-bar-eye");
-        let preview_before = cx.update(|_w, cx| app.read(cx).show_preview());
-        assert!(eye_before.is_some(), "当前选中 .md 文件时，选项卡栏最右侧应显示眼睛图标");
+        let preview_before = cx.update(|_w, cx| view.read(cx).show_preview());
+        assert!(
+            eye_before.is_some(),
+            "当前选中 .md 文件时，选项卡栏最右侧应显示眼睛图标"
+        );
         assert!(preview_before, "打开 .md 文件应自动开启预览");
 
-        // 点击眼睛：应关闭当前选项卡的预览（当前仍是 .md，眼睛保持显示，仅变关闭）
+        // 点击眼睛：应关闭当前选项卡的预览（当前仍是 .md，眼睛保持显示，仅变关闭态）
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_preview_for_tab(0, window, cx));
+            view.update(cx, |app, cx| app.toggle_preview_for_tab(0, window, cx));
         });
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let preview_off = cx.update(|_w, cx| app.read(cx).show_preview());
+        let preview_off = cx.update(|_w, cx| view.read(cx).show_preview());
         let eye_still = cx.debug_bounds("tab-bar-eye").is_some();
         assert!(!preview_off, "点击眼睛后预览应关闭");
         assert!(eye_still, "当前仍是 .md 文件，眼睛图标应保持显示");
         let _ = std::fs::remove_file(&dir);
 
         // 另起一个窗口：打开非 .md 文件，选项卡栏最右侧不应出现眼睛（该窗口从未渲染过眼睛）
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let app = cx.new(|cx| EditorApp::new(window, cx));
-            gpui_component::Root::new(app, window, cx)
-        });
+        let (view2, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
         let dir2 = std::env::temp_dir().join("gpui-editor-eye-test.txt");
         std::fs::write(&dir2, "plain").unwrap();
-        cx.update(|window, cx| {
-            if let Ok(app) = view.read(cx).view().clone().downcast::<EditorApp>() {
-                let _ = app.update(cx, |app, cx| {
-                    app.open_file(dir2.to_str().unwrap(), window, cx);
-                });
-            }
-        });
+        view2.update(cx, |app, cx| app.open_file(dir2.to_str().unwrap(), cx));
         for _ in 0..5 {
             cx.run_until_parked();
         }
         let eye_txt = cx.debug_bounds("tab-bar-eye");
-        assert!(eye_txt.is_none(), "当前选中的文件不是 .md 时，选项卡栏不应显示眼睛图标");
+        assert!(
+            eye_txt.is_none(),
+            "当前选中的文件不是 .md 时，选项卡栏不应显示眼睛图标"
+        );
         let _ = std::fs::remove_file(&dir2);
+    }
+
+    /// 行号槽必须虚拟渲染：上千行时，远离视口的行号不应被实例化成元素
+    /// （否则每次重渲染/输入都会创建上千个 div，导致卡顿）。
+    #[gpui::test]
+    async fn gutter_virtualizes_offscreen_lines(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 写入 1000 行
+        let editor =
+            cx.update(|_w, cx| view.read(cx).tabs[view.read(cx).active_tab].editor.clone());
+        let text = (0..1000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.update(|window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.insert_text_at_cursor(&text, window, cx);
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        // 未滚动时：首行行号应存在；远离视口的行号不应被实例化（虚拟渲染）
+        let first = cx.debug_bounds("gutter-line-1");
+        let far = cx.debug_bounds("gutter-line-500");
+        assert!(first.is_some(), "首行行号应存在");
+        assert!(
+            far.is_none(),
+            "远离视口的行号不应被实例化为元素（虚拟渲染，避免上千元素卡顿）"
+        );
     }
 
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]
     async fn tab_bar_scrolls_when_tabs_overflow(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
         cx.simulate_resize(gpui::size(px(400.), px(400.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
         // 连续新建大量选项卡，总宽超过一屏
         for _ in 0..30 {
-            cx.update(|window, cx| app.update(cx, |app, cx| app.new_tab(window, cx)));
+            cx.update(|window, cx| view.update(cx, |app, cx| app.new_tab(window, cx)));
             for _ in 0..2 {
                 cx.run_until_parked();
             }
@@ -1796,7 +1875,10 @@ mod tests {
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let max_w = cx.update(|_w, cx| app.read(cx).tab_bar_hscroll.handle.max_offset().width);
-        assert!(max_w > px(0.), "选项卡过多时选项卡栏应可横向滚动：max_offset={max_w:?}");
+        let max_w = cx.update(|_w, cx| view.read(cx).tab_bar_hscroll.handle.max_offset().width);
+        assert!(
+            max_w > px(0.),
+            "选项卡过多时选项卡栏应可横向滚动（横向滚动条出现）：max_offset={max_w:?}"
+        );
     }
 }

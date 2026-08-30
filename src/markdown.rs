@@ -6,18 +6,18 @@
 //!
 //! 渲染结果是一个 `Div`，可直接作为 `.child(...)` 使用。
 
+use super::scrollbar::{horizontal_scrollbar, TableScrollState};
 use gpui::{
-    div, font, point, relative, size, px, rgb, rgba, AnyElement, App, Bounds, CursorStyle, Div,
-    Element, ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement,
-    InteractiveElement, LayoutId, MouseButton, ParentElement, Pixels, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, StyledText, Style, TextRun, UnderlineStyle,
-    Window, WrappedLine,
+    div, font, point, px, relative, rgb, rgba, size, AnyElement, App, Bounds, CursorStyle, Div,
+    Element, ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, InteractiveElement,
+    IntoElement, LayoutId, MouseButton, ParentElement, Pixels, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Style, Styled, StyledText, TextRun, UnderlineStyle, Window,
+    WrappedLine,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use super::scrollbar::{horizontal_scrollbar, TableScrollState};
 
 /// 表格超宽时的处理方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,9 +82,15 @@ pub(crate) struct Span {
 #[derive(Clone, Debug)]
 pub(crate) enum Block {
     Paragraph(Vec<Vec<Span>>), // 每行一个 Vec<Span>
-    Heading { level: usize, spans: Vec<Span> },
+    Heading {
+        level: usize,
+        spans: Vec<Span>,
+    },
     Code(String),
-    List { ordered: bool, items: Vec<Vec<Span>> },
+    List {
+        ordered: bool,
+        items: Vec<Vec<Span>>,
+    },
     Table {
         headers: Vec<Vec<Span>>,
         rows: Vec<Vec<Vec<Span>>>,
@@ -453,10 +459,7 @@ fn flush_table(blocks: &mut Vec<Block>, table_buf: &mut Vec<String>) {
     if rows.is_empty() {
         return;
     }
-    let headers = rows[0]
-        .iter()
-        .map(|h| parse_inline(h))
-        .collect::<Vec<_>>();
+    let headers = rows[0].iter().map(|h| parse_inline(h)).collect::<Vec<_>>();
     let data: Vec<Vec<Vec<Span>>> = rows[1..]
         .iter()
         .filter(|row| {
@@ -546,11 +549,7 @@ fn spans_to_styled(spans: &[Span], theme: &MarkdownTheme, force_bold: bool) -> S
             } else {
                 theme.text
             },
-            background_color: if sp.code {
-                Some(theme.code_bg)
-            } else {
-                None
-            },
+            background_color: if sp.code { Some(theme.code_bg) } else { None },
             underline: if sp.link {
                 Some(UnderlineStyle {
                     thickness: px(1.),
@@ -708,12 +707,7 @@ pub fn selected_markdown(md: &str, selection: &Range<usize>) -> String {
                 let se = si + sp_len;
                 let (os, oe) = (ls.max(si), le.min(se));
                 if os < oe {
-                    let sub: String = sp
-                        .text
-                        .chars()
-                        .skip(os - si)
-                        .take(oe - os)
-                        .collect();
+                    let sub: String = sp.text.chars().skip(os - si).take(oe - os).collect();
                     if os == si && oe == se {
                         // 整段 span 完整选中 → 还原标记
                         out.push_str(&span_markdown(sp, &sub));
@@ -856,30 +850,31 @@ impl Element for SelectText {
         let text = self.data.text.clone();
         let runs = self.data.runs.clone();
         let ctx = self.ctx.clone();
-        let layout_id = window.request_measured_layout(style, move |known, available, window, _cx| {
-            let wrap_width = known.width.or(match available.width {
-                gpui::AvailableSpace::Definite(x) => Some(x),
-                _ => None,
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, _cx| {
+                let wrap_width = known.width.or(match available.width {
+                    gpui::AvailableSpace::Definite(x) => Some(x),
+                    _ => None,
+                });
+                let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+                // 命中缓存（宽度+字号一致）→ 不重新 shape，直接用上次的行数/行高
+                let cached = {
+                    let c = ctx.cache.borrow();
+                    c.get(&start)
+                        .filter(|lc| lc.matches(wrap_width.unwrap_or(px(0.)), font_size, &text))
+                        .map(|lc| (lc.rows, lc.line_height))
+                };
+                let (rows, lh) = match cached {
+                    Some((r, l)) => (r, l),
+                    None => {
+                        // 首帧兜底：现场 shape（行高用与绘制一致的逻辑值，避免底部空白）
+                        let rows = shape_rows(&text, font_size, &runs, wrap_width, window);
+                        (rows, window.line_height())
+                    }
+                };
+                let w = wrap_width.unwrap_or(px(0.));
+                size(w, lh * rows as f32)
             });
-            let font_size = window.text_style().font_size.to_pixels(window.rem_size());
-            // 命中缓存（宽度+字号一致）→ 不重新 shape，直接用上次的行数/行高
-            let cached = {
-                let c = ctx.cache.borrow();
-                c.get(&start)
-                    .filter(|lc| lc.matches(wrap_width.unwrap_or(px(0.)), font_size, &text))
-                    .map(|lc| (lc.rows, lc.line_height))
-            };
-            let (rows, lh) = match cached {
-                Some((r, l)) => (r, l),
-                None => {
-                    // 首帧兜底：现场 shape（行高用与绘制一致的逻辑值，避免底部空白）
-                    let rows = shape_rows(&text, font_size, &runs, wrap_width, window);
-                    (rows, window.line_height())
-                }
-            };
-            let w = wrap_width.unwrap_or(px(0.));
-            size(w, lh * rows as f32)
-        });
         (layout_id, ())
     }
 
@@ -902,7 +897,9 @@ impl Element for SelectText {
         // 布局没变：只更新屏上坐标（滚动时上下移动），跳过 shape 与几何计算
         {
             let c = self.ctx.cache.borrow_mut();
-            let reuse = c.get(&start).filter(|lc| lc.matches(wrap, font_size, text.as_ref()));
+            let reuse = c
+                .get(&start)
+                .filter(|lc| lc.matches(wrap, font_size, text.as_ref()));
             if let Some(lc) = reuse {
                 let lh = lc.line_height;
                 let mut g = self.ctx.geom.borrow_mut();
@@ -991,11 +988,7 @@ impl Element for SelectText {
                     let boundaries = wl.wrap_boundaries();
                     let rows_count = boundaries.len() + 1;
                     for r in 0..rows_count {
-                        let rs = if r == 0 {
-                            0
-                        } else {
-                            boundary_byte(wl, r - 1)
-                        };
+                        let rs = if r == 0 { 0 } else { boundary_byte(wl, r - 1) };
                         let re = if r == rows_count - 1 {
                             wl.len()
                         } else {
@@ -1005,12 +998,18 @@ impl Element for SelectText {
                             let x0 = if bl <= rs {
                                 px(0.)
                             } else {
-                                wl.position_for_index(bl, lh).map(|p| p.x).unwrap_or_default()
+                                wl.position_for_index(bl, lh)
+                                    .map(|p| p.x)
+                                    .unwrap_or_default()
                             };
                             let x1 = if br >= re {
-                                wl.position_for_index(re, lh).map(|p| p.x).unwrap_or_default()
+                                wl.position_for_index(re, lh)
+                                    .map(|p| p.x)
+                                    .unwrap_or_default()
                             } else {
-                                wl.position_for_index(br, lh).map(|p| p.x).unwrap_or_default()
+                                wl.position_for_index(br, lh)
+                                    .map(|p| p.x)
+                                    .unwrap_or_default()
                             };
                             if x1 > x0 {
                                 window.paint_quad(
@@ -1103,7 +1102,13 @@ fn shape_rows(
 ) -> usize {
     window
         .text_system()
-        .shape_text(SharedString::from(text.to_owned()), font_size, runs, wrap_width, None)
+        .shape_text(
+            SharedString::from(text.to_owned()),
+            font_size,
+            runs,
+            wrap_width,
+            None,
+        )
         .ok()
         .and_then(|v| v.into_iter().next())
         .map(|wl| wl.wrap_boundaries().len() + 1)
@@ -1154,28 +1159,26 @@ fn render_selectable_spans(
                 }
             }
         })
-        .on_mouse_move(
-            {
-                let ctx = ctx.clone();
-                move |ev, window, _cx| {
-                    let Some(anchor) = *ctx.anchor.borrow() else {
-                        return;
-                    };
-                    let Some(g) = ctx.geom.borrow().get(&start).cloned() else {
-                        return;
-                    };
-                    let idx = g.char_at(&ev.position);
-                    let cur = start + idx;
-                    let (a, b) = (anchor.min(cur), anchor.max(cur));
-                    let changed = *ctx.selection.borrow() != Some(a..b);
-                    if changed {
-                        *ctx.selection.borrow_mut() = Some(a..b);
-                        // 拖动过程中立即重绘，让选区高亮实时跟随鼠标
-                        window.refresh();
-                    }
+        .on_mouse_move({
+            let ctx = ctx.clone();
+            move |ev, window, _cx| {
+                let Some(anchor) = *ctx.anchor.borrow() else {
+                    return;
+                };
+                let Some(g) = ctx.geom.borrow().get(&start).cloned() else {
+                    return;
+                };
+                let idx = g.char_at(&ev.position);
+                let cur = start + idx;
+                let (a, b) = (anchor.min(cur), anchor.max(cur));
+                let changed = *ctx.selection.borrow() != Some(a..b);
+                if changed {
+                    *ctx.selection.borrow_mut() = Some(a..b);
+                    // 拖动过程中立即重绘，让选区高亮实时跟随鼠标
+                    window.refresh();
                 }
-            },
-        )
+            }
+        })
         .on_mouse_up(MouseButton::Left, {
             let ctx = ctx.clone();
             move |_ev, _window, _cx| {
@@ -1185,13 +1188,16 @@ fn render_selectable_spans(
         .child(SelectText::new(data, ctx))
 }
 
-
 fn render_spans_line(spans: &[Span], theme: &MarkdownTheme) -> StyledText {
     render_spans_line_weighted(spans, theme, false)
 }
 
 /// 渲染一行行内片段，可整体强制加粗（用于表头单元格）。
-fn render_spans_line_weighted(spans: &[Span], theme: &MarkdownTheme, force_bold: bool) -> StyledText {
+fn render_spans_line_weighted(
+    spans: &[Span],
+    theme: &MarkdownTheme,
+    force_bold: bool,
+) -> StyledText {
     spans_to_styled(spans, theme, force_bold).into_element()
 }
 
@@ -1227,7 +1233,9 @@ fn render_block(
             let st = if let Some(sel) = sel {
                 render_selectable_spans(spans, theme, false, sel, stream).into_any_element()
             } else {
-                spans_to_styled(spans, theme, false).into_element().into_any_element()
+                spans_to_styled(spans, theme, false)
+                    .into_element()
+                    .into_any_element()
             };
             div()
                 .mb_2()
@@ -1288,22 +1296,20 @@ fn render_block(
                 };
                 let mut row = div().flex().flex_row().min_w(px(0.));
                 row = row.child(
-                    div()
-                        .min_w(px(0.))
-                        .child(
-                            SpannedText {
-                                text: SharedString::from(marker.to_owned()),
-                                runs: vec![TextRun {
-                                    len: marker.len(),
-                                    font: font(".SystemUIFont"),
-                                    color: theme.text,
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                }],
-                            }
-                            .into_element(),
-                        ),
+                    div().min_w(px(0.)).child(
+                        SpannedText {
+                            text: SharedString::from(marker.to_owned()),
+                            runs: vec![TextRun {
+                                len: marker.len(),
+                                font: font(".SystemUIFont"),
+                                color: theme.text,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }],
+                        }
+                        .into_element(),
+                    ),
                 );
                 // 条目文本放进可收缩容器，超长不可断片段靠 break_long_runs 换行
                 if let Some(sel) = sel {
@@ -1314,14 +1320,21 @@ fn render_block(
                             .child(render_selectable_spans(item, theme, false, sel, stream)),
                     );
                 } else {
-                    row = row.child(div().flex_1().min_w(px(0.)).child(render_spans_line(item, theme)));
+                    row = row.child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(render_spans_line(item, theme)),
+                    );
                 }
                 d = d.child(row);
             }
             d.into_any_element()
         }
         Block::Table { headers, rows } => {
-            let ncols = headers.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+            let ncols = headers
+                .len()
+                .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
             if ncols == 0 {
                 return div().into_any_element();
             }
@@ -1344,10 +1357,7 @@ fn render_block(
                                 .text_system()
                                 .shape_line(st.text, font_size, &st.runs, None)
                                 .width;
-                            let w = lw
-                                + CELL_H_PAD
-                                + CELL_BORDER
-                                + CELL_HEADER_BOLD_BUFFER;
+                            let w = lw + CELL_H_PAD + CELL_BORDER + CELL_HEADER_BOLD_BUFFER;
                             if w > m {
                                 m = w;
                             }
@@ -1359,49 +1369,44 @@ fn render_block(
 
             // 单元格：统一 padding/字号/颜色；c>0 的列加左侧分割线（网格线）；表头加浅色底
             // （捕获 sel/stream 使其为 FnMut）
-            let mut render_cell = |c: usize,
-                                   row: &Vec<Vec<Span>>,
-                                   header: bool,
-                                   theme: &MarkdownTheme|
-             -> Div {
-                let mut cell = div()
-                    .px_2()
-                    .py_1()
-                    .text_size(px(13.))
-                    .text_color(theme.table_text);
-                if header {
-                    cell = cell.font_weight(FontWeight::BOLD).bg(theme.table_bg);
-                }
-                // 每一列之间画一条竖直分割线，让各列文字有齐平的参考线
-                if c > 0 {
-                    cell = cell.border_l_1().border_color(theme.blockquote_border);
-                }
-                match mode {
-                    TableMode::Wrap => {
-                        // 等宽列：flex_1 平分可用宽度，min_w(0) 允许收缩，文本自动换行
-                        cell = cell.flex_1().min_w(px(0.));
+            let mut render_cell =
+                |c: usize, row: &Vec<Vec<Span>>, header: bool, theme: &MarkdownTheme| -> Div {
+                    let mut cell = div()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(13.))
+                        .text_color(theme.table_text);
+                    if header {
+                        cell = cell.font_weight(FontWeight::BOLD).bg(theme.table_bg);
                     }
-                    TableMode::Scroll => {
-                        // 列宽取自测量值（全列一致 → 对齐），nowrap 保证单行、表宽=内容宽
-                        cell = cell
-                            .w(col_widths[c])
-                            .flex_shrink_0()
-                            .whitespace_nowrap();
+                    // 每一列之间画一条竖直分割线，让各列文字有齐平的参考线
+                    if c > 0 {
+                        cell = cell.border_l_1().border_color(theme.blockquote_border);
                     }
-                }
-                if let Some(spans) = row.get(c) {
-                    let force = header;
-                    if let Some(sel) = sel {
-                        cell = cell.child(render_selectable_spans(spans, theme, force, sel, stream));
-                    } else if force {
-                        // 表头：强行使 run 加粗（仅 div.font_weight 不会级联进带显式 font 的 run）
-                        cell = cell.child(render_spans_line_weighted(spans, theme, true));
-                    } else {
-                        cell = cell.child(render_spans_line(spans, theme));
+                    match mode {
+                        TableMode::Wrap => {
+                            // 等宽列：flex_1 平分可用宽度，min_w(0) 允许收缩，文本自动换行
+                            cell = cell.flex_1().min_w(px(0.));
+                        }
+                        TableMode::Scroll => {
+                            // 列宽取自测量值（全列一致 → 对齐），nowrap 保证单行、表宽=内容宽
+                            cell = cell.w(col_widths[c]).flex_shrink_0().whitespace_nowrap();
+                        }
                     }
-                }
-                cell
-            };
+                    if let Some(spans) = row.get(c) {
+                        let force = header;
+                        if let Some(sel) = sel {
+                            cell = cell
+                                .child(render_selectable_spans(spans, theme, force, sel, stream));
+                        } else if force {
+                            // 表头：强行使 run 加粗（仅 div.font_weight 不会级联进带显式 font 的 run）
+                            cell = cell.child(render_spans_line_weighted(spans, theme, true));
+                        } else {
+                            cell = cell.child(render_spans_line(spans, theme));
+                        }
+                    }
+                    cell
+                };
 
             let header_row = div()
                 .flex()
@@ -1441,7 +1446,9 @@ fn render_block(
                     let idx = *table_idx;
                     *table_idx += 1;
                     let scroller = div()
-                        .id(ElementId::Name(SharedString::from(format!("md-tbl-scroll-{idx}"))))
+                        .id(ElementId::Name(SharedString::from(format!(
+                            "md-tbl-scroll-{idx}"
+                        ))))
                         .mt_1()
                         .flex()
                         .flex_row()
@@ -1494,7 +1501,14 @@ fn render_block(
 /// 渲染为轻量 Markdown 的入口（用亮色主题；表格默认"自动换行"模式）。
 #[allow(dead_code)]
 pub fn render_markdown(md: &str) -> Div {
-    render_markdown_with_options(md, &MarkdownTheme::light(), TableMode::Wrap, None, None, None)
+    render_markdown_with_options(
+        md,
+        &MarkdownTheme::light(),
+        TableMode::Wrap,
+        None,
+        None,
+        None,
+    )
 }
 
 /// 使用自定义主题渲染 Markdown。
@@ -1629,7 +1643,10 @@ mod tests {
     #[test]
     fn break_long_runs_only_splits_long_unbroken_runs() {
         // 普通句子（含空格/标点/中文，本身有断点）→ 原样保留
-        assert_eq!(break_long_runs("你好，这是普通句子，带 空格。"), "你好，这是普通句子，带 空格。");
+        assert_eq!(
+            break_long_runs("你好，这是普通句子，带 空格。"),
+            "你好，这是普通句子，带 空格。"
+        );
         // 短单词 → 不插入
         assert_eq!(break_long_runs("short"), "short");
         // 60 个连续字母 → 在 28/42/56 处插入 3 个零宽空格
@@ -1673,7 +1690,10 @@ mod tests {
         let md = "一二三\n\n**甲**乙";
         let out = selected_markdown(md, &(0..3));
         assert!(out.contains("一二三"));
-        assert!(!out.contains("甲"), "选中只在一段时不应带出后面的片段: {out}");
+        assert!(
+            !out.contains("甲"),
+            "选中只在一段时不应带出后面的片段: {out}"
+        );
     }
 
     /// 字符级裁剪：只选中加粗串的一部分时，不还原 `**`（避免半截标记）。
@@ -1772,18 +1792,16 @@ mod tests {
             ) -> impl gpui::IntoElement {
                 let long: String = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(12);
                 let md = format!("| 列A | 很长的列B |\n| --- | --- |\n| 值 | {long} |");
-                div()
-                    .h(px(200.))
-                    .w(px(400.))
-                    .bg(gpui::rgb(0xffffff))
-                    .child(render_markdown_with_options(
+                div().h(px(200.)).w(px(400.)).bg(gpui::rgb(0xffffff)).child(
+                    render_markdown_with_options(
                         &md,
                         &MarkdownTheme::light(),
                         TableMode::Scroll,
                         Some(&self.state),
                         Some(window),
                         None,
-                    ))
+                    ),
+                )
             }
         }
 
@@ -1799,14 +1817,13 @@ mod tests {
             max_w > px(0.),
             "横向滚动模式下超宽表格应可横向滚动：max_offset.width={max_w:?}"
         );
-        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值。
-        // 滚动条是贴在滚动容器底部的高 3px 细条，点击点必须落在 [bottom, bottom+3px] 内。
-        let (bar_left, bar_bottom, viewport_w) = cx.update(|_window, cx| {
+        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值
+        let (bar_left, bar_top, viewport_w) = cx.update(|_window, cx| {
             let b = view.read(cx).state.handle.bounds();
-            (b.left(), b.bottom(), b.size.width)
+            (b.left(), b.bottom() + px(1.), b.size.width)
         });
         cx.simulate_click(
-            gpui::point(bar_left + viewport_w * 0.7, bar_bottom + px(1.5)),
+            gpui::point(bar_left + viewport_w * 0.7, bar_top),
             gpui::Modifiers::default(),
         );
         cx.run_until_parked();

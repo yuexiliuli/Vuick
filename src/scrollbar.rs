@@ -54,9 +54,7 @@ impl Default for TableScrollState {
 }
 
 /// 计算横向滚动条几何；内容没超宽时返回 `None`（无需绘制/可滚动）。
-fn hscroll_geometry(
-    handle: &ScrollHandle,
-) -> Option<(Pixels, Pixels, Pixels, Pixels)> {
+fn hscroll_geometry(handle: &ScrollHandle) -> Option<(Pixels, Pixels, Pixels, Pixels)> {
     let bounds = handle.bounds();
     let viewport_w = bounds.size.width;
     if viewport_w <= px(0.) {
@@ -134,62 +132,51 @@ pub fn horizontal_scrollbar(
     }
 
     el = el
-        .on_mouse_down(
-            MouseButton::Left,
-            {
-                let handle = handle.clone();
-                let drag = drag.clone();
-                move |ev, window, _cx| {
-                    let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
-                        return;
-                    };
-                    let bar_left = handle.bounds().left() + GAP_RIGHT;
-                    let rel = ev.position.x - bar_left;
-                    // 记录抓取点相对滑块中心的偏移，拖动时保持
-                    *drag.borrow_mut() = Some(rel - thumb_w / 2.0);
-                    set_thumb_from_center(rel, bar_w, thumb_w, max_scroll, &handle);
-                    window.refresh();
+        .on_mouse_down(MouseButton::Left, {
+            let handle = handle.clone();
+            let drag = drag.clone();
+            move |ev, window, _cx| {
+                let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
+                    return;
+                };
+                let bar_left = handle.bounds().left() + GAP_RIGHT;
+                let rel = ev.position.x - bar_left;
+                // 记录抓取点相对滑块中心的偏移，拖动时保持
+                *drag.borrow_mut() = Some(rel - thumb_w / 2.0);
+                set_thumb_from_center(rel, bar_w, thumb_w, max_scroll, &handle);
+                window.refresh();
+            }
+        })
+        .on_mouse_move({
+            let handle = handle.clone();
+            let drag = drag.clone();
+            move |ev, window, _cx| {
+                if drag.borrow().is_none() {
+                    return;
                 }
-            },
-        )
-        .on_mouse_move(
-            {
-                let handle = handle.clone();
-                let drag = drag.clone();
-                move |ev, window, _cx| {
-                    if drag.borrow().is_none() {
-                        return;
-                    }
-                    let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
-                        *drag.borrow_mut() = None;
-                        return;
-                    };
-                    let grab = drag.borrow().unwrap();
-                    let bar_left = handle.bounds().left() + GAP_RIGHT;
-                    let rel = ev.position.x - bar_left - grab;
-                    set_thumb_from_center(rel, bar_w, thumb_w, max_scroll, &handle);
-                    window.refresh();
-                }
-            },
-        )
-        .on_mouse_up(
-            MouseButton::Left,
-            {
-                let drag = drag.clone();
-                move |_ev, _window, _cx| {
+                let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
                     *drag.borrow_mut() = None;
-                }
-            },
-        )
-        .on_mouse_up_out(
-            MouseButton::Left,
-            {
-                let drag = drag.clone();
-                move |_ev, _window, _cx| {
-                    *drag.borrow_mut() = None;
-                }
-            },
-        );
+                    return;
+                };
+                let grab = drag.borrow().unwrap();
+                let bar_left = handle.bounds().left() + GAP_RIGHT;
+                let rel = ev.position.x - bar_left - grab;
+                set_thumb_from_center(rel, bar_w, thumb_w, max_scroll, &handle);
+                window.refresh();
+            }
+        })
+        .on_mouse_up(MouseButton::Left, {
+            let drag = drag.clone();
+            move |_ev, _window, _cx| {
+                *drag.borrow_mut() = None;
+            }
+        })
+        .on_mouse_up_out(MouseButton::Left, {
+            let drag = drag.clone();
+            move |_ev, _window, _cx| {
+                *drag.borrow_mut() = None;
+            }
+        });
 
     el
 }
@@ -247,7 +234,8 @@ impl Element for Scrollbar {
         _request_layout: &mut (),
         _window: &mut Window,
         _cx: &mut App,
-    ) -> () {}
+    ) -> () {
+    }
 
     fn paint(
         &mut self,
@@ -281,7 +269,10 @@ impl Element for Scrollbar {
 
         // 轨道：左移出 GAP_RIGHT，一条非常淡的圆角底
         let track_x = bounds.left() + GAP_RIGHT;
-        let track = Bounds::new(point(track_x, bounds.top()), size(BAR_W, bounds.size.height));
+        let track = Bounds::new(
+            point(track_x, bounds.top()),
+            size(BAR_W, bounds.size.height),
+        );
         window.paint_quad(
             gpui::fill(track, rgba(0x93a0aa1f)).corner_radii(Corners::all(THUMB_RADIUS)),
         );
@@ -305,8 +296,8 @@ impl Element for Scrollbar {
 mod tests {
     use super::*;
     use gpui::{
-        div, px, rgb, size, SharedString, Styled, IntoElement, InteractiveElement, ParentElement,
-        Context, Render, StatefulInteractiveElement, Window,
+        div, px, rgb, size, Context, InteractiveElement, IntoElement, ParentElement, Render,
+        SharedString, StatefulInteractiveElement, Styled, Window,
     };
 
     /// 复刻 `app.rs::render_messages` 的结构（行包装 + 可滚动消息列 + 右侧滚动条），
