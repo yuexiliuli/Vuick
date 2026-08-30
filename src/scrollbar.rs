@@ -60,7 +60,7 @@ fn hscroll_geometry(handle: &ScrollHandle) -> Option<(Pixels, Pixels, Pixels, Pi
     if viewport_w <= px(0.) {
         return None;
     }
-    let max_scroll = handle.max_offset().width;
+    let max_scroll = handle.max_offset().x;
     let content_w = viewport_w + max_scroll;
     if content_w <= viewport_w + px(1.) {
         return None;
@@ -253,7 +253,7 @@ impl Element for Scrollbar {
         if viewport_h <= px(0.) {
             return;
         }
-        let content_h = viewport_h + handle.max_offset().height;
+        let content_h = viewport_h + handle.max_offset().y;
         if content_h <= viewport_h + px(1.) {
             return; // 内容不超高，无需滚动条
         }
@@ -349,7 +349,7 @@ mod tests {
         }
         let (max_h, _) = cx.update(|_window, cx| {
             let host = view.read(cx);
-            (host.handle.max_offset().height, host.handle.bounds())
+            (host.handle.max_offset().y, host.handle.bounds())
         });
         assert!(
             max_h > px(0.),

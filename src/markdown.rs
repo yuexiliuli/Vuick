@@ -637,7 +637,7 @@ pub struct LeafCache {
     pub wrap: Pixels,
     pub rows: usize,
     /// 最近一次排版的单行结果（绘制直接复用，避免每帧再次 shape）
-    pub shaped: Option<WrappedLine>,
+    pub shaped: Option<Rc<WrappedLine>>,
 }
 
 impl LeafCache {
@@ -663,7 +663,7 @@ pub struct LeafGeom {
     /// 该叶子的文本（命中后用 byte→char 换算）
     pub text: SharedString,
     /// 最近一次排版结果（没有则退化为 0）
-    pub layout: Option<WrappedLine>,
+    pub layout: Option<Rc<WrappedLine>>,
 }
 
 impl LeafGeom {
@@ -928,7 +928,8 @@ impl Element for SelectText {
             .text_system()
             .shape_text(text.clone(), font_size, runs, Some(wrap), None)
             .ok()
-            .and_then(|v| v.into_iter().next());
+            .and_then(|v| v.into_iter().next())
+            .map(Rc::new);
         let rows_count = shaped
             .as_ref()
             .map(|wl| wl.wrap_boundaries().len() + 1)
@@ -1046,7 +1047,8 @@ impl Element for SelectText {
                                 None,
                             )
                             .ok()
-                            .and_then(|v| v.into_iter().next()),
+                            .and_then(|v| v.into_iter().next())
+                            .map(Rc::new),
                         window.line_height(),
                     )
                 }
@@ -1143,9 +1145,9 @@ fn render_selectable_spans(
         .cursor(CursorStyle::IBeam)
         .on_mouse_down(MouseButton::Left, {
             let ctx = ctx.clone();
-            move |ev, window, _cx| {
+            move |ev, window, cx| {
                 // 把键盘焦点移交根视图：之后 Ctrl+C 由"复制选区"处理，而非输入框
-                window.focus(&ctx.focus);
+                window.focus(&ctx.focus, cx);
                 let Some(g) = ctx.geom.borrow().get(&start).cloned() else {
                     return;
                 };
@@ -1460,7 +1462,7 @@ fn render_block(
                         .on_scroll_wheel({
                             let handle = handle.clone();
                             move |_event: &ScrollWheelEvent, _window, cx| {
-                                if handle.max_offset().width > px(0.) {
+                                if handle.max_offset().x > px(0.) {
                                     cx.stop_propagation();
                                 }
                             }
@@ -1755,7 +1757,7 @@ mod tests {
                     top: px(0.),
                     line_height: window.line_height(),
                     text: text.into(),
-                    layout: Some(wl),
+                    layout: Some(Rc::new(wl)),
                 };
                 let len = text.chars().count();
                 // 点击远超行尾 → 结尾（len）
@@ -1812,18 +1814,19 @@ mod tests {
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let max_w = cx.update(|_window, cx| view.read(cx).state.handle.max_offset().width);
+        let max_w = cx.update(|_window, cx| view.read(cx).state.handle.max_offset().x);
         assert!(
             max_w > px(0.),
             "横向滚动模式下超宽表格应可横向滚动：max_offset.width={max_w:?}"
         );
-        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值
-        let (bar_left, bar_top, viewport_w) = cx.update(|_window, cx| {
+        // 点击横向滚动条应能"跳转/拖拽"到对应位置：横向偏移从 0 变成负值。
+        // 滚动条是贴在滚动容器底部的高 3px 细条，点击点必须落在 [bottom, bottom+3px] 内。
+        let (bar_left, bar_bottom, viewport_w) = cx.update(|_window, cx| {
             let b = view.read(cx).state.handle.bounds();
-            (b.left(), b.bottom() + px(1.), b.size.width)
+            (b.left(), b.bottom(), b.size.width)
         });
         cx.simulate_click(
-            gpui::point(bar_left + viewport_w * 0.7, bar_top),
+            gpui::point(bar_left + viewport_w * 0.7, bar_bottom + px(1.5)),
             gpui::Modifiers::default(),
         );
         cx.run_until_parked();
