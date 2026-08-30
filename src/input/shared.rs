@@ -71,6 +71,27 @@ pub struct TextEditEvent;
 #[derive(Clone, Debug)]
 pub struct FileDropped(pub PathBuf);
 
+/// 将外部文本统一为编辑器内部使用的 LF 换行。
+///
+/// Windows 编辑器通常通过剪贴板提供 CRLF。若把 `\r` 留在每个逻辑行末，
+/// GPUI 会把它当作普通字符参与 shaping 和命中计算；最后一行没有 `\r`，
+/// 因而会出现只有前 N-1 行显示异常的规律性问题。
+pub fn normalize_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_newlines;
+
+    #[test]
+    fn normalizes_windows_newlines_without_losing_last_line() {
+        assert_eq!(normalize_newlines("a\r\nb\r\nc"), "a\nb\nc");
+        assert_eq!(normalize_newlines("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(normalize_newlines("a\rb"), "a\nb");
+    }
+}
+
 /// 撤销/重做的历史记录单元。
 ///
 /// 一次编辑 = 在 `range`（修改前内容中的位置）处把 `old_text` 替换为 `new_text`：

@@ -295,6 +295,7 @@ impl EditorApp {
         };
         match fs::read_to_string(&p) {
             Ok(text) => {
+                let text = input::normalize_newlines(&text);
                 let len = text.len();
                 tab.editor.update(cx, |ed, cx| {
                     ed.content = SharedString::from(text);
@@ -1000,10 +1001,6 @@ impl EditorApp {
     fn render_editor_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.tabs[self.active_tab].editor.clone();
         let handle = editor.read(cx).scroll_handle.clone();
-        // TextArea 的"布局高度"会被 taffy 缓存压到一行（内容在构造后才增长时不会重新量高），
-        // 因此滚动容器的溢出检测不能依赖它，改用 TextArea 自己精确追踪的 last_content_height
-        // 作为正文包装层的显式高度，驱动滚轮/滚动条。
-        let content_h = editor.read(cx).last_content_height;
         div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
@@ -1048,7 +1045,10 @@ impl EditorApp {
                         div()
                             .id("editor-text-wrap")
                             .debug_selector(|| "editor-text-wrap".into())
-                            .h(content_h)
+                            // 由 TextArea 的 TextElement intrinsic layout 提供当前内容高度。
+                            // 不能使用上一帧的 last_content_height，否则新增换行行会被裁剪。
+                            .min_h(px(40.))
+                            .flex_none()
                             .min_w(px(0.))
                             .pl(GUTTER_W + px(4.))
                             .pr_3()
@@ -1690,6 +1690,80 @@ mod tests {
         assert!(
             max_h > px(0.),
             "编辑区内容超高时应可滚动，max_offset={max_h:?}"
+        );
+    }
+
+    /// 回归：在多行粘贴内容中间连续粘贴时，正文包装器不能继续使用旧高度。
+    /// 旧实现会把新增的前几行裁掉，导致视觉上整行空白，但 Ctrl+A/复制仍能取到文本。
+    #[gpui::test]
+    async fn repeated_paste_keeps_all_lines_visible(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_window, cx| EditorApp::new(cx));
+        cx.simulate_resize(gpui::size(px(600.), px(400.)));
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        let editor =
+            cx.update(|_window, cx| view.read(cx).tabs[view.read(cx).active_tab].editor.clone());
+        let source = "use std::cell::RefCell;\n".to_owned()
+            + "use std::collections::HashMap;\n"
+            + "use std::ops::Range;\n"
+            + "use std::rc::Rc;";
+        cx.update(|_window, cx| {
+            editor.update(cx, |ed, cx| {
+                ed.content = source.clone().into();
+                let first_line_end = "use std::cell::RefCell;".len();
+                ed.selected_range = first_line_end..first_line_end;
+                cx.notify();
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        cx.update(|window, cx| {
+            window.focus(&editor.read(cx).focus_handle.clone());
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            "use std::cell::RefCell;\r\n".to_owned(),
+        ));
+        for _ in 0..3 {
+            cx.dispatch_action(input::Paste);
+            cx.run_until_parked();
+        }
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        let (content, layout_lines, content_height) = cx.update(|_window, cx| {
+            let ed = editor.read(cx);
+            (
+                ed.content.to_string(),
+                ed.last_layout
+                    .as_ref()
+                    .map(|lines| lines.len())
+                    .unwrap_or(0),
+                ed.last_content_height,
+            )
+        });
+        assert_eq!(
+            content.matches("use std::cell::RefCell;").count(),
+            4,
+            "连续粘贴后源文本不能丢失"
+        );
+        assert_eq!(
+            layout_lines,
+            content.matches('\n').count() + 1,
+            "每个逻辑行都应有对应的排版结果"
+        );
+        assert!(content_height > px(0.), "最新排版高度应已更新");
+        let wrap_bounds = cx
+            .debug_bounds("editor-text-wrap")
+            .expect("编辑器正文包装器应存在");
+        assert!(
+            wrap_bounds.size.height >= content_height,
+            "正文包装器高度不能小于最新排版高度：wrap={:?}, content={content_height:?}",
+            wrap_bounds.size.height
         );
     }
 

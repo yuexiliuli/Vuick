@@ -111,6 +111,21 @@ pub struct TextArea {
 }
 
 impl TextArea {
+    /// 内容发生变化时使依赖排版结果的状态失效。
+    ///
+    /// `last_content_height` 会被编辑器外层用作滚动内容高度，而新高度只有在
+    /// TextElement 的测量/预排版阶段才能得到。若继续保留旧的 `last_layout` 和高度，
+    /// GPUI 可能沿用父级的旧布局，把新增换行内容裁掉。保留 `line_cache` 让下一次
+    /// prepaint 仍可复用未变化的行。
+    fn invalidate_layout(&mut self) {
+        self.last_layout = None;
+        self.last_shaped_content = None;
+        self.last_wrap_width = None;
+        self.cached_line_ranges = None;
+        self.last_visual_offsets.clear();
+        self.last_content_height = px(0.);
+    }
+
     /// 创建一个文本输入框实体（在 App 上下文中以 `cx.new(...)` 包装使用）。
     ///
     /// 注意 `cx.new` 要求 `TextArea: 'static`，本类型满足。
@@ -314,16 +329,18 @@ impl TextArea {
             Some(r) => r,
             None => self.selected_range.clone(),
         };
+        let text = normalize_newlines(text);
         let old = self.content.to_string();
         // 每次编辑都记录一个撤销快照（撤销/重做都能正确恢复双向文本）
         self.history.push(HistoryItem {
             range: range.clone(),
             old_text: old[range.clone()].to_string(),
-            new_text: text.to_string(),
+            new_text: text.clone(),
         });
         let mut new = old;
-        new.replace_range(range.clone(), text);
+        new.replace_range(range.clone(), &text);
         self.content = SharedString::from(new);
+        self.invalidate_layout();
         self.selected_range = range.start + text.len()..range.start + text.len();
         self.selection_reversed = false;
         let _ = window;
@@ -1113,6 +1130,10 @@ impl Render for TextArea {
             .w_full()
             .min_w(px(0.))
             .min_h(px(40.))
+            // 编辑器作为滚动内容的子项时必须保留 TextElement 的 intrinsic height。
+            // 不声明 flex-none 会让父级在内容变化后按旧的最小高度压缩整个 TextArea，
+            // 导致排版结果有多行但实际绘制 bounds 只有一行高。
+            .flex_none()
             // 垂直居中子元素：内容不足一行（占位符/空态，容器高=min_h）时文字垂直居中；
             // 多行时容器高=内容高，居中自动失效，不影响换行/滚动布局。
             .items_center()
@@ -1503,10 +1524,17 @@ impl Element for TextElement {
                 // 才现场 shape 兜底（保证布局槽位高度与绘制内容一致，避免"底部空白"回归）。
                 let cached_size = {
                     let e = input.read(cx);
-                    if let (Some(lines), cw, lh) =
-                        (&e.last_layout, e.last_wrap_width, e.last_line_height)
-                    {
-                        if cw == wrap_width && lh > px(0.) {
+                    if let (Some(lines), Some(shaped_content), cw, lh) = (
+                        &e.last_layout,
+                        &e.last_shaped_content,
+                        e.last_wrap_width,
+                        e.last_line_height,
+                    ) {
+                        // 只有布局缓存对应当前源文本时才能复用高度。粘贴换行内容后，
+                        // 若沿用旧文本的高度，prepaint 虽会得到新行，父级却已经按旧高度
+                        // 完成布局，新增内容会被裁剪，表现为前置行视觉空白。
+                        let current_content = e.content.clone();
+                        if shaped_content == &current_content && cw == wrap_width && lh > px(0.) {
                             let cwpx = lines
                                 .iter()
                                 .map(|wl| wl.width())
@@ -1553,7 +1581,7 @@ impl Element for TextElement {
             // 增量缓存虽然只归 prepaint 维护，但 measure 相位（量布局）可能已把
             // last_layout 更新到别的宽度/字号；此时缓存与"要绘制的内容"不一致，必须重建。
             let cache_ok = input.line_cache.as_ref().map_or(false, |c| {
-                c.wrap_width == wrap_width && c.font_size == font_size
+                c.wrap_width == wrap_width && c.font_size == font_size && c.content == input.content
             });
             input.last_layout.is_none()
                 || input.last_shaped_content.as_ref() != Some(&input.content)
@@ -1719,6 +1747,7 @@ impl Element for TextElement {
         }
 
         // 把本次绘制所需的布局数据存回控件（paint 结束后保留给下一帧用量布局/命中测试用）
+        let previous_content_height = self.input.read(cx).last_content_height;
         self.input.update(cx, |input, _cx| {
             // 趁"未滚动"时预热 pad 缓存（见 content_top_screen），让后续滚动后的
             // 命中测试从一开始就精确，无需等用户到顶再点击。
@@ -1731,6 +1760,11 @@ impl Element for TextElement {
             input.last_visual_offsets = offsets;
             input.last_content_height = total_content_h;
         });
+        // 内容高度在 TextElement 排版阶段才确定。通知观察者（EditorApp）重新渲染，
+        // 使正文包装器同步到新增换行后的高度，否则它会继续使用上一帧的高度并裁剪文本。
+        if previous_content_height != total_content_h {
+            self.input.update(cx, |_input, cx| cx.notify());
+        }
 
         // 自绘常驻滚动条：轨道 + 滑块。GPUI 0.2.2 的系统 overlay 滚动条在
         // Windows 上会自动隐藏等同不可见，所以自己画（圆角、半透明美化版）。
@@ -1871,9 +1905,11 @@ impl EntityInputHandler for TextArea {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        let new_text = normalize_newlines(new_text);
         self.content = SharedString::from(
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..],
+            self.content[..range.start].to_owned() + &new_text + &self.content[range.end..],
         );
+        self.invalidate_layout();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range = None;
         self.selection_reversed = false;
@@ -1897,9 +1933,11 @@ impl EntityInputHandler for TextArea {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
         let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        let new_text = normalize_newlines(new_text);
         self.content = SharedString::from(
-            self.content[..range.start].to_owned() + new_text + &self.content[range.end..],
+            self.content[..range.start].to_owned() + &new_text + &self.content[range.end..],
         );
+        self.invalidate_layout();
         if !new_text.is_empty() {
             self.marked_range = Some(range.start..range.start + new_text.len());
         } else {
