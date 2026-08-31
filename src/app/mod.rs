@@ -135,13 +135,13 @@ impl EditorApp {
         };
         app.make_tab(window, cx);
 
-        // 命令行参数：第一个参数作为初始打开文件
+        // 命令行参数：第一个参数作为初始打开文件（复用首个空选项卡，不额外新建）
         let mut args = std::env::args_os();
         args.next(); // 跳过程序名
         if let Some(first) = args.next() {
             let p = PathBuf::from(&first);
             if p.is_file() {
-                app.open_file(&p.to_string_lossy(), window, cx);
+                app.open_file_in_tab(0, &p.to_string_lossy(), window, cx);
             }
         }
         app
@@ -826,7 +826,7 @@ mod tests {
             cx.run_until_parked();
         }
 
-        // 打开 .md 文件（当前选中的就是它）：选项卡栏最右侧应显示眼睛，并自动开启预览
+        // 打开 .md 文件（自动新建选项卡并选中它）：选项卡栏最右侧应显示眼睛，并自动开启预览
         let dir = std::env::temp_dir().join("gpui-editor-eye-test.md");
         std::fs::write(&dir, "# 标题\n").unwrap();
         cx.update(|window, cx| {
@@ -847,7 +847,9 @@ mod tests {
 
         // 点击眼睛：应关闭当前选项卡的预览（当前仍是 .md，眼睛保持显示，仅变关闭）
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.toggle_preview_for_tab(0, window, cx));
+            app.update(cx, |app, cx| {
+                app.toggle_preview_for_tab(app.active_tab, window, cx)
+            });
         });
         for _ in 0..3 {
             cx.run_until_parked();

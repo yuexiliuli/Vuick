@@ -48,13 +48,19 @@ impl EditorApp {
         }
     }
 
+    /// 打开文件：新建一个文件选项卡并在其中载入文件内容，
+    /// 随后把焦点移到新选项卡的编辑区。
     pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_in_tab(self.active_tab, path, window, cx);
+        let idx = self.make_tab(window, cx);
+        self.open_file_in_tab(idx, path, window, cx);
+        if let Some(tab) = self.tabs.get(idx) {
+            let focus = tab.editor.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
     }
 
     pub(super) fn open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.entity();
-        let idx = self.active_tab;
         window
             .spawn(cx, async move |cx| {
                 let Some(file) = rfd::AsyncFileDialog::new()
@@ -66,7 +72,7 @@ impl EditorApp {
                 };
                 let path = file.path().to_string_lossy().into_owned();
                 let _ = cx.update_window_entity(&entity, |this, window, cx| {
-                    this.open_file_in_tab(idx, &path, window, cx);
+                    this.open_file(&path, window, cx);
                 });
             })
             .detach();
