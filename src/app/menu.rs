@@ -152,11 +152,18 @@ impl EditorApp {
         .item(Self::menu_action_item(
             "重置字号",
             "Ctrl+0",
-            weak,
+            weak.clone(),
             |this, _window, cx| {
                 this.font_size = DEFAULT_FONT_SIZE;
                 cx.notify();
             },
+        ))
+        .separator()
+        .item(Self::menu_action_item(
+            "黑白切换",
+            "",
+            weak,
+            |this, window, cx| this.toggle_theme(window, cx),
         ))
     }
 
@@ -186,6 +193,8 @@ impl EditorApp {
 
     pub(super) fn render_menu_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
+        let (text_primary, bar_bg, bar_border) =
+            (self.text_primary(), self.bar_bg(), self.bar_border());
         let make = |id: &'static str,
                     label: &'static str,
                     items: fn(PopupMenu, gpui::WeakEntity<Self>) -> PopupMenu,
@@ -200,7 +209,7 @@ impl EditorApp {
                 .px_2()
                 .rounded_md()
                 .text_size(px(13.))
-                .text_color(rgb(0x111827))
+                .text_color(text_primary)
                 .dropdown_menu(move |menu, _, _| items(menu, weak.clone()))
         };
 
@@ -212,9 +221,9 @@ impl EditorApp {
             .flex()
             .items_center()
             .gap_1()
-            .bg(rgb(0xf3f4f6))
+            .bg(bar_bg)
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(bar_border)
             .child(make("menu-btn-file", "文件", Self::file_items, weak.clone()))
             .child(make("menu-btn-edit", "编辑", Self::edit_items, weak.clone()))
             .child(make("menu-btn-view", "查看", Self::view_items, weak.clone()))

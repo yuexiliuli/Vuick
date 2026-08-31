@@ -206,6 +206,16 @@ impl EditorApp {
 
     pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_tab;
+        let (text_primary, text_minor, tab_active_bg, tab_active_border, chip_bg, chip_text, bar_bg, bar_border) = (
+            self.text_primary(),
+            self.text_minor(),
+            self.tab_active_bg(),
+            self.tab_active_border(),
+            self.chip_bg(),
+            self.chip_text(),
+            self.bar_bg(),
+            self.bar_border(),
+        );
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == active;
@@ -227,7 +237,7 @@ impl EditorApp {
                 .justify_center()
                 .rounded_md()
                 .text_size(px(13.))
-                .text_color(rgb(0x9ca3af))
+                .text_color(text_minor)
                 .cursor(CursorStyle::PointingHand)
                 .child("×")
                 .on_mouse_down(
@@ -249,19 +259,19 @@ impl EditorApp {
                     .flex_shrink(1.)
                     .rounded_md()
                     .bg(if is_active {
-                        rgb(0xffffff)
+                        tab_active_bg
                     } else {
-                        rgba(0x00000000)
+                        rgba(0x00000000).into()
                     })
                     .border_1()
                     .border_color(if is_active {
-                        rgb(0xd1d5db)
+                        tab_active_border
                     } else {
-                        rgba(0x00000000)
+                        rgba(0x00000000).into()
                     })
                     .cursor(CursorStyle::PointingHand)
                     .text_size(px(12.))
-                    .text_color(rgb(0x111827))
+                    .text_color(text_primary)
                     .child(if dirty { "● " } else { "" })
                     .child(name)
                     .child(close)
@@ -281,9 +291,9 @@ impl EditorApp {
             .w(px(24.))
             .h(px(24.))
             .rounded_md()
-            .bg(rgb(0xe5e7eb))
+            .bg(chip_bg)
             .text_size(px(15.))
-            .text_color(rgb(0x374151))
+            .text_color(chip_text)
             .on_click(
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| this.new_tab(window, cx)),
             );
@@ -370,9 +380,9 @@ impl EditorApp {
             .flex()
             .items_center()
             .gap_1()
-            .bg(rgb(0xf3f4f6))
+            .bg(bar_bg)
             .border_b_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(bar_border)
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
             // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变原 34px 高度。
             .child(

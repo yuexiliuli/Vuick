@@ -2,9 +2,9 @@
 //! 创建主窗口并把窗口根视图包上 [`gpui_component::Root`]。
 //!
 //! 模块结构：
-//! - [`app`]：主视图 `EditorApp`（菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）
+//! - [`app`]：主视图 `EditorApp`（自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）
 //! - `gpui_component::text::TextView`：Markdown 解析、排版与选择
-//! - [`scrollbar`]：自绘滚动条（选项卡栏 / 预览区用）
+//! - [`scrollbar`]：自绘横向滚动条（选项卡栏用）
 //! - [`actions`]：应用级动作类型
 //!
 //! 文本（代码）编辑区使用 **gpui-component 的 `Input`（CodeEditor 模式）**：
@@ -57,6 +57,13 @@ fn main() {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        // 隐藏原生标题栏（它在深色系统上不受控为黑色），
+                        // 改由应用内自绘标题栏（随黑白主题）。详见 app::render_title_bar。
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("GPUI 编辑器".into()),
+                            appears_transparent: true,
+                            ..Default::default()
+                        }),
                         ..Default::default()
                     },
                     |window, cx| {

@@ -354,8 +354,8 @@
         }
 
         // 点击"文件"菜单按钮，展开 gpui_component 的 DropdownMenu/PopupMenu 并渲染
-        // （菜单栏置于窗口顶部，首个按钮"文件"中心约为 (32, 13)）
-        cx.simulate_click(gpui::Point::new(px(32.), px(13.)), Default::default());
+        // （顶部为 30px 自绘标题栏，菜单栏在其下，按钮"文件"中心约为 (32, 43)）
+        cx.simulate_click(gpui::Point::new(px(32.), px(43.)), Default::default());
         for _ in 0..5 {
             cx.run_until_parked();
         }

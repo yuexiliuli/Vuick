@@ -15,6 +15,13 @@ impl EditorApp {
         let (line_count, char_count) = tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
         let dirty = tab.map(|t| t.dirty).unwrap_or(false);
         let language = self.language_label().to_string();
+        let (text_primary, text_minor, chip_text, surface_bg, bar_border) = (
+            self.text_primary(),
+            self.text_minor(),
+            self.chip_text(),
+            self.surface_bg(),
+            self.bar_border(),
+        );
 
         // 左侧：文件名 + 脏标记 + 语言徽标
         let left = div()
@@ -40,7 +47,7 @@ impl EditorApp {
                         div()
                             .text_size(px(12.))
                             .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0x111827))
+                            .text_color(text_primary)
                             .child(self.file_display_name()),
                     ),
             )
@@ -64,28 +71,28 @@ impl EditorApp {
             .child(
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(0x374151))
+                    .text_color(chip_text)
                     .child(format!("Ln {ln}, Col {col}")),
             )
             .child(
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(0x6b7280))
+                    .text_color(text_minor)
                     .child(format!("{line_count} 行")),
             )
             .child(
                 div()
                     .text_size(px(12.))
-                    .text_color(rgb(0x6b7280))
+                    .text_color(text_minor)
                     .child(format!("{char_count} 字")),
             )
             .child(self.status_bar_font_controls(cx));
 
         div()
             .h(px(28.))
-            .bg(rgb(0xffffff))
+            .bg(surface_bg)
             .border_t_1()
-            .border_color(rgb(0xe5e7eb))
+            .border_color(bar_border)
             .flex()
             .items_center()
             .justify_between()
@@ -96,6 +103,7 @@ impl EditorApp {
     }
 
     pub(super) fn status_bar_font_controls(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let text_minor = self.text_minor();
         let weak = cx.weak_entity();
         let minus = Button::new("font-minus")
             .label("−")
@@ -124,7 +132,7 @@ impl EditorApp {
                 div()
                     .w(px(34.))
                     .text_size(px(12.))
-                    .text_color(rgb(0x6b7280))
+                    .text_color(text_minor)
                     .flex()
                     .justify_center()
                     .child(format!("{}px", self.font_size.round() as i32)),

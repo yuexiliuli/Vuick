@@ -38,8 +38,6 @@ use gpui_component::input::{Editor, EditorState, InputEvent, TabSize};
 use crate::actions::*;
 use crate::scrollbar::TableScrollState;
 
-/// 编辑区背景色（亮色）。
-const EDIT_BG: gpui::Hsla = white();
 /// 编辑器默认正文字号（px）。
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 /// 字号调节范围（px）。
@@ -88,6 +86,8 @@ pub struct EditorApp {
     status_ok: bool,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
+    /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
+    dark_mode: bool,
     focus_handle: FocusHandle,
 }
 
@@ -115,6 +115,7 @@ impl EditorApp {
             status: SharedString::from("就绪"),
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
+            dark_mode: false,
             focus_handle,
         };
         app.make_tab(window, cx);
@@ -254,6 +255,195 @@ impl EditorApp {
         self.font_size = (self.font_size + delta).clamp(FONT_MIN, FONT_MAX);
         cx.notify();
     }
+
+    /// 窗口整体背景（编辑区以外的画布）。
+    fn window_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x111827).into()
+        } else {
+            rgb(0xf3f4f6).into()
+        }
+    }
+
+    /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
+    fn bar_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x1f2937).into()
+        } else {
+            rgb(0xf3f4f6).into()
+        }
+    }
+
+    /// 工具条分隔边框。
+    fn bar_border(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x374151).into()
+        } else {
+            rgb(0xe5e7eb).into()
+        }
+    }
+
+    /// 编辑器/预览面板背景。
+    fn panel_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x111827).into()
+        } else {
+            white()
+        }
+    }
+
+    /// 主要文字颜色。
+    fn text_primary(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0xe5e7eb).into()
+        } else {
+            rgb(0x111827).into()
+        }
+    }
+
+    /// 次要/弱化文字颜色。
+    fn text_minor(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x9ca3af).into()
+        } else {
+            rgb(0x6b7280).into()
+        }
+    }
+
+    /// 胶囊/小按钮等"芯片"背景。
+    fn chip_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x374151).into()
+        } else {
+            rgb(0xe5e7eb).into()
+        }
+    }
+
+    /// 芯片上的文字颜色。
+    fn chip_text(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0xe5e7eb).into()
+        } else {
+            rgb(0x374151).into()
+        }
+    }
+
+    /// 激活选项卡背景。
+    fn tab_active_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x374151).into()
+        } else {
+            white()
+        }
+    }
+
+    /// 激活选项卡边框。
+    fn tab_active_border(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x4b5563).into()
+        } else {
+            rgb(0xd1d5db).into()
+        }
+    }
+
+    /// 状态栏/其他整体面板背景。
+    fn surface_bg(&self) -> gpui::Hsla {
+        if self.dark_mode {
+            rgb(0x111b2a).into()
+        } else {
+            white()
+        }
+    }
+
+    /// 切换黑白（深色/浅色）主题：驱动 gpui_component 组件主题与自绘色板。
+    /// 自绘标题栏也走同一套色板，因此整窗（含标题栏）随之切换。
+    fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.dark_mode = !self.dark_mode;
+        gpui_component::Theme::change(
+            if self.dark_mode {
+                gpui_component::ThemeMode::Dark
+            } else {
+                gpui_component::ThemeMode::Light
+            },
+            None,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
+    /// 左侧为拖拽区（按下即移动窗口），右侧为最小化 / 关闭按钮。
+    pub(super) fn render_title_bar(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (bar_bg, bar_border, text_primary, text_minor) = (
+            self.bar_bg(),
+            self.bar_border(),
+            self.text_primary(),
+            self.text_minor(),
+        );
+
+        let minimize = div(
+            
+
+        )
+            .id("title-minimize")
+            .w(px(30.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_size(px(12.))
+            .text_color(text_minor)
+            .cursor(CursorStyle::PointingHand)
+            .child("─")
+            .on_click(move |_, window, _cx| window.minimize_window());
+
+        let close = div()
+            .id("title-close")
+            .w(px(30.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_size(px(13.))
+            .text_color(text_minor)
+            .cursor(CursorStyle::PointingHand)
+            .child("✕")
+            .on_click(|_, _window, cx| cx.quit());
+
+        div()
+            .id("title-bar")
+            .h(px(30.))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .bg(bar_bg)
+            .border_b_1()
+            .border_color(bar_border)
+            .child(
+                div()
+                    .id("title-drag")
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(text_primary)
+                    .child("GPUI 编辑器")
+                    .on_mouse_down(MouseButton::Left, |_, window, _cx| {
+                        window.start_window_move();
+                    }),
+            )
+            .children([minimize.into_any_element(), close.into_any_element()])
+    }
 }
 
 impl Render for EditorApp {
@@ -284,7 +474,7 @@ impl Render for EditorApp {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xf3f4f6))
+            .bg(self.window_bg())
             .track_focus(&self.focus_handle(cx))
             // 从资源管理器拖入文件到非编辑区 → 直接打开（编辑区由 Input 的父面板处理）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
@@ -346,6 +536,7 @@ impl Render for EditorApp {
                     cx.notify();
                 }),
             )
+            .child(self.render_title_bar(window, cx))
             .child(self.render_menu_bar(cx))
             .child(self.render_tab_bar(cx))
             .child(body)
