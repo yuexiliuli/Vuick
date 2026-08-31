@@ -1,13 +1,9 @@
 //! status_bar.
 
 use super::*;
-use gpui_component::{
-    button::{Button, ButtonVariants as _},
-    Sizable as _,
-};
 
 impl EditorApp {
-    pub(super) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_status_bar(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tabs.get(self.active_tab);
         let (ln, col) = tab
             .map(|t| (t.cursor_row + 1, t.cursor_col + 1))
@@ -62,7 +58,7 @@ impl EditorApp {
                     .child(language),
             );
 
-        // 右侧：统计信息 + 字号控制
+        // 右侧：统计信息
         let right = div()
             .flex()
             .flex_row()
@@ -85,8 +81,7 @@ impl EditorApp {
                     .text_size(px(12.))
                     .text_color(text_minor)
                     .child(format!("{char_count} 字")),
-            )
-            .child(self.status_bar_font_controls(cx));
+            );
 
         div()
             .h(px(28.))
@@ -100,43 +95,5 @@ impl EditorApp {
             .px_3()
             .child(left)
             .child(right)
-    }
-
-    pub(super) fn status_bar_font_controls(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let text_minor = self.text_minor();
-        let weak = cx.weak_entity();
-        let minus = Button::new("font-minus")
-            .label("−")
-            .xsmall()
-            .compact()
-            .ghost()
-            .on_click(move |_event, _window, cx| {
-                let _ = weak.update(cx, |this, cx| this.change_font_size(-1.0, cx));
-            });
-        let weak = cx.weak_entity();
-        let plus = Button::new("font-plus")
-            .label("+")
-            .xsmall()
-            .compact()
-            .ghost()
-            .on_click(move |_event, _window, cx| {
-                let _ = weak.update(cx, |this, cx| this.change_font_size(1.0, cx));
-            });
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .child(minus)
-            .child(
-                div()
-                    .w(px(34.))
-                    .text_size(px(12.))
-                    .text_color(text_minor)
-                    .flex()
-                    .justify_center()
-                    .child(format!("{}px", self.font_size.round() as i32)),
-            )
-            .child(plus)
     }
 }
