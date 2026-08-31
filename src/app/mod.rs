@@ -44,19 +44,6 @@ const FONT_MIN: f32 = 10.0;
 const FONT_MAX: f32 = 28.0;
 /// 菜单栏高度。
 const MENU_BAR_H: Pixels = px(26.);
-/// 菜单项宽度。
-const MENU_ITEM_W: Pixels = px(56.);
-/// 下拉菜单面板宽度。
-const MENU_PANEL_W: Pixels = px(220.);
-
-/// 顶部菜单标识。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MenuId {
-    File,
-    Edit,
-    View,
-    Help,
-}
 
 /// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
 struct EditorTab {
@@ -98,10 +85,6 @@ pub struct EditorApp {
     status_ok: bool,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
-    /// 当前展开的下拉菜单（None = 无）
-    open_menu: Option<MenuId>,
-    /// 下拉菜单中当前悬停的条目（用于高亮）
-    menu_hover: Option<(MenuId, usize)>,
     focus_handle: FocusHandle,
 }
 
@@ -129,8 +112,6 @@ impl EditorApp {
             status: SharedString::from("就绪"),
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
-            open_menu: None,
-            menu_hover: None,
             focus_handle,
         };
         app.make_tab(window, cx);
@@ -270,26 +251,6 @@ impl EditorApp {
         self.font_size = (self.font_size + delta).clamp(FONT_MIN, FONT_MAX);
         cx.notify();
     }
-
-    /// 关闭所有下拉菜单。
-    fn close_menus(&mut self, cx: &mut Context<Self>) {
-        if self.open_menu.is_some() {
-            self.open_menu = None;
-            self.menu_hover = None;
-            cx.notify();
-        }
-    }
-
-    /// 切换指定下拉菜单的展开状态。
-    fn toggle_menu(&mut self, id: MenuId, cx: &mut Context<Self>) {
-        self.open_menu = if self.open_menu == Some(id) {
-            None
-        } else {
-            Some(id)
-        };
-        self.menu_hover = None;
-        cx.notify();
-    }
 }
 
 impl Render for EditorApp {
@@ -322,11 +283,6 @@ impl Render for EditorApp {
             .size_full()
             .bg(rgb(0xf3f4f6))
             .track_focus(&self.focus_handle(cx))
-            // 任意空白处点击 → 关闭已展开的下拉菜单
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this: &mut EditorApp, _ev, _w, cx| this.close_menus(cx)),
-            )
             // 从资源管理器拖入文件到非编辑区 → 直接打开（编辑区由 Input 的父面板处理）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
             .on_drop(cx.listener(
@@ -391,8 +347,6 @@ impl Render for EditorApp {
             .child(self.render_tab_bar(cx))
             .child(body)
             .child(self.render_status_bar(cx))
-            // 下拉菜单覆盖层放在最后一层，保证绘制在编辑区之上
-            .child(self.render_menu_dropdown(cx))
     }
 }
 
@@ -751,16 +705,10 @@ mod tests {
             cx.run_until_parked();
         }
 
-        // 展开"文件"菜单并渲染（覆盖 render_menu_dropdown 全路径）
-        app.update(cx, |app, cx| {
-            app.toggle_menu(MenuId::File, cx);
-            app.toggle_menu(MenuId::View, cx);
-        });
+        // 点击"文件"菜单按钮，展开 gpui_component 的 DropdownMenu/PopupMenu 并渲染
+        // （菜单栏置于窗口顶部，首个按钮"文件"中心约为 (32, 13)）
+        cx.simulate_click(gpui::Point::new(px(32.), px(13.)), Default::default());
         for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        app.update(cx, |app, cx| app.close_menus(cx));
-        for _ in 0..3 {
             cx.run_until_parked();
         }
 

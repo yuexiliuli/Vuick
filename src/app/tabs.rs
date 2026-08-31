@@ -73,7 +73,6 @@ impl EditorApp {
         }
         self.active_tab = idx;
         self.preview_scroll = gpui::ScrollHandle::new();
-        self.menu_hover = None;
         let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();

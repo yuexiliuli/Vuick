@@ -1,53 +1,208 @@
-//! menu.
+//! menu：顶部菜单栏 + 下拉菜单（gpui_component DropdownMenu / PopupMenu）。
 
 use super::*;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 
 impl EditorApp {
-    pub(super) fn menu_button_left(id: MenuId) -> Pixels {
-        let idx = match id {
-            MenuId::File => 0,
-            MenuId::Edit => 1,
-            MenuId::View => 2,
-            MenuId::Help => 3,
-        };
-        px(4.) + (MENU_ITEM_W + px(4.)) * idx as f32
+    /// 构造一个带右侧快捷键提示的菜单项；点击后通过弱引用更新本应用状态。
+    fn menu_action_item<F>(
+        label: &'static str,
+        shortcut: &'static str,
+        weak: gpui::WeakEntity<Self>,
+        f: F,
+    ) -> PopupMenuItem
+    where
+        F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    {
+        PopupMenuItem::element(move |_, _| {
+            let mut content = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(label);
+            if !shortcut.is_empty() {
+                content = content.child(div().text_color(rgb(0x9ca3af)).child(shortcut));
+            }
+            content
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak.update(cx, |this, cx| f(this, window, cx));
+        })
+    }
+
+    /// "文件"菜单。
+    fn file_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+        menu.item(Self::menu_action_item("新建", "Ctrl+N", weak.clone(), |this, window, cx| {
+            this.new_tab(window, cx)
+        }))
+        .item(Self::menu_action_item(
+            "打开文件…",
+            "Ctrl+O",
+            weak.clone(),
+            |this, window, cx| this.open_dialog(window, cx),
+        ))
+        .item(Self::menu_action_item(
+            "保存",
+            "Ctrl+S",
+            weak.clone(),
+            |this, window, cx| this.save(window, cx),
+        ))
+        .item(Self::menu_action_item(
+            "另存为…",
+            "Shift+Ctrl+S",
+            weak.clone(),
+            |this, window, cx| this.save_as(window, cx),
+        ))
+        .separator()
+        .item(Self::menu_action_item(
+            "退出",
+            "Ctrl+Q",
+            weak,
+            |_, _window, cx| cx.quit(),
+        ))
+    }
+
+    /// "编辑"菜单。
+    fn edit_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+        menu.item(Self::menu_action_item(
+            "撤销",
+            "Ctrl+Z",
+            weak.clone(),
+            |this, window, cx| {
+                Self::focus_active_editor(this, window, cx);
+                window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
+            },
+        ))
+        .item(Self::menu_action_item(
+            "重做",
+            "Ctrl+Y",
+            weak.clone(),
+            |this, window, cx| {
+                Self::focus_active_editor(this, window, cx);
+                window.dispatch_action(Box::new(gpui_component::input::Redo), cx);
+            },
+        ))
+        .separator()
+        .item(Self::menu_action_item(
+            "剪切",
+            "Ctrl+X",
+            weak.clone(),
+            |this, window, cx| {
+                Self::focus_active_editor(this, window, cx);
+                window.dispatch_action(Box::new(gpui_component::input::Cut), cx);
+            },
+        ))
+        .item(Self::menu_action_item(
+            "复制",
+            "Ctrl+C",
+            weak.clone(),
+            |this, window, cx| {
+                Self::focus_active_editor(this, window, cx);
+                window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+            },
+        ))
+        .item(Self::menu_action_item(
+            "粘贴",
+            "Ctrl+V",
+            weak.clone(),
+            |this, window, cx| this.paste_normalized(window, cx),
+        ))
+        .separator()
+        .item(Self::menu_action_item(
+            "全选",
+            "Ctrl+A",
+            weak,
+            |this, window, cx| {
+                Self::focus_active_editor(this, window, cx);
+                window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+            },
+        ))
+    }
+
+    /// "查看"菜单。
+    fn view_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+        menu.item(Self::menu_action_item(
+            "预览",
+            "Ctrl+P",
+            weak.clone(),
+            |this, _window, cx| {
+                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                    tab.preview_on = !tab.preview_on;
+                    this.preview_scroll = gpui::ScrollHandle::new();
+                }
+                cx.notify();
+            },
+        ))
+        .separator()
+        .item(Self::menu_action_item(
+            "增大字号",
+            "Ctrl+=",
+            weak.clone(),
+            |this, _window, cx| this.change_font_size(1.0, cx),
+        ))
+        .item(Self::menu_action_item(
+            "减小字号",
+            "Ctrl+-",
+            weak.clone(),
+            |this, _window, cx| this.change_font_size(-1.0, cx),
+        ))
+        .item(Self::menu_action_item(
+            "重置字号",
+            "Ctrl+0",
+            weak,
+            |this, _window, cx| {
+                this.font_size = DEFAULT_FONT_SIZE;
+                cx.notify();
+            },
+        ))
+    }
+
+    /// "帮助"菜单。
+    fn help_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
+        menu.item(Self::menu_action_item(
+            "关于",
+            "",
+            weak,
+            |this, _window, cx| {
+                this.status = SharedString::from(
+                    "GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2 + gpui-component",
+                );
+                this.status_ok = true;
+                cx.notify();
+            },
+        ))
+    }
+
+    /// 把焦点还给当前激活选项卡的编辑区（编辑动作派发到 Input 上下文所需）。
+    fn focus_active_editor(this: &mut Self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = this.tabs.get(this.active_tab) {
+            let focus = tab.editor.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
     }
 
     pub(super) fn render_menu_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let open = self.open_menu;
-        let make_button = |id: MenuId, label: &'static str, cx: &mut Context<Self>| {
-            let is_open = open == Some(id);
-            Button::new(SharedString::from(format!("menu-btn-{id:?}")))
+        let weak = cx.weak_entity();
+        let make = |id: &'static str,
+                    label: &'static str,
+                    items: fn(PopupMenu, gpui::WeakEntity<Self>) -> PopupMenu,
+                    weak: gpui::WeakEntity<Self>| {
+            Button::new(id)
                 .label(label)
                 .ghost()
-                .w(MENU_ITEM_W)
+                .w(px(56.))
                 .h(MENU_BAR_H)
                 .flex()
                 .items_center()
                 .px_2()
                 .rounded_md()
-                .bg(if is_open {
-                    rgb(0xe5e7eb)
-                } else {
-                    rgba(0x00000000)
-                })
                 .text_size(px(13.))
-                .font_weight(if is_open {
-                    gpui::FontWeight::SEMIBOLD
-                } else {
-                    gpui::FontWeight::NORMAL
-                })
                 .text_color(rgb(0x111827))
-                .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                    this.toggle_menu(id, cx);
-                    cx.stop_propagation();
-                }))
+                .dropdown_menu(move |menu, _, _| items(menu, weak.clone()))
         };
-        let file_btn = make_button(MenuId::File, "文件", cx);
-        let edit_btn = make_button(MenuId::Edit, "编辑", cx);
-        let view_btn = make_button(MenuId::View, "查看", cx);
-        let help_btn = make_button(MenuId::Help, "帮助", cx);
 
         div()
             .id("menu-bar")
@@ -60,215 +215,9 @@ impl EditorApp {
             .bg(rgb(0xf3f4f6))
             .border_b_1()
             .border_color(rgb(0xe5e7eb))
-            .child(file_btn)
-            .child(edit_btn)
-            .child(view_btn)
-            .child(help_btn)
-    }
-
-    #[allow(clippy::type_complexity)]
-    pub(super) fn menu_definitions(
-        &self,
-    ) -> Vec<(MenuId, &'static str, Vec<(&'static str, &'static str)>)> {
-        vec![
-            (
-                MenuId::File,
-                "文件",
-                vec![
-                    ("新建", "Ctrl+N"),
-                    ("打开文件…", "Ctrl+O"),
-                    ("保存", "Ctrl+S"),
-                    ("另存为…", ""),
-                    ("—", ""),
-                    ("退出", "Ctrl+Q"),
-                ],
-            ),
-            (
-                MenuId::Edit,
-                "编辑",
-                vec![
-                    ("撤销", "Ctrl+Z"),
-                    ("重做", "Ctrl+Y"),
-                    ("—", ""),
-                    ("剪切", "Ctrl+X"),
-                    ("复制", "Ctrl+C"),
-                    ("粘贴", "Ctrl+V"),
-                    ("—", ""),
-                    ("全选", "Ctrl+A"),
-                ],
-            ),
-            (
-                MenuId::View,
-                "查看",
-                vec![
-                    ("预览", "Ctrl+P"),
-                    ("—", ""),
-                    ("增大字号", "Ctrl+="),
-                    ("减小字号", "Ctrl+-"),
-                    ("重置字号", "Ctrl+0"),
-                ],
-            ),
-            (MenuId::Help, "帮助", vec![("关于", "")]),
-        ]
-    }
-
-    pub(super) fn render_menu_dropdown(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(menu) = self.open_menu else {
-            return div().into_any_element();
-        };
-        let left = Self::menu_button_left(menu);
-        let hover = self.menu_hover;
-        let weak = cx.weak_entity();
-        let items = self
-            .menu_definitions()
-            .into_iter()
-            .find(|(id, _, _)| *id == menu)
-            .map(|(_, _, items)| items)
-            .unwrap_or_default();
-
-        let mut panel_children: Vec<gpui::AnyElement> = Vec::new();
-        for (idx, (label, shortcut)) in items.iter().enumerate() {
-            // 分隔线
-            if *label == "—" {
-                panel_children.push(div().my_1().h(px(1.)).bg(rgb(0xe5e7eb)).into_any_element());
-                continue;
-            }
-            let is_hover = hover == Some((menu, idx));
-            let weak = weak.clone();
-            panel_children.push(
-                div()
-                    .id(SharedString::from(format!("menu-item-{menu:?}-{idx}")))
-                    .h(px(30.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .bg(if is_hover {
-                        rgb(0xeef2ff)
-                    } else {
-                        rgba(0x00000000)
-                    })
-                    .rounded_md()
-                    .text_size(px(13.))
-                    .text_color(rgb(0x111827))
-                    .cursor(CursorStyle::PointingHand)
-                    .child(*label)
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(0x9ca3af))
-                            .child(shortcut.to_string()),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                            this.dispatch_menu_action(menu, idx, window, cx);
-                            this.close_menus(cx);
-                        }),
-                    )
-                    .on_hover({
-                        let weak = weak.clone();
-                        move |hovered: &bool, _w, cx| {
-                            let _ = weak.update(cx, |this, cx| {
-                                if *hovered {
-                                    this.menu_hover = Some((menu, idx));
-                                } else if this.menu_hover == Some((menu, idx)) {
-                                    this.menu_hover = None;
-                                }
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .into_any_element(),
-            );
-        }
-
-        div()
-            .id("menu-overlay")
-            .absolute()
-            .inset_0()
-            // 空白处点击：让事件冒泡到根视图关闭菜单，同时挡住下层编辑器
-            .on_mouse_down(MouseButton::Left, |_ev, _w, _cx| {})
-            .child(
-                div()
-                    .absolute()
-                    .left(left)
-                    .top(MENU_BAR_H + px(2.))
-                    .w(MENU_PANEL_W)
-                    .bg(white())
-                    .border_1()
-                    .border_color(rgb(0xe5e7eb))
-                    .rounded_md()
-                    .shadow_lg()
-                    .py_1()
-                    .px_1()
-                    .flex()
-                    .flex_col()
-                    .children(panel_children),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn dispatch_menu_action(
-        &mut self,
-        menu: MenuId,
-        idx: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let defs = self.menu_definitions();
-        let Some(items) = defs
-            .iter()
-            .find(|(id, _, _)| *id == menu)
-            .map(|(_, _, i)| i)
-        else {
-            return;
-        };
-        if items.get(idx).is_none() {
-            return;
-        }
-        match menu {
-            MenuId::File => match idx {
-                0 => self.new_tab(window, cx),
-                1 => self.open_dialog(window, cx),
-                2 => self.save(window, cx),
-                3 => self.save_as(window, cx),
-                5 => cx.quit(),
-                _ => {}
-            },
-            MenuId::Edit => match idx {
-                0 => window.dispatch_action(Box::new(gpui_component::input::Undo), cx),
-                1 => window.dispatch_action(Box::new(gpui_component::input::Redo), cx),
-                3 => window.dispatch_action(Box::new(gpui_component::input::Cut), cx),
-                4 => window.dispatch_action(Box::new(gpui_component::input::Copy), cx),
-                5 => self.paste_normalized(window, cx),
-                7 => window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx),
-                _ => {}
-            },
-            MenuId::View => match idx {
-                0 => {
-                    if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                        tab.preview_on = !tab.preview_on;
-                        self.preview_scroll = gpui::ScrollHandle::new();
-                    }
-                    cx.notify();
-                }
-                2 => self.change_font_size(1.0, cx),
-                3 => self.change_font_size(-1.0, cx),
-                4 => {
-                    self.font_size = DEFAULT_FONT_SIZE;
-                    cx.notify();
-                }
-                _ => {}
-            },
-            MenuId::Help => {
-                self.status = SharedString::from(
-                    "GPUI 编辑器 v0.1.0 — 基于 Rust + GPUI 0.2.2 + gpui-component",
-                );
-                self.status_ok = true;
-                cx.notify();
-            }
-        }
+            .child(make("menu-btn-file", "文件", Self::file_items, weak.clone()))
+            .child(make("menu-btn-edit", "编辑", Self::edit_items, weak.clone()))
+            .child(make("menu-btn-view", "查看", Self::view_items, weak.clone()))
+            .child(make("menu-btn-help", "帮助", Self::help_items, weak))
     }
 }
