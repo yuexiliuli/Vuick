@@ -191,10 +191,10 @@ impl EditorApp {
         }
     }
 
-    pub(super) fn render_menu_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 菜单按钮组（文件/编辑/查看/帮助），并入自绘标题栏使用。
+    pub(super) fn render_menu_buttons(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let weak = cx.weak_entity();
-        let (text_primary, bar_bg, bar_border) =
-            (self.text_primary(), self.bar_bg(), self.bar_border());
+        let text_primary = self.text_primary();
         let make = |id: &'static str,
                     label: &'static str,
                     items: fn(PopupMenu, gpui::WeakEntity<Self>) -> PopupMenu,
@@ -215,15 +215,9 @@ impl EditorApp {
 
         div()
             .id("menu-bar")
-            .h(MENU_BAR_H)
-            .w_full()
-            .px_1()
             .flex()
             .items_center()
             .gap_1()
-            .bg(bar_bg)
-            .border_b_1()
-            .border_color(bar_border)
             .child(make("menu-btn-file", "文件", Self::file_items, weak.clone()))
             .child(make("menu-btn-edit", "编辑", Self::edit_items, weak.clone()))
             .child(make("menu-btn-view", "查看", Self::view_items, weak.clone()))

@@ -370,25 +370,17 @@ impl EditorApp {
         );
         cx.notify();
     }
-
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
-    /// 左侧为拖拽区（按下即移动窗口），右侧为最小化 / 关闭按钮。
+    /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，右侧为最小化/关闭。
     pub(super) fn render_title_bar(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (bar_bg, bar_border, text_primary, text_minor) = (
-            self.bar_bg(),
-            self.bar_border(),
-            self.text_primary(),
-            self.text_minor(),
-        );
+        let (bar_bg, bar_border, text_minor) =
+            (self.bar_bg(), self.bar_border(), self.text_minor());
 
-        let minimize = div(
-            
-
-        )
+        let minimize = div()
             .id("title-minimize")
             .w(px(30.))
             .h(px(24.))
@@ -422,22 +414,17 @@ impl EditorApp {
             .w_full()
             .flex()
             .items_center()
-            .gap_2()
+            .gap_1()
             .px_2()
             .bg(bar_bg)
             .border_b_1()
             .border_color(bar_border)
+            .child(self.render_menu_buttons(cx))
             .child(
                 div()
                     .id("title-drag")
                     .flex_1()
                     .h_full()
-                    .flex()
-                    .items_center()
-                    .text_size(px(13.))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(text_primary)
-                    .child("GPUI 编辑器")
                     .on_mouse_down(MouseButton::Left, |_, window, _cx| {
                         window.start_window_move();
                     }),
@@ -537,7 +524,6 @@ impl Render for EditorApp {
                 }),
             )
             .child(self.render_title_bar(window, cx))
-            .child(self.render_menu_bar(cx))
             .child(self.render_tab_bar(cx))
             .child(body)
             .child(self.render_status_bar(cx))
