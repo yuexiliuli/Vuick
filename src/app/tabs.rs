@@ -147,21 +147,24 @@ impl EditorApp {
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {
-                if let Some(file) = rfd::FileDialog::new()
+                let Some(file) = rfd::AsyncFileDialog::new()
                     .set_title("保存文件")
                     .set_file_name(&file_name)
                     .save_file()
-                {
-                    let saved = cx
-                        .update_window_entity(&entity, |this, _window, cx| {
-                            this.write_to_path(idx, &file, text.clone(), cx)
-                        })
-                        .unwrap_or(false);
-                    if saved {
-                        let _ = cx.update_window_entity(&entity, |this, window, cx| {
-                            this.remove_tab(idx, window, cx);
-                        });
-                    }
+                    .await
+                else {
+                    return;
+                };
+                let file = file.path().to_path_buf();
+                let saved = cx
+                    .update_window_entity(&entity, |this, _window, cx| {
+                        this.write_to_path(idx, &file, text.clone(), cx)
+                    })
+                    .unwrap_or(false);
+                if saved {
+                    let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                        this.remove_tab(idx, window, cx);
+                    });
                 }
             })
             .detach();

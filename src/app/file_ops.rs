@@ -57,10 +57,14 @@ impl EditorApp {
         let idx = self.active_tab;
         window
             .spawn(cx, async move |cx| {
-                let Some(path) = rfd::FileDialog::new().set_title("打开文件").pick_file() else {
+                let Some(file) = rfd::AsyncFileDialog::new()
+                    .set_title("打开文件")
+                    .pick_file()
+                    .await
+                else {
                     return;
                 };
-                let path = path.to_string_lossy().into_owned();
+                let path = file.path().to_string_lossy().into_owned();
                 let _ = cx.update_window_entity(&entity, |this, window, cx| {
                     this.open_file_in_tab(idx, &path, window, cx);
                 });
@@ -120,13 +124,15 @@ impl EditorApp {
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {
-                let Some(file) = rfd::FileDialog::new()
+                let Some(file) = rfd::AsyncFileDialog::new()
                     .set_title("保存文件")
                     .set_file_name(&file_name)
                     .save_file()
+                    .await
                 else {
                     return;
                 };
+                let file = file.path().to_path_buf();
                 let _ = cx.update_window_entity(&entity, |this, _window, cx| {
                     this.write_to_path(idx, &file, text, cx);
                 });
