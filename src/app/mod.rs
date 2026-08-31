@@ -356,6 +356,15 @@ impl EditorApp {
         }
     }
 
+    /// 深色模式下把编辑区与行号栏(gutter)背景统一为 0x111827
+    /// 消除默认深色主题下二者不慎一致的底色。浅色模式保持默认。
+    fn apply_dark_editor_colors(cx: &mut App) {
+        let theme = gpui_component::Theme::global_mut(cx);
+        let highlight = Arc::make_mut(&mut theme.highlight_theme);
+        highlight.style.editor_background = Some(rgb(0x111827).into());
+        highlight.style.editor_gutter_background = Some(rgb(0x111827).into());
+    }
+
     /// 切换黑白（深色/浅色）主题：驱动 gpui_component 组件主题与自绘色板。
     /// 自绘标题栏也走同一套色板，因此整窗（含标题栏）随之切换。
     fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -369,6 +378,9 @@ impl EditorApp {
             None,
             cx,
         );
+        if self.dark_mode {
+            Self::apply_dark_editor_colors(cx);
+        }
         cx.notify();
     }
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
