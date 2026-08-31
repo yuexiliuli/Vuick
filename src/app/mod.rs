@@ -336,13 +336,17 @@ impl Render for EditorApp {
                     }
                 },
             ))
-            .on_action(cx.listener(|this: &mut EditorApp, _: &Save, _w, cx| this.save(cx)))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {
+                this.save(window, cx)
+            }))
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &PasteNormalized, window, cx| {
                     this.paste_normalized(window, cx)
                 }),
             )
-            .on_action(cx.listener(|this: &mut EditorApp, _: &SaveAs, _w, cx| this.save_as(cx)))
+            .on_action(cx.listener(|this: &mut EditorApp, _: &SaveAs, window, cx| {
+                this.save_as(window, cx)
+            }))
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &NewFile, window, cx| {
                     this.new_tab(window, cx)

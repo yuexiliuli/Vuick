@@ -100,15 +100,69 @@ impl EditorApp {
             .spawn(cx, async move |cx| {
                 // oneshot 通道被取消视为"取消"
                 let idx_ans = answer.await.unwrap_or(2);
-                let _ = cx.update_window_entity(&entity, |this, window, cx| match idx_ans {
+                let should_close = match idx_ans {
                     0 => {
-                        if this.save_tab(idx, cx) {
-                            this.remove_tab(idx, window, cx);
+                        let (saved, need_dialog) = cx
+                            .update_window_entity(&entity, |this, _window, cx| match this
+                                .tabs
+                                .get(idx)
+                                .and_then(|t| t.file_path.clone())
+                            {
+                                Some(p) => {
+                                    let text =
+                                        this.tabs[idx].editor.read(cx).value().to_string();
+                                    (Some(this.write_to_path(idx, &p, text, cx)), false)
+                                }
+                                None => (None, true),
+                            })
+                            .unwrap_or((None, false));
+                        if need_dialog {
+                            let _ =
+                                cx.update_window_entity(&entity, |this, window, cx| {
+                                    this.save_unnamed_and_close(idx, window, cx);
+                                });
+                            false
+                        } else {
+                            saved.unwrap_or(false)
                         }
                     }
-                    1 => this.remove_tab(idx, window, cx),
-                    _ => {}
-                });
+                    1 => true,
+                    _ => false,
+                };
+                if should_close {
+                    let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                        this.remove_tab(idx, window, cx);
+                    });
+                }
+            })
+            .detach();
+    }
+
+    fn save_unnamed_and_close(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(idx) else {
+            return;
+        };
+        let file_name = self.tab_file_name(idx);
+        let text = tab.editor.read(cx).value().to_string();
+        let entity = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                if let Some(file) = rfd::FileDialog::new()
+                    .set_title("保存文件")
+                    .set_file_name(&file_name)
+                    .save_file()
+                {
+                    let saved = cx
+                        .update_window_entity(&entity, |this, _window, cx| {
+                            this.write_to_path(idx, &file, text.clone(), cx)
+                        })
+                        .unwrap_or(false);
+                    if saved {
+                        let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                            this.remove_tab(idx, window, cx);
+                        });
+                    }
+                }
             })
             .detach();
     }

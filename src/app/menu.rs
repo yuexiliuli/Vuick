@@ -232,8 +232,8 @@ impl EditorApp {
             MenuId::File => match idx {
                 0 => self.new_tab(window, cx),
                 1 => self.open_dialog(window, cx),
-                2 => self.save(cx),
-                3 => self.save_as(cx),
+                2 => self.save(window, cx),
+                3 => self.save_as(window, cx),
                 5 => cx.quit(),
                 _ => {}
             },
