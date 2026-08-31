@@ -34,6 +34,7 @@ use gpui::{
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
 use gpui_component::input::{Editor, EditorState, InputEvent, TabSize};
+use gpui_component::{Icon, IconName};
 
 use crate::actions::*;
 use crate::scrollbar::TableScrollState;
@@ -371,14 +372,28 @@ impl EditorApp {
         cx.notify();
     }
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
-    /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，右侧为最小化/关闭。
+    /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，
+    /// 右侧为最小化 / 最大化 / 关闭按钮。
+    ///
+    /// 拖拽与窗口控制全部交给平台原生处理：各元素标上
+    /// [`gpui::WindowControlArea`]，GPUI 在 WM_NCHITTEST 里返回对应
+    /// HTCAPTION / HTMINMAXBUTTON，由系统完成移动（贴边吸附）、
+    /// 最小化、最大化（含双击标题栏切换）与关闭。
     pub(super) fn render_title_bar(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (bar_bg, bar_border, text_minor) =
             (self.bar_bg(), self.bar_border(), self.text_minor());
+        let icon_style = |icon: IconName| {
+            Icon::new(icon).size(px(14.)).text_color(text_minor)
+        };
+        let maximize_icon = if window.is_maximized() {
+            IconName::WindowRestore
+        } else {
+            IconName::WindowMaximize
+        };
 
         let minimize = div()
             .id("title-minimize")
@@ -388,11 +403,23 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .rounded_md()
-            .text_size(px(12.))
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
-            .child("─")
-            .on_click(move |_, window, _cx| window.minimize_window());
+            .child(icon_style(IconName::WindowMinimize))
+            .window_control_area(gpui::WindowControlArea::Min);
+
+        let maximize = div()
+            .id("title-maximize")
+            .w(px(30.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_color(text_minor)
+            .cursor(CursorStyle::PointingHand)
+            .child(icon_style(maximize_icon))
+            .window_control_area(gpui::WindowControlArea::Max);
 
         let close = div()
             .id("title-close")
@@ -402,11 +429,10 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .rounded_md()
-            .text_size(px(13.))
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
-            .child("✕")
-            .on_click(|_, _window, cx| cx.quit());
+            .child(icon_style(IconName::WindowClose))
+            .window_control_area(gpui::WindowControlArea::Close);
 
         div()
             .id("title-bar")
@@ -425,11 +451,13 @@ impl EditorApp {
                     .id("title-drag")
                     .flex_1()
                     .h_full()
-                    .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-                        window.start_window_move();
-                    }),
+                    .window_control_area(gpui::WindowControlArea::Drag),
             )
-            .children([minimize.into_any_element(), close.into_any_element()])
+            .children([
+                minimize.into_any_element(),
+                maximize.into_any_element(),
+                close.into_any_element(),
+            ])
     }
 }
 
