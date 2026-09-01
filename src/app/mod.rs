@@ -65,8 +65,8 @@ struct EditorTab {
     cursor_row: usize,
     /// 光标列（0 基）
     cursor_col: usize,
-    /// gpui-component 的 Markdown 解析、排版和选择状态。
-    md_view: gpui::Entity<gpui_component::text::TextViewState>,
+    /// 自研 Markdown 渲染器状态（行级虚拟化）。
+    md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
@@ -78,8 +78,6 @@ pub struct EditorApp {
     tabs: Vec<EditorTab>,
     /// 当前激活的选项卡下标
     active_tab: usize,
-    /// 预览区滚动句柄（切换选项卡时重置）
-    preview_scroll: gpui::ScrollHandle,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
     tab_bar_hscroll: TableScrollState,
     /// 顶部状态文字与是否"正常"
@@ -87,6 +85,8 @@ pub struct EditorApp {
     status_ok: bool,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
+    /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）
+    preview_pending: bool,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
     focus_handle: FocusHandle,
@@ -111,11 +111,11 @@ impl EditorApp {
         let mut app = EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
-            preview_scroll: gpui::ScrollHandle::new(),
             tab_bar_hscroll: TableScrollState::new(),
             status: SharedString::from("就绪"),
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
+            preview_pending: false,
             dark_mode: false,
             focus_handle,
         };
@@ -159,14 +159,29 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
+    /// 把指定选项卡的当前编辑内容同步到 Markdown 预览（开启预览时刷新一次）。
+    fn sync_md_preview(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let panel_bg = self.panel_bg();
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        let value = tab.editor.read(cx).value();
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(panel_bg);
+            view.set_source(value.as_ref(), cx);
+        });
+    }
+
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
-    /// 会先激活该选项卡，再翻转其 `preview_on`，并重置预览滚动状态。
+    /// 会先激活该选项卡，再翻转其 `preview_on`。
     fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
         if let Some(tab) = self.tabs.get_mut(idx) {
             tab.preview_on = !tab.preview_on;
         }
-        self.preview_scroll = gpui::ScrollHandle::new();
+        if self.tabs[idx].preview_on {
+            self.sync_md_preview(idx, cx);
+        }
         cx.notify();
     }
 
@@ -536,7 +551,9 @@ impl Render for EditorApp {
                 cx.listener(|this: &mut EditorApp, _: &TogglePreview, _w, cx| {
                     if let Some(tab) = this.tabs.get_mut(this.active_tab) {
                         tab.preview_on = !tab.preview_on;
-                        this.preview_scroll = gpui::ScrollHandle::new();
+                    }
+                    if this.tabs[this.active_tab].preview_on {
+                        this.sync_md_preview(this.active_tab, cx);
                     }
                     cx.notify();
                 }),

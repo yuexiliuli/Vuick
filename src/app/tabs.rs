@@ -1,6 +1,7 @@
 //! tabs.
 
 use super::*;
+use crate::app::file_ops::PREVIEW_DEBOUNCE_MS;
 use crate::scrollbar::horizontal_scrollbar;
 use gpui_component::button::ButtonVariants as _;
 
@@ -24,8 +25,31 @@ impl EditorApp {
                         let state = tab.editor.read(cx);
                         (state.value(), state.cursor_position())
                     };
-                    tab.md_view
-                        .update(cx, |view, cx| view.set_text(value.as_ref(), cx));
+                    // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖：
+                    // 打字时不逐键整篇重解析+重建虚拟化列表，停止后片刻再同步。
+                    if tab.preview_on && !this.preview_pending {
+                        this.preview_pending = true;
+                        cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.preview_pending = false;
+                                let panel_bg = this.panel_bg();
+                                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                                    if tab.preview_on {
+                                        let value = tab.editor.read(cx).value();
+                                        tab.md_preview.update(cx, |view, cx| {
+                                            view.set_background(panel_bg);
+                                            view.set_source(value.as_ref(), cx);
+                                        });
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
                     tab.content = value.clone();
                     tab.line_count = value.lines().count().max(1);
                     tab.char_count = value.chars().count();
@@ -48,13 +72,12 @@ impl EditorApp {
             char_count: 0,
             cursor_row: 0,
             cursor_col: 0,
-            md_view: cx.new(|cx| gpui_component::text::TextViewState::markdown("", cx)),
+            md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             preview_on: false,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
-        self.preview_scroll = gpui::ScrollHandle::new();
         idx
     }
 
@@ -72,7 +95,6 @@ impl EditorApp {
             return;
         }
         self.active_tab = idx;
-        self.preview_scroll = gpui::ScrollHandle::new();
         let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
         window.focus(&focus, cx);
         cx.notify();
@@ -178,7 +200,7 @@ impl EditorApp {
             tab.editor.update(cx, |ed, cx| {
                 ed.set_value("", window, cx);
             });
-            tab.md_view.update(cx, |view, cx| view.set_text("", cx));
+            tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
             tab.file_path = None;
             tab.dirty = false;
             tab.content = SharedString::default();
@@ -187,7 +209,6 @@ impl EditorApp {
             tab.cursor_row = 0;
             tab.cursor_col = 0;
             tab.preview_on = false;
-            self.preview_scroll = gpui::ScrollHandle::new();
             let focus = tab.editor.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
             self.status = SharedString::from("已关闭");

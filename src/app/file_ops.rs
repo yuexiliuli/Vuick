@@ -10,6 +10,12 @@ struct OpenFailureNotification;
 /// 打开失败提示自动消失时长（秒）。
 const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
 
+/// Markdown 预览重渲染的去抖时长（毫秒）。
+///
+/// 打字时不再逐键整篇重解析+重建虚拟化列表（大文件每键都可能触发整份
+/// set_text + 列表 reset 重测量），而是停止输入片刻后再同步一次。
+pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 200;
+
 impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。
     fn report_open_failure(
@@ -62,6 +68,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -72,7 +79,11 @@ impl EditorApp {
             ed.set_value(text.clone(), window, cx);
             ed.set_highlighter(lang, cx);
         });
-        tab.md_view.update(cx, |view, cx| view.set_text(&text, cx));
+        // 自研渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(panel_bg);
+            view.set_source(&text, cx);
+        });
         tab.file_path = Some(p.to_path_buf());
         tab.content = SharedString::from(text);
         tab.line_count = lines;
@@ -83,7 +94,6 @@ impl EditorApp {
         if Self::is_markdown_path(p) {
             tab.preview_on = true;
         }
-        self.preview_scroll = gpui::ScrollHandle::new();
         self.status = SharedString::from(format!("已打开：{}", p.display()));
         self.status_ok = true;
         cx.notify();

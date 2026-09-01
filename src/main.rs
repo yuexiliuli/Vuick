@@ -16,6 +16,7 @@
 
 mod actions;
 mod app;
+mod markdown;
 mod scrollbar;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};

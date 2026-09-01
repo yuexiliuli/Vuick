@@ -1,7 +1,6 @@
 //! panes.
 
 use super::*;
-use gpui_component::text::TextView;
 
 impl EditorApp {
     pub(super) fn render_editor_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -90,17 +89,10 @@ impl EditorApp {
                     .id("preview-pane")
                     .flex_1()
                     .min_w(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.preview_scroll)
                     .bg(self.panel_bg())
-                    .px_4()
-                    .py_3()
-                    .text_size(px(14.))
-                    .child(
-                        TextView::new(&tab.md_view)
-                            .selectable(true)
-                            .selection_format(gpui_component::text::SelectionFormat::Source),
-                    ),
+                    // 自研 Markdown 渲染器：行级虚拟化 + 自带置顶滚动条；
+                    // Entity 直接作为子元素渲染（内部 size_full）。
+                    .child(tab.md_preview.clone()),
             )
     }
 }

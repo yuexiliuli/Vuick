@@ -131,7 +131,9 @@ impl EditorApp {
             |this, _window, cx| {
                 if let Some(tab) = this.tabs.get_mut(this.active_tab) {
                     tab.preview_on = !tab.preview_on;
-                    this.preview_scroll = gpui::ScrollHandle::new();
+                }
+                if this.tabs[this.active_tab].preview_on {
+                    this.sync_md_preview(this.active_tab, cx);
                 }
                 cx.notify();
             },

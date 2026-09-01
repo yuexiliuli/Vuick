@@ -593,3 +593,89 @@
         assert_eq!(count2, 0, "6 秒后打开失败通知应已自动消失");
         let _ = std::fs::remove_file(&p);
     }
+
+    /// 大文档 Markdown 预览冒烟测试：上千行也应能渲染（走虚拟化列表），不 panic。
+    #[gpui::test]
+    async fn large_markdown_preview_renders(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-large-md.md");
+        let mut doc = String::new();
+        for i in 1..=800 {
+            doc.push_str(&format!("## 标题 {i}\n"));
+        }
+        std::fs::write(&p, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        let (preview_on, content_lines, tabs) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].preview_on,
+                a.tabs[a.active_tab].content.lines().count(),
+                a.tabs.len(),
+            )
+        });
+        assert!(preview_on, "md 文件打开应自动开启预览");
+        assert_eq!(content_lines, 800, "内容应完整载入 800 行");
+        assert_eq!(tabs, 2, "打开成功应新增一个标签页（初始 1 + 1）");
+        // 切换预览数次后再渲染多帧，确认虚拟化列表路径稳定
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.toggle_preview_for_tab(app.active_tab, window, cx));
+            });
+            for _ in 0..5 {
+                cx.run_until_parked();
+            }
+        }
+        let still_preview = cx.update(|_w, cx| app.read(cx).show_preview());
+        assert!(still_preview);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Markdown 预览同步带 200ms 去抖：编辑后不立即整篇重解析，
+    /// 停顿足够时间后才落盘到 md_view。
+    #[gpui::test]
+    async fn preview_sync_is_debounced(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-debounce.md");
+        std::fs::write(&p, "# 初始\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 聚焦编辑区并做一次真实编辑（粘贴触发 InputEvent::Change）
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("已编辑".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let pending = cx.update(|_w, cx| app.read(cx).preview_pending);
+        assert!(pending, "编辑后应立即进入去抖挂起状态（不逐键同步）");
+        // 推进 250ms，去抖计时到点后应执行一次同步并复位
+        cx.executor().advance_clock(std::time::Duration::from_millis(250));
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        let pending_after = cx.update(|_w, cx| app.read(cx).preview_pending);
+        assert!(!pending_after, "去抖时间到点后应复位挂起状态");
+        let _ = std::fs::remove_file(&p);
+    }
