@@ -510,3 +510,41 @@
             "选项卡过多时选项卡栏应可横向滚动：max_offset={max_w:?}"
         );
     }
+
+    /// 外部文件拖放（OS FileDrop）：拖动文件到窗口并松手应打开文件，
+    /// 多个文件逐个开选项卡，且激活最后拖入的文件。
+    #[gpui::test]
+    async fn external_file_drop_opens_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        let f1 = std::env::temp_dir().join("gpui-drop-a.txt");
+        let f2 = std::env::temp_dir().join("gpui-drop-b.txt");
+        std::fs::write(&f1, "AAA").unwrap();
+        std::fs::write(&f2, "BBB").unwrap();
+        let pos = gpui::Point::new(px(480.), px(700.));
+
+        // 模拟资源管理器拖放文件的完整事件序列
+        cx.simulate_event(gpui::FileDropEvent::Entered {
+            position: pos,
+            paths: gpui::ExternalPaths(vec![f1.clone(), f2.clone()].into_iter().collect()),
+        });
+        cx.simulate_event(gpui::FileDropEvent::Pending { position: pos });
+        cx.simulate_event(gpui::FileDropEvent::Submit { position: pos });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        let (tabs, active_content) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs.len(), a.tabs[a.active_tab].content.to_string())
+        });
+        assert_eq!(tabs, 3, "拖入 2 个文件后应比初始多 2 个选项卡，实际={tabs}");
+        assert_eq!(active_content, "BBB", "激活选项卡应载入最后拖入的文件内容");
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+    }

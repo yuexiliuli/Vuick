@@ -503,13 +503,11 @@ impl Render for EditorApp {
             .size_full()
             .bg(self.window_bg())
             .track_focus(&self.focus_handle(cx))
-            // 从资源管理器拖入文件到非编辑区 → 直接打开（编辑区由 Input 的父面板处理）
-            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
+            // 从资源管理器拖入文件到窗口任意处 → 打开每个文件（目录跳过）
+            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
             .on_drop(cx.listener(
-                |this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                    if let Some(p) = paths.paths().first() {
-                        this.open_file(&p.to_string_lossy(), window, cx);
-                    }
+                |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
+                    this.open_dropped_paths(paths, window, cx);
                 },
             ))
             .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {

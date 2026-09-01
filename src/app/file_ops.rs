@@ -59,6 +59,20 @@ impl EditorApp {
         }
     }
 
+    /// 外部拖入文件（整窗 / 编辑区 / 预览区共用）：逐个打开，目录跳过。
+    pub(super) fn open_dropped_paths(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for path in paths.paths() {
+            if path.is_file() {
+                self.open_file(&path.to_string_lossy(), window, cx);
+            }
+        }
+    }
+
     pub(super) fn open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let entity = cx.entity();
         window

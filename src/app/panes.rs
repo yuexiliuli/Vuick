@@ -20,12 +20,10 @@ impl EditorApp {
             .rounded_md()
             .overflow_hidden()
             // 从资源管理器拖入文件 → 打开（Input 本身不接收拖放）
-            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
+            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
             .on_drop(cx.listener(
-                |this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                    if let Some(p) = paths.paths().first() {
-                        this.open_file(&p.to_string_lossy(), window, cx);
-                    }
+                |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
+                    this.open_dropped_paths(paths, window, cx);
                 },
             ))
             // 字号直接作用于编辑器自身：`Editor` 渲染时会显式设置 text_size，
@@ -83,12 +81,10 @@ impl EditorApp {
             .flex_1()
             .min_w(px(0.))
             // 预览区也可接收文件拖放
-            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<Arc<ExternalPaths>>().is_some())
+            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
             .on_drop(cx.listener(
-                |this: &mut EditorApp, paths: &Arc<ExternalPaths>, window, cx| {
-                    if let Some(p) = paths.paths().first() {
-                        this.open_file(&p.to_string_lossy(), window, cx);
-                    }
+                |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
+                    this.open_dropped_paths(paths, window, cx);
                 },
             ))
             .child(
