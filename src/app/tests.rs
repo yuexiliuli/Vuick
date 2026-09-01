@@ -548,3 +548,40 @@
         let _ = std::fs::remove_file(&f1);
         let _ = std::fs::remove_file(&f2);
     }
+
+    /// 无法读取内容的文件（非 UTF-8）：状态置为失败，并推送一条可关闭的提示通知。
+    #[gpui::test]
+    async fn unreadable_file_shows_notification(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-unreadable-test.bin");
+        std::fs::write(&p, [0xFF, 0xFE, 0x00, 0xD8, 0x80, 0x00]).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let status_ok = cx.update(|_w, cx| app.read(cx).status_ok);
+        assert!(!status_ok, "打开非 UTF-8 文件应置状态为失败");
+        let count = cx.update(|window, cx| {
+            use gpui_component::WindowExt as _;
+            window.notifications(cx).len()
+        });
+        assert_eq!(count, 1, "打开失败应推送一条通知");
+        // 5 秒后应自动消失（推进模拟时钟 6 秒）
+        cx.executor().advance_clock(std::time::Duration::from_secs(6));
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        let count2 = cx.update(|window, cx| {
+            use gpui_component::WindowExt as _;
+            window.notifications(cx).len()
+        });
+        assert_eq!(count2, 0, "6 秒后打开失败通知应已自动消失");
+        let _ = std::fs::remove_file(&p);
+    }

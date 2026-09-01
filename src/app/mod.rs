@@ -565,5 +565,7 @@ impl Render for EditorApp {
             .child(self.render_tab_bar(cx))
             .child(body)
             .child(self.render_status_bar(cx))
+            // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
+            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }

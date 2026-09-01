@@ -1,6 +1,14 @@
 //! file_ops.
 
 use super::*;
+use gpui_component::notification::{Notification, NotificationType};
+use gpui_component::WindowExt as _;
+
+/// 打开失败通知的 id 类型（配合唯一 key，便于 5 秒后精确移除）。
+struct OpenFailureNotification;
+
+/// 打开失败提示自动消失时长（秒）。
+const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
 
 impl EditorApp {
     pub(super) fn open_file_in_tab(
@@ -43,6 +51,36 @@ impl EditorApp {
             Err(e) => {
                 self.status = SharedString::from(format!("打开失败：{e}"));
                 self.status_ok = false;
+                // 弹出可点击关闭的提示；5 秒后自动消失。
+                // 自托管计时移除（而非依赖通知层按窗口激活状态倒计时），保证必然消失。
+                let key = gpui::ElementId::from(SharedString::from(format!(
+                    "open-fail-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                )));
+                window.push_notification(
+                    Notification::new()
+                        .id1::<OpenFailureNotification>(key.clone())
+                        .title("打开失败")
+                        .message(format!("无法读取文件内容：{}\n{e}", p.display()))
+                        .with_type(NotificationType::Error)
+                        .autohide(false),
+                    cx,
+                );
+                let entity = cx.entity();
+                window
+                    .spawn(cx, async move |cx| {
+                        use gpui::VisualContext as _;
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(OPEN_FAILURE_AUTOHIDE_SECS))
+                            .await;
+                        let _ = cx.update_window_entity(&entity, |_, window, cx| {
+                            window.remove_notification1::<OpenFailureNotification>(key, cx)
+                        });
+                    })
+                    .detach();
                 cx.notify();
             }
         }
