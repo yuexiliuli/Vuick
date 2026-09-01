@@ -566,13 +566,21 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let status_ok = cx.update(|_w, cx| app.read(cx).status_ok);
+        let (status_ok, tabs_before) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.status_ok, a.tabs.len())
+        });
         assert!(!status_ok, "打开非 UTF-8 文件应置状态为失败");
         let count = cx.update(|window, cx| {
             use gpui_component::WindowExt as _;
             window.notifications(cx).len()
         });
         assert_eq!(count, 1, "打开失败应推送一条通知");
+        let tabs_after = cx.update(|_w, cx| app.read(cx).tabs.len());
+        assert_eq!(
+            tabs_after, tabs_before,
+            "打开失败不应新增空白标签页"
+        );
         // 5 秒后应自动消失（推进模拟时钟 6 秒）
         cx.executor().advance_clock(std::time::Duration::from_secs(6));
         for _ in 0..10 {
