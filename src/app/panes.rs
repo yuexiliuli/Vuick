@@ -15,9 +15,7 @@ impl EditorApp {
             .min_w(px(0.))
             .min_h(px(0.))
             .bg(self.panel_bg())
-            .border_1()
-            .border_color(self.bar_border())
-            .rounded_md()
+            // 无边框、无圆角：编辑区占满整块区域，不留白
             .overflow_hidden()
             // 从资源管理器拖入文件 → 打开（Input 本身不接收拖放）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())

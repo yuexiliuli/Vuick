@@ -482,8 +482,6 @@ impl Render for EditorApp {
                 .flex_1()
                 .min_h(px(0.))
                 .gap_2()
-                .px_2()
-                .py_2()
                 .child(self.render_editor_pane(cx))
                 .child(self.render_preview_pane(window, cx))
         } else {
@@ -491,8 +489,6 @@ impl Render for EditorApp {
                 .flex()
                 .flex_1()
                 .min_h(px(0.))
-                .px_2()
-                .py_2()
                 .child(self.render_editor_pane(cx))
         };
 
