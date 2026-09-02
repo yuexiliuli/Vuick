@@ -485,6 +485,53 @@
         let _ = std::fs::remove_file(&dir2);
     }
 
+    /// 选项 app 里打开超宽 .md 时，预览横向滚动容器应真实溢出
+    /// （md-list-wrap 宽度 > md-preview / md-harea 视口宽度）。
+    #[gpui::test]
+    async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(500.), px(500.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        let dir = std::env::temp_dir().join("gpui-editor-hscroll-test.md");
+        std::fs::write(&dir, "# 标题\n\n".to_string() + &"x".repeat(300) + "\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        let (preview, harea, wrap) = (
+            cx.debug_bounds("md-preview"),
+            cx.debug_bounds("md-harea"),
+            cx.debug_bounds("md-list-wrap"),
+        );
+        let preview = preview.expect("md-preview 应渲染");
+        let harea = harea.expect("md-harea 应渲染");
+        let wrap = wrap.expect("md-list-wrap 应渲染");
+        eprintln!(
+            "[hscroll] preview={preview:?} harea={harea:?} wrap={wrap:?}"
+        );
+        assert!(
+            preview.size.width > px(0.),
+            "预览视口应有宽度，实际={:?}",
+            preview.size.width
+        );
+        assert!(
+            wrap.size.width > preview.size.width,
+            "宽包装层应宽于预览视口（wrap={:?} > preview={:?}，harea={:?}），
+             否则横向不会溢出、滚动条也不出现",
+            wrap.size.width,
+            preview.size.width,
+            harea.size.width
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]
     async fn tab_bar_scrolls_when_tabs_overflow(cx: &mut TestAppContext) {

@@ -46,6 +46,10 @@ const FONT_MIN: f32 = 10.0;
 const FONT_MAX: f32 = 28.0;
 /// 菜单栏高度。
 const MENU_BAR_H: Pixels = px(26.);
+/// 分屏比例拖拽下限（编辑区最小占比）。
+const SPLIT_RATIO_MIN: f32 = 0.2;
+/// 分屏比例拖拽上限（编辑区最大占比）。
+const SPLIT_RATIO_MAX: f32 = 0.8;
 
 /// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
 struct EditorTab {
@@ -89,6 +93,12 @@ pub struct EditorApp {
     preview_pending: bool,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
+    /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
+    split_ratio: f32,
+    /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
+    split_drag: Option<(f32, f32)>,
+    /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
+    splitter_hovered: bool,
     focus_handle: FocusHandle,
 }
 
@@ -117,6 +127,9 @@ impl EditorApp {
             font_size: DEFAULT_FONT_SIZE,
             preview_pending: false,
             dark_mode: false,
+            split_ratio: 0.5,
+            split_drag: None,
+            splitter_hovered: false,
             focus_handle,
         };
         app.make_tab(window, cx);
@@ -491,20 +504,53 @@ impl EditorApp {
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.show_preview() {
+            let ratio = self.split_ratio;
             div()
+                .id("app-split-body")
+                .debug_selector(|| "app-split-body".into())
                 .flex()
                 .flex_row()
                 .flex_1()
                 .min_h(px(0.))
-                .gap_2()
-                .child(self.render_editor_pane(cx))
-                .child(self.render_preview_pane(window, cx))
+                // 分割线拖拽：鼠标移动/松开事件冒泡到容器统一处理
+                .on_mouse_move(cx.listener(
+                    |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, window, cx| {
+                        if let Some((start_x, start_ratio)) = this.split_drag {
+                            let total = window.bounds().size.width.as_f32();
+                            if total > 0. {
+                                let x = ev.position.x.as_f32();
+                                this.split_ratio = (start_ratio + (x - start_x) / total)
+                                    .clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX);
+                                cx.notify();
+                            }
+                        }
+                    },
+                ))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                        this.split_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                        this.split_drag = None;
+                        cx.notify();
+                    }),
+                )
+                .child(self.render_editor_pane(ratio, cx))
+                .child(self.render_splitter(cx))
+                .child(self.render_preview_pane(window, 1.0 - ratio, cx))
+                .into_any_element()
         } else {
             div()
                 .flex()
                 .flex_1()
                 .min_h(px(0.))
-                .child(self.render_editor_pane(cx))
+                .child(self.render_editor_pane(1.0, cx))
+                .into_any_element()
         };
 
         div()

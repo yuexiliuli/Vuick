@@ -3,14 +3,20 @@
 use super::*;
 
 impl EditorApp {
-    pub(super) fn render_editor_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_editor_pane(
+        &mut self,
+        grow: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let editor = self.tabs[self.active_tab].editor.clone();
         let font_size = px(self.font_size);
         div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
             .relative()
+            // grow = 编辑区占宽比例（无预览时为 1）
             .flex_1()
+            .flex_grow(grow)
             .min_w(px(0.))
             .min_h(px(0.))
             .bg(self.panel_bg())
@@ -66,16 +72,55 @@ impl EditorApp {
             )
     }
 
+    /// 编辑区 / 预览区之间的分割线（可拖拽调整分屏比例）。
+    pub(super) fn render_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = self.bar_border();
+        let line_color: gpui::Hsla = if self.splitter_hovered || self.split_drag.is_some() {
+            gpui::rgb(0x2563eb).into()
+        } else {
+            border
+        };
+        div()
+            .id("splitter")
+            .debug_selector(|| "splitter".into())
+            .w(px(6.))
+            .h_full()
+            .flex_none()
+            .cursor(CursorStyle::ResizeColumn)
+            .bg(gpui::transparent_black())
+            .flex()
+            .items_stretch()
+            .justify_center()
+            // 命中测试加宽（左右各 3px），视觉只有中间 2px 细线
+            .on_hover(cx.listener(
+                |this: &mut EditorApp, hovered: &bool, _window, cx| {
+                    this.splitter_hovered = *hovered;
+                    cx.notify();
+                },
+            ))
+            .on_mouse_down(MouseButton::Left, cx.listener(
+                |this: &mut EditorApp, ev: &gpui::MouseDownEvent, _window, cx| {
+                    this.split_drag = Some((ev.position.x.as_f32(), this.split_ratio));
+                    cx.notify();
+                },
+            ))
+            .child(div().h_full().w(px(2.)).flex_none().rounded(px(1.)).bg(line_color))
+    }
+
     pub(super) fn render_preview_pane(
         &mut self,
         _window: &mut Window,
+        grow: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tab = &self.tabs[self.active_tab];
         div()
             .flex()
             .flex_row()
-            .flex_1()
+            // grow = 预览区占宽比例
+            .flex_grow(grow)
+            .flex_shrink_1()
+            .flex_basis(px(0.))
             .min_w(px(0.))
             // 预览区也可接收文件拖放
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
