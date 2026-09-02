@@ -2,3 +2,4 @@ target/
 .kilo
 assets/
 kilo.json
+records/

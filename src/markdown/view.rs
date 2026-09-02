@@ -44,6 +44,8 @@ struct StyleParams {
     table_head_bg: Hsla,
     para_size: Pixels,
     para_line: Pixels,
+    /// 普通文本行额外垂直间距（行高之外，用于拉开行与行之间的距离）。
+    para_gap: Pixels,
     code_size: Pixels,
     code_line: Pixels,
     blank_h: Pixels,
@@ -77,9 +79,10 @@ impl StyleParams {
             table_head_bg,
             para_size: sm.size,
             para_line: sm.line_height,
+            para_gap: px(4.),
             code_size: mono.size,
             code_line: mono.line_height,
-            blank_h: px(8.),
+            blank_h: px(12.),
             rule_h: px(18.),
         }
     }
@@ -365,7 +368,7 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
                 .child(row.text.clone())
         }
         RowKind::Quote => div()
-            .h(p.para_line)
+            .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
             .w_full()
             .flex_shrink_0()
             .flex()
@@ -386,7 +389,7 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
                 text = format!("{prefix} {text}");
             }
             div()
-                .h(p.para_line)
+                .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
                 .flex_shrink_0()
                 .ml_3()
@@ -399,7 +402,7 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
                 .child(text)
         }
         RowKind::Paragraph => div()
-            .h(p.para_line)
+            .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
             .w_full()
             .flex_shrink_0()
             .flex()
@@ -683,5 +686,51 @@ mod tests {
             "表格宽度应计入横向滚动内容宽（content_w={content_w:.0}，表宽={:?}）",
             table.size.width
         );
+    }
+
+    /// 每个标题下的文本行（段落/列表/引述）都应获得相同的加高行距（不只是第一个标题下）。
+    /// 复现：多个标题各带若干段，逐个用 `bounds_for_item` 检查文本 item 高度。
+    #[gpui::test]
+    fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        // 两个标题各带文本：开头段落 → 标题一 → 段落 → 标题二 → 列表项 → 引述
+        let md_src = "# 标题一\n开头段落\n\n## 标题二\n第二个段落\n- 列表项\n> 引述\n";
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| md.set_source(md_src, cx));
+        });
+        cx.simulate_resize(size(px(400.), px(600.)));
+        settle(cx);
+
+        let p = cx.update(|_w, cx| StyleParams::from_theme(cx));
+        let rows = parse_to_rows(md_src);
+        let expected = p.para_line.as_f32() + p.para_gap.as_f32();
+
+        // 找出所有文本行（段落/列表/引述）在 rows 中的下标
+        let mut checked = 0usize;
+        for (ix, r) in rows.iter().enumerate() {
+            if !matches!(
+                r.kind,
+                RowKind::Paragraph | RowKind::Bullet | RowKind::Quote
+            ) {
+                continue;
+            }
+            let b = cx
+                .update(|_, cx| host.read(cx).md.read(cx).list_state.bounds_for_item(ix))
+                .expect("文本行 item 应有 bounds");
+            assert!(
+                (b.size.height.as_f32() - expected).abs() < 1.0,
+                "第 {ix} 行（{:?}）高度应为 {expected:.1}，实际={:?}",
+                r.kind,
+                b.size.height
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "应检查到 4 个文本行（2 段+1 列表+1 引述）");
     }
 }
