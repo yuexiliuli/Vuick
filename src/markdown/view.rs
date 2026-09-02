@@ -19,7 +19,7 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
-use crate::markdown::parser::{parse_to_rows, Row, RowKind};
+use crate::markdown::parser::{parse_to_rows, Row, RowKind, TableAlign, TableData};
 
 /// 行级虚拟化在视口上下各多构建的像素量（保证快速滚动时内容连续）。
 const ROW_OVERDRAW_PX: f32 = 600.0;
@@ -111,7 +111,32 @@ fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
             est_text_width(&row.text, p.para_size.as_f32()) + prefix_w + 12.0
         }
         RowKind::Paragraph => est_text_width(&row.text, p.para_size.as_f32()),
+        RowKind::Table => row
+            .table
+            .as_ref()
+            .map(|t| table_column_widths(t, p).iter().sum())
+            .unwrap_or(0.0),
     }
+}
+
+/// 表格每列估算宽度（px）：逐格 `est_text_width` + 左右各 10px 内距，
+/// 下限 48px，与 [`render_table`] 的实际布局一致（超宽表格撑出横向滚动范围）。
+fn table_column_widths(table: &TableData, p: &StyleParams) -> Vec<f32> {
+    let ncols = table.header.len().max(1);
+    let mut widths = vec![0.0f32; ncols];
+    let font = p.para_size.as_f32();
+    for (ci, cell) in table.header.iter().enumerate() {
+        widths[ci] = widths[ci].max(est_text_width(cell.as_ref(), font) + 20.0);
+    }
+    for row in &table.rows {
+        for (ci, cell) in row.iter().enumerate().take(ncols) {
+            widths[ci] = widths[ci].max(est_text_width(cell.as_ref(), font) + 20.0);
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).max(48.0);
+    }
+    widths
 }
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
@@ -257,6 +282,11 @@ impl Render for MarkdownPreview {
 
 /// 渲染单个行（固定高度、不换行、超出裁剪；超宽由外层横向滚动容器处理）。
 fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyElement {
+    // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配
+    if let RowKind::Table = row.kind {
+        let table = row.table.as_ref().expect("Table 行必须携带表格结构");
+        return render_table(table, p).into_any_element();
+    }
     let el: gpui::Div = match row.kind {
         RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0(),
         RowKind::Rule => div()
@@ -347,8 +377,100 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
             .text_size(p.para_size)
             .text_color(p.fg)
             .child(row.text.clone()),
+        RowKind::Table => unreachable!("表格已在上方提前返回"),
     };
     el.into_any_element()
+}
+
+/// 渲染一张 GFM 表格为带边框网格（参考 zorite 的 Grid 风格）：
+/// 外边 1px 圆角边框 + 表头底色/加粗 + 表头下分隔线 + 列竖线，
+/// 列宽按 [`table_column_widths`] 估算（内容自适应，超宽走外层横向滚动）。
+fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::Div> {
+    let border = p.divider;
+    let widths = table_column_widths(table, p);
+    let total: f32 = widths.iter().sum();
+    let row_h = px(p.para_size.as_f32() * 1.45 + 12.0);
+
+    let mut grid = div()
+        .id("md-table")
+        .debug_selector(|| "md-table".into())
+        .flex()
+        .flex_col()
+        .w(px(total))
+        .flex_shrink_0()
+        .border_1()
+        .border_color(border)
+        .rounded(px(6.))
+        .overflow_hidden();
+
+    grid = grid.child(render_table_row(
+        &table.header,
+        &widths,
+        &table.aligns,
+        true,
+        border,
+        row_h,
+        p,
+    ));
+    // 表头下分隔线
+    grid = grid.child(div().h(px(1.)).w_full().flex_shrink_0().bg(border));
+    for row in &table.rows {
+        let mut cells = row.clone();
+        cells.resize(table.header.len(), SharedString::from(""));
+        grid = grid.child(render_table_row(
+            &cells,
+            &widths,
+            &table.aligns,
+            false,
+            border,
+            row_h,
+            p,
+        ));
+    }
+    grid
+}
+
+/// 表格的一行：定宽单元格 + 列竖线；表头加粗/着色，按对齐方式排版。
+fn render_table_row(
+    cells: &[SharedString],
+    widths: &[f32],
+    aligns: &[TableAlign],
+    is_header: bool,
+    border: Hsla,
+    row_h: Pixels,
+    p: &StyleParams,
+) -> gpui::Div {
+    let ncols = cells.len();
+    let mut row_el = div().flex().flex_row().w_full().flex_shrink_0();
+    if is_header {
+        row_el = row_el.bg(p.muted_bg);
+    }
+    for (ci, cell) in cells.iter().enumerate() {
+        let mut cell_el = div()
+            .w(px(widths.get(ci).copied().unwrap_or(48.0)))
+            .h(row_h)
+            .flex_shrink_0()
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_size(p.para_size)
+            .text_color(p.fg);
+        if ci + 1 < ncols {
+            cell_el = cell_el.border_r_1().border_color(border);
+        }
+        match aligns.get(ci) {
+            Some(TableAlign::Center) => cell_el = cell_el.text_center(),
+            Some(TableAlign::Right) => cell_el = cell_el.text_right(),
+            _ => {}
+        }
+        if is_header {
+            cell_el = cell_el.font_weight(FontWeight::BOLD);
+        }
+        row_el = row_el.child(cell_el.child(cell.clone()));
+    }
+    row_el
 }
 
 #[cfg(test)]
@@ -493,5 +615,36 @@ mod tests {
             "短内容估算宽应小于视口，content_w={content_w:.0}"
         );
         assert_eq!(max_x, px(0.), "短内容不应产生横向滚动范围，实际={max_x:?}");
+    }
+
+    /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。
+    #[gpui::test]
+    fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        let md_src = "| 型号 | 尺寸 |\n|:---|---:|\n| A | 10 |\n| B | 20 |\n";
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| md.set_source(md_src, cx));
+        });
+        cx.simulate_resize(size(px(300.), px(400.)));
+        settle(cx);
+
+        let table = cx
+            .debug_bounds("md-table")
+            .expect("表格应渲染出 md-table 网格");
+        assert!(table.size.width > px(0.), "表格应有宽度，实际={table:?}");
+        assert!(table.size.height > px(0.), "表格应有高度（表头+数据行），实际={table:?}");
+
+        let content_w = cx.update(|_, cx| host.read(cx).md.read(cx).content_w);
+        assert!(
+            content_w + 40.0 >= table.size.width.as_f32(),
+            "表格宽度应计入横向滚动内容宽（content_w={content_w:.0}，表宽={:?}）",
+            table.size.width
+        );
     }
 }
