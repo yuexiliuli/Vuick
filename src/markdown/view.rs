@@ -13,9 +13,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, list, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement, ListAlignment,
-    ListState, ParentElement, Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Window,
+    div, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ListAlignment, ListState, ParentElement, Pixels, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
@@ -27,13 +27,21 @@ const ROW_OVERDRAW_PX: f32 = 600.0;
 const WIDTH_BUFFER_PX: f32 = 24.0;
 
 /// 排版参数：渲染时从全局主题取一份“快照”，避免每行重复查主题。
+/// 所有取值都对齐 gpui_component `node.rs` 的 Markdown 渲染风格：
+/// 段落用 `sm`，标题用语义字号 + 加粗，代码块用 `muted` 底 + 等宽字体，
+/// 引述用浅灰底 + 强调色左边框。
 struct StyleParams {
     mono: SharedString,
     fg: Hsla,
     muted_fg: Hsla,
     muted_bg: Hsla,
     divider: Hsla,
+    accent: Hsla,
     bg: Hsla,
+    /// 引述块背景（浅灰卡片感）。
+    quote_bg: Hsla,
+    /// 表头底色（浅灰）。
+    table_head_bg: Hsla,
     para_size: Pixels,
     para_line: Pixels,
     code_size: Pixels,
@@ -50,13 +58,23 @@ impl StyleParams {
         let typo = tokens.typography;
         let sm = typo.sm;
         let mono = typo.mono_md;
+        let is_dark = theme.is_dark();
+        // 引用旧 render.rs：引述 = 浅灰底 + 粗左边框；表头 = 浅灰底。暗色模式配深色变体。
+        let (quote_bg, table_head_bg) = if is_dark {
+            (rgb(0x1b2431).into(), rgb(0x1f2937).into())
+        } else {
+            (rgb(0xf9fafb).into(), rgb(0xf3f4f6).into())
+        };
         Self {
             mono: typo.mono.clone(),
             fg: colors.foreground,
             muted_fg: colors.muted_foreground,
             muted_bg: colors.muted,
             divider: colors.border,
+            accent: colors.accent,
             bg: colors.background,
+            quote_bg,
+            table_head_bg,
             para_size: sm.size,
             para_line: sm.line_height,
             code_size: mono.size,
@@ -64,6 +82,17 @@ impl StyleParams {
             blank_h: px(8.),
             rule_h: px(18.),
         }
+    }
+
+    /// 第 n 级标题的字号与行高（借鉴旧 render.rs：h1=20 h2=18 h3=16 其余 15）。
+    fn heading_metrics(&self, level: u8) -> (Pixels, Pixels) {
+        let fs = match level {
+            1 => px(20.),
+            2 => px(18.),
+            3 | 4 => px(16.),
+            _ => px(15.),
+        };
+        (fs, px(fs.as_f32() * 1.45))
     }
 }
 
@@ -94,14 +123,15 @@ fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
     match row.kind {
         RowKind::Blank | RowKind::Rule => 0.0,
         RowKind::Code => {
-            // 等宽字体按 0.65em/字符 + 左右 padding
-            row.text.chars().count() as f32 * p.code_size.as_f32() * 0.65 + 16.0
+            // 等宽字体按 0.65em/字符 + 左右 padding（pl_3 + pr_3 = 24px）
+            row.text.chars().count() as f32 * p.code_size.as_f32() * 0.65 + 24.0
         }
         RowKind::Heading(n) => {
-            let scale = 1.9f32 - 0.13f32 * (n as f32 - 1.0);
-            est_text_width(&row.text, p.para_size.as_f32() * scale)
+            let (fs, _) = p.heading_metrics(n);
+            est_text_width(&row.text, fs.as_f32())
         }
-        RowKind::Quote => est_text_width(&row.text, p.para_size.as_f32()) + 8.0,
+        // 引述：左边框 3px + pl_3 12px 缩进
+        RowKind::Quote => est_text_width(&row.text, p.para_size.as_f32()) + 16.0,
         RowKind::Bullet => {
             let prefix_w = row
                 .prefix
@@ -295,10 +325,10 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
             .flex_shrink_0()
             .flex()
             .items_center()
-            .px_2()
-            .child(div().h(px(2.)).w_full().bg(p.divider).rounded_full()),
+            .px_3()
+            .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
         RowKind::Code => {
-            // 代码行：整行背景带，文本带左右 padding
+            // 代码行：整行浅灰背景带（与栅栏内其它行连成一块），等宽字体
             let t = row.text.clone();
             div()
                 .h(p.code_line)
@@ -310,8 +340,8 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
                 .overflow_hidden()
                 .child(
                     div()
-                        .pl_2()
-                        .pr_2()
+                        .pl_3()
+                        .pr_3()
                         .whitespace_nowrap()
                         .font_family(p.mono.clone())
                         .text_size(p.code_size)
@@ -320,11 +350,9 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
                 )
         }
         RowKind::Heading(n) => {
-            let scale = 1.9f32 - 0.13f32 * (n as f32 - 1.0);
-            let fs = px(p.para_size.as_f32() * scale);
-            let h = px(p.para_line.as_f32() * scale);
+            let (fs, lh) = p.heading_metrics(n);
             div()
-                .h(h)
+                .h(lh)
                 .w_full()
                 .flex_shrink_0()
                 .flex()
@@ -340,9 +368,13 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
             .h(p.para_line)
             .w_full()
             .flex_shrink_0()
-            .ml_2()
             .flex()
             .items_center()
+            .pl_3()
+            .py_1()
+            .border_l_2()
+            .border_color(p.accent)
+            .bg(p.quote_bg)
             .overflow_hidden()
             .whitespace_nowrap()
             .text_size(p.para_size)
@@ -382,8 +414,8 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyEle
     el.into_any_element()
 }
 
-/// 渲染一张 GFM 表格为带边框网格（参考 zorite 的 Grid 风格）：
-/// 外边 1px 圆角边框 + 表头底色/加粗 + 表头下分隔线 + 列竖线，
+/// 渲染一张 GFM 表格为带边框网格（借鉴旧 render.rs 的表格视觉）：
+/// 外边 1px 圆角边框 + 表头浅灰底/加粗 + 表头下分隔线 + 列左竖线 + 数据行上横线，
 /// 列宽按 [`table_column_widths`] 估算（内容自适应，超宽走外层横向滚动）。
 fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::Div> {
     let border = p.divider;
@@ -414,10 +446,10 @@ fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::
     ));
     // 表头下分隔线
     grid = grid.child(div().h(px(1.)).w_full().flex_shrink_0().bg(border));
-    for row in &table.rows {
+    for (ri, row) in table.rows.iter().enumerate() {
         let mut cells = row.clone();
         cells.resize(table.header.len(), SharedString::from(""));
-        grid = grid.child(render_table_row(
+        let mut row_el = render_table_row(
             &cells,
             &widths,
             &table.aligns,
@@ -425,12 +457,17 @@ fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::
             border,
             row_h,
             p,
-        ));
+        );
+        // 数据行之间加一条上横线（旧 render.rs 用 border_t_1）
+        if ri > 0 {
+            row_el = row_el.border_t_1().border_color(border);
+        }
+        grid = grid.child(row_el);
     }
     grid
 }
 
-/// 表格的一行：定宽单元格 + 列竖线；表头加粗/着色，按对齐方式排版。
+/// 表格的一行：定宽单元格 + 列左竖线；表头加粗/着色，按对齐方式排版。
 fn render_table_row(
     cells: &[SharedString],
     widths: &[f32],
@@ -440,10 +477,9 @@ fn render_table_row(
     row_h: Pixels,
     p: &StyleParams,
 ) -> gpui::Div {
-    let ncols = cells.len();
     let mut row_el = div().flex().flex_row().w_full().flex_shrink_0();
     if is_header {
-        row_el = row_el.bg(p.muted_bg);
+        row_el = row_el.bg(p.table_head_bg);
     }
     for (ci, cell) in cells.iter().enumerate() {
         let mut cell_el = div()
@@ -457,8 +493,9 @@ fn render_table_row(
             .whitespace_nowrap()
             .text_size(p.para_size)
             .text_color(p.fg);
-        if ci + 1 < ncols {
-            cell_el = cell_el.border_r_1().border_color(border);
+        // 借鉴旧 render.rs：c>0 的列在左边加分割线（网格线齐平）
+        if ci > 0 {
+            cell_el = cell_el.border_l_1().border_color(border);
         }
         match aligns.get(ci) {
             Some(TableAlign::Center) => cell_el = cell_el.text_center(),
