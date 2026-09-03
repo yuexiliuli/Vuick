@@ -95,6 +95,8 @@ pub struct EditorApp {
     dark_mode: bool,
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
     split_ratio: f32,
+    /// 编辑器是否自动换行（默认换行；预览开启时强制换行）。
+    wrap_enabled: bool,
     /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
     split_drag: Option<(f32, f32)>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
@@ -128,6 +130,7 @@ impl EditorApp {
             preview_pending: false,
             dark_mode: false,
             split_ratio: 0.5,
+            wrap_enabled: true,
             split_drag: None,
             splitter_hovered: false,
             focus_handle,
@@ -189,11 +192,36 @@ impl EditorApp {
     /// 会先激活该选项卡，再翻转其 `preview_on`。
     fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
-        if let Some(tab) = self.tabs.get_mut(idx) {
+        let preview_on = {
+            let tab = &mut self.tabs[idx];
             tab.preview_on = !tab.preview_on;
-        }
-        if self.tabs[idx].preview_on {
+            tab.preview_on
+        };
+        // 开启预览 → 编辑区强制换行，方便在分屏里编辑 Markdown；
+        // 关闭预览 → 恢复用户偏好的换行设置。
+        let wrap = preview_on || self.wrap_enabled;
+        self.tabs[idx].editor.update(cx, |ed, cx| {
+            ed.set_soft_wrap(wrap, window, cx);
+        });
+        if preview_on {
             self.sync_md_preview(idx, cx);
+        }
+        cx.notify();
+    }
+
+    /// 切换当前选项卡的自动换行/不换行，并更新全局偏好。
+    fn toggle_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.wrap_enabled = !self.wrap_enabled;
+        let preview_on = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.preview_on)
+            .unwrap_or(false);
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let wrap = preview_on || self.wrap_enabled;
+            tab.editor.update(cx, |ed, cx| {
+                ed.set_soft_wrap(wrap, window, cx);
+            });
         }
         cx.notify();
     }
@@ -594,14 +622,9 @@ impl Render for EditorApp {
                 }),
             )
             .on_action(
-                cx.listener(|this: &mut EditorApp, _: &TogglePreview, _w, cx| {
-                    if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                        tab.preview_on = !tab.preview_on;
-                    }
-                    if this.tabs[this.active_tab].preview_on {
-                        this.sync_md_preview(this.active_tab, cx);
-                    }
-                    cx.notify();
+                cx.listener(|this: &mut EditorApp, _: &TogglePreview, window, cx| {
+                    let idx = this.active_tab;
+                    this.toggle_preview_for_tab(idx, window, cx);
                 }),
             )
             .on_action(
@@ -618,6 +641,11 @@ impl Render for EditorApp {
                 cx.listener(|this: &mut EditorApp, _: &ResetFontSize, _w, cx| {
                     this.font_size = DEFAULT_FONT_SIZE;
                     cx.notify();
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &ToggleWordWrap, window, cx| {
+                    this.toggle_wrap(window, cx);
                 }),
             )
             .child(self.render_title_bar(window, cx))

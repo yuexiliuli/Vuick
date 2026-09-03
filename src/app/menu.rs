@@ -128,14 +128,9 @@ impl EditorApp {
             "预览",
             "Ctrl+P",
             weak.clone(),
-            |this, _window, cx| {
-                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                    tab.preview_on = !tab.preview_on;
-                }
-                if this.tabs[this.active_tab].preview_on {
-                    this.sync_md_preview(this.active_tab, cx);
-                }
-                cx.notify();
+            |this, window, cx| {
+                let idx = this.active_tab;
+                this.toggle_preview_for_tab(idx, window, cx);
             },
         ))
         .separator()
@@ -161,6 +156,8 @@ impl EditorApp {
             },
         ))
         .separator()
+        .item(Self::wrap_menu_item(weak.clone()))
+        .separator()
         .item(Self::menu_action_item(
             "黑白切换",
             "",
@@ -183,6 +180,28 @@ impl EditorApp {
                 cx.notify();
             },
         ))
+    }
+
+    /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
+    fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| e.read(cx).wrap_enabled)
+                .unwrap_or(true);
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(if on { "☑ 自动换行" } else { "☐ 自动换行" })
+                .child(div().text_color(rgb(0x9ca3af)).child("Ctrl+Alt+W"))
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_wrap(window, cx));
+        })
     }
 
     /// 把焦点还给当前激活选项卡的编辑区（编辑动作派发到 Input 上下文所需）。

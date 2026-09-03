@@ -13,7 +13,7 @@ impl EditorApp {
                     tab_size: 4,
                     hard_tabs: false,
                 })
-                .soft_wrap(false)
+                .soft_wrap(self.wrap_enabled)
         });
 
         // 编辑内容被修改 → 置脏 + 同步内容/行列缓存

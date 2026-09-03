@@ -39,6 +39,7 @@ fn main() {
                 KeyBinding::new("shift-ctrl-s", SaveAs, None),
                 KeyBinding::new("ctrl-w", CloseTab, None),
                 KeyBinding::new("ctrl-p", TogglePreview, None),
+                KeyBinding::new("ctrl-alt-w", ToggleWordWrap, None),
                 KeyBinding::new("ctrl-=", IncreaseFontSize, None),
                 KeyBinding::new("ctrl--", DecreaseFontSize, None),
                 KeyBinding::new("ctrl-0", ResetFontSize, None),

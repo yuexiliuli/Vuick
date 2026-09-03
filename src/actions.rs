@@ -14,6 +14,7 @@ actions!(
         SaveAs,
         CloseTab,
         TogglePreview,
+        ToggleWordWrap,
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
