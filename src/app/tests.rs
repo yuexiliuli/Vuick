@@ -726,3 +726,38 @@
         assert!(!pending_after, "去抖时间到点后应复位挂起状态");
         let _ = std::fs::remove_file(&p);
     }
+    /// 打开 .epub：应解析正文（含书名/章节），自动进入预览模式并填充内容。
+    #[gpui::test]
+    async fn opens_epub_and_shows_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub");
+        assert!(epub.exists(), "测试 EPUB 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(epub.to_str().unwrap(), window, cx)
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (preview_on, content, tabs, status_ok) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].preview_on,
+                a.tabs[a.active_tab].content.to_string(),
+                a.tabs.len(),
+                a.status_ok,
+            )
+        });
+        assert!(status_ok, "打开 EPUB 应成功");
+        assert!(preview_on, "打开 EPUB 应自动进入预览");
+        assert_eq!(tabs, 2, "应新增一个标签页");
+        assert!(content.contains("共产党宣言"), "正文应包含书名");
+        assert!(content.len() > 1000, "正文应有实际内容（>1000 字符），实际={}", content.len());
+    }
+

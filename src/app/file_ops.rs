@@ -99,6 +99,52 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 把 EPUB 解析结果载入指定选项卡：纯展示（只读预览），编辑区置空。
+    fn load_epub(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        doc: crate::epub::EpubDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel_bg = self.panel_bg();
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        let text = doc.markdown;
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        // 编辑区置为提示文本（EPUB 只读，不参与文本编辑）
+        tab.editor.update(cx, |ed, cx| {
+            ed.set_value("", window, cx);
+            ed.set_highlighter("markdown", cx);
+        });
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(panel_bg);
+            view.set_source(&text, cx);
+        });
+        tab.file_path = Some(p.to_path_buf());
+        tab.content = SharedString::from(text);
+        tab.line_count = lines;
+        tab.char_count = chars;
+        tab.cursor_row = 0;
+        tab.cursor_col = 0;
+        tab.dirty = false;
+        tab.preview_on = true;
+        let author = if doc.author.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", doc.author)
+        };
+        self.status = SharedString::from(format!(
+            "已打开 EPUB：{}{} · {} 章",
+            doc.title, author, doc.chapter_count
+        ));
+        self.status_ok = true;
+        cx.notify();
+    }
+
     /// 把文件内容载入已存在的选项卡（读取失败仅提示，保留原选项卡）。
     pub(super) fn open_file_in_tab(
         &mut self,
@@ -108,6 +154,17 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         let p = PathBuf::from(path.trim());
+        if Self::is_epub_path(&p) {
+            match crate::epub::parse_epub_file(&p) {
+                Ok(doc) => self.load_epub(idx, &p, doc, window, cx),
+                Err(e) => {
+                    self.status = SharedString::from(format!("打开失败：{e}"));
+                    self.status_ok = false;
+                    cx.notify();
+                }
+            }
+            return;
+        }
         match fs::read_to_string(&p) {
             Ok(text) => {
                 let text = Self::normalize_newlines(&text);
@@ -119,10 +176,30 @@ impl EditorApp {
 
     /// 打开文件：新建一个文件选项卡并在其中载入文件内容，随后把焦点移到新选项卡的编辑区。
     ///
-    /// 先读取文件内容再创建选项卡：读取失败时只给出错误提示，
+    /// 先确认内容可读/可解析再创建选项卡：读取失败时只给出错误提示，
     /// 不再生成一个内容空白的标签页。
     pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let p = PathBuf::from(path.trim());
+        // EPUB：先生成解析结果，失败则仅提示、不建空标签页
+        if Self::is_epub_path(&p) {
+            match crate::epub::parse_epub_file(&p) {
+                Ok(doc) => {
+                    let idx = self.make_tab(window, cx);
+                    self.load_epub(idx, &p, doc, window, cx);
+                    if let Some(tab) = self.tabs.get(idx) {
+                        let focus = tab.editor.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                    }
+                }
+                Err(e) => {
+                    self.status = SharedString::from(format!("打开失败：{e}"));
+                    self.status_ok = false;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        // 文本：先读成功再建 tab
         let text = match fs::read_to_string(&p) {
             Ok(text) => Self::normalize_newlines(&text),
             Err(e) => {

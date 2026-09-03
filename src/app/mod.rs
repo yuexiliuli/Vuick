@@ -233,6 +233,14 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
+    /// 是否 EPUB 文件（按扩展名识别）。
+    fn is_epub_path(p: &Path) -> bool {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("epub"))
+            .unwrap_or(false)
+    }
+
     /// 按扩展名推断 gpui-component 语法高亮的语言名（未知扩展名回退 "text"）。
     fn language_id(p: &Path) -> &'static str {
         let ext = p

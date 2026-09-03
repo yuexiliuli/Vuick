@@ -16,6 +16,7 @@
 
 mod actions;
 mod app;
+mod epub;
 mod markdown;
 mod scrollbar;
 
