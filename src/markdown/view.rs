@@ -13,12 +13,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, list, rgb, rgba, px, App, BoxShadow, Context, CursorStyle, FontWeight, Hsla,
-    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ParentElement, Pixels,
-    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
-    Styled, Window,
+    div, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
+    ListAlignment, ListState, ParentElement, Pixels, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 
 use crate::markdown::parser::{parse_to_rows, Row, RowKind, TableAlign, TableData};
 
@@ -208,8 +209,6 @@ pub struct MarkdownPreview {
     font_override: Option<f32>,
     /// 目录：文档内标题行的 (行号, 级别, 文本)。
     toc: Vec<(usize, u8, String)>,
-    /// 目录卡片是否展开。
-    show_toc: bool,
 }
 
 impl MarkdownPreview {
@@ -224,7 +223,6 @@ impl MarkdownPreview {
             wrap: false,
             font_override: None,
             toc: Vec::new(),
-            show_toc: false,
         }
     }
 
@@ -278,18 +276,12 @@ impl MarkdownPreview {
         self.wrap
     }
 
-    /// 目录卡片展开/收起。
-    pub fn toggle_toc(&mut self) {
-        self.show_toc = !self.show_toc;
-    }
-
     /// 滚动到指定行（目录跳转）。
     pub fn scroll_to_row(&mut self, ix: usize) {
         if ix >= self.rows.len() {
             return;
         }
         self.list_state.scroll_to_reveal_item(ix);
-        self.show_toc = false;
     }
 
     /// 设置预览源码（仅影响预览，原文不变）。
@@ -326,9 +318,8 @@ impl Render for MarkdownPreview {
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
         let wrap = self.wrap;
-        // 目录：供目录卡片渲染
+        // 目录：供目录菜单渲染
         let toc = self.toc.clone();
-        let show_toc = self.show_toc;
 
         if cfg!(debug_assertions) {
             let h = &self.h_handle;
@@ -418,90 +409,101 @@ impl Render for MarkdownPreview {
                 .into_any_element()
         };
 
-        // 目录浮层：右上角悬浮按钮 → 展开目录卡片；点击目录项跳转到对应行。
-        let toc_button = div()
-            .id("md-toc-toggle")
-            .debug_selector(|| "md-toc-toggle".into())
-            .absolute()
-            .top(px(8.))
-            .right(px(8.))
-            .w(px(28.))
-            .h(px(28.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .border_1()
-            .border_color(p.divider)
-            .bg(p.bg)
-            .text_size(px(14.))
-            .text_color(p.muted_fg)
-            .cursor(CursorStyle::PointingHand)
-            .child("☰")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this: &mut MarkdownPreview, _ev, _w, cx| {
-                    this.toggle_toc();
-                    cx.notify();
-                }),
-            );
-
-        let mut toc_layer: Vec<gpui::AnyElement> = vec![toc_button.into_any_element()];
-        if show_toc {
-            let entries: Vec<gpui::AnyElement> = toc
-                .iter()
-                .enumerate()
-                .map(|(entry_ix, &(row_ix, level, ref text))| {
-                    let indent = if level > 1 { (level as f32 - 1.0) * 12.0 } else { 0.0 };
-                    let label = text.clone();
-                    div()
-                        .id(SharedString::from(format!("md-toc-item-{entry_ix}")))
-                        .w_full()
-                        .h(px(26.))
-                        .pl(px(indent))
-                        .pr_2()
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(px(13.))
-                        .text_color(p.fg)
-                        .child(label)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this: &mut MarkdownPreview, _ev, _w, cx| {
-                                this.scroll_to_row(row_ix);
-                                cx.notify();
+        // 目录：右上角悬浮按钮（gpui-component Button + DropdownMenu），
+        // 点击弹出下拉菜单列出标题；条目 hover 背景/圆角由组件主题自动处理（含从下往上移动）。
+        // 条目内部样式读取当前主题色，保证黑白切换后依旧清晰。
+        let weak = cx.weak_entity();
+        let toc_entries = toc.clone();
+        let toc_trigger = Button::new("md-toc-toggle")
+            .label("☰")
+            .ghost()
+            .w(px(30.))
+            .h(px(30.))
+            .rounded(px(6.))
+            .text_size(px(15.))
+            .text_color(p.fg)
+            .dropdown_menu(move |menu: PopupMenu, _window: &mut Window, cx: &mut Context<PopupMenu>| {
+                let mut m = menu;
+                // 读取当前主题语义色（作用于自定义目录条目内容）
+                let theme = gpui_component::Theme::global(cx);
+                let colors = theme.semantic_tokens().colors;
+                let color = colors.foreground;
+                let muted = colors.muted_foreground;
+                let accent = colors.accent;
+                if toc_entries.is_empty() {
+                    m = m.item(PopupMenuItem::element(move |_, _| {
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_1()
+                            .text_size(px(13.))
+                            .text_color(muted)
+                            .child("（空目录）")
+                    }));
+                } else {
+                    for &(row_ix, level, ref text) in &toc_entries {
+                        let label = text.clone();
+                        let weak = weak.clone();
+                        let color = color.clone();
+                        let muted = muted.clone();
+                        let accent = accent.clone();
+                        m = m.item(
+                            PopupMenuItem::element(move |_, _| {
+                                let indent = (level.saturating_sub(1) as f32) * 16.0;
+                                div()
+                                    .w_full()
+                                    .pl(px(indent))
+                                    .pr_2()
+                                    .py_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(5.))
+                                            .h(px(5.))
+                                            .rounded_full()
+                                            .bg(if level == 1 { accent } else { muted }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_size(if level == 1 { px(13.5) } else { px(13.) })
+                                            .text_color(color)
+                                            .font_weight(if level == 1 {
+                                                FontWeight::SEMIBOLD
+                                            } else {
+                                                FontWeight::NORMAL
+                                            })
+                                            .child(label.clone()),
+                                    )
+                            })
+                            .on_click(move |_, _window, cx| {
+                                // 点击后组件菜单自动 dismiss（PopupMenuItem::ElementItem）
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.scroll_to_row(row_ix);
+                                    cx.notify();
+                                });
                             }),
-                        )
-                        .into_any_element()
-                })
-                .collect();
-            toc_layer.push(
-                div()
-                    .id("md-toc-card")
-                    .debug_selector(|| "md-toc-card".into())
-                    .absolute()
-                    .top(px(38.))
-                    .right(px(8.))
-                    .w(px(240.))
-                    .max_h(px(320.))
-                    .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(p.divider)
-                    .bg(p.bg)
-                    .shadow(vec![
-                        BoxShadow::new(px(0.), px(3.), rgba(0x00000026).into())
-                            .blur_radius(px(8.))
-                    ])
-                    .children(entries)
-                    .into_any_element(),
-            );
-        }
+                        );
+                    }
+                }
+                m
+            });
+
+        let toc_layer = vec![
+            div()
+                .id("md-toc-toggle-wrap")
+                .debug_selector(|| "md-toc-toggle-wrap".into())
+                .absolute()
+                .top(px(8.))
+                .right(px(8.))
+                .child(toc_trigger)
+                .into_any_element(),
+        ];
 
         // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；相对定位承载目录浮层。
         div()
@@ -1093,23 +1095,25 @@ mod tests {
         assert_eq!(*lvl0, 1u8, "第一章是 h1");
         assert!(toc[0].2.contains("第一章"));
 
-        // 展开目录
-        cx.update(|_, cx| {
-            let md = host.read(cx).md.clone();
-            md.update(cx, |md, _cx| md.toggle_toc());
-        });
-        settle(cx);
-        let open = cx.update(|_, cx| host.read(cx).md.read(cx).show_toc);
-        assert!(open, "toggle_toc 后应展开");
+        // 目录组件渲染冒烟：右上角触发按钮应存在
+        let btn = cx.debug_bounds("md-toc-toggle-wrap");
+        assert!(btn.is_some(), "目录引导按钮应渲染（md-toc-toggle-wrap）");
 
-        // 跳转到一个中段标题（不应 panic），并自动收起
+        // 跳转到一个中段标题（不应 panic），并验证目标行被滚动到视口顶部附近
         let target = toc[1].0;
         cx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |md, _cx| md.scroll_to_row(target));
         });
         settle(cx);
-        let open2 = cx.update(|_, cx| host.read(cx).md.read(cx).show_toc);
-        assert!(!open2, "跳转后目录应收起");
+        let target_bounds = cx.update(|_, cx| {
+            host.read(cx).md.read(cx).list_state.bounds_for_item(target)
+        });
+        let tb = target_bounds.expect("跳转后目标行应有 bounds");
+        assert!(
+            tb.origin.y >= px(0.) && tb.origin.y < px(200.),
+            "跳转到中段标题后目标行应滚动到视口顶部附近（origin.y={:?}）",
+            tb.origin.y
+        );
     }
 }

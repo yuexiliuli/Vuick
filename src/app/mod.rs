@@ -490,6 +490,16 @@ impl EditorApp {
         if self.dark_mode {
             Self::apply_dark_editor_colors(cx);
         }
+        // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
+        // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
+        let panel_bg = self.panel_bg();
+        for tab in &self.tabs {
+            let md = tab.md_preview.clone();
+            md.update(cx, |view, cx| {
+                view.set_background(panel_bg);
+                cx.notify();
+            });
+        }
         cx.notify();
     }
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
