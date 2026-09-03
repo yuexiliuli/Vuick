@@ -74,6 +74,7 @@ impl EditorApp {
             cursor_col: 0,
             md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             preview_on: false,
+            preview_fullscreen: false,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;

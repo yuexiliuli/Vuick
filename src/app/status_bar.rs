@@ -3,7 +3,7 @@
 use super::*;
 
 impl EditorApp {
-    pub(super) fn render_status_bar(&mut self, _cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tabs.get(self.active_tab);
         let (ln, col) = tab
             .map(|t| (t.cursor_row + 1, t.cursor_col + 1))
@@ -58,12 +58,66 @@ impl EditorApp {
                     .child(language),
             );
 
-        // 右侧：统计信息
-        let right = div()
+        // 右侧：EPUB 阅读按钮（全屏/还原 + 换行开关）+ 统计信息
+        let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
+        let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
+        let wrap_on = tab
+            .map(|t| t.md_preview.read(cx).is_wrap())
+            .unwrap_or(false);
+        let mut right = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap_3()
+            .gap_2()
+            .flex_shrink_0();
+
+        // 全屏/还原按钮：仅在开启预览时显示
+        if preview_on {
+            let btn = div()
+                .id("status-fullscreen-btn")
+                .debug_selector(|| "status-fullscreen-btn".into())
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0xeef2ff))
+                .text_size(px(12.))
+                .text_color(rgb(0x4338ca))
+                .cursor(CursorStyle::PointingHand)
+                .child(if fullscreen { "还原" } else { "全屏" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(
+                        |this: &mut EditorApp, _ev, window, cx| {
+                            this.toggle_preview_fullscreen(window, cx);
+                        },
+                    ),
+                );
+            right = right.child(btn);
+        }
+
+        // 换行开关按钮：EPUB（或任意带预览的文档）切换自动换行
+        {
+            let btn = div()
+                .id("status-wrap-btn")
+                .debug_selector(|| "status-wrap-btn".into())
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0xeef2ff))
+                .text_size(px(12.))
+                .text_color(rgb(0x4338ca))
+                .cursor(CursorStyle::PointingHand)
+                .child(if wrap_on { "换行" } else { "不换行" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                        this.toggle_wrap(window, cx);
+                    }),
+                );
+            right = right.child(btn);
+        }
+
+        let right = right
             .child(
                 div()
                     .text_size(px(12.))

@@ -122,6 +122,8 @@ impl EditorApp {
         });
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
+            // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
+            view.set_wrap(true, cx);
             view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());
@@ -132,6 +134,7 @@ impl EditorApp {
         tab.cursor_col = 0;
         tab.dirty = false;
         tab.preview_on = true;
+        tab.preview_fullscreen = true;
         let author = if doc.author.is_empty() {
             String::new()
         } else {

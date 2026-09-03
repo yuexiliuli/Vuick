@@ -13,9 +13,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ListAlignment, ListState, ParentElement, Pixels, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    div, list, rgb, rgba, px, App, BoxShadow, Context, CursorStyle, FontWeight, Hsla,
+    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, ParentElement, Pixels,
+    Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
@@ -53,13 +54,32 @@ struct StyleParams {
 }
 
 impl StyleParams {
-    fn from_theme(cx: &mut App) -> Self {
+    /// 从主题构建排版参数；`font_override` 可覆盖正文/代码字号（EPUB 缩放字号用）。
+    fn from_theme_with_font(cx: &mut App, font_override: Option<f32>) -> Self {
         let theme = gpui_component::Theme::global(cx);
         let tokens = theme.semantic_tokens();
         let colors = tokens.colors;
         let typo = tokens.typography;
         let sm = typo.sm;
         let mono = typo.mono_md;
+        // 正文基准字号：默认用主题 sm；有覆盖时按其缩放等宽字体（等宽按 0.85 比例）
+        let (para, line, code, code_line) = match font_override {
+            Some(fs) => {
+                let fs = fs.max(9.0);
+                (
+                    px(fs),
+                    px(fs * 1.45),
+                    px(fs * 0.88),
+                    px(fs * 1.3),
+                )
+            }
+            None => (
+                sm.size,
+                sm.line_height,
+                mono.size,
+                mono.line_height,
+            ),
+        };
         let is_dark = theme.is_dark();
         // 引用旧 render.rs：引述 = 浅灰底 + 粗左边框；表头 = 浅灰底。暗色模式配深色变体。
         let (quote_bg, table_head_bg) = if is_dark {
@@ -77,11 +97,11 @@ impl StyleParams {
             bg: colors.background,
             quote_bg,
             table_head_bg,
-            para_size: sm.size,
-            para_line: sm.line_height,
+            para_size: para,
+            para_line: line,
             para_gap: px(4.),
-            code_size: mono.size,
-            code_line: mono.line_height,
+            code_size: code,
+            code_line: code_line,
             blank_h: px(12.),
             rule_h: px(18.),
         }
@@ -182,6 +202,14 @@ pub struct MarkdownPreview {
     content_w: f32,
     /// 横向滚动句柄（跟踪外层横向滚动容器，供 `horizontal_scrollbar` 使用）。
     h_handle: ScrollHandle,
+    /// 是否启用文本自动换行（true：段落/标题/引述/列表折行、无横向滚动；false：单行横向滚动）。
+    wrap: bool,
+    /// 正文字号覆盖（None = 用主题默认；EPUB 缩放字号时设置）。
+    font_override: Option<f32>,
+    /// 目录：文档内标题行的 (行号, 级别, 文本)。
+    toc: Vec<(usize, u8, String)>,
+    /// 目录卡片是否展开。
+    show_toc: bool,
 }
 
 impl MarkdownPreview {
@@ -193,6 +221,10 @@ impl MarkdownPreview {
             bg: None,
             content_w: 0.0,
             h_handle: ScrollHandle::new(),
+            wrap: false,
+            font_override: None,
+            toc: Vec::new(),
+            show_toc: false,
         }
     }
 
@@ -201,35 +233,102 @@ impl MarkdownPreview {
         self.bg = Some(bg);
     }
 
+    /// 设置正文字号覆盖（px）。None 使用主题默认；用于 EPUB 等阅读场景的缩放。
+    pub fn set_font_override(&mut self, size: Option<f32>, cx: &mut App) {
+        if self.font_override == size {
+            return;
+        }
+        self.font_override = size;
+        self.remeasure_dimensions(cx);
+        self.list_state.remeasure();
+    }
+
+    /// 在当前字号基础上增减（EPUB 滚动缩放）；返回新的字号覆盖。
+    pub fn bump_font_size(&mut self, delta: f32, cx: &mut App, current_default: f32) {
+        let base = self.font_override.unwrap_or(current_default);
+        self.set_font_override(Some((base + delta).clamp(9.0, 32.0)), cx);
+    }
+
+    /// 重建尺寸估算（换行/字号/内容变化后调用）。
+    fn remeasure_dimensions(&mut self, cx: &mut App) {
+        let p = StyleParams::from_theme_with_font(cx, self.font_override);
+        self.content_w = if self.wrap {
+            0.0
+        } else {
+            self.rows
+                .iter()
+                .map(|r| est_row_width(r, &p))
+                .fold(0.0, f32::max)
+                + WIDTH_BUFFER_PX
+        };
+    }
+
+    /// 设置是否文本自动换行（EPUB 阅读等场景）。切换后无需重解析，直接触发重渲染。
+    pub fn set_wrap(&mut self, wrap: bool, cx: &mut App) {
+        if self.wrap == wrap {
+            return;
+        }
+        self.wrap = wrap;
+        self.remeasure_dimensions(cx);
+        self.list_state.remeasure();
+    }
+
+    /// 当前是否文本自动换行。
+    pub fn is_wrap(&self) -> bool {
+        self.wrap
+    }
+
+    /// 目录卡片展开/收起。
+    pub fn toggle_toc(&mut self) {
+        self.show_toc = !self.show_toc;
+    }
+
+    /// 滚动到指定行（目录跳转）。
+    pub fn scroll_to_row(&mut self, ix: usize) {
+        if ix >= self.rows.len() {
+            return;
+        }
+        self.list_state.scroll_to_reveal_item(ix);
+        self.show_toc = false;
+    }
+
     /// 设置预览源码（仅影响预览，原文不变）。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
         let rows: Vec<Rc<Row>> = parse_to_rows(src).into_iter().map(Rc::new).collect();
-        // 估算最宽一行（决定横向滚动范围），加一点缓冲防截断
-        let p = StyleParams::from_theme(cx);
-        self.content_w = rows
+        // 提取目录：标题行（行号, 级别, 清理后的文本）
+        self.toc = rows
             .iter()
-            .map(|r| est_row_width(r, &p))
-            .fold(0.0, f32::max)
-            + WIDTH_BUFFER_PX;
-        if rows.len() != self.list_state.item_count() {
+            .enumerate()
+            .filter_map(|(ix, r)| match r.kind {
+                RowKind::Heading(level) => Some((ix, level, r.text.to_string())),
+                _ => None,
+            })
+            .collect();
+        self.rows = Rc::new(rows);
+        self.remeasure_dimensions(cx);
+        if self.rows.len() != self.list_state.item_count() {
             // 行数变化 → 重建并 measure_all，保证滚动条范围从一开始就正确
-            self.list_state = ListState::new(rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX))
-                .measure_all();
+            self.list_state =
+                ListState::new(self.rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX))
+                    .measure_all();
         } else {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置）
             self.list_state.remeasure();
         }
-        self.rows = Rc::new(rows);
     }
 }
 
 impl Render for MarkdownPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
-        let p = Rc::new(StyleParams::from_theme(cx));
+        let p = Rc::new(StyleParams::from_theme_with_font(cx, self.font_override));
         let bg = self.bg.unwrap_or(p.bg);
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
+        let wrap = self.wrap;
+        // 目录：供目录卡片渲染
+        let toc = self.toc.clone();
+        let show_toc = self.show_toc;
 
         if cfg!(debug_assertions) {
             let h = &self.h_handle;
@@ -244,7 +343,7 @@ impl Render for MarkdownPreview {
                 use std::io::Write;
                 let _ = writeln!(
                     f,
-                    "render: content_w={content_w:.0} max_off=({:.0},{:.0}) bounds={:?}",
+                    "render: wrap={wrap} content_w={content_w:.0} max_off=({:.0},{:.0}) bounds={:?}",
                     h.max_offset().x.as_f32(),
                     h.max_offset().y.as_f32(),
                     h.bounds(),
@@ -252,74 +351,271 @@ impl Render for MarkdownPreview {
             }
         }
 
-        let content = list(list_state.clone(), move |ix, _window, cx| {
-            render_row(&rows[ix], &p, cx)
-        })
+        let content = {
+            let p = p.clone();
+            list(list_state.clone(), move |ix, _window, cx| {
+                render_row(&rows[ix], &p, wrap, cx)
+            })
+        }
         .size_full();
 
-        // 宽包装层：宽度 = max(估算最宽内容, 视口宽)。用 `min_w_full`（100%）兜底视口，
-        // 不再靠 `view_w` 字段 + `on_prepaint` 逐帧校准（那种写法依赖绘制时序、会漂移）：
-        // 普通文档撑满视口、超宽文档产生真实横向溢出。这也是 gpui-component 的
-        // `Scrollable` 对横向滚动容器子节点的写法（`flex_none` + `min_w_full`）。
-        let inner = div()
-            .id("md-list-wrap")
-            .debug_selector(|| "md-list-wrap".into())
-            .w(px(content_w))
-            .min_w_full()
-            .h_full()
-            .child(content);
+        // 预览核心：换行模式（宽随视口）或非换行（横向滚动）。各分支产出任意元素。
+        let core: gpui::AnyElement = if wrap {
+            let inner = div()
+                .id("md-list-wrap")
+                .debug_selector(|| "md-list-wrap".into())
+                .w_full()
+                .h_full()
+                .child(content);
+            div()
+                .id("md-preview")
+                .debug_selector(|| "md-preview".into())
+                .size_full()
+                .relative()
+                .bg(bg)
+                .child(inner)
+                // 竖向滚动条（组件自绘，跟踪 ListState）
+                .vertical_scrollbar(&list_state)
+                .into_any_element()
+        } else {
+            // 非换行：宽包装层 = max(估算最宽内容, 视口宽)，超宽产生横向溢出
+            let inner = div()
+                .id("md-list-wrap")
+                .debug_selector(|| "md-list-wrap".into())
+                .w(px(content_w))
+                .min_w_full()
+                .h_full()
+                .child(content);
+            // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
+            let harea = div()
+                .id("md-harea")
+                .debug_selector(|| "md-harea".into())
+                .size_full()
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .track_scroll(&self.h_handle)
+                .child(inner);
+            div()
+                .id("md-preview")
+                .debug_selector(|| "md-preview".into())
+                .size_full()
+                .relative()
+                .bg(bg)
+                .child(harea)
+                .child(
+                    div()
+                        .id("md-hscrollbar-overlay")
+                        .debug_selector(|| "md-hscrollbar-overlay".into())
+                        .absolute()
+                        .inset_0()
+                        .child(
+                            Scrollbar::horizontal(&self.h_handle)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                )
+                .vertical_scrollbar(&list_state)
+                .into_any_element()
+        };
 
-        // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪，
-        // gpui_component 的横向滚动条读它取范围 / 偏移，并回写偏移拖拽。
-        // `restrict_scroll_to_axis` 阻止 GPUI 把竖向滚轮增量折到横向，
-        // 竖向滚轮只滚动 List，横向滚轮（含 Shift+滚轮）在此原生横滚。
-        let harea = div()
-            .id("md-harea")
-            .debug_selector(|| "md-harea".into())
-            .size_full()
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
-            .track_scroll(&self.h_handle)
-            .child(inner);
+        // 目录浮层：右上角悬浮按钮 → 展开目录卡片；点击目录项跳转到对应行。
+        let toc_button = div()
+            .id("md-toc-toggle")
+            .debug_selector(|| "md-toc-toggle".into())
+            .absolute()
+            .top(px(8.))
+            .right(px(8.))
+            .w(px(28.))
+            .h(px(28.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(p.divider)
+            .bg(p.bg)
+            .text_size(px(14.))
+            .text_color(p.muted_fg)
+            .cursor(CursorStyle::PointingHand)
+            .child("☰")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut MarkdownPreview, _ev, _w, cx| {
+                    this.toggle_toc();
+                    cx.notify();
+                }),
+            );
 
+        let mut toc_layer: Vec<gpui::AnyElement> = vec![toc_button.into_any_element()];
+        if show_toc {
+            let entries: Vec<gpui::AnyElement> = toc
+                .iter()
+                .enumerate()
+                .map(|(entry_ix, &(row_ix, level, ref text))| {
+                    let indent = if level > 1 { (level as f32 - 1.0) * 12.0 } else { 0.0 };
+                    let label = text.clone();
+                    div()
+                        .id(SharedString::from(format!("md-toc-item-{entry_ix}")))
+                        .w_full()
+                        .h(px(26.))
+                        .pl(px(indent))
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(13.))
+                        .text_color(p.fg)
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this: &mut MarkdownPreview, _ev, _w, cx| {
+                                this.scroll_to_row(row_ix);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            toc_layer.push(
+                div()
+                    .id("md-toc-card")
+                    .debug_selector(|| "md-toc-card".into())
+                    .absolute()
+                    .top(px(38.))
+                    .right(px(8.))
+                    .w(px(240.))
+                    .max_h(px(320.))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(p.divider)
+                    .bg(p.bg)
+                    .shadow(vec![
+                        BoxShadow::new(px(0.), px(3.), rgba(0x00000026).into())
+                            .blur_radius(px(8.))
+                    ])
+                    .children(entries)
+                    .into_any_element(),
+            );
+        }
+
+        // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；相对定位承载目录浮层。
         div()
-            .id("md-preview")
-            .debug_selector(|| "md-preview".into())
+            .id("md-preview-root")
+            .debug_selector(|| "md-preview-root".into())
             .size_full()
             .relative()
-            .bg(bg)
-            .child(harea)
-            // 横向滚动条（组件自绘，跟踪横向容器句柄）。
-            // 挂法与 gpui-component 的 `Scrollable`/`vertical_scrollbar` 保持一致：
-            // 先套一层 absolute+inset_0 的叠层，再放 `viewport_from_layout()` 的滚动条。
-            // 裸 `Scrollbar::horizontal` 直接作 `flex` 容器的绝对子元素时，布局尺寸可能
-            // 塌缩（当作 flex item、flex-basis 趋近 0），导致滚动条画不出来；叠层保证它
-            // 铺满预览区、拿到确定视口。默认 Scrolling 模式只在横向偏移变化时短暂出现，
-            // 竖向滚轮不会触发它，内容超宽时也看不见 → 显式 Always（无横向溢出仍自动隐藏）。
-            .child(
-                div()
-                    .id("md-hscrollbar-overlay")
-                    .debug_selector(|| "md-hscrollbar-overlay".into())
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        Scrollbar::horizontal(&self.h_handle)
-                            .mode(ScrollbarMode::Always)
-                            .viewport_from_layout(),
-                    ),
-            )
-            // 竖向滚动条（组件自绘，跟踪 ListState）
-            .vertical_scrollbar(&list_state)
+            .on_scroll_wheel(cx.listener(
+                |this: &mut MarkdownPreview, event: &ScrollWheelEvent, _w, cx| {
+                    if !event.modifiers.control {
+                        return;
+                    }
+                    let delta_y = match event.delta {
+                        ScrollDelta::Lines(lines) => lines.y,
+                        ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                    };
+                    let step = delta_y.clamp(-1.0, 1.0);
+                    if step != 0.0 {
+                        let default =
+                            StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
+                        this.bump_font_size(step * 1.5, cx, default);
+                        cx.notify();
+                    }
+                },
+            ))
+            .child(core)
+            .children(toc_layer)
     }
 }
 
 /// 渲染单个行（固定高度、不换行、超出裁剪；超宽由外层横向滚动容器处理）。
-fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, _cx: &mut App) -> gpui::AnyElement {
+///
+/// `wrap = true` 时为**自动换行模式**：文本行高度自适应、自然折行（用于 EPUB 阅读）；
+/// `wrap = false`（默认）为单行 + 横向滚动模式。
+fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> gpui::AnyElement {
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配
     if let RowKind::Table = row.kind {
         let table = row.table.as_ref().expect("Table 行必须携带表格结构");
         return render_table(table, p).into_any_element();
     }
+
+    // ---------- 自动换行模式：仅对文本行生效，代码/规则/空行保持原样 ----------
+    if wrap {
+        match row.kind {
+            RowKind::Paragraph => {
+                let t = row.text.clone();
+                return div()
+                    .w_full()
+                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .whitespace_normal()
+                    .text_size(p.para_size)
+                    .text_color(p.fg)
+                    .child(t)
+                    .into_any_element();
+            }
+            RowKind::Heading(n) => {
+                let (fs, lh) = p.heading_metrics(n);
+                let t = row.text.clone();
+                return div()
+                    .w_full()
+                    .min_h(lh)
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .whitespace_normal()
+                    .text_size(fs)
+                    .text_color(p.fg)
+                    .font_weight(FontWeight::BOLD)
+                    .child(t)
+                    .into_any_element();
+            }
+            RowKind::Quote => {
+                let t = row.text.clone();
+                return div()
+                    .w_full()
+                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+                    .flex_shrink_0()
+                    .pl_3()
+                    .pr_3()
+                    .py_1()
+                    .border_l_2()
+                    .border_color(p.accent)
+                    .bg(p.quote_bg)
+                    .whitespace_normal()
+                    .text_size(p.para_size)
+                    .text_color(p.muted_fg)
+                    .child(t)
+                    .into_any_element();
+            }
+            RowKind::Bullet => {
+                let mut text = row.text.to_string();
+                if let Some(prefix) = &row.prefix {
+                    text = format!("{prefix} {text}");
+                }
+                return div()
+                    .w_full()
+                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+                    .flex_shrink_0()
+                    .pl_5()
+                    .pr_3()
+                    .py_1()
+                    .whitespace_normal()
+                    .text_size(p.para_size)
+                    .text_color(p.fg)
+                    .child(text)
+                    .into_any_element();
+            }
+            _ => {}
+        }
+    }
+
     let el: gpui::Div = match row.kind {
         RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0(),
         RowKind::Rule => div()
@@ -707,7 +1003,7 @@ mod tests {
         cx.simulate_resize(size(px(400.), px(600.)));
         settle(cx);
 
-        let p = cx.update(|_w, cx| StyleParams::from_theme(cx));
+        let p = cx.update(|_w, cx| StyleParams::from_theme_with_font(cx, None));
         let rows = parse_to_rows(md_src);
         let expected = p.para_line.as_f32() + p.para_gap.as_f32();
 
@@ -732,5 +1028,88 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 4, "应检查到 4 个文本行（2 段+1 列表+1 引述）");
+    }
+
+    /// EPUB 阅读：Ctrl+滚轮缩放应更新正文字号覆盖（基数 = 主题默认）。
+    #[gpui::test]
+    fn font_zoom_updates_override(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        let md_src = "# 标题\n正文段落内容，用于字号缩放验证。\n";
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| md.set_source(md_src, cx));
+        });
+        cx.simulate_resize(size(px(400.), px(600.)));
+        settle(cx);
+
+        let default = cx.update(|_, cx| {
+            StyleParams::from_theme_with_font(cx, None).para_size.as_f32()
+        });
+        // 初始无覆盖
+        let none = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
+        assert!(none.is_none(), "初始应无字号覆盖");
+
+        // 模拟 Ctrl+滚轮向上（放大 1 档）
+        cx.update(|window, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| md.bump_font_size(1.5, cx, default));
+            window.refresh();
+        });
+        settle(cx);
+        let after = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
+        assert!(after.is_some(), "滚动后应产生字号覆盖");
+        assert!(
+            (after.unwrap() - (default + 1.5)).abs() < 0.001,
+            "字号应增大 1.5，实际={after:?}"
+        );
+    }
+
+    /// EPUB 目录：标题行应进入 toc；toggle_toc 可展开/收起；scroll_to_row 定位不 panic。
+    #[gpui::test]
+    fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        let md_src = "# 第一章\n开头\n\n## 第一节\n内容\n\n# 第二章\n结尾\n";
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| md.set_source(md_src, cx));
+        });
+        cx.simulate_resize(size(px(400.), px(600.)));
+        settle(cx);
+
+        let toc = cx.update(|_, cx| host.read(cx).md.read(cx).toc.clone());
+        assert_eq!(toc.len(), 3, "应有 3 个标题进入目录，实际={toc:?}");
+        let (row0, lvl0, _) = &toc[0];
+        assert_eq!(*row0, 0usize, "首个目录项应是第 0 行（# 第一章）");
+        assert_eq!(*lvl0, 1u8, "第一章是 h1");
+        assert!(toc[0].2.contains("第一章"));
+
+        // 展开目录
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, _cx| md.toggle_toc());
+        });
+        settle(cx);
+        let open = cx.update(|_, cx| host.read(cx).md.read(cx).show_toc);
+        assert!(open, "toggle_toc 后应展开");
+
+        // 跳转到一个中段标题（不应 panic），并自动收起
+        let target = toc[1].0;
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, _cx| md.scroll_to_row(target));
+        });
+        settle(cx);
+        let open2 = cx.update(|_, cx| host.read(cx).md.read(cx).show_toc);
+        assert!(!open2, "跳转后目录应收起");
     }
 }

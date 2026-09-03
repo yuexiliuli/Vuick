@@ -745,13 +745,15 @@
         for _ in 0..8 {
             cx.run_until_parked();
         }
-        let (preview_on, content, tabs, status_ok) = cx.update(|_w, cx| {
+        let (preview_on, content, tabs, status_ok, fullscreen, wrap) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
                 a.tabs[a.active_tab].preview_on,
                 a.tabs[a.active_tab].content.to_string(),
                 a.tabs.len(),
                 a.status_ok,
+                a.tabs[a.active_tab].preview_fullscreen,
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
             )
         });
         assert!(status_ok, "打开 EPUB 应成功");
@@ -759,5 +761,80 @@
         assert_eq!(tabs, 2, "应新增一个标签页");
         assert!(content.contains("共产党宣言"), "正文应包含书名");
         assert!(content.len() > 1000, "正文应有实际内容（>1000 字符），实际={}", content.len());
+        assert!(
+            fullscreen,
+            "打开 EPUB 应自动进入全屏占满阅读模式"
+        );
+        assert!(wrap, "打开 EPUB 应默认开启文本自动换行");
+    }
+
+    /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏，换行开关可切换自动换行。
+    #[gpui::test]
+    async fn toggles_epub_fullscreen_and_wrap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(epub.to_str().unwrap(), window, cx)
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        // 初始：全屏 + 换行
+        let (fs0, wrap0) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (t.preview_fullscreen, t.md_preview.read(cx).is_wrap())
+        });
+        assert!(fs0, "初始应是全屏");
+        assert!(wrap0, "初始应换行");
+
+        // 切换全屏 → 分屏
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_preview_fullscreen(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (fs1, wrap1) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            // 退出全屏：预览恢复全局偏好（默认 true）
+            (t.preview_fullscreen, t.md_preview.read(cx).is_wrap())
+        });
+        assert!(!fs1, "切换后应退出全屏");
+        assert!(wrap1, "退出全屏后预览应保持换行（全局默认换行）");
+
+        // 切换换行 → 不换行
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_wrap(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let wrap2 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+        });
+        assert!(!wrap2, "切换后应关闭换行");
+
+        // 再切回换行
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_wrap(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let wrap3 = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+        });
+        assert!(wrap3, "再切换后应恢复换行");
     }
 

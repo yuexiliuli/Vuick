@@ -73,6 +73,8 @@ struct EditorTab {
     md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
+    /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
+    preview_fullscreen: bool,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }
@@ -195,6 +197,10 @@ impl EditorApp {
         let preview_on = {
             let tab = &mut self.tabs[idx];
             tab.preview_on = !tab.preview_on;
+            // 关闭预览时同步退出全屏
+            if !tab.preview_on {
+                tab.preview_fullscreen = false;
+            }
             tab.preview_on
         };
         // 开启预览 → 编辑区强制换行，方便在分屏里编辑 Markdown；
@@ -209,19 +215,58 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 切换当前选项卡预览是否全屏占满（EPUB 阅读模式）。
+    fn toggle_preview_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let idx = self.active_tab;
+        let (fullscreen, preview, editor) = {
+            let Some(tab) = self.tabs.get_mut(idx) else {
+                return;
+            };
+            tab.preview_fullscreen = !tab.preview_fullscreen;
+            let fs = tab.preview_fullscreen;
+            (fs, tab.md_preview.clone(), tab.editor.clone())
+        };
+        // 进入全屏阅读模式 → 预览强制换行、编辑区强制换行；
+        // 退出全屏 → 预览恢复全局偏好。
+        let preview_wrap = if fullscreen { true } else { self.wrap_enabled };
+        preview.update(cx, |view, cx| view.set_wrap(preview_wrap, cx));
+        let editor_wrap = if fullscreen {
+            true
+        } else {
+            self.wrap_enabled
+        };
+        editor.update(cx, |ed, cx| {
+            ed.set_soft_wrap(editor_wrap, window, cx);
+        });
+        cx.notify();
+    }
+
     /// 切换当前选项卡的自动换行/不换行，并更新全局偏好。
     fn toggle_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.wrap_enabled = !self.wrap_enabled;
+        let idx = self.active_tab;
+        let wrap_enabled = !self.wrap_enabled;
+        self.wrap_enabled = wrap_enabled;
         let preview_on = self
             .tabs
-            .get(self.active_tab)
+            .get(idx)
             .map(|t| t.preview_on)
             .unwrap_or(false);
-        if let Some(tab) = self.tabs.get(self.active_tab) {
-            let wrap = preview_on || self.wrap_enabled;
-            tab.editor.update(cx, |ed, cx| {
-                ed.set_soft_wrap(wrap, window, cx);
-            });
+        // 全屏阅读模式强制换行，跳过（由全屏切换控制）；否则按全局偏好
+        if self
+            .tabs
+            .get(idx)
+            .map(|t| !t.preview_fullscreen)
+            .unwrap_or(true)
+        {
+            if let Some(tab) = self.tabs.get(idx) {
+                // 同步 Markdown 预览的换行设置
+                let preview = tab.md_preview.clone();
+                preview.update(cx, |view, cx| view.set_wrap(wrap_enabled, cx));
+                let wrap = preview_on || wrap_enabled;
+                tab.editor.update(cx, |ed, cx| {
+                    ed.set_soft_wrap(wrap, window, cx);
+                });
+            }
         }
         cx.notify();
     }
@@ -541,45 +586,66 @@ impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.show_preview() {
             let ratio = self.split_ratio;
-            div()
-                .id("app-split-body")
-                .debug_selector(|| "app-split-body".into())
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_h(px(0.))
-                // 分割线拖拽：鼠标移动/松开事件冒泡到容器统一处理
-                .on_mouse_move(cx.listener(
-                    |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, window, cx| {
-                        if let Some((start_x, start_ratio)) = this.split_drag {
-                            let total = window.bounds().size.width.as_f32();
-                            if total > 0. {
-                                let x = ev.position.x.as_f32();
-                                this.split_ratio = (start_ratio + (x - start_x) / total)
-                                    .clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX);
-                                cx.notify();
+            // EPUB 等全屏预览：预览区占满整个内容区，不显示编辑区与分割线。
+            let fullscreen = self
+                .tabs
+                .get(self.active_tab)
+                .map(|t| t.preview_fullscreen)
+                .unwrap_or(false);
+            if fullscreen {
+                div()
+                    .id("app-fullscreen-preview")
+                    .debug_selector(|| "app-fullscreen-preview".into())
+                    .flex()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .child(self.render_fullscreen_preview(window, cx))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("app-split-body")
+                    .debug_selector(|| "app-split-body".into())
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.))
+                    // 分割线拖拽：鼠标移动/松开事件冒泡到容器统一处理
+                    .on_mouse_move(cx.listener(
+                        |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, window, cx| {
+                            if let Some((start_x, start_ratio)) = this.split_drag {
+                                let total = window.bounds().size.width.as_f32();
+                                if total > 0. {
+                                    let x = ev.position.x.as_f32();
+                                    this.split_ratio = (start_ratio + (x - start_x) / total)
+                                        .clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX);
+                                    cx.notify();
+                                }
                             }
-                        }
-                    },
-                ))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
-                        this.split_drag = None;
-                        cx.notify();
-                    }),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
-                        this.split_drag = None;
-                        cx.notify();
-                    }),
-                )
-                .child(self.render_editor_pane(ratio, cx))
-                .child(self.render_splitter(cx))
-                .child(self.render_preview_pane(window, 1.0 - ratio, cx))
-                .into_any_element()
+                        },
+                    ))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(
+                            |this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                                this.split_drag = None;
+                                cx.notify();
+                            },
+                        ),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(
+                            |this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                                this.split_drag = None;
+                                cx.notify();
+                            },
+                        ),
+                    )
+                    .child(self.render_editor_pane(ratio, cx))
+                    .child(self.render_splitter(cx))
+                    .child(self.render_preview_pane(window, 1.0 - ratio, cx))
+                    .into_any_element()
+            }
         } else {
             div()
                 .flex()

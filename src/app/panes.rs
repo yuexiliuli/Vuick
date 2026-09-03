@@ -140,4 +140,19 @@ impl EditorApp {
                     .child(tab.md_preview.clone()),
             )
     }
+
+    /// 全屏预览（EPUB 阅读模式）：渲染占满整个内容区，不显示编辑区/分割线。
+    pub(super) fn render_fullscreen_preview(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tab = &self.tabs[self.active_tab];
+        div()
+            .id("fullscreen-preview")
+            .debug_selector(|| "fullscreen-preview".into())
+            .size_full()
+            .bg(self.panel_bg())
+            .child(tab.md_preview.clone())
+    }
 }
