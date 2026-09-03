@@ -75,6 +75,7 @@ impl EditorApp {
             md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             preview_on: false,
             preview_fullscreen: false,
+            readonly_preview: false,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;
@@ -210,6 +211,8 @@ impl EditorApp {
             tab.cursor_row = 0;
             tab.cursor_col = 0;
             tab.preview_on = false;
+            tab.preview_fullscreen = false;
+            tab.readonly_preview = false;
             let focus = tab.editor.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
             self.status = SharedString::from("已关闭");

@@ -135,6 +135,8 @@ impl EditorApp {
         tab.dirty = false;
         tab.preview_on = true;
         tab.preview_fullscreen = true;
+        // EPUB 正文只存在于预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
+        tab.readonly_preview = true;
         let author = if doc.author.is_empty() {
             String::new()
         } else {

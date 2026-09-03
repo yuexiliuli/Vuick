@@ -75,6 +75,8 @@ struct EditorTab {
     preview_on: bool,
     /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
     preview_fullscreen: bool,
+    /// 预览是否只读锁定（EPUB：正文只在预览区，编辑区为空，不能关闭/翻转预览）
+    readonly_preview: bool,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }
@@ -177,29 +179,43 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
-    /// 把指定选项卡的当前编辑内容同步到 Markdown 预览（开启预览时刷新一次）。
+    /// 把指定选项卡的当前内容同步到 Markdown 预览（开启预览时刷新一次）。
+    /// 源用 `tab.content`（编辑区内容的镜像，EPUB 打开时正文只存在于 content/预览，
+    /// 编辑区为空，不能用 editor.value() 否则会拿空串覆盖预览导致内容消失）。
     fn sync_md_preview(&mut self, idx: usize, cx: &mut Context<Self>) {
         let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
-        let value = tab.editor.read(cx).value();
+        let value = if !tab.content.is_empty() {
+            tab.content.clone().to_string()
+        } else {
+            tab.editor.read(cx).value().to_string()
+        };
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
-            view.set_source(value.as_ref(), cx);
+            view.set_source(&value, cx);
         });
     }
 
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
     /// 会先激活该选项卡，再翻转其 `preview_on`。
+    /// EPUB（`readonly_preview`）：正文只在预览区、编辑区为空，翻转预览无意义，
+    /// 点击仅重新同步内容（持久保持全屏预览，不会落入空白编辑区）。
     fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
+        let readonly = self.tabs.get(idx).map(|t| t.readonly_preview).unwrap_or(false);
         let preview_on = {
             let tab = &mut self.tabs[idx];
-            tab.preview_on = !tab.preview_on;
-            // 关闭预览时同步退出全屏
-            if !tab.preview_on {
-                tab.preview_fullscreen = false;
+            if readonly {
+                tab.preview_on = true;
+                tab.preview_fullscreen = true;
+            } else {
+                tab.preview_on = !tab.preview_on;
+                // 关闭预览时同步退出全屏
+                if !tab.preview_on {
+                    tab.preview_fullscreen = false;
+                }
             }
             tab.preview_on
         };

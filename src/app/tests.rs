@@ -766,6 +766,38 @@
             "打开 EPUB 应自动进入全屏占满阅读模式"
         );
         assert!(wrap, "打开 EPUB 应默认开启文本自动换行");
+
+        // 回归：EPUB 正文只在预览区、编辑区为空，点击预览/Ctrl+P（toggle_preview_for_tab）
+        // 不能翻转进空白编辑区或把预览源覆盖成空串导致内容消失。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_preview_for_tab(app.active_tab, window, cx);
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (still_on, still_fullscreen, still_content) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.preview_on,
+                t.preview_fullscreen,
+                t.content.contains("共产党宣言"),
+            )
+        });
+        assert!(
+            still_on,
+            "EPUB 预览锁定：toggle 后 preview_on 应保持 true"
+        );
+        assert!(
+            still_fullscreen,
+            "EPUB 预览锁定：toggle 后应保持全屏，不倒向空白编辑区"
+        );
+        assert!(
+            still_content,
+            "toggle 后正文（tab.content）应仍在，未被空编辑区覆盖"
+        );
     }
 
     /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏，换行开关可切换自动换行。
