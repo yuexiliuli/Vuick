@@ -30,14 +30,15 @@ const PAGE_GAP: f32 = 14.0;
 const PAGE_PAD_Y: f32 = 16.0;
 /// 页面左右内边距（px）。
 const PAGE_PAD_X: f32 = 20.0;
-/// 最小渲染倍率：更小则软化不放大。
-const MAX_RENDER_SCALE: f32 = 3.0;
+/// 栅格化倍率上限：超过则不再放大（控制每个页位图像素数与内存）。
+/// 840px 宽 × 1.5 ≈ 1260 device px，A4 竖版高 ≈1780px ≈ 4B×2.2M ≈ 9MB/页封顶。
+const MAX_RENDER_SCALE: f32 = 1.5;
 /// 可见页上下各多留存的已渲染页数（滚动时已就绪，不抖动）。
 const MARGIN: usize = 3;
-/// 最多同时保留的已渲染位图页数（内存上限）。超出后把**离当前视口最远**的页回收；
-/// 只要总量未超限，「往回翻」命中的都是已渲染位图，不会重新加载。
-/// 按 840px 宽 A4（≈4MB/页）估算，70 页 ≈ 280MB。
-const CACHE_MAX_PAGES: usize = 70;
+/// **内存**最多同时保留的已渲染位图页数（内存上限）。超出后把**离当前视口最远**的页回收
+/// 到磁盘缓存；翻回时从磁盘恢复（毫秒级），不重新栅格化。
+/// 只保留近视口的几页在 RAM，其余靠磁盘：几百页文档内存也稳定在几十 MB。
+const CACHE_MAX_PAGES: usize = 8;
 
 /// 页槽：某页的渲染状态。
 #[derive(Default, Clone)]
@@ -152,18 +153,14 @@ fn plan_page_work(
     (to_render, to_evict)
 }
 
-/// 磁盘二级页缓存：内存页位图预算淘汰后，把 BGRA 字节落盘为每页一个文件；
-/// 再次翻回时**直接读盘重建** `RenderImage`，无需重新栅格化（读本地磁盘 ≈ 毫秒级，
-/// 重栅格化 ≈ 秒级）。这样即便长文档，来回翻页也不再出现长时间“加载中”。
+/// 磁盘二级页缓存：内存页位图预算淘汰后，把页以 **PNG 压缩** 落盘为每页一个文件；
+/// 再次翻回时**直接读盘解码**重建 `RenderImage`（毫秒级），无需重新栅格化
+/// （重栅格化 ≈ 秒级）。PNG 编码让空白为主的 PDF 页压缩 10~50 倍，避免临时目录膨胀。
 #[derive(Clone, Debug)]
 pub struct PageCache {
     /// 缓存目录（每个 PDF 一个独立子目录；None 表示用户目录不可用，退化为纯内存）。
     dir: Option<PathBuf>,
 }
-
-/// 每页缓存文件头：magic(4) + width(4) + height(4) = 12 字节，随后为 BGRA 字节。
-const PAGE_CACHE_MAGIC: &[u8; 4] = b"PDPG";
-const PAGE_CACHE_HEADER: u64 = 12;
 
 impl PageCache {
     /// 以 `pdf_path` 的文件名在系统临时目录开一个分片缓存目录。
@@ -176,32 +173,25 @@ impl PageCache {
     }
 
     fn page_file(&self, idx: usize) -> Option<PathBuf> {
-        self.dir.as_ref().map(|d| d.join(format!("{idx:05}.bin")))
+        self.dir.as_ref().map(|d| d.join(format!("{idx:05}.png")))
     }
 
-    /// 保存某页 BGRA 字节（落盘失败静默忽略——缓存是尽力而为）。
-    pub fn save(&self, idx: usize, bytes: &[u8], w: u32, h: u32) {
+    /// 保存某页位图（BGRA 字节 → PNG 落盘；失败静默忽略——缓存是尽力而为）。
+    pub fn save(&self, idx: usize, bgra: &[u8], w: u32, h: u32) {
         let Some(path) = self.page_file(idx) else {
             return;
         };
-        let mut out = Vec::with_capacity(PAGE_CACHE_HEADER as usize + bytes.len());
-        out.extend_from_slice(PAGE_CACHE_MAGIC);
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes());
-        out.extend_from_slice(bytes);
-        let _ = std::fs::write(path, out);
+        let png = encode_bgra_png(bgra, w, h);
+        if let Some(png) = png {
+            let _ = std::fs::write(path, png);
+        }
     }
 
-    /// 从磁盘读取某页 BGRA 字节（校验头；损坏/缺失返回 None）。
+    /// 从磁盘读取某页位图（PNG → BGRA 字节；缺失/损坏返回 None）。
     pub fn load(&self, idx: usize) -> Option<(Vec<u8>, u32, u32)> {
         let path = self.page_file(idx)?;
         let data = std::fs::read(path).ok()?;
-        if data.len() < PAGE_CACHE_HEADER as usize || data[..4] != *PAGE_CACHE_MAGIC {
-            return None;
-        }
-        let w = u32::from_le_bytes(data[4..8].try_into().ok()?);
-        let h = u32::from_le_bytes(data[8..12].try_into().ok()?);
-        Some((data[PAGE_CACHE_HEADER as usize..].to_vec(), w, h))
+        decode_png_bgra(&data)
     }
 
     /// 清理本 PDF 的整个缓存目录（关闭标签页时调用）。
@@ -210,6 +200,38 @@ impl PageCache {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+}
+
+/// 把 BGRA 像素字节编码为 PNG（内部先换成 RGBA 再交给 PngEncoder）。
+fn encode_bgra_png(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // B,G,R,A -> R,G,B,A
+    }
+    let img = image::RgbaImage::from_raw(w, h, rgba)?;
+    let mut out = Vec::new();
+    let enc = image::codecs::png::PngEncoder::new(&mut out);
+    use image::ImageEncoder as _;
+    enc.write_image(
+        img.as_raw(),
+        w,
+        h,
+        image::ExtendedColorType::Rgba8,
+    )
+    .ok()?;
+    Some(out)
+}
+
+/// 从 PNG 字节解码回 BGRA 像素 + (宽, 高)。
+fn decode_png_bgra(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(data).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let mut bgra = Vec::with_capacity(rgba.len() * 4);
+    for px in rgba.as_raw().chunks_exact(4) {
+        bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // R,G,B,A -> B,G,R,A
+    }
+    Some((bgra, w, h))
 }
 
 /// 用文件名做缓存目录指纹（防路径含非法字符）。
