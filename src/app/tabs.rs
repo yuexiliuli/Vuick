@@ -74,6 +74,7 @@ impl EditorApp {
             cursor_row: 0,
             cursor_col: 0,
             md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
+            pdf_preview: None,
             preview_on: false,
             preview_fullscreen: false,
             readonly_preview: false,
@@ -204,6 +205,7 @@ impl EditorApp {
                 ed.set_value("", window, cx);
             });
             tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
+            tab.pdf_preview = None;
             tab.file_path = None;
             tab.dirty = false;
             tab.content = SharedString::default();

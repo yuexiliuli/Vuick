@@ -226,8 +226,8 @@ pub struct MarkdownPreview {
     toc: Vec<(usize, u8, String)>,
     /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
     base_dir: Option<std::path::PathBuf>,
-    /// EPUB 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
-    epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
+    memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
 }
 
 impl MarkdownPreview {
@@ -243,17 +243,17 @@ impl MarkdownPreview {
             font_override: None,
             toc: Vec::new(),
             base_dir: None,
-            epub_images: Default::default(),
+            memory_images: Default::default(),
         }
     }
 
-    /// 注册 EPUB 内存图片表（虚拟 src → 图片字节，不落盘）。
+    /// 注册内存图片表（虚拟 src → 图片字节，不落盘），EPUB 用 `epubimg://...`。
     /// 需在 set_source 之前调用；后续每次 set_source 都会按虚拟 src 重新挂载。
-    pub fn set_epub_images(
+    pub fn set_memory_images(
         &mut self,
         images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     ) {
-        self.epub_images = images;
+        self.memory_images = images;
     }
 
     /// 设置 markdown 文件目录（相对路径图片解析依据）。
@@ -412,8 +412,8 @@ impl MarkdownPreview {
                 continue;
             }
             if let Some(s) = r.src.take() {
-                // EPUB 内存图片：src 为虚拟地址，直接查注册表挂载字节（不落盘、不读文件）
-                if let Some(img) = self.epub_images.get(s.as_ref()) {
+                // 内存图片（EPUB/PDF 虚拟 src）：直接查注册表挂载字节（不落盘、不读文件）
+                if let Some(img) = self.memory_images.get(s.as_ref()) {
                     if let Some((w, h)) = Self::image_dimensions_bytes(&img.bytes) {
                         r.img_w = Some(w);
                         r.img_h = Some(h);
@@ -1542,7 +1542,7 @@ mod tests {
         );
     }
 
-    /// EPUB 内存图片端到端：set_epub_images 注册虚拟 src 后，
+    /// EPUB/PDF 内存图片端到端：set_memory_images 注册虚拟 src 后，
     /// set_source 应把字节挂到图片行（img_data）并解析出固有尺寸，渲染出图片盒。
     #[gpui::test]
     fn epub_in_memory_images_render(cx: &mut TestAppContext) {
@@ -1568,7 +1568,7 @@ mod tests {
         cx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |md, cx| {
-                md.set_epub_images(doc.images.clone());
+                md.set_memory_images(doc.images.clone());
                 md.set_source(&md_src, cx);
             });
         });

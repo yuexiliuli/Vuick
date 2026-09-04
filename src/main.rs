@@ -18,6 +18,7 @@ mod actions;
 mod app;
 mod epub;
 mod markdown;
+mod pdf;
 mod scrollbar;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};

@@ -800,6 +800,52 @@
         );
     }
 
+    /// 打开 .pdf：应把每页按原样栅格化成内存 PNG 并载入 PdfViewer，
+    /// 自动进入全屏只读预览（不解析为 Markdown）。
+    #[gpui::test]
+    async fn opens_pdf_and_shows_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/N107内外饰配置表NEW.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(pdf.to_str().unwrap(), window, cx)
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (page_count, tabs, status, status_ok, fullscreen, readonly, no_md_content) =
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                (
+                    t.pdf_preview
+                        .as_ref()
+                        .map(|pv| pv.read(cx).page_count())
+                        .unwrap_or(0),
+                    a.tabs.len(),
+                    a.status.to_string(),
+                    a.status_ok,
+                    t.preview_fullscreen,
+                    t.readonly_preview,
+                    t.content.is_empty(),
+                )
+            });
+        assert!(status_ok, "打开 PDF 应成功，状态={status:?}");
+        assert!(page_count >= 1, "PdfViewer 应载入至少 1 页，实际={page_count}");
+        assert_eq!(tabs, 2, "应新增一个标签页");
+        assert!(fullscreen, "打开 PDF 应自动进入全屏占满阅读模式");
+        assert!(readonly, "打开 PDF 应锁定只读预览");
+        assert!(no_md_content, "PDF 不应进入 Markdown 文本（content 应为空）");
+    }
+
     /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏，换行开关可切换自动换行。
     #[gpui::test]
     async fn toggles_epub_fullscreen_and_wrap(cx: &mut TestAppContext) {

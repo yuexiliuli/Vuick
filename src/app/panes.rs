@@ -3,6 +3,15 @@
 use super::*;
 
 impl EditorApp {
+    /// 当前选项卡的预览视图：PDF 选项卡用 `PdfViewer`（整页原样），
+    /// 其余用 `MarkdownPreview`。
+    fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
+        match &tab.pdf_preview {
+            Some(pdf) => pdf.clone().into_any_element(),
+            None => tab.md_preview.clone().into_any_element(),
+        }
+    }
+
     pub(super) fn render_editor_pane(
         &mut self,
         grow: f32,
@@ -113,7 +122,6 @@ impl EditorApp {
         grow: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let tab = &self.tabs[self.active_tab];
         div()
             .flex()
             .flex_row()
@@ -135,13 +143,13 @@ impl EditorApp {
                     .flex_1()
                     .min_w(px(0.))
                     .bg(self.panel_bg())
-                    // 自研 Markdown 渲染器：行级虚拟化 + 自带置顶滚动条；
+                    // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
                     // Entity 直接作为子元素渲染（内部 size_full）。
-                    .child(tab.md_preview.clone()),
+                    .child(Self::preview_element(&self.tabs[self.active_tab])),
             )
     }
 
-    /// 全屏预览（EPUB 阅读模式）：渲染占满整个内容区，不显示编辑区/分割线。
+    /// 全屏预览（EPUB / PDF 阅读模式）：渲染占满整个内容区，不显示编辑区/分割线。
     pub(super) fn render_fullscreen_preview(
         &mut self,
         _window: &mut Window,
@@ -153,6 +161,6 @@ impl EditorApp {
             .debug_selector(|| "fullscreen-preview".into())
             .size_full()
             .bg(self.panel_bg())
-            .child(tab.md_preview.clone())
+            .child(Self::preview_element(tab))
     }
 }

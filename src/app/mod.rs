@@ -71,6 +71,8 @@ struct EditorTab {
     cursor_col: usize,
     /// 自研 Markdown 渲染器状态（行级虚拟化）。
     md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
+    /// PDF 阅读器（打开 .pdf 时创建）：整页原样显示；None = 非 PDF 选项卡。
+    pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
     /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
@@ -303,6 +305,14 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
+    /// 是否 PDF 文件（按扩展名识别）。
+    fn is_pdf_path(p: &Path) -> bool {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .unwrap_or(false)
+    }
+
     /// 按扩展名推断 gpui-component 语法高亮的语言名（未知扩展名回退 "text"）。
     fn language_id(p: &Path) -> &'static str {
         let ext = p
@@ -357,6 +367,8 @@ impl EditorApp {
             .unwrap_or_default();
         match ext.as_str() {
             "md" | "markdown" => "Markdown",
+            "epub" => "EPUB",
+            "pdf" => "PDF",
             "rs" => "Rust",
             "toml" => "TOML",
             "json" => "JSON",
@@ -516,6 +528,14 @@ impl EditorApp {
                 view.set_background(panel_bg);
                 cx.notify();
             });
+            // PDF 阅读器同样刷新背景（主题色变化后保持与编辑区一致）
+            if let Some(pdf) = &tab.pdf_preview {
+                let pv = pdf.clone();
+                pv.update(cx, |view, cx| {
+                    view.set_background(panel_bg);
+                    cx.notify();
+                });
+            }
         }
         cx.notify();
     }

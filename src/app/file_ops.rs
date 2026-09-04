@@ -125,7 +125,7 @@ impl EditorApp {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
             // EPUB 图片保持内存，渲染时由预览查表直接解码（不写硬盘）
-            view.set_epub_images(doc.images.clone());
+            view.set_memory_images(doc.images.clone());
             // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
             view.set_wrap(true, cx);
             view.set_source(&text, cx);
@@ -154,6 +154,50 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 把 PDF 解析结果载入指定选项卡：整页原样显示（PdfViewer），编辑区置空。
+    fn load_pdf(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        doc: crate::pdf::PdfDocument,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel_bg = self.panel_bg();
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        let title = doc.title;
+        let page_count = doc.page_count;
+        // 编辑区置为提示文本（PDF 只读，不参与文本编辑）
+        tab.editor.update(cx, |ed, cx| {
+            ed.set_value("", window, cx);
+            ed.set_highlighter("markdown", cx);
+        });
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(panel_bg);
+            view.set_source("", cx);
+        });
+        // PdfViewer：直接持有按原样栅格化的页面位图，逐页显示（不解析为 Markdown）
+        let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(doc.pages, cx));
+        viewer.update(cx, |view, _| view.set_background(panel_bg));
+        tab.pdf_preview = Some(viewer);
+        tab.file_path = Some(p.to_path_buf());
+        tab.content = SharedString::default();
+        tab.line_count = page_count;
+        tab.char_count = 0;
+        tab.cursor_row = 0;
+        tab.cursor_col = 0;
+        tab.dirty = false;
+        tab.preview_on = true;
+        tab.preview_fullscreen = true;
+        // PDF 正文只存在于阅读器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
+        tab.readonly_preview = true;
+        self.status = SharedString::from(format!("已打开 PDF：{title} · {page_count} 页"));
+        self.status_ok = true;
+        cx.notify();
+    }
+
     /// 把文件内容载入已存在的选项卡（读取失败仅提示，保留原选项卡）。
     pub(super) fn open_file_in_tab(
         &mut self,
@@ -166,6 +210,17 @@ impl EditorApp {
         if Self::is_epub_path(&p) {
             match crate::epub::parse_epub_file(&p) {
                 Ok(doc) => self.load_epub(idx, &p, doc, window, cx),
+                Err(e) => {
+                    self.status = SharedString::from(format!("打开失败：{e}"));
+                    self.status_ok = false;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if Self::is_pdf_path(&p) {
+            match crate::pdf::parse_pdf_file(&p) {
+                Ok(doc) => self.load_pdf(idx, &p, doc, window, cx),
                 Err(e) => {
                     self.status = SharedString::from(format!("打开失败：{e}"));
                     self.status_ok = false;
@@ -189,12 +244,30 @@ impl EditorApp {
     /// 不再生成一个内容空白的标签页。
     pub(super) fn open_file(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let p = PathBuf::from(path.trim());
-        // EPUB：先生成解析结果，失败则仅提示、不建空标签页
+        // EPUB / PDF：先生成解析结果，失败则仅提示、不建空标签页
         if Self::is_epub_path(&p) {
             match crate::epub::parse_epub_file(&p) {
                 Ok(doc) => {
                     let idx = self.make_tab(window, cx);
                     self.load_epub(idx, &p, doc, window, cx);
+                    if let Some(tab) = self.tabs.get(idx) {
+                        let focus = tab.editor.read(cx).focus_handle(cx);
+                        window.focus(&focus, cx);
+                    }
+                }
+                Err(e) => {
+                    self.status = SharedString::from(format!("打开失败：{e}"));
+                    self.status_ok = false;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if Self::is_pdf_path(&p) {
+            match crate::pdf::parse_pdf_file(&p) {
+                Ok(doc) => {
+                    let idx = self.make_tab(window, cx);
+                    self.load_pdf(idx, &p, doc, window, cx);
                     if let Some(tab) = self.tabs.get(idx) {
                         let focus = tab.editor.read(cx).focus_handle(cx);
                         window.focus(&focus, cx);
