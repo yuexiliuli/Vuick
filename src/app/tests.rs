@@ -818,8 +818,17 @@
                 app.open_file(pdf.to_str().unwrap(), window, cx)
             });
         });
-        for _ in 0..8 {
+        // 打开异步化：PDFium 在后台执行器栅格化，泵驱动到 PdfViewer 载入完成
+        for _ in 0..200 {
             cx.run_until_parked();
+            let ready = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .pdf_preview
+                    .is_some()
+            });
+            if ready {
+                break;
+            }
         }
         let (page_count, tabs, status, status_ok, fullscreen, readonly, no_md_content) =
             cx.update(|_w, cx| {

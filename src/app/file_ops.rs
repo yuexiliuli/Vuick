@@ -163,7 +163,8 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let panel_bg = self.panel_bg();
+        // 阅读画布用灰色系（非白面板），让页面“纸面”卡片与画布形成分隔
+        let canvas_bg = self.window_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -175,12 +176,12 @@ impl EditorApp {
             ed.set_highlighter("markdown", cx);
         });
         tab.md_preview.update(cx, |view, cx| {
-            view.set_background(panel_bg);
+            view.set_background(canvas_bg);
             view.set_source("", cx);
         });
         // PdfViewer：直接持有按原样栅格化的页面位图，逐页显示（不解析为 Markdown）
         let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(doc.pages, cx));
-        viewer.update(cx, |view, _| view.set_background(panel_bg));
+        viewer.update(cx, |view, _| view.set_background(canvas_bg));
         tab.pdf_preview = Some(viewer);
         tab.file_path = Some(p.to_path_buf());
         tab.content = SharedString::default();
@@ -196,6 +197,41 @@ impl EditorApp {
         self.status = SharedString::from(format!("已打开 PDF：{title} · {page_count} 页"));
         self.status_ok = true;
         cx.notify();
+    }
+
+    /// 异步打开 PDF：主线程立即返回（窗口保持响应），在后台执行器上完成
+    /// PDFium 逐页栅格化，完成后回主线程载入阅读器；失败仅提示、保留选项卡。
+    fn open_pdf_async(
+        &mut self,
+        idx: usize,
+        p: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = SharedString::from(format!("正在解析 PDF：{}…", p.display()));
+        self.status_ok = true;
+        cx.notify();
+        let entity = cx.entity();
+        window
+            .spawn(cx, async move |cx| {
+                // pdfium 栅格化是 CPU 重活，放后台执行器跑，避免拖住 UI 主线程
+                let parse_path = p.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { crate::pdf::parse_pdf_file(&parse_path) })
+                    .await;
+                let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                    match result {
+                        Ok(doc) => this.load_pdf(idx, &p, doc, window, cx),
+                        Err(e) => {
+                            this.status = SharedString::from(format!("打开失败：{e}"));
+                            this.status_ok = false;
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
     }
 
     /// 把文件内容载入已存在的选项卡（读取失败仅提示，保留原选项卡）。
@@ -219,14 +255,7 @@ impl EditorApp {
             return;
         }
         if Self::is_pdf_path(&p) {
-            match crate::pdf::parse_pdf_file(&p) {
-                Ok(doc) => self.load_pdf(idx, &p, doc, window, cx),
-                Err(e) => {
-                    self.status = SharedString::from(format!("打开失败：{e}"));
-                    self.status_ok = false;
-                    cx.notify();
-                }
-            }
+            self.open_pdf_async(idx, p.clone(), window, cx);
             return;
         }
         match fs::read_to_string(&p) {
@@ -264,20 +293,12 @@ impl EditorApp {
             return;
         }
         if Self::is_pdf_path(&p) {
-            match crate::pdf::parse_pdf_file(&p) {
-                Ok(doc) => {
-                    let idx = self.make_tab(window, cx);
-                    self.load_pdf(idx, &p, doc, window, cx);
-                    if let Some(tab) = self.tabs.get(idx) {
-                        let focus = tab.editor.read(cx).focus_handle(cx);
-                        window.focus(&focus, cx);
-                    }
-                }
-                Err(e) => {
-                    self.status = SharedString::from(format!("打开失败：{e}"));
-                    self.status_ok = false;
-                    cx.notify();
-                }
+            // 先建标签页、立即返回：解析放到后台，避免拖窗卡顿
+            let idx = self.make_tab(window, cx);
+            self.open_pdf_async(idx, p.clone(), window, cx);
+            if let Some(tab) = self.tabs.get(idx) {
+                let focus = tab.editor.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
             }
             return;
         }

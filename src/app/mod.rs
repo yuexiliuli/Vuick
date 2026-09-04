@@ -522,17 +522,19 @@ impl EditorApp {
         // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
         // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
         let panel_bg = self.panel_bg();
+        // PDF 阅读器画布用灰色系（window_bg），与页面“纸面”卡片形成分隔
+        let canvas_bg = self.window_bg();
         for tab in &self.tabs {
             let md = tab.md_preview.clone();
             md.update(cx, |view, cx| {
                 view.set_background(panel_bg);
                 cx.notify();
             });
-            // PDF 阅读器同样刷新背景（主题色变化后保持与编辑区一致）
+            // PDF 阅读器同样刷新背景（主题色变化后与画布保持一致）
             if let Some(pdf) = &tab.pdf_preview {
                 let pv = pdf.clone();
                 pv.update(cx, |view, cx| {
-                    view.set_background(panel_bg);
+                    view.set_background(canvas_bg);
                     cx.notify();
                 });
             }
