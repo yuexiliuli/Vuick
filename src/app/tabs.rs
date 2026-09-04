@@ -205,7 +205,9 @@ impl EditorApp {
                 ed.set_value("", window, cx);
             });
             tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
-            tab.pdf_preview = None;
+            if let Some(pdf) = tab.pdf_preview.take() {
+                let _ = pdf.update(cx, |view, cx| view.release(window, cx));
+            }
             tab.file_path = None;
             tab.dirty = false;
             tab.content = SharedString::default();
@@ -222,6 +224,9 @@ impl EditorApp {
             self.status_ok = true;
             cx.notify();
             return;
+        }
+        if let Some(pdf) = self.tabs[idx].pdf_preview.take() {
+            let _ = pdf.update(cx, |view, cx| view.release(window, cx));
         }
         self.tabs.remove(idx);
         if idx < self.active_tab {

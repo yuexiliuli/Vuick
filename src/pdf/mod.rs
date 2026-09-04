@@ -1,82 +1,86 @@
 //! PDF 读取与展示模块。
 //!
-//! 用 `pdfium-render`（Google PDFium）把 PDF 逐页**栅格化**成内存位图（PNG），
-//! 由 [`PdfViewer`] 按**原样**逐页显示：页面即原图，不做任何文本抽取/布局改写，
-//! 全程不落盘。这样即使是表格/矢量绘图为主的 PDF（纯文本提取几乎为空）
-//! 也能完整、保真地呈现每一页内容。
+//! 基于纯 Rust 的 [`hayro`] 栅格化器（无原生 DLL，Windows/macOS/Linux 通用），
+//! 架构参照 gpui-pdf（zorite `crates/gpui-pdf`）：
+//! - 文件只**解析一次**（结构 + 页尺寸，很快），解析出的 [`Document`]（`Send + Sync`）
+//!   在后台任务间用 `Arc` 共享；
+//! - [`PdfViewer`] **页级虚拟化**：先按页尺寸铺设正确的页槽（滚动条即时正确），
+//!   只对**靠近视口的页**后台按需栅格化，滚远即释放位图与 GPU 纹理——长文档
+//!   内存受限、打开即显、窗口不卡。
 //!
 //! 模块结构：
-//! - [`parser`]（`parser.rs`）：PDFium 绑定、DLL 定位、逐页栅格化与 PNG 编码，产出 [`PdfDocument`]
-//! - [`view`]（`view.rs`）：[`PdfViewer`]——行级虚拟化、整页原样显示的阅读器
-//!
-//! 运行时需要一个 `pdfium.dll`：优先在可执行文件同目录查找，其次资源目录
-//! `resources/pdfium/pdfium.dll`。Windows 上 libloading 会按 EXE 所在目录搜索。
+//! - [`parser`]（`parser.rs`）：底层原语——解析、页尺寸、单页栅格化为
+//!   [`gpui::RenderImage`]
+//! - [`view`]（`view.rs`）：[`PdfViewer`]——自包含阅读器（加载/滚动/按需渲染/回收）
 
 mod parser;
 mod view;
 
-pub use parser::parse_pdf_file;
+pub use parser::{parse_bytes, render_page, page_dims};
 pub use view::PdfViewer;
 
-use std::sync::Arc;
+use hayro::hayro_syntax::Pdf;
 
-use gpui::Image;
-
-/// 解析后的 PDF 文档：元数据 + 栅格化分页位图（原样显示用）。
-#[derive(Debug, Clone, Default)]
-pub struct PdfDocument {
-    /// 文件名（不含扩展名，作为标题显示）
-    pub title: String,
-    /// 页数
-    pub page_count: usize,
-    /// 逐页栅格化位图（按阅读顺序）。
-    pub pages: Vec<PdfPage>,
-}
-
-/// 一页 PDF：栅格化后的内存 PNG 位图 + 位图像素尺寸。
-/// 仅承载“原样”页面图像，不包含任何文本改写。
-#[derive(Debug, Clone)]
-pub struct PdfPage {
-    /// 页面 PNG 位图（内存，不落盘）。
-    pub image: Arc<Image>,
-    /// 位图像素宽。
-    pub width: u32,
-    /// 位图像素高。
-    pub height: u32,
-}
+/// 已解析的 PDF 文档：结构 + 页尺寸 + 页缓存均在其内部（`Send + Sync`），
+/// 可跨后台任务 `Arc` 共享，多次按页渲染无需重解析。
+pub type Document = Pdf;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::ImageFormat;
 
-    fn test_pdf_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/N107内外饰配置表NEW.pdf")
+    fn test_pdf_paths() -> Vec<std::path::PathBuf> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        vec![
+            manifest.join("N107内外饰配置表NEW.pdf"),
+            manifest.join("17. 道路机动车辆产品准入审查要求1.0.pdf.pdf"),
+        ]
     }
 
     #[test]
-    fn renders_pdf_pages_unchanged() {
-        let doc = parse_pdf_file(&test_pdf_path()).expect("解析 PDF 应成功");
-        assert!(doc.page_count >= 1, "应有至少 1 页，实际={}", doc.page_count);
-        assert_eq!(
-            doc.pages.len(),
-            doc.page_count,
-            "页数应为每页一张位图: pages={} count={}",
-            doc.pages.len(),
-            doc.page_count
-        );
-        for (i, page) in doc.pages.iter().enumerate() {
-            assert_eq!(page.image.format, ImageFormat::Png, "第 {i} 页位图应为 PNG");
+    fn parses_all_test_pdfs_quickly_and_reads_dims() {
+        for p in test_pdf_paths() {
+            assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+            let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+            let t0 = std::time::Instant::now();
+            let doc = parse_bytes(bytes).expect("解析 PDF 应成功");
+            let dims = page_dims(&doc);
+            let elapsed = t0.elapsed();
+            // 结构解析（不栅格化）应很快：大文件也应在数秒内完成，否则无法“打开即显”
             assert!(
-                page.image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-                "第 {i} 页 PNG 魔数正确"
+                elapsed < std::time::Duration::from_secs(15),
+                "{} 结构解析过慢：{elapsed:?}（{} 页）",
+                p.display(),
+                dims.len()
             );
-            assert!(
-                page.width > 0 && page.height > 0,
-                "第 {i} 页应有正尺寸: {}x{}",
-                page.width,
-                page.height
-            );
+            assert!(!dims.is_empty(), "{} 应有页", p.display());
+            for (w, h) in &dims {
+                assert!(*w > 0.0 && *h > 0.0, "{} 页尺寸应为正: {w}x{h}", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn renders_single_page_from_shared_document() {
+        let p = test_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let doc = parse_bytes(bytes).expect("解析 PDF 应成功");
+        let img = render_page(&doc, 0, 1.0).expect("栅格化第 1 页应成功");
+        assert!(img.frame_count() >= 1, "应生成至少 1 帧");
+    }
+
+    #[test]
+    fn renders_many_pages_individually() {
+        // 259 页的 PDF：逐页按需渲染都应成功（证明「按需渲染」可行，不再一次性全画）
+        let p = test_pdf_paths()[1].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let doc = parse_bytes(bytes).expect("解析 PDF 应成功");
+        let dims = page_dims(&doc);
+        assert!(dims.len() >= 200, "长文档应有大量页，实际={}", dims.len());
+        // 只抽查首/中/末各一页，模拟「滚动到哪渲染哪」
+        for idx in [0usize, dims.len() / 2, dims.len() - 1] {
+            let img = render_page(&doc, idx, 0.5).expect("按需栅格化应成功");
+            assert!(img.frame_count() >= 1, "第 {idx} 页应渲染出帧");
         }
     }
 }

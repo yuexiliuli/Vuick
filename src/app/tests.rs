@@ -800,8 +800,8 @@
         );
     }
 
-    /// 打开 .pdf：应把每页按原样栅格化成内存 PNG 并载入 PdfViewer，
-    /// 自动进入全屏只读预览（不解析为 Markdown）。
+    /// 打开 .pdf：PdfViewer 自包含后台解析（进 UI 不阻塞），
+    /// 加载完成后全屏只读预览，解析为页级位图而非 Markdown 文本。
     #[gpui::test]
     async fn opens_pdf_and_shows_preview(cx: &mut TestAppContext) {
         init_test(cx);
@@ -818,15 +818,17 @@
                 app.open_file(pdf.to_str().unwrap(), window, cx)
             });
         });
-        // 打开异步化：PDFium 在后台执行器栅格化，泵驱动到 PdfViewer 载入完成
+        // 解析在后台执行器做，泵驱动到 PdfViewer 加载完成
         for _ in 0..200 {
             cx.run_until_parked();
-            let ready = cx.update(|_w, cx| {
+            let loaded = cx.update(|_w, cx| {
                 app.read(cx).tabs[app.read(cx).active_tab]
                     .pdf_preview
-                    .is_some()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
             });
-            if ready {
+            if loaded {
                 break;
             }
         }
@@ -853,6 +855,62 @@
         assert!(fullscreen, "打开 PDF 应自动进入全屏占满阅读模式");
         assert!(readonly, "打开 PDF 应锁定只读预览");
         assert!(no_md_content, "PDF 不应进入 Markdown 文本（content 应为空）");
+    }
+
+    /// 回归：打开 259 页的长 PDF（曾因全量栅格化耗时 ~270s 表现为“无法加载”）。
+    /// 现在应为页级虚拟化——结构解析秒级完成，进 UI 后按需渲染。
+    #[gpui::test]
+    async fn opens_long_pdf_virtualized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        let t0 = std::time::Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(pdf.to_str().unwrap(), window, cx)
+            });
+        });
+        // 泵驱动到 PdfViewer 加载完成
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .pdf_preview
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        let (page_count, status_ok) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.pdf_preview
+                    .as_ref()
+                    .map(|pv| pv.read(cx).page_count())
+                    .unwrap_or(0),
+                a.status_ok,
+            )
+        });
+        let elapsed = t0.elapsed();
+        assert!(status_ok, "打开长 PDF 应成功");
+        assert!(
+            page_count == 259,
+            "259 页文件应完整列出 259 页，实际={page_count}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "长 PDF 结构解析应秒级完成（曾需 ~270s 全量栅格化），实际 {elapsed:?}"
+        );
     }
 
     /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏，换行开关可切换自动换行。

@@ -154,12 +154,12 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 把 PDF 解析结果载入指定选项卡：整页原样显示（PdfViewer），编辑区置空。
+    /// 把一个新 PDF 阅读器载入指定选项卡：编辑区置空、全屏只读预览。
+    /// 解析由 [`crate::pdf::PdfViewer`] 自己在后台完成，窗口不阻塞。
     fn load_pdf(
         &mut self,
         idx: usize,
         p: &std::path::Path,
-        doc: crate::pdf::PdfDocument,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -168,8 +168,6 @@ impl EditorApp {
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
-        let title = doc.title;
-        let page_count = doc.page_count;
         // 编辑区置为提示文本（PDF 只读，不参与文本编辑）
         tab.editor.update(cx, |ed, cx| {
             ed.set_value("", window, cx);
@@ -179,13 +177,13 @@ impl EditorApp {
             view.set_background(canvas_bg);
             view.set_source("", cx);
         });
-        // PdfViewer：直接持有按原样栅格化的页面位图，逐页显示（不解析为 Markdown）
-        let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(doc.pages, cx));
+        // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
+        let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(p.to_path_buf(), cx));
         viewer.update(cx, |view, _| view.set_background(canvas_bg));
         tab.pdf_preview = Some(viewer);
         tab.file_path = Some(p.to_path_buf());
         tab.content = SharedString::default();
-        tab.line_count = page_count;
+        tab.line_count = 0;
         tab.char_count = 0;
         tab.cursor_row = 0;
         tab.cursor_col = 0;
@@ -194,13 +192,13 @@ impl EditorApp {
         tab.preview_fullscreen = true;
         // PDF 正文只存在于阅读器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
         tab.readonly_preview = true;
-        self.status = SharedString::from(format!("已打开 PDF：{title} · {page_count} 页"));
+        self.status = SharedString::from(format!("已打开 PDF：{}（解析中…）", p.display()));
         self.status_ok = true;
         cx.notify();
     }
 
-    /// 异步打开 PDF：主线程立即返回（窗口保持响应），在后台执行器上完成
-    /// PDFium 逐页栅格化，完成后回主线程载入阅读器；失败仅提示、保留选项卡。
+    /// 打开 PDF：立即建标签页并创建自包含的 PdfViewer（在后台加载解析），
+    /// 窗口保持响应；解析完成/失败由阅读器内部呈现。
     fn open_pdf_async(
         &mut self,
         idx: usize,
@@ -208,30 +206,9 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.status = SharedString::from(format!("正在解析 PDF：{}…", p.display()));
+        self.status = SharedString::from(format!("正在打开 PDF：{}…", p.display()));
         self.status_ok = true;
-        cx.notify();
-        let entity = cx.entity();
-        window
-            .spawn(cx, async move |cx| {
-                // pdfium 栅格化是 CPU 重活，放后台执行器跑，避免拖住 UI 主线程
-                let parse_path = p.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { crate::pdf::parse_pdf_file(&parse_path) })
-                    .await;
-                let _ = cx.update_window_entity(&entity, |this, window, cx| {
-                    match result {
-                        Ok(doc) => this.load_pdf(idx, &p, doc, window, cx),
-                        Err(e) => {
-                            this.status = SharedString::from(format!("打开失败：{e}"));
-                            this.status_ok = false;
-                            cx.notify();
-                        }
-                    }
-                });
-            })
-            .detach();
+        self.load_pdf(idx, &p, window, cx);
     }
 
     /// 把文件内容载入已存在的选项卡（读取失败仅提示，保留原选项卡）。
