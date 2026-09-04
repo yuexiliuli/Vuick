@@ -16,7 +16,7 @@
 mod parser;
 mod view;
 
-pub use parser::{parse_bytes, render_page, page_dims};
+pub use parser::{parse_bytes, render_image_from_bytes, render_page_bytes, page_dims};
 pub use view::PdfViewer;
 
 use hayro::hayro_syntax::Pdf;
@@ -65,8 +65,9 @@ mod tests {
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let doc = parse_bytes(bytes).expect("解析 PDF 应成功");
-        let img = render_page(&doc, 0, 1.0).expect("栅格化第 1 页应成功");
-        assert!(img.frame_count() >= 1, "应生成至少 1 帧");
+        let (page, w, h) = render_page_bytes(&doc, 0, 1.0).expect("栅格化第 1 页应成功");
+        assert!(w > 0 && h > 0, "应有正尺寸: {w}x{h}");
+        assert_eq!(page.len(), (w as usize) * (h as usize) * 4, "RGBA 字节数应匹配");
     }
 
     #[test]
@@ -79,8 +80,8 @@ mod tests {
         assert!(dims.len() >= 200, "长文档应有大量页，实际={}", dims.len());
         // 只抽查首/中/末各一页，模拟「滚动到哪渲染哪」
         for idx in [0usize, dims.len() / 2, dims.len() - 1] {
-            let img = render_page(&doc, idx, 0.5).expect("按需栅格化应成功");
-            assert!(img.frame_count() >= 1, "第 {idx} 页应渲染出帧");
+            let (page, w, h) = render_page_bytes(&doc, idx, 0.5).expect("按需栅格化应成功");
+            assert!(!page.is_empty() && w > 0 && h > 0, "第 {idx} 页应渲染出位图");
         }
     }
 }

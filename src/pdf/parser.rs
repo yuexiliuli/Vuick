@@ -52,9 +52,10 @@ pub fn page_dims(doc: &Document) -> Vec<(f32, f32)> {
     doc.pages().iter().map(|p| p.render_dimensions()).collect()
 }
 
-/// 栅格化单页为 [`gpui::RenderImage`]（BGRA）。`scale` = PDF 点尺寸 × 此系数；
-/// 页面以白色为底（透明处合成白底），超出视口按比例缩放。
-pub fn render_page(doc: &Document, idx: usize, scale: f32) -> Result<Arc<RenderImage>> {
+/// 栅格化单页，返回 BGRA 像素字节 + (宽, 高)。
+/// `scale` = PDF 点尺寸 × 此系数；页面以白色为底（透明处合成白底），超出视口按比例缩放。
+/// 纯数据、无 UI 依赖——便于落盘做二级缓存（再次翻回时直接读盘，无需重栅格化）。
+pub fn render_page_bytes(doc: &Document, idx: usize, scale: f32) -> Result<(Vec<u8>, u32, u32)> {
     let pixmaps = hayro::render_pdf(doc, scale, InterpreterSettings::default(), Some(idx..=idx))
         .context("render_pdf 失败")?;
     let pixmap = pixmaps
@@ -77,6 +78,11 @@ pub fn render_page(doc: &Document, idx: usize, scale: f32) -> Result<Arc<RenderI
         out[2] = p[0]; // R
         out[3] = p[3]; // A
     }
+    Ok((bgra, w, h))
+}
+
+/// 栅格化单页为 [`gpui::RenderImage`]（BGRA），供内存直接显示。
+pub fn render_image_from_bytes(bgra: Vec<u8>, w: u32, h: u32) -> Result<Arc<RenderImage>> {
     let buf = RgbaImage::from_raw(w, h, bgra).context("坏像素缓冲")?;
     Ok(Arc::new(RenderImage::new(vec![Frame::new(buf)])))
 }

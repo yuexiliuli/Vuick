@@ -9,7 +9,7 @@
 //! - **回收**：滚离视口的页释放位图 + GPU 纹理（`drop_image`），内存受限。
 //! - **不闪烁**：页槽先是有尺寸占位（页号/加载中），位图到位后替换，布局稳定。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
@@ -18,7 +18,9 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::pdf::{page_dims, parse_bytes, render_page, Document};
+use crate::pdf::{
+    page_dims, parse_bytes, render_image_from_bytes, render_page_bytes, Document,
+};
 
 /// 页面统一显示基准宽（px，视口内按比例缩放）。
 const PAGE_WIDTH: f32 = 840.0;
@@ -150,6 +152,87 @@ fn plan_page_work(
     (to_render, to_evict)
 }
 
+/// 磁盘二级页缓存：内存页位图预算淘汰后，把 BGRA 字节落盘为每页一个文件；
+/// 再次翻回时**直接读盘重建** `RenderImage`，无需重新栅格化（读本地磁盘 ≈ 毫秒级，
+/// 重栅格化 ≈ 秒级）。这样即便长文档，来回翻页也不再出现长时间“加载中”。
+#[derive(Clone, Debug)]
+pub struct PageCache {
+    /// 缓存目录（每个 PDF 一个独立子目录；None 表示用户目录不可用，退化为纯内存）。
+    dir: Option<PathBuf>,
+}
+
+/// 每页缓存文件头：magic(4) + width(4) + height(4) = 12 字节，随后为 BGRA 字节。
+const PAGE_CACHE_MAGIC: &[u8; 4] = b"PDPG";
+const PAGE_CACHE_HEADER: u64 = 12;
+
+impl PageCache {
+    /// 以 `pdf_path` 的文件名在系统临时目录开一个分片缓存目录。
+    pub fn new(pdf_path: &Path) -> Self {
+        let dir = std::env::temp_dir()
+            .join("gpui-editor-pdf-cache")
+            .join(fingerprint(pdf_path));
+        let _ = std::fs::create_dir_all(&dir);
+        Self { dir: Some(dir) }
+    }
+
+    fn page_file(&self, idx: usize) -> Option<PathBuf> {
+        self.dir.as_ref().map(|d| d.join(format!("{idx:05}.bin")))
+    }
+
+    /// 保存某页 BGRA 字节（落盘失败静默忽略——缓存是尽力而为）。
+    pub fn save(&self, idx: usize, bytes: &[u8], w: u32, h: u32) {
+        let Some(path) = self.page_file(idx) else {
+            return;
+        };
+        let mut out = Vec::with_capacity(PAGE_CACHE_HEADER as usize + bytes.len());
+        out.extend_from_slice(PAGE_CACHE_MAGIC);
+        out.extend_from_slice(&w.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes());
+        out.extend_from_slice(bytes);
+        let _ = std::fs::write(path, out);
+    }
+
+    /// 从磁盘读取某页 BGRA 字节（校验头；损坏/缺失返回 None）。
+    pub fn load(&self, idx: usize) -> Option<(Vec<u8>, u32, u32)> {
+        let path = self.page_file(idx)?;
+        let data = std::fs::read(path).ok()?;
+        if data.len() < PAGE_CACHE_HEADER as usize || data[..4] != *PAGE_CACHE_MAGIC {
+            return None;
+        }
+        let w = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let h = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        Some((data[PAGE_CACHE_HEADER as usize..].to_vec(), w, h))
+    }
+
+    /// 清理本 PDF 的整个缓存目录（关闭标签页时调用）。
+    pub fn clear(&self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// 用文件名做缓存目录指纹（防路径含非法字符）。
+fn fingerprint(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pdf".into());
+    // 简单散列：文件大小 + 名称字节异或，避免依赖额外 crate
+    let mut hash = 0x9e37u64.wrapping_mul(name.len() as u64);
+    for b in name.bytes() {
+        hash = hash.wrapping_mul(131).wrapping_add(b as u64);
+    }
+    format!("{:016x}-{}", hash, sanitize(&name))
+}
+
+/// 只保留安全字符，避免路径分隔符/通配等被误用。
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
 /// PDF 阅读器：自包含的页级虚拟化视图。
 pub struct PdfViewer {
     /// 文件路径（含文件名，标题用）。
@@ -172,11 +255,14 @@ pub struct PdfViewer {
     bg: Option<Hsla>,
     /// 待释放的旧位图（重渲染替换下来的，需在下一帧 `drop_image`）。
     pending_drops: Vec<Arc<RenderImage>>,
+    /// 磁盘二级页缓存：内存淘汰后读盘即得，来回翻页不重新栅格化。
+    cache: PageCache,
 }
 
 impl PdfViewer {
     /// 创建阅读器并异步加载 `path`（读文件 + 解析 + 量页在后台，UI 不阻塞）。
     pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
+        let cache = PageCache::new(&path);
         let mut this = Self {
             path,
             pdf: None,
@@ -188,6 +274,7 @@ impl PdfViewer {
             load_error: None,
             bg: None,
             pending_drops: Vec::new(),
+            cache,
         };
         this.start_load(cx);
         this
@@ -261,13 +348,14 @@ impl PdfViewer {
         }
     }
 
-    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用）。
+    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），并清空磁盘缓存。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut drops = std::mem::take(&mut self.pending_drops);
         drops.extend(self.slots.iter_mut().filter_map(|s| s.image.take()));
         for arc in drops {
             cx.drop_image(arc, Some(window));
         }
+        self.cache.clear();
     }
 
     /// 当前页列宽度。
@@ -294,7 +382,7 @@ impl PdfViewer {
         let rendered: Vec<bool> = self.slots.iter().map(|s| s.image.is_some()).collect();
         let loading: Vec<bool> = self.slots.iter().map(|s| s.loading).collect();
         let rendered_generation: Vec<u64> = self.slots.iter().map(|s| s.generation).collect();
-        let (mut to_render, to_evict_idx) =
+        let (to_render, to_evict_idx) =
             plan_page_work(&rendered, &loading, start, end, generation, &rendered_generation);
         let mut to_evict: Vec<Arc<RenderImage>> = Vec::new();
         for i in to_evict_idx {
@@ -308,35 +396,57 @@ impl PdfViewer {
         for arc in to_evict {
             cx.drop_image(arc, Some(window));
         }
-        for i in &to_render {
-            self.slots[*i].loading = true;
+        // 先尝试磁盘二级缓存：命中则直接恢复位图，不派发栅格化任务（毫秒级）；
+        // 未命中才需要真正栅格化。
+        let mut need_render: Vec<usize> = Vec::new();
+        for &i in &to_render {
+            let cached = self
+                .cache
+                .load(i)
+                .and_then(|(bytes, w, h)| render_image_from_bytes(bytes, w, h).ok());
+            match cached {
+                Some(img) => {
+                    self.slots[i].loading = false;
+                    self.slots[i].image = Some(img);
+                    self.slots[i].generation = generation;
+                }
+                None => need_render.push(i),
+            }
         }
-        if to_render.is_empty() {
+        if need_render.is_empty() {
             return;
         }
 
         // 靠近可见区中心的页先渲染（先填正在看的那页）
         let center = (start + end) / 2;
-        to_render.sort_by_key(|&i| (i as i64 - center as i64).unsigned_abs());
+        need_render.sort_by_key(|&i| (i as i64 - center as i64).unsigned_abs());
 
         let pdf = self.pdf.clone().unwrap();
-        for i in to_render {
+        let cache = self.cache.clone();
+        for i in need_render {
+            self.slots[i].loading = true;
             let pdf = pdf.clone();
+            let cache = cache.clone();
             let scale = render_scale(page_width, scale_factor, self.dims[i].0);
             cx.spawn(async move |weak, cx| {
+                // 后台栅格化（返回裸字节 + 尺寸），顺带落盘二级缓存
                 let page = cx
                     .background_executor()
-                    .spawn(async move { render_page(&pdf, i, scale).ok() })
+                    .spawn(async move { render_page_bytes(&pdf, i, scale).ok() })
                     .await;
                 let _ = weak.update(cx, |this, cx| {
+                    // 先落盘（尽力而为），再从字节重建 RenderImage 装进内存槽
+                    let mut stored: Option<Arc<RenderImage>> = None;
+                    if let Some((bytes, w, h)) = page {
+                        cache.save(i, &bytes, w, h);
+                        stored = render_image_from_bytes(bytes, w, h).ok();
+                    }
                     let gen_now = this.generation;
                     let mut retired = None;
                     if let Some(slot) = this.slots.get_mut(i) {
                         slot.loading = false;
-                        // 始终存入结果（预算淘汰在每帧 plan_page_work 里做）；
-                        // 只有代次过期才丢弃，避免替换还在显示的旧图。
                         if gen_now == generation {
-                            if let Some(img) = page {
+                            if let Some(img) = stored {
                                 retired = slot.image.replace(img);
                                 slot.generation = generation;
                             }
