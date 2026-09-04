@@ -32,6 +32,10 @@ const PAGE_PAD_X: f32 = 20.0;
 const MAX_RENDER_SCALE: f32 = 3.0;
 /// 可见页上下各多留存的已渲染页数（滚动时已就绪，不抖动）。
 const MARGIN: usize = 3;
+/// 最多同时保留的已渲染位图页数（内存上限）。超出后把**离当前视口最远**的页回收；
+/// 只要总量未超限，「往回翻」命中的都是已渲染位图，不会重新加载。
+/// 按 840px 宽 A4（≈4MB/页）估算，70 页 ≈ 280MB。
+const CACHE_MAX_PAGES: usize = 70;
 
 /// 页槽：某页的渲染状态。
 #[derive(Default, Clone)]
@@ -94,6 +98,56 @@ fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f32) -> f32 {
     } else {
         1.5
     }
+}
+
+/// 每帧的页工作规划（纯函数，便于测试）：根据每页当前是否“已渲染/正在加载/代次”，
+/// 决定 (需要渲染的页, 需要淘汰位图的页)。
+///
+/// - **渲染**：可见区内既**未渲染**又**未在加载中**（或位图代次过期）的页。
+///   正在加载的页绝不再派发任务，避免每个可见帧都重复栅格化同一页。
+/// - **淘汰（延后回收 / 距离 LRU）**：仅当保留位图数超过 [`CACHE_MAX_PAGES`] 时，
+///   才把**离当前视口中心最远**的页依次回收直到回到预算内。预算内任一页——无论多靠前
+///   多靠后——都保留，因此「往下翻很多页再倒回去」命中缓存，不重新加载。
+fn plan_page_work(
+    rendered: &[bool],
+    loading: &[bool],
+    start: usize,
+    end: usize,
+    generation: u64,
+    rendered_generation: &[u64],
+) -> (Vec<usize>, Vec<usize>) {
+    let dims_len = rendered.len();
+    let mut to_render: Vec<usize> = Vec::new();
+    for i in start..=end.min(dims_len.saturating_sub(1)) {
+        let needs_render =
+            !rendered[i] || rendered_generation.get(i).copied() != Some(generation);
+        if needs_render && !loading[i] {
+            to_render.push(i);
+        }
+    }
+
+    let retained = rendered.iter().filter(|r| **r).count();
+    if retained <= CACHE_MAX_PAGES {
+        return (to_render, Vec::new());
+    }
+    // 预算已满：离中心最远优先淘汰（等距取索引小者，保证确定性）
+    let center = (start + end) / 2;
+    let mut candidates: Vec<usize> = rendered
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| **r)
+        .map(|(i, _)| i)
+        .collect();
+    candidates.sort_by_key(|&i| (std::cmp::Reverse((i as i64 - center as i64).abs()), i));
+    let mut to_evict: Vec<usize> = Vec::new();
+    for i in candidates {
+        if to_evict.len() >= retained - CACHE_MAX_PAGES {
+            break;
+        }
+        to_evict.push(i);
+    }
+    to_evict.sort_unstable();
+    (to_render, to_evict)
 }
 
 /// PDF 阅读器：自包含的页级虚拟化视图。
@@ -236,23 +290,26 @@ impl PdfViewer {
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
         let generation = self.generation;
 
-        // 回收可见区之外位图 + 决定需要渲染的页
-        let mut to_render: Vec<usize> = Vec::new();
+        // 规划：要渲染的页 + 要淘汰位图的页（保留策略见 plan_page_work）
+        let rendered: Vec<bool> = self.slots.iter().map(|s| s.image.is_some()).collect();
+        let loading: Vec<bool> = self.slots.iter().map(|s| s.loading).collect();
+        let rendered_generation: Vec<u64> = self.slots.iter().map(|s| s.generation).collect();
+        let (mut to_render, to_evict_idx) =
+            plan_page_work(&rendered, &loading, start, end, generation, &rendered_generation);
         let mut to_evict: Vec<Arc<RenderImage>> = Vec::new();
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            let in_window = i >= start && i <= end;
-            if in_window {
-                if !slot.loading && (slot.image.is_none() || slot.generation != generation) {
-                    slot.loading = true;
-                    to_render.push(i);
+        for i in to_evict_idx {
+            if let Some(slot) = self.slots.get_mut(i) {
+                if let Some(arc) = slot.image.take() {
+                    slot.generation = 0;
+                    to_evict.push(arc);
                 }
-            } else if let Some(arc) = slot.image.take() {
-                slot.generation = 0;
-                to_evict.push(arc);
             }
         }
         for arc in to_evict {
             cx.drop_image(arc, Some(window));
+        }
+        for i in &to_render {
+            self.slots[*i].loading = true;
         }
         if to_render.is_empty() {
             return;
@@ -272,18 +329,13 @@ impl PdfViewer {
                     .spawn(async move { render_page(&pdf, i, scale).ok() })
                     .await;
                 let _ = weak.update(cx, |this, cx| {
-                    let in_window = {
-                        let pw = this.page_width();
-                        let sy = f32::from(-this.scroll.offset().y);
-                        let vh = f32::from(this.scroll.bounds().size.height);
-                        let (s, e) = keep_window(&this.dims, pw, sy, vh);
-                        i >= s && i <= e
-                    };
                     let gen_now = this.generation;
                     let mut retired = None;
                     if let Some(slot) = this.slots.get_mut(i) {
                         slot.loading = false;
-                        if gen_now == generation && in_window {
+                        // 始终存入结果（预算淘汰在每帧 plan_page_work 里做）；
+                        // 只有代次过期才丢弃，避免替换还在显示的旧图。
+                        if gen_now == generation {
                             if let Some(img) = page {
                                 retired = slot.image.replace(img);
                                 slot.generation = generation;
@@ -335,7 +387,10 @@ impl Render for PdfViewer {
                 .into_any_element()
         } else {
             // 页列：每页一个固定宽高（宽高比不变）的页槽卡片，位图到位即替换占位。
-            let mut column = div().id("pdf-pages").flex().flex_col().w(px(page_width));
+            // 页间距必须与 keep_window/plan_page_work 的虚拟布局一致（PAGE_GAP），
+            // 否则按滚动位置推算的“可见/保留窗口”会随页数漂移，导致可见页被误判淘汰。
+            let mut column =
+                div().id("pdf-pages").flex().flex_col().gap(px(PAGE_GAP)).w(px(page_width));
             for (i, dim) in dims.iter().enumerate() {
                 let disp_h = display_height(*dim, page_width);
                 let slot_img = slots.get(i).and_then(|s| s.image.clone());
@@ -434,6 +489,94 @@ mod tests {
     #[test]
     fn keep_window_empty_dims_returns_zero() {
         assert_eq!(keep_window(&[], 840.0, 0.0, 600.0), (0, 0));
+    }
+
+    #[test]
+    fn plan_renders_only_unrendered_visible_pages() {
+        // 10 页，第 0 页已渲染且代次一致；视口 [0,2] → 只应渲染 1、2
+        let rendered = [true, false, false, false, false, false, false, false, false, false];
+        let loading = [false; 10];
+        let gens = [0u64; 10];
+        let (render, evict) = plan_page_work(&rendered, &loading, 0, 2, 0, &gens);
+        assert_eq!(render, vec![1, 2], "仅未渲染的可见页应列入渲染");
+        assert!(evict.is_empty(), "无越界已渲染页不应淘汰");
+    }
+
+    #[test]
+    fn plan_skips_pages_already_loading() {
+        // 可见页 1 正在加载 → 不应重复派发渲染任务（CPU 占用暴增的元凶）
+        let rendered = [true, false, false, false, false, false, false, false, false, false];
+        let mut loading = [false; 10];
+        loading[1] = true;
+        let gens = [0u64; 10];
+        let (render, _) = plan_page_work(&rendered, &loading, 0, 2, 0, &gens);
+        assert!(
+            !render.contains(&1),
+            "正在加载的页 1 不应重复派发（杜绝每帧重栅格化）"
+        );
+        assert!(render.contains(&2), "其余未渲染可见页仍应渲染");
+    }
+
+    #[test]
+    fn plan_keeps_rendered_pages_within_budget() {
+        // 200 页：仅第 10 页渲染，其余未渲染。预算 70，远未满 → 第 10 页必须保留。
+        let mut rendered = vec![false; 200];
+        let mut gens = vec![0u64; 200];
+        let loading = vec![false; 200];
+        rendered[10] = true;
+        gens[10] = 0;
+        let (_r, evict) = plan_page_work(&rendered, &loading, 50, 55, 0, &gens);
+        assert!(evict.is_empty(), "预算未满不应淘汰任何页（即使远在 40 页之外）");
+    }
+
+    #[test]
+    fn plan_evicts_farthest_first_when_over_budget() {
+        // 200 页都渲染（超预算 70），视口在 [100,105]。
+        // 应淘汰离中心最远的页（最前/最后），而可见页绝不能被淘汰。
+        let n = 200usize;
+        let rendered = vec![true; n];
+        let gens = vec![0u64; n];
+        let loading = vec![false; n];
+        let (r, evict) = plan_page_work(&rendered, &loading, 100, 105, 0, &gens);
+        assert!(r.is_empty(), "全部已渲染，无需再渲染");
+        // 回收到预算内
+        assert_eq!(n - evict.len(), CACHE_MAX_PAGES, "保留数应等于预算");
+        assert!(evict.contains(&0) && evict.contains(&199), "最远两端应先被淘汰");
+        for i in 100..=105 {
+            assert!(!evict.contains(&i), "可见页 {i} 绝不能被淘汰");
+        }
+    }
+
+    #[test]
+    fn scrolling_down_and_back_does_not_reload_rendered_pages() {
+        // 模拟用户「往下翻很多页再倒回去」：全程用 plan_page_work 推进状态机，
+        // 已渲染页只要未超预算、未被 LRU 淘汰，就绝不会进入 to_render（即不再“加载”）。
+        let n = 400usize;
+        let mut rendered = vec![false; n];
+        let mut gens = vec![0u64; n];
+        let loading = vec![false; n];
+        let mut render_calls = 0usize;
+
+        // 逐窗口滚动：从第 0 页往下翻 100 次（每次窗口推进 2 页），再倒回翻 100 次
+        for step in -100i64..=100 {
+            let base = (50 + step * 2).clamp(0, (n as i64) - 6) as usize;
+            let (start, end) = (base, (base + 5).min(n - 1));
+            let (to_render, to_evict) = plan_page_work(&rendered, &loading, start, end, 0, &gens);
+            // 记录本轮“需要重新加载”的页（应只含“从未渲染过”的页）
+            for i in &to_render {
+                assert!(
+                    !rendered[*i],
+                    "第 {i} 页已渲染却仍被要求渲染（往回翻又加载了！）step={step}"
+                );
+                rendered[*i] = true;
+                gens[*i] = 0;
+                render_calls += 1;
+            }
+            for i in &to_evict {
+                rendered[*i] = false;
+            }
+            let _ = render_calls;
+        }
     }
 
     #[test]
