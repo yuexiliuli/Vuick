@@ -226,6 +226,8 @@ pub struct MarkdownPreview {
     toc: Vec<(usize, u8, String)>,
     /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
     base_dir: Option<std::path::PathBuf>,
+    /// EPUB 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
+    epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
 }
 
 impl MarkdownPreview {
@@ -241,7 +243,17 @@ impl MarkdownPreview {
             font_override: None,
             toc: Vec::new(),
             base_dir: None,
+            epub_images: Default::default(),
         }
+    }
+
+    /// 注册 EPUB 内存图片表（虚拟 src → 图片字节，不落盘）。
+    /// 需在 set_source 之前调用；后续每次 set_source 都会按虚拟 src 重新挂载。
+    pub fn set_epub_images(
+        &mut self,
+        images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    ) {
+        self.epub_images = images;
     }
 
     /// 设置 markdown 文件目录（相对路径图片解析依据）。
@@ -270,8 +282,11 @@ impl MarkdownPreview {
     /// 从本地图片文件头读取固有尺寸 (w, h)（不整图解码，快）。
     /// 仅解析常见格式；失败返回 None，渲染回退到固定高度。
     fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
-        let data = std::fs::read(path).ok()?;
-        let d = data.as_slice();
+        Self::image_dimensions_bytes(&std::fs::read(path).ok()?)
+    }
+
+    /// 从图片字节头读取固有尺寸（不整图解码）。支持 PNG/JPEG/GIF/BMP。
+    fn image_dimensions_bytes(d: &[u8]) -> Option<(u32, u32)> {
         if d.len() < 8 {
             return None;
         }
@@ -397,6 +412,16 @@ impl MarkdownPreview {
                 continue;
             }
             if let Some(s) = r.src.take() {
+                // EPUB 内存图片：src 为虚拟地址，直接查注册表挂载字节（不落盘、不读文件）
+                if let Some(img) = self.epub_images.get(s.as_ref()) {
+                    if let Some((w, h)) = Self::image_dimensions_bytes(&img.bytes) {
+                        r.img_w = Some(w);
+                        r.img_h = Some(h);
+                    }
+                    r.img_data = Some(img.clone());
+                    r.src = Some(s.into());
+                    continue;
+                }
                 let resolved = if let Some(base) = &base {
                     Self::resolve_image_src(base, &s)
                 } else {
@@ -681,23 +706,9 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
         let alt = row.text.clone();
         let fallback_color = p.muted_fg;
 
-        let img_el = if src.is_empty() {
-            div()
-                .text_size(px(13.))
-                .text_color(fallback_color)
-                .child(alt)
-                .into_any_element()
-        } else {
-            // 本地绝对路径 → PathBuf（ImageAssetLoader 走 Resource::Path = fs::read）；
-            // URL → &str（走向 Resource::Uri，经 HTTP 加载）。
-            let src_is_url =
-                src.starts_with("http://") || src.starts_with("https://") || src.starts_with("file://");
-            let source: gpui::ImageSource = if src_is_url {
-                src.as_str().into()
-            } else {
-                std::path::PathBuf::from(&src).into()
-            };
-            img(source)
+        let img_el = match row.img_data.clone() {
+            // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
+            Some(image) => img(gpui::ImageSource::Image(image))
                 .object_fit(ObjectFit::Contain)
                 .w_full()
                 .h_full()
@@ -707,11 +718,42 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
                         .items_center()
                         .justify_center()
                         .text_size(px(13.))
-                        .text_color(fallback_color)
+                        .text_color(fallback_color.clone())
                         .child(alt.clone())
                         .into_any_element()
                 })
-                .into_any_element()
+                .into_any_element(),
+            None if src.is_empty() => div()
+                .text_size(px(13.))
+                .text_color(fallback_color)
+                .child(alt)
+                .into_any_element(),
+            None => {
+                // 本地绝对路径 → PathBuf（ImageAssetLoader 走 Resource::Path = fs::read）；
+                // URL → &str（走向 Resource::Uri，经 HTTP 加载）。
+                let src_is_url =
+                    src.starts_with("http://") || src.starts_with("https://") || src.starts_with("file://");
+                let source: gpui::ImageSource = if src_is_url {
+                    src.as_str().into()
+                } else {
+                    std::path::PathBuf::from(&src).into()
+                };
+                img(source)
+                    .object_fit(ObjectFit::Contain)
+                    .w_full()
+                    .h_full()
+                    .with_fallback(move || {
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .text_color(fallback_color.clone())
+                            .child(alt.clone())
+                            .into_any_element()
+                    })
+                    .into_any_element()
+            }
         };
 
         // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
@@ -1498,5 +1540,56 @@ mod tests {
             "宽视口下图片盒仍应水平居中：期望左缘={expect_x2:.0}，实际={:?}",
             bo2.origin
         );
+    }
+
+    /// EPUB 内存图片端到端：set_epub_images 注册虚拟 src 后，
+    /// set_source 应把字节挂到图片行（img_data）并解析出固有尺寸，渲染出图片盒。
+    #[gpui::test]
+    fn epub_in_memory_images_render(cx: &mut TestAppContext) {
+        let doc = crate::epub::parse_epub_file(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub"))
+            .expect("解析 xy.epub 应成功");
+        let vsrcs: Vec<String> = doc.images.keys().cloned().collect();
+        assert!(!vsrcs.is_empty(), "xy.epub 应提取到内存图片");
+        // 用读取到的真实图片字节构造虚拟 src（保证注册表有对应项）
+        let first = doc
+            .images
+            .iter()
+            .find(|(_, img)| img.format == gpui::ImageFormat::Jpeg)
+            .map(|(k, _)| k.clone())
+            .unwrap_or_else(|| "epubimg://1.jpeg".to_string());
+        let md_src = format!("![图]({first})");
+
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_epub_images(doc.images.clone());
+                md.set_source(&md_src, cx);
+            });
+        });
+        cx.simulate_resize(size(px(500.), px(700.)));
+        settle(cx);
+
+        // 图片行应挂上内存字节与尺寸
+        let (has_data, dims_ok) = cx.update(|_, cx| {
+            let md = host.read(cx).md.read(cx);
+            let img_rows: Vec<_> = md.rows.iter().filter(|r| r.kind == RowKind::Image).collect();
+            assert_eq!(img_rows.len(), 1, "应有 1 个图片行");
+            let r = img_rows[0];
+            (r.img_data.is_some(), r.img_w.is_some() && r.img_h.is_some())
+        });
+        assert!(has_data, "EPUB 内存图片应挂到图片行(img_data)");
+        assert!(dims_ok, "内存图片应解析出固有尺寸");
+
+        // 渲染出图片盒
+        let box_ = cx
+            .debug_bounds("md-img-box")
+            .expect("内存图片应渲染出 md-img-box");
+        assert!(box_.size.width > px(0.) && box_.size.height > px(0.), "图片盒应有尺寸，实际={box_:?}");
     }
 }

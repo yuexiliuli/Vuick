@@ -11,7 +11,7 @@
 use std::ops::Range;
 use std::sync::OnceLock;
 
-use gpui::SharedString;
+use gpui::{Image, SharedString};
 use regex::Regex;
 
 /// 渲染行类型。
@@ -88,6 +88,8 @@ pub struct Row {
     /// 图片固有尺寸（像素，kind == [Image] 且 src 可解析时 Some）。用于按比例显示。
     pub img_w: Option<u32>,
     pub img_h: Option<u32>,
+    /// 内存图片数据（EPUB 等不落盘场景；Some 时渲染直接用该字节，忽略 src 路径）。
+    pub img_data: Option<std::sync::Arc<Image>>,
 }
 
 impl Row {
@@ -106,6 +108,7 @@ impl Row {
             src: None,
             img_w: None,
             img_h: None,
+            img_data: None,
         }
     }
 
@@ -120,6 +123,7 @@ impl Row {
             src: None,
             img_w: None,
             img_h: None,
+            img_data: None,
         }
     }
 
@@ -134,6 +138,7 @@ impl Row {
             src: Some(src.into()),
             img_w: None,
             img_h: None,
+            img_data: None,
         }
     }
 }

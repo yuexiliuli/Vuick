@@ -124,6 +124,8 @@ impl EditorApp {
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
+            // EPUB 图片保持内存，渲染时由预览查表直接解码（不写硬盘）
+            view.set_epub_images(doc.images.clone());
             // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
             view.set_wrap(true, cx);
             view.set_source(&text, cx);
