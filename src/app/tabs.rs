@@ -41,6 +41,7 @@ impl EditorApp {
                                         let value = tab.editor.read(cx).value();
                                         tab.md_preview.update(cx, |view, cx| {
                                             view.set_background(panel_bg);
+                                            view.set_base_dir(tab.file_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
                                             view.set_source(value.as_ref(), cx);
                                         });
                                     }

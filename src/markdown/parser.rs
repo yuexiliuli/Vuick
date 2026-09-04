@@ -31,6 +31,8 @@ pub enum RowKind {
     Rule,
     /// GFM 表格（一个行 = 整个表格，结构见 [`Row::table`]）
     Table,
+    /// 独立图片行（`![alt](src)`，src 在 [`Row::src`]）
+    Image,
     /// 空行（作为行间留白）
     Blank,
 }
@@ -80,6 +82,9 @@ pub struct Row {
     pub prefix: Option<SharedString>,
     /// 表格结构（kind == [Table] 时 Some）
     pub table: Option<TableData>,
+    /// 图片源（kind == [Image] 时为 `![alt](src)` 的 src）。
+    #[allow(dead_code)]
+    pub src: Option<SharedString>,
 }
 
 impl Row {
@@ -95,6 +100,7 @@ impl Row {
             runs,
             prefix,
             table: None,
+            src: None,
         }
     }
 
@@ -106,6 +112,19 @@ impl Row {
             runs: Vec::new(),
             prefix: None,
             table: Some(table),
+            src: None,
+        }
+    }
+
+    /// 图片行：`![alt](src)`，文本为 alt（可空），src 另存。
+    fn new_image(alt: &str, src: &str) -> Self {
+        Self {
+            text: alt.into(),
+            kind: RowKind::Image,
+            runs: Vec::new(),
+            prefix: None,
+            table: None,
+            src: Some(src.into()),
         }
     }
 }
@@ -311,6 +330,35 @@ fn inline_strip(s: &str) -> SharedString {
     inline_style(s).0
 }
 
+/// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
+fn parse_image_line(t: &str) -> Option<(String, String)> {
+    if !t.starts_with("![") || t.find("](").is_none() {
+        return None;
+    }
+    // 剥掉首尾空白后必须整体匹配 `![...](...)`
+    let s = t.trim();
+    let end = s.find(']')?;
+    if !s.starts_with("![") || end < 2 {
+        return None;
+    }
+    let alt = &s[2..end];
+    let rest = s[end + 1..].trim_start();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close = rest.find(')')?;
+    // 允许 `)` 前的路径内含空格；闭合后不应再有非空内容（允许尾部空白，已被 trim）
+    let src = rest[1..close].trim();
+    let tail = &rest[close + 1..];
+    if src.is_empty() || (tail.trim() != s && tail.trim() != "") {
+        // 非纯整行图片（后面还有文字）→ 不作为独立图片行
+        if !tail.trim().is_empty() {
+            return None;
+        }
+    }
+    Some((alt.to_string(), src.to_string()))
+}
+
 /// 把 Markdown 源码解析成渲染行（每行一行，含行内清理）。
 pub fn parse_to_rows(src: &str) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -379,6 +427,12 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         // 水平分隔线
         if is_rule(t) {
             rows.push(Row::new("", RowKind::Rule, Vec::new(), None));
+            idx += 1;
+            continue;
+        }
+        // 独立图片行：`![alt](src)` 整行占位
+        if let Some((alt, src)) = parse_image_line(t) {
+            rows.push(Row::new_image(&alt, &src));
             idx += 1;
             continue;
         }
@@ -507,5 +561,22 @@ mod tests {
         let src = "姓名|年龄\n-|-\n张三|30\n";
         let rows = parse_to_rows(src);
         assert_eq!(rows[0].kind, RowKind::Table);
+    }
+
+    #[test]
+    fn full_line_image_becomes_image_row() {
+        let src = "前文\n\n![插图](images/a.jpeg)\n\n后文\n";
+        let rows = parse_to_rows(src);
+        let img = rows.iter().find(|r| r.kind == RowKind::Image).expect("应有图片行");
+        assert_eq!(img.text.as_ref(), "插图", "图片行文本应为 alt");
+        assert_eq!(
+            img.src.as_ref().map(|s| s.as_ref()),
+            Some("images/a.jpeg"),
+            "图片行 src 应保留"
+        );
+        // 非整行的行内图片仍是段落
+        let src2 = "文字 ![内嵌](x.png) 尾部\n";
+        let rows2 = parse_to_rows(src2);
+        assert_eq!(rows2[0].kind, RowKind::Paragraph, "行内图片不作独立图片行");
     }
 }

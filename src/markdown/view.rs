@@ -13,9 +13,9 @@
 use std::rc::Rc;
 
 use gpui::{
-    div, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
+    div, img, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
     ListAlignment, ListState, ParentElement, Pixels, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -27,6 +27,8 @@ use crate::markdown::parser::{parse_to_rows, Row, RowKind, TableAlign, TableData
 const ROW_OVERDRAW_PX: f32 = 600.0;
 /// 内容宽估算的额外缓冲（px），避免估算值微偏导致最后几个字符被截断。
 const WIDTH_BUFFER_PX: f32 = 24.0;
+/// 独立图片行的显示高度（px，contain 保持比例）。
+const IMAGE_ROW_H: f32 = 280.0;
 
 /// 排版参数：渲染时从全局主题取一份“快照”，避免每行重复查主题。
 /// 所有取值都对齐 gpui_component `node.rs` 的 Markdown 渲染风格：
@@ -146,6 +148,10 @@ fn est_text_width(text: &str, font_size: f32) -> f32 {
 fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
     match row.kind {
         RowKind::Blank | RowKind::Rule => 0.0,
+        RowKind::Image => {
+            // 图片行 by contain 撑满可用宽度 → 宽度由视口决定，不计入最宽内容
+            0.0
+        }
         RowKind::Code => {
             // 等宽字体按 0.65em/字符 + 左右 padding（pl_3 + pr_3 = 24px）
             row.text.chars().count() as f32 * p.code_size.as_f32() * 0.65 + 24.0
@@ -209,6 +215,8 @@ pub struct MarkdownPreview {
     font_override: Option<f32>,
     /// 目录：文档内标题行的 (行号, 级别, 文本)。
     toc: Vec<(usize, u8, String)>,
+    /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
+    base_dir: Option<std::path::PathBuf>,
 }
 
 impl MarkdownPreview {
@@ -223,7 +231,31 @@ impl MarkdownPreview {
             wrap: false,
             font_override: None,
             toc: Vec::new(),
+            base_dir: None,
         }
+    }
+
+    /// 设置 markdown 文件目录（相对路径图片解析依据）。
+    pub fn set_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.base_dir = dir;
+    }
+
+    /// 解析图片源：URL / Windows 绝对路径 / 已绝对路径原样返回，其余基于 base 目录拼成绝对路径。
+    fn resolve_image_src(base: &std::path::Path, src: &str) -> String {
+        let lower = src.to_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("file://")
+        {
+            return src.to_string();
+        }
+        if src.len() >= 2 && src.as_bytes()[1] == b':' {
+            return src.to_string();
+        }
+        if std::path::Path::new(src).is_absolute() {
+            return src.to_string();
+        }
+        base.join(src).to_string_lossy().to_string()
     }
 
     /// 设置预览背景色（打开/同步时由应用传入，使预览与编辑区同底色）。
@@ -286,7 +318,19 @@ impl MarkdownPreview {
 
     /// 设置预览源码（仅影响预览，原文不变）。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
-        let rows: Vec<Rc<Row>> = parse_to_rows(src).into_iter().map(Rc::new).collect();
+        let base = self.base_dir.clone();
+        let mut parsed = parse_to_rows(src);
+        // 相对图片路径基于文件目录解析为绝对路径（URL/绝对路径原样）
+        if let Some(base) = base {
+            for r in parsed.iter_mut() {
+                if r.kind == RowKind::Image {
+                    if let Some(s) = r.src.take() {
+                        r.src = Some(Self::resolve_image_src(&base, &s).into());
+                    }
+                }
+            }
+        }
+        let rows: Vec<Rc<Row>> = parsed.into_iter().map(Rc::new).collect();
         // 提取目录：标题行（行号, 级别, 清理后的文本）
         self.toc = rows
             .iter()
@@ -544,6 +588,56 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
         let table = row.table.as_ref().expect("Table 行必须携带表格结构");
         return render_table(table, p).into_any_element();
     }
+    // 独立图片行：固定高度容器 + contain 内嵌 Img（保持比例、不裁切变形）。
+    // src 为空/加载失败时显示 alt 作为 fallback。
+    if let RowKind::Image = row.kind {
+        let src = row.src.clone().unwrap_or_default().to_string();
+        let alt = row.text.clone();
+        let fallback_color = p.muted_fg;
+        let img_el = if src.is_empty() {
+            div()
+                .text_size(px(13.))
+                .text_color(fallback_color)
+                .child(alt)
+                .into_any_element()
+        } else {
+            // 本地绝对路径 → PathBuf（ImageAssetLoader 走 Resource::Path = fs::read）；
+            // URL → &str（走向 Resource::Uri，经 HTTP 加载）。
+            let src_is_url =
+                src.starts_with("http://") || src.starts_with("https://") || src.starts_with("file://");
+            let source: gpui::ImageSource = if src_is_url {
+                src.as_str().into()
+            } else {
+                std::path::PathBuf::from(&src).into()
+            };
+            img(source)
+                .w_full()
+                .h_full()
+                .with_fallback(move || {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(13.))
+                        .text_color(fallback_color)
+                        .child(alt.clone())
+                        .into_any_element()
+                })
+                .into_any_element()
+        };
+        return div()
+            .w_full()
+            .min_h(px(IMAGE_ROW_H))
+            .h(px(IMAGE_ROW_H))
+            .flex_shrink_0()
+            .px_3()
+            .py_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(img_el)
+            .into_any_element();
+    }
 
     // ---------- 自动换行模式：仅对文本行生效，代码/规则/空行保持原样 ----------
     if wrap {
@@ -711,6 +805,7 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
             .text_color(p.fg)
             .child(row.text.clone()),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
+        RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
     el.into_any_element()
 }
@@ -1114,6 +1209,72 @@ mod tests {
             tb.origin.y >= px(0.) && tb.origin.y < px(200.),
             "跳转到中段标题后目标行应滚动到视口顶部附近（origin.y={:?}）",
             tb.origin.y
+        );
+    }
+
+    /// 设置了 `set_base_dir` 后，相对路径图片 src 应解析为绝对路径；
+    /// URL / Windows 盘符绝对路径保持原样；未设置时保持原样。
+    #[gpui::test]
+    fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
+        use std::path::PathBuf;
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let md_src = "![1](wuling.png)\n\n![1](C:\\Users\\c22500540\\Pictures\\dify.jpg)\n\n![1](https://example.com/a.png)\n";
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_base_dir(Some(PathBuf::from(r"C:\Users\c22500540\Pictures")));
+                md.set_source(md_src, cx);
+            });
+        });
+        cx.simulate_resize(size(px(400.), px(600.)));
+        settle(cx);
+
+        let rows = cx.update(|_, cx| {
+            host.read(cx)
+                .md
+                .read(cx)
+                .rows
+                .iter()
+                .map(|r| r.kind.clone() == RowKind::Image)
+                .collect::<Vec<_>>()
+        });
+        drop(rows); // 仅确保读取不 panic；src 从 parsed 断言
+
+        // 直接从 parse 通路验证：resolve 逻辑在 set_source 内完成了 base 拼接
+        let srcs = cx.update(|_, cx| {
+            host.read(cx)
+                .md
+                .read(cx)
+                .rows
+                .iter()
+                .filter(|r| r.kind == RowKind::Image)
+                .map(|r| r.src.clone().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(srcs.len(), 3, "应解析出 3 张图片行，实际={srcs:?}");
+        assert_eq!(
+            srcs[0].as_deref(),
+            Some(r"C:\Users\c22500540\Pictures\wuling.png"),
+            "相对路径应基于 base_dir 解析为绝对路径，实际={:?}",
+            srcs[0]
+        );
+        assert_eq!(
+            srcs[1].as_deref(),
+            Some(r"C:\Users\c22500540\Pictures\dify.jpg"),
+            "Windows 盘符绝对路径应保持原样，实际={:?}",
+            srcs[1]
+        );
+        assert_eq!(
+            srcs[2].as_deref(),
+            Some("https://example.com/a.png"),
+            "URL 应保持原样，实际={:?}",
+            srcs[2]
         );
     }
 }

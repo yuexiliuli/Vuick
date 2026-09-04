@@ -82,6 +82,7 @@ impl EditorApp {
         // 自研渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
+            view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
             view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());
@@ -122,6 +123,7 @@ impl EditorApp {
         });
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
+            view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
             // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
             view.set_wrap(true, cx);
             view.set_source(&text, cx);

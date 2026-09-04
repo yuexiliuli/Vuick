@@ -52,15 +52,53 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         .with_context(|| format!("读取 OPF 失败：{opf_path}"))?;
     let (title, author, spine_hrefs) = parse_opf(&opf_xml, &opf_path)?;
 
-    // 3) 按 spine 顺序逐章读取 XHTML → 转 Markdown
+    // 3) 按 spine 顺序逐章读取 XHTML → 转 Markdown；图片落盘到临时目录供预览渲染
     let mut markdown = String::new();
     let mut chapters: Vec<String> = Vec::new();
     let base_dir = parent_zip_dir(&opf_path);
+    let img_dir = std::env::temp_dir().join("gpui-editor-epub");
+    let _ = std::fs::create_dir_all(&img_dir);
+    // src(zip 内路径) → 已落盘的绝对路径（去重）
+    let mut img_cache: std::collections::HashMap<String, String> = Default::default();
+    let mut img_counter = 0usize;
     for href in &spine_hrefs {
         let entry_path = join_zip_path(&base_dir, href);
         let chapter_html = read_zip_entry(&mut archive, &entry_path)
             .with_context(|| format!("读取章节失败：{entry_path}"))?;
-        let chapter_md = xhtml_to_markdown(&chapter_html);
+        let chapter_dir = {
+            let s = href.rsplitn(2, '/').nth(1).unwrap_or("").to_string();
+            if s.is_empty() {
+                base_dir.clone()
+            } else {
+                join_zip_path(&base_dir, &s)
+            }
+        };
+        let mut on_img = |src: &str, _alt: &str| -> Option<String> {
+            if src.is_empty() {
+                return None;
+            }
+            if let Some(p) = img_cache.get(src) {
+                return Some(p.clone());
+            }
+            let full = join_zip_path(&chapter_dir, src);
+            let mut file = archive.by_name(&full).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            img_counter += 1;
+            // 由 src 推断扩展名（默认 .img）
+            let ext = src
+                .rsplit('.')
+                .next()
+                .filter(|e| e.len() <= 5)
+                .unwrap_or("img")
+                .to_lowercase();
+            let path = img_dir.join(format!("img_{img_counter}.{ext}"));
+            std::fs::write(&path, &bytes).ok()?;
+            let plen = path.to_string_lossy().into_owned();
+            img_cache.insert(src.to_string(), plen.clone());
+            Some(plen)
+        };
+        let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img);
         if chapter_md.trim().is_empty() {
             continue;
         }
@@ -171,14 +209,17 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
 /// 把一棵 XHTML 章节转成 Markdown。
 ///
 /// 支持：标题(h1..h6)、段落(p)、引述(blockquote)、列表(ul/ol/li)、
-/// 换行(br)、脚注上标(sup/注记) 简化、图片(img) 占位、忽略 head/style/script。
-fn xhtml_to_markdown(html: &str) -> String {
+/// 换行(br)、脚注上标(sup/注记) 简化、图片(img)、忽略 head/style/script。
+///
+/// `on_img`：`(src, alt) -> Option<绝对路径>`（把 zip 内图片落盘后返回路径，
+/// 用于生成 `![alt](path)`；返回 None 时输出文本占位）。
+fn xhtml_to_markdown(html: &str, on_img: &mut dyn FnMut(&str, &str) -> Option<String>) -> String {
     let doc = match roxmltree::Document::parse(html) {
         Ok(d) => d,
         Err(_) => return String::new(),
     };
     let mut out = String::new();
-    walk_body(&doc.root_element(), &mut out, 0);
+    walk_body(&doc.root_element(), &mut out, 0, on_img);
     // 修整：多个空行合并、去掉行尾空格
     let mut result = String::with_capacity(out.len());
     let mut blank = 0usize;
@@ -199,7 +240,12 @@ fn xhtml_to_markdown(html: &str) -> String {
 }
 
 /// 递归遍历正文元素，`quoted` 为当前引述嵌套深度。
-fn walk_body(node: &roxmltree::Node, out: &mut String, quoted: usize) {
+fn walk_body(
+    node: &roxmltree::Node,
+    out: &mut String,
+    quoted: usize,
+    on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
+) {
     match node.tag_name().name() {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = node.tag_name().name()[1..].parse::<u8>().unwrap_or(1);
@@ -236,8 +282,21 @@ fn walk_body(node: &roxmltree::Node, out: &mut String, quoted: usize) {
             return;
         }
         "img" => {
-            let alt = node.attribute("alt").unwrap_or("图");
-            out.push_str(&format!("\n\n> [图片：{alt}]\n\n"));
+            let alt = node.attribute("alt").unwrap_or("").to_string();
+            let src = node
+                .attribute("src")
+                .unwrap_or("")
+                .to_string();
+            match on_img(&src, &alt) {
+                Some(path) => {
+                    let alt_esc = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+                    out.push_str(&format!("\n\n![{alt_esc}]({path})\n\n"));
+                }
+                None => {
+                    let label = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+                    out.push_str(&format!("\n\n> [图片：{label}]\n\n"));
+                }
+            }
             return;
         }
         "br" => {
@@ -259,7 +318,7 @@ fn walk_body(node: &roxmltree::Node, out: &mut String, quoted: usize) {
     let child_quoted = quoted + usize::from(node.has_tag_name("blockquote"));
     for child in node.children() {
         if child.is_element() || child.is_text() {
-            walk_body(&child, out, child_quoted);
+            walk_body(&child, out, child_quoted, on_img);
         }
     }
 }
@@ -356,12 +415,63 @@ mod tests {
     }
 
     #[test]
+    fn extracts_epub_images_to_temp_files() {
+        let doc = parse_epub_file(&test_epub_path()).expect("解析 xy.epub 应成功");
+        // xy.epub 含 6 张 jpeg，正文里应以 `![...](绝对路径)` 引用
+        let img_marks: Vec<&str> = doc
+            .markdown
+            .lines()
+            .filter(|l| l.starts_with("!["))
+            .collect();
+        assert!(!img_marks.is_empty(), "应提取出图片，实际段落:\n{}", doc.markdown);
+        let mut found = 0usize;
+        for line in &img_marks {
+            // 形如 ![alt]( <abs path> )
+            if let (Some(start), Some(end)) = (line.find("]("), line.rfind(')')) {
+                let path = &line[start + 2..end];
+                assert!(
+                    std::path::Path::new(path).is_file(),
+                    "图片落盘文件应存在：{path}"
+                );
+                found += 1;
+            }
+        }
+        assert!(
+            found >= 5,
+            "EPUB 中 6 张 jpeg 至少应有 5 张被提取（其余可能为未引用的封面），实际={found}"
+        );
+    }
+
+    #[test]
     fn xhtml_to_markdown_preserves_heading_and_paragraph() {
         let html = "<html><body><h1>第一章</h1><p>正文内容。</p><blockquote><p>引述。</p></blockquote></body></html>";
-        let md = xhtml_to_markdown(html);
+        let no_img: Option<String> = None;
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no_img.clone());
         assert!(md.contains("# 第一章"));
         assert!(md.contains("正文内容。"));
         assert!(md.contains("> 引述。"));
+    }
+
+    #[test]
+    fn xhtml_img_becomes_markdown_image() {
+        let html = "<html><body><p>前文</p><img src=\"images/p1.jpeg\" alt=\"插图一\"/><p>后文</p></body></html>";
+        let md = {
+            let mut on_img = |src: &str, alt: &str| {
+                assert_eq!(src, "images/p1.jpeg");
+                assert_eq!(alt, "插图一");
+                Some("/tmp/x/p1.jpeg".to_string())
+            };
+            xhtml_to_markdown(&html, &mut on_img)
+        };
+        assert!(md.contains("![插图一](/tmp/x/p1.jpeg)"), "图片应转成 markdown 图片，实际={md:?}");
+    }
+
+    #[test]
+    fn xhtml_img_without_resolver_falls_back() {
+        let html = "<html><body><img src=\"x.png\" alt=\"图A\"/></body></html>";
+        let no: Option<String> = None;
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone());
+        assert!(md.contains("[图片：图A]"), "无解析结果应输出占位，实际={md:?}");
     }
 
     #[test]
