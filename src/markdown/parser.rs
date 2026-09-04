@@ -85,6 +85,9 @@ pub struct Row {
     /// 图片源（kind == [Image] 时为 `![alt](src)` 的 src）。
     #[allow(dead_code)]
     pub src: Option<SharedString>,
+    /// 图片固有尺寸（像素，kind == [Image] 且 src 可解析时 Some）。用于按比例显示。
+    pub img_w: Option<u32>,
+    pub img_h: Option<u32>,
 }
 
 impl Row {
@@ -101,6 +104,8 @@ impl Row {
             prefix,
             table: None,
             src: None,
+            img_w: None,
+            img_h: None,
         }
     }
 
@@ -113,6 +118,8 @@ impl Row {
             prefix: None,
             table: Some(table),
             src: None,
+            img_w: None,
+            img_h: None,
         }
     }
 
@@ -125,6 +132,8 @@ impl Row {
             prefix: None,
             table: None,
             src: Some(src.into()),
+            img_w: None,
+            img_h: None,
         }
     }
 }

@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use gpui::{
     div, img, list, rgb, px, App, Context, FontWeight, Hsla, InteractiveElement, IntoElement,
-    ListAlignment, ListState, ParentElement, Pixels, Render, ScrollDelta, ScrollHandle,
+    ListAlignment, ListState, ObjectFit, ParentElement, Pixels, Render, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
@@ -27,8 +27,17 @@ use crate::markdown::parser::{parse_to_rows, Row, RowKind, TableAlign, TableData
 const ROW_OVERDRAW_PX: f32 = 600.0;
 /// 内容宽估算的额外缓冲（px），避免估算值微偏导致最后几个字符被截断。
 const WIDTH_BUFFER_PX: f32 = 24.0;
-/// 独立图片行的显示高度（px，contain 保持比例）。
-const IMAGE_ROW_H: f32 = 280.0;
+/// 未知尺寸图片行的默认显示高度（px）。
+const IMAGE_ROW_DEFAULT_H: f32 = 280.0;
+
+/// 图片固有宽度显示上限（px）：更宽的图按 contain 缩放，避免小图被拉大。
+const IMAGE_MAX_W: f32 = 600.0;
+
+/// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。
+fn be_u32(d: &[u8], at: usize) -> Option<u32> {
+    d.get(at..at + 4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
 
 /// 排版参数：渲染时从全局主题取一份“快照”，避免每行重复查主题。
 /// 所有取值都对齐 gpui_component `node.rs` 的 Markdown 渲染风格：
@@ -258,6 +267,69 @@ impl MarkdownPreview {
         base.join(src).to_string_lossy().to_string()
     }
 
+    /// 从本地图片文件头读取固有尺寸 (w, h)（不整图解码，快）。
+    /// 仅解析常见格式；失败返回 None，渲染回退到固定高度。
+    fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+        let data = std::fs::read(path).ok()?;
+        let d = data.as_slice();
+        if d.len() < 8 {
+            return None;
+        }
+        // PNG: 8 字节签名 + IHDR(4 长度 + 4 类型) + 宽高(各 4 大端)
+        if d.starts_with(&[0x89, b'P', b'N', b'G']) {
+            return Some((be_u32(d, 16)?, be_u32(d, 20)?));
+        }
+        // JPEG: 扫描段找 SOF0/SOF1/SOF2 (0xFFC0..0xFFC3)，高度在前
+        if d.starts_with(&[0xFF, 0xD8]) {
+            let mut i = 2usize;
+            while i + 9 < d.len() {
+                if d[i] != 0xFF {
+                    i += 1;
+                    continue;
+                }
+                let marker = d[i + 1];
+                if marker == 0xFF {
+                    i += 1;
+                    continue;
+                }
+                // standalone markers
+                if matches!(marker, 0xD8 | 0xD9 | 0x01 | 0xD0..=0xD7) {
+                    i += 2;
+                    continue;
+                }
+                if i + 4 > d.len() {
+                    break;
+                }
+                let seg_len = u16::from_be_bytes([d[i + 2], d[i + 3]]) as usize;
+                if matches!(marker, 0xC0..=0xC3) {
+                    return Some((
+                        u16::from_be_bytes([d[i + 7], d[i + 8]]) as u32,
+                        u16::from_be_bytes([d[i + 5], d[i + 6]]) as u32,
+                    ));
+                }
+                i += 2 + seg_len;
+            }
+            return None;
+        }
+        // GIF: "GIF87a"/"GIF89a" + 逻辑屏幕宽高（小端）
+        if d.starts_with(b"GIF8") {
+            return Some((
+                u16::from_le_bytes([d[6], d[7]]) as u32,
+                u16::from_le_bytes([d[8], d[9]]) as u32,
+            ));
+        }
+        // BMP: "BM" + 14 字节头后有 40 字节 DIB，宽高（有符号小端）
+        if d.starts_with(b"BM") && d.len() >= 26 {
+            let w = i32::from_le_bytes([d[18], d[19], d[20], d[21]]);
+            let h = i32::from_le_bytes([d[22], d[23], d[24], d[25]]);
+            if w > 0 {
+                return Some((w as u32, h.unsigned_abs()));
+            }
+            return None;
+        }
+        None
+    }
+
     /// 设置预览背景色（打开/同步时由应用传入，使预览与编辑区同底色）。
     pub fn set_background(&mut self, bg: Hsla) {
         self.bg = Some(bg);
@@ -320,14 +392,27 @@ impl MarkdownPreview {
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
         let base = self.base_dir.clone();
         let mut parsed = parse_to_rows(src);
-        // 相对图片路径基于文件目录解析为绝对路径（URL/绝对路径原样）
-        if let Some(base) = base {
-            for r in parsed.iter_mut() {
-                if r.kind == RowKind::Image {
-                    if let Some(s) = r.src.take() {
-                        r.src = Some(Self::resolve_image_src(&base, &s).into());
+        for r in parsed.iter_mut() {
+            if r.kind != RowKind::Image {
+                continue;
+            }
+            if let Some(s) = r.src.take() {
+                let resolved = if let Some(base) = &base {
+                    Self::resolve_image_src(base, &s)
+                } else {
+                    s.to_string()
+                };
+                // 本地文件 → 读固有尺寸（保持比例显示；URL/不可读时保持 None）
+                if !resolved.starts_with("http://")
+                    && !resolved.starts_with("https://")
+                    && !resolved.starts_with("file://")
+                {
+                    if let Some((w, h)) = Self::image_dimensions(std::path::Path::new(&resolved)) {
+                        r.img_w = Some(w);
+                        r.img_h = Some(h);
                     }
                 }
+                r.src = Some(resolved.into());
             }
         }
         let rows: Vec<Rc<Row>> = parsed.into_iter().map(Rc::new).collect();
@@ -588,12 +673,14 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
         let table = row.table.as_ref().expect("Table 行必须携带表格结构");
         return render_table(table, p).into_any_element();
     }
-    // 独立图片行：固定高度容器 + contain 内嵌 Img（保持比例、不裁切变形）。
+    // 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。
+    // 宽不超过 IMAGE_MAX_W；未知尺寸（URL/不可读）回退固定 IMAGE_ROW_DEFAULT_H。
     // src 为空/加载失败时显示 alt 作为 fallback。
     if let RowKind::Image = row.kind {
         let src = row.src.clone().unwrap_or_default().to_string();
         let alt = row.text.clone();
         let fallback_color = p.muted_fg;
+
         let img_el = if src.is_empty() {
             div()
                 .text_size(px(13.))
@@ -611,6 +698,7 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
                 std::path::PathBuf::from(&src).into()
             };
             img(source)
+                .object_fit(ObjectFit::Contain)
                 .w_full()
                 .h_full()
                 .with_fallback(move || {
@@ -625,17 +713,34 @@ fn render_row(row: &Rc<Row>, p: &Rc<StyleParams>, wrap: bool, _cx: &mut App) -> 
                 })
                 .into_any_element()
         };
+
+        // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
+        //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
+        // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
+        let img_w = row.img_w;
+        let img_h = row.img_h;
+        let box_ = match (img_w, img_h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => div()
+                .w_full()
+                .max_w(px(IMAGE_MAX_W))
+                .aspect_ratio(w as f32 / h as f32)
+                .debug_selector(|| "md-img-box".into()),
+            _ => div()
+                .w(px(IMAGE_MAX_W))
+                .max_w_full()
+                .h(px(IMAGE_ROW_DEFAULT_H))
+                .min_h(px(IMAGE_ROW_DEFAULT_H))
+                .debug_selector(|| "md-img-box".into()),
+        };
         return div()
             .w_full()
-            .min_h(px(IMAGE_ROW_H))
-            .h(px(IMAGE_ROW_H))
             .flex_shrink_0()
             .px_3()
             .py_1()
             .flex()
-            .items_center()
             .justify_center()
-            .child(img_el)
+            .items_center()
+            .child(box_.child(img_el))
             .into_any_element();
     }
 
@@ -1275,6 +1380,123 @@ mod tests {
             Some("https://example.com/a.png"),
             "URL 应保持原样，实际={:?}",
             srcs[2]
+        );
+
+        // 本地文件应读取固有尺寸（wuling.png=565x724，dify.jpg=1632x492）
+        let dims = cx.update(|_, cx| {
+            host.read(cx)
+                .md
+                .read(cx)
+                .rows
+                .iter()
+                .filter(|r| r.kind == RowKind::Image)
+                .map(|r| (r.img_w, r.img_h))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(dims[0], (Some(565), Some(724)), "wuling.png 尺寸期望 565x724，实际={:?}", dims[0]);
+        assert_eq!(dims[1], (Some(1632), Some(492)), "dify.jpg 尺寸期望 1632x492，实际={:?}", dims[1]);
+        assert_eq!(dims[2], (None, None), "URL 无本地尺寸，实际={:?}", dims[2]);
+    }
+
+    /// 实际渲染的图片行高度应按固有比例随可用宽度变化（aspect-ratio 驱动），
+    /// 缩小视口高度也随之缩小——不出现固定高度的大片留白。
+    #[gpui::test]
+    fn image_rows_height_follows_width(cx: &mut TestAppContext) {
+        use std::path::PathBuf;
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        let wabsp = r"C:\Users\c22500540\Pictures\wuling.png";
+        let md_src = format!("# 标题\n\n![w]({wabsp})\n\n![s](C:\\Users\\c22500540\\Pictures\\dify.jpg)\n");
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_base_dir(Some(PathBuf::from(r"C:\Users\c22500540\Pictures")));
+                md.set_source(&md_src, cx);
+            });
+        });
+
+        let measure = |cx: &mut VisualTestContext| -> (f32, f32) {
+            let (wh, dh) = cx.update(|_, cx| {
+                let md = host.read(cx).md.read(cx);
+                let wi = md
+                    .rows
+                    .iter()
+                    .position(|r| r.kind == RowKind::Image && r.text == "w")
+                    .expect("应有 wuling 图片行");
+                let di = md
+                    .rows
+                    .iter()
+                    .position(|r| r.kind == RowKind::Image && r.text == "s")
+                    .expect("应有 dify 图片行");
+                let wb = md.list_state.bounds_for_item(wi).expect("wuling 行应有 bounds");
+                let db = md.list_state.bounds_for_item(di).expect("dify 行应有 bounds");
+                (wb.size.height.as_f32(), db.size.height.as_f32())
+            });
+            (wh, dh)
+        };
+
+        // 宽视口 500px：wuling 宽=min(500-24, 600)=476 → 高=476*724/565≈610，限高后按比例
+        cx.simulate_resize(size(px(500.), px(800.)));
+        settle(cx);
+        let (w_wide, d_wide) = measure(cx);
+
+        // 窄视口 260px：wuling 宽=260-24=236 → 高=236*724/565≈302（成比例缩小）
+        cx.simulate_resize(size(px(260.), px(800.)));
+        settle(cx);
+        let (w_small, d_small) = measure(cx);
+
+        assert!(
+            w_small < w_wide - 50.0,
+            "缩小视口后图片行高度应明显变小：wide={w_wide:.0} small={w_small:.0}"
+        );
+        assert!(
+            d_small < d_wide - 50.0,
+            "dify 行高同样应随宽度缩小：wide={d_wide:.0} small={d_small:.0}"
+        );
+
+        // 图片盒水平居中：md-img-box 左缘 ≈ (视口宽 - 盒宽)/2
+        cx.simulate_resize(size(px(500.), px(800.)));
+        settle(cx);
+        let bo = cx
+            .debug_bounds("md-img-box")
+            .expect("图片盒 md-img-box 应存在");
+        let prev = cx
+            .debug_bounds("md-preview")
+            .expect("预览根 md-preview 应存在");
+        let view_w = prev.size.width.as_f32();
+        let expect_x = (view_w - bo.size.width.as_f32()) / 2.0;
+        assert!(
+            (bo.origin.x.as_f32() - expect_x).abs() < 2.0,
+            "图片盒应水平居中：盒宽={:.0}，期望左缘={expect_x:.0}，实际={:?}",
+            bo.size.width.as_f32(),
+            bo.origin
+        );
+
+        // 宽视口（预览 > 600）：盒宽应被 IMAGE_MAX_W 封顶并仍然居中
+        cx.simulate_resize(size(px(900.), px(800.)));
+        settle(cx);
+        let bo2 = cx
+            .debug_bounds("md-img-box")
+            .expect("图片盒 md-img-box 应存在(宽视口)");
+        let prev2 = cx
+            .debug_bounds("md-preview")
+            .expect("预览根 md-preview 应存在(宽视口)");
+        let view_w2 = prev2.size.width.as_f32();
+        assert!(
+            (bo2.size.width.as_f32() - IMAGE_MAX_W).abs() < 2.0,
+            "宽视口下图片盒宽应封顶 {IMAGE_MAX_W}，实际={:.0}",
+            bo2.size.width.as_f32()
+        );
+        let expect_x2 = (view_w2 - IMAGE_MAX_W) / 2.0;
+        assert!(
+            (bo2.origin.x.as_f32() - expect_x2).abs() < 2.0,
+            "宽视口下图片盒仍应水平居中：期望左缘={expect_x2:.0}，实际={:?}",
+            bo2.origin
         );
     }
 }
