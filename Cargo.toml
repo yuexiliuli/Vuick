@@ -30,3 +30,10 @@ gpui = { git = "https://github.com/zed-industries/zed", features = ["test-suppor
 
 [features]
 test-support = ["gpui/test-support"]
+
+[profile.release]
+opt-level = "z"        # 优化目标改为最小体积（而非速度）
+lto = true             # 跨 crate 链接时优化，消除重复代码
+strip = true           # 剥离符号表和调试信息
+panic = "abort"        # 移除 unwind 表
+codegen-units = 1      # 单线程编译，最大化优化机会（编译变慢）
