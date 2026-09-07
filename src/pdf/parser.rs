@@ -143,8 +143,28 @@ pub struct RenderResult {
     pub height: u32,
 }
 
+/// 一条 PDF 书签（目录项）：标题 + 层级 + 目标页码。
+///
+/// 由工作线程在打开文档时从 pdfium 书签树提取为**自包含**结构（不借用 pdfium），
+/// 可跨线程传到 [`PdfViewer`] 展示为目录。
+///
+/// [`PdfViewer`]: super::view::PdfViewer
+#[derive(Debug, Clone)]
+pub struct PdfOutlineEntry {
+    /// 书签标题。
+    pub title: String,
+    /// 树层级：顶层为 0，每深入一层 +1（用于缩进）。
+    pub level: usize,
+    /// 目标页码（0 基）。无目标页码时用 `usize::MAX`（不跳转）。
+    pub page_index: usize,
+}
+
 enum WorkerMsg {
-    Open(DocId, Vec<u8>, mpsc::Sender<Result<Vec<(f32, f32)>>>),
+    Open(
+        DocId,
+        Vec<u8>,
+        mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
+    ),
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
     Close(DocId),
 }
@@ -174,18 +194,27 @@ fn shared_worker() -> Result<&'static PdfWorker> {
 
 impl PdfWorker {
     /// 打开文档并取每页尺寸（结构解析，快）。成功则返回 (DocId, dims)，
-    /// 便于调用方同时得到文档句柄与页面布局数据。
+    /// 便于调用方同时得到文档句柄与页面布局数据。书签目录由 [`Self::open_and_dims_full`] 取。
     pub fn open_and_dims(bytes: Vec<u8>) -> Result<(Self, DocId, Vec<(f32, f32)>)> {
+        let (w, id, dims, _outlines) = Self::open_and_dims_full(bytes)?;
+        Ok((w, id, dims))
+    }
+
+    /// 打开文档并取每页尺寸 + 书签目录（结构解析，快）。
+    /// 成功则返回 (DocId, dims, outlines)，便于调用方同时得到文档句柄与页面布局、目录。
+    pub fn open_and_dims_full(
+        bytes: Vec<u8>,
+    ) -> Result<(Self, DocId, Vec<(f32, f32)>, Vec<PdfOutlineEntry>)> {
         let worker = shared_worker()?;
         let (tx, rx) = mpsc::channel();
         let doc_id = next_doc_id();
         let _ = worker.tx.send(WorkerMsg::Open(doc_id, bytes, tx));
-        let dims = match rx.recv() {
-            Ok(Ok(dims)) => dims,
+        let (dims, outlines) = match rx.recv() {
+            Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(anyhow::anyhow!("{e}")),
             Err(_) => return Err(anyhow::anyhow!("pdfium 工作线程已退出")),
         };
-        Ok((worker.clone(), doc_id, dims))
+        Ok((worker.clone(), doc_id, dims, outlines))
     }
 
     /// 请求渲染某页（异步）。返回一个接收结果的通道。
@@ -215,19 +244,20 @@ impl PdfWorker {
         while let Ok(msg) = rx.recv() {
             match msg {
                 WorkerMsg::Open(doc_id, bytes, tx) => {
-                    let dims = match pdfium.load_pdf_from_byte_vec(bytes, None) {
+                    let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
                         Ok(doc) => {
                             let dims: Vec<(f32, f32)> = doc
                                 .pages()
                                 .iter()
                                 .map(|p| (p.width().value, p.height().value))
                                 .collect();
+                            let outlines = extract_outline(&doc);
                             docs.insert(doc_id, doc);
-                            Ok(dims)
+                            Ok((dims, outlines))
                         }
                         Err(e) => Err(anyhow::anyhow!("PDF 解析失败：{e}")),
                     };
-                    let _ = tx.send(dims);
+                    let _ = tx.send(result);
                 }
                 WorkerMsg::Render(doc_id, req, tx) => {
                     let result = docs
@@ -248,6 +278,38 @@ fn next_doc_id() -> DocId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// 从文档书签树提取自包含的目录条目（标题 + 层级 + 目标页码）。
+///
+/// 深度优先先序展开（pdfium `bookmarks().iter()` 即 DF 先序）。每个书签的层级 =
+/// 其父链长度（`parent()` 链递推）；目标页码取书签指向的 destination，
+/// 解析失败（如指向外部/无页码）记为 `usize::MAX`。
+fn extract_outline(doc: &PdfDocument<'_>) -> Vec<PdfOutlineEntry> {
+    let mut out = Vec::new();
+    for bookmark in doc.bookmarks().iter() {
+        let title = bookmark.title().unwrap_or_default();
+        if title.trim().is_empty() {
+            continue;
+        }
+        let page_index = bookmark
+            .destination()
+            .and_then(|d| d.page_index().ok().map(|i| i as usize))
+            .unwrap_or(usize::MAX);
+        // 层级 = 父链长度
+        let mut level = 0usize;
+        let mut parent = bookmark.parent();
+        while let Some(p) = parent {
+            level += 1;
+            parent = p.parent();
+        }
+        out.push(PdfOutlineEntry {
+            title,
+            level,
+            page_index,
+        });
+    }
+    out
 }
 
 /// 在工作线程内：把单个页面栅格化，返回**紧凑 BGRA** 像素 + 尺寸。

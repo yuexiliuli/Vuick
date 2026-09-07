@@ -32,9 +32,13 @@ use gpui::{
     ParentElement, Render, RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement,
     Styled, Window,
 };
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::pdf::{render_image_from_bgra, DocId, PdfWorker, RenderRequest, RenderResult};
+use crate::pdf::{
+    render_image_from_bgra, DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult,
+};
 
 /// 页面统一显示基准宽（px，视口内按比例缩放）。
 const PAGE_WIDTH: f32 = 840.0;
@@ -363,6 +367,8 @@ pub struct PdfViewer {
     pending_drops: Vec<Arc<RenderImage>>,
     /// 磁盘二级页缓存：内存淘汰后读盘即得，来回翻页不重新栅格化。
     cache: PageCache,
+    /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。
+    outlines: Vec<PdfOutlineEntry>,
 }
 
 impl PdfViewer {
@@ -385,12 +391,13 @@ impl PdfViewer {
             bg: None,
             pending_drops: Vec::new(),
             cache,
+            outlines: Vec::new(),
         };
         this.start_load(cx);
         this
     }
 
-    /// 后台加载：读文件 + 经单例 pdfium 工作线程解析 + 量页，完成后在主线程铺页槽。
+    /// 后台加载：读文件 + 经单例 pdfium 工作线程解析 + 量页 + 书签目录，完成后在主线程铺页槽。
     fn start_load(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         cx.spawn(async move |weak, cx| {
@@ -398,18 +405,20 @@ impl PdfViewer {
                 .background_executor()
                 .spawn(async move {
                     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    // 进程级单例工作线程：打开文档 + 量页，返回句柄与 DocId
-                    let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes)
-                        .map_err(|e| format!("无法启动 pdfium：{e}"))?;
-                    Ok::<_, String>((worker, doc_id, dims))
+                    // 进程级单例工作线程：打开文档 + 量页 + 书签目录，返回句柄与 DocId
+                    let (worker, doc_id, dims, outlines) =
+                        PdfWorker::open_and_dims_full(bytes)
+                            .map_err(|e| format!("无法启动 pdfium：{e}"))?;
+                    Ok::<_, String>((worker, doc_id, dims, outlines))
                 })
                 .await;
             let _ = weak.update(cx, |this, cx| {
                 match result {
-                    Ok((worker, doc_id, dims)) => {
+                    Ok((worker, doc_id, dims, outlines)) => {
                         this.worker = Some(worker);
                         this.doc_id = doc_id;
                         this.dims = dims;
+                        this.outlines = outlines;
                         let (tops, total) = compute_layout(&this.dims, this.page_width());
                         this.page_tops = tops;
                         this.total_height = total;
@@ -426,6 +435,15 @@ impl PdfViewer {
             });
         })
         .detach();
+    }
+
+    /// 滚动到指定页（目录跳转）。页码越界时忽略。
+    pub fn scroll_to_page(&mut self, page_index: usize) {
+        if page_index >= self.dims.len() {
+            return;
+        }
+        let top = self.page_tops.get(page_index).copied().unwrap_or(0.0);
+        self.scroll.set_offset(gpui::point(px(0.), px(-top)));
     }
 
     /// 页数（测试 / 状态栏使用；文档尚未加载完时为 0）。
@@ -619,6 +637,107 @@ impl PdfViewer {
             cx.notify();
         }
     }
+
+    /// 右上角悬浮目录按钮：只有文档含书签时才渲染。
+    ///
+    /// 用 gpui-component 的 `Button` + `DropdownMenu`（与 markdown 预览目录一致）：
+    /// 点击弹出书签列表，条目按层级缩进；点击跳转到对应页。
+    fn render_toc_layer(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.outlines.is_empty() {
+            return Vec::new();
+        }
+        let outlines = self.outlines.clone();
+        let theme = gpui_component::Theme::global(cx);
+        let colors = theme.semantic_tokens().colors;
+        let fg = colors.foreground;
+        let weak = cx.weak_entity();
+
+        let trigger = Button::new("pdf-toc-toggle")
+            .label("≡ 目录")
+            .ghost()
+            .h(px(28.))
+            .rounded(px(6.))
+            .text_size(px(12.5))
+            .text_color(fg)
+            .dropdown_menu(
+                move |menu: PopupMenu, _window: &mut Window, cx: &mut Context<PopupMenu>| {
+                    let mut m = menu;
+                    let theme = gpui_component::Theme::global(cx);
+                    let colors = theme.semantic_tokens().colors;
+                    let fg = colors.foreground;
+                    let muted = colors.muted_foreground;
+                    let accent = colors.accent;
+                    for entry in outlines.iter() {
+                        let title = entry.title.clone();
+                        let level = entry.level;
+                        let has_page = entry.page_index != usize::MAX;
+                        let page = entry.page_index;
+                        let weak = weak.clone();
+                        let fg = fg.clone();
+                        let muted = muted.clone();
+                        let accent = accent.clone();
+                        let item = PopupMenuItem::element(move |_, _| {
+                            let indent = (level as f32) * 12.0;
+                            div()
+                                .w_full()
+                                .pl(px(indent))
+                                .pr_2()
+                                .py_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .w(px(5.))
+                                        .h(px(5.))
+                                        .rounded_full()
+                                        .bg(if level == 0 { accent } else { muted }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_size(px(13.))
+                                        .text_color(if has_page { fg } else { muted })
+                                        .child(title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(10.5))
+                                        .text_color(muted)
+                                        .child(if has_page {
+                                            (page + 1).to_string()
+                                        } else {
+                                            "—".into()
+                                        }),
+                                )
+                        });
+                        let item = item.on_click(move |_, _w, cx| {
+                            if has_page {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.scroll_to_page(page);
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        m = m.item(item);
+                    }
+                    m
+                },
+            );
+
+        vec![div()
+            .id("pdf-toc-wrap")
+            .debug_selector(|| "pdf-toc-wrap".into())
+            .absolute()
+            .top(px(8.))
+            .right(px(20.))
+            .child(trigger)
+            .into_any_element()]
+    }
 }
 
 impl Render for PdfViewer {
@@ -747,6 +866,7 @@ impl Render for PdfViewer {
                             .viewport_from_layout(),
                     ),
             )
+            .children(self.render_toc_layer(cx))
     }
 }
 

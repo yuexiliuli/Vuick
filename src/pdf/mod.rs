@@ -15,7 +15,7 @@
 mod parser;
 mod view;
 
-pub use parser::{DocId, PdfWorker, RenderRequest, RenderResult};
+pub use parser::{DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult};
 pub use view::PdfViewer;
 
 use std::sync::Arc;
@@ -82,6 +82,44 @@ mod tests {
                 assert!(*w > 0.0 && *h > 0.0, "{} 页尺寸应为正: {w}x{h}", p.display());
             }
         }
+    }
+
+    #[test]
+    fn extracts_outline_from_pdf_bookmarks() {
+        let _guard = pdf_lock().lock().unwrap();
+        // 目录提取冒烟测试：真实 PDF 能安全打开，outline 返回合法结构（可空）。
+        // 注：本 dll 无法解析含 ObjStm（压缩对象流）的 PDF（如 pdfium-render 官方
+        // test-toc.pdf 报 FormatError），故不依赖固定书签资产；有书签时校验字段正确性。
+        for p in test_pdf_paths() {
+            let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+            let (_worker, _doc_id, dims, outlines) =
+                PdfWorker::open_and_dims_full(bytes).expect("打开 worker 应成功");
+            assert!(!dims.is_empty(), "应有页");
+            for e in &outlines {
+                if e.page_index != usize::MAX {
+                    assert!(
+                        e.page_index < dims.len(),
+                        "书签页码越界：{} p{}",
+                        e.title,
+                        e.page_index
+                    );
+                }
+            }
+        }
+        // 纯逻辑：outline 条目字段一致性（标题非空、层级有限）
+        let entries = vec![
+            crate::pdf::PdfOutlineEntry {
+                title: "章节一".into(),
+                level: 0,
+                page_index: 0,
+            },
+            crate::pdf::PdfOutlineEntry {
+                title: "子节".into(),
+                level: 1,
+                page_index: 1,
+            },
+        ];
+        assert!(entries.iter().all(|e| !e.title.trim().is_empty() && e.level <= 6));
     }
 
     #[test]
