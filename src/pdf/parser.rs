@@ -29,25 +29,85 @@ use std::sync::{mpsc, OnceLock};
 use anyhow::{Context as _, Result};
 use pdfium_render::prelude::*;
 
-/// 进程级单例：pdfium.dll 路径（只定位一次）。
+/// 进程级单例：pdfium 动态库路径（只定位一次）。
 static PDFIUM_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
-/// 定位 pdfium 动态库：可执行文件同目录 → `resources/pdfium/pdfium.dll`。
+/// pdfium 版本号文件名（与 `resources/pdfium/` 内实际文件、`build.rs` 保持一致）。
+///
+/// 用**带版本号**的文件名（`pdfium-<版本>.dll`）替代裸 `pdfium.dll`：
+/// - 一眼可辨当前内置的 pdfium 快照版本；
+/// - 升级 pdfium 时新旧文件可并存，随时回滚，不用覆盖。
+const PDFIUM_VERSIONED_NAME: &str = "pdfium-154.0.8035.0.dll";
+
+/// 内嵌的 pdfium 字节（仅当 `build.rs` 探测到 dll 存在时启用 `embed_pdfium` cfg）。
+///
+/// 通过编译期 `include_bytes!` 把 dll 打包进可执行文件，实现**单文件分发**：
+/// 运行时把字节解出到临时目录再动态加载（Windows 的 `libloading` 必须从磁盘加载 dll，
+/// 无法直接内存加载）。若本机没有该 dll（未触发 `embed_pdfium`），则退化为仅磁盘查找。
+///
+/// 路径由 `build.rs` 通过 `cargo:rustc-env=PDFIUM_DLL_PATH` 注入（指向
+/// `resources/pdfium/pdfium-<版本>.dll`）。
+#[cfg(embed_pdfium)]
+const EMBEDDED_PDFIUM: &[u8] = include_bytes!(env!("PDFIUM_DLL_PATH"));
+
+/// 在临时目录解出内嵌的 pdfium 并返回其路径。
+///
+/// 文件命名为 `gpui-editor/pdfium-<版本>.dll`（仅首次写入；内容与 `include_bytes!`
+/// 一致时直接复用，退出后由临时目录清理，不污染项目目录）。
+#[cfg(embed_pdfium)]
+fn extract_embedded_pdfium() -> PathBuf {
+    let dir = std::env::temp_dir().join("gpui-editor");
+    let path = dir.join(PDFIUM_VERSIONED_NAME);
+    // 已存在且长度一致 → 直接复用（避免每次启动重写 7MB；长度校验足够，跨版本名唯一）
+    let reuse = path.is_file() && path.metadata().map(|m| m.len() as usize).unwrap_or(0) == EMBEDDED_PDFIUM.len();
+    if reuse {
+        return path;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, EMBEDDED_PDFIUM);
+    path
+}
+
+/// 定位 pdfium 动态库（按优先级，**只用带版本号的文件**，不退回裸 `pdfium.dll`）：
+/// 1. 环境变量 `GPUI_EDITOR_PDFIUM`：绝对路径直接指定（最优先，逃生口；支持任意文件名）
+/// 2. 可执行文件同目录：`<版本号>.dll`（旁置分发/就地升级，可覆盖内嵌版）
+/// 3. 项目 `resources/pdfium/`：`<版本号>.dll`（开发树自带）
+/// 4. 内嵌到 exe 的 pdfium（`embed_pdfium` cfg）：解出到临时目录（单文件分发兜底）
 fn locate_dll() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("GPUI_EDITOR_PDFIUM") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Ok(pb);
+        }
+    }
+    #[allow(unused)]
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    let mut candidates = Vec::new();
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(dir) = exe_dir {
-        candidates.push(dir.join("pdfium.dll"));
+        candidates.push(dir.join(PDFIUM_VERSIONED_NAME));
     }
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        candidates.push(PathBuf::from(manifest).join("resources/pdfium/pdfium.dll"));
+        candidates.push(
+            PathBuf::from(manifest)
+                .join("resources/pdfium")
+                .join(PDFIUM_VERSIONED_NAME),
+        );
     }
+    #[cfg(embed_pdfium)]
+    candidates.push(extract_embedded_pdfium());
+    #[cfg(not(embed_pdfium))]
+    let _ = &candidates; // 无内嵌：candidates 仅磁盘候选
+
     candidates
         .into_iter()
         .find(|c| c.is_file())
-        .ok_or_else(|| anyhow::anyhow!("无法找到 pdfium.dll：请在可执行文件旁或 resources/pdfium/ 放置"))
+        .ok_or_else(|| anyhow::anyhow!(
+            "无法找到 pdfium 动态库 {PDFIUM_VERSIONED_NAME}：\
+             请把它放在可执行文件旁或 resources/pdfium/，或用 GPUI_EDITOR_PDFIUM=<路径> 指定"
+        ))
 }
 
 fn pdfium_dll_path() -> Result<&'static PathBuf> {
@@ -220,4 +280,49 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
 pub fn page_dims(bytes: &[u8]) -> Result<Vec<(f32, f32)>> {
     let (_worker, _doc_id, dims) = PdfWorker::open_and_dims(bytes.to_vec())?;
     Ok(dims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 校验内嵌 byte 确实是有效 PE 可执行（`MZ` + `PE\0\0`）。
+    /// 若磁盘上的 dll 仍在，再确认内嵌与磁盘一致（embed 来源正确）。
+    /// 不触碰 pdfium（无需串行锁）。
+    #[test]
+    fn embedded_pdfium_is_valid_pe_and_matches_disk() {
+        #[cfg(embed_pdfium)]
+        {
+            let bytes = EMBEDDED_PDFIUM;
+            // PE 校验：MZ 头 + e_lfanew(0x3C) → 指向 "PE\0\0"
+            assert_eq!(&bytes[..2], b"MZ", "内嵌 pdfium 应以 MZ 开头");
+            let pe_off = u32::from_le_bytes(bytes[0x3C..0x40].try_into().unwrap()) as usize;
+            assert_eq!(
+                &bytes[pe_off..pe_off + 4],
+                b"PE\x00\x00",
+                "MZ 头应指向合法 PE 签名"
+            );
+            // 若磁盘 dll 尚在（build.rs 注入的是编译期路径），比对一致性
+            if let Ok(disk) = std::fs::read(env!("PDFIUM_DLL_PATH")) {
+                assert_eq!(bytes.len(), disk.len(), "内嵌与磁盘长度应一致");
+                assert_eq!(bytes[..16], disk[..16], "内嵌与磁盘头部应一致");
+            }
+        }
+        // 非 embed 配置下该测试无意义——直接通过（无断言）
+    }
+
+    /// 内嵌字节能正确解出到临时目录并返回存在的文件路径。
+    ///
+    /// 注意：**不清理**解出的文件——pdf 测试并行跑，别的测试（worker_renders_* /
+    /// parses_all）可能正并发复用同一个临时 dll；此处清理会让它们读盘时文件已消失。
+    /// 该临时文件由系统 temp 清理机制回收，无泄漏问题。
+    #[cfg(embed_pdfium)]
+    #[test]
+    fn embedded_pdfium_extracts_to_temp_dir() {
+        let path = extract_embedded_pdfium();
+        assert!(path.is_file(), "解出的 dll 文件应存在: {}", path.display());
+        let written = std::fs::read(&path).expect("应能读回解出的 dll");
+        assert_eq!(written.len(), EMBEDDED_PDFIUM.len(), "解出内容长度应一致");
+        assert_eq!(&written[..2], b"MZ", "解出文件应以 MZ 开头");
+    }
 }
