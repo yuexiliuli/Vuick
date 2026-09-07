@@ -804,6 +804,7 @@
     /// 加载完成后全屏只读预览，解析为页级位图而非 Markdown 文本。
     #[gpui::test]
     async fn opens_pdf_and_shows_preview(cx: &mut TestAppContext) {
+        let _pdf_guard = crate::pdf::test_util::lock().lock().unwrap();
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -861,6 +862,7 @@
     /// 现在应为页级虚拟化——结构解析秒级完成，进 UI 后按需渲染。
     #[gpui::test]
     async fn opens_long_pdf_virtualized(cx: &mut TestAppContext) {
+        let _pdf_guard = crate::pdf::test_util::lock().lock().unwrap();
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));

@@ -8,19 +8,33 @@
 //!   缓冲），只对这些页在后台栅格化；渲染按“离可见区中心最近优先”填充。
 //! - **回收**：滚离视口的页释放位图 + GPU 纹理（`drop_image`），内存受限。
 //! - **不闪烁**：页槽先是有尺寸占位（页号/加载中），位图到位后替换，布局稳定。
+//!
+//! ## 性能优化（相对旧版）
+//!
+//! 1. **页列 DOM 虚拟化**：`render()` 每帧只构建「可见页 + MARGIN 缓冲」这几张页面卡片
+//!    并以绝对定位铺在等高的“全文档高度”容器里（[`compute_layout`]），
+//!    不再把几百上千页全部 `div()` 出来布局——长文档滚动/换帧开销从 O(页数) 降到 O(可见页)。
+//! 2. **磁盘二级缓存 = 原始 BGRA**：[`PageCache`] 落盘的是**去 stride 的紧凑 BGRA**，
+//!    不再经 PNG 压缩。翻回已淘汰页时直接读盘 + `Frame::from_raw`（毫秒级），
+//!    彻底去掉旧版的 PNG 解码（≈128ms 主线程冻结）。PNG 编码也退出 pdfium 工作线程
+//!    （旧版每次渲染都在 worker 里编码，白白拖慢后续页面排队）。
+//! 3. **在途请求节流** [`MAX_INFLIGHT`]：同时排队给 pdfium 线程的请求不超过 N 个。
+//!    单线程 pdfium 串行渲染吞吐不变，但快速滚动时不会无限堆积过期请求——
+//!    停止滚动后「正在看的那页」最多等 N-1 个在途页，不再被几十个旧请求插队。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use gpui::{
     div, img, px, rgb, App, Context, Hsla, ImageSource, InteractiveElement, IntoElement,
-    ParentElement, Render, RenderImage, ScrollHandle, StatefulInteractiveElement, Styled, Window,
+    ParentElement, Render, RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::pdf::{
-    page_dims, parse_bytes, render_image_from_bytes, render_page_bytes, Document,
-};
+use crate::pdf::{render_image_from_bgra, DocId, PdfWorker, RenderRequest, RenderResult};
 
 /// 页面统一显示基准宽（px，视口内按比例缩放）。
 const PAGE_WIDTH: f32 = 840.0;
@@ -39,6 +53,126 @@ const MARGIN: usize = 3;
 /// 到磁盘缓存；翻回时从磁盘恢复（毫秒级），不重新栅格化。
 /// 只保留近视口的几页在 RAM，其余靠磁盘：几百页文档内存也稳定在几十 MB。
 const CACHE_MAX_PAGES: usize = 8;
+/// 同时排队给 pdfium 工作线程的**在途渲染请求上限**。pdfium 是单线程串行渲染，
+/// 该上限不改变吞吐，但能遏制「快速滚动 → 请求无限堆积」：停止滚动后正在看的那页
+/// 最多排在 N-1 个在途页之后，即最多等 (N-1)×单页耗时，而不是几十个旧请求。
+const MAX_INFLIGHT: usize = 2;
+
+/// 磁盘缓存文件头魔数（4 字节）+ 宽高各 4 字节 + 紧凑 BGRA 像素。
+const CACHE_MAGIC: &[u8; 4] = b"GPBG";
+const CACHE_HEADER: usize = 12;
+/// 磁盘缓存在磁盘上最多保留的页数（LRU 淘汰到该上限）。
+///
+/// 光栅化本身已很快（~11ms/页，无 PNG 编码），磁盘缓存只是「翻回这几页」时免重算的
+/// 安全网（对慢页/密集页尤其值）；用预算封顶，避免原始 BGRA（~2.8MB/页）把临时目录
+/// 撑爆。此值略大于内存预算 [`CACHE_MAX_PAGES`]，保证常见的短程回翻都命中。
+const CACHE_DISK_PAGES: usize = 32;
+
+/// 磁盘二级页缓存：内存页位图预算淘汰后，把页以**紧凑 BGRA**（去 stride）落盘为每页一个
+/// 文件；再次翻回时**直接读盘、`Frame::from_raw` 重建** `RenderImage`（毫秒级），
+/// 无需重新栅格化。磁盘页数用 LRU 封顶到 [`CACHE_DISK_PAGES`]，避免原始 BGRA 撑爆临时目录。
+///
+/// 写入由调用方放到**后台 executor**（异步）；读回在主线程（NVMe ~1ms，可接受）。
+/// 状态（关闭标记 + LRU 顺序）放在 [`CacheInner`] 里由异步写与主线程读共享。
+#[derive(Debug)]
+struct CacheInner {
+    dir: PathBuf,
+    /// 已关闭标记：`clear()` 后置位，阻止迟到的后台落盘任务重建目录。
+    closed: AtomicBool,
+    /// 目前在磁盘上的页号（最近使用在队尾）。
+    lru: std::sync::Mutex<Vec<usize>>,
+    /// 磁盘页数上限。LRU 淘汰到该上限。
+    budget: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct PageCache {
+    inner: Arc<CacheInner>,
+}
+
+impl PageCache {
+    /// 以 `pdf_path` 的文件名在系统临时目录开一个分片缓存目录。
+    pub fn new(pdf_path: &Path) -> Self {
+        let dir = std::env::temp_dir()
+            .join("gpui-editor-pdf-cache")
+            .join(fingerprint(pdf_path));
+        // 沿用旧格式目录（可能残留 `.bin`/`.png` 旧缓存文件）不主动清理；读盘按魔数跳过损坏文件。
+        Self {
+            inner: Arc::new(CacheInner {
+                dir,
+                closed: AtomicBool::new(false),
+                lru: std::sync::Mutex::new(Vec::new()),
+                budget: CACHE_DISK_PAGES,
+            }),
+        }
+    }
+
+    /// 从磁盘读取某页 BGRA（缺失/损坏返回 None）。供主线程快速恢复：
+    /// 命中后直接 `render_image_from_bgra`，毫秒级、无冻结。
+    pub fn load_bgra(&self, idx: usize) -> Option<(Vec<u8>, u32, u32)> {
+        if self.inner.closed.load(Ordering::Relaxed) {
+            return None;
+        }
+        let path = self.inner.dir.join(format!("{idx:05}.bin"));
+        let data = std::fs::read(path).ok()?;
+        if data.len() < CACHE_HEADER || &data[..4] != CACHE_MAGIC {
+            return None;
+        }
+        let w = u32::from_le_bytes(data[4..8].try_into().ok()?);
+        let h = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        let expect = CACHE_HEADER + (w as usize) * (h as usize) * 4;
+        if data.len() != expect {
+            return None;
+        }
+        let bgra = data[CACHE_HEADER..].to_vec();
+        // 标记为最近使用
+        if let Ok(mut lru) = self.inner.lru.lock() {
+            lru.retain(|&p| p != idx);
+            lru.push(idx);
+            let excess = lru.len().saturating_sub(self.inner.budget);
+            if excess > 0 {
+                lru.drain(0..excess);
+            }
+        }
+        Some((bgra, w, h))
+    }
+
+    /// 清理本 PDF 的整个缓存目录（关闭标签页时调用）。
+    pub fn clear(&self) {
+        self.inner.closed.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&self.inner.dir);
+    }
+}
+
+/// 后台落盘：把一页紧凑 BGRA 写成 `idx.bin`（带魔数与宽高头），并按 LRU 封顶磁盘页数。
+/// 在后台 executor 执行，不触碰主线程 / pdfium 工作线程。
+fn save_bgra(inner: Arc<CacheInner>, idx: usize, bgra: Vec<u8>, w: u32, h: u32) {
+    if inner.closed.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&inner.dir);
+    let mut data = Vec::with_capacity(CACHE_HEADER + bgra.len());
+    data.extend_from_slice(CACHE_MAGIC);
+    data.extend_from_slice(&w.to_le_bytes());
+    data.extend_from_slice(&h.to_le_bytes());
+    data.extend_from_slice(&bgra);
+    let _ = std::fs::write(inner.dir.join(format!("{idx:05}.bin")), data);
+    // 超出预算：淘汰最久未用的页（异步删除，失败静默）
+    let evict: Vec<usize> = {
+        let mut lru = inner.lru.lock().unwrap_or_else(|e| e.into_inner());
+        lru.retain(|&p| p != idx);
+        lru.push(idx);
+        if lru.len() > inner.budget {
+            let extra = lru.len() - inner.budget;
+            lru.drain(0..extra).collect()
+        } else {
+            Vec::new()
+        }
+    };
+    for page in evict {
+        let _ = std::fs::remove_file(inner.dir.join(format!("{page:05}.bin")));
+    }
+}
 
 /// 页槽：某页的渲染状态。
 #[derive(Default, Clone)]
@@ -60,6 +194,25 @@ fn display_height((w, h): (f32, f32), page_width: f32) -> f32 {
     }
 }
 
+/// 预先计算整列布局：每页的 top 偏移（`PAGE_PAD_Y` + 前缀和）与整列总高。
+///
+/// 与 [`keep_window`] / [`render`](PdfViewer::render) 的绝对定位**使用同一套数学**，
+/// 保证滚动位置推算与 DOM 位置严格一致（否则可见页会被误判）。
+fn compute_layout(dims: &[(f32, f32)], page_width: f32) -> (Vec<f32>, f32) {
+    let mut tops = Vec::with_capacity(dims.len());
+    let mut y = PAGE_PAD_Y;
+    for dim in dims {
+        tops.push(y);
+        y += display_height(*dim, page_width) + PAGE_GAP;
+    }
+    let last = dims.last().copied();
+    let total = match last {
+        Some(dim) => tops[dims.len() - 1] + display_height(dim, page_width) + PAGE_PAD_Y,
+        None => PAGE_PAD_Y * 2.0,
+    };
+    (tops, total)
+}
+
 /// 可见页区间（含缓冲）：与页列布局镜像，纯函数便于测试。
 ///
 /// `scroll_y` 为内容已向下滚动的像素数（≥0）；`viewport_h` 为可见区高度。
@@ -75,20 +228,24 @@ fn keep_window(
     let vh = if viewport_h > 1.0 { viewport_h } else { 720.0 };
     let top = scroll_y.max(0.0);
     let bottom = top + vh;
+    let (tops, _) = compute_layout(dims, page_width);
 
-    let mut y = PAGE_PAD_Y;
-    let mut first: Option<usize> = None;
-    let mut last = 0usize;
+    // 第一页「页面底 > 视口顶」
+    let mut first = 0usize;
     for (i, dim) in dims.iter().enumerate() {
-        let page_top = y;
-        let page_bottom = y + display_height(*dim, page_width);
-        if page_bottom > top && page_top < bottom {
-            first.get_or_insert(i);
-            last = i;
+        if tops[i] + display_height(*dim, page_width) > top {
+            first = i;
+            break;
         }
-        y = page_bottom + PAGE_GAP;
     }
-    let first = first.unwrap_or(0);
+    // 最后一页「页面顶 < 视口底」
+    let mut last = 0usize;
+    for i in (0..dims.len()).rev() {
+        if tops[i] < bottom {
+            last = i;
+            break;
+        }
+    }
     let start = first.saturating_sub(MARGIN);
     let end = (last + MARGIN).min(dims.len() - 1);
     (start, end)
@@ -152,88 +309,7 @@ fn plan_page_work(
     to_evict.sort_unstable();
     (to_render, to_evict)
 }
-
-/// 磁盘二级页缓存：内存页位图预算淘汰后，把页以 **PNG 压缩** 落盘为每页一个文件；
-/// 再次翻回时**直接读盘解码**重建 `RenderImage`（毫秒级），无需重新栅格化
-/// （重栅格化 ≈ 秒级）。PNG 编码让空白为主的 PDF 页压缩 10~50 倍，避免临时目录膨胀。
-#[derive(Clone, Debug)]
-pub struct PageCache {
-    /// 缓存目录（每个 PDF 一个独立子目录；None 表示用户目录不可用，退化为纯内存）。
-    dir: Option<PathBuf>,
-}
-
-impl PageCache {
-    /// 以 `pdf_path` 的文件名在系统临时目录开一个分片缓存目录。
-    pub fn new(pdf_path: &Path) -> Self {
-        let dir = std::env::temp_dir()
-            .join("gpui-editor-pdf-cache")
-            .join(fingerprint(pdf_path));
-        let _ = std::fs::create_dir_all(&dir);
-        Self { dir: Some(dir) }
-    }
-
-    fn page_file(&self, idx: usize) -> Option<PathBuf> {
-        self.dir.as_ref().map(|d| d.join(format!("{idx:05}.png")))
-    }
-
-    /// 保存某页位图（BGRA 字节 → PNG 落盘；失败静默忽略——缓存是尽力而为）。
-    pub fn save(&self, idx: usize, bgra: &[u8], w: u32, h: u32) {
-        let Some(path) = self.page_file(idx) else {
-            return;
-        };
-        let png = encode_bgra_png(bgra, w, h);
-        if let Some(png) = png {
-            let _ = std::fs::write(path, png);
-        }
-    }
-
-    /// 从磁盘读取某页位图（PNG → BGRA 字节；缺失/损坏返回 None）。
-    pub fn load(&self, idx: usize) -> Option<(Vec<u8>, u32, u32)> {
-        let path = self.page_file(idx)?;
-        let data = std::fs::read(path).ok()?;
-        decode_png_bgra(&data)
-    }
-
-    /// 清理本 PDF 的整个缓存目录（关闭标签页时调用）。
-    pub fn clear(&self) {
-        if let Some(dir) = &self.dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
-/// 把 BGRA 像素字节编码为 PNG（内部先换成 RGBA 再交给 PngEncoder）。
-fn encode_bgra_png(bgra: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let mut rgba = Vec::with_capacity(bgra.len());
-    for px in bgra.chunks_exact(4) {
-        rgba.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // B,G,R,A -> R,G,B,A
-    }
-    let img = image::RgbaImage::from_raw(w, h, rgba)?;
-    let mut out = Vec::new();
-    let enc = image::codecs::png::PngEncoder::new(&mut out);
-    use image::ImageEncoder as _;
-    enc.write_image(
-        img.as_raw(),
-        w,
-        h,
-        image::ExtendedColorType::Rgba8,
-    )
-    .ok()?;
-    Some(out)
-}
-
-/// 从 PNG 字节解码回 BGRA 像素 + (宽, 高)。
-fn decode_png_bgra(data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let img = image::load_from_memory(data).ok()?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut bgra = Vec::with_capacity(rgba.len() * 4);
-    for px in rgba.as_raw().chunks_exact(4) {
-        bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]); // R,G,B,A -> B,G,R,A
-    }
-    Some((bgra, w, h))
-}
-
+ 
 /// 用文件名做缓存目录指纹（防路径含非法字符）。
 fn fingerprint(path: &Path) -> String {
     let name = path
@@ -259,14 +335,22 @@ fn sanitize(s: &str) -> String {
 pub struct PdfViewer {
     /// 文件路径（含文件名，标题用）。
     path: PathBuf,
-    /// 已解析文档（加载完成后为 `Some`）。
-    pdf: Option<Arc<Document>>,
+    /// 进程级 pdfium 工作线程句柄（加载完成后为 `Some`）。
+    worker: Option<PdfWorker>,
+    /// 本阅读器在该工作线程中打开的文档编号。
+    doc_id: DocId,
     /// 每页 (宽,高)（PDF 点）。
     dims: Vec<(f32, f32)>,
+    /// 每页 top 偏移（`compute_layout` 结果，渲染定位 + 可见区推算共用）。
+    page_tops: Vec<f32>,
+    /// 整列总高（含上下内边距）。
+    total_height: f32,
     /// 每页渲染槽。
     slots: Vec<Slot>,
     /// 渲染代次（缩放/质量变化时递增使旧位图失效）。
     generation: u64,
+    /// 在途渲染请求的结果接收通道（worker 线程回传）。
+    pending: HashMap<usize, mpsc::Receiver<Option<RenderResult>>>,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     scroll: ScrollHandle,
     /// 是否仍在后台解析。
@@ -287,10 +371,14 @@ impl PdfViewer {
         let cache = PageCache::new(&path);
         let mut this = Self {
             path,
-            pdf: None,
+            worker: None,
+            doc_id: 0,
             dims: Vec::new(),
+            page_tops: Vec::new(),
+            total_height: 0.0,
             slots: Vec::new(),
             generation: 0,
+            pending: HashMap::new(),
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
@@ -302,7 +390,7 @@ impl PdfViewer {
         this
     }
 
-    /// 后台加载：读文件 + 解析 + 量页，完成后在主线程铺页槽。
+    /// 后台加载：读文件 + 经单例 pdfium 工作线程解析 + 量页，完成后在主线程铺页槽。
     fn start_load(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         cx.spawn(async move |weak, cx| {
@@ -310,16 +398,21 @@ impl PdfViewer {
                 .background_executor()
                 .spawn(async move {
                     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                    let doc = parse_bytes(bytes).map_err(|e| e.to_string())?;
-                    let dims = page_dims(&doc);
-                    Ok::<_, String>((doc, dims))
+                    // 进程级单例工作线程：打开文档 + 量页，返回句柄与 DocId
+                    let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes)
+                        .map_err(|e| format!("无法启动 pdfium：{e}"))?;
+                    Ok::<_, String>((worker, doc_id, dims))
                 })
                 .await;
             let _ = weak.update(cx, |this, cx| {
                 match result {
-                    Ok((doc, dims)) => {
-                        this.pdf = Some(doc);
+                    Ok((worker, doc_id, dims)) => {
+                        this.worker = Some(worker);
+                        this.doc_id = doc_id;
                         this.dims = dims;
+                        let (tops, total) = compute_layout(&this.dims, this.page_width());
+                        this.page_tops = tops;
+                        this.total_height = total;
                         this.slots = vec![Slot::default(); this.dims.len()];
                         this.loading = false;
                         cx.notify();
@@ -344,7 +437,7 @@ impl PdfViewer {
     /// 是否已加载完成（测试用）。
     #[allow(dead_code)]
     pub fn is_loaded(&self) -> bool {
-        self.pdf.is_some()
+        !self.loading && self.worker.is_some() && !self.dims.is_empty()
     }
 
     /// 设置阅读画布背景色。
@@ -370,12 +463,18 @@ impl PdfViewer {
         }
     }
 
-    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），并清空磁盘缓存。
+    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），关闭 worker 侧文档并清空磁盘缓存。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut drops = std::mem::take(&mut self.pending_drops);
         drops.extend(self.slots.iter_mut().filter_map(|s| s.image.take()));
         for arc in drops {
             cx.drop_image(arc, Some(window));
+        }
+        if let Some(worker) = &self.worker {
+            if self.doc_id != 0 {
+                worker.close(self.doc_id);
+                self.doc_id = 0;
+            }
         }
         self.cache.clear();
     }
@@ -390,15 +489,19 @@ impl PdfViewer {
         for arc in std::mem::take(&mut self.pending_drops) {
             cx.drop_image(arc, Some(window));
         }
-        if self.dims.is_empty() || self.pdf.is_none() {
+        if self.dims.is_empty() || self.worker.is_none() {
             return;
         }
+        let generation = self.generation;
+
+        // 1) 回收本帧已完成的在途渲染结果（GPT 主线程，BGRA 直包 + 异步落盘）
+        self.collect_results(cx);
+
         let page_width = self.page_width();
         let scale_factor = window.scale_factor();
         let scroll_y = f32::from(-self.scroll.offset().y);
         let viewport_h = f32::from(self.scroll.bounds().size.height);
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
-        let generation = self.generation;
 
         // 规划：要渲染的页 + 要淘汰位图的页（保留策略见 plan_page_work）
         let rendered: Vec<bool> = self.slots.iter().map(|s| s.image.is_some()).collect();
@@ -418,14 +521,14 @@ impl PdfViewer {
         for arc in to_evict {
             cx.drop_image(arc, Some(window));
         }
-        // 先尝试磁盘二级缓存：命中则直接恢复位图，不派发栅格化任务（毫秒级）；
+        // 先尝试磁盘二级缓存：命中则直接读盘重建位图（毫秒级），不派发栅格化任务；
         // 未命中才需要真正栅格化。
         let mut need_render: Vec<usize> = Vec::new();
         for &i in &to_render {
             let cached = self
                 .cache
-                .load(i)
-                .and_then(|(bytes, w, h)| render_image_from_bytes(bytes, w, h).ok());
+                .load_bgra(i)
+                .and_then(|(bgra, w, h)| render_image_from_bgra(bgra, w, h).ok());
             match cached {
                 Some(img) => {
                     self.slots[i].loading = false;
@@ -443,44 +546,77 @@ impl PdfViewer {
         let center = (start + end) / 2;
         need_render.sort_by_key(|&i| (i as i64 - center as i64).unsigned_abs());
 
-        let pdf = self.pdf.clone().unwrap();
-        let cache = self.cache.clone();
-        for i in need_render {
+        // 2) 派发渲染请求给进程级 pdfium 工作线程；已在途（loading）的页绝不重复派发；
+        //    同时用 MAX_INFLIGHT 节流，防止快速滚动时请求无限堆积。
+        let inflight = self.pending.len();
+        let budget = MAX_INFLIGHT.saturating_sub(inflight);
+        if budget == 0 {
+            return;
+        }
+        let worker = self.worker.as_ref().unwrap();
+        for i in need_render.into_iter().take(budget) {
+            if self.slots[i].loading {
+                continue;
+            }
             self.slots[i].loading = true;
-            let pdf = pdf.clone();
-            let cache = cache.clone();
             let scale = render_scale(page_width, scale_factor, self.dims[i].0);
-            cx.spawn(async move |weak, cx| {
-                // 后台栅格化（返回裸字节 + 尺寸），顺带落盘二级缓存
-                let page = cx
-                    .background_executor()
-                    .spawn(async move { render_page_bytes(&pdf, i, scale).ok() })
-                    .await;
-                let _ = weak.update(cx, |this, cx| {
-                    // 先落盘（尽力而为），再从字节重建 RenderImage 装进内存槽
-                    let mut stored: Option<Arc<RenderImage>> = None;
-                    if let Some((bytes, w, h)) = page {
-                        cache.save(i, &bytes, w, h);
-                        stored = render_image_from_bytes(bytes, w, h).ok();
-                    }
-                    let gen_now = this.generation;
-                    let mut retired = None;
-                    if let Some(slot) = this.slots.get_mut(i) {
-                        slot.loading = false;
-                        if gen_now == generation {
-                            if let Some(img) = stored {
-                                retired = slot.image.replace(img);
-                                slot.generation = generation;
-                            }
-                        }
-                    }
-                    if let Some(old) = retired {
-                        this.pending_drops.push(old);
-                    }
-                    cx.notify();
-                });
+            let rx = worker.request_render(self.doc_id, RenderRequest { page: i, scale });
+            self.pending.insert(i, rx);
+        }
+    }
+
+    /// 回收已完成的在途渲染结果：worker 回传 BGRA → 重建 `RenderImage` 装入内存槽
+    /// （代次未变才装；被淘汰/失效的槽只清 loading 允许重投）→ **异步落盘**二级缓存。
+    /// 非阻塞：仅检查已就绪通道，未完成的留到下一帧。
+    fn collect_results(&mut self, cx: &mut Context<Self>) {
+        let generation = self.generation;
+        let finished: Vec<(usize, Option<RenderResult>)> = self
+            .pending
+            .iter_mut()
+            .filter_map(|(i, rx)| match rx.try_recv() {
+                Ok(res) => Some((*i, res)),
+                Err(_) => None,
             })
-            .detach();
+            .collect();
+        let mut ready: Vec<(usize, Arc<RenderImage>)> = Vec::new();
+        for (i, res) in finished {
+            self.pending.remove(&i);
+            match res {
+                Some(res) => {
+                    let (w, h) = (res.width, res.height);
+                    // 后台异步落盘紧凑 BGRA（写盘/LRU 淘汰不在主线程、不在 pdfium worker）
+                    let cache_inner = self.cache.inner.clone();
+                    let bgra = res.bgra.clone();
+                    cx.background_executor()
+                        .spawn(async move { save_bgra(cache_inner, i, bgra, w, h) })
+                        .detach();
+                    // 主线程快路径：BGRA 直接包裹（零像素循环），worker 已排好字节序
+                    if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
+                        ready.push((i, img));
+                    }
+                }
+                None => {
+                    if let Some(slot) = self.slots.get_mut(i) {
+                        slot.loading = false; // 渲染失败，允许之后重试
+                    }
+                }
+            }
+        }
+        let mut any = false;
+        for (i, img) in ready {
+            if let Some(s) = self.slots.get_mut(i) {
+                s.loading = false;
+                if generation == self.generation {
+                    s.generation = generation;
+                    if let Some(old) = s.image.replace(img) {
+                        self.pending_drops.push(old);
+                    }
+                }
+            }
+            any = true;
+        }
+        if any {
+            cx.notify();
         }
     }
 }
@@ -491,8 +627,6 @@ impl Render for PdfViewer {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let (page_bg, page_border) = Self::page_card_colors(cx);
         let page_width = self.page_width();
-        let dims = self.dims.clone();
-        let slots = &self.slots;
 
         // 错误 / 加载中 / 已加载三种状态
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
@@ -518,16 +652,26 @@ impl Render for PdfViewer {
                 .child("正在解析 PDF…")
                 .into_any_element()
         } else {
-            // 页列：每页一个固定宽高（宽高比不变）的页槽卡片，位图到位即替换占位。
-            // 页间距必须与 keep_window/plan_page_work 的虚拟布局一致（PAGE_GAP），
-            // 否则按滚动位置推算的“可见/保留窗口”会随页数漂移，导致可见页被误判淘汰。
-            let mut column =
-                div().id("pdf-pages").flex().flex_col().gap(px(PAGE_GAP)).w(px(page_width));
-            for (i, dim) in dims.iter().enumerate() {
-                let disp_h = display_height(*dim, page_width);
+            // **页列 DOM 虚拟化**：scroll 容器里放一个「全文档总高」的定位容器，
+            // 只把可见页 ± MARGIN 的卡片以绝对定位铺进去。整列高度 = total_height，
+            // 所以滚动条范围从一开始就正确；远页（几千页时）不参与本帧 DOM/布局。
+            let scroll_y = f32::from(-self.scroll.offset().y);
+            let viewport_h = f32::from(self.scroll.bounds().size.height);
+            let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
+            let tops = &self.page_tops;
+            let total = self.total_height;
+            let slots = &self.slots;
+
+            let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
+            for i in start..=end {
+                let disp_h = display_height(self.dims[i], page_width);
+                let top = tops[i];
                 let slot_img = slots.get(i).and_then(|s| s.image.clone());
-                let card = div()
-                    .id(gpui::SharedString::from(format!("pdf-page-{i}")))
+                let mut card = div()
+                    .id(SharedString::from(format!("pdf-page-{i}")))
+                    .absolute()
+                    .top(px(top))
+                    .left(px(0.))
                     .flex_shrink_0()
                     .w(px(page_width))
                     .h(px(disp_h))
@@ -535,7 +679,7 @@ impl Render for PdfViewer {
                     .border_1()
                     .border_color(page_border)
                     .overflow_hidden();
-                let card = match slot_img {
+                card = match slot_img {
                     Some(page_img) => card.child(
                         img(ImageSource::Render(page_img))
                             .w(px(page_width))
@@ -553,9 +697,18 @@ impl Render for PdfViewer {
                                 .child(format!("第 {} 页 加载中…", i + 1)),
                         ),
                 };
-                column = column.child(card);
+                cards.push(card.into_any_element());
             }
-            // 竖向滚动容器 + 页列（水平居中，宽 = 页宽，高自适应溢出）
+
+            let content = div()
+                .id("pdf-pages")
+                .debug_selector(|| "pdf-pages".into())
+                .relative()
+                .w(px(page_width))
+                .h(px(total))
+                .children(cards);
+
+            // 竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
             div()
                 .id("pdf-scroll")
                 .debug_selector(|| "pdf-scroll".into())
@@ -570,8 +723,7 @@ impl Render for PdfViewer {
                         .flex_row()
                         .justify_center()
                         .px(px(PAGE_PAD_X))
-                        .py(px(PAGE_PAD_Y))
-                        .child(column),
+                        .child(content),
                 )
                 .into_any_element()
         };
@@ -624,6 +776,27 @@ mod tests {
     }
 
     #[test]
+    fn compute_layout_is_monotonic_and_bounded() {
+        let dims: Vec<(f32, f32)> = vec![a4(); 100];
+        let (tops, total) = compute_layout(&dims, 840.0);
+        assert_eq!(tops.len(), 100);
+        assert_eq!(tops[0], PAGE_PAD_Y, "首页 top = 顶部内边距");
+        for i in 1..100 {
+            assert!(
+                tops[i] > tops[i - 1],
+                "top 应严格递增：第 {i} 页 top={} < 前一页 top={}",
+                tops[i],
+                tops[i - 1]
+            );
+        }
+        let last = tops[99] + display_height(dims[99], 840.0);
+        assert!(
+            (total - (last + PAGE_PAD_Y)).abs() < 0.01,
+            "总高 = 末页底 + 底部内边距：total={total}, last={last}"
+        );
+    }
+
+    #[test]
     fn plan_renders_only_unrendered_visible_pages() {
         // 10 页，第 0 页已渲染且代次一致；视口 [0,2] → 只应渲染 1、2
         let rendered = [true, false, false, false, false, false, false, false, false, false];
@@ -651,7 +824,7 @@ mod tests {
 
     #[test]
     fn plan_keeps_rendered_pages_within_budget() {
-        // 200 页：仅第 10 页渲染，其余未渲染。预算 70，远未满 → 第 10 页必须保留。
+        // 200 页：仅第 10 页渲染，其余未渲染。预算 CACHE_MAX_PAGES，远未满 → 第 10 页必须保留。
         let mut rendered = vec![false; 200];
         let mut gens = vec![0u64; 200];
         let loading = vec![false; 200];
@@ -663,7 +836,7 @@ mod tests {
 
     #[test]
     fn plan_evicts_farthest_first_when_over_budget() {
-        // 200 页都渲染（超预算 70），视口在 [100,105]。
+        // 200 页都渲染（超预算 CACHE_MAX_PAGES），视口在 [100,105]。
         // 应淘汰离中心最远的页（最前/最后），而可见页绝不能被淘汰。
         let n = 200usize;
         let rendered = vec![true; n];
@@ -687,7 +860,6 @@ mod tests {
         let mut rendered = vec![false; n];
         let mut gens = vec![0u64; n];
         let loading = vec![false; n];
-        let mut render_calls = 0usize;
 
         // 逐窗口滚动：从第 0 页往下翻 100 次（每次窗口推进 2 页），再倒回翻 100 次
         for step in -100i64..=100 {
@@ -702,12 +874,10 @@ mod tests {
                 );
                 rendered[*i] = true;
                 gens[*i] = 0;
-                render_calls += 1;
             }
             for i in &to_evict {
                 rendered[*i] = false;
             }
-            let _ = render_calls;
         }
     }
 
@@ -734,6 +904,113 @@ mod tests {
         // 超大 DPI（Retina 2x）也要封顶
         let s2 = render_scale(840.0, 2.0, 100.0);
         assert!(s2 <= MAX_RENDER_SCALE);
+    }
+
+    #[test]
+    fn page_cache_bgra_roundtrip() {
+        // 临时目录里写一页 BGRA、再读回，验证文件头 + 像素完整
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-pdf-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 用测试目录构造（隔离，避免与真实缓存混用）
+        let cache = PageCache {
+            inner: Arc::new(CacheInner {
+                dir: dir.clone(),
+                closed: AtomicBool::new(false),
+                lru: std::sync::Mutex::new(Vec::new()),
+                budget: CACHE_DISK_PAGES,
+            }),
+        };
+        for idx in [0usize, 7usize] {
+            let w = 16 + idx as u32;
+            let h = 32u32;
+            let mut bgra = Vec::new();
+            for v in 0..(w * h) as u32 {
+                bgra.extend_from_slice(&[(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, 0x7f, 0xff]);
+            }
+            save_bgra(cache.inner.clone(), idx, bgra, w, h);
+        }
+        let (back, pw, ph) = cache.load_bgra(0).expect("第 0 页应读回");
+        assert_eq!((pw, ph), (16, 32), "宽高应一致");
+        assert_eq!(back.len(), 16 * 32 * 4, "像素字节数应一致");
+        let (back7, pw7, ph7) = cache.load_bgra(7).expect("第 7 页应读回");
+        assert_eq!((pw7, ph7), (23, 32));
+        assert_eq!(back7[0..4], [0, 0, 0x7f, 0xff], "首像素 BGRA 应一致");
+        // 不存在的页 → None
+        assert!(cache.load_bgra(99).is_none(), "缺失页应返回 None");
+        // 关闭后拒读（模拟已释放）
+        cache.clear();
+        assert!(cache.load_bgra(0).is_none(), "clear 后不应再读");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_cache_ignores_corrupt_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-pdf-cache-test-{}-corrupt",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("00000.bin"), b"not-a-pdf-cache").unwrap();
+        std::fs::write(dir.join("00001.bin"), b"GPBG" ).unwrap();
+        let cache = PageCache {
+            inner: Arc::new(CacheInner {
+                dir: dir.clone(),
+                closed: AtomicBool::new(false),
+                lru: std::sync::Mutex::new(Vec::new()),
+                budget: CACHE_DISK_PAGES,
+            }),
+        };
+        assert!(cache.load_bgra(0).is_none(), "魔数不对应忽略");
+        assert!(cache.load_bgra(1).is_none(), "头不全应忽略");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_cache_respects_disk_budget() {
+        // 预算 = 小数字：写入超过预算的页后，最久未用的页文件应被删掉（LRU 淘汰）
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-pdf-cache-test-{}-lru",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = PageCache {
+            inner: Arc::new(CacheInner {
+                dir: dir.clone(),
+                closed: AtomicBool::new(false),
+                lru: std::sync::Mutex::new(Vec::new()),
+                budget: 4,
+            }),
+        };
+        for idx in 0..8usize {
+            let bgra = vec![0x11u8, 0x22, 0x33, 0xff].repeat(64); // 8x8 像素
+            save_bgra(cache.inner.clone(), idx, bgra, 8, 8);
+        }
+        // 写入 0..8 → 预算 4，最旧的 0..3 应被淘汰，4..7 仍在
+        for idx in 0..4usize {
+            assert!(
+                cache.load_bgra(idx).is_none(),
+                "预算内最旧的页 {idx} 应被 LRU 淘汰"
+            );
+        }
+        for idx in 4..8usize {
+            assert!(
+                cache.load_bgra(idx).is_some(),
+                "最近的页 {idx} 应保留在磁盘"
+            );
+        }
+        // 读 4 会把它标记为最近使用 → 下一次写 8 时淘汰的是 5
+        cache.load_bgra(4);
+        let bgra = vec![0xffu8; 8 * 8 * 4];
+        save_bgra(cache.inner.clone(), 8, bgra, 8, 8);
+        assert!(cache.load_bgra(4).is_some(), "最近用过的页 4 不应被淘汰");
+        assert!(cache.load_bgra(5).is_none(), "最久未用的页 5 应被淘汰");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 与 `keep_window` 同款布局的一页（高 + 间距）步长（测试辅助）。

@@ -20,9 +20,9 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 anyhow = "1.0"
 zip = "2"
 roxmltree = "0.21"
-# 纯 Rust PDF 栅格化（无原生 DLL），文档可跨线程共享，页级按需渲染。
-# 参考 gpui-pdf（zorite crates/gpui-pdf）解析/渲染路径。
-hayro = "0.7"
+# PDF 栅格化用 native pdfium（Edge 同款内核，首次浏览流畅）；
+# 页级按需渲染 + 磁盘 PNG 二级缓存/内存预算由 view.rs 承担。
+pdfium-render = "0.9.3"
 image = "0.25"
 
 [dev-dependencies]
