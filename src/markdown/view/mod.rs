@@ -66,6 +66,8 @@ pub struct MarkdownPreview {
     base_dir: Option<std::path::PathBuf>,
     /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
     memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    /// 代码块的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
+    code_scroll: std::collections::HashMap<usize, ScrollHandle>,
 }
 
 impl MarkdownPreview {
@@ -82,6 +84,7 @@ impl MarkdownPreview {
             toc: Vec::new(),
             base_dir: None,
             memory_images: Default::default(),
+            code_scroll: Default::default(),
         }
     }
 
@@ -222,6 +225,13 @@ impl MarkdownPreview {
                 _ => None,
             })
             .collect();
+        // 代码行 → 稳定的横向滚动句柄（供块内滚动条拖动）
+        self.code_scroll = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == RowKind::Code)
+            .map(|(ix, _)| (ix, ScrollHandle::new()))
+            .collect();
         self.rows = Rc::new(rows);
         self.remeasure_dimensions(cx);
         if self.rows.len() != self.list_state.item_count() {
@@ -244,6 +254,7 @@ impl Render for MarkdownPreview {
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
         let wrap = self.wrap;
+        let code_scroll = self.code_scroll.clone();
         // 目录：供目录菜单渲染
         let toc = self.toc.clone();
 
@@ -270,70 +281,54 @@ impl Render for MarkdownPreview {
 
         let content = {
             let p = p.clone();
+            let code_scroll = code_scroll;
             list(list_state.clone(), move |ix, _window, cx| {
-                render_row(&rows[ix], &p, wrap, cx)
+                let h = code_scroll.get(&ix).cloned();
+                render_row(&rows[ix], &p, wrap, h, cx)
             })
         }
         .size_full();
 
-        // 预览核心：换行模式（宽随视口）或非换行（横向滚动）。各分支产出任意元素。
-        let core: gpui::AnyElement = if wrap {
-            let inner = div()
-                .id("md-list-wrap")
-                .debug_selector(|| "md-list-wrap".into())
-                .w_full()
-                .h_full()
-                .child(content);
-            div()
-                .id("md-preview")
-                .debug_selector(|| "md-preview".into())
-                .size_full()
-                .relative()
-                .bg(bg)
-                .child(inner)
-                // 竖向滚动条（组件自绘，跟踪 ListState）
-                .vertical_scrollbar(&list_state)
-                .into_any_element()
-        } else {
-            // 非换行：宽包装层 = max(估算最宽内容, 视口宽)，超宽产生横向溢出
-            let inner = div()
-                .id("md-list-wrap")
-                .debug_selector(|| "md-list-wrap".into())
-                .w(px(content_w))
-                .min_w_full()
-                .h_full()
-                .child(content);
-            // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
-            let harea = div()
-                .id("md-harea")
-                .debug_selector(|| "md-harea".into())
-                .size_full()
-                .overflow_x_scroll()
-                .restrict_scroll_to_axis()
-                .track_scroll(&self.h_handle)
-                .child(inner);
-            div()
-                .id("md-preview")
-                .debug_selector(|| "md-preview".into())
-                .size_full()
-                .relative()
-                .bg(bg)
-                .child(harea)
-                .child(
-                    div()
-                        .id("md-hscrollbar-overlay")
-                        .debug_selector(|| "md-hscrollbar-overlay".into())
-                        .absolute()
-                        .inset_0()
-                        .child(
-                            Scrollbar::horizontal(&self.h_handle)
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                )
-                .vertical_scrollbar(&list_state)
-                .into_any_element()
-        };
+        // 预览核心：换行（宽随视口）或非换行（横向滚动）共用外层横向滚动容器。
+        // 换行模式：宽包装层保持视口宽（正文按视口折行），超宽的代码带溢出交由 harea 统一横向滚动；
+        // 非换行模式：宽包装层 = max(估算最宽内容, 视口宽)，超宽产生横向溢出。
+        let inner = div()
+            .id("md-list-wrap")
+            .debug_selector(|| "md-list-wrap".into())
+            .w(px(content_w))
+            .min_w_full()
+            .h_full()
+            .child(content);
+        // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
+        let harea = div()
+            .id("md-harea")
+            .debug_selector(|| "md-harea".into())
+            .size_full()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.h_handle)
+            .child(inner);
+        let core: gpui::AnyElement = div()
+            .id("md-preview")
+            .debug_selector(|| "md-preview".into())
+            .size_full()
+            .relative()
+            .bg(bg)
+            .child(harea)
+            .child(
+                div()
+                    .id("md-hscrollbar-overlay")
+                    .debug_selector(|| "md-hscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::horizontal(&self.h_handle)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
+            .vertical_scrollbar(&list_state)
+            .into_any_element();
 
         // 目录：右上角悬浮按钮 + 下拉菜单（见 [`toc`] 模块）
         let toc_trigger = build_toc_trigger(cx.weak_entity(), toc, p.fg);

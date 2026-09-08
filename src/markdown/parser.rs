@@ -90,6 +90,8 @@ pub struct Row {
     pub img_h: Option<u32>,
     /// 内存图片数据（EPUB 等不落盘场景；Some 时渲染直接用该字节，忽略 src 路径）。
     pub img_data: Option<std::sync::Arc<Image>>,
+    /// 代码块内容（kind == [Code] 时是一整个围栏内的所有行，逐行一条渲染）。
+    pub code_lines: Vec<SharedString>,
 }
 
 impl Row {
@@ -109,6 +111,24 @@ impl Row {
             img_w: None,
             img_h: None,
             img_data: None,
+            code_lines: Vec::new(),
+        }
+    }
+
+    /// 代码块行：整个围栏折叠成一个 [RowKind::Code] 渲染行（逐行渲染成连续块）。
+    fn code_block(lines: Vec<SharedString>) -> Self {
+        let text = lines.first().cloned().unwrap_or_default();
+        Self {
+            text,
+            kind: RowKind::Code,
+            runs: Vec::new(),
+            prefix: None,
+            table: None,
+            src: None,
+            img_w: None,
+            img_h: None,
+            img_data: None,
+            code_lines: lines,
         }
     }
 
@@ -124,6 +144,7 @@ impl Row {
             img_w: None,
             img_h: None,
             img_data: None,
+            code_lines: Vec::new(),
         }
     }
 
@@ -139,6 +160,7 @@ impl Row {
             img_w: None,
             img_h: None,
             img_data: None,
+            code_lines: Vec::new(),
         }
     }
 }
@@ -376,28 +398,27 @@ fn parse_image_line(t: &str) -> Option<(String, String)> {
 /// 把 Markdown 源码解析成渲染行（每行一行，含行内清理）。
 pub fn parse_to_rows(src: &str) -> Vec<Row> {
     let mut rows = Vec::new();
-    let mut in_fence: Option<char> = None;
     let lines: Vec<&str> = src.split('\n').collect();
     let mut idx = 0;
     while idx < lines.len() {
         let line = lines[idx].trim_end_matches('\r');
         let t = line.trim_start();
-        if let Some(fc) = in_fence {
-            // 围栏内：碰到同字符闭合行则结束
-            if let Some((c, _)) = fence_len(t) {
-                if c == fc {
-                    in_fence = None;
-                    idx += 1;
-                    continue;
-                }
-            }
-            rows.push(Row::new(line, RowKind::Code, Vec::new(), None));
-            idx += 1;
-            continue;
-        }
+        // 栅栏开头：收集到同字符闭合行之间的所有行，折叠成一个 Code 渲染行
         if let Some((fc, _)) = fence_len(t) {
-            in_fence = Some(fc);
+            let mut code_lines = Vec::new();
             idx += 1;
+            while idx < lines.len() {
+                let l = lines[idx].trim_end_matches('\r');
+                if let Some((c, _)) = fence_len(l.trim_start()) {
+                    if c == fc {
+                        idx += 1;
+                        break;
+                    }
+                }
+                code_lines.push(SharedString::from(l));
+                idx += 1;
+            }
+            rows.push(Row::code_block(code_lines));
             continue;
         }
         if t.is_empty() {

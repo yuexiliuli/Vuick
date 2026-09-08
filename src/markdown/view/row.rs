@@ -7,19 +7,37 @@ use std::rc::Rc;
 
 use gpui::{
     div, img, px, App, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    Styled, StyledImage,
+    ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
 };
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::markdown::parser::{Row, RowKind};
 use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 
-/// 渲染单个行。
+/// 渲染一行代码（等宽、不换行、浅灰底）。
+fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
+    div()
+        .debug_selector(|| "md-code-band".into())
+        .h(p.code_line)
+        .w_full()
+        .pl_3()
+        .pr_3()
+        .whitespace_nowrap()
+        .font_family(p.mono.clone())
+        .text_size(p.code_size)
+        .text_color(p.fg)
+        .bg(p.muted_bg)
+        .child(t)
+}
+
+/// 渲染单个行。`code_handle` 为代码块稳定的横向滚动句柄（None 时自动创建）。
 pub(crate) fn render_row(
     row: &Rc<Row>,
     p: &Rc<StyleParams>,
     wrap: bool,
+    code_handle: Option<ScrollHandle>,
     _cx: &mut App,
 ) -> gpui::AnyElement {
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
@@ -125,6 +143,58 @@ pub(crate) fn render_row(
 
     // ---------- 自动换行模式：仅对文本行生效，代码/规则/空行保持原样 ----------
     if wrap {
+        // 换行模式下代码保持不换行：整个围栏折叠成一个渲染行（多行紧贴相连成连续块）。
+        // 该块按内容宽撑开（content_w 计入最宽代码行 → 外层 md-harea 统一横向滚动，
+        // 底部单一横向滚动条可拖动）；正文仍限制在视口宽内折行。
+        if row.kind == RowKind::Code {
+            let lines = row.code_lines.clone();
+            let p_ = p.clone();
+            let block_h = lines.len() as f32 * p.code_line.as_f32();
+            let h = code_handle.unwrap_or_else(ScrollHandle::new);
+            let column = div()
+                .debug_selector(|| "md-code-row".into())
+                .flex()
+                .flex_col()
+                .flex_shrink_0()
+                .children(lines.iter().map(|l| code_band(l.clone(), &p_)));
+            return div()
+                .debug_selector(|| "md-code-hscroll".into())
+                .h(px(block_h))
+                .w_full()
+                .flex_shrink_0()
+                .px_3()
+                .child(
+                    div()
+                        .debug_selector(|| "md-code-hscroll-inner".into())
+                        .w_full()
+                        .h_full()
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("md-code-scroll")
+                                .w_full()
+                                .h_full()
+                                .flex()
+                                .flex_row()
+                                .overflow_x_scroll()
+                                .track_scroll(&h)
+                                .child(column),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "md-code-scrollbar".into())
+                                .absolute()
+                                .inset_0()
+                                .child(
+                                    Scrollbar::horizontal(&h)
+                                        .mode(ScrollbarMode::Always)
+                                        .viewport_from_layout(),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
         match row.kind {
             RowKind::Paragraph => {
                 let t = row.text.clone();
@@ -216,36 +286,24 @@ pub(crate) fn render_row(
             .px_3()
             .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
         RowKind::Code => {
-            // 代码行：浅灰背景带（左右内缩 px_3，与正文对齐；栅栏内各行连成一块），等宽字体。
-            // 背景必须放到内层元素：外层 px_3 只缩内容盒，bg 会铺满含 padding 的整盒。
-            let t = row.text.clone();
+            // 代码块：整栏折叠为一行的所有代码行按 h(code_line) 纵向堆叠成连续块，
+            // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体。超宽由外层横向滚动。
+            let lines = row.code_lines.clone();
+            let p_ = p.clone();
+            let block_h = lines.len() as f32 * p.code_line.as_f32();
             div()
-                .h(p.code_line)
+                .h(px(block_h))
                 .w_full()
                 .flex_shrink_0()
                 .px_3()
-                .flex()
-                .items_center()
-                .overflow_hidden()
                 .child(
                     div()
-                        .debug_selector(|| "md-code-band".into())
+                        .debug_selector(|| "md-code-row".into())
                         .h_full()
                         .w_full()
-                        .bg(p.muted_bg)
                         .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .pl_3()
-                                .pr_3()
-                                .whitespace_nowrap()
-                                .font_family(p.mono.clone())
-                                .text_size(p.code_size)
-                                .text_color(p.fg)
-                                .child(t),
-                        ),
+                        .flex_col()
+                        .children(lines.iter().map(|l| code_band(l.clone(), &p_))),
                 )
         }
         RowKind::Heading(n) => {

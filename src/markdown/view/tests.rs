@@ -578,3 +578,113 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
         .expect("内存图片应渲染出 md-img-box");
     assert!(box_.size.width > px(0.) && box_.size.height > px(0.), "图片盒应有尺寸，实际={box_:?}");
 }
+
+/// 回归：超宽代码块应能横向滚动、且整个代码块只有一个可拖动的滚动条，
+/// 而不是被裁剪遮挡 / 每行一个滚动条。
+/// 这在换行模式（wrap=true，默认）下尤其重要——整个围栏折叠成一个渲染行，
+/// 内部一个横向滚动容器 + 底部单一 Always 滚动条，句柄跨帧稳定（set_offset 能真正滚动）。
+#[gpui::test]
+fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 一个多行长代码行组成的代码栅栏，行宽超过视口
+    let long_line = "f".repeat(500);
+    let md_src = format!("```rs\n{long_line}\n{long_line}\n{long_line}\n```\n");
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(&md_src, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+
+    let preview = cx
+        .debug_bounds("md-preview")
+        .expect("预览根 md-preview 应存在");
+    let band = cx
+        .debug_bounds("md-code-band")
+        .expect("代码背景带 md-code-band 应存在");
+    assert!(
+        band.size.width > preview.size.width,
+        "超宽代码背景带应宽于预览视口（从而可横向滚动而非被裁剪），band={band:?} preview={preview:?}"
+    );
+    // 代码块滚动容器应等于预览视口宽（自身不撑大，内容在内部横向滚动）
+    let hscroll = cx
+        .debug_bounds("md-code-hscroll")
+        .expect("代码块滚动容器 md-code-hscroll 应存在");
+    assert!(
+        hscroll.size.width <= preview.size.width + px(1.),
+        "代码滚动容器应等于预览视口宽，实际 hscroll={hscroll:?} preview={preview:?}"
+    );
+    // 滚动条叠层真实渲染（非零尺寸）
+    let sbar = cx
+        .debug_bounds("md-code-scrollbar")
+        .expect("代码块横向滚动条 md-code-scrollbar 应存在");
+    assert!(
+        sbar.size.width > px(0.) && sbar.size.height > px(0.),
+        "横向滚动条不应塌缩成 0，实际={sbar:?}"
+    );
+
+    // 整个围栏折叠成一个 Code 渲染行：item 高度 = 3 * code_line（多行紧贴相连成一大块）
+    let p = cx.update(|_w, cx| StyleParams::from_theme_with_font(cx, None));
+    let rows = parse_to_rows(&md_src);
+    let code_ix: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == RowKind::Code)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(code_ix.len(), 1, "整个围栏应折叠成一个 Code 渲染行");
+    let b = cx
+        .update(|_, cx| host.read(cx).md.read(cx).list_state.bounds_for_item(code_ix[0]))
+        .expect("代码行 item 应有 bounds");
+    assert!(
+        (b.size.height.as_f32() - p.code_line.as_f32() * 3.0).abs() < 1.5,
+        "代码块行高应等于 3*code_line（连续块），实际={:?}",
+        b.size.height
+    );
+
+    // 关键：代码块滚动句柄跨帧稳定，set_offset 能真正移动代码带（即滚动条可拖动生效）
+    let origin_x = band.origin.x.as_f32();
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let h = md
+            .read(cx)
+            .code_scroll
+            .get(&code_ix[0])
+            .expect("代码块应注册滚动句柄")
+            .clone();
+        h.set_offset(gpui::point(px(-200.), px(0.)));
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+    let box2 = cx
+        .debug_bounds("md-code-band")
+        .expect("滚动后 md-code-band 应仍存在");
+    assert!(
+        box2.origin.x.as_f32() < origin_x - 100.0,
+        "设置代码滚动句柄后代码带应向左滚动，origin.x: {origin_x:.0} -> {:?}",
+        box2.origin.x
+    );
+
+    // 非换行模式：折叠成单行后宽度估算仍计入最宽代码行 → 产生横向滚动范围
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_wrap(false, cx));
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+    let (max_x,) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        (md.read(cx).h_handle.max_offset().x,)
+    });
+    assert!(max_x > px(0.), "非换行模式也应横向可滚动，max_offset.x={max_x:?}");
+}
+
+
