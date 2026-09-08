@@ -1,18 +1,24 @@
 //! PDF 读取与展示模块。
 //!
 //! 基于 native **pdfium**（Edge 同源内核）栅格化，单页渲染快，首次浏览即流畅。
-//! 架构：页级虚拟化 + 内存预算 + 磁盘 PNG 二级缓存：
+//! 架构：页级虚拟化 + 内存预算 + 磁盘二级缓存：
 //! - [`PdfWorker`]（`parser.rs`）是**进程级单例后台线程**（pdfium 整进程只能绑定一次），
 //!   持有唯一 `Pdfium` 与一个 `HashMap<DocId, PdfDocument>`，通过 mpsc 接收各阅读器的
-//!   `Open / Render / Close` 请求并回传 **BGRA 像素 + PNG 码流**；
+//!   `Open / Render / Close` 请求并回传 **BGRA 像素**；
 //! - [`PdfViewer`]（`view.rs`）只做收发与位图显示：首帧用 BGRA 直接包 `RenderImage`
-//!   （主线程零像素循环，流畅），翻回已淘汰页时从磁盘 PNG 恢复。
+//!   （主线程零像素循环，流畅），翻回已淘汰页时从磁盘缓存恢复。
 //!
 //! 模块结构：
-//! - [`parser`]：pdfium.dll 定位、单例工作线程、多文档逐页栅格化（BGRA + PNG）
-//! - [`view`]：自包含阅读器（加载/滚动/按需渲染/磁盘缓存/回收）
+//! - [`parser`]：pdfium.dll 定位、单例工作线程、多文档逐页栅格化（BGRA）
+//! - [`view`]：阅读器视图核心（加载/滚动/按需渲染/滚动条）
+//! - [`layout`]：页列纯布局/调度数学（尺寸、可见区间、渲染规划）
+//! - [`cache`]：磁盘二级页缓存（紧凑 BGRA 落盘 + LRU 封顶）
+//! - [`toc`]：书签目录面板（折叠、悬浮、拖拽调宽）与其交互
 
+mod cache;
+mod layout;
 mod parser;
+mod toc;
 mod view;
 
 pub use parser::{DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult};
