@@ -99,8 +99,16 @@ impl EditorApp {
             return;
         }
         self.active_tab = idx;
-        let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
+        // PDF / EPUB 等只读预览文档没有可见编辑区，不把焦点给隐藏的编辑器，
+        // 而是给 App 根（让窗口级快捷键仍可用）。
+        let readonly = self.tabs[idx].readonly_preview;
+        if readonly {
+            let root = self.focus_handle(cx);
+            window.focus(&root, cx);
+        } else {
+            let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 

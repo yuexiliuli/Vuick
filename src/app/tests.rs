@@ -856,6 +856,22 @@
         assert!(fullscreen, "打开 PDF 应自动进入全屏占满阅读模式");
         assert!(readonly, "打开 PDF 应锁定只读预览");
         assert!(no_md_content, "PDF 不应进入 Markdown 文本（content 应为空）");
+
+        // PDF 阅读器自带全屏与分页，状态栏不应出现「全屏/还原」「换行」按钮
+        let ws = cx.debug_bounds("status-wrap-btn").is_none();
+        let fs = cx.debug_bounds("status-fullscreen-btn").is_none();
+        assert!(ws, "PDF 预览时状态栏不应有换行开关");
+        assert!(fs, "PDF 预览时状态栏不应有全屏/还原按钮");
+
+        // 全屏预览下编辑区不进入布局（非“被遮挡”，而是根本不渲染）
+        assert!(
+            cx.debug_bounds("editor-area").is_none(),
+            "PDF 全屏预览时不应渲染编辑区"
+        );
+        assert!(
+            cx.debug_bounds("fullscreen-preview").is_some(),
+            "PDF 应以 fullscreen-preview 呈现"
+        );
     }
 
     /// 回归：打开 259 页的长 PDF（曾因全量栅格化耗时 ~270s 表现为“无法加载”）。
@@ -941,6 +957,16 @@
         });
         assert!(fs0, "初始应是全屏");
         assert!(wrap0, "初始应换行");
+
+        // EPUB 是只读预览文档：状态栏不应出现「全屏/还原」「换行」按钮
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_none(),
+            "EPUB 预览时状态栏不应有换行开关"
+        );
+        assert!(
+            cx.debug_bounds("status-fullscreen-btn").is_none(),
+            "EPUB 预览时状态栏不应有全屏/还原按钮"
+        );
 
         // 切换全屏 → 分屏
         cx.update(|window, cx| {

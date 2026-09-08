@@ -17,6 +17,15 @@ impl EditorApp {
         grow: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // PDF / EPUB 等只读预览文档不生成编辑区（即使处于分屏/编辑-only 布局也直接跳过）。
+        let readonly = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.readonly_preview)
+            .unwrap_or(false);
+        if readonly {
+            return div().id("editor-area").size_full();
+        }
         let editor = self.tabs[self.active_tab].editor.clone();
         let font_size = px(self.font_size);
         div()

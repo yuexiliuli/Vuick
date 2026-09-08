@@ -58,8 +58,11 @@ impl EditorApp {
                     .child(language),
             );
 
-        // 右侧：EPUB 阅读按钮（全屏/还原 + 换行开关）+ 统计信息
+        // 右侧：阅读/统计按钮
+        // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
         let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
+        // 只读预览文档（按后缀识别为 PDF/EPUB 时置位）→ 隐藏阅读控制按钮
+        let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
         let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
         let wrap_on = tab
             .map(|t| t.md_preview.read(cx).is_wrap())
@@ -71,8 +74,8 @@ impl EditorApp {
             .gap_2()
             .flex_shrink_0();
 
-        // 全屏/还原按钮：仅在开启预览时显示
-        if preview_on {
+        // 全屏/还原按钮：仅在开启预览且非只读预览（PDF/EPUB）时显示
+        if preview_on && !readonly_preview {
             let btn = div()
                 .id("status-fullscreen-btn")
                 .debug_selector(|| "status-fullscreen-btn".into())
@@ -95,8 +98,8 @@ impl EditorApp {
             right = right.child(btn);
         }
 
-        // 换行开关按钮：EPUB（或任意带预览的文档）切换自动换行
-        {
+        // 换行开关按钮：仅非只读预览（非 PDF/EPUB）的预览切换自动换行
+        if !readonly_preview {
             let btn = div()
                 .id("status-wrap-btn")
                 .debug_selector(|| "status-wrap-btn".into())
