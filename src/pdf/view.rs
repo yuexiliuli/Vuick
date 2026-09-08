@@ -28,12 +28,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use gpui::{
-    div, img, px, rgb, App, Context, Hsla, ImageSource, InteractiveElement, IntoElement,
-    ParentElement, Render, RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Window,
+    div, img, px, rgb, App, Context, CursorStyle, Hsla, ImageSource, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, RenderImage, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_component::{Icon, IconName};
 
 use crate::pdf::{
     render_image_from_bgra, DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult,
@@ -334,6 +335,47 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// 断言某个条目是否有下级（可折叠）：pre-order 下紧邻下一项层级更深即有子项。
+fn toc_node_has_child(outlines: &[PdfOutlineEntry], idx: usize) -> bool {
+    outlines
+        .get(idx + 1)
+        .is_some_and(|next| next.level > outlines[idx].level)
+}
+
+/// 目录折叠可见性：按 pre-order 条目判断每个下标是否应显示。///
+/// 语义（与 [`toc_collapsed`](PdfViewer::toc_collapsed) 匹配）：
+/// - 条目本身可见，除非它处于某个**已折叠祖先**之下（祖先 index ∈ `collapsed`）。
+///   `collapsed` 只含「有下级的条目」（`level[i] < level[i+1]`）。折叠即隐藏全部后代。
+/// - 祖先链判定：pre-order 下，条目 i 的祖先 = 在其之前、层级严格递增且未被其后更浅
+///   条目截断的那些条目；采用「层级递减栈」维护。任一祖先折叠 → 本条隐藏。
+///
+/// 纯函数、无副作用，便于单测。
+fn toc_visibility(
+    levels: &[usize],
+    collapsed: &std::collections::HashSet<usize>,
+) -> Vec<bool> {
+    let n = levels.len();
+    let mut visible = vec![true; n];
+    // 祖先栈：保存“截至当前位置仍处于祖先链上的条目下标”（层级严格递增）。
+    let mut stack: Vec<usize> = Vec::with_capacity(n.min(64));
+    for i in 0..n {
+        let lvl = levels[i];
+        // 弹出层级 >= 当前条的祖先（它们不再是 lvl 的后代链成员）
+        while let Some(&top) = stack.last() {
+            if levels[top] >= lvl {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        // 祖先链上任一成员折叠 → 本条被隐藏
+        let any_collapsed = stack.iter().any(|&a| collapsed.contains(&a));
+        visible[i] = !any_collapsed;
+        stack.push(i);
+    }
+    visible
+}
+
 /// PDF 阅读器：自包含的页级虚拟化视图。
 pub struct PdfViewer {
     /// 文件路径（含文件名，标题用）。
@@ -368,9 +410,24 @@ pub struct PdfViewer {
     cache: PageCache,
     /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。
     outlines: Vec<PdfOutlineEntry>,
-    /// 左侧目录抽屉是否展开。
+    /// 已折叠的目录父项索引（`HashSet<条目下标>`），默认全部展开。
+    /// 只有「有下级」的条目（下标 i 满足 level[i] < level[i+1]）才可能被折叠；
+    /// 折叠后其所有后代（直到回到同层或更浅的祖先层）都不再显示。
+    toc_collapsed: std::collections::HashSet<usize>,
+    /// 目录面板当前宽度（px，可拖拽右缘调整）。
+    toc_width: f32,
+    /// 目录右缘拖拽状态：(按下的起始 x, 起始面板宽)。`None` = 未在拖拽。
+    toc_drag: Option<(f32, f32)>,
+    /// 右侧目录抽屉是否展开。
     toc_open: bool,
 }
+
+/// 目录面板宽度下限（px）——太窄容纳不下标题文字。
+const TOC_WIDTH_MIN: f32 = 160.0;
+/// 目录面板宽度上限（px）——避免把右侧 PDF 主体挤没。
+const TOC_WIDTH_MAX: f32 = 480.0;
+/// 目录面板默认宽度（px）。
+const TOC_WIDTH_DEFAULT: f32 = 280.0;
 
 impl PdfViewer {
     /// 创建阅读器并异步加载 `path`（读文件 + 解析 + 量页在后台，UI 不阻塞）。
@@ -393,6 +450,9 @@ impl PdfViewer {
             pending_drops: Vec::new(),
             cache,
             outlines: Vec::new(),
+            toc_collapsed: std::collections::HashSet::new(),
+            toc_width: TOC_WIDTH_DEFAULT,
+            toc_drag: None,
             toc_open: false,
         };
         this.start_load(cx);
@@ -421,6 +481,7 @@ impl PdfViewer {
                         this.doc_id = doc_id;
                         this.dims = dims;
                         this.outlines = outlines;
+                        this.toc_collapsed.clear(); // 新文档默认全部展开
                         let (tops, total) = compute_layout(&this.dims, this.page_width());
                         this.page_tops = tops;
                         this.total_height = total;
@@ -652,6 +713,42 @@ impl PdfViewer {
         cx.notify();
     }
 
+    /// 切换某个目录父项的折叠/展开。只有「有下级」的条目可折叠。
+    fn toggle_toc_collapse(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.outlines.len() {
+            return;
+        }
+        if toc_node_has_child(&self.outlines, index) {
+            let collapsed = &mut self.toc_collapsed;
+            if !collapsed.remove(&index) {
+                collapsed.insert(index);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 开始拖拽目录右缘：记录 (起始 x, 起始宽)。
+    fn start_toc_resize(&mut self, start_x: f32, cx: &mut Context<Self>) {
+        self.toc_drag = Some((start_x, self.toc_width));
+        cx.notify();
+    }
+
+    /// 拖拽中：按鼠标位移更新面板宽（自变量窗口坐标 x）。宽度 clamp 在 [MIN, MAX]。
+    fn update_toc_resize(&mut self, x: f32, cx: &mut Context<Self>) {
+        if let Some((start_x, start_w)) = self.toc_drag {
+            self.toc_width = (start_w + (x - start_x)).clamp(TOC_WIDTH_MIN, TOC_WIDTH_MAX);
+            cx.notify();
+        }
+    }
+
+    /// 结束拖拽。
+    fn end_toc_resize(&mut self, cx: &mut Context<Self>) {
+        if self.toc_drag.is_some() {
+            self.toc_drag = None;
+            cx.notify();
+        }
+    }
+
     /// 测试辅助：注入任意书签（默认先有 2 条），用于驱动 TOC 面板展开的布局回归测试。
     #[cfg(test)]
     fn seed_outlines_for_test(&mut self) {
@@ -673,6 +770,12 @@ impl PdfViewer {
     #[cfg(test)]
     fn force_toc_open_for_test(&mut self) {
         self.toc_open = true;
+    }
+
+    /// 测试辅助：读取折叠集合（校验折叠交互结果）。
+    #[cfg(test)]
+    fn toc_collapsed_for_test(&self) -> &std::collections::HashSet<usize> {
+        &self.toc_collapsed
     }
 
     /// 浮在 PDF 主体上的目录开关按钮（始终可见，有书签时）。
@@ -716,6 +819,8 @@ impl PdfViewer {
             return None;
         }
         let outlines = self.outlines.clone();
+        let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
+        let visible = toc_visibility(&levels, &self.toc_collapsed);
         let theme = gpui_component::Theme::global(cx);
         let colors = theme.semantic_tokens().colors;
         let fg = colors.foreground;
@@ -724,34 +829,90 @@ impl PdfViewer {
         let weak = cx.weak_entity();
 
         let mut items: Vec<gpui::AnyElement> = Vec::with_capacity(outlines.len());
-        for entry in outlines.iter() {
+        for (idx, entry) in outlines.iter().enumerate() {
+            if !visible[idx] {
+                continue;
+            }
             let title = entry.title.clone();
             let level = entry.level;
             let has_page = entry.page_index != usize::MAX;
             let page = entry.page_index;
             let weak = weak.clone();
             let fg = fg.clone();
-            let item = div()
-                .id(SharedString::from(format!("pdf-toc-item-{page}")))
+            // 有下级 → 可折叠
+            let has_child = toc_node_has_child(&outlines, idx);
+            let is_collapsed = has_child && self.toc_collapsed.contains(&idx);
+
+            let mut row = div()
+                .id(SharedString::from(format!("pdf-toc-item-{page}-{idx}")))
+                .debug_selector(move || format!("pdf-toc-item-{page}-{idx}"))
                 .pl(px(6. + level as f32 * 14.))
                 .pr(px(8.))
                 .py(px(5.))
                 .w_full()
+                .relative()
                 .flex()
                 .items_center()
-                .gap(px(8.))
+                .gap(px(6.))
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(0xffffff).opacity(0.06)))
-                .active(|style| style.bg(rgb(0xffffff).opacity(0.12)))
-                .on_click(move |_, _w, cx| {
-                    if has_page {
-                        // 跳转到目标页，但保持目录面板打开（不 close_toc）
-                        let _ = weak.update(cx, |this, cx| {
-                            this.scroll_to_page(page);
-                            cx.notify();
-                        });
-                    }
-                })
+                .group("toc-item")
+                .rounded(px(4.))
+                // 悬浮：主题化柔和底 + 左侧指示条 + 交互反馈；按下稍微加深
+                .hover(|style| style.bg(colors.muted).text_color(fg))
+                .active(|style| style.bg(colors.muted).opacity(0.9));
+
+            // 左侧当前项指示条（hover 时显现，accent 色）
+            let indicator = div()
+                .id(SharedString::from(format!("pdf-toc-ind-{idx}")))
+                .debug_selector(move || format!("pdf-toc-ind-{idx}"))
+                .absolute()
+                .top(px(5.))
+                .bottom(px(5.))
+                .left(px(2.))
+                .w(px(2.))
+                .rounded_full()
+                .bg(colors.accent)
+                .opacity(0.0)
+                .group_hover("toc-item", |style| style.opacity(1.0));
+
+            row = row.child(indicator);
+
+            // 折叠箭头（有下级时）：点击只折叠/展开，不跳转
+            if has_child {
+                let weak = weak.clone();
+                let chevron = if is_collapsed {
+                    Icon::new(IconName::ChevronRight)
+                } else {
+                    Icon::new(IconName::ChevronDown)
+                }
+                .size(px(12.))
+                .text_color(muted);
+                let chevron_btn = div()
+                    .id(SharedString::from(format!("pdf-toc-caret-{idx}")))
+                    .debug_selector(move || format!("pdf-toc-caret-{idx}"))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(3.))
+                    .text_color(muted)
+                    .group_hover("toc-item", |style| {
+                        style.text_color(colors.foreground)
+                    })
+                    .hover(|style| style.bg(colors.muted))
+                    .on_click(move |_, _w, cx| {
+                        cx.stop_propagation();
+                        let _ = weak.update(cx, |this, cx| this.toggle_toc_collapse(idx, cx));
+                    })
+                    .child(chevron);
+                row = row.child(chevron_btn);
+            } else {
+                // 无子项：占位宽度对齐箭头列
+                row = row.child(div().w(px(16.)));
+            }
+
+            row = row
                 .child(
                     div()
                         .w(px(5.))
@@ -768,6 +929,7 @@ impl PdfViewer {
                         .whitespace_nowrap()
                         .text_size(px(13.))
                         .text_color(if has_page { fg } else { muted })
+                        .group_hover("toc-item", |style| style.text_color(fg.clone()))
                         .child(title),
                 )
                 .child(
@@ -781,7 +943,18 @@ impl PdfViewer {
                             "—".into()
                         }),
                 );
-            items.push(item.into_any_element());
+
+            let weak_row = weak;
+            row = row.on_click(move |_, _w, cx| {
+                if has_page {
+                    // 跳转到目标页，但保持目录面板打开（不 close_toc）
+                    let _ = weak_row.update(cx, |this, cx| {
+                        this.scroll_to_page(page);
+                        cx.notify();
+                    });
+                }
+            });
+            items.push(row.into_any_element());
         }
 
         let close_btn = {
@@ -799,13 +972,48 @@ impl PdfViewer {
                 })
         };
 
+        // 右缘拖拽手柄：宽 6px 命中区，视觉 2px 细线；按下开始拖拽。
+        let resize_handle = {
+            let weak = weak.clone();
+            div()
+                .id("pdf-toc-resize")
+                .debug_selector(|| "pdf-toc-resize".into())
+                .absolute()
+                .right(px(0.))
+                .top(px(0.))
+                .bottom(px(0.))
+                .w(px(6.))
+                .flex()
+                .items_stretch()
+                .justify_center()
+                .cursor(CursorStyle::ResizeColumn)
+                .on_hover(cx.listener(|_this: &mut Self, _hovered: &bool, _, cx| {
+                    cx.notify();
+                }))
+                .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.start_toc_resize(ev.position.x.as_f32(), cx)
+                    });
+                })
+                // 命中区透明，视觉中心一条 2px 竖线（颜色：拖拽/悬浮 accent，平时 border）
+                .child(
+                    div()
+                        .w(px(2.))
+                        .h_full()
+                        .flex_none()
+                        .rounded_full()
+                        .bg(if self.toc_drag.is_some() { colors.accent } else { border }),
+                )
+        };
+
         Some(
             div()
                 .id("pdf-toc-panel")
                 .debug_selector(|| "pdf-toc-panel".into())
                 .h_full()
-                .w(px(280.))
+                .w(px(self.toc_width))
                 .flex_shrink_0()
+                .relative()
                 .bg(colors.surface)
                 .border_r_1()
                 .border_color(border)
@@ -835,12 +1043,13 @@ impl PdfViewer {
                         .top(px(46.))
                         .bottom(px(0.))
                         .left(px(0.))
-                        .right(px(0.))
+                        .right(px(6.))
                         .overflow_y_scroll()
                         .child(
                             div().id("pdf-toc-list-inner").flex().flex_col().children(items),
                         ),
                 )
+                .child(resize_handle)
                 .into_any_element(),
         )
     }
@@ -970,6 +1179,24 @@ impl Render for PdfViewer {
             .flex()
             .flex_row()
             .bg(canvas)
+            // 目录拖拽：鼠标移动/松开事件冒泡到容器统一处理（与 app 分割线同款）
+            .on_mouse_move(cx.listener(
+                |this: &mut Self, ev: &gpui::MouseMoveEvent, _window, cx| {
+                    this.update_toc_resize(ev.position.x.as_f32(), cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _: &gpui::MouseUpEvent, _window, cx| {
+                    this.end_toc_resize(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this: &mut Self, _: &gpui::MouseUpEvent, _window, cx| {
+                    this.end_toc_resize(cx);
+                }),
+            )
             .children(toc_panel) // 左：目录面板（宽度参与布局，展开时挤压右侧）
             .child(
                 div()
@@ -1010,6 +1237,7 @@ impl Render for PdfViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn a4() -> (f32, f32) {
         (595.0, 842.0) // A4 竖版（pt）
@@ -1030,6 +1258,95 @@ mod tests {
     #[test]
     fn keep_window_empty_dims_returns_zero() {
         assert_eq!(keep_window(&[], 840.0, 0.0, 600.0), (0, 0));
+    }
+
+    #[test]
+    fn toc_visibility_all_visible_when_nothing_collapsed() {
+        // 默认（未折叠）→ 全部可见
+        let levels = vec![0, 1, 2, 1, 0, 1];
+        let collapsed = std::collections::HashSet::new();
+        let v = toc_visibility(&levels, &collapsed);
+        assert!(v.into_iter().all(|x| x), "未折叠时应全部可见");
+    }
+
+    #[test]
+    fn toc_visibility_hides_descendants_of_collapsed_parent() {
+        // 0: L0  ├1: L1  │└2: L2  ├3: L1  │└4: L2  └5: L1
+        let levels = vec![0, 1, 2, 1, 2, 1];
+        let mut collapsed = std::collections::HashSet::new();
+        // 折叠第 0 项（L0）→ 全部后代(1..=5)隐藏，仅第 0 项可见
+        collapsed.insert(0);
+        let v = toc_visibility(&levels, &collapsed);
+        assert_eq!(
+            v,
+            vec![true, false, false, false, false, false],
+            "折叠 L0 应隐藏其后全部后代"
+        );
+
+        // 折叠第 1 项（L1，父 0 未折叠）→ 只隐藏它的直系后代 2；3/4/5 不受影响
+        let collapsed = HashSet::from([1usize]);
+        let v = toc_visibility(&levels, &collapsed);
+        assert_eq!(
+            v,
+            vec![true, true, false, true, true, true],
+            "折叠 L1(1) 只应隐藏其后代 2"
+        );
+
+        // 折叠第 3 项（L1 的第二个子树）→ 隐藏 4
+        let collapsed = HashSet::from([3usize]);
+        let v = toc_visibility(&levels, &collapsed);
+        assert_eq!(
+            v,
+            vec![true, true, true, true, false, true],
+            "折叠 L1(3) 只应隐藏其后代 4"
+        );
+
+        // 同时折叠 0 与 3 → 全部后代都隐藏
+        let collapsed = HashSet::from([0usize, 3usize]);
+        let v = toc_visibility(&levels, &collapsed);
+        assert_eq!(
+            v,
+            vec![true, false, false, false, false, false],
+            "折叠 L0 后 3 及其后代 4 均被 L0 遮蔽"
+        );
+
+        // 折叠一个无子项的条目（没有下级）→ 无效果
+        let collapsed = HashSet::from([2usize]); // L2，下一项 L1 < L2 → 无子项
+        let v = toc_visibility(&levels, &collapsed);
+        assert!(
+            v.into_iter().all(|x| x),
+            "无子项的条目在折叠集合中也不应影响任何可见性"
+        );
+    }
+
+    #[test]
+    fn toc_visibility_nested_sibling_boundary() {
+        // 兄弟边界：折叠第 1 项(L1) 后，第 3 项(L1，为 0 的第二子)应仍可见。
+        let levels = vec![0, 1, 2, 1, 0, 1];
+        let collapsed = HashSet::from([1usize]);
+        let v = toc_visibility(&levels, &collapsed);
+        assert_eq!(
+            v,
+            vec![true, true, false, true, true, true],
+            "折叠第一个 L1 不应影响第 0 的第二个孩子 L1(3)"
+        );
+    }
+
+    #[test]
+    fn toggle_collapse_only_affects_nodes_with_children() {
+        // 构建 outlines，直接测真实判定 helper：有下级才可折叠
+        let outlines = vec![
+            PdfOutlineEntry { title: "A".into(), level: 0, page_index: 0 },
+            PdfOutlineEntry { title: "A1".into(), level: 1, page_index: 1 },
+            PdfOutlineEntry { title: "A2".into(), level: 1, page_index: 2 },
+            PdfOutlineEntry { title: "B".into(), level: 0, page_index: 3 },
+            PdfOutlineEntry { title: "B1".into(), level: 1, page_index: 4 },
+        ];
+        assert!(toc_node_has_child(&outlines, 0), "A(L0) 有子项 A1");
+        assert!(!toc_node_has_child(&outlines, 1), "A1(L1) 下一项同级 → 无子项");
+        assert!(!toc_node_has_child(&outlines, 2), "A2(L1) 下一项更浅 → 无子项");
+        assert!(toc_node_has_child(&outlines, 3), "B(L0) 有子项 B1");
+        assert!(!toc_node_has_child(&outlines, 4), "末项无子项");
     }
 
     #[test]
@@ -1290,9 +1607,24 @@ mod tests {
         cx: &mut TestAppContext,
         size: gpui::Size<gpui::Pixels>,
     ) -> (Entity<PdfHost>, &mut VisualTestContext) {
+        let path = Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/N107内外饰配置表NEW.pdf"),
+        );
+        setup_host_with(cx, size, path)
+    }
+
+    /// 通用宿主：`path` 为 `None`/不可读时 viewer 加载失败，但**保留 seed 的目录**
+    /// （不会被真实书签覆盖），适合校验目录树交互。
+    fn setup_host_with(
+        cx: &mut TestAppContext,
+        size: gpui::Size<gpui::Pixels>,
+        path: Option<std::path::PathBuf>,
+    ) -> (Entity<PdfHost>, &mut VisualTestContext) {
         cx.update(gpui_component::init);
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/N107内外饰配置表NEW.pdf");
+        let path = path.unwrap_or_else(|| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/__missing__.pdf")
+        });
         let (host, cx) = cx.add_window_view(|_window, cx| {
             let viewer = cx.new(|cx| {
                 let mut v = PdfViewer::new(path, cx);
@@ -1370,5 +1702,168 @@ mod tests {
             let _ = cx.cx.refresh();
         }
         check(cx, 340.0);
+    }
+
+    /// 回归：点击折叠箭头后，父项子代应被隐藏（从面板 DOM 消失），再次点击展开恢复。
+    ///
+    /// （只校验折叠状态机 + 可见性，避免对真实 pdfium 的强依赖：用 seed 的 2 层目录。）
+    #[gpui::test]
+    fn toc_collapse_hides_children_and_expands_back(cx: &mut TestAppContext) {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        // 用空路径 → 加载失败，seed 的 2 层书签不被真实书签覆盖，便于精确校验树交互
+        let (host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
+
+        // seed_outlines_for_test: idx0=L0「测试章节」、idx1=L1「测试小节」
+        // 初始全展开：两条目都应渲染
+        let item1 = cx.debug_bounds("pdf-toc-item-0-0").expect("父项应渲染");
+        let child = cx.debug_bounds("pdf-toc-item-1-1").expect("子项初始应可见");
+        assert!(child.size.height > px(0.), "子项默认可见");
+        let parent_y0 = item1.origin.y;
+
+        // 折叠父项(0)：子项(1)应进入隐藏集合且不再渲染；父行仍在
+        cx.update(|_, cx| {
+            let viewer = host.read(cx).viewer.clone();
+            viewer.update(cx, |v, cx| v.toggle_toc_collapse(0, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let collapsed_now = cx.update(|_, cx| {
+            host.read(cx).viewer.read(cx).toc_collapsed_for_test().contains(&0)
+        });
+        assert!(collapsed_now, "父项 0 应进入折叠集合");
+        assert!(
+            cx.debug_bounds("pdf-toc-item-1-1").is_none(),
+            "子项折叠后不应再渲染"
+        );
+        assert!(cx.debug_bounds("pdf-toc-item-0-0").is_some(), "父项仍应渲染");
+
+        // 再点击一次 → 展开，子项恢复
+        cx.update(|_, cx| {
+            let viewer = host.read(cx).viewer.clone();
+            viewer.update(cx, |v, cx| v.toggle_toc_collapse(0, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let collapsed_now = cx.update(|_, cx| {
+            host.read(cx).viewer.read(cx).toc_collapsed_for_test().contains(&0)
+        });
+        assert!(!collapsed_now, "再次点击应展开（折叠集合移除）");
+        let child = cx.debug_bounds("pdf-toc-item-1-1").expect("展开后子项应恢复");
+        assert!(child.size.height > px(0.), "展开后子项应可见");
+        assert!(
+            (parent_y0.as_f32() - child.origin.y.as_f32()).abs() > 1.0,
+            "子项应与父项不同行（在面板内垂直排列）"
+        );
+    }
+
+    /// 冒烟：目录项 hover 不应 panic；指示条元素存在且位于对应行内（左侧指示条渲染）。
+    #[gpui::test]
+    fn toc_item_hover_renders_indicator(cx: &mut TestAppContext) {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let (_host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
+
+        let row = cx.debug_bounds("pdf-toc-item-0-0").expect("父项应渲染");
+        let ind = cx.debug_bounds("pdf-toc-ind-0").expect("指示条应渲染");
+        assert!(
+            ind.origin.x.as_f32() >= row.origin.x.as_f32() - 1.0
+                && ind.origin.x.as_f32() <= row.origin.x.as_f32() + row.size.width.as_f32(),
+            "指示条应在行水平范围内，ind={ind:?} row={row:?}"
+        );
+
+        // 把鼠标移到父项上：仅验证不 panic、布局稳定（纯样式细化，无运行时断言）。
+        let center = gpui::point(
+            row.origin.x + row.size.width / 2.,
+            row.origin.y + row.size.height / 2.,
+        );
+        cx.simulate_mouse_move(center, None, gpui::Modifiers::none());
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        assert!(cx.debug_bounds("pdf-toc-item-0-0").is_some(), "hover 后行仍渲染");
+    }
+
+    /// 回归：目录右缘可拖拽改变面板宽；宽度受限在 [MIN, MAX]；松开后宽度保持。
+    #[gpui::test]
+    fn toc_resize_drag_changes_width(cx: &mut TestAppContext) {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let (host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
+
+        let panel0 = cx.debug_bounds("pdf-toc-panel").expect("目录面板应存在");
+        let w0 = panel0.size.width.as_f32();
+        assert!((w0 - TOC_WIDTH_DEFAULT).abs() < 2.0, "默认宽应 280，实际 {w0}");
+
+        // 取右缘中点（命中区 6px 内）作为拖拽起点
+        let handle = cx.debug_bounds("pdf-toc-resize").expect("拖拽手柄应存在");
+        let start = gpui::point(
+            handle.origin.x + handle.size.width / 2.,
+            panel0.origin.y + panel0.size.height / 2.,
+        );
+        // 按下 → 向右拖 60px → 松开
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::none());
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(start.x + px(60.), start.y),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+
+        let panel1 = cx.debug_bounds("pdf-toc-panel").expect("目录面板应存在");
+        let w1 = panel1.size.width.as_f32();
+        assert!(
+            (w1 - (w0 + 60.0)).abs() < 3.0,
+            "右拖 60px 后宽度应约 +60，w0={w0} w1={w1}"
+        );
+        assert!(
+            (w1 - cx
+                .update(|_, cx| host.read(cx).viewer.read(cx).toc_width)
+                .abs()) < 0.01,
+            "拖拽后内部保存宽度应一致"
+        );
+
+        // 拖出上限：向右拖到接近窗口右缘 → 宽度应封顶 == TOC_WIDTH_MAX
+        // （起点 ~337，拖到 ~970 共 ~+630，远超 MAX-340=140 的门槛）
+        let handle = cx.debug_bounds("pdf-toc-resize").expect("手柄应存在");
+        let start = gpui::point(
+            handle.origin.x + handle.size.width / 2.,
+            panel1.origin.y + panel1.size.height / 2.,
+        );
+        cx.simulate_mouse_move(start, None, gpui::Modifiers::none());
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(
+            gpui::point(start.x + px(630.), start.y),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::none(),
+        );
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let w_max = cx
+            .debug_bounds("pdf-toc-panel")
+            .expect("目录面板应存在")
+            .size
+            .width
+            .as_f32();
+        assert!(
+            (w_max - TOC_WIDTH_MAX).abs() < 1.0,
+            "超大拖动应封顶在 MAX，实际 {w_max}"
+        );
     }
 }
