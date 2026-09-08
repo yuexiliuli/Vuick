@@ -179,17 +179,11 @@ pub(crate) fn render_row(
                                 .flex()
                                 .flex_row()
                                 .overflow_x_scroll()
+                                // 只允许鼠标左键拖动滚动条，禁止滚轮滚动代码块：
+                                // restrict_scroll_to_axis 使纵向滚轮不被本容器横向消费（delta_x=0），
+                                // 事件继续冒泡给页面做纵向滚动。
+                                .restrict_scroll_to_axis()
                                 .track_scroll(&h)
-                                // 滚轮放代码块上：代码可横向滚动时 stop_propagation，让滚轮只横向滚代码块、
-                                // 页面（纵向）不再跟着滚动；不可横向滚动时放行交给页面（纵向）滚动。
-                                .on_scroll_wheel({
-                                    let h = h.clone();
-                                    move |_event, _window, cx| {
-                                        if h.max_offset().x > px(0.) {
-                                            cx.stop_propagation();
-                                        }
-                                    }
-                                })
                                 .child(column),
                         )
                         .child(
