@@ -122,8 +122,8 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
             let (fs, _) = p.heading_metrics(n);
             est_text_width(&row.text, fs.as_f32())
         }
-        // 引述：左边框 3px + pl_3 12px 缩进
-        RowKind::Quote => est_text_width(&row.text, p.para_size.as_f32()) + 16.0,
+        // 引述：外层 px_3 内缩(左右 24) + 内层 pl_3/pr_3(左右 24) + 左边框 2px（同代码块做法）
+        RowKind::Quote => est_text_width(&row.text, p.para_size.as_f32()) + 50.0,
         RowKind::Bullet => {
             let prefix_w = row
                 .prefix

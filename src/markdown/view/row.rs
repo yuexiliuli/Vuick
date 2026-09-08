@@ -157,21 +157,30 @@ pub(crate) fn render_row(
                     .into_any_element();
             }
             RowKind::Quote => {
+                // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
+                // 避免背景带顶到左边缘（同代码块做法）。
                 let t = row.text.clone();
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
                     .flex_shrink_0()
-                    .pl_3()
-                    .pr_3()
+                    .px_3()
                     .py_1()
-                    .border_l_2()
-                    .border_color(p.accent)
-                    .bg(p.quote_bg)
-                    .whitespace_normal()
-                    .text_size(p.para_size)
-                    .text_color(p.muted_fg)
-                    .child(t)
+                    .child(
+                        div()
+                            .debug_selector(|| "md-quote-band".into())
+                            .w_full()
+                            .pl_3()
+                            .pr_3()
+                            .py_1()
+                            .border_l_2()
+                            .border_color(p.accent)
+                            .bg(p.quote_bg)
+                            .whitespace_normal()
+                            .text_size(p.para_size)
+                            .text_color(p.muted_fg)
+                            .child(t),
+                    )
                     .into_any_element();
             }
             RowKind::Bullet => {
@@ -254,22 +263,37 @@ pub(crate) fn render_row(
                 .font_weight(FontWeight::BOLD)
                 .child(row.text.clone())
         }
-        RowKind::Quote => div()
-            .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-            .w_full()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .pl_3()
-            .py_1()
-            .border_l_2()
-            .border_color(p.accent)
-            .bg(p.quote_bg)
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .text_size(p.para_size)
-            .text_color(p.muted_fg)
-            .child(row.text.clone()),
+        RowKind::Quote => {
+            // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
+            // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
+            let t = row.text.clone();
+            div()
+                .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
+                .w_full()
+                .flex_shrink_0()
+                .px_3()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .debug_selector(|| "md-quote-band".into())
+                        .h_full()
+                        .w_full()
+                        .pl_3()
+                        .pr_3()
+                        .border_l_2()
+                        .border_color(p.accent)
+                        .bg(p.quote_bg)
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(p.para_size)
+                        .text_color(p.muted_fg)
+                        .child(t),
+                )
+        }
         RowKind::Bullet => {
             let mut text = row.text.to_string();
             if let Some(prefix) = &row.prefix {
