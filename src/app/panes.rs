@@ -85,7 +85,7 @@ impl EditorApp {
     pub(super) fn render_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = self.bar_border();
         let line_color: gpui::Hsla = if self.splitter_hovered || self.split_drag.is_some() {
-            gpui::rgb(0x2563eb).into()
+            gpui::rgb(crate::scrollbar::RESIZE_ACCENT).into()
         } else {
             border
         };

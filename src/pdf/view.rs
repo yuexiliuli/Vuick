@@ -544,6 +544,26 @@ impl PdfViewer {
         }
     }
 
+    /// 目录面板配色：与应用工具栏色板一致（避免组件库 surface 在暗色下近黑，突兀）。
+    /// 返回 (面板底, 分隔边框, 主文字, 次要文字)。
+    fn toc_panel_colors(cx: &App) -> (Hsla, Hsla, Hsla, Hsla) {
+        if gpui_component::Theme::global(cx).is_dark() {
+            (
+                rgb(0x1f2937).into(), // 面板底（同 bar_bg / 页面卡片）
+                rgb(0x374151).into(), // 边框（同 bar_border）
+                rgb(0xe5e7eb).into(), // 主文字（同 text_primary）
+                rgb(0x9ca3af).into(), // 次要文字（同 text_minor）
+            )
+        } else {
+            (
+                gpui::white().into(), // 面板底
+                rgb(0xe5e7eb).into(), // 边框
+                rgb(0x111827).into(), // 主文字
+                rgb(0x6b7280).into(), // 次要文字
+            )
+        }
+    }
+
     /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），关闭 worker 侧文档并清空磁盘缓存。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut drops = std::mem::take(&mut self.pending_drops);
@@ -823,9 +843,8 @@ impl PdfViewer {
         let visible = toc_visibility(&levels, &self.toc_collapsed);
         let theme = gpui_component::Theme::global(cx);
         let colors = theme.semantic_tokens().colors;
-        let fg = colors.foreground;
-        let border = colors.border;
-        let muted = colors.muted_foreground;
+        // 目录面板配色：与应用工具栏色板一致（暗色下是 1f2937 而非组件库 surface 的近黑）
+        let (panel_bg, border, fg, muted) = Self::toc_panel_colors(cx);
         let weak = cx.weak_entity();
 
         let mut items: Vec<gpui::AnyElement> = Vec::with_capacity(outlines.len());
@@ -858,10 +877,10 @@ impl PdfViewer {
                 .group("toc-item")
                 .rounded(px(4.))
                 // 悬浮：主题化柔和底 + 左侧指示条 + 交互反馈；按下稍微加深
-                .hover(|style| style.bg(colors.muted).text_color(fg))
-                .active(|style| style.bg(colors.muted).opacity(0.9));
+                .hover(|style| style.bg(colors.secondary).text_color(fg))
+                .active(|style| style.bg(colors.secondary).opacity(0.85));
 
-            // 左侧当前项指示条（hover 时显现，accent 色）
+            // 左侧当前项指示条（hover 时显现，统一强调蓝）
             let indicator = div()
                 .id(SharedString::from(format!("pdf-toc-ind-{idx}")))
                 .debug_selector(move || format!("pdf-toc-ind-{idx}"))
@@ -871,7 +890,7 @@ impl PdfViewer {
                 .left(px(2.))
                 .w(px(2.))
                 .rounded_full()
-                .bg(colors.accent)
+                .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
                 .opacity(0.0)
                 .group_hover("toc-item", |style| style.opacity(1.0));
 
@@ -900,7 +919,7 @@ impl PdfViewer {
                     .group_hover("toc-item", |style| {
                         style.text_color(colors.foreground)
                     })
-                    .hover(|style| style.bg(colors.muted))
+                    .hover(|style| style.bg(colors.secondary))
                     .on_click(move |_, _w, cx| {
                         cx.stop_propagation();
                         let _ = weak.update(cx, |this, cx| this.toggle_toc_collapse(idx, cx));
@@ -919,7 +938,11 @@ impl PdfViewer {
                         .h(px(5.))
                         .rounded_full()
                         .flex_shrink_0()
-                        .bg(if level == 0 { colors.accent } else { muted }),
+                        .bg(if level == 0 {
+                            rgb(crate::scrollbar::RESIZE_ACCENT).into()
+                        } else {
+                            muted
+                        }),
                 )
                 .child(
                     div()
@@ -995,14 +1018,18 @@ impl PdfViewer {
                         this.start_toc_resize(ev.position.x.as_f32(), cx)
                     });
                 })
-                // 命中区透明，视觉中心一条 2px 竖线（颜色：拖拽/悬浮 accent，平时 border）
+                // 命中区透明，视觉中心一条 2px 竖线（颜色：拖拽/悬浮与分割线统一的强调色，平时 border）
                 .child(
                     div()
                         .w(px(2.))
                         .h_full()
                         .flex_none()
                         .rounded_full()
-                        .bg(if self.toc_drag.is_some() { colors.accent } else { border }),
+                        .bg(if self.toc_drag.is_some() {
+                            rgb(crate::scrollbar::RESIZE_ACCENT).into()
+                        } else {
+                            border
+                        }),
                 )
         };
 
@@ -1014,7 +1041,7 @@ impl PdfViewer {
                 .w(px(self.toc_width))
                 .flex_shrink_0()
                 .relative()
-                .bg(colors.surface)
+                .bg(panel_bg)
                 .border_r_1()
                 .border_color(border)
                 .child(
