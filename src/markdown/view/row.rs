@@ -180,6 +180,16 @@ pub(crate) fn render_row(
                                 .flex_row()
                                 .overflow_x_scroll()
                                 .track_scroll(&h)
+                                // 滚轮放代码块上：代码可横向滚动时 stop_propagation，让滚轮只横向滚代码块、
+                                // 页面（纵向）不再跟着滚动；不可横向滚动时放行交给页面（纵向）滚动。
+                                .on_scroll_wheel({
+                                    let h = h.clone();
+                                    move |_event, _window, cx| {
+                                        if h.max_offset().x > px(0.) {
+                                            cx.stop_propagation();
+                                        }
+                                    }
+                                })
                                 .child(column),
                         )
                         .child(

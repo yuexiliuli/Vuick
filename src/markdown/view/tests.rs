@@ -652,6 +652,14 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
 
     // 关键：代码块滚动句柄跨帧稳定，set_offset 能真正移动代码带（即滚动条可拖动生效）
     let origin_x = band.origin.x.as_f32();
+    // 代码可横向溢出时，句柄 max_offset.x 应 > 0 —— on_scroll_wheel 据此 stop_propagation，
+    // 保证滚轮只横向滚代码、页面不跟着纵向滚动。
+    let (code_max_x,) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        let h = md.code_scroll.get(&code_ix[0]).expect("代码块应注册滚动句柄");
+        (h.max_offset().x,)
+    });
+    assert!(code_max_x > px(0.), "超宽代码块句柄 max_offset.x 应 > 0，实际={code_max_x:?}");
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         let h = md
