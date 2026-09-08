@@ -418,6 +418,10 @@ pub struct PdfViewer {
     toc_width: f32,
     /// 目录右缘拖拽状态：(按下的起始 x, 起始面板宽)。`None` = 未在拖拽。
     toc_drag: Option<(f32, f32)>,
+    /// 目录右缘拖拽手柄是否被鼠标悬浮（用于悬浮/拖拽时高亮手势线）。
+    toc_resize_hovered: bool,
+    /// 目录面板滚动句柄（跟踪纵向滚动容器，供滚动条组件显示）。
+    toc_scroll: ScrollHandle,
     /// 右侧目录抽屉是否展开。
     toc_open: bool,
 }
@@ -453,6 +457,8 @@ impl PdfViewer {
             toc_collapsed: std::collections::HashSet::new(),
             toc_width: TOC_WIDTH_DEFAULT,
             toc_drag: None,
+            toc_resize_hovered: false,
+            toc_scroll: ScrollHandle::new(),
             toc_open: false,
         };
         this.start_load(cx);
@@ -1010,26 +1016,31 @@ impl PdfViewer {
                 .items_stretch()
                 .justify_center()
                 .cursor(CursorStyle::ResizeColumn)
-                .on_hover(cx.listener(|_this: &mut Self, _hovered: &bool, _, cx| {
-                    cx.notify();
-                }))
+                .on_hover(cx.listener(
+                    |this: &mut Self, hovered: &bool, _window, cx| {
+                        this.toc_resize_hovered = *hovered;
+                        cx.notify();
+                    },
+                ))
                 .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
                     let _ = weak.update(cx, |this, cx| {
                         this.start_toc_resize(ev.position.x.as_f32(), cx)
                     });
                 })
-                // 命中区透明，视觉中心一条 2px 竖线（颜色：拖拽/悬浮与分割线统一的强调色，平时 border）
+                // 命中区透明；平时不画第三条线（面板右缘已有 border 边线），
+                // 仅悬浮/拖拽时在命中区中心显示一条强调色竖线作为手势反馈。
                 .child(
                     div()
                         .w(px(2.))
                         .h_full()
                         .flex_none()
                         .rounded_full()
-                        .bg(if self.toc_drag.is_some() {
-                            rgb(crate::scrollbar::RESIZE_ACCENT).into()
+                        .opacity(if self.toc_drag.is_some() || self.toc_resize_hovered {
+                            1.0
                         } else {
-                            border
-                        }),
+                            0.0
+                        })
+                        .bg(rgb(crate::scrollbar::RESIZE_ACCENT)),
                 )
         };
 
@@ -1065,15 +1076,40 @@ impl PdfViewer {
                 )
                 .child(
                     div()
-                        .id("pdf-toc-list")
+                        .id("pdf-toc-scroll-wrap")
+                        .debug_selector(|| "pdf-toc-scroll-wrap".into())
                         .absolute()
                         .top(px(46.))
                         .bottom(px(0.))
                         .left(px(0.))
                         .right(px(6.))
-                        .overflow_y_scroll()
                         .child(
-                            div().id("pdf-toc-list-inner").flex().flex_col().children(items),
+                            div()
+                                .id("pdf-toc-list")
+                                .debug_selector(|| "pdf-toc-list".into())
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.toc_scroll)
+                                .child(
+                                    div()
+                                        .id("pdf-toc-list-inner")
+                                        .flex()
+                                        .flex_col()
+                                        .children(items),
+                                ),
+                        )
+                        // 纵向滚动条：跟随 toc_scroll，滚动时显示（Scrolling 模式）
+                        .child(
+                            div()
+                                .id("pdf-toc-vscroll")
+                                .debug_selector(|| "pdf-toc-vscroll".into())
+                                .absolute()
+                                .inset_0()
+                                .child(
+                                    Scrollbar::vertical(&self.toc_scroll)
+                                        .mode(ScrollbarMode::Scrolling)
+                                        .viewport_from_layout(),
+                                ),
                         ),
                 )
                 .child(resize_handle)
