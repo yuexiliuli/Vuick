@@ -33,7 +33,6 @@ use gpui::{
     Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::pdf::{
@@ -369,6 +368,8 @@ pub struct PdfViewer {
     cache: PageCache,
     /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。
     outlines: Vec<PdfOutlineEntry>,
+    /// 左侧目录抽屉是否展开。
+    toc_open: bool,
 }
 
 impl PdfViewer {
@@ -392,6 +393,7 @@ impl PdfViewer {
             pending_drops: Vec::new(),
             cache,
             outlines: Vec::new(),
+            toc_open: false,
         };
         this.start_load(cx);
         this
@@ -638,105 +640,209 @@ impl PdfViewer {
         }
     }
 
-    /// 右上角悬浮目录按钮：只有文档含书签时才渲染。
-    ///
-    /// 用 gpui-component 的 `Button` + `DropdownMenu`（与 markdown 预览目录一致）：
-    /// 点击弹出书签列表，条目按层级缩进；点击跳转到对应页。
-    fn render_toc_layer(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    /// 切换左侧目录面板开关。
+    fn toggle_toc(&mut self, cx: &mut Context<Self>) {
+        self.toc_open = !self.toc_open;
+        cx.notify();
+    }
+
+    /// 关闭左侧目录面板（点击目录项跳转后 / 点击 ✕ 时）。
+    fn close_toc(&mut self, cx: &mut Context<Self>) {
+        self.toc_open = false;
+        cx.notify();
+    }
+
+    /// 测试辅助：注入任意书签（默认先有 2 条），用于驱动 TOC 面板展开的布局回归测试。
+    #[cfg(test)]
+    fn seed_outlines_for_test(&mut self) {
+        self.outlines = vec![
+            crate::pdf::PdfOutlineEntry {
+                title: "测试章节".into(),
+                level: 0,
+                page_index: 0,
+            },
+            crate::pdf::PdfOutlineEntry {
+                title: "测试小节".into(),
+                level: 1,
+                page_index: 1,
+            },
+        ];
+    }
+
+    /// 测试辅助：直接置位目录展开（不依赖真实书签解析结果）。
+    #[cfg(test)]
+    fn force_toc_open_for_test(&mut self) {
+        self.toc_open = true;
+    }
+
+    /// 浮在 PDF 主体上的目录开关按钮（始终可见，有书签时）。
+    fn render_toc_button(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         if self.outlines.is_empty() {
             return Vec::new();
+        }
+        let theme = gpui_component::Theme::global(cx);
+        let colors = theme.semantic_tokens().colors;
+        let fg = colors.foreground;
+        let weak = cx.weak_entity();
+        let toggle = {
+            let weak = weak.clone();
+            Button::new("pdf-toc-toggle")
+                .label(if self.toc_open { "☰ 收起" } else { "☰ 目录" })
+                .ghost()
+                .h(px(28.))
+                .rounded_full()
+                .text_size(px(12.5))
+                .text_color(fg)
+                .on_click(move |_, _w, cx| {
+                    let _ = weak.update(cx, |this, cx| this.toggle_toc(cx));
+                })
+        };
+        vec![div()
+            .id("pdf-toc-open-btn")
+            .debug_selector(|| "pdf-toc-open-btn".into())
+            .absolute()
+            .top(px(8.))
+            .right(px(10.))
+            .child(toggle)
+            .into_any_element()]
+    }
+
+    /// 左侧目录面板：作为 flex 行布局的**同级兄弟**，展开时占 280px，
+    /// 右侧 PDF 主体被挤压缩小（而非浮层遮挡）。
+    ///
+    /// 关闭或无书签时返回 `None`（完全不参与布局）。
+    fn render_toc_panel(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.outlines.is_empty() || !self.toc_open {
+            return None;
         }
         let outlines = self.outlines.clone();
         let theme = gpui_component::Theme::global(cx);
         let colors = theme.semantic_tokens().colors;
         let fg = colors.foreground;
+        let border = colors.border;
+        let muted = colors.muted_foreground;
         let weak = cx.weak_entity();
 
-        let trigger = Button::new("pdf-toc-toggle")
-            .label("≡ 目录")
-            .ghost()
-            .h(px(28.))
-            .rounded(px(6.))
-            .text_size(px(12.5))
-            .text_color(fg)
-            .dropdown_menu(
-                move |menu: PopupMenu, _window: &mut Window, cx: &mut Context<PopupMenu>| {
-                    let mut m = menu;
-                    let theme = gpui_component::Theme::global(cx);
-                    let colors = theme.semantic_tokens().colors;
-                    let fg = colors.foreground;
-                    let muted = colors.muted_foreground;
-                    let accent = colors.accent;
-                    for entry in outlines.iter() {
-                        let title = entry.title.clone();
-                        let level = entry.level;
-                        let has_page = entry.page_index != usize::MAX;
-                        let page = entry.page_index;
-                        let weak = weak.clone();
-                        let fg = fg.clone();
-                        let muted = muted.clone();
-                        let accent = accent.clone();
-                        let item = PopupMenuItem::element(move |_, _| {
-                            let indent = (level as f32) * 12.0;
-                            div()
-                                .w_full()
-                                .pl(px(indent))
-                                .pr_2()
-                                .py_0()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .w(px(5.))
-                                        .h(px(5.))
-                                        .rounded_full()
-                                        .bg(if level == 0 { accent } else { muted }),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
-                                        .text_size(px(13.))
-                                        .text_color(if has_page { fg } else { muted })
-                                        .child(title.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(10.5))
-                                        .text_color(muted)
-                                        .child(if has_page {
-                                            (page + 1).to_string()
-                                        } else {
-                                            "—".into()
-                                        }),
-                                )
+        let mut items: Vec<gpui::AnyElement> = Vec::with_capacity(outlines.len());
+        for entry in outlines.iter() {
+            let title = entry.title.clone();
+            let level = entry.level;
+            let has_page = entry.page_index != usize::MAX;
+            let page = entry.page_index;
+            let weak = weak.clone();
+            let fg = fg.clone();
+            let item = div()
+                .id(SharedString::from(format!("pdf-toc-item-{page}")))
+                .pl(px(6. + level as f32 * 14.))
+                .pr(px(8.))
+                .py(px(5.))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(0xffffff).opacity(0.06)))
+                .active(|style| style.bg(rgb(0xffffff).opacity(0.12)))
+                .on_click(move |_, _w, cx| {
+                    if has_page {
+                        // 跳转到目标页，但保持目录面板打开（不 close_toc）
+                        let _ = weak.update(cx, |this, cx| {
+                            this.scroll_to_page(page);
+                            cx.notify();
                         });
-                        let item = item.on_click(move |_, _w, cx| {
-                            if has_page {
-                                let _ = weak.update(cx, |this, cx| {
-                                    this.scroll_to_page(page);
-                                    cx.notify();
-                                });
-                            }
-                        });
-                        m = m.item(item);
                     }
-                    m
-                },
-            );
+                })
+                .child(
+                    div()
+                        .w(px(5.))
+                        .h(px(5.))
+                        .rounded_full()
+                        .flex_shrink_0()
+                        .bg(if level == 0 { colors.accent } else { muted }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(13.))
+                        .text_color(if has_page { fg } else { muted })
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(10.5))
+                        .text_color(muted)
+                        .child(if has_page {
+                            (page + 1).to_string()
+                        } else {
+                            "—".into()
+                        }),
+                );
+            items.push(item.into_any_element());
+        }
 
-        vec![div()
-            .id("pdf-toc-wrap")
-            .debug_selector(|| "pdf-toc-wrap".into())
-            .absolute()
-            .top(px(8.))
-            .right(px(20.))
-            .child(trigger)
-            .into_any_element()]
+        let close_btn = {
+            let weak = weak.clone();
+            Button::new("pdf-toc-close")
+                .label("✕")
+                .ghost()
+                .h(px(24.))
+                .w(px(24.))
+                .rounded(px(4.))
+                .text_size(px(12.))
+                .text_color(muted)
+                .on_click(move |_, _w, cx| {
+                    let _ = weak.update(cx, |this, cx| this.close_toc(cx));
+                })
+        };
+
+        Some(
+            div()
+                .id("pdf-toc-panel")
+                .debug_selector(|| "pdf-toc-panel".into())
+                .h_full()
+                .w(px(280.))
+                .flex_shrink_0()
+                .bg(colors.surface)
+                .border_r_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .id("pdf-toc-header")
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(12.))
+                        .h(px(40.))
+                        .border_b_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child("目录"),
+                        )
+                        .child(close_btn),
+                )
+                .child(
+                    div()
+                        .id("pdf-toc-list")
+                        .absolute()
+                        .top(px(46.))
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .overflow_y_scroll()
+                        .child(
+                            div().id("pdf-toc-list-inner").flex().flex_col().children(items),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -827,46 +933,77 @@ impl Render for PdfViewer {
                 .h(px(total))
                 .children(cards);
 
-            // 竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
+            // 竖向+横向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
+            // wrap 宽度 = max(视口宽, 页宽+边距)：窗口宽时内容居中；窗口过窄（如目录
+            // 展开挤压）时 wrap 宽于视口 → 触发横向滚动条，可滚到全部页面不被裁剪。
+            let view_w = f32::from(self.scroll.bounds().size.width);
+            let wrap_w = view_w.max(page_width + 2.0 * PAGE_PAD_X);
             div()
                 .id("pdf-scroll")
                 .debug_selector(|| "pdf-scroll".into())
                 .size_full()
                 .overflow_y_scroll()
+                .overflow_x_scroll()
                 .track_scroll(&self.scroll)
                 .child(
                     div()
                         .id("pdf-column-wrap")
-                        .w_full()
+                        .w(px(wrap_w))
                         .flex()
                         .flex_row()
                         .justify_center()
-                        .px(px(PAGE_PAD_X))
                         .child(content),
                 )
                 .into_any_element()
         };
+
+        // 外层：flex row——左 TOC 面板（展开时挤压右侧 PDF）+ 右 PDF 主体
+        // 目录按钮作为 absolute 覆盖层挂在最外层 pdf-viewer（relative），
+        // 不随 PDF 滚动、也不被面板挤压，始终悬浮在右上角可见。
+        let toc_panel: Option<gpui::AnyElement> = self.render_toc_panel(cx);
 
         div()
             .id("pdf-viewer")
             .debug_selector(|| "pdf-viewer".into())
             .size_full()
             .relative()
+            .flex()
+            .flex_row()
             .bg(canvas)
-            .child(body)
+            .children(toc_panel) // 左：目录面板（宽度参与布局，展开时挤压右侧）
             .child(
                 div()
-                    .id("pdf-vscroll-overlay")
-                    .debug_selector(|| "pdf-vscroll-overlay".into())
-                    .absolute()
-                    .inset_0()
+                    .id("pdf-main")
+                    .debug_selector(|| "pdf-main".into())
+                    // 右：PDF 页面主体。flex 行里填满剩余宽度；min_w(0) 允许其压缩到内容
+                    // 最小宽以下——否则自动最小尺寸=页面列宽(~880px)，目录展开时不被挤压，
+                    // 滚动条叠层越出窗口右侧（横向条的右半不可见）且 bounds/比例与窗口脱节。
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .relative()
+                    .child(body)
                     .child(
-                        Scrollbar::vertical(&self.scroll)
-                            .mode(ScrollbarMode::Scrolling)
-                            .viewport_from_layout(),
+                        div()
+                            .id("pdf-scrollbar-overlay")
+                            .debug_selector(|| "pdf-scrollbar-overlay".into())
+                            .absolute()
+                            .inset_0()
+                            .child(
+                                Scrollbar::vertical(&self.scroll)
+                                    .mode(ScrollbarMode::Scrolling)
+                                    .viewport_from_layout(),
+                            )
+                            // 横向滚动条：参照 markdown 预览——窗口过窄（如目录展开挤压）时
+                            // scroll 容器内容宽于视口，横向溢出可滚；轴 Always 常驻可见。
+                            .child(
+                                Scrollbar::horizontal(&self.scroll)
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
                     ),
             )
-            .children(self.render_toc_layer(cx))
+            .children(self.render_toc_button(cx)) // 悬浮按钮：absolute 覆盖在最外层
     }
 }
 
@@ -1136,5 +1273,102 @@ mod tests {
     /// 与 `keep_window` 同款布局的一页（高 + 间距）步长（测试辅助）。
     fn page_step(page_width: f32) -> f32 {
         display_height(a4(), page_width) + PAGE_GAP
+    }
+
+    use gpui::{AppContext, Entity, TestAppContext, VisualTestContext, size};
+
+    struct PdfHost {
+        viewer: Entity<PdfViewer>,
+    }
+    impl Render for PdfHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.viewer.clone()
+        }
+    }
+
+    fn setup_host(
+        cx: &mut TestAppContext,
+        size: gpui::Size<gpui::Pixels>,
+    ) -> (Entity<PdfHost>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/N107内外饰配置表NEW.pdf");
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let viewer = cx.new(|cx| {
+                let mut v = PdfViewer::new(path, cx);
+                // 测试不依赖真实书签解析：直接布出 2 条目录并展开面板
+                v.seed_outlines_for_test();
+                v.force_toc_open_for_test();
+                v
+            });
+            PdfHost { viewer }
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.simulate_resize(size);
+        // 泵驱动：后台解析的 async 任务需要跑完（真实 PdfWorker 加载），
+        // 多送几帧让滚动容器以最终窗口尺寸完成布局。
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        (host, cx)
+    }
+
+    /// 回归：目录展开 + 窗口收窄时，右侧 PDF 主体必须被挤压进窗口内，
+    /// 滚动条叠层（`pdf-scrollbar-overlay`）不得越出窗口右边界；同时 `pdf-scroll`
+    /// 视口宽应按剩余可用宽度计算（否则横向滚动条的滑块几何与窗口宽度脱节）。
+    #[gpui::test]
+    fn toc_open_narrow_window_keeps_scrollbar_inside(cx: &mut TestAppContext) {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let (host, cx) = setup_host(cx, size(px(980.), px(720.)));
+        // 等 PdfViewer 真正加载完成（真实 pdfium 解析），在已铺页状态下校验布局。
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_, cx| host.read(cx).viewer.read(cx).is_loaded());
+            if loaded {
+                break;
+            }
+        }
+
+        // 目录面板展开时占 280px（280+40=320：TOC 固定 280 + 右侧滚动条？不，
+        // TOC 只是 flex 兄弟占 280px），主体视口宽应 = 980 - 280 = 700。
+        let check = |cx: &mut VisualTestContext, expect_w: f32| {
+            let main = cx.debug_bounds("pdf-main").expect("pdf-main 应存在");
+            let overlay = cx
+                .debug_bounds("pdf-scrollbar-overlay")
+                .expect("滚动条叠层应存在");
+            let scroll = cx.debug_bounds("pdf-scroll").expect("pdf-scroll 应存在");
+            assert!(
+                (main.size.width.as_f32() - expect_w).abs() < 2.0,
+                "pdf-main 宽应约为 {expect_w}（视口 - 目录 280），实际={main:?}"
+            );
+            assert!(
+                (overlay.size.width.as_f32() - expect_w).abs() < 2.0,
+                "滚动条叠层应铺满 pdf-main（约 {expect_w}），不得越出窗口，实际={overlay:?}"
+            );
+            assert!(
+                (scroll.size.width.as_f32() - expect_w).abs() < 2.0,
+                "pdf-scroll 视口宽应等于剩余可用宽（约 {expect_w}），实际={scroll:?}"
+            );
+            let origin = overlay.origin;
+            assert!(
+                origin.x.as_f32() >= -0.5 && origin.y.as_f32() >= -0.5,
+                "滚动条叠层不应越出窗口左上角，actual origin={origin:?}"
+            );
+        };
+        check(cx, 700.0);
+
+        // 窗口收窄到 620：主体宽应 ≈ 620 - 280 = 340（此前 bug：flex 项被自动
+        // 最小宽=页面列宽阻止收缩，主体仍约 880px 且滚动条右半越出窗口）。
+        cx.simulate_resize(size(px(620.), px(720.)));
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        check(cx, 340.0);
     }
 }
