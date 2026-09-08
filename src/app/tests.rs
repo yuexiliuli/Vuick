@@ -527,10 +527,53 @@
              否则横向不会溢出、滚动条也不出现",
             wrap.size.width,
             preview.size.width,
-            harea.size.width
+              harea.size.width
         );
         let _ = std::fs::remove_file(&dir);
     }
+
+    /// Markdown 编辑区与预览区默认/始终自动换行，不提供切换 → 状态栏隐藏「换行/不换行」按钮；
+    /// 普通文本文件仍保留该切换按钮。
+    #[gpui::test]
+    async fn wrap_button_hidden_for_markdown(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(500.), px(500.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // md 文件：应隐藏换行按钮
+        let md = std::env::temp_dir().join("gpui-editor-wrap-test.md");
+        std::fs::write(&md, "# 标题\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_none(),
+            "Markdown 文件预览时状态栏不应出现换行开关"
+        );
+        let _ = std::fs::remove_file(&md);
+
+        // 普通文本文件：应保留换行按钮
+        let txt = std::env::temp_dir().join("gpui-editor-wrap-test.txt");
+        std::fs::write(&txt, "hello world\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_some(),
+            "普通文本文件状态栏应保留换行开关"
+        );
+        let _ = std::fs::remove_file(&txt);
+    }
+
 
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]
