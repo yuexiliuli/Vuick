@@ -156,6 +156,7 @@ pub(crate) fn render_row(
                 .flex()
                 .flex_col()
                 .flex_shrink_0()
+                .min_w_full()
                 .children(lines.iter().map(|l| code_band(l.clone(), &p_)));
             return div()
                 .debug_selector(|| "md-code-hscroll".into())

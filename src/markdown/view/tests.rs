@@ -687,4 +687,40 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
     assert!(max_x > px(0.), "非换行模式也应横向可滚动，max_offset.x={max_x:?}");
 }
 
+/// 换行模式下，短代码块的背景应铺满预览视口宽（跟随窗口），而不是只到文本最右边缘，
+/// 使各代码块视觉宽度统一；且不产生（无溢出的）横向滚动条。
+#[gpui::test]
+fn code_block_bg_spans_pane_width_in_wrap(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 很短的多行代码（远窄于视口）
+    let md_src = "```rs\nlet a = 1;\nlet b = 2;\n```\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(md_src, cx);
+        });
+    });
+    cx.simulate_resize(size(px(500.), px(400.)));
+    settle(cx);
+
+    let preview = cx
+        .debug_bounds("md-preview")
+        .expect("预览根 md-preview 应存在");
+    let band = cx
+        .debug_bounds("md-code-band")
+        .expect("代码背景带 md-code-band 应存在");
+    // 代码块背景铺满预览内容宽 = 视口宽 - 左右 px_3(24px)，各代码块宽度统一并跟随窗口
+    let expect_w = preview.size.width.as_f32() - 24.0;
+    assert!(
+        (band.size.width.as_f32() - expect_w).abs() < 2.0,
+        "短代码块背景应铺满预览内容宽({expect_w:.0})，band={band:?} preview={preview:?}"
+    );
+}
+
 
