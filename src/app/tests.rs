@@ -485,8 +485,8 @@
         let _ = std::fs::remove_file(&dir2);
     }
 
-    /// 选项 app 里打开超宽 .md 时，预览横向滚动容器应真实溢出
-    /// （md-list-wrap 宽度 > md-preview / md-harea 视口宽度）。
+    /// 换行模式下在 app 里打开含超宽代码块的 .md 时，代码块横向滚动条应真实渲染/可滚动
+    /// （md-preview 渲染、代码带宽于预览视口）。
     #[gpui::test]
     async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
         init_test(cx);
@@ -496,8 +496,9 @@
             cx.run_until_parked();
         }
 
+        let long_line = "f".repeat(500);
         let dir = std::env::temp_dir().join("gpui-editor-hscroll-test.md");
-        std::fs::write(&dir, "# 标题\n\n".to_string() + &"x".repeat(300) + "\n").unwrap();
+        std::fs::write(&dir, format!("```rs\n{long_line}\n```\n")).unwrap();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
         });
@@ -505,29 +506,28 @@
             cx.run_until_parked();
         }
 
-        let (preview, harea, wrap) = (
-            cx.debug_bounds("md-preview"),
-            cx.debug_bounds("md-harea"),
-            cx.debug_bounds("md-list-wrap"),
-        );
-        let preview = preview.expect("md-preview 应渲染");
-        let harea = harea.expect("md-harea 应渲染");
-        let wrap = wrap.expect("md-list-wrap 应渲染");
-        eprintln!(
-            "[hscroll] preview={preview:?} harea={harea:?} wrap={wrap:?}"
-        );
+        let preview = cx
+            .debug_bounds("md-preview")
+            .expect("md-preview 应渲染");
         assert!(
             preview.size.width > px(0.),
             "预览视口应有宽度，实际={:?}",
             preview.size.width
         );
+        // 超宽代码带应宽于预览视口（可横向滚动），滚动条叠层非零渲染
+        let band = cx
+            .debug_bounds("md-code-band")
+            .expect("代码背景带 md-code-band 应存在");
         assert!(
-            wrap.size.width > preview.size.width,
-            "宽包装层应宽于预览视口（wrap={:?} > preview={:?}，harea={:?}），
-             否则横向不会溢出、滚动条也不出现",
-            wrap.size.width,
-            preview.size.width,
-              harea.size.width
+            band.size.width > preview.size.width,
+            "代码带宽应宽于预览视口（可横向滚动），band={band:?} preview={preview:?}"
+        );
+        let sbar = cx
+            .debug_bounds("md-code-scrollbar")
+            .expect("代码块横向滚动条 md-code-scrollbar 应存在");
+        assert!(
+            sbar.size.width > px(0.) && sbar.size.height > px(0.),
+            "横向滚动条不应塌缩成 0，实际={sbar:?}"
         );
         let _ = std::fs::remove_file(&dir);
     }
@@ -556,6 +556,11 @@
             cx.debug_bounds("status-wrap-btn").is_none(),
             "Markdown 文件预览时状态栏不应出现换行开关"
         );
+        let wraps = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+        });
+        assert!(wraps, "刚打开 Markdown 预览应默认自动换行");
         let _ = std::fs::remove_file(&md);
 
         // 普通文本文件：应保留换行按钮
