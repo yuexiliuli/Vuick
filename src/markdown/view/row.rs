@@ -22,10 +22,17 @@ pub(crate) fn render_row(
     wrap: bool,
     _cx: &mut App,
 ) -> gpui::AnyElement {
-    // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配
+    // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
+    // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
     if let RowKind::Table = row.kind {
         let table = row.table.as_ref().expect("Table 行必须携带表格结构");
-        return render_table(table, p).into_any_element();
+        return div()
+            .w_full()
+            .flex_shrink_0()
+            .px_3()
+            .py_1()
+            .child(render_table(table, p))
+            .into_any_element();
     }
     // 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。
     // 宽不超过 IMAGE_MAX_W；未知尺寸（URL/不可读）回退固定 IMAGE_ROW_DEFAULT_H。
@@ -200,25 +207,36 @@ pub(crate) fn render_row(
             .px_3()
             .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
         RowKind::Code => {
-            // 代码行：整行浅灰背景带（与栅栏内其它行连成一块），等宽字体
+            // 代码行：浅灰背景带（左右内缩 px_3，与正文对齐；栅栏内各行连成一块），等宽字体。
+            // 背景必须放到内层元素：外层 px_3 只缩内容盒，bg 会铺满含 padding 的整盒。
             let t = row.text.clone();
             div()
                 .h(p.code_line)
                 .w_full()
                 .flex_shrink_0()
-                .bg(p.muted_bg)
+                .px_3()
                 .flex()
                 .items_center()
                 .overflow_hidden()
                 .child(
                     div()
-                        .pl_3()
-                        .pr_3()
-                        .whitespace_nowrap()
-                        .font_family(p.mono.clone())
-                        .text_size(p.code_size)
-                        .text_color(p.fg)
-                        .child(t),
+                        .debug_selector(|| "md-code-band".into())
+                        .h_full()
+                        .w_full()
+                        .bg(p.muted_bg)
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .pl_3()
+                                .pr_3()
+                                .whitespace_nowrap()
+                                .font_family(p.mono.clone())
+                                .text_size(p.code_size)
+                                .text_color(p.fg)
+                                .child(t),
+                        ),
                 )
         }
         RowKind::Heading(n) => {

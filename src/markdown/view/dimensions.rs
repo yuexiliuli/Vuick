@@ -115,8 +115,8 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
             0.0
         }
         RowKind::Code => {
-            // 等宽字体按 0.65em/字符 + 左右 padding（pl_3 + pr_3 = 24px）
-            row.text.chars().count() as f32 * p.code_size.as_f32() * 0.65 + 24.0
+            // 等宽字体按 0.65em/字符 + 内部 padding（pl_3 + pr_3 = 24px）+ 外层内缩（px_3 = 24px）
+            row.text.chars().count() as f32 * p.code_size.as_f32() * 0.65 + 48.0
         }
         RowKind::Heading(n) => {
             let (fs, _) = p.heading_metrics(n);
@@ -137,7 +137,9 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
             .table
             .as_ref()
             .map(|t| table_column_widths(t, p).iter().sum())
-            .unwrap_or(0.0),
+            .unwrap_or(0.0)
+            // 渲染时外层 px_3 内缩（左右共 24px）
+            + 24.0,
     }
 }
 

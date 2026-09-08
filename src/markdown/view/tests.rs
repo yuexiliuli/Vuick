@@ -143,6 +143,46 @@ fn no_hscroll_when_content_fits(cx: &mut TestAppContext) {
     assert_eq!(max_x, px(0.), "短内容不应产生横向滚动范围，实际={max_x:?}");
 }
 
+/// 代码块的浅灰背景带与表格网格都应内缩（不贴左分隔栏边缘），与正文对齐。
+/// 回归：背景必须画在内层元素上，外层仅用 px_3 留白（bg 会铺满含 padding 的整盒）。
+#[gpui::test]
+fn code_band_and_table_inset_from_left_edge(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 段落 → 代码栅栏 → 表格，保证三种元素都在同一份源码里
+    let md_src = "开场段落\n\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 型号 | 尺寸 |\n|---|---|\n| A | 10 |\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(md_src, cx));
+    });
+    cx.simulate_resize(size(px(400.), px(600.)));
+    settle(cx);
+
+    let band = cx
+        .debug_bounds("md-code-band")
+        .expect("代码背景带 md-code-band 应存在");
+    let table = cx
+        .debug_bounds("md-table")
+        .expect("表格 md-table 应存在");
+    // 与正文一致的 px_3 = 12px 内缩（容 1px 浮点误差）
+    for (name, b) in [("代码背景带", band), ("表格", table)] {
+        assert!(
+            (b.origin.x - px(12.)).abs() < px(1.),
+            "{name} 应从左边缘内缩约 12px，实际 origin.x={:?}",
+            b.origin.x
+        );
+    }
+    // 代码背景带应有宽高（不会塌缩成 0）
+    assert!(
+        band.size.width > px(0.) && band.size.height > px(0.),
+        "代码背景带不应塌缩，实际={band:?}"
+    );
+}
+
 /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。
 #[gpui::test]
 fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {
