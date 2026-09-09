@@ -19,12 +19,36 @@ use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 
-/// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 弱化文字色；浅灰圆角背景由
+/// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
+/// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
+/// 黑=底 #3e3f40 + 文字 #dadada；文字与正文同色，靠底色 + 等宽字体区分。
+struct InlineCodeColors {
+    fg: Hsla,
+    bg: Hsla,
+}
+
+/// 按主题取行内代码配色（浅色/暗色定制）。
+fn inline_code_colors(cx: &App) -> InlineCodeColors {
+    let dark = gpui_component::Theme::global(cx).is_dark();
+    if dark {
+        InlineCodeColors {
+            fg: gpui::rgb(0xdadada).into(),
+            bg: gpui::rgb(0x3e3f40).into(),
+        }
+    } else {
+        InlineCodeColors {
+            fg: gpui::rgb(0x222222).into(),
+            bg: gpui::rgb(0xf3f4f4).into(),
+        }
+    }
+}
+
+/// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 主题配色文字；圆角底色由
 /// [`RoundedInlineText`] 在 paint 阶段按代码段的像素几何自绘（方角 highlight 背景
 /// 无法圆角，且 gpui 文本 run 背景只有平面矩形）。
-fn inline_code_highlight(p: &StyleParams) -> HighlightStyle {
+fn inline_code_highlight(colors: &InlineCodeColors) -> HighlightStyle {
     HighlightStyle {
-        color: Some(p.muted_fg),
+        color: Some(colors.fg),
         ..Default::default()
     }
 }
@@ -62,6 +86,7 @@ fn styled_text(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
+    colors: &InlineCodeColors,
 ) -> Option<StyledText> {
     if runs.is_empty() {
         return None;
@@ -71,8 +96,8 @@ fn styled_text(
     for (range, kind) in runs {
         match kind {
             RunKind::InlineCode => {
-                // 等宽字体 overrides 只覆盖代码本体；文字色用弱化前景（背景圆角自绘）。
-                highlights.push((range.clone(), inline_code_highlight(p)));
+                // 等宽字体 overrides 只覆盖代码本体；文字色用主题配色（背景圆角自绘）。
+                highlights.push((range.clone(), inline_code_highlight(colors)));
                 mono.push((range.clone(), p.mono.clone()));
             }
             RunKind::Bold => highlights.push((
@@ -161,6 +186,7 @@ fn row_text_child(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
+    colors: &InlineCodeColors,
 ) -> gpui::AnyElement {
     // 主题自带的 HighlightStyle 背景只能是平面矩形；要圆角必须自绘。
     // 这里提取"扩展空白后的代码背景区间"，用自绘 Element 画圆角。
@@ -170,19 +196,19 @@ fn row_text_child(
         .map(|(r, _)| expand_bg_over_whitespace(text.as_ref(), r))
         .collect();
     if code_bg.is_empty() {
-        return match styled_text(text, runs, p) {
+        return match styled_text(text, runs, p, colors) {
             Some(st) => st.into_any_element(),
             None => text.clone().into_any_element(),
         };
     }
-    let Some(st) = styled_text(text, runs, p) else {
+    let Some(st) = styled_text(text, runs, p, colors) else {
         return text.clone().into_any_element();
     };
     RoundedInlineText {
         text: st,
         code_bg,
         radius: px(5.),
-        bg: p.muted_bg,
+        bg: colors.bg,
     }
     .into_any_element()
 }
@@ -333,8 +359,10 @@ pub(crate) fn render_row(
     p: &Rc<StyleParams>,
     wrap: bool,
     code_handle: Option<ScrollHandle>,
-    _cx: &mut App,
+    cx: &mut App,
 ) -> gpui::AnyElement {
+    // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
+    let inline_colors = inline_code_colors(cx);
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
     // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
     if let RowKind::Table = row.kind {
@@ -497,7 +525,7 @@ pub(crate) fn render_row(
         }
         match row.kind {
             RowKind::Paragraph => {
-                let t = row_text_child(&row.text, &row.runs, &p);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -512,7 +540,7 @@ pub(crate) fn render_row(
             }
             RowKind::Heading(n) => {
                 let (fs, lh) = p.heading_metrics(n);
-                let t = row_text_child(&row.text, &row.runs, &p);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
                 return div()
                     .w_full()
                     .min_h(lh)
@@ -529,7 +557,7 @@ pub(crate) fn render_row(
             RowKind::Quote => {
                 // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
                 // 避免背景带顶到左边缘（同代码块做法）。
-                let t = row_text_child(&row.text, &row.runs, &p);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -561,7 +589,7 @@ pub(crate) fn render_row(
                 let display = gpui::SharedString::from(text);
                 let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
                 let runs = shift_runs(&row.runs, shift);
-                let t = row_text_child(&display, &runs, &p);
+                let t = row_text_child(&display, &runs, &p, &inline_colors);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -613,7 +641,7 @@ pub(crate) fn render_row(
         }
         RowKind::Heading(n) => {
             let (fs, lh) = p.heading_metrics(n);
-            let t = row_text_child(&row.text, &row.runs, &p);
+            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
             div()
                 .h(lh)
                 .w_full()
@@ -630,7 +658,7 @@ pub(crate) fn render_row(
         RowKind::Quote => {
             // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
             // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = row_text_child(&row.text, &row.runs, &p);
+            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -666,7 +694,7 @@ pub(crate) fn render_row(
             let display = gpui::SharedString::from(text);
             let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
             let runs = shift_runs(&row.runs, shift);
-            let t = row_text_child(&display, &runs, &p);
+            let t = row_text_child(&display, &runs, &p, &inline_colors);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -690,7 +718,7 @@ pub(crate) fn render_row(
             .whitespace_nowrap()
             .text_size(p.para_size)
             .text_color(p.fg)
-            .child(row_text_child(&row.text, &row.runs, &p)),
+            .child(row_text_child(&row.text, &row.runs, &p, &inline_colors)),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
