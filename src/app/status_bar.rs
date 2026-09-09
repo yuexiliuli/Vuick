@@ -3,6 +3,21 @@
 use super::*;
 
 impl EditorApp {
+    /// 切换当前激活项的 PDF/EPUB 左侧目录面板「打开/收起」。
+    fn toggle_doc_toc(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        if let Some(pdf) = &tab.pdf_preview {
+            let pv = pdf.clone();
+            pv.update(cx, |v, cx| v.toggle_toc(cx));
+        } else {
+            let md = tab.md_preview.clone();
+            md.update(cx, |v, cx| v.toggle_toc_panel(cx));
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_status_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tabs.get(self.active_tab);
         let (ln, col) = tab
@@ -20,7 +35,7 @@ impl EditorApp {
         );
 
         // 左侧：文件名 + 脏标记 + 语言徽标
-        let left = div()
+        let mut left = div()
             .flex()
             .flex_row()
             .items_center()
@@ -57,6 +72,38 @@ impl EditorApp {
                     .text_color(rgb(0x4338ca))
                     .child(language),
             );
+
+        // PDF/EPUB 目录「打开/收起」开关：放在状态栏左侧、语言徽标之后。
+        // PDF → 书签目录（pdf_preview）；EPUB → PDF 式左侧目录面板（md_preview）。
+        let toc_open = tab.and_then(|t| {
+            if let Some(pdf) = &t.pdf_preview {
+                let p = pdf.read(cx);
+                (!p.outlines().is_empty()).then_some(p.toc_open)
+            } else {
+                let md = t.md_preview.read(cx);
+                (md.toc_panel_enabled() && md.toc_has_content()).then_some(md.toc_open_state())
+            }
+        });
+        if let Some(open) = toc_open {
+            let btn = div()
+                .id("status-toc-btn")
+                .debug_selector(|| "status-toc-btn".into())
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(rgb(0xeef2ff))
+                .text_size(px(12.))
+                .text_color(rgb(0x4338ca))
+                .cursor(CursorStyle::PointingHand)
+                .child(if open { "☰ 收起" } else { "☰ 目录" })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
+                        this.toggle_doc_toc(cx);
+                    }),
+                );
+            left = left.child(btn);
+        }
 
         // 右侧：阅读/统计按钮
         // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。

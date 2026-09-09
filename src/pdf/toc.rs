@@ -9,7 +9,6 @@ use gpui::{
     div, px, rgb, App, Context, CursorStyle, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::{Icon, IconName};
 
@@ -132,40 +131,6 @@ impl PdfViewer {
             self.toc_drag = None;
             cx.notify();
         }
-    }
-
-    /// 浮在 PDF 主体上的目录开关按钮（始终可见，有书签时）。
-    pub(crate) fn render_toc_button(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        if self.outlines().is_empty() {
-            return Vec::new();
-        }
-        let theme = gpui_component::Theme::global(cx);
-        let colors = theme.semantic_tokens().colors;
-        let fg = colors.foreground;
-        let weak = cx.weak_entity();
-        let toggle = {
-            let weak = weak.clone();
-            Button::new("pdf-toc-toggle")
-                .label(if self.toc_open { "☰ 收起" } else { "☰ 目录" })
-                .ghost()
-                .h(px(28.))
-                .rounded_full()
-                .text_size(px(12.5))
-                .text_color(fg)
-                .on_click(move |_, _w, cx| {
-                    let _ = weak.update(cx, |this, cx| this.toggle_toc(cx));
-                })
-        };
-        vec![
-            div()
-                .id("pdf-toc-open-btn")
-                .debug_selector(|| "pdf-toc-open-btn".into())
-                .absolute()
-                .top(px(8.))
-                .right(px(10.))
-                .child(toggle)
-                .into_any_element(),
-        ]
     }
 
     /// 左侧目录面板：作为 flex 行布局的**同级兄弟**，展开时占 `toc_width`.

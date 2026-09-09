@@ -1,9 +1,9 @@
 //! EPUB 阅读的左侧目录面板（PDF 书签目录同款样式）。
 //!
 //! 实现与 [`crate::pdf::toc`] 对齐——左侧面板占宽挤压预览主体、可折叠树、
-//! 右缘拖拽调宽、纵向滚动条、右上角「☰ 目录/收起」开关；数据来自
-//! [`MarkdownPreview::toc`]（行号 / 标题级别 / 标题文本），点击条目跳转到
-//! 对应标题行。
+//! 右缘拖拽调宽、纵向滚动条；「☰ 目录/收起」开关统一放在应用底部状态栏
+//! （见 `app::status_bar`），数据来自 [`MarkdownPreview::toc`]（行号 / 标题级别 /
+//! 标题文本），点击条目跳转到对应标题行。
 //!
 //! 通过 [`MarkdownPreview::set_toc_panel`] 开启（EPUB 打开时由应用设置）；
 //! 普通 Markdown 预览仍用右上角下拉目录，不受影响。
@@ -12,7 +12,6 @@ use gpui::{
     div, px, rgb, App, Context, CursorStyle, Hsla, InteractiveElement, IntoElement, MouseButton,
     ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_component::{Icon, IconName};
 
@@ -59,6 +58,21 @@ impl MarkdownPreview {
         cx.notify();
     }
 
+    /// 是否启用 PDF 式左侧目录面板（EPUB 打开时置位）。
+    pub(crate) fn toc_panel_enabled(&self) -> bool {
+        self.toc_panel
+    }
+
+    /// 目录是否有内容（有标题行才能展开面板）。
+    pub(crate) fn toc_has_content(&self) -> bool {
+        !self.toc.is_empty()
+    }
+
+    /// 目录面板当前是否展开。
+    pub(crate) fn toc_open_state(&self) -> bool {
+        self.toc_open
+    }
+
     /// 关闭左侧目录面板（点击 ✕ 时）。
     pub(crate) fn close_toc_panel(&mut self, cx: &mut Context<Self>) {
         self.toc_open = false;
@@ -100,40 +114,6 @@ impl MarkdownPreview {
             self.toc_drag = None;
             cx.notify();
         }
-    }
-
-    /// 浮在预览主体上的目录开关按钮（面板模式、有标题时始终可见）。
-    pub(crate) fn render_toc_button(&self, cx: &Context<Self>) -> Vec<gpui::AnyElement> {
-        if !self.toc_panel || self.toc.is_empty() {
-            return Vec::new();
-        }
-        let theme = gpui_component::Theme::global(cx);
-        let colors = theme.semantic_tokens().colors;
-        let fg = colors.foreground;
-        let weak = cx.weak_entity();
-        let toggle = {
-            let weak = weak.clone();
-            Button::new("epub-toc-toggle")
-                .label(if self.toc_open { "☰ 收起" } else { "☰ 目录" })
-                .ghost()
-                .h(px(28.))
-                .rounded_full()
-                .text_size(px(12.5))
-                .text_color(fg)
-                .on_click(move |_, _w, cx| {
-                    let _ = weak.update(cx, |this, cx| this.toggle_toc_panel(cx));
-                })
-        };
-        vec![
-            div()
-                .id("epub-toc-open-btn")
-                .debug_selector(|| "epub-toc-open-btn".into())
-                .absolute()
-                .top(px(8.))
-                .right(px(10.))
-                .child(toggle)
-                .into_any_element(),
-        ]
     }
 
     /// 左侧目录面板：作为 flex 行布局的**同级兄弟**，展开时占 `toc_width`，

@@ -491,9 +491,8 @@ impl Render for PdfViewer {
                 .into_any_element()
         };
 
-        // 外层：flex row——左 TOC 面板（展开时挤压右侧 PDF）+ 右 PDF 主体
-        // 目录按钮作为 absolute 覆盖层挂在最外层 pdf-viewer（relative），
-        // 不随 PDF 滚动、也不被面板挤压，始终悬浮在右上角可见。
+        // 外层：flex row——左 TOC 面板（展开时挤压右侧 PDF）+ 右 PDF 主体。
+        // 目录开关统一放在应用底部状态栏（见 app::status_bar），此处不再悬浮按钮。
         let toc_panel: Option<gpui::AnyElement> = self.render_toc_panel(cx);
 
         div()
@@ -555,7 +554,6 @@ impl Render for PdfViewer {
                             ),
                     ),
             )
-            .children(self.render_toc_button(cx)) // 悬浮按钮：absolute 覆盖在最外层
     }
 }
 

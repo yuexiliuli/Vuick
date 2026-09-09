@@ -406,11 +406,11 @@ impl Render for MarkdownPreview {
                 },
             ));
 
-        // EPUB 目录：PDF 式左侧面板（展开时挤压右侧预览主体）+ 右上角「☰ 目录/收起」；
-        // 普通 Markdown 预览仍用右上角下拉目录。
+        // EPUB 目录：PDF 式左侧面板（展开时挤压右侧预览主体）；「☰ 目录/收起」
+        // 开关统一放在应用底部状态栏（见 app::status_bar），普通 Markdown 预览仍用
+        // 右上角下拉目录。
         if self.toc_panel {
             let panel: Option<gpui::AnyElement> = self.render_toc_panel(cx);
-            let toc_button = self.render_toc_button(cx);
             return root
                 .flex()
                 .flex_row()
@@ -448,8 +448,7 @@ impl Render for MarkdownPreview {
                         .h_full()
                         .relative()
                         .child(core),
-                )
-                .children(toc_button);
+                );
         }
 
         // 普通 Markdown：右上角悬浮按钮 + 下拉菜单（见 [`toc`] 模块）

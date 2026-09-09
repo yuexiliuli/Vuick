@@ -904,7 +904,8 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
 }
 
 /// 回归：EPUB 目录应使用 PDF 式左侧面板——面板在最左侧占 280px、
-/// 挤压预览主体到右侧；右上角有「☰」开关；折叠父项隐藏其后代标题。
+/// 挤压预览主体到右侧；（「☰ 目录/收起」开关在应用底部状态栏，不在此渲染）；
+/// 折叠父项隐藏其后代标题。
 #[gpui::test]
 fn epub_toc_panel_renders_on_left(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -948,11 +949,7 @@ fn epub_toc_panel_renders_on_left(cx: &mut TestAppContext) {
         preview.origin,
         panel.size.width.as_f32()
     );
-    // 开关按钮与纵向滚动条真实渲染
-    assert!(
-        cx.debug_bounds("epub-toc-open-btn").is_some(),
-        "应有目录开关按钮（epub-toc-open-btn）"
-    );
+    // 纵向滚动条真实渲染
     assert!(
         cx.debug_bounds("epub-toc-vscroll").is_some(),
         "目录面板应有纵向滚动条"
