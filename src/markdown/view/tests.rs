@@ -740,12 +740,28 @@ fn wide_table_scrolls_in_wrap_mode(cx: &mut TestAppContext) {
         hscroll.size.width <= preview.size.width + px(1.),
         "表格滚动容器应等于预览视口宽，实际 hscroll={hscroll:?} preview={preview:?}"
     );
-    // 表格应完整放进滚动容器高度（估算高度与实际渲染一致，不被裁剪）
+    // 表格应完整放进滚动容器：容器严格高于表格（自然高度，不被裁剪）；
+    // 底部预留滚动条轨道条（≥15px），横向滚动条不遮挡表格末行。
     assert!(
-        table.size.height <= hscroll.size.height + px(1.),
-        "表格应完整放进滚动容器，table_h={:.0} hscroll_h={:?}",
+        hscroll.size.height > table.size.height,
+        "滚动容器应严格高于表格（自然高度不被裁剪），table_h={:.0} hscroll_h={:?}",
         table.size.height.as_f32(),
         hscroll.size.height
+    );
+    assert!(
+        hscroll.size.height.as_f32() - table.size.height.as_f32() >= 15.0,
+        "底部应预留横向滚动条轨道条（≥15px 不遮挡内容），table_h={:.0} hscroll_h={:?}",
+        table.size.height.as_f32(),
+        hscroll.size.height
+    );
+    // 表格渲染高度至少覆盖 表头 + 分隔线 + 数据行（末行不被裁剪）
+    let p = cx.update(|_w, cx| StyleParams::from_theme_with_font(cx, None));
+    let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+    let content_h = row_h * 2.0 + 1.0;
+    assert!(
+        table.size.height.as_f32() >= content_h - 1.0,
+        "表格高度应覆盖表头+数据行+分隔线（content_h={content_h:.1}），实际={:?}",
+        table.size.height
     );
     // 滚动条叠层真实渲染（非零尺寸）
     let sbar = cx

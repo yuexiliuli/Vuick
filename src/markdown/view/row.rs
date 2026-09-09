@@ -17,7 +17,11 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use crate::markdown::parser::{Row, RowKind, RunKind};
 use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
-use crate::markdown::view::table::{render_table, table_height};
+use crate::markdown::view::table::render_table;
+
+/// 表格横向滚动条底部预留条高度（px）：与 gpui-component 横向滚动条轨道高度
+/// （scrollbar.rs 的 `WIDTH = 4*2 + 8 = 16`）一致，避免滚动条遮挡表格内容。
+const TABLE_SCROLLBAR_RESERVE_PX: f32 = 16.0;
 
 /// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
 /// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
@@ -374,7 +378,6 @@ pub(crate) fn render_row(
         // 非换行模式仍交外层 md-harea 统一横向滚动。
         if wrap {
             let h = table_handle.unwrap_or_else(ScrollHandle::new);
-            let table_h = table_height(table, p);
             return div()
                 .w_full()
                 .flex_shrink_0()
@@ -383,7 +386,8 @@ pub(crate) fn render_row(
                 .child(
                     div()
                         .debug_selector(|| "md-table-hscroll".into())
-                        .h(px(table_h))
+                        // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
+                        // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
                         .w_full()
                         .relative()
                         .overflow_hidden()
@@ -391,13 +395,14 @@ pub(crate) fn render_row(
                             div()
                                 .id("md-table-scroll")
                                 .w_full()
-                                .h_full()
                                 .flex()
                                 .flex_row()
                                 .overflow_x_scroll()
                                 // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
                                 .restrict_scroll_to_axis()
                                 .track_scroll(&h)
+                                // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
+                                .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
                                 .child(render_table(table, p)),
                         )
                         .child(
