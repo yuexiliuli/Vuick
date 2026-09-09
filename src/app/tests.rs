@@ -485,6 +485,42 @@
         let _ = std::fs::remove_file(&dir2);
     }
 
+    /// 选项卡栏最右侧的新建(+)按钮：应渲染出（非零尺寸）按钮 + 手绘「＋」图标，且可点击新建。
+    #[gpui::test]
+    async fn tab_add_button_renders_plus_icon(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        // 按钮 + 图标都有非零尺寸
+        let btn = cx
+            .debug_bounds("tab-add")
+            .expect("新建按钮 tab-add 应存在");
+        let icon = cx
+            .debug_bounds("tab-add-icon")
+            .expect("手绘 ＋ 图标 tab-add-icon 应存在");
+        assert!(
+            btn.size.width > px(0.) && btn.size.height > px(0.),
+            "新建按钮应有实际尺寸，实际={btn:?}"
+        );
+        assert!(
+            icon.size.width > px(0.) && icon.size.height > px(0.),
+            "＋ 图标应有实际尺寸，实际={icon:?}"
+        );
+        // 点击 → 新建选项卡
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.new_tab(window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let tabs1 = cx.update(|_w, cx| app.read(cx).tabs.len());
+        assert_eq!(tabs1, tabs0 + 1, "点击/调用新建后应增加 1 个选项卡");
+    }
+
     /// 换行模式下在 app 里打开含超宽代码块的 .md 时，代码块横向滚动条应真实渲染/可滚动
     /// （md-preview 渲染、代码带宽于预览视口）。
     #[gpui::test]

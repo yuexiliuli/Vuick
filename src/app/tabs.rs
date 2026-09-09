@@ -3,7 +3,6 @@
 use super::*;
 use crate::app::file_ops::PREVIEW_DEBOUNCE_MS;
 use crate::scrollbar::horizontal_scrollbar;
-use gpui_component::button::ButtonVariants as _;
 
 impl EditorApp {
     pub(super) fn make_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
@@ -326,17 +325,53 @@ impl EditorApp {
             );
         }
 
-        let add = gpui_component::button::Button::new("tab-add")
-            .label("+")
-            .ghost()
+        // 新建(+)：手绘「＋」形图标（横/竖两条圆角细条居中），替代文本 "+"，
+        // 避免不同字体下粗细/偏移不一显得歪斜；带 hover/按下交互反馈。
+        let add = div()
+            .id("tab-add")
+            .debug_selector(|| "tab-add".into())
             .w(px(24.))
             .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_md()
             .bg(chip_bg)
-            .text_size(px(15.))
-            .text_color(chip_text)
+            .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(tab_active_bg))
+            .active(|style| style.bg(tab_active_border))
             .on_click(
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| this.new_tab(window, cx)),
+            )
+            .child(
+                div()
+                    .id("tab-add-icon")
+                    .debug_selector(|| "tab-add-icon".into())
+                    .relative()
+                    .w(px(10.))
+                    .h(px(10.))
+                    // 横条：居中水平线
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(4.))
+                            .left(px(0.))
+                            .right(px(0.))
+                            .h(px(2.))
+                            .rounded_full()
+                            .bg(chip_text),
+                    )
+                    // 竖条：居中垂直线（盖在横条之上）
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(4.))
+                            .top(px(0.))
+                            .bottom(px(0.))
+                            .w(px(2.))
+                            .rounded_full()
+                            .bg(chip_text),
+                    ),
             );
 
         // 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
