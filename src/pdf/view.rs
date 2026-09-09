@@ -470,7 +470,13 @@ impl Render for PdfViewer {
             // 竖向+横向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
             // wrap 宽度 = max(视口宽, 页宽+边距)：窗口宽时内容居中；窗口过窄（如目录
             // 展开挤压）时 wrap 宽于视口 → 触发横向滚动条，可滚到全部页面不被裁剪。
-            let view_w = f32::from(self.scroll.bounds().size.width);
+            //
+            // 视口宽**不能用 `self.scroll.bounds()`**：那是上一帧布局写回的测量值。
+            // 目录打开/收起的那一帧，面板宽度尚未被计入 bounds，仍在用旧（更宽）的
+            // 视口算 wrap_w → 页列按旧宽度居中，产生一帧“往左弹”，下一帧 layout 落定
+            // 才按新宽度回正。这里改从「窗口宽 − 目录面板宽」直接推导，布局变化当帧即正确。
+            let panel_w: f32 = if self.toc_open { self.toc_width } else { 0.0 };
+            let view_w = f32::from(window.bounds().size.width) - panel_w;
             let wrap_w = view_w.max(page_width + 2.0 * PAGE_PAD_X);
             div()
                 .id("pdf-scroll")
