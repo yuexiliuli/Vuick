@@ -957,6 +957,14 @@ fn epub_toc_panel_renders_on_left(cx: &mut TestAppContext) {
         cx.debug_bounds("epub-toc-vscroll").is_some(),
         "目录面板应有纵向滚动条"
     );
+    // 关闭按钮：矢量图标渲染、非零尺寸（替代易变形文本 "✕"）
+    let close = cx
+        .debug_bounds("epub-toc-close")
+        .expect("目录面板应有关闭按钮 epub-toc-close");
+    assert!(
+        close.size.width > px(0.) && close.size.height > px(0.),
+        "关闭按钮应有实际尺寸，实际={close:?}"
+    );
     // 面板模式不应再出现默认的下拉目录按钮
     assert!(
         cx.debug_bounds("md-toc-toggle-wrap").is_none(),

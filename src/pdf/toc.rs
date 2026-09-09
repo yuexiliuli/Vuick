@@ -318,17 +318,24 @@ impl PdfViewer {
 
         let close_btn = {
             let weak = weak.clone();
-            Button::new("pdf-toc-close")
-                .label("✕")
-                .ghost()
-                .h(px(24.))
-                .w(px(24.))
+            // 关闭按钮：手绘置中图标按钮（IconName::Close 矢量 SVG），替代文本 "✕"，
+            // 避免不同字体下字形粗细/偏移不一；带 hover/按下反馈。
+            div()
+                .id("pdf-toc-close")
+                .debug_selector(|| "pdf-toc-close".into())
+                .w(px(22.))
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
                 .rounded(px(4.))
-                .text_size(px(12.))
-                .text_color(muted)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(colors.secondary))
+                .active(|style| style.bg(colors.secondary).opacity(0.85))
                 .on_click(move |_, _w, cx| {
                     let _ = weak.update(cx, |this, cx| this.close_toc(cx));
                 })
+                .child(Icon::new(IconName::Close).size(px(12.)).text_color(muted))
         };
 
         // 右缘拖拽手柄：宽 6px 命中区，视觉 2px 细线；按下开始拖拽。
