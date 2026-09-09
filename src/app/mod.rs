@@ -34,7 +34,7 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PromptLevel,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
-use gpui_component::input::{Editor, EditorState, InputEvent, TabSize};
+use gpui_component::input::{Editor, EditorState, InputEvent, InputState, TabSize};
 use gpui_component::{Icon, IconName};
 
 use crate::actions::*;
@@ -113,6 +113,12 @@ pub struct EditorApp {
     splitter_hovered: bool,
     /// 侧边栏是否展开。
     sidebar_open: bool,
+    /// 侧边栏当前视图（文件 / 目录 / 搜索）。
+    sidebar_view: sidebar::SidebarView,
+    /// 侧边栏「搜索」关键字输入控件。
+    search_state: gpui::Entity<InputState>,
+    /// 监听搜索框输入变化 → 刷新搜索结果。
+    _search_sub: Subscription,
     focus_handle: FocusHandle,
 }
 
@@ -132,6 +138,18 @@ impl EditorApp {
     /// `gpui_component::Root` 包裹）。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
         let focus_handle = cx.focus_handle();
+        // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("搜索文件与内容…")
+                .default_value("")
+        });
+        let search_state = search.clone();
+        let search_sub = cx.subscribe(&search, |_this, _emitter, ev: &InputEvent, cx| {
+            if let InputEvent::Change = ev {
+                cx.notify();
+            }
+        });
         let mut app = EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
@@ -146,6 +164,9 @@ impl EditorApp {
             split_drag: None,
             splitter_hovered: false,
             sidebar_open: true,
+            sidebar_view: sidebar::SidebarView::Toc,
+            search_state,
+            _search_sub: search_sub,
             focus_handle,
         };
         app.make_tab(window, cx);

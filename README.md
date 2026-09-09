@@ -75,7 +75,7 @@ src/
 | `Ctrl+Q` | 退出 |
 
 ## 构建与运行
-
+如果需要pdf预览功能，请前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到pdfium.dll，重命名并放于resources\pdfium\pdfium-154.0.8035.0.dll
 ```bash
 # 运行（开发）
 cargo run

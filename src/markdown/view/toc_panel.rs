@@ -68,6 +68,11 @@ impl MarkdownPreview {
         !self.toc.is_empty()
     }
 
+    /// 目录条目：(行号, 标题级别, 标题文本)。
+    pub(crate) fn toc_entries(&self) -> &[(usize, u8, String)] {
+        &self.toc
+    }
+
     /// 目录面板当前是否展开。
     pub(crate) fn toc_open_state(&self) -> bool {
         self.toc_open

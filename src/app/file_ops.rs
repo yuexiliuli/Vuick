@@ -419,6 +419,17 @@ impl EditorApp {
             return;
         };
         let text = Self::normalize_newlines(&text);
+        // 若侧边栏搜索框持有焦点 → 粘贴到搜索框（其不处理应用级 PasteNormalized）
+        let search_focused = window
+            .focused(cx)
+            .is_some_and(|fh| fh == self.search_state.read(cx).focus_handle(cx));
+        if search_focused {
+            let search = self.search_state.clone();
+            search.update(cx, |s, cx| {
+                s.replace(text, window, cx);
+            });
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
