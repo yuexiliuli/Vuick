@@ -32,6 +32,26 @@ fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
         .child(t)
 }
 
+/// 代码块上下各补一行空白带（带同一背景色）：让代码块背景在首行文字上方 /
+/// 末行文字下方各多出一整行的呼吸空间，视觉上从紧贴文字变成留出前/后一行空白。
+/// `selector` 区分顶/底空白带，便于测试定位。
+fn code_blank(selector: &'static str, p: &StyleParams) -> gpui::Div {
+    div()
+        .debug_selector(move || selector.into())
+        .h(p.code_line)
+        .w_full()
+        .bg(p.muted_bg)
+}
+
+/// 代码块＝首行空白带 + 代码行 + 末行空白带（背景连续铺平）。
+fn code_block_bands(lines: &[gpui::SharedString], p: &StyleParams) -> Vec<gpui::Div> {
+    let mut bands = Vec::with_capacity(lines.len() + 2);
+    bands.push(code_blank("md-code-blank-top", p));
+    bands.extend(lines.iter().map(|l| code_band(l.clone(), p)));
+    bands.push(code_blank("md-code-blank-bottom", p));
+    bands
+}
+
 /// 渲染单个行。`code_handle` 为代码块稳定的横向滚动句柄（None 时自动创建）。
 pub(crate) fn render_row(
     row: &Rc<Row>,
@@ -149,7 +169,7 @@ pub(crate) fn render_row(
         if row.kind == RowKind::Code {
             let lines = row.code_lines.clone();
             let p_ = p.clone();
-            let block_h = lines.len() as f32 * p.code_line.as_f32();
+            let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             let h = code_handle.unwrap_or_else(ScrollHandle::new);
             let column = div()
                 .debug_selector(|| "md-code-row".into())
@@ -157,7 +177,7 @@ pub(crate) fn render_row(
                 .flex_col()
                 .flex_shrink_0()
                 .min_w_full()
-                .children(lines.iter().map(|l| code_band(l.clone(), &p_)));
+                .children(code_block_bands(&lines, &p_));
             return div()
                 .debug_selector(|| "md-code-hscroll".into())
                 .h(px(block_h))
@@ -292,10 +312,11 @@ pub(crate) fn render_row(
             .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
         RowKind::Code => {
             // 代码块：整栏折叠为一行的所有代码行按 h(code_line) 纵向堆叠成连续块，
+            // 上下各补一行空白带（同背景），使背景在首/末行之外多出一行呼吸空间。
             // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体。超宽由外层横向滚动。
             let lines = row.code_lines.clone();
             let p_ = p.clone();
-            let block_h = lines.len() as f32 * p.code_line.as_f32();
+            let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             div()
                 .h(px(block_h))
                 .w_full()
@@ -308,7 +329,7 @@ pub(crate) fn render_row(
                         .w_full()
                         .flex()
                         .flex_col()
-                        .children(lines.iter().map(|l| code_band(l.clone(), &p_))),
+                        .children(code_block_bands(&lines, &p_)),
                 )
         }
         RowKind::Heading(n) => {

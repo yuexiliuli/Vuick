@@ -631,7 +631,8 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
         "横向滚动条不应塌缩成 0，实际={sbar:?}"
     );
 
-    // 整个围栏折叠成一个 Code 渲染行：item 高度 = 3 * code_line（多行紧贴相连成一大块）
+    // 整个围栏折叠成一个 Code 渲染行：item 高度 = 5 * code_line
+    //（3 行代码 + 上下各 1 行空白带，多行紧贴相连成一大块）
     let p = cx.update(|_w, cx| StyleParams::from_theme_with_font(cx, None));
     let rows = parse_to_rows(&md_src);
     let code_ix: Vec<usize> = rows
@@ -645,8 +646,8 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
         .update(|_, cx| host.read(cx).md.read(cx).list_state.bounds_for_item(code_ix[0]))
         .expect("代码行 item 应有 bounds");
     assert!(
-        (b.size.height.as_f32() - p.code_line.as_f32() * 3.0).abs() < 1.5,
-        "代码块行高应等于 3*code_line（连续块），实际={:?}",
+        (b.size.height.as_f32() - p.code_line.as_f32() * 5.0).abs() < 1.5,
+        "代码块行高应等于 5*code_line（3 行代码 + 上下空白带），实际={:?}",
         b.size.height
     );
 
@@ -729,6 +730,64 @@ fn code_block_bg_spans_pane_width_in_wrap(cx: &mut TestAppContext) {
         (band.size.width.as_f32() - expect_w).abs() < 2.0,
         "短代码块背景应铺满预览内容宽({expect_w:.0})，band={band:?} preview={preview:?}"
     );
+}
+
+/// 代码块上下各补一行空白带：背景色在首个代码行上方 / 末个代码行下方各多出一整行。
+/// 验证 3 行代码的代码块渲染出 5 个相同高度的背景带，且首末两个空白带与代码行等高。
+#[gpui::test]
+fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let md_src = "```rs\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(md_src, cx);
+        });
+    });
+    cx.simulate_resize(size(px(400.), px(400.)));
+    settle(cx);
+
+    let blank_top = cx
+        .debug_bounds("md-code-blank-top")
+        .expect("代码块顶部空白带应存在");
+    let blank_bottom = cx
+        .debug_bounds("md-code-blank-bottom")
+        .expect("代码块底部空白带应存在");
+    // "md-code-band" 选择器被同名的三个代码带覆盖，debug_bounds 只保留最后一个（末行代码带）
+    let last_band = cx
+        .debug_bounds("md-code-band")
+        .expect("代码背景带 md-code-band 应存在");
+    let band_h = last_band.size.height.as_f32();
+
+    // 顶/底空白带与代码带等高
+    assert!(
+        (blank_top.size.height.as_f32() - band_h).abs() < 0.5
+            && (blank_bottom.size.height.as_f32() - band_h).abs() < 0.5,
+        "空白带应与代码带等高：top={:?} bottom={:?} band={:?}",
+        blank_top.size.height,
+        blank_bottom.size.height,
+        last_band.size.height
+    );
+    // 底部空白带紧贴最后一（3rd）个代码带下方，背景连续
+    assert_eq!(
+        blank_bottom.origin.y.as_f32(),
+        last_band.origin.y.as_f32() + last_band.size.height.as_f32()
+    );
+
+    // 整体跨度：顶部空白带顶部 -> 底部空白带顶部 = 顶空白 + 3 行代码 = 4 * code_line
+    let span = blank_bottom.origin.y.as_f32() - blank_top.origin.y.as_f32();
+    assert!(
+        (span - band_h * 4.0).abs() < 1.5,
+        "顶空白带顶到 3 行代码块底部应跨 4*code_line，span={span:.1} band_h={band_h:.1}"
+    );
+    // 边界：顶部空白带从代码块渲染行顶端（y=0）开始，首行代码带在它下方
+    assert_eq!(blank_top.origin.y.as_f32(), 0.0, "顶空白带应位于代码块渲染行顶端，实际={:?}", blank_top.origin.y);
 }
 
 
