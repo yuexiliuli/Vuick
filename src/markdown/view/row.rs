@@ -158,27 +158,34 @@ fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
         .font_family(p.mono.clone())
         .text_size(p.code_size)
         .text_color(p.fg)
-        .bg(p.muted_bg)
+        .bg(p.code_bg)
         .child(t)
 }
 
 /// 代码块上下各补一行空白带（带同一背景色）：让代码块背景在首行文字上方 /
 /// 末行文字下方各多出一整行的呼吸空间，视觉上从紧贴文字变成留出前/后一行空白。
-/// `selector` 区分顶/底空白带，便于测试定位。
+/// `selector` 区分顶/底空白带，便于测试定位；顶带圆上角、底带圆下角使整块边缘变圆。
 fn code_blank(selector: &'static str, p: &StyleParams) -> gpui::Div {
     div()
         .debug_selector(move || selector.into())
         .h(p.code_line)
         .w_full()
-        .bg(p.muted_bg)
+        .bg(p.code_bg)
 }
 
 /// 代码块＝首行空白带 + 代码行 + 末行空白带（背景连续铺平）。
+/// 首/末空白带分别圆上角 / 下角（lg=8px），让代码块整体呈圆角卡片。
 fn code_block_bands(lines: &[gpui::SharedString], p: &StyleParams) -> Vec<gpui::Div> {
     let mut bands = Vec::with_capacity(lines.len() + 2);
-    bands.push(code_blank("md-code-blank-top", p));
+    bands.push(
+        code_blank("md-code-blank-top", p)
+            .rounded_t_lg(),
+    );
     bands.extend(lines.iter().map(|l| code_band(l.clone(), p)));
-    bands.push(code_blank("md-code-blank-bottom", p));
+    bands.push(
+        code_blank("md-code-blank-bottom", p)
+            .rounded_b_lg(),
+    );
     bands
 }
 

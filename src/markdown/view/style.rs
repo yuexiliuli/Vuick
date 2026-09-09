@@ -10,7 +10,8 @@ pub(crate) struct StyleParams {
     pub(crate) mono: SharedString,
     pub(crate) fg: Hsla,
     pub(crate) muted_fg: Hsla,
-    pub(crate) muted_bg: Hsla,
+    /// 代码块背景（白 #F3F4F4 / 黑 #282936），见 [`StyleParams::from_theme_with_font`]。
+    pub(crate) code_bg: Hsla,
     pub(crate) divider: Hsla,
     pub(crate) accent: Hsla,
     pub(crate) bg: Hsla,
@@ -62,11 +63,17 @@ impl StyleParams {
         } else {
             (gpui::rgb(0xf9fafb).into(), gpui::rgb(0xf3f4f6).into())
         };
+        // 代码块背景按主题定制：白 = #F3F4F4，黑 = #282936。
+        let code_bg = if is_dark {
+            gpui::rgb(0x282936).into()
+        } else {
+            gpui::rgb(0xf3f4f4).into()
+        };
         Self {
             mono: typo.mono.clone(),
             fg: colors.foreground,
             muted_fg: colors.muted_foreground,
-            muted_bg: colors.muted,
+            code_bg,
             divider: colors.border,
             accent: colors.accent,
             bg: colors.background,

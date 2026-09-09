@@ -903,4 +903,34 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
     assert_eq!(blank_top.origin.y.as_f32(), 0.0, "顶空白带应位于代码块渲染行顶端，实际={:?}", blank_top.origin.y);
 }
 
+/// 回归：代码块背景按主题定制——白 #F3F4F4、黑 #282936（用户指定色板）。
+#[gpui::test]
+fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    // 浅色主题
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+    let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
+    assert_eq!(
+        light,
+        gpui::rgb(0xf3f4f4).into(),
+        "白主题代码块背景应为 #F3F4F4"
+    );
+    // 深色主题
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    });
+    let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
+    assert_eq!(
+        dark,
+        gpui::rgb(0x282936).into(),
+        "黑主题代码块背景应为 #282936"
+    );
+    // 恢复浅色（主题为全局共享，避免影响后续测试）
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+}
+
 
