@@ -17,6 +17,7 @@
 mod file_ops;
 mod menu;
 mod panes;
+mod sidebar;
 mod status_bar;
 mod tabs;
 
@@ -50,6 +51,8 @@ const MENU_BAR_H: Pixels = px(26.);
 const SPLIT_RATIO_MIN: f32 = 0.2;
 /// 分屏比例拖拽上限（编辑区最大占比）。
 const SPLIT_RATIO_MAX: f32 = 0.8;
+/// 侧边栏宽度（px）。
+const SIDEBAR_WIDTH: f32 = 240.0;
 
 /// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
 struct EditorTab {
@@ -108,6 +111,8 @@ pub struct EditorApp {
     split_drag: Option<(f32, f32)>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
     splitter_hovered: bool,
+    /// 侧边栏是否展开。
+    sidebar_open: bool,
     focus_handle: FocusHandle,
 }
 
@@ -140,6 +145,7 @@ impl EditorApp {
             wrap_enabled: true,
             split_drag: None,
             splitter_hovered: false,
+            sidebar_open: true,
             focus_handle,
         };
         app.make_tab(window, cx);
@@ -388,6 +394,12 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 切换侧边栏「展开/收起」。
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
     /// 窗口整体背景（编辑区以外的画布）。
     fn window_bg(&self) -> gpui::Hsla {
         if self.dark_mode {
@@ -552,6 +564,33 @@ impl EditorApp {
         let icon_style = |icon: IconName| {
             Icon::new(icon).size(px(14.)).text_color(text_minor)
         };
+
+        // 侧边栏「展开/收起」开关：收拢时显示打开图标（点击展开），展开时显示收起图标。
+        // 用自绘图标按钮（非 window_control_area，普通点击交互）。
+        let sidebar_toggle = div()
+            .id("title-sidebar-toggle")
+            .debug_selector(|| "title-sidebar-toggle".into())
+            .w(px(30.))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_color(text_minor)
+            .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(self.bar_border()))
+            .child(icon_style(if self.sidebar_open {
+                IconName::PanelLeftClose
+            } else {
+                IconName::PanelLeftOpen
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
+                    this.toggle_sidebar(cx);
+                }),
+            );
+
         let maximize_icon = if window.is_maximized() {
             IconName::WindowRestore
         } else {
@@ -617,6 +656,7 @@ impl EditorApp {
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
             .children([
+                sidebar_toggle.into_any_element(),
                 minimize.into_any_element(),
                 maximize.into_any_element(),
                 close.into_any_element(),
@@ -766,7 +806,7 @@ impl Render for EditorApp {
             )
             .child(self.render_title_bar(window, cx))
             .child(self.render_tab_bar(cx))
-            .child(body)
+            .child(self.render_body_sidebar(body, cx))
             .child(self.render_status_bar(cx))
             // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
             .children(gpui_component::Root::render_notification_layer(window, cx))

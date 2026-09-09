@@ -521,8 +521,55 @@
         assert_eq!(tabs1, tabs0 + 1, "点击/调用新建后应增加 1 个选项卡");
     }
 
-    /// 换行模式下在 app 里打开含超宽代码块的 .md 时，代码块横向滚动条应真实渲染/可滚动
-    /// （md-preview 渲染、代码带宽于预览视口）。
+    /// 侧边栏：默认展开，停靠在内容区左侧（宽 240px）；收起后整体移除；
+    /// 标题栏右上角有展开/收起开关（title-sidebar-toggle）。
+    #[gpui::test]
+    async fn sidebar_collapses_and_expands(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 默认展开：侧边栏在，右缘宽度 ≈ SIDEBAR_WIDTH
+        let bar = cx
+            .debug_bounds("sidebar")
+            .expect("侧边栏 sidebar 应默认渲染");
+        assert!(
+            (bar.size.width.as_f32() - crate::app::SIDEBAR_WIDTH).abs() < 2.0,
+            "侧边栏宽应约为 SIDEBAR_WIDTH，实际={bar:?}"
+        );
+        assert!(
+            cx.debug_bounds("title-sidebar-toggle").is_some(),
+            "标题栏应有侧边栏开关 title-sidebar-toggle"
+        );
+
+        // 收起：sidebar 与内容区包裹层一起移除
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar").is_none(),
+            "收起后侧边栏不应再渲染"
+        );
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "收起后内容区包裹层不应再渲染"
+        );
+
+        // 再次展开：侧边栏恢复
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar").is_some(),
+            "再次展开后侧边栏应恢复"
+        );
+    }
+
+
     #[gpui::test]
     async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
         init_test(cx);
