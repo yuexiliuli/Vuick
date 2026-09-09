@@ -903,6 +903,112 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
     assert_eq!(blank_top.origin.y.as_f32(), 0.0, "顶空白带应位于代码块渲染行顶端，实际={:?}", blank_top.origin.y);
 }
 
+/// 回归：EPUB 目录应使用 PDF 式左侧面板——面板在最左侧占 280px、
+/// 挤压预览主体到右侧；右上角有「☰」开关；折叠父项隐藏其后代标题。
+#[gpui::test]
+fn epub_toc_panel_renders_on_left(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let md_src = "# 第一章\n封面正文\n\n## 第一节\n小节内容\n\n# 第二章\n结尾\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_toc_panel(true, cx);
+            md.set_source(md_src, cx);
+            md.toggle_toc_panel(cx);
+        });
+    });
+    cx.simulate_resize(size(px(900.), px(600.)));
+    settle(cx);
+
+    // 左侧面板：左缘≈0、宽=默认 290 内、预览主体被挤压到面板右侧
+    let panel = cx
+        .debug_bounds("epub-toc-panel")
+        .expect("EPUB 目录面板 epub-toc-panel 应存在");
+    let preview = cx
+        .debug_bounds("md-preview")
+        .expect("预览主体 md-preview 应存在");
+    assert!(
+        panel.origin.x < px(1.),
+        "目录面板应在最左侧，origin={:?}",
+        panel.origin
+    );
+    assert!(
+        panel.size.width > px(0.) && panel.size.height > px(0.),
+        "面板应有实际尺寸，实际={panel:?}"
+    );
+    assert!(
+        (preview.origin.x.as_f32() - panel.size.width.as_f32()).abs() < 2.0,
+        "预览主体应被目录面板挤压到右侧 origin.x ≈ 面板宽，preview={:?} panel_w={}",
+        preview.origin,
+        panel.size.width.as_f32()
+    );
+    // 开关按钮与纵向滚动条真实渲染
+    assert!(
+        cx.debug_bounds("epub-toc-open-btn").is_some(),
+        "应有目录开关按钮（epub-toc-open-btn）"
+    );
+    assert!(
+        cx.debug_bounds("epub-toc-vscroll").is_some(),
+        "目录面板应有纵向滚动条"
+    );
+    // 面板模式不应再出现默认的下拉目录按钮
+    assert!(
+        cx.debug_bounds("md-toc-toggle-wrap").is_none(),
+        "面板模式下不应再渲染默认下拉目录按钮"
+    );
+
+    // 折叠父项（h1 第一章，idx0）→ 隐藏其后代 h2（第一节，idx1）
+    let item1_before = cx.debug_bounds("epub-toc-item-1").is_some();
+    assert!(item1_before, "折叠前 h2 目录项应可见");
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.toggle_toc_collapse(0, cx));
+    });
+    cx.simulate_resize(size(px(900.), px(600.)));
+    settle(cx);
+    assert!(
+        cx.debug_bounds("epub-toc-item-1").is_none(),
+        "折叠父项后其后代 h2 目录项应被隐藏"
+    );
+    assert!(
+        cx.debug_bounds("epub-toc-item-0").is_some()
+            && cx.debug_bounds("epub-toc-item-2").is_some(),
+        "折叠父项后同级/祖先项仍应可见"
+    );
+    // 再展开 → h2 恢复
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.toggle_toc_collapse(0, cx));
+    });
+    cx.simulate_resize(size(px(900.), px(600.)));
+    settle(cx);
+    assert!(
+        cx.debug_bounds("epub-toc-item-1").is_some(),
+        "再次展开父项后 h2 目录项应恢复可见"
+    );
+
+    // 右缘拖拽调宽：start → update → end，面板宽应变化且被 clamp
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.start_toc_resize(300.0, cx);
+            md.update_toc_resize(400.0, cx);
+            md.end_toc_resize(cx);
+        });
+    });
+    let w = cx.update(|_, cx| host.read(cx).md.read(cx).toc_width);
+    assert!(
+        (w - 380.0).abs() < 1.0,
+        "拖拽后面板宽应更新，实际={w:.0}"
+    );
+}
+
 /// 回归：代码块背景按主题定制——白 #F3F4F4、黑 #282936（用户指定色板）。
 #[gpui::test]
 fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {

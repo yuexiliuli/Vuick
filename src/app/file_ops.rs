@@ -132,6 +132,8 @@ impl EditorApp {
             view.set_memory_images(doc.images.clone());
             // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
             view.set_wrap(true, cx);
+            // EPUB 目录用 PDF 式左侧面板（替代默认右上角下拉目录）
+            view.set_toc_panel(true, cx);
             view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());
