@@ -101,7 +101,8 @@ pub struct EditorApp {
     dark_mode: bool,
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
     split_ratio: f32,
-    /// 编辑器是否自动换行（默认换行；预览开启时强制换行）。
+    /// 编辑区是否自动换行（默认换行）。开关只作用编辑区；Markdown 预览
+    /// 始终自动换行，不随此偏好变化（预览换行由文件类型/全屏阅读模式决定）。
     wrap_enabled: bool,
     /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
     split_drag: Option<(f32, f32)>,
@@ -260,17 +261,13 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 切换当前选项卡的自动换行/不换行，并更新全局偏好。
+    /// 切换当前选项卡编辑区的自动换行/不换行，并更新全局编辑器偏好。
+    /// 只作用于编辑区；Markdown/EPUB 预览始终自动换行，不随此开关变化。
     fn toggle_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
         let wrap_enabled = !self.wrap_enabled;
         self.wrap_enabled = wrap_enabled;
-        let preview_on = self
-            .tabs
-            .get(idx)
-            .map(|t| t.preview_on)
-            .unwrap_or(false);
-        // 全屏阅读模式强制换行，跳过（由全屏切换控制）；否则按全局偏好
+        // 全屏阅读模式强制换行，跳过（由全屏切换控制）；否则按编辑器偏好
         if self
             .tabs
             .get(idx)
@@ -278,12 +275,8 @@ impl EditorApp {
             .unwrap_or(true)
         {
             if let Some(tab) = self.tabs.get(idx) {
-                // 同步 Markdown 预览的换行设置
-                let preview = tab.md_preview.clone();
-                preview.update(cx, |view, cx| view.set_wrap(wrap_enabled, cx));
-                let wrap = preview_on || wrap_enabled;
                 tab.editor.update(cx, |ed, cx| {
-                    ed.set_soft_wrap(wrap, window, cx);
+                    ed.set_soft_wrap(wrap_enabled, window, cx);
                 });
             }
         }

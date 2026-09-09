@@ -579,6 +579,73 @@
         let _ = std::fs::remove_file(&txt);
     }
 
+    /// 回归：「查看」→「自动换行」只作用编辑区，不改变 Markdown 预览的换行状态。
+    /// 旧逻辑 toggle_wrap 以 `preview_on || wrap_enabled` 算 editor wrap——Markdown
+    /// 打开即 preview_on=true → 编辑区恒为换行、"开关只动预览"；现在去掉预览联动。
+    #[gpui::test]
+    async fn wrap_toggle_affects_md_editor_only(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(500.), px(500.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join("gpui-editor-wrap-toggle.md");
+        std::fs::write(&md, "# 标题\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 初始：预览自动换行 + 全局编辑区偏好换行
+        let (w0, pref0) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.wrap_enabled,
+            )
+        });
+        assert!(w0 && pref0, "初始预览应自动换行且全局偏好开启，w0={w0} pref0={pref0}");
+
+        // 切换换行：只作用编辑区 → 预览保持换行、全局偏好关闭
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_wrap(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (w1, pref1) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.wrap_enabled,
+            )
+        });
+        assert!(
+            w1,
+            "切换「自动换行」不应改变 Markdown 预览（预览始终自动换行），实际 w1={w1}"
+        );
+        assert!(!pref1, "全局编辑区换行偏好应切为关闭");
+
+        // 再切回：预览仍保持换行、偏好恢复
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_wrap(window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let (w2, pref2) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.wrap_enabled,
+            )
+        });
+        assert!(w2 && pref2, "预览应保持换行、偏好恢复，w2={w2} pref2={pref2}");
+        let _ = std::fs::remove_file(&md);
+    }
+
 
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]
@@ -979,7 +1046,8 @@
         );
     }
 
-    /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏，换行开关可切换自动换行。
+    /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏；
+    /// 换行开关只切换编辑区偏好，不改变预览换行（预览独立保持换行）。
     #[gpui::test]
     async fn toggles_epub_fullscreen_and_wrap(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1032,30 +1100,38 @@
         assert!(!fs1, "切换后应退出全屏");
         assert!(wrap1, "退出全屏后预览应保持换行（全局默认换行）");
 
-        // 切换换行 → 不换行
+        // 切换换行：只作用编辑区偏好，不改变预览换行（预览独立保持换行）
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let wrap2 = cx.update(|_w, cx| {
+        let (wrap2, pref2) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+            (
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.wrap_enabled,
+            )
         });
-        assert!(!wrap2, "切换后应关闭换行");
+        assert!(wrap2, "切换换行开关不应影响 EPUB 预览（预览独立保持换行）");
+        assert!(!pref2, "全局编辑区换行偏好应切为关闭");
 
-        // 再切回换行
+        // 再切回
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let wrap3 = cx.update(|_w, cx| {
+        let (wrap3, pref3) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+            (
+                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.wrap_enabled,
+            )
         });
-        assert!(wrap3, "再切换后应恢复换行");
+        assert!(wrap3, "预览应保持换行");
+        assert!(pref3, "再切换后全局编辑区换行偏好应恢复");
     }
 
