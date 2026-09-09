@@ -3,18 +3,119 @@
 //! `wrap = true` 时为**自动换行模式**：文本行高度自适应、自然折行（用于 EPUB 阅读）；
 //! `wrap = false`（默认）为单行 + 横向滚动模式。
 
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    div, img, px, App, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    ScrollHandle, StatefulInteractiveElement, Styled, StyledImage,
+    div, fill, img, point, px, App, Bounds, Corners, Element, ElementId, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement, IntoElement,
+    LayoutId, ObjectFit, ParentElement, Pixels, ScrollHandle, StatefulInteractiveElement,
+    StrikethroughStyle, Styled, StyledImage, StyledText, WrappedLineLayout, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::markdown::parser::{Row, RowKind};
+use crate::markdown::parser::{Row, RowKind, RunKind};
 use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
+
+/// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 弱化文字色；浅灰圆角背景由
+/// [`RoundedInlineText`] 在 paint 阶段按代码段的像素几何自绘（方角 highlight 背景
+/// 无法圆角，且 gpui 文本 run 背景只有平面矩形）。
+fn inline_code_highlight(p: &StyleParams) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(p.muted_fg),
+        ..Default::default()
+    }
+}
+
+/// 把背景区间向左右扩展吞掉紧邻空白：留给圆角背景的左右视觉间距。
+/// （高亮区间即"代码文本 + 两侧各一个空格"，等宽 overrides 只覆盖代码本体，
+/// 空格保持正文字宽 → 圆角灰底略宽于字形，左右有呼吸空间。）
+fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
+    let mut start = range.start;
+    let mut end = range.end;
+    if start > 0 {
+        let prev = text[..start].chars().next_back();
+        if let Some(c) = prev {
+            if c.is_whitespace() {
+                start -= c.len_utf8();
+            }
+        }
+    }
+    if end < text.len() {
+        let next = text[end..].chars().next();
+        if let Some(c) = next {
+            if c.is_whitespace() {
+                end += c.len_utf8();
+            }
+        }
+    }
+    start..end
+}
+
+/// 把行内的样式段（`runs`，字节区间）套到整段文本上，生成 [`StyledText`]；
+/// 没有任何样式段时返回 `None`，调用方直接渲染纯文本以省一次分配。
+/// 反引号代码 → 等宽 + 灰底；粗体/斜体/删除线 → 对应字重/风格；
+/// 链接/图片（v1 渲染按文字处理）不特殊着色。
+fn styled_text(
+    text: &gpui::SharedString,
+    runs: &[(Range<usize>, RunKind)],
+    p: &StyleParams,
+) -> Option<StyledText> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut highlights = Vec::with_capacity(runs.len());
+    let mut mono: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
+    for (range, kind) in runs {
+        match kind {
+            RunKind::InlineCode => {
+                // 等宽字体 overrides 只覆盖代码本体；文字色用弱化前景（背景圆角自绘）。
+                highlights.push((range.clone(), inline_code_highlight(p)));
+                mono.push((range.clone(), p.mono.clone()));
+            }
+            RunKind::Bold => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )),
+            RunKind::Italic => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                },
+            )),
+            RunKind::Strikethrough => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    strikethrough: Some(StrikethroughStyle::default()),
+                    ..Default::default()
+                },
+            )),
+            // 链接/图片：v1 按普通文字渲染（去掉 URL/括号后的文本），不额外着色
+            RunKind::Link | RunKind::Image => {}
+        }
+    }
+    let mut st = StyledText::new(text.clone()).with_highlights(highlights);
+    if !mono.is_empty() {
+        st = st.with_font_family_overrides(mono);
+    }
+    Some(st)
+}
+
+/// 把行内样式段的字节区间整体右移 `shift`（列表项前缀占位后偏移对齐显示文本）。
+fn shift_runs(runs: &[(Range<usize>, RunKind)], shift: usize) -> Vec<(Range<usize>, RunKind)> {
+    if shift == 0 {
+        return runs.to_vec();
+    }
+    runs.iter()
+        .map(|(r, k)| ((r.start + shift)..(r.end + shift), *k))
+        .collect()
+}
 
 /// 渲染一行代码（等宽、不换行、浅灰底）。
 fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
@@ -50,6 +151,180 @@ fn code_block_bands(lines: &[gpui::SharedString], p: &StyleParams) -> Vec<gpui::
     bands.extend(lines.iter().map(|l| code_band(l.clone(), p)));
     bands.push(code_blank("md-code-blank-bottom", p));
     bands
+}
+
+/// 把行内样式段转成可直接作 `.child()` 的元素：
+/// 有样式段时用 [`StyledText`]（等宽代码 / 粗斜体 / 删除线），否则回退纯文本。
+/// 行内代码（反引号）段会额外套一层圆角灰底背景（[`RoundedInlineText`]），
+/// 保持与正文同行/折行的同时呈现圆润 pill 效果。
+fn row_text_child(
+    text: &gpui::SharedString,
+    runs: &[(Range<usize>, RunKind)],
+    p: &StyleParams,
+) -> gpui::AnyElement {
+    // 主题自带的 HighlightStyle 背景只能是平面矩形；要圆角必须自绘。
+    // 这里提取"扩展空白后的代码背景区间"，用自绘 Element 画圆角。
+    let code_bg: Vec<Range<usize>> = runs
+        .iter()
+        .filter(|(_, k)| *k == RunKind::InlineCode)
+        .map(|(r, _)| expand_bg_over_whitespace(text.as_ref(), r))
+        .collect();
+    if code_bg.is_empty() {
+        return match styled_text(text, runs, p) {
+            Some(st) => st.into_any_element(),
+            None => text.clone().into_any_element(),
+        };
+    }
+    let Some(st) = styled_text(text, runs, p) else {
+        return text.clone().into_any_element();
+    };
+    RoundedInlineText {
+        text: st,
+        code_bg,
+        radius: px(5.),
+        bg: p.muted_bg,
+    }
+    .into_any_element()
+}
+
+/// 自绘行内代码圆角背景的元素：委托 [`StyledText`] 完成文本的测量/布局，
+/// paint 阶段先按代码段的像素几何画圆角灰底，再委托绘制文字本身。
+/// 这样代码串与正文共用同一条文本流（正确同行、折行、光标对齐），
+/// 背景则是独立可控的圆角矩形。
+struct RoundedInlineText {
+    text: StyledText,
+    /// 代码段的背景区间（已扩展空白），字节坐标相对整段文本。
+    code_bg: Vec<Range<usize>>,
+    radius: Pixels,
+    bg: Hsla,
+}
+
+impl RoundedInlineText {
+    /// 把代码背景区间按折行切成多段矩形并 paint 圆角背景。
+    /// `layout` 是整段文本的 wrap 布局（`TextLayout::line_layouts()`），
+    /// 用 `position_for_index` 把字节区间映射到像素位置；跨行时逐行切开。
+    fn paint_ranges(
+        &self,
+        text_origin: gpui::Point<Pixels>,
+        line_height: Pixels,
+        layout: &WrappedLineLayout,
+        window: &mut Window,
+    ) {
+        let line_h = line_height.as_f32();
+        for range in &self.code_bg {
+            let Some(p0) = layout.position_for_index(range.start, line_height) else {
+                continue;
+            };
+            let Some(p1) = layout.position_for_index(range.end, line_height) else {
+                continue;
+            };
+            let y0 = (p0.y.as_f32() / line_h).floor() as usize;
+            let y1 = (p1.y.as_f32() / line_h).floor() as usize;
+            if y0 == y1 {
+                // 单行内：一段矩形
+                let bounds = Bounds {
+                    origin: point(
+                        px(text_origin.x.as_f32() + p0.x.as_f32()),
+                        px(text_origin.y.as_f32() + p0.y.as_f32()),
+                    ),
+                    size: gpui::size(
+                        px((p1.x.as_f32() - p0.x.as_f32()).max(0.0)),
+                        px(line_h),
+                    ),
+                };
+                window.paint_quad(fill(bounds, self.bg).corner_radii(Corners::all(self.radius)));
+            } else {
+                // 跨行：首段画到该行行尾、中间整行、末段从行首到终点
+                let line_origin_x = text_origin.x.as_f32();
+                let origin_y = text_origin.y.as_f32();
+                for real_ri in y0..=y1 {
+                    let (rx0, rx1) = if real_ri == y0 {
+                        (p0.x.as_f32(), layout.width().as_f32())
+                    } else if real_ri == y1 {
+                        (0.0, p1.x.as_f32())
+                    } else {
+                        (0.0, layout.width().as_f32())
+                    };
+                    let bounds = Bounds {
+                        origin: point(
+                            px(line_origin_x + rx0),
+                            px(origin_y + real_ri as f32 * line_h),
+                        ),
+                        size: gpui::size(px((rx1 - rx0).max(0.0)), px(line_h)),
+                    };
+                    window
+                        .paint_quad(fill(bounds, self.bg).corner_radii(Corners::all(self.radius)));
+                }
+            }
+        }
+    }
+}
+
+impl IntoElement for RoundedInlineText {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for RoundedInlineText {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        // 委托给文本本身布局
+        let (lid, ()) = self.text.request_layout(id, inspector_id, window, cx);
+        (lid, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.text
+            .prepaint(id, inspector_id, bounds, request_layout, window, cx);
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint_state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 1) 画代码段的圆角背景
+        let layout = self.text.layout();
+        let origin = bounds.origin;
+        let line_h = layout.line_height();
+        if let Some(single) = layout.line_layouts().first() {
+            self.paint_ranges(origin, line_h, single, window);
+        }
+        // 2) 委托绘制文字
+        self.text
+            .paint(id, inspector_id, bounds, request_layout, prepaint_state, window, cx);
+    }
 }
 
 /// 渲染单个行。`code_handle` 为代码块稳定的横向滚动句柄（None 时自动创建）。
@@ -222,7 +497,7 @@ pub(crate) fn render_row(
         }
         match row.kind {
             RowKind::Paragraph => {
-                let t = row.text.clone();
+                let t = row_text_child(&row.text, &row.runs, &p);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -237,7 +512,7 @@ pub(crate) fn render_row(
             }
             RowKind::Heading(n) => {
                 let (fs, lh) = p.heading_metrics(n);
-                let t = row.text.clone();
+                let t = row_text_child(&row.text, &row.runs, &p);
                 return div()
                     .w_full()
                     .min_h(lh)
@@ -254,7 +529,7 @@ pub(crate) fn render_row(
             RowKind::Quote => {
                 // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
                 // 避免背景带顶到左边缘（同代码块做法）。
-                let t = row.text.clone();
+                let t = row_text_child(&row.text, &row.runs, &p);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -283,6 +558,10 @@ pub(crate) fn render_row(
                 if let Some(prefix) = &row.prefix {
                     text = format!("{prefix} {text}");
                 }
+                let display = gpui::SharedString::from(text);
+                let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
+                let runs = shift_runs(&row.runs, shift);
+                let t = row_text_child(&display, &runs, &p);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -293,7 +572,7 @@ pub(crate) fn render_row(
                     .whitespace_normal()
                     .text_size(p.para_size)
                     .text_color(p.fg)
-                    .child(text)
+                    .child(t)
                     .into_any_element();
             }
             _ => {}
@@ -334,6 +613,7 @@ pub(crate) fn render_row(
         }
         RowKind::Heading(n) => {
             let (fs, lh) = p.heading_metrics(n);
+            let t = row_text_child(&row.text, &row.runs, &p);
             div()
                 .h(lh)
                 .w_full()
@@ -345,12 +625,12 @@ pub(crate) fn render_row(
                 .text_size(fs)
                 .text_color(p.fg)
                 .font_weight(FontWeight::BOLD)
-                .child(row.text.clone())
+                .child(t)
         }
         RowKind::Quote => {
             // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
             // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = row.text.clone();
+            let t = row_text_child(&row.text, &row.runs, &p);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -383,6 +663,10 @@ pub(crate) fn render_row(
             if let Some(prefix) = &row.prefix {
                 text = format!("{prefix} {text}");
             }
+            let display = gpui::SharedString::from(text);
+            let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
+            let runs = shift_runs(&row.runs, shift);
+            let t = row_text_child(&display, &runs, &p);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -394,7 +678,7 @@ pub(crate) fn render_row(
                 .whitespace_nowrap()
                 .text_size(p.para_size)
                 .text_color(p.fg)
-                .child(text)
+                .child(t)
         }
         RowKind::Paragraph => div()
             .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
@@ -406,7 +690,7 @@ pub(crate) fn render_row(
             .whitespace_nowrap()
             .text_size(p.para_size)
             .text_color(p.fg)
-            .child(row.text.clone()),
+            .child(row_text_child(&row.text, &row.runs, &p)),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
