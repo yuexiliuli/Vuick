@@ -11,6 +11,13 @@ use crate::markdown::parser::{TableAlign, TableData};
 use crate::markdown::view::dimensions::table_column_widths;
 use crate::markdown::view::style::StyleParams;
 
+/// 表格渲染总高度（px）：表头行 + 1px 分隔线 + N 个数据行。
+/// 行高公式与 [`render_table`] 保持一致，供外层横向滚动容器定高。
+pub(crate) fn table_height(table: &TableData, p: &StyleParams) -> f32 {
+    let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+    row_h * (1.0 + table.rows.len() as f32) + 1.0
+}
+
 /// 渲染一张 GFM 表格为带边框网格。
 pub(crate) fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::Div> {
     let border = p.divider;

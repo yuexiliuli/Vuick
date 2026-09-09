@@ -1,4 +1,4 @@
-//! 自研 Markdown 渲染器的视图层：行级虚拟化 + gpui_component 滚动条（双向）。
+//! Markdown 渲染器的视图层：行级虚拟化 + gpui_component 滚动条（双向）。
 //!
 //! 核心思路（参考 vellum / zorite 的行级虚拟化）：
 //! - 文档被拆成**一行一条**的渲染行（见 [`crate::markdown::parser`]）；
@@ -68,6 +68,8 @@ pub struct MarkdownPreview {
     memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// 代码块的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     code_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
+    table_scroll: std::collections::HashMap<usize, ScrollHandle>,
 }
 
 impl MarkdownPreview {
@@ -85,6 +87,7 @@ impl MarkdownPreview {
             base_dir: None,
             memory_images: Default::default(),
             code_scroll: Default::default(),
+            table_scroll: Default::default(),
         }
     }
 
@@ -232,6 +235,13 @@ impl MarkdownPreview {
             .filter(|(_, r)| r.kind == RowKind::Code)
             .map(|(ix, _)| (ix, ScrollHandle::new()))
             .collect();
+        // 表格行 → 稳定的横向滚动句柄（供块内滚动条拖动）
+        self.table_scroll = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.kind == RowKind::Table)
+            .map(|(ix, _)| (ix, ScrollHandle::new()))
+            .collect();
         self.rows = Rc::new(rows);
         self.remeasure_dimensions(cx);
         if self.rows.len() != self.list_state.item_count() {
@@ -255,6 +265,7 @@ impl Render for MarkdownPreview {
         let content_w = self.content_w;
         let wrap = self.wrap;
         let code_scroll = self.code_scroll.clone();
+        let table_scroll = self.table_scroll.clone();
         // 目录：供目录菜单渲染
         let toc = self.toc.clone();
 
@@ -282,9 +293,11 @@ impl Render for MarkdownPreview {
         let content = {
             let p = p.clone();
             let code_scroll = code_scroll;
+            let table_scroll = table_scroll;
             list(list_state.clone(), move |ix, _window, cx| {
-                let h = code_scroll.get(&ix).cloned();
-                render_row(&rows[ix], &p, wrap, h, cx)
+                let ch = code_scroll.get(&ix).cloned();
+                let th = table_scroll.get(&ix).cloned();
+                render_row(&rows[ix], &p, wrap, ch, th, cx)
             })
         }
         .size_full();

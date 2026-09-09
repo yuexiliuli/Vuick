@@ -696,6 +696,103 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
     assert!(max_x > px(0.), "非换行模式也应横向可滚动，max_offset.x={max_x:?}");
 }
 
+/// 回归：超宽表格在换行模式（默认）下应自带横向滚动条，而不是被视口裁剪遮挡。
+/// 表格滚动容器 = 预览视口宽；内部固定宽表格超宽时块内可横向滚动、滚动条真实渲染，
+/// 句柄跨帧稳定（set_offset 能把表格真正向左滚动）——对齐代码块方案。
+#[gpui::test]
+fn wide_table_scrolls_in_wrap_mode(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 5 列 × 超长内容：估算宽远超 300px 视口
+    let long = "x".repeat(60);
+    let md_src = format!(
+        "| {long} | {long} | {long} | {long} | {long} |\n|---|---|---|---|---|\n| {long} | {long} | {long} | {long} | {long} |\n"
+    );
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(&md_src, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+
+    let preview = cx
+        .debug_bounds("md-preview")
+        .expect("预览根 md-preview 应存在");
+    let table = cx
+        .debug_bounds("md-table")
+        .expect("表格 md-table 应存在");
+    assert!(
+        table.size.width > preview.size.width,
+        "超宽表格应宽于预览视口（从而可在块内横向滚动而非被裁剪），table={table:?} preview={preview:?}"
+    );
+    // 表格滚动容器应等于预览视口宽（自身不撑大，内容在内部横向滚动）
+    let hscroll = cx
+        .debug_bounds("md-table-hscroll")
+        .expect("表格滚动容器 md-table-hscroll 应存在");
+    assert!(
+        hscroll.size.width <= preview.size.width + px(1.),
+        "表格滚动容器应等于预览视口宽，实际 hscroll={hscroll:?} preview={preview:?}"
+    );
+    // 表格应完整放进滚动容器高度（估算高度与实际渲染一致，不被裁剪）
+    assert!(
+        table.size.height <= hscroll.size.height + px(1.),
+        "表格应完整放进滚动容器，table_h={:.0} hscroll_h={:?}",
+        table.size.height.as_f32(),
+        hscroll.size.height
+    );
+    // 滚动条叠层真实渲染（非零尺寸）
+    let sbar = cx
+        .debug_bounds("md-table-scrollbar")
+        .expect("表格横向滚动条 md-table-scrollbar 应存在");
+    assert!(
+        sbar.size.width > px(0.) && sbar.size.height > px(0.),
+        "横向滚动条不应塌缩成 0，实际={sbar:?}"
+    );
+
+    // 表格行在对应滚动句柄处注册；句柄 max_offset.x 应 > 0（可横向滚动）
+    let rows = parse_to_rows(&md_src);
+    let table_ix = rows
+        .iter()
+        .position(|r| r.kind == RowKind::Table)
+        .expect("应有表格行");
+    let (max_x,) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        let h = md.table_scroll.get(&table_ix).expect("表格应注册滚动句柄");
+        (h.max_offset().x,)
+    });
+    assert!(max_x > px(0.), "超宽表格句柄 max_offset.x 应 > 0，实际={max_x:?}");
+
+    // 关键：句柄跨帧稳定，set_offset 能真正向左滚动表格（滚动条拖动生效）
+    let origin_x = table.origin.x.as_f32();
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let h = md
+            .read(cx)
+            .table_scroll
+            .get(&table_ix)
+            .expect("表格应注册滚动句柄")
+            .clone();
+        h.set_offset(gpui::point(px(-200.), px(0.)));
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+    let table2 = cx
+        .debug_bounds("md-table")
+        .expect("滚动后 md-table 应仍存在");
+    assert!(
+        table2.origin.x.as_f32() < origin_x - 100.0,
+        "设置表格滚动句柄后表格应向左滚动，origin.x: {origin_x:.0} -> {:?}",
+        table2.origin.x
+    );
+}
+
 /// 换行模式下，短代码块的背景应铺满预览视口宽（跟随窗口），而不是只到文本最右边缘，
 /// 使各代码块视觉宽度统一；且不产生（无溢出的）横向滚动条。
 #[gpui::test]

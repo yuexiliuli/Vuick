@@ -17,7 +17,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 use crate::markdown::parser::{Row, RowKind, RunKind};
 use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
-use crate::markdown::view::table::render_table;
+use crate::markdown::view::table::{render_table, table_height};
 
 /// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
 /// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
@@ -353,12 +353,14 @@ impl Element for RoundedInlineText {
     }
 }
 
-/// 渲染单个行。`code_handle` 为代码块稳定的横向滚动句柄（None 时自动创建）。
+/// 渲染单个行。`code_handle` / `table_handle` 为各自稳定的横向滚动句柄
+/// （None 时自动创建），供滚动条拖动使用。
 pub(crate) fn render_row(
     row: &Rc<Row>,
     p: &Rc<StyleParams>,
     wrap: bool,
     code_handle: Option<ScrollHandle>,
+    table_handle: Option<ScrollHandle>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
@@ -367,6 +369,51 @@ pub(crate) fn render_row(
     // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
     if let RowKind::Table = row.kind {
         let table = row.table.as_ref().expect("Table 行必须携带表格结构");
+        // 换行模式（默认，预览视口不横向撑宽）：表格自带横向滚动容器 + Always 滚动条，
+        // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
+        // 非换行模式仍交外层 md-harea 统一横向滚动。
+        if wrap {
+            let h = table_handle.unwrap_or_else(ScrollHandle::new);
+            let table_h = table_height(table, p);
+            return div()
+                .w_full()
+                .flex_shrink_0()
+                .px_3()
+                .py_1()
+                .child(
+                    div()
+                        .debug_selector(|| "md-table-hscroll".into())
+                        .h(px(table_h))
+                        .w_full()
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("md-table-scroll")
+                                .w_full()
+                                .h_full()
+                                .flex()
+                                .flex_row()
+                                .overflow_x_scroll()
+                                // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
+                                .restrict_scroll_to_axis()
+                                .track_scroll(&h)
+                                .child(render_table(table, p)),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "md-table-scrollbar".into())
+                                .absolute()
+                                .inset_0()
+                                .child(
+                                    Scrollbar::horizontal(&h)
+                                        .mode(ScrollbarMode::Always)
+                                        .viewport_from_layout(),
+                                ),
+                        ),
+                )
+                .into_any_element();
+        }
         return div()
             .w_full()
             .flex_shrink_0()
