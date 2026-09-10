@@ -1018,3 +1018,47 @@ fn search_jump_highlight_appears_and_clears(cx: &mut TestAppContext) {
         "超时后高亮应自动消失"
     );
 }
+
+/// 回归：竖滚动条量程在首次渲染后由「平均行高 × 行数」铺设到接近真实总高，
+/// 而不是只算可见行（否则滚动条一开始拖动不了全文）。这是确定性断言：
+/// `update_height_hint` 在无布局（summary=0）时会把统一高度提示填满整列表。
+#[gpui::test]
+fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut md = cx.update(|cx| MarkdownPreview::new(cx));
+    let mut src = String::new();
+    // 多种行型混合 + 一个大代码块：若平均行高漏算代码块，量程会严重偏小
+    src.push_str("```rs\n");
+    for i in 0..200 {
+        src.push_str(&format!("let x = {i};\n"));
+    }
+    src.push_str("```\n\n");
+    for i in 0..3000 {
+        src.push_str(&match i % 5 {
+            0 => format!("## 标题 {i} 内容内容内容内容内容内容内容内容内容内容内容内容\n"),
+            1 => format!("- 列表项 {i} 内容内容内容内容内容内容内容内容内容内容内容内容\n"),
+            2 => format!("普通段落行 {i} 内容内容内容内容内容内容内容内容内容内容内容内容\n"),
+            3 => format!("> 引述内容 {i} 内容内容内容内容内容内容内容内容内容内容\n"),
+            _ => format!("正文 {i}\n"),
+        });
+    }
+    cx.update(|cx| md.set_source(&src, cx));
+    let (n, hint, max_off) = cx.update(|cx| {
+        let changed = md.update_height_hint(cx, 490.0);
+        assert!(changed, "首次无布局（summary=0）时应触发一次重填");
+        (
+            md.rows.len(),
+            md.est_hint,
+            md.list_state.max_offset_for_scrollbar().y.as_f32(),
+        )
+    });
+    assert!(n > 0, "应有渲染行");
+    assert!(hint > 20.0, "平均行高应超过单行正文高，实际={hint:.1}");
+    // 量程 = 行数 × 平均行高（尚未布局，无视口扣除）；应接近估算总高
+    let expected = n as f32 * hint;
+    assert!(
+        (max_off - expected).abs() < expected * 0.05,
+        "滚动条量程应接近 行数×平均行高：max_off={max_off:.0} expected={expected:.0} hint={hint:.1}"
+    );
+}
+

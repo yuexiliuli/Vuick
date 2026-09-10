@@ -290,6 +290,10 @@ impl EditorApp {
         });
         if preview_on {
             self.sync_md_preview(idx, cx);
+        } else {
+            // 关闭预览：释放整篇解析出的行数据与测量缓存，内存回到基线
+            // （否则隐藏的预览仍占着整篇文档，反复开关只涨不降）。
+            self.tabs[idx].md_preview.update(cx, |view, cx| view.release(cx));
         }
         cx.notify();
     }

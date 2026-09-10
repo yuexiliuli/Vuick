@@ -3,6 +3,9 @@
 //! 核心思路（参考 vellum / zorite 的行级虚拟化）：
 //! - 文档被拆成**一行一条**的渲染行（见 [`crate::markdown::parser`]）；
 //! - 用 gpui 的 `List` 做虚拟化：只构建 / 绘制可见行，滚动时按需重建；
+//! - **竖滚动条量程**：`measure_all()` 会首帧排版整篇（十万行一次 1GB+），所以改用
+//!   `with_uniform_item_height` 以「宽度感知的平均行高」铺设量程（见 `update_height_hint`）
+//!   ——行数 × 平均高 ≈ 真实总高，滚动条从一开始就能拖动到全文，内存只随可见窗口走；
 //! - 横向溢出走**原生滚动容器**：`List` 的内容宽（估算的最宽行 `content_w`）由
 //!   `w(content_w).min_w_full()` 在布局期一次算定（超宽行撑宽、普通文档撑满视口），
 //!   外面套一层 `overflow_x_scroll` + `track_scroll(&h_handle)`；
@@ -36,7 +39,7 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
 use crate::markdown::parser::{parse_to_rows, Row, RowKind};
 
-use dimensions::{est_row_width, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX};
+use dimensions::{est_row_width, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX, IMAGE_ROW_DEFAULT_H};
 use row::render_row;
 use style::StyleParams;
 
@@ -74,6 +77,11 @@ pub struct MarkdownPreview {
     highlight_search: Option<(usize, String)>,
     /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮，避免旧定时器误清新高亮。
     highlight_seq: u64,
+    /// 统一行高提示（px）：宽度感知的平均行高估算，用于 `ListState::with_uniform_item_height`，
+    /// 让竖滚动条量程从头一开始就接近真实总高（不用一次性排版整篇）。
+    est_hint: f32,
+    /// 生成 `est_hint` 时的视口宽度（px）；<0 表示尚未按宽度估算（需要重算）。
+    est_hint_width: f32,
 }
 
 impl MarkdownPreview {
@@ -94,6 +102,8 @@ impl MarkdownPreview {
             table_scroll: Default::default(),
             highlight_search: None,
             highlight_seq: 0,
+            est_hint: 0.0,
+            est_hint_width: -1.0,
         }
     }
 
@@ -179,6 +189,7 @@ impl MarkdownPreview {
         self.font_override = size;
         self.remeasure_dimensions(cx);
         self.list_state.remeasure();
+        self.invalidate_height_hint();
     }
 
     /// 在当前字号基础上增减（EPUB 滚动缩放）；返回新的字号覆盖。
@@ -209,6 +220,7 @@ impl MarkdownPreview {
         self.wrap = wrap;
         self.remeasure_dimensions(cx);
         self.list_state.remeasure();
+        self.invalidate_height_hint();
     }
 
     /// 当前是否文本自动换行。
@@ -319,23 +331,180 @@ impl MarkdownPreview {
             .collect();
         self.rows = Rc::new(rows);
         self.remeasure_dimensions(cx);
+        // 行高估算依赖视口宽度，换源后强制按新宽度重算（render 里执行）。
+        self.invalidate_height_hint();
         if self.rows.len() != self.list_state.item_count() {
-            // 行数变化 → 重建并 measure_all，保证滚动条范围从一开始就正确
+            // 行数变化 → 重建 ListState。注意**不能**用 `measure_all()`：它会首帧
+            // 就把整篇所有行全部渲染并排版（十万行文档一次吃进 1GB+ 的字体测量缓存），
+            // 而且每次开关预览重解析都会再生成一份、内存只涨不降。
+            // 这里**故意不设**静态高度提示：若先设一个占位提示，首帧 summary 会被它
+            // 垫到「看似有效」而跳过统一高度提示的重填，随后列表又在首次布局时把
+            // size_hint 清成 None（见 `update_height_hint`），滚动条量程就再没人管了。
+            // 直接全部留空，交给 `update_height_hint` 在首次渲染按视口宽度填平均高：
+            // 滚动条量程从一开始就接近真实总高，但只对可见行测量/排版（行级虚拟化）。
             self.list_state =
-                ListState::new(self.rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX))
-                    .measure_all();
+                ListState::new(self.rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
         } else {
-            // 行数不变但内容变了 → 重新测量高度（保留滚动位置）
+            // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();
         }
     }
+
+    /// 释放预览重资源（解析出的行数据 + 列表测量缓存），关闭预览时调用。
+    /// 否则隐藏的预览仍占着整篇文档的解析结果；反复开关预览会积累内存。
+    /// 下次开启预览时 [`Self::set_source`] 会重新解析，行为不变。
+    pub fn release(&mut self, cx: &mut App) {
+        self.rows = Rc::new(Vec::new());
+        self.list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX));
+        self.content_w = 0.0;
+        self.toc.clear();
+        self.code_scroll.clear();
+        self.table_scroll.clear();
+        self.highlight_search = None;
+        self.highlight_seq = self.highlight_seq.wrapping_add(1);
+        self.est_hint = 0.0;
+        self.est_hint_width = -1.0;
+        self.remeasure_dimensions(cx);
+    }
+
+    /// 标记「平均行高的宽度感知估算」已失效：换源 / 换行 / 字号变化后调用，
+    /// 下一次 render（视口宽度已知）会重算并刷新统一高度提示。
+    fn invalidate_height_hint(&mut self) {
+        self.est_hint_width = -1.0;
+    }
+
+    /// 按当前视口宽度估算「平均渲染行高」作为列表的统一高度提示。
+    /// 这样竖滚动条量程 = 行数 × 平均行高 ≈ 真实总高，从头一开始就可用滚动条
+    /// 跳到任意位置（含文末），而无需像 `measure_all()` 那样一次性排版整篇。
+    /// 估算规则尽量贴合 `render_row` 的几何：非文本行按公式精确，文本行按字符宽
+    /// 折算行数（CJK ≈ 字号，其余 ≈ 0.55 × 字号），微差只会让滚动条映射略微
+    /// 非线性，随行真正渲染后逐步收敛。
+    fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
+        if self.rows.is_empty() {
+            return p.body_row_hint().as_f32();
+        }
+        let avail = (width - 24.0).max(40.0); // px_3 左右内缩
+        let wrap = self.wrap;
+        let mut total = 0.0f32;
+        for r in self.rows.iter() {
+            let h = match r.kind {
+                RowKind::Blank => p.blank_h.as_f32(),
+                RowKind::Rule => p.rule_h.as_f32(),
+                RowKind::Code => {
+                    (r.code_lines.len().max(1) as f32 + 2.0) * p.code_line.as_f32()
+                }
+                RowKind::Table => {
+                    let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+                    (1.0 + r.table.as_ref().map_or(0, |t| t.rows.len()) as f32) * row_h
+                        + 2.0
+                        + 8.0
+                }
+                RowKind::Image => IMAGE_ROW_DEFAULT_H,
+                RowKind::Heading(n) => {
+                    let (fs, lh) = p.heading_metrics(n);
+                    if wrap {
+                        est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
+                            * lh.as_f32()
+                            + 8.0
+                    } else {
+                        lh.as_f32()
+                    }
+                }
+                RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+                    if wrap {
+                        let lines =
+                            est_wrap_lines(&r.text, avail, p.para_size.as_f32()).max(1) as f32;
+                        (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
+                            + p.para_gap.as_f32()
+                            + 8.0
+                    } else {
+                        p.para_line.as_f32() + p.para_gap.as_f32()
+                    }
+                }
+            };
+            total += h;
+        }
+        total / self.rows.len() as f32
+    }
+
+    /// 视口宽度已知（render 里）后刷新统一高度提示。
+    ///
+    /// 背景：gpui 的 `list` 元素在**首次布局/视口宽度变化**时的 prepaint 里会把所有
+    /// 未测量项的 size_hint 清为 `None`（`list.rs`，比较 `last_layout_bounds` 宽度），
+    /// 之后滚动条总高就只算可见行、无法一开始拖到全文。这里每次渲染用 O(1) 的
+    /// summary 总高对账：发现总高远小于「行数×平均高」（提示已被清掉）就重新套用；
+    /// 套用**不重建** ListState（保 `last_layout_bounds`，下一帧 prepaint 不再清），
+    /// 并返回 `true` 让调用方 `cx.notify()` 多画一帧闭环。收敛后不再触发，不无限重画。
+    fn update_height_hint(&mut self, cx: &mut App, width: f32) -> bool {
+        if self.rows.is_empty() {
+            return false;
+        }
+        let width_changed = (self.est_hint_width - width).abs() >= 2.0;
+        if width_changed {
+            let p = StyleParams::from_theme_with_font(cx, self.font_override);
+            self.est_hint = self.estimated_avg_row_height(&p, width);
+            self.est_hint_width = width;
+        }
+        let hint = self.est_hint;
+        if hint <= 0.0 {
+            return false;
+        }
+        let n = self.rows.len();
+        if self.list_state.item_count() != n {
+            return false;
+        }
+        // 列表当前总高 = 可滚动上限 + 视口高（尚未布局时二者皆 0）
+        let summary_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
+            + self.list_state.viewport_bounds().size.height.as_f32();
+        let expected = n as f32 * hint;
+        if summary_h >= expected * 0.5 {
+            // 提示仍有效（或已被测量行撑到足够高）→ 无需处理
+            return false;
+        }
+        // 提示被清掉 → 不重建、原地重新填满（保留 last_layout_bounds，避免下次 prepaint 再清）
+        self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
+        true
+    }
+}
+
+/// 估算法：按字符宽（CJK/全角 ≈ font_size，其余 ≈ 0.55 × font_size）累计文本宽度，
+/// 折出在可用宽度 `avail` 下的行数。用于「平均行高」估算，非精确排版。
+fn est_wrap_lines(text: &str, avail: f32, font_size: f32) -> usize {
+    if text.is_empty() {
+        return 1;
+    }
+    let mut w = 0.0f32;
+    for ch in text.chars() {
+        let c = ch as u32;
+        let cw = if (0x2E80..=0x9FFF).contains(&c) || (0xFF00..=0xFFEF).contains(&c) {
+            font_size
+        } else {
+            font_size * 0.55
+        };
+        w += cw;
+    }
+    (w / avail).ceil() as usize
 }
 
 impl Render for MarkdownPreview {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let p = Rc::new(StyleParams::from_theme_with_font(cx, self.font_override));
         let bg = self.bg.unwrap_or(p.bg);
+        // 视口宽度已知 → 刷新统一行高提示，让竖滚动条量程从一开始就接近真实总高。
+        // （首次布局/宽度变化后 gpui 会清空 size_hint，这里检测到就重建重填，并
+        // 请求多画一帧让量程真正生效——下一帧量程即满、不会再通知，不会无限重画。）
+        let pane_w = {
+            let hw = self.h_handle.bounds().size.width.as_f32();
+            if hw > 0.0 {
+                hw
+            } else {
+                window.bounds().size.width.as_f32() * 0.5
+            }
+        };
+        if self.update_height_hint(cx, pane_w) {
+            cx.notify();
+        }
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
         let wrap = self.wrap;

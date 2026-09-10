@@ -99,4 +99,11 @@ impl StyleParams {
         };
         (fs, px(fs.as_f32() * 1.45))
     }
+
+    /// 普通正文行的估算高度（px）：段落/列表/引述等多数行的实际高度都接近这个值。
+    /// 作为行级虚拟化列表「未测量行统一高度提示」（`ListState::with_uniform_item_height`），
+    /// 让滚动条量程从一开始就大致正确，同时避免一次性测量整篇（大文档的内存炸弹）。
+    pub(crate) fn body_row_hint(&self) -> Pixels {
+        self.para_line + self.para_gap
+    }
 }
