@@ -630,6 +630,188 @@
         );
     }
 
+    /// 回归：侧边栏「目录」视图的条目应带 PDF 书签目录同款样式——
+    /// 有子级的条目渲染折叠箭头，点击折叠后隐藏其后代标题，再点恢复。
+    #[gpui::test]
+    async fn sidebar_toc_pdf_style_collapsible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join("gpui-editor-sidebar-toc.md");
+        std::fs::write(
+            &dir,
+            "# 第一章 这是一个特别长的标题用于验证目录自适应宽度\n正文\n## 第一节\n小节\n# 第二章\n结尾\n",
+        )
+        .unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        // 目录视图宽度自适应：长标题应把侧边栏撑到超过固定默认宽（240）
+        let bar = cx
+            .debug_bounds("sidebar")
+            .expect("侧边栏 sidebar 应存在");
+        assert!(
+            bar.size.width.as_f32() > 240.0,
+            "目录视图应随内容自适应加宽，实际={bar:?}"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-resize").is_some(),
+            "侧边栏右缘应有拖拽手柄 sidebar-resize"
+        );
+        // 侧边栏目录应带「目录」面板头（无关闭按钮，开关走活动栏「目录」按钮）
+        assert!(
+            cx.debug_bounds("sidebar-toc-header").is_some(),
+            "目录视图应有面板头 sidebar-toc-header（含「目录」标题）"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-close").is_none(),
+            "目录视图不应再有独立的关闭按钮（由「目录」按钮再点一次关闭）"
+        );
+
+        // 目录条目 + 折叠箭头渲染
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-0").is_some()
+                && cx.debug_bounds("sidebar-toc-md-1").is_some()
+                && cx.debug_bounds("sidebar-toc-md-2").is_some(),
+            "侧边栏目录应有标题条目 sidebar-toc-md-*"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-caret-0").is_some(),
+            "h1（第一章）有子级 h2，应渲染折叠箭头 sidebar-toc-caret-0"
+        );
+
+        // 折叠 h1 → h2 后代条目隐藏
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| app.toggle_sidebar_toc_collapse(0, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1").is_none(),
+            "折叠父项后其后代 h2 条目应隐藏"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-2").is_some(),
+            "折叠不影响其它顶级条目"
+        );
+
+        // 再展开 → h2 恢复
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| app.toggle_sidebar_toc_collapse(0, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1").is_some(),
+            "再次展开父项后 h2 条目应恢复"
+        );
+
+        // 右缘拖拽调宽：start → update → end，宽度按位移更新，且关闭自适应
+        let w0 = cx.update(|_w, cx| app.read(cx).sidebar_width);
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.start_sidebar_resize(300.0, cx);
+                app.update_sidebar_resize(320.0, cx);
+                app.end_sidebar_resize(cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (w1, auto) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar_width, a.sidebar_width_auto)
+        });
+        assert!(
+            (w1 - w0 - 20.0).abs() < 1.0,
+            "拖拽后侧边栏宽应按位移更新，w0={w0:.1} w1={w1:.1}"
+        );
+        assert!(!auto, "手动拖拽后应关闭宽度自适应");
+
+        // 「目录」按钮开关逻辑：再点一次只收起目录面板，侧边栏（活动栏）保留为窄条
+        assert!(
+            cx.update(|_w, cx| app.read(cx).sidebar_open),
+            "打开文件后侧边栏应处于展开"
+        );
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (open, panel) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.sidebar_open, a.sidebar_panel_open)
+        });
+        assert!(open && !panel, "再点「目录」应收起目录面板、侧边栏仍展开");
+        assert!(
+            cx.debug_bounds("sidebar-toc").is_none(),
+            "再次点「目录」后目录内容应关闭"
+        );
+        // 侧边栏仍可见，但收窄为活动栏（46px），不留空白宽区
+        let slim = cx
+            .debug_bounds("sidebar")
+            .expect("目录面板收起后侧边栏（活动栏）应仍在");
+        assert!(
+            (slim.size.width.as_f32() - crate::app::SIDEBAR_ACTIVITY_W).abs() < 2.0,
+            "面板收起后侧边栏应只剩活动栏宽，实际={slim:?}"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-activity-bar").is_some(),
+            "活动栏在面板收起后应仍可见"
+        );
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc").is_some(),
+            "再次点「目录」应重新展开目录面板"
+        );
+
+        // 回归：再次拖窄目录后，条目不得溢出侧边栏右缘（否则其 hover/点击会延伸到编辑器区）
+        let wnow = cx.update(|_w, cx| app.read(cx).sidebar_width);
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.start_sidebar_resize(wnow + 50.0, cx);
+                app.update_sidebar_resize(wnow - 60.0, cx);
+                app.end_sidebar_resize(cx);
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let sb = cx
+            .debug_bounds("sidebar")
+            .expect("拖窄后侧边栏应仍存在");
+        let row = cx
+            .debug_bounds("sidebar-toc-md-0")
+            .expect("目录条目应仍存在");
+        let sb_right = sb.origin.x.as_f32() + sb.size.width.as_f32();
+        let row_right = row.origin.x.as_f32() + row.size.width.as_f32();
+        assert!(
+            row_right <= sb_right + 1.0,
+            "拖窄后目录条目应随面板裁剪、不溢出右缘：row_right={row_right:.0} sb_right={sb_right:.0}"
+        );
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
     #[gpui::test]
     async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
         init_test(cx);

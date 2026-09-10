@@ -25,7 +25,7 @@ pub use parser::{DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult}
 pub use view::PdfViewer;
 
 // 目录折叠/可见性的纯函数（供 EPUB 等其它阅读器复用同一套树可见性逻辑）
-pub(crate) use toc::toc_visibility;
+pub(crate) use toc::{toc_node_has_child, toc_visibility};
 
 use std::sync::Arc;
 

@@ -20,9 +20,23 @@ pub(super) enum SidebarView {
 const SEARCH_RESULT_CAP: usize = 200;
 
 impl EditorApp {
-    /// 切换侧边栏视图。
+    /// 切换侧边栏视图（并展开对应面板）。
     pub(super) fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
         self.sidebar_view = view;
+        self.sidebar_panel_open = true;
+        cx.notify();
+    }
+
+    /// 活动栏按钮点按：未在该面板 → 展开并切到该面板；
+    /// 已在该面板再点一次 → **只收起面板**，侧边栏保留为窄活动栏（不留空白宽区）。
+    pub(super) fn toggle_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
+        if self.sidebar_panel_open && self.sidebar_view == view {
+            self.sidebar_panel_open = false;
+        } else {
+            self.sidebar_open = true;
+            self.sidebar_panel_open = true;
+            self.sidebar_view = view;
+        }
         cx.notify();
     }
 
@@ -43,30 +57,139 @@ impl EditorApp {
             .flex_row()
             .flex_1()
             .min_h(px(0.))
+            // 侧边栏右缘拖拽调宽：鼠标移动/松开事件冒泡到整个内容容器统一处理。
+            // 若挂在 sidebar 自身，指针一旦移出侧边栏右缘（进入正文区）就不再派发，
+            // 拖拽会“卡住不灵敏”；挂在整行容器上（与 pdf::toc、splitter 同款）即可全程跟踪。
+            .on_mouse_move(cx.listener(
+                |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, _w, cx| {
+                    this.update_sidebar_resize(ev.position.x.as_f32(), cx);
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                    this.end_sidebar_resize(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _: &gpui::MouseUpEvent, _w, cx| {
+                    this.end_sidebar_resize(cx);
+                }),
+            )
             .child(self.render_sidebar(cx))
             .child(body)
             .into_any_element()
     }
 
-    /// 侧边栏整体：左侧为一竖列切换栏（目录/搜索），右侧为当前视图内容。
+    /// 侧边栏整体：左侧为常驻竖列切换栏（活动栏），右侧为可展开的内容面板
+    /// （目录/搜索）。面板收起时仅剩 46px 活动栏，正文区随之占满，不留空白宽区。
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (side_bg, border) = (self.bar_bg(), self.bar_border());
-        let content: gpui::AnyElement = match self.sidebar_view {
-            SidebarView::Toc => self.render_sidebar_toc(cx),
-            SidebarView::Search => self.render_sidebar_search(cx),
+        // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
+        let content: Option<gpui::AnyElement> = if self.sidebar_panel_open {
+            Some(match self.sidebar_view {
+                SidebarView::Toc => self.render_sidebar_toc(cx),
+                SidebarView::Search => self.render_sidebar_search(cx),
+            })
+        } else {
+            None
+        };
+        let width_px = if self.sidebar_panel_open {
+            self.sidebar_width
+        } else {
+            crate::app::SIDEBAR_ACTIVITY_W
         };
         div()
             .id("sidebar")
             .debug_selector(|| "sidebar".into())
-            .w(px(crate::app::SIDEBAR_WIDTH))
+            .w(px(width_px))
             .flex_shrink_0()
+            .relative()
             .flex()
             .flex_row()
             .bg(side_bg)
             .border_r_1()
             .border_color(border)
+            // 拖拽调宽事件由外层 app-body-with-sidebar 容器统一处理（见 render_body_sidebar）
             .child(self.render_sidebar_activity_bar(border, cx))
-            .child(content)
+            .children(content)
+            .children(self.render_sidebar_resize_handle(cx))
+    }
+
+    /// 开始拖拽侧边栏右缘：记录 (起始 x, 起始宽)，关闭自适应由用户接管。
+    pub(super) fn start_sidebar_resize(&mut self, start_x: f32, cx: &mut Context<Self>) {
+        self.sidebar_resize = Some((start_x, self.sidebar_width));
+        self.sidebar_width_auto = false;
+        cx.notify();
+    }
+
+    /// 拖拽中：按鼠标位移更新侧边栏宽（自变量窗口坐标 x）。宽度 clamp 在 [MIN, MAX]。
+    pub(super) fn update_sidebar_resize(&mut self, x: f32, cx: &mut Context<Self>) {
+        if let Some((start_x, start_w)) = self.sidebar_resize {
+            self.sidebar_width = (start_w + (x - start_x))
+                .clamp(crate::app::SIDEBAR_WIDTH_MIN, crate::app::SIDEBAR_WIDTH_MAX);
+            cx.notify();
+        }
+    }
+
+    /// 结束拖拽。
+    pub(super) fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_resize.is_some() {
+            self.sidebar_resize = None;
+            cx.notify();
+        }
+    }
+
+    /// 侧边栏右缘拖拽手柄：宽 6px 命中区，视觉 2px 强调细线（悬停/拖拽时显现）。
+    /// 面板收起时返回空（无拖拽意义）。
+    fn render_sidebar_resize_handle(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if !self.sidebar_panel_open {
+            return Vec::new();
+        }
+        let accent = rgb(crate::scrollbar::RESIZE_ACCENT);
+        vec![
+            div()
+                .id("sidebar-resize")
+                .debug_selector(|| "sidebar-resize".into())
+                .absolute()
+                .right(px(0.))
+                .top(px(0.))
+                .bottom(px(0.))
+                .w(px(6.))
+                .cursor(CursorStyle::ResizeColumn)
+                .on_hover(cx.listener(
+                    |this: &mut EditorApp, hovered: &bool, _w, cx| {
+                        this.sidebar_resize_hovered = *hovered;
+                        cx.notify();
+                    },
+                ))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this: &mut EditorApp, ev: &gpui::MouseDownEvent, _w, cx| {
+                        this.start_sidebar_resize(ev.position.x.as_f32(), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        // 贴到右缘，不用 flex 居中（否则蓝色线离边缘差 ~2px 看着有缝）
+                        .absolute()
+                        .right(px(0.))
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .w(px(2.))
+                        .rounded_full()
+                        .opacity(
+                            if self.sidebar_resize.is_some() || self.sidebar_resize_hovered {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        )
+                        .bg(accent),
+                )
+                .into_any_element(),
+        ]
     }
 
     /// 侧边栏左侧竖列切换栏：目录 / 搜索 两个按钮上下排布（当前项高亮）。
@@ -83,7 +206,7 @@ impl EditorApp {
         ];
         let mut btns: Vec<gpui::AnyElement> = Vec::with_capacity(2);
         for (view, icon, label, id) in specs {
-            let is_active = self.sidebar_view == view;
+            let is_active = self.sidebar_panel_open && self.sidebar_view == view;
             let bg = if is_active { active_bg } else { gpui::transparent_black() };
             let col = if is_active { fg } else { muted };
             let id_owned = id.to_string();
@@ -105,7 +228,7 @@ impl EditorApp {
                 .cursor(CursorStyle::PointingHand)
                 .hover(|style| style.bg(if is_active { bg } else { border }))
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                    this.set_sidebar_view(view, cx);
+                    this.toggle_sidebar_view(view, cx);
                 }))
                 .child(Icon::new(icon).size(px(17.)).text_color(col))
                 .child(div().text_size(px(9.5)).text_color(col).child(label));
@@ -114,7 +237,7 @@ impl EditorApp {
         div()
             .id("sidebar-activity-bar")
             .debug_selector(|| "sidebar-activity-bar".into())
-            .w(px(46.))
+            .w(px(crate::app::SIDEBAR_ACTIVITY_W))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -137,40 +260,119 @@ impl EditorApp {
             .into_any_element()
     }
 
-    /// 目录条目行（返回可再挂 on_click 的 Stateful div）。
-    fn toc_row_styled(
+    /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
+    pub(super) fn toggle_sidebar_toc_collapse(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let has_child = match self.tabs.get(self.active_tab) {
+            Some(t) if t.pdf_preview.is_some() => {
+                let outlines = t.pdf_preview.as_ref().unwrap().read(cx).outlines().to_vec();
+                crate::pdf::toc_node_has_child(&outlines, idx)
+            }
+            Some(t) => {
+                let entries = t.md_preview.read(cx).toc_entries().to_vec();
+                idx + 1 < entries.len() && entries[idx + 1].1 as usize > entries[idx].1 as usize
+            }
+            None => false,
+        };
+        if !has_child {
+            return;
+        }
+        if !self.sidebar_toc_collapsed.remove(&idx) {
+            self.sidebar_toc_collapsed.insert(idx);
+        }
+        cx.notify();
+    }
+
+    /// 目录条目可视件（样式对齐 `pdf::toc` 的条目：组 hover 左侧指示条 + 折叠箭头列 +
+    /// 圆点 + 标题 + 右侧页码；整行可点跳转，箭头只折叠/展开）。`top_accent`：顶级条目用
+    /// 强调色圆点；`page_label`：右侧页码文本（PDF 用页+1，Markdown 无页传 `None`）。
+    #[allow(clippy::too_many_arguments)]
+    fn toc_item_frame(
         &self,
-        id_owned: String,
+        id: String,
         level: usize,
         title: String,
+        has_child: bool,
+        is_collapsed: bool,
+        top_accent: bool,
+        page_label: Option<String>,
         fg: gpui::Hsla,
         muted: gpui::Hsla,
-        active_bg: gpui::Hsla,
-    ) -> gpui::Stateful<gpui::Div> {
-        let level = level.min(8);
-        let id2 = id_owned.clone();
-        div()
-            .id(SharedString::from(id_owned))
+        hover_bg: gpui::Hsla,
+        idx: usize,
+        on_select: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let id2 = id.clone();
+        let mut row = div()
+            .id(SharedString::from(id))
             .debug_selector(move || id2.clone())
+            .pl(px(6. + level as f32 * 14.))
+            .pr(px(8.))
+            .py(px(5.))
+            .w_full()
+            .relative()
             .flex()
             .items_center()
-            .pl(px(6. + level as f32 * 12.))
-            .pr(px(8.))
-            .py(px(4.))
-            .mx(px(4.))
-            .rounded_md()
-            .text_size(px(12.))
-            .text_color(fg)
+            .gap(px(6.))
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(active_bg))
+            .group("toc-item")
+            .rounded(px(4.))
+            .hover(|style| style.bg(hover_bg).text_color(fg))
+            .active(|style| style.bg(hover_bg).opacity(0.85));
+
+        // 左侧当前项指示条（hover 时显现，统一强调蓝）
+        let indicator = div()
+            .absolute()
+            .top(px(5.))
+            .bottom(px(5.))
+            .left(px(2.))
+            .w(px(2.))
+            .rounded_full()
+            .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
+            .opacity(0.0)
+            .group_hover("toc-item", |style| style.opacity(1.0));
+        row = row.child(indicator);
+
+        // 折叠箭头（有下级时）：点击只折叠/展开，不跳转
+        if has_child {
+            let chevron = if is_collapsed {
+                Icon::new(IconName::ChevronRight)
+            } else {
+                Icon::new(IconName::ChevronDown)
+            }
+            .size(px(12.))
+            .text_color(muted);
+            let caret = div()
+                .id(SharedString::from(format!("sidebar-toc-caret-{idx}")))
+                .debug_selector(move || format!("sidebar-toc-caret-{idx}"))
+                .w(px(16.))
+                .h(px(16.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .text_color(muted)
+                .group_hover("toc-item", |style| style.text_color(fg))
+                .hover(|style| style.bg(hover_bg))
+                .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.toggle_sidebar_toc_collapse(idx, cx);
+                }))
+                .child(chevron);
+            row = row.child(caret);
+        } else {
+            // 无子项：占位宽度对齐箭头列
+            row = row.child(div().w(px(16.)));
+        }
+
+        row = row
             .child(
                 div()
-                    .w(px(4.))
-                    .h(px(4.))
+                    .w(px(5.))
+                    .h(px(5.))
                     .rounded_full()
                     .flex_shrink_0()
-                    .mr(px(6.))
-                    .bg(if level == 0 {
+                    .bg(if top_accent {
                         rgb(crate::scrollbar::RESIZE_ACCENT).into()
                     } else {
                         muted
@@ -182,90 +384,225 @@ impl EditorApp {
                     .min_w(px(0.))
                     .overflow_hidden()
                     .whitespace_nowrap()
+                    .text_size(px(13.))
+                    .text_color(fg)
+                    .group_hover("toc-item", |style| style.text_color(fg))
                     .child(title),
+            );
+
+        // 右侧页码（PDF 书签）：承前对齐 pdf::toc 的灰色小号页码
+        if let Some(page) = page_label {
+            row = row.child(
+                div()
+                    .flex_shrink_0()
+                    .pl_2()
+                    .text_size(px(10.5))
+                    .text_color(muted)
+                    .child(page),
+            );
+        }
+
+        row.on_click(on_select).into_any_element()
+    }
+
+    /// 估算目录文字宽度（px）：CJK 取全宽、ASCII 取 0.6 倍字号。
+    fn toc_text_width(text: &str, font_px: f32) -> f32 {
+        text.chars()
+            .map(|c| font_px * if c.is_ascii() { 0.6 } else { 1.0 })
+            .sum()
+    }
+
+    /// 目录条目行所需宽度（px）：起始缩进 + 层级缩进 + 箭头列 + 圆点 + 标题 + 右侧留白。
+    fn toc_row_width(level: usize, title: &str, font_px: f32) -> f32 {
+        Self::toc_text_width(title, font_px)
+            + 6.0              // pl 起始缩进
+            + level as f32 * 14.0
+            + 16.0             // 箭头列（无箭头也占位对齐）
+            + 6.0 + 5.0 + 6.0  // gap + 圆点 + gap
+            + 8.0              // pr
+    }
+
+    /// 计算当前激活文档目录所需的最大行宽（px）；无文档/无标题返回 `None`。
+    fn compute_sidebar_toc_width(&self, cx: &gpui::App) -> Option<f32> {
+        let tab = self.tabs.get(self.active_tab)?;
+        let font_px = 13.0f32;
+        // 右侧页码列宽（PDF 书签有页码，Markdown 无）：预留以免标题被截断
+        let page_col_w = 34.0f32;
+        let max_row = if let Some(pdf) = &tab.pdf_preview {
+            let outlines = pdf.read(cx).outlines();
+            outlines
+                .iter()
+                .map(|e| Self::toc_row_width(e.level, &e.title, font_px) + page_col_w)
+                .fold(0.0f32, f32::max)
+        } else {
+            let entries = tab.md_preview.read(cx).toc_entries();
+            entries
+                .iter()
+                .map(|&(_, l, ref t)| Self::toc_row_width(l as usize, t, font_px))
+                .fold(0.0f32, f32::max)
+        };
+        (max_row > 0.0).then_some(max_row)
+    }
+
+    /// 目录视图顶栏：「目录」标题。开关交给左侧竖列「目录」按钮（再点一次收拢侧边栏）。
+    fn render_sidebar_toc_header(&mut self) -> impl IntoElement {
+        let (fg, _muted) = (self.text_primary(), self.text_minor());
+        let border = self.bar_border();
+        div()
+            .id("sidebar-toc-header")
+            .debug_selector(|| "sidebar-toc-header".into())
+            .flex()
+            .items_center()
+            .px(px(10.))
+            .h(px(36.))
+            .border_b_1()
+            .border_color(border)
+            .child(
+                div()
+                    .text_size(px(13.5))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(fg)
+                    .child("目录"),
             )
     }
 
-    /// 「目录」视图：当前文档的标题大纲（Markdown 标题 / PDF 书签）。
+    /// 「目录」视图：当前文档的标题大纲（Markdown 标题 / PDF 书签），
+    /// 带面板头（「目录」+ 关闭）与页码，条目样式对齐 `pdf::toc`（可折叠树）。
     fn render_sidebar_toc(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
 
-        let inner: gpui::AnyElement = if let Some(tab) = self.tabs.get(self.active_tab) {
-            // PDF 书签目录
-            if let Some(pdf) = &tab.pdf_preview {
-                let outlines = pdf.read(cx).outlines().to_vec();
-                if outlines.is_empty() {
-                    self.sidebar_empty_hint("当前 PDF 无书签目录")
+        // 折叠状态按文档缓存：切换文档即清空，并重新按新文档内容自适应宽度
+        let active = self.active_tab;
+        if self.sidebar_toc_tab != Some(active) {
+            self.sidebar_toc_tab = Some(active);
+            self.sidebar_toc_collapsed.clear();
+            self.sidebar_width_auto = true;
+        }
+
+        // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）
+        if self.sidebar_width_auto {
+            if let Some(w) = self.compute_sidebar_toc_width(cx) {
+                self.sidebar_width = (crate::app::SIDEBAR_ACTIVITY_W + w + 12.0)
+                    .clamp(crate::app::SIDEBAR_WIDTH_MIN, crate::app::SIDEBAR_WIDTH_MAX);
+            }
+        }
+
+        let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
+            Some(tab) => {
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                // PDF 书签目录
+                if let Some(pdf) = &tab.pdf_preview {
+                    let outlines = pdf.read(cx).outlines().to_vec();
+                    if outlines.is_empty() {
+                        self.sidebar_empty_hint("当前 PDF 无书签目录")
+                    } else {
+                        let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
+                        let visible =
+                            crate::pdf::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                        let wk = pdf.clone();
+                        for (i, e) in outlines.iter().enumerate() {
+                            if !visible[i] {
+                                continue;
+                            }
+                            let page = e.page_index;
+                            let wk = wk.clone();
+                            let has_child = crate::pdf::toc_node_has_child(&outlines, i);
+                            let is_collapsed =
+                                has_child && self.sidebar_toc_collapsed.contains(&i);
+                            rows.push(self.toc_item_frame(
+                                format!("sidebar-toc-pdf-{i}"),
+                                e.level,
+                                e.title.clone(),
+                                has_child,
+                                is_collapsed,
+                                e.level == 0,
+                                (page != usize::MAX).then(|| (page + 1).to_string()),
+                                fg,
+                                muted,
+                                active_bg,
+                                i,
+                                move |_, _w, cx| {
+                                    if page != usize::MAX {
+                                        let _ = wk.update(cx, |v, cx| {
+                                            v.scroll_to_page(page);
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                                cx,
+                            ));
+                        }
+                        div().flex().flex_col().py_1().children(rows).into_any_element()
+                    }
                 } else {
-                    let weak = pdf.clone();
-                    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(outlines.len());
-                    for (i, e) in outlines.iter().enumerate() {
-                        let page = e.page_index;
-                        let wk = weak.clone();
-                        let mut el = self.toc_row_styled(
-                            format!("sidebar-toc-pdf-{i}"),
-                            e.level,
-                            e.title.clone(),
-                            fg,
-                            muted,
-                            active_bg,
-                        );
-                        if page != usize::MAX {
-                            el = el.on_click(
-                                cx.listener(move |_this: &mut EditorApp, _ev, _window, cx| {
+                    // Markdown 标题
+                    let entries = tab.md_preview.read(cx).toc_entries().to_vec();
+                    if entries.is_empty() {
+                        self.sidebar_empty_hint("当前文件无目录（无标题）")
+                    } else {
+                        let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
+                        let visible =
+                            crate::pdf::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                        let wk = tab.md_preview.clone();
+                        for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
+                            if !visible[i] {
+                                continue;
+                            }
+                            let wk = wk.clone();
+                            let has_child = levels.get(i + 1).is_some_and(|&n| n > levels[i]);
+                            let is_collapsed =
+                                has_child && self.sidebar_toc_collapsed.contains(&i);
+                            rows.push(self.toc_item_frame(
+                                format!("sidebar-toc-md-{i}"),
+                                lvl as usize,
+                                text.clone(),
+                                has_child,
+                                is_collapsed,
+                                lvl == 1,
+                                None,
+                                fg,
+                                muted,
+                                active_bg,
+                                i,
+                                move |_, _w, cx| {
                                     let _ = wk.update(cx, |v, cx| {
-                                        v.scroll_to_page(page);
+                                        v.scroll_to_row(row_ix);
                                         cx.notify();
                                     });
-                                }),
-                            );
+                                },
+                                cx,
+                            ));
                         }
-                        rows.push(el.into_any_element());
+                        div().flex().flex_col().py_1().children(rows).into_any_element()
                     }
-                    div().flex().flex_col().py_1().children(rows).into_any_element()
-                }
-            } else {
-                // Markdown 标题
-                let entries = tab.md_preview.read(cx).toc_entries().to_vec();
-                if entries.is_empty() {
-                    self.sidebar_empty_hint("当前文件无目录（无标题）")
-                } else {
-                    let weak_md = tab.md_preview.clone();
-                    let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(entries.len());
-                    for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
-                        let wk = weak_md.clone();
-                        let mut el = self.toc_row_styled(
-                            format!("sidebar-toc-md-{i}"),
-                            lvl as usize,
-                            text.clone(),
-                            fg,
-                            muted,
-                            active_bg,
-                        );
-                        el = el.on_click(cx.listener(move |_this: &mut EditorApp, _ev, _window, cx| {
-                            let _ = wk.update(cx, |v, cx| {
-                                v.scroll_to_row(row_ix);
-                                cx.notify();
-                            });
-                        }));
-                        rows.push(el.into_any_element());
-                    }
-                    div().flex().flex_col().py_1().children(rows).into_any_element()
                 }
             }
-        } else {
-            self.sidebar_empty_hint("当前无打开文档")
+            None => self.sidebar_empty_hint("当前无打开文档"),
         };
 
         div()
             .id("sidebar-toc")
             .debug_selector(|| "sidebar-toc".into())
             .flex_1()
+            // 允许面板缩到比最宽条目还窄（否则 min-width:auto 拒绝缩窄，拖窄后
+            // 面板溢出侧边栏右缘，条目 hover/点击仍响应编辑器区）
+            .min_w(px(0.))
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .py_1()
-            .child(inner)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(self.render_sidebar_toc_header())
+            .child(
+                div()
+                    .id("sidebar-toc-scroll")
+                    .debug_selector(|| "sidebar-toc-scroll".into())
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .py_1()
+                    .child(inner),
+            )
             .into_any_element()
     }
 
@@ -304,7 +641,9 @@ impl EditorApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w(px(0.))
             .min_h(px(0.))
+            .overflow_hidden()
             .child(input)
             .child(result_area)
             .into_any_element()
@@ -438,6 +777,7 @@ impl EditorApp {
             .id("sidebar-search-results")
             .debug_selector(|| "sidebar-search-results".into())
             .flex_1()
+            .min_w(px(0.))
             .min_h(px(0.))
             .overflow_y_scroll()
             .child(summary)

@@ -53,6 +53,12 @@ const SPLIT_RATIO_MIN: f32 = 0.2;
 const SPLIT_RATIO_MAX: f32 = 0.8;
 /// 侧边栏宽度（px）。
 const SIDEBAR_WIDTH: f32 = 240.0;
+/// 侧边栏左侧竖列切换栏宽度（px，固定，不含在内容区内）。
+pub(super) const SIDEBAR_ACTIVITY_W: f32 = 46.0;
+/// 侧边栏宽度下限（px，拖拽 clamp）。
+pub(super) const SIDEBAR_WIDTH_MIN: f32 = 160.0;
+/// 侧边栏宽度上限（px，拖拽 clamp）。
+pub(super) const SIDEBAR_WIDTH_MAX: f32 = 480.0;
 
 /// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
 struct EditorTab {
@@ -113,10 +119,24 @@ pub struct EditorApp {
     splitter_hovered: bool,
     /// 侧边栏是否展开。
     sidebar_open: bool,
-    /// 侧边栏当前视图（文件 / 目录 / 搜索）。
+    /// 侧边栏当前视图（目录 / 搜索）。
     sidebar_view: sidebar::SidebarView,
+    /// 侧边栏内容面板是否展开（false = 只留窄活动栏，目录/搜索面板收起）。
+    sidebar_panel_open: bool,
     /// 侧边栏「搜索」关键字输入控件。
     search_state: gpui::Entity<InputState>,
+    /// 侧边栏目录折叠集合（仅当前激活文档，切换文档时清空）。
+    sidebar_toc_collapsed: std::collections::HashSet<usize>,
+    /// 侧边栏目录折叠集合对应的选项卡下标（切换文档即失效清空）。
+    sidebar_toc_tab: Option<usize>,
+    /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
+    sidebar_width: f32,
+    /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。
+    sidebar_width_auto: bool,
+    /// 侧边栏右缘拖拽：`Some((起始 x, 起始宽))`。
+    sidebar_resize: Option<(f32, f32)>,
+    /// 侧边栏右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
+    sidebar_resize_hovered: bool,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
     focus_handle: FocusHandle,
@@ -165,7 +185,14 @@ impl EditorApp {
             splitter_hovered: false,
             sidebar_open: true,
             sidebar_view: sidebar::SidebarView::Toc,
+            sidebar_panel_open: true,
             search_state,
+            sidebar_toc_collapsed: Default::default(),
+            sidebar_toc_tab: None,
+            sidebar_width: SIDEBAR_WIDTH,
+            sidebar_width_auto: true,
+            sidebar_resize: None,
+            sidebar_resize_hovered: false,
             _search_sub: search_sub,
             focus_handle,
         };
