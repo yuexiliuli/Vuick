@@ -33,6 +33,7 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PromptLevel,
     Render, SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
+use gpui_component::highlighter::HighlightTheme;
 use gpui_component::input::{Editor, EditorState, InputEvent, InputState, TabSize};
 use gpui_component::{Icon, IconName};
 
@@ -388,7 +389,8 @@ impl EditorApp {
             "json" => "json",
             "py" => "python",
             "js" | "jsx" => "javascript",
-            "ts" | "tsx" => "typescript",
+            "ts" => "typescript",
+            "tsx" => "tsx",
             "html" | "htm" => "html",
             "css" | "scss" => "css",
             "c" | "h" => "c",
@@ -563,7 +565,7 @@ impl EditorApp {
 
     /// 切换黑白（深色/浅色）主题：驱动 gpui_component 组件主题与自绘色板。
     /// 自绘标题栏也走同一套色板，因此整窗（含标题栏）随之切换。
-    /// 编辑器语法配色随明暗切换为 GitHub Light / GitHub Dark（见 [`crate::syntax`]）。
+    /// 编辑器语法配色随明暗切换为 gpui-component 官方默认 HighlightTheme。
     fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.dark_mode = !self.dark_mode;
         gpui_component::Theme::change(
@@ -575,9 +577,14 @@ impl EditorApp {
             None,
             cx,
         );
-        // Theme::change 会重置 highlight_theme，这里重装 GitHub 语法配色
-        // （暗色编辑区/行号栏背景也由该配色承载：0x111827，与旧 apply_dark_editor_colors 一致）。
-        crate::syntax::install_github_theme(cx);
+        // Theme::change 可能按配置重置 highlight_theme，这里按当前明暗重装
+        // gpui-component 官方默认语法配色（default_light / default_dark）。
+        let highlight = if self.dark_mode {
+            HighlightTheme::default_dark()
+        } else {
+            HighlightTheme::default_light()
+        };
+        gpui_component::Theme::global_mut(cx).highlight_theme = highlight;
         // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
         // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
         let panel_bg = self.panel_bg();

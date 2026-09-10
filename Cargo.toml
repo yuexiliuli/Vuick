@@ -15,7 +15,14 @@ reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 aes-gcm = "0.10"
 hex = "0.4"
 rfd = "0.17"
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+# 编辑器代码/文本高亮用 gpui-component 官方 tree-sitter 实现
+# （crates/ui/src/highlighter + input_highlighter_factory，按需开语言）。
+gpui-component = { git = "https://github.com/longbridge/gpui-component",
+    features = ["tree-sitter", "tree-sitter-markdown", "tree-sitter-rust", "tree-sitter-toml",
+        "tree-sitter-python", "tree-sitter-javascript", "tree-sitter-typescript",
+        "tree-sitter-tsx", "tree-sitter-html", "tree-sitter-css", "tree-sitter-c",
+        "tree-sitter-cpp", "tree-sitter-go", "tree-sitter-java", "tree-sitter-bash",
+        "tree-sitter-yaml", "tree-sitter-sql"] }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 anyhow = "1.0"
 zip = "2"
@@ -24,45 +31,59 @@ roxmltree = "0.21"
 # 页级按需渲染 + 磁盘 PNG 二级缓存/内存预算由 view.rs 承担。
 pdfium-render = "0.9.3"
 image = "0.25"
-# 编辑器代码高亮：syntect 解析默认语法集（与 gpui-component 工作区同版本同特性，
-# 复用其缓存产物；features 对齐根 Cargo.toml：parsing + default-syntaxes + regex-fancy）。
-syntect = { version = "5.3.0", default-features = false, features = [
-    "parsing",
-    "default-syntaxes",
-    "regex-fancy",
-] }
-
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 
 [features]
 test-support = ["gpui/test-support"]
 
-# 编辑器语法高亮与文本编辑是 CPU 密集的正则/文本处理，debug（未优化）下慢到不可用
-# （syntect 解析 16 万行要十余秒、编辑器显示映射/换行布局 6MB 文档 10s+）。
-# 对它们单独开 3 级优化（其余依赖保持快速编译），保证开发/调试时高亮与打开大文件即时。
-[profile.dev.package.syntect]
+# 编辑器语法高亮与文本编辑是 CPU 密集的处理，debug（未优化）下慢到不可用：
+# gpui-component 官方 highlighter 用 tree-sitter 增量解析**全文语法树**，
+# 160 万行/6MB 文档未优化时解析+配色可达约 10s。
+# 对 tree-sitter 栈与编辑核心单独开 3 级优化（其余依赖保持快速编译），
+# 保证开发/调试时高亮与打开大文件即时。
+[profile.dev.package.tree-sitter]
 opt-level = 3
-[profile.dev.package.fancy-regex]
+[profile.dev.package.tree-sitter-language]
 opt-level = 3
-[profile.dev.package.regex]
+[profile.dev.package.streaming-iterator]
 opt-level = 3
-[profile.dev.package.regex-automata]
+[profile.dev.package.tree-sitter-rust]
 opt-level = 3
-[profile.dev.package.regex-syntax]
+[profile.dev.package.tree-sitter-json]
 opt-level = 3
-[profile.dev.package.memchr]
+[profile.dev.package.tree-sitter-javascript]
 opt-level = 3
-[profile.dev.package.aho-corasick]
+[profile.dev.package.tree-sitter-typescript]
 opt-level = 3
-[profile.dev.package.bitflags]
+[profile.dev.package.tree-sitter-python]
 opt-level = 3
-[profile.dev.package.fnv]
+[profile.dev.package.tree-sitter-html]
 opt-level = 3
-# 编辑器核心（gpui-component/base 的文本缓冲/显示映射/换行布局 + 语法高亮窗口解析）
-[profile.dev.package.gpui-base]
+[profile.dev.package.tree-sitter-css]
 opt-level = 3
+[profile.dev.package.tree-sitter-c]
+opt-level = 3
+[profile.dev.package.tree-sitter-cpp]
+opt-level = 3
+[profile.dev.package.tree-sitter-go]
+opt-level = 3
+[profile.dev.package.tree-sitter-java]
+opt-level = 3
+[profile.dev.package.tree-sitter-bash]
+opt-level = 3
+[profile.dev.package.tree-sitter-yaml]
+opt-level = 3
+[profile.dev.package.tree-sitter-toml-ng]
+opt-level = 3
+[profile.dev.package.tree-sitter-sequel]
+opt-level = 3
+[profile.dev.package.tree-sitter-md]
+opt-level = 3
+# 编辑核心（gpui-component/base 的文本缓冲/显示映射/换行布局 + 高亮）
 [profile.dev.package.gpui-component]
+opt-level = 3
+[profile.dev.package.gpui-base]
 opt-level = 3
 [profile.dev.package.sum_tree]
 opt-level = 3
