@@ -20,6 +20,7 @@ mod epub;
 mod markdown;
 mod pdf;
 mod scrollbar;
+mod toc;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 use gpui_component::{Root, Theme, ThemeMode};

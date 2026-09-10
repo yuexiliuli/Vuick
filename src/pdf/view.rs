@@ -3,7 +3,9 @@
 //! 子模块拆分（都在 `src/pdf/` 下）：
 //! - [`super::cache`]：磁盘二级页缓存（紧凑 BGRA 落盘 + LRU 封顶）
 //! - [`super::layout`]：页列纯布局/调度数学（尺寸、可见区间、渲染规划）
-//! - [`super::toc`]：书签目录面板（折叠、悬浮、拖拽调宽）与其交互
+//!
+//! 书签目录已统一移到侧边栏（[`crate::app::sidebar`] + 公共 [`crate::toc`]），
+//! 本模块只保留书签数据（`outlines`）与 [`Self::scroll_to_page`] 跳页能力。
 //!
 //! 关键机制：
 //! - **打开即显**：文件读取 + 结构解析 + 页尺寸测量都在后台线程做（便宜），
@@ -28,8 +30,8 @@ use std::sync::{mpsc, Arc};
 
 use gpui::{
     div, img, px, rgb, App, Context, Hsla, ImageSource, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, RenderImage, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    ParentElement, Render, RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
@@ -38,7 +40,6 @@ use crate::pdf::layout::{
     Slot, compute_layout, display_height, keep_window, plan_page_work, render_scale, MAX_INFLIGHT,
     PAGE_PAD_X, PAGE_WIDTH,
 };
-use crate::pdf::toc::TOC_WIDTH_DEFAULT;
 use crate::pdf::{
     render_image_from_bgra, DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult,
 };
@@ -75,22 +76,8 @@ pub struct PdfViewer {
     pub(crate) pending_drops: Vec<Arc<RenderImage>>,
     /// 磁盘二级页缓存：内存淘汰后读盘即得，来回翻页不重新栅格化。
     pub(crate) cache: PageCache,
-    /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。
+    /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。供侧边栏目录使用。
     pub(crate) outlines: Vec<PdfOutlineEntry>,
-    /// 已折叠的目录父项索引（`HashSet<条目下标>`），默认全部展开。
-    /// 只有「有下级」的条目（下标 i 满足 level[i] < level[i+1]）才可能被折叠；
-    /// 折叠后其所有后代（直到回到同层或更浅的祖先层）都不再显示。
-    pub(crate) toc_collapsed: std::collections::HashSet<usize>,
-    /// 目录面板当前宽度（px，可拖拽右缘调整）。
-    pub(crate) toc_width: f32,
-    /// 目录右缘拖拽状态：(按下的起始 x, 起始面板宽)。`None` = 未在拖拽。
-    pub(crate) toc_drag: Option<(f32, f32)>,
-    /// 目录右缘拖拽手柄是否被鼠标悬浮（用于悬浮/拖拽时高亮手势线）。
-    pub(crate) toc_resize_hovered: bool,
-    /// 目录面板滚动句柄（跟踪纵向滚动容器，供滚动条组件显示）。
-    pub(crate) toc_scroll: ScrollHandle,
-    /// 右侧目录抽屉是否展开。
-    pub(crate) toc_open: bool,
 }
 
 impl PdfViewer {
@@ -114,12 +101,6 @@ impl PdfViewer {
             pending_drops: Vec::new(),
             cache,
             outlines: Vec::new(),
-            toc_collapsed: std::collections::HashSet::new(),
-            toc_width: TOC_WIDTH_DEFAULT,
-            toc_drag: None,
-            toc_resize_hovered: false,
-            toc_scroll: ScrollHandle::new(),
-            toc_open: false,
         };
         this.start_load(cx);
         this
@@ -147,7 +128,6 @@ impl PdfViewer {
                         this.doc_id = doc_id;
                         this.dims = dims;
                         this.outlines = outlines;
-                        this.toc_collapsed.clear(); // 新文档默认全部展开
                         let (tops, total) = compute_layout(&this.dims, this.page_width());
                         this.page_tops = tops;
                         this.total_height = total;
@@ -368,15 +348,9 @@ impl PdfViewer {
         }
     }
 
-    /// 目录相关子模块所需的只读访问器。
+    /// 书签目录访问器（侧边栏目录使用）。
     pub(crate) fn outlines(&self) -> &[PdfOutlineEntry] {
         &self.outlines
-    }
-    pub(crate) fn toc_collapsed(&self) -> &std::collections::HashSet<usize> {
-        &self.toc_collapsed
-    }
-    pub(crate) fn toc_collapsed_mut(&mut self) -> &mut std::collections::HashSet<usize> {
-        &mut self.toc_collapsed
     }
 }
 
@@ -467,16 +441,10 @@ impl Render for PdfViewer {
                 .h(px(total))
                 .children(cards);
 
-            // 竖向+横向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
-            // wrap 宽度 = max(视口宽, 页宽+边距)：窗口宽时内容居中；窗口过窄（如目录
-            // 展开挤压）时 wrap 宽于视口 → 触发横向滚动条，可滚到全部页面不被裁剪。
-            //
-            // 视口宽**不能用 `self.scroll.bounds()`**：那是上一帧布局写回的测量值。
-            // 目录打开/收起的那一帧，面板宽度尚未被计入 bounds，仍在用旧（更宽）的
-            // 视口算 wrap_w → 页列按旧宽度居中，产生一帧“往左弹”，下一帧 layout 落定
-            // 才按新宽度回正。这里改从「窗口宽 − 目录面板宽」直接推导，布局变化当帧即正确。
-            let panel_w: f32 = if self.toc_open { self.toc_width } else { 0.0 };
-            let view_w = f32::from(window.bounds().size.width) - panel_w;
+            // 横向+竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
+            // wrap 宽度 = max(视口宽, 页宽+边距)：窗口宽时内容居中；窗口过窄时
+            // wrap 宽于视口 → 触发横向滚动条，可滚到全部页面不被裁剪。
+            let view_w = f32::from(window.bounds().size.width);
             let wrap_w = view_w.max(page_width + 2.0 * PAGE_PAD_X);
             div()
                 .id("pdf-scroll")
@@ -497,10 +465,7 @@ impl Render for PdfViewer {
                 .into_any_element()
         };
 
-        // 外层：flex row——左 TOC 面板（展开时挤压右侧 PDF）+ 右 PDF 主体。
-        // 目录开关统一放在应用底部状态栏（见 app::status_bar），此处不再悬浮按钮。
-        let toc_panel: Option<gpui::AnyElement> = self.render_toc_panel(cx);
-
+        // 外层：PDF 主体铺满画布。目录已统一由侧边栏提供，此处不再有内部目录面板。
         div()
             .id("pdf-viewer")
             .debug_selector(|| "pdf-viewer".into())
@@ -509,32 +474,13 @@ impl Render for PdfViewer {
             .flex()
             .flex_row()
             .bg(canvas)
-            // 目录拖拽：鼠标移动/松开事件冒泡到容器统一处理（与 app 分割线同款）
-            .on_mouse_move(cx.listener(
-                |this: &mut Self, ev: &gpui::MouseMoveEvent, _window, cx| {
-                    this.update_toc_resize(ev.position.x.as_f32(), cx);
-                },
-            ))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this: &mut Self, _: &gpui::MouseUpEvent, _window, cx| {
-                    this.end_toc_resize(cx);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|this: &mut Self, _: &gpui::MouseUpEvent, _window, cx| {
-                    this.end_toc_resize(cx);
-                }),
-            )
-            .children(toc_panel) // 左：目录面板（宽度参与布局，展开时挤压右侧）
             .child(
                 div()
                     .id("pdf-main")
                     .debug_selector(|| "pdf-main".into())
                     // 右：PDF 页面主体。flex 行里填满剩余宽度；min_w(0) 允许其压缩到内容
-                    // 最小宽以下——否则自动最小尺寸=页面列宽(~880px)，目录展开时不被挤压，
-                    // 滚动条叠层越出窗口右侧（横向条的右半不可见）且 bounds/比例与窗口脱节。
+                    // 最小宽以下——否则自动最小尺寸=页面列宽(~880px)，滚动条叠层越出窗口
+                    // 右侧（横向条的右半不可见）且 bounds/比例与窗口脱节。
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
@@ -551,8 +497,8 @@ impl Render for PdfViewer {
                                     .mode(ScrollbarMode::Scrolling)
                                     .viewport_from_layout(),
                             )
-                            // 横向滚动条：参照 markdown 预览——窗口过窄（如目录展开挤压）时
-                            // scroll 容器内容宽于视口，横向溢出可滚；轴 Always 常驻可见。
+                            // 横向滚动条：窗口过窄时 scroll 容器内容宽于视口，
+                            // 横向溢出可滚；轴 Always 常驻可见。
                             .child(
                                 Scrollbar::horizontal(&self.scroll)
                                     .mode(ScrollbarMode::Always)
@@ -560,283 +506,5 @@ impl Render for PdfViewer {
                             ),
                     ),
             )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::{AppContext, Entity, TestAppContext, VisualTestContext, size};
-
-    struct PdfHost {
-        viewer: Entity<PdfViewer>,
-    }
-    impl Render for PdfHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.viewer.clone()
-        }
-    }
-
-    fn setup_host(
-        cx: &mut TestAppContext,
-        size: gpui::Size<gpui::Pixels>,
-    ) -> (Entity<PdfHost>, &mut VisualTestContext) {
-        let path = Some(
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/N107内外饰配置表NEW.pdf"),
-        );
-        setup_host_with(cx, size, path)
-    }
-
-    /// 通用宿主：`path` 为 `None`/不可读时 viewer 加载失败，但**保留 seed 的目录**
-    /// （不会被真实书签覆盖），适合校验目录树交互。
-    fn setup_host_with(
-        cx: &mut TestAppContext,
-        size: gpui::Size<gpui::Pixels>,
-        path: Option<std::path::PathBuf>,
-    ) -> (Entity<PdfHost>, &mut VisualTestContext) {
-        cx.update(gpui_component::init);
-        let path = path.unwrap_or_else(|| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/__missing__.pdf")
-        });
-        let (host, cx) = cx.add_window_view(|_window, cx| {
-            let viewer = cx.new(|cx| {
-                let mut v = PdfViewer::new(path, cx);
-                // 测试不依赖真实书签解析：直接布出 2 条目录并展开面板
-                v.seed_outlines_for_test();
-                v.force_toc_open_for_test();
-                v
-            });
-            PdfHost { viewer }
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.simulate_resize(size);
-        // 泵驱动：后台解析的 async 任务需要跑完（真实 PdfWorker 加载），
-        // 多送几帧让滚动容器以最终窗口尺寸完成布局。
-        for _ in 0..200 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        (host, cx)
-    }
-
-    /// 回归：目录展开 + 窗口收窄时，右侧 PDF 主体必须被挤压进窗口内，
-    /// 滚动条叠层（`pdf-scrollbar-overlay`）不得越出窗口右边界；同时 `pdf-scroll`
-    /// 视口宽应按剩余可用宽度计算（否则横向滚动条的滑块几何与窗口宽度脱节）。
-    #[gpui::test]
-    fn toc_open_narrow_window_keeps_scrollbar_inside(cx: &mut TestAppContext) {
-        let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        let (host, cx) = setup_host(cx, size(px(980.), px(720.)));
-        // 等 PdfViewer 真正加载完成（真实 pdfium 解析），在已铺页状态下校验布局。
-        for _ in 0..300 {
-            cx.run_until_parked();
-            let loaded = cx.update(|_, cx| host.read(cx).viewer.read(cx).is_loaded());
-            if loaded {
-                break;
-            }
-        }
-
-        // 目录面板展开时占 280px，主体视口宽应 = 980 - 280 = 700。
-        let check = |cx: &mut VisualTestContext, expect_w: f32| {
-            let main = cx.debug_bounds("pdf-main").expect("pdf-main 应存在");
-            let overlay = cx
-                .debug_bounds("pdf-scrollbar-overlay")
-                .expect("滚动条叠层应存在");
-            let scroll = cx.debug_bounds("pdf-scroll").expect("pdf-scroll 应存在");
-            assert!(
-                (main.size.width.as_f32() - expect_w).abs() < 2.0,
-                "pdf-main 宽应约为 {expect_w}（视口 - 目录 280），实际={main:?}"
-            );
-            assert!(
-                (overlay.size.width.as_f32() - expect_w).abs() < 2.0,
-                "滚动条叠层应铺满 pdf-main（约 {expect_w}），不得越出窗口，实际={overlay:?}"
-            );
-            assert!(
-                (scroll.size.width.as_f32() - expect_w).abs() < 2.0,
-                "pdf-scroll 视口宽应等于剩余可用宽（约 {expect_w}），实际={scroll:?}"
-            );
-            let origin = overlay.origin;
-            assert!(
-                origin.x.as_f32() >= -0.5 && origin.y.as_f32() >= -0.5,
-                "滚动条叠层不应越出窗口左上角，actual origin={origin:?}"
-            );
-        };
-        check(cx, 700.0);
-
-        // 窗口收窄到 620：主体宽应 ≈ 620 - 280 = 340（此前 bug：flex 项被自动
-        // 最小宽=页面列宽阻止收缩，主体仍约 880px 且滚动条右半越出窗口）。
-        cx.simulate_resize(size(px(620.), px(720.)));
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        check(cx, 340.0);
-    }
-
-    /// 回归：点击折叠箭头后，父项子代应被隐藏（从面板 DOM 消失），再次点击展开恢复。
-    ///
-    /// （只校验折叠状态机 + 可见性，避免对真实 pdfium 的强依赖：用 seed 的 2 层目录。）
-    #[gpui::test]
-    fn toc_collapse_hides_children_and_expands_back(cx: &mut TestAppContext) {
-        let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        // 用空路径 → 加载失败，seed 的 2 层书签不被真实书签覆盖，便于精确校验树交互
-        let (host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
-
-        // seed_outlines_for_test: idx0=L0「测试章节」、idx1=L1「测试小节」
-        // 初始全展开：两条目都应渲染
-        let item1 = cx.debug_bounds("pdf-toc-item-0-0").expect("父项应渲染");
-        let child = cx.debug_bounds("pdf-toc-item-1-1").expect("子项初始应可见");
-        assert!(child.size.height > px(0.), "子项默认可见");
-        let parent_y0 = item1.origin.y;
-
-        // 折叠父项(0)：子项(1)应进入隐藏集合且不再渲染；父行仍在
-        cx.update(|_, cx| {
-            let viewer = host.read(cx).viewer.clone();
-            viewer.update(cx, |v, cx| v.toggle_toc_collapse(0, cx));
-        });
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let collapsed_now = cx.update(|_, cx| {
-            host.read(cx).viewer.read(cx).toc_collapsed_for_test().contains(&0)
-        });
-        assert!(collapsed_now, "父项 0 应进入折叠集合");
-        assert!(
-            cx.debug_bounds("pdf-toc-item-1-1").is_none(),
-            "子项折叠后不应再渲染"
-        );
-        assert!(cx.debug_bounds("pdf-toc-item-0-0").is_some(), "父项仍应渲染");
-
-        // 再点击一次 → 展开，子项恢复
-        cx.update(|_, cx| {
-            let viewer = host.read(cx).viewer.clone();
-            viewer.update(cx, |v, cx| v.toggle_toc_collapse(0, cx));
-        });
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let collapsed_now = cx.update(|_, cx| {
-            host.read(cx).viewer.read(cx).toc_collapsed_for_test().contains(&0)
-        });
-        assert!(!collapsed_now, "再次点击应展开（折叠集合移除）");
-        let child = cx.debug_bounds("pdf-toc-item-1-1").expect("展开后子项应恢复");
-        assert!(child.size.height > px(0.), "展开后子项应可见");
-        assert!(
-            (parent_y0.as_f32() - child.origin.y.as_f32()).abs() > 1.0,
-            "子项应与父项不同行（在面板内垂直排列）"
-        );
-    }
-
-    /// 冒烟：目录项 hover 不应 panic；指示条元素存在且位于对应行内（左侧指示条渲染）。
-    #[gpui::test]
-    fn toc_item_hover_renders_indicator(cx: &mut TestAppContext) {
-        let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        let (_host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
-
-        let row = cx.debug_bounds("pdf-toc-item-0-0").expect("父项应渲染");
-        let ind = cx.debug_bounds("pdf-toc-ind-0").expect("指示条应渲染");
-        assert!(
-            ind.origin.x.as_f32() >= row.origin.x.as_f32() - 1.0
-                && ind.origin.x.as_f32() <= row.origin.x.as_f32() + row.size.width.as_f32(),
-            "指示条应在行水平范围内，ind={ind:?} row={row:?}"
-        );
-
-        // 把鼠标移到父项上：仅验证不 panic、布局稳定（纯样式细化，无运行时断言）。
-        let center = gpui::point(
-            row.origin.x + row.size.width / 2.,
-            row.origin.y + row.size.height / 2.,
-        );
-        cx.simulate_mouse_move(center, None, gpui::Modifiers::none());
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        assert!(cx.debug_bounds("pdf-toc-item-0-0").is_some(), "hover 后行仍渲染");
-    }
-
-    /// 回归：目录右缘可拖拽改变面板宽；宽度受限在 [MIN, MAX]；松开后宽度保持。
-    #[gpui::test]
-    fn toc_resize_drag_changes_width(cx: &mut TestAppContext) {
-        use crate::pdf::toc::{TOC_WIDTH_DEFAULT as DEF, TOC_WIDTH_MAX as MAX};
-        let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        let (host, cx) = setup_host_with(cx, size(px(980.), px(720.)), None);
-
-        let panel0 = cx.debug_bounds("pdf-toc-panel").expect("目录面板应存在");
-        let w0 = panel0.size.width.as_f32();
-        assert!((w0 - DEF).abs() < 2.0, "默认宽应 280，实际 {w0}");
-
-        // 取右缘中点（命中区 6px 内）作为拖拽起点
-        let handle = cx.debug_bounds("pdf-toc-resize").expect("拖拽手柄应存在");
-        let start = gpui::point(
-            handle.origin.x + handle.size.width / 2.,
-            panel0.origin.y + panel0.size.height / 2.,
-        );
-        // 按下 → 向右拖 60px → 松开
-        cx.simulate_mouse_move(start, None, gpui::Modifiers::none());
-        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_move(
-            gpui::point(start.x + px(60.), start.y),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::none(),
-        );
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::none());
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-
-        let panel1 = cx.debug_bounds("pdf-toc-panel").expect("目录面板应存在");
-        let w1 = panel1.size.width.as_f32();
-        assert!(
-            (w1 - (w0 + 60.0)).abs() < 3.0,
-            "右拖 60px 后宽度应约 +60，w0={w0} w1={w1}"
-        );
-        assert!(
-            (w1 - cx
-                .update(|_, cx| host.read(cx).viewer.read(cx).toc_width)
-                .abs()) < 0.01,
-            "拖拽后内部保存宽度应一致"
-        );
-
-        // 拖出上限：向右拖到接近窗口右缘 → 宽度应封顶 == MAX
-        let handle = cx.debug_bounds("pdf-toc-resize").expect("手柄应存在");
-        let start = gpui::point(
-            handle.origin.x + handle.size.width / 2.,
-            panel1.origin.y + panel1.size.height / 2.,
-        );
-        cx.simulate_mouse_move(start, None, gpui::Modifiers::none());
-        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
-        cx.simulate_mouse_move(
-            gpui::point(start.x + px(630.), start.y),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::none(),
-        );
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.simulate_mouse_up(start, gpui::MouseButton::Left, gpui::Modifiers::none());
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        let w_max = cx
-            .debug_bounds("pdf-toc-panel")
-            .expect("目录面板应存在")
-            .size
-            .width
-            .as_f32();
-        assert!(
-            (w_max - MAX).abs() < 1.0,
-            "超大拖动应封顶在 MAX，实际 {w_max}"
-        );
     }
 }

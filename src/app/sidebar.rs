@@ -52,7 +52,7 @@ impl EditorApp {
             .min_h(px(0.))
             // 侧边栏右缘拖拽调宽：鼠标移动/松开事件冒泡到整个内容容器统一处理。
             // 若挂在 sidebar 自身，指针一旦移出侧边栏右缘（进入正文区）就不再派发，
-            // 拖拽会“卡住不灵敏”；挂在整行容器上（与 pdf::toc、splitter 同款）即可全程跟踪。
+            // 拖拽会“卡住不灵敏”；挂在整行容器上（与公共 toc 行、splitter 同款）即可全程跟踪。
             .on_mouse_move(cx.listener(
                 |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, _w, cx| {
                     this.update_sidebar_resize(ev.position.x.as_f32(), cx);
@@ -270,11 +270,13 @@ impl EditorApp {
         let has_child = match self.tabs.get(self.active_tab) {
             Some(t) if t.pdf_preview.is_some() => {
                 let outlines = t.pdf_preview.as_ref().unwrap().read(cx).outlines().to_vec();
-                crate::pdf::toc_node_has_child(&outlines, idx)
+                let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
+                crate::toc::toc_node_has_child(&levels, idx)
             }
             Some(t) => {
                 let entries = t.md_preview.read(cx).toc_entries().to_vec();
-                idx + 1 < entries.len() && entries[idx + 1].1 as usize > entries[idx].1 as usize
+                let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
+                crate::toc::toc_node_has_child(&levels, idx)
             }
             None => false,
         };
@@ -285,129 +287,6 @@ impl EditorApp {
             self.sidebar_toc_collapsed.insert(idx);
         }
         cx.notify();
-    }
-
-    /// 目录条目可视件（样式对齐 `pdf::toc` 的条目：组 hover 左侧指示条 + 折叠箭头列 +
-    /// 圆点 + 标题 + 右侧页码；整行可点跳转，箭头只折叠/展开）。`top_accent`：顶级条目用
-    /// 强调色圆点；`page_label`：右侧页码文本（PDF 用页+1，Markdown 无页传 `None`）。
-    #[allow(clippy::too_many_arguments)]
-    fn toc_item_frame(
-        &self,
-        id: String,
-        level: usize,
-        title: String,
-        has_child: bool,
-        is_collapsed: bool,
-        top_accent: bool,
-        page_label: Option<String>,
-        fg: gpui::Hsla,
-        muted: gpui::Hsla,
-        hover_bg: gpui::Hsla,
-        idx: usize,
-        on_select: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let id2 = id.clone();
-        let mut row = div()
-            .id(SharedString::from(id))
-            .debug_selector(move || id2.clone())
-            .pl(px(6. + level as f32 * 14.))
-            .pr(px(8.))
-            .py(px(5.))
-            .w_full()
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .cursor(CursorStyle::PointingHand)
-            .group("toc-item")
-            .rounded(px(4.))
-            .hover(|style| style.bg(hover_bg).text_color(fg))
-            .active(|style| style.bg(hover_bg).opacity(0.85));
-
-        // 左侧当前项指示条（hover 时显现，统一强调蓝）
-        let indicator = div()
-            .absolute()
-            .top(px(5.))
-            .bottom(px(5.))
-            .left(px(2.))
-            .w(px(2.))
-            .rounded_full()
-            .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
-            .opacity(0.0)
-            .group_hover("toc-item", |style| style.opacity(1.0));
-        row = row.child(indicator);
-
-        // 折叠箭头（有下级时）：点击只折叠/展开，不跳转
-        if has_child {
-            let chevron = if is_collapsed {
-                Icon::new(IconName::ChevronRight)
-            } else {
-                Icon::new(IconName::ChevronDown)
-            }
-            .size(px(12.))
-            .text_color(muted);
-            let caret = div()
-                .id(SharedString::from(format!("sidebar-toc-caret-{idx}")))
-                .debug_selector(move || format!("sidebar-toc-caret-{idx}"))
-                .w(px(16.))
-                .h(px(16.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(3.))
-                .text_color(muted)
-                .group_hover("toc-item", |style| style.text_color(fg))
-                .hover(|style| style.bg(hover_bg))
-                .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                    cx.stop_propagation();
-                    this.toggle_sidebar_toc_collapse(idx, cx);
-                }))
-                .child(chevron);
-            row = row.child(caret);
-        } else {
-            // 无子项：占位宽度对齐箭头列
-            row = row.child(div().w(px(16.)));
-        }
-
-        row = row
-            .child(
-                div()
-                    .w(px(5.))
-                    .h(px(5.))
-                    .rounded_full()
-                    .flex_shrink_0()
-                    .bg(if top_accent {
-                        rgb(crate::scrollbar::RESIZE_ACCENT).into()
-                    } else {
-                        muted
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_size(px(13.))
-                    .text_color(fg)
-                    .group_hover("toc-item", |style| style.text_color(fg))
-                    .child(title),
-            );
-
-        // 右侧页码（PDF 书签）：承前对齐 pdf::toc 的灰色小号页码
-        if let Some(page) = page_label {
-            row = row.child(
-                div()
-                    .flex_shrink_0()
-                    .pl_2()
-                    .text_size(px(10.5))
-                    .text_color(muted)
-                    .child(page),
-            );
-        }
-
-        row.on_click(on_select).into_any_element()
     }
 
     /// 估算目录文字宽度（px）：CJK 取全宽、ASCII 取 0.6 倍字号。
@@ -472,7 +351,7 @@ impl EditorApp {
     }
 
     /// 「目录」视图：当前文档的标题大纲（Markdown 标题 / PDF 书签），
-    /// 带面板头（「目录」+ 关闭）与页码，条目样式对齐 `pdf::toc`（可折叠树）。
+    /// 带面板头（「目录」+ 关闭）与页码，条目样式统一来自公共 [`crate::toc`]（可折叠树）。
     fn render_sidebar_toc(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
@@ -504,7 +383,7 @@ impl EditorApp {
                     } else {
                         let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
                         let visible =
-                            crate::pdf::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                            crate::toc::toc_visibility(&levels, &self.sidebar_toc_collapsed);
                         let wk = pdf.clone();
                         for (i, e) in outlines.iter().enumerate() {
                             if !visible[i] {
@@ -512,11 +391,13 @@ impl EditorApp {
                             }
                             let page = e.page_index;
                             let wk = wk.clone();
-                            let has_child = crate::pdf::toc_node_has_child(&outlines, i);
+                            let has_child = crate::toc::toc_node_has_child(&levels, i);
                             let is_collapsed =
                                 has_child && self.sidebar_toc_collapsed.contains(&i);
-                            rows.push(self.toc_item_frame(
+                            let idx = i;
+                            rows.push(crate::toc::toc_item_frame(
                                 format!("sidebar-toc-pdf-{i}"),
+                                format!("sidebar-toc-caret-{i}"),
                                 e.level,
                                 e.title.clone(),
                                 has_child,
@@ -526,7 +407,6 @@ impl EditorApp {
                                 fg,
                                 muted,
                                 active_bg,
-                                i,
                                 move |_, _w, cx| {
                                     if page != usize::MAX {
                                         let _ = wk.update(cx, |v, cx| {
@@ -535,7 +415,10 @@ impl EditorApp {
                                         });
                                     }
                                 },
-                                cx,
+                                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_sidebar_toc_collapse(idx, cx);
+                                }),
                             ));
                         }
                         div().flex().flex_col().py_1().children(rows).into_any_element()
@@ -548,18 +431,20 @@ impl EditorApp {
                     } else {
                         let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
                         let visible =
-                            crate::pdf::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                            crate::toc::toc_visibility(&levels, &self.sidebar_toc_collapsed);
                         let wk = tab.md_preview.clone();
                         for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
                             if !visible[i] {
                                 continue;
                             }
                             let wk = wk.clone();
-                            let has_child = levels.get(i + 1).is_some_and(|&n| n > levels[i]);
+                            let has_child = crate::toc::toc_node_has_child(&levels, i);
                             let is_collapsed =
                                 has_child && self.sidebar_toc_collapsed.contains(&i);
-                            rows.push(self.toc_item_frame(
+                            let idx = i;
+                            rows.push(crate::toc::toc_item_frame(
                                 format!("sidebar-toc-md-{i}"),
+                                format!("sidebar-toc-caret-{i}"),
                                 lvl as usize,
                                 text.clone(),
                                 has_child,
@@ -569,14 +454,16 @@ impl EditorApp {
                                 fg,
                                 muted,
                                 active_bg,
-                                i,
                                 move |_, _w, cx| {
                                     let _ = wk.update(cx, |v, cx| {
                                         v.scroll_to_row(row_ix);
                                         cx.notify();
                                     });
                                 },
-                                cx,
+                                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_sidebar_toc_collapse(idx, cx);
+                                }),
                             ));
                         }
                         div().flex().flex_col().py_1().children(rows).into_any_element()

@@ -13,19 +13,17 @@
 //! - [`view`]：阅读器视图核心（加载/滚动/按需渲染/滚动条）
 //! - [`layout`]：页列纯布局/调度数学（尺寸、可见区间、渲染规划）
 //! - [`cache`]：磁盘二级页缓存（紧凑 BGRA 落盘 + LRU 封顶）
-//! - [`toc`]：书签目录面板（折叠、悬浮、拖拽调宽）与其交互
+//!
+//! 书签目录统一由**侧边栏**提供（见 [`crate::app::sidebar`] 与公共 [`crate::toc`]），
+//! 本模块只保留书签数据（[`PdfOutlineEntry`]）与跳页能力（[`crate::pdf::PdfViewer::scroll_to_page`]）。
 
 mod cache;
 mod layout;
 mod parser;
-mod toc;
 mod view;
 
 pub use parser::{DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult};
 pub use view::PdfViewer;
-
-// 目录折叠/可见性的纯函数（供 EPUB 等其它阅读器复用同一套树可见性逻辑）
-pub(crate) use toc::{toc_node_has_child, toc_visibility};
 
 use std::sync::Arc;
 
