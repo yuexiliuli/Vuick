@@ -20,6 +20,7 @@ mod epub;
 mod markdown;
 mod pdf;
 mod scrollbar;
+mod syntax;
 mod toc;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
@@ -53,6 +54,8 @@ fn main() {
             // 这里强制浅色主题，与现有界面的亮色调保持一致。
             gpui_component::init(cx);
             Theme::change(ThemeMode::Light, None, cx);
+            // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
+            crate::syntax::install_github_theme(cx);
             // 覆盖组件库默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，
             // 否则回车符会作为普通字符参与代码编辑器的布局。
             cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);

@@ -27,7 +27,6 @@ mod tests;
 use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use gpui::{
     div, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths, FocusHandle,
@@ -554,17 +553,9 @@ impl EditorApp {
         }
     }
 
-    /// 深色模式下把编辑区与行号栏(gutter)背景统一为 0x111827
-    /// 消除默认深色主题下二者不慎一致的底色。浅色模式保持默认。
-    fn apply_dark_editor_colors(cx: &mut App) {
-        let theme = gpui_component::Theme::global_mut(cx);
-        let highlight = Arc::make_mut(&mut theme.highlight_theme);
-        highlight.style.editor_background = Some(rgb(0x111827).into());
-        highlight.style.editor_gutter_background = Some(rgb(0x111827).into());
-    }
-
     /// 切换黑白（深色/浅色）主题：驱动 gpui_component 组件主题与自绘色板。
     /// 自绘标题栏也走同一套色板，因此整窗（含标题栏）随之切换。
+    /// 编辑器语法配色随明暗切换为 GitHub Light / GitHub Dark（见 [`crate::syntax`]）。
     fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.dark_mode = !self.dark_mode;
         gpui_component::Theme::change(
@@ -576,9 +567,9 @@ impl EditorApp {
             None,
             cx,
         );
-        if self.dark_mode {
-            Self::apply_dark_editor_colors(cx);
-        }
+        // Theme::change 会重置 highlight_theme，这里重装 GitHub 语法配色
+        // （暗色编辑区/行号栏背景也由该配色承载：0x111827，与旧 apply_dark_editor_colors 一致）。
+        crate::syntax::install_github_theme(cx);
         // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
         // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
         let panel_bg = self.panel_bg();
