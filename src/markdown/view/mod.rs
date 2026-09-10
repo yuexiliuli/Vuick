@@ -30,9 +30,9 @@ mod tests;
 use std::rc::Rc;
 
 use gpui::{
-    div, list, px, App, Context, Hsla, InteractiveElement, IntoElement, ListAlignment, ListState,
-    ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
-    Styled, Window,
+    div, list, px, rgba, App, Context, Hsla, InteractiveElement, IntoElement, ListAlignment,
+    ListState, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
@@ -45,6 +45,9 @@ use toc::build_toc_trigger;
 
 /// 行级虚拟化在视口上下各多构建的像素量（保证快速滚动时内容连续）。
 const ROW_OVERDRAW_PX: f32 = 600.0;
+
+/// 搜索跳转高亮停留时长（ms）：侧边栏搜索跳到命中行后高亮一段时间，随后自动消失。
+const HIGHLIGHT_MS: u64 = 2200;
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {
@@ -70,6 +73,10 @@ pub struct MarkdownPreview {
     code_scroll: std::collections::HashMap<usize, ScrollHandle>,
     /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     table_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// 搜索跳转高亮：命中的源码行（0 基）与小写查询词；None = 无高亮。
+    highlight_search: Option<(usize, String)>,
+    /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮，避免旧定时器误清新高亮。
+    highlight_seq: u64,
 }
 
 impl MarkdownPreview {
@@ -88,7 +95,45 @@ impl MarkdownPreview {
             memory_images: Default::default(),
             code_scroll: Default::default(),
             table_scroll: Default::default(),
+            highlight_search: None,
+            highlight_seq: 0,
         }
+    }
+
+    /// 搜索跳转后高亮「源码第 `line` 行」（0 基）内**第一个命中 `query` 的文本**，
+    /// 只给搜索词本身着色（不吃整行），[`HIGHLIGHT_MS`] 后自动消失。
+    pub fn highlight_search(&mut self, line: usize, query: &str, cx: &mut Context<Self>) {
+        self.highlight_search = Some((line, query.to_lowercase()));
+        self.highlight_seq = self.highlight_seq.wrapping_add(1);
+        let seq = self.highlight_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(HIGHLIGHT_MS))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.highlight_seq == seq {
+                    view.highlight_search = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 清除搜索跳转高亮。
+    pub fn clear_highlight(&mut self) {
+        self.highlight_search = None;
+        self.highlight_seq = self.highlight_seq.wrapping_add(1);
+    }
+
+    /// 当前搜索跳转高亮映射到的 **(渲染行, 行内字节区间)**；无高亮或命中文本不在
+    /// 渲染文本中时返回 `None`。测试/调试用，确认高亮只覆盖搜索词而非整行。
+    pub fn search_highlight_range(&self) -> Option<(usize, std::ops::Range<usize>)> {
+        let (line, query) = self.highlight_search.as_ref()?;
+        let row_ix = self.row_for_line(*line)?;
+        let text = self.rows.get(row_ix)?.text.as_ref();
+        let range = find_text_range(text, query)?;
+        Some((row_ix, range))
     }
 
     /// 注册内存图片表（虚拟 src → 图片字节，不落盘），EPUB 用 `epubimg://...`。
@@ -213,6 +258,8 @@ impl MarkdownPreview {
 
     /// 设置预览源码（仅影响预览，原文不变）。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
+        // 内容变了，旧的跳转高亮随之失效
+        self.clear_highlight();
         let base = self.base_dir.clone();
         let mut parsed = parse_to_rows(src);
         for r in parsed.iter_mut() {
@@ -320,14 +367,42 @@ impl Render for MarkdownPreview {
             }
         }
 
+        // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
+        // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
+        let search_highlight = {
+            let mut hit: Option<(usize, std::ops::Range<usize>)> = None;
+            if let Some((line, query)) = self.highlight_search.as_ref() {
+                if let Some(row_ix) = self.row_for_line(*line) {
+                    if let Some(range) = find_text_range(&self.rows[row_ix].text, query) {
+                        hit = Some((row_ix, range));
+                    }
+                }
+            }
+            let color = if hit.is_some() {
+                Some(if gpui_component::Theme::global(cx).is_dark() {
+                    rgba(0xf59e0b47).into()
+                } else {
+                    rgba(0xfef08a8c).into()
+                })
+            } else {
+                None
+            };
+            hit.map(|(row_ix, range)| (row_ix, range, color.expect("命中则有背景色")))
+        };
+
         let content = {
             let p = p.clone();
             let code_scroll = code_scroll;
             let table_scroll = table_scroll;
+            let search_highlight = search_highlight;
             list(list_state.clone(), move |ix, _window, cx| {
                 let ch = code_scroll.get(&ix).cloned();
                 let th = table_scroll.get(&ix).cloned();
-                render_row(&rows[ix], &p, wrap, ch, th, cx)
+                let search = search_highlight
+                    .as_ref()
+                    .filter(|(row_ix, _, _)| *row_ix == ix)
+                    .map(|(_, range, color)| (range.clone(), *color));
+                render_row(&rows[ix], &p, wrap, ch, th, search, cx)
             })
         }
         .size_full();
@@ -414,4 +489,23 @@ impl Render for MarkdownPreview {
 
         root.child(core).children(toc_layer)
     }
+}
+
+/// 在 `text` 内查找第一个忽略大小写命中小写 `needle` 的字节区间；未命中返回 `None`。
+/// 用于搜索跳转为命中**文本**着色（非整行）。
+fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    let needle_chars = needle.chars().count();
+    if needle_chars == 0 {
+        return None;
+    }
+    let mut i = 0usize;
+    while i < text.len() {
+        let candidate: String = text[i..].chars().take(needle_chars).collect();
+        if !candidate.is_empty() && candidate.to_lowercase() == needle {
+            return Some(i..(i + candidate.len()));
+        }
+        let ch = text[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
 }

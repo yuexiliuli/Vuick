@@ -969,3 +969,56 @@ fn row_for_line_maps_source_lines(cx: &mut TestAppContext) {
 }
 
 
+
+/// 搜索跳转后：只给命中**文本**临时高亮（不吃整行），
+/// 时钟推进超过 [`HIGHLIGHT_MS`] 后自动消失。
+#[gpui::test]
+fn search_jump_highlight_appears_and_clears(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 行 0 标题 / 1 空 / 2 正文一 / 3 空 / 4 正文二（含关键字）/ 5 空
+    let src = "# 标题\n\n正文一\n\n正文二，包含关键字\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    cx.simulate_resize(size(px(400.), px(400.)));
+    settle(cx);
+
+    // 高亮源码第 4 行（正文二）内的搜索词，只覆盖命中文本、不整行
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.highlight_search(4, "关键字", cx);
+            cx.notify();
+        });
+    });
+    for _ in 0..5 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+
+    let (row_ix, rng) = cx
+        .read(|cx| host.read(cx).md.read(cx).search_highlight_range())
+        .expect("跳转后应定位到命中文本");
+    assert_eq!(row_ix, 4, "正文二应映射到渲染行 4");
+    let text = "正文二，包含关键字";
+    assert_eq!(&text[rng.clone()], "关键字", "高亮区间应只覆盖搜索词");
+    assert!(rng.len() < text.len(), "不应高亮整行（区间小于整行长度）");
+
+    // 时钟推进超过高亮停留时长后，高亮应自动消失
+    cx.executor().advance_clock(std::time::Duration::from_millis(HIGHLIGHT_MS + 500));
+    for _ in 0..5 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    assert!(
+        cx.read(|cx| host.read(cx).md.read(cx).search_highlight_range())
+            .is_none(),
+        "超时后高亮应自动消失"
+    );
+}

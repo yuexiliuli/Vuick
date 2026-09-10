@@ -83,19 +83,21 @@ fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
 }
 
 /// 把行内的样式段（`runs`，字节区间）套到整段文本上，生成 [`StyledText`]；
-/// 没有任何样式段时返回 `None`，调用方直接渲染纯文本以省一次分配。
+/// 没有任何样式段且无搜索高亮时返回 `None`，调用方直接渲染纯文本以省一次分配。
 /// 反引号代码 → 等宽 + 灰底；粗体/斜体/删除线 → 对应字重/风格；
 /// 链接/图片（v1 渲染按文字处理）不特殊着色。
+/// `search`：搜索跳转高亮的 (字节区间, 背景色)，只给命中文本上背景色（不吃整行）。
 fn styled_text(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
     colors: &InlineCodeColors,
+    search: Option<(Range<usize>, Hsla)>,
 ) -> Option<StyledText> {
-    if runs.is_empty() {
+    if runs.is_empty() && search.is_none() {
         return None;
     }
-    let mut highlights = Vec::with_capacity(runs.len());
+    let mut highlights = Vec::with_capacity(runs.len() + 1);
     let mut mono: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
     for (range, kind) in runs {
         match kind {
@@ -129,6 +131,21 @@ fn styled_text(
             RunKind::Link | RunKind::Image => {}
         }
     }
+    // 搜索跳转高亮：给命中文本叠加背景色（裁剪到文本边界；与加粗/等宽等字段正交，可共存）
+    if let Some((range, color)) = search {
+        if range.start < text.len() {
+            let end = range.end.min(text.len());
+            if end > range.start {
+                highlights.push((
+                    range.start..end,
+                    HighlightStyle {
+                        background_color: Some(color),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    }
     let mut st = StyledText::new(text.clone()).with_highlights(highlights);
     if !mono.is_empty() {
         st = st.with_font_family_overrides(mono);
@@ -144,6 +161,17 @@ fn shift_runs(runs: &[(Range<usize>, RunKind)], shift: usize) -> Vec<(Range<usiz
     runs.iter()
         .map(|(r, k)| ((r.start + shift)..(r.end + shift), *k))
         .collect()
+}
+
+/// 把搜索高亮区间整体右移 `shift`：列表项显示串 = "前缀 + 文本"，命中区间按行内文本定位，
+/// 转成显示串坐标后须同样平移（与 [`shift_runs`] 同理）。
+fn shift_search(
+    search: &Option<(Range<usize>, Hsla)>,
+    shift: usize,
+) -> Option<(Range<usize>, Hsla)> {
+    search
+        .as_ref()
+        .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c))
 }
 
 /// 渲染一行代码（等宽、不换行、浅灰底）。
@@ -198,6 +226,7 @@ fn row_text_child(
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
     colors: &InlineCodeColors,
+    search: Option<(Range<usize>, Hsla)>,
 ) -> gpui::AnyElement {
     // 主题自带的 HighlightStyle 背景只能是平面矩形；要圆角必须自绘。
     // 这里提取"扩展空白后的代码背景区间"，用自绘 Element 画圆角。
@@ -207,12 +236,12 @@ fn row_text_child(
         .map(|(r, _)| expand_bg_over_whitespace(text.as_ref(), r))
         .collect();
     if code_bg.is_empty() {
-        return match styled_text(text, runs, p, colors) {
+        return match styled_text(text, runs, p, colors, search) {
             Some(st) => st.into_any_element(),
             None => text.clone().into_any_element(),
         };
     }
-    let Some(st) = styled_text(text, runs, p, colors) else {
+    let Some(st) = styled_text(text, runs, p, colors, search) else {
         return text.clone().into_any_element();
     };
     RoundedInlineText {
@@ -366,12 +395,14 @@ impl Element for RoundedInlineText {
 
 /// 渲染单个行。`code_handle` / `table_handle` 为各自稳定的横向滚动句柄
 /// （None 时自动创建），供滚动条拖动使用。
+/// `search`：搜索跳转高亮 (命中文本字节区间, 背景色)，只给命中文本着色（不吃整行）。
 pub(crate) fn render_row(
     row: &Rc<Row>,
     p: &Rc<StyleParams>,
     wrap: bool,
     code_handle: Option<ScrollHandle>,
     table_handle: Option<ScrollHandle>,
+    search: Option<(Range<usize>, Hsla)>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
@@ -584,7 +615,7 @@ pub(crate) fn render_row(
         }
         match row.kind {
             RowKind::Paragraph => {
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -599,7 +630,7 @@ pub(crate) fn render_row(
             }
             RowKind::Heading(n) => {
                 let (fs, lh) = p.heading_metrics(n);
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
                 return div()
                     .w_full()
                     .min_h(lh)
@@ -616,7 +647,7 @@ pub(crate) fn render_row(
             RowKind::Quote => {
                 // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
                 // 避免背景带顶到左边缘（同代码块做法）。
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
+                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -648,7 +679,7 @@ pub(crate) fn render_row(
                 let display = gpui::SharedString::from(text);
                 let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
                 let runs = shift_runs(&row.runs, shift);
-                let t = row_text_child(&display, &runs, &p, &inline_colors);
+                let t = row_text_child(&display, &runs, &p, &inline_colors, shift_search(&search, shift));
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -700,7 +731,7 @@ pub(crate) fn render_row(
         }
         RowKind::Heading(n) => {
             let (fs, lh) = p.heading_metrics(n);
-            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
+            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
             div()
                 .h(lh)
                 .w_full()
@@ -717,7 +748,7 @@ pub(crate) fn render_row(
         RowKind::Quote => {
             // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
             // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors);
+            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -753,7 +784,7 @@ pub(crate) fn render_row(
             let display = gpui::SharedString::from(text);
             let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
             let runs = shift_runs(&row.runs, shift);
-            let t = row_text_child(&display, &runs, &p, &inline_colors);
+            let t = row_text_child(&display, &runs, &p, &inline_colors, shift_search(&search, shift));
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -777,7 +808,7 @@ pub(crate) fn render_row(
             .whitespace_nowrap()
             .text_size(p.para_size)
             .text_color(p.fg)
-            .child(row_text_child(&row.text, &row.runs, &p, &inline_colors)),
+            .child(row_text_child(&row.text, &row.runs, &p, &inline_colors, search)),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };

@@ -714,6 +714,9 @@ impl EditorApp {
                         if hits >= SEARCH_RESULT_CAP {
                             break;
                         }
+                        // 命中文本在全文中的字节区间：跳转后选中它作为高亮提示
+                        let match_range = find_match_range(&content, q, li);
+                        let q_owned = q.to_string();
                         let snippet = line.trim().to_string();
                         let r = div()
                             .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
@@ -730,17 +733,31 @@ impl EditorApp {
                                 this.activate_tab(ti, window, cx);
                                 if let Some(tab) = this.tabs.get(ti) {
                                     if tab.readonly_preview {
-                                        // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行
+                                        // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本
                                         let md = tab.md_preview.clone();
-                                        md.update(cx, |v, _cx| v.scroll_to_line(li));
+                                        md.update(cx, |v, cx| {
+                                            v.scroll_to_line(li);
+                                            v.highlight_search(li, &q_owned, cx);
+                                        });
                                     } else {
+                                        // 预览可见（分屏/全屏）时同步高亮预览中的命中文本
+                                        if tab.preview_on || tab.preview_fullscreen {
+                                            let md = tab.md_preview.clone();
+                                            md.update(cx, |v, cx| {
+                                                v.highlight_search(li, &q_owned, cx);
+                                            });
+                                        }
                                         let ed = tab.editor.clone();
                                         ed.update(cx, |ed, cx| {
+                                            // 先落光标（滚动到该行），再选中命中文本作为高亮
                                             ed.set_cursor_position(
                                                 Position::new(li as u32, 0),
                                                 window,
                                                 cx,
                                             );
+                                            if let Some(range) = match_range.clone() {
+                                                ed.set_selected_range(range, cx);
+                                            }
                                         });
                                     }
                                 }
@@ -795,4 +812,33 @@ impl EditorApp {
             .child(div().flex().flex_col().py_1().children(rows))
             .into_any_element()
     }
+}
+
+/// 在 `content` 的第 `line` 行（0 基）内查找第一个忽略大小写命中 `q` 的
+/// 文档级字节区间（用于搜索跳转后选中命中文本作为高亮）；未命中返回 `None`。
+fn find_match_range(content: &str, q: &str, line: usize) -> Option<std::ops::Range<usize>> {
+    let needle = q.to_lowercase();
+    let needle_chars = needle.chars().count();
+    if needle_chars == 0 {
+        return None;
+    }
+    let mut doc_pos = 0usize;
+    for (li, l) in content.split('\n').enumerate() {
+        if li == line {
+            let mut i = 0usize;
+            while i < l.len() {
+                let Some(ch) = l[i..].chars().next() else {
+                    break;
+                };
+                let candidate: String = l[i..].chars().take(needle_chars).collect();
+                if !candidate.is_empty() && candidate.to_lowercase() == needle {
+                    return Some((doc_pos + i)..(doc_pos + i + candidate.len()));
+                }
+                i += ch.len_utf8();
+            }
+            return None;
+        }
+        doc_pos += l.len() + 1;
+    }
+    None
 }
