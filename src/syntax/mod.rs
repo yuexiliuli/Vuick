@@ -498,7 +498,7 @@ fn ts(color: u32, italic: bool) -> ThemeStyle {
 }
 
 /// GitHub 风格语法配色（明/暗两套），取自 GitHub 官方（Primer）语法色板。
-/// 同时带上编辑区/行号栏背景（暗色沿用应用当前的 0x111827）。
+/// 同时带上编辑区背景（暗色沿用应用当前的 0x111827）；行号栏不设独立背景色。
 pub(crate) fn github_theme(dark: bool) -> HighlightTheme {
     let syntax = if dark {
         SyntaxColors {
@@ -572,11 +572,7 @@ pub(crate) fn github_theme(dark: bool) -> HighlightTheme {
             editor_line_number: None,
             editor_active_line_number: None,
             editor_invisible: None,
-            editor_gutter_background: Some(if dark {
-                gpui::rgb(0x111827).into()
-            } else {
-                gpui::rgb(0xf6f8fa).into()
-            }),
+            editor_gutter_background: None,
             status: StatusColors::default(),
             syntax,
         },

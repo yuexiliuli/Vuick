@@ -580,7 +580,7 @@ impl EditorApp {
             cx,
         );
         // Theme::change 会重置 highlight_theme，这里重装 GitHub 语法配色
-        // （暗色编辑区/行号栏背景也由该配色承载：0x111827，与旧 apply_dark_editor_colors 一致）。
+        // （暗色编辑区背景也由该配色承载：0x111827，与旧 apply_dark_editor_colors 一致；行号栏不设独立背景色）。
         crate::syntax::install_github_theme(cx);
         // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
         // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
