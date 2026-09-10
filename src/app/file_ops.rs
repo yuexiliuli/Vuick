@@ -16,6 +16,14 @@ const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
 /// set_text + 列表 reset 重测量），而是停止输入片刻后再同步一次。
 pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 200;
 
+/// 超过该行数的 Markdown 文档打开时**不自动解析/开启预览**。
+///
+/// 行级虚拟化只优化了渲染（内存只随可见窗口走），但 `parse_to_rows` 的解析结果仍
+/// **整篇保留**：一条源码行就是一个 `Row` 结构体（约 150~200 字节，含独立的
+/// `SharedString` 文本分配）。15 万行 ≈ 30MB+，超过原文好几倍。这类大文档打开时
+/// 只加载编辑区；需要预览再按 Ctrl+P 手动开启（届时按需解析，关闭时可释放）。
+pub(crate) const PREVIEW_MAX_DOC_LINES: usize = 20_000;
+
 impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。
     fn report_open_failure(
@@ -77,6 +85,9 @@ impl EditorApp {
         let chars = text.chars().count();
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
+        // 超大纲文档：跳过预览整篇解析（一行一条 Row ≈ 30MB+/150k 行）。
+        // 默认只开编辑区；需要预览时用户按 Ctrl+P 手动开启（届时才解析）。
+        let preview_skipped = is_md && lines > PREVIEW_MAX_DOC_LINES;
         tab.editor.update(cx, |ed, cx| {
             ed.set_value(text.clone(), window, cx);
             if is_md {
@@ -90,10 +101,12 @@ impl EditorApp {
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
-            if Self::is_markdown_path(p) {
+            if is_md {
                 // Markdown 默认/始终自动换行
                 view.set_wrap(true, cx);
-                view.set_source(&text, cx);
+                if !preview_skipped {
+                    view.set_source(&text, cx);
+                }
             }
         });
         tab.file_path = Some(p.to_path_buf());
@@ -103,10 +116,17 @@ impl EditorApp {
         tab.cursor_row = 0;
         tab.cursor_col = 0;
         tab.dirty = false;
-        if Self::is_markdown_path(p) {
+        if is_md && !preview_skipped {
             tab.preview_on = true;
         }
-        self.status = SharedString::from(format!("已打开：{}", p.display()));
+        self.status = SharedString::from(if preview_skipped {
+            format!(
+                "已打开：{} · 大文档预览已自动关闭（Ctrl+P 开启）",
+                p.display()
+            )
+        } else {
+            format!("已打开：{}", p.display())
+        });
         self.status_ok = true;
         cx.notify();
     }

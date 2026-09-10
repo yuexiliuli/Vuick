@@ -51,7 +51,7 @@ const HIGHLIGHT_MS: u64 = 2200;
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {
-    rows: Rc<Vec<Rc<Row>>>,
+    rows: Rc<Vec<Row>>,
     list_state: ListState,
     /// 背景色覆盖（由应用传入，与编辑区保持一致；None 用主题背景）。
     bg: Option<Hsla>,
@@ -305,7 +305,11 @@ impl MarkdownPreview {
                 r.src = Some(resolved.into());
             }
         }
-        let rows: Vec<Rc<Row>> = parsed.into_iter().map(Rc::new).collect();
+        // `parse_to_rows` 已返回 `Vec<Row>`。直接整块存进 `Rc` 即可：相比「每个
+        // Row 各自 `Rc::new` 堆分配」再装进 `Vec<Rc<Row>>`，省掉每行一个 Rc 头 +
+        // 分配器开销（15 万行 ≈ 5~8MB），且 `Vec<Row>` 是连续内存、缓存更友好。
+        // 渲染/测量只读借用 `&Row`，`Rc<Vec<Row>>` 克隆代价仍是 O(1)。
+        let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）
         self.toc = rows
             .iter()

@@ -397,7 +397,7 @@ impl Element for RoundedInlineText {
 /// （None 时自动创建），供滚动条拖动使用。
 /// `search`：搜索跳转高亮 (命中文本字节区间, 背景色)，只给命中文本着色（不吃整行）。
 pub(crate) fn render_row(
-    row: &Rc<Row>,
+    row: &Row,
     p: &Rc<StyleParams>,
     wrap: bool,
     code_handle: Option<ScrollHandle>,
