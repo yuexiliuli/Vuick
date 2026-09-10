@@ -729,7 +729,11 @@ impl EditorApp {
                             .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                                 this.activate_tab(ti, window, cx);
                                 if let Some(tab) = this.tabs.get(ti) {
-                                    if !tab.readonly_preview {
+                                    if tab.readonly_preview {
+                                        // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行
+                                        let md = tab.md_preview.clone();
+                                        md.update(cx, |v, _cx| v.scroll_to_line(li));
+                                    } else {
                                         let ed = tab.editor.clone();
                                         ed.update(cx, |ed, cx| {
                                             ed.set_cursor_position(

@@ -933,4 +933,39 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
     });
 }
 
+/// 源码行 → 渲染行映射（EPUB 搜索跳转）：标题/空行/段落各占一渲染行，
+/// 代码围栏折叠成单个渲染行覆盖多源码行，命中的源码行应定位到对应渲染行。
+#[gpui::test]
+fn row_for_line_maps_source_lines(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 行 0 标题 / 1 空 / 2 正文一 / 3 正文二 / 4 空 / 5-8 代码围栏 / 9 空
+    let src = "# 标题\n\n正文一\n正文二\n\n```\ncode1\ncode2\n```\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    cx.simulate_resize(size(px(300.), px(400.)));
+    settle(cx);
+
+    let md = cx.read(|cx| host.read(cx).md.clone());
+    let at = |line: usize| cx.read(|cx| md.read(cx).row_for_line(line));
+    assert_eq!(at(2), Some(2), "源码第 2 行（正文一）应映射到渲染行 2");
+    assert_eq!(at(3), Some(3), "源码第 3 行（正文二）应映射到渲染行 3");
+    assert_eq!(at(6), Some(5), "代码围栏内第 6 行应定位到折叠的代码渲染行");
+    assert_eq!(at(8), Some(5), "代码围栏末行仍属折叠代码行");
+    assert_eq!(at(0), Some(0), "标题行映射到渲染行 0");
+    // 空预览 → None
+    let (host2, cx2) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let row = cx2.update(|_, _cx| host2.read(_cx).md.read(_cx).row_for_line(0));
+    assert_eq!(row, None, "空预览无渲染行 → None");
+}
+
 

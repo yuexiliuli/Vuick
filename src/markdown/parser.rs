@@ -75,6 +75,8 @@ pub struct Row {
     /// 渲染文本（已去除常见内联记号：`**` / `` ` `` 等）
     pub text: SharedString,
     pub kind: RowKind,
+    /// 该渲染行覆盖的源码起始行号（0 基）。用于搜索跳转等「行→渲染行」映射。
+    pub src_line: usize,
     /// 行内样式段（字节区间 → 类型）
     #[allow(dead_code)]
     pub runs: Vec<(Range<usize>, RunKind)>,
@@ -104,6 +106,7 @@ impl Row {
         Self {
             text: text.into(),
             kind,
+            src_line: 0,
             runs,
             prefix,
             table: None,
@@ -115,12 +118,19 @@ impl Row {
         }
     }
 
+    /// 记录该渲染行对应的源码起始行号（解析时填充）。
+    fn with_line(mut self, line: usize) -> Self {
+        self.src_line = line;
+        self
+    }
+
     /// 代码块行：整个围栏折叠成一个 [RowKind::Code] 渲染行（逐行渲染成连续块）。
     fn code_block(lines: Vec<SharedString>) -> Self {
         let text = lines.first().cloned().unwrap_or_default();
         Self {
             text,
             kind: RowKind::Code,
+            src_line: 0,
             runs: Vec::new(),
             prefix: None,
             table: None,
@@ -137,6 +147,7 @@ impl Row {
         Self {
             text: SharedString::from(""),
             kind: RowKind::Table,
+            src_line: 0,
             runs: Vec::new(),
             prefix: None,
             table: Some(table),
@@ -153,6 +164,7 @@ impl Row {
         Self {
             text: alt.into(),
             kind: RowKind::Image,
+            src_line: 0,
             runs: Vec::new(),
             prefix: None,
             table: None,
@@ -401,6 +413,7 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
     let lines: Vec<&str> = src.split('\n').collect();
     let mut idx = 0;
     while idx < lines.len() {
+        let row_start = idx;
         let line = lines[idx].trim_end_matches('\r');
         let t = line.trim_start();
         // 栅栏开头：收集到同字符闭合行之间的所有行，折叠成一个 Code 渲染行
@@ -418,11 +431,11 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
                 code_lines.push(SharedString::from(l));
                 idx += 1;
             }
-            rows.push(Row::code_block(code_lines));
+            rows.push(Row::code_block(code_lines).with_line(row_start));
             continue;
         }
         if t.is_empty() {
-            rows.push(Row::new("", RowKind::Blank, Vec::new(), None));
+            rows.push(Row::new("", RowKind::Blank, Vec::new(), None).with_line(row_start));
             idx += 1;
             continue;
         }
@@ -430,12 +443,15 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) && t.len() > hashes {
             let (text, runs) = inline_style(t[hashes..].trim_start());
-            rows.push(Row::new(
-                text.as_ref(),
-                RowKind::Heading(hashes as u8),
-                runs,
-                None,
-            ));
+            rows.push(
+                Row::new(
+                    text.as_ref(),
+                    RowKind::Heading(hashes as u8),
+                    runs,
+                    None,
+                )
+                .with_line(row_start),
+            );
             idx += 1;
             continue;
         }
@@ -443,42 +459,45 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         if t.starts_with('>') {
             let rest = t.trim_start_matches('>').trim_start();
             let (text, runs) = inline_style(rest);
-            rows.push(Row::new(text.as_ref(), RowKind::Quote, runs, None));
+            rows.push(Row::new(text.as_ref(), RowKind::Quote, runs, None).with_line(row_start));
             idx += 1;
             continue;
         }
         // 列表项：`- ` / `* ` / `+ ` / `1. ` / 任务列表
         if let Some((prefix, content)) = list_prefix(t) {
             let (text, runs) = inline_style(content);
-            rows.push(Row::new(
-                text.as_ref(),
-                RowKind::Bullet,
-                runs,
-                Some(prefix.clone()),
-            ));
+            rows.push(
+                Row::new(
+                    text.as_ref(),
+                    RowKind::Bullet,
+                    runs,
+                    Some(prefix.clone()),
+                )
+                .with_line(row_start),
+            );
             idx += 1;
             continue;
         }
         // 水平分隔线
         if is_rule(t) {
-            rows.push(Row::new("", RowKind::Rule, Vec::new(), None));
+            rows.push(Row::new("", RowKind::Rule, Vec::new(), None).with_line(row_start));
             idx += 1;
             continue;
         }
         // 独立图片行：`![alt](src)` 整行占位
         if let Some((alt, src)) = parse_image_line(t) {
-            rows.push(Row::new_image(&alt, &src));
+            rows.push(Row::new_image(&alt, &src).with_line(row_start));
             idx += 1;
             continue;
         }
         // 表格：当前行是表头、下一行是分隔行（结构块优先于表格，故放在最后判定）
         if let Some((table, consumed)) = try_parse_table(&lines, idx) {
-            rows.push(Row::with_table(table));
+            rows.push(Row::with_table(table).with_line(row_start));
             idx += consumed;
             continue;
         }
         let (text, runs) = inline_style(line.trim());
-        rows.push(Row::new(text.as_ref(), RowKind::Paragraph, runs, None));
+        rows.push(Row::new(text.as_ref(), RowKind::Paragraph, runs, None).with_line(row_start));
         idx += 1;
     }
     rows

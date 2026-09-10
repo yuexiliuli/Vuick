@@ -186,6 +186,31 @@ impl MarkdownPreview {
         self.list_state.scroll_to_reveal_item(ix);
     }
 
+    /// 返回覆盖**源码第 `line` 行**（0 基）的渲染行下标；空/无行返回 `None`。
+    pub fn row_for_line(&self, line: usize) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        // 最后一个 src_line <= line 的渲染行即覆盖该源码行的行（二分）
+        let (mut lo, mut hi) = (0usize, self.rows.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.rows[mid].src_line <= line {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Some(lo.saturating_sub(1))
+    }
+
+    /// 滚动到包含**源码第 `line` 行**（0 基）的渲染行：搜索跳转（EPUB 只读预览）用。
+    pub fn scroll_to_line(&mut self, line: usize) {
+        if let Some(ix) = self.row_for_line(line) {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
+    }
+
     /// 设置预览源码（仅影响预览，原文不变）。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
         let base = self.base_dir.clone();
