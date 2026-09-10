@@ -1229,6 +1229,46 @@
         assert!(!pending_after, "去抖时间到点后应复位挂起状态");
         let _ = std::fs::remove_file(&p);
     }
+
+    /// 回归：首次在新选项卡编辑内容后打开预览，预览应默认换行
+    /// （不出现单行横向滚动），与「md 文件打开即换行」一致。
+    #[gpui::test]
+    async fn preview_defaults_to_wrap_after_edit_then_toggle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // 初始空选项卡（未命名）里输入一段超长内容
+        let long_text = "这是一个比较长的段落".repeat(60);
+        cx.update(|window, cx| {
+            let idx = app.read(cx).active_tab;
+            let ed = app.read(cx).tabs[idx].editor.clone();
+            ed.update(cx, |ed, cx| ed.set_value(long_text, window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        // 打开预览
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_preview_for_tab(app.active_tab, window, cx)
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        let wrap = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+        });
+        assert!(wrap, "编辑内容后首次打开预览应默认为换行模式");
+    }
+
     /// 打开 .epub：应解析正文（含书名/章节），自动进入预览模式并填充内容。
     #[gpui::test]
     async fn opens_epub_and_shows_preview(cx: &mut TestAppContext) {

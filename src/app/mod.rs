@@ -241,6 +241,12 @@ impl EditorApp {
     /// 编辑区为空，不能用 editor.value() 否则会拿空串覆盖预览导致内容消失）。
     fn sync_md_preview(&mut self, idx: usize, cx: &mut Context<Self>) {
         let panel_bg = self.panel_bg();
+        // 预览默认换行：只读（EPUB）/ 全屏阅读强制换行，其余跟随编辑区换行偏好
+        // （wrap_enabled 默认开启 → 首次打开预览即为换行模式，不出现单行横向滚动）。
+        let preview_wrap = {
+            let tab = &self.tabs[idx];
+            tab.readonly_preview || tab.preview_fullscreen || self.wrap_enabled
+        };
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -252,6 +258,7 @@ impl EditorApp {
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(tab.file_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
+            view.set_wrap(preview_wrap, cx);
             view.set_source(&value, cx);
         });
     }
