@@ -610,7 +610,7 @@
         // 切到搜索视图
         cx.update(|_w, cx| {
             app.update(cx, |app, cx| {
-                app.set_sidebar_view(crate::app::sidebar::SidebarView::Search, cx)
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx)
             });
         });
         for _ in 0..3 {

@@ -20,13 +20,6 @@ pub(super) enum SidebarView {
 const SEARCH_RESULT_CAP: usize = 200;
 
 impl EditorApp {
-    /// 切换侧边栏视图（并展开对应面板）。
-    pub(super) fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
-        self.sidebar_view = view;
-        self.sidebar_panel_open = true;
-        cx.notify();
-    }
-
     /// 活动栏按钮点按：未在该面板 → 展开并切到该面板；
     /// 已在该面板再点一次 → **只收起面板**，侧边栏保留为窄活动栏（不留空白宽区）。
     pub(super) fn toggle_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {

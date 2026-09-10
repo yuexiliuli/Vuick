@@ -86,12 +86,6 @@ impl PdfViewer {
     }
 
     /// 切换左侧目录面板开关。
-    pub(crate) fn toggle_toc(&mut self, cx: &mut Context<Self>) {
-        self.toc_open = !self.toc_open;
-        cx.notify();
-    }
-
-    /// 关闭左侧目录面板（点击目录项跳转后 / 点击 ✕ 时）。
     pub(crate) fn close_toc(&mut self, cx: &mut Context<Self>) {
         self.toc_open = false;
         cx.notify();

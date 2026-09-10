@@ -23,7 +23,6 @@ mod row;
 mod style;
 mod table;
 mod toc;
-mod toc_panel;
 
 #[cfg(test)]
 mod tests;
@@ -32,8 +31,8 @@ use std::rc::Rc;
 
 use gpui::{
     div, list, px, App, Context, Hsla, InteractiveElement, IntoElement, ListAlignment, ListState,
-    MouseButton, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, Window,
+    ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, StatefulInteractiveElement,
+    Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
@@ -71,20 +70,6 @@ pub struct MarkdownPreview {
     code_scroll: std::collections::HashMap<usize, ScrollHandle>,
     /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     table_scroll: std::collections::HashMap<usize, ScrollHandle>,
-    /// 是否启用 PDF 式左侧目录面板（EPUB；false = 默认右上角下拉目录）。
-    toc_panel: bool,
-    /// 左侧目录面板是否展开。
-    toc_open: bool,
-    /// 已折叠的目录父项下标集合（仅面板模式使用）。
-    toc_collapsed: std::collections::HashSet<usize>,
-    /// 目录面板宽度（px）。
-    toc_width: f32,
-    /// 目录右缘拖拽：`Some((起始指针 x, 起始宽))`。
-    toc_drag: Option<(f32, f32)>,
-    /// 目录右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
-    toc_resize_hovered: bool,
-    /// 目录面板纵向滚动句柄。
-    toc_scroll: ScrollHandle,
 }
 
 impl MarkdownPreview {
@@ -103,13 +88,6 @@ impl MarkdownPreview {
             memory_images: Default::default(),
             code_scroll: Default::default(),
             table_scroll: Default::default(),
-            toc_panel: false,
-            toc_open: false,
-            toc_collapsed: Default::default(),
-            toc_width: toc_panel::TOC_PANEL_WIDTH_DEFAULT,
-            toc_drag: None,
-            toc_resize_hovered: false,
-            toc_scroll: ScrollHandle::new(),
         }
     }
 
@@ -195,17 +173,9 @@ impl MarkdownPreview {
         self.wrap
     }
 
-    /// 切换目录形态：`true` = PDF 式左侧目录面板（EPUB）；`false` = 右上角下拉目录（默认）。
-    /// 关闭面板模式时会收起面板。
-    pub fn set_toc_panel(&mut self, panel: bool, cx: &mut Context<Self>) {
-        if self.toc_panel == panel {
-            return;
-        }
-        self.toc_panel = panel;
-        if !panel {
-            self.toc_open = false;
-        }
-        cx.notify();
+    /// 目录条目：(行号, 标题级别, 标题文本)。供侧边栏目录视图使用。
+    pub(crate) fn toc_entries(&self) -> &[(usize, u8, String)] {
+        &self.toc
     }
 
     /// 滚动到指定行（目录跳转）。
@@ -278,9 +248,6 @@ impl MarkdownPreview {
             .map(|(ix, _)| (ix, ScrollHandle::new()))
             .collect();
         self.rows = Rc::new(rows);
-        // 内容变了（EPUB 只读不会变；普通 Markdown 面板模式未开启）——折叠状态
-        // 按旧标题下标缓存可能失效，直接清空由用户重新折叠。
-        self.toc_collapsed.clear();
         self.remeasure_dimensions(cx);
         if self.rows.len() != self.list_state.item_count() {
             // 行数变化 → 重建并 measure_all，保证滚动条范围从一开始就正确
@@ -406,52 +373,7 @@ impl Render for MarkdownPreview {
                 },
             ));
 
-        // EPUB 目录：PDF 式左侧面板（展开时挤压右侧预览主体）；「☰ 目录/收起」
-        // 开关统一放在应用底部状态栏（见 app::status_bar），普通 Markdown 预览仍用
-        // 右上角下拉目录。
-        if self.toc_panel {
-            let panel: Option<gpui::AnyElement> = self.render_toc_panel(cx);
-            return root
-                .flex()
-                .flex_row()
-                // 目录右缘拖拽调宽：鼠标移动/松开事件冒泡到容器统一处理
-                .on_mouse_move(cx.listener(
-                    |this: &mut MarkdownPreview, ev: &gpui::MouseMoveEvent, _window, cx| {
-                        this.update_toc_resize(ev.position.x.as_f32(), cx);
-                    },
-                ))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(
-                        |this: &mut MarkdownPreview, _: &gpui::MouseUpEvent, _window, cx| {
-                            this.end_toc_resize(cx);
-                        },
-                    ),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(
-                        |this: &mut MarkdownPreview, _: &gpui::MouseUpEvent, _window, cx| {
-                            this.end_toc_resize(cx);
-                        },
-                    ),
-                )
-                .children(panel) // 左：目录面板（宽度参与布局，展开时挤压右侧）
-                .child(
-                    div()
-                        .id("md-preview-body")
-                        .debug_selector(|| "md-preview-body".into())
-                        // 右：预览主体。flex 行里填满剩余宽度；min_w(0) 允许其压缩到
-                        // 内容最小宽以下，目录展开时被挤压进窗口内。
-                        .flex_1()
-                        .min_w(px(0.))
-                        .h_full()
-                        .relative()
-                        .child(core),
-                );
-        }
-
-        // 普通 Markdown：右上角悬浮按钮 + 下拉菜单（见 [`toc`] 模块）
+        // 目录：右上角悬浮按钮 + 下拉菜单（见 [`toc`] 模块）
         let toc_trigger = build_toc_trigger(cx.weak_entity(), toc, p.fg);
 
         let toc_layer = vec![
