@@ -155,6 +155,8 @@ pub(crate) fn toc_item_frame(
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_size(px(13.))
+                // 收窄目录超出条目宽度时，以 … 提示后面还有内容（配合 overflow_hidden）
+                .text_overflow(gpui::TextOverflow::Truncate("…".into()))
                 .text_color(fg)
                 .group_hover("toc-item", |style| style.text_color(fg))
                 .child(title),

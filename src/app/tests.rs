@@ -521,8 +521,8 @@
         assert_eq!(tabs1, tabs0 + 1, "点击/调用新建后应增加 1 个选项卡");
     }
 
-    /// 侧边栏：默认展开，停靠在内容区左侧（宽 240px）；收起后整体移除；
-    /// 标题栏右上角有展开/收起开关（title-sidebar-toggle）。
+    /// 侧边栏：默认仅收窄为活动栏（目录面板收起，占 46px 不挤正文）；
+    /// 整体收起后移除；标题栏右上角有展开/收起开关（title-sidebar-toggle）。
     #[gpui::test]
     async fn sidebar_collapses_and_expands(cx: &mut TestAppContext) {
         init_test(cx);
@@ -531,20 +531,20 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 默认展开：侧边栏在，右缘宽度 ≈ SIDEBAR_WIDTH
+        // 默认：侧边栏在（活动栏），宽 ≈ SIDEBAR_ACTIVITY_W，目录面板未自动展开
         let bar = cx
             .debug_bounds("sidebar")
             .expect("侧边栏 sidebar 应默认渲染");
         assert!(
-            (bar.size.width.as_f32() - crate::app::SIDEBAR_WIDTH).abs() < 2.0,
-            "侧边栏宽应约为 SIDEBAR_WIDTH，实际={bar:?}"
+            (bar.size.width.as_f32() - crate::app::SIDEBAR_ACTIVITY_W).abs() < 2.0,
+            "默认目录面板收起，侧边栏应只剩活动栏宽，实际={bar:?}"
         );
         assert!(
             cx.debug_bounds("title-sidebar-toggle").is_some(),
             "标题栏应有侧边栏开关 title-sidebar-toggle"
         );
 
-        // 收起：sidebar 与内容区包裹层一起移除
+        // 整体收起：sidebar 与内容区包裹层一起移除
         cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
         for _ in 0..3 {
             cx.run_until_parked();
@@ -578,7 +578,17 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 默认目录视图；竖列切换栏有「目录/搜索」两个按钮（无「文件」）
+        // 目录面板默认收起（活动栏常驻）；先点「目录」打开目录视图
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 竖列切换栏有「目录/搜索」两个按钮（无「文件」）
         assert!(
             cx.debug_bounds("sidebar-toc").is_some(),
             "默认应为目录视图"
@@ -650,6 +660,15 @@
             app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
         });
         for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 目录面板默认收起（不挤正文）；打开目录视图后再验证自适应宽度/条目/折叠
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx);
+            });
+        });
+        for _ in 0..3 {
             cx.run_until_parked();
         }
 

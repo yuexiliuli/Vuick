@@ -184,7 +184,9 @@ impl EditorApp {
             splitter_hovered: false,
             sidebar_open: true,
             sidebar_view: sidebar::SidebarView::Toc,
-            sidebar_panel_open: true,
+            // 目录面板默认收起（仅留 46px 活动栏，不挤占正文）；
+            // 点活动栏「目录」按钮再展开。
+            sidebar_panel_open: false,
             search_state,
             sidebar_toc_collapsed: Default::default(),
             sidebar_toc_tab: None,
