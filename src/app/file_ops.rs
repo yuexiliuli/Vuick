@@ -79,15 +79,17 @@ impl EditorApp {
             ed.set_value(text.clone(), window, cx);
             ed.set_highlighter(lang, cx);
         });
-        // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）
+        // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）。
+        // 只对 Markdown 类文件解析预览：非 md 文件预览区不展示，喂入整篇 6MB
+        // 文本纯属浪费（parse_to_rows 会全量解析），拖慢打开。
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
-            // Markdown 默认/始终自动换行
             if Self::is_markdown_path(p) {
+                // Markdown 默认/始终自动换行
                 view.set_wrap(true, cx);
+                view.set_source(&text, cx);
             }
-            view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());
         tab.content = SharedString::from(text);

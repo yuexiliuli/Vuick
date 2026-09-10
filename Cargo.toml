@@ -38,27 +38,40 @@ gpui = { git = "https://github.com/zed-industries/zed", features = ["test-suppor
 [features]
 test-support = ["gpui/test-support"]
 
-# 编辑器语法高亮：syntect + fancy-regex 是 CPU 密集的正则解析，debug（未优化）下
-# 逐行解析慢到不可交互（约 1.7~12ms/行）。对它们单独开 3 级优化（其余保持编译速度），
-# 保证开发/调试时高亮依旧即时（窗口高亮一次约几十毫秒）。
-# [profile.dev.package.syntect]
-# opt-level = 3
-# [profile.dev.package.fancy-regex]
-# opt-level = 3
-# [profile.dev.package.regex]
-# opt-level = 3
-# [profile.dev.package.regex-automata]
-# opt-level = 3
-# [profile.dev.package.regex-syntax]
-# opt-level = 3
-# [profile.dev.package.memchr]
-# opt-level = 3
-# [profile.dev.package.aho-corasick]
-# opt-level = 3
-# [profile.dev.package.bitflags]
-# opt-level = 3
-# [profile.dev.package.fnv]
-# opt-level = 3
+# 编辑器语法高亮与文本编辑是 CPU 密集的正则/文本处理，debug（未优化）下慢到不可用
+# （syntect 解析 16 万行要十余秒、编辑器显示映射/换行布局 6MB 文档 10s+）。
+# 对它们单独开 3 级优化（其余依赖保持快速编译），保证开发/调试时高亮与打开大文件即时。
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.memchr]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.bitflags]
+opt-level = 3
+[profile.dev.package.fnv]
+opt-level = 3
+# 编辑器核心（gpui-component/base 的文本缓冲/显示映射/换行布局 + 语法高亮窗口解析）
+[profile.dev.package.gpui-base]
+opt-level = 3
+[profile.dev.package.gpui-component]
+opt-level = 3
+[profile.dev.package.sum-tree]
+opt-level = 3
+[profile.dev.package.ropey]
+opt-level = 3
+[profile.dev.package.unicode-segmentation]
+opt-level = 3
+[profile.dev.package.smallvec]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"        # 优化目标改为最小体积（而非速度）
