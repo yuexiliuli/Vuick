@@ -299,7 +299,7 @@ fn font_zoom_updates_override(cx: &mut TestAppContext) {
     );
 }
 
-/// EPUB 目录：标题行应进入 toc；toggle_toc 可展开/收起；scroll_to_row 定位不 panic。
+/// EPUB 目录数据：标题行应进入 toc；scroll_to_row 定位不 panic（目录跳转由侧边栏提供）。
 #[gpui::test]
 fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -322,10 +322,6 @@ fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
     assert_eq!(*row0, 0usize, "首个目录项应是第 0 行（# 第一章）");
     assert_eq!(*lvl0, 1u8, "第一章是 h1");
     assert!(toc[0].2.contains("第一章"));
-
-    // 目录组件渲染冒烟：右上角触发按钮应存在
-    let btn = cx.debug_bounds("md-toc-toggle-wrap");
-    assert!(btn.is_some(), "目录引导按钮应渲染（md-toc-toggle-wrap）");
 
     // 跳转到一个中段标题（不应 panic），并验证目标行被滚动到视口顶部附近
     let target = toc[1].0;

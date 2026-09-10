@@ -15,14 +15,12 @@
 //! - `dimensions`：行宽 / 表格列宽估算、图片头尺寸解析
 //! - `row`：单行渲染（[`row::render_row`]）
 //! - `table`：GFM 表格渲染（[`table::render_table`] / `render_table_row`）
-//! - `toc`：目录悬浮按钮 + 下拉菜单（[`toc::build_toc_trigger`]）
 //! - `tests`：视图层测试
 
 mod dimensions;
 mod row;
 mod style;
 mod table;
-mod toc;
 
 #[cfg(test)]
 mod tests;
@@ -41,7 +39,6 @@ use crate::markdown::parser::{parse_to_rows, Row, RowKind};
 use dimensions::{est_row_width, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX};
 use row::render_row;
 use style::StyleParams;
-use toc::build_toc_trigger;
 
 /// 行级虚拟化在视口上下各多构建的像素量（保证快速滚动时内容连续）。
 const ROW_OVERDRAW_PX: f32 = 600.0;
@@ -344,8 +341,6 @@ impl Render for MarkdownPreview {
         let wrap = self.wrap;
         let code_scroll = self.code_scroll.clone();
         let table_scroll = self.table_scroll.clone();
-        // 目录：供目录菜单渲染
-        let toc = self.toc.clone();
 
         if cfg!(debug_assertions) {
             let h = &self.h_handle;
@@ -474,21 +469,7 @@ impl Render for MarkdownPreview {
                 },
             ));
 
-        // 目录：右上角悬浮按钮 + 下拉菜单（见 [`toc`] 模块）
-        let toc_trigger = build_toc_trigger(cx.weak_entity(), toc, p.fg);
-
-        let toc_layer = vec![
-            div()
-                .id("md-toc-toggle-wrap")
-                .debug_selector(|| "md-toc-toggle-wrap".into())
-                .absolute()
-                .top(px(8.))
-                .right(px(8.))
-                .child(toc_trigger)
-                .into_any_element(),
-        ];
-
-        root.child(core).children(toc_layer)
+        root.child(core)
     }
 }
 
