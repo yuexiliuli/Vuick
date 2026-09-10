@@ -14,9 +14,12 @@ impl EditorApp {
                 })
                 .soft_wrap(self.wrap_enabled)
         });
-        // 语法高亮用 gpui-component 官方 tree-sitter 实现：CodeEditor 渲染时
-        // 自动安装其 input_highlighter_factory（tree-sitter 特性已开启），
-        // 无需手动 set_highlighter_factory（配色在 main::install_github_theme 设置）。
+        // 安装语法高亮工厂：gpui-component 在 tree-sitter 特性关闭时工厂为空操作，
+        // 这里提供 syntect 解析 + GitHub 配色（配色在 main::install_github_theme 设置）。
+        let ed = editor.clone();
+        ed.update(cx, |ed, cx| {
+            ed.set_highlighter_factory(crate::syntax::highlighter_factory(), cx);
+        });
 
         // 编辑内容被修改 → 置脏 + 同步内容/行列缓存
         let ed = editor.clone();
