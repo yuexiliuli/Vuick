@@ -1005,7 +1005,7 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        // 初始：预览自动换行 + 全局编辑区偏好换行
+        // 初始：预览自动换行；全局编辑区换行偏好默认关闭（仅 md 编辑区默认换行）
         let (w0, pref0) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
@@ -1013,9 +1013,10 @@
                 a.wrap_enabled,
             )
         });
-        assert!(w0 && pref0, "初始预览应自动换行且全局偏好开启，w0={w0} pref0={pref0}");
+        assert!(w0, "initial 预览应自动换行，w0={w0}");
+        assert!(!pref0, "全局编辑区换行偏好应默认关闭（仅 md 编辑区换行），pref0={pref0}");
 
-        // 切换换行：只作用编辑区 → 预览保持换行、全局偏好关闭
+        // 切换换行：只作用编辑区 → 预览保持换行、全局偏好开启
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
@@ -1033,9 +1034,9 @@
             w1,
             "切换「自动换行」不应改变 Markdown 预览（预览始终自动换行），实际 w1={w1}"
         );
-        assert!(!pref1, "全局编辑区换行偏好应切为关闭");
+        assert!(pref1, "切换一次后全局编辑区换行偏好应开启");
 
-        // 再切回：预览仍保持换行、偏好恢复
+        // 再切回：预览仍保持换行、偏好恢复关闭
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
@@ -1049,7 +1050,8 @@
                 a.wrap_enabled,
             )
         });
-        assert!(w2 && pref2, "预览应保持换行、偏好恢复，w2={w2} pref2={pref2}");
+        assert!(w2, "预览应保持换行，w2={w2}");
+        assert!(!pref2, "再切换后全局编辑区换行偏好应恢复关闭");
         let _ = std::fs::remove_file(&md);
     }
 
@@ -1589,11 +1591,10 @@
         let (fs1, wrap1) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
-            // 退出全屏：预览恢复全局偏好（默认 true）
             (t.preview_fullscreen, t.md_preview.read(cx).is_wrap())
         });
         assert!(!fs1, "切换后应退出全屏");
-        assert!(wrap1, "退出全屏后预览应保持换行（全局默认换行）");
+        assert!(wrap1, "退出全屏后预览应保持换行（预览始终自动换行）");
 
         // 切换换行：只作用编辑区偏好，不改变预览换行（预览独立保持换行）
         cx.update(|window, cx| {
@@ -1610,7 +1611,7 @@
             )
         });
         assert!(wrap2, "切换换行开关不应影响 EPUB 预览（预览独立保持换行）");
-        assert!(!pref2, "全局编辑区换行偏好应切为关闭");
+        assert!(pref2, "切换一次后全局编辑区换行偏好应开启");
 
         // 再切回
         cx.update(|window, cx| {
@@ -1627,6 +1628,6 @@
             )
         });
         assert!(wrap3, "预览应保持换行");
-        assert!(pref3, "再切换后全局编辑区换行偏好应恢复");
+        assert!(!pref3, "再切换后全局编辑区换行偏好应恢复关闭");
     }
 

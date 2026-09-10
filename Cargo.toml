@@ -64,7 +64,7 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gpui-component]
 opt-level = 3
-[profile.dev.package.sum-tree]
+[profile.dev.package.sum_tree]
 opt-level = 3
 [profile.dev.package.ropey]
 opt-level = 3

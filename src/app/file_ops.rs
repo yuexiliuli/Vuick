@@ -75,8 +75,13 @@ impl EditorApp {
         let lang = Self::language_id(p);
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
+        // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
+        let is_md = Self::is_markdown_path(p);
         tab.editor.update(cx, |ed, cx| {
             ed.set_value(text.clone(), window, cx);
+            if is_md {
+                ed.set_soft_wrap(true, window, cx);
+            }
             ed.set_highlighter(lang, cx);
         });
         // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）。

@@ -179,7 +179,8 @@ impl EditorApp {
             preview_pending: false,
             dark_mode: false,
             split_ratio: 0.5,
-            wrap_enabled: true,
+            // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
+            wrap_enabled: false,
             split_drag: None,
             splitter_hovered: false,
             sidebar_open: true,
@@ -242,12 +243,7 @@ impl EditorApp {
     /// 编辑区为空，不能用 editor.value() 否则会拿空串覆盖预览导致内容消失）。
     fn sync_md_preview(&mut self, idx: usize, cx: &mut Context<Self>) {
         let panel_bg = self.panel_bg();
-        // 预览默认换行：只读（EPUB）/ 全屏阅读强制换行，其余跟随编辑区换行偏好
-        // （wrap_enabled 默认开启 → 首次打开预览即为换行模式，不出现单行横向滚动）。
-        let preview_wrap = {
-            let tab = &self.tabs[idx];
-            tab.readonly_preview || tab.preview_fullscreen || self.wrap_enabled
-        };
+        // 预览区始终自动换行（Markdown/EPUB，不随编辑区换行偏好）
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -259,7 +255,7 @@ impl EditorApp {
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(tab.file_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
-            view.set_wrap(preview_wrap, cx);
+            view.set_wrap(true, cx);
             view.set_source(&value, cx);
         });
     }
@@ -286,8 +282,9 @@ impl EditorApp {
             tab.preview_on
         };
         // 开启预览 → 编辑区强制换行，方便在分屏里编辑 Markdown；
-        // 关闭预览 → 恢复用户偏好的换行设置。
-        let wrap = preview_on || self.wrap_enabled;
+        // 关闭预览 → 恢复默认：Markdown 文件编辑区仍换行（md 默认），其余按全局偏好。
+        let is_md = self.is_markdown_tab(idx);
+        let wrap = preview_on || is_md || self.wrap_enabled;
         self.tabs[idx].editor.update(cx, |ed, cx| {
             ed.set_soft_wrap(wrap, window, cx);
         });
@@ -309,13 +306,13 @@ impl EditorApp {
             (fs, tab.md_preview.clone(), tab.editor.clone())
         };
         // 进入全屏阅读模式 → 预览强制换行、编辑区强制换行；
-        // 退出全屏 → 预览恢复全局偏好。
-        let preview_wrap = if fullscreen { true } else { self.wrap_enabled };
-        preview.update(cx, |view, cx| view.set_wrap(preview_wrap, cx));
+        // 退出全屏 → 预览始终换行（不随偏好）；编辑区恢复默认（md 换行 / 其余按偏好）。
+        preview.update(cx, |view, cx| view.set_wrap(true, cx));
+        let is_md = self.is_markdown_tab(idx);
         let editor_wrap = if fullscreen {
             true
         } else {
-            self.wrap_enabled
+            is_md || self.wrap_enabled
         };
         editor.update(cx, |ed, cx| {
             ed.set_soft_wrap(editor_wrap, window, cx);
@@ -349,6 +346,15 @@ impl EditorApp {
         p.extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+            .unwrap_or(false)
+    }
+
+    /// 选项卡是否 Markdown 文件（编辑区/预览默认换行的依据）。
+    fn is_markdown_tab(&self, idx: usize) -> bool {
+        self.tabs
+            .get(idx)
+            .and_then(|t| t.file_path.as_ref())
+            .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false)
     }
 
