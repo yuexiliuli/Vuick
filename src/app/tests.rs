@@ -1288,6 +1288,54 @@
         assert!(wrap, "编辑内容后首次打开预览应默认为换行模式");
     }
 
+    /// 语法高亮回归：打开 rust 文件，解析在后台异步进行（不卡 UI / 不 panic），
+    /// 推进时钟超过防抖后解析落地并触发重渲染，编辑器区正常、内容完整载入。
+    #[gpui::test]
+    async fn opens_rust_file_highlight_async_no_hang(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join("gpui-syntax-async.rs");
+        let mut src = String::from(
+            "fn main() {\n    // 注释\n    let s = \"hello\";\n    println!(\"{} 世界\", s);\n}\n",
+        );
+        src.push_str(&"// filler line\n".repeat(600));
+        std::fs::write(&dir, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // 推进超过解析防抖（150ms），后台解析落地 → 触发重渲染
+        cx.executor().advance_clock(std::time::Duration::from_millis(400));
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("editor-area").is_some(),
+            "打开 rust 后编辑区应正常渲染"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .editor
+                    .read(cx)
+                    .value()
+                    .to_string()
+            }),
+            src,
+            "rust 文件内容应完整载入"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// 打开 .epub：应解析正文（含书名/章节），自动进入预览模式并填充内容。
     #[gpui::test]
     async fn opens_epub_and_shows_preview(cx: &mut TestAppContext) {

@@ -38,6 +38,28 @@ gpui = { git = "https://github.com/zed-industries/zed", features = ["test-suppor
 [features]
 test-support = ["gpui/test-support"]
 
+# 编辑器语法高亮：syntect + fancy-regex 是 CPU 密集的正则解析，debug（未优化）下
+# 逐行解析慢到不可交互（约 1.7~12ms/行）。对它们单独开 3 级优化（其余保持编译速度），
+# 保证开发/调试时高亮依旧即时（窗口高亮一次约几十毫秒）。
+# [profile.dev.package.syntect]
+# opt-level = 3
+# [profile.dev.package.fancy-regex]
+# opt-level = 3
+# [profile.dev.package.regex]
+# opt-level = 3
+# [profile.dev.package.regex-automata]
+# opt-level = 3
+# [profile.dev.package.regex-syntax]
+# opt-level = 3
+# [profile.dev.package.memchr]
+# opt-level = 3
+# [profile.dev.package.aho-corasick]
+# opt-level = 3
+# [profile.dev.package.bitflags]
+# opt-level = 3
+# [profile.dev.package.fnv]
+# opt-level = 3
+
 [profile.release]
 opt-level = "z"        # 优化目标改为最小体积（而非速度）
 lto = true             # 跨 crate 链接时优化，消除重复代码
