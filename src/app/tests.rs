@@ -812,6 +812,69 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 回归：侧边栏搜索的「行内容」只搜当前活动文档——在 A 文档激活时，
+    /// 输入只出现在 B 文档里的关键字，不应冒出 B 的内容行（旧逻辑扫所有打开
+    /// 选项卡的 content，在 PDF 预览下会误显示 EPUB 正文）。
+    #[gpui::test]
+    async fn sidebar_search_scoped_to_active_doc(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let a = std::env::temp_dir().join("gpui-sz-a.md");
+        let b = std::env::temp_dir().join("gpui-sz-b.md");
+        std::fs::write(&a, "# 甲\n阿尔法内容仅此一处\n").unwrap();
+        std::fs::write(&b, "# 乙\nshanghai 明珠塔夜景\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(a.to_str().unwrap(), window, cx));
+            app.update(cx, |app, cx| app.open_file(b.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 第 0 个选项卡是初始空「未命名」，A=1、B=2。激活 A，切到搜索视图，
+        // 键入只存在于 B 的关键字
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(1, window, cx));
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx);
+            });
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        // 活动文档 A 不含 "shanghai" → 不应出现任何行结果（B 的行不得冒出来）
+        assert!(
+            cx.debug_bounds("sidebar-search-line-2-1").is_none()
+                && cx.debug_bounds("sidebar-search-line-1-0").is_none()
+                && cx.debug_bounds("sidebar-search-line-0-0").is_none(),
+            "激活 A 时搜索 B 的关键字不应返回内容行"
+        );
+        // 却不影响文件名匹配（文件名含关键字的文件仍可选中）；两文件名均不含关键字，跳过
+
+        // 切到 B 再搜同一关键字 → 应出现 B 的内容行
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.activate_tab(2, window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("sidebar-search-line-2-1").is_some(),
+            "激活 B 后搜索同一关键字应出现 B 的内容行"
+        );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
     #[gpui::test]
     async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
         init_test(cx);

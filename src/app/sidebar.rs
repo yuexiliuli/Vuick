@@ -599,7 +599,7 @@ impl EditorApp {
             .into_any_element()
     }
 
-    /// 「搜索」视图：关键字输入框 + 跨打开文件的匹配结果。
+    /// 「搜索」视图：关键字输入框 + 当前文档的匹配结果（文件名跨打开文件匹配）。
     fn render_sidebar_search(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let muted = self.text_minor();
         let query = self.search_state.read(cx).value().to_string();
@@ -622,7 +622,7 @@ impl EditorApp {
                 .py_2()
                 .text_size(px(12.))
                 .text_color(muted)
-                .child("输入关键字，搜索所有已打开文件")
+                .child("输入关键字，搜索当前文件内容；文件名匹配所有打开文件")
                 .into_any_element()
         } else {
             self.render_sidebar_search_results(&q, cx)
@@ -654,7 +654,12 @@ impl EditorApp {
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
         let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
         let mut hits = 0usize;
-        'outer: for (ti, tab) in self.tabs.iter().enumerate() {
+
+        // 文件名匹配（跨所有打开文件）：相当于「打开文件」快速选择器
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            if hits >= SEARCH_RESULT_CAP {
+                break;
+            }
             let name = tab
                 .file_path
                 .as_ref()
@@ -662,83 +667,92 @@ impl EditorApp {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未命名".to_string());
             if !name.is_empty() && name.to_lowercase().contains(q) {
-                if hits < SEARCH_RESULT_CAP {
-                    let row_fg = if ti == self.active_tab { fg } else { muted };
-                    let nm = name.clone();
-                    let r = div()
-                        .id(SharedString::from(format!("sidebar-search-file-{ti}")))
-                        .debug_selector(move || format!("sidebar-search-file-{ti}"))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .mx(px(4.))
-                        .rounded_md()
-                        .text_color(row_fg)
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(|style| style.bg(active_bg))
-                        .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                            this.activate_tab(ti, window, cx);
-                        }))
-                        .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_size(px(12.))
-                                .text_color(row_fg)
-                                .child(nm),
-                        );
-                    file_rows.push(r.into_any_element());
-                    hits += 1;
-                } else {
-                    break 'outer;
-                }
+                let row_fg = if ti == self.active_tab { fg } else { muted };
+                let nm = name.clone();
+                let r = div()
+                    .id(SharedString::from(format!("sidebar-search-file-{ti}")))
+                    .debug_selector(move || format!("sidebar-search-file-{ti}"))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_1()
+                    .mx(px(4.))
+                    .rounded_md()
+                    .text_color(row_fg)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|style| style.bg(active_bg))
+                    .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                        this.activate_tab(ti, window, cx);
+                    }))
+                    .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(12.))
+                            .text_color(row_fg)
+                            .child(nm),
+                    );
+                file_rows.push(r.into_any_element());
+                hits += 1;
             }
-            let content = tab.content.to_string();
-            for (li, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(q) {
-                    if hits >= SEARCH_RESULT_CAP {
-                        break 'outer;
-                    }
-                    let snippet = line.trim().to_string();
-                    let r = div()
-                        .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
-                        .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
-                        .px_2()
-                        .py_1()
-                        .mx(px(4.))
-                        .rounded_md()
-                        .text_size(px(12.))
-                        .text_color(muted)
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(|style| style.bg(active_bg))
-                        .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                            this.activate_tab(ti, window, cx);
-                            if let Some(tab) = this.tabs.get(ti) {
-                                if !tab.readonly_preview {
-                                    let ed = tab.editor.clone();
-                                    ed.update(cx, |ed, cx| {
-                                        ed.set_cursor_position(Position::new(li as u32, 0), window, cx);
-                                    });
+        }
+
+        // 行内容匹配：只在「当前活动文档」内搜索——若仍扫描所有打开的选项卡，
+        // 在 PDF 预览（PDF 无可搜索文本，content 为空）下会冒出别的文件
+        // （如 EPUB 完整正文）的内容，看起来像搜索到了错误文档。
+        if hits < SEARCH_RESULT_CAP {
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                let content = tab.content.to_string();
+                let ti = self.active_tab;
+                for (li, line) in content.lines().enumerate() {
+                    if line.to_lowercase().contains(q) {
+                        if hits >= SEARCH_RESULT_CAP {
+                            break;
+                        }
+                        let snippet = line.trim().to_string();
+                        let r = div()
+                            .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
+                            .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
+                            .px_2()
+                            .py_1()
+                            .mx(px(4.))
+                            .rounded_md()
+                            .text_size(px(12.))
+                            .text_color(muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|style| style.bg(active_bg))
+                            .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                                this.activate_tab(ti, window, cx);
+                                if let Some(tab) = this.tabs.get(ti) {
+                                    if !tab.readonly_preview {
+                                        let ed = tab.editor.clone();
+                                        ed.update(cx, |ed, cx| {
+                                            ed.set_cursor_position(
+                                                Position::new(li as u32, 0),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }
                                 }
-                            }
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .child(format!("L{}  {}", li + 1, snippet)),
-                        );
-                    line_rows.push(r.into_any_element());
-                    hits += 1;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .child(format!("L{}  {}", li + 1, snippet)),
+                            );
+                        line_rows.push(r.into_any_element());
+                        hits += 1;
+                    }
                 }
             }
         }
