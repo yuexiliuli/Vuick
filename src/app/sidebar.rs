@@ -185,46 +185,58 @@ impl EditorApp {
         ]
     }
 
-    /// 侧边栏左侧竖列切换栏：目录 / 搜索 两个按钮上下排布（当前项高亮）。
+    /// 侧边栏左侧竖列切换栏：目录 / 搜索 两个纯图标按钮上下排布。
+    /// 活动项**仅图标高亮**（强调蓝、背景不变），并在最左侧边缘出现蓝色竖条
+    /// （与目录条目左侧指示条同款），便于快速识别当前面板。
     fn render_sidebar_activity_bar(
         &mut self,
         border: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active_bg = self.tab_active_bg();
         let (fg, muted) = (self.text_primary(), self.text_minor());
+        let accent: gpui::Hsla = rgb(crate::scrollbar::RESIZE_ACCENT).into();
         let specs = [
-            (SidebarView::Toc, IconName::BookOpen, "目录", "sidebar-btn-toc"),
-            (SidebarView::Search, IconName::Search, "搜索", "sidebar-btn-search"),
+            (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc"),
+            (SidebarView::Search, IconName::Search, "sidebar-btn-search"),
         ];
         let mut btns: Vec<gpui::AnyElement> = Vec::with_capacity(2);
-        for (view, icon, label, id) in specs {
+        for (view, icon, id) in specs {
             let is_active = self.sidebar_panel_open && self.sidebar_view == view;
-            let bg = if is_active { active_bg } else { gpui::transparent_black() };
+            // 活动项图标用主前景色（深色主题下近白），不变蓝
             let col = if is_active { fg } else { muted };
             let id_owned = id.to_string();
             let btn = div()
                 .id(SharedString::from(id))
                 .debug_selector(move || id_owned.clone())
+                .relative()
                 .w(px(40.))
                 .h(px(38.))
                 .flex()
-                .flex_col()
                 .items_center()
                 .justify_center()
-                .gap_1()
                 .mx(px(3.))
                 .my(px(1.))
                 .rounded_md()
-                .bg(bg)
+                // 背景不随活动状态变化，仅图标着色区分
                 .text_color(col)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(if is_active { bg } else { border }))
+                .hover(|style| style.bg(border))
+                // 活动项：最左侧蓝色竖条（同目录条目左侧指示条）
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(5.))
+                        .bottom(px(5.))
+                        .left(px(2.))
+                        .w(px(2.))
+                        .rounded_full()
+                        .bg(accent)
+                        .opacity(if is_active { 1.0 } else { 0.0 }),
+                )
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
                     this.toggle_sidebar_view(view, cx);
                 }))
-                .child(Icon::new(icon).size(px(17.)).text_color(col))
-                .child(div().text_size(px(9.5)).text_color(col).child(label));
+                .child(Icon::new(icon).size(px(22.)).text_color(col));
             btns.push(btn.into_any_element());
         }
         div()

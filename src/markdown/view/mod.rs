@@ -127,7 +127,8 @@ impl MarkdownPreview {
     }
 
     /// 当前搜索跳转高亮映射到的 **(渲染行, 行内字节区间)**；无高亮或命中文本不在
-    /// 渲染文本中时返回 `None`。测试/调试用，确认高亮只覆盖搜索词而非整行。
+    /// 渲染文本中时返回 `None`。测试用，确认高亮只覆盖搜索词而非整行。
+    #[cfg(test)]
     pub fn search_highlight_range(&self) -> Option<(usize, std::ops::Range<usize>)> {
         let (line, query) = self.highlight_search.as_ref()?;
         let row_ix = self.row_for_line(*line)?;
