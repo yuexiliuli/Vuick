@@ -166,7 +166,7 @@
             cx.run_until_parked();
         }
 
-        // 内容与镜像缓存一致、不丢失不错乱
+        // 内容不丢失不错乱；普通选项卡不再整份镜像全文到 content（省一份副本）
         let (value, cached, dirty) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let tab = &a.tabs[a.active_tab];
@@ -183,7 +183,7 @@
             value.len()
         );
         assert!(value.contains(chunk), "内容应仍包含原文片段");
-        assert_eq!(cached, value, "镜像缓存应等于编辑区内容");
+        assert!(cached.is_empty(), "普通选项卡不应镜像全文到 content（省内存）");
         assert!(dirty, "粘贴后应置脏");
 
         // 纯文本剪贴板不会凭空引入换行：仍是单个逻辑行（软换行是排版行为，不改文本）
@@ -373,7 +373,10 @@
         }
         let (content, preview) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs[a.active_tab].content.to_string(), a.show_preview())
+            (
+                a.tabs[a.active_tab].editor.read(cx).value().to_string(),
+                a.show_preview(),
+            )
         });
         assert!(
             content.contains("标题"),
@@ -1112,7 +1115,10 @@
 
         let (tabs, active_content) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.tabs.len(), a.tabs[a.active_tab].content.to_string())
+            (
+                a.tabs.len(),
+                a.tabs[a.active_tab].editor.read(cx).value().to_string(),
+            )
         });
         assert_eq!(tabs, 3, "拖入 2 个文件后应比初始多 2 个选项卡，实际={tabs}");
         assert_eq!(active_content, "BBB", "激活选项卡应载入最后拖入的文件内容");
@@ -1190,7 +1196,7 @@
             let a = app.read(cx);
             (
                 a.tabs[a.active_tab].preview_on,
-                a.tabs[a.active_tab].content.lines().count(),
+                a.tabs[a.active_tab].editor.read(cx).value().to_string().lines().count(),
                 a.tabs.len(),
             )
         });

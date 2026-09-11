@@ -85,9 +85,11 @@ fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
 
 /// 可见窗口解析缓存（后台任务“算好→写回”，UI 线程读取；仅同线程访问）。
 struct WindowCache {
-    /// 当前文本快照（`update` 时整份复制，用于判断文本是否变化）。
-    text: SharedString,
-    /// 行 i 的行首字节偏移；`line_starts.len()` = 行数（末行结束 = `text.len()`）。
+    /// 当前文本快照（ropey COW 共享克隆 O(1)，**不整份复制**；编辑时编辑器
+    /// 的 Rope 与这里共享底层块，省掉一份全文副本，6MB 文档即省 6MB）。
+    /// 用于判断文本是否变化（ropey 实现了按内容的 `PartialEq`）。
+    rope: Rope,
+    /// 行 i 的行首字节偏移；`line_starts.len()` = 行数（末行结束 = `rope.len()`）。
     line_starts: Vec<usize>,
     /// 折叠使能（当前文本）。
     folding: bool,
@@ -102,7 +104,7 @@ struct WindowCache {
 impl WindowCache {
     fn new() -> Self {
         Self {
-            text: SharedString::default(),
+            rope: Rope::from(""),
             line_starts: Vec::new(),
             folding: false,
             applied: None,
@@ -112,10 +114,9 @@ impl WindowCache {
     }
 
     /// 文本变化时重建行索引并清空产出，让下一次渲染按新文本重算顶部窗口。
-    fn reset_for(&mut self, text: String, folding: bool) {
-        let line_starts = build_line_starts(&text);
-        self.text = text.into();
-        self.line_starts = line_starts;
+    fn reset_for(&mut self, rope: Rope, folding: bool) {
+        self.line_starts = build_line_starts_rope(&rope);
+        self.rope = rope;
         self.folding = folding;
         self.applied = None;
         self.win_styles.clear();
@@ -141,39 +142,80 @@ impl SyntectHighlighter {
     }
 
     /// 同步解析可见窗口（含过扫与 lookback 前缀）并写回缓存。代价有界、与文档总大小
-    /// 无关；不复制整份文本（借用 `SharedString`/行索引，仅拷贝结果）。
+    /// 无关；只物化「可见+前缀」的连续窗口文本（不整份复制）。
     /// 超过 [`SYNC_MAX_PARSE_LINES`] 的大视口直接跳过（本次沿用旧缓存）。
     fn compute_and_store(&self, req_lo: usize, req_hi: usize) {
-        let (plo, phi, result) = {
+        let update = {
             let c = self.cache.borrow();
-            if c.text.is_empty() {
-                return;
-            }
-            let line_count = c.line_starts.len();
-            if line_count == 0 {
-                return;
-            }
-            let plo = req_lo.saturating_sub(WINDOW_PAD);
-            let phi = (req_hi + WINDOW_PAD).min(line_count - 1);
-            let parse_lo = plo.saturating_sub(LOOKBACK_LINES);
-            if phi.saturating_sub(parse_lo) + 1 > SYNC_MAX_PARSE_LINES {
-                return;
-            }
-            let result = compute_window(
-                c.text.as_ref(),
+            compute_window_doc(
+                &c.rope,
                 &c.line_starts,
-                plo,
-                phi,
+                req_lo,
+                req_hi,
                 self.language.as_ref(),
                 c.folding,
-            );
-            (plo, phi, result)
+            )
+        };
+        let Some(((styles, folds), plo, phi)) = update else {
+            return;
         };
         let mut c = self.cache.borrow_mut();
-        c.win_styles = result.0;
-        c.win_folds = result.1;
+        c.win_styles = styles;
+        c.win_folds = folds;
         c.applied = Some((plo, phi));
     }
+}
+
+/// 在 rope 上解析「可见窗口 + 过扫 + lookback 前缀」区域，产出 **文档坐标** 的
+/// 高亮段与折叠段。纯函数，独立于缓存；返回 None 表示无需更新（文档为空 /
+/// 超过单次解析上限）。`plo/phi` 为本次覆盖的行区间（含过扫）。
+///
+/// 只物化 ≤ ~116 行的连续窗口文本（ropey `slice` 用字节偏移且行首是 char 边界），
+/// 不会整份复制长文档——省掉编辑器高亮缓存里的一份全文副本。
+fn compute_window_doc(
+    rope: &Rope,
+    line_starts: &[usize],
+    req_lo: usize,
+    req_hi: usize,
+    language: &str,
+    folding: bool,
+) -> Option<((Vec<(Range<usize>, &'static str)>, Vec<FoldRange>), usize, usize)> {
+    if rope.len() == 0 || line_starts.is_empty() {
+        return None;
+    }
+    let line_count = line_starts.len();
+    let plo = req_lo.saturating_sub(WINDOW_PAD);
+    let phi = (req_hi + WINDOW_PAD).min(line_count - 1);
+    let parse_lo = plo.saturating_sub(LOOKBACK_LINES);
+    if phi.saturating_sub(parse_lo) + 1 > SYNC_MAX_PARSE_LINES {
+        return None;
+    }
+    let start_byte = line_starts[parse_lo.min(line_count - 1)];
+    let end_byte = if phi + 1 < line_count {
+        line_starts[phi + 1]
+    } else {
+        rope.len()
+    };
+    let window = rope.slice(start_byte..end_byte).to_string();
+    let win_starts = build_line_starts(&window);
+    let (styles, folds) = compute_window(
+        &window,
+        &win_starts,
+        plo.saturating_sub(parse_lo),
+        phi.saturating_sub(parse_lo),
+        language,
+        folding,
+    );
+    // 窗口相对坐标 → 文档坐标
+    let styles = styles
+        .into_iter()
+        .map(|(r, n)| ((r.start + start_byte)..(r.end + start_byte), n))
+        .collect();
+    let folds = folds
+        .into_iter()
+        .map(|f| FoldRange::new(f.start_line + parse_lo, f.end_line + parse_lo))
+        .collect();
+    Some(((styles, folds), plo, phi))
 }
 
 /// 请求是否已被满足：已产出的窗口（含扩展余量）包含当前可见窗口。
@@ -210,21 +252,21 @@ impl InputHighlighter for SyntectHighlighter {
         if text.len() > MAX_TEXT_BYTES {
             // 超大纲：清掉高亮（保持即时响应）
             let mut c = self.cache.borrow_mut();
-            if !c.text.is_empty() {
+            if c.rope.len() != 0 {
                 c.win_styles.clear();
                 c.win_folds.clear();
-                c.text = SharedString::default();
+                c.rope = Rope::from("");
                 c.line_starts.clear();
                 c.applied = None;
             }
             return;
         }
-        let t = text.to_string();
         let mut c = self.cache.borrow_mut();
-        if c.text.as_ref() != t.as_str() {
-            c.reset_for(t, folding);
+        // ropey 实现了按内容的 PartialEq；`&c.rope != text` 不拷贝、不分配，
+        // 文本未变（通知帧/重复更新）时保持已有产出，不重算。
+        if &c.rope != text {
+            c.reset_for(text.clone(), folding);
         }
-        // 文本未变（通知帧/重复更新）：保持已有产出，不重算
     }
 
     /// 渲染时按**当前可见窗口**请求高亮；若缓存窗口不覆盖当前可见区，
@@ -278,6 +320,17 @@ fn build_line_starts(text: &str) -> Vec<usize> {
         if b == b'\n' {
             starts.push(i + 1);
         }
+    }
+    starts
+}
+
+/// 从 ropey Rope 构建行首字节索引（行首调用 `lazy` 求字节偏移，O(行数)，
+/// 不对全文做字符串复制）。
+fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
+    use gpui_component::input::RopeExt;
+    let mut starts = Vec::with_capacity(rope.lines_len());
+    for row in 0..rope.lines_len() {
+        starts.push(rope.line_start_offset(row));
     }
     starts
 }
@@ -708,5 +761,52 @@ mod tests {
             let (hl, _) = compute_window(&src, &starts, lo, lo + 40, "rust", true);
             println!("{name}: window@{lo} = {}ms, {} 段", t.elapsed().as_millis(), hl.len());
         }
+    }
+
+    /// 回归：`compute_window_doc` 的产物必须落在**文档坐标**——
+    /// 高亮字节段受 `start_byte` 平移、折叠行号受 `parse_lo` 平移，
+    /// 而不是窗口内的小偏移（漏平移会让中部/末尾窗口的高亮与折叠坐标错乱）。
+    #[test]
+    fn window_doc_produces_document_coordinates() {
+        use gpui_component::input::RopeExt;
+
+        // ~1000 行、含注释/字符串/花括号的 rust 文档
+        let mut src = String::new();
+        for i in 0..200 {
+            src.push_str(&format!(
+                "// 注释 {i}\nfn func_{i}() {{\n    let s = \"str\";\n    // 内\n}}\n"
+            ));
+        }
+        let rope = Rope::from(src.as_str());
+        let line_starts = build_line_starts_rope(&rope);
+        assert_eq!(line_starts.len(), rope.lines_len(), "行索引应与 rope 行数一致");
+
+        // 请求中后部窗口：若坐标没平移，产物会落在窗口内的极小值
+        let req_lo = 500usize;
+        let req_hi = 505usize;
+        let Some(((styles, folds), plo, _phi)) =
+            compute_window_doc(&rope, &line_starts, req_lo, req_hi, "rust", true)
+        else {
+            panic!("中部窗口应可解析");
+        };
+        assert!(!styles.is_empty(), "应有高亮段");
+        let plo_byte = line_starts[plo];
+        assert!(
+            styles.iter().all(|(r, _)| r.start >= plo_byte && r.end <= rope.len()),
+            "高亮段应为文档字节坐标 >= 窗口起始字节 {plo_byte}: {styles:?}"
+        );
+        // 至少一段落在请求窗口内
+        let req_byte = line_starts[req_lo];
+        assert!(
+            styles.iter().any(|(r, _)| r.start >= req_byte),
+            "应有高亮段落在请求窗口内: {styles:?}"
+        );
+
+        assert!(!folds.is_empty(), "应有折叠段");
+        // 漏平移的折叠行号 ≤ 窗口高度(~116)；平移后 ≈ 文档行号(≥400)
+        assert!(
+            folds.iter().all(|f| f.start_line >= req_lo.saturating_sub(100) && f.end_line <= rope.lines_len()),
+            "折叠行号应为文档坐标(带 parse_lo 平移): {folds:?}"
+        );
     }
 }

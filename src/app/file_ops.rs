@@ -111,7 +111,10 @@ impl EditorApp {
             }
         });
         tab.file_path = Some(p.to_path_buf());
-        tab.content = SharedString::from(text);
+        // 普通文本/Markdown 选项卡：正文以编辑器 Rope 为准，不再整份镜像到
+        // `content`（省一份全文副本，6MB 文件即省 6MB/卡）。EPUB/PDF 这类
+        // `readonly_preview`（编辑区为空）才把正文存进 content。
+        tab.content = SharedString::default();
         tab.line_count = lines;
         tab.char_count = chars;
         tab.cursor_row = 0;

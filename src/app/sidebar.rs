@@ -606,7 +606,12 @@ impl EditorApp {
         // （如 EPUB 完整正文）的内容，看起来像搜索到了错误文档。
         if hits < SEARCH_RESULT_CAP {
             if let Some(tab) = self.tabs.get(self.active_tab) {
-                let content = tab.content.to_string();
+                // 普通文件正文在编辑器 Rope；readonly_preview（EPUB/PDF）在 content
+                let content = if tab.readonly_preview {
+                    tab.content.to_string()
+                } else {
+                    tab.editor.read(cx).value().to_string()
+                };
                 let ti = self.active_tab;
                 for (li, line) in content.lines().enumerate() {
                     if line.to_lowercase().contains(q) {

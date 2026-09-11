@@ -56,7 +56,11 @@ impl EditorApp {
                         })
                         .detach();
                     }
-                    tab.content = value.clone();
+                    // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
+                    // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
+                    if tab.readonly_preview {
+                        tab.content = value.clone();
+                    }
                     tab.line_count = value.lines().count().max(1);
                     tab.char_count = value.chars().count();
                     tab.cursor_row = cursor_position.line as usize;
