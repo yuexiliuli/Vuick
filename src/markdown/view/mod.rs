@@ -306,11 +306,17 @@ impl MarkdownPreview {
         }
     }
 
-    /// 设置预览源码（仅影响预览，原文不变）。
+    /// 设置预览源码（仅影响预览，原文不变）。块索引在调用内现算。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
+        self.set_source_with_index(src, Rc::new(scan_blocks(src)), cx);
+    }
+
+    /// 设置预览源码，但**复用外部预建的块索引**（异步打开时由后台线程扫好，
+    /// 省掉 UI 线程上为了打开大文档做 `scan_blocks` 的几百毫秒）。
+    pub fn set_source_with_index(&mut self, src: &str, index: Rc<BlockIndex>, cx: &mut App) {
         // 内容变了，旧的跳转高亮随之失效
         self.clear_highlight();
-        let index = scan_blocks(src);
+        let index = Rc::try_unwrap(index).unwrap_or_else(|rc| (*rc).clone());
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
             // ---- 大文档：窗口级懒解析 ----
             // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本，

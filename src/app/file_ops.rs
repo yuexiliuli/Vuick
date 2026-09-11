@@ -16,6 +16,14 @@ const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
 /// set_text + 列表 reset 重测量），而是停止输入片刻后再同步一次。
 pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 200;
 
+/// 超过该行数的 Markdown 文档，**编辑区不默认软换行**。
+///
+/// 实测（6MB/16 万行）：编辑器软换行会让 gpui-component 的 DisplayMap 一次性
+/// 布局整篇（首帧 ~2.2s）+ set_value 阶段整篇换行计算（~0.7s），拖入即卡顿数秒。
+/// 这样的大文档编辑区改为横向滚动（像普通大文本），**预览区仍始终换行**
+/// （预览是窗口级懒布局，不受影响）；需要换行时用户可 Ctrl+W 随时开。
+pub(crate) const EDITOR_WRAP_MAX_LINES: usize = 30_000;
+
 impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。
     fn report_open_failure(
@@ -60,6 +68,9 @@ impl EditorApp {
     }
 
     /// 把已读取的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
+    ///
+    /// `prebuilt_index`：非 None 时预览直接复用外部（后台）预建的块索引，
+    /// 跳过 UI 线程上的 `scan_blocks`（大文档异步打开用）。
     fn load_file_text(
         &mut self,
         idx: usize,
@@ -67,6 +78,7 @@ impl EditorApp {
         text: String,
         window: &mut Window,
         cx: &mut Context<Self>,
+        prebuilt_index: Option<std::rc::Rc<crate::markdown::BlockIndex>>,
     ) {
         let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
@@ -78,26 +90,43 @@ impl EditorApp {
         let src_len = text.len();
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
+        let t_editor = std::time::Instant::now();
         tab.editor.update(cx, |ed, cx| {
             ed.set_value(text.clone(), window, cx);
-            if is_md {
+            if is_md && lines <= EDITOR_WRAP_MAX_LINES {
+                // 大文档不软换行：避免 DisplayMap 一次性布局整篇（见常量注释）
                 ed.set_soft_wrap(true, window, cx);
             }
             ed.set_highlighter(lang, cx);
         });
+        let elapsed_editor = t_editor.elapsed();
         // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）。
         // 只对 Markdown 类文件解析预览：非 md 文件预览区不展示，喂入整篇 6MB
         // 文本纯属浪费（parse_to_rows 会全量解析），拖慢打开。
         // 大文档（> PREVIEW_MAX_DOC_LINES 行）由预览内部自动切窗口级懒解析。
+        let t_preview = std::time::Instant::now();
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
             if is_md {
                 // Markdown 默认/始终自动换行
                 view.set_wrap(true, cx);
-                view.set_source(&text, cx);
+                if let Some(index) = prebuilt_index {
+                    // 复用后台预建的块索引（省 UI 线程几百 ms）
+                    view.set_source_with_index(&text, index, cx);
+                } else {
+                    view.set_source(&text, cx);
+                }
             }
         });
+        let elapsed_preview = t_preview.elapsed();
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!(
+                "[MD_OPEN_DEBUG] load_file_text: 编辑器(set_value+wrap+highlight)={} ms, 预览(set_wrap+scan_blocks)={} ms",
+                elapsed_editor.as_millis(),
+                elapsed_preview.as_millis(),
+            );
+        }
         tab.file_path = Some(p.to_path_buf());
         // 普通文本/Markdown 选项卡：正文以编辑器 Rope 为准，不再整份镜像到
         // `content`（省一份全文副本，6MB 文件即省 6MB/卡）。EPUB/PDF 这类
@@ -128,7 +157,11 @@ impl EditorApp {
         if is_md {
             tab.preview_on = true;
         }
-        self.status = SharedString::from(format!("已打开：{}", p.display()));
+        self.status = SharedString::from(if is_md && lines > EDITOR_WRAP_MAX_LINES {
+            format!("已打开：{} · 大文档编辑区已关闭软换行（Ctrl+W 可开，预览保持换行）", p.display())
+        } else {
+            format!("已打开：{}", p.display())
+        });
         self.status_ok = true;
         cx.notify();
     }
@@ -271,7 +304,7 @@ impl EditorApp {
         match fs::read_to_string(&p) {
             Ok(text) => {
                 let text = Self::normalize_newlines(&text);
-                self.load_file_text(idx, &p, text, window, cx);
+                self.load_file_text(idx, &p, text, window, cx, None);
             }
             Err(e) => self.report_open_failure(&p, &e, window, cx),
         }
@@ -313,6 +346,7 @@ impl EditorApp {
             return;
         }
         // 文本：先读成功再建 tab
+        let t_read = std::time::Instant::now();
         let text = match fs::read_to_string(&p) {
             Ok(text) => Self::normalize_newlines(&text),
             Err(e) => {
@@ -320,11 +354,78 @@ impl EditorApp {
                 return;
             }
         };
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!(
+                "[MD_OPEN_DEBUG] 读文件+归一化: {} ms ({} B)",
+                t_read.elapsed().as_millis(),
+                text.len()
+            );
+        }
+        let lines = text.lines().count().max(1);
+        // 大文档（md 且超编辑区软换行阈值）：**异步打开**——先建标签页 + “正在打开…”
+        // 状态立即返回，read/scan_blocks 已在上面完成读、预览索引放后台线程算，
+        // 完成后在主线程一次性装配编辑器与预览。拖入瞬间不再卡死 UI。
+        if Self::is_markdown_path(&p) && lines > EDITOR_WRAP_MAX_LINES {
+            let idx = self.make_tab(window, cx);
+            self.status =
+                SharedString::from(format!("正在打开大文档：{}…", p.display()));
+            self.status_ok = true;
+            let entity = cx.entity();
+            let p2 = p.clone();
+            // 后台线程预建预览块索引（纯函数，几百 ms，不阻塞 UI）
+            let src_for_scan = text.clone();
+            window
+                .spawn(cx, async move |cx| {
+                    let index = cx
+                        .background_executor()
+                        .spawn(async move { crate::markdown::scan_blocks(&src_for_scan) })
+                        .await;
+                    eprintln!(
+                        "[MD_OPEN_DEBUG] 后台 scan_blocks 完成: {} 块",
+                        index.blocks.len()
+                    );
+                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                        this.load_file_text(
+                            idx,
+                            &p2,
+                            text,
+                            window,
+                            cx,
+                            Some(std::rc::Rc::new(index)),
+                        );
+                        if let Some(tab) = this.tabs.get(idx) {
+                            let focus = tab.editor.read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                        }
+                    });
+                })
+                .detach();
+            return;
+        }
+        // 小文档：同步打开（原路径）
+        let t_mk = std::time::Instant::now();
         let idx = self.make_tab(window, cx);
-        self.load_file_text(idx, &p, text, window, cx);
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!("[MD_OPEN_DEBUG] make_tab: {} ms", t_mk.elapsed().as_millis());
+        }
+        let t_load = std::time::Instant::now();
+        self.load_file_text(idx, &p, text, window, cx, None);
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!(
+                "[MD_OPEN_DEBUG] load_file_text: {} ms",
+                t_load.elapsed().as_millis()
+            );
+        }
         if let Some(tab) = self.tabs.get(idx) {
+            let t_focus = std::time::Instant::now();
             let focus = tab.editor.read(cx).focus_handle(cx);
             window.focus(&focus, cx);
+            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                eprintln!(
+                    "[MD_OPEN_DEBUG] focus 编辑器: {} ms",
+                    t_focus.elapsed().as_millis()
+                );
+            }
         }
     }
 

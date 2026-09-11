@@ -10,4 +10,5 @@
 mod parser;
 mod view;
 
+pub use parser::{scan_blocks, BlockIndex};
 pub use view::MarkdownPreview;

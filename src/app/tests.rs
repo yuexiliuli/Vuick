@@ -1637,3 +1637,59 @@
         assert!(!pref3, "再切换后全局编辑区换行偏好应恢复关闭");
     }
 
+    /// 基准：打开 16 万行大文档的逐阶段耗时（读文件 / 编辑器装配 / 预览扫描 / 首帧渲染）。
+    /// 用与拖入完全相同的 `open_file` 同步路径，定位"拖入大文档卡顿几秒"到底卡在哪。
+    /// 运行：`cargo test --release --bench --ignored bench_open_large_md --nocapture`（见下）
+    #[gpui::test]
+    #[ignore]
+    async fn bench_open_large_md(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        std::env::set_var("MD_OPEN_DEBUG", "1");
+        // md：大文档异步打开。open_file 应立即返回（拖入不卡 UI），
+        // 内容稍后在后台装配出来。
+        let t0 = std::time::Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(r"target/大文档测试.md", window, cx);
+            });
+        });
+        let sync_ms = t0.elapsed().as_millis();
+        println!("【md 异步打开：open_file 同步返回】(拖入不卡 UI) {} ms", sync_ms);
+        // 等待内容就绪（后台 scan + 主线程装配 + 首帧）
+        let mut frames = 0;
+        let ready = loop {
+            frames += 1;
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            let done = cx.update(|_, cx| {
+                let a = app.read(cx);
+                a.tabs
+                    .last()
+                    .map(|t| !t.editor.read(cx).value().is_empty())
+                    .unwrap_or(false)
+            });
+            if done {
+                break true;
+            }
+            if frames > 200 {
+                break false;
+            }
+        };
+        let total_ms = t0.elapsed().as_millis();
+        println!("【md 内容就绪总耗时】(拖入到正文可编辑) {} ms, ready={ready}, frames={frames}", total_ms);
+
+        // 对照：同内容的 .txt（非 md → 同步打开、不软换行、无预览、无高亮语法）
+        let t_txt = std::time::Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(r"target/大文档测试.txt", window, cx);
+            });
+        });
+        println!("【txt 同步打开】(对照) {} ms", t_txt.elapsed().as_millis());
+    }
+
