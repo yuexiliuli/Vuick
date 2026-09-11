@@ -32,19 +32,34 @@ use std::rc::Rc;
 
 use gpui::{
     div, list, px, rgba, App, Context, Hsla, InteractiveElement, IntoElement, ListAlignment,
-    ListState, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    ListState, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
-use crate::markdown::parser::{parse_to_rows, rows_memory_estimate, Row, RowKind};
+use crate::markdown::parser::{
+    parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, Row, RowKind,
+    RowPayload,
+};
 
-use dimensions::{est_row_width, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX, IMAGE_ROW_DEFAULT_H};
+use dimensions::{
+    est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX,
+    IMAGE_ROW_DEFAULT_H,
+};
 use row::render_row;
 use style::StyleParams;
 
 /// 行级虚拟化在视口上下各多构建的像素量（保证快速滚动时内容连续）。
 const ROW_OVERDRAW_PX: f32 = 600.0;
+
+/// 渲染行数超过该阈值启用「窗口级懒解析」：只物化可见窗口的 [`Row`]，
+/// 整篇只保留轻量块索引（≈16B/行）+ 原始文本，驻留不随文档增长。
+/// 阈值以下走原有全量路径（行为与之前完全一致，回归风险低）。
+const WINDOWED_MIN_BLOCKS: usize = 4_000;
+
+/// 窗口懒解析时在可见范围上下各多物化的块数（滚动止境/过扫的余量，
+/// 避免轻微滚动反复重解析）。
+const WINDOWED_OVERDRAW_BLOCKS: usize = 24;
 
 /// 搜索跳转高亮停留时长（ms）：侧边栏搜索跳到命中行后高亮一段时间，随后自动消失。
 const HIGHLIGHT_MS: u64 = 2200;
@@ -82,6 +97,14 @@ pub struct MarkdownPreview {
     est_hint: f32,
     /// 生成 `est_hint` 时的视口宽度（px）；<0 表示尚未按宽度估算（需要重算）。
     est_hint_width: f32,
+    /// 大文档「窗口级懒解析」的整篇轻量块索引；`None` = 小文档走全量 `rows`。
+    index: Option<Rc<BlockIndex>>,
+    /// 窗口模式下保留的原始 markdown（窗口重解析需要）。
+    src_buf: Option<SharedString>,
+    /// 已物化窗口的全局块下标（`win_rows[0]` 对应第 `win_lo` 块）。
+    win_lo: usize,
+    /// 已物化的当前窗口行（全局块下标 `win_lo..win_lo+len`；窗口模式才有内容）。
+    win_rows: Rc<Vec<Row>>,
 }
 
 impl MarkdownPreview {
@@ -104,6 +127,10 @@ impl MarkdownPreview {
             highlight_seq: 0,
             est_hint: 0.0,
             est_hint_width: -1.0,
+            index: None,
+            src_buf: None,
+            win_lo: 0,
+            win_rows: Rc::new(Vec::new()),
         }
     }
 
@@ -204,11 +231,19 @@ impl MarkdownPreview {
         self.content_w = if self.wrap {
             0.0
         } else {
-            self.rows
-                .iter()
-                .map(|r| est_row_width(r, &p))
-                .fold(0.0, f32::max)
-                + WIDTH_BUFFER_PX
+            let max_w = match &self.index {
+                Some(idx) => idx
+                    .blocks
+                    .iter()
+                    .map(|b| est_row_width_meta(b, &p))
+                    .fold(0.0, f32::max),
+                None => self
+                    .rows
+                    .iter()
+                    .map(|r| est_row_width(r, &p))
+                    .fold(0.0, f32::max),
+            };
+            max_w + WIDTH_BUFFER_PX
         };
     }
 
@@ -235,7 +270,7 @@ impl MarkdownPreview {
 
     /// 滚动到指定行（目录跳转）。
     pub fn scroll_to_row(&mut self, ix: usize) {
-        if ix >= self.rows.len() {
+        if ix >= self.item_count() {
             return;
         }
         self.list_state.scroll_to_reveal_item(ix);
@@ -243,14 +278,19 @@ impl MarkdownPreview {
 
     /// 返回覆盖**源码第 `line` 行**（0 基）的渲染行下标；空/无行返回 `None`。
     pub fn row_for_line(&self, line: usize) -> Option<usize> {
-        if self.rows.is_empty() {
+        let n = self.item_count();
+        if n == 0 {
             return None;
         }
         // 最后一个 src_line <= line 的渲染行即覆盖该源码行的行（二分）
-        let (mut lo, mut hi) = (0usize, self.rows.len());
+        let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if self.rows[mid].src_line <= line {
+            let src_line = match &self.index {
+                Some(idx) => idx.blocks[mid].src_line as usize,
+                None => self.rows[mid].src_line,
+            };
+            if src_line <= line {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -270,56 +310,41 @@ impl MarkdownPreview {
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
         // 内容变了，旧的跳转高亮随之失效
         self.clear_highlight();
-        let base = self.base_dir.clone();
-        let mut parsed = parse_to_rows(src);
-        for r in parsed.iter_mut() {
-            if r.kind != RowKind::Image {
-                continue;
+        let index = scan_blocks(src);
+        if index.blocks.len() > WINDOWED_MIN_BLOCKS {
+            // ---- 大文档：窗口级懒解析 ----
+            // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本，
+            // 渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
+            self.index = Some(Rc::new(index.clone()));
+            self.src_buf = Some(SharedString::from(src));
+            self.win_lo = 0;
+            self.win_rows = Rc::new(Vec::new());
+            self.rows = Rc::new(Vec::new());
+            self.toc = index.toc;
+            self.code_scroll.clear();
+            self.table_scroll.clear();
+            self.list_state =
+                ListState::new(index.blocks.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
+            if std::env::var_os("MD_MEM_DEBUG").is_some() {
+                let n = index.blocks.len();
+                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
+                    + index.line_starts.len() * 4;
+                eprintln!(
+                    "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 行未物化",
+                    src.len(),
+                    src.lines().count(),
+                    n,
+                    index_b / 1024,
+                );
             }
-            let Some(p) = r.payload.as_mut() else {
-                continue;
-            };
-            let crate::markdown::parser::RowPayload::Image {
-                src,
-                img_w,
-                img_h,
-                img_data,
-            } = p.as_mut()
-            else {
-                continue;
-            };
-            let s = src.clone();
-            // 内存图片（EPUB/PDF 虚拟 src）：直接查注册表挂载字节（不落盘、不读文件）
-            if let Some(img) = self.memory_images.get(s.as_ref()) {
-                if let Some((w, h)) = image_dimensions_bytes(&img.bytes) {
-                    *img_w = Some(w);
-                    *img_h = Some(h);
-                }
-                *img_data = Some(img.clone());
-                *src = s;
-                continue;
-            }
-            let resolved = if let Some(base) = &base {
-                Self::resolve_image_src(base, &s)
-            } else {
-                s.to_string()
-            };
-            // 本地文件 → 读固有尺寸（保持比例显示；URL/不可读时保持 None）
-            if !resolved.starts_with("http://")
-                && !resolved.starts_with("https://")
-                && !resolved.starts_with("file://")
-            {
-                if let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
-                    *img_w = Some(w);
-                    *img_h = Some(h);
-                }
-            }
-            *src = resolved.into();
+            self.remeasure_dimensions(cx);
+            self.invalidate_height_hint();
+            return;
         }
-        // `parse_to_rows` 已返回 `Vec<Row>`。直接整块存进 `Rc` 即可：相比「每个
-        // Row 各自 `Rc::new` 堆分配」再装进 `Vec<Rc<Row>>`，省掉每行一个 Rc 头 +
-        // 分配器开销（15 万行 ≈ 5~8MB），且 `Vec<Row>` 是连续内存、缓存更友好。
-        // 渲染/测量只读借用 `&Row`，`Rc<Vec<Row>>` 克隆代价仍是 O(1)。
+
+        // ---- 小文档：全量路径（原有行为不变） ----
+        let mut parsed = parse_to_rows(src);
+        self.resolve_image_rows(&mut parsed);
         let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）
         self.toc = rows
@@ -375,10 +400,128 @@ impl MarkdownPreview {
         }
     }
 
+    /// 图片行后处理：解析内存图/本地图尺寸（全量路径与窗口路径共用）。
+    fn resolve_image_rows(&self, parsed: &mut [Row]) {
+        let base = self.base_dir.clone();
+        for r in parsed.iter_mut() {
+            if r.kind != RowKind::Image {
+                continue;
+            }
+            let Some(p) = r.payload.as_mut() else {
+                continue;
+            };
+            let RowPayload::Image {
+                src,
+                img_w,
+                img_h,
+                img_data,
+            } = p.as_mut()
+            else {
+                continue;
+            };
+            let s = src.clone();
+            // 内存图片（EPUB/PDF 虚拟 src）：直接查注册表挂载字节（不落盘、不读文件）
+            if let Some(img) = self.memory_images.get(s.as_ref()) {
+                if let Some((w, h)) = image_dimensions_bytes(&img.bytes) {
+                    *img_w = Some(w);
+                    *img_h = Some(h);
+                }
+                *img_data = Some(img.clone());
+                *src = s;
+                continue;
+            }
+            let resolved = if let Some(base) = &base {
+                Self::resolve_image_src(base, &s)
+            } else {
+                s.to_string()
+            };
+            // 本地文件 → 读固有尺寸（保持比例显示；URL/不可读时保持 None）
+            if !resolved.starts_with("http://")
+                && !resolved.starts_with("https://")
+                && !resolved.starts_with("file://")
+            {
+                if let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
+                    *img_w = Some(w);
+                    *img_h = Some(h);
+                }
+            }
+            *src = resolved.into();
+        }
+    }
+
+    /// 渲染条目总数：全量 = 渲染行数；窗口模式 = 块数。
+    fn item_count(&self) -> usize {
+        match &self.index {
+            Some(idx) => idx.blocks.len(),
+            None => self.rows.len(),
+        }
+    }
+
+    /// 窗口模式：确保 `win_rows` 覆盖块区间 `[lo, hi]`（含上下过扫余量）。
+    /// 命中缓存的窗口（或仅 ±1 内）不重解析，避免轻微滚动反复重建。
+    fn ensure_window(&mut self, lo: usize, hi: usize) {
+        let Some(idx) = self.index.clone() else {
+            return;
+        };
+        let Some(src) = self.src_buf.clone() else {
+            return;
+        };
+        let n = idx.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let want_lo = lo.min(n - 1);
+        let want_hi = hi.clamp(want_lo, n - 1);
+        let cur_lo = self.win_lo;
+        let cur_hi = cur_lo.saturating_add(self.win_rows.len()).saturating_sub(1);
+        // 命中：当前窗口已覆盖所需区间（含上下过扫余量）→ 不重解析。
+        // 注意不能要求 |want_lo-cur_lo| 很小：带余量重建后 cur_lo 本就比
+        // 需求靠前 24 块，那样会每帧都判"没命中"而反复重解析。
+        if !self.win_rows.is_empty() && cur_lo <= want_lo && cur_hi >= want_hi {
+            return;
+        }
+        let margin = WINDOWED_OVERDRAW_BLOCKS.min(n / 2);
+        let w_lo = want_lo.saturating_sub(margin);
+        let w_hi = (want_hi + margin).min(n - 1);
+        let mut rows = parse_block_window(&src, &idx, w_lo, w_hi);
+        self.resolve_image_rows(&mut rows);
+        self.win_lo = w_lo;
+        self.win_rows = Rc::new(rows);
+        self.build_window_scroll_handles();
+    }
+
+    /// 为当前窗口建立代码/表格块的稳定横向滚动句柄（键 = 全局块下标）。
+    fn build_window_scroll_handles(&mut self) {
+        self.code_scroll.clear();
+        self.table_scroll.clear();
+        for (j, r) in self.win_rows.iter().enumerate() {
+            let ix = self.win_lo + j;
+            match r.kind {
+                RowKind::Code => {
+                    self.code_scroll.insert(ix, ScrollHandle::new());
+                }
+                RowKind::Table => {
+                    self.table_scroll.insert(ix, ScrollHandle::new());
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
     /// 供运行时诊断（`MD_MEM_DEBUG=1`）输出，判断解析放大了多少倍。
     pub fn memory_estimate(&self) -> (usize, usize) {
-        rows_memory_estimate(&self.rows)
+        match &self.index {
+            Some(idx) => {
+                let (_, win_b) = rows_memory_estimate(&self.win_rows);
+                let n = idx.blocks.len();
+                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
+                    + idx.line_starts.len() * 4;
+                let src_b = self.src_buf.as_ref().map(|s| s.len()).unwrap_or(0);
+                (n, index_b + src_b + win_b)
+            }
+            None => rows_memory_estimate(&self.rows),
+        }
     }
 
     /// 释放预览重资源（解析出的行数据 + 列表测量缓存），关闭预览时调用。
@@ -395,6 +538,10 @@ impl MarkdownPreview {
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
         self.est_hint = 0.0;
         self.est_hint_width = -1.0;
+        self.index = None;
+        self.src_buf = None;
+        self.win_lo = 0;
+        self.win_rows = Rc::new(Vec::new());
         self.remeasure_dimensions(cx);
     }
 
@@ -411,51 +558,105 @@ impl MarkdownPreview {
     /// 折算行数（CJK ≈ 字号，其余 ≈ 0.55 × 字号），微差只会让滚动条映射略微
     /// 非线性，随行真正渲染后逐步收敛。
     fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
-        if self.rows.is_empty() {
-            return p.body_row_hint().as_f32();
-        }
         let avail = (width - 24.0).max(40.0); // px_3 左右内缩
         let wrap = self.wrap;
-        let mut total = 0.0f32;
-        for r in self.rows.iter() {
-            let h = match r.kind {
-                RowKind::Blank => p.blank_h.as_f32(),
-                RowKind::Rule => p.rule_h.as_f32(),
-                RowKind::Code => {
-                    (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
+        let (n, total) = match &self.index {
+            Some(idx) => {
+                if idx.blocks.is_empty() {
+                    return p.body_row_hint().as_f32();
                 }
-                RowKind::Table => {
-                    let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-                    (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
-                        + 2.0
-                        + 8.0
+                let mut total = 0.0f32;                for b in &idx.blocks {
+                    let h = match b.kind {
+                        RowKind::Blank => p.blank_h.as_f32(),
+                        RowKind::Rule => p.rule_h.as_f32(),
+                        RowKind::Code => {
+                            (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32()
+                        }
+                        RowKind::Table => {
+                            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+                            (1.0 + b.aux as f32) * row_h + 2.0 + 8.0
+                        }
+                        RowKind::Image => IMAGE_ROW_DEFAULT_H,
+                        RowKind::Heading(hh) => {
+                            let (fs, lh) = p.heading_metrics(hh);
+                            if wrap {
+                                est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32
+                                    * lh.as_f32()
+                                    + 8.0
+                            } else {
+                                lh.as_f32()
+                            }
+                        }
+                        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+                            if wrap {
+                                let lines = est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32())
+                                    .max(1) as f32;
+                                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
+                                    + p.para_gap.as_f32()
+                                    + 8.0
+                            } else {
+                                p.para_line.as_f32() + p.para_gap.as_f32()
+                            }
+                        }
+                    };
+                    total += h;
                 }
-                RowKind::Image => IMAGE_ROW_DEFAULT_H,
-                RowKind::Heading(n) => {
-                    let (fs, lh) = p.heading_metrics(n);
-                    if wrap {
-                        est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
-                            * lh.as_f32()
-                            + 8.0
-                    } else {
-                        lh.as_f32()
-                    }
+                (idx.blocks.len(), total)
+            }
+            None => {
+                if self.rows.is_empty() {
+                    return p.body_row_hint().as_f32();
                 }
-                RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
-                    if wrap {
-                        let lines =
-                            est_wrap_lines(&r.text, avail, p.para_size.as_f32()).max(1) as f32;
-                        (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
-                            + p.para_gap.as_f32()
-                            + 8.0
-                    } else {
-                        p.para_line.as_f32() + p.para_gap.as_f32()
-                    }
+                let mut total = 0.0f32;
+                for r in self.rows.iter() {
+                    let h = match r.kind {
+                        RowKind::Blank => p.blank_h.as_f32(),
+                        RowKind::Rule => p.rule_h.as_f32(),
+                        RowKind::Code => {
+                            (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
+                        }
+                        RowKind::Table => {
+                            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+                            (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
+                                + 2.0
+                                + 8.0
+                        }
+                        RowKind::Image => IMAGE_ROW_DEFAULT_H,
+                        RowKind::Heading(n) => {
+                            let (fs, lh) = p.heading_metrics(n);
+                            if wrap {
+                                est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
+                                    * lh.as_f32()
+                                    + 8.0
+                            } else {
+                                lh.as_f32()
+                            }
+                        }
+                        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+                            if wrap {
+                                let lines = est_wrap_lines(
+                                    &r.text,
+                                    avail,
+                                    p.para_size.as_f32(),
+                                )
+                                .max(1) as f32;
+                                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
+                                    + p.para_gap.as_f32()
+                                    + 8.0
+                            } else {
+                                p.para_line.as_f32() + p.para_gap.as_f32()
+                            }
+                        }
+                    };
+                    total += h;
                 }
-            };
-            total += h;
+                (self.rows.len(), total)
+            }
+        };
+        if n == 0 {
+            return p.body_row_hint().as_f32();
         }
-        total / self.rows.len() as f32
+        total / n as f32
     }
 
     /// 视口宽度已知（render 里）后刷新统一高度提示。
@@ -467,7 +668,8 @@ impl MarkdownPreview {
     /// 套用**不重建** ListState（保 `last_layout_bounds`，下一帧 prepaint 不再清），
     /// 并返回 `true` 让调用方 `cx.notify()` 多画一帧闭环。收敛后不再触发，不无限重画。
     fn update_height_hint(&mut self, cx: &mut App, width: f32) -> bool {
-        if self.rows.is_empty() {
+        let n = self.item_count();
+        if n == 0 {
             return false;
         }
         let width_changed = (self.est_hint_width - width).abs() >= 2.0;
@@ -480,7 +682,6 @@ impl MarkdownPreview {
         if hint <= 0.0 {
             return false;
         }
-        let n = self.rows.len();
         if self.list_state.item_count() != n {
             return false;
         }
@@ -517,9 +718,18 @@ fn est_wrap_lines(text: &str, avail: f32, font_size: f32) -> usize {
     (w / avail).ceil() as usize
 }
 
+/// 按「字节长度」估算折行数（窗口模式用：块索引不含清理后文本）。
+/// 以 0.55em/字节 的保守平均宽折算（CJK 每字节的实际宽/3 更小），避免严重低估。
+fn est_wrap_len(bytes: usize, avail: f32, font_size: f32) -> usize {
+    if bytes == 0 {
+        return 1;
+    }
+    let w = bytes as f32 * font_size * 0.55;
+    ((w / avail).ceil() as usize).max(1)
+}
+
 impl Render for MarkdownPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.rows.clone();
         let p = Rc::new(StyleParams::from_theme_with_font(cx, self.font_override));
         let bg = self.bg.unwrap_or(p.bg);
         // 视口宽度已知 → 刷新统一行高提示，让竖滚动条量程从一开始就接近真实总高。
@@ -535,6 +745,20 @@ impl Render for MarkdownPreview {
         };
         if self.update_height_hint(cx, pane_w) {
             cx.notify();
+        }
+        // 窗口模式：按当前可见范围预物化行的窗口。必须在构造 list 闭包前完成，
+        // 闭包内只读窗口数据（Rc），以避免在元素构造期改 `self`。
+        if self.index.is_some() {
+            let lo_vis = self.list_state.logical_scroll_top().item_ix;
+            let view_h = self.list_state.viewport_bounds().size.height.as_f32();
+            let hint = self.est_hint.max(20.0);
+            let vis_n = ((view_h / hint).ceil() as usize)
+                .saturating_add(WINDOWED_OVERDRAW_BLOCKS)
+                .max(16);
+            let last = self.item_count().saturating_sub(1);
+            let need_lo = lo_vis.saturating_sub(WINDOWED_OVERDRAW_BLOCKS);
+            let need_hi = lo_vis.saturating_add(vis_n).min(last);
+            self.ensure_window(need_lo, need_hi);
         }
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
@@ -567,10 +791,30 @@ impl Render for MarkdownPreview {
         // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
         let search_highlight = {
             let mut hit: Option<(usize, std::ops::Range<usize>)> = None;
-            if let Some((line, query)) = self.highlight_search.as_ref() {
-                if let Some(row_ix) = self.row_for_line(*line) {
-                    if let Some(range) = find_text_range(&self.rows[row_ix].text, query) {
-                        hit = Some((row_ix, range));
+            if let Some((line, query)) = self
+                .highlight_search
+                .as_ref()
+                .map(|(l, q)| (*l, q.clone()))
+            {
+                if let Some(row_ix) = self.row_for_line(line) {
+                    let text = match &self.index {
+                        None => self.rows.get(row_ix).map(|r| r.text.clone()),
+                        Some(_) => {
+                            // 窗口模式：先把命中块纳入窗口，再取文本
+                            self.ensure_window(row_ix, row_ix);
+                            if row_ix >= self.win_lo
+                                && row_ix - self.win_lo < self.win_rows.len()
+                            {
+                                Some(self.win_rows[row_ix - self.win_lo].text.clone())
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(t) = text {
+                        if let Some(range) = find_text_range(&t, &query) {
+                            hit = Some((row_ix, range));
+                        }
                     }
                 }
             }
@@ -586,6 +830,11 @@ impl Render for MarkdownPreview {
             hit.map(|(row_ix, range)| (row_ix, range, color.expect("命中则有背景色")))
         };
 
+        // 行数据源：全量路径用整篇 `rows`；窗口路径用已物化的 `win_rows`（Rc，O(1) 克隆）。
+        let rows = self.rows.clone();
+        let win_rows = self.win_rows.clone();
+        let win_lo = self.win_lo;
+        let windowed = self.index.is_some();
         let content = {
             let p = p.clone();
             let code_scroll = code_scroll;
@@ -598,7 +847,15 @@ impl Render for MarkdownPreview {
                     .as_ref()
                     .filter(|(row_ix, _, _)| *row_ix == ix)
                     .map(|(_, range, color)| (range.clone(), *color));
-                render_row(&rows[ix], &p, wrap, ch, th, search, cx)
+                if !windowed {
+                    render_row(&rows[ix], &p, wrap, ch, th, search, cx)
+                } else if ix >= win_lo && ix - win_lo < win_rows.len() {
+                    render_row(&win_rows[ix - win_lo], &p, wrap, ch, th, search, cx)
+                } else {
+                    // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
+                    // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
+                    div().size_full().into_any_element()
+                }
             })
         }
         .size_full();

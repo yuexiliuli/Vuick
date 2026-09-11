@@ -2,7 +2,7 @@
 //! - 估算每行渲染宽度（决定横向滚动容器的内容宽）；
 //! - 解析常见图片格式的文件头得到固有尺寸（不整图解码，快）。
 
-use crate::markdown::parser::{Row, RowKind, TableData};
+use crate::markdown::parser::{BlockMeta, Row, RowKind, TableData};
 use crate::markdown::view::style::StyleParams;
 
 /// 内容宽估算的额外缓冲（px），避免估算值微偏导致最后几个字符被截断。
@@ -144,6 +144,24 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
             .unwrap_or(0.0)
             // 渲染时外层 px_3 内缩（左右共 24px）
             + 24.0,
+    }
+}
+
+/// 估算一个块的渲染宽度（px）。窗口模式（大文档）用：块索引不含清理后文本，
+/// 按首行原始字节长度粗估（CJK 每字节 ≈ 0.2em，但这里统一按 0.6em/字节 取略宽，
+/// 宁可让横向滚动范围略宽也不截断）。
+pub(crate) fn est_row_width_meta(m: &BlockMeta, p: &StyleParams) -> f32 {
+    let bytes_w = |b: u32, font: f32| b as f32 * font * 0.6;
+    match m.kind {
+        // 围栏行本身很短，代码块宽由内部最宽行决定（无法无文本精确估算，
+        // 取 fence 行宽与 40 字符的较大者，够用的下限）
+        RowKind::Code => m.raw_len.max(40) as f32 * p.code_size.as_f32() * 0.65 + 48.0,
+        RowKind::Heading(n) => bytes_w(m.raw_len, p.heading_metrics(n).0.as_f32()),
+        RowKind::Quote => bytes_w(m.raw_len, p.para_size.as_f32()) + 50.0,
+        RowKind::Bullet => bytes_w(m.raw_len, p.para_size.as_f32()) + 20.0,
+        RowKind::Paragraph => bytes_w(m.raw_len, p.para_size.as_f32()),
+        RowKind::Table => m.raw_len as f32 * p.para_size.as_f32() * 0.6 + 24.0,
+        _ => 0.0,
     }
 }
 

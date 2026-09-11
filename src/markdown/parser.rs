@@ -555,6 +555,216 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
     rows
 }
 
+/// 一个渲染行的**轻量元数据**（只存行号/类型/几个长度，不复制文本）。
+///
+/// 供大文档「窗口级懒解析」使用：行号索引（二分定位源码行→渲染行）、
+/// 平均行高估算、目录扫描都只依赖它，不需要物化整篇 [`Row`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMeta {
+    /// 该渲染行覆盖的源码起始行（0 基，与 [`parse_to_rows`] 产出的 `Row.src_line` 一致）。
+    pub src_line: u32,
+    /// 块类型（与 [`parse_to_rows`] 产出的 `Row.kind` 一致）。
+    pub kind: RowKind,
+    /// 块首行的原始字节长度（估算用；表格/代码块按 `aux` 计数）。
+    pub raw_len: u32,
+    /// Code：代码行数；Table：数据行数；Image：1；其余：0。
+    pub aux: u32,
+}
+
+/// 整篇文档的轻量块索引（≈16B/行，160k 行 ≈ 2.6MB，而整篇 `Vec<Row>` ≈ 25MB）。
+#[derive(Debug, Clone)]
+pub struct BlockIndex {
+    /// 每个渲染行一个条目（按行序，`src_line` 严格递增）。
+    pub blocks: Vec<BlockMeta>,
+    /// 行 i（0 基）的字节起始偏移；`line_starts.len() == 行数（含末尾空行）`。
+    pub line_starts: Vec<u32>,
+    /// 目录：(渲染行号, 标题级别, 标题文本)。窗口模式下照常全量可用。
+    pub toc: Vec<(usize, u8, String)>,
+}
+
+/// 行 → 字节起始偏移表（与 `build_line_starts(&str)` 语义相同，但存 u32 省内存）。
+fn build_line_starts_u32(src: &str) -> Vec<u32> {
+    let mut starts = Vec::with_capacity(src.len() / 8 + 2);
+    starts.push(0u32);
+    for (i, &b) in src.as_bytes().iter().enumerate() {
+        if b == b'\n' {
+            starts.push((i + 1) as u32);
+        }
+    }
+    starts
+}
+
+/// 一次遍历产出整篇轻量块索引（不复制文本，不建 [`Row`]）。
+///
+/// 判定顺序与 [`parse_to_rows`] 完全一致（围栏 / 空行 / 标题 / 引述 / 列表 /
+/// 分隔线 / 独立图片 / 表格 / 段落），并复用同一切块判定函数（`fence_len`、
+/// `list_prefix`、`is_rule`、`parse_image_line`、`try_parse_table`），
+/// 因此块边界与消耗行数与全量解析天然一致（有测试背书）。
+pub fn scan_blocks(src: &str) -> BlockIndex {
+    let line_starts = build_line_starts_u32(src);
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut blocks: Vec<BlockMeta> = Vec::with_capacity(lines.len());
+    let mut toc: Vec<(usize, u8, String)> = Vec::new();
+
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let row_start = idx;
+        let line = lines[idx].trim_end_matches('\r');
+        let t = line.trim_start();
+        let raw_len = line.len() as u32;
+
+        if let Some((fc, _)) = fence_len(t) {
+            let mut code_lines = 0u32;
+            idx += 1;
+            while idx < lines.len() {
+                let l = lines[idx].trim_end_matches('\r');
+                if let Some((c, _)) = fence_len(l.trim_start()) {
+                    if c == fc {
+                        idx += 1;
+                        break;
+                    }
+                }
+                code_lines += 1;
+                idx += 1;
+            }
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Code,
+                raw_len,
+                aux: code_lines,
+            });
+            continue;
+        }
+        if t.is_empty() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Blank,
+                raw_len: 0,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) && t.len() > hashes {
+            let text = inline_strip(t[hashes..].trim_start()).to_string();
+            toc.push((row_start, hashes as u8, text));
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Heading(hashes as u8),
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if t.starts_with('>') {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Quote,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if list_prefix(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Bullet,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if is_rule(t) {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Rule,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if parse_image_line(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Image,
+                raw_len,
+                aux: 1,
+            });
+            idx += 1;
+            continue;
+        }
+        if let Some((table, consumed)) = try_parse_table(&lines, idx) {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Table,
+                raw_len,
+                aux: table.rows.len() as u32,
+            });
+            idx += consumed;
+            continue;
+        }
+        blocks.push(BlockMeta {
+            src_line: row_start as u32,
+            kind: RowKind::Paragraph,
+            raw_len,
+            aux: 0,
+        });
+        idx += 1;
+    }
+    BlockIndex {
+        blocks,
+        line_starts,
+        toc,
+    }
+}
+
+/// 物化块区间 `[lo, hi]`（闭区间）的渲染行。
+///
+/// 关键正确性前提：`parse_to_rows` 是**逐块无状态**的（每轮 while 迭代自包含），
+/// 且 `lo/hi` 是块边界。因此从 `lo` 行的字节起始切片重新解析，
+/// 产出的行与全量解析第 `lo..=hi` 个 [`Row`] **逐字节一致**——索引不会漂移。
+/// 缓存只保留这块窗口，渲染随滚动窗口移动，整篇驻留不随文档增长。
+pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -> Vec<Row> {
+    if index.blocks.is_empty() {
+        return Vec::new();
+    }
+    let n = index.blocks.len();
+    let lo = lo.min(n - 1);
+    let hi = hi.min(n - 1);
+    if lo > hi {
+        return Vec::new();
+    }
+    let start = index.line_starts[index.blocks[lo].src_line as usize] as usize;
+    let mut end = if hi + 1 < n {
+        index.line_starts[index.blocks[hi + 1].src_line as usize] as usize
+    } else {
+        src.len()
+    };
+    // 切片到"下一块首行"处会带上最后一块的换行符：`split('\n')` 会多造一个
+    // 代表"下一行"的空元素 → 多出幻影空行。裁掉这 1 个 '\n' 即精确到块边界。
+    if end < src.len() && src.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+    }
+    let rows = parse_to_rows(&src[start..end]);
+    debug_assert_eq!(rows.len(), hi - lo + 1, "窗口重解析行数必须与块数一致");
+    // 窗口内 parse 的行号是"切片相对"的，平移到文档坐标（与块索引一致）
+    let base_line = index.blocks[lo].src_line as usize;
+    if base_line != 0 {
+        let mut rows = rows;
+        for r in &mut rows {
+            r.src_line += base_line;
+        }
+        rows
+    } else {
+        rows
+    }
+}
+
 /// 估算渲染行列表的**驻留内存**（近似）：返回（行数，约多少字节）。
 ///
 /// 口径说明：
@@ -736,6 +946,82 @@ mod tests {
         assert_eq!(rows2[0].kind, RowKind::Paragraph, "行内图片不作独立图片行");
     }
 
+    /// 关键正确性：`scan_blocks` 的块边界/类型/aux 必须与全量 `parse_to_rows`
+    /// 完全一致；`parse_block_window` 重解析出的行必须与全量行的同下标切片逐字节一致。
+    /// 这是「窗口级懒解析」索引不漂移的根基测试。
+    #[test]
+    fn block_index_and_window_match_full_parse() {
+        // 覆盖：围栏 / 表格 / 标题 / 列表 / 引述 / 图片 / 空行 / 普通段落混排
+        let cases: Vec<String> = {
+            let mut v = Vec::new();
+            v.push(
+                "# 一级标题\n\n正文段落，`code` 与 **bold**\n\n- 列表一\n- 列表二\n\n> 引述\n\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 型号 | 尺寸 |\n| :--- | ---: |\n| A | 10 |\n| B | 20 |\n\n![插图](images/x.png)\n\n后文\n"
+                    .to_string(),
+            );
+            // 真实（若有）+ benchdata
+            for name in ["SKILL.md", "大文档测试.md", "bench_20k.md", "bench_160k.md"] {
+                if let Ok(s) = std::fs::read_to_string(format!("target/{name}")) {
+                    v.push(s);
+                }
+                if let Ok(s) = std::fs::read_to_string(format!("target/benchdata/{name}")) {
+                    v.push(s);
+                }
+            }
+            v
+        };
+
+        for src in &cases {
+            let rows = parse_to_rows(src);
+            let idx = scan_blocks(src);
+            assert_eq!(
+                idx.blocks.len(),
+                rows.len(),
+                "块数应等于渲染行数 (源 {} B)",
+                src.len()
+            );
+            for (i, (m, r)) in idx.blocks.iter().zip(&rows).enumerate() {
+                assert_eq!(m.src_line as usize, r.src_line, "block {i} src_line");
+                assert_eq!(m.kind, r.kind, "block {i} kind");
+                let aux = match r.kind {
+                    RowKind::Code => r.code_lines().len() as u32,
+                    RowKind::Table => r.table().map_or(0, |t| t.rows.len() as u32),
+                    RowKind::Image => 1,
+                    _ => 0,
+                };
+                assert_eq!(m.aux, aux, "block {i} aux");
+            }
+
+            // 目录：标题行号/级别/文本一致
+            assert_eq!(idx.toc.len(), rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_))).count());
+            for ((li, lv, tx), r) in idx.toc.iter().zip(rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_)))) {
+                assert_eq!(*li, r.src_line);
+                assert_eq!(*lv as u8, match r.kind { RowKind::Heading(n) => n, _ => 0 });
+                assert_eq!(tx.as_str(), r.text.as_ref());
+            }
+
+            // 窗口重解析 == 全量切片（开头 / 中部 / 末尾）
+            let n = idx.blocks.len();
+            assert!(n > 0);
+            for (lo, hi) in [
+                (0, (5.min(n) + 0) as usize),
+                (n / 2 - 2, n / 2 + 3),
+                (n.saturating_sub(6), n - 1),
+            ] {
+                if lo > hi || hi >= n {
+                    continue;
+                }
+                let win = parse_block_window(src, &idx, lo, hi);
+                assert_eq!(win.len(), hi - lo + 1, "窗口 {lo}..={hi}");
+                for (j, r) in win.iter().enumerate() {
+                    let full = &rows[lo + j];
+                    assert_eq!(r.src_line, full.src_line, "win hit {lo}+{j}");
+                    assert_eq!(r.kind, full.kind);
+                    assert_eq!(r.text.as_ref(), full.text.as_ref());
+                }
+            }
+        }
+    }
+
     /// 基准：解析结果的驻留内存放大倍数（打印，不构成断言；`--ignored` 运行）。
     ///
     /// 运行：`cargo test --release -- --ignored bench_row_parse_memory --nocapture`
@@ -855,6 +1141,34 @@ mod tests {
                 delta_kb,
                 std::mem::size_of::<Row>(),
                 t.elapsed().as_millis(),
+            );
+        }
+
+        // —— 大文档：窗口级懒解析 vs 全量驻留 ——
+        println!("--- 窗口级懒解析对比（索引 + 原文 + 顶部 40 块窗口） ---");
+        for (name, src) in &cases {
+            let idx = scan_blocks(src);
+            if idx.blocks.len() <= 4_000 {
+                continue;
+            }
+            let n = idx.blocks.len();
+            let index_b = n * std::mem::size_of::<BlockMeta>()
+                + idx.line_starts.len() * 4
+                + idx
+                    .toc
+                    .iter()
+                    .map(|(_, _, t)| t.len() + 32)
+                    .sum::<usize>();
+            let src_b = src.len();
+            let win = parse_block_window(src, &idx, 0, 40);
+            let (_, win_b) = rows_memory_estimate(&win);
+            let windowed_b = (index_b + src_b + win_b).max(1);
+            let (full_n, full_b) = rows_memory_estimate(&parse_to_rows(src));
+            let pct = 100.0 * (1.0 - windowed_b as f64 / full_b.max(1) as f64);
+            println!(
+                "{name}: 全量 {full_n} 行 ≈ {} KB ↔ 窗口模式 ≈ {} KB（省 {pct:.0}%）",
+                full_b / 1024,
+                windowed_b / 1024,
             );
         }
     }

@@ -1069,3 +1069,103 @@ fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
     );
 }
 
+/// 大文档（块数 > WINDOWED_MIN_BLOCKS）必须走「窗口级懒解析」：
+/// - 不物化整篇（win_rows 远小于块数、memory_estimate 有界）
+/// - 渲染不 panic、可见窗口内有真实行
+/// - 目录齐全、row_for_line 基于块索引可查、滚动到深处会移动窗口
+#[gpui::test]
+fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 每轮迭代 8 块：Heading/Blank/Paragraph/Blank/Bullet/Blank/Code/Blank
+    let iters = WINDOWED_MIN_BLOCKS / 2 + 400;
+    let mut src = String::new();
+    for i in 0..iters {
+        src.push_str(&format!("# 标题{i}\n\n正文段落 {i}\n\n- item\n\n```rs\nlet a = {i};\n```\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(&src, cx));
+    });
+    cx.simulate_resize(size(px(400.), px(600.)));
+    settle(cx);
+
+    let (n_items, win_lo, win_len, mem, mid_row, toc_n) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        (
+            md.item_count(),
+            md.win_lo,
+            md.win_rows.len(),
+            md.memory_estimate(),
+            md.row_for_line(src.lines().count() / 2).map(|i| i),
+            md.toc.len(),
+        )
+    });
+    assert!(
+        n_items > WINDOWED_MIN_BLOCKS,
+        "应启用窗口模式（块数={n_items} 应 > 阈值）"
+    );
+    assert!(win_len > 0, "渲染后应已物化窗口行");
+    assert!(
+        win_len < 200,
+        "窗口行数应远小于全文（win_len={win_len}，全文 {n_items}）"
+    );
+    assert!(
+        win_lo < 30,
+        "初始窗口应从顶部附近开始，win_lo={win_lo}"
+    );
+    assert!(
+        mem.1 < 1_000_000,
+        "窗口模式驻留应该有界（{mem:?} 应 < 1MB）"
+    );
+    assert!(mid_row.is_some(), "row_for_line 应基于块索引可查（中部）");
+    assert_eq!(toc_n, iters, "目录应由块索引全量提供");
+
+    // 用像素滚动（scroll_by＝滚轮/滚动条同款路径）连续下滚：render 每帧调度
+    // ensure_window，窗口应随可见范围移动。注：gpui ListState 的
+    // `scroll_to_reveal_item` 对未物化远处条目只到达已布局窗口（既有限制），
+    // 像素路径不受此限，故这里用像素滚动验证「窗口跟随」。
+    for _ in 0..30 {
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, view_cx| {
+                md.list_state.scroll_by(px(300.));
+                view_cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    for _ in 0..3 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    let (scroll_top, win_lo2, win_len2) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        (
+            md.list_state.logical_scroll_top().item_ix,
+            md.win_lo,
+            md.win_rows.len(),
+        )
+    });
+    assert!(
+        scroll_top > 100,
+        "像素滚动应将可见范围下移，scroll_top_item={scroll_top}"
+    );
+    assert!(
+        win_lo2 > 50,
+        "窗口应随滚动下移，win_lo={win_lo2}（scroll_top={scroll_top}）"
+    );
+    assert!(
+        win_lo2 <= scroll_top && scroll_top < win_lo2 + win_len2 + 64,
+        "窗口应覆盖可见范围，win_lo={win_lo2} len={win_len2} scroll_top={scroll_top}"
+    );
+    assert!(win_len2 < 200, "任一时刻窗口应保持有界，win_len={win_len2}");
+}
+
