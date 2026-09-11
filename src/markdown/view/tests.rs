@@ -183,6 +183,63 @@ fn code_band_and_table_inset_from_left_edge(cx: &mut TestAppContext) {
     );
 }
 
+/// 代码块的语法高亮缓存：` ```rust ` 围栏按语言整块解析（有 keyword/string/comment run），
+/// 无语言 ` ``` ` 围栏不产出高亮。这是「预览代码块着色」的管线回归——
+/// set_source → 建缓存 → 渲染时按主题解析颜色的完整链路。
+#[gpui::test]
+fn code_block_syntax_highlight_cache(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    let rust_src = "```rust\nfn main() {\n    let s = \"str\";\n    // 注释\n}\n```\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(rust_src, cx));
+    });
+    cx.simulate_resize(size(px(400.), px(600.)));
+    settle(cx);
+
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        let code_ix = md
+            .rows
+            .iter()
+            .position(|r| r.kind == RowKind::Code)
+            .expect("应有代码渲染行");
+        let runs = md
+            .code_hl
+            .get(&code_ix)
+            .expect("rust 代码行应有语法高亮缓存");
+        assert!(!runs.is_empty(), "高亮缓存应非空");
+        let names: Vec<&str> = runs
+            .iter()
+            .flat_map(|l| l.iter().map(|(_, n)| *n))
+            .collect();
+        assert!(names.contains(&"keyword"), "应识别关键字: {names:?}");
+        assert!(names.contains(&"string"), "应识别字符串: {names:?}");
+        assert!(names.contains(&"comment"), "应识别注释: {names:?}");
+    });
+
+    // 无语言栅栏 → 不建立高亮缓存（按纯文本渲染）
+    let plain_src = "```\nlet x = 1;\n```\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(plain_src, cx));
+    });
+    cx.simulate_resize(size(px(400.), px(600.)));
+    settle(cx);
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        assert!(md.code_hl.is_empty(), "无语言代码块不应有高亮缓存");
+    });
+}
+
 /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。
 #[gpui::test]
 fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {

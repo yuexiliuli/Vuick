@@ -79,9 +79,11 @@ pub struct TableData {
 /// 装箱后每行只占一个指针（8B），罕见行多一次堆分配（本来就稀少，可忽略）。
 #[derive(Debug, Clone)]
 pub enum RowPayload {
-    /// 代码块内所有源码行（逐行渲染成连续块）。
+    /// 代码块内所有源码行（逐行渲染成连续块）+ 围栏语言标记（用于语法着色；
+    /// `None` = 无语言标记，按纯文本渲染）。
     Code {
         code_lines: Vec<SharedString>,
+        language: Option<SharedString>,
     },
     /// 独立图片行：源 + 固有尺寸 + 内存图数据（EPUB 不落盘场景）。
     Image {
@@ -144,7 +146,8 @@ impl Row {
     }
 
     /// 代码块行：整个围栏折叠成一个 [RowKind::Code] 渲染行（逐行渲染成连续块）。
-    fn code_block(lines: Vec<SharedString>) -> Self {
+    /// `language`：围栏首行语言标记（如 ` ```rust ` → `"rust"`），None 表示无标记。
+    fn code_block(lines: Vec<SharedString>, language: Option<SharedString>) -> Self {
         let text = lines.first().cloned().unwrap_or_default();
         Self {
             text,
@@ -152,7 +155,10 @@ impl Row {
             src_line: 0,
             runs: Vec::new(),
             prefix: None,
-            payload: Some(Box::new(RowPayload::Code { code_lines: lines })),
+            payload: Some(Box::new(RowPayload::Code {
+                code_lines: lines,
+                language,
+            })),
         }
     }
 
@@ -189,10 +195,22 @@ impl Row {
     pub fn code_lines(&self) -> &[SharedString] {
         match &self.payload {
             Some(p) => match &**p {
-                RowPayload::Code { code_lines } => code_lines,
+                RowPayload::Code { code_lines, .. } => code_lines,
                 _ => &[],
             },
             None => &[],
+        }
+    }
+
+    /// 代码块的语言标记（围栏首行信息串，如 ` ```rust ` → "rust"；
+    /// 无标记或非代码行返回 `None`）。用于预览代码块的语法着色。
+    pub fn code_language(&self) -> Option<&str> {
+        match &self.payload {
+            Some(p) => match &**p {
+                RowPayload::Code { language, .. } => language.as_deref(),
+                _ => None,
+            },
+            None => None,
         }
     }
 
@@ -285,6 +303,24 @@ fn fence_len(t: &str) -> Option<(char, usize)> {
         return None;
     }
     Some((c, n))
+}
+
+/// 围栏首行的语言标记（信息串）：` ```rust ` → "rust"，` ~~~python extra ` → "python"。
+/// 剥掉围栏字符后取第一个空白分隔的词；词尾的标点（如 `rust,`）一并剥掉，
+/// 只留语言本体（`#` / `+` / `-` 等属合法字符保留）；无标记返回 `None`（纯文本代码）。
+fn fence_language(t: &str) -> Option<&str> {
+    let rest = t.trim_start_matches(['`', '~']).trim();
+    let lang = rest.split_whitespace().next().unwrap_or("");
+    let lang = lang
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, ',' | ';' | '.' | ':' | '!' | '?'));
+    if lang.is_empty() {
+        None
+    } else {
+        Some(lang)
+    }
 }
 
 fn is_rule(t: &str) -> bool {
@@ -471,6 +507,7 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         // 栅栏开头：收集到同字符闭合行之间的所有行，折叠成一个 Code 渲染行
         if let Some((fc, _)) = fence_len(t) {
             let mut code_lines = Vec::new();
+            let language = fence_language(t).map(|s| s.into());
             idx += 1;
             while idx < lines.len() {
                 let l = lines[idx].trim_end_matches('\r');
@@ -483,7 +520,7 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
                 code_lines.push(SharedString::from(l));
                 idx += 1;
             }
-            rows.push(Row::code_block(code_lines).with_line(row_start));
+            rows.push(Row::code_block(code_lines, language).with_line(row_start));
             continue;
         }
         if t.is_empty() {
@@ -795,6 +832,10 @@ pub(crate) fn rows_memory_estimate(rows: &[Row]) -> (usize, usize) {
         }
         bytes += r.runs.capacity() * std::mem::size_of::<(Range<usize>, RunKind)>();
         bytes += string_vec_bytes(r.code_lines());
+        bytes += r
+            .code_language()
+            .map(|l| ALLOC_OVERHEAD + l.len())
+            .unwrap_or(0);
         if let Some(t) = r.table() {
             bytes += std::mem::size_of::<TableData>();
             for h in &t.header {
@@ -826,6 +867,7 @@ mod tests {
         assert_eq!(rows[0].kind, RowKind::Heading(1));
         assert_eq!(rows[0].text.as_ref(), "一级标题");
         assert_eq!(rows[1].kind, RowKind::Code);
+        assert_eq!(rows[1].code_language(), Some("rs"), "围栏语言应被捕获");
         assert_eq!(rows[1].text.as_ref(), "let a = 1;");
         assert_eq!(rows[2].kind, RowKind::Bullet);
         assert_eq!(rows[2].text.as_ref(), "item");
@@ -835,6 +877,18 @@ mod tests {
             "无序列表应带前缀"
         );
         assert_eq!(rows[4].kind, RowKind::Quote);
+    }
+
+    #[test]
+    fn code_fence_language_variants() {
+        // 无语言标记 / 含信息串 / `{lang}` 旧式包裹 / 波浪号围栏
+        let rows = parse_to_rows("```\nplain\n```\n\n```rust, ignore\nlet x = 1;\n```\n\n~~~{python}\nx = 1\n~~~\n");
+        assert_eq!(rows[0].kind, RowKind::Code);
+        assert_eq!(rows[0].code_language(), None, "纯 ``` 围栏无语言");
+        assert_eq!(rows[2].kind, RowKind::Code);
+        assert_eq!(rows[2].code_language(), Some("rust"), "取信息串首词");
+        assert_eq!(rows[4].kind, RowKind::Code);
+        assert_eq!(rows[4].code_language(), Some("python"), "`{{lang}}` 旧式包裹应剥掉花括号");
     }
 
     #[test]

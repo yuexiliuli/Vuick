@@ -18,6 +18,7 @@ use crate::markdown::parser::{Row, RowKind, RunKind};
 use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
+use crate::syntax::{github_theme, resolve_line_styles_with, CodeLineRuns};
 
 /// 表格横向滚动条底部预留条高度（px）：与 gpui-component 横向滚动条轨道高度
 /// （scrollbar.rs 的 `WIDTH = 4*2 + 8 = 16`）一致，避免滚动条遮挡表格内容。
@@ -174,8 +175,21 @@ fn shift_search(
         .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c))
 }
 
-/// 渲染一行代码（等宽、不换行、浅灰底）。
-fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
+/// 渲染一行代码（等宽、不换行、浅灰底）。`styles` = 该行已解析的颜色 run
+/// （`Some` 时用 [`StyledText`] 逐段着色；`None` 按纯文本渲染）。
+fn code_band(
+    t: &gpui::SharedString,
+    styles: Option<&[(Range<usize>, HighlightStyle)]>,
+    p: &StyleParams,
+) -> gpui::AnyElement {
+    // 有颜色 run 且有内容时用 StyledText（无命中段时 resolve 仍产出覆盖整行的
+    // 默认 run → 走 Some 分支，颜色字段为 None 沿用外层 text_color）。
+    let child: gpui::AnyElement = match styles.filter(|s| !s.is_empty()) {
+        Some(styles) => StyledText::new(t.clone())
+            .with_highlights(styles.to_vec())
+            .into_any_element(),
+        None => t.clone().into_any_element(),
+    };
     div()
         .debug_selector(|| "md-code-band".into())
         .h(p.code_line)
@@ -187,7 +201,8 @@ fn code_band(t: gpui::SharedString, p: &StyleParams) -> gpui::Div {
         .text_size(p.code_size)
         .text_color(p.fg)
         .bg(p.code_bg)
-        .child(t)
+        .child(child)
+        .into_any_element()
 }
 
 /// 代码块上下各补一行空白带（带同一背景色）：让代码块背景在首行文字上方 /
@@ -203,16 +218,31 @@ fn code_blank(selector: &'static str, p: &StyleParams) -> gpui::Div {
 
 /// 代码块＝首行空白带 + 代码行 + 末行空白带（背景连续铺平）。
 /// 首/末空白带分别圆上角 / 下角（lg=8px），让代码块整体呈圆角卡片。
-fn code_block_bands(lines: &[gpui::SharedString], p: &StyleParams) -> Vec<gpui::Div> {
-    let mut bands = Vec::with_capacity(lines.len() + 2);
+/// `runs`：整块每行的语义名高亮（可选；无语言/未知语法时按纯文本渲染）。颜色随 `dark`。
+fn code_block_bands(
+    lines: &[gpui::SharedString],
+    runs: Option<&CodeLineRuns>,
+    dark: bool,
+    p: &StyleParams,
+) -> Vec<gpui::AnyElement> {
+    // 复用同一个 GitHub 明/暗色板解析各行的颜色，避免每行重建主题。
+    let resolver = github_theme(dark);
+    let mut bands: Vec<gpui::AnyElement> = Vec::with_capacity(lines.len() + 2);
     bands.push(
         code_blank("md-code-blank-top", p)
-            .rounded_t_lg(),
+            .rounded_t_lg()
+            .into_any_element(),
     );
-    bands.extend(lines.iter().map(|l| code_band(l.clone(), p)));
+    for (i, line) in lines.iter().enumerate() {
+        let styles = runs
+            .and_then(|all| all.get(i))
+            .map(|line_runs| resolve_line_styles_with(line_runs, line.len(), &resolver));
+        bands.push(code_band(line, styles.as_deref(), p));
+    }
     bands.push(
         code_blank("md-code-blank-bottom", p)
-            .rounded_b_lg(),
+            .rounded_b_lg()
+            .into_any_element(),
     );
     bands
 }
@@ -395,18 +425,23 @@ impl Element for RoundedInlineText {
 
 /// 渲染单个行。`code_handle` / `table_handle` 为各自稳定的横向滚动句柄
 /// （None 时自动创建），供滚动条拖动使用。
+/// `code_hl`：该代码块的语法高亮缓存（每行语义名 run）；None = 无高亮（纯文本）。
 /// `search`：搜索跳转高亮 (命中文本字节区间, 背景色)，只给命中文本着色（不吃整行）。
 pub(crate) fn render_row(
     row: &Row,
     p: &Rc<StyleParams>,
     wrap: bool,
     code_handle: Option<ScrollHandle>,
+    code_hl: Option<Rc<CodeLineRuns>>,
     table_handle: Option<ScrollHandle>,
     search: Option<(Range<usize>, Hsla)>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
     let inline_colors = inline_code_colors(cx);
+    // 当前主题明/暗（代码块语法着色色板随主题）。
+    let dark = gpui_component::Theme::global(cx).is_dark();
+    let code_runs = code_hl.as_deref();
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
     // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
     if let RowKind::Table = row.kind {
@@ -564,6 +599,7 @@ pub(crate) fn render_row(
         if row.kind == RowKind::Code {
             let lines = row.code_lines().to_vec();
             let p_ = p.clone();
+            let runs = code_runs;
             let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             let h = code_handle.unwrap_or_else(ScrollHandle::new);
             let column = div()
@@ -572,7 +608,7 @@ pub(crate) fn render_row(
                 .flex_col()
                 .flex_shrink_0()
                 .min_w_full()
-                .children(code_block_bands(&lines, &p_));
+                .children(code_block_bands(&lines, runs, dark, &p_));
             return div()
                 .debug_selector(|| "md-code-hscroll".into())
                 .h(px(block_h))
@@ -712,9 +748,10 @@ pub(crate) fn render_row(
         RowKind::Code => {
             // 代码块：整栏折叠为一行的所有代码行按 h(code_line) 纵向堆叠成连续块，
             // 上下各补一行空白带（同背景），使背景在首/末行之外多出一行呼吸空间。
-            // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体。超宽由外层横向滚动。
+            // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体 + 语法着色。超宽由外层横向滚动。
             let lines = row.code_lines().to_vec();
             let p_ = p.clone();
+            let runs = code_runs;
             let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             div()
                 .h(px(block_h))
@@ -728,7 +765,7 @@ pub(crate) fn render_row(
                         .w_full()
                         .flex()
                         .flex_col()
-                        .children(code_block_bands(&lines, &p_)),
+                        .children(code_block_bands(&lines, runs, dark, &p_)),
                 )
         }
         RowKind::Heading(n) => {

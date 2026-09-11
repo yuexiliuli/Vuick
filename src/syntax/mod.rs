@@ -458,6 +458,62 @@ fn resolve_styles(
     runs
 }
 
+/// Markdown 预览代码块的高亮结果：**每行一个**未解析的语义名 run
+/// （行内字节区间 → 语义名）。与主题无关，可跨明/暗主题复用缓存。
+pub(crate) type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
+
+/// 解析整个代码块文本，返回每行的语义名 run（整块一次解析，
+/// 多行注释 / 字符串 / 跨行语法上下文能正确配色，预览不会“逐行独立”地错色）。
+/// `language` 无标记或未知 → 返回 `None`（按纯文本渲染，不产出高亮）。
+pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRuns> {
+    let syntax = find_syntax(language)?;
+    let line_starts = build_line_starts(code);
+    let line_count = line_starts.len();
+    let mut parser = ParseState::new(syntax);
+    let mut scopes = ScopeStack::new();
+    let mut semantic_names: HashMap<Scope, Option<&'static str>> = HashMap::new();
+    let mut out = Vec::with_capacity(line_count);
+    for li in 0..line_count {
+        let line_end = if li + 1 < line_count {
+            line_starts[li + 1]
+        } else {
+            code.len()
+        };
+        let line = &code[line_starts[li]..line_end];
+        let mut runs: Vec<(Range<usize>, &'static str)> = Vec::new();
+        if let Ok(operations) = parser.parse_line(line, &SYNTAX_SET) {
+            let mut cursor = 0;
+            for (index, operation) in operations {
+                if cursor < index {
+                    if let Some(name) = find_name(&mut semantic_names, &scopes) {
+                        runs.push((cursor..index, name));
+                    }
+                }
+                let _ = scopes.apply(&operation);
+                cursor = index;
+            }
+            if cursor < line.len() {
+                if let Some(name) = find_name(&mut semantic_names, &scopes) {
+                    runs.push((cursor..line.len(), name));
+                }
+            }
+        }
+        out.push(runs);
+    }
+    Some(out)
+}
+
+/// 把某一行的语义名 run 解析成**覆盖整行、无缝隙**的 `HighlightStyle` run。
+/// 颜色由 `resolver`（GitHub 明/暗色板）决定；无命中段时返回单个默认 run（沿用外层文字色）。
+/// 调用方应复用同一个 resolver 逐行解析，避免每行重建主题。
+pub(crate) fn resolve_line_styles_with(
+    runs: &[(Range<usize>, &'static str)],
+    line_len: usize,
+    resolver: &dyn HighlightStyleResolver,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    resolve_styles(runs, &(0..line_len), resolver)
+}
+
 /// 把 syntect scope 字符串映射为语义名（与 `SyntaxColors::style` 的键一致）。
 fn semantic_name(scope: Scope) -> Option<&'static str> {
     let scope = scope.build_string();
@@ -730,6 +786,44 @@ mod tests {
             dark.style.syntax.keyword.map(|s| s.color),
             "明暗 keyword 颜色应不同"
         );
+    }
+
+    /// 预览代码块高亮：整块解析 → 每行语义名 run；未知语言返回 None；
+    /// `resolve_line_styles_with` 产出无缝隙、可着色、随明暗变化的 run。
+    #[test]
+    fn preview_code_block_highlight_lines() {
+        // rust 多行注释/字符串跨行也能正确配色（无尾换行 → 行数与内容行一致）
+        let code = "fn main() {\n    // 注释\n    let s = \"str\";\n}";
+        let runs = parse_code_lines("rust", code).expect("rust 应有高亮");
+        assert_eq!(runs.len(), 4, "每行一条");
+        let names: Vec<_> = runs
+            .iter()
+            .map(|l| l.iter().map(|(_, n)| *n).collect::<Vec<_>>())
+            .collect();
+        assert!(names[0].contains(&"keyword"), "fn/关键字行应有 keyword: {names:?}");
+        assert!(names[1].contains(&"comment"), "注释行应有 comment: {names:?}");
+        assert!(names[2].contains(&"string"), "字符串行应有 string: {names:?}");
+
+        // 未知语言 → None（不做高亮）
+        assert!(parse_code_lines("no-such-lang", "x = 1").is_none());
+
+        // 每行解析出的颜色 run 无缝隙覆盖整行（长度 = 行字节长）
+        let resolver = github_theme(false);
+        let mut total_colored = 0;
+        for (li, line_runs) in runs.iter().enumerate() {
+            let line = code.lines().nth(li).unwrap_or("");
+            let styles = resolve_line_styles_with(line_runs, line.len(), &resolver);
+            let mut cursor = 0;
+            for (r, st) in &styles {
+                assert_eq!(r.start, cursor, "行 {li} 应无缝隙");
+                cursor = r.end;
+                if st.color.is_some() {
+                    total_colored += 1;
+                }
+            }
+            assert_eq!(cursor, line.len(), "行 {li} 应覆盖整行");
+        }
+        assert!(total_colored > 0, "整块至少有颜色 run");
     }
 
     /// 基准：窗口解析代价与文档总量无关（打印、不构成断言；`--ignored` 运行）。

@@ -41,6 +41,7 @@ use crate::markdown::parser::{
     parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, Row, RowKind,
     RowPayload,
 };
+use crate::syntax::{parse_code_lines, CodeLineRuns};
 
 use dimensions::{
     est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX,
@@ -86,6 +87,10 @@ pub struct MarkdownPreview {
     memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// 代码块的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     code_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// 代码块语法高亮缓存（行号 → 每行语义名 run；键与 `code_scroll` 一致）。
+    /// 建在 set_source / 窗口重建时整块解析一次，渲染只做颜色解析——
+    /// 结果与主题无关，换明/暗主题无需重算。
+    code_hl: std::collections::HashMap<usize, std::rc::Rc<CodeLineRuns>>,
     /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     table_scroll: std::collections::HashMap<usize, ScrollHandle>,
     /// 搜索跳转高亮：命中的源码行（0 基）与小写查询词；None = 无高亮。
@@ -122,6 +127,7 @@ impl MarkdownPreview {
             base_dir: None,
             memory_images: Default::default(),
             code_scroll: Default::default(),
+            code_hl: Default::default(),
             table_scroll: Default::default(),
             highlight_search: None,
             highlight_seq: 0,
@@ -328,6 +334,7 @@ impl MarkdownPreview {
             self.rows = Rc::new(Vec::new());
             self.toc = index.toc;
             self.code_scroll.clear();
+            self.code_hl.clear();
             self.table_scroll.clear();
             self.list_state =
                 ListState::new(index.blocks.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
@@ -376,6 +383,8 @@ impl MarkdownPreview {
             .map(|(ix, _)| (ix, ScrollHandle::new()))
             .collect();
         self.rows = Rc::new(rows);
+        // 代码块语法高亮：按围栏语言整块解析一次缓存（渲染只做颜色解析）。
+        self.code_hl = build_code_highlights_for(&self.rows);
         if std::env::var_os("MD_MEM_DEBUG").is_some() {
             let (n, bytes) = rows_memory_estimate(&self.rows);
             eprintln!(
@@ -512,6 +521,7 @@ impl MarkdownPreview {
                 _ => {}
             }
         }
+        self.code_hl = build_code_highlights_for(&self.win_rows);
     }
 
     /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
@@ -539,6 +549,7 @@ impl MarkdownPreview {
         self.content_w = 0.0;
         self.toc.clear();
         self.code_scroll.clear();
+        self.code_hl.clear();
         self.table_scroll.clear();
         self.highlight_search = None;
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
@@ -705,6 +716,35 @@ impl MarkdownPreview {
     }
 }
 
+/// 为给定行集重建代码块语法高亮缓存：按围栏语言**整块**解析一次，返回
+/// 「行号 → 每行语义名 run」的映射（键与 `code_scroll` 一致；无语言/未知语法
+/// 的代码行跳过）。结果与主题无关（明/暗色在渲染时解析），换主题无需重算。
+fn build_code_highlights_for(rows: &[Row]) -> std::collections::HashMap<usize, Rc<CodeLineRuns>> {
+    let mut hl = std::collections::HashMap::new();
+    for (ix, r) in rows.iter().enumerate() {
+        if r.kind != RowKind::Code {
+            continue;
+        }
+        let Some(lang) = r.code_language() else {
+            continue;
+        };
+        if lang.is_empty() {
+            continue;
+        }
+        let mut code = String::new();
+        for (i, l) in r.code_lines().iter().enumerate() {
+            if i > 0 {
+                code.push('\n');
+            }
+            code.push_str(l.as_ref());
+        }
+        if let Some(runs) = parse_code_lines(lang, &code) {
+            hl.insert(ix, Rc::new(runs));
+        }
+    }
+    hl
+}
+
 /// 估算法：按字符宽（CJK/全角 ≈ font_size，其余 ≈ 0.55 × font_size）累计文本宽度，
 /// 折出在可用宽度 `avail` 下的行数。用于「平均行高」估算，非精确排版。
 fn est_wrap_lines(text: &str, avail: f32, font_size: f32) -> usize {
@@ -770,6 +810,7 @@ impl Render for MarkdownPreview {
         let content_w = self.content_w;
         let wrap = self.wrap;
         let code_scroll = self.code_scroll.clone();
+        let code_hl = self.code_hl.clone();
         let table_scroll = self.table_scroll.clone();
 
         if cfg!(debug_assertions) {
@@ -844,19 +885,21 @@ impl Render for MarkdownPreview {
         let content = {
             let p = p.clone();
             let code_scroll = code_scroll;
+            let code_hl = code_hl;
             let table_scroll = table_scroll;
             let search_highlight = search_highlight;
             list(list_state.clone(), move |ix, _window, cx| {
                 let ch = code_scroll.get(&ix).cloned();
+                let chr = code_hl.get(&ix).cloned();
                 let th = table_scroll.get(&ix).cloned();
                 let search = search_highlight
                     .as_ref()
                     .filter(|(row_ix, _, _)| *row_ix == ix)
                     .map(|(_, range, color)| (range.clone(), *color));
                 if !windowed {
-                    render_row(&rows[ix], &p, wrap, ch, th, search, cx)
+                    render_row(&rows[ix], &p, wrap, ch, chr, th, search, cx)
                 } else if ix >= win_lo && ix - win_lo < win_rows.len() {
-                    render_row(&win_rows[ix - win_lo], &p, wrap, ch, th, search, cx)
+                    render_row(&win_rows[ix - win_lo], &p, wrap, ch, chr, th, search, cx)
                 } else {
                     // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
                     // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
