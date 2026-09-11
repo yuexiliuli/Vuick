@@ -87,6 +87,7 @@ impl EditorApp {
             preview_on: false,
             preview_fullscreen: false,
             readonly_preview: false,
+            editor_pending: false,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;

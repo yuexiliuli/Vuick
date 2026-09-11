@@ -87,6 +87,10 @@ struct EditorTab {
     preview_fullscreen: bool,
     /// 预览是否只读锁定（EPUB：正文只在预览区，编辑区为空，不能关闭/翻转预览）
     readonly_preview: bool,
+    /// 大文档异步打开：预览先出、编辑器暂缓挂载（首帧显示轻量占位，
+    /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
+    /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
+    editor_pending: bool,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }

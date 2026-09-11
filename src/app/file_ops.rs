@@ -104,6 +104,9 @@ impl EditorApp {
         // 只对 Markdown 类文件解析预览：非 md 文件预览区不展示，喂入整篇 6MB
         // 文本纯属浪费（parse_to_rows 会全量解析），拖慢打开。
         // 大文档（> PREVIEW_MAX_DOC_LINES 行）由预览内部自动切窗口级懒解析。
+        // 大文档异步打开（带预建索引）：编辑器已填入内容，但挂载延后一拍——
+        // 让预览先把内容画出来，编辑器 16 万行的首帧布局再放到随后帧（见 panes）。
+        tab.editor_pending = prebuilt_index.is_some();
         let t_preview = std::time::Instant::now();
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);

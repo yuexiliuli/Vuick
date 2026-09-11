@@ -1660,28 +1660,44 @@
         });
         let sync_ms = t0.elapsed().as_millis();
         println!("【md 异步打开：open_file 同步返回】(拖入不卡 UI) {} ms", sync_ms);
-        // 等待内容就绪（后台 scan + 主线程装配 + 首帧）
+        // 阶段 A：等待预览内容就绪（块索引已建 → 预览区可显示内容）
+        // 阶段 B：等待编辑器挂载完成（editor_pending 复位 → 编辑区升起）
+        let mut a_ready_ms = 0usize;
+        let mut b_ready_ms = 0usize;
         let mut frames = 0;
-        let ready = loop {
+        loop {
             frames += 1;
             cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            let done = cx.update(|_, cx| {
+            let (preview_blocks, editor_pending) = cx.update(|_, cx| {
                 let a = app.read(cx);
-                a.tabs
-                    .last()
-                    .map(|t| !t.editor.read(cx).value().is_empty())
-                    .unwrap_or(false)
+                let i = a.tabs.len().saturating_sub(1);
+                (
+                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                    a.tabs[i].editor_pending,
+                )
             });
-            if done {
-                break true;
+            if a_ready_ms == 0 && preview_blocks > 0 {
+                a_ready_ms = t0.elapsed().as_millis() as usize;
+            }
+            if preview_blocks > 0 && !editor_pending {
+                b_ready_ms = t0.elapsed().as_millis() as usize;
+                break;
             }
             if frames > 200 {
-                break false;
+                break;
             }
-        };
-        let total_ms = t0.elapsed().as_millis();
-        println!("【md 内容就绪总耗时】(拖入到正文可编辑) {} ms, ready={ready}, frames={frames}", total_ms);
+        }
+        println!("【A. 预览内容就绪】(拖入→预览可见) {} ms", a_ready_ms);
+        println!("【B. 编辑区挂载完成】(拖入→编辑器升起) {}", if b_ready_ms > 0 { format!("{} ms", b_ready_ms) } else { "超时".to_string() });
+        // 首帧真实渲染/布局（编辑器 DisplayMap + 预览 ListState + 高亮窗口）
+        let tb = std::time::Instant::now();
+        for i in 0..3 {
+            let tf = std::time::Instant::now();
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            println!("【C. 挂载后第 {} 次 refresh】(真实布局) {} ms", i + 1, tf.elapsed().as_millis());
+        }
+        println!("【C. 前 3 次 refresh 合计】 {} ms", tb.elapsed().as_millis());
 
         // 对照：同内容的 .txt（非 md → 同步打开、不软换行、无预览、无高亮语法）
         let t_txt = std::time::Instant::now();

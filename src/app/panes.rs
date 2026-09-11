@@ -26,6 +26,30 @@ impl EditorApp {
         if readonly {
             return div().id("editor-area").size_full();
         }
+        // 大文档异步打开：编辑器内容已就绪，但让预览先把内容画出来。
+        // 这一帧渲染轻量占位（不含 16 万行编辑器 → 布局轻快），并复位标记请求
+        // 下一帧挂载编辑器；编辑器的首帧 DisplayMap 布局（可能冻结一两秒）
+        // 因此排在用户看到预览内容之后，而不是挡在最前面。
+        if self.tabs[self.active_tab].editor_pending {
+            self.tabs[self.active_tab].editor_pending = false;
+            cx.notify();
+            let panel_bg = self.panel_bg();
+            let muted = self.text_minor();
+            return div()
+                .id("editor-area")
+                .debug_selector(|| "editor-area".into())
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(panel_bg)
+                .child(
+                    div()
+                        .text_color(muted)
+                        .text_size(px(13.))
+                        .child("正在载入编辑区…（预览已就绪）"),
+                );
+        }
         let editor = self.tabs[self.active_tab].editor.clone();
         let font_size = px(self.font_size);
         div()
