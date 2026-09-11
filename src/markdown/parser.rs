@@ -69,6 +69,40 @@ pub struct TableData {
     pub aligns: Vec<TableAlign>,
 }
 
+/// 渲染行的"额外载荷"——只对少数行非 None：
+/// - [`RowKind::Code`] → [`RowPayload::Code`]
+/// - [`RowKind::Image`] → [`RowPayload::Image`]
+/// - [`RowKind::Table`] → [`RowPayload::Table`]
+///
+/// 装箱保存：普通段落/标题/引述/列表行绝大多数是文本 + 行内样式，
+/// 若把这些罕见字段内联进 [`Row`]，每行都要背 72B+（16 万行 ≈ 10MB+）。
+/// 装箱后每行只占一个指针（8B），罕见行多一次堆分配（本来就稀少，可忽略）。
+#[derive(Debug, Clone)]
+pub enum RowPayload {
+    /// 代码块内所有源码行（逐行渲染成连续块）。
+    Code {
+        code_lines: Vec<SharedString>,
+    },
+    /// 独立图片行：源 + 固有尺寸 + 内存图数据（EPUB 不落盘场景）。
+    Image {
+        src: SharedString,
+        img_w: Option<u32>,
+        img_h: Option<u32>,
+        img_data: Option<std::sync::Arc<Image>>,
+    },
+    /// 表格（一个渲染行 = 整张表）。
+    Table(TableData),
+}
+
+/// 图片行载荷的只读视图（非图片行返回 None）。
+#[derive(Debug, Clone, Copy)]
+pub struct ImageInfo<'a> {
+    pub src: &'a SharedString,
+    pub img_w: Option<u32>,
+    pub img_h: Option<u32>,
+    pub img_data: Option<&'a std::sync::Arc<Image>>,
+}
+
 /// 一个渲染行：文本 + 类型 + 可选的行内样式段 + 列表前缀。
 #[derive(Debug, Clone)]
 pub struct Row {
@@ -82,18 +116,8 @@ pub struct Row {
     pub runs: Vec<(Range<usize>, RunKind)>,
     /// 列表前缀，如 "•" 或有序 "1."
     pub prefix: Option<SharedString>,
-    /// 表格结构（kind == [Table] 时 Some）
-    pub table: Option<TableData>,
-    /// 图片源（kind == [Image] 时为 `![alt](src)` 的 src）。
-    #[allow(dead_code)]
-    pub src: Option<SharedString>,
-    /// 图片固有尺寸（像素，kind == [Image] 且 src 可解析时 Some）。用于按比例显示。
-    pub img_w: Option<u32>,
-    pub img_h: Option<u32>,
-    /// 内存图片数据（EPUB 等不落盘场景；Some 时渲染直接用该字节，忽略 src 路径）。
-    pub img_data: Option<std::sync::Arc<Image>>,
-    /// 代码块内容（kind == [Code] 时是一整个围栏内的所有行，逐行一条渲染）。
-    pub code_lines: Vec<SharedString>,
+    /// 稀有字段（代码块行 / 图片行 / 表格行）装箱保存，普通行不背上这些字段。
+    pub payload: Option<Box<RowPayload>>,
 }
 
 impl Row {
@@ -109,12 +133,7 @@ impl Row {
             src_line: 0,
             runs,
             prefix,
-            table: None,
-            src: None,
-            img_w: None,
-            img_h: None,
-            img_data: None,
-            code_lines: Vec::new(),
+            payload: None,
         }
     }
 
@@ -133,12 +152,7 @@ impl Row {
             src_line: 0,
             runs: Vec::new(),
             prefix: None,
-            table: None,
-            src: None,
-            img_w: None,
-            img_h: None,
-            img_data: None,
-            code_lines: lines,
+            payload: Some(Box::new(RowPayload::Code { code_lines: lines })),
         }
     }
 
@@ -150,12 +164,7 @@ impl Row {
             src_line: 0,
             runs: Vec::new(),
             prefix: None,
-            table: Some(table),
-            src: None,
-            img_w: None,
-            img_h: None,
-            img_data: None,
-            code_lines: Vec::new(),
+            payload: Some(Box::new(RowPayload::Table(table))),
         }
     }
 
@@ -167,12 +176,55 @@ impl Row {
             src_line: 0,
             runs: Vec::new(),
             prefix: None,
-            table: None,
-            src: Some(src.into()),
-            img_w: None,
-            img_h: None,
-            img_data: None,
-            code_lines: Vec::new(),
+            payload: Some(Box::new(RowPayload::Image {
+                src: src.into(),
+                img_w: None,
+                img_h: None,
+                img_data: None,
+            })),
+        }
+    }
+
+    /// 代码块的所有源码行（非 [`RowKind::Code`] 行返回空切片）。
+    pub fn code_lines(&self) -> &[SharedString] {
+        match &self.payload {
+            Some(p) => match &**p {
+                RowPayload::Code { code_lines } => code_lines,
+                _ => &[],
+            },
+            None => &[],
+        }
+    }
+
+    /// 表格结构（仅 [`RowKind::Table`] 行）。
+    pub fn table(&self) -> Option<&TableData> {
+        match &self.payload {
+            Some(p) => match &**p {
+                RowPayload::Table(t) => Some(t),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// 图片行载荷（仅 [`RowKind::Image`] 行）。
+    pub fn image(&self) -> Option<ImageInfo<'_>> {
+        match &self.payload {
+            Some(p) => match &**p {
+                RowPayload::Image {
+                    src,
+                    img_w,
+                    img_h,
+                    img_data,
+                } => Some(ImageInfo {
+                    src,
+                    img_w: *img_w,
+                    img_h: *img_h,
+                    img_data: img_data.as_ref(),
+                }),
+                _ => None,
+            },
+            None => None,
         }
     }
 }
@@ -503,6 +555,56 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
     rows
 }
 
+/// 估算渲染行列表的**驻留内存**（近似）：返回（行数，约多少字节）。
+///
+/// 口径说明：
+/// - 计入 `Row` 结构体本身（`size_of::<Row>()`）；
+/// - 计入每个 `SharedString` 的**内容**（`len()` 字节）外加每块独立堆分配的
+///   分配器开销（这里按 `+32 B/块` 粗估，实际 16~64 B 视分配器而定）；
+/// - 计入内联 `runs` / `code_lines` / 表格 cell 的 Vec 容量与内容。
+///
+/// 不包含：`toc` / `code_scroll` / `table_scroll` 等辅助结构、文本整形/字体缓存。
+/// 用于定位“解析结果把文档放大多少倍”（15 万行 ≈ 30MB+ 的量级来自此处）。
+pub(crate) fn rows_memory_estimate(rows: &[Row]) -> (usize, usize) {
+    /// 每个独立堆分配的近似分配器开销（head + 对齐 + 页头分摊）。
+    const ALLOC_OVERHEAD: usize = 32;
+    fn string_bytes(s: &SharedString) -> usize {
+        ALLOC_OVERHEAD + s.len()
+    }
+    fn string_vec_bytes(v: &[SharedString]) -> usize {
+        v.len() * std::mem::size_of::<SharedString>()
+            + v.iter().map(string_bytes).sum::<usize>()
+    }
+
+    let mut bytes = 0usize;
+    for r in rows {
+        bytes += std::mem::size_of::<Row>();
+        bytes += string_bytes(&r.text);
+        if let Some(p) = &r.prefix {
+            bytes += string_bytes(p);
+        }
+        bytes += r.runs.capacity() * std::mem::size_of::<(Range<usize>, RunKind)>();
+        bytes += string_vec_bytes(r.code_lines());
+        if let Some(t) = r.table() {
+            bytes += std::mem::size_of::<TableData>();
+            for h in &t.header {
+                bytes += string_bytes(h);
+            }
+            for row in &t.rows {
+                bytes += string_vec_bytes(row);
+            }
+            bytes += t.aligns.capacity() * std::mem::size_of::<TableAlign>();
+        }
+        if let Some(img) = r.image() {
+            bytes += string_bytes(img.src);
+            if img.img_data.is_some() {
+                bytes += std::mem::size_of::<std::sync::Arc<Image>>();
+            }
+        }
+    }
+    (rows.len(), bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,7 +673,7 @@ mod tests {
     fn parses_gfm_pipe_table() {
         let src = "| 型号 | 尺寸 |\n| :--- | ---: |\n| A | 10 |\n| B | 20 |\n";
         let rows = parse_to_rows(src);
-        let table = rows[0].table.as_ref().expect("应为表格行");
+        let table = rows[0].table().expect("应为表格行");
         assert_eq!(rows.len(), 2, "表格折叠成 1 行 + 末尾空行");
         assert_eq!(table.header.len(), 2);
         assert_eq!(table.header[0].as_ref(), "型号");
@@ -584,7 +686,7 @@ mod tests {
     fn table_supports_no_outer_pipes_and_escaped_pipe() {
         let src = "a | b\n--- | ---\n1 | x\\|y\n";
         let rows = parse_to_rows(src);
-        let table = rows[0].table.as_ref().expect("应为表格行");
+        let table = rows[0].table().expect("应为表格行");
         assert_eq!(table.header[0].as_ref(), "a");
         assert_eq!(table.rows[0][1].as_ref(), "x|y", "\\| 应解义为字面竖线");
     }
@@ -624,7 +726,7 @@ mod tests {
         let img = rows.iter().find(|r| r.kind == RowKind::Image).expect("应有图片行");
         assert_eq!(img.text.as_ref(), "插图", "图片行文本应为 alt");
         assert_eq!(
-            img.src.as_ref().map(|s| s.as_ref()),
+            img.image().map(|i| i.src.as_ref()),
             Some("images/a.jpeg"),
             "图片行 src 应保留"
         );
@@ -632,5 +734,128 @@ mod tests {
         let src2 = "文字 ![内嵌](x.png) 尾部\n";
         let rows2 = parse_to_rows(src2);
         assert_eq!(rows2[0].kind, RowKind::Paragraph, "行内图片不作独立图片行");
+    }
+
+    /// 基准：解析结果的驻留内存放大倍数（打印，不构成断言；`--ignored` 运行）。
+    ///
+    /// 运行：`cargo test --release -- --ignored bench_row_parse_memory --nocapture`
+    /// 真实小文档（SKILL 风格）+ 接近 `PREVIEW_MAX_DOC_LINES` 的大文档各测一遍，
+    /// 直观看出「解析成 Row 把源码放大了多少倍」。
+    /// 当前进程**私有字节**（`GetProcessMemoryInfo` 的 `PrivateUsage`），
+    /// 直接反映本进程堆上被该次解析真正占住的内存（含分配器锯齿/碎片）。
+    /// Windows 上用 Win32 API 读取；非 Windows 无法取数返回 0（基准仅内网 Windows 用）。
+    #[cfg(windows)]
+    fn process_private_bytes() -> usize {
+        #[repr(C)]
+        struct ProcessMemoryCounters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_nonpaged_pool_usage: usize,
+            quota_nonpaged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+            private_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                counters: *mut ProcessMemoryCounters,
+                size: u32,
+            ) -> i32;
+        }
+        unsafe {
+            let mut m: ProcessMemoryCounters = std::mem::zeroed();
+            m.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m, m.cb) != 0 {
+                m.private_usage
+            } else {
+                0
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn process_private_bytes() -> usize {
+        0
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_row_parse_memory() {
+        use std::time::Instant;
+
+        // 项目 target 目录下的真实 SKILL 文档（与本讨论同款，143 行小文档）；
+        // 以及 16 万行大文档（超过 PREVIEW_MAX_DOC_LINES=20000 自动预览拦截线）。
+        // 跑 --ignored 且文件存在才打印，避免路径依赖。
+        let mut cases: Vec<(String, String)> = Vec::new();
+        for name in ["SKILL.md", "SKILL.txt", "大文档测试.md", "大文档测试.txt"] {
+            if let Ok(s) = std::fs::read_to_string(format!("target/{name}")) {
+                cases.push((format!("target/{name}"), s));
+            }
+        }
+        // 自动扫描 target/benchdata/*.md（生成脚本同目录即可自动纳入对比）
+        if let Ok(dir) = std::fs::read_dir("target/benchdata") {
+            let mut paths: Vec<_> = dir
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
+                .collect();
+            paths.sort();
+            for p in paths {
+                if let Ok(s) = std::fs::read_to_string(&p) {
+                    cases.push((format!("{}", p.display()), s));
+                }
+            }
+        }
+
+        // 大文档：标题/段落/列表/表格/代码围栏混合 ≈ 1.4 万行，贴近自动预览上限
+        let block = "# 章节标题\n\n正文段落，包含 `行内代码` 与 **加粗** 和 [链接](https://x.y)。\n\n- 列表项一\n- 列表项二\n\n| 列A | 列B |\n| --- | --- |\n| 值1 | 值2 |\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n";
+        let mut big = String::with_capacity(block.len() * 700);
+        for _ in 0..700 {
+            big.push_str(block);
+        }
+        cases.push(("合成大文档（≈1.4 万行）".to_string(), big));
+
+        use std::mem::size_of;
+        println!(
+            "Row={}B | RowKind={}B RunKind={}B SharedString={}B Vec<SharedString>={}B (Range,RunKind)={}B TableData={}B Option<TableData>={}B Option<Box<TableData>>={}B Option<SharedString>={}B Option<Arc<Image>>={}B Option<u32>={}B",
+            size_of::<Row>(),
+            size_of::<RowKind>(),
+            size_of::<RunKind>(),
+            size_of::<SharedString>(),
+            size_of::<Vec<SharedString>>(),
+            size_of::<(Range<usize>, RunKind)>(),
+            size_of::<TableData>(),
+            size_of::<Option<TableData>>(),
+            size_of::<Option<Box<TableData>>>(),
+            size_of::<Option<SharedString>>(),
+            size_of::<Option<std::sync::Arc<Image>>>(),
+            size_of::<Option<u32>>(),
+        );
+
+        for (name, src) in &cases {
+            let t = Instant::now();
+            let before = process_private_bytes();
+            let rows = parse_to_rows(src);
+            let after = process_private_bytes();
+            let (n, bytes) = rows_memory_estimate(&rows);
+            let bytes = bytes.max(1);
+            let delta_kb = after.saturating_sub(before) / 1024;
+            println!(
+                "{name}: 源 {} B / {} 行 → {} 渲染行, 估算驻留 {} KB (= 源×{:.1}), 进程私有字节增量 {} KB, Row {} B, 解析 {} ms",
+                src.len(),
+                src.lines().count(),
+                n,
+                bytes / 1024,
+                bytes as f64 / src.len().max(1) as f64,
+                delta_kb,
+                std::mem::size_of::<Row>(),
+                t.elapsed().as_millis(),
+            );
+        }
     }
 }

@@ -37,7 +37,7 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
-use crate::markdown::parser::{parse_to_rows, Row, RowKind};
+use crate::markdown::parser::{parse_to_rows, rows_memory_estimate, Row, RowKind};
 
 use dimensions::{est_row_width, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX, IMAGE_ROW_DEFAULT_H};
 use row::render_row;
@@ -276,34 +276,45 @@ impl MarkdownPreview {
             if r.kind != RowKind::Image {
                 continue;
             }
-            if let Some(s) = r.src.take() {
-                // 内存图片（EPUB/PDF 虚拟 src）：直接查注册表挂载字节（不落盘、不读文件）
-                if let Some(img) = self.memory_images.get(s.as_ref()) {
-                    if let Some((w, h)) = image_dimensions_bytes(&img.bytes) {
-                        r.img_w = Some(w);
-                        r.img_h = Some(h);
-                    }
-                    r.img_data = Some(img.clone());
-                    r.src = Some(s.into());
-                    continue;
+            let Some(p) = r.payload.as_mut() else {
+                continue;
+            };
+            let crate::markdown::parser::RowPayload::Image {
+                src,
+                img_w,
+                img_h,
+                img_data,
+            } = p.as_mut()
+            else {
+                continue;
+            };
+            let s = src.clone();
+            // 内存图片（EPUB/PDF 虚拟 src）：直接查注册表挂载字节（不落盘、不读文件）
+            if let Some(img) = self.memory_images.get(s.as_ref()) {
+                if let Some((w, h)) = image_dimensions_bytes(&img.bytes) {
+                    *img_w = Some(w);
+                    *img_h = Some(h);
                 }
-                let resolved = if let Some(base) = &base {
-                    Self::resolve_image_src(base, &s)
-                } else {
-                    s.to_string()
-                };
-                // 本地文件 → 读固有尺寸（保持比例显示；URL/不可读时保持 None）
-                if !resolved.starts_with("http://")
-                    && !resolved.starts_with("https://")
-                    && !resolved.starts_with("file://")
-                {
-                    if let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
-                        r.img_w = Some(w);
-                        r.img_h = Some(h);
-                    }
-                }
-                r.src = Some(resolved.into());
+                *img_data = Some(img.clone());
+                *src = s;
+                continue;
             }
+            let resolved = if let Some(base) = &base {
+                Self::resolve_image_src(base, &s)
+            } else {
+                s.to_string()
+            };
+            // 本地文件 → 读固有尺寸（保持比例显示；URL/不可读时保持 None）
+            if !resolved.starts_with("http://")
+                && !resolved.starts_with("https://")
+                && !resolved.starts_with("file://")
+            {
+                if let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
+                    *img_w = Some(w);
+                    *img_h = Some(h);
+                }
+            }
+            *src = resolved.into();
         }
         // `parse_to_rows` 已返回 `Vec<Row>`。直接整块存进 `Rc` 即可：相比「每个
         // Row 各自 `Rc::new` 堆分配」再装进 `Vec<Rc<Row>>`，省掉每行一个 Rc 头 +
@@ -334,6 +345,16 @@ impl MarkdownPreview {
             .map(|(ix, _)| (ix, ScrollHandle::new()))
             .collect();
         self.rows = Rc::new(rows);
+        if std::env::var_os("MD_MEM_DEBUG").is_some() {
+            let (n, bytes) = rows_memory_estimate(&self.rows);
+            eprintln!(
+                "[MD_MEM_DEBUG] preview set_source: 源 {} B / {} 行 → {} 渲染行, 估算驻留 {} KB",
+                src.len(),
+                src.lines().count(),
+                n,
+                bytes / 1024,
+            );
+        }
         self.remeasure_dimensions(cx);
         // 行高估算依赖视口宽度，换源后强制按新宽度重算（render 里执行）。
         self.invalidate_height_hint();
@@ -352,6 +373,12 @@ impl MarkdownPreview {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();
         }
+    }
+
+    /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
+    /// 供运行时诊断（`MD_MEM_DEBUG=1`）输出，判断解析放大了多少倍。
+    pub fn memory_estimate(&self) -> (usize, usize) {
+        rows_memory_estimate(&self.rows)
     }
 
     /// 释放预览重资源（解析出的行数据 + 列表测量缓存），关闭预览时调用。
@@ -395,11 +422,11 @@ impl MarkdownPreview {
                 RowKind::Blank => p.blank_h.as_f32(),
                 RowKind::Rule => p.rule_h.as_f32(),
                 RowKind::Code => {
-                    (r.code_lines.len().max(1) as f32 + 2.0) * p.code_line.as_f32()
+                    (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
                 }
                 RowKind::Table => {
                     let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-                    (1.0 + r.table.as_ref().map_or(0, |t| t.rows.len()) as f32) * row_h
+                    (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
                         + 2.0
                         + 8.0
                 }

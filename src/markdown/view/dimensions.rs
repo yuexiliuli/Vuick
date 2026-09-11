@@ -117,7 +117,7 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
         RowKind::Code => {
             // 等宽字体按 0.65em/字符 + 内部 padding（pl_3 + pr_3 = 24px）+ 外层内缩（px_3 = 24px）
             let widest = row
-                .code_lines
+                .code_lines()
                 .iter()
                 .map(|l| l.chars().count() as f32)
                 .fold(0.0f32, f32::max);
@@ -139,8 +139,7 @@ pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
         }
         RowKind::Paragraph => est_text_width(&row.text, p.para_size.as_f32()),
         RowKind::Table => row
-            .table
-            .as_ref()
+            .table()
             .map(|t| table_column_widths(t, p).iter().sum())
             .unwrap_or(0.0)
             // 渲染时外层 px_3 内缩（左右共 24px）

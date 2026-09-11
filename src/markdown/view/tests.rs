@@ -383,7 +383,7 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             .rows
             .iter()
             .filter(|r| r.kind == RowKind::Image)
-            .map(|r| r.src.clone().map(|s| s.to_string()))
+            .map(|r| r.image().map(|i| i.src.to_string()))
             .collect::<Vec<_>>()
     });
     assert_eq!(srcs.len(), 3, "应解析出 3 张图片行，实际={srcs:?}");
@@ -414,7 +414,10 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             .rows
             .iter()
             .filter(|r| r.kind == RowKind::Image)
-            .map(|r| (r.img_w, r.img_h))
+            .map(|r| {
+                let i = r.image();
+                (i.map_or(None, |i| i.img_w), i.map_or(None, |i| i.img_h))
+            })
             .collect::<Vec<_>>()
     });
     assert_eq!(dims[0], (Some(565), Some(724)), "wuling.png 尺寸期望 565x724，实际={:?}", dims[0]);
@@ -563,7 +566,11 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
         let img_rows: Vec<_> = md.rows.iter().filter(|r| r.kind == RowKind::Image).collect();
         assert_eq!(img_rows.len(), 1, "应有 1 个图片行");
         let r = img_rows[0];
-        (r.img_data.is_some(), r.img_w.is_some() && r.img_h.is_some())
+        let i = r.image();
+        (
+            i.map_or(false, |i| i.img_data.is_some()),
+            i.map_or(false, |i| i.img_w.is_some() && i.img_h.is_some()),
+        )
     });
     assert!(has_data, "EPUB 内存图片应挂到图片行(img_data)");
     assert!(dims_ok, "内存图片应解析出固有尺寸");

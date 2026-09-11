@@ -410,7 +410,7 @@ pub(crate) fn render_row(
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
     // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
     if let RowKind::Table = row.kind {
-        let table = row.table.as_ref().expect("Table 行必须携带表格结构");
+        let table = row.table().expect("Table 行必须携带表格结构");
         // 换行模式（默认，预览视口不横向撑宽）：表格自带横向滚动容器 + Always 滚动条，
         // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
         // 非换行模式仍交外层 md-harea 统一横向滚动。
@@ -469,11 +469,12 @@ pub(crate) fn render_row(
     // 宽不超过 IMAGE_MAX_W；未知尺寸（URL/不可读）回退固定 IMAGE_ROW_DEFAULT_H。
     // src 为空/加载失败时显示 alt 作为 fallback。
     if let RowKind::Image = row.kind {
-        let src = row.src.clone().unwrap_or_default().to_string();
+        let info = row.image();
+        let src = info.map(|i| i.src.to_string()).unwrap_or_default();
         let alt = row.text.clone();
         let fallback_color = p.muted_fg;
 
-        let img_el = match row.img_data.clone() {
+        let img_el = match info.and_then(|i| i.img_data.cloned()) {
             // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
             Some(image) => img(gpui::ImageSource::Image(image))
                 .object_fit(ObjectFit::Contain)
@@ -527,9 +528,10 @@ pub(crate) fn render_row(
         // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
         //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
         // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
-        let img_w = row.img_w;
-        let img_h = row.img_h;
-        let box_ = match (img_w, img_h) {
+        let (img_w, img_h) = match row.image() {
+            Some(i) => (i.img_w, i.img_h),
+            None => (None, None),
+        };        let box_ = match (img_w, img_h) {
             (Some(w), Some(h)) if w > 0 && h > 0 => div()
                 .w_full()
                 .max_w(px(IMAGE_MAX_W))
@@ -560,7 +562,7 @@ pub(crate) fn render_row(
         // 该块按内容宽撑开（content_w 计入最宽代码行 → 外层 md-harea 统一横向滚动，
         // 底部单一横向滚动条可拖动）；正文仍限制在视口宽内折行。
         if row.kind == RowKind::Code {
-            let lines = row.code_lines.clone();
+            let lines = row.code_lines().to_vec();
             let p_ = p.clone();
             let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             let h = code_handle.unwrap_or_else(ScrollHandle::new);
@@ -711,7 +713,7 @@ pub(crate) fn render_row(
             // 代码块：整栏折叠为一行的所有代码行按 h(code_line) 纵向堆叠成连续块，
             // 上下各补一行空白带（同背景），使背景在首/末行之外多出一行呼吸空间。
             // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体。超宽由外层横向滚动。
-            let lines = row.code_lines.clone();
+            let lines = row.code_lines().to_vec();
             let p_ = p.clone();
             let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
             div()

@@ -83,6 +83,7 @@ impl EditorApp {
         let lang = Self::language_id(p);
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
+        let src_len = text.len();
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
         // 超大纲文档：跳过预览整篇解析（一行一条 Row ≈ 30MB+/150k 行）。
@@ -116,6 +117,23 @@ impl EditorApp {
         tab.cursor_row = 0;
         tab.cursor_col = 0;
         tab.dirty = false;
+        // 运行时内存诊断：`MD_MEM_DEBUG=1 cargo run` 打开文件时输出各份文本副本与
+        // 预览解析驻留（定位“同样内容，.md 比 .txt 内存高”到底高在哪）。
+        if std::env::var_os("MD_MEM_DEBUG").is_some() {
+            let content_len = tab.content.len();
+            let editor_len = tab.editor.read(cx).value().len();
+            let (rows, preview_bytes) = tab.md_preview.read(cx).memory_estimate();
+            eprintln!(
+                "[MD_MEM_DEBUG] 打开 {:?}: 源文件 {} B / {} 行 / {} 字符 → 副本 content={} B + editor={} B + 预览 {rows} 行≈{} KB",
+                p.file_name(),
+                src_len,
+                lines,
+                chars,
+                content_len,
+                editor_len,
+                preview_bytes / 1024,
+            );
+        }
         if is_md && !preview_skipped {
             tab.preview_on = true;
         }
