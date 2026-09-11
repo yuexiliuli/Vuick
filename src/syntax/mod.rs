@@ -465,7 +465,13 @@ pub(crate) type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
 /// 解析整个代码块文本，返回每行的语义名 run（整块一次解析，
 /// 多行注释 / 字符串 / 跨行语法上下文能正确配色，预览不会“逐行独立”地错色）。
 /// `language` 无标记或未知 → 返回 `None`（按纯文本渲染，不产出高亮）。
+///
+/// TOML 不在 syntect 内置语法集里（syntect 5.3 的 default_newlines 无 TOML），
+/// 走内置的轻量扫描器 [`toml_code_runs`]（与 GitHub 配色同一套语义名）。
 pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRuns> {
+    if normalize_language(language).eq_ignore_ascii_case("toml") {
+        return Some(toml_code_runs(code));
+    }
     let syntax = find_syntax(language)?;
     let line_starts = build_line_starts(code);
     let line_count = line_starts.len();
@@ -501,6 +507,314 @@ pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRun
         out.push(runs);
     }
     Some(out)
+}
+
+/// TOML 字符串类型：basic `"..."` / literal `'...'` 与其三引号多行变体。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlStr {
+    Basic,
+    Literal,
+    Basic3,
+    Literal3,
+}
+
+impl TomlStr {
+    /// 该字符串的行内定界符（单行 = 1 个引号，多行 = 3 个引号）。
+    fn delim(&self) -> char {
+        match self {
+            TomlStr::Basic | TomlStr::Basic3 => '"',
+            TomlStr::Literal | TomlStr::Literal3 => '\'',
+        }
+    }
+    fn multiline(&self) -> bool {
+        matches!(self, TomlStr::Basic3 | TomlStr::Literal3)
+    }
+    /// 多行字符串允许换行。
+    fn is_literal(&self) -> bool {
+        matches!(self, TomlStr::Literal | TomlStr::Literal3)
+    }
+}
+
+/// 轻量 TOML 语法扫描器（syntect 内置语法集没有 TOML，这里手写一个按行扫描的
+/// 语义分类器）。复用与 syntect 相同的语义名（comment/string/number/boolean/
+/// property/function/operator…），因此直接接入 GitHub 明/暗配色。
+///
+/// 覆盖：`#` 注释、单/三引号字符串（支持跨行）、数值、布尔、裸/点分/引号键、
+/// 表头 `[table]`、`=` 赋值。字符串内部查重、整体一次解析，跨行字符串不错位。
+fn toml_code_runs(code: &str) -> CodeLineRuns {
+    let line_starts = build_line_starts(code);
+    let line_count = line_starts.len();
+    let mut out = Vec::with_capacity(line_count);
+    // 跨行字符串状态（None = 不在字符串内）；字符串跨行时在下一行从行首继续。
+    let mut state: Option<TomlStr> = None;
+    for li in 0..line_count {
+        let line_end = if li + 1 < line_count {
+            line_starts[li + 1]
+        } else {
+            code.len()
+        };
+        let line = &code[line_starts[li]..line_end];
+        let (runs, next) = scan_toml_line(line, state);
+        state = next;
+        out.push(runs);
+    }
+    out
+}
+
+/// 扫描一行 TOML，返回该行的语义名 run 与退出时的跨行字符串状态。
+/// `incoming`：进入本行时未闭合的字符串（在上一行已开始，本行从 0 处继续）。
+fn scan_toml_line(line: &str, incoming: Option<TomlStr>) -> (Vec<(Range<usize>, &'static str)>, Option<TomlStr>) {
+    let mut runs: Vec<(Range<usize>, &'static str)> = Vec::new();
+    let mut i = 0usize;
+    // 可见文本长度（去掉结尾换行/回车，避免把 '\n' 算进着色区间）
+    let vis = line.trim_end_matches(['\n', '\r']).len();
+    // 当前行内正在进行的字符串：Some((类型, 起始字节))（incoming → 从 0 继续）
+    let mut cur: Option<(TomlStr, usize)> = incoming.map(|s| (s, 0));
+
+    // —— section header：`[table]` / `[[array-of-tables]]` 整段染「function」色 ——
+    // 判据：行首（可带缩进）为 `[`，首 `[` 到末 `]` 之间没有 `=`（避免把
+    // `key = [1, 2]` 这类行误判成表头）。
+    {
+        let head = line.trim_start();
+        if head.starts_with('[') {
+            let open = line.len() - head.len();
+            if let Some(rel) = head.rfind(']') {
+                let close = open + rel;
+                if !line[open + 1..close].contains('=') {
+                    runs.push((open..close + 1, "function"));
+                    i = close + 1;
+                }
+            }
+        }
+    }
+
+    while i < line.len() {
+        if let Some((kind, start)) = cur {
+            // —— 处于字符串内：找闭合定界符 ——
+            // 跨行续接时从行首(0)搜；本行新开时从开引号之后(i)搜。
+            let search_from = if start == 0 && incoming.is_some() { 0 } else { i };
+            match find_string_close(line, search_from, kind) {
+                Some(close) => {
+                    // 闭合 → 整段字符串；basic 型内的转义另拆成 string.escape
+                    push_run(&mut runs, start, close, vis, "string");
+                    if !kind.is_literal() {
+                        escape_runs(line, start, close, &mut runs);
+                    }
+                    cur = None;
+                    i = close;
+                }
+                None => {
+                    // 未闭合 → 延续到本行末；着可见部分并保持跨行状态
+                    push_run(&mut runs, start, vis, vis, "string");
+                    if !kind.is_literal() {
+                        escape_runs(line, start, vis, &mut runs);
+                    }
+                    i = line.len();
+                }
+            }
+            continue;
+        }
+
+        let ch = line[i..].chars().next().expect("i < line.len()");
+        match ch {
+            '#' => {
+                // 注释到行尾
+                push_run(&mut runs, i, vis, vis, "comment");
+                break;
+            }
+            '"' | '\'' => {
+                // 字符串开头（含三引号检测）
+                let (kind, next) = detect_string_kind(line, i);
+                let start = i;
+                cur = Some((kind, start));
+                i = next;
+            }
+            '=' => {
+                push_run(&mut runs, i, i + 1, vis, "operator");
+                i += 1;
+            }
+            c if c.is_ascii_digit()
+                || ((c == '+' || c == '-')
+                    && line[i + c.len_utf8()..].chars().next().is_some_and(|n| n.is_ascii_digit())) =>
+            {
+                // 数值
+                let (s, e) = scan_number(line, i, vis);
+                push_run(&mut runs, s, e, vis, "number");
+                i = e;
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                // 标识符：布尔 / 键（后跟 `=` 的为 property）/ 其它（constant）
+                let (s, e) = scan_word(line, i, vis);
+                let word = &line[s..e];
+                let name = if word == "true" || word == "false" {
+                    "boolean"
+                } else if lookahead_is_key(line, e, vis) {
+                    "property"
+                } else {
+                    "constant"
+                };
+                push_run(&mut runs, s, e, vis, name);
+                i = e;
+            }
+            _ => i += ch.len_utf8(), // 括号/逗号/点号等结构符不着色
+        }
+    }
+
+    // 行尾仍开着字符串 → 跨行状态交给下一行（含空行续接多行字符串的情况）
+    let outgoing = cur.map(|(kind, _)| kind);
+    (runs, outgoing)
+}
+
+/// 压入着色 run（裁剪到可见区间 [0, vis]；空区间忽略）。
+fn push_run(
+    runs: &mut Vec<(Range<usize>, &'static str)>,
+    s: usize,
+    e: usize,
+    vis: usize,
+    name: &'static str,
+) {
+    let s = s.min(vis);
+    let e = e.min(vis);
+    if s < e {
+        runs.push((s..e, name));
+    }
+}
+
+/// 检测字符串开头：返回（类型，开引号之后的续位）。
+fn detect_string_kind(line: &str, i: usize) -> (TomlStr, usize) {
+    let ch = line[i..].chars().next().expect("ch");
+    let triple = {
+        let mut s = String::with_capacity(3);
+        s.push(ch);
+        s.push(ch);
+        s.push(ch);
+        s
+    };
+    let is_triple = line[i..].starts_with(&triple);
+    match (ch, is_triple) {
+        ('"', true) => (TomlStr::Basic3, i + 3),
+        ('"', false) => (TomlStr::Basic, i + 1),
+        ('\'', true) => (TomlStr::Literal3, i + 3),
+        ('\'', false) => (TomlStr::Literal, i + 1),
+        _ => unreachable!(),
+    }
+}
+
+/// 从 `from` 起查找字符串闭合定界符（不含 from 处本身）。
+/// - 单行：下一个（未转义的）同引号
+/// - 三引号多行：下一组三个同引号（跨行搜索，含本行）
+fn find_string_close(line: &str, from: usize, kind: TomlStr) -> Option<usize> {
+    let q = kind.delim();
+    if kind.multiline() {
+        let slice = &line[from..];
+        let pat = format!("{q}{q}{q}");
+        let offset = slice.find(&pat)?;
+        let idx = from + offset;
+        // 跳过 `""""`（= 内容中的转义引号 + 闭合），取真正的三引号闭界
+        // 简单起见：找到的 `"""` 即闭合（极少边界情况忽略）
+        return Some(idx + 3);
+    }
+    // 单行：basic 型跳过 `\x`，literal 型无转义直接找
+    if kind.is_literal() {
+        return line[from..].find(q).map(|o| from + o + 1);
+    }
+    // basic 单行：`\"` 为转义，不入匹配
+    let bytes = line.as_bytes();
+    let mut pos = from;
+    while pos < line.len() {
+        let b = bytes[pos];
+        if b == b'\\' && pos + 1 < line.len() {
+            pos += 2;
+            continue;
+        }
+        if b == b'"' {
+            return Some(pos + 1);
+        }
+        pos += 1;
+    }
+    None
+}
+
+/// 把 `[start,end)` 内 basic 型字符串的 `\x` 转义切成 string.escape run。
+fn escape_runs(
+    line: &str,
+    start: usize,
+    end: usize,
+    runs: &mut Vec<(Range<usize>, &'static str)>,
+) {
+    let bytes = line.as_bytes();
+    let mut pos = start;
+    while pos + 1 < end {
+        if bytes[pos] == b'\\' {
+            let esc_end = (pos + 2).min(end);
+            runs.push((pos..esc_end, "string.escape"));
+            pos = esc_end;
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+/// 扫描数值 token：数字开头（或 ± 后跟数字）。吃进 [0-9A-Fa-fxob_+.eE]，外加 ±。
+fn scan_number(line: &str, start: usize, vis: usize) -> (usize, usize) {
+    let mut e = start;
+    while e < vis {
+        let c = line[e..].chars().next().unwrap();
+        let c = c as u8; // 数值/符号均为 ASCII
+        if c.is_ascii_hexdigit() || b"_+.eExob".contains(&c) {
+            e += 1;
+        } else {
+            break;
+        }
+    }
+    (start, e)
+}
+
+/// 扫描标识符 token：`[A-Za-z0-9_-]+` 或引号包裹的键。返回（起, 止）。
+fn scan_word(line: &str, start: usize, vis: usize) -> (usize, usize) {
+    let mut e = start;
+    while e < vis {
+        let c = line[e..].chars().next().unwrap();
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            e += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (start, e)
+}
+
+/// 向前窥探：跳过空格 / 点 / 更多的键段，若在遇到换行 / `,` / `]` / `}` 之前
+/// 命中 `=` → 说明当前词是（点分）键 → true。
+fn lookahead_is_key(line: &str, mut k: usize, vis: usize) -> bool {
+    while k < vis {
+        let ch = line[k..].chars().next().unwrap();
+        match ch {
+            c if c.is_whitespace() => k += c.len_utf8(),
+            '.' => k += 1,
+            '"' | '\'' => {
+                // 引号键段：跳到同引号闭合之后
+                let q = ch;
+                match line[k + 1..].find(q) {
+                    Some(off) => k += 1 + off + 1,
+                    None => return false,
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == '_' || c == '-' => {
+                while k < vis {
+                    let c2 = line[k..].chars().next().unwrap();
+                    if c2.is_ascii_alphanumeric() || c2 == '_' || c2 == '-' {
+                        k += c2.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            '=' => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// 把某一行的语义名 run 解析成**覆盖整行、无缝隙**的 `HighlightStyle` run。
@@ -824,6 +1138,41 @@ mod tests {
             assert_eq!(cursor, line.len(), "行 {li} 应覆盖整行");
         }
         assert!(total_colored > 0, "整块至少有颜色 run");
+    }
+
+    /// TOML 不在 syntect 内置语法集，走内置轻量扫描器：注释/表头/键/字符串/
+    /// 数值/布尔/转义/跨行三引号字符串都能正确分类。
+    #[test]
+    fn preview_toml_code_block_highlight() {
+        let code = "# 顶部注释\n[server]\nhost = \"127.0.0.1\"  # 行内注释\nport = 8080\ndebug = true\nesc = \"a\\nb\"\nname = 'literal'\n[server.deps]\nfeatures = [\"x\", 'y']\n";
+        let runs = parse_code_lines("toml", code).expect("toml 应产出高亮");
+        assert_eq!(runs.len(), 10, "9 内容行 + 末尾换行的空行槽位，每行一条");
+        let names: Vec<Vec<&str>> = runs
+            .iter()
+            .map(|l| l.iter().map(|(_, n)| *n).collect())
+            .collect();
+        let flat: Vec<&str> = names.iter().flatten().copied().collect();
+        for want in ["comment", "function", "property", "string", "number", "boolean", "string.escape", "operator"] {
+            assert!(
+                flat.contains(&want),
+                "toml 应含有 {want} 高亮，实际 names={flat:?}"
+            );
+        }
+        // 表头 `[server]` 整段为 function；键 `host` 为 property
+        assert!(names[1].contains(&"function"), "表头行应是 function: {:?}", names[1]);
+        assert!(names[2].contains(&"property"), "键行应是 property: {:?}", names[2]);
+        assert!(names[2].contains(&"comment"), "行内注释应识别: {:?}", names[2]);
+
+        // 跨行三引号基本字符串：整段连续着色为 string（状态跨行）
+        let multi = "s = \"\"\"\n第一行\n第二行\"\"\"\n";
+        let runs = parse_code_lines("toml", multi).unwrap();
+        assert_eq!(runs.len(), 4, "3 内容行 + 末尾换行的空行槽位");
+        let flat: Vec<&str> = runs.iter().flat_map(|l| l.iter().map(|(_, n)| *n)).collect();
+        let strings = flat.iter().filter(|n| **n == "string").count();
+        assert!(
+            strings >= 3,
+            "三引号字符串内容跨行应全部着色为 string: {flat:?}"
+        );
     }
 
     /// 基准：窗口解析代价与文档总量无关（打印、不构成断言；`--ignored` 运行）。
