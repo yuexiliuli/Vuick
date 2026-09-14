@@ -33,6 +33,8 @@ pub struct TableScrollState {
     pub handle: ScrollHandle,
     /// `Some(px)` = 正在拖拽，值为"指针相对滑块中心"的水平偏移
     pub drag: Rc<RefCell<Option<Pixels>>>,
+    /// 滚动条是否应显示（自动隐藏：滚动/拖拽时置真，停止滚动后由调用方定时隐藏）。
+    pub visible: Rc<RefCell<bool>>,
 }
 
 impl TableScrollState {
@@ -40,6 +42,7 @@ impl TableScrollState {
         Self {
             handle: ScrollHandle::new(),
             drag: Rc::new(RefCell::new(None)),
+            visible: Rc::new(RefCell::new(false)),
         }
     }
 }
@@ -89,12 +92,15 @@ fn set_thumb_from_center(
 ///
 /// - 内容没超宽时不绘制；
 /// - 点击/拖动均可滑到对应位置（拖动用 `state.drag` 跨帧记录抓取点）。
+/// - 只画滑块、不画整条轨道：选项卡栏底边与编辑区交界处不要出现
+///   “淡淡的灰色条状”（全宽半透明轨道），只用短滑块指示可滚/进度。
 pub fn horizontal_scrollbar(
     state: &TableScrollState,
     id: impl Into<ElementId>,
 ) -> impl IntoElement {
     let handle = state.handle.clone();
     let drag = state.drag.clone();
+    let visible = state.visible.clone();
 
     let mut el = div()
         .id(id)
@@ -104,35 +110,27 @@ pub fn horizontal_scrollbar(
         .w_full()
         .cursor(CursorStyle::PointingHand);
 
-    if let Some((bar_w, thumb_w, thumb_x, _)) = hscroll_geometry(&handle) {
-        el = el
-            .child(
-                div()
-                    .absolute()
-                    .left(GAP_RIGHT)
-                    .top(px(0.))
-                    .w(bar_w)
-                    .h(px(2.))
-                    .rounded(px(1.))
-                    .bg(rgba(0x93a0aa14)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(thumb_x)
-                    .top(px(0.))
-                    .w(thumb_w)
-                    .h(px(2.))
-                    .rounded(px(1.))
-                    .bg(rgba(0x64748b4a)),
-            );
+    if let Some((_bar_w, thumb_w, thumb_x, _)) = hscroll_geometry(&handle) {
+        el = el.child(
+            div()
+                .absolute()
+                .left(thumb_x)
+                .top(px(0.))
+                .w(thumb_w)
+                .h(px(2.))
+                .rounded(px(1.))
+                .bg(rgba(0x64748b4a)),
+        );
     }
 
     el = el
         .on_mouse_down(MouseButton::Left, {
             let handle = handle.clone();
             let drag = drag.clone();
+            let visible = visible.clone();
             move |ev, window, _cx| {
+                // 抓取滑块即视为“正在滚动”→ 保持滚动条可见（自动隐藏计时由调用方重启）
+                *visible.borrow_mut() = true;
                 let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
                     return;
                 };

@@ -102,6 +102,8 @@ pub struct EditorApp {
     active_tab: usize,
     /// 选项卡栏横向滚动状态（标签过多时横向滚动 + 滚动条）
     tab_bar_hscroll: TableScrollState,
+    /// 自动隐藏定时器的代序号：只清除同代定时器，避免旧定时器误清新滚动。
+    tab_hscroll_seq: u64,
     /// 顶部状态文字与是否"正常"
     status: SharedString,
     status_ok: bool,
@@ -177,6 +179,7 @@ impl EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
             tab_bar_hscroll: TableScrollState::new(),
+            tab_hscroll_seq: 0,
             status: SharedString::from("就绪"),
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,

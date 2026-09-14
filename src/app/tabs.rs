@@ -4,6 +4,9 @@ use super::*;
 use crate::app::file_ops::PREVIEW_DEBOUNCE_MS;
 use crate::scrollbar::horizontal_scrollbar;
 
+/// 选项卡栏横向滚动条自动隐藏：停止滚动该时长（ms）后隐藏。
+const TAB_HSCROLL_HIDE_MS: u64 = 900;
+
 impl EditorApp {
     pub(super) fn make_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         let editor = cx.new(|cx| {
@@ -255,6 +258,27 @@ impl EditorApp {
         self.activate_tab(self.active_tab, window, cx);
     }
 
+    /// 标记“选项卡栏最近在滚动”：横向滚动条立即可见，并重启自动隐藏计时
+    /// （[`TAB_HSCROLL_HIDE_MS`] 后无新滚动则隐藏）。带代序号防旧定时器误清新滚动。
+    pub(super) fn poke_tab_hscroll(&mut self, cx: &mut Context<Self>) {
+        *self.tab_bar_hscroll.visible.borrow_mut() = true;
+        cx.notify();
+        self.tab_hscroll_seq = self.tab_hscroll_seq.wrapping_add(1);
+        let seq = self.tab_hscroll_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(TAB_HSCROLL_HIDE_MS))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if app.tab_hscroll_seq == seq {
+                    *app.tab_bar_hscroll.visible.borrow_mut() = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_tab;
         let (text_primary, text_minor, tab_active_bg, tab_active_border, chip_bg, chip_text, bar_bg, panel_bg) = (
@@ -452,16 +476,21 @@ impl EditorApp {
             right.push(eye);
         }
 
-        // 横向滚动条只在标签超宽时出现：半透明、贴着标签底部、浮在上方（不额外占高度）
+        // 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现；
+        // 半透明、贴着标签底部、浮在上方（不额外占高度）。
         let mut hscroll_overlay: Vec<gpui::AnyElement> = Vec::new();
-        if self.tab_bar_hscroll.handle.max_offset().x > px(0.) {
+        let hscroll_dragging = self.tab_bar_hscroll.drag.borrow().is_some();
+        if self.tab_bar_hscroll.handle.max_offset().x > px(0.)
+            && (*self.tab_bar_hscroll.visible.borrow() || hscroll_dragging)
+        {
             hscroll_overlay.push(
                 div()
                     .absolute()
+                    .debug_selector(|| "tab-bar-hscroll-overlay".into())
                     .left(px(0.))
                     .right(px(0.))
                     .bottom(px(0.))
-                    .h(px(0.))
+                    .h(px(3.))
                     .child(horizontal_scrollbar(
                         &self.tab_bar_hscroll,
                         "tab-bar-hscroll",
@@ -493,6 +522,7 @@ impl EditorApp {
                     .child(
                         div()
                             .id("tab-bar-tabs")
+                            .debug_selector(|| "tab-bar-tabs".into())
                             .w_full()
                             .h_full()
                             .flex()
@@ -501,6 +531,12 @@ impl EditorApp {
                             .gap_1()
                             .overflow_x_scroll()
                             .track_scroll(&self.tab_bar_hscroll.handle)
+                            // 滚动时点亮横向滚动条（自动隐藏计时由此重启）
+                            .on_scroll_wheel(cx.listener(
+                                |this: &mut EditorApp, _ev, _window, cx| {
+                                    this.poke_tab_hscroll(cx);
+                                },
+                            ))
                             .children(tabs),
                     )
                     .children(hscroll_overlay),
