@@ -1579,6 +1579,111 @@
         let _ = std::fs::remove_file(&p);
     }
 
+    /// #4 回归：编辑同步的行/字数改用 Rope 的 O(1) 计数（每键不再物化全文），
+    /// 数值必须与旧 `str::lines()/chars()` 语义一致——在真实编辑（粘贴触发
+    /// `InputEvent::Change`）后与 `editor.value()` 的 str 推导值逐项比对。
+    #[gpui::test]
+    async fn editing_updates_line_char_counts_via_rope(cx: &mut TestAppContext) {
+        fn assert_counts(cx: &mut VisualTestContext, app: &gpui::Entity<EditorApp>, what: &str) {
+            let (lc, cc, expected_lc, expected_cc) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                let val = t.editor.read(cx).value();
+                (
+                    t.line_count,
+                    t.char_count,
+                    val.lines().count().max(1),
+                    val.chars().count(),
+                )
+            });
+            assert_eq!(lc, expected_lc, "{what}：行数应与 str::lines() 一致");
+            assert_eq!(cc, expected_cc, "{what}：字数应与 str::chars() 一致");
+        }
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-counts.txt");
+        std::fs::write(&p, "第一行\n第二行\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert_counts(cx, &app, "打开文件后");
+        // 真实编辑：粘贴触发 InputEvent::Change → 走新的 Rope O(1) 计数
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("第三行".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert_counts(cx, &app, "粘贴编辑后");
+        // 再粘贴带换行的内容，行数应增加且仍与 str 语义一致
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("A\nB".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert_counts(cx, &app, "粘贴多行后");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 基准：编辑大文档时「每键同步行/字数」的代价——旧逻辑每键物化全文 +
+    /// `lines()/chars()` 全量扫描（16 万行约产生 3 次 O(n) + 一次 6MB 副本，编辑卡顿主因），
+    /// 新逻辑走 Rope 的 O(1) 计数零物化。打印、不构成断言；`--ignored` 运行。
+    #[test]
+    #[ignore]
+    fn bench_edit_sync_counts_old_materialize_vs_rope() {
+        use gpui_component::input::{Rope, RopeExt};
+        use std::time::Instant;
+        let line = "普通段落内容 alpha beta 关键字 shanghai 你好\n";
+        let mut doc = String::with_capacity(line.len() * 160_000);
+        for _ in 0..160_000 {
+            doc.push_str(line);
+        }
+        let rope = Rope::from(doc.as_str());
+        let runs = 60usize;
+        // 旧：value() 物化（6MB 副本）+ lines().count() + chars().count()
+        let t0 = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..runs {
+            let v: gpui::SharedString = doc.clone().into();
+            let lc = v.lines().count().max(1);
+            let cc = v.chars().count();
+            sink = sink.wrapping_add(lc + cc);
+        }
+        let old = t0.elapsed();
+        // 新：Rope 的 O(1) 计数（len_chars / lines_len / byte），零物化
+        let t1 = Instant::now();
+        let mut sink2 = 0usize;
+        for _ in 0..runs {
+            let lines = rope.lines_len();
+            let lc = if rope.len() > 0 && rope.byte(rope.len() - 1) == b'\n' {
+                lines - 1
+            } else {
+                lines
+            };
+            let cc = rope.len_chars();
+            sink2 = sink2.wrapping_add(lc.max(1) + cc);
+        }
+        let new_ = t1.elapsed();
+        assert_eq!(sink, sink2, "新旧计数的结果必须一致");
+        println!(
+            "编辑每键行/字计数（{} 行 × {runs} 次）：旧(物化 6MB+lines+chars)={}ms, 新(Rope O(1))={}ms（提升 {:.1}x）",
+            160_000,
+            old.as_millis(),
+            new_.as_millis(),
+            old.as_secs_f64() / new_.as_secs_f64().max(1e-9),
+        );
+    }
+
     /// 基准：大文档预览同步里 `scan_blocks` 的代价（#4 把它从 UI 线程挪到后台）。
     /// 打印、不构成断言；`--ignored` 运行。
     #[test]

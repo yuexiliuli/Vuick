@@ -802,6 +802,69 @@ fn md_preview_block_extras_are_shared_rc_across_renders(cx: &mut TestAppContext)
     assert_eq!(count0, count1, "反复渲染后强引用计数不应增长（无每帧克隆泄漏）");
 }
 
+/// 回归：编辑大文档触发预览重同步（`set_source_with_index` **窗口级懒解析**路径）
+/// 重建 ListState 时，必须恢复到更新前的滚动位置——否则预览每次编辑都跳回开头。
+#[gpui::test]
+fn large_preview_keeps_scroll_across_source_replacement(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 构造超过 WINDOWED_MIN_BLOCKS 的文档 → 窗口级懒解析
+    let block = "# 章节标题\n\n正文段落内容 alpha\n- 列表项\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+    let mut src = String::new();
+    for _ in 0..700 {
+        src.push_str(block);
+    }
+    let index = std::rc::Rc::new(crate::markdown::scan_blocks(&src));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source_with_index(&src, index, cx));
+    });
+    cx.simulate_resize(size(px(500.), px(500.)));
+    settle(cx);
+    let n = cx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+    assert!(
+        n > crate::config::limits::WINDOWED_MIN_BLOCKS,
+        "应启用窗口级懒解析，块数 {n}"
+    );
+    // 先滚动到中部
+    let mid = n / 2;
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.scroll_to_row(mid);
+            cx.notify();
+        });
+    });
+    for _ in 0..8 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    cx.run_until_parked();
+    let before =
+        cx.update(|_, cx| host.read(cx).md.read(cx).list_state.logical_scroll_top().item_ix);
+    assert!(before > 0, "滚动应生效（before={before}，目标 mid={mid}）");
+
+    // 编辑后重设源（内容多一行 → 块数变化 → 走窗口模式 ListState 重建路径）
+    let src2 = format!("新增内容行\n{src}");
+    let index2 = std::rc::Rc::new(crate::markdown::scan_blocks(&src2));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source_with_index(&src2, index2, cx));
+    });
+    cx.simulate_resize(size(px(500.), px(500.)));
+    settle(cx);
+    let after =
+        cx.update(|_, cx| host.read(cx).md.read(cx).list_state.logical_scroll_top().item_ix);
+    assert!(
+        after >= before,
+        "源更新后预览不应跳回开头：before={before} after={after}"
+    );
+}
+
 /// 基准：代码块/表格句柄地图「每帧整张 HashMap 克隆 vs Rc 共享」的代价对比。
 /// 旧代码在 `render()` 里逐帧 `code_scroll/table_scroll/code_hl.clone()`（O(N) 深拷贝），
 /// 新逻辑克隆 `Rc`（O(1) 引用计数）。打印、不构成断言；`--ignored` 运行。

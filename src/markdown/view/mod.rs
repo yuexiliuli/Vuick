@@ -308,6 +308,9 @@ impl MarkdownPreview {
     pub fn set_source_with_index(&mut self, src: &str, index: Rc<BlockIndex>, cx: &mut App) {
         // 内容变了，旧的跳转高亮随之失效
         self.clear_highlight();
+        // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
+        // 都会重建 ListState 跳回开头）。
+        let prev_scroll = self.list_state.logical_scroll_top();
         let index = Rc::try_unwrap(index).unwrap_or_else(|rc| (*rc).clone());
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
             // ---- 大文档：窗口级懒解析 ----
@@ -324,6 +327,8 @@ impl MarkdownPreview {
             self.table_scroll = Default::default();
             self.list_state =
                 ListState::new(index.blocks.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
+            // 恢复到更新前的滚动位置（块号越界自动夹紧到文末）
+            self.list_state.scroll_to(prev_scroll);
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
@@ -397,6 +402,8 @@ impl MarkdownPreview {
             // 滚动条量程从一开始就接近真实总高，但只对可见行测量/排版（行级虚拟化）。
             self.list_state =
                 ListState::new(self.rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
+            // 行数变化只会重建列表：把滚动恢复到更新前的逻辑位置，避免跳回开头
+            self.list_state.scroll_to(prev_scroll);
         } else {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();

@@ -1,6 +1,7 @@
 //! tabs.
 
 use super::*;
+use gpui_component::input::RopeExt;
 use crate::config::timing::{PREVIEW_DEBOUNCE_MS, TAB_HSCROLL_HIDE_MS};
 use crate::scrollbar::horizontal_scrollbar;
 
@@ -28,9 +29,20 @@ impl EditorApp {
                 if let InputEvent::Change = ev {
                     // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）
                     this.search_scan = None;
-                    let (value, cursor_position) = {
+                    // 行/字数走 Rope 的 O(1) 计数，不再每键 `value()` 物化全文 +
+                    // `lines()/chars()` 全量扫描（16 万行文档每键三次 O(n)、一次 6MB
+                    // 副本——正是大文档编辑卡顿的主因）。行数保持旧 `str::lines()` 语义
+                    // （末尾换行不额外计一行），字数 = 字符数。
+                    let (line_count, char_count, cursor_position) = {
                         let state = tab.editor.read(cx);
-                        (state.value(), state.cursor_position())
+                        let text = state.text();
+                        let lines = text.lines_len();
+                        let lines = if text.len() > 0 && text.byte(text.len() - 1) == b'\n' {
+                            lines.saturating_sub(1)
+                        } else {
+                            lines
+                        };
+                        (lines.max(1), text.len_chars(), state.cursor_position())
                     };
                     // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖：
                     // 打字时不逐键整篇重解析+重建虚拟化列表，停止后片刻再同步。
@@ -75,26 +87,26 @@ impl EditorApp {
                                 .background_executor()
                                 .spawn(async move { crate::markdown::scan_blocks(&scan_src) })
                                 .await;
-                            // 3) UI 线程：仍是最新一代且正文未再变才装配（旧轮结果不覆盖）
+                            // 3) UI 线程：仍是最新一代才装配——scan_blocks 期间若有
+                            // 新编辑，必然已开启新一轮并把 `preview_seq` 推进，旧轮结果
+                            // 直接丢弃（内容必然已变；无需再 `value()` 比对，省一次
+                            // 6MB 物化）。
                             let _ = this.update(cx, |this, cx| {
                                 if this.preview_seq != seq {
                                     return;
                                 }
                                 if let Some(tab) = this.tabs.get_mut(this.active_tab) {
                                     if tab.preview_on {
-                                        let current = tab.editor.read(cx).value();
-                                        if current == snapshot {
-                                            tab.md_preview.update(cx, |view, cx| {
-                                                view.set_background(panel_bg);
-                                                view.set_base_dir(base_dir);
-                                                view.set_source_with_index(
-                                                    &snapshot,
-                                                    std::rc::Rc::new(index),
-                                                    cx,
-                                                );
-                                            });
-                                            cx.notify();
-                                        }
+                                        tab.md_preview.update(cx, |view, cx| {
+                                            view.set_background(panel_bg);
+                                            view.set_base_dir(base_dir);
+                                            view.set_source_with_index(
+                                                &snapshot,
+                                                std::rc::Rc::new(index),
+                                                cx,
+                                            );
+                                        });
+                                        cx.notify();
                                     }
                                 }
                             });
@@ -104,10 +116,11 @@ impl EditorApp {
                     // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
                     // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
                     if tab.readonly_preview {
-                        tab.content = value.clone();
+                        let content = tab.editor.read(cx).text().to_string();
+                        tab.content = SharedString::from(content);
                     }
-                    tab.line_count = value.lines().count().max(1);
-                    tab.char_count = value.chars().count();
+                    tab.line_count = line_count;
+                    tab.char_count = char_count;
                     tab.cursor_row = cursor_position.line as usize;
                     tab.cursor_col = cursor_position.character as usize;
                     if !tab.dirty {
