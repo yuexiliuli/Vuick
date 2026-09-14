@@ -600,6 +600,10 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
 pub struct BlockMeta {
     /// 该渲染行覆盖的源码起始行（0 基，与 [`parse_to_rows`] 产出的 `Row.src_line` 一致）。
     pub src_line: u32,
+    /// 块首行的**字节起始偏移**（原文坐标）：`parse_block_window` 直接用它切片到
+    /// 块边界；增量扫描用它做尾部对齐与锚点定位——替代过去整篇 `line_starts` 数组
+    /// （省内存，且增量扫描不再为建数组而全串扫一遍）。
+    pub byte: u32,
     /// 块类型（与 [`parse_to_rows`] 产出的 `Row.kind` 一致）。
     pub kind: RowKind,
     /// 块首行的原始字节长度（估算用；表格/代码块按 `aux` 计数）。
@@ -608,13 +612,11 @@ pub struct BlockMeta {
     pub aux: u32,
 }
 
-/// 整篇文档的轻量块索引（≈16B/行，160k 行 ≈ 2.6MB，而整篇 `Vec<Row>` ≈ 25MB）。
+/// 整篇文档的轻量块索引（≈20B/行，160k 行 ≈ 3.2MB，而整篇 `Vec<Row>` ≈ 25MB）。
 #[derive(Debug, Clone)]
 pub struct BlockIndex {
-    /// 每个渲染行一个条目（按行序，`src_line` 严格递增）。
+    /// 每个渲染行一个条目（按行序，`src_line`/`byte` 严格递增）。
     pub blocks: Vec<BlockMeta>,
-    /// 行 i（0 基）的字节起始偏移；`line_starts.len() == 行数（含末尾空行）`。
-    pub line_starts: Vec<u32>,
     /// 目录：(渲染行号, 标题级别, 标题文本)。窗口模式下照常全量可用。
     pub toc: Vec<(usize, u8, String)>,
 }
@@ -649,6 +651,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         let line = lines[idx].trim_end_matches('\r');
         let t = line.trim_start();
         let raw_len = line.len() as u32;
+        let byte = line_starts[row_start];
 
         if let Some((fc, _)) = fence_len(t) {
             let mut code_lines = 0u32;
@@ -666,6 +669,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
             }
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Code,
                 raw_len,
                 aux: code_lines,
@@ -675,6 +679,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if t.is_empty() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Blank,
                 raw_len: 0,
                 aux: 0,
@@ -688,6 +693,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
             toc.push((row_start, hashes as u8, text));
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Heading(hashes as u8),
                 raw_len,
                 aux: 0,
@@ -698,6 +704,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if t.starts_with('>') {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Quote,
                 raw_len,
                 aux: 0,
@@ -708,6 +715,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if list_prefix(t).is_some() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Bullet,
                 raw_len,
                 aux: 0,
@@ -718,6 +726,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if is_rule(t) {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Rule,
                 raw_len,
                 aux: 0,
@@ -728,6 +737,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if parse_image_line(t).is_some() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Image,
                 raw_len,
                 aux: 1,
@@ -738,6 +748,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         if let Some((table, consumed)) = try_parse_table(&lines, idx) {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte,
                 kind: RowKind::Table,
                 raw_len,
                 aux: table.rows.len() as u32,
@@ -747,6 +758,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
+            byte,
             kind: RowKind::Paragraph,
             raw_len,
             aux: 0,
@@ -755,7 +767,6 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     }
     BlockIndex {
         blocks,
-        line_starts,
         toc,
     }
 }
@@ -807,16 +818,13 @@ fn common_suffix_bytes(a: &str, b: &str) -> usize {
     i
 }
 
-/// 字节偏移 → 行号（0 基），按 `line_starts` 二分。
-fn line_of(line_starts: &[u32], byte: usize) -> usize {
-    match line_starts.binary_search(&(byte as u32)) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    }
-}
-
 /// **预览增量解析**：在上一次块索引基础上，只重扫「变化区及其所在块、直到与旧索引
 /// 尾部重新对齐」的部分，跳过未变行的重复扫描。
+///
+/// `dirty`：编辑器侧通道给出的「当前文本中与 `prev_src` 不同的字节区间」（打字路径
+/// 按 `InputEdit` 累积，O(k)），提供后**跳过 `common_prefix/_suffix` 两次 O(n) 全串
+/// 比对**——打字同步的主成本从 O(n) 落到 O(k)（k=编辑字节数）。
+/// `None` 时回退到全串比对定位变化区（快照 diff 无编辑信息的下界，作为兜底/测试安全网）。
 ///
 /// 正确性保证与 `scan_blocks` 完全一致（复用同一套切块判定）；增量只在「尾部字节与
 /// 旧文本相同、且当前位置恰是旧索引的块边界」时截断并复用旧尾部（块结束必为 Normal
@@ -826,15 +834,32 @@ pub fn scan_blocks_incremental(
     prev_src: &str,
     prev: &BlockIndex,
     new_src: &str,
+    dirty: Option<Range<usize>>,
 ) -> BlockIndex {
     let old_len = prev_src.len();
     let new_len = new_src.len();
-    let cp = common_prefix_bytes(prev_src, new_src);
-    let cs = common_suffix_bytes(prev_src, new_src);
-    let tail_start_new = new_len.saturating_sub(cs);
-    let changed = new_len.saturating_sub(cp + cs);
+    let new_lines: Vec<&str> = new_src.split('\n').collect();
+    let (tail_start_new, changed, b_first) = match dirty {
+        // 已知变化区间（new_src 坐标）→ 直接定位，跳过前后缀全串比对。
+        // 首处变化之前字节未变，故 b_first 在 prev_src 中的偏移相同。
+        Some(r) => {
+            let dlo = r.start.min(new_len);
+            let dhi = r.end.min(new_len).max(dlo);
+            (dhi, dhi - dlo, dlo)
+        }
+        None => {
+            let cp = common_prefix_bytes(prev_src, new_src);
+            let cs = common_suffix_bytes(prev_src, new_src);
+            let tail_start_new = new_len.saturating_sub(cs);
+            let changed = new_len.saturating_sub(cp + cs);
+            if new_len == old_len && changed == 0 {
+                // 文本未变（同长且公共前后缀覆盖全串）
+                return prev.clone();
+            }
+            (tail_start_new, changed, cp)
+        }
+    };
     if new_len == old_len && changed == 0 {
-        // 文本未变（同长且公共前后缀覆盖全串）
         return prev.clone();
     }
     // 变化区过大 → 全扫兜底（增量没赚头）。注意纯删除 changed 可能低估，
@@ -843,17 +868,17 @@ pub fn scan_blocks_incremental(
         return scan_blocks(new_src);
     }
 
-    let new_lines: Vec<&str> = new_src.split('\n').collect();
-    let new_line_starts = build_line_starts_u32(new_src);
     let delta = new_len as i64 - old_len as i64; // 总字节增量（可负）
 
-    // 变化区首行在旧索引中所在的块起始行：变化行前的行未变，行号两边一致
-    let l0 = line_of(&new_line_starts, cp);
+    // 锚点 = 旧索引中含首处变化字节的块（首处变化之前字节/行号两边一致）。
+    // 用块的 `byte` 二分定位：变化前的行字节偏移在两帧相同。
     let bi = prev
         .blocks
-        .partition_point(|b| b.src_line as usize <= l0)
+        .partition_point(|b| b.byte as usize <= b_first)
         .saturating_sub(1);
     let anchor = prev.blocks.get(bi).map(|b| b.src_line as usize).unwrap_or(0);
+    // 当前行的起始字节：锚点行起始 < b_first → 未变，直接复用旧索引的 byte。
+    let anchor_byte = prev.blocks.get(bi).map(|b| b.byte as usize).unwrap_or(0);
 
     // 未变前缀直接沿用；toc 同样取前缀
     let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
@@ -865,27 +890,28 @@ pub fn scan_blocks_incremental(
         .collect();
 
     let mut idx = anchor;
+    let mut cur_byte = anchor_byte as u32; // 当前扫描行的起始字节（new 坐标）
     let mut reused = false;
     while idx < new_lines.len() {
         // —— 复用旧尾部的机会：游标已进入「与旧文本字节相同」的尾部，且对应旧位置恰是块边界 ——
-        let new_byte = new_line_starts[idx] as usize;
+        //    prev_off = new_byte - delta 映射到旧坐标；旧块的 `byte` 即其行首偏移，
+        //    能命中块边界（块 byte 严格递增，二分可定位）。
+        let new_byte = cur_byte as usize;
         if new_byte >= tail_start_new {
             let prev_off = new_byte as i64 - delta;
             if (0..=old_len as i64).contains(&prev_off) {
                 let prev_off = prev_off as usize;
-                let prev_line = line_of(&prev.line_starts, prev_off);
-                // prev_off 必须是旧文本的行首（行首索引命中才是块边界）
-                if prev.line_starts.binary_search(&(prev_off as u32)).is_ok() {
-                    if let Some(pbi) = prev
-                        .blocks
-                        .iter()
-                        .position(|b| b.src_line as usize == prev_line)
-                    {
-                        // 同字节尾部 + 块首 Normal 态 → 旧尾部块逐字有效，仅行号平移
+                let pi = prev.blocks.partition_point(|b| (b.byte as usize) < prev_off);
+                if let Some(pb) = prev.blocks.get(pi) {
+                    if pb.byte as usize == prev_off {
+                        // 同字节尾部 + 块首 Normal 态 → 旧尾部块逐字有效，行号与字节
+                        // 同时平移（byte 平移 = 总字节增量 delta，源后缀整体平移）。
+                        let prev_line = pb.src_line as usize;
                         let line_shift = idx as i64 - prev_line as i64;
-                        for b in &prev.blocks[pbi..] {
+                        for b in &prev.blocks[pi..] {
                             let mut nb = *b;
                             nb.src_line = (b.src_line as i64 + line_shift).max(0) as u32;
+                            nb.byte = (b.byte as i64 + delta).max(0) as u32;
                             blocks.push(nb);
                         }
                         // toc 尾部：与 `scan_blocks` 一致的「源码行」坐标 → 随行号偏移
@@ -904,23 +930,27 @@ pub fn scan_blocks_incremental(
         let line = new_lines[idx].trim_end_matches('\r');
         let t = line.trim_start();
         let raw_len = line.len() as u32;
-
+        let blk_byte = cur_byte;
         if let Some((fc, _)) = fence_len(t) {
             let mut code_lines = 0u32;
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             while idx < new_lines.len() {
                 let l = new_lines[idx].trim_end_matches('\r');
                 if let Some((c, _)) = fence_len(l.trim_start()) {
                     if c == fc {
                         idx += 1;
+                        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
                         break;
                     }
                 }
                 code_lines += 1;
                 idx += 1;
+                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             }
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Code,
                 raw_len,
                 aux: code_lines,
@@ -930,11 +960,13 @@ pub fn scan_blocks_incremental(
         if t.is_empty() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Blank,
                 raw_len: 0,
                 aux: 0,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         let hashes = t.chars().take_while(|&c| c == '#').count();
@@ -943,70 +975,86 @@ pub fn scan_blocks_incremental(
             toc.push((row_start, hashes as u8, text));
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Heading(hashes as u8),
                 raw_len,
                 aux: 0,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         if t.starts_with('>') {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Quote,
                 raw_len,
                 aux: 0,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         if list_prefix(t).is_some() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Bullet,
                 raw_len,
                 aux: 0,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         if is_rule(t) {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Rule,
                 raw_len,
                 aux: 0,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         if parse_image_line(t).is_some() {
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Image,
                 raw_len,
                 aux: 1,
             });
             idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             continue;
         }
         if let Some((table, consumed)) = try_parse_table(&new_lines, idx) {
+            for _ in 0..consumed {
+                idx += 1;
+                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
+            }
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
+                byte: blk_byte,
                 kind: RowKind::Table,
                 raw_len,
                 aux: table.rows.len() as u32,
             });
-            idx += consumed;
             continue;
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
+            byte: blk_byte,
             kind: RowKind::Paragraph,
             raw_len,
             aux: 0,
         });
         idx += 1;
+        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
     }
     debug_assert!(
         reused || idx >= new_lines.len(),
@@ -1014,9 +1062,16 @@ pub fn scan_blocks_incremental(
     );
     BlockIndex {
         blocks,
-        line_starts: new_line_starts,
         toc,
     }
+}
+
+/// 从行 `i` 的起始字节推进到下一行的起始字节（+行长+换行符；末行无换行时
+/// clamp 到 `new_len`，哨兵多算的 1 字节只会让尾部复用更早就触发、不会越界）。
+fn next_line_byte(new_lines: &[&str], cur: u32, i: usize, new_len: usize) -> u32 {
+    cur.saturating_add(new_lines[i].len() as u32)
+        .saturating_add(1)
+        .min(new_len as u32)
 }
 
 /// 物化块区间 `[lo, hi]`（闭区间）的渲染行。
@@ -1035,9 +1090,9 @@ pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -
     if lo > hi {
         return Vec::new();
     }
-    let start = index.line_starts[index.blocks[lo].src_line as usize] as usize;
+    let start = index.blocks[lo].byte as usize;
     let mut end = if hi + 1 < n {
-        index.line_starts[index.blocks[hi + 1].src_line as usize] as usize
+        index.blocks[hi + 1].byte as usize
     } else {
         src.len()
     };
@@ -1466,7 +1521,6 @@ mod tests {
             }
             let n = idx.blocks.len();
             let index_b = n * std::mem::size_of::<BlockMeta>()
-                + idx.line_starts.len() * 4
                 + idx
                     .toc
                     .iter()
@@ -1486,7 +1540,7 @@ mod tests {
         }
     }
 
-    /// 增量索引必须与全量 `scan_blocks` 逐字节一致（blocks / line_starts / toc）——
+    /// 增量索引必须与全量 `scan_blocks` 逐字节一致（blocks / toc）——
     /// 覆盖插入、删行、拆行、合并、围栏内改、围栏新开、表格改、标题改。
     #[test]
     fn incremental_equals_full_scan_across_edits() {
@@ -1499,12 +1553,10 @@ mod tests {
             new.push_str(&src[..s]);
             new.push_str(ins);
             new.push_str(&src[e..]);
-            let inc = scan_blocks_incremental(src, prev, &new);
+            let inc = scan_blocks_incremental(src, prev, &new, None);
             let full = scan_blocks(&new);
             assert!(
-                inc.blocks == full.blocks
-                    && inc.line_starts == full.line_starts
-                    && inc.toc == full.toc,
+                inc.blocks == full.blocks && inc.toc == full.toc,
                 "编辑后不一致\n新文本头≈:\n{:?}\ninc_blocks={:?}\n\nfull_blocks={:?}",
                 &new[..new.len().min(160)],
                 inc.blocks,
@@ -1545,39 +1597,102 @@ mod tests {
     fn incremental_noop_returns_prev() {
         let src = "# 标题\n正文\n";
         let prev = scan_blocks(src);
-        let inc = scan_blocks_incremental(src, &prev, src);
+        let inc = scan_blocks_incremental(src, &prev, src, None);
         assert_eq!(inc.blocks, prev.blocks);
         assert_eq!(inc.toc, prev.toc);
     }
 
-    /// 基准（--ignored）：大文档小编辑时，增量 vs 全量扫描耗时对比（打印、不断言）。
+    /// dirty 侧通道路径：给 `scan_blocks_incremental` 提供「变化字节区间」时，
+    /// 结果必须与全量 `scan_blocks` 逐字节一致。覆盖各种编辑 + 用真实的前后缀
+    /// 定位精确 dirty，以及模拟 tabs 侧 bounding box 的「膨胀」dirty。
     #[test]
+    fn incremental_with_dirty_equals_full_scan() {
+        let base = String::from("# 标题\n> 引用\n- 列表\n\n```rust\nfn f() {}\nlet s = \"x\";\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n末段与[链接](https://x) 结尾\n");
+        // 每个场景：构造 prev_src（前一帧）→ new_src（当前帧），dirty 用前后缀定位的
+        // 精确变化区 + 一个「前后膨胀 6B」的 bounding box 版各验一遍。
+        let run = |name: &str, prev_src: String, new_src: String| {
+            let prev = scan_blocks(&prev_src);
+            let cp = common_prefix_bytes(&prev_src, &new_src);
+            let cs = common_suffix_bytes(&prev_src, &new_src);
+            let exact = cp..(new_src.len() - cs);
+            for (tag, dirty) in [
+                ("精确", exact.clone()),
+                ("膨胀", (exact.start.saturating_sub(6))..(exact.end + 6).min(new_src.len())),
+            ] {
+                let inc = scan_blocks_incremental(&prev_src, &prev, &new_src, Some(dirty));
+                let full = scan_blocks(&new_src);
+                assert!(
+                    inc.blocks == full.blocks && inc.toc == full.toc,
+                    "{name}/{tag} 不一致\nprev_len={} new_len={} dirty={:?}\ninc_blocks={:?}\nfull_blocks={:?}",
+                    prev_src.len(),
+                    new_src.len(),
+                    exact,
+                    inc.blocks,
+                    full.blocks,
+                );
+            }
+        };
+
+        // —— 连续两次编辑构造两帧（去抖窗口内多次编辑的真实场景）——
+        let mut frame1 = base.clone();
+        let mut frame2 = base.clone();
+        let a = frame1.find("fn f").unwrap() + 4;
+        frame1.insert_str(a, "g");
+        let a = frame2.find("fn f").unwrap() + 4;
+        frame2.insert_str(a, "g");
+        frame2.insert_str(frame2.find("结尾").unwrap(), "XYZ");
+        run("两帧累积", frame1, frame2);
+
+        // —— 同帧多处编辑（dirty 须覆盖全部变化点）——
+        run("两处编辑", base.clone(), {
+            let mut v = base.clone();
+            v.insert_str(v.find("| a").unwrap() + 2, "XX");
+            v.insert_str(v.find("结尾").unwrap(), "YY");
+            v
+        });
+
+        // —— 单编辑场景 ——
+        run("文末追加", base.clone(), { let mut v = base.clone(); v.push_str("\n尾行"); v });
+        run("中部删字", base.clone(), { let mut v = base.clone(); v.remove(v.find("结尾").unwrap()); v });
+        run("中部插字", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "XYZ"); v });
+        run("插整段", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n\n新段落\n"); v });
+        run("拆行", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n"); v });
+        run("合并行", base.clone(), { let mut v = base.clone(); let at = v.rfind('\n').unwrap(); v.remove(at); v });
+        run("表头改", base.clone(), { let mut v = base.clone(); let at = v.find("| a ").unwrap(); v.replace_range(at..at + 4, "| ah"); v });
+        run("围栏内改", base.clone(), { let mut v = base.clone(); v.replace_range(v.find("fn f").unwrap() + 4..v.find("fn f").unwrap() + 7, "g()"); v });
+        run("去围栏", base.clone(), { let mut v = base.clone(); let at = v.find("```rust").unwrap(); v.replace_range(at..at + 3, "kok"); v });
+    }
+
+    /// 基准（--ignored）：大文档小编辑时，增量（dirty 侧通道 vs 快照 diff）vs
+    /// 全量扫描耗时对比（打印、不断言）。    #[test]
     #[ignore]
     fn bench_incremental_vs_full_scan() {
         use std::time::Instant;
-        let block = String::from("# 标题段 {i}\n> 引用\n- 列表项\n\n```rust\nfn f() {{}}\nlet s = \"x\";\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n普通段落与 `code` [链接](https://x)\n\n");
         let mut src = String::new();
         for i in 0..1600 {
             src.push_str(&format!("# 标题段 {i}\n> 引用\n- 列表项\n\n```rust\nfn f() {{}}\nlet s = \"x\";\n```\n\n普通段落与 `code` [链接](https://x)\n\n"));
         }
-        let _ = block;
         let prev = scan_blocks(&src);
         // 中部小编辑：给某段插几个字
         let at = src.find("普通段落").unwrap() + 6;
         let mut new = src.clone();
         new.insert_str(at, "ABC");
+        let dirty = at..(at + 3);
         let t0 = Instant::now();
-        let _inc = scan_blocks_incremental(&src, &prev, &new);
+        let _inc_fast = scan_blocks_incremental(&src, &prev, &new, Some(dirty));
+        let fast_ms = t0.elapsed();
+        let t0 = Instant::now();
+        let _inc = scan_blocks_incremental(&src, &prev, &new, None);
         let inc_ms = t0.elapsed();
         let t1 = Instant::now();
         let _full = scan_blocks(&new);
         let full_ms = t1.elapsed();
         println!(
-            "{} 行：增量扫描 {:.1} ms vs 全量 {:.1} ms（{:.1}x）",
+            "{} 行：增量(dirty) {:.1} ms vs 增量(快照diff) {:.1} ms vs 全量 {:.1} ms",
             prev.blocks.len(),
+            fast_ms.as_secs_f64() * 1000.0,
             inc_ms.as_secs_f64() * 1000.0,
             full_ms.as_secs_f64() * 1000.0,
-            full_ms.as_secs_f64() / inc_ms.as_secs_f64().max(1e-6),
         );
     }
 }

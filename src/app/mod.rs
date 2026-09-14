@@ -81,6 +81,12 @@ struct EditorTab {
     /// 编辑版本号：每次内容变更 +1。预览同步循环用它判断「扫描期间是否又有新编辑」，
     /// 从而在扫描结束后自动续跑合并，而不是丢给下一次按键才触发。
     edit_version: u64,
+    /// 编辑侧通道：最近一次 `InputEdit` 的字节区间 `(start, old_end, new_end)`。
+    /// 打字时由 Markdown 高亮器的 `update(Some(edit))` 写入（先于 `InputEvent::Change`）。
+    edit_tracker: crate::syntax::EditTracker,
+    /// 去抖窗口内累积的「dirty 字节区间」（bounding box，当前文本字节坐标）：供
+    /// [`crate::markdown::scan_blocks_incremental`] 跳过 O(n) 快照 diff；同步取走时清空。
+    preview_dirty: Option<(usize, usize)>,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }

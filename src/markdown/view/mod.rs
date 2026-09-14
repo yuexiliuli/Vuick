@@ -353,8 +353,7 @@ impl MarkdownPreview {
             }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
-                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
-                    + index.line_starts.len() * 4;
+                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
                 eprintln!(
                     "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 行未物化",
                     src.len(),
@@ -554,8 +553,7 @@ impl MarkdownPreview {
             Some(idx) => {
                 let (_, win_b) = rows_memory_estimate(&self.win_rows);
                 let n = idx.blocks.len();
-                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
-                    + idx.line_starts.len() * 4;
+                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
                 let src_b = self.src_buf.as_ref().map(|s| s.len()).unwrap_or(0);
                 (n, index_b + src_b + win_b)
             }

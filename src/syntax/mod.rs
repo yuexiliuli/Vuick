@@ -39,6 +39,16 @@ use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet
 
 use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES, SYNC_MAX_PARSE_LINES, WINDOW_PAD};
 
+/// 编辑器编辑侧通道：最近一次 `InputEdit` 的字节区间 `(start, old_end, new_end)`。
+///
+/// gpui-component 的文本替换先于 `InputEvent::Change` 调高亮器 `update(Some(edit))`
+/// （`replace_text_in_range` 内 `drive_highlighter` → `emit(Change)`），因此
+/// 「读一次并清空」与 Change 事件严格 1:1；`set_value`/undo/redo 走 silent 路径
+/// 不发射 Change，不会污染。去抖窗口内多次编辑由预览同步（`app::tabs`）按字节
+/// 坐标累积成 **dirty 区间**，喂给 [`crate::markdown::scan_blocks_incremental`]
+/// 跳过 O(n) 快照 diff。
+pub(crate) type EditTracker = Rc<std::cell::RefCell<Option<(usize, usize, usize)>>>;
+
 /// 共享语法集（默认语法定义有几 MB，跨实例共享一次）。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
@@ -122,14 +132,16 @@ impl WindowCache {
 struct SyntectHighlighter {
     language: SharedString,
     cache: Rc<RefCell<WindowCache>>,
+    tracker: EditTracker,
 }
 
 impl SyntectHighlighter {
-    fn new(language: &str) -> Option<Self> {
+    fn new(language: &str, tracker: EditTracker) -> Option<Self> {
         find_syntax(language)?;
         Some(Self {
             language: language.to_owned().into(),
             cache: Rc::new(RefCell::new(WindowCache::new())),
+            tracker,
         })
     }
 
@@ -235,12 +247,16 @@ impl InputHighlighter for SyntectHighlighter {
     /// （解析推迟到渲染时按可见窗口同步做）。
     fn update(
         &mut self,
-        _edit: Option<InputEdit>,
+        edit: Option<InputEdit>,
         text: &Rope,
         folding: bool,
         _window: &mut Window,
         _cx: &mut Context<EditorState>,
     ) {
+        // 编辑侧通道：把本次编辑的字节区间交给预览同步（先于 InputEvent::Change）。
+        if let Some(e) = &edit {
+            *self.tracker.borrow_mut() = Some((e.start_byte, e.old_end_byte, e.new_end_byte));
+        }
         if text.len() > MAX_TEXT_BYTES {
             // 超大纲：清掉高亮（保持即时响应）
             let mut c = self.cache.borrow_mut();
@@ -300,13 +316,16 @@ impl InputHighlighter for SyntectHighlighter {
 ///
 /// Markdown 走本仓库手写的**逐行状态机**（[`markdown::MarkdownHighlighter`]，编辑只重扫
 /// 受影响行，单键成本与文档总行数无关）；其余语言走 syntect 窗口式解析。
-pub(crate) fn highlighter_factory() -> InputHighlighterFactory {
-    Rc::new(|language| {
+/// `tracker`：编辑侧通道，注入到每个高亮器实例（打字时记录 `InputEdit` 字节区间，
+/// 供预览同步当 dirty 区间用）。
+pub(crate) fn highlighter_factory_with_tracker(tracker: EditTracker) -> InputHighlighterFactory {
+    Rc::new(move |language| {
         if normalize_language(language) == "markdown" {
-            return Some(Box::new(markdown::MarkdownHighlighter::new(language))
-                as Box<dyn InputHighlighter>);
+            return Some(Box::new(markdown::MarkdownHighlighter::new(
+                language, tracker.clone(),
+            )) as Box<dyn InputHighlighter>);
         }
-        SyntectHighlighter::new(language)
+        SyntectHighlighter::new(language, tracker.clone())
             .map(|hl| Box::new(hl) as Box<dyn InputHighlighter>)
     })
 }
@@ -1025,12 +1044,13 @@ mod tests {
     /// 解析器可覆盖常见语言；`resolve_styles` 把区间切成无缝隙的样式 run。
     #[test]
     fn syntax_covers_common_languages_and_styles_cover_range() {
+        let tracker = EditTracker::default();
         for lang in ["rust", "python", "javascript", "html", "css", "json"] {
-            let hl = SyntectHighlighter::new(lang);
+            let hl = SyntectHighlighter::new(lang, tracker.clone());
             let hl = hl.unwrap_or_else(|| panic!("{lang} 应在默认语法集内"));
             assert_eq!(hl.language(), lang);
         }
-        assert!(SyntectHighlighter::new("no-such-lang-xyz").is_none());
+        assert!(SyntectHighlighter::new("no-such-lang-xyz", tracker).is_none());
 
         let resolver = github_theme(false);
         let styles =

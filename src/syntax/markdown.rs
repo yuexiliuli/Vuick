@@ -21,7 +21,7 @@ use gpui_component::input::{
 };
 
 use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES};
-use crate::syntax::{parse_code_lines, resolve_styles};
+use crate::syntax::{parse_code_lines, resolve_styles, EditTracker};
 
 /// 一行的语义 run：**行内字节区间** → 语义名（与 GitHub 配色键一致）。
 type LineRuns = Vec<(Range<usize>, &'static str)>;
@@ -37,13 +37,15 @@ struct Fence {
 pub(crate) struct MarkdownHighlighter {
     language: SharedString,
     text: Rope,
+    tracker: EditTracker,
 }
 
 impl MarkdownHighlighter {
-    pub(crate) fn new(language: &str) -> Self {
+    pub(crate) fn new(language: &str, tracker: EditTracker) -> Self {
         Self {
             language: language.to_owned().into(),
             text: Rope::from(""),
+            tracker,
         }
     }
 }
@@ -53,16 +55,20 @@ impl InputHighlighter for MarkdownHighlighter {
         self.language.clone()
     }
 
+    /// 编辑侧通道：把本次编辑的字节区间交给预览同步（先于 InputEvent::Change）。
     /// 只保留编辑后的文本 COW 克隆（O(1)），不做任何整篇工作；解析推迟到渲染。
     fn update(
         &mut self,
-        _edit: Option<InputEdit>,
+        edit: Option<InputEdit>,
         text: &Rope,
         _folding: bool,
         _window: &mut Window,
         _cx: &mut Context<EditorState>,
     ) {
         let _t = crate::prof::begin();
+        if let Some(e) = &edit {
+            *self.tracker.borrow_mut() = Some((e.start_byte, e.old_end_byte, e.new_end_byte));
+        }
         if text.len() > MAX_TEXT_BYTES {
             // 超大纲：清掉高亮，保持即时响应
             if self.text.len() != 0 {
@@ -620,7 +626,7 @@ mod tests {
         }
         let src = "# 标题\n正文 `code` 与 **粗**\n```\nx\n```\n";
         let rope = Rope::from(src);
-        let mut hl = MarkdownHighlighter::new("markdown");
+        let mut hl = MarkdownHighlighter::new("markdown", EditTracker::default());
         hl.text = rope.clone(); // 等价于 update() 只暂存文本
         let len = rope.len();
         let styles = hl.styles(&(0..len), &Dummy);

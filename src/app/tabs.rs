@@ -18,9 +18,15 @@ impl EditorApp {
         });
         // 安装语法高亮工厂：gpui-component 在 tree-sitter 特性关闭时工厂为空操作，
         // 这里提供 syntect 解析 + GitHub 配色（配色在 main::install_github_theme 设置）。
+        // 编辑侧通道 tracker 注入工厂：打字时高亮器把 InputEdit 字节区间记下，
+        // 供预览同步当 dirty 区间用（跳过 O(n) 快照 diff）。
+        let tracker: crate::syntax::EditTracker = std::rc::Rc::new(std::cell::RefCell::new(None));
         let ed = editor.clone();
         ed.update(cx, |ed, cx| {
-            ed.set_highlighter_factory(crate::syntax::highlighter_factory(), cx);
+            ed.set_highlighter_factory(
+                crate::syntax::highlighter_factory_with_tracker(tracker.clone()),
+                cx,
+            );
         });
 
         // 编辑内容被修改 → 置脏 + 同步内容/行列缓存
@@ -32,6 +38,27 @@ impl EditorApp {
                     // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）+ 版本号推进
                     this.search_scan = None;
                     tab.edit_version = tab.edit_version.wrapping_add(1);
+                    // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
+                    // 供预览增量扫描跳过 O(n) 快照 diff。每次 Change 对应一次
+                    // 高亮器 update(Some(edit))（先于本事件），1:1 取走。
+                    if let Some((s, oe, ne)) = tab.edit_tracker.borrow_mut().take() {
+                        let delta = ne as i64 - oe as i64;
+                        tab.preview_dirty = Some(match tab.preview_dirty {
+                            None => (s, ne),
+                            Some((lo, hi)) => {
+                                // 把上一帧的 dirty 平移到本帧（编辑点之前不变、之后随 δ 平移）
+                                // 再并入 [s, ne)（新增变化区间），取 bounding box。
+                                let hi_shifted = if hi > oe {
+                                    hi as i64 + delta
+                                } else if hi >= s {
+                                    ne as i64
+                                } else {
+                                    hi as i64
+                                };
+                                (lo.min(s), hi_shifted.max(ne as i64).max(0) as usize)
+                            }
+                        });
+                    }
                     // 行/字数走 Rope 的 O(1) 计数，不再每键 `value()` 物化全文 +
                     // `lines()/chars()` 全量扫描（16 万行文档每键三次 O(n)、一次 6MB
                     // 副本——正是大文档编辑卡顿的主因）。行数保持旧 `str::lines()` 语义
@@ -64,39 +91,48 @@ impl EditorApp {
                                     .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
                                     .await;
                                 // 1) UI 线程：快照当前正文 + 取上一版索引（增量基底）+ 版本号
-                                let Some((snapshot, panel_bg, base_dir, prev, version)) = this
-                                    .update(cx, |this, cx| {
-                                        let panel_bg = this.panel_bg();
-                                        let base_dir = this
-                                            .tabs
-                                            .get(this.active_tab)
-                                            .and_then(|t| t.file_path.as_ref())
-                                            .and_then(|p| p.parent())
-                                            .map(|d| d.to_path_buf());
-                                        let snapshot = this
-                                            .tabs
-                                            .get(this.active_tab)
-                                            .filter(|t| t.preview_on)
-                                            .map(|t| t.editor.read(cx).value());
-                                        let prev = this
-                                            .tabs
-                                            .get(this.active_tab)
-                                            .and_then(|t| t.preview_prev.clone());
-                                        let version = this
-                                            .tabs
-                                            .get(this.active_tab)
-                                            .map(|t| t.edit_version)
-                                            .unwrap_or(0);
-                                        snapshot.map(|snap| {
-                                            (snap, panel_bg, base_dir, prev, version)
+                                //    + 取走 dirty（自上次快照以来累积的变化区间；取走即清零）。
+                                //    快照与 dirty 同帧取：dirty 覆盖的正是 快照 vs 上一版 的差异。
+                                let Some((snapshot, panel_bg, base_dir, prev, version, dirty)) =
+                                    this
+                                        .update(cx, |this, cx| {
+                                            let panel_bg = this.panel_bg();
+                                            let base_dir = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .and_then(|t| t.file_path.as_ref())
+                                                .and_then(|p| p.parent())
+                                                .map(|d| d.to_path_buf());
+                                            let snapshot = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .filter(|t| t.preview_on)
+                                                .map(|t| t.editor.read(cx).value());
+                                            let prev = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .and_then(|t| t.preview_prev.clone());
+                                            let version = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .map(|t| t.edit_version)
+                                                .unwrap_or(0);
+                                            let dirty = this
+                                                .tabs
+                                                .get_mut(this.active_tab)
+                                                .and_then(|t| t.preview_dirty.take());
+                                            snapshot.map(|snap| {
+                                                (snap, panel_bg, base_dir, prev, version, dirty)
+                                            })
                                         })
-                                    })
-                                    .ok()
-                                    .flatten()
+                                        .ok()
+                                        .flatten()
                                 else {
                                     break;
                                 };
-                                // 2) 后台线程：增量（有上一版）或全量扫描
+                                // 2) 后台线程：增量（有上一版）或全量扫描。
+                                //    有 dirty → 增量扫描跳过 O(n) 快照 diff（O(k)）；
+                                //    无 dirty（首轮 / 高亮器未装）→ 走快照 diff 兜底。
                                 let index = match &prev {
                                     Some((p_src, p_idx)) => {
                                         let p_src = p_src.clone();
@@ -104,12 +140,14 @@ impl EditorApp {
                                         // O(块数) memcpy（几 ms）仍远小于全量扫描（几百 ms）。
                                         let p_idx = (**p_idx).clone();
                                         let snap = snapshot.clone();
+                                        let dirty = dirty.map(|(a, b)| a..b);
                                         cx.background_executor()
                                             .spawn(async move {
                                                 scan_blocks_incremental(
                                                     p_src.as_ref(),
                                                     &p_idx,
                                                     snap.as_ref(),
+                                                    dirty,
                                                 )
                                             })
                                             .await
@@ -199,6 +237,8 @@ impl EditorApp {
             editor_pending: false,
             preview_prev: None,
             edit_version: 0,
+            edit_tracker: tracker,
+            preview_dirty: None,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;
