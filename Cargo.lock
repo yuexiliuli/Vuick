@@ -2626,6 +2626,7 @@ dependencies = [
  "gpui_platform",
  "hex",
  "image",
+ "memchr",
  "pdfium-render",
  "regex",
  "reqwest",

@@ -999,6 +999,16 @@ pub(crate) fn install_github_theme(cx: &mut gpui::App) {
     theme.highlight_theme = Arc::new(github_theme(theme.mode.is_dark()));
 }
 
+/// 明/暗 GitHub 语法色板（各静态缓存一份）。代码块渲染**每帧**都要把逐行语义名
+/// 解析成颜色（[`resolve_line_styles_with`]），若每次现建整套配色（~20 个
+/// `ThemeStyle` 的堆分配 + 颜色转换）纯属浪费、随可见代码块数成倍放大。
+/// 配色是编译期常量、只随明/暗变化，与运行时主题无关，静态缓存永久有效。
+pub(crate) fn github_theme_cached(dark: bool) -> &'static HighlightTheme {
+    static LIGHT: LazyLock<HighlightTheme> = LazyLock::new(|| github_theme(false));
+    static DARK: LazyLock<HighlightTheme> = LazyLock::new(|| github_theme(true));
+    if dark { &DARK } else { &LIGHT }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1089,6 +1099,61 @@ mod tests {
             light.style.syntax.keyword.map(|s| s.color),
             dark.style.syntax.keyword.map(|s| s.color),
             "明暗 keyword 颜色应不同"
+        );
+    }
+
+    /// 优化回归：`github_theme_cached` 必须**复用同一实例**（同主题两次调用返回同指针），
+    /// 证明代码块渲染不再每帧重建整套配色；明/暗各一份互不串扰，检出不了则说明缓存失效。
+    #[test]
+    fn github_theme_cached_reuses_single_instance_per_theme() {
+        let light1 = github_theme_cached(false) as *const HighlightTheme;
+        let light2 = github_theme_cached(false) as *const HighlightTheme;
+        let dark1 = github_theme_cached(true) as *const HighlightTheme;
+        let dark2 = github_theme_cached(true) as *const HighlightTheme;
+        assert!(std::ptr::eq(light1, light2), "同主题应复用同一缓存实例");
+        assert!(std::ptr::eq(dark1, dark2), "同主题应复用同一缓存实例");
+        assert!(!std::ptr::eq(light1, dark1), "明暗应为不同实例");
+        // 缓存实例的颜色解析功能与现建一致（light function = #8250df）
+        let styles = resolve_styles(
+            &[(0..3, "function")],
+            &(0..3),
+            github_theme_cached(false),
+        );
+        assert_eq!(
+            styles[0].1.color,
+            Some(gpui::rgb(0x8250df).into()),
+            "缓存色板应能正常解析颜色"
+        );
+    }
+
+    /// 基准：GitHub 色板「每帧现建 vs 静态缓存」的代价对比（打印、不构成断言；
+    /// `--ignored` 运行）。旧代码块渲染每帧 `github_theme(dark)` 重建整套配色，
+    /// 新逻辑复用 [`github_theme_cached`] 的静态实例，仅做颜色解析。
+    #[test]
+    #[ignore]
+    fn bench_github_theme_cached_vs_fresh() {
+        use std::time::Instant;
+        let runs = 20_000usize;
+        let t0 = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..runs {
+            let th = github_theme(true);
+            sink = sink.wrapping_add(u64::from(th.style("keyword").is_some()));
+        }
+        let fresh = t0.elapsed();
+        let t1 = Instant::now();
+        let mut sink2 = 0u64;
+        for _ in 0..runs {
+            let th = github_theme_cached(true);
+            sink2 = sink2.wrapping_add(u64::from(th.style("keyword").is_some()));
+        }
+        let cached = t1.elapsed();
+        assert_eq!(sink, sink2, "缓存后解析结果必须一致");
+        println!(
+            "GitHub 色板解析（{runs} 次）：每帧现建 theme={}ms, 静态缓存={}ms（提升 {:.1}x）",
+            fresh.as_millis(),
+            cached.as_millis(),
+            fresh.as_secs_f64() / cached.as_secs_f64().max(1e-9),
         );
     }
 

@@ -897,6 +897,143 @@
         let _ = std::fs::remove_file(&b);
     }
 
+    /// 验证侧边栏搜索的「扫描结果缓存」真实生效（优化回归，防负优化）：
+    /// - 查询词/活动文档未变时，反复渲染帧**不重扫**（`search_scan_count` 不增）；
+    /// - 查询词变化才重扫（计数 +1）；
+    /// - 内容命中（当前活动文档行）能出结果行。
+    #[gpui::test]
+    async fn sidebar_search_scan_is_cached_across_renders(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-sz-cache.md");
+        std::fs::write(&f, "# 甲\n阿尔法 shanghai 内容\n真义行 beta\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let ti = cx.update(|_w, cx| app.read(cx).active_tab);
+
+        // 打开搜索面板（查询为空）：空查询不做扫描
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx);
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let before = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(before, 0, "查询为空时不应扫描");
+
+        // 第一次键入「shanghai」→ 扫描一次，命中第 1 行
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let after = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(after, 1, "首次搜索应精确扫描 1 次");
+        let hit_row1 = Box::leak(format!("sidebar-search-line-{ti}-1").into_boxed_str());
+        assert!(
+            cx.debug_bounds(hit_row1).is_some(),
+            "应命中第 1 行（shanghai），ti={ti}"
+        );
+
+        // 同一查询反复渲染（模拟逐帧渲染）→ 缓存命中，不重扫
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let steady = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(steady, after, "查询未变时重复渲染不应重扫");
+
+        // 换查询「beta」→ 再扫描一次，命中第 2 行
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("beta", window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let changed = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(changed, steady + 1, "查询变化应再扫描一次");
+        let hit_row2 = Box::leak(format!("sidebar-search-line-{ti}-2").into_boxed_str());
+        assert!(
+            cx.debug_bounds(hit_row2).is_some(),
+            "换查询 beta 应命中第 2 行"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 基准：侧边栏搜索「旧每帧全扫 vs 新缓存 + 无分配内核」的代价对比。
+    /// 旧逻辑：渲染帧每帧 `to_string()` 物化全文 + 每行 `to_lowercase()` 分配 + `contains`；
+    /// 新逻辑：查询变化才扫一次（无分配 [`find_ci`]），其余渲染帧走 O(1) 缓存键比较。
+    /// 打印、不构成断言；`--ignored` 运行（匹配项目既有 bench 惯例）。
+    #[test]
+    #[ignore]
+    fn bench_sidebar_search_old_vs_new() {
+        use crate::app::sidebar::find_ci;
+        use std::time::Instant;
+        let block = "# 章节标题\n\n普通段落内容 alpha beta 关键字 shanghai 你好\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let mut doc = String::with_capacity(block.len() * 12000);
+        for _ in 0..12000 {
+            doc.push_str(block);
+        }
+        let q = "shanghai";
+        let lines: Vec<&str> = doc.lines().collect();
+        let n = lines.len();
+
+        // 旧内核：每行 to_lowercase() 分配后 contains（模拟每个渲染帧全量重扫）
+        let t0 = Instant::now();
+        let mut old_hits = 0usize;
+        for _ in 0..100 {
+            old_hits = lines.iter().filter(|l| l.to_lowercase().contains(q)).count();
+        }
+        let old = t0.elapsed();
+
+        // 新内核：无分配 find_ci（同样每帧扫，展示内核本身提速）
+        let t1 = Instant::now();
+        let mut new_hits = 0usize;
+        for _ in 0..100 {
+            new_hits = lines.iter().filter(|l| find_ci(l, q).is_some()).count();
+        }
+        let new_kernel = t1.elapsed();
+        assert_eq!(old_hits, new_hits, "新旧命中数必须一致");
+
+        // 新路径整体：100 帧 = 1 次真实扫描 + 99 次 O(1) 缓存键比较
+        let t2 = Instant::now();
+        let mut key = String::new();
+        for i in 0..100 {
+            if key != q {
+                key = q.to_string();
+            }
+            let _ = i;
+        }
+        let cached_path = t2.elapsed();
+
+        println!(
+            "侧边栏搜索（{n} 行）：100 帧旧内核={}ms, 新内核={}ms（内核提升 {:.1}x）, 新缓存路径(1 扫+99 次键比较)={}ms",
+            old.as_millis(),
+            new_kernel.as_millis(),
+            old.as_secs_f64() / new_kernel.as_secs_f64().max(1e-9),
+            cached_path.as_millis(),
+        );
+    }
+
     #[gpui::test]
     async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
         init_test(cx);

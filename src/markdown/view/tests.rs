@@ -756,6 +756,90 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
     assert!(max_x > px(0.), "非换行模式也应横向可滚动，max_offset.x={max_x:?}");
 }
 
+/// 优化回归：`code_scroll`/`code_hl`/`table_scroll` 必须按 [`Rc`] 跨帧**共享**——
+/// 反复渲染后 self 里的 Rc 指针不变（渲染帧只克隆 Rc 本身、不整张克隆 HashMap），
+/// 且强引用计数不随渲染增长。指针变化说明渲染路径在重建/深拷贝地图，即为回归。
+#[gpui::test]
+fn md_preview_block_extras_are_shared_rc_across_renders(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let src = "```rust\nlet a = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    cx.simulate_resize(size(px(500.), px(500.)));
+    settle(cx);
+    let (ptr0, count0, code_blocks) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (
+            std::rc::Rc::as_ptr(&md.code_scroll) as usize,
+            std::rc::Rc::strong_count(&md.code_scroll),
+            md.code_scroll.len(),
+        )
+    });
+    assert_eq!(code_blocks, 1, "应注册 1 个代码块滚动句柄");
+    assert!(count0 >= 1, "滚动句柄应已建成共享块");
+
+    // 反复渲染多帧：指针必须不变、强引用计数不得增长
+    for _ in 0..10 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    cx.run_until_parked();
+    let (ptr1, count1) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (
+            std::rc::Rc::as_ptr(&md.code_scroll) as usize,
+            std::rc::Rc::strong_count(&md.code_scroll),
+        )
+    });
+    assert_eq!(ptr0, ptr1, "反复渲染后 code_scroll 应为同一 Rc（未整张重建/深拷贝）");
+    assert_eq!(count0, count1, "反复渲染后强引用计数不应增长（无每帧克隆泄漏）");
+}
+
+/// 基准：代码块/表格句柄地图「每帧整张 HashMap 克隆 vs Rc 共享」的代价对比。
+/// 旧代码在 `render()` 里逐帧 `code_scroll/table_scroll/code_hl.clone()`（O(N) 深拷贝），
+/// 新逻辑克隆 `Rc`（O(1) 引用计数）。打印、不构成断言；`--ignored` 运行。
+#[test]
+#[ignore]
+fn bench_block_extras_clone_vs_rc_share() {
+    use std::time::Instant;
+    use std::collections::HashMap;
+    use std::rc::Rc;
+    let mut m: HashMap<usize, u64> = HashMap::new();
+    for i in 0..1000 {
+        m.insert(i, i as u64);
+    }
+    let shared = Rc::new(m.clone());
+    let runs = 2_000_000usize;
+    let t0 = Instant::now();
+    let mut sink = 0u64;
+    for i in 0..runs {
+        let c = m.clone();
+        sink = sink.wrapping_add(c.get(&(i % 1000)).copied().unwrap_or(0));
+    }
+    let cloned = t0.elapsed();
+    let t1 = Instant::now();
+    let mut sink2 = 0u64;
+    for i in 0..runs {
+        let c = shared.clone();
+        sink2 = sink2.wrapping_add(c.get(&(i % 1000)).copied().unwrap_or(0));
+    }
+    let rc_share = t1.elapsed();
+    assert_eq!(sink, sink2, "两种取数方式结果必须一致");
+    println!(
+        "1000 项句柄地图共享（{runs} 次）：每帧整张克隆={}ms, Rc 共享={}ms（提升 {:.1}x）",
+        cloned.as_millis(),
+        rc_share.as_millis(),
+        cloned.as_secs_f64() / rc_share.as_secs_f64().max(1e-9),
+    );
+}
+
 /// 回归：超宽表格在换行模式（默认）下应自带横向滚动条，而不是被视口裁剪遮挡。
 /// 表格滚动容器 = 预览视口宽；内部固定宽表格超宽时块内可横向滚动、滚动条真实渲染，
 /// 句柄跨帧稳定（set_offset 能把表格真正向左滚动）——对齐代码块方案。

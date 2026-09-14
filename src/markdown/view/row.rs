@@ -18,7 +18,7 @@ use crate::config::markdown::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, TABLE_SCROLLBAR_
 use crate::markdown::parser::{Row, RowKind, RunKind};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
-use crate::syntax::{github_theme, resolve_line_styles_with, CodeLineRuns};
+use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
 
 /// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
 /// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
@@ -221,8 +221,8 @@ fn code_block_bands(
     dark: bool,
     p: &StyleParams,
 ) -> Vec<gpui::AnyElement> {
-    // 复用同一个 GitHub 明/暗色板解析各行的颜色，避免每行重建主题。
-    let resolver = github_theme(dark);
+    // 复用同一次明/暗 GitHub 色板解析各行的颜色（静态缓存，避免每帧/每块重建整套主题）。
+    let resolver = github_theme_cached(dark);
     let mut bands: Vec<gpui::AnyElement> = Vec::with_capacity(lines.len() + 2);
     bands.push(
         code_blank("md-code-blank-top", p)
@@ -232,7 +232,7 @@ fn code_block_bands(
     for (i, line) in lines.iter().enumerate() {
         let styles = runs
             .and_then(|all| all.get(i))
-            .map(|line_runs| resolve_line_styles_with(line_runs, line.len(), &resolver));
+            .map(|line_runs| resolve_line_styles_with(line_runs, line.len(), resolver));
         bands.push(code_band(line, styles.as_deref(), p));
     }
     bands.push(

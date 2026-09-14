@@ -71,13 +71,14 @@ pub struct MarkdownPreview {
     /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
     memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// 代码块的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
-    code_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// 装箱（[`Rc`]）：渲染时 O(1) 共享，避免每帧整张克隆 HashMap。
+    code_scroll: std::rc::Rc<std::collections::HashMap<usize, ScrollHandle>>,
     /// 代码块语法高亮缓存（行号 → 每行语义名 run；键与 `code_scroll` 一致）。
     /// 建在 set_source / 窗口重建时整块解析一次，渲染只做颜色解析——
-    /// 结果与主题无关，换明/暗主题无需重算。
-    code_hl: std::collections::HashMap<usize, std::rc::Rc<CodeLineRuns>>,
-    /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
-    table_scroll: std::collections::HashMap<usize, ScrollHandle>,
+    /// 结果与主题无关，换明/暗主题无需重算。装箱同上。
+    code_hl: std::rc::Rc<std::collections::HashMap<usize, std::rc::Rc<CodeLineRuns>>>,
+    /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。装箱同上。
+    table_scroll: std::rc::Rc<std::collections::HashMap<usize, ScrollHandle>>,
     /// 搜索跳转高亮：命中的源码行（0 基）与小写查询词；None = 无高亮。
     highlight_search: Option<(usize, String)>,
     /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮，避免旧定时器误清新高亮。
@@ -318,9 +319,9 @@ impl MarkdownPreview {
             self.win_rows = Rc::new(Vec::new());
             self.rows = Rc::new(Vec::new());
             self.toc = index.toc;
-            self.code_scroll.clear();
-            self.code_hl.clear();
-            self.table_scroll.clear();
+            self.code_scroll = Default::default();
+            self.code_hl = Default::default();
+            self.table_scroll = Default::default();
             self.list_state =
                 ListState::new(index.blocks.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
@@ -354,22 +355,24 @@ impl MarkdownPreview {
             })
             .collect();
         // 代码行 → 稳定的横向滚动句柄（供块内滚动条拖动）
-        self.code_scroll = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.kind == RowKind::Code)
-            .map(|(ix, _)| (ix, ScrollHandle::new()))
-            .collect();
+        self.code_scroll = Rc::new(
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.kind == RowKind::Code)
+                .map(|(ix, _)| (ix, ScrollHandle::new()))
+                .collect(),
+        );
         // 表格行 → 稳定的横向滚动句柄（供块内滚动条拖动）
-        self.table_scroll = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.kind == RowKind::Table)
-            .map(|(ix, _)| (ix, ScrollHandle::new()))
-            .collect();
+        self.table_scroll = Rc::new(
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.kind == RowKind::Table)
+                .map(|(ix, _)| (ix, ScrollHandle::new()))
+                .collect(),
+        );
         self.rows = Rc::new(rows);
         // 代码块语法高亮：按围栏语言整块解析一次缓存（渲染只做颜色解析）。
-        self.code_hl = build_code_highlights_for(&self.rows);
+        self.code_hl = Rc::new(build_code_highlights_for(&self.rows));
         if std::env::var_os("MD_MEM_DEBUG").is_some() {
             let (n, bytes) = rows_memory_estimate(&self.rows);
             eprintln!(
@@ -492,21 +495,23 @@ impl MarkdownPreview {
 
     /// 为当前窗口建立代码/表格块的稳定横向滚动句柄（键 = 全局块下标）。
     fn build_window_scroll_handles(&mut self) {
-        self.code_scroll.clear();
-        self.table_scroll.clear();
+        let cs = Rc::make_mut(&mut self.code_scroll);
+        let ts = Rc::make_mut(&mut self.table_scroll);
+        cs.clear();
+        ts.clear();
         for (j, r) in self.win_rows.iter().enumerate() {
             let ix = self.win_lo + j;
             match r.kind {
                 RowKind::Code => {
-                    self.code_scroll.insert(ix, ScrollHandle::new());
+                    cs.insert(ix, ScrollHandle::new());
                 }
                 RowKind::Table => {
-                    self.table_scroll.insert(ix, ScrollHandle::new());
+                    ts.insert(ix, ScrollHandle::new());
                 }
                 _ => {}
             }
         }
-        self.code_hl = build_code_highlights_for(&self.win_rows);
+        self.code_hl = Rc::new(build_code_highlights_for(&self.win_rows));
     }
 
     /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
@@ -533,9 +538,9 @@ impl MarkdownPreview {
         self.list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX));
         self.content_w = 0.0;
         self.toc.clear();
-        self.code_scroll.clear();
-        self.code_hl.clear();
-        self.table_scroll.clear();
+        self.code_scroll = Default::default();
+        self.code_hl = Default::default();
+        self.table_scroll = Default::default();
         self.highlight_search = None;
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
         self.est_hint = 0.0;

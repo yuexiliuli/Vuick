@@ -66,6 +66,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
         prebuilt_index: Option<std::rc::Rc<crate::markdown::BlockIndex>>,
     ) {
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
@@ -164,6 +165,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
@@ -218,6 +220,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         // 阅读画布用灰色系（非白面板），让页面“纸面”卡片与画布形成分隔
         let canvas_bg = self.window_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {

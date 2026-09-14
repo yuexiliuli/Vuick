@@ -5,9 +5,11 @@
 //! （选项卡栏之下、状态栏之上）。
 
 use super::*;
-use gpui_component::input::{Input, Position};
+use gpui_component::input::{Input, Position, RopeExt};
 
 use crate::config::limits::SEARCH_RESULT_CAP;
+
+use std::rc::Rc;
 
 /// 侧边栏视图。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -541,6 +543,9 @@ impl EditorApp {
     }
 
     /// 计算并渲染搜索结果（文件名命中 + 行内容命中，按打开顺序排列，封顶）。
+    /// 扫描结果缓存在 [`Self::search_scan`]：查询词/活动文档未变时，反复渲染帧
+    /// 直接 O(1) 复用，不再每帧 O(全文) 重扫（旧逻辑在 render 里逐帧全量扫 + 
+    /// 每行 `to_lowercase()` 分配）。
     fn render_sidebar_search_results(
         &mut self,
         q: &str,
@@ -548,137 +553,114 @@ impl EditorApp {
     ) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
+        let scan = self.sidebar_search_scan(q, cx);
 
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
         let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
-        let mut hits = 0usize;
+        let hits = scan.file_tabs.len() + scan.line_hits.len();
 
         // 文件名匹配（跨所有打开文件）：相当于「打开文件」快速选择器
-        for (ti, tab) in self.tabs.iter().enumerate() {
-            if hits >= SEARCH_RESULT_CAP {
-                break;
-            }
-            let name = tab
+        for ti in scan.file_tabs.iter().copied() {
+            let name = self.tabs[ti]
                 .file_path
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "未命名".to_string());
-            if !name.is_empty() && name.to_lowercase().contains(q) {
-                let row_fg = if ti == self.active_tab { fg } else { muted };
-                let nm = name.clone();
-                let r = div()
-                    .id(SharedString::from(format!("sidebar-search-file-{ti}")))
-                    .debug_selector(move || format!("sidebar-search-file-{ti}"))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .mx(px(4.))
-                    .rounded_md()
-                    .text_color(row_fg)
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(|style| style.bg(active_bg))
-                    .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                        this.activate_tab(ti, window, cx);
-                    }))
-                    .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_size(px(12.))
-                            .text_color(row_fg)
-                            .child(nm),
-                    );
-                file_rows.push(r.into_any_element());
-                hits += 1;
-            }
+            let row_fg = if ti == self.active_tab { fg } else { muted };
+            let nm = name;
+            let r = div()
+                .id(SharedString::from(format!("sidebar-search-file-{ti}")))
+                .debug_selector(move || format!("sidebar-search-file-{ti}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .mx(px(4.))
+                .rounded_md()
+                .text_color(row_fg)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(active_bg))
+                .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                    this.activate_tab(ti, window, cx);
+                }))
+                .child(Icon::new(IconName::File).size(px(13.)).text_color(row_fg))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_size(px(12.))
+                        .text_color(row_fg)
+                        .child(nm),
+                );
+            file_rows.push(r.into_any_element());
         }
 
-        // 行内容匹配：只在「当前活动文档」内搜索——若仍扫描所有打开的选项卡，
+        // 行内容命中：只在「当前活动文档」内搜索——若仍扫描所有打开的选项卡，
         // 在 PDF 预览（PDF 无可搜索文本，content 为空）下会冒出别的文件
         // （如 EPUB 完整正文）的内容，看起来像搜索到了错误文档。
-        if hits < SEARCH_RESULT_CAP {
-            if let Some(tab) = self.tabs.get(self.active_tab) {
-                // 普通文件正文在编辑器 Rope；readonly_preview（EPUB/PDF）在 content
-                let content = if tab.readonly_preview {
-                    tab.content.to_string()
-                } else {
-                    tab.editor.read(cx).value().to_string()
-                };
-                let ti = self.active_tab;
-                for (li, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(q) {
-                        if hits >= SEARCH_RESULT_CAP {
-                            break;
+        let ti = self.active_tab;
+        for hit in &scan.line_hits {
+            let li = hit.line;
+            let match_range = hit.range.clone();
+            let snippet = hit.snippet.clone();
+            let q_owned = scan.query.clone();
+            let r = div()
+                .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
+                .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
+                .px_2()
+                .py_1()
+                .mx(px(4.))
+                .rounded_md()
+                .text_size(px(12.))
+                .text_color(muted)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(active_bg))
+                .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                    this.activate_tab(ti, window, cx);
+                    if let Some(tab) = this.tabs.get(ti) {
+                        if tab.readonly_preview {
+                            // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本
+                            let md = tab.md_preview.clone();
+                            md.update(cx, |v, cx| {
+                                v.scroll_to_line(li);
+                                v.highlight_search(li, &q_owned, cx);
+                            });
+                        } else {
+                            // 预览可见（分屏/全屏）时同步高亮预览中的命中文本
+                            if tab.preview_on || tab.preview_fullscreen {
+                                let md = tab.md_preview.clone();
+                                md.update(cx, |v, cx| {
+                                    v.highlight_search(li, &q_owned, cx);
+                                });
+                            }
+                            let ed = tab.editor.clone();
+                            ed.update(cx, |ed, cx| {
+                                // 先落光标（滚动到该行），再选中命中文本作为高亮
+                                ed.set_cursor_position(
+                                    Position::new(li as u32, 0),
+                                    window,
+                                    cx,
+                                );
+                                ed.set_selected_range(match_range.clone(), cx);
+                            });
                         }
-                        // 命中文本在全文中的字节区间：跳转后选中它作为高亮提示
-                        let match_range = find_match_range(&content, q, li);
-                        let q_owned = q.to_string();
-                        let snippet = line.trim().to_string();
-                        let r = div()
-                            .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
-                            .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
-                            .px_2()
-                            .py_1()
-                            .mx(px(4.))
-                            .rounded_md()
-                            .text_size(px(12.))
-                            .text_color(muted)
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|style| style.bg(active_bg))
-                            .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                                this.activate_tab(ti, window, cx);
-                                if let Some(tab) = this.tabs.get(ti) {
-                                    if tab.readonly_preview {
-                                        // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本
-                                        let md = tab.md_preview.clone();
-                                        md.update(cx, |v, cx| {
-                                            v.scroll_to_line(li);
-                                            v.highlight_search(li, &q_owned, cx);
-                                        });
-                                    } else {
-                                        // 预览可见（分屏/全屏）时同步高亮预览中的命中文本
-                                        if tab.preview_on || tab.preview_fullscreen {
-                                            let md = tab.md_preview.clone();
-                                            md.update(cx, |v, cx| {
-                                                v.highlight_search(li, &q_owned, cx);
-                                            });
-                                        }
-                                        let ed = tab.editor.clone();
-                                        ed.update(cx, |ed, cx| {
-                                            // 先落光标（滚动到该行），再选中命中文本作为高亮
-                                            ed.set_cursor_position(
-                                                Position::new(li as u32, 0),
-                                                window,
-                                                cx,
-                                            );
-                                            if let Some(range) = match_range.clone() {
-                                                ed.set_selected_range(range, cx);
-                                            }
-                                        });
-                                    }
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .child(format!("L{}  {}", li + 1, snippet)),
-                            );
-                        line_rows.push(r.into_any_element());
-                        hits += 1;
                     }
-                }
-            }
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(format!("L{}  {}", li + 1, snippet)),
+                );
+            line_rows.push(r.into_any_element());
         }
 
         let total = hits;
@@ -715,33 +697,176 @@ impl EditorApp {
             .child(div().flex().flex_col().py_1().children(rows))
             .into_any_element()
     }
+
+    /// 侧边栏搜索「扫描并缓存」：查询词 + 活动文档未变时命中缓存（O(1) Rc 克隆，
+    /// 渲染帧不重扫）；否则对文件名（跨全部打开文件）与活动文档行内容扫一次。
+    /// 行内容直接借 `Rope`/`content`（`&str`），不做整份 `to_string()` 物化；
+    /// 匹配用无分配 ASCII 大小写不敏感查找（非 ASCII 查询词回退字符级扫描）。
+    /// 结果在 [`EditorApp::search_scan`] 缓存，编辑/加载/切文档时清空重扫。
+    fn sidebar_search_scan(&mut self, q: &str, cx: &App) -> Rc<SidebarSearchScan> {
+        if let Some(s) = &self.search_scan {
+            if s.tab == self.active_tab && s.query == q {
+                return s.clone();
+            }
+        }
+        self.search_scan_count += 1;
+
+        let mut file_tabs: Vec<usize> = Vec::new();
+        let mut line_hits: Vec<SearchLineHit> = Vec::new();
+        // 文件名匹配（跨所有打开文件）
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
+                break;
+            }
+            let name = tab
+                .file_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default();
+            if contains_ci(&name, q) {
+                file_tabs.push(ti);
+            }
+        }
+        // 行内容命中（仅当前活动文档；readonly 走 content，可编辑走编辑器 Rope）
+        if file_tabs.len() < SEARCH_RESULT_CAP {
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                if tab.readonly_preview {
+                    let content: &str = tab.content.as_ref();
+                    let mut li = 0usize;
+                    let mut doc_offset = 0usize;
+                    for line in content.split('\n') {
+                        if let Some(r) = find_ci(line, q) {
+                            line_hits.push(SearchLineHit {
+                                line: li,
+                                range: (doc_offset + r.start)..(doc_offset + r.end),
+                                snippet: line.trim().to_string(),
+                            });
+                            if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
+                                break;
+                            }
+                        }
+                        li += 1;
+                        doc_offset += line.len() + 1;
+                    }
+                } else {
+                    let rope = tab.editor.read(cx).text();
+                    for (li, lineslice) in rope.iter_lines().enumerate() {
+                        // 常规行在单 chunk 内：`as_str()` 零拷贝借出，逐行扫描不做分配；
+                        // 罕见跨 chunk 的超长行才整行物化一次（`iter_lines` 的 RopeSlice
+                        // 无 Deref<str>，无法直接当 &str 用）。
+                        let found = if let Some(s) = lineslice.as_str() {
+                            find_ci(s, q).map(|r| (r, s.trim().to_string()))
+                        } else {
+                            let owned = lineslice.to_string();
+                            find_ci(&owned, q).map(|r| (r, owned.trim().to_string()))
+                        };
+                        let Some((r, snippet)) = found else { continue };
+                        let line_start = rope.line_start_offset(li);
+                        line_hits.push(SearchLineHit {
+                            line: li,
+                            range: (line_start + r.start)..(line_start + r.end),
+                            snippet,
+                        });
+                        if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let scan = std::rc::Rc::new(SidebarSearchScan {
+            query: q.to_string(),
+            tab: self.active_tab,
+            file_tabs,
+            line_hits,
+        });
+        self.search_scan = Some(scan.clone());
+        scan
+    }
 }
 
-/// 在 `content` 的第 `line` 行（0 基）内查找第一个忽略大小写命中 `q` 的
-/// 文档级字节区间（用于搜索跳转后选中命中文本作为高亮）；未命中返回 `None`。
-fn find_match_range(content: &str, q: &str, line: usize) -> Option<std::ops::Range<usize>> {
-    let needle = q.to_lowercase();
-    let needle_chars = needle.chars().count();
-    if needle_chars == 0 {
+/// 侧边栏搜索一次扫描产出的**命中索引**（渲染复用缓存，不重扫全文）。
+#[derive(Debug, Default)]
+pub(super) struct SidebarSearchScan {
+    /// 归一化后的查询词（trim + to_lowercase，环节点上色与缓存键）。
+    pub(super) query: String,
+    /// 扫描时的活动选项卡下标（缓存键的一部分：切文档自动失效重扫）。
+    pub(super) tab: usize,
+    /// 文件名命中的选项卡下标（按打开顺序）。
+    pub(super) file_tabs: Vec<usize>,
+    /// 当前活动文档中内容命中的行。
+    pub(super) line_hits: Vec<SearchLineHit>,
+}
+
+/// 一行内容命中：行号 + 首个命中文本的文档字节区间 + 展示条目片段。
+#[derive(Debug, Clone)]
+pub(super) struct SearchLineHit {
+    /// 文档行号（0 基）。
+    pub(super) line: usize,
+    /// 首个命中文本的文档字节区间（跳转后选中高亮）。
+    pub(super) range: std::ops::Range<usize>,
+    /// 去掉首尾空白后的行内容（渲染条目显示）。
+    pub(super) snippet: String,
+}
+
+/// ASCII 大小写不敏感子串查找（无分配），返回首个命中的字节区间。
+/// 仅当 `needle` 全 ASCII 时走 `memchr` 加速的字节快路径（用 `memchr2` 同时搜
+/// 首字节大小写两种形式，命中再逐字节校验余下部分）：UTF-8 多字节序列的内部字节
+/// 都 ≥ 0x80，因此纯 ASCII 命中必然落在字符边界上，返回的区间始终合法。
+/// 非 ASCII 查询词回退到与原逻辑等价的字符级大小写折叠扫描（保留原语义）。
+pub(super) fn find_ci(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+    if needle.is_empty() {
         return None;
     }
-    let mut doc_pos = 0usize;
-    for (li, l) in content.split('\n').enumerate() {
-        if li == line {
-            let mut i = 0usize;
-            while i < l.len() {
-                let Some(ch) = l[i..].chars().next() else {
-                    break;
-                };
-                let candidate: String = l[i..].chars().take(needle_chars).collect();
-                if !candidate.is_empty() && candidate.to_lowercase() == needle {
-                    return Some((doc_pos + i)..(doc_pos + i + candidate.len()));
-                }
-                i += ch.len_utf8();
-            }
+    if needle.is_ascii() {
+        let h = haystack.as_bytes();
+        let n = needle.as_bytes();
+        if n.len() > h.len() {
             return None;
         }
-        doc_pos += l.len() + 1;
+        let first = n[0];
+        // 同时搜首字节的 ASCII 大小写两种形式（字母大小写差 0x20）
+        let first_alt = if first.is_ascii_alphabetic() {
+            first ^ 0x20
+        } else {
+            first
+        };
+        let mut pos = 0usize;
+        while let Some(rel) = memchr::memchr2(first, first_alt, &h[pos..]) {
+            let at = pos + rel;
+            if at + n.len() <= h.len() {
+                let mut ok = true;
+                for (j, &nb) in n.iter().enumerate().skip(1) {
+                    if h[at + j].to_ascii_lowercase() != nb {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    return Some(at..(at + n.len()));
+                }
+            }
+            pos = at + 1;
+        }
+        return None;
+    }
+    // 非 ASCII needle：字符级大小写折叠比较
+    let needle_chars = needle.chars().count();
+    let mut i = 0usize;
+    while i < haystack.len() {
+        let candidate: String = haystack[i..].chars().take(needle_chars).collect();
+        if !candidate.is_empty() && candidate.to_lowercase() == needle {
+            return Some(i..(i + candidate.len()));
+        }
+        let ch = haystack[i..].chars().next()?;
+        i += ch.len_utf8();
     }
     None
+}
+
+/// ASCII 大小写不敏感子串是否存在（无分配；语义与旧 `to_lowercase().contains()` 一致）。
+pub(super) fn contains_ci(haystack: &str, needle: &str) -> bool {
+    find_ci(haystack, needle).is_some()
 }

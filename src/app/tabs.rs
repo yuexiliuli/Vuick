@@ -26,6 +26,8 @@ impl EditorApp {
         let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &InputEvent, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
                 if let InputEvent::Change = ev {
+                    // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）
+                    this.search_scan = None;
                     let (value, cursor_position) = {
                         let state = tab.editor.read(cx);
                         (state.value(), state.cursor_position())
@@ -217,6 +219,7 @@ impl EditorApp {
         if idx >= self.tabs.len() {
             return;
         }
+        self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         if self.tabs.len() == 1 {
             let tab = &mut self.tabs[0];
             tab.editor.update(cx, |ed, cx| {
