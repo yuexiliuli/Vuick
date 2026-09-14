@@ -1476,6 +1476,138 @@
         let _ = std::fs::remove_file(&p);
     }
 
+    /// #4 回归：编辑去抖到点后的预览同步走「后台 `scan_blocks`」路径，且内容**真实更新**
+    /// （新路径在后台线程扫描块索引，UI 线程只做快照 + 装配——不能只动机制不落内容）。
+    #[gpui::test]
+    async fn preview_syncs_content_after_debounce(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-bgpreview.md");
+        std::fs::write(&p, "# 初始标题\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let preview = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.clone()
+        });
+        let t0 = cx.update(|_w, cx| preview.read(cx).rendered_text());
+        assert!(t0.contains("初始标题"), "打开时预览应含初始标题，实际 {t0:?}");
+
+        // 真实编辑：粘贴触发 InputEvent::Change
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("新增段落".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).preview_pending),
+            "编辑后应进入去抖挂起"
+        );
+        // 推进 250ms 让去抖计时到点，再驱动后台 scan_blocks 完成并装配
+        cx.executor().advance_clock(std::time::Duration::from_millis(250));
+        for _ in 0..30 {
+            cx.run_until_parked();
+        }
+        let t1 = cx.update(|_w, cx| preview.read(cx).rendered_text());
+        assert!(
+            t1.contains("新增段落"),
+            "去抖后预览应同步到新内容（后台扫描路径），实际 {t1:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// #4 回归：快速连续两次编辑（第一轮后台扫描可能被第二轮抢占/丢弃），最终预览
+    /// 必须收敛到**最新**内容，旧轮结果不得覆盖新编辑（`preview_seq` 代次守卫）。
+    #[gpui::test]
+    async fn preview_sync_rapid_edits_converges_without_stale_override(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join("gpui-bgpreview2.md");
+        std::fs::write(&p, "A\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let preview = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.clone()
+        });
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        // 第一次编辑 → 250ms（第一轮计时到点，开始后台扫描）
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("B".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        cx.executor().advance_clock(std::time::Duration::from_millis(250));
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        // 第二次编辑 → 再 250ms（第二轮接管），最终预览应含 B、C 且不为旧内容覆盖
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("C".to_string()));
+        cx.dispatch_action(gpui_component::input::Paste);
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        cx.executor().advance_clock(std::time::Duration::from_millis(250));
+        for _ in 0..30 {
+            cx.run_until_parked();
+        }
+        let t = cx.update(|_w, cx| preview.read(cx).rendered_text());
+        assert!(
+            t.contains("C") && t.contains("B"),
+            "最终预览应含两次编辑内容（收敛到最新），实际 {t:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// 基准：大文档预览同步里 `scan_blocks` 的代价（#4 把它从 UI 线程挪到后台）。
+    /// 打印、不构成断言；`--ignored` 运行。
+    #[test]
+    #[ignore]
+    fn bench_preview_sync_scan_blocks_off_ui_thread() {
+        use std::time::Instant;
+        let block = "# 章节标题\n\n正文段落 alpha beta 关键字 shanghai\n\n- 列表项\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let mut doc = String::with_capacity(block.len() * 12000);
+        for _ in 0..12000 {
+            doc.push_str(block);
+        }
+        // 旧路径 UI 线程同步成本 = value().to_string() + scan_blocks（都占 UI）
+        let t0 = Instant::now();
+        let idx = crate::markdown::scan_blocks(&doc);
+        let scan = t0.elapsed();
+        // 新路径 UI 线程只做快照（value() 的 SharedString 物化），scan_blocks 在后台
+        let t1 = Instant::now();
+        let _ = std::hint::black_box(gpui::SharedString::from(doc.clone()));
+        let snap = t1.elapsed();
+        println!(
+            "大文档预览同步（{} 行 / {} MB，{} 块）：scan_blocks={}ms（已转后台不占 UI），UI 快照仅 {}ms",
+            doc.lines().count(),
+            doc.len() / 1024 / 1024,
+            idx.blocks.len(),
+            scan.as_millis(),
+            snap.as_millis(),
+        );
+    }
+
     /// 回归：首次在新选项卡编辑内容后打开预览，预览应默认换行
     /// （不出现单行横向滚动），与「md 文件打开即换行」一致。
     #[gpui::test]

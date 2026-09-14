@@ -93,8 +93,11 @@ pub struct EditorApp {
     status_ok: bool,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
-    /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）
+    /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）。
     preview_pending: bool,
+    /// 预览同步的代序号：每轮去抖发起时 +1；后台 `scan_blocks` 结果只允许最新代
+    /// 落盘，旧代迟到结果直接丢弃（防旧内容覆盖新编辑）。
+    preview_seq: u64,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
@@ -174,6 +177,7 @@ impl EditorApp {
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
             preview_pending: false,
+            preview_seq: 0,
             dark_mode: false,
             split_ratio: 0.5,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。

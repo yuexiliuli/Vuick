@@ -530,6 +530,17 @@ impl MarkdownPreview {
         }
     }
 
+    /// 拼出已物化预览行的纯文本（测试/诊断用：验证预览内容是否同步到最新）。
+    /// 窗口模式下仅返回当前窗口已物化的行（小文档全量路径返回整篇）。
+    #[cfg(test)]
+    pub(crate) fn rendered_text(&self) -> String {
+        let rows: Vec<&str> = match &self.index {
+            Some(_) => self.win_rows.iter().map(|r| r.text.as_ref()).collect(),
+            None => self.rows.iter().map(|r| r.text.as_ref()).collect(),
+        };
+        rows.join("\n")
+    }
+
     /// 释放预览重资源（解析出的行数据 + 列表测量缓存），关闭预览时调用。
     /// 否则隐藏的预览仍占着整篇文档的解析结果；反复开关预览会积累内存。
     /// 下次开启预览时 [`Self::set_source`] 会重新解析，行为不变。

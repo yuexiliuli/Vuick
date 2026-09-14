@@ -230,12 +230,18 @@ impl PdfViewer {
         let viewport_h = f32::from(self.scroll.bounds().size.height);
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
 
-        // 规划：要渲染的页 + 要淘汰位图的页（保留策略见 plan_page_work）
-        let rendered: Vec<bool> = self.slots.iter().map(|s| s.image.is_some()).collect();
-        let loading: Vec<bool> = self.slots.iter().map(|s| s.loading).collect();
-        let rendered_generation: Vec<u64> = self.slots.iter().map(|s| s.generation).collect();
-        let (to_render, to_evict_idx) =
-            plan_page_work(&rendered, &loading, start, end, generation, &rendered_generation);
+        // 规划：要渲染的页 + 要淘汰位图的页（保留策略见 plan_page_work）。
+        // 直接以闭包逐页投影 slots 的状态，不再按总页数物化 Vec<bool>/Vec<u64>
+        //（旧版每帧 3×O(总页数) 堆分配，几百上千页的 PDF 纯浪费）。
+        let (to_render, to_evict_idx) = plan_page_work(
+            self.slots.len(),
+            start,
+            end,
+            generation,
+            |i| self.slots[i].image.is_some(),
+            |i| self.slots[i].loading,
+            |i| self.slots[i].generation,
+        );
         let mut to_evict: Vec<Arc<RenderImage>> = Vec::new();
         for i in to_evict_idx {
             if let Some(slot) = self.slots.get_mut(i) {

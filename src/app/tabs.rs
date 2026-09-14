@@ -34,26 +34,69 @@ impl EditorApp {
                     };
                     // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖：
                     // 打字时不逐键整篇重解析+重建虚拟化列表，停止后片刻再同步。
+                    // 大文档的 `scan_blocks`（整篇块索引扫描，16 万行几百 ms）放到
+                    // **后台线程**做，UI 线程只留快照与装配；用 `preview_seq` 保证
+                    // 只有最新一轮的结果落盘，旧轮迟到结果丢弃（不覆盖新编辑）。
                     if tab.preview_on && !this.preview_pending {
                         this.preview_pending = true;
+                        this.preview_seq = this.preview_seq.wrapping_add(1);
+                        let seq = this.preview_seq;
                         cx.spawn(async move |this, cx| {
                             cx.background_executor()
                                 .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
                                 .await;
+                            // 1) UI 线程：释放去抖闸门（扫描期间新编辑可开启新一轮），
+                            //    快照当前正文；预览已关则直接结束。
+                            let Some((snapshot, panel_bg, base_dir)) =
+                                this.update(cx, |this, cx| {
+                                    this.preview_pending = false;
+                                    let panel_bg = this.panel_bg();
+                                    let base_dir = this
+                                        .tabs
+                                        .get(this.active_tab)
+                                        .and_then(|t| t.file_path.as_ref())
+                                        .and_then(|p| p.parent())
+                                        .map(|d| d.to_path_buf());
+                                    let snapshot = this
+                                        .tabs
+                                        .get(this.active_tab)
+                                        .filter(|t| t.preview_on)
+                                        .map(|t| t.editor.read(cx).value());
+                                    snapshot.map(|snap| (snap, panel_bg, base_dir))
+                                })
+                                .ok()
+                                .flatten()
+                            else {
+                                return;
+                            };
+                            // 2) 后台线程：整篇块索引扫描（纯 CPU，不阻塞 UI）
+                            let scan_src = snapshot.clone();
+                            let index = cx
+                                .background_executor()
+                                .spawn(async move { crate::markdown::scan_blocks(&scan_src) })
+                                .await;
+                            // 3) UI 线程：仍是最新一代且正文未再变才装配（旧轮结果不覆盖）
                             let _ = this.update(cx, |this, cx| {
-                                this.preview_pending = false;
-                                let panel_bg = this.panel_bg();
+                                if this.preview_seq != seq {
+                                    return;
+                                }
                                 if let Some(tab) = this.tabs.get_mut(this.active_tab) {
                                     if tab.preview_on {
-                                        let value = tab.editor.read(cx).value();
-                                        tab.md_preview.update(cx, |view, cx| {
-                                            view.set_background(panel_bg);
-                                            view.set_base_dir(tab.file_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
-                                            view.set_source(value.as_ref(), cx);
-                                        });
+                                        let current = tab.editor.read(cx).value();
+                                        if current == snapshot {
+                                            tab.md_preview.update(cx, |view, cx| {
+                                                view.set_background(panel_bg);
+                                                view.set_base_dir(base_dir);
+                                                view.set_source_with_index(
+                                                    &snapshot,
+                                                    std::rc::Rc::new(index),
+                                                    cx,
+                                                );
+                                            });
+                                            cx.notify();
+                                        }
                                     }
                                 }
-                                cx.notify();
                             });
                         })
                         .detach();

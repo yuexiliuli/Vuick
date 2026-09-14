@@ -92,8 +92,12 @@ pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f3
     }
 }
 
-/// 每帧的页工作规划（纯函数，便于测试）：根据每页当前是否“已渲染/正在加载/代次”，
-/// 决定 (需要渲染的页, 需要淘汰位图的页)。
+/// 每帧的页工作规划（纯函数，便于测试）：通过投影闭包按页号读取「是否已渲染 /
+/// 是否正在加载 / 渲染代次」，决定 (需要渲染的页, 需要淘汰位图的页)。
+///
+/// **不物化任何按总页数的临时数组**：旧版在 `view.rs` 每帧先按全文页数构造
+/// `Vec<bool>`×2 + `Vec<u64>`（几百上千页时每帧三次堆分配），再传给本函数；
+/// 这里改为闭包逐页投影，渲染帧零额外分配。
 ///
 /// - **渲染**：可见区内既**未渲染**又**未在加载中**（或位图代次过期）的页。
 ///   正在加载的页绝不再派发任务，避免每个可见帧都重复栅格化同一页。
@@ -101,35 +105,35 @@ pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f3
 ///   才把**离当前视口中心最远**的页依次回收直到回到预算内。预算内任一页——无论多靠前
 ///   多靠后——都保留，因此「往下翻很多页再倒回去」命中缓存，不重新加载。
 pub(crate) fn plan_page_work(
-    rendered: &[bool],
-    loading: &[bool],
+    page_count: usize,
     start: usize,
     end: usize,
     generation: u64,
-    rendered_generation: &[u64],
+    is_rendered: impl Fn(usize) -> bool,
+    is_loading: impl Fn(usize) -> bool,
+    rendered_generation: impl Fn(usize) -> u64,
 ) -> (Vec<usize>, Vec<usize>) {
-    let dims_len = rendered.len();
+    let last = page_count.saturating_sub(1);
     let mut to_render: Vec<usize> = Vec::new();
-    for i in start..=end.min(dims_len.saturating_sub(1)) {
-        let needs_render =
-            !rendered[i] || rendered_generation.get(i).copied() != Some(generation);
-        if needs_render && !loading[i] {
+    for i in start..=end.min(last) {
+        let needs_render = !is_rendered(i) || rendered_generation(i) != generation;
+        if needs_render && !is_loading(i) {
             to_render.push(i);
         }
     }
 
-    let retained = rendered.iter().filter(|r| **r).count();
+    let mut retained = 0usize;
+    for i in 0..page_count {
+        if is_rendered(i) {
+            retained += 1;
+        }
+    }
     if retained <= CACHE_MAX_PAGES {
         return (to_render, Vec::new());
     }
     // 预算已满：离中心最远优先淘汰（等距取索引小者，保证确定性）
     let center = (start + end) / 2;
-    let mut candidates: Vec<usize> = rendered
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| **r)
-        .map(|(i, _)| i)
-        .collect();
+    let mut candidates: Vec<usize> = (0..page_count).filter(|&i| is_rendered(i)).collect();
     candidates.sort_by_key(|&i| (std::cmp::Reverse((i as i64 - center as i64).abs()), i));
     let mut to_evict: Vec<usize> = Vec::new();
     for i in candidates {
@@ -198,7 +202,16 @@ mod tests {
         let rendered = [true, false, false, false, false, false, false, false, false, false];
         let loading = [false; 10];
         let gens = [0u64; 10];
-        let (render, evict) = plan_page_work(&rendered, &loading, 0, 2, 0, &gens);
+        let n = rendered.len();
+        let (render, evict) = plan_page_work(
+            n,
+            0,
+            2,
+            0,
+            |i| rendered[i],
+            |i| loading[i],
+            |i| gens[i],
+        );
         assert_eq!(render, vec![1, 2], "仅未渲染的可见页应列入渲染");
         assert!(evict.is_empty(), "无越界已渲染页不应淘汰");
     }
@@ -210,7 +223,16 @@ mod tests {
         let mut loading = [false; 10];
         loading[1] = true;
         let gens = [0u64; 10];
-        let (render, _) = plan_page_work(&rendered, &loading, 0, 2, 0, &gens);
+        let n = rendered.len();
+        let (render, _) = plan_page_work(
+            n,
+            0,
+            2,
+            0,
+            |i| rendered[i],
+            |i| loading[i],
+            |i| gens[i],
+        );
         assert!(
             !render.contains(&1),
             "正在加载的页 1 不应重复派发（杜绝每帧重栅格化）"
@@ -221,12 +243,19 @@ mod tests {
     #[test]
     fn plan_keeps_rendered_pages_within_budget() {
         // 200 页：仅第 10 页渲染，其余未渲染。预算 CACHE_MAX_PAGES，远未满 → 第 10 页必须保留。
-        let mut rendered = vec![false; 200];
-        let mut gens = vec![0u64; 200];
-        let loading = vec![false; 200];
-        rendered[10] = true;
-        gens[10] = 0;
-        let (_r, evict) = plan_page_work(&rendered, &loading, 50, 55, 0, &gens);
+        let n = 200usize;
+        let rendered = vec![false; n];
+        let gens = vec![0u64; n];
+        let loading = vec![false; n];
+        let (_r, evict) = plan_page_work(
+            n,
+            50,
+            55,
+            0,
+            |i| i == 10 || rendered[i],
+            |i| loading[i],
+            |i| gens[i],
+        );
         assert!(evict.is_empty(), "预算未满不应淘汰任何页（即使远在 40 页之外）");
     }
 
@@ -235,10 +264,17 @@ mod tests {
         // 200 页都渲染（超预算 CACHE_MAX_PAGES），视口在 [100,105]。
         // 应淘汰离中心最远的页（最前/最后），而可见页绝不能被淘汰。
         let n = 200usize;
-        let rendered = vec![true; n];
-        let gens = vec![0u64; n];
         let loading = vec![false; n];
-        let (r, evict) = plan_page_work(&rendered, &loading, 100, 105, 0, &gens);
+        let gens = vec![0u64; n];
+        let (r, evict) = plan_page_work(
+            n,
+            100,
+            105,
+            0,
+            |_| true,
+            |i| loading[i],
+            |i| gens[i],
+        );
         assert!(r.is_empty(), "全部已渲染，无需再渲染");
         // 回收到预算内
         assert_eq!(n - evict.len(), CACHE_MAX_PAGES, "保留数应等于预算");
@@ -261,7 +297,15 @@ mod tests {
         for step in -100i64..=100 {
             let base = (50 + step * 2).clamp(0, (n as i64) - 6) as usize;
             let (start, end) = (base, (base + 5).min(n - 1));
-            let (to_render, to_evict) = plan_page_work(&rendered, &loading, start, end, 0, &gens);
+            let (to_render, to_evict) = plan_page_work(
+                n,
+                start,
+                end,
+                0,
+                |i| rendered[i],
+                |i| loading[i],
+                |i| gens[i],
+            );
             // 记录本轮“需要重新加载”的页（应只含“从未渲染过”的页）
             for i in &to_render {
                 assert!(
@@ -300,5 +344,71 @@ mod tests {
         // 超大 DPI（Retina 2x）也要封顶
         let s2 = render_scale(840.0, 2.0, 100.0);
         assert!(s2 <= MAX_RENDER_SCALE);
+    }
+
+    /// 基准：`plan_page_work` 每帧「先按总页数物化 3 个 Vec 再规划」 vs
+    /// 「闭包投影直接规划」（[`Self`] 里被 `view.rs` 每帧调用）。
+    /// 打印、不构成断言；`--ignored` 运行（匹配项目既有 bench 惯例）。
+    #[test]
+    #[ignore]
+    fn bench_plan_page_work_vec_materialize_vs_closure_projection() {
+        use std::time::Instant;
+        let n = 2000usize;
+        let mut rendered = vec![false; n];
+        let loading = vec![false; n];
+        let mut gens = vec![0u64; n];
+        for (i, r) in rendered.iter_mut().enumerate() {
+            if i % 3 == 0 {
+                *r = true;
+                gens[i] = 1;
+            }
+        }
+        let (start, end) = (950usize, 1050usize);
+        let generation = 1u64;
+        let runs = 1000usize;
+
+        // 旧路径：每帧先按总页数物化 3 个 Vec（要消除的成本）
+        let t0 = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..runs {
+            let r: Vec<bool> = rendered.iter().copied().collect();
+            let l: Vec<bool> = loading.iter().copied().collect();
+            let g: Vec<u64> = gens.iter().copied().collect();
+            let (tr, _ev) = plan_page_work(
+                n,
+                start,
+                end,
+                generation,
+                |i| r[i],
+                |i| l[i],
+                |i| g[i],
+            );
+            sink = sink.wrapping_add(tr.len());
+        }
+        let old = t0.elapsed();
+
+        // 新路径：闭包直接投影 slots 状态，零按总页数分配
+        let t1 = Instant::now();
+        let mut sink2 = 0usize;
+        for _ in 0..runs {
+            let (tr, _ev) = plan_page_work(
+                n,
+                start,
+                end,
+                generation,
+                |i| rendered[i],
+                |i| loading[i],
+                |i| gens[i],
+            );
+            sink2 = sink2.wrapping_add(tr.len());
+        }
+        let new_ = t1.elapsed();
+        assert_eq!(sink, sink2, "两种路径规划结果必须一致");
+        println!(
+            "PDF plan_page_work（{n} 页 × {runs} 帧）：旧(每帧物化 3 Vec)={}ms, 新(闭包投影)={}ms（提升 {:.1}x）",
+            old.as_millis(),
+            new_.as_millis(),
+            old.as_secs_f64() / new_.as_secs_f64().max(1e-9),
+        );
     }
 }
