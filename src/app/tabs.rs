@@ -257,7 +257,7 @@ impl EditorApp {
 
     pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_tab;
-        let (text_primary, text_minor, tab_active_bg, tab_active_border, chip_bg, chip_text, bar_bg, bar_border) = (
+        let (text_primary, text_minor, tab_active_bg, tab_active_border, chip_bg, chip_text, bar_bg, panel_bg) = (
             self.text_primary(),
             self.text_minor(),
             self.tab_active_bg(),
@@ -265,7 +265,7 @@ impl EditorApp {
             self.chip_bg(),
             self.chip_text(),
             self.bar_bg(),
-            self.bar_border(),
+            self.panel_bg(),
         );
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -299,40 +299,52 @@ impl EditorApp {
                     }),
                 );
 
-            tabs.push(
+            // 激活选项卡顶部 2px 蓝色强调线（色 = scrollbar::RESIZE_ACCENT）。
+            // 用绝对定位细条绘制：本版 gpui 的 border_color 是整圈一个色，
+            // 没有“只染某一边”的 API，无法用 border 实现顶蓝其余透明。
+            let accent = is_active.then(|| {
                 div()
-                    .id(SharedString::from(format!("tab-{idx}")))
-                    .h(px(26.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .flex_shrink(1.)
-                    .rounded_md()
-                    .bg(if is_active {
-                        tab_active_bg
-                    } else {
-                        rgba(0x00000000).into()
-                    })
-                    .border_1()
-                    .border_color(if is_active {
-                        tab_active_border
-                    } else {
-                        rgba(0x00000000).into()
-                    })
-                    .cursor(CursorStyle::PointingHand)
-                    .text_size(px(12.))
-                    .text_color(text_primary)
-                    .child(if dirty { "● " } else { "" })
-                    .child(name)
-                    .child(close)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                            this.activate_tab(idx, window, cx);
-                        }),
-                    )
-                    .into_any_element(),
+                    .id(SharedString::from(format!("tab-accent-{idx}")))
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(1.))
+                    .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
+                    .into_any_element()
+            });
+
+            let mut el = div()
+                .id(SharedString::from(format!("tab-{idx}")))
+                .h_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .flex_shrink(1.)
+                .relative()
+                .bg(if is_active {
+                    panel_bg
+                } else {
+                    rgba(0x00000000).into()
+                })
+                .cursor(CursorStyle::PointingHand)
+                .text_size(px(12.))
+                .text_color(text_primary)
+                .child(if dirty { "● " } else { "" })
+                .child(name)
+                .child(close);
+            if let Some(accent) = accent {
+                el = el.child(accent);
+            }
+            tabs.push(
+                el.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                        this.activate_tab(idx, window, cx);
+                    }),
+                )
+                .into_any_element(),
             );
         }
 
@@ -462,23 +474,22 @@ impl EditorApp {
             .id("tab-bar")
             .relative()
             .w_full()
-            .px_2()
-            .py_1()
+            // 左侧不留内边距：第一个选项卡紧贴窗口左边缘；右侧保留 px_2 给新建/眼睛按钮
+            .pl_0()
+            .pr_2()
             .flex()
             .items_center()
             .gap_1()
             .bg(bar_bg)
-            .border_b_1()
-            .border_color(bar_border)
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
-            // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变原 34px 高度。
+            // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变整体高度。
             .child(
                 div()
                     .id("tab-bar-scroll")
                     .relative()
                     .flex_1()
                     .min_w(px(0.))
-                    .h(px(26.))
+                    .h(px(32.))
                     .child(
                         div()
                             .id("tab-bar-tabs")
@@ -486,7 +497,7 @@ impl EditorApp {
                             .h_full()
                             .flex()
                             .flex_row()
-                            .items_center()
+                            .items_stretch()
                             .gap_1()
                             .overflow_x_scroll()
                             .track_scroll(&self.tab_bar_hscroll.handle)
