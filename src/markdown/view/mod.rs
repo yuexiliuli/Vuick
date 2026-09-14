@@ -41,8 +41,8 @@ use crate::config::limits::{WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS};
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parser::{
-    parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, Row, RowKind,
-    RowPayload,
+    parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, BlockMeta,
+    Row, RowKind, RowPayload,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
@@ -88,6 +88,13 @@ pub struct MarkdownPreview {
     est_hint: f32,
     /// 生成 `est_hint` 时的视口宽度（px）；<0 表示尚未按宽度估算（需要重算）。
     est_hint_width: f32,
+    /// 「统一行高提示」上次应用到的 (行数, 提示值)。同一 (行数, 提示值) 只应用一次：
+    /// `with_uniform_item_height` 会逐项物化整棵 SumTree（16 万块一次 30~90ms），
+    /// 若每帧都补会直接卡死；记忆后只有块数变化/换宽/换源才重做。
+    hint_applied: Option<(usize, f32)>,
+    /// 提示被 gpui 首布局按宽度变化清掉后，本轮是否已补过一份（补后不再反复补，
+    /// 防每帧 O(块数) 重建的无限循环）。
+    hint_recovered: bool,
     /// 大文档「窗口级懒解析」的整篇轻量块索引；`None` = 小文档走全量 `rows`。
     index: Option<Rc<BlockIndex>>,
     /// 窗口模式下保留的原始 markdown（窗口重解析需要）。
@@ -119,6 +126,8 @@ impl MarkdownPreview {
             highlight_seq: 0,
             est_hint: 0.0,
             est_hint_width: -1.0,
+            hint_applied: None,
+            hint_recovered: false,
             index: None,
             src_buf: None,
             win_lo: 0,
@@ -325,10 +334,20 @@ impl MarkdownPreview {
             self.code_scroll = Default::default();
             self.code_hl = Default::default();
             self.table_scroll = Default::default();
-            self.list_state =
-                ListState::new(index.blocks.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
-            // 恢复到更新前的滚动位置（块号越界自动夹紧到文末）
-            self.list_state.scroll_to(prev_scroll);
+            let new_n = index.blocks.len();
+            if new_n == self.list_state.item_count() {
+                // 块数未变（最常见的小编辑）：复用列表状态——保留 `last_layout_bounds`
+                // 与统一高度提示，避免 gpui 每帧按宽度变化 O(块数) 清空/重建；只重测高度。
+                self.list_state.remeasure();
+            } else {
+                // 块数变化：重建列表 + 恢复到更新前的滚动位置（块号越界自动夹紧到文末），
+                // 并把「统一高度提示」标记为待应用（一次性 O(n)，不再每帧重复）。
+                self.list_state =
+                    ListState::new(new_n, ListAlignment::Top, px(ROW_OVERDRAW_PX));
+                self.list_state.scroll_to(prev_scroll);
+                self.hint_applied = None;
+                self.hint_recovered = false;
+            }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>()
@@ -404,6 +423,8 @@ impl MarkdownPreview {
                 ListState::new(self.rows.len(), ListAlignment::Top, px(ROW_OVERDRAW_PX));
             // 行数变化只会重建列表：把滚动恢复到更新前的逻辑位置，避免跳回开头
             self.list_state.scroll_to(prev_scroll);
+            self.hint_applied = None;
+            self.hint_recovered = false;
         } else {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();
@@ -490,6 +511,7 @@ impl MarkdownPreview {
         if !self.win_rows.is_empty() && cur_lo <= want_lo && cur_hi >= want_hi {
             return;
         }
+        let _t = crate::prof::begin();
         let margin = WINDOWED_OVERDRAW_BLOCKS.min(n / 2);
         let w_lo = want_lo.saturating_sub(margin);
         let w_hi = (want_hi + margin).min(n - 1);
@@ -498,6 +520,7 @@ impl MarkdownPreview {
         self.win_lo = w_lo;
         self.win_rows = Rc::new(rows);
         self.build_window_scroll_handles();
+        crate::prof::end("md_ensure_window", _t);
     }
 
     /// 为当前窗口建立代码/表格块的稳定横向滚动句柄（键 = 全局块下标）。
@@ -563,6 +586,8 @@ impl MarkdownPreview {
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
         self.est_hint = 0.0;
         self.est_hint_width = -1.0;
+        self.hint_applied = None;
+        self.hint_recovered = false;
         self.index = None;
         self.src_buf = None;
         self.win_lo = 0;
@@ -590,43 +615,26 @@ impl MarkdownPreview {
                 if idx.blocks.is_empty() {
                     return p.body_row_hint().as_f32();
                 }
-                let mut total = 0.0f32;                for b in &idx.blocks {
-                    let h = match b.kind {
-                        RowKind::Blank => p.blank_h.as_f32(),
-                        RowKind::Rule => p.rule_h.as_f32(),
-                        RowKind::Code => {
-                            (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32()
-                        }
-                        RowKind::Table => {
-                            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-                            (1.0 + b.aux as f32) * row_h + 2.0 + 8.0
-                        }
-                        RowKind::Image => IMAGE_ROW_DEFAULT_H,
-                        RowKind::Heading(hh) => {
-                            let (fs, lh) = p.heading_metrics(hh);
-                            if wrap {
-                                est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32
-                                    * lh.as_f32()
-                                    + 8.0
-                            } else {
-                                lh.as_f32()
-                            }
-                        }
-                        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
-                            if wrap {
-                                let lines = est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32())
-                                    .max(1) as f32;
-                                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
-                                    + p.para_gap.as_f32()
-                                    + 8.0
-                            } else {
-                                p.para_line.as_f32() + p.para_gap.as_f32()
-                            }
-                        }
-                    };
-                    total += h;
-                }
-                (idx.blocks.len(), total)
+                // 大文档的块索引有十几万条：平均行高按**等距采样**估算（预算 ~256 块），
+                // 避免每次换源/字号变化在 UI 线程全量遍历——采样误差只让滚动条映射
+                // 轻微非线性，随行真正渲染后由 `update_height_hint` 收敛，无需精确。
+                let n = idx.blocks.len();
+                let budget = 256usize;
+                let total = if n <= budget {
+                    idx.blocks
+                        .iter()
+                        .map(|b| index_block_height(b, p, wrap, avail))
+                        .sum::<f32>()
+                } else {
+                    let step = n as f64 / budget as f64;
+                    let mut sum = 0.0f32;
+                    for k in 0..budget {
+                        let i = (k as f64 * step).floor() as usize;
+                        sum += index_block_height(&idx.blocks[i], p, wrap, avail);
+                    }
+                    sum / budget as f32 * n as f32
+                };
+                (n, total)
             }
             None => {
                 if self.rows.is_empty() {
@@ -689,9 +697,12 @@ impl MarkdownPreview {
     /// 背景：gpui 的 `list` 元素在**首次布局/视口宽度变化**时的 prepaint 里会把所有
     /// 未测量项的 size_hint 清为 `None`（`list.rs`，比较 `last_layout_bounds` 宽度），
     /// 之后滚动条总高就只算可见行、无法一开始拖到全文。这里每次渲染用 O(1) 的
-    /// summary 总高对账：发现总高远小于「行数×平均高」（提示已被清掉）就重新套用；
-    /// 套用**不重建** ListState（保 `last_layout_bounds`，下一帧 prepaint 不再清），
-    /// 并返回 `true` 让调用方 `cx.notify()` 多画一帧闭环。收敛后不再触发，不无限重画。
+    /// summary 总高对账：发现总高远小于「行数×平均高」（提示已被清掉）就重新套用。
+    ///
+    /// 关键约束：`with_uniform_item_height` 会**逐项物化整棵 SumTree**（16 万块一次
+    /// 30~90ms），绝对不能在每一帧或每次重同步都调用。这里用 `hint_applied` 记忆
+    /// 「(行数, 提示值) 已应用」：只有块数/宽度变化或换源才重做一次；若提示被 gpui
+    /// 首布局按宽度变化清掉，则**每轮至多补一次**（`hint_recovered`），不再无限循环。
     fn update_height_hint(&mut self, cx: &mut App, width: f32) -> bool {
         let n = self.item_count();
         if n == 0 {
@@ -714,12 +725,19 @@ impl MarkdownPreview {
         let summary_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
             + self.list_state.viewport_bounds().size.height.as_f32();
         let expected = n as f32 * hint;
-        if summary_h >= expected * 0.5 {
-            // 提示仍有效（或已被测量行撑到足够高）→ 无需处理
-            return false;
+        if self.hint_applied == Some((n, hint)) {
+            // 已应用；只有当提示被清掉（gpui 换宽清空）才补一次，且每轮至多补一次
+            if summary_h >= expected * 0.5 || self.hint_recovered {
+                return false;
+            }
+            self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
+            self.hint_recovered = true;
+            return true;
         }
-        // 提示被清掉 → 不重建、原地重新填满（保留 last_layout_bounds，避免下次 prepaint 再清）
+        // 首次 / 块数或宽度变化 / 换源：应用一次 O(n)，之后由 `hint_applied` 记忆
         self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
+        self.hint_applied = Some((n, hint));
+        self.hint_recovered = false;
         true
     }
 }
@@ -753,6 +771,40 @@ fn build_code_highlights_for(rows: &[Row]) -> std::collections::HashMap<usize, R
     hl
 }
 
+/// 单一「块元数据」的平均高度估算（窗口模式：只靠元数据，不物化 Row）。
+/// 与 [`MarkdownPreview::estimated_avg_row_height`] 里 rows 全量路径的公式一一对应。
+fn index_block_height(b: &BlockMeta, p: &StyleParams, wrap: bool, avail: f32) -> f32 {
+    match b.kind {
+        RowKind::Blank => p.blank_h.as_f32(),
+        RowKind::Rule => p.rule_h.as_f32(),
+        RowKind::Code => (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32(),
+        RowKind::Table => {
+            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+            (1.0 + b.aux as f32) * row_h + 2.0 + 8.0
+        }
+        RowKind::Image => IMAGE_ROW_DEFAULT_H,
+        RowKind::Heading(hh) => {
+            let (fs, lh) = p.heading_metrics(hh);
+            if wrap {
+                est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
+            } else {
+                lh.as_f32()
+            }
+        }
+        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+            if wrap {
+                let lines =
+                    est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
+                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
+                    + p.para_gap.as_f32()
+                    + 8.0
+            } else {
+                p.para_line.as_f32() + p.para_gap.as_f32()
+            }
+        }
+    }
+}
+
 /// 估算法：按字符宽（CJK/全角 ≈ font_size，其余 ≈ 0.55 × font_size）累计文本宽度，
 /// 折出在可用宽度 `avail` 下的行数。用于「平均行高」估算，非精确排版。
 fn est_wrap_lines(text: &str, avail: f32, font_size: f32) -> usize {
@@ -784,7 +836,10 @@ fn est_wrap_len(bytes: usize, avail: f32, font_size: f32) -> usize {
 
 impl Render for MarkdownPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t_render = crate::prof::begin();
+        let _t_style = crate::prof::begin();
         let p = Rc::new(StyleParams::from_theme_with_font(cx, self.font_override));
+        crate::prof::end("md_style", _t_style);
         let bg = self.bg.unwrap_or(p.bg);
         // 视口宽度已知 → 刷新统一行高提示，让竖滚动条量程从一开始就接近真实总高。
         // （首次布局/宽度变化后 gpui 会清空 size_hint，这里检测到就重建重填，并
@@ -797,9 +852,11 @@ impl Render for MarkdownPreview {
                 window.bounds().size.width.as_f32() * 0.5
             }
         };
+        let _t_hint = crate::prof::begin();
         if self.update_height_hint(cx, pane_w) {
             cx.notify();
         }
+        crate::prof::end("md_hint", _t_hint);
         // 窗口模式：按当前可见范围预物化行的窗口。必须在构造 list 闭包前完成，
         // 闭包内只读窗口数据（Rc），以避免在元素构造期改 `self`。
         if self.index.is_some() {
@@ -812,7 +869,9 @@ impl Render for MarkdownPreview {
             let last = self.item_count().saturating_sub(1);
             let need_lo = lo_vis.saturating_sub(WINDOWED_OVERDRAW_BLOCKS);
             let need_hi = lo_vis.saturating_add(vis_n).min(last);
+            let _t_ensure = crate::prof::begin();
             self.ensure_window(need_lo, need_hi);
+            crate::prof::end("md_ensure_call", _t_ensure);
         }
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
@@ -983,7 +1042,9 @@ impl Render for MarkdownPreview {
                 },
             ));
 
-        root.child(core)
+        let out = root.child(core);
+        crate::prof::end("md_render", _t_render);
+        out
     }
 }
 

@@ -3,6 +3,7 @@
 use super::*;
 use gpui_component::input::RopeExt;
 use crate::config::timing::{PREVIEW_DEBOUNCE_MS, TAB_HSCROLL_HIDE_MS};
+use crate::markdown::{scan_blocks, scan_blocks_incremental};
 use crate::scrollbar::horizontal_scrollbar;
 
 impl EditorApp {
@@ -27,8 +28,10 @@ impl EditorApp {
         let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &InputEvent, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
                 if let InputEvent::Change = ev {
-                    // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）
+                    let _t_change = crate::prof::begin();
+                    // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）+ 版本号推进
                     this.search_scan = None;
+                    tab.edit_version = tab.edit_version.wrapping_add(1);
                     // 行/字数走 Rope 的 O(1) 计数，不再每键 `value()` 物化全文 +
                     // `lines()/chars()` 全量扫描（16 万行文档每键三次 O(n)、一次 6MB
                     // 副本——正是大文档编辑卡顿的主因）。行数保持旧 `str::lines()` 语义
@@ -44,71 +47,116 @@ impl EditorApp {
                         };
                         (lines.max(1), text.len_chars(), state.cursor_position())
                     };
-                    // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖：
-                    // 打字时不逐键整篇重解析+重建虚拟化列表，停止后片刻再同步。
-                    // 大文档的 `scan_blocks`（整篇块索引扫描，16 万行几百 ms）放到
-                    // **后台线程**做，UI 线程只留快照与装配；用 `preview_seq` 保证
-                    // 只有最新一轮的结果落盘，旧轮迟到结果丢弃（不覆盖新编辑）。
-                    if tab.preview_on && !this.preview_pending {
+                    // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖 + **合成一轮**：
+                    // 一次同步任务里循环「等待 → 快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
+                    // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
+                    // （`preview_syncing` 闸门），且从「最后一次按键」起约 200ms+扫描时间即收敛。
+                    // 大文档用**增量扫描**（[`scan_blocks_incremental`]，复用上一版索引只重扫
+                    // 变化区，16 万行从几百 ms 降到几十 ms）在后台线程做，UI 线程只留快照/装配。
+                    if tab.preview_on && !this.preview_pending && !this.preview_syncing {
                         this.preview_pending = true;
+                        this.preview_syncing = true;
                         this.preview_seq = this.preview_seq.wrapping_add(1);
                         let seq = this.preview_seq;
                         cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
-                                .await;
-                            // 1) UI 线程：释放去抖闸门（扫描期间新编辑可开启新一轮），
-                            //    快照当前正文；预览已关则直接结束。
-                            let Some((snapshot, panel_bg, base_dir)) =
-                                this.update(cx, |this, cx| {
-                                    this.preview_pending = false;
-                                    let panel_bg = this.panel_bg();
-                                    let base_dir = this
-                                        .tabs
-                                        .get(this.active_tab)
-                                        .and_then(|t| t.file_path.as_ref())
-                                        .and_then(|p| p.parent())
-                                        .map(|d| d.to_path_buf());
-                                    let snapshot = this
-                                        .tabs
-                                        .get(this.active_tab)
-                                        .filter(|t| t.preview_on)
-                                        .map(|t| t.editor.read(cx).value());
-                                    snapshot.map(|snap| (snap, panel_bg, base_dir))
-                                })
-                                .ok()
-                                .flatten()
-                            else {
-                                return;
-                            };
-                            // 2) 后台线程：整篇块索引扫描（纯 CPU，不阻塞 UI）
-                            let scan_src = snapshot.clone();
-                            let index = cx
-                                .background_executor()
-                                .spawn(async move { crate::markdown::scan_blocks(&scan_src) })
-                                .await;
-                            // 3) UI 线程：仍是最新一代才装配——scan_blocks 期间若有
-                            // 新编辑，必然已开启新一轮并把 `preview_seq` 推进，旧轮结果
-                            // 直接丢弃（内容必然已变；无需再 `value()` 比对，省一次
-                            // 6MB 物化）。
-                            let _ = this.update(cx, |this, cx| {
-                                if this.preview_seq != seq {
-                                    return;
-                                }
-                                if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                                    if tab.preview_on {
-                                        tab.md_preview.update(cx, |view, cx| {
-                                            view.set_background(panel_bg);
-                                            view.set_base_dir(base_dir);
-                                            view.set_source_with_index(
-                                                &snapshot,
-                                                std::rc::Rc::new(index),
-                                                cx,
-                                            );
-                                        });
-                                        cx.notify();
+                            loop {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
+                                    .await;
+                                // 1) UI 线程：快照当前正文 + 取上一版索引（增量基底）+ 版本号
+                                let Some((snapshot, panel_bg, base_dir, prev, version)) = this
+                                    .update(cx, |this, cx| {
+                                        let panel_bg = this.panel_bg();
+                                        let base_dir = this
+                                            .tabs
+                                            .get(this.active_tab)
+                                            .and_then(|t| t.file_path.as_ref())
+                                            .and_then(|p| p.parent())
+                                            .map(|d| d.to_path_buf());
+                                        let snapshot = this
+                                            .tabs
+                                            .get(this.active_tab)
+                                            .filter(|t| t.preview_on)
+                                            .map(|t| t.editor.read(cx).value());
+                                        let prev = this
+                                            .tabs
+                                            .get(this.active_tab)
+                                            .and_then(|t| t.preview_prev.clone());
+                                        let version = this
+                                            .tabs
+                                            .get(this.active_tab)
+                                            .map(|t| t.edit_version)
+                                            .unwrap_or(0);
+                                        snapshot.map(|snap| {
+                                            (snap, panel_bg, base_dir, prev, version)
+                                        })
+                                    })
+                                    .ok()
+                                    .flatten()
+                                else {
+                                    break;
+                                };
+                                // 2) 后台线程：增量（有上一版）或全量扫描
+                                let index = match &prev {
+                                    Some((p_src, p_idx)) => {
+                                        let p_src = p_src.clone();
+                                        // Rc 非 Send：物化一份 BlockIndex 给后台线程。
+                                        // O(块数) memcpy（几 ms）仍远小于全量扫描（几百 ms）。
+                                        let p_idx = (**p_idx).clone();
+                                        let snap = snapshot.clone();
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                scan_blocks_incremental(
+                                                    p_src.as_ref(),
+                                                    &p_idx,
+                                                    snap.as_ref(),
+                                                )
+                                            })
+                                            .await
                                     }
+                                    None => {
+                                        let snap = snapshot.clone();
+                                        cx.background_executor()
+                                            .spawn(async move { scan_blocks(snap.as_ref()) })
+                                            .await
+                                    }
+                                };
+                                // 3) UI 线程：装配最新代，记录增量基底；有新版本文 继续循环、
+                                //    反之结束（合成一轮完毕）。
+                                let keep = this
+                                    .update(cx, |this, cx| {
+                                        if this.preview_seq != seq {
+                                            return false;
+                                        }
+                                        let mut keep = false;
+                                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                                            if tab.preview_on {
+                                                tab.md_preview.update(cx, |view, cx| {
+                                                    view.set_background(panel_bg);
+                                                    view.set_base_dir(base_dir);
+                                                    view.set_source_with_index(
+                                                        &snapshot,
+                                                        std::rc::Rc::new(index.clone()),
+                                                        cx,
+                                                    );
+                                                });
+                                                cx.notify();
+                                            }
+                                            tab.preview_prev =
+                                                Some((snapshot.clone(), std::rc::Rc::new(index)));
+                                            keep = tab.preview_on && tab.edit_version != version;
+                                        }
+                                        keep
+                                    })
+                                    .unwrap_or(false);
+                                if !keep {
+                                    break;
                                 }
+                            }
+                            // 4) 释放闸门（本轮追上最新内容后）
+                            let _ = this.update(cx, |this, _| {
+                                this.preview_pending = false;
+                                this.preview_syncing = false;
                             });
                         })
                         .detach();
@@ -127,6 +175,7 @@ impl EditorApp {
                         tab.dirty = true;
                     }
                     cx.notify();
+                    crate::prof::end("tab_change", _t_change);
                 }
             }
         });
@@ -146,6 +195,8 @@ impl EditorApp {
             preview_fullscreen: false,
             readonly_preview: false,
             editor_pending: false,
+            preview_prev: None,
+            edit_version: 0,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;

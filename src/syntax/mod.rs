@@ -17,6 +17,8 @@
 //! - [`highlighter_factory`]：创建编辑器（`app::tabs::make_tab`）时安装
 //! - [`install_github_theme`]：启动（`main.rs`）与切换明/暗主题（`app::toggle_theme`）时安装
 
+mod markdown;
+
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -295,8 +297,15 @@ impl InputHighlighter for SyntectHighlighter {
 }
 
 /// 创建可安装到编辑器的高亮工厂（找不到语法时返回 `None` = 不做高亮）。
+///
+/// Markdown 走本仓库手写的**逐行状态机**（[`markdown::MarkdownHighlighter`]，编辑只重扫
+/// 受影响行，单键成本与文档总行数无关）；其余语言走 syntect 窗口式解析。
 pub(crate) fn highlighter_factory() -> InputHighlighterFactory {
     Rc::new(|language| {
+        if normalize_language(language) == "markdown" {
+            return Some(Box::new(markdown::MarkdownHighlighter::new(language))
+                as Box<dyn InputHighlighter>);
+        }
         SyntectHighlighter::new(language)
             .map(|hl| Box::new(hl) as Box<dyn InputHighlighter>)
     })
@@ -416,7 +425,7 @@ fn find_name(
 
 /// 把区间内的高亮段切成无缝隙的样式 run。`highlights` 有序且互不重叠，
 /// 用二分定位首个候选段，避免每帧全量扫描。
-fn resolve_styles(
+pub(crate) fn resolve_styles(
     highlights: &[(Range<usize>, &'static str)],
     range: &Range<usize>,
     resolver: &dyn HighlightStyleResolver,

@@ -20,6 +20,7 @@ mod config;
 mod epub;
 mod markdown;
 mod pdf;
+mod prof;
 mod scrollbar;
 mod syntax;
 mod toc;

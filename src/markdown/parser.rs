@@ -760,6 +760,237 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     }
 }
 
+/// 两字符串从前向后相同的字节数（公共前缀长度）。
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes().iter())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// 两字符串从后向前相同的字节数（公共后缀长度）。
+fn common_suffix_bytes(a: &str, b: &str) -> usize {
+    a.as_bytes()
+        .iter()
+        .rev()
+        .zip(b.as_bytes().iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+/// 字节偏移 → 行号（0 基），按 `line_starts` 二分。
+fn line_of(line_starts: &[u32], byte: usize) -> usize {
+    match line_starts.binary_search(&(byte as u32)) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    }
+}
+
+/// **预览增量解析**：在上一次块索引基础上，只重扫「变化区及其所在块、直到与旧索引
+/// 尾部重新对齐」的部分，跳过未变行的重复扫描。
+///
+/// 正确性保证与 `scan_blocks` 完全一致（复用同一套切块判定）；增量只在「尾部字节与
+/// 旧文本相同、且当前位置恰是旧索引的块边界」时截断并复用旧尾部（块结束必为 Normal
+/// 态、同字节 → 同分类，故复用安全）；对不上（如围栏边界跨变化区）就一直重扫到文末，
+/// 结果与全量 `scan_blocks` 逐字节一致——这是**正确性兜底**。变化区过大直接全扫。
+pub fn scan_blocks_incremental(
+    prev_src: &str,
+    prev: &BlockIndex,
+    new_src: &str,
+) -> BlockIndex {
+    let old_len = prev_src.len();
+    let new_len = new_src.len();
+    let cp = common_prefix_bytes(prev_src, new_src);
+    let cs = common_suffix_bytes(prev_src, new_src);
+    let tail_start_new = new_len.saturating_sub(cs);
+    let changed = new_len.saturating_sub(cp + cs);
+    if new_len == old_len && changed == 0 {
+        // 文本未变（同长且公共前后缀覆盖全串）
+        return prev.clone();
+    }
+    // 变化区过大 → 全扫兜底（增量没赚头）。注意纯删除 changed 可能低估，
+    // 但仍交给增量循环处理（正确性不依赖该阈值）。
+    if changed >= old_len.max(new_len) / 2 {
+        return scan_blocks(new_src);
+    }
+
+    let new_lines: Vec<&str> = new_src.split('\n').collect();
+    let new_line_starts = build_line_starts_u32(new_src);
+    let delta = new_len as i64 - old_len as i64; // 总字节增量（可负）
+
+    // 变化区首行在旧索引中所在的块起始行：变化行前的行未变，行号两边一致
+    let l0 = line_of(&new_line_starts, cp);
+    let bi = prev
+        .blocks
+        .partition_point(|b| b.src_line as usize <= l0)
+        .saturating_sub(1);
+    let anchor = prev.blocks.get(bi).map(|b| b.src_line as usize).unwrap_or(0);
+
+    // 未变前缀直接沿用；toc 同样取前缀
+    let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
+    let mut toc: Vec<(usize, u8, String)> = prev
+        .toc
+        .iter()
+        .filter(|(r, _, _)| *r < bi)
+        .cloned()
+        .collect();
+
+    let mut idx = anchor;
+    let mut reused = false;
+    while idx < new_lines.len() {
+        // —— 复用旧尾部的机会：游标已进入「与旧文本字节相同」的尾部，且对应旧位置恰是块边界 ——
+        let new_byte = new_line_starts[idx] as usize;
+        if new_byte >= tail_start_new {
+            let prev_off = new_byte as i64 - delta;
+            if (0..=old_len as i64).contains(&prev_off) {
+                let prev_off = prev_off as usize;
+                let prev_line = line_of(&prev.line_starts, prev_off);
+                // prev_off 必须是旧文本的行首（行首索引命中才是块边界）
+                if prev.line_starts.binary_search(&(prev_off as u32)).is_ok() {
+                    if let Some(pbi) = prev
+                        .blocks
+                        .iter()
+                        .position(|b| b.src_line as usize == prev_line)
+                    {
+                        // 同字节尾部 + 块首 Normal 态 → 旧尾部块逐字有效，仅行号平移
+                        let line_shift = idx as i64 - prev_line as i64;
+                        for b in &prev.blocks[pbi..] {
+                            let mut nb = *b;
+                            nb.src_line = (b.src_line as i64 + line_shift).max(0) as u32;
+                            blocks.push(nb);
+                        }
+                        // toc 尾部：与 `scan_blocks` 一致的「源码行」坐标 → 随行号偏移
+                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
+                            toc.push((( *r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
+                        }
+                        reused = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // —— 否则与 `scan_blocks` 完全相同的切块逻辑（逐块消费 `idx`）——
+        let row_start = idx;
+        let line = new_lines[idx].trim_end_matches('\r');
+        let t = line.trim_start();
+        let raw_len = line.len() as u32;
+
+        if let Some((fc, _)) = fence_len(t) {
+            let mut code_lines = 0u32;
+            idx += 1;
+            while idx < new_lines.len() {
+                let l = new_lines[idx].trim_end_matches('\r');
+                if let Some((c, _)) = fence_len(l.trim_start()) {
+                    if c == fc {
+                        idx += 1;
+                        break;
+                    }
+                }
+                code_lines += 1;
+                idx += 1;
+            }
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Code,
+                raw_len,
+                aux: code_lines,
+            });
+            continue;
+        }
+        if t.is_empty() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Blank,
+                raw_len: 0,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) && t.len() > hashes {
+            let text = inline_strip(t[hashes..].trim_start()).to_string();
+            toc.push((row_start, hashes as u8, text));
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Heading(hashes as u8),
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if t.starts_with('>') {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Quote,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if list_prefix(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Bullet,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if is_rule(t) {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Rule,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            continue;
+        }
+        if parse_image_line(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Image,
+                raw_len,
+                aux: 1,
+            });
+            idx += 1;
+            continue;
+        }
+        if let Some((table, consumed)) = try_parse_table(&new_lines, idx) {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                kind: RowKind::Table,
+                raw_len,
+                aux: table.rows.len() as u32,
+            });
+            idx += consumed;
+            continue;
+        }
+        blocks.push(BlockMeta {
+            src_line: row_start as u32,
+            kind: RowKind::Paragraph,
+            raw_len,
+            aux: 0,
+        });
+        idx += 1;
+    }
+    debug_assert!(
+        reused || idx >= new_lines.len(),
+        "增量扫描要么对齐复用旧尾部、要么扫完新文本"
+    );
+    BlockIndex {
+        blocks,
+        line_starts: new_line_starts,
+        toc,
+    }
+}
+
 /// 物化块区间 `[lo, hi]`（闭区间）的渲染行。
 ///
 /// 关键正确性前提：`parse_to_rows` 是**逐块无状态**的（每轮 while 迭代自包含），
@@ -1225,5 +1456,100 @@ mod tests {
                 windowed_b / 1024,
             );
         }
+    }
+
+    /// 增量索引必须与全量 `scan_blocks` 逐字节一致（blocks / line_starts / toc）——
+    /// 覆盖插入、删行、拆行、合并、围栏内改、围栏新开、表格改、标题改。
+    #[test]
+    fn incremental_equals_full_scan_across_edits() {
+        let base = "# 标题\n> 引用\n- 列表\n\n```rust\nfn f() {}\nlet s = \"x\";\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n末段 `code` 与[链接](https://x)\n";
+        let mut src = base.to_string();
+        let mut prev = scan_blocks(&src);
+        let apply = |src: &mut String, prev: &mut BlockIndex, start: usize, end: usize, ins: &str| {
+            let (s, e) = (start.min(src.len()), end.min(src.len()).max(start));
+            let mut new = String::with_capacity(src.len() + ins.len() - (e - s));
+            new.push_str(&src[..s]);
+            new.push_str(ins);
+            new.push_str(&src[e..]);
+            let inc = scan_blocks_incremental(src, prev, &new);
+            let full = scan_blocks(&new);
+            assert!(
+                inc.blocks == full.blocks
+                    && inc.line_starts == full.line_starts
+                    && inc.toc == full.toc,
+                "编辑后不一致\n新文本头≈:\n{:?}\ninc_blocks={:?}\n\nfull_blocks={:?}",
+                &new[..new.len().min(160)],
+                inc.blocks,
+                full.blocks,
+            );
+            *src = new;
+            *prev = inc;
+        };
+
+        // 行内插入
+        let at = src.find("let s").unwrap() + 3;
+        apply(&mut src, &mut prev, at, at, "ux ");
+        // 删除引用行
+        let q = "> 引用";
+        let at = src.find(q).unwrap();
+        apply(&mut src, &mut prev, at, at + q.len(), "");
+        // 拆行（列表后插入换行+新项）
+        let at = src.find("- 列表").unwrap() + "- 列表".len();
+        apply(&mut src, &mut prev, at, at, "- 新项\n");
+        // 合并行（删除末段前换行）
+        let at = src.find("末段").unwrap() - 1;
+        apply(&mut src, &mut prev, at, at + 1, " ");
+        // 围栏内新增一行（前一步把 "let s" 改成了 "letux"）
+        let at = src.find("letux").unwrap();
+        apply(&mut src, &mut prev, at, at, "    let t2 = 2;\n");
+        // 中段新开一个围栏
+        let at = src.find("末段").unwrap();
+        apply(&mut src, &mut prev, at, at, "```\n中间代码\n```\n\n");
+        // 编辑表头（表格行坐标变化；全 ASCII 区间避免切在 UTF-8 中间）
+        let at = src.find("| a ").unwrap();
+        apply(&mut src, &mut prev, at, at + 4, "| ah");
+        // 编辑标题（toc 变化）："#" → "## "（0..2 全 ASCII）
+        apply(&mut src, &mut prev, 0, 2, "## ");
+    }
+
+    /// 未变文本 → 增量直接返回旧索引（零重扫）。
+    #[test]
+    fn incremental_noop_returns_prev() {
+        let src = "# 标题\n正文\n";
+        let prev = scan_blocks(src);
+        let inc = scan_blocks_incremental(src, &prev, src);
+        assert_eq!(inc.blocks, prev.blocks);
+        assert_eq!(inc.toc, prev.toc);
+    }
+
+    /// 基准（--ignored）：大文档小编辑时，增量 vs 全量扫描耗时对比（打印、不断言）。
+    #[test]
+    #[ignore]
+    fn bench_incremental_vs_full_scan() {
+        use std::time::Instant;
+        let block = String::from("# 标题段 {i}\n> 引用\n- 列表项\n\n```rust\nfn f() {{}}\nlet s = \"x\";\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n普通段落与 `code` [链接](https://x)\n\n");
+        let mut src = String::new();
+        for i in 0..1600 {
+            src.push_str(&format!("# 标题段 {i}\n> 引用\n- 列表项\n\n```rust\nfn f() {{}}\nlet s = \"x\";\n```\n\n普通段落与 `code` [链接](https://x)\n\n"));
+        }
+        let _ = block;
+        let prev = scan_blocks(&src);
+        // 中部小编辑：给某段插几个字
+        let at = src.find("普通段落").unwrap() + 6;
+        let mut new = src.clone();
+        new.insert_str(at, "ABC");
+        let t0 = Instant::now();
+        let _inc = scan_blocks_incremental(&src, &prev, &new);
+        let inc_ms = t0.elapsed();
+        let t1 = Instant::now();
+        let _full = scan_blocks(&new);
+        let full_ms = t1.elapsed();
+        println!(
+            "{} 行：增量扫描 {:.1} ms vs 全量 {:.1} ms（{:.1}x）",
+            prev.blocks.len(),
+            inc_ms.as_secs_f64() * 1000.0,
+            full_ms.as_secs_f64() * 1000.0,
+            full_ms.as_secs_f64() / inc_ms.as_secs_f64().max(1e-6),
+        );
     }
 }

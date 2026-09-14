@@ -77,6 +77,17 @@ impl EditorApp {
         let src_len = text.len();
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
+        // 大文档异步打开：把「预建的块索引」登记为增量基底，第一次编辑即可走
+        // 增量扫描，而不是先全量扫一遍（打开当下编辑器 set_value 也会触发变更事件）。
+        let preview_seed: Option<(SharedString, std::rc::Rc<crate::markdown::BlockIndex>)> = if is_md
+        {
+            prebuilt_index
+                .as_ref()
+                .map(|ix| (SharedString::from(text.clone()), ix.clone()))
+        } else {
+            None
+        };
+        tab.preview_prev = preview_seed;
         let t_editor = std::time::Instant::now();
         tab.editor.update(cx, |ed, cx| {
             ed.set_value(text.clone(), window, cx);

@@ -75,6 +75,12 @@ struct EditorTab {
     /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
+    /// 预览**增量解析**的基底：上次同步的整篇快照与其块索引。下一次去抖后用
+    /// [`crate::markdown::scan_blocks_incremental`] 复用（只重扫变化区）。
+    preview_prev: Option<(SharedString, std::rc::Rc<crate::markdown::BlockIndex>)>,
+    /// 编辑版本号：每次内容变更 +1。预览同步循环用它判断「扫描期间是否又有新编辑」，
+    /// 从而在扫描结束后自动续跑合并，而不是丢给下一次按键才触发。
+    edit_version: u64,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }
@@ -95,6 +101,9 @@ pub struct EditorApp {
     font_size: f32,
     /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）。
     preview_pending: bool,
+    /// 预览同步是否正在扫描/装配中：为 true 时不再起新一轮（防多轮 500ms 后台扫描
+    /// 叠在一起；同步循环结束后复位，其间若有新编辑会自动续跑合并）。
+    preview_syncing: bool,
     /// 预览同步的代序号：每轮去抖发起时 +1；后台 `scan_blocks` 结果只允许最新代
     /// 落盘，旧代迟到结果直接丢弃（防旧内容覆盖新编辑）。
     preview_seq: u64,
@@ -177,6 +186,7 @@ impl EditorApp {
             status_ok: true,
             font_size: DEFAULT_FONT_SIZE,
             preview_pending: false,
+            preview_syncing: false,
             preview_seq: 0,
             dark_mode: false,
             split_ratio: 0.5,
@@ -280,6 +290,8 @@ impl EditorApp {
                 // 关闭预览时同步退出全屏
                 if !tab.preview_on {
                     tab.preview_fullscreen = false;
+                    // 增量基底随预览关闭即失效（下次开启重新全量建立）
+                    tab.preview_prev = None;
                 }
             }
             tab.preview_on

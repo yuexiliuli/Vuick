@@ -2165,3 +2165,324 @@
         println!("【txt 同步打开】(对照) {} ms", t_txt.elapsed().as_millis());
     }
 
+    /// 基准：用编辑器本体追加同一段文本 1000 次所需耗时。
+    /// 在编辑器里打开目标文件（与真实使用完全相同的 `open_file` 路径），
+    /// 再通过 gpui-component 编辑器的 `insert` 接口连续插入同一段样本文本 1000 次，
+    /// 统计总耗时。运行：
+    /// `cargo test --release -- --ignored --nocapture bench_insert_1000_times`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_insert_1000_times(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 每次插入的“同样文本”（多行样本，贴近真实编辑内容）
+        const SAMPLE: &str = "### 性能基准测试\n性能测试文本 0123456789 abcdefghijklmnopqrstuvwxyz 中文内容测试。\n```text\ncode block line\n```\n";
+        const N: usize = 1000;
+
+        // 目标文件可由环境变量 BENCH_INSERT_FILES 覆盖（分号分隔），默认三份样本
+        let files: Vec<String> = std::env::var("BENCH_INSERT_FILES")
+            .map(|v| {
+                v.split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    r"target/大文档测试.md".to_string(),
+                    r"target/SKILL.md".to_string(),
+                    r"target/SKILL.txt".to_string(),
+                ]
+            });
+
+        for path in &files {
+            let file_name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string());
+            if !std::path::Path::new(path).is_file() {
+                println!("跳过（文件不存在）：{file_name}");
+                continue;
+            }
+
+            // 1) 打开文件（md 大文档走异步打开，小文档同步打开）
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.open_file(path, window, cx));
+            });
+            // 2) 等待编辑器挂载完成（editor_pending 复位 = 编辑区已升起）
+            let t_open = std::time::Instant::now();
+            let mut frames = 0;
+            loop {
+                cx.run_until_parked();
+                let pending = cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    a.tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                });
+                if !pending {
+                    break;
+                }
+                frames += 1;
+                if frames > 400 {
+                    panic!("打开超时：{file_name}");
+                }
+            }
+            let open_ms = t_open.elapsed();
+
+            // 3) 聚焦当前编辑区
+            let (editor, focus) = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let idx = a.active_tab;
+                (
+                    a.tabs[idx].editor.clone(),
+                    a.tabs[idx].editor.read(cx).focus_handle(cx),
+                )
+            });
+            cx.update(|window, cx| window.focus(&focus, cx));
+
+            // 4) 连续插入同样文本 N 次并计时（编辑器操作本体，不含渲染帧）
+            let before = cx.update(|_, cx| editor.read(cx).value().len());
+            let t_insert = std::time::Instant::now();
+            for _ in 0..N {
+                cx.update(|window, cx| {
+                    editor.update(cx, |ed, cx| ed.insert(SAMPLE, window, cx));
+                });
+            }
+            let dt = t_insert.elapsed();
+            let after = cx.update(|_, cx| editor.read(cx).value().len());
+            let grew = after.saturating_sub(before);
+            let expect = N * SAMPLE.len();
+            assert_eq!(
+                grew, expect,
+                "插入 {N} 次后应恰好新增 {expect} B，实际 {grew} B"
+            );
+            println!(
+                "【{file_name}】打开(异步装配) {} ms | {} 次 insert 耗时 {:.1} ms（单次平均 {:.2} ms），长度 {} -> {}（+{} B）",
+                open_ms.as_millis(),
+                N,
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1000.0 / N as f64,
+                before,
+                after,
+                grew,
+            );
+        }
+    }
+
+    /// 基准（debug 体感）：大文档开着 Markdown 预览时，一次按键的 UI 线程成本拆解
+    /// （insert 编辑 vs 帧渲染/布局），并对比「预览开/关」以定位预览在每帧里的占比。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_keystroke_frame_cost(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(r"target/大文档测试.md", window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let pending =
+                cx.update(|_, cx| app.read(cx).tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+            if !pending {
+                break;
+            }
+            frames += 1;
+            if frames > 400 {
+                panic!("打开超时");
+            }
+        }
+        let editor = cx.update(|_, cx| app.read(cx).tabs.last().unwrap().editor.clone());
+        let sample = "x";
+        // 预热：预览窗口物化 + 行高提示收敛
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+
+        // 预览开：insert / 帧渲染 各自耗时
+        {
+            let mut insert_tot = 0.0f64;
+            let mut paint_tot = 0.0f64;
+            let rep = 5;
+            for i in 0..rep {
+                let t0 = std::time::Instant::now();
+                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+                let t1 = std::time::Instant::now();
+                cx.run_until_parked();
+                let _ = cx.cx.refresh();
+                cx.run_until_parked();
+                let t2 = std::time::Instant::now();
+                let ins = t1.duration_since(t0).as_secs_f64() * 1000.0;
+                let paint = t2.duration_since(t1).as_secs_f64() * 1000.0;
+                insert_tot += ins;
+                paint_tot += paint;
+                println!("  [预览开] iter {i}: insert={ins:.2} ms, frame={paint:.2} ms");
+            }
+            println!(
+                "【预览开】insert={:.2} ms + 帧渲染={:.2} ms = {:.2} ms/键",
+                insert_tot / rep as f64,
+                paint_tot / rep as f64,
+                (insert_tot + paint_tot) / rep as f64,
+            );
+        }
+        // 关预览后再测一次
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.toggle_preview_for_tab(a.active_tab, window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        {
+            let mut insert_tot = 0.0f64;
+            let mut paint_tot = 0.0f64;
+            let rep = 5;
+            for _ in 0..rep {
+                let t0 = std::time::Instant::now();
+                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+                let t1 = std::time::Instant::now();
+                cx.run_until_parked();
+                let _ = cx.cx.refresh();
+                cx.run_until_parked();
+                let t2 = std::time::Instant::now();
+                insert_tot += t1.duration_since(t0).as_secs_f64() * 1000.0;
+                paint_tot += t2.duration_since(t1).as_secs_f64() * 1000.0;
+            }
+            println!(
+                "【预览关】insert={:.2} ms + 帧渲染={:.2} ms = {:.2} ms/键",
+                insert_tot / rep as f64,
+                paint_tot / rep as f64,
+                (insert_tot + paint_tot) / rep as f64,
+            );
+        }
+    }
+
+    /// 基准（debug，KILO_PROF=1 时为默认关闭内部拆解）：模拟真实编辑大文件的
+    /// 「连续输入 → 停顿（触发预览增量同步）」节奏，逐键测插入与渲染停驻耗时，
+    /// 并用 [`crate::prof`] 输出各热点（tab_change / hl_update / hl_styles / md_render /
+    /// md_ensure_window）的累计拆解。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_realistic_large_file_editing(cx: &mut TestAppContext) {
+        use std::time::{Duration, Instant};
+        crate::prof::enable();
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(r"target/大文档测试.md", window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let pending = cx
+                .update(|_, cx| app.read(cx).tabs.last().map(|t| t.editor_pending).unwrap_or(true));
+            if !pending {
+                break;
+            }
+            frames += 1;
+            if frames > 600 {
+                panic!("打开超时");
+            }
+        }
+        let editor = cx.update(|_, cx| app.read(cx).tabs.last().unwrap().editor.clone());
+        // 预热：预览窗口物化 + 行高提示收敛
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        crate::prof::dump("开篇预热后");
+        let sample = "性能耗时代码行 performance line 1234567890 更多中文输入继续。\n";
+        // —— A. 光标在文档开头连续输入 ~8 键（每键都渲染一帧）——
+        let mut ins: Vec<f64> = Vec::new();
+        let mut park: Vec<f64> = Vec::new();
+        for _ in 0..8 {
+            let t = Instant::now();
+            cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+            let t1 = Instant::now();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let t2 = Instant::now();
+            ins.push(t1.duration_since(t).as_secs_f64() * 1000.0);
+            park.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
+        }
+        crate::prof::dump("A. 开头连续输入8键");
+        println!(
+            "A. 开头连续输入：insert 均值 {:.2} ms，渲染停驻均值 {:.2} ms",
+            ins.iter().sum::<f64>() / ins.len() as f64,
+            park.iter().sum::<f64>() / park.len() as f64,
+        );
+        // 停顿 → 触发预览增量同步（真实应用里用户打字停顿处）
+        cx.executor().advance_clock(Duration::from_millis(300));
+        let t = Instant::now();
+        for _ in 0..80 {
+            cx.run_until_parked();
+        }
+        println!("A. 停顿+预览同步 停驻 {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+        crate::prof::dump("A. 停顿同步后");
+
+        // —— B. 光标移到文档中部继续输入 ——
+        let total = cx.update(|_, cx| editor.read(cx).value().len());
+        let mid = (total / 2).min(total);
+        cx.update(|_, cx| {
+            editor.update(cx, |e, cx| e.set_selected_range(mid..mid, cx));
+        });
+        for _ in 0..8 {
+            let t = Instant::now();
+            cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+            let t1 = Instant::now();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let t2 = Instant::now();
+            ins.push(t1.duration_since(t).as_secs_f64() * 1000.0);
+            park.push(t2.duration_since(t1).as_secs_f64() * 1000.0);
+        }
+        crate::prof::dump("B. 中部连续输入8键");
+        println!(
+            "B. 中部连续输入：insert 均值 {:.2} ms，渲染停驻均值 {:.2} ms",
+            ins.iter().rev().take(8).sum::<f64>() / 8.0,
+            park.iter().rev().take(8).sum::<f64>() / 8.0,
+        );
+        cx.executor().advance_clock(Duration::from_millis(300));
+        let t = Instant::now();
+        for _ in 0..80 {
+            cx.run_until_parked();
+        }
+        println!("B. 停顿+预览同步 停驻 {:.2} ms", t.elapsed().as_secs_f64() * 1000.0);
+        crate::prof::dump("B. 停顿同步后（完成）");
+
+        // —— C. 探针：裸 ropey Rope.insert vs 编辑器 insert，分离引擎/回调 ——
+        {
+            use gpui_component::input::Rope;
+            let text = cx.update(|_, cx| editor.read(cx).value().to_string());
+            let mid = text.len() / 2;
+            let mut rope = Rope::from(text.as_str());
+            let t0 = Instant::now();
+            for _ in 0..50 {
+                rope.insert(mid.min(rope.len()), "x");
+            }
+            let rope_ms = t0.elapsed().as_secs_f64() * 1000.0 / 50.0;
+            let t1 = Instant::now();
+            for _ in 0..50 {
+                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert("x", w, cx)));
+            }
+            let ins_ms = t1.elapsed().as_secs_f64() * 1000.0 / 50.0;
+            println!(
+                "C. 探针：裸 ropey Rope(6MB).insert 中段 = {rope_ms:.2} ms/次；编辑器 insert（含事件/订阅） = {ins_ms:.2} ms/次"
+            );
+            crate::prof::dump("C. 探针后");
+        }
+    }
+
