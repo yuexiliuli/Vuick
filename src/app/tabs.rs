@@ -123,6 +123,9 @@ impl EditorApp {
                                 };
                                 // 3) UI 线程：装配最新代，记录增量基底；有新版本文 继续循环、
                                 //    反之结束（合成一轮完毕）。
+                                // 索引只持一份 Rc：视图与 `preview_prev` 共享同一块（O(1) 克隆），
+                                // 不再每轮 `Rc::new(index.clone())` 整份拷贝（156K 块 ≈ 3.7MB）。
+                                let index = std::rc::Rc::new(index);
                                 let keep = this
                                     .update(cx, |this, cx| {
                                         if this.preview_seq != seq {
@@ -135,15 +138,14 @@ impl EditorApp {
                                                     view.set_background(panel_bg);
                                                     view.set_base_dir(base_dir);
                                                     view.set_source_with_index(
-                                                        &snapshot,
-                                                        std::rc::Rc::new(index.clone()),
+                                                        snapshot.clone(),
+                                                        index.clone(),
                                                         cx,
                                                     );
                                                 });
                                                 cx.notify();
                                             }
-                                            tab.preview_prev =
-                                                Some((snapshot.clone(), std::rc::Rc::new(index)));
+                                            tab.preview_prev = Some((snapshot.clone(), index.clone()));
                                             keep = tab.preview_on && tab.edit_version != version;
                                         }
                                         keep

@@ -309,28 +309,31 @@ impl MarkdownPreview {
 
     /// 设置预览源码（仅影响预览，原文不变）。块索引在调用内现算。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
-        self.set_source_with_index(src, Rc::new(scan_blocks(src)), cx);
+        self.set_source_with_index(SharedString::from(src), Rc::new(scan_blocks(src)), cx);
     }
 
     /// 设置预览源码，但**复用外部预建的块索引**（异步打开时由后台线程扫好，
     /// 省掉 UI 线程上为了打开大文档做 `scan_blocks` 的几百毫秒）。
-    pub fn set_source_with_index(&mut self, src: &str, index: Rc<BlockIndex>, cx: &mut App) {
+    ///
+    /// `src`/`index` 均为引用计数句柄：内部直接共享同一份（`SharedString` 是
+    /// `Arc<str>`、`Rc<BlockIndex>` 共享读取），**不再把 6.4MB 全文二次物化、
+    /// 也不再 try_unwrap 整份拷贝索引**——大文档每轮打字同步省掉两次 O(n)。
+    pub fn set_source_with_index(&mut self, src: SharedString, index: Rc<BlockIndex>, cx: &mut App) {
         // 内容变了，旧的跳转高亮随之失效
         self.clear_highlight();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
         let prev_scroll = self.list_state.logical_scroll_top();
-        let index = Rc::try_unwrap(index).unwrap_or_else(|rc| (*rc).clone());
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
             // ---- 大文档：窗口级懒解析 ----
             // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本，
             // 渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
-            self.index = Some(Rc::new(index.clone()));
-            self.src_buf = Some(SharedString::from(src));
+            self.index = Some(index.clone());
+            self.src_buf = Some(src.clone());
             self.win_lo = 0;
             self.win_rows = Rc::new(Vec::new());
             self.rows = Rc::new(Vec::new());
-            self.toc = index.toc;
+            self.toc = index.toc.clone();
             self.code_scroll = Default::default();
             self.code_hl = Default::default();
             self.table_scroll = Default::default();
@@ -366,7 +369,7 @@ impl MarkdownPreview {
         }
 
         // ---- 小文档：全量路径（原有行为不变） ----
-        let mut parsed = parse_to_rows(src);
+        let mut parsed = parse_to_rows(src.as_ref());
         self.resolve_image_rows(&mut parsed);
         let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）

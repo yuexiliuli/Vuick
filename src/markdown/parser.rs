@@ -761,22 +761,50 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
 }
 
 /// 两字符串从前向后相同的字节数（公共前缀长度）。
+///
+/// 大文档增量扫描几乎总是「只有一小段编辑，前后都是整段相等的字节」，因此按
+/// 4KB 分块比较（`&[u8]` 的 `==` 落到底层 memcmp / 向量化），命中同块直接跳过，
+/// 只在首个相异的块内逐字节定位——相对于逐字节迭代器（`zip().take_while()`）在
+/// debug 下慢 5~10 倍、release 下数倍。量级仍是 O(n)（要读全串找差异），但把
+/// 「背全文」的常数压到内存带宽级。
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
-    a.as_bytes()
-        .iter()
-        .zip(b.as_bytes().iter())
-        .take_while(|(x, y)| x == y)
-        .count()
+    const BLK: usize = 4096;
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    let n = aa.len().min(bb.len());
+    let mut i = 0;
+    while i + BLK <= n {
+        if &aa[i..i + BLK] != &bb[i..i + BLK] {
+            break;
+        }
+        i += BLK;
+    }
+    while i < n && aa[i] == bb[i] {
+        i += 1;
+    }
+    i
 }
 
-/// 两字符串从后向前相同的字节数（公共后缀长度）。
+/// 两字符串从后向前相同的字节数（公共后缀长度）。分块策略同上。
 fn common_suffix_bytes(a: &str, b: &str) -> usize {
-    a.as_bytes()
-        .iter()
-        .rev()
-        .zip(b.as_bytes().iter().rev())
-        .take_while(|(x, y)| x == y)
-        .count()
+    const BLK: usize = 4096;
+    let aa = a.as_bytes();
+    let bb = b.as_bytes();
+    let n = aa.len().min(bb.len());
+    let (la, lb) = (aa.len(), bb.len());
+    let mut i = 0;
+    while i + BLK <= n {
+        let sa = &aa[la - i - BLK..la - i];
+        let sb = &bb[lb - i - BLK..lb - i];
+        if sa != sb {
+            break;
+        }
+        i += BLK;
+    }
+    while i < n && aa[la - 1 - i] == bb[lb - 1 - i] {
+        i += 1;
+    }
+    i
 }
 
 /// 字节偏移 → 行号（0 基），按 `line_starts` 二分。

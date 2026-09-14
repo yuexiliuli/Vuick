@@ -114,7 +114,7 @@ impl EditorApp {
                 view.set_wrap(true, cx);
                 if let Some(index) = prebuilt_index {
                     // 复用后台预建的块索引（省 UI 线程几百 ms）
-                    view.set_source_with_index(&text, index, cx);
+                    view.set_source_with_index(SharedString::from(text.clone()), index, cx);
                 } else {
                     view.set_source(&text, cx);
                 }
