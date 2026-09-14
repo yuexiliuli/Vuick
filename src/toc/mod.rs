@@ -100,7 +100,7 @@ pub(crate) fn toc_item_frame(
         .left(px(2.))
         .w(px(2.))
         .rounded_full()
-        .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
+        .bg(rgb(crate::config::colors::RESIZE_ACCENT))
         .opacity(0.0)
         .group_hover("toc-item", |style| style.opacity(1.0));
     row = row.child(indicator);
@@ -143,7 +143,7 @@ pub(crate) fn toc_item_frame(
                 .rounded_full()
                 .flex_shrink_0()
                 .bg(if top_accent {
-                    rgb(crate::scrollbar::RESIZE_ACCENT).into()
+                    rgb(crate::config::colors::RESIZE_ACCENT).into()
                 } else {
                     muted
                 }),

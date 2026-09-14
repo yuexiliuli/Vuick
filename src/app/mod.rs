@@ -30,34 +30,18 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     div, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, PromptLevel,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
+    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, PromptLevel, Render,
+    SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
 use gpui_component::input::{Editor, EditorState, InputEvent, InputState, TabSize};
 use gpui_component::{Icon, IconName};
 
 use crate::actions::*;
+use crate::config::layout::{
+    DEFAULT_FONT_SIZE, FONT_MAX, FONT_MIN, MENU_BAR_H, SIDEBAR_WIDTH, SPLIT_RATIO_MAX,
+    SPLIT_RATIO_MIN,
+};
 use crate::scrollbar::TableScrollState;
-
-/// 编辑器默认正文字号（px）。
-const DEFAULT_FONT_SIZE: f32 = 14.0;
-/// 字号调节范围（px）。
-const FONT_MIN: f32 = 10.0;
-const FONT_MAX: f32 = 28.0;
-/// 菜单栏高度。
-const MENU_BAR_H: Pixels = px(26.);
-/// 分屏比例拖拽下限（编辑区最小占比）。
-const SPLIT_RATIO_MIN: f32 = 0.2;
-/// 分屏比例拖拽上限（编辑区最大占比）。
-const SPLIT_RATIO_MAX: f32 = 0.8;
-/// 侧边栏宽度（px）。
-const SIDEBAR_WIDTH: f32 = 240.0;
-/// 侧边栏左侧竖列切换栏宽度（px，固定，不含在内容区内）。
-pub(super) const SIDEBAR_ACTIVITY_W: f32 = 46.0;
-/// 侧边栏宽度下限（px，拖拽 clamp）。
-pub(super) const SIDEBAR_WIDTH_MIN: f32 = 160.0;
-/// 侧边栏宽度上限（px，拖拽 clamp）。
-pub(super) const SIDEBAR_WIDTH_MAX: f32 = 480.0;
 
 /// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
 struct EditorTab {

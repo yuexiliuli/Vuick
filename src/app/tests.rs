@@ -539,7 +539,7 @@
             .debug_bounds("sidebar")
             .expect("侧边栏 sidebar 应默认渲染");
         assert!(
-            (bar.size.width.as_f32() - crate::app::SIDEBAR_ACTIVITY_W).abs() < 2.0,
+            (bar.size.width.as_f32() - crate::config::layout::SIDEBAR_ACTIVITY_W).abs() < 2.0,
             "默认目录面板收起，侧边栏应只剩活动栏宽，实际={bar:?}"
         );
         assert!(
@@ -786,7 +786,7 @@
             .debug_bounds("sidebar")
             .expect("目录面板收起后侧边栏（活动栏）应仍在");
         assert!(
-            (slim.size.width.as_f32() - crate::app::SIDEBAR_ACTIVITY_W).abs() < 2.0,
+            (slim.size.width.as_f32() - crate::config::layout::SIDEBAR_ACTIVITY_W).abs() < 2.0,
             "面板收起后侧边栏应只剩活动栏宽，实际={slim:?}"
         );
         assert!(

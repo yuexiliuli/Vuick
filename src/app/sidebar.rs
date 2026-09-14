@@ -91,7 +91,7 @@ impl EditorApp {
         let width_px = if self.sidebar_panel_open {
             self.sidebar_width
         } else {
-            crate::app::SIDEBAR_ACTIVITY_W
+            crate::config::layout::SIDEBAR_ACTIVITY_W
         };
         div()
             .id("sidebar")
@@ -121,7 +121,7 @@ impl EditorApp {
     pub(super) fn update_sidebar_resize(&mut self, x: f32, cx: &mut Context<Self>) {
         if let Some((start_x, start_w)) = self.sidebar_resize {
             self.sidebar_width = (start_w + (x - start_x))
-                .clamp(crate::app::SIDEBAR_WIDTH_MIN, crate::app::SIDEBAR_WIDTH_MAX);
+                .clamp(crate::config::layout::SIDEBAR_WIDTH_MIN, crate::config::layout::SIDEBAR_WIDTH_MAX);
             cx.notify();
         }
     }
@@ -140,7 +140,7 @@ impl EditorApp {
         if !self.sidebar_panel_open {
             return Vec::new();
         }
-        let accent = rgb(crate::scrollbar::RESIZE_ACCENT);
+        let accent = rgb(crate::config::colors::RESIZE_ACCENT);
         vec![
             div()
                 .id("sidebar-resize")
@@ -194,7 +194,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
-        let accent: gpui::Hsla = rgb(crate::scrollbar::RESIZE_ACCENT).into();
+        let accent: gpui::Hsla = rgb(crate::config::colors::RESIZE_ACCENT).into();
         let specs = [
             (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc"),
             (SidebarView::Search, IconName::Search, "sidebar-btn-search"),
@@ -242,7 +242,7 @@ impl EditorApp {
         div()
             .id("sidebar-activity-bar")
             .debug_selector(|| "sidebar-activity-bar".into())
-            .w(px(crate::app::SIDEBAR_ACTIVITY_W))
+            .w(px(crate::config::layout::SIDEBAR_ACTIVITY_W))
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -367,8 +367,8 @@ impl EditorApp {
         // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）
         if self.sidebar_width_auto {
             if let Some(w) = self.compute_sidebar_toc_width(cx) {
-                self.sidebar_width = (crate::app::SIDEBAR_ACTIVITY_W + w + 12.0)
-                    .clamp(crate::app::SIDEBAR_WIDTH_MIN, crate::app::SIDEBAR_WIDTH_MAX);
+                self.sidebar_width = (crate::config::layout::SIDEBAR_ACTIVITY_W + w + 12.0)
+                    .clamp(crate::config::layout::SIDEBAR_WIDTH_MIN, crate::config::layout::SIDEBAR_WIDTH_MAX);
             }
         }
 

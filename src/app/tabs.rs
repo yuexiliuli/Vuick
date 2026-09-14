@@ -334,7 +334,7 @@ impl EditorApp {
                     .left(px(0.))
                     .right(px(0.))
                     .h(px(1.))
-                    .bg(rgb(crate::scrollbar::RESIZE_ACCENT))
+                    .bg(rgb(crate::config::colors::RESIZE_ACCENT))
                     .into_any_element()
             });
 

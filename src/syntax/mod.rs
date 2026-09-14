@@ -35,17 +35,7 @@ use gpui_component::input::{
 };
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
-/// 超过该体积的文档不做高亮（工作集过大，无法支撑换代场景；正常文档远小于此）。
-const MAX_TEXT_BYTES: usize = 24 * 1024 * 1024;
-/// 可见窗口**向前**多解析的行数（语法状态前缀），使跨越行边界的注释/字符串/代码块
-/// 在大多数情况下也能正确配色。
-const LOOKBACK_LINES: usize = 48;
-/// 计算时向可见窗口上下各扩展的行数：滚动在小余量内命中缓存不重算。
-/// 调小 → 每次重算更快、颜色更早落屏。
-const WINDOW_PAD: usize = 16;
-/// 单次**同步**解析的行数上限：超过则本次不着色（避免超大视口卡帧）。
-/// 可见窗口 ~36 行 + 2×WINDOW_PAD + LOOKBACK ≈ 116 行 ≈ 十几 ms，正常远低于此。
-const SYNC_MAX_PARSE_LINES: usize = 2000;
+use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES, SYNC_MAX_PARSE_LINES, WINDOW_PAD};
 
 /// 共享语法集（默认语法定义有几 MB，跨实例共享一次）。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);

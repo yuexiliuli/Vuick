@@ -15,15 +15,7 @@ use gpui::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// 滑块距边缘间距
-const GAP_RIGHT: Pixels = px(3.);
-/// 滑块最小尺寸
-const THUMB_MIN: Pixels = px(26.);
-
-/// 可拖拽分隔条（编辑/预览分割线、PDF 目录右缘等）在「悬浮/拖拽中」的强调色。
-///
-/// 全局唯一来源：所有可拖动条共享同一种强调色，改这一处即可统一全部。
-pub const RESIZE_ACCENT: u32 = 0x0078d4;
+use crate::config::layout::{HSCROLL_GAP_RIGHT, HSCROLL_THUMB_MIN};
 
 /// 横向滚动条的共享状态：滚动句柄 + 拖拽抓取偏移（跨帧保留，元素每帧重建也不丢）。
 ///
@@ -65,10 +57,10 @@ fn hscroll_geometry(handle: &ScrollHandle) -> Option<(Pixels, Pixels, Pixels, Pi
     if content_w <= viewport_w + px(1.) {
         return None;
     }
-    let bar_w = (viewport_w - GAP_RIGHT * 2.).max(px(0.));
+    let bar_w = (viewport_w - HSCROLL_GAP_RIGHT * 2.).max(px(0.));
     let frac = ((-handle.offset().x).max(px(0.)) / max_scroll).clamp(0., 1.);
-    let thumb_w = (bar_w * (viewport_w / content_w)).max(THUMB_MIN).min(bar_w);
-    let thumb_x = GAP_RIGHT + (bar_w - thumb_w) * frac;
+    let thumb_w = (bar_w * (viewport_w / content_w)).max(HSCROLL_THUMB_MIN).min(bar_w);
+    let thumb_x = HSCROLL_GAP_RIGHT + (bar_w - thumb_w) * frac;
     Some((bar_w, thumb_w, thumb_x, max_scroll))
 }
 
@@ -134,7 +126,7 @@ pub fn horizontal_scrollbar(
                 let Some((bar_w, thumb_w, _, max_scroll)) = hscroll_geometry(&handle) else {
                     return;
                 };
-                let bar_left = handle.bounds().left() + GAP_RIGHT;
+                let bar_left = handle.bounds().left() + HSCROLL_GAP_RIGHT;
                 let rel = ev.position.x - bar_left;
                 // 记录抓取点相对滑块中心的偏移，拖动时保持
                 *drag.borrow_mut() = Some(rel - thumb_w / 2.0);
@@ -154,7 +146,7 @@ pub fn horizontal_scrollbar(
                     return;
                 };
                 let grab = drag.borrow().unwrap();
-                let bar_left = handle.bounds().left() + GAP_RIGHT;
+                let bar_left = handle.bounds().left() + HSCROLL_GAP_RIGHT;
                 let rel = ev.position.x - bar_left - grab;
                 set_thumb_from_center(rel, bar_w, thumb_w, max_scroll, &handle);
                 window.refresh();
