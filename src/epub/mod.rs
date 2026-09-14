@@ -19,6 +19,8 @@ use std::sync::Arc;
 use anyhow::{bail, Context as _, Result};
 use gpui::{Image, ImageFormat};
 
+use crate::config::markdown::EPUB_IMG_SCHEME;
+
 /// 解析后的 EPUB 文档：元数据 + 按 spine 顺序的章节 Markdown 文本 + 内存图片。
 #[derive(Debug, Clone, Default)]
 pub struct EpubDocument {
@@ -37,9 +39,6 @@ pub struct EpubDocument {
     /// 渲染时由预览查表直接解码，不落盘。
     pub images: HashMap<String, Arc<Image>>,
 }
-
-/// 图片虚拟 src 前缀：`epubimg://<n>.<ext>`。
-const EPUB_IMG_SCHEME: &str = "epubimg://";
 
 /// 从 `.epub` 文件路径解析文档。
 pub fn parse_epub_file(path: &Path) -> Result<EpubDocument> {

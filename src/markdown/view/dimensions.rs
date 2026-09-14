@@ -5,13 +5,6 @@
 use crate::markdown::parser::{BlockMeta, Row, RowKind, TableData};
 use crate::markdown::view::style::StyleParams;
 
-/// 内容宽估算的额外缓冲（px），避免估算值微偏导致最后几个字符被截断。
-pub(crate) const WIDTH_BUFFER_PX: f32 = 24.0;
-/// 未知尺寸图片行的默认显示高度（px）。
-pub(crate) const IMAGE_ROW_DEFAULT_H: f32 = 280.0;
-/// 图片固有宽度显示上限（px）：更宽的图按 contain 缩放，避免小图被拉大。
-pub(crate) const IMAGE_MAX_W: f32 = 600.0;
-
 /// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。
 fn be_u32(d: &[u8], at: usize) -> Option<u32> {
     d.get(at..at + 4)

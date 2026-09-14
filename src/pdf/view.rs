@@ -35,10 +35,10 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
+use crate::config::pdf::{MAX_INFLIGHT, PAGE_PAD_X, PAGE_WIDTH};
 use crate::pdf::cache::PageCache;
 use crate::pdf::layout::{
-    Slot, compute_layout, display_height, keep_window, plan_page_work, render_scale, MAX_INFLIGHT,
-    PAGE_PAD_X, PAGE_WIDTH,
+    Slot, compute_layout, display_height, keep_window, plan_page_work, render_scale,
 };
 use crate::pdf::{
     render_image_from_bgra, DocId, PdfOutlineEntry, PdfWorker, RenderRequest, RenderResult,

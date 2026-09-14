@@ -37,33 +37,18 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
+use crate::config::limits::{WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS};
+use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
+use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parser::{
     parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, Row, RowKind,
     RowPayload,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
-use dimensions::{
-    est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes, WIDTH_BUFFER_PX,
-    IMAGE_ROW_DEFAULT_H,
-};
+use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
 use row::render_row;
 use style::StyleParams;
-
-/// 行级虚拟化在视口上下各多构建的像素量（保证快速滚动时内容连续）。
-const ROW_OVERDRAW_PX: f32 = 600.0;
-
-/// 渲染行数超过该阈值启用「窗口级懒解析」：只物化可见窗口的 [`Row`]，
-/// 整篇只保留轻量块索引（≈16B/行）+ 原始文本，驻留不随文档增长。
-/// 阈值以下走原有全量路径（行为与之前完全一致，回归风险低）。
-const WINDOWED_MIN_BLOCKS: usize = 4_000;
-
-/// 窗口懒解析时在可见范围上下各多物化的块数（滚动止境/过扫的余量，
-/// 避免轻微滚动反复重解析）。
-const WINDOWED_OVERDRAW_BLOCKS: usize = 24;
-
-/// 搜索跳转高亮停留时长（ms）：侧边栏搜索跳到命中行后高亮一段时间，随后自动消失。
-const HIGHLIGHT_MS: u64 = 2200;
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {

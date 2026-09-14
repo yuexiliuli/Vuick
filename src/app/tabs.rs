@@ -1,11 +1,8 @@
 //! tabs.
 
 use super::*;
-use crate::app::file_ops::PREVIEW_DEBOUNCE_MS;
+use crate::config::timing::{PREVIEW_DEBOUNCE_MS, TAB_HSCROLL_HIDE_MS};
 use crate::scrollbar::horizontal_scrollbar;
-
-/// 选项卡栏横向滚动条自动隐藏：停止滚动该时长（ms）后隐藏。
-const TAB_HSCROLL_HIDE_MS: u64 = 900;
 
 impl EditorApp {
     pub(super) fn make_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {

@@ -1,7 +1,7 @@
 //! 视图层测试：行级虚拟化 / 横向滚动 / 表格 / 目录 / 图片 / 字号缩放 的回归与冒烟测试。
 
 use super::*;
-use super::dimensions::IMAGE_MAX_W;
+use crate::config::markdown::IMAGE_MAX_W;
 use gpui::{AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, size};
 
 struct PreviewHost {

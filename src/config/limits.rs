@@ -10,3 +10,11 @@ pub const LOOKBACK_LINES: usize = 48;
 pub const WINDOW_PAD: usize = 16;
 /// 单次**同步**解析的行数上限：超过则本次不着色（避免超大视口卡帧）。
 pub const SYNC_MAX_PARSE_LINES: usize = 2000;
+/// 编辑器自动软换行阈值：超过该行数的文档不换行（保持滚动/打开流畅）。
+pub const EDITOR_WRAP_MAX_LINES: usize = 30_000;
+/// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
+pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
+/// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。
+pub const WINDOWED_OVERDRAW_BLOCKS: usize = 24;
+/// 侧边栏搜索结果条数上限。
+pub const SEARCH_RESULT_CAP: usize = 200;

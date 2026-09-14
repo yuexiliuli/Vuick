@@ -4,25 +4,11 @@ use super::*;
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::WindowExt as _;
 
+use crate::config::limits::EDITOR_WRAP_MAX_LINES;
+use crate::config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
+
 /// 打开失败通知的 id 类型（配合唯一 key，便于 5 秒后精确移除）。
 struct OpenFailureNotification;
-
-/// 打开失败提示自动消失时长（秒）。
-const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
-
-/// Markdown 预览重渲染的去抖时长（毫秒）。
-///
-/// 打字时不再逐键整篇重解析+重建虚拟化列表（大文件每键都可能触发整份
-/// set_text + 列表 reset 重测量），而是停止输入片刻后再同步一次。
-pub(crate) const PREVIEW_DEBOUNCE_MS: u64 = 200;
-
-/// 超过该行数的 Markdown 文档，**编辑区不默认软换行**。
-///
-/// 实测（6MB/16 万行）：编辑器软换行会让 gpui-component 的 DisplayMap 一次性
-/// 布局整篇（首帧 ~2.2s）+ set_value 阶段整篇换行计算（~0.7s），拖入即卡顿数秒。
-/// 这样的大文档编辑区改为横向滚动（像普通大文本），**预览区仍始终换行**
-/// （预览是窗口级懒布局，不受影响）；需要换行时用户可 Ctrl+W 随时开。
-pub(crate) const EDITOR_WRAP_MAX_LINES: usize = 30_000;
 
 impl EditorApp {
     /// 打开失败：状态栏置为失败，并弹出可点击关闭、5 秒后自动消失的通知。

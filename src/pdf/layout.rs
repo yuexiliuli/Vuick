@@ -3,27 +3,9 @@
 //! 全部为无副作用纯函数（便于单测），与 `view.rs` 的页列 DOM 绝对定位**使用同一套数学**，
 //! 保证滚动位置推算与 DOM 位置严格一致（否则可见页会被误判）。
 
-/// 页面统一显示基准宽（px，视口内按比例缩放）。
-pub(crate) const PAGE_WIDTH: f32 = 840.0;
-/// 页与页之间的垂直间距（px）。
-pub(crate) const PAGE_GAP: f32 = 14.0;
-/// 页列顶部/底部内边距（px）。
-pub(crate) const PAGE_PAD_Y: f32 = 16.0;
-/// 页面左右内边距（px）。
-pub(crate) const PAGE_PAD_X: f32 = 20.0;
-/// 栅格化倍率上限：超过则不再放大（控制每个页位图像素数与内存）。
-/// 840px 宽 × 1.5 ≈ 1260 device px，A4 竖版高 ≈1780px ≈ 4B×2.2M ≈ 9MB/页封顶。
-pub(crate) const MAX_RENDER_SCALE: f32 = 1.5;
-/// 可见页上下各多留存的已渲染页数（滚动时已就绪，不抖动）。
-pub(crate) const MARGIN: usize = 3;
-/// **内存**最多同时保留的已渲染位图页数（内存上限）。超出后把**离当前视口最远**的页回收
-/// 到磁盘缓存；翻回时从磁盘恢复（毫秒级），不重新栅格化。
-/// 只保留近视口的几页在 RAM，其余靠磁盘：几百页文档内存也稳定在几十 MB。
-pub(crate) const CACHE_MAX_PAGES: usize = 8;
-/// 同时排队给 pdfium 工作线程的**在途渲染请求上限**。pdfium 是单线程串行渲染，
-/// 该上限不改变吞吐，但能遏制「快速滚动 → 请求无限堆积」：停止滚动后正在看的那页
-/// 最多排在 N-1 个在途页之后，即最多等 (N-1)×单页耗时，而不是几十个旧请求。
-pub(crate) const MAX_INFLIGHT: usize = 2;
+use crate::config::pdf::{
+    CACHE_MAX_PAGES, MARGIN, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y,
+};
 
 /// 页槽：某页的渲染状态（内存态）。
 #[derive(Default, Clone)]

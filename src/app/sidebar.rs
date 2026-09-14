@@ -7,6 +7,8 @@
 use super::*;
 use gpui_component::input::{Input, Position};
 
+use crate::config::limits::SEARCH_RESULT_CAP;
+
 /// 侧边栏视图。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SidebarView {
@@ -15,9 +17,6 @@ pub(super) enum SidebarView {
     /// 跨打开文件的搜索。
     Search,
 }
-
-/// 搜索结果显示上限（避免超大文档每键全量铺满）。
-const SEARCH_RESULT_CAP: usize = 200;
 
 impl EditorApp {
     /// 活动栏按钮点按：未在该面板 → 展开并切到该面板；

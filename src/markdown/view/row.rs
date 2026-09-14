@@ -14,15 +14,11 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
+use crate::config::markdown::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, TABLE_SCROLLBAR_RESERVE_PX};
 use crate::markdown::parser::{Row, RowKind, RunKind};
-use crate::markdown::view::dimensions::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 use crate::syntax::{github_theme, resolve_line_styles_with, CodeLineRuns};
-
-/// 表格横向滚动条底部预留条高度（px）：与 gpui-component 横向滚动条轨道高度
-/// （scrollbar.rs 的 `WIDTH = 4*2 + 8 = 16`）一致，避免滚动条遮挡表格内容。
-const TABLE_SCROLLBAR_RESERVE_PX: f32 = 16.0;
 
 /// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
 /// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，

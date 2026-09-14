@@ -9,15 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::config::pdf::CACHE_DISK_PAGES;
+
 /// 磁盘缓存文件头魔数（4 字节）+ 宽高各 4 字节 + 紧凑 BGRA 像素。
 const CACHE_MAGIC: &[u8; 4] = b"GPBG";
 const CACHE_HEADER: usize = 12;
-/// 磁盘缓存在磁盘上最多保留的页数（LRU 淘汰到该上限）。
-///
-/// 光栅化本身已很快（~11ms/页，无 PNG 编码），磁盘缓存只是「翻回这几页」时免重算的
-/// 安全网（对慢页/密集页尤其值）；用预算封顶，避免原始 BGRA（~2.8MB/页）把临时目录
-/// 撑爆。此值略大于内存预算（见 `super::layout::CACHE_MAX_PAGES`），保证常见短程回翻命中。
-const CACHE_DISK_PAGES: usize = 32;
 
 /// 磁盘二级页缓存的共享状态（关闭标记 + LRU 顺序）。
 #[derive(Debug)]
