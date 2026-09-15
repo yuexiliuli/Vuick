@@ -21,6 +21,12 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 anyhow = "1.0"
 zip = "2"
 roxmltree = "0.21"
+# 与 gpui-component 同版本同 feature 的 ropey：自研编辑器直接持有的文本存储类型。
+ropey = { version = "=2.0.0-beta.1", features = [
+    "metric_chars",
+    "metric_lines_lf",
+    "metric_utf16",
+] }
 # PDF 栅格化用 native pdfium（Edge 同款内核，首次浏览流畅）；
 # 页级按需渲染 + 磁盘 PNG 二级缓存/内存预算由 view.rs 承担。
 pdfium-render = "0.9.3"

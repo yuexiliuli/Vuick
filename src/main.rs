@@ -17,6 +17,7 @@
 mod actions;
 mod app;
 mod config;
+mod editor;
 mod epub;
 mod markdown;
 mod pdf;
