@@ -2,7 +2,7 @@
 
 use super::*;
 use gpui_component::input::RopeExt;
-use crate::config::timing::{PREVIEW_DEBOUNCE_MS, TAB_HSCROLL_HIDE_MS};
+use crate::config::timing::TAB_HSCROLL_HIDE_MS;
 use crate::markdown::{PreviewSrc, scan_blocks_incremental_rope, scan_blocks_rope};
 use crate::scrollbar::horizontal_scrollbar;
 
@@ -74,10 +74,10 @@ impl EditorApp {
                         };
                         (lines.max(1), text.len_chars(), state.cursor_position())
                     };
-                    // 仅在开启预览时才同步 Markdown 预览，且做 200ms 去抖 + **合成一轮**：
-                    // 一次同步任务里循环「等待 → 快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
+                    // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**：
+                    // 一次同步任务里循环「快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
                     // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
-                    // （`preview_syncing` 闸门），且从「最后一次按键」起约 200ms+扫描时间即收敛。
+                    // （`preview_syncing` 闸门），从「最后一次按键」起该轮扫描结束即收敛。
                     // 大文档用**增量扫描**（[`scan_blocks_incremental_rope`]，复用上一版索引只重扫
                     // 变化区，16 万行从几百 ms 降到几十 ms）在后台线程做，UI 线程只留快照/装配。
                     if tab.preview_on && !this.preview_pending && !this.preview_syncing {
@@ -87,9 +87,6 @@ impl EditorApp {
                         let seq = this.preview_seq;
                         cx.spawn(async move |this, cx| {
                             loop {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(PREVIEW_DEBOUNCE_MS))
-                                    .await;
                                 // 1) UI 线程：快照当前正文 + 取上一版索引（增量基底）+ 版本号
                                 //    + 取走 dirty（自上次快照以来累积的变化区间；取走即清零）。
                                 //    快照与 dirty 同帧取：dirty 覆盖的正是 快照 vs 上一版 的差异。

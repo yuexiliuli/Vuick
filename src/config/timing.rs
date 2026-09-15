@@ -4,8 +4,6 @@
 pub const HIGHLIGHT_MS: u64 = 2200;
 /// 打开文件失败通知自动消失秒数。
 pub const OPEN_FAILURE_AUTOHIDE_SECS: u64 = 5;
-/// Markdown 预览重渲染去抖（ms，避免打字时逐键整篇重解析）。
-pub const PREVIEW_DEBOUNCE_MS: u64 = 30;
 /// 选项卡栏横向滚动条自动隐藏（ms，停止滚动后该时长隐藏）。
 pub const TAB_HSCROLL_HIDE_MS: u64 = 900;
 /// 统一行高提示的 O(块数) SumTree 重建**最小间隔**（ms）：换宽/拖分屏时宽度每帧变化，
