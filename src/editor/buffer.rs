@@ -9,6 +9,7 @@
 //! [`RopeExt`]（`gpui_component::input::RopeExt`）提供，列在本模块里指「字符列」
 //! （Unicode 标量数），与渲染的等宽列同向。
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use gpui::SharedString;
@@ -92,11 +93,13 @@ pub struct Buffer {
     /// （`refresh_max` 被增大的行更新），删除最长行后保持旧值（横向过度留白可接受，
     /// 换来编辑最长行时 O(编辑大小) 而非 O(n) 每次重扫）。
     max_line_chars: usize,
-    /// 全文最宽行（**宽度单位**，见 [`char_width_units`]；CJK/全角=2、ASCII=1、
-    /// Tab=4）——横向内容宽度的依据。与 `max_line_chars` 同样「只增不减」维护，
-    /// 保证任何行的真实字形宽 ≤ `max_line_units × 等宽格宽`，从而 StyledText 不会
-    /// 行内折行（折行会让行号/点击/光标全部错位并重叠）。
-    max_line_units: usize,
+    /// 行宽直方图（multiset）：宽度单位 → 拥有该宽度的行数（见 [`char_width_units`]，
+    /// CJK/全角=2、ASCII=1、Tab=4）。最宽行 = `keys().next_back()`(O(1))。
+    ///
+    /// **始终精确且增量维护**：编辑时先删旧受影响行的整行宽、再加新受影响行的整行宽
+    /// （O(受影响行 × log L)，L=不同宽度数）——删除长内容后横向滚动条量程立即精确
+    /// 收敛，不欠 O(1) 旧上界、也不做同步 O(n) 全量重扫。
+    line_width_histogram: BTreeMap<usize, usize>,
 }
 
 impl Default for Buffer {
@@ -105,7 +108,7 @@ impl Default for Buffer {
             text: Rope::from(""),
             version: 0,
             max_line_chars: 0,
-            max_line_units: 0,
+            line_width_histogram: BTreeMap::new(),
         }
     }
 }
@@ -117,7 +120,7 @@ impl Buffer {
             text: Rope::from(source.as_ref()),
             version: 0,
             max_line_chars: 0,
-            max_line_units: 0,
+            line_width_histogram: BTreeMap::new(),
         };
         b.recompute_max_line();
         b
@@ -129,7 +132,7 @@ impl Buffer {
             text,
             version: 0,
             max_line_chars: 0,
-            max_line_units: 0,
+            line_width_histogram: BTreeMap::new(),
         };
         b.recompute_max_line();
         b
@@ -141,39 +144,73 @@ impl Buffer {
     }
 
     /// 全文最宽行（宽度单位）——O(1) 读，供横向内容宽度（不折行的依据）。
+    /// multiset 始终精确，编辑后立即反映真实最宽行。
     pub fn max_line_units(&self) -> usize {
-        self.max_line_units
+        self.line_width_histogram
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// 某行的宽度单位（O(行内容)）。
+    fn line_units(&self, i: usize) -> usize {
+        self.text.slice_line(i).chars().map(char_width_units).sum()
+    }
+
+    /// `[a, b]` 各行的宽度 collect（替换前捕获旧行宽用；注意替换后这些行可能消失）。
+    fn line_widths_in(&self, a: usize, b: usize) -> Vec<usize> {
+        (a..=b).map(|i| self.line_units(i)).collect()
+    }
+
+    /// 从直方图减一行宽度；计数归零则移除键。
+    fn remove_line_width(&mut self, w: usize) {
+        if let Some(c) = self.line_width_histogram.get_mut(&w) {
+            *c -= 1;
+            if *c == 0 {
+                self.line_width_histogram.remove(&w);
+            }
+        }
+    }
+
+    /// 向直方图加一行宽度。
+    fn add_line_width(&mut self, w: usize) {
+        *self.line_width_histogram.entry(w).or_insert(0) += 1;
+    }
+
+    /// 编辑后的行宽直方图维护 + `max_line_chars`（只增不减）：先减被替换旧行的
+    /// 整行宽（`old_widths` 须在替换前捕获），再加新行 `[old_line_a, new_line_b]`
+    /// 的整行宽。行宽全用**整行**口径（边界被部分覆盖的行也要整体换新）。
+    fn refresh_lines(&mut self, old_widths: Vec<usize>, old_line_a: usize, new_line_b: usize) {
+        for w in old_widths {
+            self.remove_line_width(w);
+        }
+        let mut mx_chars = self.max_line_chars;
+        for i in old_line_a..=new_line_b {
+            let (units, chars) = {
+                let line = self.text.slice_line(i);
+                (
+                    line.chars().map(char_width_units).sum::<usize>(),
+                    line.chars().count(),
+                )
+            };
+            self.add_line_width(units);
+            mx_chars = mx_chars.max(chars);
+        }
+        self.max_line_chars = mx_chars;
     }
 
     fn recompute_max_line(&mut self) {
+        let mut hist = BTreeMap::new();
         let mut mx_chars = 0usize;
-        let mut mx_units = 0usize;
         for i in 0..self.text.lines_len() {
             let line = self.text.slice_line(i);
+            let units = line.chars().map(char_width_units).sum::<usize>();
+            *hist.entry(units).or_insert(0) += 1;
             mx_chars = mx_chars.max(line.chars().count());
-            mx_units = mx_units.max(line.chars().map(char_width_units).sum());
         }
+        self.line_width_histogram = hist;
         self.max_line_chars = mx_chars;
-        self.max_line_units = mx_units;
-    }
-
-    /// 编辑后增量更新最长行（字节区间 `[from, to)` 覆盖的新行）。
-    /// 只增不减：不大于当前值就保持（避免删除最长行时每次 O(n) 重扫）。
-    fn refresh_max_line(&mut self, from: usize, to: usize) {
-        let from = self.clip(from);
-        let to = self.clip(to.max(from));
-        if from >= to {
-            return;
-        }
-        let mut mx_chars = self.max_line_chars;
-        let mut mx_units = self.max_line_units;
-        for i in self.line_of_offset(from)..=self.line_of_offset(to) {
-            let line = self.text.slice_line(i);
-            mx_chars = mx_chars.max(line.chars().count());
-            mx_units = mx_units.max(line.chars().map(char_width_units).sum());
-        }
-        self.max_line_chars = mx_chars;
-        self.max_line_units = mx_units;
     }
 
     /// 底层文本（只读）。
@@ -351,10 +388,15 @@ impl Buffer {
     /// 应用一次替换（返回可逆记录）。`range` 需在字符边界上。
     pub fn apply_edit(&mut self, range: Range<usize>, new_text: &str) -> Edit {
         let range = self.clip(range.start).min(self.clip(range.end))..self.clip(range.end);
+        let old_line_a = self.line_of_offset(range.start.min(self.text.len()));
+        let old_line_b = self.line_of_offset(range.end.min(self.text.len()));
+        // 先捕获受影响旧行的整行宽（行宽直方图需要，替换后这些行可能消失）。
+        let old_widths = self.line_widths_in(old_line_a, old_line_b);
         let old = SharedString::from(self.text.slice(range.clone()).to_string());
         self.text.replace(range.clone(), new_text);
         self.version += 1;
-        self.refresh_max_line(range.start, range.start + new_text.len());
+        let new_line_b = self.line_of_offset((range.start + new_text.len()).min(self.text.len()));
+        self.refresh_lines(old_widths, old_line_a, new_line_b);
         Edit {
             start: range.start,
             old_text: old,
@@ -364,16 +406,28 @@ impl Buffer {
 
     /// 撤销：把 `inserted_range` 还原为 `old_text`。
     pub fn undo_edit(&mut self, edit: &Edit) {
-        self.text.replace(edit.inserted_range(), edit.old_text.as_ref());
+        let ir = edit.inserted_range();
+        let old_line_a = self.line_of_offset(ir.start.min(self.text.len()));
+        let old_line_b = self.line_of_offset(ir.end.min(self.text.len()));
+        let old_widths = self.line_widths_in(old_line_a, old_line_b);
+        self.text.replace(ir, edit.old_text.as_ref());
         self.version += 1;
-        self.refresh_max_line(edit.start, edit.start + edit.old_text.len());
+        let new_line_b = self
+            .line_of_offset((edit.start + edit.old_text.len()).min(self.text.len()));
+        self.refresh_lines(old_widths, old_line_a, new_line_b);
     }
 
     /// 重做：把 `replaced_range` 重新替换为 `new_text`。
     pub fn redo_edit(&mut self, edit: &Edit) {
-        self.text.replace(edit.replaced_range(), edit.new_text.as_ref());
+        let rr = edit.replaced_range();
+        let old_line_a = self.line_of_offset(rr.start.min(self.text.len()));
+        let old_line_b = self.line_of_offset(rr.end.min(self.text.len()));
+        let old_widths = self.line_widths_in(old_line_a, old_line_b);
+        self.text.replace(rr, edit.new_text.as_ref());
         self.version += 1;
-        self.refresh_max_line(edit.start, edit.start + edit.new_text.len());
+        let new_line_b = self
+            .line_of_offset((edit.start + edit.new_text.len()).min(self.text.len()));
+        self.refresh_lines(old_widths, old_line_a, new_line_b);
     }
 
     /// 整篇文本（测试/导出用；O(n) 物化）。

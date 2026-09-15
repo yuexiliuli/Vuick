@@ -1594,11 +1594,22 @@ impl Render for CodeEditor {
         // 的更长行时内容宽突跳；用全局最长行永远稳定，只在编辑产生更长行/窗口宽度/
         // 字号变化时才变化。
         let harea_w = (avail_w - self.gutter_width_px.as_f32()).max(0.);
-        let content_w_px = (self.buffer.max_line_units() as f32
-            * self.char_width.as_f32().max(1.))
+        let cw_max = self.char_width.as_f32().max(1.);
+        // `max_line_units` 由 Buffer 行宽直方图（multiset）维护，编辑后**始终精确**
+        // O(1) 读——删除长内容后横向滚动条量程立即收敛，无需重扫。
+        let content_w_px = (self.buffer.max_line_units() as f32 * cw_max)
             .max(harea_w)
             .max(1.);
         self.content_w_px = content_w_px;
+        // 内容变短（量程缩小时）把 `h_handle` 夹回新量程（O(1)）——删除长内容后
+        // 横向滚动位置不再停在旧更远处的空白处。ScrollableElement 布局也会夹，
+        // 这里显式夹一遍即时生效。
+        let cur_px = self.hscroll_px();
+        let max_px = (content_w_px - harea_w).max(0.);
+        if cur_px > max_px + 1.0 {
+            let cols = (max_px / cw_max).round() as usize;
+            self.set_hscroll(cols);
+        }
 
         let rv = RowView {
             lo,

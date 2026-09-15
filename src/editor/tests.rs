@@ -77,6 +77,31 @@ fn buffer_utf16_roundtrip() {
 }
 
 #[test]
+fn buffer_max_line_units_multiset_survives_multi_line_undo_redo() {
+    // 行宽直方图（multiset）增量维护的正确性：跨多行替换 + 撤销/重做后
+    // `max_line_units` 始终精确（O(1) 查询，无全量重扫）。
+    let mut b = Buffer::new("aaa\nbb\nccc"); // 行宽 3 / 2 / 3
+    assert_eq!(b.max_line_units(), 3, "有 tie 时 max=3");
+    // 跨行替换：range 2..7 = "a\nbb\n"，换成 "XY" → "aaXYccc"（单行，宽 7）
+    let e = b.apply_edit(2..7, "XY");
+    assert_eq!(b.to_string(), "aaXYccc");
+    assert_eq!(b.max_line_units(), 7, "跨行替换后精确");
+    // 撤销 → 回到 "aaa\nbb\nccc"（max 3）
+    b.undo_edit(&e);
+    assert_eq!(b.max_line_units(), 3, "撤销后精确");
+    // 重做 → "aaXYccc"（max 7）
+    b.redo_edit(&e);
+    assert_eq!(b.max_line_units(), 7, "重做后精确");
+    // 再插一行更宽行 → max 增长（"超宽的尾行字" = 6 全角 = 12 格）
+    b.apply_edit(b.len()..b.len(), "\n超宽的尾行字");
+    assert_eq!(b.max_line_units(), 2 * 6, "追加的全角行 = 12 格");
+    // 删除它 → 精确缩回 7
+    let prefix = format!("aaXYccc\n");
+    b.apply_edit(prefix.len()..prefix.len() + "超宽的尾行字".len(), "");
+    assert_eq!(b.max_line_units(), 7, "删除后精确缩回");
+}
+
+#[test]
 fn buffer_max_line_chars_initial_and_grows_on_edit() {
     // 横向内容宽度依据：全文最长行的**字符数**，须稳定 = 真实最长行。
     let mut b = Buffer::new("short\n这是最长的一行here\nend");
@@ -117,10 +142,10 @@ fn buffer_max_line_units_counts_fullwidth() {
     // 编辑写入更宽行 → 增长
     b.apply_edit(b.len()..b.len(), "\n中文很宽的一行字");
     assert_eq!(b.max_line_units(), 2 * 8, "8 个全角字 = 16 格");
-    // 删除最宽行 → 只增不减（保持旧上界，不做 O(n) 重扫）
+    // 删除最宽行 → 行宽直方图（multiset）增量精确：量程立即缩到真实次宽行
     let prefix = format!("short\n这是最长行here\nend\n");
     b.apply_edit(prefix.len()..prefix.len() + "中文很宽的一行字".len(), "");
-    assert_eq!(b.max_line_units(), 16, "删除最宽行后不重扫，保持旧上界");
+    assert_eq!(b.max_line_units(), 14, "删除最宽行后量程立即精确收敛到 14");
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +710,38 @@ fn gutter_scroll_locked_to_text_scroll(cx: &mut TestAppContext) {
     );
     assert!(t1.0 > t0.0, "应已向下滚动（{t0:?} → {t1:?}）");
     assert_eq!(t1, g1, "滚动后行号应与文本锁步一致（{t1:?} vs {g1:?}）");
+}
+
+#[gpui::test]
+fn hscroll_max_shrinks_after_deleting_widest_content(cx: &mut TestAppContext) {
+    // 回归（用户实测）：横向滚动条拉到最右 → 末尾追加超宽内容（量程变大）→
+    // 删除后量程不缩回。方案 A+B：删除置脏后（量程可见 + 首次/节流）精确重算使
+    // max_line_units 收敛，render 再把 h_handle 夹回新量程——不逐键 O(n)。
+    let (host, mut cx) = open(cx, "start\nline2");
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let base_max = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    // 光标移到文末，追加 600 个 x 的超宽内容
+    let len = cx.update(|_, cx| host.read(cx).ed.read(cx).text_string().len());
+    ed.update(cx, |ed, _| ed.set_caret_to(len));
+    let wide = "x".repeat(600);
+    ed.update(cx, |ed, cx| ed.insert_text(&wide, cx));
+    settle(&mut cx);
+    let wide_max = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(
+        wide_max > base_max + 1.0,
+        "追加超宽内容后量程应增大（{base_max} → {wide_max}）"
+    );
+    // 撤销 = 删除刚追加的超宽内容 → 量程应缩回
+    let w = window_handle(&mut cx);
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-z").unwrap());
+    settle(&mut cx);
+    let shrunk_max = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(
+        shrunk_max <= base_max + 1.0,
+        "删除超宽内容后量程应缩回（wide={wide_max} → shrunk={shrunk_max}，base={base_max}）"
+    );
 }
 
 #[gpui::test]
