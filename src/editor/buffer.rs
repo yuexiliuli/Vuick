@@ -61,6 +61,23 @@ impl Edit {
     }
 }
 
+/// 单字符的「渲染宽度单位」（等宽格数，供横向内容宽度估算）。
+///
+/// - Tab = 4 格；
+/// - ASCII（0x00-0x7F）= 1 格；
+/// - 其余（CJK 全角、emoji、复杂文字等）保守按 2 格。
+///
+/// 宁可高估（横向多留白）也绝不低估：低估会让 `StyledText` 在行内折行，行号、
+/// 点击、光标全部错位并重叠（用户实测：中文长行自动"换行"、序号没对齐、点下一行
+/// 文本重叠）。
+pub(crate) fn char_width_units(c: char) -> usize {
+    match c {
+        '\t' => 4,
+        c if c.is_ascii() => 1,
+        _ => 2,
+    }
+}
+
 /// 文本缓冲：Rope 全文 + 版本号（供缓存失效判断）。
 ///
 /// 行模型：以 LF 为行分隔符（`metric_lines_lf`，CR 视为普通字符）；
@@ -70,11 +87,16 @@ impl Edit {
 pub struct Buffer {
     text: Rope,
     version: u64,
-    /// 全文最长（字符数，Unicode 标量）的行 —— 编辑器横向内容宽度的依据。
+    /// 全文最长（字符数，Unicode 标量）的行 —— 保留给等宽列近似/测试。
     /// 一致性：`Buffer::new/from_rope/set_text` 全量重算；编辑类操作**只增不减**
     /// （`refresh_max` 被增大的行更新），删除最长行后保持旧值（横向过度留白可接受，
     /// 换来编辑最长行时 O(编辑大小) 而非 O(n) 每次重扫）。
     max_line_chars: usize,
+    /// 全文最宽行（**宽度单位**，见 [`char_width_units`]；CJK/全角=2、ASCII=1、
+    /// Tab=4）——横向内容宽度的依据。与 `max_line_chars` 同样「只增不减」维护，
+    /// 保证任何行的真实字形宽 ≤ `max_line_units × 等宽格宽`，从而 StyledText 不会
+    /// 行内折行（折行会让行号/点击/光标全部错位并重叠）。
+    max_line_units: usize,
 }
 
 impl Default for Buffer {
@@ -83,6 +105,7 @@ impl Default for Buffer {
             text: Rope::from(""),
             version: 0,
             max_line_chars: 0,
+            max_line_units: 0,
         }
     }
 }
@@ -94,6 +117,7 @@ impl Buffer {
             text: Rope::from(source.as_ref()),
             version: 0,
             max_line_chars: 0,
+            max_line_units: 0,
         };
         b.recompute_max_line();
         b
@@ -105,22 +129,32 @@ impl Buffer {
             text,
             version: 0,
             max_line_chars: 0,
+            max_line_units: 0,
         };
         b.recompute_max_line();
         b
     }
 
-    /// 全文最长行（字符数）——O(1) 读，供横向内容宽度。
+    /// 全文最长行（字符数）——O(1) 读，供等宽列近似/测试。
     pub fn max_line_chars(&self) -> usize {
         self.max_line_chars
     }
 
+    /// 全文最宽行（宽度单位）——O(1) 读，供横向内容宽度（不折行的依据）。
+    pub fn max_line_units(&self) -> usize {
+        self.max_line_units
+    }
+
     fn recompute_max_line(&mut self) {
-        let mut mx = 0usize;
+        let mut mx_chars = 0usize;
+        let mut mx_units = 0usize;
         for i in 0..self.text.lines_len() {
-            mx = mx.max(self.text.slice_line(i).chars().count());
+            let line = self.text.slice_line(i);
+            mx_chars = mx_chars.max(line.chars().count());
+            mx_units = mx_units.max(line.chars().map(char_width_units).sum());
         }
-        self.max_line_chars = mx;
+        self.max_line_chars = mx_chars;
+        self.max_line_units = mx_units;
     }
 
     /// 编辑后增量更新最长行（字节区间 `[from, to)` 覆盖的新行）。
@@ -131,11 +165,15 @@ impl Buffer {
         if from >= to {
             return;
         }
-        let mut mx = self.max_line_chars;
+        let mut mx_chars = self.max_line_chars;
+        let mut mx_units = self.max_line_units;
         for i in self.line_of_offset(from)..=self.line_of_offset(to) {
-            mx = mx.max(self.text.slice_line(i).chars().count());
+            let line = self.text.slice_line(i);
+            mx_chars = mx_chars.max(line.chars().count());
+            mx_units = mx_units.max(line.chars().map(char_width_units).sum());
         }
-        self.max_line_chars = mx;
+        self.max_line_chars = mx_chars;
+        self.max_line_units = mx_units;
     }
 
     /// 底层文本（只读）。
@@ -228,6 +266,20 @@ impl Buffer {
             .slice(..self.byte_column(offset))
             .chars()
             .count()
+    }
+
+    /// 字节偏移在当前行内的「宽度单位」列（O(行)，见 [`char_width_units`])——
+    /// 与渲染等宽格一致：CJK 一个占 2 格。横向滚动/光标 reveal 用这个，否则
+    /// 中文长行按字符列 reveal 会少滚一半，光标跑出可视区。
+    pub fn unit_column(&self, offset: usize) -> usize {
+        let offset = self.clip(offset);
+        let line = self.line_of_offset(offset);
+        self.text
+            .slice_line(line)
+            .slice(..self.byte_column(offset))
+            .chars()
+            .map(char_width_units)
+            .sum()
     }
 
     /// 把「行内字符列」换算回字节偏移（越界夹到行尾；O(行)）。

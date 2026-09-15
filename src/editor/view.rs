@@ -2,7 +2,8 @@
 //!
 //! 渲染：复用 gpui 原生 `ListState`（统一行高、行级虚拟化、内置竖滚动条）+ 外圈
 //! `overflow_x_scroll` 横向容器（`h_handle` + gpui-component 滚动条）——
-//! 与 markdown 预览同一套成熟模式。每行 = 行号 gutter + `StyledText`
+//! 与 markdown 预览同一套成熟模式。行号 gutter 是编辑区左缘的固定叠层
+//! （按 ListState 竖向滚动对齐，不随内容横向滚动），每行内容 = `StyledText`
 //! （语法着色 + 选区底色）+ 光标竖条。
 //!
 //! 输入：
@@ -59,6 +60,10 @@ const CARET_WIDTH_PX: f32 = 2.;
 const MIN_VISIBLE_ROWS: usize = 12;
 /// 横向滚动右缘留白的列数缓冲。
 const HSCROLL_MARGIN_COLS: usize = 4;
+/// 行号与编辑区左缘（侧边栏侧）之间的留白（px）。
+const GUTTER_LEFT_PAD_PX: f32 = 12.;
+/// 行号与文本之间的留白（px）。
+const GUTTER_RIGHT_PAD_PX: f32 = 6.;
 
 /// 编辑器对外事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,10 +100,8 @@ struct RowView {
     lo: usize,
     rows: Vec<RowData>,
     line_height: Pixels,
-    gutter_width: Pixels,
     mono: SharedString,
     font_size: Pixels,
-    gutter_fg: Hsla,
     caret_color: Hsla,
 }
 
@@ -108,7 +111,15 @@ pub struct CodeEditor {
     selection: Selection,
     undo: UndoManager,
     focus_handle: FocusHandle,
+    /// 文本区 ListState（竖向虚拟化 + 滚动 + 竖滚动条量程）。行号列用独立的
+    /// [`Self::gutter_list_state`]，两者**锁步**（见 `sync_gutter_scroll`），
+    /// 不共用同一 StateInner——共用会让换宽/统一高度提示互相干扰（量程坍缩实测）。
     list_state: ListState,
+    /// 行号列 ListState：与 `list_state` 同 item 数、同行高，滚动由
+    /// `sync_gutter_scroll` 从文本区逐帧对齐。行号不再手工按 `logical_scroll_top`
+    /// 反推 y（旧叠层每次 render 重建，滚轮滚动时与 List 行绘制不同步 → 序号
+    /// 「翻动/闪烁/晃动」），而是由 List 自身虚拟化渲染。
+    gutter_list_state: ListState,
     h_handle: ScrollHandle,
     highlighter: Highlighter,
     language: Option<String>,
@@ -128,6 +139,9 @@ pub struct CodeEditor {
     gutter_width_px: Pixels,
     content_w_px: f32,
     uniform_applied: Option<Pixels>,
+    /// 行号列已应用统一高度提示的行高（行号行恒等于 line_height，避免首次整表
+    /// 测量 O(n) 与量程失真；仅在行高/重置后重挂）。
+    gutter_uniform_applied: Option<Pixels>,
     /// 统一高度提示最近一次重挂时间（节流：gpui 换宽会清空 size_hint，
     /// 导致量程坍缩，检测到坍缩后重挂，但同一时间窗口内至多重挂一次）。
     last_uniform_apply: Option<std::time::Instant>,
@@ -171,12 +185,14 @@ impl CodeEditor {
         let buffer = Buffer::default();
         let row_count = buffer.line_count().max(1);
         let list_state = ListState::new(row_count, ListAlignment::Top, px(16.));
+        let gutter_list_state = ListState::new(row_count, ListAlignment::Top, px(16.));
         Self {
             buffer,
             selection: Selection::collapsed(0),
             undo: UndoManager::new(),
             focus_handle,
             list_state,
+            gutter_list_state,
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
             language: None,
@@ -192,6 +208,7 @@ impl CodeEditor {
             gutter_width_px: px(0.),
             content_w_px: 0.,
             uniform_applied: None,
+            gutter_uniform_applied: None,
             last_uniform_apply: None,
             hint_healthy: false,
             bg: rgb(0xffffff).into(),
@@ -400,11 +417,25 @@ impl CodeEditor {
         self.caret_color = colors.foreground;
         // 选区底色同样避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
         self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
+        // 行号列统一高度提示：行号行恒等于 line_height，预填提示可跳过首次整表
+        // 测量（大文档 O(n)），滚动/可视渲染也稳定。
+        if self.gutter_uniform_applied != Some(self.line_height) {
+            self.gutter_list_state = self
+                .gutter_list_state
+                .clone()
+                .with_uniform_item_height(self.line_height);
+            self.gutter_uniform_applied = Some(self.line_height);
+        }
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
         self.gutter_chars = digits.max(3);
-        self.gutter_width_px = px(self.gutter_chars as f32 * char_width.as_f32() + 14.);
+        self.gutter_width_px = px(
+            self.gutter_chars as f32 * char_width.as_f32()
+                + GUTTER_LEFT_PAD_PX
+                + GUTTER_RIGHT_PAD_PX
+                + 4.,
+        );
     }
 
     /// 列表条目数与行数一致（reset 场景：首次/整篇替换/撤销重做）。
@@ -412,7 +443,10 @@ impl CodeEditor {
         let new_n = self.buffer.line_count().max(1);
         if new_n != self.list_state.item_count() {
             self.list_state.reset(new_n);
+            self.gutter_list_state.reset(new_n);
             self.uniform_applied = None;
+            // reset 会清空统一高度提示 → 下帧 refresh_metrics 重新预填。
+            self.gutter_uniform_applied = None;
         }
         self.row_count = new_n;
     }
@@ -429,6 +463,8 @@ impl CodeEditor {
         let new_span = new_b - old_a + 1;
         if new_span != old_span {
             self.list_state
+                .splice(old_a..old_a + old_span, new_span);
+            self.gutter_list_state
                 .splice(old_a..old_a + old_span, new_span);
         }
         self.row_count = self.buffer.line_count().max(1);
@@ -490,6 +526,19 @@ impl CodeEditor {
             .with_uniform_item_height(self.line_height);
         self.uniform_applied = Some(self.line_height);
         self.last_uniform_apply = Some(std::time::Instant::now());
+    }
+
+    /// 把文本区 ListState 的竖向滚动位置对齐到行号列（两者锁步）。
+    /// 每次渲染调用一次（O(1) 差量读，仅在两者不同时才写一次）。行号列不挂
+    /// 滚动条、不做统一高度提示，只需反映与文本相同的可视行。
+    fn sync_gutter_scroll(&mut self) {
+        let text_top = self.list_state.logical_scroll_top();
+        let gutter_top = self.gutter_list_state.logical_scroll_top();
+        let drifted = gutter_top.item_ix != text_top.item_ix
+            || (gutter_top.offset_in_item.as_f32() - text_top.offset_in_item.as_f32()).abs() > 0.5;
+        if drifted {
+            self.gutter_list_state.scroll_to(text_top);
+        }
     }
 
     fn visible_chars_from_width(&self, width_px: f32) -> usize {
@@ -643,7 +692,9 @@ impl CodeEditor {
         let row = self.buffer.line_of_offset(head);
         self.list_state.scroll_to_reveal_item(row);
 
-        let col = self.buffer.char_column(head);
+        // 横向 reveal 用「宽度单位」列（CJK=2 格）与可视格数一致，否则中文长行
+        // 少滚一半、光标仍跑出可视区（用户实测：内容超窗后新输入看不见）。
+        let col = self.buffer.unit_column(head);
         let margin = HSCROLL_MARGIN_COLS;
         let right_edge = self.visible_chars.saturating_sub(margin).max(1);
         if col < self.hscroll_cols + margin
@@ -658,6 +709,13 @@ impl CodeEditor {
         }
     }
 
+    /// 仅竖向 reveal（鼠标点击/拖动用）。点击必落在可视区内，无需横向自动滚动；
+    /// 若不区分，点行首/空白行会把内容强行拉去最左 →「内容左右晃动」。
+    fn reveal_caret_vertical(&mut self) {
+        let row = self.buffer.line_of_offset(self.selection.head());
+        self.list_state.scroll_to_reveal_item(row);
+    }
+
     fn set_hscroll(&mut self, cols: usize) {
         self.hscroll_cols = cols;
         let x = cols as f32 * self.char_width.as_f32();
@@ -665,12 +723,16 @@ impl CodeEditor {
     }
 
     /// 按像素横向滚动（容器滚到底/顶自动夹紧），并同步 `hscroll_cols`。
+    /// `view_w` = 文本区可视宽（编辑区宽 − 行号列宽），`content_w_px` 也按文本区计。
+    /// 亚格增量（<半格）直接丢弃：部分鼠标滚轮带轻微水平分量/倾斜轮噪声，若每帧
+    /// 量化成整格会令内容（行号右缘）左右跳一格、看起来像在“晃”。
     fn scroll_horizontal_px(&mut self, dx_px: f32) {
-        if dx_px == 0. {
+        let cw = self.char_width.as_f32().max(1.);
+        if dx_px.abs() < cw * 0.5 {
             return;
         }
-        let cw = self.char_width.as_f32().max(1.);
-        let view_w = self.element_bounds.size.width.as_f32();
+        let view_w = (self.element_bounds.size.width.as_f32() - self.gutter_width_px.as_f32())
+            .max(0.);
         let max_px = (self.content_w_px - view_w).max(0.);
         let cur_px = (-self.h_handle.offset().x.as_f32()).clamp(0.0, max_px);
         let target_px = (cur_px + dx_px).clamp(0.0, max_px);
@@ -777,6 +839,38 @@ impl CodeEditor {
             .map(|layout| layout.x_for_index(byte_col).as_f32())
             .unwrap_or(0.)
     }
+
+    /// 测试用：当前横向滚动像素（断言横向滚动确实把内容推走了）。
+    pub(crate) fn test_hscroll_px(&self) -> f32 {
+        self.hscroll_px()
+    }
+
+    /// 测试用：当前横向内容宽度（px）。断言行宽估算不低估真实字形宽 → 不折行。
+    pub(crate) fn test_content_w_px(&self) -> f32 {
+        self.content_w_px
+    }
+
+    /// 测试用：横向滚动容器最大可滚量（px）——底部横向滚动条量程的依据。
+    pub(crate) fn test_hscroll_max_px(&self) -> f32 {
+        self.h_handle.max_offset().x.as_f32()
+    }
+
+    /// 测试用：当前可视格（宽度单位）数。
+    pub(crate) fn test_visible_chars(&self) -> usize {
+        self.visible_chars
+    }
+
+    /// 测试用：文本区竖向滚动顶 `(item_ix, offset_in_item)`。
+    pub(crate) fn test_text_scroll_top(&self) -> (usize, f32) {
+        let s = self.list_state.logical_scroll_top();
+        (s.item_ix, s.offset_in_item.as_f32())
+    }
+
+    /// 测试用：行号列竖向滚动顶（应与文本区锁步一致）。
+    pub(crate) fn test_gutter_scroll_top(&self) -> (usize, f32) {
+        let s = self.gutter_list_state.logical_scroll_top();
+        (s.item_ix, s.offset_in_item.as_f32())
+    }
 }
 
 impl CodeEditor {
@@ -853,7 +947,7 @@ impl CodeEditor {
         }
         self.dragging = true;
         self.kick_caret();
-        self.reveal_caret();
+        self.reveal_caret_vertical();
         cx.notify();
     }
 
@@ -866,7 +960,7 @@ impl CodeEditor {
         self.selection.set_head(offset);
         self.selection.remember_column(self.buffer.char_column(offset));
         self.kick_caret();
-        self.reveal_caret();
+        self.reveal_caret_vertical();
         cx.notify();
     }
 
@@ -1294,13 +1388,18 @@ impl EntityInputHandler for CodeEditor {
         cx: &mut Context<Self>,
     ) {
         let byte_range = match range {
-            Some(r) => self.buffer.utf16_to_byte(r.start)..self.buffer.utf16_to_byte(r.end),
+            Some(r) => self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
+                ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16())),
             None => self
                 .marked_range
                 .clone()
                 .unwrap_or_else(|| self.selection.range()),
         };
         self.insert_edit(byte_range, text, EditIntent::Typing, cx);
+        // 提交/直输会结束一次 IME 组合：Windows 提交候选时只发
+        // `replace_text_in_range(None, …)`（不调 unmark_text），不清掉
+        // marked_range 的话，下一次组合会把已提交文本当成旧 marked 区域再次替换。
+        self.marked_range = None;
     }
 
     fn replace_and_mark_text_in_range(
@@ -1311,15 +1410,39 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `None` 区间 = 替换当前 marked（正在组合的）文本；只有没有任何 marked 时的
+        // 首个字符才落在普通 selection 上。以前用 selection 会让每次组合更新都
+        // 「追加」到旧组合后面 → 垃圾残留。
         let byte_range = match range_utf16 {
-            Some(r) => self.buffer.utf16_to_byte(r.start)..self.buffer.utf16_to_byte(r.end),
-            None => self.selection.range(),
+            Some(r) => self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
+                ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16())),
+            None => self
+                .marked_range
+                .clone()
+                .unwrap_or_else(|| self.selection.range()),
         };
         self.insert_edit(byte_range.clone(), new_text, EditIntent::Atomic, cx);
-        self.marked_range = Some(byte_range.start..byte_range.start + new_text.len());
-        if let Some(sel) = new_selected_range {
-            let s = self.buffer.utf16_to_byte(sel.start.min(self.buffer.len_utf16()));
-            let e = self.buffer.utf16_to_byte(sel.end.min(self.buffer.len_utf16()));
+        if new_text.is_empty() {
+            // 组合被取消：清掉 marked，光标停在原地（等价于删掉刚标记的占位）。
+            self.marked_range = None;
+            self.selection = Selection::collapsed(byte_range.start);
+        } else {
+            self.marked_range = Some(byte_range.start..byte_range.start + new_text.len());
+            // `new_selected_range` 是**相对被标记文本（new_text）起点**的 UTF-16
+            // 偏移（AppKit setMarkedText 的 selectedRange 语义），不是文档绝对偏移。
+            // 以前当绝对偏移用 → 光标跳到文档开头附近（大文档任意位置输入中文时
+            // 若光标落点恰在多字节字符中间，后续 insert 直接撞 `byte index is not
+            // on a char boundary` 崩溃）。
+            let (s, e) = match new_selected_range {
+                Some(sel) => (
+                    byte_range.start + ime_utf16_offset_to_byte(new_text, sel.start),
+                    byte_range.start + ime_utf16_offset_to_byte(new_text, sel.end),
+                ),
+                None => (
+                    byte_range.start + new_text.len(),
+                    byte_range.start + new_text.len(),
+                ),
+            };
             self.selection = Selection::from_range(s, e);
             self.kick_caret();
         }
@@ -1431,6 +1554,8 @@ impl Render for CodeEditor {
 
         self.refresh_metrics(window, cx);
         self.ensure_uniform_hint();
+        // 行号列与文本区竖向锁步（覆盖滚轮/拖动滚动条/reveal 等一切滚动来源）。
+        self.sync_gutter_scroll();
         // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
         if self.char_width.as_f32() > 0. {
             self.hscroll_cols = ((-self.h_handle.offset().x.as_f32())
@@ -1461,13 +1586,17 @@ impl Render for CodeEditor {
         let show_caret = self.caret_shown_now();
         let rows = self.build_rows(window, lo, hi, show_caret);
 
-        // 横向内容宽度 = 整篇最长行的字符数（Buffer O(1) 维护）。
-        // 此前用「可见窗口的行 max + 单调上修」：拖垂直滚动条经过首次出现的更长行时
-        // 内容宽会突然跳大（编辑区宽度突然变大）。改成文档全局最长行就永远稳定，
-        // 只在编辑产生更长行/窗口宽度/字号变化时才变化。
-        let content_w_px = (self.buffer.max_line_chars() as f32
+        // 横向内容宽度 = 整篇最长行的字符数（Buffer O(1) 维护），按**文本区**计：
+        // 文本区可视宽 = 编辑区宽 − 行号列宽（横向滚动容器 `harea` 从行号列右缘
+        // 开始）。此前用整编辑区宽，会多出行号宽度的“幻影可滚范围”（量程/滚动到达
+        // 边界提前），也让首帧 `reveal_caret` 误以为可以横向滚动。
+        // 此前提过：用「可见窗口的行 max + 单调上修」会在拖垂直滚动条经过首次出现
+        // 的更长行时内容宽突跳；用全局最长行永远稳定，只在编辑产生更长行/窗口宽度/
+        // 字号变化时才变化。
+        let harea_w = (avail_w - self.gutter_width_px.as_f32()).max(0.);
+        let content_w_px = (self.buffer.max_line_units() as f32
             * self.char_width.as_f32().max(1.))
-            .max(avail_w)
+            .max(harea_w)
             .max(1.);
         self.content_w_px = content_w_px;
 
@@ -1475,10 +1604,8 @@ impl Render for CodeEditor {
             lo,
             rows,
             line_height: self.line_height,
-            gutter_width: self.gutter_width_px,
             mono: self.mono.clone(),
             font_size: self.font_size,
-            gutter_fg: self.gutter_fg,
             caret_color: self.caret_color,
         };
         let rv = std::rc::Rc::new(rv);
@@ -1492,7 +1619,7 @@ impl Render for CodeEditor {
             } else {
                 &RowData::empty()
             };
-            row_element(rd, &rv, ix).into_any_element()
+            row_element(rd, &rv).into_any_element()
         })
         // 关键：必须把 List 元素撑满容器（size_full → 视口=编辑器整块）。
         // 不加会走 List 的 Infer 测量——高度=内容高（一行 ~22px），视口≈0，
@@ -1506,14 +1633,49 @@ impl Render for CodeEditor {
             .min_w_full()
             .h_full()
             .child(content);
+        // 横向滚动容器只包住「文本区」：`absolute left=gutter_width` 使内容从行号
+        // 列右缘开始滚动；行号本身在下方固定叠层（`gutter`）里，不随内容横移。
         let harea = div()
             .id("ce-harea")
             .debug_selector(|| "ce-harea".into())
-            .size_full()
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(self.gutter_width_px)
+            .right(px(0.))
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .track_scroll(&self.h_handle)
             .child(inner);
+
+        // 行号 gutter：固定编辑区左缘、不随内容横向滚动。**与文本共用同一个
+        // ListState 的第二个 `list()`** —— 竖向滚动完全由 List 自身虚拟化+绘制，
+        // 不再手工按 `logical_scroll_top` 反推每个行号 y（旧叠层每次 render 重建，
+        // 滚轮滚动时与 List 行绘制差半拍 → 序号「翻动/闪烁/晃动」）。两列行高、
+        // 滚动位置、可见范围来自同一状态，天然逐像素一致。
+        let gv = std::rc::Rc::new(GutterView {
+            line_height: self.line_height,
+            mono: self.mono.clone(),
+            font_size: self.font_size,
+            fg: self.gutter_fg,
+        });
+        // 行号列用独立的 gutter_list_state（与文本锁步），不复用文本的
+        // list_state —— 共用同一 StateInner 会让换宽/统一高度互相干扰（量程坍缩）。
+        let gutter_content = list(self.gutter_list_state.clone(), move |ix, _window, _cx| {
+            number_element(ix, &gv).into_any_element()
+        })
+        .size_full();
+        let gutter_wrap = div()
+            .id("ce-gutter")
+            .debug_selector(|| "ce-gutter".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(px(0.))
+            .w(self.gutter_width_px)
+            .bg(bg)
+            .overflow_hidden()
+            .child(gutter_content);
 
         let core = div()
             .id("code-editor")
@@ -1656,6 +1818,9 @@ impl Render for CodeEditor {
                 cx.stop_propagation()
             }))
             .child(harea)
+            // 行号列（第二个 List，与文本共用 ListState）：盖在横向滚动文本区左缘，
+            // 不随内容横移，竖向滚动与文本逐行一致。
+            .child(gutter_wrap)
             // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
             // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
             // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
@@ -1689,34 +1854,22 @@ impl Render for CodeEditor {
     }
 }
 
-/// 行元素：gutter + 文本 + 光标。
-fn row_element(rd: &RowData, rv: &RowView, ix: usize) -> gpui::Div {
-    let number = SharedString::from((ix + 1).to_string());
+/// 行元素：文本 + 光标。行号 gutter 已是编辑区左侧固定叠层（见 render `gutter`），
+/// 不放进本行，否则会跟随横向滚动容器一起被推走；文本从行左缘（叠层右缘）开始。
+fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
     div()
         .h(rv.line_height)
         .relative()
         .w_full()
+        // 兜底：行高固定 = 一屏行高。即使某行字形宽一度超出内容宽（宽度单位估算
+        // 永远只增不减、正常情况下不会），也绝不把溢出文本画到下一行去（否则行号
+        // 错位、点击/光标重叠）。
+        .overflow_hidden()
         .child(
             div()
                 .absolute()
                 .top(px(0.))
-                .bottom(px(0.))
                 .left(px(0.))
-                .w(rv.gutter_width)
-                .flex()
-                .items_center()
-                .justify_end()
-                .pr(px(6.))
-                .text_color(rv.gutter_fg)
-                .text_size(rv.font_size)
-                .font_family(rv.mono.clone())
-                .child(number),
-        )
-        .child(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(rv.gutter_width)
                 .h(rv.line_height)
                 .font_family(rv.mono.clone())
                 .text_size(rv.font_size)
@@ -1728,7 +1881,7 @@ fn row_element(rd: &RowData, rv: &RowView, ix: usize) -> gpui::Div {
                     .absolute()
                     .debug_selector(|| "ce-caret".into())
                     .top(px(0.))
-                    .left(rv.gutter_width + px(rd.caret.unwrap_or(0.)))
+                    .left(px(rd.caret.unwrap_or(0.)))
                     .w(px(CARET_WIDTH_PX))
                     .h(rv.line_height)
                     .bg(rv.caret_color),
@@ -1738,6 +1891,51 @@ fn row_element(rd: &RowData, rv: &RowView, ix: usize) -> gpui::Div {
 
 fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
     StyledText::new(rd.text.clone()).with_highlights(rd.highlights.clone())
+}
+
+/// 行号列渲染上下文（供 gutter 列表闭包只读捕获）。
+struct GutterView {
+    line_height: Pixels,
+    mono: SharedString,
+    font_size: Pixels,
+    fg: Hsla,
+}
+
+/// 行号单元格：右对齐、行高与文本行一致。由共享 ListState 的第二个 `list()`
+/// 驱动 → 行号与文本行对齐、随滚动同步移动且不闪烁。
+fn number_element(ix: usize, gv: &GutterView) -> gpui::Div {
+    let number = SharedString::from((ix + 1).to_string());
+    div()
+        .h(gv.line_height)
+        .flex()
+        .items_center()
+        .justify_end()
+        .pl(px(GUTTER_LEFT_PAD_PX))
+        .pr(px(GUTTER_RIGHT_PAD_PX))
+        .text_color(gv.fg)
+        .text_size(gv.font_size)
+        .font_family(gv.mono.clone())
+        .child(number)
+}
+
+/// IME `new_selected_range` 辅助：把「相对被标记文本（`text`）起点」的 UTF-16
+/// 偏移换算成 `text` 内的字节偏移。偏到两半的代理对按字符边界取整（停在该字符
+/// 起点），越界夹到文本末尾。
+fn ime_utf16_offset_to_byte(text: &str, offset_utf16: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut units = 0usize;
+    for ch in text.chars() {
+        if units >= offset_utf16 {
+            break;
+        }
+        let cu = ch.len_utf16();
+        if units + cu > offset_utf16 {
+            break;
+        }
+        units += cu;
+        bytes += ch.len_utf8();
+    }
+    bytes
 }
 
 /// 包装元素：把内部 UI 委托给 gpui 布局/绘制，同时在 paint 阶段挂上

@@ -6,8 +6,8 @@ use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
 use crate::editor::undo::EditIntent;
 use gpui::{
-    AppContext, Context, Entity, IntoElement, Keystroke, Modifiers, MouseButton, Render,
-    TestAppContext, VisualTestContext, Window, point, px, size,
+    AppContext, Context, Entity, EntityInputHandler, IntoElement, Keystroke, Modifiers,
+    MouseButton, Render, TestAppContext, VisualTestContext, Window, point, px, size,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +100,27 @@ fn buffer_max_line_chars_initial_and_grows_on_edit() {
     // 撤销应能找回该行（仍 21）
     b.undo_edit(&e);
     assert_eq!(b.max_line_chars(), 21);
+}
+
+#[test]
+fn buffer_max_line_units_counts_fullwidth() {
+    // 宽度单位是「不折行」的依据（CJK 全角 = 2 格、ASCII = 1 格、Tab = 4 格），
+    // 且可随删除缩小。任何行的真实字形宽 ≤ 单位 × 等宽格宽，StyledText 才不会折行。
+    assert_eq!(Buffer::new("a\nbb\nccc").max_line_units(), 3);
+    assert_eq!(Buffer::new("").max_line_units(), 0);
+    assert_eq!(Buffer::new("是").max_line_units(), 2, "单个全角字 = 2 格");
+    assert_eq!(Buffer::new("abcd中文").max_line_units(), 4 + 2 * 2);
+    assert_eq!(Buffer::new("a\tb").max_line_units(), 1 + 4 + 1, "Tab = 4 格");
+    let mut b = Buffer::new("short\n这是最长行here\nend");
+    // 这(2)是(2)最(2)长(2)行(2)h(1)e(1)r(1)e(1) → 2*5 + 4 = 14
+    assert_eq!(b.max_line_units(), 14);
+    // 编辑写入更宽行 → 增长
+    b.apply_edit(b.len()..b.len(), "\n中文很宽的一行字");
+    assert_eq!(b.max_line_units(), 2 * 8, "8 个全角字 = 16 格");
+    // 删除最宽行 → 只增不减（保持旧上界，不做 O(n) 重扫）
+    let prefix = format!("short\n这是最长行here\nend\n");
+    b.apply_edit(prefix.len()..prefix.len() + "中文很宽的一行字".len(), "");
+    assert_eq!(b.max_line_units(), 16, "删除最宽行后不重扫，保持旧上界");
 }
 
 // ---------------------------------------------------------------------------
@@ -475,6 +496,299 @@ fn caret_image_is_laid_out_when_focused(cx: &mut TestAppContext) {
         b.size.width.as_f32() > 1.0 && b.size.height.as_f32() > 0.0
             && b.origin.y < px(40.),
         "光标应落在第 1 行、宽≥1px、高>0：{b:?}"
+    );
+}
+
+#[gpui::test]
+fn gutter_fixed_while_content_scrolls_horizontally(cx: &mut TestAppContext) {
+    // 回归（2026-09-15 用户反馈）：编辑区内容横向滚动时，行号也跟着滚走。
+    // 现在行号是编辑区左缘的固定列（`ce-gutter`，独立 List 与文本锁步）——
+    // 横向滚动内容后行号列左缘必须纹丝不动，而文本内容必须真的被推走。
+    // 测试窗 1920px 宽 → 最长行需远超可视区才有横向可滚量程。
+    let long = "一".repeat(600);
+    let (host, mut cx) = open(cx, &format!("{long}\n第二行"));
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let gutter0 = cx
+        .debug_bounds("ce-gutter")
+        .expect("行号固定列应渲染");
+    assert!(
+        gutter0.size.width.as_f32() > 0.,
+        "行号列应有宽度：{gutter0:?}"
+    );
+    // 向编辑区中心派发横向滚轮（向右 = 内容左移，正 delta）。事件坐标与
+    // `debug_bounds` 同空间（不能用 `window.bounds()`——那是平台坐标）。
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + ed_b.size.width.as_f32() / 2.0),
+        px(ed_b.origin.y.as_f32() + ed_b.size.height.as_f32() / 2.0),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(120.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(&mut cx);
+    let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(hscroll > 0., "横向滚动应真正发生（hscroll={hscroll}）");
+    let gutter1 = cx.debug_bounds("ce-gutter").expect("行号列仍在");
+    assert_eq!(
+        gutter0.origin.x,
+        gutter1.origin.x,
+        "行号列左缘不应随内容横向滚动（{gutter0:?} → {gutter1:?}）"
+    );
+    assert!(
+        gutter1.origin.x.as_f32().abs() < 1.0,
+        "行号应贴在编辑区左缘（origin.x={}）",
+        gutter1.origin.x.as_f32()
+    );
+}
+
+#[gpui::test]
+fn ime_composition_replaces_marked_text_and_commits(cx: &mut TestAppContext) {
+    // 回归：IME 组合曾把每次 `replace_and_mark(None, …)` 追加到旧组合后面
+    // （产生 'nn'...垃圾残留），提交后也不清 marked → 下次组合把已提交文本当
+    // 旧 marked 再次替换。参照 gpui-component 的组合流：None 区间 = 替换当前
+    // marked；普通 `replace_text_in_range` 提交后自动结束组合。
+    let (host, mut cx) = open(cx, "");
+    focus(&host, cx);
+    cx.update(|window, app| {
+        let ed = host.read(app).ed.clone();
+        ed.update(app, |ed, cx| {
+            ed.replace_text_in_range(None, "prefix ", window, cx);
+            // 组合第 1 字：n → ni → 你（每次更新替换旧的 marked）
+            ed.replace_and_mark_text_in_range(None, "n", None, window, cx);
+            ed.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            ed.replace_and_mark_text_in_range(None, "你", None, window, cx);
+            // 提交第 1 字（结束本次组合，marked 清空）
+            ed.replace_text_in_range(None, "你", window, cx);
+            // 组合第 2 字并提交
+            ed.replace_and_mark_text_in_range(None, "h", None, window, cx);
+            ed.replace_and_mark_text_in_range(None, "ha", None, window, cx);
+            ed.replace_and_mark_text_in_range(None, "好", None, window, cx);
+            ed.replace_text_in_range(None, "好", window, cx);
+        });
+    });
+    assert_eq!(editor_text(&host, &mut cx), "prefix 你好");
+    let sel = editor_selection(&host, &mut cx);
+    assert_eq!(sel.head(), "prefix 你好".len());
+    // 提交后再开一次组合，不应把已提交的 "prefix 你好" 当旧 marked 覆盖
+    cx.update(|window, app| {
+        let ed = host.read(app).ed.clone();
+        ed.update(app, |ed, cx| {
+            ed.replace_and_mark_text_in_range(None, "x", None, window, cx);
+            ed.replace_text_in_range(None, "!", window, cx);
+        });
+    });
+    assert_eq!(editor_text(&host, &mut cx), "prefix 你好!");
+}
+
+#[gpui::test]
+fn ime_new_selected_range_is_relative_to_marked_text(cx: &mut TestAppContext) {
+    // 回归 1（崩溃）：`new_selected_range` 曾被当「文档绝对 UTF-16 偏移」→ 光标
+    // 跳到文档开头附近，落点多字节字符中间时后续插入触发
+    // `byte index is not on a char boundary` panic（buffer.rs apply_edit）。
+    // 回归 2（跳开头）：同一根因让大文档任意位置输入中文时插入位置跑回文首。
+    let (host, mut cx) = open(cx, "一二三四五");
+    let ed = cx.update(|_, app| host.read(app).ed.clone());
+    // 光标移到文末（第 5 字后，字节 15）
+    ed.update(cx, |ed, _| ed.set_caret_to(15));
+    // 文末开始组合 "ni"，IMS 光标停在组合内第 1 个 UTF-16 单元后（相对 1..1）
+    cx.update(|window, app| {
+        ed.update(app, |ed, cx| {
+            ed.replace_and_mark_text_in_range(None, "ni", Some(1..1), window, cx);
+        });
+    });
+    // 光标 = 文末 + 组合内偏移 1 单元（"n"=1 字节）→ 16，绝不能跳回文档开头
+    let sel = editor_selection(&host, &mut cx);
+    assert_eq!(sel.head(), 15 + 1, "光标应停在组合内相对位置而非文档开头");
+    assert_eq!(editor_text(&host, &mut cx), "一二三四五ni");
+    // 再输一次组合，替换 marked、不崩溃、光标仍在组合内
+    cx.update(|window, app| {
+        ed.update(app, |ed, cx| {
+            ed.replace_and_mark_text_in_range(None, "你i", Some(1..1), window, cx);
+        });
+    });
+    let sel = editor_selection(&host, &mut cx);
+    assert_eq!(sel.head(), 15 + "你".len(), "光标应停在组合内 '你' 之后");
+    assert_eq!(editor_text(&host, &mut cx), "一二三四五你i");
+    // 提交
+    cx.update(|window, app| {
+        ed.update(app, |ed, cx| {
+            ed.replace_text_in_range(None, "你", window, cx);
+        });
+    });
+    assert_eq!(editor_text(&host, &mut cx), "一二三四五你");
+    let sel = editor_selection(&host, &mut cx);
+    assert_eq!(sel.head(), 15 + "你".len());
+}
+
+#[gpui::test]
+fn cjk_long_line_does_not_narrow_content_width(cx: &mut TestAppContext) {
+    // 回归（用户实测）：纯中文长行曾因「字符数×等宽」低估字形宽 → 行宽小于真实
+    // 文本宽 → StyledText 行内折行 → 行号错位、点下一行文本重叠。
+    // 现在宽度按「宽度单位」计，内容宽必须 ≥ 真实最宽行的整形宽（即不会折行）。
+    let cjk = "一".repeat(200); // 200 全角字 = 400 格 = 600 字节
+    let (host, mut cx) = open(cx, &format!("{cjk}\n第二行"));
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (cw, _, _) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let content_w = cx.update(|_, cx| ed.read(cx).test_content_w_px());
+    // 真实整形宽（行内末字边界 x，byte_col=600 = 行尾）
+    let shaped = cx.update(|window, cx| {
+        ed.read(cx)
+            .test_char_boundary_x(window, 0, 200 * 3)
+    });
+    assert!(
+        content_w >= shaped - 1.0 && content_w >= 400.0 * cw - 1.0,
+        "内容宽应 ≥ 真实最宽行（content={content_w:.1} shaped宽={shaped:.1} 400×charw={:.1}）",
+        400.0 * cw
+    );
+}
+
+#[gpui::test]
+fn gutter_scroll_locked_to_text_scroll(cx: &mut TestAppContext) {
+    // 回归（用户实测）：滚轮滚动时行号「翻动/闪烁」——旧实现是每次 render 手工按
+    // `logical_scroll_top` 重建行号叠层，与 List 行绘制不同步。现在行号列是独立的
+    // 第二个 `List`（独立 ListState），由 `sync_gutter_scroll` 与文本区逐帧锁步。
+    let text = (1..=100).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let (host, mut cx) = open(cx, &text);
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (t0, g0) = (
+        cx.update(|_, cx| ed.read(cx).test_text_scroll_top()),
+        cx.update(|_, cx| ed.read(cx).test_gutter_scroll_top()),
+    );
+    assert_eq!(t0, g0, "初始行号应与文本对齐（{t0:?} vs {g0:?}）");
+    // 向下滚 6 格（每格 3 行 ≈ 3×行高）
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑器应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + 100.),
+    );
+    for _ in 0..6 {
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: pos,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            modifiers: Modifiers::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        settle(&mut cx);
+    }
+    let (t1, g1) = (
+        cx.update(|_, cx| ed.read(cx).test_text_scroll_top()),
+        cx.update(|_, cx| ed.read(cx).test_gutter_scroll_top()),
+    );
+    assert!(t1.0 > t0.0, "应已向下滚动（{t0:?} → {t1:?}）");
+    assert_eq!(t1, g1, "滚动后行号应与文本锁步一致（{t1:?} vs {g1:?}）");
+}
+
+#[gpui::test]
+fn click_near_line_start_keeps_horizontal_scroll(cx: &mut TestAppContext) {
+    // 回归（用户实测）：点击行首/前几个字符曾把内容强行拉去最左（内容左右晃动）。
+    // 根因：鼠标点击也走 `reveal_caret` 的横向 margin 规则（col<margin → hscroll=col）。
+    // 现在点击/拖动只做竖向 reveal，横向滚动只能由键盘/输入/滚轮驱动。
+    let long = "x".repeat(600);
+    let (host, mut cx) = open(cx, &format!("short\n{long}"));
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (_, lh, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    // 先横向滚到右侧
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑器应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + lh * 0.5),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(400.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(&mut cx);
+    let before = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(before > 0., "应先横向滚动（before={before}）");
+    // 点击短行行首（空白处/首个字符）——不得把内容拖回最左
+    let y = px(lh * 0.5);
+    let x = px(gutter + 2.0);
+    let mods = Modifiers::default();
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    settle(&mut cx);
+    let after = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(
+        after.abs() >= before - 0.1,
+        "点击不应重置横向滚动（before={before} → after={after}）"
+    );
+    // 空白行同样不应重置
+    let blank_y = px(lh * 2.5);
+    cx.simulate_mouse_move(point(x, blank_y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, blank_y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, blank_y), MouseButton::Left, mods);
+    settle(&mut cx);
+    let after2 = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(
+        after2.abs() >= before - 0.1,
+        "点击行首空白也不应重置横向滚动（{before} → {after2}）"
+    );
+}
+
+#[gpui::test]
+fn typing_long_cjk_keeps_caret_visible(cx: &mut TestAppContext) {
+    // 回归（用户实测）：内容超出窗口后，新输入不可见（光标没跟随）。
+    // 根因：横向 reveal 用「字符列」，中文每字占 2 格 → 少滚一半。改按「宽度单位」
+    // 列后，中文长行光标会滚回可视区。
+    let (host, mut cx) = open(cx, "");
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (cw, _, _gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let visible = cx.update(|_, cx| ed.read(cx).test_visible_chars());
+    // 打远超可视格的中文（400 字 = 800 格）
+    cx.simulate_keystrokes(&"你".repeat(400));
+    settle(&mut cx);
+    let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(hscroll > 0., "超窗输入应自动横向滚到光标处（hscroll={hscroll}）");
+    // 光标近似 x（单位列 800 格）× 格宽 − 已滚像素应落在可视区 [0, 可视格×格宽]
+    let caret_x_approx = 800.0 * cw;
+    let visible_px = (visible.saturating_sub(4)) as f32 * cw;
+    assert!(
+        caret_x_approx - hscroll <= visible_px + cw * 2.0
+            && caret_x_approx - hscroll + cw >= 0.0,
+        "光标应滚回可视区（caret_x={caret_x_approx:.0} hscroll={hscroll:.0} 可视≈{visible_px:.0}）"
+    );
+}
+
+#[gpui::test]
+fn hscroll_bar_max_tracks_content_growth(cx: &mut TestAppContext) {
+    // 回归（用户实测）：底部横向滚动条不随内容变化。量程应跟随 content_w_px 增长。
+    let (host, mut cx) = open(cx, "");
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let max0 = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(max0 == 0., "短内容量程应为 0（max0={max0}）");
+    // 输入超过可视宽度 → content_w_px 增长 → 量程应 > 0
+    cx.simulate_keystrokes(&"x".repeat(400));
+    settle(&mut cx);
+    let max1 = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(
+        max1 > 0.,
+        "内容变宽后横向滚动条量程应 > 0（max1={max1}）"
+    );
+    // 追加更长 → 量程继续增长
+    cx.simulate_keystrokes(&"x".repeat(400));
+    settle(&mut cx);
+    let max2 = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(
+        max2 > max1 + 1.0,
+        "更宽内容应让量程继续增长（{max1} → {max2}）"
     );
 }
 
