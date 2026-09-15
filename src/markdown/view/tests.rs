@@ -240,6 +240,137 @@ fn code_block_syntax_highlight_cache(cx: &mut TestAppContext) {
     });
 }
 
+/// 纯函数：自适应过扫余量随可见块数增长、并有 [24, MAX] 上下限、且单调不减。
+#[test]
+fn adaptive_overdraw_scales_with_visibility() {
+    use crate::config::limits::{WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_MAX};
+    assert_eq!(
+        adaptive_overdraw(1),
+        WINDOWED_OVERDRAW_BLOCKS,
+        "小视口保持基准余量"
+    );
+    assert_eq!(adaptive_overdraw(20), WINDOWED_OVERDRAW_BLOCKS);
+    let big = adaptive_overdraw(200);
+    assert!(big > WINDOWED_OVERDRAW_BLOCKS, "大视口余量应超过基准: {big}");
+    assert!(big <= WINDOWED_OVERDRAW_MAX);
+    assert_eq!(
+        adaptive_overdraw(10_000),
+        WINDOWED_OVERDRAW_MAX,
+        "超大视口应封顶"
+    );
+    let mut prev = 0usize;
+    for v in 1..600 {
+        let m = adaptive_overdraw(v);
+        assert!(m >= prev, "余量应随可见块数单调不减: v={v} m={m} prev={prev}");
+        prev = m;
+    }
+}
+
+/// `CodeHlCache` 纯单元测试：LRU 命中复用同一 `Rc`（不重解析）、容量满逐出最久未用、
+/// 清空后从零开始。
+#[test]
+fn code_hl_cache_lru_semantics() {
+    use std::rc::Rc;
+    let mut cache = super::CodeHlCache::new();
+    // 命中 → 同一 Rc（复用，不重跑解析）
+    let a1 = Rc::new(vec![vec![(0..3, "keyword")]]);
+    cache.insert(7, a1.clone());
+    let got = cache.get(7).expect("应命中");
+    assert!(Rc::ptr_eq(&a1, &got), "命中应返回同一 Rc");
+    // 更新已有键 → 仍同一键
+    let a2 = Rc::new(vec![]);
+    cache.insert(7, a2.clone());
+    assert!(Rc::ptr_eq(&a2, &cache.get(7).unwrap()), "更新后返回新 Rc");
+    // 容量：用小容量验证逐出（0 访问过 → 最久未用是 1）
+    let mut small = super::CodeHlCache {
+        cap: 3,
+        map: std::collections::HashMap::new(),
+        lru: std::collections::VecDeque::new(),
+    };
+    let mk = |x: usize| Rc::new(vec![vec![(x..x, "x")]]);
+    for k in 0..3 {
+        small.insert(k, mk(k));
+    }
+    small.get(0); // 0 变为最近使用
+    small.insert(3, mk(3)); // 逐出最久未用（=1）
+    assert!(small.get(0).is_some(), "访问过的 0 应存活");
+    assert!(small.get(1).is_none(), "最久未用 1 应被逐出");
+    assert!(small.get(3).is_some(), "新插入 3 应存在");
+    small.clear();
+    assert_eq!(small.len(), 0, "clear 后清空");
+}
+
+/// 回归 + LRU 复用：窗口模式的代码块高亮键必须是**全局块下标**（旧代码误用窗口内
+/// 局部下标，win_lo>0 后渲染永远查不到 → 滚动后代码块丢色）。把列表滚到中部让
+/// render 在那里建房：当前窗口每个代码块在 `code_hl` 里按全局键都能查到。
+#[gpui::test]
+fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    // 代码块散布整篇的大文档（> WINDOWED_MIN_BLOCKS → 窗口级懒解析）
+    let block = "```rust\nfn f() { let s = \"x\"; }\n```\n\n正文段 `code`\n\n";
+    let mut src = String::new();
+    for _ in 0..1200 {
+        src.push_str(block);
+    }
+    let index = std::rc::Rc::new(crate::markdown::scan_blocks(&src));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src)), index, cx)
+        });
+    });
+    cx.simulate_resize(size(px(600.), px(600.)));
+    settle(cx);
+
+    // 像素滚动（与滚轮/滚动条同款路径）连续下滚：render 每帧调度 ensure_window，
+    // 窗口应随可见范围移动（`scroll_to_reveal_item` 对远处未物化条目只到已布局窗口，
+    // 像素路径不受此限）。滚到中部让窗口建在 win_lo>0 处。
+    for _ in 0..100 {
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.list_state.scroll_by(px(500.));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    for _ in 0..3 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+
+    let win_lo = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        assert!(md.win_lo > 0, "窗口应已移离顶部 win_lo={}", md.win_lo);
+        let hl = md.code_hl.clone();
+        assert!(hl.len() > 0, "窗口内应有代码高亮");
+        let code_keys: Vec<usize> = (0..md.win_rows.len())
+            .filter(|&j| md.win_rows[j].kind == RowKind::Code)
+            .map(|j| md.win_lo + j)
+            .collect();
+        let found = code_keys.iter().filter(|k| hl.get(k).is_some()).count();
+        assert_eq!(
+            found,
+            code_keys.len(),
+            "当前窗口的代码块应全部有高亮（全局键），漏 {}/{}\nwin_lo={} code_keys={code_keys:?}",
+            code_keys.len() - found,
+            code_keys.len(),
+            md.win_lo,
+        );
+        md.win_lo
+    });
+    assert!(win_lo > 0);
+}
+
 /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。
 #[gpui::test]
 fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {
@@ -905,6 +1036,132 @@ fn bench_block_extras_clone_vs_rc_share() {
         rc_share.as_millis(),
         cloned.as_secs_f64() / rc_share.as_secs_f64().max(1e-9),
     );
+}
+
+/// 基准（--ignored）：窗口模式滚动时，代码块语法高亮 LRU 缓存 + 自适应过扫的效果。
+///
+/// 方法：合成「代码块散布整篇」的大文档（窗口级懒解析），在文档中**滚动 200 步**
+/// （每步前进 6 块、可见带 20 块），驱动 `ensure_window`：
+/// - **冷**（旧行为）：每次重建后清空 LRU → 每窗所有代码块都重跑 syntect；
+/// - **热**（新）：保留 LRU → 重叠代码块复用 `Rc`，只有新进窗的块才解析；
+/// - **过扫重建数**：固定余量 24 vs 大余量 100（模拟自适应高视口）各自的窗口重建次数。
+/// 打印、不断言；`--ignored` 运行。
+#[gpui::test]
+#[ignore]
+fn bench_windowed_scroll_highlight_cache(cx: &mut TestAppContext) {
+    use std::time::Instant;
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    let block = "```rust\nfn main() {\n    let s = \"str\";\n    // 注释行\n    let n = s.len();\n    println!(\"{n}\");\n}\n```\n\n正文段 `code` 与[链接](https://x)\n\n";
+    let mut src = String::new();
+    for _ in 0..1500 {
+        src.push_str(block);
+    }
+    let index = std::rc::Rc::new(crate::markdown::scan_blocks(&src));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src)), index, cx)
+        });
+    });
+    cx.simulate_resize(size(px(700.), px(700.)));
+    settle(cx);
+    let n_items = cx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+    assert!(n_items > crate::config::limits::WINDOWED_MIN_BLOCKS);
+
+    let steps = 200usize;
+    let step = 6usize;
+    let vis = 20usize;
+
+    // —— 冷（旧）：每窗全量重解析 ——
+    let t0 = Instant::now();
+    let cold_rebuilds = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _| {
+            md.overdraw_margin = 24;
+            let mut rebuilds = 0usize;
+            let mut last = md.win_lo;
+            for s in 0..steps {
+                let lo = s * step;
+                md.ensure_window(lo, lo + vis);
+                if md.win_lo != last {
+                    rebuilds += 1;
+                    last = md.win_lo;
+                }
+                md.code_hl_cache.clear(); // 旧行为：无缓存
+            }
+            rebuilds
+        })
+    });
+    let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // —— 热（新）：LRU 复用 ——
+    let t0 = Instant::now();
+    let warm_rebuilds = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _| {
+            md.overdraw_margin = 24;
+            let mut rebuilds = 0usize;
+            let mut last = md.win_lo;
+            for s in 0..steps {
+                let lo = s * step;
+                md.ensure_window(lo, lo + vis);
+                if md.win_lo != last {
+                    rebuilds += 1;
+                    last = md.win_lo;
+                }
+            }
+            rebuilds
+        })
+    });
+    let warm_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let cache_len = cx.update(|_, cx| host.read(cx).md.read(cx).code_hl_cache.len());
+
+    // —— 过扫：固定 24 vs 大余量 100（自适应高视口），重建次数对比 ——
+    let rebuilds_m24 = run_scroll_rebuild_count(cx, &host, 24, steps, step, vis);
+    let rebuilds_m100 = run_scroll_rebuild_count(cx, &host, 100, steps, step, vis);
+    let adaptive_for_200 = super::adaptive_overdraw(200);
+
+    println!(
+        "窗口滚动 {} 步（步进 {step} 块、可见 {vis} 块，{} 块文档）：高亮冷(旧,无缓存)={cold_ms:.1} ms（{cold_rebuilds} 次重建） vs 热(新,LRU)={warm_ms:.1} ms（{warm_rebuilds} 次重建） 提升 {:.2}x；LRU 驻留 {} 块；过扫重建数 固定24={rebuilds_m24} vs 余量100={rebuilds_m100}（自适应视口200块→{adaptive_for_200}）",
+        steps,
+        n_items,
+        cold_ms / warm_ms.max(1e-9),
+        cache_len,
+    );
+}
+
+/// 以给定过扫余量跑一遍向前滚动，返回实际窗口重建次数（`win_lo` 变化次数）。
+fn run_scroll_rebuild_count(
+    cx: &mut VisualTestContext,
+    host: &gpui::Entity<PreviewHost>,
+    margin: usize,
+    steps: usize,
+    step: usize,
+    vis: usize,
+) -> usize {
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _| {
+            md.overdraw_margin = margin;
+            let mut rebuilds = 0usize;
+            let mut last = md.win_lo;
+            for s in 0..steps {
+                let lo = s * step;
+                md.ensure_window(lo, lo + vis);
+                if md.win_lo != last {
+                    rebuilds += 1;
+                    last = md.win_lo;
+                }
+            }
+            rebuilds
+        })
+    })
 }
 
 /// 回归：超宽表格在换行模式（默认）下应自带横向滚动条，而不是被视口裁剪遮挡。

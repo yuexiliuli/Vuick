@@ -16,5 +16,14 @@ pub const EDITOR_WRAP_MAX_LINES: usize = 30_000;
 pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
 /// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。
 pub const WINDOWED_OVERDRAW_BLOCKS: usize = 24;
+/// **自适应过扫**：实际余量 = max(基准 [`WINDOWED_OVERDRAW_BLOCKS`], 可见块数 × 系数)。
+/// 高视口 / 快速滚动时缓冲随之变大，窗口重建次数变少（配合代码块高亮 LRU 缓存，
+/// 滚动手感更跟手）；系数取 0.5 → 余量约半屏。上限见 [`WINDOWED_OVERDRAW_MAX`]。
+pub const WINDOWED_OVERDRAW_FACTOR: f32 = 0.5;
+/// 自适应过扫的块数上限（防超高视口把窗口拉得过大、每次重建过慢）。
+pub const WINDOWED_OVERDRAW_MAX: usize = 120;
+/// 窗口模式代码块语法高亮的小型 LRU 容量（按块数）：滚动时复用相邻窗口已解析的
+/// 代码块（syntect 整块解析是滚动手感主成本），容量有限防滚遍整篇把结果全部驻留。
+pub const CODE_HL_LRU_CAP: usize = 96;
 /// 侧边栏搜索结果条数上限。
 pub const SEARCH_RESULT_CAP: usize = 200;

@@ -38,7 +38,10 @@ use gpui::{
 use gpui_component::input::Rope;
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
-use crate::config::limits::{WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS};
+use crate::config::limits::{
+    CODE_HL_LRU_CAP, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_FACTOR,
+    WINDOWED_OVERDRAW_MAX,
+};
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parser::{
@@ -50,6 +53,78 @@ use crate::syntax::{parse_code_lines, CodeLineRuns};
 use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
 use row::render_row;
 use style::StyleParams;
+
+/// 窗口模式代码块语法高亮的小型 LRU：键 = **全局块下标** → `Rc<CodeLineRuns>`。
+///
+/// `ensure_window` 每次窗口移动都会对新窗口内的代码块重跑 syntect（整块解析是滚动
+/// 手感的主成本，debug 下单块几十 µs~ms）。滚动时相邻窗口大半代码块重叠，加一个
+/// 容量受限的本地缓存，重叠块直接复用 `Rc`（O(1)），只有新进入窗口的块才重解析。
+/// 源一旦变化就 [`CodeHlCache::clear`]（缓存键依赖块号/内容，不支持跨源复用）。
+struct CodeHlCache {
+    map: std::collections::HashMap<usize, Rc<CodeLineRuns>>,
+    /// 访问序：队头最旧、队尾最新；命中/插入时移到队尾（真 LRU 近似）。
+    lru: std::collections::VecDeque<usize>,
+    cap: usize,
+}
+
+impl CodeHlCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            lru: std::collections::VecDeque::new(),
+            cap: CODE_HL_LRU_CAP,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.lru.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn get(&mut self, key: usize) -> Option<Rc<CodeLineRuns>> {
+        if let Some(v) = self.map.get(&key) {
+            // 命中 → 移到队尾（真 LRU：最近用过的块最后被淘汰）
+            if let Some(pos) = self.lru.iter().position(|&k| k == key) {
+                self.lru.remove(pos);
+                self.lru.push_back(key);
+            }
+            Some(v.clone())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: usize, value: Rc<CodeLineRuns>) {
+        if self.map.contains_key(&key) {
+            // 已存在：更新内容并视为最近使用（移到队尾）
+            self.map.insert(key, value);
+            if let Some(pos) = self.lru.iter().position(|&k| k == key) {
+                self.lru.remove(pos);
+                self.lru.push_back(key);
+            }
+            return;
+        }
+        if self.map.len() >= self.cap {
+            // 容量满：逐出最久未用的块
+            if let Some(old) = self.lru.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+        self.map.insert(key, value);
+        self.lru.push_back(key);
+    }
+}
+
+/// 自适应过扫余量（块数）：随可见块数增长，让高视口/快速滚动少重建窗口。
+fn adaptive_overdraw(visible_blocks: usize) -> usize {
+    let adaptive = (visible_blocks as f32 * WINDOWED_OVERDRAW_FACTOR) as usize;
+    adaptive.clamp(WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_MAX)
+}
 
 /// 预览的原始文本源。窗口级懒解析在滚动/重解析时要反复对**原文**切片，
 /// 因此预览侧保存的源可以是：
@@ -118,10 +193,16 @@ pub struct MarkdownPreview {
     /// 代码块的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。
     /// 装箱（[`Rc`]）：渲染时 O(1) 共享，避免每帧整张克隆 HashMap。
     code_scroll: std::rc::Rc<std::collections::HashMap<usize, ScrollHandle>>,
-    /// 代码块语法高亮缓存（行号 → 每行语义名 run；键与 `code_scroll` 一致）。
+    /// 代码块语法高亮缓存（**全局块下标** → 每行语义名 run；键与 `code_scroll` 一致）。
     /// 建在 set_source / 窗口重建时整块解析一次，渲染只做颜色解析——
     /// 结果与主题无关，换明/暗主题无需重算。装箱同上。
     code_hl: std::rc::Rc<std::collections::HashMap<usize, std::rc::Rc<CodeLineRuns>>>,
+    /// 窗口模式代码块高亮的小型 LRU（跨窗口移动复用已解析块，见 [`CodeHlCache`]）。
+    /// 换源 / 释放时清空（键依赖块号/内容，不可跨源复用）。
+    code_hl_cache: CodeHlCache,
+    /// 本次渲染算出的**自适应过扫余量**（块数）：render 依视口高度更新，
+    /// `ensure_window` 用它替代固定 [`WINDOWED_OVERDRAW_BLOCKS`]。
+    overdraw_margin: usize,
     /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。装箱同上。
     table_scroll: std::rc::Rc<std::collections::HashMap<usize, ScrollHandle>>,
     /// 搜索跳转高亮：命中的源码行（0 基）与小写查询词；None = 无高亮。
@@ -166,6 +247,8 @@ impl MarkdownPreview {
             memory_images: Default::default(),
             code_scroll: Default::default(),
             code_hl: Default::default(),
+            code_hl_cache: CodeHlCache::new(),
+            overdraw_margin: WINDOWED_OVERDRAW_BLOCKS,
             table_scroll: Default::default(),
             highlight_search: None,
             highlight_seq: 0,
@@ -365,8 +448,10 @@ impl MarkdownPreview {
     /// 物化、也不整份拷贝索引**。打字同步主路径传 [`PreviewSrc::Rope`]（编辑器正文
     /// 快照，O(1)），窗口模式按可见窗口从 rope 切片，驻留不随文档增长。
     pub fn set_source_with_index(&mut self, src: PreviewSrc, index: Rc<BlockIndex>, cx: &mut App) {
-        // 内容变了，旧的跳转高亮随之失效
+        // 内容变了，旧的跳转高亮随之失效；代码块高亮缓存键依赖块号/内容，一并作废
+        // （否则旧源的高亮会按新源的块号被误复用）。
         self.clear_highlight();
+        self.code_hl_cache.clear();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
         let prev_scroll = self.list_state.logical_scroll_top();
@@ -563,7 +648,7 @@ impl MarkdownPreview {
             return;
         }
         let _t = crate::prof::begin();
-        let margin = WINDOWED_OVERDRAW_BLOCKS.min(n / 2);
+        let margin = self.overdraw_margin.min(n / 2);
         let w_lo = want_lo.saturating_sub(margin);
         let w_hi = (want_hi + margin).min(n - 1);
         let mut rows = match &src {
@@ -577,25 +662,69 @@ impl MarkdownPreview {
         crate::prof::end("md_ensure_window", _t);
     }
 
-    /// 为当前窗口建立代码/表格块的稳定横向滚动句柄（键 = 全局块下标）。
+    /// 为当前窗口建立代码/表格块的稳定横向滚动句柄与代码块语法高亮（键 = **全局块下标**，
+    /// 与渲染按 `ix` 查表一致）。代码块高亮不再每次都整窗重跑 syntect：先查
+    /// [`CodeHlCache`]（滚动时相邻窗口大半块重叠 → 直接复用 `Rc`，O(1)），仅新进入
+    /// 窗口的块才解析并写入缓存。
     fn build_window_scroll_handles(&mut self) {
-        let cs = Rc::make_mut(&mut self.code_scroll);
-        let ts = Rc::make_mut(&mut self.table_scroll);
-        cs.clear();
-        ts.clear();
-        for (j, r) in self.win_rows.iter().enumerate() {
-            let ix = self.win_lo + j;
-            match r.kind {
-                RowKind::Code => {
-                    cs.insert(ix, ScrollHandle::new());
+        let win_rows = self.win_rows.clone(); // 借 win_rows 的同时要 &mut self（缓存）
+        let win_lo = self.win_lo;
+        let mut cs_old = std::mem::take(&mut self.code_scroll);
+        let mut ts_old = std::mem::take(&mut self.table_scroll);
+        {
+            let cs = Rc::make_mut(&mut cs_old);
+            let ts = Rc::make_mut(&mut ts_old);
+            cs.clear();
+            ts.clear();
+            for (j, _r) in win_rows.iter().enumerate() {
+                let ix = win_lo + j;
+                match _r.kind {
+                    RowKind::Code => {
+                        cs.insert(ix, ScrollHandle::new());
+                    }
+                    RowKind::Table => {
+                        ts.insert(ix, ScrollHandle::new());
+                    }
+                    _ => {}
                 }
-                RowKind::Table => {
-                    ts.insert(ix, ScrollHandle::new());
-                }
-                _ => {}
             }
         }
-        self.code_hl = Rc::new(build_code_highlights_for(&self.win_rows));
+        // 窗口内代码行 → 高亮（缓存优先）
+        let mut window_hl: std::collections::HashMap<usize, Rc<CodeLineRuns>> =
+            std::collections::HashMap::new();
+        for (j, r) in win_rows.iter().enumerate() {
+            let ix = win_lo + j;
+            if let Some(runs) = self.code_hl_for_row(ix, r) {
+                window_hl.insert(ix, runs);
+            }
+        }
+        self.code_scroll = cs_old;
+        self.table_scroll = ts_old;
+        self.code_hl = Rc::new(window_hl);
+    }
+
+    /// 取第 `ix` 个块的代码高亮：命中 LRU 直接复用；未命中则按语言整块解析并写入缓存。
+    fn code_hl_for_row(&mut self, ix: usize, r: &Row) -> Option<Rc<CodeLineRuns>> {
+        if r.kind != RowKind::Code {
+            return None;
+        }
+        if let Some(hit) = self.code_hl_cache.get(ix) {
+            return Some(hit);
+        }
+        let lang = r.code_language()?;
+        if lang.is_empty() {
+            return None;
+        }
+        let mut code = String::new();
+        for (i, l) in r.code_lines().iter().enumerate() {
+            if i > 0 {
+                code.push('\n');
+            }
+            code.push_str(l.as_ref());
+        }
+        let runs = Rc::new(parse_code_lines(lang, &code)?);
+        self.code_hl_cache.insert(ix, runs.clone());
+        Some(runs)
     }
 
     /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
@@ -634,6 +763,8 @@ impl MarkdownPreview {
         self.toc.clear();
         self.code_scroll = Default::default();
         self.code_hl = Default::default();
+        self.code_hl_cache.clear();
+        self.overdraw_margin = WINDOWED_OVERDRAW_BLOCKS;
         self.table_scroll = Default::default();
         self.highlight_search = None;
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
@@ -916,11 +1047,12 @@ impl Render for MarkdownPreview {
             let lo_vis = self.list_state.logical_scroll_top().item_ix;
             let view_h = self.list_state.viewport_bounds().size.height.as_f32();
             let hint = self.est_hint.max(20.0);
-            let vis_n = ((view_h / hint).ceil() as usize)
-                .saturating_add(WINDOWED_OVERDRAW_BLOCKS)
-                .max(16);
+            let vis_base = ((view_h / hint).ceil() as usize).max(1);
+            // 自适应过扫：余量随可见块数增长（高视口/快速滚动早日命中「窗口已覆盖」）。
+            self.overdraw_margin = adaptive_overdraw(vis_base);
+            let vis_n = vis_base.saturating_add(self.overdraw_margin);
             let last = self.item_count().saturating_sub(1);
-            let need_lo = lo_vis.saturating_sub(WINDOWED_OVERDRAW_BLOCKS);
+            let need_lo = lo_vis.saturating_sub(self.overdraw_margin);
             let need_hi = lo_vis.saturating_add(vis_n).min(last);
             let _t_ensure = crate::prof::begin();
             self.ensure_window(need_lo, need_hi);
