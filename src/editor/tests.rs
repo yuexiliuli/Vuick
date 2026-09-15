@@ -850,6 +850,65 @@ fn hscroll_bar_max_tracks_content_growth(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn vertical_range_stays_healthy_while_typing_in_widest_line(cx: &mut TestAppContext) {
+    // 回归（用户实测）：在最宽长行末尾持续输入时，纵向滚动条“突然变长又变短”。
+    // 根因：内容宽逐键变化 → gpui List 布局宽度变化时清空全部 size_hint → 纵向量程
+    // 坍缩；`ensure_uniform_hint` 的 120ms 冷却阻止持续打字时自愈（量程一直缩成极小）。
+    // 修复：内容宽按 64px 向上量化，只在每 ~8 字符才变化一次，冷却期间即可自愈。
+    let mut text = String::from("x".repeat(10000));
+    for i in 1..=500 {
+        text.push_str(&format!("\nline{i}"));
+    }
+    let (host, mut cx) = open(cx, &text);
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let healthy = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+    assert!(healthy > 6000., "初始纵向量程应健康（{healthy}）");
+    // 光标移到最宽行（第 1 行）末尾
+    ed.update(cx, |ed, _| ed.set_caret_to(10000));
+    // 持续输入 80 字符（跨多个 64px 桶）
+    for _ in 0..80 {
+        ed.update(cx, |ed, cx| ed.insert_text("x", cx));
+        settle(&mut cx);
+    }
+    // 补一拍冷却，确认自愈而非一直坍缩
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    settle(&mut cx);
+    let after = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+    assert!(after > 6000., "持续输入后纵向量程应保持健康（{after}）");
+}
+
+#[gpui::test]
+fn reveal_keeps_caret_visible_while_typing_in_long_line(cx: &mut TestAppContext) {
+    // 回归（用户实测）：长行末尾持续输入时「横向滚动条算错，最新内容看不见」。
+    // 根因：`reveal_caret` 把带 +8 估算余量的 visible_chars 当真实可视格数 → 光标被
+    // 滚到真实右缘之外 ~4 格（实测 screen=1911 > 视口1883）。修复：先减掉 +8 余量。
+    let mut text = String::from("x".repeat(10000));
+    for i in 1..=500 {
+        text.push_str(&format!("\nline{i}"));
+    }
+    let (host, mut cx) = open(cx, &text);
+    focus(&host, cx);
+    settle(&mut cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (cw, _, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let viewport_px = 1920.0 - gutter; // 测试窗 1920 宽
+    ed.update(cx, |ed, _| ed.set_caret_to(10000));
+    for _ in 0..60 {
+        ed.update(cx, |ed, cx| ed.insert_text("x", cx));
+        settle(&mut cx);
+        let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+        let caret_units = cx.update(|_, cx| host.read(cx).ed.read(cx).test_caret_units());
+        let screen = caret_units as f32 * cw - hscroll;
+        assert!(
+            (0.0..=viewport_px + 0.5).contains(&screen),
+            "光标应滚回可视区（screen={screen:.0} ≤ 视口{viewport_px:.0}）"
+        );
+    }
+}
+
+#[gpui::test]
 fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
     // 回归（2026-09-15 实机）：gpui 在宽度变化时清空全部 size_hint，
     // 未测条目高度按 0 计 → `max_offset_for_scrollbar()` 坍缩，滚动条量程失真。

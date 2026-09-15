@@ -34,7 +34,7 @@ use gpui::{
     UTF16Selection, Window, prelude::FluentBuilder as _,
 };
 use gpui_component::input::Rope;
-use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use gpui_component::input::{
     Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, Enter,
     IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
@@ -694,9 +694,13 @@ impl CodeEditor {
 
         // 横向 reveal 用「宽度单位」列（CJK=2 格）与可视格数一致，否则中文长行
         // 少滚一半、光标仍跑出可视区（用户实测：内容超窗后新输入看不见）。
+        // 注意 `visible_chars` 带有 +8 的估算余量（visible_chars_from_width），
+        // 若直接当可视格数用，`right_edge` 会偏大 8 格 → 光标停在真实右缘之外 4 格
+        // （用户实测：长行末尾输入后最新内容看不到）。先减掉余量得真实可视格。
         let col = self.buffer.unit_column(head);
         let margin = HSCROLL_MARGIN_COLS;
-        let right_edge = self.visible_chars.saturating_sub(margin).max(1);
+        let view_cells = self.visible_chars.saturating_sub(8).max(1);
+        let right_edge = view_cells.saturating_sub(margin).max(1);
         if col < self.hscroll_cols + margin
             || col >= self.hscroll_cols.saturating_add(right_edge)
         {
@@ -870,6 +874,11 @@ impl CodeEditor {
     pub(crate) fn test_gutter_scroll_top(&self) -> (usize, f32) {
         let s = self.gutter_list_state.logical_scroll_top();
         (s.item_ix, s.offset_in_item.as_f32())
+    }
+
+    /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
+    pub(crate) fn test_caret_units(&self) -> usize {
+        self.buffer.unit_column(self.selection.head().min(self.buffer.len()))
     }
 }
 
@@ -1596,10 +1605,18 @@ impl Render for CodeEditor {
         let harea_w = (avail_w - self.gutter_width_px.as_f32()).max(0.);
         let cw_max = self.char_width.as_f32().max(1.);
         // `max_line_units` 由 Buffer 行宽直方图（multiset）维护，编辑后**始终精确**
-        // O(1) 读——删除长内容后横向滚动条量程立即收敛，无需重扫。
-        let content_w_px = (self.buffer.max_line_units() as f32 * cw_max)
-            .max(harea_w)
-            .max(1.);
+        // O(1) 读。内容宽按 64px 向上取整量化：gpui List 在「布局宽度变化」时会清空
+        // 全部 size_hint → 纵向量程坍缩（vertical 滚动条突然变长），需 `ensure_uniform_hint`
+        // 的 120ms 冷却后 O(n) 自愈。若内容宽逐键变化（在最宽行末尾打字），量程会一直
+        // 坍缩（滚动条变长再变短）。量化后只在每 ~8 字符（64px）才变化一次，冷却期间
+        // 即可自愈，纵向量程保持稳定。量化只加不减（= 上界），不影响不折行。
+        const HSCROLL_QUANTUM_PX: f32 = 64.;
+        let raw_max_w = self.buffer.max_line_units() as f32 * cw_max;
+        let content_w_px = if raw_max_w <= harea_w {
+            harea_w
+        } else {
+            (raw_max_w / HSCROLL_QUANTUM_PX).ceil() * HSCROLL_QUANTUM_PX
+        };
         self.content_w_px = content_w_px;
         // 内容变短（量程缩小时）把 `h_handle` 夹回新量程（O(1)）——删除长内容后
         // 横向滚动位置不再停在旧更远处的空白处。ScrollableElement 布局也会夹，
@@ -1842,11 +1859,16 @@ impl Render for CodeEditor {
                     .debug_selector(|| "ce-vscrollbar-overlay".into())
                     .absolute()
                     .inset_0()
-                    .child(
-                        Scrollbar::vertical(&list_state)
+                    .child({
+                        let v = VerticalScrollHandle {
+                            state: list_state.clone(),
+                            content_width: content_w_px,
+                            content_height: self.row_count as f32 * self.line_height.as_f32(),
+                        };
+                        Scrollbar::vertical(&v)
                             .mode(ScrollbarMode::Always)
-                            .viewport_from_layout(),
-                    ),
+                            .viewport_from_layout()
+                    }),
             )
             .child(
                 div()
@@ -1927,6 +1949,43 @@ fn number_element(ix: usize, gv: &GutterView) -> gpui::Div {
         .text_size(gv.font_size)
         .font_family(gv.mono.clone())
         .child(number)
+}
+
+/// 纵向滚动条的「确定性量程」句柄：内容高 = 行数 × 行高（固定），而不用
+/// `ListState::max_offset_for_scrollbar()`——gpui 在布局宽度变化（长行末尾输入使
+/// 内容宽逐帧变化）时会清空全部 size_hint，使后者瞬时坍缩，滚动条 thumb 表现为
+/// “突然变长又变短”。拖动/位置/量程比例仍委托给真实 ListState，保证与内容滚动一致。
+#[derive(Clone)]
+struct VerticalScrollHandle {
+    state: ListState,
+    content_width: f32,
+    content_height: f32,
+}
+
+impl ScrollbarHandle for VerticalScrollHandle {
+    fn viewport_bounds(&self) -> Bounds<Pixels> {
+        self.state.viewport_bounds()
+    }
+
+    fn offset(&self) -> Point<Pixels> {
+        self.state.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.state.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<Pixels> {
+        size(px(self.content_width), px(self.content_height))
+    }
+
+    fn start_drag(&self) {
+        self.state.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.state.scrollbar_drag_ended();
+    }
 }
 
 /// IME `new_selected_range` 辅助：把「相对被标记文本（`text`）起点」的 UTF-16
