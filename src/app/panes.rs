@@ -35,10 +35,17 @@ impl EditorApp {
             cx.notify();
             let panel_bg = self.panel_bg();
             let muted = self.text_minor();
+            // 占位与正式编辑区使用**同一套 flex 布局参数**（flex_1/grow/min_w(0)/
+            // overflow_hidden），否则 `.size_full()`（w:100%）在分屏 flex 行里会占满
+            // 整行，把预览顶出窗口——用户看到"编辑区一打开就很宽、不与预览平分"。
             return div()
                 .id("editor-area")
                 .debug_selector(|| "editor-area".into())
-                .size_full()
+                .flex_1()
+                .flex_grow(grow)
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .justify_center()
