@@ -76,6 +76,32 @@ fn buffer_utf16_roundtrip() {
     assert_eq!(u2, 4);
 }
 
+#[test]
+fn buffer_max_line_chars_initial_and_grows_on_edit() {
+    // 横向内容宽度依据：全文最长行的**字符数**，须稳定 = 真实最长行。
+    let mut b = Buffer::new("short\n这是最长的一行here\nend");
+    // "这是最长的一行here" = 8 个汉字 + 4 个 ASCII = 12 字符? 数一下：
+    // 这(1)是(2)最(3)长(4)的(5)一(6)行(7)h(8)e(9)r(10)e(11) → 11
+    assert_eq!(b.max_line_chars(), 11);
+    // 纯 ASCII 文件
+    assert_eq!(Buffer::new("a\nbb\nccc").max_line_chars(), 3);
+    // 空文档
+    assert_eq!(Buffer::new("").max_line_chars(), 0);
+    // 编辑写入更长的行 → 应更新
+    b.apply_edit(b.len()..b.len(), "\n012345678901234567890"); // 21 字符新行
+    assert_eq!(b.max_line_chars(), 21);
+    // 编辑不产生更长行 → 保持不变
+    b.apply_edit(0..0, "x"); // 首行变 xshort，仍短
+    assert_eq!(b.max_line_chars(), 21);
+    // 删除最长行 → 只增不减语义下保持旧值（横向过度留白，不做 O(n) 重扫）
+    let prefix = format!("xshort\n这是最长的一行here\nend\n");
+    let e = b.apply_edit(prefix.len()..prefix.len() + "012345678901234567890".len(), "");
+    assert_eq!(b.max_line_chars(), 21, "删除最长行后不重扫，保持旧上界");
+    // 撤销应能找回该行（仍 21）
+    b.undo_edit(&e);
+    assert_eq!(b.max_line_chars(), 21);
+}
+
 // ---------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------
@@ -194,6 +220,46 @@ fn highlight_rust_keyword_comment_string() {
     // 同一窗口重查应命中缓存（保持稳定）
     let again = hl.highlight_window(&b, 0, 1, 16);
     assert_eq!(again.len(), 2);
+}
+
+#[test]
+fn highlight_window_aligned_to_base_for_batched_indexing() {
+    // 视图 `build_rows` 依赖 `highlight_window(lo, hi, lookback)` 返回**与请求
+    // 窗口对齐**的切片：第 0 项 = `lo` 行、总长 = hi − lo + 1，可用 `rows[r - lo]`
+    // 直接按行取。缓存命中（返回子切片）与未命中（重解析）两条路径都必须一致，
+    // 否则滚动窗口的高亮会错位/越界。
+    let src = (0..50)
+        .map(|i| format!("line{i} fun() // c{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let b = Buffer::new(&src);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let lo = 20usize;
+    let hi = 25usize;
+    let rows = hl.highlight_window(&b, lo, hi, 16).to_vec();
+    // `base()` 保留内部缓存起点（含回看），但返回切片对齐到 lo：
+    assert_eq!(hl.base(), lo - 16, "内部缓存起点仅用于命中判定，不直接暴露给调用方");
+    assert_eq!(
+        rows.len(),
+        hi - lo + 1,
+        "返回切片应与请求窗口同行数（第 0 项 = lo 行）"
+    );
+    for r in lo..=hi {
+        let runs = &rows[r - lo];
+        assert!(!runs.is_empty(), "行 {r} 应有高亮段（r−lo={}）", r - lo);
+    }
+    // 缓存命中（同窗口再查）应返回等长、内容一致的 lo 对齐切片
+    let rows2 = hl.highlight_window(&b, lo, hi, 16).to_vec();
+    assert_eq!(rows2.len(), hi - lo + 1);
+    assert_eq!(&rows2[0], &rows[0], "缓存命中，内容稳定");
+    // 相邻窗口（滚动 1 行）在缓存内也应得 lo 对齐切片
+    let rows3 = hl.highlight_window(&b, lo + 1, hi + 1, 16).to_vec();
+    assert_eq!(rows3.len(), hi + 1 - (lo + 1) + 1);
+    for r in (lo + 1)..=(hi + 1) {
+        let runs = &rows3[r - (lo + 1)];
+        assert!(!runs.is_empty(), "滚动窗口行 {r} 应有高亮段");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +410,58 @@ fn mouse_click_places_caret_on_second_row(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn mouse_click_lands_on_ascii_char_boundaries(cx: &mut TestAppContext) {
+    // 回归护栏：等宽 ASCII 命中测试在接入真实行布局后仍应精确落在字符边界。
+    let line = "abcdef";
+    let (host, mut cx) = open(cx, line);
+    focus(&host, cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (_, lh, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let y = px(lh * 0.5);
+    for (k, expected_head) in [(1usize, 1usize), (2, 2), (3, 3), (6, 6)] {
+        let x = cx.update(|window, cx| {
+            px(gutter + ed.read(cx).test_char_boundary_x(window, 0, expected_head))
+        });
+        let mods = Modifiers::default();
+        cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+        settle(&mut cx);
+        assert_eq!(
+            editor_selection(&host, &mut cx).head(),
+            expected_head,
+            "点击第 {k} 个 ASCII 字符右边界应落在第 {k} 字符后"
+        );
+    }
+}
+
+#[gpui::test]
+fn mouse_click_lands_on_cjk_char_boundaries(cx: &mut TestAppContext) {
+    // 回归（2026-09-15 真机反馈）：中文行点击中间输入，实际偏移到更后面。
+    // 根因：命中测试按「每字符 = 1×ASCII 字符宽」等宽近似，而 CJK 全角字实际
+    // 宽 2× → 点击第 k 个字被算成第 2k 个字。现在用真实行布局
+    // `closest_index_for_x` 做像素→字符边界映射，点击即落点。
+    let line = "中华文字"; // 4 个全角字：每字 3 字节
+    let (host, mut cx) = open(cx, line);
+    focus(&host, cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (_, lh, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let y = px(lh * 0.5);
+    for (k, expected_head) in [(1usize, 3usize), (2, 6), (3, 9), (4, 12)] {
+        let x = cx.update(|window, cx| {
+            px(gutter + ed.read(cx).test_char_boundary_x(window, 0, expected_head))
+        });
+        let mods = Modifiers::default();
+        cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+        cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+        settle(&mut cx);
+        let head = editor_selection(&host, &mut cx).head();
+        assert_eq!(head, expected_head, "点击第 {k} 个全角字右边界应落在第 {k} 字后");
+    }
+}
+
+#[gpui::test]
 fn caret_image_is_laid_out_when_focused(cx: &mut TestAppContext) {
     let (host, mut cx) = open(cx, "abc\nxyz");
     focus(&host, &mut cx);
@@ -365,25 +483,44 @@ fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
     // 回归（2026-09-15 实机）：gpui 在宽度变化时清空全部 size_hint，
     // 未测条目高度按 0 计 → `max_offset_for_scrollbar()` 坍缩，滚动条量程失真。
     // 编辑器应在坍缩后重挂统一高度提示，量程不被换宽清掉。
+    //
+    // 注：横向内容宽度跟随窗口宽（短文档 content=avail_w），短文档每次换宽都会
+    // 触发 List 重测；`ensure_uniform_hint` 的 120ms 风暴冷却（防拖分屏每帧 O(n)）
+    // 用真实墙钟计。因此两次 resize 之间要留出冷却窗口，模拟真实人类换窗节奏
+    // （0.12s 内的连发 resize 属于“拖拽风暴”，量程暂时性失真本就是冷却的取舍）。
     let text = (1..=300)
         .map(|i| format!("第{i}行"))
         .collect::<Vec<_>>()
         .join("\n");
     let (host, mut cx) = open(cx, &text);
-    cx.simulate_resize(size(px(300.), px(600.)));
-    settle(&mut cx);
-    let mut last_max = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+    // 横向内容宽度跟随窗口宽（短文档 content=avail_w），换宽会让 gpui List 在
+    // prepaint 里清空全部 size_hint → 量程坍缩；`ensure_uniform_hint` 重挂统一高度
+    // 会自愈，但其 120ms 风暴冷却（防拖分屏每帧 O(n)）用真实墙钟计，且换宽那一帧
+    // 的 heand 会被同帧 prepaint 再次抹掉。因此每轮换宽后以「等冷却→重渲染」循环
+    // 直到量程恢复，断言的是「换宽后量程最终自愈」而非瞬时（连发 resize 属拖拽风暴，
+    // 瞬时失真本就是冷却的取舍）。
+    fn reflow_and_assert(host: &Entity<Host>, cx: &mut VisualTestContext, w: f32) -> f32 {
+        cx.simulate_resize(size(px(w), px(600.)));
+        let mut m = 0.0;
+        for _ in 0..8 {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            settle(cx);
+            m = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+            if m > 1000. {
+                break;
+            }
+        }
+        assert!(m > 1000., "换宽后量程应在冷却后自愈（m={m:.1} w={w}）");
+        m
+    }
+    let mut last_max = reflow_and_assert(&host, &mut cx, 300.);
     assert!(
         last_max > 1000.,
         "首次渲染量程应接近 300 行（last_max={last_max:.1}）"
     );
     // 再换两次宽 → 应自愈，量程保持。
     for w in [440., 520.] {
-        cx.simulate_resize(size(px(w), px(600.)));
-        settle(&mut cx);
-        let m = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
-        assert!(m > 1000., "换宽后量程不应坍缩（m={m:.1} w={w}）");
-        last_max = m;
+        last_max = reflow_and_assert(&host, &mut cx, w);
     }
     let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1);
     assert!(

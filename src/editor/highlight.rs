@@ -173,8 +173,11 @@ impl Highlighter {
         }
     }
 
-    /// 请求可见行窗口 `[lo, hi]`（含两端）的高亮。返回与窗口对齐的每行样式。
+    /// 请求可见行窗口 `[lo, hi]`（含两端）的高亮。返回**与请求窗口对齐**的
+    /// 切片：第 0 项 = `lo` 行、长度 = `hi - lo + 1`（缓存命中返回子切片，未命中
+    /// 从 `lookback` 回看起点重解析后也裁剪成同样对齐——两条路径必须一致）。
     /// 命中缓存直接返回；否则以 `lookback` 行回看起点重新解析窗口。
+    /// 内部缓存起点（含回看）见 [`Self::base`]，调用方请用 `rows[r - lo]` 按行取。
     pub fn highlight_window(
         &mut self,
         buffer: &Buffer,
@@ -213,7 +216,9 @@ impl Highlighter {
             self.lines = lines;
             self.base = start;
             self.key = Some((version, lo, hi));
-            return &self.lines;
+            // 统一返回「与请求窗口对齐」的切片（第 0 项 = lo 行），与缓存命中
+            // 路径一致 —— 否则调用方（视图批量取行）在命中/未命中间错位。
+            return &self.lines[lo - start..lo - start + (hi - lo) + 1];
         };
 
         let dark = self.dark;
@@ -227,10 +232,10 @@ impl Highlighter {
         self.lines = lines;
         self.base = start;
         self.key = Some((version, lo, hi));
-        &self.lines
+        &self.lines[lo - start..lo - start + (hi - lo) + 1]
     }
 
-    /// 解析起点行（回看前缀起点；调用方用 `row - base` 访问 `lines`）。
+    /// 内部缓存起点行（含回看前缀；仅用于命中判定，不直接用于对返回切片取行）。
     pub fn base(&self) -> usize {
         self.base
     }

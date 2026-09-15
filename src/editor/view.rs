@@ -503,7 +503,13 @@ impl CodeEditor {
     // 行数据
     // -----------------------------------------------------------------
 
-    fn row_data(&mut self, row: usize, show_caret: bool) -> RowData {
+    fn row_data(
+        &self,
+        window: &mut Window,
+        row: usize,
+        show_caret: bool,
+        hl_runs: &[(Range<usize>, Hsla)],
+    ) -> RowData {
         if self.row_count == 0 || self.buffer.line_count() == 0 || row >= self.row_count {
             return RowData::empty();
         }
@@ -526,26 +532,20 @@ impl CodeEditor {
             };
         }
 
-        // 语法着色：高亮缓存整行范围 in buffer 坐标，平移到行内字节坐标。
+        // 语法着色：`hl_runs` 是已按整窗批量解析的窗口内本行范围，且是
+        // **行内字节坐标**（syntect `parse_line` 相对本行文本），直接转样式段。
         let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-        let hl_lines = self
-            .highlighter
-            .highlight_window(&self.buffer, row, row, HL_LOOKBACK_LINES);
-        if let Some(runs) = hl_lines.first() {
-            for (r, color) in runs {
-                if r.end > line_start && r.start < line_end {
-                    let s = r.start.max(line_start) - line_start;
-                    let e = r.end.min(line_end) - line_start;
-                    if e > s {
-                        highlights.push((
-                            s..e,
-                            HighlightStyle {
-                                color: Some(*color),
-                                ..Default::default()
-                            },
-                        ));
-                    }
-                }
+        for (r, color) in hl_runs {
+            let s = r.start.min(text.len());
+            let e = r.end.min(text.len());
+            if e > s {
+                highlights.push((
+                    s..e,
+                    HighlightStyle {
+                        color: Some(*color),
+                        ..Default::default()
+                    },
+                ));
             }
         }
 
@@ -565,11 +565,18 @@ impl CodeEditor {
             }
         }
 
-        // 光标（横向滚动交给外层容器，行内文本从 x=0 全宽绘制
-        // —— 绝不再按 hscroll 裁文本，避免「文本窗口裁切 + 容器滚动」双重偏移）
-        let caret = if show_caret && self.selection.head() >= line_start && self.selection.head() <= line_end {
-            let col = self.buffer.char_column(self.selection.head());
-            Some(col as f32 * self.char_width.as_f32())
+        // 光标：真实字形宽度（CJK 双宽不再按等宽列近似）→ 光标停在真实字符边界上
+        // （横向滚动交给外层容器，行内文本从 x=0 全宽绘制，这里只算文本本地 x）。
+        let caret = if show_caret
+            && self.selection.head() >= line_start
+            && self.selection.head() <= line_end
+        {
+            let byte_col = self.selection.head() - line_start;
+            let x = self
+                .row_layout(window, row)
+                .map(|layout| layout.x_for_index(byte_col).as_f32())
+                .unwrap_or_else(|| byte_col as f32 * self.char_width.as_f32().max(1.));
+            Some(x)
         } else {
             None
         };
@@ -582,7 +589,18 @@ impl CodeEditor {
     }
 
     /// 行数据：渲染窗口内（`[lo, hi]`）每行。
-    fn build_rows(&mut self, lo: usize, hi: usize, show_caret: bool) -> Vec<RowData> {        if self.row_count == 0 {
+    ///
+    /// 高亮必须整窗一次批量解析再按行进 `runs`：逐行调用 `highlight_window(row,row)`
+    /// 会让缓存每行都失效并各自重解析 16 行回看上下文 → 每帧 O(窗口×回看) 重复解析，
+    /// 是滚轮滚动"卡顿/不顺滑"的主因之一（syntect 上下文解析不便宜）。
+    fn build_rows(
+        &mut self,
+        window: &mut Window,
+        lo: usize,
+        hi: usize,
+        show_caret: bool,
+    ) -> Vec<RowData> {
+        if self.row_count == 0 {
             return Vec::new();
         }
         let last = self.row_count.saturating_sub(1);
@@ -591,7 +609,19 @@ impl CodeEditor {
         if hi < lo {
             return Vec::new();
         }
-        (lo..=hi).map(|r| self.row_data(r, show_caret)).collect()
+        // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
+        // 借用，否则后续 `self.row_data` 与 `highlight_window` 的借用冲突）。
+        // 返回切片约定：第 0 项 = `lo` 行（`highlight_window` 已统一对齐到请求窗口）。
+        let hl_lines = self
+            .highlighter
+            .highlight_window(&self.buffer, lo, hi, HL_LOOKBACK_LINES)
+            .to_vec();
+        let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
+        for r in lo..=hi {
+            let runs: &[(Range<usize>, Hsla)] = &hl_lines[r - lo];
+            out.push(self.row_data(window, r, show_caret, runs));
+        }
+        out
     }
 
     // -----------------------------------------------------------------
@@ -660,7 +690,36 @@ impl CodeEditor {
     // 坐标换算（元素本地坐标）
     // -----------------------------------------------------------------
 
-    fn offset_at_point(&self, position: Point<Pixels>) -> usize {
+    /// 当前横向滚动像素（内容被推向左的量；`h_handle` offset 为负）。
+    fn hscroll_px(&self) -> f32 {
+        (-self.h_handle.offset().x.as_f32()).max(0.)
+    }
+
+    /// 整行文本整形为布局（与 `StyledText` 渲染同一个 font/size）。
+    ///
+    /// 供命中测试 / 光标 x / IME 坐标使用：CJK 全角字按真实字形宽度定位，
+    /// 不再用 `col × char_width` 等宽近似（否则中文行点击/光标整体后移）。
+    /// `TextSystem` 内置行布局缓存，同一行同帧重复整形是缓存命中，开销≈0。
+    fn row_layout(&self, window: &mut Window, row: usize) -> Option<gpui::ShapedLine> {
+        if !self.metrics_ready || self.font_size.as_f32() <= 0. {
+            return None;
+        }
+        let text = self.buffer.line_text(row);
+        if text.is_empty() {
+            return None;
+        }
+        let run = gpui::TextRun {
+            len: text.len(),
+            font: gpui::font(self.mono.clone()),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        Some(window.text_system().shape_line(text, self.font_size, &[run], None))
+    }
+
+    fn offset_at_point(&self, position: Point<Pixels>, window: &mut Window) -> usize {
         if self.row_count == 0 || self.line_height.as_f32() <= 0. {
             return 0;
         }
@@ -671,15 +730,21 @@ impl CodeEditor {
         let row = (content_y / lh).floor().max(0.) as usize;
         let row = row.min(self.row_count.saturating_sub(1));
 
-        let x_text = position.x.as_f32() - self.gutter_width_px.as_f32();
-        let col_rel = if x_text > 0. {
-            (x_text / self.char_width.as_f32().max(1.)).floor() as usize
-        } else {
-            0
-        };
-        let col = col_rel.saturating_add(self.hscroll_cols);
+        // 命中的文本本地 x（补偿横向滚动像素）：x_text = local.x − gutter + 已滚像素。
+        let line_start = self.buffer.line_start(row);
+        let x_text = position.x.as_f32() - self.gutter_width_px.as_f32() + self.hscroll_px();
+        if x_text <= 0. {
+            return line_start;
+        }
+        if let Some(layout) = self.row_layout(window, row) {
+            // closest_index_for_x 返回**行内字节索引**，且总落在字符边界上
+            // （绝不把光标拆进 CJK/emoji 中间）。
+            return self.buffer.clip(line_start + layout.closest_index_for_x(px(x_text)));
+        }
+        // 兜底（度量未就绪等）：等宽近似。
+        let col_rel = (x_text / self.char_width.as_f32().max(1.)).floor() as usize;
         let line_chars = self.buffer.line_text(row).chars().count();
-        let col = col.min(line_chars);
+        let col = col_rel.min(line_chars);
         self.buffer.offset_for_char_column(row, col)
     }
 }
@@ -697,6 +762,20 @@ impl CodeEditor {
             self.line_height.as_f32(),
             self.gutter_width_px.as_f32(),
         )
+    }
+
+    /// 测试用：`row` 行内 `byte_col`（行内字节列）字符边界在文本本地的 x（px）。
+    /// 与渲染/命中测试共用 `row_layout`，可用来构造"点到真实字符边界"的鼠标事件。
+    pub(crate) fn test_char_boundary_x(
+        &self,
+        window: &mut Window,
+        row: usize,
+        byte_col: usize,
+    ) -> f32 {
+        let byte_col = byte_col.min(self.buffer.line_len(row));
+        self.row_layout(window, row)
+            .map(|layout| layout.x_for_index(byte_col).as_f32())
+            .unwrap_or(0.)
     }
 }
 
@@ -764,7 +843,7 @@ impl CodeEditor {
         self.focus_handle.focus(window, cx);
         self.undo.set_cooperative(false);
         let local = event.position - self.element_bounds.origin;
-        let offset = self.offset_at_point(local);
+        let offset = self.offset_at_point(local, window);
         if event.modifiers.shift {
             self.selection.set_head(offset);
             self.selection.remember_column(self.buffer.char_column(offset));
@@ -778,12 +857,12 @@ impl CodeEditor {
         cx.notify();
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.dragging {
             return;
         }
         let local = event.position - self.element_bounds.origin;
-        let offset = self.offset_at_point(local);
+        let offset = self.offset_at_point(local, window);
         self.selection.set_head(offset);
         self.selection.remember_column(self.buffer.char_column(offset));
         self.kick_caret();
@@ -1255,17 +1334,21 @@ impl EntityInputHandler for CodeEditor {
         &mut self,
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let off = self.buffer.utf16_to_byte(range_utf16.start.min(self.buffer.len_utf16()));
         let row = self.buffer.line_of_offset(off);
-        let col = self.buffer.char_column(off);
+        let byte_col = off - self.buffer.line_start(row);
         let lh = self.line_height.as_f32().max(1.);
         let scroll = self.list_state.logical_scroll_top();
         let y = (row as f32 - scroll.item_ix as f32) * lh - scroll.offset_in_item.as_f32();
-        let x = self.gutter_width_px.as_f32()
-            + (col as f32 - self.hscroll_cols as f32) * self.char_width.as_f32().max(1.);
+        // 字形真实宽度（IME 组合窗口/预选高亮定位不能再用等宽列近似，否则中文错位）。
+        let x_text = self
+            .row_layout(window, row)
+            .map(|layout| layout.x_for_index(byte_col).as_f32())
+            .unwrap_or_else(|| byte_col as f32 * self.char_width.as_f32().max(1.));
+        let x = self.gutter_width_px.as_f32() + x_text - self.hscroll_px();
         Some(Bounds::new(
             point(
                 element_bounds.origin.x + px(x),
@@ -1278,11 +1361,11 @@ impl EntityInputHandler for CodeEditor {
     fn character_index_for_point(
         &mut self,
         point: Point<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let local = point - self.element_bounds.origin;
-        Some(self.buffer.byte_to_utf16(self.offset_at_point(local)))
+        Some(self.buffer.byte_to_utf16(self.offset_at_point(local, window)))
     }
 
     fn set_selected_text_range(
@@ -1376,15 +1459,14 @@ impl Render for CodeEditor {
         let last = self.row_count.saturating_sub(1);
         let hi = vis_top.saturating_add(nrows * 2).min(last);
         let show_caret = self.caret_shown_now();
-        let rows = self.build_rows(lo, hi, show_caret);
+        let rows = self.build_rows(window, lo, hi, show_caret);
 
-        // 横向内容宽度（单调上修：只增不减，避免 List 宽度抖动 → 清量程）
-        let mut max_cols = self.content_w_px / self.char_width.as_f32().max(1.);
-        for rd in &rows {
-            let cols = rd.text.chars().count() as f32;
-            max_cols = max_cols.max(cols);
-        }
-        let content_w_px = (max_cols * self.char_width.as_f32().max(1.))
+        // 横向内容宽度 = 整篇最长行的字符数（Buffer O(1) 维护）。
+        // 此前用「可见窗口的行 max + 单调上修」：拖垂直滚动条经过首次出现的更长行时
+        // 内容宽会突然跳大（编辑区宽度突然变大）。改成文档全局最长行就永远稳定，
+        // 只在编辑产生更长行/窗口宽度/字号变化时才变化。
+        let content_w_px = (self.buffer.max_line_chars() as f32
+            * self.char_width.as_f32().max(1.))
             .max(avail_w)
             .max(1.);
         self.content_w_px = content_w_px;
