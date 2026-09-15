@@ -485,13 +485,36 @@ impl MarkdownPreview {
                     self.list_state.remeasure_items(r_lo..r_hi);
                 }
             } else {
-                // 块数变化：重建列表 + 恢复到更新前的滚动位置（块号越界自动夹紧到文末），
-                // 并把「统一高度提示」标记为待应用（一次性 O(n)，不再每帧重复）。
-                self.list_state =
-                    ListState::new(new_n, ListAlignment::Top, px(ROW_OVERDRAW_PX));
-                self.list_state.scroll_to(prev_scroll);
-                self.hint_applied = None;
-                self.hint_recovered = false;
+                let old_n = self.list_state.item_count();
+                if old_n == 0 {
+                    // 首次装源 / release 后重建：没有可保留的高度提示与滚动，直接建新
+                    // ListState（同时丢弃构造函数里的 `measure_all()`，避免首帧把 N 行
+                    // 全部测量/排版，破坏窗口级懒解析）。
+                    self.list_state =
+                        ListState::new(new_n, ListAlignment::Top, px(ROW_OVERDRAW_PX));
+                    self.list_state.scroll_to(prev_scroll);
+                    self.hint_applied = None;
+                    self.hint_recovered = false;
+                } else {
+                    // 块数变化：**不重建 ListState**——用增量 `splice` 把新旧块数对齐
+                    // （O(log n)，SumTree 前后缀 O(1) 共享，旧块的统一高度提示原样保留）。
+                    // 绝不能每次换块都重建 64 万块的统一高度 SumTree（debug 300ms+/次，
+                    // 正是大文档逐键卡顿的主因）：少量新增/删除的块位于编辑点（可见窗口
+                    // 内），下一帧 `ensure_window` 重新物化即真实测量收敛；滚动条量程只对
+                    // 未测的新块差几行，宽度/主题变化时仍会走一次性 O(n) 校准。
+                    if new_n > old_n {
+                        self.list_state.splice(old_n..old_n, new_n - old_n);
+                    } else {
+                        self.list_state.splice(new_n..old_n, 0);
+                    }
+                    // splice 已维护逻辑滚动位置（收缩时自动夹紧），无需重建 scroll_to。
+                    if let Some((_, hint)) = self.hint_applied {
+                        // 保留统一高度提示记忆：提示值不变，只把块数对齐新值。
+                        self.hint_applied = Some((new_n, hint));
+                    } else {
+                        self.hint_recovered = false;
+                    }
+                }
             }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
@@ -504,8 +527,20 @@ impl MarkdownPreview {
                     index_b / 1024,
                 );
             }
-            self.remeasure_dimensions(cx);
-            self.invalidate_height_hint();
+            // 不调用 `invalidate_height_hint()`：行高估算只在**视口宽度变化**时重算
+            // 就够了（`update_height_hint` 在 render 里比对本帧宽度）。若每次同步都作废
+            // 估算，会迫使 render 重算 → 与 `hint_applied` 记忆（f32 逐位比较）失配 →
+            // 每次换块都 O(n) 重建 64 万块统一高度 SumTree（debug 300ms+/次，正是大文档
+            // 逐键卡顿的主因）。宽度 / 换行 / 字号变化仍由对应 setter 主动作废。
+            //
+            // `content_w` 同理必须**跨编辑稳定**（单调不减）：它决定 List 的布局宽，
+            // gpui 在「宽度变化时」会清空全部未测量项的 size_hint（`list.rs` prepaint），
+            // 清空后统一高度提示失效、下次渲染又要 O(n) 重建。因此文本同步**不**重算
+            // content_w（首次由 open 算一次），渲染窗口里出现更宽的行时由
+            // `ensure_window` 单调**上修**，绝不因删短某行而回拨。
+            if self.content_w <= 0.0 {
+                self.remeasure_dimensions(cx);
+            }
             return;
         }
 
@@ -555,8 +590,8 @@ impl MarkdownPreview {
             );
         }
         self.remeasure_dimensions(cx);
-        // 行高估算依赖视口宽度，换源后强制按新宽度重算（render 里执行）。
-        self.invalidate_height_hint();
+        // 行高估算只在视口宽度变化时由 render 里的 `update_height_hint` 重算；这里
+        // 不主动作废，避免每次同步都迫使 O(n) 重建统一高度 SumTree（大文档逐键卡顿源）。
         if self.rows.len() != self.list_state.item_count() {
             // 行数变化 → 重建 ListState。注意**不能**用 `measure_all()`：它会首帧
             // 就把整篇所有行全部渲染并排版（十万行文档一次吃进 1GB+ 的字体测量缓存），
@@ -948,6 +983,25 @@ impl MarkdownPreview {
         self.hint_recovered = false;
         true
     }
+
+    /// 单调**上修** `content_w` 到能容纳当前窗口里最宽的行（只增不减）。
+    /// 文本编辑时 `content_w` 不重算全局最大行（避免 List 宽度抖动 → gpui 清空全部
+    /// size_hint → O(n) 重建统一高度提示，正是大文档逐键卡顿源）；这里按已物化窗口
+    /// 的行宽上限补齐横向溢出即可，更宽的行滚入窗口时再上修。真正的回拨只发生在
+    /// 换行 / 字号 / 换源重建（`remeasure_dimensions`）。
+    fn bump_content_width_to_cover(&mut self, p: &StyleParams) {
+        if self.wrap || self.win_rows.is_empty() {
+            return;
+        }
+        let mut w = self.content_w.max(0.0);
+        for r in self.win_rows.iter() {
+            let rw = est_row_width(r, p) + WIDTH_BUFFER_PX;
+            if rw > w {
+                w = rw;
+            }
+        }
+        self.content_w = w;
+    }
 }
 
 /// 为给定行集重建代码块语法高亮缓存：按围栏语言**整块**解析一次，返回
@@ -1080,6 +1134,9 @@ impl Render for MarkdownPreview {
             let need_hi = lo_vis.saturating_add(vis_n).min(last);
             let _t_ensure = crate::prof::begin();
             self.ensure_window(need_lo, need_hi);
+            // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
+            // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。
+            self.bump_content_width_to_cover(&p);
             crate::prof::end("md_ensure_call", _t_ensure);
         }
         let list_state = self.list_state.clone();

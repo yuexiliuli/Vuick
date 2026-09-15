@@ -1436,50 +1436,10 @@
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Markdown 预览同步带 200ms 去抖：编辑后不立即整篇重解析，
-    /// 停顿足够时间后才落盘到 md_view。
+    /// Markdown 预览同步（无去抖，合成一轮立即同步）：编辑触发后同步完成并复位挂起，
+    /// 内容**真实落盘**到预览（后台 `scan_blocks` 路径，UI 线程只做快照 + 装配）。
     #[gpui::test]
-    async fn preview_sync_is_debounced(cx: &mut TestAppContext) {
-        init_test(cx);
-        let (app, cx) = add_app(cx);
-        cx.simulate_resize(gpui::size(px(980.), px(720.)));
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        let p = std::env::temp_dir().join("gpui-debounce.md");
-        std::fs::write(&p, "# 初始\n").unwrap();
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
-        });
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        // 聚焦编辑区并做一次真实编辑（粘贴触发 InputEvent::Change）
-        cx.update(|window, cx| {
-            let focus = app.read(cx).editor_focus_handle(cx);
-            window.focus(&focus, cx);
-        });
-        cx.write_to_clipboard(gpui::ClipboardItem::new_string("已编辑".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        let pending = cx.update(|_w, cx| app.read(cx).preview_pending);
-        assert!(pending, "编辑后应立即进入去抖挂起状态（不逐键同步）");
-        // 推进 250ms，去抖计时到点后应执行一次同步并复位
-        cx.executor().advance_clock(std::time::Duration::from_millis(250));
-        for _ in 0..10 {
-            cx.run_until_parked();
-        }
-        let pending_after = cx.update(|_w, cx| app.read(cx).preview_pending);
-        assert!(!pending_after, "去抖时间到点后应复位挂起状态");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// #4 回归：编辑去抖到点后的预览同步走「后台 `scan_blocks`」路径，且内容**真实更新**
-    /// （新路径在后台线程扫描块索引，UI 线程只做快照 + 装配——不能只动机制不落内容）。
-    #[gpui::test]
-    async fn preview_syncs_content_after_debounce(cx: &mut TestAppContext) {
+    async fn preview_syncs_content_after_edit(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -1501,30 +1461,24 @@
         let t0 = cx.update(|_w, cx| preview.read(cx).rendered_text());
         assert!(t0.contains("初始标题"), "打开时预览应含初始标题，实际 {t0:?}");
 
-        // 真实编辑：粘贴触发 InputEvent::Change
+        // 真实编辑：粘贴触发 InputEvent::Change → 立即进入合成一轮同步
         cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
         });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("新增段落".to_string()));
         cx.dispatch_action(gpui_component::input::Paste);
-        for _ in 0..5 {
-            cx.run_until_parked();
-        }
-        assert!(
-            cx.update(|_w, cx| app.read(cx).preview_pending),
-            "编辑后应进入去抖挂起"
-        );
-        // 推进 250ms 让去抖计时到点，再驱动后台 scan_blocks 完成并装配
-        cx.executor().advance_clock(std::time::Duration::from_millis(250));
+        // 同步在后台扫描、尽可能多地驱动到完成
         for _ in 0..30 {
             cx.run_until_parked();
         }
         let t1 = cx.update(|_w, cx| preview.read(cx).rendered_text());
         assert!(
             t1.contains("新增段落"),
-            "去抖后预览应同步到新内容（后台扫描路径），实际 {t1:?}"
+            "编辑后预览应同步到新内容（后台扫描路径），实际 {t1:?}"
         );
+        let pending = cx.update(|_w, cx| app.read(cx).preview_pending);
+        assert!(!pending, "同步完成后应复位挂起状态");
         let _ = std::fs::remove_file(&p);
     }
 
