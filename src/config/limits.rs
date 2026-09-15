@@ -1,14 +1,18 @@
 //! 性能 / 解析 / 缓存相关的阈值上限常量。
 
 /// 超过该体积的文档不做语法高亮（工作集过大，无法支撑换代场景；正常文档远小于此）。
+#[allow(dead_code)] // 语法引擎（暂未接线）使用
 pub const MAX_TEXT_BYTES: usize = 24 * 1024 * 1024;
 /// 可见窗口**向前**多解析的行数（语法状态前缀），使跨越行边界的注释/字符串/
 /// 代码块在大多数情况下也能正确配色。
+#[allow(dead_code)] // 语法引擎（暂未接线）使用
 pub const LOOKBACK_LINES: usize = 48;
 /// 计算时向可见窗口上下各扩展的行数：滚动在小余量内命中缓存不重算。
 /// 调小 → 每次重算更快、颜色更早落屏。
+#[allow(dead_code)] // 语法引擎（暂未接线）使用
 pub const WINDOW_PAD: usize = 16;
 /// 单次**同步**解析的行数上限：超过则本次不着色（避免超大视口卡帧）。
+#[allow(dead_code)] // 语法引擎（暂未接线）使用
 pub const SYNC_MAX_PARSE_LINES: usize = 2000;
 /// 编辑器自动软换行阈值：超过该行数的文档不换行（保持滚动/打开流畅）。
 pub const EDITOR_WRAP_MAX_LINES: usize = 30_000;

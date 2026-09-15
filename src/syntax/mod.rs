@@ -17,6 +17,8 @@
 //! - [`highlighter_factory`]：创建编辑器（`app::tabs::make_tab`）时安装
 //! - [`install_github_theme`]：启动（`main.rs`）与切换明/暗主题（`app::toggle_theme`）时安装
 
+#![allow(dead_code)] // gpui-component 编辑高亮引擎已被自研 editor 替代，保留未接线部分（markdown 预览仍用其配色/块解析）
+
 mod markdown;
 
 use std::{

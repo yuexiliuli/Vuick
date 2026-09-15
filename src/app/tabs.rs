@@ -1,47 +1,28 @@
 //! tabs.
 
 use super::*;
-use gpui_component::input::RopeExt;
 use crate::config::timing::TAB_HSCROLL_HIDE_MS;
+use crate::editor::EditorEvent;
 use crate::markdown::{PreviewSrc, scan_blocks_incremental_rope, scan_blocks_rope};
 use crate::scrollbar::horizontal_scrollbar;
 
 impl EditorApp {
-    pub(super) fn make_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
-        let editor = cx.new(|cx| {
-            EditorState::new(window, cx)
-                .tab_size(TabSize {
-                    tab_size: 4,
-                    hard_tabs: false,
-                })
-                .soft_wrap(self.wrap_enabled)
-        });
-        // 安装语法高亮工厂：gpui-component 在 tree-sitter 特性关闭时工厂为空操作，
-        // 这里提供 syntect 解析 + GitHub 配色（配色在 main::install_github_theme 设置）。
-        // 编辑侧通道 tracker 注入工厂：打字时高亮器把 InputEdit 字节区间记下，
-        // 供预览同步当 dirty 区间用（跳过 O(n) 快照 diff）。
-        let tracker: crate::syntax::EditTracker = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let ed = editor.clone();
-        ed.update(cx, |ed, cx| {
-            ed.set_highlighter_factory(
-                crate::syntax::highlighter_factory_with_tracker(tracker.clone()),
-                cx,
-            );
-        });
+    pub(super) fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
+        // 自研编辑器组件：创建即空文档；语法高亮语言在打开文件时 set_language。
+        let editor = cx.new(|cx| crate::editor::CodeEditor::new(cx));
 
-        // 编辑内容被修改 → 置脏 + 同步内容/行列缓存
+        // 编辑内容被修改 → 置脏 + 同步内容/行列缓存 + 预览增量入口。
         let ed = editor.clone();
-        let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &InputEvent, cx| {
+        let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &EditorEvent, cx| {
             if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
-                if let InputEvent::Change = ev {
+                if ev == &EditorEvent::Edited {
                     let _t_change = crate::prof::begin();
-                    // 内容被编辑 → 侧边栏搜索缓存失效（下次渲染按新内容重扫）+ 版本号推进
+                    // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
                     this.search_scan = None;
                     tab.edit_version = tab.edit_version.wrapping_add(1);
                     // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
-                    // 供预览增量扫描跳过 O(n) 快照 diff。每次 Change 对应一次
-                    // 高亮器 update(Some(edit))（先于本事件），1:1 取走。
-                    if let Some((s, oe, ne)) = tab.edit_tracker.borrow_mut().take() {
+                    // CodeEditor 记录最近一次编辑区间（字节），每轮 Change 1:1 取走。
+                    if let Some((s, oe, ne)) = tab.editor.update(cx, |ed, _| ed.take_last_edit()) {
                         let delta = ne as i64 - oe as i64;
                         tab.preview_dirty = Some(match tab.preview_dirty {
                             None => (s, ne),
@@ -59,20 +40,13 @@ impl EditorApp {
                             }
                         });
                     }
-                    // 行/字数走 Rope 的 O(1) 计数，不再每键 `value()` 物化全文 +
-                    // `lines()/chars()` 全量扫描（16 万行文档每键三次 O(n)、一次 6MB
-                    // 副本——正是大文档编辑卡顿的主因）。行数保持旧 `str::lines()` 语义
-                    // （末尾换行不额外计一行），字数 = 字符数。
-                    let (line_count, char_count, cursor_position) = {
-                        let state = tab.editor.read(cx);
-                        let text = state.text();
-                        let lines = text.lines_len();
-                        let lines = if text.len() > 0 && text.byte(text.len() - 1) == b'\n' {
-                            lines.saturating_sub(1)
-                        } else {
-                            lines
-                        };
-                        (lines.max(1), text.len_chars(), state.cursor_position())
+                    // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
+                    // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
+                    // 不用含幻影尾行的编辑器模型 `line_count()`。
+                    let (line_count, char_count, cursor_row, cursor_col) = {
+                        let st = tab.editor.read(cx);
+                        let cursor = st.cursor_position();
+                        (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
                     };
                     // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**：
                     // 一次同步任务里循环「快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
@@ -209,8 +183,8 @@ impl EditorApp {
                     }
                     tab.line_count = line_count;
                     tab.char_count = char_count;
-                    tab.cursor_row = cursor_position.line as usize;
-                    tab.cursor_col = cursor_position.character as usize;
+                    tab.cursor_row = cursor_row;
+                    tab.cursor_col = cursor_col;
                     if !tab.dirty {
                         tab.dirty = true;
                     }
@@ -237,7 +211,6 @@ impl EditorApp {
             editor_pending: false,
             preview_prev: None,
             edit_version: 0,
-            edit_tracker: tracker,
             preview_dirty: None,
             _edit_sub: edit_sub,
         });
@@ -248,7 +221,7 @@ impl EditorApp {
 
     pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.make_tab(window, cx);
-        let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
+        let focus = self.tabs[idx].editor.read(cx).focus_handle();
         window.focus(&focus, cx);
         self.status = SharedString::from("新建文件");
         self.status_ok = true;
@@ -267,7 +240,7 @@ impl EditorApp {
             let root = self.focus_handle(cx);
             window.focus(&root, cx);
         } else {
-            let focus = self.tabs[idx].editor.read(cx).focus_handle(cx);
+            let focus = self.tabs[idx].editor.read(cx).focus_handle();
             window.focus(&focus, cx);
         }
         cx.notify();
@@ -371,8 +344,8 @@ impl EditorApp {
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         if self.tabs.len() == 1 {
             let tab = &mut self.tabs[0];
-            tab.editor.update(cx, |ed, cx| {
-                ed.set_value("", window, cx);
+            tab.editor.update(cx, |ed, _cx| {
+                ed.set_text("");
             });
             tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
             if let Some(pdf) = tab.pdf_preview.take() {
@@ -388,7 +361,7 @@ impl EditorApp {
             tab.preview_on = false;
             tab.preview_fullscreen = false;
             tab.readonly_preview = false;
-            let focus = tab.editor.read(cx).focus_handle(cx);
+            let focus = tab.editor.read(cx).focus_handle();
             window.focus(&focus, cx);
             self.status = SharedString::from("已关闭");
             self.status_ok = true;

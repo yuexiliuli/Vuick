@@ -35,7 +35,7 @@
         // 第 1 个选项卡输入内容
         let editor0 = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
         cx.update(|window, cx| {
-            editor0.update(cx, |state, cx| state.set_value("hello", window, cx));
+            editor0.update(cx, |ed, _| ed.set_text("hello"));
         });
         for _ in 0..3 {
             cx.run_until_parked();
@@ -78,7 +78,7 @@
             app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
         });
         cx.update(|window, cx| {
-            editor.update(cx, |state, cx| state.set_value("hello", window, cx));
+            editor.update(cx, |ed, _| ed.set_text("hello"));
         });
         for _ in 0..3 {
             cx.run_until_parked();
@@ -123,15 +123,12 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let sel = cx.update(|window, cx| {
-            editor.update(cx, |state, cx| state.selected_text_range(false, window, cx))
-        });
-        let sel = sel.expect("全选后应有选区");
-        assert_eq!(sel.range.start, 0, "全选应从文档开头开始");
+        let sel = cx.update(|_w, cx| editor.read(cx).selection());
+        assert_eq!(sel.start(), 0, "全选应从文档开头开始");
         assert!(
-            sel.range.end > 0,
+            sel.end() > 0,
             "全选应覆盖全部内容，实际={:?}",
-            sel.range
+            sel.range()
         );
     }
 
@@ -255,14 +252,12 @@
     /// 仅含编辑器的极简宿主：窗口中只有 gpui-component 的代码编辑器，
     /// 没有菜单栏/选项卡/状态栏/预览等任何外围代码。
     struct BareEditor {
-        editor: Entity<EditorState>,
+        editor: Entity<crate::editor::CodeEditor>,
     }
 
     impl Render for BareEditor {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .size_full()
-                .child(Editor::new(&self.editor).h(gpui::relative(1.)))
+            div().size_full().child(self.editor.clone())
         }
     }
 
@@ -273,17 +268,10 @@
     async fn minimal_editor_paste_integrity(cx: &mut TestAppContext) {
         init_test(cx);
 
-        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<EditorState>>>> =
+        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<crate::editor::CodeEditor>>>> =
             std::rc::Rc::default();
         let (root, cx) = cx.add_window_view(|window, cx| {
-            let editor = cx.new(|cx| {
-                EditorState::new(window, cx)
-                    .tab_size(TabSize {
-                        tab_size: 4,
-                        hard_tabs: false,
-                    })
-                    .soft_wrap(false)
-            });
+            let editor = cx.new(|cx| crate::editor::CodeEditor::new(cx));
             *holder.borrow_mut() = Some(editor.clone());
             let view = cx.new(|_cx| BareEditor { editor });
             gpui_component::Root::new(view, window, cx)
@@ -296,7 +284,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            let focus = editor.read(cx).focus_handle(cx);
+            let focus = editor.read(cx).focus_handle();
             window.focus(&focus, cx);
         });
         for _ in 0..2 {
@@ -1683,7 +1671,7 @@
         cx.update(|window, cx| {
             let idx = app.read(cx).active_tab;
             let ed = app.read(cx).tabs[idx].editor.clone();
-            ed.update(cx, |ed, cx| ed.set_value(long_text, window, cx));
+            ed.update(cx, |ed, _| ed.set_text(&long_text));
         });
         for _ in 0..5 {
             cx.run_until_parked();
@@ -2192,7 +2180,7 @@
                 let idx = a.active_tab;
                 (
                     a.tabs[idx].editor.clone(),
-                    a.tabs[idx].editor.read(cx).focus_handle(cx),
+                    a.tabs[idx].editor.read(cx).focus_handle(),
                 )
             });
             cx.update(|window, cx| window.focus(&focus, cx));
@@ -2202,7 +2190,7 @@
             let t_insert = std::time::Instant::now();
             for _ in 0..N {
                 cx.update(|window, cx| {
-                    editor.update(cx, |ed, cx| ed.insert(SAMPLE, window, cx));
+                    editor.update(cx, |ed, cx| ed.insert_text(SAMPLE, cx));
                 });
             }
             let dt = t_insert.elapsed();
@@ -2269,7 +2257,7 @@
             let rep = 5;
             for i in 0..rep {
                 let t0 = std::time::Instant::now();
-                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+                cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text(sample, cx)));
                 let t1 = std::time::Instant::now();
                 cx.run_until_parked();
                 let _ = cx.cx.refresh();
@@ -2301,7 +2289,7 @@
             let rep = 5;
             for _ in 0..rep {
                 let t0 = std::time::Instant::now();
-                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+                cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text(sample, cx)));
                 let t1 = std::time::Instant::now();
                 cx.run_until_parked();
                 let _ = cx.cx.refresh();
@@ -2364,7 +2352,7 @@
         let mut park: Vec<f64> = Vec::new();
         for _ in 0..8 {
             let t = Instant::now();
-            cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+            cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text(sample, cx)));
             let t1 = Instant::now();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
@@ -2391,11 +2379,11 @@
         let total = cx.update(|_, cx| editor.read(cx).value().len());
         let mid = (total / 2).min(total);
         cx.update(|_, cx| {
-            editor.update(cx, |e, cx| e.set_selected_range(mid..mid, cx));
+            editor.update(cx, |e, cx| e.set_selection_range(mid..mid, cx));
         });
         for _ in 0..8 {
             let t = Instant::now();
-            cx.update(|w, cx| editor.update(cx, |e, cx| e.insert(sample, w, cx)));
+            cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text(sample, cx)));
             let t1 = Instant::now();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
@@ -2430,7 +2418,7 @@
             let rope_ms = t0.elapsed().as_secs_f64() * 1000.0 / 50.0;
             let t1 = Instant::now();
             for _ in 0..50 {
-                cx.update(|w, cx| editor.update(cx, |e, cx| e.insert("x", w, cx)));
+                cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text("x", cx)));
             }
             let ins_ms = t1.elapsed().as_secs_f64() * 1000.0 / 50.0;
             println!(

@@ -62,7 +62,7 @@ impl EditorApp {
         idx: usize,
         p: &std::path::Path,
         text: String,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
         prebuilt_index: Option<std::rc::Rc<crate::markdown::BlockIndex>>,
     ) {
@@ -90,13 +90,13 @@ impl EditorApp {
         };
         tab.preview_prev = preview_seed.clone();
         let t_editor = std::time::Instant::now();
-        tab.editor.update(cx, |ed, cx| {
-            ed.set_value(text.clone(), window, cx);
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text(&text);
             if is_md && lines <= EDITOR_WRAP_MAX_LINES {
-                // 大文档不软换行：避免 DisplayMap 一次性布局整篇（见常量注释）
-                ed.set_soft_wrap(true, window, cx);
+                // 自研编辑器尚不支持软换行（占位，API 一致；大文档无 DisplayMap 布局问题）
+                ed.set_soft_wrap(true);
             }
-            ed.set_highlighter(lang, cx);
+            ed.set_language(Some(lang));
         });
         let elapsed_editor = t_editor.elapsed();
         // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）。
@@ -178,7 +178,7 @@ impl EditorApp {
         idx: usize,
         p: &std::path::Path,
         doc: crate::epub::EpubDocument,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
@@ -190,9 +190,9 @@ impl EditorApp {
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
         // 编辑区置为提示文本（EPUB 只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, cx| {
-            ed.set_value("", window, cx);
-            ed.set_highlighter("markdown", cx);
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text("");
+            ed.set_language(Some("markdown"));
         });
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
@@ -233,7 +233,7 @@ impl EditorApp {
         &mut self,
         idx: usize,
         p: &std::path::Path,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
@@ -243,9 +243,9 @@ impl EditorApp {
             return;
         };
         // 编辑区置为提示文本（PDF 只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, cx| {
-            ed.set_value("", window, cx);
-            ed.set_highlighter("markdown", cx);
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text("");
+            ed.set_language(Some("markdown"));
         });
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(canvas_bg);
@@ -331,7 +331,7 @@ impl EditorApp {
                     let idx = self.make_tab(window, cx);
                     self.load_epub(idx, &p, doc, window, cx);
                     if let Some(tab) = self.tabs.get(idx) {
-                        let focus = tab.editor.read(cx).focus_handle(cx);
+                        let focus = tab.editor.read(cx).focus_handle();
                         window.focus(&focus, cx);
                     }
                 }
@@ -348,7 +348,7 @@ impl EditorApp {
             let idx = self.make_tab(window, cx);
             self.open_pdf_async(idx, p.clone(), window, cx);
             if let Some(tab) = self.tabs.get(idx) {
-                let focus = tab.editor.read(cx).focus_handle(cx);
+                let focus = tab.editor.read(cx).focus_handle();
                 window.focus(&focus, cx);
             }
             return;
@@ -402,7 +402,7 @@ impl EditorApp {
                             Some(std::rc::Rc::new(index)),
                         );
                         if let Some(tab) = this.tabs.get(idx) {
-                            let focus = tab.editor.read(cx).focus_handle(cx);
+                            let focus = tab.editor.read(cx).focus_handle();
                             window.focus(&focus, cx);
                         }
                     });
@@ -426,7 +426,7 @@ impl EditorApp {
         }
         if let Some(tab) = self.tabs.get(idx) {
             let t_focus = std::time::Instant::now();
-            let focus = tab.editor.read(cx).focus_handle(cx);
+            let focus = tab.editor.read(cx).focus_handle();
             window.focus(&focus, cx);
             if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                 eprintln!(
@@ -570,7 +570,7 @@ impl EditorApp {
             return;
         };
         tab.editor.update(cx, |editor, cx| {
-            editor.replace(text, window, cx);
+            editor.paste_text(&text, cx);
         });
     }
 }

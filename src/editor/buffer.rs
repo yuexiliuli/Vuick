@@ -134,9 +134,19 @@ impl Buffer {
         self.text.utf16_to_byte_idx(offset_utf16.min(self.text.len_utf16()))
     }
 
-    /// 行数（LF 分隔；尾换行产生幻影空行）。
+    /// 行数（LF 分隔；尾换行产生幻影空行）——编辑器光标模型语义。
     pub fn line_count(&self) -> usize {
         self.text.lines_len()
+    }
+
+    /// 显示语义行数（与 `str::lines()` 一致：`"a\nb\n"`→2，尾换行不追加一行）。
+    /// 与 [`line_count`]（含幻影空行，供 ListState/光标定位用）不同——状态栏/统计用这个。
+    /// O(log n)（只查末行是否为空），不物化全文。
+    pub fn display_line_count(&self) -> usize {
+        let n = self.text.lines_len();
+        // 非空文本的末行为空 ⟺ 以换行结尾（ropey 幻影空行 = str::lines 丢弃的尾段；"\r\n" 同理）。
+        let trailing_newline = self.len() > 0 && self.text.line_len(n - 1) == 0;
+        (n - usize::from(trailing_newline)).max(1)
     }
 
     /// 行首字节偏移。

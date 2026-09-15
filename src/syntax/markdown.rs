@@ -13,6 +13,8 @@
 //!
 //! 其余语言仍走 [`super::SyntectHighlighter`]（syntect 窗口式解析 + 折叠）。
 
+#![allow(dead_code)] // 编辑区 Markdown 高亮器未被接线（自研 editor 自带），保留防告警
+
 use std::ops::Range;
 
 use gpui::{Context, HighlightStyle, SharedString, Window};

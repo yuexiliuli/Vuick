@@ -194,12 +194,13 @@ impl Highlighter {
         let version = buffer.version();
 
         if let Some((v, _a, b)) = self.key {
-            if v == version && lo >= self.base && hi < self.base + self.lines.len().max(b + 1) {
+            if v == version && lo >= self.base && hi < self.base + self.lines.len() {
                 let rel = lo - self.base;
-                if rel + (hi - lo) <= self.lines.len() {
+                if rel + (hi - lo) + 1 <= self.lines.len() {
                     return &self.lines[rel..rel + (hi - lo) + 1];
                 }
             }
+            let _ = b;
         }
 
         // 重解析：从回看起点到 hi。

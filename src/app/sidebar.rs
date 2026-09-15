@@ -5,7 +5,7 @@
 //! （选项卡栏之下、状态栏之上）。
 
 use super::*;
-use gpui_component::input::{Input, Position, RopeExt};
+use gpui_component::input::{Input, RopeExt};
 
 use crate::config::limits::SEARCH_RESULT_CAP;
 
@@ -641,12 +641,9 @@ impl EditorApp {
                             let ed = tab.editor.clone();
                             ed.update(cx, |ed, cx| {
                                 // 先落光标（滚动到该行），再选中命中文本作为高亮
-                                ed.set_cursor_position(
-                                    Position::new(li as u32, 0),
-                                    window,
-                                    cx,
-                                );
-                                ed.set_selected_range(match_range.clone(), cx);
+                                let start = ed.offset_for_line_col(li as usize, 0);
+                                ed.set_caret_to(start);
+                                ed.set_selection_range(match_range.clone(), cx);
                             });
                         }
                     }

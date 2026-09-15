@@ -24,15 +24,23 @@ use std::{
 };
 
 use gpui::{
-    div, list, point, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context, Element,
-    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    div, list, point, px, rgb, size, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement,
     KeyDownEvent, LayoutId, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, StyledText, TextInputConfiguration, UTF16Selection, Window,
-    prelude::FluentBuilder as _,
+    MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledText, TextInputConfiguration,
+    UTF16Selection, Window, prelude::FluentBuilder as _,
 };
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::input::Rope;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_component::input::{
+    Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, Enter,
+    IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
+    MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline, Paste,
+    Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
+    SelectToStart, SelectToStartOfLine, Undo,
+};
 
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
@@ -120,6 +128,12 @@ pub struct CodeEditor {
     gutter_width_px: Pixels,
     content_w_px: f32,
     uniform_applied: Option<Pixels>,
+    /// 统一高度提示最近一次重挂时间（节流：gpui 换宽会清空 size_hint，
+    /// 导致量程坍缩，检测到坍缩后重挂，但同一时间窗口内至多重挂一次）。
+    last_uniform_apply: Option<std::time::Instant>,
+    /// 是否已观察过一次「量程健康」帧。健康后才启用 120ms 重挂冷却；
+    /// 从未健康（首帧/新文档/紧跟其后的换宽坍缩）时不冷却，立即自愈。
+    hint_healthy: bool,
 
     // —— 主题色快照 ——
     bg: Hsla,
@@ -130,6 +144,11 @@ pub struct CodeEditor {
 
     // —— IME ——
     marked_range: Option<Range<usize>>,
+    /// 最近一次编辑的字节区间 `(start, old_end, new_end)`（当前文本坐标），
+    /// 由插入/撤销/重做写，供预览增量同步取走累积 dirty。
+    last_edit: Option<(usize, usize, usize)>,
+    /// 字号覆盖（px，`None` = 主题默认）。
+    font_override: Option<f32>,
 
     // —— 交互状态 ——
     dragging: bool,
@@ -137,6 +156,7 @@ pub struct CodeEditor {
     caret_visible: bool,
     caret_pause_until: Option<Instant>,
     blink_epoch: u64,
+    blink_running: bool,
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
 
@@ -172,17 +192,22 @@ impl CodeEditor {
             gutter_width_px: px(0.),
             content_w_px: 0.,
             uniform_applied: None,
+            last_uniform_apply: None,
+            hint_healthy: false,
             bg: rgb(0xffffff).into(),
             fg: rgb(0x000000).into(),
             gutter_fg: rgb(0x9aa0a6).into(),
             sel_bg: rgb(0xd0d7de).into(),
             caret_color: rgb(0x000000).into(),
             marked_range: None,
+            last_edit: None,
+            font_override: None,
             dragging: false,
             focused: false,
             caret_visible: false,
             caret_pause_until: None,
             blink_epoch: 0,
+            blink_running: false,
             focus_registered: false,
             element_bounds: Bounds::default(),
             tab_size: 4,
@@ -206,6 +231,7 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         self.hscroll_cols = 0;
         self.marked_range = None;
+        self.last_edit = None;
         self.resync_list();
     }
 
@@ -214,8 +240,98 @@ impl CodeEditor {
         self.insert_edit(self.selection.range(), text, EditIntent::Typing, cx);
     }
 
-    pub fn text(&self) -> String {
+    /// 底层 Rope（只读；O(1) COW 快照给后台线程）。
+    pub fn text(&self) -> &Rope {
+        self.buffer.text()
+    }
+
+    /// Rope 别称（语义化：给预览同步取快照）。
+    pub fn rope(&self) -> &Rope {
+        self.buffer.text()
+    }
+
+    /// 整篇文本（O(n) 物化；导出/保存用）。
+    pub fn text_string(&self) -> String {
         self.buffer.to_string()
+    }
+
+    /// 兼容 `EditorState::value()`：返回全文 String（保存/测试用）。
+    pub fn value(&self) -> String {
+        self.buffer.to_string()
+    }
+
+    /// 编辑版本号：每次编辑 +1（预览同步判断“扫描期间是否有新编辑”）。
+    pub fn version(&self) -> u64 {
+        self.buffer.version()
+    }
+
+    /// 文本行数（LF 计行，尾换行含幻影空行）——编辑器行模型语义。
+    pub fn line_count(&self) -> usize {
+        self.buffer.line_count()
+    }
+
+    /// 状态栏显示用行数（`str::lines()` 语义：`"a\nb\n"`→2，尾换行不追加一行）。
+    pub fn display_line_count(&self) -> usize {
+        self.buffer.display_line_count()
+    }
+
+    /// 列表视口高（px，测试断言用：List 必须撑满容器，否则可见行数为 0）。
+    #[cfg(test)]
+    pub(crate) fn list_viewport_height(&self) -> f32 {
+        self.list_state.viewport_bounds().size.height.as_f32()
+    }
+
+    /// 竖向最大滚动量（px，测试断言用：换宽会清空 size_hint，量程不应坍缩）。
+    #[cfg(test)]
+    pub(crate) fn list_max_offset(&self) -> f32 {
+        self.list_state.max_offset_for_scrollbar().y.as_f32()
+    }
+
+    /// 字符总数。
+    pub fn char_count(&self) -> usize {
+        self.buffer.char_count()
+    }
+
+    /// 行内字符列 → 字节偏移（越界夹到行尾；搜索跳转/程序化定位用）。
+    pub fn offset_for_line_col(&self, line: usize, column_char: usize) -> usize {
+        self.buffer.offset_for_char_column(line, column_char)
+    }
+
+    /// 选中字节区间（搜索跳转高亮/程序化选区）：滚动到可见并通知。
+    pub fn set_selection_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let s = self.buffer.clip(range.start);
+        let e = self.buffer.clip(range.end);
+        self.selection = Selection::from_range(s, e);
+        self.undo.set_cooperative(false);
+        self.kick_caret();
+        self.reveal_caret();
+        cx.notify();
+    }
+
+    /// 光标位置 `(行 0 基, 字符列 0 基)`。
+    pub fn cursor_position(&self) -> (usize, usize) {
+        let h = self.selection.head();
+        (self.buffer.line_of_offset(h), self.buffer.char_column(h))
+    }
+
+    /// 取走最近一次编辑的字节区间 `(start, old_end, new_end)`（当前文本坐标）。
+    /// 供预览增量扫描累积 dirty；取走后清空。
+    pub fn take_last_edit(&mut self) -> Option<(usize, usize, usize)> {
+        self.last_edit.take()
+    }
+
+    /// 软换行开关（暂未实现：首版 display 行 ≡ buffer 行，占位保持 API 一致）。
+    pub fn set_soft_wrap(&mut self, _enable: bool) {}
+
+    /// 字号覆盖（px；`None` 走主题默认）。由应用 Ctrl+=/- 调节。
+    pub fn set_font_override(&mut self, size_px: Option<f32>) {
+        self.font_override = size_px;
+        self.metrics_ready = false;
+    }
+
+    /// 当前生效字号（px）。
+    pub fn font_size_px(&self) -> f32 {
+        self.font_size.as_f32()
     }
 
     pub fn buffer_text(&self) -> &gpui_component::input::Rope {
@@ -252,8 +368,18 @@ impl CodeEditor {
 
         let mono = typo.mono.clone();
         let mono_md = typo.mono_md.clone();
-        let font_size = mono_md.size;
-        let line_height = mono_md.line_height;
+        // 字号覆盖：应用 Ctrl+=/- 调节（默认 None = 主题字号）
+        let (font_size, line_height) = match self.font_override {
+            Some(px_override) => {
+                let ratio = if mono_md.size.as_f32() > 0. {
+                    mono_md.line_height.as_f32() / mono_md.size.as_f32()
+                } else {
+                    1.3
+                };
+                (px(px_override), px(px_override * ratio))
+            }
+            None => (mono_md.size, mono_md.line_height),
+        };
 
         let text_system = window.text_system();
         let font = gpui::font(mono.clone());
@@ -268,8 +394,12 @@ impl CodeEditor {
         self.bg = colors.background;
         self.fg = colors.foreground;
         self.gutter_fg = colors.muted_foreground;
-        self.caret_color = colors.accent;
-        self.sel_bg = colors.accent.opacity(if dark { 0.4 } else { 0.3 });
+        // 光标不能用 colors.accent：本应用 Light 主题的 accent=l≈0.961（#f5f5f5），
+        // 白底上画白光标=看不见（用户反馈“点击无闪烁光标”就是这个）。用前景墨色，
+        // 明/暗主题下都一定可见。
+        self.caret_color = colors.foreground;
+        // 选区底色同样避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
+        self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
@@ -306,19 +436,60 @@ impl CodeEditor {
     }
 
     /// 统一高度的量程提示：仅在行高/条目结构变化后重挂（避免每帧 O(n)）。
+    ///
+    /// gpui 在「宽度变化」时会把 ListState 所有条目的 `size_hint` 清空（未测
+    /// 条目高度按 0 计）→ `max_offset_for_scrollbar()` 坍缩，滚动条量程随之
+    /// 失真（表现为“内容长但滚动条极短/拖动失效”）。这里在**每次渲染**用
+    /// O(1) 读摘要判断量程是否坍缩，坍缩则重挂提示；健康时清掉重挂痕迹，
+    /// 保证换宽后的首次坍缩立即重挂；连续坍缩风暴（拖分屏）120ms 至多重挂一次
+    /// （`with_uniform_item_height` 是 O(n) SumTree 物化，不能每帧跑）。
     fn ensure_uniform_hint(&mut self) {
         if !self.metrics_ready {
             return;
         }
-        if self.uniform_applied != Some(self.line_height)
-            && self.list_state.item_count() > 0
-        {
+        let n = self.list_state.item_count();
+        if n == 0 {
+            return;
+        }
+        let lh = self.line_height.as_f32();
+        let expected = n as f32 * lh.max(1.);
+        let content_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
+            + self.list_state.viewport_bounds().size.height.as_f32();
+        // 量程坍缩：未测条目把总高压到远低于预期（<97%）。
+        let undercount = expected > 0. && content_h < expected * 0.97;
+
+        if !undercount {
+            // 量程健康：记录「已健康」，抹掉重挂痕迹。
+            self.hint_healthy = true;
+            self.last_uniform_apply = None;
+            if self.uniform_applied == Some(self.line_height) {
+                return;
+            }
             self.list_state = self
                 .list_state
                 .clone()
                 .with_uniform_item_height(self.line_height);
             self.uniform_applied = Some(self.line_height);
+            return;
         }
+
+        // 坍缩：宽度变化把 size_hint 清了 → 重挂整棵 SumTree（O(n)）。
+        // 冷却仅在「已观察过健康帧」之后生效（否则首帧/新文档紧跟的换宽坍缩会被
+        // 冷却误伤，量程长时间不自愈）。连续坍缩风暴（拖分屏）120ms 至多重挂一次。
+        if self.hint_healthy
+            && self
+                .last_uniform_apply
+                .is_some_and(|t| t.elapsed().as_millis() < 120)
+        {
+            return;
+        }
+
+        self.list_state = self
+            .list_state
+            .clone()
+            .with_uniform_item_height(self.line_height);
+        self.uniform_applied = Some(self.line_height);
+        self.last_uniform_apply = Some(std::time::Instant::now());
     }
 
     fn visible_chars_from_width(&self, width_px: f32) -> usize {
@@ -337,43 +508,34 @@ impl CodeEditor {
             return RowData::empty();
         }
 
-        let from_char = self.hscroll_cols;
-        let win_chars = self.visible_chars.max(1);
-        let text = self.buffer.line_text_window(row, from_char, win_chars);
+        let line_start = self.buffer.line_start(row);
+        let line_end = self.buffer.line_end(row);
+        let text = self.buffer.line_text(row);
         if text.is_empty() {
+            // 空行：仅在光标停在本行（head==line_start==line_end）时画在 x=0。
             return RowData {
                 text,
                 highlights: Vec::new(),
-                caret: if show_caret && self.selection.head() == self.buffer.line_end(row) {
-                    // 空行/行尾：光标画在行首（x=0，若在横向可见区）
-                    if self.buffer.char_column(self.selection.head()) >= from_char {
-                        Some(0.)
-                    } else {
-                        None
-                    }
+                caret: if show_caret
+                    && self.selection.head() == line_start
+                {
+                    Some(0.)
                 } else {
                     None
                 },
             };
         }
 
-        // 语法着色：高亮缓存整行范围，按窗口字节裁剪平移
-        let line_start = self.buffer.line_start(row);
-        let line_end = self.buffer.line_end(row);
-        let win_start = self
-            .buffer
-            .offset_for_char_column(row, from_char)
-            .max(line_start);
+        // 语法着色：高亮缓存整行范围 in buffer 坐标，平移到行内字节坐标。
         let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-
         let hl_lines = self
             .highlighter
             .highlight_window(&self.buffer, row, row, HL_LOOKBACK_LINES);
         if let Some(runs) = hl_lines.first() {
             for (r, color) in runs {
-                if r.end > win_start && r.start < line_end {
-                    let s = r.start.max(win_start).saturating_sub(win_start);
-                    let e = r.end.min(line_end).saturating_sub(win_start);
+                if r.end > line_start && r.start < line_end {
+                    let s = r.start.max(line_start) - line_start;
+                    let e = r.end.min(line_end) - line_start;
                     if e > s {
                         highlights.push((
                             s..e,
@@ -387,34 +549,27 @@ impl CodeEditor {
             }
         }
 
-        // 选区底色（当前行与选区交叠）
+        // 选区底色（本行与选区交叠）
         if !self.selection.is_collapsed() {
             let sel = self.selection.range();
             let lo = sel.start.max(line_start);
             let hi = sel.end.min(line_end);
             if hi > lo {
-                let s = lo.max(win_start).saturating_sub(win_start);
-                let e = hi.saturating_sub(win_start);
-                if e > s {
-                    highlights.push((
-                        s..e,
-                        HighlightStyle {
-                            background_color: Some(self.sel_bg),
-                            ..Default::default()
-                        },
-                    ));
-                }
+                highlights.push((
+                    (lo - line_start)..(hi - line_start),
+                    HighlightStyle {
+                        background_color: Some(self.sel_bg),
+                        ..Default::default()
+                    },
+                ));
             }
         }
 
-        // 光标
+        // 光标（横向滚动交给外层容器，行内文本从 x=0 全宽绘制
+        // —— 绝不再按 hscroll 裁文本，避免「文本窗口裁切 + 容器滚动」双重偏移）
         let caret = if show_caret && self.selection.head() >= line_start && self.selection.head() <= line_end {
             let col = self.buffer.char_column(self.selection.head());
-            if col >= from_char {
-                Some((col - from_char) as f32 * self.char_width.as_f32())
-            } else {
-                None
-            }
+            Some(col as f32 * self.char_width.as_f32())
         } else {
             None
         };
@@ -479,6 +634,28 @@ impl CodeEditor {
         self.h_handle.set_offset(point(px(-x), px(0.)));
     }
 
+    /// 按像素横向滚动（容器滚到底/顶自动夹紧），并同步 `hscroll_cols`。
+    fn scroll_horizontal_px(&mut self, dx_px: f32) {
+        if dx_px == 0. {
+            return;
+        }
+        let cw = self.char_width.as_f32().max(1.);
+        let view_w = self.element_bounds.size.width.as_f32();
+        let max_px = (self.content_w_px - view_w).max(0.);
+        let cur_px = (-self.h_handle.offset().x.as_f32()).clamp(0.0, max_px);
+        let target_px = (cur_px + dx_px).clamp(0.0, max_px);
+        let cols = (target_px / cw).round() as usize;
+        self.set_hscroll(cols);
+    }
+
+    /// 滚轮步长换算：`(行高, 字符宽)`。
+    fn scroll_factors(&self) -> (f32, f32) {
+        (
+            self.line_height.as_f32().max(1.),
+            self.char_width.as_f32().max(1.),
+        )
+    }
+
     // -----------------------------------------------------------------
     // 坐标换算（元素本地坐标）
     // -----------------------------------------------------------------
@@ -529,7 +706,9 @@ impl CodeEditor {
         self.caret_visible = true;
         self.caret_pause_until = Some(Instant::now());
         cx.emit(EditorEvent::Focus);
-        self.start_blink(cx);
+        if !self.blink_running {
+            self.start_blink(cx);
+        }
     }
 
     fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -540,6 +719,10 @@ impl CodeEditor {
     }
 
     fn start_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_running {
+            return;
+        }
+        self.blink_running = true;
         self.blink_epoch = self.blink_epoch.wrapping_add(1);
         let epoch = self.blink_epoch;
         cx.spawn(async move |this, cx| loop {
@@ -562,6 +745,7 @@ impl CodeEditor {
                 .update(cx, |this, _| this.focused && epoch == this.blink_epoch)
                 .unwrap_or(false);
             if !keep {
+                this.update(cx, |this, _| this.blink_running = false).ok();
                 break;
             }
         })
@@ -611,58 +795,36 @@ impl CodeEditor {
         self.dragging = false;
     }
 
-    /// 统一按键：非文本键在此完成。
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// 统一按键：仅处理 keymap 未覆盖的 **Shift+方向**（gpui-component 的
+    /// Select{Left,Right,Up,Down} 是组件内部 action、公共 keymap 用了它但我们无法
+    /// 注册 handler，故在原样 key_down 层处理）。其余键全部走 `on_action`。
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = &event.keystroke;
         let m = k.modifiers;
-
-        // 无修饰键的可打印字符 → 交给 IME/InputHandler（此处不收）
-        if !m.control && !m.alt && !m.platform && k.key_char.is_some() && k.key.len() <= 1 {
+        // 无修饰可打印字符 → IME/InputHandler
+        if !m.control && !m.alt && !m.platform && k.key_char.is_some() {
             return;
         }
-
-        // Ctrl 组合
-        if m.control {
+        if m.shift && !m.control && !m.alt && !m.platform {
             match k.key.to_ascii_lowercase().as_str() {
-                "c" => return self.copy(window, cx),
-                "x" => return self.cut(window, cx),
-                "v" => return self.paste(window, cx),
-                "a" => return self.select_all(cx),
-                "z" => return self.undo(cx),
-                "y" => return self.redo(cx),
                 "left" => {
-                    if m.shift {
-                        return self.select_word_left(cx);
-                    }
-                    return self.move_word_left(cx);
+                    self.arrow(true, -1, 0, cx);
+                    return;
                 }
                 "right" => {
-                    if m.shift {
-                        return self.select_word_right(cx);
-                    }
-                    return self.move_word_right(cx);
+                    self.arrow(true, 1, 0, cx);
+                    return;
                 }
-                "backspace" => return self.backspace_word(cx),
-                "delete" => return self.delete_word_forward(cx),
+                "up" => {
+                    self.arrow(true, 0, -1, cx);
+                    return;
+                }
+                "down" => {
+                    self.arrow(true, 0, 1, cx);
+                    return;
+                }
                 _ => {}
             }
-        }
-
-        let select = m.shift;
-        match k.key.to_ascii_lowercase().as_str() {
-            "left" => return self.arrow(select, -1, 0, cx),
-            "right" => return self.arrow(select, 1, 0, cx),
-            "up" => return self.arrow(select, 0, -1, cx),
-            "down" => return self.arrow(select, 0, 1, cx),
-            "home" => return self.move_line_start(select, cx),
-            "end" => return self.move_line_end(select, cx),
-            "pageup" => return self.page(select, -1, cx),
-            "pagedown" => return self.page(select, 1, cx),
-            "backspace" => return self.backspace(cx),
-            "delete" => return self.delete_forward(cx),
-            "enter" | "return" => return self.insert_newline(cx),
-            "tab" => return self.tab(m.shift, cx),
-            _ => {}
         }
     }
 
@@ -747,6 +909,16 @@ impl CodeEditor {
         self.apply_move(select, new, None, cx);
     }
 
+    fn move_doc_start(&mut self, select: bool, cx: &mut Context<Self>) {
+        self.undo.set_cooperative(false);
+        self.apply_move(select, 0, None, cx);
+    }
+
+    fn move_doc_end(&mut self, select: bool, cx: &mut Context<Self>) {
+        self.undo.set_cooperative(false);
+        self.apply_move(select, self.buffer.len(), None, cx);
+    }
+
     fn page_row_count(&self) -> usize {
         let vh = self.list_state.viewport_bounds().size.height.as_f32();
         let lh = self.line_height.as_f32().max(1.);
@@ -774,6 +946,8 @@ impl CodeEditor {
             .start_tx(intent, (self.selection.anchor, self.selection.head));
         let edit = self.apply_edit_synced(range, text);
         let head = edit.inserted_range().end;
+        let old_end = edit.replaced_range().end;
+        self.last_edit = Some((edit.start, old_end, head));
         self.undo.push_edit(edit);
         self.selection.place(head);
         // 打字/退格/删除保留合作（连续合并）；换行/原子编辑断开
@@ -923,10 +1097,15 @@ impl CodeEditor {
     fn paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(item) = cx.read_from_clipboard() {
             if let Some(text) = item.text() {
-                let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                self.insert_edit(self.selection.range(), &normalized, EditIntent::Atomic, cx);
+                self.paste_text(&text, cx);
             }
         }
+    }
+
+    /// 在选区处粘贴（归一化 CRLF→LF；程序化/应用侧调用）。
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.insert_edit(self.selection.range(), &normalized, EditIntent::Atomic, cx);
     }
 
     fn undo(&mut self, cx: &mut Context<Self>) {
@@ -935,6 +1114,16 @@ impl CodeEditor {
         };
         for edit in tx.edits.iter().rev() {
             self.buffer.undo_edit(edit);
+        }
+        // 撤销整组：dirty 用覆盖所有编辑的最小−最大区间（bounding box，保守）
+        if let (Some(a), Some(b)) = (
+            tx.edits.iter().map(|e| e.start).min(),
+            tx.edits
+                .iter()
+                .map(|e| e.start + e.old_text.len())
+                .max(),
+        ) {
+            self.last_edit = Some((a, b, a));
         }
         self.selection = Selection::from_range(tx.before.0, tx.before.1);
         self.resync_list();
@@ -950,6 +1139,15 @@ impl CodeEditor {
         };
         for edit in tx.edits.iter() {
             self.buffer.redo_edit(edit);
+        }
+        if let (Some(a), Some(b)) = (
+            tx.edits.iter().map(|e| e.start).min(),
+            tx.edits
+                .iter()
+                .map(|e| e.start + e.new_text.len())
+                .max(),
+        ) {
+            self.last_edit = Some((a, a, b));
         }
         self.selection = Selection::from_range(tx.after.0, tx.after.1);
         self.resync_list();
@@ -1137,9 +1335,25 @@ impl Render for CodeEditor {
             let _ = cx.on_blur(&self.focus_handle, window, Self::on_blur);
             self.focus_registered = true;
         }
+        // 补同步：应用启动时 window.focus() 发生在 on_focus 注册之前 → 事件丢失，
+        // `focused` 永远是 false → 光标不显示但也无法输入。这里按当前焦点态对齐。
+        if self.focus_handle.is_focused(window) && !self.focused {
+            self.focused = true;
+            self.kick_caret();
+            if !self.blink_running {
+                self.start_blink(cx);
+            }
+            cx.notify();
+        }
 
         self.refresh_metrics(window, cx);
         self.ensure_uniform_hint();
+        // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
+        if self.char_width.as_f32() > 0. {
+            self.hscroll_cols = ((-self.h_handle.offset().x.as_f32())
+                / self.char_width.as_f32())
+                .round() as usize;
+        }
 
         // 可见字符数（用上一帧元素宽，首帧退回窗口宽）
         let avail_w = if self.element_bounds.size.width > px(0.) {
@@ -1167,7 +1381,7 @@ impl Render for CodeEditor {
         // 横向内容宽度（单调上修：只增不减，避免 List 宽度抖动 → 清量程）
         let mut max_cols = self.content_w_px / self.char_width.as_f32().max(1.);
         for rd in &rows {
-            let cols = rd.text.chars().count() as f32 + self.hscroll_cols as f32;
+            let cols = rd.text.chars().count() as f32;
             max_cols = max_cols.max(cols);
         }
         let content_w_px = (max_cols * self.char_width.as_f32().max(1.))
@@ -1197,7 +1411,11 @@ impl Render for CodeEditor {
                 &RowData::empty()
             };
             row_element(rd, &rv, ix).into_any_element()
-        });
+        })
+        // 关键：必须把 List 元素撑满容器（size_full → 视口=编辑器整块）。
+        // 不加会走 List 的 Infer 测量——高度=内容高（一行 ~22px），视口≈0，
+        // 列表永远不渲染任何行（md 预览正是这样挂的，见 markdown/view/mod.rs）。
+        .size_full();
 
         let inner = div()
             .id("ce-list-wrap")
@@ -1228,9 +1446,162 @@ impl Render for CodeEditor {
             .on_mouse_down(MouseButton::Left, window.listener_for(&entity, CodeEditor::on_mouse_down))
             .on_mouse_move(window.listener_for(&entity, CodeEditor::on_mouse_move))
             .on_mouse_up(MouseButton::Left, window.listener_for(&entity, CodeEditor::on_mouse_up))
+            // —— 输入 action（keymap 由 gpui_component::init 在 "Input" 上下文绑定，
+            // 与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler ——
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveLeft, _w, cx| {
+                ed.arrow(false, -1, 0, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveRight, _w, cx| {
+                ed.arrow(false, 1, 0, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveUp, _w, cx| {
+                ed.arrow(false, 0, -1, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveDown, _w, cx| {
+                ed.arrow(false, 0, 1, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveHome, _w, cx| {
+                ed.move_line_start(false, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveEnd, _w, cx| {
+                ed.move_line_end(false, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToStartOfLine, _w, cx| {
+                ed.move_line_start(true, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToEndOfLine, _w, cx| {
+                ed.move_line_end(true, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveToStart, _w, cx| {
+                ed.move_doc_start(false, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveToEnd, _w, cx| {
+                ed.move_doc_end(false, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToStart, _w, cx| {
+                ed.move_doc_start(true, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToEnd, _w, cx| {
+                ed.move_doc_end(true, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveToPreviousWord, _w, cx| {
+                ed.move_word_left(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MoveToNextWord, _w, cx| {
+                ed.move_word_right(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToPreviousWordStart, _w, cx| {
+                ed.select_word_left(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectToNextWordEnd, _w, cx| {
+                ed.select_word_right(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MovePageUp, _w, cx| {
+                ed.page(false, -1, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &MovePageDown, _w, cx| {
+                ed.page(false, 1, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Backspace, _w, cx| {
+                ed.backspace(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Delete, _w, cx| {
+                ed.delete_forward(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &DeleteToPreviousWordStart, _w, cx| {
+                ed.backspace_word(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &DeleteToNextWordEnd, _w, cx| {
+                ed.delete_word_forward(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Enter, _w, cx| {
+                ed.insert_newline(cx);
+                ed.undo.set_cooperative(false);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &IndentInline, _w, cx| {
+                ed.tab(false, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &OutdentInline, _w, cx| {
+                ed.tab(true, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &SelectAll, _w, cx| {
+                ed.select_all(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Undo, _w, cx| {
+                ed.undo(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Redo, _w, cx| {
+                ed.redo(cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Copy, window, cx| {
+                ed.copy(window, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Cut, window, cx| {
+                ed.cut(window, cx);
+                cx.stop_propagation()
+            }))
+            .on_action(window.listener_for(&entity, |ed: &mut CodeEditor, _: &Paste, window, cx| {
+                ed.paste(window, cx);
+                cx.stop_propagation()
+            }))
             .child(harea)
-            .vertical_scrollbar(&list_state)
-            .horizontal_scrollbar(&self.h_handle);
+            // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
+            // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
+            // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
+            // 空闲 2s 自动隐藏，用户误以为滚动条“时有时无/不准确”）。
+            .child(
+                div()
+                    .id("ce-vscrollbar-overlay")
+                    .debug_selector(|| "ce-vscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::vertical(&list_state)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ce-hscrollbar-overlay")
+                    .debug_selector(|| "ce-hscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::horizontal(&self.h_handle.clone())
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            );
 
         EditorElement::new(entity, core.into_any_element())
     }
@@ -1273,6 +1644,7 @@ fn row_element(rd: &RowData, rv: &RowView, ix: usize) -> gpui::Div {
             this.child(
                 div()
                     .absolute()
+                    .debug_selector(|| "ce-caret".into())
                     .top(px(0.))
                     .left(rv.gutter_width + px(rd.caret.unwrap_or(0.)))
                     .w(px(CARET_WIDTH_PX))
@@ -1361,5 +1733,44 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+
+        // 滚轮：在列表原生滚动之前拦截，把 Line 增量按「行高 × 3 行/格」折算成
+        // 像素再滚动（原生 List 用 20px/行 → 一格只见 ~1 行，太慢）。touchpad 的
+        // Pixels 增量原样透传。注册在 `inner.paint` 之后 → bubble 先于列表触发，
+        // `stop_propagation` 使列表原生 handler 不会二次滚动。
+        let editor = self.editor.clone();
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _, cx| {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            if !editor.read(cx).element_bounds.contains(&event.position) {
+                return;
+            }
+            let (line_h, char_w) = editor.read(cx).scroll_factors();
+            let (dx, dy) = match event.delta {
+                ScrollDelta::Pixels(p) => (p.x.as_f32(), p.y.as_f32()),
+                ScrollDelta::Lines(l) => {
+                    // Windows 一格已送 Lines(y=±3)：行高×3 ≈ 3 行/格（标准手感）。
+                    // 别再乘回 3，否则一格滚 ~9 行。
+                    const LINES_PER_NOTCH: f32 = 1.0;
+                    (
+                        l.x * char_w * LINES_PER_NOTCH,
+                        l.y * line_h * LINES_PER_NOTCH,
+                    )
+                }
+            };
+            editor.update(cx, |ed, cx| {
+                if dy != 0. {
+                    // gpui 滚轮约定：向下 = delta.y<0，而 ListState::scroll_by 直接
+                    // 加到偏移上（正值向下）。取反一下才和滚轮方向一致。
+                    ed.list_state.scroll_by(px(-dy));
+                }
+                if dx != 0. {
+                    ed.scroll_horizontal_px(dx);
+                }
+                cx.notify();
+            });
+            cx.stop_propagation();
+        });
     }
 }

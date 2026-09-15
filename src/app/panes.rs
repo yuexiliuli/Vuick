@@ -51,7 +51,9 @@ impl EditorApp {
                 );
         }
         let editor = self.tabs[self.active_tab].editor.clone();
-        let font_size = px(self.font_size);
+        // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
+        let font_size = self.font_size;
+        editor.update(cx, |ed, _| ed.set_font_override(Some(font_size)));
         div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
@@ -64,21 +66,14 @@ impl EditorApp {
             .bg(self.panel_bg())
             // 无边框、无圆角：编辑区占满整块区域，不留白
             .overflow_hidden()
-            // 从资源管理器拖入文件 → 打开（Input 本身不接收拖放）
+            // 从资源管理器拖入文件 → 打开（编辑器自身不接收拖放）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
             .on_drop(cx.listener(
                 |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
                     this.open_dropped_paths(paths, window, cx);
                 },
             ))
-            // 字号直接作用于编辑器自身：`Editor` 渲染时会显式设置 text_size，
-            // 会覆盖父级继承值，因此在此设 text_size 才真正生效。
-            .child(
-                Editor::new(&editor)
-                    .h(gpui::relative(1.))
-                    .bordered(false)
-                    .text_size(font_size),
-            )
+            .child(editor)
             // 透明覆盖层（画在编辑器之上，命中测试最靠前）：拦截 Ctrl+滚轮缩放。
             // 编辑器的自带滚动处理在内容溢出时会 stop_propagation()，父级监听收不到，
             // 因此必须用这个更靠前的覆盖层先处理。普通滚轮不拦截，仍传给下层编辑区滚动。

@@ -207,7 +207,7 @@ impl EditorApp {
     /// 把焦点还给当前激活选项卡的编辑区（编辑动作派发到 Input 上下文所需）。
     fn focus_active_editor(this: &mut Self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab) = this.tabs.get(this.active_tab) {
-            let focus = tab.editor.read(cx).focus_handle(cx);
+            let focus = tab.editor.read(cx).focus_handle();
             window.focus(&focus, cx);
         }
     }

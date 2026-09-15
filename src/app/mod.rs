@@ -33,7 +33,7 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, PromptLevel, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
-use gpui_component::input::{Editor, EditorState, InputEvent, InputState, Rope, TabSize};
+use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
 
 use crate::actions::*;
@@ -43,10 +43,10 @@ use crate::config::layout::{
 };
 use crate::scrollbar::TableScrollState;
 
-/// 一个文件选项卡：独立持有 gpui-component 的代码编辑器状态、文件路径与脏标记。
+/// 一个文件选项卡：独立持有自研编辑器组件状态、文件路径与脏标记。
 struct EditorTab {
-    /// 本选项卡的编辑区（gpui-component `EditorState`）。
-    editor: gpui::Entity<EditorState>,
+    /// 本选项卡的编辑区（[`crate::editor::CodeEditor`]）。
+    editor: gpui::Entity<crate::editor::CodeEditor>,
     /// 当前文件路径（None = 未命名）
     file_path: Option<PathBuf>,
     /// 内容自上次打开/保存后是否被修改
@@ -82,11 +82,9 @@ struct EditorTab {
     /// 编辑版本号：每次内容变更 +1。预览同步循环用它判断「扫描期间是否又有新编辑」，
     /// 从而在扫描结束后自动续跑合并，而不是丢给下一次按键才触发。
     edit_version: u64,
-    /// 编辑侧通道：最近一次 `InputEdit` 的字节区间 `(start, old_end, new_end)`。
-    /// 打字时由 Markdown 高亮器的 `update(Some(edit))` 写入（先于 `InputEvent::Change`）。
-    edit_tracker: crate::syntax::EditTracker,
     /// 去抖窗口内累积的「dirty 字节区间」（bounding box，当前文本字节坐标）：供
     /// [`crate::markdown::scan_blocks_incremental_rope`] 跳过 O(n) 快照 diff；同步取走时清空。
+    /// 数据来自 [`crate::editor::CodeEditor::take_last_edit`]（每轮 Change 取走）。
     preview_dirty: Option<(usize, usize)>,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
@@ -236,7 +234,7 @@ impl EditorApp {
     pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
         self.tabs
             .get(self.active_tab)
-            .map(|t| t.editor.read(cx).focus_handle(cx))
+            .map(|t| t.editor.read(cx).focus_handle())
             .unwrap_or_else(|| self.focus_handle.clone())
     }
 
@@ -307,8 +305,8 @@ impl EditorApp {
         // 关闭预览 → 恢复默认：Markdown 文件编辑区仍换行（md 默认），其余按全局偏好。
         let is_md = self.is_markdown_tab(idx);
         let wrap = preview_on || is_md || self.wrap_enabled;
-        self.tabs[idx].editor.update(cx, |ed, cx| {
-            ed.set_soft_wrap(wrap, window, cx);
+        self.tabs[idx].editor.update(cx, |ed, _cx| {
+            ed.set_soft_wrap(wrap);
         });
         if preview_on {
             self.sync_md_preview(idx, cx);
@@ -321,7 +319,7 @@ impl EditorApp {
     }
 
     /// 切换当前选项卡预览是否全屏占满（EPUB 阅读模式）。
-    fn toggle_preview_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_preview_fullscreen(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
         let (fullscreen, preview, editor) = {
             let Some(tab) = self.tabs.get_mut(idx) else {
@@ -340,15 +338,15 @@ impl EditorApp {
         } else {
             is_md || self.wrap_enabled
         };
-        editor.update(cx, |ed, cx| {
-            ed.set_soft_wrap(editor_wrap, window, cx);
+        editor.update(cx, |ed, _cx| {
+            ed.set_soft_wrap(editor_wrap);
         });
         cx.notify();
     }
 
     /// 切换当前选项卡编辑区的自动换行/不换行，并更新全局编辑器偏好。
     /// 只作用于编辑区；Markdown/EPUB 预览始终自动换行，不随此开关变化。
-    fn toggle_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
         let wrap_enabled = !self.wrap_enabled;
         self.wrap_enabled = wrap_enabled;
@@ -360,8 +358,8 @@ impl EditorApp {
             .unwrap_or(true)
         {
             if let Some(tab) = self.tabs.get(idx) {
-                tab.editor.update(cx, |ed, cx| {
-                    ed.set_soft_wrap(wrap_enabled, window, cx);
+                tab.editor.update(cx, |ed, _cx| {
+                    ed.set_soft_wrap(wrap_enabled);
                 });
             }
         }
@@ -809,10 +807,15 @@ impl Render for EditorApp {
                     .into_any_element()
             }
         } else {
+            // 无预览：编辑区占满剩余。必须 min_w(0)+overflow_hidden——
+            // 否则该容器 min-width:auto 被编辑器 980px 内容撑住，右侧溢出窗口
+            // 46px，编辑器元素右缘落在屏幕外 → 滚动条画在窗口外看不见。
             div()
                 .flex()
                 .flex_1()
                 .min_h(px(0.))
+                .min_w(px(0.))
+                .overflow_hidden()
                 .child(self.render_editor_pane(1.0, cx))
                 .into_any_element()
         };

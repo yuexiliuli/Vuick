@@ -7,7 +7,7 @@ use crate::editor::movement;
 use crate::editor::undo::EditIntent;
 use gpui::{
     AppContext, Context, Entity, IntoElement, Keystroke, Modifiers, MouseButton, Render,
-    TestAppContext, VisualTestContext, Window, point, px,
+    TestAppContext, VisualTestContext, Window, point, px, size,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +44,23 @@ fn buffer_line_index_matches_str_lines() {
             assert_eq!(b.line_start(i), expected_start, "line {i} start");
             assert_eq!(b.line_len(i), sl.len(), "line {i} len");
         }
+    }
+}
+
+#[test]
+fn buffer_display_line_count_matches_str_lines() {
+    // 显示语义 = str::lines()（尾换行不追加行）；编辑器模型 line_count() 含幻影尾行。
+    let cases = [
+        "", "a", "a\n", "a\nb", "a\nb\n", "a\nb\nc\n", "\n", "\n\n", "\r\n",
+        "a\r\nb", "a\r\nb\r\n", "中文\n第二行",
+    ];
+    for src in cases {
+        let b = Buffer::new(src);
+        // 应用侧显示口径 = str::lines() 取 `.max(1)`（空文本显示 1 行，见 app 状态栏/测试）。
+        let expected = src.lines().count().max(1);
+        assert_eq!(b.display_line_count(), expected, "display_line_count src={src:?}");
+        let phantoms = usize::from(!src.is_empty() && src.ends_with('\n'));
+        assert_eq!(b.line_count(), expected + phantoms, "line_count 应含幻影尾行 src={src:?}");
     }
 }
 
@@ -222,7 +239,7 @@ fn focus(host: &Entity<Host>, cx: &mut VisualTestContext) {
 }
 
 fn editor_text(host: &Entity<Host>, cx: &mut VisualTestContext) -> String {
-    cx.update(|_, cx| host.read(cx).ed.read(cx).text())
+    cx.update(|_, cx| host.read(cx).ed.read(cx).text_string())
 }
 
 fn editor_selection(host: &Entity<Host>, cx: &mut VisualTestContext) -> Selection {
@@ -241,6 +258,14 @@ fn editor_renders_list_and_rows(cx: &mut TestAppContext) {
         .expect("编辑器列表容器应渲染");
     assert!(wrap.size.height > px(0.));
     assert!(wrap.size.width > px(0.));
+    // 回归（2026-09-15 实机验证）：`list()` 必须 `.size_full()` 撑满容器。
+    // 否则 List 走 Infer 测量，高度=内容高，ListState 视口高=0，
+    // 整块编辑区不绘制任何行（编辑区空白、看似“无法编辑”）。
+    let viewport_h = cx.update(|_, cx| host.read(cx).ed.read(cx).list_viewport_height());
+    assert!(
+        viewport_h > 0.,
+        "list 视口应被撑满（viewport_h={viewport_h}），否则可见行数为 0"
+    );
     assert_eq!(editor_text(&host, cx), "第一行\n第二行\n第三行");
 }
 
@@ -316,4 +341,54 @@ fn mouse_click_places_caret_on_second_row(cx: &mut TestAppContext) {
     settle(&mut cx);
     let sel = editor_selection(&host, &mut cx);
     assert_eq!(sel.head(), "row0\n".len(), "应落到第 2 行行首");
+}
+
+#[gpui::test]
+fn caret_image_is_laid_out_when_focused(cx: &mut TestAppContext) {
+    let (host, mut cx) = open(cx, "abc\nxyz");
+    focus(&host, &mut cx);
+    settle(&mut cx);
+    // 回归（2026-09-15 实机）：光标此前画画的是 colors.accent（Light 主题 =#f5f5f5
+    // 白底近白 → 看不见）；这里断言光标元素真实布局出来，且尺寸 = 2px×行高。
+    let b = cx
+        .debug_bounds("ce-caret")
+        .expect("焦点状态下应渲染光标元素");
+    assert!(
+        b.size.width.as_f32() > 1.0 && b.size.height.as_f32() > 0.0
+            && b.origin.y < px(40.),
+        "光标应落在第 1 行、宽≥1px、高>0：{b:?}"
+    );
+}
+
+#[gpui::test]
+fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
+    // 回归（2026-09-15 实机）：gpui 在宽度变化时清空全部 size_hint，
+    // 未测条目高度按 0 计 → `max_offset_for_scrollbar()` 坍缩，滚动条量程失真。
+    // 编辑器应在坍缩后重挂统一高度提示，量程不被换宽清掉。
+    let text = (1..=300)
+        .map(|i| format!("第{i}行"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (host, mut cx) = open(cx, &text);
+    cx.simulate_resize(size(px(300.), px(600.)));
+    settle(&mut cx);
+    let mut last_max = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+    assert!(
+        last_max > 1000.,
+        "首次渲染量程应接近 300 行（last_max={last_max:.1}）"
+    );
+    // 再换两次宽 → 应自愈，量程保持。
+    for w in [440., 520.] {
+        cx.simulate_resize(size(px(w), px(600.)));
+        settle(&mut cx);
+        let m = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+        assert!(m > 1000., "换宽后量程不应坍缩（m={m:.1} w={w}）");
+        last_max = m;
+    }
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1);
+    assert!(
+        (last_max - (300.0 * lh - 600.0)).abs() < lh * 4.,
+        "量程应≈300×行高−视口高（{last_max:.1} vs {:.1}）",
+        300.0 * lh - 600.0
+    );
 }
