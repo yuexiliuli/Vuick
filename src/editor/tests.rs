@@ -308,10 +308,135 @@ fn highlight_window_aligned_to_base_for_batched_indexing() {
     }
 }
 
+/// 复现 gpui `StyledText::compute_runs` 的长度求和逻辑，验证「选区叠在语法段上」
+/// 是否把 run 总量撑爆（run 总长 > 文本长 → shape_text 按行尾截断 → 选区底色丢失）。
+/// 这正是 .rs（Rust 每行多段高亮）无法鼠标选择、而 .txt/.md（同字节无高亮）正常的原因。
+#[test]
+fn selection_run_must_not_oversubscribe_row() {
+    let text = "fn main() { // 注释";
+    let b = Buffer::new(text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let rows = hl.highlight_window(&b, 0, 0, 0).to_vec();
+    let runs = rows.get(0).cloned().unwrap_or_default();
+    assert!(!runs.is_empty(), "rust 行应有语法段");
+
+    // 选区整行选中（line-local 0..text.len()）
+    let sel = 0..text.len();
+
+    // —— gpui 路径（旧行为）：语法段 + 尾巴再附一个重叠选区段 ——
+    let mut old: Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> = Vec::new();
+    for (r, color) in &runs {
+        let s = r.start.min(text.len());
+        let e = r.end.min(text.len());
+        if e > s {
+            old.push((
+                s..e,
+                gpui::HighlightStyle {
+                    color: Some(*color),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    old.push((
+        sel.clone(),
+        gpui::HighlightStyle {
+            background_color: Some(gpui::rgb(0x0078d4).into()),
+            ..Default::default()
+        },
+    ));
+    // 复刻 compute_runs：逐条 push「gap + highlight.len」
+    let mut ix = 0usize;
+    let mut subscribed = 0usize;
+    for (range, _) in &old {
+        if ix < range.start {
+            subscribed += range.start - ix;
+        }
+        subscribed += range.len();
+        ix = range.end;
+    }
+    assert!(
+        subscribed > text.len(),
+        "旧路径必须超订（run 总长 {subscribed} > 行字节长 {}），否则本测试前提不成立",
+        text.len()
+    );
+}
+
+/// 修复后：`merge_highlights` 把语法段 + 选区合并成非重叠段，run 总量不再超订，
+/// 且选区范围整段都有选区底色（可被 gpui 画出）。
+#[test]
+fn merge_highlights_keeps_selection_within_line_and_non_overlapping() {
+    use gpui::HighlightStyle;
+
+    let text = "fn main() { // 注释";
+    let b = Buffer::new(text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let rows = hl.highlight_window(&b, 0, 0, 0).to_vec();
+    let runs = rows.get(0).cloned().unwrap_or_default();
+    assert!(!runs.is_empty(), "rust 行应有语法段");
+
+    let sel_bg = gpui::rgb(0x0078d4).opacity(0.28).into();
+    // 选区从中部到行尾（横跨多个语法段，正是旧的“重叠尾巴”场景）
+    let sel = 6..text.len();
+    let merged = crate::editor::view::merge_highlights(&runs, Some(sel.clone()), sel_bg);
+    assert!(!merged.is_empty(), "合并后应有段");
+
+    // 1) 非重叠且严格递增、都在行内
+    let mut prev_end = 0usize;
+    for (r, _) in &merged {
+        assert!(r.start >= prev_end, "段应非重叠有序: {r:?}");
+        assert!(r.end <= text.len(), "段应在行内: {r:?}");
+        prev_end = r.end;
+    }
+
+    // 2) 复刻 gpui compute_runs 的总量：不得超订
+    let mut ix = 0usize;
+    let mut subscribed = 0usize;
+    for (r, _) in &merged {
+        if ix < r.start {
+            subscribed += r.start - ix;
+        }
+        subscribed += r.len();
+        ix = r.end;
+    }
+    assert!(
+        subscribed <= text.len(),
+        "合并后 run 总量 {subscribed} 不得超过行字节长 {}",
+        text.len()
+    );
+
+    // 3) 选区整段都有背景色（语法色与背景色可并存）
+    for (r, st) in &merged {
+        if r.end <= sel.start || r.start >= sel.end {
+            continue;
+        }
+        assert!(
+            st.background_color == Some(sel_bg),
+            "选区段 {r:?} 应带背景色; style={:?}",
+            st
+        );
+    }
+    let covered: usize = merged
+        .iter()
+        .filter(|(r, st)| st.background_color == Some(sel_bg))
+        .map(|(r, _)| r.end.min(sel.end).saturating_sub(r.start.max(sel.start)))
+        .sum();
+    assert_eq!(
+        covered,
+        sel.end - sel.start,
+        "选区范围每个字节都应有背景色（covered={covered}）"
+    );
+
+    // 4) 无选区时，仅语法段、总量恰等于语法覆盖（仍不超订）
+    let plain = crate::editor::view::merge_highlights(&runs, None, sel_bg);
+    assert!(!plain.is_empty(), "无选区也应有语法段");
+}
+
 // ---------------------------------------------------------------------------
 // 视图
 // ---------------------------------------------------------------------------
-
 struct Host {
     ed: Entity<CodeEditor>,
 }
@@ -504,6 +629,48 @@ fn mouse_click_lands_on_cjk_char_boundaries(cx: &mut TestAppContext) {
         settle(&mut cx);
         let head = editor_selection(&host, &mut cx).head();
         assert_eq!(head, expected_head, "点击第 {k} 个全角字右边界应落在第 {k} 字后");
+    }
+}
+
+#[gpui::test]
+fn mouse_drag_selects_across_rows_rust_vs_plain(cx: &mut TestAppContext) {
+    // 复现调查：大文档测试.rs 无法鼠标选择、而 .txt/.md 正常。
+    // 组件内鼠标逻辑与语言无关，此测试把「带 Rust 高亮」与「纯文本」并排验证，
+    // 确认是否为语言/高亮路径引起。
+    for lang in [Some("rust"), Some("markdown"), None] {
+        let text = "fn main() {\n    let s = \"hello\";\n    // 注释\n}\n";
+        let (host, mut cx) = open(&mut *cx, text);
+        let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+        ed.update(cx, |ed, _| ed.set_language(lang));
+        focus(&host, &mut cx);
+        settle(&mut cx);
+        let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+        let (_, lh, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+        let x1 = cx.update(|window, cx| {
+            px(gutter + ed.read(cx).test_char_boundary_x(window, 0, 2))
+        });
+        let x2 = cx.update(|window, cx| {
+            px(gutter + ed.read(cx).test_char_boundary_x(window, 2, 3))
+        });
+        let y1 = px(lh * 0.5);
+        let y2 = px(lh * 2.5);
+        let mods = Modifiers::default();
+        cx.simulate_mouse_move(point(x1, y1), MouseButton::Left, mods);
+        cx.simulate_mouse_down(point(x1, y1), MouseButton::Left, mods);
+        cx.simulate_mouse_move(point(x2, y2), MouseButton::Left, mods);
+        cx.simulate_mouse_up(point(x2, y2), MouseButton::Left, mods);
+        settle(&mut cx);
+        let sel = editor_selection(&host, &mut cx);
+        assert!(
+            !sel.is_collapsed(),
+            "lang={lang:?}: 拖选应形成选区，sel={sel:?}"
+        );
+        assert_eq!(sel.range().start, 2, "lang={lang:?} 选区起点");
+        assert_eq!(
+            sel.range().end,
+            "fn main() {\n    let s = \"hello\";\n".len() + 3,
+            "lang={lang:?} 选区终点应在第 3 行第 4 字符后"
+        );
     }
 }
 

@@ -583,36 +583,26 @@ impl CodeEditor {
 
         // 语法着色：`hl_runs` 是已按整窗批量解析的窗口内本行范围，且是
         // **行内字节坐标**（syntect `parse_line` 相对本行文本），直接转样式段。
-        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-        for (r, color) in hl_runs {
-            let s = r.start.min(text.len());
-            let e = r.end.min(text.len());
-            if e > s {
-                highlights.push((
-                    s..e,
-                    HighlightStyle {
-                        color: Some(*color),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-
-        // 选区底色（本行与选区交叠）
-        if !self.selection.is_collapsed() {
+        // 注意：选区底色不能“附在语法段后面一并交出去”。gpui `StyledText`
+        // 的 `compute_runs` 假定各 highlight **互不重叠**；选区必然横跨多个语法段，
+        // 重叠会使 run 总量超出整行字节长（实测 42 > 18），`shape_text` 按行尾
+        // 截断 → 尾部选区整段被丢（选中不出高亮）。这解释了同一份内容
+        // `.txt/.md`（无语法段）可选、`.rs`（Rust 每行多段）“不可选择”。
+        // 这里把语法色与选区色**合并**成非重叠的连续段：每个单元被语法覆盖就上
+        // color、被选区覆盖就上 background_color。
+        let sel_range = if !self.selection.is_collapsed() {
             let sel = self.selection.range();
             let lo = sel.start.max(line_start);
             let hi = sel.end.min(line_end);
             if hi > lo {
-                highlights.push((
-                    (lo - line_start)..(hi - line_start),
-                    HighlightStyle {
-                        background_color: Some(self.sel_bg),
-                        ..Default::default()
-                    },
-                ));
+                Some((lo - line_start)..(hi - line_start))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
+        let highlights = merge_highlights(hl_runs, sel_range, self.sel_bg);
 
         // 光标：真实字形宽度（CJK 双宽不再按等宽列近似）→ 光标停在真实字符边界上
         // （横向滚动交给外层容器，行内文本从 x=0 全宽绘制，这里只算文本本地 x）。
@@ -1924,6 +1914,71 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
 
 fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
     StyledText::new(rd.text.clone()).with_highlights(rd.highlights.clone())
+}
+
+/// 把「语法着色段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
+/// 样式段，供 `StyledText` 使用。
+///
+/// 决不能把选区（通常横跨多个语法段）作为**重叠**的独立 highlight 附在语法段
+/// 后面：gpui `StyledText::compute_runs` 假定 highlight 互不重叠（`text.rs` 里
+/// 逐段按全长入 run，重叠会令 run 总长 > 行字节长），而 `shape_text` 消费到行尾
+/// 即停 → 尾部的选区整段被丢弃（选中底色不显示，表现为“语法高亮文件无法鼠标
+/// 选择”，同字节的 .txt/.md 因无语法段而正常）。
+///
+/// 这里把 0..行尾 按「语法段边界 ∪ 选区边界」切成连续单元，逐单元：语法覆盖
+/// 则写 `color`，选区覆盖则写 `background_color`。产出严格递增、不重叠、每段
+/// 都在行内，run 总量恰为各覆盖区间之和 ≤ 行字节长。
+pub(crate) fn merge_highlights(
+    runs: &[(Range<usize>, Hsla)],
+    sel: Option<Range<usize>>,
+    sel_bg: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    // 收集所有切分边界：语法段边界 ∪ 选区边界。
+    let mut bounds: Vec<usize> = Vec::with_capacity(runs.len() * 2 + 3);
+    for (r, _) in runs {
+        let s = r.start.min(r.end);
+        let e = r.end.max(r.start);
+        if e <= s {
+            continue;
+        }
+        bounds.push(s);
+        bounds.push(e);
+    }
+    if let Some(s) = &sel {
+        if s.end > s.start {
+            bounds.push(s.start);
+            bounds.push(s.end);
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for (i, a) in bounds.iter().copied().enumerate() {
+        let Some(&b) = bounds.get(i + 1) else { break };
+        if b <= a {
+            continue;
+        }
+        let mut style = HighlightStyle::default();
+        // 语法色：runs 互不重叠且升序，取首个覆盖 [a, b) 的段。
+        for (r, color) in runs {
+            if r.end <= a {
+                continue;
+            }
+            if r.start >= b {
+                break;
+            }
+            style.color = Some(*color);
+            break;
+        }
+        if sel.as_ref().is_some_and(|s| a >= s.start && b <= s.end) {
+            style.background_color = Some(sel_bg);
+        }
+        if style.color.is_some() || style.background_color.is_some() {
+            out.push((a..b, style));
+        }
+    }
+    out
 }
 
 /// 行号列渲染上下文（供 gutter 列表闭包只读捕获）。
