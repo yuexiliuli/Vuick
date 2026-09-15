@@ -35,20 +35,65 @@ use gpui::{
     ListState, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
+use gpui_component::input::Rope;
 use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
 
 use crate::config::limits::{WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS};
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parser::{
-    parse_block_window, parse_to_rows, rows_memory_estimate, scan_blocks, BlockIndex, BlockMeta,
-    Row, RowKind, RowPayload,
+    parse_block_window, parse_block_window_rope, parse_to_rows, rows_memory_estimate, scan_blocks,
+    BlockIndex, BlockMeta, Row, RowKind, RowPayload,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
 use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
 use row::render_row;
 use style::StyleParams;
+
+/// 预览的原始文本源。窗口级懒解析在滚动/重解析时要反复对**原文**切片，
+/// 因此预览侧保存的源可以是：
+/// - [`Self::Str`]：小文档/一次性喂入的 `SharedString`；
+/// - [`Self::Rope`]：编辑器正文 rope 的 O(1) COW 克隆（打字同步的主路径）——
+///   与编辑器共享底层块，不物化全文，快照可安全交后台线程。
+#[derive(Clone)]
+pub enum PreviewSrc {
+    Str(SharedString),
+    Rope(Rope),
+}
+
+impl PreviewSrc {
+    /// 源码字节数（内存估算用）。
+    pub fn len(&self) -> usize {
+        match self {
+            PreviewSrc::Str(s) => s.len(),
+            PreviewSrc::Rope(r) => r.len(),
+        }
+    }
+
+    /// 源码行数（诊断输出用；`Rope` 用与 `split('\n')` 一致的行数口径）。
+    pub fn line_count(&self) -> usize {
+        match self {
+            PreviewSrc::Str(s) => s.lines().count(),
+            PreviewSrc::Rope(r) => {
+                use gpui_component::input::RopeExt;
+                r.lines_len()
+            }
+        }
+    }
+}
+
+impl From<Rope> for PreviewSrc {
+    fn from(r: Rope) -> Self {
+        PreviewSrc::Rope(r)
+    }
+}
+
+impl From<SharedString> for PreviewSrc {
+    fn from(s: SharedString) -> Self {
+        PreviewSrc::Str(s)
+    }
+}
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {
@@ -97,8 +142,8 @@ pub struct MarkdownPreview {
     hint_recovered: bool,
     /// 大文档「窗口级懒解析」的整篇轻量块索引；`None` = 小文档走全量 `rows`。
     index: Option<Rc<BlockIndex>>,
-    /// 窗口模式下保留的原始 markdown（窗口重解析需要）。
-    src_buf: Option<SharedString>,
+    /// 窗口模式下保留的原始 markdown（窗口重解析需要）。rope COW 共享、不物化全文。
+    src_buf: Option<PreviewSrc>,
     /// 已物化窗口的全局块下标（`win_rows[0]` 对应第 `win_lo` 块）。
     win_lo: usize,
     /// 已物化的当前窗口行（全局块下标 `win_lo..win_lo+len`；窗口模式才有内容）。
@@ -309,16 +354,17 @@ impl MarkdownPreview {
 
     /// 设置预览源码（仅影响预览，原文不变）。块索引在调用内现算。
     pub fn set_source(&mut self, src: &str, cx: &mut App) {
-        self.set_source_with_index(SharedString::from(src), Rc::new(scan_blocks(src)), cx);
+        self.set_source_with_index(PreviewSrc::Str(SharedString::from(src)), Rc::new(scan_blocks(src)), cx);
     }
 
     /// 设置预览源码，但**复用外部预建的块索引**（异步打开时由后台线程扫好，
     /// 省掉 UI 线程上为了打开大文档做 `scan_blocks` 的几百毫秒）。
     ///
-    /// `src`/`index` 均为引用计数句柄：内部直接共享同一份（`SharedString` 是
-    /// `Arc<str>`、`Rc<BlockIndex>` 共享读取），**不再把 6.4MB 全文二次物化、
-    /// 也不再 try_unwrap 整份拷贝索引**——大文档每轮打字同步省掉两次 O(n)。
-    pub fn set_source_with_index(&mut self, src: SharedString, index: Rc<BlockIndex>, cx: &mut App) {
+    /// `src`/`index` 均为成本 O(1) 的句柄：内部直接共享同一份（`Rope` COW 克隆 /
+    /// `SharedString` 的 `Arc<str>`、`Rc<BlockIndex>` 共享读取）——**不把全文二次
+    /// 物化、也不整份拷贝索引**。打字同步主路径传 [`PreviewSrc::Rope`]（编辑器正文
+    /// 快照，O(1)），窗口模式按可见窗口从 rope 切片，驻留不随文档增长。
+    pub fn set_source_with_index(&mut self, src: PreviewSrc, index: Rc<BlockIndex>, cx: &mut App) {
         // 内容变了，旧的跳转高亮随之失效
         self.clear_highlight();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
@@ -326,8 +372,8 @@ impl MarkdownPreview {
         let prev_scroll = self.list_state.logical_scroll_top();
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
             // ---- 大文档：窗口级懒解析 ----
-            // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本，
-            // 渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
+            // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本（rope
+            // COW 共享、不物化全文），渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
             self.index = Some(index.clone());
             self.src_buf = Some(src.clone());
             self.win_lo = 0;
@@ -357,7 +403,7 @@ impl MarkdownPreview {
                 eprintln!(
                     "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 行未物化",
                     src.len(),
-                    src.lines().count(),
+                    src.line_count(),
                     n,
                     index_b / 1024,
                 );
@@ -367,8 +413,11 @@ impl MarkdownPreview {
             return;
         }
 
-        // ---- 小文档：全量路径（原有行为不变） ----
-        let mut parsed = parse_to_rows(src.as_ref());
+        // ---- 小文档：全量路径（原有行为不变；rope 源在此物化，但仅小文档、低频） ----
+        let mut parsed = match &src {
+            PreviewSrc::Str(s) => parse_to_rows(s.as_ref()),
+            PreviewSrc::Rope(r) => parse_to_rows(&r.to_string()),
+        };
         self.resolve_image_rows(&mut parsed);
         let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）
@@ -404,7 +453,7 @@ impl MarkdownPreview {
             eprintln!(
                 "[MD_MEM_DEBUG] preview set_source: 源 {} B / {} 行 → {} 渲染行, 估算驻留 {} KB",
                 src.len(),
-                src.lines().count(),
+                src.line_count(),
                 n,
                 bytes / 1024,
             );
@@ -517,7 +566,10 @@ impl MarkdownPreview {
         let margin = WINDOWED_OVERDRAW_BLOCKS.min(n / 2);
         let w_lo = want_lo.saturating_sub(margin);
         let w_hi = (want_hi + margin).min(n - 1);
-        let mut rows = parse_block_window(&src, &idx, w_lo, w_hi);
+        let mut rows = match &src {
+            PreviewSrc::Str(s) => parse_block_window(s, &idx, w_lo, w_hi),
+            PreviewSrc::Rope(r) => parse_block_window_rope(r, &idx, w_lo, w_hi),
+        };
         self.resolve_image_rows(&mut rows);
         self.win_lo = w_lo;
         self.win_rows = Rc::new(rows);

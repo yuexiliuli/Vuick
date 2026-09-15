@@ -79,15 +79,16 @@ impl EditorApp {
         let is_md = Self::is_markdown_path(p);
         // 大文档异步打开：把「预建的块索引」登记为增量基底，第一次编辑即可走
         // 增量扫描，而不是先全量扫一遍（打开当下编辑器 set_value 也会触发变更事件）。
-        let preview_seed: Option<(SharedString, std::rc::Rc<crate::markdown::BlockIndex>)> = if is_md
-        {
+        // 基底快照 = 该全文的 Rope：仅在打开时一次性构建（O(n)）；此后每轮打字同步
+        // 由同步循环换成编辑器正文 Rope 的 O(1) COW 克隆，这里只为「首轮即增量」垫底。
+        let preview_seed: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)> = if is_md {
             prebuilt_index
                 .as_ref()
-                .map(|ix| (SharedString::from(text.clone()), ix.clone()))
+                .map(|ix| (Rope::from(text.as_str()), ix.clone()))
         } else {
             None
         };
-        tab.preview_prev = preview_seed;
+        tab.preview_prev = preview_seed.clone();
         let t_editor = std::time::Instant::now();
         tab.editor.update(cx, |ed, cx| {
             ed.set_value(text.clone(), window, cx);
@@ -113,8 +114,12 @@ impl EditorApp {
                 // Markdown 默认/始终自动换行
                 view.set_wrap(true, cx);
                 if let Some(index) = prebuilt_index {
-                    // 复用后台预建的块索引（省 UI 线程几百 ms）
-                    view.set_source_with_index(SharedString::from(text.clone()), index, cx);
+                    // 复用后台预建的块索引（省 UI 线程几百 ms）；源传同一份 Rope 的 O(1) 克隆。
+                    let seed = preview_seed
+                        .as_ref()
+                        .map(|(r, _)| r.clone())
+                        .unwrap_or_else(Rope::new);
+                    view.set_source_with_index(crate::markdown::PreviewSrc::Rope(seed), index, cx);
                 } else {
                     view.set_source(&text, cx);
                 }

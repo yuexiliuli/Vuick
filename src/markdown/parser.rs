@@ -12,6 +12,7 @@ use std::ops::Range;
 use std::sync::OnceLock;
 
 use gpui::{Image, SharedString};
+use gpui_component::input::Rope;
 use regex::Regex;
 
 /// 渲染行类型。
@@ -778,6 +779,11 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
 /// 只在首个相异的块内逐字节定位——相对于逐字节迭代器（`zip().take_while()`）在
 /// debug 下慢 5~10 倍、release 下数倍。量级仍是 O(n)（要读全串找差异），但把
 /// 「背全文」的常数压到内存带宽级。
+///
+/// 生产路径已全部切到 [`scan_blocks_incremental_rope`]（按 dirty 区域切片，不再
+/// 全串比对）；本函数与 [`common_suffix_bytes`]、[`scan_blocks_incremental`] 仅
+/// 保留给测试/基准复用（str 路径的正确性安全网）。
+#[cfg(test)]
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
     const BLK: usize = 4096;
     let aa = a.as_bytes();
@@ -796,7 +802,8 @@ fn common_prefix_bytes(a: &str, b: &str) -> usize {
     i
 }
 
-/// 两字符串从后向前相同的字节数（公共后缀长度）。分块策略同上。
+/// 两字符串从后向前相同的字节数（公共后缀长度）。分块策略同上。测试/基准复用。
+#[cfg(test)]
 fn common_suffix_bytes(a: &str, b: &str) -> usize {
     const BLK: usize = 4096;
     let aa = a.as_bytes();
@@ -830,6 +837,10 @@ fn common_suffix_bytes(a: &str, b: &str) -> usize {
 /// 旧文本相同、且当前位置恰是旧索引的块边界」时截断并复用旧尾部（块结束必为 Normal
 /// 态、同字节 → 同分类，故复用安全）；对不上（如围栏边界跨变化区）就一直重扫到文末，
 /// 结果与全量 `scan_blocks` 逐字节一致——这是**正确性兜底**。变化区过大直接全扫。
+///
+/// 生产路径已改用 rope 版 [`scan_blocks_incremental_rope`]（快照 Rope::clone O(1) +
+/// 按 dirty 区域切片，不再对全串 split）；本 `&str` 版保留给测试/基准做正确性参照。
+#[cfg(test)]
 pub fn scan_blocks_incremental(
     prev_src: &str,
     prev: &BlockIndex,
@@ -880,12 +891,14 @@ pub fn scan_blocks_incremental(
     // 当前行的起始字节：锚点行起始 < b_first → 未变，直接复用旧索引的 byte。
     let anchor_byte = prev.blocks.get(bi).map(|b| b.byte as usize).unwrap_or(0);
 
-    // 未变前缀直接沿用；toc 同样取前缀
+    // 未变前缀直接沿用；toc 同样取前缀。注意 toc 行号是**源码行**坐标，不能用
+    // 块下标 `bi` 比较（围栏/表格是一块对应多行源码，两类坐标会漂移）：保留
+    // 所有「行号 < 重扫起点行号 anchor」的旧标题（重扫会重新产出其后的标题）。
     let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
     let mut toc: Vec<(usize, u8, String)> = prev
         .toc
         .iter()
-        .filter(|(r, _, _)| *r < bi)
+        .filter(|(r, _, _)| *r < anchor)
         .cloned()
         .collect();
 
@@ -1066,6 +1079,311 @@ pub fn scan_blocks_incremental(
     }
 }
 
+/// 全量扫描一个 **ropey Rope** 文本（打开/首同步/大变化兜底用）。
+///
+/// 全量扫描本身就是 O(n)，因此内部物化一次 `String` 后复用 [`scan_blocks`]；
+/// 单次 O(n) 物化只发生在「打开文档 / 预览首次同步 / 变化区过大」这类低频路径，
+/// 打字同步的热路径走的是下面的 [`scan_blocks_incremental_rope`]（按 dirty 区域
+/// 切片，O(k)）。传 `rope` 共享底层的快照更便宜（见 ropey COW 语义）。
+pub fn scan_blocks_rope(rope: &Rope) -> BlockIndex {
+    let text = rope.to_string();
+    scan_blocks(&text)
+}
+
+/// 两个 rope 的公共前缀字节数。只在 `dirty=None` 的快照 diff 兜底路径调用（O(n)，
+/// 与旧 `&str` 全串比对同量级），用 rope 的逐字节迭代器避免物化全文。
+fn common_prefix_bytes_rope(a: &Rope, b: &Rope) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    let mut ia = a.bytes();
+    let mut ib = b.bytes();
+    while i < n {
+        match (ia.next(), ib.next()) {
+            (Some(x), Some(y)) if x == y => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// 两个 rope 的公共后缀字节数（方向反转的逐字节迭代）。
+fn common_suffix_bytes_rope(a: &Rope, b: &Rope) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    let mut ia = a.bytes().reversed();
+    let mut ib = b.bytes().reversed();
+    while i < n {
+        match (ia.next(), ib.next()) {
+            (Some(x), Some(y)) if x == y => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// **预览增量解析（rope 版）**：语义与 `scan_blocks_incremental`（str 版，测试参照）
+/// 完全一致，但输入为 ropey `Rope` —— 从而 UI 线程快照可 `Rope::clone`（O(1) COW，
+/// 不物化全文），后台扫描也**不再对全串 split 建行表**：按 dirty 区/尾部对齐点从
+/// rope `slice` 出变化区域（O(k)）再对区域切片扫描。
+///
+/// 定位尾部对齐点的关键不变量（与 str 版逐行对齐等价）：
+/// dirty 之外新文本字节与旧文本相同，因此变化区之后的「第一条旧块边界」在旧坐标
+/// `ob ≥ tail_start_new - delta` 处，对应新坐标行首 `ob + delta`——增量扫描从锚点
+/// 行扫到该行首即可安全复用旧尾部 [`prev.blocks[pi..]`]（行号/字节整体平移）。
+/// 对齐假设不命中（罕见，如变化区横跨围栏导致边界漂移）则整轮回退全量扫描兜底。
+pub fn scan_blocks_incremental_rope(
+    prev_src: &Rope,
+    prev: &BlockIndex,
+    new_src: &Rope,
+    dirty: Option<Range<usize>>,
+) -> BlockIndex {
+    let old_len = prev_src.len();
+    let new_len = new_src.len();
+    let (tail_start_new, changed, b_first) = match dirty {
+        // 已知变化区间（new_src 坐标）→ 直接定位，跳过前后缀全串比对。
+        Some(r) => {
+            let dlo = r.start.min(new_len);
+            let dhi = r.end.min(new_len).max(dlo);
+            (dhi, dhi - dlo, dlo)
+        }
+        None => {
+            let cp = common_prefix_bytes_rope(prev_src, new_src);
+            let cs = common_suffix_bytes_rope(prev_src, new_src);
+            let tail_start_new = new_len.saturating_sub(cs);
+            let changed = new_len.saturating_sub(cp + cs);
+            if new_len == old_len && changed == 0 {
+                return prev.clone();
+            }
+            (tail_start_new, changed, cp)
+        }
+    };
+    if new_len == old_len && changed == 0 {
+        return prev.clone();
+    }
+    if changed >= old_len.max(new_len) / 2 {
+        return scan_blocks_rope(new_src);
+    }
+
+    let delta = new_len as i64 - old_len as i64;
+
+    // 锚点 = 旧索引中含首处变化字节的块（变化前字节/行号两边一致）。
+    let bi = prev
+        .blocks
+        .partition_point(|b| b.byte as usize <= b_first)
+        .saturating_sub(1);
+    let anchor = prev.blocks.get(bi).map(|b| b.src_line as usize).unwrap_or(0);
+    let anchor_byte = prev.blocks.get(bi).map(|b| b.byte as usize).unwrap_or(0);
+
+    // 未变前缀直接沿用；toc 同样取前缀（与 str 版相同的「源码行 vs 块下标」坐标
+    // 修正：按重扫起点 `anchor` 行号过滤，而非块下标 `bi`）。
+    let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
+    let mut toc: Vec<(usize, u8, String)> = prev
+        .toc
+        .iter()
+        .filter(|(r, _, _)| *r < anchor)
+        .cloned()
+        .collect();
+
+    // —— 只从 rope 切出「锚点到尾部对齐点」的变化区域（O(k)），不对全串 split ——
+    let tail_old = tail_start_new as i64 - delta; // 尾部起点映射到旧坐标
+    let pi = if tail_old <= old_len as i64 {
+        prev.blocks.partition_point(|b| (b.byte as i64) < tail_old)
+    } else {
+        prev.blocks.len()
+    };
+    let region_end = if pi < prev.blocks.len() {
+        // 第一条旧块边界 ≥ 尾部起点 → 新坐标行首即对齐点；夹紧到 [anchor_byte, new_len]
+        ((prev.blocks[pi].byte as i64 + delta).max(anchor_byte as i64)).min(new_len as i64)
+            as usize
+    } else {
+        // 尾部没有可用块边界 → 扫到文末（不复用，等价全量重扫）
+        new_len
+    };
+    let region = if region_end > anchor_byte {
+        new_src.slice(anchor_byte..region_end).to_string()
+    } else {
+        String::new()
+    };
+    let new_lines: Vec<&str> = region.split('\n').collect();
+    let region_bytes = region.len();
+
+    let mut idx = 0usize;
+    let mut cur_byte = 0u32; // 区域内（相对锚点）当前行起始字节
+    let mut reused = false;
+    while idx < new_lines.len() {
+        // —— 复用旧尾部的机会（absolute 坐标）——
+        let new_byte = anchor_byte + cur_byte as usize;
+        if new_byte >= tail_start_new {
+            let prev_off = new_byte as i64 - delta;
+            if (0..=old_len as i64).contains(&prev_off) {
+                let prev_off = prev_off as usize;
+                let pii = prev.blocks.partition_point(|b| (b.byte as usize) < prev_off);
+                if let Some(pb) = prev.blocks.get(pii) {
+                    if pb.byte as usize == prev_off {
+                        let prev_line = pb.src_line as usize;
+                        let line_shift = (anchor + idx) as i64 - prev_line as i64;
+                        for b in &prev.blocks[pii..] {
+                            let mut nb = *b;
+                            nb.src_line = (b.src_line as i64 + line_shift).max(0) as u32;
+                            nb.byte = (b.byte as i64 + delta).max(0) as u32;
+                            blocks.push(nb);
+                        }
+                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
+                            toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
+                        }
+                        reused = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // —— 否则与 `scan_blocks` 完全相同的切块逻辑（逐块消费 `idx`）——
+        let row_start = anchor + idx; // 文档绝对行号
+        let line = new_lines[idx].trim_end_matches('\r');
+        let t = line.trim_start();
+        let raw_len = line.len() as u32;
+        let blk_byte = (anchor_byte as u32).wrapping_add(cur_byte); // 文档绝对字节
+        if let Some((fc, _)) = fence_len(t) {
+            let mut code_lines = 0u32;
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            while idx < new_lines.len() {
+                let l = new_lines[idx].trim_end_matches('\r');
+                if let Some((c, _)) = fence_len(l.trim_start()) {
+                    if c == fc {
+                        idx += 1;
+                        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+                        break;
+                    }
+                }
+                code_lines += 1;
+                idx += 1;
+                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            }
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Code,
+                raw_len,
+                aux: code_lines,
+            });
+            continue;
+        }
+        if t.is_empty() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Blank,
+                raw_len: 0,
+                aux: 0,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        let hashes = t.chars().take_while(|&c| c == '#').count();
+        if (1..=6).contains(&hashes) && t.len() > hashes {
+            let text = inline_strip(t[hashes..].trim_start()).to_string();
+            toc.push((row_start, hashes as u8, text));
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Heading(hashes as u8),
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        if t.starts_with('>') {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Quote,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        if list_prefix(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Bullet,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        if is_rule(t) {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Rule,
+                raw_len,
+                aux: 0,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        if parse_image_line(t).is_some() {
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Image,
+                raw_len,
+                aux: 1,
+            });
+            idx += 1;
+            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            continue;
+        }
+        if let Some((table, consumed)) = try_parse_table(&new_lines, idx) {
+            for _ in 0..consumed {
+                idx += 1;
+                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+            }
+            blocks.push(BlockMeta {
+                src_line: row_start as u32,
+                byte: blk_byte,
+                kind: RowKind::Table,
+                raw_len,
+                aux: table.rows.len() as u32,
+            });
+            continue;
+        }
+        blocks.push(BlockMeta {
+            src_line: row_start as u32,
+            byte: blk_byte,
+            kind: RowKind::Paragraph,
+            raw_len,
+            aux: 0,
+        });
+        idx += 1;
+        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+    }
+    debug_assert!(
+        reused || idx >= new_lines.len(),
+        "增量扫描要么对齐复用旧尾部、要么扫完新文本"
+    );
+    if !reused && region_end < new_len {
+        // 对齐假设未命中（如变化区横跨围栏导致边界漂移）→ 全量兜底保证与
+        // [`scan_blocks`] 逐字节一致（区域切片只覆盖到假设对齐点，不能丢）。
+        return scan_blocks_rope(new_src);
+    }
+    BlockIndex {
+        blocks,
+        toc,
+    }
+}
+
 /// 从行 `i` 的起始字节推进到下一行的起始字节（+行长+换行符；末行无换行时
 /// clamp 到 `new_len`，哨兵多算的 1 字节只会让尾部复用更早就触发、不会越界）。
 fn next_line_byte(new_lines: &[&str], cur: u32, i: usize, new_len: usize) -> u32 {
@@ -1104,6 +1422,46 @@ pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -
     let rows = parse_to_rows(&src[start..end]);
     debug_assert_eq!(rows.len(), hi - lo + 1, "窗口重解析行数必须与块数一致");
     // 窗口内 parse 的行号是"切片相对"的，平移到文档坐标（与块索引一致）
+    let base_line = index.blocks[lo].src_line as usize;
+    if base_line != 0 {
+        let mut rows = rows;
+        for r in &mut rows {
+            r.src_line += base_line;
+        }
+        rows
+    } else {
+        rows
+    }
+}
+
+/// rope 版 [`parse_block_window`]：块边界/行号/字节语义完全一致，只是输入为
+/// ropey `Rope`——窗口只 `slice`（O(log n)）到可见区间（≤ 过扫块数），再 `to_string`
+/// 物化该小块交给 [`parse_to_rows`]。窗口级懒解析路径不必再驻留整篇 6.4MB 的
+/// `SharedString`（src_buf 改持 `Rope`，与编辑器 COW 共享底层，clone O(1)）。
+pub fn parse_block_window_rope(rope: &Rope, index: &BlockIndex, lo: usize, hi: usize) -> Vec<Row> {
+    if index.blocks.is_empty() {
+        return Vec::new();
+    }
+    let n = index.blocks.len();
+    let lo = lo.min(n - 1);
+    let hi = hi.min(n - 1);
+    if lo > hi {
+        return Vec::new();
+    }
+    let start = index.blocks[lo].byte as usize;
+    let mut end = if hi + 1 < n {
+        index.blocks[hi + 1].byte as usize
+    } else {
+        rope.len()
+    };
+    // 切片到"下一块首行"处会带上最后一块的换行符：`split('\n')` 会多造一个
+    // 代表"下一行"的空元素 → 多出幻影空行。裁掉这 1 个 '\n' 即精确到块边界。
+    if end < rope.len() && rope.get_byte(end.saturating_sub(1)) == Some(b'\n') {
+        end = end.saturating_sub(1);
+    }
+    let region = rope.slice(start..end).to_string();
+    let rows = parse_to_rows(&region);
+    debug_assert_eq!(rows.len(), hi - lo + 1, "窗口重解析行数必须与块数一致");
     let base_line = index.blocks[lo].src_line as usize;
     if base_line != 0 {
         let mut rows = rows;
@@ -1390,6 +1748,47 @@ mod tests {
         }
     }
 
+    /// rope 版窗口重解析（[`parse_block_window_rope`]）必须与 str 版逐行一致——
+    /// 覆盖窗口模式的「从 Rope 按块字节边界切片」路径（视图 src_buf 改持 Rope 后
+    /// 滚动重解析的全部走这里）。
+    #[test]
+    fn rope_block_window_matches_str_window() {
+        let block = "# 一级标题\n\n正文段落，`code` 与 **bold**\n\n- 列表一\n- 列表二\n\n> 引述\n\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 型号 | 尺寸 |\n| :--- | ---: |\n| A | 10 |\n| B | 20 |\n\n![插图](images/x.png)\n\n后文\n";
+        let mut src = String::from(block);
+        for i in 0..60 {
+            src.push_str(&format!("# 章节 {i}\n\n段落与 `code` [链接](https://x)\n\n"));
+        }
+        let rope = Rope::from(src.as_str());
+        let idx_str = scan_blocks(&src);
+        let idx_rope = scan_blocks_rope(&rope);
+        assert_eq!(idx_rope.blocks, idx_str.blocks, "rope 全量索引与 str 一致");
+        assert_eq!(idx_rope.toc, idx_str.toc);
+
+        let n = idx_str.blocks.len();
+        for (lo, hi) in [
+            (0, 4_usize),
+            (n / 2 - 2, n / 2 + 3),
+            (n.saturating_sub(5), n - 1),
+        ] {
+            if lo > hi || hi >= n {
+                continue;
+            }
+            let ws = parse_block_window(&src, &idx_str, lo, hi);
+            let wr = parse_block_window_rope(&rope, &idx_rope, lo, hi);
+            assert_eq!(wr.len(), ws.len(), "rope 窗口 {lo}..={hi} 行数");
+            for (r, s) in wr.iter().zip(&ws) {
+                assert_eq!(r.src_line, s.src_line);
+                assert_eq!(r.kind, s.kind);
+                assert_eq!(r.text.as_ref(), s.text.as_ref());
+                assert_eq!(
+                    r.code_lines().len(),
+                    s.code_lines().len(),
+                    "rope 窗口 {lo}..={hi} code 行数"
+                );
+            }
+        }
+    }
+
     /// 基准：解析结果的驻留内存放大倍数（打印，不构成断言；`--ignored` 运行）。
     ///
     /// 运行：`cargo test --release -- --ignored bench_row_parse_memory --nocapture`
@@ -1663,8 +2062,306 @@ mod tests {
         run("去围栏", base.clone(), { let mut v = base.clone(); let at = v.find("```rust").unwrap(); v.replace_range(at..at + 3, "kok"); v });
     }
 
+    /// ropey `Rope` 必须 `Send + Sync`（快照交后台线程扫描的前提），且 `clone` 为
+    /// O(1) COW（不物化全文）。编译期 + 运行期断言。
+    #[test]
+    fn rope_is_send_sync_clone_cheap() {
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<Rope>();
+        let a = Rope::from("hello 中文，多行\n第二行\n");
+        let b = a.clone();
+        assert_eq!(a.to_string(), b.to_string(), "COW 克隆内容一致");
+        assert_eq!(a.len(), b.len());
+    }
+
+    /// rope 版增量索引必须与 rope 全量扫描逐字节一致（blocks / toc）——这是
+    /// 「按 dirty 区域切片 + 尾部对齐复用」路径的正确性安全网。复现 str 版的
+    /// 全部编辑场景（含跨帧累积、同帧多处编辑、精确/膨胀 dirty）。
+    #[test]
+    fn incremental_rope_with_dirty_equals_full_scan() {
+        let base = String::from("# 标题\n> 引用\n- 列表\n\n```rust\nfn f() {}\nlet s = \"x\";\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n末段与[链接](https://x) 结尾\n");
+        let run = |name: &str, prev_src: String, new_src: String| {
+            let prev_rope = Rope::from(prev_src.as_str());
+            let prev = scan_blocks_rope(&prev_rope);
+            let new_rope = Rope::from(new_src.as_str());
+            let cp = common_prefix_bytes(&prev_src, &new_src);
+            let cs = common_suffix_bytes(&prev_src, &new_src);
+            let exact = cp..(new_src.len() - cs);
+            for (tag, dirty) in [
+                ("精确", exact.clone()),
+                ("膨胀", (exact.start.saturating_sub(6))..(exact.end + 6).min(new_src.len())),
+            ] {
+                let inc = scan_blocks_incremental_rope(&prev_rope, &prev, &new_rope, Some(dirty));
+                let full = scan_blocks_rope(&new_rope);
+                assert!(
+                    inc.blocks == full.blocks && inc.toc == full.toc,
+                    "{name}/{tag} 不一致\nprev_len={} new_len={} dirty={:?}\ninc_blocks={:?}\nfull_blocks={:?}",
+                    prev_src.len(),
+                    new_src.len(),
+                    exact,
+                    inc.blocks,
+                    full.blocks,
+                );
+            }
+        };
+
+        // 连续两次编辑构造两帧（去抖窗口内多次编辑的真实场景）
+        let mut frame1 = base.clone();
+        let mut frame2 = base.clone();
+        let a = frame1.find("fn f").unwrap() + 4;
+        frame1.insert_str(a, "g");
+        let a = frame2.find("fn f").unwrap() + 4;
+        frame2.insert_str(a, "g");
+        frame2.insert_str(frame2.find("结尾").unwrap(), "XYZ");
+        run("两帧累积", frame1, frame2);
+
+        // 同帧多处编辑（dirty 须覆盖全部变化点）
+        run("两处编辑", base.clone(), {
+            let mut v = base.clone();
+            v.insert_str(v.find("| a").unwrap() + 2, "XX");
+            v.insert_str(v.find("结尾").unwrap(), "YY");
+            v
+        });
+
+        // 单编辑场景
+        run("文末追加", base.clone(), { let mut v = base.clone(); v.push_str("\n尾行"); v });
+        run("中部删字", base.clone(), { let mut v = base.clone(); v.remove(v.find("结尾").unwrap()); v });
+        run("中部插字", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "XYZ"); v });
+        run("插整段", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n\n新段落\n"); v });
+        run("拆行", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n"); v });
+        run("合并行", base.clone(), { let mut v = base.clone(); let at = v.rfind('\n').unwrap(); v.remove(at); v });
+        run("表头改", base.clone(), { let mut v = base.clone(); let at = v.find("| a ").unwrap(); v.replace_range(at..at + 4, "| ah"); v });
+        run("围栏内改", base.clone(), { let mut v = base.clone(); v.replace_range(v.find("fn f").unwrap() + 4..v.find("fn f").unwrap() + 7, "g()"); v });
+        run("去围栏", base.clone(), { let mut v = base.clone(); let at = v.find("```rust").unwrap(); v.replace_range(at..at + 3, "kok"); v });
+    }
+
+    /// rope 版 `dirty=None` 的快照 diff 兜底路径 + 「未变文本零重扫」——
+    /// 与 str 版行为一致。
+    #[test]
+    fn incremental_rope_noop_and_snapshot_diff_fallback() {
+        // 未变 → 直接返回旧索引
+        let src = Rope::from("# 标题\n正文\n");
+        let prev = scan_blocks_rope(&src);
+        let inc = scan_blocks_incremental_rope(&src, &prev, &src, None);
+        assert_eq!(inc.blocks, prev.blocks);
+        assert_eq!(inc.toc, prev.toc);
+
+        // dirty=None 兜底：真实编辑，靠前后缀 diff 定位变化区
+        let prev_src = Rope::from("# 标题\n> 引用\n普通段落与 `code` [链接](https://x) 结尾\n");
+        let prev = scan_blocks_rope(&prev_src);
+        let mut text = prev_src.to_string();
+        let at = text.find("普通段落").unwrap() + 3;
+        text.insert_str(at, "ABC");
+        let new = Rope::from(text.as_str());
+        let inc = scan_blocks_incremental_rope(&prev_src, &prev, &new, None);
+        let full = scan_blocks_rope(&new);
+        assert!(
+            inc.blocks == full.blocks && inc.toc == full.toc,
+            "dirty=None 兜底不一致\ninc_blocks={:?}\nfull_blocks={:?}",
+            inc.blocks,
+            full.blocks,
+        );
+    }
+
+    /// 基准（--ignored）：rope 化「打字同步每轮」成本对比——旧 str 路径（`value()`
+    /// 物化 6.4MB + 增量扫描对全串 split）vs 新 rope 路径（Rope::clone O(1) + 按 dirty
+    /// 区域切片）。与 handoff 3.1 同量级的大文档（≈6MB/14 万行），打印不断言。
+    #[test]
+    #[ignore]
+    fn bench_rope_incremental_vs_old_str_snapshot() {
+        use std::time::Instant;
+        let block = "# 章节标题\n\n正文段落，包含 `行内代码` 与 **加粗** 和 [链接](https://x.y)。\n\n- 列表项一\n- 列表项二\n\n| 列A | 列B |\n| --- | --- |\n| 值1 | 值2 |\n\n```rust\nfn main() { println!(\"hi\"); }\n```\n";
+        let mut text = String::new();
+        while text.len() < 6_000_000 {
+            text.push_str(block);
+        }
+        let n_lines = text.lines().count();
+        let prev_str = text.clone();
+        let prev_rope = Rope::from(prev_str.as_str());
+        let prev = scan_blocks(&prev_str);
+
+        // 每次在文档中部插 6 字节（模拟打字），dirty 形如 (at..at+6)；
+        // 插入点取字节边界（真实 InputEdit 的 dirty 区间恒为字符边界）。
+        let at = text.find("，包含").unwrap();
+        let mut new = text.clone();
+        new.insert_str(at, "ABCXYZ");
+        let rope = Rope::from(new.as_str());
+        let dirty_range = at..(at + 6);
+
+        // 快照成本：旧 `value()`（String 物化/克隆）vs 新 `Rope::clone`（O(1) COW）
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..50 {
+            let s = prev_str.to_string();
+            sink += s.len();
+        }
+        let value_ms = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+        let t = Instant::now();
+        for _ in 0..50 {
+            let r = prev_rope.clone();
+            sink += r.len();
+        }
+        let rope_ms = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+
+        // 增量扫描：旧 str（全串 split 建行表）vs 新 rope（只切 dirty 区域）
+        let t = Instant::now();
+        let mut sum_blocks = 0usize;
+        for _ in 0..50 {
+            let idx = scan_blocks_incremental(&prev_str, &prev, &new, Some(dirty_range.clone()));
+            sum_blocks += idx.blocks.len();
+        }
+        let str_inc_ms = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+        let t = Instant::now();
+        for _ in 0..50 {
+            let idx =
+                scan_blocks_incremental_rope(&prev_rope, &prev, &rope, Some(dirty_range.clone()));
+            sum_blocks += idx.blocks.len();
+        }
+        let rope_inc_ms = t.elapsed().as_secs_f64() * 1000.0 / 50.0;
+
+        println!(
+            "大文档 {} 行 / {:.1} MB：快照 value()/String 物化 {:.3} ms vs Rope::clone {:.3} ms（{:.0}x）；增量 str(全串split) {:.3} ms vs rope(区域切片) {:.3} ms；每轮合计 str {:.3} ms vs rope {:.3} ms（{:.1}x）",
+            n_lines,
+            text.len() as f64 / 1e6,
+            value_ms,
+            rope_ms,
+            value_ms / rope_ms.max(1e-9),
+            str_inc_ms,
+            rope_inc_ms,
+            str_inc_ms + value_ms,
+            rope_inc_ms + rope_ms,
+            (str_inc_ms + value_ms) / (rope_inc_ms + rope_ms).max(1e-9),
+        );
+        assert!(sum_blocks > 0, "sink {}", sink);
+    }
+
+    /// 回归：增量 toc 前缀过滤曾用「块下标 `bi`」去比较**源码行号**。围栏（一块对
+    /// 应多行源码）会让两类坐标漂移：文档中部某标题的源码行号 > 它前方的块数。
+    /// 末尾追加时，如果该标题在重扫起点之前（应保留），旧过滤器却把它误丢 →
+    /// 增量 toc 与全量不一致（str 与 rope 两条增量路径都曾受影响）。
+    #[test]
+    fn toc_prefix_uses_source_line_not_block_index() {
+        // 500 行围栏（1 块）→「前置标题」（行号很大、块下标很小）→ 若干单行段落块
+        let mut src = String::from("```rust\n");
+        for i in 0..500 {
+            src.push_str(&format!("// 第 {i} 行\n"));
+        }
+        src.push_str("```\n");
+        src.push_str("# 前置标题\n");
+        for i in 0..500 {
+            src.push_str(&format!("正文行 {i}\n"));
+        }
+        src.push('\n');
+        let base = scan_blocks(&src);
+        assert!(
+            base.toc.iter().any(|(_, _, t)| t == "前置标题"),
+            "前置标题应在 toc"
+        );
+
+        // 末尾追加新标题：锚点 = 末尾空块，其块下标 ≈ 502 > 前置标题行号 502 附近
+        let mut new = src.clone();
+        new.push_str("# 追加标题\n正文追加\n");
+        let dirty = src.len()..new.len();
+        let full = scan_blocks(&new);
+
+        let str_prev = base.clone();
+        let inc = scan_blocks_incremental(&src, &str_prev, &new, Some(dirty.clone()));
+        assert!(
+            inc.blocks == full.blocks && inc.toc == full.toc,
+            "str 版 toc 前缀过滤不应丢标题\ninc_toc={:?}\nfull_toc={:?}",
+            inc.toc,
+            full.toc,
+        );
+
+        let prev_rope = Rope::from(src.as_str());
+        let prev = scan_blocks_rope(&prev_rope);
+        let new_rope = Rope::from(new.as_str());
+        let inc = scan_blocks_incremental_rope(&prev_rope, &prev, &new_rope, Some(dirty));
+        assert!(
+            inc.blocks == full.blocks && inc.toc == full.toc,
+            "rope 版 toc 前缀过滤不应丢标题\ninc_toc={:?}\nfull_toc={:?}",
+            inc.toc,
+            full.toc,
+        );
+    }
+
+    /// 基准（--ignored）：复刻 handoff §3.1 的方法——对参考文件 `target/大文档测试.md`
+    /// （6.4MB / ≈17 万行）连续做 **1000 次文末插入**，对比 str 路径（`value()`
+    /// String 物化 + 增量扫描全串 split）与新 rope 路径（Rope::clone O(1) + 增量
+    /// 扫描区域切片），每轮取 dirty，最终与全量扫描逐字节校验。打印、不断言。
+    #[test]
+    #[ignore]
+    fn bench_1000_inserts_on_reference_doc() {
+        use std::time::Instant;
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/大文档测试.md"
+        ));
+        if !path.exists() {
+            eprintln!("跳过：缺少参考文件 {path:?}");
+            return;
+        }
+        let text = std::fs::read_to_string(path).expect("参考文件读取失败");
+        let n_inserts = 1000usize;
+
+        // —— 旧 str 路径：每轮 value()（String 物化）+ 增量扫描（全串 split）——
+        let mut cur = text.clone();
+        let mut prev = scan_blocks(&cur);
+        let mut str_total = std::time::Duration::ZERO;
+        let t0 = Instant::now();
+        for i in 0..n_inserts {
+            let old_len = cur.len();
+            let mut next = cur.clone();
+            next.push_str(&format!("\n# 追加基准段 {i}\n正文 `code` 与[链接](https://x)\n"));
+            let dirty = old_len..next.len();
+            let t = Instant::now();
+            let inc = scan_blocks_incremental(&cur, &prev, &next, Some(dirty));
+            str_total += t.elapsed();
+            if i % 100 == 99 {
+                let full = scan_blocks(&next);
+                assert!(inc.blocks == full.blocks && inc.toc == full.toc, "str 第 {i} 轮不一致");
+            }
+            cur = next;
+            prev = inc;
+        }
+        println!(
+            "旧 str（value+split+增量）: {} 次文末插入共 {:.1} s，扫描累计 {:.1} ms/次",
+            n_inserts,
+            t0.elapsed().as_secs_f64(),
+            str_total.as_secs_f64() * 1000.0 / n_inserts as f64,
+        );
+
+        // —— 新 rope 路径：每轮 Rope::clone（O(1)）+ 增量扫描（区域切片）——
+        let mut cur = Rope::from(text.as_str());
+        let mut prev = scan_blocks_rope(&cur);
+        let mut rope_total = std::time::Duration::ZERO;
+        let t0 = Instant::now();
+        for i in 0..n_inserts {
+            let old_len = cur.len();
+            let mut next = cur.clone();
+            next.insert(old_len, &format!("\n# 追加基准段 {i}\n正文 `code` 与[链接](https://x)\n"));
+            let dirty = old_len..next.len();
+            let t = Instant::now();
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &next, Some(dirty));
+            rope_total += t.elapsed();
+            if i % 100 == 99 {
+                let full = scan_blocks_rope(&next);
+                assert!(inc.blocks == full.blocks && inc.toc == full.toc, "rope 第 {i} 轮不一致");
+            }
+            cur = next;
+            prev = inc;
+        }
+        println!(
+            "新 rope（clone+区域切片+增量）: {} 次文末插入共 {:.1} s，扫描累计 {:.1} ms/次",
+            n_inserts,
+            t0.elapsed().as_secs_f64(),
+            rope_total.as_secs_f64() * 1000.0 / n_inserts as f64,
+        );
+    }
+
     /// 基准（--ignored）：大文档小编辑时，增量（dirty 侧通道 vs 快照 diff）vs
-    /// 全量扫描耗时对比（打印、不断言）。    #[test]
+    /// 全量扫描耗时对比（打印、不断言）。
+    #[test]
     #[ignore]
     fn bench_incremental_vs_full_scan() {
         use std::time::Instant;

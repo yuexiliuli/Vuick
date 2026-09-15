@@ -45,7 +45,7 @@ use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES, SYNC_MAX_PARSE_LINES
 /// （`replace_text_in_range` 内 `drive_highlighter` → `emit(Change)`），因此
 /// 「读一次并清空」与 Change 事件严格 1:1；`set_value`/undo/redo 走 silent 路径
 /// 不发射 Change，不会污染。去抖窗口内多次编辑由预览同步（`app::tabs`）按字节
-/// 坐标累积成 **dirty 区间**，喂给 [`crate::markdown::scan_blocks_incremental`]
+/// 坐标累积成 **dirty 区间**，喂给 [`crate::markdown::scan_blocks_incremental_rope`]
 /// 跳过 O(n) 快照 diff。
 pub(crate) type EditTracker = Rc<std::cell::RefCell<Option<(usize, usize, usize)>>>;
 

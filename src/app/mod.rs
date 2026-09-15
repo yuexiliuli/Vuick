@@ -33,7 +33,7 @@ use gpui::{
     Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, PromptLevel, Render,
     SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
 };
-use gpui_component::input::{Editor, EditorState, InputEvent, InputState, TabSize};
+use gpui_component::input::{Editor, EditorState, InputEvent, InputState, Rope, TabSize};
 use gpui_component::{Icon, IconName};
 
 use crate::actions::*;
@@ -75,9 +75,10 @@ struct EditorTab {
     /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
-    /// 预览**增量解析**的基底：上次同步的整篇快照与其块索引。下一次去抖后用
-    /// [`crate::markdown::scan_blocks_incremental`] 复用（只重扫变化区）。
-    preview_prev: Option<(SharedString, std::rc::Rc<crate::markdown::BlockIndex>)>,
+    /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
+    /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
+    /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
+    preview_prev: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)>,
     /// 编辑版本号：每次内容变更 +1。预览同步循环用它判断「扫描期间是否又有新编辑」，
     /// 从而在扫描结束后自动续跑合并，而不是丢给下一次按键才触发。
     edit_version: u64,
@@ -85,7 +86,7 @@ struct EditorTab {
     /// 打字时由 Markdown 高亮器的 `update(Some(edit))` 写入（先于 `InputEvent::Change`）。
     edit_tracker: crate::syntax::EditTracker,
     /// 去抖窗口内累积的「dirty 字节区间」（bounding box，当前文本字节坐标）：供
-    /// [`crate::markdown::scan_blocks_incremental`] 跳过 O(n) 快照 diff；同步取走时清空。
+    /// [`crate::markdown::scan_blocks_incremental_rope`] 跳过 O(n) 快照 diff；同步取走时清空。
     preview_dirty: Option<(usize, usize)>,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,

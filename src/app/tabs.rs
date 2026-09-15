@@ -3,7 +3,7 @@
 use super::*;
 use gpui_component::input::RopeExt;
 use crate::config::timing::{PREVIEW_DEBOUNCE_MS, TAB_HSCROLL_HIDE_MS};
-use crate::markdown::{scan_blocks, scan_blocks_incremental};
+use crate::markdown::{PreviewSrc, scan_blocks_incremental_rope, scan_blocks_rope};
 use crate::scrollbar::horizontal_scrollbar;
 
 impl EditorApp {
@@ -78,7 +78,7 @@ impl EditorApp {
                     // 一次同步任务里循环「等待 → 快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
                     // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
                     // （`preview_syncing` 闸门），且从「最后一次按键」起约 200ms+扫描时间即收敛。
-                    // 大文档用**增量扫描**（[`scan_blocks_incremental`]，复用上一版索引只重扫
+                    // 大文档用**增量扫描**（[`scan_blocks_incremental_rope`]，复用上一版索引只重扫
                     // 变化区，16 万行从几百 ms 降到几十 ms）在后台线程做，UI 线程只留快照/装配。
                     if tab.preview_on && !this.preview_pending && !this.preview_syncing {
                         this.preview_pending = true;
@@ -107,7 +107,7 @@ impl EditorApp {
                                                 .tabs
                                                 .get(this.active_tab)
                                                 .filter(|t| t.preview_on)
-                                                .map(|t| t.editor.read(cx).value());
+                                                .map(|t| t.editor.read(cx).text().clone());
                                             let prev = this
                                                 .tabs
                                                 .get(this.active_tab)
@@ -133,6 +133,9 @@ impl EditorApp {
                                 // 2) 后台线程：增量（有上一版）或全量扫描。
                                 //    有 dirty → 增量扫描跳过 O(n) 快照 diff（O(k)）；
                                 //    无 dirty（首轮 / 高亮器未装）→ 走快照 diff 兜底。
+                                //    快照 = 编辑器 Rope 的 O(1) COW 克隆（不物化 6.4MB 全文），
+                                //    后台扫描只按 dirty 区从 rope 切片（见
+                                //    scan_blocks_incremental_rope），UI 线程不再背全文。
                                 let index = match &prev {
                                     Some((p_src, p_idx)) => {
                                         let p_src = p_src.clone();
@@ -143,10 +146,10 @@ impl EditorApp {
                                         let dirty = dirty.map(|(a, b)| a..b);
                                         cx.background_executor()
                                             .spawn(async move {
-                                                scan_blocks_incremental(
-                                                    p_src.as_ref(),
+                                                scan_blocks_incremental_rope(
+                                                    &p_src,
                                                     &p_idx,
-                                                    snap.as_ref(),
+                                                    &snap,
                                                     dirty,
                                                 )
                                             })
@@ -155,7 +158,7 @@ impl EditorApp {
                                     None => {
                                         let snap = snapshot.clone();
                                         cx.background_executor()
-                                            .spawn(async move { scan_blocks(snap.as_ref()) })
+                                            .spawn(async move { scan_blocks_rope(&snap) })
                                             .await
                                     }
                                 };
@@ -176,7 +179,7 @@ impl EditorApp {
                                                     view.set_background(panel_bg);
                                                     view.set_base_dir(base_dir);
                                                     view.set_source_with_index(
-                                                        snapshot.clone(),
+                                                        PreviewSrc::Rope(snapshot.clone()),
                                                         index.clone(),
                                                         cx,
                                                     );

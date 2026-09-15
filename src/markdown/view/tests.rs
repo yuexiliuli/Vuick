@@ -822,7 +822,7 @@ fn large_preview_keeps_scroll_across_source_replacement(cx: &mut TestAppContext)
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_source_with_index(SharedString::from(src.clone()), index, cx)
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src.clone())), index, cx)
         });
     });
     cx.simulate_resize(size(px(500.), px(500.)));
@@ -856,7 +856,7 @@ fn large_preview_keeps_scroll_across_source_replacement(cx: &mut TestAppContext)
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_source_with_index(SharedString::from(src2), index2, cx)
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src2)), index2, cx)
         });
     });
     cx.simulate_resize(size(px(500.), px(500.)));
