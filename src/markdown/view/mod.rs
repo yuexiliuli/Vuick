@@ -368,7 +368,7 @@ impl MarkdownPreview {
                 Some(idx) => idx
                     .blocks
                     .iter()
-                    .map(|b| est_row_width_meta(b, &p))
+                    .map(|b| est_row_width_meta(&b, &p))
                     .fold(0.0, f32::max),
                 None => self
                     .rows
@@ -420,7 +420,7 @@ impl MarkdownPreview {
         while lo < hi {
             let mid = (lo + hi) / 2;
             let src_line = match &self.index {
-                Some(idx) => idx.blocks[mid].src_line as usize,
+                Some(idx) => idx.blocks.at(mid).src_line as usize,
                 None => self.rows[mid].src_line,
             };
             if src_line <= line {
@@ -819,14 +819,14 @@ impl MarkdownPreview {
                 let total = if n <= budget {
                     idx.blocks
                         .iter()
-                        .map(|b| index_block_height(b, p, wrap, avail))
+                        .map(|b| index_block_height(&b, p, wrap, avail))
                         .sum::<f32>()
                 } else {
                     let step = n as f64 / budget as f64;
                     let mut sum = 0.0f32;
                     for k in 0..budget {
                         let i = (k as f64 * step).floor() as usize;
-                        sum += index_block_height(&idx.blocks[i], p, wrap, avail);
+                        sum += index_block_height(&idx.blocks.at(i), p, wrap, avail);
                     }
                     sum / budget as f32 * n as f32
                 };

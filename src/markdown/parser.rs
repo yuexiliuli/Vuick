@@ -616,10 +616,229 @@ pub struct BlockMeta {
 /// 整篇文档的轻量块索引（≈20B/行，160k 行 ≈ 3.2MB，而整篇 `Vec<Row>` ≈ 25MB）。
 #[derive(Debug, Clone)]
 pub struct BlockIndex {
-    /// 每个渲染行一个条目（按行序，`src_line`/`byte` 严格递增）。
-    pub blocks: Vec<BlockMeta>,
+    /// 每个渲染行一个条目（按行序，`src_line`/`byte` 严格递增）。**分段持久化**：
+    /// 增量扫描 O(1) 共享未变前后缀，只重建变化段（见 [`Blocks`]）。
+    pub blocks: Blocks,
     /// 目录：(渲染行号, 标题级别, 标题文本)。窗口模式下照常全量可用。
     pub toc: Vec<(usize, u8, String)>,
+}
+
+/// 分段持久化的轻量块列表。
+///
+/// 背景：增量扫描每轮都要产出「旧前缀 + 新中段 + 旧尾部(平移)」——用扁平 `Vec` 时
+/// 前后缀每轮整体 memcpy（16 万块 ≈ 3.2MB ≈ 一两 ms，是 rope 化后每轮唯一 O(n)）。
+/// 这里把 `blocks` 拆成**只读段**：段内是 `Arc<[BlockMeta]>`（不可变共享），段携带
+/// 子区间与常量坐标平移，读写只发生在段边界：
+/// - 前缀复用 = 对前段做 O(1) 子区间裁剪，零拷贝；
+/// - 尾部复用 = 子区间裁剪 + 叠加 (byte_delta, line_shift) 平移（各块统一平移，可在读取时算）；
+/// - 只重建「变化中段」（通常极小）。
+/// 段数超 [`BLOCKS_MAX_SEGS`] 时合并且 amortize：合并是 O(n)，但每数轮才一次。
+/// 用 `Arc`（非 `Rc`）→ `BlockIndex` 仍 `Send`，可整份交给后台线程继续增量（顺带把
+/// 同步循环里 `Rc<BlockIndex> → 后台` 的整份拷贝从 O(n) 降到 O(1) 引用共享）。
+#[derive(Clone, Debug)]
+pub struct Blocks {
+    segs: std::sync::Arc<Vec<BlocksSeg>>,
+    len: usize,
+}
+
+/// 一段不可变块元数据（`[start,end)` 于 `data`），读取时施加常量坐标平移。
+#[derive(Clone, Debug)]
+pub struct BlocksSeg {
+    data: std::sync::Arc<[BlockMeta]>,
+    start: usize,
+    end: usize,
+    byte_delta: i64,
+    line_shift: i64,
+}
+
+/// 段数上限：超过即合并成一段（amortize，读取仍是 O(段数)，段数很小）。
+const BLOCKS_MAX_SEGS: usize = 8;
+
+impl BlocksSeg {
+    fn new(data: std::sync::Arc<[BlockMeta]>) -> Self {
+        let len = data.len();
+        Self { data, start: 0, end: len, byte_delta: 0, line_shift: 0 }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+    /// 段内第 `i` 个块的**当前值**（已施加平移）。
+    #[inline]
+    fn at(&self, i: usize) -> BlockMeta {
+        let mut b = self.data[self.start + i];
+        b.byte = (b.byte as i64 + self.byte_delta).max(0) as u32;
+        b.src_line = (b.src_line as i64 + self.line_shift).max(0) as u32;
+        b
+    }
+    /// 段内子区间 `[s,e)`（O(1)，保持原平移）。
+    fn sub(&self, s: usize, e: usize) -> Self {
+        debug_assert!(s <= e && e <= self.len());
+        Self { data: self.data.clone(), start: self.start + s, end: self.start + e, byte_delta: self.byte_delta, line_shift: self.line_shift }
+    }
+    /// 叠加常量平移（与已有平移合成：`(data.byte + 旧δ) + 新δ = data.byte + (旧δ+新δ)`）。
+    fn shifted(&self, byte_delta: i64, line_shift: i64) -> Self {
+        let mut seg = self.clone();
+        seg.byte_delta += byte_delta;
+        seg.line_shift += line_shift;
+        seg
+    }
+    fn iter(&self) -> impl Iterator<Item = BlockMeta> + '_ {
+        (0..self.len()).map(move |i| self.at(i))
+    }
+}
+
+impl Blocks {
+    /// 由完整 `Vec` 建立（全量扫描 / 合并）：原地转成单个共享段，之后裁剪零拷贝。
+    pub fn from_vec(v: Vec<BlockMeta>) -> Self {
+        let len = v.len();
+        Self { segs: std::sync::Arc::new(vec![BlocksSeg::new(v.into())]), len }
+    }
+
+    /// 段数（读取路径的遍历代价，通常 ≤ [`BLOCKS_MAX_SEGS`]）。测试/基准观测用。
+    #[cfg(test)]
+    pub fn seg_count(&self) -> usize {
+        self.segs.len()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// 第 `i` 个块的当前值（O(段数) ≤ [`BLOCKS_MAX_SEGS`]）。
+    #[inline]
+    pub fn at(&self, mut i: usize) -> BlockMeta {
+        debug_assert!(i < self.len, "blocks.at({i}) 越界 len={}", self.len);
+        for seg in self.segs.iter() {
+            let l = seg.len();
+            if i < l {
+                return seg.at(i);
+            }
+            i -= l;
+        }
+        unreachable!("blocks.at({i}) 越界 len={}", self.len)
+    }
+
+    pub fn get(&self, i: usize) -> Option<BlockMeta> {
+        if i >= self.len {
+            return None;
+        }
+        Some(self.at(i))
+    }
+
+    pub fn iter(&self) -> BlocksIter<'_> {
+        BlocksIter { blocks: self, seg_i: 0, seg_off: 0 }
+    }
+
+    /// 二分定位：`blocks[..n]` 中最后一个满足 `pred` 的块下标 + 1（块 `byte` 严格递增，
+    /// 平移保持单调，等价于原 `slice::partition_point`）。
+    pub fn partition_point<P: Fn(&BlockMeta) -> bool>(&self, pred: P) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let b = self.at(mid);
+            if pred(&b) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// 增量组装：前缀（共享段）+ 中段（新扫描的 owned）+ 后缀（共享段）。段数超限合并且。
+    fn assemble(prefix: Vec<BlocksSeg>, middle: Vec<BlockMeta>, suffix: Vec<BlocksSeg>) -> Self {
+        let mut segs = prefix;
+        if !middle.is_empty() {
+            segs.push(BlocksSeg::new(middle.into()));
+        }
+        segs.extend(suffix);
+        segs.retain(|s| s.len() > 0);
+        let len = segs.iter().map(|s| s.len()).sum();
+        if segs.len() > BLOCKS_MAX_SEGS {
+            // amortize：合并成单一共享段（O(n) 一次，之后数轮裁剪零拷贝）
+            let mut flat = Vec::with_capacity(len);
+            for s in &segs {
+                flat.extend(s.iter());
+            }
+            return Self { segs: std::sync::Arc::new(vec![BlocksSeg::new(flat.into())]), len };
+        }
+        Self { segs: std::sync::Arc::new(segs), len }
+    }
+
+    /// 取出前 `k` 个块的共享段（O(段数)）——增量扫描复用未变前缀，零拷贝。
+    fn shares_prefix(&self, k: usize) -> Vec<BlocksSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            if rem == 0 {
+                break;
+            }
+            let l = seg.len();
+            if rem >= l {
+                out.push(seg.clone());
+                rem -= l;
+            } else {
+                out.push(seg.sub(0, rem));
+                rem = 0;
+            }
+        }
+        out
+    }
+
+    /// 取出从第 `k` 块起的共享段并叠加平移 `(byte_delta, line_shift)`——复用旧尾部。
+    fn shares_suffix(&self, k: usize, byte_delta: i64, line_shift: i64) -> Vec<BlocksSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            let l = seg.len();
+            if rem >= l {
+                rem -= l;
+                continue;
+            }
+            let seg = seg.sub(rem, l).shifted(byte_delta, line_shift);
+            out.push(seg);
+            rem = 0;
+        }
+        out
+    }
+}
+
+impl PartialEq for Blocks {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+impl Eq for Blocks {}
+
+/// 按序产出每个块的当前值（值语义：平移段需即时计算，无法按引用借出）。
+pub struct BlocksIter<'a> {
+    blocks: &'a Blocks,
+    seg_i: usize,
+    seg_off: usize,
+}
+impl<'a> Iterator for BlocksIter<'a> {
+    type Item = BlockMeta;
+    fn next(&mut self) -> Option<BlockMeta> {
+        while self.seg_i < self.blocks.segs.len() {
+            let seg = &self.blocks.segs[self.seg_i];
+            if self.seg_off < seg.len() {
+                let b = seg.at(self.seg_off);
+                self.seg_off += 1;
+                return Some(b);
+            }
+            self.seg_i += 1;
+            self.seg_off = 0;
+        }
+        None
+    }
 }
 
 /// 行 → 字节起始偏移表（与 `build_line_starts(&str)` 语义相同，但存 u32 省内存）。
@@ -767,7 +986,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         idx += 1;
     }
     BlockIndex {
-        blocks,
+        blocks: Blocks::from_vec(blocks),
         toc,
     }
 }
@@ -891,10 +1110,13 @@ pub fn scan_blocks_incremental(
     // 当前行的起始字节：锚点行起始 < b_first → 未变，直接复用旧索引的 byte。
     let anchor_byte = prev.blocks.get(bi).map(|b| b.byte as usize).unwrap_or(0);
 
-    // 未变前缀直接沿用；toc 同样取前缀。注意 toc 行号是**源码行**坐标，不能用
-    // 块下标 `bi` 比较（围栏/表格是一块对应多行源码，两类坐标会漂移）：保留
-    // 所有「行号 < 重扫起点行号 anchor」的旧标题（重扫会重新产出其后的标题）。
-    let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
+    // 未变前缀直接沿用（分段共享，O(1) 不再整段 to_vec memcpy）；toc 同样取前缀。
+    // 注意 toc 行号是**源码行**坐标，不能用块下标 `bi` 比较（围栏/表格是一块对应
+    // 多行源码，两类坐标会漂移）：保留所有「行号 < 重扫起点行号 anchor」的旧标题
+    // （重扫会重新产出其后的标题）。
+    let prefix_segs = prev.blocks.shares_prefix(bi);
+    let mut blocks: Vec<BlockMeta> = Vec::new(); // 新扫描的变化中段（通常极小）
+    let mut suffix_segs: Vec<BlocksSeg> = Vec::new();
     let mut toc: Vec<(usize, u8, String)> = prev
         .toc
         .iter()
@@ -919,14 +1141,10 @@ pub fn scan_blocks_incremental(
                     if pb.byte as usize == prev_off {
                         // 同字节尾部 + 块首 Normal 态 → 旧尾部块逐字有效，行号与字节
                         // 同时平移（byte 平移 = 总字节增量 delta，源后缀整体平移）。
+                        // 分段持久化：O(1) 共享 + 读取时施加 (delta, line_shift)。
                         let prev_line = pb.src_line as usize;
                         let line_shift = idx as i64 - prev_line as i64;
-                        for b in &prev.blocks[pi..] {
-                            let mut nb = *b;
-                            nb.src_line = (b.src_line as i64 + line_shift).max(0) as u32;
-                            nb.byte = (b.byte as i64 + delta).max(0) as u32;
-                            blocks.push(nb);
-                        }
+                        suffix_segs = prev.blocks.shares_suffix(pi, delta, line_shift);
                         // toc 尾部：与 `scan_blocks` 一致的「源码行」坐标 → 随行号偏移
                         for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
                             toc.push((( *r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
@@ -1074,7 +1292,7 @@ pub fn scan_blocks_incremental(
         "增量扫描要么对齐复用旧尾部、要么扫完新文本"
     );
     BlockIndex {
-        blocks,
+        blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
         toc,
     }
 }
@@ -1176,7 +1394,9 @@ pub fn scan_blocks_incremental_rope(
 
     // 未变前缀直接沿用；toc 同样取前缀（与 str 版相同的「源码行 vs 块下标」坐标
     // 修正：按重扫起点 `anchor` 行号过滤，而非块下标 `bi`）。
-    let mut blocks: Vec<BlockMeta> = prev.blocks[..bi].to_vec();
+    let prefix_segs = prev.blocks.shares_prefix(bi);
+    let mut blocks: Vec<BlockMeta> = Vec::new(); // 新扫描的变化中段（通常极小）
+    let mut suffix_segs: Vec<BlocksSeg> = Vec::new();
     let mut toc: Vec<(usize, u8, String)> = prev
         .toc
         .iter()
@@ -1193,7 +1413,7 @@ pub fn scan_blocks_incremental_rope(
     };
     let region_end = if pi < prev.blocks.len() {
         // 第一条旧块边界 ≥ 尾部起点 → 新坐标行首即对齐点；夹紧到 [anchor_byte, new_len]
-        ((prev.blocks[pi].byte as i64 + delta).max(anchor_byte as i64)).min(new_len as i64)
+        ((prev.blocks.at(pi).byte as i64 + delta).max(anchor_byte as i64)).min(new_len as i64)
             as usize
     } else {
         // 尾部没有可用块边界 → 扫到文末（不复用，等价全量重扫）
@@ -1222,12 +1442,7 @@ pub fn scan_blocks_incremental_rope(
                     if pb.byte as usize == prev_off {
                         let prev_line = pb.src_line as usize;
                         let line_shift = (anchor + idx) as i64 - prev_line as i64;
-                        for b in &prev.blocks[pii..] {
-                            let mut nb = *b;
-                            nb.src_line = (b.src_line as i64 + line_shift).max(0) as u32;
-                            nb.byte = (b.byte as i64 + delta).max(0) as u32;
-                            blocks.push(nb);
-                        }
+                        suffix_segs = prev.blocks.shares_suffix(pii, delta, line_shift);
                         for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
                             toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
                         }
@@ -1379,7 +1594,7 @@ pub fn scan_blocks_incremental_rope(
         return scan_blocks_rope(new_src);
     }
     BlockIndex {
-        blocks,
+        blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
         toc,
     }
 }
@@ -1408,9 +1623,9 @@ pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -
     if lo > hi {
         return Vec::new();
     }
-    let start = index.blocks[lo].byte as usize;
+    let start = index.blocks.at(lo).byte as usize;
     let mut end = if hi + 1 < n {
-        index.blocks[hi + 1].byte as usize
+        index.blocks.at(hi + 1).byte as usize
     } else {
         src.len()
     };
@@ -1422,7 +1637,7 @@ pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -
     let rows = parse_to_rows(&src[start..end]);
     debug_assert_eq!(rows.len(), hi - lo + 1, "窗口重解析行数必须与块数一致");
     // 窗口内 parse 的行号是"切片相对"的，平移到文档坐标（与块索引一致）
-    let base_line = index.blocks[lo].src_line as usize;
+    let base_line = index.blocks.at(lo).src_line as usize;
     if base_line != 0 {
         let mut rows = rows;
         for r in &mut rows {
@@ -1448,9 +1663,9 @@ pub fn parse_block_window_rope(rope: &Rope, index: &BlockIndex, lo: usize, hi: u
     if lo > hi {
         return Vec::new();
     }
-    let start = index.blocks[lo].byte as usize;
+    let start = index.blocks.at(lo).byte as usize;
     let mut end = if hi + 1 < n {
-        index.blocks[hi + 1].byte as usize
+        index.blocks.at(hi + 1).byte as usize
     } else {
         rope.len()
     };
@@ -1462,7 +1677,7 @@ pub fn parse_block_window_rope(rope: &Rope, index: &BlockIndex, lo: usize, hi: u
     let region = rope.slice(start..end).to_string();
     let rows = parse_to_rows(&region);
     debug_assert_eq!(rows.len(), hi - lo + 1, "窗口重解析行数必须与块数一致");
-    let base_line = index.blocks[lo].src_line as usize;
+    let base_line = index.blocks.at(lo).src_line as usize;
     if base_line != 0 {
         let mut rows = rows;
         for r in &mut rows {
@@ -2285,6 +2500,48 @@ mod tests {
         );
     }
 
+    /// #5 持久段：连续编辑后 `blocks` 的段数被 amortize 压在上限内（读取保持 O(段数)），
+    /// 且每轮结果与全量扫描一致（中段的 `分割/平移` 合成正确）。
+    #[test]
+    fn blocks_segments_stay_bounded_across_edits() {
+        let block = "# 章节\n\n正文 `code` [链接](https://x)\n\n- 项一\n- 项二\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n\n";
+        let mut text = String::new();
+        for _ in 0..1500 {
+            text.push_str(block);
+        }
+        let mut cur = Rope::from(text.as_str());
+        let mut prev = scan_blocks_rope(&cur);
+        // 中部 ASCII 锚点「| a |」（纯 ASCII → 其字节位置必为字符边界），供中段编辑用
+        let bytes = text.as_bytes();
+        let half = text.len() / 2;
+        let at_mid = (half..text.len().saturating_sub(5))
+            .find(|&i| bytes[i] == b'|' && &bytes[i..i + 4] == b"| a ")
+            .unwrap_or(text.len() - 1);
+        let mut max_segs = 0usize;
+        for i in 0..120 {
+            // 文末追加（段数会累积 → 触发合并），每 3 轮夹一次中部编辑（触发前缀/后缀
+            // 共享与平移合成）。
+            let at = if i % 3 == 2 { at_mid } else { cur.len() };
+            let ins = "\n# 追加\n正文\n";
+            let mut next = cur.clone();
+            next.insert(at, ins);
+            let dirty = at..at + ins.len();
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &next, Some(dirty));
+            max_segs = max_segs.max(inc.blocks.seg_count());
+            let full = scan_blocks_rope(&next);
+            assert!(
+                inc.blocks == full.blocks && inc.toc == full.toc,
+                "第 {i} 轮增量应与全量一致"
+            );
+            cur = next;
+            prev = inc;
+        }
+        assert!(
+            max_segs <= BLOCKS_MAX_SEGS,
+            "段数应被 amortize 压在上限内: max={max_segs} 上限={BLOCKS_MAX_SEGS}"
+        );
+    }
+
     /// 基准（--ignored）：复刻 handoff §3.1 的方法——对参考文件 `target/大文档测试.md`
     /// （6.4MB / ≈17 万行）连续做 **1000 次文末插入**，对比 str 路径（`value()`
     /// String 物化 + 增量扫描全串 split）与新 rope 路径（Rope::clone O(1) + 增量
@@ -2352,10 +2609,41 @@ mod tests {
             prev = inc;
         }
         println!(
-            "新 rope（clone+区域切片+增量）: {} 次文末插入共 {:.1} s，扫描累计 {:.1} ms/次",
+            "新 rope（clone+区域切片+增量）: {} 次文末插入共 {:.1} s，扫描累计 {:.1} ms/次；末尾 blocks 段数 {}（≤ {} 才保持 O(1) 共享）",
             n_inserts,
             t0.elapsed().as_secs_f64(),
             rope_total.as_secs_f64() * 1000.0 / n_inserts as f64,
+            prev.blocks.seg_count(),
+            BLOCKS_MAX_SEGS,
+        );
+
+        // —— 中部编辑（前后缀都要共享/平移）：持久分段的典型场景 ——
+        let mid = text.len() / 2;
+        let mut cur = Rope::from(text.as_str());
+        let mut prev = scan_blocks_rope(&cur);
+        let mut mid_total = std::time::Duration::ZERO;
+        let ins = "\n# 中段追加行\n正文\n";
+        let t0 = Instant::now();
+        for i in 0..200 {
+            let at = mid + (i * 3) % 8000;
+            let mut next = cur.clone();
+            next.insert(at, ins);
+            let dirty = at..at + ins.len();
+            let t = Instant::now();
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &next, Some(dirty));
+            mid_total += t.elapsed();
+            if i % 100 == 99 {
+                let full = scan_blocks_rope(&next);
+                assert!(inc.blocks == full.blocks && inc.toc == full.toc, "rope 中段第 {i} 轮不一致");
+            }
+            cur = next;
+            prev = inc;
+        }
+        println!(
+            "rope 中部编辑（前后缀持久共享）: 200 次共 {:.1} s，扫描累计 {:.1} ms/次；段数 {}",
+            t0.elapsed().as_secs_f64(),
+            mid_total.as_secs_f64() * 1000.0 / 200.0,
+            prev.blocks.seg_count(),
         );
     }
 
