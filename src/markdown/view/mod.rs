@@ -203,6 +203,9 @@ pub struct MarkdownPreview {
     /// 本次渲染算出的**自适应过扫余量**（块数）：render 依视口高度更新，
     /// `ensure_window` 用它替代固定 [`WINDOWED_OVERDRAW_BLOCKS`]。
     overdraw_margin: usize,
+    /// 最近一次统一行高提示重建的时刻：换宽/拖分屏时按 [`crate::config::timing::HINT_REAPPLY_INTERVAL_MS`]
+    /// 节流 O(块数) 的 SumTree 重建，避免宽度每帧变化时每帧都卡一次。
+    last_hint_apply: Option<std::time::Instant>,
     /// 表格的横向滚动句柄（行号 → 句柄）。句柄跨帧稳定，供滚动条拖动。装箱同上。
     table_scroll: std::rc::Rc<std::collections::HashMap<usize, ScrollHandle>>,
     /// 搜索跳转高亮：命中的源码行（0 基）与小写查询词；None = 无高亮。
@@ -249,6 +252,7 @@ impl MarkdownPreview {
             code_hl: Default::default(),
             code_hl_cache: CodeHlCache::new(),
             overdraw_margin: WINDOWED_OVERDRAW_BLOCKS,
+            last_hint_apply: None,
             table_scroll: Default::default(),
             highlight_search: None,
             highlight_seq: 0,
@@ -471,8 +475,15 @@ impl MarkdownPreview {
             let new_n = index.blocks.len();
             if new_n == self.list_state.item_count() {
                 // 块数未变（最常见的小编辑）：复用列表状态——保留 `last_layout_bounds`
-                // 与统一高度提示，避免 gpui 每帧按宽度变化 O(块数) 清空/重建；只重测高度。
-                self.list_state.remeasure();
+                // 与统一高度提示，避免 gpui 每帧按宽度变化 O(块数) 清空/重建。
+                // 内容变了只**重测可见窗口内**已物化的行高（O(窗口)，而非全量 remeasure
+                // 的 O(块数) SumTree 重建）；窗口外的行本来就是未测量占位，滚动过去时
+                // ensure_window 会用新源重建，无需此处铺满。
+                let r_lo = self.win_lo;
+                let r_hi = (r_lo + self.win_rows.len()).min(new_n);
+                if r_lo < r_hi {
+                    self.list_state.remeasure_items(r_lo..r_hi);
+                }
             } else {
                 // 块数变化：重建列表 + 恢复到更新前的滚动位置（块号越界自动夹紧到文末），
                 // 并把「统一高度提示」标记为待应用（一次性 O(n)，不再每帧重复）。
@@ -765,6 +776,7 @@ impl MarkdownPreview {
         self.code_hl = Default::default();
         self.code_hl_cache.clear();
         self.overdraw_margin = WINDOWED_OVERDRAW_BLOCKS;
+        self.last_hint_apply = None;
         self.table_scroll = Default::default();
         self.highlight_search = None;
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
@@ -918,8 +930,20 @@ impl MarkdownPreview {
             self.hint_recovered = true;
             return true;
         }
-        // 首次 / 块数或宽度变化 / 换源：应用一次 O(n)，之后由 `hint_applied` 记忆
+        // 首次 / 块数或宽度变化 / 换源：应用一次 O(n)，之后由 `hint_applied` 记忆。
+        // 换宽/拖分屏时宽度每帧变化 → 每帧都会走到这里；按最小间隔节流，避免 160k 块
+        // 的 SumTree 重建在拖动期间每帧卡一次（量程短暂滞后、松手即收敛）。首次不节流。
+        if width_changed && self.hint_applied.is_some() {
+            let now = std::time::Instant::now();
+            let interval = crate::config::timing::HINT_REAPPLY_INTERVAL_MS;
+            if let Some(last) = self.last_hint_apply {
+                if (now.duration_since(last).as_millis() as u64) < interval {
+                    return false;
+                }
+            }
+        }
         self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
+        self.last_hint_apply = Some(std::time::Instant::now());
         self.hint_applied = Some((n, hint));
         self.hint_recovered = false;
         true

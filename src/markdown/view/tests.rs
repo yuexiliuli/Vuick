@@ -1164,6 +1164,49 @@ fn run_scroll_rebuild_count(
     })
 }
 
+/// 基准（--ignored）：#3 统一高度提示的 O(块数) SumTree 物化成本。仿真大文档量级
+/// （16 万块）：ListState::new 与 with_uniform_item_height 各建一遍节点树，再模拟
+/// 连续换宽（每次重建）10 次。打印、不断言。
+#[gpui::test]
+#[ignore]
+fn bench_list_uniform_height_cost(cx: &mut TestAppContext) {
+    use std::time::Instant;
+    let (new_ms, hint_ms, x10_ms, remeasure_ms, remeasure_win_ms) = cx.update(|_cx| {
+        use gpui::{ListAlignment, ListState, px};
+        let n = 160_000usize;
+        let t = Instant::now();
+        let state = ListState::new(n, ListAlignment::Top, px(12.0));
+        let new_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let state_hinted = state.clone().with_uniform_item_height(px(24.0));
+        let hint_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // 模拟连续换宽：每次 with_uniform 全量重建
+        let t = Instant::now();
+        for w in 0..10 {
+            let _ = state_hinted.clone().with_uniform_item_height(px(20.0 + w as f32));
+        }
+        let x10_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // 同块数换内容时的 remeasure（不重建树，仅置脏可见区）
+        let t = Instant::now();
+        for _ in 0..10 {
+            state_hinted.remeasure();
+        }
+        let remeasure_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // 优化后：打字路径只 remeasure 可见窗口（~60 行）而非全量
+        let t = Instant::now();
+        for _ in 0..10 {
+            state_hinted.remeasure_items(50..110);
+        }
+        let remeasure_win_ms = t.elapsed().as_secs_f64() * 1000.0;
+        (new_ms, hint_ms, x10_ms, remeasure_ms, remeasure_win_ms)
+    });
+    println!(
+        "16 万块 ListState：new={new_ms:.1} ms；with_uniform_item_height={hint_ms:.1} ms（+new ≈ 打开时两次数节点分配）；连续换宽 ×10（每次重建）={x10_ms:.1} ms；打字同块数全量 remeasure ×10={remeasure_ms:.1} ms vs 只重测可见窗口 ×10={remeasure_win_ms:.1} ms（{:.0}x）",
+        remeasure_ms / remeasure_win_ms.max(1e-6),
+    );
+    let _ = cx;
+}
+
 /// 回归：超宽表格在换行模式（默认）下应自带横向滚动条，而不是被视口裁剪遮挡。
 /// 表格滚动容器 = 预览视口宽；内部固定宽表格超宽时块内可横向滚动、滚动条真实渲染，
 /// 句柄跨帧稳定（set_offset 能把表格真正向左滚动）——对齐代码块方案。
@@ -1532,6 +1575,87 @@ fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
         (max_off - expected).abs() < expected * 0.05,
         "滚动条量程应接近 行数×平均行高：max_off={max_off:.0} expected={expected:.0} hint={hint:.1}"
     );
+}
+
+/// 回归：#3 换宽节流——宽度连续变化（拖分屏）时，O(块数) 的统一高度重建至多每
+/// [`HINT_REAPPLY_INTERVAL_MS`] 一次，拖动期间不会每帧卡一下。首次建立不节流。
+#[gpui::test]
+fn hint_reapply_throttle_on_rapid_width_change(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut md = cx.update(|cx| MarkdownPreview::new(cx));
+    // 换行（wrap）文档：不同视口宽 → 折行数不同 → 平均行高不同 → 每次换宽都要重建提示
+    let mut src = String::new();
+    for i in 0..1200 {
+        src.push_str(&format!("# 标题 {i} 内容内容内容内容内容内容内容内容内容内容\n正文段落 {i}\n\n"));
+    }
+    cx.update(|cx| md.set_source(&src, cx));
+
+    let first = cx.update(|cx| md.update_height_hint(cx, 480.0));
+    assert!(first, "首次（无提示记录）应立即建立，不节流");
+    let mut applied = 0u8;
+    for w in [481.0, 483.0, 486.0, 490.0, 495.0] {
+        applied += cx.update(|cx| md.update_height_hint(cx, w)) as u8;
+    }
+    assert!(
+        applied <= 1,
+        "120ms 内连续换宽至多重建 1 次（其余被节流），实际 {applied}"
+    );
+}
+
+/// 回归：#3 打字路径——源更新（块数不变）时只重测**可见窗口内**的行高，不再全量
+/// remeasure 整棵 O(块数) SumTree。断言：块数不变时 ListState 的 item_count 不变、
+/// 统一高度提示未被破坏（量程仍在），且窗口外未物化行保持占位。
+#[gpui::test]
+fn source_reapply_same_count_only_remeasures_window(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let block = "```rust\nfn f() {}\n```\n\n正文 `code`\n\n";
+    let mut src = String::new();
+    for _ in 0..1200 {
+        src.push_str(block);
+    }
+    let index = std::rc::Rc::new(crate::markdown::scan_blocks(&src));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src.clone())), index, cx)
+        });
+    });
+    cx.simulate_resize(size(px(600.), px(600.)));
+    settle(cx);
+    let n0 = cx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+
+    // 块数不变的小编辑（改一个字符再同步）
+    let mut src2 = src.clone();
+    src2 = src2.replacen("正文 `code`", "正文！`code`", 1);
+    let index2 = std::rc::Rc::new(crate::markdown::scan_blocks(&src2));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(PreviewSrc::from(SharedString::from(src2)), index2, cx);
+            cx.notify();
+        });
+    });
+    for _ in 0..4 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+
+    let (n1, win_len) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (md.item_count(), md.win_rows.len())
+    });
+    assert_eq!(n1, n0, "块数不变时列表项数应保持不变（不再整棵重建）");
+    assert!(
+        win_len > 0 && win_len <= 200,
+        "窗口行数应保持有界（win_len={win_len}）"
+    );
+    cx.simulate_resize(size(px(600.), px(600.)));
+    settle(cx);
 }
 
 /// 大文档（块数 > WINDOWED_MIN_BLOCKS）必须走「窗口级懒解析」：
