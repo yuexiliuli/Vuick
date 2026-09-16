@@ -15,6 +15,7 @@
 //! 键上下文中自行处理，这里只订阅其 `InputEvent::Change` 刷新状态栏与脏标记。
 
 mod file_ops;
+mod open_progress;
 mod menu;
 mod panes;
 mod sidebar;

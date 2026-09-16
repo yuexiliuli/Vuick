@@ -22,6 +22,15 @@ pub const EDITOR_WRAP_MAX_LINES: usize = 30_000;
 /// （小而快，且保留既有测试/行为）。取 128KB：几 KB~几十 KB 的常见源码/笔记仍即时
 /// 打开，再大（含中等 md）不再随体积线性冻住主线程。
 pub const OPEN_ASYNC_MIN_BYTES: u64 = 128 * 1024;
+/// 大文档「分块读盘渐进装配」：后台**每读满这么多归一化字节**（整行），就把这一块
+/// 推进给 UI 线程追加进编辑器 —— 内容随读随显（+ 滚动条横向量程随块补齐），不再等
+/// 整篇读完才挂载。取 1MB：主线程每次只做 O(1MB) 的 rope 追加 ≈ 毫秒级，不卡帧。
+pub const OPEN_CHUNK_TARGET_BYTES: usize = 1024 * 1024;
+/// 首个分块的下限：仅首块用它（更小，几十 KB 即出首屏），之后统一用
+/// [`OPEN_CHUNK_TARGET_BYTES`]。
+pub const OPEN_FIRST_CHUNK_BYTES: usize = 256 * 1024;
+/// 大文档分块读盘的原始字节缓存大小（每次 `File::read` 读这么多；与发行块大小无关）。
+pub const READ_BUF_BYTES: usize = 256 * 1024;
 /// 编辑器 ListState **固定窗口虚拟化**的窗口条数：列表恒持这么多条目（O(1)，与文档行数无关），
 /// 滚动位置由 `window_base`（窗口首行绝对行号）+ 窗口内相对滚动合成，
 /// 目标滚出窗口即 `reset` 重定位（O(窗口)）。512 行 × 22px ≈ 11k px 可视高度，远超任何单屏。

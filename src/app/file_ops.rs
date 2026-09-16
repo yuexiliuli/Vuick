@@ -4,8 +4,25 @@ use super::*;
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::WindowExt as _;
 
+use crate::app::open_progress::TextChunk;
 use crate::config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES};
 use crate::config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
+
+/// [`EditorApp::apply_open_chunk`] 的结果：一块被如何处理（消费者据此决定继续/中止）。
+enum ChunkApply {
+    /// 首块装配成功，携带「打开瞬间的编辑版本号」（收尾的未编辑守卫）。
+    Mounted(u64),
+    /// 后续块追加成功（继续收下一块）。
+    Appended,
+    /// 目标选项卡已不存在 / 下标被换成其它文件（中止本打开流水线）。
+    Stale,
+}
+
+/// 首块挂载的行数提示（`str::lines()` 口径）。首块可能不含完整文件，这只是过渡值，
+/// 后续块追加后 [`CodeEditor::append_mounted_chunk`] 会经 `display_line_count()` 校正。
+fn prep_first_lines_hint(text: &str) -> usize {
+    text.lines().count().max(1)
+}
 
 /// 打开失败通知的 id 类型（配合唯一 key，便于 5 秒后精确移除）。
 struct OpenFailureNotification;
@@ -213,14 +230,18 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 大文件后台打开流水线：**两段式**——
-    /// 1. 快段（≈几十 ms）：后台 读盘→归一化→Rope→计数，UI 立即 `load_file_text`(defer)
-    ///    把编辑器挂上，**内容瞬时可见**；
-    /// 2. 慢段（后台并行）：行宽统计 ‖ (md)scan_blocks（`std::thread::scope` OS 线程真
-    ///    并行；实测 gpui `background_executor().spawn` 同会话仍串行），完成后
-    ///    `finish_file_text` O(1) 修正滚动条量程 + 装预览。
+    /// 大文档「分块读盘 · 渐进装配」打开流水线：
+    /// 1. **生产者**（后台线程）：[`open_progress::produce_open_chunks`] 逐块
+    ///    `File::read`→UTF-8 校验→CRLF 归一化→按块精确算行宽统计（读多少、发多少，
+    ///    不再整篇 `read_to_string` 物化 ~1× 文件字节的 String 临时代理），经 channel
+    ///    把每一块推给消费者，首块下限 256KB（几十 KB 即出首屏）、之后 1MB；
+    /// 2. **消费者**（逐块到主线程）：首块 [`Self::apply_open_chunk`] 走
+    ///    `load_file_text`(defer) 快速挂载（内容瞬时可见）；后续块 O(块大小) 追加，
+    ///    滚动/撤销/光标保留，横向量程随块精确补齐；
+    /// 3. **收尾**：md 后台 `scan_blocks` 建索引 → `finish_file_text` O(1) 装预览 +
+    ///    最终状态。
     /// `idx` 处须已存在选项卡（`open_file` 新建 / `open_file_in_tab` 复用）。
-    fn spawn_background_open(
+    fn spawn_progressive_open(
         &mut self,
         idx: usize,
         p: std::path::PathBuf,
@@ -231,107 +252,261 @@ impl EditorApp {
         self.status_ok = true;
         let is_md = Self::is_markdown_path(&p);
         let entity = cx.entity();
-        // send 类型别名：PreparedText（String/Rope/BTreeMap）与 BlockIndex 均 Send，
-        // Rc 留到 UI 线程再包（与 preview_syncing 的「Rc 非 Send」注释一致）。
-        type FastResult = Result<PreparedText, std::io::Error>;
-        type StatsResult = (
-            usize,
-            crate::editor::buffer::LineWidthHistogram,
-            Option<crate::markdown::BlockIndex>,
-        );
+
+        /// 生产者 → 消费者的消息。
+        enum OpenMsg {
+            Chunk(crate::app::open_progress::TextChunk),
+            Eof { src_len: u64 },
+            Err(std::io::Error),
+        }
+
+        // 异步**有界**通道（容量 4）：消费端 `next()` 空时让出调度，生产端 `send()`
+        // 满时也 `await` 让出（背压）——既不物化整篇 String，也不让通道囤积整篇
+        // （测试的协作式调度器下，blocking recv 会卡死，故绝不用 std::sync::mpsc）。
+        let (tx, rx) = futures::channel::mpsc::channel::<OpenMsg>(4);
         window
             .spawn(cx, async move |cx| {
-                // ---- 快段：读盘 + 归一化 + Rope + 计数（Rope 建好编辑器即可显示）----
-                let p_read = p.clone();
-                let fast: FastResult = cx
-                    .background_executor()
+                use futures::{SinkExt as _, StreamExt as _};
+                // ---- 生产者（后台线程；逐块读盘 → `send().await` 背压外推）----
+                let mut prod_tx = tx.clone();
+                let prod_p = p.clone();
+                cx.background_executor()
                     .spawn(async move {
                         let t = std::time::Instant::now();
-                        let text = fs::read_to_string(&p_read)
-                            .map(|raw| Self::normalize_newlines(&raw))?;
-                        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                            eprintln!(
-                                "[MD_OPEN_DEBUG] 后台 读文件+归一化: {} ms ({} B)",
-                                t.elapsed().as_millis(),
-                                text.len()
-                            );
-                        }
-                        Ok(prepare_text_fast(text))
-                    })
-                    .await;
-                let Some((resume_version, snap_rope)) = (match fast {
-                    Ok(prep) => {
-                        let snap_rope = prep.rope.clone(); // O(1) COW：慢段统计用同一棵树
-                        let p_fast = p.clone();
-                        let r = cx.update_window_entity(&entity, move |this, window, cx| {
-                            this.load_file_text(idx, &p_fast, prep, window, cx, true);
-                            // 打开此刻的编辑版本号：finish 用它当「未编辑」守卫。
-                            this.tabs.get(idx).map(|t| t.edit_version)
-                        });
-                        match r {
-                            Ok(Some(v)) => Some((Some(v), snap_rope)),
-                            _ => None,
-                        }
-                    }
-                    Err(e) => {
-                        let p_err = p.clone();
-                        let _ = cx.update_window_entity(&entity, move |this, window, cx| {
-                            this.report_open_failure(&p_err, &e, window, cx)
-                        });
-                        None
-                    }
-                }) else {
-                    return;
-                };
-                // ---- 慢段：行宽统计 ‖ (md)scan_blocks（OS 线程真并行，纯后台）----
-                let stats: StatsResult = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let t = std::time::Instant::now();
-                        let out = std::thread::scope(|s| {
-                            let stats_rope = snap_rope.clone();
-                            let stats_thread = s.spawn(move || {
-                                crate::editor::buffer::compute_line_stats(&stats_rope)
-                            });
-                            let scan_thread = if is_md {
-                                let scan_rope = snap_rope.clone();
-                                Some(s.spawn(move || {
-                                    crate::markdown::scan_blocks_rope(&scan_rope)
-                                }))
-                            } else {
-                                None
+                        let mut reader =
+                            match crate::app::open_progress::ChunkReader::open(&prod_p) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    let _ = prod_tx.send(OpenMsg::Err(e)).await;
+                                    prod_tx.close_channel();
+                                    return;
+                                }
                             };
-                            let (mx, hist) =
-                                stats_thread.join().expect("行宽统计线程应可 join");
-                            let index = scan_thread
-                                .map(|th| th.join().expect("scan_blocks 线程应可 join"));
-                            (mx, hist, index)
-                        });
-                        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                            eprintln!(
-                                "[MD_OPEN_DEBUG] 后台 并行(行宽统计+scan_blocks) 合计: {} ms",
-                                t.elapsed().as_millis()
-                            );
+                        loop {
+                            match reader.next_chunk() {
+                                Ok(Some(chunk)) => {
+                                    if prod_tx.send(OpenMsg::Chunk(chunk)).await.is_err() {
+                                        return; // 消费端已放弃 → 停止读盘
+                                    }
+                                }
+                                Ok(None) => {
+                                    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                                        eprintln!(
+                                            "[MD_OPEN_DEBUG] 后台 分块读盘+归一化+逐块统计 合计: {} ms",
+                                            t.elapsed().as_millis()
+                                        );
+                                    }
+                                    let _ = prod_tx
+                                        .send(OpenMsg::Eof { src_len: reader.total_bytes() })
+                                        .await;
+                                    prod_tx.close_channel();
+                                    return;
+                                }
+                                Err(e) => {
+                                    let _ = prod_tx.send(OpenMsg::Err(e)).await;
+                                    prod_tx.close_channel();
+                                    return;
+                                }
+                            }
                         }
-                        out
                     })
-                    .await;
-                let (max_line_chars, line_width_histogram, index) = stats;
-                // ---- 收尾：应用到编辑器（滚动条量程）+ Markdown 预览（索引）----
+                    .detach();
+
+                // ---- 消费者：逐块取（空时让出调度），再到主线程追加装配 ----
+                let mut cum_mx = 0usize;
+                let mut cum_hist = crate::editor::buffer::LineWidthHistogram::new();
+                let mut src_len = 0u64;
+                let mut first = true;
+                let mut resume_version: Option<u64> = None;
+                let mut io_err: Option<std::io::Error> = None;
+                let mut aborted = false;
+                let mut rx = rx;
+                while let Some(msg) = rx.next().await {
+                    match msg {
+                        OpenMsg::Chunk(chunk) => {
+                            // 累计精确统计（与 编辑器每个块合并 的是同一份；finish 用它复位）。
+                            cum_mx = cum_mx.max(chunk.max_line_chars);
+                            for (w, c) in chunk.hist.iter() {
+                                *cum_hist.entry(*w).or_insert(0) += c;
+                            }
+                            let is_first = first;
+                            let p_ch = p.clone();
+                            let r = cx
+                                .update_window_entity(&entity, move |this, window, cx| {
+                                    this.apply_open_chunk(idx, &p_ch, chunk, is_first, window, cx)
+                                });
+                            match r {
+                                Ok(ChunkApply::Mounted(v)) => {
+                                    if resume_version.is_none() {
+                                        resume_version = Some(v);
+                                    }
+                                    first = false;
+                                }
+                                Ok(ChunkApply::Appended) => {}
+                                _ => {
+                                    aborted = true; // 选项卡已关 / 下标被换成其它文件
+                                    break;
+                                }
+                            }
+                        }
+                        OpenMsg::Eof { src_len: s } => {
+                            src_len = s;
+                            break;
+                        }
+                        OpenMsg::Err(e) => {
+                            io_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+
+                // ---- 收尾（主线程任务上下文）----
+                if let Some(e) = io_err {
+                    let p_err = p.clone();
+                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                        this.report_open_failure(&p_err, &e, window, cx)
+                    });
+                    return;
+                }
+                if aborted {
+                    return; // 目标选项卡已不存在/被换成别的文件 → 放弃后续收尾
+                }
+                if first {
+                    // 从未挂过首块（如空文件走漏进来的兜底）：挂一个空文档，
+                    // 使 editor_pending 复位、编辑器可正常显示/保存。
+                    let p_emp = p.clone();
+                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                        let prep = prepare_text(String::new());
+                        this.load_file_text(idx, &p_emp, prep, window, cx, true);
+                    });
+                }
+                // md：后台扫块建预览索引（快照 rope O(1) 克隆，行块统计已逐块精确）。
+                let index = if is_md {
+                    let p_snap = p.clone();
+                    let snap = cx
+                        .update_window_entity(&entity, move |this, _w, cx| {
+                            this.tabs
+                                .get(idx)
+                                .filter(|t| t.file_path.as_deref() == Some(p_snap.as_path()))
+                                .map(|t| t.editor.read(cx).rope().clone())
+                        })
+                        .ok()
+                        .flatten();
+                    let Some(snap) = snap else { return };
+                    let t = std::time::Instant::now();
+                    let index = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let out = crate::markdown::scan_blocks_rope(&snap);
+                            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                                eprintln!(
+                                    "[MD_OPEN_DEBUG] 后台 scan_blocks 合计: {} ms",
+                                    t.elapsed().as_millis()
+                                );
+                            }
+                            out
+                        })
+                        .await;
+                    Some(index)
+                } else {
+                    None
+                };
+                // 最终：装算统计/预览索引 + 恢复「已打开」状态。
+                let hist_lines = cum_hist.values().sum::<usize>();
                 let p_fin = p.clone();
                 let _ = cx.update_window_entity(&entity, move |this, _window, cx| {
                     this.finish_file_text(
                         idx,
                         &p_fin,
-                        max_line_chars,
-                        line_width_histogram,
+                        cum_mx,
+                        cum_hist,
                         index,
                         resume_version,
                         cx,
                     );
+                    // 最终状态：内容就绪，恢复「已打开」（含大文档关闭软换行的提示）。
+                    if let Some(tab) = this.tabs.get(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
+                        this.status = SharedString::from(if is_md && tab.line_count > EDITOR_WRAP_MAX_LINES {
+                            format!(
+                                "已打开：{} · 大文档编辑区已关闭软换行（Ctrl+W 可开，预览保持换行）",
+                                p_fin.display()
+                            )
+                        } else {
+                            format!("已打开：{}", p_fin.display())
+                        });
+                        this.status_ok = true;
+                    }
                 });
+                if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                    eprintln!(
+                        "[MD_OPEN_DEBUG] 分块渐进装配完成：{} 原始字节 / 累计 {} 行统计",
+                        src_len, hist_lines
+                    );
+                }
             })
             .detach();
+    }
+
+    /// 把后台读到的第 `first` 块（首块）挂上 / 后续块追到编辑器末尾。
+    ///
+    /// - 首块：走 [`Self::load_file_text`](defer=true) 快速挂载（`open_fast_count` +1、
+    ///   `editor_pending`=false → **几十 KB 即出内容**），并返回打开瞬间的编辑版本号
+    ///   作为收尾的「未编辑」守卫；
+    /// - 后续块：`CodeEditor::append_mounted_chunk` O(块大小) 追加（滚动/撤销保留），
+    ///   行/字缓存与横向量程随块精确补齐。
+    fn apply_open_chunk(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        chunk: crate::app::open_progress::TextChunk,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ChunkApply {
+        if first {
+            // 复用既有选项卡重开文件：file_path 此刻仍是旧文件，不拦截（首块即替换内容）。
+            let TextChunk { text, hist, max_line_chars } = chunk;
+            let rope = Rope::from(text.as_str());
+            let lines = prep_first_lines_hint(&text);
+            let chars = text.chars().count();
+            let src_len = text.len();
+            let prep = PreparedText {
+                text,
+                rope,
+                lines,
+                chars,
+                src_len,
+                max_line_chars,
+                line_width_histogram: hist,
+            };
+            self.load_file_text(idx, p, prep, window, cx, true);
+            // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」，读完置最终态。
+            if let Some(tab) = self.tabs.get(idx) {
+                self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
+                self.status_ok = true;
+                return ChunkApply::Mounted(tab.edit_version);
+            }
+            return ChunkApply::Stale;
+        }
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return ChunkApply::Stale;
+        };
+        if tab.file_path.as_deref() != Some(p) {
+            return ChunkApply::Stale; // 该下标已被换成其它文件
+        }
+        self.search_scan = None; // 内容被追加 → 搜索缓存失效
+        let TextChunk { text, hist, max_line_chars } = chunk;
+        tab.editor.update(cx, |ed, _| {
+            ed.append_mounted_chunk(&text, max_line_chars, hist);
+        });
+        let (lc, cc) = {
+            let st = tab.editor.read(cx);
+            (st.display_line_count(), st.char_count())
+        };
+        tab.line_count = lc;
+        tab.char_count = cc;
+        cx.notify();
+        ChunkApply::Appended
     }
 
     /// 把 EPUB 解析结果载入指定选项卡：纯展示（只读预览），编辑区置空。
@@ -472,9 +647,9 @@ impl EditorApp {
             return;
         }
         // 大文件（按字节阈值判断）：后台打开（复用已有选项卡），
-        // 读盘→归一化→Rope→行宽统计→(md)scan_blocks 全在后台线程，UI 只做 O(1) 装配。
+        // 分块读盘→归一化→按块统计→逐块装配 全在后台线程，UI 每块只做 O(块大小) 追加。
         if is_large_path(&p) {
-            self.spawn_background_open(idx, p, window, cx);
+            self.spawn_progressive_open(idx, p, window, cx);
             return;
         }
         match fs::read_to_string(&p) {
@@ -522,12 +697,11 @@ impl EditorApp {
             return;
         }
         // 文本：大文件（按字节阈值判断，无需读盘）→ **后台打开**——先建标签页 +
-        // “正在打开…”状态立即返回，读盘→归一化→Rope→行宽统计→(md)scan_blocks
-        // 全在后台线程，完成后 UI 线程只做 O(1) 装配。拖入瞬间不再卡死 UI，
-        // 且打开耗时不再随文件体积线性冻住主线程。
+        // “正在打开…”状态立即返回，分块读盘→归一化→按块统计→逐块装配 全在后台线程，
+        // UI 每块只做 O(块大小) 追加。拖入瞬间不再卡死 UI，首屏几十 KB 即出内容。
         if is_large_path(&p) {
             let idx = self.make_tab(window, cx);
-            self.spawn_background_open(idx, p.clone(), window, cx);
+            self.spawn_progressive_open(idx, p.clone(), window, cx);
             if let Some(tab) = self.tabs.get(idx) {
                 let focus = tab.editor.read(cx).focus_handle();
                 window.focus(&focus, cx);
@@ -752,46 +926,6 @@ fn prepare_text(text: String) -> PreparedText {
     if std::env::var_os("MD_OPEN_DEBUG").is_some() {
         eprintln!(
             "[MD_OPEN_DEBUG] 准备文本: 计数(lines+chars)={counts_ms} ms, Rope::from({src_len} B)={rope_ms} ms, compute_line_stats({lines} 行)={stats_ms} ms"
-        );
-    }
-    PreparedText {
-        text,
-        rope,
-        lines,
-        chars,
-        src_len,
-        max_line_chars,
-        line_width_histogram,
-    }
-}
-
-/// 大文档「先瞬时显示」版预处理：只做 Rope + 计数 + **占位横向量程**（≈几十 ms），
-/// 编辑器文本可以立刻挂上；真统计由后台 `compute_line_stats` 全量算出后经
-/// `Buffer::apply_stats` O(1) 替换。
-/// 占位期 = 均匀采样行宽 ×1.2 的估计（见 [`crate::editor::buffer::sample_line_stats`]），
-/// 横向滚动条量程**立刻可滚**、不坍缩成视口宽（此前空直方图让 116MB 前 7.3s 无法
-/// 左右平移），真值到达后 `apply_stats` 无缝校正。
-fn prepare_text_fast(text: String) -> PreparedText {
-    let src_len = text.len();
-    let t = std::time::Instant::now();
-    let lines = text.lines().count().max(1);
-    let chars = text.chars().count();
-    let rope = Rope::from(text.as_str());
-    let counts_ms = t.elapsed().as_millis();
-    let t = std::time::Instant::now();
-    let (max_line_chars, line_width_histogram) = crate::editor::buffer::sample_line_stats(&rope);
-    let sample_ms = t.elapsed().as_millis();
-    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-        eprintln!(
-            "[MD_OPEN_DEBUG] prepare_text_fast({src_len} B/{} 行): 计数+Rope {:.1} ms, 采样占位行宽 {:.1} ms (est={} 格)",
-            lines,
-            counts_ms,
-            sample_ms,
-            line_width_histogram
-                .keys()
-                .next_back()
-                .copied()
-                .unwrap_or(0),
         );
     }
     PreparedText {

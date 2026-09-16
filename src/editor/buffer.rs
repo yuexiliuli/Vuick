@@ -225,6 +225,27 @@ impl Buffer {
         self.line_width_histogram = line_width_histogram;
     }
 
+    /// 大文档「分块渐进装配」用：把后台已归一化的一块文本追到全文末尾（ropey
+    /// `insert` 到字节末尾，O(块大小)），并合并本块的行宽统计（O(本块行数)）。
+    ///
+    /// 语义约束（调用方〔`crate::app::open_progress`〕保证）：
+    /// - `text` 只含**完整行**（除文件末尾的未结束行外，均以 `\n` 结尾），绝不出现
+    ///   被劈开的行——否则 `chunk_hist` 的「整行」直方图与逐块合并不成立；
+    /// - `chunk_hist` / `chunk_max_chars` 是本块这些完整行的精确统计。
+    ///
+    /// 与 [`Self::apply_edit`] 的区别：**不产生可逆编辑记录、不算用户编辑**
+    /// （撤销栈/脏标记/编辑事件都不涉及），只推进 `version` 让缓存失效。
+    pub fn append_chunk(&mut self, text: &str, chunk_max_chars: usize, chunk_hist: LineWidthHistogram) {
+        if !text.is_empty() {
+            self.text.insert(self.text.len(), text);
+            self.version += 1;
+        }
+        self.max_line_chars = self.max_line_chars.max(chunk_max_chars);
+        for (w, c) in chunk_hist {
+            *self.line_width_histogram.entry(w).or_insert(0) += c;
+        }
+    }
+
     /// 全文最长行（字符数）——O(1) 读，供等宽列近似/测试。
     pub fn max_line_chars(&self) -> usize {
         self.max_line_chars

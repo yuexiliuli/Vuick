@@ -12,6 +12,9 @@ serde_json = "1"
 regex = "1"
 memchr = "2"
 unicode-segmentation = "1"
+# 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
+# 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
+futures = "0.3"
 reqwest = { version = "0.13", features = ["blocking", "json", "multipart"] }
 aes-gcm = "0.10"
 hex = "0.4"

@@ -1956,6 +1956,86 @@
         );
     }
 
+    /// 回归：大文档「分块读盘·渐进装配」——打开期间编辑器内容**渐进**出现（读多少
+    /// 显示多少），首块挂载即可视（`editor_pending`=false），全部读完后内容字节级一致。
+    /// 逐 tick 驱动协作式调度器，断言在某个中间时刻行数落在 (0, 全文行数) 之间——
+    /// 证明内容不是「整篇读完一次性原子挂载」，而是逐块推送上屏。
+    #[gpui::test]
+    async fn progressive_load_shows_partial_content_early(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-progressive-mount-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // ~3.3MB / 60k 行：远超异步阈值与首块 256KB 下限，且多于有界通道容量（多块）。
+        let line = "x".repeat(48);
+        let content = (0..60_000)
+            .map(|i| format!("{line} {i:07}\n"))
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试文件应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+
+        let mut saw_partial = false;
+        let mut ticks = 0;
+        let mut done = false;
+        // 逐 tick（每步至多一个任务轮询）：观察进程中的部分内容；无余量任务即停止。
+        while ticks < 3000 {
+            if !cx.cx.executor().tick() {
+                break;
+            }
+            ticks += 1;
+            let (lc, pending, ready_full) = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let tab = &a.tabs[i];
+                let ed = tab.editor.read(cx);
+                let outf_block = a.status_ok && ed.value() == content;
+                (ed.line_count(), tab.editor_pending, outf_block)
+            });
+            if !pending && lc > 0 && lc < 60_000 {
+                saw_partial = true;
+            }
+            if ready_full {
+                done = true;
+            }
+        }
+        assert!(done, "渐进装配应收尾：{ticks} ticks 后未完成");
+        assert!(
+            saw_partial,
+            "应观察到「部分内容先行上屏」的中间态（{ticks} ticks；若缺 256KB 首块下限/逐块外推则为整篇原子挂载）"
+        );
+        let (dlc, pending, final_ok) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let tab = &a.tabs[i];
+            (
+                tab.editor.read(cx).display_line_count(),
+                tab.editor_pending,
+                tab.editor.read(cx).value() == content,
+            )
+        });
+        assert!(!pending, "装配完成后 editor_pending 应复位");
+        assert!(final_ok, "最终内容应与文件字节级一致");
+        assert_eq!(dlc, 60_000, "最终显示行数应为全文行数");
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// 回归（专家评审 P1 升级版）：固定窗口虚拟化下的大文档「深跳」——Ctrl+End /
     /// 搜索跳到远超视口的行时：
     /// 1. ListState 恒是**固定小窗口**（O(WINDOW) 挂载，不建 3.2M 条 → 内存 O(1)）；
@@ -2991,6 +3071,270 @@
                 grew,
             );
         }
+    }
+
+    /// 进程内存探针（Windows）：`PagefileUsage`（私有提交字节）= 本进程真实分配量，
+    /// `WorkingSetSize`（工作集）= 物理驻留。二者均可反映内存峰值。
+    #[cfg(windows)]
+    mod mem_probe {
+        #[repr(C)]
+        pub struct ProcessMemoryCounters {
+            pub cb: u32,
+            pub page_fault_count: u32,
+            pub peak_working_set_size: usize,
+            pub working_set_size: usize,
+            pub quota_peak_paged_pool_usage: usize,
+            pub quota_paged_pool_usage: usize,
+            pub quota_peak_nonpaged_pool_usage: usize,
+            pub quota_nonpaged_pool_usage: usize,
+            pub pagefile_usage: usize,
+            pub peak_pagefile_usage: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                counter: *mut ProcessMemoryCounters,
+                cb: u32,
+            ) -> i32;
+        }
+        pub fn counters() -> (u64, u64) {
+            unsafe {
+                let mut c: ProcessMemoryCounters = std::mem::zeroed();
+                c.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+                if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                    (c.pagefile_usage as u64, c.working_set_size as u64)
+                } else {
+                    (0, 0)
+                }
+            }
+        }
+    }
+
+    /// 流式数 `\n` 字节 + 尾换行幻影，得 ropey `lines_len()` 口径的预期行数（不经
+    /// 常驻整篇拷贝；memchr SIMD 扫 128MB ≈ 百毫秒级）。
+    fn expected_rope_lines(path: &str) -> usize {
+        use std::io::Read as _;
+        let mut f = std::fs::File::open(path).expect("基准文件应存在");
+        let mut buf = vec![0u8; 1 << 20];
+        let mut nl = 0usize;
+        let mut last = 0u8;
+        loop {
+            let n = f.read(&mut buf).expect("读基准文件");
+            if n == 0 {
+                break;
+            }
+            nl += memchr::memchr_iter(b'\n', &buf[..n]).count();
+            last = buf[n - 1];
+        }
+        nl + usize::from(last == b'\n')
+    }
+
+    /// 基准：打开大文档（默认 `target/大文档测试126MB.txt`，可用 `BENCH_OPEN_FILE`
+    /// 覆盖）的分阶段墙钟 + 进程私有内存峰值。
+    /// - 「首屏可见」= 编辑器首次出现内容（旧：整篇读完一次性挂载才非空；
+    ///   新：分块读盘首块 256KB 即挂）。
+    /// - 「全文就绪」= 行数达到全文行数（旧：快段整篇装配；新：末块追加完成）。
+    /// - 「流水线结束」= `open_finish_count>=1`（旧：还要全量行宽统计 ≈7s；
+    ///   新：EOF 后即刻）。
+    /// - 内存峰值 = 打开窗口内进程私有提交字节增量（1ms 采样；旧路径读盘期有
+    ///   「读盘 String + 归一化 String + Rope」≈2× 文件，新路径峰值≈1× 文件）。
+    /// 运行：`cargo test --release --bin gpui-editor bench_open_large_txt_progressive -- \
+    ///        --ignored --nocapture`（debug 亦可，比值一致、绝对值放大）。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_open_large_txt_progressive(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let path = std::env::var("BENCH_OPEN_FILE").unwrap_or_else(|_| {
+            r"target/大文档测试126MB.txt".to_string()
+        });
+        if !std::path::Path::new(&path).is_file() {
+            // 资产缺失：现场生成一份 ~120MB LF 文本（保证可复现基准）。
+            let line = "x".repeat(80);
+            let mut out = std::fs::File::create(&path).expect("创建基准文件");
+            use std::io::Write as _;
+            for i in 0..1_400_000usize {
+                let _ = writeln!(out, "{line} {i:010}");
+            }
+            drop(out);
+        }
+        let expected_lines = expected_rope_lines(&path);
+        let (base_pf, base_ws) = {
+            #[cfg(windows)]
+            {
+                mem_probe::counters()
+            }
+            #[cfg(not(windows))]
+            {
+                (0, 0)
+            }
+        };
+
+        // 看门狗：打开期间 1ms 采样私有内存峰值（读盘瞬间的瞬态高峰也能抓到）。
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let peak_pf = std::sync::Arc::new(AtomicU64::new(base_pf));
+        let peak_ws = std::sync::Arc::new(AtomicU64::new(base_ws));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let (pp, pw, st) = (peak_pf.clone(), peak_ws.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !st.load(Ordering::Relaxed) {
+                    #[cfg(windows)]
+                    {
+                        let (pf, ws) = mem_probe::counters();
+                        pp.fetch_max(pf, Ordering::Relaxed);
+                        pw.fetch_max(ws, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+        }
+
+        let t0 = std::time::Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(&path, window, cx));
+        });
+        let sync_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let mut t_first_ms = f64::NAN;
+        let mut t_full_ms = f64::NAN;
+        let mut t_done_ms = f64::NAN;
+        let mut ticks = 0usize;
+        loop {
+            if !cx.cx.executor().tick() {
+                break;
+            }
+            ticks += 1;
+            let (lc, fin) = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                (
+                    a.tabs[i].editor.read(cx).line_count(),
+                    a.open_finish_count,
+                )
+            });
+            let now = t0.elapsed().as_secs_f64() * 1000.0;
+            if t_first_ms.is_nan() && lc > 1 {
+                t_first_ms = now;
+            }
+            if t_full_ms.is_nan() && lc >= expected_lines {
+                t_full_ms = now;
+            }
+            if t_done_ms.is_nan() && fin >= 1 {
+                t_done_ms = now;
+            }
+            if !t_first_ms.is_nan() && !t_done_ms.is_nan() {
+                break;
+            }
+            if ticks > 400_000 {
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        // 最终字节级一致性（一次性物化比较；编辑器统一 LF，与读取后归一化对比）。
+        let ok = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let expected = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            a.tabs[i].editor.read(cx).value() == expected
+        });
+        let last_lc = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].editor.read(cx).line_count()
+        });
+        let d_pf = peak_pf.load(Ordering::Relaxed).saturating_sub(base_pf);
+        let d_ws = peak_ws.load(Ordering::Relaxed).saturating_sub(base_ws);
+
+        println!("==== 打开大文档基准：{} ====", path);
+        println!(
+            "  文件 {} MB / {} 行；base 私有提交 {:.1} MB / 工作集 {:.1} MB",
+            std::fs::metadata(&path).map(|m| m.len() / 1024 / 1024).unwrap_or(0),
+            expected_lines,
+            base_pf as f64 / 1048576.0,
+            base_ws as f64 / 1048576.0,
+        );
+        println!(
+            "  open_file 同步返回: {:.1} ms（不卡 UI）",
+            sync_ms
+        );
+        println!(
+            "  首屏可见(T_first):        {:.1} ms",
+            t_first_ms
+        );
+        println!(
+            "  全文装配(T_full_content): {:.1} ms",
+            t_full_ms
+        );
+        println!(
+            "  流水线结束(T_done):       {:.1} ms",
+            t_done_ms
+        );
+        println!(
+            "  峰值内存增量: 私有提交 {:.1} MB / 工作集 {:.1} MB",
+            d_pf as f64 / 1048576.0,
+            d_ws as f64 / 1048576.0
+        );
+        println!(
+            "  最终: {} 行 / 字节一致={ok} / ticks={ticks}",
+            last_lc
+        );
+    }
+
+    /// 基准：ropey 全文构建「一次性 `Rope::from`」 vs「1MB 分块末尾 `insert`」——
+    /// 量化新管线把构建搬到逐块追加（<主线程每块 O(块)>）相对旧一次性构建的开销。
+    /// 运行：`cargo test --release --bin gpui-editor bench_rope_grow_strategies -- \
+    ///        --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_rope_grow_strategies(cx: &mut TestAppContext) {
+        init_test(cx);
+        // ~33MB 全文（3300 行 × 10KB），可比又不会跑太久。
+        let line = "x".repeat(10_000);
+        let full = {
+            let mut s = String::with_capacity(line.len() * 3_300 + 1);
+            for _ in 0..3_300 {
+                s.push_str(&line);
+                s.push('\n');
+            }
+            s
+        };
+
+        let t0 = std::time::Instant::now();
+        let rope_oneshot = gpui_component::input::Rope::from(full.as_str());
+        let ms_oneshot = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t0 = std::time::Instant::now();
+        let mut rope_incr = gpui_component::input::Rope::new();
+        let chunk = 1 << 20;
+        let mut i = 0usize;
+        while i < full.len() {
+            let e = full.len().min(i + chunk);
+            rope_incr.insert(rope_incr.len(), &full[i..e]);
+            i = e;
+        }
+        let ms_incr = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let n_chunks = full.len().div_ceil(chunk);
+        assert_eq!(rope_oneshot.len(), rope_incr.len());
+        println!(
+            "==== ropey 构建基准（{} MB / {} 块）====",
+            full.len() / 1024 / 1024,
+            n_chunks
+        );
+        println!("  Rope::from 一次性:   {ms_oneshot:.2} ms");
+        println!("  1MB×{n_chunks} 分块追加: {ms_incr:.2} ms（增量开销 = {:.2} ms，{:.1}%）",
+            ms_incr - ms_oneshot,
+            if ms_oneshot > 0. { (ms_incr - ms_oneshot) / ms_oneshot * 100. } else { 0. });
     }
 
     /// 基准（debug 体感）：大文档开着 Markdown 预览时，一次按键的 UI 线程成本拆解

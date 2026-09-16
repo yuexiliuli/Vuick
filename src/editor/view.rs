@@ -297,6 +297,19 @@ impl CodeEditor {
         self.buffer.apply_stats(max_line_chars, line_width_histogram);
     }
 
+    /// 大文档「分块渐进装配」追加一块已归一化文本（整行语义）：只把该块追到 Buffer
+    /// 末尾并更新行数，**不重建列表 / 不回滚光标 / 不产生编辑事件**——打开期间的
+    /// 滚动位置与撤销栈保留。首块仍走 [`Self::set_rope_with_stats`]（建立文档）。
+    pub fn append_mounted_chunk(
+        &mut self,
+        chunk: &str,
+        chunk_max_chars: usize,
+        chunk_hist: crate::editor::buffer::LineWidthHistogram,
+    ) {
+        self.buffer.append_chunk(chunk, chunk_max_chars, chunk_hist);
+        self.row_count = self.buffer.line_count().max(1);
+    }
+
     /// 整篇替换文档后的通用复位（撤销/选区/横向滚动/标记清空 + 列表行数同步）。
     fn reset_document(&mut self) {
         self.undo.clear();
