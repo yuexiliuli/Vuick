@@ -44,7 +44,10 @@ use gpui_component::input::{
     SelectToStart, SelectToStartOfLine, Undo,
 };
 
+use crate::config::layout::EDITOR_RULER_COLUMNS;
 use crate::config::limits::EDITOR_VSCROLL_BOTTOM_EXTRA_LINES;
+use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES;
+use crate::editor::fold::{scan_bracket_pairs, BracketPair, Fold, FoldMap};
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
 use crate::editor::undo::{EditIntent, UndoManager};
@@ -85,6 +88,9 @@ struct RowData {
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     /// 本行是否绘制光标 + 光标 x（相对文本起点，px）。
     caret: Option<f32>,
+    /// 本行是折叠首行时：折叠指示「…」的 x（相对文本起点，px）。`None` 非折叠首行。
+    /// 独立元素渲染（不进 `StyledText`/shape_text），不污染行内测量。
+    folded: Option<f32>,
 }
 
 impl RowData {
@@ -93,6 +99,7 @@ impl RowData {
             text: SharedString::new_static(""),
             highlights: Vec::new(),
             caret: None,
+            folded: None,
         }
     }
 }
@@ -105,6 +112,8 @@ struct RowView {
     mono: SharedString,
     font_size: Pixels,
     caret_color: Hsla,
+    /// 折叠指示器/「…」等次要文字色。
+    fold_color: Hsla,
 }
 
 /// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行
@@ -199,6 +208,20 @@ pub struct CodeEditor {
 
     // —— 配置 ——
     tab_size: usize,
+    /// 代码折叠（视图层投影：视觉行 ↔ 逻辑行映射；不改 Rope）。
+    folds: FoldMap,
+    /// 自动探测的「可折叠候选」（gutter 默认指示器 + 点击/快捷键折叠的区间来源）。
+    /// 只对 ≤ [`FOLD_CANDIDATE_FULL_MAX_LINES`] 行的文档整篇维护（超大文档手动折叠）。
+    /// 候选可与 `folds`（已激活折叠）共存/嵌套，仅作「这里能折」的提示，不参与视觉映射。
+    fold_candidates: Vec<Fold>,
+    /// 跨行括号配对（括号标尺竖线）：`{()}`/`[]`/`()` 每条跨行配对一根竖线，
+    /// 从开括号列画到闭括号行。≤ 200k 行整篇扫描，随编辑/行数变化重扫。
+    bracket_pairs: Vec<BracketPair>,
+    /// 垂直标尺线颜色（主题 `muted_foreground` 派生，refresh_metrics 设置；
+    /// 已验证可见——行号列同款）。不依赖 `border`（可能为透明默认值）。
+    ruler_color: Hsla,
+    /// 括号标尺竖线颜色（更淡的次要前景）。
+    guide_color: Hsla,
 }
 
 impl CodeEditor {
@@ -254,6 +277,11 @@ impl CodeEditor {
             pixel_scroll: true,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
             tab_size: 4,
+            folds: FoldMap::new(),
+            fold_candidates: Vec::new(),
+            bracket_pairs: Vec::new(),
+            ruler_color: rgb(0x000000).into(),
+            guide_color: rgb(0x000000).into(),
         }
     }
 
@@ -308,6 +336,9 @@ impl CodeEditor {
     ) {
         self.buffer.append_chunk(chunk, chunk_max_chars, chunk_hist);
         self.row_count = self.buffer.line_count().max(1);
+        self.folds.set_total(self.row_count);
+        self.recompute_fold_candidates();
+        self.recompute_bracket_pairs();
     }
 
     /// 整篇替换文档后的通用复位（撤销/选区/横向滚动/标记清空 + 列表行数同步）。
@@ -319,6 +350,8 @@ impl CodeEditor {
         self.last_edit = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
         self.desired_scroll.set(0.);
+        // 整篇替换：折叠视图投影一并清空（文本结构已变）。
+        self.folds.clear();
         self.resync_list(true);
     }
 
@@ -567,6 +600,11 @@ impl CodeEditor {
         self.bg = colors.background;
         self.fg = colors.foreground;
         self.gutter_fg = colors.muted_foreground;
+        // 垂直标尺线：次要前景（与行号同源、已验证明暗主题都可见；不用 `border`——
+        // 主题默认可能为透明）。细微参考线不刺眼。
+        self.ruler_color = colors.muted_foreground.opacity(0.55);
+        // 括号标尺竖线：更淡，纯视觉参考不干扰阅读。
+        self.guide_color = colors.muted_foreground.opacity(0.4);
         // 光标不能用 colors.accent：本应用 Light 主题的 accent=l≈0.961（#f5f5f5），
         // 白底上画白光标=看不见（用户反馈“点击无闪烁光标”就是这个）。用前景墨色，
         // 明/暗主题下都一定可见。
@@ -598,6 +636,12 @@ impl CodeEditor {
         self.pixel_scroll = true;
         self.window_base = 0;
         self.desired_scroll.set(0.);
+        // 折叠投影总行数跟随文档行数（区间越界由 FoldMap 侧裁剪）。
+        self.folds.set_total(new_n);
+        // 自动折叠候选（gutter 默认指示器）随文档行数重扫。
+        self.recompute_fold_candidates();
+        // 括号标尺配对同样随文档重扫。
+        self.recompute_bracket_pairs();
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
                 "[MD_OPEN_DEBUG] 编辑器 ListState 固定窗口 reset({LIST_WINDOW_ROWS})，{new_n} 行 + {} 预留空行: {} ms",
@@ -611,8 +655,26 @@ impl CodeEditor {
     /// 无关，无需 splice——只更新 `row_count`；后续 `reveal_caret` 会按新光标行
     /// 重新定位窗口。
     fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
+        // 先取被替换区间的**编辑前**行跨度（折叠区间同步需要，编辑后行号已变）。
+        let prev_rows = self.row_count;
+        let line_a = self.buffer.line_of_offset(range.start);
+        let line_b = self.buffer.line_of_offset(range.end);
         let edit = self.buffer.apply_edit(range, text);
         self.row_count = self.buffer.line_count().max(1);
+        // 折叠同步：编辑进折叠体 → 自动展开；折叠后整体平移；锚被删 → 丢弃。
+        self.folds.sync_edit(line_a, line_b, text, self.row_count);
+        // 折叠候选（指示器）只在行数变化或编辑触及候选边界时重扫。
+        self.recompute_candidates_if_dirty(prev_rows, line_a, line_b);
+        // 括号标尺配对：行数变化或编辑文本含括号字符时重扫（保持竖线即时更新）。
+        let has_bracket =
+            text.bytes().any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'))
+                || edit
+                    .old_text
+                    .bytes()
+                    .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'));
+        if self.row_count != prev_rows || has_bracket {
+            self.recompute_bracket_pairs();
+        }
         edit
     }
 
@@ -732,6 +794,18 @@ impl CodeEditor {
         let line_start = self.buffer.line_start(row);
         let line_end = self.buffer.line_end(row);
         let text = self.buffer.line_text(row);
+        // 折叠首行：记「…」指示器 x（文本尾随位置，独立元素渲染，不进 StyledText）。
+        let folded = if self.folds.fold_starting_at(row).is_some() {
+            Some(
+                self.row_layout(window, row)
+                    .map(|layout| layout.width().as_f32())
+                    .unwrap_or_else(|| {
+                        text.chars().count() as f32 * self.char_width.as_f32().max(1.)
+                    }),
+            )
+        } else {
+            None
+        };
         if text.is_empty() {
             // 空行：仅在光标停在本行（head==line_start==line_end）时画在 x=0。
             return RowData {
@@ -744,6 +818,7 @@ impl CodeEditor {
                 } else {
                     None
                 },
+                folded,
             };
         }
 
@@ -790,10 +865,11 @@ impl CodeEditor {
             text,
             highlights,
             caret,
+            folded,
         }
     }
 
-    /// 行数据：渲染窗口内（`[lo, hi]`）每行。
+    /// 行数据：渲染窗口内（`[lo, hi]`，**视觉行**）每行。
     ///
     /// 高亮必须整窗一次批量解析再按行进 `runs`：逐行调用 `highlight_window(row,row)`
     /// 会让缓存每行都失效并各自重解析 16 行回看上下文 → 每帧 O(窗口×回看) 重复解析，
@@ -808,23 +884,30 @@ impl CodeEditor {
         if self.row_count == 0 {
             return Vec::new();
         }
-        let last = self.row_count.saturating_sub(1);
-        let lo = lo.min(last);
-        let hi = hi.min(last);
+        // 窗口与滚动同在**视觉行**空间：折叠后行窗口以视觉行为界。
+        let vtotal = self.folds.visual_line_count().max(1);
+        let last_v = vtotal - 1;
+        let lo = lo.min(last_v);
+        let hi = hi.min(last_v);
         if hi < lo {
             return Vec::new();
         }
+        // 把窗口两端映射成逻辑行，供高亮整窗批量解析与行文本提取。
+        let lo_l = self.folds.logical_row(lo);
+        let hi_l = self.folds.logical_row(hi);
         // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
         // 借用，否则后续 `self.row_data` 与 `highlight_window` 的借用冲突）。
-        // 返回切片约定：第 0 项 = `lo` 行（`highlight_window` 已统一对齐到请求窗口）。
+        // 返回切片约定：第 0 项 = `lo_l` 行（`highlight_window` 已统一对齐到请求窗口）。
         let hl_lines = self
             .highlighter
-            .highlight_window(&self.buffer, lo, hi, HL_LOOKBACK_LINES)
+            .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
             .to_vec();
+        // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
-        for r in lo..=hi {
-            let runs: &[(Range<usize>, Hsla)] = &hl_lines[r - lo];
-            out.push(self.row_data(window, r, show_caret, runs));
+        for v in lo..=hi {
+            let logical = self.folds.logical_row(v);
+            let runs: &[(Range<usize>, Hsla)] = &hl_lines[logical - lo_l];
+            out.push(self.row_data(window, logical, show_caret, runs));
         }
         out
     }
@@ -876,10 +959,14 @@ impl CodeEditor {
         (self.vscroll_bottom_pad_px() / lh).round() as usize
     }
 
-    /// 滚动涉及的**全文条目数** = 文档行数 + 底部预留空行数。纵向滚动上限 / 量程 /
-    /// clamp 全部以它为准（与固定窗口无关——窗口只是「从哪里开始渲染」）。
+    /// 滚动涉及的**全文条目数** = 视觉行数（逻辑行 − 折叠隐藏行）+ 底部预留空行数。
+    /// 纵向滚动上限 / 量程 / clamp 全部以它为准（与固定窗口无关——窗口只是
+    /// 「从哪里开始渲染」）。折叠会缩小它（与窗口大小无关，thumb 无坍缩）。
     fn scroll_item_count(&self) -> usize {
-        self.row_count.saturating_add(self.pad_row_count())
+        self.folds
+            .visual_line_count()
+            .max(1)
+            .saturating_add(self.pad_row_count())
     }
 
     /// 文本区 **绝对**滚动位置 `(绝对行号, 已滚进该行的 px)`。窗口内的相对
@@ -952,17 +1039,19 @@ impl CodeEditor {
         self.scroll_to_px(self.scroll_top_px() - dy);
     }
 
-    /// 把目标行滚进可视区（统一行高模型；可视高度扣除底部预留，保证被 reveal 的
-    /// 行不会贴到横向滚动条之下）。
+    /// 把目标**逻辑行**滚进可视区（统一行高模型；先经折叠映射成视觉行，再算像素：
+    /// 折叠隐藏行的逻辑行会塌缩到折叠首行的视觉位置）。可视高度扣除底部预留，
+    /// 保证被 reveal 的行不会贴到横向滚动条之下。
     fn reveal_row(&mut self, row: usize) {
         let lh = self.line_height.as_f32().max(1.);
+        let vis = self.folds.visual_row(row);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
         let rows_visible = ((view - self.vscroll_bottom_pad_px()) / lh).floor().max(1.) as usize;
         let cur_top = (self.scroll_top_px() / lh).floor() as usize;
-        if row < cur_top {
-            self.scroll_to_px(row as f32 * lh);
-        } else if row >= cur_top + rows_visible {
-            let target = row.saturating_add(1).saturating_sub(rows_visible);
+        if vis < cur_top {
+            self.scroll_to_px(vis as f32 * lh);
+        } else if vis >= cur_top + rows_visible {
+            let target = vis.saturating_add(1).saturating_sub(rows_visible);
             self.scroll_to_px(target as f32 * lh);
         }
     }
@@ -1041,6 +1130,26 @@ impl CodeEditor {
         (-self.h_handle.offset().x.as_f32()).max(0.)
     }
 
+    /// 垂直标尺第 `col`（宽度单位列）列在**editor 本地 x**（px）。标尺随内容横向
+    /// 滚动（方案 A）；移出文本区右缘或左滚出文本区（< 行号列右缘）→ `None`（被
+    /// 裁掉/不可见）。`avail_w` = 编辑区可视宽（文本区右界）。
+    fn ruler_screen_x(&self, col: usize, avail_w: f32) -> Option<f32> {
+        if !self.metrics_ready || self.char_width.as_f32() <= 0. {
+            return None;
+        }
+        let gutter = self.gutter_width_px.as_f32();
+        let view_w = (avail_w - gutter).max(0.);
+        if view_w <= 0. {
+            return None;
+        }
+        let x = gutter + col as f32 * self.char_width.as_f32() - self.hscroll_px();
+        if x >= gutter && x < gutter + view_w {
+            Some(x.round().max(gutter))
+        } else {
+            None
+        }
+    }
+
     /// 整行文本整形为布局（与 `StyledText` 渲染同一个 font/size）。
     ///
     /// 供命中测试 / 光标 x / IME 坐标使用：CJK 全角字按真实字形宽度定位，
@@ -1073,7 +1182,10 @@ impl CodeEditor {
         // 用「有效滚动顶」：深跳占位期 = 用户目标（点击占位符命中其代表的目标行），
         // 常规期 = ListState 实际位置（一致）。
         let content_y = self.scroll_top_px() + position.y.as_f32();
-        let row = (content_y / lh).floor().max(0.) as usize;
+        // 命中换算到**视觉行**，再经折叠映射成逻辑行（视觉行可被折叠压缩）。
+        let vis = (content_y / lh).floor().max(0.) as usize;
+        let vis = vis.min(self.folds.visual_line_count().saturating_sub(1));
+        let row = self.folds.logical_row(vis);
         let row = row.min(self.row_count.saturating_sub(1));
 
         // 命中的文本本地 x（补偿横向滚动像素）：x_text = local.x − gutter + 已滚像素。
@@ -1108,6 +1220,58 @@ impl CodeEditor {
             self.line_height.as_f32(),
             self.gutter_width_px.as_f32(),
         )
+    }
+
+    /// 测试用：折叠映射（只读）。
+    pub(crate) fn test_folds(&self) -> &FoldMap {
+        &self.folds
+    }
+
+    /// 测试用：程序化添加折叠 `[start, end)`（半开逻辑行）。
+    pub(crate) fn test_set_fold(&mut self, start: usize, end: usize) {
+        self.folds.toggle(start, end);
+    }
+
+    /// 测试用：自动探测的折叠候选（只读）。
+    pub(crate) fn test_fold_candidates(&self) -> &[Fold] {
+        &self.fold_candidates
+    }
+
+    /// 测试用：括号标尺配对（只读）。
+    pub(crate) fn test_bracket_pairs(&self) -> &[BracketPair] {
+        &self.bracket_pairs
+    }
+
+    /// 测试用：括号标尺在当前视口的竖线段 `(x, y_rel, h)`（文本区本地坐标）。
+    pub(crate) fn test_bracket_guide_segments(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        harea_w: f32,
+        view_h: f32,
+    ) -> Vec<(f32, f32, f32)> {
+        self.bracket_guide_segments(top_vis, off, lh, harea_w, view_h)
+    }
+
+    /// 测试用：`line` 是否起始一个可折叠候选/激活折叠（gutter 指示器口径）。
+    pub(crate) fn test_has_fold_or_candidate(&self, line: usize) -> bool {
+        self.has_fold_or_candidate(line)
+    }
+
+    /// 测试用：光标行折叠切换（gutter 点击同路径）。
+    pub(crate) fn test_toggle_fold_at(&mut self, line: usize) {
+        self.toggle_fold_at(line);
+    }
+
+    /// 测试用：缩进启发式块的结束行（开区间）。
+    pub(crate) fn test_fold_block_end(&self, start: usize) -> Option<usize> {
+        self.fold_block_end(start)
+    }
+
+    /// 测试用：垂直标尺第 `col` 列在当前横向滚动下的本地 x（px；不可见为 `None`）。
+    pub(crate) fn test_ruler_x(&self, col: usize, avail_w: f32) -> Option<f32> {
+        self.ruler_screen_x(col, avail_w)
     }
 
     /// 测试用：`row` 行内 `byte_col`（行内字节列）字符边界在文本本地的 x（px）。
@@ -1214,6 +1378,20 @@ impl CodeEditor {
         self.focus_handle.focus(window, cx);
         self.undo.set_cooperative(false);
         let local = event.position - self.element_bounds.origin;
+        // gutter 内点击：命中**折叠首行或可折叠候选** → 切换折叠（不移动光标）；
+        // 否则回落普通点击（x 在行号列 → 列 0，与既有行为一致）。
+        if local.x >= px(0.) && local.x < self.gutter_width_px {
+            let lh = self.line_height.as_f32().max(1.);
+            let content_y = self.scroll_top_px() + local.y.as_f32();
+            let vis = (content_y / lh).floor().max(0.) as usize;
+            let vis = vis.min(self.folds.visual_line_count().saturating_sub(1));
+            let logical = self.folds.logical_row(vis);
+            if self.has_fold_or_candidate(logical) {
+                self.toggle_fold_at(logical);
+                self.dragging = false;
+                return;
+            }
+        }
         let offset = self.offset_at_point(local, window);
         if event.modifiers.shift {
             self.selection.set_head(offset);
@@ -1276,10 +1454,26 @@ impl CodeEditor {
                 _ => {}
             }
         }
+        // 代码折叠：Ctrl+Shift+[ 折叠光标所在块；Ctrl+Shift+] 展开光标处折叠。
+        if m.control && m.shift && !m.alt && !m.platform {
+            match k.key.to_ascii_lowercase().as_str() {
+                "[" => {
+                    self.fold_under_caret(cx);
+                    return;
+                }
+                "]" => {
+                    self.unfold_under_caret(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
-    /// 统一的移动+选区应用点。
+    /// 统一的移动+选区应用点：新光标若落进折叠隐藏体 → 跳到该折叠之后的首个可见行
+    /// （VS Code 式「跳过折叠体」，不自动展开）。
     fn apply_move(&mut self, select: bool, new_head: usize, preferred: Option<u32>, cx: &mut Context<Self>) {
+        let new_head = self.snap_out_of_hidden(new_head);
         if select {
             let col = self.buffer.char_column(new_head);
             self.selection.set_head(new_head);
@@ -1292,6 +1486,306 @@ impl CodeEditor {
         self.kick_caret();
         self.reveal_caret();
         cx.notify();
+    }
+
+    /// 若 `off` 处于某折叠的隐藏体内部 → 返回该折叠**结束行**（首个可见行）的行首；
+    /// 否则原样返回。
+    fn snap_out_of_hidden(&self, off: usize) -> usize {
+        let row = self.buffer.line_of_offset(off);
+        match self.folds.hidden_containing(row) {
+            Some(f) => self.buffer.line_start(f.end.min(self.row_count)),
+            None => off,
+        }
+    }
+
+    /// 折叠操作后保持「视口顶行逻辑行」稳定：把**编辑前**捕获的顶行逻辑行重新映射
+    /// 到新视觉坐标并滚动到位——折叠/展开上方的折叠会改变视觉行数与像素位置，否则
+    /// 视口会瞬间跳走。`top_logical` = 折叠前 `abs_scroll_top().0` 经映射得到的逻辑行。
+    fn anchor_top_logical_after_fold(&mut self, top_logical: usize, off_px: f32) {
+        let vis2 = self.folds.visual_row(top_logical);
+        self.scroll_to_px(vis2 as f32 * self.line_height.as_f32().max(1.) + off_px);
+    }
+
+    /// 视口顶行的逻辑行（折叠操作前捕获用）。
+    fn capture_top_logical(&self) -> (usize, f32) {
+        let (top_vis, off) = self.abs_scroll_top();
+        (self.folds.logical_row(top_vis), off)
+    }
+
+    /// gutter 点击切换：该行已有激活折叠 → 展开；否则有候选 → 按候选区间折叠；
+    /// 否则尝试按缩进启发式创建。
+    fn toggle_fold_at(&mut self, line: usize) {
+        let line = line.min(self.row_count.saturating_sub(1));
+        let top = self.capture_top_logical();
+        let did = if let Some(f) = self.folds.fold_starting_at(line).copied() {
+            self.folds.expand_at(f.start);
+            true
+        } else if let Some(c) = self.candidate_starting_at(line) {
+            self.folds.toggle(c.start, c.end);
+            true
+        } else if let Some(end) = self.fold_block_end(line) {
+            self.folds.toggle(line, end);
+            true
+        } else {
+            false
+        };
+        if did {
+            self.anchor_top_logical_after_fold(top.0, top.1);
+        }
+    }
+
+    /// Ctrl+Shift+[：创建光标所在块（优先用折叠候选；否则缩进启发式）的折叠；
+    /// 已折叠则保持。
+    fn fold_under_caret(&mut self, cx: &mut Context<Self>) {
+        let line = self.buffer.line_of_offset(self.selection.head());
+        if self.folds.fold_starting_at(line).is_some() {
+            return;
+        }
+        let fold_range = self
+            .candidate_starting_at(line)
+            .map(|c| (c.start, c.end))
+            .or_else(|| self.fold_block_end(line).map(|end| (line, end)));
+        if let Some((start, end)) = fold_range {
+            let top = self.capture_top_logical();
+            self.folds.toggle(start, end);
+            self.anchor_top_logical_after_fold(top.0, top.1);
+            cx.notify();
+        }
+    }
+
+    /// Ctrl+Shift+]：展开光标所在/包含的折叠。
+    fn unfold_under_caret(&mut self, cx: &mut Context<Self>) {
+        let line = self.buffer.line_of_offset(self.selection.head());
+        if self.folds.fold_at(line).is_some() {
+            let top = self.capture_top_logical();
+            self.folds.expand_at(line);
+            self.anchor_top_logical_after_fold(top.0, top.1);
+            cx.notify();
+        }
+    }
+
+    /// 缩进启发式折叠块：从 `start` 行起向后找到块结束行（**开区间** end）。
+    /// - 首个缩进 `< start 行缩进` 的行 → 块结束（dedent）；
+    /// - 同缩进且以闭/尾记号（`}` `)` `]` `#` `` ` ``）开头 → 块结束；
+    /// - 空行跳过；
+    /// - 到文件尾 → 结束。
+    /// 至少需隐藏 1 行（`end ≥ start+2`）才视为可折叠。
+    fn fold_block_end(&self, start: usize) -> Option<usize> {
+        if self.row_count == 0 || start >= self.row_count {
+            return None;
+        }
+        let base_indent = leading_ws_len(self.buffer.line_text(start).as_ref());
+        let mut end = None;
+        for r in (start + 1)..self.row_count {
+            let line = self.buffer.line_text(r);
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = leading_ws_len(line.as_ref());
+            if indent < base_indent {
+                end = Some(r);
+                break;
+            }
+            if indent == base_indent
+                && matches!(
+                    trimmed.chars().next(),
+                    Some('}') | Some(')') | Some(']') | Some('#') | Some('`')
+                )
+            {
+                end = Some(r);
+                break;
+            }
+        }
+        let end = end.unwrap_or(self.row_count);
+        (end >= start + 2).then_some(end)
+    }
+
+    /// 全篇扫描「可折叠候选」（不重叠可嵌套，O(行数) 单遍）：
+    /// 行 `i` 是候选起点 ⟺ 其后的首个非空行缩进更深（该行将藏起一个块）；块结束 = 首个
+    /// 缩进回退 `/` 同级闭记号（`}` 等）行。与 [`Self::fold_block_end`] 同口径，
+    /// 供 gutter 默认指示器与点击/快捷键折叠使用。
+    fn scan_fold_candidates(&self) -> Vec<Fold> {
+        let n = self.row_count;
+        if n <= 1 {
+            return Vec::new();
+        }
+        let mut out: Vec<Fold> = Vec::new();
+        // 栈：挂起的块 `(start, indent)`。pending 记录上一非空行；下次看到更深行才入栈。
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        let mut pending: Option<(usize, usize)> = None;
+        for r in 0..n {
+            let line = self.buffer.line_text(r);
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = leading_ws_len(line.as_ref());
+            let closing = matches!(
+                trimmed.chars().next(),
+                Some('}') | Some(')') | Some(']') | Some('#') | Some('`')
+            );
+            if let Some((ps, pi)) = pending {
+                // 上一行是块起点 ⟺ 当前行缩进更深。
+                if indent > pi {
+                    stack.push((ps, pi));
+                }
+                // 关闭缩进 ≥ 当前行的块（缩进回退或同级闭记号）。
+                while let Some(&(bs, bi)) = stack.last() {
+                    if indent < bi || (indent == bi && closing) {
+                        if r >= bs + 2 {
+                            out.push(Fold { start: bs, end: r });
+                        }
+                        stack.pop();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            pending = Some((r, indent));
+        }
+        // EOF：关闭仍开着的块（延伸到最后一行）。
+        let end = n;
+        while let Some((bs, _bi)) = stack.pop() {
+            if end >= bs + 2 {
+                out.push(Fold { start: bs, end });
+            }
+        }
+        out
+    }
+
+    /// 重扫折叠候选：≤ 阈值的整篇扫，超大文档清空（改为按需折叠）。
+    fn recompute_fold_candidates(&mut self) {
+        if self.row_count > FOLD_CANDIDATE_FULL_MAX_LINES {
+            self.fold_candidates.clear();
+        } else {
+            self.fold_candidates = self.scan_fold_candidates();
+        }
+    }
+
+    /// 编辑后按需重扫候选：行数变了，或编辑跨度触及某候选的边界（start−1..=end）才重扫。
+    fn recompute_candidates_if_dirty(&mut self, prev_rows: usize, line_a: usize, line_b: usize) {
+        if self.row_count != prev_rows {
+            self.recompute_fold_candidates();
+            return;
+        }
+        let touches = self.fold_candidates.iter().any(|f| {
+            let lo = f.start.saturating_sub(1);
+            line_b >= lo && line_a <= f.end
+        });
+        if touches {
+            self.fold_candidates = self.scan_fold_candidates();
+        }
+    }
+
+    /// 以 `line` 为起点的折叠候选（gutter 指示器/点击折叠的区间来源）。
+    fn candidate_starting_at(&self, line: usize) -> Option<Fold> {
+        self.fold_candidates
+            .iter()
+            .find(|f| f.start == line)
+            .copied()
+    }
+
+    /// `line` 是否有「可折叠」标记：已激活折叠首行，或折叠候选起点。
+    fn has_fold_or_candidate(&self, line: usize) -> bool {
+        self.folds.fold_starting_at(line).is_some()
+            || self.candidate_starting_at(line).is_some()
+    }
+
+    /// 重扫括号标尺配对：≤ 阈值整篇扫（跨字符串/注释词法），超大文档清空。
+    fn recompute_bracket_pairs(&mut self) {
+        if self.row_count > FOLD_CANDIDATE_FULL_MAX_LINES {
+            self.bracket_pairs.clear();
+        } else {
+            let buffer = &self.buffer;
+            self.bracket_pairs = scan_bracket_pairs(
+                |r| buffer.line_text(r),
+                self.row_count,
+            );
+        }
+    }
+
+    /// 括号标尺在当前视口内的竖线段：`(x_px, y_rel, h_px)`（文本区本地坐标）。
+    /// 每个跨行括号配对一根竖线，位于**块首行缩进列**（`guide_units` × 字宽，随横向
+    /// 滚动），从开行**之后**画到闭行**之前**（不占开/闭行 → 不压 `{`/`}` 字形）。
+    ///
+    /// **同列区间合并**：同一列上重叠/相邻的竖线合并成一根连续线——否则两条 1px
+    /// 线在同像素叠加会显得更暗/更粗（同列嵌套块会命中此情况）。
+    /// `top_vis`/`off` = `abs_scroll_top()`；`lh` 行高；`harea_w` 文本区宽；`view_h` 视口高。
+    fn bracket_guide_segments(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        harea_w: f32,
+        view_h: f32,
+    ) -> Vec<(f32, f32, f32)> {
+        if self.bracket_pairs.is_empty() {
+            return Vec::new();
+        }
+        let cw = self.char_width.as_f32().max(1.);
+        let hscroll = self.hscroll_px();
+        let bottom_vis = top_vis.saturating_add(((view_h / lh).ceil() as usize) + 1);
+        // (x, 视觉顶行, 视觉底行**开区间**) —— 先整列收集，再合并同列重叠/相邻段。
+        let mut intervals: Vec<(f32, usize, usize)> = Vec::new();
+        for p in &self.bracket_pairs {
+            if p.open_line >= p.close_line {
+                continue; // 过期（编辑后未及时重扫）的配对；重扫会清理。
+            }
+            let vs = self.folds.visual_row(p.open_line);
+            let ve = self.folds.visual_row(p.close_line);
+            // 区间 [open 行之后, close 行之前)。
+            let seg_top = vs.saturating_add(1);
+            let seg_bot = ve.saturating_sub(1);
+            if seg_bot < seg_top {
+                continue; // 相邻行块（无体）或折叠压缩 → 无竖线。
+            }
+            if seg_bot < top_vis || seg_top > bottom_vis {
+                continue; // 与视口不相交。
+            }
+            let x = p.guide_units as f32 * cw - hscroll;
+            if x < 0.0 || x > harea_w {
+                continue; // 出文本区裁掉。
+            }
+            intervals.push((
+                x.round().max(0.0),
+                seg_top.max(top_vis),
+                seg_bot.min(bottom_vis).saturating_add(1),
+            ));
+        }
+        // 按列排序，合并同列重叠/相邻区间。
+        intervals.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        let mut out: Vec<(f32, f32, f32)> = Vec::new();
+        let mut cur: Option<(f32, usize, usize)> = None;
+        for (x, t, b) in intervals {
+            match &mut cur {
+                Some((cx, ct, cb)) if *cx == x && t <= *cb => {
+                    *cb = (*cb).max(b);
+                }
+                _ => {
+                    if let Some((cx, ct, cb)) = cur.take() {
+                        out.push((
+                            cx,
+                            (ct as f32 - top_vis as f32) * lh - off,
+                            (cb - ct) as f32 * lh,
+                        ));
+                    }
+                    cur = Some((x, t, b));
+                }
+            }
+        }
+        if let Some((cx, ct, cb)) = cur {
+            out.push((
+                cx,
+                (ct as f32 - top_vis as f32) * lh - off,
+                (cb - ct) as f32 * lh,
+            ));
+        }
+        out
     }
 
     fn arrow(&mut self, select: bool, dc: isize, dr: isize, cx: &mut Context<Self>) {
@@ -1563,7 +2057,14 @@ impl CodeEditor {
             return;
         };
         for edit in tx.edits.iter().rev() {
+            // 撤销前该编辑处于「新文本已插入」状态：被替换区 = inserted_range。
+            let la = self.buffer.line_of_offset(edit.start);
+            let lb = self.buffer.line_of_offset(
+                edit.inserted_range().end.min(self.buffer.len()),
+            );
             self.buffer.undo_edit(edit);
+            self.row_count = self.buffer.line_count().max(1);
+            self.folds.sync_edit(la, lb, &edit.old_text, self.row_count);
         }
         // 撤销整组：dirty 用覆盖所有编辑的最小−最大区间（bounding box，保守）
         if let (Some(a), Some(b)) = (
@@ -1588,7 +2089,14 @@ impl CodeEditor {
             return;
         };
         for edit in tx.edits.iter() {
+            // 重做前该编辑处于「旧文本被移除」状态：被替换区 = replaced_range。
+            let la = self.buffer.line_of_offset(edit.start);
+            let lb = self.buffer.line_of_offset(
+                edit.replaced_range().end.min(self.buffer.len()),
+            );
             self.buffer.redo_edit(edit);
+            self.row_count = self.buffer.line_count().max(1);
+            self.folds.sync_edit(la, lb, &edit.new_text, self.row_count);
         }
         if let (Some(a), Some(b)) = (
             tx.edits.iter().map(|e| e.start).min(),
@@ -1741,8 +2249,10 @@ impl EntityInputHandler for CodeEditor {
         let row = self.buffer.line_of_offset(off);
         let byte_col = off - self.buffer.line_start(row);
         let lh = self.line_height.as_f32().max(1.);
+        // 顶部与行高都在视觉空间：逻辑行先映射成视觉行再算 y（折叠体塌缩到首行）。
         let (top_abs, off_px) = self.abs_scroll_top();
-        let y = (row as f32 - top_abs as f32) * lh - off_px;
+        let vis = self.folds.visual_row(row);
+        let y = (vis as f32 - top_abs as f32) * lh - off_px;
         // 字形真实宽度（IME 组合窗口/预选高亮定位不能再用等宽列近似，否则中文错位）。
         let x_text = self
             .row_layout(window, row)
@@ -1857,14 +2367,15 @@ impl Render for CodeEditor {
         let dark = gpui_component::Theme::global(cx).is_dark();
         self.highlighter.set_dark(dark);
 
-        // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对行号**（窗口基址 + 相对滚动）。
+        // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对视觉行号**（窗口基址 + 相对
+        // 滚动；折叠后视觉行 = 逻辑行 − 其前隐藏行数，行窗口以视觉行为上界）。
         let lh = self.line_height.as_f32().max(1.);
         let (vis_top, _vis_off) = self.abs_scroll_top();
         let view_h = self.list_state.viewport_bounds().size.height.as_f32();
         let nrows = ((view_h / lh).ceil() as usize).max(MIN_VISIBLE_ROWS);
         let lo = vis_top.saturating_sub(nrows);
-        let last = self.row_count.saturating_sub(1);
-        let hi = vis_top.saturating_add(nrows * 2).min(last);
+        let last_v = self.folds.visual_line_count().saturating_sub(1);
+        let hi = vis_top.saturating_add(nrows * 2).min(last_v);
         let show_caret = self.caret_shown_now();
         let rows = self.build_rows(window, lo, hi, show_caret);
 
@@ -1908,6 +2419,7 @@ impl Render for CodeEditor {
             mono: self.mono.clone(),
             font_size: self.font_size,
             caret_color: self.caret_color,
+            fold_color: self.gutter_fg,
         };
         let rv = std::rc::Rc::new(rv);
         let list_state = self.list_state.clone();
@@ -1966,11 +2478,25 @@ impl Render for CodeEditor {
             fg: self.gutter_fg,
         });
         let (g_top_abs, gutter_offset) = self.abs_scroll_top();
-        let gutter_rows = self.row_count;
+        let gutter_rows = self.folds.visual_line_count().max(1);
         // 可见行号 = 绝对顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
         // offset：与 List 把首个可见 item 画在 `origin − offset_in_item` 完全一致。
+        // 折叠后 gutter 按**视觉行**取逻辑行号（隐藏行不占视觉行 → 行号呈缺口，
+        // 折叠首行渲染「▾」指示器）。先快照（closure 不捕获 self）。
         let gutter_start = g_top_abs;
         let gutter_count = (((view_h / lh) as f32).ceil() as usize).clamp(1, 4096) + 1;
+        let gutter_items: Vec<Option<(usize, bool)>> = (gutter_start..gutter_start + gutter_count)
+            .map(|vix| {
+                if vix < gutter_rows {
+                    let l = self.folds.logical_row(vix);
+                    // 指示器：激活折叠首行，或自动探测的折叠候选起点（默认可见）。
+                    let folded = self.has_fold_or_candidate(l);
+                    Some((l, folded))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let gutter_col = div()
             .id("ce-gutter-col")
             .debug_selector(|| "ce-gutter-col".into())
@@ -1978,12 +2504,11 @@ impl Render for CodeEditor {
             .left(px(0.))
             .top(px(-gutter_offset))
             .w_full()
-            .children((gutter_start..gutter_start + gutter_count).map(move |ix| {
-                if ix < gutter_rows {
-                    number_element(ix, &gv).into_any_element()
-                } else {
-                    div().h(gv.line_height).into_any_element()
+            .children(gutter_items.into_iter().map(move |item| match item {
+                Some((logical, folded)) => {
+                    number_element(logical, folded, &gv).into_any_element()
                 }
+                None => div().h(gv.line_height).into_any_element(),
             }));
         let gutter_wrap = div()
             .id("ce-gutter")
@@ -1996,6 +2521,60 @@ impl Render for CodeEditor {
             .bg(bg)
             .overflow_hidden()
             .child(gutter_col);
+
+        // 垂直标尺（margin guide）：**纯视觉覆盖层**。坐标 = 行号列右缘 + 列×字宽
+        // − 横向滚动像素（随内容横移、左移出文本区即被 overflow_hidden 裁掉，行为同
+        // VS Code 方案 A）。不参与文本布局、不依赖 ListState——折叠/滚动/分帧都无关。
+        // 放在 `core` 第一个子元素 → 画在编辑器背景之上、文本/选区/滚动条之下。
+        let ruler_wrap = EDITOR_RULER_COLUMNS.iter().fold(
+            div()
+                .id("ce-rulers")
+                .debug_selector(|| "ce-rulers".into())
+                .absolute()
+                .top(px(0.))
+                .bottom(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .overflow_hidden(),
+            |wrap, &col| match self.ruler_screen_x(col, avail_w) {
+                Some(x) => wrap.child(
+                    div()
+                        .absolute()
+                        .debug_selector(|| "ce-ruler-line".into())
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .left(px(x))
+                        .w(px(1.))
+                        .bg(self.ruler_color),
+                ),
+                None => wrap,
+            },
+        );
+
+        // 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
+        // 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
+        // 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。
+        let guide_segments =
+            self.bracket_guide_segments(vis_top, _vis_off, lh, harea_w, view_h);
+        let guide_layer = div()
+            .id("ce-bracket-guides")
+            .debug_selector(|| "ce-bracket-guides".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(self.gutter_width_px)
+            .right(px(0.))
+            .overflow_hidden()
+            .children(guide_segments.into_iter().map(|(x, y, h)| {
+                div()
+                    .absolute()
+                    .debug_selector(|| "ce-bracket-guide".into())
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(1.))
+                    .h(px(h.max(0.)))
+                    .bg(self.guide_color)
+            }));
 
         let core = div()
             .id("code-editor")
@@ -2137,6 +2716,10 @@ impl Render for CodeEditor {
                 ed.paste(window, cx);
                 cx.stop_propagation()
             }))
+            // 垂直标尺叠层：第一个子元素 → 位于文本/选区/滚动条之下（经典后台参考线）。
+            .child(ruler_wrap)
+            // 括号标尺竖线叠层：也在文本之下（与标尺同级序），盖在背景上、不挡文本。
+            .child(guide_layer)
             .child(harea)
             // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
             // 竖向滚动与文本逐行一致。
@@ -2225,6 +2808,23 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
                     .bg(rv.caret_color),
             )
         })
+        // 折叠首行的「…」指示器：独立绝对定位元素（不进 StyledText，不污染行内
+        // 测量），尾随在行文本之后，颜色用次要前景。
+        .when(rd.folded.is_some(), |this| {
+            let x = rd.folded.unwrap_or(0.);
+            this.child(
+                div()
+                    .absolute()
+                    .debug_selector(|| "ce-fold-marker".into())
+                    .top(px(0.))
+                    .left(px(x))
+                    .h(rv.line_height)
+                    .font_family(rv.mono.clone())
+                    .text_size(rv.font_size)
+                    .text_color(rv.fold_color)
+                    .child("…"),
+            )
+        })
 }
 
 fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
@@ -2305,8 +2905,9 @@ struct GutterView {
 }
 
 /// 行号单元格：右对齐、行高与文本行一致。由共享 ListState 的第二个 `list()`
-/// 驱动 → 行号与文本行对齐、随滚动同步移动且不闪烁。
-fn number_element(ix: usize, gv: &GutterView) -> gpui::Div {
+/// 驱动 → 行号与文本行对齐、随滚动同步移动且不闪烁。`folded=true` 时在行号左侧
+/// 渲染「▾」（指示该行为折叠首行、有隐藏内容，点击可展开——见 `on_mouse_down`）。
+fn number_element(ix: usize, folded: bool, gv: &GutterView) -> gpui::Div {
     let number = SharedString::from((ix + 1).to_string());
     div()
         .h(gv.line_height)
@@ -2318,6 +2919,14 @@ fn number_element(ix: usize, gv: &GutterView) -> gpui::Div {
         .text_color(gv.fg)
         .text_size(gv.font_size)
         .font_family(gv.mono.clone())
+        .when(folded, |this| {
+            this.child(
+                div()
+                    .debug_selector(|| "ce-fold-arrow".into())
+                    .pr(px(2.))
+                    .child("▾"),
+            )
+        })
         .child(number)
 }
 
@@ -2544,4 +3153,11 @@ impl Element for EditorElement {
             cx.stop_propagation();
         });
     }
+}
+
+/// 行首空白字节数（空格/Tab；缩进折叠启发式用）。
+fn leading_ws_len(s: &str) -> usize {
+    s.bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
 }

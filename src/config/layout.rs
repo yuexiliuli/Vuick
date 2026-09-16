@@ -26,3 +26,7 @@ pub const SIDEBAR_WIDTH_MAX: f32 = 480.0;
 pub const HSCROLL_GAP_RIGHT: Pixels = px(3.);
 /// 横向滚动条滑块最小尺寸（px）。
 pub const HSCROLL_THUMB_MIN: Pixels = px(26.);
+/// 编辑器垂直标尺（margin guide）的列位置（宽度单位列：CJK=2 格），多列升序。
+/// **默认置空（不画）**：用户真正需要的是「括号标尺」（见 view.rs bracket guides），
+/// 这条第 80 列的长竖线会显得多余。如需启用显式填列（如 `&[80, 100]`）。
+pub const EDITOR_RULER_COLUMNS: &[usize] = &[];

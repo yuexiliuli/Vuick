@@ -35,6 +35,7 @@
 #![allow(dead_code)] // 组件库公共 API：接入 app 主视图前，bin crate 会对未使用项误报 dead_code
 
 pub mod buffer;
+pub mod fold;
 pub mod highlight;
 pub mod movement;
 pub mod selection;

@@ -38,6 +38,10 @@ pub const EDITOR_LIST_PROVISIONAL_ROWS: usize = 512;
 /// 纵向最大滚动量底部的**额外**行数（在横向滚动条厚度之上再预留的余量）：
 /// 滚到底时最后一行停在「横向滚动条之上 + 再多 8 行」之上，保证不被叠加的横向滚动条遮住。
 pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 8;
+/// 自动折叠候选（gutter 默认指示器）的**全量扫描行数上限**：≤该行数的文档打开/编辑
+/// 时整篇扫一遍缩进折叠候选（O(行数)，几十万行毫秒级），gutter 默认显示可折叠指示器；
+/// 超过则由「手动 Ctrl+Shift+[/点击」按需折叠（候选为空，避免超大文档每键 O(N) 重扫）。
+pub const FOLD_CANDIDATE_FULL_MAX_LINES: usize = 200_000;
 /// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
 pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
 /// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。

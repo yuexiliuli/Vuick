@@ -2,6 +2,7 @@
 //! （渲染、输入、撤销、选区、鼠标）。
 
 use super::*;
+use crate::editor::fold::Fold;
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
 use crate::editor::undo::EditIntent;
@@ -635,6 +636,307 @@ fn mouse_click_places_caret_on_second_row(cx: &mut TestAppContext) {
     settle(&mut cx);
     let sel = editor_selection(&host, &mut cx);
     assert_eq!(sel.head(), "row0\n".len(), "应落到第 2 行行首");
+}
+
+#[gpui::test]
+fn fold_block_heuristic_detects_indent_blocks(cx: &mut TestAppContext) {
+    let text = "fn foo() {\n    a();\n    b();\n}\nfn bar() {\n    c();\n}";
+    let (host, cx) = open(cx, text);
+    let ends = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        // 0 行块：缩进 0，直到同缩进 "}" → [0,3)；4 行块（单行体）→ [4,6)。
+        (ed.test_fold_block_end(0), ed.test_fold_block_end(4))
+    });
+    assert_eq!(ends, (Some(3), Some(6)));
+    // 文件末行无后续块 → 不可折叠。
+    let none = cx.update(|_, cx| host.read(cx).ed.read(cx).test_fold_block_end(6));
+    assert_eq!(none, None);
+}
+
+#[gpui::test]
+fn fold_reduces_scroll_range_and_expand_restores(cx: &mut TestAppContext) {
+    let text = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let (host, mut cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(5, 10)));
+    settle(&mut cx);
+    let folded = cx.update(|_, cx| host.read(cx).ed.read(cx).test_scroll_item_count());
+    // 折叠 [5,10) 隐藏 4 行 → 量程条目数应相对全文减少。
+    assert!(folded < 20 + 8, "折叠后量程条目数应缩小（folded={folded}）");
+    // 再次 toggle（同为 start）→ 展开恢复。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(5, 10)));
+    settle(&mut cx);
+    let expanded = cx.update(|_, cx| host.read(cx).ed.read(cx).test_scroll_item_count());
+    assert!(expanded > folded, "展开后量程条目数应恢复（{folded} → {expanded}）");
+}
+
+#[gpui::test]
+fn click_maps_through_fold_to_logical_line(cx: &mut TestAppContext) {
+    // 20 行折叠 [5,10)（隐藏 6..9）。视觉行 7 = 逻辑行 11：点击应命中 11 行行首。
+    let text = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let (host, mut cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(5, 10)));
+    settle(&mut cx);
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1).max(1.);
+    let y = px(lh * 7.5); // 视觉行 7
+    let x = px(4.); // 行号列内 → 列 0
+    let mods = Modifiers::default();
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    settle(&mut cx);
+    let head = editor_selection(&host, &mut cx).head();
+    let expected = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(11, 0));
+    assert_eq!(head, expected, "点击视觉行 7 应命中折叠后的逻辑行 11（{head} vs {expected}）");
+}
+
+#[gpui::test]
+fn gutter_click_toggles_active_fold(cx: &mut TestAppContext) {
+    let text = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let (host, mut cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(5, 10)));
+    settle(&mut cx);
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1).max(1.);
+    // 点击折叠首行（视觉行 5）gutter → 展开。
+    let y = px(lh * 5.5);
+    let x = px(2.);
+    let mods = Modifiers::default();
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    settle(&mut cx);
+    assert!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().is_empty()),
+        "点击折叠首行 gutter 应展开折叠"
+    );
+}
+
+#[gpui::test]
+fn typing_inside_folded_body_expands_fold(cx: &mut TestAppContext) {
+    let (host, mut cx) = open(cx, "aaa\nbbb\nccc\nddd");
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(1, 3))); // 隐藏行 2
+    settle(&mut cx);
+    // 把光标直接放进隐藏行 2 中间，键入 → 自动展开并写入。
+    let off = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(2, 1));
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.set_caret_to(off)));
+    focus(&host, cx);
+    cx.simulate_keystrokes("X");
+    settle(&mut cx);
+    assert!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().is_empty()),
+        "编辑折叠体内应自动展开折叠"
+    );
+    // 行 0="aaa" 行 1="bbb" 行 2="ccc"（被折叠隐藏）行 3="ddd"：在行 2 第 1 列插 X。
+    assert_eq!(editor_text(&host, &mut cx), "aaa\nbbb\ncXcc\nddd");
+}
+
+#[gpui::test]
+fn ctrl_shift_bracket_folds_and_unfolds(cx: &mut TestAppContext) {
+    let text = "fn foo() {\n    a();\n    b();\n}";
+    let (host, mut cx) = open(cx, text);
+    focus(&host, cx);
+    let w = window_handle(&mut cx);
+    // 光标在 0 行：Ctrl+Shift+[ → 折叠 [0,3)。
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-shift-[").unwrap());
+    settle(&mut cx);
+    let folds = cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().to_vec());
+    assert_eq!(folds, vec![Fold { start: 0, end: 3 }]);
+    // Ctrl+Shift+] → 展开。
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-shift-]").unwrap());
+    settle(&mut cx);
+    assert!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().is_empty()),
+        "Ctrl+Shift+] 应展开折叠"
+    );
+}
+
+#[gpui::test]
+fn ruler_x_computed_from_metric_and_moves_with_hscroll(cx: &mut TestAppContext) {
+    // 长行文档让横向可视范围/滚动条可用。
+    let text = "x".repeat(300);
+    let (host, mut cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (cw, _, gutter) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    // 测试窗 1920 宽 > 80 列标尺位置 → 标尺在可视区。
+    let avail_w = cx.update(|_, cx| host.read(cx).ed.read(cx).test_content_w_px());
+    let x0 = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_ruler_x(80, avail_w))
+        .expect("80 列标尺应在可视区");
+    assert!(
+        (x0 - (gutter + 80.0 * cw)).abs() < 1.0,
+        "标尺 x 应 = gutter + col*char_width（x0={x0}）"
+    );
+    // 横向滚动 ≥5 格 → 标尺随内容左移约 300px。
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + 50.),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(300.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(&mut cx);
+    let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(hscroll > 0., "应真正横向滚动（hscroll={hscroll}）");
+    let x1 = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_ruler_x(80, avail_w))
+        .expect("80 列标尺滚动后仍应在可视区");
+    assert!(
+        (x1 - (x0 - hscroll)).abs() < 1.0,
+        "标尺应随内容左移 hscroll（x0={x0} x1={x1} hscroll={hscroll}）"
+    );
+}
+
+#[gpui::test]
+fn fold_candidates_detected_for_indented_blocks(cx: &mut TestAppContext) {
+    // 打开即自动探测：内层 if 块 + 外层函数块（可嵌套）。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    let cands = cx.update(|_, cx| host.read(cx).ed.read(cx).test_fold_candidates().to_vec());
+    assert_eq!(cands, vec![Fold { start: 1, end: 3 }, Fold { start: 0, end: 5 }]);
+    // gutter 指示器口径：候选起点行有标记。
+    let marks = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        let ed = ed.read(cx);
+        (
+            ed.test_has_fold_or_candidate(0),
+            ed.test_has_fold_or_candidate(1),
+            ed.test_has_fold_or_candidate(2),
+        )
+    });
+    assert_eq!(marks, (true, true, false));
+}
+
+#[gpui::test]
+fn gutter_click_on_candidate_creates_fold(cx: &mut TestAppContext) {
+    // 候选已自动探测但未激活：点击 candidate 起点行的 gutter → 创建激活折叠。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, mut cx) = open(cx, text);
+    // 确认尚未激活。
+    assert!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().is_empty()),
+        "打开时不应有激活折叠"
+    );
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1).max(1.);
+    // 视觉行 1 = 逻辑行 1（if 块候选）。
+    let y = px(lh * 1.5);
+    let x = px(2.);
+    let mods = Modifiers::default();
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    settle(&mut cx);
+    let folds = cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().to_vec());
+    assert_eq!(folds, vec![Fold { start: 1, end: 3 }], "点击候选起点应创建激活折叠");
+}
+
+#[gpui::test]
+fn ruler_infra_renders_but_defaults_off(cx: &mut TestAppContext) {
+    // margin guide 默认关闭（EDITOR_RULER_COLUMNS 为空）：叠层容器仍渲染、无竖线子元素；
+    // 坐标换算（第 80 列在可视区内应给 Some(x)）保持精确，供用户配置恢复使用。
+    let text = "x".repeat(300);
+    let (host, cx) = open(cx, &text);
+    let (cw, _, gutter) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let avail_w = cx.update(|_, cx| host.read(cx).ed.read(cx).test_content_w_px());
+    let x = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_ruler_x(80, avail_w))
+        .expect("第 80 列在可视区内应可通过单纯换算得到 x");
+    assert!((x - (gutter + 80.0 * cw)).abs() < 1.0, "标尺换算 = gutter + col*char_width");
+    assert!(
+        cx.debug_bounds("ce-rulers").is_some(),
+        "标尺叠层容器仍应在渲染树中"
+    );
+    // 默认列数为空 → 不渲染任何 ce-ruler-line（margin guide 默认隐藏）。
+    assert!(
+        cx.debug_bounds("ce-ruler-line").is_none(),
+        "默认不渲染第 80 列竖线（用户要的是括号标尺）"
+    );
+}
+
+#[gpui::test]
+fn bracket_guides_detected_and_rendered(cx: &mut TestAppContext) {
+    // 用户示例：三对跨行花括号 → 三条括号标尺竖线。
+    let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
+    let (host, cx) = open(cx, text);
+    let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
+    assert_eq!(
+        pairs,
+        vec![
+            crate::editor::fold::BracketPair { open_line: 2, open_col: 13, close_line: 4, guide_units: 8 },
+            crate::editor::fold::BracketPair { open_line: 1, open_col: 23, close_line: 5, guide_units: 4 },
+            crate::editor::fold::BracketPair { open_line: 0, open_col: 13, close_line: 6, guide_units: 0 },
+        ]
+    );
+    // 竖线叠层确实渲染进树。
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_some(),
+        "括号标尺叠层应渲染"
+    );
+}
+
+#[gpui::test]
+fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
+    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**之前**。
+    let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
+    let (host, cx) = open(cx, text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let harea_w = 1200.0;
+    let view_h = 1000.0;
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, harea_w, view_h)
+    });
+    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行)。
+    assert_eq!(segs.len(), 3, "三对跨行花括号 → 三条竖线");
+    // 外层 impl 块：x≈0cw、y=1lh 起、高 5lh（行 1..5，闭行 6 前结束）。
+    let impl_guide = segs
+        .iter()
+        .find(|(x, y, h)| (*y - 1.0 * lh).abs() < 0.5 && (*h - 5.0 * lh).abs() < 0.5)
+        .expect("应有 impl 块竖线 (y=1lh, h=5lh)");
+    assert!(
+        (impl_guide.0 - 0.0 * cw).abs() < 1.0,
+        "外层竖线应在块首列 0×字宽，实际 {}",
+        impl_guide.0
+    );
+    // Self 块：x≈8cw、y=3lh 起、高 1lh（仅行 3）。
+    let self_guide = segs
+        .iter()
+        .find(|(_, y, h)| (*y - 3.0 * lh).abs() < 0.5 && (*h - 1.0 * lh).abs() < 0.5)
+        .expect("应有 Self 块竖线 (y=3lh, h=1lh)");
+    assert!(
+        (self_guide.0 - 8.0 * cw).abs() < 1.0,
+        "内层竖线应在块首列 8×字宽，实际 {}",
+        self_guide.0
+    );
+}
+
+#[gpui::test]
+fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
+    // 同列（缩进 0）嵌套的两个块：原会画两条重叠竖线（视觉加粗/变色），合并成一根。
+    let text = "fn a() {\n{\n    x();\n}\n}";
+    let (host, cx) = open(cx, text);
+    let (_, lh, _) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
+    });
+    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)。
+    assert_eq!(segs.len(), 1, "同列重叠竖线应合并为一根");
+    assert!(
+        (segs[0].1 - 1.0 * lh).abs() < 0.5 && (segs[0].2 - 3.0 * lh).abs() < 0.5,
+        "合并段应覆盖行 1..3（实际 y={} h={}）",
+        segs[0].1,
+        segs[0].2
+    );
 }
 
 #[gpui::test]
