@@ -45,6 +45,7 @@ use gpui_component::input::{
 
 use crate::config::limits::{
     EDITOR_LIST_DEFER_MIN_LINES, EDITOR_LIST_GROW_CHUNK_LINES, EDITOR_LIST_PROVISIONAL_ROWS,
+    EDITOR_VSCROLL_BOTTOM_EXTRA_LINES,
 };
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
@@ -265,7 +266,8 @@ impl CodeEditor {
             focus_registered: false,
             element_bounds: Bounds::default(),
             list_mount: ListMountState::Ready,
-            pixel_scroll: false,
+            // 全文档统一像素级确定性量程（见 ListMountState/pixel_scroll 注释）。
+            pixel_scroll: true,
             pending_grow: None,
             grow_loop_running: false,
             tab_size: 4,
@@ -368,11 +370,13 @@ impl CodeEditor {
         self.list_state.viewport_bounds().size.height.as_f32()
     }
 
-    /// 竖向最大滚动量（px，测试断言用：换宽会清空 size_hint，量程不应坍缩）。
+    /// 竖向最大滚动量（px，测试断言用；像素路径含底部预留，滚到底时最后一行在
+    /// 横向滚动条之上）。
     #[cfg(test)]
     pub(crate) fn list_max_offset(&self) -> f32 {
         if self.pixel_scroll {
             (self.row_count as f32 * self.line_height.as_f32().max(1.)
+                + self.vscroll_bottom_pad_px()
                 - self.list_state.viewport_bounds().size.height.as_f32())
                 .max(0.)
         } else {
@@ -380,11 +384,11 @@ impl CodeEditor {
         }
     }
 
-    /// 纵向量程总高（px）。uniform 路径 = `max_offset_for_scrollbar().y + 视口高`；
-    /// 像素两段式路径 = 行数 × 行高（确定性，条目不预铺高度所以恒精确）。诊断/测试用。
+    /// 纵向量程总高（px）。像素路径 = 行数 × 行高 + 底部预留（确定性）；诊断/测试用。
     pub(crate) fn vertical_total_px(&self) -> f32 {
         if self.pixel_scroll {
             self.row_count as f32 * self.line_height.as_f32().max(1.)
+                + self.vscroll_bottom_pad_px()
         } else {
             self.list_state.max_offset_for_scrollbar().y.as_f32()
                 + self.list_state.viewport_bounds().size.height.as_f32()
@@ -584,13 +588,14 @@ impl CodeEditor {
             self.row_count = new_n;
             return;
         }
-        // 小文档 / 撤销重做：同步全量装配 + uniform 高度提示（O(N) 便宜，原行为）。
+        // 小文档 / 撤销重做：同步全量 `reset(N)`（便宜）＋像素量程（不预铺 uniform、
+        // 按需实测——与标题一致，见 struct 的 pixel_scroll 注释）。
         self.list_state.reset(new_n);
         self.gutter_list_state.reset(new_n);
         self.uniform_applied = None;
-        // reset 会清空统一高度提示 → 下帧 refresh_metrics 重新预填。
+        // 像素路径不预填 uniform；这两个标记仅保留给旧路径，避免误触 ensure_uniform_hint。
         self.gutter_uniform_applied = None;
-        self.pixel_scroll = false;
+        self.pixel_scroll = true;
         self.pending_grow = None;
         self.list_mount = ListMountState::Ready;
         self.row_count = new_n;
@@ -911,6 +916,15 @@ impl CodeEditor {
     // 确定性像素模型换算成 ListOffset，再交给 `list_state.scroll_to`（只看 item_count，
     // 不看高度）。量程则全由 VerticalScrollHandle 的 content_height 承担。
 
+    /// 纵向最大滚动量的**底部预留**（px）= 横向滚动条厚度 + 额外行数×行高。
+    /// 叠加在底部的横向滚动条会遮住最后一行：预留后滚到底时最后一行停在
+    /// 「横向滚动条之上 + 1 行」，始终可读。
+    fn vscroll_bottom_pad_px(&self) -> f32 {
+        let thickness = gpui_component::scroll::Scrollbar::width().as_f32();
+        thickness
+            + EDITOR_VSCROLL_BOTTOM_EXTRA_LINES as f32 * self.line_height.as_f32().max(1.)
+    }
+
     /// 当前竖向滚动量（px，内容被推出的量；0 = 顶部）。
     fn scroll_top_px(&self) -> f32 {
         let s = self.list_state.logical_scroll_top();
@@ -925,14 +939,12 @@ impl CodeEditor {
         ListOffset { item_ix, offset_in_item: gpui::px(offset.max(0.)) }
     }
 
-    /// 滚到目标像素（夹到 [0, 全文高−视口]），同步给 ListState。
+    /// 滚到目标像素（夹到 [0, 全文高+底部预留−视口]），同步给 ListState。
+    /// 底部预留让最后一行能滚到横向滚动条之上。
     fn scroll_to_px(&mut self, target_px: f32) {
-        if !self.pixel_scroll {
-            return;
-        }
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        let max_px = (self.row_count as f32 * lh - view).max(0.);
+        let max_px = (self.row_count as f32 * lh + self.vscroll_bottom_pad_px() - view).max(0.);
         let px = target_px.clamp(0., max_px);
         // scroll_to 自带 item_ix ≥ item_count 时的钳制：分帧增长未完成时，深跳先停在
         // “已增长的底部”，随后每帧随 splice 增长自动可及（清空/恢复由增长步骤保证）。
@@ -941,22 +953,15 @@ impl CodeEditor {
 
     /// 滚轮竖向滚动（dy = 滚轮 delta，负=向下）。
     fn scroll_vertical(&mut self, dy: f32) {
-        if self.pixel_scroll {
-            self.scroll_to_px(self.scroll_top_px() - dy);
-        } else {
-            self.list_state.scroll_by(px(-dy));
-        }
+        self.scroll_to_px(self.scroll_top_px() - dy);
     }
 
-    /// 把目标行滚进可视区（统一行高模型；大文档像素路径替代 `scroll_to_reveal_item`）。
+    /// 把目标行滚进可视区（统一行高模型；可视高度扣除底部预留，保证被 reveal 的
+    /// 行不会贴到横向滚动条之下）。
     fn reveal_row(&mut self, row: usize) {
-        if !self.pixel_scroll {
-            self.list_state.scroll_to_reveal_item(row);
-            return;
-        }
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        let rows_visible = (view / lh).floor().max(1.) as usize;
+        let rows_visible = ((view - self.vscroll_bottom_pad_px()) / lh).floor().max(1.) as usize;
         let cur_top = (self.scroll_top_px() / lh).floor() as usize;
         if row < cur_top {
             self.scroll_to_px(row as f32 * lh);
@@ -1852,7 +1857,6 @@ impl Render for CodeEditor {
         // 都可靠（不依赖“每次 render 都 self-notify 续帧”的脆弱续环）。
         if self.pending_grow.is_some() && !self.grow_loop_running {
             self.grow_loop_running = true;
-            let entity = cx.entity();
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
@@ -2168,16 +2172,18 @@ impl Render for CodeEditor {
                         let v = VerticalScrollHandle {
                             state: list_state.clone(),
                             content_width: content_w_px,
-                            // 像素路径按「已增长的 item_count × 行高」取量程（增长中不出现
-                            // 拖到“应到但还不可及”的空区）；uniform 小文档路径按全文行数。
+                            // 量程 = 已增长行数 × 行高 + 底部预留：增长中 thumb 反映“现在
+                            // 真正可滚到的高度”；滚到底时最后一行停在横向滚动条之上。
                             content_height: if self.pixel_scroll {
                                 self.list_state.item_count() as f32
                                     * self.line_height.as_f32().max(1.)
+                                    + self.vscroll_bottom_pad_px()
                             } else {
                                 self.row_count as f32 * self.line_height.as_f32()
                             },
                             line_height: self.line_height,
                             pixel_scroll: self.pixel_scroll,
+                            bottom_pad: self.vscroll_bottom_pad_px(),
                         };
                         Scrollbar::vertical(&v)
                             .mode(ScrollbarMode::Always)
@@ -2348,6 +2354,9 @@ struct VerticalScrollHandle {
     content_height: f32,
     line_height: Pixels,
     pixel_scroll: bool,
+    /// 底部预留（px，覆盖层横向滚动条厚 + 额外行数）：量程/滚到底都包含它，保证
+    /// 最后一行能滚到横向滚动条之上，且 thumb 范围与「真实可滚距离」一致。
+    bottom_pad: f32,
 }
 
 impl ScrollbarHandle for VerticalScrollHandle {
