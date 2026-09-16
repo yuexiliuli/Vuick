@@ -135,15 +135,11 @@ pub struct CodeEditor {
     selection: Selection,
     undo: UndoManager,
     focus_handle: FocusHandle,
-    /// 文本区 ListState（竖向虚拟化 + 滚动 + 竖滚动条量程）。行号列用独立的
-    /// [`Self::gutter_list_state`]，两者**锁步**（见 `sync_gutter_scroll`），
-    /// 不共用同一 StateInner——共用会让换宽/统一高度提示互相干扰（量程坍缩实测）。
+    /// 文本区 ListState（竖向虚拟化 + 滚动 + 竖滚动条量程）。行号列**不是**独立的
+    /// O(N) ListState（大文档会白存 3.2M 个空行条目 ≈ 300MB），而是同一帧用本列表
+    /// 的 `logical_scroll_top` 反推出可见行号、以叠层绝对定位渲染（见 render gutter）——
+    /// 与 List 行绘制共用同一滚动状态、同一帧，天然逐像素锁步。
     list_state: ListState,
-    /// 行号列 ListState：与 `list_state` 同 item 数、同行高，滚动由
-    /// `sync_gutter_scroll` 从文本区逐帧对齐。行号不再手工按 `logical_scroll_top`
-    /// 反推 y（旧叠层每次 render 重建，滚轮滚动时与 List 行绘制不同步 → 序号
-    /// 「翻动/闪烁/晃动」），而是由 List 自身虚拟化渲染。
-    gutter_list_state: ListState,
     h_handle: ScrollHandle,
     highlighter: Highlighter,
     language: Option<String>,
@@ -167,9 +163,6 @@ pub struct CodeEditor {
     /// 挡住自愈重挂（此时量程坍缩，立刻拖滚动条会拖不到底）。
     last_list_width: f32,
     uniform_applied: Option<Pixels>,
-    /// 行号列已应用统一高度提示的行高（行号行恒等于 line_height，避免首次整表
-    /// 测量 O(n) 与量程失真；仅在行高/重置后重挂）。
-    gutter_uniform_applied: Option<Pixels>,
     /// 统一高度提示最近一次重挂时间（节流：gpui 换宽会清空 size_hint，
     /// 导致量程坍缩，检测到坍缩后重挂，但同一时间窗口内至多重挂一次）。
     last_uniform_apply: Option<std::time::Instant>,
@@ -232,14 +225,12 @@ impl CodeEditor {
         let buffer = Buffer::default();
         let row_count = buffer.line_count().max(1);
         let list_state = ListState::new(row_count, ListAlignment::Top, px(16.));
-        let gutter_list_state = ListState::new(row_count, ListAlignment::Top, px(16.));
         Self {
             buffer,
             selection: Selection::collapsed(0),
             undo: UndoManager::new(),
             focus_handle,
             list_state,
-            gutter_list_state,
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
             language: None,
@@ -256,7 +247,6 @@ impl CodeEditor {
             content_w_px: 0.,
             last_list_width: 0.,
             uniform_applied: None,
-            gutter_uniform_applied: None,
             last_uniform_apply: None,
             hint_healthy: false,
             bg: rgb(0xffffff).into(),
@@ -571,20 +561,6 @@ impl CodeEditor {
         self.caret_color = colors.foreground;
         // 选区底色同样避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
         self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
-        // 行号列统一高度提示：行号行恒等于 line_height，预填提示可跳过首次整表
-        // 测量（大文档 O(n)），滚动/可视渲染也稳定。
-        // 像素两段式（pixel_scroll）：行号条目不预铺 uniform，按需实测（行号列没有
-        // 滚动条，量程由像素滚动承担），`gutter_uniform_applied` 不再需要。
-        if !self.pixel_scroll
-            && self.list_mount == ListMountState::Ready
-            && self.gutter_uniform_applied != Some(self.line_height)
-        {
-            self.gutter_list_state = self
-                .gutter_list_state
-                .clone()
-                .with_uniform_item_height(self.line_height);
-            self.gutter_uniform_applied = Some(self.line_height);
-        }
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
@@ -623,9 +599,7 @@ impl CodeEditor {
             // 增长目标是 `N + 底部预留空行`：空行占真实列表高度，滚到底才有可见预留区。
             let prov = EDITOR_LIST_PROVISIONAL_ROWS.min(new_n);
             self.list_state.reset(prov);
-            self.gutter_list_state.reset(prov);
             self.uniform_applied = None;
-            self.gutter_uniform_applied = None;
             self.pixel_scroll = true;
             self.pending_grow = Some(want_items);
             self.list_mount = ListMountState::Provisional;
@@ -646,10 +620,7 @@ impl CodeEditor {
         // 小文档 / 撤销重做：同步全量 `reset(N)`（便宜）＋像素量程（不预铺 uniform、
         // 按需实测——与标题一致，见 struct 的 pixel_scroll 注释）。
         self.list_state.reset(want_items);
-        self.gutter_list_state.reset(want_items);
         self.uniform_applied = None;
-        // 像素路径不预填 uniform；这两个标记仅保留给旧路径，避免误触 ensure_uniform_hint。
-        self.gutter_uniform_applied = None;
         self.pixel_scroll = true;
         self.pending_grow = None;
         self.list_mount = ListMountState::Ready;
@@ -689,11 +660,9 @@ impl CodeEditor {
         let saved = self.list_state.logical_scroll_top();
         let t_g = std::time::Instant::now();
         self.list_state.splice(cur..cur, chunk);
-        self.gutter_list_state.splice(cur..cur, chunk);
         // 追加在末尾不改变既有行位置，但 gpui splice 在「滚动停在旧末尾」时会误移
         // item_ix，显式恢复保存的滚动顶（像素位置不变）。
         self.list_state.scroll_to(saved);
-        self.gutter_list_state.scroll_to(saved);
         // 深跳收敛：若用户目标（desired_scroll，见 scroll_to_px）已被新增条目可达，
         // 立即滚到目标——占位符随即消失、真实内容无缝显现。非占位期目标 == 当前
         // 位置，此处等价于「把滚动钉在原地」（追加不改变既有可见内容）。
@@ -703,7 +672,6 @@ impl CodeEditor {
         if wanted <= reach + SCROLL_REACH_EPS {
             let off = Self::px_to_offset(wanted.min(reach), lh);
             self.list_state.scroll_to(off);
-            self.gutter_list_state.scroll_to(off);
         }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() && (cur < EDITOR_LIST_GROW_CHUNK_LINES) {
             eprintln!(
@@ -728,8 +696,6 @@ impl CodeEditor {
         let new_span = new_b - old_a + 1;
         if new_span != old_span {
             self.list_state
-                .splice(old_a..old_a + old_span, new_span);
-            self.gutter_list_state
                 .splice(old_a..old_a + old_span, new_span);
         }
         self.row_count = self.buffer.line_count().max(1);
@@ -824,19 +790,6 @@ impl CodeEditor {
                 vb.size.width.as_f32(),
                 self.content_w_px,
             );
-        }
-    }
-
-    /// 把文本区 ListState 的竖向滚动位置对齐到行号列（两者锁步）。
-    /// 每次渲染调用一次（O(1) 差量读，仅在两者不同时才写一次）。行号列不挂
-    /// 滚动条、不做统一高度提示，只需反映与文本相同的可视行。
-    fn sync_gutter_scroll(&mut self) {
-        let text_top = self.list_state.logical_scroll_top();
-        let gutter_top = self.gutter_list_state.logical_scroll_top();
-        let drifted = gutter_top.item_ix != text_top.item_ix
-            || (gutter_top.offset_in_item.as_f32() - text_top.offset_in_item.as_f32()).abs() > 0.5;
-        if drifted {
-            self.gutter_list_state.scroll_to(text_top);
         }
     }
 
@@ -1031,13 +984,10 @@ impl CodeEditor {
         let saved = self.list_state.logical_scroll_top();
         if want > cur {
             self.list_state.splice(cur..cur, want - cur);
-            self.gutter_list_state.splice(cur..cur, want - cur);
         } else {
             self.list_state.splice(want..cur, 0);
-            self.gutter_list_state.splice(want..cur, 0);
         }
         self.list_state.scroll_to(saved);
-        self.gutter_list_state.scroll_to(saved);
     }
 
     /// ListState **实际**滚动位置（px，不读 `desired_scroll`）。用于重建后把
@@ -1309,10 +1259,10 @@ impl CodeEditor {
         (s.item_ix, s.offset_in_item.as_f32())
     }
 
-    /// 测试用：行号列竖向滚动顶（应与文本区锁步一致）。
+    /// 测试用：行号列竖向滚动顶。行号已是文本列表的叠层（同一 `logical_scroll_top`），
+    /// 故恒等于 [`Self::test_text_scroll_top`]——保留此测试只读方法只为既有回归可跑。
     pub(crate) fn test_gutter_scroll_top(&self) -> (usize, f32) {
-        let s = self.gutter_list_state.logical_scroll_top();
-        (s.item_ix, s.offset_in_item.as_f32())
+        self.test_text_scroll_top()
     }
 
     /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
@@ -2027,8 +1977,6 @@ impl Render for CodeEditor {
             })
             .detach();
         }
-        // 行号列与文本区竖向锁步（覆盖滚轮/拖动滚动条/reveal 等一切滚动来源）。
-        self.sync_gutter_scroll();
         // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
         if self.char_width.as_f32() > 0. {
             self.hscroll_cols = ((-self.h_handle.offset().x.as_f32())
@@ -2140,28 +2088,38 @@ impl Render for CodeEditor {
             .track_scroll(&self.h_handle)
             .child(inner);
 
-        // 行号 gutter：固定编辑区左缘、不随内容横向滚动。**与文本共用同一个
-        // ListState 的第二个 `list()`** —— 竖向滚动完全由 List 自身虚拟化+绘制，
-        // 不再手工按 `logical_scroll_top` 反推每个行号 y（旧叠层每次 render 重建，
-        // 滚轮滚动时与 List 行绘制差半拍 → 序号「翻动/闪烁/晃动」）。两列行高、
-        // 滚动位置、可见范围来自同一状态，天然逐像素一致。
+        // 行号 gutter：固定编辑区左缘、不随内容横向滚动。**不是独立的 O(N) ListState**
+        // ——126MB/3.2M 行时那棵「纯行号树」白占 ~300MB。改为同一帧用文本列表的
+        // `logical_scroll_top` 反推出可见行号、绝对定位叠层渲染：与 List 行绘制共用
+        // 同一滚动状态、同一帧（无新旧半拍差异 → 序号不翻/不闪/不晃），末尾的底部
+        // 预留区（ix ≥ row_count）自然不显示行号。视口外部分被 `overflow_hidden` 裁掉。
         let gv = std::rc::Rc::new(GutterView {
             line_height: self.line_height,
             mono: self.mono.clone(),
             font_size: self.font_size,
             fg: self.gutter_fg,
         });
-        // 行号列用独立的 gutter_list_state（与文本锁步），不复用文本的
-        // list_state —— 共用同一 StateInner 会让换宽/统一高度互相干扰（量程坍缩）。
-        // 末尾的底部预留空行（ix ≥ row_count）不显示行号，只占行高留白。
+        let g_top = self.list_state.logical_scroll_top();
         let gutter_rows = self.row_count;
-        let gutter_content = list(self.gutter_list_state.clone(), move |ix, _window, _cx| {
-            if ix >= gutter_rows {
-                return div().h(gv.line_height).into_any_element();
-            }
-            number_element(ix, &gv).into_any_element()
-        })
-        .size_full();
+        // 可见行号 = 逻辑顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
+        // offset：与 List 把首个可见 item 画在 `origin − offset_in_item` 完全一致。
+        let gutter_start = g_top.item_ix;
+        let gutter_offset = g_top.offset_in_item.as_f32();
+        let gutter_count = (((view_h / lh) as f32).ceil() as usize).clamp(1, 4096) + 1;
+        let gutter_col = div()
+            .id("ce-gutter-col")
+            .debug_selector(|| "ce-gutter-col".into())
+            .absolute()
+            .left(px(0.))
+            .top(px(-gutter_offset))
+            .w_full()
+            .children((gutter_start..gutter_start + gutter_count).map(move |ix| {
+                if ix < gutter_rows {
+                    number_element(ix, &gv).into_any_element()
+                } else {
+                    div().h(gv.line_height).into_any_element()
+                }
+            }));
         let gutter_wrap = div()
             .id("ce-gutter")
             .debug_selector(|| "ce-gutter".into())
@@ -2172,7 +2130,7 @@ impl Render for CodeEditor {
             .w(self.gutter_width_px)
             .bg(bg)
             .overflow_hidden()
-            .child(gutter_content);
+            .child(gutter_col);
 
         // 深跳占位期（分帧增长未完成 + 目标超出已增长范围）：ListState 还显示不了
         // 目标行，用全屏占位符提示正在加载的行号；增长赶上后 jumping 变 false，
