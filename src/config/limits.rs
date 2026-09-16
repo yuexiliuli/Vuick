@@ -35,7 +35,7 @@ pub const EDITOR_LIST_PROVISIONAL_ROWS: usize = 512;
 pub const EDITOR_LIST_GROW_CHUNK_LINES: usize = 32_768;
 /// 纵向最大滚动量底部的**额外**行数（在横向滚动条厚度之上再预留的余量）：
 /// 滚到底时最后一行停在「横向滚动条之上 + 再多 1 行」，保证不被叠加的横向滚动条遮住。
-pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 1;
+pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 8;
 /// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
 pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
 /// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。

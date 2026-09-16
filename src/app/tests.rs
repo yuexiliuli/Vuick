@@ -1956,6 +1956,124 @@
         );
     }
 
+    /// 回归（专家评审 P1）：大文档分帧增长期间的「深跳」——Ctrl+End / 搜索跳到远超
+    /// 已增长范围的行时：
+    /// 1. 不再钳在「已增长底部」（滚动条在底部而行号列显示 ~1M 的错位）；
+    /// 2. 立即进入深跳占位期（desired_scroll = 目标，jump_placeholder_active=true，
+    ///    render 显示「正在加载第 R 行…」）；
+    /// 3. 后续每帧增长赶上后自动收敛到目标行（占位消失、真实内容落位），全程无
+    ///    「快进式补足」的大块 splice。
+    #[gpui::test]
+    async fn deep_jump_during_grow_placeholder_then_converges(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 90k 行（≈2.7 个增长块）：深跳目标在增长到全文之后才是「可直达行」，
+        // 确保测试期间能处于「已增长 < 目标」的占位中间态。
+        let line = "x".repeat(60);
+        let content = (0..90_000)
+            .map(|i| format!("{line} {i:010}\n"))
+            .collect::<String>();
+        use gpui_component::input::RopeExt as _;
+        let rope = gpui_component::input::Rope::from(content.as_str());
+        let line_count = rope.lines_len();
+        assert!(
+            line_count > crate::config::limits::EDITOR_LIST_DEFER_MIN_LINES as usize,
+            "测试应超过两段式阈值，实际 {line_count} 行"
+        );
+
+        let ed_ent = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        cx.update(|_w, cx| {
+            ed_ent.update(cx, |ed, cx| {
+                ed.set_rope_with_stats(rope.clone(), 0, Default::default());
+                // 常规（未跳转）：不进入占位期（desired=0 ≤ 已增长可滚范围）
+                assert!(!ed.test_jump_placeholder_active(), "未跳转不应占位");
+                assert_eq!(ed.test_desired_scroll_px(), 0.);
+                cx.notify(); // 等价 load_file_text 的 notify，驱动首帧 render
+            });
+        });
+
+        // 驱动增长到「至少一个大块且未铺满全文」的中间态。
+        let mut frames = 0;
+        loop {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            let (ic, lc) = cx.update(|_w, cx| {
+                let ed = ed_ent.read(cx);
+                (ed.test_list_state().item_count(), ed.line_count())
+            });
+            if ic > crate::config::limits::EDITOR_LIST_GROW_CHUNK_LINES as usize && ic < lc {
+                break;
+            }
+            frames += 1;
+            if frames > 200 {
+                panic!("增长未到中间态：ic={ic} lc={lc}");
+            }
+        }
+
+        // 深跳：选区到全文末尾（模拟 Ctrl+End / 搜索跳转到最后一行）→ 应进入占位期，
+        // ListState 仍停在「已增长底部」（目标行尚未 splice 出来，不能直接显示）。
+        cx.update(|_w, cx| {
+            ed_ent.update(cx, |ed, cx| {
+                ed.set_selection_range(content.len().saturating_sub(1)..content.len(), cx);
+            });
+        });
+        cx.cx.executor().advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        let (listing, placeholder, desired, ic, lh) = cx.update(|_w, cx| {
+            let ed = ed_ent.read(cx);
+            (
+                ed.test_list_state().logical_scroll_top().item_ix,
+                ed.test_jump_placeholder_active(),
+                ed.test_desired_scroll_px(),
+                ed.test_list_state().item_count(),
+                ed.test_metrics().1.max(1.),
+            )
+        });
+        assert!(placeholder, "深跳应进入占位期（目标超出已增长范围）");
+        assert!(
+            listing <= ic.saturating_sub(1),
+            "占位期 ListState 应仍在已增长底部：top={listing}（item_count={ic}）"
+        );
+        assert!(
+            desired / lh > (ic.saturating_sub(1)) as f32,
+            "desired 应在全文末尾、远超已增长行数：desired={desired:.0}px / lh={lh:.0} → {} 行，item_count={ic}",
+            desired / lh
+        );
+
+        // 继续驱动到增长完成：占位消失、列表收敛到目标附近（最后一行）。
+        let mut frames2 = 0;
+        loop {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            let (ph, ic, top) = cx.update(|_w, cx| {
+                let ed = ed_ent.read(cx);
+                (
+                    ed.test_jump_placeholder_active(),
+                    ed.test_list_state().item_count(),
+                    ed.test_list_state().logical_scroll_top().item_ix,
+                )
+            });
+            if !ph && ic == line_count {
+                assert!(
+                    top >= line_count.saturating_sub(64),
+                    "增长完成后应滚到目标附近：top={top}（全文 {line_count} 行）"
+                );
+                break;
+            }
+            frames2 += 1;
+            if frames2 > 200 {
+                panic!("深跳收敛超时：placeholder={ph} ic={ic}");
+            }
+        }
+    }
+
     /// 临时基准（ignored，release）：开不同体积的真实大文档，量化各阶段耗时——
     /// 同步返回 / 内容可见（快段）/ 全文 ListState 分帧增长完成 / 滚动条就绪。
     /// 运行：`cargo test --release -- --ignored bench_open_large_multiple --nocapture`

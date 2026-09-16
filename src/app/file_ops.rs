@@ -765,22 +765,33 @@ fn prepare_text(text: String) -> PreparedText {
     }
 }
 
-/// 大文档「先瞬时显示」版预处理：只做 Rope + 计数（≈几十 ms），**行宽统计留占位**
-/// （`max_line_chars=0`、空直方图）——编辑器文本可以立刻挂上；真统计由后台
-/// `compute_line_stats` 并行算出后经 `Buffer::apply_stats` O(1) 替换。
-/// 占位期的代价仅在「横向滑动条量程/token 余量」上（长行暂时只显示不横滚），
-/// 量化后约几百 ms 内自动收敛，相比让内容等 300+ms 明显更值。
+/// 大文档「先瞬时显示」版预处理：只做 Rope + 计数 + **占位横向量程**（≈几十 ms），
+/// 编辑器文本可以立刻挂上；真统计由后台 `compute_line_stats` 全量算出后经
+/// `Buffer::apply_stats` O(1) 替换。
+/// 占位期 = 均匀采样行宽 ×1.2 的估计（见 [`crate::editor::buffer::sample_line_stats`]），
+/// 横向滚动条量程**立刻可滚**、不坍缩成视口宽（此前空直方图让 116MB 前 7.3s 无法
+/// 左右平移），真值到达后 `apply_stats` 无缝校正。
 fn prepare_text_fast(text: String) -> PreparedText {
     let src_len = text.len();
     let t = std::time::Instant::now();
     let lines = text.lines().count().max(1);
     let chars = text.chars().count();
     let rope = Rope::from(text.as_str());
+    let counts_ms = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let (max_line_chars, line_width_histogram) = crate::editor::buffer::sample_line_stats(&rope);
+    let sample_ms = t.elapsed().as_millis();
     if std::env::var_os("MD_OPEN_DEBUG").is_some() {
         eprintln!(
-            "[MD_OPEN_DEBUG] prepare_text_fast({src_len} B/{} 行): 计数+Rope {:.1} ms",
+            "[MD_OPEN_DEBUG] prepare_text_fast({src_len} B/{} 行): 计数+Rope {:.1} ms, 采样占位行宽 {:.1} ms (est={} 格)",
             lines,
-            t.elapsed().as_secs_f64() * 1000.0
+            counts_ms,
+            sample_ms,
+            line_width_histogram
+                .keys()
+                .next_back()
+                .copied()
+                .unwrap_or(0),
         );
     }
     PreparedText {
@@ -789,8 +800,8 @@ fn prepare_text_fast(text: String) -> PreparedText {
         lines,
         chars,
         src_len,
-        max_line_chars: 0,
-        line_width_histogram: crate::editor::buffer::LineWidthHistogram::new(),
+        max_line_chars,
+        line_width_histogram,
     }
 }
 

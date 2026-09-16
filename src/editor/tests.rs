@@ -128,6 +128,46 @@ fn buffer_max_line_chars_initial_and_grows_on_edit() {
 }
 
 #[test]
+fn buffer_sample_line_stats_placeholder_estimate() {
+    // 大文档「先瞬时显示」占位横向量程：均匀采样 × 安全系数，真统计到达前横向
+    // 滚动条不至于坍缩成视口宽。要求：恒采样第 0 行；估计 ≥ 采样最宽（×1.2 取整）；
+    // 全空行返回空直方图（无内容 → 无横向量程）。
+    use crate::editor::buffer::{sample_line_stats, LINE_SAMPLE_SAFETY};
+    use gpui_component::input::Rope;
+
+    // 最宽行恰在第 0 行（恒采样）：8 格 / 8 字符
+    let rope = Rope::from("zzzzzzzz\nxy\nhi\n");
+    let (mx_chars, hist) = sample_line_stats(&rope);
+    assert_eq!(mx_chars, 8);
+    let est = *hist.keys().next_back().expect("有估计值");
+    assert_eq!(est, ((8.0 * LINE_SAMPLE_SAFETY).ceil()) as usize);
+    assert!(est >= 8, "估计不得低估采样最宽");
+
+    // 经 Buffer::from_parts 装配后，max_line_units 即返回该占位估计（滚动条消费方）
+    let b = Buffer::from_parts(rope, mx_chars, hist);
+    assert!(b.max_line_units() >= 8);
+
+    // 采样值 0（全空行）→ 空直方图（保持「无内容 → 无横向量程」语义）
+    let empty = Rope::from("\n\n\n\n");
+    let (mx0, h0) = sample_line_stats(&empty);
+    assert_eq!(mx0, 0);
+    assert!(h0.is_empty());
+
+    // 最宽行落在采样点之外的普通场景：估计只由采样值放大，安全系数保证 ≥ 采样最宽
+    let mut src = String::from("aaa\n");
+    for _ in 0..(crate::editor::buffer::LINE_SAMPLE_STRIDE * 2) {
+        src.push_str("x\n");
+    }
+    let wide_miss = Rope::from(src.as_str());
+    let (_, hmm) = sample_line_stats(&wide_miss);
+    let est_miss = *hmm.keys().next_back().unwrap();
+    assert!(
+        est_miss >= 3 && est_miss >= ((3.0 * LINE_SAMPLE_SAFETY).ceil()) as usize,
+        "采样估计应覆盖采样最宽：est={est_miss}"
+    );
+}
+
+#[test]
 fn buffer_max_line_units_counts_fullwidth() {
     // 宽度单位是「不折行」的依据（CJK 全角 = 2 格、ASCII = 1 格、Tab = 4 格），
     // 且可随删除缩小。任何行的真实字形宽 ≤ 单位 × 等宽格宽，StyledText 才不会折行。
@@ -485,6 +525,23 @@ fn editor_selection(host: &Entity<Host>, cx: &mut VisualTestContext) -> Selectio
 
 fn window_handle(cx: &mut VisualTestContext) -> gpui::AnyWindowHandle {
     cx.windows().first().copied().expect("有窗口")
+}
+
+#[gpui::test]
+fn editor_bottom_pad_quantized_to_line_height(cx: &mut TestAppContext) {
+    // 回归（专家评审 P4）：底部预留（横向滚动条厚 16px + 额外行高）向上量化到
+    // line_height 整数倍——否则滚到底视口停在「行间半格」上，最后一行加载/点击
+    // 命中/光标出现次像素误差。断言 pad 是行高的整数倍且 ≥ 一行。
+    let (host, cx) = open(cx, "row0\nrow1\nrow2");
+    let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1).max(1.);
+    let pad = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bottom_pad_px());
+    let frac = pad / lh;
+    assert!(
+        (frac - frac.round()).abs() < 1e-3,
+        "底部预留 {pad:.2}px 应为行高 {lh:.2}px 的整数倍，实际 {} 行",
+        frac
+    );
+    assert!(pad >= lh, "底部预留应至少覆盖一行（{pad:.2} ≥ {lh:.2}）");
 }
 
 #[gpui::test]

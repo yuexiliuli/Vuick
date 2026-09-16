@@ -20,6 +20,7 @@
 //! 首版取舍：不放行内折行；光标列按等宽字符近似；无多光标；IME 组合各步为独立撤销单元。
 
 use std::{
+    cell::Cell,
     ops::Range,
     time::{Duration, Instant},
 };
@@ -70,6 +71,8 @@ const GUTTER_LEFT_PAD_PX: f32 = 12.;
 const GUTTER_RIGHT_PAD_PX: f32 = 6.;
 /// 分帧增长定时器间隔（ms）：每 ~1 帧时间 append 一块，约 23MB/0.3s、116MB/1.6s 长满。
 const GROW_TICK_MS: u64 = 16;
+/// 深跳占位判定/收敛的浮点容差（px）：目标恰好等于可滚范围末端时视为「已可达」。
+const SCROLL_REACH_EPS: f32 = 0.5;
 
 /// 编辑器对外事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,6 +213,13 @@ pub struct CodeEditor {
     pending_grow: Option<usize>,
     /// 分帧增长定时器循环是否已启动（防重复 spawn；循环结束自动复位）。
     grow_loop_running: bool,
+    /// 用户请求的纵向滚动位置（内容 px），与纵向滚动条句柄共享（`Rc<Cell<f32>>`，
+    /// 见 [`VerticalScrollHandle`]）。分帧增长未完成时的深跳目标（Ctrl+End / 搜索
+    /// /翻页）可能超出现有 ListState 可滚范围——此刻 `desired_scroll` 记录真实目标
+    /// （render 据此显示「正在加载第 R 行…」占位符），ListState 停在「已增长底部」；
+    /// 每帧 splice 增长赶上后按它收敛，占位符消失、真实内容无缝显现。无占位时恒
+    /// 等于 ListState 的实际滚动位置（常规滚动两条路径保持一致）。
+    desired_scroll: std::rc::Rc<Cell<f32>>,
 
     // —— 配置 ——
     tab_size: usize,
@@ -270,6 +280,7 @@ impl CodeEditor {
             pixel_scroll: true,
             pending_grow: None,
             grow_loop_running: false,
+            desired_scroll: std::rc::Rc::new(Cell::new(0.)),
             tab_size: 4,
         }
     }
@@ -321,6 +332,8 @@ impl CodeEditor {
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
+        // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
+        self.desired_scroll.set(0.);
         self.resync_list(true);
     }
 
@@ -412,6 +425,24 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_list_is_deferred(&self) -> bool {
         self.list_mount != ListMountState::Ready
+    }
+
+    /// 测试：是否处于「深跳占位期」（分帧增长未完成 + 滚动目标超出已增长范围）。
+    #[cfg(test)]
+    pub(crate) fn test_jump_placeholder_active(&self) -> bool {
+        self.jump_placeholder_active()
+    }
+
+    /// 测试：用户请求的竖向滚动目标（px，深跳占位期的逻辑位置）。
+    #[cfg(test)]
+    pub(crate) fn test_desired_scroll_px(&self) -> f32 {
+        self.desired_scroll.get()
+    }
+
+    /// 测试：纵向底部预留（px，已量化到行高整数倍）。
+    #[cfg(test)]
+    pub(crate) fn test_bottom_pad_px(&self) -> f32 {
+        self.vscroll_bottom_pad_px()
     }
 
     /// 字符总数。
@@ -585,6 +616,9 @@ impl CodeEditor {
                     t.elapsed().as_secs_f64() * 1000.0
                 );
             }
+            // 列表重建 && 回到顶部：让「用户目标」与 ListState 实际位置重新对齐，
+            // 防止滚动条句柄（读 desired）读到陈旧目标导致 thumb 错位。
+            self.desired_scroll.set(self.list_scroll_top_px());
             self.row_count = new_n;
             return;
         }
@@ -598,6 +632,8 @@ impl CodeEditor {
         self.pixel_scroll = true;
         self.pending_grow = None;
         self.list_mount = ListMountState::Ready;
+        // 同上：撤销/重做重铺会回顶部，重建后把 desired 对齐 ListState 实际位置。
+        self.desired_scroll.set(self.list_scroll_top_px());
         self.row_count = new_n;
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
@@ -636,6 +672,17 @@ impl CodeEditor {
         // item_ix，显式恢复保存的滚动顶（像素位置不变）。
         self.list_state.scroll_to(saved);
         self.gutter_list_state.scroll_to(saved);
+        // 深跳收敛：若用户目标（desired_scroll，见 scroll_to_px）已被新增条目可达，
+        // 立即滚到目标——占位符随即消失、真实内容无缝显现。非占位期目标 == 当前
+        // 位置，此处等价于「把滚动钉在原地」（追加不改变既有可见内容）。
+        let lh = self.line_height.as_f32().max(1.);
+        let wanted = self.desired_scroll.get();
+        let reach = self.reach_px();
+        if wanted <= reach + SCROLL_REACH_EPS {
+            let off = Self::px_to_offset(wanted.min(reach), lh);
+            self.list_state.scroll_to(off);
+            self.gutter_list_state.scroll_to(off);
+        }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() && (cur < EDITOR_LIST_GROW_CHUNK_LINES) {
             eprintln!(
                 "[MD_OPEN_DEBUG] 编辑器 ListState 分帧增长：splice(+{chunk} → {}) +{:.2}ms",
@@ -916,20 +963,53 @@ impl CodeEditor {
     // 确定性像素模型换算成 ListOffset，再交给 `list_state.scroll_to`（只看 item_count，
     // 不看高度）。量程则全由 VerticalScrollHandle 的 content_height 承担。
 
-    /// 纵向最大滚动量的**底部预留**（px）= 横向滚动条厚度 + 额外行数×行高。
-    /// 叠加在底部的横向滚动条会遮住最后一行：预留后滚到底时最后一行停在
-    /// 「横向滚动条之上 + 1 行」，始终可读。
+    /// 纵向最大滚动量的**底部预留**（px）= 横向滚动条厚度 + 额外行数×行高，
+    /// **向上量化到 line_height 的整数倍**：叠加在底部的横向滚动条厚度（16px）
+    /// 通常不是行高的整数倍，若不量化，滚到底时视口停在「行间半格」上，最后一行
+    /// 加载/点击命中/光标位置出现次像素误差。量化后一切纵向偏移都是整行像素，
+    /// 宁可多留白半行也绝不出现 0.5px 的渲染模糊。
     fn vscroll_bottom_pad_px(&self) -> f32 {
-        let thickness = gpui_component::scroll::Scrollbar::width().as_f32();
-        thickness
-            + EDITOR_VSCROLL_BOTTOM_EXTRA_LINES as f32 * self.line_height.as_f32().max(1.)
+        let lh = self.line_height.as_f32().max(1.);
+        let raw = gpui_component::scroll::Scrollbar::width().as_f32()
+            + EDITOR_VSCROLL_BOTTOM_EXTRA_LINES as f32 * lh;
+        (raw / lh).ceil() * lh
     }
 
-    /// 当前竖向滚动量（px，内容被推出的量；0 = 顶部）。
-    fn scroll_top_px(&self) -> f32 {
+    /// ListState **实际**滚动位置（px，不读 `desired_scroll`）。用于重建后把
+    /// 「用户目标」重新对齐 ListState（见 `resync_list`），以及非占位期读数。
+    fn list_scroll_top_px(&self) -> f32 {
         let s = self.list_state.logical_scroll_top();
         let lh = self.line_height.as_f32().max(1.);
         s.item_ix as f32 * lh + s.offset_in_item.as_f32()
+    }
+
+    /// 当前**已增长**可滚范围（px）= 现有条目高 + 底部预留 − 视口，夹 ≥0。
+    /// 深跳占位判定 / 收敛 / 滚动条 clamp 共用这一份量（单一来源，避免四处复制漂移）。
+    fn reach_px(&self) -> f32 {
+        let lh = self.line_height.as_f32().max(1.);
+        let view = self.list_state.viewport_bounds().size.height.as_f32();
+        (self.list_state.item_count() as f32 * lh + self.vscroll_bottom_pad_px() - view).max(0.)
+    }
+
+    /// 是否处于「分帧增长未完成 + 用户滚动目标超出已增长可滚范围」的**深跳占位期**。
+    /// 此期 ListState 停在「已增长底部」（内容行尚未 splice 出来、无法直接显示目标行），
+    /// 由 render 用全屏占位符提示正在加载的目标行；每帧增长赶上后占位自动消失。
+    fn jump_placeholder_active(&self) -> bool {
+        if self.pending_grow.is_none() {
+            return false;
+        }
+        self.desired_scroll.get() > self.reach_px() + SCROLL_REACH_EPS
+    }
+
+    /// 当前竖向滚动量（px，内容被推出的量；0 = 顶部）。
+    /// 深跳占位期返回**用户目标**（占位符所代表的逻辑位置，[`Self::desired_scroll`]），
+    /// 否则返回 ListState 实际位置——常规期二者一致，滚动/命中/reveal 全部以此为据。
+    fn scroll_top_px(&self) -> f32 {
+        if self.jump_placeholder_active() {
+            self.desired_scroll.get()
+        } else {
+            self.list_scroll_top_px()
+        }
     }
 
     /// 像素 → ListOffset（统一行高模型）。
@@ -941,14 +1021,20 @@ impl CodeEditor {
 
     /// 滚到目标像素（夹到 [0, 全文高+底部预留−视口]），同步给 ListState。
     /// 底部预留让最后一行能滚到横向滚动条之上。
+    ///
+    /// **分帧增长未完成时的深跳**：目标可能超出 ListState 已增长的可滚范围
+    /// （gpui `scroll_to` 把行号钳到 item_count）。这里把**用户目标**记入
+    /// [`Self::desired_scroll`]（纵向量程是全文档确定性量程，目标按全文合法值），
+    /// 实际只把 ListState 滚到「已增长可滚范围」（= 现有底部，见钳制注释）；随后
+    /// [`Self::grow_one_chunk`] 每帧赶上后按 `desired_scroll` 收敛，占位符消失。
     fn scroll_to_px(&mut self, target_px: f32) {
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
         let max_px = (self.row_count as f32 * lh + self.vscroll_bottom_pad_px() - view).max(0.);
         let px = target_px.clamp(0., max_px);
-        // scroll_to 自带 item_ix ≥ item_count 时的钳制：分帧增长未完成时，深跳先停在
-        // “已增长的底部”，随后每帧随 splice 增长自动可及（清空/恢复由增长步骤保证）。
-        self.list_state.scroll_to(Self::px_to_offset(px, lh));
+        self.desired_scroll.set(px);
+        let apply = px.min(self.reach_px());
+        self.list_state.scroll_to(Self::px_to_offset(apply, lh));
     }
 
     /// 滚轮竖向滚动（dy = 滚轮 delta，负=向下）。
@@ -1074,9 +1160,9 @@ impl CodeEditor {
             return 0;
         }
         let lh = self.line_height.as_f32();
-        let scroll = self.list_state.logical_scroll_top();
-        let content_y =
-            scroll.item_ix as f32 * lh + scroll.offset_in_item.as_f32() + position.y.as_f32();
+        // 用「有效滚动顶」：深跳占位期 = 用户目标（点击占位符命中其代表的目标行），
+        // 常规期 = ListState 实际位置（一致）。
+        let content_y = self.scroll_top_px() + position.y.as_f32();
         let row = (content_y / lh).floor().max(0.) as usize;
         let row = row.min(self.row_count.saturating_sub(1));
 
@@ -2014,6 +2100,22 @@ impl Render for CodeEditor {
             .overflow_hidden()
             .child(gutter_content);
 
+        // 深跳占位期（分帧增长未完成 + 目标超出已增长范围）：ListState 还显示不了
+        // 目标行，用全屏占位符提示正在加载的行号；增长赶上后 jumping 变 false，
+        // 下一帧真实内容无缝显现（见 jump_placeholder_active / grow_one_chunk）。
+        let jumping = self.jump_placeholder_active();
+        let (jump_row, jump_pct) = if jumping {
+            let row = (self.desired_scroll.get() / lh).floor() as usize + 1;
+            let pct = if self.row_count > 0 {
+                (self.list_state.item_count() as f32 / self.row_count as f32 * 100.) as u32
+            } else {
+                100
+            };
+            (row, pct)
+        } else {
+            (0, 100)
+        };
+
         let core = div()
             .id("code-editor")
             .debug_selector(|| "code-editor".into())
@@ -2158,6 +2260,26 @@ impl Render for CodeEditor {
             // 行号列（第二个 List，与文本共用 ListState）：盖在横向滚动文本区左缘，
             // 不随内容横移，竖向滚动与文本逐行一致。
             .child(gutter_wrap)
+            // 深跳占位符（见 jumping 计算）：盖住文本区 + 行号列（二者都还显示不到
+            // 目标行），滚动条叠层在后声明 → 仍在其上、可拖动。
+            .when(jumping, |this| {
+                this.child(
+                    div()
+                        .id("ce-jump-placeholder")
+                        .debug_selector(|| "ce-jump-placeholder".into())
+                        .absolute()
+                        .inset_0()
+                        .bg(bg)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .font_family(self.mono.clone())
+                        .text_color(fg)
+                        .child(SharedString::from(format!(
+                            "正在加载第 {jump_row} 行…（已增长 {jump_pct}%）"
+                        ))),
+                )
+            })
             // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
             // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
             // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
@@ -2184,6 +2306,9 @@ impl Render for CodeEditor {
                             line_height: self.line_height,
                             pixel_scroll: self.pixel_scroll,
                             bottom_pad: self.vscroll_bottom_pad_px(),
+                            desired_scroll: self.desired_scroll.clone(),
+                            // 单一来源：与编辑器 scroll_to_px/占位判定同一份「已增长范围」。
+                            reach_px: self.reach_px(),
                         };
                         Scrollbar::vertical(&v)
                             .mode(ScrollbarMode::Always)
@@ -2357,6 +2482,14 @@ struct VerticalScrollHandle {
     /// 底部预留（px，覆盖层横向滚动条厚 + 额外行数）：量程/滚到底都包含它，保证
     /// 最后一行能滚到横向滚动条之上，且 thumb 范围与「真实可滚距离」一致。
     bottom_pad: f32,
+    /// 用户请求的竖向滚动（px，内容坐标）——与编辑器共享（`Rc<Cell<f32>>`）。
+    /// 深跳占位期 thumb 用它显示目标（可能超出 ListState 实际可滚范围，Scrollbar
+    /// 会把它夹到量程尾 = 「已到当前可滚底部」）；常规期恒等于 ListState 位置。
+    /// 拖动滚动条也写它（新目标可落 ListState 的钳回由 `scroll_to` 承担）。
+    desired_scroll: std::rc::Rc<Cell<f32>>,
+    /// 拖动回钳上限 = 「已增长可滚范围」（px，与编辑器 [`CodeEditor::reach_px`]
+    /// 同一来源：render 构造时快照）。量程增长中 thumb 拖动也到不了未增长的部分。
+    reach_px: f32,
 }
 
 impl ScrollbarHandle for VerticalScrollHandle {
@@ -2366,10 +2499,9 @@ impl ScrollbarHandle for VerticalScrollHandle {
 
     fn offset(&self) -> Point<Pixels> {
         if self.pixel_scroll {
-            let s = self.state.logical_scroll_top();
-            let lh = self.line_height.as_f32().max(1.);
-            let offset_px = s.item_ix as f32 * lh + s.offset_in_item.as_f32();
-            point(px(0.), px(-offset_px))
+            // 用「用户请求位置」而非 ListState 实际滚动顶：深跳占位期 thumb 指示
+            // 目标（超量程时 Scrollbar 夹到量程尾端）；常规期二者一致。
+            point(px(0.), px(-self.desired_scroll.get()))
         } else {
             self.state.scroll_px_offset_for_scrollbar()
         }
@@ -2379,8 +2511,11 @@ impl ScrollbarHandle for VerticalScrollHandle {
         if self.pixel_scroll {
             let lh = self.line_height.as_f32().max(1.);
             let off = (-offset.y.as_f32()).max(0.);
-            let max = (self.content_height - self.state.viewport_bounds().size.height.as_f32()).max(0.);
-            self.state.scroll_to(CodeEditor::px_to_offset(off.min(max), lh));
+            let off = off.min(self.reach_px);
+            // 拖动滚动条 = 用户新目标：写共享 desired（后续增长按它收敛），并落
+            // ListState（超出已增长可滚范围的部分由 scroll_to 钳回，占位符接管）。
+            self.desired_scroll.set(off);
+            self.state.scroll_to(CodeEditor::px_to_offset(off, lh));
         } else {
             self.state.set_offset_from_scrollbar(offset);
         }

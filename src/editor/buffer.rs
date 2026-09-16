@@ -12,6 +12,12 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
+/// 大文档「先瞬时显示」占位横向量程的**采样步长**：均匀每隔这么多行算一次行宽。
+/// 取 256 → 116MB(3.2M 行) 只算 ~12.5k 行（<1ms），远快于全量 [`compute_line_stats`]（7.3s）。
+pub(crate) const LINE_SAMPLE_STRIDE: usize = 256;
+/// 采样估计放大系数：采样间距可能漏掉个别极长行，放大补偿（宁可高估多留白）。
+pub(crate) const LINE_SAMPLE_SAFETY: f32 = 1.2;
+
 use gpui::SharedString;
 use gpui_component::input::{Rope, RopeExt};
 use ropey::LineType;
@@ -95,6 +101,41 @@ pub(crate) fn compute_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
         *hist.entry(units).or_insert(0) += 1;
         mx_chars = mx_chars.max(line.chars().count());
     }
+    (mx_chars, hist)
+}
+
+/// 大文档「先瞬时显示」的**占位横向量程**：均匀采样 [`LINE_SAMPLE_STRIDE`] 行算
+/// 行宽，取最大值 × [`LINE_SAMPLE_SAFETY`] 作为估计放入直方图（单条目的「伪计数」——
+/// 只服务于 [`Buffer::max_line_units`] 的 O(1) 最宽行查询）。真统计由后台
+/// [`compute_line_stats`] 全量算出后经 [`Buffer::apply_stats`] O(1) 替换。
+///
+/// 效果：打开后横向滚动条量程**立刻**接近真实（无需等 116MB ≈ 7.3s 的全量统计），
+/// 长行可立即左右平移；真值到位后 `apply_stats` 无缝校正。
+///
+/// 注意这是**采样估计**，不是硬上界：均匀间距可能漏掉个别极长行（如某条超长行整体
+/// 落在采样格之外，甚至所有采样行都空/短时 est=0 → 空直方图），此类长行要等真统计
+/// 到达后才可滚到尾部——×[`LINE_SAMPLE_SAFETY`] 只缓解常见情况，不保证覆盖最坏样本。
+/// 若编辑发生在真统计到达前，`apply_stats` 会被「已编辑」守卫跳过，占位估计保持
+/// （作为近似值，配合行宽直方图增量维护仍稳健）。
+pub(crate) fn sample_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
+    let n = rope.lines_len();
+    let mut mx_units = 0usize;
+    let mut mx_chars = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let line = rope.slice_line(i);
+        let units = line.chars().map(char_width_units).sum::<usize>();
+        mx_units = mx_units.max(units);
+        mx_chars = mx_chars.max(line.chars().count());
+        i += LINE_SAMPLE_STRIDE;
+    }
+    let est = ((mx_units as f32 * LINE_SAMPLE_SAFETY).ceil() as usize).max(mx_units);
+    let hist = if est > 0 {
+        LineWidthHistogram::from([(est, 1)])
+    } else {
+        // 全空行（est=0）：保持空直方图语义（无内容 → 无横向量程）。
+        LineWidthHistogram::new()
+    };
     (mx_chars, hist)
 }
 
