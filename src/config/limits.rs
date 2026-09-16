@@ -23,12 +23,16 @@ pub const EDITOR_WRAP_MAX_LINES: usize = 30_000;
 /// 打开，再大（含中等 md）不再随体积线性冻住主线程。
 pub const OPEN_ASYNC_MIN_BYTES: u64 = 128 * 1024;
 /// 编辑器 ListState「两段式装配」的行数阈值：超过该行数的文档，打开瞬间只建一个
-/// **视口小列表**（首帧<1ms 显示内容），再在下一帧 defer 里补建全文 N 条统一高度
-/// （O(N) 一次，移出“打开瞬间”的关键路径）。小于等于该阈值仍同步全量装配（便宜）。
+/// **视口小列表**（首帧<1ms 显示内容），随后由 render 定时器**分帧 splice 增长**到
+/// 全文行数（每帧 ~5ms，不整帧冻结）。小于等于该阈值仍同步全量装配（便宜）。
 pub const EDITOR_LIST_DEFER_MIN_LINES: usize = 4_096;
 /// 两段式装配的「首帧视口小列表」条数：需 ≥ 最高分辨率的可见行 + 过扫余量。
-/// 512 行 × 22px ≈ 11k px 可视高度，远超任何单屏；上半屏以上滚动由 defer 同位帧补齐。
+/// 512 行 × 22px ≈ 11k px 可视高度，远超任何单屏；上半屏以上滚动由分帧增长补足。
 pub const EDITOR_LIST_PROVISIONAL_ROWS: usize = 512;
+/// 「分帧增长」每帧往两个 ListState 追加的行数（`ListState::splice` O(块)，~0.16µs/行
+/// ⇒ 32k ≈ 5ms/帧）。把打开大文件的 O(N) 整帧冻结拆成每帧 ~5ms 的隐形块，任意文件
+/// 大小的首帧/滚动都恒定。116MB(3.2M 行) 约 1.6s 长到全文，期间跳转先钳到已增长范围。
+pub const EDITOR_LIST_GROW_CHUNK_LINES: usize = 32_768;
 /// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
 pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
 /// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。

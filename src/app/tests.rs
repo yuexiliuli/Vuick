@@ -1883,8 +1883,8 @@
 
     /// 回归：大文档打开把「ListState 全量装配（O(N)）」从打开瞬间移出——直挂总绳的
     /// mount 只建「视口小列表」（同一同步栈内即可断言 item_count 远小于全文行数，
-    /// 不依赖帧时序），全文 N 条统一高度由 render 排定的 defer 补建（量程恢复健康）。
-    /// 防止退化成 mount 同步 O(N) 建全文（把 ~85ms 开销挪回打开瞬间关键路径）。
+    /// 不依赖帧时序），全文 N 条由定时器**分帧 splice 增长**补建（量程恢复健康）。
+    /// 防止退化成 mount 同步 O(N) 建全文（把 ~2s 开销挪回打开瞬间关键路径）。
     #[gpui::test]
     async fn open_large_doc_mounts_list_two_phase(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1909,7 +1909,7 @@
         // 同步栈内断言两段式：mount 返回时只建了视口小列表（若非两段式，这里
         // item_count 直接等于全文行数）。
         cx.update(|_w, cx| {
-            ed_ent.update(cx, |ed, _| {
+            ed_ent.update(cx, |ed, cx| {
                 ed.set_rope_with_stats(rope.clone(), 0, Default::default());
                 let ic = ed.test_list_state().item_count();
                 assert!(
@@ -1918,11 +1918,14 @@
                      两段式应只建 ≤{}）",
                     crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS
                 );
+                cx.notify(); // 真实打开路径 load_file_text 会 notify；这里等价驱动首帧 render
             });
         });
-        // 驱动帧：render 排 defer → 补建全文 → 量程健康。
+        // 驱动帧 + 推模拟时钟：render 启动分帧增长定时器 → splice 补建全文 → 量程健康。
+        // （真实应用由 OS 定时器驱动；测试需显式 advance_clock 触发。）
         let mut frames = 0;
         loop {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             let done = cx.update(|_w, cx| ed_ent.read(cx).test_list_state().item_count() == line_count);
@@ -1931,9 +1934,10 @@
             }
             frames += 1;
             if frames > 120 {
-                panic!("defer 补建全文超时：{} 帧后 item_count 仍 < line_count", frames);
+                panic!("分帧增长超时：{} 帧后 item_count 仍 < line_count", frames);
             }
         }
+        cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
         cx.run_until_parked();
         let _ = cx.cx.refresh();
         cx.run_until_parked();
@@ -1948,14 +1952,86 @@
         let expected = (line_count.saturating_sub(1)) as f32 * lh - vh;
         assert!(
             mo > expected * 0.9,
-            "defer 补建后量程应健康：max_off={mo:.0}，预期≈{expected:.0}（行 {line_count}/高 {lh:.0}px）"
+            "分帧增长后量程应健康：max_off={mo:.0}，预期≈{expected:.0}（行 {line_count}/高 {lh:.0}px）"
         );
     }
 
-    /// 基准（ignored，release）：隔离测量大列表「统一高度重铺」的原始开销——打开大
-    /// 文档时 defer 补建全文用的就是它。定位「两段式第二帧」的量级，以及验证
-    /// `reset_with_uniform_height` 单趟构建相对旧「reset + with_uniform_item_height」
-    /// 两趟的速度差异。运行：
+    /// 临时基准（ignored，release）：开不同体积的真实大文档，量化各阶段耗时——
+    /// 同步返回 / 内容可见（快段）/ 全文 ListState 分帧增长完成 / 滚动条就绪。
+    /// 运行：`cargo test --release -- --ignored bench_open_large_multiple --nocapture`
+    /// 打开期间设 MD_OPEN_DEBUG=1，配合每阶段的墙钟标记定位瓶颈占比。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_open_large_multiple(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        std::env::set_var("MD_OPEN_DEBUG", "1");
+        for path in [
+            r"target/大文档测试.md",
+            r"target/大文档测试23MB.md",
+            r"target/大文档测试23MB.txt",
+            r"target/大文档测试116MB.txt",
+        ] {
+            println!("========== {path} ==========");
+            let t0 = std::time::Instant::now();
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.open_file(path, window, cx));
+            });
+            let sync_ms = t0.elapsed().as_millis();
+            println!("【open_file 同步返回】 {sync_ms} ms");
+            let mut content_ms = None;
+            let mut full_ms = None;
+            let mut frames = 0;
+            loop {
+                frames += 1;
+                // 推模拟时钟触发分帧增长定时器（真实应用由 OS 定时器/帧循环驱动）。
+                cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+                cx.run_until_parked();
+                let _ = cx.cx.refresh();
+                let (line_count, item_count, deferred) = cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    let i = a.tabs.len().saturating_sub(1);
+                    let ed = a.tabs[i].editor.read(cx);
+                    (
+                        ed.line_count(),
+                        ed.test_list_state().item_count(),
+                        ed.test_list_is_deferred(),
+                    )
+                });
+                if content_ms.is_none() && line_count > 0 {
+                    content_ms = Some(t0.elapsed().as_millis() as usize);
+                }
+                if !deferred && full_ms.is_none() {
+                    full_ms = Some(t0.elapsed().as_millis() as usize);
+                }
+                if content_ms.is_some() && full_ms.is_some() {
+                    break;
+                }
+                if frames > 4000 {
+                    println!("【超时】 content={content_ms:?} full={full_ms:?}");
+                    break;
+                }
+            }
+            println!(
+                "【内容可见（快段）】 {:?} ms，【全文 ListState 增长完成】 {:?} ms，行数 {}",
+                content_ms,
+                full_ms,
+                cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    let i = a.tabs.len().saturating_sub(1);
+                    a.tabs[i].editor.read(cx).line_count()
+                })
+            );
+        }
+    }
+
+    /// 基准（ignored，release）：隔离测量大列表「统一高度重铺」的原始开销——正是旧的
+    /// 一次性 defer 补建/量程自愈会用到的操作（现大文档路径已改分帧增长 + 按需实测，
+    /// 不再调用）。运行：
     /// `cargo test --release -- --ignored bench_reset_uniform_height --nocapture`
     #[gpui::test]
     #[ignore]
@@ -2025,6 +2101,7 @@
         // 的多画一帧」（gpui 测试里 notify 不会自动重画，需 refresh；真实应用由帧循环）。
         let mut frames = 0;
         loop {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             let done = cx.update(|_, cx| app.read(cx).open_finish_count >= 1);
