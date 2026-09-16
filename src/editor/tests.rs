@@ -1177,9 +1177,10 @@ fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
         last_max = reflow_and_assert(&host, &mut cx, w);
     }
     let lh = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1);
+    let pad = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bottom_pad_px());
     assert!(
-        (last_max - (300.0 * lh - 600.0)).abs() < lh * 4.,
-        "量程应≈300×行高−视口高（{last_max:.1} vs {:.1}）",
-        300.0 * lh - 600.0
+        (last_max - (300.0 * lh + pad - 600.0)).abs() < lh * 4.,
+        "量程应≈300×行高+底部预留−视口高（{last_max:.1} vs {:.1}）",
+        300.0 * lh + pad - 600.0
     );
 }

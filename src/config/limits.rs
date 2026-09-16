@@ -34,7 +34,7 @@ pub const EDITOR_LIST_PROVISIONAL_ROWS: usize = 512;
 /// 大小的首帧/滚动都恒定。116MB(3.2M 行) 约 1.6s 长到全文，期间跳转先钳到已增长范围。
 pub const EDITOR_LIST_GROW_CHUNK_LINES: usize = 32_768;
 /// 纵向最大滚动量底部的**额外**行数（在横向滚动条厚度之上再预留的余量）：
-/// 滚到底时最后一行停在「横向滚动条之上 + 再多 1 行」，保证不被叠加的横向滚动条遮住。
+/// 滚到底时最后一行停在「横向滚动条之上 + 再多 8 行」之上，保证不被叠加的横向滚动条遮住。
 pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 8;
 /// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
 pub const WINDOWED_MIN_BLOCKS: usize = 4_000;

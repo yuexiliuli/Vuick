@@ -1928,7 +1928,10 @@
             cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
             cx.run_until_parked();
             let _ = cx.cx.refresh();
-            let done = cx.update(|_w, cx| ed_ent.read(cx).test_list_state().item_count() == line_count);
+            let done = cx.update(|_w, cx| {
+                let ed = ed_ent.read(cx);
+                ed.test_list_state().item_count() == ed.test_scroll_item_count()
+            });
             if done {
                 break;
             }
@@ -2060,7 +2063,9 @@
                     ed.test_list_state().logical_scroll_top().item_ix,
                 )
             });
-            if !ph && ic == line_count {
+            // 增长目标 = 全文行数 + 底部预留空行（见 editor::CodeEditor::scroll_item_count），
+            // 占位在最后一小块（含预留空行）splice 后才清除，ic 最终 = line_count + 预留行。
+            if !ph && ic >= line_count {
                 assert!(
                     top >= line_count.saturating_sub(64),
                     "增长完成后应滚到目标附近：top={top}（全文 {line_count} 行）"
@@ -2072,6 +2077,103 @@
                 panic!("深跳收敛超时：placeholder={ph} ic={ic}");
             }
         }
+    }
+
+    /// 回归（2026-09-16）：底部预留必须被渲染成**可见**的空白区，最后一行不得被
+    /// 底部横向滚动条盖住。曾用「滚动量程里加 pad」实现，但 gpui 的 List 在下方内容
+    /// 不足一屏时会**自动上移填满视口**，把预留区吃掉、最后一行贴到视口底（被滚动条
+    /// 遮住）。修复：把预留做成 ListState 末尾的**真实空白条目**（占行高）。本测试在
+    /// 真实 app 布局下滚到量程最大值，断言最后一行底边距视口底 ≈ pad（空白真实可见）。
+    #[gpui::test]
+    async fn bottom_pad_renders_visible_blank_at_max_scroll(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!("gpui-botpad-{}.txt", std::process::id()));
+        let content = (0..300)
+            .map(|i| format!("这是第 {i} 行内容"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&dir, &content).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let ed_ent = {
+            let mut notices = 0;
+            loop {
+                cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+                cx.run_until_parked();
+                let _ = cx.cx.refresh();
+                let ready = cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    let i = a.tabs.len().saturating_sub(1);
+                    let ed = a.tabs[i].editor.read(cx);
+                    ed.line_count() > 1 && !ed.test_list_is_deferred()
+                });
+                if ready {
+                    break;
+                }
+                notices += 1;
+                if notices > 120 {
+                    panic!("打开/增长未完成");
+                }
+            }
+            cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                a.tabs[i].editor.clone()
+            })
+        };
+        let (lh, pad, row_count, item_count, want_items) = cx.update(|_, cx| {
+            let ed = ed_ent.read(cx);
+            (
+                ed.test_metrics().1.max(1.),
+                ed.test_bottom_pad_px(),
+                ed.line_count(),
+                ed.test_list_state().item_count(),
+                ed.test_scroll_item_count(),
+            )
+        });
+        assert_eq!(
+            item_count, want_items,
+            "列表条目数应 = 文档行数 + 底部预留空行（item_count={item_count}，want={want_items}，行数={row_count}）"
+        );
+        cx.update(|_, cx| {
+            ed_ent.update(cx, |ed, _| ed.test_scroll_to_bottom());
+        });
+        for _ in 0..4 {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        let (ix, off, view2) = cx.update(|_, cx| {
+            let ed = ed_ent.read(cx);
+            let t = ed.test_text_scroll_top();
+            (t.0, t.1, ed.list_viewport_height())
+        });
+        // 最后一行底边在视口内的 y =（最后一行距滚动顶的行数 × 行高）+ 行高 − 已滚进
+        // 顶行的偏移；底部空白 = 视口高 − 该 y。基底预留应 ≈ pad 且 ≥ pad − 1 行。
+        let last_top_px = (row_count as f32 - ix as f32) * lh - off;
+        let last_bottom = last_top_px + lh;
+        let blank_valid = (view2 - last_bottom) as f32;
+        // gpui 对「填充不满一屏」会回退一行把视口填满（浮点舍入所致），实际空白可能
+        // 比 pad 少约 1 行；断言「可见空白 ≥ pad − 行高 − 余量」即可证明预留区真实渲染、
+        // 最后一行未被横向滚动条盖住。
+        assert!(
+            blank_valid >= pad - lh - 2.,
+            "滚到底后最后一行下方应有可见预留空白：blank={blank_valid:.1}px，pad={pad:.1}px，行高 {lh:.1}（scroll_top=({ix},{off}), view={view2}, rows={row_count}）——真实预留空行未渲染"
+        );
+        assert!(
+            blank_valid <= pad + lh + 1.,
+            "底部空白不应明显超过预留：blank={blank_valid:.1}px ≤ pad+行高={:.1}",
+            pad + lh + 1.
+        );
+        let _ = std::fs::remove_file(&dir);
     }
 
     /// 临时基准（ignored，release）：开不同体积的真实大文档，量化各阶段耗时——

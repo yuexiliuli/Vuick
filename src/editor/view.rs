@@ -388,8 +388,7 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn list_max_offset(&self) -> f32 {
         if self.pixel_scroll {
-            (self.row_count as f32 * self.line_height.as_f32().max(1.)
-                + self.vscroll_bottom_pad_px()
+            (self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
                 - self.list_state.viewport_bounds().size.height.as_f32())
                 .max(0.)
         } else {
@@ -397,11 +396,11 @@ impl CodeEditor {
         }
     }
 
-    /// 纵向量程总高（px）。像素路径 = 行数 × 行高 + 底部预留（确定性）；诊断/测试用。
+    /// 纵向量程总高（px）。像素路径 = 条目总数 × 行高（含底部预留空行；确定性），
+    /// 诊断/测试用。
     pub(crate) fn vertical_total_px(&self) -> f32 {
         if self.pixel_scroll {
-            self.row_count as f32 * self.line_height.as_f32().max(1.)
-                + self.vscroll_bottom_pad_px()
+            self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
         } else {
             self.list_state.max_offset_for_scrollbar().y.as_f32()
                 + self.list_state.viewport_bounds().size.height.as_f32()
@@ -443,6 +442,19 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_bottom_pad_px(&self) -> f32 {
         self.vscroll_bottom_pad_px()
+    }
+
+    /// 测试：列表条目总数（文档行数 + 底部预留空行）。增长完成后
+    /// `test_list_state().item_count() == test_scroll_item_count()`。
+    #[cfg(test)]
+    pub(crate) fn test_scroll_item_count(&self) -> usize {
+        self.scroll_item_count()
+    }
+
+    /// 测试：直接滚到「量程最大值（含底部预留空行）」——复现滚到底的真实渲染结果。
+    #[cfg(test)]
+    pub(crate) fn test_scroll_to_bottom(&mut self) {
+        self.scroll_to_px(self.list_max_offset());
     }
 
     /// 字符总数。
@@ -519,6 +531,7 @@ impl CodeEditor {
     // -----------------------------------------------------------------
 
     fn refresh_metrics(&mut self, window: &mut Window, cx: &mut App) {
+        let old_line_height = self.line_height;
         let theme = gpui_component::Theme::global(cx);
         let typo = theme.semantic_tokens().typography;
         let colors = theme.semantic_tokens().colors;
@@ -582,6 +595,11 @@ impl CodeEditor {
                 + GUTTER_RIGHT_PAD_PX
                 + 4.,
         );
+        // 行高变化会改变底部预留空行数（pad_row_count = 额外行 + ceil(滚动条厚/行高)）：
+        // 已在列表末尾固化的空行条目数需同步增删（reconcile 只动尾部、不重铺、不跳滚动）。
+        if self.metrics_ready && self.line_height != old_line_height {
+            self.reconcile_spacers();
+        }
     }
 
     /// 列表条目数与行数一致（reset 场景：首次/整篇替换/撤销重做）。
@@ -593,7 +611,8 @@ impl CodeEditor {
     /// 确定性滚动条。撤销/重做传 `false`（保持同步全文 + uniform 提示）。
     fn resync_list(&mut self, defer_large: bool) {
         let new_n = self.buffer.line_count().max(1);
-        if new_n == self.list_state.item_count() {
+        let want_items = new_n + self.pad_row_count();
+        if want_items == self.list_state.item_count() {
             self.row_count = new_n;
             return;
         }
@@ -601,17 +620,19 @@ impl CodeEditor {
         if defer_large && new_n > EDITOR_LIST_DEFER_MIN_LINES {
             // 首帧可见内容 = `row_count`（全文行数 N）+ 小列表 item 索引 0..视口，
             // 渲染闭包用 rows[ix-lo] 索引，行号用 ix+1，首屏从行 0 起，天然正确。
+            // 增长目标是 `N + 底部预留空行`：空行占真实列表高度，滚到底才有可见预留区。
             let prov = EDITOR_LIST_PROVISIONAL_ROWS.min(new_n);
             self.list_state.reset(prov);
             self.gutter_list_state.reset(prov);
             self.uniform_applied = None;
             self.gutter_uniform_applied = None;
             self.pixel_scroll = true;
-            self.pending_grow = Some(new_n);
+            self.pending_grow = Some(want_items);
             self.list_mount = ListMountState::Provisional;
             if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                 eprintln!(
-                    "[MD_OPEN_DEBUG] 编辑器 ListState 像素两段式：首帧小列表 reset({prov})，分帧增长到 {new_n} 行（每帧 ≤{} 行）+{:.1}ms",
+                    "[MD_OPEN_DEBUG] 编辑器 ListState 像素两段式：首帧小列表 reset({prov})，分帧增长到 {want_items} 条目（{new_n} 行 + {} 预留空行，每帧 ≤{} 条）+{:.1}ms",
+                    self.pad_row_count(),
                     EDITOR_LIST_GROW_CHUNK_LINES,
                     t.elapsed().as_secs_f64() * 1000.0
                 );
@@ -624,8 +645,8 @@ impl CodeEditor {
         }
         // 小文档 / 撤销重做：同步全量 `reset(N)`（便宜）＋像素量程（不预铺 uniform、
         // 按需实测——与标题一致，见 struct 的 pixel_scroll 注释）。
-        self.list_state.reset(new_n);
-        self.gutter_list_state.reset(new_n);
+        self.list_state.reset(want_items);
+        self.gutter_list_state.reset(want_items);
         self.uniform_applied = None;
         // 像素路径不预填 uniform；这两个标记仅保留给旧路径，避免误触 ensure_uniform_hint。
         self.gutter_uniform_applied = None;
@@ -637,7 +658,8 @@ impl CodeEditor {
         self.row_count = new_n;
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
-                "[MD_OPEN_DEBUG] 编辑器 ListState::reset({new_n} 行): {} ms",
+                "[MD_OPEN_DEBUG] 编辑器 ListState::reset({want_items} 条目, {new_n} 行 + {} 预留空行): {} ms",
+                self.pad_row_count(),
                 t.elapsed().as_millis()
             );
         }
@@ -975,6 +997,49 @@ impl CodeEditor {
         (raw / lh).ceil() * lh
     }
 
+    /// 底部预留换算成的**真实空白条目行数**（`vscroll_bottom_pad_px` 已量化到行高
+    /// 整数倍，故整除）。这些空白条目追加在文本列表末尾、渲染为空行。
+    ///
+    /// **为什么必须做成真实条目**：gpui 的 List 在「下方内容不足一屏」时会**自动上移
+    /// 填满视口**（`layout_items` 里 `rendered_height - offset < available_height` 即
+    /// 把滚动顶往回走、让最后内容贴到视口底）——只靠「滚动量程里加 pad」永远产生不了
+    /// 可见的底部预留区，最后一行会被底部横向滚动条盖住。追加真实空白条目后，列表末端
+    /// 有真高度，「自动填满」只会填到空白条目，预留区随之真实可见。
+    fn pad_row_count(&self) -> usize {
+        let lh = self.line_height.as_f32().max(1.);
+        (self.vscroll_bottom_pad_px() / lh).round() as usize
+    }
+
+    /// 列表**条目总数** = 文档行数 + 底部预留空行数。分帧增长目标 / 全量重建条目数 /
+    /// 纵向滚动 clamp 全部以此为准（项条目总数里已含底部空行，滚动公式不再另加 pad）。
+    fn scroll_item_count(&self) -> usize {
+        self.row_count.saturating_add(self.pad_row_count())
+    }
+
+    /// 行高变化（字号缩放/主题换字）后，把列表末尾的预留空行数对齐到新的
+    /// `pad_row_count`（增删尾部条目即可，不必整树重建、不动滚动位置）。
+    /// 文本行与预留空行的分界 = `row_count`，只在尾部增删 → 不影响既有行。
+    fn reconcile_spacers(&mut self) {
+        if !self.metrics_ready || self.row_count == 0 {
+            return;
+        }
+        let want = self.scroll_item_count();
+        let cur = self.list_state.item_count();
+        if want == cur {
+            return;
+        }
+        let saved = self.list_state.logical_scroll_top();
+        if want > cur {
+            self.list_state.splice(cur..cur, want - cur);
+            self.gutter_list_state.splice(cur..cur, want - cur);
+        } else {
+            self.list_state.splice(want..cur, 0);
+            self.gutter_list_state.splice(want..cur, 0);
+        }
+        self.list_state.scroll_to(saved);
+        self.gutter_list_state.scroll_to(saved);
+    }
+
     /// ListState **实际**滚动位置（px，不读 `desired_scroll`）。用于重建后把
     /// 「用户目标」重新对齐 ListState（见 `resync_list`），以及非占位期读数。
     fn list_scroll_top_px(&self) -> f32 {
@@ -983,12 +1048,14 @@ impl CodeEditor {
         s.item_ix as f32 * lh + s.offset_in_item.as_f32()
     }
 
-    /// 当前**已增长**可滚范围（px）= 现有条目高 + 底部预留 − 视口，夹 ≥0。
-    /// 深跳占位判定 / 收敛 / 滚动条 clamp 共用这一份量（单一来源，避免四处复制漂移）。
+    /// 当前**已增长**可滚范围（px）= 现有条目高 − 视口，夹 ≥0。
+    /// 条目总数结尾含底部预留空行（见 [`Self::pad_row_count`]），故 `item_count × 行高`
+    /// 已覆盖预留——滚动公式不再另加 pad。深跳占位判定 / 收敛 / 滚动条 clamp 共用这
+    /// 一份量（单一来源，避免四处复制漂移）。
     fn reach_px(&self) -> f32 {
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        (self.list_state.item_count() as f32 * lh + self.vscroll_bottom_pad_px() - view).max(0.)
+        (self.list_state.item_count() as f32 * lh - view).max(0.)
     }
 
     /// 是否处于「分帧增长未完成 + 用户滚动目标超出已增长可滚范围」的**深跳占位期**。
@@ -1030,7 +1097,9 @@ impl CodeEditor {
     fn scroll_to_px(&mut self, target_px: f32) {
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        let max_px = (self.row_count as f32 * lh + self.vscroll_bottom_pad_px() - view).max(0.);
+        // 纵向滚动上限 = 条目总数（含底部预留空行）× 行高 − 视口；预留空行在列表
+        // 末尾占真实高度，滚到底时它们呈现在最后一行之下（而不是被 gpui 填满吃掉）。
+        let max_px = (self.scroll_item_count() as f32 * lh - view).max(0.);
         let px = target_px.clamp(0., max_px);
         self.desired_scroll.set(px);
         let apply = px.min(self.reach_px());
@@ -2084,7 +2153,12 @@ impl Render for CodeEditor {
         });
         // 行号列用独立的 gutter_list_state（与文本锁步），不复用文本的
         // list_state —— 共用同一 StateInner 会让换宽/统一高度互相干扰（量程坍缩）。
+        // 末尾的底部预留空行（ix ≥ row_count）不显示行号，只占行高留白。
+        let gutter_rows = self.row_count;
         let gutter_content = list(self.gutter_list_state.clone(), move |ix, _window, _cx| {
+            if ix >= gutter_rows {
+                return div().h(gv.line_height).into_any_element();
+            }
             number_element(ix, &gv).into_any_element()
         })
         .size_full();
@@ -2294,12 +2368,12 @@ impl Render for CodeEditor {
                         let v = VerticalScrollHandle {
                             state: list_state.clone(),
                             content_width: content_w_px,
-                            // 量程 = 已增长行数 × 行高 + 底部预留：增长中 thumb 反映“现在
-                            // 真正可滚到的高度”；滚到底时最后一行停在横向滚动条之上。
+                            // 量程 = 已增长条目数 × 行高（条目末尾含底部预留空行，见
+                            // pad_row_count）：增长中 thumb 反映“现在真正可滚到的高度”；
+                            // 滚到底时最后一行停在横向滚动条之上的预留空行区。
                             content_height: if self.pixel_scroll {
                                 self.list_state.item_count() as f32
                                     * self.line_height.as_f32().max(1.)
-                                    + self.vscroll_bottom_pad_px()
                             } else {
                                 self.row_count as f32 * self.line_height.as_f32()
                             },
