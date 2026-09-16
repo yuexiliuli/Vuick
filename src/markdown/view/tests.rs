@@ -1757,3 +1757,66 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     assert!(win_len2 < 200, "任一时刻窗口应保持有界，win_len={win_len2}");
 }
 
+    /// 预览与编辑器共享源 Rope（第二步）：
+    /// - 窗口模式 `set_source_with_index(PreviewSrc::Rope(editor_rope))` 后，内部
+    ///   `src_buf` 与传入 rope **共享同一棵 Arc 树**（ropey 2.0 `Rope` 是 Arc 树、
+    ///   `Clone` O(1)）——大 md 预览不常驻「+1× 源文本」（那是共享句柄，不是副本）；
+    /// - COW 语义：此后编辑原 rope（用户打字），预览持有的快照内容不受影响
+    ///   （ropey 沿编辑路径 `Arc::make_mut`，未编辑子树仍共享）。
+    #[gpui::test]
+    fn windowed_preview_shares_editor_rope(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let cx: &mut VisualTestContext = cx;
+        // 窗口模式的源文本（块数 > WINDOWED_MIN_BLOCKS）。
+        use gpui_component::input::Rope;
+        let iters = crate::config::limits::WINDOWED_MIN_BLOCKS + 600;
+        let mut src = String::new();
+        for i in 0..iters {
+            src.push_str(&format!("# 标题 {i}\n\n正文段落 {i} *强调*\n\n```rs\nlet a = {i};\n```\n\n"));
+        }
+        let mut editor_rope = Rope::from(src.as_str());
+        let snapshot = editor_rope.clone();
+        let index = std::rc::Rc::new(crate::markdown::scan_blocks_rope(&snapshot));
+        assert!(
+            index.blocks.len() > crate::config::limits::WINDOWED_MIN_BLOCKS,
+            "测试应走窗口模式"
+        );
+        cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_source_with_index(PreviewSrc::Rope(snapshot.clone()), index, cx);
+            });
+        });
+        cx.simulate_resize(size(px(400.), px(600.)));
+        settle(cx);
+
+        let shared = cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.read(cx).test_src_rope_shared_with(&editor_rope)
+        });
+        assert!(
+            shared,
+            "预览源码应与编辑器共享同一棵 Rope（O(1) 克隆；false = 被物化成副本）"
+        );
+
+        // COW：编辑编辑器 rope（模拟打字），预览持有的快照内容仍等于原文。
+        editor_rope.insert(editor_rope.len(), "\n末尾追加");
+        assert_ne!(editor_rope.to_string(), src, "编辑器 rope 应已分叉");
+        let src_text = cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.read(cx).test_src_text()
+        });
+        assert_eq!(
+            src_text.as_deref(),
+            Some(src.as_str()),
+            "预览快照在编辑器编辑后应保持原内容（COW，不受影响）"
+        );
+        // 摆动：预编译器不 panic；其余不深究（本测试只负责共享语义）。
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+

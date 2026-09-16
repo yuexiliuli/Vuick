@@ -2036,6 +2036,73 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 回归（第二步：预览与编辑器共享源 Rope）：大 md 打开（完整异步流水线 +
+    /// `finish_file_text` 装预览）后，预览源码与编辑区正文是**同一棵 Rope**（ropey
+    /// 2.0 Arc 树，`Clone` O(1)、写时复制）——大 md 预览不常驻第二份源文本副本。
+    #[gpui::test]
+    async fn large_md_preview_shares_editor_rope(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-md-share-rope-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // 块数 > WINDOWED_MIN_BLOCKS 且 > 128KB → 走异步流水线（finish 装 PreviewSrc::Rope）。
+        let n = crate::config::limits::WINDOWED_MIN_BLOCKS + 800;
+        let content = (0..n)
+            .map(|i| {
+                format!("# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调*、`行内代码` 与 [链接](https://x.y)。\n\n")
+            })
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试 md 应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let (blocks, pending) = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                (
+                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                    a.tabs[i].editor_pending,
+                )
+            });
+            if blocks > 0 && !pending {
+                break;
+            }
+            frames += 1;
+            if frames > 300 {
+                panic!("大 md 打开/预览装配超时：{frames} 帧（blocks={blocks}）");
+            }
+        }
+        let shared = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let editor_rope = a.tabs[i].editor.read(cx).rope().clone();
+            a.tabs[i].md_preview.read(cx).test_src_rope_shared_with(&editor_rope)
+        });
+        assert!(
+            shared,
+            "异步打开 + finish 装预览后，预览源码应与编辑区共享同一棵 Rope（不物化第二份源）"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// 回归（专家评审 P1 升级版）：固定窗口虚拟化下的大文档「深跳」——Ctrl+End /
     /// 搜索跳到远超视口的行时：
     /// 1. ListState 恒是**固定小窗口**（O(WINDOW) 挂载，不建 3.2M 条 → 内存 O(1)）；

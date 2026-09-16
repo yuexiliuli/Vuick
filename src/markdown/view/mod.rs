@@ -955,10 +955,38 @@ impl MarkdownPreview {
                 let (_, win_b) = rows_memory_estimate(&self.win_rows);
                 let n = idx.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
-                let src_b = self.src_buf.as_ref().map(|s| s.len()).unwrap_or(0);
+                // 源：`Str` 是预览自持副本（小文档 / EPUB 全量路径）如实计入；
+                // `Rope` 与编辑器共享同一棵 Arc 树（O(1) 克隆、不物化），**不重复
+                // 计入**预览驻留——大 md 的「源」不是第二份文本。
+                let src_b = self.src_buf.as_ref().map(|s| match s {
+                    PreviewSrc::Str(s) => s.len(),
+                    PreviewSrc::Rope(_) => 0,
+                }).unwrap_or(0);
                 (n, index_b + src_b + win_b)
             }
             None => rows_memory_estimate(&self.rows),
+        }
+    }
+
+    /// 测试探针：窗口模式下，内部持有的源码 rope 是否与 `rope` **共享同一棵 Arc 树**
+    /// （ropey 2.0 `Rope` 是 Arc 树、`Clone` O(1)；算子来自 `extra::esoterica`，逐根
+    /// `Arc::ptr_eq`）。成立 → 预览不另持一份源文本（大 md 的「+1× 源」实为共享句柄，
+    /// 非副本）。仅测试用。
+    #[cfg(test)]
+    pub(crate) fn test_src_rope_shared_with(&self, rope: &Rope) -> bool {
+        match &self.src_buf {
+            Some(PreviewSrc::Rope(r)) => ropey::extra::esoterica::ropes_are_instances(r, rope),
+            _ => false,
+        }
+    }
+
+    /// 测试探针：取窗口模式内部持有的源码文本（O(n) 物化，仅测试 / COW 快照核验）。
+    #[cfg(test)]
+    pub(crate) fn test_src_text(&self) -> Option<String> {
+        match &self.src_buf {
+            Some(PreviewSrc::Rope(r)) => Some(r.to_string()),
+            Some(PreviewSrc::Str(s)) => Some(s.to_string()),
+            None => None,
         }
     }
 
