@@ -328,14 +328,14 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
     cx.simulate_resize(size(px(600.), px(600.)));
     settle(cx);
 
-    // 像素滚动（与滚轮/滚动条同款路径）连续下滚：render 每帧调度 ensure_window，
-    // 窗口应随可见范围移动（`scroll_to_reveal_item` 对远处未物化条目只到已布局窗口，
-    // 像素路径不受此限）。滚到中部让窗口建在 win_lo>0 处。
+    // 像素滚动（与滚轮同款路径）连续下滚：render 每帧调度 ensure_window，
+    // 窗口应随可见范围移动（固定窗口虚拟化的 `scroll_vertical` 会按需重定位窗口）。
+    // 滚到中部让窗口建在 win_lo>0 处。
     for _ in 0..100 {
         cx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |md, cx| {
-                md.list_state.scroll_by(px(500.));
+                md.scroll_vertical(-500.);
                 cx.notify();
             });
         });
@@ -1715,15 +1715,14 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     assert!(mid_row.is_some(), "row_for_line 应基于块索引可查（中部）");
     assert_eq!(toc_n, iters, "目录应由块索引全量提供");
 
-    // 用像素滚动（scroll_by＝滚轮/滚动条同款路径）连续下滚：render 每帧调度
-    // ensure_window，窗口应随可见范围移动。注：gpui ListState 的
-    // `scroll_to_reveal_item` 对未物化远处条目只到达已布局窗口（既有限制），
-    // 像素路径不受此限，故这里用像素滚动验证「窗口跟随」。
+    // 用像素滚动（scroll_vertical＝滚轮同款路径）连续下滚：render 每帧调度
+    // ensure_window，窗口应随可见范围移动（固定窗口虚拟化下 `scroll_vertical`
+    // 直接驱动窗口重定位，无「到达已布局窗口」的旧限制）。
     for _ in 0..30 {
         cx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |md, view_cx| {
-                md.list_state.scroll_by(px(300.));
+                md.scroll_vertical(-300.);
                 view_cx.notify();
             });
         });
@@ -1738,22 +1737,22 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         let md = host.read(cx).md.clone();
         let md = md.read(cx);
         (
-            md.list_state.logical_scroll_top().item_ix,
+            md.abs_scroll_top().0,
             md.win_lo,
             md.win_rows.len(),
         )
     });
     assert!(
         scroll_top > 100,
-        "像素滚动应将可见范围下移，scroll_top_item={scroll_top}"
+        "像素滚动应将绝对可见块下移，abs_top_block={scroll_top}"
     );
     assert!(
         win_lo2 > 50,
-        "窗口应随滚动下移，win_lo={win_lo2}（scroll_top={scroll_top}）"
+        "窗口应随滚动下移，win_lo={win_lo2}（abs_top={scroll_top}）"
     );
     assert!(
         win_lo2 <= scroll_top && scroll_top < win_lo2 + win_len2 + 64,
-        "窗口应覆盖可见范围，win_lo={win_lo2} len={win_len2} scroll_top={scroll_top}"
+        "窗口应覆盖可见范围，win_lo={win_lo2} len={win_len2} abs_top={scroll_top}"
     );
     assert!(win_len2 < 200, "任一时刻窗口应保持有界，win_len={win_len2}");
 }

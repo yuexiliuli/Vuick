@@ -30,10 +30,12 @@ mod tests;
 
 use std::rc::Rc;
 
+use std::cell::Cell;
+
 use gpui::{
-    div, list, px, rgba, App, Context, Hsla, InteractiveElement, IntoElement, ListAlignment,
-    ListState, ParentElement, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    div, list, point, px, rgba, App, Context, Hsla, InteractiveElement, IntoElement,
+    ListAlignment, ListOffset, ListState, ParentElement, Render, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::input::Rope;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode, ScrollableElement as _};
@@ -125,6 +127,20 @@ fn adaptive_overdraw(visible_blocks: usize) -> usize {
     let adaptive = (visible_blocks as f32 * WINDOWED_OVERDRAW_FACTOR) as usize;
     adaptive.clamp(WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_MAX)
 }
+
+/// 固定窗口虚拟化（预览窗口模式）：ListState 恒持这么多条目（O(1)，与块数无关）。
+/// 要求 > 可见块数 + 过扫 + 重定位前移余量（2048 块 × 平均高远超任何单屏）。
+/// 窗口内条目**不预铺统一高度**（全部 Unmeasured、overdraw=0）→ List 自身无可滚
+/// 高度、滚轮不作动，纵向滚动完全由预览自持像素模型驱动（见 `scroll_to_px`）。
+const PREVIEW_LIST_WINDOW: usize = 2048;
+/// 窗口重定位时目标块之前保留的前置块数（滚动余量，减少频繁重定位/重解析窗口）。
+const WINDOW_LEAD_BLOCKS: usize = 96;
+/// 块高抽样目标（块）：`stride = max(1, 块数 / 目标)`。换宽/字号变化时重建
+/// 抽样块高模型 O(N/stride)（4k 次 `index_block_height` 纯算术 < 1ms），
+/// 替代原先全量 O(N) 的 20~40ms 平均行高估算。
+const HEIGHT_SAMPLE_TARGET: usize = 4096;
+/// 超过该块数才启用块高抽样（否则逐块精确：几十万块 ≈ 几 ms，仅换源/换宽发生）。
+const HEIGHT_FULL_BLOCKS_MAX: usize = 262_144;
 
 /// 预览的原始文本源。窗口级懒解析在滚动/重解析时要反复对**原文**切片，
 /// 因此预览侧保存的源可以是：
@@ -239,6 +255,20 @@ pub struct MarkdownPreview {
     win_lo: usize,
     /// 已物化的当前窗口行（全局块下标 `win_lo..win_lo+len`；窗口模式才有内容）。
     win_rows: Rc<Vec<Row>>,
+    /// 固定窗口虚拟化（窗口模式）：ListState 窗口首行的**绝对块下标**。
+    /// ListState 只持 [`PREVIEW_LIST_WINDOW`] 条，渲染闭包把相对 item_ix 抬成
+    /// 绝对块 `= win_base + ix` 取行；目标滚出窗口即重定位本字段并 `reset`。
+    win_base: usize,
+    /// 用户纵向滚动目标（px，全篇绝对坐标），与纵向滚动条句柄共享
+    /// （`Rc<Cell<f32>>`）。滚动条拖动只写这里，render 逐帧按它重定位窗口。
+    desired_scroll: std::rc::Rc<Cell<f32>>,
+    /// 全篇块高（px）抽样模型（窗口模式；按当前 宽/换行/字号 由 [`Self::rebuild_height_model`]
+    /// 计算，见 [`HEIGHT_SAMPLE_TARGET`]）。`height_pref[i]` = 第 i 组**采样块**的起始 px，
+    /// 第 i 组覆盖块 `[i*stride, min((i+1)*stride, n))`、每组近似等高于组首块
+    /// `block_h[i]`。用于「像素↔块」确定性换算（窗口重定位 + 纵向量程 + 滚轮）。
+    block_h: Vec<f32>,
+    height_pref: Vec<f32>,
+    height_stride: usize,
 }
 
 impl MarkdownPreview {
@@ -273,6 +303,11 @@ impl MarkdownPreview {
             src_buf: None,
             win_lo: 0,
             win_rows: Rc::new(Vec::new()),
+            win_base: 0,
+            desired_scroll: std::rc::Rc::new(Cell::new(0.)),
+            block_h: Vec::new(),
+            height_pref: Vec::new(),
+            height_stride: 1,
         }
     }
 
@@ -410,12 +445,17 @@ impl MarkdownPreview {
         &self.toc
     }
 
-    /// 滚动到指定行（目录跳转）。
+    /// 滚动到指定行（目录跳转）。窗口模式走自持像素模型（瞬时重定位窗口），
+    /// 小文档仍用 ListState 的 reveal。
     pub fn scroll_to_row(&mut self, ix: usize) {
         if ix >= self.item_count() {
             return;
         }
-        self.list_state.scroll_to_reveal_item(ix);
+        if self.index.is_some() {
+            self.scroll_to_px(self.px_of_block(ix));
+        } else {
+            self.list_state.scroll_to_reveal_item(ix);
+        }
     }
 
     /// 返回覆盖**源码第 `line` 行**（0 基）的渲染行下标；空/无行返回 `None`。
@@ -444,7 +484,7 @@ impl MarkdownPreview {
     /// 滚动到包含**源码第 `line` 行**（0 基）的渲染行：搜索跳转（EPUB 只读预览）用。
     pub fn scroll_to_line(&mut self, line: usize) {
         if let Some(ix) = self.row_for_line(line) {
-            self.list_state.scroll_to_reveal_item(ix);
+            self.scroll_to_row(ix);
         }
     }
 
@@ -469,9 +509,12 @@ impl MarkdownPreview {
         // 都会重建 ListState 跳回开头）。
         let prev_scroll = self.list_state.logical_scroll_top();
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
-            // ---- 大文档：窗口级懒解析 ----
-            // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本（rope
-            // COW 共享、不物化全文），渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
+            // ---- 大文档：窗口级懒解析 + 固定窗口虚拟化 ----
+            // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本（rope COW
+            // 共享、不物化全文），渲染按可见窗口惰性物化 `Row`，驻留不随文档增长。
+            // ListState 恒 [`PREVIEW_LIST_WINDOW`] 条（O(1)，不再是 O(块数) 的大树）；
+            // 滚动由自持像素模型（`rebuild_height_model` 抽样块高）驱动 + 窗口重定位。
+            let prev_abs = self.abs_scroll_top();
             self.index = Some(index.clone());
             self.src_buf = Some(src.clone());
             self.win_lo = 0;
@@ -481,74 +524,31 @@ impl MarkdownPreview {
             self.code_scroll = Default::default();
             self.code_hl = Default::default();
             self.table_scroll = Default::default();
-            let new_n = index.blocks.len();
-            if new_n == self.list_state.item_count() {
-                // 块数未变（最常见的小编辑）：复用列表状态——保留 `last_layout_bounds`
-                // 与统一高度提示，避免 gpui 每帧按宽度变化 O(块数) 清空/重建。
-                // 内容变了只**重测可见窗口内**已物化的行高（O(窗口)，而非全量 remeasure
-                // 的 O(块数) SumTree 重建）；窗口外的行本来就是未测量占位，滚动过去时
-                // ensure_window 会用新源重建，无需此处铺满。
-                let r_lo = self.win_lo;
-                let r_hi = (r_lo + self.win_rows.len()).min(new_n);
-                if r_lo < r_hi {
-                    self.list_state.remeasure_items(r_lo..r_hi);
-                }
-            } else {
-                let old_n = self.list_state.item_count();
-                if old_n == 0 {
-                    // 首次装源 / release 后重建：没有可保留的高度提示与滚动，直接建新
-                    // ListState（同时丢弃构造函数里的 `measure_all()`，避免首帧把 N 行
-                    // 全部测量/排版，破坏窗口级懒解析）。
-                    self.list_state =
-                        ListState::new(new_n, ListAlignment::Top, px(ROW_OVERDRAW_PX));
-                    self.list_state.scroll_to(prev_scroll);
-                    self.hint_applied = None;
-                    self.hint_recovered = false;
-                } else {
-                    // 块数变化：**不重建 ListState**——用增量 `splice` 把新旧块数对齐
-                    // （O(log n)，SumTree 前后缀 O(1) 共享，旧块的统一高度提示原样保留）。
-                    // 绝不能每次换块都重建 64 万块的统一高度 SumTree（debug 300ms+/次，
-                    // 正是大文档逐键卡顿的主因）：少量新增/删除的块位于编辑点（可见窗口
-                    // 内），下一帧 `ensure_window` 重新物化即真实测量收敛；滚动条量程只对
-                    // 未测的新块差几行，宽度/主题变化时仍会走一次性 O(n) 校准。
-                    if new_n > old_n {
-                        self.list_state.splice(old_n..old_n, new_n - old_n);
-                    } else {
-                        self.list_state.splice(new_n..old_n, 0);
-                    }
-                    // splice 已维护逻辑滚动位置（收缩时自动夹紧），无需重建 scroll_to。
-                    if let Some((_, hint)) = self.hint_applied {
-                        // 保留统一高度提示记忆：提示值不变，只把块数对齐新值。
-                        self.hint_applied = Some((new_n, hint));
-                    } else {
-                        self.hint_recovered = false;
-                    }
-                }
+            self.list_state =
+                ListState::new(PREVIEW_LIST_WINDOW, ListAlignment::Top, px(0.));
+            self.win_base = 0;
+            self.hint_applied = None;
+            self.hint_recovered = false;
+            // 高度/块宽模型失效：下次 render（宽度已知）按新源重建。
+            self.invalidate_height_model();
+            if self.content_w <= 0.0 {
+                self.remeasure_dimensions(cx);
+            }
+            // 恢复滚动：窗口重定位回旧绝对位置（px），render 的 apply_desired 落窗口。
+            if prev_abs.0 > 0 || prev_abs.1 > 0.0 {
+                self.desired_scroll.set(self.px_of_block(prev_abs.0) + prev_abs.1);
             }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
                 eprintln!(
-                    "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 行未物化",
+                    "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 固定窗口 {} 条",
                     src.len(),
                     src.line_count(),
                     n,
                     index_b / 1024,
+                    PREVIEW_LIST_WINDOW,
                 );
-            }
-            // 不调用 `invalidate_height_hint()`：行高估算只在**视口宽度变化**时重算
-            // 就够了（`update_height_hint` 在 render 里比对本帧宽度）。若每次同步都作废
-            // 估算，会迫使 render 重算 → 与 `hint_applied` 记忆（f32 逐位比较）失配 →
-            // 每次换块都 O(n) 重建 64 万块统一高度 SumTree（debug 300ms+/次，正是大文档
-            // 逐键卡顿的主因）。宽度 / 换行 / 字号变化仍由对应 setter 主动作废。
-            //
-            // `content_w` 同理必须**跨编辑稳定**（单调不减）：它决定 List 的布局宽，
-            // gpui 在「宽度变化时」会清空全部未测量项的 size_hint（`list.rs` prepaint），
-            // 清空后统一高度提示失效、下次渲染又要 O(n) 重建。因此文本同步**不**重算
-            // content_w（首次由 open 算一次），渲染窗口里出现更宽的行时由
-            // `ensure_window` 单调**上修**，绝不因删短某行而回拨。
-            if self.content_w <= 0.0 {
-                self.remeasure_dimensions(cx);
             }
             return;
         }
@@ -679,6 +679,171 @@ impl MarkdownPreview {
         }
     }
 
+    /// 纵向滚动目标总量程（px，窗口模式 = 抽样块高模型总高；小文档 = 行数×平均高）。
+    fn total_h(&self) -> f32 {
+        if self.index.is_some() {
+            self.height_pref.last().copied().unwrap_or(0.0)
+        } else {
+            self.rows.len() as f32 * self.est_hint.max(1.0)
+        }
+    }
+
+    /// 「像素↔块」模型已按当前宽度/换行/字号失效（换源/换行/字号/宽度变化时置 -1，
+    /// render 依宽度重建，重建时顺带刷新 `est_hint` 平均高）。
+    fn invalidate_height_model(&mut self) {
+        self.est_hint_width = -1.0;
+    }
+
+    /// 重建全篇块高抽样模型（窗口模式专用）：O(N/stride) 纯算术，替代原先 O(N)
+    /// 的 `estimated_avg_row_height`（20~40ms），换宽/换源成本降到 <1ms。
+    fn rebuild_height_model(&mut self, p: &StyleParams, width: f32) {
+        let Some(idx) = self.index.clone() else {
+            return;
+        };
+        let n = idx.blocks.len();
+        if n == 0 {
+            self.block_h = Vec::new();
+            self.height_pref = Vec::new();
+            self.height_stride = 1;
+            self.est_hint = 0.0;
+            return;
+        }
+        let avail = (width - 24.0).max(40.0); // px_3 左右内缩，与旧估算一致
+        // 抽样步长：中等文档（≤ 该阈值）**逐块精确**算高（几十万块 ≈ 几 ms，换源/换宽
+        // 才发生）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度
+        // 周期复用块」有偏差，故只在 N 大到精确成本不可接受时启用。
+        let stride = if n > HEIGHT_FULL_BLOCKS_MAX {
+            (n / HEIGHT_SAMPLE_TARGET).max(1)
+        } else {
+            1
+        };
+        let groups = n / stride + 1;
+        let mut block_h: Vec<f32> = Vec::with_capacity(groups);
+        let mut pref: Vec<f32> = Vec::with_capacity(groups + 1);
+        pref.push(0.0);
+        let mut si = 0usize;
+        while si < n {
+            let b = &idx.blocks.at(si.min(n - 1));
+            let h = index_block_height(b, p, self.wrap, avail).max(1.0);
+            block_h.push(h);
+            let group_len = stride.min(n - si);
+            pref.push(pref.last().copied().unwrap_or(0.0) + h * group_len as f32);
+            si += stride;
+        }
+        self.block_h = block_h;
+        self.height_pref = pref;
+        self.height_stride = stride;
+        self.est_hint = self.total_h() / n.max(1) as f32;
+        self.est_hint_width = width;
+    }
+
+    /// 块 → 像素（抽样模型近似；未建模型退化为 平均高×块号）。
+    fn px_of_block(&self, block: usize) -> f32 {
+        if self.height_pref.is_empty() {
+            return self.est_hint.max(1.0) * block as f32;
+        }
+        let stride = self.height_stride.max(1);
+        let g = (block / stride).min(self.height_pref.len().saturating_sub(1));
+        let base = self.height_pref[g];
+        let gh = self.block_h.get(g).copied().unwrap_or(1.0);
+        base + (block.saturating_sub(g * stride)) as f32 * gh
+    }
+
+    /// 像素 → (绝对块, 块内 px 偏移)（抽样模型二分；未建模型退化）。
+    fn block_of_px(&self, px: f32) -> (usize, f32) {
+        let n = self.item_count();
+        if n == 0 {
+            return (0, 0.0);
+        }
+        if self.height_pref.len() <= 1 {
+            let hint = self.est_hint.max(1.0);
+            let block = (px / hint).floor().max(0.) as usize;
+            return (block.min(n - 1), (px - block as f32 * hint).max(0.));
+        }
+        let h = &self.height_pref;
+        // 二分：最大的 i 使 h[i] <= px
+        let mut lo = 0usize;
+        let mut hi = h.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if h[mid] <= px {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let g = lo.saturating_sub(1).min(self.block_h.len().saturating_sub(1));
+        let within = (px - self.height_pref[g]).max(0.0);
+        let gh = self.block_h.get(g).copied().unwrap_or(1.0).max(1.0);
+        let stride = self.height_stride.max(1);
+        let k = (within / gh).floor() as usize;
+        let block = (g * stride + k).min(n - 1);
+        (block, within - k as f32 * gh)
+    }
+
+    /// 文本区 **绝对**滚动位置 `(绝对块, 块内 px)`（窗口模式 = base + 相对）。
+    fn abs_scroll_top(&self) -> (usize, f32) {
+        let s = self.list_state.logical_scroll_top();
+        (self.win_base + s.item_ix, s.offset_in_item.as_f32())
+    }
+
+    /// 当前纵向滚动像素（全篇绝对坐标）。小文档按平均高近似（与纵向量程同口径）。
+    fn scroll_top_px(&self) -> f32 {
+        if self.index.is_some() {
+            let (b, off) = self.abs_scroll_top();
+            self.px_of_block(b) + off
+        } else {
+            let s = self.list_state.logical_scroll_top();
+            self.est_hint.max(1.0) * s.item_ix as f32 + s.offset_in_item.as_f32()
+        }
+    }
+
+    /// 滚到目标像素（夹到 [0, 总量−视口]）并写入共享 desired；窗口模式重定位窗口，
+    /// 小文档直接交给 ListState（保持原行为）。
+    fn scroll_to_px(&mut self, target_px: f32) {
+        let view = self.list_state.viewport_bounds().size.height.as_f32();
+        let max_px = (self.total_h() - view).max(0.0);
+        let tp = target_px.clamp(0.0, max_px);
+        self.desired_scroll.set(tp);
+        if self.index.is_some() {
+            self.apply_desired(tp);
+        } else {
+            let lh = self.est_hint.max(1.0);
+            self.list_state.scroll_to(ListOffset {
+                item_ix: (tp / lh).floor().max(0.) as usize,
+                offset_in_item: px(tp - (tp / lh).floor() * lh),
+            });
+        }
+    }
+
+    /// 滚轮竖向滚动：dy = delta px（Lines 已乘平均高换算），负 = 向下。
+    fn scroll_vertical(&mut self, dy: f32) {
+        self.scroll_to_px(self.scroll_top_px() - dy);
+    }
+
+    /// 固定窗口重定位：目标块在窗口外 / 余量不足 → `reset(WINDOW)` + 移 `win_base`，
+    /// 再 `scroll_to` 窗口内相对位置（O(窗口)，任意跳转瞬时可达）。
+    fn apply_desired(&mut self, tp: f32) {
+        if self.index.is_none() {
+            return;
+        }
+        let (abs_block, frac) = self.block_of_px(tp);
+        let view = self.list_state.viewport_bounds().size.height.as_f32();
+        let vis = ((view / self.est_hint.max(1.0)).ceil() as usize).max(1);
+        let rel = abs_block.saturating_sub(self.win_base);
+        let in_window =
+            abs_block >= self.win_base && rel + vis + WINDOW_LEAD_BLOCKS <= PREVIEW_LIST_WINDOW;
+        if !in_window {
+            self.win_base = abs_block.saturating_sub(WINDOW_LEAD_BLOCKS);
+            self.list_state = ListState::new(PREVIEW_LIST_WINDOW, ListAlignment::Top, px(0.));
+        }
+        let rel = abs_block
+            .saturating_sub(self.win_base)
+            .min(PREVIEW_LIST_WINDOW.saturating_sub(1));
+        self.list_state
+            .scroll_to(ListOffset { item_ix: rel, offset_in_item: px(frac) });
+    }
+
     /// 窗口模式：确保 `win_rows` 覆盖块区间 `[lo, hi]`（含上下过扫余量）。
     /// 命中缓存的窗口（或仅 ±1 内）不重解析，避免轻微滚动反复重建。
     fn ensure_window(&mut self, lo: usize, hi: usize) {
@@ -801,8 +966,26 @@ impl MarkdownPreview {
     /// 统一高度提示（精确平均高）生效时 ≈ 全篇块高之和；抽样偏差/坍缩时失真。
     /// 诊断用：配合 `MD_OPEN_DEBUG` 校验“拖到底不到底”的量程是否精确。
     pub(crate) fn vertical_total_px(&self) -> f32 {
-        self.list_state.max_offset_for_scrollbar().y.as_f32()
-            + self.list_state.viewport_bounds().size.height.as_f32()
+        if self.index.is_some() {
+            // 窗口模式：量程 = 抽样块高模型总高（确定性，与固定窗口/未测量无关）。
+            self.total_h()
+        } else {
+            self.list_state.max_offset_for_scrollbar().y.as_f32()
+                + self.list_state.viewport_bounds().size.height.as_f32()
+        }
+    }
+
+    /// 诊断：当前统一行高提示值（px）。应 ≈ 全篇块的精确平均行高（>0）。
+    /// 测试：窗口模式绝对滚动顶 `(绝对块, 块内 px)`。
+    #[cfg(test)]
+    pub(crate) fn test_abs_scroll_top(&self) -> (usize, f32) {
+        self.abs_scroll_top()
+    }
+
+    /// 测试：抽样块高模型的样本组数（= block_h 长度；stride=1 时等于块数）。
+    #[cfg(test)]
+    pub(crate) fn test_height_groups(&self) -> usize {
+        self.block_h.len()
     }
 
     /// 诊断：当前统一行高提示值（px）。应 ≈ 全篇块的精确平均行高（>0）。
@@ -856,6 +1039,11 @@ impl MarkdownPreview {
         self.src_buf = None;
         self.win_lo = 0;
         self.win_rows = Rc::new(Vec::new());
+        self.win_base = 0;
+        self.desired_scroll = std::rc::Rc::new(Cell::new(0.));
+        self.block_h = Vec::new();
+        self.height_pref = Vec::new();
+        self.height_stride = 1;
         self.remeasure_dimensions(cx);
     }
 
@@ -1163,14 +1351,24 @@ impl Render for MarkdownPreview {
             }
         };
         let _t_hint = crate::prof::begin();
-        if self.update_height_hint(cx, pane_w) {
-            cx.notify();
+        if self.index.is_some() {
+            // 窗口模式：重建（如失效）抽样块高模型 + 把固定窗口对齐到用户目标
+            // （滚动条拖动只写 desired；滚轮/跳转的 scroll_to_px 已同步，此处幂等兜底）。
+            if self.est_hint_width < 0.0 || (self.est_hint_width - pane_w).abs() >= 2.0 {
+                self.rebuild_height_model(&p, pane_w);
+            }
+            self.apply_desired(self.desired_scroll.get());
+        } else {
+            // 小文档：原来的统一高度提示量程路径不变。
+            if self.update_height_hint(cx, pane_w) {
+                cx.notify();
+            }
         }
         crate::prof::end("md_hint", _t_hint);
         // 窗口模式：按当前可见范围预物化行的窗口。必须在构造 list 闭包前完成，
         // 闭包内只读窗口数据（Rc），以避免在元素构造期改 `self`。
         if self.index.is_some() {
-            let lo_vis = self.list_state.logical_scroll_top().item_ix;
+            let (lo_vis, _off) = self.abs_scroll_top();
             let view_h = self.list_state.viewport_bounds().size.height.as_f32();
             let hint = self.est_hint.max(20.0);
             let vis_base = ((view_h / hint).ceil() as usize).max(1);
@@ -1262,6 +1460,7 @@ impl Render for MarkdownPreview {
         let rows = self.rows.clone();
         let win_rows = self.win_rows.clone();
         let win_lo = self.win_lo;
+        let win_base = self.win_base;
         let windowed = self.index.is_some();
         let content = {
             let p = p.clone();
@@ -1269,18 +1468,21 @@ impl Render for MarkdownPreview {
             let code_hl = code_hl;
             let table_scroll = table_scroll;
             let search_highlight = search_highlight;
+            // 列表 item_ix 是窗口内**相对**下标：绝对块 = `win_base + ix`（行数据窗口
+            // `win_rows`/`rows` 用绝对块下标）。超出已物化窗口渲染空占位。
             list(list_state.clone(), move |ix, _window, cx| {
-                let ch = code_scroll.get(&ix).cloned();
-                let chr = code_hl.get(&ix).cloned();
-                let th = table_scroll.get(&ix).cloned();
+                let abs = if windowed { win_base + ix } else { ix };
+                let ch = code_scroll.get(&abs).cloned();
+                let chr = code_hl.get(&abs).cloned();
+                let th = table_scroll.get(&abs).cloned();
                 let search = search_highlight
                     .as_ref()
-                    .filter(|(row_ix, _, _)| *row_ix == ix)
+                    .filter(|(row_ix, _, _)| *row_ix == abs)
                     .map(|(_, range, color)| (range.clone(), *color));
                 if !windowed {
-                    render_row(&rows[ix], &p, wrap, ch, chr, th, search, cx)
-                } else if ix >= win_lo && ix - win_lo < win_rows.len() {
-                    render_row(&win_rows[ix - win_lo], &p, wrap, ch, chr, th, search, cx)
+                    render_row(&rows[abs], &p, wrap, ch, chr, th, search, cx)
+                } else if abs >= win_lo && abs - win_lo < win_rows.len() {
+                    render_row(&win_rows[abs - win_lo], &p, wrap, ch, chr, th, search, cx)
                 } else {
                     // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
                     // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
@@ -1338,12 +1540,19 @@ impl Render for MarkdownPreview {
                     .child({
                         let n = self.item_count();
                         let eh = self.est_hint.max(0.0);
+                        let windowed = self.index.is_some();
                         let v = PreviewVerticalScrollHandle {
                             list: list_state.clone(),
                             content_width: self.content_w,
-                            content_height: n as f32 * eh,
+                            content_height: if windowed {
+                                self.total_h()
+                            } else {
+                                n as f32 * eh
+                            },
                             est_hint: eh,
                             n,
+                            windowed,
+                            desired: self.desired_scroll.clone(),
                         };
                         Scrollbar::vertical(&v)
                             .mode(ScrollbarMode::Always)
@@ -1352,7 +1561,8 @@ impl Render for MarkdownPreview {
             )
             .into_any_element();
 
-        // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；相对定位承载目录浮层/面板开关。
+        // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；窗口模式普通滚轮走自持像素滚动；
+        // 相对定位承载目录浮层/面板开关。
         let root = div()
             .id("md-preview-root")
             .debug_selector(|| "md-preview-root".into())
@@ -1360,19 +1570,31 @@ impl Render for MarkdownPreview {
             .relative()
             .on_scroll_wheel(cx.listener(
                 |this: &mut MarkdownPreview, event: &ScrollWheelEvent, _w, cx| {
-                    if !event.modifiers.control {
+                    if event.modifiers.control {
+                        let delta_y = match event.delta {
+                            ScrollDelta::Lines(lines) => lines.y,
+                            ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                        };
+                        let step = delta_y.clamp(-1.0, 1.0);
+                        if step != 0.0 {
+                            let default =
+                                StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
+                            this.bump_font_size(step * 1.5, cx, default);
+                            cx.notify();
+                        }
                         return;
                     }
-                    let delta_y = match event.delta {
-                        ScrollDelta::Lines(lines) => lines.y,
-                        ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-                    };
-                    let step = delta_y.clamp(-1.0, 1.0);
-                    if step != 0.0 {
-                        let default =
-                            StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
-                        this.bump_font_size(step * 1.5, cx, default);
-                        cx.notify();
+                    // 窗口模式：List 固定窗口自身无可滚高度（overdraw=0、不预铺高度），
+                    // 纵向滚动完全由像素模型驱动（覆盖任何 List 内部滚轮残留位移）。
+                    if this.index.is_some() {
+                        let dy = match event.delta {
+                            ScrollDelta::Lines(lines) => lines.y * this.est_hint.max(4.0),
+                            ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                        };
+                        if dy != 0.0 {
+                            this.scroll_vertical(dy);
+                            cx.notify();
+                        }
                     }
                 },
             ));
@@ -1402,11 +1624,12 @@ fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
     None
 }
 
-/// 预览纵向滚动条的「确定性量程」句柄（与编辑器 `VerticalScrollHandle` 同法）：
-/// 拖拽开始前若量程坍缩（gpui 换宽清空 size_hint / 陈旧戳值），用精确平均行高强制
-/// 重铺后**再冻结** `scrollbar_drag_start_height`。内置 `vertical_scrollbar(&list_state)`
-/// 会在量程坍缩/自愈未完成时冻结旧值 → 拖到底也到不了真正的底部（滚轮还能再翻）。
-/// 滚轮滚动由 `list()` 元素自身处理，与本滚动条无关。
+/// 预览纵向滚动条的「确定性量程」句柄（与编辑器 `VerticalScrollHandle` 同法）。
+/// - **窗口模式**：量程 = 抽样块高模型总高（`content_height`，与窗口大小无关），
+///   拖拽只写共享 `desired`（px，render 逐帧 `apply_desired` 落窗口重定位）——
+///   确定性、无坍缩、拖到底必到全文末尾。
+/// - **小文档**：仍走 ListState 的 summary 量程 + 拖拽前 O(n) 校准冻结（原路径）。
+/// 滚轮滚动由容器级处理器驱动（窗口模式），与本滚动条无关。
 #[derive(Clone)]
 struct PreviewVerticalScrollHandle {
     list: ListState,
@@ -1414,6 +1637,8 @@ struct PreviewVerticalScrollHandle {
     content_height: f32,
     est_hint: f32,
     n: usize,
+    windowed: bool,
+    desired: std::rc::Rc<Cell<f32>>,
 }
 
 impl ScrollbarHandle for PreviewVerticalScrollHandle {
@@ -1422,11 +1647,22 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
     }
 
     fn offset(&self) -> gpui::Point<gpui::Pixels> {
-        self.list.scroll_px_offset_for_scrollbar()
+        if self.windowed {
+            // 用「用户目标」而非固定窗口的实际位置：窗口只是渲染切片，量程是全文的。
+            point(px(0.), px(-self.desired.get()))
+        } else {
+            self.list.scroll_px_offset_for_scrollbar()
+        }
     }
 
     fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
-        self.list.set_offset_from_scrollbar(offset);
+        if self.windowed {
+            let view = self.list.viewport_bounds().size.height.as_f32();
+            let off = (-offset.y.as_f32()).max(0.).min((self.content_height - view).max(0.));
+            self.desired.set(off);
+        } else {
+            self.list.set_offset_from_scrollbar(offset);
+        }
     }
 
     fn content_size(&self) -> gpui::Size<gpui::Pixels> {
@@ -1434,7 +1670,11 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
     }
 
     fn start_drag(&self) {
-        // 拖拽开始前把量程铺到「确定性正确」再冻结（O(n) 仅在坍缩时一次）：
+        if self.windowed {
+            // 窗口模式量程确定性，无坍缩，无需重铺/冻结。
+            return;
+        }
+        // 小文档：拖拽开始前把量程铺到「确定性正确」再冻结（O(n) 仅在坍缩时一次）：
         // `items.summary().height` 会被冻结进 `scrollbar_drag_start_height`，
         // 若此时仍是坍缩值，整次拖拽都会被夹在旧量程 → 拖不到底、只能滚轮兜底。
         let total = self.list.max_offset_for_scrollbar().y.as_f32()
@@ -1450,6 +1690,9 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
     }
 
     fn end_drag(&self) {
+        if self.windowed {
+            return;
+        }
         self.list.scrollbar_drag_ended();
     }
 }

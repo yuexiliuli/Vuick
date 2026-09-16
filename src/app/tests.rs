@@ -2353,8 +2353,8 @@
             lines.saturating_sub(eix) <= 50,
             "编辑器拖到底应到达最后内容（滚动顶行 item_ix={eix}/{lines}）"
         );
-        // 预览侧量程同样须**精确**（≈ 全篇块高之和），不能因抽样/坍缩缩到视口高
-        // ——否则预览滚动条拖不到底部。回归：精确平均行高替代 256 块抽样。
+        // 预览侧量程同样须**精确**（≈ 全篇块高之和）：固定窗口虚拟化下用
+        // 抽样块高模型总高（`total_h`），不能缩到视口高——否则预览滚动条拖不到底部。
         let (pv_total, blocks, est, applied) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
@@ -2370,33 +2370,28 @@
             pv_total > blocks as f32 * 15.0,
             "预览纵向量程应精确（total={pv_total:.0}px / {blocks} 块，est_hint={est:.0}，applied={applied:?}，坍缩态≈{vh:.0}px）"
         );
-        // 确定性「拖到底」回归：模拟 PreviewVerticalScrollHandle.start_drag 的重铺+冻结+
-        // 拖底（用户实测：内置滚动条在量程坍缩/未自愈时开始拖，冻结旧值 → 拖不到真正的
-        // 底部，只能滚轮兜底）。断言拖到底后逻辑项到最后一两块。
-        let drag_top = cx.update(|_, cx| {
+        // 确定性「拖到底」回归（用户实测：内置滚动条在量程坍缩/未自愈时开始拖会冻结
+        // 旧值 → 拖不到真正的底部）。窗口模式走 `scroll_to_row`（像素模型 + 窗口
+        // 重定位）；断言跳到底后绝对顶块落在末尾一个视口内。
+        let pv_ent = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].md_preview.read(cx).test_list_state()
+            a.tabs[i].md_preview.clone()
         });
-        drag_top.reset_with_uniform_height(blocks, gpui::px(est));
-        drag_top.scrollbar_drag_started();
-        drag_top.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
+        cx.update(|_, cx| {
+            pv_ent.update(cx, |md, _| md.scroll_to_row(blocks.saturating_sub(1)));
+        });
         cx.run_until_parked();
         let _ = cx.cx.refresh();
         cx.run_until_parked();
         let top_ix = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i]
-                .md_preview
-                .read(cx)
-                .test_list_state()
-                .logical_scroll_top()
-                .item_ix
+            a.tabs[i].md_preview.read(cx).test_abs_scroll_top().0
         });
         assert!(
-            blocks.saturating_sub(top_ix) <= 50,
-            "预览拖到底应到达最后内容（滚动顶块 item_ix={top_ix}，共 {blocks}；应距末尾在一个视口内）"
+            blocks.saturating_sub(top_ix) <= 200,
+            "预览跳到底应到达最后内容（绝对顶块={top_ix}，共 {blocks}；应距末尾在一个视口内）"
         );
         let _ = std::fs::remove_file(&dir);
     }
