@@ -1881,10 +1881,9 @@
         let _ = std::fs::remove_file(&dir);
     }
 
-    /// 回归：大文档打开把「ListState 全量装配（O(N)）」从打开瞬间移出——直挂总绳的
-    /// mount 只建「视口小列表」（同一同步栈内即可断言 item_count 远小于全文行数，
-    /// 不依赖帧时序），全文 N 条由定时器**分帧 splice 增长**补建（量程恢复健康）。
-    /// 防止退化成 mount 同步 O(N) 建全文（把 ~2s 开销挪回打开瞬间关键路径）。
+    /// 回归：大文档打开时 ListState 为**固定小窗口**（O(1) 挂载，与全文行数无关）——
+    /// mount 同步栈内即可断言 item_count 远小于全文行数（★不建 N 条 → 内存 O(1)），
+    /// 防止退化成 mount 同步 O(N) 建全文（那正是内存 +~300MB / 打开冻帧的元凶）。
     #[gpui::test]
     async fn open_large_doc_mounts_list_two_phase(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1900,10 +1899,7 @@
         use gpui_component::input::RopeExt as _;
         let rope = gpui_component::input::Rope::from(content.as_str());
         let line_count = rope.lines_len();
-        assert!(
-            line_count > crate::config::limits::EDITOR_LIST_DEFER_MIN_LINES as usize,
-            "测试应超过两段式阈值，实际 {line_count} 行"
-        );
+        assert!(line_count > 4_096, "测试应远超固定窗口（512），实际 {line_count} 行");
 
         let ed_ent = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
         // 同步栈内断言两段式：mount 返回时只建了视口小列表（若非两段式，这里
@@ -1921,8 +1917,7 @@
                 cx.notify(); // 真实打开路径 load_file_text 会 notify；这里等价驱动首帧 render
             });
         });
-        // 驱动帧 + 推模拟时钟：render 启动分帧增长定时器 → splice 补建全文 → 量程健康。
-        // （真实应用由 OS 定时器驱动；测试需显式 advance_clock 触发。）
+        // 固定窗口虚拟化：mount 即就绪（无分帧增长），列表恒为小窗口。
         let mut frames = 0;
         loop {
             cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
@@ -1930,14 +1925,16 @@
             let _ = cx.cx.refresh();
             let done = cx.update(|_w, cx| {
                 let ed = ed_ent.read(cx);
-                ed.test_list_state().item_count() == ed.test_scroll_item_count()
+                !ed.test_list_is_deferred()
+                    && ed.test_list_window_len() <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS
+                    && ed.test_metrics().1 > 0.
             });
             if done {
                 break;
             }
             frames += 1;
             if frames > 120 {
-                panic!("分帧增长超时：{} 帧后 item_count 仍 < line_count", frames);
+                panic!("固定窗口挂载超时：{frames} 帧");
             }
         }
         cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
@@ -1955,27 +1952,23 @@
         let expected = (line_count.saturating_sub(1)) as f32 * lh - vh;
         assert!(
             mo > expected * 0.9,
-            "分帧增长后量程应健康：max_off={mo:.0}，预期≈{expected:.0}（行 {line_count}/高 {lh:.0}px）"
+            "量程应按全文行数健康：max_off={mo:.0}，预期≈{expected:.0}（行 {line_count}/高 {lh:.0}px）"
         );
     }
 
-    /// 回归（专家评审 P1）：大文档分帧增长期间的「深跳」——Ctrl+End / 搜索跳到远超
-    /// 已增长范围的行时：
-    /// 1. 不再钳在「已增长底部」（滚动条在底部而行号列显示 ~1M 的错位）；
-    /// 2. 立即进入深跳占位期（desired_scroll = 目标，jump_placeholder_active=true，
-    ///    render 显示「正在加载第 R 行…」）；
-    /// 3. 后续每帧增长赶上后自动收敛到目标行（占位消失、真实内容落位），全程无
-    ///    「快进式补足」的大块 splice。
+    /// 回归（专家评审 P1 升级版）：固定窗口虚拟化下的大文档「深跳」——Ctrl+End /
+    /// 搜索跳到远超视口的行时：
+    /// 1. ListState 恒是**固定小窗口**（O(WINDOW) 挂载，不建 3.2M 条 → 内存 O(1)）；
+    /// 2. 跳转**瞬时落位**（重定位 `window_base` 到目标行附近并渲染：无占位符、无
+    ///    「分帧增长逐块收敛」循环），比旧「深跳占位 + 逐帧增长」更快且更简单。
     #[gpui::test]
-    async fn deep_jump_during_grow_placeholder_then_converges(cx: &mut TestAppContext) {
+    async fn deep_jump_lands_instantly_with_window(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 90k 行（≈2.7 个增长块）：深跳目标在增长到全文之后才是「可直达行」，
-        // 确保测试期间能处于「已增长 < 目标」的占位中间态。
         let line = "x".repeat(60);
         let content = (0..90_000)
             .map(|i| format!("{line} {i:010}\n"))
@@ -1983,100 +1976,61 @@
         use gpui_component::input::RopeExt as _;
         let rope = gpui_component::input::Rope::from(content.as_str());
         let line_count = rope.lines_len();
-        assert!(
-            line_count > crate::config::limits::EDITOR_LIST_DEFER_MIN_LINES as usize,
-            "测试应超过两段式阈值，实际 {line_count} 行"
-        );
 
         let ed_ent = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
         cx.update(|_w, cx| {
             ed_ent.update(cx, |ed, cx| {
                 ed.set_rope_with_stats(rope.clone(), 0, Default::default());
-                // 常规（未跳转）：不进入占位期（desired=0 ≤ 已增长可滚范围）
-                assert!(!ed.test_jump_placeholder_active(), "未跳转不应占位");
-                assert_eq!(ed.test_desired_scroll_px(), 0.);
                 cx.notify(); // 等价 load_file_text 的 notify，驱动首帧 render
             });
         });
-
-        // 驱动增长到「至少一个大块且未铺满全文」的中间态。
-        let mut frames = 0;
-        loop {
-            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+        // 挂载即就绪：固定小窗口，无分帧增长。
+        for _ in 0..5 {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             let _ = cx.cx.refresh();
-            let (ic, lc) = cx.update(|_w, cx| {
-                let ed = ed_ent.read(cx);
-                (ed.test_list_state().item_count(), ed.line_count())
-            });
-            if ic > crate::config::limits::EDITOR_LIST_GROW_CHUNK_LINES as usize && ic < lc {
-                break;
-            }
-            frames += 1;
-            if frames > 200 {
-                panic!("增长未到中间态：ic={ic} lc={lc}");
-            }
         }
+        let (deferred, win, base0, rows) = cx.update(|_w, cx| {
+            let ed = ed_ent.read(cx);
+            (
+                ed.test_list_is_deferred(),
+                ed.test_list_window_len(),
+                ed.test_window_base(),
+                ed.line_count(),
+            )
+        });
+        assert!(!deferred, "固定窗口挂载即就绪（无两段式中间态）");
+        assert!(
+            win <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            "固定窗口应为小窗口，实际 {win}"
+        );
+        assert_eq!(base0, 0, "未滚动前窗口基址应为 0");
+        assert!(rows >= line_count, "行数应加载完整：{rows} ≥ {line_count}");
 
-        // 深跳：选区到全文末尾（模拟 Ctrl+End / 搜索跳转到最后一行）→ 应进入占位期，
-        // ListState 仍停在「已增长底部」（目标行尚未 splice 出来，不能直接显示）。
+        // 深跳：选区到全文末尾 → 瞬时落位。
         cx.update(|_w, cx| {
             ed_ent.update(cx, |ed, cx| {
                 ed.set_selection_range(content.len().saturating_sub(1)..content.len(), cx);
             });
         });
-        cx.cx.executor().advance_clock(std::time::Duration::from_millis(1));
-        cx.run_until_parked();
-        let _ = cx.cx.refresh();
-        let (listing, placeholder, desired, ic, lh) = cx.update(|_w, cx| {
-            let ed = ed_ent.read(cx);
-            (
-                ed.test_list_state().logical_scroll_top().item_ix,
-                ed.test_jump_placeholder_active(),
-                ed.test_desired_scroll_px(),
-                ed.test_list_state().item_count(),
-                ed.test_metrics().1.max(1.),
-            )
-        });
-        assert!(placeholder, "深跳应进入占位期（目标超出已增长范围）");
-        assert!(
-            listing <= ic.saturating_sub(1),
-            "占位期 ListState 应仍在已增长底部：top={listing}（item_count={ic}）"
-        );
-        assert!(
-            desired / lh > (ic.saturating_sub(1)) as f32,
-            "desired 应在全文末尾、远超已增长行数：desired={desired:.0}px / lh={lh:.0} → {} 行，item_count={ic}",
-            desired / lh
-        );
-
-        // 继续驱动到增长完成：占位消失、列表收敛到目标附近（最后一行）。
-        let mut frames2 = 0;
-        loop {
-            cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
+        for _ in 0..5 {
+            cx.cx.executor().advance_clock(std::time::Duration::from_millis(1));
             cx.run_until_parked();
             let _ = cx.cx.refresh();
-            let (ph, ic, top) = cx.update(|_w, cx| {
-                let ed = ed_ent.read(cx);
-                (
-                    ed.test_jump_placeholder_active(),
-                    ed.test_list_state().item_count(),
-                    ed.test_list_state().logical_scroll_top().item_ix,
-                )
-            });
-            // 增长目标 = 全文行数 + 底部预留空行（见 editor::CodeEditor::scroll_item_count），
-            // 占位在最后一小块（含预留空行）splice 后才清除，ic 最终 = line_count + 预留行。
-            if !ph && ic >= line_count {
-                assert!(
-                    top >= line_count.saturating_sub(64),
-                    "增长完成后应滚到目标附近：top={top}（全文 {line_count} 行）"
-                );
-                break;
-            }
-            frames2 += 1;
-            if frames2 > 200 {
-                panic!("深跳收敛超时：placeholder={ph} ic={ic}");
-            }
         }
+        let (top, base) = cx.update(|_w, cx| {
+            let ed = ed_ent.read(cx);
+            (ed.test_text_scroll_top().0, ed.test_window_base())
+        });
+        assert!(
+            top >= line_count.saturating_sub(64),
+            "深跳应瞬时滚到全文末尾附近：top={top}（全文 {line_count} 行）"
+        );
+        assert!(base > 0, "窗口基址应重定位到大行号：base={base}");
+        assert!(
+            top.saturating_sub(base) < crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            "目标行应在窗口内：abs_top={top} base={base}"
+        );
     }
 
     /// 回归（2026-09-16）：底部预留必须被渲染成**可见**的空白区，最后一行不得被
@@ -2137,9 +2091,16 @@
                 ed.test_scroll_item_count(),
             )
         });
-        assert_eq!(
-            item_count, want_items,
-            "列表条目数应 = 文档行数 + 底部预留空行（item_count={item_count}，want={want_items}，行数={row_count}）"
+        // 固定窗口虚拟化：条目数恒为小窗口（与全文行数无关），量程按全文
+        // `scroll_item_count` 计算——底部预留随量程存在于滚动最底端。
+        assert!(
+            item_count <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            "固定窗口应是小窗口：item_count={item_count} ≤ {}",
+            crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS
+        );
+        assert!(
+            want_items >= row_count && want_items <= row_count + 16,
+            "全文量程条目数应为行数+预留空行：want={want_items} rows={row_count}"
         );
         cx.update(|_, cx| {
             ed_ent.update(cx, |ed, _| ed.test_scroll_to_bottom());
@@ -2212,7 +2173,7 @@
                 cx.cx.executor().advance_clock(std::time::Duration::from_millis(20));
                 cx.run_until_parked();
                 let _ = cx.cx.refresh();
-                let (line_count, item_count, deferred) = cx.update(|_, cx| {
+                let (line_count, _item_count, deferred) = cx.update(|_, cx| {
                     let a = app.read(cx);
                     let i = a.tabs.len().saturating_sub(1);
                     let ed = a.tabs[i].editor.read(cx);
@@ -2237,9 +2198,10 @@
                 }
             }
             println!(
-                "【内容可见（快段）】 {:?} ms，【全文 ListState 增长完成】 {:?} ms，行数 {}",
+                "【内容可见】 {:?} ms，【ListState 就绪（固定窗口）】 {:?} ms，固定窗口条目 {}（常数），行数 {}",
                 content_ms,
                 full_ms,
+                crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS,
                 cx.update(|_, cx| {
                     let a = app.read(cx);
                     let i = a.tabs.len().saturating_sub(1);

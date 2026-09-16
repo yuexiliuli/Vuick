@@ -44,10 +44,7 @@ use gpui_component::input::{
     SelectToStart, SelectToStartOfLine, Undo,
 };
 
-use crate::config::limits::{
-    EDITOR_LIST_DEFER_MIN_LINES, EDITOR_LIST_GROW_CHUNK_LINES, EDITOR_LIST_PROVISIONAL_ROWS,
-    EDITOR_VSCROLL_BOTTOM_EXTRA_LINES,
-};
+use crate::config::limits::EDITOR_VSCROLL_BOTTOM_EXTRA_LINES;
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
 use crate::editor::undo::{EditIntent, UndoManager};
@@ -69,10 +66,6 @@ const HSCROLL_MARGIN_COLS: usize = 4;
 const GUTTER_LEFT_PAD_PX: f32 = 12.;
 /// 行号与文本之间的留白（px）。
 const GUTTER_RIGHT_PAD_PX: f32 = 6.;
-/// 分帧增长定时器间隔（ms）：每 ~1 帧时间 append 一块，约 23MB/0.3s、116MB/1.6s 长满。
-const GROW_TICK_MS: u64 = 16;
-/// 深跳占位判定/收敛的浮点容差（px）：目标恰好等于可滚范围末端时视为「已可达」。
-const SCROLL_REACH_EPS: f32 = 0.5;
 
 /// 编辑器对外事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,20 +107,16 @@ struct RowView {
     caret_color: Hsla,
 }
 
-/// 大文档打开时 ListState 的「两段式装配」状态机：不再一次性把全文构建进 ListState
-/// （那是 O(N)×2 趟、116MB ≈ 2s 整帧冻结的元凶）。改为：
-/// - mount 瞬间只建「视口小列表」（O(视口)，首帧即显示内容）；
-/// - 之后由 render 逐帧 `splice` **分帧增长** 到全文行数（每帧 ~5ms，隐形）；
-/// - 条目高度全部按需实测（不预铺 uniform），纵向量程由像素级确定性滚动条承担。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ListMountState {
-    /// 列表已增长到全文行数，正常渲染。
-    Ready,
-    /// 刚挂载大文档：仅视口小列表，`pending_grow` 逐帧 splice 补齐中。
-    /// 此状态下 `ensure_uniform_hint` 的量程自愈必须**停**（uniform 提示已不用，
-    /// 量程是像素级确定的，不会被当成“坍缩”去 O(N) 重铺）。
-    Provisional,
-}
+/// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行
+/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
+/// [`CodeEditor::window_base`]（窗口首行绝对行号）+ ListState 相对滚动合成：
+/// - 目标超出当前窗口即 `reset(WINDOW)` 重定位（O(窗口)，一刀切重定位、无需分帧）；
+/// - 量程/clamp 全部按**全文** `scroll_item_count()×行高` 算（与窗口无关）；
+/// - 打开大文件瞬时 O(1)：不再需要「两段式 + 分帧增长」机制。
+/// 条目高度仍全部按需实测（不预铺 uniform），纵向量程由像素级确定性滚动条承担。
+
+/// 固定窗口条目数：需 ≥ 最高分辨率的可见行 + 过扫余量（512 × 行高 ≈ 上万 px 视口）。
+const LIST_WINDOW_ROWS: usize = crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS;
 
 /// 自研代码编辑器（首版）。
 pub struct CodeEditor {
@@ -195,23 +184,17 @@ pub struct CodeEditor {
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
 
-    /// ListState 两段式装配状态（大文档打开用；Ready = 已增长到全文行数）。
-    list_mount: ListMountState,
-    /// 本文档是否走「像素级确定性量程 + 按需实测行高」模式（大文档路径）。
-    /// 与小文档的「uniform 高度提示 + summary 量程」并存：本模式不预铺统一高度，
-    /// 纵向量程完全由滚动换算 + `ScrollbarHandle.content_height = 行数×行高`决定，
-    /// 因此不存在换宽/陈旧 size_hint 导致的量程坍缩问题（F2/F3 的根治）。
+    /// ListState 固定窗口的**首行绝对行号**：ListState 的 item_ix 是窗口内的相对下标，
+    /// 绝对行 = `window_base + item_ix`（所有滚动/命中/行号/量程都以绝对行为准）。
+    /// 目标滚出窗口即重定位本字段（`reset(LIST_WINDOW_ROWS)`，O(窗口)），不改文档。
+    window_base: usize,
+    /// 恒为 true 的「像素级确定性量程」标志（固定窗口虚拟化下条目不预铺 uniform，
+    /// 纵向量程由滚动换算 + `ScrollbarHandle.content_height = 全文行数×行高` 承担，
+    /// 不存在换宽/陈旧 size_hint 的量程坍缩）。保留为布尔以让旧分支/测试沿用。
     pixel_scroll: bool,
-    /// 分帧增长目标：`Some(全文行数)` 表示仍逐帧 `splice` 追加条目；`None` 表示已长满。
-    pending_grow: Option<usize>,
-    /// 分帧增长定时器循环是否已启动（防重复 spawn；循环结束自动复位）。
-    grow_loop_running: bool,
-    /// 用户请求的纵向滚动位置（内容 px），与纵向滚动条句柄共享（`Rc<Cell<f32>>`，
-    /// 见 [`VerticalScrollHandle`]）。分帧增长未完成时的深跳目标（Ctrl+End / 搜索
-    /// /翻页）可能超出现有 ListState 可滚范围——此刻 `desired_scroll` 记录真实目标
-    /// （render 据此显示「正在加载第 R 行…」占位符），ListState 停在「已增长底部」；
-    /// 每帧 splice 增长赶上后按它收敛，占位符消失、真实内容无缝显现。无占位时恒
-    /// 等于 ListState 的实际滚动位置（常规滚动两条路径保持一致）。
+    /// 用户请求的纵向滚动位置（内容 px，全文绝对坐标），与纵向滚动条句柄共享
+    /// （`Rc<Cell<f32>>`，见 [`VerticalScrollHandle`]）。滚动条拖动只写这里，render
+    /// 每帧按它重定位窗口；键盘/滚轮/跳转经 [`Self::scroll_to_px`] 同步落窗口。
     desired_scroll: std::rc::Rc<Cell<f32>>,
 
     // —— 配置 ——
@@ -265,11 +248,10 @@ impl CodeEditor {
             blink_running: false,
             focus_registered: false,
             element_bounds: Bounds::default(),
-            list_mount: ListMountState::Ready,
-            // 全文档统一像素级确定性量程（见 ListMountState/pixel_scroll 注释）。
+            // 固定窗口虚拟化：窗口首行绝对行号（初始 0）。
+            window_base: 0,
+            // 全文档统一像素级确定性量程（见 struct 的 pixel_scroll 注释）。
             pixel_scroll: true,
-            pending_grow: None,
-            grow_loop_running: false,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
             tab_size: 4,
         }
@@ -409,20 +391,38 @@ impl CodeEditor {
         self.last_list_width
     }
 
-    /// 测试：是否处于「两段式装配中间态」（视口小列表已建、全文未补建完成）。
-    /// 大文档 mount 同步栈内应返回 true（证明未同步 O(N) 建全文）。
+    /// 固定窗口虚拟化：列表始终是就绪的固定窗口（无两段式中间态），恒 false。
     #[cfg(test)]
     pub(crate) fn test_list_is_deferred(&self) -> bool {
-        self.list_mount != ListMountState::Ready
+        false
     }
 
-    /// 测试：是否处于「深跳占位期」（分帧增长未完成 + 滚动目标超出已增长范围）。
+    /// 测试：ListState 固定窗口条数（= LIST_WINDOW_ROWS，与文档行数无关）。
     #[cfg(test)]
-    pub(crate) fn test_jump_placeholder_active(&self) -> bool {
-        self.jump_placeholder_active()
+    pub(crate) fn test_list_window_len(&self) -> usize {
+        self.list_state.item_count()
     }
 
-    /// 测试：用户请求的竖向滚动目标（px，深跳占位期的逻辑位置）。
+    /// 测试：当前固定窗口首行绝对行号。
+    #[cfg(test)]
+    pub(crate) fn test_window_base(&self) -> usize {
+        self.window_base
+    }
+
+    /// 测试：文本区竖向滚动顶 `(绝对行号, offset_in_item)`。
+    #[cfg(test)]
+    pub(crate) fn test_text_scroll_top(&self) -> (usize, f32) {
+        self.abs_scroll_top()
+    }
+
+    /// 测试：行号列竖向滚动顶——行号是文本列表的叠层（同一绝对滚动顶），恒等于
+    /// [`Self::test_text_scroll_top`]。
+    #[cfg(test)]
+    pub(crate) fn test_gutter_scroll_top(&self) -> (usize, f32) {
+        self.abs_scroll_top()
+    }
+
+    /// 测试:用户请求的竖向滚动目标（px，绝对坐标）。
     #[cfg(test)]
     pub(crate) fn test_desired_scroll_px(&self) -> f32 {
         self.desired_scroll.get()
@@ -521,7 +521,6 @@ impl CodeEditor {
     // -----------------------------------------------------------------
 
     fn refresh_metrics(&mut self, window: &mut Window, cx: &mut App) {
-        let old_line_height = self.line_height;
         let theme = gpui_component::Theme::global(cx);
         let typo = theme.semantic_tokens().typography;
         let colors = theme.semantic_tokens().colors;
@@ -571,133 +570,35 @@ impl CodeEditor {
                 + GUTTER_RIGHT_PAD_PX
                 + 4.,
         );
-        // 行高变化会改变底部预留空行数（pad_row_count = 额外行 + ceil(滚动条厚/行高)）：
-        // 已在列表末尾固化的空行条目数需同步增删（reconcile 只动尾部、不重铺、不跳滚动）。
-        if self.metrics_ready && self.line_height != old_line_height {
-            self.reconcile_spacers();
-        }
     }
 
-    /// 列表条目数与行数一致（reset 场景：首次/整篇替换/撤销重做）。
-    ///
-    /// **大文档两段式**（仅 `defer_large=true` 的整篇替换走）：超过
-    /// [`EDITOR_LIST_DEFER_MIN_LINES`] 时主线程不整篇建树——只建「视口小列表」
-    /// （O(视口)，首帧即时显示），随后由 render 每帧 `splice` **分帧增长**到全文
-    /// 行数（每帧 ~5ms，条目高度按需实测、不预铺 uniform）；纵向量程走像素级
-    /// 确定性滚动条。撤销/重做传 `false`（保持同步全文 + uniform 提示）。
-    fn resync_list(&mut self, defer_large: bool) {
+    /// 重建 ListState 为固定窗口 `[0, LIST_WINDOW_ROWS)` 并回顶。首次 / 整篇替换 /
+    /// 撤销重做都走这里：O(窗口) 常数，与文档规模无关——**不再是两段式 + 分帧增长**
+    /// （改固定窗口虚拟化后打开大文件瞬时 O(1)，无需增长机制）。`defer_large` 保留为
+    /// 旧调用方的占位形参（已无两段式语义）。
+    fn resync_list(&mut self, _defer_large: bool) {
         let new_n = self.buffer.line_count().max(1);
-        let want_items = new_n + self.pad_row_count();
-        if want_items == self.list_state.item_count() {
-            self.row_count = new_n;
-            return;
-        }
+        self.row_count = new_n;
         let t = std::time::Instant::now();
-        if defer_large && new_n > EDITOR_LIST_DEFER_MIN_LINES {
-            // 首帧可见内容 = `row_count`（全文行数 N）+ 小列表 item 索引 0..视口，
-            // 渲染闭包用 rows[ix-lo] 索引，行号用 ix+1，首屏从行 0 起，天然正确。
-            // 增长目标是 `N + 底部预留空行`：空行占真实列表高度，滚到底才有可见预留区。
-            let prov = EDITOR_LIST_PROVISIONAL_ROWS.min(new_n);
-            self.list_state.reset(prov);
-            self.uniform_applied = None;
-            self.pixel_scroll = true;
-            self.pending_grow = Some(want_items);
-            self.list_mount = ListMountState::Provisional;
-            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                eprintln!(
-                    "[MD_OPEN_DEBUG] 编辑器 ListState 像素两段式：首帧小列表 reset({prov})，分帧增长到 {want_items} 条目（{new_n} 行 + {} 预留空行，每帧 ≤{} 条）+{:.1}ms",
-                    self.pad_row_count(),
-                    EDITOR_LIST_GROW_CHUNK_LINES,
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-            // 列表重建 && 回到顶部：让「用户目标」与 ListState 实际位置重新对齐，
-            // 防止滚动条句柄（读 desired）读到陈旧目标导致 thumb 错位。
-            self.desired_scroll.set(self.list_scroll_top_px());
-            self.row_count = new_n;
-            return;
-        }
-        // 小文档 / 撤销重做：同步全量 `reset(N)`（便宜）＋像素量程（不预铺 uniform、
-        // 按需实测——与标题一致，见 struct 的 pixel_scroll 注释）。
-        self.list_state.reset(want_items);
+        self.list_state.reset(LIST_WINDOW_ROWS);
         self.uniform_applied = None;
         self.pixel_scroll = true;
-        self.pending_grow = None;
-        self.list_mount = ListMountState::Ready;
-        // 同上：撤销/重做重铺会回顶部，重建后把 desired 对齐 ListState 实际位置。
-        self.desired_scroll.set(self.list_scroll_top_px());
-        self.row_count = new_n;
+        self.window_base = 0;
+        self.desired_scroll.set(0.);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
-                "[MD_OPEN_DEBUG] 编辑器 ListState::reset({want_items} 条目, {new_n} 行 + {} 预留空行): {} ms",
+                "[MD_OPEN_DEBUG] 编辑器 ListState 固定窗口 reset({LIST_WINDOW_ROWS})，{new_n} 行 + {} 预留空行: {} ms",
                 self.pad_row_count(),
                 t.elapsed().as_millis()
             );
         }
     }
 
-    /// 分帧增长的一个 tick：往两个 ListState 末尾 splice 一小块条目（无高度提示，
-    /// 按需实测），返回 `true` = 已增长到全文行数（调用方结束循环）。
-    fn grow_one_chunk(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(target) = self.pending_grow else {
-            return true;
-        };
-        let cur = self.list_state.item_count();
-        if cur >= target {
-            self.pending_grow = None;
-            self.list_mount = ListMountState::Ready;
-            self.grow_loop_running = false;
-            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                eprintln!(
-                    "[MD_OPEN_DEBUG] 编辑器 ListState 分帧增长完成：item_count={} / row_count={}",
-                    cur, self.row_count
-                );
-            }
-            cx.notify();
-            return true;
-        }
-        let chunk = EDITOR_LIST_GROW_CHUNK_LINES.min(target - cur);
-        let saved = self.list_state.logical_scroll_top();
-        let t_g = std::time::Instant::now();
-        self.list_state.splice(cur..cur, chunk);
-        // 追加在末尾不改变既有行位置，但 gpui splice 在「滚动停在旧末尾」时会误移
-        // item_ix，显式恢复保存的滚动顶（像素位置不变）。
-        self.list_state.scroll_to(saved);
-        // 深跳收敛：若用户目标（desired_scroll，见 scroll_to_px）已被新增条目可达，
-        // 立即滚到目标——占位符随即消失、真实内容无缝显现。非占位期目标 == 当前
-        // 位置，此处等价于「把滚动钉在原地」（追加不改变既有可见内容）。
-        let lh = self.line_height.as_f32().max(1.);
-        let wanted = self.desired_scroll.get();
-        let reach = self.reach_px();
-        if wanted <= reach + SCROLL_REACH_EPS {
-            let off = Self::px_to_offset(wanted.min(reach), lh);
-            self.list_state.scroll_to(off);
-        }
-        if std::env::var_os("MD_OPEN_DEBUG").is_some() && (cur < EDITOR_LIST_GROW_CHUNK_LINES) {
-            eprintln!(
-                "[MD_OPEN_DEBUG] 编辑器 ListState 分帧增长：splice(+{chunk} → {}) +{:.2}ms",
-                cur + chunk,
-                t_g.elapsed().as_secs_f64() * 1000.0
-            );
-        }
-        cx.notify();
-        false
-    }
-
-    /// 就地编辑并用 `splice` 增量同步行数（O(log n)，避免大文档整树重建）。
+    /// 就地编辑并同步行数（O(log n) 缓冲编辑）。固定窗口虚拟化下列表条目数与文档
+    /// 无关，无需 splice——只更新 `row_count`；后续 `reveal_caret` 会按新光标行
+    /// 重新定位窗口。
     fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
-        let old_a = self.buffer.line_of_offset(range.start);
-        let old_end = self.buffer.clip(range.end.max(range.start));
-        let old_b = self.buffer.line_of_offset(old_end);
-        let old_span = old_b - old_a + 1;
         let edit = self.buffer.apply_edit(range, text);
-        let new_end = self.buffer.clip(edit.inserted_range().end.max(edit.inserted_range().start));
-        let new_b = self.buffer.line_of_offset(new_end);
-        let new_span = new_b - old_a + 1;
-        if new_span != old_span {
-            self.list_state
-                .splice(old_a..old_a + old_span, new_span);
-        }
         self.row_count = self.buffer.line_count().max(1);
         edit
     }
@@ -950,110 +851,87 @@ impl CodeEditor {
         (raw / lh).ceil() * lh
     }
 
-    /// 底部预留换算成的**真实空白条目行数**（`vscroll_bottom_pad_px` 已量化到行高
-    /// 整数倍，故整除）。这些空白条目追加在文本列表末尾、渲染为空行。
+    /// 底部预留换算成的行数（`vscroll_bottom_pad_px` 已量化到行高整数倍，故整除）。
     ///
-    /// **为什么必须做成真实条目**：gpui 的 List 在「下方内容不足一屏」时会**自动上移
-    /// 填满视口**（`layout_items` 里 `rendered_height - offset < available_height` 即
-    /// 把滚动顶往回走、让最后内容贴到视口底）——只靠「滚动量程里加 pad」永远产生不了
-    /// 可见的底部预留区，最后一行会被底部横向滚动条盖住。追加真实空白条目后，列表末端
-    /// 有真高度，「自动填满」只会填到空白条目，预留区随之真实可见。
+    /// 固定窗口虚拟化下预留区**不是**列表里的真实条目，而是「滚动上限包含它」：
+    /// 滚到底时视口顶行 = `scroll_item_count − 可见行数`，该行落在文档正文内，窗口
+    /// 从它往下渲染自然盖住预留区（超出 `row_count` 的窗口条目渲染为空行 = 预留空白，
+    /// 见 render 的 RowView 映射）。gpui「自动填满视口」只会把窗口内的**空行**拉到
+    /// 视口底，预留区仍是可见的空白。
     fn pad_row_count(&self) -> usize {
         let lh = self.line_height.as_f32().max(1.);
         (self.vscroll_bottom_pad_px() / lh).round() as usize
     }
 
-    /// 列表**条目总数** = 文档行数 + 底部预留空行数。分帧增长目标 / 全量重建条目数 /
-    /// 纵向滚动 clamp 全部以此为准（项条目总数里已含底部空行，滚动公式不再另加 pad）。
+    /// 滚动涉及的**全文条目数** = 文档行数 + 底部预留空行数。纵向滚动上限 / 量程 /
+    /// clamp 全部以它为准（与固定窗口无关——窗口只是「从哪里开始渲染」）。
     fn scroll_item_count(&self) -> usize {
         self.row_count.saturating_add(self.pad_row_count())
     }
 
-    /// 行高变化（字号缩放/主题换字）后，把列表末尾的预留空行数对齐到新的
-    /// `pad_row_count`（增删尾部条目即可，不必整树重建、不动滚动位置）。
-    /// 文本行与预留空行的分界 = `row_count`，只在尾部增删 → 不影响既有行。
-    fn reconcile_spacers(&mut self) {
-        if !self.metrics_ready || self.row_count == 0 {
-            return;
-        }
-        let want = self.scroll_item_count();
-        let cur = self.list_state.item_count();
-        if want == cur {
-            return;
-        }
-        let saved = self.list_state.logical_scroll_top();
-        if want > cur {
-            self.list_state.splice(cur..cur, want - cur);
-        } else {
-            self.list_state.splice(want..cur, 0);
-        }
-        self.list_state.scroll_to(saved);
-    }
-
-    /// ListState **实际**滚动位置（px，不读 `desired_scroll`）。用于重建后把
-    /// 「用户目标」重新对齐 ListState（见 `resync_list`），以及非占位期读数。
-    fn list_scroll_top_px(&self) -> f32 {
+    /// 文本区 **绝对**滚动位置 `(绝对行号, 已滚进该行的 px)`。窗口内的相对
+    /// `item_ix` 由 [`Self::window_base`] 抬成绝对行；行号/命中/渲染全文都以它为准。
+    fn abs_scroll_top(&self) -> (usize, f32) {
         let s = self.list_state.logical_scroll_top();
-        let lh = self.line_height.as_f32().max(1.);
-        s.item_ix as f32 * lh + s.offset_in_item.as_f32()
+        (self.window_base + s.item_ix, s.offset_in_item.as_f32())
     }
 
-    /// 当前**已增长**可滚范围（px）= 现有条目高 − 视口，夹 ≥0。
-    /// 条目总数结尾含底部预留空行（见 [`Self::pad_row_count`]），故 `item_count × 行高`
-    /// 已覆盖预留——滚动公式不再另加 pad。深跳占位判定 / 收敛 / 滚动条 clamp 共用这
-    /// 一份量（单一来源，避免四处复制漂移）。
+    /// ListState **实际**滚动位置（px，绝对坐标；读窗口合成，不读 `desired_scroll`）。
+    /// 用于重建后把「用户目标」重新对齐 ListState（见 `resync_list`），以及常规读数。
+    fn list_scroll_top_px(&self) -> f32 {
+        let (abs_ix, off) = self.abs_scroll_top();
+        let lh = self.line_height.as_f32().max(1.);
+        abs_ix as f32 * lh + off
+    }
+
+    /// 当前竖向量程（px）= 全文条目数 × 行高 − 视口，夹 ≥0（绝对值，与窗口无关）。
+    /// 滚动 clamp / 滚动条 thumb / 量程诊断共用这一份。
     fn reach_px(&self) -> f32 {
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        (self.list_state.item_count() as f32 * lh - view).max(0.)
+        (self.scroll_item_count() as f32 * lh - view).max(0.)
     }
 
-    /// 是否处于「分帧增长未完成 + 用户滚动目标超出已增长可滚范围」的**深跳占位期**。
-    /// 此期 ListState 停在「已增长底部」（内容行尚未 splice 出来、无法直接显示目标行），
-    /// 由 render 用全屏占位符提示正在加载的目标行；每帧增长赶上后占位自动消失。
-    fn jump_placeholder_active(&self) -> bool {
-        if self.pending_grow.is_none() {
-            return false;
-        }
-        self.desired_scroll.get() > self.reach_px() + SCROLL_REACH_EPS
-    }
-
-    /// 当前竖向滚动量（px，内容被推出的量；0 = 顶部）。
-    /// 深跳占位期返回**用户目标**（占位符所代表的逻辑位置，[`Self::desired_scroll`]），
-    /// 否则返回 ListState 实际位置——常规期二者一致，滚动/命中/reveal 全部以此为据。
+    /// 当前竖向滚动量（px，绝对坐标；0 = 顶部）。
     fn scroll_top_px(&self) -> f32 {
-        if self.jump_placeholder_active() {
-            self.desired_scroll.get()
-        } else {
-            self.list_scroll_top_px()
-        }
+        self.list_scroll_top_px()
     }
 
-    /// 像素 → ListOffset（统一行高模型）。
+    /// 像素 → ListOffset（统一行高模型，窗口内相对坐标由调用方套 `window_base`）。
     fn px_to_offset(px: f32, lh: f32) -> ListOffset {
         let item_ix = (px / lh).floor().max(0.) as usize;
         let offset = px - item_ix as f32 * lh;
         ListOffset { item_ix, offset_in_item: gpui::px(offset.max(0.)) }
     }
 
-    /// 滚到目标像素（夹到 [0, 全文高+底部预留−视口]），同步给 ListState。
-    /// 底部预留让最后一行能滚到横向滚动条之上。
-    ///
-    /// **分帧增长未完成时的深跳**：目标可能超出 ListState 已增长的可滚范围
-    /// （gpui `scroll_to` 把行号钳到 item_count）。这里把**用户目标**记入
-    /// [`Self::desired_scroll`]（纵向量程是全文档确定性量程，目标按全文合法值），
-    /// 实际只把 ListState 滚到「已增长可滚范围」（= 现有底部，见钳制注释）；随后
-    /// [`Self::grow_one_chunk`] 每帧赶上后按 `desired_scroll` 收敛，占位符消失。
-    fn scroll_to_px(&mut self, target_px: f32) {
+    /// 把固定窗口对齐到用户目标（`desired_scroll`，绝对 px）：目标窗口覆盖不足一屏则
+    /// 重定位 `window_base = abs_top` 并 `reset(LIST_WINDOW_ROWS)`（O(窗口)，任意跳转
+    /// 瞬时可达，无分帧、无占位符）；窗口内则直接 `scroll_to` 相对位置。滚动条拖动只写
+    /// `desired_scroll`，render 每帧调用本方法落窗口；滚轮/键盘/跳转也经它。
+    fn apply_desired_to_window(&mut self) {
         let lh = self.line_height.as_f32().max(1.);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        // 纵向滚动上限 = 条目总数（含底部预留空行）× 行高 − 视口；预留空行在列表
-        // 末尾占真实高度，滚到底时它们呈现在最后一行之下（而不是被 gpui 填满吃掉）。
-        let max_px = (self.scroll_item_count() as f32 * lh - view).max(0.);
-        let px = target_px.clamp(0., max_px);
+        let vis_rows = ((view / lh).ceil() as usize).max(1);
+        let target = self.desired_scroll.get().clamp(0., self.reach_px());
+        let abs_top = (target / lh).floor().max(0.) as usize;
+        let frac = target - abs_top as f32 * lh;
+        let rel = abs_top.saturating_sub(self.window_base);
+        let covers = abs_top >= self.window_base && rel + vis_rows <= LIST_WINDOW_ROWS;
+        if !covers {
+            self.window_base = abs_top;
+            self.list_state.reset(LIST_WINDOW_ROWS);
+        }
+        let rel = abs_top.saturating_sub(self.window_base);
+        self.list_state.scroll_to(ListOffset { item_ix: rel, offset_in_item: px(frac) });
+        self.desired_scroll.set(target);
+    }
+
+    /// 滚到目标像素（夹到 [0, 全文高−视口]），写入 `desired_scroll` 并落窗口。
+    /// 底部预留让最后一行能滚到横向滚动条之上（见 `pad_row_count`）。
+    fn scroll_to_px(&mut self, target_px: f32) {
+        let px = target_px.clamp(0., self.reach_px());
         self.desired_scroll.set(px);
-        let apply = px.min(self.reach_px());
-        self.list_state.scroll_to(Self::px_to_offset(apply, lh));
+        self.apply_desired_to_window();
     }
 
     /// 滚轮竖向滚动（dy = 滚轮 delta，负=向下）。
@@ -1251,18 +1129,6 @@ impl CodeEditor {
     /// 测试用：当前可视格（宽度单位）数。
     pub(crate) fn test_visible_chars(&self) -> usize {
         self.visible_chars
-    }
-
-    /// 测试用：文本区竖向滚动顶 `(item_ix, offset_in_item)`。
-    pub(crate) fn test_text_scroll_top(&self) -> (usize, f32) {
-        let s = self.list_state.logical_scroll_top();
-        (s.item_ix, s.offset_in_item.as_f32())
-    }
-
-    /// 测试用：行号列竖向滚动顶。行号已是文本列表的叠层（同一 `logical_scroll_top`），
-    /// 故恒等于 [`Self::test_text_scroll_top`]——保留此测试只读方法只为既有回归可跑。
-    pub(crate) fn test_gutter_scroll_top(&self) -> (usize, f32) {
-        self.test_text_scroll_top()
     }
 
     /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
@@ -1862,8 +1728,8 @@ impl EntityInputHandler for CodeEditor {
         let row = self.buffer.line_of_offset(off);
         let byte_col = off - self.buffer.line_start(row);
         let lh = self.line_height.as_f32().max(1.);
-        let scroll = self.list_state.logical_scroll_top();
-        let y = (row as f32 - scroll.item_ix as f32) * lh - scroll.offset_in_item.as_f32();
+        let (top_abs, off_px) = self.abs_scroll_top();
+        let y = (row as f32 - top_abs as f32) * lh - off_px;
         // 字形真实宽度（IME 组合窗口/预选高亮定位不能再用等宽列近似，否则中文错位）。
         let x_text = self
             .row_layout(window, row)
@@ -1951,31 +1817,13 @@ impl Render for CodeEditor {
         }
 
         self.refresh_metrics(window, cx);
+        // 每个 render 把固定窗口对齐到用户目标（desired_scroll）：滚动条拖动只写
+        // desired、由这里落窗口；滚轮/键盘/跳转的 scroll_to_px 已同步，此处为幂等兜底。
+        self.apply_desired_to_window();
         // 量程坍缩时重挂统一高度提示，并请求多画一帧让其真正生效（防「拖到底不到底」）。
         // （pixel_scroll 大文档路径由 ensure_uniform_hint 内部直接短路，见其注释。）
         if self.ensure_uniform_hint() {
             cx.notify();
-        }
-        // 大文档分帧增长：pending 且有未跑完的增长循环时，由此处启动一个定时器循环，
-        // 每 ~1 帧时间 splice 一小块（~7ms/帧、隐形）直到长到全文行数。不做一次性
-        // defer 补建——那正是 116MB≈2s 整帧冻结的元凶。定时器驱动在真实应用与测试里
-        // 都可靠（不依赖“每次 render 都 self-notify 续帧”的脆弱续环）。
-        if self.pending_grow.is_some() && !self.grow_loop_running {
-            self.grow_loop_running = true;
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(GROW_TICK_MS))
-                        .await;
-                    let done = this
-                        .update(cx, |ed, cx| ed.grow_one_chunk(cx))
-                        .unwrap_or(true);
-                    if done {
-                        break;
-                    }
-                }
-            })
-            .detach();
         }
         // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
         if self.char_width.as_f32() > 0. {
@@ -1996,9 +1844,9 @@ impl Render for CodeEditor {
         let dark = gpui_component::Theme::global(cx).is_dark();
         self.highlighter.set_dark(dark);
 
-        // 行级数据窗口（可见 + 过扫）
+        // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对行号**（窗口基址 + 相对滚动）。
         let lh = self.line_height.as_f32().max(1.);
-        let vis_top = self.list_state.logical_scroll_top().item_ix;
+        let (vis_top, _vis_off) = self.abs_scroll_top();
         let view_h = self.list_state.viewport_bounds().size.height.as_f32();
         let nrows = ((view_h / lh).ceil() as usize).max(MIN_VISIBLE_ROWS);
         let lo = vis_top.saturating_sub(nrows);
@@ -2053,9 +1901,13 @@ impl Render for CodeEditor {
         let bg = self.bg;
         let fg = self.fg;
 
+        // 列表 item_ix 是窗口内**相对**下标：绝对行 = `window_base + ix`。行数据窗口
+        // (`rv.lo..rv.rows`) 用绝对行，超出窗口/文档末尾（含底部预留区）渲染空行。
+        let window_base = self.window_base;
         let content = list(list_state.clone(), move |ix, _window, _cx| {
-            let rd = if ix >= rv.lo && ix - rv.lo < rv.rows.len() {
-                &rv.rows[ix - rv.lo]
+            let abs = window_base + ix;
+            let rd = if abs >= rv.lo && abs - rv.lo < rv.rows.len() {
+                &rv.rows[abs - rv.lo]
             } else {
                 &RowData::empty()
             };
@@ -2090,21 +1942,21 @@ impl Render for CodeEditor {
 
         // 行号 gutter：固定编辑区左缘、不随内容横向滚动。**不是独立的 O(N) ListState**
         // ——126MB/3.2M 行时那棵「纯行号树」白占 ~300MB。改为同一帧用文本列表的
-        // `logical_scroll_top` 反推出可见行号、绝对定位叠层渲染：与 List 行绘制共用
-        // 同一滚动状态、同一帧（无新旧半拍差异 → 序号不翻/不闪/不晃），末尾的底部
-        // 预留区（ix ≥ row_count）自然不显示行号。视口外部分被 `overflow_hidden` 裁掉。
+        // **绝对滚动顶**（`window_base + 相对 item_ix`）反推出可见行号、绝对定位叠层
+        // 渲染：与 List 行绘制共用同一滚动状态、同一帧（无新旧半拍差异 → 序号不翻/
+        // 不闪/不晃），末尾的底部预留区（ix ≥ row_count）自然不显示行号。视口外部分
+        // 被 `overflow_hidden` 裁掉。
         let gv = std::rc::Rc::new(GutterView {
             line_height: self.line_height,
             mono: self.mono.clone(),
             font_size: self.font_size,
             fg: self.gutter_fg,
         });
-        let g_top = self.list_state.logical_scroll_top();
+        let (g_top_abs, gutter_offset) = self.abs_scroll_top();
         let gutter_rows = self.row_count;
-        // 可见行号 = 逻辑顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
+        // 可见行号 = 绝对顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
         // offset：与 List 把首个可见 item 画在 `origin − offset_in_item` 完全一致。
-        let gutter_start = g_top.item_ix;
-        let gutter_offset = g_top.offset_in_item.as_f32();
+        let gutter_start = g_top_abs;
         let gutter_count = (((view_h / lh) as f32).ceil() as usize).clamp(1, 4096) + 1;
         let gutter_col = div()
             .id("ce-gutter-col")
@@ -2131,22 +1983,6 @@ impl Render for CodeEditor {
             .bg(bg)
             .overflow_hidden()
             .child(gutter_col);
-
-        // 深跳占位期（分帧增长未完成 + 目标超出已增长范围）：ListState 还显示不了
-        // 目标行，用全屏占位符提示正在加载的行号；增长赶上后 jumping 变 false，
-        // 下一帧真实内容无缝显现（见 jump_placeholder_active / grow_one_chunk）。
-        let jumping = self.jump_placeholder_active();
-        let (jump_row, jump_pct) = if jumping {
-            let row = (self.desired_scroll.get() / lh).floor() as usize + 1;
-            let pct = if self.row_count > 0 {
-                (self.list_state.item_count() as f32 / self.row_count as f32 * 100.) as u32
-            } else {
-                100
-            };
-            (row, pct)
-        } else {
-            (0, 100)
-        };
 
         let core = div()
             .id("code-editor")
@@ -2289,29 +2125,9 @@ impl Render for CodeEditor {
                 cx.stop_propagation()
             }))
             .child(harea)
-            // 行号列（第二个 List，与文本共用 ListState）：盖在横向滚动文本区左缘，
-            // 不随内容横移，竖向滚动与文本逐行一致。
+            // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
+            // 竖向滚动与文本逐行一致。
             .child(gutter_wrap)
-            // 深跳占位符（见 jumping 计算）：盖住文本区 + 行号列（二者都还显示不到
-            // 目标行），滚动条叠层在后声明 → 仍在其上、可拖动。
-            .when(jumping, |this| {
-                this.child(
-                    div()
-                        .id("ce-jump-placeholder")
-                        .debug_selector(|| "ce-jump-placeholder".into())
-                        .absolute()
-                        .inset_0()
-                        .bg(bg)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .font_family(self.mono.clone())
-                        .text_color(fg)
-                        .child(SharedString::from(format!(
-                            "正在加载第 {jump_row} 行…（已增长 {jump_pct}%）"
-                        ))),
-                )
-            })
             // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
             // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
             // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
@@ -2326,11 +2142,10 @@ impl Render for CodeEditor {
                         let v = VerticalScrollHandle {
                             state: list_state.clone(),
                             content_width: content_w_px,
-                            // 量程 = 已增长条目数 × 行高（条目末尾含底部预留空行，见
-                            // pad_row_count）：增长中 thumb 反映“现在真正可滚到的高度”；
-                            // 滚到底时最后一行停在横向滚动条之上的预留空行区。
+                            // 量程 = **全文**条目数 × 行高（含底部预留空行，见 pad_row_count）
+                            // ——与窗口大小无关，thumb 始终反映全文可滚范围。
                             content_height: if self.pixel_scroll {
-                                self.list_state.item_count() as f32
+                                self.scroll_item_count() as f32
                                     * self.line_height.as_f32().max(1.)
                             } else {
                                 self.row_count as f32 * self.line_height.as_f32()
@@ -2339,7 +2154,7 @@ impl Render for CodeEditor {
                             pixel_scroll: self.pixel_scroll,
                             bottom_pad: self.vscroll_bottom_pad_px(),
                             desired_scroll: self.desired_scroll.clone(),
-                            // 单一来源：与编辑器 scroll_to_px/占位判定同一份「已增长范围」。
+                            // 单一来源：与编辑器 scroll_to_px 同一份「全文量程」。
                             reach_px: self.reach_px(),
                         };
                         Scrollbar::vertical(&v)
@@ -2541,13 +2356,11 @@ impl ScrollbarHandle for VerticalScrollHandle {
 
     fn set_offset(&self, offset: Point<Pixels>) {
         if self.pixel_scroll {
-            let lh = self.line_height.as_f32().max(1.);
-            let off = (-offset.y.as_f32()).max(0.);
-            let off = off.min(self.reach_px);
-            // 拖动滚动条 = 用户新目标：写共享 desired（后续增长按它收敛），并落
-            // ListState（超出已增长可滚范围的部分由 scroll_to 钳回，占位符接管）。
+            let off = (-offset.y.as_f32()).max(0.).min(self.reach_px);
+            // 拖动滚动条 = 写用户目标（desired_scroll，全文绝对坐标）。这里的 ListState
+            // 是固定窗口内的相对坐标，不能直接 scroll_to 绝对 px——窗口重定位由 render
+            // 每帧的 `apply_desired_to_window` 承担（O(窗口)，即时生效）。
             self.desired_scroll.set(off);
-            self.state.scroll_to(CodeEditor::px_to_offset(off, lh));
         } else {
             self.state.set_offset_from_scrollbar(offset);
         }
