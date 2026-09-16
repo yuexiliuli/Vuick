@@ -36,7 +36,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::input::Rope;
-use gpui_component::scroll::{Scrollbar, ScrollbarMode, ScrollableElement as _};
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode, ScrollableElement as _};
 
 use crate::config::limits::{
     CODE_HL_LRU_CAP, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_FACTOR,
@@ -217,6 +217,13 @@ pub struct MarkdownPreview {
     est_hint: f32,
     /// 生成 `est_hint` 时的视口宽度（px）；<0 表示尚未按宽度估算（需要重算）。
     est_hint_width: f32,
+    /// 上一次 `update_height_hint` 收到的渲染宽度（px）：连续宽度变化（拖分屏）期间
+    /// 做重挂去抖；宽度安定（<2px 抖动）后坍缩**立即**重挂自愈，不受 120ms 精确估算
+    /// 节流影响（否则打开/换宽后的前 120ms 里滚动条量程坍缩，立刻拖动会拖不到底）。
+    last_render_width: f32,
+    /// 上次「精确估算全篇平均行高」的时刻（px）：换宽/拖分屏期间宽度逐帧变化，
+    /// 精确估算对 16 万块是 O(n)（~30ms），不能每帧重算 → 用与重挂同频的冷却。
+    last_hint_estimate: std::time::Instant,
     /// 「统一行高提示」上次应用到的 (行数, 提示值)。同一 (行数, 提示值) 只应用一次：
     /// `with_uniform_item_height` 会逐项物化整棵 SumTree（16 万块一次 30~90ms），
     /// 若每帧都补会直接卡死；记忆后只有块数变化/换宽/换源才重做。
@@ -258,6 +265,8 @@ impl MarkdownPreview {
             highlight_seq: 0,
             est_hint: 0.0,
             est_hint_width: -1.0,
+            last_render_width: -1.0,
+            last_hint_estimate: std::time::Instant::now(),
             hint_applied: None,
             hint_recovered: false,
             index: None,
@@ -788,6 +797,30 @@ impl MarkdownPreview {
         }
     }
 
+    /// 纵向量程总高（px）= `max_offset_for_scrollbar().y + 视口高`。
+    /// 统一高度提示（精确平均高）生效时 ≈ 全篇块高之和；抽样偏差/坍缩时失真。
+    /// 诊断用：配合 `MD_OPEN_DEBUG` 校验“拖到底不到底”的量程是否精确。
+    pub(crate) fn vertical_total_px(&self) -> f32 {
+        self.list_state.max_offset_for_scrollbar().y.as_f32()
+            + self.list_state.viewport_bounds().size.height.as_f32()
+    }
+
+    /// 诊断：当前统一行高提示值（px）。应 ≈ 全篇块的精确平均行高（>0）。
+    pub(crate) fn test_est_hint(&self) -> f32 {
+        self.est_hint
+    }
+
+    /// 诊断：统一行高提示「已应用」记忆 `(块数, 提示值)`。None = 尚未应用（量程会坍缩）。
+    pub(crate) fn test_hint_applied(&self) -> Option<(usize, f32)> {
+        self.hint_applied
+    }
+
+    /// 测试：暴露 ListState（共享 Rc）——测试拖拽路径（start_drag 重铺 + 冻结 + 拖底）。
+    #[cfg(test)]
+    pub(crate) fn test_list_state(&self) -> ListState {
+        self.list_state.clone()
+    }
+
     /// 拼出已物化预览行的纯文本（测试/诊断用：验证预览内容是否同步到最新）。
     /// 窗口模式下仅返回当前窗口已物化的行（小文档全量路径返回整篇）。
     #[cfg(test)]
@@ -846,25 +879,17 @@ impl MarkdownPreview {
                 if idx.blocks.is_empty() {
                     return p.body_row_hint().as_f32();
                 }
-                // 大文档的块索引有十几万条：平均行高按**等距采样**估算（预算 ~256 块），
-                // 避免每次换源/字号变化在 UI 线程全量遍历——采样误差只让滚动条映射
-                // 轻微非线性，随行真正渲染后由 `update_height_hint` 收敛，无需精确。
+                // 大文档块索引十几万条：**精确求和全篇块高**（不抽样）。滚动条总长 =
+                // 块数 × 平均高，只要平均高精确，总长就精确（与分布无关），拖到底必然
+                // 到达真实末尾——抽样会把偏差写进量程，欠估 → 底部内容拖不到。
+                // 成本 O(n) 纯算术（16 万块 ≈ 20~40ms），仅在换源/视口宽变化（120ms
+                // 节流）时重算一次；`update_height_hint` 里已做节流。
                 let n = idx.blocks.len();
-                let budget = 256usize;
-                let total = if n <= budget {
-                    idx.blocks
-                        .iter()
-                        .map(|b| index_block_height(&b, p, wrap, avail))
-                        .sum::<f32>()
-                } else {
-                    let step = n as f64 / budget as f64;
-                    let mut sum = 0.0f32;
-                    for k in 0..budget {
-                        let i = (k as f64 * step).floor() as usize;
-                        sum += index_block_height(&idx.blocks.at(i), p, wrap, avail);
-                    }
-                    sum / budget as f32 * n as f32
-                };
+                let total = idx
+                    .blocks
+                    .iter()
+                    .map(|b| index_block_height(&b, p, wrap, avail))
+                    .sum::<f32>();
                 (n, total)
             }
             None => {
@@ -935,15 +960,33 @@ impl MarkdownPreview {
     /// 「(行数, 提示值) 已应用」：只有块数/宽度变化或换源才重做一次；若提示被 gpui
     /// 首布局按宽度变化清掉，则**每轮至多补一次**（`hint_recovered`），不再无限循环。
     fn update_height_hint(&mut self, cx: &mut App, width: f32) -> bool {
+        // gpui 的 `max_offset_for_scrollbar` = `max_scroll_offset()`，优先返回
+        // **拖拽开始时冻结的** `scrollbar_drag_start_height`（见 list.rs）。若内置竖向
+        // 滚动条在量程坍缩时收到过按下而没正常松手（或初始化路径留下的），冻结值会
+        // 一直压在旧的小值上 → 量程/滚动永远恢复不了（“拖到底不到底”的强力元凶）。
+        // 当前**没在拖拽**时清除陈旧冻结值，让量程回到真实 summary。真正拖拽中不碰。
+        if !self.list_state.is_scrollbar_dragging() {
+            self.list_state.scrollbar_drag_ended();
+        }
         let n = self.item_count();
         if n == 0 {
             return false;
         }
         let width_changed = (self.est_hint_width - width).abs() >= 2.0;
         if width_changed {
-            let p = StyleParams::from_theme_with_font(cx, self.font_override);
-            self.est_hint = self.estimated_avg_row_height(&p, width);
-            self.est_hint_width = width;
+            // 精确估算全篇平均行高是 O(n)（16 万块 ≈ 20~40ms）：换宽/拖分屏期间宽度
+            // 逐帧变化，与重挂统一提示同频节流，避免每帧重算卡顿（量程短暂滞后、松手
+            // 即收敛）。**首次建立**（est_hint_width<0，换源/初始化）不节流。
+            let now = std::time::Instant::now();
+            let interval = crate::config::timing::HINT_REAPPLY_INTERVAL_MS as u128;
+            let allowed = self.est_hint_width < 0.0
+                || now.duration_since(self.last_hint_estimate).as_millis() >= interval;
+            if allowed {
+                let p = StyleParams::from_theme_with_font(cx, self.font_override);
+                self.est_hint = self.estimated_avg_row_height(&p, width);
+                self.est_hint_width = width;
+                self.last_hint_estimate = now;
+            }
         }
         let hint = self.est_hint;
         if hint <= 0.0 {
@@ -956,31 +999,36 @@ impl MarkdownPreview {
         let summary_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
             + self.list_state.viewport_bounds().size.height.as_f32();
         let expected = n as f32 * hint;
-        if self.hint_applied == Some((n, hint)) {
-            // 已应用；只有当提示被清掉（gpui 换宽清空）才补一次，且每轮至多补一次
-            if summary_h >= expected * 0.5 || self.hint_recovered {
+        if summary_h >= expected * 0.5 {
+            // 量程健康：清除「重挂保护」痕迹——宽度安定后若提示再被清空，要立即可自愈，
+            // 不能残留 `hint_recovered=true` 永远卡死不重挂（“拖到底不到底”的持久根因）。
+            self.hint_recovered = false;
+            if self.hint_applied == Some((n, hint)) {
                 return false;
             }
-            self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
-            self.hint_recovered = true;
-            return true;
+            // 提示值变了但量程仍健康：直接更新记忆，不重建（省一次 O(n)）。
+            self.hint_applied = Some((n, hint));
+            self.last_hint_apply = Some(std::time::Instant::now());
+            return false;
         }
-        // 首次 / 块数或宽度变化 / 换源：应用一次 O(n)，之后由 `hint_applied` 记忆。
-        // 换宽/拖分屏时宽度每帧变化 → 每帧都会走到这里；按最小间隔节流，避免 160k 块
-        // 的 SumTree 重建在拖动期间每帧卡一次（量程短暂滞后、松手即收敛）。首次不节流。
-        if width_changed && self.hint_applied.is_some() {
-            let now = std::time::Instant::now();
-            let interval = crate::config::timing::HINT_REAPPLY_INTERVAL_MS;
-            if let Some(last) = self.last_hint_apply {
-                if (now.duration_since(last).as_millis() as u64) < interval {
-                    return false;
-                }
-            }
+        // 坍缩（size_hint 被 gpui 按换宽清空，或布局把窗口外条目戳上陈旧的小 size_hint）
+        // → 重铺统一高度提示。**必须用 `reset_with_uniform_height` 强制重铺**：它先
+        // `reset`（splice 成全新 Unmeasured{None}）再统一填高，覆盖任何陈旧戳值——
+        // `with_uniform_item_height` 用 `unwrap_or` 会保留陈旧戳值（实测窗口外条目被
+        // 戳成 height≈0，量程永远恢复不了）。滚动位置先保存再恢复（reset 会清零）。
+        // 连续宽度变化（拖分屏，`last_render_width` 逐帧跳）中去抖：刚重挂过就被同帧
+        // prepaint 清掉属于常态，每帧 O(n) 是卡顿源；宽度安定后坍缩立即重铺一次。
+        let width_active = (self.last_render_width - width).abs() >= 2.0;
+        self.last_render_width = width;
+        if self.hint_recovered && width_active {
+            return false;
         }
-        self.list_state = self.list_state.clone().with_uniform_item_height(px(hint));
+        let prev_scroll = self.list_state.logical_scroll_top();
+        self.list_state.reset_with_uniform_height(n, px(hint));
+        self.list_state.scroll_to(prev_scroll);
         self.last_hint_apply = Some(std::time::Instant::now());
         self.hint_applied = Some((n, hint));
-        self.hint_recovered = false;
+        self.hint_recovered = true;
         true
     }
 
@@ -1280,7 +1328,28 @@ impl Render for MarkdownPreview {
                             .viewport_from_layout(),
                     ),
             )
-            .vertical_scrollbar(&list_state)
+            // 纵向滚动条：确定性量程句柄 + 拖拽前重铺（拖到底必到全文末尾）。
+            .child(
+                div()
+                    .id("md-vscrollbar-overlay")
+                    .debug_selector(|| "md-vscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child({
+                        let n = self.item_count();
+                        let eh = self.est_hint.max(0.0);
+                        let v = PreviewVerticalScrollHandle {
+                            list: list_state.clone(),
+                            content_width: self.content_w,
+                            content_height: n as f32 * eh,
+                            est_hint: eh,
+                            n,
+                        };
+                        Scrollbar::vertical(&v)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout()
+                    }),
+            )
             .into_any_element();
 
         // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；相对定位承载目录浮层/面板开关。
@@ -1331,4 +1400,56 @@ fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
         i += ch.len_utf8();
     }
     None
+}
+
+/// 预览纵向滚动条的「确定性量程」句柄（与编辑器 `VerticalScrollHandle` 同法）：
+/// 拖拽开始前若量程坍缩（gpui 换宽清空 size_hint / 陈旧戳值），用精确平均行高强制
+/// 重铺后**再冻结** `scrollbar_drag_start_height`。内置 `vertical_scrollbar(&list_state)`
+/// 会在量程坍缩/自愈未完成时冻结旧值 → 拖到底也到不了真正的底部（滚轮还能再翻）。
+/// 滚轮滚动由 `list()` 元素自身处理，与本滚动条无关。
+#[derive(Clone)]
+struct PreviewVerticalScrollHandle {
+    list: ListState,
+    content_width: f32,
+    content_height: f32,
+    est_hint: f32,
+    n: usize,
+}
+
+impl ScrollbarHandle for PreviewVerticalScrollHandle {
+    fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.list.viewport_bounds()
+    }
+
+    fn offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.list.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
+        self.list.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<gpui::Pixels> {
+        gpui::size(px(self.content_width), px(self.content_height))
+    }
+
+    fn start_drag(&self) {
+        // 拖拽开始前把量程铺到「确定性正确」再冻结（O(n) 仅在坍缩时一次）：
+        // `items.summary().height` 会被冻结进 `scrollbar_drag_start_height`，
+        // 若此时仍是坍缩值，整次拖拽都会被夹在旧量程 → 拖不到底、只能滚轮兜底。
+        let total = self.list.max_offset_for_scrollbar().y.as_f32()
+            + self.list.viewport_bounds().size.height.as_f32();
+        if self.n > 0 && self.est_hint > 0.0 && total < self.content_height * 0.97 {
+            let prev = self.list.logical_scroll_top();
+            // 与 update_height_hint 的 apply 同法：reset 成全 None 再统一填高，
+            // 覆盖陈旧 size_hint（with_uniform 的 unwrap_or 会保留陈旧值）。
+            self.list.reset_with_uniform_height(self.n, px(self.est_hint));
+            self.list.scroll_to(prev);
+        }
+        self.list.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.list.scrollbar_drag_ended();
+    }
 }

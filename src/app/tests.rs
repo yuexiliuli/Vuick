@@ -1742,6 +1742,519 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 回归：>1MB 文本文件走「后台打开」流水线——`open_file` 立即返回（编辑器仍为空、
+    /// 不在 UI 线程同步读+统计），随后后台线程装配出完整内容（字节级一致）。同时
+    /// 防「打开耗时随文件体积线性冻住 UI」这一性质被后续改动破坏。
+    #[gpui::test]
+    async fn opens_large_text_file_asynchronously(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-large-open-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let line = "x".repeat(80);
+        let content = (0..20_000)
+            .map(|i| format!("{line} {i:07}\n"))
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试文件应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+        let tabs_before = cx.update(|_, cx| app.read(cx).tabs.len());
+
+        // 打开应**立即返回**且编辑器仍为空（内容由后台线程装配，不阻塞 UI）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let empty_after_open = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).value().is_empty()
+        });
+        assert!(empty_after_open, "大文件应异步打开：open_file 返回时编辑器应为空");
+
+        // 驱动后台任务 + 装配，直到内容字节级一致。
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let tab = &a.tabs[a.active_tab];
+                !tab.editor_pending && tab.editor.read(cx).value() == content
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 300 {
+                panic!("大文件后台打开超时：{} 帧未装配完成", frames);
+            }
+        }
+        assert_eq!(
+            cx.update(|_, cx| app.read(cx).tabs.len()),
+            tabs_before + 1,
+            "大文件打开应新增一个选项卡"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 回归：>128KB 的 Markdown 走「两段式打开」**完整流程**——快段（defer）即时挂载
+    /// 编辑器内容，慢段后台并行 行宽统计 + scan_blocks 后补齐滚动条统计与预览索引。
+    /// 断言两段各执行 1 次（open_fast_count/open_finish_count）、编辑器内容字节级一致、
+    /// 预览块索引就绪、打开状态成功。
+    #[gpui::test]
+    async fn opens_large_markdown_full_flow(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-large-md-flow-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let content = (0..3000)
+            .map(|i| {
+                format!(
+                    "# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调*、`行内代码` 与 [链接](https://x.y)。\n\n"
+                )
+            })
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试文件应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let tab = &a.tabs[i];
+                !tab.editor_pending
+                    && tab.editor.read(cx).value() == content
+                    && tab.md_preview.read(cx).memory_estimate().0 > 0
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 300 {
+                panic!("大 md 完整流程超时：{} 帧", frames);
+            }
+        }
+        let (fast_count, finish_count, preview_blocks, status_ok) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            (
+                a.open_fast_count,
+                a.open_finish_count,
+                a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                a.status_ok,
+            )
+        });
+        assert_eq!(fast_count, 1, "两段式快段应执行 1 次");
+        assert_eq!(finish_count, 1, "两段式慢段应执行 1 次");
+        assert!(preview_blocks > 0, "预览块索引应就绪");
+        assert!(status_ok, "打开状态应成功");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 回归：大文档打开把「ListState 全量装配（O(N)）」从打开瞬间移出——直挂总绳的
+    /// mount 只建「视口小列表」（同一同步栈内即可断言 item_count 远小于全文行数，
+    /// 不依赖帧时序），全文 N 条统一高度由 render 排定的 defer 补建（量程恢复健康）。
+    /// 防止退化成 mount 同步 O(N) 建全文（把 ~85ms 开销挪回打开瞬间关键路径）。
+    #[gpui::test]
+    async fn open_large_doc_mounts_list_two_phase(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let line = "x".repeat(60);
+        let content = (0..12_000)
+            .map(|i| format!("{line} {i:010}\n"))
+            .collect::<String>();
+        use gpui_component::input::RopeExt as _;
+        let rope = gpui_component::input::Rope::from(content.as_str());
+        let line_count = rope.lines_len();
+        assert!(
+            line_count > crate::config::limits::EDITOR_LIST_DEFER_MIN_LINES as usize,
+            "测试应超过两段式阈值，实际 {line_count} 行"
+        );
+
+        let ed_ent = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        // 同步栈内断言两段式：mount 返回时只建了视口小列表（若非两段式，这里
+        // item_count 直接等于全文行数）。
+        cx.update(|_w, cx| {
+            ed_ent.update(cx, |ed, _| {
+                ed.set_rope_with_stats(rope.clone(), 0, Default::default());
+                let ic = ed.test_list_state().item_count();
+                assert!(
+                    ic < line_count && ic <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS,
+                    "mount 同步栈内应为视口小列表：item_count={ic}（全文 {line_count} 行，\
+                     两段式应只建 ≤{}）",
+                    crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS
+                );
+            });
+        });
+        // 驱动帧：render 排 defer → 补建全文 → 量程健康。
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            let done = cx.update(|_w, cx| ed_ent.read(cx).test_list_state().item_count() == line_count);
+            if done {
+                break;
+            }
+            frames += 1;
+            if frames > 120 {
+                panic!("defer 补建全文超时：{} 帧后 item_count 仍 < line_count", frames);
+            }
+        }
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let (mo, vh, lh) = cx.update(|_w, cx| {
+            let ed = ed_ent.read(cx);
+            (
+                ed.list_max_offset(),
+                ed.list_viewport_height(),
+                ed.test_metrics().1,
+            )
+        });
+        let expected = (line_count.saturating_sub(1)) as f32 * lh - vh;
+        assert!(
+            mo > expected * 0.9,
+            "defer 补建后量程应健康：max_off={mo:.0}，预期≈{expected:.0}（行 {line_count}/高 {lh:.0}px）"
+        );
+    }
+
+    /// 基准（ignored，release）：隔离测量大列表「统一高度重铺」的原始开销——打开大
+    /// 文档时 defer 补建全文用的就是它。定位「两段式第二帧」的量级，以及验证
+    /// `reset_with_uniform_height` 单趟构建相对旧「reset + with_uniform_item_height」
+    /// 两趟的速度差异。运行：
+    /// `cargo test --release -- --ignored bench_reset_uniform_height --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_reset_uniform_height(cx: &mut TestAppContext) {
+        init_test(cx);
+        for n in [16_000usize, 169_721] {
+            let ls = gpui::ListState::new(1, gpui::ListAlignment::Top, gpui::px(16.));
+            let mut best_new = u128::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                ls.reset_with_uniform_height(n, gpui::px(21.5));
+                best_new = best_new.min(t.elapsed().as_micros());
+            }
+            let mut best_two = u128::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                ls.reset(n);
+                let _ = ls.clone().with_uniform_item_height(gpui::px(21.5));
+                best_two = best_two.min(t.elapsed().as_micros());
+            }
+            println!(
+                "【reset_with_uniform_height】 n={n}: 单趟 new={}µs, 旧两趟(reset+uniform)={}µs",
+                best_new, best_two
+            );
+            let _ = cx;
+        }
+    }
+
+    /// 回归：两段式打开大 md 后，**纵向滚动条量程必须健康**（拖到底可到全文末尾）。
+    /// 根因曾为：gpui 在布局宽度变化时清空 ListState 全部 size_hint；编辑器统一高度
+    /// 提示虽在 render 里重挂，但被同帧 prepaint 再次抹掉、且没有请求后续帧 →
+    /// `max_offset_for_scrollbar()` 坍缩到 ~0，拖到底也滚不到底。修复：重挂时
+    /// `cx.notify()` 多画一帧，下一帧宽度对齐后提示才真正生效（与 Markdown 预览同手法）。
+    #[gpui::test]
+    async fn opens_large_md_keeps_vertical_scrollbar_healthy(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-scroll-healthy-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut content = format!("{}\n", "x".repeat(8000));
+        content.push_str(
+            &(0..5000)
+                .map(|i| {
+                    format!("# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调* 与 `code`。\n\n")
+                })
+                .collect::<String>(),
+        );
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试文件应超过后台打开阈值"
+        );
+        std::fs::write(&dir, &content).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        // 等待完整流程（快段 + 慢段 finish），并通过 refresh 驱动「重挂统一高度提示后
+        // 的多画一帧」（gpui 测试里 notify 不会自动重画，需 refresh；真实应用由帧循环）。
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            let done = cx.update(|_, cx| app.read(cx).open_finish_count >= 1);
+            if done && frames > 6 {
+                break;
+            }
+            frames += 1;
+            if frames > 120 {
+                break;
+            }
+        }
+        let (lines, lh) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let ed = a.tabs[i].editor.read(cx);
+            (ed.line_count(), ed.test_metrics().1)
+        });
+        // 编辑器「再次渲染后量程自愈」：idle 时 summary 可能被最后一次换宽清掉（gpui
+        // 只在实际布局时清），但只要再渲染一次（用户移动鼠标/滚轮即如此），
+        // `ensure_uniform_hint` 应重挂恢复。手动 notify 驱动一次渲染来验证。
+        let ed_ent = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].editor.clone()
+        });
+        cx.update(|_, cx| {
+            ed_ent.update(cx, |_, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let (mo, vh) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let ed = a.tabs[i].editor.read(cx);
+            (ed.list_max_offset(), ed.list_viewport_height())
+        });
+        let expected = (lines.saturating_sub(1)) as f32 * lh - vh;
+        assert!(
+            mo > expected * 0.9,
+            "编辑器量程在再次渲染时应自愈（max_off={mo:.0}，预期≈{expected:.0}）"
+        );
+        // 编辑器「拖到底」：模拟 VerticalScrollHandle.start_drag 的重铺+冻结+拖底，
+        // 断言拖到底后最后内容可见。
+        let els = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].editor.read(cx).test_list_state()
+        });
+        els.reset_with_uniform_height(lines, gpui::px(lh));
+        els.scrollbar_drag_started();
+        els.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let eix = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i]
+                .editor
+                .read(cx)
+                .test_list_state()
+                .logical_scroll_top()
+                .item_ix
+        });
+        assert!(
+            lines.saturating_sub(eix) <= 50,
+            "编辑器拖到底应到达最后内容（滚动顶行 item_ix={eix}/{lines}）"
+        );
+        // 预览侧量程同样须**精确**（≈ 全篇块高之和），不能因抽样/坍缩缩到视口高
+        // ——否则预览滚动条拖不到底部。回归：精确平均行高替代 256 块抽样。
+        let (pv_total, blocks, est, applied) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let pv = a.tabs[i].md_preview.read(cx);
+            (
+                pv.vertical_total_px(),
+                pv.memory_estimate().0,
+                pv.test_est_hint(),
+                pv.test_hint_applied(),
+            )
+        });
+        assert!(
+            pv_total > blocks as f32 * 15.0,
+            "预览纵向量程应精确（total={pv_total:.0}px / {blocks} 块，est_hint={est:.0}，applied={applied:?}，坍缩态≈{vh:.0}px）"
+        );
+        // 确定性「拖到底」回归：模拟 PreviewVerticalScrollHandle.start_drag 的重铺+冻结+
+        // 拖底（用户实测：内置滚动条在量程坍缩/未自愈时开始拖，冻结旧值 → 拖不到真正的
+        // 底部，只能滚轮兜底）。断言拖到底后逻辑项到最后一两块。
+        let drag_top = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].md_preview.read(cx).test_list_state()
+        });
+        drag_top.reset_with_uniform_height(blocks, gpui::px(est));
+        drag_top.scrollbar_drag_started();
+        drag_top.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let top_ix = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i]
+                .md_preview
+                .read(cx)
+                .test_list_state()
+                .logical_scroll_top()
+                .item_ix
+        });
+        assert!(
+            blocks.saturating_sub(top_ix) <= 50,
+            "预览拖到底应到达最后内容（滚动顶块 item_ix={top_ix}，共 {blocks}；应距末尾在一个视口内）"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// 诊断（临时，手工跑）：真机大文档上对比编辑器/预览双层量程 + 模拟拖到底。
+    /// 依赖 `target/大文档测试.md` 存在；正常跑套件时跳过。#[ignore] 手动：
+    /// `cargo test -- --ignored diag_drag_bottom_real_file --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn diag_drag_bottom_real_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        std::env::set_var("MD_OPEN_DEBUG", "1");
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.open_file(r"target/大文档测试.md", window, cx);
+            });
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let (n_lines, ed_max, ed_vh, lh, pw_total, pv_blocks, pv_est) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let ed = a.tabs[i].editor.read(cx);
+            let pv = a.tabs[i].md_preview.read(cx);
+            (
+                ed.line_count(),
+                ed.list_max_offset(),
+                ed.list_viewport_height(),
+                ed.test_metrics().1,
+                pv.vertical_total_px(),
+                pv.memory_estimate().0,
+                pv.test_est_hint(),
+            )
+        });
+        println!(
+            "DIAG 编辑器: lines={n_lines} 摘要总高={:.1} 句柄高(lines×lh)={:.1} 行高={lh:.1}",
+            ed_max + ed_vh,
+            n_lines as f32 * lh
+        );
+        let (ed_vw, ed_cw, ed_lastw) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            let ed = a.tabs[i].editor.read(cx);
+            (
+                ed.test_list_state().viewport_bounds().size.width.as_f32(),
+                ed.test_content_w_px(),
+                ed.test_last_list_width(),
+            )
+        });
+        println!(
+            "DIAG 编辑器宽: viewport_w={ed_vw:.1} content_w={ed_cw:.1} last_list_width={ed_lastw:.1}"
+        );
+        println!(
+            "DIAG 预览: blocks={pv_blocks} est={pv_est:.1} 摘要total={pw_total:.1} 句柄高(blocks×est)={:.1}",
+            pv_blocks as f32 * pv_est
+        );
+
+        // 编辑器模拟拖到底（重置→冻结→拖超远）
+        let ls = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].editor.read(cx).test_list_state()
+        });
+        ls.reset_with_uniform_height(n_lines, gpui::px(lh));
+        ls.scrollbar_drag_started();
+        ls.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let ed_ix = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i]
+                .editor
+                .read(cx)
+                .test_list_state()
+                .logical_scroll_top()
+                .item_ix
+        });
+        println!("DIAG 编辑器拖到底: 滚动顶行 item_ix={ed_ix} / {n_lines}（距末尾 {}）", n_lines.saturating_sub(ed_ix));
+
+        // 预览模拟拖到底
+        let pls = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].md_preview.read(cx).test_list_state()
+        });
+        pls.reset_with_uniform_height(pv_blocks, gpui::px(pv_est.max(0.0)));
+        pls.scrollbar_drag_started();
+        pls.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        cx.run_until_parked();
+        let pv_ix = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i]
+                .md_preview
+                .read(cx)
+                .test_list_state()
+                .logical_scroll_top()
+                .item_ix
+        });
+        println!(
+            "DIAG 预览拖到底: 滚动顶块 item_ix={pv_ix} / {pv_blocks}（距末尾 {}）",
+            pv_blocks.saturating_sub(pv_ix)
+        );
+    }
+
     /// 打开 .epub：应解析正文（含书名/章节），自动进入预览模式并填充内容。
     #[gpui::test]
     async fn opens_epub_and_shows_preview(cx: &mut TestAppContext) {
@@ -2058,26 +2571,37 @@
         });
         let sync_ms = t0.elapsed().as_millis();
         println!("【md 异步打开：open_file 同步返回】(拖入不卡 UI) {} ms", sync_ms);
-        // 阶段 A：等待预览内容就绪（块索引已建 → 预览区可显示内容）
-        // 阶段 B：等待编辑器挂载完成（editor_pending 复位 → 编辑区升起）
+        // 两段式打开：D=编辑区**内容**即时就绪（快段，≈几十 ms），A=预览就绪（慢段
+        // 后台并行统计+scan_blocks 完成后）。B 语义沿用「编辑区挂载完成」。
+        // 用「行数 + !editor_pending」作廉价就绪判据（大文档必然远超；不用每帧 value()
+        // 物化 6MB，那会污染墙钟）。
+        let mut d_ready = false;
+        let mut a_ready = false;
+        let mut d_ready_ms = 0usize;
         let mut a_ready_ms = 0usize;
         let mut b_ready_ms = 0usize;
         let mut frames = 0;
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (preview_blocks, editor_pending) = cx.update(|_, cx| {
+            let (preview_blocks, editor_pending, editor_lines) = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 (
                     a.tabs[i].md_preview.read(cx).memory_estimate().0,
                     a.tabs[i].editor_pending,
+                    a.tabs[i].editor.read(cx).line_count(),
                 )
             });
-            if a_ready_ms == 0 && preview_blocks > 0 {
+            if !d_ready && !editor_pending && editor_lines > 1000 {
+                d_ready = true;
+                d_ready_ms = t0.elapsed().as_millis() as usize;
+            }
+            if !a_ready && preview_blocks > 0 {
+                a_ready = true;
                 a_ready_ms = t0.elapsed().as_millis() as usize;
             }
-            if preview_blocks > 0 && !editor_pending {
+            if d_ready && a_ready {
                 b_ready_ms = t0.elapsed().as_millis() as usize;
                 break;
             }
@@ -2085,8 +2609,9 @@
                 break;
             }
         }
-        println!("【A. 预览内容就绪】(拖入→预览可见) {} ms", a_ready_ms);
-        println!("【B. 编辑区挂载完成】(拖入→编辑器升起) {}", if b_ready_ms > 0 { format!("{} ms", b_ready_ms) } else { "超时".to_string() });
+        println!("【D. 编辑区内容即时就绪】(两段式快段) {d_ready_ms} ms");
+        println!("【A. 预览内容就绪】(慢段后台完成) {a_ready_ms} ms");
+        println!("【B. 两者就绪】(总墙钟) {}", if b_ready_ms > 0 { format!("{b_ready_ms} ms") } else { "超时".to_string() });
         // 首帧真实渲染/布局（编辑器 DisplayMap + 预览 ListState + 高亮窗口）
         let tb = std::time::Instant::now();
         for i in 0..3 {
@@ -2097,14 +2622,14 @@
         }
         println!("【C. 前 3 次 refresh 合计】 {} ms", tb.elapsed().as_millis());
 
-        // 对照：同内容的 .txt（非 md → 同步打开、不软换行、无预览、无高亮语法）
+        // 对照：同内容的 .txt（非 md → 无预览/无 scan_blocks；大文件同样走后台流水线）
         let t_txt = std::time::Instant::now();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_file(r"target/大文档测试.txt", window, cx);
             });
         });
-        println!("【txt 同步打开】(对照) {} ms", t_txt.elapsed().as_millis());
+        println!("【txt 打开：open_file 返回】(对照) {} ms", t_txt.elapsed().as_millis());
     }
 
     /// 基准：用编辑器本体追加同一段文本 1000 次所需耗时。

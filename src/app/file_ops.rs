@@ -4,7 +4,7 @@ use super::*;
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::WindowExt as _;
 
-use crate::config::limits::EDITOR_WRAP_MAX_LINES;
+use crate::config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES};
 use crate::config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
 
 /// 打开失败通知的 id 类型（配合唯一 key，便于 5 秒后精确移除）。
@@ -53,18 +53,21 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 把已读取的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
+    /// 把已读取并预处理好的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
     ///
-    /// `prebuilt_index`：非 None 时预览直接复用外部（后台）预建的块索引，
-    /// 跳过 UI 线程上的 `scan_blocks`（大文档异步打开用）。
+    /// `prep`：读盘→归一化→Rope→行宽统计 的产物。同步小文档在 UI 线程现算
+    /// （`defer_preview`=false，预览直接全量解析）；大文档由
+    /// [`Self::spawn_background_open`] 走**两段式**：先快速挂载编辑器
+    /// （`defer_preview`=true，统计为占位、预览延迟、`editor_pending`=false），
+    /// **内容瞬时可见**；行宽统计与预览索引由后台完成后 `finish_file_text` O(1) 补齐。
     fn load_file_text(
         &mut self,
         idx: usize,
         p: &std::path::Path,
-        text: String,
+        prep: PreparedText,
         _window: &mut Window,
         cx: &mut Context<Self>,
-        prebuilt_index: Option<std::rc::Rc<crate::markdown::BlockIndex>>,
+        defer_preview: bool,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         let panel_bg = self.panel_bg();
@@ -72,26 +75,19 @@ impl EditorApp {
             return;
         };
         let lang = Self::language_id(p);
-        let lines = text.lines().count().max(1);
-        let chars = text.chars().count();
-        let src_len = text.len();
+        let lines = prep.lines;
+        let chars = prep.chars;
+        let src_len = prep.src_len;
+        if defer_preview {
+            self.open_fast_count += 1; // 大文档两段式打开：快段（内容瞬时挂载）
+        }
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
-        // 大文档异步打开：把「预建的块索引」登记为增量基底，第一次编辑即可走
-        // 增量扫描，而不是先全量扫一遍（打开当下编辑器 set_value 也会触发变更事件）。
-        // 基底快照 = 该全文的 Rope：仅在打开时一次性构建（O(n)）；此后每轮打字同步
-        // 由同步循环换成编辑器正文 Rope 的 O(1) COW 克隆，这里只为「首轮即增量」垫底。
-        let preview_seed: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)> = if is_md {
-            prebuilt_index
-                .as_ref()
-                .map(|ix| (Rope::from(text.as_str()), ix.clone()))
-        } else {
-            None
-        };
-        tab.preview_prev = preview_seed.clone();
         let t_editor = std::time::Instant::now();
         tab.editor.update(cx, |ed, _cx| {
-            ed.set_text(&text);
+            // O(1) 装配：行宽统计在后台算好（快速挂载时为占位，finish 再补真值），
+            // 不再 UI 线程 recompute_max_line（≈350ms）。
+            ed.set_rope_with_stats(prep.rope, prep.max_line_chars, prep.line_width_histogram);
             if is_md && lines <= EDITOR_WRAP_MAX_LINES {
                 // 自研编辑器尚不支持软换行（占位，API 一致；大文档无 DisplayMap 布局问题）
                 ed.set_soft_wrap(true);
@@ -99,13 +95,8 @@ impl EditorApp {
             ed.set_language(Some(lang));
         });
         let elapsed_editor = t_editor.elapsed();
-        // 渲染器按行解析，原文直接喂入即可（行级虚拟化内部做块识别）。
-        // 只对 Markdown 类文件解析预览：非 md 文件预览区不展示，喂入整篇 6MB
-        // 文本纯属浪费（parse_to_rows 会全量解析），拖慢打开。
-        // 大文档（> PREVIEW_MAX_DOC_LINES 行）由预览内部自动切窗口级懒解析。
-        // 大文档异步打开（带预建索引）：编辑器已填入内容，但挂载延后一拍——
-        // 让预览先把内容画出来，编辑器 16 万行的首帧布局再放到随后帧（见 panes）。
-        tab.editor_pending = prebuilt_index.is_some();
+        // 编辑器即刻挂载（大文档不再是「预览优先」：内容瞬时可见优先于预览/滚动条精度）。
+        tab.editor_pending = false;
         let t_preview = std::time::Instant::now();
         tab.md_preview.update(cx, |view, cx| {
             view.set_background(panel_bg);
@@ -113,24 +104,22 @@ impl EditorApp {
             if is_md {
                 // Markdown 默认/始终自动换行
                 view.set_wrap(true, cx);
-                if let Some(index) = prebuilt_index {
-                    // 复用后台预建的块索引（省 UI 线程几百 ms）；源传同一份 Rope 的 O(1) 克隆。
-                    let seed = preview_seed
-                        .as_ref()
-                        .map(|(r, _)| r.clone())
-                        .unwrap_or_else(Rope::new);
-                    view.set_source_with_index(crate::markdown::PreviewSrc::Rope(seed), index, cx);
-                } else {
-                    view.set_source(&text, cx);
+                if !defer_preview {
+                    // 同步小文档：直接全量解析（行块索引现算；文件小故可接受在 UI 线程）。
+                    view.set_source(&prep.text, cx);
                 }
+                // defer=true（大文档快速挂载）：预览留空，行块索引用 finish_file_text
+                // 的 set_source_with_index 补上（并登记增量基底 preview_prev）。
             }
         });
         let elapsed_preview = t_preview.elapsed();
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
-                "[MD_OPEN_DEBUG] load_file_text: 编辑器(set_value+wrap+highlight)={} ms, 预览(set_wrap+scan_blocks)={} ms",
+                "[MD_OPEN_DEBUG] load_file_text:{src_len} B/{} 行: 编辑器(from_parts+wrap+highlight)={} ms, 预览={} ms{}",
+                lines,
                 elapsed_editor.as_millis(),
                 elapsed_preview.as_millis(),
+                if defer_preview { " (预览延迟，finish 补齐)" } else { "" },
             );
         }
         tab.file_path = Some(p.to_path_buf());
@@ -170,6 +159,179 @@ impl EditorApp {
         });
         self.status_ok = true;
         cx.notify();
+    }
+
+    /// 大文档「先瞬时显示、后台补齐」的第二段：后台并行算好行宽统计 + (md)scan_blocks
+    /// 后调用。守卫：选项卡仍存、仍是同一文件、且**打开后未编辑**（已编辑则跳过，让
+    /// 增量同步/编辑自身维护）。应用后 O(1) 修正横向滑动条量程，并给 Markdown 预览装上
+    /// 预建索引（登记增量基底，后续编辑即可走增量扫描）。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_file_text(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        max_line_chars: usize,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+        index: Option<crate::markdown::BlockIndex>,
+        resume_version: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        if tab.file_path.as_deref() != Some(p) {
+            return; // 选项卡已被换成其它文件
+        }
+        self.open_finish_count += 1; // 大文档两段式打开：慢段（统计 + 预览索引补齐）
+        if resume_version.is_some_and(|v| tab.edit_version != v) {
+            return; // 打开后已编辑：统计/索引已过期，交给编辑/增量同步链路维护
+        }
+        tab.editor.update(cx, |ed, _| {
+            ed.apply_stats(max_line_chars, line_width_histogram);
+        });
+        if let Some(index) = index {
+            if Self::is_markdown_path(p) && tab.preview_on {
+                let rc = std::rc::Rc::new(index);
+                let rope = tab.editor.read(cx).rope().clone();
+                tab.preview_prev = Some((rope.clone(), rc.clone()));
+                tab.md_preview.update(cx, |view, cx| {
+                    view.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope), rc, cx);
+                });
+            }
+        }
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            // 诊断“拖到底不到底”：量程就绪后两栏纵向量程总高。编辑器精确时应 ≈
+            // 行数×行高；预览(精确平均高) 应 ≈ 全篇块高之和。值远小于预期 → 该栏量程坍缩。
+            let editor_total = tab.editor.read(cx).vertical_total_px();
+            let preview_total = tab.md_preview.read(cx).vertical_total_px();
+            eprintln!(
+                "[MD_SCROLL] finish 后纵向 total——编辑器={editor_total:.0}px ({} 行), 预览={preview_total:.0}px ({} 块)",
+                tab.line_count,
+                tab.md_preview.read(cx).memory_estimate().0,
+            );
+        }
+        cx.notify();
+    }
+
+    /// 大文件后台打开流水线：**两段式**——
+    /// 1. 快段（≈几十 ms）：后台 读盘→归一化→Rope→计数，UI 立即 `load_file_text`(defer)
+    ///    把编辑器挂上，**内容瞬时可见**；
+    /// 2. 慢段（后台并行）：行宽统计 ‖ (md)scan_blocks（`std::thread::scope` OS 线程真
+    ///    并行；实测 gpui `background_executor().spawn` 同会话仍串行），完成后
+    ///    `finish_file_text` O(1) 修正滚动条量程 + 装预览。
+    /// `idx` 处须已存在选项卡（`open_file` 新建 / `open_file_in_tab` 复用）。
+    fn spawn_background_open(
+        &mut self,
+        idx: usize,
+        p: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));
+        self.status_ok = true;
+        let is_md = Self::is_markdown_path(&p);
+        let entity = cx.entity();
+        // send 类型别名：PreparedText（String/Rope/BTreeMap）与 BlockIndex 均 Send，
+        // Rc 留到 UI 线程再包（与 preview_syncing 的「Rc 非 Send」注释一致）。
+        type FastResult = Result<PreparedText, std::io::Error>;
+        type StatsResult = (
+            usize,
+            crate::editor::buffer::LineWidthHistogram,
+            Option<crate::markdown::BlockIndex>,
+        );
+        window
+            .spawn(cx, async move |cx| {
+                // ---- 快段：读盘 + 归一化 + Rope + 计数（Rope 建好编辑器即可显示）----
+                let p_read = p.clone();
+                let fast: FastResult = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let t = std::time::Instant::now();
+                        let text = fs::read_to_string(&p_read)
+                            .map(|raw| Self::normalize_newlines(&raw))?;
+                        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                            eprintln!(
+                                "[MD_OPEN_DEBUG] 后台 读文件+归一化: {} ms ({} B)",
+                                t.elapsed().as_millis(),
+                                text.len()
+                            );
+                        }
+                        Ok(prepare_text_fast(text))
+                    })
+                    .await;
+                let Some((resume_version, snap_rope)) = (match fast {
+                    Ok(prep) => {
+                        let snap_rope = prep.rope.clone(); // O(1) COW：慢段统计用同一棵树
+                        let p_fast = p.clone();
+                        let r = cx.update_window_entity(&entity, move |this, window, cx| {
+                            this.load_file_text(idx, &p_fast, prep, window, cx, true);
+                            // 打开此刻的编辑版本号：finish 用它当「未编辑」守卫。
+                            this.tabs.get(idx).map(|t| t.edit_version)
+                        });
+                        match r {
+                            Ok(Some(v)) => Some((Some(v), snap_rope)),
+                            _ => None,
+                        }
+                    }
+                    Err(e) => {
+                        let p_err = p.clone();
+                        let _ = cx.update_window_entity(&entity, move |this, window, cx| {
+                            this.report_open_failure(&p_err, &e, window, cx)
+                        });
+                        None
+                    }
+                }) else {
+                    return;
+                };
+                // ---- 慢段：行宽统计 ‖ (md)scan_blocks（OS 线程真并行，纯后台）----
+                let stats: StatsResult = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let t = std::time::Instant::now();
+                        let out = std::thread::scope(|s| {
+                            let stats_rope = snap_rope.clone();
+                            let stats_thread = s.spawn(move || {
+                                crate::editor::buffer::compute_line_stats(&stats_rope)
+                            });
+                            let scan_thread = if is_md {
+                                let scan_rope = snap_rope.clone();
+                                Some(s.spawn(move || {
+                                    crate::markdown::scan_blocks_rope(&scan_rope)
+                                }))
+                            } else {
+                                None
+                            };
+                            let (mx, hist) =
+                                stats_thread.join().expect("行宽统计线程应可 join");
+                            let index = scan_thread
+                                .map(|th| th.join().expect("scan_blocks 线程应可 join"));
+                            (mx, hist, index)
+                        });
+                        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                            eprintln!(
+                                "[MD_OPEN_DEBUG] 后台 并行(行宽统计+scan_blocks) 合计: {} ms",
+                                t.elapsed().as_millis()
+                            );
+                        }
+                        out
+                    })
+                    .await;
+                let (max_line_chars, line_width_histogram, index) = stats;
+                // ---- 收尾：应用到编辑器（滚动条量程）+ Markdown 预览（索引）----
+                let p_fin = p.clone();
+                let _ = cx.update_window_entity(&entity, move |this, _window, cx| {
+                    this.finish_file_text(
+                        idx,
+                        &p_fin,
+                        max_line_chars,
+                        line_width_histogram,
+                        index,
+                        resume_version,
+                        cx,
+                    );
+                });
+            })
+            .detach();
     }
 
     /// 把 EPUB 解析结果载入指定选项卡：纯展示（只读预览），编辑区置空。
@@ -309,10 +471,16 @@ impl EditorApp {
             self.open_pdf_async(idx, p.clone(), window, cx);
             return;
         }
+        // 大文件（按字节阈值判断）：后台打开（复用已有选项卡），
+        // 读盘→归一化→Rope→行宽统计→(md)scan_blocks 全在后台线程，UI 只做 O(1) 装配。
+        if is_large_path(&p) {
+            self.spawn_background_open(idx, p, window, cx);
+            return;
+        }
         match fs::read_to_string(&p) {
             Ok(text) => {
-                let text = Self::normalize_newlines(&text);
-                self.load_file_text(idx, &p, text, window, cx, None);
+                let prep = prepare_text(Self::normalize_newlines(&text));
+                self.load_file_text(idx, &p, prep, window, cx, false);
             }
             Err(e) => self.report_open_failure(&p, &e, window, cx),
         }
@@ -353,7 +521,20 @@ impl EditorApp {
             }
             return;
         }
-        // 文本：先读成功再建 tab
+        // 文本：大文件（按字节阈值判断，无需读盘）→ **后台打开**——先建标签页 +
+        // “正在打开…”状态立即返回，读盘→归一化→Rope→行宽统计→(md)scan_blocks
+        // 全在后台线程，完成后 UI 线程只做 O(1) 装配。拖入瞬间不再卡死 UI，
+        // 且打开耗时不再随文件体积线性冻住主线程。
+        if is_large_path(&p) {
+            let idx = self.make_tab(window, cx);
+            self.spawn_background_open(idx, p.clone(), window, cx);
+            if let Some(tab) = self.tabs.get(idx) {
+                let focus = tab.editor.read(cx).focus_handle();
+                window.focus(&focus, cx);
+            }
+            return;
+        }
+        // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）
         let t_read = std::time::Instant::now();
         let text = match fs::read_to_string(&p) {
             Ok(text) => Self::normalize_newlines(&text),
@@ -369,55 +550,14 @@ impl EditorApp {
                 text.len()
             );
         }
-        let lines = text.lines().count().max(1);
-        // 大文档（md 且超编辑区软换行阈值）：**异步打开**——先建标签页 + “正在打开…”
-        // 状态立即返回，read/scan_blocks 已在上面完成读、预览索引放后台线程算，
-        // 完成后在主线程一次性装配编辑器与预览。拖入瞬间不再卡死 UI。
-        if Self::is_markdown_path(&p) && lines > EDITOR_WRAP_MAX_LINES {
-            let idx = self.make_tab(window, cx);
-            self.status =
-                SharedString::from(format!("正在打开大文档：{}…", p.display()));
-            self.status_ok = true;
-            let entity = cx.entity();
-            let p2 = p.clone();
-            // 后台线程预建预览块索引（纯函数，几百 ms，不阻塞 UI）
-            let src_for_scan = text.clone();
-            window
-                .spawn(cx, async move |cx| {
-                    let index = cx
-                        .background_executor()
-                        .spawn(async move { crate::markdown::scan_blocks(&src_for_scan) })
-                        .await;
-                    eprintln!(
-                        "[MD_OPEN_DEBUG] 后台 scan_blocks 完成: {} 块",
-                        index.blocks.len()
-                    );
-                    let _ = cx.update_window_entity(&entity, move |this, window, cx| {
-                        this.load_file_text(
-                            idx,
-                            &p2,
-                            text,
-                            window,
-                            cx,
-                            Some(std::rc::Rc::new(index)),
-                        );
-                        if let Some(tab) = this.tabs.get(idx) {
-                            let focus = tab.editor.read(cx).focus_handle();
-                            window.focus(&focus, cx);
-                        }
-                    });
-                })
-                .detach();
-            return;
-        }
-        // 小文档：同步打开（原路径）
         let t_mk = std::time::Instant::now();
         let idx = self.make_tab(window, cx);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!("[MD_OPEN_DEBUG] make_tab: {} ms", t_mk.elapsed().as_millis());
         }
         let t_load = std::time::Instant::now();
-        self.load_file_text(idx, &p, text, window, cx, None);
+        let prep = prepare_text(text);
+        self.load_file_text(idx, &p, prep, window, cx, false);
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
                 "[MD_OPEN_DEBUG] load_file_text: {} ms",
@@ -573,4 +713,90 @@ impl EditorApp {
             editor.paste_text(&text, cx);
         });
     }
+}
+
+/// 读盘→归一化→Rope→行宽统计 的打开预处理产物：UI 线程据此 O(1) 装配，
+/// 不在 UI 线程做任何 O(n) 重扫。可跨线程（`String`/`Rope`/`BTreeMap` 均 `Send`）。
+struct PreparedText {
+    /// 归一化后的全文（同步小文档预览的 `set_source` 用；大文档预览走 Rope）。
+    text: String,
+    /// 全文 Rope（编辑器 + Markdown 预览共享，O(1) 克隆）。
+    rope: Rope,
+    /// 显示行数（`str::lines()` 语义，尾换行不追加行）。
+    lines: usize,
+    /// 字符总数（Unicode 标量）。
+    chars: usize,
+    /// 原文件字节数。
+    src_len: usize,
+    /// 全文最长行（字符数）。
+    max_line_chars: usize,
+    /// 行宽直方图（最宽行 / 横向滚动条量程依据；通常由后台线程算好）。
+    line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+}
+
+/// 把归一化文本预处理成编辑器装配产物（纯函数，可在后台线程跑）：
+/// Rope::from + 行/字计数 + 行宽直方图 —— 这一整条 O(n) 链路（大文档合计
+/// 几百 ms）由调用方决定放在后台线程，UI 线程不再背。
+fn prepare_text(text: String) -> PreparedText {
+    let src_len = text.len();
+    let t = std::time::Instant::now();
+    let lines = text.lines().count().max(1);
+    let chars = text.chars().count();
+    let counts_ms = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let rope = Rope::from(text.as_str());
+    let rope_ms = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let (max_line_chars, line_width_histogram) = crate::editor::buffer::compute_line_stats(&rope);
+    let stats_ms = t.elapsed().as_millis();
+    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+        eprintln!(
+            "[MD_OPEN_DEBUG] 准备文本: 计数(lines+chars)={counts_ms} ms, Rope::from({src_len} B)={rope_ms} ms, compute_line_stats({lines} 行)={stats_ms} ms"
+        );
+    }
+    PreparedText {
+        text,
+        rope,
+        lines,
+        chars,
+        src_len,
+        max_line_chars,
+        line_width_histogram,
+    }
+}
+
+/// 大文档「先瞬时显示」版预处理：只做 Rope + 计数（≈几十 ms），**行宽统计留占位**
+/// （`max_line_chars=0`、空直方图）——编辑器文本可以立刻挂上；真统计由后台
+/// `compute_line_stats` 并行算出后经 `Buffer::apply_stats` O(1) 替换。
+/// 占位期的代价仅在「横向滑动条量程/token 余量」上（长行暂时只显示不横滚），
+/// 量化后约几百 ms 内自动收敛，相比让内容等 300+ms 明显更值。
+fn prepare_text_fast(text: String) -> PreparedText {
+    let src_len = text.len();
+    let t = std::time::Instant::now();
+    let lines = text.lines().count().max(1);
+    let chars = text.chars().count();
+    let rope = Rope::from(text.as_str());
+    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+        eprintln!(
+            "[MD_OPEN_DEBUG] prepare_text_fast({src_len} B/{} 行): 计数+Rope {:.1} ms",
+            lines,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    PreparedText {
+        text,
+        rope,
+        lines,
+        chars,
+        src_len,
+        max_line_chars: 0,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram::new(),
+    }
+}
+
+/// 是否走「后台打开」流水线：按文件大小元数据判断（无需读盘）。
+fn is_large_path(p: &std::path::Path) -> bool {
+    std::fs::metadata(p)
+        .map(|m| m.len() > OPEN_ASYNC_MIN_BYTES)
+        .unwrap_or(false)
 }

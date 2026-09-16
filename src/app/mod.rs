@@ -151,6 +151,11 @@ pub struct EditorApp {
     /// 实际执行过的搜索扫描次数（每次命中缓存复用不改）。测试用：验证「查询未变
     /// 时反复渲染不重扫」这一优化真实生效。
     pub(crate) search_scan_count: usize,
+    /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。
+    /// 测试用：验证大文件先瞬时挂编辑器、再后台补齐统计/预览的完整流程两段都跑了。
+    pub(crate) open_fast_count: usize,
+    /// 大文档「两段式打开」慢段（`finish_file_text` 应用统计 + 预览索引）执行次数。
+    pub(crate) open_finish_count: usize,
     focus_handle: FocusHandle,
 }
 
@@ -214,6 +219,8 @@ impl EditorApp {
             _search_sub: search_sub,
             search_scan: None,
             search_scan_count: 0,
+            open_fast_count: 0,
+            open_finish_count: 0,
             focus_handle,
         };
         app.make_tab(window, cx);

@@ -79,6 +79,25 @@ pub(crate) fn char_width_units(c: char) -> usize {
     }
 }
 
+/// 行宽直方图（multiset）：宽度单位 → 拥有该宽度的行数（见 [`char_width_units`]，
+/// CJK/全角=2、ASCII=1、Tab=4）。最宽行 = `keys().next_back()`(O(1))。
+pub(crate) type LineWidthHistogram = BTreeMap<usize, usize>;
+
+/// 纯计函数（不依赖 `&mut Buffer`，可放后台线程）：统计全文的行宽直方图与
+/// 最长行字符数。与 [`Buffer::recompute_max_line`] 等价，但可以在后台算好后
+/// 经 [`Buffer::from_parts`] O(1) 装配，避免打开大文档时在 UI 线程全量重扫。
+pub(crate) fn compute_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
+    let mut hist = LineWidthHistogram::new();
+    let mut mx_chars = 0usize;
+    for i in 0..rope.lines_len() {
+        let line = rope.slice_line(i);
+        let units = line.chars().map(char_width_units).sum::<usize>();
+        *hist.entry(units).or_insert(0) += 1;
+        mx_chars = mx_chars.max(line.chars().count());
+    }
+    (mx_chars, hist)
+}
+
 /// 文本缓冲：Rope 全文 + 版本号（供缓存失效判断）。
 ///
 /// 行模型：以 LF 为行分隔符（`metric_lines_lf`，CR 视为普通字符）；
@@ -99,7 +118,7 @@ pub struct Buffer {
     /// **始终精确且增量维护**：编辑时先删旧受影响行的整行宽、再加新受影响行的整行宽
     /// （O(受影响行 × log L)，L=不同宽度数）——删除长内容后横向滚动条量程立即精确
     /// 收敛，不欠 O(1) 旧上界、也不做同步 O(n) 全量重扫。
-    line_width_histogram: BTreeMap<usize, usize>,
+    line_width_histogram: LineWidthHistogram,
 }
 
 impl Default for Buffer {
@@ -132,10 +151,37 @@ impl Buffer {
             text,
             version: 0,
             max_line_chars: 0,
-            line_width_histogram: BTreeMap::new(),
+            line_width_histogram: LineWidthHistogram::new(),
         };
         b.recompute_max_line();
         b
+    }
+
+    /// 直接用外部（后台线程）算好的统计装配，跳过全量重扫（打开大文档的 O(1)
+    /// 装配路径；统计须来自 [`compute_line_stats`]，否则行宽/横向滑动条失真）。
+    pub fn from_parts(
+        text: Rope,
+        max_line_chars: usize,
+        line_width_histogram: LineWidthHistogram,
+    ) -> Self {
+        Self {
+            text,
+            version: 0,
+            max_line_chars,
+            line_width_histogram,
+        }
+    }
+
+    /// 「先瞬时显示、后台补齐统计」路径用：全文已由 [`Self::from_parts`] 挂上（统计为
+    /// 占位），后台算好真统计后 O(1) 替换。**要求文本自挂载以来未变**（调用方以版本/
+    /// 编辑计数 guard），否则替换会覆盖增量维护的直方图、横向滑动条短暂失真。
+    pub fn apply_stats(
+        &mut self,
+        max_line_chars: usize,
+        line_width_histogram: LineWidthHistogram,
+    ) {
+        self.max_line_chars = max_line_chars;
+        self.line_width_histogram = line_width_histogram;
     }
 
     /// 全文最长行（字符数）——O(1) 读，供等宽列近似/测试。
@@ -201,16 +247,17 @@ impl Buffer {
     }
 
     fn recompute_max_line(&mut self) {
-        let mut hist = BTreeMap::new();
-        let mut mx_chars = 0usize;
-        for i in 0..self.text.lines_len() {
-            let line = self.text.slice_line(i);
-            let units = line.chars().map(char_width_units).sum::<usize>();
-            *hist.entry(units).or_insert(0) += 1;
-            mx_chars = mx_chars.max(line.chars().count());
-        }
+        let t = std::time::Instant::now();
+        let (mx, hist) = compute_line_stats(&self.text);
         self.line_width_histogram = hist;
-        self.max_line_chars = mx_chars;
+        self.max_line_chars = mx;
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!(
+                "[MD_OPEN_DEBUG] Buffer::recompute_max_line({} 行): {} ms",
+                self.text.lines_len(),
+                t.elapsed().as_millis()
+            );
+        }
     }
 
     /// 底层文本（只读）。

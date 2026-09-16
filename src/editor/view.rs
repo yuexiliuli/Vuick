@@ -43,6 +43,7 @@ use gpui_component::input::{
     SelectToStart, SelectToStartOfLine, Undo,
 };
 
+use crate::config::limits::{EDITOR_LIST_DEFER_MIN_LINES, EDITOR_LIST_PROVISIONAL_ROWS};
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
 use crate::editor::undo::{EditIntent, UndoManager};
@@ -105,6 +106,23 @@ struct RowView {
     caret_color: Hsla,
 }
 
+/// 大文档打开时 ListState 的「两段式装配」状态机：挂载整篇的 SumTree（O(N)）是
+/// 打开瞬间唯一的 UI 线程大开销，把它**推迟到内容可见之后的一帧**执行，
+/// 首帧只建一个视口小列表（O(视口)）即时显示内容。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ListMountState {
+    /// 列表已按全文行数建好（统一高度提示已应用），正常渲染。
+    Ready,
+    /// 刚挂载大文档：已建「视口小列表」，本帧可用小列表渲染首屏；render 末尾会
+    /// 排一个 defer 补建全文。此状态下 `ensure_uniform_hint` 的自愈必须**停**
+    /// （它会把"量程坍缩"误判为该补建，导致首帧就 O(N) 全量重建，破坏两段式）。
+    Provisional,
+    /// defer 已排定（一次一帧只会排一个），等待该 defer 执行全文装配后转 Ready。
+    /// 新一轮 `resync_list`（又打开别的文件）会把它盖回 Provisional，让旧 defer
+    /// 因状态不再匹配而跳过（防止旧文件的装配误建到新文件上）。
+    Expanding,
+}
+
 /// 自研代码编辑器（首版）。
 pub struct CodeEditor {
     buffer: Buffer,
@@ -138,6 +156,10 @@ pub struct CodeEditor {
     gutter_chars: usize,
     gutter_width_px: Pixels,
     content_w_px: f32,
+    /// 上次 render 时列表元素的布局宽（px）：gpui 按「宽度变化」清空 size_hint。
+    /// 用「宽度是否仍在变」替代纯 120ms 墙钟去抖——后者会在打开/换宽后的 120ms 内
+    /// 挡住自愈重挂（此时量程坍缩，立刻拖滚动条会拖不到底）。
+    last_list_width: f32,
     uniform_applied: Option<Pixels>,
     /// 行号列已应用统一高度提示的行高（行号行恒等于 line_height，避免首次整表
     /// 测量 O(n) 与量程失真；仅在行高/重置后重挂）。
@@ -174,6 +196,9 @@ pub struct CodeEditor {
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
 
+    /// ListState 两段式装配状态（大文档打开用；Ready 时走原有量程自愈逻辑）。
+    list_mount: ListMountState,
+
     // —— 配置 ——
     tab_size: usize,
 }
@@ -207,6 +232,7 @@ impl CodeEditor {
             gutter_chars: 3,
             gutter_width_px: px(0.),
             content_w_px: 0.,
+            last_list_width: 0.,
             uniform_applied: None,
             gutter_uniform_applied: None,
             last_uniform_apply: None,
@@ -227,6 +253,7 @@ impl CodeEditor {
             blink_running: false,
             focus_registered: false,
             element_bounds: Bounds::default(),
+            list_mount: ListMountState::Ready,
             tab_size: 4,
         }
     }
@@ -244,12 +271,41 @@ impl CodeEditor {
     /// 设置文档文本（清空撤销/重做与选区）。
     pub fn set_text(&mut self, text: &str) {
         self.buffer = Buffer::new(text);
+        self.reset_document();
+    }
+
+    /// 与 [`Self::set_text`] 相同，但**连 Rope 与行宽统计都复用调用方（后台）算好的
+    /// 结果**（O(1) 装配，不再全量重扫）。统计须与 `text` 严格对应（见
+    /// `Buffer::from_parts`），否则横向滑动条量程/最长行列估算失真。打开大文档的主路径。
+    pub fn set_rope_with_stats(
+        &mut self,
+        text: Rope,
+        max_line_chars: usize,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+    ) {
+        self.buffer = Buffer::from_parts(text, max_line_chars, line_width_histogram);
+        self.reset_document();
+    }
+
+    /// 大文档「先瞬时显示、后台补齐统计」用：全文已经由 [`Self::set_rope_with_stats`]
+    /// 挂上（统计为占位），后台算好真统计后 O(1) 修正横向滑动条量程/最长行。
+    /// **要求调用方保证统计与当前文本一致**（打开后未编辑）。
+    pub fn apply_stats(
+        &mut self,
+        max_line_chars: usize,
+        line_width_histogram: crate::editor::buffer::LineWidthHistogram,
+    ) {
+        self.buffer.apply_stats(max_line_chars, line_width_histogram);
+    }
+
+    /// 整篇替换文档后的通用复位（撤销/选区/横向滚动/标记清空 + 列表行数同步）。
+    fn reset_document(&mut self) {
         self.undo.clear();
         self.selection = Selection::collapsed(0);
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
-        self.resync_list();
+        self.resync_list(true);
     }
 
     /// 在选区处输入文本（等同连续打字：合并撤销、走同一编辑主链）。
@@ -302,6 +358,32 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn list_max_offset(&self) -> f32 {
         self.list_state.max_offset_for_scrollbar().y.as_f32()
+    }
+
+    /// 纵向量程总高（px）= `max_offset_for_scrollbar().y + 视口高`。
+    /// 统一高度提示生效时 ≈ 行数 × 行高（精确）；坍缩时 ≈ 视口高。诊断/测试用。
+    pub(crate) fn vertical_total_px(&self) -> f32 {
+        self.list_state.max_offset_for_scrollbar().y.as_f32()
+            + self.list_state.viewport_bounds().size.height.as_f32()
+    }
+
+    /// 测试：暴露 ListState（共享 Rc）——测试拖拽路径 / 量程对账。
+    #[cfg(test)]
+    pub(crate) fn test_list_state(&self) -> ListState {
+        self.list_state.clone()
+    }
+
+    /// 测试/诊断：最近一次 render 记录的列表布局宽（px）。
+    #[cfg(test)]
+    pub(crate) fn test_last_list_width(&self) -> f32 {
+        self.last_list_width
+    }
+
+    /// 测试：是否处于「两段式装配中间态」（视口小列表已建、全文未补建完成）。
+    /// 大文档 mount 同步栈内应返回 true（证明未同步 O(N) 建全文）。
+    #[cfg(test)]
+    pub(crate) fn test_list_is_deferred(&self) -> bool {
+        self.list_mount != ListMountState::Ready
     }
 
     /// 字符总数。
@@ -419,7 +501,11 @@ impl CodeEditor {
         self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
         // 行号列统一高度提示：行号行恒等于 line_height，预填提示可跳过首次整表
         // 测量（大文档 O(n)），滚动/可视渲染也稳定。
-        if self.gutter_uniform_applied != Some(self.line_height) {
+        // 两段式装配（Provisional/Expanding）期间行号列是视口小列表、且稍后由
+        // defer 一起以全文补建并设 gutter_uniform_applied，这里不重复 O(N) 预填。
+        if self.list_mount == ListMountState::Ready
+            && self.gutter_uniform_applied != Some(self.line_height)
+        {
             self.gutter_list_state = self
                 .gutter_list_state
                 .clone()
@@ -439,16 +525,51 @@ impl CodeEditor {
     }
 
     /// 列表条目数与行数一致（reset 场景：首次/整篇替换/撤销重做）。
-    fn resync_list(&mut self) {
+    ///
+    /// **大文档两段式**（仅 `defer_large=true` 的整篇替换走）：超过
+    /// [`EDITOR_LIST_DEFER_MIN_LINES`] 时主线程不整篇建树——只建「视口小列表」
+    /// （O(视口)，首帧即时显示），全文 N 条统一高度由 render 末尾的 defer 在首帧
+    /// 内容可见后补建。撤销/重做传 `false`（`reveal_caret` 依赖同步全文列表，
+    /// 延迟补建会把光标 reveal 丢在小列表上）。
+    fn resync_list(&mut self, defer_large: bool) {
         let new_n = self.buffer.line_count().max(1);
-        if new_n != self.list_state.item_count() {
-            self.list_state.reset(new_n);
-            self.gutter_list_state.reset(new_n);
-            self.uniform_applied = None;
-            // reset 会清空统一高度提示 → 下帧 refresh_metrics 重新预填。
-            self.gutter_uniform_applied = None;
+        if new_n == self.list_state.item_count() {
+            self.row_count = new_n;
+            return;
         }
+        let t = std::time::Instant::now();
+        if defer_large && new_n > EDITOR_LIST_DEFER_MIN_LINES {
+            // 首帧可见内容 = `row_count`（全文行数 N）+ 小列表 item 索引 0..视口，
+            // 渲染闭包用 rows[ix-lo] 索引，行号用 ix+1，首屏从行 0 起，天然正确。
+            let prov = EDITOR_LIST_PROVISIONAL_ROWS.min(new_n);
+            self.list_state.reset(prov);
+            self.gutter_list_state.reset(prov);
+            self.uniform_applied = None;
+            self.gutter_uniform_applied = None;
+            self.list_mount = ListMountState::Provisional;
+            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                eprintln!(
+                    "[MD_OPEN_DEBUG] 编辑器 ListState 两段式：首帧视口小列表 reset({prov})（全文 {new_n} 行，defer 补全）+{:.1}ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            self.row_count = new_n;
+            return;
+        }
+        // 小文档：同步全量装配（O(N) 便宜，保留原行为）。
+        self.list_state.reset(new_n);
+        self.gutter_list_state.reset(new_n);
+        self.uniform_applied = None;
+        // reset 会清空统一高度提示 → 下帧 refresh_metrics 重新预填。
+        self.gutter_uniform_applied = None;
+        self.list_mount = ListMountState::Ready;
         self.row_count = new_n;
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            eprintln!(
+                "[MD_OPEN_DEBUG] 编辑器 ListState::reset({new_n} 行): {} ms",
+                t.elapsed().as_millis()
+            );
+        }
     }
 
     /// 就地编辑并用 `splice` 增量同步行数（O(log n)，避免大文档整树重建）。
@@ -471,7 +592,11 @@ impl CodeEditor {
         edit
     }
 
-    /// 统一高度的量程提示：仅在行高/条目结构变化后重挂（避免每帧 O(n)）。
+    /// 统一高度的量程提示：仅在行高/条目结构变化后重挂（避免每帧 O(n)）。返回
+    /// `true` 表示「本轮应用了统一高度提示」——调用方应 `cx.notify()` 请求多画一帧：
+    /// gpui 在**本次布局**（prepaint 按 `last_layout_bounds` 宽度比对）会再次清掉刚填的
+    /// size_hint，只有下一帧宽度对齐后才不会被清，提示才真正生效（与 Markdown 预览
+    /// `update_height_hint` 的「换宽自愈」同一手法）。量程健康/冷却中返回 `false`。
     ///
     /// gpui 在「宽度变化」时会把 ListState 所有条目的 `size_hint` 清空（未测
     /// 条目高度按 0 计）→ `max_offset_for_scrollbar()` 坍缩，滚动条量程随之
@@ -479,13 +604,19 @@ impl CodeEditor {
     /// O(1) 读摘要判断量程是否坍缩，坍缩则重挂提示；健康时清掉重挂痕迹，
     /// 保证换宽后的首次坍缩立即重挂；连续坍缩风暴（拖分屏）120ms 至多重挂一次
     /// （`with_uniform_item_height` 是 O(n) SumTree 物化，不能每帧跑）。
-    fn ensure_uniform_hint(&mut self) {
+    fn ensure_uniform_hint(&mut self) -> bool {
         if !self.metrics_ready {
-            return;
+            return false;
+        }
+        // 两段式装配（Provisional/Expanding）：列表还是视口小列表，量程“小”是
+        // 状态机该有的样子，不是坍缩——不要在首帧就该补建时 O(N) 自愈；全文由
+        // render 末尾排定的 defer 在内容可见后一帧补建。
+        if self.list_mount != ListMountState::Ready {
+            return false;
         }
         let n = self.list_state.item_count();
         if n == 0 {
-            return;
+            return false;
         }
         let lh = self.line_height.as_f32();
         let expected = n as f32 * lh.max(1.);
@@ -499,33 +630,58 @@ impl CodeEditor {
             self.hint_healthy = true;
             self.last_uniform_apply = None;
             if self.uniform_applied == Some(self.line_height) {
-                return;
+                return false;
             }
-            self.list_state = self
-                .list_state
-                .clone()
-                .with_uniform_item_height(self.line_height);
-            self.uniform_applied = Some(self.line_height);
-            return;
+            self.apply_uniform_hint();
+            return true;
         }
 
         // 坍缩：宽度变化把 size_hint 清了 → 重挂整棵 SumTree（O(n)）。
-        // 冷却仅在「已观察过健康帧」之后生效（否则首帧/新文档紧跟的换宽坍缩会被
-        // 冷却误伤，量程长时间不自愈）。连续坍缩风暴（拖分屏）120ms 至多重挂一次。
+        // 去抖只针对「宽度仍在连续变化」（拖分屏，刚重挂就被同帧 prepaint 清掉，
+        // 每帧 O(n) 会卡）：用列表自身布局宽 `last_list_width`（即 gpui 判断是否清空的
+        // 那个宽度）是否在变来判断。**宽度安定后坍缩立即重挂**——不再依赖 120ms 墙钟
+        // 冷却，避免打开/换宽后的 ~120ms 内量程坍缩、立刻拖滚动条拖不到底。
+        let list_w = self.list_state.viewport_bounds().size.width.as_f32();
+        let width_active = (self.last_list_width - list_w).abs() >= 2.0;
+        self.last_list_width = list_w;
         if self.hint_healthy
+            && width_active
             && self
                 .last_uniform_apply
                 .is_some_and(|t| t.elapsed().as_millis() < 120)
         {
-            return;
+            return false;
         }
 
-        self.list_state = self
-            .list_state
-            .clone()
-            .with_uniform_item_height(self.line_height);
+        self.apply_uniform_hint();
+        true
+    }
+
+    /// 重挂统一行高提示。**必须用 `reset_with_uniform_height` 强制重铺**：它先
+    /// `reset`（splice 成全 None）再统一填高，覆盖任何陈旧 size_hint——gpui 布局会把
+    /// 窗口外条目戳上陈旧的小 `Some` 戳值，`with_uniform_item_height` 的
+    /// `unwrap_or` 会保留它们 → 量程永远恢复不上（实测大文档摘要总高被卡死在 ~视口）。
+    /// 滚动位置先保存再恢复（reset 会清零滚动顶）。
+    fn apply_uniform_hint(&mut self) {
+        let t = std::time::Instant::now();
+        let prev = self.list_state.logical_scroll_top();
+        let n = self.list_state.item_count();
+        self.list_state
+            .reset_with_uniform_height(n, self.line_height);
+        self.list_state.scroll_to(prev);
         self.uniform_applied = Some(self.line_height);
         self.last_uniform_apply = Some(std::time::Instant::now());
+        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+            let vb = self.list_state.viewport_bounds();
+            eprintln!(
+                "[MD_OPEN_DEBUG] 编辑器 reset_with_uniform_height({n} 行): {} ms 摘要总高={:.1} viewport_w={:.1} content_w={:.1}",
+                t.elapsed().as_millis(),
+                self.list_state.max_offset_for_scrollbar().y.as_f32()
+                    + self.list_state.viewport_bounds().size.height.as_f32(),
+                vb.size.width.as_f32(),
+                self.content_w_px,
+            );
+        }
     }
 
     /// 把文本区 ListState 的竖向滚动位置对齐到行号列（两者锁步）。
@@ -1298,7 +1454,7 @@ impl CodeEditor {
             self.last_edit = Some((a, b, a));
         }
         self.selection = Selection::from_range(tx.before.0, tx.before.1);
-        self.resync_list();
+        self.resync_list(false);
         self.kick_caret();
         self.reveal_caret();
         cx.emit(EditorEvent::Edited);
@@ -1322,7 +1478,7 @@ impl CodeEditor {
             self.last_edit = Some((a, a, b));
         }
         self.selection = Selection::from_range(tx.after.0, tx.after.1);
-        self.resync_list();
+        self.resync_list(false);
         self.kick_caret();
         self.reveal_caret();
         cx.emit(EditorEvent::Edited);
@@ -1552,7 +1708,48 @@ impl Render for CodeEditor {
         }
 
         self.refresh_metrics(window, cx);
-        self.ensure_uniform_hint();
+        // 量程坍缩时重挂统一高度提示，并请求多画一帧让其真正生效（防「拖到底不到底」）。
+        if self.ensure_uniform_hint() {
+            cx.notify();
+        }
+        // 大文档两段式装配：首帧用视口小列表即时显示内容；这里排一个 defer，在
+        // 本帧内容画出去/可见之后补建全文 N 条统一高度（O(N) 一帧，移出“打开瞬间”
+        // 关键路径），再 notify 重画一帧让滚动条量程/行号列恢复全文正确。靠
+        // Provisional→Expanding 状态切换保证一次只排一个；期间重开别的文档会把
+        // 状态盖回 Provisional，令旧 defer 作废。
+        if self.list_mount == ListMountState::Provisional && self.metrics_ready {
+            self.list_mount = ListMountState::Expanding;
+            let entity = cx.entity();
+            let mount_t = std::time::Instant::now();
+            window.defer(cx, move |_window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    if this.list_mount != ListMountState::Expanding {
+                        return; // 期间又打开了别的文档：旧 defer 作废
+                    }
+                    let n = this.buffer.line_count().max(1);
+                    let lh = this.line_height.max(px(1.));
+                    let t0 = std::time::Instant::now();
+                    this.list_state.reset_with_uniform_height(n, lh);
+                    let t_text = t0.elapsed();
+                    let t1 = std::time::Instant::now();
+                    this.gutter_list_state.reset_with_uniform_height(n, lh);
+                    let t_gutter = t1.elapsed();
+                    this.uniform_applied = Some(lh);
+                    this.gutter_uniform_applied = Some(lh);
+                    this.list_mount = ListMountState::Ready;
+                    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                        eprintln!(
+                            "[MD_OPEN_DEBUG] 编辑器 ListState 两段式：defer 补建全文({n} 行, {:.1}px/行): 文本={} ms, 行号={} ms, 已排定到执行={} ms",
+                            lh.as_f32(),
+                            t_text.as_millis(),
+                            t_gutter.as_millis(),
+                            mount_t.elapsed().as_millis()
+                        );
+                    }
+                    cx.notify();
+                });
+            });
+        }
         // 行号列与文本区竖向锁步（覆盖滚轮/拖动滚动条/reveal 等一切滚动来源）。
         self.sync_gutter_scroll();
         // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
@@ -1854,6 +2051,7 @@ impl Render for CodeEditor {
                             state: list_state.clone(),
                             content_width: content_w_px,
                             content_height: self.row_count as f32 * self.line_height.as_f32(),
+                            line_height: self.line_height,
                         };
                         Scrollbar::vertical(&v)
                             .mode(ScrollbarMode::Always)
@@ -2015,6 +2213,7 @@ struct VerticalScrollHandle {
     state: ListState,
     content_width: f32,
     content_height: f32,
+    line_height: Pixels,
 }
 
 impl ScrollbarHandle for VerticalScrollHandle {
@@ -2035,6 +2234,20 @@ impl ScrollbarHandle for VerticalScrollHandle {
     }
 
     fn start_drag(&self) {
+        // gpui 在布局宽度变化后清空全部 size_hint → `items.summary().height` 瞬时坍缩；
+        // 若此刻开始拖拽，`scrollbar_drag_start_height` 会把坍缩值**冻结一整次拖拽**
+        // （gpui list.rs，拖到底也到不了真正的底部）。拖拽开始前若检测到量程坍缩，用
+        // *确定性行高强制重铺*（`reset_with_uniform_height` 覆盖陈旧戳值；O(n) 一次），
+        // 保证冻结的量程是正确的；健康量程则直接冻结（省掉不必要的 O(n)）。
+        // （clone/self.state 与编辑器共享同一 `Rc<RefCell<Inner>>`，换掉 items 即全局生效。）
+        let total = self.state.max_offset_for_scrollbar().y.as_f32()
+            + self.state.viewport_bounds().size.height.as_f32();
+        if total < self.content_height * 0.97 {
+            let prev = self.state.logical_scroll_top();
+            self.state
+                .reset_with_uniform_height(self.state.item_count(), self.line_height);
+            self.state.scroll_to(prev);
+        }
         self.state.scrollbar_drag_started();
     }
 
