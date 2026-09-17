@@ -245,7 +245,12 @@ impl CodeEditor {
         let focus_handle = cx.focus_handle().tab_stop(true);
         let buffer = Buffer::default();
         let row_count = buffer.line_count().max(1);
-        let list_state = ListState::new(row_count, ListAlignment::Top, px(16.));
+        // 固定窗口虚拟化：ListState **恒持 `LIST_WINDOW_ROWS` 项**（与 `resync_list`
+        // 的 `reset(LIST_WINDOW_ROWS)` 同一不变量）。绝不能用 `row_count` 初始化——
+        // 空文档 row_count=1 → 列表只有 1 项，且 `apply_desired_to_window` 的窗口覆盖
+        // 判定不会补建窗口 → 新建空标签后粘贴多行会「只有第一行能渲染」（回归测试
+        // `empty_new_tab_paste_not_collapsed_to_first_row`）。
+        let list_state = ListState::new(LIST_WINDOW_ROWS, ListAlignment::Top, px(16.));
         Self {
             buffer,
             selection: Selection::collapsed(0),

@@ -1541,3 +1541,51 @@ fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
         300.0 * lh + pad - 600.0
     );
 }
+
+// ---------------------------------------------------------------------------
+// 粘贴/列表窗口（回归：空标签粘贴只显示首行）
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
+    // 回归（用户实测「新建空标签 → 粘贴多行 → 编辑器只显示第一行」）：
+    // `CodeEditor::new` 建空标签时 ListState 若按 `row_count`(1) 初始化，则固定窗口
+    // 虚拟化从未建立（`resync_list` 只在 set_text/开文件/撤销重做时重置为
+    // `LIST_WINDOW_ROWS`）；`apply_desired_to_window` 的「窗口覆盖」判定又会误判
+    // 无需补建 → 粘贴 300 行后列表仍只有 1 项 → `list()` 只渲染首行。
+    // 修复：`new()` 直接以固定窗口 `LIST_WINDOW_ROWS` 初始化。
+    use crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as WINDOW;
+    cx.update(gpui_component::init);
+    let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let ed = cx.new(|cx| CodeEditor::new(cx));
+        Host { ed }
+    });
+    let cx: &mut VisualTestContext = cx;
+    settle(cx);
+    let win0 = cx.update(|_, cx| host.read(cx).ed.read(cx).test_list_window_len());
+    assert_eq!(
+        win0, WINDOW,
+        "空标签首帧 ListState 就应为固定窗口 {WINDOW} 项（而不是 1 项）"
+    );
+    // 粘贴 300 行多行文本。
+    let text = (0..300).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    ed.update(cx, |ed, cx| ed.paste_text(&text, cx));
+    settle(cx);
+    let (lc, vis, win, sic) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        (
+            ed.line_count(),
+            ed.test_folds().visual_line_count(),
+            ed.test_list_window_len(),
+            ed.test_scroll_item_count(),
+        )
+    });
+    assert_eq!(lc, 300, "数据行数应完整");
+    assert_eq!(vis, 300, "视觉行数应完整");
+    assert!(sic >= vis, "滚动量程应覆盖全部视觉行（sic={sic} vis={vis}）");
+    assert_eq!(
+        win, WINDOW,
+        "粘贴后固定窗口条目数应保持 = {WINDOW}（实际 {win}）——否则只渲染首行"
+    );
+}
