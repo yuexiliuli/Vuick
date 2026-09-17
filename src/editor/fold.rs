@@ -60,6 +60,17 @@ fn leading_ws_units(s: &str) -> usize {
         .sum()
 }
 
+/// 行首空白**字节数**（空格/Tab 各 1 字节；折叠候选缩进比较用）。
+///
+/// 注意：与 [`leading_ws_units`]（宽度单位）不同——候选扫描沿用视图层原
+/// `view::leading_ws_len` 的「字节数」口径（`scan_fold_candidates` 里缩进只做
+/// 大小比较，两者各自单调、但与旧实现保持逐位一致以免候选集合变化）。
+fn leading_ws_bytes(s: &str) -> usize {
+    s.bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
+}
+
 /// 扫描全文的跨行括号配对（`{ }` / `( )` / `[ ]`），O(行数) 单遍、仅记录**跨行**配对
 /// （单行 `{}` 不产竖线）。`line` 按逻辑行号返回该行文本（只读）。
 ///
@@ -141,6 +152,63 @@ where
                     col += ch.len_utf8();
                 }
             }
+        }
+    }
+    out
+}
+
+/// 全篇扫描「可折叠候选」**纯函数**（缩进 + 闭记号启发式，与视图层解耦，可在
+/// 后台线程/只读 Rope 快照上运行，语义等价于原 `CodeEditor::scan_fold_candidates`）。
+///
+/// 行 `i` 是候选起点 ⟺ 其后的首个非空行缩进更深（该行将藏起一个块）；块结束 = 首个
+/// 缩进回退 `/` 同级闭记号（`}` 等）行。`line` 按逻辑行号返回该行文本（只读）。
+/// 缩进口径 = 行首空白**字节数**（[`leading_ws_bytes`]，与折叠缩进启发式一致）。
+pub(crate) fn scan_fold_candidates<F>(line: F, row_count: usize) -> Vec<Fold>
+where
+    F: Fn(usize) -> SharedString,
+{
+    if row_count <= 1 {
+        return Vec::new();
+    }
+    let mut out: Vec<Fold> = Vec::new();
+    // 栈：挂起的块 `(start, indent)`。pending 记录上一非空行；下次看到更深行才入栈。
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut pending: Option<(usize, usize)> = None;
+    for r in 0..row_count {
+        let text = line(r);
+        let trimmed = text.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = leading_ws_bytes(text.as_ref());
+        let closing = matches!(
+            trimmed.chars().next(),
+            Some('}') | Some(')') | Some(']') | Some('#') | Some('`')
+        );
+        if let Some((ps, pi)) = pending {
+            // 上一行是块起点 ⟺ 当前行缩进更深。
+            if indent > pi {
+                stack.push((ps, pi));
+            }
+            // 关闭缩进 ≥ 当前行的块（缩进回退或同级闭记号）。
+            while let Some(&(bs, bi)) = stack.last() {
+                if indent < bi || (indent == bi && closing) {
+                    if r >= bs + 2 {
+                        out.push(Fold { start: bs, end: r });
+                    }
+                    stack.pop();
+                    continue;
+                }
+                break;
+            }
+        }
+        pending = Some((r, indent));
+    }
+    // EOF：关闭仍开着的块（延伸到最后一行）。
+    let end = row_count;
+    while let Some((bs, _bi)) = stack.pop() {
+        if end >= bs + 2 {
+            out.push(Fold { start: bs, end });
         }
     }
     out
@@ -586,6 +654,44 @@ mod tests {
         assert_eq!(
             pairs,
             vec![BracketPair { open_line: 0, open_col: 43, close_line: 2, guide_units: 0 }]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 折叠候选纯函数（`scan_fold_candidates`）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fold_candidates_find_indented_blocks() {
+        let lines = [
+            "fn outer() {",
+            "    fn inner() {",
+            "        x();",
+            "    }",
+            "    y();",
+            "}",
+            "fn next() {}",
+        ];
+        let cands = scan_fold_candidates(line_fn(&lines), lines.len());
+        // outer 块跨 0..5（藏 1..5），inner 块跨 1..3（藏 2）——两者并存（候选允许嵌套）。
+        assert!(cands.contains(&Fold { start: 0, end: 5 }), "{cands:?}");
+        assert!(cands.contains(&Fold { start: 1, end: 3 }), "{cands:?}");
+        // 空行不干扰、无嵌套内容的单行块不产候选。
+        let blank = ["fn a() {", "", "    x", "}"];
+        assert_eq!(
+            scan_fold_candidates(line_fn(&blank), blank.len()),
+            vec![Fold { start: 0, end: 3 }]
+        );
+    }
+
+    #[test]
+    fn fold_candidates_identical_to_view_metric() {
+        // 用 Tab 缩进回归：行首空白按**字节**计（与原 `view::leading_ws_len` 相同），
+        // 保证候选集合与折叠展开/收拢语义不因口径漂移而变化。
+        let lines = ["\tfn a() {", "\t\tx;", "\t}"];
+        assert_eq!(
+            scan_fold_candidates(line_fn(&lines), lines.len()),
+            vec![Fold { start: 0, end: 2 }]
         );
     }
 }

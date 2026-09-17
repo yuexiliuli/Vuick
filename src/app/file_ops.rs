@@ -436,6 +436,13 @@ impl EditorApp {
                         });
                         this.status_ok = true;
                     }
+                    // 折叠候选 / 括号标尺：末块落定后**后台**重扫一次（打开全程不再每块
+                    // 整篇重扫 → 打开 160k 行文档从 ~2s UI 卡顿降到毫秒级装配）。
+                    if let Some(tab) = this.tabs.get_mut(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
+                        tab.editor.update(cx, |ed, cx| {
+                            ed.refresh_fold_brackets(cx);
+                        });
+                    }
                 });
                 if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                     eprintln!(

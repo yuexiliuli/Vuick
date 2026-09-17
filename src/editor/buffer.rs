@@ -89,6 +89,15 @@ pub(crate) fn char_width_units(c: char) -> usize {
 /// CJK/全角=2、ASCII=1、Tab=4）。最宽行 = `keys().next_back()`(O(1))。
 pub(crate) type LineWidthHistogram = BTreeMap<usize, usize>;
 
+/// 按逻辑行号取只读 Rope 的行文本（无 `Buffer` 外壳；越界返回空）。
+/// 供后台线程的折叠候选 / 括号配对扫描使用（Rope 为 O(1) COW 快照）。
+pub(crate) fn line_shared(rope: &Rope, line: usize) -> SharedString {
+    if line >= rope.lines_len() {
+        return SharedString::new_static("");
+    }
+    SharedString::from(rope.slice_line(line).to_string())
+}
+
 /// 纯计函数（不依赖 `&mut Buffer`，可放后台线程）：统计全文的行宽直方图与
 /// 最长行字符数。与 [`Buffer::recompute_max_line`] 等价，但可以在后台算好后
 /// 经 [`Buffer::from_parts`] O(1) 装配，避免打开大文档时在 UI 线程全量重扫。

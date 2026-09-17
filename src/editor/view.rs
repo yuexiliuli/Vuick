@@ -217,6 +217,13 @@ pub struct CodeEditor {
     /// 跨行括号配对（括号标尺竖线）：`{()}`/`[]`/`()` 每条跨行配对一根竖线，
     /// 从开括号列画到闭括号行。≤ 200k 行整篇扫描，随编辑/行数变化重扫。
     bracket_pairs: Vec<BracketPair>,
+    /// 折叠候选 / 括号配对的**后台刷新**版本号：每次请求 +1；后台任务回来时若
+    /// 版本已过期（期间又编辑/又请求）则丢弃旧结果、用最新快照重跑一轮。
+    scan_epoch: u64,
+    /// 是否已有一轮后台刷新在进行（单飞：防止连续输入堆积多个任务）。
+    scan_inflight: bool,
+    /// 编辑后待刷新：下一帧 render 挂起一次后台刷新（替代原同步整篇重扫）。
+    scan_dirty_edit: bool,
     /// 垂直标尺线颜色（主题 `muted_foreground` 派生，refresh_metrics 设置；
     /// 已验证可见——行号列同款）。不依赖 `border`（可能为透明默认值）。
     ruler_color: Hsla,
@@ -280,6 +287,9 @@ impl CodeEditor {
             folds: FoldMap::new(),
             fold_candidates: Vec::new(),
             bracket_pairs: Vec::new(),
+            scan_epoch: 0,
+            scan_inflight: false,
+            scan_dirty_edit: false,
             ruler_color: rgb(0x000000).into(),
             guide_color: rgb(0x000000).into(),
         }
@@ -328,6 +338,10 @@ impl CodeEditor {
     /// 大文档「分块渐进装配」追加一块已归一化文本（整行语义）：只把该块追到 Buffer
     /// 末尾并更新行数，**不重建列表 / 不回滚光标 / 不产生编辑事件**——打开期间的
     /// 滚动位置与撤销栈保留。首块仍走 [`Self::set_rope_with_stats`]（建立文档）。
+    ///
+    /// **不在此做折叠候选/括号配对扫描**（旧实现每块整篇重扫 → 打开 160k 行文档
+    /// UI 线程卡 ~2s）。打开收尾（`file_ops` 末块落定）由 [`Self::refresh_fold_brackets`]
+    /// 在后台统一重扫一次。
     pub fn append_mounted_chunk(
         &mut self,
         chunk: &str,
@@ -337,8 +351,6 @@ impl CodeEditor {
         self.buffer.append_chunk(chunk, chunk_max_chars, chunk_hist);
         self.row_count = self.buffer.line_count().max(1);
         self.folds.set_total(self.row_count);
-        self.recompute_fold_candidates();
-        self.recompute_bracket_pairs();
     }
 
     /// 整篇替换文档后的通用复位（撤销/选区/横向滚动/标记清空 + 列表行数同步）。
@@ -352,7 +364,7 @@ impl CodeEditor {
         self.desired_scroll.set(0.);
         // 整篇替换：折叠视图投影一并清空（文本结构已变）。
         self.folds.clear();
-        self.resync_list(true);
+        self.resync_list(false);
     }
 
     /// 在选区处输入文本（等同连续打字：合并撤销、走同一编辑主链）。
@@ -625,9 +637,12 @@ impl CodeEditor {
 
     /// 重建 ListState 为固定窗口 `[0, LIST_WINDOW_ROWS)` 并回顶。首次 / 整篇替换 /
     /// 撤销重做都走这里：O(窗口) 常数，与文档规模无关——**不再是两段式 + 分帧增长**
-    /// （改固定窗口虚拟化后打开大文件瞬时 O(1)，无需增长机制）。`defer_large` 保留为
-    /// 旧调用方的占位形参（已无两段式语义）。
-    fn resync_list(&mut self, _defer_large: bool) {
+    /// （改固定窗口虚拟化后打开大文件瞬时 O(1)，无需增长机制）。
+    ///
+    /// `defer_scans`：`true` = 撤销/重做等「文档行数已变、避免 UI 线程整篇重扫」——
+    /// 折叠候选/括号配对改为**下一帧挂起后台刷新**（[`Self::scan_dirty_edit`]）；
+    /// `false` = 整篇替换/打开（内容全新，同步重扫一次，首屏即就绪，测试依赖）。
+    fn resync_list(&mut self, defer_scans: bool) {
         let new_n = self.buffer.line_count().max(1);
         self.row_count = new_n;
         let t = std::time::Instant::now();
@@ -638,10 +653,14 @@ impl CodeEditor {
         self.desired_scroll.set(0.);
         // 折叠投影总行数跟随文档行数（区间越界由 FoldMap 侧裁剪）。
         self.folds.set_total(new_n);
-        // 自动折叠候选（gutter 默认指示器）随文档行数重扫。
-        self.recompute_fold_candidates();
-        // 括号标尺配对同样随文档重扫。
-        self.recompute_bracket_pairs();
+        if defer_scans {
+            // 撤销/重做路径：不在这里整篇重扫（大文档 ~280ms UI 卡顿），交给后台刷新。
+            self.scan_dirty_edit = true;
+        } else {
+            // 打开/整篇替换路径：同步重扫一次（内容全新，首屏即就绪）。
+            self.recompute_fold_candidates();
+            self.recompute_bracket_pairs();
+        }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             eprintln!(
                 "[MD_OPEN_DEBUG] 编辑器 ListState 固定窗口 reset({LIST_WINDOW_ROWS})，{new_n} 行 + {} 预留空行: {} ms",
@@ -663,18 +682,15 @@ impl CodeEditor {
         self.row_count = self.buffer.line_count().max(1);
         // 折叠同步：编辑进折叠体 → 自动展开；折叠后整体平移；锚被删 → 丢弃。
         self.folds.sync_edit(line_a, line_b, text, self.row_count);
-        // 折叠候选（指示器）只在行数变化或编辑触及候选边界时重扫。
-        self.recompute_candidates_if_dirty(prev_rows, line_a, line_b);
-        // 括号标尺配对：行数变化或编辑文本含括号字符时重扫（保持竖线即时更新）。
+        // 折叠候选 / 括号配对：**不再同步整篇重扫**（大文档逐键卡顿）。行数变了或
+        // 文本含括号字符 → 打标，由下一帧 render 挂起一轮后台刷新（单飞 + 版本号）。
         let has_bracket =
             text.bytes().any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'))
                 || edit
                     .old_text
                     .bytes()
                     .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'));
-        if self.row_count != prev_rows || has_bracket {
-            self.recompute_bracket_pairs();
-        }
+        self.scan_dirty_edit = self.scan_dirty_edit || self.row_count != prev_rows || has_bracket;
         edit
     }
 
@@ -1242,6 +1258,12 @@ impl CodeEditor {
         &self.bracket_pairs
     }
 
+    /// 测试用：清空折叠候选与括号配对（验证后台刷新会重新落地）。
+    pub(crate) fn test_clear_fold_brackets(&mut self) {
+        self.fold_candidates.clear();
+        self.bracket_pairs.clear();
+    }
+
     /// 测试用：括号标尺在当前视口的竖线段 `(x, y_rel, h)`（文本区本地坐标）。
     pub(crate) fn test_bracket_guide_segments(
         &self,
@@ -1605,53 +1627,9 @@ impl CodeEditor {
     /// 行 `i` 是候选起点 ⟺ 其后的首个非空行缩进更深（该行将藏起一个块）；块结束 = 首个
     /// 缩进回退 `/` 同级闭记号（`}` 等）行。与 [`Self::fold_block_end`] 同口径，
     /// 供 gutter 默认指示器与点击/快捷键折叠使用。
+    /// 委托给纯函数 [`crate::editor::fold::scan_fold_candidates`]（语义逐位一致）。
     fn scan_fold_candidates(&self) -> Vec<Fold> {
-        let n = self.row_count;
-        if n <= 1 {
-            return Vec::new();
-        }
-        let mut out: Vec<Fold> = Vec::new();
-        // 栈：挂起的块 `(start, indent)`。pending 记录上一非空行；下次看到更深行才入栈。
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        let mut pending: Option<(usize, usize)> = None;
-        for r in 0..n {
-            let line = self.buffer.line_text(r);
-            let trimmed = line.trim_start();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let indent = leading_ws_len(line.as_ref());
-            let closing = matches!(
-                trimmed.chars().next(),
-                Some('}') | Some(')') | Some(']') | Some('#') | Some('`')
-            );
-            if let Some((ps, pi)) = pending {
-                // 上一行是块起点 ⟺ 当前行缩进更深。
-                if indent > pi {
-                    stack.push((ps, pi));
-                }
-                // 关闭缩进 ≥ 当前行的块（缩进回退或同级闭记号）。
-                while let Some(&(bs, bi)) = stack.last() {
-                    if indent < bi || (indent == bi && closing) {
-                        if r >= bs + 2 {
-                            out.push(Fold { start: bs, end: r });
-                        }
-                        stack.pop();
-                        continue;
-                    }
-                    break;
-                }
-            }
-            pending = Some((r, indent));
-        }
-        // EOF：关闭仍开着的块（延伸到最后一行）。
-        let end = n;
-        while let Some((bs, _bi)) = stack.pop() {
-            if end >= bs + 2 {
-                out.push(Fold { start: bs, end });
-            }
-        }
-        out
+        crate::editor::fold::scan_fold_candidates(|r| self.buffer.line_text(r), self.row_count)
     }
 
     /// 重扫折叠候选：≤ 阈值的整篇扫，超大文档清空（改为按需折叠）。
@@ -1659,21 +1637,6 @@ impl CodeEditor {
         if self.row_count > FOLD_CANDIDATE_FULL_MAX_LINES {
             self.fold_candidates.clear();
         } else {
-            self.fold_candidates = self.scan_fold_candidates();
-        }
-    }
-
-    /// 编辑后按需重扫候选：行数变了，或编辑跨度触及某候选的边界（start−1..=end）才重扫。
-    fn recompute_candidates_if_dirty(&mut self, prev_rows: usize, line_a: usize, line_b: usize) {
-        if self.row_count != prev_rows {
-            self.recompute_fold_candidates();
-            return;
-        }
-        let touches = self.fold_candidates.iter().any(|f| {
-            let lo = f.start.saturating_sub(1);
-            line_b >= lo && line_a <= f.end
-        });
-        if touches {
             self.fold_candidates = self.scan_fold_candidates();
         }
     }
@@ -1703,6 +1666,61 @@ impl CodeEditor {
                 self.row_count,
             );
         }
+    }
+
+    /// 在**后台线程**重算折叠候选 + 括号标尺配对并落地（单飞 + 版本号取消）。
+    ///
+    /// - 打开收尾（file_ops 末块落定）与编辑后的下一帧 render 都会调用；
+    /// - 用 Rope O(1) COW 快照在 `background_executor` 上跑纯函数扫描（`fold.rs` /
+    ///   [`scan_bracket_pairs`]），结果回来时若期间又有请求（`scan_epoch` 已变）则
+    ///   丢弃旧结果、用最新快照重跑一轮；
+    /// - 不阻塞 UI 线程：打开 160k 行文档的 ~280ms 全量扫描不再卡界面，输入含括号
+    ///   字符也不再逐键整篇重扫。
+    pub(crate) fn refresh_fold_brackets(&mut self, cx: &mut Context<Self>) {
+        use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES as SCAN_LIMIT;
+        self.scan_epoch = self.scan_epoch.wrapping_add(1);
+        if self.scan_inflight {
+            return; // 已有任务在跑：其末尾会因 epoch 已变而用最新快照重跑一轮。
+        }
+        self.scan_inflight = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let snap = this.update(cx, |this, _| {
+                    (this.scan_epoch, this.row_count, this.buffer.text().clone())
+                });
+                let Ok((epoch, row_count, rope)) = snap else { return };
+                let (folds, brackets) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if row_count > SCAN_LIMIT {
+                            return (Vec::new(), Vec::new());
+                        }
+                        let line = |r: usize| crate::editor::buffer::line_shared(&rope, r);
+                        // `line` 捕获 `&rope`（Copy 闭包）→ 按值传给两个纯函数扫描。
+                        let folds = crate::editor::fold::scan_fold_candidates(line, row_count);
+                        let brackets = scan_bracket_pairs(line, row_count);
+                        (folds, brackets)
+                    })
+                    .await;
+                let done = this
+                    .update(cx, |this, cx| {
+                        if epoch == this.scan_epoch {
+                            this.fold_candidates = folds;
+                            this.bracket_pairs = brackets;
+                            this.scan_inflight = false;
+                            cx.notify();
+                            true
+                        } else {
+                            false // 期间又有编辑/请求 → 用最新快照重跑
+                        }
+                    })
+                    .unwrap_or(true);
+                if done {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// 括号标尺在当前视口内的竖线段：`(x_px, y_rel, h_px)`（文本区本地坐标）。
@@ -2077,7 +2095,7 @@ impl CodeEditor {
             self.last_edit = Some((a, b, a));
         }
         self.selection = Selection::from_range(tx.before.0, tx.before.1);
-        self.resync_list(false);
+        self.resync_list(true);
         self.kick_caret();
         self.reveal_caret();
         cx.emit(EditorEvent::Edited);
@@ -2108,7 +2126,7 @@ impl CodeEditor {
             self.last_edit = Some((a, a, b));
         }
         self.selection = Selection::from_range(tx.after.0, tx.after.1);
-        self.resync_list(false);
+        self.resync_list(true);
         self.kick_caret();
         self.reveal_caret();
         cx.emit(EditorEvent::Edited);
@@ -2340,6 +2358,12 @@ impl Render for CodeEditor {
         }
 
         self.refresh_metrics(window, cx);
+        // 编辑后待刷新的折叠候选/括号配对：下一帧在这里挂起**后台**刷新
+        // （替代原「输入含括号字符即同步整篇重扫」的卡顿路径；单飞 + 版本号取消）。
+        if self.scan_dirty_edit {
+            self.scan_dirty_edit = false;
+            self.refresh_fold_brackets(cx);
+        }
         // 每个 render 把固定窗口对齐到用户目标（desired_scroll）：滚动条拖动只写
         // desired、由这里落窗口；滚轮/键盘/跳转的 scroll_to_px 已同步，此处为幂等兜底。
         self.apply_desired_to_window();
