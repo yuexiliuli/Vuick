@@ -42,4 +42,4 @@ pub const BRACKET_GUIDE_CLOSE_TAIL_LINES: f32 = 0.4;
 /// 竖线**顶部**从首覆盖行（开行下一行）顶部向下缩进的行高系数：0 = 紧贴开行
 /// （默认）；调大 → 顶部留白（开行与竖线起点间距）增大。与
 /// [`BRACKET_GUIDE_CLOSE_TAIL_LINES`] 配套微调上下观感。
-pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.0;
+pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.3;

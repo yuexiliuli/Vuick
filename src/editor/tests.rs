@@ -883,7 +883,11 @@ fn bracket_guides_detected_and_rendered(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
-    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**内约半行**（贴 `}` 字形）。
+    use crate::config::layout::{
+        BRACKET_GUIDE_CLOSE_TAIL_LINES as TAIL, BRACKET_GUIDE_OPEN_HEAD_LINES as HEAD,
+    };
+    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**内约半行**（贴 `}` 字形），
+    // 端点微调一律按 config 常量算期望（用户调 HEAD/TAIL 后不打红）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
@@ -894,23 +898,29 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, harea_w, view_h)
     });
-    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行) 底端再伸入 0.4 行高。
+    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行) 底端再伸 TAIL、顶部缩 HEAD。
     assert_eq!(segs.len(), 3, "三对跨行花括号 → 三条竖线");
-    // 外层 impl 块：x≈0cw、y=1lh 起、高 5.4lh（行 1..5 + 0.4 行尾巴）。
+    // 外层 impl 块：x≈0cw，y=(1+HEAD)lh 起、高 (5−HEAD+TAIL)lh（行 1..5 + 尾巴）。
     let impl_guide = segs
         .iter()
-        .find(|(x, y, h)| (*y - 1.0 * lh).abs() < 0.5 && (*h - 5.4 * lh).abs() < 0.5)
-        .expect("应有 impl 块竖线 (y=1lh, h=5.4lh)");
+        .find(|(x, y, h)| {
+            (*y - (1.0 + HEAD) * lh).abs() < 0.5
+                && (*h - (5.0 - HEAD + TAIL) * lh).abs() < 0.5
+        })
+        .expect("应有 impl 块竖线");
     assert!(
         (impl_guide.0 - 0.0 * cw).abs() < 1.0,
         "外层竖线应在块首列 0×字宽，实际 {}",
         impl_guide.0
     );
-    // Self 块：x≈8cw、y=3lh 起、高 1.4lh（行 3 + 0.4 行尾巴）。
+    // Self 块：x≈8cw，y=(3+HEAD)lh 起、高 (1−HEAD+TAIL)lh（行 3 + 尾巴）。
     let self_guide = segs
         .iter()
-        .find(|(_, y, h)| (*y - 3.0 * lh).abs() < 0.5 && (*h - 1.4 * lh).abs() < 0.5)
-        .expect("应有 Self 块竖线 (y=3lh, h=1.4lh)");
+        .find(|(_, y, h)| {
+            (*y - (3.0 + HEAD) * lh).abs() < 0.5
+                && (*h - (1.0 - HEAD + TAIL) * lh).abs() < 0.5
+        })
+        .expect("应有 Self 块竖线");
     assert!(
         (self_guide.0 - 8.0 * cw).abs() < 1.0,
         "内层竖线应在块首列 8×字宽，实际 {}",
@@ -920,6 +930,9 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
+    use crate::config::layout::{
+        BRACKET_GUIDE_CLOSE_TAIL_LINES as TAIL, BRACKET_GUIDE_OPEN_HEAD_LINES as HEAD,
+    };
     // 同列（缩进 0）嵌套的两个块：原会画两条重叠竖线（视觉加粗/变色），合并成一根。
     let text = "fn a() {\n{\n    x();\n}\n}";
     let (host, cx) = open(cx, text);
@@ -929,14 +942,56 @@ fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
     });
-    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)，尾端再伸 0.4 行高。
+    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)，端点半行微调。
     assert_eq!(segs.len(), 1, "同列重叠竖线应合并为一根");
     assert!(
-        (segs[0].1 - 1.0 * lh).abs() < 0.5 && (segs[0].2 - 3.4 * lh).abs() < 0.5,
-        "合并段应覆盖行 1..3 + 0.4 行（实际 y={} h={}）",
+        (segs[0].1 - (1.0 + HEAD) * lh).abs() < 0.5
+            && (segs[0].2 - (3.0 - HEAD + TAIL) * lh).abs() < 0.5,
+        "合并段应覆盖行 1..3 + 端点半行（实际 y={} h={}）",
         segs[0].1,
         segs[0].2
     );
+}
+
+#[gpui::test]
+fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
+    // 语义（用户确认）：标尺不可点选；点体内某行 → 点亮该行所属**最内层**括号块竖线；
+    // 点非块内行（如顶层）→ 清除。命中断言：行 3 ∈ Self 块 [2,4)、行 2 = 开行 → 外层。
+    let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}\nfn other() {}";
+    let (host, mut cx) = open(cx, text);
+    // 口径断言（不依赖鼠标坐标）。
+    let (case, case2, case7) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        (
+            ed.test_guide_for_logical_row(3),
+            ed.test_guide_for_logical_row(2),
+            ed.test_guide_for_logical_row(7),
+        )
+    });
+    assert_eq!(case, Some(2), "行 3 ∈ Self 块 [2,4) → 点亮 Self 开行 2");
+    assert_eq!(case2, Some(1), "行 2 = Self 开行（非块内）→ 归外层 fn 块");
+    assert_eq!(case7, None, "行 7 = 顶层 fn 行 → 无命中");
+    let (lh, gutter) = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx).test_metrics();
+        (ed.1.max(1.), ed.2)
+    });
+    let mods = Modifiers::default();
+    // 点体内（行 3 中部，x 取 gutter+10px → 文本区）。
+    let y = px(lh * 3.5);
+    let x = px(gutter + 10.);
+    cx.simulate_mouse_move(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y), MouseButton::Left, mods);
+    // 点亮 Self 块。
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
+    assert_eq!(lit, Some(2), "点行 3 应点亮 Self 块（open_line=2）");
+    // 点顶层行 7 → 清除。
+    let y7 = px(lh * 7.5);
+    cx.simulate_mouse_move(point(x, y7), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x, y7), MouseButton::Left, mods);
+    cx.simulate_mouse_up(point(x, y7), MouseButton::Left, mods);
+    let lit = cx.update(|_, cx| host.read(cx).ed.read(cx).test_active_guide());
+    assert_eq!(lit, None, "点顶层行 7 应清除点亮");
 }
 
 #[gpui::test]

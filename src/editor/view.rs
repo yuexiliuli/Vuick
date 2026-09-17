@@ -231,6 +231,12 @@ pub struct CodeEditor {
     ruler_color: Hsla,
     /// 括号标尺竖线颜色（更淡的次要前景）。
     guide_color: Hsla,
+    /// 点击代码区域点亮的最内层括号块（`open_line`；`None` = 未点亮/已清除）。
+    /// 编辑（`apply_edit_synced`）与整篇替换（`reset_document`）会复位为 `None`。
+    active_guide_open: Option<usize>,
+    /// 点亮竖线颜色：硬编码强调蓝 `rgb(0x0078d4).opacity(0.9)`（`refresh_metrics` 设置；
+    /// **勿抽进 config**——用户已明确回滚过颜色抽取）。
+    active_guide_color: Hsla,
 }
 
 impl CodeEditor {
@@ -294,6 +300,8 @@ impl CodeEditor {
             scan_dirty_edit: false,
             ruler_color: rgb(0x000000).into(),
             guide_color: rgb(0x000000).into(),
+            active_guide_open: None,
+            active_guide_color: rgb(0x000000).into(),
         }
     }
 
@@ -362,6 +370,8 @@ impl CodeEditor {
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
+        // 整篇替换：点亮标尺清除（内容已变，旧“所属块”提示无意义）。
+        self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
         self.desired_scroll.set(0.);
         // 整篇替换：折叠视图投影一并清空（文本结构已变）。
@@ -619,6 +629,8 @@ impl CodeEditor {
         self.ruler_color = colors.muted_foreground.opacity(0.55);
         // 括号标尺竖线：更淡，纯视觉参考不干扰阅读。
         self.guide_color = colors.muted_foreground.opacity(0.4);
+        // 点亮竖线（guide click highlight）：硬编码强调蓝（用户口径，勿抽 config）。
+        self.active_guide_color = rgb(0x0078d4).opacity(0.9).into();
         // 光标不能用 colors.accent：本应用 Light 主题的 accent=l≈0.961（#f5f5f5），
         // 白底上画白光标=看不见（用户反馈“点击无闪烁光标”就是这个）。用前景墨色，
         // 明/暗主题下都一定可见。
@@ -676,6 +688,8 @@ impl CodeEditor {
     /// 无关，无需 splice——只更新 `row_count`；后续 `reveal_caret` 会按新光标行
     /// 重新定位窗口。
     fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
+        // 编辑会改变块结构/跨度：清除熄灭点亮标尺（语义见 guide click highlight）。
+        self.active_guide_open = None;
         // 先取被替换区间的**编辑前**行跨度（折叠区间同步需要，编辑后行号已变）。
         let prev_rows = self.row_count;
         let line_a = self.buffer.line_of_offset(range.start);
@@ -1278,6 +1292,16 @@ impl CodeEditor {
         self.bracket_guide_segments(top_vis, off, lh, harea_w, view_h)
     }
 
+    /// 测试用：当前点亮的标尺块（`open_line`，`None` = 未点亮）。
+    pub(crate) fn test_active_guide(&self) -> Option<usize> {
+        self.active_guide_open
+    }
+
+    /// 测试用：逻辑行 `logical` 应命中的最内层括号块（`open_line`）。
+    pub(crate) fn test_guide_for_logical_row(&self, logical: usize) -> Option<usize> {
+        self.guide_pair_for_logical_row(logical)
+    }
+
     /// 测试用：`line` 是否起始一个可折叠候选/激活折叠（gutter 指示器口径）。
     pub(crate) fn test_has_fold_or_candidate(&self, line: usize) -> bool {
         self.has_fold_or_candidate(line)
@@ -1417,6 +1441,10 @@ impl CodeEditor {
             }
         }
         let offset = self.offset_at_point(local, window);
+        // 标尺点亮：代码区点击 → 该行所属最内层括号块的标尺竖线点亮；非块内行 → 清除。
+        // （此处已越过 gutter 分支，标尺本身不可点选，只响应代码区。）
+        let caret_row = self.buffer.line_of_offset(offset);
+        self.active_guide_open = self.guide_pair_for_logical_row(caret_row);
         if event.modifiers.shift {
             self.selection.set_head(offset);
             self.selection.remember_column(self.buffer.char_column(offset));
@@ -1734,14 +1762,27 @@ impl CodeEditor {
     /// **同列区间合并**：同一列上重叠/相邻的竖线合并成一根连续线——否则两条 1px
     /// 线在同像素叠加会显得更暗/更粗（同列嵌套块会命中此情况）。
     /// `top_vis`/`off` = `abs_scroll_top()`；`lh` 行高；`harea_w` 文本区宽；`view_h` 视口高。
-    fn bracket_guide_segments(
+    /// 光标逻辑行 L 落在配对跨度 `(open_line, close_line]` 内即命中（点击点亮用）。
+    /// 多对命中时取**最深**（`open_line` 最大的那个）——即光标所在的最内层块。
+    fn guide_pair_for_logical_row(&self, logical: usize) -> Option<usize> {
+        self.bracket_pairs
+            .iter()
+            .filter(|p| p.open_line < logical && logical <= p.close_line)
+            .map(|p| p.open_line)
+            .max()
+    }
+
+    /// 同 [`Self::bracket_guide_segments`]，但每个合并段额外带 `bool` = 该段是否命中
+    /// `active`（点亮标尺的 `open_line`）。合并同列样本段时，任一样本命中则整段点亮。
+    fn bracket_guide_segments_flagged(
         &self,
         top_vis: usize,
         off: f32,
         lh: f32,
         harea_w: f32,
         view_h: f32,
-    ) -> Vec<(f32, f32, f32)> {
+        active: Option<usize>,
+    ) -> Vec<(f32, f32, f32, bool)> {
         if self.bracket_pairs.is_empty() {
             return Vec::new();
         }
@@ -1752,8 +1793,8 @@ impl CodeEditor {
         let cw = self.char_width.as_f32().max(1.);
         let hscroll = self.hscroll_px();
         let bottom_vis = top_vis.saturating_add(((view_h / lh).ceil() as usize) + 1);
-        // (x, 视觉顶行, 视觉底行**开区间**) —— 先整列收集，再合并同列重叠/相邻段。
-        let mut intervals: Vec<(f32, usize, usize)> = Vec::new();
+        // (x, 视觉顶行, 视觉底行**开区间**, 是否点亮) —— 先整列收集，再合并同列重叠/相邻段。
+        let mut intervals: Vec<(f32, usize, usize, bool)> = Vec::new();
         for p in &self.bracket_pairs {
             if p.open_line >= p.close_line {
                 continue; // 过期（编辑后未及时重扫）的配对；重扫会清理。
@@ -1777,6 +1818,7 @@ impl CodeEditor {
                 x.round().max(0.0),
                 seg_top.max(top_vis),
                 seg_bot.min(bottom_vis).saturating_add(1),
+                active == Some(p.open_line),
             ));
         }
         // 按列排序，合并同列重叠/相邻区间。
@@ -1785,33 +1827,51 @@ impl CodeEditor {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.1.cmp(&b.1))
         });
-        let mut out: Vec<(f32, f32, f32)> = Vec::new();
-        let mut cur: Option<(f32, usize, usize)> = None;
-        for (x, t, b) in intervals {
+        let mut out: Vec<(f32, f32, f32, bool)> = Vec::new();
+        let mut cur: Option<(f32, usize, usize, bool)> = None;
+        for (x, t, b, hl) in intervals {
             match &mut cur {
-                Some((cx, ct, cb)) if *cx == x && t <= *cb => {
+                Some((cx, ct, cb, ca)) if *cx == x && t <= *cb => {
                     *cb = (*cb).max(b);
+                    *ca |= hl;
                 }
                 _ => {
-                    if let Some((cx, ct, cb)) = cur.take() {
+                    if let Some((cx, ct, cb, ca)) = cur.take() {
                         out.push((
                             cx,
                             (ct as f32 - top_vis as f32) * lh - off + head,
                             (cb - ct) as f32 * lh - head + tail,
+                            ca,
                         ));
                     }
-                    cur = Some((x, t, b));
+                    cur = Some((x, t, b, hl));
                 }
             }
         }
-        if let Some((cx, ct, cb)) = cur {
+        if let Some((cx, ct, cb, ca)) = cur {
             out.push((
                 cx,
                 (ct as f32 - top_vis as f32) * lh - off + head,
                 (cb - ct) as f32 * lh - head + tail,
+                ca,
             ));
         }
         out
+    }
+
+    fn bracket_guide_segments(
+        &self,
+        top_vis: usize,
+        off: f32,
+        lh: f32,
+        harea_w: f32,
+        view_h: f32,
+    ) -> Vec<(f32, f32, f32)> {
+        // 未点亮（active=None）→ 与旧实现语义一致（3 元组）。
+        self.bracket_guide_segments_flagged(top_vis, off, lh, harea_w, view_h, None)
+            .into_iter()
+            .map(|(x, y, h, _)| (x, y, h))
+            .collect()
     }
 
     fn arrow(&mut self, select: bool, dc: isize, dr: isize, cx: &mut Context<Self>) {
@@ -2585,9 +2645,13 @@ impl Render for CodeEditor {
 
         // 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
         // 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
-        // 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。
-        let guide_segments =
-            self.bracket_guide_segments(vis_top, _vis_off, lh, harea_w, view_h);
+        // 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
+        // 最内层块竖线（`active_guide_open`）用强调蓝加粗 2px。
+        let guide_segments = self.bracket_guide_segments_flagged(
+            vis_top, _vis_off, lh, harea_w, view_h, self.active_guide_open,
+        );
+        let guide_color = self.guide_color;
+        let active_guide_color = self.active_guide_color;
         let guide_layer = div()
             .id("ce-bracket-guides")
             .debug_selector(|| "ce-bracket-guides".into())
@@ -2597,15 +2661,15 @@ impl Render for CodeEditor {
             .left(self.gutter_width_px)
             .right(px(0.))
             .overflow_hidden()
-            .children(guide_segments.into_iter().map(|(x, y, h)| {
+            .children(guide_segments.into_iter().map(|(x, y, h, active)| {
                 div()
                     .absolute()
                     .debug_selector(|| "ce-bracket-guide".into())
                     .left(px(x))
                     .top(px(y))
-                    .w(px(1.))
+                    .w(px(if active { 2.0 } else { 1.0 }))
                     .h(px(h.max(0.)))
-                    .bg(self.guide_color)
+                    .bg(if active { active_guide_color } else { guide_color })
             }));
 
         let core = div()
