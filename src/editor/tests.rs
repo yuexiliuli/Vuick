@@ -883,7 +883,7 @@ fn bracket_guides_detected_and_rendered(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
-    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**之前**。
+    // 与用户样例同构。注意 spans：竖线从开行**之后**画到闭行**内约半行**（贴 `}` 字形）。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
@@ -894,23 +894,23 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, harea_w, view_h)
     });
-    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行)。
+    // 三条竖线：x = 块首行缩进列 0/4/8；跨度 [开行+1, 闭行) 底端再伸入 0.4 行高。
     assert_eq!(segs.len(), 3, "三对跨行花括号 → 三条竖线");
-    // 外层 impl 块：x≈0cw、y=1lh 起、高 5lh（行 1..5，闭行 6 前结束）。
+    // 外层 impl 块：x≈0cw、y=1lh 起、高 5.4lh（行 1..5 + 0.4 行尾巴）。
     let impl_guide = segs
         .iter()
-        .find(|(x, y, h)| (*y - 1.0 * lh).abs() < 0.5 && (*h - 5.0 * lh).abs() < 0.5)
-        .expect("应有 impl 块竖线 (y=1lh, h=5lh)");
+        .find(|(x, y, h)| (*y - 1.0 * lh).abs() < 0.5 && (*h - 5.4 * lh).abs() < 0.5)
+        .expect("应有 impl 块竖线 (y=1lh, h=5.4lh)");
     assert!(
         (impl_guide.0 - 0.0 * cw).abs() < 1.0,
         "外层竖线应在块首列 0×字宽，实际 {}",
         impl_guide.0
     );
-    // Self 块：x≈8cw、y=3lh 起、高 1lh（仅行 3）。
+    // Self 块：x≈8cw、y=3lh 起、高 1.4lh（行 3 + 0.4 行尾巴）。
     let self_guide = segs
         .iter()
-        .find(|(_, y, h)| (*y - 3.0 * lh).abs() < 0.5 && (*h - 1.0 * lh).abs() < 0.5)
-        .expect("应有 Self 块竖线 (y=3lh, h=1lh)");
+        .find(|(_, y, h)| (*y - 3.0 * lh).abs() < 0.5 && (*h - 1.4 * lh).abs() < 0.5)
+        .expect("应有 Self 块竖线 (y=3lh, h=1.4lh)");
     assert!(
         (self_guide.0 - 8.0 * cw).abs() < 1.0,
         "内层竖线应在块首列 8×字宽，实际 {}",
@@ -929,11 +929,11 @@ fn bracket_guide_overlapping_same_column_merged(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         ed.read(cx).test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
     });
-    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)。
+    // 两根（fn a 的 [1,4) 与内层 { 的 [2,3)）同列 → 合并成一根 [1,4)，尾端再伸 0.4 行高。
     assert_eq!(segs.len(), 1, "同列重叠竖线应合并为一根");
     assert!(
-        (segs[0].1 - 1.0 * lh).abs() < 0.5 && (segs[0].2 - 3.0 * lh).abs() < 0.5,
-        "合并段应覆盖行 1..3（实际 y={} h={}）",
+        (segs[0].1 - 1.0 * lh).abs() < 0.5 && (segs[0].2 - 3.4 * lh).abs() < 0.5,
+        "合并段应覆盖行 1..3 + 0.4 行（实际 y={} h={}）",
         segs[0].1,
         segs[0].2
     );

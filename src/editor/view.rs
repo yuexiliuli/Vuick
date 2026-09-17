@@ -44,7 +44,9 @@ use gpui_component::input::{
     SelectToStart, SelectToStartOfLine, Undo,
 };
 
-use crate::config::layout::EDITOR_RULER_COLUMNS;
+use crate::config::layout::{
+    BRACKET_GUIDE_CLOSE_TAIL_LINES, BRACKET_GUIDE_OPEN_HEAD_LINES, EDITOR_RULER_COLUMNS,
+};
 use crate::config::limits::EDITOR_VSCROLL_BOTTOM_EXTRA_LINES;
 use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES;
 use crate::editor::fold::{scan_bracket_pairs, BracketPair, Fold, FoldMap};
@@ -1725,7 +1727,9 @@ impl CodeEditor {
 
     /// 括号标尺在当前视口内的竖线段：`(x_px, y_rel, h_px)`（文本区本地坐标）。
     /// 每个跨行括号配对一根竖线，位于**块首行缩进列**（`guide_units` × 字宽，随横向
-    /// 滚动），从开行**之后**画到闭行**之前**（不占开/闭行 → 不压 `{`/`}` 字形）。
+    /// 滚动），从开行**之后**画到闭行**内约 0.4 行深**（可配）——`}` 字形位于闭行
+    /// 中部，竖线底端伸入闭行以贴近 `}` 字形顶端、与顶部距离一致（不画满整行，
+    /// 避免穿过 `}`）。端点微调常量见 `crate::config::layout`。
     ///
     /// **同列区间合并**：同一列上重叠/相邻的竖线合并成一根连续线——否则两条 1px
     /// 线在同像素叠加会显得更暗/更粗（同列嵌套块会命中此情况）。
@@ -1741,6 +1745,10 @@ impl CodeEditor {
         if self.bracket_pairs.is_empty() {
             return Vec::new();
         }
+        // 竖线端点微调（× 行高，见 config/layout.rs）：底部伸入闭行贴 `}` 字形，
+        // 顶部从首覆盖行向下缩进控制留白。均为可配置行高系数。
+        let head = BRACKET_GUIDE_OPEN_HEAD_LINES * lh;
+        let tail = BRACKET_GUIDE_CLOSE_TAIL_LINES * lh;
         let cw = self.char_width.as_f32().max(1.);
         let hscroll = self.hscroll_px();
         let bottom_vis = top_vis.saturating_add(((view_h / lh).ceil() as usize) + 1);
@@ -1788,8 +1796,8 @@ impl CodeEditor {
                     if let Some((cx, ct, cb)) = cur.take() {
                         out.push((
                             cx,
-                            (ct as f32 - top_vis as f32) * lh - off,
-                            (cb - ct) as f32 * lh,
+                            (ct as f32 - top_vis as f32) * lh - off + head,
+                            (cb - ct) as f32 * lh - head + tail,
                         ));
                     }
                     cur = Some((x, t, b));
@@ -1799,8 +1807,8 @@ impl CodeEditor {
         if let Some((cx, ct, cb)) = cur {
             out.push((
                 cx,
-                (ct as f32 - top_vis as f32) * lh - off,
-                (cb - ct) as f32 * lh,
+                (ct as f32 - top_vis as f32) * lh - off + head,
+                (cb - ct) as f32 * lh - head + tail,
             ));
         }
         out
