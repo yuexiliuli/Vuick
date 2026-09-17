@@ -32,10 +32,14 @@ use std::rc::Rc;
 
 use std::cell::Cell;
 
+use std::cell::RefCell;
+
 use gpui::{
-    div, list, point, px, rgba, App, Context, Hsla, InteractiveElement, IntoElement,
-    ListAlignment, ListOffset, ListState, ParentElement, Render, ScrollDelta, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window,
+    anchored, deferred, div, list, point, px, rgba, App, Bounds, ClipboardItem, Context, FocusHandle,
+    Hsla, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
+    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Window,
 };
 use gpui_component::input::Rope;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode, ScrollableElement as _};
@@ -47,14 +51,58 @@ use crate::config::limits::{
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parser::{
-    parse_block_window, parse_block_window_rope, parse_to_rows, rows_memory_estimate, scan_blocks,
-    BlockIndex, BlockMeta, Row, RowKind, RowPayload,
+    citation_index_from_rows, parse_block_window, parse_block_window_rope, parse_to_rows,
+    rows_memory_estimate, scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row,
+    RowKind, RowPayload,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
 use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
 use row::render_row;
 use style::StyleParams;
+
+/// EPUB 脚注悬浮命中：一行内某个 `[n]` 标记在**上一帧**的画面矩形 + 对应注释正文。
+/// 由 [`row::NoteMarkers`] 在 paint 时写入共享表（窗口坐标）；鼠标移动时视图据此判 hover，
+/// 点击时据此做「文内 ↔ 末尾定义」双向跳转。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct NoteHit {
+    /// 全局块下标（渲染行标识；同一行每次重绘覆盖旧条目）。
+    pub(crate) row_ix: usize,
+    /// 注记号。
+    pub(crate) n: usize,
+    /// 是否末尾定义标记（`[!n]`）；false = 文内引用 `[^n]`。
+    pub(crate) is_def: bool,
+    /// 标记矩形（窗口坐标，上一帧）。
+    pub(crate) bounds: Bounds<Pixels>,
+}
+
+/// EPUB 注记渲染的共享上下文：注释文本表 + 上帧命中矩形表。
+#[derive(Clone, Default)]
+pub(crate) struct NoteCtx {
+    /// 注记号 → 注释正文（`set_epub` 注入；空 = 非 EPUB）。
+    pub(crate) notes: std::collections::BTreeMap<usize, SharedString>,
+    /// 命中矩形共享表（row.rs 写、view 读）。
+    pub(crate) hits: Rc<RefCell<Vec<NoteHit>>>,
+}
+
+/// 最近一帧某个可见文本行的字形命中数据：供「鼠标点选字符」反查。
+#[derive(Clone)]
+pub(crate) struct TextHit {
+    /// 全局块下标。
+    pub(crate) row_ix: usize,
+    /// 显示文本（选中复制用）。
+    pub(crate) text: gpui::SharedString,
+    /// 文本布局（request_layout/prepaint 后已填；Rc 克隆共享，命中时可直接反查）。
+    pub(crate) layout: gpui::TextLayout,
+    /// 该行在窗口坐标中的起点。
+    pub(crate) origin: gpui::Point<gpui::Pixels>,
+}
+
+/// 文本命中共享表（row.rs paint 写、view 鼠标处理器读）。
+#[derive(Clone, Default)]
+pub(crate) struct TextCtx {
+    pub(crate) hits: Rc<RefCell<Vec<TextHit>>>,
+}
 
 /// 窗口模式代码块语法高亮的小型 LRU：键 = **全局块下标** → `Rc<CodeLineRuns>`。
 ///
@@ -228,6 +276,34 @@ pub struct MarkdownPreview {
     highlight_search: Option<(usize, String)>,
     /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮，避免旧定时器误清新高亮。
     highlight_seq: u64,
+    /// EPUB 阅读排版模式：标题居中、正文首行缩进 2 字符、注记悬浮卡片（由 [`Self::set_epub`] 开）。
+    epub_mode: bool,
+    /// EPUB 注释共享上下文（注记悬浮卡片用；非 EPUB 为空表）。
+    note_ctx: Rc<NoteCtx>,
+    /// 当前悬浮的引用/注记标记（`Some(hit)` 时渲染详情卡片）；鼠标离开标记矩形即清。
+    /// 存整条 [`NoteHit`]（含 is_def / bounds）而非只有注记号：卡片既能定位到当前
+    /// 悬浮的标记，又能在 EPUB 注记表缺失时按 `cit.details` 取引用详情正文。
+    hover_hit: Option<NoteHit>,
+    /// 引用「文内 ↔ 末尾定义」双向跳转索引（重解析时作废）。窗口模式在首次交互时
+    /// **懒重扫**整篇源码（见 [`Self::ensure_citations`]），不打字同步热路径。
+    cit: CitationIndex,
+    /// 源码代（每次 [`Self::set_source_with_index`] 递增）；`cit` 落后于它即需重建。
+    cit_gen: u64,
+    /// `cit` 实际构建到的源码代。
+    cit_built_gen: u64,
+    /// 点击跳转后要加亮的 (渲染行, 注记号, 是否定义)；滚动定位后由 render 给该行的
+    /// 对应 `[n]` 标记加亮，[`HIGHLIGHT_MS`] 后自动消失。
+    marker_hl: Option<(usize, usize, bool)>,
+    /// 加亮代序列号：每次发起/清除跳转加亮 +1，定时器只清除同代（防旧定时器误清新亮）。
+    marker_hl_seq: u64,
+    /// 文本命中表（最近一帧可见行）：鼠标点选字符用。
+    text_ctx: Rc<TextCtx>,
+    /// 键盘焦点句柄（鼠标点选 + Ctrl+C 复制需要预览获得焦点）。
+    focus_handle: FocusHandle,
+    /// 文本选择（对数序，`((起始行, 起始字节), (结束行, 结束字节))`）；None = 无选择。
+    selection: Option<((usize, usize), (usize, usize))>,
+    /// 拖拽起点（行, 字节）；拖拽中 = Some，落下后 = None（保留 selection）。
+    select_anchor: Option<(usize, usize)>,
     /// 统一行高提示（px）：宽度感知的平均行高估算，用于 `ListState::with_uniform_item_height`，
     /// 让竖滚动条量程从头一开始就接近真实总高（不用一次性排版整篇）。
     est_hint: f32,
@@ -272,7 +348,7 @@ pub struct MarkdownPreview {
 }
 
 impl MarkdownPreview {
-    pub fn new(_cx: &mut App) -> Self {
+    pub fn new(cx: &mut App) -> Self {
         let list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX)).measure_all();
         Self {
             rows: Rc::new(Vec::new()),
@@ -293,6 +369,18 @@ impl MarkdownPreview {
             table_scroll: Default::default(),
             highlight_search: None,
             highlight_seq: 0,
+            epub_mode: false,
+            note_ctx: Rc::new(NoteCtx::default()),
+            hover_hit: None,
+            cit: CitationIndex::default(),
+            cit_gen: 0,
+            cit_built_gen: 0,
+            marker_hl: None,
+            marker_hl_seq: 0,
+            text_ctx: Rc::new(TextCtx::default()),
+            focus_handle: cx.focus_handle(),
+            selection: None,
+            select_anchor: None,
             est_hint: 0.0,
             est_hint_width: -1.0,
             last_render_width: -1.0,
@@ -440,6 +528,273 @@ impl MarkdownPreview {
         self.wrap
     }
 
+    /// 开启/关闭 EPUB 阅读排版并注入脚注表（`load_epub` 调用）。
+    /// 开启后：标题居中、正文首行缩进 2 字符、`[n]` 注记悬停显示卡片。
+    pub fn set_epub(&mut self, on: bool, notes: std::collections::BTreeMap<usize, String>, cx: &mut App) {
+        self.epub_mode = on;
+        // 换新注记上下文（命中表也随之清空重来）。
+        self.note_ctx = Rc::new(NoteCtx {
+            notes: notes
+                .into_iter()
+                .map(|(k, v)| (k, SharedString::from(v)))
+                .collect(),
+            hits: Rc::new(RefCell::new(Vec::new())),
+        });
+        self.hover_hit = None;
+        self.remeasure_dimensions(cx);
+        self.list_state.remeasure();
+        self.invalidate_height_hint();
+    }
+
+    /// 清空上帧注记/文本命中与悬浮状态（换源 / 换滚动位置 / 关 EPUB 排版时调用）。
+    fn clear_note_state(&mut self) {
+        self.note_ctx.hits.borrow_mut().clear();
+        self.text_ctx.hits.borrow_mut().clear();
+        self.hover_hit = None;
+    }
+
+    /// 鼠标按下：聚焦预览并开启文本点选（记录拖拽锚点 = 命中的 (行, 字符)）。
+    /// 点空白处清除已有选择。**点击引用标记 `[n]` 优先**：做文内 ↔ 末尾定义双向跳转，
+    /// 不进入文本点选（标记即链接）。
+    fn on_preview_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_handle.focus(window, cx);
+        if event.button == MouseButton::Left {
+            if let Some(hit) = self.note_hit_at(event.position) {
+                self.navigate_marker(hit, cx);
+                return;
+            }
+        }
+        let pos = event.position;
+        match self.hit_test(pos) {
+            Some((row, byte)) => {
+                self.select_anchor = Some((row, byte));
+                self.selection = Some(((row, byte), (row, byte)));
+            }
+            None => {
+                self.select_anchor = None;
+                self.selection = None;
+            }
+        }
+        cx.notify();
+    }
+
+    /// 命中引用标记（上一帧注记矩形共享表），返回该标记的 [`NoteHit`]。
+    fn note_hit_at(&self, pos: Point<Pixels>) -> Option<NoteHit> {
+        self.note_ctx
+            .hits
+            .borrow()
+            .iter()
+            .find(|h| h.bounds.contains(&pos))
+            .copied()
+    }
+
+    /// 确保引用跳转索引就绪（懒建：只在源码代变化后重建；小文档走行集，大文档全源逐块扫描）。
+    fn ensure_citations(&mut self) {
+        if self.cit_built_gen == self.cit_gen {
+            return;
+        }
+        self.cit = match &self.index {
+            // 窗口模式：整篇源码逐块扫描（懒，仅交互到引用时；不占用打字同步热路径）。
+            Some(_) => {
+                let src = match &self.src_buf {
+                    Some(PreviewSrc::Str(s)) => s.to_string(),
+                    Some(PreviewSrc::Rope(r)) => r.to_string(),
+                    None => String::new(),
+                };
+                scan_citations(&src)
+            }
+            // 小文档：从已解析行集直接取（几乎零成本）。
+            None => citation_index_from_rows(&self.rows),
+        };
+        self.cit_built_gen = self.cit_gen;
+    }
+
+    /// 点击引用标记 `hit` 后跳转对端：
+    /// - 文内引用 `[^n]` → 末尾定义 `[!n]`（引用详情）；
+    /// - 末尾定义 `[!n]` → 文内引用 `[^n]`。
+    ///
+    /// 跳到对端所在渲染行并给该行的 `[n]` 标记加亮；无对端（孤立标记）仅清点选、不跳转。
+    fn navigate_marker(&mut self, hit: NoteHit, cx: &mut Context<Self>) {
+        self.ensure_citations();
+        let target = if hit.is_def {
+            self.cit.refs.get(&hit.n).cloned()
+        } else {
+            self.cit.defs.get(&hit.n).cloned()
+        };
+        let Some((row, _range)) = target else {
+            self.select_anchor = None;
+            self.selection = None;
+            cx.notify();
+            return;
+        };
+        // scroll_to_row 内部已清悬浮/命中（滚动会改变注记矩形）；随后加亮对端标记。
+        self.scroll_to_row(row);
+        self.set_marker_highlight(row, hit.n, !hit.is_def, cx);
+        cx.notify();
+    }
+
+    /// 跳转后给目标行的 `[n]` 标记加亮（`is_def` 指明是定义还是文内引用），
+    /// [`HIGHLIGHT_MS`] 后自动消失（代序号防旧定时器误清）。
+    fn set_marker_highlight(&mut self, row: usize, n: usize, is_def: bool, cx: &mut Context<Self>) {
+        self.marker_hl = Some((row, n, is_def));
+        self.marker_hl_seq = self.marker_hl_seq.wrapping_add(1);
+        let seq = self.marker_hl_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(HIGHLIGHT_MS))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.marker_hl_seq == seq {
+                    view.marker_hl = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 鼠标移动：
+    /// - 按住左键 → 拖拽选择（更新选择区间到当前命中的 (行, 字符)）；
+    /// - 未按住 → 注记悬浮（命中上帧注记矩形 → 显示注释卡片）。
+    fn on_preview_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pos = window.mouse_position();
+        if event.pressed_button == Some(MouseButton::Left) {
+            if let Some(anchor) = self.select_anchor {
+                if let Some(cur) = self.hit_test(pos) {
+                    let (s, e) = if (anchor.0, anchor.1) <= (cur.0, cur.1) {
+                        (anchor, cur)
+                    } else {
+                        (cur, anchor)
+                    };
+                    if self.selection != Some((s, e)) {
+                        self.selection = Some((s, e));
+                        cx.notify();
+                    }
+                }
+            }
+            return;
+        }
+        let found = self.note_hit_at(pos);
+        // 悬浮到标记：确保引用索引就绪（悬浮详情正文走 `cit.details`，非 EPUB 也有）。
+        if found.is_some() {
+            self.ensure_citations();
+        }
+        if found != self.hover_hit {
+            self.hover_hit = found;
+            cx.notify();
+        }
+    }
+
+    /// 鼠标松开：结束拖拽（保留选择区间），不再记录锚点。
+    fn on_preview_mouse_up(
+        &mut self,
+        _: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.select_anchor.is_some() {
+            self.select_anchor = None;
+            cx.notify();
+        }
+    }
+
+    /// Ctrl/Cmd+C：把当前选择复制到剪贴板。
+    fn on_preview_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = event.keystroke.modifiers;
+        if (m.control || m.platform) && !m.alt && !m.shift && event.keystroke.key == "c" {
+            self.copy_selection(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 把当前文本选择复制到剪贴板（供 Ctrl/Cmd+C 与测试调用）。
+    fn copy_selection(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// 鼠标点 → (渲染行, 字符字节偏移)：在最近一帧文本命中表里找包含该点的行，
+    /// 再用该行文本布局反查字符偏移。
+    fn hit_test(&self, pos: Point<Pixels>) -> Option<(usize, usize)> {
+        let hits = self.text_ctx.hits.borrow();
+        for hit in hits.iter() {
+            let origin = hit.origin;
+            let line_h = hit.layout.line_height();
+            let lines = hit.layout.line_layouts();
+            let Some(line) = lines.first() else {
+                continue;
+            };
+            let h = line.size(line_h).height.as_f32();
+            let w = line.width().as_f32();
+            if pos.y.as_f32() >= origin.y.as_f32() - 1.0
+                && pos.y.as_f32() <= origin.y.as_f32() + h + 1.0
+                && pos.x.as_f32() >= origin.x.as_f32() - 1.0
+                && pos.x.as_f32() <= origin.x.as_f32() + w + 1.0
+            {
+                let byte = hit
+                    .layout
+                    .index_for_position(pos)
+                    .unwrap_or(0)
+                    .min(hit.text.len());
+                return Some((hit.row_ix, byte));
+            }
+        }
+        None
+    }
+
+    /// 取第 `ix` 个渲染行的文本（窗口模式只能用已物化窗口行，尽力而为）。
+    fn row_text_at(&self, ix: usize) -> Option<SharedString> {
+        if self.index.is_some() {
+            self.win_rows.get(ix - self.win_lo).map(|r| r.text.clone())
+        } else {
+            self.rows.get(ix).map(|r| r.text.clone())
+        }
+    }
+
+    /// 当前选择的文本（跨行用「行1\n行2…」拼接）；无选择返回 None。
+    fn selected_text(&self) -> Option<String> {
+        let (s, e) = self.selection?;
+        let mut out = String::new();
+        for ix in s.0..=e.0 {
+            let text = self.row_text_at(ix)?;
+            let a = if ix == s.0 { s.1 } else { 0 };
+            let b = if ix == e.0 { e.1 } else { text.len() };
+            let a = a.min(text.len());
+            let b = b.min(text.len());
+            if b > a {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&text[a..b]);
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// 悬浮卡片的显示位置（窗口坐标，位于注记矩形右下方，带边距）。
+    fn note_card_point(&self, hit: &NoteHit) -> Point<Pixels> {
+        point(
+            px(hit.bounds.right().as_f32() + 8.0),
+            px(hit.bounds.top().as_f32() + 4.0),
+        )
+    }
+
     /// 目录条目：(行号, 标题级别, 标题文本)。供侧边栏目录视图使用。
     pub(crate) fn toc_entries(&self) -> &[(usize, u8, String)] {
         &self.toc
@@ -451,6 +806,8 @@ impl MarkdownPreview {
         if ix >= self.item_count() {
             return;
         }
+        // 滚动会改变注记矩形 → 上帧命中失效，先清悬浮。
+        self.clear_note_state();
         if self.index.is_some() {
             self.scroll_to_px(self.px_of_block(ix));
         } else {
@@ -504,7 +861,11 @@ impl MarkdownPreview {
         // 内容变了，旧的跳转高亮随之失效；代码块高亮缓存键依赖块号/内容，一并作废
         // （否则旧源的高亮会按新源的块号被误复用）。
         self.clear_highlight();
+        self.marker_hl = None;
+        self.marker_hl_seq = self.marker_hl_seq.wrapping_add(1);
+        self.cit_gen = self.cit_gen.wrapping_add(1);
         self.code_hl_cache.clear();
+        self.clear_note_state();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
         let prev_scroll = self.list_state.logical_scroll_top();
@@ -801,6 +1162,8 @@ impl MarkdownPreview {
     /// 滚到目标像素（夹到 [0, 总量−视口]）并写入共享 desired；窗口模式重定位窗口，
     /// 小文档直接交给 ListState（保持原行为）。
     fn scroll_to_px(&mut self, target_px: f32) {
+        // 滚动会改变注记矩形 → 上帧命中缓存失效，先清悬浮。
+        self.clear_note_state();
         let view = self.list_state.viewport_bounds().size.height.as_f32();
         let max_px = (self.total_h() - view).max(0.0);
         let tp = target_px.clamp(0.0, max_px);
@@ -1059,6 +1422,12 @@ impl MarkdownPreview {
         self.table_scroll = Default::default();
         self.highlight_search = None;
         self.highlight_seq = self.highlight_seq.wrapping_add(1);
+        self.marker_hl = None;
+        self.marker_hl_seq = self.marker_hl_seq.wrapping_add(1);
+        self.cit = CitationIndex::default();
+        // 代推进：后续 set_source 会再推进并自然失效；空视图置「已构建」防空扫。
+        self.cit_gen = self.cit_gen.wrapping_add(1);
+        self.cit_built_gen = self.cit_gen;
         self.est_hint = 0.0;
         self.est_hint_width = -1.0;
         self.hint_applied = None;
@@ -1490,6 +1859,12 @@ impl Render for MarkdownPreview {
         let win_lo = self.win_lo;
         let win_base = self.win_base;
         let windowed = self.index.is_some();
+        let epub = self.epub_mode;
+        let note_ctx = self.note_ctx.clone();
+        let text_ctx = self.text_ctx.clone();
+        let selection = self.selection;
+        let sel_color = selection_color(cx);
+        let marker_hl = self.marker_hl;
         let content = {
             let p = p.clone();
             let code_scroll = code_scroll;
@@ -1507,15 +1882,51 @@ impl Render for MarkdownPreview {
                     .as_ref()
                     .filter(|(row_ix, _, _)| *row_ix == abs)
                     .map(|(_, range, color)| (range.clone(), *color));
-                if !windowed {
-                    render_row(&rows[abs], &p, wrap, ch, chr, th, search, cx)
+                let row = if !windowed {
+                    rows.get(abs)
                 } else if abs >= win_lo && abs - win_lo < win_rows.len() {
-                    render_row(&win_rows[abs - win_lo], &p, wrap, ch, chr, th, search, cx)
+                    win_rows.get(abs - win_lo)
                 } else {
+                    None
+                };
+                let Some(row) = row else {
                     // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
                     // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
-                    div().size_full().into_any_element()
-                }
+                    return div().size_full().into_any_element();
+                };
+                // 本行在选择区间内 → 截出 (区间, 背景色)。
+                let sel = selection.and_then(|((sr, sb), (er, eb))| {
+                    if sr > abs || abs > er {
+                        return None;
+                    }
+                    let rl = row.text.len();
+                    let a = if sr == abs { sb } else { 0 };
+                    let b = if er == abs { eb } else { rl };
+                    let a = a.min(rl);
+                    let b = b.min(rl);
+                    (b > a).then(|| (a..b, sel_color))
+                });
+                // 跳转加亮：本行是被定位的目标行 → 把 (注记号, 是否定义) 交给 render_row，
+                // 给该行对应的 `[n]` 标记加亮。
+                let marker_hl = marker_hl
+                    .filter(|(row, _, _)| *row == abs)
+                    .map(|(_, n, is_def)| (n, is_def));
+                render_row(
+                    row,
+                    &p,
+                    wrap,
+                    ch,
+                    chr,
+                    th,
+                    search,
+                    epub,
+                    &note_ctx,
+                    &text_ctx,
+                    sel,
+                    marker_hl,
+                    abs,
+                    cx,
+                )
             })
         }
         .size_full();
@@ -1539,12 +1950,19 @@ impl Render for MarkdownPreview {
             .restrict_scroll_to_axis()
             .track_scroll(&self.h_handle)
             .child(inner);
-        let core: gpui::AnyElement = div()
+        let core = div()
             .id("md-preview")
             .debug_selector(|| "md-preview".into())
             .size_full()
             .relative()
             .bg(bg)
+            // 鼠标点选 + Ctrl/Cmd+C 复制：预览获得键盘焦点，拖拽选择文本。
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+            .on_key_down(cx.listener(Self::on_preview_key_down))
+            // 悬浮脚注命中：鼠标移动 → 判定「上帧注记矩形」→ 显示注释卡片。
+            .on_mouse_move(cx.listener(Self::on_preview_mouse_move))
             .child(harea)
             .child(
                 div()
@@ -1586,8 +2004,42 @@ impl Render for MarkdownPreview {
                             .mode(ScrollbarMode::Always)
                             .viewport_from_layout()
                     }),
-            )
-            .into_any_element();
+            );
+
+        // 悬浮详情卡片：鼠标停在一个 `[n]` 标记（文内引用 / 末尾定义皆可）上时，
+        // 浮出该引用的详情正文。正文优先用 EPUB 注记表（`set_epub` 注入）；非 EPUB
+        // 的 markdown 用 `cit.details`（定义 `[!n]` 行剥掉 `[n]` 标记后的文本）。
+        let core = {
+            let hit = self.hover_hit;
+            match hit {
+                Some(hit) => {
+                    let text = self
+                        .note_ctx
+                        .notes
+                        .get(&hit.n)
+                        .cloned()
+                        .or_else(|| self.cit.details.get(&hit.n).cloned());
+                    match text {
+                        Some(text) => {
+                            let at = self.note_card_point(&hit);
+                            let card = note_card(text, at, cx);
+                            core.child(
+                                deferred(
+                                    anchored()
+                                        .snap_to_window_with_margin(px(8.))
+                                        .position(at)
+                                        .child(card),
+                                )
+                                .with_priority(1),
+                            )
+                        }
+                        None => core,
+                    }
+                }
+                None => core,
+            }
+        }
+        .into_any_element();
 
         // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；窗口模式普通滚轮走自持像素滚动；
         // 相对定位承载目录浮层/面板开关。
@@ -1631,6 +2083,42 @@ impl Render for MarkdownPreview {
         crate::prof::end("md_render", _t_render);
         out
     }
+}
+
+/// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）
+fn selection_color(cx: &App) -> Hsla {
+    if gpui_component::Theme::global(cx).is_dark() {
+        gpui::rgba(0x4d6bfe61).into()
+    } else {
+        gpui::rgba(0x4d6bfe42).into()
+    }
+}
+
+/// EPUB 脚注悬浮卡片：主题配色的 popover 样小卡片，展示一条注释正文。
+fn note_card(text: SharedString, _at: Point<Pixels>, cx: &App) -> gpui::AnyElement {
+    let theme = gpui_component::Theme::global(cx);
+    let colors = theme.semantic_tokens().colors;
+    let card_bg: Hsla = if theme.is_dark() {
+        gpui::rgb(0x1e2430).into()
+    } else {
+        gpui::rgb(0xffffff).into()
+    };
+    div()
+        .debug_selector(|| "md-note-card".into())
+        .bg(card_bg)
+        .border_1()
+        .border_color(colors.border)
+        .rounded_md()
+        .p_3()
+        .max_w(px(460.))
+        .child(
+            div()
+                .whitespace_normal()
+                .text_size(px(12.5))
+                .text_color(colors.foreground)
+                .child(text),
+        )
+        .into_any_element()
 }
 
 /// 在 `text` 内查找第一个忽略大小写命中小写 `needle` 的字节区间；未命中返回 `None`。

@@ -20,6 +20,7 @@ use anyhow::{bail, Context as _, Result};
 use gpui::{Image, ImageFormat};
 
 use crate::config::markdown::EPUB_IMG_SCHEME;
+use crate::markdown::RowAlign;
 
 /// 解析后的 EPUB 文档：元数据 + 按 spine 顺序的章节 Markdown 文本 + 内存图片。
 #[derive(Debug, Clone, Default)]
@@ -38,6 +39,8 @@ pub struct EpubDocument {
     /// 内存图片表：markdown 里的虚拟 src（`epubimg://xxx`）→ 图片字节。
     /// 渲染时由预览查表直接解码，不落盘。
     pub images: HashMap<String, Arc<Image>>,
+    /// 脚注表：注记号 → 注释正文（正文里 `[^n]` 悬浮卡片的数据源）。
+    pub notes: std::collections::BTreeMap<usize, String>,
 }
 
 /// 从 `.epub` 文件路径解析文档。
@@ -65,6 +68,7 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
     let mut markdown = String::new();
     let mut chapters: Vec<String> = Vec::new();
     let mut images: HashMap<String, Arc<Image>> = HashMap::new();
+    let mut notes: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     let base_dir = parent_zip_dir(&opf_path);
     // 虚拟 src → 字段/条目的去重（同一 zip 内路径只解码一次进内存）
     let mut img_cache: HashMap<String, String> = HashMap::new();
@@ -108,7 +112,7 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
             img_cache.insert(src.to_string(), vsrc.clone());
             Some(vsrc)
         };
-        let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img);
+        let chapter_md = xhtml_to_markdown(&chapter_html, &mut on_img, &mut notes);
         if chapter_md.trim().is_empty() {
             continue;
         }
@@ -128,6 +132,7 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         chapters,
         chapter_count: spine_hrefs.len(),
         images,
+        notes,
     })
 }
 
@@ -264,17 +269,25 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
 /// 把一棵 XHTML 章节转成 Markdown。
 ///
 /// 支持：标题(h1..h6)、段落(p)、引述(blockquote)、列表(ul/ol/li)、
-/// 换行(br)、脚注上标(sup/注记) 简化、图片(img)、忽略 head/style/script。
+/// 换行(br)、图片(img)、忽略 head/style/script。EPUB 排版增强：
+/// - `p.signature` / `div.float-r` / `div.float-l` → 行首加 `%%ALIGN:(RIGHT|LEFT)%%`
+///   指令（渲染器据此右/左对齐，右对齐/浮段不做正文首行缩进）；
+/// - 正文的 `<a id="noteN"><sup>[N]</sup></a>` 脚注标记 → `[^N]`（渲染器做悬浮卡片）；
+/// - 「注释」章的 `p.note` 段落 → 抽出 (注记号 → 注释正文) 进 `notes`（正文仍照常渲染）。
 ///
 /// `on_img`：`(src, alt) -> Option<绝对路径>`（把 zip 内图片落盘后返回路径，
 /// 用于生成 `![alt](path)`；返回 None 时输出文本占位）。
-fn xhtml_to_markdown(html: &str, on_img: &mut dyn FnMut(&str, &str) -> Option<String>) -> String {
+fn xhtml_to_markdown(
+    html: &str,
+    on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
+    notes: &mut std::collections::BTreeMap<usize, String>,
+) -> String {
     let doc = match roxmltree::Document::parse(html) {
         Ok(d) => d,
         Err(_) => return String::new(),
     };
     let mut out = String::new();
-    walk_body(&doc.root_element(), &mut out, 0, on_img);
+    walk_body(&doc.root_element(), &mut out, 0, None, notes, on_img);
     // 修整：多个空行合并、去掉行尾空格
     let mut result = String::with_capacity(out.len());
     let mut blank = 0usize;
@@ -294,17 +307,23 @@ fn xhtml_to_markdown(html: &str, on_img: &mut dyn FnMut(&str, &str) -> Option<St
     result
 }
 
-/// 递归遍历正文元素，`quoted` 为当前引述嵌套深度。
+/// 递归遍历正文元素。
+///
+/// - `quoted`：当前引述嵌套深度；
+/// - `align`：从祖先 `float-r`/`float-l` 继承的对齐（`p.signature` 会就地覆写为右）；
+/// - `notes`：脚注表（「注释」章的 `p.note` 段落在此登记）。
 fn walk_body(
     node: &roxmltree::Node,
     out: &mut String,
     quoted: usize,
+    align: Option<RowAlign>,
+    notes: &mut std::collections::BTreeMap<usize, String>,
     on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
 ) {
     match node.tag_name().name() {
         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
             let level = node.tag_name().name()[1..].parse::<u8>().unwrap_or(1);
-            let text = node_text(node);
+            let text = node_text_epub(node);
             out.push('\n');
             out.push_str(&"#".repeat(level as usize));
             out.push(' ');
@@ -313,11 +332,66 @@ fn walk_body(
             return;
         }
         "p" => {
-            let t = node_text(node);
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                out.push_str(&quote_prefix(&t, quoted));
-                out.push('\n');
+            let cls = node.attribute("class").unwrap_or("");
+            // 落款（签名）段落右对齐；其余沿用祖先对齐（float-r→右 / float-l→左）。
+            let p_align = if cls.split_whitespace().any(|c| c == "signature") {
+                Some(RowAlign::Right)
+            } else {
+                align
+            };
+            // 按 `<br>` 切开成多行（落款“…恩格斯<br/>1882年1月21日于伦敦”分行显示）。
+            let mut segs = node_text_epub_lines(node);
+            // 「注释」章：`p.note` 段落的 leading `<a id="footnoteN">[N]</a>` 是「注释定义」标记
+            // → 改写成 `[!N]`（渲染层识别为定义标记，可逆跳到文内对应位置）；
+            // 同时抽出 (注记号 → 注释正文) 进 `notes`（悬浮卡片数据源）。
+            let note_def = leading_footnote_id(node).is_some();
+            if note_def {
+                if let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty()) {
+                    if let Some(rel) = first.find('[') {
+                        let after = &first[rel + 1..];
+                        let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
+                        if d > 0 && after[d..].starts_with(']') {
+                            first.insert(rel + 1, '!');
+                        }
+                    }
+                }
+            }
+            let joined = segs.join("\n");
+            let t = joined.trim().to_string();
+            if note_def {
+                if let Some(n) = leading_footnote_id(node) {
+                    let marker = format!("[{n}]");
+                    if let Some(rest) = t.strip_prefix(marker.as_str()) {
+                        notes
+                            .entry(n)
+                            .or_insert_with(|| rest.trim_start_matches('\u{3000}').trim().to_string());
+                    }
+                }
+            }
+            // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：
+            // 行首前置两个全角空格，渲染时折行后天然「首行缩进、次行顶格」；
+            // 对齐行（落款/浮段）与引述/注释等段落不缩进。
+            let is_body_text = quoted == 0
+                && (cls.split_whitespace().any(|c| c == "text") || cls.trim().is_empty());
+            for seg in segs.into_iter().map(|s| s.trim().to_string()) {
+                if seg.is_empty() {
+                    continue;
+                }
+                // 对齐段落每一 `br` 行都带对齐指令（多行落款整块靠右）。
+                let line = match (p_align, is_body_text) {
+                    (Some(a), _) => {
+                        let mut s = String::with_capacity(seg.len() + 16);
+                        s.push_str(align_directive(a));
+                        s.push_str(&seg);
+                        s
+                    }
+                    (None, true) => format!("\u{3000}\u{3000}{seg}"),
+                    _ => seg,
+                };
+                if !line.trim().is_empty() {
+                    out.push_str(&quote_prefix(&line, quoted));
+                    out.push('\n');
+                }
             }
             return;
         }
@@ -326,15 +400,33 @@ fn walk_body(
         }
         "ul" | "ol" => {}
         "li" => {
-            let t = node_text(node);
+            let t = node_text_epub(node);
             let t = t.trim().to_string();
             if !t.is_empty() {
+                let line = match align {
+                    Some(a) => {
+                        let mut s = String::with_capacity(t.len() + 16);
+                        s.push_str(align_directive(a));
+                        s.push_str(&t);
+                        s
+                    }
+                    None => t,
+                };
                 let marker = if parent_is_ordered(node) { "- " } else { "• " };
                 out.push_str(marker);
-                out.push_str(&quote_prefix(&t, quoted));
+                out.push_str(&quote_prefix(&line, quoted));
                 out.push('\n');
             }
             return;
+        }
+        "a" => {
+            // 正文脚注标记：`<a id="noteN" href="...#footnoteN"><sup>[N]</sup></a>`
+            // → `[^N]`（渲染层做悬浮卡片；通常已在 p/标题内被 [`node_text_epub`]
+            // 处理，此处兜底裸露在 div/块外的锚）；普通链接原样走子节点文本。
+            if let Some(n) = note_ref_at(node) {
+                out.push_str(&format!(" [^{n}] "));
+                return;
+            }
         }
         "img" | "image" => {
             let alt = node.attribute("alt").unwrap_or("").to_string();
@@ -379,10 +471,49 @@ fn walk_body(
     }
 
     let child_quoted = quoted + usize::from(node.has_tag_name("blockquote"));
+    // `float-r` / `float-l` 容器内的段落下移该对齐（也用于取消正文首行缩进）。
+    let child_align = if node.has_tag_name("div") {
+        match node.attribute("class").unwrap_or("").split_whitespace().find(|c| {
+            *c == "float-r" || *c == "float-l" || *c == "float-right" || *c == "float-left"
+        }) {
+            Some("float-r") | Some("float-right") => Some(RowAlign::Right),
+            Some("float-l") | Some("float-left") => Some(RowAlign::Left),
+            _ => align,
+        }
+    } else {
+        align
+    };
     for child in node.children() {
         if child.is_element() || child.is_text() {
-            walk_body(&child, out, child_quoted, on_img);
+            walk_body(&child, out, child_quoted, child_align, notes, on_img);
         }
+    }
+}
+
+/// `%%ALIGN:X%%` 指令串（渲染层据此对齐该行）。
+fn align_directive(a: RowAlign) -> &'static str {
+    match a {
+        RowAlign::Left => "%%ALIGN:LEFT%%",
+        RowAlign::Center => "%%ALIGN:CENTER%%",
+        RowAlign::Right => "%%ALIGN:RIGHT%%",
+    }
+}
+
+/// 「注释」段落的 leading 脚注锚 id：`footnoteN` → `N`（无则 `None`）。
+fn leading_footnote_id(node: &roxmltree::Node) -> Option<usize> {
+    let a = node.children().find(|c| c.is_element() && c.has_tag_name("a"))?;
+    let id = a.attribute("id")?;
+    id.strip_prefix("footnote")?.parse().ok()
+}
+
+/// 从正文脚注锚的 href（如 `part0018.html#footnote1`）里取注记号。
+fn note_ref_number(href: &str) -> Option<usize> {
+    let after = href.split("#footnote").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
     }
 }
 
@@ -406,6 +537,75 @@ fn node_text(node: &roxmltree::Node) -> String {
         }
     }
     s
+}
+
+/// 取段落等**正文容器**的文本，但把正文脚注锚
+/// （`<a id="noteN" href="...#footnoteN"><sup>[N]</sup></a>`）替换成 `[^N]` 标记
+/// （渲染层据此做悬浮注释卡片）。普通链接/注释章锚（`id="footnoteN"`）按文本走。
+fn node_text_epub(node: &roxmltree::Node) -> String {
+    let mut s = String::new();
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(t) = child.text() {
+                s.push_str(t);
+            }
+        } else if child.is_element() {
+            if child.has_tag_name("a") {
+                if let Some(n) = note_ref_at(&child) {
+                    s.push_str(&format!(" [^{n}] "));
+                    continue; // 跳过其 `<sup>[N]</sup>` 子节点
+                }
+            }
+            s.push_str(&node_text_epub(&child));
+        }
+    }
+    s
+}
+
+/// 同 [`node_text_epub`]，但把段落里的 `<br>` 当成**换行**：返回按 `<br>` 切开的
+/// 多段文本（EPUB 落款如“卡尔·马克思 弗里德里希·恩格斯<br/>1882年1月21日于伦敦”
+/// 应分别成行，而不是挤在同一行）。
+fn node_text_epub_lines(node: &roxmltree::Node) -> Vec<String> {
+    let mut segs = vec![String::new()];
+    walk_text_lines(node, &mut segs);
+    segs
+}
+
+fn walk_text_lines(node: &roxmltree::Node, segs: &mut Vec<String>) {
+    for child in node.children() {
+        if child.is_text() {
+            if let Some(t) = child.text() {
+                segs.last_mut().unwrap().push_str(t);
+            }
+        } else if child.is_element() {
+            if child.has_tag_name("br") {
+                // 换行：收束当前段，新起一段。
+                if !segs.last().unwrap().is_empty() {
+                    segs.push(String::new());
+                }
+                continue;
+            }
+            if child.has_tag_name("a") {
+                if let Some(n) = note_ref_at(&child) {
+                    segs.last_mut().unwrap().push_str(&format!(" [^{n}] "));
+                    continue;
+                }
+            }
+            walk_text_lines(&child, segs);
+        }
+    }
+}
+
+/// `a` 是否正文脚注锚（`id^=note` + `href` 含 `#footnote`）；返回注记号。
+fn note_ref_at(node: &roxmltree::Node) -> Option<usize> {
+    if !node.has_tag_name("a") {
+        return None;
+    }
+    let id = node.attribute("id").unwrap_or("");
+    if !id.starts_with("note") {
+        return None;
+    }
+    note_ref_number(node.attribute("href").unwrap_or(""))
 }
 
 /// 判断列表项是否有序（父级 `<ol>`）。
@@ -527,10 +727,62 @@ mod tests {
     fn xhtml_to_markdown_preserves_heading_and_paragraph() {
         let html = "<html><body><h1>第一章</h1><p>正文内容。</p><blockquote><p>引述。</p></blockquote></body></html>";
         let no_img: Option<String> = None;
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no_img.clone());
+        let mut notes = std::collections::BTreeMap::new();
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no_img.clone(), &mut notes);
         assert!(md.contains("# 第一章"));
         assert!(md.contains("正文内容。"));
         assert!(md.contains("> 引述。"));
+    }
+
+    #[test]
+    fn xhtml_signature_and_float_emit_align_directives() {
+        // `p.signature` → 右对齐指令；`div.float-r` 内 p.text → 右对齐；`div.float-l` → 左对齐。
+        let html = "<html><body>\
+<p class=\"text\">普通正文段。</p>\
+<p class=\"signature\">卡尔·马克思<br/>1872年6月24日于伦敦</p>\
+<div class=\"float-r\"><p class=\"text\">原文是德文</p></div>\
+<div class=\"float-l\"><p class=\"text\">卡·马克思写于1872年</p></div>\
+</body></html>";
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        assert!(md.contains("%%ALIGN:RIGHT%%卡尔·马克思"), "签名应带右对齐指令：{md}");
+        // `<br>` 应把签名拆成两行，且每行都带右对齐指令（日期单独成行）。
+        assert!(
+            md.contains("%%ALIGN:RIGHT%%卡尔·马克思\n%%ALIGN:RIGHT%%1872年6月24日于伦敦"),
+            "签名 `<br>` 应拆行且两行都右对齐：{md:?}"
+        );
+        assert!(!md.contains("卡尔·马克思1872年6月24日于伦敦"), "日期不得与姓名挤在一行: {md:?}");
+        assert!(md.contains("%%ALIGN:RIGHT%%原文是德文"), "float-r 应带右对齐指令：{md}");
+        assert!(md.contains("%%ALIGN:LEFT%%卡·马克思写于1872年"), "float-l 应带左对齐指令：{md}");
+        assert!(!md.contains("%%ALIGN:%普通正文段"), "普通正文不应带对齐指令：{md}");
+        assert!(
+            md.contains("\u{3000}\u{3000}普通正文段。"),
+            "正文（class=text）应首行缩进 2 全角空格：{md:?}"
+        );
+    }
+
+    #[test]
+    fn xhtml_footnote_markers_and_definitions() {
+        // 正文标记 `[^1]`；注释章 p.note 定义进 notes 表且正文照常渲染。
+        let html = "<html><body>\
+<p class=\"text\">共产主义者同盟<a id=\"note2\" href=\"part0018.html#footnote2\" class=\"calibre2\"><sup class=\"suptext1\">[2]</sup></a>成立于1847年。</p>\
+<p class=\"note\"><a id=\"footnote2\" href=\"part0002.html#note2\">[2]</a> 共产主义者同盟是历史上第一个无产阶级政党。</p>\
+</body></html>";
+        let no: Option<String> = None;
+        let mut notes = std::collections::BTreeMap::new();
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        assert!(md.contains("[^2]"), "正文脚注应转成 [^2] 标记：{md}");
+        assert_eq!(
+            notes.get(&2).map(|s| s.as_str()),
+            Some("共产主义者同盟是历史上第一个无产阶级政党。"),
+            "注释表应有第 2 条：{notes:?}"
+        );
+        // 注释章定义标记应改写为 `[!2]`（renderer 识别为定义、可逆跳），正文照常渲染。
+        assert!(
+            md.contains("[!2]") && md.contains("共产主义者同盟是历史上第一个无产阶级政党。"),
+            "注释定义标记应为 [!2] 且正文照常渲染：{md}"
+        );
     }
 
     #[test]
@@ -542,7 +794,8 @@ mod tests {
                 assert_eq!(alt, "插图一");
                 Some("/tmp/x/p1.jpeg".to_string())
             };
-            xhtml_to_markdown(&html, &mut on_img)
+            let mut notes = std::collections::BTreeMap::new();
+            xhtml_to_markdown(&html, &mut on_img, &mut notes)
         };
         assert!(md.contains("![插图一](/tmp/x/p1.jpeg)"), "图片应转成 markdown 图片，实际={md:?}");
     }
@@ -551,7 +804,8 @@ mod tests {
     fn xhtml_img_without_resolver_falls_back() {
         let html = "<html><body><img src=\"x.png\" alt=\"图A\"/></body></html>";
         let no: Option<String> = None;
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone());
+        let mut notes = std::collections::BTreeMap::new();
+        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
         assert!(md.contains("[图片：图A]"), "无解析结果应输出占位，实际={md:?}");
     }
 
@@ -564,7 +818,8 @@ mod tests {
                 assert_eq!(src, "images/cover.jpeg");
                 Some("epubimg://1.jpeg".to_string())
             };
-            xhtml_to_markdown(&html, &mut on_img)
+            let mut notes = std::collections::BTreeMap::new();
+            xhtml_to_markdown(&html, &mut on_img, &mut notes)
         };
         assert!(
             md.contains("![图片](epubimg://1.jpeg)"),

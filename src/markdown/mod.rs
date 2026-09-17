@@ -10,5 +10,5 @@
 mod parser;
 mod view;
 
-pub use parser::{scan_blocks, scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex};
+pub use parser::{scan_blocks, scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};
 pub use view::{MarkdownPreview, PreviewSrc};

@@ -59,6 +59,14 @@ pub enum TableAlign {
     Right,
 }
 
+/// 渲染行对齐方式（EPUB 排版指令 `%%ALIGN:X%%` 驱动）：None = 跟随默认左对齐。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowAlign {
+    Left,
+    Center,
+    Right,
+}
+
 /// GFM 表格结构：表头 + 数据行 + 每列对齐。
 #[derive(Debug, Clone, Default)]
 pub struct TableData {
@@ -121,6 +129,14 @@ pub struct Row {
     pub prefix: Option<SharedString>,
     /// 稀有字段（代码块行 / 图片行 / 表格行）装箱保存，普通行不背上这些字段。
     pub payload: Option<Box<RowPayload>>,
+    /// 行对齐（EPUB 排版指令 `%%ALIGN:X%%`；None = 默认左对齐）。
+    pub align: Option<RowAlign>,
+    /// 行内注记标记：`(字节区间, 注记号)`（EPUB 脚注 `[^n]` 的悬浮卡片/跳转用）。
+    /// 区间相对 `text`；标记显示成 `[n]`（`^` 已剥掉）。
+    pub notes: Vec<(Range<usize>, usize)>,
+    /// 注释**定义**标记：`(字节区间, 注记号)`（EPUB「注释」章 `p.note` 的 `[!n]`，
+    /// 逆跳到文内对应位置用）。显示成 `[n]`（`!` 已剥掉）。
+    pub note_defs: Vec<(Range<usize>, usize)>,
 }
 
 impl Row {
@@ -137,12 +153,28 @@ impl Row {
             runs,
             prefix,
             payload: None,
+            align: None,
+            notes: Vec::new(),
+            note_defs: Vec::new(),
         }
     }
 
     /// 记录该渲染行对应的源码起始行号（解析时填充）。
     fn with_line(mut self, line: usize) -> Self {
         self.src_line = line;
+        self
+    }
+
+    /// 记录行对齐 + 行内注记标记 + 注释定义标记（解析时填充）。
+    fn with_format(
+        mut self,
+        align: Option<RowAlign>,
+        notes: Vec<(Range<usize>, usize)>,
+        note_defs: Vec<(Range<usize>, usize)>,
+    ) -> Self {
+        self.align = align;
+        self.notes = notes;
+        self.note_defs = note_defs;
         self
     }
 
@@ -160,6 +192,9 @@ impl Row {
                 code_lines: lines,
                 language,
             })),
+            align: None,
+            notes: Vec::new(),
+            note_defs: Vec::new(),
         }
     }
 
@@ -172,6 +207,9 @@ impl Row {
             runs: Vec::new(),
             prefix: None,
             payload: Some(Box::new(RowPayload::Table(table))),
+            align: None,
+            notes: Vec::new(),
+            note_defs: Vec::new(),
         }
     }
 
@@ -189,6 +227,9 @@ impl Row {
                 img_h: None,
                 img_data: None,
             })),
+            align: None,
+            notes: Vec::new(),
+            note_defs: Vec::new(),
         }
     }
 
@@ -291,6 +332,105 @@ fn inline_style(src: &str) -> (SharedString, Vec<(Range<usize>, RunKind)>) {
     }
     out.push_str(&src[last..]);
     (out.into(), runs)
+}
+
+/// 解析行首的 EPUB 对齐指令 `%%ALIGN:X%%`（仅 EPUB 转换器产出；普通正文不会出现）。
+/// 命中返回 `(Some(对齐), 指令剥掉后的剩余行)`，否则 `(None, 原行)`。
+/// 指令与内容**同一行**（`%%ALIGN:RIGHT%%内容`）——这样该行仍是一个普通块，
+/// `scan_blocks`/增量/窗口切片不需要任何额外坐标处理，块数与字节边界天然一致。
+fn strip_align_directive(line: &str) -> (Option<RowAlign>, &str) {
+    const PREFIX: &str = "%%ALIGN:";
+    let Some(rest) = line.strip_prefix(PREFIX) else {
+        return (None, line);
+    };
+    let Some(close) = rest.find("%%") else {
+        return (None, line);
+    };
+    let name = &rest[..close];
+    let align = match name {
+        "LEFT" => Some(RowAlign::Left),
+        "CENTER" => Some(RowAlign::Center),
+        "RIGHT" => Some(RowAlign::Right),
+        _ => return (None, line),
+    };
+    (align, &rest[close + 2..])
+}
+
+/// 把行内脚注标记从文本中识别出来：
+/// - `[^<数字>]`：正文脚注引用（`Row.notes`，悬浮/跳到注释章）；
+/// - `[!<数字>]`：注释**定义**（`Row.note_defs`，跳到文内对应位置）。
+/// 显示文本都剥掉标记字符（`[^1]`/`[!1]` → `[1]`），记录 `(字节区间, 注记号)`；
+/// marker 之后的既有样式段区间整体左移 1 字节（被剥字符删掉）。
+fn extract_notes(
+    text: SharedString,
+    mut runs: Vec<(Range<usize>, RunKind)>,
+) -> (
+    SharedString,
+    Vec<(Range<usize>, RunKind)>,
+    Vec<(Range<usize>, usize)>,
+    Vec<(Range<usize>, usize)>,
+) {
+    let src = text.as_ref();
+    let mut out = String::with_capacity(src.len());
+    let mut notes: Vec<(Range<usize>, usize)> = Vec::new();
+    let mut note_defs: Vec<(Range<usize>, usize)> = Vec::new();
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut ci = 0usize;
+    while ci < chars.len() {
+        let (idx, ch) = chars[ci];
+        if ch == '[' {
+            // 形如 `[^digits]` 或 `[!digits]`
+            let is_note = chars.get(ci + 1).is_some_and(|&(_, c)| c == '^');
+            let is_def = chars.get(ci + 1).is_some_and(|&(_, c)| c == '!');
+            if is_note || is_def {
+                let mut nxt = ci + 2;
+                let dstart = nxt;
+                while let Some(&(_, d)) = chars.get(nxt) {
+                    if d.is_ascii_digit() {
+                        nxt += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if nxt > dstart && chars.get(nxt).is_some_and(|&(_, c)| c == ']') {
+                    let digits: String =
+                        src[chars[dstart].0..chars[nxt - 1].0 + 1].chars().collect();
+                    let n: usize = digits.parse().unwrap_or(0);
+                    let mark_start = out.len();
+                    out.push('[');
+                    out.push_str(&digits);
+                    out.push(']');
+                    let mark_end = out.len();
+                    let entry = (mark_start..mark_end, n);
+                    if is_def {
+                        note_defs.push(entry);
+                    } else {
+                        notes.push(entry);
+                    }
+                    // 标记字符被删 → marker 之后的区间整体左移 1 字节。
+                    let cut = idx;
+                    for r in runs.iter_mut() {
+                        if r.0.start > cut {
+                            r.0.start -= 1;
+                            r.0.end -= 1;
+                        }
+                    }
+                    ci = nxt + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        ci += 1;
+    }
+    (out.into(), runs, notes, note_defs)
+}
+
+/// 段落文本的行首/行尾修整：剥掉 ASCII 空格/Tab 与尾部空白，但**保留行首全角空格**
+/// （U+3000 在 Rust 的 `str::trim` 里也算空白——EPUB 正文首行缩进「　　」靠它实现，
+/// 不能被这里吃掉）。普通 Markdown 段落行首没有全角空格，行为与以前一致。
+fn trim_paragraph(line: &str) -> &str {
+    line.trim_end().trim_start_matches([' ', '\t'])
 }
 
 /// 围栏检测：行首（允许缩进）是否有 ≥3 个 ` 或 ~。
@@ -504,6 +644,8 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
     while idx < lines.len() {
         let row_start = idx;
         let line = lines[idx].trim_end_matches('\r');
+        // EPUB 对齐指令（`%%ALIGN:X%%内容`）：同一行，剥掉后该行仍是普通块。
+        let (align, line) = strip_align_directive(line);
         let t = line.trim_start();
         // 栅栏开头：收集到同字符闭合行之间的所有行，折叠成一个 Code 渲染行
         if let Some((fc, _)) = fence_len(t) {
@@ -532,7 +674,8 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         // 标题：`#{1,6} ` 后跟内容
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) && t.len() > hashes {
-            let (text, runs) = inline_style(t[hashes..].trim_start());
+            let (raw, runs) = inline_style(t[hashes..].trim_start());
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
             rows.push(
                 Row::new(
                     text.as_ref(),
@@ -540,22 +683,32 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
                     runs,
                     None,
                 )
-                .with_line(row_start),
+                .with_line(row_start)
+                .with_format(align, notes, note_defs),
             );
             idx += 1;
             continue;
         }
         // 引述：`>` 开头
         if t.starts_with('>') {
-            let rest = t.trim_start_matches('>').trim_start();
-            let (text, runs) = inline_style(rest);
-            rows.push(Row::new(text.as_ref(), RowKind::Quote, runs, None).with_line(row_start));
+            let (content_align, rest) = strip_align_directive(t.trim_start_matches('>').trim_start());
+            let align = content_align.or(align);
+            let (raw, runs) = inline_style(rest);
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+            rows.push(
+                Row::new(text.as_ref(), RowKind::Quote, runs, None)
+                    .with_line(row_start)
+                    .with_format(align, notes, note_defs),
+            );
             idx += 1;
             continue;
         }
         // 列表项：`- ` / `* ` / `+ ` / `1. ` / 任务列表
         if let Some((prefix, content)) = list_prefix(t) {
-            let (text, runs) = inline_style(content);
+            let (content_align, content) = strip_align_directive(content);
+            let align = content_align.or(align);
+            let (raw, runs) = inline_style(content);
+            let (text, runs, notes, note_defs) = extract_notes(raw, runs);
             rows.push(
                 Row::new(
                     text.as_ref(),
@@ -563,7 +716,8 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
                     runs,
                     Some(prefix.clone()),
                 )
-                .with_line(row_start),
+                .with_line(row_start)
+                .with_format(align, notes, note_defs),
             );
             idx += 1;
             continue;
@@ -586,8 +740,13 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
             idx += consumed;
             continue;
         }
-        let (text, runs) = inline_style(line.trim());
-        rows.push(Row::new(text.as_ref(), RowKind::Paragraph, runs, None).with_line(row_start));
+        let (raw, runs) = inline_style(trim_paragraph(line));
+        let (text, runs, notes, note_defs) = extract_notes(raw, runs);
+        rows.push(
+            Row::new(text.as_ref(), RowKind::Paragraph, runs, None)
+                .with_line(row_start)
+                .with_format(align, notes, note_defs),
+        );
         idx += 1;
     }
     rows
@@ -868,10 +1027,12 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     let mut idx = 0usize;
     while idx < lines.len() {
         let row_start = idx;
-        let line = lines[idx].trim_end_matches('\r');
-        let t = line.trim_start();
-        let raw_len = line.len() as u32;
+        let raw_line = lines[idx].trim_end_matches('\r');
+        let raw_len = raw_line.len() as u32;
         let byte = line_starts[row_start];
+        // 与 parse_to_rows 一致的 EPUB 对齐指令剥离（kind 判定对同一份内容做）。
+        let (_, line) = strip_align_directive(raw_line);
+        let t = line.trim_start();
 
         if let Some((fc, _)) = fence_len(t) {
             let mut code_lines = 0u32;
@@ -989,6 +1150,130 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         blocks: Blocks::from_vec(blocks),
         toc,
     }
+}
+
+/// 引用的**双向跳转**索引：注记号 → 文内引用 / 末尾定义所在渲染行。
+///
+/// 渲染行坐标 = 全局块下标（小文档 = `Vec<Row>` 下标；窗口模式 = [`BlockIndex`] 块下标），
+/// 与视图层 `scroll_to_row` 的入参一致。
+///
+/// - [`Self::refs`]：`[^n]`（正文引用标记，显示成 `[n]`）→ (渲染行, 显示文本字节区间)
+/// - [`Self::defs`]：`[!n]`（末尾定义标记，显示成 `[n]`）→ (渲染行, 显示文本字节区间)
+///
+/// 多个同号标记只记**第一个**（点击跳转取首处足够）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CitationIndex {
+    /// 注记号 → 文内引用 `[^n]` 的 (渲染行, 显示文本字节区间)。
+    pub refs: std::collections::BTreeMap<usize, (usize, Range<usize>)>,
+    /// 注记号 → 末尾定义 `[!n]` 的 (渲染行, 显示文本字节区间)。
+    pub defs: std::collections::BTreeMap<usize, (usize, Range<usize>)>,
+    /// 注记号 → 引用详情正文（定义 `[!n]` 所在行剥掉 `[n]` 标记后的文本，去首空白）。
+    /// 悬浮卡片在非 EPUB 时展示这个；EPUB 场景优先用外部注记表。
+    pub details: std::collections::BTreeMap<usize, SharedString>,
+}
+
+/// 从**已解析行集**构建引用跳转索引（小文档全量路径；多位置取第一个）。
+pub fn citation_index_from_rows(rows: &[Row]) -> CitationIndex {
+    let mut idx = CitationIndex::default();
+    for (ix, r) in rows.iter().enumerate() {
+        for (range, n) in &r.notes {
+            idx.refs.entry(*n).or_insert((ix, range.clone()));
+        }
+        for (range, n) in &r.note_defs {
+            idx.defs.entry(*n).or_insert((ix, range.clone()));
+            // 详情正文：定义标记 `[n]` 之后的文本（去首尾空白）。
+            idx.details.entry(*n).or_insert_with(|| {
+                let start = range.end.min(r.text.len());
+                r.text[start..].trim().into()
+            });
+        }
+    }
+    idx
+}
+
+/// 提取一段**已剥行内样式**文本里的引用标记：返回 (清理后文本, 标记列表)。
+/// 每个标记是 (显示文本字节区间, 注记号, 是否定义)；区间与 [`parse_to_rows`] 内
+/// [`extract_notes`] 的产出一致。
+fn extract_citation_markers(text: &str) -> (SharedString, Vec<(Range<usize>, usize, bool)>) {
+    let (out, _, notes, note_defs) = extract_notes(text.into(), Vec::new());
+    let markers = notes
+        .into_iter()
+        .map(|(r, n)| (r, n, false))
+        .chain(note_defs.into_iter().map(|(r, n)| (r, n, true)))
+        .collect();
+    (out, markers)
+}
+
+/// 从整篇源码**逐块**扫描出引用跳转索引（窗口模式懒重建用）。
+///
+/// 与 [`scan_blocks`] 共用同一套切块判定（围栏 / 空行 / 标题 / 引述 / 列表 / 分隔线 /
+/// 独立图片 / 表格 / 段落），块序号即渲染行下标——因此产出的渲染行坐标与窗口模式的
+/// [`BlockIndex`] 完全一致，按需跳转不会错位。只对**文本块**（标题 / 引述 / 列表 /
+/// 段落）剥行内样式后提取 `[^n]` / `[!n]` 标记（与 [`parse_to_rows`] 定义一致）；
+/// 代码块 / 表格 / 图片不产生引用标记。
+pub fn scan_citations(src: &str) -> CitationIndex {
+    let mut idx = CitationIndex::default();
+    let lines: Vec<&str> = src.split('\n').collect();
+    let mut row_ix = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i].trim_end_matches('\r');
+        let (_, line) = strip_align_directive(line);
+        let t = line.trim_start();
+        let (cleaned, markers, consumed) = if let Some((fc, _)) = fence_len(t) {
+            // 代码块：整体折叠成一渲染行（围栏行 + 到闭合行），不解析标记。
+            let mut k = i + 1;
+            while k < lines.len() {
+                let l = lines[k].trim_end_matches('\r').trim_start();
+                if fence_len(l).is_some_and(|(c, _)| c == fc) {
+                    k += 1;
+                    break;
+                }
+                k += 1;
+            }
+            (SharedString::default(), Vec::new(), k - i)
+        } else if t.is_empty() {
+            (SharedString::default(), Vec::new(), 1)
+        } else {
+            let hashes = t.chars().take_while(|&c| c == '#').count();
+            if (1..=6).contains(&hashes) && t.len() > hashes {
+                let (cleaned, m) =
+                    extract_citation_markers(inline_style(t[hashes..].trim_start()).0.as_ref());
+                (cleaned, m, 1)
+            } else if t.starts_with('>') {
+                let (_, rest) = strip_align_directive(t.trim_start_matches('>').trim_start());
+                let (cleaned, m) = extract_citation_markers(inline_style(rest).0.as_ref());
+                (cleaned, m, 1)
+            } else if let Some((_, content)) = list_prefix(t) {
+                let (_, content) = strip_align_directive(content);
+                let (cleaned, m) = extract_citation_markers(inline_style(content).0.as_ref());
+                (cleaned, m, 1)
+            } else if is_rule(t) {
+                (SharedString::default(), Vec::new(), 1)
+            } else if parse_image_line(t).is_some() {
+                (SharedString::default(), Vec::new(), 1)
+            } else if let Some((_table, consumed)) = try_parse_table(&lines, i) {
+                (SharedString::default(), Vec::new(), consumed)
+            } else {
+                let (cleaned, m) =
+                    extract_citation_markers(inline_style(trim_paragraph(line)).0.as_ref());
+                (cleaned, m, 1)
+            }
+        };
+        for (range, n, is_def) in markers {
+            if is_def {
+                idx.defs.entry(n).or_insert((row_ix, range.clone()));
+                // 详情正文：定义标记 `[n]` 之后的文本（去首尾空白）。
+                let detail = cleaned[range.end..].trim();
+                idx.details.entry(n).or_insert_with(|| detail.into());
+            } else {
+                idx.refs.entry(n).or_insert((row_ix, range));
+            }
+        }
+        row_ix += 1;
+        i += consumed;
+    }
+    idx
 }
 
 /// 两字符串从前向后相同的字节数（公共前缀长度）。
@@ -1899,6 +2184,10 @@ mod tests {
                 "# 一级标题\n\n正文段落，`code` 与 **bold**\n\n- 列表一\n- 列表二\n\n> 引述\n\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 型号 | 尺寸 |\n| :--- | ---: |\n| A | 10 |\n| B | 20 |\n\n![插图](images/x.png)\n\n后文\n"
                     .to_string(),
             );
+            // EPUB 排版指令 / 脚注标记（对齐指令 + 正文缩进「　　」 + `[^n]` 注记）。
+            v.push(
+                "%%ALIGN:RIGHT%%落款行\n　　正文[^1]段落。\n正文[^2]第二段。\n".to_string(),
+            );
             // 真实（若有）+ benchdata
             for name in ["SKILL.md", "大文档测试.md", "bench_20k.md", "bench_160k.md"] {
                 if let Ok(s) = std::fs::read_to_string(format!("target/{name}")) {
@@ -2679,5 +2968,110 @@ mod tests {
             inc_ms.as_secs_f64() * 1000.0,
             full_ms.as_secs_f64() * 1000.0,
         );
+    }
+
+    #[test]
+    fn epub_align_directive_and_notes_parse() {
+        let src = "%%ALIGN:RIGHT%%落款第一行\n%%ALIGN:LEFT%%浮段\n　　正文[^1]带注段。\n正文[^2]再一段。";
+        let rows = parse_to_rows(src);
+        assert_eq!(rows.len(), 4, "指令行不产生额外渲染行");
+        // 右对齐行
+        assert_eq!(rows[0].kind, RowKind::Paragraph);
+        assert_eq!(rows[0].align, Some(RowAlign::Right), "RIGHT 指令应生效");
+        assert_eq!(rows[0].text.as_ref(), "落款第一行", "指令前缀应被剥掉");
+        // 左对齐行
+        assert_eq!(rows[1].align, Some(RowAlign::Left));
+        assert_eq!(rows[1].text.as_ref(), "浮段");
+        // 普通正文：无对齐、`[^1]` → `[1]` + 注记区间（含前置「　　」缩进）
+        assert_eq!(rows[2].align, None);
+        assert_eq!(rows[2].text.as_ref(), "　　正文[1]带注段。", "注记 ^ 应剥掉");
+        assert_eq!(rows[2].notes.len(), 1, "应有 1 条注记");
+        let (r, n) = &rows[2].notes[0];
+        assert_eq!(*n, 1);
+        assert_eq!(&rows[2].text[r.clone()], "[1]", "注记区间应对应 [1]");
+        // 无指令行保持默认
+        assert_eq!(rows[3].align, None);
+        // 窗口重解析（块边界切片）也要恢复对齐：从第 2 块起的切片应含指令行。
+        let src2 = "前缀段\n%%ALIGN:RIGHT%%落款行";
+        let idx = scan_blocks(src2);
+        let mut rb = Vec::new();
+        for i in 0..idx.blocks.len() {
+            rb.extend(parse_block_window(src2, &idx, i, i));
+        }
+        assert_eq!(rb.len(), idx.blocks.len());
+        assert_eq!(rb[1].align, Some(RowAlign::Right), "窗口重解析应恢复对齐指令");
+    }
+
+    #[test]
+    fn epub_directive_inside_quote_and_bullet_is_stripped() {
+        // 引述块/列表项里被包裹的对齐指令（如 `> %%ALIGN:RIGHT%%…`）会漏到行首判断
+        // 之外，必须从内容里也剥掉，不能作为可见文本渲染。
+        let rows = parse_to_rows("> %%ALIGN:RIGHT%%引述落款\n- %%ALIGN:LEFT%%列表项");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind, RowKind::Quote);
+        assert_eq!(rows[0].text.as_ref(), "引述落款", "引述里的指令应剥掉，实际 {}", rows[0].text);
+        assert_eq!(rows[0].align, Some(RowAlign::Right));
+        assert!(!rows[0].text.contains("%%ALIGN"), "不得泄漏指令串");
+        assert_eq!(rows[1].kind, RowKind::Bullet);
+        assert_eq!(rows[1].text.as_ref(), "列表项", "列表项里的指令应剥掉，实际 {}", rows[1].text);
+        assert_eq!(rows[1].align, Some(RowAlign::Left));
+        assert!(!rows[1].text.contains("%%ALIGN"), "不得泄漏指令串");
+        // 扫描器一致性不受影响（指令行仍是同一块）。
+        let idx = scan_blocks("> %%ALIGN:RIGHT%%引述落款\n- %%ALIGN:LEFT%%列表项");
+        assert_eq!(idx.blocks.len(), 2);
+    }
+
+    #[test]
+    fn epub_note_def_marker_parses() {
+        // 注释定义标记 `[!n]` → Row.note_defs（逆跳用），显示成 `[n]`。
+        let rows = parse_to_rows("正文[^2]引用。\n[!2]　注释定义内容。\n[!33]　另一条。");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].notes.len(), 1);
+        assert_eq!(rows[0].note_defs.len(), 0);
+        assert_eq!(rows[1].notes.len(), 0);
+        assert_eq!(rows[1].note_defs.len(), 1, "定义标记应进 note_defs");
+        let (r, n) = &rows[1].note_defs[0];
+        assert_eq!(*n, 2);
+        assert_eq!(&rows[1].text[r.clone()], "[2]");
+        assert_eq!(rows[1].text.starts_with("[2]"), true);
+        assert_eq!(rows[2].note_defs[0].1, 33);
+    }
+
+    #[test]
+    fn citation_index_from_rows_maps_refs_and_defs() {
+        // 全量路径：注记号 → (渲染行, 显示文本字节区间) + 详情正文。
+        let rows = parse_to_rows("一句话[^1]引用。\n[!1]　定义1。\n[!2]　定义2（无文内对端）。");
+        let idx = citation_index_from_rows(&rows);
+        // 区间是**字节**坐标（CJK 每字 3 字节）：「一句话」=9B → [^1] 显示成 [1] 在 [9..12)。
+        assert_eq!(idx.refs.get(&1), Some(&(0, 9..12)), "文内 [1] 应在第 0 行、区间 [9..12)");
+        assert_eq!(idx.defs.get(&1), Some(&(1, 0..3)), "定义 [1] 应在第 1 行、区间 [0..3)");
+        assert_eq!(idx.defs.get(&2), Some(&(2, 0..3)), "定义 [2] 应在第 2 行");
+        assert_eq!(idx.refs.get(&2), None, "孤立定义不应进 refs");
+        assert_eq!(idx.details.get(&1).map(|s| s.as_ref()), Some("定义1。"), "详情应剥掉 [1] 标记");
+        assert_eq!(
+            idx.details.get(&2).map(|s| s.as_ref()),
+            Some("定义2（无文内对端）。")
+        );
+    }
+
+    #[test]
+    fn scan_citations_matches_row_indexes_and_skips_code() {
+        // 窗口模式懒扫描：与 parse_to_rows 同块结构，行坐标（BlockIndex 下标）一致；
+        // 代码块里的 `[^n]` 不是引用，不得计入。
+        let src = "# 标题[^1]\n\n正文[^2]。\n\n```\n[^9] 代码里的方括号不是引用\n```\n\n[!1]　定1。\n[!2]　定2。";
+        let idx = scan_citations(src);
+        // 块：0=标题,1=空行,2=正文,3=空行,4=代码块,5=空行,6=定1,7=定2
+        // （字节区间：「标题」=6B → [1] 在 [6..9)；「正文」=6B → [2] 在 [6..9)。）
+        assert_eq!(idx.refs.get(&1), Some(&(0, 6..9)), "文内 [1] 在第 0 块");
+        assert_eq!(idx.refs.get(&2), Some(&(2, 6..9)), "文内 [2] 在第 2 块");
+        assert_eq!(idx.refs.contains_key(&9), false, "代码块里的 [^9] 不是引用");
+        assert_eq!(idx.defs.get(&1), Some(&(6, 0..3)), "定义 [1] 在第 6 块");
+        assert_eq!(idx.defs.get(&2), Some(&(7, 0..3)), "定义 [2] 在第 7 块");
+        assert_eq!(idx.details.get(&1).map(|s| s.as_ref()), Some("定1。"));
+        assert_eq!(idx.details.get(&2).map(|s| s.as_ref()), Some("定2。"));
+        // 与全量路径产出一致（同结构 → 同名块坐标一致）。
+        let rows = parse_to_rows(src);
+        let from_rows = citation_index_from_rows(&rows);
+        assert_eq!(idx, from_rows, "scan_citations 应与全量行推导一致");
     }
 }

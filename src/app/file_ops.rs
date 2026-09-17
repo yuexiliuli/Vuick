@@ -545,6 +545,8 @@ impl EditorApp {
             view.set_memory_images(doc.images.clone());
             // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
             view.set_wrap(true, cx);
+            // EPUB 阅读排版：标题居中、正文首行缩进 2 字符、脚注 `[n]` 悬浮卡片
+            view.set_epub(true, doc.notes.clone(), cx);
             view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());

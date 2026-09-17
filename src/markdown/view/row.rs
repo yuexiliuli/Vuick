@@ -10,15 +10,21 @@ use gpui::{
     div, fill, img, point, px, App, Bounds, Corners, Element, ElementId, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hsla, InspectorElementId, InteractiveElement, IntoElement,
     LayoutId, ObjectFit, ParentElement, Pixels, ScrollHandle, StatefulInteractiveElement,
-    StrikethroughStyle, Styled, StyledImage, StyledText, WrappedLineLayout, Window,
+    StrikethroughStyle, Styled, StyledImage, StyledText, TextStyle, WrappedLineLayout, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::config::markdown::{IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, TABLE_SCROLLBAR_RESERVE_PX};
-use crate::markdown::parser::{Row, RowKind, RunKind};
+use crate::config::colors::RESIZE_ACCENT;
+use crate::config::markdown::{
+    IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH_PX,
+    TABLE_SCROLLBAR_RESERVE_PX,
+};
+use crate::markdown::parser::{Row, RowAlign, RowKind, RunKind};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
+
+use super::{NoteCtx, NoteHit, TextCtx, TextHit};
 
 /// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
 /// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
@@ -77,77 +83,6 @@ fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
         }
     }
     start..end
-}
-
-/// 把行内的样式段（`runs`，字节区间）套到整段文本上，生成 [`StyledText`]；
-/// 没有任何样式段且无搜索高亮时返回 `None`，调用方直接渲染纯文本以省一次分配。
-/// 反引号代码 → 等宽 + 灰底；粗体/斜体/删除线 → 对应字重/风格；
-/// 链接/图片（v1 渲染按文字处理）不特殊着色。
-/// `search`：搜索跳转高亮的 (字节区间, 背景色)，只给命中文本上背景色（不吃整行）。
-fn styled_text(
-    text: &gpui::SharedString,
-    runs: &[(Range<usize>, RunKind)],
-    p: &StyleParams,
-    colors: &InlineCodeColors,
-    search: Option<(Range<usize>, Hsla)>,
-) -> Option<StyledText> {
-    if runs.is_empty() && search.is_none() {
-        return None;
-    }
-    let mut highlights = Vec::with_capacity(runs.len() + 1);
-    let mut mono: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
-    for (range, kind) in runs {
-        match kind {
-            RunKind::InlineCode => {
-                // 等宽字体 overrides 只覆盖代码本体；文字色用主题配色（背景圆角自绘）。
-                highlights.push((range.clone(), inline_code_highlight(colors)));
-                mono.push((range.clone(), p.mono.clone()));
-            }
-            RunKind::Bold => highlights.push((
-                range.clone(),
-                HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                },
-            )),
-            RunKind::Italic => highlights.push((
-                range.clone(),
-                HighlightStyle {
-                    font_style: Some(FontStyle::Italic),
-                    ..Default::default()
-                },
-            )),
-            RunKind::Strikethrough => highlights.push((
-                range.clone(),
-                HighlightStyle {
-                    strikethrough: Some(StrikethroughStyle::default()),
-                    ..Default::default()
-                },
-            )),
-            // 链接/图片：v1 按普通文字渲染（去掉 URL/括号后的文本），不额外着色
-            RunKind::Link | RunKind::Image => {}
-        }
-    }
-    // 搜索跳转高亮：给命中文本叠加背景色（裁剪到文本边界；与加粗/等宽等字段正交，可共存）
-    if let Some((range, color)) = search {
-        if range.start < text.len() {
-            let end = range.end.min(text.len());
-            if end > range.start {
-                highlights.push((
-                    range.start..end,
-                    HighlightStyle {
-                        background_color: Some(color),
-                        ..Default::default()
-                    },
-                ));
-            }
-        }
-    }
-    let mut st = StyledText::new(text.clone()).with_highlights(highlights);
-    if !mono.is_empty() {
-        st = st.with_font_family_overrides(mono);
-    }
-    Some(st)
 }
 
 /// 把行内样式段的字节区间整体右移 `shift`（列表项前缀占位后偏移对齐显示文本）。
@@ -243,38 +178,204 @@ fn code_block_bands(
     bands
 }
 
-/// 把行内样式段转成可直接作 `.child()` 的元素：
-/// 有样式段时用 [`StyledText`]（等宽代码 / 粗斜体 / 删除线），否则回退纯文本。
-/// 行内代码（反引号）段会额外套一层圆角灰底背景（[`RoundedInlineText`]），
-/// 保持与正文同行/折行的同时呈现圆润 pill 效果。
-fn row_text_child(
+/// 跳转加亮「目标 `[n]` 标记」的背景色（与搜索跳转同款暖琥珀，浅/暗各一版）。
+fn marker_flash_color(dark: bool) -> Hsla {
+    if dark {
+        gpui::rgba(0xf59e0b47).into()
+    } else {
+        gpui::rgba(0xfef08a8c).into()
+    }
+}
+
+/// 把（可能重叠的）半开区间高亮合并成互不重叠的段：覆盖同一段的多个样式按字段
+/// 合并（后出现的非 None 字段覆盖前值）。gpui 的 `compute_runs`（
+/// `StyledText::with_default_highlights`）假定区间不重叠，重叠会产出长度错误的
+/// run 直接 panic——调用侧必须在喂入前合并。本处只用到 `color` / `background_color`
+/// 两个字段，合并这两者即可。
+fn merge_highlights(
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if highlights.len() <= 1 {
+        return highlights;
+    }
+    // 扫掠事件：(位置, 进入=+1/离开=-1, 区间序号)；同位置先「进入」后「离开」。
+    let mut events: Vec<(usize, i32, usize)> = Vec::with_capacity(highlights.len() * 2);
+    for (i, (r, _)) in highlights.iter().enumerate() {
+        events.push((r.start, 1, i));
+        events.push((r.end, -1, i));
+    }
+    events.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut active: Vec<usize> = Vec::new();
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut prev = 0usize;
+    for (pos, delta, idx) in events {
+        if !active.is_empty() && pos > prev {
+            let mut s = HighlightStyle::default();
+            for &a in &active {
+                if highlights[a].1.color.is_some() {
+                    s.color = highlights[a].1.color;
+                }
+                if highlights[a].1.background_color.is_some() {
+                    s.background_color = highlights[a].1.background_color;
+                }
+            }
+            out.push((prev..pos, s));
+        }
+        if delta > 0 {
+            active.push(idx);
+        } else if let Some(p) = active.iter().position(|&a| a == idx) {
+            active.remove(p);
+        }
+        prev = pos;
+    }
+    out
+}
+
+/// 行内文本子元素（统一入口）：按需要构建 [`StyledText`]（行内样式/搜索高亮/
+/// 选区高亮/引用标记着色+跳转加亮），再包一层 [`TextTrack`]——paint 阶段把文本
+/// 布局与注记矩形写进共享表，供「鼠标点选字符」与「注记双向跳转/悬浮卡片」反查。
+///
+/// - `base`：**纯文本行**的基础样式（字号/颜色要跟行级 div 一致，保证命中布局一致）；
+///   有行内样式/搜索/选区的行沿用主题默认作为基（旧观感）。
+/// - `selection`：本行选中的 (字节区间, 背景色)；None = 无选区。
+/// - `marker_hl`：跳转定位 (注记号, 是否定义, 背景色)；命中该行的对应 `[n]` 标记加亮。
+fn text_child(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
     colors: &InlineCodeColors,
     search: Option<(Range<usize>, Hsla)>,
+    selection: Option<(Range<usize>, Hsla)>,
+    base: &TextStyle,
+    notes: &[(Range<usize>, usize)],
+    note_defs: &[(Range<usize>, usize)],
+    marker_hl: Option<(usize, bool, Hsla)>,
+    row_ix: usize,
+    text_ctx: &Rc<TextCtx>,
+    note_ctx: &Rc<NoteCtx>,
 ) -> gpui::AnyElement {
-    // 主题自带的 HighlightStyle 背景只能是平面矩形；要圆角必须自绘。
-    // 这里提取"扩展空白后的代码背景区间"，用自绘 Element 画圆角。
+    // 1) 汇集行内样式段 → highlights（粗体/斜体/删除线/等宽 + 搜索背景 + 选区背景）
+    let mut highlights = Vec::with_capacity(runs.len() + 2);
+    let mut mono: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
+    for (range, kind) in runs {
+        match kind {
+            RunKind::InlineCode => {
+                // 等宽字体 overrides 只覆盖代码本体；文字色用主题配色（背景圆角自绘）。
+                highlights.push((range.clone(), inline_code_highlight(colors)));
+                mono.push((range.clone(), p.mono.clone()));
+            }
+            RunKind::Bold => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..Default::default()
+                },
+            )),
+            RunKind::Italic => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    font_style: Some(FontStyle::Italic),
+                    ..Default::default()
+                },
+            )),
+            RunKind::Strikethrough => highlights.push((
+                range.clone(),
+                HighlightStyle {
+                    strikethrough: Some(StrikethroughStyle::default()),
+                    ..Default::default()
+                },
+            )),
+            // 链接/图片：v1 按普通文字渲染（去掉 URL/括号后的文本），不额外着色
+            RunKind::Link | RunKind::Image => {}
+        }
+    }
+    // 引用标记 `[n]`（文内 `[^n]` 与末尾定义 `[!n]` 都显示成 `[n]`）→ 全局强调色
+    // RESIZE_ACCENT，与正文区分开、醒目地表明它是可点击的链接（点击做
+    // 「文内 ↔ 末尾定义」双向跳转）。
+    let link_color: Hsla = gpui::rgb(RESIZE_ACCENT).into();
+    for (range, _) in notes.iter().chain(note_defs.iter()) {
+        let end = range.end.min(text.len());
+        if range.start < end {
+            highlights.push((
+                range.start..end,
+                HighlightStyle {
+                    color: Some(link_color),
+                    ..Default::default()
+                },
+            ));
+        }
+    }
+    let push_bg = |range: &Range<usize>, color: Hsla, highlights: &mut Vec<_>| {
+        if range.start < text.len() {
+            let end = range.end.min(text.len());
+            if end > range.start {
+                highlights.push((
+                    range.start..end,
+                    HighlightStyle {
+                        background_color: Some(color),
+                        ..Default::default()
+                    },
+                ));
+            }
+        }
+    };
+    // 跳转加亮：本行是被跳转定位的目标行时，给对应的 `[n]` 标记加背景色。
+    if let Some((hn, is_def, hcolor)) = marker_hl {
+        let src = if is_def { note_defs } else { notes };
+        for (range, _) in src.iter().filter(|(_, n)| *n == hn) {
+            push_bg(range, hcolor, &mut highlights);
+        }
+    }
+    if let Some((range, color)) = &search {
+        push_bg(range, *color, &mut highlights);
+    }
+    if let Some((range, color)) = &selection {
+        push_bg(range, *color, &mut highlights);
+    }
+    // 2) 构建 StyledText（有样式段走主题默认基，纯文本走行级 base）
+    let st = if !runs.is_empty() || search.is_some() {
+        let mut s = StyledText::new(text.clone()).with_highlights(highlights);
+        if !mono.is_empty() {
+            s = s.with_font_family_overrides(mono);
+        }
+        s
+    } else {
+        // 纯文本基路径走 gpui 的 `compute_runs`：不接受重叠高亮区间（会产出长度
+        // 错误的 run 而 panic），先把标记着色/标记加亮/选区等（可能重叠的）区间
+        // 合并成互不重叠的段再喂给它。
+        StyledText::new(text.clone()).with_default_highlights(base, merge_highlights(highlights))
+    };
+    // 3) 行内代码（反引号）圆角灰底（自绘），保持与正文同行/折行
     let code_bg: Vec<Range<usize>> = runs
         .iter()
         .filter(|(_, k)| *k == RunKind::InlineCode)
         .map(|(r, _)| expand_bg_over_whitespace(text.as_ref(), r))
         .collect();
-    if code_bg.is_empty() {
-        return match styled_text(text, runs, p, colors, search) {
-            Some(st) => st.into_any_element(),
-            None => text.clone().into_any_element(),
-        };
-    }
-    let Some(st) = styled_text(text, runs, p, colors, search) else {
-        return text.clone().into_any_element();
+    let (child, st) = if code_bg.is_empty() {
+        (None, Some(st))
+    } else {
+        (
+            Some(
+                RoundedInlineText {
+                    text: st,
+                    code_bg,
+                    radius: px(5.),
+                    bg: colors.bg,
+                }
+                .into_any_element(),
+            ),
+            None,
+        )
     };
-    RoundedInlineText {
-        text: st,
-        code_bg,
-        radius: px(5.),
-        bg: colors.bg,
+    TextTrack {
+        child,
+        st,
+        text: text.clone(),
+        row_ix,
+        notes: notes.to_vec(),
+        note_defs: note_defs.to_vec(),
+        note_ctx: (!notes.is_empty() || !note_defs.is_empty()).then(|| note_ctx.clone()),
+        text_ctx: Some(text_ctx.clone()),
     }
     .into_any_element()
 }
@@ -419,10 +520,191 @@ impl Element for RoundedInlineText {
     }
 }
 
+/// 文本行包裹元素：委托被包裹文本（[`StyledText`] 或行内代码圆角）完成测量/布局/paint，
+/// 并在 paint 阶段把两种反查数据写进共享表：
+/// - 文本布局（`TextCtx.hits`）→ 鼠标点选字符定位；
+/// - 注记矩形（`NoteCtx.hits`，文内 `[^n]` 与末尾定义 `[!n]` 都记）→ 悬浮卡片 + 双向跳转。
+///
+/// `st` 与 `child` 二选一：主路径直接持有 [`StyledText`]（`child=None`），行内代码行
+/// 把 `st` 移入 [`RoundedInlineText`]（`st=None`，不参与字符级点选，仅整行层面可用）。
+struct TextTrack {
+    /// 真实渲染子元素（行内代码圆角时；主路径为 None，直接画 `st`）。
+    child: Option<gpui::AnyElement>,
+    /// 文本载体（主路径；命中时用其 `layout().index_for_position`）。
+    st: Option<StyledText>,
+    /// 显示文本（命中后取文本长度钳制字节偏移）。
+    text: gpui::SharedString,
+    /// 全局块下标（共享命中表的行标识；同帧同行使旧条目失效）。
+    row_ix: usize,
+    /// 文内引用标记 `[^n]` 的（字节区间, 注记号），区间相对 `text`。
+    notes: Vec<(Range<usize>, usize)>,
+    /// 末尾定义标记 `[!n]` 的（字节区间, 注记号），区间相对 `text`。
+    note_defs: Vec<(Range<usize>, usize)>,
+    /// 注记共享表（存在标记时记录）。
+    note_ctx: Option<Rc<NoteCtx>>,
+    /// 文本命中共享表。
+    text_ctx: Option<Rc<TextCtx>>,
+}
+
+impl TextTrack {
+    /// 把每个注记标记（`[^n]` / `[!n]`）的窗口坐标矩形写入共享命中表
+    /// （同帧同行使旧条目失效）。命中框上下左右各放大 1px，方便鼠标悬停/点击。
+    fn record_note_hits(
+        &self,
+        origin: gpui::Point<Pixels>,
+        line_h: Pixels,
+        layout: &WrappedLineLayout,
+    ) {
+        let Some(ctx) = self.note_ctx.as_ref() else {
+            return;
+        };
+        let mut hits = ctx.hits.borrow_mut();
+        hits.retain(|h| h.row_ix != self.row_ix);
+        let mut push_hit = |range: &Range<usize>, n: usize, is_def: bool| {
+            let (Some(p0), Some(p1)) = (
+                layout.position_for_index(range.start, line_h),
+                layout.position_for_index(range.end, line_h),
+            ) else {
+                return;
+            };
+            // 标记通常单行；跨行取整段包围盒。
+            let x0 = p0.x.as_f32().min(p1.x.as_f32());
+            let y0 = p0.y.as_f32().min(p1.y.as_f32());
+            let x1 = p0.x.as_f32().max(p1.x.as_f32());
+            let y1 = (p1.y.as_f32() + line_h.as_f32()).max(p0.y.as_f32() + line_h.as_f32());
+            hits.push(NoteHit {
+                row_ix: self.row_ix,
+                n,
+                is_def,
+                bounds: Bounds {
+                    origin: point(
+                        px(origin.x.as_f32() + x0 - 1.0),
+                        px(origin.y.as_f32() + y0 - 1.0),
+                    ),
+                    size: gpui::size(px(x1 - x0 + 2.0), px(y1 - y0 + 2.0)),
+                },
+            });
+        };
+        for (range, n) in &self.notes {
+            push_hit(range, *n, false);
+        }
+        for (range, n) in &self.note_defs {
+            push_hit(range, *n, true);
+        }
+    }
+}
+
+impl IntoElement for TextTrack {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TextTrack {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        if let Some(st) = &mut self.st {
+            let (lid, ()) = st.request_layout(id, inspector_id, window, cx);
+            (lid, ())
+        } else if let Some(child) = &mut self.child {
+            let lid = child.request_layout(window, cx);
+            (lid, ())
+        } else {
+            (window.request_layout(gpui::Style::default(), None, cx), ())
+        }
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        if let Some(st) = &mut self.st {
+            st.prepaint(id, inspector_id, bounds, request_layout, window, cx);
+        } else if let Some(child) = &mut self.child {
+            child.prepaint(window, cx);
+        }
+        ()
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint_state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        // 1) 记录文本命中（layout 与可见文本一致；bounds.origin 已含滚动/布局变换）。
+        if let Some(st) = &self.st {
+            let layout = st.layout();
+            if let Some(ctx) = self.text_ctx.as_ref() {
+                let mut hits = ctx.hits.borrow_mut();
+                hits.retain(|h| h.row_ix != self.row_ix);
+                hits.push(TextHit {
+                    row_ix: self.row_ix,
+                    text: self.text.clone(),
+                    layout: layout.clone(),
+                    origin: bounds.origin,
+                });
+            }
+            // 2) 记录注记命中矩形（EPUB 悬浮卡片）。
+            let origin = bounds.origin;
+            let line_h = layout.line_height();
+            if let Some(single) = layout.line_layouts().first() {
+                self.record_note_hits(origin, line_h, single);
+            }
+        }
+        // 3) 委托绘制文字。
+        if let Some(st) = &mut self.st {
+            st.paint(
+                id,
+                inspector_id,
+                bounds,
+                request_layout,
+                prepaint_state,
+                window,
+                cx,
+            );
+        } else if let Some(child) = &mut self.child {
+            child.paint(window, cx);
+        }
+    }
+}
+
 /// 渲染单个行。`code_handle` / `table_handle` 为各自稳定的横向滚动句柄
 /// （None 时自动创建），供滚动条拖动使用。
 /// `code_hl`：该代码块的语法高亮缓存（每行语义名 run）；None = 无高亮（纯文本）。
 /// `search`：搜索跳转高亮 (命中文本字节区间, 背景色)，只给命中文本着色（不吃整行）。
+/// `epub`：EPUB 阅读排版（标题居中、正文首行缩进 2 字符）。
+/// `note_ctx`：注记共享上下文（[`NoteCtx`]；EPUB 脚注悬浮卡片用）。
+/// `text_ctx`：文本命中共享上下文（[`TextCtx`]；鼠标点选字符用）。
+/// `selection`: 本行选中的 (字节区间, 背景色)；None = 无选区。
+/// `marker_hl`：引用双向跳转的定位 (注记号, 是否定义)；本行是被定位目标时由 `text_child`
+/// 给对应 `[n]` 标记加亮（背景色按主题取）。
+/// `row_ix`：全局块下标（注记/文本命中表行标识）。
 pub(crate) fn render_row(
     row: &Row,
     p: &Rc<StyleParams>,
@@ -431,12 +713,20 @@ pub(crate) fn render_row(
     code_hl: Option<Rc<CodeLineRuns>>,
     table_handle: Option<ScrollHandle>,
     search: Option<(Range<usize>, Hsla)>,
+    epub: bool,
+    note_ctx: &Rc<NoteCtx>,
+    text_ctx: &Rc<TextCtx>,
+    selection: Option<(Range<usize>, Hsla)>,
+    marker_hl: Option<(usize, bool)>,
+    row_ix: usize,
     cx: &mut App,
 ) -> gpui::AnyElement {
     // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
     let inline_colors = inline_code_colors(cx);
     // 当前主题明/暗（代码块语法着色色板随主题）。
     let dark = gpui_component::Theme::global(cx).is_dark();
+    // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
     let code_runs = code_hl.as_deref();
     // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
     // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
@@ -649,8 +939,27 @@ pub(crate) fn render_row(
         }
         match row.kind {
             RowKind::Paragraph => {
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
-                return div()
+                // 正文首行缩进 2 字符由 EPUB 转换器在行首前置「　　」实现（本行只负责对齐）。
+                let t = text_child(
+                    &row.text,
+                    &row.runs,
+                    &p,
+                    &inline_colors,
+                    search,
+                    selection,
+                    &TextStyle {
+                        font_size: p.para_size.into(),
+                        color: p.fg,
+                        ..TextStyle::default()
+                    },
+                    &row.notes,
+                    &row.note_defs,
+                    marker_hl,
+                    row_ix,
+                    text_ctx,
+                    note_ctx,
+                );
+                let mut el = div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
                     .flex_shrink_0()
@@ -658,14 +967,41 @@ pub(crate) fn render_row(
                     .py_1()
                     .whitespace_normal()
                     .text_size(p.para_size)
-                    .text_color(p.fg)
-                    .child(t)
-                    .into_any_element();
+                    .text_color(p.fg);
+                match row.align {
+                    Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
+                    Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
+                    _ => {}
+                }
+                return el.child(t).into_any_element();
             }
             RowKind::Heading(n) => {
                 let (fs, lh) = p.heading_metrics(n);
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
-                return div()
+                // EPUB 章/节标题居中（行内也可显式指定对齐）。
+                let h_align = row
+                    .align
+                    .or_else(|| if epub { Some(RowAlign::Center) } else { None });
+                let t = text_child(
+                    &row.text,
+                    &row.runs,
+                    &p,
+                    &inline_colors,
+                    search,
+                    selection,
+                    &TextStyle {
+                        font_size: fs.into(),
+                        color: p.fg,
+                        font_weight: FontWeight::BOLD,
+                        ..TextStyle::default()
+                    },
+                    &row.notes,
+                    &row.note_defs,
+                    marker_hl,
+                    row_ix,
+                    text_ctx,
+                    note_ctx,
+                );
+                let mut el = div()
                     .w_full()
                     .min_h(lh)
                     .flex_shrink_0()
@@ -674,35 +1010,66 @@ pub(crate) fn render_row(
                     .whitespace_normal()
                     .text_size(fs)
                     .text_color(p.fg)
-                    .font_weight(FontWeight::BOLD)
-                    .child(t)
-                    .into_any_element();
+                    .font_weight(FontWeight::BOLD);
+                match h_align {
+                    Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
+                    Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
+                    _ => {}
+                }
+                return el.child(t).into_any_element();
             }
             RowKind::Quote => {
                 // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
                 // 避免背景带顶到左边缘（同代码块做法）。
-                let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
+                // 引述块**连续化**：去掉每行的外层纵向外衬与段落行距——相邻引述行的
+                // 灰带紧贴 → 整段引述（跨多行/多段）呈现一整片背景，无白色分割。
+                // 块内行距由每行灰带的 `py_1`（背景内衬）提供。
+                // 行内对齐（EPUB 引述里的落款 `%%ALIGN:RIGHT%%` 等）作用于引述带内容。
+                let bar_color: Hsla = gpui::rgb(QUOTE_BAR_COLOR).into();
+                let t = text_child(
+                    &row.text,
+                    &row.runs,
+                    &p,
+                    &inline_colors,
+                    search,
+                    selection,
+                    &TextStyle {
+                        font_size: p.para_size.into(),
+                        color: p.muted_fg,
+                        ..TextStyle::default()
+                    },
+                    &row.notes,
+                    &row.note_defs,
+                    marker_hl,
+                    row_ix,
+                    text_ctx,
+                    note_ctx,
+                );
+                let mut band = div()
+                    .debug_selector(|| "md-quote-band".into())
+                    .w_full()
+                    .pl_3()
+                    .pr_3()
+                    .py_1()
+                    // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
+                    // 比灰底略深，标识引用块。
+                    .border_l(px(QUOTE_BAR_WIDTH_PX))
+                    .border_color(bar_color)
+                    .bg(p.quote_bg)
+                    .whitespace_normal()
+                    .text_size(p.para_size)
+                    .text_color(p.muted_fg);
+                match row.align {
+                    Some(RowAlign::Center) => band = band.flex().flex_row().justify_center(),
+                    Some(RowAlign::Right) => band = band.flex().flex_row().justify_end(),
+                    _ => {}
+                }
                 return div()
                     .w_full()
-                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+                    .min_h(px(p.para_line.as_f32()))
                     .flex_shrink_0()
                     .px_3()
-                    .py_1()
-                    .child(
-                        div()
-                            .debug_selector(|| "md-quote-band".into())
-                            .w_full()
-                            .pl_3()
-                            .pr_3()
-                            .py_1()
-                            .border_l_2()
-                            .border_color(p.accent)
-                            .bg(p.quote_bg)
-                            .whitespace_normal()
-                            .text_size(p.para_size)
-                            .text_color(p.muted_fg)
-                            .child(t),
-                    )
+                    .child(band.child(t))
                     .into_any_element();
             }
             RowKind::Bullet => {
@@ -713,7 +1080,38 @@ pub(crate) fn render_row(
                 let display = gpui::SharedString::from(text);
                 let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
                 let runs = shift_runs(&row.runs, shift);
-                let t = row_text_child(&display, &runs, &p, &inline_colors, shift_search(&search, shift));
+                let notes: Vec<(Range<usize>, usize)> = row
+                    .notes
+                    .iter()
+                    .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+                    .collect();
+                let note_defs: Vec<(Range<usize>, usize)> = row
+                    .note_defs
+                    .iter()
+                    .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+                    .collect();
+                let selection2 = selection
+                    .as_ref()
+                    .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c));
+                let t = text_child(
+                    &display,
+                    &runs,
+                    &p,
+                    &inline_colors,
+                    shift_search(&search, shift),
+                    selection2,
+                    &TextStyle {
+                        font_size: p.para_size.into(),
+                        color: p.fg,
+                        ..TextStyle::default()
+                    },
+                    &notes,
+                    &note_defs,
+                    marker_hl,
+                    row_ix,
+                    text_ctx,
+                    note_ctx,
+                );
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -766,7 +1164,26 @@ pub(crate) fn render_row(
         }
         RowKind::Heading(n) => {
             let (fs, lh) = p.heading_metrics(n);
-            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
+            let t = text_child(
+                &row.text,
+                &row.runs,
+                &p,
+                &inline_colors,
+                search,
+                selection,
+                &TextStyle {
+                    font_size: fs.into(),
+                    color: p.fg,
+                    font_weight: FontWeight::BOLD,
+                    ..TextStyle::default()
+                },
+                &row.notes,
+                &row.note_defs,
+                marker_hl,
+                row_ix,
+                text_ctx,
+                note_ctx,
+            );
             div()
                 .h(lh)
                 .w_full()
@@ -783,7 +1200,25 @@ pub(crate) fn render_row(
         RowKind::Quote => {
             // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
             // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = row_text_child(&row.text, &row.runs, &p, &inline_colors, search);
+            let t = text_child(
+                &row.text,
+                &row.runs,
+                &p,
+                &inline_colors,
+                search,
+                selection,
+                &TextStyle {
+                    font_size: p.para_size.into(),
+                    color: p.muted_fg,
+                    ..TextStyle::default()
+                },
+                &row.notes,
+                &row.note_defs,
+                marker_hl,
+                row_ix,
+                text_ctx,
+                note_ctx,
+            );
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -819,7 +1254,38 @@ pub(crate) fn render_row(
             let display = gpui::SharedString::from(text);
             let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
             let runs = shift_runs(&row.runs, shift);
-            let t = row_text_child(&display, &runs, &p, &inline_colors, shift_search(&search, shift));
+            let notes: Vec<(Range<usize>, usize)> = row
+                .notes
+                .iter()
+                .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+                .collect();
+            let note_defs: Vec<(Range<usize>, usize)> = row
+                .note_defs
+                .iter()
+                .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+                .collect();
+            let selection2 = selection
+                .as_ref()
+                .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c));
+            let t = text_child(
+                &display,
+                &runs,
+                &p,
+                &inline_colors,
+                shift_search(&search, shift),
+                selection2,
+                &TextStyle {
+                    font_size: p.para_size.into(),
+                    color: p.fg,
+                    ..TextStyle::default()
+                },
+                &notes,
+                &note_defs,
+                marker_hl,
+                row_ix,
+                text_ctx,
+                note_ctx,
+            );
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -843,7 +1309,27 @@ pub(crate) fn render_row(
             .whitespace_nowrap()
             .text_size(p.para_size)
             .text_color(p.fg)
-            .child(row_text_child(&row.text, &row.runs, &p, &inline_colors, search)),
+            .child(
+                text_child(
+                    &row.text,
+                    &row.runs,
+                    &p,
+                    &inline_colors,
+                    search,
+                    selection,
+                    &TextStyle {
+                        font_size: p.para_size.into(),
+                        color: p.fg,
+                        ..TextStyle::default()
+                    },
+                    &row.notes,
+                    &row.note_defs,
+                    marker_hl,
+                    row_ix,
+                    text_ctx,
+                    note_ctx,
+                ),
+            ),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
