@@ -45,7 +45,8 @@ use gpui_component::input::{
 };
 
 use crate::config::layout::{
-    BRACKET_GUIDE_CLOSE_TAIL_LINES, BRACKET_GUIDE_OPEN_HEAD_LINES, EDITOR_RULER_COLUMNS,
+    BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_CLOSE_TAIL_LINES, BRACKET_GUIDE_OPEN_HEAD_LINES,
+    BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
 };
 use crate::config::limits::EDITOR_VSCROLL_BOTTOM_EXTRA_LINES;
 use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES;
@@ -2651,7 +2652,8 @@ impl Render for CodeEditor {
         // 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
         // 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
         // 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
-        // 最内层块竖线（`active_guide_open`）用强调蓝加粗 2px。
+        // 最内层块竖线（`active_guide_open`）用强调蓝加宽（粗细见
+        // [`crate::config::layout::BRACKET_GUIDE_ACTIVE_WIDTH`]）。
         let guide_segments = self.bracket_guide_segments_flagged(
             vis_top, _vis_off, lh, harea_w, view_h, self.active_guide_open,
         );
@@ -2672,7 +2674,11 @@ impl Render for CodeEditor {
                     .debug_selector(|| "ce-bracket-guide".into())
                     .left(px(x))
                     .top(px(y))
-                    .w(px(if active { 2.0 } else { 1.0 }))
+                    .w(px(if active {
+                        BRACKET_GUIDE_ACTIVE_WIDTH
+                    } else {
+                        BRACKET_GUIDE_WIDTH
+                    }))
                     .h(px(h.max(0.)))
                     .bg(if active { active_guide_color } else { guide_color })
             }));

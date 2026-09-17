@@ -42,4 +42,11 @@ pub const BRACKET_GUIDE_CLOSE_TAIL_LINES: f32 = 0.4;
 /// 竖线**顶部**从首覆盖行（开行下一行）顶部向下缩进的行高系数：0 = 紧贴开行
 /// （默认）；调大 → 顶部留白（开行与竖线起点间距）增大。与
 /// [`BRACKET_GUIDE_CLOSE_TAIL_LINES`] 配套微调上下观感。
-pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.3;
+pub const BRACKET_GUIDE_OPEN_HEAD_LINES: f32 = 0.4;
+
+/// 括号标尺竖线宽度（px）：普通（未点亮）竖线。
+pub const BRACKET_GUIDE_WIDTH: f32 = 1.0;
+
+/// 括号标尺**点亮**竖线宽度（px）：点击代码区域后高亮的最内层块竖线。
+/// 与普通竖线等宽（1px），高亮仅靠强调色区分，不额外加粗、不喧宾夺主。
+pub const BRACKET_GUIDE_ACTIVE_WIDTH: f32 = 1.0;
