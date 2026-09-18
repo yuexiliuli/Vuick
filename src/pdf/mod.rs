@@ -192,6 +192,48 @@ mod tests {
     }
 
     #[test]
+    fn worker_renders_mid_at_mid_resolution() {
+        let _guard = pdf_lock().lock().unwrap();
+        // L0.5 中清页：宽度应按 MID_WIDTH 推导，体积介于缩略图与全清之间（拖动清晰度主力）
+        let p = test_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let rx_mid = worker.request_mid(doc_id, 0);
+        let mid = rx_mid
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到中清页")
+            .expect("中清页渲染应成功");
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let full = rx_full
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到全清")
+            .expect("全清渲染应成功");
+        let rx_thumb = worker.request_thumb(doc_id, 0);
+        let thumb = rx_thumb
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到缩略图")
+            .expect("缩略图渲染应成功");
+        let pt_w = dims[0].0;
+        let expect_w = ((crate::config::pdf::MID_WIDTH / pt_w.max(1.0))
+            .clamp(0.1, 1.0)
+            * pt_w)
+            .ceil() as u32; // ceil(pw * scale)，与 render_page 一致
+        assert_eq!(
+            mid.width, expect_w,
+            "中清页宽应与 MID_WIDTH 推导一致：实际 {} 期望 {}",
+            mid.width, expect_w
+        );
+        assert!(
+            mid.bgra.len() > thumb.bgra.len() && mid.bgra.len() < full.bgra.len(),
+            "中清体积应介于缩略图与全清之间：thumb {} < mid {} < full {}",
+            thumb.bgra.len(),
+            mid.bgra.len(),
+            full.bgra.len()
+        );
+    }
+
+    #[test]
     fn worker_renders_many_pages_individually() {
         let _guard = pdf_lock().lock().unwrap();
         // 259 页的 PDF：抽查首/中/末各一页（模拟「滚动到哪渲染哪」）

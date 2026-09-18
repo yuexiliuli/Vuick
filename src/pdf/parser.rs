@@ -249,8 +249,11 @@ enum WorkerMsg {
         mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
     ),
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
-    /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级低于全尺寸 Render、
-    /// 高于懒加载的 Text：拖动期间先铺低清占位，全尺寸随后补齐。
+    /// L0.5 中清页渲染（~520px，~5ms/张）。优先级低于全尺寸 Render、高于缩略图
+    /// Thumb：快速拖动时用中清页保证可辨识度，同时比全清便宜 ~6×。
+    Mid(DocId, usize, mpsc::Sender<Option<RenderResult>>),
+    /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级从高到低：Render > Mid > Thumb >
+    /// Text——拖动期间先铺中清/缩略占位，全尺寸随后补齐。
     Thumb(DocId, usize, mpsc::Sender<Option<RenderResult>>),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
@@ -323,6 +326,14 @@ impl PdfWorker {
         rx
     }
 
+    /// 请求某页的 L0.5 中清页（异步、~520px）。优先级介于全尺寸与缩略图之间：
+    /// 快速拖动时用中清页保证可辨识度，停止后淡入全清。
+    pub fn request_mid(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<RenderResult>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::Mid(doc_id, page, tx));
+        rx
+    }
+
     /// 关闭文档，释放 pdfium 侧资源（阅读器关闭时调用）。
     pub fn close(&self, doc_id: DocId) {
         let _ = self.tx.send(WorkerMsg::Close(doc_id));
@@ -373,10 +384,11 @@ impl PdfWorker {
             while let Ok(msg) = rx.try_recv() {
                 queue.push_back(msg);
             }
-            // 优先级：全尺寸 Render > Thumb（低清占位）> 其余（Open/Close/Text/Search FIFO）
+            // 优先级：全尺寸 Render > Mid（中清）> Thumb（低清）> 其余（Open/Close/Text/Search FIFO）
             let msg = queue
                 .iter()
                 .position(|m| matches!(m, WorkerMsg::Render(..)))
+                .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Mid(..))))
                 .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))))
                 .map(|i| queue.remove(i).expect("position 已命中"))
                 .unwrap_or_else(|| queue.pop_front().expect("queue 已保证非空"));
@@ -401,6 +413,12 @@ impl PdfWorker {
                     let result = docs
                         .get(&doc_id)
                         .and_then(|doc| render_page(doc, req));
+                    let _ = tx.send(result);
+                }
+                WorkerMsg::Mid(doc_id, page, tx) => {
+                    let result = docs
+                        .get(&doc_id)
+                        .and_then(|doc| render_mid(doc, page));
                     let _ = tx.send(result);
                 }
                 WorkerMsg::Thumb(doc_id, page, tx) => {
@@ -497,6 +515,20 @@ fn render_thumb(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0) as f32;
     let scale = (crate::config::pdf::THUMB_WIDTH / pw).clamp(0.1, 1.0);
+    render_page(doc, RenderRequest {
+        page: page_index,
+        scale,
+    })
+}
+
+/// 在工作线程内：栅格化某页的 **L0.5 中清页**（~520px 宽，~5ms/张，用于快速拖动）。
+///
+/// 缩放按目标宽度 [`MID_WIDTH`](crate::config::pdf::MID_WIDTH) 推导并夹在
+/// `[0.1, 1.0]`。比全清便宜 ~6×，比 260px 缩略图清晰得多（可辨识标题/段落结构）。
+fn render_mid(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult> {
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let pw = page.width().value.max(1.0) as f32;
+    let scale = (crate::config::pdf::MID_WIDTH / pw).clamp(0.1, 1.0);
     render_page(doc, RenderRequest {
         page: page_index,
         scale,

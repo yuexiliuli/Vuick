@@ -22,6 +22,11 @@ pub(crate) struct Slot {
     pub(crate) thumb: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 缩略图是否正在后台渲染（避免重复派发）。
     pub(crate) thumb_loading: bool,
+    /// L0.5 中清页（~520px）：快速拖动时优先展示（比 260px 缩略图清晰、可辨识标题/
+    /// 段落结构），停止后作为淡入底图过渡到全尺寸。
+    pub(crate) mid: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// 中清页是否正在后台渲染（避免重复派发）。
+    pub(crate) mid_loading: bool,
 }
 
 /// 某页在页列里的显示高度（保持宽高比）。

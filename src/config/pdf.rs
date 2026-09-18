@@ -21,7 +21,8 @@ pub const ZOOM_STEP: f32 = 0.12;
 /// 可见窗口外保留的页数（虚拟化/预取缓冲）。
 pub const MARGIN: usize = 3;
 /// 内存页位图保留上限（页数，超过按距离 LRU 淘汰）。
-pub const CACHE_MAX_PAGES: usize = 12;
+/// 偏保守（8 页 ≈ 32MB @840px 全清）：全清昂贵，回翻由磁盘缓存+缩略图/中清占位兜底。
+pub const CACHE_MAX_PAGES: usize = 8;
 /// 并发排队给 pdfium 线程的渲染请求上限（节流，防快速滚动请求堆积）。
 pub const MAX_INFLIGHT: usize = 3;
 /// 滚动方向预测性预取：可见窗口外、滚动方向前方再预取 N 页进调度队列
@@ -34,8 +35,14 @@ pub const WRITE_QUEUE_MAX: usize = 16;
 /// 滚动速度（px/帧，EMA）超过此值视为"快速拖动"：全尺寸渲染降并发、跳过预取、
 /// 只由缩略图层占位——避免把 GPU/pdfium + 编码 CPU 烧在即将滚过的页面上。
 pub const MOVE_THRESHOLD_PX: f32 = 160.0;
+/// 速度迟滞退出比率：**进入**快速模式仍用 [`MOVE_THRESHOLD_PX`]，**退出**用它×本
+/// 比率（更小阈值）——临界速度下保持上一状态，避免 LOD 降级/恢复反复横跳。
+pub const MOVE_THRESHOLD_LOWER_RATIO: f32 = 0.7;
 /// 快速拖动时同时排队给 pdfium 的全尺寸渲染请求上限（常态用 [`MAX_INFLIGHT`]）。
 pub const MAX_INFLIGHT_MOTION: usize = 1;
+/// L0→L1 交叉淡入时长（ms）：全尺寸位图就绪后与缩略图叠加、透明度渐显，
+/// 消除停止瞬间的清晰化跳变；动画结束才卸载缩略图。
+pub const FADE_MS: u64 = 150;
 /// 磁盘二级页缓存字节上限（≈ 150 页压缩后的 WebP；页面大小差异大时页数上限不可靠，
 /// 32 页 A3 图纸 vs 32 页 A4 文本差 10 倍，故按字节累计、LRU 淘汰，最多保留 1 页兜底）。
 pub const CACHE_DISK_BYTES: u64 = 256 * 1024 * 1024;
@@ -44,10 +51,20 @@ pub const CACHE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 pub const THUMB_WIDTH: f32 = 260.0;
 /// 同时在途的缩略图请求上限（独立于全尺寸 `MAX_INFLIGHT`，不挤占渲染带宽）。
 pub const MAX_THUMB_INFLIGHT: usize = 4;
-/// 内存中保留的缩略图页数上限（超限丢离视口中心最远者；每张 ~250KB）。
-pub const THUMB_CACHE_PAGES: usize = 200;
+/// 内存中保留的缩略图页数上限（超限丢离视口中心最远者；每张 ~0.37MB RGBA，
+/// 40 张 ≈ 15MB——够覆盖快速拖动最近 ~5 屏，兼顾内存）。
+pub const THUMB_CACHE_PAGES: usize = 40;
 /// 磁盘缩略图字节预算（≈ 上千张 260px WebP；热页缩略图常驻盘，回翻即时）。
 pub const CACHE_THUMB_BYTES: u64 = 96 * 1024 * 1024;
+// ---- L0.5 中清 LOD（快速拖动时的清晰度）：260px 缩略图拉 3.2× 到 840px 必然糊，
+// 加一档 ~520px 中清页，拖动时可辨识标题/段落结构，且比全清便宜 ~6×（~5ms/张）----
+/// 中清目标显示宽（px）：快速拖动时优先派发/显示；停止后中清→全清淡入。
+pub const MID_WIDTH: f32 = 520.0;
+/// 同时在途的中清请求上限（仅拖动期使用，独立于全尺寸在途）。
+pub const MAX_MID_INFLIGHT: usize = 4;
+/// 内存中保留的中清页数上限（每张 ~1.5MB RGBA，16 张 ≈ 24MB；中清可 ~5ms 重建，
+/// 低驻留即可——快速拖动最近 ~2 屏，停止淡入完成后即卸载）。
+pub const MID_CACHE_PAGES: usize = 16;
 /// 文本层 LRU 缓存页数上限（每页 ~20-100KB，24 页 <3MB；选中/复制/搜索用）。
 pub const TEXT_CACHE_PAGES: usize = 24;
 /// 同时并发预取的文本页数上限（低优先级，不抢栅格化带宽）。

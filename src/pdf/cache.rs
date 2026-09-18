@@ -515,4 +515,94 @@ mod tests {
         assert_eq!(stale, 0, "旧版本文件应被清理");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// 性能对比摸底（打印，不构成断言；`--ignored` 运行，匹配仓库 bench 惯例）：
+    /// 「修改前＝原始紧凑 BGRA 落盘 + 页数 LRU(32)」 vs 「修改后＝WebP-Lossless +
+    /// 字节预算 LRU(256MB)」——真实 PDF 页面的单页体积压缩率、落盘编码耗时、
+    /// 读回解码耗时，以及文档级磁盘缓存体量预估。
+    ///
+    /// 运行：`cargo test --release --bin gpui-editor bench_webp_vs_raw -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_webp_vs_raw() {
+        use std::time::{Duration, Instant};
+        use crate::pdf::{PdfWorker, RenderRequest};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf");
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let page_count = dims.len();
+        let n = page_count.min(10);
+
+        let mut raw_total = 0u64;
+        let mut webp_total = 0u64;
+        let mut enc_sum: u64 = 0;
+        let mut dec_sum: u64 = 0;
+        let mut enc_max: u64 = 0;
+        let mut dec_max: u64 = 0;
+        eprintln!("=== 修改前/后 磁盘缓存对比（{page_count} 页长文档，采样前 {n} 页，页面显示宽 ~840px）===");
+        for idx in 0..n {
+            let pt_w = dims[idx].0;
+            let scale = crate::pdf::layout::render_scale(840.0, 1.0, pt_w);
+            let rx = worker.request_render(doc_id, RenderRequest { page: idx, scale });
+            let res = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("渲染超时")
+                .expect("渲染应成功");
+            let raw = res.bgra.len() as u64; // 修改前：紧凑 BGRA 原文落盘
+            let t0 = Instant::now();
+            let webp = encode_webp(&res.bgra, res.width, res.height).expect("编码应成功");
+            let enc_ms = t0.elapsed().as_millis() as u64;
+            let t1 = Instant::now();
+            let (back, w, h) = decode_webp(&webp).expect("解码应成功");
+            let dec_ms = t1.elapsed().as_millis() as u64;
+            assert_eq!((w, h), (res.width, res.height), "解码尺寸应一致");
+            assert_eq!(back.len() as u64, raw, "WebP 无损往返应字节等长");
+            raw_total += raw;
+            webp_total += webp.len() as u64;
+            enc_sum += enc_ms;
+            dec_sum += dec_ms;
+            enc_max = enc_max.max(enc_ms);
+            dec_max = dec_max.max(dec_ms);
+            eprintln!(
+                "  页 {idx:>2}: {w}x{h}px  原始 {raw:>8}B → WebP {wp:>7}B ({ratio:.1}%)  编码 {enc_ms}ms 解码 {dec_ms}ms",
+                w = res.width,
+                h = res.height,
+                raw = raw,
+                wp = webp.len(),
+                ratio = webp.len() as f64 / raw as f64 * 100.0
+            );
+        }
+        let avg_raw = raw_total / n as u64;
+        let avg_webp = webp_total / n as u64;
+        // 修改前：旧页数 LRU = 32 页 × 均页原始体积（最坏存量上限）
+        let before_budget_cap = 32u64.saturating_mul(avg_raw);
+        // 修改后：256MB 字节预算 × WebP 均页 → 可驻留页数（全文档是否放得下）
+        let after_cap_pages = crate::config::pdf::CACHE_DISK_BYTES / avg_webp.max(1);
+        let after_full_doc = avg_webp * page_count as u64;
+        eprintln!(
+            "=== 汇总（前 {n} 页均值）==="
+        );
+        eprintln!(
+            "单页体积：原始 {avg_raw} B/页 → WebP {avg_webp} B/页（{:.0}% = 约 {:.1}× 压缩）",
+            avg_webp as f64 / avg_raw as f64 * 100.0,
+            avg_raw as f64 / avg_webp.max(1) as f64
+        );
+        eprintln!(
+            "编码耗时：均值 {enc_avg}ms（最大 {enc_max}ms）；读回解码：均值 {dec_avg}ms（最大 {dec_max}ms）",
+            enc_avg = enc_sum / n as u64,
+            dec_avg = dec_sum / n as u64
+        );
+        eprintln!(
+            "磁盘预算：修改前 页数LRU上限 32×均页 = {:.1} MB；修改后 字节预算 256MB 可驻留 {} 页（全文档 {} 页需 {:.1} MB → {})",
+            before_budget_cap as f64 / 1e6,
+            after_cap_pages,
+            page_count,
+            after_full_doc as f64 / 1e6,
+            if after_cap_pages >= page_count as u64 { "全量驻留 ✓" } else { "超出字节预算会 LRU 淘汰" }
+        );
+    }
 }
