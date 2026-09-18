@@ -128,6 +128,47 @@ pub struct RenderRequest {
     pub scale: f32,
 }
 
+/// 瓦片渲染请求：把某页切成 [TILE_SIZE × TILE_SIZE] 的网格，栅格化其中一格。
+///
+/// - `scale` = 当前显示密度（px/pt，见 [`crate::pdf::layout::render_scale`]）：瓦片按
+///   **显示物理像素** 1:1 渲染，无论是高 DPI 屏还是 Ctrl+滚轮放大，文字/图形都不经
+///   GPU 上采样——这是"整页 4× 缩放位图 → 发糊"的根治手段之一。
+/// - `col / row` 决定页位图内的哪一格；worker 只分配一格大小的 BGRA 缓冲
+///   （~512²×4 ≈ 1MB），整页分摊到视口可见的几片里，内存不再随缩放爆炸。
+#[derive(Debug, Clone, Copy)]
+pub struct TileRequest {
+    pub page: usize,
+    pub scale: f32,
+    pub tile_size: u32,
+    pub row: u32,
+    pub col: u32,
+}
+
+/// 一块瓦片的渲染结果：像素 + 在页位图中的几何（含出血裁剪，夹到页内）。
+///
+/// view 层用 `x0/y0/w/h` **原样**定位瓦片（与 worker 同宗同一套数学，见
+/// [`crate::pdf::layout::tile_rect`]），再用 `full_w/full_h` 换算卡片显示比例。
+#[derive(Debug)]
+pub struct TileResult {
+    pub page: usize,
+    pub row: u32,
+    pub col: u32,
+    /// 瓦片在页位图中的左上角 x（含出血）。
+    pub x0: u32,
+    /// 瓦片在页位图中的左上角 y。
+    pub y0: u32,
+    /// 瓦片位图实际宽（含出血，夹到页内）。
+    pub w: u32,
+    /// 瓦片位图实际高。
+    pub h: u32,
+    /// 页位图全宽（= ceil(页pt宽 × scale)）。
+    pub full_w: u32,
+    /// 页位图全高。
+    pub full_h: u32,
+    /// 紧凑 RGBA 像素（`w*h*4` 字节；pdfium 反字节序后即 RGBA）。
+    pub bgra: Vec<u8>,
+}
+
 /// 渲染结果：页面 **BGRA 像素字节** + 位图像素 (宽, 高)。
 ///
 /// `bgra` 直接来自 pdfium 的原生 BGRA 缓冲（`FPDFBitmap_GetBuffer_as_vec`），
@@ -248,12 +289,17 @@ enum WorkerMsg {
         Vec<u8>,
         mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
     ),
+    #[allow(dead_code)] // 供回归/基准测试渲染整页（文本对齐、贴片比对）；生产内容层走 RenderTile
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
-    /// L0.5 中清页渲染（~520px，~5ms/张）。优先级低于全尺寸 Render、高于缩略图
+    /// 瓦片渲染（主内容路径）：只栅格化一页的一格（~512px）。与全尺寸 Render 同一
+    /// 优先级（视口内容优先），worker 内实现见 [`render_tile`]。
+    RenderTile(DocId, TileRequest, mpsc::Sender<Option<TileResult>>),
+    /// L0.5 中清页渲染（~520px × DPI，~5ms/张）。优先级低于全尺寸 Render、高于缩略图
     /// Thumb：快速拖动时用中清页保证可辨识度，同时比全清便宜 ~6×。
-    Mid(DocId, usize, mpsc::Sender<Option<RenderResult>>),
-    /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级从高到低：Render > Mid > Thumb >
-    /// Text——拖动期间先铺中清/缩略占位，全尺寸随后补齐。
+    /// `scale_factor` 使目标宽度按显示 DPI 推导（DPI>1 时预览仍锐利，不经 GPU 上采样发糊）。
+    Mid(DocId, usize, f32, mpsc::Sender<Option<RenderResult>>),
+    /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级从高到低：Render/RenderTile > Mid >
+    /// Thumb > Text——拖动期间先铺中清/缩略占位，瓦片随后补齐。
     Thumb(DocId, usize, mpsc::Sender<Option<RenderResult>>),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
@@ -311,10 +357,19 @@ impl PdfWorker {
         Ok((worker.clone(), doc_id, dims, outlines))
     }
 
-    /// 请求渲染某页（异步）。返回一个接收结果的通道。
+    /// 请求渲染某页（异步，供回归/基准测试用；生产内容层改用 [`Self::request_tile`]）。
+    /// 返回一个接收结果的通道。
+    #[allow(dead_code)]
     pub fn request_render(&self, doc_id: DocId, req: RenderRequest) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send(WorkerMsg::Render(doc_id, req, tx));
+        rx
+    }
+
+    /// 请求渲染某页的一格瓦片（异步、主内容路径）。返回接收结果的通道。
+    pub fn request_tile(&self, doc_id: DocId, req: TileRequest) -> mpsc::Receiver<Option<TileResult>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::RenderTile(doc_id, req, tx));
         rx
     }
 
@@ -326,11 +381,17 @@ impl PdfWorker {
         rx
     }
 
-    /// 请求某页的 L0.5 中清页（异步、~520px）。优先级介于全尺寸与缩略图之间：
-    /// 快速拖动时用中清页保证可辨识度，停止后淡入全清。
-    pub fn request_mid(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<RenderResult>> {
+    /// 请求某页的 L0.5 中清页（异步、~520px × DPI）。优先级介于瓦片/全尺寸与缩略图之间：
+    /// 快速拖动时用中清页保证可辨识度。`scale_factor` 参与目标宽度推导（高 DPI 屏上
+    /// 预览仍锐利）。
+    pub fn request_mid(
+        &self,
+        doc_id: DocId,
+        page: usize,
+        scale_factor: f32,
+    ) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
-        let _ = self.tx.send(WorkerMsg::Mid(doc_id, page, tx));
+        let _ = self.tx.send(WorkerMsg::Mid(doc_id, page, scale_factor, tx));
         rx
     }
 
@@ -384,10 +445,11 @@ impl PdfWorker {
             while let Ok(msg) = rx.try_recv() {
                 queue.push_back(msg);
             }
-            // 优先级：全尺寸 Render > Mid（中清）> Thumb（低清）> 其余（Open/Close/Text/Search FIFO）
+            // 优先级：全尺寸 Render / RenderTile > Mid（中清）> Thumb（低清）> 其余
+            // （Open/Close/Text/Search FIFO）。瓦片与整页渲染同为视口内容，优先级并列。
             let msg = queue
                 .iter()
-                .position(|m| matches!(m, WorkerMsg::Render(..)))
+                .position(|m| matches!(m, WorkerMsg::Render(..) | WorkerMsg::RenderTile(..)))
                 .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Mid(..))))
                 .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))))
                 .map(|i| queue.remove(i).expect("position 已命中"))
@@ -415,10 +477,16 @@ impl PdfWorker {
                         .and_then(|doc| render_page(doc, req));
                     let _ = tx.send(result);
                 }
-                WorkerMsg::Mid(doc_id, page, tx) => {
+                WorkerMsg::RenderTile(doc_id, req, tx) => {
                     let result = docs
                         .get(&doc_id)
-                        .and_then(|doc| render_mid(doc, page));
+                        .and_then(|doc| render_tile(doc, req));
+                    let _ = tx.send(result);
+                }
+                WorkerMsg::Mid(doc_id, page, scale_factor, tx) => {
+                    let result = docs
+                        .get(&doc_id)
+                        .and_then(|doc| render_mid(doc, page, scale_factor));
                     let _ = tx.send(result);
                 }
                 WorkerMsg::Thumb(doc_id, page, tx) => {
@@ -507,6 +575,43 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
     })
 }
 
+/// 在工作线程内：栅格化某页的一格瓦片（SumatraPDF 式分块渲染的主内容路径）。
+///
+/// 机制（与 pdfium-render 官方 `set_origin` 条带拼接测试同款）：给瓦片大小的
+/// BGRA 缓冲，把页面以**整页位图尺寸**为参考缩放到 `full_w × full_h`，再用
+/// 负 `set_origin(-x0, -y0)` 把页面左上角推到缓冲右上角——pdfium 渲染时自动
+/// 裁剪到缓冲边界，于是只有 `[x0, x0+w) × [y0, y0+h)` 这一格被画进 ~1MB 的小缓冲。
+///
+/// 内存：每片恒 ≈ TILE_SIZE² × 4，**与缩放倍数无关**；同一页切成 视口可见 的几片，
+/// 不再存在"4× 缩放一页 = 64MB 整页位图"的内存/density 上限墙。
+fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
+    let page = doc.pages().get(req.page as i32).ok()?;
+    let (pw, ph) = (page.width().value as f32, page.height().value as f32);
+    let bmp = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
+    let (x0, y0, w, h) =
+        crate::pdf::layout::tile_rect(req.col, req.row, req.tile_size, crate::config::pdf::TILE_BLEED, bmp)?;
+    let mut dst = PdfBitmap::empty(w as i32, h as i32, PdfBitmapFormat::BGRA).ok()?;
+    page.render_into_bitmap_with_config(
+        &mut dst,
+        &PdfRenderConfig::new()
+            .set_fixed_size(bmp.0 as i32, bmp.1 as i32)
+            .set_origin(-(x0 as i32), -(y0 as i32)),
+    )
+    .ok()?;
+    Some(TileResult {
+        page: req.page,
+        row: req.row,
+        col: req.col,
+        x0,
+        y0,
+        w,
+        h,
+        full_w: bmp.0,
+        full_h: bmp.1,
+        bgra: dst.as_raw_bytes(),
+    })
+}
+
 /// 在工作线程内：栅格化某页的 **L0 缩略图**（低分辨率，用于拖动期间占位 / 回翻即时内容）。
 ///
 /// 缩放按目标宽度 [`THUMB_WIDTH`](crate::config::pdf::THUMB_WIDTH) 推导并夹在
@@ -521,14 +626,20 @@ fn render_thumb(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult
     })
 }
 
-/// 在工作线程内：栅格化某页的 **L0.5 中清页**（~520px 宽，~5ms/张，用于快速拖动）。
+/// 在工作线程内：栅格化某页的 **L0.5 中清页**（~520px × DPI 宽，~5ms/张，用于快速拖动）。
 ///
-/// 缩放按目标宽度 [`MID_WIDTH`](crate::config::pdf::MID_WIDTH) 推导并夹在
-/// `[0.1, 1.0]`。比全清便宜 ~6×，比 260px 缩略图清晰得多（可辨识标题/段落结构）。
-fn render_mid(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult> {
+/// 缩放按目标宽度 [`MID_WIDTH`](crate::config::pdf::MID_WIDTH) × 显示 `scale_factor` 推导
+/// 并夹在 `[0.1, 1.0]`：DPI>1 的屏上目标宽度随之放大，预览不经 GPU 大倍率上采样、保持锐利
+/// （避免“字体/图像发糊”）。比全清便宜 ~6×，比 260px 缩略图清晰得多（可辨识标题/段落结构）。
+fn render_mid(
+    doc: &PdfDocument<'_>,
+    page_index: usize,
+    scale_factor: f32,
+) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
     let pw = page.width().value.max(1.0) as f32;
-    let scale = (crate::config::pdf::MID_WIDTH / pw).clamp(0.1, 1.0);
+    let target_w = crate::config::pdf::MID_WIDTH * scale_factor.max(1.0);
+    let scale = (target_w / pw).clamp(0.1, 1.0);
     render_page(doc, RenderRequest {
         page: page_index,
         scale,

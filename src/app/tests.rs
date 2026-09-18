@@ -2804,7 +2804,7 @@
         );
     }
 
-    /// 回归：打开 259 页的长 PDF（曾因全量栅格化耗时 ~270s 表现为“无法加载”）。
+    /// 回归：打开 242 页的长 PDF（曾因全量栅格化耗时 ~270s 表现为“无法加载”）。
     /// 现在应为页级虚拟化——结构解析秒级完成，进 UI 后按需渲染。
     #[gpui::test]
     async fn opens_long_pdf_virtualized(cx: &mut TestAppContext) {
@@ -2852,8 +2852,8 @@
         let elapsed = t0.elapsed();
         assert!(status_ok, "打开长 PDF 应成功");
         assert!(
-            page_count == 259,
-            "259 页文件应完整列出 259 页，实际={page_count}"
+            page_count == 242,
+            "242 页文件应完整列出 242 页，实际={page_count}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(20),

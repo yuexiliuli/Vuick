@@ -1,32 +1,56 @@
-//! PDF 页面的**纯布局/调度数学**：页列尺寸、可见页区间、渲染倍率、每帧页工作规划。
+//! PDF 页面的**纯布局/调度数学**：页列尺寸、可见页区间、渲染倍率、瓦片网格、每帧工作规划。
 //!
 //! 全部为无副作用纯函数（便于单测），与 `view.rs` 的页列 DOM 绝对定位**使用同一套数学**，
-//! 保证滚动位置推算与 DOM 位置严格一致（否则可见页会被误判）。
+//! 保证滚动位置推算与 DOM 位置严格一致（否则可见页会被误判）。瓦片几何（[`tile_rect`]）
+//! 由 **worker 线程**（`parser.rs`）与 **view 线程**（`view.rs`）共用——两侧各自独立算出
+//! 的瓦片矩形必须逐像素一致，拼片才不会错位。
 
-use crate::config::pdf::{
-    CACHE_MAX_PAGES, MARGIN, MAX_BITMAP_SCALE, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y, PAGE_WIDTH,
-};
+use std::collections::HashMap;
+
+use crate::config::pdf::{CACHE_MAX_PAGES, MARGIN, MAX_BITMAP_SCALE, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y, PAGE_WIDTH};
 use crate::pdf::PageText;
 
 /// 页槽：某页的渲染状态（内存态）。
 #[derive(Default, Clone)]
 pub(crate) struct Slot {
-    /// 已栅格化位图（`None` = 从未渲染或已回收）。
-    pub(crate) image: Option<std::sync::Arc<gpui::RenderImage>>,
-    /// 是否正在后台栅格化（避免重复派发）。
-    pub(crate) loading: bool,
-    /// 该位图对应的渲染代次（缩放/质量变化时使旧位图失效）。
-    pub(crate) generation: u64,
-    /// L0 缩略图（低清层）：全尺寸位图缺席时先展示，拖动期间"永远有内容"；
-    /// 全尺寸位图回收后仍保留，回翻时即时占位再补全尺寸。
+    /// 已栅格化的**瓦片**缓存（键 = 页位图内的 (row, col) 网格格号）。瓦片按显示物理
+    /// 像素密度渲染（见 [`render_scale`]），**内存 = 视口可见瓦片数 × TILE_SIZE² × 4**，
+    /// 不随整页位图面积缩放爆炸（旧整页方案 4× 缩放一页 A4 = 64MB 的根因）。
+    pub(crate) tiles: HashMap<(u32, u32), TileSlot>,
+    /// 现有瓦片对应的渲染倍率（px/pt）。缩放/换 DPI 显示器后与新一轮 [`render_scale`]
+    /// 不一致 → 该页瓦片被惰性作废，按新密度重栅格化（旧瓦片 `drop_image` 下线）。
+    pub(crate) tile_scale: f32,
+    /// L0 缩略图（低清层）：全尺寸瓦片缺席时先展示，拖动期间"永远有内容"；
+    /// 快速拖动时全页只有缩略图占位，停止后按需补齐瓦片。
     pub(crate) thumb: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 缩略图是否正在后台渲染（避免重复派发）。
     pub(crate) thumb_loading: bool,
     /// L0.5 中清页（~520px）：快速拖动时优先展示（比 260px 缩略图清晰、可辨识标题/
-    /// 段落结构），停止后作为淡入底图过渡到全尺寸。
+    /// 段落结构），作瓦片下方的底图占位。
     pub(crate) mid: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 中清页是否正在后台渲染（避免重复派发）。
     pub(crate) mid_loading: bool,
+}
+
+/// 一块已完成栅格化的瓦片：图像本体 + 它在页位图中的几何。
+#[derive(Clone)]
+pub(crate) struct TileSlot {
+    pub(crate) image: std::sync::Arc<gpui::RenderImage>,
+    /// 瓦片在页位图中的左上角 x（含出血裁剪，已夹到页内）。
+    pub(crate) x0: u32,
+    /// 瓦片在页位图中的左上角 y。
+    pub(crate) y0: u32,
+    /// 瓦片位图实际宽（含出血，已夹到页内）。
+    pub(crate) w: u32,
+    /// 瓦片位图实际高。
+    pub(crate) h: u32,
+}
+
+impl TileSlot {
+    /// 瓦片占用的近似内存字节（RGBA）。
+    pub(crate) fn bytes(&self) -> u64 {
+        (self.w as u64) * (self.h as u64) * 4
+    }
 }
 
 /// 某页在页列里的显示高度（保持宽高比）。
@@ -95,16 +119,124 @@ pub(crate) fn keep_window(
 }
 
 /// 渲染倍率：以在屏宽度、显示 DPI 推导，封顶避免超大位图。
-/// 高倍缩放（page_width > [`PAGE_WIDTH`]）时按缩放比抬高封顶，保证放大后仍清晰；
-/// zoom=1 时封顶仍为 [`MAX_RENDER_SCALE`]，行为不变。
+/// 高倍缩放（page_width > [`PAGE_WIDTH`]）时按缩放比抬高封顶，保证放大后仍清晰。
+/// **封顶随物理像素需求（`scale_factor`）同步抬升**：渲染目标必须先够到“显示物理像素”
+/// （宽 = `page_width × DPI`），否则 GPU 对低分辨位图上采样拉伸 → 高 DPI 屏文字/图像发糊。
+/// [`MAX_RENDER_SCALE`] 是相对 DPI 的倍率，[`MAX_BITMAP_SCALE`]（px/pt 绝对硬顶）兜底。
 pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f32) -> f32 {
     if page_pt_width > 0.0 {
         let zoom = (page_width / PAGE_WIDTH).max(1.0);
-        let cap = (MAX_RENDER_SCALE * zoom).min(MAX_BITMAP_SCALE);
+        let cap = (MAX_RENDER_SCALE * zoom * scale_factor.max(1.0)).min(MAX_BITMAP_SCALE);
         (page_width * scale_factor / page_pt_width).clamp(0.5, cap)
     } else {
         MAX_RENDER_SCALE
     }
+}
+
+// ---- 瓦片（Tile）几何：worker 与 view 共用同一套数学，保证拼片逐像素对齐 ----
+
+/// 页（PDF 点）→ 页位图（物理像素）尺寸。与 pdfium 栅格化的取整一致：`ceil` 且最小 1。
+pub(crate) fn page_bitmap_size((pw, ph): (f32, f32), scale: f32) -> (u32, u32) {
+    (
+        (pw * scale).ceil().max(1.0) as u32,
+        (ph * scale).ceil().max(1.0) as u32,
+    )
+}
+
+/// 页位图 → 卡片显示像素的分轴缩放（宽/高各自独立，吸收两轴 ceil 取整差异）。
+/// 与 [`pt_to_local`] 的映射同源（local = 位图像素 × 此缩放），瓦片与文本高亮严格对齐。
+pub(crate) fn bitmap_display_scales(
+    bmp: (u32, u32),
+    display_w: f32,
+    disp_h: f32,
+) -> (f32, f32) {
+    (
+        display_w / bmp.0.max(1) as f32,
+        disp_h / bmp.1.max(1) as f32,
+    )
+}
+
+/// 瓦片网格维度：(行数, 列数)。每格名义 [TILE_SIZE × TILE_SIZE]（页尾/侧不足则为残片）。
+pub(crate) fn tile_grid(bmp: (u32, u32), tile_size: u32) -> (u32, u32) {
+    if tile_size == 0 {
+        return (1, 1);
+    }
+    (bmp.1.div_ceil(tile_size).max(1), bmp.0.div_ceil(tile_size).max(1))
+}
+
+/// 某格在页位图中的实际绘制矩形 `(x0, y0, w, h)`（含出血、夹到页内）。
+/// 整格在页外（越界的排/列守卫）→ `None`；否则 worker 按此矩形渲染、view 按此定位。
+/// ⚠️ 这是两侧共用的**唯一权威实现**：改动必须同步 worker 输出与 view 放置语义。
+pub(crate) fn tile_rect(
+    col: u32,
+    row: u32,
+    tile_size: u32,
+    bleed: u32,
+    bmp: (u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    if tile_size == 0 {
+        return None;
+    }
+    let (bw, bh) = bmp;
+    let x0 = col.saturating_mul(tile_size).saturating_sub(bleed);
+    let y0 = row.saturating_mul(tile_size).saturating_sub(bleed);
+    if x0 >= bw || y0 >= bh {
+        return None;
+    }
+    let x1 = col
+        .saturating_add(1)
+        .saturating_mul(tile_size)
+        .saturating_add(bleed)
+        .min(bw);
+    let y1 = row
+        .saturating_add(1)
+        .saturating_mul(tile_size)
+        .saturating_add(bleed)
+        .min(bh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1 - x0, y1 - y0))
+}
+
+/// 给定卡片局部可见矩形（CSS px，已夹在页内），推算需要覆盖的瓦片网格区间，
+/// 返回 `(row0, col0, row1, col1)`（含端点，已夹进网格）。`rect = (x0, y0, x1, y1)`。
+/// 视口外缘再外扩 `margin` 格以缓冲滚动。无交点 → `None`。
+pub(crate) fn visible_tile_range(
+    bmp: (u32, u32),
+    display_w: f32,
+    disp_h: f32,
+    rect: (f32, f32, f32, f32),
+    tile_size: u32,
+    margin: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    if tile_size == 0 {
+        return None;
+    }
+    let (rx0, ry0, rx1, ry1) = rect;
+    if rx1 <= rx0 || ry1 <= ry0 {
+        return None;
+    }
+    let (sx, sy) = bitmap_display_scales(bmp, display_w, disp_h);
+    if sx <= 0.0 || sy <= 0.0 {
+        return None;
+    }
+    let (rows, cols) = tile_grid(bmp, tile_size);
+    let clamp = |v: i64, max: i64| -> u32 { v.clamp(0, max.max(0)) as u32 };
+    let cell = tile_size as i64;
+    // 位图像素区间 → 网格格号区间（含端点）
+    let c0 = ((rx0 / sx) / cell as f32).floor() as i64 - (margin as i64);
+    let c1 = ((rx1 / sx - 1.0).max(0.0) / cell as f32).floor() as i64 + (margin as i64);
+    let r0 = ((ry0 / sy) / cell as f32).floor() as i64 - (margin as i64);
+    let r1 = ((ry1 / sy - 1.0).max(0.0) / cell as f32).floor() as i64 + (margin as i64);
+    let c0 = clamp(c0, cols as i64 - 1);
+    let c1 = clamp(c1, cols as i64 - 1);
+    let r0 = clamp(r0, rows as i64 - 1);
+    let r1 = clamp(r1, rows as i64 - 1);
+    if r0 > r1 || c0 > c1 {
+        return None;
+    }
+    Some((r0, c0, r1, c1))
 }
 
 /// 页内 PDF 点坐标 → 页卡**局部**显示 px（原点 = 卡片左上角，Y 轴已翻转为"向下为正"）。
@@ -361,15 +493,10 @@ pub(crate) fn trim_transient_writes(len: usize, queue_max: usize, moving: bool) 
 /// 每帧的页工作规划（纯函数，便于测试）：通过投影闭包按页号读取「是否已渲染 /
 /// 是否正在加载 / 渲染代次」，决定 (需要渲染的页, 需要淘汰位图的页)。
 ///
-/// **不物化任何按总页数的临时数组**：旧版在 `view.rs` 每帧先按全文页数构造
-/// `Vec<bool>`×2 + `Vec<u64>`（几百上千页时每帧三次堆分配），再传给本函数；
-/// 这里改为闭包逐页投影，渲染帧零额外分配。
-///
-/// - **渲染**：可见区内既**未渲染**又**未在加载中**（或位图代次过期）的页。
-///   正在加载的页绝不再派发任务，避免每个可见帧都重复栅格化同一页。
-/// - **淘汰（延后回收 / 距离 LRU）**：仅当保留位图数超过 [`CACHE_MAX_PAGES`] 时，
-///   才把**离当前视口中心最远**的页依次回收直到回到预算内。预算内任一页——无论多靠前
-///   多靠后——都保留，因此「往下翻很多页再倒回去」命中缓存，不重新加载。
+/// ⚠️ 整页位图渲染已由瓦片渲染取代（参见 `view.rs`），本函数不再被生产代码调用；
+/// 保留仅作为「整页蓝图调度」的回归测试锚点（`scrolling_down_and_back_*` 等测试），
+/// 并可供未来按页聚合瓦片的调度复用。
+#[allow(dead_code)] // 仅回归测试使用（生产走瓦片调度）
 pub(crate) fn plan_page_work(
     page_count: usize,
     start: usize,
@@ -648,12 +775,27 @@ mod tests {
 
     #[test]
     fn render_scale_capped_and_sane() {
-        // 页宽 595pt，在屏 840px @ 1x DPI → ~1.41x，夹在 [0.5, MAX_RENDER_SCALE]
+        // 1x DPI：页宽 595pt、在屏 840px → ~1.41x，夹在 [0.5, MAX_RENDER_SCALE]，行为不变
         let s = render_scale(840.0, 1.0, 595.0);
         assert!(s > 0.5 && s <= MAX_RENDER_SCALE);
-        // 超大 DPI（Retina 2x）也要封顶
+        // 高 DPI（150%）：渲染必须够到“显示物理像素”，不能被 MAX_RENDER_SCALE 压回 1.5
+        // （否则 GPU 上采样拉伸 → 文字/图像发糊）。A4 595pt → 自然 840*1.5/595 ≈ 2.117
+        let s_dpi = render_scale(840.0, 1.5, 595.0);
+        assert!(
+            s_dpi > MAX_RENDER_SCALE,
+            "150% DPI 下缩放应超过 1.5（物理像素对齐），实际 {s_dpi}"
+        );
+        // 换算成位图宽应约等于显示物理宽度 840*1.5 = 1260px
+        let px = (595.0 * s_dpi).round();
+        assert!(
+            (px - 840.0 * 1.5).abs() <= 1.0,
+            "位图宽应≈显示物理宽 1260px，实际 {px}"
+        );
+        // 超高 DPI / 超大页仍受 MAX_BITMAP_SCALE 绝对硬顶
         let s2 = render_scale(840.0, 2.0, 100.0);
-        assert!(s2 <= MAX_RENDER_SCALE);
+        assert!(s2 <= MAX_BITMAP_SCALE, "不得突破绝对硬顶: {s2}");
+        let s3 = render_scale(840.0, 4.0, 100.0);
+        assert!(s3 <= MAX_BITMAP_SCALE, "不得突破绝对硬顶: {s3}");
     }
 
     /// 页内 pt → 卡片局部 px：Y 翻转、边界与单调性（纯函数，不触 pdfium）。
@@ -900,5 +1042,81 @@ mod tests {
             new_.as_millis(),
             old.as_secs_f64() / new_.as_secs_f64().max(1e-9),
         );
+    }
+
+    /// 瓦片基础几何：位图尺寸 ceil 取整、网格行列计数、残片夹边。
+    #[test]
+    fn tile_geometry_grid_and_rect_with_bleed() {
+        // A4 @1.0 (595pt→595px)：bmp=(595,842)；512 片 → 2×2 网格，第二行列是残片
+        let bmp = page_bitmap_size(a4(), 1.0);
+        assert_eq!(bmp, (595, 842), "位图尺寸应 ceil(页pt×scale)");
+        let (rows, cols) = tile_grid(bmp, 512);
+        assert_eq!((rows, cols), (2, 2), "595/842 应各切成 2 格");
+        // 左上角瓦片：出血把 x0/y0 顶在页缘，右/下缘 512+2 出血（页面够大不夹边）
+        let r = tile_rect(0, 0, 512, 2, bmp).expect("应有矩形");
+        assert_eq!(r, (0, 0, 514, 514), "首片含出血：x0/y0 顶页缘，右/下扩 2px");
+        // 第二行第二列（残片）：x0=512-2=510 起，end=512+2 夹到 595
+        let r2 = tile_rect(1, 1, 512, 2, bmp).expect("残片应有矩形");
+        assert_eq!(r2, (510, 510, 85, 332), "x0/y0 含出血，宽高夹到页内");
+        // 越界格（整格在页外）→ None
+        assert!(tile_rect(2, 0, 512, 2, bmp).is_none(), "第 3 列整格在页外应 None");
+        assert!(
+            tile_rect(0, 2, 512, 2, bmp).is_none(),
+            "第 3 行整格在页外应 None"
+        );
+        // 空位图守卫：tile_size=0 不除零
+        assert!(tile_rect(0, 0, 0, 2, (1, 1)).is_none());
+    }
+
+    /// 页位图像素尺寸与显示像素尺寸的换算（高 DPI 物理像素 1:1 的前提）。
+    #[test]
+    fn bitmap_display_scales_are_physical_pixel_faithful() {
+        // 1x DPI：位图 840×1189 显示在 840×1189 CSS px → 缩放 1:1
+        let bmp = (840u32, 1189u32);
+        let (sx, sy) = bitmap_display_scales(bmp, 840.0, 1189.0);
+        assert!((sx - 1.0).abs() < 1e-3 && (sy - 1.0).abs() < 1e-3, "1x 应 1:1");
+        // 2x DPI：位图 1680×2377 显示在 840×1189 CSS px → 每个 CSS px = 2 位图像素
+        let (sx2, sy2) = bitmap_display_scales((1680, 2377), 840.0, 1189.0);
+        assert!((sx2 - 0.5).abs() < 1e-3 && (sy2 - 0.5).abs() < 1e-3, "2x 应半缩");
+    }
+
+    /// 可见矩形 → 瓦片区间：只圈中相交的格、外扩 margin、且夹进网格。
+    #[test]
+    fn visible_tile_range_covers_only_intersecting_tiles() {
+        let bmp = page_bitmap_size(a4(), 1.0); // 595×842，512 片 → 2×2
+        // 只看左上角 200×100 CSS px（@1x 即位图像素 200×100）→ 只应圈第 0 行 0 列
+        let mut r = visible_tile_range(bmp, 595.0, 842.0, (0.0, 0.0, 200.0, 100.0), 512, 0).unwrap();
+        assert_eq!(r, (0, 0, 0, 0), "仅可见左上格不含 margin");
+        // margin=2 → 扩展到整页网格
+        r = visible_tile_range(bmp, 595.0, 842.0, (0.0, 0.0, 200.0, 100.0), 512, 2).unwrap();
+        assert_eq!(r, (0, 0, 1, 1), "margin 应外扩到 2×2 全覆盖");
+        // 可见区恰跨两个格（x ∈ [200, 595]）→ 只覆盖 0、1 两列
+        r = visible_tile_range(bmp, 595.0, 842.0, (200.0, 0.0, 595.0, 100.0), 512, 0).unwrap();
+        assert_eq!(r, (0, 0, 0, 1), "横向跨格两列都应覆盖");
+        // 空白/空矩形 → None
+        assert!(
+            visible_tile_range(bmp, 595.0, 842.0, (0.0, 0.0, 0.0, 100.0), 512, 0).is_none(),
+            "零宽矩形应 None"
+        );
+    }
+
+    /// 瓦片几何往返：visible_tile_range 覆盖的每格，tile_rect 都能给出正尺寸矩形，
+    /// 且网格与矩形互洽（view 派发 view 收工，同一套数学）。
+    #[test]
+    fn tile_range_rects_are_well_formed_and_in_grid() {
+        let bmp = page_bitmap_size(a4(), 1.0);
+        let (rows, cols) = tile_grid(bmp, 512);
+        let rng = visible_tile_range(bmp, 595.0, 842.0, (0.0, 0.0, 595.0, 842.0), 512, 0).unwrap();
+        let mut count = 0usize;
+        for row in rng.0..=rng.2 {
+            for col in rng.1..=rng.3 {
+                assert!(row < rows && col < cols, "格号应在网格内");
+                let (x0, y0, w, h) = tile_rect(col, row, 512, 2, bmp).expect("格应有矩形");
+                assert!(w >= 1 && h >= 1, "瓦片应正尺寸");
+                assert!(x0 + w <= bmp.0 && y0 + h <= bmp.1, "瓦片不越页位图边界");
+                count += 1;
+            }
+        }
+        assert_eq!(count, (rows * cols) as usize, "整页应圈出全部 2×2 格");
     }
 }

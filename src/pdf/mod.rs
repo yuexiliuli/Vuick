@@ -1,18 +1,23 @@
 //! PDF 读取与展示模块。
 //!
 //! 基于 native **pdfium**（Edge 同源内核）栅格化，单页渲染快，首次浏览即流畅。
-//! 架构：页级虚拟化 + 内存预算 + 磁盘二级缓存：
+//! 架构：**瓦片级虚拟化** + 内存预算 + 缩略图占位：
+//! - 内容层走 **瓦片渲染**（SumatraPDF 式分块）：页面按 [TILE_SIZE]×[TILE_SIZE]
+//!   切成网格，只栅格化视口可见 + 边缘缓冲的那几片（每片 ~1MB，内存按视口而非
+//!   页面积封顶），瓦片按显示物理像素 1:1 渲染，高 DPI / 放大不模糊；
+//! - L0 缩略图 / L0.5 中清页作快速拖动占位（瓦片逐片到达前先铺低清底图）；
 //! - [`PdfWorker`]（`parser.rs`）是**进程级单例后台线程**（pdfium 整进程只能绑定一次），
 //!   持有唯一 `Pdfium` 与一个 `HashMap<DocId, PdfDocument>`，通过 mpsc 接收各阅读器的
-//!   `Open / Render / Close` 请求并回传 **BGRA 像素**；
-//! - [`PdfViewer`]（`view.rs`）只做收发与位图显示：首帧用 BGRA 直接包 `RenderImage`
-//!   （主线程零像素循环，流畅），翻回已淘汰页时从磁盘缓存恢复。
+//!   `Open / Render / RenderTile / Mid / Thumb / Close` 请求并回传像素；
+//! - [`PdfViewer`]（`view.rs`）只做收发与显示：首片 BGRA 直包 `RenderImage`，快速
+//!   滚动先用缩略/中清占位、停止后瓦片逐片补齐（无整页大位图，消除了高 DPI 下
+//!   "一页 64MB" 的内存爆炸与位图密度封顶导致的放大发糊）。
 //!
 //! 模块结构：
-//! - [`parser`]：pdfium.dll 定位、单例工作线程、多文档逐页栅格化（BGRA）
-//! - [`view`]：阅读器视图核心（加载/滚动/按需渲染/滚动条）
-//! - [`layout`]：页列纯布局/调度数学（尺寸、可见区间、渲染规划）
-//! - [`cache`]：磁盘二级页缓存（紧凑 BGRA 落盘 + LRU 封顶）
+//! - [`parser`]：pdfium.dll 定位、单例工作线程、多文档逐页/逐瓦片栅格化（RGBA）
+//! - [`view`]：阅读器视图核心（加载/滚动/瓦片按需渲染/滚动条）
+//! - [`layout`]：页列纯布局 + 瓦片网格几何（worker 与 view 共用同一套数学）
+//! - [`cache`]：磁盘二级**缩略图**缓存（内存淘汰后读盘即得，快速回翻不重新栅格化）
 //!
 //! 书签目录统一由**侧边栏**提供（见 [`crate::app::sidebar`] 与公共 [`crate::toc`]），
 //! 本模块只保留书签数据（[`PdfOutlineEntry`]）与跳页能力（[`crate::pdf::PdfViewer::scroll_to_page`]）。
@@ -27,7 +32,7 @@ mod view;
 #[allow(unused_imports)]
 pub use parser::{
     DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults, PdfTextChar, PdfWorker,
-    RenderRequest, RenderResult,
+    RenderRequest, RenderResult, TileRequest, TileResult,
 };
 pub use view::PdfViewer;
 
@@ -155,6 +160,103 @@ mod tests {
         );
     }
 
+    /// 瓦片渲染与整页渲染逐像素互洽：把网格的全部瓦片缝回整页位图，与直接整页渲染
+    /// 对比，每通道平均漂移 <5/255（沿用 pdfium-render 官方 set_origin 条带拼接测试的
+    /// 判据）。同时验证单瓦片尺寸恒 ~TILE_SIZE、内存不随页面积爆炸（单瓦片 ≪ 整页）。
+    #[test]
+    fn tiles_stitch_back_to_full_page_render() {
+        let _guard = pdf_lock().lock().unwrap();
+        let p = test_pdf_paths()[0].clone();
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let (pw, ph) = dims[0];
+        let scale = 1.0f32;
+        let bmp = layout::page_bitmap_size((pw, ph), scale);
+        // 首页须大到切成 2×2 瓦片（否则退化为单瓦片整页，跳过拼缝验证）
+        assert!(bmp.0 > 512 && bmp.1 > 512, "测试 PDF 首页应足够大: {bmp:?}");
+        let (rows, cols) = layout::tile_grid(bmp, crate::config::pdf::TILE_SIZE);
+
+        // 整页基准
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale });
+        let full = rx_full
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("应收到整页")
+            .expect("整页渲染应成功");
+        assert_eq!(
+            (full.width, full.height),
+            bmp,
+            "整页尺寸应与瓦片同宗（同 scale 同取整）"
+        );
+
+        // 逐格瓦片 + 缝回整页缓冲
+        let mut stitched = vec![0xffu8; (bmp.0 as usize) * (bmp.1 as usize) * 4];
+        for row in 0..rows {
+            for col in 0..cols {
+                let rx_t = worker.request_tile(
+                    doc_id,
+                    crate::pdf::TileRequest {
+                        page: 0,
+                        scale,
+                        tile_size: crate::config::pdf::TILE_SIZE,
+                        row,
+                        col,
+                    },
+                );
+                let tile = rx_t
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .expect("应收到瓦片")
+                    .expect("瓦片渲染应成功");
+                assert_eq!((tile.row, tile.col), (row, col), "瓦片回传格号应与请求一致");
+                assert_eq!(
+                    (tile.full_w, tile.full_h),
+                    bmp,
+                    "瓦片应携带与请求同宗的整页尺寸"
+                );
+                assert_eq!(
+                    tile.bgra.len(),
+                    (tile.w as usize) * (tile.h as usize) * 4,
+                    "瓦片像素应紧凑 w*h*4"
+                );
+                // 单瓦片面积恒 ≤ (TILE_SIZE + 2×TILE_BLEED)²：内存不随页面积/缩放爆炸
+                //（真实收益是「只驻留视口可见的几片」，而非单瓦片小于整页）。
+                let max_tile_edge =
+                    crate::config::pdf::TILE_SIZE + 2 * crate::config::pdf::TILE_BLEED;
+                assert!(
+                    tile.w <= max_tile_edge && tile.h <= max_tile_edge,
+                    "瓦片应被 TILE_SIZE+出血 封顶：{}x{} ≤ {}",
+                    tile.w,
+                    tile.h,
+                    max_tile_edge
+                );
+                for y in 0..tile.h as usize {
+                    let src = &tile.bgra[y * tile.w as usize * 4..(y + 1) * tile.w as usize * 4];
+                    let dst_off =
+                        ((tile.y0 as usize) + y) * bmp.0 as usize * 4 + (tile.x0 as usize) * 4;
+                    stitched[dst_off..dst_off + src.len()].copy_from_slice(src);
+                }
+            }
+        }
+
+        // 逐像素漂移（缝合 vs 整页），判据与 pdfium-render 官方条带拼接测试一致
+        let mut sums = [0u64; 4];
+        let px_count = (bmp.0 as usize) * (bmp.1 as usize);
+        for px in 0..px_count {
+            for ch in 0..4 {
+                let a = stitched[px * 4 + ch] as i64;
+                let b = full.bgra[px * 4 + ch] as i64;
+                sums[ch] += a.abs_diff(b) as u64;
+            }
+        }
+        let n = px_count as f64;
+        let max_drift = (0..4)
+            .map(|ch| sums[ch] as f64 / n)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_drift < 5.0,
+            "缝合瓦片 vs 整页渲染的平均每通道漂移 {max_drift:.3}/255 超过容差"
+        );
+    }
+
     #[test]
     fn worker_renders_thumbnail_at_low_resolution() {
         let _guard = pdf_lock().lock().unwrap();
@@ -199,7 +301,7 @@ mod tests {
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let rx_mid = worker.request_mid(doc_id, 0);
+        let rx_mid = worker.request_mid(doc_id, 0, 1.0);
         let mid = rx_mid
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("应收到中清页")
@@ -236,7 +338,7 @@ mod tests {
     #[test]
     fn worker_renders_many_pages_individually() {
         let _guard = pdf_lock().lock().unwrap();
-        // 259 页的 PDF：抽查首/中/末各一页（模拟「滚动到哪渲染哪」）
+        // 长 PDF（当前 fixture 242 页）：抽查首/中/末各一页（模拟「滚动到哪渲染哪」）
         let p = test_pdf_paths()[1].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let dims = parser::page_dims(&bytes).expect("解析应成功");
@@ -394,18 +496,30 @@ mod tests {
     #[test]
     fn mapped_line_baselines_stay_within_pixel_variance() {
         let _guard = pdf_lock().lock().unwrap();
-        let p = test_pdf_paths()[1].clone();
+        // 注：长 PDF fixture 已变更为 242 页**扫描件**（无文本层），故改在文本型
+        // pdf测试.pdf 上选内容稠密页验证（动态挑页，防 fixture 换页号被戳穿）。
+        let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
-        let page_idx = 1usize;
+        let max_scan = dims.len().min(12);
+        let mut chosen: Option<(usize, PageText)> = None;
+        for idx in 0..max_scan {
+            let rx = worker.request_text(doc_id, idx);
+            let text = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("应收到文本")
+                .expect("文本应成功");
+            let usable = text.chars.iter().filter(|c| !c.synthetic).count();
+            if usable >= 40 {
+                chosen = Some((idx, text));
+                break;
+            }
+        }
+        let (page_idx, text) =
+            chosen.expect("应在文本型 PDF 内找到内容稠密页（可用字符 ≥40）");
         let page_pt = dims[page_idx];
         let display_w = crate::config::pdf::PAGE_WIDTH;
         let scale = layout::render_scale(display_w, 1.0, page_pt.0);
-        let rx_text = worker.request_text(doc_id, page_idx);
-        let text = rx_text
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("应收到文本")
-            .expect("文本应成功");
 
         // 每字符映射后的基线局部 y（origin_y 为 PDF 点，经 pt_to_local 翻转）
         let mut ys: Vec<(i32, f32)> = text
@@ -622,14 +736,14 @@ mod tests {
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
 
-        let rx = worker.search(doc_id, "空调".to_string());
+        let rx = worker.search(doc_id, "配置".to_string());
         let results = rx
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("应收到检索结果")
             .expect("检索应成功");
         assert!(
             !results.hits.is_empty(),
-            "pdf测试.pdf 应能检索到「空调」以外的正文词"
+            "pdf测试.pdf 应能检索到正文词命中（如「配置」）"
         );
         let min_hits = results.hits.first().cloned().expect("非空");
         assert!(min_hits.start < min_hits.end, "区间应有序: {min_hits:?}");
@@ -644,9 +758,9 @@ mod tests {
                 .expect("文本应成功");
             assert!(hit.end <= text.chars.len(), "区间应在页内: {hit:?}");
             let seg = layout::page_char_substring(&text, hit.start, hit.end.saturating_sub(1));
-            assert_eq!(seg, "空调", "命中文本应与关键字一致，实际 {seg:?}");
+            assert_eq!(seg, "配置", "命中文本应与关键字一致，实际 {seg:?}");
             assert!(
-                hit.snippet.contains("空调"),
+                hit.snippet.contains("配置"),
                 "命中片段应包含关键字：{:?}",
                 hit.snippet
             );
@@ -998,6 +1112,108 @@ mod tests {
             (off3.y.as_f32() - exp_y3).abs() < 1.0 && (off3.x.as_f32() - exp_x3).abs() < 1.0,
             "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}",
             off3.y.as_f32()
+        );
+    }
+
+    /// 瓦片管线端到端（视口驱动）：打开 pdf测试.pdf 后，视口覆盖的首页应经
+    /// 「调度 → pdfium worker 栅格化 → 主线程收集」产出**非空瓦片缓存**；页槽
+    /// `tile_scale` 与当前显示密度一致；且可视区只驻留少量瓦片（内存按视口封顶）。
+    #[gpui::test]
+    async fn tiles_fill_viewport_on_visible_pages(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(gpui_component::init);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        // 泵若干帧 + 少量真实等待：`refresh()` 强制重绘（驱动 `ensure_window` 收图），
+        // 真实等待给 pdfium worker 线程物理时间（gpui 测试的虚拟时钟不会真的睡眠）。
+        let mut got_tile = false;
+        for _ in 0..200 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let any = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .slots
+                    .first()
+                    .map(|s| s.tiles.len() > 0)
+                    .unwrap_or(false)
+            });
+            if any {
+                got_tile = true;
+                break;
+            }
+        }
+        // 再泵几帧让泵停表（避免遗留在途任务）
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        let (pages, page0_tiles, page0_scale) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let page0 = v.slots.first();
+            (
+                v.page_count(),
+                page0.map(|s| s.tiles.len()).unwrap_or(0),
+                page0.map(|s| s.tile_scale).unwrap_or(0.0),
+            )
+        });
+        assert!(pages >= 1, "应载入至少 1 页");
+        assert!(
+            got_tile && page0_tiles >= 1,
+            "视口覆盖的首页应栅格出至少 1 片瓦片（实际 {page0_tiles} 片）"
+        );
+        assert!(
+            page0_scale > 0.5 && page0_scale.is_finite(),
+            "首页瓦片密度应与显示一致：{page0_scale}"
+        );
+        assert!(
+            page0_tiles <= 16,
+            "可视区只应驻留少量瓦片（{page0_tiles} > 16 说明过度栅格化）"
         );
     }
 }
