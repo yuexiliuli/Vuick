@@ -642,6 +642,13 @@ impl PdfViewer {
             }
 
             let Some(rect) = rect else { continue };
+            // 整页封面已在当前密度下覆盖整页 → 该页瓦片全部冗余，**不再派发**（省渲染与
+            // 内存：封面即全页锐化底图，瓦片只服务于「无封面/封面被密度上限截断」的页）。
+            let skip_covered = self.slots[page].cover.is_some()
+                && (self.slots[page].cover_scale - scale).abs() <= 1e-4;
+            if skip_covered {
+                continue;
+            }
             let Some((r0, c0, r1, c1)) =
                 visible_tile_range(bmp, page_width, disp_h, rect, tile_size, TILE_MARGIN)
             else {
@@ -955,15 +962,21 @@ impl PdfViewer {
             let Ok(img) = render_image_from_bgra(res.bgra, res.w, res.h) else {
                 continue;
             };
-            let ts = TileSlot {
-                image: img,
-                x0: res.x0,
-                y0: res.y0,
-                w: res.w,
-                h: res.h,
-            };
-            let est = ts.bytes();
             if let Some(slot) = self.slots.get_mut(page) {
+                // 该页此时已有同密度整页封面 → 瓦片冗余（调度侧已不派新的，此处兜底收到
+                // 封面到位前/后仍可能在途的老瓦片）：直接回收，不占内存不占显存。
+                if slot.cover.is_some() && (slot.cover_scale - scale).abs() <= 1e-4 {
+                    self.pending_drops.push(img);
+                    continue;
+                }
+                let ts = TileSlot {
+                    image: img,
+                    x0: res.x0,
+                    y0: res.y0,
+                    w: res.w,
+                    h: res.h,
+                };
+                let est = ts.bytes();
                 if let Some(old) = slot.tiles.insert((row, col), ts) {
                     self.tile_bytes = self.tile_bytes.saturating_sub(old.bytes());
                     self.pending_drops.push(old.image);
@@ -1050,6 +1063,16 @@ impl PdfViewer {
                     self.pending_drops.push(old);
                 }
                 s.cover_scale = cscale;
+                // 封面 = 全页同密度整页位图：该页的瓦片（~整页 12-15 片）与中清（~2MB 占位）
+                // 全部冗余 → 立即回收内存/显存；渲染直接以封面为底图，无任何视觉回退。
+                for (_, ts) in s.tiles.drain() {
+                    self.tile_bytes = self.tile_bytes.saturating_sub(ts.bytes());
+                    self.pending_drops.push(ts.image);
+                }
+                if let Some(old) = s.mid.take() {
+                    self.mid_lru.retain(|&p| p != page);
+                    self.pending_drops.push(old);
+                }
                 let _ = (w, h);
                 any = true;
             }

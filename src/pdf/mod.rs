@@ -1239,20 +1239,23 @@ mod tests {
         // 少量真实等待给 pdfium worker（真实 app 是真实时钟，帧天然持续）。
         // 验证完整链路：负载完成 → refresh → 布局就位 → 调度瓦片/封面 + 邻居封面预取 →
         // worker 回传 → 收集入槽（此前"负载完成 notify 空操作 + 首帧 bounds=0"导致永不调度）。
-        let mut got_tile = false;
+        let mut got_content = false;
         for _ in 0..800 {
             cx.executor().advance_clock(std::time::Duration::from_millis(16));
             cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(5));
-            let (t0, c1) = cx.update(|_w, cx| {
+            let (c0, c1) = cx.update(|_w, cx| {
                 let v = holder.borrow().as_ref().unwrap().read(cx);
+                let content0 = v.slots.first().map(|s| {
+                    s.cover.is_some() || !s.tiles.is_empty() // 封面或瓦片皆可（封面到位即回收瓦片）
+                });
                 (
-                    v.slots.first().map(|s| s.tiles.len() > 0).unwrap_or(false),
+                    content0.unwrap_or(false),
                     v.slots.get(1).map(|s| s.cover.is_some()).unwrap_or(false),
                 )
             });
-            if t0 && c1 {
-                got_tile = true;
+            if c0 && c1 {
+                got_content = true;
                 break;
             }
         }
@@ -1274,8 +1277,8 @@ mod tests {
         });
         assert!(pages >= 1, "应载入至少 1 页");
         assert!(
-            got_tile && page0_tiles >= 1,
-            "视口覆盖的首页应栅格出至少 1 片瓦片（实际 {page0_tiles} 片）"
+            got_content && (page0_cover || page0_tiles >= 1),
+            "视口覆盖的首页应渲染到位（整页锐化封面 或 瓦片，实际 cover={page0_cover} tiles={page0_tiles}）"
         );
         assert!(
             page0_cover,
@@ -1286,8 +1289,8 @@ mod tests {
             "空闲期应预取滚动方向邻居页的封面（滚到下一页立即澄清）"
         );
         assert!(
-            page0_scale > 0.5 && page0_scale.is_finite(),
-            "首页瓦片密度应与显示一致：{page0_scale}"
+            page0_tiles == 0 || (page0_scale > 0.5 && page0_scale.is_finite()),
+            "有驻留瓦片时首页瓦片密度应与显示一致：tiles={page0_tiles} scale={page0_scale}"
         );
         assert!(
             page0_tiles <= 16,
@@ -1683,6 +1686,180 @@ mod tests {
         assert!(
             sharp && settled,
             "骤停后无输入应自动换挡并补清晰：sharp={sharp} settled={settled}"
+        );
+    }
+
+    /// 回归（内存）：完整滚动一遍整份文档后，渲染驻留内存必须**有界**且消灭“封面 + 瓦片
+    /// 双份持有”。修复前：整页封面与同页瓦片/中清并存 → 全量缓存预算合计 ~280MB（瓦片
+    /// 96MB + 封面 ~36MB + 中清 32MB + 缩略 15MB + 基座）。修复后：同密度整页封面在位即
+    /// 回收该页瓦片与中清、瓦片预算降到 40MB，完整滚动后应显著回落。
+    #[gpui::test]
+    async fn memory_stays_bounded_after_full_scroll(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(gpui_component::init);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).page_count()
+        });
+        assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
+
+        // 完整滚动一遍（采样停靠，重演“翻到底”的累积路径）
+        let mut targets: Vec<usize> = Vec::new();
+        for t in (0..n).step_by(9) {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        for t in [3usize, n - 2, 7, n - 5, 40].into_iter() {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        let settle_iters = {
+            let mut it = 0usize;
+            for target in targets {
+                cx.update(|_w, cx| {
+                    holder
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .update(cx, |v, cx| {
+                            v.scroll_to_page(target);
+                            cx.notify();
+                        });
+                });
+                for _ in 0..200 {
+                    cx.executor().advance_clock(Duration::from_millis(16));
+                    cx.run_until_parked();
+                    std::thread::sleep(Duration::from_millis(3));
+                    let st = cx.update(|_w, cx| {
+                        let v = holder.borrow().as_ref().unwrap().read(cx);
+                        (
+                            v.pending_tiles.is_empty()
+                                && v.pending_cover.is_empty()
+                                && !v.tile_pump_running,
+                            !v.prev_fast,
+                        )
+                    });
+                    if st == (true, true) {
+                        break;
+                    }
+                }
+                it += 1;
+            }
+            it
+        };
+        assert!(settle_iters >= 5, "应完成至少 5 个采样停靠点");
+
+        let (tile_bytes, covers, mids, thumbs, double_hold, total_est, cap) =
+            cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                let pw = v.page_width();
+                // 测试窗口为 1× DPI（gpui TestAppContext 默认），缩放因子即 1.0
+                let sf = 1.0f32;
+                let mut covers_held = 0usize;
+                let mut mids_held = 0usize;
+                let mut thumbs_held = 0usize;
+                let mut double_hold = 0usize;
+                let mut cover_bytes = 0u64;
+                for (p, s) in v.slots.iter().enumerate() {
+                    if s.cover.is_some() {
+                        covers_held += 1;
+                        let (w, h) =
+                            layout::page_bitmap_size(v.dims[p], layout::cover_scale(v.dims[p], pw, sf));
+                        cover_bytes += (w as u64) * (h as u64) * 4;
+                        if !s.tiles.is_empty() {
+                            double_hold += 1; // 封面在位又留瓦片 = 冗余双份，应被回收
+                        }
+                    }
+                    if s.mid.is_some() {
+                        mids_held += 1;
+                    }
+                    if s.thumb.is_some() {
+                        thumbs_held += 1;
+                    }
+                }
+                // 中清 ~2MB、缩略 ~0.37MB 为近似值（不精确到单页，仅用于有界断言）
+                let total_est =
+                    v.tile_bytes + cover_bytes + mids_held as u64 * 2 * 1024 * 1024
+                        + thumbs_held as u64 * 385 * 1024;
+                (
+                    v.tile_bytes,
+                    covers_held,
+                    mids_held,
+                    thumbs_held,
+                    double_hold,
+                    total_est,
+                    crate::config::pdf::TILE_CACHE_BYTES,
+                )
+            });
+        eprintln!(
+            "[MEM] tile_bytes={tile_bytes}MB covers={covers} mids={mids} thumbs={thumbs} double_hold={double_hold} total_est={total_est}MB cap={cap}MB",
+            tile_bytes = tile_bytes / 1024 / 1024,
+            total_est = total_est / 1024 / 1024,
+            cap = cap / 1024 / 1024,
+        );
+        assert!(
+            tile_bytes <= cap,
+            "瓦片占用应不超预算：{tile_bytes} > {cap}"
+        );
+        assert!(covers <= 5, "封面驻留应 ≤ 5：{covers}");
+        assert!(mids <= crate::config::pdf::MID_CACHE_PAGES, "中清驻留应 ≤ 上限：{mids}");
+        assert!(
+            thumbs <= crate::config::pdf::THUMB_CACHE_PAGES,
+            "缩略驻留应 ≤ 上限：{thumbs}"
+        );
+        assert!(
+            double_hold == 0,
+            "封面在位时不得双份持有瓦片（内存回归）：{double_hold} 页"
+        );
+        assert!(
+            total_est < 220 * 1024 * 1024,
+            "完整滚动后渲染驻留内存应明显低于修复前（~280MB）：{total_est}"
         );
     }
 }
