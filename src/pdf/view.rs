@@ -1,7 +1,7 @@
 //! PDF 阅读器视图：瓦片级虚拟化核心（加载、滚动调度、按需瓦片渲染、滚动条）。
+//! **零磁盘缓存**：瓦片与占位（缩略/中清）全部纯内存，关闭文档即释放。
 //!
 //! 子模块拆分（都在 `src/pdf/` 下）：
-//! - [`super::cache`]：磁盘二级**缩略图**缓存（瓦片不落盘，见模块说明）
 //! - [`super::layout`]：页列纯布局 + 瓦片网格几何（worker 与 view 共用同一套数学）
 //!
 //! 书签目录已统一移到侧边栏（[`crate::app::sidebar`] + 公共 [`crate::toc`]），
@@ -45,16 +45,13 @@ use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::config::pdf::{
     MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO,
-    MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT,
-    THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE, WRITE_QUEUE_MAX,
-    ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
+    MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES,
+    TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
-use crate::pdf::cache::PageCache;
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
     display_height, hit_char, keep_window, local_to_pt, page_bitmap_size, page_segment_text,
-    pt_to_local, render_scale, selection_spans_pt, trim_transient_writes, visible_tile_range, Slot,
-    TileSlot,
+    pt_to_local, render_scale, selection_spans_pt, visible_tile_range, Slot, TileSlot,
 };
 use crate::pdf::{
     render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
@@ -99,13 +96,6 @@ pub struct PdfViewer {
     pub(crate) scroll_velocity: f32,
     /// 迟滞判定后的"快速拖动"标志（进入 v>阈值、退出 v<阈值×比率，中间保持）。
     pub(crate) prev_fast: bool,
-    /// 待落盘写队列 `(页, 缩略图 BGRA, w, h)`：编码/写盘在后台 executor **串行**
-    /// （最多 1 在途）；快速拖动时超 [`WRITE_QUEUE_MAX`] 的旧条目直接丢弃。
-    pub(crate) disk_queue: VecDeque<(usize, Vec<u8>, u32, u32)>,
-    /// 后台写盘任务是否在途（串行闸：最多同时 1 个编码）。
-    pub(crate) disk_write_inflight: bool,
-    /// 写盘完成唤醒通道（后台任务完成后回信，主线程据此放行下一个）。
-    pub(crate) disk_write_wakeup: Option<mpsc::Receiver<()>>,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
     /// 是否仍在后台解析。
@@ -116,8 +106,6 @@ pub struct PdfViewer {
     pub(crate) bg: Option<Hsla>,
     /// 待释放的旧位图/旧瓦片（替换或回收的，需在下一帧 `drop_image`）。
     pub(crate) pending_drops: Vec<Arc<RenderImage>>,
-    /// 磁盘二级**缩略图**缓存：内存淘汰后读盘即得，快速回翻不重新栅格化。
-    pub(crate) cache: PageCache,
     /// 书签目录（标题 + 层级 + 目标页码）；无书签时为 `[]`。供侧边栏目录使用。
     pub(crate) outlines: Vec<PdfOutlineEntry>,
     /// 键盘焦点句柄（点选后聚焦，`Ctrl+C` 复制）。
@@ -155,7 +143,6 @@ pub struct PdfViewer {
 impl PdfViewer {
     /// 创建阅读器并异步加载 `path`（读文件 + 解析 + 量页在后台，UI 不阻塞）。
     pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
-        let cache = PageCache::new(&path);
         let mut this = Self {
             path,
             worker: None,
@@ -173,15 +160,11 @@ impl PdfViewer {
             last_scroll_y: 0.0,
             scroll_velocity: 0.0,
             prev_fast: false,
-            disk_queue: VecDeque::new(),
-            disk_write_inflight: false,
-            disk_write_wakeup: None,
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
             bg: None,
             pending_drops: Vec::new(),
-            cache,
             outlines: Vec::new(),
             // 焦点句柄须由 Context 创建（gpui 内部注册），同 markdown 预览
             focus_handle: cx.focus_handle(),
@@ -288,7 +271,7 @@ impl PdfViewer {
         }
     }
 
-    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），关闭 worker 侧文档并清空磁盘缓存。
+    /// 释放所有已上传的 GPU 纹理（关闭标签页 / 丢弃视图时调用），关闭 worker 侧文档。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut drops = std::mem::take(&mut self.pending_drops);
         for slot in self.slots.iter_mut() {
@@ -311,7 +294,6 @@ impl PdfViewer {
                 self.doc_id = 0;
             }
         }
-        self.cache.clear();
         // 文本层与选区随文档一起释放
         self.text_pages.clear();
         self.text_lru.clear();
@@ -322,9 +304,6 @@ impl PdfViewer {
         self.tile_bytes = 0;
         self.tile_pump_running = false;
         self.mid_lru.clear();
-        self.disk_queue.clear();
-        self.disk_write_wakeup = None;
-        self.disk_write_inflight = false;
         self.sel_anchor = None;
         self.sel_active = None;
         self.selecting = false;
@@ -435,9 +414,6 @@ impl PdfViewer {
         self.scroll_velocity = self.scroll_velocity * 0.7 + dy * 0.3;
         self.update_fast_flag();
         self.last_scroll_y = scroll_y;
-
-        // 3) 帧内刷盘（缩略图串行写盘）
-        self.flush_disk_queue(cx);
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
@@ -658,31 +634,9 @@ impl PdfViewer {
         Some((vx0, vy0, vx1, vy1))
     }
 
-    /// 快速拖动占位：为可见页派发 L0.5 中清（比缩略图清晰，可辨识标题/段落），
-    /// 盘上已有缩略图则秒级铺占位。停止后常态调度自动补齐瓦片、替换占位。
+    /// 快速拖动占位：为可见页派发 L0.5 中清（比缩略图清晰，可辨识标题/段落）、
+    /// L0 缩略图（纯内存，无磁盘缓存）。停止后常态调度自动补齐瓦片、替换占位。
     fn schedule_placeholders(&mut self, start: usize, end: usize, scale_factor: f32) {
-        // 0) 盘上缩略图兜底：缺中清/缩略图的可见页先铺低清占位（几十 KB 小文件，主线程 ~1ms）
-        let from_disk: Vec<(usize, Option<(Vec<u8>, u32, u32)>)> = (start..=end)
-            .map(|p| {
-                let s = &self.slots[p];
-                if s.thumb.is_some() || s.thumb_loading || s.mid.is_some() {
-                    (p, None)
-                } else {
-                    (p, self.cache.load_thumb(p))
-                }
-            })
-            .collect();
-        for (p, data) in from_disk {
-            if let Some((bgra, w, h)) = data {
-                if let Ok(img) = render_image_from_bgra(bgra, w, h) {
-                    let s = &mut self.slots[p];
-                    if s.thumb.is_none() && !s.thumb_loading && s.mid.is_none() {
-                        s.thumb = Some(img);
-                    }
-                }
-            }
-        }
-
         let worker = self.worker.clone().unwrap();
         // 1) L0.5 中清：优先派发（比缩略图清晰），独立额度不挤占瓦片/缩略图
         if self.pending_mid.len() < MAX_MID_INFLIGHT {
@@ -828,7 +782,7 @@ impl PdfViewer {
     }
 
     /// 回收已完成的在途 **L0 缩略图**结果：worker 回传低清 BGRA → 装入 `slot.thumb`
-    /// → 入队异步落盘。非阻塞：仅检查已就绪通道；返回是否有新缩略图入槽。
+    /// （纯内存占位，不落盘）。非阻塞：仅检查已就绪通道；返回是否有新缩略图入槽。
     fn collect_thumb_results(&mut self) -> bool {
         let finished: Vec<(usize, Option<RenderResult>)> = self
             .pending_thumb
@@ -844,8 +798,6 @@ impl PdfViewer {
             match res {
                 Some(res) => {
                     let (w, h) = (res.width, res.height);
-                    // 入队异步落盘（与缩略图同队列，串行节流）
-                    self.disk_queue.push_back((i, res.bgra.clone(), w, h));
                     if let Some(s) = self.slots.get_mut(i) {
                         s.thumb_loading = false;
                         if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
@@ -902,41 +854,6 @@ impl PdfViewer {
             }
         }
         any
-    }
-
-    /// 帧内刷盘：缩略图落盘 WebP 编码在后台 executor **串行**执行（最多 1 在途，
-    /// 经 `disk_write_wakeup` 闸门放行下一个）。快速拖动期间超 [`WRITE_QUEUE_MAX`] 的
-    /// **最旧**条目直接丢弃（瞬态页不落盘/不编码）。
-    fn flush_disk_queue(&mut self, cx: &mut Context<Self>) {
-        // 1) 回收在途写盘完成标记 → 放行下一个
-        if self.disk_write_inflight {
-            if let Some(rx) = &self.disk_write_wakeup {
-                if rx.try_recv().is_ok() {
-                    self.disk_write_inflight = false;
-                    self.disk_write_wakeup = None;
-                }
-            }
-        }
-        // 2) 拖动中：丢弃最旧的瞬态条目（保留最近的 WRITE_QUEUE_MAX 个）
-        if self.prev_fast && self.disk_queue.len() > WRITE_QUEUE_MAX {
-            let excess = trim_transient_writes(self.disk_queue.len(), WRITE_QUEUE_MAX, true);
-            self.disk_queue.drain(0..excess);
-        }
-        if self.disk_write_inflight || self.disk_queue.is_empty() {
-            return;
-        }
-        // 3) 取队首，后台串行编码 + 写盘
-        let (idx, bgra, w, h) = self.disk_queue.pop_front().unwrap();
-        self.disk_write_inflight = true;
-        let (tx, rx) = mpsc::channel();
-        self.disk_write_wakeup = Some(rx);
-        let cache_inner = self.cache.inner_arc();
-        cx.background_executor()
-            .spawn(async move {
-                crate::pdf::cache::save_bgra_thumb(cache_inner, idx, bgra, w, h);
-                let _ = tx.send(());
-            })
-            .detach();
     }
 
     /// 迟滞比较：进入快速模式用 [`MOVE_THRESHOLD_PX`]，退出用其×

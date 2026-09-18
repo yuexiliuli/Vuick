@@ -26,28 +26,21 @@ pub const MARGIN: usize = 3;
 /// 整页位图内存保留上限（页数）。内容层已瓦片化、不再走整页位图，本常量仅供
 /// [`crate::pdf::layout::plan_page_work`] 的回归测试锚点使用。
 pub const CACHE_MAX_PAGES: usize = 8;
-/// 拖动/写盘节流（长 PDF 来回拖滚动条时防多核 CPU 打满）：
-/// 待落盘写队列上限：超出后从**最旧**丢弃（瞬态页不落盘）。落盘 WebP 无损编码在
-/// 后台 executor **串行**执行（最多 1 在途），配合此上限避免编码任务逐页堆积。
-pub const WRITE_QUEUE_MAX: usize = 16;
-/// 滚动速度（px/帧，EMA）超过此值视为"快速拖动"：全尺寸渲染降并发、跳过预取、
-/// 只由缩略图层占位——避免把 GPU/pdfium + 编码 CPU 烧在即将滚过的页面上。
+/// 滚动速度（px/帧，EMA）超过此值视为"快速拖动"：改派缩略/中清占位、暂停瓦片派发，
+/// 避免把 GPU/pdfium 烧在即将滚过的页面上。
 pub const MOVE_THRESHOLD_PX: f32 = 160.0;
 /// 速度迟滞退出比率：**进入**快速模式仍用 [`MOVE_THRESHOLD_PX`]，**退出**用它×本
 /// 比率（更小阈值）——临界速度下保持上一状态，避免 LOD 降级/恢复反复横跳。
 pub const MOVE_THRESHOLD_LOWER_RATIO: f32 = 0.7;
-/// 磁盘二级页缓存字节上限已随「整页位图磁盘缓存」移除（瓦片不落盘）；缩略图缓存见
-/// [`CACHE_THUMB_BYTES`]。
-// ---- L0 缩略图层（拖动期间"永远有内容"，消除"加载中"白块）----
-/// 缩略图目标显示宽（px，LOD 低清层）：pdfium 下采样 ~1ms、WebP ~几十 KB/张。
+// ---- L0 缩略图层（拖动期间"永远有内容"，消除"加载中"白块）。**纯内存**：
+// 不落盘、不编码 WebP；超 [`THUMB_CACHE_PAGES`] 按距离 LRU 淘汰。----
+/// 缩略图目标显示宽（px，LOD 低清层）：pdfium 下采样 ~1ms/张。
 pub const THUMB_WIDTH: f32 = 260.0;
 /// 同时在途的缩略图请求上限（独立于瓦片/中清额度）。
 pub const MAX_THUMB_INFLIGHT: usize = 4;
 /// 内存中保留的缩略图页数上限（超限丢离视口中心最远者；每张 ~0.37MB RGBA，
 /// 40 张 ≈ 15MB——够覆盖快速拖动最近 ~5 屏，兼顾内存）。
 pub const THUMB_CACHE_PAGES: usize = 40;
-/// 磁盘缩略图字节预算（≈ 上千张 260px WebP；热页缩略图常驻盘，回翻即时）。
-pub const CACHE_THUMB_BYTES: u64 = 96 * 1024 * 1024;
 // ---- L0.5 中清 LOD（快速拖动时的清晰度）：260px 缩略图拉 3.2× 到 840px 必然糊，
 // 加一档 ~520px 中清页，拖动时可辨识标题/段落结构，且比瓦片整屏便宜（~5ms/张）----
 /// 中清目标显示宽（px）：快速拖动时优先派发/显示，作瓦片下方的占位底图。

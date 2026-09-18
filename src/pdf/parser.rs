@@ -173,7 +173,7 @@ pub struct TileResult {
 ///
 /// `bgra` 直接来自 pdfium 的原生 BGRA 缓冲（`FPDFBitmap_GetBuffer_as_vec`），
 /// 主线程用 `Frame::from_raw` 直接包裹即上传 → **没有任何像素循环或字节重排**。
-/// PNG 编码不再由 worker 承担，改由 view 层在后台 executor 异步落盘。
+/// （缩略/中清/全尺寸均为纯内存，无 PNG/WebP 编码与落盘。）
 #[derive(Debug)]
 pub struct RenderResult {
     /// 原始 BGRA 像素（`w*h*4` 字节），主线程 `Frame::from_raw` 直接包裹即上传。
