@@ -1689,6 +1689,90 @@ mod tests {
         );
     }
 
+    /// 完整滚动一遍（采样停靠）后测渲染驻留内存构成：瓦片字节 + 封面（整页位图按当前
+    /// 密度估算）+ 中清/缩略计数 + 封面/瓦片双份持有数。返回
+    /// `(tile_bytes, covers, mids, thumbs, double_hold, est_total)`。
+    #[allow(clippy::type_complexity)]
+    fn full_scroll_memory(
+        holder: &std::rc::Rc<
+            std::cell::RefCell<Option<gpui::Entity<crate::pdf::PdfViewer>>>,
+        >,
+        cx: &mut gpui::VisualTestContext,
+        targets: &[usize],
+    ) -> (u64, usize, usize, usize, usize, u64) {
+        use std::time::Duration;
+        assert!(targets.len() >= 5, "应至少 5 个采样停靠点，实际 {}", targets.len());
+        let view = holder.borrow().as_ref().expect("视图应存在").clone();
+        for &target in targets {
+            cx.update(|_w, cx| {
+                view.update(cx, |v, cx| {
+                    v.scroll_to_page(target);
+                    cx.notify();
+                });
+            });
+            for _ in 0..200 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                let st = cx.update(|_w, cx| {
+                    let v = view.read(cx);
+                    (
+                        v.pending_tiles.is_empty()
+                            && v.pending_cover.is_empty()
+                            && !v.tile_pump_running,
+                        !v.prev_fast,
+                    )
+                });
+                if st == (true, true) {
+                    break;
+                }
+            }
+        }
+        cx.update(|_w, cx| {
+            let v = view.read(cx);
+            let pw = v.page_width();
+            // 测试窗口为 1× DPI（gpui TestAppContext 默认），缩放因子即 1.0
+            let sf = 1.0f32;
+            let mut covers_held = 0usize;
+            let mut mids_held = 0usize;
+            let mut thumbs_held = 0usize;
+            let mut double_hold = 0usize;
+            let mut cover_bytes = 0u64;
+            for (p, s) in v.slots.iter().enumerate() {
+                if s.cover.is_some() {
+                    covers_held += 1;
+                    let (w, h) =
+                        layout::page_bitmap_size(v.dims[p], layout::cover_scale(v.dims[p], pw, sf));
+                    cover_bytes += (w as u64) * (h as u64) * 4;
+                    // 冗余双份 = 封面与瓦片**同密度**且同页并存（应为 0，evict_tiles 每帧回收）。
+                    // 密度不同（封面被 COVER_SCALE_CAP 截断、瓦片更细）属正常“底图+精修”，不计。
+                    if !s.tiles.is_empty() && (s.cover_scale - s.tile_scale).abs() <= 1e-4 {
+                        double_hold += 1;
+                    }
+                }
+                if s.mid.is_some() {
+                    mids_held += 1;
+                }
+                if s.thumb.is_some() {
+                    thumbs_held += 1;
+                }
+            }
+            // 中清 ~2MB、缩略 ~0.37MB 为近似值（不精确到单页，仅用于有界断言）
+            let total_est = v.tile_bytes
+                + cover_bytes
+                + mids_held as u64 * 2 * 1024 * 1024
+                + thumbs_held as u64 * 385 * 1024;
+            (
+                v.tile_bytes,
+                covers_held,
+                mids_held,
+                thumbs_held,
+                double_hold,
+                total_est,
+            )
+        })
+    }
+
     /// 回归（内存）：完整滚动一遍整份文档后，渲染驻留内存必须**有界**且消灭“封面 + 瓦片
     /// 双份持有”。修复前：整页封面与同页瓦片/中清并存 → 全量缓存预算合计 ~280MB（瓦片
     /// 96MB + 封面 ~36MB + 中清 32MB + 缩略 15MB + 基座）。修复后：同密度整页封面在位即
@@ -1745,7 +1829,7 @@ mod tests {
         });
         assert!(n >= 40, "测试文档应至少有 40 页，实际 {n}");
 
-        // 完整滚动一遍（采样停靠，重演“翻到底”的累积路径）
+        // 完整滚动一遍的采样停靠（重演“翻到底”的累积路径）
         let mut targets: Vec<usize> = Vec::new();
         for t in (0..n).step_by(9) {
             let t = t.min(n - 1);
@@ -1759,107 +1843,271 @@ mod tests {
                 targets.push(t);
             }
         }
-        let settle_iters = {
-            let mut it = 0usize;
-            for target in targets {
-                cx.update(|_w, cx| {
-                    holder
-                        .borrow()
-                        .as_ref()
-                        .unwrap()
-                        .update(cx, |v, cx| {
-                            v.scroll_to_page(target);
-                            cx.notify();
-                        });
-                });
-                for _ in 0..200 {
-                    cx.executor().advance_clock(Duration::from_millis(16));
-                    cx.run_until_parked();
-                    std::thread::sleep(Duration::from_millis(3));
-                    let st = cx.update(|_w, cx| {
-                        let v = holder.borrow().as_ref().unwrap().read(cx);
-                        (
-                            v.pending_tiles.is_empty()
-                                && v.pending_cover.is_empty()
-                                && !v.tile_pump_running,
-                            !v.prev_fast,
-                        )
-                    });
-                    if st == (true, true) {
-                        break;
-                    }
-                }
-                it += 1;
-            }
-            it
-        };
-        assert!(settle_iters >= 5, "应完成至少 5 个采样停靠点");
 
-        let (tile_bytes, covers, mids, thumbs, double_hold, total_est, cap) =
-            cx.update(|_w, cx| {
-                let v = holder.borrow().as_ref().unwrap().read(cx);
-                let pw = v.page_width();
-                // 测试窗口为 1× DPI（gpui TestAppContext 默认），缩放因子即 1.0
-                let sf = 1.0f32;
-                let mut covers_held = 0usize;
-                let mut mids_held = 0usize;
-                let mut thumbs_held = 0usize;
-                let mut double_hold = 0usize;
-                let mut cover_bytes = 0u64;
-                for (p, s) in v.slots.iter().enumerate() {
-                    if s.cover.is_some() {
-                        covers_held += 1;
-                        let (w, h) =
-                            layout::page_bitmap_size(v.dims[p], layout::cover_scale(v.dims[p], pw, sf));
-                        cover_bytes += (w as u64) * (h as u64) * 4;
-                        if !s.tiles.is_empty() {
-                            double_hold += 1; // 封面在位又留瓦片 = 冗余双份，应被回收
-                        }
-                    }
-                    if s.mid.is_some() {
-                        mids_held += 1;
-                    }
-                    if s.thumb.is_some() {
-                        thumbs_held += 1;
-                    }
-                }
-                // 中清 ~2MB、缩略 ~0.37MB 为近似值（不精确到单页，仅用于有界断言）
-                let total_est =
-                    v.tile_bytes + cover_bytes + mids_held as u64 * 2 * 1024 * 1024
-                        + thumbs_held as u64 * 385 * 1024;
-                (
-                    v.tile_bytes,
-                    covers_held,
-                    mids_held,
-                    thumbs_held,
-                    double_hold,
-                    total_est,
-                    crate::config::pdf::TILE_CACHE_BYTES,
-                )
-            });
+        let measure = full_scroll_memory(&holder, cx, &targets);
+        let (tile_bytes, covers, mids, thumbs, double_hold, total_est) = measure;
+        let cap = crate::config::pdf::TILE_CACHE_BYTES;
         eprintln!(
-            "[MEM] tile_bytes={tile_bytes}MB covers={covers} mids={mids} thumbs={thumbs} double_hold={double_hold} total_est={total_est}MB cap={cap}MB",
-            tile_bytes = tile_bytes / 1024 / 1024,
-            total_est = total_est / 1024 / 1024,
-            cap = cap / 1024 / 1024,
+            "[MEM zoom=1.0] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB cap={}MB",
+            tile_bytes / 1024 / 1024,
+            covers,
+            mids,
+            thumbs,
+            double_hold,
+            total_est / 1024 / 1024,
+            cap / 1024 / 1024,
         );
+        assert!(tile_bytes <= cap, "zoom1 瓦片占用应不超预算：{tile_bytes} > {cap}");
+        assert!(covers <= 5, "zoom1 封面驻留应 ≤ 5：{covers}");
         assert!(
-            tile_bytes <= cap,
-            "瓦片占用应不超预算：{tile_bytes} > {cap}"
+            mids <= crate::config::pdf::MID_CACHE_PAGES,
+            "zoom1 中清驻留应 ≤ 上限：{mids}"
         );
-        assert!(covers <= 5, "封面驻留应 ≤ 5：{covers}");
-        assert!(mids <= crate::config::pdf::MID_CACHE_PAGES, "中清驻留应 ≤ 上限：{mids}");
         assert!(
             thumbs <= crate::config::pdf::THUMB_CACHE_PAGES,
-            "缩略驻留应 ≤ 上限：{thumbs}"
+            "zoom1 缩略驻留应 ≤ 上限：{thumbs}"
         );
         assert!(
             double_hold == 0,
-            "封面在位时不得双份持有瓦片（内存回归）：{double_hold} 页"
+            "zoom1 封面在位时不得双份持有瓦片（内存回归）：{double_hold} 页"
         );
         assert!(
             total_est < 220 * 1024 * 1024,
-            "完整滚动后渲染驻留内存应明显低于修复前（~280MB）：{total_est}"
+            "zoom1 完整滚动后渲染驻留内存应明显低于修复前（~280MB）：{total_est}"
+        );
+
+        // 再以用户实测量的高倍密度（Ctrl+滚轮放大 → zoom≈1.76 → 渲染密度≈2.48）完整滚动
+        // 一遍复测：封面单张变 ~12MB，正是真实场景里 160MB 的主要构成，必须同样有界。
+        // ⚠️ 必须走真实滚轮事件触发 `on_scroll_wheel` 的重排（直接改 `v.zoom` 会让布局/滚动
+        // 锚点失配 → 可见区间虚增 → 封面/瓦片翻倍，测不出真实数）。
+        let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..6 {
+                cx.run_until_parked();
+            }
+        }
+        let z = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).zoom
+        });
+        assert!(z > 1.5, "Ctrl+滚轮应放大到高倍密度为主：{z}");
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let (tile_bytes2, covers2, mids2, thumbs2, double_hold2, total_est2) =
+            full_scroll_memory(&holder, cx, &targets);
+        eprintln!(
+            "[MEM zoom=1.75(d=2.47)] tile_bytes={}MB covers={} mids={} thumbs={} double_hold={} est_total={}MB cap={}MB",
+            tile_bytes2 / 1024 / 1024,
+            covers2,
+            mids2,
+            thumbs2,
+            double_hold2,
+            total_est2 / 1024 / 1024,
+            cap / 1024 / 1024,
+        );
+        assert!(
+            tile_bytes2 <= cap,
+            "zoom1.75 瓦片占用应不超预算：{tile_bytes2} > {cap}"
+        );
+        assert!(covers2 <= 5, "zoom1.75 封面驻留应 ≤ 5：{covers2}");
+        assert!(
+            mids2 <= crate::config::pdf::MID_CACHE_PAGES,
+            "zoom1.75 中清驻留应 ≤ 上限：{mids2}"
+        );
+        assert!(
+            thumbs2 <= crate::config::pdf::THUMB_CACHE_PAGES,
+            "zoom1.75 缩略驻留应 ≤ 上限：{thumbs2}"
+        );
+        assert!(
+            double_hold2 == 0,
+            "zoom1.75 封面在位时不得双份持有瓦片（内存回归）：{double_hold2} 页"
+        );
+        assert!(
+            total_est2 < 150 * 1024 * 1024,
+            "zoom1.75 高倍密度下渲染驻留内存也应有界：{total_est2}"
+        );
+    }
+
+    /// 时空基准（自动对比前后两版）：只依赖两版公共 API，用**完全相同的固定工作负载**
+    /// 打印一条 `[BENCH]`：总耗时（加载 + Ctrl+滚轮放大到 ~2.48 密度 + 整份文档前后翻页
+    /// 停稳）、停靠总帧数、最终渲染驻留内存估算（瓦片字节 + 封面 + 中清 + 缩略）。
+    /// 用法：当前工作树跑一遍记录 after；再 `git worktree add <tmp> e031f0c` 并在其中
+    /// 打上 `git diff HEAD -- src/pdf/mod.rs`（本文件即基准源码）后各跑一次，对比 [BENCH]。
+    #[gpui::test]
+    async fn bench_full_scroll_time_memory(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(gpui_component::init);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        assert!(pdf_path.exists(), "测试 PDF 应存在");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let t_all = Instant::now();
+        let mut loaded = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            loaded = cx.update(|_w, cx| {
+                holder.borrow().as_ref().unwrap().read(cx).is_loaded()
+            });
+            if loaded {
+                break;
+            }
+        }
+        assert!(loaded, "应加载完成");
+        let n = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count());
+        let t_open = t_all.elapsed();
+        for _ in 0..40 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+
+        // Ctrl+滚轮放大到 ~2.48 渲染密度（用户实测档）
+        let zoom_wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for _ in 0..5 {
+            cx.simulate_event(zoom_wheel(true, 240.0));
+            for _ in 0..6 {
+                cx.run_until_parked();
+            }
+        }
+        let t_zoom = t_all.elapsed();
+
+        // 固定翻页负载：前向每 6 页 + 回翻（重演用户“完整滚动一遍”）
+        let mut targets: Vec<usize> = Vec::new();
+        for t in (0..n).step_by(6) {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        for t in (0..n).step_by(6).rev() {
+            let t = t.min(n - 1);
+            if !targets.contains(&t) {
+                targets.push(t);
+            }
+        }
+        let mut total_iters = 0usize;
+        for &target in &targets {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |v, cx| {
+                        v.scroll_to_page(target);
+                        cx.notify();
+                    });
+            });
+            for _ in 0..200 {
+                cx.executor().advance_clock(Duration::from_millis(16));
+                cx.run_until_parked();
+                std::thread::sleep(Duration::from_millis(3));
+                total_iters += 1;
+                let st = cx.update(|_w, cx| {
+                    let v = holder.borrow().as_ref().unwrap().read(cx);
+                    (
+                        v.pending_tiles.is_empty()
+                            && v.pending_cover.is_empty()
+                            && !v.tile_pump_running,
+                        !v.prev_fast,
+                    )
+                });
+                if st == (true, true) {
+                    break;
+                }
+            }
+        }
+        let t_flip = t_all.elapsed();
+
+        // 最终渲染驻留内存估算（只依赖公共字段/布局函数）
+        let (tile_bytes, covers, mids, thumbs, cover_bytes) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            let pw = v.page_width();
+            let sf = 1.0f32;
+            let mut covers_held = 0usize;
+            let mut mids_held = 0usize;
+            let mut thumbs_held = 0usize;
+            let mut cover_bytes = 0u64;
+            for (p, s) in v.slots.iter().enumerate() {
+                if s.cover.is_some() {
+                    covers_held += 1;
+                    let (w, h) = layout::page_bitmap_size(
+                        v.dims[p],
+                        layout::cover_scale(v.dims[p], pw, sf),
+                    );
+                    cover_bytes += (w as u64) * (h as u64) * 4;
+                }
+                if s.mid.is_some() {
+                    mids_held += 1;
+                }
+                if s.thumb.is_some() {
+                    thumbs_held += 1;
+                }
+            }
+            (v.tile_bytes, covers_held, mids_held, thumbs_held, cover_bytes)
+        });
+        let est = tile_bytes
+            + cover_bytes
+            + mids as u64 * 2 * 1024 * 1024
+            + thumbs as u64 * 385 * 1024;
+        eprintln!(
+            "[BENCH] stops={} open_ms={:.0} zoom_ms={:.0} flip_ms={:.0} iters={} tiles={}MB covers={} mids={} thumbs={} est={}MB",
+            targets.len(),
+            t_open.as_secs_f64() * 1e3,
+            t_zoom.as_secs_f64() * 1e3,
+            t_flip.as_secs_f64() * 1e3,
+            total_iters,
+            tile_bytes / 1024 / 1024,
+            covers,
+            mids,
+            thumbs,
+            est / 1024 / 1024,
         );
     }
 }
