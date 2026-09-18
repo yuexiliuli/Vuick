@@ -10,6 +10,14 @@ pub const PAGE_PAD_Y: f32 = 16.0;
 pub const PAGE_PAD_X: f32 = 20.0;
 /// 渲染缩放上限（相对屏幕 DPI 的倍率）。
 pub const MAX_RENDER_SCALE: f32 = 1.5;
+/// 位图密度（px/pt）绝对上限：Ctrl+滚轮高倍缩放时仍保持清晰，同时防超大位图撑爆内存
+/// （实际封顶 = `MAX_RENDER_SCALE * zoom`，但不超过本值）。
+pub const MAX_BITMAP_SCALE: f32 = 4.0;
+/// 页面缩放倍数范围（Ctrl+滚轮可调）：0.5×～4×。
+pub const ZOOM_MIN: f32 = 0.5;
+pub const ZOOM_MAX: f32 = 4.0;
+/// 每格滚轮（≈1 行）的缩放倍率增幅（12%）。
+pub const ZOOM_STEP: f32 = 0.12;
 /// 可见窗口外保留的页数（虚拟化/预取缓冲）。
 pub const MARGIN: usize = 3;
 /// 内存页位图保留上限（页数，超过按距离 LRU 淘汰）。

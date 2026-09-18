@@ -25,6 +25,9 @@ pub(crate) struct CacheInner {
     pub(crate) lru: std::sync::Mutex<Vec<usize>>,
     /// 磁盘页数上限。LRU 淘汰到该上限。
     pub(crate) budget: usize,
+    /// 缓存版本（缩放/质量变化时递增）：文件名带版本前缀，旧版本位图像素密度不符，
+    /// 读盘键失效 → 按新密度重新栅格化；旧文件在递增时清理。
+    pub(crate) version: std::sync::atomic::AtomicU32,
 }
 
 /// 磁盘二级页缓存句柄（可克隆共享）。
@@ -46,6 +49,7 @@ impl PageCache {
                 closed: AtomicBool::new(false),
                 lru: std::sync::Mutex::new(Vec::new()),
                 budget: CACHE_DISK_PAGES,
+                version: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -55,13 +59,41 @@ impl PageCache {
         self.inner.clone()
     }
 
+    /// 缩放/质量变化：递增缓存版本并清理旧版本文件与 LRU。
+    /// 旧版本的位图像素密度与当前显示倍率不符，读盘键（文件）随之失效 → 重新栅格化。
+    pub(crate) fn bump_version(&self) {
+        let v = self
+            .inner
+            .version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if let Ok(mut lru) = self.inner.lru.lock() {
+            lru.clear();
+        }
+        let prefix = format!("v{v:03}-");
+        if let Ok(entries) = std::fs::read_dir(&self.inner.dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('v') && name.ends_with(".bin") && !name.starts_with(&prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+
+    /// 版本化页文件名：`v<version>-<idx>.bin`。
+    fn file_path(dir: &std::path::Path, version: u32, idx: usize) -> std::path::PathBuf {
+        dir.join(format!("v{version:03}-{idx:05}.bin"))
+    }
+
     /// 从磁盘读取某页 BGRA（缺失/损坏返回 None）。供主线程快速恢复：
     /// 命中后直接 `render_image_from_bgra`，毫秒级、无冻结。
     pub(crate) fn load_bgra(&self, idx: usize) -> Option<(Vec<u8>, u32, u32)> {
         if self.inner.closed.load(Ordering::Relaxed) {
             return None;
         }
-        let path = self.inner.dir.join(format!("{idx:05}.bin"));
+        let version = self.inner.version.load(Ordering::Relaxed);
+        let path = Self::file_path(&self.inner.dir, version, idx);
         let data = std::fs::read(path).ok()?;
         if data.len() < CACHE_HEADER || &data[..4] != CACHE_MAGIC {
             return None;
@@ -105,12 +137,13 @@ pub(crate) fn save_bgra(
         return;
     }
     let _ = std::fs::create_dir_all(&inner.dir);
+    let version = inner.version.load(Ordering::Relaxed);
     let mut data = Vec::with_capacity(CACHE_HEADER + bgra.len());
     data.extend_from_slice(CACHE_MAGIC);
     data.extend_from_slice(&w.to_le_bytes());
     data.extend_from_slice(&h.to_le_bytes());
     data.extend_from_slice(&bgra);
-    let _ = std::fs::write(inner.dir.join(format!("{idx:05}.bin")), data);
+    let _ = std::fs::write(PageCache::file_path(&inner.dir, version, idx), data);
     // 超出预算：淘汰最久未用的页（异步删除，失败静默）
     let evict: Vec<usize> = {
         let mut lru = inner.lru.lock().unwrap_or_else(|e| e.into_inner());
@@ -124,7 +157,7 @@ pub(crate) fn save_bgra(
         }
     };
     for page in evict {
-        let _ = std::fs::remove_file(inner.dir.join(format!("{page:05}.bin")));
+        let _ = std::fs::remove_file(PageCache::file_path(&inner.dir, version, page));
     }
 }
 
@@ -160,6 +193,7 @@ mod tests {
                 closed: AtomicBool::new(false),
                 lru: std::sync::Mutex::new(Vec::new()),
                 budget,
+                version: std::sync::atomic::AtomicU32::new(0),
             }),
         }
     }
@@ -246,6 +280,38 @@ mod tests {
         save_bgra(cache.inner.clone(), 8, bgra, 8, 8);
         assert!(cache.load_bgra(4).is_some(), "最近用过的页 4 不应被淘汰");
         assert!(cache.load_bgra(5).is_none(), "最久未用的页 5 应被淘汰");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn page_cache_bump_version_invalidates_old_scale() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-pdf-cache-test-{}-ver",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = make_cache(dir.clone(), CACHE_DISK_PAGES);
+        // v0 落一页
+        let bgra = vec![0x11u8, 0x22, 0x33, 0xff].repeat(64);
+        save_bgra(cache.inner.clone(), 3, bgra, 8, 8);
+        assert!(cache.load_bgra(3).is_some(), "v0 应能读回");
+        // 版本递增（模拟缩放）→ 旧文件失效并清理
+        cache.bump_version();
+        assert!(cache.load_bgra(3).is_none(), "旧版本位图不应再被读到");
+        // 新版本可正常落盘 + 读回
+        let bgra2 = vec![0xFFu8; 16 * 16 * 4];
+        save_bgra(cache.inner.clone(), 3, bgra2, 16, 16);
+        let (back, pw, ph) = cache.load_bgra(3).expect("新版本应读回");
+        assert_eq!((pw, ph), (16, 16));
+        assert_eq!(back.len(), 16 * 16 * 4);
+        // 磁盘上不应残留旧版本文件
+        let stale = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("v000-"))
+            .count();
+        assert_eq!(stale, 0, "旧版本文件应被清理");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

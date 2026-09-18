@@ -31,12 +31,15 @@ use std::sync::{mpsc, Arc};
 use gpui::{
     div, img, px, rgba, rgb, App, ClipboardItem, Context, FocusHandle, Hsla, ImageSource,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Point, Pixels, Render, RenderImage, ScrollHandle, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    MouseUpEvent, ParentElement, Point, Pixels, Render, RenderImage, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
-use crate::config::pdf::{MAX_INFLIGHT, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT};
+use crate::config::pdf::{
+    MAX_INFLIGHT, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, ZOOM_MAX, ZOOM_MIN,
+    ZOOM_STEP,
+};
 use crate::pdf::cache::PageCache;
 use crate::pdf::layout::{
     Slot, advance_match_index, column_left, compute_layout, content_to_local, display_height,
@@ -110,6 +113,8 @@ pub struct PdfViewer {
     pub(crate) search_pending_seq: u64,
     /// 检索调度代次（防抖：仅最新一次生效）。
     pub(crate) search_seq: u64,
+    /// 页面缩放倍数（Ctrl+滚轮可调；页面显示宽度 = `PAGE_WIDTH * zoom`）。
+    pub(crate) zoom: f32,
 }
 
 impl PdfViewer {
@@ -148,6 +153,7 @@ impl PdfViewer {
             search_pending: None,
             search_pending_seq: 0,
             search_seq: 0,
+            zoom: 1.0,
         };
         this.start_load(cx);
         this
@@ -264,9 +270,58 @@ impl PdfViewer {
         self.search_pending = None;
     }
 
-    /// 当前页列宽度。
-    fn page_width(&self) -> f32 {
-        PAGE_WIDTH
+    /// 当前页列显示宽度（随 Ctrl+滚轮缩放变化）。
+    pub(crate) fn page_width(&self) -> f32 {
+        PAGE_WIDTH * self.zoom
+    }
+
+    /// Ctrl+滚轮缩放：页列宽按倍率变化，锚定视口顶部内容点，重算布局并失效旧密度位图。
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 仅 Ctrl+滚轮缩放；普通滚轮不拦截（交给滚动容器）。
+        if !event.modifiers.control {
+            return;
+        }
+        let delta_y = match event.delta {
+            gpui::ScrollDelta::Lines(v) => v.y,
+            gpui::ScrollDelta::Pixels(v) => f32::from(v.y),
+        };
+        // 实测本平台：向上滚动 delta.y>0 → 放大；向下 <0 → 缩小（与编辑器字号缩放一致）
+        let step = delta_y.clamp(-1.0, 1.0);
+        self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
+        cx.stop_propagation();
+    }
+
+    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局、递增渲染/缓存代次。
+    fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
+        if self.dims.is_empty() {
+            return;
+        }
+        let old_w = self.page_width();
+        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - self.zoom).abs() < 1e-4 {
+            return;
+        }
+        self.zoom = new_zoom;
+        let new_w = self.page_width();
+        // 锚定视口：页列布局随 page_width 线性缩放 → 同一文档点的滚动偏移同比缩放。
+        let ratio = new_w / old_w;
+        let sx = f32::from(-self.scroll.offset().x);
+        let sy = f32::from(-self.scroll.offset().y);
+        self.scroll
+            .set_offset(gpui::point(px(-sx * ratio), px(-sy * ratio)));
+        // 重算布局 + 递增代次：旧缩放位图失效，可见页按新密度重栅格化；
+        // 磁盘缓存键随版本递增失效（旧密度位图不复用）。
+        let (tops, total) = compute_layout(&self.dims, new_w);
+        self.page_tops = tops;
+        self.total_height = total;
+        self.generation = self.generation.wrapping_add(1);
+        self.cache.bump_version();
+        cx.notify();
     }
 
     /// 页列 wrap 宽度 = 滚动容器实际可视宽。⚠️ 不用 `window.bounds()`（那是全窗口宽）：
@@ -1043,6 +1098,10 @@ impl Render for PdfViewer {
                         .flex()
                         .flex_row()
                         .justify_center()
+                        // Ctrl+滚轮缩放：挂在 wrap（pdf-scroll 的子树）上，bubble 期先于
+                        // pdf-scroll 的内置滚动处理 → Ctrl 时 stop_propagation 可阻止滚动；
+                        // 普通滚轮不拦截，仍回落到滚动容器。覆盖整个可视区（含页边距）。
+                        .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                         .child(content),
                 )
                 .into_any_element()

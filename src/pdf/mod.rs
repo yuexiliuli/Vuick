@@ -766,4 +766,160 @@ mod tests {
             }
         }
     }
+
+    /// 回归：Ctrl+滚轮应放大/缩小页面（页列宽、整列高随之变化），普通滚轮不改变缩放。
+    #[gpui::test]
+    async fn pdf_ctrl_wheel_zooms_in_out(cx: &mut gpui::TestAppContext) {
+        use gpui::{
+            AppContext, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct ZoomProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for ZoomProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div()
+                    .id("zoom-pane")
+                    .w(gpui::px(1200.))
+                    .h_full()
+                    .child(self.pdf.clone())
+            }
+        }
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(gpui_component::init);
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/pdf测试.pdf");
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            ZoomProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (w0, total0) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_width(), v.total_height)
+        });
+        assert!((w0 - 840.0).abs() < 1.0, "初始页宽应为 PAGE_WIDTH");
+        // 先滚到第 5 页，留出纵向滚动余量；布局稳定后记录滚动偏移作为缩放锚点
+        cx.update(|_w, cx| {
+            let pdf = holder.borrow().as_ref().unwrap().clone();
+            pdf.update(cx, |v, cx| {
+                v.scroll_to_page(5);
+                cx.notify();
+            });
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let off0 = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).scroll.offset()
+        });
+        assert!(
+            off0.y.as_f32() < 0.0,
+            "滚到第 5 页后应向下偏移（负值）：{off0:?}"
+        );
+
+        let wheel = |control: bool, delta_y: f32| gpui::ScrollWheelEvent {
+            position: gpui::point(gpui::px(400.), gpui::px(500.)),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(delta_y))),
+            modifiers: gpui::Modifiers {
+                control,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Ctrl+向上滚（y>0）→ 放大
+        cx.simulate_event(wheel(true, 240.0));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (w1, z1, total1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_width(), v.zoom, v.total_height)
+        });
+        let (w1, z1, total1) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_width(), v.zoom, v.total_height)
+        });
+        assert!(w1 > w0, "Ctrl+向上滚应放大：{w0} → {w1}");
+        assert!(z1 > 1.0, "zoom 应 >1：{z1}");
+        assert!(total1 > total0, "整列高应随缩放增大：{total0} → {total1}");
+        // Ctrl 滚轮**不应滚动**：滚动偏移应恰好等于「缩放前 × 缩放比」的锚定值。
+        let off1 = cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).scroll.offset());
+        let exp_y1 = off0.y.as_f32() * (w1 / w0);
+        let exp_x1 = off0.x.as_f32() * (w1 / w0);
+        assert!(
+            (off1.y.as_f32() - exp_y1).abs() < 1.0 && (off1.x.as_f32() - exp_x1).abs() < 1.0,
+            "Ctrl 放大不应产生额外滚动：锚定 y={exp_y1:.1} 实际 y={:.1}（x 锚={exp_x1:.1} 实际 x={:.1}）",
+            off1.y.as_f32(),
+            off1.x.as_f32()
+        );
+
+        // 普通滚轮（无 Ctrl）→ 缩放不变，且照常滚动
+        let z_before = z1;
+        let off_before_plain = cx.update(|_w, cx| {
+            holder.borrow().as_ref().unwrap().read(cx).scroll.offset()
+        });
+        cx.simulate_event(wheel(false, 240.0));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (z2, off2) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.zoom, v.scroll.offset())
+        });
+        assert!((z2 - z_before).abs() < 1e-4, "普通滚轮不应改变缩放：{z_before}→{z2}");
+        assert!(
+            off2.y.as_f32() != off_before_plain.y.as_f32(),
+            "普通滚轮应照常滚动（偏移发生变化）"
+        );
+
+        // Ctrl+向下滚（y<0）→ 缩小：锚定基准 = 当前（普通滚轮已滚动后）的偏移
+        cx.simulate_event(wheel(true, -240.0));
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (w3, z3, off3) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.page_width(), v.zoom, v.scroll.offset())
+        });
+        assert!(w3 < w1, "Ctrl+向下滚应缩小：{w1} → {w3}");
+        assert!(z3 < z1, "zoom 应变小：{z1} → {z3}");
+        let exp_y3 = off2.y.as_f32() * (w3 / w1);
+        let exp_x3 = off2.x.as_f32() * (w3 / w1);
+        assert!(
+            (off3.y.as_f32() - exp_y3).abs() < 1.0 && (off3.x.as_f32() - exp_x3).abs() < 1.0,
+            "Ctrl 缩小也不应滚动：锚定 y={exp_y3:.1} 实际 y={:.1}",
+            off3.y.as_f32()
+        );
+    }
 }

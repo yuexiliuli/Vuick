@@ -4,7 +4,7 @@
 //! 保证滚动位置推算与 DOM 位置严格一致（否则可见页会被误判）。
 
 use crate::config::pdf::{
-    CACHE_MAX_PAGES, MARGIN, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y,
+    CACHE_MAX_PAGES, MARGIN, MAX_BITMAP_SCALE, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y, PAGE_WIDTH,
 };
 use crate::pdf::PageText;
 
@@ -85,11 +85,15 @@ pub(crate) fn keep_window(
 }
 
 /// 渲染倍率：以在屏宽度、显示 DPI 推导，封顶避免超大位图。
+/// 高倍缩放（page_width > [`PAGE_WIDTH`]）时按缩放比抬高封顶，保证放大后仍清晰；
+/// zoom=1 时封顶仍为 [`MAX_RENDER_SCALE`]，行为不变。
 pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f32) -> f32 {
     if page_pt_width > 0.0 {
-        (page_width * scale_factor / page_pt_width).clamp(0.5, MAX_RENDER_SCALE)
+        let zoom = (page_width / PAGE_WIDTH).max(1.0);
+        let cap = (MAX_RENDER_SCALE * zoom).min(MAX_BITMAP_SCALE);
+        (page_width * scale_factor / page_pt_width).clamp(0.5, cap)
     } else {
-        1.5
+        MAX_RENDER_SCALE
     }
 }
 
