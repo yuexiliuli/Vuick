@@ -1,5 +1,6 @@
 target/
 .kilo
+.code-review-graph/
 assets/
 kilo.json
 records/
