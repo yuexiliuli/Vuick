@@ -289,7 +289,7 @@ enum WorkerMsg {
         Vec<u8>,
         mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
     ),
-    #[allow(dead_code)] // 供回归/基准测试渲染整页（文本对齐、贴片比对）；生产内容层走 RenderTile
+    #[allow(dead_code)] // 回归测试渲染整页（文本对齐、贴片比对）使用
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
     /// 瓦片渲染（主内容路径）：只栅格化一页的一格（~512px）。与全尺寸 Render 同一
     /// 优先级（视口内容优先），worker 内实现见 [`render_tile`]。
@@ -357,9 +357,8 @@ impl PdfWorker {
         Ok((worker.clone(), doc_id, dims, outlines))
     }
 
-    /// 请求渲染某页（异步，供回归/基准测试用；生产内容层改用 [`Self::request_tile`]）。
-    /// 返回一个接收结果的通道。
-    #[allow(dead_code)]
+    /// 请求渲染某页（异步）。生产用于「首屏整页锐化封面」（廉价密度一渲铺满首屏，
+    /// 见 `view.rs` 的封面调度），测试亦用于回归/基准比对。返回接收结果的通道。
     pub fn request_render(&self, doc_id: DocId, req: RenderRequest) -> mpsc::Receiver<Option<RenderResult>> {
         let (tx, rx) = mpsc::channel();
         let _ = self.tx.send(WorkerMsg::Render(doc_id, req, tx));

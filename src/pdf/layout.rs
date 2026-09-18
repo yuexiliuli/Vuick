@@ -20,6 +20,12 @@ pub(crate) struct Slot {
     /// 现有瓦片对应的渲染倍率（px/pt）。缩放/换 DPI 显示器后与新一轮 [`render_scale`]
     /// 不一致 → 该页瓦片被惰性作废，按新密度重栅格化（旧瓦片 `drop_image` 下线）。
     pub(crate) tile_scale: f32,
+    /// **首屏整页锐化封面**（SumatraPDF 首遍同款）：可见页在「廉价密度」下先整页一渲、
+    /// 立刻铺满首屏（瓦片几十片串行渲染前的瞬时清晰），瓦片补齐后丢弃回收内存。
+    /// 与瓦片同密度，故与瓦片拼图完全对齐，只是作底层、先行到达。
+    pub(crate) cover: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// 封面对应的渲染倍率（px/pt）；缩放变化后视为过期并丢弃。
+    pub(crate) cover_scale: f32,
     /// L0 缩略图（低清层）：全尺寸瓦片缺席时先展示，拖动期间"永远有内容"；
     /// 快速拖动时全页只有缩略图占位，停止后按需补齐瓦片。
     pub(crate) thumb: Option<std::sync::Arc<gpui::RenderImage>>,
@@ -237,6 +243,17 @@ pub(crate) fn visible_tile_range(
         return None;
     }
     Some((r0, c0, r1, c1))
+}
+
+/// 「整页锐化封面」是否廉价可整渲：该密度下整页位图字节 ≤ [`COVER_SIZE_BUDGET`] 时，
+/// 一个 `render_page` 即铺满首屏（再把瓦片叠上来精修）；超预算（高倍缩放/超大页）→
+/// 纯瓦片路径。
+pub(crate) fn cover_affordable(page_pt: (f32, f32), scale: f32) -> bool {
+    if scale < 0.2 || page_pt.0 <= 0.0 || page_pt.1 <= 0.0 {
+        return false;
+    }
+    let bytes = (page_pt.0 as f64) * (page_pt.1 as f64) * (scale as f64) * (scale as f64) * 4.0;
+    bytes <= crate::config::pdf::COVER_SIZE_BUDGET as f64
 }
 
 /// 页内 PDF 点坐标 → 页卡**局部**显示 px（原点 = 卡片左上角，Y 轴已翻转为"向下为正"）。
@@ -1070,6 +1087,23 @@ mod tests {
             visible_tile_range(bmp, 595.0, 842.0, (0.0, 0.0, 0.0, 100.0), 512, 0).is_none(),
             "零宽矩形应 None"
         );
+    }
+
+    /// 「整页锐化封面」廉价判定：普通 A4 @1.0 应可整渲（≈2MB），超高密度则应转纯瓦片。
+    #[test]
+    fn cover_affordable_gates_by_size_budget() {
+        assert!(cover_affordable(a4(), 1.0), "A4 @1.0（~2MB）应可整渲封面");
+        assert!(
+            cover_affordable(a4(), 2.8),
+            "A4 @2.8（~16MB）仍在 32MB 预算内"
+        );
+        assert!(!cover_affordable(a4(), 8.0), "A4 @8.0（~128MB）应转纯瓦片");
+        assert!(
+            !cover_affordable((2000.0, 1000.0), 4.0),
+            "超大页 @4.0（~128MB）应转纯瓦片"
+        );
+        assert!(!cover_affordable((0.0, 100.0), 1.0), "零宽页不整渲");
+        assert!(!cover_affordable(a4(), 0.0), "零密度不整渲");
     }
 
     /// 瓦片几何往返：visible_tile_range 覆盖的每格，tile_rect 都能给出正尺寸矩形，

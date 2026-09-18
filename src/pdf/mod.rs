@@ -1193,19 +1193,24 @@ mod tests {
         for _ in 0..10 {
             cx.run_until_parked();
         }
-        let (pages, page0_tiles, page0_scale) = cx.update(|_w, cx| {
+        let (pages, page0_tiles, page0_scale, page0_cover) = cx.update(|_w, cx| {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             let page0 = v.slots.first();
             (
                 v.page_count(),
                 page0.map(|s| s.tiles.len()).unwrap_or(0),
                 page0.map(|s| s.tile_scale).unwrap_or(0.0),
+                page0.map(|s| s.cover.is_some()).unwrap_or(false),
             )
         });
         assert!(pages >= 1, "应载入至少 1 页");
         assert!(
             got_tile && page0_tiles >= 1,
             "视口覆盖的首页应栅格出至少 1 片瓦片（实际 {page0_tiles} 片）"
+        );
+        assert!(
+            page0_cover,
+            "首屏应先有整页锐化封面（一渲铺满，消除瓦片逐片渲染前的模糊）"
         );
         assert!(
             page0_scale > 0.5 && page0_scale.is_finite(),

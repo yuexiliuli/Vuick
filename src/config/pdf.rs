@@ -68,3 +68,11 @@ pub const TILE_INFLIGHT: usize = 6;
 /// 瓦片内存字节预算（512²×4≈1MB/片；96MB ≈ 96 片，覆盖数屏滚动余量）。超预算按
 /// 「离视口中心最远」LRU 淘汰并显式 `drop_image` 下线 GPU 纹理。
 pub const TILE_CACHE_BYTES: u64 = 96 * 1024 * 1024;
+// ---- 首屏“整页锐化封面”（SumatraPDF 首遍同款）：档廉价时整页一渲即铺满首屏，
+// 瓦片再在下层精修——消除“首屏几十片瓦片串行渲染 → 模糊十几秒”----
+/// 封面整页位图字节上限：≤ 本值才走「整页一渲」封面（高倍缩放/超大页超预算 → 纯瓦片）。
+pub const COVER_SIZE_BUDGET: u64 = 32 * 1024 * 1024;
+/// 同时在途的封面渲染上限（单页即可盖住首屏）。
+pub const COVER_INFLIGHT: usize = 1;
+/// 内存中保留的封面页数上限（封面只服务可见页；瓦片补全后即淘汰，防御性上限）。
+pub const COVER_CACHE_PAGES: usize = 4;
