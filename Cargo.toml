@@ -31,9 +31,11 @@ ropey = { version = "=2.0.0-beta.1", features = [
     "metric_utf16",
 ] }
 # PDF 栅格化用 native pdfium（Edge 同款内核，首次浏览流畅）；
-# 页级按需渲染 + 磁盘 PNG 二级缓存/内存预算由 view.rs 承担。
+# 页级按需渲染 + 磁盘 WebP-Lossless 二级缓存/内存预算由 view.rs 承担。
+# webp feature = 纯 Rust 的 image-webp（VP8L 无损），磁盘缓存的 BGRA 以 Rgba8
+# 容器无损往返，字节逐像素保真（文本层对齐精度不受影响）。
 pdfium-render = "0.9.3"
-image = "0.25"
+image = { version = "0.25", features = ["webp"] }
 # 编辑器代码高亮：syntect 解析默认语法集（与 gpui-component 工作区同版本同特性，
 # 复用其缓存产物；features 对齐根 Cargo.toml：parsing + default-syntaxes + regex-fancy）。
 syntect = { version = "5.3.0", default-features = false, features = [

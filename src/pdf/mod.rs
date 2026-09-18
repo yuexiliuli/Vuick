@@ -156,6 +156,42 @@ mod tests {
     }
 
     #[test]
+    fn worker_renders_thumbnail_at_low_resolution() {
+        let _guard = pdf_lock().lock().unwrap();
+        // L0 缩略图：应远小于全尺寸位图，且宽度与 THUMB_WIDTH 推导一致（低成本占位层）
+        let p = test_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let rx_thumb = worker.request_thumb(doc_id, 0);
+        let thumb = rx_thumb
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到缩略图")
+            .expect("缩略图渲染应成功");
+        let rx_full = worker.request_render(doc_id, RenderRequest { page: 0, scale: 1.0 });
+        let full = rx_full
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到全尺寸")
+            .expect("全尺寸渲染应成功");
+        assert!(
+            thumb.bgra.len() < full.bgra.len(),
+            "缩略图字节数应远小于全尺寸：{} < {}",
+            thumb.bgra.len(),
+            full.bgra.len()
+        );
+        let pt_w = dims[0].0;
+        let expect_w = ((crate::config::pdf::THUMB_WIDTH / pt_w.max(1.0))
+            .clamp(0.1, 1.0)
+            * pt_w)
+            .ceil() as u32; // ceil(pw * scale)，与 render_page 的 ceil 一致
+        assert_eq!(
+            thumb.width, expect_w,
+            "缩略图宽应与 THUMB_WIDTH 推导一致：实际 {} 期望 {}",
+            thumb.width, expect_w
+        );
+    }
+
+    #[test]
     fn worker_renders_many_pages_individually() {
         let _guard = pdf_lock().lock().unwrap();
         // 259 页的 PDF：抽查首/中/末各一页（模拟「滚动到哪渲染哪」）

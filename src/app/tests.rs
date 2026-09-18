@@ -2742,7 +2742,7 @@
             cx.run_until_parked();
         }
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/N107内外饰配置表NEW.pdf");
+            .join("target/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {

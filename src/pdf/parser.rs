@@ -249,6 +249,9 @@ enum WorkerMsg {
         mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
     ),
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
+    /// L0 缩略图渲染（低清晰度、~1ms/张）。优先级低于全尺寸 Render、
+    /// 高于懒加载的 Text：拖动期间先铺低清占位，全尺寸随后补齐。
+    Thumb(DocId, usize, mpsc::Sender<Option<RenderResult>>),
     Close(DocId),
     /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
     /// worker 调度保证绝不排在栅格化（Render）之后执行。
@@ -312,6 +315,14 @@ impl PdfWorker {
         rx
     }
 
+    /// 请求某页的 L0 缩略图（异步、低清晰度）。worker 按目标宽度推导低缩放，
+    /// 结果与全尺寸同构（`RenderResult`），供阅读器做拖动占位 / 回翻即时内容。
+    pub fn request_thumb(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<RenderResult>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::Thumb(doc_id, page, tx));
+        rx
+    }
+
     /// 关闭文档，释放 pdfium 侧资源（阅读器关闭时调用）。
     pub fn close(&self, doc_id: DocId) {
         let _ = self.tx.send(WorkerMsg::Close(doc_id));
@@ -362,10 +373,13 @@ impl PdfWorker {
             while let Ok(msg) = rx.try_recv() {
                 queue.push_back(msg);
             }
-            let msg = match queue.iter().position(|m| matches!(m, WorkerMsg::Render(..))) {
-                Some(i) => queue.remove(i).expect("position 已命中"),
-                None => queue.pop_front().expect("queue 已保证非空"),
-            };
+            // 优先级：全尺寸 Render > Thumb（低清占位）> 其余（Open/Close/Text/Search FIFO）
+            let msg = queue
+                .iter()
+                .position(|m| matches!(m, WorkerMsg::Render(..)))
+                .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))))
+                .map(|i| queue.remove(i).expect("position 已命中"))
+                .unwrap_or_else(|| queue.pop_front().expect("queue 已保证非空"));
             match msg {
                 WorkerMsg::Open(doc_id, bytes, tx) => {
                     let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
@@ -387,6 +401,12 @@ impl PdfWorker {
                     let result = docs
                         .get(&doc_id)
                         .and_then(|doc| render_page(doc, req));
+                    let _ = tx.send(result);
+                }
+                WorkerMsg::Thumb(doc_id, page, tx) => {
+                    let result = docs
+                        .get(&doc_id)
+                        .and_then(|doc| render_thumb(doc, page));
                     let _ = tx.send(result);
                 }
                 WorkerMsg::Close(doc_id) => {
@@ -466,6 +486,20 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
         bgra,
         width: w as u32,
         height: h as u32,
+    })
+}
+
+/// 在工作线程内：栅格化某页的 **L0 缩略图**（低分辨率，用于拖动期间占位 / 回翻即时内容）。
+///
+/// 缩放按目标宽度 [`THUMB_WIDTH`](crate::config::pdf::THUMB_WIDTH) 推导并夹在
+/// `[0.1, 1.0]`（防止超大页 / 极小页产生荒谬分辨率）；pdfium 下采样极快（~1ms/张）。
+fn render_thumb(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult> {
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let pw = page.width().value.max(1.0) as f32;
+    let scale = (crate::config::pdf::THUMB_WIDTH / pw).clamp(0.1, 1.0);
+    render_page(doc, RenderRequest {
+        page: page_index,
+        scale,
     })
 }
 

@@ -17,6 +17,11 @@ pub(crate) struct Slot {
     pub(crate) loading: bool,
     /// 该位图对应的渲染代次（缩放/质量变化时使旧位图失效）。
     pub(crate) generation: u64,
+    /// L0 缩略图（低清层）：全尺寸位图缺席时先展示，拖动期间"永远有内容"；
+    /// 全尺寸位图回收后仍保留，回翻时即时占位再补全尺寸。
+    pub(crate) thumb: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// 缩略图是否正在后台渲染（避免重复派发）。
+    pub(crate) thumb_loading: bool,
 }
 
 /// 某页在页列里的显示高度（保持宽高比）。
@@ -338,6 +343,16 @@ pub(crate) fn advance_match_index(count: usize, active: usize, delta: i64) -> Op
     Some(next)
 }
 
+/// 快速拖动时的"瞬态写丢弃"决定（纯函数）：写队列超上限时返回应丢弃的**最旧**条目数。
+/// `moving=false`（静止/慢速）时从不丢弃——保证停止后所有热页都会归档到磁盘。
+pub(crate) fn trim_transient_writes(len: usize, queue_max: usize, moving: bool) -> usize {
+    if moving && len > queue_max {
+        len - queue_max
+    } else {
+        0
+    }
+}
+
 /// 每帧的页工作规划（纯函数，便于测试）：通过投影闭包按页号读取「是否已渲染 /
 /// 是否正在加载 / 渲染代次」，决定 (需要渲染的页, 需要淘汰位图的页)。
 ///
@@ -428,6 +443,24 @@ mod tests {
 
     fn page_step(page_width: f32) -> f32 {
         display_height(a4(), page_width) + PAGE_GAP
+    }
+
+    #[test]
+    fn trim_transient_writes_only_when_moving_over_cap() {
+        // 拖动中超上限 → 丢弃最旧的（返回应丢弃条数）；未超上限/静止 → 全部保留
+        assert_eq!(trim_transient_writes(20, 16, true), 4, "拖动超上限应丢弃 4 条最旧");
+        assert_eq!(trim_transient_writes(16, 16, true), 0, "恰在上限不丢弃");
+        assert_eq!(trim_transient_writes(10, 16, true), 0, "未超上限不丢弃");
+        assert_eq!(
+            trim_transient_writes(20, 16, false),
+            0,
+            "静止/慢速从不丢弃（保证热页归档）"
+        );
+        assert_eq!(
+            trim_transient_writes(0, 16, true),
+            0,
+            "空队列丢弃 0 条"
+        );
     }
 
     #[test]

@@ -37,14 +37,15 @@ use gpui::{
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::config::pdf::{
-    MAX_INFLIGHT, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, ZOOM_MAX, ZOOM_MIN,
-    ZOOM_STEP,
+    LOOKAHEAD_PAGES, MAX_INFLIGHT, MAX_INFLIGHT_MOTION, MAX_THUMB_INFLIGHT, MOVE_THRESHOLD_PX,
+    PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES, TEXT_INFLIGHT, THUMB_CACHE_PAGES,
+    WRITE_QUEUE_MAX, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use crate::pdf::cache::PageCache;
 use crate::pdf::layout::{
     Slot, advance_match_index, column_left, compute_layout, content_to_local, display_height,
     hit_char, keep_window, local_to_pt, page_segment_text, plan_page_work, pt_to_local,
-    render_scale, selection_spans_pt,
+    render_scale, selection_spans_pt, trim_transient_writes,
 };
 use crate::pdf::{
     render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
@@ -71,6 +72,24 @@ pub struct PdfViewer {
     pub(crate) generation: u64,
     /// 在途渲染请求的结果接收通道（worker 线程回传）。
     pub(crate) pending: HashMap<usize, mpsc::Receiver<Option<RenderResult>>>,
+    /// 在途 **L0 缩略图**请求的结果接收通道（独立于全尺寸，不占 `MAX_INFLIGHT` 额度）。
+    pub(crate) pending_thumb: HashMap<usize, mpsc::Receiver<Option<RenderResult>>>,
+    /// 在途**磁盘读回 + 解码**请求的接收通道（主线程不读盘：命中缓存时后台读/解码，
+    /// 结果下一帧应用；避免快速滚动时主线程同步读几个 MB 卡帧）。
+    pub(crate) restoring: HashMap<usize, mpsc::Receiver<Option<(Vec<u8>, u32, u32)>>>,
+    /// 上一帧滚动偏移（预测滚动方向用：delta>0 正在往下滚 → 预取下方页）。
+    pub(crate) last_scroll_y: f32,
+    /// 滚动速度估计（px/帧，EMA)：> [`MOVE_THRESHOLD_PX`] 视为快速拖动 →
+    /// 全尺寸渲染降并发、跳过预取与文本预取，由缩略图层占位。
+    pub(crate) scroll_velocity: f32,
+    /// 待落盘写队列 `(页, BGRA, w, h, 是否缩略图)`：编码/写盘在后台 executor **串行**
+    /// （最多 1 在途）；快速拖动时超 [`WRITE_QUEUE_MAX`] 的旧条目直接丢弃——
+    /// 避免 WebP 无损编码把后台 CPU 打满（长 PDF 拖滚动条时的 CPU 尖峰主因）。
+    pub(crate) disk_queue: VecDeque<(usize, Vec<u8>, u32, u32, bool)>,
+    /// 后台写盘任务是否在途（串行闸：最多同时 1 个编码）。
+    pub(crate) disk_write_inflight: bool,
+    /// 写盘完成唤醒通道（后台任务完成后回信，主线程据此放行下一个）。
+    pub(crate) disk_write_wakeup: Option<mpsc::Receiver<()>>,
     /// 竖向滚动句柄（页列外层 scroll 容器）。
     pub(crate) scroll: ScrollHandle,
     /// 是否仍在后台解析。
@@ -131,6 +150,13 @@ impl PdfViewer {
             slots: Vec::new(),
             generation: 0,
             pending: HashMap::new(),
+            pending_thumb: HashMap::new(),
+            restoring: HashMap::new(),
+            last_scroll_y: 0.0,
+            scroll_velocity: 0.0,
+            disk_queue: VecDeque::new(),
+            disk_write_inflight: false,
+            disk_write_wakeup: None,
             scroll: ScrollHandle::new(),
             loading: true,
             load_error: None,
@@ -261,6 +287,11 @@ impl PdfViewer {
         self.text_pages.clear();
         self.text_lru.clear();
         self.pending_text.clear();
+        self.pending_thumb.clear();
+        self.restoring.clear();
+        self.disk_queue.clear();
+        self.disk_write_wakeup = None;
+        self.disk_write_inflight = false;
         self.sel_anchor = None;
         self.sel_active = None;
         self.selecting = false;
@@ -349,11 +380,17 @@ impl PdfViewer {
 
         // 1) 回收本帧已完成的在途渲染结果（主线程，BGRA 直包 + 异步落盘）
         self.collect_results(cx);
-        // 1b) 回收在途文本层结果入 LRU 缓存（懒加载）：有新文本到达则重绘（选中高亮补全/可复制）
+        // 1a) 回收在途缩略图结果 → 装入 slot.thumb（拖动/回翻的低清占位即时可见）
+        if self.collect_thumb_results() {
+            cx.notify();
+        }
+        // 1b) 回收在途**磁盘恢复**结果：成功装入槽；失败/过期 → 这些页需真正栅格化
+        let restore_failed = self.collect_restores(cx);
+        // 1c) 回收在途文本层结果入 LRU 缓存（懒加载）：有新文本到达则重绘（选中高亮补全/可复制）
         if self.collect_text_results() {
             cx.notify();
         }
-        // 1c) P3 检索：回收在途结果（代次过期即弃）；查询由侧边栏经 `set_search` 驱动
+        // 1d) P3 检索：回收在途结果（代次过期即弃）；查询由侧边栏经 `set_search` 驱动
         if self.collect_search_results() {
             cx.notify();
         }
@@ -362,6 +399,11 @@ impl PdfViewer {
         let scale_factor = window.scale_factor();
         let scroll_y = f32::from(-self.scroll.offset().y);
         let viewport_h = f32::from(self.scroll.bounds().size.height);
+        // 滚动速度估计（EMA，px/帧）：> MOVE_THRESHOLD_PX 视为快速拖动
+        let dy = (scroll_y - self.last_scroll_y).abs();
+        self.scroll_velocity = self.scroll_velocity * 0.7 + dy * 0.3;
+        // 0) 刷盘：串行写盘（检测速度阈值在 flush 内部）
+        self.flush_disk_queue(cx);
         let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
 
         // 规划：要渲染的页 + 要淘汰位图的页（保留策略见 plan_page_work）。
@@ -388,21 +430,100 @@ impl PdfViewer {
         for arc in to_evict {
             cx.drop_image(arc, Some(window));
         }
-        // 先尝试磁盘二级缓存：命中则直接读盘重建位图（毫秒级），不派发栅格化任务；
-        // 未命中才需要真正栅格化。
-        let mut need_render: Vec<usize> = Vec::new();
-        for &i in &to_render {
-            let cached = self
-                .cache
-                .load_bgra(i)
-                .and_then(|(bgra, w, h)| render_image_from_bgra(bgra, w, h).ok());
-            match cached {
-                Some(img) => {
-                    self.slots[i].loading = false;
-                    self.slots[i].image = Some(img);
-                    self.slots[i].generation = generation;
+        // L0 内存封顶：保留缩略图数超 THUMB_CACHE_PAGES 时，丢离视口中心最远的
+        //（缩略图仅占全尺寸 ~1/20 内存，预算大，仅防长文档无限累积）。先于调度，
+        // 保证本轮窗口内的缩略图不受影响。
+        let center = (start + end) / 2;
+        let thumb_retained = self.slots.iter().filter(|s| s.thumb.is_some()).count();
+        if thumb_retained > THUMB_CACHE_PAGES {
+            let mut th_candidates: Vec<(usize, u64)> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.thumb.is_some())
+                .map(|(i, _)| (i, (i as i64 - center as i64).unsigned_abs()))
+                .collect();
+            th_candidates.sort_by_key(|&(i, d)| (d, i));
+            let excess = thumb_retained - THUMB_CACHE_PAGES;
+            for (i, _) in th_candidates.into_iter().take(excess) {
+                if let Some(slot) = self.slots.get_mut(i) {
+                    slot.thumb = None;
                 }
-                None => need_render.push(i),
+            }
+        }
+        // 先尝试磁盘二级缓存：`contains`（无 IO 记账查询）预判是否存在——
+        // 在 → 后台**异步**读盘+解码（`restoring`，结果下帧应用，主线程不读盘）；
+        // 不在 → 需要真正栅格化。`collect_restores` 产出的失败页并入 need_render。
+        let mut need_render: Vec<usize> = restore_failed;
+        for &i in &to_render {
+            if self.slots[i].image.is_some() {
+                continue;
+            }
+            if self.restoring.contains_key(&i) {
+                continue; // 已在异步恢复中，等结果，不重复发起
+            }
+            if self.cache.contains(i) {
+                let cache_inner = self.cache.inner_arc();
+                let (tx, rx) = mpsc::channel();
+                cx.background_executor()
+                    .spawn(async move {
+                        let res = crate::pdf::cache::load_bgra_inner(&cache_inner, i);
+                        let _ = tx.send(res);
+                    })
+                    .detach();
+                self.restoring.insert(i, rx);
+            } else {
+                need_render.push(i);
+            }
+        }
+        need_render.sort_unstable();
+        need_render.dedup();
+        // 4) 预测性预取：滚动方向前方窗口外的页提前入调度队列（低优先级——离可见区
+        //    中心远 → 排序后自然排在可见页之后、预算耗尽是自然放弃；有盘缓存的页
+        //    到时按需异步恢复即可，不在此预栅格化）。快速拖动时不预取——正在飞掠的
+        //    页全尺寸渲染纯属浪费（缩略图层已占位）。
+        let dir = (scroll_y - self.last_scroll_y).signum() as i32;
+        self.last_scroll_y = scroll_y;
+        if dir != 0 && self.scroll_velocity <= MOVE_THRESHOLD_PX {
+            let last = self.dims.len().saturating_sub(1);
+            let (lo, hi) = if dir > 0 {
+                (
+                    end.saturating_add(1),
+                    end.saturating_add(LOOKAHEAD_PAGES).min(last),
+                )
+            } else {
+                (
+                    start.saturating_sub(LOOKAHEAD_PAGES),
+                    start.saturating_sub(1),
+                )
+            };
+            if lo <= hi {
+                for p in lo..=hi {
+                    if self.slots[p].image.is_some()
+                        || self.slots[p].loading
+                        || self.restoring.contains_key(&p)
+                        || self.cache.contains(p)
+                    {
+                        continue;
+                    }
+                    need_render.push(p);
+                }
+                need_render.sort_unstable();
+                need_render.dedup();
+            }
+        }
+        // L0：磁盘缩略图兜底——缺全尺寸的可见页若盘上有缩略图，先铺低清占位
+        //（几十 KB 小文件，主线程 ~1ms；否则等全尺寸/缩略图请求补齐）。
+        for &i in &need_render {
+            if self.slots[i].thumb.is_some() || self.slots[i].thumb_loading {
+                continue;
+            }
+            if let Some(img) = self
+                .cache
+                .load_thumb(i)
+                .and_then(|(bgra, w, h)| render_image_from_bgra(bgra, w, h).ok())
+            {
+                self.slots[i].thumb = Some(img);
             }
         }
         if need_render.is_empty() {
@@ -410,25 +531,50 @@ impl PdfViewer {
         }
 
         // 靠近可见区中心的页先渲染（先填正在看的那页）
-        let center = (start + end) / 2;
         need_render.sort_by_key(|&i| (i as i64 - center as i64).unsigned_abs());
 
-        // 2) 派发渲染请求给进程级 pdfium 工作线程；已在途（loading）的页绝不重复派发；
-        //    同时用 MAX_INFLIGHT 节流，防止快速滚动时请求无限堆积。
-        let inflight = self.pending.len();
-        let budget = MAX_INFLIGHT.saturating_sub(inflight);
-        if budget == 0 {
-            return;
-        }
         let worker = self.worker.as_ref().unwrap();
-        for i in need_render.into_iter().take(budget) {
-            if self.slots[i].loading {
-                continue;
+        // 2) 派发全尺寸渲染请求给进程级 pdfium 工作线程；已在途（loading）的页绝不重复派发；
+        //    用 MAX_INFLIGHT 节流。**快速拖动时降并发到 MAX_INFLIGHT_MOTION**——
+        //    正在飞掠的页只请求 1 个全尺寸（中心页），其余靠缩略图占位，等停止后再补齐，
+        //    避免把单线程 pdfium 烧在即将滚过的页面上。
+        let inflight = self.pending.len();
+        let max_inflight = if self.scroll_velocity > MOVE_THRESHOLD_PX {
+            MAX_INFLIGHT_MOTION
+        } else {
+            MAX_INFLIGHT
+        };
+        if inflight < max_inflight {
+            let budget = max_inflight - inflight;
+            for &i in need_render.iter().take(budget) {
+                if self.slots[i].loading {
+                    continue;
+                }
+                self.slots[i].loading = true;
+                let scale = render_scale(page_width, scale_factor, self.dims[i].0);
+                let rx = worker.request_render(self.doc_id, RenderRequest { page: i, scale });
+                self.pending.insert(i, rx);
             }
-            self.slots[i].loading = true;
-            let scale = render_scale(page_width, scale_factor, self.dims[i].0);
-            let rx = worker.request_render(self.doc_id, RenderRequest { page: i, scale });
-            self.pending.insert(i, rx);
+        }
+        // 3) 派发 L0 缩略图：缺缩略图、未在途、且无全尺寸在渲染的可见页（独立并发上限，
+        //    不占全尺寸额度）。拖动/快速翻页时先铺低清占位——"永远有内容"。
+        if self.pending_thumb.len() < MAX_THUMB_INFLIGHT {
+            let mut thumb_budget = MAX_THUMB_INFLIGHT - self.pending_thumb.len();
+            for &i in need_render.iter() {
+                if thumb_budget == 0 {
+                    break;
+                }
+                if self.slots[i].thumb.is_some()
+                    || self.slots[i].thumb_loading
+                    || self.slots[i].loading
+                {
+                    continue;
+                }
+                self.slots[i].thumb_loading = true;
+                let rx = worker.request_thumb(self.doc_id, i);
+                self.pending_thumb.insert(i, rx);
+                thumb_budget -= 1;
+            }
         }
     }
 
@@ -436,7 +582,6 @@ impl PdfViewer {
     /// （代次未变才装；被淘汰/失效的槽只清 loading 允许重投）→ **异步落盘**二级缓存。
     /// 非阻塞：仅检查已就绪通道，未完成的留到下一帧。
     fn collect_results(&mut self, cx: &mut Context<Self>) {
-        use crate::pdf::cache::save_bgra;
         let generation = self.generation;
         let finished: Vec<(usize, Option<RenderResult>)> = self
             .pending
@@ -452,12 +597,10 @@ impl PdfViewer {
             match res {
                 Some(res) => {
                     let (w, h) = (res.width, res.height);
-                    // 后台异步落盘紧凑 BGRA（写盘/LRU 淘汰不在主线程、不在 pdfium worker）
-                    let cache_inner = self.cache.inner_arc();
-                    let bgra = res.bgra.clone();
-                    cx.background_executor()
-                        .spawn(async move { save_bgra(cache_inner, i, bgra, w, h) })
-                        .detach();
+                    // 入队异步落盘（串行写盘见 flush_disk_queue；拖动时瞬态页被丢弃，
+                    // 编码不打满后台 CPU）。拷贝是主线程 ~4.5MB memcpy（~百 µs，可接受）。
+                    self.disk_queue
+                        .push_back((i, res.bgra.clone(), w, h, false));
                     // 主线程快路径：BGRA 直接包裹（零像素循环），worker 已排好字节序
                     if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
                         ready.push((i, img));
@@ -486,6 +629,144 @@ impl PdfViewer {
         if any {
             cx.notify();
         }
+    }
+
+    /// 帧内刷盘：落盘 WebP 编码在后台 executor **串行**执行（最多 1 在途，经
+    /// `disk_write_wakeup` 闸门放行下一个），防止逐页编码任务堆积打满后台 CPU。
+    /// 快速拖动期间，超过 [`WRITE_QUEUE_MAX`] 的**最旧**条目直接丢弃（瞬态页不落盘/
+    /// 不编码）；停止后队列自然排空，热页仍会归档到磁盘。
+    fn flush_disk_queue(&mut self, cx: &mut Context<Self>) {
+        // 1) 回收在途写盘完成标记 → 放行下一个
+        if self.disk_write_inflight {
+            if let Some(rx) = &self.disk_write_wakeup {
+                if rx.try_recv().is_ok() {
+                    self.disk_write_inflight = false;
+                    self.disk_write_wakeup = None;
+                }
+            }
+        }
+        // 2) 拖动中：丢弃最旧的瞬态条目（保留最近的 WRITE_QUEUE_MAX 个）
+        if self.scroll_velocity > MOVE_THRESHOLD_PX && self.disk_queue.len() > WRITE_QUEUE_MAX {
+            let excess = trim_transient_writes(self.disk_queue.len(), WRITE_QUEUE_MAX, true);
+            self.disk_queue.drain(0..excess);
+        }
+        if self.disk_write_inflight || self.disk_queue.is_empty() {
+            return;
+        }
+        // 3) 取队首，后台串行编码 + 写盘
+        let (idx, bgra, w, h, is_thumb) = self.disk_queue.pop_front().unwrap();
+        self.disk_write_inflight = true;
+        let (tx, rx) = mpsc::channel();
+        self.disk_write_wakeup = Some(rx);
+        let cache_inner = self.cache.inner_arc();
+        cx.background_executor()
+            .spawn(async move {
+                if is_thumb {
+                    crate::pdf::cache::save_bgra_thumb(cache_inner, idx, bgra, w, h);
+                } else {
+                    crate::pdf::cache::save_bgra(cache_inner, idx, bgra, w, h);
+                }
+                let _ = tx.send(());
+            })
+            .detach();
+    }
+
+    /// 回收已完成的**磁盘恢复**结果：成功 → BGRA 包裹成 `RenderImage` 装入槽
+    /// （代次未变才装；被淘汰/失效的槽只清 loading 允许重投）；失败/过期
+    /// → 把页号返回给调用方，纳入 `need_render` 真正栅格化。非阻塞。
+    fn collect_restores(&mut self, cx: &mut Context<Self>) -> Vec<usize> {
+        let generation = self.generation;
+        let finished: Vec<(usize, Option<(Vec<u8>, u32, u32)>)> = self
+            .restoring
+            .iter_mut()
+            .filter_map(|(i, rx)| match rx.try_recv() {
+                Ok(res) => Some((*i, res)),
+                Err(_) => None,
+            })
+            .collect();
+        if finished.is_empty() {
+            return Vec::new();
+        }
+        let mut failed = Vec::new();
+        let mut applied = false;
+        for (i, res) in finished {
+            self.restoring.remove(&i);
+            match res {
+                Some((bgra, w, h)) => {
+                    let slot_ok = self
+                        .slots
+                        .get_mut(i)
+                        .map(|s| {
+                            s.loading = false;
+                            if generation == self.generation {
+                                if let Ok(img) = render_image_from_bgra(bgra, w, h) {
+                                    s.generation = generation;
+                                    if let Some(old) = s.image.replace(img) {
+                                        self.pending_drops.push(old);
+                                    }
+                                    return true;
+                                }
+                            }
+                            false
+                        })
+                        .unwrap_or(false);
+                    if slot_ok {
+                        applied = true;
+                    } else {
+                        failed.push(i);
+                    }
+                }
+                None => {
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.loading = false; // 缺失/损坏，允许栅格化重试
+                    }
+                    failed.push(i);
+                }
+            }
+        }
+        if applied {
+            cx.notify();
+        }
+        failed
+    }
+
+    /// 回收已完成的在途 **L0 缩略图**结果：worker 回传低清 BGRA → 装入 `slot.thumb`
+    /// （供拖动/回翻期间的低清占位，不依赖代次——缩放后低清占位仍可先用）→ 入队异步落盘。
+    /// 非阻塞：仅检查已就绪通道；返回是否有新缩略图入槽（调用方决定重绘）。
+    fn collect_thumb_results(&mut self) -> bool {
+        let finished: Vec<(usize, Option<RenderResult>)> = self
+            .pending_thumb
+            .iter_mut()
+            .filter_map(|(i, rx)| match rx.try_recv() {
+                Ok(res) => Some((*i, res)),
+                Err(_) => None,
+            })
+            .collect();
+        let mut any = false;
+        for (i, res) in finished {
+            self.pending_thumb.remove(&i);
+            match res {
+                Some(res) => {
+                    let (w, h) = (res.width, res.height);
+                    // 入队异步落盘（与全尺寸同队列，串行节流）
+                    self.disk_queue
+                        .push_back((i, res.bgra.clone(), w, h, true));
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.thumb_loading = false;
+                        if let Ok(img) = render_image_from_bgra(res.bgra, w, h) {
+                            s.thumb = Some(img);
+                        }
+                        any = true;
+                    }
+                }
+                None => {
+                    if let Some(s) = self.slots.get_mut(i) {
+                        s.thumb_loading = false; // 失败，允许之后重试
+                    }
+                }
+            }
+        }
+        any
     }
 
     /// 书签目录访问器（侧边栏目录使用）。
@@ -976,7 +1257,11 @@ impl Render for PdfViewer {
             let viewport_h = f32::from(self.scroll.bounds().size.height);
             let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
             // 1d) 预取可见窗口文本层（低优先级懒加载）：交互时命中测试/复制/高亮已就绪。
-            self.prefetch_texts(start, end);
+            //   快速拖动时**跳过**——正在飞掠的页文本提取（FPDFText_GetCharBox 逐字符）
+            //   纯属浪费、还会占 pdfium worker 的时间；停止后由 ensure_window 恢复预取。
+            if self.scroll_velocity <= MOVE_THRESHOLD_PX {
+                self.prefetch_texts(start, end);
+            }
             let tops = &self.page_tops;
             let total = self.total_height;
             let slots = &self.slots;
@@ -994,6 +1279,7 @@ impl Render for PdfViewer {
                 let disp_h = display_height(self.dims[i], page_width);
                 let top = tops[i];
                 let slot_img = slots.get(i).and_then(|s| s.image.clone());
+                let slot_thumb = slots.get(i).and_then(|s| s.thumb.clone());
                 let scale = render_scale(page_width, scale_factor, self.dims[i].0);
                 let mut overlays = selection_overlays_for_page(
                     i,
@@ -1041,6 +1327,16 @@ impl Render for PdfViewer {
                         .relative()
                         .child(
                             img(ImageSource::Render(page_img))
+                                .w(px(page_width))
+                                .h(px(disp_h)),
+                        ),
+                    // L0 低清占位：全尺寸未到时先铺缩略图（拖动/回翻期间"永远有内容"，
+                    // 拉伸到卡片尺寸，全尺寸落入后由 `slot_img` 分支无缝替换）。
+                    None if slot_thumb.is_some() => div()
+                        .size_full()
+                        .relative()
+                        .child(
+                            img(ImageSource::Render(slot_thumb.unwrap()))
                                 .w(px(page_width))
                                 .h(px(disp_h)),
                         ),
