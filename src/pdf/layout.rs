@@ -6,6 +6,7 @@
 use crate::config::pdf::{
     CACHE_MAX_PAGES, MARGIN, MAX_RENDER_SCALE, PAGE_GAP, PAGE_PAD_Y,
 };
+use crate::pdf::PageText;
 
 /// 页槽：某页的渲染状态（内存态）。
 #[derive(Default, Clone)]
@@ -92,6 +93,247 @@ pub(crate) fn render_scale(page_width: f32, scale_factor: f32, page_pt_width: f3
     }
 }
 
+/// 页内 PDF 点坐标 → 页卡**局部**显示 px（原点 = 卡片左上角，Y 轴已翻转为"向下为正"）。
+///
+/// 关键点（文本层高亮与渲染字形严格对齐的基础）：
+/// - **局部坐标**：只做"页内 → 卡片内"变换，**不放**滚动/分栏/居中偏移——`page_tops`、
+///   列左偏移与 scroll 偏移由 P2 的 view 层叠加，否则滚动时高亮会漂移。
+/// - **走位图真实尺寸**：`scale`（px/pt，见 [`render_scale`]）先把 pt 换算成位图像素，
+///   再按"位图 → 卡片拉伸比"（`display_w / 位图宽`）映射到显示 px，`ceil` 亚像素偏差消掉。
+/// - **Y 翻转**：PDF 原点在页左下、Y 向上；显示坐标原点在卡片左上、Y 向下
+///   （`(page_pt_h - py)`）。
+///
+/// 边界（局部坐标）：pt 页左上 `(0, page_pt_h)` → `(0, 0)`；
+/// pt 页右下 `(page_pt_w, 0)` → `(display_w, display_height(...))`。
+pub(crate) fn pt_to_local(
+    px: f32,
+    py: f32,
+    page_pt_w: f32,
+    page_pt_h: f32,
+    display_w: f32,
+    scale: f32,
+) -> (f32, f32) {
+    let scale = scale.max(0.01);
+    let bmp_w = (page_pt_w * scale).ceil().max(1.0);
+    let bmp_h = (page_pt_h * scale).ceil().max(1.0);
+    let disp_h = display_height((page_pt_w, page_pt_h), display_w);
+    let bx = px * scale;
+    let by = (page_pt_h - py) * scale;
+    (
+        bx * (display_w / bmp_w),
+        by * (disp_h / bmp_h),
+    )
+}
+
+/// 页卡局部 px → 页内 PDF 点坐标（[`pt_to_local`] 的逆；命中测试：鼠标 → 字符索引）。
+pub(crate) fn local_to_pt(
+    lx: f32,
+    ly: f32,
+    page_pt_w: f32,
+    page_pt_h: f32,
+    display_w: f32,
+    scale: f32,
+) -> (f32, f32) {
+    let scale = scale.max(0.01);
+    let bmp_w = (page_pt_w * scale).ceil().max(1.0);
+    let bmp_h = (page_pt_h * scale).ceil().max(1.0);
+    let disp_h = display_height((page_pt_w, page_pt_h), display_w);
+    let bx = lx * (bmp_w / display_w);
+    let by = ly * (bmp_h / disp_h);
+    (bx / scale, page_pt_h - by / scale)
+}
+
+/// 页列左偏移：wrap 容器内居中对齐（列宽 = 页宽）。P2 命中测试与渲染同式。
+pub(crate) fn column_left(wrap_w: f32, page_width: f32) -> f32 {
+    ((wrap_w - page_width) / 2.0).max(0.0)
+}
+
+/// 内容列坐标 (cx, cy) → (页号, 页内局部 x, 页内局部 y)。
+///
+/// - `cx/cy` 为**页列空间**坐标（wrap 内减去 [`column_left`] 后的列偏移；无需关心滚动
+///   偏移——那是 view 层把窗口坐标换算到 wrap 空间时消掉的）。
+/// - 列宽 = `page_width`；点到列的空白（左/右页边、页间纵向间隙）→ `None`（清空选区）。
+pub(crate) fn content_to_local(
+    dims: &[(f32, f32)],
+    tops: &[f32],
+    page_width: f32,
+    cx: f32,
+    cy: f32,
+) -> Option<(usize, f32, f32)> {
+    if dims.is_empty() || cx < 0.0 || cx > page_width {
+        return None;
+    }
+    for i in 0..dims.len() {
+        let h = display_height(dims[i], page_width);
+        let (top, bottom) = (tops[i], tops[i] + h);
+        if cy >= top - 1.0 && cy <= bottom + 1.0 {
+            return Some((i, cx, cy - tops[i]));
+        }
+    }
+    None
+}
+
+/// 命中测试（纯函数）：页内 PDF 点 → 最近字符索引。
+///
+/// 优先“包含该点的字符”（若多个取中心最近）；否则取加权最近中心（纵向权 3，
+/// 落在行间空隙时贴向最近的一行）。synthetic（零宽盒）不参与。
+pub(crate) fn hit_char(text: &PageText, px: f32, py: f32) -> Option<usize> {
+    let mut contain: Option<(usize, f32)> = None;
+    let mut near: Option<(usize, f32)> = None;
+    for (i, c) in text.chars.iter().enumerate() {
+        if c.synthetic {
+            continue;
+        }
+        let (cxm, cym) = ((c.left + c.right) / 2.0, (c.bottom + c.top) / 2.0);
+        let inside = px >= c.left && px <= c.right && py >= c.bottom && py <= c.top;
+        let d2 = (cxm - px).powi(2) + (cym - py).powi(2);
+        if inside {
+            match contain {
+                Some((_, bd)) if bd <= d2 => {}
+                _ => contain = Some((i, d2)),
+            }
+        }
+        let wd2 = (cxm - px).powi(2) + 9.0 * (cym - py).powi(2);
+        match near {
+            Some((_, bd)) if bd <= wd2 => {}
+            _ => near = Some((i, wd2)),
+        }
+    }
+    contain.or(near).map(|(i, _)| i)
+}
+
+/// 单个字符选中区间的高亮矩形（PDF 点），按“行”合并成最小条数。
+///
+/// 将 `chars[lo..=hi]` 中非 synthetic 字符按基线（`origin_y`，容差 2pt）分组成行，
+/// 每行一个矩形，覆盖该行选中字符的 min-left..max-right、min-bottom..max-top——
+/// 行为与 Edge/pdf.js 的“整行高亮”一致；synthetic 的零宽盒不产生子矩形。
+pub(crate) fn selection_spans_pt(text: &PageText, lo: usize, hi: usize) -> Vec<(f32, f32, f32, f32)> {
+    const ROW_BUCKET_PT: f32 = 2.0;
+    let hi = hi.min(text.chars.len().saturating_sub(1));
+    let mut rows: Vec<(f32, (f32, f32, f32, f32))> = Vec::new();
+    for i in lo..=hi {
+        let c = &text.chars[i];
+        // 零宽/退化盒（synthetic 或引擎漏标）不参与几何，仅正文
+        if c.synthetic || c.right <= c.left || c.top <= c.bottom {
+            continue;
+        }
+        let bucket = (c.origin_y / ROW_BUCKET_PT).round() * ROW_BUCKET_PT;
+        match rows.iter_mut().find(|(b, _)| (*b - bucket).abs() < 1e-3) {
+            Some((_, r)) => {
+                r.0 = r.0.min(c.left);
+                r.1 = r.1.min(c.bottom);
+                r.2 = r.2.max(c.right);
+                r.3 = r.3.max(c.top);
+            }
+            None => rows.push((bucket, (c.left, c.bottom, c.right, c.top))),
+        }
+    }
+    rows.into_iter().map(|(_, r)| r).collect()
+}
+
+/// 单页选中文本（纯函数启发式，PDF 无“逻辑换行”信息）：
+///
+/// - 换行：下一字符基线比当前低超过 [`LINE_EPS_PT`] → 插入 `\n`；
+/// - 空格：同行且字符间隙 > 平均字宽 × [`SPACE_GAP_RATIO`] → 插入 `' '`；
+/// - 跳过 `\0`（pdfium 生成的填充）。
+pub(crate) fn page_segment_text(text: &PageText, lo: usize, hi: usize) -> String {
+    const LINE_EPS_PT: f32 = 3.0;
+    const SPACE_GAP_RATIO: f32 = 1.5;
+    let hi = hi.min(text.chars.len().saturating_sub(1));
+    if lo > hi {
+        return String::new();
+    }
+    let count = (hi - lo + 1) as f32;
+    let avg_w = (lo..=hi)
+        .filter_map(|i| text.chars.get(i))
+        .map(|c| (c.right - c.left).max(0.0))
+        .sum::<f32>()
+        / count.max(1.0);
+    let mut out = String::new();
+    let mut prev: Option<(f32, f32)> = None; // (右缘, origin_y)
+    for i in lo..=hi {
+        let c = &text.chars[i];
+        if c.ch == '\0' {
+            continue;
+        }
+        if let Some((pr, py)) = prev {
+            if c.origin_y < py - LINE_EPS_PT {
+                out.push('\n');
+            } else if avg_w > 0.0 && avg_w.is_finite() && c.origin_y >= py - LINE_EPS_PT - 0.5 {
+                if c.left - pr > SPACE_GAP_RATIO * avg_w {
+                    out.push(' ');
+                }
+            }
+        }
+        out.push(c.ch);
+        prev = Some((c.right.max(c.left), c.origin_y));
+    }
+    out
+}
+
+#[allow(dead_code)] // 测试与后续命中预览使用（生产 bin 尚未物化命中文本）
+/// 原始字符下标区间 → 拼接字符串（跳过 NUL；与 [`search_page_text`] 的"可见序列"一致）。
+/// P3 用于校验检索命中文本 == 关键字，及展示命中预览。
+pub(crate) fn page_char_substring(text: &PageText, lo: usize, hi: usize) -> String {
+    let hi = hi.min(text.chars.len().saturating_sub(1));
+    let mut s = String::new();
+    for i in lo..=hi {
+        if text.chars[i].ch != '\0' {
+            s.push(text.chars[i].ch);
+        }
+    }
+    s
+}
+
+/// 检索命中上下文片段：`前 ctx 字 + 命中目标 + 后 ctx 字`（基于“可见序列”，跳过 NUL；
+/// 接近页首/页尾时该侧自然取不足 ctx 字，不再补省略符）。P3 侧边栏命中行展示用。
+pub(crate) fn search_snippet(text: &PageText, start: usize, end: usize, ctx: usize) -> String {
+    let visible: Vec<(usize, char)> = text
+        .chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.ch != '\0' && c.ch != '\r' && c.ch != '\n')
+        .map(|(orig, c)| (orig, c.ch))
+        .collect();
+    if visible.is_empty() {
+        return String::new();
+    }
+    // 命中在可见序列里的半开区间 [m0, m1)
+    let m0 = visible
+        .iter()
+        .position(|(orig, _)| *orig >= start)
+        .unwrap_or(visible.len());
+    let m1 = visible
+        .iter()
+        .position(|(orig, _)| *orig >= end)
+        .unwrap_or(visible.len());
+    if m0 >= m1 {
+        return String::new();
+    }
+    let a = m0.saturating_sub(ctx);
+    let b = (m1 + ctx).min(visible.len());
+    let mut s = String::new();
+    for k in a..m0 {
+        s.push(visible[k].1);
+    }
+    for k in m0..m1 {
+        s.push(visible[k].1);
+    }
+    for k in m1..b {
+        s.push(visible[k].1);
+    }
+    s
+}
+
+/// 检索激活下标前进/后退（循环）；空命中 → None。
+pub(crate) fn advance_match_index(count: usize, active: usize, delta: i64) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let next = (active as i64 + delta).rem_euclid(count as i64) as usize;
+    Some(next)
+}
+
 /// 每帧的页工作规划（纯函数，便于测试）：通过投影闭包按页号读取「是否已渲染 /
 /// 是否正在加载 / 渲染代次」，决定 (需要渲染的页, 需要淘汰位图的页)。
 ///
@@ -149,6 +391,32 @@ pub(crate) fn plan_page_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdf::{PageText, PdfTextChar};
+
+    /// 测试用：构造一个（非合成）字符盒（PDF 点，左下原点，Y 向上）。
+    fn tchar(ch: char, l: f32, b: f32, r: f32, t: f32, oy: f32) -> PdfTextChar {
+        PdfTextChar {
+            ch,
+            left: l,
+            bottom: b,
+            right: r,
+            top: t,
+            synthetic: false,
+            origin_x: l,
+            origin_y: oy,
+        }
+    }
+
+    /// 测试用：把字符列表包成 PageText（`synthetic` 为其中合成计数，仅诊断字段）。
+    fn page_text_of(chars: Vec<PdfTextChar>, synthetic: usize) -> PageText {
+        PageText {
+            page_index: 0,
+            width: 100.0,
+            height: 200.0,
+            chars,
+            synthetic_count: synthetic,
+        }
+    }
 
     fn a4() -> (f32, f32) {
         (595.0, 842.0) // A4 竖版（pt）
@@ -346,8 +614,188 @@ mod tests {
         assert!(s2 <= MAX_RENDER_SCALE);
     }
 
+    /// 页内 pt → 卡片局部 px：Y 翻转、边界与单调性（纯函数，不触 pdfium）。
+    #[test]
+    fn pt_to_local_flips_y_and_maps_corners() {
+        let (pw, ph) = a4(); // 595 x 842
+        let (dw, scale) = (840.0f32, 1.4f32);
+        let disp_h = display_height(a4(), dw);
+        // 页左上 (0, ph) → 卡片左上 (0, 0)
+        let (x, y) = pt_to_local(0.0, ph, pw, ph, dw, scale);
+        assert!(x.abs() < 1e-2 && y.abs() < 1e-2, "页左上应映射到卡片左上: ({x},{y})");
+        // 页右下 (pw, 0) → 卡片右下 (dw, disp_h)；y 允许 ±ceil 亚像素
+        let (x, y) = pt_to_local(pw, 0.0, pw, ph, dw, scale);
+        assert!((x - dw).abs() < 1e-2, "x 应到卡片右缘: {x}");
+        assert!(
+            (y - disp_h).abs() < 0.25,
+            "y 应到卡片底缘（±ceil 亚像素）: {y} vs {disp_h}"
+        );
+        // 单调：pt x 增大 → 局部 x 增大；pt y 减小（更靠页底）→ 局部 y 增大
+        let (x1, y1) = pt_to_local(10.0, 100.0, pw, ph, dw, scale);
+        let (x2, _) = pt_to_local(20.0, 100.0, pw, ph, dw, scale);
+        let (x3, y3) = pt_to_local(10.0, 90.0, pw, ph, dw, scale);
+        assert!(x2 > x1, "右移应使局部 x 增大: {x1} → {x2}");
+        assert!((x3 - x1).abs() < 1e-3, "x 不变则局部 x 不变");
+        assert!(y3 > y1, "更靠页底（pt y 更小）应使局部 y 增大: {y1} → {y3}");
+    }
+
+    /// pt → local → pt 往返闭合（P2 命中测试依赖逆向映射精度）。
+    #[test]
+    fn pt_to_local_roundtrips_via_local_to_pt() {
+        let (pw, ph, dw, scale) = (595.0f32, 842.0f32, 900.0f32, 1.5f32);
+        for (px, py) in [
+            (0.0, 0.0),
+            (pw, ph),
+            (123.0, 456.0),
+            (pw / 2.0, ph * 0.3),
+            (1.0, 1.0),
+            (pw - 1.0, ph - 1.0),
+        ] {
+            let (lx, ly) = pt_to_local(px, py, pw, ph, dw, scale);
+            let (bx, by) = local_to_pt(lx, ly, pw, ph, dw, scale);
+            assert!(
+                (bx - px).abs() < 0.05 && (by - py).abs() < 0.05,
+                "往返应闭合: ({px},{py}) → local({lx},{ly}) → ({bx},{by})"
+            );
+        }
+    }
+
+    /// 列坐标 → (页, 页内局部)；空白/页间沟槽/列外应返回 None（清空选区）。
+    #[test]
+    fn content_to_local_hits_pages_and_rejects_gutters() {
+        let dims = vec![a4(), a4()];
+        let page_width = 840.0f32;
+        let (tops, _total) = compute_layout(&dims, page_width);
+        let (p0, lx, ly) =
+            content_to_local(&dims, &tops, page_width, 10.0, tops[0] + 100.0).expect("页内应命中");
+        assert_eq!(p0, 0);
+        assert!((lx - 10.0).abs() < 0.01 && (ly - 100.0).abs() < 0.01, "页内局部坐标应正确");
+        let (p1, _, _) =
+            content_to_local(&dims, &tops, page_width, 10.0, tops[1] + 50.0).expect("第 2 页应命中");
+        assert_eq!(p1, 1);
+        // 页间沟槽中点
+        let gutter = tops[0] + display_height(a4(), page_width) + PAGE_GAP / 2.0;
+        assert!(content_to_local(&dims, &tops, page_width, 10.0, gutter).is_none(), "沟槽应 None");
+        // 列外 x
+        assert!(content_to_local(&dims, &tops, page_width, -5.0, tops[0] + 100.0).is_none(), "左缘外应 None");
+        assert!(content_to_local(&dims, &tops, page_width, page_width + 5.0, tops[0] + 100.0).is_none(), "右缘外应 None");
+    }
+
+    /// 命中测试：盒内含点优先（中心最近），空隙贴最近行。
+    #[test]
+    fn hit_char_prefers_contained_then_nearest() {
+        let text = page_text_of(vec![
+            tchar('A', 10.0, 20.0, 12.0, 22.0, 20.0),
+            tchar('B', 14.0, 20.0, 16.0, 22.0, 20.0),
+            tchar('S', 0.0, 0.0, 0.0, 0.0, 0.0), // synthetic：应被跳过
+        ], 1);
+        assert_eq!(hit_char(&text, 11.0, 21.0), Some(0), "点在 A 盒内");
+        assert_eq!(hit_char(&text, 15.0, 21.0), Some(1), "点在 B 盒内");
+        assert_eq!(hit_char(&text, 14.5, 21.0), Some(1), "格间空隙应贴最近");
+        assert_eq!(hit_char(&text, 11.0, 25.0), Some(0), "行下空隙应贴最近行");
+    }
+
+    /// 选区合并成行矩形：同行顺延合并，synthetic 零宽盒不产生子矩形。
+    #[test]
+    fn selection_spans_merge_by_line_and_skip_synthetic() {
+        let text = page_text_of(vec![
+            tchar('a', 10.0, 100.0, 12.0, 112.0, 100.0),
+            tchar('b', 13.0, 100.0, 15.0, 112.0, 100.0),
+            tchar('c', 10.0, 80.0, 14.0, 92.0, 80.0),
+            tchar('d', 16.0, 80.0, 20.0, 92.0, 80.0),
+            PdfTextChar {
+                synthetic: true,
+                ..tchar('s', 0.0, 0.0, 0.0, 0.0, 0.0)
+            },
+        ], 1);
+        let mut spans = selection_spans_pt(&text, 0, 4);
+        spans.sort_by(|a, b| a.1.total_cmp(&b.1)); // 按 bottom 排序，去顺序依赖
+        assert_eq!(
+            spans,
+            vec![(10.0, 80.0, 20.0, 92.0), (10.0, 100.0, 15.0, 112.0)],
+            "每行应合并为一个矩形，synthetic 不参与"
+        );
+    }
+
+    /// 文本拼接：行内宽间隙插空格、跨行插 \n、跳过 \0。
+    #[test]
+    fn page_segment_text_handles_space_newline_and_nul() {
+        let text = page_text_of(vec![
+            tchar('a', 10.0, 100.0, 12.0, 112.0, 100.0),
+            tchar('b', 13.0, 100.0, 15.0, 112.0, 100.0),
+            tchar('c', 30.0, 100.0, 32.0, 112.0, 100.0), // 与 b 间隙 15 > 1.5*avg(2)
+            tchar('\0', 0.0, 0.0, 0.0, 0.0, 100.0),       // 填充 NUL
+            tchar('d', 10.0, 80.0, 12.0, 92.0, 80.0),     // 基线降 20 → 换行
+            tchar('e', 13.0, 80.0, 15.0, 92.0, 80.0),
+        ], 1);
+        assert_eq!(page_segment_text(&text, 0, 5), "ab c\nde");
+    }
+
+    /// 原文子串拼接：跳过 NUL、越界下标钳制。
+    #[test]
+    fn page_char_substring_skips_nul_and_clamps() {
+        let text = page_text_of(vec![
+            tchar('a', 0.0, 0.0, 1.0, 1.0, 0.0),
+            tchar('\0', 0.0, 0.0, 0.0, 0.0, 0.0),
+            tchar('c', 2.0, 0.0, 3.0, 1.0, 0.0),
+        ], 0);
+        assert_eq!(page_char_substring(&text, 0, 2), "ac", "NUL 应被跳过");
+        assert_eq!(page_char_substring(&text, 0, 99), "ac", "越界 hi 应钳制");
+        assert_eq!(page_char_substring(&text, 5, 9), "", "全越界应为空");
+    }
+
+    /// 检索命中上下文片段：目标前/后各含至多 ctx 字（页首/页尾一侧不足即取不足）。
+    #[test]
+    fn search_snippet_shows_context_around_hit() {
+        let text = page_text_of(
+            "abcdefghij"
+                .chars()
+                .enumerate()
+                .map(|(i, ch)| tchar(ch, i as f32, 0.0, i as f32 + 1.0, 1.0, 0.0))
+                .collect(),
+            0,
+        );
+        // 命中 'def'(3..6)，ctx=2 → b,c + def + g,h
+        assert_eq!(search_snippet(&text, 3, 6, 2), "bcdefgh");
+        // 页首命中 'a'(0..1)，ctx=2 → 前不足则只取可用：a + b,c
+        assert_eq!(search_snippet(&text, 0, 1, 2), "abc");
+        // 页尾命中 'ij'(8..10)，ctx=2 → g,h + i,j
+        assert_eq!(search_snippet(&text, 8, 10, 2), "ghij");
+        // ctx=0 → 只目标本身
+        assert_eq!(search_snippet(&text, 3, 6, 0), "def");
+        // 跳过 NUL：可见序列里连续，命中片段不含 NUL
+        let with_nul = page_text_of(
+            ['a', 'b', '\0', 'c', 'd']
+                .into_iter()
+                .enumerate()
+                .map(|(i, ch)| tchar(ch, i as f32, 0.0, i as f32 + 1.0, 1.0, 0.0))
+                .collect(),
+            1,
+        );
+        assert_eq!(search_snippet(&with_nul, 3, 5, 0), "cd", "NUL 不进入可见序列");
+        // 换行控制符（pdfium 文本流里的 CR/LF）也不进入可见序列，保持单行干净
+        let with_nl = page_text_of(
+            ['a', 'b', '\r', '\n', 'c']
+                .into_iter()
+                .enumerate()
+                .map(|(i, ch)| tchar(ch, i as f32, 0.0, i as f32 + 1.0, 1.0, 0.0))
+                .collect(),
+            0,
+        );
+        assert_eq!(search_snippet(&with_nl, 0, 5, 2), "abc", "CR/LF 被过滤");
+    }
+
+    /// 检索激活下标循环前进/后退。
+    #[test]
+    fn advance_match_wraps_cyclically() {
+        assert_eq!(advance_match_index(4, 0, 1), Some(1));
+        assert_eq!(advance_match_index(4, 3, 1), Some(0), "末尾 +1 应回绕到 0");
+        assert_eq!(advance_match_index(4, 0, -1), Some(3), "0 -1 应到末位");
+        assert_eq!(advance_match_index(0, 0, 1), None, "无命中返回 None");
+    }
+
     /// 基准：`plan_page_work` 每帧「先按总页数物化 3 个 Vec 再规划」 vs
-    /// 「闭包投影直接规划」（[`Self`] 里被 `view.rs` 每帧调用）。
+    ///「闭包投影直接规划」（[`Self`] 里被 `view.rs` 每帧调用）。
     /// 打印、不构成断言；`--ignored` 运行（匹配项目既有 bench 惯例）。
     #[test]
     #[ignore]

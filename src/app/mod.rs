@@ -146,6 +146,11 @@ pub struct EditorApp {
     sidebar_resize_hovered: bool,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
+    /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
+    _pdf_observe: Option<gpui::Subscription>,
+    /// 已推送给 PDF 阅读器的查询（`(活动标签, 查询词)`）：两者都未变才跳过推送，
+    /// 切换标签/重开 PDF 后即使查询相同也会重新推送。
+    pdf_search: Option<(usize, String)>,
     /// 侧边栏搜索的惰性扫描缓存：按（查询词, 活动文档）复用，渲染帧不重扫全文。
     /// 查询变化 / 切换文档 / 内容被编辑时清空，下次渲染重建。
     search_scan: Option<std::rc::Rc<sidebar::SidebarSearchScan>>,
@@ -218,6 +223,8 @@ impl EditorApp {
             sidebar_resize: None,
             sidebar_resize_hovered: false,
             _search_sub: search_sub,
+            _pdf_observe: None,
+            pdf_search: None,
             search_scan: None,
             search_scan_count: 0,
             open_fast_count: 0,

@@ -583,6 +583,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        self.pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
         // 阅读画布用灰色系（非白面板），让页面“纸面”卡片与画布形成分隔
         let canvas_bg = self.window_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
@@ -601,6 +602,11 @@ impl EditorApp {
         let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(p.to_path_buf(), cx));
         viewer.update(cx, |view, _| view.set_background(canvas_bg));
         tab.pdf_preview = Some(viewer);
+        // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/页列表更新）
+        let preview = tab.pdf_preview.clone().expect("上面刚写入");
+        self._pdf_observe = Some(cx.observe(&preview, |_this, _e, cx| {
+            cx.notify();
+        }));
         tab.file_path = Some(p.to_path_buf());
         tab.content = SharedString::default();
         tab.line_count = 0;

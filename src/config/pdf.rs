@@ -18,3 +18,7 @@ pub const CACHE_MAX_PAGES: usize = 8;
 pub const MAX_INFLIGHT: usize = 2;
 /// 磁盘二级页缓存页数（略大于内存预算，保证常见短程回翻命中）。
 pub const CACHE_DISK_PAGES: usize = 32;
+/// 文本层 LRU 缓存页数上限（每页 ~20-100KB，24 页 <3MB；选中/复制/搜索用）。
+pub const TEXT_CACHE_PAGES: usize = 24;
+/// 同时并发预取的文本页数上限（低优先级，不抢栅格化带宽）。
+pub const TEXT_INFLIGHT: usize = 4;

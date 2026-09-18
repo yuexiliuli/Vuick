@@ -22,7 +22,7 @@
 //!
 //! [`PdfViewer`]: super::view::PdfViewer
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{mpsc, OnceLock};
 
@@ -143,6 +143,89 @@ pub struct RenderResult {
     pub height: u32,
 }
 
+/// 页内单个字符的文本层数据：Unicode + 包围盒。
+///
+/// 坐标语义：与 pdfium 一致（PDF 用户空间，原点在页**左下角**，Y 轴向上），单位
+/// 为 PDF 点；到屏幕坐标的 Y 翻转与缩放由 view 层的映射（layout.rs，P1）负责。
+/// 盒字段均已夹到页内 [0, width] × [0, height]。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfTextChar {
+    /// Unicode 码点（pdfium 无法解码时为 `U+FFFD`；可能为不可见字符）。
+    pub ch: char,
+    /// 包围盒左缘（PDF 点）。
+    pub left: f32,
+    /// 包围盒下缘（PDF 点）。
+    pub bottom: f32,
+    /// 包围盒右缘（PDF 点）。
+    pub right: f32,
+    /// 包围盒上缘（PDF 点）。
+    pub top: f32,
+    /// 盒退化（tight 与 loose 均为 0 宽 0 高）：命中测试应**降权**此字符（复制仍可用）。
+    pub synthetic: bool,
+    /// 字符基线原点（PDF 点）。同一行（同一文本对象 run）的 `origin_y` 一致——
+    /// P1 用它做"基线对齐"校验（映射后同行 `origin_y` 方差 < 1px，防选区高亮锯齿）。
+    pub origin_x: f32,
+    pub origin_y: f32,
+}
+
+/// 一页的文本层数据（**自包含**、可跨线程传给阅读器；复制/命中测试/搜索用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageText {
+    /// 所属页号（0 基）。
+    pub page_index: usize,
+    /// 页面宽度（PDF 点）。
+    pub width: f32,
+    /// 页面高度（PDF 点）。
+    pub height: f32,
+    /// 按 pdfium 文本索引顺序排列的字符（≈文档内定义顺序，选中复制按此拼接）。
+    pub chars: Vec<PdfTextChar>,
+    /// 盒退化字符数（诊断用；正常应为 0）。
+    pub synthetic_count: usize,
+}
+
+/// 字符包围盒（PDF 点）。仅 worker 内部临时结构。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CharBox {
+    left: f32,
+    bottom: f32,
+    right: f32,
+    top: f32,
+}
+
+impl CharBox {
+    const ZERO: CharBox = CharBox {
+        left: 0.0,
+        bottom: 0.0,
+        right: 0.0,
+        top: 0.0,
+    };
+
+    /// 盒是否可用于命中测试（正宽高 + 有限值）。
+    fn valid(self) -> bool {
+        self.right - self.left > 0.0
+            && self.top - self.bottom > 0.0
+            && self.left.is_finite()
+            && self.right.is_finite()
+            && self.bottom.is_finite()
+            && self.top.is_finite()
+    }
+}
+
+/// 字符盒回退策略：**tight（首选）→ loose（回退）→ 标记 synthetic**。
+///
+/// `FPDFText_GetCharBox` 对空格、零宽连接符、部分 CJK 标点等可能返回 0 宽 0 高
+/// （或负尺寸）的退化盒；此时用 `FPDFText_GetLooseCharBox` 兜底。若连 loose 都退化，
+/// 只能保留（标记 synthetic）供复制，并让命中测试跳过它。
+fn resolve_char_box(tight: Option<CharBox>, loose: Option<CharBox>) -> (CharBox, bool) {
+    match tight {
+        Some(t) if t.valid() => (t, false),
+        _ => match loose {
+            Some(l) if l.valid() => (l, false),
+            l => (l.unwrap_or(CharBox::ZERO), true),
+        },
+    }
+}
+
 /// 一条 PDF 书签（目录项）：标题 + 层级 + 目标页码。
 ///
 /// 由工作线程在打开文档时从 pdfium 书签树提取为**自包含**结构（不借用 pdfium），
@@ -167,6 +250,11 @@ enum WorkerMsg {
     ),
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
     Close(DocId),
+    /// 请求某页文本层数据（懒加载：仅选中/复制/搜索时调用）。**低优先级**：
+    /// worker 调度保证绝不排在栅格化（Render）之后执行。
+    Text(DocId, usize, mpsc::Sender<Option<PageText>>),
+    /// 请求文档级检索（懒加载，低优先级；全页文本层扫描）。
+    Search(DocId, String, mpsc::Sender<Option<PdfSearchResults>>),
 }
 
 /// 进程级单例工作线程句柄。所有 [`PdfViewer`] 通过克隆它共享同一个 pdfium 线程。
@@ -229,6 +317,25 @@ impl PdfWorker {
         let _ = self.tx.send(WorkerMsg::Close(doc_id));
     }
 
+    /// 请求某页文本层数据（异步、低优先级）。返回接收结果的通道。
+    ///
+    /// 只应在用户开始选中/搜索时按需调用（懒加载：不交互则零开销）。
+    /// 调用方须在结果到达后自行判断是否仍需要：滚动/缩放已使页面过期时直接丢弃
+    /// （P2 会绑定 generation 校验，此处只建立契约）。
+    pub fn request_text(&self, doc_id: DocId, page: usize) -> mpsc::Receiver<Option<PageText>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::Text(doc_id, page, tx));
+        rx
+    }
+
+    /// 请求文档级检索（异步、低优先级；全页文本层扫描，命中上限 [`SEARCH_MAX_HITS`]）。
+    /// 返回接收结果的通道；文档不存在 → `None`。
+    pub fn search(&self, doc_id: DocId, needle: String) -> mpsc::Receiver<Option<PdfSearchResults>> {
+        let (tx, rx) = mpsc::channel();
+        let _ = self.tx.send(WorkerMsg::Search(doc_id, needle, tx));
+        rx
+    }
+
     /// 工作线程主体（进程内唯一）：绑定 pdfium 一次 → 循环处理命令。
     fn run(rx: mpsc::Receiver<WorkerMsg>, dll: PathBuf) {
         let bindings = match Pdfium::bind_to_library(&dll) {
@@ -241,7 +348,24 @@ impl PdfWorker {
         let pdfium = Pdfium::new(bindings);
         // 文档存活期 = `pdfium` 存活期；所有 `PdfDocument<'a>` 都借用上面的 `pdfium`。
         let mut docs: HashMap<DocId, PdfDocument<'_>> = HashMap::new();
-        while let Ok(msg) = rx.recv() {
+        // 本地优先级队列：阻塞等第一条消息后，把当前积压一次性入队再调度。
+        // **Render 永不排在 Text 之后**（滚动画帧的栅格化优先于懒加载的文本提取），
+        // 其余消息（Open/Close/Text 之间）保持 FIFO。
+        let mut queue: VecDeque<WorkerMsg> = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                match rx.recv() {
+                    Ok(msg) => queue.push_back(msg),
+                    Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
+                }
+            }
+            while let Ok(msg) = rx.try_recv() {
+                queue.push_back(msg);
+            }
+            let msg = match queue.iter().position(|m| matches!(m, WorkerMsg::Render(..))) {
+                Some(i) => queue.remove(i).expect("position 已命中"),
+                None => queue.pop_front().expect("queue 已保证非空"),
+            };
             match msg {
                 WorkerMsg::Open(doc_id, bytes, tx) => {
                     let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
@@ -267,6 +391,16 @@ impl PdfWorker {
                 }
                 WorkerMsg::Close(doc_id) => {
                     docs.remove(&doc_id);
+                }
+                WorkerMsg::Text(doc_id, page, tx) => {
+                    let result = docs
+                        .get(&doc_id)
+                        .and_then(|doc| extract_page_text(doc, page));
+                    let _ = tx.send(result);
+                }
+                WorkerMsg::Search(doc_id, needle, tx) => {
+                    let result = docs.get(&doc_id).and_then(|doc| search_document(doc, &needle));
+                    let _ = tx.send(result);
                 }
             }
         }
@@ -344,6 +478,164 @@ pub fn page_dims(bytes: &[u8]) -> Result<Vec<(f32, f32)>> {
     Ok(dims)
 }
 
+fn char_box_from_rect(r: PdfRect) -> CharBox {
+    CharBox {
+        left: r.left().value,
+        bottom: r.bottom().value,
+        right: r.right().value,
+        top: r.top().value,
+    }
+}
+
+/// 在工作线程内：抽取单页的完整文本层（Unicode + 每字符包围盒）。
+///
+/// - 用 [`PdfPageText::chars`](PdfPageText) 遍历 pdfium 文本索引顺序（≈文档内定义顺序，
+///   复制时按此拼接，与视觉阅读顺序在复杂排版下可能略有出入——见 pdfium 文档说明）。
+/// - 每字符取 `tight_bounds`（`FPDFText_GetCharBox`），退化时按 [`resolve_char_box`]
+///   回退 `loose_bounds`（`FPDFText_GetLooseCharBox`）并标记 `synthetic`。
+/// - 所有盒夹到页内，保证下游命中测试/高亮不越界。
+/// - 页面无文本（扫描件）返回 `Some(PageText { chars: [] })`；页/文档不存在返回 `None`。
+fn extract_page_text(doc: &PdfDocument<'_>, page_index: usize) -> Option<PageText> {
+    let page = doc.pages().get(page_index as i32).ok()?;
+    let (page_w, page_h) = (page.width().value as f32, page.height().value as f32);
+    let text = page.text().ok()?;
+    let mut chars = Vec::with_capacity(text.len().max(0) as usize);
+    let mut synthetic_count = 0usize;
+    for c in text.chars().iter() {
+        let tight = c.tight_bounds().ok().map(char_box_from_rect);
+        let loose = c.loose_bounds().ok().map(char_box_from_rect);
+        let (mut b, synthetic) = resolve_char_box(tight, loose);
+        if synthetic {
+            synthetic_count += 1;
+        }
+        // 基线原点（PDF 点；失败为 0，仅影响基线校验不参与命中测试）
+        let (origin_x, origin_y) = c
+            .origin()
+            .map(|o| (o.0.value, o.1.value))
+            .unwrap_or((0.0, 0.0));
+        // 夹到页内（防负坐标/越界；到屏幕的 Y 翻转与缩放由 P1 的映射层完成）
+        b.left = b.left.clamp(0.0, page_w);
+        b.right = b.right.clamp(0.0, page_w);
+        b.bottom = b.bottom.clamp(0.0, page_h);
+        b.top = b.top.clamp(0.0, page_h);
+        chars.push(PdfTextChar {
+            ch: c.unicode_char().unwrap_or('\u{FFFD}'),
+            left: b.left,
+            bottom: b.bottom,
+            right: b.right,
+            top: b.top,
+            synthetic,
+            origin_x,
+            origin_y,
+        });
+    }
+    Some(PageText {
+        page_index,
+        width: page_w,
+        height: page_h,
+        chars,
+        synthetic_count,
+    })
+}
+
+/// 一次文档级检索的命中：页号 + 页内**原始字符区间**（`[start, end)`，与
+/// [`PageText::chars`](PageText) 下标一致）+ 就地生成的**上下文片段**
+/// （前/后各 [`SEARCH_SNIPPET_CTX`] 字，侧边栏逐行展示用；不依赖阅读器文本缓存）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfSearchHit {
+    pub page: usize,
+    pub start: usize,
+    pub end: usize,
+    /// `前5字 + 命中目标 + 后5字`（左右不足一侧带 `…` 省略标记）。
+    pub snippet: String,
+}
+
+/// 文档级检索结果（**自包含**、可跨线程传给阅读器）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdfSearchResults {
+    /// 全部命中（页号升序，页内按文本顺序；非重叠）。
+    pub hits: Vec<PdfSearchHit>,
+    /// 命中数是否因超过上限被截断。
+    pub truncated: bool,
+}
+
+/// 文档检索命中数上限（防超大文档/单字节查询返回海量结果撑爆 UI）。
+pub(crate) const SEARCH_MAX_HITS: usize = 1000;
+/// 命中上下文片段每侧字数（`前5字 + 目标 + 后5字`）。
+pub(crate) const SEARCH_SNIPPET_CTX: usize = 5;
+
+/// 单页文本层内做（ASCII 大小写不敏感、非重叠）子串匹配，返回**原始字符区间**。
+///
+/// 基于已抽取的 `chars` 重建"可见码点序列"（跳过 NUL——pdfium 生成的填充），
+/// 用 `to_ascii_lowercase` 折叠字母（CJK/全角不受影响，仍按精确字匹配）。
+/// 返回 `(start, end)`：`start` 为匹配首字符下标，`end` 为匹配末字符下标 +1。
+pub(crate) fn search_page_text(text: &PageText, needle: &[char]) -> Vec<(usize, usize)> {
+    let m = needle.len();
+    if m == 0 || text.chars.is_empty() {
+        return Vec::new();
+    }
+    let hay: Vec<(usize, char)> = text
+        .chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.ch != '\0')
+        .map(|(i, c)| (i, c.ch))
+        .collect();
+    if hay.len() < m {
+        return Vec::new();
+    }
+    let fold = |c: char| c.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + m <= hay.len() {
+        let mut matched = true;
+        for k in 0..m {
+            if fold(hay[i + k].1) != fold(needle[k]) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            out.push((hay[i].0, hay[i + m - 1].0 + 1));
+            i += m; // 非重叠：跳过已匹配段
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 在工作线程内：全页扫描子串检索（每页经 [`extract_page_text`] 重建文本层）。
+/// 命中按页升序；达到 [`SEARCH_MAX_HITS`] 截断并置 `truncated`。文档/页不存在 → None。
+fn search_document(doc: &PdfDocument<'_>, needle: &str) -> Option<PdfSearchResults> {
+    if needle.is_empty() {
+        return Some(PdfSearchResults { hits: Vec::new(), truncated: false });
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    let page_count = doc.pages().len().max(0) as usize;
+    for page_ix in 0..page_count {
+        let Some(text) = extract_page_text(doc, page_ix) else {
+            continue;
+        };
+        for (s, e) in search_page_text(&text, &needle_chars) {
+            let snippet = crate::pdf::layout::search_snippet(&text, s, e, SEARCH_SNIPPET_CTX);
+            hits.push(PdfSearchHit {
+                page: page_ix,
+                start: s,
+                end: e,
+                snippet,
+            });
+            if hits.len() >= SEARCH_MAX_HITS {
+                truncated = true;
+                return Some(PdfSearchResults { hits, truncated });
+            }
+        }
+    }
+    Some(PdfSearchResults { hits, truncated })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +678,234 @@ mod tests {
         let written = std::fs::read(&path).expect("应能读回解出的 dll");
         assert_eq!(written.len(), EMBEDDED_PDFIUM.len(), "解出内容长度应一致");
         assert_eq!(&written[..2], b"MZ", "解出文件应以 MZ 开头");
+    }
+
+    fn target_pdf_paths() -> Vec<std::path::PathBuf> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        vec![
+            manifest.join("pdf测试.pdf"),
+            manifest.join("17. 道路机动车辆产品准入审查要求1.0.pdf.pdf"),
+        ]
+    }
+
+    /// 文本提取冒烟：真实 PDF 首页能取出非空文本层，且每个字符盒有限、落在页内。
+    #[test]
+    fn extracts_page_text_from_real_pdf() {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let rx = worker.request_text(doc_id, 0);
+        let text = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到文本结果")
+            .expect("文本提取应成功");
+        assert!(
+            text.chars.len() >= 10,
+            "内容页应有足量文本字符，实际 {}",
+            text.chars.len()
+        );
+        assert!(text.width > 0.0 && text.height > 0.0, "页面尺寸应为正");
+        assert!(
+            text.synthetic_count <= text.chars.len(),
+            "degenerate 字符数不应超过总数"
+        );
+        for c in &text.chars {
+            let (l, r, b, t) = (c.left, c.right, c.bottom, c.top);
+            for v in [l, r, b, t] {
+                assert!(v.is_finite(), "盒字段应有限: {c:?}");
+            }
+            assert!(
+                l >= 0.0 - 1e-3 && r <= text.width + 1e-3,
+                "X 应在页内 [0,{}]: {c:?}",
+                text.width
+            );
+            assert!(
+                b >= 0.0 - 1e-3 && t <= text.height + 1e-3,
+                "Y 应在页内 [0,{}]: {c:?}",
+                text.height
+            );
+            if !c.synthetic {
+                assert!(r >= l && t >= b, "有效字符盒应非负尺寸: {c:?}");
+            }
+        }
+        // 抽取应稳定：同一页重复抽取，字符序列一致
+        let rx2 = worker.request_text(doc_id, 0);
+        let text2 = rx2
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("应收到第二次结果")
+            .expect("第二次抽取应成功");
+        assert_eq!(text.chars, text2.chars, "同页重复抽取字符应一致");
+    }
+
+    /// 未打开的文档请求文本 → None（区别于“页面无文本”的 Some(空)）。
+    #[test]
+    fn text_request_for_unknown_doc_returns_none() {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[0].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, _doc_id, _dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let rx = worker.request_text(u64::MAX, 0); // 从没打开过的 doc
+        let res = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("应收到应答")
+            ;
+        assert!(res.is_none(), "未知文档的文本请求应返回 None");
+    }
+
+    /// 检索子串匹配（纯逻辑，不触 pdfium）：大小写折叠、跳过 NUL、非重叠。
+    #[test]
+    fn search_page_text_matches_casefold_skips_nul_non_overlap() {
+        use super::{search_page_text, PageText, PdfTextChar};
+        // 可见序列 = "ab" + NUL 跳过 + "ABc" → "abABc"
+        let mut chars = Vec::new();
+        for (i, ch) in ['a', 'b', '\0', 'A', 'B', 'c'].into_iter().enumerate() {
+            chars.push(PdfTextChar {
+                ch,
+                left: i as f32,
+                bottom: 0.0,
+                right: i as f32 + 1.0,
+                top: 1.0,
+                synthetic: ch == '\0',
+                origin_x: i as f32,
+                origin_y: 0.0,
+            });
+        }
+        let text = PageText {
+            page_index: 0,
+            width: 100.0,
+            height: 100.0,
+            chars,
+            synthetic_count: 1,
+        };
+        let ndl = |s: &str| s.chars().collect::<Vec<char>>();
+        // 可见序列 "abABc"：大小写折叠下 ab/AB/aB 都在 0..2 与 3..5 两处命中
+        assert_eq!(
+            search_page_text(&text, &ndl("ab")),
+            vec![(0, 2), (3, 5)],
+            "ab 折叠后命中可见序列两处"
+        );
+        assert_eq!(
+            search_page_text(&text, &ndl("AB")),
+            vec![(0, 2), (3, 5)],
+            "AB 折叠后与 ab 同命中"
+        );
+        assert_eq!(
+            search_page_text(&text, &ndl("aB")),
+            vec![(0, 2), (3, 5)],
+            "aB 混合大小写折叠命中"
+        );
+        assert_eq!(search_page_text(&text, &ndl("c")), vec![(5, 6)], "c 命中可见序列末");
+        // NUL 被跳过 → 可见序列连续：'abc'(折叠) 命中可见 'ABc'(3..6)；'bA' 跨过 NUL 连续命中
+        assert_eq!(
+            search_page_text(&text, &ndl("abc")),
+            vec![(3, 6)],
+            "跳过 NUL 后可见序列连续，abc(折叠) 命中 ABc"
+        );
+        assert_eq!(
+            search_page_text(&text, &ndl("bA")),
+            vec![(1, 4)],
+            "bA 跨过 NUL 仍为可见序列连续"
+        );
+        // 非重叠：连续重复只取不重叠段
+        let rep = PageText {
+            page_index: 0,
+            width: 100.0,
+            height: 100.0,
+            chars: ['a', 'a', 'a', 'a']
+                .into_iter()
+                .enumerate()
+                .map(|(i, ch)| PdfTextChar {
+                    ch,
+                    left: i as f32,
+                    bottom: 0.0,
+                    right: i as f32 + 1.0,
+                    top: 1.0,
+                    synthetic: false,
+                    origin_x: i as f32,
+                    origin_y: 0.0,
+                })
+                .collect(),
+            synthetic_count: 0,
+        };
+        assert_eq!(search_page_text(&rep, &ndl("aa")), vec![(0, 2), (2, 4)], "非重叠命中");
+        // 空串 / 长于文本 → 空
+        assert_eq!(search_page_text(&text, &ndl("")), Vec::<(usize, usize)>::new());
+        assert_eq!(search_page_text(&text, &ndl("abABcx")), Vec::<(usize, usize)>::new());
+    }
+
+    /// 纯逻辑（不触 pdfium）：字符盒回退策略 tight > loose > synthetic。
+    #[test]
+    fn resolve_char_box_prefers_tight_then_loose_then_synthetic() {
+        use super::{CharBox, resolve_char_box};
+        let tight = Some(CharBox {
+            left: 10.0,
+            bottom: 20.0,
+            right: 12.0,
+            top: 22.0,
+        });
+        let (b, syn) = resolve_char_box(tight, Some(CharBox::ZERO));
+        assert!(!syn && b.left == 10.0 && b.top == 22.0, "tight 正常应直接采用");
+
+        // tight 退化（0 宽 0 高）→ 回退到可用的 loose
+        let (b2, syn2) = resolve_char_box(Some(CharBox::ZERO), Some(CharBox {
+            left: 1.0,
+            bottom: 2.0,
+            right: 4.0,
+            top: 5.0,
+        }));
+        assert!(!syn2 && b2.right - b2.left > 0.0, "退化的 tight 应回退 loose");
+
+        // 全部退化 → 标记 synthetic（保留盒内容便于复制）
+        let (b3, syn3) = resolve_char_box(Some(CharBox::ZERO), Some(CharBox::ZERO));
+        assert!(syn3 && b3 == CharBox::ZERO, "全退化应标记 synthetic");
+
+        // 全部缺失 → synthetic + ZERO
+        let (b4, syn4) = resolve_char_box(None, None);
+        assert!(syn4 && b4 == CharBox::ZERO, "双 None 应 synthetic + ZERO");
+
+        // 负尺寸（引擎异常返回）→ 视为退化，不回退已坏的 tight
+        let neg = Some(CharBox {
+            left: 10.0,
+            bottom: 20.0,
+            right: 8.0,
+            top: 22.0,
+        });
+        let (b5, syn5) = resolve_char_box(neg, None);
+        assert!(syn5, "负宽 tight 应标记 synthetic");
+        assert!(b5 == CharBox::ZERO, "无可用回退时应为 ZERO");
+    }
+
+    /// 文本提取单页端到端延迟摸底（Release 目标 ~8ms/页）。打印，不构成断言。
+    #[test]
+    #[ignore]
+    fn bench_page_text_extraction() {
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        let p = target_pdf_paths()[1].clone();
+        assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
+        let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
+        let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
+        let n = dims.len().min(8);
+        let mut ms: Vec<u64> = Vec::new();
+        for idx in 0..n {
+            let t0 = std::time::Instant::now();
+            let rx = worker.request_text(doc_id, idx);
+            let res = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("应收到文本结果");
+            let m = t0.elapsed().as_millis() as u64;
+            ms.push(m);
+            if let Some(t) = res {
+                eprintln!(
+                    "page {idx}: {m}ms, {} chars (synthetic {})",
+                    t.chars.len(),
+                    t.synthetic_count
+                );
+            }
+        }
+        let avg = ms.iter().sum::<u64>() / n as u64;
+        eprintln!("BENCH-TEXT: 单页文本提取均值 {avg}ms; 明细 {ms:?}");
     }
 }

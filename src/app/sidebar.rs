@@ -520,6 +520,10 @@ impl EditorApp {
             div()
                 .px_3()
                 .py_2()
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_overflow(gpui::TextOverflow::Truncate("…".into()))
                 .text_size(px(12.))
                 .text_color(muted)
                 .child("输入关键字，搜索当前文件内容；文件名匹配所有打开文件")
@@ -553,6 +557,22 @@ impl EditorApp {
     ) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
+        // PDF 标签：全文检索由 PdfViewer 后台执行（文本在 pdfium 里，不在 tab.content）。
+        // 查询按（标签, 词）键控、变化才推送（阅读器内部 250ms 防抖）；侧边栏只展示
+        // 计数/页列表并驱动跳转。结果异步到达 → 经 `_pdf_observe` 重绘本面板。
+        if let Some(pdf) = self.tabs.get(self.active_tab).and_then(|t| t.pdf_preview.clone()) {
+            let push = self
+                .pdf_search
+                .as_ref()
+                .map(|(ti, q0)| *ti != self.active_tab || q0 != q)
+                .unwrap_or(true);
+            if push {
+                self.pdf_search = Some((self.active_tab, q.to_string()));
+                let qo = q.to_string();
+                pdf.update(cx, |v, cx| v.set_search(&qo, cx));
+            }
+            return self.render_sidebar_pdf_search(&pdf, q, cx);
+        }
         let scan = self.sidebar_search_scan(q, cx);
 
         let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
@@ -692,6 +712,151 @@ impl EditorApp {
             .overflow_y_scroll()
             .child(summary)
             .child(div().flex().flex_col().py_1().children(rows))
+            .into_any_element()
+    }
+
+    /// PDF 标签的搜索视图：顶部一行「n 处匹配」计数（右侧为 ↑/↓ 导航），
+    /// 下方逐命中上下文行（`L N  前5字…目标…后5字`，单行显示超长省略，点击跳转到该命中页）。
+    /// 检索本身由 [`crate::pdf::PdfViewer::set_search`] 在阅读器后台执行，这里只读状态并驱动跳转。
+    fn render_sidebar_pdf_search(
+        &mut self,
+        pdf: &gpui::Entity<crate::pdf::PdfViewer>,
+        q: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (fg, muted) = (self.text_primary(), self.text_minor());
+        let active_bg = self.tab_active_bg();
+        let (count, truncated, active) = pdf.read(cx).search_summary();
+        let snippets: Vec<(usize, String)> = pdf.read(cx).search_snippets();
+
+        // 计数 + ↑/↓ 导航同行排布于顶部一行（计数在左、导航靠右；计数过长尾部省略）
+        let mk_nav = |symbol: &'static str,
+                      delta: i64,
+                      target: gpui::Entity<crate::pdf::PdfViewer>,
+                      cx: &mut Context<Self>| {
+            let id = if delta < 0 {
+                "sidebar-search-pdf-prev"
+            } else {
+                "sidebar-search-pdf-next"
+            };
+            div()
+                .id(SharedString::from(id))
+                .debug_selector(move || SharedString::from(id).into())
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(28.))
+                .h(px(24.))
+                .mx(px(2.))
+                .rounded_md()
+                .text_size(px(16.))
+                .text_color(fg)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(active_bg))
+                .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
+                    target.update(cx, |v, cx| v.move_match(delta, cx));
+                    cx.notify();
+                }))
+                .child(symbol)
+        };
+        let prev_btn = mk_nav("↑", -1, pdf.clone(), cx);
+        let next_btn = mk_nav("↓", 1, pdf.clone(), cx);
+
+        let summary: gpui::AnyElement = if count == 0 {
+            let hint = if q.trim().is_empty() {
+                "在 PDF 全文检索；输入关键字"
+            } else {
+                "PDF 中没有匹配"
+            };
+            div()
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(muted)
+                .child(hint)
+                .into_any_element()
+        } else {
+            let text = if truncated {
+                format!("{count} 处匹配（已截断）")
+            } else {
+                format!("{count} 处匹配")
+            };
+            div()
+                .id("sidebar-search-pdf-head")
+                .px_3()
+                .py_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .text_size(px(12.))
+                        .text_color(fg)
+                        .child(text),
+                )
+                .child(
+                    div()
+                        .id("sidebar-search-pdf-nav")
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(prev_btn)
+                        .child(next_btn),
+                )
+                .into_any_element()
+        };
+
+        // 命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；当前激活命中高亮
+        let mut hit_rows: Vec<gpui::AnyElement> = Vec::new();
+        for (idx, (page, snippet)) in snippets.into_iter().enumerate() {
+            let color = if idx == active { fg } else { muted };
+            let row_pdf = pdf.clone();
+            let r = div()
+                .id(SharedString::from(format!("sidebar-search-pdf-hit-{idx}")))
+                .debug_selector(move || format!("sidebar-search-pdf-hit-{idx}"))
+                .px_2()
+                .py_1()
+                .mx(px(4.))
+                .rounded_md()
+                .flex()
+                .flex_row()
+                .items_center()
+                .text_size(px(12.))
+                .text_color(color)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(active_bg))
+                .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
+                    row_pdf.update(cx, |v, cx| v.focus_match_on_page(page, cx));
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                        .child(format!("L{}  {}", page + 1, snippet)),
+                );
+            hit_rows.push(r.into_any_element());
+        }
+
+        div()
+            .id("sidebar-search-results-pdf")
+            .debug_selector(|| "sidebar-search-results-pdf".into())
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(summary)
+            .child(div().flex().flex_col().py_1().children(hit_rows))
             .into_any_element()
     }
 
