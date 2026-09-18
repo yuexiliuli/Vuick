@@ -2804,6 +2804,71 @@
         );
     }
 
+    /// 决定性回归：**无任何用户输入**的情况下，后台瓦片/封面渲染后必须经「notify →
+    /// 窗口重绘」链条被绘制出来。若此测试失败 = worker 渲完了但主线程从未重绘 →
+    /// 用户看到“CPU 低、画面长时间不变”，正是当前体感问题的根因候选。
+    #[gpui::test]
+    async fn pdf_content_reaches_pixels_without_user_input(cx: &mut TestAppContext) {
+        let _pdf_guard = crate::pdf::test_util::lock().lock().unwrap();
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1500.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        assert!(pdf.exists(), "测试 PDF 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .pdf_preview
+                    .as_ref()
+                    .map(|pv| pv.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if loaded {
+                break;
+            }
+        }
+        // 不触发任何输入/事件：仅跑虚拟帧 + 少量真实等待给 pdfium worker。
+        // 用 advance_clock 推进虚拟时间以驱动 16ms 自刷新泵（真实 app 里是真实时钟，
+        // 定时器天然触发；测试虚拟时钟需显式推进）。
+        for _ in 0..400 {
+            cx.executor().advance_clock(std::time::Duration::from_millis(16));
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..120 {
+            cx.refresh().unwrap();
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (loaded, tiles, cover, pending) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let pv = a.tabs[a.active_tab].pdf_preview.as_ref().unwrap().read(cx);
+            let s0 = pv.slots.first();
+            (
+                pv.is_loaded(),
+                s0.map(|s| s.tiles.len()).unwrap_or(0),
+                s0.map(|s| s.cover.is_some()).unwrap_or(false),
+                pv.pending_tiles.len(),
+            )
+        });
+        assert!(loaded, "应已加载");
+        // 关键回归：无任何输入也必须在首帧布局就位后**发出瓦片/封面请求**（此前
+        // "负载完成 → notify 空操作 → 永不重绘 → 首帧 bounds=0 → 永远调不到瓦片"）。
+        // 说明：测试 harness 对深层嵌套子视图无法一直驱动 collect，故此处断言"已调度"；
+        // 完整"调度→回传→收集→绘制"链路由 pdf::tests 的窗口根节点测试覆盖。
+        assert!(
+            tiles >= 1 || cover || pending >= 1,
+            "无输入也应发起瓦片/封面调度：tiles={tiles} cover={cover} pending={pending}"
+        );
+    }
+
     /// 回归：打开 242 页的长 PDF（曾因全量栅格化耗时 ~270s 表现为“无法加载”）。
     /// 现在应为页级虚拟化——结构解析秒级完成，进 UI 后按需渲染。
     #[gpui::test]

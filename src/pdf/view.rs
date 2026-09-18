@@ -44,21 +44,27 @@ use gpui::{
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 use crate::config::pdf::{
-    COVER_CACHE_PAGES, COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES,
-    MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
+    COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
     TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
     ZOOM_MAX, ZOOM_MIN, ZOOM_STEP,
 };
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
-    cover_affordable, display_height, hit_char, keep_window, local_to_pt, page_bitmap_size,
-    page_segment_text, pt_to_local, render_scale, selection_spans_pt, visible_tile_range, Slot,
-    TileSlot,
+    cover_affordable, cover_scale, display_height, hit_char, keep_window, local_to_pt,
+    page_bitmap_size, page_segment_text, pt_to_local, render_scale, selection_spans_pt,
+    visible_tile_range, Slot, TileSlot,
 };
 use crate::pdf::{
     render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
     PdfWorker, RenderRequest, RenderResult, TileRequest, TileResult,
 };
+/// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
+fn timing_view() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var_os("GPUI_EDITOR_PDF_TIMING").map_or(false, |v| v == "1" || v == "true")
+    })
+}
 
 /// PDF 阅读器：自包含的瓦片级虚拟化视图。
 pub struct PdfViewer {
@@ -219,11 +225,25 @@ impl PdfViewer {
                         this.total_height = total;
                         this.slots = vec![Slot::default(); this.dims.len()];
                         this.loading = false;
+                        if timing_view() {
+                            eprintln!(
+                                "[{:.1}ms] [VIEW-OPEN-DONE] pages={} tops0={:.1} total={:.1}",
+                                crate::pdf::timing_ms(),
+                                this.dims.len(),
+                                this.page_tops.first().copied().unwrap_or(0.0),
+                                this.total_height,
+                            );
+                        }
+                        // 关键：`refresh_windows()` 无条件要求重绘（不依赖实体被窗口 tracking）。
+                        // 仅 `notify()` 在实体未注册 window invalidator 时是空操作 → 首帧后
+                        // 永远不会再跑 `ensure_window` → 瓦片/封面从未被调度（“CPU 低、不变化”）。
+                        cx.refresh_windows();
                         cx.notify();
                     }
                     Err(e) => {
                         this.loading = false;
                         this.load_error = Some(e);
+                        cx.refresh_windows();
                         cx.notify();
                     }
                 }
@@ -391,6 +411,19 @@ impl PdfViewer {
     /// 每帧：回收在途结果、估速、刷盘、按视口调度瓦片（常态）/占位（快速拖动）、
     /// 淘汰超预算瓦片。
     fn ensure_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if timing_view() {
+            eprintln!(
+                "[{:.1}ms] [VIEW-TICK] loading={} dims={} pending_t={} pending_c={} fast={} bounds_h={:.0} off_y={:.0}",
+                crate::pdf::timing_ms(),
+                self.loading,
+                self.dims.len(),
+                self.pending_tiles.len(),
+                self.pending_cover.len(),
+                self.prev_fast,
+                f32::from(self.scroll.bounds().size.height),
+                f32::from(-self.scroll.offset().y),
+            );
+        }
         for arc in std::mem::take(&mut self.pending_drops) {
             cx.drop_image(arc, Some(window));
         }
@@ -499,7 +532,7 @@ impl PdfViewer {
         // 6) 调度：常态 → 瓦片（视口附近按需栅格化）；快速拖动 → 缩略/中清占位
         //    （瓦片停止后自动补齐）。之后统一做瓦片字节预算淘汰。
         if self.prev_fast {
-            self.schedule_placeholders(start, end, scale_factor);
+            self.schedule_placeholders(window, start, end, scroll_y, viewport_h, scale_factor);
         } else {
             self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
         }
@@ -510,14 +543,18 @@ impl PdfViewer {
         self.ensure_tile_pump(cx);
     }
 
-    /// 瓦片在途期间的自刷新泵：仅当 `pending_tiles` 非空时启动，每 ~16ms 触发一次
-    /// 重绘（驱动 `collect_tile_results` 收图），在途清空后自动停止。避免"派发了瓦片
-    /// 但没有任何事件触发重绘 → 首屏永远停留在占位/加载中"。
+    /// 瓦片在途期间的自刷新泵：仅当「有在途瓦片/封面」或「已加载但滚动容器尚未拿到真实
+    /// 布局高度（首帧 bounds=0，此时视口为空 → 调度不到任何瓦片）」时启动，每 ~16ms 触发
+    /// 一次窗口重绘（`refresh_windows`），直到工作清空后自动停止。避免"派发了瓦片但没有任何
+    /// 事件触发重绘 → 首屏永远停留在占位/加载中"以及"首帧 bounds=0 → 永远调不到瓦片"。
     fn ensure_tile_pump(&mut self, cx: &mut Context<Self>) {
-        if self.tile_pump_running || self.pending_tiles.is_empty() {
+        if self.tile_pump_running || !self.pump_still_needed() {
             return;
         }
         self.tile_pump_running = true;
+        if timing_view() {
+            eprintln!("[{:.1}ms] [VIEW-PUMP] start pending_t={}", crate::pdf::timing_ms(), self.pending_tiles.len());
+        }
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -525,8 +562,15 @@ impl PdfViewer {
                     .await;
                 let still = this
                     .update(cx, |v, cx| {
-                        cx.notify();
-                        !v.pending_tiles.is_empty() || !v.pending_cover.is_empty()
+                        if timing_view() {
+                            eprintln!("[{:.1}ms] [VIEW-PUMP] tick pending_t={}", crate::pdf::timing_ms(), v.pending_tiles.len());
+                        }
+                        // 关键：`refresh_windows()` 无条件要求全部窗口重绘（不依赖实体是否被
+                        // 窗口 tracking，测试/真实 app 都可靠）。单用 `notify()` 在实体未被
+                        // `tracked_entities` 收录时是空操作 → “worker 渲完了但从未重绘”。
+                        // 16ms 泵节流，工作清空即停。
+                        cx.refresh_windows();
+                        v.pump_still_needed()
                     })
                     .unwrap_or(false);
                 if !still {
@@ -536,6 +580,29 @@ impl PdfViewer {
             let _ = this.update(cx, |v, _cx| v.tile_pump_running = false);
         })
         .detach();
+    }
+
+    /// 泵是否仍需运行：有在途瓦片/封面 → 重绘收图；已加载但滚动容器布局仍为零高
+    /// （首帧 layout 落后于 render）→ 重绘以拿到真实视口、否则瓦片永远调度不出来。
+    /// **额外关键分支：仍处快速模式（`prev_fast`）时持续出帧。** 速度 EMA 靠“帧”衰减，
+    /// 而帧由输入驱动——滚轮骤停时最后几帧速度还在快速阈值上（`fast=true` 且无在途 →
+    /// 泵自停 → 再没有帧 → `prev_fast` 卡死、`ensure_window` 不再跑 → 可见页停在低清占位，
+    /// 直到用户下一次输入才换挡补瓦片（实测日志：1.7 秒无 `[VIEW-TICK]`，正是“随机页先
+    /// 模糊、数秒后清晰”的根因）。本分支让泵一直驱动到退出快速态并完成清尾，无需输入。
+    fn pump_still_needed(&self) -> bool {
+        if self.prev_fast {
+            return true;
+        }
+        if !self.pending_tiles.is_empty() || !self.pending_cover.is_empty() {
+            return true;
+        }
+        if !self.loading && !self.dims.is_empty() && self.load_error.is_none() {
+            let viewport_h = f32::from(self.scroll.bounds().size.height);
+            if viewport_h <= 0.0 {
+                return true;
+            }
+        }
+        false
     }
 
     /// 常态瓦片调度：为可见页推算视口相交的瓦片网格区间，惰性作废旧密度瓦片，
@@ -554,8 +621,6 @@ impl PdfViewer {
         let tile_size = TILE_SIZE;
         let center = (start + end) / 2;
         let mut need: Vec<(usize, u32, u32, u64)> = Vec::new();
-        // 每页「还需要但缺失」的瓦片数（封面调度的依据：>0 → 首屏尚未铺满，先整页锐化）
-        let mut page_missing: HashMap<usize, u32> = HashMap::new();
 
         for page in start..=end {
             let dim = self.dims[page];
@@ -583,7 +648,6 @@ impl PdfViewer {
                 continue;
             };
             let mid_row = (r0 + r1) / 2;
-            let mut missing_here = 0u32;
             for row in r0..=r1 {
                 for col in c0..=c1 {
                     if self.slots[page].tiles.contains_key(&(row, col))
@@ -591,73 +655,95 @@ impl PdfViewer {
                     {
                         continue;
                     }
-                    missing_here += 1;
                     let d = (page as i64 - center as i64).unsigned_abs() as u64 * 1_000_000
                         + (row as i64 - mid_row as i64).unsigned_abs() as u64;
                     need.push((page, row, col, d));
                 }
             }
-            if missing_here > 0 {
-                page_missing.insert(page, missing_here);
+        }
+
+        // 瓦片（**先派**）：可见页瓦片先进 worker 队列 → 停稳瞬间可见条带每片 ~2-8ms
+        // 逐片出图、首片 ~5ms 就清晰。日志佐证：快速澄清的页没有 `[PAGE-RENDER] scale=2.47`
+        // 全页封面、纯靠瓦片填满；慢的页是「整页封面 20-40ms 堵在瓦片前面」才清晰。故把
+        // 封面调度排到瓦片之后：可见页的封面/下折叠与邻居预取仍会整页锐化，只是不再阻塞
+        // 首屏瓦片（封面候选集合、驻留与淘汰语义完全不变，风暴安全无回归）。
+        if need.is_empty() {
+            if timing_view() {
+                eprintln!("[{:.1}ms] [VIEW-SCHED] need empty pending_t={}", crate::pdf::timing_ms(), self.pending_tiles.len());
+            }
+        } else {
+            // 靠近视口的瓦片先渲染（正在看的那片先填）
+            need.sort_by_key(|&(_, _, _, d)| d);
+            let worker = self.worker.clone().unwrap();
+            let budget = TILE_INFLIGHT.saturating_sub(self.pending_tiles.len());
+            for (page, row, col, _) in need.into_iter().take(budget) {
+                let scale = render_scale(page_width, scale_factor, self.dims[page].0);
+                let rx = worker.request_tile(
+                    self.doc_id,
+                    TileRequest {
+                        page,
+                        scale,
+                        tile_size,
+                        row,
+                        col,
+                    },
+                );
+                self.pending_tiles.insert((page, row, col), (scale, rx));
             }
         }
 
-        // 封面：可见页在「廉价密度」下先整页一渲、立即铺满首屏（瓦片几十片串行渲染前的
-        // 瞬时清晰）。封面与瓦片同密度、完全对齐，只作底层、先行到达；瓦片补全后仍保留
-        // 到该页滚出可视窗（`evict_covers` 回收）——避免“每滚动 1px 就整页重渲封面”的抖动。
-        // 缩放过期在此丢弃；离开可视窗/超上限由 [`Self::evict_covers`] 处理。
-        let cover_worker = self.worker.clone().unwrap();
-        let mut cover_requested = false;
+        // 封面（**后派**）：**只服务真正可见页 + 上下各 1 邻居**。`start..end` 来自
+        // `keep_window`，含 MARGIN 调度缓冲页；若把这些也纳入封面候选，候选页数会超出
+        // 驻留上限 → 「收集→淘汰最远→下帧重请求」换页风暴（worker 被封面重渲占满）。
+        // 先量出真正可见页区间，再向外扩 1 页预取。
+        let mut vis_first: Option<usize> = None;
+        let mut vis_last: Option<usize> = None;
         for page in start..=end {
-            let scale = render_scale(page_width, scale_factor, self.dims[page].0);
+            if self
+                .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                .is_some()
+            {
+                vis_first.get_or_insert(page);
+                vis_last = Some(page);
+            }
+        }
+        let vis_first = vis_first.unwrap_or(start);
+        let vis_last = vis_last.unwrap_or(end);
+        let first = vis_first.saturating_sub(1);
+        let last = (vis_last + 1).min(self.dims.len().saturating_sub(1));
+        let cover_worker = self.worker.clone().unwrap();
+        // 封面按「离可视中心远近」派发：正在看的页封面先出队（预览/整页锐化优先级更高，
+        // 但已在瓦片之后，不再与首屏瓦片抢 worker）。
+        let center_vis = (vis_first + vis_last) / 2;
+        let mut cover_order: Vec<usize> = (first..=last).collect();
+        cover_order.sort_by_key(|&p| (p as i64 - center_vis as i64).unsigned_abs());
+        for page in cover_order {
             let dim = self.dims[page];
-            let missing = page_missing.get(&page).copied().unwrap_or(0);
+            let cscale = cover_scale(dim, page_width, scale_factor);
             // 缩放过期（缩放/DPI 已变）→ 丢弃旧封面
             if let Some(slot) = self.slots.get_mut(page) {
-                let stale = slot.cover.is_some() && (slot.cover_scale - scale).abs() > 1e-4;
+                let stale = slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
                 if stale {
                     if let Some(old) = slot.cover.take() {
                         self.pending_drops.push(old);
                     }
                 }
             }
-            // 需要（缺失瓦片 >0）且廉价且未加载/未在途 → 派发（先于瓦片入队，worker
-            // 同优先级 FIFO 先渲封面，首屏立即清晰）。
-            if missing > 0
-                && cover_affordable(dim, scale)
+            // 整页不超预算 且 无封面 且 未在途 → 派发
+            if cover_affordable(dim, cscale)
                 && self.slots[page].cover.is_none()
                 && !self.pending_cover.contains_key(&page)
-                && !cover_requested
                 && self.pending_cover.len() < COVER_INFLIGHT
             {
-                let rx = cover_worker.request_render(self.doc_id, RenderRequest { page, scale });
-                self.pending_cover.insert(page, (scale, rx));
-                cover_requested = true;
+                if timing_view() {
+                    eprintln!("[{:.1}ms] [VIEW-COVER-REQ] page={page}", crate::pdf::timing_ms());
+                }
+                let rx =
+                    cover_worker.request_render(self.doc_id, RenderRequest { page, scale: cscale });
+                self.pending_cover.insert(page, (cscale, rx));
             }
         }
-        self.evict_covers(start, end);
-
-        if need.is_empty() {
-            return;
-        }
-        // 靠近视口的瓦片先渲染（正在看的那片先填）
-        need.sort_by_key(|&(_, _, _, d)| d);
-        let worker = self.worker.clone().unwrap();
-        let budget = TILE_INFLIGHT.saturating_sub(self.pending_tiles.len());
-        for (page, row, col, _) in need.into_iter().take(budget) {
-            let scale = render_scale(page_width, scale_factor, self.dims[page].0);
-            let rx = worker.request_tile(
-                self.doc_id,
-                TileRequest {
-                    page,
-                    scale,
-                    tile_size,
-                    row,
-                    col,
-                },
-            );
-            self.pending_tiles.insert((page, row, col), (scale, rx));
-        }
+        self.evict_covers(first, last);
     }
 
     /// 页 `page` 在当前视口内**可见**的卡片局部矩形 `(x0, y0, x1, y1)`（CSS px），
@@ -692,7 +778,15 @@ impl PdfViewer {
 
     /// 快速拖动占位：为可见页派发 L0.5 中清（比缩略图清晰，可辨识标题/段落）、
     /// L0 缩略图（纯内存，无磁盘缓存）。停止后常态调度自动补齐瓦片、替换占位。
-    fn schedule_placeholders(&mut self, start: usize, end: usize, scale_factor: f32) {
+    fn schedule_placeholders(
+        &mut self,
+        window: &Window,
+        start: usize,
+        end: usize,
+        scroll_y: f32,
+        viewport_h: f32,
+        scale_factor: f32,
+    ) {
         let worker = self.worker.clone().unwrap();
         // 1) L0.5 中清：优先派发（比缩略图清晰），独立额度不挤占瓦片/缩略图
         if self.pending_mid.len() < MAX_MID_INFLIGHT {
@@ -731,6 +825,88 @@ impl PdfViewer {
                 let rx = worker.request_thumb(self.doc_id, page);
                 self.pending_thumb.insert(page, rx);
                 tb -= 1;
+            }
+        }
+        // 3) 减速期可见条带瓦片预热：仍 fast（迟滞未退出）但速度已降到「进入阈值」之下 →
+        //    用户即将停稳。此时把**真正可见页**缺失的瓦片提前派发（中心页优先、
+        //    TILE_INFLIGHT 封顶）：停稳换挡瞬间可见条带多半已被瓦片填满 → “停稳即清晰”
+        //    走快路径（小片 ~2-8ms 逐片出图）。
+        //    ⚠️ 封面是“慢路径”的修正依据：日志佐证 **[PAGE-RENDER] scale=2.47 整页封面
+        //    20-40ms 一张、窗内 2-3 张串行，且堵在瓦片前面**；而“停稳即清晰”的页都是纯瓦片
+        //    填满、没有整页封面。故这里不再派封面（原来预热的封面恰恰制造了“模糊→换挡→
+        //    重新清晰”的慢感）；封面改由停稳帧 `schedule_tiles` 在瓦片之后预取邻居/下折叠。
+        //    ⚠️ 可见区间必须与 `schedule_tiles` 同源（`page_visible_rect` 非空页），不能用
+        //    `keep_window` 的算术中心（含 MARGIN 缓冲页，会偏出真正可见页）。
+        //    风暴安全：速度 > MOVE_THRESHOLD_PX 的长距飞掠不派（避免小片洪流）；同一片
+        //    已在 slot / 在途则跳过；TILE_INFLIGHT 封顶。（本函数只在 `prev_fast` 分支被调用。）
+        if self.scroll_velocity < MOVE_THRESHOLD_PX {
+            let page_width = self.page_width();
+            let wrap_w = self.wrap_width(window, page_width);
+            let tile_size = TILE_SIZE;
+            let mut need: Vec<(usize, u32, u32, u64)> = Vec::new();
+            let mut vis_first: Option<usize> = None;
+            let mut vis_last: Option<usize> = None;
+            for page in start..=end {
+                if self
+                    .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                    .is_some()
+                {
+                    vis_first.get_or_insert(page);
+                    vis_last = Some(page);
+                }
+            }
+            if let (Some(vf), Some(vl)) = (vis_first, vis_last) {
+                let center_vis = (vf + vl) / 2;
+                for page in vf..=vl {
+                    let dim = self.dims[page];
+                    let scale = render_scale(page_width, scale_factor, dim.0);
+                    let bmp = page_bitmap_size(dim, scale);
+                    let disp_h = display_height(dim, page_width);
+                    let Some(rect) = self
+                        .page_visible_rect(page, scroll_y, viewport_h, page_width, wrap_w)
+                    else {
+                        continue;
+                    };
+                    let Some((r0, c0, r1, c1)) =
+                        visible_tile_range(bmp, page_width, disp_h, rect, tile_size, TILE_MARGIN)
+                    else {
+                        continue;
+                    };
+                    let mid_row = (r0 + r1) / 2;
+                    for row in r0..=r1 {
+                        for col in c0..=c1 {
+                            if self.slots[page].tiles.contains_key(&(row, col))
+                                || self.pending_tiles.contains_key(&(page, row, col))
+                            {
+                                continue;
+                            }
+                            let d = (page as i64 - center_vis as i64).unsigned_abs() as u64
+                                * 1_000_000
+                                + (row as i64 - mid_row as i64).unsigned_abs() as u64;
+                            need.push((page, row, col, d));
+                        }
+                    }
+                }
+                // 中心页/中心行优先，只补在途预算内
+                need.sort_by_key(|&(_, _, _, d)| d);
+                let budget = TILE_INFLIGHT.saturating_sub(self.pending_tiles.len());
+                for (page, row, col, _) in need.into_iter().take(budget) {
+                    if timing_view() {
+                        eprintln!("[{:.1}ms] [VIEW-TILE-REQ] warm p{page} r{row}c{col}", crate::pdf::timing_ms());
+                    }
+                    let scale = render_scale(page_width, scale_factor, self.dims[page].0);
+                    let rx = worker.request_tile(
+                        self.doc_id,
+                        TileRequest {
+                            page,
+                            scale,
+                            tile_size,
+                            row,
+                            col,
+                        },
+                    );
+                    self.pending_tiles.insert((page, row, col), (scale, rx));
+                }
             }
         }
     }
@@ -861,8 +1037,8 @@ impl PdfViewer {
             if page >= self.dims.len() {
                 continue;
             }
-            let scale = render_scale(self.page_width(), scale_factor, self.dims[page].0);
-            if (req_scale - scale).abs() > 1e-4 {
+            let cscale = cover_scale(self.dims[page], self.page_width(), scale_factor);
+            if (req_scale - cscale).abs() > 1e-4 {
                 continue; // 缩放/DPI 已变 → 过期封面丢弃
             }
             let (w, h) = (res.width, res.height);
@@ -873,7 +1049,7 @@ impl PdfViewer {
                 if let Some(old) = s.cover.replace(img) {
                     self.pending_drops.push(old);
                 }
-                s.cover_scale = scale;
+                s.cover_scale = cscale;
                 let _ = (w, h);
                 any = true;
             }
@@ -881,42 +1057,19 @@ impl PdfViewer {
         any
     }
 
-    /// 封面内存管理：封面只服务可见页 → 滚出可视窗即回收；另设防御性页数上限
-    /// [`COVER_CACHE_PAGES`]（丢离视口中心最远者），防极端滚动下载体残留累积。
-    fn evict_covers(&mut self, start: usize, end: usize) {
-        // 不在可视窗的封面直接回收（瓦片补齐后按需重建，但滚动中的页我们保留到离开）
+    /// 封面内存管理：**只保留当前想要的封面 `[wanted_first..=wanted_last]`（可见页 ±1
+    /// 邻居），窗外封面逐帧回收**。窗口内 ≤ 可见页+2 页，内存有界且**绝不触发换页风暴**：
+    /// 当前窗口的封面永不被淘汰 → 不会被反复重请求；窗外的旧封面（随滚动累积）下帧即清。
+    fn evict_covers(&mut self, wanted_first: usize, wanted_last: usize) {
+        let mut drops: Vec<Arc<RenderImage>> = Vec::new();
         for (page, slot) in self.slots.iter_mut().enumerate() {
-            if page < start || page > end {
+            if slot.cover.is_some() && (page < wanted_first || page > wanted_last) {
                 if let Some(old) = slot.cover.take() {
-                    self.pending_drops.push(old);
+                    drops.push(old);
                 }
             }
         }
-        // 防御性上限
-        let held: Vec<usize> = self
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.cover.is_some())
-            .map(|(i, _)| i)
-            .collect();
-        if held.len() <= COVER_CACHE_PAGES {
-            return;
-        }
-        let center = (start + end) / 2;
-        let excess = held.len().saturating_sub(COVER_CACHE_PAGES);
-        let mut far = held;
-        far.sort_by_key(|&p| {
-            let d = (p as i64 - center as i64).unsigned_abs();
-            (d, p)
-        });
-        for p in far.into_iter().take(excess) {
-            if let Some(slot) = self.slots.get_mut(p) {
-                if let Some(old) = slot.cover.take() {
-                    self.pending_drops.push(old);
-                }
-            }
-        }
+        self.pending_drops.extend(drops);
     }
 
     /// 回收已完成的在途 **L0 缩略图**结果：worker 回传低清 BGRA → 装入 `slot.thumb`
@@ -1538,8 +1691,11 @@ impl Render for PdfViewer {
                 let tile_ok = (slot.tile_scale - scale).abs() <= 1e-4;
                 let slot_thumb = slot.thumb.clone();
                 let slot_mid = slot.mid.clone();
-                // 首屏整页锐化封面（当前密度）；缩放过期时 schedule_tiles 已丢弃，顶层保险。
-                let slot_cover = if (slot.cover_scale - scale).abs() <= 1e-4 {
+                // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已丢弃，顶层保险）。
+                let slot_cover = if (slot.cover_scale - cover_scale(dim, page_width, scale_factor))
+                    .abs()
+                    <= 1e-4
+                {
                     slot.cover.clone()
                 } else {
                     None

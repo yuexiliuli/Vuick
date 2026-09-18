@@ -256,6 +256,14 @@ pub(crate) fn cover_affordable(page_pt: (f32, f32), scale: f32) -> bool {
     bytes <= crate::config::pdf::COVER_SIZE_BUDGET as f64
 }
 
+/// 封面渲染密度：**满显示密度**（`render_scale`，物理像素 1:1）——实测整页渲染
+/// ~10-50ms 且 Open 结构解析已近免费，首帧封面一渲即锐利、文字无需等瓦片精修；
+/// 仅对病理性超高倍率用 [COVER_SCALE_CAP]（4.0）护栏（更高密度由预算/瓦片兜底）。
+/// 1x / 2x-DPI 屏均得到与其屏幕密度完全一致的封面，缩放变化自会惰性重渲。
+pub(crate) fn cover_scale(page_pt: (f32, f32), page_width: f32, scale_factor: f32) -> f32 {
+    render_scale(page_width, scale_factor, page_pt.0).min(crate::config::pdf::COVER_SCALE_CAP)
+}
+
 /// 页内 PDF 点坐标 → 页卡**局部**显示 px（原点 = 卡片左上角，Y 轴已翻转为"向下为正"）。
 ///
 /// 关键点（文本层高亮与渲染字形严格对齐的基础）：

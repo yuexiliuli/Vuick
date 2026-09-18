@@ -434,79 +434,149 @@ impl PdfWorker {
         // **Render 永不排在 Text 之后**（滚动画帧的栅格化优先于懒加载的文本提取），
         // 其余消息（Open/Close/Text 之间）保持 FIFO。
         let mut queue: VecDeque<WorkerMsg> = VecDeque::new();
+        // 在途的全文档检索（分片续跑）：worker 无渲染/占位积压时每轮扫一片（几页/几 ms），
+        // 保证检索期间到达的 Render/RenderTile 可以插队先跑——否则一次全量扫描会冻结所有
+        // 瓦片/封面（87 页文本 PDF 实测检索 ~440ms，期间渲染被整段堵住 → 随机页先模糊）。
+        let mut pending_search: Option<PendingSearch> = None;
         loop {
-            if queue.is_empty() {
-                match rx.recv() {
-                    Ok(msg) => queue.push_back(msg),
-                    Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
-                }
-            }
             while let Ok(msg) = rx.try_recv() {
                 queue.push_back(msg);
             }
-            // 优先级：全尺寸 Render / RenderTile > Mid（中清）> Thumb（低清）> 其余
-            // （Open/Close/Text/Search FIFO）。瓦片与整页渲染同为视口内容，优先级并列。
-            let msg = queue
+            // 1) 渲染永远最优先：全尺寸 Render / RenderTile（瓦片与整页同为视口内容），
+            //    即使渲染消息排在检索/文本之后到，也会先从队列里抽出来执行。
+            if let Some(i) = queue
                 .iter()
                 .position(|m| matches!(m, WorkerMsg::Render(..) | WorkerMsg::RenderTile(..)))
-                .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Mid(..))))
-                .or_else(|| queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))))
-                .map(|i| queue.remove(i).expect("position 已命中"))
-                .unwrap_or_else(|| queue.pop_front().expect("queue 已保证非空"));
-            match msg {
-                WorkerMsg::Open(doc_id, bytes, tx) => {
-                    let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
-                        Ok(doc) => {
-                            let dims: Vec<(f32, f32)> = doc
-                                .pages()
-                                .iter()
-                                .map(|p| (p.width().value, p.height().value))
-                                .collect();
-                            let outlines = extract_outline(&doc);
-                            docs.insert(doc_id, doc);
-                            Ok((dims, outlines))
+            {
+                match queue.remove(i).expect("position 已命中") {
+                    WorkerMsg::Render(doc_id, req, tx) => {
+                        let result = docs.get(&doc_id).and_then(|doc| render_page(doc, req));
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::RenderTile(doc_id, req, tx) => {
+                        let result = docs.get(&doc_id).and_then(|doc| render_tile(doc, req));
+                        let _ = tx.send(result);
+                    }
+                    _ => unreachable!("只抽到 Render/RenderTile"),
+                }
+                continue;
+            }
+            // 2) LOD 占位：Mid（中清）> Thumb（缩略），低于渲染、高于其余。
+            if let Some(i) = queue.iter().position(|m| matches!(m, WorkerMsg::Mid(..))) {
+                match queue.remove(i).expect("已命中") {
+                    WorkerMsg::Mid(doc_id, page, sf, tx) => {
+                        let result = docs.get(&doc_id).and_then(|doc| render_mid(doc, page, sf));
+                        let _ = tx.send(result);
+                    }
+                    _ => unreachable!("只抽到 Mid"),
+                }
+                continue;
+            }
+            if let Some(i) = queue.iter().position(|m| matches!(m, WorkerMsg::Thumb(..))) {
+                match queue.remove(i).expect("已命中") {
+                    WorkerMsg::Thumb(doc_id, page, tx) => {
+                        let result = docs.get(&doc_id).and_then(|doc| render_thumb(doc, page));
+                        let _ = tx.send(result);
+                    }
+                    _ => unreachable!("只抽到 Thumb"),
+                }
+                continue;
+            }
+            // 3) 其余 FIFO：Open / Close / Text / Search。Search 只登记成分片状态、不在此阻塞。
+            if let Some(msg) = queue.pop_front() {
+                match msg {
+                    WorkerMsg::Open(doc_id, bytes, tx) => {
+                        let t0 = std::time::Instant::now();
+                        let result = match pdfium.load_pdf_from_byte_vec(bytes, None) {
+                            Ok(doc) => {
+                                let t1 = std::time::Instant::now();
+                                // 优先用 FPDF_GetPageSizeByIndexF（页树 MediaBox，**不加载页对象**，
+                                // 免去逐页 Resources/字体解析，实测 87 页 284ms → ~5ms）；个别 PDF
+                                // 该 API 失败时回退逐页加载量尺寸。
+                                let dims: Vec<(f32, f32)> = match doc.pages().page_sizes() {
+                                    Ok(sizes) => sizes
+                                        .into_iter()
+                                        .map(|r| (r.width().value, r.height().value))
+                                        .collect(),
+                                    Err(_) => doc
+                                        .pages()
+                                        .iter()
+                                        .map(|p| (p.width().value, p.height().value))
+                                        .collect(),
+                                };
+                                let t2 = std::time::Instant::now();
+                                let outlines = extract_outline(&doc);
+                                let t3 = std::time::Instant::now();
+                                if timing() {
+                                    eprintln!(
+                                        "[{:.1}ms] [OPEN-STRUCT] load={:.1}ms dims({})={:.1}ms outline={:.1}ms total={:.1}ms",
+                                        crate::pdf::timing_ms(),
+                                        t1.duration_since(t0).as_secs_f64() * 1e3,
+                                        dims.len(),
+                                        t2.duration_since(t1).as_secs_f64() * 1e3,
+                                        t3.duration_since(t2).as_secs_f64() * 1e3,
+                                        t3.duration_since(t0).as_secs_f64() * 1e3,
+                                    );
+                                }
+                                docs.insert(doc_id, doc);
+                                Ok((dims, outlines))
+                            }
+                            Err(e) => Err(anyhow::anyhow!("PDF 解析失败：{e}")),
+                        };
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::Close(doc_id) => {
+                        docs.remove(&doc_id);
+                    }
+                    WorkerMsg::Text(doc_id, page, tx) => {
+                        let result = docs
+                            .get(&doc_id)
+                            .and_then(|doc| extract_page_text(doc, page));
+                        let _ = tx.send(result);
+                    }
+                    WorkerMsg::Search(doc_id, needle, tx) => {
+                        if needle.is_empty() {
+                            let _ = tx.send(Some(PdfSearchResults {
+                                hits: Vec::new(),
+                                truncated: false,
+                            }));
+                        } else if let Some(doc) = docs.get(&doc_id) {
+                            // 只登记成分片状态：后续每轮在「步骤 4」分片执行，不整段占用 worker
+                            pending_search = Some(PendingSearch {
+                                doc_id,
+                                needle: needle.chars().collect(),
+                                next_page: 0,
+                                page_count: doc.pages().len().max(0) as usize,
+                                hits: Vec::new(),
+                                truncated: false,
+                                tx,
+                            });
+                        } else {
+                            let _ = tx.send(None);
                         }
-                        Err(e) => Err(anyhow::anyhow!("PDF 解析失败：{e}")),
-                    };
-                    let _ = tx.send(result);
+                    }
+                    _ => unreachable!("Render/RenderTile/Mid/Thumb 已在上方抽走"),
                 }
-                WorkerMsg::Render(doc_id, req, tx) => {
-                    let result = docs
-                        .get(&doc_id)
-                        .and_then(|doc| render_page(doc, req));
-                    let _ = tx.send(result);
+                continue;
+            }
+            // 4) 无渲染/占位/其他积压时，跑一片在途检索再回主循环（新渲染消息可插队）。
+            //    每片至多数页/数 ms，因此检索期间的前台渲染冻结有上界，不再拖到全文扫完。
+            if let Some(mut ps) = pending_search.take() {
+                search_slice(&mut docs, &mut ps);
+                if ps.is_done() {
+                    let _ = ps.tx.send(Some(PdfSearchResults {
+                        hits: ps.hits,
+                        truncated: ps.truncated,
+                    }));
+                } else {
+                    pending_search = Some(ps);
                 }
-                WorkerMsg::RenderTile(doc_id, req, tx) => {
-                    let result = docs
-                        .get(&doc_id)
-                        .and_then(|doc| render_tile(doc, req));
-                    let _ = tx.send(result);
-                }
-                WorkerMsg::Mid(doc_id, page, scale_factor, tx) => {
-                    let result = docs
-                        .get(&doc_id)
-                        .and_then(|doc| render_mid(doc, page, scale_factor));
-                    let _ = tx.send(result);
-                }
-                WorkerMsg::Thumb(doc_id, page, tx) => {
-                    let result = docs
-                        .get(&doc_id)
-                        .and_then(|doc| render_thumb(doc, page));
-                    let _ = tx.send(result);
-                }
-                WorkerMsg::Close(doc_id) => {
-                    docs.remove(&doc_id);
-                }
-                WorkerMsg::Text(doc_id, page, tx) => {
-                    let result = docs
-                        .get(&doc_id)
-                        .and_then(|doc| extract_page_text(doc, page));
-                    let _ = tx.send(result);
-                }
-                WorkerMsg::Search(doc_id, needle, tx) => {
-                    let result = docs.get(&doc_id).and_then(|doc| search_document(doc, &needle));
-                    let _ = tx.send(result);
-                }
+                continue;
+            }
+            // 5) 真空闲：阻塞等新消息（只有在既无排队消息也无在途检索时才会真阻塞）。
+            match rx.recv() {
+                Ok(msg) => queue.push_back(msg),
+                Err(_) => break, // 所有发送端已关闭（全部阅读器已释放）
             }
         }
     }
@@ -557,16 +627,37 @@ fn extract_outline(doc: &PdfDocument<'_>) -> Vec<PdfOutlineEntry> {
 /// `w*4`——见 `PdfBitmap::preferred_stride_bytes` 对 4 通道格式从不补对齐），
 /// 直接 `as_raw_bytes()` 拷出即可，**零像素循环、零字节重排**。旧的
 /// `as_image()` → `into_rgba8()` 会对每像素做 BGRA→RGBA 再一次 RGBA→BGRA 的浪费。
+/// 是否开启 worker 渲染计时日志（`GPUI_EDITOR_PDF_TIMING=1`）：打印每次瓦片/整页渲染的
+/// get_page 与 pdfium 光栅化耗时，便于在真实慢 PDF 上定位瓶颈（worker 侧）。
+fn timing() -> bool {
+    static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EN.get_or_init(|| {
+        std::env::var_os("GPUI_EDITOR_PDF_TIMING").map_or(false, |v| v == "1" || v == "true")
+    })
+}
+
 fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
     let (pw, ph) = (page.width().value as f32, page.height().value as f32);
     let w = (pw * req.scale).ceil().max(1.0) as i32;
     let h = (ph * req.scale).ceil().max(1.0) as i32;
+    let t1 = std::time::Instant::now();
     let bmp = page.render(w, h, None).ok()?;
     // pdfium-render 的 `PdfBitmap::render()` 用 `PdfBitmapFormat::default()`（= BGRA）建位图，
     // BGRA 的 stride 恒为 `width*4`（无对齐填充，见 preferred_stride_bytes）。
     // `as_raw_bytes()` 直接返回整块原生 BGRA 缓冲 → 主线程 `Frame::from_raw` 直接包裹。
     let bgra = bmp.as_raw_bytes();
+    if timing() {
+        eprintln!(
+            "[{:.1}ms] [PAGE-RENDER] p{} scale={:.2} render={:.3}ms -> {}x{}",
+            crate::pdf::timing_ms(),
+            req.page,
+            req.scale,
+            t1.elapsed().as_secs_f64() * 1e3,
+            w,
+            h,
+        );
+    }
     Some(RenderResult {
         bgra,
         width: w as u32,
@@ -584,12 +675,15 @@ fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult
 /// 内存：每片恒 ≈ TILE_SIZE² × 4，**与缩放倍数无关**；同一页切成 视口可见 的几片，
 /// 不再存在"4× 缩放一页 = 64MB 整页位图"的内存/density 上限墙。
 fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
+    let t0 = std::time::Instant::now();
     let page = doc.pages().get(req.page as i32).ok()?;
+    let t_get = std::time::Instant::now();
     let (pw, ph) = (page.width().value as f32, page.height().value as f32);
     let bmp = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
     let (x0, y0, w, h) =
         crate::pdf::layout::tile_rect(req.col, req.row, req.tile_size, crate::config::pdf::TILE_BLEED, bmp)?;
     let mut dst = PdfBitmap::empty(w as i32, h as i32, PdfBitmapFormat::BGRA).ok()?;
+    let t1 = std::time::Instant::now();
     page.render_into_bitmap_with_config(
         &mut dst,
         &PdfRenderConfig::new()
@@ -597,7 +691,7 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
             .set_origin(-(x0 as i32), -(y0 as i32)),
     )
     .ok()?;
-    Some(TileResult {
+    let res = TileResult {
         page: req.page,
         row: req.row,
         col: req.col,
@@ -608,7 +702,21 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
         full_w: bmp.0,
         full_h: bmp.1,
         bgra: dst.as_raw_bytes(),
-    })
+    };
+    if timing() {
+        let end = std::time::Instant::now();
+        eprintln!(
+            "[{:.1}ms] [TILE-RENDER] p{} r{}c{} scale={:.2} get_page={:.3}ms render={:.3}ms",
+            crate::pdf::timing_ms(),
+            req.page,
+            req.row,
+            req.col,
+            req.scale,
+            t_get.duration_since(t0).as_secs_f64() * 1e3,
+            end.duration_since(t1).as_secs_f64() * 1e3,
+        );
+    }
+    Some(res)
 }
 
 /// 在工作线程内：栅格化某页的 **L0 缩略图**（低分辨率，用于拖动期间占位 / 回翻即时内容）。
@@ -781,35 +889,82 @@ pub(crate) fn search_page_text(text: &PageText, needle: &[char]) -> Vec<(usize, 
     out
 }
 
-/// 在工作线程内：全页扫描子串检索（每页经 [`extract_page_text`] 重建文本层）。
-/// 命中按页升序；达到 [`SEARCH_MAX_HITS`] 截断并置 `truncated`。文档/页不存在 → None。
-fn search_document(doc: &PdfDocument<'_>, needle: &str) -> Option<PdfSearchResults> {
-    if needle.is_empty() {
-        return Some(PdfSearchResults { hits: Vec::new(), truncated: false });
+/// 全文档检索分片参数：worker 侧每次续跑最多扫 [`SEARCH_SLICE_PAGES`] 页、且耗时不超过
+/// [`SEARCH_SLICE_TIMEOUT`]，就回主循环 → 让排队的 Render/RenderTile 插队执行。没有它，
+/// 一次全文档同步扫描会在检索期间冻结所有瓦片/封面（87 页文本 PDF 实测检索 ~440ms，
+/// 期间到达的渲染被堵到检索扫完全文——正是“随机页先模糊、数秒后清晰”的根因）。
+const SEARCH_SLICE_PAGES: usize = 4;
+const SEARCH_SLICE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(6);
+
+/// worker 内的一次在途全文档检索（分片续跑）：由 `WorkerMsg::Search` 建立，主循环在
+/// 无渲染/占位积压时每轮到 [`search_slice`] 扫一片；文档中途被 Close → 直接取已扫到的
+/// 部分结果收尾，绝不长期独占工作线程。
+struct PendingSearch {
+    doc_id: DocId,
+    needle: Vec<char>,
+    next_page: usize,
+    page_count: usize,
+    hits: Vec<PdfSearchHit>,
+    truncated: bool,
+    tx: mpsc::Sender<Option<PdfSearchResults>>,
+}
+
+impl PendingSearch {
+    /// 是否已扫完（下一页越界）或命中数已到上限（截断）。
+    fn is_done(&self) -> bool {
+        self.truncated || self.next_page >= self.page_count
     }
-    let needle_chars: Vec<char> = needle.chars().collect();
-    let mut hits = Vec::new();
-    let mut truncated = false;
-    let page_count = doc.pages().len().max(0) as usize;
-    for page_ix in 0..page_count {
-        let Some(text) = extract_page_text(doc, page_ix) else {
-            continue;
-        };
-        for (s, e) in search_page_text(&text, &needle_chars) {
-            let snippet = crate::pdf::layout::search_snippet(&text, s, e, SEARCH_SNIPPET_CTX);
-            hits.push(PdfSearchHit {
-                page: page_ix,
-                start: s,
-                end: e,
-                snippet,
-            });
-            if hits.len() >= SEARCH_MAX_HITS {
-                truncated = true;
-                return Some(PdfSearchResults { hits, truncated });
+}
+
+/// 单页检索：把该页命中合并进 `hits`；已达上限置 `truncated` 并停止追加。页无效/无文本 → 无命中。
+fn search_one_page_into(
+    doc: &PdfDocument<'_>,
+    page_ix: usize,
+    needle: &[char],
+    hits: &mut Vec<PdfSearchHit>,
+    truncated: &mut bool,
+) {
+    if *truncated {
+        return;
+    }
+    let Some(text) = extract_page_text(doc, page_ix) else {
+        return;
+    };
+    for (s, e) in search_page_text(&text, needle) {
+        let snippet = crate::pdf::layout::search_snippet(&text, s, e, SEARCH_SNIPPET_CTX);
+        hits.push(PdfSearchHit {
+            page: page_ix,
+            start: s,
+            end: e,
+            snippet,
+        });
+        if hits.len() >= SEARCH_MAX_HITS {
+            *truncated = true;
+            return;
+        }
+    }
+}
+
+/// 主循环调用的“一片检索”：最多扫 [`SEARCH_SLICE_PAGES`] 页、耗时不超过
+/// [`SEARCH_SLICE_TIMEOUT`]，随后返回让其它消息处理。文档被 Close → 置为结束。
+fn search_slice(docs: &mut HashMap<DocId, PdfDocument<'_>>, ps: &mut PendingSearch) {
+    let start = std::time::Instant::now();
+    for _ in 0..SEARCH_SLICE_PAGES {
+        if ps.is_done() || start.elapsed() > SEARCH_SLICE_TIMEOUT {
+            return;
+        }
+        match docs.get(&ps.doc_id) {
+            Some(doc) => {
+                search_one_page_into(doc, ps.next_page, &ps.needle, &mut ps.hits, &mut ps.truncated);
+                ps.next_page += 1;
+            }
+            None => {
+                // 文档已被 Close：收尾（返回已扫到的部分结果）
+                ps.page_count = ps.next_page;
+                return;
             }
         }
     }
-    Some(PdfSearchResults { hits, truncated })
 }
 
 #[cfg(test)]
