@@ -473,3 +473,26 @@ fn doc_model_agrees_with_preview_and_ir() {
     let missing: Vec<usize> = (0..n_lines).filter(|i| !covered.contains(i)).collect();
     assert!(missing.is_empty(), "Doc 未覆盖行: {missing:?}");
 }
+
+/// 底座双源路径一致：Rope（大文档 COW 路径）窗口行 == Str（小文档路径）逐块相同。
+/// 这是「preview 用 Rope 免整份拷贝、live 将来同路径」的性能底座正确性护栏。
+#[test]
+fn doc_rope_path_matches_str_path() {
+    let src = "# 标题\n正文 **加粗** `代码`\n\n- 列表\n  - 嵌套\n1) 数字\n> 引述\n---\n```rust\nlet a = 1;\n```\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n![图](a.png)\n";
+    let n_lines = src.split('\n').count();
+
+    let str_doc = super::doc::Doc::open(SharedString::from(src));
+    let rope = gpui_component::input::Rope::from(src);
+    let rope_doc = super::doc::Doc::open_rope(rope);
+
+    assert_eq!(str_doc.block_count(), rope_doc.block_count(), "两源块数应一致");
+    let sc = str_doc.rows_in_line_window(0, n_lines);
+    let rc = rope_doc.rows_in_line_window(0, n_lines);
+    assert_eq!(sc.len(), rc.len(), "两源窗口行数一致");
+    for (a, b) in sc.iter().zip(rc.iter()) {
+        assert_eq!(a.kind, b.kind);
+        assert_eq!(a.src_line, b.src_line);
+        assert_eq!(a.text, b.text, "src_line {} 文本不一致（Rope vs Str）", a.src_line);
+        assert_eq!(a.lines, b.lines);
+    }
+}

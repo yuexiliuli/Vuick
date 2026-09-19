@@ -3,20 +3,24 @@
 //! 目标（用户路线）：以本项目的 Markdown 预览底座（行级虚拟化、窗口化块索引、恒定内存）
 //! 为基干，抽象出一个 preview 与 live（WYSIWYG）都从其上衍生的统一文档层：
 //! - **语义** = [`ir::IrKind`]（`markdown::ir`，金标准）；
-//! - **结构索引** = [`parser::BlockIndex`]（`scan_blocks` / 增量 rope，O(1) 打开、窗口物化）；
-//! - **行物化** = [`parser::parse_block_window`]（与预览**同一份** 文本/行内段，保证两分支渲染一致）。
+//! - **结构索引** = [`parser::BlockIndex`]（`scan_blocks`/`scan_blocks_rope`，
+//!   O(1) 打开、窗口物化，与预览同一增量机制）；
+//! - **行物化** = [`parser::parse_block_window`(_rope)]（与预览**同一份**
+//!   文本/行内段，保证两分支渲染一致）。
 //!
 //! [`DocRow`] 是两分支的**统一行**：合并「IR 语义 + 预览文本 + 行号 + 行区间」。
-//! 后续阶段叠加编辑映射（渲染字节↔源字节）并让 preview/live 迁移到本层消费
-//! （见会话交接：Phase 2 迁移 preview，Phase 3 迁移 live 编辑态）。
-//! 一致性由 `markdown::parity::doc_model_agrees_with_preview_and_ir` 钉死。
+//! 源支持 `Str`（小文档/测试）与 `Rope`（大文档，与编辑器 COW 共享底层，窗口化
+//! 物化不整份持有——预览的性能底座）。后续阶段叠加编辑映射并让 preview/live
+//! 迁移到本层消费；一致性由 `markdown::parity` 钉死。
 
 use std::ops::Range;
 
 use gpui::SharedString;
+use gpui_component::input::Rope;
 
 use super::ir::{build_ir, IrBlock, IrKind};
-use super::parser::{parse_block_window, scan_blocks, BlockIndex, Row, RowKind, RunKind};
+use super::parser::{parse_block_window, parse_block_window_rope, Row, RowKind, RunKind};
+use super::parser;
 
 /// 统一渲染行（块粒度：Code/Table 等一个块 = 一个 DocRow，跨多行）。
 #[derive(Debug, Clone, PartialEq)]
@@ -33,28 +37,40 @@ pub(crate) struct DocRow {
     pub(crate) runs: Vec<(Range<usize>, RunKind)>,
 }
 
-/// 共享文档：IR（语义） + BlockIndex（结构索引） + 打开时的源码。
+/// 文档源：`Str`（小文档）或 `Rope`（大文档，COW，与编辑器共享底层树）。
+enum DocSrc {
+    Str(SharedString),
+    Rope(Rope),
+}
+
+/// 共享文档：IR（语义） + BlockIndex（结构索引） + 源（窗口化物化）。
 pub(crate) struct Doc {
-    src: SharedString,
-    index: BlockIndex,
+    src: DocSrc,
+    index: parser::BlockIndex,
     ir: Vec<IrBlock>,
 }
 
 impl Doc {
-    /// 打开一份 Markdown 源码：一次建 IR + 结构索引（O(n)，毫秒级；编辑后走
-    /// 增量索引重建，替换文本只重建受影响段——与预览同一套增量机制）。
+    /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
-        let index = scan_blocks(src.as_ref());
+        let index = parser::scan_blocks(src.as_ref());
         let ir = build_ir(src.as_ref());
-        Self { src, index, ir }
+        Self { src: DocSrc::Str(src), index, ir }
     }
 
-    /// 更新内容（编辑后调用）。当前先全量重建；后续可改用
-    /// `scan_blocks_incremental_rope` 做增量（与预览一致）。
+    /// 打开大文档（`Rope` 源，COW）：块索引与 IR 各物化一次（O(n)，毫秒级），
+    /// 但是**窗口化物化行**走 rope 切片，不整份持有字符串——与预览一致。
+    pub(crate) fn open_rope(rope: Rope) -> Self {
+        let index = parser::scan_blocks_rope(&rope);
+        let ir = build_ir(&rope.to_string());
+        Self { src: DocSrc::Rope(rope), index, ir }
+    }
+
+    /// 更新内容（编辑后调用）。全量重建索引/IR；后续可改用增量（与预览一致）。
     pub(crate) fn set_source(&mut self, src: SharedString) {
-        self.index = scan_blocks(src.as_ref());
+        self.index = parser::scan_blocks(src.as_ref());
         self.ir = build_ir(src.as_ref());
-        self.src = src;
+        self.src = DocSrc::Str(src);
     }
 
     /// 块总数（虚拟化滚动条量程用，O(1)）。
@@ -64,10 +80,11 @@ impl Doc {
 
     /// 按块窗口物化统一行（`[lo_block, hi_block]`，含两端）。
     pub(crate) fn rows_in_block_window(&self, lo: usize, hi: usize) -> Vec<DocRow> {
-        parse_block_window(self.src.as_ref(), &self.index, lo, hi)
-            .into_iter()
-            .map(|r| self.assemble(r))
-            .collect()
+        let rows = match &self.src {
+            DocSrc::Str(s) => parse_block_window(s.as_ref(), &self.index, lo, hi),
+            DocSrc::Rope(r) => parse_block_window_rope(r, &self.index, lo, hi),
+        };
+        rows.into_iter().map(|r| self.assemble(r)).collect()
     }
 
     /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。
@@ -76,7 +93,6 @@ impl Doc {
         if b.is_empty() {
             return Vec::new();
         }
-        // [lo_line, hi_line) → 覆盖这些行的块下标范围（二分，O(log n)）。
         let lo = b
             .partition_point(|m| m.src_line < lo_line as u32)
             .saturating_sub(1)
@@ -88,10 +104,7 @@ impl Doc {
 
     /// 把预览侧一个块行装成统一行：kind/行区间取自 IR（金标准），文本取自预览。
     fn assemble(&self, r: Row) -> DocRow {
-        let block = self
-            .ir
-            .iter()
-            .find(|b| b.lines.start == r.src_line);
+        let block = self.ir.iter().find(|b| b.lines.start == r.src_line);
         let kind = block.map_or_else(|| row_kind(r.kind), |b| b.kind);
         let lines = block.map(|b| b.lines.clone()).unwrap_or(r.src_line..r.src_line + 1);
         DocRow {
