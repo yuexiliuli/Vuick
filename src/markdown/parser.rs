@@ -16,6 +16,7 @@ use gpui_component::input::Rope;
 use regex::Regex;
 
 use super::cells;
+use super::image;
 
 /// 渲染行类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -641,32 +642,20 @@ fn inline_strip(s: &str) -> SharedString {
 }
 
 /// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
+/// 前缀识别复用共享核心 `image::parse_ref`（与 live 同一字节逻辑，见 parity），
+/// 这里叠加「整行」策略：`]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
 fn parse_image_line(t: &str) -> Option<(String, String)> {
-    if !t.starts_with("![") || t.find("](").is_none() {
+    let r = image::parse_ref(t)?;
+    // 历史语义：alt 由「第一个 `]`」界定且必须紧跟 `(`。`parse_ref` 取的是第一处
+    // `](`；仅当 `]` 出现在 `](` 之前时二者不同（如 `![a]b](c)`）→ 既有实现返回 None。
+    let close_pos = 2 + r.close_alt_rel; // `](` 的 `]` 在 `t` 中的字节偏移
+    if t.as_bytes()[..close_pos].contains(&b']') {
         return None;
     }
-    // 剥掉首尾空白后必须整体匹配 `![...](...)`
-    let s = t.trim();
-    let end = s.find(']')?;
-    if !s.starts_with("![") || end < 2 {
+    if !r.tail.trim().is_empty() {
         return None;
     }
-    let alt = &s[2..end];
-    let rest = s[end + 1..].trim_start();
-    if !rest.starts_with('(') {
-        return None;
-    }
-    let close = rest.find(')')?;
-    // 允许 `)` 前的路径内含空格；闭合后不应再有非空内容（允许尾部空白，已被 trim）
-    let src = rest[1..close].trim();
-    let tail = &rest[close + 1..];
-    if src.is_empty() || (tail.trim() != s && tail.trim() != "") {
-        // 非纯整行图片（后面还有文字）→ 不作为独立图片行
-        if !tail.trim().is_empty() {
-            return None;
-        }
-    }
-    Some((alt.to_string(), src.to_string()))
+    Some((r.alt.to_string(), r.src.to_string()))
 }
 
 /// 把 Markdown 源码解析成渲染行（每行一行，含行内清理）。

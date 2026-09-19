@@ -1603,14 +1603,11 @@ pub(crate) fn toggle_task_checkbox(line: &str) -> Option<String> {
 /// `{width=N}` / `{width=Npx}` attribute, with only whitespace around it —
 /// return `(src, explicit_width)`. The editor renders such a line as the image
 /// (W4) when the caret is elsewhere; a line with any other trailing text stays
-/// plain source.
+/// plain source. Prefix recognition is shared with the preview parser
+/// (`crate::markdown::image::parse_ref`, parity-pinned).
 pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
-    let rest = line.trim().strip_prefix("![")?;
-    let close_alt = rest.find("](")?;
-    let after_alt = &rest[close_alt + 2..];
-    let close_src = after_alt.find(')')?;
-    let src = after_alt[..close_src].trim();
-    let tail = after_alt[close_src + 1..].trim();
+    let r = crate::markdown::image::parse_ref(line.trim())?;
+    let tail = r.tail.trim();
     let width = if tail.is_empty() {
         None
     } else {
@@ -1623,7 +1620,7 @@ pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
                 .ok()?,
         )
     };
-    (!src.is_empty()).then_some((src, width))
+    Some((r.src, width))
 }
 
 /// Like [`image_line`], but also matches an image that is the sole body of a

@@ -14,6 +14,8 @@ mod parser;
 pub(crate) mod view;
 
 mod cells;
+mod image;
+mod ir;
 
 #[cfg(test)]
 mod parity;

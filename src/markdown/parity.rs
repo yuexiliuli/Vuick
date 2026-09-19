@@ -12,10 +12,11 @@
 
 #![cfg(test)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gpui::SharedString;
 
+use super::ir;
 use super::live::markdown_syntax::{
     alert_kind, blockquote_prefix, heading_level, image_row, is_table_row, list_prefix,
     math_regions, table_cells, table_regions, task_prefix, thematic_break,
@@ -215,4 +216,174 @@ fn known_differences_are_documented() {
     let w = "![a](x.png){width=50}";
     assert!(image_row(w).is_some());
     assert_ne!(parse_to_rows(w)[0].kind, RowKind::Image);
+
+    // 10) 缩进标题 `  # x`：预览先 trim_start → Heading；live `heading_level` 要求
+    //     `#` 在字节 0 → 段落（除非跟在列表标记后）。
+    assert_eq!(parse_to_rows("  # x\n")[0].kind, RowKind::Heading(1));
+    assert_eq!(heading_level("  # x"), None);
+}
+
+#[test]
+fn image_construct_edges_are_documented() {
+    // `![a]b](c)`：预览 alt 由「第一个 `]`」界定且必须紧跟 `(` → 整行不算图片；
+    // live 取「第一处 `](`」→ 识别成功（src="c"）。
+    let weird = "![a]b](c)";
+    assert_eq!(parse_to_rows(weird)[0].kind, RowKind::Paragraph);
+    assert!(image_row(weird).is_some());
+
+    // `![alt] (src)`：`]` 与 `(` 之间有空格 → 两边都不识别为图片。
+    let spaced = "![a] (b)";
+    assert_ne!(parse_to_rows(spaced)[0].kind, RowKind::Image);
+    assert!(image_row(spaced).is_none());
+
+    // 列表项图片 `- ![x](y)`：live `image_row` 识别（列表标记 + 图片）；预览列表
+    // 分支先命中 → Bullet，不是 Image。
+    let li_img = "- ![x](y)";
+    assert_eq!(parse_to_rows(li_img)[0].kind, RowKind::Bullet);
+    assert!(image_row(li_img).is_some());
+}
+
+/// 逐行「粗粒度 kind」，供整文档一致性对照（对齐子集语料）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    Paragraph,
+    Heading(u8),
+    Bullet,
+    Quote,
+    Rule,
+    Image,
+    Blank,
+    Code,
+    Table,
+}
+
+impl Tag {
+    fn from_row(kind: RowKind) -> Option<Tag> {
+        Some(match kind {
+            RowKind::Paragraph => Tag::Paragraph,
+            RowKind::Heading(n) => Tag::Heading(n),
+            RowKind::Bullet => Tag::Bullet,
+            RowKind::Quote => Tag::Quote,
+            RowKind::Rule => Tag::Rule,
+            RowKind::Image => Tag::Image,
+            RowKind::Blank => Tag::Blank,
+            RowKind::Code | RowKind::Table => return None, // 多行块，按 span 展开
+        })
+    }
+}
+
+/// 预览侧每行 kind（多行块 Code/Table 按 live 区域展开成逐行）。
+fn preview_line_tags(src: &str) -> Vec<Tag> {
+    let n = src.split('\n').count();
+    let mut tags = vec![Tag::Paragraph; n];
+    let regions = table_regions(src);
+    for r in parse_to_rows(src) {
+        let span: std::ops::Range<usize> = match r.kind {
+            RowKind::Table => regions
+                .iter()
+                .find(|rg| rg.lines.start == r.src_line)
+                .map(|rg| rg.lines.clone())
+                .unwrap_or(r.src_line..n),
+            RowKind::Code => {
+                let lines: Vec<&str> = src.split('\n').collect();
+                let mut end = r.src_line + 1;
+                while end < lines.len() && !lines[end].trim_start().starts_with("```") {
+                    end += 1;
+                }
+                let end = if end < lines.len() { end + 1 } else { n };
+                r.src_line..end
+            }
+            _ => r.src_line..r.src_line + 1,
+        };
+        let tag = match r.kind {
+            RowKind::Code => Tag::Code,
+            RowKind::Table => Tag::Table,
+            _ => Tag::from_row(r.kind).expect("单行块必有 kind"),
+        };
+        for i in span {
+            tags[i] = tag;
+        }
+    }
+    tags
+}
+
+/// live 侧每行 kind。
+fn live_line_tags(src: &str) -> Vec<Tag> {
+    let lines: Vec<&str> = src.split('\n').collect();
+    let fence = live_fence_odd(src);
+    let table_lines: HashSet<usize> =
+        table_regions(src).into_iter().flat_map(|rg| rg.lines).collect();
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            if table_lines.contains(&i) {
+                return Tag::Table;
+            }
+            if fence.get(i).copied().unwrap_or(false) || l.trim_start().starts_with("```") {
+                return Tag::Code;
+            }
+            if let Some(h) = heading_level(l) {
+                return Tag::Heading(h);
+            }
+            if blockquote_prefix(l).is_some() {
+                return Tag::Quote;
+            }
+            if list_prefix(l).is_some() {
+                return Tag::Bullet;
+            }
+            if thematic_break(l) {
+                return Tag::Rule;
+            }
+            if image_row(l).is_some() {
+                return Tag::Image;
+            }
+            if l.trim().is_empty() {
+                return Tag::Blank;
+            }
+            Tag::Paragraph
+        })
+        .collect()
+}
+
+/// IR 侧每行 kind。
+fn ir_line_tags(src: &str) -> Vec<Tag> {
+    let n = src.split('\n').count();
+    let mut tags = vec![Tag::Paragraph; n];
+    for b in ir::build_ir(src) {
+        let tag = match b.kind {
+            ir::IrKind::Paragraph => Tag::Paragraph,
+            ir::IrKind::Heading(h) => Tag::Heading(h),
+            ir::IrKind::Bullet => Tag::Bullet,
+            ir::IrKind::Quote => Tag::Quote,
+            ir::IrKind::Rule => Tag::Rule,
+            ir::IrKind::Image => Tag::Image,
+            ir::IrKind::Blank => Tag::Blank,
+            ir::IrKind::Code => Tag::Code,
+            ir::IrKind::Table => Tag::Table,
+        };
+        for i in b.lines.clone() {
+            if i < n {
+                tags[i] = tag;
+            }
+        }
+    }
+    tags
+}
+
+/// 对齐子集语料上的「预览 == live == IR」三向逐行一致。
+#[test]
+fn per_line_kinds_agree_across_rich_docs() {
+    let docs = [
+        "下\n\n# 标题\n一些正文\n- 列表\n  - 嵌套\n1. 有序\n- [ ] 待办\n> 引述\n---\n\n```rust\nlet a = 1;\n```\n\n| 列A | 列B |\n| :- | -: |\n| 1 | 2 |\n\n![图](a.png)\n*斜体* 与 `代码`\nשלום עולם\n> 引述2\n- 收尾\n",
+        "# 章节\n\n段落一 内容\n段落二 **加粗** 与 文本\n\n## 小节\n- [x] 已完成\n- [ ] 待办\n  继续\n1) 数字\n\n> 块引用\n\n```\nconst x: number = 1;\n```\n\n---\n![logo](logo.png)\n",
+    ];
+    for (k, src) in docs.iter().enumerate() {
+        let pv = preview_line_tags(src);
+        let lv = live_line_tags(src);
+        let ir = ir_line_tags(src);
+        assert_eq!(pv, lv, "doc {k}: 预览 vs live 逐行不一致");
+        assert_eq!(ir, lv, "doc {k}: IR 与 live 不符（IR 是金标准）");
+        assert_eq!(ir, pv, "doc {k}: IR 与预览不符（IR 是金标准）");
+    }
 }
