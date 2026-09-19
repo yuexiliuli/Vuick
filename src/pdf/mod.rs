@@ -1381,8 +1381,8 @@ mod tests {
         v.dims
             .iter()
             .enumerate()
-            .filter(|(i, &(w, h))| {
-                let dh = layout::display_height((w, h), page_width);
+            .filter(|(i, (w, h))| {
+                let dh = layout::display_height((*w, *h), page_width);
                 let top = v.page_tops[*i];
                 top + dh > off_y && top < off_y + viewport_h
             })

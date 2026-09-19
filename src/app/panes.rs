@@ -1,4 +1,4 @@
-//! panes.
+﻿//! panes.
 
 use super::*;
 
@@ -57,7 +57,7 @@ impl EditorApp {
                         .child("正在载入编辑区…（预览已就绪）"),
                 );
         }
-        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `wysiwyg_editor::EditorState`。
+        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `MarkdownLivePreview`。
         // 该编辑器 AUTO-GROW（内部无滚动条），宿主负责滚动；点击/光标/IME 坐标
         // 随元素自动跟随（不再有旧 live.rs 的内部滚动容器 + 滚动补偿）。
         if let Some(live) = self.tabs[self.active_tab].live.clone() {

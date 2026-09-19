@@ -1,4 +1,4 @@
-//! 应用主视图 `EditorApp`：文本 / 代码 / Markdown 编辑器（多文件选项卡）。
+﻿//! 应用主视图 `EditorApp`：文本 / 代码 / Markdown 编辑器（多文件选项卡）。
 //!
 //! 布局（自上而下）：
 //! - 菜单栏：文件 / 编辑 / 查看 / 帮助，点击弹出下拉菜单（[`EditorApp::render_menu_bar`]）
@@ -39,9 +39,8 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
 
-// 实时预览编辑（WYSIWYG）：从 zorite 移植的所见即所得 Markdown 编辑器
-// （crates/wysiwyg-editor，auto-grow + 宿主滚动，点击/光标/IME 全部由其处理）。
-use wysiwyg_editor;
+// 实时预览编辑（WYSIWYG）——本项目 `crate::markdown::live`（zorite 移植并入）。
+use crate::markdown::{EditorEvent, MarkdownLivePreview, SyntaxStyle};
 
 use crate::actions::*;
 use crate::config::layout::{
@@ -83,10 +82,10 @@ struct EditorTab {
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
     /// 是否处于「实时预览编辑」（WYSIWYG）模式：左面板用移植的
-    /// [`wysiwyg_editor::EditorState`] 代替源码编辑区；退出时内容写回。
+    /// [`MarkdownLivePreview`] 代替源码编辑区；退出时内容写回。
     live_edit: bool,
     /// 实时预览编辑器实体（None = 未启用；auto-grow，宿主滚动）。
-    live: Option<gpui::Entity<wysiwyg_editor::EditorState>>,
+    live: Option<gpui::Entity<MarkdownLivePreview>>,
     /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
     /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
     /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
@@ -1061,7 +1060,7 @@ impl EditorApp {
     // -------------------------------------------------------------------
 
     /// WYSIWYG 编辑器的 Markdown 语法配色（对齐 markdown 预览 [`StyleParams`]）。
-    fn wysiwyg_style(&mut self, cx: &mut Context<Self>) -> wysiwyg_editor::SyntaxStyle {
+    fn wysiwyg_style(&mut self, cx: &mut Context<Self>) -> SyntaxStyle {
         let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
             cx,
             Some(self.font_size),
@@ -1071,7 +1070,7 @@ impl EditorApp {
         let muted = self.text_minor();
         let fg = self.text_primary();
         let accent = p.accent;
-        wysiwyg_editor::SyntaxStyle {
+        SyntaxStyle {
             marker: muted,
             code: fg,
             code_bg: p.code_bg,
@@ -1101,7 +1100,7 @@ impl EditorApp {
     }
 
     /// 切换当前选项卡的「实时预览编辑」模式（仅 Markdown 选项卡）。
-    /// 开启：用移植的 [`wysiwyg_editor::EditorState`] 渲染左面板（所见即所得，
+    /// 开启：用移植的 [`MarkdownLivePreview`] 渲染左面板（所见即所得，
     /// 点击/光标/IME 全部由它处理，auto-grow + 宿主滚动）；关闭：写回源码编辑区/预览。
     fn toggle_live_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
@@ -1118,7 +1117,7 @@ impl EditorApp {
             let text_seed = text.clone();
             let style = self.wysiwyg_style(cx);
             let live = cx.new(|cx| {
-                let mut e = wysiwyg_editor::EditorState::new(window, cx)
+                let mut e = MarkdownLivePreview::new(window, cx)
                     .with_text(text_seed.as_str())
                     .with_placeholder("空文档（实时预览编辑：点击正文定位，直接键入编辑）");
                 e.set_markdown_style(style.clone(), cx);
@@ -1128,8 +1127,8 @@ impl EditorApp {
             // 让保存/搜索/状态栏等既有流程照常读取真源（不改动其余模块）。
             let live_sub = cx.subscribe(
                 &live,
-                |this, emitter, ev: &wysiwyg_editor::EditorEvent, cx| {
-                    if ev == &wysiwyg_editor::EditorEvent::Changed {
+                |this, emitter, ev: &EditorEvent, cx| {
+                    if ev == &EditorEvent::Changed {
                         if let Some(tab) =
                             this.tabs.iter_mut().find(|t| t.live.as_ref() == Some(&emitter))
                         {
@@ -1163,7 +1162,7 @@ impl EditorApp {
         tab._live_sub = None;
         tab.live_edit = false;
         let text = live.read(cx).text();
-        tab.content = SharedString::from(text.clone());
+        tab.content = SharedString::from(text);
         let content = tab.content.clone();
         let n_lines = content.as_ref().lines().count().max(1);
         let n_chars = content.as_ref().chars().count();

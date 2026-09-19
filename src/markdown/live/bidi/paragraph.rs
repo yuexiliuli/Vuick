@@ -32,7 +32,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::VisualMap;
+use super::VisualMap;
 
 use gpui::{
     App, AvailableSpace, Bounds, ContentMask, Element, ElementId, GlobalElementId, HighlightStyle,
@@ -330,7 +330,7 @@ pub fn layout_rows(
             start: orig,
             len,
             width: line.width(),
-            map: crate::shaped::map_of_wrapped(&line, len),
+            map: super::shaped::map_of_wrapped(&line, len),
             runs: row_runs,
             line,
             font_size,

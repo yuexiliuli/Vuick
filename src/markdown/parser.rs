@@ -2668,7 +2668,7 @@ mod tests {
             peak_pagefile_usage: usize,
             private_usage: usize,
         }
-        extern "system" {
+        unsafe extern "system" {
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
             fn K32GetProcessMemoryInfo(
                 process: *mut std::ffi::c_void,

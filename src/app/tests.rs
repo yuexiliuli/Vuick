@@ -2297,7 +2297,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        std::env::set_var("MD_OPEN_DEBUG", "1");
+        unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
         for path in [
             r"target/大文档测试.md",
             r"target/大文档测试23MB.md",
@@ -2550,7 +2550,7 @@
     #[ignore]
     async fn diag_drag_bottom_real_file(cx: &mut TestAppContext) {
         init_test(cx);
-        std::env::set_var("MD_OPEN_DEBUG", "1");
+        unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(1200.), px(800.)));
         for _ in 0..3 {
@@ -3026,7 +3026,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        std::env::set_var("MD_OPEN_DEBUG", "1");
+        unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
         // md：大文档异步打开。open_file 应立即返回（拖入不卡 UI），
         // 内容稍后在后台装配出来。
         let t0 = std::time::Instant::now();
@@ -3222,7 +3222,7 @@
             pub pagefile_usage: usize,
             pub peak_pagefile_usage: usize,
         }
-        extern "system" {
+        unsafe extern "system" {
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
             fn K32GetProcessMemoryInfo(
                 process: *mut std::ffi::c_void,

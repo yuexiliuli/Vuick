@@ -2,27 +2,20 @@
 name = "gpui-editor"
 version = "0.1.0"
 description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
-edition = "2021"
-
-[workspace]
-# 实时预览编辑（WYSIWYG）：zorite 的 gpui-editor 移植（自包含，非外部路径依赖）。
-# 根包（本应用）仍叫 gpui-editor；移植的编辑器包改名 wysiwyg-editor 避免包名冲突。
-members = [".", "crates/gpui-bidi", "crates/gpui-markdown", "crates/wysiwyg-editor"]
-
-[workspace.dependencies]
-# 与根包/`gpui-component` 保持**同一** gpui 依赖 spec（git 分支，不锁 rev）：
-# Cargo 只在 spec 完全一致时把 git 依赖统一成一份，否则应用与移植的编辑器各编译
-# 一份 gpui → 类型不互通。分支 tip 已由 Cargo.lock 固定为 399258f，不会漂移。
-gpui = { git = "https://github.com/zed-industries/zed" }
+# 2024：随 zorite 移植的 WYSIWYG 编辑器（src/markdown/live）使用 edition-2024 的 let-chain。
+edition = "2024"
 
 [dependencies]
-gpui = { workspace = true }
+gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 memchr = "2"
+# 实时预览编辑（WYSIWYG，src/markdown/live）需要的两个小依赖：
+# Unicode 字素簇边界（光标移动）与 UAX#9 bidi（RTL 视觉光标/点击映射）。
 unicode-segmentation = "1"
+unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data"] }
 # 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
 # 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
 futures = "0.3"
@@ -54,11 +47,10 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "default-syntaxes",
     "regex-fancy",
 ] }
-# 实时预览编辑（WYSIWYG）：zorite 移植的所见即所得 Markdown 编辑器。
-wysiwyg-editor = { path = "crates/wysiwyg-editor" }
+# 实时预览编辑（WYSIWYG）：已并入 `src/markdown/live`（不再有独立包）。
 
 [dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 
 [features]
 test-support = ["gpui/test-support"]

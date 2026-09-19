@@ -3,7 +3,7 @@
 
 use super::*;
 
-impl EditorState {
+impl MarkdownLivePreview {
     /// The table-affordance region the pointer is in — `(table index, 0 = in the
     /// hover zone / 1 = on the below "+" strip / 2 = on the right "+" strip)`, or
     /// `None` off every table. Drives `on_mouse_move`'s repaint-on-change.
@@ -752,10 +752,10 @@ impl EditorState {
         let Some(region) = self.caret_table_region() else {
             return;
         };
-        let style = gpui_markdown::syntax::TableStyle::from_name(name.unwrap_or("grid"))
+        let style = super::md_syntax::TableStyle::from_name(name.unwrap_or("grid"))
             .unwrap_or_default();
         let marker =
-            gpui_markdown::syntax::table_marker_text(style, region.col_widths_attr.as_deref());
+            super::md_syntax::table_marker_text(style, region.col_widths_attr.as_deref());
         self.rewrite_table_marker(&region, marker, cx);
     }
 
@@ -844,7 +844,7 @@ impl EditorState {
         if let Some(w) = widths.get_mut(resize.col) {
             *w = resize.width.max(24.);
         }
-        let marker = gpui_markdown::syntax::table_marker_text(region.style, Some(&widths));
+        let marker = super::md_syntax::table_marker_text(region.style, Some(&widths));
         self.rewrite_table_marker(&region, marker, cx);
     }
 
@@ -1049,7 +1049,7 @@ pub(crate) fn table_column_widths(
     }
     // No scale-to-fit: a table wider than the viewport keeps its natural
     // columns and scrolls horizontally in place (Cditor-style) — see
-    // `EditorState::table_scroll_x`.
+    // `MarkdownLivePreview::table_scroll_x`.
     widths
 }
 
@@ -1128,7 +1128,7 @@ pub(crate) struct TableThumb {
 /// the RIGHT edge with the gutter on the other side — the reader's
 /// `.mr(22).ml_auto()` — and its scroll reveals content to the left. Either
 /// way the visible band is `TABLE_GUTTER` narrower than the note column, so
-/// [`EditorState::table_sx`]'s clamp is direction-agnostic.
+/// [`MarkdownLivePreview::table_sx`]'s clamp is direction-agnostic.
 ///
 /// The single source for every x on a table: paint, hit-tests, the caret,
 /// the resize bands and the add/delete affordances all derive from it, so
@@ -1272,8 +1272,8 @@ pub(crate) fn table_caret_pos(
     // RTL run onto one x, which is a caret that won't move through the word.
     // Only an unwrapped cell can use it — a map's x's run along the single
     // pre-wrap line (same limit as elsewhere).
-    if !wrapped && gpui_markdown::syntax::contains_rtl(content) {
-        let map = gpui_bidi::shaped::map_of_wrapped(&wl, content.len());
+    if !wrapped && super::md_syntax::contains_rtl(content) {
+        let map = super::bidi::shaped::map_of_wrapped(&wl, content.len());
         pos.x = px(map.x_for_index(in_cell));
     }
     let full_w = wl.width();
@@ -1312,9 +1312,9 @@ fn cell_offset_for_point(
     ) else {
         return 0;
     };
-    if wl.wrap_boundaries().is_empty() && gpui_markdown::syntax::contains_rtl(content) {
+    if wl.wrap_boundaries().is_empty() && super::md_syntax::contains_rtl(content) {
         // Same reason as the caret above, in reverse.
-        let map = gpui_bidi::shaped::map_of_wrapped(&wl, content.len());
+        let map = super::bidi::shaped::map_of_wrapped(&wl, content.len());
         return map.index_for_x(f32::from(target.x));
     }
     match wl.closest_index_for_position(

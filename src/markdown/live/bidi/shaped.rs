@@ -11,7 +11,7 @@
 
 use gpui::{ShapedLine, WrappedLine};
 
-use crate::{Glyph, VisualMap};
+use super::{Glyph, VisualMap};
 
 /// Build a map from a shaped line.
 ///

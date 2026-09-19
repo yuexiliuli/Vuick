@@ -1,3320 +1,6881 @@
-//! 实时预览编辑（WYSIWYG，Phase 3 v2）：把 Markdown **渲染视图**做成可直接编辑的
-//! 块级编辑器。
+//! 本项目的「实时预览编辑」（WYSIWYG / live-preview）Markdown 编辑器。
 //!
-//! 架构（独立于 [`crate::editor::CodeEditor`] 的显示层）：
-//! - **单一数据源 = [`crate::editor::buffer::Buffer`]**（Rope 纯文本 + 字节偏移），
-//!   光标/选区/编辑全部在字节空间；WYSIWYG 只是它的**块级渲染滤镜**；
-//! - 由 [`crate::markdown::parser::parse_to_rows_live`] 解析成 [`LiveRow`]（含
-//!   「渲染字节 ↔ 源码字节」映射），逐块绘制并**自动换行**：每行被「按单词折行」拆成
-//!   显示的段（`SegHit`），正文/标题/引述用**系统 UI 字体**、代码用等宽字体——
-//!   命中整形与渲染同字体同字号（杜绝点击/光标错位）；
-//! - 点击/键盘直接编辑 Buffer；代码块按源码行映射（点击代码行即光标落在该源码行），
-//!   可正常增删改。
+//! 从 zorite 的 `gpui-editor`（GPL-3.0-or-later）移植并并入本二进制 crate，
+//! 不再依赖外部包：子模块 `element`/`markdown_syntax`/`tables` 对应移植的三个
+//! 源文件，`md_syntax`（markdown 构造识别）与 `bidi`（RTL 视觉光标/点击映射）
+//! 对应移植的 `gpui-markdown`/`gpui-bidi` 两包。与 GPUI 祖先无关地自洽。
 //!
-//! 样式与右侧 `MarkdownPreview` 保持同步：引述灰色带 + 强调色左边条、代码深/浅底
-//! + 等宽、标题分级字号加粗、行内加粗/斜体/代码/链接富样式。
+//! 设计要点：
+//! - 基于 gpui 文本原语（`EntityInputHandler` 键盘+IME 输入、`shape_line` 逐行
+//!   排版、自定义 [`Element`] 布局+绘制光标/选区）；**auto-grow** 到内容高度
+//!   （无内部滚动条），宿主滚动 → 点击/光标/IME 坐标随元素自动跟随，不再有
+//!   「光标与输入分离」的偏移误差。
+//! - W6 标记隐藏 + reveal-on-caret：绘制文本去掉语法标记，逐行 offset map
+//!   在显示↔源码之间换算。
 //!
-//! 调试：`#[cfg(debug_assertions)]` 下每帧打印 `[md-live] mouse / os-caret / input`
-//! 三行，用于排查「鼠标点击 / OS 闪烁光标 / 实际输入位置」三者是否一致。
+//! 用法：创建 [`MarkdownLivePreview`] 实体并渲染；启动时调用 [`bind_keys`]。
 
-use std::cell::RefCell;
 use std::ops::Range;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    div, font, point, px, size, AnyElement, App, Bounds, Context, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, FontStyle, FontWeight,
-    GlobalElementId, HighlightStyle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, ShapedLine,
-    StatefulInteractiveElement, Styled, StyledText, UnderlineStyle, UTF16Selection, Window,
+    App, AvailableSpace, BorderStyle, Bounds, ClipboardItem, Context, Corners, CursorStyle, Edges,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    Focusable, Font, FontWeight, GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, InteractiveElement, IntoElement, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels,
+    Point, Render, RenderImage, ScrollHandle, SharedString, StatefulInteractiveElement, Style,
+    Styled, TextRun, UTF16Selection, Window, WrappedLine, actions, div, fill, hsla, point, px,
+    relative, rgb, rgba, size,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::editor::buffer::Buffer;
-use crate::editor::merge_highlights;
-use crate::editor::selection::Selection;
-use crate::markdown::parser::{LiveRow, RowKind, RowPayload, RunKind, is_text_kind, parse_to_rows_live};
-use crate::markdown::view::style::StyleParams;
+mod markdown_syntax;
+pub use markdown_syntax::{AlertIcons, MathAlign, PropertyIconFn, SyntaxStyle};
 
-/// 系统 UI 字体（gpui 专用名 `.SystemUIFont`）：正文/标题/引述用，与预览一致。
-const BODY_FONT: &str = ".SystemUIFont";
-/// 行的左右外边距（px）：对齐预览 `px_3` 观感。
-const ROW_MX: f32 = 12.0;
-/// 光标条宽（px）。
-const CARET_WIDTH_PX: f32 = 2.0;
-/// 引述/代码带内纵衬（px）：布局用它起步，保证光标/命中与视觉一致。
-const BAND_PY: f32 = 3.0;
+mod tables;
+use tables::*;
 
-/// 调试用：一位小数。
-#[cfg(debug_assertions)]
-fn round1(v: f32) -> f32 {
-    (v * 10.0).round() / 10.0
+mod element;
+use element::*;
+
+// 随 zorite 编辑器一同移植入内的两个小模块（不再是外部 crate）：
+mod md_syntax; // = gpui-markdown::syntax：markdown 构造识别（与 gpui 无关）
+mod bidi; // = gpui-bidi：RTL 行的 byte index ↔ x 视觉映射
+
+
+/// Key context the editing actions are scoped to (so they only fire while an
+/// editor is focused).
+const CONTEXT: &str = "Editor";
+
+actions!(
+    gpui_editor,
+    [
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+        SelectLeft,
+        SelectRight,
+        SelectUp,
+        SelectDown,
+        SelectAll,
+        Newline,
+        Paste,
+        Copy,
+        Cut,
+        ShowCharacterPalette,
+        Undo,
+        Redo,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        Indent,
+        Outdent,
+        Bold,
+        Italic,
+        Underline,
+        Strike,
+        Code,
+        Dismiss,
+    ]
+);
+
+/// Bind the editor's editing keys. Call once at startup. Bindings are scoped to
+/// the editor's key context, so they don't shadow the host's shortcuts.
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some(CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("delete", Delete, ctx),
+        KeyBinding::new("left", Left, ctx),
+        KeyBinding::new("right", Right, ctx),
+        KeyBinding::new("up", Up, ctx),
+        KeyBinding::new("down", Down, ctx),
+        KeyBinding::new("home", Home, ctx),
+        KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-left", SelectLeft, ctx),
+        KeyBinding::new("shift-right", SelectRight, ctx),
+        KeyBinding::new("shift-up", SelectUp, ctx),
+        KeyBinding::new("shift-down", SelectDown, ctx),
+        KeyBinding::new("enter", Newline, ctx),
+        KeyBinding::new("tab", Indent, ctx),
+        KeyBinding::new("shift-tab", Outdent, ctx),
+        KeyBinding::new("cmd-a", SelectAll, ctx),
+        KeyBinding::new("ctrl-a", SelectAll, ctx),
+        KeyBinding::new("cmd-c", Copy, ctx),
+        KeyBinding::new("ctrl-c", Copy, ctx),
+        KeyBinding::new("cmd-v", Paste, ctx),
+        KeyBinding::new("ctrl-v", Paste, ctx),
+        KeyBinding::new("cmd-x", Cut, ctx),
+        KeyBinding::new("ctrl-x", Cut, ctx),
+        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, ctx),
+        KeyBinding::new("cmd-z", Undo, ctx),
+        KeyBinding::new("ctrl-z", Undo, ctx),
+        KeyBinding::new("cmd-shift-z", Redo, ctx),
+        KeyBinding::new("ctrl-shift-z", Redo, ctx),
+        KeyBinding::new("ctrl-y", Redo, ctx),
+        KeyBinding::new("alt-left", WordLeft, ctx),
+        KeyBinding::new("alt-right", WordRight, ctx),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+        KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+        KeyBinding::new("cmd-b", Bold, ctx),
+        KeyBinding::new("ctrl-b", Bold, ctx),
+        KeyBinding::new("cmd-i", Italic, ctx),
+        KeyBinding::new("ctrl-i", Italic, ctx),
+        KeyBinding::new("cmd-e", Code, ctx),
+        KeyBinding::new("ctrl-e", Code, ctx),
+        KeyBinding::new("cmd-shift-x", Strike, ctx),
+        KeyBinding::new("ctrl-shift-x", Strike, ctx),
+        KeyBinding::new("cmd-u", Underline, ctx),
+        KeyBinding::new("ctrl-u", Underline, ctx),
+        KeyBinding::new("escape", Dismiss, ctx),
+    ]);
 }
 
-/// 行内某一段（一个显示行）的命中信息：渲染/命中共用，含「段→源码」换算所需。
-struct SegHit {
-    row_ix: usize,
-    /// 段在内容坐标（滚动前）中的 y 顶 / 高 / 文本起点 x（行内坐标）。
-    top: f32,
-    height: f32,
-    x: f32,
-    /// 文本行：段在 `row.text` 中的渲染字节范围。
+/// Cap on undo history (full snapshots) to bound memory.
+const UNDO_LIMIT: usize = 256;
+
+/// Line height as a multiple of the font size. Derived from the editor's own
+/// font (not the ambient `window.line_height()`, which tracks the host's UI text
+/// style and would leave the caret/rows mismatched against differently-sized
+/// editor text). 1.45 for comfortable reading density while typing (1.25 felt
+/// cramped, especially stacking several list rows). Public so a host's scroll
+/// math (e.g. Zorite's click-to-edit caret prediction) can mirror row heights.
+pub const LINE_HEIGHT_RATIO: f32 = 1.45;
+
+/// Extra height under each list/task row in WYSIWYG, matching the reader's
+/// roomier item gap (its list column uses a 4px inter-item gap) — the one
+/// place the reader's look wins over the editor's (see AGENTS.md "Parity
+/// direction"). Detected from the raw line, so it's caret-stable.
+const LIST_ROW_GAP: f32 = 4.;
+/// The gap between a painted bullet/checkbox and its item text — the reader's
+/// 8px marker gap, whose roomier indent wins (AGENTS.md "Parity direction").
+const LIST_TEXT_GAP: f32 = 8.;
+/// Per-space width (px) of one nesting level's indent, matching the reader's
+/// `list_indent` sizing (`spaces × 4.5`). A level therefore advances by
+/// bullet + gap + this — noticeably wider than the raw source spaces, so the
+/// display shifts on reveal-on-caret (the quote inset already set that
+/// precedent, just smaller).
+const LIST_LEVEL_PER_SPACE: f32 = 4.5;
+
+/// Caret thickness (px) — thin like a native text caret, so it doesn't blend into
+/// the first glyph at the start of a line/cell.
+const CARET_WIDTH: f32 = 1.0;
+
+/// Horizontal inset (px) of fenced-code-block text from the box's left edge, so
+/// code sits inside the padded box rather than flush against it. Mirrors the old
+/// renderer's `px(12)` left padding.
+const CODE_INSET: f32 = 12.;
+
+/// Vertical padding (px) above the first / below the last line of a fenced code
+/// block. Reserved as layout space (a gap in the line tops + total height) so the
+/// box doesn't overlap adjacent lines, with no blank line required.
+const CODE_PAD: f32 = 8.;
+
+/// Horizontal inset (px) of blockquote text from the editor's left edge, leaving
+/// room for the left border (2px) + a gap, matching the reading view's `pl(12)`.
+const QUOTE_INSET: f32 = 14.;
+
+/// Vertical padding (px) inside a file chip (e.g. a PDF embed), above + below its
+/// label, so the chip box reads as a button rather than a bare line of text.
+const CHIP_PAD: f32 = 5.;
+
+/// Total vertical breathing room (px) reserved around an inline image — split
+/// above + below — so consecutive images (a bulleted photo list) don't touch.
+const IMG_ROW_PAD: f32 = 12.;
+
+/// Extra height (px) a text row gets beyond its tallest inline `$…$` formula, so a fraction
+/// has a little breathing room above + below instead of touching the neighbouring rows.
+const INLINE_MATH_ROW_PAD: f32 = 6.;
+
+/// Side length (px) of the square drag-to-resize grip painted at an inline
+/// image's bottom-right corner (matching the reading view's 14px handle).
+const IMG_GRIP: f32 = 14.;
+
+/// Smallest width (px) a drag may shrink an inline image to, so it can't vanish.
+const IMG_MIN_W: f32 = 40.;
+
+/// An in-progress drag of an inline image's corner grip: which logical line's
+/// `![](src)` is being resized, its display width when the drag began, the
+/// pointer x at grab, and the live (preview) width the drag has reached. The
+/// image paints at `width` (aspect-preserved) until release writes `{width=N}`.
+#[derive(Clone, Copy)]
+struct ImageResize {
+    line: usize,
+    start_width: f32,
+    start_x: Pixels,
+    width: f32,
+}
+
+/// A restorable editor state, for undo/redo. Stores the caret offset (not a
+/// selection), so undo/redo place the caret rather than re-selecting text.
+#[derive(Clone)]
+struct Snapshot {
+    content: String,
+    caret: usize,
+}
+
+/// The last edit's kind, for coalescing a run of edits into one undo step.
+/// `Insert(end)` is a single-grapheme insert whose caret ends at `end`.
+#[derive(Clone, Copy, PartialEq)]
+enum EditKind {
+    Insert(usize),
+    Delete,
+    Other,
+}
+
+/// A flagged span (e.g. a misspelling) to underline. The host (e.g. a spell
+/// checker) computes these and feeds them in via [`MarkdownLivePreview::set_diagnostics`].
+/// Replacement suggestions are fetched lazily when the user right-clicks the
+/// span, via the provider set with [`MarkdownLivePreview::on_suggest`] — so detection
+/// can stay cheap and run on every edit.
+#[derive(Clone)]
+pub struct Diagnostic {
+    /// Byte range in the document.
+    pub range: Range<usize>,
+}
+
+/// An open right-click suggestions menu for a diagnostic.
+#[derive(Clone)]
+struct DiagMenu {
+    /// Popup top-left, in window space (rendered on a deferred/anchored layer).
+    anchor: Point<Pixels>,
+    /// The diagnostic's byte range, replaced when a suggestion is chosen.
     range: Range<usize>,
-    /// 文本行：整行的渲染→源码映射。
-    map: Option<Rc<Vec<usize>>>,
-    /// 代码行：该源码行行首字节（恒等映射）。其余块 = `source_start`。
-    base: usize,
-    /// 段文本整形（与渲染同字体同字号）；None = 非交互段。
-    line: Option<ShapedLine>,
-    text_len: usize,
+    suggestions: Vec<SharedString>,
+    /// Scroll state of the (capped-height) list, so a thumb can track it.
+    scroll: ScrollHandle,
+    /// Whether the "Turn into" flyout is open (hover-opened; dies with the menu).
+    turn_into: bool,
 }
 
-impl SegHit {
-    /// 段内字符位置（本段相对字节）→ 源码字节。
-    fn source_for(&self, local_byte: usize) -> usize {
-        if let Some(map) = &self.map {
-            let g = self.range.start + local_byte.min(self.range.len().max(0));
-            let g = g.min(map.len() - 1);
-            map[g]
-        } else {
-            self.base + local_byte.min(self.text_len)
+/// A block kind the right-click "Turn into" menu converts between —
+/// flat-markdown natural: each conversion is a line-prefix rewrite (fenced
+/// kinds wrap/unwrap the block's lines).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnKind {
+    Text,
+    H1,
+    H2,
+    H3,
+    Bullet,
+    Numbered,
+    Todo,
+    Quote,
+    Callout,
+    Code,
+    Math,
+}
+
+impl TurnKind {
+    const ALL: [TurnKind; 11] = [
+        TurnKind::Text,
+        TurnKind::H1,
+        TurnKind::H2,
+        TurnKind::H3,
+        TurnKind::Bullet,
+        TurnKind::Numbered,
+        TurnKind::Todo,
+        TurnKind::Quote,
+        TurnKind::Callout,
+        TurnKind::Code,
+        TurnKind::Math,
+    ];
+
+    fn label(self, labels: &Labels) -> SharedString {
+        match self {
+            TurnKind::Text => labels.text.clone(),
+            TurnKind::H1 => labels.heading_1.clone(),
+            TurnKind::H2 => labels.heading_2.clone(),
+            TurnKind::H3 => labels.heading_3.clone(),
+            TurnKind::Bullet => labels.bulleted_list.clone(),
+            TurnKind::Numbered => labels.numbered_list.clone(),
+            TurnKind::Todo => labels.todo.clone(),
+            TurnKind::Quote => labels.quote.clone(),
+            TurnKind::Callout => labels.callout.clone(),
+            TurnKind::Code => labels.code_block.clone(),
+            TurnKind::Math => labels.math_block.clone(),
         }
     }
 }
 
-/// 实时预览编辑（块级 WYSIWYG）。
+/// Canonicalize freshly loaded content: words-attached `$$` forms (mixed
+/// lines, words-on-fence-lines) normalize onto their own lines — in memory,
+/// persisted on the first edit — so STORED documents render display math
+/// exactly like fresh typing and the reader's pre-parse normalization.
+/// Unpaired `$$` prose/code is untouched. Both load paths (`with_text`,
+/// `set_text`) route through here.
+fn normalize_loaded(content: String) -> String {
+    if !content.contains("$$") {
+        return content;
+    }
+    match md_syntax::normalize_math_fences(&content) {
+        std::borrow::Cow::Owned(n) => n,
+        std::borrow::Cow::Borrowed(_) => content,
+    }
+}
+
+/// If `offset` sits on a collapsed marker line (a table style marker or a
+/// math align marker), the offset of the nearest line that reveals nothing
+/// when the caret rests there: the table's header, or the line after the
+/// math block. Otherwise `offset` unchanged.
+fn caret_off_marker_line(content: &str, offset: usize) -> usize {
+    let row = content[..offset.min(content.len())].matches('\n').count();
+    let line_start = |r: usize| {
+        let mut off = 0;
+        for (i, l) in content.split('\n').enumerate() {
+            if i == r {
+                return off;
+            }
+            off += l.len() + 1;
+        }
+        content.len()
+    };
+    if let Some(t) = markdown_syntax::table_regions(content)
+        .iter()
+        .find(|t| t.marker_line == Some(row))
+    {
+        return line_start(t.lines.start);
+    }
+    if let Some(m) = markdown_syntax::math_regions(content)
+        .iter()
+        .find(|m| m.marker_line == Some(row))
+    {
+        // Anywhere inside a math region reveals it whole — land after it.
+        return line_start(m.range.end);
+    }
+    offset
+}
+
+/// Strip a line's block dressing (heading hashes, list/todo bullet, ordered
+/// number, quote `>`), leaving the text a "Turn into" conversion re-prefixes.
+fn strip_block_prefix(line: &str) -> &str {
+    // Composes the renderer's own recognizers so the strip grammar can't
+    // drift from what WYSIWYG classifies (task/list/heading/quote).
+    if let Some((p, ..)) = markdown_syntax::task_prefix(line) {
+        return &line[p..];
+    }
+    if let Some((p, ..)) = markdown_syntax::list_prefix(line) {
+        return &line[p..];
+    }
+    if let Some(n) = markdown_syntax::heading_level(line) {
+        let after = &line[n as usize..];
+        return after.strip_prefix(' ').unwrap_or(after);
+    }
+    if let Some(p) = markdown_syntax::blockquote_prefix(line) {
+        return &line[p..];
+    }
+    line.trim_start()
+}
+
+/// Join `body` lines each carrying the prefix `p(index)` produces — the
+/// assembly half of a "Turn into" conversion.
+fn prefix_lines(body: &[String], p: impl Fn(usize) -> String) -> String {
+    body.iter()
+        .enumerate()
+        .map(|(i, l)| format!("{}{l}", p(i)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A column edit applied to every row of a table (insert/delete a cell at index).
+#[derive(Clone, Copy)]
+enum ColEdit {
+    Insert(usize),
+    Delete(usize),
+}
+
+/// An item in the table right-click menu (Word-style table editing).
+#[derive(Clone, Copy)]
+enum TableMenuAction {
+    InsertRowAbove,
+    InsertRowBelow,
+    DuplicateRow,
+    InsertColLeft,
+    InsertColRight,
+    DeleteRow,
+    DeleteColumn,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    /// Rewrite the table's `<!-- table:STYLE -->` marker (`None` = the
+    /// default Grid, which has no marker).
+    SetStyle(Option<&'static str>),
+    CopyTable,
+    DeleteTable,
+}
+
+impl TableMenuAction {
+    fn apply(self, editor: &mut MarkdownLivePreview, cx: &mut Context<MarkdownLivePreview>) {
+        match self {
+            TableMenuAction::InsertRowAbove => editor.insert_table_row(false, cx),
+            TableMenuAction::InsertRowBelow => editor.insert_table_row(true, cx),
+            TableMenuAction::DuplicateRow => editor.duplicate_table_row(cx),
+            TableMenuAction::InsertColLeft => editor.insert_table_column(false, cx),
+            TableMenuAction::InsertColRight => editor.insert_table_column(true, cx),
+            TableMenuAction::DeleteRow => editor.delete_table_row(cx),
+            TableMenuAction::DeleteColumn => editor.delete_table_column(cx),
+            TableMenuAction::AlignLeft => editor.set_caret_table_align(CellAlign::Left, cx),
+            TableMenuAction::AlignCenter => editor.set_caret_table_align(CellAlign::Center, cx),
+            TableMenuAction::AlignRight => editor.set_caret_table_align(CellAlign::Right, cx),
+            TableMenuAction::SetStyle(name) => editor.set_table_style(name, cx),
+            TableMenuAction::CopyTable => editor.copy_table(cx),
+            TableMenuAction::DeleteTable => editor.delete_table(cx),
+        }
+    }
+}
+
+/// Events the editor emits so a host can react. Subscribe with
+/// `cx.subscribe(&editor, …)` — e.g. to re-run spell-check after an edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// The document text changed via a user edit (typing, delete, paste, IME,
+    /// applying a suggestion). Not emitted for programmatic `set_text`.
+    Changed,
+    /// A file chip (e.g. a PDF embed) or an inline `[text](url)` link was
+    /// left-clicked — the host opens the `src`/url (http externally, files
+    /// via its own resolution). A navigation hint; the text is untouched.
+    OpenLink(SharedString),
+    /// A `[[wiki-link]]` or `#tag` was left-clicked — the host opens the page
+    /// with this title (Logseq semantics, matching the reading view).
+    OpenWikiLink(SharedString),
+    /// The caret / selection moved without a text change — so a host can update a
+    /// caret-anchored affordance (e.g. the table-alignment toolbar).
+    SelectionChanged,
+    /// The caret entered a `$$…$$` math block (by click, or by arrowing into it): its byte
+    /// `range` in the document (covering both fences) and the LaTeX `source` between them, so
+    /// the host can open a structural editor and replace the block's text on commit. `at_end`
+    /// seats that editor's caret at the formula's end (entered from below/right or by click)
+    /// vs its start (from above/left).
+    EditMath {
+        range: Range<usize>,
+        source: SharedString,
+        at_end: bool,
+        /// `true` for an inline `$…$` span (host splices `$…$` back, seats the editor at the
+        /// formula's spot); `false` for a `$$…$$` block (full-width gap).
+        inline: bool,
+    },
+    /// A `$$…$$` math block was right-clicked: the LaTeX source and the window-space click
+    /// position, so the host can show a context menu (Copy LaTeX / Export).
+    MathMenu {
+        source: SharedString,
+        position: Point<Pixels>,
+    },
+    /// A property panel was clicked or arrowed into: the byte `range` of the whole
+    /// `key:: value` block and its `source`, so the host can seat an in-place
+    /// property editor (via `set_editing_block`) and replace the block's text on
+    /// commit — the same seat/commit pattern as [`EditorEvent::EditMath`] for a
+    /// `$$` block. `at_end` seats focus on the last field (entered by arrowing up
+    /// from below) vs the first (click / arrowing down from above). A click also
+    /// carries `row` — the property line's index within the block — so the host
+    /// focuses the row the user actually clicked; arrows pass `None`.
+    EditProperties {
+        range: Range<usize>,
+        source: SharedString,
+        at_end: bool,
+        row: Option<usize>,
+    },
+    /// An inline `![](src)` image was left-clicked — the host opens a full-size
+    /// preview. The text is untouched.
+    PreviewImage(SharedString),
+}
+
+/// A table column's text alignment, for the host-driven alignment toolbar
+/// ([`MarkdownLivePreview::caret_table_align`] / [`MarkdownLivePreview::set_caret_table_align`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Provides replacement suggestions for a flagged word (best first); set by the
+/// host via [`MarkdownLivePreview::on_suggest`] and consulted on right-click.
+type SuggestFn = Box<dyn Fn(&str) -> Vec<String>>;
+
+/// Resolves a standalone image line's `src` to a decoded image so the editor can
+/// render it inline (W4). Set by the host via
+/// [`MarkdownLivePreview::set_block_image_provider`]; the host owns loading + caching and
+/// returns `None` while still decoding / on failure (the line shows raw source).
+type BlockImageFn = Box<dyn Fn(&str) -> Option<Arc<RenderImage>>>;
+
+/// Classifies an `![](src)` reference as a file chip (e.g. a PDF) rather than an
+/// image, returning its display label. Set via
+/// [`MarkdownLivePreview::set_block_chip_provider`]; the editor renders such a line as a
+/// clickable chip (left-click emits [`EditorEvent::OpenLink`]).
+type BlockChipFn = Box<dyn Fn(&str) -> Option<SharedString>>;
+
+/// Host-supplied clipboard writer for Copy/Cut — receives the markdown text
+/// the editor would put on the clipboard, so a host can add flavors gpui's
+/// clipboard can't (e.g. rendered HTML beside the plain string). See
+/// [`MarkdownLivePreview::set_clipboard_writer`].
+pub type ClipboardWriter = std::rc::Rc<dyn Fn(&str, &mut App)>;
+
+/// Resolves a standalone `![[target]]` embed line to the host view that renders
+/// the transclusion, plus the row height to reserve for it (the host estimates
+/// and caps it; long content scrolls inside the view). `None` falls back to the
+/// embed chip.
+type EmbedViewFn = Box<dyn Fn(&str) -> Option<(gpui::AnyView, Pixels)>>;
+
+/// Resolves a ` ```mermaid ` block's source to a rendered diagram bitmap plus its
+/// **logical** (display) px size — supplied by the host for the same reason as
+/// [`BlockMathFn`]. Set via [`MarkdownLivePreview::set_block_mermaid_provider`]; the host
+/// renders + caches off-thread (see [`mermaid_sources`] to pre-render).
+type BlockMermaidFn = Box<dyn Fn(&str) -> Option<(Arc<RenderImage>, f32, f32)>>;
+
+/// Resolves a `$$…$$` math block's LaTeX to a typeset bitmap plus its **logical**
+/// (display) px size, so the editor can render the block as the equation (caret
+/// outside) instead of raw source. The host supplies the logical size because it
+/// knows the raster's pixel density (e.g. typeset at a fixed 2× DPR); deriving it
+/// from texture pixels ÷ window scale factor renders 2× too large on a 1× display
+/// (the Linux/X11 bug — the division only cancels on a 2× "Retina" screen). Set
+/// via [`MarkdownLivePreview::set_block_math_provider`]; pre-render with [`math_sources`].
+type BlockMathFn = Box<dyn Fn(&str) -> Option<(Arc<RenderImage>, f32, f32)>>;
+
+/// Colors a fenced code block's tokens in WYSIWYG: `(language tag, block
+/// text) → sorted, non-overlapping styled ranges` (byte offsets into the
+/// block). Host-supplied (e.g. a tree-sitter highlighter) so the crate stays
+/// engine-free; absent it, code renders in `SyntaxStyle::code`. Set via
+/// [`MarkdownLivePreview::set_code_highlighter`].
+type CodeHighlightFn = Box<dyn Fn(&str, &str) -> Vec<(Range<usize>, HighlightStyle)>>;
+
+/// Host auto-replace hook, consulted when a word-boundary character (space,
+/// punctuation, Enter) completes a word: receives the just-finished line's
+/// text up to the boundary and returns the slice range to replace plus its
+/// replacement — e.g. wrapping a completed page title as `[[title]]`. The
+/// edit is one undo step (⌫Z restores the plain word) and the caret keeps its
+/// place after the boundary. Not consulted inside fenced code, and only for
+/// single-character insertions (never pastes or IME commits). Set via
+/// [`MarkdownLivePreview::set_auto_replace`].
+type AutoReplaceFn = Box<dyn Fn(&str) -> Option<(Range<usize>, String)>>;
+
+/// The diagram sources of every ` ```mermaid ` block in `content`, so a host can
+/// pre-render them (the editor's mermaid provider then finds the ready bitmap).
+pub fn mermaid_sources(content: &str) -> Vec<SharedString> {
+    markdown_syntax::mermaid_blocks(content)
+        .into_iter()
+        .map(|(_, source)| source.into())
+        .collect()
+}
+
+/// The LaTeX sources of every `$$…$$` math block in `content`, so a host can
+/// pre-render them (the editor's math provider then finds the ready bitmap).
+pub fn math_sources(content: &str) -> Vec<SharedString> {
+    markdown_syntax::math_blocks(content)
+        .into_iter()
+        .map(|(_, source)| source.into())
+        .collect()
+}
+
+/// The LaTeX sources of every inline `$…$` formula in `content` (the inner LaTeX, no `$`
+/// delimiters), so a host can pre-render them into the same math store the block provider
+/// reads. Skips lines inside fenced code blocks, where `$…$` is literal.
+pub fn inline_math_sources(content: &str) -> Vec<SharedString> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for line in content.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        for span in markdown_syntax::inline_math_spans(line) {
+            out.push(markdown_syntax::inline_math_latex(line, &span).into());
+        }
+    }
+    out
+}
+
+/// The editor: text + cursor/selection state, an undo/redo history, plus a
+/// cached layout (the wrapped lines from the last paint) for hit-testing + IME.
+/// Renders the WYSIWYG view when a markdown [`SyntaxStyle`] is installed, the
+/// raw-markdown view otherwise.
+/// Host-injectable UI labels the editor renders in its context menus and
+/// chrome (right-click menu items, the code-block / math `Copy` chips, the
+/// table / "Turn into" menus). The crate stays host-agnostic so it never
+/// calls `t!()`; the app passes localized strings here via
+/// [`MarkdownLivePreview::set_labels`]. The default is English, keeping the crate
+/// usable standalone (and existing tests' expectations intact).
+#[derive(Clone)]
+pub struct Labels {
+    /// Text-selection right-click menu.
+    pub cut: SharedString,
+    pub copy: SharedString,
+    pub copy_as_markdown: SharedString,
+    pub paste: SharedString,
+    /// Code-block / formula chrome.
+    pub code_copy: SharedString,
+    pub math_copy: SharedString,
+    /// "Turn into" block-conversion menu.
+    pub turn_into: SharedString,
+    pub text: SharedString,
+    pub heading_1: SharedString,
+    pub heading_2: SharedString,
+    pub heading_3: SharedString,
+    pub bulleted_list: SharedString,
+    pub numbered_list: SharedString,
+    pub todo: SharedString,
+    pub quote: SharedString,
+    pub callout: SharedString,
+    pub code_block: SharedString,
+    pub math_block: SharedString,
+    /// Table right-click menu.
+    pub insert_row_above: SharedString,
+    pub insert_row_below: SharedString,
+    pub duplicate_row: SharedString,
+    pub insert_column_left: SharedString,
+    pub insert_column_right: SharedString,
+    pub align_left: SharedString,
+    pub align_center: SharedString,
+    pub align_right: SharedString,
+    pub grid_style: SharedString,
+    pub striped_style: SharedString,
+    pub header_style: SharedString,
+    pub minimal_style: SharedString,
+    pub delete_row: SharedString,
+    pub delete_column: SharedString,
+    pub delete_table: SharedString,
+    /// Property-panel menu.
+    pub edit_properties: SharedString,
+    pub delete_property: SharedString,
+    /// Image menu.
+    pub delete_image: SharedString,
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Self {
+            cut: "Cut".into(),
+            copy: "Copy".into(),
+            copy_as_markdown: "Copy as Markdown".into(),
+            paste: "Paste".into(),
+            code_copy: "Copy".into(),
+            math_copy: "Copy".into(),
+            turn_into: "Turn into".into(),
+            text: "Text".into(),
+            heading_1: "Heading 1".into(),
+            heading_2: "Heading 2".into(),
+            heading_3: "Heading 3".into(),
+            bulleted_list: "Bulleted list".into(),
+            numbered_list: "Numbered list".into(),
+            todo: "To-do".into(),
+            quote: "Quote".into(),
+            callout: "Callout".into(),
+            code_block: "Code block".into(),
+            math_block: "Math block".into(),
+            insert_row_above: "Insert row above".into(),
+            insert_row_below: "Insert row below".into(),
+            duplicate_row: "Duplicate row".into(),
+            insert_column_left: "Insert column left".into(),
+            insert_column_right: "Insert column right".into(),
+            align_left: "Align left".into(),
+            align_center: "Align center".into(),
+            align_right: "Align right".into(),
+            grid_style: "Grid style".into(),
+            striped_style: "Striped style".into(),
+            header_style: "Header style".into(),
+            minimal_style: "Minimal style".into(),
+            delete_row: "Delete row".into(),
+            delete_column: "Delete column".into(),
+            delete_table: "Delete table".into(),
+            edit_properties: "Edit properties".into(),
+            delete_property: "Delete property".into(),
+            delete_image: "Delete image".into(),
+        }
+    }
+}
+
 pub struct MarkdownLivePreview {
-    buffer: Buffer,
-    selection: Selection,
-    marked_range: Option<Range<usize>>,
-    /// 当前解析出的渲染行（含「渲染 ↔ 源码」映射）。
-    live: Vec<LiveRow>,
     focus_handle: FocusHandle,
-    /// 排版参数快照（主题字体/颜色）。
-    p: Rc<StyleParams>,
-    /// 上一帧是否深色（主题切换触发刷新）。
-    dark: bool,
-    /// 内容区元素的窗口边界（包装元素 paint 回写；命中/坐标换算用）。
-    element_bounds: Bounds<Pixels>,
-    /// 纵向滚动句柄（跟随原生 `overflow_y_scroll` 容器）。
-    v_handle: gpui::ScrollHandle,
-    /// 上帧命中段表（内容坐标）。
-    segs: Rc<RefCell<Vec<SegHit>>>,
-    /// 字号覆盖（None = 主题默认），变化后下一帧刷新排版参数。
-    font_override: Option<f32>,
-    /// 排版参数是否待刷新（字号覆盖变化）。
-    styles_dirty: bool,
-    /// 自绘光标闪烁开关（每 ~530ms 切换）。
-    blink_on: bool,
-    /// 闪烁定时器是否已启动（首次渲染时惰性启动一次）。
-    blink_started: bool,
-    /// 上一次推给平台的滚动偏移（滚动变化时重推 IME 定位，避免候选窗停在滚动前）。
-    last_ime_scroll: f32,
-    /// `GPUI_IMEDEBUG=1` 调试覆盖层：绿点=最后点击、洋红环=光标、红框=OS IME bounds。
-    #[cfg(debug_assertions)]
-    ime_debug: bool,
-    /// 最后点击位置（内容坐标）。
-    #[cfg(debug_assertions)]
-    click_content: Option<(f32, f32)>,
-    /// 最后报告的 IME bounds（内容坐标 x, y, w, h）。
-    #[cfg(debug_assertions)]
-    ime_content: Option<(f32, f32, f32, f32)>,
-    /// 点击落点与光标差过大（行尾/空行/短行钳制）时，「点击点」幽灵竖条
-    /// （内容 x, y, h, 时间戳）。只在点击后 ~700ms 内绘制，用来说明
-    /// 「为什么光标在这里、插入在这里」——参考实现（zorite/vellum）同为钳制，
-    /// 幽灵条是纯粹的视觉说明，不改变插入位置。
-    click_ghost: Option<(f32, f32, f32, std::time::Instant)>,
-    /// 上次 `relayout` 使用的布局宽度。命中/IME 查询若发现当前元素宽度已变
-    /// （窗口→全屏换宽瞬间旧几何残留），强制重排，避免用旧宽度的换行做点击/输入定位。
-    last_layout_width: f32,
-    /// 空行「插入列」（真 WYSIWYG）：点空行后记录 (行 idx, 点击列内容 x, 空格宽)。
-    /// 光标/IME 显示在该列；首次输入先补空格到该列，字符落在点击处；非空短行仍 EOL 钳制。
-    goal: Option<(usize, f32, f32)>,
+    /// The whole document, newline-separated. Byte offsets index into this.
+    content: String,
+    placeholder: SharedString,
+    /// Selection as a byte range; the caret is one end (see [`Self::cursor_offset`]).
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+    /// IME composition range, if any.
+    marked_range: Option<Range<usize>>,
+    /// Host-supplied clipboard writer for Copy/Cut (e.g. adding an HTML
+    /// flavor beside the plain text). `None` = gpui's plain-string copy.
+    clipboard_writer: Option<ClipboardWriter>,
+    /// Find-in-feed highlights: match byte ranges + the active index, painted
+    /// behind the text like the selection. Host-driven ([`Self::set_search`]).
+    search: Option<(Vec<Range<usize>>, Option<usize>)>,
+    /// Last paint's wrapped lines (one per logical line) and each line's top
+    /// offset relative to the editor's top — both used for hit-testing and
+    /// cursor/IME positioning.
+    wrapped: Vec<WrappedLine>,
+    line_tops: Vec<Pixels>,
+    /// Per-logical-line wrap-row count (from the last paint). Geometry reads
+    /// this, not `wrapped[i].wrap_boundaries()` — a windowed-out line's entry
+    /// in `wrapped` is an empty placeholder.
+    wrap_rows: Vec<usize>,
+    /// Per-logical-line wrap-row height. Variable so a heading (bigger font) gets
+    /// a taller row (W2); `line_height` is the base/fallback for the empty doc
+    /// and any row without a recorded height.
+    line_heights: Vec<Pixels>,
+    /// Per-logical-line table-grid row (from the last paint), so a click /
+    /// Tab / caret hit-tests against cells instead of the raw source line.
+    table_rows: Vec<Option<TableRow>>,
+    /// Hover-revealed "+" add-row / add-column strips for each table (issue #16),
+    /// each paired with the table row to seat the caret in before inserting. From
+    /// the last paint, committed only while the table is hovered; hit-tested on
+    /// mouse-down.
+    table_row_add_rects: Vec<(Bounds<Pixels>, usize)>,
+    table_col_add_rects: Vec<(Bounds<Pixels>, usize, usize)>,
+    /// Each table's hover zone (grid + a thin margin) with its header row,
+    /// committed every paint so `on_mouse_move` can repaint when the pointer's
+    /// table-affordance region changes (the editor otherwise only repaints on
+    /// the caret blink) and `on_scroll_wheel` can hit-test the PAINTED table.
+    table_hover_zones: Vec<(Bounds<Pixels>, usize)>,
+    /// The affordance region the pointer was last in — `(table index, 0 = zone /
+    /// 1 = below strip / 2 = right strip)` — so the repaint fires only on change.
+    table_hover_region: Option<(usize, u8)>,
+    /// Committed delete-handle rects (issue #16): the hovered row's "−" `(bounds,
+    /// row)` and the hovered column's "−" `(bounds, row, col)`, hit-tested on click.
+    table_row_del: Option<(Bounds<Pixels>, usize)>,
+    table_col_del: Option<(Bounds<Pixels>, usize, usize)>,
+    /// The table cell `(row, col)` the pointer was last over, so `on_mouse_move`
+    /// repaints the delete handles when it changes.
+    table_hover_cell: Option<(usize, usize)>,
+    /// Per-logical-line flag: this row is painted as an inline image (W4), so a
+    /// click on it places the caret at the line start instead of hit-testing
+    /// source text. From the last paint.
+    widget_rows: Vec<bool>,
+    /// Per-logical-line display→source byte map for rows with hidden markers
+    /// (W6); `None` when the painted text equals the source. From the last paint.
+    offset_maps: Vec<Option<std::rc::Rc<Vec<usize>>>>,
+    /// Per-logical-line horizontal text inset (and so the caret/selection/hit-test
+    /// inset): non-zero for fenced code blocks and gutter marks (blockquotes,
+    /// lists). From the last paint.
+    line_insets: Vec<Pixels>,
+    /// Per-logical-line right-to-left geometry (#66), `None` on every LTR row
+    /// so an LTR document pays nothing. From the last paint. See [`RtlRow`].
+    rtl_rows: Vec<Option<RtlRow>>,
+    last_bounds: Option<Bounds<Pixels>>,
+    line_height: Pixels,
+    /// Font size from the last paint. Hit-testing that runs during event
+    /// dispatch (e.g. table-cell clicks) must measure at this size — the
+    /// window's text-style stack is unwound there, so `window.text_style()`
+    /// would report the root size, not the host wrapper's.
+    font_size: Pixels,
+    /// The font of the last paint, for the same reason: event-time
+    /// `text_style()` reports the ROOT font, whose family/metrics can differ
+    /// from what the table was painted with (column auto-fit measured with
+    /// the wrong glyph widths and wrapped cells).
+    paint_font: Option<Font>,
+    is_selecting: bool,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
+    last_edit: EditKind,
+    /// Whether the last content edit was a single typed grapheme or a single-char
+    /// backspace — the only edits auto-pairing should react to, so programmatic /
+    /// structural edits (table ops, etc.) don't trip it.
+    last_edit_keystroke: bool,
+    /// Spaces inserted per Tab / one list-nesting level (`Indent`/`Outdent`); set
+    /// by the host via [`Self::set_tab_indent`] to match its list-indent setting.
+    tab_indent: usize,
+    /// The target x for vertical (Up/Down) movement, so the caret keeps its
+    /// column across short lines. `Some` only during a run of Up/Down.
+    goal_x: Option<Pixels>,
+    /// Spans to underline (misspellings, etc.), set by the host via
+    /// [`Self::set_diagnostics`].
+    diagnostics: Vec<Diagnostic>,
+    /// Inline-markdown styling palette; `Some` = the WYSIWYG (live-preview)
+    /// view (W1), `None` = the raw view (plain text). Set by the host via
+    /// [`Self::set_markdown_style`].
+    markdown_style: Option<SyntaxStyle>,
+    /// Host-injectable UI labels for context menus / chrome; English by
+    /// default, localized through [`Self::set_labels`].
+    labels: Labels,
+    /// The open right-click suggestions menu, if any.
+    menu: Option<DiagMenu>,
+    /// The open table right-click menu's anchor (window space), if any. Its actions
+    /// operate on the caret's table cell.
+    table_menu: Option<Point<Pixels>>,
+    /// Scroll state for the table menu, so its overflow scrolls + shows a thumb.
+    table_menu_scroll: ScrollHandle,
+    /// The open image right-click menu, if any: the image's logical line + the
+    /// menu's anchor (window space). Offers Word-style object actions (Delete).
+    image_menu: Option<(usize, Point<Pixels>)>,
+    /// Right-clicked property-panel row: its source line + click position
+    /// (anchors the Edit/Delete property menu).
+    prop_menu: Option<(usize, Point<Pixels>)>,
+    /// Supplies replacement suggestions for a flagged word, fetched lazily when
+    /// the user right-clicks it. Set by the host via [`Self::on_suggest`];
+    /// without it, the right-click menu has nothing to offer.
+    suggest: Option<SuggestFn>,
+    /// Resolves a standalone image line's `src` to a decoded image for inline
+    /// rendering (W4); set by the host via [`Self::set_block_image_provider`].
+    block_image: Option<BlockImageFn>,
+    /// Classifies an `![](src)` as a file chip (e.g. a PDF) + its label; set by
+    /// the host via [`Self::set_block_chip_provider`].
+    block_chip: Option<BlockChipFn>,
+    embed_view: Option<EmbedViewFn>,
+    /// Resolves a ` ```mermaid ` block's source to a rendered diagram; set by the
+    /// host via [`Self::set_block_mermaid_provider`].
+    block_mermaid: Option<BlockMermaidFn>,
+    /// Resolves a `$$…$$` block's LaTeX to a typeset equation; set by the host via
+    /// [`Self::set_block_math_provider`].
+    block_math: Option<BlockMathFn>,
+    /// Fenced-code syntax highlighter, see [`CodeHighlightFn`].
+    code_highlight: Option<CodeHighlightFn>,
+    /// Host auto-replace hook, see [`Self::set_auto_replace`].
+    auto_replace: Option<AutoReplaceFn>,
+    /// What the most recent keystroke edit replaced (the selected text), for
+    /// the host's auto-pair logic — a text diff alone can't distinguish
+    /// "typed `[` over a selection starting with `[`" from "backspaced inside
+    /// a doubled pair". Consumed via [`Self::take_replaced_selection`].
+    last_replaced: Option<String>,
+    /// The em (px/font-size) the `block_math` provider rasterizes at — set via
+    /// [`Self::set_block_math_em`]. Inline `$…$` formulas reuse those rasters scaled by
+    /// `text_em / this`, so they sit at text size. `None` disables inline math rendering.
+    block_math_em: Option<f32>,
+    /// Per-logical-line `src` for rows painted as a file chip (from the last
+    /// paint), so a left-click can open it and a right-click can edit it.
+    chip_rows: Vec<Option<(SharedString, bool)>>,
+    /// Window-space painted bounds of each inline image, with its logical line
+    /// index (from the last paint), so a press near a corner can start a resize
+    /// and know which `![](src)` line to rewrite. One entry per rendered image.
+    image_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// Window-space bounds of each painted task checkbox, with its logical line —
+    /// so a click on the box toggles `[ ]`↔`[x]` instead of placing the caret.
+    checkbox_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// Painted code-card chrome bounds from the last frame (lang tag + Copy per
+    /// code block, keyed by the opening-fence row) — clicks route here before
+    /// caret placement.
+    code_chip_rects: Vec<CodeChipHit>,
+    /// Full card bounds of each code block from the last paint (`(first body
+    /// line, rect)`), for hover tracking — the chrome is hover-revealed.
+    code_card_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// The hovered code block's first body line, if any (chrome shows there).
+    code_chip_hover: Option<usize>,
+    /// Open language picker for a code block: `(opening fence row, anchor)`.
+    code_lang_menu: Option<(usize, Point<Pixels>)>,
+    code_lang_scroll: ScrollHandle,
+    /// Languages the host's highlighter supports, offered in the code block's
+    /// language picker. Empty (the default) disables the picker.
+    code_langs: Vec<SharedString>,
+    /// Painted chevron bounds of foldable callouts (`(line, rect)`, from the
+    /// last paint) — a click flips the marker's `-`/`+` fold char.
+    alert_fold_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// The in-progress corner-grip drag, if any (see [`ImageResize`]). While set,
+    /// that image paints at the live width and other mouse handling is suppressed.
+    image_resize: Option<ImageResize>,
+    /// An in-progress table column-border drag (drag-to-resize, issue #16):
+    /// the column resizes live; release persists `cols=` into the table's
+    /// marker line. `None` = no drag.
+    table_col_resize: Option<TableColResize>,
+    /// Last-paint column-resize grip bands: `(band, header row, column, width)`.
+    table_col_resize_rects: Vec<(Bounds<Pixels>, usize, usize, f32)>,
+    /// The band index the pointer is on (repaint-on-change for its accent line).
+    table_resize_hover: Option<usize>,
+    /// See [`ShapeMemo`] — `RefCell` because the measure closure holds only a
+    /// read borrow of the editor.
+    shape_memo: std::cell::RefCell<Option<ShapeMemo>>,
+    /// See [`ScanData`].
+    scan_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<ScanData>)>>,
+    /// See [`ScrollCompensatorFn`].
+    scroll_compensator: Option<ScrollCompensatorFn>,
+    /// Cross-frame shaping caches — line runs, table column widths, and table
+    /// wrap rows (see [`ShapeCaches`]). Capacity-capped in `shape_document`.
+    shape_caches: ShapeCaches,
+    /// The shaping window (element-local y, quantized), set after each
+    /// prepaint from the painted bounds — one frame stale by design, so the
+    /// measure pass and prepaint always shape with the SAME band and the
+    /// measure→prepaint memo keeps hitting.
+    shape_band: std::cell::Cell<Option<(f32, f32)>>,
+    /// Latch: the scroll compensator fired since the last paint. Measure can
+    /// run several times before a paint commits fresh `line_tops`; without
+    /// this, one async height change compensates once per measure call.
+    compensated: std::cell::Cell<bool>,
+    /// An active gutter block drag (Notion/Cditor-style reorder): the grabbed
+    /// block's first + last rows and the current drop boundary (a row index;
+    /// `== rows` drops at the document end).
+    line_drag: Option<(usize, usize, usize)>,
+    /// The row whose gutter grip the pointer hovers (mirrors prepaint's
+    /// computation) — tracked so hover changes repaint the grip.
+    grip_hover_row: Option<usize>,
+    /// Horizontal scroll of each wide table, keyed by its header row — wide
+    /// tables keep natural column widths and scroll in place. Keys drift on
+    /// edits above a table; entries are clamped at use, so a stale one is a
+    /// harmless partial offset. (ponytail: no eviction, the map stays tiny)
+    table_scroll_x: std::collections::HashMap<usize, f32>,
+    /// Last-paint wide-table scroll thumbs (padded grab rects), so the thumb
+    /// is mouse-draggable, not just an indicator.
+    table_thumbs: Vec<TableThumb>,
+    /// A live thumb drag: `(header row, grab x, scroll offset at grab)`.
+    table_thumb_drag: Option<(usize, Pixels, f32)>,
+    /// Extra left offset for the drag grip — the host sets its line-number
+    /// gutter's width here so the grip sits beside the numbers, not on them.
+    grip_inset: Pixels,
+    /// `content_gen` as of the last paint — a measure with the SAME generation
+    /// but different heights means an async (non-edit) height change, the
+    /// scroll-anchoring trigger.
+    last_paint_gen: u64,
+    /// Bumped on every content mutation — cheap staleness key for caches
+    /// (the UTF-16 conversion anchor below; a shape cache later).
+    content_gen: u64,
+    /// Resume point for UTF-8↔UTF-16 conversion: `(generation, utf8, utf16)`
+    /// of the last converted offset. IME composition fires conversions many
+    /// times per keystroke, clustered near the caret — resuming from the
+    /// anchor makes them O(distance) instead of O(document) (CJK latency
+    /// grew with note size; found auditing against Cditor's per-block IME).
+    utf16_anchor: std::cell::Cell<(u64, usize, usize)>,
+    /// A `$$…$$` block being edited in-line: its byte range + the host-supplied view (the
+    /// structural editor) painted in a reserved gap at the block's spot. `None` = none.
+    editing_block: Option<EditingBlock>,
+    /// Window-space painted bounds of each inline `$…$` formula + its absolute byte range and
+    /// inner LaTeX (from the last paint), so a click can open its structural editor and the
+    /// seated editor can be positioned at the formula's spot.
+    inline_math_rects: Vec<(Range<usize>, SharedString, Bounds<Pixels>)>,
+    /// An inline `$…$` formula under structural edit: its byte range + the host's editor view,
+    /// overlaid at the formula's spot. `None` = none.
+    editing_inline: Option<EditingInline>,
+    /// Painted bounds + target of each property-panel pill (from the last paint),
+    /// so a left-click opens it (`OpenWikiLink` / `OpenLink`).
+    prop_pill_rects: Vec<(Bounds<Pixels>, md_syntax::LinkHit)>,
+    /// Painted bounds of each property-panel row (from the last paint), so
+    /// `on_mouse_move` repaints when the hovered row changes (the panel's hover
+    /// border reads the live pointer during paint).
+    /// Each painted property-panel row's bounds + its source line (for
+    /// hover borders and the right-click property menu).
+    prop_row_rects: Vec<(Bounds<Pixels>, usize)>,
+    /// The property row the pointer was last over — drives `on_mouse_move`'s
+    /// repaint-on-change (like the table hover).
+    prop_hover_row: Option<usize>,
+    /// Collapsed headings, keyed by the heading's trimmed source line
+    /// (`## Goals`). View-local — markdown has no heading-fold syntax (unlike
+    /// callouts' `-`/`+`), so folds live for the editor's lifetime and a key
+    /// self-heals by vanishing when its heading text is edited.
+    folded_headings: std::collections::HashSet<String>,
+    /// Painted chevron bounds of heading folds (`(line, rect)`, from the last
+    /// paint) — a click toggles that heading in `folded_headings`.
+    heading_fold_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// Window-space bounds of every heading's first visual row (from the last
+    /// paint) — `on_mouse_move` hit-tests these for the hover chevron.
+    heading_row_rects: Vec<(usize, Bounds<Pixels>)>,
+    /// The heading line the pointer was last over — its chevron shows on hover
+    /// (a fold chevron on every heading would clutter). Drives
+    /// `on_mouse_move`'s repaint-on-change, like the property-row hover.
+    heading_hover_row: Option<usize>,
+}
+
+/// A math block under in-line structural edit: the byte range to overwrite on commit, and
+/// the host's editor view to render in the reserved gap.
+struct EditingBlock {
+    range: Range<usize>,
+    view: gpui::AnyView,
+    /// The block's displayed height — the gap reserved while editing, so the formula stays
+    /// put instead of jumping to a fixed size.
+    height: Pixels,
+}
+
+/// An inline `$…$` formula under structural edit: the byte range to overwrite on commit, and
+/// the host's editor view, overlaid at the formula's painted spot.
+struct EditingInline {
+    range: Range<usize>,
+    view: gpui::AnyView,
+    /// Where the view's top-left sits relative to the formula raster's top-left. The
+    /// host's editor view pads its raster differently than the display raster (whose
+    /// padding was baked at the block em and scaled down), so a zero offset shifts
+    /// the glyphs visibly on entering edit.
+    offset: Point<Pixels>,
 }
 
 impl MarkdownLivePreview {
-    /// 以源码创建实时预览编辑器（光标在 0）。
-    pub fn new(source: &str, cx: &mut App) -> Self {
-        let buffer = Buffer::new(source);
-        let live = parse_to_rows_live(source);
-        let p = Rc::new(StyleParams::from_theme_with_font(cx, None));
-        let dark = gpui_component::Theme::global(cx).is_dark();
-        #[cfg(debug_assertions)]
-        let ime_debug = std::env::var("GPUI_IMEDEBUG").is_ok();
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
-            buffer,
-            selection: Selection::collapsed(0),
+            focus_handle: cx.focus_handle(),
+            content: String::new(),
+            placeholder: SharedString::default(),
+            selected_range: 0..0,
+            selection_reversed: false,
             marked_range: None,
-            live,
-            focus_handle: cx.focus_handle().tab_stop(true),
-            p,
-            dark,
-            element_bounds: Bounds::default(),
-            v_handle: gpui::ScrollHandle::new(),
-            segs: Rc::new(RefCell::new(Vec::new())),
-            font_override: None,
-            styles_dirty: false,
-            blink_on: true,
-            blink_started: false,
-            last_ime_scroll: 0.0,
-            #[cfg(debug_assertions)]
-            ime_debug,
-            #[cfg(debug_assertions)]
-            click_content: None,
-            #[cfg(debug_assertions)]
-            ime_content: None,
-            click_ghost: None,
-            last_layout_width: 0.0,
-            goal: None,
+            clipboard_writer: None,
+            search: None,
+            wrapped: Vec::new(),
+            line_tops: Vec::new(),
+            line_heights: Vec::new(),
+            wrap_rows: Vec::new(),
+            widget_rows: Vec::new(),
+            offset_maps: Vec::new(),
+            line_insets: Vec::new(),
+            rtl_rows: Vec::new(),
+            table_rows: Vec::new(),
+            table_row_add_rects: Vec::new(),
+            table_col_add_rects: Vec::new(),
+            table_hover_zones: Vec::new(),
+            table_hover_region: None,
+            table_row_del: None,
+            table_col_del: None,
+            table_hover_cell: None,
+            last_bounds: None,
+            line_height: px(20.),
+            font_size: px(16.),
+            paint_font: None,
+            is_selecting: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: EditKind::Other,
+            last_edit_keystroke: false,
+            tab_indent: 4,
+            goal_x: None,
+            diagnostics: Vec::new(),
+            markdown_style: None,
+            labels: Labels::default(),
+            menu: None,
+            table_menu: None,
+            table_menu_scroll: ScrollHandle::new(),
+            image_menu: None,
+            prop_menu: None,
+            suggest: None,
+            block_image: None,
+            block_chip: None,
+            embed_view: None,
+            block_mermaid: None,
+            block_math: None,
+            block_math_em: None,
+            code_highlight: None,
+            auto_replace: None,
+            last_replaced: None,
+            chip_rows: Vec::new(),
+            image_rects: Vec::new(),
+            checkbox_rects: Vec::new(),
+            code_chip_rects: Vec::new(),
+            code_card_rects: Vec::new(),
+            code_chip_hover: None,
+            code_lang_menu: None,
+            code_lang_scroll: ScrollHandle::new(),
+            code_langs: Vec::new(),
+            alert_fold_rects: Vec::new(),
+            image_resize: None,
+            table_col_resize: None,
+            table_col_resize_rects: Vec::new(),
+            table_resize_hover: None,
+            shape_memo: std::cell::RefCell::new(None),
+            scan_cache: std::cell::RefCell::new(None),
+            scroll_compensator: None,
+            last_paint_gen: 0,
+            shape_caches: ShapeCaches::default(),
+            shape_band: std::cell::Cell::new(None),
+            compensated: std::cell::Cell::new(false),
+            line_drag: None,
+            grip_hover_row: None,
+            table_scroll_x: std::collections::HashMap::new(),
+            table_thumbs: Vec::new(),
+            table_thumb_drag: None,
+            grip_inset: px(0.),
+            content_gen: 0,
+            utf16_anchor: std::cell::Cell::new((0, 0, 0)),
+            editing_block: None,
+            inline_math_rects: Vec::new(),
+            editing_inline: None,
+            prop_pill_rects: Vec::new(),
+            prop_row_rects: Vec::new(),
+            prop_hover_row: None,
+            folded_headings: std::collections::HashSet::new(),
+            heading_fold_rects: Vec::new(),
+            heading_row_rects: Vec::new(),
+            heading_hover_row: None,
         }
     }
 
-    /// 首次渲染时启动自绘光标闪烁（只启动一次）。
-    fn ensure_blink(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.blink_started {
-            return;
+    /// Builder: start with the given text (caret at the start).
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.content = normalize_loaded(text.into());
+        let caret = caret_off_marker_line(&self.content, 0);
+        self.selected_range = caret..caret;
+        self
+    }
+
+    /// Builder: placeholder shown when empty.
+    pub fn with_placeholder(mut self, text: impl Into<SharedString>) -> Self {
+        self.placeholder = text.into();
+        self
+    }
+
+    /// The current document text.
+    pub fn text(&self) -> &str {
+        &self.content
+    }
+
+    /// Replace byte `range` with `text` as ONE recorded (undoable) edit, leaving the caret
+    /// after the inserted text. Unlike [`Self::set_text`] this preserves — and extends — the
+    /// undo history, so a host writing back a structural edit (e.g. a committed `$$…$$`
+    /// formula) lands as a normal undo step rather than clobbering the history.
+    pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        // Snap to char boundaries (start down, end up) so a stale/shifted range — e.g. one
+        // captured before a prior formula commit moved the bytes — can't panic mid-UTF-8.
+        let len = self.content.len();
+        let mut start = range.start.min(len);
+        while start > 0 && !self.content.is_char_boundary(start) {
+            start -= 1;
         }
-        self.blink_started = true;
-        cx.spawn_in(window, async move |this, cx: &mut gpui::AsyncWindowContext| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(530))
-                    .await;
-                let Some(this) = this.upgrade() else { break };
-                let _ = this.update_in(cx, |this, window, cx| {
-                    // 仅在编辑器获得输入焦点时闪烁；失焦则光标常亮且不重绘。
-                    if window.focused(cx).as_ref() == Some(&this.focus_handle) {
-                        this.blink_on = !this.blink_on;
-                        cx.notify();
-                    } else {
-                        this.blink_on = true;
-                    }
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// 当前全文（退出实时模式时写回/保存用）。
-    pub fn text(&self) -> String {
-        self.buffer.to_string()
-    }
-
-    /// 覆盖正文字号（应用 Ctrl+=/- 缩放用）；下一帧刷新排版参数。
-    pub fn set_font_override(&mut self, size_px: Option<f32>) {
-        if self.font_override != size_px {
-            self.font_override = size_px;
-            self.styles_dirty = true;
+        let mut end = range.end.clamp(start, len);
+        while end < len && !self.content.is_char_boundary(end) {
+            end += 1;
         }
-    }
-
-    pub fn focus_handle(&self) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-
-    /// 刷新主题排版参数（明暗 / 字号覆盖变化时）。
-    fn refresh_styles(&mut self, cx: &mut Context<Self>) {
-        let dark = gpui_component::Theme::global(cx).is_dark();
-        if dark != self.dark || self.styles_dirty {
-            self.dark = dark;
-            self.styles_dirty = false;
-            self.p = Rc::new(StyleParams::from_theme_with_font(cx, self.font_override));
-        }
-    }
-
-    /// 编辑后重解析（整篇）+ 清命中。
-    fn reparse(&mut self) {
-        self.live = parse_to_rows_live(&self.buffer.to_string());
-        self.segs.borrow_mut().clear();
-    }
-
-    /// 应用一次替换的**核心**（无 `cx`，可单测）：改 Buffer → 选区移到新文本末尾 →
-    /// 重解析。UI 包装见 [`Self::insert_edit`]（额外 notify）。
-    fn apply_edit(&mut self, range: Range<usize>, text: &str) {
-        let s = self.buffer.clip(range.start).min(self.buffer.len());
-        let e = self.buffer.clip(range.end).min(self.buffer.len());
-        let (s, e) = if s <= e { (s, e) } else { (e, s) };
-        self.buffer.apply_edit(s..e, text);
-        self.selection = Selection::collapsed(s + text.len());
+        let range = start..end;
+        self.record_edit(&range, text);
+        self.content.replace_range(range.clone(), text);
+        self.remap_diagnostics(&range, text.len());
+        let caret = range.start + text.len();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
         self.marked_range = None;
-        self.reparse();
-    }
-
-    /// 应用一次替换：改 Buffer → 选区移到新文本末尾 → 重解析 + 通知。
-    ///
-    /// 每次真实输入/编辑后必须把 OS 的 IME 定位推给平台（`invalidate_character_coordinates`
-    /// → 下一帧 `selected_bounds` → `ImmSetCompositionWindow`/`ImmSetCandidateWindow`）。
-    /// 否则 Windows 只在 `WM_IME_STARTCOMPOSITION` 拉取一次光标几何，组合/滚动期间
-    /// 候选窗与自绘闪烁光标会互相脱离。
-    fn insert_edit(&mut self, range: Range<usize>, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.apply_edit(range, text);
-        window.invalidate_character_coordinates();
+        // Don't coalesce a following keystroke into this structural replacement.
+        self.last_edit = EditKind::Other;
         cx.notify();
     }
 
-    // ------------------------------------------------------------------
-    // 坐标换算：源码字节 ↔ 渲染位置
-    // ------------------------------------------------------------------
-
-    /// 光标（源码偏移）→ (渲染行下标, 行内渲染字节)。文本行精确；块行 = (行,0)。
-    fn caret_target(&self) -> Option<(usize, usize)> {
-        if self.live.is_empty() {
-            return None;
-        }
-        let off = self.buffer.clip(self.selection.head());
-        for (ix, lr) in self.live.iter().enumerate() {
-            if lr.map.is_empty() {
-                continue;
-            }
-            let lo = lr.map[0];
-            let hi = *lr.map.last().unwrap();
-            if off >= lo && off <= hi {
-                let b = lr.map.partition_point(|&s| s <= off).saturating_sub(1);
-                let b = b.min(lr.map.len() - 1);
-                return Some((ix, b));
-            }
-        }
-        let mut chosen = 0usize;
-        for (ix, lr) in self.live.iter().enumerate() {
-            if lr.source_start <= off {
-                chosen = ix;
-            } else {
-                break;
-            }
-        }
-        Some((chosen, 0))
+    /// Replace the whole document; resets the caret to the start.
+    pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.content_gen += 1;
+        self.content = normalize_loaded(text.into());
+        // Never park the loaded caret on a collapsed marker line (`<!-- table/
+        // math:… -->`): the first focus would reveal it raw mid-interaction.
+        // This is the ONE passive parking path — every other caret write is a
+        // deliberate placement (which SHOULD reveal markers for editing).
+        let caret = caret_off_marker_line(&self.content, 0);
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        // A programmatic load isn't undoable to the prior document.
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = EditKind::Other;
+        cx.notify();
     }
 
-    /// 该行渲染字节区间内是否有选中；命中返回（渲染起, 渲染止）。
-    fn selection_rendered(&self, lr: &LiveRow, sel: (usize, usize)) -> Option<Range<usize>> {
-        if lr.map.is_empty() {
-            return None;
-        }
-        let (s, e) = if sel.0 <= sel.1 { sel } else { (sel.1, sel.0) };
-        let lo = lr.map[0];
-        let hi = *lr.map.last().unwrap();
-        if e <= lo || s >= hi {
-            return None;
-        }
-        let rs = lr.map.partition_point(|&v| v <= s).saturating_sub(1);
-        let re = lr.map.partition_point(|&v| v <= e).saturating_sub(1).min(lr.map.len() - 1);
-        Some(rs.min(re)..re)
+    /// Replace the set of diagnostics (underlined spans). The host computes these
+    /// (e.g. spell-check) and refreshes them as the text changes.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>, cx: &mut Context<Self>) {
+        self.diagnostics = diagnostics;
+        // Diagnostics feed the per-row run keys (they underline spans) — drop
+        // the memo so the next shape re-keys affected lines.
+        *self.shape_caches.row_keys.borrow_mut() = (None, Vec::new());
+        cx.notify();
     }
 
-    // ------------------------------------------------------------------
-    // 布局与渲染
-    // ------------------------------------------------------------------
+    /// Turn on WYSIWYG (live-preview) markdown styling with the given
+    /// color/font palette (call once at setup). Inline bold/italic/code/link/
+    /// tag formatting then renders as you type — markers stay in the text,
+    /// dimmed. Without it the editor is the raw view: plain text, spell-check
+    /// underlines only.
+    /// Languages offered in a code block's language picker (the host's
+    /// highlighter set, e.g. its compiled tree-sitter grammars). Empty — the
+    /// default — leaves the tag click-inert.
+    pub fn set_code_languages(&mut self, langs: Vec<SharedString>) {
+        self.code_langs = langs;
+    }
 
-    /// 行内样式（RunKind → 富样式）。
-    fn run_highlight(&self, kind: RunKind) -> HighlightStyle {
-        let mut s = HighlightStyle::default();
-        match kind {
-            RunKind::Bold => {
-                s.font_weight = Some(FontWeight::BOLD);
-            }
-            RunKind::Italic => {
-                s.font_style = Some(FontStyle::Italic);
-            }
-            RunKind::InlineCode => {
-                s.background_color = Some(self.p.code_bg);
-            }
-            RunKind::Strikethrough => {
-                s.strikethrough = Some(gpui::StrikethroughStyle { thickness: px(1.0), color: None });
-            }
-            RunKind::Link | RunKind::Image => {
-                s.color = Some(self.p.accent);
-                s.underline = Some(UnderlineStyle {
-                    thickness: px(1.0),
-                    color: Some(self.p.accent),
-                    wavy: false,
-                });
-            }
+    /// Install the scroll-anchoring hook (see [`ScrollCompensatorFn`]): when
+    /// an async block render (math/mermaid/image) changes heights above the
+    /// window viewport, the host receives the delta and shifts its scroll
+    /// offset so the visible content stays put (Cditor's anchor-restore).
+    pub fn set_scroll_compensator(&mut self, f: impl Fn(Pixels, &mut Window, &mut App) + 'static) {
+        self.scroll_compensator = Some(std::rc::Rc::new(f));
+    }
+
+    pub fn set_markdown_style(&mut self, style: SyntaxStyle, cx: &mut Context<Self>) {
+        self.markdown_style = Some(style);
+        cx.notify();
+    }
+
+    /// Set the host-localized labels for the context menus / chrome. Replace
+    /// on every language switch so the current editors pick it up.
+    pub fn set_labels(&mut self, labels: Labels, cx: &mut Context<Self>) {
+        self.labels = labels;
+        cx.notify();
+    }
+
+    /// Turn off live-preview styling — the editor falls back to plain text
+    /// (spell-check underlines only). Used when the host's WYSIWYG setting is
+    /// switched off; a no-op if styling was already off.
+    pub fn clear_markdown_style(&mut self, cx: &mut Context<Self>) {
+        if self.markdown_style.take().is_some() {
+            cx.notify();
         }
-        s
     }
 
-    /// 组装整行渲染字节内的样式段（富样式 + 本行选区底色），供段裁剪。
-    fn row_styles(&self, lr: &LiveRow, sel: Option<Range<usize>>) -> Vec<(Range<usize>, HighlightStyle)> {
-        let runs: Vec<(Range<usize>, HighlightStyle)> = lr
-            .row
-            .runs
-            .iter()
-            .map(|(r, k)| (r.clone(), self.run_highlight(*k)))
-            .collect();
-        merge_highlights(&runs, sel, self.p.accent.opacity(0.30))
+    /// Install the provider consulted when the user right-clicks a flagged word.
+    /// It's handed the offending word and returns replacements (best first).
+    /// Kept lazy by design — the OS suggestion call can be slow, so it runs only
+    /// on right-click, never in the per-edit detection pass.
+    pub fn on_suggest(&mut self, provider: impl Fn(&str) -> Vec<String> + 'static) {
+        self.suggest = Some(Box::new(provider));
     }
 
-    /// 把整行样式裁剪到某段渲染字节范围（`range` 相对 `row_text`）。
-    fn seg_styled_text(
+    /// Install the provider that resolves a standalone image line's `src` to a
+    /// decoded image; with it, such lines render inline (W4) when the caret is
+    /// elsewhere. Without it (or while an image is still loading), the line shows
+    /// its raw `![](src)` source.
+    pub fn set_block_image_provider(
+        &mut self,
+        provider: impl Fn(&str) -> Option<Arc<RenderImage>> + 'static,
+    ) {
+        self.block_image = Some(Box::new(provider));
+    }
+
+    /// Install the provider that classifies an `![](src)` reference as a file chip
+    /// (e.g. a PDF) and supplies its label. With it, such lines render as a
+    /// clickable chip when the caret is elsewhere; a left-click emits
+    /// [`EditorEvent::OpenLink`] and a right-click places the caret to edit.
+    pub fn set_block_chip_provider(
+        &mut self,
+        provider: impl Fn(&str) -> Option<SharedString> + 'static,
+    ) {
+        self.block_chip = Some(Box::new(provider));
+    }
+
+    /// Install the provider that resolves a standalone `![[target]]` line to a
+    /// host view rendering the transclusion + the height to reserve for it.
+    /// With it, such lines show the embedded content in place (raw on caret);
+    /// without (or when it returns `None`) they fall back to a clickable chip.
+    pub fn set_embed_provider(
+        &mut self,
+        provider: impl Fn(&str) -> Option<(gpui::AnyView, Pixels)> + 'static,
+    ) {
+        self.embed_view = Some(Box::new(provider));
+    }
+
+    /// Install the provider that resolves a ` ```mermaid ` block's source to a
+    /// rendered diagram: the bitmap plus its logical (display) px size — see
+    /// [`BlockMathFn`] for why the host supplies the size. With it, such a block
+    /// renders as the diagram when the caret is elsewhere; with the caret inside
+    /// (or while it renders) it shows the raw fenced source. Pre-render with
+    /// [`mermaid_sources`].
+    pub fn set_block_mermaid_provider(
+        &mut self,
+        provider: impl Fn(&str) -> Option<(Arc<RenderImage>, f32, f32)> + 'static,
+    ) {
+        self.block_mermaid = Some(Box::new(provider));
+    }
+
+    /// Install the provider that resolves a `$$…$$` block's LaTeX to a typeset
+    /// equation: the bitmap plus its logical (display) px size — see
+    /// [`BlockMathFn`] for why the host supplies the size. With it, such a block
+    /// renders as the equation when the caret is elsewhere; with the caret inside
+    /// (or while it renders) it shows the raw `$$…$$` source. Pre-render with
+    /// [`math_sources`].
+    /// Route Copy/Cut through `writer` instead of gpui's plain-string copy —
+    /// the host owns the actual clipboard write (and its extra flavors).
+    pub fn set_clipboard_writer(&mut self, writer: ClipboardWriter) {
+        self.clipboard_writer = Some(writer);
+    }
+
+    /// Highlight `matches` (source byte ranges) behind the text — soft yellow,
+    /// with `active` in the stronger current-match orange (the reader's
+    /// browser-style find colors). Empty clears. Host-driven: a find bar
+    /// computes matches (see [`find_in_source`]) and steps `active`.
+    pub fn set_search(
+        &mut self,
+        matches: Vec<Range<usize>>,
+        active: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        self.search = (!matches.is_empty()).then_some((matches, active));
+        cx.notify();
+    }
+
+    /// The window-space top of the row containing byte `offset` (from the
+    /// last layout) — for a host scrolling a find match into view. `None`
+    /// before first paint or for an out-of-range offset.
+    pub fn offset_screen_top(&self, offset: usize) -> Option<Pixels> {
+        let bounds = self.last_bounds?;
+        let (row, _) = self.row_col(offset.min(self.content.len()));
+        Some(bounds.top() + self.line_tops.get(row).copied()?)
+    }
+
+    pub fn set_block_math_provider(
+        &mut self,
+        provider: impl Fn(&str) -> Option<(Arc<RenderImage>, f32, f32)> + 'static,
+    ) {
+        self.block_math = Some(Box::new(provider));
+    }
+
+    /// Declare the em the `block_math` provider rasterizes at (e.g. the host's display-math
+    /// font size). Turns on inline `$…$` rendering: each inline formula reuses the block
+    /// raster for the same LaTeX, scaled by `text_em / em` so it sits at text size. Pre-render
+    /// inline sources too (see [`inline_math_sources`]).
+    pub fn set_block_math_em(&mut self, em: f32) {
+        self.block_math_em = (em > 0.).then_some(em);
+    }
+
+    /// Set the fenced-code syntax highlighter (see [`CodeHighlightFn`]).
+    pub fn set_code_highlighter(
+        &mut self,
+        f: impl Fn(&str, &str) -> Vec<(Range<usize>, HighlightStyle)> + 'static,
+    ) {
+        self.code_highlight = Some(Box::new(f));
+    }
+
+    /// The text the most recent keystroke edit replaced (its selection), if
+    /// any — consumed (one read per edit). Lets a host's auto-pair logic tell
+    /// "opener typed over a selection" from deletions with identical diffs.
+    pub fn take_replaced_selection(&mut self) -> Option<String> {
+        self.last_replaced.take()
+    }
+
+    /// Set the word-completion auto-replace hook (see [`AutoReplaceFn`]).
+    pub fn set_auto_replace(
+        &mut self,
+        f: impl Fn(&str) -> Option<(Range<usize>, String)> + 'static,
+    ) {
+        self.auto_replace = Some(Box::new(f));
+    }
+
+    /// Run the host's auto-replace hook after a boundary character landed at
+    /// `boundary` (the byte offset of the char itself). Applies the returned
+    /// replacement as its own undo step and shifts the caret by the growth.
+    fn apply_auto_replace(&mut self, boundary: usize) {
+        let Some(f) = self.auto_replace.as_ref() else {
+            return;
+        };
+        let line_start = self.content[..boundary].rfind('\n').map_or(0, |p| p + 1);
+        let line = &self.content[line_start..boundary];
+        if line.is_empty() {
+            return;
+        }
+        // Inside a fenced code block, the text is verbatim — never rewrite it.
+        // Fence parity comes from the cached scan (this runs on every boundary
+        // keystroke; the per-line rescan grew with the document).
+        let (row, _) = self.row_col(boundary);
+        if *self.scan_data().fence_odd.get(row).unwrap_or(&false)
+            || line.trim_start().starts_with("```")
+        {
+            return;
+        }
+        let Some((r, replacement)) = f(line) else {
+            // No host rule fired — normalize math around the caret instead:
+            // words-attached `$$` fences and words-mixed `$$…$$` pairs split
+            // onto their own lines (issue #54: the formula renders display,
+            // the words stay VISIBLE — nothing is ever hidden). Paragraph-
+            // bounded, one recorded edit.
+            self.normalize_math_at(row);
+            return;
+        };
+        if r.start >= r.end || r.end > line.len() {
+            return;
+        }
+        let abs = line_start + r.start..line_start + r.end;
+        let delta = replacement.len() as isize - abs.len() as isize;
+        self.record_edit(&abs, &replacement);
+        self.content =
+            self.content[..abs.start].to_owned() + &replacement + &self.content[abs.end..];
+        self.remap_diagnostics(&abs, replacement.len());
+        let caret = (self.selected_range.start as isize + delta) as usize;
+        self.selected_range = caret..caret;
+    }
+
+    /// Begin an in-line structural edit of the `$$…$$` block at `range`: reserve a gap at
+    /// its spot and paint `view` (the host's editor) there. The host focuses `view`.
+    pub fn set_editing_block(
+        &mut self,
+        range: Range<usize>,
+        view: gpui::AnyView,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing_block = Some(EditingBlock {
+            range,
+            view,
+            height,
+        });
+        cx.notify();
+    }
+
+    /// The byte range of the block currently being structurally edited (the range handed
+    /// to [`Self::set_editing_block`] — the source text is untouched while the edit is
+    /// open, so it stays valid). `None` when no block edit is open.
+    pub fn editing_block_range(&self) -> Option<Range<usize>> {
+        self.editing_block.as_ref().map(|eb| eb.range.clone())
+    }
+
+    /// End an in-line math edit (the host has committed / cancelled). Returns the block's
+    /// byte range, so the host can overwrite it.
+    pub fn end_editing_block(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        let range = self.editing_block.take().map(|eb| eb.range);
+        cx.notify();
+        range
+    }
+
+    /// Begin a structural edit of the inline `$…$` span at `range` (absolute bytes): overlay
+    /// `view` (the host's editor) at the formula's painted spot. The host focuses `view`.
+    /// `offset` places the view relative to the raster's top-left, letting the host
+    /// align the view's glyphs with the displayed formula's (their paddings differ).
+    pub fn set_editing_inline(
+        &mut self,
+        range: Range<usize>,
+        view: gpui::AnyView,
+        offset: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing_inline = Some(EditingInline {
+            range,
+            view,
+            offset,
+        });
+        cx.notify();
+    }
+
+    /// End an inline math edit. Returns the span's byte range, so the host can overwrite it.
+    pub fn end_editing_inline(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
+        let range = self.editing_inline.take().map(|e| e.range);
+        cx.notify();
+        range
+    }
+
+    /// Whether `range` still bounds an inline `$…$` span (a `$` at each end, content between, no
+    /// newline, not a `$$` fence) — guards the inline commit against a stale/shifted range that
+    /// would otherwise splice text at the wrong spot.
+    pub fn is_inline_math_range(&self, range: &Range<usize>) -> bool {
+        range.start < range.end
+            && range.end <= self.content.len()
+            && self.content.is_char_boundary(range.start)
+            && self.content.is_char_boundary(range.end)
+            && {
+                let s = &self.content[range.clone()];
+                s.len() >= 3
+                    && s.starts_with('$')
+                    && s.ends_with('$')
+                    && !s.starts_with("$$")
+                    && !s.contains('\n')
+            }
+    }
+
+    /// The horizontal alignment of the `$$…$$` block whose byte range starts at `block_start`
+    /// (its `<!-- math:ALIGN -->` marker, or `Center` by default) — so the host can seed the
+    /// in-line editor at the right justification when opening it.
+    pub fn math_align(&self, block_start: usize) -> MathAlign {
+        let row = self.row_col(block_start).0;
+        markdown_syntax::math_regions(&self.content)
+            .into_iter()
+            .find(|r| r.range.start == row)
+            .map_or(MathAlign::default(), |r| r.align)
+    }
+
+    /// Compute the recorded edit that writes `align`'s marker for the `$$` block at byte
+    /// `block`: the (possibly marker-extended) range to replace, and the marker prefix to
+    /// prepend to the rewritten block. Center (default) → no marker (drops any existing one);
+    /// left/right → add or replace it. The host appends the block text to the prefix. Folding
+    /// the marker into the block's commit edit avoids a separate, range-shifting edit.
+    pub fn math_marker_edit(
         &self,
-        seg_text: &SharedString,
-        range: &Range<usize>,
-        styles: &[(Range<usize>, HighlightStyle)],
-    ) -> StyledText {
-        let mut clipped: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-        for (r, st) in styles {
-            let s = r.start.max(range.start);
-            let e = r.end.min(range.end);
-            if e > s {
-                clipped.push(((s - range.start)..(e - range.start), *st));
-            }
-        }
-        StyledText::new(seg_text.clone()).with_highlights(clipped)
-    }
-
-    /// 空行目标列用：该行字体的空格前缀宽（`" "` 的 x_for_index(1)）。
-    fn space_advance(&self, window: &mut Window, kind: RowKind) -> f32 {
-        let p = self.p.clone();
-        let (fs, fam) = if matches!(kind, RowKind::Code) {
-            (p.code_size, p.mono.clone())
+        block: Range<usize>,
+        align: MathAlign,
+    ) -> (Range<usize>, String) {
+        let row = self.row_col(block.start).0;
+        let prefix = align.marker().map_or(String::new(), |m| format!("{m}\n"));
+        let has_marker =
+            row > 0 && markdown_syntax::math_align_marker(self.line_str(row - 1)).is_some();
+        let start = if has_marker {
+            self.line_starts()[row - 1]
         } else {
-            (p.para_size, SharedString::from(BODY_FONT))
+            block.start
         };
-        let run = gpui::TextRun {
-            len: 1,
-            font: font(fam),
-            color: Hsla::default(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let l = window.text_system().shape_line(SharedString::from(" "), fs, &[run], None);
-        l.x_for_index(1).as_f32().max(1.0)
+        (start..block.end, prefix)
     }
 
-    /// 按单词自动换行：把 `text` 拆成 ≤`max_width_px` 的显示段。返回 (段字节范围, 段文本, 整形)。
-    fn wrap_segments(
-        &self,
-        window: &mut Window,
-        text: SharedString,
-        font_size: gpui::Pixels,
-        family: SharedString,
-        max_width_px: f32,
-    ) -> Vec<(Range<usize>, SharedString, ShapedLine)> {
-        let shape = |window: &mut Window, s: &str, len: usize| -> ShapedLine {
-            let run = gpui::TextRun {
-                len,
-                font: font(family.clone()),
-                color: Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_line(SharedString::from(s), font_size, &[run], None)
-        };
-        if text.is_empty() || max_width_px <= 8.0 {
-            let l = shape(window, text.as_ref(), text.len());
-            return vec![(0..l.len(), text, l)];
-        }
-        let mut out: Vec<(Range<usize>, SharedString, ShapedLine)> = Vec::new();
-        let bytes = text.as_bytes();
-        let mut line_begin = 0usize;
-        let mut i = 0usize;
-        let mut acc = String::new();
-        let mut last_break = 0usize;
-        while i < bytes.len() {
-            let ch = text[i..].chars().next().unwrap();
-            acc.push_str(&text[i..i + ch.len_utf8()]);
-            if ch.is_whitespace() {
-                last_break = acc.len();
-            }
-            let w = shape(window, &acc, acc.len()).width.as_f32();
-            if w > max_width_px && !acc.is_empty() {
-                let (cut_rel, skip_space) = if last_break > 0 {
-                    (last_break, true)
-                } else {
-                    ((acc.len() - ch.len_utf8()).max(1), false)
-                };
-                let slice_end = line_begin + cut_rel;
-                let seg_text = SharedString::from(text[line_begin..slice_end].to_string());
-                let l = shape(window, &seg_text, seg_text.len());
-                out.push((line_begin..slice_end, seg_text, l));
-                line_begin = slice_end;
-                if skip_space {
-                    while line_begin < bytes.len()
-                        && text[line_begin..].chars().next().is_some_and(|c| c.is_whitespace())
+    /// Re-find a `$$…$$` block by its exact LaTeX `source`, returned as a BYTE range (nearest
+    /// to the now-stale byte `approx` if several match) — so opening/committing one after a
+    /// prior formula's commit shifted offsets targets the right block. `math_blocks` yields
+    /// LINE ranges, so convert like `math_block_at` does (else the caret jumps to the top).
+    pub fn find_math_block(&self, source: &str, approx: usize) -> Option<Range<usize>> {
+        let starts = self.line_starts();
+        markdown_syntax::math_blocks(&self.content)
+            .into_iter()
+            .filter(|(_, s)| s == source)
+            .map(|(r, _)| starts[r.start]..self.line_end(r.end - 1))
+            .min_by_key(|r| r.start.abs_diff(approx))
+    }
+
+    /// Re-find an inline `$…$` span by its exact inner LaTeX, as an absolute byte range (nearest
+    /// to the now-stale byte `approx` if several match) — the inline counterpart of
+    /// [`Self::find_math_block`], so opening/committing after a prior edit shifted offsets
+    /// targets the right span.
+    pub fn find_inline_math(&self, latex: &str, approx: usize) -> Option<Range<usize>> {
+        let mut line_start = 0;
+        let mut best: Option<Range<usize>> = None;
+        for line in self.content.split('\n') {
+            for span in markdown_syntax::inline_math_spans(line) {
+                if markdown_syntax::inline_math_latex(line, &span) == latex {
+                    let abs = line_start + span.start..line_start + span.end;
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| abs.start.abs_diff(approx) < b.start.abs_diff(approx))
                     {
-                        line_begin += text[line_begin..].chars().next().unwrap().len_utf8();
+                        best = Some(abs);
                     }
                 }
-                last_break = 0;
-                let hi = i.saturating_add(ch.len_utf8()).max(line_begin);
-                acc = text.get(line_begin..hi).map(str::to_string).unwrap_or_default();
             }
-            i += ch.len_utf8();
+            line_start += line.len() + 1;
         }
-        if text.len() > line_begin {
-            let seg_text = SharedString::from(text[line_begin..].to_string());
-            let l = shape(window, &seg_text, seg_text.len());
-            out.push((line_begin..text.len(), seg_text, l));
+        best
+    }
+
+    /// Whether byte `range` (half-open) still starts a `$$…$$` block — a commit guard so a
+    /// stale/shifted range can't splice the block into the wrong place and corrupt the doc.
+    pub fn is_math_block_range(&self, range: &Range<usize>) -> bool {
+        range.end <= self.content.len()
+            && range.start <= range.end
+            && self.content.is_char_boundary(range.start)
+            && self.content[range.start..range.end]
+                .trim_start()
+                .starts_with("$$")
+    }
+
+    /// The text of logical line `row` (without its trailing newline).
+    fn line_str(&self, row: usize) -> &str {
+        let starts = self.line_starts();
+        match starts.get(row) {
+            Some(&s) => &self.content[s..self.line_end(row)],
+            None => "",
+        }
+    }
+
+    /// The host-supplied embed views, each positioned in the gap its
+    /// `![[target]]` line reserved (from the last paint's line tops) — the
+    /// editing-block overlay generalized to N transclusions. Absolute children
+    /// of the editor's `relative` root, so they scroll with the content; the
+    /// caret's own line shows raw source instead (its gap wasn't reserved).
+    fn embed_overlays(&self, window: &Window) -> Vec<gpui::Div> {
+        let Some(provider) = &self.embed_view else {
+            return Vec::new();
+        };
+        if self.markdown_style.is_none() {
+            return Vec::new();
+        }
+        let caret_row = self
+            .focus_handle
+            .is_focused(window)
+            .then(|| self.row_col(self.cursor_offset()).0);
+        let mut out = Vec::new();
+        for (row, line) in self.content.split('\n').enumerate() {
+            if caret_row == Some(row) {
+                continue;
+            }
+            let Some(inner) = md_syntax::embed_line(line) else {
+                continue;
+            };
+            let (Some(top), Some((view, height))) = (self.line_tops.get(row), provider(inner))
+            else {
+                continue;
+            };
+            out.push(
+                div()
+                    .absolute()
+                    .top(*top)
+                    .left(px(0.))
+                    .w_full()
+                    .h(height)
+                    // Clicks/wheel belong to the embed (it may scroll its own
+                    // content), not the text layer underneath.
+                    .occlude()
+                    .child(view),
+            );
         }
         out
     }
 
-    /// 布局某行 → 把该行各段写入 `self.segs`（内容坐标），返回行高。
-    fn layout_row(
-        &mut self,
-        window: &mut Window,
-        row_ix: usize,
-        lr: &LiveRow,
-        y: f32,
-        width_px: f32,
-        row_maps: &[Option<Rc<Vec<usize>>>],
-    ) -> f32 {
-        let p = self.p.clone();
-        let map = row_maps[row_ix].clone();
-        let left_x = Self::row_left_x(lr.row.kind, lr);
-        // 引述带用内衬（py）留出上下呼吸空间；代码块改用「顶/底空白带」实现，
-        // 不再带内衬（首/末空白带各自占一行，对齐预览 code_block_bands）。
-        let band_py = if matches!(lr.row.kind, RowKind::Quote) {
-            BAND_PY
-        } else {
-            0.0
-        };
-        let mut row_h = band_py;
-        // 引述 DOM 带上下 `py(BAND_PY)`：上内衬随文本段顶部对齐，下内衬（3px）只影响
-        // 该行总高。必须计入返回的 `row_h`，否则后续行的 seg 几何比实际绘制矮 → 每处
-        // 引述累积 +3px「光标/输入相对文本往上飘」漂移。
-        let band_footer = if matches!(lr.row.kind, RowKind::Quote) {
-            BAND_PY
-        } else {
-            0.0
-        };
-        let segs = self.segs.clone();
-        let push = |segs: &Rc<RefCell<Vec<SegHit>>>, s: SegHit| segs.borrow_mut().push(s);
-        if is_text_kind(lr.row.kind) {
-            let font_size = match lr.row.kind {
-                RowKind::Heading(level) => p.heading_metrics(level).0,
-                _ => p.para_size,
-            };
-            let line_h_f = match lr.row.kind {
-                RowKind::Heading(level) => p.heading_metrics(level).1.as_f32(),
-                _ => p.para_line.as_f32(),
-            };
-            let max_w = Self::text_width(width_px, lr.row.kind);
-            let wrapped = self.wrap_segments(window, lr.row.text.clone(), font_size, SharedString::from(BODY_FONT), max_w);
-            for (range, seg_text, line) in &wrapped {
-                let len = seg_text.len();
-                push(
-                    &segs,
-                    SegHit {
-                        row_ix,
-                        top: y + row_h,
-                        height: line_h_f,
-                        x: left_x,
-                        range: range.clone(),
-                        map: map.clone(),
-                        base: lr.source_start,
-                        line: Some(line.clone()),
-                        text_len: len,
-                    },
-                );
-                row_h += line_h_f;
-            }
-            if wrapped.is_empty() {
-                push(
-                    &segs,
-                    SegHit {
-                        row_ix,
-                        top: y + row_h,
-                        height: line_h_f,
-                        x: left_x,
-                        range: 0..0,
-                        map: map.clone(),
-                        base: lr.source_start,
-                        line: None,
-                        text_len: 0,
-                    },
-                );
-                row_h += line_h_f;
-            }
-            row_h += band_footer;
-        } else if lr.row.kind == RowKind::Code {
-            let (code_lines, _language) = match &lr.row.payload {
-                Some(pl) => match &**pl {
-                    RowPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
-                    _ => (Vec::new(), None),
-                },
-                None => (Vec::new(), None),
-            };
-            let fence_line = self.buffer.line_of_offset(lr.source_start);
-            let line_h = p.code_line.as_f32();
-            let spacer = |row_ix: usize, y: f32, x: f32, base: usize| SegHit {
-                row_ix,
-                top: y,
-                height: line_h,
-                x,
-                range: 0..0,
-                map: None,
-                base,
-                line: None,
-                text_len: 0,
-            };
-            // 顶空白带（圆角卡片的顶部呼吸空间，对齐预览首行空白带，非交互段）。
-            push(&segs, spacer(row_ix, y + row_h, left_x, lr.source_start));
-            row_h += line_h;
-            // 语言头（非交互段，占一行保证几何对齐）；仅渲染存在语言标签时画，故必须存在。
-            if _language.is_some() {
-                push(&segs, spacer(row_ix, y + row_h, left_x, lr.source_start));
-                row_h += line_h;
-            }
-            for k in 0..code_lines.len() {
-                let base_line = (fence_line + 1 + k).min(self.buffer.line_count().saturating_sub(1));
-                let base = self.buffer.line_start(base_line);
-                let code = code_lines[k].clone();
-                let run = gpui::TextRun {
-                    len: code.len(),
-                    font: font(p.mono.clone()),
-                    color: Hsla::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let l = window.text_system().shape_line(code.clone(), p.code_size, &[run], None);
-                let len = code.len();
-                push(
-                    &segs,
-                    SegHit {
-                        row_ix,
-                        top: y + row_h,
-                        height: line_h,
-                        x: left_x,
-                        range: 0..len,
-                        map: None,
-                        base,
-                        line: Some(l),
-                        text_len: len,
-                    },
-                );
-                row_h += line_h;
-            }
-            // 底空白带（圆角卡片的底部呼吸空间）。
-            let last_base = code_lines
-                .len()
-                .checked_sub(1)
-                .map(|k| {
-                    let base_line = (fence_line + 1 + k).min(self.buffer.line_count().saturating_sub(1));
-                    self.buffer.line_start(base_line)
-                })
-                .unwrap_or(lr.source_start);
-            push(&segs, spacer(row_ix, y + row_h, left_x, last_base));
-            row_h += line_h;
-        } else {
-            let h = self.block_height(lr.row.kind, lr, p.clone());
-            push(
-                &segs,
-                SegHit {
-                    row_ix,
-                    top: y + row_h,
-                    height: h,
-                    x: left_x,
-                    range: 0..0,
-                    map: None,
-                    base: lr.source_start,
-                    line: None,
-                    text_len: 0,
-                },
-            );
-            row_h += h;
-        }
-        row_h
-    }
-
-    /// 行文本左起点 x（对齐预览）：外层 `px_3`(ROW_MX) 内缩背景，代码带再加带内
-    /// `pl_3`(ROW_MX)，引述带再叠左边条宽。与 `text_or_code_element` 的结构一一对应。
-    fn row_left_x(kind: RowKind, _lr: &LiveRow) -> f32 {
-        match kind {
-            RowKind::Quote => crate::config::markdown::QUOTE_BAR_WIDTH_PX + ROW_MX * 2.0,
-            RowKind::Code => ROW_MX * 2.0,
-            _ => ROW_MX,
-        }
-    }
-
-    /// 当前行的文本可用宽度（与渲染结构一致，供自动换行折行用）：
-    /// 引述 = 宽 - 外层两内缩 - 带内两内缩 - 左边条；其余文本行 = 宽 - 两内缩。
-    fn text_width(width_px: f32, kind: RowKind) -> f32 {
-        match kind {
-            RowKind::Quote => width_px - crate::config::markdown::QUOTE_BAR_WIDTH_PX - ROW_MX * 4.0,
-            _ => width_px - ROW_MX * 2.0,
-        }
-    }
-
-    /// 非文本占位块高度。
-    fn block_height(&self, kind: RowKind, lr: &LiveRow, p: Rc<StyleParams>) -> f32 {
-        match kind {
-            RowKind::Blank => p.blank_h.as_f32(),
-            RowKind::Rule => p.rule_h.as_f32(),
-            RowKind::Image => crate::config::markdown::IMAGE_ROW_DEFAULT_H as f32,
-            RowKind::Table => {
-                let rows = lr.row.table().map_or(1.0, |t| (t.rows.len() + 1) as f32);
-                rows * (p.para_line.as_f32() + p.para_gap.as_f32())
-            }
-            _ => p.para_line.as_f32(),
-        }
-    }
-
-    /// 文本（或代码）行的元素：由 `self.segs` 里该行的段驱动。
-    fn text_or_code_element(
-        &mut self,
-        row_ix: usize,
-        lr: &LiveRow,
-        styles: &[(Range<usize>, HighlightStyle)],
-    ) -> AnyElement {
-        let p = self.p.clone();
-        if lr.row.kind == RowKind::Code {
-            let (mut lines, language) = match &lr.row.payload {
-                Some(pl) => match &**pl {
-                    RowPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
-                    _ => (Vec::new(), None),
-                },
-                None => (Vec::new(), None),
-            };
-            let line_h = p.code_line;
-            // 整块圆角卡片（对齐预览 code_block_bands）：顶/底空白带同背景铺平（上下
-            // 各留一行呼吸空间），整块圆角 lg(8px)；代码行 `pl_3`/`pr_3` 内衬；
-            // 外层 `px_3` 内缩 → 背景不与边缘相接。
-            let mut col = div()
+    /// The host-supplied editor view for an in-line math edit, positioned in the gap its
+    /// block reserves (from the last paint's line tops/heights). An absolute child of the
+    /// editor's `relative` root, so it scrolls with the content.
+    fn editing_block_overlay(&self) -> Option<gpui::Div> {
+        let eb = self.editing_block.as_ref()?;
+        let row = self.row_col(eb.range.start).0;
+        let top = *self.line_tops.get(row)?;
+        let height = *self.line_heights.get(row)?;
+        Some(
+            div()
+                .absolute()
+                .top(top)
+                .left(px(0.))
                 .w_full()
-                .flex()
-                .flex_col()
-                .bg(p.code_bg)
-                .overflow_hidden()
-                .rounded(px(8.0));
-            col = col.child(div().h(line_h).w_full().bg(p.code_bg));
-            if let Some(lang) = language {
-                col = col.child(
-                    div()
-                        .h(line_h)
-                        .flex()
-                        .items_center()
-                        .pl(px(ROW_MX))
-                        .pr(px(ROW_MX))
-                        .text_color(p.muted_fg)
-                        .text_size(px(11.0))
-                        .child(lang),
-                );
-            }
-            for code in lines.drain(..) {
-                col = col.child(
-                    div()
-                        .h(line_h)
-                        .flex()
-                        .items_center()
-                        .pl(px(ROW_MX))
-                        .pr(px(ROW_MX))
-                        .child(
-                            div()
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .font_family(p.mono.clone())
-                                .text_size(p.code_size)
-                                .text_color(p.fg)
-                                .child(SharedString::from(code.as_ref())),
-                        ),
-                );
-            }
-            col = col.child(div().h(line_h).w_full().bg(p.code_bg));
-            return div().w_full().px(px(ROW_MX)).child(col).into_any_element();
-        }
-        // 文本行：按该行的段逐段渲染（自动换行由 `wrap_segments` 已拆好的段驱动）。
-        let text = lr.row.text.clone();
-        let style_fs = match lr.row.kind {
-            RowKind::Heading(level) => p.heading_metrics(level).0,
-            _ => p.para_size,
-        };
-        let mut stack = div().w_full().flex().flex_col();
-        let segs = self.segs.borrow();
-        for s in segs.iter().filter(|s| s.row_ix == row_ix) {
-            let seg_text = if s.range.start < text.len() {
-                SharedString::from(text[s.range.start.min(text.len())..s.range.end.min(text.len())].to_string())
-            } else {
-                SharedString::from("")
-            };
-            let st = self.seg_styled_text(&seg_text, &s.range, styles);
-            let color = if lr.row.kind == RowKind::Quote {
-                p.muted_fg
-            } else {
-                p.fg
-            };
-            stack = stack.child(
-                div()
-                    .h(px(s.height))
-                    .flex()
-                    .items_center()
-                    .font_family(SharedString::from(BODY_FONT))
-                    .text_size(style_fs)
-                    .text_color(color)
-                    .child(st),
-            );
-        }
-        let stack = stack.into_any_element();
-        if lr.row.kind == RowKind::Quote {
-            let bar: Hsla = gpui::rgb(crate::config::markdown::QUOTE_BAR_COLOR).into();
-            // 对齐预览：外层 `px_3` 内缩（背景不与边缘相接），内层带 `pl_3`/`pr_3`
-            // + `py_1` 内衬 + 左边条 + 灰底。
-            return div()
-                .w_full()
-                .px(px(ROW_MX))
-                .child(
-                    div()
-                        .w_full()
-                        .py(px(BAND_PY))
-                        .pl(px(ROW_MX))
-                        .pr(px(ROW_MX))
-                        .border_l(px(crate::config::markdown::QUOTE_BAR_WIDTH_PX))
-                        .border_color(bar)
-                        .bg(p.quote_bg)
-                        .child(stack),
-                )
-                .into_any_element();
-        }
-        div()
-            .w_full()
-            .pl(px(Self::row_left_x(lr.row.kind, lr)))
-            .pr(px(ROW_MX))
-            .child(stack)
-            .into_any_element()
+                .h(height)
+                // Occlude so clicks inside the hosted math editor don't fall through to the
+                // text layer below — which would seat the caret on the next line and steal
+                // focus, blurring (committing + closing) the structural editor.
+                .occlude()
+                .child(eb.view.clone()),
+        )
     }
 
-    /// 空/规则/图片/表格等块元素。
-    fn block_element(&mut self, lr: &LiveRow) -> AnyElement {
-        let p = self.p.clone();
-        match lr.row.kind {
-            RowKind::Blank => div().h(px(p.blank_h.as_f32())).w_full().into_any_element(),
-            RowKind::Rule => div()
-                .w_full()
-                .h(px(p.rule_h.as_f32()))
-                .flex()
-                .items_center()
-                .pl(px(ROW_MX))
-                .pr(px(ROW_MX))
-                .child(div().w_full().h(px(1.0)).bg(p.divider))
-                .into_any_element(),
-            RowKind::Image => div()
-                .w_full()
-                .h(px(crate::config::markdown::IMAGE_ROW_DEFAULT_H))
-                .flex()
-                .items_center()
-                .justify_center()
-                .pl(px(ROW_MX))
-                .child(div().text_color(p.muted_fg).text_size(px(12.0)).child("图片（实时模式只读占位）"))
-                .into_any_element(),
-            RowKind::Table => {
-                let mut col = div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .pl(px(ROW_MX))
-                    .pr(px(ROW_MX))
-                    .text_size(p.para_size)
-                    .text_color(p.fg);
-                if let Some(t) = lr.row.table() {
-                    col = col
-                        .child(
-                            div()
-                                .whitespace_nowrap()
-                                .font_weight(FontWeight::BOLD)
-                                .bg(p.table_head_bg)
-                                .child(format!("| {}", t.header.join(" | "))),
-                        )
-                        .child(
-                            div().whitespace_nowrap().child(
-                                t.rows.first().map_or_else(String::new, |r| {
-                                    format!(
-                                        "| {}",
-                                        r.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(" | ")
-                                    )
-                                }),
-                            ),
-                        );
-                }
-                col.into_any_element()
-            }
-            _ => div().w_full().h(px(p.para_line.as_f32())).into_any_element(),
-        }
-    }
-
-    /// 按**当前** buffer/live 重新布局：清空 `segs` 后逐行写入内容坐标，返回总内容高。
-    /// 渲染帧与「渲染外的几何查询」（IME 光标 bounds / 字符点选 / 鼠标点击）共用：
-    /// 编辑后 `reparse` 已清空 `segs`，而输入系统会在**下一帧渲染前**同步查询光标
-    /// 坐标——若直接用上帧的过期/空 `segs`，光标会掉到兜底（文档末尾）→
-    /// 「闪烁光标与输入实际位置不匹配」。因此这些查询在 `segs` 为空时先重排。
-    fn relayout(&mut self, window: &mut Window) -> f32 {
-        self.segs.borrow_mut().clear();
-        let width_px = {
-            let w = self.element_bounds.size.width.as_f32();
-            if w > 0.0 {
-                w
-            } else {
-                window.bounds().size.width.as_f32().max(400.0)
-            }
-        };
-        self.last_layout_width = width_px;
-        let row_maps: Vec<Option<Rc<Vec<usize>>>> = self
-            .live
+    /// The host-supplied editor view for an inline `$…$` edit, overlaid at the formula's last-
+    /// painted spot (its window rect, made editor-relative via `content_origin`). Unlike a
+    /// `$$` block it doesn't reserve a full-width gap — it floats over the formula, leaving the
+    /// surrounding text in place.
+    fn editing_inline_overlay(&self) -> Option<gpui::Div> {
+        let ei = self.editing_inline.as_ref()?;
+        let (_, _, rect) = self
+            .inline_math_rects
             .iter()
-            .map(|lr| {
-                if lr.map.is_empty() {
+            .find(|(r, _, _)| *r == ei.range)?;
+        let origin = self.last_bounds.map_or(Point::default(), |b| b.origin);
+        Some(
+            div()
+                .absolute()
+                .top(rect.origin.y - origin.y + ei.offset.y)
+                .left(rect.origin.x - origin.x + ei.offset.x)
+                .occlude()
+                .child(ei.view.clone()),
+        )
+    }
+
+    /// Spaces inserted per Tab / list-nesting level (`Indent`/`Outdent`). The host
+    /// keeps this in sync with its list-indent setting so nesting is configurable.
+    pub fn set_tab_indent(&mut self, spaces: usize) {
+        self.tab_indent = spaces.max(1);
+    }
+
+    /// The caret's byte offset into [`Self::text`] (the moving end of any
+    /// selection). For hosts that drive a menu/completion off the caret position.
+    pub fn cursor(&self) -> usize {
+        self.cursor_offset()
+    }
+
+    /// Whether the last content change was a single typed character or single-char
+    /// backspace (vs a programmatic / multi-char edit). Hosts gate auto-pairing on
+    /// this so structural edits (table row/column ops, paste, …) don't trip it.
+    pub fn last_edit_was_keystroke(&self) -> bool {
+        self.last_edit_keystroke
+    }
+
+    /// Place the caret at `offset` (a byte offset into the document), collapsing
+    /// any selection. Clamped to the document and snapped down to a char
+    /// boundary, so a host can pass a raw click offset safely — e.g. to enter
+    /// edit mode where rendered text was clicked.
+    pub fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let mut offset = offset.min(self.content.len());
+        while !self.content.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        self.move_to(offset, cx);
+    }
+
+    /// Per logical line, from the last paint: its top offset within the
+    /// editor and its first wrap-row's height — enough for a host-drawn
+    /// gutter (line numbers) to align with rows without re-deriving layout.
+    /// Empty before the first paint. Rows collapsed by a heading fold show
+    /// no vertical advance (the next row's top equals theirs) — a gutter
+    /// should skip those.
+    pub fn row_layout(&self) -> Vec<(Pixels, Pixels)> {
+        self.line_tops
+            .iter()
+            .enumerate()
+            .map(|(row, &top)| (top, self.line_h(row)))
+            .collect()
+    }
+
+    /// The cached [`ScanData`] for the current content, rebuilding on a
+    /// generation mismatch.
+    fn scan_data(&self) -> std::rc::Rc<ScanData> {
+        if let Some((generation, data)) = self.scan_cache.borrow().as_ref()
+            && *generation == self.content_gen
+        {
+            return data.clone();
+        }
+        let lines: Vec<&str> = self.content.split('\n').collect();
+        let mut fence_odd = Vec::with_capacity(lines.len());
+        let mut odd = false;
+        for l in &lines {
+            fence_odd.push(odd);
+            if l.trim_start().starts_with("```") {
+                odd = !odd;
+            }
+        }
+        let data = std::rc::Rc::new(ScanData {
+            generation: self.content_gen,
+            ordered: markdown_syntax::ordered_numbers(&lines),
+            tables: markdown_syntax::table_regions(&self.content),
+            mermaid: markdown_syntax::mermaid_blocks(&self.content),
+            math: markdown_syntax::math_regions(&self.content),
+            props: markdown_syntax::property_regions(&self.content),
+            alert_folds: markdown_syntax::alert_fold_regions(&self.content),
+            fence_odd,
+        });
+        *self.scan_cache.borrow_mut() = Some((self.content_gen, data.clone()));
+        data
+    }
+
+    /// The wrap-row count of logical line `row` (1 when unrecorded).
+    fn row_span(&self, row: usize) -> usize {
+        self.wrap_rows.get(row).copied().unwrap_or(1).max(1)
+    }
+
+    /// The wrap-row height of logical line `row` (a heading is taller). Falls
+    /// back to the base `line_height` for unrecorded rows / the empty document.
+    fn line_h(&self, row: usize) -> Pixels {
+        self.line_heights
+            .get(row)
+            .copied()
+            .unwrap_or(self.line_height)
+    }
+
+    /// Horizontal text inset for logical line `row` (from the last paint): non-zero
+    /// for fenced code blocks + gutter marks. Applied to the caret, selection,
+    /// hit-test, and text paint so they all stay aligned.
+    fn line_inset(&self, row: usize) -> Pixels {
+        self.line_insets.get(row).copied().unwrap_or(px(0.))
+    }
+
+    /// The right-align shift of an RTL row (zero everywhere else) — see
+    /// [`RtlRow::shift`].
+    fn rtl_shift(&self, row: usize) -> Pixels {
+        self.rtl_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .and_then(|r| r.shifts.first().copied())
+            .unwrap_or(px(0.))
+    }
+
+    /// Where logical line `row`'s painted text actually starts: its inset plus
+    /// the right-align shift of an RTL row (#66). Everything that positions
+    /// against a row's text — caret, click, selection, link boxes — goes
+    /// through this, so the two can never drift apart.
+    fn row_origin_x(&self, row: usize) -> Pixels {
+        self.line_inset(row) + self.rtl_shift(row)
+    }
+
+    /// Does the caret's TABLE row read right-to-left? Cells step through their
+    /// own stepper, which walks in logical order — so on an RTL table the
+    /// visual arrows map to the opposite step.
+    fn caret_table_is_rtl(&self) -> bool {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.table_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .is_some_and(|t| t.rtl)
+    }
+
+    /// Does the caret's line read right-to-left?
+    ///
+    /// Arrow keys move VISUALLY — Right steps to the character on the right of
+    /// the screen, which every platform does in bidi text and which readers of
+    /// Persian expect. On an RTL row that character is the logically PREVIOUS
+    /// one, so the two step functions swap.
+    fn caret_row_is_rtl(&self) -> bool {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.rtl_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .is_some_and(|r| r.base_rtl)
+    }
+
+    /// The offset one step to the visual left/right of the caret, taking the
+    /// row's direction into account.
+    fn horizontal_step(&self, visual_right: bool) -> usize {
+        let off = self.cursor_offset();
+        let (row, col) = self.row_col(off);
+        // Inside a bidi row, "one step right" is not "one byte forward, maybe
+        // flipped". A Latin word or URL embedded in Persian runs the other way,
+        // and the caret has to flow THROUGH it rather than jump to its far end
+        // — so the step comes from the glyph order, via the row's map.
+        if let Some(r) = self.bidi_map(row) {
+            let dcol = self.display_col(row, col);
+            let (k, local) = r.row_of(dcol);
+            if let Some(rr) = r.rows.get(k)
+                && let Some(next) = rr.map.step_visual(local, visual_right)
+            {
+                let target = self.line_starts()[row] + self.source_col(row, rr.start + next);
+                // A visual step that doesn't move the caret in the DOCUMENT has
+                // landed inside something atomic — an inline formula's spacer,
+                // whose every display byte maps back to the span's start. The
+                // logical stepper knows how to cross those (and how to hand the
+                // formula to its editor), so defer to it rather than sitting
+                // still.
+                if target != off {
+                    // Landing ON a spacer resolves to the span's START, and the
+                    // "is the caret inside a formula?" test wants strictly
+                    // inside — so approaching a formula from its end side, the
+                    // caret stepped to the start, failed the test, and the next
+                    // press left the formula behind. Step one byte in so the
+                    // formula opens from either side.
+                    let line_start = self.line_starts()[row];
+                    let here = off.saturating_sub(line_start);
+                    let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(row))
+                        .into_iter()
+                        .any(|s| {
+                            line_start + s.start == target && !(s.start < here && here < s.end)
+                        });
+                    return if lands_on_a_formula {
+                        target + 1
+                    } else {
+                        target
+                    };
+                }
+            }
+            // Off the end of this row: fall through to the logical neighbour,
+            // which is what carries the caret onto the next row or line.
+            return if visual_right != self.caret_row_is_rtl() {
+                self.next_visible_boundary(off)
+            } else {
+                self.prev_visible_boundary(off)
+            };
+        }
+        if visual_right {
+            self.next_visible_boundary(off)
+        } else {
+            let target = self.prev_visible_boundary(off);
+            // Same nudge as the bidi branch above: a leftward step over a formula's
+            // spacer resolves to the span's START, which fails `left()`'s strictly-
+            // inside test — so on plain LTR rows the editor never opened from the
+            // right and the caret just seated at the formula's start (#77).
+            let (trow, _) = self.row_col(target);
+            let line_start = self.line_starts()[trow];
+            let here = off.saturating_sub(line_start);
+            let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(trow))
+                .into_iter()
+                .any(|s| line_start + s.start == target && !(s.start < here && here < s.end));
+            if lands_on_a_formula {
+                target + 1
+            } else {
+                target
+            }
+        }
+    }
+
+    /// The RTL layout for `row`, if it has one (see [`RtlRow`]).
+    fn bidi_map(&self, row: usize) -> Option<&RtlRow> {
+        self.rtl_rows.get(row).and_then(Option::as_ref)
+    }
+
+    /// Window-space bounds of the caret at `offset`, from the last paint's
+    /// layout — for anchoring a popup (e.g. a slash menu) at a document offset.
+    /// `None` before the first paint or if `offset`'s row isn't laid out.
+    pub fn bounds_for_offset(&self, offset: usize) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_bounds?;
+        let (row, col) = self.row_col(offset);
+        let lh = self.line_h(row);
+        let line = self.wrapped.get(row)?;
+        let p = line_pos(line, self.bidi_map(row), self.display_col(row, col), lh)?;
+        let top = bounds.top() + self.line_tops.get(row).copied().unwrap_or(px(0.)) + p.y;
+        let x = bounds.left() + p.x + self.row_origin_x(row);
+        Some(Bounds::from_corners(point(x, top), point(x, top + lh)))
+    }
+
+    /// The document text as an owned [`SharedString`]; use [`Self::text`] for a
+    /// borrowed `&str`.
+    pub fn value(&self) -> SharedString {
+        self.content.clone().into()
+    }
+
+    /// Focus the editor so it receives keyboard input. (`set_cursor` only moves
+    /// the caret; call this to enter edit mode, e.g. on a click into rendered text.)
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    /// Keep diagnostics valid across an edit at `edited` (the replaced byte
+    /// range) that inserted `new_len` bytes: spans before the edit are left
+    /// alone, spans after it are shifted by the size delta, and spans that
+    /// overlap the edited text are dropped (that text changed, so they're
+    /// stale). The host still recomputes the edited region on its own schedule —
+    /// this just keeps the *other* spans correct so they don't all flicker off
+    /// on every keystroke.
+    fn remap_diagnostics(&mut self, edited: &Range<usize>, new_len: usize) {
+        let delta = new_len as isize - (edited.end - edited.start) as isize;
+        self.diagnostics.retain_mut(|d| {
+            if d.range.end <= edited.start {
+                true
+            } else if d.range.start >= edited.end {
+                d.range.start = (d.range.start as isize + delta) as usize;
+                d.range.end = (d.range.end as isize + delta) as usize;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    // --- Cursor movement -----------------------------------------------------
+
+    fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            // Collapse to the selection's VISUALLY left edge, which on an RTL
+            // row is its logical end.
+            let to = if self.caret_row_is_rtl() {
+                self.selected_range.end
+            } else {
+                self.selected_range.start
+            };
+            self.move_to(to, cx);
+            return;
+        }
+        if self.caret_in_table()
+            && let Some(off) =
+                self.table_move_horizontal(if self.caret_table_is_rtl() { 1 } else { -1 })
+        {
+            self.move_to(off, cx);
+            return;
+        }
+        let off = self.horizontal_step(false);
+        if let Some((range, source)) = self.inline_math_span_at(off) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: true,
+                inline: true,
+            });
+            return;
+        }
+        if let Some((range, source)) = self.math_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: true,
+                inline: false,
+            });
+            return;
+        }
+        // Left into a property panel opens its editor at the last field.
+        if let Some((range, source)) = self.property_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end: true,
+                row: None,
+            });
+            return;
+        }
+        self.move_to(off, cx);
+    }
+
+    fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let to = if self.caret_row_is_rtl() {
+                self.selected_range.start
+            } else {
+                self.selected_range.end
+            };
+            self.move_to(to, cx);
+            return;
+        }
+        if self.caret_in_table()
+            && let Some(off) =
+                self.table_move_horizontal(if self.caret_table_is_rtl() { -1 } else { 1 })
+        {
+            self.move_to(off, cx);
+            return;
+        }
+        let off = self.horizontal_step(true);
+        if let Some((range, source)) = self.inline_math_span_at(off) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: false,
+                inline: true,
+            });
+            return;
+        }
+        if let Some((range, source)) = self.math_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: false,
+                inline: false,
+            });
+            return;
+        }
+        // Right into a property panel opens its editor at the first field.
+        if let Some((range, source)) = self.property_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end: false,
+                row: None,
+            });
+            return;
+        }
+        self.move_to(off, cx);
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        // In a table, step cell-to-cell keeping the column; at the table's edge
+        // `table_move_vertical` returns `None` and a normal move exits the table.
+        if self.caret_in_table()
+            && let Some(off) = self.table_move_vertical(-1)
+        {
+            self.move_to(off, cx);
+            return;
+        }
+        let off = self.move_vertical(-1);
+        if let Some((range, source)) = self.inline_math_span_at(off) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: true,
+                inline: true,
+            });
+            return;
+        }
+        if let Some((range, source)) = self.math_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: true,
+                inline: false,
+            });
+            return;
+        }
+        // Arrowing UP into a property panel opens its editor at the LAST field
+        // (entered from below), not the raw source.
+        if let Some((range, source)) = self.property_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end: true,
+                row: None,
+            });
+            return;
+        }
+        // Set the caret directly (not via `move_to`) to keep the goal column.
+        self.selected_range = off..off;
+        self.last_edit = EditKind::Other;
+        cx.emit(EditorEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.caret_in_table()
+            && let Some(off) = self.table_move_vertical(1)
+        {
+            self.move_to(off, cx);
+            return;
+        }
+        let off = self.move_vertical(1);
+        if let Some((range, source)) = self.inline_math_span_at(off) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: false,
+                inline: true,
+            });
+            return;
+        }
+        if let Some((range, source)) = self.math_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: false,
+                inline: false,
+            });
+            return;
+        }
+        // Arrowing DOWN into a property panel opens its editor at the FIRST field.
+        if let Some((range, source)) = self.property_block_at(self.row_col(off).0) {
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end: false,
+                row: None,
+            });
+            return;
+        }
+        self.selected_range = off..off;
+        self.last_edit = EditKind::Other;
+        cx.emit(EditorEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        let off = self.horizontal_step(false);
+        self.select_to(off, cx);
+    }
+
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        let off = self.horizontal_step(true);
+        self.select_to(off, cx);
+    }
+
+    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        let off = self.move_vertical(-1);
+        self.select_to(off, cx);
+    }
+
+    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        let off = self.move_vertical(1);
+        self.select_to(off, cx);
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+        self.select_to(self.content.len(), cx);
+    }
+
+    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        let (row, col) = self.row_col(self.cursor_offset());
+        let starts = self.line_starts();
+        // Smart Home on a gutter line (list/task/quote): the marker is hidden
+        // behind a painted bullet, so land on the first content character —
+        // the raw line start would reveal the marker and let typing break it.
+        // A second Home (at or inside the prefix) goes to the true start.
+        let plen = self.hidden_prefix_len(row);
+        let target = if plen > 0 && col > plen {
+            starts[row] + plen
+        } else {
+            starts[row]
+        };
+        self.move_to(target, cx);
+    }
+
+    /// The hidden marker prefix length of logical `row` — list/task/quote
+    /// lines draw their marker as a painted gutter and hide the source chars.
+    /// 0 when the line has no gutter or markdown styling is off.
+    fn hidden_prefix_len(&self, row: usize) -> usize {
+        if self.markdown_style.is_none() {
+            return 0;
+        }
+        let Some(&start) = self.line_starts().get(row) else {
+            return 0;
+        };
+        let line = &self.content[start..self.line_end(row)];
+        markdown_syntax::task_prefix(line)
+            .map(|(l, ..)| l)
+            .or_else(|| markdown_syntax::list_prefix(line).map(|(l, ..)| l))
+            .or_else(|| markdown_syntax::blockquote_prefix(line))
+            .unwrap_or(0)
+    }
+
+    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.move_to(self.line_end(row), cx);
+    }
+
+    // --- Editing -------------------------------------------------------------
+
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            // Word-style image deletion: with the caret on an image row — or at
+            // the start of the line just below one — remove the whole picture
+            // (line + newline) as one edit, never stepping into its hidden
+            // markdown character by character.
+            let off = self.cursor_offset();
+            let (row, col) = self.row_col(off);
+            if let Some(range) = self.image_row_range(row).or_else(|| {
+                (col == 0 && row > 0)
+                    .then(|| self.image_row_range(row - 1))
+                    .flatten()
+            }) {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            // The same Word-style treatment for math: backspacing onto an
+            // inline formula's closing `$` removes the whole formula, and at
+            // the start of the line below a `$$` block removes the whole
+            // block — never stripping one hidden delimiter and dumping raw
+            // LaTeX. A caret strictly INSIDE a span (revealed source) still
+            // edits character-wise.
+            if let Some((range, _)) = self
+                .inline_math_span_at(self.previous_boundary(off))
+                .filter(|(r, _)| off == r.end)
+            {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            if col == 0
+                && row > 0
+                && self.math_block_at(row).is_none() // inside = raw editing
+                && let Some((range, _)) = self.math_block_at(row - 1)
+            {
+                let range = self.math_delete_range(range);
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            // Backspacing from the line below a property panel joins as
+            // usual — but the caret would land inside the panel and reveal
+            // its raw `key:: value` source. Seat the in-place form after the
+            // join instead (the same landing as arrowing in from below).
+            let join_into_props = col == 0
+                && row > 0
+                && self.property_block_at(row).is_none()
+                && self.property_block_at(row - 1).is_some();
+            // Cditor-style around hidden formatting markers: delete the
+            // previous VISIBLE character (never a marker byte), and take an
+            // emptied construct's marker pair with it.
+            if let Some(range) = self.fmt_delete_range(off, true) {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            let prev = self.previous_boundary(off);
+            if off == prev {
+                return;
+            }
+            self.select_to(prev, cx);
+            self.replace_text_in_range(None, "", window, cx);
+            if join_into_props {
+                self.edit_properties_at_caret(true, cx);
+            }
+            return;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            // Word-style, mirroring `backspace`: the caret on an image row — or
+            // at the end of the line just above one — removes the whole picture.
+            let off = self.cursor_offset();
+            let (row, _) = self.row_col(off);
+            if let Some(range) = self.image_row_range(row).or_else(|| {
+                (off == self.line_end(row))
+                    .then(|| self.image_row_range(row + 1))
+                    .flatten()
+            }) {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            // Math mirrors of the backspace guards: deleting onto an inline
+            // formula's opening `$` removes the whole formula; at the end of
+            // the line above a `$$` block removes the whole block.
+            if let Some((range, _)) = self
+                .inline_math_span_at(self.next_boundary(off))
+                .filter(|(r, _)| off == r.start)
+            {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            if off == self.line_end(row)
+                && self.math_block_at(row).is_none() // inside = raw editing
+                && let Some((range, _)) = self.math_block_at(row + 1)
+            {
+                let range = self.math_delete_range(range);
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            // Mirroring backspace's property join: pulling the panel's first
+            // line up would seat a raw caret in the block — open the form.
+            let join_into_props = off == self.line_end(row)
+                && self.property_block_at(row).is_none()
+                && self.property_block_at(row + 1).is_some();
+            // Cditor-style around hidden formatting markers (see backspace).
+            if let Some(range) = self.fmt_delete_range(off, false) {
+                self.replace_range(range, "", cx);
+                cx.emit(EditorEvent::Changed);
+                return;
+            }
+            let next = self.next_boundary(off);
+            if off == next {
+                return;
+            }
+            self.select_to(next, cx);
+            self.replace_text_in_range(None, "", window, cx);
+            if join_into_props {
+                self.edit_properties_at_caret(false, cx);
+            }
+            return;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        // Inside a table, a raw newline would split the row's `| … |` markup.
+        // Enter instead moves to the cell directly below (next row, same column,
+        // spreadsheet-style); from the last row it exits onto a fresh line below
+        // the table.
+        if self.caret_in_table() {
+            if let Some(off) = self.table_move_vertical(1)
+                && self
+                    .table_rows
+                    .get(self.row_col(off).0)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|t| !t.is_separator)
+            {
+                self.move_to(off, cx);
+                return;
+            }
+            let (row, _) = self.row_col(self.cursor_offset());
+            let mut last = row;
+            while self
+                .table_rows
+                .get(last + 1)
+                .and_then(Option::as_ref)
+                .is_some()
+            {
+                last += 1;
+            }
+            let starts = self.line_starts();
+            let end = starts.get(last + 1).map_or(self.content.len(), |&s| s - 1);
+            self.selected_range = end..end;
+            self.replace_text_in_range(None, "\n", window, cx);
+            return;
+        }
+        // Inside a property panel a raw newline would split a `key:: value`
+        // line. Enter opens the panel's editor instead — the same route as a
+        // click or arrow-in (the form's own Enter then commits).
+        if self.selected_range.is_empty() {
+            let (row, _) = self.row_col(self.cursor_offset());
+            if self.property_block_at(row).is_some() {
+                self.edit_properties_at_caret(false, cx);
+                return;
+            }
+        }
+        // List auto-continuation: Enter on a list/task item opens the next item
+        // (same marker + indent; ordered numbers increment); Enter on an *empty*
+        // item removes the marker, exiting the list. Only with a collapsed
+        // selection — a selection is just replaced by the newline.
+        if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = self.content[line_start..]
+                .find('\n')
+                .map_or(self.content.len(), |i| line_start + i);
+            let line = &self.content[line_start..line_end];
+            if let Some((prefix_len, indent, ordered, num)) = markdown_syntax::list_prefix(line) {
+                let task = markdown_syntax::task_prefix(line);
+                let content_start = task.map_or(prefix_len, |(l, ..)| l);
+                let empty = line.get(content_start..).unwrap_or("").trim().is_empty();
+                let cont = if empty {
                     None
                 } else {
-                    Some(Rc::new(lr.map.clone()))
+                    let ws = &line[..indent];
+                    let bullet = line.as_bytes()[indent] as char;
+                    Some(if task.is_some() {
+                        format!("\n{ws}{bullet} [ ] ")
+                    } else if ordered {
+                        format!("\n{ws}{}. ", num + 1)
+                    } else {
+                        format!("\n{ws}{bullet} ")
+                    })
+                };
+                match cont {
+                    // Empty item: clear the marker, leaving an empty line.
+                    None => {
+                        self.selected_range = line_start..line_end;
+                        self.replace_text_in_range(None, "", window, cx);
+                    }
+                    Some(text) => self.replace_text_in_range(None, &text, window, cx),
                 }
-            })
-            .collect();
-        let mut y = 0.0f32;
-        let n = self.live.len();
-        for ix in 0..n {
-            let lr = self.live[ix].clone();
-            let h = self.layout_row(window, ix, &lr, y, width_px, &row_maps);
-            y += h;
+                return;
+            }
         }
-        y
+        self.replace_text_in_range(None, "\n", window, cx);
     }
 
-    /// 确保 hit/IME 用「当前宽度」几何：`segs` 空（编辑后重解析）或元素宽度已变
-    /// （窗口↔全屏换宽瞬间，旧宽度的换行会残留）→ 强制重排，杜绝旧几何定位。
-    fn ensure_fresh_layout(&mut self, window: &mut Window) {
-        let width_changed = self.element_bounds.size.width.as_f32() != self.last_layout_width;
-        if self.segs.borrow().is_empty() || width_changed {
-            self.relayout(window);
-        }
+    /// Toggle an inline wrapping marker (`**` bold, `*` italic, `` ` `` code)
+    /// around the selection — the symmetric case of [`Self::toggle_wrap_pair`].
+    fn toggle_wrap(&mut self, marker: &str, cx: &mut Context<Self>) {
+        self.toggle_wrap_pair(marker, marker, cx);
     }
 
-    /// 布局 + 渲染全部行，返回容器元素。
-    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.live.is_empty() {
-            self.segs.borrow_mut().clear();
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().text_color(self.p.muted_fg).child("空文档"))
-                .into_any_element();
+    /// Toggle an open/close marker pair (`<u>`/`</u>`, or a symmetric `**`)
+    /// around the selection. No-op on an empty selection. Unwraps when the
+    /// selection is already wrapped (markers just inside or just outside it),
+    /// otherwise wraps — keeping the same text selected so presses toggle.
+    fn toggle_wrap_pair(&mut self, open: &str, close: &str, cx: &mut Context<Self>) {
+        let sel = self.selected_range.clone();
+        if sel.start >= sel.end {
+            return;
         }
-        // 1) 布局：逐行写 `segs`（内容坐标），累计行高。
-        self.relayout(window);
-        // 滚动偏移变化 → 内容坐标→屏幕坐标的换算已变：重推 IME 定位，避免候选窗/
-        // 组合窗停在滚动前的位置（Windows 只在组合开始或显式 push 时更新）。
-        let scroll_y = (-self.v_handle.offset().y.as_f32()).max(0.0);
-        if scroll_y != self.last_ime_scroll {
-            self.last_ime_scroll = scroll_y;
-            window.invalidate_character_coordinates();
+        let (ol, cl) = (open.len(), close.len());
+        let sel_text = &self.content[sel.clone()];
+        let (range, new, new_sel) =
+            if sel_text.len() >= ol + cl && sel_text.starts_with(open) && sel_text.ends_with(close)
+            {
+                // `**foo**` selected → strip the markers inside the selection.
+                let inner = self.content[sel.start + ol..sel.end - cl].to_string();
+                (sel.clone(), inner, sel.start..sel.end - ol - cl)
+            } else if self.content[..sel.start].ends_with(open)
+                && self.content[sel.end..].starts_with(close)
+            {
+                // `foo` selected with the markers just outside → strip them.
+                (
+                    sel.start - ol..sel.end + cl,
+                    sel_text.to_string(),
+                    sel.start - ol..sel.end - ol,
+                )
+            } else {
+                // Plain → wrap.
+                (
+                    sel.clone(),
+                    format!("{open}{sel_text}{close}"),
+                    sel.start + ol..sel.end + ol,
+                )
+            };
+        self.record_edit(&range, &new);
+        self.content.replace_range(range.clone(), &new);
+        self.selected_range = new_sel;
+        self.selection_reversed = false;
+        self.goal_x = None;
+        self.remap_diagnostics(&range, new.len());
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
+    fn bold(&mut self, _: &Bold, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_wrap("**", cx);
+    }
+
+    fn italic(&mut self, _: &Italic, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_wrap("*", cx);
+    }
+
+    fn code(&mut self, _: &Code, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_wrap("`", cx);
+    }
+
+    fn strike(&mut self, _: &Strike, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_wrap("~~", cx);
+    }
+
+    fn underline(&mut self, _: &Underline, _: &mut Window, cx: &mut Context<Self>) {
+        // Markdown has no underline — the `<u>` tag, which both views honor.
+        self.toggle_wrap_pair("<u>", "</u>", cx);
+    }
+
+    /// Tab: on a list/quote item, indent the whole item one level (`tab_indent`
+    /// spaces at the line start, caret shifts with it); elsewhere insert that many
+    /// spaces at the caret (replacing any selection).
+    fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
+        // In a table, Tab moves to the next cell rather than indenting.
+        if self.caret_in_table() {
+            if let Some(offset) = self.table_cell_nav(true) {
+                self.move_to(offset, cx);
+            }
+            return;
         }
-        let sel = {
-            let s = self.selection;
-            (s.start(), s.end())
+        let cursor = self.cursor_offset();
+        let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = self.content[line_start..]
+            .find('\n')
+            .map_or(self.content.len(), |i| line_start + i);
+        let line = &self.content[line_start..line_end];
+        let item = markdown_syntax::list_prefix(line);
+        let is_item = item.is_some() || markdown_syntax::blockquote_prefix(line).is_some();
+        let indent = " ".repeat(self.tab_indent);
+        if !is_item {
+            self.replace_text_in_range(None, &indent, window, cx);
+            return;
+        }
+        // Indenting an ordered item starts a NESTED list, so its number
+        // becomes the new list's start: rewrite it to 1. (Both views
+        // renumber the items after it, so only the start digit matters.)
+        let (range, new_text) = match item {
+            Some((_, ws, true, _)) => {
+                let de = ws + line[ws..].bytes().take_while(u8::is_ascii_digit).count();
+                (
+                    line_start..line_start + de,
+                    format!("{indent}{}1", &line[..ws]),
+                )
+            }
+            _ => (line_start..line_start, indent),
         };
-        let entity = cx.entity();
-        // 2) 逐行建元素。
-        let mut rows_el = div().w_full().relative().flex().flex_col();
-        for ix in 0..self.live.len() {
-            let lr = self.live[ix].clone();
-            let el = if is_text_kind(lr.row.kind) || lr.row.kind == RowKind::Code {
-                let sel_rend = self.selection_rendered(&lr, sel);
-                let styles = self.row_styles(&lr, sel_rend);
-                self.text_or_code_element(ix, &lr, &styles)
-            } else {
-                self.block_element(&lr)
-            };
-            // debug：每行包一个 `debug_selector` 包装器，登记 GPUI **实际绘制**的
-            // bounds——供 `paint` 后逐行核对 painted top == seg top（判定算法 vs 实际）。
-            #[cfg(debug_assertions)]
-            {
-                rows_el = rows_el.child(
-                    div().debug_selector(move || format!("md-row-{ix}")).child(el),
-                );
-            }
-            #[cfg(not(debug_assertions))]
-            {
-                rows_el = rows_el.child(el);
-            }
-        }
-        // 3) 光标 overlay：绝对定位在内容坐标系（随滚动）；自绘闪烁（不依赖平台/IME 光标）。
-        //    空行「插入列」：目标行匹配时把光标条画在点击列（真 WYSIWYG）。
-        if let Some((crow, x, y, h)) = self.caret_point() {
-            let draw_x = match self.goal {
-                Some((grow, gx, _)) if grow == crow => gx,
-                _ => x,
-            };
-            let blink = self.blink_on;
-            rows_el = rows_el.child(
-                div()
-                    .absolute()
-                    .left(px(draw_x))
-                    .top(px(y + 1.5))
-                    .h(px(h - 3.0))
-                    .w(px(CARET_WIDTH_PX))
-                    .rounded(px(1.0))
-                    .opacity(if blink { 0.9 } else { 0.12 })
-                    .bg(gpui::rgb(0x0078d4)),
-            );
-        }
-        // 4) 钳制说明幽灵条：点击处（仅行尾/空行钳制时出现，~700ms 后消失）。
-        if let Some((gx, gy, gh, at)) = self.click_ghost {
-            if at.elapsed() < std::time::Duration::from_millis(700) {
-                rows_el = rows_el.child(
-                    div()
-                        .absolute()
-                        .left(px(gx))
-                        .top(px(gy + 1.5))
-                        .h(px((gh - 3.0).max(1.0)))
-                        .w(px(CARET_WIDTH_PX))
-                        .rounded(px(1.0))
-                        .opacity(0.35)
-                        .bg(self.p.accent),
-                );
-            } else {
-                self.click_ghost = None;
-            }
-        }
-        let bg = self.p.bg;
-        let scroll_div = div()
-            .id("md-live-scroll")
-            .size_full()
-            .overflow_y_scroll()
-            .overflow_x_hidden()
-            .track_scroll(&self.v_handle)
-            .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, window.listener_for(&entity, Self::on_mouse_down))
-            .on_key_down(window.listener_for(&entity, Self::on_key_down))
-            .child(rows_el);
-        let mut root = div()
-            .id("md-live")
-            .debug_selector(|| "md-live".into())
-            .size_full()
-            .relative()
-            .overflow_hidden()
-            .bg(bg)
-            .child(scroll_div);
-        #[cfg(debug_assertions)]
-        if self.ime_debug {
-            root = root.child(self.debug_overlay());
-        }
-        root.into_any_element()
+        self.record_edit(&range, &new_text);
+        let delta = new_text.len() as isize - (range.end - range.start) as isize;
+        self.content.replace_range(range.clone(), &new_text);
+        let caret = (cursor as isize + delta).max(line_start as isize) as usize;
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.goal_x = None;
+        self.remap_diagnostics(&range, new_text.len());
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
     }
 
-    /// `GPUI_IMEDEBUG=1` 覆盖层：绿点=最后点击、洋红环=光标、红框=OS IME bounds。
-    /// 三者重合 = WYSIWYG 定位正确；谁偏离谁就暴露在那一环。
-    #[cfg(debug_assertions)]
-    fn debug_overlay(&self) -> impl IntoElement {
-        let scroll_y = (-self.v_handle.offset().y.as_f32()).max(0.0);
-        let mut ov = div().absolute().left(px(0.)).top(px(0.)).size_full();
-        if let Some((ix, iy, iw, ih)) = self.ime_content {
-            ov = ov.child(
-                div()
-                    .absolute()
-                    .left(px(ix))
-                    .top(px(iy - scroll_y))
-                    .w(px(iw.max(1.0)))
-                    .h(px(ih.max(1.0)))
-                    .border(px(1.5))
-                    .border_color(gpui::rgb(0xe53935).opacity(0.9))
-                    .bg(gpui::rgb(0xe53935).opacity(0.10)),
-            );
-        }
-        if let Some((cx, cy, _h)) = self.caret_point().map(|(_, x, y, h)| (x, y, h)) {
-            let cy = cy - scroll_y;
-            ov = ov.child(
-                div()
-                    .absolute()
-                    .left(px(cx - 6.0))
-                    .top(px(cy - 6.0))
-                    .w(px(12.0))
-                    .h(px(12.0))
-                    .rounded(px(6.0))
-                    .border(px(2.0))
-                    .border_color(gpui::rgb(0xd81b60).opacity(0.9)),
-            );
-        }
-        if let Some((gx, gy)) = self.click_content {
-            let gy = gy - scroll_y;
-            ov = ov.child(
-                div()
-                    .absolute()
-                    .left(px(gx - 7.0))
-                    .top(px(gy - 7.0))
-                    .w(px(14.0))
-                    .h(px(14.0))
-                    .rounded(px(7.0))
-                    .bg(gpui::rgb(0x43a047).opacity(0.85)),
-            );
-        }
-        ov
-    }
-
-    /// 光标（源码偏移）→ (行, 内容坐标 x, 内容坐标 y, 段高)。
-    fn caret_point(&self) -> Option<(usize, f32, f32, f32)> {
-        if self.live.is_empty() {
-            return None;
-        }
-        self.point_for_offset(self.buffer.clip(self.selection.head()))
-    }
-
-    /// 任意源码偏移 → (行, 内容坐标 x, 内容坐标 y, 段高)。与 `caret_point` 同源，
-    /// 供 IME 组合区间（起点/终点）与选区几何使用——所有几何都来自同一份 `segs`。
-    fn point_for_offset(&self, off: usize) -> Option<(usize, f32, f32, f32)> {
-        if self.live.is_empty() {
-            return None;
-        }
-        let segs = self.segs.borrow();
-        let mut found = None::<(usize, f32, f32, f32)>;
-        for s in segs.iter() {
-            let (local_b, hit) = if let Some(map) = &s.map {
-                let lo = map[s.range.start.min(map.len() - 1)];
-                let hi_m = s.range.end.min(map.len() - 1);
-                let hi = map[hi_m];
-                if off >= lo && off <= hi {
-                    let g = map.partition_point(|&v| v <= off).saturating_sub(1).clamp(s.range.start, hi_m);
-                    (g - s.range.start, true)
-                } else {
-                    (0, false)
-                }
-            } else if off >= s.base && off <= s.base + s.text_len {
-                ((off - s.base).min(s.text_len), true)
-            } else {
-                (0, false)
-            };
-            let x = s
-                .line
-                .as_ref()
-                .map(|l| l.x_for_index(local_b.min(s.text_len)).as_f32())
-                .unwrap_or(0.0);
-            if hit {
-                found = Some((s.row_ix, s.x + x, s.top, s.height));
-                break;
+    /// Shift+Tab: outdent the caret's line — remove up to `tab_indent` leading
+    /// spaces (or one leading tab) from the line start. No-op if there's none.
+    fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        // In a table, Shift+Tab moves to the previous cell rather than outdenting.
+        if self.caret_in_table() {
+            if let Some(offset) = self.table_cell_nav(false) {
+                self.move_to(offset, cx);
             }
+            return;
         }
-        if let Some(v) = found {
-            return Some(v);
-        }
-        // 兜底：off 在所有段之后 → 最末尾段。
-        let s = segs.last()?;
-        Some((s.row_ix, s.x, s.top, s.height))
-    }
-
-    /// 命中段：字段 y 是否落在段「可命中区」内。引述带上下各 3px 的 `py` 内衬
-    /// 不计入任何 seg 的 top/height（隔开相邻行），但必须算成该行的可命中区——
-    /// 否则点在带内留白会落空（"点这儿没反应"），且「可命中高」与绘制不等。
-    fn seg_hit_bot(&self, s: &SegHit, cy: f32) -> bool {
-        let is_quote = matches!(
-            self.live.get(s.row_ix).map(|lr| lr.row.kind),
-            Some(RowKind::Quote)
-        );
-        if is_quote {
-            cy >= s.top - BAND_PY && cy <= s.top + s.height + BAND_PY
+        let cursor = self.cursor_offset();
+        let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
+        let line = &self.content[line_start..];
+        let removed = if line.starts_with('\t') {
+            1
         } else {
-            cy >= s.top && cy <= s.top + s.height
+            line.bytes()
+                .take(self.tab_indent)
+                .take_while(|b| *b == b' ')
+                .count()
+        };
+        if removed == 0 {
+            return;
+        }
+        let range = line_start..line_start + removed;
+        self.record_edit(&range, "");
+        self.content.replace_range(range.clone(), "");
+        let caret = cursor.saturating_sub(removed).max(line_start);
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.goal_x = None;
+        self.remap_diagnostics(&range, 0);
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let item = cx.read_from_clipboard();
+        // A copied FILE also carries its path as text; inserting that string
+        // is never what a paste meant. Treat file and image clipboards as
+        // not-ours: fall through so a host binding on the same keys
+        // (zorite's image/file paste) can run.
+        let has_files = item.as_ref().is_some_and(|i| {
+            i.entries()
+                .iter()
+                .any(|e| matches!(e, gpui::ClipboardEntry::ExternalPaths(_)))
+        });
+        match item.and_then(|i| i.text()).filter(|_| !has_files) {
+            Some(text) => {
+                // Normalize foreign line endings — a Windows/browser copy
+                // carries \r\n (or bare \r), and a literal \r in the buffer
+                // garbles rendering + desyncs the \n-based column math.
+                let mut text = if text.contains('\r') {
+                    text.replace("\r\n", "\n").replace('\r', "\n")
+                } else {
+                    text
+                };
+                // Inside a table cell, a raw paste of newlines/pipes would
+                // break the `| … |` row markup (Enter is guarded the same
+                // way): flatten newlines and escape pipes so the paste stays
+                // one cell's content.
+                if self.caret_in_table() && text.contains(['\n', '|']) {
+                    // Unescape-then-escape so text already carrying `\|`
+                    // doesn't double up into `\\|` (an escaped backslash
+                    // followed by a live separator).
+                    text = text
+                        .trim_end_matches('\n')
+                        .replace('\n', " ")
+                        .replace("\\|", "|")
+                        .replace('|', "\\|");
+                } else if self.markdown_style.is_some() && text.contains("$$") {
+                    // Words-attached `$$` fences / words-mixed pairs in pasted
+                    // text split onto their own lines (issue #54) — same
+                    // normalization typing gets.
+                    if let std::borrow::Cow::Owned(n) =
+                        md_syntax::normalize_math_fences(&text)
+                    {
+                        text = n;
+                    }
+                }
+                self.replace_text_in_range(None, &text, window, cx);
+            }
+            None => cx.propagate(),
         }
     }
 
-    /// 点击：命中段 → 源码字节落光标。
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let range = self.copy_range();
+            // Ordered markers copy at their DISPLAYED positions (still digit
+            // markdown), so a paste counts the way the screen did.
+            let text = if self.markdown_style.is_some() {
+                markdown_syntax::renumber_copy(&self.content, range)
+            } else {
+                self.content[range].to_string()
+            };
+            self.write_clipboard(text, cx);
+        }
+    }
+
+    /// Copy the selection as the raw markdown ONLY — no host clipboard
+    /// flavors — for pasting literal source into rich surfaces (the context
+    /// menu's "Copy as Markdown"). Same selection/renumber rules as `copy`.
+    pub fn copy_plain(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            let range = self.copy_range();
+            let text = if self.markdown_style.is_some() {
+                markdown_syntax::renumber_copy(&self.content, range)
+            } else {
+                self.content[range].to_string()
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// Route a Copy/Cut payload through the host's clipboard writer when one
+    /// is set (see [`Self::set_clipboard_writer`]), else gpui's plain copy.
+    fn write_clipboard(&self, text: String, cx: &mut Context<Self>) {
+        match &self.clipboard_writer {
+            Some(writer) => writer(&text, cx),
+            None => cx.write_to_clipboard(ClipboardItem::new_string(text)),
+        }
+    }
+
+    /// What a copy takes: the selection — extended back over the first
+    /// line's hidden list/task/quote prefix when the selection is multi-line
+    /// and starts exactly at that line's body start. With markers painted
+    /// (not text), "select the whole list" visually anchors AFTER the first
+    /// `1. `, so a verbatim copy dropped the first marker while every other
+    /// line kept its own. Raw mode (no markdown style) copies verbatim.
+    fn copy_range(&self) -> std::ops::Range<usize> {
+        let (start, end) = (
+            self.selected_range.start.min(self.selected_range.end),
+            self.selected_range.start.max(self.selected_range.end),
+        );
+        if self.markdown_style.is_none() || !self.content[start..end].contains('\n') {
+            return start..end;
+        }
+        let line_start = self.content[..start].rfind('\n').map_or(0, |i| i + 1);
+        let line_end = self.content[line_start..]
+            .find('\n')
+            .map_or(self.content.len(), |i| line_start + i);
+        let line = &self.content[line_start..line_end];
+        let prefix_len = markdown_syntax::task_prefix(line)
+            .map(|(l, ..)| l)
+            .or_else(|| markdown_syntax::list_prefix(line).map(|(l, ..)| l))
+            .or_else(|| markdown_syntax::blockquote_prefix(line));
+        match prefix_len {
+            Some(plen) if start == line_start + plen => line_start..end,
+            _ => start..end,
+        }
+    }
+
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            self.write_clipboard(self.content[self.selected_range.clone()].to_string(), cx);
+            self.replace_text_in_range(None, "", window, cx);
+        }
+    }
+
+    fn show_character_palette(
+        &mut self,
+        _: &ShowCharacterPalette,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        window.show_character_palette();
+    }
+
+    // --- Undo / redo ---------------------------------------------------------
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.snapshot());
+            self.restore(prev);
+            self.last_edit = EditKind::Other;
+            cx.notify();
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.snapshot());
+            self.restore(next);
+            self.last_edit = EditKind::Other;
+            cx.notify();
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            content: self.content.clone(),
+            // The forward caret (selection end), so undoing a backspace lands the
+            // caret after the restored text rather than inside it.
+            caret: self.selected_range.end,
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.content_gen += 1;
+        self.content = s.content;
+        let caret = s.caret.min(self.content.len());
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+    }
+
+    /// Snapshot the pre-edit state for undo, coalescing a run of single-grapheme
+    /// inserts (or a run of deletes) into one undo step so typing isn't undone
+    /// one character at a time.
+    fn record_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        self.content_gen += 1;
+        let kind = if new_text.is_empty() {
+            EditKind::Delete
+        } else if range.start == range.end
+            && new_text != "\n"
+            && new_text.graphemes(true).count() == 1
+        {
+            EditKind::Insert(range.start + new_text.len())
+        } else {
+            EditKind::Other
+        };
+        let coalesce = match (self.last_edit, kind) {
+            (EditKind::Insert(end), EditKind::Insert(_)) => end == range.start,
+            (EditKind::Delete, EditKind::Delete) => true,
+            _ => false,
+        };
+        if !coalesce {
+            self.undo_stack.push(self.snapshot());
+            if self.undo_stack.len() > UNDO_LIMIT {
+                self.undo_stack.remove(0);
+            }
+            self.redo_stack.clear();
+        }
+        self.last_edit = kind;
+        // A keystroke is one typed grapheme (incl. typed over a selection — that's
+        // an auto-pair "wrap") or a single-char backspace. Multi-char edits (paste,
+        // table ops, …) are not, so auto-pairing skips them.
+        self.last_edit_keystroke = (new_text != "\n" && new_text.graphemes(true).count() == 1)
+            || (new_text.is_empty() && self.content[range.clone()].graphemes(true).count() == 1);
+    }
+
+    // --- Mouse ---------------------------------------------------------------
+
+    /// If logical `row` is inside a `$$…$$` block, the block's byte range in the document
+    /// (both fences) and the LaTeX between them — so a double-click can hand it to the host's
+    /// structural editor.
+    fn math_block_at(&self, row: usize) -> Option<(Range<usize>, SharedString)> {
+        // The structural LaTeX editor is a WYSIWYG affordance (markdown_style is set only in
+        // live-preview mode). In raw-markdown mode the user edits `$$…$$` as plain text, so
+        // report no math block here — clicks / arrows / `/math` stay in the text editor.
+        self.markdown_style.as_ref()?;
+        let starts = self.line_starts();
+        let blocks = markdown_syntax::math_blocks(&self.content);
+        blocks
+            .iter()
+            .find(|(r, _)| r.contains(&row))
+            .or_else(|| {
+                // A `<!-- math:ALIGN -->` marker row belongs to the block directly
+                // below it: it's invisible in WYSIWYG, so a caret seated there —
+                // e.g. arrow-up returns offset 0 when the block opens the document
+                // (#77) — would reveal the raw rows instead of opening the editor.
+                markdown_syntax::math_align_marker(self.line_str(row))?;
+                blocks.iter().find(|(r, _)| r.start == row + 1)
+            })
+            .map(|(r, source)| {
+                (
+                    starts[r.start]..self.line_end(r.end - 1),
+                    source.clone().into(),
+                )
+            })
+    }
+
+    /// A `$$` block's byte range grown for deletion: takes in the
+    /// `<!-- math:ALIGN -->` marker line directly above (removing the block
+    /// alone would orphan it) and the trailing newline.
+    fn math_delete_range(&self, range: Range<usize>) -> Range<usize> {
+        let mut start = range.start;
+        let (row, _) = self.row_col(range.start);
+        if row > 0 {
+            let prev_start = self.line_starts()[row - 1];
+            let prev = &self.content[prev_start..self.line_end(row - 1)];
+            if markdown_syntax::math_align_marker(prev).is_some() {
+                start = prev_start;
+            }
+        }
+        start..(range.end + 1).min(self.content.len())
+    }
+
+    /// Route a landing offset into an atomic construct the way the plain
+    /// arrows do: an inline `$…$` span strictly containing it, or a `$$`
+    /// block / property-panel row, opens its in-place editor instead of
+    /// seating a raw caret (which would reveal hidden source). Returns true
+    /// when handled — word-jumps (⌥←/→) stop there.
+    fn enter_construct_at(&mut self, off: usize, at_end: bool, cx: &mut Context<Self>) -> bool {
+        if let Some((range, source)) = self.inline_math_span_at(off) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end,
+                inline: true,
+            });
+            return true;
+        }
+        let (row, _) = self.row_col(off);
+        if let Some((range, source)) = self.math_block_at(row) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end,
+                inline: false,
+            });
+            return true;
+        }
+        if let Some((range, source)) = self.property_block_at(row) {
+            let block_row = row - self.row_col(range.start).0;
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end,
+                row: Some(block_row),
+            });
+            return true;
+        }
+        false
+    }
+
+    /// If the caret sits inside a property block, ask the host to seat the
+    /// in-place form there (focused on the caret's row; `at_end` = caret at
+    /// the value's end) — the recovery for any edit that lands a raw caret in
+    /// the panel, mirroring what arrows and clicks do on entry.
+    fn edit_properties_at_caret(&mut self, at_end: bool, cx: &mut Context<Self>) {
+        let (row, _) = self.row_col(self.cursor_offset());
+        if let Some((range, source)) = self.property_block_at(row) {
+            let block_row = row - self.row_col(range.start).0;
+            cx.emit(EditorEvent::EditProperties {
+                range,
+                source,
+                at_end,
+                row: Some(block_row),
+            });
+        }
+    }
+
+    /// The property block whose lines cover `row`, as an absolute byte range +
+    /// source — so a click or an arrow into the panel opens the property editor
+    /// instead of landing in (and revealing) the raw `key:: value` lines.
+    /// WYSIWYG-only, like [`Self::math_block_at`].
+    fn property_block_at(&self, row: usize) -> Option<(Range<usize>, SharedString)> {
+        self.markdown_style.as_ref()?;
+        let region = markdown_syntax::property_regions(&self.content)
+            .into_iter()
+            .find(|r| r.contains(&row))?;
+        let start = *self.line_starts().get(region.start)?;
+        let end = self.line_end(region.end - 1);
+        Some((start..end, self.content[start..end].to_string().into()))
+    }
+
+    /// The inline `$…$` span strictly containing source byte `off` (between the `$` delimiters),
+    /// as an absolute byte range + inner LaTeX — so arrowing the caret into a formula opens its
+    /// structural editor instead of landing in (and revealing) the raw source. WYSIWYG-only.
+    fn inline_math_span_at(&self, off: usize) -> Option<(Range<usize>, SharedString)> {
+        self.markdown_style.as_ref()?;
+        let (row, _) = self.row_col(off);
+        let line_start = *self.line_starts().get(row)?;
+        let line = self.line_str(row);
+        let col = off.saturating_sub(line_start);
+        markdown_syntax::inline_math_spans(line)
+            .into_iter()
+            .find(|s| s.start < col && col < s.end)
+            .map(|s| {
+                (
+                    line_start + s.start..line_start + s.end,
+                    SharedString::from(markdown_syntax::inline_math_latex(line, &s).to_string()),
+                )
+            })
+    }
+
+    /// If the caret sits inside a `$$…$$` block, ask the host to open the structural editor
+    /// for it (caret at the formula's start). Lets the host turn a freshly-inserted, empty
+    /// math block (the `/math` snippet) straight into a live editor instead of raw source.
+    pub fn edit_math_at_caret(&mut self, cx: &mut Context<Self>) {
+        let (row, _) = self.row_col(self.cursor_offset());
+        if let Some((range, source)) = self.math_block_at(row) {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: false,
+                inline: false,
+            });
+        }
+    }
+
+    /// The property block covering the caret's line, if any (WYSIWYG-only, like
+    /// [`Self::edit_math_at_caret`]) — so the host can open the property editor
+    /// on a freshly-inserted `/property` line instead of leaving raw source.
+    pub fn property_block_at_caret(&self) -> Option<(Range<usize>, SharedString)> {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.property_block_at(row)
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.button != MouseButton::Left {
+        // A press on an image's corner grip starts a resize drag — this takes
+        // precedence over placing the caret on the image row (which the press
+        // would otherwise do). The image keeps its bounds; the drag previews a new
+        // width and release writes `{width=N}` (see on_mouse_move / on_mouse_up).
+        if let Some((line, width)) = self.grip_at(event.position) {
+            self.image_resize = Some(ImageResize {
+                line,
+                start_width: width,
+                start_x: event.position.x,
+                width,
+            });
+            self.is_selecting = false;
+            self.menu = None;
+            self.table_menu = None;
+            self.image_menu = None;
+            self.prop_menu = None;
+            cx.notify();
             return;
         }
-        window.focus(&self.focus_handle, cx);
-        // 编辑后重解析会清空 `segs`/换宽后旧几何残留：点击前用当前宽度重排。
-        self.ensure_fresh_layout(window);
-        let local = event.position - self.element_bounds.origin;
-        let scroll_y = (-self.v_handle.offset().y.as_f32()).max(0.0);
-        let cy = local.y.as_f32() + scroll_y;
-        let x = local.x.as_f32();
-        let hit = {
-            let segs = self.segs.borrow();
-            let s = segs.iter().find(|s| self.seg_hit_bot(s, cy));
-            s.map(|s| {
-                let local_b = s
-                    .line
-                    .as_ref()
-                    .map(|l| l.closest_index_for_x(px((x - s.x).max(0.0))).min(s.text_len))
-                    .unwrap_or(0);
-                (s.source_for(local_b), s.row_ix, s.x, s.line.is_none() && s.text_len == 0)
-            })
-        };
-        if let Some((source, _, _, _)) = hit {
-            self.selection = Selection::collapsed(source);
-            self.marked_range = None;
+        // A press on a task checkbox toggles it (☐↔☑) instead of placing the
+        // caret — the box sits in the gutter, so this never competes with editing
+        // the body text. Same length swap, so the caret/selection stay valid.
+        if let Some(row) = self.checkbox_at(event.position) {
+            let range = self.line_starts()[row]..self.line_end(row);
+            if let Some(new_line) =
+                markdown_syntax::toggle_task_checkbox(&self.content[range.clone()])
+            {
+                self.record_edit(&range, &new_line);
+                self.content =
+                    self.content[..range.start].to_owned() + &new_line + &self.content[range.end..];
+                self.remap_diagnostics(&range, new_line.len());
+                cx.emit(EditorEvent::Changed);
+                cx.notify();
+            }
+            return;
         }
-        // 点击即重定位光标：同步把 OS IME 定位推到新光标处（否则候选窗仍停旧位置）。
-        window.invalidate_character_coordinates();
-        if let Some((source, srow, _sx, is_empty)) = hit {
-            if is_empty {
-                // 空行 → 「插入列」真 WYSIWYG：光标/IME 显示在点击列，首次输入先补空格。
-                let kind = self.live.get(srow).map(|lr| lr.row.kind).unwrap_or(RowKind::Blank);
-                let sw = self.space_advance(window, kind);
-                self.goal = Some((srow, x, sw.max(1.0)));
-                self.click_ghost = None;
-                let _ = source;
+        // A press on a code card's chrome: Copy writes the block's body to the
+        // clipboard; the language tag opens the picker — neither places the caret.
+        if let Some((on_copy, fence_row)) = self.code_chip_at(event.position) {
+            if on_copy {
+                if let Some((_, body)) = self.code_block_at(fence_row) {
+                    let text = self.content[body].to_string();
+                    self.write_clipboard(text, cx);
+                }
+            } else if !self.code_langs.is_empty() {
+                self.code_lang_menu = Some((fence_row, event.position));
+                cx.notify();
+            }
+            return;
+        }
+        // A press on a foldable callout's chevron flips its `-`/`+` fold char
+        // (folding/unfolding the body) instead of placing the caret — the same
+        // toggle-in-source model as the task checkbox.
+        if let Some(row) = self.alert_fold_at(event.position) {
+            let start = self.line_starts()[row];
+            let line = &self.content[start..self.line_end(row)];
+            if let Some((at, folded)) = md_syntax::alert_fold_char(line) {
+                let range = start + at..start + at + 1;
+                let repl = if folded { "+" } else { "-" };
+                self.record_edit(&range, repl);
+                self.content.replace_range(range.clone(), repl);
+                self.remap_diagnostics(&range, 1);
+                cx.emit(EditorEvent::Changed);
+                cx.notify();
+            }
+            return;
+        }
+        // A press on a heading's fold chevron toggles its section collapsed —
+        // view-local state, not an edit (markdown has no heading-fold syntax).
+        if let Some(row) = self.heading_fold_at(event.position) {
+            let start = self.line_starts()[row];
+            let end = self.line_end(row);
+            let key = self.content[start..end].trim().to_string();
+            if !self.folded_headings.remove(&key) {
+                // Folding with the caret inside the section would no-op
+                // (reveal-on-caret keeps it open) — seat the caret at the
+                // heading's end first.
+                let single = std::collections::HashSet::from([key.clone()]);
+                let crow = self.row_col(self.cursor_offset()).0;
+                if markdown_syntax::heading_fold_regions(&self.content, &single)
+                    .iter()
+                    .any(|r| crow > r.start && crow < r.end)
+                {
+                    self.move_to(end, cx);
+                }
+                self.folded_headings.insert(key);
+            }
+            cx.notify();
+            return;
+        }
+        // Left-click a file chip (e.g. a PDF embed) opens it rather than editing —
+        // the host handles the link. Right-click edits (see on_right_mouse_down).
+        if let Some((src, wiki)) = self.chip_at(event.position) {
+            cx.emit(if wiki {
+                EditorEvent::OpenWikiLink(src)
             } else {
-                self.goal = None;
-                // 幽灵条：仅非空短行 EOL 钳制时，说明「点在这里、字进那里」。
-                if let Some((_, cx_, cy, ch)) = self.caret_point() {
-                    if (x - cx_).abs() > 8.0 {
-                        self.click_ghost = Some((x, cy, ch, std::time::Instant::now()));
-                    } else {
-                        self.click_ghost = None;
+                EditorEvent::OpenLink(src)
+            });
+            return;
+        }
+        // Left-click an inline `$…$` formula opens its structural editor at the formula's spot
+        // (the host seats it). Shift extends a selection; Control-click is the secondary button.
+        if !event.modifiers.shift
+            && !event.modifiers.control
+            && let Some((range, source)) = self.inline_math_at(event.position)
+        {
+            cx.emit(EditorEvent::EditMath {
+                range,
+                source,
+                at_end: true,
+                inline: true,
+            });
+            return;
+        }
+        // Left-click a property-panel pill opens its target — the pill is painted
+        // over a collapsed source line, so hit-test the painted bounds directly
+        // (not the raw text like `link_at` below).
+        if event.click_count == 1
+            && !event.modifiers.shift
+            && !event.modifiers.control
+            && let Some((_, hit)) = self
+                .prop_pill_rects
+                .iter()
+                .find(|(b, _)| b.contains(&event.position))
+        {
+            match hit {
+                md_syntax::LinkHit::Page(t) => {
+                    cx.emit(EditorEvent::OpenWikiLink(t.clone().into()))
+                }
+                md_syntax::LinkHit::BlockRef(id) => {
+                    cx.emit(EditorEvent::OpenWikiLink(format!("#^{id}").into()))
+                }
+                md_syntax::LinkHit::Url(u) => {
+                    cx.emit(EditorEvent::OpenLink(u.clone().into()))
+                }
+            }
+            return;
+        }
+        // Left-click on (or beside) a property panel opens the in-place editor
+        // for its whole block — the panel edits its properties, not the raw
+        // markdown. Keyed off the ROW the click maps to, not the painted panel
+        // rects, so a click in the empty space right of the panel opens the
+        // editor too instead of seating the caret in (and revealing) the source.
+        if event.click_count == 1 && !event.modifiers.shift && !event.modifiers.control {
+            let offset = self.index_for_mouse_position(event.position);
+            let row = self.row_col(offset).0;
+            if let Some((range, source)) = self.property_block_at(row) {
+                // Which property line within the block was clicked — the host
+                // focuses that row's field instead of always the first.
+                let block_row = row - self.row_col(range.start).0;
+                cx.emit(EditorEvent::EditProperties {
+                    range,
+                    source,
+                    at_end: false,
+                    row: Some(block_row),
+                });
+                return;
+            }
+        }
+        // Left-click an inline image opens a full-size preview (host-shown).
+        if !event.modifiers.shift
+            && !event.modifiers.control
+            && let Some(src) = self.inline_image_at(event.position)
+        {
+            cx.emit(EditorEvent::PreviewImage(src));
+            return;
+        }
+        // Left-click a link navigates, like the reading view: a `[[wiki]]` /
+        // `#tag` opens that page, a `[text](url)` opens the url — consistent
+        // with chips and inline math above. Only a plain single click: a
+        // double-click still selects the word, shift still extends the
+        // selection, and the caret goes anywhere else as usual (to edit a
+        // link's own text, click beside it and arrow in — reveal-on-caret).
+        if event.click_count == 1
+            && !event.modifiers.shift
+            && !event.modifiers.control
+            && self.markdown_style.is_some()
+        {
+            let offset = self.index_for_mouse_position(event.position);
+            let (row, _) = self.row_col(offset);
+            let start = self.line_starts()[row];
+            let line = &self.content[start..self.line_end(row)];
+            match markdown_syntax::link_at(line, offset - start) {
+                Some(markdown_syntax::LinkHit::Page(title)) => {
+                    cx.emit(EditorEvent::OpenWikiLink(title.into()));
+                    return;
+                }
+                Some(markdown_syntax::LinkHit::BlockRef(id)) => {
+                    cx.emit(EditorEvent::OpenWikiLink(format!("#^{id}").into()));
+                    return;
+                }
+                Some(markdown_syntax::LinkHit::Url(url)) => {
+                    cx.emit(EditorEvent::OpenLink(url.into()));
+                    return;
+                }
+                None => {}
+            }
+            // The reference-count badge painted over a hidden ` ^id` anchor:
+            // a click on its (replaced) range lists the referencers. Only when
+            // the anchor is hidden — with the caret on the line the raw text
+            // is revealed for editing and clicks place the caret as usual.
+            if self.row_col(self.selected_range.start).0 != row
+                && let Some((at, id)) = md_syntax::block_id(line)
+                && offset - start >= at
+                && self
+                    .markdown_style
+                    .as_ref()
+                    .and_then(|st| st.block_ref_count.as_ref().map(|f| f(id)))
+                    .unwrap_or(0)
+                    > 0
+            {
+                cx.emit(EditorEvent::OpenWikiLink(format!("refs:^{id}").into()));
+                return;
+            }
+        }
+        // A press on a table's hover "+" strip adds a row (below) or column (right).
+        // The insert APIs are caret-driven, so seat the caret in the table to target
+        // them — but capture the user's cell first and restore it after, so the
+        // caret stays put instead of following the new row/column.
+        if let Some(row) = self.table_add_row_at(event.position) {
+            let keep = self.caret_table_cell_pos();
+            if let Some(off) = self.cell_start_offset(row, 0) {
+                self.selected_range = off..off;
+                self.insert_table_row(true, cx);
+            }
+            if let Some((r, c, ic)) = keep {
+                let caret = self.caret_pos_for_cell(r, c, ic);
+                self.selected_range = caret..caret;
+                cx.notify();
+            }
+            return;
+        }
+        if let Some((row, col)) = self.table_add_col_at(event.position) {
+            let keep = self.caret_table_cell_pos();
+            if let Some(off) = self.cell_start_offset(row, col) {
+                self.selected_range = off..off;
+                self.insert_table_column(true, cx);
+            }
+            if let Some((r, c, ic)) = keep {
+                let caret = self.caret_pos_for_cell(r, c, ic);
+                self.selected_range = caret..caret;
+                cx.notify();
+            }
+            return;
+        }
+        // A press on a row/column delete "−" handle removes that row/column (seat
+        // the caret in it, then reuse the caret-driven delete APIs).
+        if let Some((rect, row)) = self.table_row_del
+            && rect.contains(&event.position)
+        {
+            if let Some(off) = self.cell_start_offset(row, 0) {
+                self.selected_range = off..off;
+                self.delete_table_row(cx);
+            }
+            return;
+        }
+        if let Some((rect, row, col)) = self.table_col_del
+            && rect.contains(&event.position)
+        {
+            if let Some(off) = self.cell_start_offset(row, col) {
+                self.selected_range = off..off;
+                self.delete_table_column(cx);
+            }
+            return;
+        }
+        // A press on a wide table's scroll thumb starts a thumb drag — the
+        // table scrolls with the pointer (see `on_mouse_move`).
+        if let Some(&TableThumb { header, .. }) = self
+            .table_thumbs
+            .iter()
+            .find(|t| t.grab.contains(&event.position))
+        {
+            let sx = self.table_scroll_x.get(&header).copied().unwrap_or(0.);
+            self.table_thumb_drag = Some((header, event.position.x, sx));
+            self.is_selecting = false;
+            cx.notify();
+            return;
+        }
+        // A press on a column border's resize band starts a drag — the column
+        // resizes live; release persists the width (issue #16). A DOUBLE-click
+        // auto-fits the column to its content instead (the Excel/Sheets
+        // convention for a column border).
+        if let Some(&(_, header_row, col, width)) = self
+            .table_col_resize_rects
+            .iter()
+            .find(|(band, ..)| band.contains(&event.position))
+        {
+            if event.click_count == 2 {
+                self.autofit_table_col(header_row, col, window, cx);
+                return;
+            }
+            self.table_col_resize = Some(TableColResize {
+                header_row,
+                col,
+                start_x: event.position.x,
+                orig: width,
+                width,
+            });
+            self.is_selecting = false;
+            cx.notify();
+            return;
+        }
+        // A click on a table cell drops the caret inside the cell, not in the raw
+        // `| … |` source.
+        let offset = self
+            .table_offset_at(event.position, window)
+            .unwrap_or_else(|| self.index_for_mouse_position(event.position));
+        self.menu = None;
+        self.table_menu = None;
+        self.image_menu = None;
+        self.prop_menu = None;
+        self.code_lang_menu = None;
+        self.goal_x = None;
+        self.last_edit = EditKind::Other;
+        // 左键进入正文即进入编辑模式：点击要同时聚焦（否则光标移动了但键盘输入
+        // 仍落在别处——宿主集成时尤其明显）。右击/表格/公式路径已各自 focus。
+        self.focus(window, cx);
+        match event.click_count {
+            // Double-click selects the word under the cursor. On a $$…$$ block
+            // or property panel the FIRST click of the pair already opened the
+            // in-place editor — word-selecting the hidden source underneath
+            // would fight the seated editor, so those clicks are swallowed.
+            2 => {
+                let (row, _) = self.row_col(offset);
+                if self.math_block_at(row).is_some() || self.property_block_at(row).is_some() {
+                    return;
+                }
+                self.is_selecting = false;
+                self.selected_range = self.word_range_at(offset).unwrap_or(offset..offset);
+                self.selection_reversed = false;
+                cx.notify();
+            }
+            // Triple-click (or more): select the whole logical line — except on
+            // a block construct, where it would select the raw hidden fences.
+            n if n >= 3 => {
+                let (row, _) = self.row_col(offset);
+                if self.math_block_at(row).is_some() || self.property_block_at(row).is_some() {
+                    return;
+                }
+                self.is_selecting = false;
+                let start = self.line_starts()[row];
+                self.selected_range = start..self.line_end(row);
+                self.selection_reversed = false;
+                cx.notify();
+            }
+            // Single click: place the caret, or extend the selection with Shift.
+            _ => {
+                // A single left-click on a $$…$$ block opens the structural editor in
+                // place; a Control-click (macOS secondary click, which AppKit delivers as
+                // a left button + control modifier, NOT a right button) shows the formula
+                // context menu instead. Shift-click still extends the selection.
+                if !event.modifiers.shift {
+                    let (row, _) = self.row_col(offset);
+                    if let Some((range, source)) = self.math_block_at(row) {
+                        if event.modifiers.control {
+                            self.focus(window, cx);
+                            cx.emit(EditorEvent::MathMenu {
+                                source,
+                                position: event.position,
+                            });
+                        } else {
+                            cx.emit(EditorEvent::EditMath {
+                                range,
+                                source,
+                                at_end: true,
+                                inline: false,
+                            });
+                        }
+                        return;
                     }
+                }
+                self.is_selecting = true;
+                if event.modifiers.shift {
+                    self.select_to(offset, cx);
+                } else {
+                    self.move_to(offset, cx);
                 }
             }
         }
-        #[cfg(debug_assertions)]
-        {
-            // 调试覆盖层：记录点击的内容坐标（绿点）。
-            self.click_content = Some((local.x.as_f32(), local.y.as_f32() + scroll_y));
-        }
-        #[cfg(debug_assertions)]
-        {
-            let c = self.caret_point();
-            eprintln!(
-                "[md-live] mouse @win=({:.1},{:.1}) bounds_origin=({:.1},{:.1}) bounds_w={:.1} local=({:.1},{:.1}) scroll={scroll_y:.1} -> byte={} caret_px={:?}",
-                event.position.x.as_f32(),
-                event.position.y.as_f32(),
-                self.element_bounds.origin.x.as_f32(),
-                self.element_bounds.origin.y.as_f32(),
-                self.element_bounds.size.width.as_f32(),
-                local.x.as_f32(),
-                local.y.as_f32(),
-                self.selection.head(),
-                c.map(|(r, x, y, h)| (r, round1(x), round1(y), round1(h)))
-            );
-        }
-        cx.notify();
     }
 
-    /// 键盘：控制键（方向/退格/删除/回车/行首行尾）；可打印字符走输入通道。
-    fn on_key_down(
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // End a gutter block drag: splice the block at the drop boundary.
+        if let Some((bs, be, t)) = self.line_drag.take() {
+            self.apply_line_drag(bs, be, t, cx);
+            cx.notify();
+            return;
+        }
+        // End an image-resize drag by persisting the rounded width as `{width=N}`
+        // in that image's source line (through the normal mutation path, so it
+        // joins the undo history + emits Changed); the next paint shows the saved
+        // size and the live override clears.
+        if let Some(resize) = self.image_resize.take() {
+            self.commit_image_resize(resize, cx);
+            cx.notify();
+            return;
+        }
+        // End a table scroll-thumb drag (the live offsets are already stored).
+        if self.table_thumb_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
+        // End a column-border drag by persisting every column's width into the
+        // table marker's `cols=` list (one undo step, emits Changed).
+        if let Some(resize) = self.table_col_resize.take() {
+            self.commit_table_col_widths(resize, cx);
+            cx.notify();
+            return;
+        }
+        self.is_selecting = false;
+    }
+
+    fn on_mouse_move(
         &mut self,
-        event: &KeyDownEvent,
+        event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let k = &event.keystroke;
-        let m = k.modifiers;
-        if !m.control && !m.alt && k.key_char.is_some() {
-            return;
-        }
-        match k.key.to_ascii_lowercase().as_str() {
-            "backspace" => {
-                let off = self.selection.start();
-                if off > 0 {
-                    let prev = self.prev_char(off).unwrap_or(0);
-                    self.insert_edit(prev..off, "", window, cx);
-                }
-            }
-            "delete" => {
-                let off = self.selection.end();
-                if off < self.buffer.len() {
-                    let next = self.next_char(off).unwrap_or(off + 1).max(off + 1);
-                    let next = next.min(self.buffer.len());
-                    self.insert_edit(off..next, "", window, cx);
-                }
-            }
-            "enter" => {
-                self.insert_edit(self.selection.range(), "\n", window, cx);
-            }
-            "left" | "right" | "up" | "down" | "home" | "end" => {
-                self.move_caret(&k.key.to_ascii_lowercase());
-                // 方向键离开目标行后清除「插入列」（避免把旧列渲染到别的行）。
-                self.goal = None;
-                window.invalidate_character_coordinates();
+        // While dragging an image's grip, track the pointer: the new width is the
+        // grab width plus the horizontal travel, floored at `IMG_MIN_W` and capped
+        // to the content width left of the image's inset (so a bulleted image's cap
+        // matches `block_img`, no snap-back on release, and it can't run off the
+        // page). The paint reads this live width for the dragged image (aspect
+        // preserved).
+        // While dragging a block by its gutter grip, track the drop boundary
+        // (snapped out of rendered regions); paint draws the indicator there.
+        if let Some((bs, be, t)) = self.line_drag {
+            let b = self.snap_drop_boundary(self.drop_boundary_at(event.position));
+            if b != t {
+                self.line_drag = Some((bs, be, b));
                 cx.notify();
             }
-            _ => {}
+            return;
+        }
+        // While dragging a wide table's scroll thumb, track the pointer: thumb
+        // travel maps to content scroll through the committed factor.
+        if let Some((header, grab_x, start_sx)) = self.table_thumb_drag {
+            let factor = self
+                .table_thumbs
+                .iter()
+                .find(|t| t.header == header)
+                .map_or(0., |t| t.factor);
+            let sx = start_sx + f32::from(event.position.x - grab_x) * factor;
+            // Clamp at use like the wheel path — the paint clamps too, but a
+            // sane stored value keeps other consumers simple.
+            let sx = sx.max(0.);
+            if self.table_scroll_x.get(&header).copied().unwrap_or(0.) != sx {
+                self.table_scroll_x.insert(header, sx);
+                cx.notify();
+            }
+            return;
+        }
+        // While dragging a table column's border, track the pointer: the new
+        // width is the grab width plus the travel, floored so the column can't
+        // vanish. Shaping applies it live (see `table_column_widths`).
+        if let Some(resize) = self.table_col_resize {
+            let dx = f32::from(event.position.x - resize.start_x);
+            let width = (resize.orig + dx).max(24.);
+            if let Some(r) = self.table_col_resize.as_mut() {
+                r.width = width;
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(resize) = self.image_resize {
+            let avail = self
+                .last_bounds
+                .map_or(f32::MAX, |b| f32::from(b.size.width))
+                - f32::from(self.line_inset(resize.line));
+            let max_w = avail.max(IMG_MIN_W);
+            let dx = f32::from(event.position.x - resize.start_x);
+            let width = (resize.start_width + dx).clamp(IMG_MIN_W, max_w);
+            if let Some(r) = self.image_resize.as_mut() {
+                r.width = width;
+            }
+            cx.notify();
+            return;
+        }
+        if self.is_selecting {
+            let offset = self
+                .table_offset_at(event.position, window)
+                .unwrap_or_else(|| self.index_for_mouse_position(event.position));
+            self.select_to(offset, cx);
+            return;
+        }
+        // While the right-click menu is open it owns the pointer — don't let the
+        // table hover (highlight/handles) track the mouse behind it.
+        if self.table_menu.is_some() {
+            return;
+        }
+        // Repaint table "+" affordances when the pointer's region changes, so the
+        // hover fill + cursor track the mouse live (the editor otherwise only
+        // repaints on the caret blink).
+        let region = self.table_hover_region_at(event.position);
+        let cell = self.hovered_table_cell(event.position);
+        if region != self.table_hover_region || cell != self.table_hover_cell {
+            self.table_hover_region = region;
+            self.table_hover_cell = cell;
+            cx.notify();
+        }
+        // Repaint the column-resize border accent as the pointer crosses a band
+        // (the cursor comes from the hitbox; the painted line needs a frame).
+        let on_band = self
+            .table_col_resize_rects
+            .iter()
+            .position(|(b, ..)| b.contains(&event.position));
+        if on_band != self.table_resize_hover {
+            self.table_resize_hover = on_band;
+            cx.notify();
+        }
+        // Repaint the property-panel hover border when the pointer moves between
+        // rows (the border itself reads the live pointer during paint).
+        let prow = self
+            .prop_row_rects
+            .iter()
+            .position(|(b, _)| b.contains(&event.position));
+        if prow != self.prop_hover_row {
+            self.prop_hover_row = prow;
+            cx.notify();
+        }
+        // Repaint the heading fold chevron when the pointer enters/leaves a
+        // heading row (the chevron is hover-revealed).
+        let hrow = self
+            .heading_row_rects
+            .iter()
+            .find_map(|(row, b)| b.contains(&event.position).then_some(*row));
+        if hrow != self.heading_hover_row {
+            self.heading_hover_row = hrow;
+            cx.notify();
+        }
+        // Repaint the code card's chrome (lang tag + Copy) when the pointer
+        // enters/leaves a card — it's hover-revealed.
+        let ccard = self
+            .code_card_rects
+            .iter()
+            .find_map(|(row, b)| b.contains(&event.position).then_some(*row));
+        if ccard != self.code_chip_hover {
+            self.code_chip_hover = ccard;
+            cx.notify();
         }
     }
 
-    fn move_caret(&mut self, key: &str) {
-        let sel = self.selection;
-        let (s, e) = (sel.start(), sel.end());
-        match key {
-            "left" => {
-                let head = if s != e { s } else { self.selection.head() };
-                let target = if head > 0 { self.prev_char(head).unwrap_or(0) } else { 0 };
-                self.selection = Selection::collapsed(target);
-            }
-            "right" => {
-                let head = if s != e { e } else { self.selection.head() };
-                let target = if head < self.buffer.len() {
-                    self.next_char(head).unwrap_or(self.buffer.len()).min(self.buffer.len())
-                } else {
-                    self.buffer.len()
-                };
-                self.selection = Selection::collapsed(target);
-            }
-            "up" | "down" => {
-                let row = self.buffer.line_of_offset(self.selection.head());
-                let last = self.buffer.line_count().saturating_sub(1);
-                let target_row = if key == "up" {
-                    row.saturating_sub(1)
-                } else {
-                    (row + 1).min(last)
-                };
-                self.selection = Selection::collapsed(self.buffer.line_start(target_row));
-            }
-            "home" => {
-                let row = self.buffer.line_of_offset(self.selection.head());
-                self.selection = Selection::collapsed(self.buffer.line_start(row));
-            }
-            "end" => {
-                let row = self.buffer.line_of_offset(self.selection.head());
-                self.selection = Selection::collapsed(self.buffer.line_end(row));
-            }
-            _ => {}
-        }
-    }
-
-    /// 前一字符边界（不拆 UTF-8）。
-    fn prev_char(&self, off: usize) -> Option<usize> {
-        if off == 0 {
-            return None;
-        }
-        let upto = self.buffer.text().slice(0..off.min(self.buffer.len()));
-        upto.chars()
-            .scan(0usize, |pos, c| {
-                let s = *pos;
-                *pos += c.len_utf8();
-                Some(s)
-            })
-            .last()
-    }
-
-    /// 下一字符边界（不拆 UTF-8）。
-    fn next_char(&self, off: usize) -> Option<usize> {
-        if off >= self.buffer.len() {
-            return None;
-        }
-        let from = self.buffer.text().slice(off..);
-        Some(off + from.chars().next()?.len_utf8())
-    }
-
-    /// 空行「插入列」的补齐前缀：光标在目标空行（goal）且为空选区时，在 `text` 前补
-    /// `floor((点击x - 行左缘)/空格宽)`（≤120）个空格，把首个字符抬到点击列。
-    /// 直插（`replace_text_in_range`）与 **IME 组合**（`replace_and_mark_text_in_range`，
-    /// 中文输入法走这条）共用——否则点空行打拼音，字会落到行首，光标却在点击列。
-    fn goal_prefixed_text(&self, byte_range: &Range<usize>, text: &str) -> String {
-        let Some((grow, gx, sw)) = self.goal else {
-            return text.to_string();
+    /// Persist a finished grip drag: replace the resized image's source line with
+    /// one carrying the rounded `{width=N}`, going through `record_edit` so it's
+    /// one undoable edit and emits `Changed`. A no-op if the line vanished or
+    /// isn't an image any more (it shaped to an image last paint, but guard
+    /// anyway), or if the width didn't actually change.
+    fn commit_image_resize(&mut self, resize: ImageResize, cx: &mut Context<Self>) {
+        let starts = self.line_starts();
+        let Some(&start) = starts.get(resize.line) else {
+            return;
         };
-        if !(self.selection.is_collapsed()
-            && self.selection.head() == byte_range.start
-            && byte_range.start == byte_range.end)
+        let end = self.line_end(resize.line);
+        let line = &self.content[start..end];
+        let new_line = set_image_width(line, resize.width.round().max(IMG_MIN_W) as u32);
+        if new_line == line {
+            return;
+        }
+        let range = start..end;
+        let delta = new_line.len() as isize - (end - start) as isize;
+        self.record_edit(&range, &new_line);
+        self.content = self.content[..start].to_owned() + &new_line + &self.content[end..];
+        self.remap_diagnostics(&range, new_line.len());
+        // The line just grew/shrank by `delta` — shift a caret at/after its old
+        // end with the text (the drop path parks it on the line below), else its
+        // stale offset lands inside the new `{width=N}` tail and reveal-on-caret
+        // swaps the freshly resized image for raw source. An offset inside the
+        // line clamps to the new line end.
+        let remap = |o: usize| {
+            if o >= end {
+                o.saturating_add_signed(delta)
+            } else {
+                o.min(start + new_line.len())
+            }
+        };
+        self.selected_range = remap(self.selected_range.start)..remap(self.selected_range.end);
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
+    }
+
+    /// If logical line `row` renders as an inline image (a standalone `![](src)`
+    /// or list-item image in markdown mode — not a file chip), the byte range of
+    /// the whole line plus its trailing newline: the atomic unit Word-style
+    /// deletion removes. `None` with styling off (raw mode edits as plain text).
+    fn image_row_range(&self, row: usize) -> Option<Range<usize>> {
+        self.markdown_style.as_ref()?;
+        let start = *self.line_starts().get(row)?;
+        let end = self.line_end(row);
+        let (src, ..) = markdown_syntax::image_row(&self.content[start..end])?;
+        if let Some(chip) = &self.block_chip
+            && chip(src).is_some()
         {
-            return text.to_string();
+            return None; // a chip's line edits as text (reveal-on-caret)
         }
-        let Some(lr) = self.live.get(grow) else {
-            return text.to_string();
+        Some(start..(end + 1).min(self.content.len()))
+    }
+
+    /// Delete the `key:: value` line at `row` (+ its newline) — the panel's
+    /// right-click "Delete property". One undoable edit; deleting the last
+    /// property removes the panel.
+    fn delete_property_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(&start) = self.line_starts().get(row) else {
+            return;
         };
-        let left_x = Self::row_left_x(lr.row.kind, lr);
-        let col = ((gx - left_x) / sw).floor().max(0.0) as usize;
-        let col = col.min(120);
-        if col > 0 {
-            format!("{:padding$}{}", "", text, padding = col)
-        } else {
-            text.to_string()
+        let end = (self.line_end(row) + 1).min(self.content.len());
+        self.replace_range(start..end, "", cx);
+        cx.emit(EditorEvent::Changed);
+    }
+
+    /// Delete the image occupying logical line `row` — line + trailing newline,
+    /// one undoable edit. Backs the right-click "Delete image" and the
+    /// Word-style Backspace/Delete on an image row.
+    fn delete_image_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        if let Some(range) = self.image_row_range(row) {
+            self.replace_range(range, "", cx);
+            cx.emit(EditorEvent::Changed);
         }
     }
-}
 
-impl Focusable for MarkdownLivePreview {
-    fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 输入（EntityInputHandler：IME / 剪贴板 / 文本输入）
-// ---------------------------------------------------------------------------
-
-impl EntityInputHandler for MarkdownLivePreview {
-    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        true
-    }
-
-    fn text_length_utf16(
+    /// Right-click: if the click lands on a flagged word, fetch its suggestions
+    /// (lazily, via the provider) and open a menu anchored there; otherwise close
+    /// any open menu.
+    fn on_right_mouse_down(
         &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        Some(self.buffer.len_utf16())
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Right-click on an inline image: Word-style object menu (Delete) — the
+        // row renders as a picture, there's no text under the pointer to edit.
+        // Only for real `![](src)` rows: mermaid/math rasters share the widget
+        // type but delete as text (their menu would silently no-op).
+        if let Some(&(line, _)) = self
+            .image_rects
+            .iter()
+            .find(|(_, rect)| rect.contains(&event.position))
+            .filter(|&&(line, _)| self.image_row_range(line).is_some())
+        {
+            self.menu = None;
+            self.table_menu = None;
+            self.focus(window, cx);
+            self.image_menu = Some((line, event.position));
+            cx.notify();
+            return;
+        }
+        // Right-click a property-panel row: Edit / Delete property menu — the
+        // panel renders as a widget, there's no text under the pointer.
+        if let Some(&(_, row)) = self
+            .prop_row_rects
+            .iter()
+            .find(|(rect, _)| rect.contains(&event.position))
+        {
+            self.menu = None;
+            self.table_menu = None;
+            self.image_menu = None;
+            self.focus(window, cx);
+            self.prop_menu = Some((row, event.position));
+            cx.notify();
+            return;
+        }
+        // Right-click a file chip places the caret to edit its source (the line
+        // then reveals raw `![](src)`), instead of opening the spell menu.
+        if self.chip_at(event.position).is_some() {
+            self.menu = None;
+            self.focus(window, cx);
+            let offset = self.index_for_mouse_position(event.position);
+            self.move_to(offset, cx);
+            return;
+        }
+        // Right-click a $$…$$ block: emit a MathMenu event so the host can show a
+        // context menu (Copy LaTeX / Export SVG / PNG). Focus the editor (not the caret
+        // move of old) so it stays live after the menu closes.
+        {
+            let offset = self.index_for_mouse_position(event.position);
+            let (row, _) = self.row_col(offset);
+            if let Some((_range, source)) = self.math_block_at(row) {
+                self.focus(window, cx);
+                cx.emit(EditorEvent::MathMenu {
+                    source,
+                    position: event.position,
+                });
+                return;
+            }
+        }
+        // Right-click in a table cell: place the caret there + open the table menu
+        // (insert/delete rows + columns), instead of the spell menu. INSIDE a
+        // selection, keep the selection and show the clipboard menu instead —
+        // Cut/Copy act on it, like prose; the structure menu stays a
+        // selection-free right-click away.
+        if let Some(offset) = self.table_offset_at(event.position, window) {
+            self.menu = None;
+            self.focus(window, cx);
+            let sel = self.selected_range.clone();
+            if !sel.is_empty() && offset >= sel.start && offset <= sel.end {
+                self.menu = Some(DiagMenu {
+                    anchor: event.position,
+                    range: offset..offset,
+                    suggestions: Vec::new(),
+                    scroll: ScrollHandle::new(),
+                    turn_into: false,
+                });
+            } else {
+                self.move_to(offset, cx);
+                self.table_menu = Some(event.position);
+            }
+            cx.notify();
+            return;
+        }
+        let offset = self.index_for_mouse_position(event.position);
+        // Window-space — the popup renders on a `deferred`/`anchored` layer.
+        let anchor = event.position;
+        // A right-click outside the selection moves the caret there (so Paste
+        // lands under the pointer); inside it, the selection stays put — it's
+        // what Cut/Copy act on.
+        let sel = self.selected_range.clone();
+        let in_selection = !sel.is_empty() && offset >= sel.start && offset <= sel.end;
+        if !in_selection {
+            self.move_to(offset, cx);
+        }
+        self.focus(window, cx);
+        // Suggestions when the click lands on a flagged word; the clipboard
+        // verbs (Cut / Copy / Paste) ride along either way.
+        let (range, suggestions) = match self.diagnostic_at(offset).map(|d| d.range.clone()) {
+            Some(range) => {
+                let word = self.content[range.clone()].to_string();
+                let suggestions = self.suggest.as_ref().map(|f| f(&word)).unwrap_or_default();
+                (range, suggestions)
+            }
+            None => (offset..offset, Vec::new()),
+        };
+        self.menu = Some(DiagMenu {
+            anchor,
+            range,
+            suggestions: suggestions.into_iter().map(SharedString::from).collect(),
+            scroll: ScrollHandle::new(),
+            turn_into: false,
+        });
+        cx.notify();
     }
 
-    fn selected_text_range(
+    /// The diagnostic whose range contains `offset`, if any.
+    fn diagnostic_at(&self, offset: usize) -> Option<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .find(|d| d.range.start <= offset && offset < d.range.end)
+    }
+
+    /// Close the suggestions menu (Escape, or a click elsewhere).
+    fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_some()
+            || self.table_menu.take().is_some()
+            || self.image_menu.take().is_some()
+            || self.prop_menu.take().is_some()
+            || self.code_lang_menu.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Run the shared math-fence normalizer over the paragraph containing
+    /// `row` (blank-line bounded), splicing only when it changes something.
+    /// One recorded (undoable) edit; the caret shifts with the insertion.
+    fn normalize_math_at(&mut self, row: usize) {
+        if self.markdown_style.is_none() {
+            return;
+        }
+        let starts = self.line_starts();
+        let last_row = starts.len().saturating_sub(1);
+        let blank = |r: usize| self.content[starts[r]..self.line_end(r)].trim().is_empty();
+        let mut first = row;
+        while first > 0 && !blank(first - 1) {
+            first -= 1;
+        }
+        let mut last = row;
+        while last < last_row && !blank(last + 1) {
+            last += 1;
+        }
+        let span = starts[first]..self.line_end(last);
+        let para = &self.content[span.clone()];
+        if !para.contains("$$") {
+            return;
+        }
+        let normalized = match md_syntax::normalize_math_fences(para) {
+            std::borrow::Cow::Borrowed(_) => return,
+            std::borrow::Cow::Owned(s) => s,
+        };
+        let old_caret = self.selected_range.start;
+        let delta = normalized.len() as isize - (span.end - span.start) as isize;
+        self.record_edit(&span, &normalized);
+        self.content =
+            self.content[..span.start].to_owned() + &normalized + &self.content[span.end..];
+        self.remap_diagnostics(&span, normalized.len());
+        // Typing happens at/after the paragraph's tail — shifting by the whole
+        // delta keeps the caret on its text for the common case.
+        let caret = if old_caret >= span.start {
+            (old_caret as isize + delta).max(0) as usize
+        } else {
+            old_caret
+        };
+        let caret = caret.min(self.content.len());
+        self.selected_range = caret..caret;
+        self.last_edit = EditKind::Other;
+    }
+
+    /// Replace `range` with a chosen suggestion and close the menu.
+    fn apply_suggestion(
         &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let sel = self.selection;
-        Some(UTF16Selection {
-            range: self.buffer.byte_to_utf16(sel.start())..self.buffer.byte_to_utf16(sel.end()),
-            reversed: sel.reversed(),
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|r| {
-            self.buffer.byte_to_utf16(r.start).min(self.buffer.len_utf16())
-                ..self.buffer.byte_to_utf16(r.end).min(self.buffer.len_utf16())
-        })
-    }
-
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        _adjusted_range: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let s = self.buffer.utf16_to_byte(range_utf16.start);
-        let e = self.buffer.utf16_to_byte(range_utf16.end);
-        Some(self.buffer.text_in_range(s..e).to_string())
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
+        range: Range<usize>,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let byte_range = match range {
-            Some(r) => {
-                self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
-                    ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16()))
-            }
-            None => self.marked_range.clone().unwrap_or_else(|| self.selection.range()),
+        self.menu = None;
+        self.selected_range = range;
+        self.selection_reversed = false;
+        self.replace_text_in_range(None, text, window, cx);
+    }
+
+    /// The fenced code block containing `row`: its opening fence row plus the
+    /// closing fence row (`None` when the block runs unclosed to the end).
+    /// The single source for turn-into, block drag, and drop snapping.
+    fn fence_block_rows(&self, row: usize) -> (usize, Option<usize>) {
+        let scan = self.scan_data();
+        let starts = self.line_starts();
+        let last_row = starts.len().saturating_sub(1);
+        let open = (0..=row)
+            .rev()
+            .find(|&r| !scan.fence_odd.get(r).copied().unwrap_or(false))
+            .unwrap_or(0);
+        let close = ((open + 1)..=last_row).find(|&r| {
+            self.content[starts[r]..self.line_end(r)]
+                .trim_start()
+                .starts_with("```")
+        });
+        (open, close)
+    }
+
+    /// The contiguous blockquote run containing `row` (first row..=last row),
+    /// by the renderer's `blockquote_prefix` test.
+    fn quote_run_rows(&self, row: usize) -> (usize, usize) {
+        let starts = self.line_starts();
+        let last_row = starts.len().saturating_sub(1);
+        let is_q = |r: usize| {
+            markdown_syntax::blockquote_prefix(&self.content[starts[r]..self.line_end(r)]).is_some()
         };
-        let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        // 空行「插入列」：首次输入时先把空格补到点击列，字符落在点击处（真 WYSIWYG），
-        // 然后清除目标列（后续输入回到真实光标）。
-        normalized = self.goal_prefixed_text(&byte_range, &normalized);
-        self.goal = None;
-        #[cfg(debug_assertions)]
-        let debug_range = byte_range.clone();
-        self.insert_edit(byte_range, &normalized, window, cx);
-        #[cfg(debug_assertions)]
-        {
-            self.ensure_fresh_layout(window);
-            let c = self.caret_point();
-            eprintln!(
-                "[md-live] input-bounds_w={:.1} apply byte {:?} {:?} -> sel={} caret_px={:?}",
-                self.element_bounds.size.width.as_f32(),
-                debug_range,
-                normalized,
-                self.selection.head(),
-                c.map(|(r, x, y, h)| (r, round1(x), round1(y), round1(h)))
-            );
+        let mut first = row;
+        while first > 0 && is_q(first - 1) {
+            first -= 1;
         }
+        let mut last = row;
+        while last < last_row && is_q(last + 1) {
+            last += 1;
+        }
+        (first, last)
+    }
+
+    /// The "Turn into" kind of the block containing `row` — what the flyout
+    /// shows checked.
+    fn block_kind_at(&self, row: usize) -> TurnKind {
+        let scan = self.scan_data();
+        if scan.math.iter().any(|m| m.range.contains(&row)) {
+            return TurnKind::Math;
+        }
+        let starts = self.line_starts();
+        let Some(&start) = starts.get(row) else {
+            return TurnKind::Text;
+        };
+        // The renderer's own recognizers (task/list/heading/quote/alert), so
+        // the checked kind always agrees with what WYSIWYG actually renders.
+        let line = &self.content[start..self.line_end(row)];
+        if scan.fence_odd.get(row).copied().unwrap_or(false) || line.trim_start().starts_with("```")
+        {
+            return TurnKind::Code;
+        }
+        if markdown_syntax::task_prefix(line).is_some() {
+            return TurnKind::Todo;
+        }
+        match markdown_syntax::heading_level(line) {
+            Some(1) => return TurnKind::H1,
+            Some(2) => return TurnKind::H2,
+            Some(3) => return TurnKind::H3,
+            _ => {}
+        }
+        if let Some((_, _, ordered, _)) = markdown_syntax::list_prefix(line) {
+            return if ordered {
+                TurnKind::Numbered
+            } else {
+                TurnKind::Bullet
+            };
+        }
+        if markdown_syntax::blockquote_prefix(line).is_some() {
+            // Callout if the caret's contiguous `>`-run carries a VALID
+            // `[!KIND]` marker anywhere (marker line or body line).
+            let (first, last) = self.quote_run_rows(row);
+            for (r, &start) in starts.iter().enumerate().take(last + 1).skip(first) {
+                let l = &self.content[start..self.line_end(r)];
+                let p = markdown_syntax::blockquote_prefix(l).unwrap_or(0);
+                if markdown_syntax::alert_kind(&l[p..]).is_some() {
+                    return TurnKind::Callout;
+                }
+            }
+            return TurnKind::Quote;
+        }
+        TurnKind::Text
+    }
+
+    /// Convert the caret's block to `kind` — the "Turn into" menu action.
+    /// One undoable edit rewriting the block's lines; fenced kinds (code,
+    /// math) and quote runs convert as whole blocks.
+    fn turn_into(&mut self, kind: TurnKind, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self.row_col(self.selected_range.start).0;
+        let cur = self.block_kind_at(row);
+        if cur == kind {
+            return;
+        }
+        let scan = self.scan_data();
+        let starts = self.line_starts();
+        let last_row = starts.len().saturating_sub(1);
+        let line_at = |r: usize| self.content[starts[r]..self.line_end(r)].to_string();
+        // The block's line span + its content with the current dressing removed.
+        let (first, last, mut body): (usize, usize, Vec<String>) = match cur {
+            TurnKind::Code => {
+                let (open, close) = self.fence_block_rows(row);
+                let last = close.unwrap_or(last_row);
+                let body_end = close.map(|c| c.saturating_sub(1)).unwrap_or(last_row);
+                let body = ((open + 1)..=body_end).map(line_at).collect();
+                (open, last, body)
+            }
+            TurnKind::Math => {
+                let Some(reg) = scan.math.iter().find(|m| m.range.contains(&row)) else {
+                    return;
+                };
+                let first = reg.range.start;
+                let last = reg.range.end.saturating_sub(1).max(first);
+                let body = ((first + 1)..last).map(line_at).collect();
+                (first, last, body)
+            }
+            TurnKind::Quote | TurnKind::Callout => {
+                let (first, last) = self.quote_run_rows(row);
+                let body = (first..=last)
+                    .filter_map(|r| {
+                        let line = line_at(r);
+                        let stripped = strip_block_prefix(&line);
+                        // Drop the `[!KIND]` marker token; keep any title text
+                        // after it (and skip the line if that leaves nothing).
+                        if let Some(rest) = stripped.trim_start().strip_prefix("[!") {
+                            let after = rest.split_once(']').map(|(_, a)| a).unwrap_or("");
+                            let after = after.trim_start_matches(['-', '+']).trim();
+                            return (!after.is_empty()).then(|| after.to_string());
+                        }
+                        Some(stripped.to_string())
+                    })
+                    .collect();
+                (first, last, body)
+            }
+            _ => (
+                row,
+                row,
+                vec![strip_block_prefix(&line_at(row)).to_string()],
+            ),
+        };
+        if body.is_empty() {
+            body.push(String::new());
+        }
+        let text = match kind {
+            TurnKind::Text => body.join("\n"),
+            TurnKind::H1 => prefix_lines(&body, |_| "# ".into()),
+            TurnKind::H2 => prefix_lines(&body, |_| "## ".into()),
+            TurnKind::H3 => prefix_lines(&body, |_| "### ".into()),
+            TurnKind::Bullet => prefix_lines(&body, |_| "- ".into()),
+            TurnKind::Numbered => prefix_lines(&body, |i| format!("{}. ", i + 1)),
+            TurnKind::Todo => prefix_lines(&body, |_| "- [ ] ".into()),
+            TurnKind::Quote => prefix_lines(&body, |_| "> ".into()),
+            TurnKind::Callout => format!("> [!NOTE]\n{}", prefix_lines(&body, |_| "> ".into())),
+            TurnKind::Code => format!("```\n{}\n```", body.join("\n")),
+            TurnKind::Math => format!("$$\n{}\n$$", body.join("\n")),
+        };
+        let range = starts[first]..self.line_end(last);
+        let range_start = range.start;
+        self.selected_range = range;
+        self.selection_reversed = false;
+        self.replace_text_in_range(None, &text, window, cx);
+        // Fenced kinds: the caret parks after the closing fence, revealing the
+        // raw markers (reveal-on-caret) — seat it on the body's first line
+        // instead, like `set_code_lang`.
+        if matches!(kind, TurnKind::Code | TurnKind::Math) {
+            let caret =
+                (range_start + text.find('\n').map_or(0, |i| i + 1)).min(self.content.len());
+            self.selected_range = caret..caret;
+        }
+    }
+
+    /// Extra left offset for the gutter drag grip (e.g. the host's
+    /// line-number gutter width), so the grip clears other gutter chrome.
+    pub fn set_grip_inset(&mut self, inset: Pixels) {
+        self.grip_inset = inset;
+    }
+
+    /// The line span the gutter grip drags as one unit: whole fenced/rendered
+    /// regions (code, math, mermaid, tables incl. their style marker,
+    /// property panels), a quote/callout run, a list item with its
+    /// deeper-indented children — otherwise the single line.
+    fn drag_block_rows(&self, row: usize) -> (usize, usize) {
+        let scan = self.scan_data();
+        let starts = self.line_starts();
+        let last_row = starts.len().saturating_sub(1);
+        let line_at = |r: usize| &self.content[starts[r]..self.line_end(r)];
+        if let Some(m) = scan
+            .math
+            .iter()
+            .find(|m| m.range.contains(&row) || m.marker_line == Some(row))
+        {
+            let first = m.marker_line.unwrap_or(m.range.start).min(m.range.start);
+            return (first, m.range.end.saturating_sub(1).max(m.range.start));
+        }
+        if let Some((r, _)) = scan.mermaid.iter().find(|(r, _)| r.contains(&row)) {
+            return (r.start, r.end.saturating_sub(1).max(r.start));
+        }
+        if let Some(t) = scan
+            .tables
+            .iter()
+            .find(|t| t.lines.contains(&row) || t.marker_line == Some(row))
+        {
+            let first = t.marker_line.unwrap_or(t.lines.start).min(t.lines.start);
+            return (first, t.lines.end.saturating_sub(1).max(t.lines.start));
+        }
+        if let Some(p) = scan.props.iter().find(|r| r.contains(&row)) {
+            return (p.start, p.end.saturating_sub(1).max(p.start));
+        }
+        if scan.fence_odd.get(row).copied().unwrap_or(false)
+            || line_at(row).trim_start().starts_with("```")
+        {
+            let (open, close) = self.fence_block_rows(row);
+            return (open, close.unwrap_or(last_row));
+        }
+        if markdown_syntax::blockquote_prefix(line_at(row)).is_some() {
+            return self.quote_run_rows(row);
+        }
+        if markdown_syntax::list_prefix(line_at(row)).is_some() {
+            let indent = |r: usize| {
+                let l = line_at(r);
+                l.len() - l.trim_start().len()
+            };
+            let base = indent(row);
+            let mut last = row;
+            while last < last_row && !line_at(last + 1).trim().is_empty() && indent(last + 1) > base
+            {
+                last += 1;
+            }
+            return (row, last);
+        }
+        (row, row)
+    }
+
+    /// The row whose gutter grip the pointer would hover (the event-time
+    /// mirror of prepaint's grip computation, for repaint change-detection).
+    fn grip_hover_row_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        if self.markdown_style.is_none()
+            || self.line_drag.is_some()
+            || position.x < grip_left(bounds.origin.x, self.grip_inset) - px(4.)
+            || position.x > bounds.origin.x + bounds.size.width
+            || position.y < bounds.origin.y
+            || position.y > bounds.origin.y + bounds.size.height
+        {
+            return None;
+        }
+        let y = position.y - bounds.origin.y;
+        (0..self.line_tops.len()).find(|&i| {
+            let h = self.line_h(i) * self.row_span(i) as f32;
+            h > px(0.5) && y >= self.line_tops[i] && y < self.line_tops[i] + h
+        })
+    }
+
+    /// The drop boundary (a between-rows index) nearest the pointer, from the
+    /// last paint's committed geometry.
+    fn drop_boundary_at(&self, position: Point<Pixels>) -> usize {
+        let Some(bounds) = self.last_bounds else {
+            return 0;
+        };
+        let y = position.y - bounds.origin.y;
+        for i in 0..self.line_tops.len() {
+            let mid = self.line_tops[i] + self.line_h(i) * self.row_span(i) as f32 / 2.;
+            if y < mid {
+                return i;
+            }
+        }
+        self.line_tops.len()
+    }
+
+    /// Clamp a drop boundary out of the interior of any rendered region — a
+    /// block can't land inside a table, fence, math block, or property panel.
+    fn snap_drop_boundary(&self, mut b: usize) -> usize {
+        let scan = self.scan_data();
+        let snap = |b: usize, s: usize, e: usize| {
+            if b > s && b < e {
+                if b - s <= e - b { s } else { e }
+            } else {
+                b
+            }
+        };
+        for m in scan.math.iter() {
+            let s = m.marker_line.unwrap_or(m.range.start).min(m.range.start);
+            b = snap(b, s, m.range.end);
+        }
+        for (r, _) in scan.mermaid.iter() {
+            b = snap(b, r.start, r.end);
+        }
+        for t in scan.tables.iter() {
+            let s = t.marker_line.unwrap_or(t.lines.start).min(t.lines.start);
+            b = snap(b, s, t.lines.end);
+        }
+        for p in scan.props.iter() {
+            b = snap(b, p.start, p.end);
+        }
+        // Inside a code fence: snap to the opening fence or past the close.
+        if scan.fence_odd.get(b).copied().unwrap_or(false) {
+            let (open, close) = self.fence_block_rows(b);
+            let close = close.map(|c| c + 1).unwrap_or(self.line_starts().len());
+            b = if b - open <= close - b { open } else { close };
+        }
+        b
+    }
+
+    /// Land the grabbed block at boundary `t` — one undoable splice of the
+    /// span between the block and the target, caret seated on the block.
+    fn apply_line_drag(&mut self, bs: usize, be: usize, t: usize, cx: &mut Context<Self>) {
+        let starts = self.line_starts();
+        let n = starts.len();
+        if bs >= n || be >= n || (t >= bs && t <= be + 1) {
+            return; // dropped onto itself (or stale rows) — no-op
+        }
+        let block_start = starts[bs];
+        let block_end = self.line_end(be);
+        let block_text = self.content[block_start..block_end].to_string();
+        if t > be {
+            // Down: [block \n between...] → [between... block (\n)]
+            let target_off = if t >= n {
+                self.content.len()
+            } else {
+                starts[t]
+            };
+            let after_block = (block_end + 1).min(self.content.len());
+            let mut new = self.content[after_block..target_off].to_string();
+            if !new.is_empty() && !new.ends_with('\n') {
+                new.push('\n');
+            }
+            let rest_len = new.len();
+            new.push_str(&block_text);
+            if t < n {
+                new.push('\n');
+            }
+            self.replace_range(block_start..target_off, &new, cx);
+            let caret = block_start + rest_len;
+            self.selected_range = caret..caret;
+        } else {
+            // Up: [between... block] → [block \n between...]
+            let target_off = starts[t];
+            let between = &self.content[target_off..block_start];
+            let mut new = block_text.clone();
+            new.push('\n');
+            new.push_str(&between[..between.len().saturating_sub(1)]);
+            self.replace_range(target_off..block_end, &new, cx);
+            self.selected_range = target_off..target_off;
+        }
+        cx.emit(EditorEvent::Changed);
+    }
+
+    // --- Selection helpers ---------------------------------------------------
+
+    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.selected_range = offset..offset;
+        // A deliberate caret move ends the current typing/deleting run and the
+        // vertical-movement goal column.
+        self.last_edit = EditKind::Other;
+        self.goal_x = None;
+        cx.emit(EditorEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    /// Seat the caret on the plain-text line just before (`after = false`) or after
+    /// (`after = true`) the math `block`, and focus the editor — the keyboard counterpart to
+    /// clicking away, for when the caret flows out of a `$$…$$` formula's structural editor
+    /// (so it never lands on the hidden `$$` fence lines, which would reveal raw source).
+    pub fn exit_math(
+        &mut self,
+        block: Range<usize>,
+        after: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus(window, cx);
+        let target = if after {
+            let (end_row, _) = self.row_col(block.end.saturating_sub(1));
+            match self.line_starts().get(end_row + 1).copied() {
+                Some(start) => start,
+                // The block ends the document: give the caret a fresh line
+                // below. Landing at content-end would park it ON the block's
+                // last row, revealing the raw source it just committed.
+                None => {
+                    let end = self.content.len();
+                    self.replace_range(end..end, "\n", cx);
+                    cx.emit(EditorEvent::Changed);
+                    self.content.len()
+                }
+            }
+        } else {
+            let (start_row, _) = self.row_col(block.start);
+            // An alignment marker directly above belongs to the block — resting
+            // on it reveals the region, so step past it too.
+            let mut row = start_row;
+            if row > 0 && markdown_syntax::math_align_marker(self.line_str(row - 1)).is_some() {
+                row -= 1;
+            }
+            if row > 0 { self.line_end(row - 1) } else { 0 }
+        };
+        self.move_to(target, cx);
+    }
+
+    /// The caret's bounds in window space (its painted Y range), or `None` before
+    /// the first paint. Lets a host scroll the caret into view; computed from the
+    /// layout stored at the last paint, so it's valid for caret moves that don't
+    /// change the text (arrow keys, click).
+    pub fn caret_screen_bounds(&self) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_bounds?;
+        let (row, col) = self.row_col(self.cursor_offset());
+        let lh = self.line_h(row);
+        let p = self
+            .wrapped
+            .get(row)?
+            .position_for_index(self.display_col(row, col), lh)?;
+        let top = bounds.top() + self.line_tops.get(row).copied().unwrap_or(px(0.)) + p.y;
+        Some(Bounds::from_corners(
+            point(bounds.left(), top),
+            point(bounds.left(), top + lh),
+        ))
+    }
+
+    fn cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if self.selection_reversed {
+            self.selected_range.start = offset;
+        } else {
+            self.selected_range.end = offset;
+        }
+        if self.selected_range.end < self.selected_range.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        cx.emit(EditorEvent::SelectionChanged);
+        cx.notify();
+    }
+
+    // --- Line / row-col mapping ---------------------------------------------
+
+    /// Byte offset where each visual line starts (line 0 starts at 0; each line
+    /// after a `\n`). Always has at least one entry.
+    fn line_starts(&self) -> Vec<usize> {
+        let mut starts = vec![0];
+        for (i, b) in self.content.bytes().enumerate() {
+            if b == b'\n' {
+                starts.push(i + 1);
+            }
+        }
+        starts
+    }
+
+    /// The `(row, byte-column)` of a byte offset.
+    fn row_col(&self, offset: usize) -> (usize, usize) {
+        let starts = self.line_starts();
+        let row = starts.partition_point(|&s| s <= offset).saturating_sub(1);
+        (row, offset - starts[row])
+    }
+
+    /// Byte offset of the end of a row's text (before its `\n`, or the document
+    /// end for the last row).
+    fn line_end(&self, row: usize) -> usize {
+        let starts = self.line_starts();
+        starts
+            .get(row + 1)
+            .map(|&s| s - 1)
+            .unwrap_or(self.content.len())
+    }
+
+    /// Offset one row up/down from the caret, preserving the byte column where
+    /// possible. At the top/bottom edge, jumps to the document start/end.
+    fn vertical_offset(&self, dir: i32) -> usize {
+        let cursor = self.cursor_offset();
+        let starts = self.line_starts();
+        let (row, col) = self.row_col(cursor);
+        let target = row as i32 + dir;
+        if target < 0 {
+            return 0;
+        }
+        if target as usize >= starts.len() {
+            return self.content.len();
+        }
+        let target = target as usize;
+        let target_start = starts[target];
+        let target_len = self.line_end(target) - target_start;
+        let mut new_col = col.min(target_len);
+        while new_col > 0 && !self.content.is_char_boundary(target_start + new_col) {
+            new_col -= 1;
+        }
+        target_start + new_col
+    }
+
+    /// Offset one *visual* row up/down from the caret, preserving the goal column
+    /// (x) across the run. Falls back to logical-line movement before the first
+    /// paint (when no wrapped layout is cached yet).
+    fn move_vertical(&mut self, dir: i32) -> usize {
+        if self.wrapped.is_empty() {
+            return self.vertical_offset(dir);
+        }
+        let (row, col) = self.row_col(self.cursor_offset());
+        let cur_lh = self.line_h(row);
+        if cur_lh <= px(0.) {
+            return self.vertical_offset(dir);
+        }
+        let Some(cur) = self
+            .wrapped
+            .get(row)
+            .and_then(|l| line_pos(l, self.bidi_map(row), self.display_col(row, col), cur_lh))
+        else {
+            return self.vertical_offset(dir);
+        };
+        let global_y = self.line_tops[row] + cur.y;
+        // The goal column is the caret's *visual* x, so it carries an RTL row's
+        // right-align shift — the target row's shift comes off again below.
+        // (Row insets stay out of it, as they always have.)
+        let goal = self.goal_x.unwrap_or(cur.x + self.rtl_shift(row));
+        self.goal_x = Some(goal);
+        // Step to the adjacent visual row. Down: to the bottom of the current
+        // row (= the top of the next one). Up: just above the current row's top
+        // — robust to the row above having a different height (e.g. a heading),
+        // since it doesn't depend on the current row's height.
+        let target_y = if dir >= 0 {
+            global_y + cur_lh
+        } else {
+            global_y - px(1.)
+        };
+        if target_y < px(0.) {
+            return 0;
+        }
+        let last = self.wrapped.len() - 1;
+        let total = self.line_tops[last] + self.line_h(last) * self.row_span(last) as f32;
+        if target_y >= total {
+            // Landing at the very end would park the caret on a trailing
+            // collapsed row (a hidden closing ``` fence) and reveal it — clamp
+            // to the end of the last VISIBLE row instead.
+            let mut r = last;
+            while r > 0 && self.line_h(r) <= px(0.) {
+                r -= 1;
+            }
+            return if r == last {
+                self.content.len()
+            } else {
+                self.line_end(r)
+            };
+        }
+        let mut trow = last;
+        for i in 0..self.wrapped.len() {
+            let h = self.line_h(i) * self.row_span(i) as f32;
+            if target_y < self.line_tops[i] + h {
+                trow = i;
+                break;
+            }
+        }
+        // A reserved gutter gap (a table's top/bottom, a code block's pads) belongs
+        // to no row, and the loop assigns it to the row *after* it — right going
+        // down, but going up that strands the caret on the far side of the gap (e.g.
+        // just below a table). Going up, target the row before the gap instead.
+        if dir < 0 && trow > 0 && target_y < self.line_tops[trow] {
+            trow -= 1;
+        }
+        // A table separator (`|---|`) row isn't editable — skip past it (in the
+        // direction of travel) so the caret lands on the header/body row rather
+        // than dropping the whole table to raw source.
+        if self
+            .table_rows
+            .get(trow)
+            .and_then(Option::as_ref)
+            .is_some_and(|t| t.is_separator)
+        {
+            let skip = if dir >= 0 {
+                trow + 1
+            } else {
+                trow.wrapping_sub(1)
+            };
+            if skip < self.wrapped.len() {
+                trow = skip;
+            }
+        }
+        // A collapsed row (a hidden ``` fence, a folded body line) has no visual
+        // height — landing there reveals it. Keep stepping in the direction of
+        // travel so the caret skips over it; if the document runs out that way,
+        // stay put.
+        if self.line_h(trow) <= px(0.) {
+            let step = |r: usize| {
+                if dir >= 0 {
+                    (r + 1 < self.wrapped.len()).then_some(r + 1)
+                } else {
+                    r.checked_sub(1)
+                }
+            };
+            let mut r = trow;
+            loop {
+                match step(r) {
+                    Some(n) if self.line_h(n) <= px(0.) => r = n,
+                    Some(n) => {
+                        trow = n;
+                        break;
+                    }
+                    None => return self.cursor_offset(),
+                }
+            }
+        }
+        let rel = point(
+            (goal - self.rtl_shift(trow)).max(px(0.)),
+            (target_y - self.line_tops[trow]).max(px(0.)),
+        );
+        let col = line_index_at(
+            &self.wrapped[trow],
+            self.bidi_map(trow),
+            rel,
+            self.line_h(trow),
+        );
+        self.line_starts()[trow] + self.source_col(trow, col)
+    }
+
+    /// The end of the next word at/after `offset` (⌥→ on macOS).
+    fn next_word(&self, offset: usize) -> usize {
+        self.content
+            .unicode_word_indices()
+            .map(|(i, w)| i + w.len())
+            .find(|&end| end > offset)
+            .unwrap_or(self.content.len())
+    }
+
+    /// The start of the previous word before `offset` (⌥← on macOS).
+    fn prev_word(&self, offset: usize) -> usize {
+        self.content
+            .unicode_word_indices()
+            .map(|(i, _)| i)
+            .rfind(|&start| start < offset)
+            .unwrap_or(0)
+    }
+
+    /// The byte range of the word at `offset` (double-click); `None` in whitespace.
+    fn word_range_at(&self, offset: usize) -> Option<Range<usize>> {
+        let mut ends_at = None;
+        for (i, w) in self.content.unicode_word_indices() {
+            let range = i..i + w.len();
+            if range.start <= offset && offset < range.end {
+                return Some(range);
+            }
+            if range.end == offset {
+                ends_at = Some(range);
+            }
+        }
+        ends_at
+    }
+
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let off = self.prev_word(self.cursor_offset());
+        if self.enter_construct_at(off, true, cx) {
+            return;
+        }
+        self.move_to(off, cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let off = self.next_word(self.cursor_offset());
+        if self.enter_construct_at(off, false, cx) {
+            return;
+        }
+        self.move_to(off, cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.select_to(self.prev_word(self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.goal_x = None;
+        self.select_to(self.next_word(self.cursor_offset()), cx);
+    }
+
+    /// The `src` of a file chip on the row at window `position`, if that row is a
+    /// chip (from the last paint) — left-click opens it, right-click edits.
+    fn chip_at(&self, position: Point<Pixels>) -> Option<(SharedString, bool)> {
+        if self.wrapped.is_empty() || self.chip_rows.iter().all(Option::is_none) {
+            return None;
+        }
+        let bounds = self.last_bounds.as_ref()?;
+        let rel_y = position.y - bounds.top();
+        let mut row = self.wrapped.len() - 1;
+        for i in 0..self.wrapped.len() {
+            let h = self.line_h(i) * self.row_span(i) as f32;
+            if rel_y < self.line_tops[i] + h {
+                row = i;
+                break;
+            }
+        }
+        self.chip_rows.get(row).and_then(Option::clone)
+    }
+
+    /// The inline `$…$` formula under `position` (its absolute byte range + inner LaTeX), from
+    /// the last paint's window-space `inline_math_rects` — so a click opens its editor.
+    fn inline_math_at(&self, position: Point<Pixels>) -> Option<(Range<usize>, SharedString)> {
+        self.inline_math_rects
+            .iter()
+            // Empty latex marks an inline IMAGE sharing this machinery — not a
+            // formula, so a click on it shouldn't open the math editor.
+            .find(|(_, latex, rect)| !latex.is_empty() && rect.contains(&position))
+            .map(|(range, latex, _)| (range.clone(), latex.clone()))
+    }
+
+    /// The inline image `src` under `position` (an empty-latex entry in
+    /// `inline_math_rects`), parsed from its `![alt](src)` source.
+    fn inline_image_at(&self, position: Point<Pixels>) -> Option<SharedString> {
+        let (range, _, _) = self
+            .inline_math_rects
+            .iter()
+            .find(|(_, latex, rect)| latex.is_empty() && rect.contains(&position))?;
+        let text = self.content.get(range.clone())?;
+        let open = text.rfind('(')?;
+        let close = text.rfind(')')?;
+        (open < close).then(|| text[open + 1..close].to_string().into())
+    }
+
+    /// If `position` lands on an inline image's bottom-right resize grip, the
+    /// `(logical line, current display width)` of that image — so a press can
+    /// start a corner-grip drag. The grip is the `IMG_GRIP`-side square pinned to
+    /// each image's painted corner (see [`Self::image_grip`]); checked against the
+    /// last paint's window-space `image_rects`.
+    fn grip_at(&self, position: Point<Pixels>) -> Option<(usize, f32)> {
+        self.image_rects.iter().find_map(|&(line, rect)| {
+            Self::image_grip(rect)
+                .contains(&position)
+                .then_some((line, f32::from(rect.size.width)))
+        })
+    }
+
+    /// The window-space bounds of an image's corner grip, given the image's
+    /// painted `rect`. A small square overhanging the bottom-right corner (its
+    /// center on the corner, like the reading view's), so it's easy to grab
+    /// without covering much of the image.
+    fn image_grip(rect: Bounds<Pixels>) -> Bounds<Pixels> {
+        let s = px(IMG_GRIP);
+        Bounds::new(
+            point(rect.right() - s / 2., rect.bottom() - s / 2.),
+            size(s, s),
+        )
+    }
+
+    /// If `position` lands on a task checkbox painted last frame, the logical line
+    /// of that task — so a click can toggle it. The hit area is the box padded a
+    /// little, to stay easy to tap without swallowing the body text beside it.
+    /// The code block whose opening fence is `fence_row`: its language token
+    /// (empty for none) and the byte range of the body between the fences.
+    fn code_block_at(&self, fence_row: usize) -> Option<(String, Range<usize>)> {
+        let starts = self.line_starts();
+        let &start = starts.get(fence_row)?;
+        let fence_line = &self.content[start..self.line_end(fence_row)];
+        let trimmed = fence_line.trim_start();
+        let lang = trimmed.strip_prefix("```")?.trim().to_string();
+        let body_start = (self.line_end(fence_row) + 1).min(self.content.len());
+        let mut body_end = self.content.len();
+        for (row, &row_start) in starts.iter().enumerate().skip(fence_row + 1) {
+            if self.content[row_start..self.line_end(row)]
+                .trim_start()
+                .starts_with("```")
+            {
+                body_end = row_start.saturating_sub(1).max(body_start);
+                break;
+            }
+        }
+        Some((lang, body_start..body_end))
+    }
+
+    /// If `position` lands on a code card's chrome painted last frame:
+    /// `(on_copy, fence_row)` — `true` = the Copy button, `false` = the
+    /// language tag.
+    fn code_chip_at(&self, position: Point<Pixels>) -> Option<(bool, usize)> {
+        self.code_chip_rects.iter().find_map(|c| {
+            if c.copy.contains(&position) {
+                Some((true, c.fence_row))
+            } else if c.lang.contains(&position) {
+                Some((false, c.fence_row))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Rewrite the block's opening fence to carry `lang` (one undo step).
+    fn set_code_lang(&mut self, fence_row: usize, lang: &str, cx: &mut Context<Self>) {
+        let starts = self.line_starts();
+        let Some(&start) = starts.get(fence_row) else {
+            return;
+        };
+        let end = self.line_end(fence_row);
+        let line = &self.content[start..end];
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("```") {
+            return;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        let new_line = format!("{indent}```{}", if lang == "text" { "" } else { lang });
+        self.replace_range(start..end, &new_line, cx);
+        // replace_range parks the caret at the fence line's end, which reveals
+        // the raw ``` marker (reveal-on-caret). Step onto the body's first
+        // line instead so the fence stays hidden.
+        let caret = (start + new_line.len() + 1).min(self.content.len());
+        self.selected_range = caret..caret;
+        cx.emit(EditorEvent::Changed);
+    }
+
+    fn checkbox_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let pad = px(4.);
+        self.checkbox_rects.iter().find_map(|&(line, rect)| {
+            Bounds::new(
+                point(rect.origin.x - pad, rect.origin.y - pad),
+                size(rect.size.width + pad * 2., rect.size.height + pad * 2.),
+            )
+            .contains(&position)
+            .then_some(line)
+        })
+    }
+
+    /// If `position` lands on a foldable callout's chevron painted last frame,
+    /// that marker's logical line — so a click can flip its fold char. Padded
+    /// like the task checkbox to stay easy to hit.
+    fn alert_fold_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let pad = px(4.);
+        self.alert_fold_rects.iter().find_map(|&(line, rect)| {
+            Bounds::new(
+                point(rect.origin.x - pad, rect.origin.y - pad),
+                size(rect.size.width + pad * 2., rect.size.height + pad * 2.),
+            )
+            .contains(&position)
+            .then_some(line)
+        })
+    }
+
+    /// If `position` lands on a heading's fold chevron painted last frame,
+    /// that heading's logical line — so a click can toggle its fold. Padded
+    /// like the callout chevron.
+    fn heading_fold_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let pad = px(4.);
+        self.heading_fold_rects.iter().find_map(|&(line, rect)| {
+            Bounds::new(
+                point(rect.origin.x - pad, rect.origin.y - pad),
+                size(rect.size.width + pad * 2., rect.size.height + pad * 2.),
+            )
+            .contains(&position)
+            .then_some(line)
+        })
+    }
+
+    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        if self.content.is_empty() || self.wrapped.is_empty() {
+            return 0;
+        }
+        let Some(bounds) = self.last_bounds.as_ref() else {
+            return 0;
+        };
+        let rel = point(position.x - bounds.left(), position.y - bounds.top());
+        // Which logical line, by the vertical band each occupies (variable height).
+        let mut row = self.wrapped.len() - 1;
+        for i in 0..self.wrapped.len() {
+            let height = self.line_h(i) * self.row_span(i) as f32;
+            if rel.y < self.line_tops[i] + height {
+                row = i;
+                break;
+            }
+        }
+        if self.widget_rows.get(row).copied().unwrap_or(false) {
+            return self.line_starts()[row];
+        }
+        let x = (rel.x - self.row_origin_x(row)).max(px(0.));
+        let line_rel = point(x, rel.y - self.line_tops[row]);
+        let col = line_index_at(
+            &self.wrapped[row],
+            self.bidi_map(row),
+            line_rel,
+            self.line_h(row),
+        );
+        self.line_starts()[row] + self.source_col(row, col)
+    }
+
+    /// Map a display byte column on `row` back to its source column. Identity
+    /// unless the row's markers are hidden (W6), where the painted text is
+    /// shorter than the source.
+    fn source_col(&self, row: usize, display_col: usize) -> usize {
+        match self.offset_maps.get(row).and_then(Option::as_ref) {
+            Some(map) => map.get(display_col).copied().unwrap_or(display_col),
+            None => display_col,
+        }
+    }
+
+    /// Map a source byte column on `row` to its display column — the inverse of
+    /// [`Self::source_col`], for positioning the caret/selection on a row whose
+    /// markers are hidden (W6/#5). Uses the last painted map; in-paint code that
+    /// has this frame's fresh map should call [`display_col_in`] directly.
+    fn display_col(&self, row: usize, source_col: usize) -> usize {
+        display_col_in(
+            self.offset_maps.get(row).and_then(Option::as_ref),
+            source_col,
+        )
+    }
+
+    // --- UTF-16 + grapheme boundaries (IME / cursor movement) ----------------
+
+    fn offset_from_utf16(&self, offset: usize) -> usize {
+        let (mut utf8, mut utf16) = self.utf16_resume(offset, false);
+        for ch in self.content[utf8..].chars() {
+            if utf16 >= offset {
+                break;
+            }
+            utf16 += ch.len_utf16();
+            utf8 += ch.len_utf8();
+        }
+        self.utf16_anchor.set((self.content_gen, utf8, utf16));
+        utf8
+    }
+
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        let (mut utf8, mut utf16) = self.utf16_resume(offset, true);
+        for ch in self.content[utf8..].chars() {
+            if utf8 >= offset {
+                break;
+            }
+            utf8 += ch.len_utf8();
+            utf16 += ch.len_utf16();
+        }
+        self.utf16_anchor.set((self.content_gen, utf8, utf16));
+        utf16
+    }
+
+    /// Where a conversion can start: the saved anchor when it's from the
+    /// current content generation and at/before the target (`by_utf8` picks
+    /// which unit the target is in), else the document start. IME composition
+    /// converts monotonically-close offsets many times per keystroke, so this
+    /// turns O(document) scans into O(distance-from-anchor).
+    fn utf16_resume(&self, target: usize, by_utf8: bool) -> (usize, usize) {
+        let (generation, utf8, utf16) = self.utf16_anchor.get();
+        let anchor_pos = if by_utf8 { utf8 } else { utf16 };
+        if generation == self.content_gen && anchor_pos <= target && utf8 <= self.content.len() {
+            (utf8, utf16)
+        } else {
+            (0, 0)
+        }
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+    }
+
+    /// One VISIBLE position left of `offset`: a grapheme step, extended while
+    /// the display column doesn't change — always-hidden formatting markers
+    /// (`**`, `~~`, …) are zero-width on screen, so crossing one must not cost
+    /// extra keypresses. Rows without a display map (raw/code) step plainly.
+    fn prev_visible_boundary(&self, offset: usize) -> usize {
+        let (row0, col0) = self.row_col(offset);
+        let d0 = self.display_col(row0, col0);
+        let mut off = self.previous_boundary(offset);
+        loop {
+            if off == 0 {
+                return off;
+            }
+            let (row, col) = self.row_col(off);
+            if row != row0
+                || self.offset_maps.get(row).and_then(Option::as_ref).is_none()
+                || self.display_col(row, col) != d0
+            {
+                return off;
+            }
+            off = self.previous_boundary(off);
+        }
+    }
+
+    /// One VISIBLE position right of `offset` — see [`Self::prev_visible_boundary`].
+    fn next_visible_boundary(&self, offset: usize) -> usize {
+        let (row0, col0) = self.row_col(offset);
+        let d0 = self.display_col(row0, col0);
+        let mut off = self.next_boundary(offset);
+        loop {
+            if off >= self.content.len() {
+                return self.content.len();
+            }
+            let (row, col) = self.row_col(off);
+            if row != row0
+                || self.offset_maps.get(row).and_then(Option::as_ref).is_none()
+                || self.display_col(row, col) != d0
+            {
+                return off;
+            }
+            off = self.next_boundary(off);
+        }
+    }
+
+    /// Cditor-style deletion planning around hidden formatting markers: the
+    /// range a backspace (`back`) / forward delete should remove at `off`.
+    /// Skips the invisible marker bytes to the adjacent VISIBLE character —
+    /// and when removing it would empty its construct, the now-empty marker
+    /// pair goes too (deleting bold's last char deletes the bold). `None` =
+    /// no hidden markers involved (the plain grapheme deletion applies).
+    fn fmt_delete_range(&self, off: usize, back: bool) -> Option<Range<usize>> {
+        let st = self.markdown_style.as_ref()?;
+        let (row, col) = self.row_col(off);
+        let line_start = self.line_starts()[row];
+        let line_end = self.line_end(row);
+        let line = &self.content[line_start..line_end];
+        // Inside a fenced code block the text is verbatim — no markers there.
+        if *self.scan_data().fence_odd.get(row).unwrap_or(&false)
+            || line.trim_start().starts_with("```")
+        {
+            return None;
+        }
+        let pairs = markdown_syntax::fmt_marker_pairs(line, st);
+        if pairs.is_empty() {
+            return None;
+        }
+        let markers: Vec<&Range<usize>> = pairs.iter().flat_map(|(o, c)| [o, c]).collect();
+        // Skip marker bytes in the deletion direction to the visible char.
+        let mut edge = col;
+        if back {
+            while let Some(sp) = markers.iter().find(|sp| sp.end == edge) {
+                edge = sp.start;
+            }
+        } else {
+            while let Some(sp) = markers.iter().find(|sp| sp.start == edge) {
+                edge = sp.end;
+            }
+        }
+        // The visible grapheme adjacent to the (possibly skipped-to) edge —
+        // staying on this line; a line join takes the default path.
+        let (del_start, del_end) = if back {
+            if edge == 0 {
+                return None;
+            }
+            let p = self.previous_boundary(line_start + edge) - line_start;
+            (p, edge)
+        } else {
+            if edge >= line.len() {
+                return None;
+            }
+            let n = self.next_boundary(line_start + edge).min(line_end) - line_start;
+            (edge, n)
+        };
+        // Would this empty a construct? Only a real PAIR collapses: ITS opener
+        // ending at the deletion's start and ITS closer starting at the end
+        // (adjacent different constructs must not fuse).
+        let emptied = pairs
+            .iter()
+            .find(|(o, c)| o.end == del_start && c.start == del_end);
+        let range = match emptied {
+            Some((o, c)) => o.start..c.end,
+            None if edge == col => return None, // no markers were involved
+            None => del_start..del_end,
+        };
+        Some(line_start + range.start..line_start + range.end)
+    }
+
+    fn previous_boundary(&self, offset: usize) -> usize {
+        self.content
+            .grapheme_indices(true)
+            .rev()
+            .find_map(|(idx, _)| (idx < offset).then_some(idx))
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        self.content
+            .grapheme_indices(true)
+            .find_map(|(idx, _)| (idx > offset).then_some(idx))
+            .unwrap_or(self.content.len())
+    }
+}
+
+impl EntityInputHandler for MarkdownLivePreview {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.content[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selected_range),
+            reversed: self.selection_reversed,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range.as_ref().map(|r| self.range_to_utf16(r))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        // Report what this edit replaced (see `last_replaced`) — the fact a
+        // diff can't reconstruct when the selection starts with the typed char.
+        self.last_replaced =
+            (range.start < range.end).then(|| self.content[range.clone()].to_string());
+        self.record_edit(&range, new_text);
+        self.content =
+            self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        let caret = range.start + new_text.len();
+        self.selected_range = caret..caret;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.goal_x = None;
+        // Keep unaffected diagnostics valid across the edit (shift those after
+        // it, drop those it overlapped); the host recomputes the edited region.
+        self.remap_diagnostics(&range, new_text.len());
+        if word_boundary_input(new_text) {
+            self.apply_auto_replace(range.start);
+        }
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
-        window: &mut Window,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let byte_range = match range_utf16 {
-            Some(r) => {
-                self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
-                    ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16()))
-            }
-            None => self.marked_range.clone().unwrap_or_else(|| self.selection.range()),
-        };
-        // IME 组合首键同样走「空行插入列」：先把空格补到点击列，组合文本（拼音）落在
-        // 点击处而不是行首；marked 区间覆盖补齐区域，提交时中文替换整个区域 → 字符在点击列。
-        let new_text = self.goal_prefixed_text(&byte_range, new_text);
-        self.goal = None;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[md-live] input-mark byte {:?} {:?} -> sel={}",
-            byte_range,
-            new_text,
-            byte_range.start + new_text.len()
-        );
-        self.insert_edit(byte_range.clone(), &new_text, window, cx);
-        if new_text.is_empty() {
-            self.marked_range = None;
-            self.selection = Selection::collapsed(byte_range.start);
-        } else {
-            self.marked_range = Some(byte_range.start..byte_range.start + new_text.len());
-            self.selection = Selection::collapsed(byte_range.start + new_text.len());
-        }
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+        let range = range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+        self.content_gen += 1;
+        self.content =
+            self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
+        self.marked_range =
+            (!new_text.is_empty()).then(|| range.start..range.start + new_text.len());
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|r| self.range_from_utf16(r))
+            .map(|r| r.start + range.start..r.end + range.start)
+            .unwrap_or_else(|| {
+                let caret = range.start + new_text.len();
+                caret..caret
+            });
+        self.remap_diagnostics(&range, new_text.len());
+        cx.emit(EditorEvent::Changed);
+        cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
         range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
+        bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // 输入系统会在编辑后、下一帧渲染前同步查询光标几何：此刻 `segs` 已被
-        // reparse 清空，直接算会掉到兜底 → 闪烁光标与输入位置不匹配。先重排。
-        self.ensure_fresh_layout(window);
-        // IME 组合区间：平台（`selected_bounds`）优先传组合文本的 marked range。
-        // 锚定整段组合文本（起点→终点，同行才拉宽），候选窗贴在所打字符下方而不是
-        // 一根零宽竖条——与 zorite/gpui-editor 的 bounds_for_range 同一语义。
-        let s_byte = self.buffer.utf16_to_byte(range_utf16.start.min(self.buffer.len_utf16()));
-        let e_byte = self.buffer.utf16_to_byte(range_utf16.end.min(self.buffer.len_utf16()));
-        let (s_row, s_x0, s_y, height) = match self.point_for_offset(s_byte) {
-            Some(v) => v,
-            None => return None,
+        let range = self.range_from_utf16(&range_utf16);
+        let (row, col) = self.row_col(range.start);
+        let lh = self.line_h(row);
+        let line = self.wrapped.get(row)?;
+        let map = self.bidi_map(row);
+        let p = line_pos(line, map, self.display_col(row, col), lh)?;
+        let top = bounds.top() + self.line_tops.get(row).copied().unwrap_or(px(0.)) + p.y;
+        let x = bounds.left() + p.x + self.row_origin_x(row);
+        // Span the whole range when it stays on one wrap row (the common IME
+        // composition), so the candidate window anchors under the marked TEXT
+        // rather than a zero-width bar at its start. Multi-row ranges keep the
+        // start-anchored bar.
+        let (erow, ecol) = self.row_col(range.end);
+        let x2 = if erow == row && range.end > range.start {
+            line_pos(line, map, self.display_col(row, ecol), lh)
+                .filter(|e| e.y == p.y)
+                .map(|e| bounds.left() + e.x + self.row_origin_x(row))
+                .unwrap_or(x)
+        } else {
+            x
         };
-        // 空行「插入列」：目标行上，IME bounds 也显示在点击列（与自绘光标一致）。
-        let s_x = match self.goal {
-            Some((grow, gx, _)) if grow == s_row => gx,
-            _ => s_x0,
-        };
-        let e_x = (e_byte > s_byte)
-            .then(|| self.point_for_offset(e_byte))
-            .flatten()
-            .filter(|(_, _ex, ey, _)| (ey - s_y).abs() < 0.5)
-            .map(|(_, ex, _, _)| ex.max(s_x));
-        let width = e_x.map_or(CARET_WIDTH_PX, |ex| (ex - s_x).max(CARET_WIDTH_PX));
-        let scroll_y = (-self.v_handle.offset().y.as_f32()).max(0.0);
-        // 用平台传入的当前 element_bounds（权威值），不用可能滞后一帧的 self.element_bounds。
-        let origin = element_bounds.origin;
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "[md-live] os-caret bounds range={range_utf16:?} -> ({:.1},{:.1}) w={:.1} caret_raw=({s_x:.1},{s_y:.1}) seed_origin=({:.1},{:.1})",
-            origin.x.as_f32() + s_x,
-            origin.y.as_f32() + s_y - scroll_y,
-            width,
-            self.element_bounds.origin.x.as_f32(),
-            self.element_bounds.origin.y.as_f32()
-        );
-        #[cfg(debug_assertions)]
-        {
-            // 调试覆盖层：记录 IME bounds（内容坐标，红框）。
-            self.ime_content = Some((s_x, s_y, width, height));
-        }
-        Some(Bounds::new(
-            point(
-                origin.x + px(s_x),
-                origin.y + px(s_y - scroll_y),
-            ),
-            size(px(width), px(height)),
+        Some(Bounds::from_corners(
+            point(x, top),
+            point(x2.max(x), top + lh),
         ))
     }
 
     fn character_index_for_point(
         &mut self,
         point: Point<Pixels>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
+        _: &mut Window,
+        _: &mut Context<Self>,
     ) -> Option<usize> {
-        self.ensure_fresh_layout(window);
-        let local = point - self.element_bounds.origin;
-        let scroll_y = (-self.v_handle.offset().y.as_f32()).max(0.0);
-        let cy = local.y.as_f32() + scroll_y;
-        let source = {
-            let segs = self.segs.borrow();
-            let s = segs.iter().find(|s| self.seg_hit_bot(s, cy))?;
-            let local_b = s
-                .line
-                .as_ref()
-                .map(|l| {
-                    l.closest_index_for_x(px((local.x.as_f32() - s.x).max(0.0))).min(s.text_len)
-                })
-                .unwrap_or(0);
-            Some(s.source_for(local_b))
-        }?;
-        Some(self.buffer.byte_to_utf16(source))
-    }
-
-    fn set_selected_text_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        let s = self.buffer.utf16_to_byte(range_utf16.start.min(self.buffer.len_utf16()));
-        let e = self.buffer.utf16_to_byte(range_utf16.end.min(self.buffer.len_utf16()));
-        self.selection = Selection::from_range(s, e);
-        window.invalidate_character_coordinates();
-    }
-
-    fn paste(&mut self, item: gpui::ClipboardItem, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = item.text() {
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            self.insert_edit(self.selection.range(), &normalized, window, cx);
-        }
-    }
-
-    fn text_input_configuration(
-        &mut self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> gpui::TextInputConfiguration {
-        gpui::TextInputConfiguration::default()
+        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
 }
 
-// ---------------------------------------------------------------------------
-// 包装元素：捕获边界 + 挂输入
-// ---------------------------------------------------------------------------
-
-struct LiveElement {
-    view: Entity<MarkdownLivePreview>,
-    inner: AnyElement,
-}
-
-impl LiveElement {
-    fn new(view: Entity<MarkdownLivePreview>, inner: AnyElement) -> Self {
-        Self { view, inner }
+impl Focusable for MarkdownLivePreview {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
-impl IntoElement for LiveElement {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for LiveElement {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id = self.inner.request_layout(window, cx);
-        (layout_id, ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.view.update(cx, |view, _| view.element_bounds = bounds);
-        self.inner.prepaint(window, cx);
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        self.inner.paint(window, cx);
-        let focus = self.view.read(cx).focus_handle();
-        window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
-    }
-}
+impl EventEmitter<EditorEvent> for MarkdownLivePreview {}
 
 impl Render for MarkdownLivePreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.ensure_blink(window, cx);
-        self.refresh_styles(cx);
-        let inner = self.render_body(window, cx);
-        let entity = cx.entity();
-        LiveElement::new(entity, inner)
+        div()
+            .relative()
+            // While a `$$` block OR an inline `$…$` formula is being edited, the hosted math
+            // editor is focused but lives *inside* this element — so the editor's own
+            // keybindings (arrows, typing, …) would capture keys before they reach it. Drop the
+            // key context for the duration so raw keys flow to the math editor's on_key_down.
+            .key_context(
+                if self.editing_block.is_some() || self.editing_inline.is_some() {
+                    ""
+                } else {
+                    CONTEXT
+                },
+            )
+            .track_focus(&self.focus_handle)
+            .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(Self::backspace))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::left))
+            .on_action(cx.listener(Self::right))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_up))
+            .on_action(cx.listener(Self::select_down))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::bold))
+            .on_action(cx.listener(Self::italic))
+            .on_action(cx.listener(Self::underline))
+            .on_action(cx.listener(Self::strike))
+            .on_action(cx.listener(Self::code))
+            .on_action(cx.listener(Self::indent))
+            .on_action(cx.listener(Self::outdent))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::show_character_palette))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::dismiss))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .child(EditorElement {
+                editor: cx.entity(),
+            })
+            .children(self.embed_overlays(window))
+            .children(self.editing_block_overlay())
+            .children(self.editing_inline_overlay())
+            // Right-click suggestions menu, absolutely positioned over the
+            // editor (anchored at the click). `Option`'s `IntoIterator` renders
+            // zero or one popup; clicking a row replaces the misspelled span.
+            .children(self.menu.clone().map(|menu| {
+                let DiagMenu {
+                    anchor,
+                    range,
+                    suggestions,
+                    scroll,
+                    turn_into: menu_turn_into,
+                } = menu;
+                let count = suggestions.len();
+                // Menu chrome from the host's theme (fallbacks match the former
+                // hardcoded dark menu when no markdown style is set).
+                let st = self.markdown_style.as_ref();
+                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
+                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
+                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
+                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
+                let mut thumb_c = st.map_or(rgba(0xffffff66).into(), |s| s.marker);
+                thumb_c.a = 0.5;
+                // Collected eagerly (not a lazy iterator) so `cx` is only
+                // borrowed here and stays free for the menu's own listeners below.
+                let rows: Vec<_> = suggestions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, sugg)| {
+                        let range = range.clone();
+                        let replacement = sugg.to_string();
+                        div()
+                            // A stable per-row id so gpui tracks hover state and
+                            // repaints as the pointer moves between rows. Without
+                            // an id, the hover style only shows on a forced
+                            // repaint (e.g. while scrolling).
+                            .id(("suggestion-row", i))
+                            // Don't let the scroll container's max-height squeeze
+                            // the rows; they keep their height and overflow.
+                            .flex_shrink_0()
+                            .px(px(10.))
+                            .py(px(3.))
+                            // Highlight the row under the pointer.
+                            .hover(move |s| s.bg(hover))
+                            .child(sugg)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                    // Keep the editor's own mouse-down from clearing
+                                    // the menu / moving the caret out from under us.
+                                    cx.stop_propagation();
+                                    editor.apply_suggestion(
+                                        range.clone(),
+                                        &replacement,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                    })
+                    .collect();
+                // A thin scrollbar thumb, shown when the list overflows ~6 rows
+                // so the scroll affordance is visible. Sized from the row count
+                // (known now) and positioned from the live scroll offset — a
+                // wheel scroll calls window.refresh(), which re-renders this.
+                const ROW_H: f32 = 24.0;
+                const PAD: f32 = 4.0;
+                const MAX_H: f32 = 180.0;
+                let rows_h = count as f32 * ROW_H;
+                let view_h = MAX_H - 2.0 * PAD;
+                let thumb = (rows_h > view_h).then(|| {
+                    let scrolled = (-f32::from(scroll.offset().y)).clamp(0.0, rows_h - view_h);
+                    let thumb_h = (view_h * view_h / rows_h).max(24.0);
+                    let thumb_top = PAD + scrolled / (rows_h - view_h) * (view_h - thumb_h);
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(2.))
+                        .w(px(6.))
+                        .h(px(thumb_h))
+                        .rounded(px(3.))
+                        .bg(thumb_c)
+                });
+
+                // Cut / Copy need a selection; Paste always applies (the caret
+                // was seated at the click when it landed outside the selection).
+                let has_sel = !self.selected_range.is_empty();
+                let clip_item = |id: &'static str, label: SharedString| {
+                    div()
+                        .id(id)
+                        .flex_shrink_0()
+                        .px(px(10.))
+                        .py(px(3.))
+                        .hover(move |s| s.bg(hover))
+                        .child(label)
+                };
+                let mut clipboard = div().flex().flex_col().py(px(4.));
+                if has_sel {
+                    clipboard = clipboard
+                        .child(
+                            clip_item("menu-cut", self.labels.cut.clone()).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.menu = None;
+                                    editor.cut(&Cut, window, cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            clip_item("menu-copy", self.labels.copy.clone()).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.menu = None;
+                                    editor.copy(&Copy, window, cx);
+                                }),
+                            ),
+                        )
+                        // Plain-only: the raw markdown with no host flavors —
+                        // for pasting literal source into rich surfaces
+                        // (email, chat) where Copy's HTML flavor would win.
+                        .child(
+                            clip_item("menu-copy-md", self.labels.copy_as_markdown.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.copy_plain(window, cx);
+                                    }),
+                                ),
+                        );
+                }
+                let clipboard = clipboard.child(
+                    clip_item("menu-paste", self.labels.paste.clone()).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.menu = None;
+                            editor.paste(&Paste, window, cx);
+                        }),
+                    ),
+                );
+
+                // Inline-format bar (Cditor-style): with a selection, a strip of
+                // B / I / S / <> buttons across the menu's top — each toggles its
+                // markdown wrap on the selection and closes the menu.
+                let fmt_btn = |id: &'static str| {
+                    div()
+                        .id(id)
+                        .w(px(28.))
+                        .h(px(24.))
+                        .rounded(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(move |s| s.bg(hover))
+                };
+                let format_bar = has_sel.then(|| {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.))
+                        .px(px(6.))
+                        .py(px(4.))
+                        .child(
+                            fmt_btn("menu-fmt-bold")
+                                .font_weight(FontWeight::BOLD)
+                                .child("B")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.bold(&Bold, window, cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            fmt_btn("menu-fmt-italic")
+                                .italic()
+                                .child("I")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.italic(&Italic, window, cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            fmt_btn("menu-fmt-underline")
+                                .underline()
+                                .child("U")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.underline(&Underline, window, cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            fmt_btn("menu-fmt-strike")
+                                .line_through()
+                                .child("S")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.strike(&Strike, window, cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            fmt_btn("menu-fmt-code")
+                                .font_family(
+                                    self.markdown_style
+                                        .as_ref()
+                                        .map(|s| s.mono.family.clone())
+                                        .unwrap_or_else(|| "monospace".into()),
+                                )
+                                .text_size(px(12.))
+                                .child("<>")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.code(&Code, window, cx);
+                                    }),
+                                ),
+                        )
+                });
+
+                // "Turn into" block conversion (Cditor-style): a row whose
+                // hover opens a kind-list flyout beside the menu, the caret
+                // block's current kind checked.
+                let cur_kind = self.block_kind_at(self.row_col(self.selected_range.start).0);
+                let turn_row = div()
+                    .id("menu-turn-into")
+                    .flex_shrink_0()
+                    .px(px(10.))
+                    .py(px(3.))
+                    .hover(move |s| s.bg(hover))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(16.))
+                    .child(self.labels.turn_into.clone())
+                    .child(div().text_size(px(10.)).child("\u{25b8}"))
+                    .on_hover(cx.listener(|editor, hovered: &bool, _, cx| {
+                        if *hovered
+                            && let Some(m) = editor.menu.as_mut()
+                            && !m.turn_into
+                        {
+                            m.turn_into = true;
+                            cx.notify();
+                        }
+                    }));
+                let turn_labels = self.labels.clone();
+                let turn_flyout = menu_turn_into.then(|| {
+                    let rows: Vec<_> = TurnKind::ALL
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &k)| {
+                            let checked = k == cur_kind;
+                            div()
+                                .id(("turn-kind", i))
+                                .flex_shrink_0()
+                                .px(px(10.))
+                                .py(px(3.))
+                                .hover(move |s| s.bg(hover))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(div().w(px(12.)).flex_shrink_0().child(if checked {
+                                    "\u{2713}"
+                                } else {
+                                    ""
+                                }))
+                                .child(k.label(&turn_labels))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.turn_into(k, window, cx);
+                                    }),
+                                )
+                        })
+                        .collect();
+                    // An absolute sibling of the (overflow-clipped) menu box —
+                    // out of flow, so it can't inflate the anchored bounds and
+                    // re-trigger the window snap (the slash-flyout lesson).
+                    div()
+                        .absolute()
+                        .left(gpui::relative(1.))
+                        .bottom(px(0.))
+                        .ml(px(2.))
+                        .occlude()
+                        .min_w(px(140.))
+                        .cursor(CursorStyle::Arrow)
+                        .bg(menu_bg)
+                        .border_1()
+                        .border_color(menu_border)
+                        .rounded(px(6.))
+                        .shadow_md()
+                        .text_color(menu_fg)
+                        .text_size(px(13.))
+                        .flex()
+                        .flex_col()
+                        .py(px(4.))
+                        .children(rows)
+                });
+
+                // Deferred + anchored to a window-space top layer with `.occlude()`,
+                // so it renders above the page chrome and captures the wheel — else a
+                // scroll over the popup scrolls the page behind it.
+                gpui::deferred(
+                    gpui::anchored().position(anchor).snap_to_window().child(
+                        div().relative().children(turn_flyout).child(
+                            div()
+                                .relative()
+                                .occlude()
+                                .min_w(px(150.))
+                                // Override the editor's I-beam — the menu is a normal
+                                // pointer surface (children inherit this hitbox's cursor).
+                                .cursor(CursorStyle::Arrow)
+                                .bg(menu_bg)
+                                .border_1()
+                                .border_color(menu_border)
+                                .rounded(px(6.))
+                                .shadow_md()
+                                // Clip rows + thumb to the rounded box.
+                                .overflow_hidden()
+                                .text_color(menu_fg)
+                                .text_size(px(13.))
+                                // A click anywhere outside the menu dismisses it.
+                                .on_mouse_down_out(cx.listener(
+                                    |editor, _: &MouseDownEvent, _, cx| {
+                                        editor.menu = None;
+                                        cx.notify();
+                                    },
+                                ))
+                                .children(format_bar)
+                                .children(has_sel.then(|| div().h(px(1.)).bg(menu_border)))
+                                .children((count > 0).then(|| {
+                                    // The scroll viewport: shows ~6 rows, the rest scroll.
+                                    div()
+                                        .id("suggestion-menu")
+                                        .max_h(px(MAX_H))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&scroll)
+                                        .flex()
+                                        .flex_col()
+                                        .py(px(PAD))
+                                        .children(rows)
+                                }))
+                                .children((count > 0).then(|| div().h(px(1.)).bg(menu_border)))
+                                .child(clipboard)
+                                .child(div().h(px(1.)).bg(menu_border))
+                                .child(div().flex().flex_col().py(px(4.)).child(turn_row))
+                                .children(thumb),
+                        ),
+                    ),
+                )
+            }))
+            // The table right-click menu (Word-style row/column editing), anchored
+            // at the click; each row runs its action on the caret's table cell.
+            .children(self.table_menu.map(|anchor| {
+                // Menu chrome from the host's theme (fallbacks match the former
+                // hardcoded dark menu when no markdown style is set).
+                let st = self.markdown_style.as_ref();
+                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
+                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
+                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
+                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
+                let divider = st.map_or(rgba(0xffffff2e).into(), |s| s.popover_divider);
+                let mut thumb_c = st.map_or(rgba(0xffffff66).into(), |s| s.marker);
+                thumb_c.a = 0.5;
+                const ROW_H: f32 = 24.0;
+                const DIV_H: f32 = 9.0;
+                const PAD: f32 = 4.0;
+                const MAX_H: f32 = 480.0;
+                // Cditor-style grouped rows: a glyph column, a checkmark on the
+                // current align/style, and the destructive group in red.
+                let danger = st.map_or(rgb(0xE5484D).into(), |s| s.popover_danger);
+                let cur_align = self.caret_table_align();
+                let cur_style = self
+                    .caret_table_region()
+                    .map(|r| r.style)
+                    .unwrap_or_default();
+                use markdown_syntax::TableStyle as TS;
+                enum Row {
+                    Div,
+                    Item {
+                        glyph: &'static str,
+                        label: SharedString,
+                        action: TableMenuAction,
+                        red: bool,
+                        checked: bool,
+                    },
+                }
+                let item = |glyph, label, action| Row::Item {
+                    glyph,
+                    label,
+                    action,
+                    red: false,
+                    checked: false,
+                };
+                let specs = [
+                    item(
+                        "↑",
+                        self.labels.insert_row_above.clone(),
+                        TableMenuAction::InsertRowAbove,
+                    ),
+                    item(
+                        "↓",
+                        self.labels.insert_row_below.clone(),
+                        TableMenuAction::InsertRowBelow,
+                    ),
+                    item(
+                        "⧉",
+                        self.labels.duplicate_row.clone(),
+                        TableMenuAction::DuplicateRow,
+                    ),
+                    Row::Div,
+                    item(
+                        "←",
+                        self.labels.insert_column_left.clone(),
+                        TableMenuAction::InsertColLeft,
+                    ),
+                    item(
+                        "→",
+                        self.labels.insert_column_right.clone(),
+                        TableMenuAction::InsertColRight,
+                    ),
+                    Row::Div,
+                    Row::Item {
+                        glyph: "",
+                        label: self.labels.align_left.clone(),
+                        action: TableMenuAction::AlignLeft,
+                        red: false,
+                        checked: cur_align == Some(CellAlign::Left),
+                    },
+                    Row::Item {
+                        glyph: "",
+                        label: self.labels.align_center.clone(),
+                        action: TableMenuAction::AlignCenter,
+                        red: false,
+                        checked: cur_align == Some(CellAlign::Center),
+                    },
+                    Row::Item {
+                        glyph: "",
+                        label: self.labels.align_right.clone(),
+                        action: TableMenuAction::AlignRight,
+                        red: false,
+                        checked: cur_align == Some(CellAlign::Right),
+                    },
+                    Row::Div,
+                    Row::Item {
+                        glyph: "▦",
+                        label: self.labels.grid_style.clone(),
+                        action: TableMenuAction::SetStyle(None),
+                        red: false,
+                        checked: cur_style == TS::Grid,
+                    },
+                    Row::Item {
+                        glyph: "▤",
+                        label: self.labels.striped_style.clone(),
+                        action: TableMenuAction::SetStyle(Some("striped")),
+                        red: false,
+                        checked: cur_style == TS::Striped,
+                    },
+                    Row::Item {
+                        glyph: "▥",
+                        label: self.labels.header_style.clone(),
+                        action: TableMenuAction::SetStyle(Some("header")),
+                        red: false,
+                        checked: cur_style == TS::Header,
+                    },
+                    Row::Item {
+                        glyph: "─",
+                        label: self.labels.minimal_style.clone(),
+                        action: TableMenuAction::SetStyle(Some("minimal")),
+                        red: false,
+                        checked: cur_style == TS::Minimal,
+                    },
+                    Row::Div,
+                    item(
+                        "⊞",
+                        self.labels.copy_as_markdown.clone(),
+                        TableMenuAction::CopyTable,
+                    ),
+                    Row::Div,
+                    Row::Item {
+                        glyph: "✕",
+                        label: self.labels.delete_row.clone(),
+                        action: TableMenuAction::DeleteRow,
+                        red: true,
+                        checked: false,
+                    },
+                    Row::Item {
+                        glyph: "✕",
+                        label: self.labels.delete_column.clone(),
+                        action: TableMenuAction::DeleteColumn,
+                        red: true,
+                        checked: false,
+                    },
+                    Row::Item {
+                        glyph: "✕",
+                        label: self.labels.delete_table.clone(),
+                        action: TableMenuAction::DeleteTable,
+                        red: true,
+                        checked: false,
+                    },
+                ];
+                let n_items = specs
+                    .iter()
+                    .filter(|r| matches!(r, Row::Item { .. }))
+                    .count();
+                let n_divs = specs.len() - n_items;
+                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                for (i, spec) in specs.into_iter().enumerate() {
+                    match spec {
+                        Row::Div => rows.push(
+                            div()
+                                .flex_shrink_0()
+                                .h(px(1.))
+                                .my(px(4.))
+                                .mx(px(8.))
+                                .bg(divider)
+                                .into_any_element(),
+                        ),
+                        Row::Item {
+                            glyph,
+                            label,
+                            action,
+                            red,
+                            checked,
+                        } => {
+                            let fg = if red { danger } else { menu_fg };
+                            let mut glyph_c = fg;
+                            glyph_c.a *= 0.7;
+                            rows.push(
+                                div()
+                                    .id(("table-menu-row", i))
+                                    .flex_shrink_0()
+                                    .px(px(10.))
+                                    .py(px(3.))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_color(fg)
+                                    .hover(move |s| s.bg(hover))
+                                    .child(
+                                        div()
+                                            .w(px(16.))
+                                            .flex_none()
+                                            .text_color(glyph_c)
+                                            .child(glyph),
+                                    )
+                                    .child(div().flex_1().child(label))
+                                    .children(checked.then(|| div().text_color(glyph_c).child("✓")))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            action.apply(editor, cx);
+                                        }),
+                                    )
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
+                // Scrollbar thumb, shown when the items overflow the cap — sized from
+                // the content height + positioned from the live scroll offset.
+                let rows_h = n_items as f32 * ROW_H + n_divs as f32 * DIV_H;
+                let view_h = MAX_H - 2.0 * PAD;
+                let thumb = (rows_h > view_h).then(|| {
+                    let scrolled =
+                        (-f32::from(self.table_menu_scroll.offset().y)).clamp(0.0, rows_h - view_h);
+                    let thumb_h = (view_h * view_h / rows_h).max(24.0);
+                    let thumb_top = PAD + scrolled / (rows_h - view_h) * (view_h - thumb_h);
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(2.))
+                        .w(px(6.))
+                        .h(px(thumb_h))
+                        .rounded(px(3.))
+                        .bg(thumb_c)
+                });
+                gpui::deferred(
+                    gpui::anchored().position(anchor).snap_to_window().child(
+                        div()
+                            .relative()
+                            .occlude()
+                            .min_w(px(190.))
+                            .cursor(CursorStyle::Arrow)
+                            .bg(menu_bg)
+                            .border_1()
+                            .border_color(menu_border)
+                            .rounded(px(6.))
+                            .shadow_md()
+                            .overflow_hidden()
+                            .text_color(menu_fg)
+                            .text_size(px(13.))
+                            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                editor.table_menu = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                // Inner scroll viewport: caps the height + scrolls the
+                                // overflow (max_h on a separate flex-col div, like the
+                                // suggestion menu — combining it with the styled box
+                                // above doesn't cap).
+                                div()
+                                    .id("table-menu")
+                                    .max_h(px(MAX_H))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.table_menu_scroll)
+                                    .flex()
+                                    .flex_col()
+                                    .py(px(PAD))
+                                    .children(rows),
+                            )
+                            .children(thumb),
+                    ),
+                )
+            }))
+            // The image right-click menu: Word-style object actions on an inline
+            // image (Delete), anchored at the click. Chrome matches the table menu.
+            .children(self.prop_menu.map(|(row, anchor)| {
+                let st = self.markdown_style.as_ref();
+                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
+                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
+                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
+                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
+                let item = |id: &'static str, label: SharedString| {
+                    div()
+                        .id(id)
+                        .px(px(10.))
+                        .py(px(3.))
+                        .hover(move |s| s.bg(hover))
+                        .child(label)
+                };
+                gpui::deferred(
+                    gpui::anchored().position(anchor).snap_to_window().child(
+                        div()
+                            .occlude()
+                            .min_w(px(160.))
+                            .cursor(CursorStyle::Arrow)
+                            .bg(menu_bg)
+                            .border_1()
+                            .border_color(menu_border)
+                            .rounded(px(6.))
+                            .shadow_md()
+                            .overflow_hidden()
+                            .text_color(menu_fg)
+                            .text_size(px(13.))
+                            .py(px(4.))
+                            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                editor.prop_menu = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                item("prop-menu-edit", self.labels.edit_properties.clone())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.prop_menu = None;
+                                            if let Some((range, source)) =
+                                                editor.property_block_at(row)
+                                            {
+                                                let block_row = row - editor.row_col(range.start).0;
+                                                cx.emit(EditorEvent::EditProperties {
+                                                    range,
+                                                    source,
+                                                    at_end: false,
+                                                    row: Some(block_row),
+                                                });
+                                            }
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                item("prop-menu-delete", self.labels.delete_property.clone())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.prop_menu = None;
+                                            editor.delete_property_row(row, cx);
+                                        }),
+                                    ),
+                            ),
+                    ),
+                )
+            }))
+            .children(self.image_menu.map(|(line, anchor)| {
+                let st = self.markdown_style.as_ref();
+                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
+                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
+                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
+                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
+                gpui::deferred(
+                    gpui::anchored().position(anchor).snap_to_window().child(
+                        div()
+                            .occlude()
+                            .min_w(px(140.))
+                            .cursor(CursorStyle::Arrow)
+                            .bg(menu_bg)
+                            .border_1()
+                            .border_color(menu_border)
+                            .rounded(px(6.))
+                            .shadow_md()
+                            .overflow_hidden()
+                            .text_color(menu_fg)
+                            .text_size(px(13.))
+                            .py(px(4.))
+                            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                editor.image_menu = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .id("image-menu-delete")
+                                    .px(px(10.))
+                                    .py(px(3.))
+                                    .hover(move |s| s.bg(hover))
+                                    .child(self.labels.delete_image.clone())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.image_menu = None;
+                                            editor.delete_image_row(line, cx);
+                                        }),
+                                    ),
+                            ),
+                    ),
+                )
+            }))
+            .children(self.code_lang_menu.map(|(row, anchor)| {
+                // The code block's language picker (Cditor-inspired): the host's
+                // highlighter languages, scrollable past the cap, current one
+                // checked. Selecting rewrites the opening fence (one undo step).
+                let st = self.markdown_style.as_ref();
+                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
+                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
+                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
+                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
+                let mut thumb_c = st.map_or(rgba(0xffffff66).into(), |s| s.marker);
+                thumb_c.a = 0.5;
+                let current = self.code_block_at(row).map(|(l, _)| l).unwrap_or_default();
+                const ROW_H: f32 = 22.0;
+                const MAX_H: f32 = 260.0;
+                const PAD: f32 = 4.0;
+                let langs = self.code_langs.clone();
+                let rows_h = langs.len() as f32 * ROW_H;
+                let view_h = MAX_H - 2.0 * PAD;
+                let thumb = (rows_h > view_h).then(|| {
+                    let scrolled =
+                        (-f32::from(self.code_lang_scroll.offset().y)).clamp(0.0, rows_h - view_h);
+                    let thumb_h = (view_h * view_h / rows_h).max(24.0);
+                    let thumb_top = PAD + scrolled / (rows_h - view_h) * (view_h - thumb_h);
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(2.))
+                        .w(px(6.))
+                        .h(px(thumb_h))
+                        .rounded(px(3.))
+                        .bg(thumb_c)
+                });
+                gpui::deferred(
+                    gpui::anchored().position(anchor).snap_to_window().child(
+                        div()
+                            .relative()
+                            .occlude()
+                            .min_w(px(140.))
+                            .cursor(CursorStyle::Arrow)
+                            .bg(menu_bg)
+                            .border_1()
+                            .border_color(menu_border)
+                            .rounded(px(6.))
+                            .shadow_md()
+                            .overflow_hidden()
+                            .text_color(menu_fg)
+                            .text_size(px(13.))
+                            .py(px(PAD))
+                            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
+                                editor.code_lang_menu = None;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .id("code-lang-list")
+                                    .max_h(px(MAX_H - 2.0 * PAD))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.code_lang_scroll)
+                                    .children(langs.into_iter().enumerate().map(|(i, lang)| {
+                                        let is_current = *lang == current
+                                            || (current.is_empty() && *lang == *"text");
+                                        let label: SharedString = if is_current {
+                                            format!("{lang} ✓").into()
+                                        } else {
+                                            lang.clone()
+                                        };
+                                        div()
+                                            .id(("code-lang-row", i))
+                                            .flex_shrink_0()
+                                            .h(px(ROW_H))
+                                            .px(px(10.))
+                                            .py(px(2.))
+                                            .hover(move |s| s.bg(hover))
+                                            .child(label)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |editor, _: &MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                        editor.code_lang_menu = None;
+                                                        editor.set_code_lang(row, &lang, cx);
+                                                    },
+                                                ),
+                                            )
+                                            .into_any_element()
+                                    })),
+                            )
+                            .children(thumb),
+                    ),
+                )
+            }))
     }
 }
 
-#[cfg(test)]
-impl MarkdownLivePreview {
-    /// 测试：在指定字节偏移插入文本（走真实编辑核心），返回新光标。
-    pub(crate) fn test_insert_at(&mut self, off: usize, text: &str) -> usize {
-        self.apply_edit(off..off, text);
-        self.selection.head()
+/// The shaped width of `text` at `font_size` — used to inset a gutter line's body
+/// to exactly where its (hidden) source prefix ends, so the rendered + raw views
+/// line up (and tab/space nesting matches the actual whitespace width).
+fn measure_width(window: &mut Window, text: &str, font: &Font, font_size: Pixels) -> Pixels {
+    if text.is_empty() {
+        return px(0.);
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(
+            SharedString::from(text.to_string()),
+            font_size,
+            &[run],
+            None,
+        )
+        .width()
+}
+
+/// Shape `text` with pre-built `runs`, so diagnostics can underline specific
+/// spans. The plain-run [`shape_all`] is used for the placeholder + measurement.
+fn shape_runs(
+    window: &mut Window,
+    text: &SharedString,
+    font_size: Pixels,
+    runs: &[TextRun],
+    wrap_width: Option<Pixels>,
+) -> Vec<WrappedLine> {
+    window
+        .text_system()
+        .shape_text(text.clone(), font_size, runs, wrap_width, None)
+        .map(|lines| lines.into_vec())
+        .unwrap_or_default()
+}
+
+/// A line currently rendered as an inline image (W4) instead of its source text:
+/// the decoded image plus its fit-to-width display size (logical px).
+#[derive(Clone)]
+struct BlockImg {
+    img: Arc<RenderImage>,
+    width: Pixels,
+    height: Pixels,
+    /// Whether to show a corner resize grip. `false` for math (nothing to persist a
+    /// `{width=N}` to, and it renders at its natural typeset size); `true` for images.
+    resizable: bool,
+    /// Horizontal alignment in the content width. `Left` for images; display math sets its
+    /// own (centered by default).
+    align: MathAlign,
+}
+
+/// One inline `$…$` formula painted within a text line. `display_off` is the byte offset of its
+/// invisible spacer in the shaped DISPLAY string (resolved to an x via the wrapped line at
+/// paint); `source` is the formula's byte range within the *source line* (to hit-test a click
+/// back to its edit range); `img`/`width`/`height` are the typeset raster scaled to text size.
+#[derive(Clone)]
+struct InlineMath {
+    display_off: usize,
+    /// Byte length of the spacer this raster sits over. On an RTL row
+    /// `display_off` is its RIGHT edge, so the whole span is needed to find the
+    /// left one — see where it is painted.
+    len: usize,
+    /// ABSOLUTE byte range of the `$…$` span in the document — to hit-test a click on the
+    /// formula back to its edit range and to position the seated editor.
+    source: Range<usize>,
+    /// The inner LaTeX (no `$` delimiters), to seed the structural editor on click.
+    latex: SharedString,
+    img: Arc<RenderImage>,
+    width: Pixels,
+    height: Pixels,
+}
+
+/// A line rendered as a block widget instead of its source text: a standalone
+/// image, or a clickable file chip (e.g. a PDF — left-click opens it, right-click
+/// edits). Shown only while the caret is off the line ("raw on caret").
+#[derive(Clone)]
+enum Block {
+    Image(BlockImg),
+    Chip {
+        src: SharedString,
+        label: SharedString,
+        /// Label color (accent, signalling clickable), box fill, box border.
+        link: Hsla,
+        bg: Hsla,
+        border: Hsla,
+        height: Pixels,
+        /// `src` is a wiki target (an `![[embed]]` chip → OpenWikiLink, which
+        /// navigates + jumps to any anchor) vs a file path (→ OpenLink).
+        wiki: bool,
+    },
+    /// A run of `key:: value` properties as a two-column panel (the reader's
+    /// `render_property_table` twin). Painted on the region's first line; the
+    /// rest of the region's lines collapse. The caret entering the region
+    /// reveals the raw source (like a math block).
+    Properties(PropPanel),
+}
+
+/// A rendered piece of a property value in the panel: plain text, or a colored
+/// pill (tag / wiki-link / URL).
+#[derive(Clone)]
+enum PanelSeg {
+    Plain(SharedString),
+    Pill {
+        text: SharedString,
+        color: Hsla,
+        target: md_syntax::LinkHit,
+    },
+}
+
+/// Layout for a WYSIWYG property panel: the measured rows (key + value
+/// segments), the column widths + per-row height, and the key/value colors. No
+/// grid lines — rows read clean (Obsidian-style); the value's tags and
+/// wiki-links render as pills.
+#[derive(Clone)]
+struct PropPanel {
+    /// `(key, icon asset path, value segments)` per property line, in order.
+    rows: Vec<(SharedString, Option<SharedString>, Vec<PanelSeg>)>,
+    key_w: Pixels,
+    /// Panel width (shared by every row) so hover borders align.
+    width: Pixels,
+    row_h: Pixels,
+    height: Pixels,
+    /// Icon draw size (0 when the host resolves no icons); the key text is inset
+    /// by `key_indent` to leave room for it.
+    icon_sz: Pixels,
+    key_indent: Pixels,
+    key_color: Hsla,
+    value_color: Hsla,
+    /// The rounded border drawn around the row under the pointer (Obsidian-style
+    /// whole-row hover).
+    hover_border: Hsla,
+}
+
+impl Block {
+    fn height(&self) -> Pixels {
+        match self {
+            Block::Image(i) => i.height,
+            Block::Chip { height, .. } => *height,
+            Block::Properties(p) => p.height,
+        }
+    }
+}
+
+/// A fenced-code-block line's background (W4b/refinement): the block reads as one
+/// rounded, content-fit box (sized to its widest line, like a table — not the
+/// full editor width). Each line carries the block color, the shared box width
+/// (back-patched once the block's extent is known), and whether it's the
+/// first/last visible line (to round the box's top/bottom corners).
+/// Last-frame hit rects for one code card's chrome (see `code_chip_rects`).
+#[derive(Clone)]
+struct CodeChipHit {
+    lang: Bounds<Pixels>,
+    copy: Bounds<Pixels>,
+    fence_row: usize,
+}
+
+/// A code card's top-right chrome, laid out in prepaint: the language tag and
+/// Copy button (Cditor-inspired, issue #16). Geometry is window-space; paint
+/// draws at these bounds and the hitboxes flip the cursor.
+struct CodeChip {
+    lang_text: SharedString,
+    copy_text: SharedString,
+    lang_bounds: Bounds<Pixels>,
+    copy_bounds: Bounds<Pixels>,
+    fence_row: usize,
+    /// Card background — the labels sit on an opaque pill of it so they stay
+    /// readable over a long first line.
+    bg: Hsla,
+    fg: Hsla,
+    lang_hb: Hitbox,
+    copy_hb: Hitbox,
+}
+
+#[derive(Clone, Copy)]
+struct CodeBg {
+    color: Hsla,
+    width: Pixels,
+    top: bool,
+    bottom: bool,
+}
+
+/// A table row rendered as a grid (W4c): its cells, per-column alignment, the
+/// content-fit per-column widths (shared across the table), header/separator/
+/// last-row flags, and the border color. Built only when the caret is outside
+/// the table — the caret's table shows source instead ("raw on caret").
+#[derive(Clone)]
+struct TableRow {
+    cells: Vec<SharedString>,
+    /// Byte range of each cell's trimmed content within its source line — for
+    /// placing the caret inside a cell + hit-testing a click back to a source
+    /// offset (in-cell editing).
+    cell_ranges: Vec<Range<usize>>,
+    aligns: Vec<markdown_syntax::Align>,
+    col_widths: Vec<Pixels>,
+    is_header: bool,
+    is_separator: bool,
+    is_last: bool,
+    /// 0-based position among the body rows (`None` for header/separator) — drives
+    /// striping (shade odd indices) + the rule-under-header (index 0).
+    body_index: Option<usize>,
+    /// The table's visual style (from its `<!-- table:STYLE -->` marker).
+    style: markdown_syntax::TableStyle,
+    border: Hsla,
+    /// Row-shade color for striped / header-shaded styles (a faint tint).
+    shade: Hsla,
+    /// The table reads right-to-left (#66) — from its region's
+    /// [`markdown_syntax::TableRegion::rtl`], so every row of one table agrees.
+    rtl: bool,
+}
+
+/// A per-line "gutter" decoration: a left-margin treatment that hides its source
+/// marker and renders something in its place, with the body text inset to make
+/// Task checkbox edge, as a fraction of the line's font size — shared by the
+/// shaping (body inset), the pointer hitbox, and the paint so they agree.
+const CHECKBOX_SCALE: f32 = 0.9;
+
+/// room. Covers blockquotes now; list bullets + task checkboxes reuse it.
+#[derive(Clone, Copy)]
+enum LineMark {
+    /// Blockquote: a left border (`bar`); the `>` markers are hidden. `text`
+    /// colors the body — `Some` = muted quote tone, `None` = the editor's
+    /// normal text color (alert bodies).
+    Quote { bar: Hsla, text: Option<Hsla> },
+    /// A GitHub alert's marker line (`> [!NOTE]` …): the marker is hidden and
+    /// a bold `label` paints in the alert color; any same-line body insets to
+    /// `text_inset` (QUOTE_INSET + the label's measured width + a gap) — the
+    /// list-bullet pattern. Continuation lines are `Quote` marks with the
+    /// alert's bar color.
+    Alert {
+        bar: Hsla,
+        label: &'static str,
+        kind: markdown_syntax::AlertKind,
+        text_inset: Pixels,
+        /// Foldable callout (`[!NOTE]-`/`+`): `Some(true)` = folded. A chevron
+        /// paints at `chevron_x` (after the label) and clicking it flips the
+        /// fold char in the source.
+        fold: Option<bool>,
+        chevron_x: Pixels,
+    },
+    /// List item: a painted bullet (`•`) or number (`N.`) at `bullet_x` (where the
+    /// hidden source marker began), muted; the body sits at `text_inset` — the
+    /// measured width of the whole source prefix, so the rendered + raw views
+    /// line up exactly and tab/space nesting stays in sync.
+    List {
+        bullet_x: Pixels,
+        text_inset: Pixels,
+        ordered: bool,
+        num: u32,
+        /// Structural nesting level (0 = top), for the Word-style marker
+        /// scheme (`1.` -> `a.` -> `i.`).
+        level: usize,
+        color: Hsla,
+    },
+    /// GFM task item: a painted ☐/☑ box at `bullet_x`, muted; the body sits at
+    /// `text_inset` (measured prefix width) like a list item.
+    Check {
+        bullet_x: Pixels,
+        text_inset: Pixels,
+        checked: bool,
+        color: Hsla,
+        /// Fill for a done box (the host's link/accent color; white check on top).
+        accent: Hsla,
+    },
+    /// Thematic break (`---`): a full-width muted divider painted in place of the
+    /// source; the line has no body text (reveal-on-caret shows the raw `---`).
+    Rule(Hsla),
+}
+
+impl LineMark {
+    /// Horizontal inset (px) applied to the body text + caret for this mark.
+    fn inset(self) -> Pixels {
+        match self {
+            LineMark::Quote { .. } => px(QUOTE_INSET),
+            LineMark::Alert { text_inset, .. } => text_inset,
+            LineMark::List { text_inset, .. } | LineMark::Check { text_inset, .. } => text_inset,
+            LineMark::Rule(_) => px(0.),
+        }
+    }
+}
+
+/// Per-logical-line shaping output — parallel vecs of equal length: the shaped
+/// source line, its row height, an optional inline-image widget, an optional
+/// fenced-code-block background, an optional table-row grid, the display→source
+/// map, and an optional gutter decoration (blockquote / list / checkbox).
+/// One shaped document: per-line parallel channels, all the same length —
+/// the per-line loop's normal push and [`ShapedDoc::push_placeholder`] are
+/// the only writers, so the lockstep invariant lives here.
+#[derive(Default)]
+struct ShapedDoc {
+    wrapped: Vec<WrappedLine>,
+    heights: Vec<Pixels>,
+    widgets: Vec<Option<Block>>,
+    backgrounds: Vec<Option<CodeBg>>,
+    tables: Vec<Option<TableRow>>,
+    /// Per-line display→source byte map for lines with markers hidden (W6);
+    /// `None` when the displayed text equals the source. Shared with the
+    /// line-run cache (a hit re-uses the same allocation across frames).
+    maps: Vec<Option<std::rc::Rc<Vec<usize>>>>,
+    marks: Vec<Option<LineMark>>,
+    /// Per-line inline `$…$` formulas painted over spacers (empty when none).
+    inline_maths: Vec<Vec<InlineMath>>,
+    /// Per-line wrap-row count. Geometry (line tops, total height) reads THIS,
+    /// not `wrap_boundaries()` — a windowed-out line's `WrappedLine` is an
+    /// empty placeholder, but its cached count keeps the layout exact. For an
+    /// RTL line it is OUR row count, which is not gpui's (#66).
+    wrap_rows: Vec<usize>,
+    /// Per-line bidi layout: whether the line READS right-to-left, plus the
+    /// rows we broke in logical order. `None` for lines with no RTL at all,
+    /// which keep gpui's own wrapping. Drives that line's paint, caret,
+    /// selection and hit-testing.
+    rtl_rows: Vec<Option<(bool, Vec<bidi::paragraph::Row>)>>,
+}
+
+impl ShapedDoc {
+    /// Push one line that renders as something other than shaped text — a
+    /// widget/collapsed/windowed-out line: an empty placeholder `WrappedLine`,
+    /// the given height/widget/mark, and `rows` wrap rows.
+    #[allow(clippy::too_many_arguments)]
+    fn push_placeholder(
+        &mut self,
+        window: &mut Window,
+        base_font_size: Pixels,
+        wrap_width: Option<Pixels>,
+        h: Pixels,
+        widget: Option<Block>,
+        mark: Option<LineMark>,
+        rows: usize,
+    ) {
+        let wl = shape_runs(
+            window,
+            &SharedString::default(),
+            base_font_size,
+            &[],
+            wrap_width,
+        )
+        .into_iter()
+        .next()
+        .expect("a line always shapes to one wrapped line");
+        self.wrapped.push(wl);
+        self.heights.push(h);
+        self.widgets.push(widget);
+        self.backgrounds.push(None);
+        self.tables.push(None);
+        self.maps.push(None);
+        self.marks.push(mark);
+        self.inline_maths.push(Vec::new());
+        self.wrap_rows.push(rows);
+        self.rtl_rows.push(None);
+    }
+}
+
+/// Rewrite an image source `line` to carry an explicit `{width=N}` after the
+/// `![alt](src)` (replacing any existing `{width=...}`), preserving a leading
+/// list marker and any trailing whitespace. Used to persist a corner-grip resize
+/// back into the document. Returns `line` unchanged if it isn't an image row.
+fn set_image_width(line: &str, width: u32) -> String {
+    let Some((_, _, marker_len)) = markdown_syntax::image_row(line) else {
+        return line.to_string();
+    };
+    // Split off any trailing whitespace so the attr lands right after `)` (or the
+    // existing `{width=…}`), with the original trailing run re-appended.
+    let trimmed_end = line.trim_end_matches([' ', '\t']);
+    let trailing_ws = &line[trimmed_end.len()..];
+    // The image body always ends at the first `)` after the list marker; an
+    // existing `{width=…}` (only valid right after it) is dropped.
+    let close = marker_len + line[marker_len..].find(')').map_or(0, |i| i + 1);
+    let body = trimmed_end[..close.min(trimmed_end.len())].trim_end();
+    format!("{body}{{width={width}}}{trailing_ws}")
+}
+
+/// Invert a display→source offset map: the display column for `source_col`. The
+/// map is ascending, so a source column that is hidden (a collapsed marker)
+/// snaps to the next visible display column. `None` map → identity (a row shown
+/// as full source). The prepaint cursor/selection pass this frame's fresh map
+/// (the committed `MarkdownLivePreview::offset_maps` lags a frame); event handlers go
+/// through [`MarkdownLivePreview::display_col`], which uses the committed map.
+fn display_col_in(map: Option<&std::rc::Rc<Vec<usize>>>, source_col: usize) -> usize {
+    match map {
+        // The first display byte whose source ≥ `source_col` (a leftmost lower-bound). Unlike
+        // `binary_search`, this is deterministic when several display bytes share one source
+        // offset — an inline `$…$` spacer maps its whole width to the span start, so the caret
+        // just before the formula must land at the spacer's LEFT edge, not somewhere inside it.
+        Some(m) => m.partition_point(|&s| s < source_col),
+        None => source_col,
+    }
+}
+
+/// The painted position of display column `dcol` on a shaped line: gpui's own
+/// lookup, with the x taken from the row's bidi map when it has one (#66).
+///
+/// gpui's `x_for_index` returns the first glyph whose `index >= dcol`, and the
+/// first glyph of an RTL line carries the HIGHEST index — so every offset in
+/// the line collapses onto x = 0. The y (which wrap row) stays gpui's; a row
+/// only gets a map while it is ONE visual row, so it is always 0 there.
+/// Excludes the row's insets — callers add [`MarkdownLivePreview::row_origin_x`].
+fn line_pos(
+    line: &WrappedLine,
+    rtl: Option<&RtlRow>,
+    dcol: usize,
+    lh: Pixels,
+) -> Option<Point<Pixels>> {
+    match rtl {
+        // Our own rows: which one holds the offset decides the y, and the
+        // row's map the x. gpui's layout is not consulted at all — its rows
+        // are not ours.
+        Some(r) => {
+            let (row, local) = r.row_of(dcol);
+            let x = px(r.rows.get(row)?.map.x_for_index(local)) + r.shift_delta(row);
+            Some(point(x, lh * row))
+        }
+        None => line.position_for_index(dcol, lh),
+    }
+}
+
+/// The display column a click at row-local `p` names — the inverse of
+/// [`line_pos`], through the bidi map when the row has one (gpui's
+/// `closest_index_for_x` fails on RTL the same way `x_for_index` does).
+fn line_index_at(line: &WrappedLine, rtl: Option<&RtlRow>, p: Point<Pixels>, lh: Pixels) -> usize {
+    match rtl {
+        Some(r) if !r.rows.is_empty() => {
+            let row = ((f32::from(p.y) / f32::from(lh).max(1.0)).floor().max(0.) as usize)
+                .min(r.rows.len() - 1);
+            let x = p.x - r.shift_delta(row);
+            let Some(rr) = r.rows.get(row) else {
+                return 0;
+            };
+            rr.start + rr.map.index_for_x(f32::from(x))
+        }
+        _ => match line.closest_index_for_position(p, lh) {
+            Ok(i) | Err(i) => i,
+        },
+    }
+}
+
+/// A right-to-left row's editor-side geometry, built in prepaint (#66).
+///
+/// Only rows whose source reads RTL ([`md_syntax::base_direction`])
+/// get one — the flag *is* `Option::is_some`, so an LTR document allocates
+/// nothing and keeps taking gpui's own (cheaper) lookups.
+pub(crate) struct RtlRow {
+    /// The line's visual rows, broken in LOGICAL order (gpui's own wrapping
+    /// slices the reordered glyph run and gets them backwards). Each carries
+    /// the map that turns an offset inside it into an x and back.
+    rows: Vec<bidi::paragraph::Row>,
+    /// Each row's right-align shift, parallel to `rows`: added to the text
+    /// origin so the row right-aligns in the content width (see [`rtl_shift`]).
+    /// Per ROW, not per line — a short last row shifts further than a full one.
+    /// Kept OUT of `line_insets` on purpose: the list-marker + gutter math
+    /// reads that, and must not move with the text.
+    shifts: Vec<Pixels>,
+    /// Does the line READ right-to-left? A left-to-right line containing a
+    /// Persian phrase gets rows and maps too, but stays left-aligned and keeps
+    /// left-to-right arrow keys.
+    base_rtl: bool,
+}
+
+impl RtlRow {
+    /// The row holding display column `dcol`, and the column's offset within
+    /// it. Rows are in reading order and contiguous, so the last row wins for
+    /// an offset at the very end of the line.
+    fn row_of(&self, dcol: usize) -> (usize, usize) {
+        row_of_spans(self.rows.iter().map(|r| (r.start, r.len)), dcol)
     }
 
-    /// 测试：直接设定光标（源码字节）。
-    pub(crate) fn test_set_caret(&mut self, off: usize) {
-        self.selection = Selection::collapsed(off);
+    /// A row's horizontal extent (left, right) relative to the FIRST row's
+    /// origin — the coordinate space callers already work in, since they add
+    /// `row_origin_x`. Used to band a selection across a row: an RTL row does
+    /// not span the content width, so "the whole row" is this, not 0..width.
+    pub(crate) fn row_extent(&self, row: usize) -> (Pixels, Pixels) {
+        let d = self.shift_delta(row);
+        (d, d + self.rows.get(row).map_or(px(0.), |r| r.width))
     }
 
-    /// 测试：光标对应的 (渲染行, 渲染字节)。
-    pub(crate) fn test_caret_target(&self) -> Option<(usize, usize)> {
-        self.caret_target()
+    /// How many visual rows this line broke into.
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
     }
 
-    /// 测试：当前渲染行数。
-    pub(crate) fn test_live_len(&self) -> usize {
-        self.live.len()
+    /// A row's shift relative to the FIRST row's. Callers already add
+    /// `row_origin_x`, which carries row 0's shift, so this is the remainder —
+    /// that keeps every existing caller correct without threading a wrap-row
+    /// index through all of them.
+    fn shift_delta(&self, row: usize) -> Pixels {
+        self.shifts.get(row).copied().unwrap_or(px(0.))
+            - self.shifts.first().copied().unwrap_or(px(0.))
+    }
+}
+
+/// Which row holds display column `dcol`, and its offset within that row.
+///
+/// Split out from [`RtlRow::row_of`] so it can be tested without a window: a
+/// `Row` carries a shaped line, which needs one. Rows are contiguous and in
+/// reading order, so an offset at the very end of the line lands on the last
+/// row rather than falling off the end — that is where the caret sits after
+/// typing at the end of a paragraph.
+fn row_of_spans(rows: impl Iterator<Item = (usize, usize)>, dcol: usize) -> (usize, usize) {
+    let mut last = (0, dcol);
+    let mut seen = false;
+    for (i, (start, len)) in rows.enumerate() {
+        seen = true;
+        last = (i, dcol.saturating_sub(start));
+        if dcol < start + len {
+            return (i, dcol - start);
+        }
+    }
+    if seen { last } else { (0, dcol) }
+}
+
+/// The x a right-to-left row's text starts at within `content_width`, so its
+/// *trailing* edge sits `inset` in from the right — the mirror of the leading
+/// `inset` an LTR row gets. Zero once the text no longer fits (it wraps, and
+/// every wrap row starts at the left edge).
+///
+/// Callers add this to the origin they already inset, hence the doubled
+/// `inset`: `origin + inset + shift` lands the text `inset` from the right.
+fn rtl_shift(content_width: Pixels, inset: Pixels, line_width: Pixels) -> Pixels {
+    (content_width - inset * 2. - line_width).max(px(0.))
+}
+
+/// Mirror a gutter marker's x (a bullet, a number, a checkbox) to the right
+/// edge for an RTL row, so it sits on the side the text now starts at —
+/// matching the reader's `flex_row_reverse` list items. Nesting is preserved:
+/// a deeper level's larger `marker_x` indents further from the right.
+fn rtl_marker_x(content_width: Pixels, marker_x: Pixels, marker_width: Pixels) -> Pixels {
+    (content_width - marker_x - marker_width).max(px(0.))
+}
+
+/// A task row's checkbox x within the content width, mirrored on an RTL row.
+/// One function so the prepaint hitbox (the hand cursor) and the paint (the
+/// box, and the rects a click hit-tests) can never land on different sides.
+fn checkbox_x(bullet_x: Pixels, size: Pixels, content_width: Pixels, rtl: bool) -> Pixels {
+    if rtl {
+        rtl_marker_x(content_width, bullet_x, size)
+    } else {
+        bullet_x
+    }
+}
+
+/// Case-insensitive occurrences of `query` in `content`, as source byte
+/// ranges — the match list a find bar feeds to [`MarkdownLivePreview::set_search`].
+/// Unicode-aware (comparison happens on lowercased text through an index map
+/// back to original byte offsets). An empty query matches nothing.
+pub fn find_in_source(content: &str, query: &str) -> Vec<Range<usize>> {
+    let query: String = query.chars().flat_map(char::to_lowercase).collect();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    // Lowercased haystack + per-byte map back to original offsets. Boundaries
+    // survive: each original char lowercases to >= 1 chars, all of whose bytes
+    // map to the original char's start.
+    let mut lower = String::with_capacity(content.len());
+    let mut map = Vec::with_capacity(content.len() + 1);
+    for (off, ch) in content.char_indices() {
+        for lc in ch.to_lowercase() {
+            lower.push(lc);
+            map.resize(lower.len(), off);
+        }
+    }
+    lower
+        .match_indices(&query)
+        .map(|(i, m)| map[i]..map.get(i + m.len()).copied().unwrap_or(content.len()))
+        .collect()
+}
+
+/// Paint a flat, line-art document glyph (a page with a folded top-right corner +
+/// two text lines) in `color`, the chip's file icon. Drawn with strokes — not a
+/// font emoji — so it reads flat and on-theme at the text's size. Public so a
+/// host's read-only view can draw the identical icon on its own file chips
+/// (cross-view parity).
+pub fn paint_doc_icon(
+    x: Pixels,
+    y: Pixels,
+    w: Pixels,
+    h: Pixels,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let f = w * 0.33; // folded-corner size
+    // Page silhouette, with the top-right corner cut away for the fold.
+    let mut outline = PathBuilder::stroke(px(1.3));
+    outline.move_to(point(x, y));
+    outline.line_to(point(x + w - f, y));
+    outline.line_to(point(x + w, y + f));
+    outline.line_to(point(x + w, y + h));
+    outline.line_to(point(x, y + h));
+    outline.line_to(point(x, y));
+    if let Ok(p) = outline.build() {
+        window.paint_path(p, color);
+    }
+    // The folded corner (dog-ear).
+    let mut fold = PathBuilder::stroke(px(1.3));
+    fold.move_to(point(x + w - f, y));
+    fold.line_to(point(x + w - f, y + f));
+    fold.line_to(point(x + w, y + f));
+    if let Ok(p) = fold.build() {
+        window.paint_path(p, color);
+    }
+    // Two short text lines below the fold.
+    for fy in [0.6_f32, 0.78] {
+        let mut ln = PathBuilder::stroke(px(1.));
+        ln.move_to(point(x + w * 0.26, y + h * fy));
+        ln.line_to(point(x + w * 0.74, y + h * fy));
+        if let Ok(p) = ln.build() {
+            window.paint_path(p, color);
+        }
+    }
+}
+
+/// How many wrap rows table row `cells` need at `col_widths` — 1 for content
+/// that fits; more once a drag-narrowed column forces its text to wrap.
+/// The gutter grip's left edge for an editor whose content starts at
+/// `bounds_left` — THE grip x formula, shared by prepaint (fresh geometry)
+/// and the event-time hover mirror so the two can't drift.
+fn grip_left(bounds_left: Pixels, inset: Pixels) -> Pixels {
+    bounds_left - px(22.) - inset
+}
+
+/// One markdown line's built display + runs, cached across frames (see
+/// `MarkdownLivePreview::line_run_cache`). `src` and `line_base` verify a hash hit —
+/// the rest of the inputs are folded into the key's hash.
+struct CachedLineRuns {
+    src: String,
+    line_base: Hsla,
+    /// Shared payloads: a cache HIT is three refcount bumps, not three deep
+    /// clones (this runs per visible line per frame).
+    disp: SharedString,
+    runs: std::rc::Rc<Vec<TextRun>>,
+    map: std::rc::Rc<Vec<usize>>,
+}
+
+/// The validity marker + per-row content keys of the run-key memo.
+type RowKeys = (Option<u64>, Vec<Option<u64>>);
+
+/// The measured table column widths cache: one keyed entry for the doc.
+type RegionCols = Option<(u64, std::rc::Rc<Vec<Vec<Pixels>>>)>;
+
+/// The editor-owned caches `shape_document` reads and writes (interior-
+/// mutable — shaping runs under a read borrow of the editor):
+/// - `line_runs`: each markdown line's built display + runs (cross-frame).
+/// - `region_cols`: the measured table column widths for the WHOLE document,
+///   one keyed entry — rebuilt when the tables' source, the wrap width, the
+///   font epoch, or a live column drag changes.
+/// - `cell_rows`: per table row, how many wrap rows its tallest cell needs.
+#[derive(Default)]
+struct ShapeCaches {
+    line_runs: std::cell::RefCell<std::collections::HashMap<u64, CachedLineRuns>>,
+    region_cols: std::cell::RefCell<RegionCols>,
+    cell_rows: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
+    /// Per-line (row height, wrap rows), keyed by the line-run key ⊕ font
+    /// size ⊕ wrap width — the shaping window's exact heights for skipped
+    /// offscreen lines.
+    line_heights: std::cell::RefCell<std::collections::HashMap<u64, (Pixels, usize)>>,
+    /// Per-row CONTENT-part run keys (line bytes + line_base + diags + epoch),
+    /// valid for one (scan generation, epoch) pair — so a steady-state frame
+    /// hashes three u64s per line instead of every line's bytes. Diagnostics
+    /// changes invalidate explicitly (see `set_diagnostics`).
+    row_keys: std::cell::RefCell<RowKeys>,
+}
+
+/// A hash of the inputs shared by every line's run build (font + palette) —
+/// part of the per-line cache key, so a theme or font change misses cleanly.
+fn line_run_epoch(font: &Font, st: Option<&SyntaxStyle>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    font.family.hash(&mut h);
+    font.weight.0.to_bits().hash(&mut h);
+    let hash_hsla = |c: Hsla, h: &mut std::collections::hash_map::DefaultHasher| {
+        c.h.to_bits().hash(h);
+        c.s.to_bits().hash(h);
+        c.l.to_bits().hash(h);
+        c.a.to_bits().hash(h);
+    };
+    if let Some(st) = st {
+        for c in [
+            st.marker, st.code, st.code_bg, st.link, st.tag, st.quote, st.mark_bg,
+        ] {
+            hash_hsla(c, &mut h);
+        }
+        st.mono.family.hash(&mut h);
+        st.block_label_gen.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Host hook for scroll anchoring: called from the measure pass when an
+/// ASYNC height change (a math/mermaid/image raster arriving) lands ABOVE
+/// the window's viewport, with the height delta — the host shifts its scroll
+/// container's offset by it so the content being read doesn't jump.
+pub type ScrollCompensatorFn = std::rc::Rc<dyn Fn(Pixels, &mut Window, &mut App)>;
+
+/// Content-derived structural scans — tables, ordered-list numbering,
+/// mermaid/math regions, property runs, foldable callouts, and per-line
+/// fence parity — cached per [`MarkdownLivePreview::content_gen`]. `shape_document`
+/// recomputed all of these on every call (twice a frame before the shape
+/// memo); now they rebuild only when the content actually changes, and the
+/// caret-driven table ops + auto-replace reuse the same scan.
+pub(crate) struct ScanData {
+    /// The `content_gen` this scan was built for — cache keys use this
+    /// instead of rehashing content.
+    generation: u64,
+    ordered: Vec<(u32, usize)>,
+    tables: Vec<markdown_syntax::TableRegion>,
+    mermaid: Vec<(Range<usize>, String)>,
+    math: Vec<markdown_syntax::MathRegion>,
+    props: Vec<Range<usize>>,
+    alert_folds: Vec<(Range<usize>, bool)>,
+    /// Whether each line STARTS inside a fenced code block (odd count of ```
+    /// fences above it).
+    fence_odd: Vec<bool>,
+}
+
+/// One frame's shaping, memoized between the measure pass and prepaint —
+/// both shape the IDENTICAL inputs, so the measure's result is handed to
+/// prepaint instead of shaping the whole document twice per frame. Consumed
+/// (taken) by prepaint, so it can never go stale across frames; a key
+/// mismatch (e.g. the resolved width differs from the available width)
+/// falls back to shaping.
+struct ShapeMemo {
+    wrap_width: Option<Pixels>,
+    caret_row: Option<usize>,
+    selection: (usize, usize),
+    font_size: Pixels,
+    shaped: ShapedDoc,
+}
+
+/// Whether a just-typed input completes a word: a single boundary character
+/// (space / punctuation / Enter, incl. a list continuation's leading newline)
+/// — the moment the host's auto-replace hook (page-title auto-linking) is
+/// offered the line. `:` is NOT a boundary, so a `key:: value` property can be
+/// typed on a key that happens to name a page — the first `:` must not wrap
+/// the key into `[[key]]`.
+fn word_boundary_input(new_text: &str) -> bool {
+    match new_text.as_bytes() {
+        [c] => !c.is_ascii_alphanumeric() && !matches!(c, b'_' | b'-' | b'/' | b'#' | b'[' | b':'),
+        [b'\n', ..] => true,
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use gpui::{size, AppContext, Modifiers, TestAppContext, VisualTestContext};
-
-    /// 代码行段的几何 + 源码映射信息（测试观测用）。
-    #[derive(Debug, Clone)]
-    struct CodeSeg {
-        base: usize,
-        text_len: usize,
-        x: f32,
-        top: f32,
-        height: f32,
+    #[test]
+    fn caret_off_marker_line_cases() {
+        use super::caret_off_marker_line;
+        // Table marker at the top: the caret steps to the header line.
+        let doc = "<!-- table:grid cols=40,40 -->\n| a | b |\n| --- | --- |\n| 1 | 2 |";
+        assert_eq!(caret_off_marker_line(doc, 0), 31);
+        // Math align marker: the caret lands after the block.
+        let doc = "<!-- math:center -->\n$$\nx^2\n$$\nafter";
+        assert_eq!(caret_off_marker_line(doc, 0), 31);
+        assert_eq!(&doc[31..], "after");
+        // Plain lines pass through untouched.
+        assert_eq!(caret_off_marker_line("hello\nworld", 0), 0);
+        assert_eq!(caret_off_marker_line("", 0), 0);
     }
 
-    struct LiveHost {
-        live: Entity<MarkdownLivePreview>,
-    }
-    impl Render for LiveHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            self.live.clone()
-        }
-    }
-
-    /// 模拟 App 布局：左 200px「侧栏」+ 右侧 live 编辑器（live 不在窗口原点）。
-    struct SidebarHost {
-        live: Entity<MarkdownLivePreview>,
-    }
-    impl Render for SidebarHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .flex()
-                .flex_row()
-                .size_full()
-                .child(div().w(px(200.)).bg(gpui::rgb(0x222222)))
-                .child(div().flex_1().child(self.live.clone()))
-        }
+    #[test]
+    fn strip_block_prefix_cases() {
+        use super::strip_block_prefix;
+        assert_eq!(strip_block_prefix("# Title"), "Title");
+        assert_eq!(strip_block_prefix("### Deep"), "Deep");
+        assert_eq!(strip_block_prefix("- [x] done"), "done");
+        assert_eq!(strip_block_prefix("- item"), "item");
+        assert_eq!(strip_block_prefix("12. nth"), "nth");
+        assert_eq!(strip_block_prefix("> quoted"), "quoted");
+        assert_eq!(strip_block_prefix(">bare"), "bare");
+        assert_eq!(strip_block_prefix("plain"), "plain");
+        // Renderer-grammar forms the old hand-rolled version missed.
+        assert_eq!(strip_block_prefix("* [ ] star task"), "star task");
+        assert_eq!(strip_block_prefix("+ [x] plus task"), "plus task");
+        assert_eq!(strip_block_prefix("3) paren"), "paren");
+        assert_eq!(strip_block_prefix("#### H4"), "H4");
+        // Not block prefixes: mid-word hash runs, `#tag`, a lone dash.
+        assert_eq!(strip_block_prefix("#tag"), "#tag");
+        assert_eq!(strip_block_prefix("-dash"), "-dash");
     }
 
-    /// 以真实窗口渲染实时编辑器：resize + 多帧收敛，让 `segs`/`element_bounds` 就绪。
-    fn open_live<'a>(
-        cx: &'a mut TestAppContext,
-        src: &str,
-    ) -> (Entity<LiveHost>, &'a mut VisualTestContext) {
-        cx.update(gpui_component::init);
-        let (host, cx) = cx.add_window_view(|_window, cx| {
-            let live = cx.new(|cx| MarkdownLivePreview::new(src, cx));
-            LiveHost { live }
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.simulate_resize(size(px(900.), px(700.)));
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.run_until_parked();
-        (host, cx)
-    }
-
-    /// 收集全部「代码行段」（map=None 且 line=Some）的几何 + 映射信息。
-    fn code_segs(live: &Entity<MarkdownLivePreview>, cx: &mut App) -> Vec<CodeSeg> {
-        let v = live.read(cx);
-        let segs = v.segs.borrow();
-        segs.iter()
-            .filter(|s| s.map.is_none() && s.line.is_some())
-            .map(|s| CodeSeg {
-                base: s.base,
-                text_len: s.text_len,
-                x: s.x,
-                top: s.top,
-                height: s.height,
-            })
-            .collect()
-    }
-
-    fn caret_source(live: &Entity<MarkdownLivePreview>, cx: &mut App) -> usize {
-        live.read(cx).selection.head()
-    }
-
-    fn buffer_text(live: &Entity<MarkdownLivePreview>, cx: &mut App) -> String {
-        live.read(cx).text()
-    }
-
-    /// 在 `s` 的字节 `at` 处插入 `ins`（与编辑核心同语义：按字节切）。
-    fn insert_bytes(s: &str, at: usize, ins: &str) -> String {
-        let mut out = String::with_capacity(s.len() + ins.len());
-        out.push_str(&s[..at]);
-        out.push_str(ins);
-        out.push_str(&s[at..]);
-        out
-    }
-
-    /// 核心回归：代码块点击 → 光标字节映射 → 输入落位，LF 与 CRLF 两种行尾都要准确。
-    fn check_code_click_and_type(cx: &mut TestAppContext, eol: &str) {
-        // 源码按行拼接，保证字节偏移可精确推导。
-        let mut src = String::new();
-        src.push_str("```rust");
-        src.push_str(eol);
-        src.push_str("let a = 1;");
-        src.push_str(eol);
-        src.push_str("let b = 22;");
-        src.push_str(eol);
-        src.push_str("```");
-        src.push('\n');
-
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        // 先验证「点击代码行某字节 → 光标 = 该源码行行首 + 字节」。
-        let segs = cx.update(|_, cx| code_segs(&code, cx));
-        assert!(
-            segs.len() >= 2,
-            "应有两个代码行段，实际 {} 个：{segs:?}",
-            segs.len()
-        );
-
-        let local_b = 3usize;
-        for (i, seg) in segs.iter().take(2).enumerate() {
-            // 垂直命中：点击行 top+2px 落在本行，光标 = base（行首）。
-            cx.simulate_mouse_down(
-                point(px(seg.x), px(seg.top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(
-                caret, seg.base,
-                "[{eol:?}] 代码行 {i}：点击行首光标应 = base({})，实际 {caret}（seg={seg:?}）",
-                seg.base
-            );
-
-            // 横向命中：在字符 local_b 的位置点击 → 光标 = base + local_b。
-            let x_for_b = cx.update(|_, cx| {
-                let v = code.read(cx);
-                let s = v.segs.borrow();
-                let s = s
-                    .iter()
-                    .find(|s| s.base == seg.base && s.line.is_some())
-                    .expect("找到代码行段");
-                s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-            });
-            cx.simulate_mouse_down(
-                point(px(seg.x + x_for_b), px(seg.top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(
-                caret,
-                seg.base + local_b,
-                "[{eol:?}] 代码行 {i}：@{local_b} 点击光标应 = {}，实际 {caret}（x_for_b={x_for_b:.1}, seg={seg:?}）",
-                seg.base + local_b
-            );
-        }
-
-        // 输入串：在第二行第 local_b 字符处插入 "XY" → 文本只在该处插入、光标推进 2 字节。
-        let seg1 = segs[1].clone();
-        let x_for_b = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let s = v.segs.borrow();
-            let s = s
-                .iter()
-                .find(|s| s.base == seg1.base && s.line.is_some())
-                .expect("找到代码行段");
-            s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-        });
-        cx.simulate_mouse_down(
-            point(px(seg1.x + x_for_b), px(seg1.top + 2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.run_until_parked();
-        cx.simulate_input("XY");
-        cx.run_until_parked();
-
-        // 期望：把第二行 `let b = 22;` 在第 local_b 字节处插 "XY"（源字节与渲染 1:1）。
-        let expected = src.replacen(
-            "let b = 22;",
-            &insert_bytes("let b = 22;", local_b, "XY"),
-            1,
-        );
-        let text = cx.update(|_, cx| buffer_text(&code, cx));
+    #[test]
+    fn find_in_source_cases() {
+        use super::find_in_source;
+        assert_eq!(find_in_source("aa bb aa", "aa"), vec![0..2, 6..8]);
+        // Case-insensitive, unicode-aware.
         assert_eq!(
-            text, expected,
-            "[{eol:?}] 输入后文本应只在该处插入（got {text:?} 期望 {expected:?}）"
+            find_in_source("Grüße hier", "grüsse"),
+            Vec::<std::ops::Range<usize>>::new()
         );
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
+        assert_eq!(find_in_source("Grüße", "grüße"), vec![0..7]);
+        assert_eq!(find_in_source("İstanbul", "i̇stanbul"), vec![0..9]);
         assert_eq!(
-            caret,
-            seg1.base + local_b + 2,
-            "[{eol:?}] 光标应推进到 base+{}，实际 {caret}",
-            local_b + 2
+            find_in_source("abc", ""),
+            Vec::<std::ops::Range<usize>>::new()
         );
     }
 
-    #[gpui::test]
-    fn live_edit_code_click_and_type_lf(cx: &mut TestAppContext) {
-        check_code_click_and_type(cx, "\n");
+    use super::{display_col_in, set_image_width, word_boundary_input};
+
+    #[test]
+    fn word_boundaries_offer_auto_replace_but_colon_never_does() {
+        // Space / punctuation / Enter (incl. a list continuation) complete a word.
+        assert!(word_boundary_input(" "));
+        assert!(word_boundary_input("."));
+        assert!(word_boundary_input("\n"));
+        assert!(word_boundary_input("\n- "));
+        // Word characters and syntax openers don't.
+        assert!(!word_boundary_input("a"));
+        assert!(!word_boundary_input("["));
+        assert!(!word_boundary_input("#"));
+        // `:` must not — typing `key::` on a page-title key would otherwise
+        // auto-link the key before the property can form.
+        assert!(!word_boundary_input(":"));
     }
 
-    #[gpui::test]
-    fn live_edit_code_click_and_type_crlf(cx: &mut TestAppContext) {
-        check_code_click_and_type(cx, "\r\n");
+    #[test]
+    fn display_col_leftmost_for_inline_math_spacer() {
+        // An inline `$…$` spacer maps its whole width to the span's start offset (here source 2,
+        // repeated across display 2..5). The caret at source 2 must land at the spacer's LEFT
+        // edge (display 2), not an arbitrary spot inside it; source 5 (just past the formula)
+        // lands at display 5.
+        let map = std::rc::Rc::new(vec![0, 1, 2, 2, 2, 5, 6, 7]);
+        assert_eq!(display_col_in(Some(&map), 2), 2);
+        assert_eq!(display_col_in(Some(&map), 5), 5);
+        // A strictly-increasing map (hidden markers) is unaffected.
+        let plain = std::rc::Rc::new(vec![0, 1, 2, 3]);
+        assert_eq!(display_col_in(Some(&plain), 2), 2);
+        assert_eq!(display_col_in(None, 4), 4);
     }
 
-    /// 光标像素（内容坐标 x, y, 高 + 行号），由 `caret_point` 直接观测。
-    fn caret_pixel(live: &Entity<MarkdownLivePreview>, cx: &mut App) -> Option<(usize, f32, f32, f32)> {
-        live.read(cx).caret_point()
-    }
-
-    /// 找某个源码行（base）对应的代码行段：返回 (x, top, line)。
-    fn find_code_seg(
-        live: &Entity<MarkdownLivePreview>,
-        cx: &mut App,
-        base: usize,
-    ) -> (f32, f32, f32, usize) {
-        let v = live.read(cx);
-        let segs = v.segs.borrow();
-        for s in segs.iter() {
-            if s.base == base && s.line.is_some() {
-                return (s.x, s.top, s.height, s.text_len);
-            }
-        }
-        panic!("找不到 base={base} 的代码行段");
-    }
-
-    /// 光标必须像「钉住」在点击/输入位置一样：输入后（重解析+重排一帧后）光标
-    /// 的像素 x/y 与该代码行段的几何严格一致——否则就是「输入错位」。
-    fn assert_caret_pinned(
-        live: &Entity<MarkdownLivePreview>,
-        cx: &mut App,
-        base: usize,
-        local_b: usize,
-        msg: &str,
-    ) {
-        let (row, x, y, h) = caret_pixel(live, cx).expect("应有光标");
-        let (sx, sty, sh, _len) = find_code_seg(live, cx, base);
-        // 光标 x = 段左起点 + 该行整形下 local_b 的 x（用整形线自己量，排除字体差异）
-        let v = live.read(cx);
-        let segs = v.segs.borrow();
-        let l = segs
-            .iter()
-            .find(|s| s.base == base && s.line.is_some())
-            .unwrap()
-            .line
-            .as_ref()
-            .unwrap();
-        let expect_x = sx + l.x_for_index(local_b.min(l.len())).as_f32();
-        let local = (x - expect_x).abs();
-        let vline = (y - sty).abs();
-        let vh = (h - sh).abs();
-        assert!(
-            local < 1.0,
-            "{msg}：光标 x={x:.1} 应与文本 {expect_x:.1} 对齐（段 x={sx:.1}，x 差={local:.2}px）"
-        );
-        assert!(
-            vline < 1.0 && vh < 1.0,
-            "{msg}：光标 y={y:.1} h={h:.1} 应与段 top={sty:.1} h={sh:.1} 对齐（垂直差 {vline:.2}/{vh:.2}px）"
-        );
-        let _ = row;
-    }
-
-    /// 真实文件形态：代码块前面有标题（块不是从第 0 行开始）+ 块内空行（测试文件
-    /// 常见），逐行点击映射 + 输入后的光标像素都得严格对齐。
-    #[gpui::test]
-    fn live_edit_code_block_offset_and_empty_lines(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n> 引用\n\n```java\npublic class A {\n    \n    private int x;\n}\n```\n\n正文结尾\n";
-        let (host, cx) = open_live(cx, src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        let segs = cx.update(|_, cx| code_segs(&code, cx));
-        assert!(
-            segs.len() == 4,
-            "代码块 4 行（含空行），实际 {}：{segs:?}",
-            segs.len()
-        );
-
-        // 每行点「行首」→ 光标 = 该行 base（空行也一样，不能落到围栏/别的行）。
-        for (i, seg) in segs.iter().enumerate() {
-            cx.simulate_mouse_down(
-                point(px(seg.x), px(seg.top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(
-                caret, seg.base,
-                "代码行 {i}（空行={}）：点行首光标应 = base({})，实际 {caret}（seg={seg:?}）",
-                seg.text_len == 0,
-                seg.base
-            );
-        }
-
-        // 非空行内横向点击 → 光标 = base + local_b，并在输入后光标像素仍钉在原位。
-        let line = segs[2].clone(); // "    private int x;"
-        assert!(line.text_len > 0);
-        let local_b = 4usize; // 行内容第 4 字节（"private" 首字节）
-        let x_for_b = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs
-                .iter()
-                .find(|s| s.base == line.base && s.line.is_some())
-                .unwrap();
-            s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-        });
-        cx.simulate_mouse_down(
-            point(px(line.x + x_for_b), px(line.top + 2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.run_until_parked();
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
+    #[test]
+    fn image_width_splice() {
+        // No existing attr: append `{width=N}` right after `)`.
         assert_eq!(
-            caret,
-            line.base + local_b,
-            "横向点击应 = base+{local_b}（={}），实际 {caret}",
-            line.base + local_b
+            set_image_width("![a](b.png)", 200),
+            "![a](b.png){width=200}"
         );
-        // 输入前光标像素就对正。
-        cx.update(|_, cx| assert_caret_pinned(&code, cx, line.base, local_b, "输入前"));
-        // 输入 3 个字符，光标推进 3 字节后仍钉在文本处。
-        cx.simulate_input("XYZ");
-        cx.run_until_parked();
-        let text = cx.update(|_, cx| buffer_text(&code, cx));
+        // Existing `{width=N}` is replaced (not duplicated).
+        assert_eq!(
+            set_image_width("![a](b.png){width=320}", 200),
+            "![a](b.png){width=200}"
+        );
+        // The `px` unit form is replaced too.
+        assert_eq!(
+            set_image_width("![a](b.png){width=320px}", 200),
+            "![a](b.png){width=200}"
+        );
+        // List-item image: the leading marker is preserved, attr lands after `)`.
+        assert_eq!(
+            set_image_width("- ![](x){width=10}", 50),
+            "- ![](x){width=50}"
+        );
+        // Trailing whitespace is preserved (attr lands before it).
+        assert_eq!(
+            set_image_width("![a](b.png)  ", 80),
+            "![a](b.png){width=80}  "
+        );
+        // Not an image row: returned unchanged.
+        assert_eq!(set_image_width("just text", 100), "just text");
+    }
+
+    // --- RTL row geometry (#66) ---------------------------------------------
+
+    use super::{checkbox_x, px, row_of_spans, rtl_marker_x, rtl_shift};
+
+    #[test]
+    fn a_caret_offset_lands_on_the_row_that_holds_it() {
+        // Three rows: "0..5", "5..11", "11..14" — contiguous, reading order.
+        let rows = || [(0usize, 5usize), (5, 6), (11, 3)].into_iter();
+        assert_eq!(row_of_spans(rows(), 0), (0, 0));
+        assert_eq!(row_of_spans(rows(), 4), (0, 4));
+        // A boundary belongs to the row that STARTS there, not the one ending.
+        assert_eq!(row_of_spans(rows(), 5), (1, 0));
+        assert_eq!(row_of_spans(rows(), 12), (2, 1));
+        // The caret sits one past the last character after typing at the end
+        // of a paragraph: it must stay on the last row, not fall off.
+        assert_eq!(row_of_spans(rows(), 14), (2, 3));
+        assert_eq!(row_of_spans(rows(), 99), (2, 88));
+        // No rows at all (an empty line) is row 0.
+        assert_eq!(row_of_spans([].into_iter(), 0), (0, 0));
+    }
+
+    #[test]
+    fn rtl_shift_mirrors_the_row_inset() {
+        // Plain paragraph (no inset): the text's right edge meets the content
+        // edge, so the shift is all the slack.
+        assert_eq!(rtl_shift(px(500.), px(0.), px(200.)), px(300.));
+        // Inset row (a list item / blockquote body): callers add the shift to
+        // an origin they already inset, so the doubled inset leaves the SAME
+        // gap on the right that an LTR row gets on the left.
+        assert_eq!(rtl_shift(px(500.), px(24.), px(200.)), px(252.));
+        assert_eq!(px(24.) + rtl_shift(px(500.), px(24.), px(200.)), px(276.));
+        // …i.e. text spans 276..476, exactly 24 in from the right edge.
+        // Text that fills or overflows the row wraps, and every wrap row starts
+        // at the left edge — no shift, never a negative one.
+        assert_eq!(rtl_shift(px(500.), px(0.), px(500.)), px(0.));
+        assert_eq!(rtl_shift(px(500.), px(0.), px(900.)), px(0.));
+        assert_eq!(rtl_shift(px(100.), px(60.), px(50.)), px(0.));
+    }
+
+    #[test]
+    fn rtl_markers_mirror_to_the_right_edge() {
+        // A bullet 8px wide at x=10 lands 10 in from the right edge instead.
+        assert_eq!(rtl_marker_x(px(500.), px(10.), px(8.)), px(482.));
+        // Nesting is preserved: a deeper level (larger x) indents further FROM
+        // THE RIGHT, so the levels keep their order.
+        let l1 = rtl_marker_x(px(500.), px(10.), px(8.));
+        let l2 = rtl_marker_x(px(500.), px(34.), px(8.));
+        assert!(l2 < l1, "level 2 must sit further in from the right");
+        assert_eq!(l1 - l2, px(24.), "the indent step survives the mirror");
+        // Never off the left edge, however wide the marker.
+        assert_eq!(rtl_marker_x(px(20.), px(10.), px(40.)), px(0.));
+        // The checkbox shares that math, and an LTR row is untouched.
+        assert_eq!(checkbox_x(px(10.), px(12.), px(500.), true), px(478.));
+        assert_eq!(checkbox_x(px(10.), px(12.), px(500.), false), px(10.));
+    }
+
+    // --- RTL table placement (#66) ------------------------------------------
+
+    use super::tables::{TABLE_GUTTER, table_left_x, table_visible_band};
+
+    /// The note column used throughout: origin 100, width 500 → the LTR band
+    /// is 122..600 and the RTL band 100..578, both `TABLE_GUTTER` wide.
+    const O: f32 = 100.;
+    const W: f32 = 500.;
+
+    #[test]
+    fn an_rtl_table_hugs_the_right_edge_with_the_gutter_mirrored() {
+        let g = TABLE_GUTTER;
+        // A table narrower than the column: LTR starts a gutter in from the
+        // left, RTL *ends* a gutter in from the right.
+        let ltr = table_left_x(px(O), px(W), px(300.), px(0.), false);
+        let rtl = table_left_x(px(O), px(W), px(300.), px(0.), true);
+        assert_eq!(ltr, px(O + g));
+        assert_eq!(rtl + px(300.), px(O + W - g), "right edge, one gutter in");
+        // The two are mirror images about the column's centre.
+        assert_eq!(
+            f32::from(ltr - px(O)),
+            f32::from(px(O + W) - (rtl + px(300.)))
+        );
+        // Column widths don't move an LTR table but do move an RTL one — it is
+        // anchored at its trailing edge.
+        assert_eq!(
+            table_left_x(px(O), px(W), px(120.), px(0.), false),
+            px(O + g)
+        );
+        assert_eq!(
+            table_left_x(px(O), px(W), px(120.), px(0.), true),
+            px(O + W - g - 120.)
+        );
+    }
+
+    #[test]
+    fn a_wide_table_scrolls_to_its_own_far_edge_either_way() {
+        let g = TABLE_GUTTER;
+        let total = px(900.);
+        let avail = px(W - g); // what `table_sx` clamps against
+        let max = total - avail;
+        // Unscrolled, each direction shows its own leading edge at the gutter.
+        assert_eq!(table_left_x(px(O), px(W), total, px(0.), false), px(O + g));
+        assert_eq!(
+            table_left_x(px(O), px(W), total, px(0.), true) + total,
+            px(O + W - g)
+        );
+        // Fully scrolled, each shows its trailing edge at the band's far side:
+        // LTR's right edge reaches the column's right, RTL's left edge the left.
+        assert_eq!(
+            table_left_x(px(O), px(W), total, max, false) + total,
+            px(O + W)
+        );
+        assert_eq!(table_left_x(px(O), px(W), total, max, true), px(O));
+        // Scroll moves the content in OPPOSITE directions — why the wheel and
+        // the thumb's `factor` invert their sign on an RTL table.
+        let step = px(50.);
+        assert!(table_left_x(px(O), px(W), total, step, false) < px(O + g));
         assert!(
-            text.contains("    XYZprivate int x;"),
-            "插入应落在该行 {local_b} 字节处：{text:?}"
+            table_left_x(px(O), px(W), total, step, true)
+                > table_left_x(px(O), px(W), total, px(0.), true)
         );
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
-        assert_eq!(caret, line.base + local_b + 3, "光标推进 3 字节");
-        cx.update(|_, cx| assert_caret_pinned(&code, cx, line.base, local_b + 3, "输入后"));
     }
 
-    /// 代码块行内「退格/方向键」编辑不改动字节语义，光标依旧钉在文本。
-    #[gpui::test]
-    fn live_edit_code_line_backspace_keeps_caret_aligned(cx: &mut TestAppContext) {
-        let src = "```java\nString a = \"hello\";\n```\n";
-        let (host, cx) = open_live(cx, src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-        let segs = cx.update(|_, cx| code_segs(&code, cx));
-        let seg = segs[0].clone();
-        let local_b = 9usize; // '=' 附近
-        let x_for_b = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base == seg.base && s.line.is_some()).unwrap();
-            s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-        });
-        cx.simulate_mouse_down(
-            point(px(seg.x + x_for_b), px(seg.top + 2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.run_until_parked();
-        // 输入一个字符，再退格删掉——文本回到原样，光标回到原字节。
-        cx.simulate_input(".");
-        cx.run_until_parked();
-        cx.simulate_keystrokes("backspace");
-        cx.run_until_parked();
-        let text = cx.update(|_, cx| buffer_text(&code, cx));
-        assert_eq!(text, src, "退格后文本应复原");
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
-        assert_eq!(caret, seg.base + local_b, "退格后光标应回到原字节位置");
-        cx.update(|_, cx| assert_caret_pinned(&code, cx, seg.base, local_b, "退格后"));
-    }
-
-    /// 无语言标签的围栏（``` 后无内容）：布局不得多占一个「幽灵语言头」行，
-    /// 否则点击第一行代码会落到围栏/上一行 → 输入错位（回归护栏）。
-    #[gpui::test]
-    fn live_edit_code_block_without_language_is_aligned(cx: &mut TestAppContext) {
-        for eol in ["\n", "\r\n"] {
-            let mut src = String::new();
-            src.push_str("```");
-            src.push_str(eol);
-            src.push_str("printf(1);");
-            src.push_str(eol);
-            src.push_str("printf(2);");
-            src.push_str(eol);
-            src.push_str("```");
-            src.push('\n');
-
-            let (host, cx) = open_live(cx, &src);
-            let code = cx.update(|_, cx| host.read(cx).live.clone());
-            let segs = cx.update(|_, cx| code_segs(&code, cx));
-            assert!(
-                segs.len() == 2,
-                "[{eol:?}] 无语言块应只有 2 个代码行段，实际 {}：{segs:?}",
-                segs.len()
-            );
-
-            // 点击第一行正文中间 → 光标必须落在该行（base+local），不能落到围栏。
-            let local_b = 4usize;
-            let base0 = segs[0].base;
-            cx.simulate_mouse_down(
-                point(px(segs[0].x), px(segs[0].top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(caret, segs[0].base, "[{eol:?}] 点行首应 = base({})，实际 {caret}", segs[0].base);
-            let x4 = cx.update(|_, cx| {
-                let v = code.read(cx);
-                let segs = v.segs.borrow();
-                let s = segs.iter().find(|s| s.base == base0 && s.line.is_some()).unwrap();
-                s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-            });
-            cx.simulate_mouse_down(
-                point(px(segs[0].x + x4), px(segs[0].top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(
-                caret, segs[0].base + local_b,
-                "[{eol:?}] 横向点击应 = base+{local_b}，实际 {caret}"
-            );
-            cx.update(|_, cx| assert_caret_pinned(&code, cx, segs[0].base, local_b, "无语言块"));
-        }
-    }
-
-    /// 编辑后、下一帧渲染前，输入系统同步查询的光标 bounds 必须基于**当前**布局：
-    /// 编辑已重解析（清空 `segs`），若直接用空/过期几何，光标会消失/跳走 →
-    /// 「闪烁光标与输入实际位置不匹配」。此处复现并回归。
-    #[gpui::test]
-    fn live_edit_ime_caret_bounds_fresh_after_edit_before_render(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n```rust\nlet x = 1;\n```\n";
-        let (host, cx) = open_live(cx, src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        // 点击进入代码行第 local_b 字节（用已渲染的几何）。
-        let local_b = 4usize; // 'x'
-        let x4 = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base > 0 && s.line.is_some()).unwrap();
-            s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-        });
-        let seg = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base > 0 && s.line.is_some()).unwrap();
-            CodeSeg {
-                base: s.base,
-                text_len: s.text_len,
-                x: s.x,
-                top: s.top,
-                height: s.height,
-            }
-        });
-        cx.simulate_mouse_down(
-            point(px(seg.x + x4), px(seg.top + 2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.run_until_parked();
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
-        assert_eq!(caret, seg.base + local_b, "点击应落在代码行内");
-
-        // 模拟击键的同步路径：走真实输入方法（apply_edit → reparse → 清空 segs），
-        // **不刷新/不重渲染**，紧接查询 IME 光标 bounds——平台正是这样做的。
-        let mut bounds = cx.update(|window, cx| {
-            let live_ent = host.read(cx).live.clone();
-            live_ent.update(cx, |v, cx| {
-                let sel = v.selection;
-                let r = v.buffer.byte_to_utf16(sel.start())..v.buffer.byte_to_utf16(sel.end());
-                v.replace_text_in_range(Some(r), "AB", window, cx);
-                let sel2 = v.selection;
-                let r2 = v.buffer.byte_to_utf16(sel2.start())..v.buffer.byte_to_utf16(sel2.end());
-                v.bounds_for_range(r2, Bounds::default(), window, cx)
-            })
-        });
-        let b = bounds.take().expect("编辑后（未重渲染）光标 bounds 不应为空");
-        // 断言：bounds 不在兜底（文档末尾），而是当前代码行的正确位置。
-        let (x, y) = (b.origin.x.as_f32(), b.origin.y.as_f32());
-        let expect = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base == seg.base && s.line.is_some()).expect("重排后仍有该行");
-            let xb = s.line.as_ref().unwrap().x_for_index((local_b + 2).min(s.text_len)).as_f32();
-            // element_bounds.origin = 窗口内 (0,0)，scroll_y=0 → bounds=(x, top)
-            (s.x + xb, s.top)
-        });
-        assert!(
-            (x - expect.0).abs() < 1.0 && (y - expect.1).abs() < 1.0,
-            "编辑后光标 bounds ({x:.1},{y:.1}) 应与当前几何 ({:.1},{:.1}) 一致，不得跳走",
-            expect.0,
-            expect.1
-        );
-        assert!(y >= 0.0 && y < 600.0, "光标 y 应在视口内（没掉到文档末尾兜底）：{y:.1}");
-    }
-
-    /// IME 组合（input-mark）路径：平台在「每次组合更新 / 每次输入法 push」时都会以
-    /// 当前选区查询光标 bounds（`selected_bounds` 优先取 marked range）。组合中
-    /// `marked_range` 已设置、光标 = 组合文本末尾；此刻查询 bounds 必须直接落在
-    /// 组合文本的末尾（下一字符输入处），不得回到组合前 / 兜底位置——否则候选窗、
-    /// 闪烁光标、实际输入位置三者即错位。
-    #[gpui::test]
-    fn live_edit_ime_marked_bounds_chase_composition_caret(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n```rust\nlet x = 1;\n```\n";
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        // 点击进入代码行第 local_b 字节。
-        let local_b = 4usize; // 'x'
-        let (seg_x, seg_top, x_for_b) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base > 0 && s.line.is_some()).unwrap();
-            let seg = CodeSeg { base: s.base, text_len: s.text_len, x: s.x, top: s.top, height: s.height };
-            (seg.x, seg.top, s.line.as_ref().unwrap().x_for_index(local_b).as_f32())
-        });
-        cx.simulate_mouse_down(point(px(seg_x + x_for_b), px(seg_top + 2.0)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let caret_byte = cx.update(|_, cx| code.read(cx).selection.head());
-        assert!(caret_byte > 0, "点击应落在代码行内");
-        let line_base = caret_byte - local_b;
-
-        // 模拟两次 input-mark（组合 pinyin "zhe'li"），每次 marker 更新后随即模拟
-        // `selected_bounds` 的查询（用当前 marked range 的 utf16 区间）：
-        // bounds 原点贴在「组合起点」，宽度覆盖整段组合文本到其末尾（同行时）——
-        // 候选窗锚在组合文本下方而不是一根零宽竖条（对齐 zorite/gpui-editor）。
-        for marks in ["z", "zhe'li"] {
-            let bounds = cx.update(|window, cx| {
-                let live_ent = host.read(cx).live.clone();
-                live_ent.update(cx, |v, cx| {
-                    let sel = v.selection;
-                    let r = v.buffer.byte_to_utf16(sel.start())..v.buffer.byte_to_utf16(sel.end());
-                    v.replace_and_mark_text_in_range(Some(r), marks, None, window, cx);
-                    let marked = v.marked_text_range(window, cx).expect("组合中应有 marked range");
-                    v.bounds_for_range(marked, Bounds::default(), window, cx)
+    #[test]
+    fn rtl_mirrors_the_column_order() {
+        use super::tables::{cell_span_width, col_offset};
+        // Three columns, 10/20/30 wide. Left to right they start at 0/10/30;
+        // mirrored, column 0 is the RIGHTMOST, so it starts at 50.
+        let w = [px(10.), px(20.), px(30.)];
+        assert_eq!(col_offset(&w, 3, 0, false), px(0.));
+        assert_eq!(col_offset(&w, 3, 1, false), px(10.));
+        assert_eq!(col_offset(&w, 3, 2, false), px(30.));
+        assert_eq!(col_offset(&w, 3, 0, true), px(50.));
+        assert_eq!(col_offset(&w, 3, 1, true), px(30.));
+        assert_eq!(col_offset(&w, 3, 2, true), px(0.));
+        // Either way the columns tile the table with no gap or overlap — paint,
+        // caret and hit-testing all read this, so a gap is a mis-click.
+        for rtl in [false, true] {
+            let mut spans: Vec<(f32, f32)> = (0..3)
+                .map(|c| {
+                    let x = f32::from(col_offset(&w, 3, c, rtl));
+                    (x, x + f32::from(cell_span_width(&w, 3, c)))
                 })
-            });
-            let b = bounds.expect("组合中光标 bounds 不应为空");
-            let (bx, by, bw) = (b.origin.x.as_f32(), b.origin.y.as_f32(), b.size.width.as_f32());
-            let (sx, sy, ex) = cx.update(|_, cx| {
-                let v = code.read(cx);
-                let segs = v.segs.borrow();
-                // marked_range 是当前组合的字节区间（相对 line_base 的索引即该行字符位）。
-                let mr = v.marked_range.clone().expect("组合范围");
-                let s = segs.iter().find(|s| s.base == line_base && s.line.is_some()).expect("重排后仍有该行");
-                let l = s.line.as_ref().unwrap();
-                let i_s = (mr.start - line_base).min(s.text_len);
-                let i_e = (mr.end - line_base).min(s.text_len);
-                (
-                    s.x + l.x_for_index(i_s).as_f32(),
-                    s.top,
-                    s.x + l.x_for_index(i_e).as_f32(),
-                )
-            });
-            assert!(
-                (bx - sx).abs() < 1.0 && (by - sy).abs() < 1.0,
-                "input-mark {marks:?} 后光标 bounds 原点 ({bx:.1},{by:.1}) 应贴组合起点 ({sx:.1},{sy:.1})"
-            );
-            assert!(
-                (bw - (ex - sx)).abs() < 1.0,
-                "input-mark {marks:?} 后光标 bounds 宽 {bw:.1} 应覆盖组合文本 {:.1}px（起点 {sx:.1}→终点 {ex:.1}）",
-                ex - sx
-            );
+                .collect();
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(spans[0].0, 0.0);
+            assert_eq!(spans[2].1, 60.0);
+            assert!(spans.windows(2).all(|s| s[0].1 == s[1].0), "{spans:?}");
         }
     }
 
-    /// 调试覆盖层的数据记录：点击后 `click_content`（绿点）、IME 查询后 `ime_content`
-    /// （红框）必须落在与命中一致的段几何上——覆盖层本身不引入坐标偏差。
-    #[gpui::test]
-    fn debug_ime_overlay_records_click_and_ime(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n```rust\nlet x = 1;\n```\n";
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        let local_b = 4usize;
-        let (seg_x, seg_top, xb4) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base > 0 && s.line.is_some()).unwrap();
-            let l = s.line.as_ref().unwrap();
-            (s.x, s.top, l.x_for_index(local_b).as_f32())
-        });
-        cx.simulate_mouse_down(
-            point(px(seg_x + xb4), px(seg_top + 2.0)),
-            MouseButton::Left,
-            Modifiers::default(),
-        );
-        cx.run_until_parked();
-        let (click, ime) = cx.update(|window, cx| {
-            let live_ent = host.read(cx).live.clone();
-            live_ent.update(cx, |v, cx| {
-                let click = v.click_content;
-                let sel = v.selection;
-                let r = v.buffer.byte_to_utf16(sel.start())..v.buffer.byte_to_utf16(sel.end());
-                let _ = v.bounds_for_range(r, Bounds::default(), window, cx);
-                (click, v.ime_content)
-            })
-        });
-        let (cx, cy) = click.expect("点击后应记录 click_content（滚动=0，内容坐标）");
-        assert!(
-            (cx - (seg_x + xb4)).abs() < 1.0 && (cy - (seg_top + 2.0)).abs() < 1.0,
-            "click 绿点 ({cx:.1},{cy:.1}) 应贴点击点 ({:.1},{:.1})",
-            seg_x + xb4,
-            seg_top + 2.0
-        );
-        let (ix, iy, iw, _ih) = ime.expect("IME 查询后应记录 ime_content");
-        assert!(
-            (ix - (seg_x + xb4)).abs() < 1.0 && (iy - seg_top).abs() < 1.0,
-            "IME 红框 ({ix:.1},{iy:.1}) 应贴光标 ({:.1},{:.1})",
-            seg_x + xb4,
-            seg_top
-        );
-        assert!(iw >= 1.0, "IME 红框宽应是零宽光标条：{iw:.1}");
-    }
-
-    /// 行尾/空行钳制的"点击幽灵条"：点文字中间不出现；点行尾之后的空白出现
-    /// （说明插入在行尾），不改变插入位置。
-    #[gpui::test]
-    fn live_edit_click_ghost_only_on_eol_clamp(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n```rust\nlet x = 1;\n```\n正文好\n";
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        // 找第一个含文字的行段，点文字中间 → 无幽灵。
-        let (seg_x, seg_top, xb, tlen) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.line.is_some() && s.text_len > 4).unwrap();
-            let l = s.line.as_ref().unwrap();
-            (s.x, s.top, l.x_for_index(1).as_f32(), s.text_len)
-        });
-        let _ = tlen;
-        cx.simulate_mouse_down(point(px(seg_x + xb), px(seg_top + 2.0)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        assert!(
-            cx.update(|_, cx| code.read(cx).click_ghost.is_none()),
-            "点文字中间不应出现幽灵条"
-        );
-
-        // 点该行文字之后很远 → 出现幽灵，且光标仍在行内（没挪到点击处）。
-        let (line_end_x, line_w) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.map.is_none() && s.line.is_some() && s.text_len > 4).unwrap();
-            let l = s.line.as_ref().unwrap();
-            (s.x + l.x_for_index(s.text_len).as_f32(), l.width().as_f32())
-        });
-        cx.simulate_mouse_down(point(px(line_end_x + line_w * 0.25), px(seg_top + 2.0)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let ghost = cx.update(|_, cx| code.read(cx).click_ghost).expect("行尾之后点击应出现幽灵条");
-        assert!(ghost.0 > line_end_x, "幽灵条应收在点击处（>行尾 {line_end_x:.1}）：x={:.1}", ghost.0);
-    }
-
-    /// 决定性：逐行读取 GPUI **实际绘制**的行 bounds（`md-row-{ix}` debug_selector），
-    /// 与 `segs` 的行 top 逐一对比。这是唯一能区分「算法自洽但绘制在别处」和
-    /// 「算法正确且绘制正确」的检查——此前只比对了总量（内容总高），不够。
-    #[gpui::test]
-    fn debug_painted_row_tops_match_segs(cx: &mut TestAppContext) {
-        let path = std::path::Path::new("target/md测试.md");
-        let src = if path.exists() {
-            std::fs::read_to_string(path).unwrap()
-        } else {
-            "# 标题\n\n正文段落，用于 painted 对齐核对，再加一些文字让它足够长以便换行。\n\n```rust\nlet a = 1;\n```\n\n> 引用行\n\n结尾\n".to_string()
-        };
-        let (host, mut cx) = open_live(cx, &src);
-        // open_live 装置下稳定收敛的宽度（900 默认 / 934.3 用户 trace 宽）。
-        // 全屏 2148.6 由 `debug_wrapped_row_painted_h_vs_seg_total` 的「全新视图」
-        // 分支以行级核对覆盖（手动建窗换宽在 harness 里有 paint/segs 时序假象）。
-        for w in [900.0f32, 934.3] {
-            cx.simulate_resize(size(px(w), px(760.)));
-            for _ in 0..4 {
-                cx.run_until_parked();
-                let _ = cx.cx.refresh();
-            }
-            cx.run_until_parked();
-            // 每行：可命中区 = min(top)-band  … max(top+h)+band（引述带上下 3px 含内衬）。
-            let rows: Vec<(usize, f32, f32)> = cx.update(|_, cx| {
-                let v = host.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                let mut by_row: std::collections::BTreeMap<usize, (f32, f32)> = Default::default();
-                for s in segs.iter() {
-                    let e = by_row.entry(s.row_ix).or_insert((f32::MAX, f32::MIN));
-                    e.0 = e.0.min(s.top);
-                    e.1 = e.1.max(s.top + s.height);
-                }
-                let live = &v.live;
-                by_row
-                    .into_iter()
-                    .map(|(rix, (t0, t1))| {
-                        let q = match live.get(rix).map(|lr| lr.row.kind) {
-                            Some(RowKind::Quote) => BAND_PY,
-                            _ => 0.0,
-                        };
-                        (rix, t0 - q, t1 + q)
-                    })
-                    .collect()
-            });
-            let mut checked = 0usize;
-            let mut max_d = 0.0f32;
-            let mut max_dh = 0.0f32;
-            for &(rix, hit_top, hit_bot) in rows.iter() {
-                let key: &'static str = Box::leak(format!("md-row-{rix}").into_boxed_str());
-                let Some(b) = cx.debug_bounds(key) else { continue };
-                let (pt, ph) = (b.origin.y.as_f32(), b.size.height.as_f32());
-                let ht = hit_top;
-                let hh = hit_bot - hit_top;
-                let d = (pt - ht).abs();
-                let dh = (ph - hh).abs();
-                max_d = max_d.max(d);
-                max_dh = max_dh.max(dh);
-                eprintln!(
-                    "PAINT w={w} row={rix} hit=(top {ht:.2}, h {hh:.2}) painted=(top {pt:.2}, h {ph:.2}) dTop={d:.2} dH={dh:.2}"
-                );
-                checked += 1;
-                if checked >= 80 {
-                    break;
-                }
-            }
-            eprintln!("PAINT w={w} checked={checked} max|ΔpaintedTop| = {max_d:.2}px  max|ΔH| = {max_dh:.2}px");
-            assert!(
-                checked >= 20,
-                "w={w}: 至少应核对到 20 个被绘制的行，实际 {checked}"
-            );
-            assert!(
-                max_d < 2.0 && max_dh < 2.0,
-                "w={w}: 行级可命中区与绘制不一致：Δtop={max_d:.2}px ΔH={max_dh:.2}px → 算法对但绘制错"
-            );
-        }
-    }
-
-    /// 复现用户新症状：滚动后点击 + 输入 + 多帧，看 `v_handle.offset()` 是否被
-    /// 自动滚回顶部（trace 里 scroll 5845→0、每 os-caret 查询后 −≈1040）。
-    #[gpui::test]
-    fn debug_scroll_does_not_drift_on_edit(cx: &mut TestAppContext) {
-        let mut src = String::new();
-        for i in 0..400 {
-            src.push_str(&format!("第 {i} 段正文足够长用于滚动与编辑并存。\n\n"));
-        }
-        let (host, mut cx) = open_live(cx, &src);
-        // 滚到中部。
-        let scroll_to = 3000.0f32;
-        cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            v.v_handle.set_offset(point(px(0.0), px(-scroll_to)));
-        });
-        for _ in 0..4 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        let off0 = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            (-v.v_handle.offset().y.as_f32()).max(0.0)
-        });
-        eprintln!("SCROLLDRIFT offset_before_click={off0:.1} (want {scroll_to})");
-        // 在一个可见行中部点击，再输入一个字符，跑 8 帧看滚动是否漂。
-        let pt = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs
-                .iter()
-                .find(|s| s.top + s.height >= scroll_to + 200.0 && s.line.is_some())
-                .unwrap();
-            let l = s.line.as_ref().unwrap();
-            gpui::Point::new(px(s.x + l.x_for_index(2).as_f32()), px(s.top - scroll_to + 2.0))
-        });
-        cx.simulate_mouse_down(pt, MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let caret = cx.update(|_, cx| host.read(cx).live.read(cx).selection.head());
-        cx.update(|window, cx| {
-            let live_ent = host.read(cx).live.clone();
-            live_ent.update(cx, |v, cx| {
-                let r = v.buffer.byte_to_utf16(caret)..v.buffer.byte_to_utf16(caret);
-                v.replace_text_in_range(Some(r), "1", window, cx);
-            })
-        });
-        for _ in 0..8 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        let off1 = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            (-v.v_handle.offset().y.as_f32()).max(0.0)
-        });
-        eprintln!("SCROLLDRIFT offset_after_edit_8fr={off1:.1}");
-        assert!(
-            (off1 - off0).abs() < 64.0,
-            "编辑后滚动漂移 {off0:.1}→{off1:.1}px：与用户 trace（scroll 5845→0）同类"
-        );
-    }
-
-    /// 空行「插入列」真 WYSIWYG：点空行 → 光标/IME 显示在点击列；首次输入先补空格
-    /// 到该列再插字符，字符落在点击处；输入后目标列清除。
-    #[gpui::test]
-    fn live_edit_empty_line_goal_column_wysiwyg(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n正文段落内容。\n\n结束。\n";
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-        let (row, top, seg_x) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.line.is_none() && s.text_len == 0).unwrap();
-            (s.row_ix, s.top, s.x)
-        });
-        assert_eq!(seg_x, 12.0, "空行段应从左缘 x=12 开始");
-
-        // 在空行中靠右处点击。
-        let click_x = seg_x + 80.0;
-        cx.simulate_mouse_down(point(px(click_x), px(top + 2.0)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let g = cx.update(|_, cx| code.read(cx).goal).expect("空行点击应设置插入列");
-        assert_eq!(g.0, row, "目标行=空行");
-        let gx = g.1;
-        assert!((gx - click_x).abs() < 1.0, "目标 x=点击 x（{gx:.1} vs {click_x:.1}）");
-        let space_w = g.2;
-        assert!(space_w > 1.0, "空格宽应 >1（{space_w:.2}）");
-
-        // 首次输入前，IME bounds 也在点击列。
-        let b = cx.update(|window, cx| {
-            let e = host.read(cx).live.clone();
-            e.update(cx, |v, cx| {
-                let sel = v.selection;
-                let r = v.buffer.byte_to_utf16(sel.start())..v.buffer.byte_to_utf16(sel.end());
-                v.bounds_for_range(r, Bounds::default(), window, cx)
-            })
-        });
-        let bx = b.expect("空行光标 bounds").origin.x.as_f32();
-        assert!((bx - click_x).abs() < 1.5, "IME bounds 应在点击列（{bx:.1} vs {click_x:.1}）");
-
-        // 输入 "a"：先补空格到点击列再插字符。
-        let caret_before = cx.update(|_, cx| code.read(cx).selection.head());
-        cx.update(|window, cx| {
-            let e = host.read(cx).live.clone();
-            e.update(cx, |v, cx| {
-                let r = v.buffer.byte_to_utf16(caret_before)..v.buffer.byte_to_utf16(caret_before);
-                v.replace_text_in_range(Some(r), "a", window, cx);
-            })
-        });
-        cx.run_until_parked();
-        let (txt, caret, goal) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            (
-                v.buffer.text_in_range(caret_before..v.selection.head()).to_string(),
-                v.selection.head(),
-                v.goal,
-            )
-        });
-        let col = (80.0 / space_w).floor().max(0.0) as usize;
+    #[test]
+    fn the_visible_band_is_the_column_less_its_gutter() {
+        let g = TABLE_GUTTER;
         assert_eq!(
-            txt,
-            format!("{:padding$}a", "", padding = col),
-            "首次输入应补 {col} 个空格再放 a（补空格到点击列）"
+            table_visible_band(px(O), px(W), false),
+            (px(O + g), px(O + W))
         );
-        assert_eq!(caret, caret_before + col + 1, "光标落在点击列字符之后");
-        assert!(goal.is_none(), "输入后目标列清除");
-    }
-
-    /// 决定性复现：**IME 组合路径**（`replace_and_mark_text_in_range`，中文输入法
-    /// 打拼音走的是这条，不是 `replace_text_in_range`）也必须走「空行插入列」。
-    /// 现状（bug）：点空行某列 → goal 已设 → 打一个拼音，组合文本落在**行首**（列 0），
-    /// 光标/IME 却在点击列 → 「点这里、字进那里」、越往下越明显。断言组合文本补空格到
-    /// 点击列、marked 区间覆盖补齐后的区域、光标落在点击列、目标列被消费。
-    #[gpui::test]
-    fn live_edit_empty_line_goal_column_wysiwyg_ime_composition(cx: &mut TestAppContext) {
-        let src = "# 标题\n\n正文段落内容。\n\n结束。\n";
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-        let (row, top, seg_x) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.line.is_none() && s.text_len == 0).unwrap();
-            (s.row_ix, s.top, s.x)
-        });
-        // 空行中靠右处点击 → 目标列。
-        let click_x = seg_x + 80.0;
-        cx.simulate_mouse_down(point(px(click_x), px(top + 2.0)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let g = cx.update(|_, cx| code.read(cx).goal).expect("空行点击应设置插入列");
-        assert_eq!(g.0, row, "目标行=空行");
-        assert!((g.1 - click_x).abs() < 1.0, "目标 x=点击 x");
-        let space_w = g.2;
-        let col = (80.0 / space_w).floor().max(0.0) as usize;
-
-        // IME 组合第一键（走 replace_and_mark_text_in_range，与中文输入法一致）。
-        let caret_before = cx.update(|_, cx| code.read(cx).selection.head());
-        cx.update(|window, cx| {
-            let e = host.read(cx).live.clone();
-            e.update(cx, |v, cx| {
-                let r = v.buffer.byte_to_utf16(caret_before)..v.buffer.byte_to_utf16(caret_before);
-                v.replace_and_mark_text_in_range(Some(r), "n", None, window, cx);
-            })
-        });
-        cx.run_until_parked();
-        let (txt, caret, goal, marked) = cx.update(|_, cx| {
-            let v = code.read(cx);
-            (
-                v.buffer.text_in_range(caret_before..v.selection.head()).to_string(),
-                v.selection.head(),
-                v.goal,
-                v.marked_range.clone(),
-            )
-        });
-        // 组合文本也应补空格到点击列（真 WYSIWYG：组合窗/候选窗在点击列）。
         assert_eq!(
-            txt,
-            format!("{:padding$}n", "", padding = col),
-            "IME 组合首键应补 {col} 空格再放 n（组合文本在点击列而非行首），实际 {txt:?}"
+            table_visible_band(px(O), px(W), true),
+            (px(O), px(O + W - g))
         );
-        assert_eq!(caret, caret_before + col + 1, "组合光标应落在点击列之后");
-        assert!(marked == Some(caret_before..caret_before + col + 1), "marked 区间应覆盖补齐区域：{marked:?}");
-        assert!(goal.is_none(), "组合首键后目标列应被消费");
-        // 渲染：组合光标 x 应明显右移出「行首」落在点击列附近（真机 1.75x 已实测：
-        // 点列 454 → 组合光标 457.5，逐字符与 click x 重合）。简单小文档里行尾
-        // 哨兵的 x 还原允许 ±0.4 列容差，但绝不能落回行首。
-        let row_left = 0.0;
-        let caret_x = cx.update(|_, cx| {
-            let v = code.read(cx);
-            v.caret_point().map(|(_, x, _, _)| x).unwrap()
-        });
-        assert!(
-            caret_x > row_left + 10.0 && caret_x < click_x + 25.0,
-            "组合光标 x={caret_x:.1} 应落在点击列附近（>行首 {row_left}、<点列 {click_x}+25），实际落在错误的位置"
-        );
-    }
-
-    /// 调试实验：把 live 视图放进「左侧 200px 侧栏 + 右侧 editor」的类 app 布局，
-    /// 查 `element_bounds.origin` 到底是窗口绝对坐标（期待 x=200）还是相对坐标。
-    #[gpui::test]
-    fn debug_bounds_origin_with_sidebar(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let src = "# 标题\n\n```rust\nlet x = 1;\n```\n";
-        let live = cx.update(|cx| cx.new(|cx| MarkdownLivePreview::new(src, cx)));
-        let (host, cx) = cx.add_window_view(|_window, _cx| SidebarHost {
-            live: live.clone(),
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.simulate_resize(size(px(900.), px(600.)));
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
+        // Both bands are the `avail` width the scroll clamp assumes.
+        for rtl in [false, true] {
+            let (l, r) = table_visible_band(px(O), px(W), rtl);
+            assert_eq!(r - l, px(W - g));
         }
-        cx.run_until_parked();
-        let (origin, w) = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            (v.element_bounds.origin, v.element_bounds.size.width)
-        });
-        eprintln!("DEBUG element_bounds.origin={:?} width={:?}", origin, w);
-        let x_abs = origin.x.as_f32();
-        assert!(
-            (x_abs - 200.0).abs() < 1.0,
-            "element_bounds.origin.x 应是窗口绝对坐标 ≈200（实测 {x_abs:.1}）"
-        );
-        let seg = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base > 0 && s.line.is_some()).unwrap();
-            CodeSeg { base: s.base, text_len: s.text_len, x: s.x, top: s.top, height: s.height }
-        });
-        let x4 = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base == seg.base && s.line.is_some()).unwrap();
-            s.line.as_ref().unwrap().x_for_index(4).as_f32()
-        });
-        let win_x = 200.0 + seg.x + x4;
-        let win_y = seg.top + 2.0;
-        cx.simulate_mouse_down(point(px(win_x), px(win_y)), MouseButton::Left, Modifiers::default());
-        cx.run_until_parked();
-        let caret = cx.update(|_, cx| host.read(cx).live.read(cx).selection.head());
-        assert_eq!(caret, seg.base + 4, "侧栏偏移后点击仍应精确映射到该字符");
-    }
-
-    /// 调试实验：滚动后点击/光标/bounds 三者的坐标换算（直接设定滚动偏移并直调
-    /// `on_mouse_down`，验证「窗口坐标 + 滚动 → 内容坐标 → 字节」与 bounds 对称）。
-    #[gpui::test]
-    fn debug_scrolled_click_and_caret(cx: &mut TestAppContext) {
-        let mut src = String::new();
-        for i in 0..40 {
-            src.push_str(&format!("第 {i} 段正文，用于把内容推高，确保可滚动。\n\n"));
-        }
-        src.push_str("```rust\nlet target = 123;\n```\n");
-        let (host, cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-
-        let code_seg = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.map.is_none() && s.line.is_some()).unwrap();
-            CodeSeg { base: s.base, text_len: s.text_len, x: s.x, top: s.top, height: s.height }
-        });
-        let local_b = 12usize;
-        let x_b = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            let s = segs.iter().find(|s| s.base == code_seg.base && s.line.is_some()).unwrap();
-            s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-        });
-        // 中等滚动（< max_offset，真实用户可达）验证换算对称。
-        let scroll_y = 500.0f32;
-        cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            v.v_handle.set_offset(point(px(0.), px(-scroll_y)));
-        });
-        let win_x = code_seg.x + x_b;
-        let win_y = code_seg.top + 2.0 - scroll_y;
-        eprintln!(
-            "DEBUG code_seg base={} text_len={} x={:.1} top={:.1} scroll_y={scroll_y:.1} click=({win_x:.1},{win_y:.1}) expect byte={}",
-            code_seg.base, code_seg.text_len, code_seg.x, code_seg.top, code_seg.base + local_b
-        );
-        let live_ent = cx.update(|_, cx| host.read(cx).live.clone());
-        let ev = MouseDownEvent {
-            position: point(px(win_x), px(win_y)),
-            modifiers: Modifiers::default(),
-            button: MouseButton::Left,
-            click_count: 1,
-            first_mouse: false,
-        };
-        cx.update(|window, cx| {
-            live_ent.update(cx, |v, cx| v.on_mouse_down(&ev, window, cx));
-        });
-        let caret = cx.update(|_, cx| caret_source(&code, cx));
-        eprintln!("DEBUG caret byte={caret}");
-        assert_eq!(caret, code_seg.base + local_b, "滚动后点击仍应精确映射");
-        // bounds_for_range 也应贴着文本（滚动后）。
-        let (bx, by) = cx.update(|window, cx| {
-            live_ent.update(cx, |v, cx| {
-                let sel = v.selection;
-                let r = v.buffer.byte_to_utf16(sel.start())..v.buffer.byte_to_utf16(sel.end());
-                v.bounds_for_range(r, Bounds::default(), window, cx)
-                    .map(|b| (b.origin.x.as_f32(), b.origin.y.as_f32()))
-            })
-        })
-        .expect("bounds");
-        eprintln!("DEBUG bounds_for_range=({bx:.1},{by:.1})");
-        // 点击点在行内 +2px，光标 bounds 顶对齐行顶：期望 x=段x+字符偏移，y=段top-滚动。
-        let expect_bx = code_seg.x + x_b;
-        let expect_by = code_seg.top - scroll_y;
-        assert!(
-            (bx - expect_bx).abs() < 1.0 && (by - expect_by).abs() < 1.0,
-            "滚动后 bounds 应贴合文本：({bx:.1},{by:.1}) vs 期望 ({expect_bx:.1},{expect_by:.1})"
-        );
-    }
-
-    /// 调试：对比「命中/光标所用的 BODY_FONT=.SystemUIFont 整形」与「渲染 div 实际
-    /// 使用的字形（主题默认 sans）」在混合 CJK/ASCII 文本上的宽度差。
-    #[gpui::test]
-    fn debug_body_font_width_vs_render(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (host, cx) = cx.add_window_view(|_window, cx| {
-            let live = cx.new(|cx| MarkdownLivePreview::new("这段中文 mixed ASCII 与 123 数字。\n", cx));
-            SidebarHost { live }
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.simulate_resize(size(px(900.), px(600.)));
-        for _ in 0..4 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.run_until_parked();
-
-        let text = "这段中文 mixed ASCII 与 123 数字。";
-        let (w_ui, w_sans, samples) = cx.update(|window, cx| {
-            let v = host.read(cx).live.read(cx);
-            let fs = v.p.para_size;
-            let run_ui = gpui::TextRun {
-                len: text.len(),
-                font: font(".SystemUIFont"),
-                color: gpui::Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let theme = gpui_component::Theme::global(cx).semantic_tokens();
-            let sans = theme.typography.sans.clone();
-            let run_sans = gpui::TextRun {
-                len: text.len(),
-                font: font(sans.clone()),
-                color: gpui::Hsla::default(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let ts = window.text_system();
-            let l_ui = ts.shape_line(SharedString::from(text), fs, &[run_ui], None);
-            let l_sans = ts.shape_line(SharedString::from(text), fs, &[run_sans], None);
-            let mut out = String::new();
-            for b in [0usize, 2, 4, 8, 12, 16, 20, text.len() / 2, text.len() - 2, text.len()] {
-                let xu = l_ui.x_for_index(b).as_f32();
-                let xs = l_sans.x_for_index(b).as_f32();
-                out.push_str(&format!("@{} UI={xu:.1} sans={xs:.1} Δ={:.1} | ", b, (xu - xs).abs()));
-            }
-            (l_ui.width().as_f32(), l_sans.width().as_f32(), out)
-        });
-        eprintln!("DEBUG BODY_FONT(.SystemUIFont) vs theme-sans\n  {text}\n  总宽 UI={w_ui:.1} sans={w_sans:.1}\n  {samples}");
-        eprintln!("DEBUG done");
-    }
-
-    /// 关键：**自动换行的段落**在不同视觉行点击时，光标 x 必须 ≈ 点击 x。
-    /// 若换行后第二/三行的点击偏差几十上百 px，就是「越往下/越往右越乱」的根源。
-    #[gpui::test]
-    fn debug_wrapped_paragraph_click_maps(cx: &mut TestAppContext) {
-        // ASCII 为主的超长句，保证在测试字形下也必然换行（>876px），真正走到 wrap 路径。
-        let src = "This is a deliberately long ASCII sentence used to force automatic line wrapping inside the available container width so that we can verify clicking on the second and third visual lines maps the caret back to the exact same horizontal position. Add some more words here to be safe about producing multiple wrapped lines. abc def ghi jkl mno pqr stu vwx yz. \n";
-        let (host, mut cx) = open_live(cx, src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-        let segs = cx.update(|_, cx| {
-            let v = code.read(cx);
-            let segs = v.segs.borrow();
-            segs.iter()
-                .filter(|s| s.line.is_some() && s.text_len > 8)
-                .map(|s| (s.base, s.text_len, s.x, s.top, s.height))
-                .collect::<Vec<_>>()
-        });
-        eprintln!(
-            "DEBUG 段落分段数={}（>1 才是真正的换行路径）段们={segs:?}",
-            segs.len()
-        );
-        assert!(segs.len() >= 2, "测试需要一个真正换行的段落（≥2 段）");
-        // 每个视觉行：点行中央，光标 x 应当回贴点击 x（± 一个字符容差 ~10px）。
-        for (k, &(base, tlen, sx, top, h)) in segs.iter().take(4).enumerate() {
-            let x_query = sx + 60.0;
-            let y_query = top + 3.0;
-            cx.simulate_mouse_down(
-                point(px(x_query), px(y_query)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            let caret_px = cx.update(|_, cx| caret_pixel(&code, cx)).unwrap();
-            let (row, cx_px, cy_px, _) = caret_px;
-            eprintln!(
-                "DEBUG 视觉行{k}: 点(x={x_query:.1},y={y_query:.1}) base={base} len={tlen} -> byte={caret} caret=(row{row} x={cx_px:.1} y={cy_px:.1})"
-            );
-            assert!(
-                (cx_px - x_query).abs() < 40.0,
-                "视觉行 {k}：点击 x={x_query:.1} 但光标回贴 x={cx_px:.1}（差 {:.1}px）→ 换行路径度量错位",
-                (cx_px - x_query).abs()
-            );
-        }
-    }
-
-    /// 决定性复核：`closest_index_for_x`（点击→索引）与 `x_for_index`（索引→x）
-    /// 是否互逆。若 x_for_index(closest(x)) 与 x 相差巨大（几十~上百 px），
-    /// 就是「鼠标点击处 → 光标落位」错位的根源。
-    #[gpui::test]
-    fn debug_closest_index_for_x_roundtrip(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
-            let live = cx.new(|cx| MarkdownLivePreview::new("# 标题\n\n正文开始：this is 一些中文 mixed rem text 用于探测。abc123。\n", cx));
-            SidebarHost { live }
-        });
-        let cx: &mut VisualTestContext = cx;
-        cx.simulate_resize(size(px(900.), px(600.)));
-        for _ in 0..4 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.run_until_parked();
-        let out = cx.update(|window, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            // 找一个含中文+ASCII 的段落段：x 范围越宽越能暴露度量错位。
-            let s = segs.iter().find(|s| s.line.is_some() && s.text_len > 20).unwrap();
-            let line = s.line.as_ref().unwrap();
-            let total = line.width().as_f32();
-            let mut out = String::new();
-            for x in [0.0f32, 24.0, 48.0, 72.0, 96.0, 120.0, 160.0, 200.0, 260.0, 320.0, total * 0.5, total - 2.0] {
-                let x = x.min(total - 1.0).max(0.0);
-                let ix = line.closest_index_for_x(px(x));
-                let back = line.x_for_index(ix).as_f32();
-                out.push_str(&format!("x={x:.0} -> idx={ix} -> back={back:.1} Δ={:.1} | ", (x - back).abs()));
-            }
-            let _ = window;
-            out
-        });
-        eprintln!("DEBUG closest_index_for_x roundtrip (line width {out})");
-        // 对密集中文段：任何查询 x 回放不应差一个字符以上（~20px）。
-        let _ = &out;
-    }
-
-    /// 用户假设复核：多行代码块是否「每行行高与文本行高不一致」导致越往后越乱。
-    /// 这里对 12 行（含语言头/空行）代码块的**每一行**点击并检查：
-    /// 1) 段 top 严格等差（=行高，无累计漂移）；2) 每行点击 → 光标 = 该行 base+local；
-    /// 3) caret_px 与段几何完全一致。全过 ⇒ 代码块行高/每行映射在应用内是精确的。
-    #[gpui::test]
-    fn debug_code_block_every_line_pins(cx: &mut TestAppContext) {
-        let mut src = String::new();
-        src.push_str("```java\n");
-        for i in 0..12 {
-            if i % 3 == 2 {
-                src.push_str("\n");
-            } else {
-                src.push_str(&format!("int v{i} = {i};\n"));
-            }
-        }
-        src.push_str("```\n\n正文\n");
-        let (host, mut cx) = open_live(cx, &src);
-        let code = cx.update(|_, cx| host.read(cx).live.clone());
-        let segs = cx.update(|_, cx| code_segs(&code, cx));
-        assert!(
-            segs.len() >= 8,
-            "12 行代码块（含空行）应有 ≥8 个代码行段，实际 {}",
-            segs.len()
-        );
-        // 1) 行距严格等差（都用同一 code_line）——检验「每行行高一致」。
-        for w in segs.windows(2) {
-            let d = w[1].top - w[0].top;
-            assert!(
-                (d - w[0].height).abs() < 0.01,
-                "代码行高不一致：line@{} top={} h={} 与下一行 top={} 差={}（应={}）",
-                w[0].base, w[0].top, w[0].height, w[1].top, d, w[0].height
-            );
-        }
-        // 2)+3) 每行点击：光标=base+local，且 caret_px 与该段一致。
-        let local_b = 4usize;
-        for (i, seg) in segs.iter().enumerate() {
-            if seg.text_len < local_b + 2 {
-                continue; // 空行只测点行首
-            }
-            let xb = cx.update(|_, cx| {
-                let v = code.read(cx);
-                let segs = v.segs.borrow();
-                let s = segs.iter().find(|s| s.base == seg.base && s.line.is_some()).unwrap();
-                s.line.as_ref().unwrap().x_for_index(local_b).as_f32()
-            });
-            cx.simulate_mouse_down(
-                point(px(seg.x + xb), px(seg.top + 2.0)),
-                MouseButton::Left,
-                Modifiers::default(),
-            );
-            cx.run_until_parked();
-            let caret = cx.update(|_, cx| caret_source(&code, cx));
-            assert_eq!(
-                caret,
-                seg.base + local_b,
-                "代码行 {i}（base={}）点击应 = base+{local_b}，实际 {caret}",
-                seg.base
-            );
-            let (row, px_, py, ph) = cx.update(|_, cx| caret_pixel(&code, cx)).expect("光标");
-            assert!(
-                (px_ - (seg.x + xb)).abs() < 1.0
-                    && (py - seg.top).abs() < 1.0
-                    && (ph - seg.height).abs() < 1.0,
-                "代码行 {i}：caret_px=({row} x={px_:.1} y={py:.1} h={ph:.1}) 应与段 (x={:.1} top={:.1} h={:.1}) 对齐",
-                seg.x + xb,
-                seg.top,
-                seg.height
-            );
-        }
-    }
-
-    /// 决定性：长文档下，seg 累计的内容高 vs 滚动容器**实际**内容高是否漂移。
-    /// 漂移 ⇒ 点击/光标用 seg 几何，但文本被 gpui 实排在别处 → 「越往后差距越大」。
-    /// `max_offset().y` 的**绝对值**即实际可滚动距离，`视图高 + 可滚动距离` = 绘制总内容高。
-    #[gpui::test]
-    fn debug_seg_vs_painted_content_height(cx: &mut TestAppContext) {
-        let mut src = String::new();
-        for i in 0..400 {
-            src.push_str(&format!("第 {i} 段正文内容足够长用于测试换行与行高累计，避免宽度相关差异。\n\n"));
-        }
-        src.push_str("```rust\nlet end = 1;\n```\n");
-        let (host, cx) = open_live(cx, &src);
-        for scale in [1.0f32, 1.25] {
-            cx.update(|window, _| window.set_scale_factor(scale));
-            for _ in 0..4 {
-                cx.run_until_parked();
-                let _ = cx.cx.refresh();
-            }
-            cx.run_until_parked();
-            let (seg_total, vp_h, max_off_y) = cx.update(|_, cx| {
-                let v = host.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                let last = segs.last().unwrap();
-                (
-                    last.top + last.height,
-                    v.element_bounds.size.height.as_f32(),
-                    v.v_handle.max_offset().y.as_f32().abs(),
-                )
-            });
-            let painted = vp_h + max_off_y;
-            let drift = painted - seg_total;
-            eprintln!("DEBUG scale={scale} seg_total={seg_total:.1} painted={painted:.1} vp={vp_h:.1} scrollable={max_off_y:.1} drift={drift:.2}px");
-            assert!(
-                drift.abs() < 4.0,
-                "scale={scale}: 绘制内容高 {painted:.1} 与 seg 几何 {seg_total:.1} 漂移 {drift:.2}px → 点击/光标与文本错位"
-            );
-        }
-    }
-
-    /// 用户真实文档（`target/md测试.md`）在两种宽度下的「绘制内容高 == seg 几何」断言，
-    /// 覆盖真机全屏(2148.6)与窗口(934.3)。这是「光标/输入相对文本往上飘」的直接护栏。
-    #[gpui::test]
-    fn debug_real_doc_painted_height_matches_segs(cx: &mut TestAppContext) {
-        let path = std::path::Path::new("target/md测试.md");
-        if !path.exists() {
-            eprintln!("WARN 缺少 target/md测试.md，跳过");
-            return;
-        }
-        let src = std::fs::read_to_string(path).unwrap();
-        cx.update(gpui_component::init);
-        for w in [934.3f32, 2148.6] {
-            let live = cx.update(|cx| cx.new(|cx| MarkdownLivePreview::new(&src, cx)));
-            let (host, mut cx2) = cx.add_window_view(|_w, _cx| LiveHost { live });
-            cx2.simulate_resize(size(px(w), px(760.)));
-            for _ in 0..4 {
-                cx2.run_until_parked();
-                let _ = cx2.cx.refresh();
-            }
-            cx2.run_until_parked();
-            let (seg_total, vp_h, scrollable) = cx2.update(|_, cx| {
-                let v = host.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                let last = segs.last().unwrap();
-                (
-                    last.top + last.height,
-                    v.element_bounds.size.height.as_f32(),
-                    v.v_handle.max_offset().y.as_f32().abs(),
-                )
-            });
-            if seg_total <= vp_h && scrollable <= 0.0 {
-                // 内容不足一屏：仍要求 seg 总高 ≤ 视口高（无溢出），语义一致。
-                eprintln!("DEBUG w={w} seg_total={seg_total:.1} vp={vp_h:.1} 不足一屏");
-                continue;
-            }
-            let painted = vp_h + scrollable;
-            let drift = painted - seg_total;
-            eprintln!("DEBUG w={w} seg_total={seg_total:.1} painted={painted:.1} vp={vp_h:.1} scrollable={scrollable:.1} drift={drift:.2}px");
-            assert!(
-                drift.abs() < 4.0,
-                "w={w}: 绘制内容高 {painted:.1} 与 seg 几何 {seg_total:.1} 漂移 {drift:.2}px（真实文档）"
-            );
-        }
-    }
-
-    #[gpui::test]
-    fn live_edit_insert_updates_text_caret_and_reparses(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let mut ed = cx.update(|cx| MarkdownLivePreview::new("# 标题\n\n正文\n", cx));
-        assert_eq!(ed.text(), "# 标题\n\n正文\n");
-        // 行：标题 / 空行 / 正文 / 尾随空行
-        assert_eq!(ed.test_live_len(), 4);
-
-        // 在 "正文" 前（源字节 10）插入 "加" → 光标推进 3 字节，重解析结构不变。
-        let caret = ed.test_insert_at(10, "加");
-        assert_eq!(caret, 13);
-        assert_eq!(ed.text(), "# 标题\n\n加正文\n");
-        assert_eq!(ed.test_live_len(), 4);
-
-        // 定位："加正文" 行是 (2,0)，把光标放回行首，映射正确。
-        ed.test_set_caret(10);
-        assert_eq!(ed.test_caret_target(), Some((2, 0)));
-    }
-
-    #[gpui::test]
-    fn live_edit_insert_within_bold_updates_source(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        // 渲染文本 "a **b** c"，在加粗内容里插入 → 源字节同步插入（不影响记号）。
-        let mut ed = cx.update(|cx| MarkdownLivePreview::new("a **b** c\n", cx));
-        // 源码字节：a0 sp1 *2 *3 b4 *5 *6 sp7 c8 → 'b' 在 4
-        let caret = ed.test_insert_at(4, "X");
-        assert_eq!(caret, 5);
-        assert_eq!(ed.text(), "a **Xb** c\n");
-    }
-
-    /// 用真实文件 + 真机点击日志做**回放校验**：给定元素宽度，逐条重算 (content_y,x)
-    /// 应得字节，与用户报的 byte 比对。可用来找出「字节映射」是否系统性偏了多少。
-    #[gpui::test]
-    fn debug_replay_real_clicks_vs_layout(cx: &mut TestAppContext) {
-        // 用户日志（bounds_w=934.3）：(content_y, local_x) -> byte
-        let clicks: &[(f32, f32, usize)] = &[
-            (292.6 + 260.0, 243.4, 534),
-            (301.7 + 260.0, 265.7, 537),
-            (300.0 + 520.0, 321.7, 1413),
-            (308.6 + 520.0, 330.3, 1414),
-            (284.6 + 520.0, 385.7, 1368),
-            (281.1 + 520.0, 250.3, 1358),
-            (344.6 + 2600.0, 289.1, 6724),
-            (490.9 + 3380.0, 329.1, 8682),
-            (185.7 + 4680.0, 372.0, 10959),
-            (362.3 + 6240.0, 344.0, 15762),
-            (372.0 + 6885.1, 320.6, 16578),
-        ];
-        let path = std::path::Path::new("target/md测试.md");
-        let src = if path.exists() {
-            std::fs::read_to_string(path).unwrap()
-        } else {
-            eprintln!("WARN missing target/md测试.md，回放跳过");
-            return;
-        };
-        cx.update(gpui_component::init);
-        let mut best = (usize::MAX, 0usize, 0.0f32);
-        // 真机实际宽度 934.3；横扫邻近宽度排除取整差异。
-        for w in [9343usize, 934, 935, 933, 936, 940, 930, 900, 1000, 1100] {
-            let wpx = if w == 9343 { 934.3 } else { w as f32 };
-            let live = cx.update(|cx| cx.new(|cx| MarkdownLivePreview::new(&src, cx)));
-            let (host, cx2) = cx.add_window_view(|_w, _cx| LiveHost { live });
-            cx2.simulate_resize(size(px(wpx), px(760.)));
-            for _ in 0..4 {
-                cx2.run_until_parked();
-                let _ = cx2.cx.refresh();
-            }
-            cx2.run_until_parked();
-            let mut bad = 0usize;
-            for &(cy, lx, want) in clicks {
-                let got = cx2.update(|_, cx| {
-                    let v = host.read(cx).live.read(cx);
-                    let segs = v.segs.borrow();
-                    let s = segs.iter().find(|s| {
-                        let isq = matches!(v.live.get(s.row_ix).map(|lr| lr.row.kind), Some(RowKind::Quote));
-                        if isq {
-                            cy >= s.top - crate::markdown::live::BAND_PY && cy <= s.top + s.height + crate::markdown::live::BAND_PY
-                        } else {
-                            cy >= s.top && cy <= s.top + s.height
-                        }
-                    })?;
-                    let lb = s
-                        .line
-                        .as_ref()
-                        .map(|l| l.closest_index_for_x(px((lx - s.x).max(0.0))).min(s.text_len))
-                        .unwrap_or(0);
-                    let srcb = s.source_for(lb);
-                    Some((srcb, s.top, s.height, s.base, s.text_len))
-                });
-                match got {
-                    Some((b, top, h, base, tlen)) => {
-                        if b != want {
-                            bad += 1;
-                            eprintln!(
-                                "  w={wpx} cy={cy:.1} x={lx:.1} want={want} got={b} (top={top:.1} h={h:.1} base={base} len={tlen})"
-                            );
-                        }
-                    }
-                    None => {
-                        bad += 1;
-                        eprintln!("  w={wpx} cy={cy:.1} x={lx:.1} want={want} -> NO SEG");
-                    }
-                }
-            }
-            eprintln!("width {wpx}: matched {} / {}   (miss={bad})", clicks.len() - bad, clicks.len());
-            if bad < best.0 {
-                best = (bad, clicks.len() - bad, wpx);
-            }
-        }
-        eprintln!(
-            "REPLAY best: miss={} matched={} at width={}",
-            best.0, best.1, best.2
-        );
-    }
-
-    /// 调试：真实文档在宽 2148.6 下，row≈170 附近的段几何 ↔ 源码行对照（验证用户点击行）。
-    #[gpui::test]
-    fn debug_dump_real_doc_near_170(cx: &mut TestAppContext) {
-        let path = std::path::Path::new("target/md测试.md");
-        let src = std::fs::read_to_string(path).unwrap();
-        cx.update(gpui_component::init);
-        let live = cx.update(|cx| cx.new(|cx| MarkdownLivePreview::new(&src, cx)));
-        let (host, mut cx2) = cx.add_window_view(|_w, _cx| LiveHost { live });
-        cx2.simulate_resize(size(px(2148.6), px(760.)));
-        for _ in 0..4 {
-            cx2.run_until_parked();
-            let _ = cx2.cx.refresh();
-        }
-        cx2.run_until_parked();
-        cx2.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            for s in segs.iter().filter(|s| (165..185).contains(&s.row_ix)) {
-                let src_line = if s.map.is_none() && s.line.is_some() {
-                    v.buffer.line_of_offset(s.base)
-                } else {
-                    usize::MAX
-                };
-                eprintln!(
-                    "row={} base={} len={} x={:.1} top={:.1} h={:.1} src_line={}",
-                    s.row_ix,
-                    s.base,
-                    s.text_len,
-                    s.x,
-                    s.top,
-                    s.height,
-                    src_line,
-                );
-            }
-        });
-    }
-
-    /// 二分定位最后一丁点残差：前缀长度 vs (绘制高 - seg高)。
-    #[gpui::test]
-    fn debug_real_doc_drift_bisect(cx: &mut TestAppContext) {
-        let path = std::path::Path::new("target/md测试.md");
-        if !path.exists() {
-            return;
-        }
-        let full = std::fs::read_to_string(path).unwrap();
-        cx.update(gpui_component::init);
-        let bytes = full.len();
-        // 安全的字符边界截断。
-        let cut_at = |cut: usize| {
-            full.char_indices()
-                .map(|(i, _)| i)
-                .chain(std::iter::once(full.len()))
-                .find(|&i| i >= cut)
-                .unwrap_or(full.len())
-        };
-        for frac in [0.05f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] {
-            let cut = cut_at((bytes as f32 * frac) as usize);
-            let prefix = full[..cut].to_string();
-            let live = cx.update(|cx| cx.new(|cx| MarkdownLivePreview::new(&prefix, cx)));
-            let (host, mut cx2) = cx.add_window_view(|_, _| LiveHost { live });
-            cx2.simulate_resize(size(px(934.3), px(760.)));
-            for _ in 0..4 {
-                cx2.run_until_parked();
-                let _ = cx2.cx.refresh();
-            }
-            cx2.run_until_parked();
-            let (seg_total, vp, scrollable) = cx2.update(|_, cx| {
-                let v = host.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                let last = segs.last().unwrap();
-                (
-                    last.top + last.height,
-                    v.element_bounds.size.height.as_f32(),
-                    v.v_handle.max_offset().y.as_f32().abs(),
-                )
-            });
-            if scrollable <= 0.0 {
-                eprintln!("DRIFTBISECT frac={frac:.2} seg={seg_total:.1} 不足一屏 skip");
-                continue;
-            }
-            eprintln!("DRIFTBISECT frac={frac:.2} seg={seg_total:.1} painted={:.1} drift={:.2}",
-                vp + scrollable, (vp + scrollable) - seg_total);
-        }
-    }
-
-    /// 定位：逐行对比「该行全部 seg 的总高」vs「实际绘制的行高」，
-    /// 找出折行/代码/引述等哪些行发生绘制与 seg 的实质偏差。
-    #[gpui::test]
-    fn debug_wrapped_row_painted_h_vs_seg_total(cx: &mut TestAppContext) {
-        let path = std::path::Path::new("target/md测试.md");
-        if !path.exists() {
-            return;
-        }
-        let src = std::fs::read_to_string(path).unwrap();
-        let (host, mut cx) = open_live(cx, &src);
-        cx.simulate_resize(size(px(934.3), px(760.)));
-        for _ in 0..4 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.run_until_parked();
-        // 每行：seg 总数/命中区高 vs painted。
-        let rows_info: Vec<(usize, usize, f32)> = cx.update(|_, cx| {
-            let v = host.read(cx).live.read(cx);
-            let segs = v.segs.borrow();
-            let mut m: std::collections::BTreeMap<usize, (usize, f32, f32)> = Default::default();
-            for s in segs.iter() {
-                let e = m.entry(s.row_ix).or_insert((0, f32::MAX, f32::MIN));
-                e.0 += 1;
-                e.1 = e.1.min(s.top);
-                e.2 = e.2.max(s.top + s.height);
-            }
-            let live = &v.live;
-            m.into_iter()
-                .map(|(ix, (n, t0, t1))| {
-                    let q = match live.get(ix).map(|lr| lr.row.kind) {
-                        Some(RowKind::Quote) => 2.0 * BAND_PY,
-                        _ => 0.0,
-                    };
-                    (ix, n, (t1 - t0) + q)
-                })
-                .collect()
-        });
-        let mut checked = 0usize;
-        let mut bad = 0usize;
-        for &(rix, nseg, hit_h) in rows_info.iter().take(90) {
-            let key: &'static str = Box::leak(format!("md-row-{rix}").into_boxed_str());
-            let Some(b) = cx.debug_bounds(key) else { continue };
-            let ph = b.size.height.as_f32();
-            let d = ph - hit_h;
-            if d.abs() > 1.0 || nseg > 1 {
-                eprintln!(
-                    "WRAP row={rix} segs={nseg} hitH={hit_h:.2} paintedH={ph:.2} dH={d:.2}",
-                );
-                if d.abs() > 1.0 {
-                    bad += 1;
-                }
-            }
-            checked += 1;
-        }
-        eprintln!("WRAP checked={checked} rows_with_paintedH_mismatch={bad}");
-
-        // 全新视图、一次性以 2148.6 建：若同样错位 → 全屏本身折行/绘制不一致（真 bug）；
-        // 若一致 → 上面 900→934→2148 的 resize 级联让旧几何残留（时序 bug）。
-        let live2 = cx.update(|_, cx| cx.new(|cx| MarkdownLivePreview::new(&src, cx)));
-        let (host2, mut cx3) = cx.add_window_view(|_w, _cx| LiveHost { live: live2 });
-        cx3.simulate_resize(size(px(2148.6), px(760.)));
-        for _ in 0..4 {
-            cx3.run_until_parked();
-            let _ = cx3.cx.refresh();
-        }
-        cx3.run_until_parked();
-        for &rix in &[14usize, 15, 16, 17, 18] {
-            let segs = cx3.update(|_, cx| {
-                let v = host2.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                segs.iter()
-                    .filter(|s| s.row_ix == rix)
-                    .map(|s| (s.top, s.height))
-                    .collect::<Vec<_>>()
-            });
-            let key: &'static str = Box::leak(format!("md-row-{rix}").into_boxed_str());
-            let pb = cx3.debug_bounds(key);
-            eprintln!(
-                "FRESH2148 row={rix} painted={:?} segs(top,h)={segs:?}",
-                pb.map(|b| (b.origin.y.as_f32(), b.size.height.as_f32()))
-            );
-        }
-
-        // 细节：dump 14..21 行的每条 seg（top/h/base/len）与 painted wrapper。
-        for &rix in &[14usize, 15, 16, 17, 18, 19, 20, 21] {
-            let segs = cx.update(|_, cx| {
-                let v = host.read(cx).live.read(cx);
-                let segs = v.segs.borrow();
-                segs.iter()
-                    .filter(|s| s.row_ix == rix)
-                    .map(|s| (s.row_ix, s.x, s.top, s.height, s.base, s.text_len))
-                    .collect::<Vec<_>>()
-            });
-            let key: &'static str = Box::leak(format!("md-row-{rix}").into_boxed_str());
-            let pb = cx.debug_bounds(key);
-            eprintln!(
-                "ROW {rix} painted={:?}  segs={:?}",
-                pb.map(|b| (b.origin.y.as_f32(), b.size.height.as_f32())),
-                segs
-            );
-        }
-        assert!(
-            bad == 0,
-            "有 {bad} 行:实际绘制高度与 seg 总高不一致 → 命中/光标/IME 偏移的根源"
-        );
     }
 }
