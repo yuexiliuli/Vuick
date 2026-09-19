@@ -4,8 +4,19 @@ version = "0.1.0"
 description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 edition = "2021"
 
-[dependencies]
+[workspace]
+# 实时预览编辑（WYSIWYG）：zorite 的 gpui-editor 移植（自包含，非外部路径依赖）。
+# 根包（本应用）仍叫 gpui-editor；移植的编辑器包改名 wysiwyg-editor 避免包名冲突。
+members = [".", "crates/gpui-bidi", "crates/gpui-markdown", "crates/wysiwyg-editor"]
+
+[workspace.dependencies]
+# 与根包/`gpui-component` 保持**同一** gpui 依赖 spec（git 分支，不锁 rev）：
+# Cargo 只在 spec 完全一致时把 git 依赖统一成一份，否则应用与移植的编辑器各编译
+# 一份 gpui → 类型不互通。分支 tip 已由 Cargo.lock 固定为 399258f，不会漂移。
 gpui = { git = "https://github.com/zed-industries/zed" }
+
+[dependencies]
+gpui = { workspace = true }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,9 +54,11 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "default-syntaxes",
     "regex-fancy",
 ] }
+# 实时预览编辑（WYSIWYG）：zorite 移植的所见即所得 Markdown 编辑器。
+wysiwyg-editor = { path = "crates/wysiwyg-editor" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = ["gpui/test-support"]

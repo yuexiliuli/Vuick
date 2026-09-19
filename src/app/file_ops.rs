@@ -688,10 +688,8 @@ impl EditorApp {
                 Ok(doc) => {
                     let idx = self.make_tab(window, cx);
                     self.load_epub(idx, &p, doc, window, cx);
-                    if let Some(tab) = self.tabs.get(idx) {
-                        let focus = tab.editor.read(cx).focus_handle();
-                        window.focus(&focus, cx);
-                    }
+                    let focus = self.tab_focus_handle(idx, cx);
+                    window.focus(&focus, cx);
                 }
                 Err(e) => {
                     self.status = SharedString::from(format!("打开失败：{e}"));
@@ -705,10 +703,8 @@ impl EditorApp {
             // 先建标签页、立即返回：解析放到后台，避免拖窗卡顿
             let idx = self.make_tab(window, cx);
             self.open_pdf_async(idx, p.clone(), window, cx);
-            if let Some(tab) = self.tabs.get(idx) {
-                let focus = tab.editor.read(cx).focus_handle();
-                window.focus(&focus, cx);
-            }
+            let focus = self.tab_focus_handle(idx, cx);
+            window.focus(&focus, cx);
             return;
         }
         // 文本：大文件（按字节阈值判断，无需读盘）→ **后台打开**——先建标签页 +
@@ -717,10 +713,8 @@ impl EditorApp {
         if is_large_path(&p) {
             let idx = self.make_tab(window, cx);
             self.spawn_progressive_open(idx, p.clone(), window, cx);
-            if let Some(tab) = self.tabs.get(idx) {
-                let focus = tab.editor.read(cx).focus_handle();
-                window.focus(&focus, cx);
-            }
+            let focus = self.tab_focus_handle(idx, cx);
+            window.focus(&focus, cx);
             return;
         }
         // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）
@@ -753,9 +747,9 @@ impl EditorApp {
                 t_load.elapsed().as_millis()
             );
         }
-        if let Some(tab) = self.tabs.get(idx) {
+        if let Some(_tab) = self.tabs.get(idx) {
             let t_focus = std::time::Instant::now();
-            let focus = tab.editor.read(cx).focus_handle();
+            let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
             if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                 eprintln!(

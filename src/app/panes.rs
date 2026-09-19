@@ -57,10 +57,12 @@ impl EditorApp {
                         .child("正在载入编辑区…（预览已就绪）"),
                 );
         }
-        // 实时预览编辑（WYSIWYG）模式：左面板 = MarkdownLivePreview。
+        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `wysiwyg_editor::EditorState`。
+        // 该编辑器 AUTO-GROW（内部无滚动条），宿主负责滚动；点击/光标/IME 坐标
+        // 随元素自动跟随（不再有旧 live.rs 的内部滚动容器 + 滚动补偿）。
         if let Some(live) = self.tabs[self.active_tab].live.clone() {
+            let text_color = self.text_primary();
             let fs = self.font_size;
-            live.update(cx, |l, _| l.set_font_override(Some(fs)));
             return div()
                 .id("editor-area")
                 .debug_selector(|| "editor-area".into())
@@ -71,7 +73,25 @@ impl EditorApp {
                 .min_h(px(0.))
                 .bg(self.panel_bg())
                 .overflow_hidden()
-                .child(live)
+                .child(
+                    div()
+                        .id("live-scroll")
+                        .debug_selector(|| "live-scroll".into())
+                        .relative()
+                        .size_full()
+                        .overflow_y_scroll()
+                        .child(
+                            div()
+                                .id("live-body")
+                                .debug_selector(|| "live-body".into())
+                                .w_full()
+                                .px(px(12.))
+                                .py(px(8.))
+                                .text_size(px(fs))
+                                .text_color(text_color)
+                                .child(live),
+                        ),
+                )
                 .child(Self::zoom_overlay(cx));
         }
         let editor = self.tabs[self.active_tab].editor.clone();

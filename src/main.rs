@@ -57,6 +57,8 @@ fn main() {
             // 这里强制浅色主题，与现有界面的亮色调保持一致。
             gpui_component::init(cx);
             Theme::change(ThemeMode::Light, None, cx);
+            // 实时预览编辑（WYSIWYG，zorite 移植）的编辑快捷键（作用域 Editor，不覆盖应用快捷键）。
+            wysiwyg_editor::bind_keys(cx);
             // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
             crate::syntax::install_github_theme(cx);
             // 覆盖组件库默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，

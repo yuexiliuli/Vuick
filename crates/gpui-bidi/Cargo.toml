@@ -1,0 +1,13 @@
+[package]
+name = "gpui-bidi"
+version = "0.1.0"
+edition = "2024"
+description = "Bidirectional-text index→x mapping for gpui shaped lines."
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# Shared workspace spec (the repo root pins the rev) so Cargo unifies to one gpui.
+gpui = { workspace = true }
+# The UAX #9 algorithm itself. Already in the tree via other deps, so this
+# adds nothing to the build.
+unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data"] }

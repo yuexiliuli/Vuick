@@ -28,6 +28,7 @@ impl EditorApp {
             editor_pending: false,
             live_edit: false,
             live: None,
+            _live_sub: None,
             preview_prev: None,
             edit_version: 0,
             preview_dirty: None,
@@ -40,7 +41,7 @@ impl EditorApp {
 
     pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.make_tab(window, cx);
-        let focus = self.tabs[idx].editor.read(cx).focus_handle();
+        let focus = self.tab_focus_handle(idx, cx);
         window.focus(&focus, cx);
         self.status = SharedString::from("新建文件");
         self.status_ok = true;
@@ -59,7 +60,7 @@ impl EditorApp {
             let root = self.focus_handle(cx);
             window.focus(&root, cx);
         } else {
-            let focus = self.tabs[idx].editor.read(cx).focus_handle();
+            let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
         }
         cx.notify();
