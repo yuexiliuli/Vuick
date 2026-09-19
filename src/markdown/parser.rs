@@ -315,7 +315,9 @@ fn inline_style(src: &str) -> (SharedString, Vec<(Range<usize>, RunKind)>) {
 ///
 /// `map` 长度恒为 `out.len()+1`：`map[r]` = 渲染文本第 `r` 个字节对应的源字节
 /// （相对 `src`），`map[out.len()]` = `src.len()`（行尾哨兵）。
-fn inline_style_mapped(
+///
+/// `pub(crate)`：底座 `markdown::doc` 复用它给统一行 [`DocRow`] 装配编辑映射。
+pub(crate) fn inline_style_mapped(
     src: &str,
 ) -> (SharedString, Vec<(Range<usize>, RunKind)>, Vec<usize>) {
     let mut out = String::with_capacity(src.len());
@@ -460,6 +462,51 @@ fn extract_notes(
 /// 不能被这里吃掉）。普通 Markdown 段落行首没有全角空格，行为与以前一致。
 fn trim_paragraph(line: &str) -> &str {
     line.trim_end().trim_start_matches([' ', '\t'])
+}
+
+/// 一行源码 → 该行传给 [`inline_style_mapped`] 的**文本段**及其在行内的字节偏移。
+///
+/// 逐类型镜像 [`parse_to_rows`] 的段派生（标题剥 `#`、列表剥前缀、引述剥 `>`、
+/// 段落剥行首空格/Tab），供底座 [`crate::markdown::doc`] 为统一行装配
+/// 「渲染字节 → 源字节」编辑映射。非文本行（代码/表格/图片/分隔线/空行）返回 `None`。
+pub(crate) fn text_segment(line: &str, kind: RowKind) -> Option<(usize, &str)> {
+    let lead = line.len() - line.trim_start().len();
+    let t = &line[lead..];
+    match kind {
+        RowKind::Paragraph => {
+            let seg = trim_paragraph(line);
+            if seg.is_empty() {
+                return None;
+            }
+            Some((line.len() - line.trim_start_matches([' ', '\t']).len(), seg))
+        }
+        RowKind::Heading(_) => {
+            let hashes = t.chars().take_while(|&c| c == '#').count();
+            let body = &t[hashes..];
+            let seg = body.trim_start();
+            if seg.is_empty() {
+                return None;
+            }
+            Some((lead + hashes + (body.len() - seg.len()), seg))
+        }
+        RowKind::Bullet => {
+            let (_, content) = list_prefix(t)?;
+            if content.is_empty() {
+                return None;
+            }
+            let off = lead + (content.as_ptr() as usize - t.as_ptr() as usize);
+            Some((off, content))
+        }
+        RowKind::Quote => {
+            let rest = t.trim_start_matches('>').trim_start();
+            if rest.is_empty() {
+                return None;
+            }
+            let off = lead + (rest.as_ptr() as usize - t.as_ptr() as usize);
+            Some((off, rest))
+        }
+        _ => None,
+    }
 }
 
 /// 围栏检测：行首（允许缩进）是否有 ≥3 个 ` 或 ~。
@@ -1019,7 +1066,9 @@ impl<'a> Iterator for BlocksIter<'a> {
 }
 
 /// 行 → 字节起始偏移表（与 `build_line_starts(&str)` 语义相同，但存 u32 省内存）。
-fn build_line_starts_u32(src: &str) -> Vec<u32> {
+/// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义，含末段）。
+/// `pub(crate)`：底座 `markdown::doc` 用它定位任意行的源字节区间。
+pub(crate) fn build_line_starts_u32(src: &str) -> Vec<u32> {
     let mut starts = Vec::with_capacity(src.len() / 8 + 2);
     starts.push(0u32);
     for (i, &b) in src.as_bytes().iter().enumerate() {

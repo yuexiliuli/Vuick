@@ -494,5 +494,39 @@ fn doc_rope_path_matches_str_path() {
         assert_eq!(a.src_line, b.src_line);
         assert_eq!(a.text, b.text, "src_line {} 文本不一致（Rope vs Str）", a.src_line);
         assert_eq!(a.lines, b.lines);
+        assert_eq!(a.byte_map, b.byte_map, "src_line {} 映射不一致", a.src_line);
     }
+}
+
+/// 底座编辑映射（渲染字节→源字节）与预览同段派生：表头/序号/加粗被剥后仍能
+/// 把「渲染位置」换算回「该行源字节」——live 点击/光标/IME 落点所要的原始数据。
+#[test]
+fn doc_byte_map_maps_render_back_to_line_source() {
+    // 语料不含尾随换行：行数与 `rows_in_line_window` 的窗口一一对应。
+    let src = "标题\n前 **加粗** 后\n- 任务 **粗体** 尾\n> 引用 `代码`";
+    let doc = super::doc::Doc::open(SharedString::from(src));
+    let rows = doc.rows_in_line_window(0, 4);
+
+    let para = &rows[1]; // 行 0="标题"；行 1="前 **加粗** 后"
+    assert_eq!(para.text.as_ref(), "前 加粗 后");
+    assert_eq!(para.byte_map.len(), para.text.len() + 1, "哨兵 = 渲染文本长+1");
+    // "加"（渲染字节 4..）→ 源字节 6（跳过 `**`）：
+    let rb = para.text.as_ref().find('加').expect("渲染文本含 加");
+    let sb = para.byte_map[rb];
+    let line = "前 **加粗** 后";
+    assert_eq!(&line[sb..sb + 3], "加", "渲染 加 应落回源行的 加（byte {sb}）");
+
+    // 列表行：`- ` 前缀也计入行内偏移（渲染 任务=byte2..，源 `- ` 后）。
+    let bullet = &rows[2];
+    assert_eq!(bullet.text.as_ref(), "任务 粗体 尾");
+    let r7 = bullet.text.as_ref().find('粗').unwrap();
+    let s7 = bullet.byte_map[r7];
+    assert_eq!(&src.split('\n').collect::<Vec<_>>()[2][s7..s7 + 3], "粗");
+
+    // 引述行：`> ` 剥掉，映射关照引号后的内容。
+    let quote = &rows[3];
+    assert_eq!(quote.text.as_ref(), "引用 代码");
+    let rq = quote.text.as_ref().find('代').unwrap();
+    let sq = quote.byte_map[rq];
+    assert_eq!(&src.split('\n').collect::<Vec<_>>()[3][sq..sq + 3], "代");
 }
