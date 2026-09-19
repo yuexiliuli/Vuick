@@ -1359,7 +1359,25 @@ impl EditorApp {
 
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = if self.show_preview() {
+        // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
+        // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
+        let live_edit = self
+            .tabs
+            .get(self.active_tab)
+            .map(|t| t.live_edit)
+            .unwrap_or(false);
+        let body = if live_edit {
+            div()
+                .id("app-live-body")
+                .debug_selector(|| "app-live-body".into())
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(self.render_editor_pane(1.0, cx))
+                .into_any_element()
+        } else if self.show_preview() {
             let ratio = self.split_ratio;
             // EPUB 等全屏预览：预览区占满整个内容区，不显示编辑区与分割线。
             let fullscreen = self
