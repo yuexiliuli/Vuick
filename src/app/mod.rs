@@ -78,6 +78,11 @@ struct EditorTab {
     /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
+    /// 是否处于「实时预览编辑」（WYSIWYG）模式：左面板渲染
+    /// [`crate::markdown::MarkdownLivePreview`] 代替源码编辑区；退出时内容写回。
+    live_edit: bool,
+    /// 实时预览编辑器实体（None = 未启用）。
+    live: Option<gpui::Entity<crate::markdown::MarkdownLivePreview>>,
     /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
     /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
     /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
@@ -614,6 +619,9 @@ impl EditorApp {
             preview_fullscreen: payload.preview_fullscreen,
             readonly_preview: payload.readonly_preview,
             editor_pending: payload.editor_pending,
+            // 实时预览编辑不随选项卡搬迁（搬迁前已提交回写，见 take_tab_payload 调用点）
+            live_edit: false,
+            live: None,
             preview_prev: payload.preview_prev,
             edit_version: payload.edit_version,
             preview_dirty: payload.preview_dirty,
@@ -669,6 +677,10 @@ impl EditorApp {
         if idx >= self.tabs.len() {
             return;
         }
+        // 实时预览编辑模式下鼠标按住拖出：先把内容写回编辑区（实时实体不随选项卡搬）。
+        if self.tabs[idx].live_edit {
+            self.commit_live(idx, cx);
+        }
         let Some(payload) = self.take_tab_payload(idx) else {
             return;
         };
@@ -697,6 +709,10 @@ impl EditorApp {
         }
         if idx >= self.tabs.len() {
             return;
+        }
+        // 实时预览编辑模式下 tear-off：先写回（实时实体不随选项卡搬）。
+        if self.tabs[idx].live_edit {
+            self.commit_live(idx, cx);
         }
         let Some(payload) = self.take_tab_payload(idx) else {
             return;
@@ -1015,7 +1031,68 @@ impl EditorApp {
     /// 调节编辑器字号并刷新预览（范围约束见 FONT_MIN/FONT_MAX）。
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.font_size = (self.font_size + delta).clamp(FONT_MIN, FONT_MAX);
+        // 实时预览编辑字号同步（下一帧渲染时由组件读取刷新排版）。
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            if let Some(live) = tab.live.clone() {
+                let fs = self.font_size;
+                live.update(cx, |l, _| l.set_font_override(Some(fs)));
+            }
+        }
         cx.notify();
+    }
+
+    // -------------------------------------------------------------------
+    // 实时预览编辑（Phase 3）
+    // -------------------------------------------------------------------
+
+    /// 切换当前选项卡的「实时预览编辑」模式（仅 Markdown 选项卡）。
+    /// 开启：用 [`crate::markdown::MarkdownLivePreview`] 渲染左面板（所见即所得）；
+    /// 关闭：把实时编辑内容写回源码编辑区/预览。
+    fn toggle_live_edit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let idx = self.active_tab;
+        if !self.is_markdown_tab(idx) {
+            self.status = SharedString::from("实时预览编辑仅支持 Markdown 文件");
+            self.status_ok = false;
+            cx.notify();
+            return;
+        }
+        if self.tabs[idx].live_edit {
+            self.commit_live(idx, cx);
+        } else {
+            let text = self.tabs[idx].editor.read(cx).text_string();
+            let fs = self.font_size;
+            let live = cx.new(|cx| crate::markdown::MarkdownLivePreview::new(&text, cx));
+            live.update(cx, |l, _| l.set_font_override(Some(fs)));
+            let tab = &mut self.tabs[idx];
+            tab.live = Some(live);
+            tab.live_edit = true;
+            self.status = SharedString::from("实时预览编辑：开（点击正文定位，直接键入编辑）");
+            self.status_ok = true;
+        }
+        cx.notify();
+    }
+
+    /// 退出实时编辑：把实时 Buffer 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
+    fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        let Some(live) = tab.live.take() else { return };
+        tab.live_edit = false;
+        let text = live.read(cx).text();
+        tab.content = SharedString::from(text.clone());
+        let content = tab.content.clone();
+        let n_lines = content.as_ref().lines().count().max(1);
+        let n_chars = content.as_ref().chars().count();
+        tab.line_count = n_lines;
+        tab.char_count = n_chars;
+        tab.editor.update(cx, |ed, _| ed.set_text(&content));
+        tab.md_preview.update(cx, |v, cx| v.set_source(&content, cx));
+        self.status = SharedString::from("实时预览编辑：关（内容已写回编辑区）");
+        self.status_ok = true;
+    }
+
+    /// 当前选项卡是否处于实时预览编辑模式（其它模块/渲染分流用）。
+    fn is_live_tab(&self, idx: usize) -> bool {
+        self.tabs.get(idx).map(|t| t.live_edit).unwrap_or(false)
     }
 
     /// 切换侧边栏「展开/收起」。

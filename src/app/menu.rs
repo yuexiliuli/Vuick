@@ -133,6 +133,7 @@ impl EditorApp {
                 this.toggle_preview_for_tab(idx, window, cx);
             },
         ))
+        .item(Self::live_edit_menu_item(weak.clone()))
         .separator()
         .item(Self::menu_action_item(
             "增大字号",
@@ -182,9 +183,37 @@ impl EditorApp {
         ))
     }
 
-    /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
-    fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+    /// "查看"菜单：「实时预览编辑」（WYSIWYG）开关：左面板在源码编辑区 ↔
+    /// 块级所见即所得编辑器之间切换（仅 Markdown 有效）。动态 ◉/○。
+    fn live_edit_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
         let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| {
+                    let i = e.read(cx).active_tab;
+                    e.read(cx).is_live_tab(i)
+                })
+                .unwrap_or(false);
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(if on {
+                    "◉ 实时预览编辑"
+                } else {
+                    "○ 实时预览编辑"
+                })
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_live_edit(window, cx));
+        })
+    }
+
+    /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
+    fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {        let weak2 = weak.clone();
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()

@@ -22,7 +22,7 @@
 
 mod dimensions;
 mod row;
-mod style;
+pub(crate) mod style;
 mod table;
 
 #[cfg(test)]

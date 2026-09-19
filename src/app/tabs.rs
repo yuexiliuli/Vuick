@@ -26,6 +26,8 @@ impl EditorApp {
             preview_fullscreen: false,
             readonly_preview: false,
             editor_pending: false,
+            live_edit: false,
+            live: None,
             preview_prev: None,
             edit_version: 0,
             preview_dirty: None,

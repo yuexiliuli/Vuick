@@ -54,3 +54,5 @@ pub use selection::Selection;
 pub use undo::{EditIntent, Transaction, UndoManager};
 #[allow(unused_imports)]
 pub use view::{CodeEditor, EditorEvent};
+#[allow(unused_imports)]
+pub(crate) use view::merge_highlights;

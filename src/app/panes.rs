@@ -57,6 +57,23 @@ impl EditorApp {
                         .child("正在载入编辑区…（预览已就绪）"),
                 );
         }
+        // 实时预览编辑（WYSIWYG）模式：左面板 = MarkdownLivePreview。
+        if let Some(live) = self.tabs[self.active_tab].live.clone() {
+            let fs = self.font_size;
+            live.update(cx, |l, _| l.set_font_override(Some(fs)));
+            return div()
+                .id("editor-area")
+                .debug_selector(|| "editor-area".into())
+                .relative()
+                .flex_1()
+                .flex_grow(grow)
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .bg(self.panel_bg())
+                .overflow_hidden()
+                .child(live)
+                .child(Self::zoom_overlay(cx));
+        }
         let editor = self.tabs[self.active_tab].editor.clone();
         // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
         let font_size = self.font_size;
@@ -81,39 +98,41 @@ impl EditorApp {
                 },
             ))
             .child(editor)
-            // 透明覆盖层（画在编辑器之上，命中测试最靠前）：拦截 Ctrl+滚轮缩放。
-            // 编辑器的自带滚动处理在内容溢出时会 stop_propagation()，父级监听收不到，
-            // 因此必须用这个更靠前的覆盖层先处理。普通滚轮不拦截，仍传给下层编辑区滚动。
-            .child(
-                div()
-                    .id("editor-zoom-overlay")
-                    .debug_selector(|| "editor-zoom-overlay".into())
-                    .absolute()
-                    .left(px(0.))
-                    .right(px(0.))
-                    .top(px(0.))
-                    .bottom(px(0.))
-                    .on_scroll_wheel(cx.listener(
-                        |this: &mut EditorApp,
-                         event: &gpui::ScrollWheelEvent,
-                         _window,
-                         cx| {
-                            if !event.modifiers.control {
-                                return;
-                            }
-                            let delta_y = match event.delta {
-                                gpui::ScrollDelta::Lines(lines) => lines.y,
-                                gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-                            };
-                            // 实测本平台：向上滚动 delta.y>0 → 放大；向下滚动 delta.y<0 → 缩小
-                            let step = delta_y.clamp(-1.0, 1.0);
-                            if step != 0.0 {
-                                this.change_font_size(step, cx);
-                            }
-                            cx.stop_propagation();
-                        },
-                    )),
-            )
+            // 透明覆盖层（画在编辑器之上，命中测试最靠前)：拦截 Ctrl+滚轮缩放。
+            .child(Self::zoom_overlay(cx))
+    }
+
+    /// 编辑区顶部的透明滚轮缩放覆盖层（Ctrl+滚轮改字号；普通滚轮透传）。
+    fn zoom_overlay(cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("editor-zoom-overlay")
+            .debug_selector(|| "editor-zoom-overlay".into())
+            .absolute()
+            .left(px(0.))
+            .right(px(0.))
+            .top(px(0.))
+            .bottom(px(0.))
+            .on_scroll_wheel(cx.listener(
+                |this: &mut EditorApp,
+                 event: &gpui::ScrollWheelEvent,
+                 _window,
+                 cx| {
+                    if !event.modifiers.control {
+                        return;
+                    }
+                    let delta_y = match event.delta {
+                        gpui::ScrollDelta::Lines(lines) => lines.y,
+                        gpui::ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                    };
+                    // 实测本平台：向上滚动 delta.y>0 → 放大；向下滚动 delta.y<0 → 缩小
+                    let step = delta_y.clamp(-1.0, 1.0);
+                    if step != 0.0 {
+                        this.change_font_size(step, cx);
+                    }
+                    cx.stop_propagation();
+                },
+            ))
+            .into_any_element()
     }
 
     /// 编辑区 / 预览区之间的分割线（可拖拽调整分屏比例）。
