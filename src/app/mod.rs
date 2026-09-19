@@ -30,10 +30,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, px, rgb, rgba, white, AnyWindowHandle, App, AppContext, Context, CursorStyle,
+    div, px, rgb, rgba, white, AnyWindowHandle, App, AppContext, Bounds, Context, CursorStyle,
     DragMoveEvent, ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, PromptLevel, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, VisualContext, Window, WindowBounds, WindowOptions,
+    MouseButton, ParentElement, Pixels, Point, PromptLevel, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, VisualContext, Window, WindowBounds,
+    WindowOptions,
 };
 use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
@@ -659,6 +660,7 @@ impl EditorApp {
     pub(crate) fn release_tab_drag_outside(
         &mut self,
         window: &mut Window,
+        release_position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
         let Some(idx) = self.tab_dragging.take() else {
@@ -675,15 +677,17 @@ impl EditorApp {
             self.restore_tab_to_primary(payload, cx);
             window.remove_window();
         } else {
-            // 主窗口：把选项卡拆进新开的独立窗口
-            self.split_tab_to_new_window(payload, window, cx);
+            // 主窗口：把选项卡拆进新开的独立窗口（窗口出现在鼠标释放处）
+            self.split_tab_to_new_window(payload, release_position, window, cx);
         }
     }
 
-    /// 把选项卡拆进一个新开的独立窗口；本窗口若已没有选项卡则补一个空选项卡。
+    /// 把选项卡拆进一个新开的独立窗口：窗口左上角跟随鼠标释放位置（屏幕坐标 =
+    /// 源窗口屏幕左上角 + 拖放点的窗口内坐标）；本窗口若已没有选项卡则补一个空选项卡。
     fn split_tab_to_new_window(
         &mut self,
         payload: DetachedTab,
+        release_position: Point<Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -692,7 +696,11 @@ impl EditorApp {
         }
         // 主窗口剩下的选项卡接管焦点（被拖走的选项卡已从 tabs 移除）
         self.activate_tab(self.active_tab, window, cx);
-        let bounds = window.bounds().clone();
+        let src_bounds = window.bounds();
+        let bounds = Bounds {
+            origin: src_bounds.origin + release_position,
+            size: src_bounds.size,
+        };
         let titlebar_options = gpui::TitlebarOptions {
             title: Some("GPUI 编辑器".into()),
             appears_transparent: true,
@@ -1358,8 +1366,8 @@ impl Render for EditorApp {
             )
             .on_mouse_up_out(
                 MouseButton::Left,
-                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
-                    this.release_tab_drag_outside(window, cx);
+                cx.listener(|this: &mut EditorApp, ev: &gpui::MouseUpEvent, window, cx| {
+                    this.release_tab_drag_outside(window, ev.position, cx);
                 }),
             )
             .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {

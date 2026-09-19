@@ -3820,6 +3820,36 @@
             !main.is_empty() && main.iter().all(|(_, n, has_path, _)| *n >= 1 && !*has_path),
             "主窗口应只剩未命名选项卡，快照={snap:?}"
         );
+
+        // 回归：新窗口应出现在鼠标释放处（源窗口左上角 + 释放点偏移），而不是与主窗口重叠。
+        // 释放点在窗口外 (-60, 50) → 新窗口左上角应向左上平移(-60, 50)。
+        // 源窗口 = 本 VisualTestContext 绑定的窗口（其 bounds 可直接读）；独立窗口经句柄读取
+        // （当前窗口在更新栈上，直接 update 会被判“window not found”）。
+        let src_origin = cx.update(|w, _| w.bounds()).origin;
+        let windows: Vec<(bool, gpui::AnyWindowHandle)> = cx.update(|_w, cx| {
+            let reg = cx.global::<EditorAppRegistry>();
+            reg.windows
+                .iter()
+                .filter_map(|(weak, wh)| {
+                    let e = weak.upgrade()?;
+                    let detached = e.read_with(cx, |a, _| a.is_detached);
+                    Some((detached, *wh))
+                })
+                .collect()
+        });
+        let det_origin = windows
+            .iter()
+            .find(|(detached, _)| *detached)
+            .and_then(|(_, wh)| wh.downcast::<gpui_component::Root>())
+            .and_then(|h| cx.update(|_w, cx| h.update(cx, |_, w, _| w.bounds()).ok()))
+            .map(|b| b.origin)
+            .expect("应有独立窗口");
+        let expected = src_origin + outside;
+        assert!(
+            (det_origin.x.as_f32() - expected.x.as_f32()).abs() < 2.0
+                && (det_origin.y.as_f32() - expected.y.as_f32()).abs() < 2.0,
+            "独立窗口应跟随鼠标释放位置：期望 origin={expected:?}，实际={det_origin:?}"
+        );
         let _ = std::fs::remove_file(&f);
     }
 
