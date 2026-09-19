@@ -1059,44 +1059,24 @@ impl EditorApp {
     // 实时预览编辑（WYSIWYG，zorite 移植）
     // -------------------------------------------------------------------
 
-    /// WYSIWYG 编辑器的 Markdown 语法配色（对齐 markdown 预览 [`StyleParams`]）。
+    /// WYSIWYG 编辑器的 Markdown 语法配色。markdown 语义色由
+    /// [`StyleParams`](crate::markdown::view::style::StyleParams)（单一主题映射源）派生，
+    /// 只读外壳 chrome 走 app 自己色板（与旧 `wysiwyg_style` 逐值一致）。
     fn wysiwyg_style(&mut self, cx: &mut Context<Self>) -> SyntaxStyle {
         let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
             cx,
             Some(self.font_size),
         );
-        let popover_bg = self.surface_bg();
-        let border = self.bar_border();
-        let muted = self.text_minor();
-        let fg = self.text_primary();
-        let accent = p.accent;
-        SyntaxStyle {
-            marker: muted,
-            code: fg,
-            code_bg: p.code_bg,
-            link: accent,
-            tag: accent,
-            quote: muted,
-            alert_note: accent,
-            alert_tip: accent,
-            alert_important: accent,
-            alert_warning: muted,
-            alert_caution: muted,
-            alert_icons: None,
-            property_icon: None,
-            rule: p.divider,
-            mark_bg: gpui::rgba(0xFFD6004D).into(),
-            block_label: None,
-            block_label_gen: 0,
-            block_ref_count: None,
-            popover_bg,
-            popover_border: border,
-            popover_fg: fg,
-            popover_hover: accent,
-            popover_divider: p.divider,
+        let marker = self.text_minor();
+        p.syntax_style(crate::markdown::view::style::SyntaxChrome {
+            marker,
+            code_fg: self.text_primary(),
+            quote: marker,
+            popover_bg: self.surface_bg(),
+            popover_border: self.bar_border(),
+            popover_fg: self.text_primary(),
             popover_danger: gpui::rgb(0xE5484D).into(),
-            mono: gpui::font(p.mono.clone()),
-        }
+        })
     }
 
     /// 切换当前选项卡的「实时预览编辑」模式（仅 Markdown 选项卡）。

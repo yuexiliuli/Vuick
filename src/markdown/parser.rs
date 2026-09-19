@@ -15,6 +15,8 @@ use gpui::{Image, SharedString};
 use gpui_component::input::Rope;
 use regex::Regex;
 
+use super::cells;
+
 /// 渲染行类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -452,90 +454,6 @@ fn extract_notes(
     (out.into(), runs, notes, note_defs)
 }
 
-/// [`extract_notes`] 的映射变体：剥 `[^n]`/`[!n]` 的 `^`/`!` 时同步调整渲染→源字节
-/// 映射。`base_map` 是当前文本的**字节索引**渲染→源字节表（如 [`inline_style_mapped`]
-/// 产出，长度 = 文本字节长 + 1）。剥掉 `^`/`!`（恰好各 1 字节）即从 `base_map` 删除
-/// 对应项（删除项及其后整体左移，与渲染文本的横向移动一致）；返回的 map 覆盖剥
-/// 标记后的最终文本，仍为字节索引。
-#[allow(clippy::type_complexity)]
-fn extract_notes_mapped(
-    text: SharedString,
-    mut runs: Vec<(Range<usize>, RunKind)>,
-    base_map: Vec<usize>,
-) -> (
-    SharedString,
-    Vec<(Range<usize>, RunKind)>,
-    Vec<(Range<usize>, usize)>,
-    Vec<(Range<usize>, usize)>,
-    Vec<usize>,
-) {
-    let src = text.as_ref();
-    let mut out = String::with_capacity(src.len());
-    let mut notes: Vec<(Range<usize>, usize)> = Vec::new();
-    let mut note_defs: Vec<(Range<usize>, usize)> = Vec::new();
-    let mut removed: Vec<usize> = Vec::new(); // 被剥字节的 map 下标（`^`/`!`）
-    let chars: Vec<(usize, char)> = src.char_indices().collect();
-    let mut ci = 0usize;
-    while ci < chars.len() {
-        let (idx, ch) = chars[ci];
-        if ch == '[' {
-            // 形如 `[^digits]` 或 `[!digits]`
-            let is_note = chars.get(ci + 1).is_some_and(|&(_, c)| c == '^');
-            let is_def = chars.get(ci + 1).is_some_and(|&(_, c)| c == '!');
-            if is_note || is_def {
-                let mut nxt = ci + 2;
-                let dstart = nxt;
-                while let Some(&(_, d)) = chars.get(nxt) {
-                    if d.is_ascii_digit() {
-                        nxt += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if nxt > dstart && chars.get(nxt).is_some_and(|&(_, c)| c == ']') {
-                    let digits: String =
-                        src[chars[dstart].0..chars[nxt - 1].0 + 1].chars().collect();
-                    let n: usize = digits.parse().unwrap_or(0);
-                    let mark_start = out.len();
-                    out.push('[');
-                    out.push_str(&digits);
-                    out.push(']');
-                    let mark_end = out.len();
-                    let entry = (mark_start..mark_end, n);
-                    if is_def {
-                        note_defs.push(entry);
-                    } else {
-                        notes.push(entry);
-                    }
-                    // 删掉 `^`/`!`（在 `[` 之后第 1 字节）→ map 删除该项。
-                    removed.push(idx + 1);
-                    // 标记字符被删 → marker 之后的区间整体左移 1 字节。
-                    let cut = idx;
-                    for r in runs.iter_mut() {
-                        if r.0.start > cut {
-                            r.0.start -= 1;
-                            r.0.end -= 1;
-                        }
-                    }
-                    ci = nxt + 1;
-                    continue;
-                }
-            }
-        }
-        out.push(ch);
-        ci += 1;
-    }
-    // 从字节索引映射删除被剥字节项（降序待删保下标有效）。
-    let mut map = base_map;
-    removed.sort_unstable();
-    for del in removed.into_iter().rev() {
-        if del < map.len() {
-            map.remove(del);
-        }
-    }
-    (out.into(), runs, notes, note_defs, map)
-}
-
 /// 段落文本的行首/行尾修整：剥掉 ASCII 空格/Tab 与尾部空白，但**保留行首全角空格**
 /// （U+3000 在 Rust 的 `str::trim` 里也算空白——EPUB 正文首行缩进「　　」靠它实现，
 /// 不能被这里吃掉）。普通 Markdown 段落行首没有全角空格，行为与以前一致。
@@ -616,29 +534,14 @@ fn list_prefix(t: &str) -> Option<(SharedString, &str)> {
 
 /// 按未转义的 `|` 拆表格行，`\|` / `\\` 先被解义，再 trim 每个单元格，
 /// 并去掉首尾的空 cell（`| a | b |` → `["a", "b"]`）。
-fn split_table_cells(line: &str) -> Vec<SharedString> {
-    let mut cells: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut it = line.chars().peekable();
-    while let Some(c) = it.next() {
-        match c {
-            '\\' => {
-                if let Some(&n) = it.peek() {
-                    if n == '|' || n == '\\' {
-                        cur.push(n);
-                        it.next();
-                    } else {
-                        cur.push('\\');
-                    }
-                } else {
-                    cur.push('\\');
-                }
-            }
-            '|' => cells.push(std::mem::take(&mut cur)),
-            _ => cur.push(c),
-        }
-    }
-    cells.push(cur);
+///
+/// 单元格**边界**判定复用 `cells::split_unescaped_pipes`（与 live `table_cells`
+/// 共用同一字节机制，见 `markdown::parity`）；本函数另做显示层清理（解义转义竖线）。
+/// `pub(crate)` 供奇偶测试（`markdown::parity`）对照 live 侧的 `table_cells`。
+pub(crate) fn split_table_cells(line: &str) -> Vec<SharedString> {
+    let mut cells: Vec<String> = cells::split_unescaped_pipes(line)
+        .map(unescape_table_cell)
+        .collect();
     if cells.first().is_some_and(|s| s.trim().is_empty()) {
         cells.remove(0);
     }
@@ -646,6 +549,26 @@ fn split_table_cells(line: &str) -> Vec<SharedString> {
         cells.pop();
     }
     cells.into_iter().map(|s| s.trim().to_string().into()).collect()
+}
+
+/// 预览用单元格显示清理：`\|`→`|`、`\\`→`\`（其余 `\x` 原样保留）。
+/// live 侧保留转义原样（源码逐字节、光标/IME 映射），差异见 `parity` #7。
+fn unescape_table_cell(s: &str) -> String {
+    let mut out = String::new();
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.peek() {
+                Some(&n @ ('|' | '\\')) => {
+                    out.push(n);
+                    it.next();
+                }
+                _ => out.push('\\'),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// 分隔行每格必须是 `:?-+:?`（冒号 + 全短横），返回每列对齐；任一格不合规返回 None。
@@ -860,161 +783,6 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
         idx += 1;
     }
     rows
-}
-
-/// `seg` 相对 `src` 的字节偏移（供映射表换算成文档坐标）。
-fn byte_offset(src: &str, seg: &str) -> usize {
-    seg.as_ptr() as usize - src.as_ptr() as usize
-}
-
-/// 实时预览编辑（WYSIWYG）用的渲染行：在 [`Row`] 基础上追加**渲染位置 ↔ 源码字节**
-/// 的映射，让「点击渲染文本 / 光标定位」能换算回 Buffer 的字节偏移。
-#[derive(Clone, Debug)]
-pub struct LiveRow {
-    /// 渲染行本体（与 [`parse_to_rows`] 产出的 `Row` 完全一致）。
-    pub row: Row,
-    /// 该块首个源码字节（文档坐标；非文本行点击/光标落点用它）。
-    pub source_start: usize,
-    /// 渲染字节 → 文档源字节（`len = row.text.len()+1`，末尾为行尾哨兵）。
-    /// 仅文本行（段落/标题/引述/列表）填充；代码/表格/图片/空行 = 空。
-    pub map: Vec<usize>,
-}
-
-impl LiveRow {
-    /// 渲染位置（字节，相对 `row.text`）→ 源码字节；非文本行返回 `source_start`。
-    pub fn rendered_to_source(&self, rendered_byte: usize) -> usize {
-        if self.map.is_empty() {
-            return self.source_start;
-        }
-        let r = rendered_byte.min(self.map.len() - 1);
-        self.map[r]
-    }
-}
-
-/// [`parse_to_rows`] 的实时编辑变体：额外产出每行的 [`LiveRow`] 映射。
-///
-/// 与 [`parse_to_rows`] 用同一套块判定与行内清理（保证渲染结果一致），仅多算
-/// 文档坐标的字节偏移与内联映射。供小/中文档的实时预览编辑使用（整篇解析）。
-pub fn parse_to_rows_live(src: &str) -> Vec<LiveRow> {
-    let line_starts = build_line_starts_u32(src);
-    let lines: Vec<&str> = src.split('\n').collect();
-    let mut out: Vec<LiveRow> = Vec::new();
-    let mut idx = 0usize;
-    while idx < lines.len() {
-        let row_start = idx;
-        let rl = lines[idx].trim_end_matches('\r');
-        let ls = line_starts[row_start] as usize;
-        let (align, line) = strip_align_directive(rl);
-        let t = line.trim_start();
-        // 围栏：整块折叠成一个 Code 渲染行（非文本行，点击落点 = 围栏首字节）
-        if let Some((fc, _)) = fence_len(t) {
-            let mut code_lines = Vec::new();
-            let language = fence_language(t).map(|s| s.into());
-            idx += 1;
-            while idx < lines.len() {
-                let l = lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start()) {
-                    if c == fc {
-                        idx += 1;
-                        break;
-                    }
-                }
-                code_lines.push(SharedString::from(l));
-                idx += 1;
-            }
-            out.push(LiveRow {
-                row: Row::code_block(code_lines, language).with_line(row_start),
-                source_start: ls,
-                map: Vec::new(),
-            });
-            continue;
-        }
-        if t.is_empty() {
-            out.push(LiveRow {
-                row: Row::new("", RowKind::Blank, Vec::new(), None).with_line(row_start),
-                source_start: ls,
-                map: Vec::new(),
-            });
-            idx += 1;
-            continue;
-        }
-        // 文本行：段落/标题/引述/列表走同一映射装配（segment → LiveRow）
-        let mk = |segment: &str, kind: RowKind, prefix: Option<SharedString>, align: Option<RowAlign>, row_start: usize, ls: usize| {
-            let (raw, runs, seg_map) = inline_style_mapped(segment);
-            let (text, runs, notes, defs, rel_map) = extract_notes_mapped(raw, runs, seg_map);
-            let base = byte_offset(src, segment);
-            let map = rel_map.into_iter().map(|b| base + b).collect();
-            let row = Row::new(text.as_ref(), kind, runs, prefix)
-                .with_line(row_start)
-                .with_format(align, notes, defs);
-            LiveRow { row, source_start: ls, map }
-        };
-        // 标题：`#{1,6} ` 后跟内容
-        let hashes = t.chars().take_while(|&c| c == '#').count();
-        if (1..=6).contains(&hashes) && t.len() > hashes {
-            out.push(mk(t[hashes..].trim_start(), RowKind::Heading(hashes as u8), None, align, row_start, ls));
-            idx += 1;
-            continue;
-        }
-        // 引述：`>` 开头
-        if t.starts_with('>') {
-            let (content_align, rest) = strip_align_directive(t.trim_start_matches('>').trim_start());
-            let align = content_align.or(align);
-            out.push(mk(rest, RowKind::Quote, None, align, row_start, ls));
-            idx += 1;
-            continue;
-        }
-        // 列表项：`- ` / `* ` / `+ ` / `1. ` / 任务列表
-        if let Some((prefix, content)) = list_prefix(t) {
-            let (content_align, content) = strip_align_directive(content);
-            let align = content_align.or(align);
-            out.push(mk(content, RowKind::Bullet, Some(prefix.clone()), align, row_start, ls));
-            idx += 1;
-            continue;
-        }
-        // 水平分隔线
-        if is_rule(t) {
-            out.push(LiveRow {
-                row: Row::new("", RowKind::Rule, Vec::new(), None).with_line(row_start),
-                source_start: ls,
-                map: Vec::new(),
-            });
-            idx += 1;
-            continue;
-        }
-        // 独立图片行：`![alt](src)` 整行占位
-        if let Some((alt, src)) = parse_image_line(t) {
-            out.push(LiveRow {
-                row: Row::new_image(&alt, &src).with_line(row_start),
-                source_start: ls,
-                map: Vec::new(),
-            });
-            idx += 1;
-            continue;
-        }
-        // 表格：当前行是表头、下一行是分隔行
-        if let Some((table, consumed)) = try_parse_table(&lines, idx) {
-            out.push(LiveRow {
-                row: Row::with_table(table).with_line(row_start),
-                source_start: ls,
-                map: Vec::new(),
-            });
-            idx += consumed;
-            continue;
-        }
-        out.push(mk(trim_paragraph(line), RowKind::Paragraph, None, align, row_start, ls));
-        idx += 1;
-    }
-    out
-}
-
-/// 渲染行的 Numeric 类型辅助：该行是否**文本行**（段落/标题/引述/列表），
-/// 即可以做「渲染字节 ↔ 源码字节」字符级编辑映射的行。
-pub fn is_text_kind(kind: RowKind) -> bool {
-    matches!(
-        kind,
-        RowKind::Paragraph | RowKind::Heading(_) | RowKind::Bullet | RowKind::Quote
-    )
 }
 
 /// 一个渲染行的**轻量元数据**（只存行号/类型/几个长度，不复制文本）。
@@ -2296,92 +2064,6 @@ pub(crate) fn rows_memory_estimate(rows: &[Row]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn live_mapping_paragraph_bold_cjk() {
-        // `rendered_to_source` 把渲染位置换算回文档字节；`**` 记号被剥（2 处各剥 2 字节）。
-        let src = "前 **加粗** 后";
-        let live = parse_to_rows_live(src);
-        assert_eq!(live.len(), 1);
-        let lr = &live[0];
-        assert_eq!(lr.row.text.as_ref(), "前 加粗 后");
-        let map = &lr.map;
-        assert_eq!(map.len(), lr.row.text.len() + 1, "映射应覆盖渲染文本+哨兵");
-        // 开头 0..3 = 前，3 = 空格；加粗内容起点 = 源 6
-        assert_eq!(lr.rendered_to_source(0), 0);
-        assert_eq!(lr.rendered_to_source(3), 3);
-        let b_for_6 = map.iter().position(|&v| v == 6).expect("源 6 应有渲染位置");
-        assert_eq!(lr.rendered_to_source(b_for_6), 6);
-    }
-
-    #[test]
-    fn live_mapping_heading_bullet_quote() {
-        let src = "# Head\n- item **b**\n> q";
-        let live = parse_to_rows_live(src);
-        assert_eq!(live.len(), 3);
-        // 标题：`# ` 剥掉，渲染 "Head"，map[0]=源 2（H 的字节）
-        assert_eq!(live[0].row.kind, RowKind::Heading(1));
-        assert_eq!(live[0].row.text.as_ref(), "Head");
-        assert_eq!(live[0].map[0], 2, "map={:?} text={:?}", live[0].map, live[0].row.text);
-        assert_eq!(live[0].rendered_to_source(0), 2);
-        // 列表：`- ` 剥掉，渲染 "item b"；`**b**` 里 b 的源字节 = 9
-        assert_eq!(live[1].row.kind, RowKind::Bullet);
-        assert_eq!(live[1].row.text.as_ref(), "item b");
-        // `**b**` 里 b 的源字节 = 16（"# Head\n"=7 + "- "=2 + "item "=5 + "**"=2）
-        assert_eq!(
-            live[1].map.iter().position(|&v| v == 16),
-            Some(5),
-            "bullet map={:?} src={:?}",
-            live[1].map,
-            src
-        );
-        // 引述：`> ` 剥掉，渲染 "q"；'> q' 在源 20..23，q 字节约 22
-        assert_eq!(live[2].row.kind, RowKind::Quote);
-        assert_eq!(live[2].row.text.as_ref(), "q");
-        assert_eq!(live[2].map[0], 22, "quote map={:?}", live[2].map);
-    }
-
-    #[test]
-    fn live_mapping_cjk_roundtrip() {
-        // 中文字符按字节映射（不拆 UTF-8）。"**你好**" = 2+6+2 = 10 字节。
-        let src = "**你好**";
-        let live = parse_to_rows_live(src);
-        let lr = &live[0];
-        assert_eq!(lr.row.text.as_ref(), "你好");
-        // 你=源 2..5，好=5..8；哨兵 = 源 10
-        assert_eq!(lr.rendered_to_source(0), 2);
-        assert_eq!(lr.rendered_to_source(3), 5);
-        assert_eq!(lr.rendered_to_source(6), 10, "渲染尾哨兵 = 段源尾");
-    }
-
-    #[test]
-    fn live_block_rows_have_source_start_no_map() {
-        let src = "~~~a\nx\n~~~\n\n![img](a.png)\n\n| a | b |\n| - | - |\n| 1 | 2 |";
-        let live = parse_to_rows_live(src);
-        // 行序：Code(0) Blank(11) Image(12) Blank(25) Table(27)
-        assert_eq!(live.len(), 5);
-        assert_eq!(live[0].row.kind, RowKind::Code);
-        assert_eq!(live[0].source_start, 0);
-        assert!(live[0].map.is_empty());
-        assert_eq!(live[2].row.kind, RowKind::Image);
-        assert_eq!(live[2].source_start, 12);
-        assert!(live[2].map.is_empty());
-        assert_eq!(live[4].row.kind, RowKind::Table);
-        assert_eq!(live[4].source_start, 27);
-        assert!(live[4].map.is_empty());
-    }
-
-    #[test]
-    fn is_text_kind_covers_editable_rows() {
-        assert!(is_text_kind(RowKind::Paragraph));
-        assert!(is_text_kind(RowKind::Heading(2)));
-        assert!(is_text_kind(RowKind::Bullet));
-        assert!(is_text_kind(RowKind::Quote));
-        assert!(!is_text_kind(RowKind::Code));
-        assert!(!is_text_kind(RowKind::Table));
-        assert!(!is_text_kind(RowKind::Image));
-    }
-
 
     #[test]
     fn parses_headings_fences_lists() {

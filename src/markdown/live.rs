@@ -30,8 +30,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-mod markdown_syntax;
-pub use markdown_syntax::{AlertIcons, MathAlign, PropertyIconFn, SyntaxStyle};
+pub(crate) mod markdown_syntax;
+pub use markdown_syntax::{MathAlign, SyntaxStyle};
 
 mod tables;
 use tables::*;

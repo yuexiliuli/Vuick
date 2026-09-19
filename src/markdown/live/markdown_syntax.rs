@@ -17,6 +17,8 @@ use gpui::{
     hsla, px,
 };
 
+use crate::markdown::cells::{is_backslash_escaped, split_unescaped_pipes};
+
 use super::Diagnostic;
 
 /// Colors + monospace font for inline markdown styling, supplied by the host so
@@ -2176,31 +2178,9 @@ pub(crate) fn table_cells(line: &str) -> Vec<&str> {
     split_unescaped_pipes(t).map(str::trim).collect()
 }
 
-/// Split `s` at its UNESCAPED `|` bytes — a `\|` (odd run of preceding
-/// backslashes) is literal cell content per GFM, not a cell separator. The
-/// escape stays in the returned slices (cells are verbatim source), so cell
-/// ranges and caret math keep their exact source mapping, and a rewrite that
-/// re-joins the cells round-trips the escape.
-fn split_unescaped_pipes(s: &str) -> impl Iterator<Item = &str> {
-    let b = s.as_bytes();
-    let mut cuts = vec![0usize];
-    for (i, &c) in b.iter().enumerate() {
-        if c == b'|' && !is_backslash_escaped(b, i) {
-            cuts.push(i + 1);
-        }
-    }
-    cuts.push(s.len() + 1);
-    (0..cuts.len() - 1).map(move |k| &s[cuts[k]..cuts[k + 1] - 1])
-}
-
-/// Whether the byte at `i` is escaped: preceded by an ODD number of `\`s.
-fn is_backslash_escaped(b: &[u8], i: usize) -> bool {
-    let mut n = 0;
-    while n < i && b[i - 1 - n] == b'\\' {
-        n += 1;
-    }
-    n % 2 == 1
-}
+/// The unescaped-pipe splitter and backslash-escape check live in
+/// [`crate::markdown::cells`] — shared byte machinery with the preview parser
+/// (edge semantics pinned by `markdown::parity`).
 
 /// The byte range of each cell's *trimmed content* within `line` (line-local), in
 /// the same order as [`table_cells`]. Lets the editor place the caret inside a

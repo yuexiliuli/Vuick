@@ -13,6 +13,11 @@ mod live;
 mod parser;
 pub(crate) mod view;
 
+mod cells;
+
+#[cfg(test)]
+mod parity;
+
 pub use live::{bind_keys, EditorEvent, MarkdownLivePreview, SyntaxStyle};
 pub use parser::{scan_blocks, scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};
 pub use view::{MarkdownPreview, PreviewSrc};
