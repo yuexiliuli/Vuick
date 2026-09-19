@@ -529,6 +529,73 @@ fn window_handle(cx: &mut VisualTestContext) -> gpui::AnyWindowHandle {
 }
 
 #[gpui::test]
+fn font_size_change_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
+    // 回归（2026-09-19 用户反馈）：编辑区 Ctrl+滚轮放大/缩小字号时窗口也跟着滚动。
+    // 修复 = 行高变化时把滚动目标同比换算（同 PDF 的视口锚定）——视口顶部的内容点
+    // 不随行高变化跳走。这里直接改字号覆盖（等价于 Ctrl+滚轮 / Ctrl+=/- 的落地路径），
+    // 断言「滚动 px 按行高比缩放、顶部绝对视觉行不变」。
+    let text = (1..=300).map(|i| format!("第{i}行")).collect::<Vec<_>>().join("\n");
+    let (host, mut cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 普通滚轮（非 Ctrl）滚到中段 → 作为缩放前的视口锚点。
+    let b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    let pos = point(
+        px(b.origin.x.as_f32() + b.size.width.as_f32() / 2.0),
+        px(b.origin.y.as_f32() + b.size.height.as_f32() / 2.0),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-3000.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(&mut cx);
+    let (d1, lh1, f0) = cx.update(|_, cx| {
+        let ed = ed.read(cx);
+        (ed.test_desired_scroll_px(), ed.test_metrics().1, ed.font_size_px())
+    });
+    assert!(d1 > 0., "应先滚到中段（d1={d1}）");
+    // 放大字号 → 行高变大 → 滚动目标应按行高比缩放（视口顶部内容点锚定）。
+    ed.update(cx, |ed, cx| {
+        ed.set_font_override(Some(f0 + 6.0));
+        cx.notify();
+    });
+    settle(&mut cx);
+    let (d2, lh2) = cx.update(|_, cx| {
+        let ed = ed.read(cx);
+        (ed.test_desired_scroll_px(), ed.test_metrics().1)
+    });
+    assert!(lh2 > lh1, "放大后行高应变大：{lh1} → {lh2}");
+    assert!(
+        (d2 - d1 * (lh2 / lh1)).abs() < lh1 * 0.5,
+        "滚动目标应按行高比缩放（锚定视口）：{d1} → {d2}（期望 {:.1}）",
+        d1 * (lh2 / lh1)
+    );
+    let row1 = (d1 / lh1).floor();
+    let row2 = (d2 / lh2).floor();
+    assert!(
+        (row2 - row1).abs() <= 2.0,
+        "缩放后顶部所在绝对视觉行应不变：{row1} → {row2}"
+    );
+    // 缩小（回到略小于初始）→ 反向同样锚定。
+    ed.update(cx, |ed, cx| {
+        ed.set_font_override(Some(f0 - 2.0));
+        cx.notify();
+    });
+    settle(&mut cx);
+    let (d3, lh3) = cx.update(|_, cx| {
+        let ed = ed.read(cx);
+        (ed.test_desired_scroll_px(), ed.test_metrics().1)
+    });
+    assert!(lh3 < lh2, "缩小后行高应变小：{lh2} → {lh3}");
+    assert!(
+        (d3 - d1 * (lh3 / lh1)).abs() < lh1 * 0.5,
+        "缩小同样按行高比锚定：{d1} → {d3}（期望 {:.1}）",
+        d1 * (lh3 / lh1)
+    );
+}
+
+#[gpui::test]
 fn editor_bottom_pad_quantized_to_line_height(cx: &mut TestAppContext) {
     // 回归（专家评审 P4）：底部预留（横向滚动条厚 16px + 额外行高）向上量化到
     // line_height 整数倍——否则滚到底视口停在「行间半格」上，最后一行加载/点击

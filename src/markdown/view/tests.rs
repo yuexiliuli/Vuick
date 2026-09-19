@@ -490,6 +490,98 @@ fn font_zoom_updates_override(cx: &mut TestAppContext) {
     );
 }
 
+/// Ctrl+滚轮（EPUB 阅读）：缩放字号**不带动页面滚动**（同 PDF 视口锚定）。
+///
+/// 覆盖层（md-zoom-overlay）最后绘制 → bubble 先于内部 List 的原生滚动运行，
+/// Ctrl 时 stop_propagation：字体放大而滚动位置（视口顶部块）保持不动；
+/// 普通滚轮（非 Ctrl）不被该覆盖层拦截，仍照常滚动、字号不变。
+#[gpui::test]
+fn ctrl_wheel_zooms_font_without_scrolling(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 大文档（块数 > WINDOWED_MIN_BLOCKS）→ 窗口级懒解析，纵向可滚。
+    let mut src = String::new();
+    for i in 0..1000 {
+        src.push_str(&format!("# 第{i}章\n\n正文段落内容 alpha，用于缩放手感验证。\n- 列表项\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(
+                PreviewSrc::from(gpui::SharedString::from(src.clone())),
+                std::rc::Rc::new(crate::markdown::scan_blocks(&src)),
+                cx,
+            );
+        });
+    });
+    cx.simulate_resize(size(px(600.), px(700.)));
+    settle(cx);
+    let n = cx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+    assert!(
+        n > crate::config::limits::WINDOWED_MIN_BLOCKS,
+        "应启用窗口级懒解析，块数 {n}"
+    );
+    // 跳到文档中部（留出双向滚动余量）。
+    let mid = n / 2;
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.scroll_to_row(mid);
+            cx.notify();
+        });
+    });
+    settle(cx);
+    let def = cx.update(|_, cx| StyleParams::from_theme_with_font(cx, None).para_size.as_f32());
+    let (before_block, _before_off) = cx.update(|_, cx| host.read(cx).md.read(cx).test_abs_scroll_top());
+    assert!(before_block > 100, "应已滚到中部（block={before_block}）");
+
+    let pos = {
+        let b = cx.debug_bounds("md-preview-root").expect("预览根应渲染");
+        point(
+            px(b.origin.x.as_f32() + b.size.width.as_f32() * 0.5),
+            px(b.origin.y.as_f32() + b.size.height.as_f32() * 0.5),
+        )
+    };
+    // Ctrl+向上滚（放大）：字号变大，且滚动位置（视口顶部块）不变（不滚动）。
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(240.))),
+        modifiers: Modifiers { control: true, ..Default::default() },
+        ..Default::default()
+    });
+    settle(cx);
+    let f1 = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
+    assert!(f1.is_some() && f1.unwrap() > def, "Ctrl+向上滚应放大字号：{f1:?}");
+    let (after_block, _after_off) = cx.update(|_, cx| host.read(cx).md.read(cx).test_abs_scroll_top());
+    assert!(
+        (after_block as i64 - before_block as i64).abs() <= 2,
+        "Ctrl 缩放不应滚动：视口顶部块 {before_block} → {after_block}"
+    );
+
+    // 普通滚轮（非 Ctrl）：不被覆盖层拦截，照常滚动、字号不变。
+    let f_before_plain = f1.unwrap();
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(240.))),
+        modifiers: Modifiers::default(),
+        ..Default::default()
+    });
+    settle(cx);
+    let (f2, plain_block) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (md.font_override, md.test_abs_scroll_top().0)
+    });
+    assert_eq!(f2, Some(f_before_plain), "普通滚轮不应改变字号");
+    assert!(
+        plain_block != after_block,
+        "普通滚轮应照常滚动（块 {after_block} → {plain_block}）"
+    );
+}
+
 /// EPUB 目录数据：标题行应进入 toc；scroll_to_row 定位不 panic（目录跳转由侧边栏提供）。
 #[gpui::test]
 fn toc_builds_and_scrolls(cx: &mut TestAppContext) {

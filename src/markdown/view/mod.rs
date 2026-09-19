@@ -345,6 +345,10 @@ pub struct MarkdownPreview {
     block_h: Vec<f32>,
     height_pref: Vec<f32>,
     height_stride: usize,
+    /// Ctrl+滚轮缩放字号时的滚动锚点 `(块号, 块内比例 0..1)`：字号变化高度模型
+    /// 重建后，据此把缩放前视口顶部的内容点放回原位（同 PDF 视口锚定）。
+    /// `None` = 无待恢复的锚点；由字号变化捕获、render 重建模型后消费。
+    zoom_anchor: Option<(usize, f32)>,
 }
 
 impl MarkdownPreview {
@@ -396,6 +400,7 @@ impl MarkdownPreview {
             block_h: Vec::new(),
             height_pref: Vec::new(),
             height_stride: 1,
+            zoom_anchor: None,
         }
     }
 
@@ -487,7 +492,44 @@ impl MarkdownPreview {
     /// 在当前字号基础上增减（EPUB 滚动缩放）；返回新的字号覆盖。
     pub fn bump_font_size(&mut self, delta: f32, cx: &mut App, current_default: f32) {
         let base = self.font_override.unwrap_or(current_default);
+        // 缩放前先记录视口锚点：字号变化高度模型重建后,视口顶部内容点不随之跳走。
+        self.capture_zoom_anchor();
         self.set_font_override(Some((base + delta).clamp(9.0, 32.0)), cx);
+    }
+
+    /// 捕获当前视口顶部的内容点锚点 `(块号, 块内比例)`。比例 = 块内偏移 ÷ 块高，
+    /// 与块高无关、跨字号稳定（缩放后按新块高乘回即可原比例放回顶部）。
+    fn capture_zoom_anchor(&mut self) {
+        let top_px = self.scroll_top_px();
+        let (block, frac) = self.block_of_px(top_px);
+        let h = self.block_height_at(block);
+        let ratio = if h > 0.0 { (frac / h).clamp(0.0, 1.0) } else { 0.0 };
+        self.zoom_anchor = Some((block, ratio));
+    }
+
+    /// 第 `block` 块的渲染高度（px；窗口模式 = 采样模型组高近似，小文档 = 平均高）。
+    fn block_height_at(&self, block: usize) -> f32 {
+        if self.height_pref.is_empty() {
+            return self.est_hint.max(1.0);
+        }
+        let stride = self.height_stride.max(1);
+        let g = (block / stride).min(self.block_h.len().saturating_sub(1));
+        self.block_h.get(g).copied().unwrap_or(1.0).max(1.0)
+    }
+
+    /// 把缩放前的视口锚点恢复为新的滚动目标 px。必须在高度模型 / 平均行高已按
+    /// 新字号重建后调用（窗口模式在 `rebuild_height_model` 后、小文档在
+    /// `update_height_hint` 后），否则按旧模型换算仍会跳。恢复后清空锚点。
+    fn restore_zoom_anchor(&mut self) {
+        let Some((block, ratio)) = self.zoom_anchor.take() else {
+            return;
+        };
+        let new_px = self.px_of_block(block) + ratio * self.block_height_at(block);
+        if self.index.is_some() {
+            self.desired_scroll.set(new_px);
+        } else {
+            self.scroll_to_px(new_px);
+        }
     }
 
     /// 重建尺寸估算（换行/字号/内容变化后调用）。
@@ -1754,12 +1796,17 @@ impl Render for MarkdownPreview {
             if self.est_hint_width < 0.0 || (self.est_hint_width - pane_w).abs() >= 2.0 {
                 self.rebuild_height_model(&p, pane_w);
             }
+            // 字号缩放后：模型已按新字号重建，把缩放前的视口锚点换算出新的滚动目标，
+            // 再落窗口（在 apply_desired 之前），保证 Ctrl+滚轮放大/缩小不带动页面滚动。
+            self.restore_zoom_anchor();
             self.apply_desired(self.desired_scroll.get());
         } else {
             // 小文档：原来的统一高度提示量程路径不变。
             if self.update_height_hint(cx, pane_w) {
                 cx.notify();
             }
+            // 字号缩放后：平均行高已按新字号刷新 → 把视口锚点恢复为新的滚动位置。
+            self.restore_zoom_anchor();
         }
         crate::prof::end("md_hint", _t_hint);
         // 窗口模式：按当前可见范围预物化行的窗口。必须在构造 list 闭包前完成，
@@ -2041,8 +2088,8 @@ impl Render for MarkdownPreview {
         }
         .into_any_element();
 
-        // 外层容器：Ctrl+滚轮缩放字号（EPUB 阅读）；窗口模式普通滚轮走自持像素滚动；
-        // 相对定位承载目录浮层/面板开关。
+        // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动
+        // （Ctrl 滚轮缩放由下方 `md-zoom-overlay` 拦截，这里只处理普通滚轮的像素滚动）。
         let root = div()
             .id("md-preview-root")
             .debug_selector(|| "md-preview-root".into())
@@ -2050,20 +2097,6 @@ impl Render for MarkdownPreview {
             .relative()
             .on_scroll_wheel(cx.listener(
                 |this: &mut MarkdownPreview, event: &ScrollWheelEvent, _w, cx| {
-                    if event.modifiers.control {
-                        let delta_y = match event.delta {
-                            ScrollDelta::Lines(lines) => lines.y,
-                            ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-                        };
-                        let step = delta_y.clamp(-1.0, 1.0);
-                        if step != 0.0 {
-                            let default =
-                                StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
-                            this.bump_font_size(step * 1.5, cx, default);
-                            cx.notify();
-                        }
-                        return;
-                    }
                     // 窗口模式：List 固定窗口自身无可滚高度（overdraw=0、不预铺高度），
                     // 纵向滚动完全由像素模型驱动（覆盖任何 List 内部滚轮残留位移）。
                     if this.index.is_some() {
@@ -2077,9 +2110,39 @@ impl Render for MarkdownPreview {
                         }
                     }
                 },
-            ));
+            ))
+            .child(core)
+            // Ctrl+滚轮缩放字号（EPUB 阅读）：挂在整个预览区之上的覆盖层（最后绘制、
+            // 命中测试最靠前 → bubble 先于内部 List 的原生滚动运行），Ctrl 时
+            // stop_propagation → 缩放不带动页面滚动；普通滚轮不拦截，仍按原路径滚动。
+            .child(
+                div()
+                    .id("md-zoom-overlay")
+                    .debug_selector(|| "md-zoom-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .on_scroll_wheel(cx.listener(
+                        |this: &mut MarkdownPreview, event: &ScrollWheelEvent, _w, cx| {
+                            if !event.modifiers.control {
+                                return;
+                            }
+                            let delta_y = match event.delta {
+                                ScrollDelta::Lines(lines) => lines.y,
+                                ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
+                            };
+                            let step = delta_y.clamp(-1.0, 1.0);
+                            if step != 0.0 {
+                                let default =
+                                    StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
+                                this.bump_font_size(step * 1.5, cx, default);
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        },
+                    )),
+            );
 
-        let out = root.child(core);
+        let out = root;
         crate::prof::end("md_render", _t_render);
         out
     }

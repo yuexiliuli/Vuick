@@ -623,6 +623,17 @@ impl CodeEditor {
             .ch_advance(text_system.resolve_font(&font), font_size)
             .unwrap_or(px(font_size.as_f32() * 0.6));
 
+        // 字号缩放（Ctrl+滚轮 / Ctrl+=/-）会同比改变行高：把「用户滚动目标」按行高比
+        // 换算，把视口顶部的内容点锚定住（同 PDF 的视口锚定）——否则放大/缩小的瞬间
+        // 行高变了但滚动 px 没变，正文会“跳”（窗口也随之滚动）。首次布局（行高 0）
+        // 与行高不变时不动作。横向以 h_handle 的像素偏移为准，天然保持像素锚点。
+        let old_lh = self.line_height.as_f32();
+        let new_lh = line_height.as_f32();
+        if old_lh > 0. && new_lh > 0. && (new_lh - old_lh).abs() >= 0.01 {
+            let d = self.desired_scroll.get();
+            self.desired_scroll.set(d * (new_lh / old_lh));
+        }
+
         self.mono = mono;
         self.font_size = font_size;
         self.line_height = line_height;
