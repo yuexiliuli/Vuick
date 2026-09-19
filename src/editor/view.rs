@@ -48,6 +48,7 @@ use crate::config::layout::{
     BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_CLOSE_TAIL_LINES, BRACKET_GUIDE_OPEN_HEAD_LINES,
     BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
 };
+use crate::editor::markdown::MarkdownDecor;
 use crate::config::limits::EDITOR_VSCROLL_BOTTOM_EXTRA_LINES;
 use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES;
 use crate::editor::fold::{scan_bracket_pairs, BracketPair, Fold, FoldMap};
@@ -143,6 +144,11 @@ pub struct CodeEditor {
     list_state: ListState,
     h_handle: ScrollHandle,
     highlighter: Highlighter,
+    /// Markdown「所见即所得」滤镜：.md 时替代 syntect 行高亮，把记号画淡、正文
+    /// 应用加粗/斜体/代码/链接/标题等富样式（只改样式，文本/光标/选区不变）。
+    md_decor: MarkdownDecor,
+    /// 是否为 Markdown 文档（true 时行渲染走滤镜扫描而非 syntect）。
+    md_mode: bool,
     language: Option<String>,
 
     // —— 字体度量（render 时由主题解析）——
@@ -260,6 +266,8 @@ impl CodeEditor {
             list_state,
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
+            md_decor: MarkdownDecor::default(),
+            md_mode: false,
             language: None,
             mono: SharedString::new_static(""),
             font_size: px(0.),
@@ -318,6 +326,9 @@ impl CodeEditor {
     /// 设置语法高亮语言（`Some("rust")` / `None` 关闭）。
     pub fn set_language(&mut self, language: Option<&str>) {
         self.language = language.map(|s| s.to_owned());
+        // Markdown 文档行渲染切到「所见即所得」滤镜（syntect 的 md 高亮不再使用，
+        // 但仍保留 syntect 用于其余语言）。`.md` 由 app 统一以 "markdown" 接入。
+        self.md_mode = matches!(language, Some("markdown"));
         self.highlighter.set_language(language);
     }
 
@@ -477,6 +488,25 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_list_window_len(&self) -> usize {
         self.list_state.item_count()
+    }
+
+    /// 测试：对指定逻辑行走真实的 `build_rows` 取数路径，返回该行**最终样式段**
+    /// （Markdown 滤镜或 syntect，选区合并前）。用于验证 Markdown WYSIWYG 接线
+    /// （`md_mode → scan_window → row_data → merge_highlights`）。
+    #[cfg(test)]
+    pub(crate) fn test_line_styles(
+        &mut self,
+        window: &mut Window,
+        logical_row: usize,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        if logical_row >= self.row_count || logical_row >= self.buffer.line_count() {
+            return Vec::new();
+        }
+        self.build_rows(window, logical_row, logical_row, false)
+            .into_iter()
+            .next()
+            .map(|rd| rd.highlights)
+            .unwrap_or_default()
     }
 
     /// 测试：当前固定窗口首行绝对行号。
@@ -834,7 +864,7 @@ impl CodeEditor {
         window: &mut Window,
         row: usize,
         show_caret: bool,
-        hl_runs: &[(Range<usize>, Hsla)],
+        hl_styles: &[(Range<usize>, HighlightStyle)],
     ) -> RowData {
         if self.row_count == 0 || self.buffer.line_count() == 0 || row >= self.row_count {
             return RowData::empty();
@@ -871,8 +901,9 @@ impl CodeEditor {
             };
         }
 
-        // 语法着色：`hl_runs` 是已按整窗批量解析的窗口内本行范围，且是
-        // **行内字节坐标**（syntect `parse_line` 相对本行文本），直接转样式段。
+        // 语法/滤镜着色：`hl_styles` 已按整窗批量解析，且是**行内字节坐标
+        // （syntect`parse_line` 相对本行文本；Markdown 滤镜扫描同样相对本行）。
+        // 直接与选区合并成非重叠样式段（含加粗/斜体/淡化等富样式字段）。
         // 注意：选区底色不能“附在语法段后面一并交出去”。gpui `StyledText`
         // 的 `compute_runs` 假定各 highlight **互不重叠**；选区必然横跨多个语法段，
         // 重叠会使 run 总量超出整行字节长（实测 42 > 18），`shape_text` 按行尾
@@ -892,7 +923,7 @@ impl CodeEditor {
         } else {
             None
         };
-        let highlights = merge_highlights(hl_runs, sel_range, self.sel_bg);
+        let highlights = merge_highlights(hl_styles, sel_range, self.sel_bg);
 
         // 光标：真实字形宽度（CJK 双宽不再按等宽列近似）→ 光标停在真实字符边界上
         // （横向滚动交给外层容器，行内文本从 x=0 全宽绘制，这里只算文本本地 x）。
@@ -945,18 +976,40 @@ impl CodeEditor {
         let lo_l = self.folds.logical_row(lo);
         let hi_l = self.folds.logical_row(hi);
         // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
-        // 借用，否则后续 `self.row_data` 与 `highlight_window` 的借用冲突）。
-        // 返回切片约定：第 0 项 = `lo_l` 行（`highlight_window` 已统一对齐到请求窗口）。
-        let hl_lines = self
-            .highlighter
-            .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
-            .to_vec();
+        // 借用，否则后续 `self.row_data` 与高亮窗口的借用冲突）。
+        // 返回切片约定：第 0 项 = `lo_l` 行（两级缓存均统一对齐到请求窗口）。
+        // Markdown 文档走「所见即所得」滤镜（记号淡化 + 正文富样式）；其余语言走
+        // syntect 语法高亮（`(Range, Hsla)` → 仅色 `HighlightStyle`）。
+        let hl_lines: Vec<Vec<(Range<usize>, HighlightStyle)>> = if self.md_mode {
+            self.md_decor
+                .scan_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
+                .to_vec()
+        } else {
+            self.highlighter
+                .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
+                .to_vec()
+                .into_iter()
+                .map(|runs| {
+                    runs.into_iter()
+                        .map(|(r, c)| {
+                            (
+                                r,
+                                HighlightStyle {
+                                    color: Some(c),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
         // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
         for v in lo..=hi {
             let logical = self.folds.logical_row(v);
-            let runs: &[(Range<usize>, Hsla)] = &hl_lines[logical - lo_l];
-            out.push(self.row_data(window, logical, show_caret, runs));
+            let styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
+            out.push(self.row_data(window, logical, show_caret, styles));
         }
         out
     }
@@ -2475,6 +2528,7 @@ impl Render for CodeEditor {
         // 高亮语言（主题明暗同步）
         let dark = gpui_component::Theme::global(cx).is_dark();
         self.highlighter.set_dark(dark);
+        self.md_decor.set_dark(dark);
 
         // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对视觉行号**（窗口基址 + 相对
         // 滚动；折叠后视觉行 = 逻辑行 − 其前隐藏行数，行窗口以视觉行为上界）。
@@ -2949,8 +3003,10 @@ fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
     StyledText::new(rd.text.clone()).with_highlights(rd.highlights.clone())
 }
 
-/// 把「语法着色段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
-/// 样式段，供 `StyledText` 使用。
+/// 把「着色/滤镜段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
+/// 样式段，供 `StyledText` 使用。输入已是最终 `HighlightStyle`（`build_rows` 里
+/// syntect 的 `(Range, Hsla)` 已转成仅 `color` 的样式；Markdown 滤镜直接产出完整
+/// 富样式：加粗 / 斜体 / 删除线 / 淡化 / 底色）。
 ///
 /// 决不能把选区（通常横跨多个语法段）作为**重叠**的独立 highlight 附在语法段
 /// 后面：gpui `StyledText::compute_runs` 假定 highlight 互不重叠（`text.rs` 里
@@ -2958,15 +3014,16 @@ fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
 /// 即停 → 尾部的选区整段被丢弃（选中底色不显示，表现为“语法高亮文件无法鼠标
 /// 选择”，同字节的 .txt/.md 因无语法段而正常）。
 ///
-/// 这里把 0..行尾 按「语法段边界 ∪ 选区边界」切成连续单元，逐单元：语法覆盖
-/// 则写 `color`，选区覆盖则写 `background_color`。产出严格递增、不重叠、每段
-/// 都在行内，run 总量恰为各覆盖区间之和 ≤ 行字节长。
+/// 这里把 0..行尾 按「样式段边界 ∪ 选区边界」切成连续单元，逐单元：取覆盖该单元
+/// 的首个样式段的**完整样式**（color/weight/italic/strike/fade/背景），选区覆盖则
+/// 覆盖 `background_color`。产出严格递增、不重叠、每段都在行内，run 总量恰为各
+/// 覆盖区间之和 ≤ 行字节长。
 pub(crate) fn merge_highlights(
-    runs: &[(Range<usize>, Hsla)],
+    runs: &[(Range<usize>, HighlightStyle)],
     sel: Option<Range<usize>>,
     sel_bg: Hsla,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    // 收集所有切分边界：语法段边界 ∪ 选区边界。
+    // 收集所有切分边界：样式段边界 ∪ 选区边界。
     let mut bounds: Vec<usize> = Vec::with_capacity(runs.len() * 2 + 3);
     for (r, _) in runs {
         let s = r.start.min(r.end);
@@ -2993,21 +3050,21 @@ pub(crate) fn merge_highlights(
             continue;
         }
         let mut style = HighlightStyle::default();
-        // 语法色：runs 互不重叠且升序，取首个覆盖 [a, b) 的段。
-        for (r, color) in runs {
+        // 样式段：runs 互不重叠且升序，取首个覆盖 [a, b) 的段（整段复制）。
+        for (r, s) in runs {
             if r.end <= a {
                 continue;
             }
             if r.start >= b {
                 break;
             }
-            style.color = Some(*color);
+            style = *s;
             break;
         }
         if sel.as_ref().is_some_and(|s| a >= s.start && b <= s.end) {
             style.background_color = Some(sel_bg);
         }
-        if style.color.is_some() || style.background_color.is_some() {
+        if style != HighlightStyle::default() {
             out.push((a..b, style));
         }
     }

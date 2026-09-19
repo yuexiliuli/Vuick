@@ -417,6 +417,12 @@ fn merge_highlights_keeps_selection_within_line_and_non_overlapping() {
     let rows = hl.highlight_window(&b, 0, 0, 0).to_vec();
     let runs = rows.get(0).cloned().unwrap_or_default();
     assert!(!runs.is_empty(), "rust 行应有语法段");
+    // `merge_highlights` 现在消费「仅色」的 `HighlightStyle` 段（syntect `(Range, Hsla)`
+    // 由 `build_rows` 转换；这里等价转换喂入）。
+    let runs: Vec<(std::ops::Range<usize>, HighlightStyle)> = runs
+        .iter()
+        .map(|(r, c)| (r.clone(), HighlightStyle { color: Some(*c), ..Default::default() }))
+        .collect();
 
     let sel_bg = gpui::rgb(0x0078d4).opacity(0.28).into();
     // 选区从中部到行尾（横跨多个语法段，正是旧的“重叠尾巴”场景）
@@ -526,6 +532,72 @@ fn editor_selection(host: &Entity<Host>, cx: &mut VisualTestContext) -> Selectio
 
 fn window_handle(cx: &mut VisualTestContext) -> gpui::AnyWindowHandle {
     cx.windows().first().copied().expect("有窗口")
+}
+
+#[gpui::test]
+fn markdown_editor_renders_wysiwyg_styles(cx: &mut TestAppContext) {
+    use std::ops::Range;
+    use gpui::HighlightStyle;
+
+    // Phase 1：`.md` 编辑区行渲染走「所见即所得」滤镜——记号淡化、正文富样式，
+    // 且底层纯文本完全不变（光标/选区/撤销/保存走原路径，无「视觉↔字节」映射）。
+    let text = "# 标题\n\n**加粗** `code` [链接](https://x) 与 *斜体*\n- 列表项\n> 引用\n";
+    let (host, mut cx) = open(cx, text);
+
+    // 非 md 语言不受滤镜影响（回归护栏：syntect 路径保持可用）
+    let _rust_row = cx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.set_language(Some("rust")));
+        ed.update(cx, |ed, _| ed.test_line_styles(window, 0))
+    });
+
+    // 切到 markdown → 启用滤镜
+    let row0 = cx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.set_language(Some("markdown")));
+        ed.update(cx, |ed, _| ed.test_line_styles(window, 0))
+    });
+    // 标题行：`#` 记号淡化 + 正文加粗
+    assert!(
+        row0.iter().any(|(_, s)| s.fade_out.is_some()),
+        "标题记号（#）应淡化: {row0:?}"
+    );
+    assert!(
+        row0.iter().any(|(_, s)| s.font_weight == Some(gpui::FontWeight::BOLD)),
+        "标题正文应加粗: {row0:?}"
+    );
+
+    // 第 3 行：**加粗** `code` [链接](https://x) 与 *斜体*
+    let row2 = cx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_line_styles(window, 2))
+    });
+    let has = |row: &[(Range<usize>, HighlightStyle)], pred: fn(&HighlightStyle) -> bool| {
+        row.iter().any(|(_, s)| pred(s))
+    };
+    assert!(
+        has(&row2, |s| s.font_weight == Some(gpui::FontWeight::BOLD)),
+        "应渲染加粗: {row2:?}"
+    );
+    assert!(
+        has(&row2, |s| s.font_style == Some(gpui::FontStyle::Italic)),
+        "应渲染斜体: {row2:?}"
+    );
+    assert!(
+        has(&row2, |s| s.background_color.is_some()),
+        "行内代码应有底色: {row2:?}"
+    );
+    assert!(
+        has(&row2, |s| s.fade_out.is_some()),
+        "记号应淡化: {row2:?}"
+    );
+    assert!(
+        has(&row2, |s| s.underline.is_some()),
+        "链接应有下划线: {row2:?}"
+    );
+
+    // 底层文本保持不变（所见≠所得底稿仍是纯 Markdown）
+    assert_eq!(editor_text(&host, &mut cx), text);
 }
 
 #[gpui::test]

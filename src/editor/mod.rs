@@ -37,6 +37,7 @@
 pub mod buffer;
 pub mod fold;
 pub mod highlight;
+mod markdown;
 pub mod movement;
 pub mod selection;
 pub mod undo;
