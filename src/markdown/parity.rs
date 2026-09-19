@@ -38,7 +38,7 @@ fn live_fence_odd(src: &str) -> Vec<bool> {
         })
         .collect()
 }
-parse_to_rows
+
 #[test]
 fn headings_agree_on_atx() {
     let src = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\nplain\n";
@@ -435,4 +435,41 @@ fn ir_carries_table_structure_and_code_language() {
         .unwrap();
     assert_eq!(code.code_language.as_deref(), Some("rust"));
     assert_eq!(parse_to_rows(code_src)[0].code_language(), Some("rust"));
+}
+
+/// 底座 `Doc`（统一文档模型）与两分支一致：DocRow.kind == IR、text == 预览、逐行覆盖。
+#[test]
+fn doc_model_agrees_with_preview_and_ir() {
+    let src = "# 标题\n正文 **加粗** 与 `代码`\n\n- 列表\n  - 嵌套\n1) 数字\n- [ ] 待办\n> 引述\n> [!NOTE]\n---\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 列A | 列B |\n| :- | -: |\n| 1 | 2 |\n\n![图](a.png)\nשלום עולם\n\n- 收尾\n";
+    let n_lines = src.split('\n').count();
+
+    // Doc 全量物化：kind 与 IR 逐行一致、text 与预览 parse_to_rows 逐块一致。
+    let doc = super::doc::Doc::open(SharedString::from(src));
+    let rows = doc.rows_in_line_window(0, n_lines);
+    let ir_blocks = ir::build_ir(src);
+    for r in &rows {
+        for line in r.lines.clone() {
+            let ir_kind = ir_blocks
+                .iter()
+                .find(|b| b.lines.contains(&line))
+                .map(|b| b.kind)
+                .expect("IR 应有该行");
+            assert_eq!(r.kind, ir_kind, "line {line} 语义不一致");
+        }
+    }
+    // text 与预览一致：对每块的 src_line，parse_to_rows 同 src_line 的 Row 文本相同。
+    let pv: std::collections::HashMap<usize, String> = parse_to_rows(src)
+        .iter()
+        .map(|r| (r.src_line, r.text.as_ref().to_string()))
+        .collect();
+    for r in &rows {
+        let expect = pv.get(&r.src_line).expect("预览应有该块");
+        assert_eq!(r.text.as_ref(), expect.as_str(), "src_line {} 文本不一致", r.src_line);
+    }
+
+    // 块粒度：DocRow 覆盖的源码行区间不重叠、不遗漏（= 全文档行集）。
+    let mut covered: Vec<usize> = rows.iter().flat_map(|r| r.lines.clone()).collect();
+    covered.sort_unstable();
+    let missing: Vec<usize> = (0..n_lines).filter(|i| !covered.contains(i)).collect();
+    assert!(missing.is_empty(), "Doc 未覆盖行: {missing:?}");
 }

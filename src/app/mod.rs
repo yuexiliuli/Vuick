@@ -1126,6 +1126,7 @@ impl EditorApp {
             tab.live = Some(live.clone());
             tab._live_sub = Some(live_sub);
             tab.live_edit = true;
+            self.install_live_code_hl(idx, cx);
             self.status = SharedString::from("实时预览编辑：开（所见即所得：点击正文定位，直接键入编辑）");
             self.status_ok = true;
             // 聚焦 WYSIWYG 编辑器（键盘输入走它，不走隐藏的源码编辑区）。
@@ -1133,6 +1134,20 @@ impl EditorApp {
             window.focus(&focus, cx);
         }
         cx.notify();
+    }
+
+    /// 给第 `idx` 个选项卡的实时编辑器挂**本项目代码块实现**：
+    /// `syntax::block_highlights`（与预览代码块同一套 parse_code_lines + GitHub 配色）。
+    /// 主题切换时需重挂（闭包捕获明/暗），见 [`Self::toggle_theme`]。
+    fn install_live_code_hl(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let dark = self.dark_mode;
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        let Some(live) = tab.live.clone() else { return };
+        live.update(cx, |ed, _| {
+            ed.set_code_highlighter(move |lang: &str, block: &str| {
+                crate::syntax::block_highlights(lang, block, dark)
+            });
+        });
     }
 
     /// 退出实时编辑：把实时 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
@@ -1300,6 +1315,10 @@ impl EditorApp {
                     cx.notify();
                 });
             }
+        }
+        // 实时编辑器代码块高亮闭包捕获了明/暗 → 主题切换后重挂（用新 dark 重建配色）。
+        if self.tabs[self.active_tab].live_edit {
+            self.install_live_code_hl(self.active_tab, cx);
         }
         cx.notify();
     }

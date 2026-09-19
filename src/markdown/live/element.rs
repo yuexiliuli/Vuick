@@ -1582,7 +1582,10 @@ impl Element for EditorElement {
                     bottom_right: if cb.bottom { r } else { z },
                 };
                 let box_origin = point(origin.x, origin.y - top_pad);
-                let box_size = size(cb.width, *lh + top_pad + bot_pad);
+                // 背景盒高度 = 整行（含折行）高度：一行代码折成 N 个视觉行时，
+                // 后续视觉行也要有代码块背景（此前只用单行 `*lh`，折行第 2 行露白）。
+                let wrap = prepaint.wrap_rows.get(i).copied().unwrap_or(1) as f32;
+                let box_size = size(cb.width, *lh * wrap + top_pad + bot_pad);
                 window.paint_quad(
                     fill(Bounds::new(box_origin, box_size), cb.color).corner_radii(corners),
                 );

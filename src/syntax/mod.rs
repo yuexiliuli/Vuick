@@ -1039,6 +1039,31 @@ pub(crate) fn github_theme_cached(dark: bool) -> &'static HighlightTheme {
     if dark { &DARK } else { &LIGHT }
 }
 
+/// 项目代码块实现的**对外形状**：给围栏语言与块内文本（`\n` 连接、无尾换行），
+/// 返回**块级字节偏移**、无缝隙的 [`HighlightStyle`] run —— 供 WYSIWYG live 的
+/// `set_code_highlighter` 钩子使用，语义/配色与预览代码块完全一致
+/// （同 `parse_code_lines` + `github_theme_cached`/`resolve_line_styles_with`）。
+/// 未知语言/无标记 → 返回空（按纯文本渲染，与预览一致）。
+pub(crate) fn block_highlights(
+    language: &str,
+    block: &str,
+    dark: bool,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let Some(line_runs) = parse_code_lines(language, block) else {
+        return Vec::new();
+    };
+    let resolver = github_theme_cached(dark);
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut offset = 0usize;
+    for (runs, line) in line_runs.iter().zip(block.split('\n')) {
+        for (r, style) in resolve_line_styles_with(runs, line.len(), resolver) {
+            out.push((r.start + offset..r.end + offset, style));
+        }
+        offset += line.len() + 1; // '\n'
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,5 +1362,34 @@ mod tests {
             folds.iter().all(|f| f.start_line >= req_lo.saturating_sub(100) && f.end_line <= rope.lines_len()),
             "折叠行号应为文档坐标(带 parse_lo 平移): {folds:?}"
         );
+    }
+
+    /// `block_highlights`（WYSIWYG live 的代码块对接）：块级偏移、覆盖每行、
+    /// 未知语言返回空——与预览代码块同语义。
+    #[test]
+    fn block_highlights_covers_block_and_ignores_unknown_lang() {
+        let code = "let a = 1;\nlet b = 2;\n";
+        let hl = block_highlights("rust", code, false);
+        assert!(!hl.is_empty(), "rust 块应有高亮");
+        // 覆盖 = 每行行长之和（`\n` 间隙不覆盖，live 按行裁剪）
+        let nl = code.matches('\n').count();
+        let covered: usize = hl.iter().map(|(r, _)| r.end - r.start).sum();
+        assert_eq!(covered, code.len() - nl, "应覆盖整块文本（去换行）");
+        // 块级偏移都在边界内、且按序不重叠
+        let mut prev = 0usize;
+        for (r, _) in &hl {
+            assert!(r.start >= prev, "应有序不重叠: {hl:?}");
+            assert!(r.end <= code.len(), "超出块边界: {hl:?}");
+            prev = r.end;
+        }
+        // 多行注释上下文能跨行（与预览一致：整块解析，不只逐行独立）
+        let comment = "/* 注释\n跨两行 */\nlet x = 1;\n";
+        assert!(
+            !block_highlights("rust", comment, false).is_empty(),
+            "跨行注释块应有高亮（说明按整块解析，非逐行独立）"
+        );
+        // 未知语言 → 空（纯文本）
+        assert!(block_highlights("definitely_not_a_lang", "x", false).is_empty());
+        assert!(block_highlights("", "x", false).is_empty());
     }
 }
