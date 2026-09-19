@@ -2,197 +2,14 @@
 
 use super::*;
 use crate::config::timing::TAB_HSCROLL_HIDE_MS;
-use crate::editor::EditorEvent;
-use crate::markdown::{PreviewSrc, scan_blocks_incremental_rope, scan_blocks_rope};
 use crate::scrollbar::horizontal_scrollbar;
 
 impl EditorApp {
     pub(super) fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
         // 自研编辑器组件：创建即空文档；语法高亮语言在打开文件时 set_language。
         let editor = cx.new(|cx| crate::editor::CodeEditor::new(cx));
-
         // 编辑内容被修改 → 置脏 + 同步内容/行列缓存 + 预览增量入口。
-        let ed = editor.clone();
-        let edit_sub = cx.subscribe(&ed, |this, emitter, ev: &EditorEvent, cx| {
-            if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
-                if ev == &EditorEvent::Edited {
-                    let _t_change = crate::prof::begin();
-                    // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
-                    this.search_scan = None;
-                    tab.edit_version = tab.edit_version.wrapping_add(1);
-                    // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
-                    // CodeEditor 记录最近一次编辑区间（字节），每轮 Change 1:1 取走。
-                    if let Some((s, oe, ne)) = tab.editor.update(cx, |ed, _| ed.take_last_edit()) {
-                        let delta = ne as i64 - oe as i64;
-                        tab.preview_dirty = Some(match tab.preview_dirty {
-                            None => (s, ne),
-                            Some((lo, hi)) => {
-                                // 把上一帧的 dirty 平移到本帧（编辑点之前不变、之后随 δ 平移）
-                                // 再并入 [s, ne)（新增变化区间），取 bounding box。
-                                let hi_shifted = if hi > oe {
-                                    hi as i64 + delta
-                                } else if hi >= s {
-                                    ne as i64
-                                } else {
-                                    hi as i64
-                                };
-                                (lo.min(s), hi_shifted.max(ne as i64).max(0) as usize)
-                            }
-                        });
-                    }
-                    // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
-                    // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
-                    // 不用含幻影尾行的编辑器模型 `line_count()`。
-                    let (line_count, char_count, cursor_row, cursor_col) = {
-                        let st = tab.editor.read(cx);
-                        let cursor = st.cursor_position();
-                        (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
-                    };
-                    // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**：
-                    // 一次同步任务里循环「快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
-                    // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
-                    // （`preview_syncing` 闸门），从「最后一次按键」起该轮扫描结束即收敛。
-                    // 大文档用**增量扫描**（[`scan_blocks_incremental_rope`]，复用上一版索引只重扫
-                    // 变化区，16 万行从几百 ms 降到几十 ms）在后台线程做，UI 线程只留快照/装配。
-                    if tab.preview_on && !this.preview_pending && !this.preview_syncing {
-                        this.preview_pending = true;
-                        this.preview_syncing = true;
-                        this.preview_seq = this.preview_seq.wrapping_add(1);
-                        let seq = this.preview_seq;
-                        cx.spawn(async move |this, cx| {
-                            loop {
-                                // 1) UI 线程：快照当前正文 + 取上一版索引（增量基底）+ 版本号
-                                //    + 取走 dirty（自上次快照以来累积的变化区间；取走即清零）。
-                                //    快照与 dirty 同帧取：dirty 覆盖的正是 快照 vs 上一版 的差异。
-                                let Some((snapshot, panel_bg, base_dir, prev, version, dirty)) =
-                                    this
-                                        .update(cx, |this, cx| {
-                                            let panel_bg = this.panel_bg();
-                                            let base_dir = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .and_then(|t| t.file_path.as_ref())
-                                                .and_then(|p| p.parent())
-                                                .map(|d| d.to_path_buf());
-                                            let snapshot = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .filter(|t| t.preview_on)
-                                                .map(|t| t.editor.read(cx).text().clone());
-                                            let prev = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .and_then(|t| t.preview_prev.clone());
-                                            let version = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .map(|t| t.edit_version)
-                                                .unwrap_or(0);
-                                            let dirty = this
-                                                .tabs
-                                                .get_mut(this.active_tab)
-                                                .and_then(|t| t.preview_dirty.take());
-                                            snapshot.map(|snap| {
-                                                (snap, panel_bg, base_dir, prev, version, dirty)
-                                            })
-                                        })
-                                        .ok()
-                                        .flatten()
-                                else {
-                                    break;
-                                };
-                                // 2) 后台线程：增量（有上一版）或全量扫描。
-                                //    有 dirty → 增量扫描跳过 O(n) 快照 diff（O(k)）；
-                                //    无 dirty（首轮 / 高亮器未装）→ 走快照 diff 兜底。
-                                //    快照 = 编辑器 Rope 的 O(1) COW 克隆（不物化 6.4MB 全文），
-                                //    后台扫描只按 dirty 区从 rope 切片（见
-                                //    scan_blocks_incremental_rope），UI 线程不再背全文。
-                                let index = match &prev {
-                                    Some((p_src, p_idx)) => {
-                                        let p_src = p_src.clone();
-                                        // Rc 非 Send：物化一份 BlockIndex 给后台线程。
-                                        // O(块数) memcpy（几 ms）仍远小于全量扫描（几百 ms）。
-                                        let p_idx = (**p_idx).clone();
-                                        let snap = snapshot.clone();
-                                        let dirty = dirty.map(|(a, b)| a..b);
-                                        cx.background_executor()
-                                            .spawn(async move {
-                                                scan_blocks_incremental_rope(
-                                                    &p_src,
-                                                    &p_idx,
-                                                    &snap,
-                                                    dirty,
-                                                )
-                                            })
-                                            .await
-                                    }
-                                    None => {
-                                        let snap = snapshot.clone();
-                                        cx.background_executor()
-                                            .spawn(async move { scan_blocks_rope(&snap) })
-                                            .await
-                                    }
-                                };
-                                // 3) UI 线程：装配最新代，记录增量基底；有新版本文 继续循环、
-                                //    反之结束（合成一轮完毕）。
-                                // 索引只持一份 Rc：视图与 `preview_prev` 共享同一块（O(1) 克隆），
-                                // 不再每轮 `Rc::new(index.clone())` 整份拷贝（156K 块 ≈ 3.7MB）。
-                                let index = std::rc::Rc::new(index);
-                                let keep = this
-                                    .update(cx, |this, cx| {
-                                        if this.preview_seq != seq {
-                                            return false;
-                                        }
-                                        let mut keep = false;
-                                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                                            if tab.preview_on {
-                                                tab.md_preview.update(cx, |view, cx| {
-                                                    view.set_background(panel_bg);
-                                                    view.set_base_dir(base_dir);
-                                                    view.set_source_with_index(
-                                                        PreviewSrc::Rope(snapshot.clone()),
-                                                        index.clone(),
-                                                        cx,
-                                                    );
-                                                });
-                                                cx.notify();
-                                            }
-                                            tab.preview_prev = Some((snapshot.clone(), index.clone()));
-                                            keep = tab.preview_on && tab.edit_version != version;
-                                        }
-                                        keep
-                                    })
-                                    .unwrap_or(false);
-                                if !keep {
-                                    break;
-                                }
-                            }
-                            // 4) 释放闸门（本轮追上最新内容后）
-                            let _ = this.update(cx, |this, _| {
-                                this.preview_pending = false;
-                                this.preview_syncing = false;
-                            });
-                        })
-                        .detach();
-                    }
-                    // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
-                    // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
-                    if tab.readonly_preview {
-                        let content = tab.editor.read(cx).text().to_string();
-                        tab.content = SharedString::from(content);
-                    }
-                    tab.line_count = line_count;
-                    tab.char_count = char_count;
-                    tab.cursor_row = cursor_row;
-                    tab.cursor_col = cursor_col;
-                    if !tab.dirty {
-                        tab.dirty = true;
-                    }
-                    cx.notify();
-                    crate::prof::end("tab_change", _t_change);
-                }
-            }
-        });
+        let edit_sub = self.subscribe_editor(&editor, cx);
 
         self.tabs.push(EditorTab {
             editor,
@@ -462,6 +279,7 @@ impl EditorApp {
 
             let mut el = div()
                 .id(SharedString::from(format!("tab-{idx}")))
+                .debug_selector(move || format!("tab-{idx}").into())
                 .h_full()
                 .px_2()
                 .flex()
@@ -478,13 +296,28 @@ impl EditorApp {
                 .text_size(px(12.))
                 .text_color(text_primary)
                 .child(if dirty { "● " } else { "" })
-                .child(name)
+                .child(SharedString::from(name.clone()))
                 .child(close);
             if let Some(accent) = accent {
                 el = el.child(accent);
             }
+            // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
+            // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
+            let drag_data = TabDragData {
+                idx,
+                name: SharedString::from(name),
+            };
+            let ghost_name = drag_data.name.clone();
             tabs.push(
-                el.on_mouse_down(
+                el.on_drag(
+                    drag_data,
+                    move |_value: &TabDragData, _offset, _window, cx| {
+                        cx.new(|_| TabDragGhost {
+                            name: ghost_name.clone(),
+                        })
+                    },
+                )
+                .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                         this.activate_tab(idx, window, cx);

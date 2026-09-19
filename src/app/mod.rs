@@ -30,9 +30,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, px, rgb, rgba, white, App, AppContext, Context, CursorStyle, ExternalPaths, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, PromptLevel, Render,
-    SharedString, StatefulInteractiveElement, Styled, Subscription, VisualContext, Window,
+    div, px, rgb, rgba, white, AnyWindowHandle, App, AppContext, Context, CursorStyle,
+    DragMoveEvent, ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, PromptLevel, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, VisualContext, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
@@ -90,6 +91,73 @@ struct EditorTab {
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
 }
+
+/// 一个从窗口中「拔出」的选项卡快照：编辑器 / 预览等实体句柄共享（GPUI 实体
+/// 与窗口无关），连同文件元数据一起跨窗口搬迁。`_edit_sub` 是源窗口持有的订阅，
+/// 拔掉时随源 `EditorTab` 一并丢弃，目标窗口重新建立订阅。
+pub(crate) struct DetachedTab {
+    editor: gpui::Entity<crate::editor::CodeEditor>,
+    md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
+    pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
+    file_path: Option<PathBuf>,
+    dirty: bool,
+    content: SharedString,
+    line_count: usize,
+    char_count: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+    preview_on: bool,
+    preview_fullscreen: bool,
+    readonly_preview: bool,
+    editor_pending: bool,
+    preview_prev: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)>,
+    edit_version: u64,
+    preview_dirty: Option<(usize, usize)>,
+}
+
+/// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名（拖拽幽灵视图用它画“小胶囊”）。
+#[derive(Clone, Debug)]
+pub(crate) struct TabDragData {
+    idx: usize,
+    name: SharedString,
+}
+
+/// 拖拽选项卡时跟随鼠标的“幽灵”小胶囊视图。
+struct TabDragGhost {
+    name: SharedString,
+}
+
+impl Render for TabDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("tab-drag-ghost")
+            .debug_selector(|| "tab-drag-ghost".into())
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(crate::config::colors::RESIZE_ACCENT))
+            .text_color(white())
+            .text_size(px(12.))
+            .child(self.name.clone())
+    }
+}
+
+/// 所有 `EditorApp` 窗口的注册表（全局）：记录每个窗口的弱实体句柄与窗口句柄。
+/// 「拖出拆分」创建的子窗口带 `is_detached=true`，把选项卡拖回主窗口时据此找到
+/// 主窗口（第一个非 detached 的 EditorApp 窗口）。
+struct EditorAppRegistry {
+    windows: Vec<(gpui::WeakEntity<EditorApp>, AnyWindowHandle)>,
+}
+
+impl Default for EditorAppRegistry {
+    fn default() -> Self {
+        Self {
+            windows: Vec::new(),
+        }
+    }
+}
+
+impl gpui::Global for EditorAppRegistry {}
 
 pub struct EditorApp {
     /// 所有文件选项卡
@@ -162,6 +230,12 @@ pub struct EditorApp {
     pub(crate) open_fast_count: usize,
     /// 大文档「两段式打开」慢段（`finish_file_text` 应用统计 + 预览索引）执行次数。
     pub(crate) open_finish_count: usize,
+    /// 正在拖拽的选项卡下标（None = 未在拖拽选项卡）：`on_drag_move<TabDragData>`
+    /// 在拖拽确认后写入；鼠标在窗口内/外松开时据此决定还原原位还是拆分/还原窗口。
+    tab_dragging: Option<usize>,
+    /// 本窗口是否为「拖出拆分」生成的独立文件窗口。是 → 把选项卡拖出窗口 = 还原回主窗口；
+    /// 否（主窗口）→ 把选项卡拖出窗口 = 拆分出新的独立窗口。
+    is_detached: bool,
     focus_handle: FocusHandle,
 }
 
@@ -180,6 +254,25 @@ impl EditorApp {
     /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
     /// `gpui_component::Root` 包裹）。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+        Self::new_impl(window, cx, None, false)
+    }
+
+    /// 「拖出拆分」创建独立文件窗口：首个选项卡直接采用拖出的选项卡快照。
+    /// 返回的 `EditorApp` 标记为 `is_detached`，它的选项卡再被拖出 = 还原回主窗口。
+    pub fn new_detached(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        first_tab: DetachedTab,
+    ) -> EditorApp {
+        Self::new_impl(window, cx, Some(first_tab), true)
+    }
+
+    fn new_impl(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        first_tab: Option<DetachedTab>,
+        is_detached: bool,
+    ) -> EditorApp {
         let focus_handle = cx.focus_handle();
         // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
         let search = cx.new(|cx| {
@@ -229,20 +322,41 @@ impl EditorApp {
             search_scan_count: 0,
             open_fast_count: 0,
             open_finish_count: 0,
+            tab_dragging: None,
+            is_detached,
             focus_handle,
         };
-        app.make_tab(window, cx);
+        app.register_window(window, cx);
+        if let Some(first_tab) = first_tab {
+            app.adopt_tab(first_tab, Some(window), cx);
+        } else {
+            app.make_tab(window, cx);
+        }
 
         // 命令行参数：第一个参数作为初始打开文件（复用首个空选项卡，不额外新建）
-        let mut args = std::env::args_os();
-        args.next(); // 跳过程序名
-        if let Some(first) = args.next() {
-            let p = PathBuf::from(&first);
-            if p.is_file() {
-                app.open_file_in_tab(0, &p.to_string_lossy(), window, cx);
+        if !is_detached {
+            let mut args = std::env::args_os();
+            args.next(); // 跳过程序名
+            if let Some(first) = args.next() {
+                let p = PathBuf::from(&first);
+                if p.is_file() {
+                    app.open_file_in_tab(0, &p.to_string_lossy(), window, cx);
+                }
             }
         }
         app
+    }
+
+    /// 把本窗口登记进全局 `EditorAppRegistry`（惰性清理已关闭窗口的失效项）。
+    fn register_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !cx.has_global::<EditorAppRegistry>() {
+            cx.set_global(EditorAppRegistry::default());
+        }
+        let weak = cx.weak_entity();
+        let handle = window.window_handle();
+        let registry = cx.global_mut::<EditorAppRegistry>();
+        registry.windows.retain(|(weak, _)| weak.upgrade().is_some());
+        registry.windows.push((weak, handle));
     }
 
     /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦）。
@@ -251,6 +365,382 @@ impl EditorApp {
             .get(self.active_tab)
             .map(|t| t.editor.read(cx).focus_handle())
             .unwrap_or_else(|| self.focus_handle.clone())
+    }
+
+    /// 订阅编辑器变更（置脏 + 刷新状态栏 + 预览增量入口）。
+    /// `make_tab` 新建与 `adopt_tab` 跨窗口迁移共用：订阅绑定的是 *本窗口* 的 `EditorApp`，
+    /// 因此选项卡迁到哪个窗口，编辑事件就只刷新哪个窗口。
+    fn subscribe_editor(
+        &self,
+        editor: &gpui::Entity<crate::editor::CodeEditor>,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let ed = editor.clone();
+        cx.subscribe(&ed, |this, emitter, ev: &crate::editor::EditorEvent, cx| {
+            if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
+                if ev == &crate::editor::EditorEvent::Edited {
+                    let _t_change = crate::prof::begin();
+                    // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
+                    this.search_scan = None;
+                    tab.edit_version = tab.edit_version.wrapping_add(1);
+                    // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
+                    // CodeEditor 记录最近一次编辑区间（字节），每轮 Change 1:1 取走。
+                    if let Some((s, oe, ne)) =
+                        tab.editor.update(cx, |ed, _| ed.take_last_edit())
+                    {
+                        let delta = ne as i64 - oe as i64;
+                        tab.preview_dirty = Some(match tab.preview_dirty {
+                            None => (s, ne),
+                            Some((lo, hi)) => {
+                                // 把上一帧的 dirty 平移到本帧（编辑点之前不变、之后随 δ 平移）
+                                // 再并入 [s, ne)（新增变化区间），取 bounding box。
+                                let hi_shifted = if hi > oe {
+                                    hi as i64 + delta
+                                } else if hi >= s {
+                                    ne as i64
+                                } else {
+                                    hi as i64
+                                };
+                                (lo.min(s), hi_shifted.max(ne as i64).max(0) as usize)
+                            }
+                        });
+                    }
+                    // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
+                    // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
+                    // 不用含幻影尾行的编辑器模型 `line_count()`。
+                    let (line_count, char_count, cursor_row, cursor_col) = {
+                        let st = tab.editor.read(cx);
+                        let cursor = st.cursor_position();
+                        (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
+                    };
+                    // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**：
+                    // 一次同步任务里循环「快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
+                    // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
+                    // （`preview_syncing` 闸门），从「最后一次按键」起该轮扫描结束即收敛。
+                    if tab.preview_on && !this.preview_pending && !this.preview_syncing {
+                        this.preview_pending = true;
+                        this.preview_syncing = true;
+                        this.preview_seq = this.preview_seq.wrapping_add(1);
+                        let seq = this.preview_seq;
+                        cx.spawn(async move |this, cx| {
+                            loop {
+                                let Some((snapshot, panel_bg, base_dir, prev, version, dirty)) =
+                                    this
+                                        .update(cx, |this, cx| {
+                                            let panel_bg = this.panel_bg();
+                                            let base_dir = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .and_then(|t| t.file_path.as_ref())
+                                                .and_then(|p| p.parent())
+                                                .map(|d| d.to_path_buf());
+                                            let snapshot = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .filter(|t| t.preview_on)
+                                                .map(|t| t.editor.read(cx).text().clone());
+                                            let prev = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .and_then(|t| t.preview_prev.clone());
+                                            let version = this
+                                                .tabs
+                                                .get(this.active_tab)
+                                                .map(|t| t.edit_version)
+                                                .unwrap_or(0);
+                                            let dirty = this
+                                                .tabs
+                                                .get_mut(this.active_tab)
+                                                .and_then(|t| t.preview_dirty.take());
+                                            snapshot.map(|snap| {
+                                                (snap, panel_bg, base_dir, prev, version, dirty)
+                                            })
+                                        })
+                                        .ok()
+                                        .flatten()
+                                else {
+                                    break;
+                                };
+                                let index = match &prev {
+                                    Some((p_src, p_idx)) => {
+                                        let p_src = p_src.clone();
+                                        let p_idx = (**p_idx).clone();
+                                        let snap = snapshot.clone();
+                                        let dirty = dirty.map(|(a, b)| a..b);
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                crate::markdown::scan_blocks_incremental_rope(
+                                                    &p_src,
+                                                    &p_idx,
+                                                    &snap,
+                                                    dirty,
+                                                )
+                                            })
+                                            .await
+                                    }
+                                    None => {
+                                        let snap = snapshot.clone();
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                crate::markdown::scan_blocks_rope(&snap)
+                                            })
+                                            .await
+                                    }
+                                };
+                                let index = std::rc::Rc::new(index);
+                                let keep = this
+                                    .update(cx, |this, cx| {
+                                        if this.preview_seq != seq {
+                                            return false;
+                                        }
+                                        let mut keep = false;
+                                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                                            if tab.preview_on {
+                                                tab.md_preview.update(cx, |view, cx| {
+                                                    view.set_background(panel_bg);
+                                                    view.set_base_dir(base_dir);
+                                                    view.set_source_with_index(
+                                                        crate::markdown::PreviewSrc::Rope(
+                                                            snapshot.clone(),
+                                                        ),
+                                                        index.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                                cx.notify();
+                                            }
+                                            tab.preview_prev =
+                                                Some((snapshot.clone(), index.clone()));
+                                            keep = tab.preview_on && tab.edit_version != version;
+                                        }
+                                        keep
+                                    })
+                                    .unwrap_or(false);
+                                if !keep {
+                                    break;
+                                }
+                            }
+                            let _ = this.update(cx, |this, _| {
+                                this.preview_pending = false;
+                                this.preview_syncing = false;
+                            });
+                        })
+                        .detach();
+                    }
+                    // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
+                    // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
+                    if tab.readonly_preview {
+                        let content = tab.editor.read(cx).text().to_string();
+                        tab.content = SharedString::from(content);
+                    }
+                    tab.line_count = line_count;
+                    tab.char_count = char_count;
+                    tab.cursor_row = cursor_row;
+                    tab.cursor_col = cursor_col;
+                    if !tab.dirty {
+                        tab.dirty = true;
+                    }
+                    cx.notify();
+                    crate::prof::end("tab_change", _t_change);
+                }
+            }
+        })
+    }
+
+    /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
+    /// 实体与元数据整体移到目标窗口），下标与激活态自动校正。
+    fn take_tab_payload(&mut self, idx: usize) -> Option<DetachedTab> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let tab = self.tabs.remove(idx);
+        if idx < self.active_tab {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len().saturating_sub(1);
+        }
+        self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
+        Some(DetachedTab {
+            editor: tab.editor,
+            md_preview: tab.md_preview,
+            pdf_preview: tab.pdf_preview,
+            file_path: tab.file_path,
+            dirty: tab.dirty,
+            content: tab.content,
+            line_count: tab.line_count,
+            char_count: tab.char_count,
+            cursor_row: tab.cursor_row,
+            cursor_col: tab.cursor_col,
+            preview_on: tab.preview_on,
+            preview_fullscreen: tab.preview_fullscreen,
+            readonly_preview: tab.readonly_preview,
+            editor_pending: tab.editor_pending,
+            preview_prev: tab.preview_prev,
+            edit_version: tab.edit_version,
+            preview_dirty: tab.preview_dirty,
+        })
+    }
+
+    /// 把一个「拔出」的选项卡收纳进本窗口：共享编辑器/预览实体、重建编辑订阅、
+    /// 置为激活并同步预览/PDF 主题与软换行偏好。
+    /// `window=None` 用于跨窗口还原（此时不抢焦点，由调用方在目标窗口聚焦）；
+    /// `Some(window)` 用于拆出新窗口（直接聚焦新窗口的编辑区）。
+    pub(super) fn adopt_tab(
+        &mut self,
+        payload: DetachedTab,
+        mut window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let edit_sub = self.subscribe_editor(&payload.editor, cx);
+        let is_md = payload
+            .file_path
+            .as_ref()
+            .map(|p| Self::is_markdown_path(p))
+            .unwrap_or(false);
+        let idx = self.tabs.len();
+        self.tabs.push(EditorTab {
+            editor: payload.editor,
+            file_path: payload.file_path,
+            dirty: payload.dirty,
+            content: payload.content,
+            line_count: payload.line_count,
+            char_count: payload.char_count,
+            cursor_row: payload.cursor_row,
+            cursor_col: payload.cursor_col,
+            md_preview: payload.md_preview,
+            pdf_preview: payload.pdf_preview,
+            preview_on: payload.preview_on,
+            preview_fullscreen: payload.preview_fullscreen,
+            readonly_preview: payload.readonly_preview,
+            editor_pending: payload.editor_pending,
+            preview_prev: payload.preview_prev,
+            edit_version: payload.edit_version,
+            preview_dirty: payload.preview_dirty,
+            _edit_sub: edit_sub,
+        });
+        self.active_tab = idx;
+        self.search_scan = None;
+        // 编辑区软换行与目标窗口偏好对齐（md 默认换行、预览开着强制换行）
+        let wrap = is_md || self.wrap_enabled || self.tabs[idx].preview_on;
+        self.tabs[idx].editor.update(cx, |ed, _cx| {
+            ed.set_soft_wrap(wrap);
+        });
+        // 预览/PDF 主题背景刷新 + PDF 订阅重建
+        let canvas_bg = self.window_bg();
+        if self.tabs[idx].preview_on {
+            self.sync_md_preview(idx, cx);
+        }
+        if let Some(pdf) = self.tabs[idx].pdf_preview.clone() {
+            let pv = pdf.clone();
+            pv.update(cx, |view, _| view.set_background(canvas_bg));
+            self._pdf_observe = Some(cx.observe(&pdf, |_this, _e, cx| {
+                cx.notify();
+            }));
+        }
+        self.pdf_search = None; // 重新推送检索查询
+        if let Some(window) = window.as_mut() {
+            self.activate_tab(idx, window, cx);
+            self.status = SharedString::from("已拆分为独立窗口");
+            // 窗口标题跟随当前文件（拆出的新窗口直接以此命名）
+            if let Some(p) = self.tabs[idx].file_path.as_ref() {
+                window.set_window_title(&p.to_string_lossy());
+            } else {
+                window.set_window_title("未命名");
+            }
+        } else {
+            self.status = SharedString::from("已还原到主窗口");
+        }
+        self.status_ok = true;
+        cx.notify();
+    }
+
+    /// 拖拽中的选项卡在**窗口外**松开：主窗口 → 拆成独立窗口；独立窗口 → 还原回主窗口。
+    /// `window.remove_window()`（独立窗口还原后），标志窗口本帧结束后销毁。
+    pub(crate) fn release_tab_drag_outside(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(idx) = self.tab_dragging.take() else {
+            return;
+        };
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let Some(payload) = self.take_tab_payload(idx) else {
+            return;
+        };
+        if self.is_detached {
+            // 独立文件窗口：把选项卡还给主窗口（找不到主窗口则自我转正为主窗口）
+            self.restore_tab_to_primary(payload, cx);
+            window.remove_window();
+        } else {
+            // 主窗口：把选项卡拆进新开的独立窗口
+            self.split_tab_to_new_window(payload, window, cx);
+        }
+    }
+
+    /// 把选项卡拆进一个新开的独立窗口；本窗口若已没有选项卡则补一个空选项卡。
+    fn split_tab_to_new_window(
+        &mut self,
+        payload: DetachedTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tabs.is_empty() {
+            self.make_tab(window, cx);
+        }
+        // 主窗口剩下的选项卡接管焦点（被拖走的选项卡已从 tabs 移除）
+        self.activate_tab(self.active_tab, window, cx);
+        let bounds = window.bounds().clone();
+        let titlebar_options = gpui::TitlebarOptions {
+            title: Some("GPUI 编辑器".into()),
+            appears_transparent: true,
+            ..Default::default()
+        };
+        let _ = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(titlebar_options),
+                ..Default::default()
+            },
+            |new_window, cx| {
+                let view = cx.new(|cx| EditorApp::new_detached(new_window, cx, payload));
+                cx.new(|cx| gpui_component::Root::new(view, new_window, cx))
+            },
+        );
+        cx.notify();
+    }
+
+    /// 把选项卡还原到主（非 detached）窗口；找不到主窗口时把本窗口转正为主窗口并原地收纳。
+    fn restore_tab_to_primary(&mut self, payload: DetachedTab, cx: &mut Context<Self>) {
+        let registry = cx.global::<EditorAppRegistry>();
+        let primary: Option<(gpui::Entity<EditorApp>, AnyWindowHandle)> = registry
+            .windows
+            .iter()
+            .filter_map(|(weak, wh)| {
+                let entity = weak.upgrade()?;
+                let detached = entity.read_with(cx, |app, _| app.is_detached);
+                (!detached).then_some((entity, *wh))
+            })
+            .next();
+        let focus_handle = payload.editor.read(cx).focus_handle();
+        match primary {
+            Some((entity, wh)) => {
+                // 把选项卡交给主窗口（数据收纳 + 不抢焦点），随后在主窗口里聚焦编辑区
+                entity.update(cx, |app, cx| app.adopt_tab(payload, None, cx));
+                if let Some(root_handle) = wh.downcast::<gpui_component::Root>() {
+                    let _ = root_handle.update(cx, |_root, window, cx| {
+                        window.focus(&focus_handle, cx);
+                    });
+                }
+            }
+            None => {
+                // 主窗口已不存在（例如被关闭）→ 本窗口转正为主窗口，选项卡原地保留
+                self.is_detached = false;
+                self.adopt_tab(payload, None, cx);
+            }
+        }
     }
 
     /// 选项卡默认文件名（用于保存对话框）。
@@ -849,6 +1339,29 @@ impl Render for EditorApp {
                     this.open_dropped_paths(paths, window, cx);
                 },
             ))
+            // 多窗口：选项卡拖拽。
+            // on_drag_move 确认「正在拖选项卡」（携带下标），on_mouse_up(_out) 决定落点——
+            // 在窗口内松开 = 原位/普通点击（仅清状态）；在窗口外松开 = 拆分独立窗口 / 还原回主窗口。
+            .on_drag_move(cx.listener(
+                |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, _window, cx| {
+                    let data = ev.drag(cx);
+                    this.tab_dragging = Some(data.idx);
+                    cx.notify();
+                },
+            ))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
+                    this.tab_dragging = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                    this.release_tab_drag_outside(window, cx);
+                }),
+            )
             .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {
                 this.save(window, cx)
             }))

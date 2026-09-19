@@ -3683,3 +3683,213 @@
         }
     }
 
+
+    // ---------------------------------------------------------------------------
+    // 多窗口（拖出拆分 / 拖回还原）
+    // ---------------------------------------------------------------------------
+
+    /// 快速读取全局 EditorApp 注册表的可观测快照：`(is_detached, tab 数, 活动选项卡含文件路径, 活动正文)`。
+    fn registry_snapshot(
+        cx: &mut TestAppContext,
+    ) -> Vec<(bool, usize, bool, Option<String>)> {
+        cx.update(|cx| {
+            let reg = cx.global::<EditorAppRegistry>();
+            reg.windows
+                .iter()
+                .filter_map(|(weak, _)| {
+                    let entity = weak.upgrade()?;
+                    let snap = entity.read_with(cx, |a, c| {
+                        let tab = a.tabs.get(a.active_tab);
+                        (
+                            a.is_detached,
+                            a.tabs.len(),
+                            tab.and_then(|t| t.file_path.clone()).is_some(),
+                            tab.map(|t| t.editor.read(c).value()),
+                        )
+                    });
+                    Some(snap)
+                })
+                .collect()
+        })
+    }
+
+    /// 选项卡「拔出」→「收纳」往返：文本、脏标记全部保留。
+    #[gpui::test]
+    async fn detach_adopt_round_trip_preserves_state(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-detach-roundtrip.txt");
+        std::fs::write(&f, "第一行原文").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 编辑区输入 → 置脏（insert_text 属真实编辑，经 EditorEvent::Edited 置脏）
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[1].editor.clone());
+        cx.update(|_w, cx| editor.update(cx, |ed, cx| ed.insert_text("初始内容", cx)));
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+
+        let payload = cx
+            .update(|_w, cx| app.update(cx, |app, _| app.take_tab_payload(1)))
+            .expect("应有可拔出的选项卡");
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.adopt_tab(payload, None, cx)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (text, dirty, count, has_path) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.editor.read(cx).value(),
+                t.dirty,
+                a.tabs.len(),
+                t.file_path.is_some(),
+            )
+        });
+        assert_eq!(
+            text.to_string(),
+            "初始内容第一行原文",
+            "拔出→收纳后正文应保留"
+        );
+        assert!(dirty, "拔出→收纳后脏标记应保留");
+        assert_eq!(count, 2, "收纳后仍应有 2 个选项卡（空 + 文件）");
+        assert!(has_path, "文件路径应保留");
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 把选项卡拖出窗口外松开 → 拆出独立窗口：主窗口剩未命名选项卡，
+    /// 新窗口带文件选项卡且 is_detached=true。
+    #[gpui::test]
+    async fn drag_tab_out_splits_detached_window(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-multiwin-a.txt");
+        std::fs::write(&f, "AAA 独立窗口").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let tab = cx.debug_bounds("tab-1").expect("文件选项卡 tab-1 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        // 按下 → 移动到超过拖拽阈值（启动 tab 拖拽）→ 移出窗口 → 窗外松开
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let outside = gpui::Point::new(px(-60.), px(50.));
+        cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        let snap = registry_snapshot(cx);
+        let detached: Vec<_> = snap.iter().filter(|(d, _, _, _)| *d).collect();
+        let main: Vec<_> = snap.iter().filter(|(d, _, _, _)| !*d).collect();
+        assert_eq!(detached.len(), 1, "应拆出一个独立窗口，快照={snap:?}");
+        assert_eq!(detached[0].1, 1, "独立窗口应恰好 1 个选项卡");
+        assert!(detached[0].2, "独立窗口的活动选项卡应有文件路径");
+        assert_eq!(
+            detached[0].3.as_deref(),
+            Some("AAA 独立窗口"),
+            "独立窗口应带原正文"
+        );
+        assert!(
+            !main.is_empty() && main.iter().all(|(_, n, has_path, _)| *n >= 1 && !*has_path),
+            "主窗口应只剩未命名选项卡，快照={snap:?}"
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    /// 独立窗口的选项卡「还原回主窗口」：主窗口重新拿到该文件选项卡与正文。
+    #[gpui::test]
+    async fn detached_tab_restores_to_primary(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (primary, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join("gpui-multiwin-b.txt");
+        std::fs::write(&f, "BBB 还原").unwrap();
+        cx.update(|window, cx| {
+            primary.update(cx, |app, cx| {
+                app.open_file(f.to_str().unwrap(), window, cx)
+            });
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        // 从主窗口拔出该文件选项卡，开一个独立窗口收纳它
+        let payload = cx
+            .update(|_w, cx| primary.update(cx, |app, _| app.take_tab_payload(1)))
+            .expect("应有可拔出的选项卡");
+        let (_det_root, cx) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| EditorApp::new_detached(window, cx, payload));
+            gpui_component::Root::new(app, window, cx)
+        });
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        // 找到独立窗口的 EditorApp 实体
+        let det = cx
+            .update(|_w, cx| {
+                let reg = cx.global::<EditorAppRegistry>();
+                reg.windows
+                    .iter()
+                    .filter_map(|(w, _)| w.upgrade())
+                    .find(|e| e.read_with(cx, |a, _| a.is_detached))
+            })
+            .expect("应存在独立窗口");
+        assert_eq!(
+            cx.update(|_w, cx| det.read_with(cx, |a, _| a.tabs.len())),
+            1,
+            "独立窗口应恰好 1 个选项卡"
+        );
+
+        // 独立窗口把选项卡还原给主窗口
+        let payload2 = cx
+            .update(|_w, cx| det.update(cx, |app, _| app.take_tab_payload(0)))
+            .expect("独立窗口应有选项卡");
+        cx.update(|_w, cx| det.update(cx, |app, cx| app.restore_tab_to_primary(payload2, cx)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+
+        let (has_file, content) = cx.update(|_w, cx| {
+            let a = primary.read(cx);
+            let tab = a.tabs.iter().find(|t| t.file_path.is_some());
+            (
+                tab.is_some(),
+                tab.map(|t| t.editor.read(cx).value().to_string()),
+            )
+        });
+        assert!(has_file, "主窗口应重新持有该文件选项卡");
+        assert_eq!(content.as_deref(), Some("BBB 还原"), "正文应完整还原");
+        let _ = std::fs::remove_file(&f);
+    }
