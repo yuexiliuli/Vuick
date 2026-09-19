@@ -202,6 +202,7 @@ impl Element for EditorElement {
                     &editor.shape_caches,
                     editor.shape_band.get().map(|(a, b)| (px(a), px(b))),
                     &editor.folded_headings,
+                    base_lh,
                 );
                 // Mirror prepaint's `line_tops` walk exactly (same `line_pads`),
                 // or the element lays out shorter than it paints.
@@ -423,6 +424,7 @@ impl Element for EditorElement {
                 &editor.shape_caches,
                 editor.shape_band.get().map(|(a, b)| (px(a), px(b))),
                 &editor.folded_headings,
+                base_lh,
             )
         };
 
@@ -2711,6 +2713,11 @@ fn shape_document(
     // Collapsed headings (trimmed source lines) — their section lines fold to
     // height 0 like a folded callout's body.
     folded_headings: &std::collections::HashSet<String>,
+    // The uniform height used for windowed-OUT plain lines that have no cached
+    // row height yet (first frame / never measured): they push a placeholder
+    // with this height instead of being full-shaped — the fix for whole-doc
+    // first-frame shaping (big-doc open was minutes + GB RAM).
+    out_of_band_default_h: Pixels,
 ) -> ShapedDoc {
     let mut out = ShapedDoc::default();
     let lines: Vec<&str> = content.split('\n').collect();
@@ -3625,23 +3632,24 @@ fn shape_document(
                 });
             if let (Some((lo, hi)), Some(hk)) = (band, skip_key) {
                 let hit = caches.line_heights.borrow().get(&hk).copied();
-                if let Some((lh_c, wr_c)) = hit {
-                    let total = lh_c * wr_c as f32;
-                    if y_acc > hi || y_acc + total < lo {
-                        // The REAL mark: paint's nesting-guide bookkeeping
-                        // walks offscreen ancestors' marks.
-                        out.push_placeholder(
-                            window,
-                            base_font_size,
-                            wrap_width,
-                            lh_c,
-                            None,
-                            mark,
-                            wr_c,
-                        );
-                        line_start = line_end + 1;
-                        continue;
-                    }
+                // 带外行：有缓存行高用真值；没有（首帧/未测得）用统一默认高占位——
+                // 绝不让「无缓存」导致整行全量 shape（大文档首帧 10 分钟/GB 的根因）。
+                let (lh_c, wr_c) = hit.unwrap_or((out_of_band_default_h, 1));
+                let total = lh_c * wr_c as f32;
+                if y_acc > hi || y_acc + total < lo {
+                    // The REAL mark: paint's nesting-guide bookkeeping
+                    // walks offscreen ancestors' marks.
+                    out.push_placeholder(
+                        window,
+                        base_font_size,
+                        wrap_width,
+                        lh_c,
+                        None,
+                        mark,
+                        wr_c,
+                    );
+                    line_start = line_end + 1;
+                    continue;
                 }
             }
             plain_hkey = skip_key;
@@ -3946,22 +3954,20 @@ fn shape_document(
             }
         }
     }
-    // Cap the run cache: edits retire entries (each changed line re-keys), so
-    // without a bound it grows one dead entry per keystroke. Clearing wholesale
-    // is fine — the next frame rebuilds only what's visible… which is
-    // everything today, but each rebuild re-primes the cache.
+    // Cap caches: with windowed (banded) shaping the run cache only gains
+    // entries for lines actually shaped — as the user scrolls a HUGE doc that
+    // would still grow unbounded (each entry = glyph runs), so cap it in
+    // ABSOLUTE terms. In-band lines rebuild next frame. Heights stay unbounded
+    // (small per-entry) — they keep off-band placeholder heights stable across
+    // frames (scrubbed lines keep their measured height).
     {
         let mut cache = caches.line_runs.borrow_mut();
-        if cache.len() > lines.len() * 2 + 64 {
+        if cache.len() > 4096 {
             cache.clear();
         }
         let mut rows = caches.cell_rows.borrow_mut();
         if rows.len() > lines.len() * 2 + 64 {
             rows.clear();
-        }
-        let mut lh = caches.line_heights.borrow_mut();
-        if lh.len() > lines.len() * 2 + 64 {
-            lh.clear();
         }
     }
     out

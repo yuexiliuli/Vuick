@@ -1066,7 +1066,7 @@ impl MarkdownLivePreview {
             scroll_compensator: None,
             last_paint_gen: 0,
             shape_caches: ShapeCaches::default(),
-            shape_band: std::cell::Cell::new(None),
+            shape_band: std::cell::Cell::new(Some((0.0, 4096.0))),
             compensated: std::cell::Cell::new(false),
             line_drag: None,
             grip_hover_row: None,
@@ -6172,6 +6172,12 @@ impl ShapedDoc {
     /// Push one line that renders as something other than shaped text — a
     /// widget/collapsed/windowed-out line: an empty placeholder `WrappedLine`,
     /// the given height/widget/mark, and `rows` wrap rows.
+    ///
+    /// The placeholder `WrappedLine` is `Default` (empty, never painted for
+    /// windowed-out lines; widgets/collapsed paint via their own vecs) — NOT a
+    /// `shape_runs("")` per line: with windowed shaping a huge document pushes
+    /// one placeholder per source line every frame, and a font-shaping call per
+    /// line would dominate the frame budget.
     #[allow(clippy::too_many_arguments)]
     fn push_placeholder(
         &mut self,
@@ -6183,17 +6189,8 @@ impl ShapedDoc {
         mark: Option<LineMark>,
         rows: usize,
     ) {
-        let wl = shape_runs(
-            window,
-            &SharedString::default(),
-            base_font_size,
-            &[],
-            wrap_width,
-        )
-        .into_iter()
-        .next()
-        .expect("a line always shapes to one wrapped line");
-        self.wrapped.push(wl);
+        let _ = (window, base_font_size, wrap_width);
+        self.wrapped.push(gpui::WrappedLine::default());
         self.heights.push(h);
         self.widgets.push(widget);
         self.backgrounds.push(None);
