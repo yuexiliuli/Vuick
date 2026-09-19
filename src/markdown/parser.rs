@@ -573,22 +573,18 @@ fn unescape_table_cell(s: &str) -> String {
 }
 
 /// 分隔行每格必须是 `:?-+:?`（冒号 + 全短横），返回每列对齐；任一格不合规返回 None。
+/// 复用共享唯一实现 `cells::parse_aligns`（与 live、IR 同源，见 parity）。
 fn parse_delimiter(cells: &[SharedString]) -> Option<Vec<TableAlign>> {
-    cells
-        .iter()
-        .map(|c| {
-            let s = c.as_ref();
-            let body = s.trim_start_matches(':').trim_end_matches(':');
-            if body.is_empty() || !body.chars().all(|ch| ch == '-') {
-                return None;
-            }
-            Some(match (s.starts_with(':'), s.ends_with(':')) {
-                (true, true) => TableAlign::Center,
-                (false, true) => TableAlign::Right,
-                _ => TableAlign::Left,
+    let strs: Vec<&str> = cells.iter().map(|s| s.as_ref()).collect();
+    super::cells::parse_aligns(&strs).map(|a| {
+        a.into_iter()
+            .map(|al| match al {
+                super::cells::CellAlign::Left => TableAlign::Left,
+                super::cells::CellAlign::Center => TableAlign::Center,
+                super::cells::CellAlign::Right => TableAlign::Right,
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 /// 尝试把 `lines[idx..]` 解析为一张 GFM 表格。

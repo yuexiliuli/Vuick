@@ -2205,7 +2205,9 @@ pub(crate) fn table_cell_ranges(line: &str) -> Vec<Range<usize>> {
 }
 
 /// If `line` is a table separator row (every cell is dashes with optional
-/// alignment colons), return its per-column alignment, else `None`.
+/// alignment colons), return its per-column alignment, else `None`. Alignment
+/// semantics are the single implementation `crate::markdown::cells::parse_aligns`
+/// (shared with the preview parser and the semantic IR — parity-pinned).
 fn separator_aligns(line: &str) -> Option<Vec<Align>> {
     if !is_table_row(line) {
         return None;
@@ -2214,21 +2216,15 @@ fn separator_aligns(line: &str) -> Option<Vec<Align>> {
     if cells.is_empty() {
         return None;
     }
-    cells
-        .iter()
-        .map(|c| {
-            let left = c.starts_with(':');
-            let right = c.ends_with(':');
-            let dashes = c.trim_matches(':');
-            (!dashes.is_empty() && dashes.bytes().all(|b| b == b'-')).then_some(
-                match (left, right) {
-                    (true, true) => Align::Center,
-                    (false, true) => Align::Right,
-                    _ => Align::Left,
-                },
-            )
-        })
-        .collect()
+    crate::markdown::cells::parse_aligns(&cells).map(|a| {
+        a.into_iter()
+            .map(|al| match al {
+                crate::markdown::cells::CellAlign::Left => Align::Left,
+                crate::markdown::cells::CellAlign::Center => Align::Center,
+                crate::markdown::cells::CellAlign::Right => Align::Right,
+            })
+            .collect()
+    })
 }
 
 fn is_word(c: u8) -> bool {

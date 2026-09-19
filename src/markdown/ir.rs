@@ -11,6 +11,7 @@
 
 use std::ops::Range;
 
+use super::cells::{self, CellAlign};
 use super::live::markdown_syntax::{
     blockquote_prefix, heading_level, image_row, list_prefix, table_regions, thematic_break,
 };
@@ -30,11 +31,23 @@ pub(crate) enum IrKind {
     Table,
 }
 
+/// 表格块的结构（raw，保留转义，与 live `table_cells` 同语义；预览显示层在其上解义）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IrTable {
+    pub(crate) header: Vec<String>,
+    pub(crate) rows: Vec<Vec<String>>,
+    pub(crate) aligns: Vec<CellAlign>,
+}
+
 /// 一个 IR 块：kind + 覆盖的源码行区间（半开）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IrBlock {
     pub(crate) kind: IrKind,
     pub(crate) lines: Range<usize>,
+    /// Table 块的结构（非 Table 块为 None）。
+    pub(crate) table: Option<IrTable>,
+    /// Code 块的围栏语言（信息串首个词；None = 无标记 / 非 Code 块）。
+    pub(crate) code_language: Option<String>,
 }
 
 /// 从源码产出一份块级 IR。围栏/表格判定与 live 一致（` ``` ` 围栏奇偶、
@@ -58,17 +71,38 @@ pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        // 表格（块级，多行）：以 live `table_regions` 的区域为准。
+        // 表格（块级，多行）：以 live `table_regions` 的区域为准；结构用共享
+        // 单元格/对齐实现（`cells::raw_cells` / `cells::parse_aligns`，与 parser、
+        // live 同源，见 parity）。
         if let Some(t) = tables.iter().find(|t| t.lines.start == i) {
+            let region: Vec<&str> = lines[t.lines.clone()].to_vec();
+            let table = (region.len() >= 2).then(|| IrTable {
+                header: cells::raw_cells(region[0]),
+                rows: region[2..]
+                    .iter()
+                    .map(|l| cells::raw_cells(l))
+                    .collect(),
+                aligns: {
+                    let sep = cells::raw_cells(region[1]);
+                    cells::parse_aligns(&sep.iter().map(String::as_str).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                },
+            });
             out.push(IrBlock {
                 kind: IrKind::Table,
                 lines: t.lines.clone(),
+                table,
+                code_language: None,
             });
             i = t.lines.end;
             continue;
         }
         // 代码围栏（块级，多行）：开门行到同字符关门行（未闭合到文末）。
         if lines[i].trim_start().starts_with("```") {
+            let language = {
+                let info = lines[i].trim_start().trim_start_matches('`').trim();
+                info.split_whitespace().next().filter(|s| !s.is_empty()).map(String::from)
+            };
             let mut j = i + 1;
             while j < n && !lines[j].trim_start().starts_with("```") {
                 j += 1;
@@ -77,6 +111,8 @@ pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
             out.push(IrBlock {
                 kind: IrKind::Code,
                 lines: i..end,
+                code_language: language,
+                table: None,
             });
             i = end;
             continue;
@@ -100,6 +136,8 @@ pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
         out.push(IrBlock {
             kind,
             lines: i..i + 1,
+            table: None,
+            code_language: None,
         });
         i += 1;
     }

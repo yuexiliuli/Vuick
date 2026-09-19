@@ -38,7 +38,7 @@ fn live_fence_odd(src: &str) -> Vec<bool> {
         })
         .collect()
 }
-
+parse_to_rows
 #[test]
 fn headings_agree_on_atx() {
     let src = "# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6\nplain\n";
@@ -386,4 +386,53 @@ fn per_line_kinds_agree_across_rich_docs() {
         assert_eq!(ir, lv, "doc {k}: IR 与 live 不符（IR 是金标准）");
         assert_eq!(ir, pv, "doc {k}: IR 与预览不符（IR 是金标准）");
     }
+}
+
+/// IR 的结构化语义（表格 cells/对齐、代码语言）同时对齐 live 与预览。
+#[test]
+fn ir_carries_table_structure_and_code_language() {
+    let src = "| 型号 | 尺寸 |\n| :- | -: |\n| A | 10 |\n| B | 20 |\n";
+    let blocks = ir::build_ir(src);
+    let tbl = blocks
+        .iter()
+        .find(|b| b.kind == ir::IrKind::Table)
+        .expect("应为表格块");
+    let t = tbl.table.as_ref().expect("表格块应带结构");
+    assert_eq!(t.header, vec!["型号".to_string(), "尺寸".to_string()]);
+    assert_eq!(
+        t.rows,
+        vec![
+            vec!["A".to_string(), "10".to_string()],
+            vec!["B".to_string(), "20".to_string()]
+        ]
+    );
+    assert_eq!(
+        t.aligns,
+        vec![super::cells::CellAlign::Left, super::cells::CellAlign::Right],
+        "分隔行 `:-| -:` 都是 Left/Right（与 parser、live 同一对齐实现）"
+    );
+
+    // IR 结构 == live `table_cells` / parser `split_table_cells`（无转义语料）逐格一致。
+    for line in src.split('\n') {
+        if line.trim().is_empty() {
+            continue; // 空行不属于表格；parser 丢空 cell、live 保留，非表格语义
+        }
+        let lc: Vec<String> = table_cells(line).into_iter().map(str::to_string).collect();
+        let pc: Vec<String> = split_table_cells(line)
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        let rc = super::cells::raw_cells(line);
+        assert_eq!(rc, lc, "IR 与 live 单元格 line `{line}`");
+        assert_eq!(rc, pc, "IR 与 parser 单元格 line `{line}`");
+    }
+
+    // Code 语言：IR == parser。
+    let code_src = "```rust\nlet a = 1;\n```\n";
+    let code = ir::build_ir(code_src)
+        .into_iter()
+        .find(|b| b.kind == ir::IrKind::Code)
+        .unwrap();
+    assert_eq!(code.code_language.as_deref(), Some("rust"));
+    assert_eq!(parse_to_rows(code_src)[0].code_language(), Some("rust"));
 }

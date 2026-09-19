@@ -31,3 +31,41 @@ pub(crate) fn is_backslash_escaped(b: &[u8], i: usize) -> bool {
     }
     n % 2 == 1
 }
+
+/// 列对齐（GFM 分隔行 `:---` / `:---:` / `---:` 语义）——**唯一的对齐实现**，
+/// 预览 `parser`、WYSIWYG `live`、语义 IR 三方共用（各自 enum 只做薄转换）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CellAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// 从分隔行单元格解析每列对齐；任一格不合规返回 `None`。
+pub(crate) fn parse_aligns(cells: &[&str]) -> Option<Vec<CellAlign>> {
+    cells
+        .iter()
+        .map(|c| {
+            let body = c.trim_start_matches(':').trim_end_matches(':');
+            if body.is_empty() || !body.chars().all(|ch| ch == '-') {
+                return None;
+            }
+            Some(match (c.starts_with(':'), c.ends_with(':')) {
+                (true, true) => CellAlign::Center,
+                (false, true) => CellAlign::Right,
+                _ => CellAlign::Left,
+            })
+        })
+        .collect()
+}
+
+/// 表格行的原始单元格（trim + 去掉首尾外竖线压出的空 cell，**保留转义原样**）——
+/// 与 live `table_cells` 同语义；预览显示层在其上叠加解义。用作 IR 的表格结构。
+pub(crate) fn raw_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    split_unescaped_pipes(t)
+        .map(|s| s.trim().to_string())
+        .collect()
+}
