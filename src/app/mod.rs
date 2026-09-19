@@ -682,6 +682,31 @@ impl EditorApp {
         }
     }
 
+    /// 拖拽中光标**第一次越过窗口边缘** → 立即把选项卡拆进光标处的新窗口（浏览器式
+    /// tear-off），让「拖出窗口」有连续过渡，而不是松开后才突然弹出独立窗口。
+    /// 独立文件窗口不在此拆分：它保持「拖到选项卡栏松开 = 还原回主窗口」的语义。
+    fn tear_off_drag(
+        &mut self,
+        idx: usize,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_detached {
+            return;
+        }
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let Some(payload) = self.take_tab_payload(idx) else {
+            return;
+        };
+        self.tab_dragging = None;
+        // 结束旧窗口的拖拽：幽灵不再画在旧窗口，也不会被新窗口的首帧绘制出来。
+        let _ = cx.stop_active_drag(window);
+        self.split_tab_to_new_window(payload, position, window, cx);
+    }
+
     /// 把选项卡拆进一个新开的独立窗口：窗口左上角跟随鼠标释放位置（屏幕坐标 =
     /// 源窗口屏幕左上角 + 拖放点的窗口内坐标）；本窗口若已没有选项卡则补一个空选项卡。
     fn split_tab_to_new_window(
@@ -1348,13 +1373,26 @@ impl Render for EditorApp {
                 },
             ))
             // 多窗口：选项卡拖拽。
-            // on_drag_move 确认「正在拖选项卡」（携带下标），on_mouse_up(_out) 决定落点——
-            // 在窗口内松开 = 原位/普通点击（仅清状态）；在窗口外松开 = 拆分独立窗口 / 还原回主窗口。
+            // on_drag_move 确认「正在拖选项卡」（携带下标）并在光标第一次越过窗口边缘时
+            // 立即 tear-off 成独立窗口（窗口出现在光标处，拖出过程有过渡）；
+            // on_mouse_up(_out) 作为兜底落点——窗口内松开 = 原位/普通点击（仅清状态），
+            // 窗口外松开 = 独立窗口还原回主窗口。
             .on_drag_move(cx.listener(
-                |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, _window, cx| {
-                    let data = ev.drag(cx);
-                    this.tab_dragging = Some(data.idx);
+                |this: &mut EditorApp, ev: &DragMoveEvent<TabDragData>, window, cx| {
+                    let idx = ev.drag(cx).idx; // 拷贝下标，避免持有对 cx 的借用
+                    // 已被 tear-off（源窗口不再有该选项卡）→ 忽略后续移动
+                    if idx >= this.tabs.len() {
+                        return;
+                    }
+                    this.tab_dragging = Some(idx);
+                    let pos = ev.event.position;
+                    let inside = gpui::Bounds::new(gpui::Point::default(), window.bounds().size)
+                        .contains(&pos);
                     cx.notify();
+                    if !inside {
+                        // 拖过窗口边缘 → 立即把选项卡拆进光标处的新窗口（tear-off）
+                        this.tear_off_drag(idx, pos, window, cx);
+                    }
                 },
             ))
             .on_mouse_up(

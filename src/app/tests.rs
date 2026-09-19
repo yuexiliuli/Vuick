@@ -3788,7 +3788,9 @@
             tab.origin.x + px(10.),
             tab.origin.y + px(tab.size.height.as_f32() / 2.0),
         );
-        // 按下 → 移动到超过拖拽阈值（启动 tab 拖拽）→ 移出窗口 → 窗外松开
+        // 按下 → 移动到超过拖拽阈值（启动 tab 拖拽）→ 移出窗口。
+        // 回归：应在光标刚越过窗口边缘（尚未松手）时立即 tear-off 出独立窗口，
+        // 而不是等到窗口外松开才突然弹窗。
         cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
         cx.simulate_mouse_move(
             gpui::Point::new(start.x + px(40.), start.y),
@@ -3800,6 +3802,26 @@
         }
         let outside = gpui::Point::new(px(-60.), px(50.));
         cx.simulate_mouse_move(outside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let before_up = registry_snapshot(cx);
+        assert_eq!(
+            before_up.iter().filter(|(d, _, _, _)| *d).count(),
+            1,
+            "越出窗口边缘（未松手）就应已拆出独立窗口，快照={before_up:?}"
+        );
+        assert!(
+            before_up
+                .iter()
+                .find(|(d, _, _, _)| *d)
+                .is_some_and(|(_, n, has_path, text)| {
+                    *n == 1 && *has_path && text.as_deref() == Some("AAA 独立窗口")
+                }),
+            "越出边缘时应已把选项卡放进新窗口，快照={before_up:?}"
+        );
+
+        // 松开（在窗口外）：不应再次拆分（仍是同一个独立窗口）
         cx.simulate_mouse_up(outside, MouseButton::Left, Default::default());
         for _ in 0..8 {
             cx.run_until_parked();
@@ -3808,7 +3830,7 @@
         let snap = registry_snapshot(cx);
         let detached: Vec<_> = snap.iter().filter(|(d, _, _, _)| *d).collect();
         let main: Vec<_> = snap.iter().filter(|(d, _, _, _)| !*d).collect();
-        assert_eq!(detached.len(), 1, "应拆出一个独立窗口，快照={snap:?}");
+        assert_eq!(detached.len(), 1, "应仍只有一个独立窗口，快照={snap:?}");
         assert_eq!(detached[0].1, 1, "独立窗口应恰好 1 个选项卡");
         assert!(detached[0].2, "独立窗口的活动选项卡应有文件路径");
         assert_eq!(
@@ -3922,4 +3944,49 @@
         assert!(has_file, "主窗口应重新持有该文件选项卡");
         assert_eq!(content.as_deref(), Some("BBB 还原"), "正文应完整还原");
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// 回归：拖拽选项卡但一直停留在窗口内、窗口内松开 → 不拆独立窗口（tear-off 只在
+    /// 越出窗口边缘时发生），选项卡仍留在主窗口。
+    #[gpui::test]
+    async fn drag_tab_inside_window_does_not_tear_off(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 拖一个未命名选项卡（tab-0），全程留在窗口内再松开
+        let tab = cx.debug_bounds("tab-0").expect("选项卡 tab-0 应渲染");
+        let start = gpui::Point::new(
+            tab.origin.x + px(10.),
+            tab.origin.y + px(tab.size.height.as_f32() / 2.0),
+        );
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(
+            gpui::Point::new(start.x + px(40.), start.y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let moved_inside = gpui::Point::new(start.x + px(120.), start.y + px(40.));
+        cx.simulate_mouse_move(moved_inside, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(moved_inside, MouseButton::Left, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        let snap = registry_snapshot(cx);
+        assert_eq!(
+            snap.iter().filter(|(d, _, _, _)| *d).count(),
+            0,
+            "窗口内拖拽+松开不应拆出独立窗口，快照={snap:?}"
+        );
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "主窗口选项卡应保持原样"
+        );
     }
