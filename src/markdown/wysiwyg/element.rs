@@ -1548,8 +1548,8 @@ fn paint_selection(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let mut hl = theme.accent;
-    hl.a = 0.28;
+    // 选区背景统一用预览同款（`#4d6bfe` 蓝，暗 38% / 亮 26%），与右预览一致。
+    let hl = crate::markdown::view::selection_color(cx);
     let e = editor.read(cx);
     for r in &f.rows {
         if !r.editable || r.wrapped.is_empty() {

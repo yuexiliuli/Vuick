@@ -652,6 +652,26 @@ mod tests {
     }
 
     #[test]
+    fn inline_code_does_not_break_following_bold() {
+        // 回归：行内代码 `` `we` `` 出现后，同行的 `**标识接口**` 必须仍是粗体。
+        let line = "我们`we`可以将它理解成一个**标识接口**。";
+        let kinds = kinds_of(line);
+        assert!(
+            kinds
+                .iter()
+                .any(|(r, d)| *d == Deco::Bold && &line[r.clone()] == "标识接口"),
+            "代码后粗体应生效：{kinds:?}"
+        );
+        // 代码段与粗体段互不重叠。
+        let code = kinds.iter().find(|(_, d)| *d == Deco::Code).expect("有代码段");
+        let bold = kinds
+            .iter()
+            .find(|(_, d)| *d == Deco::Bold)
+            .expect("有粗体段");
+        assert!(code.0.end <= bold.0.start, "代码段应结束于粗体段之前");
+    }
+
+    #[test]
     fn inline_emphasis() {
         assert_eq!(names("**加粗**"), vec![Deco::Marker, Deco::Bold, Deco::Marker]);
         assert_eq!(names("*斜体*"), vec![Deco::Marker, Deco::Italic, Deco::Marker]);

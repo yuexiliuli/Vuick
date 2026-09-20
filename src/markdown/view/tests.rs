@@ -2290,6 +2290,49 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         );
     }
 
+    #[gpui::test]
+    fn select_text_works_on_inline_code_row(cx: &mut TestAppContext) {
+        // 回归：含行内代码（反引号）的行**可以**鼠标拖选字符。旧实现把 StyledText
+        // 移进 RoundedInlineText（st=None），不写文本命中表 → hit_test 找不到该行，
+        // 选区建立不了。现统一 TextTrack 始终持有 st，两类行一致可点选。
+        cx.update(gpui_component::init);
+        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let src = "# 标题\n\n我们看看`行内代码`能不能拖选出来。\n\n第二段正文足够用来拖选。\n";
+        let md = cx.update(|_, cx| host.read(cx).md.clone());
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(src, cx);
+        });
+        cx.simulate_resize(size(px(700.), px(500.)));
+        settle(&mut cx);
+        let (b1, b2) = cx.update(|_, cx| {
+            let md = host.read(cx).md.read(cx);
+            (
+                md.list_state.bounds_for_item(2).expect("含代码段"),
+                md.list_state.bounds_for_item(4).expect("第二段"),
+            )
+        });
+        // 混入 ListState cells 引用。
+        let p0 = point(px(b1.origin.x.as_f32() + 60.0), px(b1.center().y.as_f32()));
+        let p2 = point(px(b2.origin.x.as_f32() + 60.0), px(b2.center().y.as_f32()));
+        cx.simulate_mouse_down(p0, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(p2, Some(MouseButton::Left), Modifiers::default());
+        cx.simulate_mouse_up(p2, MouseButton::Left, Modifiers::default());
+        settle(&mut cx);
+        let sel = cx.update(|_, cx| host.read(cx).md.read(cx).selection);
+        let sel = sel.expect("含行内代码的行应可拖选");
+        assert_eq!(sel.0 .0, 2, "选择应从含代码段开始（实际 {sel:?}）");
+        let text = cx.update(|_, cx| host.read(cx).md.read(cx).selected_text());
+        assert!(
+            text.as_deref().is_some_and(|t| t.contains("代码")),
+            "选中文本应含代码段内文字：{text:?}"
+        );
+    }
+
+
 
 
 

@@ -51,8 +51,8 @@ fn inline_code_colors(cx: &App) -> InlineCodeColors {
 }
 
 /// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 主题配色文字；圆角底色由
-/// [`RoundedInlineText`] 在 paint 阶段按代码段的像素几何自绘（方角 highlight 背景
-/// 无法圆角，且 gpui 文本 run 背景只有平面矩形）。
+/// [`TextTrack::paint_code_ranges`] 在 paint 阶段按代码段的像素几何自绘（方角
+/// highlight 背景无法圆角，且 gpui 文本 run 背景只有平面矩形）。
 fn inline_code_highlight(colors: &InlineCodeColors) -> HighlightStyle {
     HighlightStyle {
         color: Some(colors.fg),
@@ -189,9 +189,10 @@ fn marker_flash_color(dark: bool) -> Hsla {
 
 /// 把（可能重叠的）半开区间高亮合并成互不重叠的段：覆盖同一段的多个样式按字段
 /// 合并（后出现的非 None 字段覆盖前值）。gpui 的 `compute_runs`（
-/// `StyledText::with_default_highlights`）假定区间不重叠，重叠会产出长度错误的
-/// run 直接 panic——调用侧必须在喂入前合并。本处只用到 `color` / `background_color`
-/// 两个字段，合并这两者即可。
+/// `StyledText::with_default_highlights` / `with_highlights`）假定区间不重叠，重叠
+/// 会产出长度错误的 run 直接 panic——调用侧必须在喂入前合并。
+/// **必须合并全部样式字段**（color/背景/`font_weight`/`font_style` 等）：只合并
+/// 颜色会把与选区/引注色/搜索重叠的粗体、斜体、删除线段的字形样式丢掉（加粗失效）。
 fn merge_highlights(
     highlights: Vec<(Range<usize>, HighlightStyle)>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
@@ -212,11 +213,24 @@ fn merge_highlights(
         if !active.is_empty() && pos > prev {
             let mut s = HighlightStyle::default();
             for &a in &active {
-                if highlights[a].1.color.is_some() {
-                    s.color = highlights[a].1.color;
+                let h = &highlights[a].1;
+                if h.color.is_some() {
+                    s.color = h.color;
                 }
-                if highlights[a].1.background_color.is_some() {
-                    s.background_color = highlights[a].1.background_color;
+                if h.background_color.is_some() {
+                    s.background_color = h.background_color;
+                }
+                if h.font_weight.is_some() {
+                    s.font_weight = h.font_weight;
+                }
+                if h.font_style.is_some() {
+                    s.font_style = h.font_style;
+                }
+                if h.strikethrough.is_some() {
+                    s.strikethrough = h.strikethrough;
+                }
+                if h.underline.is_some() {
+                    s.underline = h.underline;
                 }
             }
             out.push((prev..pos, s));
@@ -363,31 +377,19 @@ fn text_child(
     } else {
         StyledText::new(text.clone()).with_default_highlights(base, merged)
     };
-    // 3) 行内代码（反引号）圆角灰底（自绘），保持与正文同行/折行
+    // 3) 行内代码（反引号）圆角灰底（自绘）。TextTrack 始终持有 `st`（同一
+    //    layout）：既画代码底，也**记录文本命中** → 含行内代码的行同样可鼠标点选，
+    //    与无代码行行为一致（旧实现把 st 移进 RoundedInlineText，使这类行无法点选）。
     let code_bg: Vec<Range<usize>> = runs
         .iter()
         .filter(|(_, k)| *k == RunKind::InlineCode)
         .map(|(r, _)| expand_bg_over_whitespace(text.as_ref(), r))
         .collect();
-    let (child, st) = if code_bg.is_empty() {
-        (None, Some(st))
-    } else {
-        (
-            Some(
-                RoundedInlineText {
-                    text: st,
-                    code_bg,
-                    radius: px(5.),
-                    bg: colors.bg,
-                }
-                .into_any_element(),
-            ),
-            None,
-        )
-    };
     TextTrack {
-        child,
         st,
+        code_bg,
+        code_radius: px(5.),
+        code_bg_color: colors.bg,
         text: text.clone(),
         row_ix,
         notes: notes.to_vec(),
@@ -398,158 +400,21 @@ fn text_child(
     .into_any_element()
 }
 
-/// 自绘行内代码圆角背景的元素：委托 [`StyledText`] 完成文本的测量/布局，
-/// paint 阶段先按代码段的像素几何画圆角灰底，再委托绘制文字本身。
-/// 这样代码串与正文共用同一条文本流（正确同行、折行、光标对齐），
-/// 背景则是独立可控的圆角矩形。
-struct RoundedInlineText {
-    text: StyledText,
-    /// 代码段的背景区间（已扩展空白），字节坐标相对整段文本。
-    code_bg: Vec<Range<usize>>,
-    radius: Pixels,
-    bg: Hsla,
-}
-
-impl RoundedInlineText {
-    /// 把代码背景区间按折行切成多段矩形并 paint 圆角背景。
-    /// `layout` 是整段文本的 wrap 布局（`TextLayout::line_layouts()`），
-    /// 用 `position_for_index` 把字节区间映射到像素位置；跨行时逐行切开。
-    fn paint_ranges(
-        &self,
-        text_origin: gpui::Point<Pixels>,
-        line_height: Pixels,
-        layout: &WrappedLineLayout,
-        window: &mut Window,
-    ) {
-        let line_h = line_height.as_f32();
-        for range in &self.code_bg {
-            let Some(p0) = layout.position_for_index(range.start, line_height) else {
-                continue;
-            };
-            let Some(p1) = layout.position_for_index(range.end, line_height) else {
-                continue;
-            };
-            let y0 = (p0.y.as_f32() / line_h).floor() as usize;
-            let y1 = (p1.y.as_f32() / line_h).floor() as usize;
-            if y0 == y1 {
-                // 单行内：一段矩形
-                let bounds = Bounds {
-                    origin: point(
-                        px(text_origin.x.as_f32() + p0.x.as_f32()),
-                        px(text_origin.y.as_f32() + p0.y.as_f32()),
-                    ),
-                    size: gpui::size(
-                        px((p1.x.as_f32() - p0.x.as_f32()).max(0.0)),
-                        px(line_h),
-                    ),
-                };
-                window.paint_quad(fill(bounds, self.bg).corner_radii(Corners::all(self.radius)));
-            } else {
-                // 跨行：首段画到该行行尾、中间整行、末段从行首到终点
-                let line_origin_x = text_origin.x.as_f32();
-                let origin_y = text_origin.y.as_f32();
-                for real_ri in y0..=y1 {
-                    let (rx0, rx1) = if real_ri == y0 {
-                        (p0.x.as_f32(), layout.width().as_f32())
-                    } else if real_ri == y1 {
-                        (0.0, p1.x.as_f32())
-                    } else {
-                        (0.0, layout.width().as_f32())
-                    };
-                    let bounds = Bounds {
-                        origin: point(
-                            px(line_origin_x + rx0),
-                            px(origin_y + real_ri as f32 * line_h),
-                        ),
-                        size: gpui::size(px((rx1 - rx0).max(0.0)), px(line_h)),
-                    };
-                    window
-                        .paint_quad(fill(bounds, self.bg).corner_radii(Corners::all(self.radius)));
-                }
-            }
-        }
-    }
-}
-
-impl IntoElement for RoundedInlineText {
-    type Element = Self;
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl Element for RoundedInlineText {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        // 委托给文本本身布局
-        let (lid, ()) = self.text.request_layout(id, inspector_id, window, cx);
-        (lid, ())
-    }
-
-    fn prepaint(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self::PrepaintState {
-        self.text
-            .prepaint(id, inspector_id, bounds, request_layout, window, cx);
-        ()
-    }
-
-    fn paint(
-        &mut self,
-        id: Option<&GlobalElementId>,
-        inspector_id: Option<&InspectorElementId>,
-        bounds: Bounds<Pixels>,
-        request_layout: &mut Self::RequestLayoutState,
-        prepaint_state: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        // 1) 画代码段的圆角背景
-        let layout = self.text.layout();
-        let origin = bounds.origin;
-        let line_h = layout.line_height();
-        if let Some(single) = layout.line_layouts().first() {
-            self.paint_ranges(origin, line_h, single, window);
-        }
-        // 2) 委托绘制文字
-        self.text
-            .paint(id, inspector_id, bounds, request_layout, prepaint_state, window, cx);
-    }
-}
-
-/// 文本行包裹元素：委托被包裹文本（[`StyledText`] 或行内代码圆角）完成测量/布局/paint，
-/// 并在 paint 阶段把两种反查数据写进共享表：
-/// - 文本布局（`TextCtx.hits`）→ 鼠标点选字符定位；
-/// - 注记矩形（`NoteCtx.hits`，文内 `[^n]` 与末尾定义 `[!n]` 都记）→ 悬浮卡片 + 双向跳转。
-///
-/// `st` 与 `child` 二选一：主路径直接持有 [`StyledText`]（`child=None`），行内代码行
-/// 把 `st` 移入 [`RoundedInlineText`]（`st=None`，不参与字符级点选，仅整行层面可用）。
+/// 文本行包裹元素：委托被包裹文本 [`StyledText`]（含行内代码时的**同一**文本）完成
+/// 测量/布局/paint，并在 paint 阶段把三种反查数据写进共享表：
+/// - 文本布局（`TextCtx.hits`）→ 鼠标点选字符定位（**与是否含行内代码无关**，两类行
+///   一致可点选——这保证预览/web 选区的行为统一，只有「可编辑」与否的差别）；
+/// - 注记矩形（`NoteCtx.hits`，文内 `[^n]` 与末尾定义 `[!n]` 都记）→ 悬浮卡片 + 双向跳转；
+/// - 行内代码圆角底：paint 前先用 [`Self::paint_code_ranges`] 画底，再委托画文字。
 struct TextTrack {
-    /// 真实渲染子元素（行内代码圆角时；主路径为 None，直接画 `st`）。
-    child: Option<gpui::AnyElement>,
-    /// 文本载体（主路径；命中时用其 `layout().index_for_position`）。
-    st: Option<StyledText>,
+    /// 文本载体（每行必有；命中时用其 `layout().index_for_position`）。
+    st: StyledText,
+    /// 行内代码（反引号）区间（已扩展空白），画圆角灰底用；空 = 无代码。
+    code_bg: Vec<Range<usize>>,
+    /// 代码底圆角半径。
+    code_radius: Pixels,
+    /// 代码底颜色。
+    code_bg_color: Hsla,
     /// 显示文本（命中后取文本长度钳制字节偏移）。
     text: gpui::SharedString,
     /// 全局块下标（共享命中表的行标识；同帧同行使旧条目失效）。
@@ -610,6 +475,71 @@ impl TextTrack {
             push_hit(range, *n, true);
         }
     }
+
+    /// 行内代码圆角灰底：把 `code_bg`（已扩展空白）区间按折行切成多段矩形并 paint，
+    /// 与正文共用 `st` 的同一 layout，保证背景与字形/折行对齐。空区间不做事。
+    fn paint_code_ranges(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        if self.code_bg.is_empty() {
+            return;
+        }
+        let layout = self.st.layout();
+        let line_height = layout.line_height();
+        let layouts = layout.line_layouts();
+        let Some(single) = layouts.first() else {
+            return;
+        };
+        let line_h = line_height.as_f32();
+        let text_origin = bounds.origin;
+        for range in &self.code_bg {
+            let Some(p0) = single.position_for_index(range.start, line_height) else {
+                continue;
+            };
+            let Some(p1) = single.position_for_index(range.end, line_height) else {
+                continue;
+            };
+            let y0 = (p0.y.as_f32() / line_h).floor() as usize;
+            let y1 = (p1.y.as_f32() / line_h).floor() as usize;
+            if y0 == y1 {
+                // 单行内：一段矩形
+                let b = Bounds {
+                    origin: point(
+                        px(text_origin.x.as_f32() + p0.x.as_f32()),
+                        px(text_origin.y.as_f32() + p0.y.as_f32()),
+                    ),
+                    size: gpui::size(
+                        px((p1.x.as_f32() - p0.x.as_f32()).max(0.0)),
+                        px(line_h),
+                    ),
+                };
+                window.paint_quad(
+                    fill(b, self.code_bg_color).corner_radii(Corners::all(self.code_radius)),
+                );
+            } else {
+                // 跨行：首段画到该行行尾、中间整行、末段从行首到终点
+                let line_origin_x = text_origin.x.as_f32();
+                let origin_y = text_origin.y.as_f32();
+                for real_ri in y0..=y1 {
+                    let (rx0, rx1) = if real_ri == y0 {
+                        (p0.x.as_f32(), single.width().as_f32())
+                    } else if real_ri == y1 {
+                        (0.0, p1.x.as_f32())
+                    } else {
+                        (0.0, single.width().as_f32())
+                    };
+                    let b = Bounds {
+                        origin: point(
+                            px(line_origin_x + rx0),
+                            px(origin_y + real_ri as f32 * line_h),
+                        ),
+                        size: gpui::size(px((rx1 - rx0).max(0.0)), px(line_h)),
+                    };
+                    window.paint_quad(
+                        fill(b, self.code_bg_color).corner_radii(Corners::all(self.code_radius)),
+                    );
+                }
+            }
+        }
+    }
 }
 
 impl IntoElement for TextTrack {
@@ -637,15 +567,8 @@ impl Element for TextTrack {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        if let Some(st) = &mut self.st {
-            let (lid, ()) = st.request_layout(id, inspector_id, window, cx);
-            (lid, ())
-        } else if let Some(child) = &mut self.child {
-            let lid = child.request_layout(window, cx);
-            (lid, ())
-        } else {
-            (window.request_layout(gpui::Style::default(), None, cx), ())
-        }
+        let (lid, ()) = self.st.request_layout(id, inspector_id, window, cx);
+        (lid, ())
     }
 
     fn prepaint(
@@ -657,11 +580,8 @@ impl Element for TextTrack {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        if let Some(st) = &mut self.st {
-            st.prepaint(id, inspector_id, bounds, request_layout, window, cx);
-        } else if let Some(child) = &mut self.child {
-            child.prepaint(window, cx);
-        }
+        self.st
+            .prepaint(id, inspector_id, bounds, request_layout, window, cx);
         ()
     }
 
@@ -676,39 +596,36 @@ impl Element for TextTrack {
         cx: &mut App,
     ) {
         // 1) 记录文本命中（layout 与可见文本一致；bounds.origin 已含滚动/布局变换）。
-        if let Some(st) = &self.st {
-            let layout = st.layout();
-            if let Some(ctx) = self.text_ctx.as_ref() {
-                let mut hits = ctx.hits.borrow_mut();
-                hits.retain(|h| h.row_ix != self.row_ix);
-                hits.push(TextHit {
-                    row_ix: self.row_ix,
-                    text: self.text.clone(),
-                    layout: layout.clone(),
-                    origin: bounds.origin,
-                });
-            }
-            // 2) 记录注记命中矩形（EPUB 悬浮卡片）。
-            let origin = bounds.origin;
-            let line_h = layout.line_height();
-            if let Some(single) = layout.line_layouts().first() {
-                self.record_note_hits(origin, line_h, single);
-            }
+        //    每行必有 `st`（含行内代码的行也不例外）→ 字符级点选对两类行一致可用。
+        let layout = self.st.layout();
+        if let Some(ctx) = self.text_ctx.as_ref() {
+            let mut hits = ctx.hits.borrow_mut();
+            hits.retain(|h| h.row_ix != self.row_ix);
+            hits.push(TextHit {
+                row_ix: self.row_ix,
+                text: self.text.clone(),
+                layout: layout.clone(),
+                origin: bounds.origin,
+            });
         }
-        // 3) 委托绘制文字。
-        if let Some(st) = &mut self.st {
-            st.paint(
-                id,
-                inspector_id,
-                bounds,
-                request_layout,
-                prepaint_state,
-                window,
-                cx,
-            );
-        } else if let Some(child) = &mut self.child {
-            child.paint(window, cx);
+        // 2) 记录注记命中矩形（EPUB 悬浮卡片）。
+        let origin = bounds.origin;
+        let line_h = layout.line_height();
+        if let Some(single) = layout.line_layouts().first() {
+            self.record_note_hits(origin, line_h, single);
         }
+        // 3) 行内代码圆角灰底（与 text_child 里的同一 layout，先画底）。
+        self.paint_code_ranges(bounds, window);
+        // 4) 委托绘制文字。
+        self.st.paint(
+            id,
+            inspector_id,
+            bounds,
+            request_layout,
+            prepaint_state,
+            window,
+            cx,
+        );
     }
 }
 
@@ -1352,4 +1269,42 @@ pub(crate) fn render_row(
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
     el.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_highlights_keeps_bold_when_overlapping_selection_bg() {
+        // 回归：选区背景与粗体 run 重叠时，合并段必须**同时**保留 font_weight 与
+        // 背景色（旧实现只合并 color/背景，与选区重叠的粗体段被抹成非粗体）。
+        let bold = HighlightStyle {
+            font_weight: Some(gpui::FontWeight::BOLD),
+            ..Default::default()
+        };
+        let sel_bg = HighlightStyle {
+            background_color: Some(gpui::rgba(0x4d6bfe42).into()),
+            ..Default::default()
+        };
+        let merged = merge_highlights(vec![(2..6, bold.clone()), (0..8, sel_bg.clone())]);
+        // [0,2) 仅背景；[2,6) 粗体+背景；[6,8) 仅背景。
+        let seg = merged
+            .iter()
+            .find(|(_, s)| s.font_weight == bold.font_weight)
+            .expect("重叠段应保留粗体");
+        assert!(seg.1.background_color == sel_bg.background_color, "重叠段应保留背景色");
+        assert_eq!(merged.len(), 3, "三个互不重叠的段：{merged:?}");
+    }
+
+    #[test]
+    fn char_align_range_absorbs_cjk_boundaries() {
+        let text = "你说得对，好。行不行。";
+        // 终点 19 切在 `。`（字节 18..21）中间 → 前向吸收到 21（完整句号）。
+        assert_eq!(char_align_range(text, 0..19), 0..21);
+        // 起点同样吸收；已对齐的保持不变。
+        assert_eq!(char_align_range(text, 3..6), 3..6);
+        // 越界安全。
+        assert_eq!(char_align_range(text, 18..999), 18..text.len());
+    }
 }

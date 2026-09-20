@@ -2150,8 +2150,9 @@ impl Render for MarkdownPreview {
     }
 }
 
-/// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）
-fn selection_color(cx: &App) -> Hsla {
+/// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）。
+/// WYSIWYG(`markdown/wysiwyg`) 也共用同一款，保证「选择区背景色」全局一致。
+pub(crate) fn selection_color(cx: &App) -> Hsla {
     if gpui_component::Theme::global(cx).is_dark() {
         gpui::rgba(0x4d6bfe61).into()
     } else {
