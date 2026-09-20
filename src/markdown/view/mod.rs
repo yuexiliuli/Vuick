@@ -819,11 +819,13 @@ impl MarkdownPreview {
             let b = if ix == e.0 { e.1 } else { text.len() };
             let a = a.min(text.len());
             let b = b.min(text.len());
-            if b > a {
+            // 防御：复制路径也把字节边界吸收到字符边界（防止非对齐偏移切进 CJK 崩）。
+            let r = crate::markdown::view::row::char_align_range(text.as_ref(), a..b);
+            if r.end > r.start {
                 if !out.is_empty() {
                     out.push('\n');
                 }
-                out.push_str(&text[a..b]);
+                out.push_str(&text[r]);
             }
         }
         (!out.is_empty()).then_some(out)

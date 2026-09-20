@@ -2250,3 +2250,48 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         assert_eq!(sel, None, "点空白应清除选择");
     }
 
+    #[gpui::test]
+    fn non_char_boundary_selection_over_cjk_does_not_panic(cx: &mut TestAppContext) {
+        // 回归：选区字节偏移切进多字节字符（CJK `。`）时，旧代码 `push_bg` 直接
+        // 用该区间喂 StyledText → shaping 时 run 边界非字符边界 → direct_write
+        // panic（byte index not a char boundary）。修复：`char_align_range` 吸收。
+        cx.update(gpui_component::init);
+        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let src = "# 标题\n\n你说得对，好。行不行。\n";
+        let md = cx.update(|_, cx| host.read(cx).md.clone());
+        md.update(cx, |md, cx| {
+            md.set_wrap(true, cx);
+            md.set_source(src, cx);
+        });
+        cx.simulate_resize(size(px(700.), px(500.)));
+        settle(&mut cx);
+        // 注入选区：终点 19 落在 `。`（字节 18..21）中间——旧代码渲染即崩。
+        let mid = "你说得对，好。".find('。').unwrap() + 1;
+        assert_eq!(mid, 19, "句号起于 18，切半偏移 19");
+        cx.update(|window, cx| {
+            let md2 = host.read(cx).md.clone();
+            md2.update(cx, |md, cx| {
+                md.selection = Some(((2, 0), (2, mid)));
+                // 复制路径的 `&text[a..b]` 切片也必须防御非字符边界（旧代码在此崩）。
+                md.copy_selection(window, cx);
+                cx.notify();
+            });
+        });
+        // 渲染带该选区高亮的行 + 复制：均不 panic 即修复生效。
+        settle(&mut cx);
+        let text = cx.update(|_, cx| host.read(cx).md.read(cx).selected_text());
+        assert_eq!(
+            text.as_deref(),
+            Some("你说得对，好。"),
+            "非边界偏移向前对齐到完整字符，且不 panic"
+        );
+    }
+
+
+
+
+
+

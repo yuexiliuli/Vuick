@@ -231,6 +231,22 @@ fn merge_highlights(
     out
 }
 
+/// 把字节区间边界逐一吸收到最近的**字符边界**（向前进位），防止多字节字符
+/// （CJK/emoji）被切半——任何非对齐偏移都会在 shaping 时崩（direct_write
+/// panic on non-char-boundary）。空/越界安全；区间可能缩小为 0 长（返回同边界）。
+pub(crate) fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let len = text.len();
+    let mut start = range.start.min(len);
+    while start < len && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut end = range.end.min(len);
+    while end < len && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    start..end
+}
+
 /// 行内文本子元素（统一入口）：按需要构建 [`StyledText`]（行内样式/搜索高亮/
 /// 选区高亮/引用标记着色+跳转加亮），再包一层 [`TextTrack`]——paint 阶段把文本
 /// 布局与注记矩形写进共享表，供「鼠标点选字符」与「注记双向跳转/悬浮卡片」反查。
@@ -306,17 +322,17 @@ fn text_child(
         }
     }
     let push_bg = |range: &Range<usize>, color: Hsla, highlights: &mut Vec<_>| {
-        if range.start < text.len() {
-            let end = range.end.min(text.len());
-            if end > range.start {
-                highlights.push((
-                    range.start..end,
-                    HighlightStyle {
-                        background_color: Some(color),
-                        ..Default::default()
-                    },
-                ));
-            }
+        // 防御：把区间边界吸收到字符边界（防止任何非对齐字节偏移切进多字节字符，
+        // 影响后续 shaping——CJK 下会 direct_write panic on non char boundary）。
+        let aligned = char_align_range(text.as_ref(), range.clone());
+        if aligned.end > aligned.start {
+            highlights.push((
+                aligned,
+                HighlightStyle {
+                    background_color: Some(color),
+                    ..Default::default()
+                },
+            ));
         }
     };
     // 跳转加亮：本行是被跳转定位的目标行时，给对应的 `[n]` 标记加背景色。
@@ -332,18 +348,20 @@ fn text_child(
     if let Some((range, color)) = &selection {
         push_bg(range, *color, &mut highlights);
     }
-    // 2) 构建 StyledText（有样式段走主题默认基，纯文本走行级 base）
+    // 2) 构建 StyledText。**所有高亮先经 `merge_highlights` 扫拢成互不重叠的段**——
+    //    选区背景 / 跳转加亮 / 搜索背景会与行内样式色 run 重叠，gpui 的
+    //    `compute_runs` 不处理重叠区间，会产出**长度错误的 run**：单字节 ASCII 碰巧
+    //    全是字符边界不炸，遇到 CJK（多字节）run 边界就会切进字符内 → direct_write
+    //    panic（byte index not a char boundary）。
+    let merged = merge_highlights(highlights);
     let st = if !runs.is_empty() || search.is_some() {
-        let mut s = StyledText::new(text.clone()).with_highlights(highlights);
+        let mut s = StyledText::new(text.clone()).with_highlights(merged);
         if !mono.is_empty() {
             s = s.with_font_family_overrides(mono);
         }
         s
     } else {
-        // 纯文本基路径走 gpui 的 `compute_runs`：不接受重叠高亮区间（会产出长度
-        // 错误的 run 而 panic），先把标记着色/标记加亮/选区等（可能重叠的）区间
-        // 合并成互不重叠的段再喂给它。
-        StyledText::new(text.clone()).with_default_highlights(base, merge_highlights(highlights))
+        StyledText::new(text.clone()).with_default_highlights(base, merged)
     };
     // 3) 行内代码（反引号）圆角灰底（自绘），保持与正文同行/折行
     let code_bg: Vec<Range<usize>> = runs
