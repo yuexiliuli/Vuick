@@ -56,9 +56,13 @@ pub(crate) struct DocRow {
     pub(crate) text: SharedString,
     /// 行内样式段（与预览同源）。
     pub(crate) runs: Vec<(Range<usize>, RunKind)>,
-    /// 编辑映射：渲染字节 → **该行**源字节（文本行，长度 = `text.len()+1`，末项为哨兵 =
-    /// 源段尾）。非文本行（代码/表格/图片/规则/空行）为空。
-    /// 由 `parser::text_segment` + `parser::inline_style_mapped` 装配（与预览同一段派生）。
+    /// 编辑映射：渲染字节 → **源字节偏移**。
+    /// - 文本行（段落/标题/列表/引述）：相对**该行**行首，长度 = `text.len()+1`，
+    ///   末项为哨兵 = 源段尾；由 `parser::text_segment` + `parser::inline_style_mapped`
+    ///   装配（与预览同一段派生）。
+    /// - 代码块（围栏内内容行可编辑）：相对**块首**（`src_line` 围栏行起始），
+    ///   渲染文本 = 各代码行以 `\n` 连接（围栏标记本身只读不渲染）。
+    /// - 其它非文本行（表格/图片/规则/空行）为空。
     pub(crate) byte_map: Vec<usize>,
     /// 块级渲染负载（非文本块的渲染数据）。
     pub(crate) payload: DocPayload,
@@ -213,23 +217,25 @@ impl Doc {
         let block = self.ir.iter().find(|b| b.lines.start == r.src_line);
         let kind = block.map_or_else(|| row_kind(r.kind), |b| b.kind);
         let lines = block.map(|b| b.lines.clone()).unwrap_or(r.src_line..r.src_line + 1);
-        let byte_map = if matches!(
-            r.kind,
+        let code_lines = r.code_lines().to_vec();
+        let byte_map = match r.kind {
             RowKind::Paragraph
-                | RowKind::Heading(_)
-                | RowKind::Bullet
-                | RowKind::Quote
-        ) {
-            let line = self.line_str(r.src_line);
-            parser::text_segment(&line, r.kind)
-                .map(|(off, seg)| parser::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+            | RowKind::Heading(_)
+            | RowKind::Bullet
+            | RowKind::Quote => {
+                let line = self.line_str(r.src_line);
+                parser::text_segment(&line, r.kind)
+                    .map(|(off, seg)| {
+                        parser::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
+                    })
+                    .unwrap_or_default()
+            }
+            RowKind::Code => self.code_byte_map(r.src_line, &code_lines),
+            _ => Vec::new(),
         };
         let payload = match r.kind {
             RowKind::Code => DocPayload::Code {
-                code_lines: r.code_lines().to_vec(),
+                code_lines,
                 language: r.code_language().map(Into::into),
             },
             RowKind::Image => DocPayload::Image {
@@ -247,6 +253,44 @@ impl Doc {
             byte_map,
             payload,
         }
+    }
+
+    /// 代码块（围栏内内容行可编辑）的块级编辑映射：
+    /// `byte_map[i]` = 整块渲染文本（代码行以 `\n` 连接，围栏标记本身只读不渲染）
+    /// 第 `i` 个渲染字节对应的**块首源偏移**（相对 `src_line` 围栏行起始），使元素层
+    /// 可对围栏内任意内容行做「渲染位置 ↔ 源字节」换算。末项哨兵 = 末内容行行尾
+    /// （= 闭合围栏行起始）。`CRLF` 下分隔符映射到上一行的 `\n`（`line_starts` 已跳过 `\r\n`）。
+    fn code_byte_map(&self, src_line: usize, code_lines: &[SharedString]) -> Vec<usize> {
+        let block_start = self.line_starts.get(src_line).copied().unwrap_or(0);
+        let mut map = Vec::new();
+        for (k, line) in code_lines.iter().enumerate() {
+            // 行与行之间的渲染 `\n`（首行前无分隔符）。
+            if k > 0 {
+                let prev_nl = self
+                    .line_starts
+                    .get(src_line + 1 + k)
+                    .copied()
+                    .unwrap_or(block_start)
+                    .saturating_sub(1);
+                map.push(prev_nl.saturating_sub(block_start));
+            }
+            let line_start = self
+                .line_starts
+                .get(src_line + 1 + k)
+                .copied()
+                .unwrap_or(block_start);
+            for (i, _) in line.as_bytes().iter().enumerate() {
+                map.push(line_start.saturating_sub(block_start) + i);
+            }
+        }
+        let sentinel = self
+            .line_starts
+            .get(src_line + 1 + code_lines.len())
+            .copied()
+            .unwrap_or_else(|| self.src_len())
+            .saturating_sub(block_start);
+        map.push(sentinel);
+        map
     }
 
     /// 第 `ix` 行的源码文本（仅该行切片，O(行长)）。

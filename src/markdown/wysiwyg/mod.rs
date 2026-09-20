@@ -9,15 +9,17 @@
 //!   一致，`parity` 钉死）。
 //! - 编辑器 = auto-grow 自绘 [`element::WyEditorElement`]（宿主滚动，与 `live` 同宿主
 //!   范式）；行内样式来自 `DocRow.runs`（`parser::RunKind`）。
-//! - 非文本块已按类型渲染：代码围栏（等宽 + 语法高亮 + 圆角面板）、GFM 表格（网格，
-//!   列宽自适应）、引述（灰底 + 左侧指示条）、独立图片行（`AnyImageCache` 异步加载，
-//!   占位/失败回退 alt）；样式统一抄自预览 [`super::view::style::StyleParams`]。
+//! - 非文本块已按类型渲染：代码围栏（等宽 + 语法高亮 + 圆角面板，**内容行可编辑**）、
+//!   GFM 表格（网格，列宽自适应）、引述（灰底 + 左侧指示条）、独立图片行
+//!   （`AnyImageCache` 异步加载，占位/失败回退 alt）；样式统一抄自预览
+//!   [`super::view::style::StyleParams`]。
 //! - 输入：普通文本/IME 组合命中（`marked` 区间追踪，修复重复串）、点击定位、
 //!   鼠标拖选 + Ctrl+C/X/V/A（选区替换/删除）。
-//! - 现状声明（留待逐步补齐）：代码/表格/图片等**非文本块只读**（块模型无行内映射，
-//!   尚不支持在围栏内/表格内编辑，光标停在块边界）；首帧/变更整篇 shape（未窗口化，
-//!   大文档慢——下一步把 `rows_in_line_window` 的窗口化落到 shape，`Doc` 已为此设计）。
-//!   仅作「预览编辑测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
+//! - 现状声明（留待逐步补齐）：代码块内容行已可编辑（块级 `byte_map` + 每行渲染
+//!   起始偏移，光标/点击/选区落在围栏内任意内容行；导航跳过只读围栏行、退格/
+//!   删除有守卫保护 ``` 标记）；表格/图片**仍只读**（需逐单元格/逐行映射，沿用
+//!   [`super::doc::Doc`] 块级 `byte_map` 同套路）。仅作「预览编辑测试」入口，
+//!   验证「本项目流程能编辑 + 正确映射回源」。
 
 mod element;
 
@@ -201,6 +203,10 @@ pub struct WyEditor {
     sel_anchor: Option<usize>,
     /// 鼠标左键拖选进行中（on_mouse_move 延伸选区）。
     dragging: bool,
+    /// 当前文档中每个代码块的**内容行区间**（`lo..hi`，左闭右开，含两端内容行；
+    /// 围栏行 = 紧邻区间首前的行与区间末行）。导航/退格/删除据此避免光标落进
+    /// 只读围栏（否则在隐藏围栏上输入会破坏 ``` 标记）。随文本变更重建。
+    code_regions: Vec<Range<usize>>,
 }
 
 impl WyEditor {
@@ -226,6 +232,7 @@ impl WyEditor {
             marked: None,
             sel_anchor: None,
             dragging: false,
+            code_regions: Vec::new(),
         }
     }
 
@@ -272,6 +279,7 @@ impl WyEditor {
     pub fn set_source_text(&mut self, text: &str) {
         self.content = SharedString::from(text);
         self.doc = Doc::open(self.content.clone());
+        self.rebuild_code_regions();
         self.preseed_image_sizes();
         self.caret = self.caret.min(self.content.len());
         *self.frame.borrow_mut() = None;
@@ -695,16 +703,81 @@ impl WyEditor {
     }
 
     /// 该行「可编辑段」的源局部区间 `(lo, hi)`：`lo` = 正文源偏移，`hi` = 行尾。
-    /// 非文本行 → `None`（只读/不可编辑）。
+    /// 非文本行 → `None`（只读/不可编辑）。代码围栏**内容行**整行可编辑（围栏
+    /// 标记行本身仍 `None`）。
     fn editable_segment(&self, line: usize) -> Option<(usize, usize)> {
         let start = self.line_start(line);
         let end = self.line_end(line);
         if end <= start {
             return None;
         }
+        if self.in_code_content(line) {
+            return Some((0, end - start));
+        }
         let raw = &self.content.as_ref()[start..end];
         let seg = crate::markdown::parser::text_segment(raw, self.kind_for_line(line))?;
         Some((seg.0, raw.len()))
+    }
+
+    /* ---------- 代码围栏（区域缓存 + 行判定） ---------- */
+
+    /// 从块索引重建每个代码块的**内容行区间**（指数 `lo..hi` 为内容行，左闭右开，
+    /// 末位=闭合围栏行号）。围栏行 = `lo-1`（开头）与 `hi`（闭合）。文本变更后调用。
+    fn rebuild_code_regions(&mut self) {
+        let n = self.doc.block_count();
+        let mut regions: Vec<Range<usize>> = Vec::new();
+        for i in 0..n {
+            let Some(m) = self.doc.block_meta(i) else {
+                continue;
+            };
+            if m.kind != crate::markdown::parser::RowKind::Code {
+                continue;
+            }
+            let lo = m.src_line as usize + 1;
+            let hi = lo + m.aux.max(1) as usize;
+            regions.push(lo..hi);
+        }
+        self.code_regions = regions;
+    }
+
+    /// `line` 是否为某代码块的**围栏行**（开头/闭合界的标记行，只读）。
+    fn is_fence_line(&self, line: usize) -> bool {
+        self.code_regions
+            .iter()
+            .any(|r| (r.start > 0 && line == r.start - 1) || line == r.end)
+    }
+
+    /// `line` 是否落在某代码块的**内容行**内（可编辑）。
+    fn in_code_content(&self, line: usize) -> bool {
+        self.code_regions.iter().any(|r| line >= r.start && line < r.end)
+    }
+
+    /// `line` 所在代码块的内容行区间 `(首内容行, 末内容行)`（含两端）；非内容行 → None。
+    fn code_content_at(&self, line: usize) -> Option<(usize, usize)> {
+        let c = self
+            .code_regions
+            .iter()
+            .find(|r| line >= r.start && line < r.end)?;
+        Some((c.start, c.end - 1))
+    }
+
+    /// 从 `line` 向下找第一个**非围栏**行（可含当前行；跳过连续围栏行）。
+    fn prev_render_line(&self, line: usize) -> usize {
+        let mut l = line;
+        while l > 0 && self.is_fence_line(l) {
+            l -= 1;
+        }
+        l
+    }
+
+    /// 从 `line` 向上找第一个**非围栏**行（可含当前行；跳过连续围栏行）。
+    fn next_render_line(&self, line: usize) -> usize {
+        let total = self.content.as_ref().matches('\n').count() + 1;
+        let mut l = line;
+        while l + 1 < total && self.is_fence_line(l) {
+            l += 1;
+        }
+        l
     }
 
     /* ---------- 编辑操作（源字节域） ---------- */
@@ -723,6 +796,7 @@ impl WyEditor {
         next.push_str(&s[r.end..]);
         self.content = SharedString::from(next);
         self.doc = Doc::open(self.content.clone());
+        self.rebuild_code_regions();
         self.caret = (r.start + text.len()).min(self.content.len());
         self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
@@ -741,6 +815,11 @@ impl WyEditor {
         if at == 0 {
             return;
         }
+        // 围栏守卫：首内容行行首退格 = no-op（否则会吃掉围栏的 `\n` 破坏 ``` 标记）。
+        let (bl, bcol) = self.row_col(at);
+        if bcol == 0 && self.code_content_at(bl).is_some_and(|(lo, _)| bl == lo) {
+            return;
+        }
         let start = s[..at].char_indices().last().map(|(i, _)| i).unwrap_or(0);
         self.replace_range(start..at, "", cx);
     }
@@ -752,6 +831,12 @@ impl WyEditor {
         let s = self.content.as_ref();
         let at = self.caret.min(s.len());
         if at >= s.len() {
+            return;
+        }
+        // 围栏守卫：末内容行行尾删除 = no-op（否则会吃掉行尾 `\n`、把闭合围栏并进内容行）。
+        let (dl, dcol) = self.row_col(at);
+        let last = self.code_content_at(dl).map(|(_, hi)| hi);
+        if last == Some(dl) && dcol >= self.line_end(dl) - self.line_start(dl) {
             return;
         }
         let end = at + s[at..].chars().next().unwrap_or(' ').len_utf8();
@@ -780,17 +865,22 @@ impl WyEditor {
                     .unwrap_or(0)
                     .max(seg_start);
             } else if self.caret >= seg_start && self.caret < seg_end {
-                // 段首（光标坐在标记后）→ 不动或回上一行段尾。
+                // 段首（光标坐在标记后/代码内容行行首）→ 回上一**可视**行段尾
+                // （跳过围栏行，光标绝不落进只读围栏）。
                 self.caret = if line > 0 {
-                    let p = line - 1;
+                    let p = self.prev_render_line(line - 1);
                     let e = self.line_end(p);
-                    self.editable_segment(p).map_or(self.line_start(p), |(_l, h)| self.line_start(p) + h).min(e).max(self.line_start(p))
+                    self.editable_segment(p)
+                        .map_or(self.line_start(p), |(_l, h)| self.line_start(p) + h)
+                        .min(e)
+                        .max(self.line_start(p))
                 } else {
                     0
                 };
             }
         } else if line > 0 {
-            self.caret = self.line_end(line - 1).max(self.line_start(line - 1));
+            let p = self.prev_render_line(line - 1);
+            self.caret = self.line_end(p).max(self.line_start(p));
         } else if self.caret > 0 {
             self.caret -= 1;
         }
@@ -807,7 +897,7 @@ impl WyEditor {
                 let n = self.caret + s[self.caret..].chars().next().map_or(1, |c| c.len_utf8());
                 self.caret = n.min(seg_end).max(seg_start + 1);
             } else {
-                // 段尾 → 下一行段首。
+                // 段尾 → 下一**可视**行段首（跳过围栏行）。
                 self.caret = self.next_segment_start(line);
             }
         } else {
@@ -819,7 +909,12 @@ impl WyEditor {
     fn next_segment_start(&self, line: usize) -> usize {
         let total = self.content.as_ref().matches('\n').count() + 1;
         if line + 1 < total {
-            let n = line + 1;
+            // 下一行是围栏（代码块边界）→ 跳到围栏之后的内容/段落行段首。
+            let n = if self.is_fence_line(line + 1) {
+                self.next_render_line(line + 1)
+            } else {
+                line + 1
+            };
             self.editable_segment(n)
                 .map_or(self.line_end(n), |(lo, _)| self.line_start(n) + lo)
         } else {
@@ -830,7 +925,12 @@ impl WyEditor {
     fn move_up(&mut self) {
         let (line, _) = self.row_col(self.caret);
         self.caret = if line > 0 {
-            self.place_in_line(line - 1, self.visual_col())
+            let target = match self.code_content_at(line) {
+                // 代码内容行内部：上一内容行；已是首内容行 → 跳出块到上一可视行。
+                Some((lo, _)) if line > lo => line - 1,
+                _ => self.prev_render_line(line - 1),
+            };
+            self.place_in_line(target, self.visual_col())
         } else {
             0
         };
@@ -841,7 +941,20 @@ impl WyEditor {
         let (line, _) = self.row_col(self.caret);
         let total = self.content.as_ref().matches('\n').count() + 1;
         self.caret = if line + 1 < total {
-            self.place_in_line(line + 1, self.visual_col())
+            let target = match self.code_content_at(line) {
+                // 代码内容行内部：下一内容行；已是末内容行 → 跳出块到下一可视行。
+                Some((_, hi)) if line < hi => line + 1,
+                // 非内容行：下一行若是围栏（代码块边界）→ 跳过围栏进入块/下一段。
+                _ => {
+                    let nxt = line + 1;
+                    if self.is_fence_line(nxt) {
+                        self.next_render_line(nxt)
+                    } else {
+                        nxt
+                    }
+                }
+            };
+            self.place_in_line(target, self.visual_col())
         } else {
             self.content.len()
         };

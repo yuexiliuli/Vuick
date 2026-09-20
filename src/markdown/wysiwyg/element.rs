@@ -83,8 +83,14 @@ pub(crate) struct ShapedRow {
     /// 带外块为空（未 shape，paint 跳过）。
     pub wrapped: Vec<gpui::WrappedLine>,
     pub sub_heights: Vec<Pixels>,
+    /// 编辑映射：渲染字节 → 源字节偏移（语义见 `DocRow::byte_map`）。
+    /// 文本行为**相对该行**的局部映射；代码块为**相对块首**的块级映射。
     pub byte_map: std::rc::Rc<Vec<usize>>,
     pub editable: bool,
+    /// （仅多源码行可编辑块，当前为代码块）每源码行在其整块渲染文本
+    /// （代码行以 `\n` 连接）中的**起始渲染字节偏移**；长度 = 源码行数。
+    /// 空 = 普通单源码行文本块（段落等折行仍只映射一行，用 `byte_map` 全宽映射）。
+    pub multi_offsets: Vec<usize>,
     /// 该行实际行高（正文=para_line、标题=heading_line、代码=code_line 等）。
     pub lh: Pixels,
     /// 文本在内容区内的**额外左缩进**（padding 之外；引述=边条+内衬）。编辑可点行
@@ -333,6 +339,7 @@ fn shape_text_row(
         sub_heights,
         byte_map: std::rc::Rc::new(r.byte_map),
         editable,
+        multi_offsets: Vec::new(),
         lh: st.lh,
         x_off,
         height,
@@ -345,6 +352,10 @@ fn shape_text_row(
 
 /// 代码围栏块：等宽 + 语法高亮（GitHub 明/暗色板，同预览）+ 首/末空白带，
 /// 行高/字号用代码专属尺寸。不换行（超宽由宿主横向裁剪，与预览 nowrap 一致）。
+/// 围栏内**内容行可编辑**：`byte_map`（块级）+ `multi_offsets`（每源码行起始渲染
+/// 字节）供命中/光标/选区换算；围栏标记本身只读（不渲染）。
+/// 文本额外缩进 `x_off = 12`（面板内 `pl_3`）：背景带与正文对齐（content 边距 12），
+/// 文字再内衬 12 —— 命中/光标/选区经通用 `r.x_off` 对齐，与预览逐像素一致。
 fn shape_code_row(
     r: DocRow,
     window: &mut Window,
@@ -414,15 +425,30 @@ fn shape_code_row(
         sub_heights.push(sh);
         wrapped.extend(v);
     }
+    // 每源码行在其整块渲染文本（代码行以 '\n' 连接）中的起始渲染字节偏移——
+    // 与 `wrapped`/`sub_heights` 逐行对齐（每行一个 WrappedLine，nowrap 不折行）。
+    let editable = !code_lines.is_empty();
+    let mut multi_offsets = Vec::with_capacity(code_lines.len());
+    {
+        let mut acc = 0usize;
+        for (k, ln) in code_lines.iter().enumerate() {
+            if k > 0 {
+                acc += 1;
+            }
+            multi_offsets.push(acc);
+            acc += ln.len();
+        }
+    }
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped,
         sub_heights,
-        byte_map: std::rc::Rc::new(Vec::new()),
-        editable: false,
+        byte_map: std::rc::Rc::new(r.byte_map),
+        editable,
+        multi_offsets,
         lh,
-        x_off: px(0.),
+        x_off: px(12.),
         height,
         top: px(0.),
         kind,
@@ -473,6 +499,7 @@ fn shape_table_row(
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
+        multi_offsets: Vec::new(),
         lh: row_h,
         x_off: px(0.),
         height,
@@ -520,6 +547,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         sub_heights: vec![px(h)],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
+        multi_offsets: Vec::new(),
         lh: px(h),
         x_off: px(0.),
         height: px(h),
@@ -579,6 +607,7 @@ pub(crate) fn build_frame(
                 sub_heights: vec![line_h],
                 byte_map: std::rc::Rc::new(Vec::new()),
                 editable: false,
+                multi_offsets: Vec::new(),
                 lh: line_h,
                 x_off: px(0.),
                 height: line_h,
@@ -618,11 +647,11 @@ pub(crate) fn build_frame(
             aux: 1,
         });
         let cache_key = match meta.kind {
-            RowKind::Paragraph
-            | RowKind::Heading(_)
-            | RowKind::Quote
-            | RowKind::Bullet
-            | RowKind::Code => {
+            // 折行文本块（段/标题/引述/列表）缓存**真实可视行数**（带外沿用真值防
+            // 滚动跳变）。代码/表格/图片**不入缓存**：它们不折行、`estimate_height`
+            // 与 shape 高同式（代码 = (行数+2)×code_line）——入缓存反而会用
+            // `line_h × 行数`（正文行高×n）重建出错误高度（比真实矮 2 行代码高）。
+            RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
                 Some(height_cache_key(rgen, igen, meta.src_line, meta.kind, width_bits))
             }
             _ => None,
@@ -708,6 +737,7 @@ pub(crate) fn build_frame(
                     sub_heights: vec![h],
                     byte_map: empty_bm.clone(),
                     editable: false,
+                    multi_offsets: Vec::new(),
                     lh: line_h,
                     x_off: px(0.),
                     height: h,
@@ -747,8 +777,57 @@ fn render_point_of(wrapped: &[gpui::WrappedLine], line_h: Pixels, dcol: usize) -
     }
 }
 
-/// 源 caret → 光标条几何。非文本行停在块首（只读）。行高用 `r.lh`（标题/代码等
-/// 类型各自行高），否则光标会错位。
+/// 代码块内 dy（相对块首 y）→ 源码行组序号（`sub_heights` 累积；块首 1 行空白带
+/// 归第 0 组——代码块 `row.lh` = code_line，与 paint 的首空白带同高）。
+fn code_group_at(row: &ShapedRow, dy: f32) -> usize {
+    if row.sub_heights.is_empty() {
+        return 0;
+    }
+    let mut acc = f32::from(row.lh);
+    for (k, sh) in row.sub_heights.iter().enumerate() {
+        acc += f32::from(*sh);
+        if dy < acc {
+            return k;
+        }
+    }
+    row.sub_heights.len() - 1
+}
+
+/// 块级渲染字节 → 所在源码行组序号（`multi_offsets` 起始偏移左界折半）。
+fn group_from_rend(row: &ShapedRow, rend: usize) -> usize {
+    if row.multi_offsets.is_empty() {
+        return 0;
+    }
+    row.multi_offsets
+        .partition_point(|&o| o <= rend)
+        .saturating_sub(1)
+        .min(row.multi_offsets.len() - 1)
+}
+
+/// 第 `g` 个源码行组的**渲染字节长**（组内列上限）。
+fn group_len(row: &ShapedRow, g: usize) -> usize {
+    let total = row.byte_map.len().saturating_sub(1);
+    let start = row.multi_offsets.get(g).copied().unwrap_or(0);
+    let next = row
+        .multi_offsets
+        .get(g + 1)
+        .copied()
+        .unwrap_or(total)
+        .min(total);
+    next.saturating_sub(start).max(1)
+}
+
+/// 代码块第 `g` 个源码行组的垂直偏移（相对块首，含 1 行首空白带）。
+fn code_group_top(row: &ShapedRow, g: usize) -> f32 {
+    let mut acc = f32::from(row.lh);
+    for sh in row.sub_heights.iter().take(g) {
+        acc += f32::from(*sh);
+    }
+    acc
+}
+
+/// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
+/// 行高用 `r.lh`（标题/代码等类型各自行高），否则光标会错位。
 fn caret_geometry(
     editor: &WyEditor,
     rows: &[ShapedRow],
@@ -760,18 +839,39 @@ fn caret_geometry(
         if !r.src_lines.contains(&cl) {
             continue;
         }
-        if r.editable {
-            let target = col.min(line_end.saturating_sub(line_start));
-            // 源列 → 渲染列（`source_to_display`，左界）——与 `source_offset_at`
-            // 的反查互为逆映射，光标才落在点击处。
-            let dcol = source_to_display(&r.byte_map, target);
-            // 折行时 p.y 是子行偏移，叠加到块首才算准缓存所在的可视行。
-            let p = render_point_of(&r.wrapped, r.lh, dcol);
-            // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
-            return (true, px(12.) + r.x_off + p.x, r.top + p.y);
-        } else {
+        if !r.editable {
             return (false, px(12.), r.top);
         }
+        if !r.multi_offsets.is_empty() {
+            // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
+            // 经块级 byte_map 映射到该代码行的渲染列与垂直偏移；围栏行上不画。
+            let n = r.multi_offsets.len();
+            if cl >= r.src_line + 1 && cl <= r.src_line + n {
+                let block_start = editor.line_start(r.src_line);
+                let target = (line_start + col).saturating_sub(block_start);
+                let rend = source_to_display(&r.byte_map, target);
+                let g = group_from_rend(r, rend);
+                let dcol = rend
+                    .saturating_sub(r.multi_offsets[g])
+                    .min(group_len(r, g));
+                let p = r
+                    .wrapped
+                    .get(g)
+                    .and_then(|wl| wl.position_for_index(dcol, r.lh))
+                    .unwrap_or_else(|| point(px(0.), px(0.)));
+                let y = r.top + px(code_group_top(r, g) + f32::from(p.y));
+                return (true, px(12.) + r.x_off + p.x, y);
+            }
+            return (false, px(12.), r.top);
+        }
+        // 单源码行文本块：源列 → 渲染列（`source_to_display`，左界）——与
+        // `source_offset_at` 的反查互为逆映射，光标才落在点击处。
+        let target = col.min(line_end.saturating_sub(line_start));
+        let dcol = source_to_display(&r.byte_map, target);
+        // 折行时 p.y 是子行偏移，叠加到块首才算准缓存所在的可视行。
+        let p = render_point_of(&r.wrapped, r.lh, dcol);
+        // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
+        return (true, px(12.) + r.x_off + p.x, r.top + p.y);
     }
     let fallback_lh = rows.first().map_or(px(20.), |r| r.lh);
     let y = rows.last().map_or(fallback_lh, |r| r.top + r.height);
@@ -787,26 +887,46 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
         let top = f32::from(r.top);
         let bottom = top + f32::from(r.height);
         if rel_y >= top && rel_y < bottom {
-            if r.editable {
-                if let Some(w0) = r.wrapped.first() {
-                    // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
-                    // （`rel_y - top`）：`closest_index_for_position` 据此选折行的第几
-                    // 可视行——写成 0 会把第二行的点击映射回第一行。
-                    let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
-                        .max(0.);
-                    let rel = point(px(rel_x), px(rel_y - top));
-                    // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
-                    // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。
-                    let dcol = match w0.closest_index_for_position(rel, r.lh) {
-                        Ok(i) | Err(i) => i,
-                    };
-                    let local = display_to_source(&r.byte_map, dcol);
-                    let ls = editor.line_start(r.src_line);
-                    let le = editor.line_end(r.src_line);
-                    return (ls + local).min(le);
-                }
-            } else {
+            if !r.editable {
                 return editor.line_end(r.src_line).max(editor.line_start(r.src_line));
+            }
+            if !r.multi_offsets.is_empty() {
+                // 代码块：y 定源码行组（`code_group_at`，首空白带归第 0 组），x 定列；
+                // 经块级 byte_map 反查 块首源偏移 → 绝对源字节（钳到末内容行行尾）。
+                let g = code_group_at(r, rel_y - top);
+                let Some(wl) = r.wrapped.get(g) else {
+                    return editor.caret();
+                };
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
+                    .max(0.);
+                let rel = point(px(rel_x), px(0.));
+                // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
+                // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。
+                let dcol = match wl.closest_index_for_position(rel, r.lh) {
+                    Ok(i) | Err(i) => i,
+                };
+                let rend = r.multi_offsets[g] + dcol.min(group_len(r, g));
+                let local = display_to_source(&r.byte_map, rend);
+                let ls = editor.line_start(r.src_line);
+                let le = editor.line_end(r.src_line + r.multi_offsets.len()).max(ls);
+                return (ls + local).min(le);
+            }
+            if let Some(w0) = r.wrapped.first() {
+                // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
+                // （`rel_y - top`）：`closest_index_for_position` 据此选折行的第几
+                // 可视行——写成 0 会把第二行的点击映射回第一行。
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
+                    .max(0.);
+                let rel = point(px(rel_x), px(rel_y - top));
+                // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
+                // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。
+                let dcol = match w0.closest_index_for_position(rel, r.lh) {
+                    Ok(i) | Err(i) => i,
+                };
+                let local = display_to_source(&r.byte_map, dcol);
+                let ls = editor.line_start(r.src_line);
+                let le = editor.line_end(r.src_line);
+                return (ls + local).min(le);
             }
         }
     }
@@ -983,8 +1103,9 @@ fn paint_table_row(
     }
 }
 
-/// 代码块：圆角面板（对齐预览：外层 `px_3` → 面板比内容区缩进 12px），
-/// 行文本带再 `pl_3/pr_3`（面板内各 12px 内衬）。首/末各留一个 code_line 空白带。
+/// 代码块：圆角面板（对齐预览：外层 `px_3` → 面板贴**内容区左缘**（=content 边距，
+/// 与正文对齐），而非再缩进）；行文本再 `pl_3`（面板内 12px 内衬，走 `row.x_off`，
+/// 命中/光标/选区同 x）。首/末各留一个 code_line 空白带。
 fn paint_code_row(
     origin: Point<Pixels>,
     theme: &WyTheme,
@@ -995,8 +1116,8 @@ fn paint_code_row(
 ) {
     let pad = f32::from(f.padding);
     let content_w = f32::from(f.width) - pad * 2.;
-    let panel_x = origin.x + f.padding + px(12.);
-    let panel_w = (content_w - 24.).max(1.);
+    let panel_x = origin.x + f.padding;
+    let panel_w = content_w.max(1.);
     window.paint_quad(gpui::PaintQuad {
         bounds: Bounds::new(
             point(panel_x, origin.y + row.top),
@@ -1008,8 +1129,8 @@ fn paint_code_row(
         border_color: gpui::Hsla::default(),
         border_style: gpui::BorderStyle::Solid,
     });
-    // 顶空白带后逐行画文本（x = 面板左 + pl_3，行高 = code_line）。
-    let text_x = panel_x + px(12.);
+    // 顶空白带后逐行画文本（x = 面板左 + 内衬 x_off，行高 = code_line）。
+    let text_x = panel_x + row.x_off;
     let mut sub_top = row.top + theme.code_line();
     for wl in &row.wrapped {
         let o = point(text_x, origin.y + sub_top);
@@ -1199,6 +1320,47 @@ fn paint_selection(
     let e = editor.read(cx);
     for r in &f.rows {
         if !r.editable || r.wrapped.is_empty() {
+            continue;
+        }
+        if !r.multi_offsets.is_empty() {
+            // 代码块：逐源码行求与选区的交集，按字形几何画高亮（每行一条）。
+            let block_start = e.line_start(r.src_line);
+            let g_count = r.multi_offsets.len();
+            for g in 0..g_count {
+                let ls = e.line_start(r.src_line + 1 + g);
+                let le = e.line_end(r.src_line + 1 + g).max(ls);
+                let from = range.start.max(ls).min(le);
+                let to = range.end.max(ls).min(le);
+                if to > from {
+                    let rd0 = source_to_display(&r.byte_map, from - block_start);
+                    let rd1 = source_to_display(&r.byte_map, to - block_start);
+                    let span = group_len(r, g);
+                    let mut c0 = rd0.saturating_sub(r.multi_offsets[g]).min(span);
+                    let mut c1 = rd1.saturating_sub(r.multi_offsets[g]).min(span);
+                    if c0 > c1 {
+                        std::mem::swap(&mut c0, &mut c1);
+                    }
+                    if let Some(wl) = r.wrapped.get(g)
+                        && let Some(p0) = wl.position_for_index(c0, r.lh)
+                        && let Some(p1) = wl.position_for_index(c1, r.lh)
+                    {
+                        let w = f32::from(p1.x - p0.x).max(2.);
+                        let y = r.top + px(code_group_top(r, g));
+                        let h = r.sub_heights.get(g).copied().unwrap_or(r.lh);
+                        window.paint_quad(gpui::PaintQuad {
+                            bounds: Bounds::new(
+                                point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
+                                size(px(w), h),
+                            ),
+                            corner_radii: gpui::Corners::default(),
+                            background: hl.into(),
+                            border_widths: gpui::Edges::default(),
+                            border_color: gpui::Hsla::default(),
+                            border_style: gpui::BorderStyle::Solid,
+                        });
+                    }
+                }
+            }
             continue;
         }
         let ls = e.line_start(r.src_line);
@@ -1734,14 +1896,29 @@ let c = 3;
             let theme = ed.read(cx).theme.clone();
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
 
-            // 代码块：3 行逐行 shape、不可编辑、块高 = (行数+2)×code_line。
+            // 代码块：3 行逐行 shape、内容行可编辑、块高 = (行数+2)×code_line。
             let code = frame
                 .rows
                 .iter()
                 .find(|r| r.kind == IrKind::Code)
                 .expect("应有代码块");
-            assert!(!code.editable, "代码块不可编辑");
+            assert!(code.editable, "代码内容行应可编辑");
             assert_eq!(code.wrapped.len(), 3, "3 行代码应各一个 WrappedLine");
+            // 每源码行起始渲染字节偏移（"let a/ b/ c = 3;" 各 10 字节 + 2 个 '\n' 分隔）。
+            assert_eq!(code.multi_offsets, vec![0, 11, 22], "每行渲染起始字节");
+            assert_eq!(
+                code.byte_map.len(),
+                "let a = 1;\nlet b = 2;\nlet c = 3;".len() + 1,
+                "块级 byte_map = 整块渲染文本长 + 哨兵"
+            );
+            // 渲染「块级映射」往返：第 2 行中间列 → 块内源偏移 → 应指到 `let c = 3;`。
+            let line2 = "let c = 3;";
+            let ok = (0..line2.len()).all(|i| {
+                let src = display_to_source(&code.byte_map, 22 + i);
+                let col = src.saturating_sub(display_to_source(&code.byte_map, 22));
+                line2.as_bytes().get(col) == line2.as_bytes().get(i)
+            });
+            assert!(ok, "第 2 行渲染字节应回落到该行对应源字节");
             let expect_h = f32::from(theme.code_line()) * 5.;
             assert!(
                 (f32::from(code.height) - expect_h).abs() < 1.,
@@ -1974,6 +2151,308 @@ let c = 3;
                 ed.read(cx).content.as_ref().contains("引X"),
                 "引述行应可编辑：{}",
                 ed.read(cx).content.as_ref()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_click_lands_on_correct_source_line(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "\
+```rust
+let a = 1;
+let b = 22;
+let c = 333;
+```
+尾段
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块");
+            assert!(code.editable, "代码内容行应可编辑");
+            let lh = f32::from(code.lh);
+            let top = f32::from(code.top);
+            let pad = f32::from(frame.padding);
+            // 点击三个代码行的中部（y = 块首 + 首空白带 + k×行高）→ 逐行命中内容。
+            for (k, expects) in
+                [(0usize, "let a = 1;"), (1, "let b = 22;"), (2, "let c = 333;")]
+            {
+                let p = point(px(pad + 30.), px(top + lh * 1.5 + lh * k as f32));
+                let off = source_offset_at(ed.read(cx), &frame, p);
+                let (line, _) = ed.read(cx).row_col(off);
+                assert_eq!(line, 1 + k, "点击第 {k} 个代码行应命中源行 {}", 1 + k);
+                let ls = ed.read(cx).line_start(line);
+                let le = ed.read(cx).line_end(line);
+                assert_eq!(
+                    &ed.read(cx).content.as_ref()[ls..le],
+                    expects,
+                    "命中文本应为该行内容"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_caret_tracks_clicked_content_line(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "\
+```py
+one
+two
+three
+```
+tail
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (offsets, code_top, lh) = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块");
+            assert!(code.editable);
+            let e = ed.read(cx);
+            let offs: Vec<usize> = (1usize..=3).map(|ln| e.line_start(ln) + 1).collect();
+            (offs, f32::from(code.top), f32::from(code.lh))
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            for (k, off) in offsets.iter().enumerate() {
+                ed.update(cx, |e, _| e.set_caret(*off));
+                let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+                let (on, _, ctop) = caret_geometry(ed.read(cx), &frame.rows);
+                assert!(on, "代码内容行应可放光标");
+                // caret 顶 = 块首 + 1 行首空白带 + k×行高。
+                let expect = code_top + lh * (1 + k) as f32;
+                assert!(
+                    (f32::from(ctop) - expect).abs() < 0.6,
+                    "k={k} 光标顶应 {expect}，得 {}",
+                    f32::from(ctop)
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_edit_typing_backspace_enter(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let text = "```rust\nlet a = 1;\nlet b = 2;\n```\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                // 光标落在首个代码行内输入 → 源文本在围栏内更新。
+                let ls = e.line_start(1);
+                e.set_caret(ls + 4);
+                e.replace_range(e.caret()..e.caret(), "X", cx);
+                assert!(
+                    e.content.as_ref().starts_with("```rust\nlet Xa = 1;"),
+                    "围栏内输入生效：{}",
+                    e.content.as_ref()
+                );
+                // 退格删去 X（插入后光标已在 X 之后）。
+                e.backspace(cx);
+                assert_eq!(
+                    &e.content.as_ref()[ls..ls + 9],
+                    "let a = 1",
+                    "退格删回原位，围栏未损坏"
+                );
+                // 末内容行行尾的删除是 no-op（保护闭合围栏）；再回车在闭合围栏前新起代码行。
+                let e2 = e.line_end(2);
+                e.set_caret(e2);
+                e.delete(cx);
+                assert!(
+                    e.content.as_ref().contains("let b = 2;\n```"),
+                    "末内容行行尾删除应被守卫（闭合围栏不被吃掉）：{}",
+                    e.content.as_ref()
+                );
+                let e2 = e.line_end(2);
+                e.set_caret(e2);
+                e.newline(cx);
+                assert!(
+                    e.content.as_ref().contains("let b = 2;\n\n```"),
+                    "回车应在闭合围栏前新起一代码行：{}",
+                    e.content.as_ref()
+                );
+                // 首内容行行首退格是 no-op（保护开围栏）。
+                e.set_caret(e.line_start(1));
+                e.backspace(cx);
+                assert!(
+                    e.content.as_ref().starts_with("```rust\n"),
+                    "首内容行行首退格应被守卫（开围栏不被吃掉）：{}",
+                    e.content.as_ref()
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_arrow_nav_skips_fences(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let text = "前段\n```rust\nlet a = 1;\nlet b = 2;\n```\n后段\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _cx| {
+                // 首内容行行首向上 → 「前段」段尾，光标不落进开围栏。
+                e.set_caret(e.line_start(2));
+                e.move_up();
+                let (l, _) = e.row_col(e.caret());
+                assert_eq!(l, 0, "首内容行向上应到行 0（前段），得 {l}");
+                // 「前段」行尾向右 → 跳过开围栏进代码首内容行（行 2）。
+                e.set_caret(e.line_end(0));
+                e.move_right();
+                let (l, col) = e.row_col(e.caret());
+                assert!(l == 2 && col == 0, "前段行尾向右应到首内容行行首，得 ({l},{col})");
+                // 内容行内上下移动 → 光标行始终在内容行 2/3。
+                e.set_caret(e.line_start(2) + 3);
+                e.move_down();
+                let (l, _) = e.row_col(e.caret());
+                assert_eq!(l, 3, "内容行内下移应在行 3，得 {l}");
+                e.move_up();
+                let (l, _) = e.row_col(e.caret());
+                assert_eq!(l, 2, "内容行内上移回行 2，得 {l}");
+                // 末内容行行尾向右 → 跳过闭合围栏到「后段」（行 5）段首。
+                e.set_caret(e.line_end(3));
+                e.move_right();
+                let (l, col) = e.row_col(e.caret());
+                assert!(l == 5 && col == 0, "末内容行行尾向右应到后段行首，得 ({l},{col})");
+                // 后段向上 → 进代码块末内容行（行 3）。
+                e.set_caret(e.line_start(5) + 2);
+                e.move_up();
+                let (l, _) = e.row_col(e.caret());
+                assert_eq!(l, 3, "后段向上应进代码块末内容行 3，得 {l}");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_off_band_height_matches_shaped(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        // 一长段把代码块推到 300px 带之外 → 带外估算高必须与整形式高度一致（防滚动跳变）。
+        let head = "the quick brown fox jumps over the lazy dog ".repeat(300);
+        let text = format!("{head}\n```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n尾行\n");
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let shaped_h = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块");
+            assert!(code.editable);
+            f32::from(code.height)
+        });
+        let off_h = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 窄带：长段 (~1000px) 全占，代码块与尾行在带外 → 占位（不 shape）。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 300.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块占位");
+            assert!(!code.editable, "带外代码块不 shape");
+            f32::from(code.height)
+        });
+        assert!(
+            (off_h - shaped_h).abs() < 1.,
+            "代码块带外估算高 {off_h} 应与整形高 {shaped_h} 一致（防滚动跳变）"
+        );
+    }
+
+    #[gpui::test]
+    fn code_block_caret_aligns_with_click_x(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        // 回归「点击 (x,y) 实际输入在 (x+n,y)/光标盖住字符」：代码行文本内衬 = 12px
+        // （`x_off`，面板 pl_3），命中/光标必须都从 `padding + x_off`(24) 起算。
+        let text = "```rust\nlet a = 1;\n```\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块");
+            assert!(code.editable);
+            let pad = f32::from(frame.padding);
+            let off_x = f32::from(code.x_off);
+            assert!((off_x - 12.).abs() < 0.1, "代码行文本内衬 = 面板 pl_3（12px），得 {off_x}");
+            let lh = f32::from(code.lh);
+            let text_start = pad + off_x; // 24：代码文本起始 x（面板背景在 pad=12，与正文对齐）
+            // 1) 点击文本起始处 → 光标 x == 文本起始 x（不右偏、不盖字）。
+            let off0 = source_offset_at(ed.read(cx), &frame, point(px(text_start), px(lh * 1.5)));
+            let (line0, _) = ed.read(cx).row_col(off0);
+            assert_eq!(line0, 1, "点击文本始应命中代码内容行，得行 {line0}");
+            ed.update(cx, |e, _| e.set_caret(off0));
+            let (on, c0, _) = caret_geometry(ed.read(cx), &frame.rows);
+            assert!(on);
+            assert!(
+                (f32::from(c0) - text_start).abs() < 0.6,
+                "光标 x {} 应 = 文本起始 x {text_start}",
+                f32::from(c0)
+            );
+            // 2) 点击面板内、文本左的内衬空白 → 光标收拢到行首（= 文本起始 x），不右偏。
+            let off1 = source_offset_at(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
+            ed.update(cx, |e, _| e.set_caret(off1));
+            let (on, c1, _) = caret_geometry(ed.read(cx), &frame.rows);
+            assert!(on);
+            assert!(
+                (f32::from(c1) - text_start).abs() < 0.6,
+                "内衬空白点击应收拢到行首 {text_start}，得 {}",
+                f32::from(c1)
+            );
+            // 3) 文本中部点击 → 光标落点在 <1 字宽误差内贴合点击处。
+            let cx_ = text_start + 28.;
+            let off2 = source_offset_at(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
+            ed.update(cx, |e, _| e.set_caret(off2));
+            let (on, c2, _) = caret_geometry(ed.read(cx), &frame.rows);
+            assert!(on);
+            assert!(
+                (f32::from(c2) - cx_).abs() < 14.,
+                "光标 x {} 应贴近点击 x {}（<1 字宽）",
+                f32::from(c2),
+                cx_
             );
         });
     }
