@@ -128,96 +128,6 @@ pub fn toggle_alert_fold_at(content: &str, offset: usize) -> Option<String> {
     Some(out)
 }
 
-/// Visual style of a GFM table, chosen per-table via a `<!-- table:STYLE -->`
-/// marker comment on the line directly above it. The renderers honor it;
-/// standard Markdown viewers ignore the comment and show a plain table.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum TableStyle {
-    /// Full outer box + all row/column gridlines.
-    #[default]
-    Grid,
-    /// Alternate body rows shaded; no gridlines; a rule under the header.
-    Striped,
-    /// Only the header row shaded; no gridlines.
-    Header,
-    /// No box or gridlines — just a rule under the header.
-    Minimal,
-}
-
-impl TableStyle {
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "grid" => Some(Self::Grid),
-            "striped" => Some(Self::Striped),
-            "header" => Some(Self::Header),
-            "minimal" => Some(Self::Minimal),
-            _ => None,
-        }
-    }
-}
-
-/// Parse a `<!-- table:STYLE -->` marker (a whole line or an HTML comment's
-/// value) into its [`TableStyle`]. `None` for anything unrecognized, so an
-/// unknown marker stays a plain HTML comment.
-pub fn table_style_marker(text: &str) -> Option<TableStyle> {
-    let body = table_marker_body(text)?;
-    // The style name is the first token; later tokens are attributes
-    // (`cols=…` column widths).
-    TableStyle::from_name(body.split_whitespace().next().unwrap_or(""))
-}
-
-/// The inner body of a `<!-- table:… -->` marker (style name + attributes),
-/// or `None` for any other text.
-fn table_marker_body(text: &str) -> Option<&str> {
-    let inner = text
-        .trim()
-        .strip_prefix("<!--")?
-        .strip_suffix("-->")?
-        .trim();
-    Some(inner.strip_prefix("table:")?.trim())
-}
-
-/// Explicit column widths (logical px) from a table marker's `cols=` attribute
-/// — `<!-- table:grid cols=120,80,200 -->` — written by the editor's
-/// drag-to-resize. `None` when absent or malformed (the table stays
-/// content-measured).
-pub fn table_col_widths(text: &str) -> Option<Vec<f32>> {
-    let body = table_marker_body(text)?;
-    let attr = body
-        .split_whitespace()
-        .find_map(|tok| tok.strip_prefix("cols="))?;
-    let widths: Vec<f32> = attr
-        .split(',')
-        .map(|w| w.trim().parse::<f32>())
-        .collect::<Result<_, _>>()
-        .ok()?;
-    (!widths.is_empty() && widths.iter().all(|w| w.is_finite() && *w > 0.)).then_some(widths)
-}
-
-/// A table marker line for `style` (+ optional explicit column widths) — the
-/// inverse of the parsers above. `None` when the marker would say nothing
-/// (Grid, no widths): the default needs no marker.
-pub fn table_marker_text(style: TableStyle, widths: Option<&[f32]>) -> Option<String> {
-    let name = match style {
-        TableStyle::Grid => "grid",
-        TableStyle::Striped => "striped",
-        TableStyle::Header => "header",
-        TableStyle::Minimal => "minimal",
-    };
-    match widths {
-        Some(w) if !w.is_empty() => {
-            let list = w
-                .iter()
-                .map(|w| (w.round() as i64).to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            Some(format!("<!-- table:{name} cols={list} -->"))
-        }
-        _ if style != TableStyle::Grid => Some(format!("<!-- table:{name} -->")),
-        _ => None,
-    }
-}
-
 /// Font-size multiplier for a heading of the given depth (h1 largest, h6 =
 /// body) — one scale for reading, editing, and export.
 pub fn heading_scale(depth: u8) -> f32 {
@@ -1274,15 +1184,5 @@ mod tests {
         assert_eq!(ordered_marker(2, 4), "iv.");
         assert_eq!(ordered_marker(2, 9), "ix.");
         assert_eq!(ordered_marker(3, 2), "2."); // cycle restarts
-    }
-
-    #[test]
-    fn table_style_markers_parse() {
-        assert_eq!(
-            table_style_marker("<!-- table:striped -->"),
-            Some(TableStyle::Striped)
-        );
-        assert_eq!(table_style_marker("<!-- math:left -->"), None);
-        assert_eq!(table_style_marker("plain text"), None);
     }
 }

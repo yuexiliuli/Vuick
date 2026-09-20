@@ -1,7 +1,7 @@
 //! 本项目的「实时预览编辑」（WYSIWYG / live-preview）Markdown 编辑器。
 //!
 //! 从 zorite 的 `gpui-editor`（GPL-3.0-or-later）移植并并入本二进制 crate，
-//! 不再依赖外部包：子模块 `element`/`markdown_syntax`/`tables` 对应移植的三个
+//! 不再依赖外部包：子模块 `element`/`markdown_syntax` 对应移植的三个
 //! 源文件，`md_syntax`（markdown 构造识别）对应移植的 `gpui-markdown` 包。
 //! 与 GPUI 祖先无关地自洽。
 //!
@@ -32,9 +32,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub(crate) mod markdown_syntax;
 pub use markdown_syntax::{MathAlign, SyntaxStyle};
-
-mod tables;
-use tables::*;
 
 mod element;
 use element::*;
@@ -336,12 +333,6 @@ fn caret_off_marker_line(content: &str, offset: usize) -> usize {
         }
         content.len()
     };
-    if let Some(t) = markdown_syntax::table_regions(content)
-        .iter()
-        .find(|t| t.marker_line == Some(row))
-    {
-        return line_start(t.lines.start);
-    }
     if let Some(m) = markdown_syntax::math_regions(content)
         .iter()
         .find(|m| m.marker_line == Some(row))
@@ -383,53 +374,6 @@ fn prefix_lines(body: &[String], p: impl Fn(usize) -> String) -> String {
         .join("\n")
 }
 
-/// A column edit applied to every row of a table (insert/delete a cell at index).
-#[derive(Clone, Copy)]
-enum ColEdit {
-    Insert(usize),
-    Delete(usize),
-}
-
-/// An item in the table right-click menu (Word-style table editing).
-#[derive(Clone, Copy)]
-enum TableMenuAction {
-    InsertRowAbove,
-    InsertRowBelow,
-    DuplicateRow,
-    InsertColLeft,
-    InsertColRight,
-    DeleteRow,
-    DeleteColumn,
-    AlignLeft,
-    AlignCenter,
-    AlignRight,
-    /// Rewrite the table's `<!-- table:STYLE -->` marker (`None` = the
-    /// default Grid, which has no marker).
-    SetStyle(Option<&'static str>),
-    CopyTable,
-    DeleteTable,
-}
-
-impl TableMenuAction {
-    fn apply(self, editor: &mut MarkdownLivePreview, cx: &mut Context<MarkdownLivePreview>) {
-        match self {
-            TableMenuAction::InsertRowAbove => editor.insert_table_row(false, cx),
-            TableMenuAction::InsertRowBelow => editor.insert_table_row(true, cx),
-            TableMenuAction::DuplicateRow => editor.duplicate_table_row(cx),
-            TableMenuAction::InsertColLeft => editor.insert_table_column(false, cx),
-            TableMenuAction::InsertColRight => editor.insert_table_column(true, cx),
-            TableMenuAction::DeleteRow => editor.delete_table_row(cx),
-            TableMenuAction::DeleteColumn => editor.delete_table_column(cx),
-            TableMenuAction::AlignLeft => editor.set_caret_table_align(CellAlign::Left, cx),
-            TableMenuAction::AlignCenter => editor.set_caret_table_align(CellAlign::Center, cx),
-            TableMenuAction::AlignRight => editor.set_caret_table_align(CellAlign::Right, cx),
-            TableMenuAction::SetStyle(name) => editor.set_table_style(name, cx),
-            TableMenuAction::CopyTable => editor.copy_table(cx),
-            TableMenuAction::DeleteTable => editor.delete_table(cx),
-        }
-    }
-}
-
 /// Events the editor emits so a host can react. Subscribe with
 /// `cx.subscribe(&editor, …)` — e.g. to re-run spell-check after an edit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -445,7 +389,7 @@ pub enum EditorEvent {
     /// with this title (Logseq semantics, matching the reading view).
     OpenWikiLink(SharedString),
     /// The caret / selection moved without a text change — so a host can update a
-    /// caret-anchored affordance (e.g. the table-alignment toolbar).
+    /// caret-anchored affordance.
     SelectionChanged,
     /// The caret entered a `$$…$$` math block (by click, or by arrowing into it): its byte
     /// `range` in the document (covering both fences) and the LaTeX `source` between them, so
@@ -483,15 +427,6 @@ pub enum EditorEvent {
     /// An inline `![](src)` image was left-clicked — the host opens a full-size
     /// preview. The text is untouched.
     PreviewImage(SharedString),
-}
-
-/// A table column's text alignment, for the host-driven alignment toolbar
-/// ([`MarkdownLivePreview::caret_table_align`] / [`MarkdownLivePreview::set_caret_table_align`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum CellAlign {
-    Left,
-    Center,
-    Right,
 }
 
 /// Provides replacement suggestions for a flagged word (best first); set by the
@@ -599,7 +534,7 @@ pub fn inline_math_sources(content: &str) -> Vec<SharedString> {
 /// raw-markdown view otherwise.
 /// Host-injectable UI labels the editor renders in its context menus and
 /// chrome (right-click menu items, the code-block / math `Copy` chips, the
-/// table / "Turn into" menus). The crate stays host-agnostic so it never
+/// "Turn into" menus). The crate stays host-agnostic so it never
 /// calls `t!()`; the app passes localized strings here via
 /// [`MarkdownLivePreview::set_labels`]. The default is English, keeping the crate
 /// usable standalone (and existing tests' expectations intact).
@@ -626,22 +561,6 @@ pub struct Labels {
     pub callout: SharedString,
     pub code_block: SharedString,
     pub math_block: SharedString,
-    /// Table right-click menu.
-    pub insert_row_above: SharedString,
-    pub insert_row_below: SharedString,
-    pub duplicate_row: SharedString,
-    pub insert_column_left: SharedString,
-    pub insert_column_right: SharedString,
-    pub align_left: SharedString,
-    pub align_center: SharedString,
-    pub align_right: SharedString,
-    pub grid_style: SharedString,
-    pub striped_style: SharedString,
-    pub header_style: SharedString,
-    pub minimal_style: SharedString,
-    pub delete_row: SharedString,
-    pub delete_column: SharedString,
-    pub delete_table: SharedString,
     /// Property-panel menu.
     pub edit_properties: SharedString,
     pub delete_property: SharedString,
@@ -670,21 +589,6 @@ impl Default for Labels {
             callout: "Callout".into(),
             code_block: "Code block".into(),
             math_block: "Math block".into(),
-            insert_row_above: "Insert row above".into(),
-            insert_row_below: "Insert row below".into(),
-            duplicate_row: "Duplicate row".into(),
-            insert_column_left: "Insert column left".into(),
-            insert_column_right: "Insert column right".into(),
-            align_left: "Align left".into(),
-            align_center: "Align center".into(),
-            align_right: "Align right".into(),
-            grid_style: "Grid style".into(),
-            striped_style: "Striped style".into(),
-            header_style: "Header style".into(),
-            minimal_style: "Minimal style".into(),
-            delete_row: "Delete row".into(),
-            delete_column: "Delete column".into(),
-            delete_table: "Delete table".into(),
             edit_properties: "Edit properties".into(),
             delete_property: "Delete property".into(),
             delete_image: "Delete image".into(),
@@ -721,30 +625,6 @@ pub struct MarkdownLivePreview {
     /// a taller row (W2); `line_height` is the base/fallback for the empty doc
     /// and any row without a recorded height.
     line_heights: Vec<Pixels>,
-    /// Per-logical-line table-grid row (from the last paint), so a click /
-    /// Tab / caret hit-tests against cells instead of the raw source line.
-    table_rows: Vec<Option<TableRow>>,
-    /// Hover-revealed "+" add-row / add-column strips for each table (issue #16),
-    /// each paired with the table row to seat the caret in before inserting. From
-    /// the last paint, committed only while the table is hovered; hit-tested on
-    /// mouse-down.
-    table_row_add_rects: Vec<(Bounds<Pixels>, usize)>,
-    table_col_add_rects: Vec<(Bounds<Pixels>, usize, usize)>,
-    /// Each table's hover zone (grid + a thin margin) with its header row,
-    /// committed every paint so `on_mouse_move` can repaint when the pointer's
-    /// table-affordance region changes (the editor otherwise only repaints on
-    /// the caret blink) and `on_scroll_wheel` can hit-test the PAINTED table.
-    table_hover_zones: Vec<(Bounds<Pixels>, usize)>,
-    /// The affordance region the pointer was last in — `(table index, 0 = zone /
-    /// 1 = below strip / 2 = right strip)` — so the repaint fires only on change.
-    table_hover_region: Option<(usize, u8)>,
-    /// Committed delete-handle rects (issue #16): the hovered row's "−" `(bounds,
-    /// row)` and the hovered column's "−" `(bounds, row, col)`, hit-tested on click.
-    table_row_del: Option<(Bounds<Pixels>, usize)>,
-    table_col_del: Option<(Bounds<Pixels>, usize, usize)>,
-    /// The table cell `(row, col)` the pointer was last over, so `on_mouse_move`
-    /// repaints the delete handles when it changes.
-    table_hover_cell: Option<(usize, usize)>,
     /// Per-logical-line flag: this row is painted as an inline image (W4), so a
     /// click on it places the caret at the line start instead of hit-testing
     /// source text. From the last paint.
@@ -759,14 +639,13 @@ pub struct MarkdownLivePreview {
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     /// Font size from the last paint. Hit-testing that runs during event
-    /// dispatch (e.g. table-cell clicks) must measure at this size — the
+    /// dispatch must measure at this size — the
     /// window's text-style stack is unwound there, so `window.text_style()`
     /// would report the root size, not the host wrapper's.
     font_size: Pixels,
     /// The font of the last paint, for the same reason: event-time
     /// `text_style()` reports the ROOT font, whose family/metrics can differ
-    /// from what the table was painted with (column auto-fit measured with
-    /// the wrong glyph widths and wrapped cells).
+    /// from what was painted with (the wrong glyph widths).
     paint_font: Option<Font>,
     is_selecting: bool,
     undo_stack: Vec<Snapshot>,
@@ -774,7 +653,7 @@ pub struct MarkdownLivePreview {
     last_edit: EditKind,
     /// Whether the last content edit was a single typed grapheme or a single-char
     /// backspace — the only edits auto-pairing should react to, so programmatic /
-    /// structural edits (table ops, etc.) don't trip it.
+    /// structural edits don't trip it.
     last_edit_keystroke: bool,
     /// Spaces inserted per Tab / one list-nesting level (`Indent`/`Outdent`); set
     /// by the host via [`Self::set_tab_indent`] to match its list-indent setting.
@@ -794,11 +673,6 @@ pub struct MarkdownLivePreview {
     labels: Labels,
     /// The open right-click suggestions menu, if any.
     menu: Option<DiagMenu>,
-    /// The open table right-click menu's anchor (window space), if any. Its actions
-    /// operate on the caret's table cell.
-    table_menu: Option<Point<Pixels>>,
-    /// Scroll state for the table menu, so its overflow scrolls + shows a thumb.
-    table_menu_scroll: ScrollHandle,
     /// The open image right-click menu, if any: the image's logical line + the
     /// menu's anchor (window space). Offers Word-style object actions (Delete).
     image_menu: Option<(usize, Point<Pixels>)>,
@@ -866,14 +740,6 @@ pub struct MarkdownLivePreview {
     /// The in-progress corner-grip drag, if any (see [`ImageResize`]). While set,
     /// that image paints at the live width and other mouse handling is suppressed.
     image_resize: Option<ImageResize>,
-    /// An in-progress table column-border drag (drag-to-resize, issue #16):
-    /// the column resizes live; release persists `cols=` into the table's
-    /// marker line. `None` = no drag.
-    table_col_resize: Option<TableColResize>,
-    /// Last-paint column-resize grip bands: `(band, header row, column, width)`.
-    table_col_resize_rects: Vec<(Bounds<Pixels>, usize, usize, f32)>,
-    /// The band index the pointer is on (repaint-on-change for its accent line).
-    table_resize_hover: Option<usize>,
     /// See [`ShapeMemo`] — `RefCell` because the measure closure holds only a
     /// read borrow of the editor.
     shape_memo: std::cell::RefCell<Option<ShapeMemo>>,
@@ -881,8 +747,8 @@ pub struct MarkdownLivePreview {
     scan_cache: std::cell::RefCell<Option<(u64, std::rc::Rc<ScanData>)>>,
     /// See [`ScrollCompensatorFn`].
     scroll_compensator: Option<ScrollCompensatorFn>,
-    /// Cross-frame shaping caches — line runs, table column widths, and table
-    /// wrap rows (see [`ShapeCaches`]). Capacity-capped in `shape_document`.
+    /// Cross-frame shaping caches (see [`ShapeCaches`]). Capacity-capped in
+    /// `shape_document`.
     shape_caches: ShapeCaches,
     /// The shaping window (element-local y, quantized), set after each
     /// prepaint from the painted bounds — one frame stale by design, so the
@@ -900,16 +766,6 @@ pub struct MarkdownLivePreview {
     /// The row whose gutter grip the pointer hovers (mirrors prepaint's
     /// computation) — tracked so hover changes repaint the grip.
     grip_hover_row: Option<usize>,
-    /// Horizontal scroll of each wide table, keyed by its header row — wide
-    /// tables keep natural column widths and scroll in place. Keys drift on
-    /// edits above a table; entries are clamped at use, so a stale one is a
-    /// harmless partial offset. (ponytail: no eviction, the map stays tiny)
-    table_scroll_x: std::collections::HashMap<usize, f32>,
-    /// Last-paint wide-table scroll thumbs (padded grab rects), so the thumb
-    /// is mouse-draggable, not just an indicator.
-    table_thumbs: Vec<TableThumb>,
-    /// A live thumb drag: `(header row, grab x, scroll offset at grab)`.
-    table_thumb_drag: Option<(usize, Pixels, f32)>,
     /// Extra left offset for the drag grip — the host sets its line-number
     /// gutter's width here so the grip sits beside the numbers, not on them.
     grip_inset: Pixels,
@@ -946,7 +802,7 @@ pub struct MarkdownLivePreview {
     /// hover borders and the right-click property menu).
     prop_row_rects: Vec<(Bounds<Pixels>, usize)>,
     /// The property row the pointer was last over — drives `on_mouse_move`'s
-    /// repaint-on-change (like the table hover).
+    /// repaint-on-change.
     prop_hover_row: Option<usize>,
     /// Collapsed headings, keyed by the heading's trimmed source line
     /// (`## Goals`). View-local — markdown has no heading-fold syntax (unlike
@@ -1005,14 +861,6 @@ impl MarkdownLivePreview {
             widget_rows: Vec::new(),
             offset_maps: Vec::new(),
             line_insets: Vec::new(),
-            table_rows: Vec::new(),
-            table_row_add_rects: Vec::new(),
-            table_col_add_rects: Vec::new(),
-            table_hover_zones: Vec::new(),
-            table_hover_region: None,
-            table_row_del: None,
-            table_col_del: None,
-            table_hover_cell: None,
             last_bounds: None,
             line_height: px(20.),
             font_size: px(16.),
@@ -1028,8 +876,6 @@ impl MarkdownLivePreview {
             markdown_style: None,
             labels: Labels::default(),
             menu: None,
-            table_menu: None,
-            table_menu_scroll: ScrollHandle::new(),
             image_menu: None,
             prop_menu: None,
             suggest: None,
@@ -1053,9 +899,6 @@ impl MarkdownLivePreview {
             code_langs: Vec::new(),
             alert_fold_rects: Vec::new(),
             image_resize: None,
-            table_col_resize: None,
-            table_col_resize_rects: Vec::new(),
-            table_resize_hover: None,
             shape_memo: std::cell::RefCell::new(None),
             scan_cache: std::cell::RefCell::new(None),
             scroll_compensator: None,
@@ -1065,9 +908,6 @@ impl MarkdownLivePreview {
             compensated: std::cell::Cell::new(false),
             line_drag: None,
             grip_hover_row: None,
-            table_scroll_x: std::collections::HashMap::new(),
-            table_thumbs: Vec::new(),
-            table_thumb_drag: None,
             grip_inset: px(0.),
             content_gen: 0,
             utf16_anchor: std::cell::Cell::new((0, 0, 0)),
@@ -1136,7 +976,7 @@ impl MarkdownLivePreview {
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.content_gen += 1;
         self.content = normalize_loaded(text.into());
-        // Never park the loaded caret on a collapsed marker line (`<!-- table/
+        // Never park the loaded caret on a collapsed marker line (`<!--
         // math:… -->`): the first focus would reveal it raw mid-interaction.
         // This is the ONE passive parking path — every other caret write is a
         // deliberate placement (which SHOULD reveal markers for editing).
@@ -1640,7 +1480,7 @@ impl MarkdownLivePreview {
 
     /// Whether the last content change was a single typed character or single-char
     /// backspace (vs a programmatic / multi-char edit). Hosts gate auto-pairing on
-    /// this so structural edits (table row/column ops, paste, …) don't trip it.
+    /// this so structural edits (paste, …) don't trip it.
     pub fn last_edit_was_keystroke(&self) -> bool {
         self.last_edit_keystroke
     }
@@ -1691,7 +1531,6 @@ impl MarkdownLivePreview {
         let data = std::rc::Rc::new(ScanData {
             generation: self.content_gen,
             ordered: markdown_syntax::ordered_numbers(&lines),
-            tables: markdown_syntax::table_regions(&self.content),
             mermaid: markdown_syntax::mermaid_blocks(&self.content),
             math: markdown_syntax::math_regions(&self.content),
             props: markdown_syntax::property_regions(&self.content),
@@ -1811,10 +1650,6 @@ impl MarkdownLivePreview {
             self.move_to(self.selected_range.start, cx);
             return;
         }
-        if self.caret_in_table() && let Some(off) = self.table_move_horizontal(-1) {
-            self.move_to(off, cx);
-            return;
-        }
         let off = self.horizontal_step(false);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
@@ -1852,10 +1687,6 @@ impl MarkdownLivePreview {
             self.move_to(self.selected_range.end, cx);
             return;
         }
-        if self.caret_in_table() && let Some(off) = self.table_move_horizontal(1) {
-            self.move_to(off, cx);
-            return;
-        }
         let off = self.horizontal_step(true);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
@@ -1889,14 +1720,6 @@ impl MarkdownLivePreview {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        // In a table, step cell-to-cell keeping the column; at the table's edge
-        // `table_move_vertical` returns `None` and a normal move exits the table.
-        if self.caret_in_table()
-            && let Some(off) = self.table_move_vertical(-1)
-        {
-            self.move_to(off, cx);
-            return;
-        }
         let off = self.move_vertical(-1);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
@@ -1935,12 +1758,6 @@ impl MarkdownLivePreview {
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if self.caret_in_table()
-            && let Some(off) = self.table_move_vertical(1)
-        {
-            self.move_to(off, cx);
-            return;
-        }
         let off = self.move_vertical(1);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
@@ -2176,37 +1993,6 @@ impl MarkdownLivePreview {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        // Inside a table, a raw newline would split the row's `| … |` markup.
-        // Enter instead moves to the cell directly below (next row, same column,
-        // spreadsheet-style); from the last row it exits onto a fresh line below
-        // the table.
-        if self.caret_in_table() {
-            if let Some(off) = self.table_move_vertical(1)
-                && self
-                    .table_rows
-                    .get(self.row_col(off).0)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|t| !t.is_separator)
-            {
-                self.move_to(off, cx);
-                return;
-            }
-            let (row, _) = self.row_col(self.cursor_offset());
-            let mut last = row;
-            while self
-                .table_rows
-                .get(last + 1)
-                .and_then(Option::as_ref)
-                .is_some()
-            {
-                last += 1;
-            }
-            let starts = self.line_starts();
-            let end = starts.get(last + 1).map_or(self.content.len(), |&s| s - 1);
-            self.selected_range = end..end;
-            self.replace_text_in_range(None, "\n", window, cx);
-            return;
-        }
         // Inside a property panel a raw newline would split a `key:: value`
         // line. Enter opens the panel's editor instead — the same route as a
         // click or arrow-in (the form's own Enter then commits).
@@ -2334,13 +2120,6 @@ impl MarkdownLivePreview {
     /// spaces at the line start, caret shifts with it); elsewhere insert that many
     /// spaces at the caret (replacing any selection).
     fn indent(&mut self, _: &Indent, window: &mut Window, cx: &mut Context<Self>) {
-        // In a table, Tab moves to the next cell rather than indenting.
-        if self.caret_in_table() {
-            if let Some(offset) = self.table_cell_nav(true) {
-                self.move_to(offset, cx);
-            }
-            return;
-        }
         let cursor = self.cursor_offset();
         let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
         let line_end = self.content[line_start..]
@@ -2382,13 +2161,6 @@ impl MarkdownLivePreview {
     /// Shift+Tab: outdent the caret's line — remove up to `tab_indent` leading
     /// spaces (or one leading tab) from the line start. No-op if there's none.
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
-        // In a table, Shift+Tab moves to the previous cell rather than outdenting.
-        if self.caret_in_table() {
-            if let Some(offset) = self.table_cell_nav(false) {
-                self.move_to(offset, cx);
-            }
-            return;
-        }
         let cursor = self.cursor_offset();
         let line_start = self.content[..cursor].rfind('\n').map_or(0, |i| i + 1);
         let line = &self.content[line_start..];
@@ -2436,23 +2208,10 @@ impl MarkdownLivePreview {
                 } else {
                     text
                 };
-                // Inside a table cell, a raw paste of newlines/pipes would
-                // break the `| … |` row markup (Enter is guarded the same
-                // way): flatten newlines and escape pipes so the paste stays
-                // one cell's content.
-                if self.caret_in_table() && text.contains(['\n', '|']) {
-                    // Unescape-then-escape so text already carrying `\|`
-                    // doesn't double up into `\\|` (an escaped backslash
-                    // followed by a live separator).
-                    text = text
-                        .trim_end_matches('\n')
-                        .replace('\n', " ")
-                        .replace("\\|", "|")
-                        .replace('|', "\\|");
-                } else if self.markdown_style.is_some() && text.contains("$$") {
-                    // Words-attached `$$` fences / words-mixed pairs in pasted
-                    // text split onto their own lines (issue #54) — same
-                    // normalization typing gets.
+                // Words-attached `$$` fences / words-mixed pairs in pasted
+                // text split onto their own lines (issue #54) — same
+                // normalization typing gets.
+                if self.markdown_style.is_some() && text.contains("$$") {
                     if let std::borrow::Cow::Owned(n) =
                         md_syntax::normalize_math_fences(&text)
                     {
@@ -2616,7 +2375,7 @@ impl MarkdownLivePreview {
         self.last_edit = kind;
         // A keystroke is one typed grapheme (incl. typed over a selection — that's
         // an auto-pair "wrap") or a single-char backspace. Multi-char edits (paste,
-        // table ops, …) are not, so auto-pairing skips them.
+        // structural edits, …) are not, so auto-pairing skips them.
         self.last_edit_keystroke = (new_text != "\n" && new_text.graphemes(true).count() == 1)
             || (new_text.is_empty() && self.content[range.clone()].graphemes(true).count() == 1);
     }
@@ -2799,7 +2558,6 @@ impl MarkdownLivePreview {
             });
             self.is_selecting = false;
             self.menu = None;
-            self.table_menu = None;
             self.image_menu = None;
             self.prop_menu = None;
             cx.notify();
@@ -3001,107 +2759,15 @@ impl MarkdownLivePreview {
                 return;
             }
         }
-        // A press on a table's hover "+" strip adds a row (below) or column (right).
-        // The insert APIs are caret-driven, so seat the caret in the table to target
-        // them — but capture the user's cell first and restore it after, so the
-        // caret stays put instead of following the new row/column.
-        if let Some(row) = self.table_add_row_at(event.position) {
-            let keep = self.caret_table_cell_pos();
-            if let Some(off) = self.cell_start_offset(row, 0) {
-                self.selected_range = off..off;
-                self.insert_table_row(true, cx);
-            }
-            if let Some((r, c, ic)) = keep {
-                let caret = self.caret_pos_for_cell(r, c, ic);
-                self.selected_range = caret..caret;
-                cx.notify();
-            }
-            return;
-        }
-        if let Some((row, col)) = self.table_add_col_at(event.position) {
-            let keep = self.caret_table_cell_pos();
-            if let Some(off) = self.cell_start_offset(row, col) {
-                self.selected_range = off..off;
-                self.insert_table_column(true, cx);
-            }
-            if let Some((r, c, ic)) = keep {
-                let caret = self.caret_pos_for_cell(r, c, ic);
-                self.selected_range = caret..caret;
-                cx.notify();
-            }
-            return;
-        }
-        // A press on a row/column delete "−" handle removes that row/column (seat
-        // the caret in it, then reuse the caret-driven delete APIs).
-        if let Some((rect, row)) = self.table_row_del
-            && rect.contains(&event.position)
-        {
-            if let Some(off) = self.cell_start_offset(row, 0) {
-                self.selected_range = off..off;
-                self.delete_table_row(cx);
-            }
-            return;
-        }
-        if let Some((rect, row, col)) = self.table_col_del
-            && rect.contains(&event.position)
-        {
-            if let Some(off) = self.cell_start_offset(row, col) {
-                self.selected_range = off..off;
-                self.delete_table_column(cx);
-            }
-            return;
-        }
-        // A press on a wide table's scroll thumb starts a thumb drag — the
-        // table scrolls with the pointer (see `on_mouse_move`).
-        if let Some(&TableThumb { header, .. }) = self
-            .table_thumbs
-            .iter()
-            .find(|t| t.grab.contains(&event.position))
-        {
-            let sx = self.table_scroll_x.get(&header).copied().unwrap_or(0.);
-            self.table_thumb_drag = Some((header, event.position.x, sx));
-            self.is_selecting = false;
-            cx.notify();
-            return;
-        }
-        // A press on a column border's resize band starts a drag — the column
-        // resizes live; release persists the width (issue #16). A DOUBLE-click
-        // auto-fits the column to its content instead (the Excel/Sheets
-        // convention for a column border).
-        if let Some(&(_, header_row, col, width)) = self
-            .table_col_resize_rects
-            .iter()
-            .find(|(band, ..)| band.contains(&event.position))
-        {
-            if event.click_count == 2 {
-                self.autofit_table_col(header_row, col, window, cx);
-                return;
-            }
-            self.table_col_resize = Some(TableColResize {
-                header_row,
-                col,
-                start_x: event.position.x,
-                orig: width,
-                width,
-            });
-            self.is_selecting = false;
-            cx.notify();
-            return;
-        }
-        // A click on a table cell drops the caret inside the cell, not in the raw
-        // `| … |` source.
-        let offset = self
-            .table_offset_at(event.position, window)
-            .unwrap_or_else(|| self.index_for_mouse_position(event.position));
+        let offset = self.index_for_mouse_position(event.position);
         self.menu = None;
-        self.table_menu = None;
         self.image_menu = None;
         self.prop_menu = None;
         self.code_lang_menu = None;
         self.goal_x = None;
         self.last_edit = EditKind::Other;
         // 左键进入正文即进入编辑模式：点击要同时聚焦（否则光标移动了但键盘输入
-        // 仍落在别处——宿主集成时尤其明显）。右击/表格/公式路径已各自 focus。
+        // 仍落在别处——宿主集成时尤其明显）。右击/公式路径已各自 focus。
         self.focus(window, cx);
         match event.click_count {
             // Double-click selects the word under the cursor. On a $$…$$ block
@@ -3183,25 +2849,13 @@ impl MarkdownLivePreview {
             cx.notify();
             return;
         }
-        // End a table scroll-thumb drag (the live offsets are already stored).
-        if self.table_thumb_drag.take().is_some() {
-            cx.notify();
-            return;
-        }
-        // End a column-border drag by persisting every column's width into the
-        // table marker's `cols=` list (one undo step, emits Changed).
-        if let Some(resize) = self.table_col_resize.take() {
-            self.commit_table_col_widths(resize, cx);
-            cx.notify();
-            return;
-        }
         self.is_selecting = false;
     }
 
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // While dragging an image's grip, track the pointer: the new width is the
@@ -3220,36 +2874,6 @@ impl MarkdownLivePreview {
             }
             return;
         }
-        // While dragging a wide table's scroll thumb, track the pointer: thumb
-        // travel maps to content scroll through the committed factor.
-        if let Some((header, grab_x, start_sx)) = self.table_thumb_drag {
-            let factor = self
-                .table_thumbs
-                .iter()
-                .find(|t| t.header == header)
-                .map_or(0., |t| t.factor);
-            let sx = start_sx + f32::from(event.position.x - grab_x) * factor;
-            // Clamp at use like the wheel path — the paint clamps too, but a
-            // sane stored value keeps other consumers simple.
-            let sx = sx.max(0.);
-            if self.table_scroll_x.get(&header).copied().unwrap_or(0.) != sx {
-                self.table_scroll_x.insert(header, sx);
-                cx.notify();
-            }
-            return;
-        }
-        // While dragging a table column's border, track the pointer: the new
-        // width is the grab width plus the travel, floored so the column can't
-        // vanish. Shaping applies it live (see `table_column_widths`).
-        if let Some(resize) = self.table_col_resize {
-            let dx = f32::from(event.position.x - resize.start_x);
-            let width = (resize.orig + dx).max(24.);
-            if let Some(r) = self.table_col_resize.as_mut() {
-                r.width = width;
-            }
-            cx.notify();
-            return;
-        }
         if let Some(resize) = self.image_resize {
             let avail = self
                 .last_bounds
@@ -3265,36 +2889,9 @@ impl MarkdownLivePreview {
             return;
         }
         if self.is_selecting {
-            let offset = self
-                .table_offset_at(event.position, window)
-                .unwrap_or_else(|| self.index_for_mouse_position(event.position));
+            let offset = self.index_for_mouse_position(event.position);
             self.select_to(offset, cx);
             return;
-        }
-        // While the right-click menu is open it owns the pointer — don't let the
-        // table hover (highlight/handles) track the mouse behind it.
-        if self.table_menu.is_some() {
-            return;
-        }
-        // Repaint table "+" affordances when the pointer's region changes, so the
-        // hover fill + cursor track the mouse live (the editor otherwise only
-        // repaints on the caret blink).
-        let region = self.table_hover_region_at(event.position);
-        let cell = self.hovered_table_cell(event.position);
-        if region != self.table_hover_region || cell != self.table_hover_cell {
-            self.table_hover_region = region;
-            self.table_hover_cell = cell;
-            cx.notify();
-        }
-        // Repaint the column-resize border accent as the pointer crosses a band
-        // (the cursor comes from the hitbox; the painted line needs a frame).
-        let on_band = self
-            .table_col_resize_rects
-            .iter()
-            .position(|(b, ..)| b.contains(&event.position));
-        if on_band != self.table_resize_hover {
-            self.table_resize_hover = on_band;
-            cx.notify();
         }
         // Repaint the property-panel hover border when the pointer moves between
         // rows (the border itself reads the live pointer during paint).
@@ -3425,7 +3022,6 @@ impl MarkdownLivePreview {
             .filter(|&&(line, _)| self.image_row_range(line).is_some())
         {
             self.menu = None;
-            self.table_menu = None;
             self.focus(window, cx);
             self.image_menu = Some((line, event.position));
             cx.notify();
@@ -3439,7 +3035,6 @@ impl MarkdownLivePreview {
             .find(|(rect, _)| rect.contains(&event.position))
         {
             self.menu = None;
-            self.table_menu = None;
             self.image_menu = None;
             self.focus(window, cx);
             self.prop_menu = Some((row, event.position));
@@ -3469,30 +3064,6 @@ impl MarkdownLivePreview {
                 });
                 return;
             }
-        }
-        // Right-click in a table cell: place the caret there + open the table menu
-        // (insert/delete rows + columns), instead of the spell menu. INSIDE a
-        // selection, keep the selection and show the clipboard menu instead —
-        // Cut/Copy act on it, like prose; the structure menu stays a
-        // selection-free right-click away.
-        if let Some(offset) = self.table_offset_at(event.position, window) {
-            self.menu = None;
-            self.focus(window, cx);
-            let sel = self.selected_range.clone();
-            if !sel.is_empty() && offset >= sel.start && offset <= sel.end {
-                self.menu = Some(DiagMenu {
-                    anchor: event.position,
-                    range: offset..offset,
-                    suggestions: Vec::new(),
-                    scroll: ScrollHandle::new(),
-                    turn_into: false,
-                });
-            } else {
-                self.move_to(offset, cx);
-                self.table_menu = Some(event.position);
-            }
-            cx.notify();
-            return;
         }
         let offset = self.index_for_mouse_position(event.position);
         // Window-space — the popup renders on a `deferred`/`anchored` layer.
@@ -3536,7 +3107,6 @@ impl MarkdownLivePreview {
     /// Close the suggestions menu (Escape, or a click elsewhere).
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_some()
-            || self.table_menu.take().is_some()
             || self.image_menu.take().is_some()
             || self.prop_menu.take().is_some()
             || self.code_lang_menu.take().is_some()
@@ -3785,8 +3355,7 @@ impl MarkdownLivePreview {
     }
 
     /// The line span the gutter grip drags as one unit: whole fenced/rendered
-    /// regions (code, math, mermaid, tables incl. their style marker,
-    /// property panels), a quote/callout run, a list item with its
+    /// regions (code, math, mermaid, property panels), a quote/callout run, a list item with its
     /// deeper-indented children — otherwise the single line.
     fn drag_block_rows(&self, row: usize) -> (usize, usize) {
         let scan = self.scan_data();
@@ -3803,14 +3372,6 @@ impl MarkdownLivePreview {
         }
         if let Some((r, _)) = scan.mermaid.iter().find(|(r, _)| r.contains(&row)) {
             return (r.start, r.end.saturating_sub(1).max(r.start));
-        }
-        if let Some(t) = scan
-            .tables
-            .iter()
-            .find(|t| t.lines.contains(&row) || t.marker_line == Some(row))
-        {
-            let first = t.marker_line.unwrap_or(t.lines.start).min(t.lines.start);
-            return (first, t.lines.end.saturating_sub(1).max(t.lines.start));
         }
         if let Some(p) = scan.props.iter().find(|r| r.contains(&row)) {
             return (p.start, p.end.saturating_sub(1).max(p.start));
@@ -3877,7 +3438,7 @@ impl MarkdownLivePreview {
     }
 
     /// Clamp a drop boundary out of the interior of any rendered region — a
-    /// block can't land inside a table, fence, math block, or property panel.
+    /// block can't land inside a fence, math block, or property panel.
     fn snap_drop_boundary(&self, mut b: usize) -> usize {
         let scan = self.scan_data();
         let snap = |b: usize, s: usize, e: usize| {
@@ -3893,10 +3454,6 @@ impl MarkdownLivePreview {
         }
         for (r, _) in scan.mermaid.iter() {
             b = snap(b, r.start, r.end);
-        }
-        for t in scan.tables.iter() {
-            let s = t.marker_line.unwrap_or(t.lines.start).min(t.lines.start);
-            b = snap(b, s, t.lines.end);
         }
         for p in scan.props.iter() {
             b = snap(b, p.start, p.end);
@@ -4160,30 +3717,12 @@ impl MarkdownLivePreview {
                 break;
             }
         }
-        // A reserved gutter gap (a table's top/bottom, a code block's pads) belongs
-        // to no row, and the loop assigns it to the row *after* it — right going
-        // down, but going up that strands the caret on the far side of the gap (e.g.
-        // just below a table). Going up, target the row before the gap instead.
+        // A reserved gutter gap (a code block's pads) belongs to no row, and the
+        // loop assigns it to the row *after* it — right going down, but going up
+        // that strands the caret on the far side of the gap. Going up, target the
+        // row before the gap instead.
         if dir < 0 && trow > 0 && target_y < self.line_tops[trow] {
             trow -= 1;
-        }
-        // A table separator (`|---|`) row isn't editable — skip past it (in the
-        // direction of travel) so the caret lands on the header/body row rather
-        // than dropping the whole table to raw source.
-        if self
-            .table_rows
-            .get(trow)
-            .and_then(Option::as_ref)
-            .is_some_and(|t| t.is_separator)
-        {
-            let skip = if dir >= 0 {
-                trow + 1
-            } else {
-                trow.wrapping_sub(1)
-            };
-            if skip < self.wrapped.len() {
-                trow = skip;
-            }
         }
         // A collapsed row (a hidden ``` fence, a folded body line) has no visual
         // height — landing there reveals it. Keep stepping in the direction of
@@ -4872,7 +4411,6 @@ impl Render for MarkdownLivePreview {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(EditorElement {
                 editor: cx.entity(),
             })
@@ -5252,274 +4790,8 @@ impl Render for MarkdownLivePreview {
                     ),
                 )
             }))
-            // The table right-click menu (Word-style row/column editing), anchored
-            // at the click; each row runs its action on the caret's table cell.
-            .children(self.table_menu.map(|anchor| {
-                // Menu chrome from the host's theme (fallbacks match the former
-                // hardcoded dark menu when no markdown style is set).
-                let st = self.markdown_style.as_ref();
-                let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
-                let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
-                let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
-                let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
-                let divider = st.map_or(rgba(0xffffff2e).into(), |s| s.popover_divider);
-                let mut thumb_c = st.map_or(rgba(0xffffff66).into(), |s| s.marker);
-                thumb_c.a = 0.5;
-                const ROW_H: f32 = 24.0;
-                const DIV_H: f32 = 9.0;
-                const PAD: f32 = 4.0;
-                const MAX_H: f32 = 480.0;
-                // Cditor-style grouped rows: a glyph column, a checkmark on the
-                // current align/style, and the destructive group in red.
-                let danger = st.map_or(rgb(0xE5484D).into(), |s| s.popover_danger);
-                let cur_align = self.caret_table_align();
-                let cur_style = self
-                    .caret_table_region()
-                    .map(|r| r.style)
-                    .unwrap_or_default();
-                use markdown_syntax::TableStyle as TS;
-                enum Row {
-                    Div,
-                    Item {
-                        glyph: &'static str,
-                        label: SharedString,
-                        action: TableMenuAction,
-                        red: bool,
-                        checked: bool,
-                    },
-                }
-                let item = |glyph, label, action| Row::Item {
-                    glyph,
-                    label,
-                    action,
-                    red: false,
-                    checked: false,
-                };
-                let specs = [
-                    item(
-                        "↑",
-                        self.labels.insert_row_above.clone(),
-                        TableMenuAction::InsertRowAbove,
-                    ),
-                    item(
-                        "↓",
-                        self.labels.insert_row_below.clone(),
-                        TableMenuAction::InsertRowBelow,
-                    ),
-                    item(
-                        "⧉",
-                        self.labels.duplicate_row.clone(),
-                        TableMenuAction::DuplicateRow,
-                    ),
-                    Row::Div,
-                    item(
-                        "←",
-                        self.labels.insert_column_left.clone(),
-                        TableMenuAction::InsertColLeft,
-                    ),
-                    item(
-                        "→",
-                        self.labels.insert_column_right.clone(),
-                        TableMenuAction::InsertColRight,
-                    ),
-                    Row::Div,
-                    Row::Item {
-                        glyph: "",
-                        label: self.labels.align_left.clone(),
-                        action: TableMenuAction::AlignLeft,
-                        red: false,
-                        checked: cur_align == Some(CellAlign::Left),
-                    },
-                    Row::Item {
-                        glyph: "",
-                        label: self.labels.align_center.clone(),
-                        action: TableMenuAction::AlignCenter,
-                        red: false,
-                        checked: cur_align == Some(CellAlign::Center),
-                    },
-                    Row::Item {
-                        glyph: "",
-                        label: self.labels.align_right.clone(),
-                        action: TableMenuAction::AlignRight,
-                        red: false,
-                        checked: cur_align == Some(CellAlign::Right),
-                    },
-                    Row::Div,
-                    Row::Item {
-                        glyph: "▦",
-                        label: self.labels.grid_style.clone(),
-                        action: TableMenuAction::SetStyle(None),
-                        red: false,
-                        checked: cur_style == TS::Grid,
-                    },
-                    Row::Item {
-                        glyph: "▤",
-                        label: self.labels.striped_style.clone(),
-                        action: TableMenuAction::SetStyle(Some("striped")),
-                        red: false,
-                        checked: cur_style == TS::Striped,
-                    },
-                    Row::Item {
-                        glyph: "▥",
-                        label: self.labels.header_style.clone(),
-                        action: TableMenuAction::SetStyle(Some("header")),
-                        red: false,
-                        checked: cur_style == TS::Header,
-                    },
-                    Row::Item {
-                        glyph: "─",
-                        label: self.labels.minimal_style.clone(),
-                        action: TableMenuAction::SetStyle(Some("minimal")),
-                        red: false,
-                        checked: cur_style == TS::Minimal,
-                    },
-                    Row::Div,
-                    item(
-                        "⊞",
-                        self.labels.copy_as_markdown.clone(),
-                        TableMenuAction::CopyTable,
-                    ),
-                    Row::Div,
-                    Row::Item {
-                        glyph: "✕",
-                        label: self.labels.delete_row.clone(),
-                        action: TableMenuAction::DeleteRow,
-                        red: true,
-                        checked: false,
-                    },
-                    Row::Item {
-                        glyph: "✕",
-                        label: self.labels.delete_column.clone(),
-                        action: TableMenuAction::DeleteColumn,
-                        red: true,
-                        checked: false,
-                    },
-                    Row::Item {
-                        glyph: "✕",
-                        label: self.labels.delete_table.clone(),
-                        action: TableMenuAction::DeleteTable,
-                        red: true,
-                        checked: false,
-                    },
-                ];
-                let n_items = specs
-                    .iter()
-                    .filter(|r| matches!(r, Row::Item { .. }))
-                    .count();
-                let n_divs = specs.len() - n_items;
-                let mut rows: Vec<gpui::AnyElement> = Vec::new();
-                for (i, spec) in specs.into_iter().enumerate() {
-                    match spec {
-                        Row::Div => rows.push(
-                            div()
-                                .flex_shrink_0()
-                                .h(px(1.))
-                                .my(px(4.))
-                                .mx(px(8.))
-                                .bg(divider)
-                                .into_any_element(),
-                        ),
-                        Row::Item {
-                            glyph,
-                            label,
-                            action,
-                            red,
-                            checked,
-                        } => {
-                            let fg = if red { danger } else { menu_fg };
-                            let mut glyph_c = fg;
-                            glyph_c.a *= 0.7;
-                            rows.push(
-                                div()
-                                    .id(("table-menu-row", i))
-                                    .flex_shrink_0()
-                                    .px(px(10.))
-                                    .py(px(3.))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .text_color(fg)
-                                    .hover(move |s| s.bg(hover))
-                                    .child(
-                                        div()
-                                            .w(px(16.))
-                                            .flex_none()
-                                            .text_color(glyph_c)
-                                            .child(glyph),
-                                    )
-                                    .child(div().flex_1().child(label))
-                                    .children(checked.then(|| div().text_color(glyph_c).child("✓")))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                                            cx.stop_propagation();
-                                            action.apply(editor, cx);
-                                        }),
-                                    )
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                }
-                // Scrollbar thumb, shown when the items overflow the cap — sized from
-                // the content height + positioned from the live scroll offset.
-                let rows_h = n_items as f32 * ROW_H + n_divs as f32 * DIV_H;
-                let view_h = MAX_H - 2.0 * PAD;
-                let thumb = (rows_h > view_h).then(|| {
-                    let scrolled =
-                        (-f32::from(self.table_menu_scroll.offset().y)).clamp(0.0, rows_h - view_h);
-                    let thumb_h = (view_h * view_h / rows_h).max(24.0);
-                    let thumb_top = PAD + scrolled / (rows_h - view_h) * (view_h - thumb_h);
-                    div()
-                        .absolute()
-                        .top(px(thumb_top))
-                        .right(px(2.))
-                        .w(px(6.))
-                        .h(px(thumb_h))
-                        .rounded(px(3.))
-                        .bg(thumb_c)
-                });
-                gpui::deferred(
-                    gpui::anchored().position(anchor).snap_to_window().child(
-                        div()
-                            .relative()
-                            .occlude()
-                            .min_w(px(190.))
-                            .cursor(CursorStyle::Arrow)
-                            .bg(menu_bg)
-                            .border_1()
-                            .border_color(menu_border)
-                            .rounded(px(6.))
-                            .shadow_md()
-                            .overflow_hidden()
-                            .text_color(menu_fg)
-                            .text_size(px(13.))
-                            .on_mouse_down_out(cx.listener(|editor, _: &MouseDownEvent, _, cx| {
-                                editor.table_menu = None;
-                                cx.notify();
-                            }))
-                            .child(
-                                // Inner scroll viewport: caps the height + scrolls the
-                                // overflow (max_h on a separate flex-col div, like the
-                                // suggestion menu — combining it with the styled box
-                                // above doesn't cap).
-                                div()
-                                    .id("table-menu")
-                                    .max_h(px(MAX_H))
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.table_menu_scroll)
-                                    .flex()
-                                    .flex_col()
-                                    .py(px(PAD))
-                                    .children(rows),
-                            )
-                            .children(thumb),
-                    ),
-                )
-            }))
             // The image right-click menu: Word-style object actions on an inline
-            // image (Delete), anchored at the click. Chrome matches the table menu.
+            // image (Delete), anchored at the click.
             .children(self.prop_menu.map(|(row, anchor)| {
                 let st = self.markdown_style.as_ref();
                 let menu_bg = st.map_or(rgb(0x26262b).into(), |s| s.popover_bg);
@@ -5872,7 +5144,7 @@ impl Block {
 }
 
 /// A fenced-code-block line's background (W4b/refinement): the block reads as one
-/// rounded, content-fit box (sized to its widest line, like a table — not the
+/// rounded, content-fit box (sized to its widest line, not the
 /// full editor width). Each line carries the block color, the shared box width
 /// (back-patched once the block's extent is known), and whether it's the
 /// first/last visible line (to round the box's top/bottom corners).
@@ -5907,32 +5179,6 @@ struct CodeBg {
     width: Pixels,
     top: bool,
     bottom: bool,
-}
-
-/// A table row rendered as a grid (W4c): its cells, per-column alignment, the
-/// content-fit per-column widths (shared across the table), header/separator/
-/// last-row flags, and the border color. Built only when the caret is outside
-/// the table — the caret's table shows source instead ("raw on caret").
-#[derive(Clone)]
-struct TableRow {
-    cells: Vec<SharedString>,
-    /// Byte range of each cell's trimmed content within its source line — for
-    /// placing the caret inside a cell + hit-testing a click back to a source
-    /// offset (in-cell editing).
-    cell_ranges: Vec<Range<usize>>,
-    aligns: Vec<markdown_syntax::Align>,
-    col_widths: Vec<Pixels>,
-    is_header: bool,
-    is_separator: bool,
-    is_last: bool,
-    /// 0-based position among the body rows (`None` for header/separator) — drives
-    /// striping (shade odd indices) + the rule-under-header (index 0).
-    body_index: Option<usize>,
-    /// The table's visual style (from its `<!-- table:STYLE -->` marker).
-    style: markdown_syntax::TableStyle,
-    border: Hsla,
-    /// Row-shade color for striped / header-shaded styles (a faint tint).
-    shade: Hsla,
 }
 
 /// A per-line "gutter" decoration: a left-margin treatment that hides its source
@@ -6007,7 +5253,7 @@ impl LineMark {
 
 /// Per-logical-line shaping output — parallel vecs of equal length: the shaped
 /// source line, its row height, an optional inline-image widget, an optional
-/// fenced-code-block background, an optional table-row grid, the display→source
+/// fenced-code-block background, the display→source
 /// map, and an optional gutter decoration (blockquote / list / checkbox).
 /// One shaped document: per-line parallel channels, all the same length —
 /// the per-line loop's normal push and [`ShapedDoc::push_placeholder`] are
@@ -6018,7 +5264,6 @@ struct ShapedDoc {
     heights: Vec<Pixels>,
     widgets: Vec<Option<Block>>,
     backgrounds: Vec<Option<CodeBg>>,
-    tables: Vec<Option<TableRow>>,
     /// Per-line display→source byte map for lines with markers hidden (W6);
     /// `None` when the displayed text equals the source. Shared with the
     /// line-run cache (a hit re-uses the same allocation across frames).
@@ -6058,7 +5303,6 @@ impl ShapedDoc {
         self.heights.push(h);
         self.widgets.push(widget);
         self.backgrounds.push(None);
-        self.tables.push(None);
         self.maps.push(None);
         self.marks.push(mark);
         self.inline_maths.push(Vec::new());
@@ -6187,8 +5431,6 @@ pub fn paint_doc_icon(
     }
 }
 
-/// How many wrap rows table row `cells` need at `col_widths` — 1 for content
-/// that fits; more once a drag-narrowed column forces its text to wrap.
 /// The gutter grip's left edge for an editor whose content starts at
 /// `bounds_left` — THE grip x formula, shared by prepaint (fresh geometry)
 /// and the event-time hover mirror so the two can't drift.
@@ -6212,21 +5454,12 @@ struct CachedLineRuns {
 /// The validity marker + per-row content keys of the run-key memo.
 type RowKeys = (Option<u64>, Vec<Option<u64>>);
 
-/// The measured table column widths cache: one keyed entry for the doc.
-type RegionCols = Option<(u64, std::rc::Rc<Vec<Vec<Pixels>>>)>;
-
 /// The editor-owned caches `shape_document` reads and writes (interior-
 /// mutable — shaping runs under a read borrow of the editor):
 /// - `line_runs`: each markdown line's built display + runs (cross-frame).
-/// - `region_cols`: the measured table column widths for the WHOLE document,
-///   one keyed entry — rebuilt when the tables' source, the wrap width, the
-///   font epoch, or a live column drag changes.
-/// - `cell_rows`: per table row, how many wrap rows its tallest cell needs.
 #[derive(Default)]
 struct ShapeCaches {
     line_runs: std::cell::RefCell<std::collections::HashMap<u64, CachedLineRuns>>,
-    region_cols: std::cell::RefCell<RegionCols>,
-    cell_rows: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
     /// Per-line (row height, wrap rows), keyed by the line-run key ⊕ font
     /// size ⊕ wrap width — the shaping window's exact heights for skipped
     /// offscreen lines.
@@ -6269,18 +5502,17 @@ fn line_run_epoch(font: &Font, st: Option<&SyntaxStyle>) -> u64 {
 /// container's offset by it so the content being read doesn't jump.
 pub type ScrollCompensatorFn = std::rc::Rc<dyn Fn(Pixels, &mut Window, &mut App)>;
 
-/// Content-derived structural scans — tables, ordered-list numbering,
-/// mermaid/math regions, property runs, foldable callouts, and per-line
-/// fence parity — cached per [`MarkdownLivePreview::content_gen`]. `shape_document`
-/// recomputed all of these on every call (twice a frame before the shape
-/// memo); now they rebuild only when the content actually changes, and the
-/// caret-driven table ops + auto-replace reuse the same scan.
+/// Content-derived structural scans — ordered-list numbering, mermaid/math
+/// regions, property runs, foldable callouts, and per-line fence parity —
+/// cached per [`MarkdownLivePreview::content_gen`]. `shape_document` recomputed
+/// all of these on every call (twice a frame before the shape memo); now they
+/// rebuild only when the content actually changes, and the auto-replace reuses
+/// the same scan.
 pub(crate) struct ScanData {
     /// The `content_gen` this scan was built for — cache keys use this
     /// instead of rehashing content.
     generation: u64,
     ordered: Vec<(u32, usize)>,
-    tables: Vec<markdown_syntax::TableRegion>,
     mermaid: Vec<(Range<usize>, String)>,
     math: Vec<markdown_syntax::MathRegion>,
     props: Vec<Range<usize>>,
@@ -6323,9 +5555,6 @@ mod tests {
     #[test]
     fn caret_off_marker_line_cases() {
         use super::caret_off_marker_line;
-        // Table marker at the top: the caret steps to the header line.
-        let doc = "<!-- table:grid cols=40,40 -->\n| a | b |\n| --- | --- |\n| 1 | 2 |";
-        assert_eq!(caret_off_marker_line(doc, 0), 31);
         // Math align marker: the caret lands after the block.
         let doc = "<!-- math:center -->\n$$\nx^2\n$$\nafter";
         assert_eq!(caret_off_marker_line(doc, 0), 31);

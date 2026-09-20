@@ -2029,39 +2029,13 @@ pub(crate) fn splice_inline_math(
     (nd, nr, nm, places)
 }
 
-/// Per-column text alignment of a GFM table.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum Align {
-    Left,
-    Center,
-    Right,
-}
-
-/// The shared table-style enum — recognition lives in `gpui_markdown::syntax`
-/// (the sanctioned dependency), including the marker's `cols=` widths.
-pub(crate) use super::md_syntax::TableStyle;
-
-/// Parse a `<!-- table:STYLE -->` marker line into its [`TableStyle`]. `None` if
-/// the line isn't a recognized table-style marker (so an unknown marker stays a
-/// plain HTML comment).
-pub(crate) fn table_style_marker(line: &str) -> Option<TableStyle> {
-    super::md_syntax::table_style_marker(line)
-}
-
 /// A detected GFM table region: the half-open range of logical line indices it
-/// spans (header, separator, then body rows) and its per-column alignment, plus
-/// an optional `<!-- table:STYLE -->` marker line directly above it.
+/// spans (header, separator, then body rows). The editor no longer renders
+/// tables (they show as source); this stays because `markdown::ir` and
+/// `markdown::parity` read `lines` to model/verify tables in the reader.
 #[derive(Clone)]
 pub(crate) struct TableRegion {
     pub lines: Range<usize>,
-    pub aligns: Vec<Align>,
-    pub style: TableStyle,
-    /// Index of the style-marker comment line above the header, if present — the
-    /// editor hides it (revealed only when the caret lands on it).
-    pub marker_line: Option<usize>,
-    /// Explicit column widths (logical px) from the marker's `cols=` attribute
-    /// — written by drag-to-resize; `None` = content-measured.
-    pub col_widths_attr: Option<Vec<f32>>,
 }
 
 /// Detect GFM table regions in `content` (W4c). A region is a row line (trimmed
@@ -2072,9 +2046,7 @@ pub(crate) fn table_regions(content: &str) -> Vec<TableRegion> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 1 < lines.len() {
-        if is_table_row(lines[i])
-            && let Some(aligns) = separator_aligns(lines[i + 1])
-        {
+        if is_table_row(lines[i]) && is_separator_row(lines[i + 1]) {
             let start = i;
             let mut end = i + 2; // header + separator
             // Stop before a new table jammed directly below: a row that is itself
@@ -2084,27 +2056,12 @@ pub(crate) fn table_regions(content: &str) -> Vec<TableRegion> {
             // shows up as `---` cells.
             while end < lines.len()
                 && is_table_row(lines[end])
-                && separator_aligns(lines.get(end + 1).copied().unwrap_or("")).is_none()
+                && !is_separator_row(lines.get(end + 1).copied().unwrap_or(""))
             {
                 end += 1;
             }
-            // A `<!-- table:STYLE -->` comment on the line directly above sets the
-            // table's visual style (and is hidden by the editor).
-            let (style, marker_line) = match start
-                .checked_sub(1)
-                .map(|m| (m, table_style_marker(lines[m])))
-            {
-                Some((m, Some(s))) => (s, Some(m)),
-                _ => (TableStyle::Grid, None),
-            };
-            let col_widths_attr =
-                marker_line.and_then(|m| super::md_syntax::table_col_widths(lines[m]));
             out.push(TableRegion {
                 lines: start..end,
-                aligns,
-                style,
-                marker_line,
-                col_widths_attr,
             });
             i = end;
         } else {
@@ -2168,52 +2125,16 @@ pub(crate) fn table_cells(line: &str) -> Vec<&str> {
 /// [`crate::markdown::cells`] — shared byte machinery with the preview parser
 /// (edge semantics pinned by `markdown::parity`).
 
-/// The byte range of each cell's *trimmed content* within `line` (line-local), in
-/// the same order as [`table_cells`]. Lets the editor place the caret inside a
-/// rendered cell and hit-test a click back to a source offset. An empty cell is a
-/// zero-width range at its content position.
-pub(crate) fn table_cell_ranges(line: &str) -> Vec<Range<usize>> {
-    let (Some(first), Some(last)) = (line.find('|'), line.rfind('|')) else {
-        return Vec::new();
-    };
-    if last <= first {
-        return Vec::new();
-    }
-    let base = first + 1; // start of the inter-pipe region in `line`
-    let inner = &line[base..last];
-    let mut out = Vec::new();
-    let mut seg = 0; // offset of the current cell within `inner`
-    for piece in split_unescaped_pipes(inner) {
-        let lead = piece.len() - piece.trim_start().len();
-        let trail = piece.len() - piece.trim_end().len();
-        let start = base + seg + lead;
-        out.push(start..(base + seg + piece.len() - trail).max(start));
-        seg += piece.len() + 1; // + the `|`
-    }
-    out
-}
-
-/// If `line` is a table separator row (every cell is dashes with optional
-/// alignment colons), return its per-column alignment, else `None`. Alignment
-/// semantics are the single implementation `crate::markdown::cells::parse_aligns`
-/// (shared with the preview parser and the semantic IR — parity-pinned).
-fn separator_aligns(line: &str) -> Option<Vec<Align>> {
+/// Is `line` a table separator row (every cell is dashes with optional
+/// alignment colons)? Alignment semantics are the single implementation
+/// `crate::markdown::cells::parse_aligns` (shared with the preview parser and
+/// the semantic IR — parity-pinned).
+fn is_separator_row(line: &str) -> bool {
     if !is_table_row(line) {
-        return None;
+        return false;
     }
     let cells = table_cells(line);
-    if cells.is_empty() {
-        return None;
-    }
-    crate::markdown::cells::parse_aligns(&cells).map(|a| {
-        a.into_iter()
-            .map(|al| match al {
-                crate::markdown::cells::CellAlign::Left => Align::Left,
-                crate::markdown::cells::CellAlign::Center => Align::Center,
-                crate::markdown::cells::CellAlign::Right => Align::Right,
-            })
-            .collect()
-    })
+    !cells.is_empty() && crate::markdown::cells::parse_aligns(&cells).is_some()
 }
 
 fn is_word(c: u8) -> bool {
@@ -2534,7 +2455,6 @@ mod tests {
         let regions = table_regions(md);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].lines, 2..6); // header, separator, 2 body rows
-        assert_eq!(regions[0].aligns, vec![Align::Left, Align::Center]);
     }
 
     #[test]
@@ -2567,51 +2487,27 @@ mod tests {
         );
         // A double backslash escapes the backslash — that pipe IS a separator.
         assert_eq!(table_cells(r"| a \\| b |"), vec![r"a \\", "b"]);
-        // Ranges walk the same split: two ranges, first spans the escape.
-        let line = r"| left \| right | ok |";
-        let ranges = table_cell_ranges(line);
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(&line[ranges[0].clone()], r"left \| right");
-        assert_eq!(&line[ranges[1].clone()], "ok");
     }
 
     #[test]
-    fn separator_required_and_alignment() {
+    fn separator_required() {
         // Pipes in prose without a separator row are not a table.
         assert!(table_regions("a | b\nc | d").is_empty());
         assert!(table_regions("| not a table\njust text").is_empty());
-        // Right alignment from `---:`.
-        assert_eq!(
-            table_regions("| h |\n| ---: |\n| x |")[0].aligns,
-            vec![Align::Right]
-        );
+        // A right-aligned separator (`---:`) still starts a region.
+        assert_eq!(table_regions("| h |\n| ---: |\n| x |")[0].lines, 0..3);
     }
 
     #[test]
-    fn table_style_marker_and_region() {
-        assert_eq!(
-            table_style_marker("<!-- table:striped -->"),
-            Some(TableStyle::Striped)
-        );
-        assert_eq!(
-            table_style_marker("<!--table:minimal-->"),
-            Some(TableStyle::Minimal)
-        );
-        assert_eq!(table_style_marker("<!-- table:bogus -->"), None);
-        assert_eq!(table_style_marker("<!-- a comment -->"), None);
-        assert_eq!(table_style_marker("| a | b |"), None);
-
-        // The marker above a table sets its style + is recorded (not in `lines`).
+    fn a_marker_comment_above_does_not_enter_the_region() {
+        // The style-marker comment line above stays out of the region's `lines`.
         let r = table_regions("<!-- table:header -->\n| h |\n| --- |\n| x |");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].style, TableStyle::Header);
-        assert_eq!(r[0].marker_line, Some(0));
         assert_eq!(r[0].lines, 1..4);
 
-        // No marker → default Grid.
+        // No marker line → the region starts at the header row.
         let g = table_regions("| h |\n| --- |\n| x |");
-        assert_eq!(g[0].style, TableStyle::Grid);
-        assert_eq!(g[0].marker_line, None);
+        assert_eq!(g[0].lines, 0..3);
     }
 
     #[test]
