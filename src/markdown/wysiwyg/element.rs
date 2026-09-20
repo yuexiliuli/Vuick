@@ -60,6 +60,29 @@ pub(crate) struct ShapedImage {
     pub h: f32,
 }
 
+/// 表格单元格的编辑排版（shape 期算了对齐位移与排好版的单行，命中/光标列↔x 换算用）。
+pub(crate) struct TableCellLayout {
+    /// 源码内容区间（相对该行行首）。
+    pub src: Range<usize>,
+    /// 单元格内文本起始 x（对齐后，相对单元格左缘）。
+    pub text_x: f32,
+    /// 渲染字节 → 源字节（相对该行行首）；长度 = 渲染文本长 + 1。
+    pub map: std::rc::Rc<Vec<usize>>,
+    /// 排好的单元格单行（`closest_index_for_x`/`x_for_index`）。
+    pub line: gpui::ShapedLine,
+}
+
+/// 表格可编辑行的排版（表头 + 各数据行，与 `ShapedTable.rows_texts` 同构对齐）。
+pub(crate) struct TableRowCellsLayout {
+    pub src_line: usize,
+    pub cells: Vec<TableCellLayout>,
+}
+
+/// 表格块整块的单元格排版（`ShapedRow.table_edit`）。
+pub(crate) struct TableCellsLayout {
+    pub rows: Vec<TableRowCellsLayout>,
+}
+
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
 pub(crate) struct Frame {
     pub padding: Pixels,
@@ -102,6 +125,8 @@ pub(crate) struct ShapedRow {
     pub kind: IrKind,
     /// Table 块的网格数据（带外块为 None）。
     pub table: Option<ShapedTable>,
+    /// Table 块的单元格编辑排版（带外块为 None；表格可编辑靠它，`byte_map` 仍空）。
+    pub table_edit: Option<TableCellsLayout>,
     /// Image 块的显示数据（带外块 / 加载失败仍 Some 显示 alt）。
     pub image: Option<ShapedImage>,
 }
@@ -346,6 +371,7 @@ fn shape_text_row(
         top: px(0.),
         kind,
         table: None,
+        table_edit: None,
         image: None,
     }
 }
@@ -453,13 +479,16 @@ fn shape_code_row(
         top: px(0.),
         kind,
         table: None,
+        table_edit: None,
         image: None,
     }
 }
 
 /// 表格块：列宽按内容自适应（与预览 `table_column_widths` 同式：最大文字宽+20，
 /// 下限 48），不缩放/不省略（超宽由宿主裁剪）；paint 期画成网格。
-/// 非文本行（不可编辑）。
+/// 单元格**可编辑**：shape 期对每可见行（表头 + 数据行）逐单元格排一行单行文本
+/// （与 paint 同字体/加粗/对齐位移），连同「渲染字节→源字节」映射存进
+/// `table_edit`（命中/光标据此把屏幕位置算出源码字节，编辑保留表格结构）。
 fn shape_table_row(
     r: DocRow,
     window: &mut Window,
@@ -492,31 +521,100 @@ fn shape_table_row(
     let height = table_block_height(theme, rows.len());
     let mut aligns2 = aligns.clone();
     aligns2.resize(ncols, TableAlign::Left);
+    let mut rows2: Vec<Vec<gpui::SharedString>> = rows
+        .into_iter()
+        .map(|mut rr| {
+            rr.resize(ncols, gpui::SharedString::default());
+            rr
+        })
+        .collect();
+    let mappings: Option<Vec<crate::markdown::doc::TableRowMap>> =
+        r.table_rows.as_ref().map(|m| m.as_ref().clone());
+
+    // 逐可见行 shape 每个单元格（表头加粗、数据行常规，与 draw_table_row 同 runs/对齐）。
+    let mut trow_edit: Vec<TableRowCellsLayout> = Vec::new();
+    let mk_row = |window: &mut Window,
+                  src_line: usize,
+                  texts: Vec<gpui::SharedString>,
+                  maps: &[crate::markdown::doc::TableCellMap],
+                  is_header: bool| {
+        let mut cells = Vec::with_capacity(texts.len());
+        for (ci, c) in texts.iter().enumerate() {
+            let col_w = widths.get(ci).copied().unwrap_or(0.);
+            let mut font = base_font.clone();
+            let mut color = theme.text;
+            if is_header {
+                font.weight = gpui::FontWeight::BOLD;
+                color.a = 0.9;
+            }
+            let run = [gpui::TextRun {
+                len: c.len(),
+                font,
+                color,
+                ..Default::default()
+            }];
+            let line = window.text_system().shape_line(c.clone(), font_size, &run, None);
+            let w = f32::from(line.width());
+            let text_x = match aligns2.get(ci).copied().unwrap_or(TableAlign::Left) {
+                TableAlign::Center => ((col_w - w) / 2.).max(0.),
+                TableAlign::Right => (col_w - w - 10.).max(0.),
+                _ => 10.,
+            };
+            // 稀疏行（少于列数）把末尾空列映射到最后一个真实单元格的尾部。
+            let m = maps.len().saturating_sub(1).min(ci);
+            let src = maps.get(m).map(|cm| cm.src.clone()).unwrap_or(0..0);
+            let map = maps
+                .get(m)
+                .map(|cm| std::rc::Rc::new(cm.map.clone()))
+                .unwrap_or_default();
+            cells.push(TableCellLayout { src, text_x, map, line });
+        }
+        TableRowCellsLayout { src_line, cells }
+    };
+    // 表头（源行 = r.src_line）。
+    let head_maps = mappings.as_ref().and_then(|r| r.first()).map(|m| m.cells.as_slice());
+    trow_edit.push(mk_row(
+        window,
+        r.src_line,
+        header.clone(),
+        head_maps.unwrap_or(&[]),
+        true,
+    ));
+    // 数据行：k=0 对应源行 = src_line + 2（分隔行为 src_line+1，不渲染、不可编辑）。
+    for (k, texts) in rows2.iter().enumerate() {
+        let src_line = r.src_line + 1 + (k + 1);
+        let maps = mappings
+            .as_ref()
+            .and_then(|r| r.get(k + 1))
+            .map(|m| m.cells.as_slice())
+            .unwrap_or(&[]);
+        trow_edit.push(mk_row(window, src_line, texts.clone(), maps, false));
+    }
+    let editable = !trow_edit.is_empty();
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped: Vec::new(),
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
-        editable: false,
+        editable,
         multi_offsets: Vec::new(),
         lh: row_h,
         x_off: px(0.),
         height,
         top: px(0.),
         kind,
+        table_edit: if trow_edit.is_empty() {
+            None
+        } else {
+            Some(TableCellsLayout { rows: trow_edit })
+        },
         table: Some(ShapedTable {
             widths,
             total_w,
             row_h,
             header_texts: header,
-            rows_texts: rows
-                .into_iter()
-                .map(|mut rr| {
-                    rr.resize(ncols, gpui::SharedString::default());
-                    rr
-                })
-                .collect(),
+            rows_texts: rows2,
             aligns: aligns2,
         }),
         image: None,
@@ -554,6 +652,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         top: px(0.),
         kind,
         table: None,
+        table_edit: None,
         image: Some(ShapedImage { src, alt, w, h }),
     }
 }
@@ -614,6 +713,7 @@ pub(crate) fn build_frame(
                 top: px(0.),
                 kind: IrKind::Blank,
                 table: None,
+                table_edit: None,
                 image: None,
             }],
             total: line_h,
@@ -744,6 +844,7 @@ pub(crate) fn build_frame(
                     top: total,
                     kind: crate::markdown::doc::row_kind(meta.kind),
                     table: None,
+                    table_edit: None,
                     image: None,
                 }
             }
@@ -826,6 +927,92 @@ fn code_group_top(row: &ShapedRow, g: usize) -> f32 {
     acc
 }
 
+/// 表格块内 dy（相对块首）→ 可见行号（0=表头，i=数据行 i）。布局与
+/// [`paint_table_row`] 同式（上边框 1px、行间分隔 1px）。带外/空白间隙返回 None。
+fn table_row_at(t: &ShapedTable, dy: f32) -> Option<usize> {
+    let rh = f32::from(t.row_h);
+    if dy < 1. {
+        return None;
+    }
+    if dy < 1. + rh {
+        return Some(0);
+    }
+    let mut y = 1. + rh;
+    for i in 0..t.rows_texts.len() {
+        y += 1.; // 行间分隔线
+        if dy < y + rh {
+            return Some(1 + i);
+        }
+        y += rh;
+    }
+    None
+}
+
+/// 可见行 `row_ix` 的块内顶部 y（与 [`table_row_at`] 互逆）。
+fn table_row_top(t: &ShapedTable, row_ix: usize) -> f32 {
+    if row_ix == 0 {
+        return 1.;
+    }
+    1. + f32::from(t.row_h) + (row_ix - 1) as f32 * (1. + f32::from(t.row_h)) + 1.
+}
+
+/// 内容坐标 x → 列号（循环列宽；超出总宽返回 None）。
+fn table_cell_index(widths: &[f32], x: f32) -> Option<usize> {
+    let mut acc = 0f32;
+    for (ci, w) in widths.iter().enumerate() {
+        if x < acc + *w {
+            return Some(ci);
+        }
+        acc += *w;
+    }
+    None
+}
+
+/// 列号 → 该列左缘坐标（内容坐标）。
+fn table_cell_x0(widths: &[f32], cell_ix: usize) -> f32 {
+    widths.iter().take(cell_ix).sum()
+}
+
+/// src caret（相对行首）→ 渲染字节（`map` 左界，<>`source_to_display`）。
+fn table_cell_display(map: &[usize], target: usize) -> usize {
+    map.partition_point(|&s| s < target)
+}
+
+/// src caret（相对行首）→ 表格单元格几何：(单元格列号, 列内渲染列)。找不到返回 None。
+fn table_cell_at_src(
+    rows: &[TableRowCellsLayout],
+    row_line: usize,
+    target: usize,
+) -> Option<(usize, usize)> {
+    let row = rows.iter().find(|r| r.src_line == row_line)?;
+    let nonempty: Vec<usize> = row
+        .cells
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.src.start < c.src.end)
+        .map(|(i, _)| i)
+        .collect();
+    let cell_ix = row
+        .cells
+        .iter()
+        .position(|c| {
+            c.src.start < c.src.end && target >= c.src.start && target <= c.src.end
+        })
+        .unwrap_or_else(|| {
+            // 落在单元格间隙（管道/空白区）：取最近的非空格尾；都无则取第一个非空格。
+            nonempty
+                .iter()
+                .rev()
+                .copied()
+                .find(|&i| row.cells[i].src.start <= target)
+                .or_else(|| nonempty.first().copied())
+                .unwrap_or(0)
+        });
+    let dcol = table_cell_display(&row.cells[cell_ix].map, target);
+    let dcol = dcol.min(row.cells[cell_ix].line.len());
+    Some((cell_ix, dcol))
+}
+
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
 /// 行高用 `r.lh`（标题/代码等类型各自行高），否则光标会错位。
 fn caret_geometry(
@@ -841,6 +1028,25 @@ fn caret_geometry(
         }
         if !r.editable {
             return (false, px(12.), r.top);
+        }
+        if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
+            // 表格：caret 落在某个可见行（表头/数据行）→ 定位到单元格内容处。
+            let Some(row_ix) = te.rows.iter().position(|rr| rr.src_line == cl) else {
+                return (false, px(12.), r.top);
+            };
+            let row_l = &te.rows[row_ix];
+            let target = col.min(line_end.saturating_sub(line_start));
+            let Some((cell_ix, dcol)) = table_cell_at_src(&te.rows, cl, target) else {
+                return (false, px(12.), r.top);
+            };
+            let cell = &row_l.cells[cell_ix];
+            let cell_x0 = table_cell_x0(&t.widths, cell_ix);
+            let col_x = f32::from(cell.line.x_for_index(dcol.min(cell.line.len())));
+            // 垂直居中于该行（与 paint 文字纵向居中一致；光标高用正文行高近似）。
+            let caret_h = f32::from(editor.theme.para_line());
+            let row_top = r.top + px(table_row_top(t, row_ix));
+            let ctop = row_top + px(((f32::from(t.row_h) - caret_h) / 2.).max(0.));
+            return (true, px(12.) + px(cell_x0 + cell.text_x + col_x), ctop);
         }
         if !r.multi_offsets.is_empty() {
             // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
@@ -889,6 +1095,33 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
         if rel_y >= top && rel_y < bottom {
             if !r.editable {
                 return editor.line_end(r.src_line).max(editor.line_start(r.src_line));
+            }
+            if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
+                // 表格：y 定可见行（表头/数据行），x 定列，再按对齐位移映射列内渲染列
+                // → 单元格 byte_map 反查源字节（相对该行行首）。
+                let Some(row_ix) = table_row_at(t, rel_y - top) else {
+                    return editor.caret();
+                };
+                let Some(row_l) = te.rows.get(row_ix) else {
+                    return editor.caret();
+                };
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding)).max(0.);
+                let cell_ix = table_cell_index(&t.widths, rel_x)
+                    .unwrap_or(t.widths.len().saturating_sub(1));
+                let Some(cell) = row_l.cells.get(cell_ix) else {
+                    return editor.caret();
+                };
+                let cell_x0 = table_cell_x0(&t.widths, cell_ix);
+                let in_cell = (rel_x - cell_x0 - cell.text_x).max(0.);
+                let col = cell
+                    .line
+                    .closest_index_for_x(px(in_cell))
+                    .min(cell.map.len().saturating_sub(1))
+                    .min(cell.line.len());
+                let local = *cell.map.get(col).unwrap_or(&0);
+                let ls = editor.line_start(row_l.src_line);
+                let le = editor.line_end(row_l.src_line).max(ls);
+                return (ls + local).min(le);
             }
             if !r.multi_offsets.is_empty() {
                 // 代码块：y 定源码行组（`code_group_at`，首空白带归第 0 组），x 定列；
@@ -1670,7 +1903,7 @@ impl Element for WyEditorElement {
 mod tests {
     use super::{
         build_frame, caret_geometry, display_to_source, source_offset_at, source_to_display,
-        table_block_height, WyEditor,
+        table_block_height, table_cell_x0, table_row_top, WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -1926,19 +2159,28 @@ let c = 3;
                 f32::from(code.height)
             );
 
-            // 表格块：表头 2 列 × 数据 2 行，渲染数据齐备。
+            // 表格块：表头 2 列 × 数据 2 行，渲染数据齐备、单元格可编辑。
             let table = frame
                 .rows
                 .iter()
                 .find(|r| r.kind == IrKind::Table)
                 .expect("应有表格块");
-            assert!(!table.editable);
+            assert!(table.editable, "表格单元格应可编辑");
             let t = table.table.as_ref().expect("表格应有渲染数据");
             assert_eq!(t.header_texts.len(), 2);
             assert_eq!(t.rows_texts.len(), 2);
             assert_eq!(t.header_texts[0].as_ref(), "A");
             assert_eq!(t.rows_texts[1][1].as_ref(), "4");
             assert!(t.total_w > 0.);
+            // 编辑排版：表头(1) + 数据行(2) = 3 个可见行，每行 2 格，源行号与块一致。
+            let te = table.table_edit.as_ref().expect("表格应有编辑排版");
+            assert_eq!(te.rows.len(), 3, "表头 + 2 数据行");
+            for (i, row) in te.rows.iter().enumerate() {
+                assert_eq!(row.cells.len(), 2, "每行 2 格");
+            }
+            assert_eq!(te.rows[0].src_line, 6, "表头源行");
+            assert_eq!(te.rows[1].src_line, 8, "首数据行源行（隔开分隔行）");
+            assert_eq!(te.rows[2].src_line, 9, "次数据行源行");
             assert!(
                 (f32::from(table.height) - f32::from(table_block_height(&theme, 2))).abs() < 1.,
                 "表格高与估算同式"
@@ -2454,6 +2696,185 @@ tail
                 f32::from(c2),
                 cx_
             );
+        });
+    }
+
+    #[gpui::test]
+    fn table_click_lands_in_correct_cell(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table)
+                .expect("应有表格");
+            assert!(row.editable, "表格单元格应可编辑");
+            let t = row.table.as_ref().expect("表格渲染数据");
+            let te = row.table_edit.as_ref().expect("表格编辑排版");
+            let rh = f32::from(t.row_h);
+            let pad = f32::from(frame.padding);
+            let top = f32::from(row.top);
+            // (可见行, 列, 期望字符)：表头第一格 A；数据行2(源行3) 两格 3/4。
+            for (row_ix, cell_ix, want) in [(0usize, 0usize, 'A'), (2, 0, '3'), (2, 1, '4')] {
+                let tx = te.rows[row_ix].cells[cell_ix].text_x;
+                let y = top + table_row_top(t, row_ix) + rh / 2.;
+                let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 1.;
+                let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+                let c = ed.read(cx).content.as_ref()[off..]
+                    .chars()
+                    .next()
+                    .unwrap_or('_');
+                assert_eq!(c, want, "单元格 (行{row_ix},列{cell_ix}) 应命中字符 {want}");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn table_caret_aligns_with_clicked_cell(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table)
+                .expect("应有表格");
+            let t = row.table.as_ref().unwrap();
+            let te = row.table_edit.as_ref().unwrap();
+            let rh = f32::from(t.row_h);
+            let pad = f32::from(frame.padding);
+            let top = f32::from(row.top);
+            // 数据第 2 行第 2 格（"4"@源行3）：点击 → set_caret → caret x 应贴合点击 x。
+            let cell_ix = 1usize;
+            let row_ix = 2usize;
+            let tx = te.rows[row_ix].cells[cell_ix].text_x;
+            let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 20.;
+            let y = top + table_row_top(t, row_ix) + rh / 2.;
+            let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+            ed.update(cx, |e, _| e.set_caret(off));
+            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame.rows);
+            assert!(on, "表格单元格应可放光标");
+            assert!(
+                (f32::from(caretx) - x).abs() < 12.,
+                "光标 x {} 应贴合点击 x {}（<1 字宽）",
+                f32::from(caretx),
+                x
+            );
+            let row_top_y = top + table_row_top(t, row_ix);
+            assert!(
+                f32::from(carety) >= row_top_y - 0.5 && f32::from(carety) <= row_top_y + rh + 0.5,
+                "光标 y {} 应在点击行带 [{row_top_y}, {}] 内",
+                f32::from(carety),
+                row_top_y + rh
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn table_cell_edit_typing_and_boundary_guards(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let text = "| 1 | 2 |\n| --- | --- |\n| a | b |\n尾\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                // 在数据行第一格 "a"（源行 2，位 2）内输入 X。
+                let ls = e.line_start(2);
+                e.set_caret(ls + 2);
+                e.replace_range(e.caret()..e.caret(), "X", cx);
+                assert!(
+                    e.content.as_ref().contains("| Xa | b |"),
+                    "格内输入生效：{}",
+                    e.content.as_ref()
+                );
+                // 退格在格内容起点（'X'）→ no-op（守卫 `| ` 不被吃掉）。
+                e.set_caret(ls + 2);
+                e.backspace(cx);
+                assert!(
+                    e.content.as_ref().contains("| Xa | b |"),
+                    "格起点退格应被守卫：{}",
+                    e.content.as_ref()
+                );
+                // 删除在格内容尾 → no-op（守卫 `|` 不被吃掉）。
+                let ls2 = e.line_start(2);
+                e.set_caret(ls2 + 4);
+                e.delete(cx);
+                assert!(
+                    e.content.as_ref().contains("| Xa | b |"),
+                    "格内容尾删除应被守卫：{}",
+                    e.content.as_ref()
+                );
+                // 表格内回车 → no-op（不拆表）。
+                let before = e.content.as_ref().to_string();
+                e.set_caret(ls2 + 3);
+                e.newline(cx);
+                assert_eq!(
+                    e.content.as_ref(),
+                    &before,
+                    "表格内回车应 no-op：{}",
+                    e.content.as_ref()
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn table_arrow_nav_skips_delimiter(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n尾\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _cx| {
+                // 表头（行 0）down → 首数据行（行 2，跳过分隔行 1）。
+                e.set_caret(e.line_start(0) + 2);
+                e.move_down();
+                assert_eq!(e.row_col(e.caret()).0, 2, "表头 down 应到首数据行");
+                // 数据行 up → 上一数据行。
+                e.set_caret(e.line_start(3) + 4);
+                e.move_up();
+                assert_eq!(e.row_col(e.caret()).0, 2, "次数据行 up 应到首数据行");
+                // 首数据行 up → 表头（跳过分隔行）。
+                e.move_up();
+                assert_eq!(e.row_col(e.caret()).0, 0, "首数据行 up 应到表头");
+                // 末数据行 down → 出表到尾段（行 4）。
+                e.set_caret(e.line_start(3) + 4);
+                e.move_down();
+                assert_eq!(e.row_col(e.caret()).0, 4, "末数据行 down 应出表到尾段");
+                // 单元格内 Left：行首 Left 被钳在格内容（不落管道空白）。
+                e.set_caret(e.line_start(2) + 2); // "1"
+                e.move_left();
+                {
+                    let (l, c) = e.row_col(e.caret());
+                    assert_eq!(l, 2, "内容行 Left 不应出表");
+                    assert_eq!(c, 2, "格内容起点 Left 被钳在格内（col {c}）");
+                }
+            });
         });
     }
 }

@@ -619,6 +619,75 @@ fn unescape_table_cell(s: &str) -> String {
     out
 }
 
+/// [`unescape_table_cell`] 的映射变体：`map[k]` = 渲染字节 `out[k]` 对应的**源字节
+/// （相对 `s` 起始）**；长度 = `out.len()+1`，末项哨兵 = `s.len()`。
+/// `\|`→`|`、`\\`→`\`（2→1 字节）时按字面字符所在源位映射。
+fn unescape_table_cell_mapped(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len() + 1);
+    let mut cs = s.char_indices().peekable();
+    while let Some((idx, c)) = cs.next() {
+        if c == '\\' && matches!(cs.peek(), Some(&(_, '|' | '\\'))) {
+            let (nidx, n) = *cs.peek().unwrap();
+            for b in 0..n.len_utf8() {
+                map.push(nidx + b);
+            }
+            out.push(n);
+            cs.next();
+            continue;
+        }
+        for b in 0..c.len_utf8() {
+            map.push(idx + b);
+        }
+        out.push(c);
+    }
+    map.push(s.len());
+    (out, map)
+}
+
+/// 按 [`split_table_cells`] **同一 pipeline**（拆未转义 `|` → 解义 → trim → 行内清理）
+/// 拆分表格行，并附加每单元格的「渲染字节 → 源字节」映射与源区间，供 WYSIWYG 表格
+/// 编辑换算（单元格内容可原地改，表格保持结构）。
+///
+/// 返回逐单元格 `(源字节区间, 渲染文本, 渲染字节→源字节映射)`：
+/// - `源字节区间`相对**该行行首**（trim 掉空白后的内容，`src.end` 为哨兵能指到的尾）；
+/// - 映射长度 = `渲染文本.len()+1`，末项哨兵 = `src.end`（相对行首）。
+pub(crate) fn split_table_cells_mapped(
+    line: &str,
+) -> Vec<(Range<usize>, SharedString, Vec<usize>)> {
+    let base = line.as_ptr() as usize;
+    let mut segs: Vec<&str> = cells::split_unescaped_pipes(line).collect();
+    if segs.first().is_some_and(|s| s.trim().is_empty()) {
+        segs.remove(0);
+    }
+    if segs.last().is_some_and(|s| s.trim().is_empty()) {
+        segs.pop();
+    }
+    let mut out = Vec::with_capacity(segs.len());
+    for seg in segs {
+        let raw_off = seg.as_ptr() as usize - base;
+        let lead = seg.len() - seg.trim_start().len();
+        let content = seg.trim();
+        let (u_text, u_map) = unescape_table_cell_mapped(content);
+        let t = u_text.trim_start();
+        let lead_t = u_text.len() - t.len();
+        let (render, _runs, i_map) = inline_style_mapped(t);
+        let src_base = raw_off + lead;
+        let src_end = raw_off + lead + content.len();
+        // 末项哨兵固定 = 内容源尾（`\|`/行内记号不改变源的物理边界）。
+        let map: Vec<usize> = i_map
+            .iter()
+            .map(|&j| src_base + u_map[lead_t + j])
+            .collect();
+        let mut map = map;
+        if let Some(last) = map.last_mut() {
+            *last = src_end;
+        }
+        out.push((src_base..src_end, render.into(), map));
+    }
+    out
+}
+
 /// 分隔行每格必须是 `:?-+:?`（冒号 + 全短横），返回每列对齐；任一格不合规返回 None。
 /// 复用共享唯一实现 `cells::parse_aligns`（与 live、IR 同源，见 parity）。
 fn parse_delimiter(cells: &[SharedString]) -> Option<Vec<TableAlign>> {
@@ -2227,6 +2296,35 @@ mod tests {
         let src = "姓名|年龄\n-|-\n张三|30\n";
         let rows = parse_to_rows(src);
         assert_eq!(rows[0].kind, RowKind::Table);
+    }
+
+    #[test]
+    fn split_table_cells_mapped_round_trips_to_source() {
+        // `| A | B |`：单元格内容 A 的源区间 [2,3)（`|`/空格编号 -> A@2）。
+        let line = "| A | B |";
+        let cells = split_table_cells_mapped(line);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].0, 2..3, "A 的源区间");
+        assert_eq!(cells[0].1.as_ref(), "A");
+        assert_eq!(cells[0].2, vec![2, 3], "渲染 A ↔ 源 2..3");
+        assert_eq!(cells[1].1.as_ref(), "B");
+        assert_eq!(cells[1].2, vec![6, 7]);
+        // 转义竖线：`a\|b` 渲染 `a|b`，仍是一格。
+        let cells2 = split_table_cells_mapped("| a\\|b | c |");
+        assert_eq!(cells2.len(), 2);
+        assert_eq!(cells2[0].1.as_ref(), "a|b", "转义竖线渲染为字面 |");
+        assert_eq!(cells2[0].0, 2..6, "内容源区间含转义 4 字节 a\\|b");
+        assert_eq!(cells2[0].2, vec![2, 4, 5, 6], "渲染 a|b ↔ 源 a\\|b（'|' 映到字面源位）");
+        // 行内粗体：`**x**` 渲染 `x`，映射跳过记号。
+        let cells3 = split_table_cells_mapped("| **x** |");
+        assert_eq!(cells3[0].1.as_ref(), "x");
+        assert_eq!(cells3[0].0, 2..7, "内容源区间 = `**x**` 五字节");
+        assert_eq!(cells3[0].2, vec![4, 7], "渲染 x ↔ ** 之间的 x（源 4..5，哨兵 7）");
+        // 无首尾外竖线（raw_cells 风格）+ 尾随空格。
+        let cells4 = split_table_cells_mapped("A | B ");
+        assert_eq!(cells4[0].0, 0..1);
+        assert_eq!(cells4[0].1.as_ref(), "A");
+        assert_eq!(cells4[1].0, 4..5, "B 在索引 4（跳过 `A | `）");
     }
 
     #[test]

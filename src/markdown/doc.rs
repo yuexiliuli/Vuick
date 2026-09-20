@@ -43,6 +43,27 @@ pub(crate) enum DocPayload {
     Table(TableData),
 }
 
+/// 表格可编辑行的源码映射（逐可见行：表头 + 各数据行；分隔行不渲染不编辑）。
+/// 供元素层命中/光标/选区把「单元格渲染位置 ↔ 源字节」换算。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TableRowMap {
+    /// 该行源码行号。
+    pub src_line: usize,
+    /// 逐单元格。
+    pub cells: Vec<TableCellMap>,
+}
+
+/// 单个表格单元格的编辑映射。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TableCellMap {
+    /// 源码内容区间（**相对该行行首**；`\|` 转义按源字节计入，哨兵指到内容物理尾）。
+    pub src: Range<usize>,
+    /// 渲染文本（与预览单元格同源，已解义/行内清理）。
+    pub text: SharedString,
+    /// 渲染字节 → 源字节（相对该行行首）；长度 = `text.len()+1`。
+    pub map: Vec<usize>,
+}
+
 /// 统一渲染行（块粒度：Code/Table 等一个块 = 一个 DocRow，跨多行）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DocRow {
@@ -66,6 +87,9 @@ pub(crate) struct DocRow {
     pub(crate) byte_map: Vec<usize>,
     /// 块级渲染负载（非文本块的渲染数据）。
     pub(crate) payload: DocPayload,
+    /// 表格块的逐行/单元格编辑映射（仅 [`IrKind::Table`] 行非 `Some`；代码块用
+    /// `byte_map`，表格因单元格多列需要更细粒度）。`Rc` 压低克隆成本。
+    pub(crate) table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
 }
 
 /// 文档源：`Str`（小文档）或 `Rope`（大文档，COW，与编辑器共享底层树）。
@@ -244,6 +268,13 @@ impl Doc {
             RowKind::Table => r.table().cloned().map(DocPayload::Table).unwrap_or_default(),
             _ => DocPayload::Text,
         };
+        let table_rows = match r.kind {
+            RowKind::Table => {
+                let n_data = r.table().map_or(0, |t| t.rows.len());
+                self.table_row_maps(r.src_line, n_data)
+            }
+            _ => None,
+        };
         DocRow {
             kind,
             src_line: r.src_line,
@@ -252,7 +283,29 @@ impl Doc {
             runs: r.runs,
             byte_map,
             payload,
+            table_rows,
         }
+    }
+
+    /// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用
+    /// [`parser::split_table_cells_mapped`] 装配单元格编辑映射。
+    fn table_row_maps(
+        &self,
+        src_line: usize,
+        n_data: usize,
+    ) -> Option<std::rc::Rc<Vec<TableRowMap>>> {
+        let mut out = Vec::with_capacity(1 + n_data);
+        for k in 0..=n_data {
+            // k=0 表头（src_line）；数据行 i（0 基，k=i+1）源行 = src_line + 1 + k。
+            let line_ix = if k == 0 { src_line } else { src_line + 1 + k };
+            let line = self.line_str(line_ix);
+            let cells = parser::split_table_cells_mapped(&line)
+                .into_iter()
+                .map(|(src, text, map)| TableCellMap { src, text, map })
+                .collect();
+            out.push(TableRowMap { src_line: line_ix, cells });
+        }
+        Some(std::rc::Rc::new(out))
     }
 
     /// 代码块（围栏内内容行可编辑）的块级编辑映射：
