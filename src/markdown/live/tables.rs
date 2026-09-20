@@ -41,7 +41,7 @@ impl MarkdownLivePreview {
             total,
             bounds.size.width - px(TABLE_GUTTER),
         );
-        table_left_x(bounds.origin.x, bounds.size.width, total, sx, t.rtl)
+        table_left_x(bounds.origin.x, sx)
     }
 
     /// The clamped horizontal scroll of the table headed at `header_row`.
@@ -112,9 +112,8 @@ impl MarkdownLivePreview {
         }
         let max = f32::from(total - avail);
         let cur = self.table_scroll_x.get(&header).copied().unwrap_or(0.);
-        // An RTL table's scroll offset runs the other way (see `table_left_x`),
-        // so the same physical swipe moves its content the same physical way.
-        let new = if t.rtl { cur + dx } else { cur - dx }.clamp(0., max);
+        // Scrolling the table shifts its content left (see `table_left_x`).
+        let new = (cur - dx).clamp(0., max);
         if new != cur {
             self.table_scroll_x.insert(header, new);
             cx.notify();
@@ -236,7 +235,7 @@ impl MarkdownLivePreview {
         let hit_x = rel.x.max(px(0.)).min(total - px(0.01));
         let mut cell = t.col_widths.len() - 1;
         for c in 0..t.col_widths.len() {
-            let x = col_offset(&t.col_widths, t.cells.len(), c, t.rtl);
+            let x = col_offset(&t.col_widths, c);
             if hit_x >= x && hit_x < x + cell_span_width(&t.col_widths, t.cells.len(), c) {
                 cell = c;
                 break;
@@ -244,7 +243,7 @@ impl MarkdownLivePreview {
         }
         // A click in a spanned trailing column lands in the short row's last cell.
         let cell = cell.min(t.cells.len().saturating_sub(1));
-        let cx = col_offset(&t.col_widths, t.cells.len(), cell, t.rtl);
+        let cx = col_offset(&t.col_widths, cell);
         let content = t.cells.get(cell)?;
         let cw = cell_span_width(&t.col_widths, t.cells.len(), cell);
         let cf = cell_font(&font, t.is_header);
@@ -257,9 +256,6 @@ impl MarkdownLivePreview {
             match t.aligns.get(cell) {
                 Some(markdown_syntax::Align::Center) => (avail - full_w).max(px(0.)) / 2.,
                 Some(markdown_syntax::Align::Right) => (avail - full_w).max(px(0.)),
-                // Unaligned cells follow the table's direction — same rule the
-                // paint uses, so the hit-test matches what's on screen.
-                _ if t.rtl => (avail - full_w).max(px(0.)),
                 _ => px(0.),
             }
         };
@@ -1133,29 +1129,15 @@ pub(crate) struct TableThumb {
 /// The single source for every x on a table: paint, hit-tests, the caret,
 /// the resize bands and the add/delete affordances all derive from it, so
 /// they cannot drift apart.
-pub(crate) fn table_left_x(
-    origin: Pixels,
-    width: Pixels,
-    total: Pixels,
-    sx: Pixels,
-    rtl: bool,
-) -> Pixels {
-    if rtl {
-        origin + width - px(TABLE_GUTTER) - total + sx
-    } else {
-        origin + px(TABLE_GUTTER) - sx
-    }
+pub(crate) fn table_left_x(origin: Pixels, sx: Pixels) -> Pixels {
+    origin + px(TABLE_GUTTER) - sx
 }
 
 /// The x band a table is visible in: the note column less its gutter, on the
 /// side [`table_left_x`] put the gutter. Clamps the scroll thumb's track and a
 /// wide table's selection highlight.
-pub(crate) fn table_visible_band(origin: Pixels, width: Pixels, rtl: bool) -> (Pixels, Pixels) {
-    if rtl {
-        (origin, origin + width - px(TABLE_GUTTER))
-    } else {
-        (origin + px(TABLE_GUTTER), origin + width)
-    }
+pub(crate) fn table_visible_band(origin: Pixels, width: Pixels) -> (Pixels, Pixels) {
+    (origin + px(TABLE_GUTTER), origin + width)
 }
 
 /// The header row of the table that `t` (the grid row at line `row`) belongs
@@ -1177,13 +1159,8 @@ fn table_header_row(t: &TableRow, row: usize) -> usize {
 /// reader's `flex_row_reverse`. Every place that turns a column into an x goes
 /// through this: paint, caret, selection bands, resize grips. They have to
 /// agree, or clicking lands in a different cell than the one drawn there.
-pub(crate) fn col_offset(col_widths: &[Pixels], cells_len: usize, c: usize, rtl: bool) -> Pixels {
-    let before: Pixels = col_widths[..c.min(col_widths.len())].iter().copied().sum();
-    if !rtl {
-        return before;
-    }
-    let total: Pixels = col_widths.iter().copied().sum();
-    total - before - cell_span_width(col_widths, cells_len, c)
+pub(crate) fn col_offset(col_widths: &[Pixels], c: usize) -> Pixels {
+    col_widths[..c.min(col_widths.len())].iter().copied().sum()
 }
 
 pub(crate) fn cell_span_width(col_widths: &[Pixels], cells_len: usize, c: usize) -> Pixels {
@@ -1249,7 +1226,7 @@ pub(crate) fn table_caret_pos(
     let range = t.cell_ranges.get(cell)?;
     let content = t.cells.get(cell)?;
     let in_cell = col.saturating_sub(range.start).min(content.len());
-    let cell_x = left + col_offset(&t.col_widths, t.cell_ranges.len(), cell, t.rtl);
+    let cell_x = left + col_offset(&t.col_widths, cell);
     let cw = cell_span_width(&t.col_widths, t.cell_ranges.len(), cell);
     // The header is bold, so shape with the bold font or the caret lands left of
     // the (wider) bold glyphs; position_for_index gives the exact kerned x — and,
@@ -1265,17 +1242,8 @@ pub(crate) fn table_caret_pos(
         Some(avail),
         Hsla::default(),
     )?;
-    let mut pos = wl.position_for_index(in_cell, line_h).unwrap_or_default();
+    let pos = wl.position_for_index(in_cell, line_h).unwrap_or_default();
     let wrapped = !wl.wrap_boundaries().is_empty();
-    // A cell holding right-to-left text needs the same index↔x map the rest of
-    // the editor uses: gpui's `position_for_index` collapses every offset in an
-    // RTL run onto one x, which is a caret that won't move through the word.
-    // Only an unwrapped cell can use it — a map's x's run along the single
-    // pre-wrap line (same limit as elsewhere).
-    if !wrapped && super::md_syntax::contains_rtl(content) {
-        let map = super::bidi::shaped::map_of_wrapped(&wl, content.len());
-        pos.x = px(map.x_for_index(in_cell));
-    }
     let full_w = wl.width();
     // Alignment shifts only unwrapped content (a wrapped cell fills its width).
     let align_off = if wrapped {
@@ -1312,11 +1280,6 @@ fn cell_offset_for_point(
     ) else {
         return 0;
     };
-    if wl.wrap_boundaries().is_empty() && super::md_syntax::contains_rtl(content) {
-        // Same reason as the caret above, in reverse.
-        let map = super::bidi::shaped::map_of_wrapped(&wl, content.len());
-        return map.index_for_x(f32::from(target.x));
-    }
     match wl.closest_index_for_position(
         point(
             target.x,
@@ -1382,15 +1345,13 @@ pub(crate) fn paint_table_row(
     if t.is_header {
         cell_font.weight = gpui::FontWeight::BOLD;
     }
-    for (c, &cw) in t.col_widths.iter().enumerate() {
-        let x = origin.x + col_offset(&t.col_widths, t.cells.len(), c, t.rtl);
+    for (c, _cw) in t.col_widths.iter().enumerate() {
+        let x = origin.x + col_offset(&t.col_widths, c);
         // Inner cell separator at the left of every cell except the first (Grid
         // only; the other styles drop vertical lines). A short row draws no
         // dividers past its last cell — that cell spans the remaining columns.
         if vlines && c > 0 && c < t.cells.len() {
-            // The divider goes on the column's LEADING edge — its right on an
-            // RTL table, where reading starts.
-            let dx = if t.rtl { x + cw - thick } else { x };
+            let dx = x;
             window.paint_quad(fill(
                 Bounds::new(point(dx, origin.y), size(thick, row_h)),
                 t.border,
@@ -1409,9 +1370,6 @@ pub(crate) fn paint_table_row(
                 let align = match t.aligns.get(c) {
                     Some(markdown_syntax::Align::Center) => gpui::TextAlign::Center,
                     Some(markdown_syntax::Align::Right) => gpui::TextAlign::Right,
-                    // No explicit alignment: follow the table's direction, so
-                    // RTL cells start at the right like their text does.
-                    _ if t.rtl => gpui::TextAlign::Right,
                     _ => gpui::TextAlign::Left,
                 };
                 let _ = shaped.paint(

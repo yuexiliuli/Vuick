@@ -340,35 +340,12 @@ impl Direction {
     }
 }
 
-/// The base direction of `text`, by the first *strong* directional character
-/// (Unicode UAX #9 rules P2/P3 — the same rule Logseq and browsers' `dir=auto`
-/// use). Neutral characters (digits, punctuation, whitespace, markdown
-/// markers) are skipped, so `- سلام` and `## سلام` detect as RTL; text with no
-/// strong character at all is LTR.
-///
-/// Ranges rather than a full Unicode table: the strong-RTL blocks are
-/// contiguous and stable (Hebrew, Arabic and its supplements, Syriac, Thaana,
-/// N'Ko, Samaritan, Mandaic, plus the Arabic presentation forms), and pulling
-/// a bidi-class table in for one predicate isn't worth the dependency.
-pub fn base_direction(text: &str) -> Direction {
-    for c in text.chars() {
-        if is_strong_rtl(c) {
-            return Direction::Rtl;
-        }
-        if is_strong_ltr(c) {
-            return Direction::Ltr;
-        }
-    }
-    Direction::Ltr
-}
-
 /// The direction of a source line's CONTENT, ignoring its markdown markers.
 ///
-/// [`base_direction`] takes the first strong character, and a marker can supply
-/// one: the `x` in `- [x] یک کار` is strong left-to-right, so a COMPLETED task
-/// read as LTR while the identical unchecked line read as RTL, and the two sat
-/// on opposite sides of the note. Blockquote arrows, list bullets, task boxes
-/// and heading hashes are syntax, not prose, so they are skipped first.
+/// Blockquote arrows, list bullets, task boxes and heading hashes are syntax,
+/// not prose, so they are skipped first (a marker like the `x` in
+/// `- [x] یک کار` is strong left-to-right, and would otherwise decide the
+/// whole line's direction).
 pub fn content_direction(line: &str) -> Direction {
     content_direction_opt(line).unwrap_or(Direction::Ltr)
 }
@@ -444,16 +421,6 @@ pub fn content_direction_opt(line: &str) -> Option<Direction> {
             None
         }
     })
-}
-
-/// Does `text` contain ANY right-to-left character?
-///
-/// Distinct from [`base_direction`], which answers which side a line starts on.
-/// A line can read left-to-right and still hold a Persian name in the middle,
-/// and that run needs the same logical↔visual mapping an RTL line does — the
-/// caret misplaces inside it otherwise.
-pub fn contains_rtl(text: &str) -> bool {
-    text.chars().any(is_strong_rtl)
 }
 
 /// Strong right-to-left: Hebrew through Arabic-script languages.
@@ -1079,33 +1046,6 @@ mod tests {
         assert!(!content_direction("## English heading").is_rtl());
         // A line that is only markers has no direction of its own.
         assert!(!content_direction("- [ ] ").is_rtl());
-    }
-
-    #[test]
-    fn base_direction_follows_the_first_strong_character() {
-        use Direction::*;
-        // Plain cases.
-        assert_eq!(base_direction("hello"), Ltr);
-        assert_eq!(base_direction("سلام دنیا"), Rtl); // Persian
-        assert_eq!(base_direction("שלום עולם"), Rtl); // Hebrew
-        // Neutrals lead — markdown markers, digits, punctuation, whitespace
-        // are all skipped, which is what makes list items and headings work.
-        assert_eq!(base_direction("- سلام"), Rtl);
-        assert_eq!(base_direction("## سلام"), Rtl);
-        assert_eq!(base_direction("> «سلام»"), Rtl);
-        assert_eq!(base_direction("  \t123 — سلام"), Rtl);
-        assert_eq!(base_direction("- hello"), Ltr);
-        // The FIRST strong character decides, not the majority: a line opening
-        // in English stays LTR however much Persian follows (and vice versa).
-        assert_eq!(base_direction("Rust سلام دنیا و بیشتر"), Ltr);
-        assert_eq!(base_direction("سلام Rust and more English"), Rtl);
-        // No strong character anywhere → LTR.
-        assert_eq!(base_direction(""), Ltr);
-        assert_eq!(base_direction("123 — !?"), Ltr);
-        // Other scripts are LTR.
-        assert_eq!(base_direction("日本語"), Ltr);
-        assert_eq!(base_direction("Привет"), Ltr);
-        assert!(Direction::Rtl.is_rtl() && !Direction::Ltr.is_rtl());
     }
 
     #[test]
