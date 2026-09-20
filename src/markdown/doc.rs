@@ -19,7 +19,7 @@ use gpui::SharedString;
 use gpui_component::input::Rope;
 
 use super::ir::{build_ir, IrBlock, IrKind};
-use super::parser::{parse_block_window, parse_block_window_rope, Row, RowKind, RunKind};
+use super::parser::{parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind};
 use super::parser;
 
 /// 统一渲染行（块粒度：Code/Table 等一个块 = 一个 DocRow，跨多行）。
@@ -99,6 +99,64 @@ impl Doc {
     /// 块总数（虚拟化滚动条量程用，O(1)）。
     pub(crate) fn block_count(&self) -> usize {
         self.index.blocks.len()
+    }
+
+    /// 第 `i` 块的轻量元数据（`BlockMeta`，≈20B，O(段数)）——窗口化 shaping 的
+    /// 块高估算/带内判定只依赖它，**不物化行**。
+    pub(crate) fn block_meta(&self, i: usize) -> Option<BlockMeta> {
+        self.index.blocks.get(i)
+    }
+
+    /// 第 `ix` 源行的 `(字符数, 是否全 ASCII)`——窗口化 shaping 的块高估算用：
+    /// 只读字节切片数 chars，不物化 `Row`、不 shape，O(行长)。
+    pub(crate) fn line_chars_ascii(&self, ix: usize) -> (usize, bool) {
+        let s = self.line_starts.get(ix).copied().unwrap_or(0);
+        let e = self
+            .line_starts
+            .get(ix + 1)
+            .copied()
+            .unwrap_or_else(|| self.src_len());
+        match &self.src {
+            DocSrc::Str(str) => {
+                let mut e2 = e;
+                if e2 > s {
+                    let b = str.as_bytes();
+                    if b[e2 - 1] == b'\n' {
+                        e2 -= 1;
+                    }
+                    if e2 > s && b[e2 - 1] == b'\r' {
+                        e2 -= 1;
+                    }
+                }
+                let mut ascii = true;
+                let mut n = 0usize;
+                for c in str[s..e2].chars() {
+                    if c.len_utf8() > 1 {
+                        ascii = false;
+                    }
+                    n += 1;
+                }
+                (n, ascii)
+            }
+            DocSrc::Rope(r) => {
+                let mut ascii = true;
+                let mut n = 0usize;
+                for bi in s..e {
+                    let b = r.get_byte(bi).unwrap_or(0);
+                    if b == b'\n' || b == b'\r' {
+                        if b == b'\n' {
+                            break;
+                        }
+                        continue;
+                    }
+                    if b >= 0x80 {
+                        ascii = false;
+                    }
+                    n += 1;
+                }
+                (n, ascii)
+            }
+        }
     }
 
     /// 按块窗口物化统一行（`[lo_block, hi_block]`，含两端）。

@@ -32,10 +32,18 @@ pub enum WyEvent {
 }
 
 /// 行内样式调色（创建时注入；后续随主题切换重建）。
+///
+/// **关键**：`font_size`/`font` 在创建时由 [`WyEditor::new`] 从
+/// `window.text_style()` **一次性**确定并存进主题——之后 `build_frame` 一律用主题值，
+/// 绝不再次读 `window.text_style()`。因为 measure（栈空=默认 16）与 prepaint
+/// （栈内含 `live-body` 的 `.text_size`）两阶段的 `text_style()` **不同**，若每帧现取
+/// 会在两个字号间交替 = 滚动时「字体一会儿大一会儿小」。
 #[derive(Clone)]
 pub struct WyTheme {
     pub text: Hsla,
     pub mono: Font,
+    pub font: Font,
+    pub font_size: Pixels,
     pub accent: Hsla,
     pub code_bg: Hsla,
 }
@@ -66,10 +74,20 @@ pub struct WyEditor {
     focus: FocusHandle,
     caret: usize,
     theme: WyTheme,
-    /// 本帧行网格（measure→prepaint→paint 复用；每帧覆盖）。
+    /// 本帧行网格（measure→prepaint→paint 复用；**窗口化**：仅带内块被真正 shape，
+    /// 带外块用 `BlockMeta` 估算高度占位，避免大文档整篇每帧 shape 卡死）。
     frame: RefCell<Option<std::rc::Rc<element::Frame>>>,
     /// 本帧元素在窗口中的布局 bounds（paint 写入；鼠标命中时全局坐标 → 元素局部）。
     last_bounds: Cell<Option<gpui::Bounds<Pixels>>>,
+    /// 内容代数：任何文本变更自增；`request_layout` 用它判断帧缓存是否仍有效。
+    content_gen: Cell<u64>,
+    /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
+    /// `viewport_size` 推算并发布，measure 用上一帧的带做窗口化 shape。
+    shape_band: Cell<Option<(f32, f32)>>,
+    /// 块「真实可视行数」缓存（关键：带宽滚动时带外块沿用**已整形过的真值**，
+    /// 而非每次回到估算——否则行高在估算/真实间跳动，滚动时文字忽大忽小）。
+    /// 键 = `(gen, src_line, kind_tag, width_bits)` 的 hash；值 = 可视行数。
+    height_cache: RefCell<std::collections::HashMap<u64, u32>>,
 }
 
 impl WyEditor {
@@ -83,11 +101,16 @@ impl WyEditor {
             theme: WyTheme {
                 text: ts.color,
                 mono: font("monospace"),
+                font: ts.font(),
+                font_size: ts.font_size.to_pixels(window.rem_size()),
                 accent: gpui::rgb(0x3b82f6).into(),
                 code_bg: gpui::hsla(0.62, 0.35, 0.62, 0.18),
             },
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
+            content_gen: Cell::new(0),
+            shape_band: Cell::new(None),
+            height_cache: RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -95,6 +118,17 @@ impl WyEditor {
     #[allow(dead_code)]
     pub fn set_theme(&mut self, theme: WyTheme) {
         self.theme = theme;
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
+    /// 保证 measure/prepaint 两阶段一致。
+    pub fn set_font_size(&mut self, size: Pixels) {
+        if self.theme.font_size == size {
+            return;
+        }
+        self.theme.font_size = size;
+        *self.frame.borrow_mut() = None;
     }
 
     /// 设置初始内容。
@@ -124,6 +158,7 @@ impl WyEditor {
         self.doc = Doc::open(self.content.clone());
         self.caret = self.caret.min(self.content.len());
         *self.frame.borrow_mut() = None;
+        self.content_gen.set(self.content_gen.get().wrapping_add(1));
     }
 
     /// 内部数据（元素读取）。
@@ -149,6 +184,22 @@ impl WyEditor {
     }
     pub(crate) fn last_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
         self.last_bounds.get()
+    }
+
+    pub(crate) fn content_gen(&self) -> u64 {
+        self.content_gen.get()
+    }
+    pub(crate) fn set_shape_band(&self, band: Option<(f32, f32)>) {
+        self.shape_band.set(band);
+    }
+    pub(crate) fn shape_band(&self) -> Option<(f32, f32)> {
+        self.shape_band.get()
+    }
+    pub(crate) fn cached_height_lines(&self, key: u64) -> Option<u32> {
+        self.height_cache.borrow().get(&key).copied()
+    }
+    pub(crate) fn cache_height_lines(&self, key: u64, lines: u32) {
+        self.height_cache.borrow_mut().insert(key, lines);
     }
 
     /* ---------- 光标 ↔ 源辅助 ---------- */
@@ -255,6 +306,7 @@ impl WyEditor {
         self.doc = Doc::open(self.content.clone());
         self.caret = (r.start + text.len()).min(self.content.len());
         *self.frame.borrow_mut() = None;
+        self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);
         cx.notify();
     }

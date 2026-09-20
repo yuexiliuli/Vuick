@@ -1,5 +1,11 @@
 //! 新管线 WYSIWYG 自绘元素：把 [`Doc`] 统一的 `DocRow` 行排版成可编辑视图。
 //! 数据完全来自本项目 `Doc`（`rows_in_block_window` + `byte_map`），零 zorite 依赖。
+//!
+//! **窗口化 shaping**：元素是 auto-grow（宿主滚动），整篇 shape 会在大文档上每帧
+//! 卡死。这里复刻 `live` 的带机制——每帧只真正 shape **可视带**（`prepaint` 由
+//! `bounds.origin.y` + `viewport_size` 推算并发布），带外块用 [`BlockMeta`] 的
+//! `raw_len`/`aux` 估算高度占位（不 shape、不物化行），帧缓存按
+//! `(content_gen, width, band)` 命中后整帧跳过重建。
 
 use std::ops::Range;
 
@@ -9,7 +15,7 @@ use gpui::{
 };
 
 use super::{CaretVis, WyEditor};
-use crate::markdown::parser::RunKind;
+use crate::markdown::parser::{BlockMeta, RowKind, RunKind};
 
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
 pub(crate) struct Frame {
@@ -17,15 +23,19 @@ pub(crate) struct Frame {
     pub line_h: Pixels,
     pub rows: Vec<ShapedRow>,
     pub total: Pixels,
-    pub caret_x: Pixels,
-    pub caret_top: Pixels,
-    pub caret_on: bool,
+    /// 本帧可视带（元素局部 y）；帧缓存键之一。
+    pub band: (f32, f32),
+    /// 本帧 shaping 宽（px）；帧缓存键之一。
+    pub width: Pixels,
+    /// 本帧内容代数；帧缓存键之一。
+    pub rgen: u64,
 }
 
 pub(crate) struct ShapedRow {
     pub src_line: usize,
     pub src_lines: Range<usize>,
     /// 该块的可视行（`shape_text` 结果；一个块 = 一个或多个 `WrappedLine`）。
+    /// 带外块为空（未 shape，paint 跳过）。
     pub wrapped: Vec<gpui::WrappedLine>,
     pub sub_heights: Vec<Pixels>,
     pub byte_map: std::rc::Rc<Vec<usize>>,
@@ -102,84 +112,266 @@ fn runs_to_text_runs(
     out
 }
 
-/// 构建一帧：物化全块窗口行并 shape。
-pub(crate) fn build_frame(editor: &WyEditor, window: &mut Window, width: Pixels) -> Frame {
-    let ts = window.text_style();
-    let font_size = ts.font_size.to_pixels(window.rem_size());
-    let line_h = font_size * 1.5;
+/// `RowKind` → 稳定小整数（高度缓存键组成用，Heading 带级数）。
+fn kind_tag(k: RowKind) -> u8 {
+    match k {
+        RowKind::Paragraph => 0,
+        RowKind::Heading(n) => 1 + n.min(6),
+        RowKind::Code => 8,
+        RowKind::Quote => 9,
+        RowKind::Bullet => 10,
+        RowKind::Rule => 11,
+        RowKind::Table => 12,
+        RowKind::Image => 13,
+        RowKind::Blank => 14,
+    }
+}
+
+/// 文本块的高度缓存键：`(内容代数, 源行, 类型, shaping 宽)`。
+fn height_cache_key(rgen: u64, src_line: u32, kind: RowKind, width_bits: u32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    rgen.hash(&mut h);
+    src_line.hash(&mut h);
+    kind_tag(kind).hash(&mut h);
+    width_bits.hash(&mut h);
+    h.finish()
+}
+
+/// 带外（且从未整形过）文本块的高度估算：用**真实字数**（`Doc::line_chars_ascii`）
+/// 与近似字符宽（ASCII ≈ 0.5 字高、含 CJK ≈ 0.95 字高）估可视行数，尽量贴合真实
+/// shape，使带外/带内高度差 ≈ 0（滚动带边界不再跳「字体大小」）；代码/表格用
+/// `aux`（行数）* 行高；空行/图片/分隔线固定一行。只作兜底——整形过的块走缓存真值。
+fn estimate_height(
+    meta: &BlockMeta,
+    chars: usize,
+    ascii: bool,
+    font_size: Pixels,
+    avail: f32,
+    line_h: Pixels,
+) -> Pixels {
+    match meta.kind {
+        RowKind::Code | RowKind::Table => line_h * meta.aux.max(1) as f32,
+        RowKind::Blank | RowKind::Image | RowKind::Rule => line_h,
+        _ => {
+            let char_w = if ascii {
+                f32::from(font_size) * 0.5
+            } else {
+                f32::from(font_size) * 0.95
+            };
+            let cpl = (avail / char_w.max(1.)).max(1.);
+            let lines = (chars as f32 / cpl).ceil().max(1.);
+            line_h * lines
+        }
+    }
+}
+
+/// 把一个物化的 `DocRow` 真正 shape 成可视行（仅带内块走这里）。
+fn shape_docrow(
+    r: crate::markdown::doc::DocRow,
+    window: &mut Window,
+    width: Pixels,
+    font_size: Pixels,
+    line_h: Pixels,
+    theme: &super::WyTheme,
+    base_font: &gpui::Font,
+) -> ShapedRow {
+    let runs = runs_to_text_runs(
+        r.text.as_ref(),
+        &r.runs,
+        base_font,
+        theme.text,
+        &theme.mono,
+        theme.accent,
+        theme.code_bg,
+    );
+    let wrapped = window
+        .text_system()
+        .shape_text(r.text.clone(), font_size, &runs, Some(width), None)
+        .map(|ls| ls.into_vec())
+        .unwrap_or_default();
+    let mut height = px(0.);
+    let mut sub_heights = Vec::with_capacity(wrapped.len());
+    for wl in &wrapped {
+        let sh = line_h * (wl.wrap_boundaries().len() + 1) as f32;
+        height += sh;
+        sub_heights.push(sh);
+    }
+    if height == px(0.) {
+        height = line_h;
+        sub_heights.push(line_h);
+    }
+    let editable = !r.byte_map.is_empty();
+    ShapedRow {
+        src_line: r.src_line,
+        src_lines: r.lines.clone(),
+        wrapped,
+        sub_heights,
+        byte_map: std::rc::Rc::new(r.byte_map),
+        editable,
+        height,
+        top: px(0.),
+    }
+}
+
+/// 构建一帧：**窗口化**——仅 `band`（元素局部 y）内的块被物化 + shape，
+/// 带外块用 [`estimate_height`] 占位（空 `wrapped`、空 `byte_map`），块高循环
+/// 仍覆盖全篇以得到正确 total（滚动条量程）与行序。
+pub(crate) fn build_frame(
+    editor: &WyEditor,
+    window: &mut Window,
+    width: Pixels,
+    band: (f32, f32),
+) -> Frame {
+    // 字形/字号一律取**主题**（创建时定格），不读 `window.text_style()`——measure 与
+    // prepaint 两阶段该值不同（栈内带/不带 `live-body.text_size`），每帧现取会在两种
+    // 字号间交替，滚动时文字忽大忽小。
     let theme = &editor.theme;
-    let base_font = ts.font();
+    let font_size = theme.font_size;
+    let line_h = font_size * 1.5;
+    let base_font = theme.font.clone();
     let doc = editor.doc();
     let n = doc.block_count();
-    let rows_in = if n == 0 {
-        Vec::new()
-    } else {
-        doc.rows_in_block_window(0, n.saturating_sub(1))
-    };
-    let mut rows: Vec<ShapedRow> = Vec::with_capacity(rows_in.len());
-    let mut top = px(0.);
-    for r in rows_in {
-        let runs = runs_to_text_runs(
-            r.text.as_ref(),
-            &r.runs,
-            &base_font,
-            theme.text,
-            &theme.mono,
-            theme.accent,
-            theme.code_bg,
-        );
-        let wrapped = window
-            .text_system()
-            .shape_text(r.text.clone(), font_size, &runs, Some(width), None)
-            .map(|ls| ls.into_vec())
-            .unwrap_or_default();
-        let mut height = px(0.);
-        let mut sub_heights = Vec::with_capacity(wrapped.len());
-        for wl in &wrapped {
-            let sh = line_h * (wl.wrap_boundaries().len() + 1) as f32;
-            height += sh;
-            sub_heights.push(sh);
-        }
-        if height == px(0.) {
-            height = line_h;
-            sub_heights.push(line_h);
-        }
-        let editable = !r.byte_map.is_empty();
-        rows.push(ShapedRow {
-            src_line: r.src_line,
-            src_lines: r.lines.clone(),
-            wrapped,
-            sub_heights,
-            byte_map: std::rc::Rc::new(r.byte_map),
-            editable,
-            height,
-            top,
-        });
-        top += height;
+    let padding = px(12.);
+    let rgen = editor.content_gen();
+
+    if n == 0 {
+        return Frame {
+            padding,
+            line_h,
+            rows: vec![ShapedRow {
+                src_line: 0,
+                src_lines: 0..1,
+                wrapped: Vec::new(),
+                sub_heights: vec![line_h],
+                byte_map: std::rc::Rc::new(Vec::new()),
+                editable: false,
+                height: line_h,
+                top: px(0.),
+            }],
+            total: line_h,
+            band,
+            width,
+            rgen,
+        };
     }
-    if rows.is_empty() {
-        rows.push(ShapedRow {
+
+    let (band_lo, band_hi) = band;
+    let avail = (f32::from(width) - f32::from(padding) * 2.).max(1.);
+    let width_bits = f32::from(width).to_bits();
+
+    // Pass 1：决定每块高度（文本块：缓存真值优先，无则用真实字数估算）+ 是否入带。
+    #[derive(Clone, Copy)]
+    struct Plan {
+        shaped: bool,
+        h: Pixels,
+        cache_key: Option<u64>,
+    }
+    let mut plan: Vec<Plan> = Vec::with_capacity(n);
+    let mut y: f32 = 0.;
+    for i in 0..n {
+        let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
             src_line: 0,
-            src_lines: 0..1,
-            wrapped: Vec::new(),
-            sub_heights: vec![line_h],
-            byte_map: std::rc::Rc::new(Vec::new()),
-            editable: false,
-            height: line_h,
-            top,
+            byte: 0,
+            kind: RowKind::Blank,
+            raw_len: 0,
+            aux: 1,
         });
-        top += line_h;
+        let cache_key = match meta.kind {
+            RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
+                Some(height_cache_key(rgen, meta.src_line, meta.kind, width_bits))
+            }
+            _ => None,
+        };
+        let h = match cache_key.and_then(|k| editor.cached_height_lines(k)) {
+            Some(lines) => line_h * lines as f32,
+            None => {
+                let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
+                estimate_height(&meta, chars, ascii, font_size, avail, line_h)
+            }
+        };
+        let bottom = y + f32::from(h);
+        plan.push(Plan {
+            shaped: bottom > band_lo && y < band_hi,
+            h,
+            cache_key,
+        });
+        y = bottom;
     }
-    let (caret_on, caret_x, caret_top) = caret_geometry(editor, &rows, line_h);
-    Frame {
-        padding: px(12.),
-        line_h,
-        rows,
-        total: top,
-        caret_x,
-        caret_top,
-        caret_on,
+
+    // Pass 2：相邻带内块合并成窗口调用物化 + shape，并把真实可视行数写回缓存。
+    let mut shaped: Vec<Option<ShapedRow>> =
+        std::iter::repeat_with(|| None).take(n).collect();
+    let mut i = 0;
+    while i < n {
+        if !plan[i].shaped {
+            i += 1;
+            continue;
+        }
+        let lo = i;
+        while i < n && plan[i].shaped {
+            i += 1;
+        }
+        let hi = i;
+        let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
+        for (j, r) in docrows.into_iter().enumerate() {
+            let srow = shape_docrow(r, window, width, font_size, line_h, theme, &base_font);
+            // 缓存该块真实可视行数（带外再遇此块时沿用真值 → 不跳）。
+            let visual = srow
+                .wrapped
+                .iter()
+                .map(|wl| wl.wrap_boundaries().len() + 1)
+                .sum::<usize>()
+                .max(1) as u32;
+            if let Some(k) = plan[lo + j].cache_key {
+                editor.cache_height_lines(k, visual);
+            }
+            shaped[lo + j] = Some(srow);
+        }
     }
+
+    // Pass 3：按块序组装（真实 top 累加），带外块填占位。
+    let empty_bm: std::rc::Rc<Vec<usize>> = std::rc::Rc::new(Vec::new());
+    let mut rows: Vec<ShapedRow> = Vec::with_capacity(n);
+    let mut total = px(0.);
+    for i in 0..n {
+        let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
+            src_line: 0,
+            byte: 0,
+            kind: RowKind::Blank,
+            raw_len: 0,
+            aux: 1,
+        });
+        let sr = match shaped[i].take() {
+            Some(mut sr) => {
+                sr.top = total;
+                total += sr.height;
+                rows.push(sr);
+                continue;
+            }
+            None => {
+                let span = match meta.kind {
+                    RowKind::Code | RowKind::Table => meta.aux.max(1) as usize,
+                    _ => 1,
+                };
+                let src_line = meta.src_line as usize;
+                let h = plan[i].h;
+                ShapedRow {
+                    src_line,
+                    src_lines: src_line..src_line + span,
+                    wrapped: Vec::new(),
+                    sub_heights: vec![h],
+                    byte_map: empty_bm.clone(),
+                    editable: false,
+                    height: h,
+                    top: total,
+                }
+            }
+        };
+        total += sr.height;
+        rows.push(sr);
+    }
+    Frame { padding, line_h, rows, total, band, width, rgen }
 }
 
 /// 源列 → 渲染列（左界：首个 `byte_map[v] >= target`；与 `display_to_source` 互逆，
@@ -314,13 +506,28 @@ impl Element for WyEditorElement {
             } else {
                 px(800.)
             };
-            let frame = build_frame(e, window, width);
-            let total = frame.total;
-            drop(e);
-            let frame = std::rc::Rc::new(frame);
-            editor.update(cx, |e, _| {
-                *e.frame.borrow_mut() = Some(frame);
-            });
+            // 帧缓存：内容/宽度/可视带都没变 → 直接复用总高，不再整篇重建
+            // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
+            let rgen = e.content_gen();
+            let band = e.shape_band().unwrap_or((0., 6500.));
+            let cached_total = e
+                .frame
+                .borrow()
+                .as_ref()
+                .filter(|f| f.rgen == rgen && f.width == width && f.band == band)
+                .map(|f| f.total);
+            let total = match cached_total {
+                Some(t) => t,
+                None => {
+                    let frame = build_frame(e, window, width, band);
+                    let total = frame.total;
+                    drop(e);
+                    editor.update(cx, |er, _| {
+                        *er.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+                    });
+                    total
+                }
+            };
             size(width.max(px(1.)), total)
         });
         (id, ())
@@ -330,19 +537,51 @@ impl Element for WyEditorElement {
         &mut self,
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut (),
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut App,
     ) {
+        // 可视带（窗口坐标 → 元素局部 y）：元素在滚动容器内的原点即滚动偏移；
+        // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。
+        let vh = f32::from(window.viewport_size().height).max(1.);
+        let top = (-f32::from(bounds.origin.y)).max(0.);
+        let q = 512.;
+        let band = (
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        );
+        self.editor.update(cx, |e, _| e.set_shape_band(Some(band)));
+
+        // 带移动 / 内容 / 宽度变化 → 按新带重建窗口化帧（大文档滚动只补新入带的
+        // shape，其余带外块估算占位，O(n) 只有廉价算术）。
+        let rgen = self.editor.read(cx).content_gen();
+        let width = {
+            let f = self.editor.read(cx).frame.borrow();
+            f.as_ref().map(|f| f.width).unwrap_or(px(800.))
+        };
+        let stale = {
+            let f = self.editor.read(cx).frame.borrow();
+            f.as_ref().map_or(true, |f| f.rgen != rgen || f.width != width || f.band != band)
+        };
+        if stale {
+            let frame = build_frame(&*self.editor.read(cx), window, width, band);
+            self.editor.update(cx, |e, _| {
+                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+            });
+        }
+
+        // 光标可视位置（元素局部）→ IME bounds。
         let frame = {
             let e = self.editor.read(cx);
             e.frame.borrow().as_ref().map(std::rc::Rc::clone)
         };
         if let Some(f) = frame.as_ref() {
+            let editor = self.editor.read(cx);
+            let (on, x, ctop) = caret_geometry(&*editor, &f.rows, f.line_h);
             super::set_caret_vis(CaretVis {
-                x: f.caret_x,
-                top: f.caret_top,
+                x,
+                top: if on { ctop } else { px(0.) },
                 line_height: f.line_h,
             });
         }
@@ -375,6 +614,10 @@ impl Element for WyEditorElement {
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
         let origin = bounds.origin;
         for row in &f.rows {
+            // 带外（未 shape）行不可见：跳过文本与背景，避免为整篇占位块画屏。
+            if row.wrapped.is_empty() {
+                continue;
+            }
             let mut sub_top = row.top;
             for wl in &row.wrapped {
                 let o = point(origin.x + f.padding, origin.y + sub_top);
@@ -392,10 +635,15 @@ impl Element for WyEditorElement {
                 sub_top += f.line_h * (wl.wrap_boundaries().len() + 1) as f32;
             }
         }
-        if f.caret_on && focus.is_focused(window) {
+        // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
+        let (caret_on, caret_x, caret_top) = {
+            let e = self.editor.read(cx);
+            caret_geometry(&*e, &f.rows, f.line_h)
+        };
+        if caret_on && focus.is_focused(window) {
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
-                    point(origin.x + f.caret_x, origin.y + f.caret_top),
+                    point(origin.x + caret_x, origin.y + caret_top),
                     size(px(2.), f.line_h),
                 ),
                 corner_radii: gpui::Corners::default(),
@@ -477,7 +725,7 @@ mod tests {
         let vcx: &mut VisualTestContext = vcx;
         let (_, o2) = vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.));
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             assert_eq!(frame.rows.len(), 1, "单段文档应只有一行（块）");
             let w0 = frame.rows[0]
                 .wrapped
@@ -508,7 +756,7 @@ mod tests {
         vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _| e.set_caret(o2));
-            let frame = build_frame(ed.read(cx), window, px(300.));
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame.rows, frame.line_h);
             let line_h = f32::from(frame.line_h);
             let top = f32::from(frame.rows[0].top);
@@ -518,6 +766,100 @@ mod tests {
                 (top2 - (top + line_h)).abs() < 0.5,
                 "光标竖条应画在第二可视行：块首 top={top}，得到 {top2}"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn large_doc_windowed_shaping_shapes_only_band(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+        // 首个超长折行段 + 大量单行段（≈2 万块）：**窄带只 shape 带内块**，
+        // 其余用 BlockMeta 估算占位——大文档再也不会整篇每帧 shape。
+        let head = "一二三四五六七八九十 ".repeat(300); // 长中文行，必然折行
+        let body = "paragraph line of text 0123456789".to_string();
+        let mut text = head;
+        for _ in 0..20_000 {
+            text.push('\n');
+            text.push_str(&body);
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 只覆盖顶部 ~80px 的窄带 → 真正 shape 的块应极少。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 80.));
+            let n = frame.rows.len();
+            assert!(n > 10_000, "应有大量块：{n}");
+            let shaped = frame.rows.iter().filter(|r| !r.wrapped.is_empty()).count();
+            assert!(
+                shaped > 0 && shaped < 20,
+                "窄带只应 shape 极少量块，实际 {shaped}/{n}"
+            );
+            assert!(
+                f32::from(frame.total) > 100_000.,
+                "总高应由估算铺满（>.1M px），实际 {:.0}",
+                f32::from(frame.total)
+            );
+            assert!(
+                frame.rows.iter().any(|r| r.wrapped.is_empty()),
+                "带外块应保持未 shape（占位）"
+            );
+        });
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 全篇带 → 全部 shape（与旧行为一致，小文档回归护栏）。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            assert_eq!(
+                frame.rows.iter().filter(|r| r.wrapped.is_empty()).count(),
+                0,
+                "全带应全部 shape"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+        // 短行 + 必折行的长段：先全带 shape（记录真实高），再窄带（长段被挤到带外）
+        // ——带外高度必须复用缓存真值，而不是跳回估算（滚动“字体大小抖动”的根因）。
+        let text = format!(
+            "short line\n{}\n{}",
+            "the quick brown fox jumps over the lazy dog ".repeat(40),
+            "tail\n"
+        );
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (h_real, top_real) = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let rows: Vec<_> = frame
+                .rows
+                .iter()
+                .map(|r| (r.height, r.top))
+                .collect();
+            assert!(rows.len() >= 3 && rows[1].0 > px(24.) * 3., "长段应多行：{:?}", rows[1]);
+            (rows[1].0, rows[1].1)
+        });
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 窄带 (0,1)：第一条短行（24px）之后即带外。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
+            assert!(frame.rows[1].wrapped.is_empty(), "长段应已带外（未 shape）");
+            assert_eq!(
+                frame.rows[1].height, h_real,
+                "带外长段高度应沿用缓存真值（不跳回估算）"
+            );
+            assert_eq!(frame.rows[1].top, top_real, "带外长段 top 也应一致");
+            // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            assert_eq!(frame.rows[1].height, h_real);
         });
     }
 }

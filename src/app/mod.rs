@@ -1207,6 +1207,9 @@ impl EditorApp {
             let text = self.tabs[idx].editor.read(cx).text_string();
             let text_seed = text.clone();
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text_seed.as_str()));
+            // 同步全局字号（新建即套用；WY 字号由编辑器自持，measure/prepaint 一致）
+            let fs = self.font_size;
+            ed.update(cx, |ed, _| ed.set_font_size(gpui::px(fs)));
             let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
                 if ev == &WyEvent::Changed {
                     if let Some(tab) = this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
