@@ -40,7 +40,7 @@ use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
 
 // 实时预览编辑（WYSIWYG）——本项目 `crate::markdown::live`（zorite 移植并入）。
-use crate::markdown::{EditorEvent, MarkdownLivePreview, SyntaxStyle};
+use crate::markdown::{EditorEvent, MarkdownLivePreview, SyntaxStyle, WyEditor, WyEvent};
 
 use crate::actions::*;
 use crate::config::layout::{
@@ -86,6 +86,9 @@ struct EditorTab {
     live_edit: bool,
     /// 实时预览编辑器实体（None = 未启用；auto-grow，宿主滚动）。
     live: Option<gpui::Entity<MarkdownLivePreview>>,
+    /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源，
+    /// 目标逐步替换 `live`）。None = 未启用。与 `live` 二选一，共用 `live_edit` 布局。
+    live2: Option<gpui::Entity<WyEditor>>,
     /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
     /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
     /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
@@ -102,6 +105,8 @@ struct EditorTab {
     /// 实时编辑的变更订阅（`EditorEvent::Changed` → 写回内容镜像/编辑区；
     /// 随 `live` 一起创建与销毁）。
     _live_sub: Option<Subscription>,
+    /// `live2`（WyEditor）的变更订阅，同上。
+    _live2_sub: Option<Subscription>,
 }
 
 /// 一个从窗口中「拔出」的选项卡快照：编辑器 / 预览等实体句柄共享（GPUI 实体
@@ -378,6 +383,10 @@ impl EditorApp {
             return self.focus_handle.clone();
         };
         if tab.live_edit {
+            if let Some(l2) = &tab.live2 {
+                let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
+                return h;
+            }
             if let Some(live) = &tab.live {
                 let h = gpui::Focusable::focus_handle(live.read(cx), cx);
                 return h;
@@ -641,6 +650,8 @@ impl EditorApp {
             live_edit: false,
             live: None,
             _live_sub: None,
+            live2: None,
+            _live2_sub: None,
             preview_prev: payload.preview_prev,
             edit_version: payload.edit_version,
             preview_dirty: payload.preview_dirty,
@@ -1151,12 +1162,19 @@ impl EditorApp {
     }
 
     /// 退出实时编辑：把实时 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
+    /// 兼容 `live`（zorite）与 `live2`（本项目 WyEditor）两种模式。
     fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
-        let Some(live) = tab.live.take() else { return };
-        tab._live_sub = None;
         tab.live_edit = false;
-        let text = live.read(cx).text();
+        tab._live_sub = None;
+        tab._live2_sub = None;
+        let text = if let Some(l2) = tab.live2.take() {
+            l2.read(cx).text().to_string()
+        } else if let Some(live) = tab.live.take() {
+            live.read(cx).text().to_string()
+        } else {
+            return;
+        };
         tab.content = SharedString::from(text);
         let content = tab.content.clone();
         let n_lines = content.as_ref().lines().count().max(1);
@@ -1165,8 +1183,55 @@ impl EditorApp {
         tab.char_count = n_chars;
         tab.editor.update(cx, |ed, _| ed.set_text(&content));
         tab.md_preview.update(cx, |v, cx| v.set_source(&content, cx));
-        self.status = SharedString::from("实时预览编辑：关（内容已写回编辑区）");
+        self.status = SharedString::from("实时预览编辑/预览编辑测试：关（内容已写回编辑区）");
         self.status_ok = true;
+    }
+
+    /// 「预览编辑测试」开关：用本项目 `markdown::wysiwyg::WyEditor` 渲染左面板。
+    /// 与 zorite `live` 二选一（开启本模式先退出 `live`）。
+    fn toggle_live_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let idx = self.active_tab;
+        if !self.is_markdown_tab(idx) {
+            self.status = SharedString::from("预览编辑测试仅支持 Markdown 文件");
+            self.status_ok = false;
+            cx.notify();
+            return;
+        }
+        if self.tabs[idx].live2.is_some() {
+            self.commit_live(idx, cx);
+        } else {
+            // 先退出 zorite live（两者共用布局位）。
+            if self.tabs[idx].live.is_some() {
+                self.commit_live(idx, cx);
+            }
+            let text = self.tabs[idx].editor.read(cx).text_string();
+            let text_seed = text.clone();
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text_seed.as_str()));
+            let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
+                if ev == &WyEvent::Changed {
+                    if let Some(tab) = this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
+                    {
+                        let value = emitter.update(cx, |e, _| e.text().to_string());
+                        tab.content = SharedString::from(value.clone());
+                        tab.line_count = value.lines().count().max(1);
+                        tab.char_count = value.chars().count();
+                        tab.dirty = true;
+                        tab.editor.update(cx, |ed, _| ed.set_text(&value));
+                    }
+                }
+            });
+            let tab = &mut self.tabs[idx];
+            tab.live = None;
+            tab._live_sub = None;
+            tab.live2 = Some(ed.clone());
+            tab._live2_sub = Some(ed_sub);
+            tab.live_edit = true;
+            self.status = SharedString::from("预览编辑测试：开（本项目 Doc 管线 WYSIWYG，初步实现）");
+            self.status_ok = true;
+            let focus = gpui::Focusable::focus_handle(ed.read(cx), cx);
+            window.focus(&focus, cx);
+        }
+        cx.notify();
     }
 
     /// 当前选项卡是否处于实时预览编辑模式（其它模块/渲染分流用）。

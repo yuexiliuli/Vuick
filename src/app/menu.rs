@@ -134,6 +134,7 @@ impl EditorApp {
             },
         ))
         .item(Self::live_edit_menu_item(weak.clone()))
+        .item(Self::live_test_menu_item(weak.clone()))
         .separator()
         .item(Self::menu_action_item(
             "增大字号",
@@ -209,6 +210,35 @@ impl EditorApp {
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_live_edit(window, cx));
+        })
+    }
+
+    /// "查看"菜单：「预览编辑测试」——本项目 `markdown::wysiwyg::WyEditor`
+    /// （以 `Doc` 为数据源的 WYSIWYG 初步实现，目标逐步替换 zorite `live`）。
+    fn live_test_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| {
+                    let i = e.read(cx).active_tab;
+                    e.read(cx).tabs.get(i).map(|t| t.live2.is_some()).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(if on {
+                    "◉ 预览编辑测试"
+                } else {
+                    "○ 预览编辑测试"
+                })
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_live_test(window, cx));
         })
     }
 

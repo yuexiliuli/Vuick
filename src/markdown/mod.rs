@@ -17,6 +17,7 @@ mod cells;
 mod doc;
 mod image;
 mod ir;
+pub(crate) mod wysiwyg;
 
 #[cfg(test)]
 mod parity;
@@ -24,3 +25,4 @@ mod parity;
 pub use live::{bind_keys, EditorEvent, MarkdownLivePreview, SyntaxStyle};
 pub use parser::{scan_blocks, scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};
 pub use view::{MarkdownPreview, PreviewSrc};
+pub use wysiwyg::{WyEditor, WyEvent};

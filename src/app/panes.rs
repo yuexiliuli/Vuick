@@ -57,10 +57,15 @@ impl EditorApp {
                         .child("正在载入编辑区…（预览已就绪）"),
                 );
         }
-        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `MarkdownLivePreview`。
-        // 该编辑器 AUTO-GROW（内部无滚动条），宿主负责滚动；点击/光标/IME 坐标
-        // 随元素自动跟随（不再有旧 live.rs 的内部滚动容器 + 滚动补偿）。
-        if let Some(live) = self.tabs[self.active_tab].live.clone() {
+        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `MarkdownLivePreview`，
+        // 或「预览编辑测试」的本项目 `WyEditor`（live2 优先）。
+        // 两者都是 AUTO-GROW（内部无滚动条），宿主负责滚动。
+        let live_any: Option<gpui::AnyElement> = self.tabs[self.active_tab]
+            .live2
+            .clone()
+            .map(|e| e.into_any_element())
+            .or_else(|| self.tabs[self.active_tab].live.clone().map(|e| e.into_any_element()));
+        if let Some(live_any) = live_any {
             let text_color = self.text_primary();
             let fs = self.font_size;
             return div()
@@ -89,7 +94,7 @@ impl EditorApp {
                                 .py(px(8.))
                                 .text_size(px(fs))
                                 .text_color(text_color)
-                                .child(live),
+                                .child(live_any),
                         ),
                 )
                 .child(Self::zoom_overlay(cx));
