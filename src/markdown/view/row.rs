@@ -26,36 +26,14 @@ use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns}
 
 use super::{NoteCtx, NoteHit, TextCtx, TextHit};
 
-/// 行内代码（反引号 `` ` `` 包裹）主题感知配色：白/黑主题各一套。
-/// 取值对齐参考截图（白主题.png / 黑主题.png）的像素：白=底 #f3f4f4 + 文字 #222222，
-/// 黑=底 #3e3f40 + 文字 #dadada；文字与正文同色，靠底色 + 等宽字体区分。
-struct InlineCodeColors {
-    fg: Hsla,
-    bg: Hsla,
-}
-
-/// 按主题取行内代码配色（浅色/暗色定制）。
-fn inline_code_colors(cx: &App) -> InlineCodeColors {
-    let dark = gpui_component::Theme::global(cx).is_dark();
-    if dark {
-        InlineCodeColors {
-            fg: gpui::rgb(0xdadada).into(),
-            bg: gpui::rgb(0x3e3f40).into(),
-        }
-    } else {
-        InlineCodeColors {
-            fg: gpui::rgb(0x222222).into(),
-            bg: gpui::rgb(0xf3f4f4).into(),
-        }
-    }
-}
-
 /// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 主题配色文字；圆角底色由
 /// [`TextTrack::paint_code_ranges`] 在 paint 阶段按代码段的像素几何自绘（方角
 /// highlight 背景无法圆角，且 gpui 文本 run 背景只有平面矩形）。
-fn inline_code_highlight(colors: &InlineCodeColors) -> HighlightStyle {
+/// 配色单一源 = [`StyleParams::code_inline_fg`] / [`StyleParams::code_inline_bg`]
+/// （不再在本文件写死色值），预览与 WYSIWYG 两区取同一来源。
+fn inline_code_highlight(p: &StyleParams) -> HighlightStyle {
     HighlightStyle {
-        color: Some(colors.fg),
+        color: Some(p.code_inline_fg),
         ..Default::default()
     }
 }
@@ -63,7 +41,8 @@ fn inline_code_highlight(colors: &InlineCodeColors) -> HighlightStyle {
 /// 把背景区间向左右扩展吞掉紧邻空白：留给圆角背景的左右视觉间距。
 /// （高亮区间即"代码文本 + 两侧各一个空格"，等宽 overrides 只覆盖代码本体，
 /// 空格保持正文字宽 → 圆角灰底略宽于字形，左右有呼吸空间。）
-fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
+/// 预览与 WYSIWYG 的行内代码 pill 共用同一扩展规则（单一行为源）。
+pub(crate) fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
     let mut start = range.start;
     let mut end = range.end;
     if start > 0 {
@@ -273,7 +252,6 @@ fn text_child(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
     p: &StyleParams,
-    colors: &InlineCodeColors,
     search: Option<(Range<usize>, Hsla)>,
     selection: Option<(Range<usize>, Hsla)>,
     base: &TextStyle,
@@ -290,8 +268,8 @@ fn text_child(
     for (range, kind) in runs {
         match kind {
             RunKind::InlineCode => {
-                // 等宽字体 overrides 只覆盖代码本体；文字色用主题配色（背景圆角自绘）。
-                highlights.push((range.clone(), inline_code_highlight(colors)));
+                // 等宽字体 overrides 只覆盖代码本体；文字色/背景单一源 StyleParams（背景圆角自绘）。
+                highlights.push((range.clone(), inline_code_highlight(p)));
                 mono.push((range.clone(), p.mono.clone()));
             }
             RunKind::Bold => highlights.push((
@@ -389,7 +367,7 @@ fn text_child(
         st,
         code_bg,
         code_radius: px(5.),
-        code_bg_color: colors.bg,
+        code_bg_color: p.code_inline_bg,
         text: text.clone(),
         row_ix,
         notes: notes.to_vec(),
@@ -656,8 +634,6 @@ pub(crate) fn render_row(
     row_ix: usize,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    // 每行渲染时取一次行内代码配色快照（浅色/暗色各一套，决定文字色与 pill 底/描边）。
-    let inline_colors = inline_code_colors(cx);
     // 当前主题明/暗（代码块语法着色色板随主题）。
     let dark = gpui_component::Theme::global(cx).is_dark();
     // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。
@@ -879,7 +855,6 @@ pub(crate) fn render_row(
                     &row.text,
                     &row.runs,
                     &p,
-                    &inline_colors,
                     search,
                     selection,
                     &TextStyle {
@@ -920,7 +895,6 @@ pub(crate) fn render_row(
                     &row.text,
                     &row.runs,
                     &p,
-                    &inline_colors,
                     search,
                     selection,
                     &TextStyle {
@@ -965,7 +939,6 @@ pub(crate) fn render_row(
                     &row.text,
                     &row.runs,
                     &p,
-                    &inline_colors,
                     search,
                     selection,
                     &TextStyle {
@@ -1032,7 +1005,6 @@ pub(crate) fn render_row(
                     &display,
                     &runs,
                     &p,
-                    &inline_colors,
                     shift_search(&search, shift),
                     selection2,
                     &TextStyle {
@@ -1103,7 +1075,6 @@ pub(crate) fn render_row(
                 &row.text,
                 &row.runs,
                 &p,
-                &inline_colors,
                 search,
                 selection,
                 &TextStyle {
@@ -1139,7 +1110,6 @@ pub(crate) fn render_row(
                 &row.text,
                 &row.runs,
                 &p,
-                &inline_colors,
                 search,
                 selection,
                 &TextStyle {
@@ -1169,8 +1139,10 @@ pub(crate) fn render_row(
                         .w_full()
                         .pl_3()
                         .pr_3()
-                        .border_l_2()
-                        .border_color(p.accent)
+                        // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
+                        // 与换行分支 / WYSIWYG 完全一致（旧实现此处误用 accent2px）。
+                        .border_l(px(QUOTE_BAR_WIDTH_PX))
+                        .border_color(gpui::rgb(QUOTE_BAR_COLOR))
                         .bg(p.quote_bg)
                         .flex()
                         .items_center()
@@ -1206,7 +1178,6 @@ pub(crate) fn render_row(
                 &display,
                 &runs,
                 &p,
-                &inline_colors,
                 shift_search(&search, shift),
                 selection2,
                 &TextStyle {
@@ -1249,7 +1220,6 @@ pub(crate) fn render_row(
                     &row.text,
                     &row.runs,
                     &p,
-                    &inline_colors,
                     search,
                     selection,
                     &TextStyle {

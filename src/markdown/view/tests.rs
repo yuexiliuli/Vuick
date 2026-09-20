@@ -1539,6 +1539,29 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
     });
 }
 
+/// 行内代码（反引号）pill 配色单一源：白 #F3F4F4/#222222、黑 #3E3F40/#DADADA——
+/// 预览与 WYSIWYG 都取 [`StyleParams::code_inline_bg`/`code_inline_fg`]（WYSIWYG 侧
+/// 在 `theme_mirrors_style_params_single_source` 验证抄自同源）。
+#[gpui::test]
+fn inline_code_palette_single_source(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+    let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
+    assert_eq!(light.code_inline_fg, gpui::rgb(0x222222).into(), "白主题行内代码文字");
+    assert_eq!(light.code_inline_bg, gpui::rgb(0xf3f4f4).into(), "白主题行内代码底");
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    });
+    let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
+    assert_eq!(dark.code_inline_fg, gpui::rgb(0xdadada).into(), "黑主题行内代码文字");
+    assert_eq!(dark.code_inline_bg, gpui::rgb(0x3e3f40).into(), "黑主题行内代码底");
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+}
+
 /// 源码行 → 渲染行映射（EPUB 搜索跳转）：标题/空行/段落各占一渲染行，
 /// 代码围栏折叠成单个渲染行覆盖多源码行，命中的源码行应定位到对应渲染行。
 #[gpui::test]

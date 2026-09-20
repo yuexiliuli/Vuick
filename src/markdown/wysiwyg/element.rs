@@ -114,6 +114,9 @@ pub(crate) struct ShapedRow {
     /// （代码行以 `\n` 连接）中的**起始渲染字节偏移**；长度 = 源码行数。
     /// 空 = 普通单源码行文本块（段落等折行仍只映射一行，用 `byte_map` 全宽映射）。
     pub multi_offsets: Vec<usize>,
+    /// （仅文本行；已按 [`crate::markdown::view::expand_bg_over_whitespace`] 扩展空白）行内代码
+    /// （反引号）在渲染文本中的字节区间——paint 前自绘圆角 pill 底。空 = 无行内代码。
+    pub code_ranges: Vec<Range<usize>>,
     /// 该行实际行高（正文=para_line、标题=heading_line、代码=code_line 等）。
     pub lh: Pixels,
     /// 文本在内容区内的**额外左缩进**（padding 之外；引述=边条+内衬）。编辑可点行
@@ -132,6 +135,9 @@ pub(crate) struct ShapedRow {
 }
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
+/// 行内代码：等宽字体 + `code_inline_fg` 文字色（**无 run 背景**——圆角 pill 由
+/// [`paint_text_row`] 在 paint 阶段按像素几何自绘，与预览 [`TextTrack::paint_code_ranges`]
+/// 同式；`code_inline_*` 单一源 [`super::WyTheme`] ← [`StyleParams`]）。
 fn runs_to_text_runs(
     text: &str,
     runs: &[(Range<usize>, RunKind)],
@@ -139,7 +145,7 @@ fn runs_to_text_runs(
     color: gpui::Hsla,
     mono: &gpui::Font,
     accent: gpui::Hsla,
-    code_bg: gpui::Hsla,
+    code_inline_fg: gpui::Hsla,
 ) -> Vec<gpui::TextRun> {
     use gpui::{StrikethroughStyle, TextRun, UnderlineStyle};
     let len = text.len();
@@ -167,8 +173,7 @@ fn runs_to_text_runs(
             RunKind::Italic => tr.font.style = gpui::FontStyle::Italic,
             RunKind::InlineCode => {
                 tr.font = mono.clone();
-                tr.background_color = Some(code_bg);
-                tr.color = accent;
+                tr.color = code_inline_fg;
             }
             RunKind::Strikethrough => {
                 tr.strikethrough = Some(StrikethroughStyle {
@@ -336,8 +341,15 @@ fn shape_text_row(
         st.color,
         &theme.mono,
         theme.accent,
-        theme.code_bg,
+        theme.code_inline_fg,
     );
+    // 行内代码（反引号）区间（已扩展空白）→ paint 自绘圆角 pill（与预览同式）。
+    let code_ranges: Vec<Range<usize>> = r
+        .runs
+        .iter()
+        .filter(|(_, k)| *k == RunKind::InlineCode)
+        .map(|(rg, _)| crate::markdown::view::expand_bg_over_whitespace(r.text.as_ref(), rg))
+        .collect();
     let wrapped = window
         .text_system()
         .shape_text(r.text.clone(), st.fs, &runs, Some(width), None)
@@ -365,6 +377,7 @@ fn shape_text_row(
         byte_map: std::rc::Rc::new(r.byte_map),
         editable,
         multi_offsets: Vec::new(),
+        code_ranges,
         lh: st.lh,
         x_off,
         height,
@@ -473,6 +486,7 @@ fn shape_code_row(
         byte_map: std::rc::Rc::new(r.byte_map),
         editable,
         multi_offsets,
+        code_ranges: Vec::new(),
         lh,
         x_off: px(12.),
         height,
@@ -599,6 +613,7 @@ fn shape_table_row(
         byte_map: std::rc::Rc::new(Vec::new()),
         editable,
         multi_offsets: Vec::new(),
+        code_ranges: Vec::new(),
         lh: row_h,
         x_off: px(0.),
         height,
@@ -646,6 +661,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
         multi_offsets: Vec::new(),
+        code_ranges: Vec::new(),
         lh: px(h),
         x_off: px(0.),
         height: px(h),
@@ -707,6 +723,7 @@ pub(crate) fn build_frame(
                 byte_map: std::rc::Rc::new(Vec::new()),
                 editable: false,
                 multi_offsets: Vec::new(),
+                code_ranges: Vec::new(),
                 lh: line_h,
                 x_off: px(0.),
                 height: line_h,
@@ -838,6 +855,7 @@ pub(crate) fn build_frame(
                     byte_map: empty_bm.clone(),
                     editable: false,
                     multi_offsets: Vec::new(),
+                    code_ranges: Vec::new(),
                     lh: line_h,
                     x_off: px(0.),
                     height: h,
@@ -1356,7 +1374,7 @@ fn paint_code_row(
             point(panel_x, origin.y + row.top),
             size(px(panel_w), row.height),
         ),
-        corner_radii: gpui::Corners::all(px(6.)),
+        corner_radii: gpui::Corners::all(px(8.)), // 与预览代码块 `rounded_t_lg`/`rounded_b_lg`（lg=8）对齐
         background: theme.code_bg.into(),
         border_widths: gpui::Edges::default(),
         border_color: gpui::Hsla::default(),
@@ -1474,6 +1492,71 @@ fn paint_image_row(
     }
 }
 
+/// 行内代码（反引号）圆角 pill 底：把 `row.code_ranges`（已扩展空白）区间按折行切成
+/// 多段矩形并 paint，与正文 `wrapped.first()` 的同一 layout 对齐（背景/字形/折行一致）。
+/// 与预览 [`TextTrack::paint_code_ranges`] 同式：先画底、再委托 WrappedLine 画文字；
+/// 颜色单一源 `WyTheme.code_inline_bg`（← StyleParams）。
+fn paint_inline_code_pills(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+) {
+    if row.code_ranges.is_empty() {
+        return;
+    }
+    let Some(wl) = row.wrapped.first() else {
+        return;
+    };
+    let line_h = row.lh.as_f32();
+    let text_origin_x = origin.x.as_f32() + f.padding.as_f32() + f32::from(row.x_off);
+    let text_origin_y = origin.y.as_f32() + row.top.as_f32();
+    for range in &row.code_ranges {
+        let Some(p0) = wl.position_for_index(range.start, row.lh) else {
+            continue;
+        };
+        let Some(p1) = wl.position_for_index(range.end, row.lh) else {
+            continue;
+        };
+        let y0 = (p0.y.as_f32() / line_h).floor() as usize;
+        let y1 = (p1.y.as_f32() / line_h).floor() as usize;
+        if y0 == y1 {
+            // 单行内：一段矩形
+            let b = Bounds::new(
+                point(
+                    px(text_origin_x + p0.x.as_f32()),
+                    px(text_origin_y + p0.y.as_f32()),
+                ),
+                size(px((p1.x.as_f32() - p0.x.as_f32()).max(0.0)), px(line_h)),
+            );
+            window.paint_quad(
+                gpui::fill(b, theme.code_inline_bg)
+                    .corner_radii(gpui::Corners::all(px(5.))),
+            );
+        } else {
+            // 跨行：首段画到该行行尾、中间整行、末段从行首到终点
+            for real_ri in y0..=y1 {
+                let (rx0, rx1) = if real_ri == y0 {
+                    (p0.x.as_f32(), wl.width().as_f32())
+                } else if real_ri == y1 {
+                    (0.0, p1.x.as_f32())
+                } else {
+                    (0.0, wl.width().as_f32())
+                };
+                let b = Bounds::new(
+                    point(px(text_origin_x + rx0), px(text_origin_y + real_ri as f32 * line_h)),
+                    size(px((rx1 - rx0).max(0.0)), px(line_h)),
+                );
+                window.paint_quad(
+                    gpui::fill(b, theme.code_inline_bg)
+                        .corner_radii(gpui::Corners::all(px(5.))),
+                );
+            }
+        }
+    }
+}
+
 /// 文本块（段落/标题/引述等可编辑行）逐可视行绘制（x 含行级缩进 `row.x_off`）。
 fn paint_text_row(
     origin: Point<Pixels>,
@@ -1483,7 +1566,8 @@ fn paint_text_row(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let _ = theme;
+    // 行内代码圆角 pill 底先画（同一 layout 的像素几何），再画文字。
+    paint_inline_code_pills(origin, theme, f, row, window);
     let mut sub_top = row.top;
     for wl in &row.wrapped {
         let o = point(origin.x + f.padding + row.x_off, origin.y + sub_top);
@@ -1952,6 +2036,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_code_pill_ranges_expand_over_whitespace(cx: &mut TestAppContext) {
+        // 行内代码（反引号）在 shape 期记录渲染字节区间（已扩展空白）供 paint 自绘圆角
+        // pill——与预览 `TextTrack::paint_code_ranges` 同一行为源。用贴题原句验证 `we`。
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "我们`we`可以将它理解成一个**标识接口**\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let para = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Paragraph)
+                .expect("应有段落行");
+            assert!(
+                !para.code_ranges.is_empty(),
+                "含行内代码的文本行应记录 pill 区间"
+            );
+            // 渲染文本 = `我们we可以将它理解成一个标识接口`，`we` 在字节 [6..8)
+            // （我们=2×3 字节）；两侧不是空白 → 不扩展。
+            assert_eq!(
+                para.code_ranges[0],
+                6..8,
+                "`we` pill 应恰好覆盖渲染字节 6..8"
+            );
+            // 圆角 pill 底色单一源：与预览 `StyleParams.code_inline_bg` 同值。
+            let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
+                cx,
+                Some(f32::from(theme.font_size)),
+            );
+            assert_eq!(theme.code_inline_bg, p.code_inline_bg, "pill 底色抄自 StyleParams");
+        });
+    }
+
+    #[gpui::test]
     fn wrapped_row_click_on_second_visual_line_lands_in_second_half(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
@@ -2219,6 +2344,14 @@ let c = 3;
                 );
             assert_eq!(theme.text, p.fg, "正文色应抄自 StyleParams");
             assert_eq!(theme.code_bg, p.code_bg, "代码块背景应抄自 StyleParams");
+            assert_eq!(
+                theme.code_inline_fg, p.code_inline_fg,
+                "行内代码文字色应抄自 StyleParams"
+            );
+            assert_eq!(
+                theme.code_inline_bg, p.code_inline_bg,
+                "行内代码 pill 底色应抄自 StyleParams"
+            );
             assert_eq!(theme.divider, p.divider, "分隔线应抄自 StyleParams");
             assert_eq!(theme.table_head_bg, p.table_head_bg, "表头底色应抄自 StyleParams");
             assert_eq!(theme.para_line(), p.para_line, "正文行高应抄自 StyleParams");

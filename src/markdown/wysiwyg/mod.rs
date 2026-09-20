@@ -65,6 +65,10 @@ pub struct WyTheme {
     pub accent: Hsla,
     /// 代码块背景（明/暗主题各自取值，与预览一致）。
     pub code_bg: Hsla,
+    /// 行内代码（反引号）文字色（预览 `code_inline_fg`）。
+    pub code_inline_fg: Hsla,
+    /// 行内代码圆角 pill 底色（预览 `code_inline_bg`）。
+    pub code_inline_bg: Hsla,
     /// 分隔线/表格边框色（预览 `divider`）。
     pub divider: Hsla,
     /// 表头底色（预览 `table_head_bg`）。
@@ -99,6 +103,8 @@ impl WyTheme {
             font_size,
             accent: p.accent,
             code_bg: p.code_bg,
+            code_inline_fg: p.code_inline_fg,
+            code_inline_bg: p.code_inline_bg,
             divider: p.divider,
             table_head_bg: p.table_head_bg,
             quote_bg: p.quote_bg,

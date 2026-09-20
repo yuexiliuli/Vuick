@@ -25,6 +25,10 @@ mod row;
 pub(crate) mod style;
 mod table;
 
+/// 行内代码 pill 背景区间的统一扩展规则（预览与 WYSIWYG 共用单一行为源；
+/// 定义在 `row`，作为 view 层 API 再导出给 `wysiwyg`）。
+pub(crate) use row::expand_bg_over_whitespace;
+
 #[cfg(test)]
 mod tests;
 

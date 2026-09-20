@@ -27,6 +27,10 @@ pub(crate) struct StyleParams {
     pub(crate) muted_fg: Hsla,
     /// 代码块背景（白 #F3F4F4 / 黑 #282936），见 [`StyleParams::from_theme_with_font`]。
     pub(crate) code_bg: Hsla,
+    /// 行内代码（反引号）文字色（白 #222222 / 黑 #DADADA，近正文——靠底色 + 等宽字体区分）。
+    pub(crate) code_inline_fg: Hsla,
+    /// 行内代码圆角 pill 底色（白 #F3F4F4 / 黑 #3E3F40）。
+    pub(crate) code_inline_bg: Hsla,
     pub(crate) divider: Hsla,
     pub(crate) accent: Hsla,
     pub(crate) bg: Hsla,
@@ -88,11 +92,20 @@ impl StyleParams {
         } else {
             gpui::rgb(0xf3f4f4).into()
         };
+        // 行内代码（反引号）pill 配色按主题定制：白 = 底 #F3F4F4 + 文字 #222222，
+        // 黑 = 底 #3E3F40 + 文字 #DADADA（文字近正文，靠底色 + 等宽字体区分）。
+        let (code_inline_fg, code_inline_bg) = if is_dark {
+            (gpui::rgb(0xdadada).into(), gpui::rgb(0x3e3f40).into())
+        } else {
+            (gpui::rgb(0x222222).into(), gpui::rgb(0xf3f4f4).into())
+        };
         Self {
             mono: typo.mono.clone(),
             fg: colors.foreground,
             muted_fg: colors.muted_foreground,
             code_bg,
+            code_inline_fg,
+            code_inline_bg,
             divider: colors.border,
             accent: colors.accent,
             bg: colors.background,
