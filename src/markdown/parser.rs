@@ -71,7 +71,7 @@ pub enum RowAlign {
 }
 
 /// GFM 表格结构：表头 + 数据行 + 每列对齐。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TableData {
     /// 表头单元格文本（已做行内记号清理）。
     pub header: Vec<SharedString>,
@@ -687,7 +687,7 @@ fn inline_strip(s: &str) -> SharedString {
 /// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
 /// 前缀识别复用共享核心 `image::parse_ref`（与 live 同一字节逻辑，见 parity），
 /// 这里叠加「整行」策略：`]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
-fn parse_image_line(t: &str) -> Option<(String, String)> {
+pub(crate) fn parse_image_line(t: &str) -> Option<(String, String)> {
     let r = image::parse_ref(t)?;
     // 历史语义：alt 由「第一个 `]`」界定且必须紧跟 `(`。`parse_ref` 取的是第一处
     // `](`；仅当 `]` 出现在 `](` 之前时二者不同（如 `![a]b](c)`）→ 既有实现返回 None。
@@ -1976,14 +1976,19 @@ pub fn parse_block_window(src: &str, index: &BlockIndex, lo: usize, hi: usize) -
         return Vec::new();
     }
     let start = index.blocks.at(lo).byte as usize;
-    let mut end = if hi + 1 < n {
+    let end0 = if hi + 1 < n {
         index.blocks.at(hi + 1).byte as usize
     } else {
         src.len()
     };
-    // 切片到"下一块首行"处会带上最后一块的换行符：`split('\n')` 会多造一个
-    // 代表"下一行"的空元素 → 多出幻影空行。裁掉这 1 个 '\n' 即精确到块边界。
-    if end < src.len() && src.as_bytes()[end - 1] == b'\n' {
+    // 切片到"下一块首行"处会带上上一块的换行符：`split('\n')` 会多造一个代表
+    // "下一行"的空元素 → 多出幻影空行。裁掉末尾的 '\n' 即精确到块边界。
+    // 唯一例外：**末块本身就是 EOF 幻影空行**（`byte == src.len()`，即文档以
+    // `\r?\n` 结尾时扫描器给最后那个空串造的 Blank 块）——它靠这 1 个 '\n'
+    // 才存在，裁掉会把窗口内的一块弄丢（全档窗口 70 vs 69 的实测来源）。
+    let mut end = end0;
+    let last_is_phantom = hi + 1 >= n && index.blocks.at(hi).byte as usize == src.len();
+    if !last_is_phantom && end > start && src.as_bytes()[end - 1] == b'\n' {
         end -= 1;
     }
     let rows = parse_to_rows(&src[start..end]);
@@ -2016,15 +2021,17 @@ pub fn parse_block_window_rope(rope: &Rope, index: &BlockIndex, lo: usize, hi: u
         return Vec::new();
     }
     let start = index.blocks.at(lo).byte as usize;
-    let mut end = if hi + 1 < n {
+    let end0 = if hi + 1 < n {
         index.blocks.at(hi + 1).byte as usize
     } else {
         rope.len()
     };
-    // 切片到"下一块首行"处会带上最后一块的换行符：`split('\n')` 会多造一个
-    // 代表"下一行"的空元素 → 多出幻影空行。裁掉这 1 个 '\n' 即精确到块边界。
-    if end < rope.len() && rope.get_byte(end.saturating_sub(1)) == Some(b'\n') {
-        end = end.saturating_sub(1);
+    // 与 `parse_block_window` 同式：裁掉窗口尾部的 '\n'（含末块 EOF 情形）——
+    // 除非末块本身是 EOF 幻影空行（`byte == src.len()`），靠它保留那 1 个 '\n'。
+    let mut end = end0;
+    let last_is_phantom = hi + 1 >= n && index.blocks.at(hi).byte as usize == rope.len();
+    if !last_is_phantom && end > start && rope.get_byte(end - 1) == Some(b'\n') {
+        end -= 1;
     }
     let region = rope.slice(start..end).to_string();
     let rows = parse_to_rows(&region);

@@ -14,8 +14,51 @@ use gpui::{
     InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window, point, px, relative, size,
 };
 
-use super::{CaretVis, WyEditor};
-use crate::markdown::parser::{BlockMeta, RowKind, RunKind};
+use super::{CaretVis, WyEditor, WyTheme};
+use crate::markdown::doc::{DocPayload, DocRow};
+use crate::markdown::ir::IrKind;
+use crate::markdown::parser::{BlockMeta, RowKind, RunKind, TableAlign};
+use crate::syntax::{github_theme_cached, parse_code_lines, resolve_line_styles_with};
+
+/// 单行文本的显示宽（px，f32）——表格列宽测量用。
+fn shaped_text_width(
+    window: &mut Window,
+    text: &str,
+    font_size: Pixels,
+    font: &gpui::Font,
+    color: gpui::Hsla,
+) -> f32 {
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: font.clone(),
+        color,
+        ..Default::default()
+    };
+    window
+        .text_system()
+        .shape_line(gpui::SharedString::from(text), font_size, &[run], None)
+        .width()
+        .into()
+}
+
+/// 一帧后的表格渲染数据（shape 期算好列宽/全量单元格文本，paint 直接画网格）。
+/// 与预览一致：列宽按内容自适应（不缩放、不省略），整表自然宽，超出由宿主裁剪。
+pub(crate) struct ShapedTable {
+    pub widths: Vec<f32>,
+    pub total_w: f32,
+    pub row_h: Pixels,
+    pub header_texts: Vec<gpui::SharedString>,
+    pub rows_texts: Vec<Vec<gpui::SharedString>>,
+    pub aligns: Vec<TableAlign>,
+}
+
+/// 一帧后的图片渲染数据（显示框 + 源 + alt 兜底）。
+pub(crate) struct ShapedImage {
+    pub src: gpui::SharedString,
+    pub alt: gpui::SharedString,
+    pub w: f32,
+    pub h: f32,
+}
 
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
 pub(crate) struct Frame {
@@ -29,6 +72,8 @@ pub(crate) struct Frame {
     pub width: Pixels,
     /// 本帧内容代数；帧缓存键之一。
     pub rgen: u64,
+    /// 本帧图片加载代数；帧缓存键之一（占位→真实尺寸后必须重建）。
+    pub igen: u64,
 }
 
 pub(crate) struct ShapedRow {
@@ -40,8 +85,19 @@ pub(crate) struct ShapedRow {
     pub sub_heights: Vec<Pixels>,
     pub byte_map: std::rc::Rc<Vec<usize>>,
     pub editable: bool,
+    /// 该行实际行高（正文=para_line、标题=heading_line、代码=code_line 等）。
+    pub lh: Pixels,
+    /// 文本在内容区内的**额外左缩进**（padding 之外；引述=边条+内衬）。编辑可点行
+    /// 的 caret/hit-test/paint 都要用它对齐，否则文本缩进但光标/点击仍在原处。
+    pub x_off: Pixels,
     pub height: Pixels,
     pub top: Pixels,
+    /// 块语义（paint 按类型分派：代码面板/表格网格/图片）。
+    pub kind: IrKind,
+    /// Table 块的网格数据（带外块为 None）。
+    pub table: Option<ShapedTable>,
+    /// Image 块的显示数据（带外块 / 加载失败仍 Some 显示 alt）。
+    pub image: Option<ShapedImage>,
 }
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
@@ -127,81 +183,149 @@ fn kind_tag(k: RowKind) -> u8 {
     }
 }
 
-/// 文本块的高度缓存键：`(内容代数, 源行, 类型, shaping 宽)`。
-fn height_cache_key(rgen: u64, src_line: u32, kind: RowKind, width_bits: u32) -> u64 {
+/// 文本块的高度缓存键：`(内容代数, 图片加载代数, 源行, 类型, shaping 宽)`。
+fn height_cache_key(rgen: u64, igen: u64, src_line: u32, kind: RowKind, width_bits: u32) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     rgen.hash(&mut h);
+    igen.hash(&mut h);
     src_line.hash(&mut h);
     kind_tag(kind).hash(&mut h);
     width_bits.hash(&mut h);
     h.finish()
 }
 
-/// 带外（且从未整形过）文本块的高度估算：用**真实字数**（`Doc::line_chars_ascii`）
+/// 表格块的总高（px）：与预览**实际渲染**同式 `(1 + 数据行数) × 行高 + 行分隔数 + 2`
+/// （行高 = 正文行高 `para_line` + 12，外边框 2px；见 `view::table::render_table`）。
+/// `estimate_height` 与 `shape_docrow` 用同一公式 → 带内/带外高度一致（滚动不跳）。
+fn table_block_height(theme: &WyTheme, n_rows: usize) -> Pixels {
+    let row_h = f32::from(theme.para_line()) + 12.;
+    px((1. + n_rows as f32) * row_h + n_rows as f32 + 2.)
+}
+
+/// 表格单行高（表头/数据行同高）＝正文行高 + 12（预览 `render_table` 的 `row_h`）。
+fn table_row_h(theme: &WyTheme) -> Pixels {
+    px(f32::from(theme.para_line()) + 12.)
+}
+
+/// 带外（且从未整形过）块的高度估算：用**真实字数**（`Doc::line_chars_ascii`）
 /// 与近似字符宽（ASCII ≈ 0.5 字高、含 CJK ≈ 0.95 字高）估可视行数，尽量贴合真实
-/// shape，使带外/带内高度差 ≈ 0（滚动带边界不再跳「字体大小」）；代码/表格用
-/// `aux`（行数）* 行高；空行/图片/分隔线固定一行。只作兜底——整形过的块走缓存真值。
+/// shape，使带外/带内高度差 ≈ 0（滚动带边界不再跳「字体大小」）；代码用
+/// `(行数+2) × code_line`（与预览同式）、表格用 [`table_block_height`]、
+/// 标题用各级行高 + 底部留白；图片用占位高度；空行/分隔线固定一行。
+/// 只作兜底——整形过的块走缓存真值。
 fn estimate_height(
     meta: &BlockMeta,
     chars: usize,
     ascii: bool,
-    font_size: Pixels,
+    theme: &WyTheme,
     avail: f32,
     line_h: Pixels,
 ) -> Pixels {
+    let est_char_w = |ascii: bool, fs: Pixels| {
+        if ascii {
+            f32::from(fs) * 0.5
+        } else {
+            f32::from(fs) * 0.95
+        }
+    };
+    let est_rows = |cpl: f32, chars: usize| -> f32 { (chars as f32 / cpl.max(1.)).ceil().max(1.) };
     match meta.kind {
-        RowKind::Code | RowKind::Table => line_h * meta.aux.max(1) as f32,
-        RowKind::Blank | RowKind::Image | RowKind::Rule => line_h,
+        RowKind::Code => theme.code_line() * (meta.aux.max(1) as f32 + 2.),
+        RowKind::Table => table_block_height(theme, meta.aux.max(1) as usize),
+        RowKind::Image => px(crate::config::markdown::IMAGE_ROW_DEFAULT_H),
+        RowKind::Heading(n) => {
+            let fs = theme.heading_fs(n);
+            let cpl = avail / est_char_w(ascii, fs).max(1.);
+            theme.heading_line(n) * est_rows(cpl, chars) + px(8.)
+        }
+        RowKind::Blank | RowKind::Rule => line_h,
         _ => {
-            let char_w = if ascii {
-                f32::from(font_size) * 0.5
-            } else {
-                f32::from(font_size) * 0.95
-            };
-            let cpl = (avail / char_w.max(1.)).max(1.);
-            let lines = (chars as f32 / cpl).ceil().max(1.);
-            line_h * lines
+            let cpl = avail / est_char_w(ascii, theme.font_size).max(1.);
+            line_h * est_rows(cpl, chars)
         }
     }
 }
 
-/// 把一个物化的 `DocRow` 真正 shape 成可视行（仅带内块走这里）。
-fn shape_docrow(
-    r: crate::markdown::doc::DocRow,
+/// 文本行（段落/标题/引述/列表）的行样式：字号/行高/基准色/加粗随类型（对齐预览）。
+struct RowTextStyle {
+    fs: Pixels,
+    lh: Pixels,
+    color: gpui::Hsla,
+    bold: bool,
+    /// 块底部额外留白（标题 py_1）。
+    pad: Pixels,
+}
+
+fn text_style_for(kind: IrKind, theme: &WyTheme) -> RowTextStyle {
+    match kind {
+        IrKind::Heading(n) => RowTextStyle {
+            fs: theme.heading_fs(n),
+            lh: theme.heading_line(n),
+            color: theme.text,
+            bold: true,
+            pad: px(8.),
+        },
+        // 引述用次要文字色（与预览一致）。
+        IrKind::Quote => RowTextStyle {
+            fs: theme.font_size,
+            lh: theme.para_line(),
+            color: theme.muted,
+            bold: false,
+            pad: px(0.),
+        },
+        _ => RowTextStyle {
+            fs: theme.font_size,
+            lh: theme.para_line(),
+            color: theme.text,
+            bold: false,
+            pad: px(0.),
+        },
+    }
+}
+
+/// 文本块（段落/标题/引述/列表/分隔线/空行）：按类型行样式形状成折行可视行。
+fn shape_text_row(
+    r: DocRow,
     window: &mut Window,
     width: Pixels,
-    font_size: Pixels,
-    line_h: Pixels,
-    theme: &super::WyTheme,
+    theme: &WyTheme,
     base_font: &gpui::Font,
 ) -> ShapedRow {
+    let kind = r.kind;
+    let st = text_style_for(kind, theme);
+    let mut base = base_font.clone();
+    if st.bold {
+        base.weight = gpui::FontWeight::BOLD;
+    }
     let runs = runs_to_text_runs(
         r.text.as_ref(),
         &r.runs,
-        base_font,
-        theme.text,
+        &base,
+        st.color,
         &theme.mono,
         theme.accent,
         theme.code_bg,
     );
     let wrapped = window
         .text_system()
-        .shape_text(r.text.clone(), font_size, &runs, Some(width), None)
+        .shape_text(r.text.clone(), st.fs, &runs, Some(width), None)
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
-    let mut height = px(0.);
+    let mut height = st.pad;
     let mut sub_heights = Vec::with_capacity(wrapped.len());
     for wl in &wrapped {
-        let sh = line_h * (wl.wrap_boundaries().len() + 1) as f32;
+        let sh = st.lh * (wl.wrap_boundaries().len() + 1) as f32;
         height += sh;
         sub_heights.push(sh);
     }
-    if height == px(0.) {
-        height = line_h;
-        sub_heights.push(line_h);
+    if height <= st.pad {
+        height = st.lh + st.pad;
+        sub_heights.push(st.lh);
     }
     let editable = !r.byte_map.is_empty();
+    // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
+    let x_off = if kind == IrKind::Quote { px(15.) } else { px(0.) };
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
@@ -209,8 +333,218 @@ fn shape_docrow(
         sub_heights,
         byte_map: std::rc::Rc::new(r.byte_map),
         editable,
+        lh: st.lh,
+        x_off,
         height,
         top: px(0.),
+        kind,
+        table: None,
+        image: None,
+    }
+}
+
+/// 代码围栏块：等宽 + 语法高亮（GitHub 明/暗色板，同预览）+ 首/末空白带，
+/// 行高/字号用代码专属尺寸。不换行（超宽由宿主横向裁剪，与预览 nowrap 一致）。
+fn shape_code_row(
+    r: DocRow,
+    window: &mut Window,
+    theme: &WyTheme,
+) -> ShapedRow {
+    let kind = r.kind;
+    let (code_lines, lang) = match &r.payload {
+        DocPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
+        _ => (Vec::new(), None),
+    };
+    let fs = theme.code_size();
+    let lh = theme.code_line();
+    let mono = theme.mono.clone();
+    let base = theme.text;
+    // 语法高亮：按围栏语言整块解析一次（与预览同源）。
+    let hl_runs = match lang.as_deref() {
+        Some(l) if !l.is_empty() && !code_lines.is_empty() => {
+            let mut code = String::new();
+            for (i, l) in code_lines.iter().enumerate() {
+                if i > 0 {
+                    code.push('\n');
+                }
+                code.push_str(l.as_ref());
+            }
+            parse_code_lines(l, &code)
+        }
+        _ => None,
+    };
+    let resolver = hl_runs.as_ref().map(|_| github_theme_cached(theme.is_dark));
+    let mut wrapped = Vec::new();
+    let mut sub_heights = Vec::with_capacity(code_lines.len().max(1));
+    // 首/末空白带（预览 code_blank × 2）。
+    let mut height = lh * 2.;
+    for (i, line) in code_lines.iter().enumerate() {
+        let runs: Vec<gpui::TextRun> = if let (Some(runs), Some(res)) = (hl_runs.as_ref(), resolver)
+        {
+            let line_runs = runs.get(i).map(|r| r.as_slice()).unwrap_or(&[]);
+            resolve_line_styles_with(line_runs, line.len(), res)
+                .into_iter()
+                .map(|(range, style)| {
+                    let mut f = mono.clone();
+                    if let Some(w) = style.font_weight {
+                        f.weight = w;
+                    }
+                    if let Some(s) = style.font_style {
+                        f.style = s;
+                    }
+                    gpui::TextRun {
+                        len: range.len(),
+                        font: f,
+                        color: style.color.unwrap_or(base),
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        } else {
+            vec![gpui::TextRun { len: line.len(), font: mono.clone(), color: base, ..Default::default() }]
+        };
+        let v = window
+            .text_system()
+            .shape_text(line.clone(), fs, &runs, None, None)
+            .map(|ls| ls.into_vec())
+            .unwrap_or_default();
+        let rows = v.iter().map(|wl| wl.wrap_boundaries().len() + 1).sum::<usize>().max(1);
+        let sh = lh * rows as f32;
+        height += sh;
+        sub_heights.push(sh);
+        wrapped.extend(v);
+    }
+    ShapedRow {
+        src_line: r.src_line,
+        src_lines: r.lines.clone(),
+        wrapped,
+        sub_heights,
+        byte_map: std::rc::Rc::new(Vec::new()),
+        editable: false,
+        lh,
+        x_off: px(0.),
+        height,
+        top: px(0.),
+        kind,
+        table: None,
+        image: None,
+    }
+}
+
+/// 表格块：列宽按内容自适应（与预览 `table_column_widths` 同式：最大文字宽+20，
+/// 下限 48），不缩放/不省略（超宽由宿主裁剪）；paint 期画成网格。
+/// 非文本行（不可编辑）。
+fn shape_table_row(
+    r: DocRow,
+    window: &mut Window,
+    font_size: Pixels,
+    theme: &WyTheme,
+    base_font: &gpui::Font,
+) -> ShapedRow {
+    let kind = r.kind;
+    let (header, rows, aligns) = match &r.payload {
+        DocPayload::Table(t) => (t.header.clone(), t.rows.clone(), t.aligns.clone()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    };
+    let ncols = header.len().max(1);
+    let mut widths: Vec<f32> = (0..ncols).map(|_| 48.).collect();
+    let mut measure = |window: &mut Window, c: &str, ci: usize| {
+        widths[ci] = widths[ci].max(
+            shaped_text_width(window, c, font_size, base_font, theme.text) + 20.,
+        );
+    };
+    for (ci, c) in header.iter().enumerate() {
+        measure(window, c.as_ref(), ci);
+    }
+    for row in &rows {
+        for (ci, c) in row.iter().enumerate().take(ncols) {
+            measure(window, c.as_ref(), ci);
+        }
+    }
+    let total_w = widths.iter().sum();
+    let row_h = table_row_h(theme);
+    let height = table_block_height(theme, rows.len());
+    let mut aligns2 = aligns.clone();
+    aligns2.resize(ncols, TableAlign::Left);
+    ShapedRow {
+        src_line: r.src_line,
+        src_lines: r.lines.clone(),
+        wrapped: Vec::new(),
+        sub_heights: vec![height],
+        byte_map: std::rc::Rc::new(Vec::new()),
+        editable: false,
+        lh: row_h,
+        x_off: px(0.),
+        height,
+        top: px(0.),
+        kind,
+        table: Some(ShapedTable {
+            widths,
+            total_w,
+            row_h,
+            header_texts: header,
+            rows_texts: rows
+                .into_iter()
+                .map(|mut rr| {
+                    rr.resize(ncols, gpui::SharedString::default());
+                    rr
+                })
+                .collect(),
+            aligns: aligns2,
+        }),
+        image: None,
+    }
+}
+
+/// 独立图片行：shape 期定显示框（已加载按真实宽高比、未加载用占位高）。
+/// 非文本行（不可编辑）；图片内容在 paint 期异步加载后画出。
+fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
+    let kind = r.kind;
+    let alt = r.text.clone();
+    let src = match &r.payload {
+        DocPayload::Image { src } => src.clone(),
+        _ => gpui::SharedString::default(),
+    };
+    let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
+    let (w, h) = match editor.image_size(src.as_ref()) {
+        Some(Some((iw, ih))) if iw > 0. && ih > 0. => {
+            let w = max_w;
+            (w, (w * ih / iw.max(1.)).max(1.))
+        }
+        _ => (max_w, crate::config::markdown::IMAGE_ROW_DEFAULT_H),
+    };
+    ShapedRow {
+        src_line: r.src_line,
+        src_lines: r.lines.clone(),
+        wrapped: Vec::new(),
+        sub_heights: vec![px(h)],
+        byte_map: std::rc::Rc::new(Vec::new()),
+        editable: false,
+        lh: px(h),
+        x_off: px(0.),
+        height: px(h),
+        top: px(0.),
+        kind,
+        table: None,
+        image: Some(ShapedImage { src, alt, w, h }),
+    }
+}
+
+/// 把一个物化的 `DocRow` 真正 shape 成可视行（仅带内块走这里）——按块类型分派。
+fn shape_docrow(
+    r: DocRow,
+    editor: &WyEditor,
+    window: &mut Window,
+    width: Pixels,
+    avail: f32,
+    theme: &WyTheme,
+    base_font: &gpui::Font,
+) -> ShapedRow {
+    match r.kind {
+        IrKind::Code => shape_code_row(r, window, theme),
+        IrKind::Table => shape_table_row(r, window, theme.font_size, theme, base_font),
+        IrKind::Image => shape_image_row(r, editor, avail),
+        _ => shape_text_row(r, window, width, theme, base_font),
     }
 }
 
@@ -227,8 +561,7 @@ pub(crate) fn build_frame(
     // prepaint 两阶段该值不同（栈内带/不带 `live-body.text_size`），每帧现取会在两种
     // 字号间交替，滚动时文字忽大忽小。
     let theme = &editor.theme;
-    let font_size = theme.font_size;
-    let line_h = font_size * 1.5;
+    let line_h = theme.para_line();
     let base_font = theme.font.clone();
     let doc = editor.doc();
     let n = doc.block_count();
@@ -246,19 +579,26 @@ pub(crate) fn build_frame(
                 sub_heights: vec![line_h],
                 byte_map: std::rc::Rc::new(Vec::new()),
                 editable: false,
+                lh: line_h,
+                x_off: px(0.),
                 height: line_h,
                 top: px(0.),
+                kind: IrKind::Blank,
+                table: None,
+                image: None,
             }],
             total: line_h,
             band,
             width,
             rgen,
+            igen: editor.images_gen(),
         };
     }
 
     let (band_lo, band_hi) = band;
     let avail = (f32::from(width) - f32::from(padding) * 2.).max(1.);
     let width_bits = f32::from(width).to_bits();
+    let igen = editor.images_gen();
 
     // Pass 1：决定每块高度（文本块：缓存真值优先，无则用真实字数估算）+ 是否入带。
     #[derive(Clone, Copy)]
@@ -278,8 +618,12 @@ pub(crate) fn build_frame(
             aux: 1,
         });
         let cache_key = match meta.kind {
-            RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
-                Some(height_cache_key(rgen, meta.src_line, meta.kind, width_bits))
+            RowKind::Paragraph
+            | RowKind::Heading(_)
+            | RowKind::Quote
+            | RowKind::Bullet
+            | RowKind::Code => {
+                Some(height_cache_key(rgen, igen, meta.src_line, meta.kind, width_bits))
             }
             _ => None,
         };
@@ -287,7 +631,7 @@ pub(crate) fn build_frame(
             Some(lines) => line_h * lines as f32,
             None => {
                 let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
-                estimate_height(&meta, chars, ascii, font_size, avail, line_h)
+                estimate_height(&meta, chars, ascii, theme, avail, line_h)
             }
         };
         let bottom = y + f32::from(h);
@@ -315,8 +659,9 @@ pub(crate) fn build_frame(
         let hi = i;
         let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
         for (j, r) in docrows.into_iter().enumerate() {
-            let srow = shape_docrow(r, window, width, font_size, line_h, theme, &base_font);
-            // 缓存该块真实可视行数（带外再遇此块时沿用真值 → 不跳）。
+            let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
+            // 缓存该块真实可视行数（带外再遇此块时沿用真值 → 不跳）。折行代码/长段落
+            // 会与"估算不折行"偏差，缓存消除滚动跳变；表格（无折行、估算同式）不入缓存。
             let visual = srow
                 .wrapped
                 .iter()
@@ -363,15 +708,20 @@ pub(crate) fn build_frame(
                     sub_heights: vec![h],
                     byte_map: empty_bm.clone(),
                     editable: false,
+                    lh: line_h,
+                    x_off: px(0.),
                     height: h,
                     top: total,
+                    kind: crate::markdown::doc::row_kind(meta.kind),
+                    table: None,
+                    image: None,
                 }
             }
         };
         total += sr.height;
         rows.push(sr);
     }
-    Frame { padding, line_h, rows, total, band, width, rgen }
+    Frame { padding, line_h, rows, total, band, width, rgen, igen }
 }
 
 /// 源列 → 渲染列（左界：首个 `byte_map[v] >= target`；与 `display_to_source` 互逆，
@@ -397,11 +747,11 @@ fn render_point_of(wrapped: &[gpui::WrappedLine], line_h: Pixels, dcol: usize) -
     }
 }
 
-/// 源 caret → 光标条几何。非文本行停在块首（只读）。
+/// 源 caret → 光标条几何。非文本行停在块首（只读）。行高用 `r.lh`（标题/代码等
+/// 类型各自行高），否则光标会错位。
 fn caret_geometry(
     editor: &WyEditor,
     rows: &[ShapedRow],
-    line_h: Pixels,
 ) -> (bool, Pixels, Pixels) {
     let (cl, col) = editor.row_col(editor.caret());
     let line_start = editor.line_start(cl);
@@ -416,37 +766,38 @@ fn caret_geometry(
             // 的反查互为逆映射，光标才落在点击处。
             let dcol = source_to_display(&r.byte_map, target);
             // 折行时 p.y 是子行偏移，叠加到块首才算准缓存所在的可视行。
-            let p = render_point_of(&r.wrapped, line_h, dcol);
-            return (true, px(12.) + p.x, r.top + p.y);
+            let p = render_point_of(&r.wrapped, r.lh, dcol);
+            // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
+            return (true, px(12.) + r.x_off + p.x, r.top + p.y);
         } else {
             return (false, px(12.), r.top);
         }
     }
-    let y = rows.last().map_or(line_h, |r| r.top + r.height);
+    let fallback_lh = rows.first().map_or(px(20.), |r| r.lh);
+    let y = rows.last().map_or(fallback_lh, |r| r.top + r.height);
     (true, px(12.), y)
 }
 
-/// 点命中 → 源字节偏移（帧内 byte_map 反查）。
-pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
-    // `MouseDownEvent.position` 是窗口坐标；`frame.rows[*].top`/行内 x 是元素局部
-    // （paint 时以 `origin = bounds.origin` 为起点绘制），先把命中换算回局部——
-    // 否则元素被 `live-body` 内边距/滚动/窗口位置偏移后，点击会映射到错误的行/列。
-    let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
-    let rel_y = f32::from(p.y) - f32::from(origin.y);
-    let rel_x = (f32::from(p.x) - f32::from(origin.x) - f32::from(frame.padding)).max(0.);
-    let line_h = frame.line_h;
+/// 点命中（**元素局部坐标**）→ 源字节偏移（帧内 byte_map 反查）。
+/// 命中用的行/列全是元素局部（paint 以 `origin = bounds.origin` 为起点绘制）；
+/// 传入前把窗口坐标减掉元素原点即可（见 [`source_offset_at`]）。
+pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
+    let rel_y = f32::from(p.y);
     for r in &frame.rows {
         let top = f32::from(r.top);
         let bottom = top + f32::from(r.height);
         if rel_y >= top && rel_y < bottom {
             if r.editable {
                 if let Some(w0) = r.wrapped.first() {
-                    // y 用点击在块内的**子行偏移**（`rel_y - top`）：`closest_index_for_position`
-                    // 据此选折行的第几可视行——写成 0 会把第二行的点击映射回第一行。
+                    // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
+                    // （`rel_y - top`）：`closest_index_for_position` 据此选折行的第几
+                    // 可视行——写成 0 会把第二行的点击映射回第一行。
+                    let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
+                        .max(0.);
                     let rel = point(px(rel_x), px(rel_y - top));
                     // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
                     // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。
-                    let dcol = match w0.closest_index_for_position(rel, line_h) {
+                    let dcol = match w0.closest_index_for_position(rel, r.lh) {
                         Ok(i) | Err(i) => i,
                     };
                     let local = display_to_source(&r.byte_map, dcol);
@@ -460,6 +811,465 @@ pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels
         }
     }
     editor.caret()
+}
+
+/// 点命中（**窗口坐标**，`MouseDownEvent.position`）→ 源字节偏移。
+pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
+    // window 坐标先换回元素局部（否则元素被 `live-body` 内边距/滚动/窗口位置偏移后，
+    // 点击会映射到错误的行/列），再走统一的局部命中。
+    let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
+    let local = point(p.x - origin.x, p.y - origin.y);
+    source_offset_at_local(editor, frame, local)
+}
+
+/// 表格的一行单元格文本（表头加粗/浅色，按列对齐）。
+fn draw_table_row(
+    window: &mut Window,
+    cx: &mut App,
+    cells: &[gpui::SharedString],
+    widths: &[f32],
+    aligns: &[TableAlign],
+    x0: f32,
+    row_top_y: f32,
+    row_h: f32,
+    is_header: bool,
+    theme: &WyTheme,
+) {
+    let font_size = theme.font_size;
+    let mut acc = 0f32;
+    for (ci, c) in cells.iter().enumerate() {
+        let col_w = widths.get(ci).copied().unwrap_or(0.);
+        let mut font = theme.font.clone();
+        let text_col = if is_header {
+            let mut c = theme.text;
+            c.a = 0.9;
+            c
+        } else {
+            theme.text
+        };
+        if is_header {
+            font.weight = gpui::FontWeight::BOLD;
+        }
+        let run = gpui::TextRun { len: c.len(), font, color: text_col, ..Default::default() };
+        let line = window.text_system().shape_line(c.clone(), font_size, &[run], None);
+        {
+            let w = f32::from(line.width());
+            let x = match aligns.get(ci) {
+                Some(TableAlign::Center) => acc + ((col_w - w) / 2.).max(0.),
+                Some(TableAlign::Right) => acc + (col_w - w - 10.).max(0.),
+                _ => acc + 10.,
+            };
+            // 单元格纵向居中（预览 `items_center`）：文字块中点对齐行中点。
+            let text_lh = f32::from(theme.para_line());
+            let ty = row_top_y + ((row_h - text_lh) / 2.).max(0.);
+            let _ = line.paint(
+                point(px(x0 + x), px(ty)),
+                px(text_lh),
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+        acc += col_w;
+    }
+}
+
+/// 画表格块网格：外框 + 表头背景 + 行/列分隔线 + 单元格文本（配色对齐预览）。
+fn paint_table_row(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    t: &ShapedTable,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let x0 = f32::from(origin.x) + f32::from(f.padding);
+    let top0 = f32::from(origin.y) + f32::from(row.top);
+    let total_w = t.total_w.max(1.);
+    let row_h_f = f32::from(t.row_h);
+    let ncols = t.header_texts.len().max(1);
+    let n_rows = t.rows_texts.len();
+    let block_h = f32::from(table_block_height(theme, n_rows));
+    let border: gpui::Hsla = theme.divider;
+    // 外框（先画：内容随后的矩形都缩进 1px，不盖住外框线）。
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(point(px(x0), px(top0)), size(px(total_w), px(block_h))),
+        corner_radii: gpui::Corners::all(px(6.)),
+        background: gpui::Hsla { h: 0., s: 0., l: 0., a: 0. }.into(),
+        border_widths: gpui::Edges::all(px(1.)),
+        border_color: border,
+        border_style: gpui::BorderStyle::Solid,
+    });
+    let inner_lo = top0 + 1.;
+    let inner_hi = top0 + block_h - 1.;
+    // 表头背景（圆角顶）。
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(
+            point(px(x0 + 1.), px(inner_lo)),
+            size(px((total_w - 2.).max(0.)), px(row_h_f)),
+        ),
+        corner_radii: gpui::Corners {
+            top_left: px(5.),
+            top_right: px(5.),
+            bottom_left: px(0.),
+            bottom_right: px(0.),
+        },
+        background: theme.table_head_bg.into(),
+        border_widths: gpui::Edges::default(),
+        border_color: border,
+        border_style: gpui::BorderStyle::Solid,
+    });
+    let mut cy = inner_lo;
+    draw_table_row(
+        window,
+        cx,
+        &t.header_texts,
+        &t.widths,
+        &t.aligns,
+        x0,
+        cy,
+        row_h_f,
+        true,
+        theme,
+    );
+    cy += row_h_f;
+    for cells in &t.rows_texts {
+        // 行间分隔线（表头下 + 数据行之间）。
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(
+                point(px(x0 + 1.), px(cy)),
+                size(px((total_w - 2.).max(0.)), px(1.)),
+            ),
+            corner_radii: gpui::Corners::default(),
+            background: border.into(),
+            border_widths: gpui::Edges::default(),
+            border_color: border,
+            border_style: gpui::BorderStyle::Solid,
+        });
+        cy += 1.;
+        draw_table_row(
+            window,
+            cx,
+            cells,
+            &t.widths,
+            &t.aligns,
+            x0,
+            cy,
+            row_h_f,
+            false,
+            theme,
+        );
+        cy += row_h_f;
+    }
+    // 列分隔竖线（内容区内）。
+    let mut acc = 0f32;
+    for ci in 0..ncols {
+        acc += t.widths.get(ci).copied().unwrap_or(0.);
+        if ci + 1 < ncols {
+            window.paint_quad(gpui::PaintQuad {
+                bounds: Bounds::new(
+                    point(px(x0 + acc), px(inner_lo)),
+                    size(px(1.), px((inner_hi - inner_lo).max(0.))),
+                ),
+                corner_radii: gpui::Corners::default(),
+                background: border.into(),
+                border_widths: gpui::Edges::default(),
+                border_color: border,
+                border_style: gpui::BorderStyle::Solid,
+            });
+        }
+    }
+}
+
+/// 代码块：圆角面板（对齐预览：外层 `px_3` → 面板比内容区缩进 12px），
+/// 行文本带再 `pl_3/pr_3`（面板内各 12px 内衬）。首/末各留一个 code_line 空白带。
+fn paint_code_row(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let pad = f32::from(f.padding);
+    let content_w = f32::from(f.width) - pad * 2.;
+    let panel_x = origin.x + f.padding + px(12.);
+    let panel_w = (content_w - 24.).max(1.);
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(
+            point(panel_x, origin.y + row.top),
+            size(px(panel_w), row.height),
+        ),
+        corner_radii: gpui::Corners::all(px(6.)),
+        background: theme.code_bg.into(),
+        border_widths: gpui::Edges::default(),
+        border_color: gpui::Hsla::default(),
+        border_style: gpui::BorderStyle::Solid,
+    });
+    // 顶空白带后逐行画文本（x = 面板左 + pl_3，行高 = code_line）。
+    let text_x = panel_x + px(12.);
+    let mut sub_top = row.top + theme.code_line();
+    for wl in &row.wrapped {
+        let o = point(text_x, origin.y + sub_top);
+        let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
+        sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+    }
+}
+
+/// 图片行占位/失败兜底：浅底细边框盒 + 居中 alt 文字（加载完成前的占位与加载失败体验）。
+fn paint_image_fallback(
+    theme: &WyTheme,
+    f: &Frame,
+    bounds: Bounds<Pixels>,
+    img: &ShapedImage,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let border: gpui::Hsla = { let mut c = theme.divider; c.a = 0.6; c };
+    let mut text = theme.muted;
+    text.a = 0.8;
+    window.paint_quad(gpui::PaintQuad {
+        bounds,
+        corner_radii: gpui::Corners::all(px(4.)),
+        background: theme.code_bg.into(),
+        border_widths: gpui::Edges::all(px(1.)),
+        border_color: border,
+        border_style: gpui::BorderStyle::Solid,
+    });
+    if img.alt.is_empty() {
+        return;
+    }
+    let run = gpui::TextRun {
+        len: img.alt.len(),
+        font: theme.font.clone(),
+        color: text,
+        ..Default::default()
+    };
+    let line = window
+        .text_system()
+        .shape_line(img.alt.clone(), theme.font_size, &[run], None);
+    {
+        let w = f32::from(line.width());
+        let h = f32::from(bounds.size.height);
+        let lh = f32::from(f.line_h);
+        let x = f32::from(bounds.origin.x) + (f32::from(bounds.size.width) - w) / 2.;
+        let y = f32::from(bounds.origin.y) + ((h - lh) / 2.).max(0.);
+        let _ = line.paint(point(px(x), px(y)), f.line_h, gpui::TextAlign::Left, None, window, cx);
+    }
+}
+
+/// 画图片行：经 `AnyImageCache` 异步加载已就绪的 `RenderImage` 后画出；
+/// 加载中/失败画 alt 占位卡片。加载成功（或已预读固有尺寸）即把真实宽高比尺寸
+/// 写回 `WyEditor`（`images_gen` 自增 → 下帧重建帧以真实行高布局）。
+fn paint_image_row(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    img: &ShapedImage,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let content_w = f32::from(f.width) - f32::from(f.padding) * 2.;
+    let x0 = f32::from(origin.x) + f32::from(f.padding) + ((content_w - img.w) / 2.).max(0.);
+    let top0 = f32::from(origin.y) + f32::from(row.top);
+    let bounds = Bounds::new(point(px(x0), px(top0)), size(px(img.w), px(img.h)));
+    // 已知加载失败：直接画 alt 兜底，不再反复发起加载。
+    let state = {
+        let e = editor.read(cx);
+        e.image_size(img.src.as_ref())
+    };
+    if matches!(state, Some(None)) {
+        paint_image_fallback(theme, f, bounds, img, window, cx);
+        return;
+    }
+    let resource = {
+        let e = editor.read(cx);
+        e.image_load_resource(img.src.as_ref())
+    };
+    let cache = {
+        let e = editor.read(cx);
+        e.image_cache()
+    };
+    let anycache: gpui::AnyImageCache = cache.clone().into();
+    match anycache.load(&resource, window, cx) {
+        Some(Ok(data)) => {
+            let img_size = data.size(0);
+            let iw = img_size.width.0 as f32;
+            let ih = img_size.height.0 as f32;
+            if iw > 0. && ih > 0. {
+                let w = img.w.max(1.);
+                let h = (w * ih / iw).max(1.);
+                if state.is_none() {
+                    editor.update(cx, |e, _| e.set_image_size(img.src.clone(), Some((w, h))));
+                }
+                let b = Bounds::new(point(px(x0), px(top0)), size(px(w), px(h)));
+                let _ = window.paint_image(b, b, gpui::Corners::all(px(4.)), data, 0, false);
+            } else {
+                paint_image_fallback(theme, f, bounds, img, window, cx);
+            }
+        }
+        Some(Err(_)) => {
+            editor.update(cx, |e, _| e.set_image_size(img.src.clone(), None));
+            paint_image_fallback(theme, f, bounds, img, window, cx);
+        }
+        None => paint_image_fallback(theme, f, bounds, img, window, cx),
+    }
+}
+
+/// 文本块（段落/标题/引述等可编辑行）逐可视行绘制（x 含行级缩进 `row.x_off`）。
+fn paint_text_row(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let _ = theme;
+    let mut sub_top = row.top;
+    for wl in &row.wrapped {
+        let o = point(origin.x + f.padding + row.x_off, origin.y + sub_top);
+        let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
+        sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+    }
+}
+
+/// 引述块：灰底带 + 左侧指示条（对齐预览：`px_3` 内缩、`py_1` 内衬、3px 边条）。
+/// 每行带从行上/下各向外 4px（`py_1`），相邻引述带重叠 → 整段引述连片灰底。
+fn paint_quote_band(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let x0 = origin.x + f.padding;
+    let y0 = origin.y + row.top - px(4.);
+    // 外层等价 `px_3`（内容边距已含），带再内缩 12 → 带宽 = 内容宽 − 24。
+    let band_w = (f32::from(f.width) - f32::from(f.padding) * 2. - 24.).max(1.);
+    let band_h = row.height + px(8.);
+    let border: gpui::Hsla = { let mut c = theme.divider; c.a = 0.2; c };
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(point(x0, y0), size(px(band_w), band_h)),
+        corner_radii: gpui::Corners::default(),
+        background: theme.quote_bg.into(),
+        border_widths: gpui::Edges::default(),
+        border_color: border,
+        border_style: gpui::BorderStyle::Solid,
+    });
+    // 左侧深色指示条（预览固定色 0xa8b1bd）。
+    let bar: gpui::Hsla = gpui::rgb(crate::config::markdown::QUOTE_BAR_COLOR).into();
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(
+            point(x0, y0),
+            size(px(crate::config::markdown::QUOTE_BAR_WIDTH_PX), band_h),
+        ),
+        corner_radii: gpui::Corners::default(),
+        background: bar.into(),
+        border_widths: gpui::Edges::default(),
+        border_color: bar,
+        border_style: gpui::BorderStyle::Solid,
+    });
+    paint_text_row(origin, theme, f, row, window, cx);
+}
+
+/// 当前选区（源字节归一化区间）；无选区返回 `None`。
+fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &mut App) -> Option<Range<usize>> {
+    editor.read(cx).selection()
+}
+
+/// 选区高亮：对可编辑且与源选区相交的行，按字形几何逐可视行画半透明 accent 矩形。
+/// 与光标共用 `x_off`/`lh`，因此引述缩进里的选中文字也高亮对齐。
+fn paint_selection(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    range: &Range<usize>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut hl = theme.accent;
+    hl.a = 0.28;
+    let e = editor.read(cx);
+    for r in &f.rows {
+        if !r.editable || r.wrapped.is_empty() {
+            continue;
+        }
+        let ls = e.line_start(r.src_line);
+        let le = e.line_end(r.src_line).max(ls);
+        let from = range.start.max(ls).min(le);
+        let to = range.end.max(ls).min(le);
+        if to <= from {
+            continue;
+        }
+        let d0 = source_to_display(&r.byte_map, from - ls);
+        let d1 = source_to_display(&r.byte_map, to - ls);
+        let Some(w0) = r.wrapped.first() else {
+            continue;
+        };
+        let len = w0.len().max(1);
+        let d0 = d0.min(len);
+        let d1 = d0.max(d1.min(len));
+        if d1 <= d0 {
+            continue;
+        }
+        // 逐换行边界组成的可视行字节区间：换行点字节 = 边界前最后 glyph 的起点。
+        let runs = &w0.unwrapped_layout.runs;
+        let mut rows: Vec<(usize, usize)> = Vec::new();
+        let mut prev = 0usize;
+        for b in w0.wrap_boundaries() {
+            let mut byte = 0usize;
+            for (ri, run) in runs.iter().enumerate() {
+                let last = run.glyphs.len().saturating_sub(1);
+                if ri < b.run_ix {
+                    byte = run.glyphs.get(last).map(|g| g.index + 1).unwrap_or(byte);
+                } else if ri == b.run_ix {
+                    byte = run
+                        .glyphs
+                        .get(b.glyph_ix.min(last))
+                        .map(|g| g.index)
+                        .unwrap_or(byte);
+                    break;
+                }
+            }
+            if byte > prev {
+                rows.push((prev, byte));
+                prev = byte;
+            }
+        }
+        rows.push((prev, len));
+        for (a, b2) in rows {
+            let c0 = d0.max(a);
+            let c1 = d1.min(b2);
+            if c1 <= c0 {
+                continue;
+            }
+            let p0 = match w0.position_for_index(c0, r.lh) {
+                Some(p) => p,
+                None => continue,
+            };
+            let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
+            let y = r.top + p1.y.min(p0.y);
+            let w = f32::from(p1.x - p0.x).max(2.);
+            window.paint_quad(gpui::PaintQuad {
+                bounds: Bounds::new(
+                    point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
+                    size(px(w), r.lh),
+                ),
+                corner_radii: gpui::Corners::default(),
+                background: hl.into(),
+                border_widths: gpui::Edges::default(),
+                border_color: gpui::Hsla::default(),
+                border_style: gpui::BorderStyle::Solid,
+            });
+        }
+    }
 }
 
 /// 元素：auto-grow、宿主滚动。
@@ -506,15 +1316,18 @@ impl Element for WyEditorElement {
             } else {
                 px(800.)
             };
-            // 帧缓存：内容/宽度/可视带都没变 → 直接复用总高，不再整篇重建
+            // 帧缓存：内容/宽度/可视带/图片代数都没变 → 直接复用总高，不再整篇重建
             // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
             let rgen = e.content_gen();
+            let igen = e.images_gen();
             let band = e.shape_band().unwrap_or((0., 6500.));
             let cached_total = e
                 .frame
                 .borrow()
                 .as_ref()
-                .filter(|f| f.rgen == rgen && f.width == width && f.band == band)
+                .filter(|f| {
+                    f.rgen == rgen && f.igen == igen && f.width == width && f.band == band
+                })
                 .map(|f| f.total);
             let total = match cached_total {
                 Some(t) => t,
@@ -553,16 +1366,18 @@ impl Element for WyEditorElement {
         );
         self.editor.update(cx, |e, _| e.set_shape_band(Some(band)));
 
-        // 带移动 / 内容 / 宽度变化 → 按新带重建窗口化帧（大文档滚动只补新入带的
-        // shape，其余带外块估算占位，O(n) 只有廉价算术）。
+        // 带移动 / 内容 / 宽度 / 图片加载变化 → 按新状态重建窗口化帧。
         let rgen = self.editor.read(cx).content_gen();
+        let igen = self.editor.read(cx).images_gen();
         let width = {
             let f = self.editor.read(cx).frame.borrow();
             f.as_ref().map(|f| f.width).unwrap_or(px(800.))
         };
         let stale = {
             let f = self.editor.read(cx).frame.borrow();
-            f.as_ref().map_or(true, |f| f.rgen != rgen || f.width != width || f.band != band)
+            f.as_ref().map_or(true, |f| {
+                f.rgen != rgen || f.igen != igen || f.width != width || f.band != band
+            })
         };
         if stale {
             let frame = build_frame(&*self.editor.read(cx), window, width, band);
@@ -578,7 +1393,7 @@ impl Element for WyEditorElement {
         };
         if let Some(f) = frame.as_ref() {
             let editor = self.editor.read(cx);
-            let (on, x, ctop) = caret_geometry(&*editor, &f.rows, f.line_h);
+            let (on, x, ctop) = caret_geometry(&*editor, &f.rows);
             super::set_caret_vis(CaretVis {
                 x,
                 top: if on { ctop } else { px(0.) },
@@ -614,31 +1429,59 @@ impl Element for WyEditorElement {
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
         let origin = bounds.origin;
         for row in &f.rows {
+            // 非文本块按类型自绘：代码面板 / 表格网格 / 图片。
+            match row.kind {
+                IrKind::Code => {
+                    // 带外（未 shape）代码块不画（占位无内容）。
+                    if row.wrapped.is_empty() {
+                        continue;
+                    }
+                    paint_code_row(origin, &theme, f, row, window, cx);
+                    continue;
+                }
+                IrKind::Table => {
+                    if let Some(t) = &row.table {
+                        paint_table_row(origin, &theme, f, row, t, window, cx);
+                    }
+                    continue;
+                }
+                IrKind::Image => {
+                    if let Some(img) = &row.image {
+                        paint_image_row(
+                            &self.editor,
+                            origin,
+                            &theme,
+                            f,
+                            row,
+                            img,
+                            window,
+                            cx,
+                        );
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             // 带外（未 shape）行不可见：跳过文本与背景，避免为整篇占位块画屏。
             if row.wrapped.is_empty() {
                 continue;
             }
-            let mut sub_top = row.top;
-            for wl in &row.wrapped {
-                let o = point(origin.x + f.padding, origin.y + sub_top);
-                if !row.editable {
-                    window.paint_quad(gpui::PaintQuad {
-                        bounds: Bounds::new(o, size(f.padding + wl.width(), f.line_h)),
-                        corner_radii: gpui::Corners::all(px(4.)),
-                        background: theme.code_bg.into(),
-                        border_widths: gpui::Edges::default(),
-                        border_color: gpui::Hsla::default(),
-                        border_style: gpui::BorderStyle::Solid,
-                    });
-                }
-                let _ = wl.paint(o, f.line_h, gpui::TextAlign::Left, None, window, cx);
-                sub_top += f.line_h * (wl.wrap_boundaries().len() + 1) as f32;
+            // 引述块：灰底带 + 左侧指示条（与预览一致：px_3 内缩、py_1 内衬、3px 边条）。
+            // 相邻引述行（源码行连续）合并成一片背景，否则各自带 py_1 空隙。
+            if row.kind == IrKind::Quote {
+                paint_quote_band(origin, &theme, f, row, window, cx);
+                continue;
             }
+            paint_text_row(origin, &theme, f, row, window, cx);
+        }
+        // 选区高亮（可编辑行与源选区相交的部分，按字形几何逐个 WrappedLine 画）。
+        if let Some(range) = editor_selection(&self.editor, cx) {
+            paint_selection(&self.editor, origin, &theme, f, &range, window, cx);
         }
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);
-            caret_geometry(&*e, &f.rows, f.line_h)
+            caret_geometry(&*e, &f.rows)
         };
         if caret_on && focus.is_focused(window) {
             window.paint_quad(gpui::PaintQuad {
@@ -665,7 +1508,7 @@ impl Element for WyEditorElement {
 mod tests {
     use super::{
         build_frame, caret_geometry, display_to_source, source_offset_at, source_to_display,
-        WyEditor,
+        table_block_height, WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -757,7 +1600,7 @@ mod tests {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _| e.set_caret(o2));
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame.rows, frame.line_h);
+            let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame.rows);
             let line_h = f32::from(frame.line_h);
             let top = f32::from(frame.rows[0].top);
             let top2 = f32::from(caret_top);
@@ -860,6 +1703,278 @@ mod tests {
             // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             assert_eq!(frame.rows[1].height, h_real);
+        });
+    }
+
+    #[gpui::test]
+    fn code_table_image_blocks_shape_with_payload(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "\
+```rust
+let a = 1;
+let b = 2;
+let c = 3;
+```
+
+| A | B |
+| --- | --- |
+| 1 | 2 |
+| 3 | 4 |
+
+![图](x.png)
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+
+            // 代码块：3 行逐行 shape、不可编辑、块高 = (行数+2)×code_line。
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code)
+                .expect("应有代码块");
+            assert!(!code.editable, "代码块不可编辑");
+            assert_eq!(code.wrapped.len(), 3, "3 行代码应各一个 WrappedLine");
+            let expect_h = f32::from(theme.code_line()) * 5.;
+            assert!(
+                (f32::from(code.height) - expect_h).abs() < 1.,
+                "代码块高=(行数+2)×code_line，实际 {}",
+                f32::from(code.height)
+            );
+
+            // 表格块：表头 2 列 × 数据 2 行，渲染数据齐备。
+            let table = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table)
+                .expect("应有表格块");
+            assert!(!table.editable);
+            let t = table.table.as_ref().expect("表格应有渲染数据");
+            assert_eq!(t.header_texts.len(), 2);
+            assert_eq!(t.rows_texts.len(), 2);
+            assert_eq!(t.header_texts[0].as_ref(), "A");
+            assert_eq!(t.rows_texts[1][1].as_ref(), "4");
+            assert!(t.total_w > 0.);
+            assert!(
+                (f32::from(table.height) - f32::from(table_block_height(&theme, 2))).abs() < 1.,
+                "表格高与估算同式"
+            );
+
+            // 图片块：占位框（未加载），带 src/alt。
+            let img_row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Image)
+                .expect("应有图片块");
+            assert!(!img_row.editable);
+            let im = img_row.image.as_ref().expect("图片应有渲染数据");
+            assert_eq!(im.src.as_ref(), "x.png");
+            assert_eq!(im.alt.as_ref(), "图");
+            assert!(f32::from(img_row.height) > 0.);
+        });
+    }
+
+    #[gpui::test]
+    fn theme_mirrors_style_params_single_source(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# t\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            // WYSIWYG 主题必须逐项抄自预览单一排版源 StyleParams（改样式只动一处）。
+            let p =
+                crate::markdown::view::style::StyleParams::from_theme_with_font(
+                    cx,
+                    Some(f32::from(theme.font_size)),
+                );
+            assert_eq!(theme.text, p.fg, "正文色应抄自 StyleParams");
+            assert_eq!(theme.code_bg, p.code_bg, "代码块背景应抄自 StyleParams");
+            assert_eq!(theme.divider, p.divider, "分隔线应抄自 StyleParams");
+            assert_eq!(theme.table_head_bg, p.table_head_bg, "表头底色应抄自 StyleParams");
+            assert_eq!(theme.para_line(), p.para_line, "正文行高应抄自 StyleParams");
+            assert_eq!(theme.code_size(), p.code_size, "代码字号应抄自 StyleParams");
+            assert_eq!(theme.code_line(), p.code_line, "代码行高应抄自 StyleParams");
+            for lv in 1..=6 {
+                let (fs, lh) = p.heading_metrics(lv);
+                assert_eq!(theme.heading_fs(lv), fs, "h{lv} 字号应抄自 StyleParams");
+                assert_eq!(theme.heading_line(lv), lh, "h{lv} 行高应抄自 StyleParams");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn image_load_updates_size_and_rebuilds_frame(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let text = "![图](x.png)\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let img_row = frame
+                .rows
+                .iter()
+                .find(|r| r.image.is_some())
+                .expect("应有图片块");
+            let img = img_row.image.as_ref().unwrap();
+            // 未加载：占位高 = IMAGE_ROW_DEFAULT_H。
+            assert_eq!(
+                f32::from(img_row.height),
+                crate::config::markdown::IMAGE_ROW_DEFAULT_H
+            );
+            // 模拟加载完成：设定源像素尺寸（200×100 = 宽高比 2:1）→ 重建帧 →
+            // 显示宽取内容宽、高按宽高比。
+            ed.update(cx, |e, _| {
+                e.set_image_size(img.src.clone(), Some((200., 100.)));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let img_row = frame
+                .rows
+                .iter()
+                .find(|r| r.image.is_some())
+                .expect("应有图片块");
+            let img = img_row.image.as_ref().unwrap();
+            assert!(
+                (img.h - img.w / 2.).abs() < 1.,
+                "图高应保持宽高比 2:1，w={} h={}",
+                img.w,
+                img.h
+            );
+            assert!(
+                (f32::from(img_row.height) - img.h).abs() < 1.,
+                "块高应等于显示图高 {}",
+                img.h
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn ime_composition_replaces_previous_marked_text(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        // 回归「输入“你好”→ “nnini'hni'hao你好”」：Windows 组合更新不携带区间，
+        // 必须替换上一次 marked，而不是一前一后堆叠。
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.set_caret("你好".len());
+                e.replace_and_mark_utf16(None, "n", None, cx);
+                assert_eq!(e.content.as_ref(), "你好n", "组合首键插在光标后");
+                e.replace_and_mark_utf16(None, "ni", None, cx);
+                assert_eq!(e.content.as_ref(), "你好ni", "组合更新应替换旧 marked，不得残留 n");
+                e.replace_and_mark_utf16(None, "nih", None, cx);
+                assert_eq!(e.content.as_ref(), "你好nih", "再次更新仍替换");
+                // 提交：`replace_text_utf16(None)` 落在 marked 上并清掉 marked。
+                e.replace_text_utf16(None, "你好", cx);
+                assert_eq!(e.content.as_ref(), "你好你好", "提交文本替换组合占位，不重复");
+                // 新组合不得再把“已提交中文”当旧 marked 替换。
+                e.replace_and_mark_utf16(None, "n", None, cx);
+                e.replace_and_mark_utf16(None, "ni", None, cx);
+                assert_eq!(e.content.as_ref(), "你好你好ni", "新组合不重复旧提交");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn ime_new_selected_range_is_relative_to_marked(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.set_caret(0);
+                // AppKit setMarkedText 的 selectedRange 是**相对组合文本**的偏移，
+                // 不是文档绝对偏移——光标应落在偏移 1（“好”前），而非文档开头。
+                e.replace_and_mark_utf16(None, "你好", Some(1..2), cx);
+                assert_eq!(e.content.as_ref(), "你好abc", "无选区时组合插入光标处");
+                assert_eq!(
+                    e.caret(),
+                    3,
+                    "光标 = 组合起点 0 + 相对偏移 1 的字节（“好”前），而非文档绝对 1"
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn selection_drag_delete_and_select_all(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("一二三五六"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.begin_selection_at(0);
+                e.extend_selection_to("一二三".len());
+                assert_eq!(e.selection(), Some(0.."一二三".len()), "拖选得源字节区间");
+                // 输入/删除应作用于选区。
+                e.backspace(cx);
+                assert_eq!(e.content.as_ref(), "五六", "Backspace 应删除整段选区");
+                assert_eq!(e.selection(), None);
+                // 全选 + 范围替换。
+                e.select_all();
+                assert_eq!(e.selection(), Some(0.."五六".len()));
+                e.replace_range(e.selection().unwrap(), "你", cx);
+                assert_eq!(e.content.as_ref(), "你", "全选范围替换");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn quote_blocks_are_editable_with_indent(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# 标题\n> 引用内容\n正文"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let quote = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Quote)
+                .expect("应有引述行");
+            assert!(quote.editable, "引述应可编辑（byte_map 非空）");
+            assert!(f32::from(quote.x_off) > 0., "引述应有文本缩进");
+            // 在引述渲染文本内落点 → 源字节在 “引用内容” 上，可正常输入。
+            let off = ed.read(cx).content.as_ref().find("引").unwrap();
+            ed.update(cx, |e, cx| {
+                e.set_caret(off + 3);
+                e.replace_range(off + 3..off + 6, "X", cx);
+            });
+            assert!(
+                ed.read(cx).content.as_ref().contains("引X"),
+                "引述行应可编辑：{}",
+                ed.read(cx).content.as_ref()
+            );
         });
     }
 }

@@ -1210,6 +1210,13 @@ impl EditorApp {
             // 同步全局字号（新建即套用；WY 字号由编辑器自持，measure/prepaint 一致）
             let fs = self.font_size;
             ed.update(cx, |ed, _| ed.set_font_size(gpui::px(fs)));
+            // 图片相对路径基于文件所在目录解析（与预览一致）
+            let base_dir = self.tabs[idx]
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|d| d.to_path_buf());
+            ed.update(cx, |ed, _| ed.set_base_dir(base_dir));
             let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
                 if ev == &WyEvent::Changed {
                     if let Some(tab) = this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))

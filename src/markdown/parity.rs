@@ -495,6 +495,7 @@ fn doc_rope_path_matches_str_path() {
         assert_eq!(a.text, b.text, "src_line {} 文本不一致（Rope vs Str）", a.src_line);
         assert_eq!(a.lines, b.lines);
         assert_eq!(a.byte_map, b.byte_map, "src_line {} 映射不一致", a.src_line);
+        assert_eq!(a.payload, b.payload, "src_line {} 负载不一致（Rope vs Str）", a.src_line);
     }
 }
 
@@ -529,4 +530,41 @@ fn doc_byte_map_maps_render_back_to_line_source() {
     let rq = quote.text.as_ref().find('代').unwrap();
     let sq = quote.byte_map[rq];
     assert_eq!(&src.split('\n').collect::<Vec<_>>()[3][sq..sq + 3], "代");
+}
+
+/// 窗口物化一致性回归：对 CRLF、围栏/表格/头部/引用/图片、**尾随空行**混合的文档
+/// 穷举所有窗口 `[lo..=hi]`，Str 与 Rope 两个源都必须行数 == 窗口块数。
+///
+/// 历史事故：`parse_block_window` 只在 `end < src.len()` 时裁尾 '\n'，文档以
+/// `\r?\n` 结尾时——窗口收束在最后一个真实文本块（EOF 幻影空行块在其后）→ 切片
+/// 多留 1 个换行 → `split('\n')` 多造 1 行 → 调试断言 `70 vs 69` 应用运行时崩溃
+/// （`target/测试.md` 打开即死）。修复：末块若不是 EOF 幻影空行块（`byte==len`）
+/// 也要裁尾 '\n'；全档窗口（末块=幻影）保留该 '\n'（它就是幻影块本体）。
+#[test]
+fn window_rows_match_blocks_for_all_windows() {
+    use crate::markdown::doc::Doc;
+    use gpui::SharedString;
+    use gpui_component::input::Rope;
+    let content = "# 标题\r\n正文 **粗**\r\n\r\n```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n\r\n| A | B |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\n> 引用\r\n\r\n![图](x.png)\r\n图片后段落\r\n";
+    let str_doc = Doc::open(SharedString::from(content));
+    let rope_doc = Doc::open_rope(Rope::from(content));
+    let n = str_doc.block_count();
+    assert_eq!(n, rope_doc.block_count(), "Str/Rope 块数一致");
+    for lo in 0..n {
+        for hi in lo..n {
+            let want = hi - lo + 1;
+            let sc = str_doc.rows_in_block_window(lo, hi);
+            let rc = rope_doc.rows_in_block_window(lo, hi);
+            assert_eq!(sc.len(), rc.len(), "lo={lo} hi={hi} Str/Rope 窗行数一致");
+            assert_eq!(
+                sc.len(),
+                want,
+                "lo={lo} hi={hi} Str 窗口行数应等于块数"
+            );
+            for (a, b) in sc.iter().zip(rc.iter()) {
+                assert_eq!(a.kind, b.kind);
+                assert_eq!(a.text, b.text, "lo={lo} hi={hi} 文本一致");
+            }
+        }
+    }
 }

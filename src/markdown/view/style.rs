@@ -42,6 +42,14 @@ pub(crate) struct StyleParams {
     pub(crate) code_line: Pixels,
     pub(crate) blank_h: Pixels,
     pub(crate) rule_h: Pixels,
+    /// 当前主题是否为暗色（预览与 WYSIWYG 各自派生语法色/代码底色时共用）。
+    pub(crate) is_dark: bool,
+}
+
+/// 由正文字号推导「正文行高/代码字号/代码行高」——**唯一**的缩放系数来源
+/// （`0.88/1.3/1.45` 只在这里出现一次），预览与 WYSIWYG 共用，避免两处各写一套。
+pub(crate) fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
+    (px(fs * 1.45), px(fs * 0.88), px(fs * 1.3))
 }
 
 impl StyleParams {
@@ -57,12 +65,8 @@ impl StyleParams {
         let (para, line, code, code_line) = match font_override {
             Some(fs) => {
                 let fs = fs.max(9.0);
-                (
-                    px(fs),
-                    px(fs * 1.45),
-                    px(fs * 0.88),
-                    px(fs * 1.3),
-                )
+                let (pl, cs, cl) = typography_for_size(fs);
+                (px(fs), pl, cs, cl)
             }
             None => (
                 sm.size,
@@ -101,6 +105,7 @@ impl StyleParams {
             code_line: code_line,
             blank_h: px(12.),
             rule_h: px(18.),
+            is_dark,
         }
     }
 

@@ -9,9 +9,15 @@
 //!   一致，`parity` 钉死）。
 //! - 编辑器 = auto-grow 自绘 [`element::WyEditorElement`]（宿主滚动，与 `live` 同宿主
 //!   范式）；行内样式来自 `DocRow.runs`（`parser::RunKind`）。
-//! - 现状声明（留待逐步补齐）：首帧/变更整篇 shape（未窗口化，大文档慢——下一步把
-//!   `rows_in_line_window` 的窗口化落到 shape，`Doc` 已为此设计）；无选区/多行选择；
-//!   无自动列表续行。仅作「预览编辑测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
+//! - 非文本块已按类型渲染：代码围栏（等宽 + 语法高亮 + 圆角面板）、GFM 表格（网格，
+//!   列宽自适应）、引述（灰底 + 左侧指示条）、独立图片行（`AnyImageCache` 异步加载，
+//!   占位/失败回退 alt）；样式统一抄自预览 [`super::view::style::StyleParams`]。
+//! - 输入：普通文本/IME 组合命中（`marked` 区间追踪，修复重复串）、点击定位、
+//!   鼠标拖选 + Ctrl+C/X/V/A（选区替换/删除）。
+//! - 现状声明（留待逐步补齐）：代码/表格/图片等**非文本块只读**（块模型无行内映射，
+//!   尚不支持在围栏内/表格内编辑，光标停在块边界）；首帧/变更整篇 shape（未窗口化，
+//!   大文档慢——下一步把 `rows_in_line_window` 的窗口化落到 shape，`Doc` 已为此设计）。
+//!   仅作「预览编辑测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
 
 mod element;
 
@@ -24,6 +30,7 @@ use gpui::{
 };
 
 use super::doc::Doc;
+use crate::markdown::view::style::StyleParams;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,19 +40,105 @@ pub enum WyEvent {
 
 /// 行内样式调色（创建时注入；后续随主题切换重建）。
 ///
-/// **关键**：`font_size`/`font` 在创建时由 [`WyEditor::new`] 从
-/// `window.text_style()` **一次性**确定并存进主题——之后 `build_frame` 一律用主题值，
-/// 绝不再次读 `window.text_style()`。因为 measure（栈空=默认 16）与 prepaint
-/// （栈内含 `live-body` 的 `.text_size`）两阶段的 `text_style()` **不同**，若每帧现取
-/// 会在两个字号间交替 = 滚动时「字体一会儿大一会儿小」。
+/// **关键**：整份主题由预览的 [`StyleParams`] 一次性派生（`WyTheme::from_style`），
+/// 颜色与排版数值**逐项抄自同一来源**——预览与 WYSIWYG 改样式只动 `StyleParams`，
+/// 这里不再有任何缩放系数/字号的二次定义。`font_size`/`font` 在创建时由
+/// [`WyEditor::new`] 从 `window.text_style()` **一次性**确定并存进主题——之后
+/// `build_frame` 一律用主题值，绝不再次读 `window.text_style()`。因为 measure
+/// （栈空=默认 16）与 prepaint（栈内含 `live-body` 的 `.text_size`）两阶段的
+/// `text_style()` **不同**，若每帧现取会在两个字号间交替 = 滚动时「字体一会儿大
+/// 一会儿小」。
 #[derive(Clone)]
 pub struct WyTheme {
     pub text: Hsla,
+    /// 引述/次要文字色（预览 `muted_fg`）。
+    pub muted: Hsla,
+    /// 等宽字体（预览主题 `mono`）。
     pub mono: Font,
+    /// 正文字体（应用默认字体）。
     pub font: Font,
+    /// 正文字号（px）——由应用全局字号驱动（主题内正文基准）。
     pub font_size: Pixels,
     pub accent: Hsla,
+    /// 代码块背景（明/暗主题各自取值，与预览一致）。
     pub code_bg: Hsla,
+    /// 分隔线/表格边框色（预览 `divider`）。
+    pub divider: Hsla,
+    /// 表头底色（预览 `table_head_bg`）。
+    pub table_head_bg: Hsla,
+    /// 引述块背景（预览 `quote_bg`，浅灰卡片感）。
+    pub quote_bg: Hsla,
+    pub is_dark: bool,
+    /// 正文行高 / 代码字号 / 代码行高（抄自 [`StyleParams`]，随字号覆盖变化）。
+    pub(crate) para_line: Pixels,
+    pub(crate) code_size: Pixels,
+    pub(crate) code_line: Pixels,
+    /// 各级标题字号/行高（抄自 [`StyleParams::heading_metrics`]，索引 1..=6，0 位不用）。
+    heading_fs: [Pixels; 7],
+    heading_lh: [Pixels; 7],
+}
+
+impl WyTheme {
+    /// 从预览单一排版源 [`StyleParams`] 派生 WYSIWYG 主题（字号覆盖用 `font_size`）。
+    pub(crate) fn from_style(p: &StyleParams, body_font: Font, font_size: Pixels) -> Self {
+        let mut heading_fs = [px(0.); 7];
+        let mut heading_lh = [px(0.); 7];
+        for lv in 1..=6u8 {
+            let (fs, lh) = p.heading_metrics(lv);
+            heading_fs[lv as usize] = fs;
+            heading_lh[lv as usize] = lh;
+        }
+        WyTheme {
+            text: p.fg,
+            muted: p.muted_fg,
+            mono: font(p.mono.clone()),
+            font: body_font,
+            font_size,
+            accent: p.accent,
+            code_bg: p.code_bg,
+            divider: p.divider,
+            table_head_bg: p.table_head_bg,
+            quote_bg: p.quote_bg,
+            is_dark: p.is_dark,
+            para_line: p.para_line,
+            code_size: p.code_size,
+            code_line: p.code_line,
+            heading_fs,
+            heading_lh,
+        }
+    }
+
+    /// 由正文字号覆盖更新尺寸相关字段（缩放系数同样只来自
+    /// [`crate::markdown::view::style::typography_for_size`]，不在此重复定义）。
+    pub(crate) fn set_font_size(&mut self, size: Pixels) {
+        self.font_size = size;
+        let (pl, cs, cl) =
+            crate::markdown::view::style::typography_for_size(f32::from(size).max(9.));
+        self.para_line = pl;
+        self.code_size = cs;
+        self.code_line = cl;
+    }
+
+    /// 正文行高（预览 `para_line`）。
+    pub fn para_line(&self) -> Pixels {
+        self.para_line
+    }
+    /// 代码字号（预览 `code_size`）。
+    pub fn code_size(&self) -> Pixels {
+        self.code_size
+    }
+    /// 代码行高（预览 `code_line`）。
+    pub fn code_line(&self) -> Pixels {
+        self.code_line
+    }
+    /// 第 n 级标题字号（预览 `heading_metrics`：h1=20 h2=18 h3/4=16 其余 15）。
+    pub fn heading_fs(&self, level: u8) -> Pixels {
+        self.heading_fs[(level as usize).clamp(1, 6)]
+    }
+    /// 第 n 级标题行高。
+    pub fn heading_line(&self, level: u8) -> Pixels {
+        self.heading_lh[(level as usize).clamp(1, 6)]
+    }
 }
 
 /// 每帧光标几何（供 IME/`EntityInputHandler::bounds_for_range` 读取）。
@@ -88,29 +181,51 @@ pub struct WyEditor {
     /// 而非每次回到估算——否则行高在估算/真实间跳动，滚动时文字忽大忽小）。
     /// 键 = `(gen, src_line, kind_tag, width_bits)` 的 hash；值 = 可视行数。
     height_cache: RefCell<std::collections::HashMap<u64, u32>>,
+    /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
+    image_cache: gpui::Entity<gpui::RetainAllImageCache>,
+    /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
+    /// `None`(外层) = 尚未尝试加载；`Some(None)` = 加载失败（一直显示 alt 兜底）；
+    /// `Some(Some(..))` = 已加载。供 shape（假布局尺寸）与 paint（占位）共用。
+    image_sizes: RefCell<std::collections::HashMap<SharedString, Option<(f32, f32)>>>,
+    /// 图片加载完成代数：任何图片从「占位尺寸」变成「真实尺寸」自增——
+    /// 纳入帧缓存键，新图到达后必须重建整帧（否则缓存总高还是旧尺寸）。
+    images_gen: Cell<u64>,
+    /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
+    base_dir: Option<std::path::PathBuf>,
+    /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
+    /// 关键：组合的每次更新都**替换**这段（而非追加到后面）——不追踪它就会把
+    /// 上一次组合的字符重复插入（输入“你好”→ “nnini'hni'hao你好”的坏字符）。
+    marked: Option<Range<usize>>,
+    /// 文本选区的固定锚点（源字节）。`Some(anchor)` 时选区 = `anchor..caret`（caret
+    /// 为活动端）；`None` = 无选区（仅光标）。拖拽/ Shift+方向 产生，Ctrl+C/A/V 消费。
+    sel_anchor: Option<usize>,
+    /// 鼠标左键拖选进行中（on_mouse_move 延伸选区）。
+    dragging: bool,
 }
 
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
+        let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
+        let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
         Self {
             content: SharedString::default(),
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
             caret: 0,
-            theme: WyTheme {
-                text: ts.color,
-                mono: font("monospace"),
-                font: ts.font(),
-                font_size: ts.font_size.to_pixels(window.rem_size()),
-                accent: gpui::rgb(0x3b82f6).into(),
-                code_bg: gpui::hsla(0.62, 0.35, 0.62, 0.18),
-            },
+            theme: WyTheme::from_style(&p, ts.font(), fs),
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
             height_cache: RefCell::new(std::collections::HashMap::new()),
+            image_cache: gpui::RetainAllImageCache::new(cx),
+            image_sizes: RefCell::new(std::collections::HashMap::new()),
+            images_gen: Cell::new(0),
+            base_dir: None,
+            marked: None,
+            sel_anchor: None,
+            dragging: false,
         }
     }
 
@@ -122,12 +237,13 @@ impl WyEditor {
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
-    /// 保证 measure/prepaint 两阶段一致。
+    /// 保证 measure/prepaint 两阶段一致。字号只影响正文/代码尺寸，标题按
+    /// [`StyleParams::heading_metrics`] 固定；缩放系数见 `typography_for_size`。
     pub fn set_font_size(&mut self, size: Pixels) {
         if self.theme.font_size == size {
             return;
         }
-        self.theme.font_size = size;
+        self.theme.set_font_size(size);
         *self.frame.borrow_mut() = None;
     }
 
@@ -156,9 +272,96 @@ impl WyEditor {
     pub fn set_source_text(&mut self, text: &str) {
         self.content = SharedString::from(text);
         self.doc = Doc::open(self.content.clone());
+        self.preseed_image_sizes();
         self.caret = self.caret.min(self.content.len());
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
+    }
+
+    /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
+    pub fn set_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.base_dir = dir;
+        // 基准目录变化 → 重新解析图片尺寸（此前按旧基准解析的作废）。
+        self.image_sizes.borrow_mut().clear();
+        self.images_gen.set(self.images_gen.get().wrapping_add(1));
+        self.preseed_image_sizes();
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
+    /// 基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src` 一致）。
+    fn resolve_image_src(&self, src: &str) -> String {
+        let lower = src.to_lowercase();
+        if lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("file://")
+        {
+            return src.to_string();
+        }
+        if src.len() >= 2 && src.as_bytes()[1] == b':' {
+            return src.to_string();
+        }
+        if std::path::Path::new(src).is_absolute() {
+            return src.to_string();
+        }
+        match &self.base_dir {
+            Some(base) => base.join(src).to_string_lossy().to_string(),
+            None => src.to_string(),
+        }
+    }
+
+    /// 图片加载资源（解析后的路径/URL → gpui 加载器资源）。
+    pub(crate) fn image_load_resource(&self, src: &str) -> gpui::Resource {
+        let resolved = self.resolve_image_src(src);
+        if resolved.starts_with("http://")
+            || resolved.starts_with("https://")
+            || resolved.starts_with("file://")
+        {
+            gpui::Resource::Uri(resolved.into())
+        } else {
+            gpui::Resource::Path(std::sync::Arc::<std::path::Path>::from(
+                std::path::PathBuf::from(resolved),
+            ))
+        }
+    }
+
+    /// 打开文档后预读图片行的固有尺寸（与预览一致：本地文件按宽高比显示，
+    /// 首帧即用真实行高，避免「占位 → 真实」跳动）。只读文件头，O(行数，廉价)。
+    ///
+    /// 从原始源码行直接取 src（`parser::parse_image_line`），不物化 [`DocRow`]——
+    /// 逐块 `rows_in_block_window(i, i)` 会命中 `parse_block_window` 的「末块含尾
+    /// 换行 ≠ 块数」边界（debug 断言），且为读个 src 物化整行纯属浪费。
+    fn preseed_image_sizes(&self) {
+        let n = self.doc.block_count();
+        for i in 0..n {
+            let Some(meta) = self.doc.block_meta(i) else {
+                continue;
+            };
+            if meta.kind != crate::markdown::parser::RowKind::Image {
+                continue;
+            }
+            let line = self.doc.line_str(meta.src_line as usize);
+            let Some((_, src)) = crate::markdown::parser::parse_image_line(line.trim()) else {
+                continue;
+            };
+            let key: SharedString = src.clone().into();
+            if self.image_sizes.borrow().contains_key(&key) {
+                continue;
+            }
+            let resolved = self.resolve_image_src(&src);
+            if !resolved.starts_with("http://")
+                && !resolved.starts_with("https://")
+                && !resolved.starts_with("file://")
+            {
+                if let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
+                    std::path::Path::new(&resolved),
+                ) {
+                    self.image_sizes
+                        .borrow_mut()
+                        .insert(key, Some((w as f32, h as f32)));
+                }
+            }
+        }
     }
 
     /// 内部数据（元素读取）。
@@ -175,7 +378,198 @@ impl WyEditor {
     /// 直接放置光标（源字节偏移）。命中/测试/编程式定位共用。
     pub(crate) fn set_caret(&mut self, off: usize) {
         self.caret = off.min(self.content.len());
+        self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
+    }
+
+    /* ---------- 选区 ---------- */
+
+    /// 当前选区（归一化源字节区间）；无选区或零宽返回 `None`。
+    pub(crate) fn selection(&self) -> Option<Range<usize>> {
+        match self.sel_anchor {
+            Some(a) if a != self.caret => {
+                let s = a.min(self.caret).min(self.content.len());
+                let e = a.max(self.caret).min(self.content.len());
+                if s < e {
+                    Some(s..e)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// 选中的源文本（复制/Ctrl+C）。
+    fn selected_text(&self) -> String {
+        self.selection()
+            .map(|r| self.content.as_ref()[r].to_string())
+            .unwrap_or_default()
+    }
+
+    /// 鼠标按下：锚点 = 光标处（开始拖选）。
+    pub(crate) fn begin_selection_at(&mut self, off: usize) {
+        let off = off.min(self.content.len());
+        self.caret = off;
+        self.sel_anchor = Some(off);
+        self.dragging = true;
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 拖拽中延伸选区（活动端跟随鼠标）。
+    pub(crate) fn extend_selection_to(&mut self, off: usize) {
+        if !self.dragging {
+            return;
+        }
+        let off = off.min(self.content.len());
+        self.caret = off;
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some(off);
+        }
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 鼠标松开结束拖选。
+    pub(crate) fn end_selection(&mut self) {
+        self.dragging = false;
+        // 零宽（纯点击）→ 视为无选区。
+        if self.sel_anchor == Some(self.caret) {
+            self.sel_anchor = None;
+        }
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 全选。
+    pub(crate) fn select_all(&mut self) {
+        self.sel_anchor = Some(0);
+        self.caret = self.content.len();
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 复制：写入平台剪贴板（由 `on_action(Copy)` 装配）。
+    fn copy(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(self.selected_text()));
+    }
+
+    /// 剪切：复制 + 删除选区。
+    fn cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.copy(window, cx);
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        self.replace_range(range, "", cx);
+    }
+
+    /// 粘贴：用剪贴板文本替换选区（若为空则插入光标处）。
+    fn paste(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let text = cx
+            .read_from_clipboard()
+            .map(|i| i.text().unwrap_or_default())
+            .unwrap_or_default();
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        if text.is_empty() && range.start == range.end {
+            return;
+        }
+        self.replace_range(range, &text, cx);
+    }
+
+    /// 直输/提交（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked，
+    /// 再清掉 marked——否则下一次组合会把已提交文本当旧 marked 再次替换。
+    pub(crate) fn replace_text_utf16(
+        &mut self,
+        range: Option<Range<usize>>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let r = match range {
+            Some(r) => range_from_utf16(self.content.as_ref(), r),
+            None => self
+                .marked
+                .clone()
+                .unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret)),
+        };
+        self.replace_range(r, text, cx);
+        self.marked = None;
+    }
+
+    /// IME 组合更新（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked
+    /// （没有 marked 时才落普通选区/光标）——否则 Windows 每次组合更新都不带区间，
+    /// 新旧组合文本会一前一后堆叠出「nnini'hni'hao你好」式垃圾串。
+    pub(crate) fn replace_and_mark_utf16(
+        &mut self,
+        range: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        let byte_range = match range {
+            Some(r) => range_from_utf16(self.content.as_ref(), r),
+            None => self
+                .marked
+                .clone()
+                .unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret)),
+        };
+        self.replace_range(byte_range.clone(), new_text, cx);
+        if new_text.is_empty() {
+            // 组合被取消：清掉 marked，光标回组合起点。
+            self.marked = None;
+            self.caret = byte_range.start.min(self.content.len());
+        } else {
+            self.marked = Some(
+                byte_range.start..byte_range.start + new_text.len().min(self.content.len() - byte_range.start),
+            );
+            // `new_selected_range` 是**相对 new_text 起点**的 UTF-16 偏移，不是文档
+            // 绝对偏移（AppKit setMarkedText 的 selectedRange 语义）。
+            let caret = match new_selected_range {
+                Some(sel) => byte_range.start + offset_from_utf16(new_text, sel.start).min(new_text.len()),
+                None => byte_range.start + new_text.len(),
+            };
+            self.caret = caret.min(self.content.len());
+        }
+        cx.notify();
+    }
+
+    /* ---------- 点击 / 鼠标 ---------- */
+
+    /// 鼠标按下命中 → 源偏移（经 frame + byte_map）；左键开始拖选并抢焦点。
+    pub(crate) fn on_mouse_down(
+        &mut self,
+        ev: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ev.button != gpui::MouseButton::Left {
+            return;
+        }
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let off = element::source_offset_at(self, f, ev.position);
+        drop(marker);
+        self.focus.focus(window, cx);
+        self.begin_selection_at(off);
+        cx.notify();
+    }
+
+    /// 拖拽中（左键已按下）。
+    pub(crate) fn on_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let off = element::source_offset_at(self, f, ev.position);
+        drop(marker);
+        self.extend_selection_to(off);
+        *self.frame.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// 鼠标松开：结束拖选。
+    pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
+        self.end_selection();
+        cx.notify();
     }
 
     /// 记录本帧元素在窗口中的 bounds（paint 调用；鼠标命中换算用）。
@@ -200,6 +594,30 @@ impl WyEditor {
     }
     pub(crate) fn cache_height_lines(&self, key: u64, lines: u32) {
         self.height_cache.borrow_mut().insert(key, lines);
+    }
+
+    /// 图片加载缓存实体（元素在 paint 里 `load` 用）。
+    pub(crate) fn image_cache(&self) -> gpui::Entity<gpui::RetainAllImageCache> {
+        self.image_cache.clone()
+    }
+
+    /// `src` 的当前显示尺寸：`None` = 未尝试加载（发起加载/占位）；
+    /// `Some(None)` = 加载失败；`Some(Some((w, h)))` = 已加载的真实宽高比尺寸。
+    pub(crate) fn image_size(&self, src: &str) -> Option<Option<(f32, f32)>> {
+        self.image_sizes.borrow().get(src).copied()
+    }
+
+    /// 记录 `src` 的显示尺寸；尺寸变化（占位→真实）自增 `images_gen` 使帧缓存失效。
+    pub(crate) fn set_image_size(&self, src: SharedString, size: Option<(f32, f32)>) {
+        let changed = self.image_sizes.borrow().get(&src).copied() != Some(size);
+        if changed {
+            self.image_sizes.borrow_mut().insert(src, size);
+            self.images_gen.set(self.images_gen.get().wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn images_gen(&self) -> u64 {
+        self.images_gen.get()
     }
 
     /* ---------- 光标 ↔ 源辅助 ---------- */
@@ -292,6 +710,7 @@ impl WyEditor {
     /* ---------- 编辑操作（源字节域） ---------- */
 
     /// 核心编辑：替换 `[start, end)` → `text`，重建模型、移光标、通知。
+    /// 任意替换都会收敛选区（无选区）与 IME 组合区间（替换后由输入处理器重设）。
     pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
         let s = self.content.as_ref();
         let r = range.start.min(s.len())..range.end.min(s.len());
@@ -305,6 +724,7 @@ impl WyEditor {
         self.content = SharedString::from(next);
         self.doc = Doc::open(self.content.clone());
         self.caret = (r.start + text.len()).min(self.content.len());
+        self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);
@@ -312,6 +732,10 @@ impl WyEditor {
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
+        // 有选区 → 直接删选区（等价退格删除选中文字）。
+        if let Some(range) = self.selection() {
+            return self.replace_range(range, "", cx);
+        }
         let s = self.content.as_ref();
         let at = self.caret.min(s.len());
         if at == 0 {
@@ -322,6 +746,9 @@ impl WyEditor {
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
+        if let Some(range) = self.selection() {
+            return self.replace_range(range, "", cx);
+        }
         let s = self.content.as_ref();
         let at = self.caret.min(s.len());
         if at >= s.len() {
@@ -332,7 +759,8 @@ impl WyEditor {
     }
 
     fn newline(&mut self, cx: &mut Context<Self>) {
-        self.replace_range(self.caret..self.caret, "\n", cx);
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        self.replace_range(range, "\n", cx);
     }
 
     /* ---------- 光标移动 ---------- */
@@ -447,24 +875,6 @@ impl WyEditor {
     fn moved(&mut self) {
         *self.frame.borrow_mut() = None;
     }
-
-    /* ---------- 点击 / 鼠标 ---------- */
-
-    /// 鼠标按下命中 → 源偏移（经 frame + byte_map）。
-    pub(crate) fn on_mouse_down(&mut self, ev: &gpui::MouseDownEvent, cx: &mut Context<Self>) {
-        if ev.button != gpui::MouseButton::Left {
-            return;
-        }
-        let marker = self.frame.borrow();
-        let Some(f) = marker.as_ref().map(|r| &**r) else {
-            return;
-        };
-        let off = element::source_offset_at(self, f, ev.position);
-        drop(marker);
-        self.caret = off.min(self.content.len());
-        *self.frame.borrow_mut() = None;
-        cx.notify();
-    }
 }
 
 /* ---------- 键盘 / IME 输入 ---------- */
@@ -502,6 +912,10 @@ wy_action!(Down, "wy-down");
 wy_action!(Backspace, "wy-backspace");
 wy_action!(Delete, "wy-delete");
 wy_action!(Enter, "wy-enter");
+wy_action!(SelectAll, "wy-select-all");
+wy_action!(Copy, "wy-copy");
+wy_action!(Cut, "wy-cut");
+wy_action!(Paste, "wy-paste");
 
 /// 装配键位（入口：`main.rs` 与其它键位一并安装）。
 pub fn bind_keys(cx: &mut gpui::App) {
@@ -514,6 +928,10 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
+        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
     ])
 }
 
@@ -563,17 +981,27 @@ impl EntityInputHandler for WyEditor {
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         let s = self.content.as_ref();
-        Some(UTF16Selection {
-            range: range_to_utf16(s, self.caret..self.caret),
-            reversed: false,
-        })
+        match self.selection() {
+            Some(r) => Some(UTF16Selection {
+                range: range_to_utf16(s, r),
+                reversed: self.caret < self.sel_anchor.unwrap_or(self.caret),
+            }),
+            None => Some(UTF16Selection {
+                range: range_to_utf16(s, self.caret..self.caret),
+                reversed: false,
+            }),
+        }
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        None
+        self.marked
+            .as_ref()
+            .map(|r| range_to_utf16(self.content.as_ref(), r.clone()))
     }
 
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.marked = None;
+    }
 
     fn replace_text_in_range(
         &mut self,
@@ -582,11 +1010,7 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let r = range
-            .as_ref()
-            .map(|r| range_from_utf16(self.content.as_ref(), r.clone()))
-            .unwrap_or(self.caret..self.caret);
-        self.replace_range(r, text, cx);
+        self.replace_text_utf16(range, text, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -597,21 +1021,24 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let r_start = range
-            .as_ref()
-            .map(|r| range_from_utf16(self.content.as_ref(), r.clone()))
-            .unwrap_or(self.caret..self.caret);
-        let r_start_end = r_start.start;
-        self.replace_range(r_start, new_text, cx);
-        if let Some(sel) = new_selected_range {
-            let start = range_from_utf16(self.content.as_ref(), sel).start;
-            self.caret = (r_start_end + start).min(self.content.len());
-        }
+        self.replace_and_mark_utf16(range, new_text, new_selected_range, cx);
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        let r = range_from_utf16(self.content.as_ref(), range_utf16);
+        self.caret = r.end.min(self.content.len());
+        self.sel_anchor = Some(r.start.min(self.content.len()));
+        *self.frame.borrow_mut() = None;
     }
 
     fn bounds_for_range(
         &mut self,
-        _range: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: gpui::Bounds<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
@@ -619,20 +1046,41 @@ impl EntityInputHandler for WyEditor {
         let v = caret_vis();
         // `caret_vis` 是元素局部坐标（`paint` 时相对元素原点记录），需叠回元素在
         // 窗口中的原点，IME/输入法候选窗才落在光标处（否则整体偏移元素原点）。
+        // 组合时画在标记文本上（从 marked 起点到本次输入终点），否则画光标竖条。
+        let r = range_from_utf16(self.content.as_ref(), range_utf16);
+        let w = if self.marked.as_ref().map_or(false, |m| r == *m) && r.end > r.start {
+            // 组合候选：让候选窗落在整个标记文本宽度上，而不是零宽竖条。
+            // 真实几何很难按字符溯源，这里用“应盖住的位置”转成可见块（至少一字符宽）。
+            px(24.)
+        } else {
+            px(2.)
+        };
         Some(gpui::Bounds::new(
             gpui::point(element_bounds.origin.x + v.x, element_bounds.origin.y + v.top),
-            gpui::size(px(2.), v.line_height),
+            gpui::size(w, v.line_height),
         ))
     }
 
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
+        point: gpui::Point<Pixels>,
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        // 初步：返回光标（平台 IME 用）；真实命中经 element 的 on_mouse_down。
-        Some(offset_to_utf16(self.content.as_ref(), self.caret))
+        // 真实命中：经 frame 反查源偏移（平台 IME/辅助功能用，坐标元素局部）。
+        let marker = self.frame.borrow();
+        let f = marker.as_ref().map(|r| &**r)?;
+        let off = element::source_offset_at_local(self, f, point);
+        drop(marker);
+        Some(offset_to_utf16(self.content.as_ref(), off))
+    }
+
+    fn text_length_utf16(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.content.as_ref().encode_utf16().count())
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
@@ -691,10 +1139,41 @@ impl gpui::Render for WyEditor {
                     this.newline(cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &SelectAll, _: &mut Window, _: &mut Context<WyEditor>| {
+                    this.select_all()
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &Copy, window: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.copy(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &Cut, window: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.cut(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &Paste, window: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.paste(window, cx)
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseDownEvent, _: &mut Window, cx: &mut Context<WyEditor>| {
-                    this.on_mouse_down(ev, cx)
+                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.on_mouse_down(ev, window, cx)
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.on_mouse_move(ev, cx)
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.on_mouse_up(ev, cx)
                 }),
             )
             .child(element::WyEditorElement {

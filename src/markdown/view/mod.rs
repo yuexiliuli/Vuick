@@ -20,7 +20,7 @@
 //! - `table`：GFM 表格渲染（[`table::render_table`] / `render_table_row`）
 //! - `tests`：视图层测试
 
-mod dimensions;
+pub(crate) mod dimensions;
 mod row;
 pub(crate) mod style;
 mod table;

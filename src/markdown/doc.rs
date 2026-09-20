@@ -19,8 +19,29 @@ use gpui::SharedString;
 use gpui_component::input::Rope;
 
 use super::ir::{build_ir, IrBlock, IrKind};
-use super::parser::{parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind};
+use super::parser::{
+    parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind, TableData,
+};
 use super::parser;
+
+/// 块级渲染负载（非纯文本块的渲染数据，统一行 [`DocRow`] 的伴生字段）。
+///
+/// Code/Table/Image 等块在预览侧重于 `Row.payload`（代码全部行 / 表格网格 / 图片源），
+/// WYSIWYG 也需要这些才画得出来——统一行把它们一并带过来，避免渲染分支丢数据。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum DocPayload {
+    #[default]
+    Text,
+    /// 代码围栏：全部代码行 + 语言标记（用于等宽排版/背景面板）。
+    Code {
+        code_lines: Vec<SharedString>,
+        language: Option<SharedString>,
+    },
+    /// 独立图片行：图片源。
+    Image { src: SharedString },
+    /// GFM 表格：网格数据。
+    Table(TableData),
+}
 
 /// 统一渲染行（块粒度：Code/Table 等一个块 = 一个 DocRow，跨多行）。
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +60,8 @@ pub(crate) struct DocRow {
     /// 源段尾）。非文本行（代码/表格/图片/规则/空行）为空。
     /// 由 `parser::text_segment` + `parser::inline_style_mapped` 装配（与预览同一段派生）。
     pub(crate) byte_map: Vec<usize>,
+    /// 块级渲染负载（非文本块的渲染数据）。
+    pub(crate) payload: DocPayload,
 }
 
 /// 文档源：`Str`（小文档）或 `Rope`（大文档，COW，与编辑器共享底层树）。
@@ -184,7 +207,8 @@ impl Doc {
     }
 
     /// 把预览侧一个块行装成统一行：kind/行区间取自 IR（金标准），文本取自预览，
-    /// 文本行额外装配「渲染字节→源字节」编辑映射。
+    /// 文本行额外装配「渲染字节→源字节」编辑映射；非文本行把渲染负载（代码行/
+    /// 图片源/表格网格）带进统一行。
     fn assemble(&self, r: Row) -> DocRow {
         let block = self.ir.iter().find(|b| b.lines.start == r.src_line);
         let kind = block.map_or_else(|| row_kind(r.kind), |b| b.kind);
@@ -203,6 +227,17 @@ impl Doc {
         } else {
             Vec::new()
         };
+        let payload = match r.kind {
+            RowKind::Code => DocPayload::Code {
+                code_lines: r.code_lines().to_vec(),
+                language: r.code_language().map(Into::into),
+            },
+            RowKind::Image => DocPayload::Image {
+                src: r.image().map(|i| i.src.clone()).unwrap_or_default(),
+            },
+            RowKind::Table => r.table().cloned().map(DocPayload::Table).unwrap_or_default(),
+            _ => DocPayload::Text,
+        };
         DocRow {
             kind,
             src_line: r.src_line,
@@ -210,11 +245,12 @@ impl Doc {
             text: r.text,
             runs: r.runs,
             byte_map,
+            payload,
         }
     }
 
     /// 第 `ix` 行的源码文本（仅该行切片，O(行长)）。
-    fn line_str(&self, ix: usize) -> String {
+    pub(crate) fn line_str(&self, ix: usize) -> String {
         let s = self.line_starts.get(ix).copied().unwrap_or(0);
         let e = self
             .line_starts
@@ -244,7 +280,7 @@ impl Doc {
 }
 
 /// 预览 `RowKind` → IR 语义（对齐子集上恒等；parity 保证二者一致）。
-fn row_kind(k: RowKind) -> IrKind {
+pub(crate) fn row_kind(k: RowKind) -> IrKind {
     match k {
         RowKind::Paragraph => IrKind::Paragraph,
         RowKind::Heading(n) => IrKind::Heading(n),
