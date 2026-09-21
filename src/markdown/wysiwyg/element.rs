@@ -2903,10 +2903,11 @@ pub(crate) fn code_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRow
 
 /// 代码块横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
 /// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回
-/// `(块首源行, 是否点在滑块上, 指针相对滑块中心的水平偏移)`。
+/// `(块首源行, 是否点在滑块上, 指针相对滑块左缘的水平偏移)`。
 /// 命中轨道（不在滑块上）→ 调用方让滑块跳到点击处；点在滑块上 → 进入拖动。
-/// 与 `paint_code_row` 的滚动条几何同源（view 的 gpui-component 语义：thumb 上拖、
-/// 轨道上跳转）。
+/// 与 `paint_code_row` 的滚动条几何同源（view 的 gpui-component 语义：
+/// **抓取点 = 指针相对滑块左缘的偏移**——按下瞬间不跳档，拖动时滑块钉住该点
+/// 1:1 跟随指针；旧实现从滑块**中心**量 grab，按下就前跳半个滑块宽 → 不跟手）。
 pub(crate) fn code_hscrollbar_hit(
     editor: &WyEditor,
     frame: &Frame,
@@ -2931,7 +2932,9 @@ pub(crate) fn code_hscrollbar_hit(
         }
         if px >= bar_x && px <= bar_x + bar_w {
             let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
-            let grab = px - (thumb_x + thumb_w / 2.0);
+            // 抓取点 = 指针相对滑块**左缘**偏移（拖动时 `thumb_x = px - grab`，
+            // 与 gpui-component 的 `drag_pos` 同语义：按下不跳、移动即钉住跟手）。
+            let grab = px - thumb_x;
             return Some((r.src_line, on_thumb, grab));
         }
     }
@@ -4979,6 +4982,122 @@ let c = 333;
                 click_count: 1,
             };
             ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+            assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_hscroll_thumb_drag_tracks_pointer_without_jump(cx: &mut TestAppContext) {
+        // 回归「不跟手」：旧实现 grab 从滑块**中心**量、却按**左缘**参与换算 →
+        // 按下滑块瞬间 scroll 前跳半个滑块宽，拖动手感像「先在别处吸住再跑」。
+        // 修后语义（对齐 gpui-component drag_pos）：grab = 指针相对滑块**左缘**偏移，
+        // 按下不跳档、拖动时滑块钉住抓取点 1:1 跟随指针（thumb_x = px − grab）。
+        use crate::markdown::ir::IrKind;
+        use gpui::{
+            Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+        };
+        cx.update(gpui_component::init);
+        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+                .expect("应有代码块");
+            let code_top = f32::from(code.top);
+            let code_h = f32::from(code.height);
+            let blk = code.src_line;
+            let (bar_x, bar_w, _, _, max_scroll) =
+                super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
+            // 滚动到中段，滑块离开左端（否则抓取点恒 0，测不出左缘语义）。
+            let mid = max_scroll * 0.5;
+            ed.update(cx, |e, _| {
+                e.set_code_h_scroll(blk, mid);
+                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+            });
+            // geo 是纯函数（读实时 scroll），用编辑器里那份帧反复重算滑块几何。
+            let geo_of = |e: &WyEditor| -> (f32, f32, f32, f32, f32) {
+                let f = e.frame.borrow();
+                let fr = f.as_ref().map(|r| &**r).unwrap();
+                let r = fr.rows.iter().find(|r| r.src_line == blk).unwrap();
+                super::code_hscroll_geo(e, fr, r).unwrap()
+            };
+            let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) = geo_of(ed.read(cx));
+            let travel = bar_w - thumb_w;
+            let grab = thumb_w * 0.25; // 抓取点：滑块内距左缘 1/4 宽。
+            let p0_x = thumb_x + grab;
+            let band_top = code_top + code_h - crate::config::layout::CODE_HSCROLL_BAND;
+            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+
+            // 1) 按下滑块：scroll 必须**保持 mid**（不跳档），并进入拖动态。
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(p0_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+            assert_eq!(
+                ed.read(cx).code_h_scroll_of(blk),
+                mid,
+                "按下滑块瞬间不应跳档（old grab=中心导致前跳半个滑块宽）"
+            );
+            assert!(ed.read(cx).code_h_drag.borrow().is_some(), "应在拖动态");
+
+            // 2) 拖动 +Δ：滑块钉住抓取点 1:1 跟随 → thumb_x_new = p − grab（轨内 clamp）。
+            let p1_x = p0_x + 60.0;
+            let m1 = MouseMoveEvent {
+                position: point(px(p1_x), px(band_y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            ed.update(cx, |e, cx| e.on_mouse_move(&m1, cx));
+            let (_, _, thumb_x2, _, _) = geo_of(ed.read(cx));
+            let expect_x = (p1_x - grab).clamp(bar_x, bar_x + travel);
+            assert!(
+                (thumb_x2 - expect_x).abs() < 0.5,
+                "拖动应钉住抓取点（thumb 应到 {expect_x:.1}，实际 {thumb_x2:.1}）"
+            );
+            let expect_scroll = (expect_x - bar_x) / travel * max_scroll;
+            let scrolled = ed.read(cx).code_h_scroll_of(blk);
+            assert!(
+                (scrolled - expect_scroll).abs() < max_scroll * 0.01,
+                "scroll 应与指针位移 1:1 对应：{scrolled:.1} ≈ {expect_scroll:.1}"
+            );
+
+            // 3) 继续拖出右端 → clamp 到 max_scroll（thumb 停在轨道端，参考语义）。
+            let far = MouseMoveEvent {
+                position: point(px(bar_x + bar_w + 100.), px(band_y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            ed.update(cx, |e, cx| e.on_mouse_move(&far, cx));
+            assert!(
+                (ed.read(cx).code_h_scroll_of(blk) - max_scroll).abs() < 0.5,
+                "拖出右端应 clamp 到 max_scroll"
+            );
+
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(p1_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_up(&up, cx));
             assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
         });
     }

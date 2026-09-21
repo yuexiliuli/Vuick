@@ -241,7 +241,7 @@ pub struct WyEditor {
     /// 由横向滚动条/拖动驱动（paint 平移 + 命中/光标/选区反向加回）。纯视图状态，
     /// 不写源码、不进撤销栈。
     code_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
-    /// 代码块横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块中心偏移))`。
+    /// 代码块横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
     code_h_drag: RefCell<Option<(usize, f32)>>,
     /// 已折叠的标题区块（视图本地状态，键 = 标题行 trim 后的文本，与 `live` 一致；
     /// markdown 没有标题折叠语法，折叠态**不写回源码**、不进撤销栈）。点击标题行
@@ -791,7 +791,8 @@ impl WyEditor {
         self.set_code_h_scroll(blk, rel * max_scroll);
     }
 
-    /// 把指针位置应用到正在拖动的代码块横向滚动条（保持抓取点相对滑块中心）。
+    /// 把指针位置应用到正在拖动的代码块横向滚动条（保持**抓取点相对滑块左缘**：
+    /// `thumb_x = px - grab`，按下瞬间 scroll 不变、拖动时滑块钉住抓取点 1:1 跟随）。
     fn code_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let Some((blk, grab)) = self.code_h_drag.borrow().clone() else {
             return;
