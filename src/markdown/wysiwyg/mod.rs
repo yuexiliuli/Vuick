@@ -266,11 +266,11 @@ pub(crate) enum MathSlot {
 }
 
 /// 数学文字色（单一源：位图着色 = Unicode 回退文本色 = 渲染 fallback 一致）。
-/// 仍按 `math_color` 的紫 `0x6d5bd0`（业界公式感），暗色主题提亮。
+/// 取 `config::math::MATH_COLOR` 的紫（业界公式感），暗色主题提亮。
 pub(crate) fn math_color(theme: &WyTheme) -> Hsla {
-    let mut c: Hsla = gpui::rgb(0x6d5bd0).into();
+    let mut c: Hsla = gpui::rgb(crate::config::math::MATH_COLOR).into();
     if theme.is_dark {
-        c.l = (c.l + 0.18).clamp(0.05, 1.);
+        c.l = (c.l + crate::config::math::MATH_COLOR_DARK_LIFT).clamp(0.05, 1.);
     }
     c
 }
@@ -780,13 +780,19 @@ impl WyEditor {
 
         // 收集块 + 行内公式 LaTeX 源码（键 = 去定界符后的源码，同 zorite 的 MathStore）。
         let content = self.content.as_ref().to_string();
-        // (槽键, 排版边距, 要排版的 LaTeX)：块用 `PAD`；行内用 `INLINE_PAD` 且键带
-        // `inline:` 前缀（否则与块公式同键、且行内吃不到小 PAD 的紧凑位图）。
-        let mut sources: Vec<(SharedString, f32, String)> = Vec::new();
+        // (槽键, 是否行内, 排版边距, 要排版的 LaTeX)：块用 `MATH_PAD`；行内用
+        // `INLINE_MATH_PAD` 且键带 `inline:` 前缀 + `\textstyle` 包层（大算子转行内式，
+        // 只压算子不缩正文——否则 `\int_0^1` 整图缩放会把 `x^2 dx` 也变小）。
+        let mut sources: Vec<(SharedString, bool, f32, String)> = Vec::new();
         for reg in markdown_syntax::math_regions(&content) {
             let s = reg.source.trim();
             if !s.is_empty() && s != "$$" {
-                sources.push((s.to_string().into(), math_typeset::PAD, s.to_string()));
+                sources.push((
+                    s.to_string().into(),
+                    false,
+                    crate::config::math::MATH_PAD,
+                    s.to_string(),
+                ));
             }
         }
         for line in content.split('\n') {
@@ -795,13 +801,14 @@ impl WyEditor {
                 if !lx.is_empty() {
                     sources.push((
                         inline_math_key(lx),
-                        math_typeset::INLINE_PAD,
+                        true,
+                        crate::config::math::INLINE_MATH_PAD,
                         lx.to_string(),
                     ));
                 }
             }
         }
-        for (key, pad, latex) in sources {
+        for (key, is_inline, pad, latex) in sources {
             let mut slots = self.math_slots.borrow_mut();
             if slots.contains_key(key.as_ref()) {
                 continue;
@@ -811,18 +818,39 @@ impl WyEditor {
             // 离屏排版（纯 CPU；与 zorite `ensure_math_loaded` 同构）。
             let slots = self.math_slots.clone();
             let color2 = color;
-            let latex2 = latex.clone();
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        math_typeset::render_latex_with_pad(
-                            &latex2,
-                            math_typeset::FONT_SIZE,
-                            math_typeset::DPR,
-                            color2,
-                            pad,
-                        )
+                        // 行内先试 `\textstyle …`（大算子转上下标、只压算子）；包层解析
+                        // 失败（如某些环境命令）则回退原样排版，避免把好公式降级成 Unicode。
+                        if is_inline {
+                            let ts = format!("\\textstyle {latex}");
+                            math_typeset::render_latex_with_pad(
+                                &ts,
+                                crate::config::math::MATH_FONT_SIZE,
+                                crate::config::math::MATH_DPR,
+                                color2,
+                                pad,
+                            )
+                            .or_else(|| {
+                                math_typeset::render_latex_with_pad(
+                                    &latex,
+                                    crate::config::math::MATH_FONT_SIZE,
+                                    crate::config::math::MATH_DPR,
+                                    color2,
+                                    pad,
+                                )
+                            })
+                        } else {
+                            math_typeset::render_latex_with_pad(
+                                &latex,
+                                crate::config::math::MATH_FONT_SIZE,
+                                crate::config::math::MATH_DPR,
+                                color2,
+                                pad,
+                            )
+                        }
                         .map(|r| (r.image, r.width, r.height))
                     })
                     .await;

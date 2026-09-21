@@ -464,7 +464,7 @@ fn splice_math_text(
                 let scale = if h > 0.0 {
                     fit / h
                 } else {
-                    f32::from(fs) / super::math_typeset::FONT_SIZE
+                    f32::from(fs) / crate::config::math::MATH_FONT_SIZE
                 };
                 let lw = (w * scale).max(1.);
                 (lw.max(1.), (lw / space_w).ceil().max(1.0) as usize, Some((img, w, h)))
@@ -504,17 +504,13 @@ fn splice_math_text(
     (nd, nr, nm, maths)
 }
 
-/// 行内公式撑高的**上限**（× 正文行高）：`\int_0^1 x^2 dx` 这类带上下限的算子公式在
-/// 22px 排版下比正文行高出很多——**只对这类超高公式**压到该倍数（保持可读），其余
-/// 公式用 `INLINE_PAD` 紧凑光栅后本就贴着行高、不被改、也不把行撑高。
-const INLINE_MATH_BAND: f32 = 1.6;
-
-/// 行内公式的显示高（px）：原生按正文行字号缩放（`fs/FONT_SIZE × 图高`），但 ≤
-/// `INLINE_MATH_BAND × 行高`（只压超高算子公式）。shape（spacer/行高）与 paint
-/// （画图）都用它——宽/高永远一致。
+/// 行内公式的显示高（px）：原生按正文行字号缩放（`fs/MATH_FONT_SIZE × 图高`），但 ≤
+/// `INLINE_MATH_BAND × 行高`（只压超高算子公式，其余保持字号缩放、不撑行）。shape
+/// （spacer/行高）与 paint（画图）都用它——宽/高永远一致。参数单一源
+/// = `crate::config::math`。
 fn inline_math_fit_h(fs: Pixels, lh: Pixels, h: f32) -> f32 {
-    let base = f32::from(fs) / super::math_typeset::FONT_SIZE;
-    let cap = f32::from(lh) * INLINE_MATH_BAND;
+    let base = f32::from(fs) / crate::config::math::MATH_FONT_SIZE;
+    let cap = f32::from(lh) * crate::config::math::INLINE_MATH_BAND;
     (base * h).clamp(1.0, cap)
 }
 
@@ -3119,7 +3115,7 @@ fn paint_inline_maths(
             let scale = if h > 0.0 {
                 fit / h
             } else {
-                f32::from(fs) / super::math_typeset::FONT_SIZE
+                f32::from(fs) / crate::config::math::MATH_FONT_SIZE
             };
             let pw = (w * scale).max(1.);
             let ph = (h * scale).max(1.);
@@ -5393,7 +5389,10 @@ A-->B
         // 且绝不超 `INLINE_MATH_BAND × 行高`（只压超高算子公式，其余保持字号缩放）。
         let tall = inline_math_fit_h(fs, lh, 70.5);
         assert!(tall > 19.0 * 0.95, "超高算子仍大于 0.95×行高：{tall}");
-        assert!(tall <= 19.0 * 1.6 + 1e-3, "不超 1.6×行高上限：{tall}");
+        assert!(
+            tall <= 19.0 * crate::config::math::INLINE_MATH_BAND + 1e-3,
+            "不超 INLINE_MATH_BAND×行高上限：{tall}"
+        );
         // 0 高兜底 ≥1px（不除零）。
         assert!(inline_math_fit_h(fs, lh, 0.0) >= 1.0);
     }

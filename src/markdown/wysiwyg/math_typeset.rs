@@ -13,17 +13,13 @@ use ratex_parser::parse;
 use ratex_render::{RenderOptions, render_to_png};
 use std::sync::Arc;
 
-/// 逻辑内衬（px），RaTeX 在公式周围留的空白。**块**数学卡片的排版边距。
-pub(crate) const PAD: f32 = 8.0;
-/// 行内（`$…$`）公式排版用的小边距：正文行高只有 ~19px，块级 PAD=8 在 22px 排下
-/// 占 ~11px 逻辑高，会把小公式也顶出 1 行（用户实测 `\int` 撑行、其它也偏高）。行内
-/// 收紧到 1.5，小公式就能贴着行高；超高算子（`\int` 等）另由高度上限压制。
-pub(crate) const INLINE_PAD: f32 = 1.5;
-
-/// 数学排版的字号（px/em）——比正文略大（同 zorite `math::FONT_SIZE` 语义）。
-pub(crate) const FONT_SIZE: f32 = 22.0;
-/// 数学排版设备像素比（按逻辑尺寸显示，2× = 清晰）。
-pub(crate) const DPR: f32 = 2.0;
+/// 排版参数单一来源 = `crate::config::math`；这里按短名（`PAD`/`INLINE_PAD`/
+/// `FONT_SIZE`/`DPR`）重导出，光栅内部与测试沿用（块 = `MATH_PAD`，行内 =
+/// `INLINE_MATH_PAD`——正文行高只有 ~19px，大边距会顶高小公式）。
+pub(crate) use crate::config::math::{
+    INLINE_MATH_PAD as INLINE_PAD, MATH_DPR as DPR, MATH_FONT_SIZE as FONT_SIZE,
+    MATH_PAD as PAD,
+};
 
 /// 一个排版好的公式：位图 + 逻辑（pre-DPR）px 尺寸。
 pub(crate) struct Rendered {
@@ -117,7 +113,7 @@ mod tests {
     fn inline_pad_reduces_raster_height() {
         // 行内小 PAD 是真收益：`x^2` 在 PAD=8（≈22px 排 16px 边距）下高 ~35px，
         // 收紧到 INLINE_PAD=1.5 后 ≈24px 逻辑高 —— 正文 16px 字号缩放后贴住行高，
-        // 不再把行撑高；超高算子（`\int`）另由高度上限压制。
+        // 不再把行撑高；超高算子（`\int`）另由 textstyle + 高度上限压制。
         let (_, w_big, h_big) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], PAD).unwrap();
         let (_, w_tight, h_tight) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
         assert!(
@@ -127,6 +123,40 @@ mod tests {
         // 行内缩放后（fs=16 → ×16/22=0.727）应贴住正文行高（≈19px）。
         let scaled = h_tight as f32 / 2.0 * (16.0 / 22.0);
         assert!(scaled < 19.0 + 1.0, "x^2 行内高应 ≤ 行高：{scaled:.1}");
+    }
+
+    #[test]
+    fn textstyle_shrinks_only_big_operators_not_body() {
+        // 用户实测：`$\int_0^1 x^2 dx = \tfrac{1}{3}$` 整图缩放把正文也压小了。
+        // 正解 = 行内用 `\textstyle …` 排版：`\int` 极限转上下标、算子变小（h 58→34），
+        // `x^2 dx` 等正文字体原样（宽 126→118 只是算子收紧，非整体缩）。
+        let (_, w_plain, h_plain) =
+            rasterize(r"\int_0^1 x^2 dx = \tfrac{1}{3}", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, w_ts, h_ts) = rasterize(
+            r"\textstyle \int_0^1 x^2 dx = \tfrac{1}{3}",
+            22.0,
+            2.0,
+            [0, 0, 0],
+            INLINE_PAD,
+        )
+        .unwrap();
+        assert!(
+            h_ts < h_plain,
+            "textstyle 应把带上下限的大算子高度压下来：{h_ts} < {h_plain}"
+        );
+        // 高度降幅主要来自算子；正文字符保持同字号（宽度应接近，仅算子收紧）。
+        assert!(
+            (w_plain as f32 - w_ts as f32) <= (w_plain as f32) * 0.2,
+            "宽度不应大幅缩小（那才是整图缩放）：{w_plain} → {w_ts}"
+        );
+        // 无算子公式包 textstyle 高度几乎不变（小公式不被改；±3 逻辑 px 容差内）。
+        let (_, _, h_x) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, _, h_tsx) =
+            rasterize(r"\textstyle x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        assert!(
+            (h_tsx as i32 - h_x as i32).abs() <= 6,
+            "`x^2` 包 textstyle 高度应基本不变：{h_x} → {h_tsx}"
+        );
     }
 
     #[test]

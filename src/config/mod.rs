@@ -13,5 +13,6 @@ pub mod colors;
 pub mod layout;
 pub mod limits;
 pub mod markdown;
+pub mod math;
 pub mod pdf;
 pub mod timing;
