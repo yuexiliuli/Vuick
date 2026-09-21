@@ -107,6 +107,10 @@ struct EditorTab {
     _live_sub: Option<Subscription>,
     /// `live2`（WyEditor）的变更订阅，同上。
     _live2_sub: Option<Subscription>,
+    /// 实时预览编辑（WYSIWYG）宿主纵向滚动句柄：`#live-scroll`（`overflow_y_scroll`）
+    /// 经 `track_scroll` 跟踪它，右侧 `Scrollbar::vertical` 跟随显示（宿主原生滚动条
+    /// 在此 GPUI 不绘制，需自绘）。每次渲染重建容器，句柄存这里跨帧稳定。
+    live_vscroll: gpui::ScrollHandle,
 }
 
 /// 一个从窗口中「拔出」的选项卡快照：编辑器 / 预览等实体句柄共享（GPUI 实体
@@ -657,6 +661,7 @@ impl EditorApp {
             _live_sub: None,
             live2: None,
             _live2_sub: None,
+            live_vscroll: gpui::ScrollHandle::new(),
             preview_prev: payload.preview_prev,
             edit_version: payload.edit_version,
             preview_dirty: payload.preview_dirty,

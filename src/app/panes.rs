@@ -1,6 +1,7 @@
 ﻿//! panes.
 
 use super::*;
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
 impl EditorApp {
     /// 当前选项卡的预览视图：PDF 选项卡用 `PdfViewer`（整页原样），
@@ -68,6 +69,9 @@ impl EditorApp {
         if let Some(live_any) = live_any {
             let text_color = self.text_primary();
             let fs = self.font_size;
+            // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
+            // GPUI 不绘制可见滚动条，右侧 `Scrollbar::vertical` 自绘跟随它。
+            let vhand = self.tabs[self.active_tab].live_vscroll.clone();
             return div()
                 .id("editor-area")
                 .debug_selector(|| "editor-area".into())
@@ -85,6 +89,7 @@ impl EditorApp {
                         .relative()
                         .size_full()
                         .overflow_y_scroll()
+                        .track_scroll(&vhand)
                         .child(
                             div()
                                 .id("live-body")
@@ -95,6 +100,18 @@ impl EditorApp {
                                 .text_size(px(fs))
                                 .text_color(text_color)
                                 .child(live_any),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("live-vscrollbar-overlay")
+                        .debug_selector(|| "live-vscrollbar-overlay".into())
+                        .absolute()
+                        .inset_0()
+                        .child(
+                            Scrollbar::vertical(&vhand)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
                         ),
                 )
                 .child(Self::zoom_overlay(cx));

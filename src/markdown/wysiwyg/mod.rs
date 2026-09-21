@@ -236,6 +236,17 @@ pub struct WyEditor {
     sel_anchor: Option<usize>,
     /// 鼠标左键拖选进行中（on_mouse_move 延伸选区）。
     dragging: bool,
+    /// 代码块横向滚动偏移（px；键 = 代码块首源码行）。长代码行 nowrap 超宽时
+    /// 由横向滚动条/拖动驱动（paint 平移 + 命中/光标/选区反向加回）。纯视图状态，
+    /// 不写源码、不进撤销栈。
+    code_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
+    /// 代码块横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块中心偏移))`。
+    code_h_drag: RefCell<Option<(usize, f32)>>,
+    /// 已折叠的标题区块（视图本地状态，键 = 标题行 trim 后的文本，与 `live` 一致；
+    /// markdown 没有标题折叠语法，折叠态**不写回源码**、不进撤销栈）。点击标题行
+    /// 右缘的折叠箭头翻转（`▸` 展开 / `▾` 折叠）；折叠后该 section 的 body 行
+    /// 折叠成 0 高（光标严格落在 body 行内才 reveal）。
+    folded_headings: RefCell<std::collections::HashSet<String>>,
     /// 当前文档中每个可编辑块的**区域**（代码内容行/表格表头+数据行）与**围栏行**
     /// （代码 ``` 标记行、表格分隔行，只读）。导航/退格/删除据此避免光标落进
     /// 只读围栏（否则在隐藏围栏上输入会破坏结构）。随文本变更重建。
@@ -309,6 +320,9 @@ impl WyEditor {
             marked: None,
             sel_anchor: None,
             dragging: false,
+            code_h_scroll: RefCell::new(std::collections::HashMap::new()),
+            code_h_drag: RefCell::new(None),
+            folded_headings: RefCell::new(std::collections::HashSet::new()),
             block_regions: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -639,6 +653,23 @@ impl WyEditor {
         };
         // 交互性命中（任务框/折叠箭头/链接）单双击都响应，展开→立即再点也能折叠回。
         if !ev.modifiers.shift && !ev.modifiers.control {
+            // 代码块横向滚动条（内容超宽的块底部轨道）：点在**滑块**上 → 拖动；
+            // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
+            if let Some((blk, on_thumb, grab)) =
+                element::code_hscrollbar_hit(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                if on_thumb {
+                    *self.code_h_drag.borrow_mut() = Some((blk, grab));
+                    self.code_h_drag_apply(ev.position, cx);
+                } else {
+                    // 跳转：滑块中心对准点击点（·`rel = (px − bar_x − thumb_w/2)/travel`）。
+                    self.code_bar_jump_to(blk, ev.position);
+                    cx.notify();
+                }
+                return;
+            }
             // C1: 点击任务框 → 翻转 `[ ]` ↔ `[x]`（写源码，走撤销栈）。
             if let Some((line, _)) = element::checkbox_hit(self, f, ev.position) {
                 drop(marker);
@@ -651,6 +682,13 @@ impl WyEditor {
                 drop(marker);
                 self.focus.focus(window, cx);
                 self.toggle_alert_fold_at_line(line, cx);
+                return;
+            }
+            // 标题折叠箭头 → 翻转视图本地折叠态（`## Goals` body 行折叠/展开）。
+            if let Some((line, _)) = element::heading_chevron_hit(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.toggle_heading_fold_at_line(line, cx);
                 return;
             }
             // C5: 点击行内链接 → 打开（安全 URL 直开系统浏览器；wiki/tag → OpenPage）。
@@ -670,6 +708,34 @@ impl WyEditor {
                 }
                 return;
             }
+            // A1/B2: 数学交互——
+            // 数学块卡片：**单击不改光标**（否则 caret 进块被 reveal、整块回显源码字符串，
+            // 即用户看到的「单击变回字符串」）；**双击**进块编辑（reveal 源码可改）。
+            // 行内公式：**双击** spacer → 光标放进 `$…$` 内（shape 期 reveal 可编辑）。
+            let dbl = ev.click_count >= 2;
+            if let Some(block_start) = element::math_card_hit(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                if dbl {
+                    // 光标放进 `$$` 行**内容内 1 字节**（不是行首 0 列）：
+                    // ①块 reveal ②单行 `$$…$$` 的行内 splice reveal 同时满足
+                    // → 两种情况（多行块 / 单行块）双击都直接还原成源码字符串
+                    // （放行首 0 列时 `splice_math_text` 的 `c > span.start` 不成立，
+                    // 单行块会被 splice 成小号行内公式，需再双击一次才还原）。
+                    self.set_caret(block_start + 1);
+                    cx.notify();
+                }
+                return;
+            }
+            if dbl {
+                if let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
+                    drop(marker);
+                    self.focus.focus(window, cx);
+                    self.set_caret(src.start + 1);
+                    cx.notify();
+                    return;
+                }
+            }
         }
         let off = element::source_offset_at(self, f, ev.position);
         drop(marker);
@@ -680,6 +746,11 @@ impl WyEditor {
 
     /// 拖拽中（左键已按下）。
     pub(crate) fn on_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        // 代码块横向滚动条拖动优先（不参与选区拖选）。
+        if self.code_h_drag.borrow().is_some() {
+            self.code_h_drag_apply(ev.position, cx);
+            return;
+        }
         if !self.dragging {
             return;
         }
@@ -694,10 +765,84 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// 鼠标松开：结束拖选。
+    /// 代码块滚动条**轨道点击跳转**：滑块中心对准点击点（view 语义：不在滑块上
+    /// 按轨道即跳转，而不是像旧实现那样点空白处无反应）。
+    fn code_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f
+            .rows
+            .iter()
+            .find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
+        else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::code_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let p_local = f32::from(pos.x) - origin_x;
+        let travel = (bar_w - thumb_w).max(1.);
+        // 滑块中心对准点击点：center = p_local → thumb_x = p_local − thumb_w/2。
+        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_code_h_scroll(blk, rel * max_scroll);
+    }
+
+    /// 把指针位置应用到正在拖动的代码块横向滚动条（保持抓取点相对滑块中心）。
+    fn code_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((blk, grab)) = self.code_h_drag.borrow().clone() else {
+            return;
+        };
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
+        else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::code_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let p_local = f32::from(pos.x) - origin_x;
+        let travel = (bar_w - thumb_w).max(1.);
+        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_code_h_scroll(blk, rel * max_scroll);
+        cx.notify();
+    }
+
+    /// 鼠标松开：结束拖选 / 代码块滚动条拖动。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
+        *self.code_h_drag.borrow_mut() = None;
         cx.notify();
+    }
+
+    /// 代码块横向滚动偏移（键 = 代码块首源码行）。视图本地状态（不写源码）。
+    pub(crate) fn code_h_scroll_of(&self, src_line: usize) -> f32 {
+        self.code_h_scroll.borrow().get(&src_line).copied().unwrap_or(0.)
+    }
+    /// 设置代码块横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    pub(crate) fn set_code_h_scroll(&self, src_line: usize, v: f32) {
+        let v = v.max(0.);
+        if v <= 0.01 {
+            self.code_h_scroll.borrow_mut().remove(&src_line);
+        } else {
+            self.code_h_scroll.borrow_mut().insert(src_line, v);
+        }
     }
 
     /// 记录本帧元素在窗口中的 bounds（paint 调用；鼠标命中换算用）。
@@ -1122,6 +1267,40 @@ impl WyEditor {
                 self.apply_edit(range, repl, cx);
             }
         }
+    }
+
+    /// 翻转第 `line` 行标题的折叠态（视图本地，不写源码）：`## Goals` body 行折叠。
+    /// 折叠时若光标在该 section 的 body 内会被 reveal 弹开（折叠无效），先把光标
+    /// 放到标题行末尾（与 live 的 `move_to(end)` 同款）。
+    pub(crate) fn toggle_heading_fold_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let start = self.line_start(line);
+        let end = self.line_end(line).max(start);
+        let key = self.content.as_ref()[start..end].trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        let was_folded = self.folded_headings.borrow().contains(&key);
+        if !was_folded {
+            // 折叠前：光标若在 section body 内，先移到标题行末（否则 body 有光标被 reveal）。
+            let single = std::collections::HashSet::from([key.clone()]);
+            let crow = self.row_col(self.caret()).0;
+            if markdown_syntax::heading_fold_regions(&self.content, &single)
+                .iter()
+                .any(|r| crow > r.start && crow < r.end)
+            {
+                self.set_caret(end);
+            }
+        }
+        {
+            let mut folded = self.folded_headings.borrow_mut();
+            if was_folded {
+                folded.remove(&key);
+            } else {
+                folded.insert(key);
+            }
+        }
+        *self.frame.borrow_mut() = None;
+        cx.notify();
     }
 
     /// 翻转第 `line` 行任务框（C1）：`[ ]`↔`[x]`。

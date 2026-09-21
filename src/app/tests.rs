@@ -1183,6 +1183,52 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// WYSIWYG（预览编辑测试 / WyEditor）模式：宿主 `#live-scroll` 提供纵向滚动，
+    /// 右侧 `Scrollbar::vertical` 自绘**可见纵向滚动条**（此 GPUI 的 `overflow_y_scroll`
+    /// 不绘制原生滚动条）。回归：切到 live 模式后滚动条叠层应存在。
+    #[gpui::test]
+    async fn wysiwyg_live_mode_has_vertical_scrollbar(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(600.), px(600.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-vscroll-{}.md",
+            std::process::id()
+        ));
+        // 内容足够高 → 真实需要纵向滚动。
+        std::fs::write(&md, format!("{}\n", "# 标题\n正文\n".repeat(300))).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        // 打开前：非 live 模式无该滚动条。
+        assert!(
+            cx.debug_bounds("live-vscrollbar-overlay").is_none(),
+            "源码编辑模式不应有 WYSIWYG 滚动条"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("live-scroll").is_some(),
+            "WYSIWYG 宿主纵向滚动容器应存在"
+        );
+        assert!(
+            cx.debug_bounds("live-vscrollbar-overlay").is_some(),
+            "WYSIWYG 模式应渲染自绘纵向滚动条叠层"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
 
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]

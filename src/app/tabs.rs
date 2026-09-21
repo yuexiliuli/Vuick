@@ -31,6 +31,7 @@ impl EditorApp {
             _live_sub: None,
             live2: None,
             _live2_sub: None,
+            live_vscroll: gpui::ScrollHandle::new(),
             preview_prev: None,
             edit_version: 0,
             preview_dirty: None,

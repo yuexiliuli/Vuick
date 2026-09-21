@@ -26,6 +26,13 @@ pub const SIDEBAR_WIDTH_MAX: f32 = 480.0;
 pub const HSCROLL_GAP_RIGHT: Pixels = px(3.);
 /// 横向滚动条滑块最小尺寸（px）。
 pub const HSCROLL_THUMB_MIN: Pixels = px(26.);
+/// WYSIWYG 代码块底部横向滚动条：可交互带高（px，覆在末空白带上，不盖文字）。
+/// 与 view 的 gpui-component 滚动条同款：轨道厚 16、内衬 4、滑块 8 高、最小 48 宽。
+pub const CODE_HSCROLL_BAND: f32 = 16.0;
+/// WYSIWYG 代码块底部横向滚动条：滑块高（px，轨道内内衬对称）。
+pub const CODE_HSCROLL_THUMB_H: f32 = 8.0;
+/// WYSIWYG 代码块底部横向滚动条：滑块最小宽（px，对齐 view 的 MIN_THUMB_SIZE=48）。
+pub const CODE_HSCROLL_THUMB_MIN: f32 = 48.0;
 /// 编辑器垂直标尺（margin guide）的列位置（宽度单位列：CJK=2 格），多列升序。
 /// **默认置空（不画）**：用户真正需要的是「括号标尺」（见 view.rs bracket guides），
 /// 这条第 80 列的长竖线会显得多余。如需启用显式填列（如 `&[80, 100]`）。

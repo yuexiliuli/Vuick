@@ -21,6 +21,9 @@ use gpui::{
 const GUTTER_MARK_X: f32 = 2.;
 /// 警报行正文缩进宽（= shape 期 `x_off`）——gutter 点击区即 [padding, padding+此宽]。
 const ALERT_GUTTER_W: f32 = 84.;
+/// 标题折叠箭头 gutter 宽（= shape 期标题行 `x_off`）——箭头画在左缘、正文右移，
+/// gutter 点击区即 [padding, padding+此宽]；与 `heading_chevron_hit`/`paint_heading_chevron` 共用。
+const HEADING_GUTTER_W: f32 = 20.;
 
 use super::{CaretVis, WyEditor, WyTheme};
 use crate::markdown::doc::{DocPayload, DocRow};
@@ -112,6 +115,11 @@ pub(crate) enum RowGutter {
 pub(crate) struct InlineMathText {
     /// spacer 起始渲染字节。
     pub display_off: usize,
+    /// spacer 字节数（= 空格数；双击命中盒宽度用它）。
+    pub len: usize,
+    /// 该公式在**源文档中的字节区间**（含定界符 `$…$`）——双击编辑时把光标塞进它、
+    /// 并在 shape 期 reveal（reveal-on-caret 只对源区间内的共享，放智能回源）。
+    pub source: Range<usize>,
     /// 去定界符后的 LaTeX（paint 以斜体排版绘制）。
     pub latex: SharedString,
     /// 已就绪的排版位图 + 逻辑（typeset em）px 尺寸；`Some` 时 paint 画 `RenderImage`
@@ -411,9 +419,15 @@ fn text_style_for(kind: IrKind, theme: &WyTheme) -> RowTextStyle {
 /// latex 宽，`splice_inline_math` 把 spacer 映射回公式源位），paint 期再在 spacer 处
 /// 画排版位图（已就绪）/ 斜体 latex（排版中或失败）。返回重写后的
 /// `(display, gpui runs, byte_map)` + 每处公式位置。
+///
+/// `caret_disp` = 本行内光标的**渲染列**（`Some` = 光标在该行；`None` = 他行 / 无）。
+/// reveal-on-caret：光标落进 `$…$` 的源区间内（含定界符 `$`）→ 该公式不 splice，
+/// 显示原始 `$…$` 文本（可编辑）——用户双击公式把光标放进去即可直接改 LaTeX。
 fn splice_math_text(
     editor: &WyEditor,
     window: &mut Window,
+    src_line: usize,
+    caret_disp: Option<usize>,
     rtext: &str,
     runs: Vec<TextRun>,
     map: Vec<usize>,
@@ -428,6 +442,7 @@ fn splice_math_text(
     if spans.is_empty() {
         return (rtext.to_string(), runs, map, Vec::new());
     }
+    let line_start = editor.line_start(src_line);
     // 跳过完全落在行内代码里的 `$…$`（反引号内是字面量，不是数学）。
     let in_code = |r: &Range<usize>| code_ranges.iter().any(|c| c.start < r.end && r.start < c.end);
     let space_w = {
@@ -440,6 +455,13 @@ fn splice_math_text(
     for span in spans {
         if in_code(&span) {
             continue;
+        }
+        // reveal-on-caret：光标严格落在 `$…$` 内（不碰定界符不算数，与块公式一致的
+        // “单击停在边上、双击进去编辑”语义）→ 不 splice，显示可编辑的原始源码。
+        if let Some(c) = caret_disp {
+            if c > span.start && c < span.end {
+                continue;
+            }
         }
         let latex = markdown_syntax::inline_math_latex(rtext, &span);
         if latex.trim().is_empty() {
@@ -483,8 +505,20 @@ fn splice_math_text(
             }
         };
         if n > 0 {
-            formulas.push((span, n.max(1)));
-            maths.push(InlineMathText { display_off: 0, latex: shown.into(), ready: paint_ready, line: 0 });
+            let n = n.max(1);
+            formulas.push((span.clone(), n));
+            // 源区间（绝对）：span 渲染列 → 经 byte_map 反查源列 → 加行首。
+            let src_lo = line_start + display_to_source(&map, span.start);
+            let src_hi = line_start
+                + display_to_source(&map, span.end.saturating_sub(1).max(span.start));
+            maths.push(InlineMathText {
+                display_off: 0,
+                len: n,
+                source: src_lo..src_hi + 1,
+                latex: shown.into(),
+                ready: paint_ready,
+                line: 0,
+            });
         }
     }
     if formulas.is_empty() {
@@ -557,9 +591,21 @@ fn shape_text_row(
     // 行内数学 `$…$`：斜体 math 字体排版宽度 → splice 成空格 spacer（B2）。
     let mut math_font = theme.font.clone();
     math_font.style = gpui::FontStyle::Italic;
+    // 光标若在该行（源列），告知 splice：光标落到 `$…$` 内 → reveal（显示可编辑的
+    // 原始 LaTeX）；他行/无 → 照常 splice 成 spacer。
+    let caret_disp = {
+        let (cl, col) = editor.row_col(editor.caret());
+        if cl == r.src_line {
+            Some(col)
+        } else {
+            None
+        }
+    };
     let (rtext, runs2, map2, mut inline_maths) = splice_math_text(
         editor,
         window,
+        r.src_line,
+        caret_disp,
         r.text.as_ref(),
         runs,
         r.byte_map.clone(),
@@ -665,6 +711,11 @@ fn shape_text_row_decorated(
     if let Some(g @ RowGutter::Alert { .. }) = &gutter {
         srow.extra.gutter = Some(g.clone());
         srow.x_off = px(84.);
+    }
+    // 标题折叠：为左缘折叠箭头预留 gutter（正文右移 `HEADING_GUTTER_W`；无折叠箭头时
+    // 也统一留位，避免命中/光标在「有无箭头」间抖动）。
+    if matches!(r.kind, IrKind::Heading(_)) {
+        srow.x_off = px(HEADING_GUTTER_W);
     }
     // C5: 行内链接命中（hand 光标 + 单键点击导航）。
     if srow.editable {
@@ -1896,6 +1947,21 @@ pub(crate) fn build_frame(
         }
         fold_lines.extend(rnge.start + 1..rnge.end);
     }
+    // 标题折叠（视图本地状态）：folded 集合里的标题，其 section body 行折叠成 0 高
+    // （标题行本身保留，折叠箭头画在那里）。reveal-on-caret 仅当光标**严格落在 body
+    // 行**（start+1..end）生效——光标在标题行上正是点击折叠后的常态，不算 reveal
+    // （与 callout 同一教训：否则点了折不起来）。
+    {
+        let folded = editor.folded_headings.borrow();
+        if !folded.is_empty() {
+            for rnge in markdown_syntax::heading_fold_regions(content, &folded) {
+                if caret_line >= rnge.start + 1 && caret_line < rnge.end {
+                    continue;
+                }
+                fold_lines.extend(rnge.start + 1..rnge.end);
+            }
+        }
+    }
     let collapsed = |srcline: usize| fold_lines.contains(&srcline) || math_body.contains(&srcline);
 
     // Pass 1：决定每块高度（文本块：缓存真值优先，无则用真实字数估算）+ 是否入带。
@@ -2018,7 +2084,10 @@ pub(crate) fn build_frame(
         });
         let srcline = meta.src_line as usize;
         // 数学块卡片（A1）：在首源码行装配整张卡片，比整个块更高。
-        if let Some(&idx) = math_start.get(&srcline) {
+        // 被折叠的行（标题/引述折叠，collapsed）不装配卡片——走下方普通 0 高占位，
+        // 否则 0 高的卡片行仍会经 `extra.card` 触发 paint_card 画出 "公式" 标签与
+        // 公式图（多个公式重叠堆在标题上方）。
+        if !collapsed(srcline) && let Some(&idx) = math_start.get(&srcline) {
             let reg = &math_regions[idx];
             let h = plan[i].h;
             rows.push(build_math_card_row(reg, srcline, h, total));
@@ -2240,12 +2309,12 @@ fn table_cell_at_src(
 /// 行高用 `r.lh`（标题/代码等类型各自行高），否则光标会错位。
 fn caret_geometry(
     editor: &WyEditor,
-    rows: &[ShapedRow],
+    f: &Frame,
 ) -> (bool, Pixels, Pixels) {
     let (cl, col) = editor.row_col(editor.caret());
     let line_start = editor.line_start(cl);
     let line_end = editor.line_end(cl);
-    for r in rows {
+    for r in &f.rows {
         if !r.src_lines.contains(&cl) {
             continue;
         }
@@ -2289,7 +2358,8 @@ fn caret_geometry(
                     .and_then(|wl| wl.position_for_index(dcol, r.lh))
                     .unwrap_or_else(|| point(px(0.), px(0.)));
                 let y = r.top + px(code_group_top(r, g) + f32::from(p.y));
-                return (true, px(12.) + r.x_off + p.x, y);
+                let scroll = code_hscroll_clamped(editor, f, r);
+                return (true, px(12.) + r.x_off + p.x - px(scroll), y);
             }
             return (false, px(12.), r.top);
         }
@@ -2302,8 +2372,8 @@ fn caret_geometry(
         // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
         return (true, px(12.) + r.x_off + p.x, r.top + px(text_row_shift(r)) + p.y);
     }
-    let fallback_lh = rows.first().map_or(px(20.), |r| r.lh);
-    let y = rows.last().map_or(fallback_lh, |r| r.top + r.height);
+    let fallback_lh = f.rows.first().map_or(px(20.), |r| r.lh);
+    let y = f.rows.last().map_or(fallback_lh, |r| r.top + r.height);
     (true, px(12.), y)
 }
 
@@ -2349,11 +2419,14 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
             if !r.multi_offsets.is_empty() {
                 // 代码块：y 定源码行组（`code_group_at`，首空白带归第 0 组），x 定列；
                 // 经块级 byte_map 反查 块首源偏移 → 绝对源字节（钳到末内容行行尾）。
+                // 横向滚动时内容坐标 = 视图坐标 + scroll（paint 平移的逆映射）。
                 let g = code_group_at(r, rel_y - top);
                 let Some(wl) = r.wrapped.get(g) else {
                     return editor.caret();
                 };
-                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
+                let scroll = code_hscroll_clamped(editor, frame, r);
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off)
+                    + scroll)
                     .max(0.);
                 let rel = point(px(rel_x), px(0.));
                 // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
@@ -2457,6 +2530,116 @@ pub(crate) fn alert_chevron_hit(
         };
         if px >= f32::from(frame.padding) && px <= f32::from(frame.padding) + ALERT_GUTTER_W {
             return Some((r.src_line, *folded));
+        }
+    }
+    None
+}
+
+/// 命中标题折叠箭头：击中标题行的 chevron 区（文本右缘 + 固定宽的命中盒）。
+/// 返回 (源行, 当前是否折叠)。几何与 `paint_heading_chevron` 共用。
+pub(crate) fn heading_chevron_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool)> {
+    let p = to_local(editor, p);
+    let py = f32::from(p.y);
+    let px = f32::from(p.x);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || !matches!(r.kind, IrKind::Heading(_)) {
+            continue;
+        }
+        let Some((cx0, cw)) = heading_chevron_box(frame, r) else {
+            // 带外（未 shape）标题行没有 wrapped：非可视区，跳过。
+            continue;
+        };
+        if px >= cx0 && px <= cx0 + cw {
+            let key = editor.content()[editor.line_start(r.src_line)..editor.line_end(r.src_line)]
+                .trim()
+                .to_string();
+            let folded = editor.folded_headings.borrow().contains(&key);
+            return Some((r.src_line, folded));
+        }
+    }
+    None
+}
+
+/// 标题折叠箭头几何：画在**左缘 gutter**（[padding, padding+HEADING_GUTTER_W]，正文
+/// 已右移 `x_off = HEADING_GUTTER_W`）；返回元素局部坐标 (x0, w)。paint 与 hit-test 共用。
+fn heading_chevron_box(f: &Frame, _row: &ShapedRow) -> Option<(f32, f32)> {
+    Some((f32::from(f.padding), HEADING_GUTTER_W))
+}
+
+/// 命中行内 `$…$` 公式的 spacer：击中其显示区 → 返回该公式的**绝对源字节区间**
+/// （含定界符 `$…$`，`InlineMathText.source`）。双击命中时把光标塞进区间起点 + 1
+/// reveal 出可编辑的原始 LaTeX（B2 双击编辑）。
+pub(crate) fn inline_math_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<Range<usize>> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || r.extra.inline_maths.is_empty() {
+            continue;
+        }
+        let Some(w0) = r.wrapped.first() else {
+            continue;
+        };
+        let ox = f32::from(frame.padding) + f32::from(r.x_off);
+        for im in &r.extra.inline_maths {
+            let (Some(p0), Some(p1)) = (
+                w0.position_for_index(im.display_off, r.lh),
+                w0.position_for_index(im.display_off + im.len, r.lh),
+            ) else {
+                continue;
+            };
+            // spacer 恒在首可视行（`visual_block_line_for_index` = 0），只按首行 y 命中。
+            let y0 = top + text_row_shift(r) + f32::from(p0.y);
+            let x0 = ox + f32::from(p0.x);
+            let x1 = ox + f32::from(p1.x);
+            if py >= y0
+                && py < y0 + f32::from(r.lh)
+                && px >= x0
+                && px <= x1.max(x0 + 1.)
+            {
+                if !im.source.is_empty() {
+                    return Some(im.source.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 命中数学块卡片（A1，`$$…$$` 折叠成的 `BlockCard::Math` 行）：击中卡片范围 →
+/// 返回该块的**首源码行行首绝对字节**（把光标放进去即 reveal 源码进入编辑）。
+/// 单击命中不应移动光标（否则 reveal 回源码字符串——用户看到的「单击变回字符串」）；
+/// 双击编辑由调用方在 `click_count >= 2` 时把光标放到这里。
+pub(crate) fn math_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> Option<usize> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) {
+            continue;
+        }
+        if !matches!(&r.extra.card, Some(BlockCard::Math { .. })) {
+            continue;
+        }
+        // 卡片铺满内容宽：左 = padding，右 = padding + 内容宽。
+        let x0 = f32::from(frame.padding);
+        let x1 = f32::from(frame.width) - f32::from(frame.padding);
+        if px >= x0 && px <= x1 {
+            return Some(editor.line_start(r.src_line));
         }
     }
     None
@@ -2672,10 +2855,95 @@ fn paint_table_row(
     }
 }
 
+/// 代码块横向滚动条几何（内容超宽才返回）。
+/// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
+/// `(bar_x, bar_w, thumb_x, thumb_w, max_scroll)`。`viewport_text` = 面板内文本可视宽
+/// （面板宽 − 左右内衬 `x_off`×2）；`max_scroll` = 最宽行 − viewport。
+pub(crate) fn code_hscroll_geo(
+    editor: &WyEditor,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    let panel_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let inset = f32::from(row.x_off).max(1.);
+    let viewport = (panel_w - inset * 2.).max(1.);
+    let max_w = row
+        .wrapped
+        .iter()
+        .map(|wl| f32::from(wl.width()))
+        .fold(0.0f32, f32::max);
+    if max_w <= viewport + 1. {
+        return None;
+    }
+    let max_scroll = max_w - viewport;
+    let scroll = editor.code_h_scroll_of(row.src_line).min(max_scroll).max(0.);
+    let frac = if max_scroll > 0. { scroll / max_scroll } else { 0. };
+    let bar_x = f32::from(f.padding) + inset;
+    let bar_w = viewport.max(1.);
+    // 与 view 的 gpui-component 同式：thumb = container/scroll_area × container，最小 48。
+    let thumb_w =
+        (bar_w * viewport / max_w)
+            .max(crate::config::layout::CODE_HSCROLL_THUMB_MIN)
+            .min(bar_w);
+    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
+    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+}
+
+/// 代码块当前生效的横向滚动偏移（px）：内容不超宽 → 0（忽略陈旧滚动值，宽窗口下
+/// 长行不再偏移）；超宽 → 按 `max_scroll` clamp。paint / 命中 / 光标 / 选区共用。
+pub(crate) fn code_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRow) -> f32 {
+    match code_hscroll_geo(editor, f, row) {
+        Some((_, _, _, _, max_scroll)) => editor
+            .code_h_scroll_of(row.src_line)
+            .min(max_scroll)
+            .max(0.),
+        None => 0.,
+    }
+}
+
+/// 代码块横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
+/// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回
+/// `(块首源行, 是否点在滑块上, 指针相对滑块中心的水平偏移)`。
+/// 命中轨道（不在滑块上）→ 调用方让滑块跳到点击处；点在滑块上 → 进入拖动。
+/// 与 `paint_code_row` 的滚动条几何同源（view 的 gpui-component 语义：thumb 上拖、
+/// 轨道上跳转）。
+pub(crate) fn code_hscrollbar_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool, f32)> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || r.multi_offsets.is_empty() || r.wrapped.is_empty() {
+            continue;
+        }
+        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = code_hscroll_geo(editor, frame, r) else {
+            continue;
+        };
+        // 底部滚动条带：轨道顶（面板底 − `CODE_HSCROLL_BAND`）之间。
+        let band_top = f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        if py < band_top {
+            continue;
+        }
+        if px >= bar_x && px <= bar_x + bar_w {
+            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
+            let grab = px - (thumb_x + thumb_w / 2.0);
+            return Some((r.src_line, on_thumb, grab));
+        }
+    }
+    None
+}
+
 /// 代码块：圆角面板（对齐预览：外层 `px_3` → 面板贴**内容区左缘**（=content 边距，
 /// 与正文对齐），而非再缩进）；行文本再 `pl_3`（面板内 12px 内衬，走 `row.x_off`，
 /// 命中/光标/选区同 x）。首/末各留一个 code_line 空白带。
+/// 长代码行（nowrap 超宽）**裁剪在面板内** + 底部横向滚动条（视图本地，可拖动）。
 fn paint_code_row(
+    editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
@@ -2687,24 +2955,72 @@ fn paint_code_row(
     let content_w = f32::from(f.width) - pad * 2.;
     let panel_x = origin.x + f.padding;
     let panel_w = content_w.max(1.);
+    let panel_rect = Bounds::new(
+        point(panel_x, origin.y + row.top),
+        size(px(panel_w), row.height),
+    );
     window.paint_quad(gpui::PaintQuad {
-        bounds: Bounds::new(
-            point(panel_x, origin.y + row.top),
-            size(px(panel_w), row.height),
-        ),
+        bounds: panel_rect,
         corner_radii: gpui::Corners::all(px(8.)), // 与预览代码块 `rounded_t_lg`/`rounded_b_lg`（lg=8）对齐
         background: theme.code_bg.into(),
         border_widths: gpui::Edges::default(),
         border_color: gpui::Hsla::default(),
         border_style: gpui::BorderStyle::Solid,
     });
-    // 顶空白带后逐行画文本（x = 面板左 + 内衬 x_off，行高 = code_line）。
     let text_x = panel_x + row.x_off;
-    let mut sub_top = row.top + theme.code_line();
-    for wl in &row.wrapped {
-        let o = point(text_x, origin.y + sub_top);
-        let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
-        sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+    // 内容超宽？超宽时的真实 `max_scroll` 与滚动条几何（同一函数单一源）；
+    // 不超宽 → 无滚动（并忽略陈旧滚动值，宽窗口下长行不再偏移）。
+    let hgeo = code_hscroll_geo(editor.read(cx), f, row);
+    let scroll = code_hscroll_clamped(editor.read(cx), f, row);
+    // 文本裁剪在面板内（横向滚动时把超出的代码藏进面板，不再溢到页面背景上）。
+    // ⚠️ 用 `with_content_mask`（给 glyph/quad 打 content mask），不是 `paint_layer`
+    // —— 后者只改 z 序不裁剪（GPUI 场景层的 `StartLayer` 不设 content mask）。
+    // 顶空白带之后逐行画文本（x = 面板左 + 内衬 x_off − 滚动偏移）。
+    window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
+        let mut sub_top = row.top + theme.code_line();
+        for wl in &row.wrapped {
+            let o = point(text_x - px(scroll), origin.y + sub_top);
+            let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
+            sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+        }
+    });
+    // 内容超宽 → 底部横向滚动条（view 的 gpui-component 同款：轨道 16 高 +
+    // 内衬 4 + 圆角滑块 8 高/最小 48 宽；点击轨道跳转、滑块可拖）。覆在末空白带上。
+    if let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = hgeo {
+        let track_h = crate::config::layout::CODE_HSCROLL_BAND;
+        let track_top =
+            f32::from(row.top) + f32::from(row.height) - track_h;
+        let inset = 4.;
+        let th = crate::config::layout::CODE_HSCROLL_THUMB_H;
+        let ty = track_top + inset;
+        // 轨道：极淡分隔色（hover/拖动前也可见，像 view 的 Always 模式）。
+        let mut track = theme.divider;
+        track.a = 0.35;
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(
+                point(origin.x + px(bar_x), origin.y + px(track_top)),
+                size(px(bar_w), px(track_h)),
+            ),
+            corner_radii: gpui::Corners::default(),
+            background: track.into(),
+            border_widths: gpui::Edges::default(),
+            border_color: gpui::Hsla::default(),
+            border_style: gpui::BorderStyle::Solid,
+        });
+        // 滑块：圆角半透明 muted（比旧 2px 细条更易抓取）。
+        let mut thumb = theme.muted;
+        thumb.a = 0.6;
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(
+                point(origin.x + px(thumb_x), origin.y + px(ty)),
+                size(px(thumb_w), px(th)),
+            ),
+            corner_radii: gpui::Corners::all(px(th / 2.)),
+            background: thumb.into(),
+            border_widths: gpui::Edges::default(),
+            border_color: gpui::Hsla::default(),
+            border_style: gpui::BorderStyle::Solid,
+        });
     }
 }
 
@@ -2904,15 +3220,23 @@ fn paint_text_row(
     }
 }
 
-/// 引述块：灰底带 + 左侧指示条（对齐预览：`px_3` 内缩、`py_1` 内衬、3px 边条）。
-/// 每行带从行上/下各向外 4px（`py_1`），相邻引述带重叠 → 整段引述连片灰底。
+/// 引述块的灰底带 + 左侧指示条（背景层；**不得**在这里画文字）。对齐预览：
+/// `px_3` 内缩、`py_1` 内衬、3px 边条。每行带从行上/下各向外 4px（`py_1`），
+/// 相邻引述带重叠 → 整段引述连片灰底。
+///
+/// `alert_kinds`（src 行号 → 警报种类）让 **callout 的 body 行**也用警报色画左条
+/// （否则只有 marker 行有彩条、body 行是灰条——「展开的 callout 标题彩、内容灰」）。
+///
+/// ⚠️ 画带与画文字必须**分两趟**：先给所有引述行画背景（本函数），再画全部文字
+/// （`paint_text_row`）。若逐行「带 + 文字」连画，后一行（带向上越 4px）会盖住
+/// 前一行文字底部——引述第一行文字被第二行背景盖掉的 bug 根源。
 fn paint_quote_band(
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
     row: &ShapedRow,
+    alert_kinds: &std::collections::HashMap<usize, AlertKind>,
     window: &mut Window,
-    cx: &mut App,
 ) {
     let x0 = origin.x + f.padding;
     let y0 = origin.y + row.top - px(4.);
@@ -2928,8 +3252,11 @@ fn paint_quote_band(
         border_color: border,
         border_style: gpui::BorderStyle::Solid,
     });
-    // 左侧深色指示条（预览固定色 0xa8b1bd）。
-    let bar: gpui::Hsla = gpui::rgb(crate::config::markdown::QUOTE_BAR_COLOR).into();
+    // 左侧指示条：callout region 内的行（marker + body）用警报色；普通引述用灰条。
+    let bar: gpui::Hsla = match alert_kinds.get(&row.src_line) {
+        Some(kind) => alert_color(theme, *kind),
+        None => gpui::rgb(crate::config::markdown::QUOTE_BAR_COLOR).into(),
+    };
     window.paint_quad(gpui::PaintQuad {
         bounds: Bounds::new(
             point(x0, y0),
@@ -2941,7 +3268,6 @@ fn paint_quote_band(
         border_color: bar,
         border_style: gpui::BorderStyle::Solid,
     });
-    paint_text_row(origin, theme, f, row, window, cx);
 }
 
 /// 每个警报（callout）对应的条色（明/暗主题微调，区分五类警报）。
@@ -2978,6 +3304,8 @@ fn paint_row_gutter(
     let x0 = f32::from(origin.x + f.padding);
     let center_y = f32::from(origin.y) + f32::from(row.top) + f32::from(row.height) / 2.;
     // 与预览（view/row.rs）一致：项目符号 / 有序号 / 任务框都是正文色字形（☐/☑/•/N.）。
+    // 警报（Alert）不画任何字形——它的 chrome（彩条 + 粗体标签 + 折叠箭头）由
+    // `paint_alert_chrome` 单独画；这里若给 `•` 会在彩条与文字之间漏个黑点。
     let glyph: SharedString = match g {
         RowGutter::Check { checked } => {
             if *checked {
@@ -2987,7 +3315,8 @@ fn paint_row_gutter(
             }
         }
         RowGutter::Ordered(n) => n.clone().into(),
-        RowGutter::Bullet | RowGutter::Alert { .. } => "•".into(),
+        RowGutter::Bullet => "•".into(),
+        RowGutter::Alert { .. } => return,
     };
     let rrun = [TextRun {
         len: glyph.len(),
@@ -3061,6 +3390,54 @@ fn paint_alert_chrome(
         if let Ok(path) = p.build() {
             window.paint_path(path, color);
         }
+    }
+}
+
+/// 标题折叠箭头（`▾` 展开 / `▸` 已折叠）：画在**左缘 gutter**（正文已右移
+/// `HEADING_GUTTER_W`，与勾选/项目符号同侧的左缘字形区，muted 半透明）。自绘实心
+/// 小三角（同 callout 折叠箭头：PathBuilder 字体无关，避免 Segoe UI 缺 `▸`/`▾`
+/// 字形画成 tofu 的坑 S）。geometry 与 `heading_chevron_hit` 共用。
+fn paint_heading_chevron(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if row.wrapped.is_empty() {
+        return;
+    }
+    let key = editor
+        .read(cx)
+        .content()[editor.read(cx).line_start(row.src_line)..editor.read(cx).line_end(row.src_line)]
+        .trim()
+        .to_string();
+    let folded = editor.read(cx).folded_headings.borrow().contains(&key);
+    let gx = origin.x + f.padding + px(GUTTER_MARK_X);
+    let cy = f32::from(origin.y) + f32::from(row.top) + f32::from(row.lh) * 0.5;
+    let mut col = theme.text;
+    col.a *= 0.45;
+    let w = 9.0_f32;
+    let h = 7.0_f32;
+    let ax = f32::from(gx) + 1.0;
+    let ay = cy - h * 0.5;
+    let mut p = gpui::PathBuilder::fill();
+    if folded {
+        // ▸ 右向（已折叠，点击展开）。
+        p.move_to(point(px(ax), px(ay)));
+        p.line_to(point(px(ax), px(ay + h)));
+        p.line_to(point(px(ax + w), px(cy)));
+    } else {
+        // ▾ 下向（展开，点击折叠）。
+        p.move_to(point(px(ax + w * 0.5), px(ay + h)));
+        p.line_to(point(px(ax), px(ay)));
+        p.line_to(point(px(ax + w), px(ay)));
+    }
+    p.close();
+    if let Ok(path) = p.build() {
+        window.paint_path(path, col);
     }
 }
 
@@ -3323,43 +3700,55 @@ fn paint_selection(
         }
         if !r.multi_offsets.is_empty() {
             // 代码块：逐源码行求与选区的交集，按字形几何画高亮（每行一条）。
+            // 横向滚动时高亮随内容平移（−scroll），并裁剪在面板内（不溢到页面背景）。
             let block_start = e.line_start(r.src_line);
             let g_count = r.multi_offsets.len();
-            for g in 0..g_count {
-                let ls = e.line_start(r.src_line + 1 + g);
-                let le = e.line_end(r.src_line + 1 + g).max(ls);
-                let from = range.start.max(ls).min(le);
-                let to = range.end.max(ls).min(le);
-                if to > from {
-                    let rd0 = source_to_display(&r.byte_map, from - block_start);
-                    let rd1 = source_to_display(&r.byte_map, to - block_start);
-                    let span = group_len(r, g);
-                    let mut c0 = rd0.saturating_sub(r.multi_offsets[g]).min(span);
-                    let mut c1 = rd1.saturating_sub(r.multi_offsets[g]).min(span);
-                    if c0 > c1 {
-                        std::mem::swap(&mut c0, &mut c1);
-                    }
-                    if let Some(wl) = r.wrapped.get(g)
-                        && let Some(p0) = wl.position_for_index(c0, r.lh)
-                        && let Some(p1) = wl.position_for_index(c1, r.lh)
-                    {
-                        let w = f32::from(p1.x - p0.x).max(2.);
-                        let y = r.top + px(code_group_top(r, g));
-                        let h = r.sub_heights.get(g).copied().unwrap_or(r.lh);
-                        window.paint_quad(gpui::PaintQuad {
-                            bounds: Bounds::new(
-                                point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
-                                size(px(w), h),
-                            ),
-                            corner_radii: gpui::Corners::default(),
-                            background: hl.into(),
-                            border_widths: gpui::Edges::default(),
-                            border_color: gpui::Hsla::default(),
-                            border_style: gpui::BorderStyle::Solid,
-                        });
+            let scroll = code_hscroll_clamped(editor.read(cx), f, r);
+            let panel_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+            let panel_rect = Bounds::new(
+                point(origin.x + f.padding, origin.y + r.top),
+                size(px(panel_w), r.height),
+            );
+            window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
+                for g in 0..g_count {
+                    let ls = e.line_start(r.src_line + 1 + g);
+                    let le = e.line_end(r.src_line + 1 + g).max(ls);
+                    let from = range.start.max(ls).min(le);
+                    let to = range.end.max(ls).min(le);
+                    if to > from {
+                        let rd0 = source_to_display(&r.byte_map, from - block_start);
+                        let rd1 = source_to_display(&r.byte_map, to - block_start);
+                        let span = group_len(r, g);
+                        let mut c0 = rd0.saturating_sub(r.multi_offsets[g]).min(span);
+                        let mut c1 = rd1.saturating_sub(r.multi_offsets[g]).min(span);
+                        if c0 > c1 {
+                            std::mem::swap(&mut c0, &mut c1);
+                        }
+                        if let Some(wl) = r.wrapped.get(g)
+                            && let Some(p0) = wl.position_for_index(c0, r.lh)
+                            && let Some(p1) = wl.position_for_index(c1, r.lh)
+                        {
+                            let w = f32::from(p1.x - p0.x).max(2.);
+                            let y = r.top + px(code_group_top(r, g));
+                            let h = r.sub_heights.get(g).copied().unwrap_or(r.lh);
+                            window.paint_quad(gpui::PaintQuad {
+                                bounds: Bounds::new(
+                                    point(
+                                        origin.x + f.padding + r.x_off + p0.x - px(scroll),
+                                        origin.y + y,
+                                    ),
+                                    size(px(w), h),
+                                ),
+                                corner_radii: gpui::Corners::default(),
+                                background: hl.into(),
+                                border_widths: gpui::Edges::default(),
+                                border_color: gpui::Hsla::default(),
+                                border_style: gpui::BorderStyle::Solid,
+                            });
+                        }
                     }
                 }
-            }
+            });
             continue;
         }
         let ls = e.line_start(r.src_line);
@@ -3570,7 +3959,7 @@ impl Element for WyEditorElement {
         };
         if let Some(f) = frame.as_ref() {
             let editor = self.editor.read(cx);
-            let (on, x, ctop) = caret_geometry(&*editor, &f.rows);
+            let (on, x, ctop) = caret_geometry(&*editor, f);
             super::set_caret_vis(CaretVis {
                 x,
                 top: if on { ctop } else { px(0.) },
@@ -3649,6 +4038,19 @@ impl Element for WyEditorElement {
         self.editor
             .update(cx, |e, ecx| e.sync_math(ecx));
         let origin = bounds.origin;
+        // 背景层：先给所有可见引述行画灰底带 + 左指示条（`py_1` 上下各越 4px，相邻带连片）。
+        // ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住
+        // 前一行文字底部（引述第一行被第二行背景盖掉的 bug）。
+        // callout 区域（marker + body 行）的左条统一用警报色，普通引述用灰条。
+        let alert_kinds = {
+            let editor = self.editor.read(cx);
+            markdown_syntax::alert_region_kinds(editor.content())
+        };
+        for row in &f.rows {
+            if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
+                paint_quote_band(origin, &theme, f, row, &alert_kinds, window);
+            }
+        }
         for row in &f.rows {
             // 块级卡片（数学块 / Mermaid 图）优先自绘，跳过普通文本/代码路径。
             if let Some(card) = &row.extra.card {
@@ -3662,7 +4064,7 @@ impl Element for WyEditorElement {
                     if row.wrapped.is_empty() {
                         continue;
                     }
-                    paint_code_row(origin, &theme, f, row, window, cx);
+                    paint_code_row(&self.editor, origin, &theme, f, row, window, cx);
                     continue;
                 }
                 IrKind::Table => {
@@ -3694,13 +4096,16 @@ impl Element for WyEditorElement {
             }
             // 行首装饰（列表符号 / 任务框 / 有序号）画在 gutter；警报 chrome 稍后叠画。
             paint_row_gutter(origin, &theme, f, row, window, cx);
-            // 引述块：灰底带 + 左侧指示条（与预览一致：px_3 内缩、py_1 内衬、3px 边条）。
-            // 相邻引述行（源码行连续）合并成一片背景，否则各自带 py_1 空隙。
+            // 引述块背景已在上面预画；这里只画文字 + 警报 chrome（标签/箭头叠在文字上）。
             if row.kind == IrKind::Quote {
-                paint_quote_band(origin, &theme, f, row, window, cx);
+                paint_text_row(origin, &theme, f, row, window, cx);
                 paint_alert_chrome(origin, &theme, f, row, window, cx);
             } else {
                 paint_text_row(origin, &theme, f, row, window, cx);
+                // 标题折叠箭头（标题保留行右缘 muted 小三角；点击翻转视图本地折叠态）。
+                if matches!(row.kind, IrKind::Heading(_)) {
+                    paint_heading_chevron(&self.editor, origin, &theme, f, row, window, cx);
+                }
             }
             // 行内数学 / 行内图片叠加（B1/B2）。
             paint_inline_maths(&self.editor, origin, &theme, f, row, window, cx);
@@ -3717,7 +4122,7 @@ impl Element for WyEditorElement {
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);
-            caret_geometry(&*e, &f.rows)
+            caret_geometry(&*e, f)
         };
         if caret_on && focus.is_focused(window) {
             window.paint_quad(gpui::PaintQuad {
@@ -3877,7 +4282,7 @@ mod tests {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _| e.set_caret(o2));
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame);
             let line_h = f32::from(frame.line_h);
             let top = f32::from(frame.rows[0].top);
             let top2 = f32::from(caret_top);
@@ -4336,6 +4741,249 @@ let c = 333;
     }
 
     #[gpui::test]
+    fn code_block_overflow_shows_hscroll_and_shifts_hit(cx: &mut TestAppContext) {
+        // 长代码行（nowrap 超出窄面板）→ 底部横向滚动条；滚动偏移使**同一可视 x**
+        // 命中更多源列（paint 平移的逆映射）；拖动滚动条更新偏移（视图本地，不写源码）。
+        use crate::markdown::ir::IrKind;
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, size};
+        cx.update(gpui_component::init);
+        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+                .expect("应有代码块");
+            let blk = code.src_line;
+            let (bar_x, bar_w, _, _, max_scroll) =
+                super::code_hscroll_geo(ed.read(cx), &frame, code)
+                    .expect("长行应超宽显示滚动条");
+            assert!(max_scroll > 50., "内容应显著超宽");
+            assert!(bar_w > 10., "滚动条轨道应有宽度");
+            // 首内容行中部 y（组 0 = 首空白带 + 首行）。
+            let y = f32::from(code.top) + f32::from(code.lh) * 1.5;
+            let view_x = f32::from(frame.padding) + f32::from(code.x_off) + 60.;
+            let p = point(px(view_x), px(y));
+            let off0 = super::source_offset_at(ed.read(cx), &frame, p);
+            // 滚到最右（大偏移）→ 同一可视 x 命中更后的源列。
+            ed.update(cx, |e, _| e.set_code_h_scroll(blk, max_scroll));
+            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let off1 = super::source_offset_at(ed.read(cx), &f2, p);
+            let (_, col0) = ed.read(cx).row_col(off0);
+            let (_, col1) = ed.read(cx).row_col(off1);
+            assert!(
+                col1 > col0,
+                "横向滚动后同一 x 应命中更后源列：col0={col0} col1={col1}"
+            );
+            // 拖动滚动条：点击轨道 90% → 偏移大；拖到 10% → 偏移小；松开清除拖拽态。
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(f2)));
+            let band_top = f32::from(code.top) + f32::from(code.height)
+                - crate::config::layout::CODE_HSCROLL_BAND;
+            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+            let down_x = bar_x + bar_w * 0.9;
+            let up_x = bar_x + bar_w * 0.1;
+            let ev_down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(down_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev_down, window, cx));
+            let scrolled = ed.read(cx).code_h_scroll_of(blk);
+            assert!(scrolled > 0., "按下轨道应产生滚动偏移：{scrolled}");
+            let ev_move = gpui::MouseMoveEvent {
+                position: point(px(up_x), px(band_y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+            let scrolled2 = ed.read(cx).code_h_scroll_of(blk);
+            assert!(
+                scrolled2 < scrolled,
+                "拖到 10% 应减小偏移：{scrolled2} < {scrolled}"
+            );
+            let ev_up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(up_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+            assert!(
+                ed.read(cx).code_h_drag.borrow().is_none(),
+                "松开应清除拖拽态"
+            );
+            // 视图本地状态：源码未变。
+            assert_eq!(ed.read(cx).text().as_ref(), text);
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_short_lines_have_no_hscroll(cx: &mut TestAppContext) {
+        // 短代码行不超宽 → 无横向滚动条（`code_hscroll_geo` None），且陈旧滚动值被
+        // `code_hscroll_clamped` 忽略（宽窗口下长行不再偏移）。防「内容超出代码块」回归。
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "```rust\nlet a = 1;\nlet b = 22;\n```\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let code = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+                .expect("应有代码块");
+            assert!(
+                super::code_hscroll_geo(ed.read(cx), &frame, code).is_none(),
+                "短行不应出现横向滚动条"
+            );
+            // 即便手动塞一个陈旧滚动值：paint/命中共用的 clamped 也应归 0。
+            ed.update(cx, |e, _| e.set_code_h_scroll(code.src_line, 999.));
+            assert_eq!(
+                super::code_hscroll_clamped(ed.read(cx), &frame, code),
+                0.,
+                "内容不超宽时应忽略陈旧滚动值"
+            );
+            assert!(super::code_hscroll_geo(ed.read(cx), &frame, code).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
+        // view 语义：点击**轨道**（不在滑块上）→ 滑块跳到点击处；点击**滑块** → 拖动。
+        // 旧实现点轨道空白处无反应（手感差），此处回归点击轨道即跳转。
+        use crate::markdown::ir::IrKind;
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size};
+        cx.update(gpui_component::init);
+        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let (blk, ctop, ctop_h, bar_x, bar_w, _thumb_x, thumb_w, max_scroll) = {
+                let code = frame
+                    .rows
+                    .iter()
+                    .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+                    .expect("应有代码块");
+                let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
+                    super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
+                // 初始 scroll=0 → 滑块贴着轨道左端。
+                assert!(thumb_x <= bar_x + 1., "初态滑块应在左端");
+                (
+                    code.src_line,
+                    f32::from(code.top),
+                    f32::from(code.height),
+                    bar_x,
+                    bar_w,
+                    thumb_x,
+                    thumb_w,
+                    max_scroll,
+                )
+            };
+            // 把刚建的帧放入编辑器，供 `on_mouse_down`/命中读取。
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
+            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+            // 点击轨道**末端**（远离初始左端滑块，必不在滑块上）→ 直接跳转（不进拖动态）。
+            let jump_x = bar_x + bar_w - 4.0;
+            let jump_y = band_y;
+            // 断言**点击前**命中的是轨道（非滑块）。
+            let (blk_pre, on_thumb_pre, _) = super::code_hscrollbar_hit(
+                ed.read(cx),
+                &ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+                point(px(jump_x), px(jump_y)),
+            )
+            .expect("轨道末应在滚动条带内");
+            assert_eq!(blk_pre, blk);
+            assert!(!on_thumb_pre, "点击末端的点不应落在初始滑块上");
+            let ev = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(jump_x), px(jump_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+            let jumped = ed.read(cx).code_h_scroll_of(blk);
+            assert!(jumped > 0., "点击轨道应立刻跳转（不拖也动）：{jumped}");
+            assert!(
+                ed.read(cx).code_h_drag.borrow().is_none(),
+                "轨道跳转不应进入拖动态"
+            );
+            assert!(
+                jumped <= max_scroll,
+                "跳转偏移应不超过 max_scroll（{jumped} ≤ {max_scroll}）"
+            );
+            // 再点滑块中心 → 进入拖动态，拖动到左端归零。
+            let geo2 = super::code_hscroll_geo(
+                ed.read(cx),
+                &ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+                &ed.read(cx).frame.borrow().as_ref().unwrap().rows.iter().find(|r| r.src_line == blk).unwrap(),
+            ).unwrap();
+            let (_, _, thumb_x2, thumb_w2, _) = geo2;
+            let thumb_cx = thumb_x2 + thumb_w2 / 2.;
+            let ev2 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(thumb_cx), px(jump_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+            assert!(
+                ed.read(cx).code_h_drag.borrow().is_some(),
+                "点滑块应进入拖动态"
+            );
+            let ev_move = MouseMoveEvent {
+                position: point(px(bar_x + 6.), px(jump_y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+            let dragged = ed.read(cx).code_h_scroll_of(blk);
+            assert!(dragged < jumped, "拖到左端应减小偏移：{dragged} < {jumped}");
+            let ev_up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(bar_x + 6.), px(jump_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+            assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
+        });
+    }
+
+    #[gpui::test]
     fn code_block_caret_tracks_clicked_content_line(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
         cx.update(gpui_component::init);
@@ -4371,7 +5019,7 @@ tail
             for (k, off) in offsets.iter().enumerate() {
                 ed.update(cx, |e, _| e.set_caret(*off));
                 let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-                let (on, _, ctop) = caret_geometry(ed.read(cx), &frame.rows);
+                let (on, _, ctop) = caret_geometry(ed.read(cx), &frame);
                 assert!(on, "代码内容行应可放光标");
                 // caret 顶 = 块首 + 1 行首空白带 + k×行高。
                 let expect = code_top + lh * (1 + k) as f32;
@@ -4557,7 +5205,7 @@ tail
             let (line0, _) = ed.read(cx).row_col(off0);
             assert_eq!(line0, 1, "点击文本始应命中代码内容行，得行 {line0}");
             ed.update(cx, |e, _| e.set_caret(off0));
-            let (on, c0, _) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, c0, _) = caret_geometry(ed.read(cx), &frame);
             assert!(on);
             assert!(
                 (f32::from(c0) - text_start).abs() < 0.6,
@@ -4567,7 +5215,7 @@ tail
             // 2) 点击面板内、文本左的内衬空白 → 光标收拢到行首（= 文本起始 x），不右偏。
             let off1 = source_offset_at(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
             ed.update(cx, |e, _| e.set_caret(off1));
-            let (on, c1, _) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, c1, _) = caret_geometry(ed.read(cx), &frame);
             assert!(on);
             assert!(
                 (f32::from(c1) - text_start).abs() < 0.6,
@@ -4578,7 +5226,7 @@ tail
             let cx_ = text_start + 28.;
             let off2 = source_offset_at(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
             ed.update(cx, |e, _| e.set_caret(off2));
-            let (on, c2, _) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, c2, _) = caret_geometry(ed.read(cx), &frame);
             assert!(on);
             assert!(
                 (f32::from(c2) - cx_).abs() < 14.,
@@ -4659,7 +5307,7 @@ tail
             let y = top + table_row_top(t, row_ix) + rh / 2.;
             let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
             ed.update(cx, |e, _| e.set_caret(off));
-            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
             assert!(on, "表格单元格应可放光标");
             assert!(
                 (f32::from(caretx) - x).abs() < 12.,
@@ -5118,14 +5766,235 @@ graph TD
     }
 
     #[gpui::test]
-    fn paint_smoke_all_new_features(cx: &mut TestAppContext) {        // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
+    fn heading_chevron_click_round_trips(cx: &mut TestAppContext) {
+        // 标题折叠箭头 → 视图本地折叠态翻转（不写源码、不进撤销栈）：`## 甲` 的
+        // section body 行折叠成 0 高；再点展开还原。折叠后光标停在标题行，不得被
+        // reveal 弹开（与 callout 的坑 P 同一教训）。
+        use super::Frame;
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        cx.update(gpui_component::init);
+        let text = "## 甲\nbody 一\nbody 二\n## 乙\n尾";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(600.)))));
+            });
+            let chevron_point = |f: &Frame| {
+                let heading = f
+                    .rows
+                    .iter()
+                    .find(|r| matches!(r.kind, crate::markdown::ir::IrKind::Heading(_)))
+                    .expect("应有标题行");
+                let (cx0, _) = super::heading_chevron_box(f, heading).unwrap();
+                let y = f32::from(heading.top) + f32::from(heading.lh) / 2.;
+                point(px(cx0 + 8.), px(y))
+            };
+            // 折叠 `## 甲`（单击标题行左缘箭头）：body 行真正折叠（0 高）。
+            let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1)));
+            let f1 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
+            let ev1 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: chevron_point(&f1),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+            assert!(
+                ed.read(cx).folded_headings.borrow().contains("## 甲"),
+                "点击标题箭头应折叠"
+            );
+            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(body.height), 0., "折叠后 body 应真正折叠");
+            let h2 = frame2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
+            assert!(f32::from(h2.height) > 0., "标题行本身保留");
+            // 展开回：body 高度恢复，文本不变（视图本地，不写源码）。
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2)));
+            let f2 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
+            let ev2 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: chevron_point(&f2),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+            assert!(
+                !ed.read(cx).folded_headings.borrow().contains("## 甲"),
+                "再点应展开"
+            );
+            assert_eq!(ed.read(cx).text().as_ref(), text, "折叠/展开不写源码");
+            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body3 = frame3.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert!(f32::from(body3.height) > 0., "展开后 body 恢复高度");
+        });
+    }
+
+    #[gpui::test]
+    fn heading_fold_stays_folded_with_caret_on_heading_line(cx: &mut TestAppContext) {
+        // 回归（坑 P 同款）：点击折叠后光标停在标题行，该 section 不得被 reveal 弹开；
+        // 光标严格落在 body 行内才 reveal。
+        cx.update(gpui_component::init);
+        let text = "# A\nbody\n## B\nmore\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.toggle_heading_fold_at_line(0, cx);
+            });
+            // 光标默认在行首（标题行）→ 折叠保持。
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(body.height), 0., "光标在标题行时折叠保持");
+            // 光标移到 body（源字节 6 = "body" 起点所在行）→ reveal：body 恢复高度。
+            ed.update(cx, |e, _| e.set_caret(text.find("body").unwrap()));
+            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body2 = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert!(f32::from(body2.height) > 0., "光标在 body 行内应 reveal");
+        });
+    }
+
+    #[gpui::test]
+    fn toggle_heading_fold_moves_caret_out_when_folding_from_body(cx: &mut TestAppContext) {
+        // 折叠时若光标在 section body 内，先把光标移到标题行末（否则 body 被 reveal，
+        // 折叠无效）——与 live 的 `move_to(end)` 同款。
+        cx.update(gpui_component::init);
+        let text = "## Goals\n- 任务一\n- 任务二\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 光标放在列表行（body 内）。
+            ed.update(cx, |e, _| e.set_caret(text.find("- 任务一").unwrap()));
+            let before = ed.read(cx).caret();
+            assert!(before > 6, "光标在 body 内");
+            ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+            assert!(
+                ed.read(cx).folded_headings.borrow().contains("## Goals"),
+                "折叠成功"
+            );
+            // 折叠后光标在标题行内、不在 body（第 0 行），保证折叠不被 reveal 弹开。
+            let (line, _) = ed.read(cx).row_col(ed.read(cx).caret());
+            assert_eq!(line, 0, "折叠时光标应移到标题行");
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(body.height), 0., "body 真正折叠");
+        });
+    }
+
+    #[gpui::test]
+    fn heading_fold_hides_math_cards_completely(cx: &mut TestAppContext) {
+        // 回归：折叠标题，其 section 内的 `$$…$$` 数学块卡片（“公式”标签 + 公式图）
+        // 必须一并折叠成 0 高，不得因 `extra.card` 继续绘制而重叠堆在标题上方。
+        use super::BlockCard;
+        cx.update(gpui_component::init);
+        let text = "# 公式区\n$$\nx^2\n$$\n$$\n\\int dx\n$$\n尾\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 展开时：两个数学卡片都在（src_lines 覆盖 `$$…$$`）。
+            let frame_open = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let open_cards: Vec<_> = frame_open
+                .rows
+                .iter()
+                .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .collect();
+            assert_eq!(open_cards.len(), 2, "展开时应有 2 个数学卡片");
+            // 折叠标题：卡片行必须消失（fold 后 math_start 不装配卡片，走普通 0 高占位）。
+            ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+            assert!(
+                ed.read(cx).folded_headings.borrow().contains("# 公式区"),
+                "已折叠"
+            );
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let cards: Vec<_> = frame
+                .rows
+                .iter()
+                .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .collect();
+            assert!(
+                cards.is_empty(),
+                "折叠标题后数学卡片不得残留绘制（{}）",
+                cards.len()
+            );
+            // 原卡片行应折叠成 0 高（普通占位），不再是卡片。
+            let m1 = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(m1.height), 0., "`\\$\\$` 起始行折叠成 0 高");
+        });
+    }
+
+    #[gpui::test]
+    fn callout_body_rows_share_alert_bar_color(cx: &mut TestAppContext) {
+        // 回归：展开的 callout，其 body 行左条应与 marker 同色（警报色），不是灰条。
+        // 检查 frame 里 callout body 行的 bar 配色走 alert 路径（间接断言：
+        // `alert_region_kinds` 把 marker + body 行都标上 kind，paint 据此取警报色）。
+        use crate::markdown::live::markdown_syntax;
+        use crate::markdown::live::md_syntax::AlertKind;
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let bodies: Vec<_> = frame
+                .rows
+                .iter()
+                .filter(|r| r.kind == IrKind::Quote && r.src_line >= 1 && r.src_line <= 2)
+                .collect();
+            assert_eq!(bodies.len(), 2, "callout body 行应存在");
+            let kinds = markdown_syntax::alert_region_kinds(ed.read(cx).content());
+            for b in &bodies {
+                assert_eq!(
+                    kinds.get(&b.src_line),
+                    Some(&AlertKind::Note),
+                    "body 行 {} 左条应取警报色",
+                    b.src_line
+                );
+            }
+            // 普通引述行不进入警报色表。
+            let plain = frame.rows.iter().find(|r| r.src_line == 4).unwrap();
+            assert!(!kinds.contains_key(&4), "普通引述不应走警报色");
+        });
+    }
+
+    #[gpui::test]
+    fn paint_smoke_all_new_features(cx: &mut TestAppContext) {
+        // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
         use super::BlockCard;
         cx.update(gpui_component::init);
         let text = "\
 - [ ] 待办
 
+# 标题折叠
+
 > [!WARNING]+ 重要
 > 内容
+
+> 连续引述第一行
+> 连续引述第二行
 
 链接 [示例](https://a.b) 与 $x^2$
 
@@ -5398,6 +6267,228 @@ A-->B
     }
 
     #[gpui::test]
+    fn inline_math_double_click_enters_edit(cx: &mut TestAppContext) {
+        // B2 双击编辑：双击 `$…$` spacer → 光标进公式（`$` 后 1 字节）→ shape 期
+        // reveal 显示可编辑的原始 LaTeX（不再 splice 成 spacer）；光标移走恢复。
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        cx.update(gpui_component::init);
+        let text = "前置文字 $x^2+\\alpha$ 后置文字\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let para = frame
+                .rows
+                .iter()
+                .find(|r| !r.extra.inline_maths.is_empty())
+                .expect("应有行内公式行");
+            let im = para.extra.inline_maths[0].clone();
+            assert!(!im.source.is_empty(), "spacer 应带绝对源区间");
+            let w0 = para.wrapped.first().unwrap();
+            let p0 = w0.position_for_index(im.display_off, para.lh).unwrap();
+            let (src_line, x_off, top, lh) = (
+                para.src_line,
+                f32::from(para.x_off),
+                f32::from(para.top),
+                para.lh,
+            );
+            let x = f32::from(frame.padding) + x_off + f32::from(p0.x) + 2.0;
+            let y = top + f32::from(lh) / 2.;
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            let ev = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(x), px(y)),
+                modifiers: Modifiers::default(),
+                click_count: 2,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+            let caret = ed.read(cx).caret();
+            assert!(
+                caret > im.source.start && caret < im.source.end,
+                "双击应把光标放进公式内：caret={caret} ∈ {:?}",
+                im.source
+            );
+            // reveal：重建帧后该行公式不再 splice。
+            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let para2 = frame2
+                .rows
+                .iter()
+                .find(|r| r.src_lines.contains(&src_line))
+                .unwrap();
+            assert!(
+                para2.extra.inline_maths.is_empty(),
+                "光标在公式内应 reveal（不 splice spacer）"
+            );
+            // 光标移走 → 恢复 splice（公式感回来）。
+            ed.update(cx, |e, _| e.set_caret(0));
+            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let para3 = frame3
+                .rows
+                .iter()
+                .find(|r| r.src_lines.contains(&src_line))
+                .unwrap();
+            assert!(
+                !para3.extra.inline_maths.is_empty(),
+                "光标离开公式应恢复 splice"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext) {
+        // A1 交互语义修复：单击数学块卡片**不改光标**（不会因 caret 进块被 reveal 回
+        // 源码字符串）；**双击**把光标放进块首 → 整块 reveal 源码进入编辑。
+        use super::BlockCard;
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        cx.update(gpui_component::init);
+        let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            ed.update(cx, |e, _| {
+                e.set_caret(text.find("尾").unwrap())
+            }); // 光标在块外（末行）
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let x = f32::from(frame.padding) + 40.;
+            let y = {
+                let card = frame
+                    .rows
+                    .iter()
+                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                    .expect("应有数学卡片");
+                f32::from(card.top) + f32::from(card.height) / 2.
+            };
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            // 单击：光标不动，卡片保持（不 reveal）。
+            let ev1 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(x), px(y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+            let caret_before = ed.read(cx).caret();
+            assert_eq!(caret_before, text.find("尾").unwrap(), "单击卡片不得移动光标");
+            let f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                f1.rows
+                    .iter()
+                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+                "单击后卡片仍在（未 reveal）"
+            );
+            // 双击：光标进块首（源码行 0）→ reveal 源码（不再有卡片）。
+            let ev2 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(x), px(y)),
+                modifiers: Modifiers::default(),
+                click_count: 2,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+            let caret = ed.read(cx).caret();
+            assert!(ed.read(cx).row_col(caret).0 == 0, "双击应把光标放进块首");
+            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                !f2.rows
+                    .iter()
+                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+                "双击后 reveal 源码（无卡片）"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn math_block_single_line_double_click_reveals_immediately(cx: &mut TestAppContext) {
+        // 单行 `$$…$$` 数学块（`$$\sum…$$` 独占一行）：双击必须**直接**还原成源码
+        // 字符串，不得先变成行内小公式再双击一次。根因：光标放在行首 0 列时
+        // `splice_math_text` 的 `c > span.start` 不成立 → 仍被 splice 成小号行内公式；
+        // 现在放 `$$` 行内容内 1 字节 → 块 reveal 与行内 splice reveal 同时满足。
+        use super::BlockCard;
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        cx.update(gpui_component::init);
+        let text = "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n尾行\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(600.), px(600.)),
+                )));
+            });
+            ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap())); // 光标在块外
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let card = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .expect("单行 `$$…$$` 也应是数学卡片");
+            let (x, y) = (
+                f32::from(frame.padding) + 40.,
+                f32::from(card.top) + f32::from(card.height) / 2.,
+            );
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            let ev = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(x), px(y)),
+                modifiers: Modifiers::default(),
+                click_count: 2,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+            // 双击一次：光标在行内（>0 列），卡片消失、不再 splice（直接是字符串）。
+            let caret = ed.read(cx).caret();
+            let (_, col) = ed.read(cx).row_col(caret);
+            assert!(col > 0, "双击后光标应进入块行内部，col={col}");
+            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                !f2.rows
+                    .iter()
+                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+                "双击后应无卡片（reveal 源码）"
+            );
+            let row0 = f2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
+            assert!(
+                row0.extra.inline_maths.is_empty(),
+                "单行块双击应直接还原字符串（不得再 splice 成行内公式）"
+            );
+            // 光标移出块（到尾行）后恢复卡片渲染。
+            ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap()));
+            let f3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                f3.rows.iter().any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+                "光标移出后应恢复数学卡片（公式感）"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn sync_math_claims_block_and_inline_slots(cx: &mut TestAppContext) {
         // 数学排版集成（参考 zorite ensure_content_math）：内容含 `$$…$$` 块 + `$…$`
         // 行内公式 → `sync_math` 按「去定界符的 LaTeX」为键把两块都占为 Loading（真正
@@ -5509,7 +6600,7 @@ A-->B
             let len = ed.read(cx).content().len() as f32;
             assert!(off as f32 <= len, "点击应解析到行内源偏移：off={off}");
             ed.update(cx, |e, _| e.set_caret(off));
-            let (on, _caretx, carety) = caret_geometry(ed.read(cx), &frame.rows);
+            let (on, _caretx, carety) = caret_geometry(ed.read(cx), &frame);
             assert!(on, "该行可放光标");
             assert!(
                 f32::from(carety) >= shift - 1.0 && f32::from(carety) <= shift + lh + 1.0,

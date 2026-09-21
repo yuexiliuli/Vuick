@@ -1428,6 +1428,38 @@ pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
     out
 }
 
+/// 每个警报（callout）区域（marker 行 + 其连续 `>` body 行）的 `AlertKind`——
+/// 供 WYSIWYG 把**整段** callout（含 body 行）的左条统一画成警报色（否则只有
+/// marker 行有彩条、body 行是灰条）。键 = 源码行号。含/不含折叠符的警报都覆盖
+/// （有折叠符 = `alert_fold_regions` 的子集，这里更宽）。
+pub(crate) fn alert_region_kinds(content: &str) -> std::collections::HashMap<usize, AlertKind> {
+    fn line_kind(line: &str) -> Option<AlertKind> {
+        let p = blockquote_prefix(line)?;
+        alert_prefix(&line[p..]).map(|(kind, _, _)| kind)
+    }
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut out = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(kind) = line_kind(lines[i]) {
+            let start = i;
+            i += 1;
+            while i < lines.len()
+                && blockquote_prefix(lines[i]).is_some()
+                && line_kind(lines[i]).is_none()
+            {
+                i += 1;
+            }
+            for l in start..i {
+                out.insert(l, kind);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn blockquote_prefix(line: &str) -> Option<usize> {
     let b = line.as_bytes();
     if b.first() != Some(&b'>') {
@@ -3040,6 +3072,22 @@ mod tests {
         // Folded NOTE spans its quote lines; open TIP's region ends at the
         // plain (non-foldable) alert marker, which starts no region itself.
         assert_eq!(r, vec![(0..3, true), (4..6, false)]);
+    }
+
+    #[test]
+    fn alert_region_kinds_cover_marker_and_body() {
+        let src = "> [!NOTE]- hidden\n> body一\n> body二\nprose\n> [!TIP]+ open\n> b\n> [!NOTE] plain\n> p2";
+        // 每个 callout region（marker + 连续 `>` body 行）的每行都记上对应 AlertKind；
+        // 有/无折叠符的警报都覆盖。普通引述/非引述行不在此表。
+        let m = alert_region_kinds(src);
+        assert_eq!(m.get(&0), Some(&AlertKind::Note));
+        assert_eq!(m.get(&1), Some(&AlertKind::Note), "body 行 1 也应变色");
+        assert_eq!(m.get(&2), Some(&AlertKind::Note), "body 行 2 也应变色");
+        assert_eq!(m.get(&4), Some(&AlertKind::Tip));
+        assert_eq!(m.get(&5), Some(&AlertKind::Tip), "TIP body 也变色");
+        assert_eq!(m.get(&6), Some(&AlertKind::Note), "无折叠符的警报也覆盖");
+        assert_eq!(m.get(&7), Some(&AlertKind::Note), "无折叠符警报的 body 也变色");
+        assert!(!m.contains_key(&3), "普通 prose 行不应变色");
     }
 
     #[test]
