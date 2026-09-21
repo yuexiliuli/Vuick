@@ -918,12 +918,18 @@ fn mermaid_graph(source: &str) -> MmGraph {
     let mut nodes: Vec<(String, String, MmShape)> = Vec::new();
     let mut edges: Vec<(String, String, Option<String>)> = Vec::new();
     let mut add = |id: &str, lab: Option<String>, shp: MmShape| {
-        let lab = lab.filter(|l| !l.is_empty()).unwrap_or_else(|| id.to_string());
         if let Some(n) = nodes.iter_mut().find(|(nid, _, _)| nid == id) {
-            n.1 = lab;
-        } else {
-            nodes.push((id.to_string(), lab, shp));
+            // 已有定义：只有本次给出**显式标签**才更新，裸 id 引用（`B -->` 里的 `B`）
+            // 不得用回退的「id 本身」覆盖之前的 `B{判断}` → 判断。
+            if let Some(l) = lab {
+                if !l.is_empty() {
+                    n.1 = l;
+                }
+            }
+            return;
         }
+        let lab = lab.filter(|l| !l.is_empty()).unwrap_or_else(|| id.to_string());
+        nodes.push((id.to_string(), lab, shp));
     };
     for raw in source.lines() {
         let mut t = raw.trim();
@@ -4842,7 +4848,15 @@ A-->B
         assert_eq!(g.nodes.len(), 4, "4 节点");
         assert_eq!(g.edges.len(), 3, "3 边");
         assert!(g.nodes.iter().any(|(id, lab, _)| id == "A" && lab == "开始"), "A=开始");
-        assert!(g.nodes.iter().any(|(id, _, shp)| id == "B" && *shp == MmShape::Diamond), "B 为判断（菱形）");
+        assert!(g.nodes.iter().any(|(id, lab, _)| id == "C" && lab == "完成"), "C=完成");
+        // 回归：`B{判断}` 的定义不能被后续裸引用 `B -->` 覆盖成 “B”。
+        assert!(
+            g.nodes.iter().any(|(id, lab, _)| id == "B" && lab == "判断"),
+            "B 的标签应保持为「判断」，却被后续裸引用覆盖：{:?}",
+            g.nodes.iter().filter(|(id, _, _)| id == "B").collect::<Vec<_>>()
+        );
+        let (id, _, shp) = g.nodes.iter().find(|(id, _, _)| id == "B").unwrap();
+        assert!(id == "B" && *shp == MmShape::Diamond, "B 为判断（菱形）");
         let (a, b, lab) = &g.edges[1];
         assert!(a == "B" && b == "C" && lab.as_deref() == Some("是"), "边 B→C(是)");
     }
