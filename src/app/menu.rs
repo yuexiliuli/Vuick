@@ -203,7 +203,7 @@ impl EditorApp {
                 .justify_between()
                 .gap_3()
                 .child(if on {
-                    "◉ 实时预览编辑"
+                    "● 实时预览编辑"
                 } else {
                     "○ 实时预览编辑"
                 })
@@ -232,7 +232,7 @@ impl EditorApp {
                 .justify_between()
                 .gap_3()
                 .child(if on {
-                    "◉ 预览编辑测试"
+                    "● 预览编辑测试"
                 } else {
                     "○ 预览编辑测试"
                 })
