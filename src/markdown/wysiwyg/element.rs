@@ -109,8 +109,6 @@ pub(crate) enum RowGutter {
 pub(crate) struct InlineMathText {
     /// spacer 起始渲染字节。
     pub display_off: usize,
-    /// spacer 渲染长度（空格数）。
-    pub len: usize,
     /// 去定界符后的 LaTeX（paint 以斜体排版绘制）。
     pub latex: SharedString,
 }
@@ -444,7 +442,7 @@ fn splice_math_text(
     let maths = places
         .into_iter()
         .zip(latexes)
-        .map(|(pl, latex)| InlineMathText { display_off: pl.display_off, len: pl.len, latex })
+        .map(|(pl, latex)| InlineMathText { display_off: pl.display_off, latex })
         .collect();
     (nd, nr, nm, maths)
 }
@@ -837,28 +835,45 @@ fn math_to_unicode(src: &str) -> String {
     out
 }
 
-/// 解析 `A[...]` / `A{...}` / `A((...))` / 裸 `A` → (id, 可选标签)。
-fn mm_node(s: &str) -> (String, Option<String>) {
+/// mermaid 节点形状。
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum MmShape {
+    /// 普通矩形。
+    Rect,
+    /// `{ … }` 判断/菱形。
+    Diamond,
+    /// `[ … ]` 圆角矩形（stadium）。
+    Round,
+    /// `(( … ))` 圆形。
+    Circle,
+}
+
+/// 解析 `A[...]` / `A{...}` / `A((...))` / `A(...)` / 裸 `A` → (id, 可选标签, 形状)。
+fn mm_node(s: &str) -> (String, Option<String>, MmShape) {
     let s = s.trim();
-    if let Some(oi) = s.find("[(") {
+    if let Some(oi) = s.find("((") {
         let id = s[..oi].trim().to_string();
         let rest = &s[oi + 2..];
-        if let Some(ci) = rest.find(")]") {
-            return (id, Some(rest[..ci].trim().to_string()));
+        if let Some(ci) = rest.find("))") {
+            return (id, Some(rest[..ci].trim().to_string()), MmShape::Circle);
         }
-        return (id, None);
+        return (id, None, MmShape::Circle);
     }
-    for (open, close) in [('[', ']'), ('{', '}'), ('(', ')')] {
+    for (open, close, shp) in [
+        ('[', ']', MmShape::Round),
+        ('{', '}', MmShape::Diamond),
+        ('(', ')', MmShape::Round),
+    ] {
         if let Some(oi) = s.find(open) {
             let id = s[..oi].trim().to_string();
             let rest = &s[oi + 1..];
             if let Some(ci) = rest.find(close) {
-                return (id, Some(rest[..ci].trim().to_string()));
+                return (id, Some(rest[..ci].trim().to_string()), shp);
             }
-            return (id, None);
+            return (id, None, shp);
         }
     }
-    (s.to_string(), None)
+    (s.to_string(), None, MmShape::Rect)
 }
 
 /// 解析一条边 `A -->|标| B` / `A --> B` / `A --- B` → (起点文本, 终点文本, 边标)。
@@ -889,26 +904,25 @@ fn mm_edge(s: &str) -> Option<(String, String, Option<String>)> {
     Some((lhs, rhs, elab))
 }
 
-/// 极简 mermaid `graph TD/LR` 展平渲染（无光栅渲染器时的「图」感）：
-/// 解析节点定义（`A[开始]`/`A{判断}`）与边（`A --> B` / `A -->|是| B`），
-/// 按入度为 0 的起点 DFS 展开路径，输出「节点 ─边标→ 节点」紧凑流式文本行。
-fn mermaid_flow_text(source: &str) -> Vec<String> {
-    use std::collections::{HashMap, HashSet};
-    let mut labels: HashMap<String, String> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+/// 解析后的 mermaid 图（节点 + 边），供层式布局与矢量绘制用。
+#[derive(Clone, Debug)]
+struct MmGraph {
+    /// (id, 显示标签, 形状)。
+    nodes: Vec<(String, String, MmShape)>,
+    /// (起点 id, 终点 id, 边标)。
+    edges: Vec<(String, String, Option<String>)>,
+}
+
+/// 解析 `graph TD/LR` 源码 → 节点与边（缺省标签回退到 id）。
+fn mermaid_graph(source: &str) -> MmGraph {
+    let mut nodes: Vec<(String, String, MmShape)> = Vec::new();
     let mut edges: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut add_node = |id: &str, lab: Option<String>| {
-        if seen.insert(id.to_string()) {
-            order.push(id.to_string());
-        }
-        match lab {
-            Some(l) if !l.is_empty() => {
-                labels.insert(id.to_string(), l);
-            }
-            _ => {
-                labels.entry(id.to_string()).or_insert_with(|| id.to_string());
-            }
+    let mut add = |id: &str, lab: Option<String>, shp: MmShape| {
+        let lab = lab.filter(|l| !l.is_empty()).unwrap_or_else(|| id.to_string());
+        if let Some(n) = nodes.iter_mut().find(|(nid, _, _)| nid == id) {
+            n.1 = lab;
+        } else {
+            nodes.push((id.to_string(), lab, shp));
         }
     };
     for raw in source.lines() {
@@ -924,77 +938,233 @@ fn mermaid_flow_text(source: &str) -> Vec<String> {
             continue;
         }
         if let Some((a, b, elab)) = mm_edge(t) {
-            let (aid, alab) = mm_node(&a);
-            let (bid, blab) = mm_node(&b);
-            add_node(&aid, alab);
-            add_node(&bid, blab);
+            let (aid, alab, ashp) = mm_node(&a);
+            let (bid, blab, bshp) = mm_node(&b);
+            add(&aid, alab, ashp);
+            add(&bid, blab, bshp);
             edges.push((aid, bid, elab));
             continue;
         }
-        let (id, lab) = mm_node(t);
-        add_node(&id, lab);
+        let (id, lab, shp) = mm_node(t);
+        add(&id, lab, shp);
     }
-    if edges.is_empty() {
-        return order.iter().map(|id| labels.get(id).cloned().unwrap_or_else(|| id.clone())).collect();
+    MmGraph { nodes, edges }
+}
+
+/// 最长路径分层：`layer[b] ≥ layer[a] + 1`，收敛后返回各节点层号。
+fn mermaid_layer_map(g: &MmGraph) -> std::collections::HashMap<String, usize> {
+    use std::collections::HashMap;
+    let mut layer: HashMap<String, usize> = HashMap::new();
+    for (id, _, _) in &g.nodes {
+        layer.insert(id.clone(), 0);
     }
-    // 入度 + 邻接。
-    let mut indeg: HashMap<String, usize> = HashMap::new();
-    let mut adjs: HashMap<String, Vec<String>> = HashMap::new();
-    for (a, b, _) in &edges {
-        adjs.entry(a.clone()).or_default().push(b.clone());
-        *indeg.entry(b.clone()).or_insert(0) += 1;
-        indeg.entry(a.clone()).or_insert(0);
-    }
-    let mut starts: Vec<String> = order
-        .iter()
-        .filter(|id| adjs.contains_key(*id) && indeg.get(*id).copied().unwrap_or(0) == 0)
-        .cloned()
-        .collect();
-    if starts.is_empty() {
-        starts = order.iter().filter(|id| adjs.contains_key(*id)).cloned().take(1).collect();
-    }
-    // DFS 展开每条 起点→… 路径。
-    let mut stack: Vec<(String, Vec<String>)> =
-        starts.into_iter().map(|s| (s.clone(), vec![s])).collect();
-    let mut paths: Vec<Vec<String>> = Vec::new();
-    while let Some((cur, path)) = stack.pop() {
-        let out = adjs.get(&cur).cloned().unwrap_or_default();
-        if out.is_empty() {
-            paths.push(path);
-            continue;
+    // 边界情况：节点多则多轮，收敛即止。
+    for _ in 0..g.nodes.len().max(1) {
+        let mut changed = false;
+        for (a, b, _) in &g.edges {
+            let la = layer.get(a).copied().unwrap_or(0);
+            if layer.get(b).copied().unwrap_or(0) < la + 1 {
+                layer.insert(b.clone(), la + 1);
+                changed = true;
+            }
         }
-        for nx in out {
-            let mut np = path.clone();
-            np.push(nx.clone());
-            stack.push((nx, np));
+        if !changed {
+            break;
         }
     }
-    let mut out_lines: Vec<String> = Vec::new();
-    let mut drawn: HashSet<String> = HashSet::new();
-    for path in paths {
-        let mut parts: Vec<String> = Vec::new();
-        for w in path.windows(2) {
-            let a = labels.get(&w[0]).cloned().unwrap_or_else(|| w[0].clone());
-            parts.push(a);
-            let elab = edges.iter().find(|(x, y, _)| x == &w[0] && y == &w[1]).and_then(|e| e.2.clone());
-            let arrow = match elab {
-                Some(l) if !l.is_empty() => format!("─{l}→"),
-                _ => " → ".to_string(),
-            };
-            parts.push(arrow);
-        }
-        if let Some(last) = path.last() {
-            parts.push(labels.get(last).cloned().unwrap_or_else(|| last.clone()));
-        }
-        out_lines.push(parts.concat());
-        drawn.extend(path.into_iter());
+    layer
+}
+
+/// 卡片布局常量（paint 与卡片高度共用，不得分开改）。
+const MM_TOP_PAD: f32 = 30.;
+const MM_LANE: f32 = 52.;
+const MM_NODE_H: f32 = 30.;
+const MM_NODE_XPAD: f32 = 14.;
+const MM_SEP: f32 = 20.;
+const MM_EDGE_X: f32 = 14.;
+
+/// Mermaid 图卡片高度：由层数决定（无窗口也能算）。
+fn mermaid_card_height(source: &str) -> Pixels {
+    let g = mermaid_graph(source);
+    if g.nodes.is_empty() {
+        return px(140.);
     }
-    for id in &order {
-        if !drawn.contains(id) {
-            out_lines.push(labels.get(id).cloned().unwrap_or_else(|| id.clone()));
+    let layers = mermaid_layer_map(&g);
+    let n = layers.values().copied().max().unwrap_or(0) + 1;
+    px(MM_TOP_PAD + n as f32 * MM_LANE + 8.)
+}
+
+/// 已摆放的节点（layout 算好几何，paint 与测试共用）。
+pub(crate) struct MmPlaced {
+    pub id: String,
+    pub label: String,
+    pub shape: MmShape,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// mermaid `graph` 的层式布局（与绘制解耦，便于单测/光栅化验证）：
+/// 返回摆放好的节点与「节点索引对」边。`area` 是卡片内容区（左上 + 可用宽）。
+pub(crate) fn mm_layout(
+    window: &Window,
+    theme: &WyTheme,
+    source: &str,
+    area_x: f32,
+    area_y: f32,
+    area_w: f32,
+) -> (Vec<MmPlaced>, Vec<(usize, usize, Option<String>)>) {
+    let g = mermaid_graph(source);
+    if g.nodes.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let layer = mermaid_layer_map(&g);
+    let n_layers = layer.values().copied().max().unwrap_or(0) + 1;
+    let mut rows: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
+    for (idx, (id, _, _)) in g.nodes.iter().enumerate() {
+        let l = layer.get(id).copied().unwrap_or(0).min(n_layers - 1);
+        rows[l].push(idx);
+    }
+    let fs = theme.font_size;
+    let font = theme.font.clone();
+    let avail = (area_w - 2. * MM_EDGE_X).max(1.);
+    let xc = area_x + MM_EDGE_X;
+    let mut placed: Vec<MmPlaced> = Vec::new();
+    for (li, row) in rows.iter().enumerate() {
+        let mut widths: Vec<f32> = Vec::with_capacity(row.len());
+        for &i in row {
+            let (_, label, _) = &g.nodes[i];
+            let run = [TextRun { len: label.len(), font: font.clone(), color: theme.text, ..Default::default() }];
+            let w = f32::from(window.text_system().shape_line(label.clone().into(), fs, &run, None).width());
+            widths.push(w + 2. * MM_NODE_XPAD);
+        }
+        let row_total = widths.iter().sum::<f32>() + MM_SEP * (row.len() as f32 - 1.);
+        let mut x = xc + ((avail - row_total) / 2.).max(0.);
+        for (j, &i) in row.iter().enumerate() {
+            let (id, label, shape) = &g.nodes[i];
+            placed.push(MmPlaced {
+                id: id.clone(),
+                label: label.clone(),
+                shape: *shape,
+                x,
+                y: area_y + MM_TOP_PAD + li as f32 * MM_LANE,
+                w: widths[j],
+                h: MM_NODE_H,
+            });
+            x += widths[j] + MM_SEP;
         }
     }
-    out_lines
+    let pos = |id: &str| placed.iter().position(|p| p.id == *id);
+    let mut edges: Vec<(usize, usize, Option<String>)> = Vec::new();
+    for (a, b, elab) in &g.edges {
+        if let (Some(ia), Some(ib)) = (pos(a), pos(b)) {
+            edges.push((ia, ib, elab.clone()));
+        }
+    }
+    (placed, edges)
+}
+
+/// 把 mermaid `graph` **画成一张真图**：圆角节点框（判断/圆形用对应形状）+ 正交连线
+/// （带箭头与边标），不再只是文本行。
+fn paint_mermaid_diagram(
+    window: &mut Window,
+    theme: &WyTheme,
+    source: &str,
+    area_x: f32,
+    area_y: f32,
+    area_w: f32,
+    cx: &mut App,
+) {
+    let (placed, edges) = mm_layout(window, theme, source, area_x, area_y, area_w);
+    if placed.is_empty() {
+        // 无可解析节点 → 弱化提示。
+        let hint: SharedString = "空图 / 渲染器未接入".into();
+        let mut reduced = theme.muted;
+        reduced.a = 0.55;
+        let hrun = [TextRun { len: hint.len(), font: theme.mono.clone(), color: reduced, ..Default::default() }];
+        let hline = window.text_system().shape_line(hint, px(12.), &hrun, None);
+        let hw = f32::from(hline.width());
+        let _ = hline.paint(
+            point(px(area_x + (area_w - hw) / 2.), px(area_y + 40.)),
+            px(16.),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+        return;
+    }
+    let label_h = px(18.);
+    let edge_color = { let mut c = theme.muted; c.a = 0.85; c };
+    // 先画边（线在框底下）。
+    for (ia, ib, elab) in &edges {
+        let (pa, pb) = (&placed[*ia], &placed[*ib]);
+        let ax = pa.x + pa.w / 2.;
+        let ay = pa.y + pa.h;
+        let bx = pb.x + pb.w / 2.;
+        let by = pb.y;
+        let mid_y = ay + (by - ay) / 2.;
+        let mut pth = gpui::PathBuilder::stroke(px(1.6));
+        pth.move_to(point(px(ax), px(ay)));
+        if (bx - ax).abs() < 1. {
+            pth.line_to(point(px(bx), px(by - 4.)));
+        } else {
+            pth.line_to(point(px(ax), px(mid_y)));
+            pth.line_to(point(px(bx), px(mid_y)));
+            pth.line_to(point(px(bx), px(by - 4.)));
+        }
+        if let Ok(path) = pth.build() {
+            window.paint_path(path, edge_color);
+        }
+        // 箭头。
+        let mut ah = gpui::PathBuilder::stroke(px(1.6));
+        ah.move_to(point(px(bx - 4.), px(by - 5.)));
+        ah.line_to(point(px(bx), px(by - 1.)));
+        ah.line_to(point(px(bx + 4.), px(by - 5.)));
+        if let Ok(path) = ah.build() {
+            window.paint_path(path, edge_color);
+        }
+        // 边标（画在折线水平段中点右侧）。
+        if let Some(l) = elab {
+            let lx = (ax + bx) / 2. + 7.;
+            let ly = mid_y - f32::from(label_h) - 3.;
+            let run = [TextRun { len: l.len(), font: theme.mono.clone(), color: theme.muted, ..Default::default() }];
+            let ln = window.text_system().shape_line(l.clone().into(), px(12.), &run, None);
+            let _ = ln.paint(point(px(lx), px(ly)), px(14.), TextAlign::Left, None, window, cx);
+        }
+    }
+    // 再画节点框 + 标签（“图”本体）。
+    let box_bg = theme.code_bg;
+    let box_border = { let mut c = theme.muted; c.a = 0.6; c };
+    for p in &placed {
+        let r = match p.shape {
+            MmShape::Circle => p.h / 2.,
+            MmShape::Round => 10.,
+            MmShape::Diamond => 4.,
+            MmShape::Rect => 6.,
+        };
+        let b = Bounds::new(point(px(p.x), px(p.y)), size(px(p.w), px(p.h)));
+        window.paint_quad(gpui::PaintQuad {
+            bounds: b,
+            corner_radii: Corners::all(px(r)),
+            background: box_bg.into(),
+            border_widths: Edges::all(px(1.2)),
+            border_color: box_border,
+            border_style: gpui::BorderStyle::Solid,
+        });
+        let run = [TextRun { len: p.label.len(), font: theme.font.clone(), color: theme.text, ..Default::default() }];
+        let ln = window.text_system().shape_line(p.label.clone().into(), theme.font_size, &run, None);
+        let tw = f32::from(ln.width());
+        let _ = ln.paint(
+            point(px(p.x + (p.w - tw) / 2.), px(p.y + (p.h - f32::from(label_h)) / 2.)),
+            label_h,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
+    }
 }
 
 /// 让「所有可点击链接」（`[[wiki]]` / `#tag` / 裸 URL，以及 parser 已产出的
@@ -1109,10 +1279,10 @@ fn shape_code_row(
         DocPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
         _ => (Vec::new(), None),
     };
-    // A2: ```mermaid 围栏折叠成「图卡片」——当前无光栅渲染器，画占位卡片
-    // （接入 `set_mermaid_provider` 后由 provider 产出位图）。更成熟后替换。
+    // A2: ```mermaid 围栏折叠成「图卡片」——画一张节点/连线的矢量图。
     if lang.as_deref() == Some("mermaid") {
-        let height = px(140.);
+        let source = code_lines.join("\n");
+        let height = mermaid_card_height(&source);
         return ShapedRow {
             src_line: r.src_line,
             src_lines: r.lines.clone(),
@@ -1131,7 +1301,7 @@ fn shape_code_row(
             table_edit: None,
             image: None,
             extra: RowExtra {
-                card: Some(BlockCard::Mermaid { source: code_lines.join("\n") }),
+                card: Some(BlockCard::Mermaid { source }),
                 ..Default::default()
             },
         };
@@ -1431,11 +1601,6 @@ fn math_card_height(reg: &MathRegion, _theme: &WyTheme) -> Pixels {
     px(20. + n as f32 * 22.)
 }
 
-/// Mermaid 图卡片高度（固定占位；接入光栅渲染器后按图尺寸）。
-fn mermaid_card_height(_theme: &WyTheme) -> Pixels {
-    px(140.)
-}
-
 /// 装配一张数学块卡片行（A1）：整块（含围栏）折叠成一张面板，占据 `height`。
 fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: Pixels) -> ShapedRow {
     ShapedRow {
@@ -1587,7 +1752,15 @@ pub(crate) fn build_frame(
         } else if let Some(idx) = math_card {
             math_card_height(&math_regions[idx], theme)
         } else if is_mermaid {
-            mermaid_card_height(theme)
+            // 由围栏内容行重建源码算卡片高（与 shape_code_row 一致）。
+            let mut src = String::new();
+            for k in 0..meta.aux {
+                if k > 0 {
+                    src.push('\n');
+                }
+                src.push_str(&doc.line_str(srcline + 1 + k as usize));
+            }
+            mermaid_card_height(&src)
         } else {
             match cache_key.and_then(|k| editor.cached_height_lines(k)) {
                 Some(lines) => line_h * lines as f32,
@@ -2800,42 +2973,8 @@ fn paint_card(
             let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
             let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
             let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
-            // 极简流图渲染：把 mermaid 边/节点展平成「A ─标→ B」文本行（居中）。
-            let flow = mermaid_flow_text(source);
-            if flow.is_empty() {
-                let hint: SharedString = "图渲染器未接入".into();
-                let mut hc = theme.muted;
-                hc.a = 0.6;
-                let hrun = [TextRun { len: hint.len(), font: theme.mono.clone(), color: hc, ..Default::default() }];
-                let hline = window.text_system().shape_line(hint, px(12.), &hrun, None);
-                let hw = f32::from(hline.width());
-                let _ = hline.paint(
-                    point(px(x0 + (content_w - hw) / 2.), px(top0 + 56.)),
-                    px(16.),
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-            } else {
-                let fs = theme.font_size;
-                let mut lc = theme.text;
-                lc.a = 0.92;
-                for (k, line) in flow.iter().enumerate() {
-                    let run = [TextRun { len: line.len(), font: theme.font.clone(), color: lc, ..Default::default() }];
-                    let sh = window.text_system().shape_line(line.clone().into(), fs, &run, None);
-                    let w = f32::from(sh.width());
-                    let x = x0 + ((content_w - w) / 2.).max(8.);
-                    let _ = sh.paint(
-                        point(px(x), px(top0 + 30. + k as f32 * 24.)),
-                        px(24.),
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-            }
+            // 矢量图渲染：圆角节点框 + 正交连线/箭头/边标。
+            paint_mermaid_diagram(window, theme, source, x0, top0, content_w, cx);
         }
     }
 }
@@ -4390,9 +4529,162 @@ A-->B
                 .iter()
                 .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
                 .expect("应有 mermaid 卡片");
-            assert_eq!(f32::from(mm.height), 140., "mermaid 卡片高");
+            assert!(
+                f32::from(mm.height) >= 100.,
+                "mermaid 卡片高按层数计算：{}",
+                f32::from(mm.height)
+            );
             let _ = IrKind::Paragraph;
         });
+    }
+
+    #[gpui::test]
+    fn mermaid_renders_diagram_to_image(cx: &mut TestAppContext) {
+        // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
+        // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
+        use super::{BlockCard, MmPlaced, mm_layout};
+        let _ = std::fs::create_dir_all(r"C:\Users\C22500~1\AppData\Local\Temp\kilo");
+        const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
+        cx.update(gpui_component::init);
+        let text = "\
+# 标题
+
+```mermaid
+graph TD
+    A[开始] --> B{判断}
+    B -->|是| C[完成]
+    B -->|否| D[返回 A]
+```
+
+尾段
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (card_h, n_nodes, n_edges, png_path, ink, size) =
+            vcx.update(|window, cx| {
+                let ed = host.read(cx).ed.clone();
+                let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+                let mm = frame
+                    .rows
+                    .iter()
+                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                    .expect("应有 mermaid 卡片");
+                let card_h = f32::from(mm.height);
+                let theme = ed.read(cx).theme.clone();
+                let (placed, edges) = mm_layout(window, &theme, SRC, 0., 0., 560.);
+                let (img, ink) = rasterize_mm_png(&placed, &edges);
+                let path = r"C:\Users\C22500~1\AppData\Local\Temp\kilo\mermaid_check.png".to_string();
+                let saved = img.save(&path).is_ok();
+                assert!(saved, "应能保存 PNG");
+                let size = (img.width(), img.height());
+                (card_h, placed.len(), edges.len(), path, ink, size)
+            });
+        assert!(card_h >= 100., "卡片高按层数计算：{card_h}");
+        assert_eq!(n_nodes, 4, "4 个节点");
+        assert_eq!(n_edges, 3, "3 条边");
+        assert!(ink > 300, "PNG 应画出盒子/连线（非白像素 {ink}）");
+        eprintln!("mermaid PNG 已导出：{png_path}（{size:?}，涂墨 {ink}px）");
+    }
+
+    /// 把布局几何光栅化成 PNG（盒子边框 + 连线 + 箭头；中文标签不进位图，
+    /// 由「框 + 箭头」结构本身表明这是一张流程图）。
+    fn rasterize_mm_png(
+        placed: &[super::MmPlaced],
+        edges: &[(usize, usize, Option<String>)],
+    ) -> (image::RgbaImage, usize) {
+        const PAD: i32 = 40;
+        if placed.is_empty() {
+            return (image::RgbaImage::new(1, 1), 0);
+        }
+        let mut x0f = f32::MAX;
+        let mut y0f = f32::MAX;
+        let mut x1f = f32::MIN;
+        let mut y1f = f32::MIN;
+        for p in placed {
+            x0f = x0f.min(p.x);
+            y0f = y0f.min(p.y);
+            x1f = x1f.max(p.x + p.w);
+            y1f = y1f.max(p.y + p.h);
+        }
+        let w = ((x1f - x0f) as i32 + 2 * PAD).max(8);
+        let h = ((y1f - y0f) as i32 + 2 * PAD).max(8);
+        let mut img = image::RgbaImage::from_pixel(
+            w as u32,
+            h as u32,
+            image::Rgba([255, 255, 255, 255]),
+        );
+        let ox = -x0f as i32 + PAD;
+        let oy = -y0f as i32 + PAD;
+        let mut ink = 0usize;
+        let dark = [40u8, 45, 60, 255];
+        let fill = [235u8, 238, 245, 255];
+        // 边：三层折线 + 箭头。
+        for (ia, ib, _) in edges {
+            let (pa, pb) = (&placed[*ia], &placed[*ib]);
+            let ax = (pa.x + pa.w / 2.) as i32 + ox;
+            let ay = (pa.y + pa.h) as i32 + oy;
+            let bx = (pb.x + pb.w / 2.) as i32 + ox;
+            let by = pb.y as i32 + oy;
+            let midy = (ay + by) / 2;
+            if (bx - ax).abs() < 2 {
+                mm_blit(&mut img, &mut ink, ax, ay, bx, by - 4, dark);
+            } else {
+                mm_blit(&mut img, &mut ink, ax, ay, ax, midy, dark);
+                mm_blit(&mut img, &mut ink, ax, midy, bx, midy, dark);
+                mm_blit(&mut img, &mut ink, bx, midy, bx, by - 4, dark);
+            }
+            mm_blit(&mut img, &mut ink, bx - 4, by - 6, bx, by - 1, dark);
+            mm_blit(&mut img, &mut ink, bx + 4, by - 6, bx, by - 1, dark);
+        }
+        // 节点：填充 + 边框。
+        for p in placed {
+            let (x0, y0) = (p.x as i32 + ox, p.y as i32 + oy);
+            let (x1, y1) = ((p.x + p.w) as i32 + ox, (p.y + p.h) as i32 + oy);
+            for yy in y0..=y1 {
+                for xx in x0..=x1 {
+                    if xx >= 0 && yy >= 0 && (xx as u32) < img.width() && (yy as u32) < img.height() {
+                        img.put_pixel(xx as u32, yy as u32, fill.into());
+                        ink += 1;
+                    }
+                }
+            }
+            mm_blit(&mut img, &mut ink, x0, y0, x1, y0, dark);
+            mm_blit(&mut img, &mut ink, x0, y1, x1, y1, dark);
+            mm_blit(&mut img, &mut ink, x0, y0, x0, y1, dark);
+            mm_blit(&mut img, &mut ink, x1, y0, x1, y1, dark);
+        }
+        (img, ink)
+    }
+
+    fn mm_blit(img: &mut image::RgbaImage, ink: &mut usize, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]) {
+        let (w, h) = (img.width() as i32, img.height() as i32);
+        let (mut x0, mut y0) = (x0, y0);
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            if x0 >= 0 && y0 >= 0 && x0 < w && y0 < h {
+                img.put_pixel(x0 as u32, y0 as u32, c.into());
+                *ink += 1;
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
     }
 
     #[gpui::test]
@@ -4543,15 +4835,16 @@ A-->B
     }
 
     #[test]
-    fn mermaid_flow_renders_edge_lines() {
-        use super::mermaid_flow_text;
+    fn mermaid_graph_parses_nodes_and_edges() {
+        use super::{MmShape, mermaid_graph};
         let src = "graph TD\n    A[开始] --> B{判断}\n    B -->|是| C[完成]\n    B -->|否| D[返回 A]\n";
-        let lines = mermaid_flow_text(src);
-        assert!(!lines.is_empty(), "应产出流式文本行");
-        let joined = lines.join("\n");
-        assert!(joined.contains("开始"), "含节点标签：{joined}");
-        assert!(joined.contains('→'), "含箭头：{joined}");
-        assert!(lines.iter().any(|l| l.contains("是") && l.contains("完成")), "含边签路径：{joined}");
+        let g = mermaid_graph(src);
+        assert_eq!(g.nodes.len(), 4, "4 节点");
+        assert_eq!(g.edges.len(), 3, "3 边");
+        assert!(g.nodes.iter().any(|(id, lab, _)| id == "A" && lab == "开始"), "A=开始");
+        assert!(g.nodes.iter().any(|(id, _, shp)| id == "B" && *shp == MmShape::Diamond), "B 为判断（菱形）");
+        let (a, b, lab) = &g.edges[1];
+        assert!(a == "B" && b == "C" && lab.as_deref() == Some("是"), "边 B→C(是)");
     }
 
     #[gpui::test]
