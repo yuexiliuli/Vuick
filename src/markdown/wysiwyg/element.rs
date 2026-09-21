@@ -10,13 +10,21 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
-    InspectorElementId, IntoElement, LayoutId, Pixels, Point, Window, point, px, relative, size,
+    App, Bounds, Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
+    Pixels, Point, SharedString, TextAlign, TextRun, Window, fill, point, px, relative, size,
 };
+
+/// 行首 gutter 几何常量（paint 与 hit-test 共用，不得分开改）。
+const GUTTER_MARK_X: f32 = 2.;
+/// 警报行正文缩进宽（= shape 期 `x_off`）——gutter 点击区即 [padding, padding+此宽]。
+const ALERT_GUTTER_W: f32 = 84.;
 
 use super::{CaretVis, WyEditor, WyTheme};
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
+use crate::markdown::live::md_syntax::{self, AlertKind, LinkHit};
+use crate::markdown::live::markdown_syntax::{self, MathAlign, MathRegion};
 use crate::markdown::parser::{BlockMeta, RowKind, RunKind, TableAlign};
 use crate::syntax::{github_theme_cached, parse_code_lines, resolve_line_styles_with};
 
@@ -83,6 +91,63 @@ pub(crate) struct TableCellsLayout {
     pub rows: Vec<TableRowCellsLayout>,
 }
 
+/// 行首装饰（列表项目符号 / 任务框 / 警报标签）——paint 画在内容区左缘 gutter。
+#[derive(Clone, Debug)]
+pub(crate) enum RowGutter {
+    /// 无序列表 `•`。
+    Bullet,
+    /// 有序列表数字（如 `1.`）。
+    Ordered(String),
+    /// 任务框（`- [x]` → `Some(true)` 已勾选）。
+    Check { checked: bool },
+    /// GitHub 警报（`> [!NOTE]` 等）；`fold` = 可折叠状态（`Some(true)` = 已折叠）。
+    Alert { kind: AlertKind, fold: Option<bool> },
+}
+
+/// 行内 `$…$` 数学：splice 后的 spacer 位置 + 要绘制的 LaTeX 文本。
+#[derive(Clone, Debug)]
+pub(crate) struct InlineMathText {
+    /// spacer 起始渲染字节。
+    pub display_off: usize,
+    /// spacer 渲染长度（空格数）。
+    pub len: usize,
+    /// 去定界符后的 LaTeX（paint 以斜体排版绘制）。
+    pub latex: SharedString,
+}
+
+/// 行内 `![alt](src)`：源 src + 显示区（alt 文本覆盖），paint 加载后画缩略图。
+#[derive(Clone, Debug)]
+pub(crate) struct InlineImageHit {
+    pub display_off: usize,
+    pub len: usize,
+    pub src: SharedString,
+}
+
+/// 可点击链接命中（显示字节区间 + 目标；hand 光标 + 点击导航）。
+#[derive(Clone, Debug)]
+pub(crate) struct RowLink {
+    pub disp: Range<usize>,
+    pub target: LinkHit,
+}
+
+/// 块级卡片（数学块 / Mermaid 图）——把整块折叠成一张自绘卡片。
+#[derive(Clone, Debug)]
+pub(crate) enum BlockCard {
+    Math { align: MathAlign, latex: String },
+    Mermaid { source: String },
+}
+
+/// 每行的增强装饰/内嵌数据（默认全空；文本行按类型填充）。
+#[derive(Clone, Default)]
+pub(crate) struct RowExtra {
+    pub gutter: Option<RowGutter>,
+    pub links: Vec<RowLink>,
+    pub inline_maths: Vec<InlineMathText>,
+    pub inline_images: Vec<InlineImageHit>,
+    /// 非空 = 本块画成一张卡片（不再画文本），并跳过普通 paint。
+    pub card: Option<BlockCard>,
+}
+
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
 pub(crate) struct Frame {
     pub padding: Pixels,
@@ -132,6 +197,8 @@ pub(crate) struct ShapedRow {
     pub table_edit: Option<TableCellsLayout>,
     /// Image 块的显示数据（带外块 / 加载失败仍 Some 显示 alt）。
     pub image: Option<ShapedImage>,
+    /// 每行的增强装饰/内嵌数据（列表 gutter、链接、行内数学/图片、块级卡片）。
+    pub extra: RowExtra,
 }
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
@@ -320,6 +387,68 @@ fn text_style_for(kind: IrKind, theme: &WyTheme) -> RowTextStyle {
     }
 }
 
+/// 行内 `$…$` 数学：把 display 文本里的公式 splice 成空格 spacer（宽度≈斜体排版后的
+/// latex 宽，`splice_inline_math` 把 spacer 映射回公式源位），paint 期再在 spacer 处画
+/// 斜体 latex。返回重写后的 (display, gpui runs, byte_map) + 每处公式位置。
+fn splice_math_text(
+    window: &mut Window,
+    rtext: &str,
+    runs: Vec<TextRun>,
+    map: Vec<usize>,
+    fs: Pixels,
+    base_font: &gpui::Font,
+    math_font: &gpui::Font,
+    math_color: Hsla,
+    code_ranges: &[Range<usize>],
+) -> (String, Vec<TextRun>, Vec<usize>, Vec<InlineMathText>) {
+    let spans = markdown_syntax::inline_math_spans(rtext);
+    if spans.is_empty() {
+        return (rtext.to_string(), runs, map, Vec::new());
+    }
+    // 跳过完全落在行内代码里的 `$…$`（反引号内是字面量，不是数学）。
+    let in_code = |r: &Range<usize>| code_ranges.iter().any(|c| c.start < r.end && r.start < c.end);
+    let space_w = {
+        let run = [TextRun { len: 1, font: base_font.clone(), color: math_color, ..Default::default() }];
+        f32::from(window.text_system().shape_line(" ".into(), fs, &run, None).width()).max(1.)
+    };
+    let mut formulas: Vec<(Range<usize>, usize)> = Vec::new();
+    let mut latexes: Vec<SharedString> = Vec::new();
+    for span in spans {
+        if in_code(&span) {
+            continue;
+        }
+        let latex = markdown_syntax::inline_math_latex(rtext, &span);
+        if latex.is_empty() {
+            continue;
+        }
+        // 无光栅渲染器：把 LaTeX 转成 Unicode 排版（上/下标、希腊字母、符号），
+        // 按排版后的宽度预留 spacer，paint 期照此绘制。
+        let shown = math_to_unicode(latex);
+        if shown.is_empty() {
+            continue;
+        }
+        let run = [TextRun { len: shown.len(), font: math_font.clone(), color: math_color, ..Default::default() }];
+        let w = f32::from(window.text_system().shape_line(shown.clone().into(), fs, &run, None).width());
+        let n = (w / space_w).ceil() as usize;
+        if n > 0 {
+            formulas.push((span, n.max(1)));
+            latexes.push(shown.into());
+        }
+    }
+    if formulas.is_empty() {
+        return (rtext.to_string(), runs, map, Vec::new());
+    }
+    let gap = TextRun { len: 0, font: base_font.clone(), color: math_color, ..Default::default() };
+    let (nd, nr, nm, places) =
+        markdown_syntax::splice_inline_math(rtext, &runs, &map, &formulas, &gap);
+    let maths = places
+        .into_iter()
+        .zip(latexes)
+        .map(|(pl, latex)| InlineMathText { display_off: pl.display_off, len: pl.len, latex })
+        .collect();
+    (nd, nr, nm, maths)
+}
+
 /// 文本块（段落/标题/引述/列表/分隔线/空行）：按类型行样式形状成折行可视行。
 fn shape_text_row(
     r: DocRow,
@@ -334,6 +463,14 @@ fn shape_text_row(
     if st.bold {
         base.weight = gpui::FontWeight::BOLD;
     }
+    // 行内代码（反引号）区间（已扩展空白）→ paint 自绘圆角 pill（与预览同式）；
+    // 在数学 splice 之前算（数学公式不落入行内代码）。
+    let code_ranges: Vec<Range<usize>> = r
+        .runs
+        .iter()
+        .filter(|(_, k)| *k == RunKind::InlineCode)
+        .map(|(rg, _)| crate::markdown::view::expand_bg_over_whitespace(r.text.as_ref(), rg))
+        .collect();
     let runs = runs_to_text_runs(
         r.text.as_ref(),
         &r.runs,
@@ -343,16 +480,23 @@ fn shape_text_row(
         theme.accent,
         theme.code_inline_fg,
     );
-    // 行内代码（反引号）区间（已扩展空白）→ paint 自绘圆角 pill（与预览同式）。
-    let code_ranges: Vec<Range<usize>> = r
-        .runs
-        .iter()
-        .filter(|(_, k)| *k == RunKind::InlineCode)
-        .map(|(rg, _)| crate::markdown::view::expand_bg_over_whitespace(r.text.as_ref(), rg))
-        .collect();
+    // 行内数学 `$…$`：斜体 math 字体排版宽度 → splice 成空格 spacer（B2）。
+    let mut math_font = theme.font.clone();
+    math_font.style = gpui::FontStyle::Italic;
+    let (rtext, runs2, map2, inline_maths) = splice_math_text(
+        window,
+        r.text.as_ref(),
+        runs,
+        r.byte_map.clone(),
+        st.fs,
+        &base,
+        &math_font,
+        theme.accent,
+        &code_ranges,
+    );
     let wrapped = window
         .text_system()
-        .shape_text(r.text.clone(), st.fs, &runs, Some(width), None)
+        .shape_text(rtext.clone().into(), st.fs, &runs2, Some(width), None)
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
     let mut height = st.pad;
@@ -366,7 +510,7 @@ fn shape_text_row(
         height = st.lh + st.pad;
         sub_heights.push(st.lh);
     }
-    let editable = !r.byte_map.is_empty();
+    let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
     let x_off = if kind == IrKind::Quote { px(15.) } else { px(0.) };
     ShapedRow {
@@ -374,7 +518,7 @@ fn shape_text_row(
         src_lines: r.lines.clone(),
         wrapped,
         sub_heights,
-        byte_map: std::rc::Rc::new(r.byte_map),
+        byte_map: std::rc::Rc::new(map2),
         editable,
         multi_offsets: Vec::new(),
         code_ranges,
@@ -386,7 +530,567 @@ fn shape_text_row(
         table: None,
         table_edit: None,
         image: None,
+        extra: RowExtra { inline_maths, ..Default::default() },
     }
+}
+
+/// 文本行的装饰化入口（在 [`shape_text_row`] 之上叠加：警报标记剥除、列表/任务
+/// gutter、可点击链接、行内图片）。需要源文本以识别构造，故把 `editor` 穿进来。
+fn shape_text_row_decorated(
+    mut r: DocRow,
+    editor: &WyEditor,
+    window: &mut Window,
+    width: Pixels,
+    theme: &WyTheme,
+    base_font: &gpui::Font,
+) -> ShapedRow {
+    let raw = editor.doc().line_str(r.src_line);
+    // C5: 让所有可点击链接（wiki/#tag/裸 URL）与 `[text](url)` 同色 + 下划线，
+    // 与预览/阅读器视觉一致（在 alert 剥标记与数学 splice 之前合并进 runs）。
+    style_links_in_runs(&mut r, &raw);
+    let mut gutter: Option<RowGutter> = None;
+    // C3: 警报（callout）——剥掉 `[!KIND]` 标记，paint 画彩条 + 粗体标签 + 折叠箭头。
+    if r.kind == IrKind::Quote
+        && let Some(p) = markdown_syntax::blockquote_prefix(&raw)
+    {
+        // 对「剥掉 `>` 后的 body」再去首空白匹配（`r.text` 也已是 trim 后的主体），
+        // 这样 `>  [!NOTE]` 这类多空格变体也能精确剥掉标记。
+        let body = &raw[p..];
+        let trimmed = body.trim_start();
+        if let Some((akind, consumed, fold)) = markdown_syntax::alert_prefix(trimmed) {
+            let n = consumed.min(r.text.len());
+            strip_prefix_bytes(&mut r, n);
+            gutter = Some(RowGutter::Alert { kind: akind, fold });
+        }
+    }
+    let mut srow = shape_text_row(r.clone(), window, width, theme, base_font);
+    // C1: 列表/任务行首装饰 + 正文缩进（与预览一致：正文色符号 + 缩进）。
+    if r.kind == IrKind::Bullet {
+        if let Some(g) = bullet_gutter(&raw) {
+            let is_check = matches!(g, RowGutter::Check { .. });
+            srow.extra.gutter = Some(g);
+            srow.x_off = if is_check { px(24.) } else { px(18.) };
+        }
+    }
+    if let Some(g @ RowGutter::Alert { .. }) = &gutter {
+        srow.extra.gutter = Some(g.clone());
+        srow.x_off = px(84.);
+    }
+    // C5: 行内链接命中（hand 光标 + 单键点击导航）。
+    if srow.editable {
+        srow.extra.links = link_hits(&raw, srow.byte_map.as_slice());
+    }
+    // B1: 行内图片 `![alt](src)` → 在 alt 文本（显示区）上方画缩略图。
+    srow.extra.inline_images = inline_image_hits(&r, &srow, &raw);
+    srow
+}
+
+/// 把渲染文本/样式/映射的前 `n` 个字节剥掉（警报标记行用；`n` 是剥掉后的字节数）。
+fn strip_prefix_bytes(r: &mut DocRow, n: usize) {
+    let n = n.min(r.text.len());
+    if n == 0 {
+        return;
+    }
+    r.text = r.text.as_ref()[n..].into();
+    r.runs = r
+        .runs
+        .iter()
+        .filter_map(|(rng, k)| {
+            let s = rng.start.saturating_sub(n);
+            let e = rng.end.saturating_sub(n);
+            (s < e).then_some((s..e, *k))
+        })
+        .collect();
+    let bm = &mut r.byte_map;
+    if bm.len() > n {
+        bm.drain(..n);
+    } else {
+        bm.clear();
+        bm.push(0);
+    }
+}
+
+/// 列表行首装饰：任务框（`- [ ]` / `- [x]`）优先于普通项目符号 / 有序号码。
+fn bullet_gutter(raw: &str) -> Option<RowGutter> {
+    let t = raw.trim_start();
+    for b in ["- ", "* ", "+ "] {
+        for (mark, checked) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
+            if let Some(rest) = t.strip_prefix(&format!("{b}{mark}")) {
+                if !rest.is_empty() {
+                    return Some(RowGutter::Check { checked });
+                }
+            }
+        }
+    }
+    if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
+        return Some(RowGutter::Bullet);
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if (1..4).contains(&digits) && (t[digits..].starts_with(". ") || t[digits..].starts_with(") ")) {
+        return Some(RowGutter::Ordered(format!("{}.", &t[..digits])));
+    }
+    None
+}
+
+/// 行内数学的显示色（与链接蓝区分：公式用紫）。
+fn math_color(theme: &WyTheme) -> Hsla {
+    let mut c: Hsla = gpui::rgb(0x6d5bd0).into();
+    if theme.is_dark {
+        c.l = (c.l + 0.18).clamp(0.05, 1.);
+    }
+    c
+}
+
+const LATEX_SYMBOLS: &[(&str, char)] = &[
+    ("pi", 'π'), ("infty", '∞'), ("int", '∫'), ("iint", '∬'), ("oint", '∮'),
+    ("sum", '∑'), ("prod", '∏'), ("cdot", '·'), ("times", '×'), ("div", '÷'),
+    ("pm", '±'), ("mp", '∓'), ("neq", '≠'), ("leq", '≤'), ("geq", '≥'),
+    ("le", '≤'), ("ge", '≥'), ("ne", '≠'), ("approx", '≈'), ("equiv", '≡'),
+    ("sim", '∼'), ("partial", '∂'), ("nabla", '∇'),
+    ("alpha", 'α'), ("beta", 'β'), ("gamma", 'γ'), ("delta", 'δ'),
+    ("epsilon", 'ε'), ("zeta", 'ζ'), ("eta", 'η'), ("theta", 'θ'),
+    ("lambda", 'λ'), ("mu", 'μ'), ("nu", 'ν'), ("xi", 'ξ'),
+    ("rho", 'ρ'), ("sigma", 'σ'), ("tau", 'τ'), ("phi", 'φ'), ("chi", 'χ'),
+    ("psi", 'ψ'), ("omega", 'ω'), ("Gamma", 'Γ'), ("Delta", 'Δ'),
+    ("Theta", 'Θ'), ("Lambda", 'Λ'), ("Sigma", 'Σ'), ("Phi", 'Φ'),
+    ("Omega", 'Ω'), ("rightarrow", '→'), ("leftarrow", '←'),
+    ("leftrightarrow", '↔'), ("to", '→'), ("mapsto", '↦'),
+    ("Rightarrow", '⇒'), ("Leftrightarrow", '⇔'),
+    ("ldots", '…'), ("cdots", '⋯'), ("dots", '…'), ("in", '∈'), ("notin", '∉'),
+    ("subset", '⊂'), ("subseteq", '⊆'), ("cup", '∪'), ("cap", '∩'),
+    ("forall", '∀'), ("exists", '∃'), ("nexists", '∄'), ("propto", '∝'),
+    ("perp", '⊥'), ("parallel", '∥'), ("angle", '∠'), ("circ", '∘'),
+    ("degree", '°'), ("deg", '°'), ("oplus", '⊕'), ("otimes", '⊗'),
+    ("emptyset", '∅'), ("ell", 'ℓ'), ("hbar", 'ℏ'), ("bullet", '•'),
+    ("uparrow", '↑'), ("downarrow", '↓'), ("ast", '∗'), ("star", '⋆'),
+    ("dag", '†'), ("ddag", '‡'),
+];
+
+/// 把一个字符上标化（Unicode 上标），不可映射返回 `None`。
+fn sup_map(c: char) -> Option<char> {
+    Some(match c {
+        '0'..='9' => ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'][c as usize - '0' as usize],
+        '+' => '⁺',
+        '-' => '⁻',
+        '=' => '⁼',
+        '(' => '⁽',
+        ')' => '⁾',
+        'n' => 'ⁿ',
+        'i' => 'ⁱ',
+        _ => return None,
+    })
+}
+
+/// 把一个字符下标化（Unicode 下标），不可映射返回 `None`。
+fn sub_map(c: char) -> Option<char> {
+    Some(match c {
+        '0'..='9' => ['₀', '₁', '₂', '₃', '₄', '₅', '₆', '₇', '₈', '₉'][c as usize - '0' as usize],
+        '+' => '₊',
+        '-' => '₋',
+        '=' => '₌',
+        'i' => 'ᵢ',
+        'n' => 'ₙ',
+        'x' => 'ₓ',
+        'j' => 'ⱼ',
+        'k' => 'ₖ',
+        'm' => 'ₘ',
+        _ => return None,
+    })
+}
+
+/// 从 `cs[pos..]` 读一个「组」：`{…}`（含嵌套）或单个字符。返回 (内容, 新位置)。
+fn read_group(cs: &[char], pos: usize) -> (String, usize) {
+    if pos < cs.len() && cs[pos] == '{' {
+        let mut depth = 0usize;
+        let mut s = String::new();
+        let mut k = pos;
+        while k < cs.len() {
+            match cs[k] {
+                '{' => {
+                    depth += 1;
+                    if depth > 1 {
+                        s.push('{');
+                    }
+                }
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (s, k + 1);
+                    }
+                    s.push('}');
+                }
+                c => s.push(c),
+            }
+            k += 1;
+        }
+        return (s, k);
+    }
+    if pos < cs.len() {
+        (cs[pos].to_string(), pos + 1)
+    } else {
+        (String::new(), pos)
+    }
+}
+
+/// 只在以 `{` 开头时读组；否则 `None`（位置不动）。
+fn read_group_opt(cs: &[char], pos: usize) -> (Option<String>, usize) {
+    if pos < cs.len() && cs[pos] == '{' {
+        let (s, ni) = read_group(cs, pos);
+        (Some(s), ni)
+    } else {
+        (None, pos)
+    }
+}
+
+/// 裸露 LaTeX → Unicode 排版（无光栅渲染器时的「公式感」显示）。
+/// 处理上下标（`^`/`_`，含 `{…}` 组）、`\frac`/`\sqrt`/`\text` 等、希腊字母与常用符号。
+fn math_to_unicode(src: &str) -> String {
+    let cs: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '{' | '}' => i += 1,
+            '^' => {
+                let (g, ni) = read_group(&cs, i + 1);
+                // 组内还可能有命令（如 `e^{-x^2}` / `^{\infty}`）→ 先整体转一遍再上标化。
+                let g = math_to_unicode(&g);
+                let mut t = String::new();
+                for c in g.chars() {
+                    t.push(sup_map(c).unwrap_or(c));
+                }
+                out.push_str(&t);
+                i = ni;
+            }
+            '_' => {
+                let (g, ni) = read_group(&cs, i + 1);
+                let g = math_to_unicode(&g);
+                let mut t = String::new();
+                for c in g.chars() {
+                    t.push(sub_map(c).unwrap_or(c));
+                }
+                out.push_str(&t);
+                i = ni;
+            }
+            '\\' => {
+                let mut j = i + 1;
+                while j < cs.len() && cs[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                let name: String = cs[i + 1..j].iter().collect();
+                match name.as_str() {
+                    "frac" | "tfrac" | "dfrac" => {
+                        let (a, ni) = read_group_opt(&cs, j);
+                        let (b, nj) = match &a {
+                            Some(_) => read_group_opt(&cs, ni),
+                            None => (None, j),
+                        };
+                        if let Some(a) = &a {
+                            out.push_str(&math_to_unicode(a));
+                        }
+                        out.push('/');
+                        if let Some(b) = &b {
+                            out.push_str(&math_to_unicode(b));
+                        }
+                        i = nj;
+                    }
+                    "sqrt" => {
+                        out.push('√');
+                        let (g, ni) = read_group_opt(&cs, j);
+                        match g {
+                            Some(g) => {
+                                if g.chars().count() > 1 {
+                                    out.push('(');
+                                    out.push_str(&math_to_unicode(&g));
+                                    out.push(')');
+                                } else {
+                                    out.push_str(&math_to_unicode(&g));
+                                }
+                            }
+                            None => {}
+                        }
+                        i = ni;
+                    }
+                    "text" | "mathrm" | "mathit" | "operatorname" | "mbox" => {
+                        let (g, ni) = read_group_opt(&cs, j);
+                        if let Some(g) = g {
+                            out.push_str(&math_to_unicode(&g));
+                        }
+                        i = ni;
+                    }
+                    "left" | "right" | "big" | "Big" | "Bigl" | "Bigr" | "bigl" | "bigr"
+                    | "small" | "limits" | "nolimits" => i = j,
+                    _ => {
+                        if let Some(sym) = LATEX_SYMBOLS.iter().find(|(n, _)| *n == name) {
+                            out.push(sym.1);
+                        }
+                        i = j;
+                    }
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// 解析 `A[...]` / `A{...}` / `A((...))` / 裸 `A` → (id, 可选标签)。
+fn mm_node(s: &str) -> (String, Option<String>) {
+    let s = s.trim();
+    if let Some(oi) = s.find("[(") {
+        let id = s[..oi].trim().to_string();
+        let rest = &s[oi + 2..];
+        if let Some(ci) = rest.find(")]") {
+            return (id, Some(rest[..ci].trim().to_string()));
+        }
+        return (id, None);
+    }
+    for (open, close) in [('[', ']'), ('{', '}'), ('(', ')')] {
+        if let Some(oi) = s.find(open) {
+            let id = s[..oi].trim().to_string();
+            let rest = &s[oi + 1..];
+            if let Some(ci) = rest.find(close) {
+                return (id, Some(rest[..ci].trim().to_string()));
+            }
+            return (id, None);
+        }
+    }
+    (s.to_string(), None)
+}
+
+/// 解析一条边 `A -->|标| B` / `A --> B` / `A --- B` → (起点文本, 终点文本, 边标)。
+fn mm_edge(s: &str) -> Option<(String, String, Option<String>)> {
+    let s = s.trim();
+    let marker = if s.contains("-->") {
+        "-->"
+    } else if s.contains("---") {
+        "---"
+    } else {
+        return None;
+    };
+    let idx = s.find(marker)?;
+    let lhs = s[..idx].trim().to_string();
+    let mut rhs = s[idx + marker.len()..].trim().to_string();
+    let mut elab = None;
+    if let Some(rest) = rhs.strip_prefix('|') {
+        if let Some(end) = rest.find('|') {
+            elab = Some(rest[..end].trim().to_string());
+            rhs = rest[end + 1..].trim().to_string();
+        } else {
+            rhs = rest.to_string();
+        }
+    }
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    Some((lhs, rhs, elab))
+}
+
+/// 极简 mermaid `graph TD/LR` 展平渲染（无光栅渲染器时的「图」感）：
+/// 解析节点定义（`A[开始]`/`A{判断}`）与边（`A --> B` / `A -->|是| B`），
+/// 按入度为 0 的起点 DFS 展开路径，输出「节点 ─边标→ 节点」紧凑流式文本行。
+fn mermaid_flow_text(source: &str) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut labels: HashMap<String, String> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut edges: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut add_node = |id: &str, lab: Option<String>| {
+        if seen.insert(id.to_string()) {
+            order.push(id.to_string());
+        }
+        match lab {
+            Some(l) if !l.is_empty() => {
+                labels.insert(id.to_string(), l);
+            }
+            _ => {
+                labels.entry(id.to_string()).or_insert_with(|| id.to_string());
+            }
+        }
+    };
+    for raw in source.lines() {
+        let mut t = raw.trim();
+        if let Some(s) = t.strip_suffix(';') {
+            t = s.trim();
+        }
+        if t.is_empty()
+            || t.starts_with("graph ")
+            || t.starts_with("flowchart ")
+            || t.starts_with("sequenceDiagram")
+        {
+            continue;
+        }
+        if let Some((a, b, elab)) = mm_edge(t) {
+            let (aid, alab) = mm_node(&a);
+            let (bid, blab) = mm_node(&b);
+            add_node(&aid, alab);
+            add_node(&bid, blab);
+            edges.push((aid, bid, elab));
+            continue;
+        }
+        let (id, lab) = mm_node(t);
+        add_node(&id, lab);
+    }
+    if edges.is_empty() {
+        return order.iter().map(|id| labels.get(id).cloned().unwrap_or_else(|| id.clone())).collect();
+    }
+    // 入度 + 邻接。
+    let mut indeg: HashMap<String, usize> = HashMap::new();
+    let mut adjs: HashMap<String, Vec<String>> = HashMap::new();
+    for (a, b, _) in &edges {
+        adjs.entry(a.clone()).or_default().push(b.clone());
+        *indeg.entry(b.clone()).or_insert(0) += 1;
+        indeg.entry(a.clone()).or_insert(0);
+    }
+    let mut starts: Vec<String> = order
+        .iter()
+        .filter(|id| adjs.contains_key(*id) && indeg.get(*id).copied().unwrap_or(0) == 0)
+        .cloned()
+        .collect();
+    if starts.is_empty() {
+        starts = order.iter().filter(|id| adjs.contains_key(*id)).cloned().take(1).collect();
+    }
+    // DFS 展开每条 起点→… 路径。
+    let mut stack: Vec<(String, Vec<String>)> =
+        starts.into_iter().map(|s| (s.clone(), vec![s])).collect();
+    let mut paths: Vec<Vec<String>> = Vec::new();
+    while let Some((cur, path)) = stack.pop() {
+        let out = adjs.get(&cur).cloned().unwrap_or_default();
+        if out.is_empty() {
+            paths.push(path);
+            continue;
+        }
+        for nx in out {
+            let mut np = path.clone();
+            np.push(nx.clone());
+            stack.push((nx, np));
+        }
+    }
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut drawn: HashSet<String> = HashSet::new();
+    for path in paths {
+        let mut parts: Vec<String> = Vec::new();
+        for w in path.windows(2) {
+            let a = labels.get(&w[0]).cloned().unwrap_or_else(|| w[0].clone());
+            parts.push(a);
+            let elab = edges.iter().find(|(x, y, _)| x == &w[0] && y == &w[1]).and_then(|e| e.2.clone());
+            let arrow = match elab {
+                Some(l) if !l.is_empty() => format!("─{l}→"),
+                _ => " → ".to_string(),
+            };
+            parts.push(arrow);
+        }
+        if let Some(last) = path.last() {
+            parts.push(labels.get(last).cloned().unwrap_or_else(|| last.clone()));
+        }
+        out_lines.push(parts.concat());
+        drawn.extend(path.into_iter());
+    }
+    for id in &order {
+        if !drawn.contains(id) {
+            out_lines.push(labels.get(id).cloned().unwrap_or_else(|| id.clone()));
+        }
+    }
+    out_lines
+}
+
+/// 让「所有可点击链接」（`[[wiki]]` / `#tag` / 裸 URL，以及 parser 已产出的
+/// `[text](url)`）都套上链接色 + 下划线（与预览一致）。在数学 splice 之前合并进
+/// `r.runs`（显示字节空间，pre-splice）。
+fn style_links_in_runs(r: &mut DocRow, raw: &str) {
+    if r.byte_map.is_empty() || md_syntax::links(raw).is_empty() {
+        return;
+    }
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (src, _) in md_syntax::links(raw) {
+        let d0 = r.byte_map.partition_point(|&b| b < src.start);
+        let d1 = r.byte_map.partition_point(|&b| b < src.end);
+        if d1 > d0 {
+            ranges.push(d0..d1);
+        }
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    let old = std::mem::take(&mut r.runs);
+    let len = r.text.len();
+    let mut breaks: Vec<usize> = vec![0, len];
+    for (rg, _) in &old {
+        breaks.push(rg.start);
+        breaks.push(rg.end);
+    }
+    for rg in &ranges {
+        breaks.push(rg.start);
+        breaks.push(rg.end);
+    }
+    breaks.sort_unstable();
+    breaks.dedup();
+    let mut out: Vec<(Range<usize>, RunKind)> = Vec::new();
+    for w in breaks.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a >= b {
+            continue;
+        }
+        let kind = if ranges.iter().any(|rg| rg.start <= a && b <= rg.end) {
+            Some(RunKind::Link)
+        } else if let Some((_, k)) = old.iter().find(|(rg, _)| rg.start <= a && b <= rg.end) {
+            Some(*k)
+        } else {
+            None
+        };
+        if let Some(k) = kind {
+            out.push((a..b, k));
+        }
+    }
+    r.runs = out;
+}
+
+/// 行内链接：源码区间（行坐标）→ 显示字节区间（经 byte_map 左界映射）。
+fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {
+    let mut out = Vec::new();
+    for (src, target) in md_syntax::links(raw) {
+        let d0 = source_to_display(byte_map, src.start);
+        let d1 = source_to_display(byte_map, src.end);
+        if d1 > d0 {
+            out.push(RowLink { disp: d0..d1, target });
+        }
+    }
+    out
+}
+
+/// 行内图片：`RunKind::Image`（alt 显示区）反向解析源 src（经 byte_map 找 `!` 位，
+/// 再在原文尾随 `![…](…)` 取 src）。`r.byte_map` 是「剥标记后、数学 splice 前」的
+/// display→源（源值不变）；`srow.byte_map` 是 splice 后的——显示区间统一以**源偏移**
+/// 为准重算（两种 map 都成立）。
+fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<InlineImageHit> {
+    let mut out = Vec::new();
+    let pre = r.byte_map.as_slice();
+    let post = srow.byte_map.as_slice();
+    for (rg, k) in &r.runs {
+        if *k != RunKind::Image {
+            continue;
+        }
+        let Some(&src_off) = pre.get(rg.start.min(pre.len().saturating_sub(1))) else {
+            continue;
+        };
+        if src_off >= raw.len() {
+            continue;
+        }
+        let tail = &raw[src_off..];
+        let Some((full, srcr)) = markdown_syntax::inline_image_spans(tail).into_iter().next() else {
+            continue;
+        };
+        let src = tail[srcr].to_string();
+        let d0 = source_to_display(post, src_off);
+        let d1 = source_to_display(post, (src_off + full.end).min(raw.len()));
+        if d1 > d0 {
+            out.push(InlineImageHit { display_off: d0, len: d1 - d0, src: src.into() });
+        }
+    }
+    out
 }
 
 /// 代码围栏块：等宽 + 语法高亮（GitHub 明/暗色板，同预览）+ 首/末空白带，
@@ -405,6 +1109,33 @@ fn shape_code_row(
         DocPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
         _ => (Vec::new(), None),
     };
+    // A2: ```mermaid 围栏折叠成「图卡片」——当前无光栅渲染器，画占位卡片
+    // （接入 `set_mermaid_provider` 后由 provider 产出位图）。更成熟后替换。
+    if lang.as_deref() == Some("mermaid") {
+        let height = px(140.);
+        return ShapedRow {
+            src_line: r.src_line,
+            src_lines: r.lines.clone(),
+            wrapped: Vec::new(),
+            sub_heights: vec![height],
+            byte_map: std::rc::Rc::new(Vec::new()),
+            editable: false,
+            multi_offsets: Vec::new(),
+            code_ranges: Vec::new(),
+            lh: px(0.),
+            x_off: px(0.),
+            height,
+            top: px(0.),
+            kind,
+            table: None,
+            table_edit: None,
+            image: None,
+            extra: RowExtra {
+                card: Some(BlockCard::Mermaid { source: code_lines.join("\n") }),
+                ..Default::default()
+            },
+        };
+    }
     let fs = theme.code_size();
     let lh = theme.code_line();
     let mono = theme.mono.clone();
@@ -495,6 +1226,7 @@ fn shape_code_row(
         table: None,
         table_edit: None,
         image: None,
+        extra: RowExtra::default(),
     }
 }
 
@@ -633,6 +1365,7 @@ fn shape_table_row(
             aligns: aligns2,
         }),
         image: None,
+        extra: RowExtra::default(),
     }
 }
 
@@ -670,6 +1403,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         table: None,
         table_edit: None,
         image: Some(ShapedImage { src, alt, w, h }),
+        extra: RowExtra::default(),
     }
 }
 
@@ -687,7 +1421,44 @@ fn shape_docrow(
         IrKind::Code => shape_code_row(r, window, theme),
         IrKind::Table => shape_table_row(r, window, theme.font_size, theme, base_font),
         IrKind::Image => shape_image_row(r, editor, avail),
-        _ => shape_text_row(r, window, width, theme, base_font),
+        _ => shape_text_row_decorated(r, editor, window, width, theme, base_font),
+    }
+}
+
+/// 数学块卡片高度：顶部标签留白 + 每行 LaTeX 一行。
+fn math_card_height(reg: &MathRegion, _theme: &WyTheme) -> Pixels {
+    let n = reg.source.lines().count().max(1);
+    px(20. + n as f32 * 22.)
+}
+
+/// Mermaid 图卡片高度（固定占位；接入光栅渲染器后按图尺寸）。
+fn mermaid_card_height(_theme: &WyTheme) -> Pixels {
+    px(140.)
+}
+
+/// 装配一张数学块卡片行（A1）：整块（含围栏）折叠成一张面板，占据 `height`。
+fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: Pixels) -> ShapedRow {
+    ShapedRow {
+        src_line,
+        src_lines: reg.range.start..reg.range.end,
+        wrapped: Vec::new(),
+        sub_heights: vec![height],
+        byte_map: std::rc::Rc::new(Vec::new()),
+        editable: false,
+        multi_offsets: Vec::new(),
+        code_ranges: Vec::new(),
+        lh: px(0.),
+        x_off: px(0.),
+        height,
+        top,
+        kind: IrKind::Paragraph,
+        table: None,
+        table_edit: None,
+        image: None,
+        extra: RowExtra {
+            card: Some(BlockCard::Math { align: reg.align, latex: reg.source.clone() }),
+            ..Default::default()
+        },
     }
 }
 
@@ -732,6 +1503,7 @@ pub(crate) fn build_frame(
                 table: None,
                 table_edit: None,
                 image: None,
+                extra: RowExtra::default(),
             }],
             total: line_h,
             band,
@@ -745,6 +1517,33 @@ pub(crate) fn build_frame(
     let avail = (f32::from(width) - f32::from(padding) * 2.).max(1.);
     let width_bits = f32::from(width).to_bits();
     let igen = editor.images_gen();
+
+    // 结构扫描（O(n) 行扫描，随内容代变化；build_frame 每代顶多跑一次）。
+    let content = editor.content();
+    let caret_line = editor.row_col(editor.caret()).0;
+    // 数学块（`$$…$$`）：首源码行 → 张卡片；其余行折叠成 0 高（caret 在块内则整块保留源码）。
+    let math_regions = markdown_syntax::math_regions(content);
+    let mut math_start: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (idx, reg) in math_regions.iter().enumerate() {
+        if caret_line >= reg.range.start && caret_line < reg.range.end {
+            continue; // reveal-on-caret：光标在块内 → 不折叠，显示源码
+        }
+        math_start.insert(reg.range.start, idx);
+        math_body.extend(reg.range.start + 1..reg.range.end);
+    }
+    // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高。
+    // reveal-on-caret 仅当光标落在 **body 行**（start+1..end）时生效——光标在 marker
+    // 行上正是点击折叠后的常态，若也算「区域内有光标」则刚点的折叠会被强制展开
+    // （「点折叠却折不起来 + 多 callout 互相串」的根因）。
+    let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (rnge, folded) in markdown_syntax::alert_fold_regions(content) {
+        if !folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
+            continue;
+        }
+        fold_lines.extend(rnge.start + 1..rnge.end);
+    }
+    let collapsed = |srcline: usize| fold_lines.contains(&srcline) || math_body.contains(&srcline);
 
     // Pass 1：决定每块高度（文本块：缓存真值优先，无则用真实字数估算）+ 是否入带。
     #[derive(Clone, Copy)]
@@ -763,26 +1562,49 @@ pub(crate) fn build_frame(
             raw_len: 0,
             aux: 1,
         });
-        let cache_key = match meta.kind {
-            // 折行文本块（段/标题/引述/列表）缓存**真实可视行数**（带外沿用真值防
-            // 滚动跳变）。代码/表格/图片**不入缓存**：它们不折行、`estimate_height`
-            // 与 shape 高同式（代码 = (行数+2)×code_line）——入缓存反而会用
-            // `line_h × 行数`（正文行高×n）重建出错误高度（比真实矮 2 行代码高）。
-            RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
-                Some(height_cache_key(rgen, igen, meta.src_line, meta.kind, width_bits))
+        let srcline = meta.src_line as usize;
+        // A2: ```mermaid 围栏（Code 块）整块折叠成「图卡片」。
+        let is_mermaid = meta.kind == RowKind::Code
+            && doc.line_str(srcline).trim_start().starts_with("```mermaid");
+        let math_card = math_start.get(&srcline).copied();
+        let special = collapsed(srcline) || math_card.is_some() || is_mermaid;
+        let cache_key = if special {
+            None
+        } else {
+            match meta.kind {
+                // 折行文本块（段/标题/引述/列表）缓存**真实可视行数**（带外沿用真值防
+                // 滚动跳变）。代码/表格/图片**不入缓存**：它们不折行、`estimate_height`
+                // 与 shape 高同式（代码 = (行数+2)×code_line）——入缓存反而会用
+                // `line_h × 行数`（正文行高×n）重建出错误高度（比真实矮 2 行代码高）。
+                RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
+                    Some(height_cache_key(rgen, igen, meta.src_line, meta.kind, width_bits))
+                }
+                _ => None,
             }
-            _ => None,
         };
-        let h = match cache_key.and_then(|k| editor.cached_height_lines(k)) {
-            Some(lines) => line_h * lines as f32,
-            None => {
-                let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
-                estimate_height(&meta, chars, ascii, theme, avail, line_h)
+        let h = if collapsed(srcline) {
+            px(0.)
+        } else if let Some(idx) = math_card {
+            math_card_height(&math_regions[idx], theme)
+        } else if is_mermaid {
+            mermaid_card_height(theme)
+        } else {
+            match cache_key.and_then(|k| editor.cached_height_lines(k)) {
+                Some(lines) => line_h * lines as f32,
+                None => {
+                    let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
+                    estimate_height(&meta, chars, ascii, theme, avail, line_h)
+                }
             }
         };
         let bottom = y + f32::from(h);
+        let mut shaped = bottom > band_lo && y < band_hi;
+        // 数学卡片块在 pass 3 直接装配（不入带内 shape）；body/callout 折叠块不 shape。
+        if math_card.is_some() || collapsed(srcline) {
+            shaped = false;
+        }
         plan.push(Plan {
-            shaped: bottom > band_lo && y < band_hi,
+            shaped,
             h,
             cache_key,
         });
@@ -833,6 +1655,15 @@ pub(crate) fn build_frame(
             raw_len: 0,
             aux: 1,
         });
+        let srcline = meta.src_line as usize;
+        // 数学块卡片（A1）：在首源码行装配整张卡片，比整个块更高。
+        if let Some(&idx) = math_start.get(&srcline) {
+            let reg = &math_regions[idx];
+            let h = plan[i].h;
+            rows.push(build_math_card_row(reg, srcline, h, total));
+            total += h;
+            continue;
+        }
         let sr = match shaped[i].take() {
             Some(mut sr) => {
                 sr.top = total;
@@ -864,6 +1695,7 @@ pub(crate) fn build_frame(
                     table: None,
                     table_edit: None,
                     image: None,
+                    extra: RowExtra::default(),
                 }
             }
         };
@@ -1191,6 +2023,118 @@ pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels
     let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
     let local = point(p.x - origin.x, p.y - origin.y);
     source_offset_at_local(editor, frame, local)
+}
+
+/// 元素局部坐标（把窗口坐标减掉元素原点）。
+fn to_local(editor: &WyEditor, p: Point<Pixels>) -> Point<Pixels> {
+    let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
+    point(p.x - origin.x, p.y - origin.y)
+}
+
+/// 命中任务框（C1）：返回 (源行, 是否已勾选)。击中「任务行 gutter（☐/☑ 字形区）」
+/// 才返回，否则 None（与 `paint_row_gutter` 的 GUTTER_MARK_X 几何一致）。
+pub(crate) fn checkbox_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool)> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) {
+            continue;
+        }
+        let Some(RowGutter::Check { checked }) = &r.extra.gutter else {
+            continue;
+        };
+        // 字形区 ≈ [padding, padding + 24)（与任务行正文缩进 x_off 内）。
+        let hi = (f32::from(frame.padding) + 24.).max(f32::from(r.x_off));
+        if px >= f32::from(frame.padding) && px <= hi {
+            return Some((r.src_line, *checked));
+        }
+    }
+    None
+}
+
+/// 命中警报折叠箭头（C3）：击中警报行 gutter（[padding, padding+ALERT_GUTTER_W] × 行高）
+/// 返回 (源行, 当前是否折叠)。
+pub(crate) fn alert_chevron_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool)> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) {
+            continue;
+        }
+        let Some(RowGutter::Alert { kind: _, fold }) = &r.extra.gutter else {
+            continue;
+        };
+        let Some(folded) = fold else {
+            continue;
+        };
+        if px >= f32::from(frame.padding) && px <= f32::from(frame.padding) + ALERT_GUTTER_W {
+            return Some((r.src_line, *folded));
+        }
+    }
+    None
+}
+
+/// 命中的可点击链接目标（C5）：窗口坐标 → 行内链接显示区间集合，命中的返回 `LinkHit`。
+pub(crate) fn link_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<LinkHit> {
+    let p = to_local(editor, p);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || r.extra.links.is_empty() || r.wrapped.is_empty() {
+            continue;
+        }
+        let Some(w0) = r.wrapped.first() else {
+            continue;
+        };
+        let ox = f32::from(frame.padding) + f32::from(r.x_off);
+        for lk in &r.extra.links {
+            let (Some(p0), Some(p1)) = (
+                w0.position_for_index(lk.disp.start, r.lh),
+                w0.position_for_index(lk.disp.end, r.lh),
+            ) else {
+                continue;
+            };
+            let p0y = top + f32::from(p0.y);
+            let p1y = top + f32::from(p1.y);
+            let contains = if f32::from(p0.y) == f32::from(p1.y) {
+                let x0 = ox + f32::from(p0.x);
+                let x1 = ox + f32::from(p1.x);
+                py >= p0y && py < p0y + f32::from(r.lh) && f32::from(p.x) >= x0 && f32::from(p.x) <= x1
+            } else {
+                // 折行：头段或尾段
+                let head_ok = py >= p0y && py < p0y + f32::from(r.lh)
+                    && f32::from(p.x) >= ox + f32::from(p0.x)
+                    && f32::from(p.x) <= ox + f32::from(w0.width());
+                let tail_ok = py >= p1y && py < p1y + f32::from(r.lh)
+                    && f32::from(p.x) >= ox
+                    && f32::from(p.x) <= ox + f32::from(p1.x);
+                head_ok || tail_ok
+            };
+            if contains {
+                return Some(lk.target.clone());
+            }
+        }
+    }
+    None
 }
 
 /// 表格的一行单元格文本（表头加粗/浅色，按列对齐）。
@@ -1616,6 +2560,286 @@ fn paint_quote_band(
     paint_text_row(origin, theme, f, row, window, cx);
 }
 
+/// 每个警报（callout）对应的条色（明/暗主题微调，区分五类警报）。
+fn alert_color(theme: &WyTheme, kind: AlertKind) -> Hsla {
+    let mut c: Hsla = match kind {
+        AlertKind::Note => gpui::rgb(0x3b82f6).into(),
+        AlertKind::Tip => gpui::rgb(0x10b981).into(),
+        AlertKind::Important => gpui::rgb(0x8b5cf6).into(),
+        AlertKind::Warning => gpui::rgb(0xf59e0b).into(),
+        AlertKind::Caution => gpui::rgb(0xef4444).into(),
+    };
+    if theme.is_dark {
+        c.l = (c.l + 0.12).clamp(0., 1.);
+        c.s = (c.s + 0.05).min(1.);
+    } else {
+        c.l = (c.l - 0.06).max(0.05);
+    }
+    c
+}
+
+/// 行首装饰：列表项目符号 / 有序号 / 任务框（画在内容区左缘 gutter，文本已缩进到
+/// `row.x_off` 之后）。与 hit-test（`checkbox_hit`）共用几何常量。
+fn paint_row_gutter(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(g) = &row.extra.gutter else {
+        return;
+    };
+    let x0 = f32::from(origin.x + f.padding);
+    let center_y = f32::from(origin.y) + f32::from(row.top) + f32::from(row.height) / 2.;
+    // 与预览（view/row.rs）一致：项目符号 / 有序号 / 任务框都是正文色字形（☐/☑/•/N.）。
+    let glyph: SharedString = match g {
+        RowGutter::Check { checked } => {
+            if *checked {
+                "☑".into()
+            } else {
+                "☐".into()
+            }
+        }
+        RowGutter::Ordered(n) => n.clone().into(),
+        RowGutter::Bullet | RowGutter::Alert { .. } => "•".into(),
+    };
+    let rrun = [TextRun {
+        len: glyph.len(),
+        font: theme.font.clone(),
+        color: theme.text,
+        ..Default::default()
+    }];
+    let rline = window.text_system().shape_line(glyph, theme.font_size, &rrun, None);
+    let _ = rline.paint(
+        point(px(x0 + GUTTER_MARK_X), px(center_y - f32::from(row.lh) / 2.)),
+        row.lh,
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
+/// 警报（callout）行 chrome：左侧彩条（覆盖引述灰条）+ 粗体标签 + 可选折叠箭头。
+/// 标签/箭头画在 gutter（正文已缩进 84px），geometry 与 `alert_chevron_hit` 对齐。
+fn paint_alert_chrome(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(RowGutter::Alert { kind, fold }) = &row.extra.gutter else {
+        return;
+    };
+    let color = alert_color(theme, *kind);
+    let x0 = origin.x + f.padding;
+    let top0 = origin.y + row.top;
+    // 左彩条（覆盖引述灰条；高对齐引述带）。
+    window.paint_quad({
+        let b = Bounds::new(point(x0, top0 - px(4.)), size(px(3.), row.height + px(8.)));
+        fill(b, color)
+    });
+    // 粗体标签。
+    let label: SharedString = kind.label().into();
+    let mut lfont = theme.font.clone();
+    lfont.weight = gpui::FontWeight::BOLD;
+    let lrun = [TextRun { len: label.len(), font: lfont, color, ..Default::default() }];
+    let lline = window.text_system().shape_line(label.clone(), theme.font_size, &lrun, None);
+    let _ = lline.paint(point(x0 + px(6.), top0), row.lh, TextAlign::Left, None, window, cx);
+    // 折叠箭头（`-` 折叠 / `+` 展开 / 无 fold char 不画）。
+    if let Some(folded) = fold {
+        let glyph: SharedString = if *folded { "▸" } else { "▾" }.into();
+        let gx = x0 + px(6.) + lline.width() + px(4.);
+        let grun = [TextRun { len: glyph.len(), font: theme.font.clone(), color, ..Default::default() }];
+        let gline = window.text_system().shape_line(glyph, theme.font_size, &grun, None);
+        let _ = gline.paint(point(gx, top0), row.lh, TextAlign::Left, None, window, cx);
+    }
+}
+
+/// 行内 `$…$` 数学：在 splice 出的 spacer 位置画斜体 LaTeX（B2）。
+fn paint_inline_maths(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if row.extra.inline_maths.is_empty() || row.wrapped.is_empty() {
+        return;
+    }
+    let w0 = &row.wrapped[0];
+    let tx = origin.x + f.padding + row.x_off;
+    let ty = origin.y + row.top;
+    let fs = w0.unwrapped_layout.font_size;
+    let mut mfont = theme.font.clone();
+    mfont.style = gpui::FontStyle::Italic;
+    let mcolor = math_color(theme);
+    for im in &row.extra.inline_maths {
+        let Some(p) = w0.position_for_index(im.display_off, row.lh) else { continue };
+        let run = [TextRun { len: im.latex.len(), font: mfont.clone(), color: mcolor, ..Default::default() }];
+        let line = window.text_system().shape_line(im.latex.clone(), fs, &run, None);
+        let _ = line.paint(point(tx + p.x, ty + p.y), row.lh, TextAlign::Left, None, window, cx);
+    }
+}
+
+/// 行内 `![alt](src)`：在 alt 文本（显示区）上方画等比缩小的缩略图（B1）。
+/// 加载中/失败保留 alt 文字（已被正文画过）。
+fn paint_inline_images(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    f: &Frame,
+    row: &ShapedRow,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if row.extra.inline_images.is_empty() || row.wrapped.is_empty() {
+        return;
+    }
+    let w0 = &row.wrapped[0];
+    let tx = origin.x + f.padding + row.x_off;
+    let ty = origin.y + row.top;
+    for ii in &row.extra.inline_images {
+        let (Some(p0), Some(p1)) = (
+            w0.position_for_index(ii.display_off, row.lh),
+            w0.position_for_index(ii.display_off + ii.len.max(1), row.lh),
+        ) else {
+            continue;
+        };
+        let x = tx + p0.x;
+        let y = ty + p0.y;
+        let show_w = (p1.x - p0.x).max(px(6.));
+        let resource = {
+            let e = editor.read(cx);
+            e.image_load_resource(ii.src.as_ref())
+        };
+        let cache = {
+            let e = editor.read(cx);
+            e.image_cache()
+        };
+        let anycache: gpui::AnyImageCache = cache.into();
+        if let Some(Ok(data)) = anycache.load(&resource, window, cx) {
+            let sz = data.size(0);
+            let (iw, ih) = (sz.width.0 as f32, sz.height.0 as f32);
+            if iw > 0. && ih > 0. {
+                let bbox = (f32::from(show_w), f32::from(row.lh));
+                let sf = (bbox.0 / iw).min(bbox.1 / ih).max(0.01);
+                let (w, h) = (iw * sf, ih * sf);
+                let x2 = f32::from(x) + (bbox.0 - w) / 2.;
+                let y2 = f32::from(y) + (bbox.1 - h) / 2.;
+                let b = Bounds::new(point(px(x2), px(y2)), size(px(w), px(h)));
+                let _ = window.paint_image(b, b, Corners::all(px(3.)), data, 0, false);
+            }
+        }
+    }
+}
+
+/// 块级卡片（数学块 / Mermaid 图）的绘制：圆角面板 + 居中排版 / 占位提示。
+fn paint_card(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    row: &ShapedRow,
+    card: &BlockCard,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let pad = f32::from(f.padding);
+    let content_w = (f32::from(f.width) - pad * 2.).max(1.);
+    let x0 = f32::from(origin.x) + pad;
+    let top0 = f32::from(origin.y) + f32::from(row.top);
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(point(px(x0), px(top0)), size(px(content_w), row.height)),
+        corner_radii: Corners::all(px(8.)),
+        background: theme.code_bg.into(),
+        border_widths: Edges::default(),
+        border_color: Hsla::default(),
+        border_style: gpui::BorderStyle::Solid,
+    });
+    match card {
+        BlockCard::Math { align, latex } => {
+            // 左上角小标签（“公式”，弱化）。
+            let tag: SharedString = "公式".into();
+            let mut muted = theme.muted;
+            muted.a = 0.7;
+            let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
+            let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
+            let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
+            // LaTeX 逐行居中排版（斜体、正文色）。
+            let mut mfont = theme.font.clone();
+            mfont.style = gpui::FontStyle::Italic;
+            let lh = px(22.);
+            let fs = (f32::from(theme.font_size) * 1.15).max(14.);
+            let lines: Vec<&str> = latex.lines().collect();
+            let n = lines.len().max(1);
+            let block_h = f32::from(row.height);
+            let mut y = top0 + 10. + ((block_h - 20. - n as f32 * 22.) / 2.).max(0.);
+            for ln in lines {
+                let shown = math_to_unicode(ln);
+                let run = [TextRun { len: shown.len(), font: mfont.clone(), color: math_color(theme), ..Default::default() }];
+                let sh = window.text_system().shape_line(shown.into(), px(fs), &run, None);
+                let w = f32::from(sh.width());
+                let x = match align {
+                    MathAlign::Left => x0 + 16.,
+                    MathAlign::Center => x0 + ((content_w - w) / 2.).max(8.),
+                    MathAlign::Right => x0 + (content_w - w - 16.).max(8.),
+                };
+                let _ = sh.paint(point(px(x), px(y)), lh, TextAlign::Left, None, window, cx);
+                y += 22.;
+            }
+        }
+        BlockCard::Mermaid { source } => {
+            // 左上角小标签（弱化）。
+            let tag: SharedString = "mermaid".into();
+            let mut muted = theme.muted;
+            muted.a = 0.7;
+            let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
+            let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
+            let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
+            // 极简流图渲染：把 mermaid 边/节点展平成「A ─标→ B」文本行（居中）。
+            let flow = mermaid_flow_text(source);
+            if flow.is_empty() {
+                let hint: SharedString = "图渲染器未接入".into();
+                let mut hc = theme.muted;
+                hc.a = 0.6;
+                let hrun = [TextRun { len: hint.len(), font: theme.mono.clone(), color: hc, ..Default::default() }];
+                let hline = window.text_system().shape_line(hint, px(12.), &hrun, None);
+                let hw = f32::from(hline.width());
+                let _ = hline.paint(
+                    point(px(x0 + (content_w - hw) / 2.), px(top0 + 56.)),
+                    px(16.),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+            } else {
+                let fs = theme.font_size;
+                let mut lc = theme.text;
+                lc.a = 0.92;
+                for (k, line) in flow.iter().enumerate() {
+                    let run = [TextRun { len: line.len(), font: theme.font.clone(), color: lc, ..Default::default() }];
+                    let sh = window.text_system().shape_line(line.clone().into(), fs, &run, None);
+                    let w = f32::from(sh.width());
+                    let x = x0 + ((content_w - w) / 2.).max(8.);
+                    let _ = sh.paint(
+                        point(px(x), px(top0 + 30. + k as f32 * 24.)),
+                        px(24.),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// 当前选区（源字节归一化区间）；无选区返回 `None`。
 fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &mut App) -> Option<Range<usize>> {
     editor.read(cx).selection()
@@ -1756,6 +2980,12 @@ pub(crate) struct WyEditorElement {
     pub editor: Entity<WyEditor>,
 }
 
+/// 元素一帧的 prepaint 产物：可点击链接的 hand 光标 hitbox（paint 期设光标样式）。
+#[derive(Default)]
+pub(crate) struct WyPrepaint {
+    link_grips: Vec<Hitbox>,
+}
+
 impl IntoElement for WyEditorElement {
     type Element = Self;
     fn into_element(self) -> Self::Element {
@@ -1765,7 +2995,7 @@ impl IntoElement for WyEditorElement {
 
 impl Element for WyEditorElement {
     type RequestLayoutState = ();
-    type PrepaintState = ();
+    type PrepaintState = WyPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -1833,7 +3063,7 @@ impl Element for WyEditorElement {
         _: &mut (),
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> WyPrepaint {
         // 可视带（窗口坐标 → 元素局部 y）：元素在滚动容器内的原点即滚动偏移；
         // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。
         let vh = f32::from(window.viewport_size().height).max(1.);
@@ -1879,6 +3109,47 @@ impl Element for WyEditorElement {
                 line_height: f.line_h,
             });
         }
+
+        // C5: 行内链接的 hand 光标 hitbox（paint 期 set_cursor_style）。几何与
+        // `link_hit_at` 一致（wrapped 首行的字形几何头/尾两段）。
+        let mut link_grips = Vec::new();
+        if let Some(f) = frame.as_ref() {
+            for row in &f.rows {
+                if row.extra.links.is_empty() || row.wrapped.is_empty() {
+                    continue;
+                }
+                let Some(w0) = row.wrapped.first() else {
+                    continue;
+                };
+                let ox = bounds.origin.x + f.padding + row.x_off;
+                let oy = bounds.origin.y + row.top;
+                for lk in &row.extra.links {
+                    let (Some(p0), Some(p1)) = (
+                        w0.position_for_index(lk.disp.start, row.lh),
+                        w0.position_for_index(lk.disp.end, row.lh),
+                    ) else {
+                        continue;
+                    };
+                    if p0.y == p1.y {
+                        let hit = Bounds::new(
+                            point(ox + p0.x, oy + p0.y),
+                            size((p1.x - p0.x).max(px(2.)), row.lh),
+                        );
+                        link_grips.push(window.insert_hitbox(hit, HitboxBehavior::Normal));
+                    } else {
+                        // 折行链接：头段到行尾、尾段从行首起。
+                        let head = Bounds::new(
+                            point(ox + p0.x, oy + p0.y),
+                            size((w0.width() - p0.x).max(px(2.)), row.lh),
+                        );
+                        let tail = Bounds::new(point(ox, oy + p1.y), size(p1.x.max(px(2.)), row.lh));
+                        link_grips.push(window.insert_hitbox(head, HitboxBehavior::Normal));
+                        link_grips.push(window.insert_hitbox(tail, HitboxBehavior::Normal));
+                    }
+                }
+            }
+        }
+        WyPrepaint { link_grips }
     }
 
     fn paint(
@@ -1887,7 +3158,7 @@ impl Element for WyEditorElement {
         _: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut (),
-        _: &mut (),
+        prepaint: &mut WyPrepaint,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -1908,6 +3179,11 @@ impl Element for WyEditorElement {
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
         let origin = bounds.origin;
         for row in &f.rows {
+            // 块级卡片（数学块 / Mermaid 图）优先自绘，跳过普通文本/代码路径。
+            if let Some(card) = &row.extra.card {
+                paint_card(origin, &theme, f, row, card, window, cx);
+                continue;
+            }
             // 非文本块按类型自绘：代码面板 / 表格网格 / 图片。
             match row.kind {
                 IrKind::Code => {
@@ -1945,13 +3221,23 @@ impl Element for WyEditorElement {
             if row.wrapped.is_empty() {
                 continue;
             }
+            // 行首装饰（列表符号 / 任务框 / 有序号）画在 gutter；警报 chrome 稍后叠画。
+            paint_row_gutter(origin, &theme, f, row, window, cx);
             // 引述块：灰底带 + 左侧指示条（与预览一致：px_3 内缩、py_1 内衬、3px 边条）。
             // 相邻引述行（源码行连续）合并成一片背景，否则各自带 py_1 空隙。
             if row.kind == IrKind::Quote {
                 paint_quote_band(origin, &theme, f, row, window, cx);
-                continue;
+                paint_alert_chrome(origin, &theme, f, row, window, cx);
+            } else {
+                paint_text_row(origin, &theme, f, row, window, cx);
             }
-            paint_text_row(origin, &theme, f, row, window, cx);
+            // 行内数学 / 行内图片叠加（B1/B2）。
+            paint_inline_maths(origin, &theme, f, row, window, cx);
+            paint_inline_images(&self.editor, origin, f, row, window, cx);
+        }
+        // C5: 悬浮在可点击链接上 → hand 光标。
+        for hb in &prepaint.link_grips {
+            window.set_cursor_style(CursorStyle::PointingHand, hb);
         }
         // 选区高亮（可编辑行与源选区相交的部分，按字形几何逐个 WrappedLine 画）。
         if let Some(range) = editor_selection(&self.editor, cx) {
@@ -3008,6 +4294,285 @@ tail
                     assert_eq!(c, 2, "格内容起点 Left 被钳在格内（col {c}）");
                 }
             });
+        });
+    }
+
+    #[gpui::test]
+    fn new_features_shape_gutters_cards_links(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        use super::{BlockCard, LinkHit, RowGutter};
+        cx.update(gpui_component::init);
+        let text = "\
+# 标题
+
+- [x] 完成
+- [ ] 待办
+
+> [!NOTE]- 提示正文
+> 折叠内容
+
+行内链接 [示例](https://example.com) 与数学 $x^2$ 同段
+
+$$
+\\int x dx
+$$
+
+```mermaid
+graph TD
+A-->B
+```
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            // C1: 任务行 gutter = Check；未勾选行在 src 行 3。
+            let check = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Check { checked: false })))
+                .expect("应有未勾选任务行");
+            assert_eq!(check.src_line, 3, "`- [ ] 待办` 的源行");
+            // C3: 警报 marker 行 gutter = Alert；其下 body 行折叠成 0 高。
+            let alert = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
+                .expect("应有警报行");
+            assert_eq!(alert.src_line, 5, "`> [!NOTE]-` marker 源行");
+            let folded = frame
+                .rows
+                .iter()
+                .find(|r| r.src_lines.contains(&6))
+                .expect("callout 主体行应存在");
+            assert_eq!(f32::from(folded.height), 0., "折叠 callout 主体应 0 高");
+            // C5: 有可点击链接的行。
+            let linkrow = frame
+                .rows
+                .iter()
+                .find(|r| !r.extra.links.is_empty())
+                .expect("应有链接行");
+            assert!(
+                linkrow.extra.links.iter().any(|l| matches!(l.target, LinkHit::Url(_))),
+                "应命中 URL 链接"
+            );
+            // B2: 行内数学 splice 成 spacer 并翻译成 Unicode 排版（`x^2` → `x²`）。
+            let math_row = frame
+                .rows
+                .iter()
+                .find(|r| !r.extra.inline_maths.is_empty())
+                .expect("应有行内数学");
+            let im = &math_row.extra.inline_maths[0];
+            assert!(
+                im.latex.as_ref().contains('²') || im.latex.as_ref().contains('π'),
+                "行内数学应翻译成 Unicode：「{}」",
+                im.latex
+            );
+            assert!(
+                !math_row.extra.links.is_empty(),
+                "含 `[text](url)` 的行应为可点击链接"
+            );
+            // A1: 数学块折叠成 Math 卡片（整块一行）。
+            let mathcard = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .expect("应有数学卡片");
+            assert!(f32::from(mathcard.height) >= 40., "数学卡片高");
+            assert_eq!(mathcard.src_lines, 10..13, "数学卡片覆盖 `$$…$$` 块");
+            // A2: mermaid 围栏 → Mermaid 卡片。
+            let mm = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                .expect("应有 mermaid 卡片");
+            assert_eq!(f32::from(mm.height), 140., "mermaid 卡片高");
+            let _ = IrKind::Paragraph;
+        });
+    }
+
+    #[gpui::test]
+    fn callout_fold_click_path_round_trips(cx: &mut TestAppContext) {
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        use super::{Frame, RowGutter};
+        cx.update(gpui_component::init);
+        let text = "> [!NOTE]- 甲\n> 乙\n> 丙\n尾";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(600.)))));
+            });
+            let chevron_point = |f: &Frame| {
+                let marker = f
+                    .rows
+                    .iter()
+                    .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
+                    .expect("应有警报 marker 行");
+                let y = f32::from(marker.top) + f32::from(marker.height) / 2.;
+                point(px(12. + 40.), px(y))
+            };
+            // 折叠态 → 点击展开。
+            let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1)));
+            let f1 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
+            let ev1 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: chevron_point(&f1),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"), "点击应展开");
+            // 展开态 → 再点折叠回。
+            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2)));
+            let f2 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
+            let ev2 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: chevron_point(&f2),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再点应折叠回");
+            assert_eq!(ed.read(cx).text().as_ref(), text, "往返后内容还原");
+            // 关键断言：折叠后 body 行必须真正折叠（0 高）——光标在 marker 行也不得被 reveal 弹开。
+            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let body = frame3.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(body.height), 0., "点击折叠后 body 应真正折叠（回归）");
+        });
+    }
+
+    #[gpui::test]
+    fn two_callouts_fold_independently_with_caret_on_marker(cx: &mut TestAppContext) {
+        // 回归：两个 callout 相邻（中间空行）。各自折叠/展开应互不影响；
+        // 尤其「光标落在 marker 行（点击折叠后的常态）」时，该 callout 仍要真正折叠。
+        cx.update(gpui_component::init);
+        let text = "> [!NOTE]- 点击箭头折叠\n> 主体一\n> 主体二\n\n> [!WARNING]- 警告\n> 警告内容。\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 光标在 NOTE marker 行：两个 callout 的 body 都应折叠。
+            ed.update(cx, |e, _| e.set_caret(0));
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let note = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(note.height), 0., "光标在 marker 行时 NOTE body 也应折叠");
+            let warn = frame.rows.iter().find(|r| r.src_lines.contains(&5)).unwrap();
+            assert_eq!(f32::from(warn.height), 0., "WARNING body 也应折叠");
+            // 展开 NOTE → 再折叠（光标仍在 NOTE marker 行）。
+            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
+            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"), "先展开");
+            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
+            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再折叠回");
+            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let note2 = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
+            assert_eq!(f32::from(note2.height), 0., "折叠后 NOTE body 应真正折叠（不是 reveal）");
+            // 互不影响：折叠 WARNING 不应改动 NOTE。
+            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(4, cx));
+            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "NOTE 折叠态保持");
+            assert!(
+                ed.read(cx).text().as_ref().find("> [!WARNING]+").is_some()
+                    || ed.read(cx).text().as_ref().find("> [!WARNING]-").is_some(),
+                "WARNING 折叠符存在"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn paint_smoke_all_new_features(cx: &mut TestAppContext) {        // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
+        use super::BlockCard;
+        cx.update(gpui_component::init);
+        let text = "\
+- [ ] 待办
+
+> [!WARNING]+ 重要
+> 内容
+
+链接 [示例](https://a.b) 与 $x^2$
+
+$$
+\\sqrt{\\pi}
+$$
+
+```mermaid
+graph TD
+A-->B
+```
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                frame.rows.iter().any(|r| matches!(r.extra.card, Some(BlockCard::Mermaid { .. }))),
+                "应渲染出 mermaid 卡片"
+            );
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            // 触发一次真实绘制（measure→prepaint→paint），catch 任何渲染 panic。
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[test]
+    fn math_to_unicode_translates_superscripts_and_symbols() {
+        use super::math_to_unicode;
+        assert!(math_to_unicode("E=mc^2").contains('²'), "上标 2 → ²");
+        assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'), "积分符号");
+        assert!(math_to_unicode("\\sqrt{\\pi}").contains('√'), "根号");
+        assert!(math_to_unicode("\\sum_{i=1}^{n}").contains('∑'), "求和");
+        assert_eq!(math_to_unicode("\\tfrac{1}{3}"), "1/3", "分数 → a/b");
+    }
+
+    #[test]
+    fn mermaid_flow_renders_edge_lines() {
+        use super::mermaid_flow_text;
+        let src = "graph TD\n    A[开始] --> B{判断}\n    B -->|是| C[完成]\n    B -->|否| D[返回 A]\n";
+        let lines = mermaid_flow_text(src);
+        assert!(!lines.is_empty(), "应产出流式文本行");
+        let joined = lines.join("\n");
+        assert!(joined.contains("开始"), "含节点标签：{joined}");
+        assert!(joined.contains('→'), "含箭头：{joined}");
+        assert!(lines.iter().any(|l| l.contains("是") && l.contains("完成")), "含边签路径：{joined}");
+    }
+
+    #[gpui::test]
+    fn undo_redo_round_trip(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.set_caret(1);
+                e.replace_range(1..1, "X", cx);
+            });
+            assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
+            ed.update(cx, |e, cx| e.undo(cx));
+            assert_eq!(ed.read(cx).text().as_ref(), "abc");
+            ed.update(cx, |e, cx| e.redo(cx));
+            assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
         });
     }
 }

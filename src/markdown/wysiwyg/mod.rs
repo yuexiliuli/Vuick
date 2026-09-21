@@ -33,12 +33,16 @@ use gpui::{
 };
 
 use super::doc::Doc;
+use crate::markdown::live::md_syntax::{self, LinkHit};
+use crate::markdown::live::markdown_syntax;
 use crate::markdown::view::style::StyleParams;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum WyEvent {
     Changed,
+    /// 点击内部链接（wiki/tag/block-ref，`[[…]]`/`#tag`/`((id))`）→ 宿主打开对应页面。
+    OpenPage(String),
 }
 
 /// 行内样式调色（创建时注入；后续随主题切换重建）。
@@ -169,6 +173,13 @@ fn caret_vis() -> CaretVis {
     CARET_VIS.with(|c| c.get())
 }
 
+/// 撤销/重做快照（整份源文本 + 光标）。
+#[derive(Clone)]
+struct Snapshot {
+    text: SharedString,
+    caret: usize,
+}
+
 /// 项目管线的所见即所得编辑器：`Doc` 为唯一数据源，`caret` 是**源字节偏移**。
 pub struct WyEditor {
     content: SharedString,
@@ -214,6 +225,9 @@ pub struct WyEditor {
     /// （代码 ``` 标记行、表格分隔行，只读）。导航/退格/删除据此避免光标落进
     /// 只读围栏（否则在隐藏围栏上输入会破坏结构）。随文本变更重建。
     block_regions: Vec<BlockRegion>,
+    /// 撤销栈（旧状态 → pop 后恢复）；重做栈。整份源文本快照（简单可靠，文档不大）。
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
 }
 
 /// 可编辑块区域（与块级编辑映射配套；围栏行不可落点）。
@@ -249,6 +263,8 @@ impl WyEditor {
             sel_anchor: None,
             dragging: false,
             block_regions: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -298,6 +314,8 @@ impl WyEditor {
         self.rebuild_block_regions();
         self.preseed_image_sizes();
         self.caret = self.caret.min(self.content.len());
+        self.undo_stack.clear();
+        self.redo_stack.clear();
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
     }
@@ -554,6 +572,7 @@ impl WyEditor {
     /* ---------- 点击 / 鼠标 ---------- */
 
     /// 鼠标按下命中 → 源偏移（经 frame + byte_map）；左键开始拖选并抢焦点。
+    /// 先试交互性命中：任务框翻转（C1）、警报折叠箭头（C3）、行内链接（C5）。
     pub(crate) fn on_mouse_down(
         &mut self,
         ev: &gpui::MouseDownEvent,
@@ -563,10 +582,48 @@ impl WyEditor {
         if ev.button != gpui::MouseButton::Left {
             return;
         }
+        // 输入命中前保证帧存在（缺帧当场重建，避免展开后立刻再点折叠时命中落空）。
+        if !self.ensure_frame_for_input(window) {
+            return;
+        }
         let marker = self.frame.borrow();
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
+        // 交互性命中（任务框/折叠箭头/链接）单双击都响应，展开→立即再点也能折叠回。
+        if !ev.modifiers.shift && !ev.modifiers.control {
+            // C1: 点击任务框 → 翻转 `[ ]` ↔ `[x]`（写源码，走撤销栈）。
+            if let Some((line, _)) = element::checkbox_hit(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.toggle_checkbox_at_line(line, cx);
+                return;
+            }
+            // C3: 点击警报折叠箭头 → 翻转 `-`/`+`（折叠/展开 callout 主体）。
+            if let Some((line, _)) = element::alert_chevron_hit(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.toggle_alert_fold_at_line(line, cx);
+                return;
+            }
+            // C5: 点击行内链接 → 打开（安全 URL 直开系统浏览器；wiki/tag → OpenPage）。
+            if let Some(hit) = element::link_hit_at(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                match hit {
+                    LinkHit::Url(u) if md_syntax::is_safe_external_url(&u) => {
+                        let _ = cx.open_url(&u);
+                    }
+                    LinkHit::Url(u) | LinkHit::Page(u) => {
+                        cx.emit(WyEvent::OpenPage(u));
+                    }
+                    LinkHit::BlockRef(id) => {
+                        cx.emit(WyEvent::OpenPage(format!("#^{id}")));
+                    }
+                }
+                return;
+            }
+        }
         let off = element::source_offset_at(self, f, ev.position);
         drop(marker);
         self.focus.focus(window, cx);
@@ -845,12 +902,19 @@ impl WyEditor {
 
     /// 核心编辑：替换 `[start, end)` → `text`，重建模型、移光标、通知。
     /// 任意替换都会收敛选区（无选区）与 IME 组合区间（替换后由输入处理器重设）。
+    /// **所有编辑**（输入/剪贴板/退格/任务框翻转/警报折叠）都从这里过——每笔真实
+    /// 内容变更先记入撤销栈（D1）。
     pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
         let s = self.content.as_ref();
         let r = range.start.min(s.len())..range.end.min(s.len());
         if r.start == r.end && text.is_empty() {
             return;
         }
+        self.undo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+        if self.undo_stack.len() > 200 {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
         let mut next = String::with_capacity(s.len() - r.len() + text.len());
         next.push_str(&s[..r.start]);
         next.push_str(text);
@@ -860,6 +924,85 @@ impl WyEditor {
         self.rebuild_block_regions();
         self.caret = (r.start + text.len()).min(self.content.len());
         self.sel_anchor = None;
+        *self.frame.borrow_mut() = None;
+        self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        cx.emit(WyEvent::Changed);
+        cx.notify();
+    }
+
+    /// 记录撤销快照并做一次文本替换（任务框 toggle / 警报折叠共用）。
+    /// 快照与重做栈的维护在 [`Self::replace_range`] 内统一完成。
+    fn apply_edit(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        self.replace_range(range, text, cx);
+    }
+
+    /// 翻转第 `line` 行（`> [!NOTE]-` / `+`）的折叠符（C3）：`-`→`+` 展开、`+`→`-` 折叠。
+    pub(crate) fn toggle_alert_fold_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let start = self.line_start(line);
+        let end = self.line_end(line).max(start);
+        let raw = self.content.as_ref()[start..end].to_string();
+        if let Some((at, cur)) = md_syntax::alert_fold_char(&raw) {
+            let range = start + at..start + at + 1;
+            let repl = if cur { "+" } else { "-" };
+            if range.end <= end {
+                self.apply_edit(range, repl, cx);
+            }
+        }
+    }
+
+    /// 翻转第 `line` 行任务框（C1）：`[ ]`↔`[x]`。
+    pub(crate) fn toggle_checkbox_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        let start = self.line_start(line);
+        let end = self.line_end(line).max(start);
+        let raw = self.content.as_ref()[start..end].to_string();
+        if let Some(new_line) = markdown_syntax::toggle_task_checkbox(&raw) {
+            self.apply_edit(start..end, &new_line, cx);
+        }
+    }
+
+    /// 输入命中前确保帧存在（帧被置空后、下一次渲染还没重建时，点击才会落空——
+    /// 这正是「展开后立刻再点折叠」偶发失效的来源）。缺帧则当场按当前可视带重建。
+    fn ensure_frame_for_input(&mut self, window: &mut Window) -> bool {
+        if self.frame.borrow().is_some() {
+            return true;
+        }
+        let width = {
+            let w = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+            if f32::from(w) <= 1. {
+                return false;
+            }
+            w
+        };
+        let band = self.shape_band().unwrap_or((0., 5000.));
+        let frame = element::build_frame(self, window, width, band);
+        *self.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+        true
+    }
+
+    /// 撤销（D1）：弹出上一状态恢复；被撤销的状态进重做栈。
+    pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.undo_stack.pop() {
+            self.redo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+            self.restore_snapshot(s, cx);
+        }
+    }
+
+    /// 重做（D1）。
+    pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
+        if let Some(s) = self.redo_stack.pop() {
+            self.undo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+            self.restore_snapshot(s, cx);
+        }
+    }
+
+    /// 恢复快照：重建模型 + 光标，通知宿主内容已变（返回 Changed，供镜像保存）。
+    fn restore_snapshot(&mut self, s: Snapshot, cx: &mut Context<Self>) {
+        self.content = s.text;
+        self.doc = Doc::open(self.content.clone());
+        self.rebuild_block_regions();
+        self.caret = s.caret.min(self.content.len());
+        self.sel_anchor = None;
+        self.marked = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);
@@ -1139,6 +1282,8 @@ wy_action!(SelectAll, "wy-select-all");
 wy_action!(Copy, "wy-copy");
 wy_action!(Cut, "wy-cut");
 wy_action!(Paste, "wy-paste");
+wy_action!(Undo, "wy-undo");
+wy_action!(Redo, "wy-redo");
 
 /// 装配键位（入口：`main.rs` 与其它键位一并安装）。
 pub fn bind_keys(cx: &mut gpui::App) {
@@ -1155,6 +1300,11 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("cmd-z", Undo, Some(CONTEXT)),
+        KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(CONTEXT)),
+        KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
     ])
 }
 
@@ -1380,6 +1530,16 @@ impl gpui::Render for WyEditor {
             .on_action(
                 cx.listener(|this: &mut WyEditor, _: &Paste, window: &mut Window, cx: &mut Context<WyEditor>| {
                     this.paste(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &Undo, _: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.undo(cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut WyEditor, _: &Redo, _: &mut Window, cx: &mut Context<WyEditor>| {
+                    this.redo(cx)
                 }),
             )
             .on_mouse_down(

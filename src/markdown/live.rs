@@ -37,7 +37,8 @@ mod element;
 use element::*;
 
 // 随 zorite 编辑器一同移植入内的一个小模块（不再是外部 crate）：
-mod md_syntax; // = gpui-markdown::syntax：markdown 构造识别（与 gpui 无关）
+// `pub(crate)` 供本项目 `markdown::wysiwyg` 复用同一套构造识别（链接/警报/折叠等）。
+pub(crate) mod md_syntax; // = gpui-markdown::syntax：markdown 构造识别（与 gpui 无关）
 
 
 /// Key context the editing actions are scoped to (so they only fire while an

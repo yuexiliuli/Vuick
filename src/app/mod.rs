@@ -1218,15 +1218,22 @@ impl EditorApp {
                 .map(|d| d.to_path_buf());
             ed.update(cx, |ed, _| ed.set_base_dir(base_dir));
             let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
-                if ev == &WyEvent::Changed {
-                    if let Some(tab) = this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
-                    {
-                        let value = emitter.update(cx, |e, _| e.text().to_string());
-                        tab.content = SharedString::from(value.clone());
-                        tab.line_count = value.lines().count().max(1);
-                        tab.char_count = value.chars().count();
-                        tab.dirty = true;
-                        tab.editor.update(cx, |ed, _| ed.set_text(&value));
+                match ev {
+                    WyEvent::Changed => {
+                        if let Some(tab) =
+                            this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
+                        {
+                            let value = emitter.update(cx, |e, _| e.text().to_string());
+                            tab.content = SharedString::from(value.clone());
+                            tab.line_count = value.lines().count().max(1);
+                            tab.char_count = value.chars().count();
+                            tab.dirty = true;
+                            tab.editor.update(cx, |ed, _| ed.set_text(&value));
+                        }
+                    }
+                    WyEvent::OpenPage(p) => {
+                        this.status = SharedString::from(format!("WYSIWYG 点击链接：{p}"));
+                        this.status_ok = true;
                     }
                 }
             });
