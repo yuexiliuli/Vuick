@@ -67,6 +67,8 @@ pub struct WyTheme {
     /// 正文字号（px）——由应用全局字号驱动（主题内正文基准）。
     pub font_size: Pixels,
     pub accent: Hsla,
+    /// 链接色（预览 `StyleParams.link`，明 #0969da / 暗 #79c0ff 单源）。
+    pub link: Hsla,
     /// 代码块背景（明/暗主题各自取值，与预览一致）。
     pub code_bg: Hsla,
     /// 行内代码（反引号）文字色（预览 `code_inline_fg`）。
@@ -106,6 +108,7 @@ impl WyTheme {
             font: body_font,
             font_size,
             accent: p.accent,
+            link: p.link,
             code_bg: p.code_bg,
             code_inline_fg: p.code_inline_fg,
             code_inline_bg: p.code_inline_bg,
@@ -1297,9 +1300,13 @@ pub fn bind_keys(cx: &mut gpui::App) {
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CONTEXT)),
         KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
+        KeyBinding::new("ctrl-x", Cut, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
         KeyBinding::new("cmd-z", Undo, Some(CONTEXT)),
         KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),

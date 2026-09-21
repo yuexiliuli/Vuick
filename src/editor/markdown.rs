@@ -19,6 +19,7 @@ use std::ops::Range;
 
 use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, StrikethroughStyle, UnderlineStyle, px, rgb};
 
+use crate::config::colors::{LINK_DARK, LINK_LIGHT};
 use crate::editor::buffer::Buffer;
 
 /// 记号淡化强度（gpui `fade_out`：alpha × (1 − 值)）。0.75 → 保留 25% 透明度，
@@ -27,9 +28,7 @@ const MARKER_FADE: f32 = 0.75;
 /// 行内代码/围栏内容背景（GitHub 浅/暗）。
 const CODE_BG_LIGHT: u32 = 0xeff1f3;
 const CODE_BG_DARK: u32 = 0x2b3340;
-/// 链接文字色（GitHub 浅/暗）。
-const LINK_LIGHT: u32 = 0x0969da;
-const LINK_DARK: u32 = 0x79c0ff;
+
 /// 标题文字色（GitHub markup.heading 浅/暗，与 syntax 高亮一致）。
 const HEADING_LIGHT: u32 = 0x0550ae;
 const HEADING_DARK: u32 = 0x79c0ff;

@@ -33,6 +33,9 @@ pub(crate) struct StyleParams {
     pub(crate) code_inline_bg: Hsla,
     pub(crate) divider: Hsla,
     pub(crate) accent: Hsla,
+    /// 链接色（`[t](u)` / wiki / tag / 裸 URL；明 #0969da / 暗 #79c0ff，单一源
+    /// `config::colors::LINK_LIGHT/LINK_DARK`——预览 / WYSIWYG / 源码编辑器一个蓝）。
+    pub(crate) link: Hsla,
     pub(crate) bg: Hsla,
     /// 引述块背景（浅灰卡片感）。
     pub(crate) quote_bg: Hsla,
@@ -99,6 +102,12 @@ impl StyleParams {
         } else {
             (gpui::rgb(0x222222).into(), gpui::rgb(0xf3f4f4).into())
         };
+        // 链接蓝：单一源 `config::colors::LINK_LIGHT/DARK`（与源码编辑器同值）。
+        let link = if is_dark {
+            gpui::rgb(crate::config::colors::LINK_DARK).into()
+        } else {
+            gpui::rgb(crate::config::colors::LINK_LIGHT).into()
+        };
         Self {
             mono: typo.mono.clone(),
             fg: colors.foreground,
@@ -108,6 +117,7 @@ impl StyleParams {
             code_inline_bg,
             divider: colors.border,
             accent: colors.accent,
+            link,
             bg: colors.background,
             quote_bg,
             table_head_bg,
@@ -147,12 +157,13 @@ impl StyleParams {
     /// `wysiwyg_style` 是唯一调用方，不再手拼 [`SyntaxStyle`]（两套配色一处定义）。
     pub(crate) fn syntax_style(&self, chrome: SyntaxChrome) -> crate::markdown::SyntaxStyle {
         let accent = self.accent;
+        let link = self.link;
         crate::markdown::SyntaxStyle {
             marker: chrome.marker,
             code: chrome.code_fg,
             code_bg: self.code_bg,
-            link: accent,
-            tag: accent,
+            link,
+            tag: link,
             quote: chrome.quote,
             alert_note: accent,
             alert_tip: accent,

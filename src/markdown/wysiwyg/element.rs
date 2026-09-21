@@ -210,6 +210,7 @@ fn runs_to_text_runs(
     color: gpui::Hsla,
     mono: &gpui::Font,
     accent: gpui::Hsla,
+    link: gpui::Hsla,
     code_inline_fg: gpui::Hsla,
 ) -> Vec<gpui::TextRun> {
     use gpui::{StrikethroughStyle, TextRun, UnderlineStyle};
@@ -246,14 +247,16 @@ fn runs_to_text_runs(
                     color: Some(color),
                 });
             }
-            RunKind::Link | RunKind::Image => {
-                tr.color = accent;
+            RunKind::Link => {
+                tr.color = link;
                 tr.underline = Some(UnderlineStyle {
                     thickness: px(1.),
-                    color: Some(accent),
+                    color: Some(link),
                     wavy: false,
                 });
             }
+            // 行内图片：alt 只是加载完成前的占位文字——正文色、无下划线（不冒充链接）。
+            RunKind::Image => {}
         }
         out.push(tr);
         i = e;
@@ -425,6 +428,8 @@ fn splice_math_text(
         if shown.is_empty() {
             continue;
         }
+        // 行内数学不应含换行（`\\` 行断在这里展开成空格）。
+        let shown = shown.replace('\n', " ");
         let run = [TextRun { len: shown.len(), font: math_font.clone(), color: math_color, ..Default::default() }];
         let w = f32::from(window.text_system().shape_line(shown.clone().into(), fs, &run, None).width());
         let n = (w / space_w).ceil() as usize;
@@ -476,6 +481,7 @@ fn shape_text_row(
         st.color,
         &theme.mono,
         theme.accent,
+        theme.link,
         theme.code_inline_fg,
     );
     // 行内数学 `$…$`：斜体 math 字体排版宽度 → splice 成空格 spacer（B2）。
@@ -771,12 +777,34 @@ fn math_to_unicode(src: &str) -> String {
                 i = ni;
             }
             '\\' => {
+                // `\\`（行断 / 矩阵对齐里的换行）→ 换行符（否则残留为字面 `\`，数学块
+                // 里 `a = b \\ c = d` 会显示成垃圾）。
+                if cs.get(i + 1) == Some(&'\\') {
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                }
                 let mut j = i + 1;
                 while j < cs.len() && cs[j].is_ascii_alphabetic() {
                     j += 1;
                 }
                 let name: String = cs[i + 1..j].iter().collect();
                 match name.as_str() {
+                    // `\begin{matrix}` / `\end{pmatrix}` 之类环境：剥掉环境名（矩阵/
+                    // cases/aligned 等直接在字符层面显示，不再泄漏 `\begin{...}` 文本）。
+                    "begin" | "end" => {
+                        if let (Some(_), ni) = read_group_opt(&cs, j) {
+                            i = ni;
+                        } else {
+                            i = j;
+                        }
+                    }
+                    // 对齐分隔符：矩阵/对齐环境里的 `&` 是列分隔 → 空格（输出排开）。
+                    // 单独处理 `&`：保持可读。
+                    "cr" | "hfill" => {
+                        out.push('\n');
+                        i = j;
+                    }
                     "frac" | "tfrac" | "dfrac" => {
                         let (a, ni) = read_group_opt(&cs, j);
                         let (b, nj) = match &a {
@@ -827,7 +855,12 @@ fn math_to_unicode(src: &str) -> String {
                 }
             }
             c => {
-                out.push(c);
+                // 矩阵/对齐环境的列分隔符 → 空格（对齐排开，不显示裸 `&`）。
+                if c == '&' {
+                    out.push(' ');
+                } else {
+                    out.push(c);
+                }
                 i += 1;
             }
         }
@@ -1241,6 +1274,14 @@ fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {
 /// 再在原文尾随 `![…](…)` 取 src）。`r.byte_map` 是「剥标记后、数学 splice 前」的
 /// display→源（源值不变）；`srow.byte_map` 是 splice 后的——显示区间统一以**源偏移**
 /// 为准重算（两种 map 都成立）。
+///
+/// 坑：`RunKind::Image` 的 run 覆盖的是 **alt 文本**（`![alt](…)` 里 disc 剥掉记号后
+/// 只留 alt，byte_map[alt] = alt 源起点）。所以：
+/// - src 起点要从 `byte_map[rg.start]` **往前退一格**（`!` 紧贴 alt 前）再喂
+///   [`markdown_syntax::inline_image_spans`]——否则 tail 从 alt 开始、找不到 `![`，
+///   行内图片永远不显示。
+/// - 显示区间只能用 **alt 的长度**（= run 长），不能用整段 `![…](…)` 的源跨度——
+///   那会越过 shaped 行的末尾，`position_for_index` 返回 None → paint 阶段被跳过。
 fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<InlineImageHit> {
     let mut out = Vec::new();
     let pre = r.byte_map.as_slice();
@@ -1249,19 +1290,29 @@ fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<InlineImage
         if *k != RunKind::Image {
             continue;
         }
-        let Some(&src_off) = pre.get(rg.start.min(pre.len().saturating_sub(1))) else {
+        let Some(&alt_src) = pre.get(rg.start.min(pre.len().saturating_sub(1))) else {
             continue;
         };
-        if src_off >= raw.len() {
+        // 源里 `![` 的 `!` 在 **alt 前两个字节**（`!` + `[` 各一字节）——`byte_map` 把
+        // alt 显示字节映射到 alt 源起点，`alt_src-1` 是 `[`，`alt_src-2` 才是 `!`。
+        if alt_src < 2 || alt_src > raw.len() {
             continue;
         }
-        let tail = &raw[src_off..];
+        let start = alt_src - 2;
+        if raw.as_bytes().get(start) != Some(&b'!')
+            || raw.as_bytes().get(start + 1) != Some(&b'[')
+        {
+            continue;
+        }
+        let tail = &raw[start..];
         let Some((full, srcr)) = markdown_syntax::inline_image_spans(tail).into_iter().next() else {
             continue;
         };
+        let _ = full;
         let src = tail[srcr].to_string();
-        let d0 = source_to_display(post, src_off);
-        let d1 = source_to_display(post, (src_off + full.end).min(raw.len()));
+        let alt_len = rg.end.saturating_sub(rg.start);
+        let d0 = source_to_display(post, alt_src);
+        let d1 = source_to_display(post, (alt_src + alt_len).min(raw.len()));
         if d1 > d0 {
             out.push(InlineImageHit { display_off: d0, len: d1 - d0, src: src.into() });
         }
@@ -1601,9 +1652,27 @@ fn shape_docrow(
     }
 }
 
+/// 数学块卡片的显示行：源码按换行 + LaTeX `\\`（行断）切成多行，逐段做 Unicode
+/// 排版。`math_card_height` 与 `paint_card` 必须用同一函数 → 高与绘制逐行对应。
+fn math_display_lines(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for ln in src.split('\n') {
+        for seg in ln.split("\\\\") {
+            let s = math_to_unicode(seg.trim());
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// 数学块卡片高度：顶部标签留白 + 每行 LaTeX 一行。
 fn math_card_height(reg: &MathRegion, _theme: &WyTheme) -> Pixels {
-    let n = reg.source.lines().count().max(1);
+    let n = math_display_lines(&reg.source).len();
     px(20. + n as f32 * 22.)
 }
 
@@ -2948,19 +3017,18 @@ fn paint_card(
             let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
             let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
             let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
-            // LaTeX 逐行居中排版（斜体、正文色）。
+            // LaTeX 逐行居中排版（斜体、正文色）。行 = 源码换行 + `\\` 行断。
             let mut mfont = theme.font.clone();
             mfont.style = gpui::FontStyle::Italic;
             let lh = px(22.);
             let fs = (f32::from(theme.font_size) * 1.15).max(14.);
-            let lines: Vec<&str> = latex.lines().collect();
+            let lines = math_display_lines(latex);
             let n = lines.len().max(1);
             let block_h = f32::from(row.height);
             let mut y = top0 + 10. + ((block_h - 20. - n as f32 * 22.) / 2.).max(0.);
-            for ln in lines {
-                let shown = math_to_unicode(ln);
+            for shown in &lines {
                 let run = [TextRun { len: shown.len(), font: mfont.clone(), color: math_color(theme), ..Default::default() }];
-                let sh = window.text_system().shape_line(shown.into(), px(fs), &run, None);
+                let sh = window.text_system().shape_line(shown.clone().into(), px(fs), &run, None);
                 let w = f32::from(sh.width());
                 let x = match align {
                     MathAlign::Left => x0 + 16.,
@@ -4880,6 +4948,189 @@ A-->B
             assert_eq!(ed.read(cx).text().as_ref(), "abc");
             ed.update(cx, |e, cx| e.redo(cx));
             assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
+        });
+    }
+
+    #[test]
+    fn link_runs_render_in_blue_with_underline() {
+        // C5 修复：WYSIWYG 链接不该用 `colors.accent`（浅色主题 = neutral-100 灰），
+        // 而是单一源 `StyleParams.link`（明 #0969da / 暗 #79c0ff，与源码编辑器同蓝）。
+        use super::runs_to_text_runs;
+        use gpui::FontWeight;
+        let base = gpui::font("Arial");
+        let mono = gpui::font("Consolas");
+        let text = "点 示例 你";
+        // 渲染字节 [2..4) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。
+        let runs = vec![((2..8), crate::markdown::parser::RunKind::Link)];
+        let accent = gpui::Hsla::default();
+        let link: gpui::Hsla = gpui::rgb(0x0969da).into();
+        let code_inline_fg = gpui::Hsla::default();
+        let out = runs_to_text_runs(
+            text,
+            &runs,
+            &base,
+            gpui::Hsla::default(),
+            &mono,
+            accent,
+            link,
+            code_inline_fg,
+        );
+        let link_run = out
+            .iter()
+            .find(|r| {
+                r.color == link && r.len == 6
+            })
+            .expect("链接段应为蓝色 TextRun（len=6 汉字）");
+        assert_eq!(link_run.color, link, "链接文字色应等于 StyleParams.link 蓝");
+        assert!(
+            link_run.underline.is_some(),
+            "链接应有下划线"
+        );
+        let ul = link_run.underline.as_ref().unwrap();
+        assert_eq!(ul.color, Some(link), "下划线颜色与文字同蓝");
+        // 非链接段保持预设底色（基色），不误伤。
+        let _ = FontWeight::default();
+        assert!(
+            out.iter().any(|r| r.len == 2),
+            "应有链接前导“点 ”（2 字节）段"
+        );
+    }
+
+    #[gpui::test]
+    fn link_theme_single_source_equals_editor_blue(cx: &mut TestAppContext) {
+        // 回检测试（坑 D 单一源）：WyTheme.link ← StyleParams.link ← 明/暗主题蓝，
+        // 且与源码编辑器 `editor/markdown.rs` 的 LINK_LIGHT/LINK_DARK 同值。
+        use crate::markdown::view::style::StyleParams;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("none"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            let p = StyleParams::from_theme_with_font(cx, Some(f32::from(theme.font_size)));
+            assert_eq!(theme.link, p.link, "WyTheme.link 抄自 StyleParams.link");
+            // 浅色主题（main.rs 强制 Light）：应与编辑器 LINK_LIGHT #0969da 逐字节一致。
+            let expect = if p.is_dark {
+                gpui::rgb(crate::config::colors::LINK_DARK).into()
+            } else {
+                gpui::rgb(crate::config::colors::LINK_LIGHT).into()
+            };
+            assert_eq!(theme.link, expect, "链接蓝单一源 config::colors::LINK_*");
+        });
+    }
+
+    #[gpui::test]
+    fn inline_image_hit_is_found_and_within_display_range(cx: &mut TestAppContext) {
+        // B1 修复：`![alt](src)` 的 `RunKind::Image` 只覆盖 alt——byte_map[alt] 是
+        // **alt 起点**（不是 `!`）。旧实现在 alt 起点处查 `![` 永远找不到（tail 没有
+        // `!`），且显示区间按整段源跨度算、越出 shaped 行 → `position_for_index` 落空。
+        // 现在：src 起点从 `!` 反查，显示区间收在 alt 内。
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "前文 ![内联蓝块](shot_blue.png) 后文\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let para = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Paragraph)
+                .expect("应有段落行");
+            assert!(
+                !para.extra.inline_images.is_empty(),
+                "行内图片应被命中（旧实现此处为空 → 永远不显示）"
+            );
+            let hit = &para.extra.inline_images[0];
+            assert_eq!(hit.src.as_ref(), "shot_blue.png", "src 取自 `!(…)`");
+            // 显示区间必须在 shaped 行长度内（否则 paint 的 position_for_index 返回 None）。
+            let dl = para.wrapped.first().map(|w| w.len()).unwrap_or(0);
+            assert!(
+                hit.display_off + hit.len <= dl,
+                "图片显示区间 {}..{} 须在 shaped 行 {} 内",
+                hit.display_off,
+                hit.display_off + hit.len,
+                dl
+            );
+            assert_eq!(hit.len, "内联蓝块".len(), "显示区只覆盖 alt（不含标记）");
+        });
+    }
+
+    #[test]
+    fn math_block_env_and_line_breaks_render_cleanly() {
+        // A1 修复：结构化 LaTeX 不再泄漏 `\begin{...}`/字面 `\\`。
+        use super::{math_display_lines, math_to_unicode};
+        // `\\` 行断 → 拆成两行（矩阵/对齐环境也如此）。
+        let lines = math_display_lines("a = b \\\\ c = d");
+        assert_eq!(lines.len(), 2, "`\\\\`（LaTeX 行断）应拆成两行");
+        assert_eq!(lines[0], "a = b");
+        assert_eq!(lines[1], "c = d");
+        // `\begin{matrix}` 环境名剥掉、`&` 列分隔 → 空格。
+        let m = math_to_unicode("\\begin{matrix}1 & 2 \\\\ 3 & 4\\end{matrix}");
+        assert!(!m.contains("begin"), "不应泄漏 \\begin：{m}");
+        assert!(!m.contains('\\'), "不应残留反斜杠：{m}");
+        assert!(m.contains('1') && m.contains('2') && m.contains('3') && m.contains('4'));
+        // 既有的普通公式仍工作。
+        assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'));
+    }
+
+    #[gpui::test]
+    fn keys_ctrl_a_c_v_select_copy_paste_round_trip(cx: &mut TestAppContext) {
+        // D1/Ctrl 修复：Windows 上 Ctrl 报 `modifiers.control`，而 `cmd-*` 绑定是
+        // `modifiers.platform`（= Win 键）→ 旧实现 Ctrl+C/V/A 全部失效。现在与
+        // `live.rs` 一样显式补 `ctrl-a/c/v` 绑定，经真实键位派发验证整条链路。
+        use gpui::{App, Keystroke};
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        // 安装 WYSIWYG 键位（与 main.rs 的 bind_keys 装配一致）。
+        vcx.update(|_w, cx: &mut App| crate::markdown::wysiwyg::bind_keys(cx));
+        // 聚焦编辑器 → 键位上下文生效。
+        vcx.update(|window, cx| {
+            let fh = host.read(cx).ed.read(cx).focus_handle();
+            window.focus(&fh, cx);
+        });
+        let wh = vcx.windows().first().copied().expect("窗口句柄");
+
+        // Ctrl+A 全选。
+        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-a").unwrap());
+        vcx.update(|_w, cx| {
+            assert_eq!(
+                host.read(cx).ed.read(cx).selection(),
+                Some(0.."hello world".len()),
+                "Ctrl+A 应全选"
+            );
+        });
+        // Ctrl+C 复制 → 剪贴板。
+        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-c").unwrap());
+        let clip: Option<String> = vcx.update(|_w, cx: &mut App| {
+            cx.read_from_clipboard().map(|i| i.text().unwrap_or_default())
+        });
+        assert_eq!(clip.as_deref(), Some("hello world"), "Ctrl+C 应写入剪贴板");
+        // 光标置开头后 Ctrl+V 粘贴（选区替换为插入）。
+        vcx.update(|_w, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_caret(0);
+            });
+        });
+        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
+        vcx.update(|_w, cx| {
+            assert_eq!(
+                host.read(cx).ed.read(cx).text().as_ref(),
+                "hello worldhello world",
+                "Ctrl+V 应在光标处粘贴剪贴板内容"
+            );
         });
     }
 }

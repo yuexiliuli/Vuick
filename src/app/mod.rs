@@ -360,6 +360,11 @@ impl EditorApp {
                     app.open_file_in_tab(0, &p.to_string_lossy(), window, cx);
                 }
             }
+            // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：打开文件后
+            // 立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
+            if std::env::var_os("WY_AUTOTEST").is_some() && app.is_markdown_tab(0) {
+                app.toggle_live_test(window, cx);
+            }
         }
         app
     }
