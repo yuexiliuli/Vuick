@@ -23,12 +23,15 @@
 //!   测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
 
 mod element;
+mod math_typeset;
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    Context, EntityInputHandler, FocusHandle, Focusable, Font, Hsla, Pixels, SharedString,
+    Context, EntityInputHandler, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
     UTF16Selection, Window, font, px,
 };
 
@@ -213,6 +216,15 @@ pub struct WyEditor {
     /// 图片加载完成代数：任何图片从「占位尺寸」变成「真实尺寸」自增——
     /// 纳入帧缓存键，新图到达后必须重建整帧（否则缓存总高还是旧尺寸）。
     images_gen: Cell<u64>,
+    /// LaTeX → 排版结果缓存（参考 zorite `<MathStore>` 按公式源码做键）。
+    /// `Loading` 排版中 / `Ready` 就绪（位图 + 逻辑 px 尺寸）/ `Failed` 失败（回退 Unicode）。
+    math_slots: Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>>,
+    /// 排版文字色；主题切换 → 清缓存重排（同 zorite `MathStore::set_color`）。
+    math_color: RefCell<Option<Hsla>>,
+    /// 最近一次已扫描的内容代数（`sync_math` 挡同代重复扫描）。
+    math_scanned_gen: Cell<u64>,
+    /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
+    math_gen: Cell<u64>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
     /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
@@ -242,6 +254,34 @@ enum BlockRegion {
     Table { header: usize, dlo: usize, dhi: usize },
 }
 
+/// 一个 LaTeX 公式的排版产物（键 = 公式源码 LaTeX；参考 zorite 的 `MathStore::Slot`）。
+#[derive(Clone)]
+pub(crate) enum MathSlot {
+    /// 排版已开始，位图未回（paint 回退 Unicode 文本；结束自增 `math_gen`）。
+    Loading,
+    /// 已就绪：位图 + 逻辑（pre-DPR）px 尺寸。
+    Ready(Arc<RenderImage>, f32, f32),
+    /// 排版失败（回退 Unicode 文本，不再重试）。
+    Failed,
+}
+
+/// 数学文字色（单一源：位图着色 = Unicode 回退文本色 = 渲染 fallback 一致）。
+/// 仍按 `math_color` 的紫 `0x6d5bd0`（业界公式感），暗色主题提亮。
+pub(crate) fn math_color(theme: &WyTheme) -> Hsla {
+    let mut c: Hsla = gpui::rgb(0x6d5bd0).into();
+    if theme.is_dark {
+        c.l = (c.l + 0.18).clamp(0.05, 1.);
+    }
+    c
+}
+
+/// 行内（`$…$`）公式的排版槽键：与块公式（键 = latex 原样）分开，行内用紧凑
+/// `INLINE_PAD` 光栅（否则小公式也被 PAD 顶高、撑行）。`latex` 从不以 `inline:` 起头，
+/// 不冲突。
+pub(crate) fn inline_math_key(latex: &str) -> SharedString {
+    format!("inline:{latex}").into()
+}
+
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
@@ -261,6 +301,10 @@ impl WyEditor {
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
+            math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            math_color: RefCell::new(None),
+            math_scanned_gen: Cell::new(0),
+            math_gen: Cell::new(0),
             base_dir: None,
             marked: None,
             sel_anchor: None,
@@ -702,6 +746,105 @@ impl WyEditor {
 
     pub(crate) fn images_gen(&self) -> u64 {
         self.images_gen.get()
+    }
+
+    /* ---------- 数学排版（LaTeX → RenderImage；参考 zorite 的 MathStore） ---------- */
+
+    /// 公式排版槽（元素 build/paint 只读查询）。
+    pub(crate) fn math_slots(
+        &self,
+    ) -> Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>> {
+        self.math_slots.clone()
+    }
+
+    /// 排版完成代数（Loading→Ready/Failed 自增，纳入帧缓存键）。
+    pub(crate) fn math_gen(&self) -> u64 {
+        self.math_gen.get()
+    }
+
+    /// 扫描当前内容里的 `$$…$$` 块 + `$…$` 行内公式，对尚未排版的发起离屏排版；
+    /// 幂等（已占用槽的不重复发起），主题色变化清缓存。每次 paint 前调一次，
+    /// `math_scanned_gen` 挡掉同代重复扫描。
+    pub(crate) fn sync_math(&mut self, cx: &mut Context<Self>) {
+        let color = math_color(&self.theme);
+        let cgen = self.content_gen.get();
+        let color_changed = self.math_color.borrow().as_ref() != Some(&color);
+        if color_changed {
+            self.math_color.borrow_mut().replace(color);
+            self.math_slots.borrow_mut().clear();
+        }
+        if !color_changed && self.math_scanned_gen.get() == cgen {
+            return;
+        }
+        self.math_scanned_gen.set(cgen);
+
+        // 收集块 + 行内公式 LaTeX 源码（键 = 去定界符后的源码，同 zorite 的 MathStore）。
+        let content = self.content.as_ref().to_string();
+        // (槽键, 排版边距, 要排版的 LaTeX)：块用 `PAD`；行内用 `INLINE_PAD` 且键带
+        // `inline:` 前缀（否则与块公式同键、且行内吃不到小 PAD 的紧凑位图）。
+        let mut sources: Vec<(SharedString, f32, String)> = Vec::new();
+        for reg in markdown_syntax::math_regions(&content) {
+            let s = reg.source.trim();
+            if !s.is_empty() && s != "$$" {
+                sources.push((s.to_string().into(), math_typeset::PAD, s.to_string()));
+            }
+        }
+        for line in content.split('\n') {
+            for span in markdown_syntax::inline_math_spans(line) {
+                let lx = markdown_syntax::inline_math_latex(line, &span).trim();
+                if !lx.is_empty() {
+                    sources.push((
+                        inline_math_key(lx),
+                        math_typeset::INLINE_PAD,
+                        lx.to_string(),
+                    ));
+                }
+            }
+        }
+        for (key, pad, latex) in sources {
+            let mut slots = self.math_slots.borrow_mut();
+            if slots.contains_key(key.as_ref()) {
+                continue;
+            }
+            slots.insert(key.clone(), MathSlot::Loading);
+            drop(slots);
+            // 离屏排版（纯 CPU；与 zorite `ensure_math_loaded` 同构）。
+            let slots = self.math_slots.clone();
+            let color2 = color;
+            let latex2 = latex.clone();
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        math_typeset::render_latex_with_pad(
+                            &latex2,
+                            math_typeset::FONT_SIZE,
+                            math_typeset::DPR,
+                            color2,
+                            pad,
+                        )
+                        .map(|r| (r.image, r.width, r.height))
+                    })
+                    .await;
+                let slot = match result {
+                    Some((img, w, h)) => MathSlot::Ready(img, w, h),
+                    None => MathSlot::Failed,
+                };
+                let slots2 = slots.clone();
+                let should_bump = slots2.borrow_mut().insert(key.clone(), slot).is_none();
+                if should_bump {
+                    let _ = this.update(cx, |e, ecx| e.on_math_ready(ecx));
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// 一个公式排版完成：自增代数 → 帧缓存失效（下次 measure 以真实高度重建）。
+    fn on_math_ready(&mut self, cx: &mut Context<Self>) {
+        self.math_gen.set(self.math_gen.get().wrapping_add(1));
+        *self.frame.borrow_mut() = None;
+        cx.notify();
     }
 
     /* ---------- 光标 ↔ 源辅助 ---------- */

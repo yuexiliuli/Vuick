@@ -8,11 +8,13 @@
 //! `(content_gen, width, band)` 命中后整帧跳过重建。
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     App, Bounds, Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Point, SharedString, TextAlign, TextRun, Window, fill, point, px, relative, size,
+    Pixels, Point, RenderImage, SharedString, TextAlign, TextRun, Window, fill, point, px, relative,
+    size,
 };
 
 /// 行首 gutter 几何常量（paint 与 hit-test 共用，不得分开改）。
@@ -105,12 +107,19 @@ pub(crate) enum RowGutter {
 }
 
 /// 行内 `$…$` 数学：splice 后的 spacer 位置 + 要绘制的 LaTeX 文本。
-#[derive(Clone, Debug)]
+/// （不 derive Debug：`RenderImage` 未实现 `Debug`。）
+#[derive(Clone)]
 pub(crate) struct InlineMathText {
     /// spacer 起始渲染字节。
     pub display_off: usize,
     /// 去定界符后的 LaTeX（paint 以斜体排版绘制）。
     pub latex: SharedString,
+    /// 已就绪的排版位图 + 逻辑（typeset em）px 尺寸；`Some` 时 paint 画 `RenderImage`
+    /// 覆盖 spacer（参考 zorite `shape_inline_math`），`None` = 排版中/失败 → 画斜体 Unicode。
+    /// `w`/`h` 是 22px 排版下的原始尺寸，画图按 `inline_math_fit_h` 再缩放。
+    pub ready: Option<(Arc<RenderImage>, f32, f32)>,
+    /// 所在 `row.wrapped` 的 BlockLine 索引（`shape_text_row` 撑高后填，paint 定位用）。
+    pub line: usize,
 }
 
 /// 行内 `![alt](src)`：源 src + 显示区（alt 文本覆盖），paint 加载后画缩略图。
@@ -160,6 +169,8 @@ pub(crate) struct Frame {
     pub rgen: u64,
     /// 本帧图片加载代数；帧缓存键之一（占位→真实尺寸后必须重建）。
     pub igen: u64,
+    /// 本帧数学排版代数；帧缓存键之一（Loading→就绪后卡片高变大，必须重建）。
+    pub mgen: u64,
 }
 
 pub(crate) struct ShapedRow {
@@ -287,12 +298,20 @@ fn kind_tag(k: RowKind) -> u8 {
     }
 }
 
-/// 文本块的高度缓存键：`(内容代数, 图片加载代数, 源行, 类型, shaping 宽)`。
-fn height_cache_key(rgen: u64, igen: u64, src_line: u32, kind: RowKind, width_bits: u32) -> u64 {
+/// 文本块的高度缓存键：`(内容代数, 图片/数学加载代数, 源行, 类型, shaping 宽)`。
+fn height_cache_key(
+    rgen: u64,
+    igen: u64,
+    mgen: u64,
+    src_line: u32,
+    kind: RowKind,
+    width_bits: u32,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     rgen.hash(&mut h);
     igen.hash(&mut h);
+    mgen.hash(&mut h);
     src_line.hash(&mut h);
     kind_tag(kind).hash(&mut h);
     width_bits.hash(&mut h);
@@ -388,15 +407,18 @@ fn text_style_for(kind: IrKind, theme: &WyTheme) -> RowTextStyle {
     }
 }
 
-/// 行内 `$…$` 数学：把 display 文本里的公式 splice 成空格 spacer（宽度≈斜体排版后的
-/// latex 宽，`splice_inline_math` 把 spacer 映射回公式源位），paint 期再在 spacer 处画
-/// 斜体 latex。返回重写后的 (display, gpui runs, byte_map) + 每处公式位置。
+/// 行内 `$…$` 数学：把 display 文本里的公式 splice 成空格 spacer（宽度≈排版后的
+/// latex 宽，`splice_inline_math` 把 spacer 映射回公式源位），paint 期再在 spacer 处
+/// 画排版位图（已就绪）/ 斜体 latex（排版中或失败）。返回重写后的
+/// `(display, gpui runs, byte_map)` + 每处公式位置。
 fn splice_math_text(
+    editor: &WyEditor,
     window: &mut Window,
     rtext: &str,
     runs: Vec<TextRun>,
     map: Vec<usize>,
     fs: Pixels,
+    lh: Pixels,
     base_font: &gpui::Font,
     math_font: &gpui::Font,
     math_color: Hsla,
@@ -412,30 +434,57 @@ fn splice_math_text(
         let run = [TextRun { len: 1, font: base_font.clone(), color: math_color, ..Default::default() }];
         f32::from(window.text_system().shape_line(" ".into(), fs, &run, None).width()).max(1.)
     };
+    let slots = editor.math_slots();
     let mut formulas: Vec<(Range<usize>, usize)> = Vec::new();
-    let mut latexes: Vec<SharedString> = Vec::new();
+    let mut maths: Vec<InlineMathText> = Vec::new();
     for span in spans {
         if in_code(&span) {
             continue;
         }
         let latex = markdown_syntax::inline_math_latex(rtext, &span);
-        if latex.is_empty() {
+        if latex.trim().is_empty() {
             continue;
         }
-        // 无光栅渲染器：把 LaTeX 转成 Unicode 排版（上/下标、希腊字母、符号），
-        // 按排版后的宽度预留 spacer，paint 期照此绘制。
+        // 排版已就绪：spacer 宽 = 位图逻辑宽（按正文行字号缩放；store 按 FONT_SIZE 排）。
+        // 排版中/失败：回退 Unicode 排版宽（paint 照旧画斜体 Unicode 文本）。
+        let ready: Option<(Arc<RenderImage>, f32, f32)> = match slots
+            .borrow()
+            .get(super::inline_math_key(latex.trim()).as_ref())
+            .cloned()
+        {
+            Some(super::MathSlot::Ready(img, w, h)) => Some((img, w, h)),
+            _ => None,
+        };
         let shown = math_to_unicode(latex);
-        if shown.is_empty() {
-            continue;
-        }
-        // 行内数学不应含换行（`\\` 行断在这里展开成空格）。
         let shown = shown.replace('\n', " ");
-        let run = [TextRun { len: shown.len(), font: math_font.clone(), color: math_color, ..Default::default() }];
-        let w = f32::from(window.text_system().shape_line(shown.clone().into(), fs, &run, None).width());
-        let n = (w / space_w).ceil() as usize;
+        let (w, n, paint_ready) = match ready {
+            Some((img, w, h)) => {
+                // spacer 宽 = 显示宽（`inline_math_fit_h` 缩放，供 paint 同式画图）。
+                let fit = inline_math_fit_h(fs, lh, h);
+                let scale = if h > 0.0 {
+                    fit / h
+                } else {
+                    f32::from(fs) / super::math_typeset::FONT_SIZE
+                };
+                let lw = (w * scale).max(1.);
+                (lw.max(1.), (lw / space_w).ceil().max(1.0) as usize, Some((img, w, h)))
+            }
+            None => {
+                if shown.is_empty() {
+                    continue;
+                }
+                let run = [TextRun { len: shown.len(), font: math_font.clone(), color: math_color, ..Default::default() }];
+                let w = f32::from(window.text_system().shape_line(shown.clone().into(), fs, &run, None).width());
+                let n = (w / space_w).ceil() as usize;
+                if n == 0 {
+                    continue;
+                }
+                (w, n.max(1), None)
+            }
+        };
         if n > 0 {
             formulas.push((span, n.max(1)));
-            latexes.push(shown.into());
+            maths.push(InlineMathText { display_off: 0, latex: shown.into(), ready: paint_ready, line: 0 });
         }
     }
     if formulas.is_empty() {
@@ -446,14 +495,39 @@ fn splice_math_text(
         markdown_syntax::splice_inline_math(rtext, &runs, &map, &formulas, &gap);
     let maths = places
         .into_iter()
-        .zip(latexes)
-        .map(|(pl, latex)| InlineMathText { display_off: pl.display_off, latex })
+        .zip(maths)
+        .map(|(pl, mut m)| {
+            m.display_off = pl.display_off;
+            m
+        })
         .collect();
     (nd, nr, nm, maths)
 }
 
+/// 行内公式撑高的**上限**（× 正文行高）：`\int_0^1 x^2 dx` 这类带上下限的算子公式在
+/// 22px 排版下比正文行高出很多——**只对这类超高公式**压到该倍数（保持可读），其余
+/// 公式用 `INLINE_PAD` 紧凑光栅后本就贴着行高、不被改、也不把行撑高。
+const INLINE_MATH_BAND: f32 = 1.6;
+
+/// 行内公式的显示高（px）：原生按正文行字号缩放（`fs/FONT_SIZE × 图高`），但 ≤
+/// `INLINE_MATH_BAND × 行高`（只压超高算子公式）。shape（spacer/行高）与 paint
+/// （画图）都用它——宽/高永远一致。
+fn inline_math_fit_h(fs: Pixels, lh: Pixels, h: f32) -> f32 {
+    let base = f32::from(fs) / super::math_typeset::FONT_SIZE;
+    let cap = f32::from(lh) * INLINE_MATH_BAND;
+    (base * h).clamp(1.0, cap)
+}
+
+/// display_off 落在 `wrapped` 里的第几个 BlockLine。文本块一源码行 = 一个
+/// BlockLine（行内数学/折行都在其内，spacer 属于首个）→ 恒 0。
+fn visual_block_line_for_index(wrapped: &[gpui::WrappedLine], _off: usize) -> usize {
+    let _ = wrapped;
+    0
+}
+
 /// 文本块（段落/标题/引述/列表/分隔线/空行）：按类型行样式形状成折行可视行。
 fn shape_text_row(
+    editor: &WyEditor,
     r: DocRow,
     window: &mut Window,
     width: Pixels,
@@ -487,15 +561,17 @@ fn shape_text_row(
     // 行内数学 `$…$`：斜体 math 字体排版宽度 → splice 成空格 spacer（B2）。
     let mut math_font = theme.font.clone();
     math_font.style = gpui::FontStyle::Italic;
-    let (rtext, runs2, map2, inline_maths) = splice_math_text(
+    let (rtext, runs2, map2, mut inline_maths) = splice_math_text(
+        editor,
         window,
         r.text.as_ref(),
         runs,
         r.byte_map.clone(),
         st.fs,
+        st.lh,
         &base,
         &math_font,
-        theme.accent,
+        super::math_color(theme),
         &code_ranges,
     );
     let wrapped = window
@@ -513,6 +589,20 @@ fn shape_text_row(
     if height <= st.pad {
         height = st.lh + st.pad;
         sub_heights.push(st.lh);
+    }
+    // 行内公式超行高：撑高所在 BlockLine（公式保持可读，不再压扁），paint 期按撑高后
+    // 的 `sub_heights` 定位文本与公式——否则 `\int_0^1 x^2 dx` 会盖住上一行/或被缩太小。
+    for im in &mut inline_maths {
+        let Some((_, _, h)) = im.ready else { continue };
+        let li = visual_block_line_for_index(&wrapped, im.display_off);
+        im.line = li;
+        let fit = inline_math_fit_h(st.fs, st.lh, h);
+        let need = fit.max(f32::from(sub_heights[li]));
+        let old = f32::from(sub_heights[li]);
+        if need > old {
+            height += px(need - old);
+            sub_heights[li] = px(need);
+        }
     }
     let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
@@ -567,7 +657,7 @@ fn shape_text_row_decorated(
             gutter = Some(RowGutter::Alert { kind: akind, fold });
         }
     }
-    let mut srow = shape_text_row(r.clone(), window, width, theme, base_font);
+    let mut srow = shape_text_row(editor, r.clone(), window, width, theme, base_font);
     // C1: 列表/任务行首装饰 + 正文缩进（与预览一致：正文色符号 + 缩进）。
     if r.kind == IrKind::Bullet {
         if let Some(g) = bullet_gutter(&raw) {
@@ -634,15 +724,6 @@ fn bullet_gutter(raw: &str) -> Option<RowGutter> {
         return Some(RowGutter::Ordered(format!("{}.", &t[..digits])));
     }
     None
-}
-
-/// 行内数学的显示色（与链接蓝区分：公式用紫）。
-fn math_color(theme: &WyTheme) -> Hsla {
-    let mut c: Hsla = gpui::rgb(0x6d5bd0).into();
-    if theme.is_dark {
-        c.l = (c.l + 0.18).clamp(0.05, 1.);
-    }
-    c
 }
 
 const LATEX_SYMBOLS: &[(&str, char)] = &[
@@ -746,41 +827,63 @@ fn read_group_opt(cs: &[char], pos: usize) -> (Option<String>, usize) {
     }
 }
 
-/// 裸露 LaTeX → Unicode 排版（无光栅渲染器时的「公式感」显示）。
-/// 处理上下标（`^`/`_`，含 `{…}` 组）、`\frac`/`\sqrt`/`\text` 等、希腊字母与常用符号。
-fn math_to_unicode(src: &str) -> String {
+/// 子/上标在**卡片**里的视觉分档：`Sup` = 上标（小一号 + 上移）、`Sub` = 下标（小一号 + 下移）。
+/// 字符串版 `math_to_unicode` 用 Unicode 上/下标码位（`ᵢ₌₁ⁿ` 这类），但 `∞` 等没有码位
+/// 只能正文大小平排 → `∫₋∞∞` 的极限看起来不对。卡片改用 `math_to_segments` + 字号/偏移。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MathPos {
+    Normal,
+    Sub,
+    Sup,
+}
+
+#[derive(Clone, Debug)]
+struct MathSeg {
+    text: String,
+    pos: MathPos,
+}
+
+/// 同 `math_to_unicode` 的扫描，但把顶层 `^{…}`/`_{…}` 拆成独立段（Sup/Sub）。
+/// 普通文本兜底进 Normal 段，`\frac/\sqrt/\text` 等命令整体仍按 math_to_unicode 转进
+/// Normal 段（组内嵌套的 `^`/`_` 在递归里转成 Unicode 码位即可，不再细分）。
+fn math_to_segments(src: &str) -> Vec<MathSeg> {
     let cs: Vec<char> = src.chars().collect();
-    let mut out = String::with_capacity(src.len());
+    let mut segs: Vec<MathSeg> = Vec::new();
+    let mut buf = String::with_capacity(src.len());
     let mut i = 0;
+    let mut flush = |segs: &mut Vec<MathSeg>, buf: &mut String| {
+        if !buf.is_empty() {
+            segs.push(MathSeg { text: std::mem::take(buf), pos: MathPos::Normal });
+        }
+    };
     while i < cs.len() {
         match cs[i] {
             '{' | '}' => i += 1,
             '^' => {
+                flush(&mut segs, &mut buf);
                 let (g, ni) = read_group(&cs, i + 1);
-                // 组内还可能有命令（如 `e^{-x^2}` / `^{\infty}`）→ 先整体转一遍再上标化。
                 let g = math_to_unicode(&g);
                 let mut t = String::new();
                 for c in g.chars() {
                     t.push(sup_map(c).unwrap_or(c));
                 }
-                out.push_str(&t);
+                segs.push(MathSeg { text: t, pos: MathPos::Sup });
                 i = ni;
             }
             '_' => {
+                flush(&mut segs, &mut buf);
                 let (g, ni) = read_group(&cs, i + 1);
                 let g = math_to_unicode(&g);
                 let mut t = String::new();
                 for c in g.chars() {
                     t.push(sub_map(c).unwrap_or(c));
                 }
-                out.push_str(&t);
+                segs.push(MathSeg { text: t, pos: MathPos::Sub });
                 i = ni;
             }
             '\\' => {
-                // `\\`（行断 / 矩阵对齐里的换行）→ 换行符（否则残留为字面 `\`，数学块
-                // 里 `a = b \\ c = d` 会显示成垃圾）。
                 if cs.get(i + 1) == Some(&'\\') {
-                    out.push('\n');
+                    buf.push('\n');
                     i += 2;
                     continue;
                 }
@@ -790,8 +893,6 @@ fn math_to_unicode(src: &str) -> String {
                 }
                 let name: String = cs[i + 1..j].iter().collect();
                 match name.as_str() {
-                    // `\begin{matrix}` / `\end{pmatrix}` 之类环境：剥掉环境名（矩阵/
-                    // cases/aligned 等直接在字符层面显示，不再泄漏 `\begin{...}` 文本）。
                     "begin" | "end" => {
                         if let (Some(_), ni) = read_group_opt(&cs, j) {
                             i = ni;
@@ -799,10 +900,8 @@ fn math_to_unicode(src: &str) -> String {
                             i = j;
                         }
                     }
-                    // 对齐分隔符：矩阵/对齐环境里的 `&` 是列分隔 → 空格（输出排开）。
-                    // 单独处理 `&`：保持可读。
                     "cr" | "hfill" => {
-                        out.push('\n');
+                        buf.push('\n');
                         i = j;
                     }
                     "frac" | "tfrac" | "dfrac" => {
@@ -812,25 +911,25 @@ fn math_to_unicode(src: &str) -> String {
                             None => (None, j),
                         };
                         if let Some(a) = &a {
-                            out.push_str(&math_to_unicode(a));
+                            buf.push_str(&math_to_unicode(a));
                         }
-                        out.push('/');
+                        buf.push('/');
                         if let Some(b) = &b {
-                            out.push_str(&math_to_unicode(b));
+                            buf.push_str(&math_to_unicode(b));
                         }
                         i = nj;
                     }
                     "sqrt" => {
-                        out.push('√');
+                        buf.push('√');
                         let (g, ni) = read_group_opt(&cs, j);
                         match g {
                             Some(g) => {
                                 if g.chars().count() > 1 {
-                                    out.push('(');
-                                    out.push_str(&math_to_unicode(&g));
-                                    out.push(')');
+                                    buf.push('(');
+                                    buf.push_str(&math_to_unicode(&g));
+                                    buf.push(')');
                                 } else {
-                                    out.push_str(&math_to_unicode(&g));
+                                    buf.push_str(&math_to_unicode(&g));
                                 }
                             }
                             None => {}
@@ -840,7 +939,7 @@ fn math_to_unicode(src: &str) -> String {
                     "text" | "mathrm" | "mathit" | "operatorname" | "mbox" => {
                         let (g, ni) = read_group_opt(&cs, j);
                         if let Some(g) = g {
-                            out.push_str(&math_to_unicode(&g));
+                            buf.push_str(&math_to_unicode(&g));
                         }
                         i = ni;
                     }
@@ -848,24 +947,34 @@ fn math_to_unicode(src: &str) -> String {
                     | "small" | "limits" | "nolimits" => i = j,
                     _ => {
                         if let Some(sym) = LATEX_SYMBOLS.iter().find(|(n, _)| *n == name) {
-                            out.push(sym.1);
+                            buf.push(sym.1);
                         }
                         i = j;
                     }
                 }
             }
             c => {
-                // 矩阵/对齐环境的列分隔符 → 空格（对齐排开，不显示裸 `&`）。
                 if c == '&' {
-                    out.push(' ');
+                    buf.push(' ');
                 } else {
-                    out.push(c);
+                    buf.push(c);
                 }
                 i += 1;
             }
         }
     }
-    out
+    flush(&mut segs, &mut buf);
+    segs
+}
+
+/// 裸露 LaTeX → Unicode 排版（无光栅渲染器时的「公式感」显示）。
+/// 处理上下标（`^`/`_`，含 `{…}` 组）、`\frac`/`\sqrt`/`\text` 等、希腊字母与常用符号。
+/// 行内数学继续用这个扁平字符串版；**卡片**走 `math_to_segments`（细分段、可缩小+偏移）。
+fn math_to_unicode(src: &str) -> String {
+    math_to_segments(src)
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
 }
 
 /// mermaid 节点形状。
@@ -1670,8 +1779,14 @@ fn math_display_lines(src: &str) -> Vec<String> {
     out
 }
 
-/// 数学块卡片高度：顶部标签留白 + 每行 LaTeX 一行。
-fn math_card_height(reg: &MathRegion, _theme: &WyTheme) -> Pixels {
+/// 数学块卡片高度：已排版就绪 → 顶部标签留白 + 图片逻辑高；否则回退
+/// Unicode 逐行（`20 + n×行高`）。两分支都与 `paint_card` 对应。
+fn math_card_height(editor: &WyEditor, reg: &MathRegion) -> Pixels {
+    if let Some(super::MathSlot::Ready(_, _, h)) =
+        editor.math_slots().borrow().get(reg.source.as_str())
+    {
+        return px(20. + h.max(16.));
+    }
     let n = math_display_lines(&reg.source).len();
     px(20. + n as f32 * 22.)
 }
@@ -1750,6 +1865,7 @@ pub(crate) fn build_frame(
             width,
             rgen,
             igen: editor.images_gen(),
+            mgen: editor.math_gen(),
         };
     }
 
@@ -1757,6 +1873,7 @@ pub(crate) fn build_frame(
     let avail = (f32::from(width) - f32::from(padding) * 2.).max(1.);
     let width_bits = f32::from(width).to_bits();
     let igen = editor.images_gen();
+    let mgen = editor.math_gen();
 
     // 结构扫描（O(n) 行扫描，随内容代变化；build_frame 每代顶多跑一次）。
     let content = editor.content();
@@ -1817,7 +1934,7 @@ pub(crate) fn build_frame(
                 // 与 shape 高同式（代码 = (行数+2)×code_line）——入缓存反而会用
                 // `line_h × 行数`（正文行高×n）重建出错误高度（比真实矮 2 行代码高）。
                 RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
-                    Some(height_cache_key(rgen, igen, meta.src_line, meta.kind, width_bits))
+                    Some(height_cache_key(rgen, igen, mgen, meta.src_line, meta.kind, width_bits))
                 }
                 _ => None,
             }
@@ -1825,7 +1942,7 @@ pub(crate) fn build_frame(
         let h = if collapsed(srcline) {
             px(0.)
         } else if let Some(idx) = math_card {
-            math_card_height(&math_regions[idx], theme)
+            math_card_height(editor, &math_regions[idx])
         } else if is_mermaid {
             // 由围栏内容行重建源码算卡片高（与 shape_code_row 一致）。
             let mut src = String::new();
@@ -1950,7 +2067,7 @@ pub(crate) fn build_frame(
         total += sr.height;
         rows.push(sr);
     }
-    Frame { padding, line_h, rows, total, band, width, rgen, igen }
+    Frame { padding, line_h, rows, total, band, width, rgen, igen, mgen }
 }
 
 /// 源列 → 渲染列（左界：首个 `byte_map[v] >= target`；与 `display_to_source` 互逆，
@@ -1974,6 +2091,18 @@ fn render_point_of(wrapped: &[gpui::WrappedLine], line_h: Pixels, dcol: usize) -
     } else {
         point(px(0.), px(0.))
     }
+}
+
+/// 文本行正文因行内公式撑高而整体下移的量（px；未撑高 = 0）——paint 文本/公式、
+/// 光标几何、点击命中、选区、链接 hitbox 必须共用，否则撑高行上光标/点击/选区
+/// 会错位（用户实测：点击该行闪烁光标位置不对）。
+fn text_row_shift(row: &ShapedRow) -> f32 {
+    let Some(w0) = row.wrapped.first() else {
+        return 0.0;
+    };
+    let band = row.sub_heights.get(0).copied().unwrap_or(row.lh);
+    let orig = row.lh * (w0.wrap_boundaries().len() + 1) as f32;
+    ((f32::from(band) - f32::from(orig)) / 2.).max(0.)
 }
 
 /// 代码块内 dy（相对块首 y）→ 源码行组序号（`sub_heights` 累积；块首 1 行空白带
@@ -2172,10 +2301,10 @@ fn caret_geometry(
         // `source_offset_at` 的反查互为逆映射，光标才落在点击处。
         let target = col.min(line_end.saturating_sub(line_start));
         let dcol = source_to_display(&r.byte_map, target);
-        // 折行时 p.y 是子行偏移，叠加到块首才算准缓存所在的可视行。
+        // 折行时 p.y 是子行偏移，叠加到块首 + 撑高下移才算准缓存所在的可视行。
         let p = render_point_of(&r.wrapped, r.lh, dcol);
         // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
-        return (true, px(12.) + r.x_off + p.x, r.top + p.y);
+        return (true, px(12.) + r.x_off + p.x, r.top + px(text_row_shift(r)) + p.y);
     }
     let fallback_lh = rows.first().map_or(px(20.), |r| r.lh);
     let y = rows.last().map_or(fallback_lh, |r| r.top + r.height);
@@ -2244,11 +2373,12 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
             }
             if let Some(w0) = r.wrapped.first() {
                 // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
-                // （`rel_y - top`）：`closest_index_for_position` 据此选折行的第几
-                // 可视行——写成 0 会把第二行的点击映射回第一行。
+                // （`rel_y - top - 撑高下移`）：`closest_index_for_position` 据此选折行的
+                // 第几可视行——写成 0 或漏掉下移量会把撑高行上的点击映射错行/错列。
                 let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
                     .max(0.);
-                let rel = point(px(rel_x), px(rel_y - top));
+                let sub_y = (rel_y - top - text_row_shift(r)).max(0.);
+                let rel = point(px(rel_x), px(sub_y));
                 // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
                 // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。
                 let dcol = match w0.closest_index_for_position(rel, r.lh) {
@@ -2361,8 +2491,8 @@ pub(crate) fn link_hit_at(
             ) else {
                 continue;
             };
-            let p0y = top + f32::from(p0.y);
-            let p1y = top + f32::from(p1.y);
+            let p0y = top + text_row_shift(r) + f32::from(p0.y);
+            let p1y = top + text_row_shift(r) + f32::from(p1.y);
             let contains = if f32::from(p0.y) == f32::from(p1.y) {
                 let x0 = ox + f32::from(p0.x);
                 let x1 = ox + f32::from(p1.x);
@@ -2702,8 +2832,9 @@ fn paint_inline_code_pills(
         return;
     };
     let line_h = row.lh.as_f32();
+    let shift = text_row_shift(row);
     let text_origin_x = origin.x.as_f32() + f.padding.as_f32() + f32::from(row.x_off);
-    let text_origin_y = origin.y.as_f32() + row.top.as_f32();
+    let text_origin_y = origin.y.as_f32() + row.top.as_f32() + shift;
     for range in &row.code_ranges {
         let Some(p0) = wl.position_for_index(range.start, row.lh) else {
             continue;
@@ -2750,6 +2881,8 @@ fn paint_inline_code_pills(
 }
 
 /// 文本块（段落/标题/引述等可编辑行）逐可视行绘制（x 含行级缩进 `row.x_off`）。
+/// 行高按 `sub_heights`（行内公式会把所在行撑高，见 `shape_text_row`）；撑高时该
+/// BlockLine 的文本组在带内垂直居中（公式在其行的上下溢出留白差异由此吸收）。
 fn paint_text_row(
     origin: Point<Pixels>,
     theme: &WyTheme,
@@ -2760,11 +2893,18 @@ fn paint_text_row(
 ) {
     // 行内代码圆角 pill 底先画（同一 layout 的像素几何），再画文字。
     paint_inline_code_pills(origin, theme, f, row, window);
-    let mut sub_top = row.top;
-    for wl in &row.wrapped {
-        let o = point(origin.x + f.padding + row.x_off, origin.y + sub_top);
+    let mut band_top = row.top;
+    for (k, wl) in row.wrapped.iter().enumerate() {
+        let band_h = row.sub_heights.get(k).copied().unwrap_or(row.lh);
+        let orig = row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+        // 撑高后的下移：文本组在 [band_top, band_top+band_h] 里垂直居中。
+        let shift = ((f32::from(band_h) - f32::from(orig)) / 2.).max(0.);
+        let o = point(
+            origin.x + f.padding + row.x_off,
+            origin.y + band_top + px(shift),
+        );
         let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
-        sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
+        band_top += band_h;
     }
 }
 
@@ -2898,18 +3038,40 @@ fn paint_alert_chrome(
     let lrun = [TextRun { len: label.len(), font: lfont, color, ..Default::default() }];
     let lline = window.text_system().shape_line(label.clone(), theme.font_size, &lrun, None);
     let _ = lline.paint(point(x0 + px(6.), top0), row.lh, TextAlign::Left, None, window, cx);
-    // 折叠箭头（`-` 折叠 / `+` 展开 / 无 fold char 不画）。
+    // 折叠箭头（`-` 折叠 / `+` 展开 / 无 fold char 不画）：自绘实心小三角。
+    // 不用 `▸`/`▾` 字形——Segoe UI（Windows 系统 UI 字体）缺 U+25B8/25BE，GPUI 单族
+    // 无回退时会画成方框 tofu（「图标不对」）。PathBuilder::fill 画三角则字体无关，
+    // Windows / Ubuntu（换系统字体也不丢字形）都稳定。命中区仍是整条 gutter，不受影响。
     if let Some(folded) = fold {
-        let glyph: SharedString = if *folded { "▸" } else { "▾" }.into();
         let gx = x0 + px(6.) + lline.width() + px(4.);
-        let grun = [TextRun { len: glyph.len(), font: theme.font.clone(), color, ..Default::default() }];
-        let gline = window.text_system().shape_line(glyph, theme.font_size, &grun, None);
-        let _ = gline.paint(point(gx, top0), row.lh, TextAlign::Left, None, window, cx);
+        let cy = f32::from(top0) + f32::from(row.lh) * 0.5;
+        let w = 9.0_f32;
+        let h = 7.0_f32;
+        let ax = f32::from(gx) + 1.0;
+        let ay = cy - h * 0.5;
+        let mut p = gpui::PathBuilder::fill();
+        if *folded {
+            // ▸ 右向（已折叠，点击展开）
+            p.move_to(point(px(ax), px(ay)));
+            p.line_to(point(px(ax), px(ay + h)));
+            p.line_to(point(px(ax + w), px(cy)));
+        } else {
+            // ▾ 下向（展开，点击折叠）
+            p.move_to(point(px(ax + w * 0.5), px(ay + h)));
+            p.line_to(point(px(ax), px(ay)));
+            p.line_to(point(px(ax + w), px(ay)));
+        }
+        p.close();
+        if let Ok(path) = p.build() {
+            window.paint_path(path, color);
+        }
     }
 }
 
-/// 行内 `$…$` 数学：在 splice 出的 spacer 位置画斜体 LaTeX（B2）。
+/// 行内 `$…$` 数学：在 splice 出的 spacer 位置画排版位图（已就绪，参考 zorite
+/// `shape_inline_math`）/ 斜体 LaTeX（排版中或失败，B2 原路径）。
 fn paint_inline_maths(
+    editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
@@ -2924,14 +3086,52 @@ fn paint_inline_maths(
     let tx = origin.x + f.padding + row.x_off;
     let ty = origin.y + row.top;
     let fs = w0.unwrapped_layout.font_size;
+    let lh = row.lh;
+    // 主题色变化清缓存会改公式色，paint 期优先取当前槽（最新着色）；若刚好在
+    // 重排版窗口（Loading）则用 shape 期截获的位图兜底；都没有 → Unicode 文本。
     let mut mfont = theme.font.clone();
     mfont.style = gpui::FontStyle::Italic;
-    let mcolor = math_color(theme);
+    let mcolor = super::math_color(theme);
     for im in &row.extra.inline_maths {
         let Some(p) = w0.position_for_index(im.display_off, row.lh) else { continue };
+        let active = match editor
+            .read(cx)
+            .math_slots()
+            .borrow()
+            .get(super::inline_math_key(im.latex.trim()).as_ref())
+            .cloned()
+        {
+            Some(super::MathSlot::Ready(img, w, h)) => Some((img, w, h)),
+            _ => im.ready.clone(),
+        };
+        // 撑高行的 band 顶（前面 BlockLine 累计）+ 本带文本下移——与 `paint_text_row`
+        // 同源；`p.y` 是 shaped 行内 y（k×lh）。
+        let li = im.line.min(row.sub_heights.len().saturating_sub(1));
+        let band_top = row.sub_heights[..li].iter().map(|b| f32::from(*b)).sum::<f32>();
+        let band_h = row.sub_heights.get(li).copied().unwrap_or(row.lh);
+        let orig = lh * (w0.wrap_boundaries().len() + 1) as f32;
+        let shift = ((f32::from(band_h) - f32::from(orig)) / 2.).max(0.);
+        let line_y = ty + px(band_top + shift) + p.y;
+        if let Some((img, w, h)) = active {
+            // 位图就绪：按 `inline_math_fit_h`（字号 + 行高上限）缩放画在 spacer 上，
+            // 以该行文本中线为锚垂直居中（参考 zorite inline_renderer）。
+            let fit = inline_math_fit_h(fs, lh, h);
+            let scale = if h > 0.0 {
+                fit / h
+            } else {
+                f32::from(fs) / super::math_typeset::FONT_SIZE
+            };
+            let pw = (w * scale).max(1.);
+            let ph = (h * scale).max(1.);
+            let by = line_y + px((f32::from(row.lh) - ph) / 2.);
+            let b = Bounds::new(point(tx + p.x, by), size(px(pw), px(ph)));
+            let _ = window.paint_image(b, b, gpui::Corners::all(px(2.)), img, 0, false);
+            continue;
+        }
+        // 排版中/失败：斜体 Unicode 文本（定位同上）。
         let run = [TextRun { len: im.latex.len(), font: mfont.clone(), color: mcolor, ..Default::default() }];
         let line = window.text_system().shape_line(im.latex.clone(), fs, &run, None);
-        let _ = line.paint(point(tx + p.x, ty + p.y), row.lh, TextAlign::Left, None, window, cx);
+        let _ = line.paint(point(tx + p.x, line_y), row.lh, TextAlign::Left, None, window, cx);
     }
 }
 
@@ -2988,6 +3188,7 @@ fn paint_inline_images(
 
 /// 块级卡片（数学块 / Mermaid 图）的绘制：圆角面板 + 居中排版 / 占位提示。
 fn paint_card(
+    editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
@@ -3017,25 +3218,73 @@ fn paint_card(
             let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
             let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
             let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
-            // LaTeX 逐行居中排版（斜体、正文色）。行 = 源码换行 + `\\` 行断。
+            // 排版已就绪 → 画 `RenderImage`（参考 zorite：RaTeX 真排版——分式横线/根号/
+            // 极限上下标/求和限都按 LaTeX 排，取代 Unicode 近似）。未就绪/失败 → Unicode。
+            let slot = editor
+                .read(cx)
+                .math_slots()
+                .borrow()
+                .get(latex.as_str())
+                .cloned();
+            if let Some(super::MathSlot::Ready(img, w, h)) = slot {
+                let iw = w.max(1.);
+                let ih = h.max(1.);
+                let x = match align {
+                    MathAlign::Left => x0 + 16.,
+                    MathAlign::Center => x0 + ((content_w - iw) / 2.).max(8.),
+                    MathAlign::Right => x0 + (content_w - iw - 16.).max(8.),
+                };
+                let avail_h = (f32::from(row.height) - 20.).max(1.);
+                let y = top0 + 20. + ((avail_h - ih) / 2.).max(0.);
+                let b = Bounds::new(point(px(x), px(y)), size(px(iw), px(ih)));
+                let _ = window.paint_image(b, b, gpui::Corners::all(px(2.)), img, 0, false);
+                return;
+            }
+            // LaTeX 逐行排版（斜体、正文色）。行 = 源码换行 + `\\` 行断。
+            // 上下标拆成独立段（Sup/Sub）：小一号字体 + 上/下偏移——`∞` 等没有 Unicode
+            // 上/下标码位的字符也能正确显示为极限（`∫₋∞∞` → `∫` + 小 ∞ 下/上标）。
             let mut mfont = theme.font.clone();
             mfont.style = gpui::FontStyle::Italic;
             let lh = px(22.);
             let fs = (f32::from(theme.font_size) * 1.15).max(14.);
+            let ss_fs = (fs * 0.78).max(10.);
+            let sup_dy = (fs * 0.34).max(2.);
+            let sub_dy = (fs * 0.18).max(2.);
+            let mcolor = super::math_color(theme);
             let lines = math_display_lines(latex);
             let n = lines.len().max(1);
             let block_h = f32::from(row.height);
             let mut y = top0 + 10. + ((block_h - 20. - n as f32 * 22.) / 2.).max(0.);
             for shown in &lines {
-                let run = [TextRun { len: shown.len(), font: mfont.clone(), color: math_color(theme), ..Default::default() }];
-                let sh = window.text_system().shape_line(shown.clone().into(), px(fs), &run, None);
-                let w = f32::from(sh.width());
-                let x = match align {
+                let segs = math_to_segments(shown);
+                // 整行宽度 = 各段 shaping 宽之和（Normal 用 fs，Sub/Sup 用 ss_fs）。
+                let mut plan: Vec<(SharedString, f32, f32, MathPos)> = Vec::with_capacity(segs.len());
+                let mut total = 0.0_f32;
+                for s in &segs {
+                    let sfs = if s.pos == MathPos::Normal { fs } else { ss_fs };
+                    let run = [TextRun { len: s.text.len(), font: mfont.clone(), color: mcolor, ..Default::default() }];
+                    let sh = window.text_system().shape_line(s.text.clone().into(), px(sfs), &run, None);
+                    let w = f32::from(sh.width());
+                    total += w;
+                    plan.push((s.text.clone().into(), sfs, w, s.pos));
+                }
+                let start_x = match align {
                     MathAlign::Left => x0 + 16.,
-                    MathAlign::Center => x0 + ((content_w - w) / 2.).max(8.),
-                    MathAlign::Right => x0 + (content_w - w - 16.).max(8.),
+                    MathAlign::Center => x0 + ((content_w - total) / 2.).max(8.),
+                    MathAlign::Right => x0 + (content_w - total - 16.).max(8.),
                 };
-                let _ = sh.paint(point(px(x), px(y)), lh, TextAlign::Left, None, window, cx);
+                let mut cursor = start_x;
+                for (text, sfs, w, pos) in plan {
+                    let run = [TextRun { len: text.len(), font: mfont.clone(), color: mcolor, ..Default::default() }];
+                    let sh = window.text_system().shape_line(text, px(sfs), &run, None);
+                    let paint_y = match pos {
+                        MathPos::Normal => y,
+                        MathPos::Sup => y - sup_dy,
+                        MathPos::Sub => y + sub_dy,
+                    };
+                    let _ = sh.paint(point(px(cursor), px(paint_y)), lh, TextAlign::Left, None, window, cx);
+                    cursor += w;
+                }
                 y += 22.;
             }
         }
@@ -3171,7 +3420,7 @@ fn paint_selection(
                 None => continue,
             };
             let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
-            let y = r.top + p1.y.min(p0.y);
+            let y = r.top + px(text_row_shift(r)) + p1.y.min(p0.y);
             let w = f32::from(p1.x - p0.x).max(2.);
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
@@ -3242,13 +3491,18 @@ impl Element for WyEditorElement {
             // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
             let rgen = e.content_gen();
             let igen = e.images_gen();
+            let mgen = e.math_gen();
             let band = e.shape_band().unwrap_or((0., 6500.));
             let cached_total = e
                 .frame
                 .borrow()
                 .as_ref()
                 .filter(|f| {
-                    f.rgen == rgen && f.igen == igen && f.width == width && f.band == band
+                    f.rgen == rgen
+                        && f.igen == igen
+                        && f.mgen == mgen
+                        && f.width == width
+                        && f.band == band
                 })
                 .map(|f| f.total);
             let total = match cached_total {
@@ -3288,9 +3542,10 @@ impl Element for WyEditorElement {
         );
         self.editor.update(cx, |e, _| e.set_shape_band(Some(band)));
 
-        // 带移动 / 内容 / 宽度 / 图片加载变化 → 按新状态重建窗口化帧。
+        // 带移动 / 内容 / 宽度 / 图片/数学加载变化 → 按新状态重建窗口化帧。
         let rgen = self.editor.read(cx).content_gen();
         let igen = self.editor.read(cx).images_gen();
+        let mgen = self.editor.read(cx).math_gen();
         let width = {
             let f = self.editor.read(cx).frame.borrow();
             f.as_ref().map(|f| f.width).unwrap_or(px(800.))
@@ -3298,7 +3553,11 @@ impl Element for WyEditorElement {
         let stale = {
             let f = self.editor.read(cx).frame.borrow();
             f.as_ref().map_or(true, |f| {
-                f.rgen != rgen || f.igen != igen || f.width != width || f.band != band
+                f.rgen != rgen
+                    || f.igen != igen
+                    || f.mgen != mgen
+                    || f.width != width
+                    || f.band != band
             })
         };
         if stale {
@@ -3335,7 +3594,7 @@ impl Element for WyEditorElement {
                     continue;
                 };
                 let ox = bounds.origin.x + f.padding + row.x_off;
-                let oy = bounds.origin.y + row.top;
+                let oy = bounds.origin.y + row.top + px(text_row_shift(row));
                 for lk in &row.extra.links {
                     let (Some(p0), Some(p1)) = (
                         w0.position_for_index(lk.disp.start, row.lh),
@@ -3390,11 +3649,14 @@ impl Element for WyEditorElement {
         // `source_offset_at` 需用它把命中换算回元素局部坐标。
         self.editor
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
+        // 数学排版同步（幂等）：扫描新公式发起离屏排版；主题色变化清缓存。
+        self.editor
+            .update(cx, |e, ecx| e.sync_math(ecx));
         let origin = bounds.origin;
         for row in &f.rows {
             // 块级卡片（数学块 / Mermaid 图）优先自绘，跳过普通文本/代码路径。
             if let Some(card) = &row.extra.card {
-                paint_card(origin, &theme, f, row, card, window, cx);
+                paint_card(&self.editor, origin, &theme, f, row, card, window, cx);
                 continue;
             }
             // 非文本块按类型自绘：代码面板 / 表格网格 / 图片。
@@ -3445,7 +3707,7 @@ impl Element for WyEditorElement {
                 paint_text_row(origin, &theme, f, row, window, cx);
             }
             // 行内数学 / 行内图片叠加（B1/B2）。
-            paint_inline_maths(origin, &theme, f, row, window, cx);
+            paint_inline_maths(&self.editor, origin, &theme, f, row, window, cx);
             paint_inline_images(&self.editor, origin, f, row, window, cx);
         }
         // C5: 悬浮在可点击链接上 → hand 光标。
@@ -5079,6 +5341,184 @@ A-->B
         assert!(m.contains('1') && m.contains('2') && m.contains('3') && m.contains('4'));
         // 既有的普通公式仍工作。
         assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'));
+    }
+
+    #[test]
+    fn math_to_segments_split_sup_sub_for_limit_layout() {
+        // A1 回归：`∫_{-\infty}^{\infty}` 里 `∞` 没有 Unicode 上/下标码位，字符串版只能
+        // 正文大小平排（`∫₋∞∞`）。卡片现在把顶层 `^{…}`/`_{…}` 拆成 Sup/Sub 段 →
+        // 绘制时小字号 + 上下偏移，`∞` 也能正确显示成极限。
+        use super::{math_to_segments, math_to_unicode, MathPos};
+        let src = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}";
+        let segs = math_to_segments(src);
+        assert!(
+            segs.iter().any(|s| s.pos == MathPos::Sub && s.text.contains('∞')),
+            "下标组应拆出 Sub 段（含 ∞）：{segs:?}"
+        );
+        assert!(
+            segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('∞')),
+            "上标组应拆出 Sup 段（含 ∞）：{segs:?}"
+        );
+        // 平铺后 = 旧的扁平字符串（行内数学/兼容路径输出不变）。
+        let flat: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(flat, math_to_unicode(src), "segments 平铺应与 math_to_unicode 一致");
+        // `e^{-x^2}` 的指数也应在 Sup 段里。
+        assert!(
+            segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('²')),
+            "e^(-x^2) 的指数应在 Sup 段：{segs:?}"
+        );
+        // `\sum_{i=1}^{n}`：下标/上标各一段，且平铺含 ∑。
+        let sum_segs = math_to_segments(r"\sum_{i=1}^{n} i");
+        assert!(sum_segs.iter().any(|s| s.pos == MathPos::Sub && s.text.contains('ᵢ')));
+        assert!(sum_segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('ⁿ')));
+    }
+
+    #[test]
+    fn inline_math_fit_h_keeps_readable_size_within_band() {
+        // 行内公式「不能太小也不能溢出」的平衡（撑高行方案）：
+        // - 矮公式按原生字号缩放（fs/FONT_SIZE），不做额外缩小；
+        // - 高公式（22px 排 `\int_0^1` 约 70px）显示高 = 1× 字号缩放值，但封顶
+        //   `INLINE_MATH_BAND × 行高`（撑高行容纳，而不是压扁到 0.95×行高）。
+        use super::inline_math_fit_h;
+        let fs = px(16.);
+        let lh = px(19.);
+        // 矮公式：按原生字号缩放（fs/FONT_SIZE×h），不被行高压扁。
+        let short = inline_math_fit_h(fs, lh, 25.0);
+        assert!((short - 16.0 / 22.0 * 25.0).abs() < 1e-3, "矮公式按字号缩放：{short}");
+        assert!(short <= 19.0, "25px 高公式 × 字号缩放后仍在行高内：{short}");
+        // 中等公式：字号缩放略超行高 → 所在行会小幅撑高（不再压扁）。
+        let mid = inline_math_fit_h(fs, lh, 30.0);
+        assert!((mid - 16.0 / 22.0 * 30.0).abs() < 1e-3, "仍按字号缩放：{mid}");
+        // 高公式（`\int_0^1 x^2 dx` 22px 下 h≈70.5）：比旧 `0.95×行高`（≈18）大得多，
+        // 且绝不超 `INLINE_MATH_BAND × 行高`（只压超高算子公式，其余保持字号缩放）。
+        let tall = inline_math_fit_h(fs, lh, 70.5);
+        assert!(tall > 19.0 * 0.95, "超高算子仍大于 0.95×行高：{tall}");
+        assert!(tall <= 19.0 * 1.6 + 1e-3, "不超 1.6×行高上限：{tall}");
+        // 0 高兜底 ≥1px（不除零）。
+        assert!(inline_math_fit_h(fs, lh, 0.0) >= 1.0);
+    }
+
+    #[gpui::test]
+    fn sync_math_claims_block_and_inline_slots(cx: &mut TestAppContext) {
+        // 数学排版集成（参考 zorite ensure_content_math）：内容含 `$$…$$` 块 + `$…$`
+        // 行内公式 → `sync_math` 按「去定界符的 LaTeX」为键把两块都占为 Loading（真正
+        // 位图由后台 executor 光栅；CPU 级光栅正确性已由 math_typeset 单测覆盖）。
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "$$\n\\int_0^1 x^2 dx\n$$\n内联 $e^{i\\pi}+1=0$ 结束";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| e.sync_math(ecx));
+        });
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let slots = ed.read(cx).math_slots();
+            let b = slots.borrow();
+            assert!(
+                b.contains_key(r"\int_0^1 x^2 dx"),
+                "块公式应占位（Loading）：keys={:?}",
+                b.keys()
+            );
+            assert!(
+                b.contains_key(super::super::inline_math_key(r"e^{i\pi}+1=0").as_ref()),
+                "行内公式应占位（Loading，带 inline: 前缀键）：keys={:?}",
+                b.keys()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn math_card_height_uses_typeset_size_when_slot_ready(cx: &mut TestAppContext) {
+        // 数学排版切 RaTeX 后：公式就绪 → 卡片高按排版位图逻辑高（`20 + h`），
+        // 不再按 Unicode 行数（`20 + n×22`）——上限的分式/根号终于有足够高度。
+        use crate::markdown::live::markdown_syntax;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "$$\na \\\\ b\n$$"; // 两行 → Unicode 回退高 = 20+44=64
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            // 一个 40×24 的假位图逻辑尺寸 20×12（RenderImage 是纯数据构造，无需 GPU）。
+            let buf = image::RgbaImage::from_raw(40, 24, vec![0u8; 40 * 24 * 4]).unwrap();
+            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+            let latex = "a \\\\ b"; // math_regions 的 source（fenced 去 `$$` 后）
+            let ed = host.read(cx).ed.clone();
+            ed.read(cx).math_slots().borrow_mut().insert(
+                latex.to_string().into(),
+                super::super::MathSlot::Ready(img, 20., 12.),
+            );
+            let e = ed.read(cx);
+            let reg = markdown_syntax::math_regions(&e.content())
+                .into_iter()
+                .next()
+                .expect("应扫到一块公式");
+            assert_eq!(reg.source, "a \\\\ b");
+            // 就绪后高 = 20 + max(h,16) = 20+16 = 36（而非 Unicode 两行的 64）。
+            let h = super::math_card_height(&e, &reg);
+            assert_eq!(f32::from(h), 36.0, "就绪应占位排版高度，而非 Unicode 行高");
+            // 未就绪（新公式）→ 回退 Unicode 行高 = 20 + 2×22 = 64。
+            e.math_slots().borrow_mut().clear();
+            let h2 = super::math_card_height(&e, &reg);
+            assert_eq!(f32::from(h2), 64.0, "未就绪应回退 Unicode 逐行高");
+        });
+    }
+
+    #[gpui::test]
+    fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
+        // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
+        // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "a $\\int_0^1 x^2 dx$ b";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 注入就绪位图（假数据，纯 CPU，无需 GPU）：40×70 逻辑 px（≈22px 排版的
+            // `\int_0^1` 高）→ 行内 fit = min(fs/22×70, 2.2×行高) ≈ 41.8px > 行高 19。
+            let buf = image::RgbaImage::from_raw(80, 140, vec![0u8; 80 * 140 * 4]).unwrap();
+            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+            ed.read(cx).math_slots().borrow_mut().insert(
+                super::super::inline_math_key("\\int_0^1 x^2 dx"),
+                super::super::MathSlot::Ready(img, 40., 70.),
+            );
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = &frame.rows[0];
+            let lh = f32::from(row.lh);
+            let band = f32::from(row.height);
+            assert!(band > lh + 1.0, "行内公式应撑高行：band={band} > lh={lh}");
+            // 文本带 = [shift, shift+lh]（撑高的下移量，与 paint/公式同源）。
+            let w0 = row.wrapped.first().unwrap();
+            let orig = lh * (w0.wrap_boundaries().len() + 1) as f32;
+            let shift = ((band - orig) / 2.).max(0.);
+            let pad = f32::from(frame.padding);
+            // 点击文本带中部（正文 "a … b" 区域）→ 源偏移应落在行内。
+            let y = shift + lh / 2.;
+            let x = pad + 30.;
+            let off = super::source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+            let len = ed.read(cx).content().len() as f32;
+            assert!(off as f32 <= len, "点击应解析到行内源偏移：off={off}");
+            ed.update(cx, |e, _| e.set_caret(off));
+            let (on, _caretx, carety) = caret_geometry(ed.read(cx), &frame.rows);
+            assert!(on, "该行可放光标");
+            assert!(
+                f32::from(carety) >= shift - 1.0 && f32::from(carety) <= shift + lh + 1.0,
+                "光标 y {} 应在撑高后的文本带 [{shift}, {}] 内，不能回到块顶空白",
+                f32::from(carety),
+                shift + lh
+            );
+        });
     }
 
     #[gpui::test]
