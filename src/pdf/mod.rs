@@ -1127,10 +1127,6 @@ mod tests {
             let v = holder.borrow().as_ref().unwrap().read(cx);
             (v.page_width(), v.zoom, v.total_height)
         });
-        let (w1, z1, total1) = cx.update(|_w, cx| {
-            let v = holder.borrow().as_ref().unwrap().read(cx);
-            (v.page_width(), v.zoom, v.total_height)
-        });
         assert!(w1 > w0, "Ctrl+向上滚应放大：{w0} → {w1}");
         assert!(z1 > 1.0, "zoom 应 >1：{z1}");
         assert!(total1 > total0, "整列高应随缩放增大：{total0} → {total1}");

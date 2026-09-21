@@ -23,7 +23,10 @@ use gpui_component::input::{
 };
 
 use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES};
-use crate::syntax::{parse_code_lines, resolve_styles, EditTracker};
+use crate::syntax::{resolve_styles, EditTracker};
+
+#[cfg(test)]
+use crate::syntax::parse_code_lines;
 
 /// 一行的语义 run：**行内字节区间** → 语义名（与 GitHub 配色键一致）。
 type LineRuns = Vec<(Range<usize>, &'static str)>;

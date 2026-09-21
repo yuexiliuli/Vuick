@@ -467,7 +467,7 @@ fn merge_highlights_keeps_selection_within_line_and_non_overlapping() {
     }
     let covered: usize = merged
         .iter()
-        .filter(|(r, st)| st.background_color == Some(sel_bg))
+        .filter(|(_, st)| st.background_color == Some(sel_bg))
         .map(|(r, _)| r.end.min(sel.end).saturating_sub(r.start.max(sel.start)))
         .sum();
     assert_eq!(
@@ -1042,7 +1042,7 @@ fn bracket_guide_segments_span_each_pair(cx: &mut TestAppContext) {
     // 外层 impl 块：x≈0cw，y=(1+HEAD)lh 起、高 (5−HEAD+TAIL)lh（行 1..5 + 尾巴）。
     let impl_guide = segs
         .iter()
-        .find(|(x, y, h)| {
+        .find(|(_, y, h)| {
             (*y - (1.0 + HEAD) * lh).abs() < 0.5
                 && (*h - (5.0 - HEAD + TAIL) * lh).abs() < 0.5
         })
@@ -1097,7 +1097,7 @@ fn guide_click_highlights_pair_and_elsewhere_clears(cx: &mut TestAppContext) {
     // 语义（用户确认）：标尺不可点选；点体内某行 → 点亮该行所属**最内层**括号块竖线；
     // 点非块内行（如顶层）→ 清除。命中断言：行 3 ∈ Self 块 [2,4)、行 2 = 开行 → 外层。
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}\nfn other() {}";
-    let (host, mut cx) = open(cx, text);
+    let (host, cx) = open(cx, text);
     // 口径断言（不依赖鼠标坐标）。
     let (case, case2, case7) = cx.update(|_, cx| {
         let ed = host.read(cx).ed.read(cx);
@@ -1695,7 +1695,7 @@ fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
     // 修复：`new()` 直接以固定窗口 `LIST_WINDOW_ROWS` 初始化。
     use crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as WINDOW;
     cx.update(gpui_component::init);
-    let (host, mut cx) = cx.add_window_view(|_window, cx| {
+    let (host, cx) = cx.add_window_view(|_window, cx| {
         let ed = cx.new(|cx| CodeEditor::new(cx));
         Host { ed }
     });

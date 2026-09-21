@@ -228,7 +228,7 @@ fn runs_to_text_runs(
     base: &gpui::Font,
     color: gpui::Hsla,
     mono: &gpui::Font,
-    accent: gpui::Hsla,
+    _accent: gpui::Hsla,
     link: gpui::Hsla,
     code_inline_fg: gpui::Hsla,
 ) -> Vec<gpui::TextRun> {
@@ -479,7 +479,7 @@ fn splice_math_text(
         };
         let shown = math_to_unicode(latex);
         let shown = shown.replace('\n', " ");
-        let (w, n, paint_ready) = match ready {
+        let (_w, n, paint_ready) = match ready {
             Some((img, w, h)) => {
                 // spacer 宽 = 显示宽（`inline_math_fit_h` 缩放，供 paint 同式画图）。
                 let fit = inline_math_fit_h(fs, lh, h);
@@ -898,7 +898,7 @@ fn math_to_segments(src: &str) -> Vec<MathSeg> {
     let mut segs: Vec<MathSeg> = Vec::new();
     let mut buf = String::with_capacity(src.len());
     let mut i = 0;
-    let mut flush = |segs: &mut Vec<MathSeg>, buf: &mut String| {
+    let flush = |segs: &mut Vec<MathSeg>, buf: &mut String| {
         if !buf.is_empty() {
             segs.push(MathSeg { text: std::mem::take(buf), pos: MathPos::Normal });
         }
@@ -1650,7 +1650,7 @@ fn shape_table_row(
     let height = table_block_height(theme, rows.len());
     let mut aligns2 = aligns.clone();
     aligns2.resize(ncols, TableAlign::Left);
-    let mut rows2: Vec<Vec<gpui::SharedString>> = rows
+    let rows2: Vec<Vec<gpui::SharedString>> = rows
         .into_iter()
         .map(|mut rr| {
             rr.resize(ncols, gpui::SharedString::default());
@@ -3685,7 +3685,7 @@ fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &mut App) -> Option<Ran
 fn paint_selection(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
-    theme: &WyTheme,
+    _theme: &WyTheme,
     f: &Frame,
     range: &Range<usize>,
     window: &mut Window,
@@ -3895,7 +3895,7 @@ impl Element for WyEditorElement {
                 None => {
                     let frame = build_frame(e, window, width, band);
                     let total = frame.total;
-                    drop(e);
+                    let _ = e;
                     editor.update(cx, |er, _| {
                         *er.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
                     });
@@ -4462,7 +4462,7 @@ let c = 3;
             // 编辑排版：表头(1) + 数据行(2) = 3 个可见行，每行 2 格，源行号与块一致。
             let te = table.table_edit.as_ref().expect("表格应有编辑排版");
             assert_eq!(te.rows.len(), 3, "表头 + 2 数据行");
-            for (i, row) in te.rows.iter().enumerate() {
+            for (_, row) in te.rows.iter().enumerate() {
                 assert_eq!(row.cells.len(), 2, "每行 2 格");
             }
             assert_eq!(te.rows[0].src_line, 6, "表头源行");
@@ -4586,7 +4586,7 @@ let c = 3;
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, cx| {
                 e.set_caret("你好".len());
@@ -4615,7 +4615,7 @@ let c = 3;
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, cx| {
                 e.set_caret(0);
@@ -4640,7 +4640,7 @@ let c = 3;
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, cx| {
                 e.begin_selection_at(0);
@@ -4889,7 +4889,7 @@ let c = 333;
                 )));
             });
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let (blk, ctop, ctop_h, bar_x, bar_w, _thumb_x, thumb_w, max_scroll) = {
+            let (blk, ctop, ctop_h, bar_x, bar_w, _thumb_x, _thumb_w, max_scroll) = {
                 let code = frame
                     .rows
                     .iter()
@@ -5041,7 +5041,7 @@ tail
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, cx| {
                 // 光标落在首个代码行内输入 → 源文本在围栏内更新。
@@ -5098,7 +5098,7 @@ tail
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _cx| {
                 // 首内容行行首向上 → 「前段」段尾，光标不落进开围栏。
@@ -5334,7 +5334,7 @@ tail
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, cx| {
                 // 在数据行第一格 "a"（源行 2，位 2）内输入 X。
@@ -5386,7 +5386,7 @@ tail
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        vcx.update(|_, cx| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _cx| {
                 // 表头（行 0）down → 首数据行（行 2，跳过分隔行 1）。
@@ -5522,7 +5522,7 @@ A-->B
     fn mermaid_renders_diagram_to_image(cx: &mut TestAppContext) {
         // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
         // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
-        use super::{BlockCard, MmPlaced, mm_layout};
+        use super::{BlockCard, mm_layout};
         let _ = std::fs::create_dir_all(r"C:\Users\C22500~1\AppData\Local\Temp\kilo");
         const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
         cx.update(gpui_component::init);
@@ -5975,7 +5975,7 @@ graph TD
                 );
             }
             // 普通引述行不进入警报色表。
-            let plain = frame.rows.iter().find(|r| r.src_line == 4).unwrap();
+            let _ = frame.rows.iter().find(|r| r.src_line == 4).unwrap();
             assert!(!kinds.contains_key(&4), "普通引述不应走警报色");
         });
     }

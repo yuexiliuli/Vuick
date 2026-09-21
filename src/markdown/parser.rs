@@ -2491,6 +2491,7 @@ mod tests {
         }
         unsafe extern "system" {
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            #[allow(clashing_extern_declarations)]
             fn K32GetProcessMemoryInfo(
                 process: *mut std::ffi::c_void,
                 counters: *mut ProcessMemoryCounters,

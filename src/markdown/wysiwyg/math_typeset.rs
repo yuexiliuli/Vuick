@@ -13,14 +13,6 @@ use ratex_parser::parse;
 use ratex_render::{RenderOptions, render_to_png};
 use std::sync::Arc;
 
-/// 排版参数单一来源 = `crate::config::math`；这里按短名（`PAD`/`INLINE_PAD`/
-/// `FONT_SIZE`/`DPR`）重导出，光栅内部与测试沿用（块 = `MATH_PAD`，行内 =
-/// `INLINE_MATH_PAD`——正文行高只有 ~19px，大边距会顶高小公式）。
-pub(crate) use crate::config::math::{
-    INLINE_MATH_PAD as INLINE_PAD, MATH_DPR as DPR, MATH_FONT_SIZE as FONT_SIZE,
-    MATH_PAD as PAD,
-};
-
 /// 一个排版好的公式：位图 + 逻辑（pre-DPR）px 尺寸。
 pub(crate) struct Rendered {
     pub image: Arc<RenderImage>,
@@ -29,12 +21,9 @@ pub(crate) struct Rendered {
 }
 
 /// 把 LaTeX 排版成 `RenderImage`（`font_size` 单位 px/em，`dpr` 设备像素比）。
-/// `None` 当 LaTeX 解析/布局/光栅失败。
-pub(crate) fn render_latex(latex: &str, font_size: f32, dpr: f32, color: Hsla) -> Option<Rendered> {
-    render_latex_with_pad(latex, font_size, dpr, color, PAD)
-}
-
-/// 同 [`render_latex`]，但指定排版边距 `padding`（块用 [`PAD`]，行内用 [`INLINE_PAD`]）。
+/// `None` 当 LaTeX 解析/布局/光栅失败。`padding` 为排版边距（块用
+/// [`crate::config::math::MATH_PAD`]，行内用 [`crate::config::math::INLINE_MATH_PAD`]——
+/// 正文行高只有 ~19px，大边距会顶高小公式）。
 pub(crate) fn render_latex_with_pad(
     latex: &str,
     font_size: f32,
@@ -95,6 +84,7 @@ fn rasterize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::math::{INLINE_MATH_PAD as INLINE_PAD, MATH_PAD as PAD};
 
     #[test]
     fn rasterizes_to_nonempty_bgra() {
@@ -114,8 +104,8 @@ mod tests {
         // 行内小 PAD 是真收益：`x^2` 在 PAD=8（≈22px 排 16px 边距）下高 ~35px，
         // 收紧到 INLINE_PAD=1.5 后 ≈24px 逻辑高 —— 正文 16px 字号缩放后贴住行高，
         // 不再把行撑高；超高算子（`\int`）另由 textstyle + 高度上限压制。
-        let (_, w_big, h_big) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], PAD).unwrap();
-        let (_, w_tight, h_tight) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
+        let (_, _, h_big) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], PAD).unwrap();
+        let (_, _, h_tight) = rasterize("x^2", 22.0, 2.0, [0, 0, 0], INLINE_PAD).unwrap();
         assert!(
             h_tight < h_big,
             "行内小 PAD 应显著降高：{h_tight} < {h_big}"

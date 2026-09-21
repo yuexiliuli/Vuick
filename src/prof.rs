@@ -19,11 +19,13 @@ thread_local! {
     });
 }
 
+#[allow(dead_code)]
 pub fn enabled() -> bool {
     std::env::var_os("KILO_PROF").is_some()
 }
 
 /// 开（测试启动时调用一次；线程局部已按环境变量初始化）。
+#[allow(dead_code)]
 pub fn enable() {
     P.with(|p| p.borrow_mut().on = true);
 }
@@ -64,6 +66,7 @@ pub fn add_absolute(label: &'static str, d: Duration) {
 }
 
 /// 打印当前累计（按总时长降序）并清空。
+#[allow(dead_code)]
 pub fn dump(tag: &str) {
     if !enabled() {
         return;

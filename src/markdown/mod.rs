@@ -25,6 +25,8 @@ pub(crate) mod wysiwyg;
 #[cfg(test)]
 mod parity;
 
-pub use parser::{scan_blocks, scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};
+pub use parser::{scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};
+#[cfg(test)]
+pub use parser::scan_blocks;
 pub use view::{MarkdownPreview, PreviewSrc};
 pub use wysiwyg::{WyEditor, WyEvent};

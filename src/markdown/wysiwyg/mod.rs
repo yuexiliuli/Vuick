@@ -359,11 +359,6 @@ impl WyEditor {
         self.content.clone()
     }
 
-    /// 块数（滚动量程等）。
-    pub fn block_count(&self) -> usize {
-        self.doc.block_count()
-    }
-
     /// 聚焦句柄（元素命中/宿主聚焦用）。
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()

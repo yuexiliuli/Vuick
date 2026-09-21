@@ -121,6 +121,7 @@ impl Doc {
 
     /// 打开大文档（`Rope` 源，COW）：块索引与 IR 各物化一次（O(n)，毫秒级），
     /// 但是**窗口化物化行**走 rope 切片，不整份持有字符串——与预览一致。
+    #[allow(dead_code)]
     pub(crate) fn open_rope(rope: Rope) -> Self {
         let index = parser::scan_blocks_rope(&rope);
         let ir = build_ir(&rope.to_string());
@@ -134,17 +135,6 @@ impl Doc {
             v
         };
         Self { src: DocSrc::Rope(rope), index, ir, line_starts }
-    }
-
-    /// 更新内容（编辑后调用）。全量重建索引/IR；后续可改用增量（与预览一致）。
-    pub(crate) fn set_source(&mut self, src: SharedString) {
-        self.index = parser::scan_blocks(src.as_ref());
-        self.ir = build_ir(src.as_ref());
-        self.line_starts = parser::build_line_starts_u32(src.as_ref())
-            .into_iter()
-            .map(|b| b as usize)
-            .collect();
-        self.src = DocSrc::Str(src);
     }
 
     /// 块总数（虚拟化滚动条量程用，O(1)）。
@@ -220,6 +210,7 @@ impl Doc {
     }
 
     /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。
+    #[allow(dead_code)]
     pub(crate) fn rows_in_line_window(&self, lo_line: usize, hi_line: usize) -> Vec<DocRow> {
         let b = &self.index.blocks;
         if b.is_empty() {

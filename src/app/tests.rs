@@ -1,7 +1,7 @@
 //! 单元测试（自 mod.rs 拆出，仅测试编译）。
 
     use super::*;
-    use gpui::{Entity, EntityInputHandler, TestAppContext, VisualTestContext};
+    use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
     fn init_test(cx: &mut TestAppContext) {
@@ -34,7 +34,7 @@
         }
         // 第 1 个选项卡输入内容
         let editor0 = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
-        cx.update(|window, cx| {
+        cx.update(|_, cx| {
             editor0.update(cx, |ed, _| ed.set_text("hello"));
         });
         for _ in 0..3 {
@@ -77,7 +77,7 @@
             window.focus(&focus, cx);
             app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
         });
-        cx.update(|window, cx| {
+        cx.update(|_, cx| {
             editor.update(cx, |ed, _| ed.set_text("hello"));
         });
         for _ in 0..3 {
@@ -1714,7 +1714,7 @@
 
         // 初始空选项卡（未命名）里输入一段超长内容
         let long_text = "这是一个比较长的段落".repeat(60);
-        cx.update(|window, cx| {
+        cx.update(|_, cx| {
             let idx = app.read(cx).active_tab;
             let ed = app.read(cx).tabs[idx].editor.clone();
             ed.update(cx, |ed, _| ed.set_text(&long_text));
@@ -3226,7 +3226,7 @@
             let before = cx.update(|_, cx| editor.read(cx).value().len());
             let t_insert = std::time::Instant::now();
             for _ in 0..N {
-                cx.update(|window, cx| {
+                cx.update(|_, cx| {
                     editor.update(cx, |ed, cx| ed.insert_text(SAMPLE, cx));
                 });
             }
@@ -3270,6 +3270,7 @@
         }
         unsafe extern "system" {
             fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            #[allow(clashing_extern_declarations)]
             fn K32GetProcessMemoryInfo(
                 process: *mut std::ffi::c_void,
                 counter: *mut ProcessMemoryCounters,

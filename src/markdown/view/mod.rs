@@ -46,7 +46,7 @@ use gpui::{
     Window,
 };
 use gpui_component::input::Rope;
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode, ScrollableElement as _};
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use crate::config::limits::{
     CODE_HL_LRU_CAP, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_FACTOR,
@@ -1421,18 +1421,14 @@ impl MarkdownPreview {
         self.abs_scroll_top()
     }
 
-    /// 测试：抽样块高模型的样本组数（= block_h 长度；stride=1 时等于块数）。
-    #[cfg(test)]
-    pub(crate) fn test_height_groups(&self) -> usize {
-        self.block_h.len()
-    }
-
     /// 诊断：当前统一行高提示值（px）。应 ≈ 全篇块的精确平均行高（>0）。
+    #[cfg(test)]
     pub(crate) fn test_est_hint(&self) -> f32 {
         self.est_hint
     }
 
     /// 诊断：统一行高提示「已应用」记忆 `(块数, 提示值)`。None = 尚未应用（量程会坍缩）。
+    #[cfg(test)]
     pub(crate) fn test_hint_applied(&self) -> Option<(usize, f32)> {
         self.hint_applied
     }
