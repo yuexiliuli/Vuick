@@ -1,7 +1,8 @@
-//! 本项目管线实现的 WYSIWYG 编辑器（初步实现）——`markdown::wysiwyg`。
+//! 本项目管线实现的 WYSIWYG 编辑器——`markdown::wysiwyg`。
 //!
-//! 路线：以本项目自研管线（`parser`/`cells`/`ir`/`doc`）实现所见即所得编辑，
-//! **逐步替换** zorite 移植的 `markdown::live`，最终全盘单一套。
+//! 以本项目自研管线（`parser`/`cells`/`ir`/`doc`）实现所见即所得编辑，
+//! 已取代 zorite 移植的 `markdown::live`（该模块已移除；其共享的
+//! `md_syntax` / `markdown_syntax` 识别层上移到 `markdown/` 顶层继续共用）。
 //!
 //! 本文件是第一步「初步实现」：
 //! - **文档模型完全来自本项目** [`super::doc::Doc`]：IR 语义 + `BlockIndex` + 源；
@@ -36,8 +37,8 @@ use gpui::{
 };
 
 use super::doc::Doc;
-use crate::markdown::live::md_syntax::{self, LinkHit};
-use crate::markdown::live::markdown_syntax;
+use crate::markdown::md_syntax::{self, LinkHit};
+use crate::markdown::markdown_syntax;
 use crate::markdown::view::style::StyleParams;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。

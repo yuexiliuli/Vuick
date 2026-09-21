@@ -9,6 +9,12 @@
 //! italic, strikethrough, inline code, links, wiki-links, and tags. Heading
 //! sizes need per-line font sizes (variable line heights) and are deferred to
 //! W2; block widgets (images, fenced code, tables, …) to W4.
+//!
+//! 自 `markdown::live`（已移除）迁至 `markdown` 顶层，与 `wysiwyg`/`view`/`ir`/`parity`
+//! 共用识别层。前半部的行内样式引擎（`styled_runs`/`hidden_runs`/`scan`…）原仅供
+//! zorite 编辑器高亮；`wysiwyg` 用自绘主题映射，故暂空闲——保留（含其单测）待后续接入；
+//! 后半部的构造识别（标题/警报/数学/表格/折叠…）为当前各消费方。
+#![allow(dead_code)]
 
 use std::ops::Range;
 
@@ -19,12 +25,17 @@ use gpui::{
 
 use crate::markdown::cells::{is_backslash_escaped, split_unescaped_pipes};
 
-use super::Diagnostic;
+/// A spell-check / diagnostic span to underline. 自 `markdown::live`（现移除）迁来，
+/// 原本是该编辑器的高亮 API 的附属类型；现为 `markdown_syntax` 自身的 `pub(crate)` 类型。
+#[derive(Clone)]
+pub(crate) struct Diagnostic {
+    /// Byte range in the document.
+    pub range: std::ops::Range<usize>,
+}
 
-/// Colors + monospace font for inline markdown styling, supplied by the host so
-/// the editor stays theme-agnostic. Install via
-/// [`crate::markdown::MarkdownLivePreview::set_markdown_style`]; absent it, the editor renders
-/// plain text (only spell-check underlines).
+/// Colors + monospace font for inline markdown styling: supplied by the host
+/// (`view` 预览经 `StyleParams.syntax_style` 派生；`wysiwyg` 用自己的主题映射），
+/// 使渲染层保持主题无关。
 #[derive(Clone)]
 pub struct SyntaxStyle {
     /// Dimmed color for the syntax markers themselves (`**`, `*`, `~~`, `[`,
@@ -1218,11 +1229,6 @@ fn find_underscore_close(b: &[u8], from: usize, end: usize, double: bool) -> Opt
     None
 }
 
-// Linkables (wiki/tag/url/bare-url) are shared with the reader
-// (`gpui_markdown::syntax`) — one grammar for clicks, hover cursors, and
-// styling in every renderer.
-pub(crate) use super::md_syntax::{LinkHit, link_at, links};
-
 /// ATX heading depth (1–6) if `line` is a heading: 1–6 leading `#` followed by
 /// a space or end-of-line. `None` otherwise.
 pub(crate) fn heading_level(line: &str) -> Option<u8> {
@@ -2179,6 +2185,8 @@ use super::md_syntax::is_tag_char as is_tag;
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 链接识别自 `markdown::md_syntax`（原 live 时代经 `pub(crate) use` 再导出）。
+    use crate::markdown::md_syntax::{link_at, LinkHit};
 
     #[test]
     fn copies_renumber_to_displayed_positions() {

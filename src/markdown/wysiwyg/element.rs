@@ -28,8 +28,8 @@ const HEADING_GUTTER_W: f32 = 20.;
 use super::{CaretVis, WyEditor, WyTheme};
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::live::md_syntax::{self, AlertKind, LinkHit};
-use crate::markdown::live::markdown_syntax::{self, MathAlign, MathRegion};
+use crate::markdown::md_syntax::{self, AlertKind, LinkHit};
+use crate::markdown::markdown_syntax::{self, MathAlign, MathRegion};
 use crate::markdown::parser::{BlockMeta, RowKind, RunKind, TableAlign};
 use crate::syntax::{github_theme_cached, parse_code_lines, resolve_line_styles_with};
 
@@ -5946,8 +5946,8 @@ graph TD
         // 回归：展开的 callout，其 body 行左条应与 marker 同色（警报色），不是灰条。
         // 检查 frame 里 callout body 行的 bar 配色走 alert 路径（间接断言：
         // `alert_region_kinds` 把 marker + body 行都标上 kind，paint 据此取警报色）。
-        use crate::markdown::live::markdown_syntax;
-        use crate::markdown::live::md_syntax::AlertKind;
+        use crate::markdown::markdown_syntax;
+        use crate::markdown::md_syntax::AlertKind;
         use crate::markdown::ir::IrKind;
         cx.update(gpui_component::init);
         let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
@@ -6526,7 +6526,7 @@ A-->B
     fn math_card_height_uses_typeset_size_when_slot_ready(cx: &mut TestAppContext) {
         // 数学排版切 RaTeX 后：公式就绪 → 卡片高按排版位图逻辑高（`20 + h`），
         // 不再按 Unicode 行数（`20 + n×22`）——上限的分式/根号终于有足够高度。
-        use crate::markdown::live::markdown_syntax;
+        use crate::markdown::markdown_syntax;
         use gpui::App;
         cx.update(gpui_component::init);
         let text = "$$\na \\\\ b\n$$"; // 两行 → Unicode 回退高 = 20+44=64

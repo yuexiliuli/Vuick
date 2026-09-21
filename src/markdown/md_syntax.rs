@@ -5,6 +5,11 @@
 //! the WYSIWYG editor (`gpui-editor`), and any other consumer (PDF export)
 //! share *what counts as a construct and what's its payload*; each keeps its
 //! own rendering. Everything here is engine-neutral and gpui-free.
+//!
+//! 自 `markdown::live`（已移除）迁至 `markdown` 顶层，供 `wysiwyg`/`view` 共用。
+//! 部分构造辅助（列表编号、正文方向、属性、内嵌、块锚点等）原仅供 zorite 编辑器
+//! 使用、现暂空闲——作为共享识别 API 保留，待 `wysiwyg` 逐项接入后恢复。
+#![allow(dead_code)]
 
 /// The five GitHub alert kinds (`> [!NOTE]` …).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

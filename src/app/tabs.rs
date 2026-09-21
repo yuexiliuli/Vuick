@@ -27,8 +27,6 @@ impl EditorApp {
             readonly_preview: false,
             editor_pending: false,
             live_edit: false,
-            live: None,
-            _live_sub: None,
             live2: None,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),

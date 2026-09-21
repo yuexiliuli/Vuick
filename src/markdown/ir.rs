@@ -12,7 +12,7 @@
 use std::ops::Range;
 
 use super::cells::{self, CellAlign};
-use super::live::markdown_syntax::{
+use super::markdown_syntax::{
     blockquote_prefix, heading_level, image_row, list_prefix, table_regions, thematic_break,
 };
 

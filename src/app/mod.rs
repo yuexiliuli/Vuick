@@ -39,8 +39,8 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState, Rope};
 use gpui_component::{Icon, IconName};
 
-// 实时预览编辑（WYSIWYG）——本项目 `crate::markdown::live`（zorite 移植并入）。
-use crate::markdown::{EditorEvent, MarkdownLivePreview, SyntaxStyle, WyEditor, WyEvent};
+// WYSIWYG 预览编辑——本项目 `crate::markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
+use crate::markdown::{WyEditor, WyEvent};
 
 use crate::actions::*;
 use crate::config::layout::{
@@ -81,13 +81,11 @@ struct EditorTab {
     /// 等用户第一时间看到预览内容后，下一拍再把编辑器挂上——编辑器
     /// 首次对 16 万行做 DisplayMap 布局会冻结一两秒，不让它挡在首帧前）。
     editor_pending: bool,
-    /// 是否处于「实时预览编辑」（WYSIWYG）模式：左面板用移植的
-    /// [`MarkdownLivePreview`] 代替源码编辑区；退出时内容写回。
+    /// 是否处于「所见即所得预览编辑」模式：左面板用 `WyEditor` 代替源码编辑区；
+    /// 退出时内容写回。
     live_edit: bool,
-    /// 实时预览编辑器实体（None = 未启用；auto-grow，宿主滚动）。
-    live: Option<gpui::Entity<MarkdownLivePreview>>,
-    /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源，
-    /// 目标逐步替换 `live`）。None = 未启用。与 `live` 二选一，共用 `live_edit` 布局。
+    /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源）。
+    /// None = 未启用。启用即 `live_edit = true`。
     live2: Option<gpui::Entity<WyEditor>>,
     /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
     /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
@@ -102,12 +100,9 @@ struct EditorTab {
     preview_dirty: Option<(usize, usize)>,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
-    /// 实时编辑的变更订阅（`EditorEvent::Changed` → 写回内容镜像/编辑区；
-    /// 随 `live` 一起创建与销毁）。
-    _live_sub: Option<Subscription>,
-    /// `live2`（WyEditor）的变更订阅，同上。
+    /// `live2`（WyEditor）的变更订阅。
     _live2_sub: Option<Subscription>,
-    /// 实时预览编辑（WYSIWYG）宿主纵向滚动句柄：`#live-scroll`（`overflow_y_scroll`）
+    /// 预览编辑（WYSIWYG）宿主纵向滚动句柄：`#live-scroll`（`overflow_y_scroll`）
     /// 经 `track_scroll` 跟踪它，右侧 `Scrollbar::vertical` 跟随显示（宿主原生滚动条
     /// 在此 GPUI 不绘制，需自绘）。每次渲染重建容器，句柄存这里跨帧稳定。
     live_vscroll: gpui::ScrollHandle,
@@ -385,7 +380,7 @@ impl EditorApp {
         registry.windows.push((weak, handle));
     }
 
-    /// 选项卡的编辑焦点句柄：实时预览编辑模式返回 WYSIWYG 编辑器（否则键盘进
+    /// 选项卡的编辑焦点句柄：预览编辑模式返回 WYSIWYG 编辑器（否则键盘进
     /// 不可见的源码编辑区）；否则返回源码编辑区。
     fn tab_focus_handle(&self, idx: usize, cx: &App) -> FocusHandle {
         let Some(tab) = self.tabs.get(idx) else {
@@ -394,10 +389,6 @@ impl EditorApp {
         if tab.live_edit {
             if let Some(l2) = &tab.live2 {
                 let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
-                return h;
-            }
-            if let Some(live) = &tab.live {
-                let h = gpui::Focusable::focus_handle(live.read(cx), cx);
                 return h;
             }
         }
@@ -655,10 +646,8 @@ impl EditorApp {
             preview_fullscreen: payload.preview_fullscreen,
             readonly_preview: payload.readonly_preview,
             editor_pending: payload.editor_pending,
-            // 实时预览编辑不随选项卡搬迁（搬迁前已提交回写，见 take_tab_payload 调用点）
+            // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交回写，见 take_tab_payload 调用点）
             live_edit: false,
-            live: None,
-            _live_sub: None,
             live2: None,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
@@ -1077,114 +1066,16 @@ impl EditorApp {
     }
 
     // -------------------------------------------------------------------
-    // 实时预览编辑（WYSIWYG，zorite 移植）
+    // 所见即所得预览编辑（WYSIWYG，`markdown::wysiwyg::WyEditor`）
     // -------------------------------------------------------------------
 
-    /// WYSIWYG 编辑器的 Markdown 语法配色。markdown 语义色由
-    /// [`StyleParams`](crate::markdown::view::style::StyleParams)（单一主题映射源）派生，
-    /// 只读外壳 chrome 走 app 自己色板（与旧 `wysiwyg_style` 逐值一致）。
-    fn wysiwyg_style(&mut self, cx: &mut Context<Self>) -> SyntaxStyle {
-        let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
-            cx,
-            Some(self.font_size),
-        );
-        let marker = self.text_minor();
-        p.syntax_style(crate::markdown::view::style::SyntaxChrome {
-            marker,
-            code_fg: self.text_primary(),
-            quote: marker,
-            popover_bg: self.surface_bg(),
-            popover_border: self.bar_border(),
-            popover_fg: self.text_primary(),
-            popover_danger: gpui::rgb(0xE5484D).into(),
-        })
-    }
-
-    /// 切换当前选项卡的「实时预览编辑」模式（仅 Markdown 选项卡）。
-    /// 开启：用移植的 [`MarkdownLivePreview`] 渲染左面板（所见即所得，
-    /// 点击/光标/IME 全部由它处理，auto-grow + 宿主滚动）；关闭：写回源码编辑区/预览。
-    fn toggle_live_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let idx = self.active_tab;
-        if !self.is_markdown_tab(idx) {
-            self.status = SharedString::from("实时预览编辑仅支持 Markdown 文件");
-            self.status_ok = false;
-            cx.notify();
-            return;
-        }
-        if self.tabs[idx].live_edit {
-            self.commit_live(idx, cx);
-        } else {
-            let text = self.tabs[idx].editor.read(cx).text_string();
-            let text_seed = text.clone();
-            let style = self.wysiwyg_style(cx);
-            let live = cx.new(|cx| {
-                let mut e = MarkdownLivePreview::new(window, cx)
-                    .with_text(text_seed.as_str())
-                    .with_placeholder("空文档（实时预览编辑：点击正文定位，直接键入编辑）");
-                e.set_markdown_style(style.clone(), cx);
-                e
-            });
-            // 变更订阅：所见即所得是唯一编辑面 → 实时镜像到源码编辑区/内容缓存，
-            // 让保存/搜索/状态栏等既有流程照常读取真源（不改动其余模块）。
-            let live_sub = cx.subscribe(
-                &live,
-                |this, emitter, ev: &EditorEvent, cx| {
-                    if ev == &EditorEvent::Changed {
-                        if let Some(tab) =
-                            this.tabs.iter_mut().find(|t| t.live.as_ref() == Some(&emitter))
-                        {
-                            let value = emitter.update(cx, |ed, _| ed.text().to_string());
-                            tab.content = SharedString::from(value.clone());
-                            tab.line_count = value.lines().count().max(1);
-                            tab.char_count = value.chars().count();
-                            tab.dirty = true;
-                            tab.editor.update(cx, |ed, _| ed.set_text(&value));
-                        }
-                    }
-                },
-            );
-            let tab = &mut self.tabs[idx];
-            tab.live = Some(live.clone());
-            tab._live_sub = Some(live_sub);
-            tab.live_edit = true;
-            self.install_live_code_hl(idx, cx);
-            self.status = SharedString::from("实时预览编辑：开（所见即所得：点击正文定位，直接键入编辑）");
-            self.status_ok = true;
-            // 聚焦 WYSIWYG 编辑器（键盘输入走它，不走隐藏的源码编辑区）。
-            let focus = gpui::Focusable::focus_handle(live.read(cx), cx);
-            window.focus(&focus, cx);
-        }
-        cx.notify();
-    }
-
-    /// 给第 `idx` 个选项卡的实时编辑器挂**本项目代码块实现**：
-    /// `syntax::block_highlights`（与预览代码块同一套 parse_code_lines + GitHub 配色）。
-    /// 主题切换时需重挂（闭包捕获明/暗），见 [`Self::toggle_theme`]。
-    fn install_live_code_hl(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let dark = self.dark_mode;
-        let Some(tab) = self.tabs.get_mut(idx) else { return };
-        let Some(live) = tab.live.clone() else { return };
-        live.update(cx, |ed, _| {
-            ed.set_code_highlighter(move |lang: &str, block: &str| {
-                crate::syntax::block_highlights(lang, block, dark)
-            });
-        });
-    }
-
-    /// 退出实时编辑：把实时 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
-    /// 兼容 `live`（zorite）与 `live2`（本项目 WyEditor）两种模式。
+    /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
     fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
         tab.live_edit = false;
-        tab._live_sub = None;
         tab._live2_sub = None;
-        let text = if let Some(l2) = tab.live2.take() {
-            l2.read(cx).text().to_string()
-        } else if let Some(live) = tab.live.take() {
-            live.read(cx).text().to_string()
-        } else {
-            return;
-        };
+        let Some(l2) = tab.live2.take() else { return };
+        let text = l2.read(cx).text().to_string();
         tab.content = SharedString::from(text);
         let content = tab.content.clone();
         let n_lines = content.as_ref().lines().count().max(1);
@@ -1193,12 +1084,11 @@ impl EditorApp {
         tab.char_count = n_chars;
         tab.editor.update(cx, |ed, _| ed.set_text(&content));
         tab.md_preview.update(cx, |v, cx| v.set_source(&content, cx));
-        self.status = SharedString::from("实时预览编辑/预览编辑测试：关（内容已写回编辑区）");
+        self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
         self.status_ok = true;
     }
 
     /// 「预览编辑测试」开关：用本项目 `markdown::wysiwyg::WyEditor` 渲染左面板。
-    /// 与 zorite `live` 二选一（开启本模式先退出 `live`）。
     fn toggle_live_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
         if !self.is_markdown_tab(idx) {
@@ -1210,10 +1100,6 @@ impl EditorApp {
         if self.tabs[idx].live2.is_some() {
             self.commit_live(idx, cx);
         } else {
-            // 先退出 zorite live（两者共用布局位）。
-            if self.tabs[idx].live.is_some() {
-                self.commit_live(idx, cx);
-            }
             let text = self.tabs[idx].editor.read(cx).text_string();
             let text_seed = text.clone();
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text_seed.as_str()));
@@ -1248,8 +1134,6 @@ impl EditorApp {
                 }
             });
             let tab = &mut self.tabs[idx];
-            tab.live = None;
-            tab._live_sub = None;
             tab.live2 = Some(ed.clone());
             tab._live2_sub = Some(ed_sub);
             tab.live_edit = true;
@@ -1259,11 +1143,6 @@ impl EditorApp {
             window.focus(&focus, cx);
         }
         cx.notify();
-    }
-
-    /// 当前选项卡是否处于实时预览编辑模式（其它模块/渲染分流用）。
-    fn is_live_tab(&self, idx: usize) -> bool {
-        self.tabs.get(idx).map(|t| t.live_edit).unwrap_or(false)
     }
 
     /// 切换侧边栏「展开/收起」。
@@ -1407,10 +1286,6 @@ impl EditorApp {
                     cx.notify();
                 });
             }
-        }
-        // 实时编辑器代码块高亮闭包捕获了明/暗 → 主题切换后重挂（用新 dark 重建配色）。
-        if self.tabs[self.active_tab].live_edit {
-            self.install_live_code_hl(self.active_tab, cx);
         }
         cx.notify();
     }

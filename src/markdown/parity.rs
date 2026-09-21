@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use gpui::SharedString;
 
 use super::ir;
-use super::live::markdown_syntax::{
+use super::markdown_syntax::{
     alert_kind, blockquote_prefix, heading_level, image_row, is_table_row, list_prefix,
     math_regions, table_cells, table_regions, task_prefix, thematic_break,
 };

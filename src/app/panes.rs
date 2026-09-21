@@ -58,14 +58,12 @@ impl EditorApp {
                         .child("正在载入编辑区…（预览已就绪）"),
                 );
         }
-        // 实时预览编辑（WYSIWYG）模式：左面板 = 移植的 `MarkdownLivePreview`，
-        // 或「预览编辑测试」的本项目 `WyEditor`（live2 优先）。
-        // 两者都是 AUTO-GROW（内部无滚动条），宿主负责滚动。
+        // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
+        // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
         let live_any: Option<gpui::AnyElement> = self.tabs[self.active_tab]
             .live2
             .clone()
-            .map(|e| e.into_any_element())
-            .or_else(|| self.tabs[self.active_tab].live.clone().map(|e| e.into_any_element()));
+            .map(|e| e.into_any_element());
         if let Some(live_any) = live_any {
             let text_color = self.text_primary();
             let fs = self.font_size;
