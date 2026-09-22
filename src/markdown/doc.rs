@@ -13,6 +13,7 @@
 //! 物化不整份持有——预览的性能底座）。后续阶段叠加编辑映射并让 preview/live
 //! 迁移到本层消费；一致性由 `markdown::parity` 钉死。
 
+use std::cell::RefCell;
 use std::ops::Range;
 
 use gpui::SharedString;
@@ -112,21 +113,48 @@ pub(crate) struct Doc {
     rope: Rope,
     /// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义）——行源文本定位用。
     line_starts: Vec<usize>,
+    /// 与 `line_starts` 平行、同长的**行粒度 UTF-16 前缀索引**：第 i 项 = `line_starts[i]`
+    /// 前的累计 UTF-16 单元数。IME/`EntityInputHandler` 的 UTF-16↔字节换算靠它
+    /// （O(log n + 行长)，替代全文扫描），`edit` 增量维护。
+    line_utf16_starts: Vec<usize>,
     /// 标量字符数（`chars().count()` 口径，状态栏显示用）——`edit` 增量维护，O(1)。
     char_count: usize,
+    /// 全文 UTF-16 单元总数（`EntityInputHandler::text_length_utf16` 用，O(1)）——
+    /// `edit` 增量维护。
+    total_utf16: usize,
+    /// 文本版本号：`text_shared` 版本化缓存键，`edit` 后 +1 失效。
+    edit_ver: u64,
+    /// `text_shared` 的全文缓存（防漏网调用点重复 O(n) 拷贝；edit 后失效清空）。
+    text_cache: RefCell<Option<(u64, SharedString)>>,
 }
 
 impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
         let index = parser::scan_blocks(src.as_ref());
-        let line_starts = parser::build_line_starts_u32(src.as_ref())
+        let line_starts: Vec<usize> = parser::build_line_starts_u32(src.as_ref())
             .into_iter()
             .map(|b| b as usize)
             .collect();
         let rope = Rope::from(&*src);
         let char_count = src.chars().count();
-        Self { src: DocSrc::Str(src), index, rope, line_starts, char_count }
+        let line_utf16_starts = build_line_utf16_starts(
+            |s, e| src.as_ref()[s..e].encode_utf16().count(),
+            &line_starts,
+            src.len(),
+        );
+        let total_utf16 = src.encode_utf16().count();
+        Self {
+            src: DocSrc::Str(src),
+            index,
+            rope,
+            line_starts,
+            line_utf16_starts,
+            char_count,
+            total_utf16,
+            edit_ver: 0,
+            text_cache: RefCell::new(None),
+        }
     }
 
     /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
@@ -137,8 +165,27 @@ impl Doc {
         let index = parser::scan_blocks_rope(&rope);
         let line_starts = build_line_starts_rope(&rope);
         let char_count = rope.chars().count();
+        let line_utf16_starts = build_line_utf16_starts(
+            |s, e| rope.slice(s..e).chars().map(|c| c.len_utf16() as usize).sum(),
+            &line_starts,
+            rope.len(),
+        );
+        let total_utf16: usize = rope
+            .chars()
+            .map(|c| c.len_utf16() as usize)
+            .sum::<usize>();
         let src = DocSrc::Rope(rope.clone());
-        Self { src, index, rope, line_starts, char_count }
+        Self {
+            src,
+            index,
+            rope,
+            line_starts,
+            line_utf16_starts,
+            char_count,
+            total_utf16,
+            edit_ver: 0,
+            text_cache: RefCell::new(None),
+        }
     }
 
     /// 原地编辑（字节区间替换）：rope COW remove+insert + 增量块扫描 + 增量行起始。
@@ -157,6 +204,18 @@ impl Doc {
             0
         };
         let inserted_chars = text.chars().count();
+        // UTF-16 单元增量（行前缀/总数索引共用）：同样只扫小编辑串。
+        let removed_u16: usize = if end > start {
+            self.rope
+                .slice(start..end)
+                .chars()
+                .map(|c| c.len_utf16() as usize)
+                .sum::<usize>()
+        } else {
+            0
+        };
+        let inserted_u16 = text.encode_utf16().count();
+        let delta_u16 = inserted_u16 as i64 - removed_u16 as i64;
         let mut new_rope = self.rope.clone();
         if end > start {
             new_rope.remove(start..end);
@@ -168,12 +227,25 @@ impl Doc {
         let new_index =
             parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
         let new_line_starts =
-            Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range);
+            Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range.clone());
+        let new_line_utf16_starts = Self::incremental_line_utf16_starts(
+            &self.line_utf16_starts,
+            &self.line_starts,
+            &new_rope,
+            old_len,
+            range.clone(),
+            delta_u16,
+        );
         self.rope = new_rope;
         self.index = new_index;
         self.line_starts = new_line_starts;
+        self.line_utf16_starts = new_line_utf16_starts;
+        self.total_utf16 = (self.total_utf16 as i64 + delta_u16).max(0) as usize;
         self.char_count =
             (self.char_count as i64 + inserted_chars as i64 - removed_chars as i64).max(0) as usize;
+        // 全文副本缓存失效。
+        self.edit_ver = self.edit_ver.wrapping_add(1);
+        *self.text_cache.borrow_mut() = None;
         // rope 为唯一源；原 Str 快路径（load 后首次编辑起）不再保留整份 SharedString。
         self.src = DocSrc::Rope(self.rope.clone());
     }
@@ -223,6 +295,51 @@ impl Doc {
         out
     }
 
+    /// 增量 UTF-16 行前缀重建（见 [`Self::edit`]）：与 [`Self::incremental_line_starts`]
+    /// 同一套三段式与边界语义（前缀沿用 + 变化区重扫 + 尾部平移 `delta_u16`），只在
+    /// 重扫时同时累计「行起始前的 UTF-16 单元数」。O(变化区 + 尾部)。
+    fn incremental_line_utf16_starts(
+        old_u16: &[usize],
+        old_bytes: &[usize],
+        new: &Rope,
+        old_len: usize,
+        edit_old: Range<usize>,
+        delta_u16: i64,
+    ) -> Vec<usize> {
+        let new_len = new.len();
+        let delta = new_len as i64 - old_len as i64;
+        // 行表对齐点与字节版本完全相同——两条索引必须同形（行数一致）。
+        let keep = old_bytes.partition_point(|&s| s <= edit_old.start);
+        let mut out: Vec<usize> = old_u16[..keep].to_vec();
+        let j = old_bytes.partition_point(|&s| s <= edit_old.end.min(old_len));
+        let region_start = old_bytes.get(keep.saturating_sub(1)).copied().unwrap_or(0);
+        let region_end = if j < old_bytes.len() {
+            (old_bytes[j] as i64 + delta).clamp(region_start as i64, new_len as i64) as usize
+        } else {
+            new_len.max(region_start)
+        };
+        // 变化区起点基线 = 上一前缀行行首前的累计 UTF-16 数。
+        let base_u16 = if keep > 0 { out[keep - 1] } else { 0 };
+        // 变化区：按字符推进累计 UTF-16，对每个新行起始 push（同字节版的
+        // `s < region_end || j >= old.len()` 判据，保证两次索引行集一致）。
+        let region = new.slice(region_start..region_end).to_string();
+        let mut run_u16 = base_u16 as i64;
+        for (i, c) in region.char_indices() {
+            run_u16 += c.len_utf16() as i64;
+            if c == '\n' {
+                let s = region_start + i + 1;
+                if s < region_end || j >= old_bytes.len() {
+                    out.push(run_u16 as usize);
+                }
+            }
+        }
+        // 尾部整体平移（编辑在其之前 ⇒ 累计 UTF-16 全体 +Δ）。
+        for &v in &old_u16[j..] {
+            out.push((v as i64 + delta_u16).max(0) as usize);
+        }
+        out
+    }
+
     /// 块总数（虚拟化滚动条量程用，O(1)）。
     pub(crate) fn block_count(&self) -> usize {
         self.index.blocks.len()
@@ -266,6 +383,67 @@ impl Doc {
     /// 标量字符数（`chars().count()` 口径），`edit` 增量维护，O(1)。
     pub(crate) fn char_count(&self) -> usize {
         self.char_count
+    }
+
+    /// 全文 UTF-16 单元总数（IME `text_length_utf16` 用），`edit` 增量维护，O(1)。
+    /// （当前由 parity 测试消费；B 步 `EntityInputHandler` 正式启用后去掉 allow。）
+    #[allow(dead_code)]
+    pub(crate) fn total_utf16(&self) -> usize {
+        self.total_utf16
+    }
+
+    /// 行粒度 UTF-16 前缀索引（与 `line_starts` 平行）：第 i 项 = `line_starts[i]` 前累计
+    /// UTF-16 单元数。
+    #[allow(dead_code)]
+    pub(crate) fn line_utf16_starts(&self) -> &[usize] {
+        &self.line_utf16_starts
+    }
+
+    /// 字节偏移 → 前累计 UTF-16 单元数（IME 协议层换算；O(log n + 行长)：行表二分
+    /// + 行内切片计数，不触碰全文）。
+    #[allow(dead_code)]
+    pub(crate) fn byte_to_utf16(&self, byte: usize) -> usize {
+        let byte = byte.min(self.len());
+        let i = self
+            .line_starts
+            .partition_point(|&s| s <= byte)
+            .saturating_sub(1);
+        let line_start = self.line_starts.get(i).copied().unwrap_or(0);
+        let base_u16 = self.line_utf16_starts.get(i).copied().unwrap_or(0);
+        if byte <= line_start {
+            return base_u16;
+        }
+        base_u16
+            + self
+                .rope
+                .slice(line_start..byte)
+                .chars()
+                .map(|c| c.len_utf16() as usize)
+                .sum::<usize>()
+    }
+
+    /// UTF-16 单元数 → 字节偏移（IME 协议层换算；O(log n + 行长)，越界钳到行尾/文末）。
+    /// 与全量 `s.char_indices()` 版 `offset_from_utf16` 语义一致：返回「累计 ≥ 目标」的
+    /// 第一个字符起始字节。
+    #[allow(dead_code)]
+    pub(crate) fn utf16_to_byte(&self, utf16: usize) -> usize {
+        let i = self
+            .line_utf16_starts
+            .partition_point(|&v| v <= utf16)
+            .saturating_sub(1);
+        let line_start = self.line_starts.get(i).copied().unwrap_or(0);
+        let base_u16 = self.line_utf16_starts.get(i).copied().unwrap_or(0);
+        let line_end = self.line_starts.get(i + 1).copied().unwrap_or(self.len());
+        let mut acc = base_u16;
+        let mut byte = line_start;
+        for c in self.rope.slice(line_start..line_end).chars() {
+            if acc >= utf16 {
+                return byte;
+            }
+            acc += c.len_utf16();
+            byte += c.len_utf8();
+        }
+        line_end
     }
 
     /// 第 `i` 块的轻量元数据（`BlockMeta`，≈20B，O(段数)）——窗口化 shaping 的
@@ -514,12 +692,20 @@ impl Doc {
     }
 
     /// 全文（宿主镜像/测试/派生全量扫描用）。Str 源（load 后）O(1) 克隆；rope 源
-    /// O(n) 一次（仅宿主写回 / 结构编辑派生 / 测试断言，不在键入热路径）。
+    /// 走**版本化缓存**（键 `edit_ver`，edit 后失效）——保底任何遗漏调用点不再重复
+    /// O(n) 拷贝（输入热路径已改走 UTF-16 索引/切片，见 `EntityInputHandler`）。
     pub(crate) fn text_shared(&self) -> SharedString {
-        match &self.src {
+        if let Some((ver, s)) = &*self.text_cache.borrow() {
+            if *ver == self.edit_ver {
+                return s.clone();
+            }
+        }
+        let s = match &self.src {
             DocSrc::Str(s) => s.clone(),
             DocSrc::Rope(r) => SharedString::from(r.to_string()),
-        }
+        };
+        *self.text_cache.borrow_mut() = Some((self.edit_ver, s.clone()));
+        s
     }
 
     /// 字节区间切片（O(区间长)；边界钳到 [0, len]，rope 单切一次）。
@@ -544,6 +730,25 @@ fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
             }
         }
         pos += chunk.len();
+    }
+    v
+}
+
+/// 行粒度 UTF-16 前缀索引构建：第 i 项 = `line_starts[i]`（含幻影尾行）前的累计
+/// UTF-16 单元数。`u16_of_range` 统计单行字节区间的 UTF-16 单元数（Str 走
+/// `encode_utf16().count()`，rope 走 `chars()` 累加）。O(n)。
+fn build_line_utf16_starts(
+    u16_of_range: impl Fn(usize, usize) -> usize,
+    line_starts: &[usize],
+    len: usize,
+) -> Vec<usize> {
+    let mut v = Vec::with_capacity(line_starts.len());
+    let mut run = 0usize;
+    for i in 0..line_starts.len() {
+        v.push(run);
+        let s = line_starts[i];
+        let e = line_starts.get(i + 1).copied().unwrap_or(len);
+        run += u16_of_range(s, e);
     }
     v
 }

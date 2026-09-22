@@ -645,3 +645,131 @@ fn doc_incremental_counts_match_full_recompute() {
         }
     }
 }
+
+/// 全量换算参考（与 `wysiwyg::offset_to_utf16/offset_from_utf16` 同语义）。
+fn ref_offset_to_utf16(s: &str, offset: usize) -> usize {
+    s[..offset.min(s.len())].encode_utf16().count()
+}
+
+fn ref_offset_from_utf16(s: &str, utf16: usize) -> usize {
+    let mut count = 0usize;
+    for (i, c) in s.char_indices() {
+        if count >= utf16 {
+            return i;
+        }
+        count += c.len_utf16();
+    }
+    s.len()
+}
+
+/// 行粒度 UTF-16 前缀索引（`byte_to_utf16/utf16_to_byte/total_utf16/line_utf16_starts`）
+/// 与全量重算逐值一致——IME 协议层换算的钉死护栏（改错会让候选窗/选区落点错位）。
+/// Str 与 Rope 两源也必须一致。
+#[test]
+fn doc_utf16_index_matches_full_recompute() {
+    use crate::markdown::doc::Doc;
+    use gpui::SharedString;
+    use gpui_component::input::Rope;
+
+    let docs = [
+        "",
+        "a",
+        "a\nb",
+        "a\nb\n",
+        "中文 🚀 emoji\n第二行\n",
+        "a\n\nb\n\n",
+    ];
+    for src in docs {
+        let mut doc = Doc::open(SharedString::from(src));
+        let rope_doc = Doc::open_rope(Rope::from(src));
+
+        let check = |d: &Doc, s: &str| {
+            assert_eq!(
+                d.line_utf16_starts().len(),
+                d.line_starts().len(),
+                "UTF-16 行索引与行表应同形"
+            );
+            assert_eq!(d.total_utf16(), s.encode_utf16().count(), "total_utf16 不一致");
+            if d.line_starts().len() > 0 {
+                assert_eq!(
+                    d.line_utf16_starts()[0],
+                    0,
+                    "首行 UTF-16 前缀应为 0"
+                );
+            }
+            // 字节 → UTF-16：对所有字符边界探测（含行首/文末）。
+            let mut bytes: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+            bytes.push(s.len());
+            for &b in &bytes {
+                assert_eq!(
+                    d.byte_to_utf16(b),
+                    ref_offset_to_utf16(s, b),
+                    "byte_to_utf16({b}) 不一致 for {:?}",
+                    s
+                );
+            }
+            // UTF-16 → 字节：行首/字符边界/越界（钳到文末）。
+            let line_bases = d.line_utf16_starts().to_vec();
+            let total = d.total_utf16();
+            let mut u16s: Vec<usize> = vec![0, total, total + 3];
+            u16s.extend(line_bases.iter().copied());
+            for b in &bytes {
+                u16s.push(d.byte_to_utf16(*b));
+            }
+            for &u in &u16s {
+                assert_eq!(
+                    d.utf16_to_byte(u),
+                    ref_offset_from_utf16(s, u),
+                    "utf16_to_byte({u}) 不一致 for {:?}",
+                    s
+                );
+            }
+        };
+        check(&doc, src);
+        check(&rope_doc, src);
+
+        // 随机编辑序列后仍一致（前进式：doc 与 rope_doc 施加相同编辑，rgu66=i64）。
+        let mut s = src.to_string();
+        let mut doc2 = Doc::open(SharedString::from(src));
+        let mut rng = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..150 {
+            let mut pts: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+            pts.push(s.len());
+            let n = pts.len();
+            let a = pts[(next() % (n.max(1)) as u64) as usize];
+            let b = pts[(next() % (n.max(1)) as u64) as usize];
+            let (a, b) = (a.min(b), a.max(b));
+            let choices = ["中\n", "x", "你好🚀\n是", "\n\n"];
+            let ins = choices[(next() % choices.len() as u64) as usize];
+            match (next() % 3) as usize {
+                0 => {
+                    if b > a {
+                        doc.edit(a..b, "");
+                        doc2.edit(a..b, "");
+                        s.drain(a..b);
+                    }
+                }
+                1 => {
+                    doc.edit(a..a, ins);
+                    doc2.edit(a..a, ins);
+                    s.insert_str(a, ins);
+                }
+                _ => {
+                    doc.edit(a..b, ins);
+                    doc2.edit(a..b, ins);
+                    s.replace_range(a..b, ins);
+                }
+            }
+            check(&doc, &s);
+            check(&doc2, &s);
+            // 双源索引逐项一致。
+            assert_eq!(doc.line_utf16_starts(), doc2.line_utf16_starts());
+        }
+    }
+}
