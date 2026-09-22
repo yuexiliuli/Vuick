@@ -126,6 +126,9 @@ pub(crate) struct Doc {
     edit_ver: u64,
     /// `text_shared` 的全文缓存（防漏网调用点重复 O(n) 拷贝；edit 后失效清空）。
     text_cache: RefCell<Option<(u64, SharedString)>>,
+    /// （仅测试）`text_shared` 被调次数——B 步断言 `EntityInputHandler` 不再物化全文。
+    #[cfg(test)]
+    text_shared_calls: std::cell::Cell<u64>,
 }
 
 impl Doc {
@@ -154,6 +157,8 @@ impl Doc {
             total_utf16,
             edit_ver: 0,
             text_cache: RefCell::new(None),
+            #[cfg(test)]
+            text_shared_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -185,6 +190,8 @@ impl Doc {
             total_utf16,
             edit_ver: 0,
             text_cache: RefCell::new(None),
+            #[cfg(test)]
+            text_shared_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -386,8 +393,6 @@ impl Doc {
     }
 
     /// 全文 UTF-16 单元总数（IME `text_length_utf16` 用），`edit` 增量维护，O(1)。
-    /// （当前由 parity 测试消费；B 步 `EntityInputHandler` 正式启用后去掉 allow。）
-    #[allow(dead_code)]
     pub(crate) fn total_utf16(&self) -> usize {
         self.total_utf16
     }
@@ -401,7 +406,6 @@ impl Doc {
 
     /// 字节偏移 → 前累计 UTF-16 单元数（IME 协议层换算；O(log n + 行长)：行表二分
     /// + 行内切片计数，不触碰全文）。
-    #[allow(dead_code)]
     pub(crate) fn byte_to_utf16(&self, byte: usize) -> usize {
         let byte = byte.min(self.len());
         let i = self
@@ -425,7 +429,6 @@ impl Doc {
     /// UTF-16 单元数 → 字节偏移（IME 协议层换算；O(log n + 行长)，越界钳到行尾/文末）。
     /// 与全量 `s.char_indices()` 版 `offset_from_utf16` 语义一致：返回「累计 ≥ 目标」的
     /// 第一个字符起始字节。
-    #[allow(dead_code)]
     pub(crate) fn utf16_to_byte(&self, utf16: usize) -> usize {
         let i = self
             .line_utf16_starts
@@ -695,6 +698,8 @@ impl Doc {
     /// 走**版本化缓存**（键 `edit_ver`，edit 后失效）——保底任何遗漏调用点不再重复
     /// O(n) 拷贝（输入热路径已改走 UTF-16 索引/切片，见 `EntityInputHandler`）。
     pub(crate) fn text_shared(&self) -> SharedString {
+        #[cfg(test)]
+        self.text_shared_calls.set(self.text_shared_calls.get() + 1);
         if let Some((ver, s)) = &*self.text_cache.borrow() {
             if *ver == self.edit_ver {
                 return s.clone();
@@ -706,6 +711,12 @@ impl Doc {
         };
         *self.text_cache.borrow_mut() = Some((self.edit_ver, s.clone()));
         s
+    }
+
+    /// （仅测试）`text_shared` 被调次数——B 步断言 `EntityInputHandler` 不再物化全文。
+    #[cfg(test)]
+    pub(crate) fn text_shared_calls(&self) -> u64 {
+        self.text_shared_calls.get()
     }
 
     /// 字节区间切片（O(区间长)；边界钳到 [0, len]，rope 单切一次）。

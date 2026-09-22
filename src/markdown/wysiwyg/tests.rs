@@ -3984,3 +3984,95 @@ A-->B
             );
         });
     }
+
+    #[gpui::test]
+    fn handler_large_doc_cjk_roundtrip_no_full_materialize(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+        cx.update(gpui_component::init);
+        // 大文档：8000 行混合 ASCII/中文/emoji——行索引目标落在文档中后部（半篇~整篇）。
+        // 同时含尾随换行（幻影尾行）与多字节字符，覆盖 UTF-16 换算的边界。
+        let mut text = String::new();
+        for i in 0..8000 {
+            if i % 17 == 0 {
+                text.push('中');
+            }
+            if i % 31 == 0 {
+                text.push('\u{1f680}');
+            }
+            text.push_str(&format!("line {i}\n"));
+        }
+        text.push_str("你好 target 尾\n");
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // `reference` 逐编辑镜像 doc，作为全文比对与 UTF-16 换算的参照。
+            let mut reference = text.clone();
+            let tail = "你好 target 尾\n";
+            ed.update(cx, |e, cx| {
+                let calls0 = e.text_shared_calls();
+                // ---- 阶段 A：纯协议查询/编辑，全部不物化全文（期间不调 e.text()）----
+                // ① 总长 = 全文 UTF-16 单元数（O(1) 计数器）。
+                assert_eq!(
+                    e.text_length_utf16(window, cx),
+                    Some(reference.encode_utf16().count()),
+                    "total_utf16 应等于全文 UTF-16 长"
+                );
+                // ② text_for_range：文档末尾一段（跨中文/emoji/换行），切片精确。
+                let total_u16 = reference.encode_utf16().count();
+                let start_u16 = total_u16 - tail.encode_utf16().count();
+                let mut actual = None;
+                let got = e
+                    .text_for_range(start_u16..total_u16, &mut actual, window, cx)
+                    .expect("text_for_range 应命中");
+                assert_eq!(got, tail, "text_for_range 切片应精确（含中文/emoji/换行）");
+                assert_eq!(actual, Some(start_u16..total_u16), "actual_range 应回填");
+                // ③ 选区：光标到文末 → UTF-16 末端零宽选区。
+                e.set_caret(reference.len());
+                let sel = e.selected_text_range(true, window, cx).unwrap();
+                assert_eq!(sel.range, total_u16..total_u16, "caret 在文末");
+                assert!(!sel.reversed);
+                // ④ set_selected_text_range 设置中后部，UTF-16 往返无损。
+                let mid_u16 = total_u16 / 2;
+                e.set_selected_text_range(mid_u16..mid_u16 + 1, window, cx);
+                assert!(e.caret() <= reference.len(), "caret 应钳在字节界内");
+                let sel2 = e.selected_text_range(true, window, cx).unwrap();
+                assert_eq!(sel2.range, mid_u16..mid_u16 + 1, "UTF-16 往返无损");
+                // ⑤ marked 组合：字节存储 → UTF-16 换算精确；取消（ESC）清占位。
+                let caret_byte = reference.len() - tail.len();
+                e.set_caret(caret_byte);
+                let mark_u16 = reference[..caret_byte].encode_utf16().count();
+                e.replace_and_mark_utf16(None, "组合", None, cx);
+                reference.insert_str(caret_byte, "组合");
+                let marked = e.marked_text_range(window, cx).expect("有 marked");
+                assert_eq!(marked.start, mark_u16, "marked 起点 UTF-16");
+                assert_eq!(marked.end - marked.start, "组合".encode_utf16().count());
+                e.replace_text_utf16(None, "", cx);
+                reference.replace_range(
+                    caret_byte..caret_byte + "组合".len(),
+                    "",
+                );
+                // ⑥ Windows 组合序列（range=None，替换旧 marked 不堆叠）：n→nih→提交"你好"。
+                e.set_caret(reference.len());
+                e.replace_and_mark_utf16(None, "n", None, cx);
+                e.replace_and_mark_utf16(None, "nih", None, cx);
+                e.replace_text_utf16(None, "你好", cx);
+                reference.push_str("你好");
+                // ⑦ 显式 UTF-16 区间（macOS 风格）走 utf16_to_byte 换算：文末插 X。
+                let pos_u16 = reference.encode_utf16().count();
+                e.replace_text_utf16(Some(pos_u16..pos_u16), "X", cx);
+                reference.push('X');
+                // ---- 断言：阶段 A 的查询/编辑全程零次 text_shared（O(n) 全拷）----
+                assert_eq!(
+                    e.text_shared_calls(),
+                    calls0,
+                    "EntityInputHandler 的查询/编辑不得调用 text_shared——必须走行索引/切片/增量计数"
+                );
+                // ---- 收尾：全文精确比对（e.text() 触发 text_shared 属正常宿主写回路径）----
+                assert_eq!(&e.text(), &reference, "大文档协议层编辑后全文与参照逐字节一致");
+            });
+        });
+    }

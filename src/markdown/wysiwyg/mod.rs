@@ -624,6 +624,12 @@ impl WyEditor {
         self.doc.char_count()
     }
 
+    /// （仅测试）`doc.text_shared` 被调次数——B 步断言 handler 查询/编辑不再物化全文。
+    #[cfg(test)]
+    pub(crate) fn text_shared_calls(&self) -> u64 {
+        self.doc.text_shared_calls()
+    }
+
     /// 聚焦句柄（元素命中/宿主聚焦用）。
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()
@@ -871,7 +877,8 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         let r = match range {
-            Some(r) => range_from_utf16(self.doc.text_shared().as_ref(), r),
+            // 显式 UTF-16 区间（macOS/部分平台）走行粒度索引换算，O(log n + 行长)。
+            Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
             None => self
                 .marked
                 .clone()
@@ -892,7 +899,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         let byte_range = match range {
-            Some(r) => range_from_utf16(self.doc.text_shared().as_ref(), r),
+            Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
             None => self
                 .marked
                 .clone()
@@ -2519,10 +2526,8 @@ pub fn bind_keys(cx: &mut gpui::App) {
 
 /* ---------- UTF16 ↔ 字节（IME/选择器用） ---------- */
 
-fn offset_to_utf16(s: &str, offset: usize) -> usize {
-    s[..offset.min(s.len())].encode_utf16().count()
-}
-
+/// 小串内（组合文本 `new_text`，`new_selected_range` 是相对它起点的 UTF-16 偏移）的
+/// UTF-16 → 字节扫描，O(串长)（组合文本只有几个字符，不需要行索引）。
 fn offset_from_utf16(s: &str, utf16: usize) -> usize {
     let mut count = 0usize;
     for (i, c) in s.char_indices() {
@@ -2534,14 +2539,6 @@ fn offset_from_utf16(s: &str, utf16: usize) -> usize {
     s.len()
 }
 
-fn range_to_utf16(s: &str, r: Range<usize>) -> Range<usize> {
-    offset_to_utf16(s, r.start)..offset_to_utf16(s, r.end)
-}
-
-fn range_from_utf16(s: &str, r: Range<usize>) -> Range<usize> {
-    offset_from_utf16(s, r.start)..offset_from_utf16(s, r.end)
-}
-
 impl EntityInputHandler for WyEditor {
     fn text_for_range(
         &mut self,
@@ -2550,11 +2547,11 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let s = self.doc.text_shared();
-        let s_str: &str = s.as_ref();
-        let range = range_from_utf16(s_str, range_utf16);
-        *actual_range = Some(range_to_utf16(s_str, range.clone()));
-        Some(s_str[range].to_string())
+        // 行粒度 UTF-16 前缀索引换算（O(log n + 行长)）+ 区间切片——不再物化全文。
+        let range =
+            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
+        *actual_range = Some(self.doc.byte_to_utf16(range.start)..self.doc.byte_to_utf16(range.end));
+        Some(self.doc.slice_str(range))
     }
 
     fn selected_text_range(
@@ -2563,15 +2560,16 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let s = self.doc.text_shared();
-        let s_str: &str = s.as_ref();
         match self.selection() {
             Some(r) => Some(UTF16Selection {
-                range: range_to_utf16(s_str, r),
+                range: self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end),
                 reversed: self.caret < self.sel_anchor.unwrap_or(self.caret),
             }),
             None => Some(UTF16Selection {
-                range: range_to_utf16(s_str, self.caret..self.caret),
+                range: {
+                    let b = self.doc.byte_to_utf16(self.caret.min(self.len()));
+                    b..b
+                },
                 reversed: false,
             }),
         }
@@ -2580,7 +2578,7 @@ impl EntityInputHandler for WyEditor {
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.marked
             .as_ref()
-            .map(|r| range_to_utf16(self.doc.text_shared().as_ref(), r.clone()))
+            .map(|r| self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -2614,7 +2612,8 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
-        let r = range_from_utf16(self.doc.text_shared().as_ref(), range_utf16);
+        let r =
+            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
         self.caret = r.end.min(self.len());
         self.sel_anchor = Some(r.start.min(self.len()));
         *self.frame.borrow_mut() = None;
@@ -2631,7 +2630,9 @@ impl EntityInputHandler for WyEditor {
         // `caret_vis` 是元素局部坐标（`paint` 时相对元素原点记录），需叠回元素在
         // 窗口中的原点，IME/输入法候选窗才落在光标处（否则整体偏移元素原点）。
         // 组合时画在标记文本上（从 marked 起点到本次输入终点），否则画光标竖条。
-        let r = range_from_utf16(self.doc.text_shared().as_ref(), range_utf16);
+        // 换算走行索引（O(log n)），不再为判等物化全文。
+        let r =
+            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
         let w = if self.marked.as_ref().map_or(false, |m| r == *m) && r.end > r.start {
             // 组合候选：让候选窗落在整个标记文本宽度上，而不是零宽竖条。
             // 真实几何很难按字符溯源，这里用“应盖住的位置”转成可见块（至少一字符宽）。
@@ -2656,7 +2657,7 @@ impl EntityInputHandler for WyEditor {
         let f = marker.as_ref().map(|r| &**r)?;
         let off = element::source_offset_at_local(self, f, point);
         drop(marker);
-        Some(offset_to_utf16(self.doc.text_shared().as_ref(), off))
+        Some(self.doc.byte_to_utf16(off))
     }
 
     fn text_length_utf16(
@@ -2664,7 +2665,7 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.doc.text_shared().encode_utf16().count())
+        Some(self.doc.total_utf16())
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
