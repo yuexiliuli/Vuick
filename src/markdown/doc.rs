@@ -215,6 +215,14 @@ impl Doc {
         rows.into_iter().map(|r| self.assemble(r)).collect()
     }
 
+    /// IR 块按 `lines.start` 升序 → 二分查 src_line 对应的语义块。
+    /// 旧实现 `self.ir.iter().find(...)` 对窗口内每行 O(n) 全扫（15.9 万块 × 每窗口
+    /// ~百行 = 每档 rebuild 上千万次比较，滚动卡顿的隐藏大头）。
+    fn ir_block(&self, src_line: usize) -> Option<&IrBlock> {
+        let i = self.ir.partition_point(|b| b.lines.start < src_line);
+        self.ir.get(i).filter(|b| b.lines.start == src_line)
+    }
+
     /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。
     #[allow(dead_code)]
     pub(crate) fn rows_in_line_window(&self, lo_line: usize, hi_line: usize) -> Vec<DocRow> {
@@ -235,7 +243,7 @@ impl Doc {
     /// 文本行额外装配「渲染字节→源字节」编辑映射；非文本行把渲染负载（代码行/
     /// 图片源/表格网格）带进统一行。
     fn assemble(&self, r: Row) -> DocRow {
-        let block = self.ir.iter().find(|b| b.lines.start == r.src_line);
+        let block = self.ir_block(r.src_line);
         let kind = block.map_or_else(|| row_kind(r.kind), |b| b.kind);
         let lines = block.map(|b| b.lines.clone()).unwrap_or(r.src_line..r.src_line + 1);
         let code_lines = r.code_lines().to_vec();

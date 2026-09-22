@@ -204,14 +204,12 @@ pub struct WyEditor {
     /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
     /// `viewport_size` 推算并发布，measure 用上一帧的带做窗口化 shape。
     shape_band: Cell<Option<(f32, f32)>>,
-    /// 块「真实高度（px）」缓存（关键：带宽滚动时带外块沿用**已整形过的真值**，
-    /// 而非每次回到估算——否则行高在估算/真实间跳动，滚动时文字忽大忽小）。
-    /// 稀疏结构：`(代, 每块高度 Option)`，代 = `height_epoch(rgen, igen, mgen, width)`；
-    /// 代或块数变 → 整表重建（估算/整形都写回这里）。**块下标即缓存键**（代内稳定），
-    /// 避免旧实现的每块 `DefaultHasher`(SipHash) 键构造 + HashMap 查找——15.9 万块
-    /// 每次重建键构造 ~200ms+（大文档滚动卡顿主因之一）。字号/主题会改 px 量纲 →
-    /// `set_theme`/`set_font_size` 把代置失效位强制重算。
-    height_cache: RefCell<(u64, Vec<Option<f32>>)>,
+    /// 全篇**基础布局**缓存：`(代, Rc<RefCell<BlockLayout>>)`——内容/图片/数学/宽度
+    /// 代内跨档持久：滚动/带移动复用，只对带内新块做 Fenwick 点更新，不再每档对整个
+    /// O(n) 高度数组重算前缀和（旧 height_cache 键构造 + HashMap 查找 15.9 万块
+    /// ~200ms、重扫源行 ~40ms）。动态高度（折叠/数学卡片）走 `Frame.deltas` 覆盖，
+    /// 不进基表。`set_theme`/`set_font_size` 把代置失效位强制重算。
+    block_layout: RefCell<Option<(u64, Rc<std::cell::RefCell<element::BlockLayout>>)>>,
     /// 内容派生扫描缓存：`(content_gen, Rc<WyDerived>)`——滚动/带移动复用，内容变更重建。
     derived: RefCell<Option<(u64, Rc<WyDerived>)>>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
@@ -343,7 +341,7 @@ impl WyEditor {
             last_bounds: Cell::new(None),
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
-            height_cache: RefCell::new((u64::MAX, Vec::new())),
+            block_layout: RefCell::new(None),
             derived: RefCell::new(None),
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
@@ -372,9 +370,9 @@ impl WyEditor {
     pub fn set_theme(&mut self, theme: WyTheme) {
         self.theme = theme;
         *self.frame.borrow_mut() = None;
-        // 高度缓存存的是 px 真值，主题/字号变化量纲改变 → 代置失效位（否则带外沿用
+        // 基础布局存的是 px 真值，主题/字号变化量纲改变 → 代置失效位（否则带外沿用
         // 旧字号的固定 px 高，行高与带内新字号不一致，滚动跳变）。
-        *self.height_cache.borrow_mut() = (u64::MAX, Vec::new());
+        *self.block_layout.borrow_mut() = None;
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
@@ -386,8 +384,8 @@ impl WyEditor {
         }
         self.theme.set_font_size(size);
         *self.frame.borrow_mut() = None;
-        // 同 `set_theme`：字号变 → 高度缓存（px）失效。
-        *self.height_cache.borrow_mut() = (u64::MAX, Vec::new());
+        // 同 `set_theme`：字号变 → 基础布局（px）失效。
+        *self.block_layout.borrow_mut() = None;
     }
 
     /// 设置初始内容。
@@ -988,29 +986,24 @@ impl WyEditor {
     pub(crate) fn shape_band(&self) -> Option<(f32, f32)> {
         self.shape_band.get()
     }
-    pub(crate) fn cached_height(&self, block_ix: usize) -> Option<f32> {
-        self.height_cache
-            .borrow()
-            .1
-            .get(block_ix)
-            .copied()
-            .flatten()
-    }
-    pub(crate) fn cache_height(&self, block_ix: usize, height_px: f32) {
-        let mut c = self.height_cache.borrow_mut();
-        if let Some(slot) = c.1.get_mut(block_ix) {
-            *slot = Some(height_px);
-        } else if block_ix < c.1.len() {
-            c.1[block_ix] = Some(height_px);
+    /// 确保基础布局命中当前（代, 块数）：命中返回 `(false, Rc)` 供复用；未命中
+    /// 建出空布局（build_frame 随即 O(n) 填估算）并缓存，返回 `(true, Rc)`。
+    pub(crate) fn ensure_block_layout(
+        &self,
+        n_blocks: usize,
+        epoch: u64,
+    ) -> (bool, Rc<std::cell::RefCell<element::BlockLayout>>) {
+        if let Some((e, l)) = &*self.block_layout.borrow() {
+            if *e == epoch && l.borrow().n() == n_blocks {
+                return (false, l.clone());
+            }
         }
-    }
-    /// 确保高度缓存命中当前（代, 块数）——代或块数变则整表重建（估算/整形写回同表）。
-    pub(crate) fn height_cache_ensure(&self, n_blocks: usize, epoch: u64) {
-        let mut c = self.height_cache.borrow_mut();
-        if c.0 != epoch || c.1.len() != n_blocks {
-            c.0 = epoch;
-            c.1 = vec![None; n_blocks];
-        }
+        let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::new(
+            vec![0.0; n_blocks],
+            vec![0u32; n_blocks],
+        )));
+        *self.block_layout.borrow_mut() = Some((epoch, l.clone()));
+        (true, l)
     }
 
     /// 内容派生扫描缓存（全篇一遍，按 `content_gen` 缓存）——`build_frame` / paint 用，

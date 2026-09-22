@@ -173,22 +173,20 @@ pub(crate) struct RowExtra {
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
 ///
 /// **大文档窗口化**：`rows` 只含**带内**（可视带 + 缓冲）的整形行；带外块不物化
-/// `ShapedRow`，靠 `tops` / `block_src_lines` 紧凑布局索引定位（命中、光标、hscroll
-/// 只需带内行；带外光标/未来命中走 `src_line_top` 兜底）。基准：7MB/15.9 万块文档
-/// 旧实现每档滚动重建重建 15.9 万个占位 `ShapedRow`（~72MB/档）→ 只物化带内几十行。
+/// `ShapedRow`，靠 `base`（全篇基础布局，跨档持久）+ `deltas`（本帧动态覆盖）
+/// 定位（命中、光标、hscroll 只需带内行；带外光标走 `src_line_top` 兜底）。
+/// 滚动/带移动不重算全篇前缀和（Fenwick 点更新），7MB/15.9 万块 doc 从每档 ~950ms
+/// 降到 ~10ms（带内整形成本）。
 pub(crate) struct Frame {
     pub padding: Pixels,
     pub line_h: Pixels,
-    /// 仅带内的整形行（含块级卡片：数学/Mermaid；折叠 body 0 高不物化）。`top` 已填真实值。
+    /// 仅带内的整形行（含块级卡片：数学/Mermaid；折叠 body 0 高不物化）。`top` 已填有效值。
     pub rows: Vec<ShapedRow>,
-    /// 全篇每块顶 y（元素局部 px，n = [`Self::block_count`]）——带外定位/量程用。
-    pub tops: Vec<f32>,
-    /// 全篇每块高（px，n 项；带内 = 整形真高、带外 = 高度缓存/估算）。
-    /// （生产命中/光标只读 `tops`；本字段供测试断言带外高沿用缓存真值。）
-    #[allow(dead_code)]
-    pub heights: Vec<f32>,
-    /// 全篇每块起始源码行（n 项，升序）——`src_line → 块` 二分映射。
-    pub block_src_lines: Vec<u32>,
+    /// 全篇基础布局（内容/宽度代缓存，跨档持久；带内整形真高经 `set` 写回）。
+    pub base: std::rc::Rc<std::cell::RefCell<BlockLayout>>,
+    /// 本帧动态高度覆盖：`(块下标, 相对基础高的增量)`，按下标升序。
+    /// 折叠 body → −base（0 高）；数学卡片 → 卡高−base。滚动期间内容代不变即恒定。
+    pub deltas: std::rc::Rc<[(usize, f32)]>,
     pub total: Pixels,
     /// 本帧可视带（元素局部 y）；帧缓存键之一。
     pub band: (f32, f32),
@@ -203,37 +201,124 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// 全篇块总数（虚拟化量程 = `total`）。（供测试；生产用 `tops.len()`。）
+    /// `i` 左侧动态增量之和（按升序 `(块下标,增量)` 稀疏表二分）。
+    fn delta_prefix(&self, i: usize) -> f32 {
+        let d = &self.deltas;
+        let k = d.partition_point(|&(ix, _)| ix < i);
+        d[..k].iter().map(|&(_, v)| v).sum()
+    }
+    /// 下标恰为 `i` 的动态增量（无则 0）。
+    fn delta_at(&self, i: usize) -> f32 {
+        self.deltas.iter().find(|(ix, _)| *ix == i).map(|&(_, v)| v).unwrap_or(0.)
+    }
+    /// 全篇块总数。（供测试；生产用 `base.n()`。）
     #[allow(dead_code)]
     pub(crate) fn block_count(&self) -> usize {
-        self.tops.len()
+        self.base.borrow().n()
     }
-    /// 第 `i` 块顶 y（元素局部 px）。
+    /// 第 `i` 块有效顶 y（元素局部 px）= 基础前缀 + 动态增量前缀。
+    /// （供测试断言带外 top 收敛；生产光标走 `src_line_top`。）
+    #[allow(dead_code)]
     pub(crate) fn block_top(&self, i: usize) -> f32 {
-        self.tops.get(i).copied().unwrap_or(0.)
+        let base = self.base.borrow();
+        base.top(i) + self.delta_prefix(i)
     }
-    /// 第 `i` 块高（px）。（供测试断言带外高。）
+    /// 第 `i` 块有效高（px）= 基础高 + 动态增量。（供测试断言带外高沿用收敛真值。）
     #[allow(dead_code)]
     pub(crate) fn block_height(&self, i: usize) -> f32 {
-        self.heights.get(i).copied().unwrap_or(0.)
+        let base = self.base.borrow();
+        base.height(i) + self.delta_at(i)
     }
     /// 源码行 → 所在块下标（块按 `src_line` 升序连续覆盖源码行；越界归到首/末块）。
     pub(crate) fn block_index_for_src_line(&self, line: usize) -> Option<usize> {
-        if self.block_src_lines.is_empty() {
+        let base = self.base.borrow();
+        let sl = base.src_lines();
+        if sl.is_empty() {
             return None;
         }
-        let i = self
-            .block_src_lines
+        let i = sl
             .partition_point(|&s| (s as usize) <= line)
             .saturating_sub(1)
-            .min(self.block_src_lines.len() - 1);
+            .min(sl.len() - 1);
         Some(i)
     }
-    /// 源码行所在块的顶 y（元素局部 px）——带外光标/命中（未物化行）的定位兜底。
+    /// 源码行所在块的有效顶 y（元素局部 px）——带外光标/命中（未物化行）的定位兜底。
     pub(crate) fn src_line_top(&self, line: usize) -> f32 {
-        self.block_index_for_src_line(line)
-            .map(|i| self.block_top(i))
-            .unwrap_or(0.)
+        match self.block_index_for_src_line(line) {
+            Some(i) => self.block_top(i),
+            None => 0.,
+        }
+    }
+}
+
+/// 全篇块**基础布局**（按「内容/图片/数学/宽度」代每档重建一次，档内滚动/带移动
+/// **持久复用**）：`heights` 每块基础高（估算或整形真值），Fenwick 维护前缀和。
+///
+/// 动态高度（折叠 body→0、数学卡片→卡高）不走这个基表——由 [`Frame::deltas`] 稀疏
+/// 增量覆盖（按块下标升序），`block_top`/`block_height` 合并计算。好处：滚动/带移动
+/// **不再对整个 O(n) 高度数组重算前缀和**（旧实现 7MB/15.9 万块 ~40ms/档）。
+/// `set(i,h)` 点更新 O(log n)（新块整形真值收敛），`top/total` 查询 O(log n)。
+pub(crate) struct BlockLayout {
+    heights: Vec<f32>,
+    fen: Vec<f64>,
+    block_src_lines: Vec<u32>,
+}
+
+impl BlockLayout {
+    /// 由整块高度 + 起始源码行建（O(n) 建 Fenwick）。
+    pub(crate) fn new(heights: Vec<f32>, block_src_lines: Vec<u32>) -> Self {
+        let mut fen = vec![0f64; heights.len() + 1];
+        for (i, &h) in heights.iter().enumerate() {
+            let mut j = i + 1;
+            let d = h as f64;
+            while j < fen.len() {
+                fen[j] += d;
+                j += j & (!j + 1);
+            }
+        }
+        Self { heights, fen, block_src_lines }
+    }
+    /// 整表重建（同代内容变更/首次打开用；O(n)）。
+    pub(crate) fn rebuild(&mut self, heights: Vec<f32>, block_src_lines: Vec<u32>) {
+        *self = BlockLayout::new(heights, block_src_lines);
+    }
+    /// 点更新第 `i` 块高（增量改前缀和；差 ~0 跳过）。
+    pub(crate) fn set(&mut self, i: usize, h: f32) {
+        let old = self.heights[i];
+        let d = h - old;
+        if d.abs() < 1e-6 {
+            return;
+        }
+        self.heights[i] = h;
+        let mut j = i + 1;
+        let dd = d as f64;
+        while j < self.fen.len() {
+            self.fen[j] += dd;
+            j += j & (!j + 1);
+        }
+    }
+    /// 第 `i` 块 top（= 前 i 块高之和，px）。
+    pub(crate) fn top(&self, i: usize) -> f32 {
+        let mut s = 0f64;
+        let mut j = i.min(self.heights.len());
+        while j > 0 {
+            s += self.fen[j];
+            j -= j & (!j + 1);
+        }
+        s as f32
+    }
+    /// 总高（px）。
+    pub(crate) fn total(&self) -> f32 {
+        self.top(self.heights.len())
+    }
+    pub(crate) fn height(&self, i: usize) -> f32 {
+        self.heights.get(i).copied().unwrap_or(0.)
+    }
+    pub(crate) fn n(&self) -> usize {
+        self.heights.len()
+    }
+    pub(crate) fn src_lines(&self) -> &[u32] {
+        &self.block_src_lines
     }
 }
 
@@ -1842,9 +1927,11 @@ pub(crate) fn build_frame(
                 image: None,
                 extra: RowExtra::default(),
             }],
-            tops: vec![0.],
-            heights: vec![f32::from(line_h)],
-            block_src_lines: vec![0],
+            base: std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
+                vec![f32::from(line_h)],
+                vec![0],
+            ))),
+            deltas: std::rc::Rc::from(vec![]),
             total: line_h,
             band,
             width,
@@ -1859,14 +1946,17 @@ pub(crate) fn build_frame(
     let width_bits = f32::from(width).to_bits();
     let igen = editor.images_gen();
     let mgen = editor.math_gen();
-    // 高度缓存：代（内容/图片/数学/宽度）+ 每块高度（下标即键）——估算与整形写回同表。
-    editor.height_cache_ensure(n, super::height_epoch(rgen, igen, mgen, width_bits));
 
-    // 结构扫描（O(n) 行扫描，随内容代变化；build_frame 每代顶多跑一次）。
+    // 基础布局：内容/图片/数学/宽度代缓存（档内滚动/带移动复用，不重算全篇前缀和
+    // ——旧实现每次档移动对整个 O(n) 高度数组重扫 ~40ms）。仅 epoch 或块数变才 O(n)
+    // 重建（估算全篇一次，随后带内整形真高经 `set` 点收敛）。
+    let epoch = super::height_epoch(rgen, igen, mgen, width_bits);
+    let (rebuilt, base) = editor.ensure_block_layout(n, epoch);
+
+    // 结构扫描（derived 缓存 → O(1) Rc 复用）。
     let content = editor.content();
     let caret_line = editor.row_col(editor.caret()).0;
     // 数学块（`$$…$$`）：首源码行 → 张卡片；其余行折叠成 0 高（caret 在块内则整块保留源码）。
-    // 内容派生扫描已按 content_gen 缓存：滚动/带移动复用，不重扫全篇（大文档主坑）。
     let math_regions = &editor.derived().math_regions;
     let mut math_start: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -1878,9 +1968,6 @@ pub(crate) fn build_frame(
         math_body.extend(reg.range.start + 1..reg.range.end);
     }
     // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高。
-    // reveal-on-caret 仅当光标落在 **body 行**（start+1..end）时生效——光标在 marker
-    // 行上正是点击折叠后的常态，若也算「区域内有光标」则刚点的折叠会被强制展开
-    // （「点折叠却折不起来 + 多 callout 互相串」的根因）。
     let alert_fold = &editor.derived().alert_fold_regions;
     let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (rnge, folded) in alert_fold {
@@ -1889,10 +1976,7 @@ pub(crate) fn build_frame(
         }
         fold_lines.extend(rnge.start + 1..rnge.end);
     }
-    // 标题折叠（视图本地状态）：folded 集合里的标题，其 section body 行折叠成 0 高
-    // （标题行本身保留，折叠箭头画在那里）。reveal-on-caret 仅当光标**严格落在 body
-    // 行**（start+1..end）生效——光标在标题行上正是点击折叠后的常态，不算 reveal
-    // （与 callout 同一教训：否则点了折不起来）。
+    // 标题折叠（视图本地状态）。
     {
         let folded = editor.folded_headings.borrow();
         if !folded.is_empty() {
@@ -1904,155 +1988,176 @@ pub(crate) fn build_frame(
             }
         }
     }
-    let collapsed = |srcline: usize| fold_lines.contains(&srcline) || math_body.contains(&srcline);
 
-    // Pass 1：全篇块高度（文本块：缓存真值优先，无则按真实字数估算——**估算也写回缓存**，
-    // 首次过后滚动/带移动不再逐块重扫源行算字数）+ 布局数组（tops/高）+ 带内判定。
-    let mut heights: Vec<f32> = Vec::with_capacity(n);
-    let mut block_src_lines: Vec<u32> = Vec::with_capacity(n);
-    let mut in_band: Vec<bool> = Vec::with_capacity(n);
-    let mut math_card_at: Vec<Option<usize>> = Vec::with_capacity(n);
-    let mut special: Vec<bool> = Vec::with_capacity(n);
-    let mut y: f32 = 0.;
-    for i in 0..n {
-        let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
-            src_line: 0,
-            byte: 0,
-            kind: RowKind::Blank,
-            raw_len: 0,
-            aux: 1,
-        });
-        let srcline = meta.src_line as usize;
-        // A2: ```mermaid 围栏（Code 块）整块折叠成「图卡片」。
-        let is_mermaid = meta.kind == RowKind::Code
-            && doc.line_str(srcline).trim_start().starts_with("```mermaid");
-        let math_card = math_start.get(&srcline).copied();
-        let is_special = collapsed(srcline) || math_card.is_some() || is_mermaid;
-        // 仅折行文本块（段/标题/引述/列表）入高度缓存（下标 = 块号，代内稳定）。
-        // 代码/表格/图片**不入缓存**：它们不折行、`estimate_height` 与 shape 高同式
-        // （代码 = (行数+2)×code_line；图片 = 见 `image_row_height`）——入缓存反而会用
-        // 错误行高重建。
-        let cacheable = !is_special
-            && matches!(meta.kind,
-                RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet);
-        let h: f32 = if collapsed(srcline) {
-            0.
-        } else if let Some(idx) = math_card {
-            f32::from(math_card_height(editor, &math_regions[idx]))
-        } else if is_mermaid {
-            // 由围栏内容行重建源码算卡片高（与 shape_code_row 一致）。
-            let mut src = String::new();
-            for k in 0..meta.aux {
-                if k > 0 {
-                    src.push('\n');
-                }
-                src.push_str(&doc.line_str(srcline + 1 + k as usize));
-            }
-            f32::from(mermaid_card_height(&src))
-        } else if meta.kind == RowKind::Image {
-            // 图片行：用当前加载尺寸（或占位默认）按 `shape_image_row` 同式算高——
-            // 占位→真实尺寸由 `igen` 触发帧重建，但带内外必须用同一公式，否则
-            // 加载后真实高 ≠ 带外估算高，滚动（尤其到文档末端）会跳。不物化行，
-            // 直接行文本取 src（`parse_image_line`）。
-            let src = crate::markdown::parser::parse_image_line(doc.line_str(srcline).trim())
-                .map(|(_, s)| s)
-                .unwrap_or_default();
-            f32::from(image_row_height(editor, &src, avail))
-        } else {
-            match if cacheable { editor.cached_height(i) } else { None } {
-                Some(h) => h,
-                None => {
-                    let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
-                    let eh = f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h));
-                    // 估算也入缓存：滚动/带移动复用，避免逐块重扫源行（大文档主坑）。
-                    if cacheable {
-                        editor.cache_height(i, eh);
-                    }
-                    eh
-                }
-            }
-        };
-        heights.push(h);
-        block_src_lines.push(meta.src_line);
-        let bottom = y + h;
-        in_band.push(bottom > band_lo && y < band_hi);
-        // 数学卡片块在 pass 2 不入带内 shape（pass 3 直接装配）；折叠 body 0 高不 shape。
-        special.push(collapsed(srcline) || math_card.is_some());
-        math_card_at.push(math_card);
-        y = bottom;
-    }
-
-    // Pass 2：带内非特殊块合并成窗口物化 + shape，真实高度（px）写回缓存——带外再遇
-    // 此块沿用**整形的真值高度**（标题 / 行内公式撑高行都算准了），带内/带外 total 完全
-    // 一致 → 滚动不跳。折行代码/长段落与「估算不折行」的偏差由缓存消除；代码/表格
-    // （无折行、估算同式）不入缓存。
-    let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
-    let mut i = 0;
-    while i < n {
-        if !(in_band[i] && !special[i]) {
-            i += 1;
-            continue;
-        }
-        let lo = i;
-        while i < n && in_band[i] && !special[i] {
-            i += 1;
-        }
-        let hi = i;
-        let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
-        for (j, r) in docrows.into_iter().enumerate() {
-            let k = lo + j;
-            let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
-            heights[k] = f32::from(srow.height);
-            if let Some(m) = doc.block_meta(k)
-                && matches!(m.kind,
-                    RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet)
+    if rebuilt {
+        // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关——折叠 body
+        // 与数学源行都用普通段高估算，动态覆盖走 deltas）+ 起始源码行，一次物化布局。
+        let mut heights = Vec::with_capacity(n);
+        let mut src_lines = Vec::with_capacity(n);
+        for i in 0..n {
+            let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
+                src_line: 0,
+                byte: 0,
+                kind: RowKind::Blank,
+                raw_len: 0,
+                aux: 1,
+            });
+            let srcline = meta.src_line as usize;
+            let h: f32 = if meta.kind == RowKind::Code
+                && doc.line_str(srcline).trim_start().starts_with("```mermaid")
             {
-                // 真实整形高度写回缓存（覆盖估算）→ 带外沿用真值，滚动不跳。
-                editor.cache_height(k, f32::from(srow.height));
+                // A2: ```mermaid 围栏 → 图卡片高（与 shape_code_row 同式）。
+                let mut src = String::new();
+                for k in 0..meta.aux {
+                    if k > 0 {
+                        src.push('\n');
+                    }
+                    src.push_str(&doc.line_str(srcline + 1 + k as usize));
+                }
+                f32::from(mermaid_card_height(&src))
+            } else if meta.kind == RowKind::Image {
+                // 图片行：用当前加载尺寸按 `shape_image_row` 同式算高（占位→真实由
+                // `igen` 触发整表重建，带内外必须同一公式防滚动跳）。
+                let src = crate::markdown::parser::parse_image_line(doc.line_str(srcline).trim())
+                    .map(|(_, s)| s)
+                    .unwrap_or_default();
+                f32::from(image_row_height(editor, &src, avail))
+            } else {
+                let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
+                f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h))
+            };
+            heights.push(h);
+            src_lines.push(meta.src_line);
+        }
+        base.borrow_mut().rebuild(heights, src_lines);
+    }
+
+    // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高），每档按 caret/折叠态重算（通常很小）。
+    let mut dyn_map: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    {
+        let base_br = base.borrow();
+        let src_lines = base_br.src_lines();
+        let block_ix_of = |srcline: usize| -> usize {
+            src_lines
+                .partition_point(|&s| (s as usize) <= srcline)
+                .saturating_sub(1)
+                .min(src_lines.len() - 1)
+        };
+        for &srcline in fold_lines.iter() {
+            let ix = block_ix_of(srcline);
+            dyn_map.insert(ix, -base_br.height(ix));
+        }
+        for &srcline in math_body.iter() {
+            let ix = block_ix_of(srcline);
+            dyn_map.insert(ix, -base_br.height(ix));
+        }
+        for (&srcline, &ridx) in math_start.iter() {
+            let ix = block_ix_of(srcline);
+            let card_h = f32::from(math_card_height(editor, &math_regions[ridx]));
+            // 折叠优先：同一行若被折叠（0 高）则不装卡片。
+            dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
+        }
+    }
+    let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
+    deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
+    let deltas: std::rc::Rc<[(usize, f32)]> = deltas_vec.into_boxed_slice().into();
+
+    // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
+    let eff_top = |i: usize| -> f32 {
+        let b = base.borrow();
+        let k = deltas.partition_point(|&(ix, _)| ix < i);
+        b.top(i) + deltas[..k].iter().map(|&(_, v)| v).sum::<f32>()
+    };
+    // 二分终止右闭（k ∈ [0, n]）：返回有效前缀满足谓词的 k 计数。
+    let count_true = |pred: &dyn Fn(usize) -> bool| -> usize {
+        let mut l = 0usize;
+        let mut r = n + 1;
+        while l < r {
+            let m = (l + r) / 2;
+            if pred(m) {
+                l = m + 1;
+            } else {
+                r = m;
             }
-            shaped.push((k, srow));
+        }
+        l
+    };
+    let i0 = count_true(&|k: usize| eff_top(k) <= band_lo).saturating_sub(1);
+    let i1 = count_true(&|k: usize| eff_top(k) < band_hi).min(n);
+
+    // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
+    let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
+    {
+        let mut i = i0;
+        while i < i1 {
+            let srcline = base.borrow().src_lines()[i] as usize;
+            let blocked = fold_lines.contains(&srcline)
+                || math_body.contains(&srcline)
+                || math_start.contains_key(&srcline);
+            if blocked {
+                i += 1;
+                continue;
+            }
+            let lo = i;
+            while i < i1 {
+                let s = base.borrow().src_lines()[i] as usize;
+                if fold_lines.contains(&s) || math_body.contains(&s) || math_start.contains_key(&s) {
+                    break;
+                }
+                i += 1;
+            }
+            let hi = i;
+            let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
+            for (j, r) in docrows.into_iter().enumerate() {
+                let k = lo + j;
+                let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
+                base.borrow_mut().set(k, f32::from(srow.height));
+                shaped.push((k, srow));
+            }
         }
     }
 
-    // Pass 3：按块序用**最终高度**（带内整形真值、带外缓存/估算）重算 tops，只物化带内行。
-    let mut tops: Vec<f32> = Vec::with_capacity(n);
+    // Pass 3：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
     let mut rows: Vec<ShapedRow> = Vec::new();
     let mut shaped_iter = shaped.into_iter().peekable();
-    let mut total = 0f32;
-    for i in 0..n {
-        tops.push(total);
-        let h = heights[i];
-        if !in_band[i] {
-            total += h;
-            continue;
+    let total = {
+        let b = base.borrow();
+        b.total()
+    } + deltas.iter().map(|&(_, v)| v).sum::<f32>();
+    // 各路行按 top 从 base+deltas 现算；total 已含全部。
+    for i in i0..i1 {
+        let srcline = base.borrow().src_lines()[i] as usize;
+        let b = base.borrow();
+        let h = b.height(i) + deltas.iter().find(|(ix, _)| *ix == i).map(|&(_, v)| v).unwrap_or(0.);
+        let top = {
+            let k = deltas.partition_point(|&(ix, _)| ix < i);
+            b.top(i) + deltas[..k].iter().map(|&(_, v)| v).sum::<f32>()
+        };
+        drop(b);
+        if h <= 0. {
+            continue; // 折叠 body / 数学 body：0 高不物化
         }
-        let srcline = block_src_lines[i] as usize;
-        // 数学块卡片（A1）：在首源码行装配整张卡片（折叠/0 高不装，避免画 label/图）。
-        if !collapsed(srcline)
-            && let Some(&idx) = math_card_at[i].as_ref()
+        let folded_here = fold_lines.contains(&srcline) || math_body.contains(&srcline);
+        if !folded_here
+            && let Some(&ridx) = math_start.get(&srcline)
         {
-            let reg = &math_regions[idx];
-            rows.push(build_math_card_row(reg, srcline, px(h), px(total)));
-            total += h;
+            // 数学块卡片（A1）。
+            let reg = &math_regions[ridx];
+            rows.push(build_math_card_row(reg, srcline, px(h), px(top)));
             continue;
         }
         if shaped_iter.peek().map(|(k, _)| *k) == Some(i) {
             let (_, mut srow) = shaped_iter.next().unwrap();
-            srow.top = px(total);
-            total += f32::from(srow.height);
+            srow.top = px(top);
             rows.push(srow);
-        } else {
-            // 带内但未整形 = 折叠 body 0 高（不物化，无视觉范围）。
-            total += h;
         }
     }
     Frame {
         padding,
         line_h,
         rows,
-        tops,
-        heights,
-        block_src_lines,
+        base,
+        deltas,
         total: px(total),
         band,
         width,
