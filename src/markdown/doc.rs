@@ -18,7 +18,7 @@ use std::ops::Range;
 use gpui::SharedString;
 use gpui_component::input::Rope;
 
-use super::ir::{build_ir, IrBlock, IrKind};
+use super::ir::IrKind;
 use super::parser::{
     parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind, TableData,
 };
@@ -98,11 +98,18 @@ enum DocSrc {
     Rope(Rope),
 }
 
-/// 共享文档：IR（语义） + BlockIndex（结构索引） + 源（窗口化物化）。
+/// 共享文档：BlockIndex（结构索引，含逐块字节/行号） + 源（窗口化物化）。
+///
+/// 不存 `ir`（仅 kind/行区间，可从索引 + `row_kind` 同式推出；`build_ir` 只留在
+/// `ir`/`parity` 作金标准与 diff 司机）——省掉每次打开/编辑对全篇 `build_ir` 的一次
+/// O(n) 扫描（7MB/15.9 万块 ~800ms）。
 pub(crate) struct Doc {
     src: DocSrc,
     index: parser::BlockIndex,
-    ir: Vec<IrBlock>,
+    /// 与 `src` 同步的 rope 快照（COW）——`reopen` 用
+    /// `scan_blocks_incremental_rope`（mid-line 插入 0.3ms，替代全量 `scan_blocks`
+    /// 的 ~1.2s）与自维护行起始。
+    rope: Rope,
     /// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义）——行源文本定位用。
     line_starts: Vec<usize>,
 }
@@ -111,20 +118,19 @@ impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
         let index = parser::scan_blocks(src.as_ref());
-        let ir = build_ir(src.as_ref());
         let line_starts = parser::build_line_starts_u32(src.as_ref())
             .into_iter()
             .map(|b| b as usize)
             .collect();
-        Self { src: DocSrc::Str(src), index, ir, line_starts }
+        let rope = Rope::from(&*src);
+        Self { src: DocSrc::Str(src), index, rope, line_starts }
     }
 
-    /// 打开大文档（`Rope` 源，COW）：块索引与 IR 各物化一次（O(n)，毫秒级），
-    /// 但是**窗口化物化行**走 rope 切片，不整份持有字符串——与预览一致。
+    /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
+    /// 切片，不整份持有字符串——与预览一致。
     #[allow(dead_code)]
     pub(crate) fn open_rope(rope: Rope) -> Self {
         let index = parser::scan_blocks_rope(&rope);
-        let ir = build_ir(&rope.to_string());
         let line_starts = {
             let mut v = vec![0usize];
             for i in 0..rope.len() {
@@ -134,12 +140,106 @@ impl Doc {
             }
             v
         };
-        Self { src: DocSrc::Rope(rope), index, ir, line_starts }
+        let src = DocSrc::Rope(rope.clone());
+        Self { src, index, rope, line_starts }
+    }
+
+    /// **增量重开**（一次编辑后）：`new_str` 到 `self` 的替换 `[edit_old) → 新文本`。
+    /// - 块索引：`scan_blocks_incremental_rope`（mid-line 插入 O(变化区+尾部平移)，
+    ///   行首/结构性编辑自动回退全量）。
+    /// - 行起始：增量重建（未变前缀 + 变化区重扫 + 尾部整体平移），不做全篇逐字节扫。
+    /// 同步于 UI 线程，把大文档每键 ~2s 的 `Doc::open`（scan_blocks+build_ir+行表）
+    /// 压到几十 ms。
+    pub(crate) fn reopen(
+        &mut self,
+        new_str: &str,
+        old_len: usize,
+        edit_old: Range<usize>,
+        inserted_len: usize,
+    ) {
+        let start = edit_old.start.min(old_len);
+        let end = edit_old.end.min(old_len);
+        let mut new_rope = self.rope.clone();
+        if end > start {
+            new_rope.remove(start..end);
+        }
+        let ins_end = (start + inserted_len).min(new_str.len());
+        if ins_end > start {
+            new_rope.insert(start, &new_str[start..ins_end]);
+        }
+        let dirty = start..start + inserted_len;
+        let new_index =
+            parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
+        let new_line_starts =
+            Self::incremental_line_starts(&self.line_starts, new_str.as_bytes(), old_len, edit_old);
+        self.rope = new_rope;
+        self.index = new_index;
+        self.line_starts = new_line_starts;
+        self.src = DocSrc::Str(SharedString::from(new_str));
+    }
+
+    /// 增量行起始重建（见 [`Self::reopen`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
+    /// 重扫 + 尾部（start > 编辑终点）整体平移 `delta`。O(变化区 + 尾部 memcpy)。
+    fn incremental_line_starts(
+        old: &[usize],
+        new_bytes: &[u8],
+        old_len: usize,
+        edit_old: Range<usize>,
+    ) -> Vec<usize> {
+        let delta = new_bytes.len() as i64 - old_len as i64;
+        // 前缀：所有 start ≤ 编辑起点 的行（其行首字节不变）。
+        let keep = old.partition_point(|&s| s <= edit_old.start);
+        let mut out: Vec<usize> = old[..keep].to_vec();
+        // 对齐点 = 首个旧 start > 编辑终点（新坐标 +delta）。
+        let j = old.partition_point(|&s| s <= edit_old.end.min(old_len));
+        let region_start = old.get(keep.saturating_sub(1)).copied().unwrap_or(0);
+        let region_end = if j < old.len() {
+            (old[j] as i64 + delta).clamp(region_start as i64, new_bytes.len() as i64) as usize
+        } else {
+            new_bytes.len().max(region_start)
+        };
+        // 变化区重扫 '\n' → 各行首字节（到对齐点；不重复 push `region_start` 本身）。
+        // 边界处理：区域尾部对齐点的行起始由「尾部整体平移」产出（= region_end），
+        // 区域扫描要**跳过恰落在 region_end 的 '\n' 行起始**（否则该行起始重复一遍）；
+        // 仅当没有尾部（编辑近文末，j==len → region_end==new_len）时才保留它
+        // （延续 `build_line_starts` 对末尾空行的语义）。
+        let mut i = region_start;
+        while i < region_end {
+            if new_bytes[i] == b'\n' {
+                let s = i + 1;
+                if s < region_end || j >= old.len() {
+                    out.push(s);
+                }
+            }
+            i += 1;
+        }
+        // 尾部整体平移。
+        for &s in &old[j..] {
+            out.push((s as i64 + delta).max(0) as usize);
+        }
+        out
     }
 
     /// 块总数（虚拟化滚动条量程用，O(1)）。
     pub(crate) fn block_count(&self) -> usize {
         self.index.blocks.len()
+    }
+
+    /// 源码行 → 包含它的块下标（块按 `src_line` 升序连续覆盖；越界归到首/末块）。
+    /// 编辑后块下标的稳定性判定（`pending_patch_blocks`）依赖它。
+    pub(crate) fn block_index_for_line(&self, line: usize) -> usize {
+        let b = &self.index.blocks;
+        if b.is_empty() {
+            return 0;
+        }
+        b.partition_point(|m| (m.src_line as usize) <= line)
+            .saturating_sub(1)
+            .min(b.len() - 1)
+    }
+    /// 第 `i` 块的类型（供 `replace_range` 判定编辑是否落在代码/表格块内——这类编辑
+    /// 走结构性重建，避免 patch 用到错误的块归属）。
+    pub(crate) fn block_kind_at_index(&self, i: usize) -> Option<RowKind> {
+        self.index.blocks.get(i).map(|m| m.kind)
     }
 
     /// 每行起始字节偏移（`split('\n')` 语义，长度 = 行数）——`row_col`/`line_start`/
@@ -212,15 +312,7 @@ impl Doc {
             DocSrc::Str(s) => parse_block_window(s.as_ref(), &self.index, lo, hi),
             DocSrc::Rope(r) => parse_block_window_rope(r, &self.index, lo, hi),
         };
-        rows.into_iter().map(|r| self.assemble(r)).collect()
-    }
-
-    /// IR 块按 `lines.start` 升序 → 二分查 src_line 对应的语义块。
-    /// 旧实现 `self.ir.iter().find(...)` 对窗口内每行 O(n) 全扫（15.9 万块 × 每窗口
-    /// ~百行 = 每档 rebuild 上千万次比较，滚动卡顿的隐藏大头）。
-    fn ir_block(&self, src_line: usize) -> Option<&IrBlock> {
-        let i = self.ir.partition_point(|b| b.lines.start < src_line);
-        self.ir.get(i).filter(|b| b.lines.start == src_line)
+        rows.into_iter().enumerate().map(|(j, r)| self.assemble(lo + j, r)).collect()
     }
 
     /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。
@@ -239,13 +331,18 @@ impl Doc {
         self.rows_in_block_window(lo, hi)
     }
 
-    /// 把预览侧一个块行装成统一行：kind/行区间取自 IR（金标准），文本取自预览，
-    /// 文本行额外装配「渲染字节→源字节」编辑映射；非文本行把渲染负载（代码行/
-    /// 图片源/表格网格）带进统一行。
-    fn assemble(&self, r: Row) -> DocRow {
-        let block = self.ir_block(r.src_line);
-        let kind = block.map_or_else(|| row_kind(r.kind), |b| b.kind);
-        let lines = block.map(|b| b.lines.clone()).unwrap_or(r.src_line..r.src_line + 1);
+    /// 把预览侧一个块行装成统一行：kind 用 `row_kind`（与 `ir` 金标准同式，parity 钉死），
+    /// 行区间用**索引自身**（块 k 覆盖 `[src_line, 下一块 src_line)`，与窗口切片同源——
+    /// 不再为 kind/行区间在整篇 IR 上二分/全扫）。
+    fn assemble(&self, k: usize, r: Row) -> DocRow {
+        let kind = row_kind(r.kind);
+        let n = self.index.blocks.len();
+        let lines = if k + 1 < n {
+            let next = self.index.blocks.get(k + 1).map(|b| b.src_line as usize).unwrap_or(r.src_line + 1);
+            r.src_line..next.max(r.src_line + 1)
+        } else {
+            r.src_line..self.line_starts.len().max(r.src_line + 1)
+        };
         let code_lines = r.code_lines().to_vec();
         let byte_map = match r.kind {
             RowKind::Paragraph

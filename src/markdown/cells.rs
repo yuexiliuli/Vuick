@@ -61,6 +61,7 @@ pub(crate) fn parse_aligns(cells: &[&str]) -> Option<Vec<CellAlign>> {
 
 /// 表格行的原始单元格（trim + 去掉首尾外竖线压出的空 cell，**保留转义原样**）——
 /// 与 live `table_cells` 同语义；预览显示层在其上叠加解义。用作 IR 的表格结构。
+#[allow(dead_code)]
 pub(crate) fn raw_cells(line: &str) -> Vec<String> {
     let t = line.trim();
     let t = t.strip_prefix('|').unwrap_or(t);

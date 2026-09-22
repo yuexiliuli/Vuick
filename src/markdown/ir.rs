@@ -33,6 +33,7 @@ pub(crate) enum IrKind {
 
 /// 表格块的结构（raw，保留转义，与 live `table_cells` 同语义；预览显示层在其上解义）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct IrTable {
     pub(crate) header: Vec<String>,
     pub(crate) rows: Vec<Vec<String>>,
@@ -41,6 +42,7 @@ pub(crate) struct IrTable {
 
 /// 一个 IR 块：kind + 覆盖的源码行区间（半开）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) struct IrBlock {
     pub(crate) kind: IrKind,
     pub(crate) lines: Range<usize>,
@@ -53,6 +55,7 @@ pub(crate) struct IrBlock {
 /// 从源码产出一份块级 IR。围栏/表格判定与 live 一致（` ``` ` 围栏奇偶、
 /// `is_table_row` 表区域），行内构造识别复用 `inline_style` 纯函数
 /// （见 parity 差异清单：`~~~`/math/缩进标题等已知不在此对齐子集）。
+#[allow(dead_code)]
 pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
     let lines: Vec<&str> = src.split('\n').collect();
     let n = lines.len();

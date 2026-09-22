@@ -1947,11 +1947,24 @@ pub(crate) fn build_frame(
     let igen = editor.images_gen();
     let mgen = editor.math_gen();
 
-    // 基础布局：内容/图片/数学/宽度代缓存（档内滚动/带移动复用，不重算全篇前缀和
-    // ——旧实现每次档移动对整个 O(n) 高度数组重扫 ~40ms）。仅 epoch 或块数变才 O(n)
-    // 重建（估算全篇一次，随后带内整形真高经 `set` 点收敛）。
-    let epoch = super::height_epoch(rgen, igen, mgen, width_bits);
+    // 基础布局：代 = `(struct_ver, 图片/数学/宽度)`。滚动/带移动与**非结构性编辑**
+    // 都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
+    // 数组重算前缀和（旧实现在内容代变化时重扫全篇 ~400ms，是「一编辑就卡」之一）。
+    let epoch = super::height_epoch(editor.struct_ver(), igen, mgen, width_bits);
     let (rebuilt, base) = editor.ensure_block_layout(n, epoch);
+    // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
+    if !rebuilt
+        && let Some(ixs) = editor.take_pending_patch_blocks()
+    {
+        let mut b = base.borrow_mut();
+        for i in ixs.into_iter().filter(|&i| i < n) {
+            if let Some(meta) = doc.block_meta(i) {
+                let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
+                let h = f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h));
+                b.set(i, h);
+            }
+        }
+    }
 
     // 结构扫描（derived 缓存 → O(1) Rc 复用）。
     let content = editor.content();
@@ -2031,7 +2044,6 @@ pub(crate) fn build_frame(
         }
         base.borrow_mut().rebuild(heights, src_lines);
     }
-
     // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高），每档按 caret/折叠态重算（通常很小）。
     let mut dyn_map: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
     {
@@ -2665,4 +2677,5 @@ impl Element for WyEditorElement {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
 

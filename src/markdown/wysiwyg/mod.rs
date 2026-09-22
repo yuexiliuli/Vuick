@@ -204,12 +204,21 @@ pub struct WyEditor {
     /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
     /// `viewport_size` 推算并发布，measure 用上一帧的带做窗口化 shape。
     shape_band: Cell<Option<(f32, f32)>>,
-    /// 全篇**基础布局**缓存：`(代, Rc<RefCell<BlockLayout>>)`——内容/图片/数学/宽度
-    /// 代内跨档持久：滚动/带移动复用，只对带内新块做 Fenwick 点更新，不再每档对整个
-    /// O(n) 高度数组重算前缀和（旧 height_cache 键构造 + HashMap 查找 15.9 万块
-    /// ~200ms、重扫源行 ~40ms）。动态高度（折叠/数学卡片）走 `Frame.deltas` 覆盖，
-    /// 不进基表。`set_theme`/`set_font_size` 把代置失效位强制重算。
+    /// 全篇**基础布局**缓存：`(代, Rc<RefCell<BlockLayout>>)`——rolling/带移动与
+    /// **非结构性编辑**都复用（只对受影响块做 Fenwick 点更新），代 ≠ 内容代：
+    /// 由 `struct_ver`/图片/数学/宽度组成。结构性变更（换行/围栏/表格等改了块数或
+    /// 块序）才整篇重建。`set_theme`/`set_font_size` 把代置失效位强制重算。
     block_layout: RefCell<Option<(u64, Rc<std::cell::RefCell<element::BlockLayout>>)>>,
+    /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
+    /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
+    struct_ver: Cell<u64>,
+    /// `$` 出现次数（内容级增量计数；`derived` 的数学预筛用，免全篇重扫）。
+    math_dollar_cnt: Cell<usize>,
+    /// `[!` 出现次数（`derived` 的警报/callout 预筛用，免全篇重扫）。
+    alert_marker_cnt: Cell<usize>,
+    /// 最近一次编辑受影响（需重估高度）的块下标；`build_frame` 消费后清空。
+    /// `None` = 无（或结构性编辑 → 整篇重建，不进此表）。
+    pending_patch_blocks: RefCell<Option<Vec<usize>>>,
     /// 内容派生扫描缓存：`(content_gen, Rc<WyDerived>)`——滚动/带移动复用，内容变更重建。
     derived: RefCell<Option<(u64, Rc<WyDerived>)>>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
@@ -304,10 +313,12 @@ pub(crate) fn inline_math_key(latex: &str) -> SharedString {
     format!("inline:{latex}").into()
 }
 
-/// 高度缓存代：`(rgen, igen, mgen, shaping 宽)` 折成一个 u64——任一变 → 整表重算。
+/// 基础布局代：`(struct_ver, igen, mgen, shaping 宽)` 折成一个 u64——**结构性内容**
+/// /图片/数学/宽度 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，
+/// 只做 Fenwick 点更新（编辑每键省掉旧实现在内容代变化时对全篇的估计重扫 ~400ms）。
 /// 纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉 ~200ms）。
-pub(crate) fn height_epoch(rgen: u64, igen: u64, mgen: u64, width_bits: u32) -> u64 {
-    let a = rgen ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+pub(crate) fn height_epoch(struct_ver: u64, igen: u64, mgen: u64, width_bits: u32) -> u64 {
+    let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
     let x = a ^ b.rotate_left(32);
     x ^ x >> 33
@@ -342,6 +353,10 @@ impl WyEditor {
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
             block_layout: RefCell::new(None),
+            struct_ver: Cell::new(0),
+            pending_patch_blocks: RefCell::new(None),
+            math_dollar_cnt: Cell::new(0),
+            alert_marker_cnt: Cell::new(0),
             derived: RefCell::new(None),
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
@@ -405,7 +420,7 @@ impl WyEditor {
     }
 
     /// 覆盖源并重建文档模型。
-    pub fn set_source_text(&mut self, text: &str) {
+    pub     fn set_source_text(&mut self, text: &str) {
         self.content = SharedString::from(text);
         self.doc = Doc::open(self.content.clone());
         self.rebuild_block_regions();
@@ -415,6 +430,13 @@ impl WyEditor {
         self.redo_stack.clear();
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        // 派生扫描的**标记计数器**（全篇一次 O(n)，之后增量维护 O(编辑)）——
+        // derived() 预筛用计数，避免每次内容变更对 7MB 全篇 `contains('$')` 重扫
+        // （debug 下 ~100ms/键）。
+        self.math_dollar_cnt.set(text.bytes().filter(|&b| b == b'$').count());
+        self.alert_marker_cnt.set(text.matches("[!").count());
+        self.struct_ver.set(0);
+        *self.pending_patch_blocks.borrow_mut() = None;
     }
 
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
@@ -986,8 +1008,16 @@ impl WyEditor {
     pub(crate) fn shape_band(&self) -> Option<(f32, f32)> {
         self.shape_band.get()
     }
-    /// 确保基础布局命中当前（代, 块数）：命中返回 `(false, Rc)` 供复用；未命中
-    /// 建出空布局（build_frame 随即 O(n) 填估算）并缓存，返回 `(true, Rc)`。
+    /// 内容结构版本（基础布局代组成；结构性编辑才递增）。
+    pub(crate) fn struct_ver(&self) -> u64 {
+        self.struct_ver.get()
+    }
+    /// 取走待修补（重估高度）的块下标（编辑后一帧用；无则 None）。
+    pub(crate) fn take_pending_patch_blocks(&self) -> Option<Vec<usize>> {
+        self.pending_patch_blocks.borrow_mut().take()
+    }
+    /// 校验基础布局命中当前（代, 块数）：命中返回 `(false, Rc)` 供复用；未命中
+    /// 建出空布局（build_frame 随即 O(n) 填估算/或 patch）并缓存，返回 `(true, Rc)`。
     pub(crate) fn ensure_block_layout(
         &self,
         n_blocks: usize,
@@ -1007,7 +1037,10 @@ impl WyEditor {
     }
 
     /// 内容派生扫描缓存（全篇一遍，按 `content_gen` 缓存）——`build_frame` / paint 用，
-    /// 避免滚动/每帧重复全篇扫描（大文档卡顿主因之一）。
+    /// 避免滚动/每帧重复全篇扫描（大文档卡顿主因之一）。**标记计数器预筛**（增量维护，
+    /// 见 `replace_range`）：无 `$` → `math_regions` 空；无 `[!` → 两个 alert 扫描空。
+    /// 7MB 大文档 `math_regions` 全篇行切分+扫描 ~390ms——无数学的文档（如大文档
+    /// 测试）编辑时每次内容变更都能省掉这 440ms。
     pub(crate) fn derived(&self) -> Rc<WyDerived> {
         let cgen = self.content_gen.get();
         if let Some((g, d)) = &*self.derived.borrow() {
@@ -1017,9 +1050,21 @@ impl WyEditor {
         }
         let content = self.content.as_ref();
         let d = WyDerived {
-            math_regions: inline_style::math_regions(content),
-            alert_fold_regions: inline_style::alert_fold_regions(content),
-            alert_region_kinds: inline_style::alert_region_kinds(content),
+            math_regions: if self.math_dollar_cnt.get() > 0 {
+                inline_style::math_regions(content)
+            } else {
+                Vec::new()
+            },
+            alert_fold_regions: if self.alert_marker_cnt.get() > 0 {
+                inline_style::alert_fold_regions(content)
+            } else {
+                Vec::new()
+            },
+            alert_region_kinds: if self.alert_marker_cnt.get() > 0 {
+                inline_style::alert_region_kinds(content)
+            } else {
+                std::collections::HashMap::new()
+            },
         };
         let d = Rc::new(d);
         *self.derived.borrow_mut() = Some((cgen, d.clone()));
@@ -1379,12 +1424,53 @@ impl WyEditor {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
-        let mut next = String::with_capacity(s.len() - r.len() + text.len());
+        let prev_len = s.len();
+        let mut next = String::with_capacity(prev_len - r.len() + text.len());
         next.push_str(&s[..r.start]);
         next.push_str(text);
         next.push_str(&s[r.end..]);
+        // 增量重建 Doc：rope COW 编辑 + `scan_blocks_incremental_rope`（mid-line 插入
+        // ~0.3ms）+ 增量行起始——替代旧 `Doc::open`（scan_blocks+build_ir+行表 ~2s /
+        // 键，7MB 大文档「一编辑就卡死」的根因）。结构性变更自动回退（仍只一次，
+        // 且已省掉 build_ir 的 ~800ms）。
+        // 同时按「是否结构性」更新基础布局：非结构性编辑 → `struct_ver` 不变、记
+        // 待修补块（build_frame 只对该块 Fenwick 点更新高度，省掉整篇重估 ~400ms）；
+        // 结构性（跨行/代码表格/围栏破坏块序）→ `struct_ver` 递增 → 整篇重建。
+        let edit_line = self.row_col(r.start).0;
+        let prev_count = self.doc.block_count();
+        let in_code_table = {
+            let blk = self.doc.block_index_for_line(edit_line);
+            matches!(
+                self.doc.block_kind_at_index(blk),
+                Some(crate::markdown::parser::RowKind::Code)
+                    | Some(crate::markdown::parser::RowKind::Table)
+            )
+        };
+        let r_old = r.clone();
+        self.doc.reopen(&next, prev_len, r_old, text.len());
+        let cross_newline =
+            text.contains('\n') || s[r.start..r.end].contains('\n') || text.contains('\r');
+        let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
+        let count_same = self.doc.block_count() == prev_count;
+        let structural = cross_newline || in_code_table || breaks_fence || !count_same;
+        if structural {
+            self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
+            *self.pending_patch_blocks.borrow_mut() = None;
+        } else {
+            // 非结构性：块下标稳定，记受影响的编辑行块。
+            let blk = self.doc.block_index_for_line(edit_line);
+            *self.pending_patch_blocks.borrow_mut() = Some(vec![blk]);
+        }
+        let removed = &s[r.start..r.end];
+        self.math_dollar_cnt.set(
+            self.math_dollar_cnt.get()
+                + text.bytes().filter(|&b| b == b'$').count()
+                - removed.bytes().filter(|&b| b == b'$').count(),
+        );
+        self.alert_marker_cnt.set(
+            self.alert_marker_cnt.get() + text.matches("[!").count() - removed.matches("[!").count(),
+        );
         self.content = SharedString::from(next);
-        self.doc = Doc::open(self.content.clone());
         self.rebuild_block_regions();
         self.caret = (r.start + text.len()).min(self.content.len());
         self.sel_anchor = None;
