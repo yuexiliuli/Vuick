@@ -42,11 +42,6 @@ use gpui_component::{Icon, IconName};
 // WYSIWYG 预览编辑——本项目 `crate::markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
 use crate::markdown::{WyEditor, WyEvent};
 
-/// WYSIWYG 内容镜像回源码编辑区的**去抖窗口**：大文档（6.4MB）每键 O(n) 镜像（全文
-/// 复制 + 行/字计数 + 源码编辑区 `set_text` 级联重解析）会卡 7-8s——停手该时长后才
-/// 执行一轮镜像，打字期间只置脏（O(1)）。
-const LIVE_MIRROR_DEBOUNCE_MS: u64 = 400;
-
 use crate::actions::*;
 use crate::config::layout::{
     DEFAULT_FONT_SIZE, FONT_MAX, FONT_MIN, MENU_BAR_H, SIDEBAR_WIDTH, SPLIT_RATIO_MAX,
@@ -202,10 +197,6 @@ pub struct EditorApp {
     /// 预览同步的代序号：每轮去抖发起时 +1；后台 `scan_blocks` 结果只允许最新代
     /// 落盘，旧代迟到结果直接丢弃（防旧内容覆盖新编辑）。
     preview_seq: u64,
-    /// WYSIWYG（`live2`/WyEditor）内容**镜像回源码编辑区**的去抖代序号：每键置脏时
-    /// +1；停手 [`LIVE_MIRROR_DEBOUNCE_MS`] 后的镜像只允许最新代执行（大文档每键
-    /// O(n)→镜像 7-8s 卡顿的根因；防抖后只写最后一次停手的一轮，且陈旧任务作废）。
-    live_mirror_seq: u64,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
@@ -322,7 +313,6 @@ impl EditorApp {
             preview_pending: false,
             preview_syncing: false,
             preview_seq: 0,
-            live_mirror_seq: 0,
             dark_mode: false,
             split_ratio: 0.5,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
@@ -1079,10 +1069,21 @@ impl EditorApp {
     // 所见即所得预览编辑（WYSIWYG，`markdown::wysiwyg::WyEditor`）
     // -------------------------------------------------------------------
 
+    /// 选项卡的「有效内容」：`live2`（WyEditor，实时）开启时读它，否则读源码编辑区。
+    /// 保存/关闭/写回统一走此口径——**live 期间源码编辑区不镜像**（去 O(n)），直接读
+    /// WyEditor 的 rope 才不丢内容（大文档 close→保存 若读旧编辑区会整段丢失）。
+    pub(super) fn tab_effective_text(&self, idx: usize, cx: &App) -> String {
+        match self.tabs.get(idx) {
+            Some(t) => match &t.live2 {
+                Some(l2) => l2.read(cx).text().to_string(),
+                None => t.editor.read(cx).value().to_string(),
+            },
+            None => String::new(),
+        }
+    }
+
     /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
     fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
-        // 作废任何未执行/执行中的去抖镜像，本次自己写回（否则陈旧镜像可能再写一遍）。
-        self.live_mirror_seq = self.live_mirror_seq.wrapping_add(1);
         let Some(tab) = self.tabs.get_mut(idx) else { return };
         tab.live_edit = false;
         tab._live2_sub = None;
@@ -1131,39 +1132,17 @@ impl EditorApp {
                         if let Some(tab) =
                             this.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&emitter))
                         {
-                            // 只置脏（O(1)）；**全量镜像去抖**——大文档（6.4MB）每键
-                            // O(n)（全文复制 + 行/字计数 + 源码编辑区 set_text 级联重
-                            // 解析/重渲染）会卡数秒。停手 ~400ms 后只执行最新一轮；
-                            // 旧代迟到任务（seq 过期）作废。源码编辑区本就藏于面板后、
-                            // 退出（commit_live）时统一写回，实时镜像仅在状态栏计数需要。
-                            tab.dirty = true;
-                            this.live_mirror_seq = this.live_mirror_seq.wrapping_add(1);
-                            let seq = this.live_mirror_seq;
-                            let em = emitter;
-                            cx.spawn(async move |this, cx| {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_millis(
-                                        LIVE_MIRROR_DEBOUNCE_MS,
-                                    ))
-                                    .await;
-                                let _ = this.update(cx, |app, cx| {
-                                    if app.live_mirror_seq != seq {
-                                        return; // 期间又输入 / 已退出 → 丢弃陈旧镜像
-                                    }
-                                    let Some(tab) =
-                                        app.tabs.iter_mut().find(|t| t.live2.as_ref() == Some(&em))
-                                    else {
-                                        return;
-                                    };
-                                    // 与 `commit_live` 同口径的写回（源码编辑区 + 计数）。
-                                    let value = em.update(cx, |e, _| e.text().to_string());
-                                    tab.content = SharedString::from(value.clone());
-                                    tab.line_count = value.lines().count().max(1);
-                                    tab.char_count = value.chars().count();
-                                    tab.editor.update(cx, |ed, _| ed.set_text(&value));
-                                });
-                            })
-                            .detach();
+                            // **O(1) 增量计数**（`WyEditor::line_count/char_count` 直读
+                            // `Doc` 行起始表/增量字符计数，不物化全文），源码编辑区与右侧
+                            // Markdown 预览不再做每键/停手整篇镜像（大文档 set_text 级联
+                            // 重解析会卡 7-8s）——它们随左面板 WYSIWYG 一起，到退出
+                            // `commit_live` 时统一写回。
+                            tab.line_count = emitter.read(cx).line_count();
+                            tab.char_count = emitter.read(cx).char_count();
+                            if !tab.dirty {
+                                tab.dirty = true;
+                            }
+                            cx.notify();
                         }
                     }
                     WyEvent::OpenPage(p) => {

@@ -827,13 +827,9 @@ impl EditorApp {
         let Some(p) = tab.file_path.clone() else {
             return self.save_tab_as(idx, window, cx);
         };
-        // WYSIWYG（live2）模式下源码编辑区是**去抖镜像 / 退出时写回**，未停手可能比
-        // WyEditor 陈旧——直接读 WyEditor 的 rope 文本（等效实时内容）。
-        let text = tab
-            .live2
-            .as_ref()
-            .map(|l2| l2.read(cx).text().to_string())
-            .unwrap_or_else(|| tab.editor.read(cx).value().to_string());
+        // WYSIWYG（live2）模式下源码编辑区不再实时镜像（去 O(n)）——直接读 WyEditor
+        // 的 rope 文本（等效实时内容），否则保存的是陈旧/空内容。
+        let text = self.tab_effective_text(idx, cx);
         self.write_to_path(idx, &p, text, cx)
     }
 
@@ -843,16 +839,12 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(tab) = self.tabs.get(idx) else {
+        if idx >= self.tabs.len() {
             return false;
-        };
+        }
         let file_name = self.tab_file_name(idx);
-        // 同 `save_tab`：WYSIWYG 开启时读 WyEditor 实时内容，而非陈旧的镜像。
-        let text = tab
-            .live2
-            .as_ref()
-            .map(|l2| l2.read(cx).text().to_string())
-            .unwrap_or_else(|| tab.editor.read(cx).value().to_string());
+        // 同 `save_tab`：WYSIWYG 开启时读 WyEditor 实时内容，而非陈旧的编辑区。
+        let text = self.tab_effective_text(idx, cx);
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {

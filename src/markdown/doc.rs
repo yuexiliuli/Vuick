@@ -112,6 +112,8 @@ pub(crate) struct Doc {
     rope: Rope,
     /// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义）——行源文本定位用。
     line_starts: Vec<usize>,
+    /// 标量字符数（`chars().count()` 口径，状态栏显示用）——`edit` 增量维护，O(1)。
+    char_count: usize,
 }
 
 impl Doc {
@@ -123,7 +125,8 @@ impl Doc {
             .map(|b| b as usize)
             .collect();
         let rope = Rope::from(&*src);
-        Self { src: DocSrc::Str(src), index, rope, line_starts }
+        let char_count = src.chars().count();
+        Self { src: DocSrc::Str(src), index, rope, line_starts, char_count }
     }
 
     /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
@@ -133,8 +136,9 @@ impl Doc {
     pub(crate) fn open_rope(rope: Rope) -> Self {
         let index = parser::scan_blocks_rope(&rope);
         let line_starts = build_line_starts_rope(&rope);
+        let char_count = rope.chars().count();
         let src = DocSrc::Rope(rope.clone());
-        Self { src, index, rope, line_starts }
+        Self { src, index, rope, line_starts, char_count }
     }
 
     /// 原地编辑（字节区间替换）：rope COW remove+insert + 增量块扫描 + 增量行起始。
@@ -146,6 +150,13 @@ impl Doc {
         let start = range.start.min(old_len);
         let end = range.end.min(old_len);
         let inserted_len = text.len();
+        // 原子符数（标量口径）增量：被删段 / 插入串都是小编辑，O(范围长)。
+        let removed_chars = if end > start {
+            self.rope.slice(start..end).chars().count()
+        } else {
+            0
+        };
+        let inserted_chars = text.chars().count();
         let mut new_rope = self.rope.clone();
         if end > start {
             new_rope.remove(start..end);
@@ -161,6 +172,8 @@ impl Doc {
         self.rope = new_rope;
         self.index = new_index;
         self.line_starts = new_line_starts;
+        self.char_count =
+            (self.char_count as i64 + inserted_chars as i64 - removed_chars as i64).max(0) as usize;
         // rope 为唯一源；原 Str 快路径（load 后首次编辑起）不再保留整份 SharedString。
         self.src = DocSrc::Rope(self.rope.clone());
     }
@@ -236,6 +249,23 @@ impl Doc {
     /// `line_end` 的 O(log n) 二分索引（替代每帧对整篇源文本的线性扫描）。
     pub(crate) fn line_starts(&self) -> &[usize] {
         &self.line_starts
+    }
+
+    /// 显示语义行数（`str::lines()` 口径，与状态栏一致）：`line_starts` 含**末尾换行符
+    /// 产生的幻影尾行**（`split('\n')` 语义），`lines().count()` 不计它——去掉即一致。
+    /// O(1)，不物化全文。
+    pub(crate) fn line_count(&self) -> usize {
+        let n = self.line_starts.len();
+        if n > 0 && self.line_starts[n - 1] == self.len() {
+            n - 1
+        } else {
+            n
+        }
+    }
+
+    /// 标量字符数（`chars().count()` 口径），`edit` 增量维护，O(1)。
+    pub(crate) fn char_count(&self) -> usize {
+        self.char_count
     }
 
     /// 第 `i` 块的轻量元数据（`BlockMeta`，≈20B，O(段数)）——窗口化 shaping 的

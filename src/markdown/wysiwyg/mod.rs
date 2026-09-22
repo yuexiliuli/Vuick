@@ -614,6 +614,16 @@ impl WyEditor {
         self.doc.text_shared()
     }
 
+    /// 显示语义行数（`str::lines()` 口径，与状态栏一致）——增量索引，O(1)，不物化全文。
+    pub fn line_count(&self) -> usize {
+        self.doc.line_count().max(1)
+    }
+
+    /// 标量字符数（`chars().count()` 口径，状态栏显示用）——增量维护，O(1)。
+    pub fn char_count(&self) -> usize {
+        self.doc.char_count()
+    }
+
     /// 聚焦句柄（元素命中/宿主聚焦用）。
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus.clone()

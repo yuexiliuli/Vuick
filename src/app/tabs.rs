@@ -97,8 +97,9 @@ impl EditorApp {
                                 .and_then(|t| t.file_path.clone())
                             {
                                 Some(p) => {
-                                    let text =
-                                        this.tabs[idx].editor.read(cx).value().to_string();
+                                    // 走统一口径：live2 开启时读 WyEditor 实时内容
+                                    // （否则关闭保存的是陈旧的源码编辑区，丢整段编辑）。
+                                    let text = this.tab_effective_text(idx, cx);
                                     (Some(this.write_to_path(idx, &p, text, cx)), false)
                                 }
                                 None => (None, true),
@@ -127,11 +128,12 @@ impl EditorApp {
     }
 
     fn save_unnamed_and_close(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(idx) else {
+        if idx >= self.tabs.len() {
             return;
-        };
+        }
         let file_name = self.tab_file_name(idx);
-        let text = tab.editor.read(cx).value().to_string();
+        // live2 开启时读 WyEditor 实时内容（防关闭保存丢编辑）。
+        let text = self.tab_effective_text(idx, cx);
         let entity = cx.entity();
         window
             .spawn(cx, async move |cx| {

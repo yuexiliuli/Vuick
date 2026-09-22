@@ -568,3 +568,80 @@ fn window_rows_match_blocks_for_all_windows() {
         }
     }
 }
+
+/// 增量 `line_count/char_count` 与全文重算逐值一致（状态栏显示口径钉死）：
+/// `line_count` == `str::lines().count().max(1)`、`char_count` == `str::chars().count()`，
+/// 且编辑（插入/删除/跨行）后仍保持——宿主镜像已改为 O(1) 直读这两个计数，错了
+/// 状态栏行数/字数就失真。
+#[test]
+fn doc_incremental_counts_match_full_recompute() {
+    use crate::markdown::doc::Doc;
+    use gpui::SharedString;
+
+    let docs = [
+        "",                              // 空
+        "a",                             // 无换行、无尾随换行
+        "a\n",                           // 单行尾随换行（幻影尾行）
+        "a\nb",                          // 多行无尾随换行
+        "a\nb\n",                        // 多行尾随换行
+        "a\nb\nc\n\n",                   // 连续尾随换行（parity 尾部语义）
+        "# 标题\n正文 **粗**\n- 项\n\n> 引\n```\nlet x;\n```\n\n中文字符与 emoji: 你好🚀\n",
+    ];
+    for src in docs {
+        let mut doc = Doc::open(SharedString::from(src));
+        let check = |d: &Doc, s: &str| {
+            // Doc 层 = `str::lines()` 口径（不含空文档的 max(1) 显示语义，那在
+            // WyEditor::line_count 处补），编辑后仍与全文重算一致。
+            assert_eq!(
+                d.line_count(),
+                s.lines().count(),
+                "line_count 不一致 for {:?}",
+                s
+            );
+            assert_eq!(d.char_count(), s.chars().count(), "char_count 不一致");
+        };
+        check(&doc, src);
+
+        // 随机编辑序列：每轮与全文重算对拍。
+        let mut s = src.to_string();
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..200 {
+            let op = (next() % 3) as usize;
+            // 只在字符边界取编辑点（String::drain 与 rope remove 都要求 UTF-8 对齐）。
+            let mut pts: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+            pts.push(s.len());
+            let n = pts.len();
+            let a = pts[(next() % (n.max(1)) as u64) as usize];
+            let b = pts[(next() % (n.max(1)) as u64) as usize];
+            let (a, b) = (a.min(b), a.max(b));
+            match op {
+                0 => {
+                    // 删除
+                    if b > a {
+                        doc.edit(a..b, "");
+                        s.drain(a..b);
+                    }
+                }
+                1 => {
+                    // 插入
+                    let ins = "中x\n🚀";
+                    doc.edit(a..a, ins);
+                    s.insert_str(a, ins);
+                }
+                _ => {
+                    // 替换
+                    let rep = if next() % 2 == 0 { "已✅" } else { "xy\nz" };
+                    doc.edit(a..b, rep);
+                    s.replace_range(a..b, rep);
+                }
+            }
+            check(&doc, &s);
+        }
+    }
+}
