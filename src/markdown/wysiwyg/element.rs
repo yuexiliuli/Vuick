@@ -129,6 +129,9 @@ pub(crate) struct InlineMathText {
     pub source: Range<usize>,
     /// 去定界符后的 LaTeX（paint 以斜体排版绘制）。
     pub latex: SharedString,
+    /// **排版槽键**（`inline:` + 去定界符 LaTeX）——`sync_math`（可见带懒光栅）按此
+    /// claim 占槽/光栅；`latex` 是 Unicode 展示态、不可当键用。
+    pub key: SharedString,
     /// 已就绪的排版位图 + 逻辑（typeset em）px 尺寸；`Some` 时 paint 画 `RenderImage`
     /// 覆盖 spacer（参考 zorite `shape_inline_math`），`None` = 排版中/失败 → 画斜体 Unicode。
     /// `w`/`h` 是 22px 排版下的原始尺寸，画图按 `inline_math_fit_h` 再缩放。
@@ -672,6 +675,7 @@ fn splice_math_text(
                 len: n,
                 source: src_lo..src_hi + 1,
                 latex: shown.into(),
+                key: super::inline_math_key(latex.trim()),
                 ready: paint_ready,
                 line: 0,
             });
@@ -2578,9 +2582,10 @@ impl Element for WyEditorElement {
         // `source_offset_at` 需用它把命中换算回元素局部坐标。
         self.editor
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
-        // 数学排版同步（幂等）：扫描新公式发起离屏排版；主题色变化清缓存。
+        // 数学排版同步（可见带懒光栅）：只对**当前带内**公式发起排版（对齐
+        // view/editor 只渲染可见区；不再开篇全量光栅 1.3 万公式占满后台 CPU）。
         self.editor
-            .update(cx, |e, ecx| e.sync_math(ecx));
+            .update(cx, |e, ecx| e.sync_math(ecx, f));
         let origin = bounds.origin;
         // 背景层：先给所有可见引述行画灰底带 + 左指示条（`py_1` 上下各越 4px，相邻带连片）。
         // ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住

@@ -2843,8 +2843,9 @@ A-->B
     #[gpui::test]
     fn sync_math_claims_block_and_inline_slots(cx: &mut TestAppContext) {
         // 数学排版集成（参考 zorite ensure_content_math）：内容含 `$$…$$` 块 + `$…$`
-        // 行内公式 → `sync_math` 按「去定界符的 LaTeX」为键把两块都占为 Loading（真正
-        // 位图由后台 executor 光栅；CPU 级光栅正确性已由 math_typeset 单测覆盖）。
+        // 行内公式 → `sync_math`（**可见带懒光栅**）按「去定界符的 LaTeX」为键把当前带内
+        // 两块都占为 Loading（真正位图由后台 executor 光栅；CPU 级正确性已由
+        // math_typeset 单测覆盖）。
         use gpui::App;
         cx.update(gpui_component::init);
         let text = "$$\n\\int_0^1 x^2 dx\n$$\n内联 $e^{i\\pi}+1=0$ 结束";
@@ -2853,12 +2854,17 @@ A-->B
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
+        let frame = vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| e.sync_math(ecx));
+            // 光标放在文档末尾（离开数学块与行内公式）→ 块折叠成卡片、行内公式被
+            // splice 带出到 frame.rows → `sync_math` 才能按带内公式 claim 占槽。
+            let n = ed.read(cx).content().len();
+            ed.update(cx, |e, _| e.set_caret(n));
+            build_frame(ed.read(cx), window, px(600.), (0., 999_999.))
         });
         vcx.update(|_window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
             let slots = ed.read(cx).math_slots();
             let b = slots.borrow();
             assert!(
@@ -3019,8 +3025,8 @@ A-->B
     #[gpui::test]
     fn plain_edit_reuses_derived_cache(cx: &mut TestAppContext) {
         // 纯文本键入（非结构、行签名不变、不在数学块内）不得触发派生整篇重建：
-        // `derived` Rc 指针不变 + regions/math 版本不递增——这是「输入不卡死」的
-        // 基石（老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
+        // `derived` Rc 指针不变 + regions 版本不递增——这是「输入不卡死」的基石
+        // （老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
         cx.update(gpui_component::init);
@@ -3031,11 +3037,11 @@ A-->B
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let d = ed.read(cx).derived();
             assert_eq!(d.borrow().math_regions.len(), 1, "应扫到这 1 个 $$ 块");
-            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+            (d, ed.read(cx).regions_ver())
         });
         // 在「末尾普通段落 here」行中间键入 'a'（纯文本，无 $ / > / ```）。
         vcx.update(|_w, cx: &mut App| {
@@ -3051,7 +3057,6 @@ A-->B
                 "纯文本键入应复用 derived Rc（不整篇重建）"
             );
             assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
-            assert_eq!(ed.read(cx).math_ver(), mv0, "math 版本应不变");
             assert_eq!(d1.borrow().math_regions.len(), 1, "块区域数不变");
             assert_eq!(
                 d1.borrow().math_regions[0].source, "\\int_x dx",
@@ -3073,11 +3078,11 @@ A-->B
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let d = ed.read(cx).derived();
             assert_eq!(d.borrow().math_regions[0].source, "\\int_a dx");
-            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+            (d, ed.read(cx).regions_ver())
         });
         // 把内部行 `\int_a dx` 的 'a' 改成 'b'。
         vcx.update(|_w, cx: &mut App| {
@@ -3097,16 +3102,13 @@ A-->B
                 d1.borrow().math_regions[0].source, "\\int_b dx",
                 "块 source 应被单块修补为新公式"
             );
-            assert_ne!(
-                ed.read(cx).math_ver(), mv0,
-                "块 source 变化 → sync 应重扫（新 latex 键光栅）"
-            );
         });
     }
 
     #[gpui::test]
-    fn dollar_edit_rebuilds_derived_and_inventory(cx: &mut TestAppContext) {
-        // 键入 `$`（行签名变化）→ 派生整篇重建 + regions/math 版本递增 + 行内清单刷新。
+    fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
+        // 键入 `$`（行签名变化）→ 派生整篇重建 + regions 版本递增（新 `$…$` 公式
+        // 由「可见带懒光栅」在下一帧 shape 后经 frame.rows claim，见 sync_math 集成）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
         cx.update(gpui_component::init);
@@ -3115,11 +3117,10 @@ A-->B
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let d = ed.read(cx).derived();
-            assert!(ed.read(cx).inline_math_entries().is_empty());
-            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+            (d, ed.read(cx).regions_ver())
         });
         // 行首写入一个完整的行内公式 `$x$`。
         vcx.update(|_w, cx: &mut App| {
@@ -3134,17 +3135,14 @@ A-->B
                 "出现 `$` 使行签名变化 → 派生应整篇重建"
             );
             assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
-            assert_ne!(ed.read(cx).math_ver(), mv0, "math 版本应递增");
-            let inv = ed.read(cx).inline_math_entries();
-            assert_eq!(inv.len(), 1, "行内清单应含新的 $x$：{inv:?}");
-            assert_eq!(inv[0].1.as_ref(), "inline:x");
         });
     }
 
     #[gpui::test]
-    fn inline_math_interior_edit_updates_inventory(cx: &mut TestAppContext) {
-        // 行内公式**内部**键入（不新增/删除 `$`）：派生不用整篇重建，但单行行内清单
-        // 要刷新为新槽键（否则 `sync_math` 吃旧键、新公式一直回退 Unicode）。
+    fn inline_math_interior_edit_reuses_derived(cx: &mut TestAppContext) {
+        // 行内公式**内部**键入（不新增/删除 `$`）：派生不用整篇重建；新公式（`$y$`）
+        // 由下一帧 shape 带出到 `frame.rows[].extra.inline_maths` → `sync_math`（可见带懒
+        // 光栅）按 `inline:y` claim 占槽（不再需要全篇行内清单）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
         cx.update(gpui_component::init);
@@ -3153,18 +3151,17 @@ A-->B
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let d = ed.read(cx).derived();
-            assert_eq!(ed.read(cx).inline_math_entries().len(), 1);
-            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+            (d, ed.read(cx).regions_ver())
         });
         vcx.update(|_w, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let at = ed.read(cx).content().find("$x$").unwrap() + 1;
             ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
         });
-        vcx.update(|_w, cx: &mut App| {
+        vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let d1 = ed.read(cx).derived();
             assert!(
@@ -3172,13 +3169,17 @@ A-->B
                 "行内公式内键入不应整篇重建"
             );
             assert_eq!(ed.read(cx).regions_ver(), rv0);
-            let inv = ed.read(cx).inline_math_entries();
-            assert_eq!(inv.len(), 1, "清单应只有一行一条：{inv:?}");
-            assert_eq!(inv[0].1.as_ref(), "inline:y", "清单应刷新为 $y$ 的槽键");
-            assert_ne!(
-                ed.read(cx).math_ver(), mv0,
-                "清单变化 → sync 应重扫以光栅新公式"
-            );
+            // 光标移出 `$y$`（否则 reveal 显示源码、不 splice）→ 下一帧带内整形行
+            // 带出 `$y$`（sync_math 据此 claim `inline:y`）。
+            let n = ed.read(cx).content().len();
+            ed.update(cx, |e, _| e.set_caret(n));
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let lx: Vec<_> = frame
+                .rows
+                .iter()
+                .flat_map(|r| r.extra.inline_maths.iter().map(|m| m.latex.to_string()))
+                .collect();
+            assert_eq!(lx, vec!["y".to_string()], "帧行内公式应已更新为 $y$：{lx:?}");
         });
     }
 
@@ -3257,9 +3258,8 @@ A-->B
             let t0 = std::time::Instant::now();
             let f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
             let dt = t0.elapsed().as_millis();
-            let inv = ed.read(cx).inline_math_entries().len();
             let nreg = ed.read(cx).derived().borrow().math_regions.len();
-            eprintln!("[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg}, inline_inv={inv})", f.block_count());
+            eprintln!("[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg})", f.block_count());
         });
 
         vcx.update(|window, cx: &mut App| {

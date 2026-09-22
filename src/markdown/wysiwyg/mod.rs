@@ -217,20 +217,13 @@ pub struct WyEditor {
     /// 跨键复用，不再每键对全篇 `math_regions`/`alert_*` 重扫（7MB/结构密集文档
     /// 「输入卡死」的主因，旧实现每键 2 次全篇扫描 ≈1s）。
     regions_ver: Cell<u64>,
-    /// 数学相关版本——`sync_math` 的守卫键：仅当编辑**确实**可能改变公式内容时递增
-    /// （`$`/围栏 编辑、数学块 source 修补、含 `$` 行单行修补）；纯文本键入不递增 →
-    /// paint 不再每键全篇重扫行内公式。
-    math_ver: Cell<u64>,
-    /// 行内公式清单 `(源码行, 槽键)`——`sync_math` 直接消费（迭代槽键、不再全篇
-    /// 重扫）。随编辑增量维护：结构/签名变化整表重建、行内含 `$` 的行被编辑单行重扫。
-    inline_math: Rc<RefCell<Vec<(usize, SharedString)>>>,
-    /// 标题折叠视图态版本：`toggle_heading_fold_at_line` 翻转 `folded_headings` 时递增
-    /// （纳入 `fold_plan` 缓存键，滚动不带折叠态重算）。
-    fold_ver: Cell<u64>,
     /// 折叠/重排计划缓存：`(key, Rc<FoldPlan>)`——与可视带无关（内容、caret reveal、
     /// 数学就绪、宽度、结构版本决定），滚动/带移动复用；build_frame 每档不再重建
     /// ~万行 Hash 集合 + 逐块二分（大文档滚动「卡顿明显」：~40ms/档）。
     fold_plan: RefCell<Option<(u64, Rc<element::FoldPlan>)>>,
+    /// 标题折叠视图态版本：`toggle_heading_fold_at_line` 翻转 `folded_headings` 时递增
+    /// （纳入 `fold_plan` 缓存键，滚动不带折叠态重算）。
+    fold_ver: Cell<u64>,
     /// `$` 出现次数（内容级增量计数；`derived` 的数学预筛用，免全篇重扫）。
     math_dollar_cnt: Cell<usize>,
     /// `[!` 出现次数（`derived` 的警报/callout 预筛用，免全篇重扫）。
@@ -256,8 +249,6 @@ pub struct WyEditor {
     math_slots: Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>>,
     /// 排版文字色；主题切换 → 清缓存重排（同 zorite `MathStore::set_color`）。
     math_color: RefCell<Option<Hsla>>,
-    /// 最近一次已扫描的内容代数（`sync_math` 挡同代重复扫描）。
-    math_scanned_gen: Cell<u64>,
     /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
     math_gen: Cell<u64>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
@@ -361,21 +352,8 @@ pub(crate) struct WyDerived {
     pub alert_region_kinds: std::collections::HashMap<usize, crate::markdown::recognition::AlertKind>,
 }
 
-/// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——`sync_math` 消费，免每次 paint / 每次
-/// 数学相关编辑对全篇逐行 `$` 字节扫（旧实现每键一次 ≈400ms）。
-fn inline_inventory(content: &str) -> Vec<(usize, SharedString)> {
-    let mut out = Vec::new();
-    for (ix, line) in content.split('\n').enumerate() {
-        for span in crate::markdown::inline_style::inline_math_spans(line) {
-            let lx = crate::markdown::inline_style::inline_math_latex(line, &span).trim();
-            if !lx.is_empty() {
-                out.push((ix, inline_math_key(lx)));
-            }
-        }
-    }
-    out
-}
-
+/// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——已被「可见带懒光栅」取代（`sync_math`
+/// 改从窗口化 `frame.rows` 拿带内公式，见约定）。此函数保留一则可应急回退。
 fn alert_kind_tag(k: crate::markdown::recognition::AlertKind) -> u8 {
     use crate::markdown::recognition::AlertKind::*;
     match k {
@@ -446,8 +424,6 @@ impl WyEditor {
             block_layout: RefCell::new(None),
             struct_ver: Cell::new(0),
             regions_ver: Cell::new(0),
-            math_ver: Cell::new(0),
-            inline_math: Rc::new(RefCell::new(Vec::new())),
             fold_ver: Cell::new(0),
             fold_plan: RefCell::new(None),
             pending_patch_blocks: RefCell::new(None),
@@ -459,7 +435,6 @@ impl WyEditor {
             images_gen: Cell::new(0),
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
-            math_scanned_gen: Cell::new(0),
             math_gen: Cell::new(0),
             base_dir: None,
             marked: None,
@@ -535,10 +510,6 @@ impl WyEditor {
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
-        if self.math_dollar_cnt.get() > 0 {
-            *self.inline_math.borrow_mut() = inline_inventory(text);
-        }
-        self.math_ver.set(self.math_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
     }
 
@@ -1119,17 +1090,6 @@ impl WyEditor {
     pub(crate) fn regions_ver(&self) -> u64 {
         self.regions_ver.get()
     }
-    /// 数学重扫版本（`sync_math` 守卫键；供回归断言「纯文本键入不重扫数学」）。
-    #[cfg(test)]
-    pub(crate) fn math_ver(&self) -> u64 {
-        self.math_ver.get()
-    }
-    /// 行内公式清单快照（增量维护；供回归断言单行修补正确性）。
-    #[cfg(test)]
-    pub(crate) fn inline_math_entries(&self) -> Vec<(usize, SharedString)> {
-        self.inline_math.borrow().clone()
-    }
-
     /// 标题折叠视图态版本（`fold_plan` 缓存键组成部分）。
     pub(crate) fn fold_ver(&self) -> u64 {
         self.fold_ver.get()
@@ -1409,34 +1369,31 @@ impl WyEditor {
         self.math_gen.get()
     }
 
-    /// 扫描当前内容里的 `$$…$$` 块 + `$…$` 行内公式，对尚未排版的发起离屏排版；
-    /// 幂等（已占用槽的不重复发起），主题色变化清缓存。每次 paint 前调一次，
-    /// `math_scanned_gen` 挡掉同代重复扫描。块公式消费 `derived()`（缓存），行内公式
-    /// 消费增量维护的行内清单——**不再每次全篇逐行重扫**（旧实现每键 2 次全篇扫描）。
-    pub(crate) fn sync_math(&mut self, cx: &mut Context<Self>) {
+    /// 对**当前带内可见**公式发起离屏排版——按「只渲染窗口可见区域」原则（对齐
+    /// `view`/`editor`）：不再开篇全量 claim 全篇 ~1.3 万公式。旧实现每个公式后台
+    /// 光栅 10-20ms（debug），全量累计数百 CPU-秒 → 打满后台线程、UI 帧被拖慢 →
+    /// 「还是很卡顿」。
+    ///
+    /// 消费**窗口化 `frame.rows`**（已整形的带内行：`extra.card = Math{latex}` 是块
+    /// 卡片、`extra.inline_maths[].latex` 是行内公式）——滚入带的公式由 shape/splice
+    /// 带出 → 这里按需 claim → 就绪后 `mgen++` 重建帧（卡片/行内 spacer 换真位图）。
+    /// 幂等：已占用槽（含 Loading/Failed）不重复发起；主题色变化清缓存强制重排。
+    /// 每次 paint 前调一次成本 = iterate `frame.rows`（≤ 带内行数）+ contains_key。
+    pub(crate) fn sync_math(&mut self, cx: &mut Context<Self>, frame: &element::Frame) {
         let color = math_color(&self.theme);
         let color_changed = self.math_color.borrow().as_ref() != Some(&color);
         if color_changed {
             self.math_color.borrow_mut().replace(color);
             self.math_slots.borrow_mut().clear();
         }
-        // 守卫键 = `math_ver`：仅数学相关编辑（`$`/围栏、数学 source 修补、含 `$` 行
-        // 单行修补）才递增；纯文本键入 / 滚动不重扫。主题色变化无条件重排。
-        let mver = self.math_ver.get();
-        if !color_changed && self.math_scanned_gen.get() == mver {
-            return;
-        }
-        self.math_scanned_gen.set(mver);
-
-        // 收集块 + 行内公式 LaTeX 源码（键 = 去定界符后的源码，同 zorite 的 MathStore）。
+        // 收集带内块 + 行内公式源（键 = 去定界符后的源码，同 zorite 的 MathStore）。
         // (槽键, 是否行内, 排版边距, 要排版的 LaTeX)：块用 `MATH_PAD`；行内用
         // `INLINE_MATH_PAD` 且键带 `inline:` 前缀 + `\textstyle` 包层（大算子转行内式，
         // 只压算子不缩正文——否则 `\int_0^1` 整图缩放会把 `x^2 dx` 也变小）。
         let mut sources: Vec<(SharedString, bool, f32, String)> = Vec::new();
-        {
-            let d = self.derived();
-            for reg in d.borrow().math_regions.iter() {
-                let s = reg.source.trim();
+        for row in &frame.rows {
+            if let Some(element::BlockCard::Math { latex, .. }) = &row.extra.card {
+                let s = latex.trim();
                 if !s.is_empty() && s != "$$" {
                     sources.push((
                         s.to_string().into(),
@@ -1446,18 +1403,16 @@ impl WyEditor {
                     ));
                 }
             }
-        }
-        {
-            let inv = self.inline_math.borrow();
-            for (_, key) in inv.iter() {
-                let ks = key.as_ref();
-                let lx = ks.strip_prefix("inline:").unwrap_or(ks);
-                sources.push((
-                    key.clone(),
-                    true,
-                    crate::config::math::INLINE_MATH_PAD,
-                    lx.to_string(),
-                ));
+            for m in &row.extra.inline_maths {
+                let lx = m.key.as_ref().strip_prefix("inline:").unwrap_or(m.key.as_ref());
+                if !lx.is_empty() {
+                    sources.push((
+                        m.key.clone(),
+                        true,
+                        crate::config::math::INLINE_MATH_PAD,
+                        lx.to_string(),
+                    ));
+                }
             }
         }
         for (key, is_inline, pad, latex) in sources {
@@ -1786,32 +1741,24 @@ impl WyEditor {
         );
         self.content = next_ss;
 
-        // —— 内容派生（derived / 行内清单 / 数学重扫）的增量判定（详见 `region_line_sig`）——
-        // 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`/`math_ver`
-        // → `derived` Rc 跨键复用、paint 不重扫——大文档（尤其结构密集）「输入卡死」的根因
-        // 是旧实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
+        // —— 内容派生（derived）的增量判定（详见 `region_line_sig`）——
+        // 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`
+        // → `derived` Rc 跨键复用——大文档（尤其结构密集）「输入卡死」的根因是旧实现
+        // 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
+        // （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
         if structural {
-            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生 + 行内清单。
+            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生。
             self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
-            if self.math_dollar_cnt.get() > 0 {
-                *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
-            }
-            self.math_ver.set(self.math_ver.get().wrapping_add(1));
         } else {
             let new_line = self.doc.line_str(edit_line);
             if region_line_sig(&old_line) != region_line_sig(&new_line) {
                 // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）
-                // → 区域结构可能变化 → 整篇重建派生 + 行内清单 + 数学重扫。
+                // → 区域结构可能变化 → 整篇重建派生。
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
-                if self.math_dollar_cnt.get() > 0 {
-                    *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
-                }
-                self.math_ver.set(self.math_ver.get().wrapping_add(1));
             } else {
-                // 快路径：区域结构不变，只做受影响点的小修补（都不全篇重建）。
-                let mut math_dirty = false;
-                // (a) 编辑行在 `$$…$$` 数学块内 → 重算该块 `source`（卡片 / 排版键正确，
-                //     否则离开块后卡片显示旧公式）。
+                // 快路径：区域结构不变，只做受影响点的小修补（都不全篇重建）——
+                // 编辑行在 `$$…$$` 数学块内 → 重算该块 `source`（卡片 / 排版键正确，
+                // 否则离开块后卡片显示旧公式）。
                 {
                     let derived = self.derived();
                     let d = derived.borrow();
@@ -1840,25 +1787,8 @@ impl WyEditor {
                         };
                         if d2.math_regions[idx].source != new_source {
                             d2.math_regions[idx].source = new_source;
-                            math_dirty = true;
                         }
                     }
-                }
-                // (b) 行内含 `$`（新或旧）→ 单行重扫行内公式清单（增量维护，非全篇）。
-                if old_line.contains('$') || new_line.contains('$') {
-                    let mut inv = self.inline_math.borrow_mut();
-                    inv.retain(|(l, _)| *l != edit_line);
-                    for span in inline_style::inline_math_spans(&new_line) {
-                        let lx = inline_style::inline_math_latex(&new_line, &span).trim();
-                        if !lx.is_empty() {
-                            inv.push((edit_line, inline_math_key(lx)));
-                        }
-                    }
-                    math_dirty = true;
-                }
-                if math_dirty {
-                    // 数学内容确实变了（块 source / 行内清单）→ 下次 paint 消费新清单重扫一次。
-                    self.math_ver.set(self.math_ver.get().wrapping_add(1));
                 }
             }
         }
@@ -1982,19 +1912,14 @@ impl WyEditor {
         self.sel_anchor = None;
         self.marked = None;
         *self.frame.borrow_mut() = None;
-        // 快照是全新内容：标记计数 / 派生版本 / 数学清单 / 基础布局全量失效
-        // （与 `set_source_text` 同款；旧实现漏刷新这些，撤销到不同结构文档会
-        // 命中陈旧派生/布局）。
+        // 快照是全新内容：标记计数 / 派生版本 / 基础布局全量失效（与 `set_source_text`
+        // 同款；旧实现漏刷新这些，撤销到不同结构文档会命中陈旧派生/布局）。
         self.math_dollar_cnt.set(self.content.as_ref().bytes().filter(|&b| b == b'$').count());
         self.alert_marker_cnt.set(self.content.matches("[!").count());
         self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
-        if self.math_dollar_cnt.get() > 0 {
-            *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
-        }
-        self.math_ver.set(self.math_ver.get().wrapping_add(1));
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);
         cx.notify();
