@@ -4076,3 +4076,224 @@ A-->B
             });
         });
     }
+    #[gpui::test]
+    #[ignore]
+    fn bench_rw_dense(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+
+        fn doc_dense() -> String {
+            let mut t = String::new();
+            let mut i = 0usize;
+            while t.len() < 6_000_000 {
+                t.push_str(&format!("# Heading {i}\n\n- list item a\n- list item b\n\n> quote {i}\n\n"));
+                i += 1;
+            }
+            t
+        }
+        fn single_case(cx: &mut TestAppContext, name: &str, text: String) {
+            let (host, _vcx) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+                WyHost { ed }
+            });
+            let _ = cx.refresh();
+            let at = text.len() / 2;
+            let mut t = 0u128;
+            let n = 12;
+            for k in 0..n {
+                let t0 = std::time::Instant::now();
+                let ins = if k % 2 == 0 { "x" } else { "y" };
+                cx.update(|cx| {
+                    host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx)));
+                });
+                let _ = cx.refresh();
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] {name} type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
+            crate::prof::dump(&format!("wyreal.{name}.type"));
+            let mut t2 = 0u128;
+            let n2 = 8;
+            for _k in 0..n2 {
+                let t0 = std::time::Instant::now();
+                cx.update(|cx| {
+                    host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "\n", ecx)));
+                });
+                let _ = cx.refresh();
+                t2 += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] {name} enter: {}ms ({:.1}ms/key)", t2, t2 as f64 / n2 as f64);
+            crate::prof::dump(&format!("wyreal.{name}.enter"));
+        }
+        single_case(cx, "dense", doc_dense());
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_rw_plain(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        fn doc_plain() -> String {
+            let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+            let mut t = String::new();
+            while t.len() < 6_000_000 {
+                t.push_str(para);
+            }
+            t
+        }
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_plain()));
+            WyHost { ed }
+        });
+        let _ = cx.refresh();
+        let at = 3_000_000usize;
+        let mut t = 0u128;
+        let n = 12;
+        for k in 0..n {
+            let t0 = std::time::Instant::now();
+            let ins = if k % 2 == 0 { "x" } else { "y" };
+            cx.update(|cx| host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))));
+            let _ = cx.refresh();
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!("[bench] plain type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
+        crate::prof::dump("wyreal.plain.type");
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_rw_code(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        fn doc_code() -> String {
+            let mut t = String::from("```\n");
+            let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
+            while t.len() < 6_000_000 {
+                t.push_str(line);
+            }
+            t.push_str("```\n");
+            t
+        }
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_code()));
+            WyHost { ed }
+        });
+        let _ = cx.refresh();
+        let at = 3_000_000usize;
+        let mut t = 0u128;
+        let n = 12;
+        for k in 0..n {
+            let t0 = std::time::Instant::now();
+            let ins = if k % 2 == 0 { "x" } else { "y" };
+            cx.update(|cx| host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))));
+            let _ = cx.refresh();
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!("[bench] code type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
+        crate::prof::dump("wyreal.code.type");
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_rw_realfile(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+        let path = "target/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        // 定位各类位置：围栏内部、表格行、数学行、普通文本行、文档中部。
+        let find_after = |needle: &str, from: usize| -> Option<usize> {
+            let rel = text[from..].find(needle)?;
+            Some(from + rel)
+        };
+        // 第一个 ``` 之后的内容位置（代码块内）。
+        let fence_open = find_after("```\n", 0).map(|i| i + 4).unwrap_or(text.len() / 2);
+        let fence_mid = {
+            let next = find_after("```\n", fence_open + 1).unwrap_or(text.len());
+            let mid = fence_open + 10 * ((next - fence_open) / 21).max(1);
+            if mid < next { mid } else { fence_open }
+        };
+        let table_row = find_after("\n|", 0).map(|i| i + 2).unwrap_or(text.len() / 2);
+        let math_line = find_after("\n$$", 0).map(|i| i + 3).unwrap_or(text.len() / 2);
+        let cb = |s: &str, i: usize| -> usize {
+            let i = i.min(s.len());
+            if i == 0 || s.is_char_boundary(i) {
+                return i;
+            }
+            let mut j = i;
+            let b = s.as_bytes();
+            while j > 0 && (b[j] & 0b1100_0000) == 0b1000_0000 {
+                j -= 1;
+            }
+            j
+        };
+        // 一个普通文本位置（避开 $ | # ` 前缀）。
+        let plain_at = (0..100)
+            .find_map(|k| {
+                let raw = text.len() / 2 + k * 97;
+                let i = cb(&text, raw.min(text.len()));
+                let line = text[i..].lines().next().unwrap_or("");
+                let at_line_start = i == 0 || text[..i].ends_with('\n');
+                if at_line_start
+                    && !line.starts_with('#')
+                    && !line.starts_with('|')
+                    && !line.starts_with("```")
+                    && !line.starts_with(">")
+                    && !line.starts_with("- ")
+                    && !line.starts_with('$')
+                    && !line.contains('$')
+                    && !line.is_empty()
+                {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(cb(&text, text.len() / 2));
+
+        eprintln!("[bench] realfile len={} fence_mid={fence_mid} table_row={table_row} math_line={math_line} plain_at={plain_at}", text.len());
+        let case = |cx: &mut TestAppContext, name: &str, at: usize, ins_seq: &[&str]| {
+            let (host, _vcx) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+                WyHost { ed }
+            });
+            let _ = cx.refresh();
+            // 定位到 ASCII 字节：替换后仍是单字节 ASCII → 区间跨多次迭代恒在字符边界。
+            let mut at2 = cb(&text, at.min(text.len().saturating_sub(1)));
+            for _ in 0..4096 {
+                if at2 >= text.len() {
+                    break;
+                }
+                let c = text[at2..].chars().next().unwrap();
+                if c.is_ascii() {
+                    break;
+                }
+                at2 += c.len_utf8();
+            }
+            let mut t = 0u128;
+            let n = ins_seq.len().max(1);
+            let ok = at2 < text.len()
+                && text.is_char_boundary(at2)
+                && text.is_char_boundary(at2 + 1)
+                && text[at2..].chars().next().map(|c| c.is_ascii()).unwrap_or(false);
+            if !ok {
+                eprintln!("[bench] realfile {name}: 跳过（4096 内无 ASCII）");
+                return;
+            }
+            eprintln!("[bench] realfile {name}: ascii_at={at2}");
+            for ins in ins_seq {
+                let t0 = std::time::Instant::now();
+                cx.update(|cx| {
+                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, *ins, ecx)));
+                });
+                let _ = cx.refresh();
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] realfile {name}: {}ms ({:.1}ms/键) at={at2}", t, t as f64 / n as f64);
+            crate::prof::dump(&format!("wy.realfile.{name}"));
+        };
+        case(cx, "plain-x", plain_at, &["x", "y", "x", "y"]);
+        case(cx, "fence-x", fence_mid, &["x", "y", "x", "y"]);
+        case(cx, "table-x", table_row, &["x", "y", "x", "y"]);
+        case(cx, "math-$$-x", math_line, &["x", "y", "x", "y"]);
+        case(cx, "enter-mid", text.len() / 2, &["\n", "\n", "\n", "\n"]);
+    }

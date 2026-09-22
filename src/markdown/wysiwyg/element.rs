@@ -1968,6 +1968,7 @@ pub(crate) fn build_frame(
     width: Pixels,
     band: (f32, f32),
 ) -> Frame {
+    let _t_bf = crate::prof::begin();
     // 字形/字号一律取**主题**（创建时定格），不读 `window.text_style()`——measure 与
     // prepaint 两阶段该值不同（栈内带/不带 `live-body.text_size`），每帧现取会在两种
     // 字号间交替，滚动时文字忽大忽小。
@@ -2047,14 +2048,18 @@ pub(crate) fn build_frame(
     let math_regions = &derived.borrow().math_regions;
 
     if rebuilt {
-        // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关——折叠 body
-        // 与数学源行都用普通段高估算，动态覆盖走 deltas）+ 起始源码行，一次物化布局。
+        let _t_p1 = crate::prof::begin();
+        // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关）+ 起始源码行。
         //
-        // **增量**（B3）：结构编辑后块数组 = [未变前缀][变化中段][未变后缀]。编辑线
-        // （`struct_dirty_line`）之前的块内容/索引均未变 → 高度**沿用旧布局**（还是
-        // 收敛真值，比重新估算更准）；只从首个「受编辑影响的块」起 → 文尾重估，最后
-        // 一次性重建 Fenwick。Enter 贴文尾 = O(变化后缀)、贴文首 = O(n)（不劣化）。
+        // **三段式增量**（B3 前缀 + 本步尾部复用）：结构编辑后块数组 =
+        // [未变前缀][变化中段][未变后缀]。编辑线（`struct_dirty_line`）之前的块内容/
+        // 索引未变 → **前缀高度沿用**；编辑影响的旧区间（`old_edit_end_line`）之前的
+        // **中段**（编辑线所在的块 → 新尾部起点）重新估算；之后**尾部块内容未变 →
+        // 高度直接沿用旧布局**（只平移 src_line）。结构编辑从「dirty_line → 文尾」全
+        // 后缀重估（大文档 Enter/代码/表格 183-375ms）降到「仅中段估算 + Vec 复制」。
         let dirty_line = editor.struct_dirty_line();
+        let old_end_line = editor.old_edit_end_line();
+        let line_delta = editor.edit_line_delta();
         let doc_lines = doc.line_starts().len();
         // 前缀复用长度：块 k 完全落在 dirty_line 之上（块末行 = 下块首行-1 < dirty）
         // → 内容不变、索引稳定。
@@ -2076,22 +2081,52 @@ pub(crate) fn build_frame(
                 break;
             }
         }
-        let (mut heights, mut src_lines) = match &old_layout {
-            Some(old) => {
-                let ob = old.borrow();
+        let old_holder = old_layout.as_ref().cloned(); // 保活旧布局 Rc 以便借用
+        let old = old_holder.as_ref().map(|rc| rc.borrow());
+        let (old_heights, old_src): (Option<&[f32]>, Option<&[u32]>) = match &old {
+            Some(ob) => (Some(ob.heights()), Some(ob.src_lines())),
+            None => (None, None),
+        };
+        let (mut heights, mut src_lines) = match &old {
+            Some(ob) => {
                 let k = keep.min(ob.n());
                 (ob.heights()[..k].to_vec(), ob.src_lines()[..k].to_vec())
             }
             None => (Vec::with_capacity(n), Vec::with_capacity(n)),
         };
-        for i in heights.len()..n {
-            let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
-                src_line: 0,
-                byte: 0,
-                kind: RowKind::Blank,
-                raw_len: 0,
-                aux: 1,
-            });
+        // 旧尾部起点 j：首个旧块 src_line > 编辑影响区间终点。
+        let old_exist = old_src.is_some();
+        let j = match old_src {
+            Some(os) => os.partition_point(|&s| (s as usize) <= old_end_line),
+            None => 0,
+        };
+        // 新尾部起点 k：首个新块 src_line ≥ 旧尾部 src_line + 行数净增。旧布局缺失
+        // （首建）或编辑近文末（无旧尾部）时中段扫到底。
+        let tail_src = match (old_src, old_src.and_then(|os| os.get(j).copied())) {
+            (_, Some(s)) => s as i64 + line_delta,
+            _ => doc_lines as i64,
+        };
+        let new_src_lines: Vec<u32> = (keep..n)
+            .filter_map(|i| doc.block_meta(i).map(|m| m.src_line))
+            .collect();
+        let k = if !old_exist {
+            n
+        } else if keep < n {
+            new_src_lines
+                .iter()
+                .position(|&s| (s as i64) >= tail_src)
+                .map(|off| keep + off)
+                .unwrap_or(n)
+        } else {
+            keep
+        };
+        // 中段（编辑所在 → 新尾部起点）重新估算。
+        let est_block = |i: usize| -> (f32, u32) {
+            let meta = if let Some(m) = doc.block_meta(i) {
+                m
+            } else {
+                return (f32::from(line_h), 0);
+            };
             let srcline = meta.src_line as usize;
             let h: f32 = if meta.kind == RowKind::Code
                 && doc.line_str(srcline).trim_start().starts_with("```mermaid")
@@ -2116,10 +2151,33 @@ pub(crate) fn build_frame(
                 let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
                 f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h))
             };
+            (h, meta.src_line)
+        };
+        for i in heights.len()..k {
+            let (h, sl) = est_block(i);
             heights.push(h);
-            src_lines.push(meta.src_line);
+            src_lines.push(sl);
         }
+        // 尾部复用：旧 [j..] 高度原样搬入新 [k..]（长度恰好吻合时才成立）。
+        let mut tail_reused = false;
+        if let (Some(oh), Some(os)) = (old_heights, old_src) {
+            if k <= n && j <= os.len() && os.len() - j == n - k {
+                src_lines.extend(os[j..].iter().map(|&s| (s as i64 + line_delta).max(0) as u32));
+                heights.extend_from_slice(&oh[j..]);
+                tail_reused = true;
+            }
+        }
+        // 兜底：尾部未复用（首建 / 对齐异常）→ 剩余块照旧逐块重估（正确 > 快）。
+        if !tail_reused {
+            for i in heights.len()..n {
+                let (h, sl) = est_block(i);
+                heights.push(h);
+                src_lines.push(sl);
+            }
+        }
+        debug_assert_eq!(heights.len(), n, "Pass1 三段式产出的块数与新索引一致");
         base.borrow_mut().rebuild(heights, src_lines);
+        crate::prof::end("wy.pass1", _t_p1);
     }
     // 折叠/重排计划（与可视带无关、不含 caret，跨带/跨光标复用——滚动与输入不再重算
     // `math_start`/`fold_lines`/`deltas`）。caret 所在区域的 reveal 由 `fold_reveal`
@@ -2175,6 +2233,7 @@ pub(crate) fn build_frame(
     // 行整形缓存（滚动/带重建复用）：键 = epoch ^ mgen；caret 严格落在含行内公式的
     // 文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由 `replace_range` 负责。
     let shape_key = epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let _t_p2 = crate::prof::begin();
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     {
         let mut row_cache = editor.shape_rows.borrow_mut();
@@ -2264,6 +2323,7 @@ pub(crate) fn build_frame(
             }
         }
     }
+    crate::prof::end("wy.pass2", _t_p2);
 
     // Pass 3：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
     let mut rows: Vec<ShapedRow> = Vec::new();
@@ -2303,6 +2363,7 @@ pub(crate) fn build_frame(
             rows.push(srow);
         }
     }
+    crate::prof::end("wy.build_frame", _t_bf);
     Frame {
         padding,
         line_h,
@@ -2559,7 +2620,9 @@ impl Element for WyEditorElement {
             let total = match cached_total {
                 Some(t) => t,
                 None => {
+                    let _t_bf = crate::prof::begin();
                     let frame = build_frame(e, window, width, band);
+                    crate::prof::end("wy.measure.bf", _t_bf);
                     let total = frame.total;
                     let _ = e;
                     editor.update(cx, |er, _| {
@@ -2582,6 +2645,7 @@ impl Element for WyEditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> WyPrepaint {
+        let _t_pp = crate::prof::begin();
         // 可视带（窗口坐标 → 元素局部 y）：元素在滚动容器内的原点即滚动偏移；
         // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。
         let vh = f32::from(window.viewport_size().height).max(1.);
@@ -2612,7 +2676,9 @@ impl Element for WyEditorElement {
             })
         };
         if stale {
+            let _t_bb = crate::prof::begin();
             let frame = build_frame(&*self.editor.read(cx), window, width, band);
+            crate::prof::end("wy.prepaint.bf", _t_bb);
             self.editor.update(cx, |e, _| {
                 *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
             });
@@ -2672,6 +2738,7 @@ impl Element for WyEditorElement {
                 }
             }
         }
+        crate::prof::end("wy.prepaint", _t_pp);
         WyPrepaint { link_grips }
     }
 
@@ -2685,6 +2752,7 @@ impl Element for WyEditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let _t_paint = crate::prof::begin();
         let (focus, theme) = {
             let e = self.editor.read(cx);
             (e.focus_handle(), e.theme.clone())
@@ -2702,8 +2770,10 @@ impl Element for WyEditorElement {
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
         // 数学排版同步（可见带懒光栅）：只对**当前带内**公式发起排版（对齐
         // view/editor 只渲染可见区；不再开篇全量光栅 1.3 万公式占满后台 CPU）。
+        let _t_sm = crate::prof::begin();
         self.editor
             .update(cx, |e, ecx| e.sync_math(ecx, f));
+        crate::prof::end("wy.paint.synmath", _t_sm);
         let origin = bounds.origin;
         // 背景层：先给所有可见引述行画灰底带 + 左指示条（`py_1` 上下各越 4px，相邻带连片）。
         // ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住
@@ -2715,6 +2785,7 @@ impl Element for WyEditorElement {
             editor.derived()
         };
         let alert_kinds = &derived.borrow().alert_region_kinds;
+        let _t_row = crate::prof::begin();
         for row in &f.rows {
             if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
                 paint_quote_band(origin, &theme, f, row, alert_kinds, window);
@@ -2780,6 +2851,7 @@ impl Element for WyEditorElement {
             paint_inline_maths(&self.editor, origin, &theme, f, row, window, cx);
             paint_inline_images(&self.editor, origin, f, row, window, cx);
         }
+        crate::prof::end("wy.paint.rowloop", _t_row);
         // C5: 悬浮在可点击链接上 → hand 光标。
         for hb in &prepaint.link_grips {
             window.set_cursor_style(CursorStyle::PointingHand, hb);
@@ -2811,6 +2883,7 @@ impl Element for WyEditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+        crate::prof::end("wy.paint", _t_paint);
     }
 }
 

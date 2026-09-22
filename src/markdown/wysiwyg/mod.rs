@@ -217,6 +217,12 @@ pub struct WyEditor {
     /// 内容未变 → 复用旧布局高度；只有「编辑线起 → 文尾」重新估算（Enter 贴近文尾时
     /// O(变化后缀) 而非全篇）。非结构编辑不参与（无重建）。
     struct_dirty_line: Cell<usize>,
+    /// 编辑影响的**最后一个旧源行**（`edit_line + 被删换行数`）：Pass1 用它定位旧尾部
+    /// 起点（`j`），从而**复用尾部高度**（编辑下方块内容未变，高度不变）——把结构编辑
+    /// 从「dirty_line→文尾」全后缀重估降为「仅变化中段」+ 尾部 Vec 复制。
+    struct_old_end_line: Cell<usize>,
+    /// 编辑的源行净增（插入换行数 − 被删换行数）：尾部块 src_line 整体平移量。
+    struct_line_delta: Cell<i64>,
     /// 内容**派生版本**——`derived()` 缓存键：结构性编辑、编辑行 region 签名变化才
     /// 递增；纯文本键入（非结构、签名不变、不在数学块内）不递增 → `derived` Rc
     /// 跨键复用，不再每键对全篇 `math_regions`/`alert_*` 重扫（7MB/结构密集文档
@@ -537,6 +543,8 @@ impl WyEditor {
             block_layout: RefCell::new(None),
             struct_ver: Cell::new(0),
             struct_dirty_line: Cell::new(0),
+            struct_old_end_line: Cell::new(0),
+            struct_line_delta: Cell::new(0),
             regions_ver: Cell::new(0),
             fold_ver: Cell::new(0),
             fold_plan: RefCell::new(None),
@@ -655,6 +663,8 @@ impl WyEditor {
         self.alert_marker_cnt.set(text.matches("[!").count());
         self.struct_ver.set(0);
         self.struct_dirty_line.set(0);
+        self.struct_old_end_line.set(0);
+        self.struct_line_delta.set(0);
         self.math_line_map.borrow_mut().clear();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
@@ -1254,6 +1264,14 @@ impl WyEditor {
     /// 结构编辑影响的首个源行（Pass1 增量前缀复用边界）。
     pub(crate) fn struct_dirty_line(&self) -> usize {
         self.struct_dirty_line.get()
+    }
+    /// 编辑影响的最后一个旧源行（Pass1 定位旧尾部起点用）。
+    pub(crate) fn old_edit_end_line(&self) -> usize {
+        self.struct_old_end_line.get()
+    }
+    /// 编辑的源行净增（插入换行 − 被删换行）。
+    pub(crate) fn edit_line_delta(&self) -> i64 {
+        self.struct_line_delta.get()
     }
     /// 派生版本（`derived()` 缓存键；供回归断言「纯文本键入不重建派生」）。
     pub(crate) fn regions_ver(&self) -> u64 {
@@ -1943,6 +1961,7 @@ impl WyEditor {
         if r.start == r.end && text.is_empty() {
             return;
         }
+        let _t_rr = crate::prof::begin();
         // 编辑前被替换区间（cross_newline / 标记计数 / 撤销意图用；O(被删长)）。
         let removed = self.doc.slice_str(r.clone());
         let inserted_len = text.len();
@@ -2003,6 +2022,11 @@ impl WyEditor {
         // Pass1 增量高度重估起点：编辑行的**前一内容行**之后的块全部未变（编辑线之前
         // 的块内容/索引稳定）——结构编辑只在「该行起 → 文尾」重估，前缀高度复用。
         self.struct_dirty_line.set(edit_line);
+        // Pass1 三段式（前缀 / 变化中段 / 尾部复用）的定位用：编辑影响的旧区间终点与
+        // 源行净增——尾部块内容未变 → 高度直接沿用，不再对整段后缀重估。
+        self.struct_old_end_line.set(edit_line + removed.matches('\n').count());
+        self.struct_line_delta
+            .set(text.matches('\n').count() as i64 - removed.matches('\n').count() as i64);
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
@@ -2050,6 +2074,7 @@ impl WyEditor {
                 // → 区域结构可能变化 → 整篇重建派生。
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
             } else {
+                let _t_m = crate::prof::begin();
                 // 快路径：区域结构不变，只做受影响点的小修补（都不全篇重建）——
                 // 编辑行在 `$$…$$` 数学块内 → 重算该块 `source`（卡片 / 排版键正确，
                 // 否则离开块后卡片显示旧公式）。
@@ -2084,6 +2109,7 @@ impl WyEditor {
                         }
                     }
                 }
+                crate::prof::end("wy.rr.math", _t_m);
             }
         }
 
@@ -2091,6 +2117,7 @@ impl WyEditor {
         self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        crate::prof::end("wy.replace_range", _t_rr);
         cx.emit(WyEvent::Changed);
         cx.notify();
     }
@@ -2212,6 +2239,8 @@ impl WyEditor {
         self.alert_marker_cnt.set(full.matches("[!").count());
         self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
         self.struct_dirty_line.set(0);
+        self.struct_old_end_line.set(0);
+        self.struct_line_delta.set(0);
         self.math_line_map.borrow_mut().clear();
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;

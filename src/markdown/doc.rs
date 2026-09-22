@@ -200,6 +200,7 @@ impl Doc {
     /// `src`，O(log n + 变化区)，删掉每键 O(n) 整串复制分配（6MB 文档每键省一次
     /// 6MB memcpy）。
     pub(crate) fn edit(&mut self, range: Range<usize>, text: &str) {
+        let _t_doc = crate::prof::begin();
         let old_len = self.len();
         let start = range.start.min(old_len);
         let end = range.end.min(old_len);
@@ -231,8 +232,11 @@ impl Doc {
             new_rope.insert(start, text);
         }
         let dirty = start..start + inserted_len;
+        let _t_sc = crate::prof::begin();
         let new_index =
             parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
+        crate::prof::end("doc.scanblocks", _t_sc);
+        let _t_ul = crate::prof::begin();
         let new_line_starts =
             Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range.clone());
         let new_line_utf16_starts = Self::incremental_line_utf16_starts(
@@ -243,6 +247,7 @@ impl Doc {
             range.clone(),
             delta_u16,
         );
+        crate::prof::end("doc.linestarts", _t_ul);
         self.rope = new_rope;
         self.index = new_index;
         self.line_starts = new_line_starts;
@@ -255,6 +260,7 @@ impl Doc {
         *self.text_cache.borrow_mut() = None;
         // rope 为唯一源；原 Str 快路径（load 后首次编辑起）不再保留整份 SharedString。
         self.src = DocSrc::Rope(self.rope.clone());
+        crate::prof::end("doc.edit", _t_doc);
     }
 
     /// 增量行起始重建（见 [`Self::edit`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
