@@ -57,3 +57,7 @@ pub const WINDOWED_OVERDRAW_MAX: usize = 120;
 pub const CODE_HL_LRU_CAP: usize = 96;
 /// 侧边栏搜索结果条数上限。
 pub const SEARCH_RESULT_CAP: usize = 200;
+/// WYSIWYG 行整形缓存容量（按**块下标**计）：滚动/带重建复用已整形的块（文本/代码/
+/// 表格），避免每档重建把可视带整批重 shape + 代码块重跑 syntect（对齐 `view` 的
+/// 行虚拟化复用与 `editor` 「只重排变更区」）。超出后按最近最少使用淘汰。
+pub const SHAPED_ROW_CACHE_CAP: usize = 16_384;

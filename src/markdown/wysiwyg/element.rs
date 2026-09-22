@@ -63,16 +63,17 @@ fn shaped_text_width(
 
 /// 一帧后的表格渲染数据（shape 期算好列宽/全量单元格文本，paint 直接画网格）。
 /// 与预览一致：列宽按内容自适应（不缩放、不省略），整表自然宽，超出由宿主裁剪。
+#[derive(Clone)]
 pub(crate) struct ShapedTable {
     pub widths: Vec<f32>,
     pub total_w: f32,
     pub row_h: Pixels,
     pub header_texts: Vec<gpui::SharedString>,
     pub rows_texts: Vec<Vec<gpui::SharedString>>,
-    pub aligns: Vec<TableAlign>,
 }
 
 /// 一帧后的图片渲染数据（显示框 + 源 + alt 兜底）。
+#[derive(Clone)]
 pub(crate) struct ShapedImage {
     pub src: gpui::SharedString,
     pub alt: gpui::SharedString,
@@ -81,6 +82,7 @@ pub(crate) struct ShapedImage {
 }
 
 /// 表格单元格的编辑排版（shape 期算了对齐位移与排好版的单行，命中/光标列↔x 换算用）。
+#[derive(Clone)]
 pub(crate) struct TableCellLayout {
     /// 源码内容区间（相对该行行首）。
     pub src: Range<usize>,
@@ -93,12 +95,14 @@ pub(crate) struct TableCellLayout {
 }
 
 /// 表格可编辑行的排版（表头 + 各数据行，与 `ShapedTable.rows_texts` 同构对齐）。
+#[derive(Clone)]
 pub(crate) struct TableRowCellsLayout {
     pub src_line: usize,
     pub cells: Vec<TableCellLayout>,
 }
 
 /// 表格块整块的单元格排版（`ShapedRow.table_edit`）。
+#[derive(Clone)]
 pub(crate) struct TableCellsLayout {
     pub rows: Vec<TableRowCellsLayout>,
 }
@@ -159,7 +163,8 @@ pub(crate) struct RowLink {
 #[derive(Clone, Debug)]
 pub(crate) enum BlockCard {
     Math { align: MathAlign, latex: String },
-    Mermaid { source: String },
+    /// mermaid 图卡片：源码不驻留（paint 只消费 `ShapedRow.mm` 的已排布局与标签）。
+    Mermaid,
 }
 
 /// 每行的增强装饰/内嵌数据（默认全空；文本行按类型填充）。
@@ -370,12 +375,14 @@ impl RevealPlan {
 }
 
 
+#[derive(Clone)]
 pub(crate) struct ShapedRow {
     pub src_line: usize,
     pub src_lines: Range<usize>,
     /// 该块的可视行（`shape_text` 结果；一个块 = 一个或多个 `WrappedLine`）。
-    /// 带外块为空（未 shape，paint 跳过）。
-    pub wrapped: Vec<gpui::WrappedLine>,
+    /// 带外块为空（未 shape，paint 跳过）。**`Rc`**：行整形缓存跨帧共享整形结果
+    /// （`WrappedLine` 本身不可 Clone；Rc 浅克隆即共享字形数据，滚动复用零重排）。
+    pub wrapped: std::rc::Rc<Vec<gpui::WrappedLine>>,
     pub sub_heights: Vec<Pixels>,
     /// 编辑映射：渲染字节 → 源字节偏移（语义见 `DocRow::byte_map`）。
     /// 文本行为**相对该行**的局部映射；代码块为**相对块首**的块级映射。
@@ -403,6 +410,8 @@ pub(crate) struct ShapedRow {
     pub table_edit: Option<TableCellsLayout>,
     /// Image 块的显示数据（带外块 / 加载失败仍 Some 显示 alt）。
     pub image: Option<ShapedImage>,
+    /// mermaid 卡片的已排布局（卡片相对坐标；shape 期算好，paint 直接画，免每帧重排）。
+    pub mm: Option<std::rc::Rc<(Vec<MmPlaced>, Vec<(usize, usize, Option<String>)>)>>,
     /// 每行的增强装饰/内嵌数据（列表 gutter、链接、行内数学/图片、块级卡片）。
     pub extra: RowExtra,
 }
@@ -809,6 +818,7 @@ fn shape_text_row(
     let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
     let x_off = if kind == IrKind::Quote { px(15.) } else { px(0.) };
+    let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
@@ -826,6 +836,7 @@ fn shape_text_row(
         table: None,
         table_edit: None,
         image: None,
+        mm: None,
         extra: RowExtra { inline_maths, ..Default::default() },
     }
 }
@@ -1544,6 +1555,7 @@ fn shape_code_row(
     r: DocRow,
     window: &mut Window,
     theme: &WyTheme,
+    width: Pixels,
 ) -> ShapedRow {
     let kind = r.kind;
     let (code_lines, lang) = match &r.payload {
@@ -1554,10 +1566,15 @@ fn shape_code_row(
     if lang.as_deref() == Some("mermaid") {
         let source = code_lines.join("\n");
         let height = mermaid_card_height(&source);
+        // 布局（`MmPlaced` 卡片相对坐标，area=(0,0)）在 **shape 期**算好缓存——paint
+        // 不再每帧重排/重测全部标签宽（否则滚动/键入时可见的 mermaid 卡片每帧整套
+        // 解析+排版；行整形缓存使其只在内容/宽度/主题变化时重算一次）。
+        let area_w = (f32::from(width) - 2. * f32::from(px(12.))).max(1.);
+        let mm = mm_layout(window, theme, &source, 0., 0., area_w);
         return ShapedRow {
             src_line: r.src_line,
             src_lines: r.lines.clone(),
-            wrapped: Vec::new(),
+            wrapped: std::rc::Rc::new(Vec::new()),
             sub_heights: vec![height],
             byte_map: std::rc::Rc::new(Vec::new()),
             editable: false,
@@ -1571,8 +1588,9 @@ fn shape_code_row(
             table: None,
             table_edit: None,
             image: None,
+            mm: Some(std::rc::Rc::new(mm)),
             extra: RowExtra {
-                card: Some(BlockCard::Mermaid { source }),
+                 card: Some(BlockCard::Mermaid),
                 ..Default::default()
             },
         };
@@ -1650,6 +1668,7 @@ fn shape_code_row(
             acc += ln.len();
         }
     }
+    let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
@@ -1667,6 +1686,7 @@ fn shape_code_row(
         table: None,
         table_edit: None,
         image: None,
+        mm: None,
         extra: RowExtra::default(),
     }
 }
@@ -1785,7 +1805,7 @@ fn shape_table_row(
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
-        wrapped: Vec::new(),
+        wrapped: std::rc::Rc::new(Vec::new()),
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable,
@@ -1807,9 +1827,9 @@ fn shape_table_row(
             row_h,
             header_texts: header,
             rows_texts: rows2,
-            aligns: aligns2,
         }),
         image: None,
+        mm: None,
         extra: RowExtra::default(),
     }
 }
@@ -1840,7 +1860,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
-        wrapped: Vec::new(),
+        wrapped: std::rc::Rc::new(Vec::new()),
         sub_heights: vec![h],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
@@ -1854,6 +1874,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         table: None,
         table_edit: None,
         image: Some(ShapedImage { src, alt, w, h: f32::from(h) }),
+        mm: None,
         extra: RowExtra::default(),
     }
 }
@@ -1869,7 +1890,7 @@ fn shape_docrow(
     base_font: &gpui::Font,
 ) -> ShapedRow {
     match r.kind {
-        IrKind::Code => shape_code_row(r, window, theme),
+        IrKind::Code => shape_code_row(r, window, theme, width),
         IrKind::Table => shape_table_row(r, window, theme.font_size, theme, base_font),
         IrKind::Image => shape_image_row(r, editor, avail),
         _ => shape_text_row_decorated(r, editor, window, width, theme, base_font),
@@ -1911,7 +1932,7 @@ fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: P
     ShapedRow {
         src_line,
         src_lines: reg.range.start..reg.range.end,
-        wrapped: Vec::new(),
+        wrapped: std::rc::Rc::new(Vec::new()),
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
@@ -1925,6 +1946,7 @@ fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: P
         table: None,
         table_edit: None,
         image: None,
+        mm: None,
         extra: RowExtra {
             card: Some(BlockCard::Math { align: reg.align, latex: reg.source.clone() }),
             ..Default::default()
@@ -1959,7 +1981,7 @@ pub(crate) fn build_frame(
             rows: vec![ShapedRow {
                 src_line: 0,
                 src_lines: 0..1,
-                wrapped: Vec::new(),
+                wrapped: std::rc::Rc::new(Vec::new()),
                 sub_heights: vec![line_h],
                 byte_map: std::rc::Rc::new(Vec::new()),
                 editable: false,
@@ -1973,6 +1995,7 @@ pub(crate) fn build_frame(
                 table: None,
                 table_edit: None,
                 image: None,
+                mm: None,
                 extra: RowExtra::default(),
             }],
             base: std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
@@ -2111,8 +2134,12 @@ pub(crate) fn build_frame(
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
+    // 行整形缓存（滚动/带重建复用）：键 = epoch ^ mgen；caret 严格落在含行内公式的
+    // 文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由 `replace_range` 负责。
+    let shape_key = epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     {
+        let mut row_cache = editor.shape_rows.borrow_mut();
         let mut i = i0;
         while i < i1 {
             let srcline = base.borrow().src_lines()[i] as usize;
@@ -2137,10 +2164,63 @@ pub(crate) fn build_frame(
                 i += 1;
             }
             let hi = i;
-            let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
-            for (j, r) in docrows.into_iter().enumerate() {
-                let k = lo + j;
-                let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
+            // A1「命中先行」：整带内先判哪些块**不需要**物化 DocRow——命中 = 缓存键
+            // 匹配且非 caret 行（caret 行 shape 依赖光标，即便已在缓存也必须强制物化
+            // 重 shape、不缓存；逐帧至多一行）。只对「未命中 ∪ caret 行」批量物化
+            // （连续段合并复用批量 parse），命中块免去 `rows_in_block_window` 的整带
+            // parse+assemble（byte_map / 表格 / code payload 装配）——每键/每带重建
+            // 从「整带物化」降到「仅 miss 块」。
+            let mut need_row: Vec<usize> = Vec::new();
+            let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
+                std::collections::HashMap::new();
+            for k in lo..hi {
+                let srcline = base.borrow().src_lines()[k] as usize;
+                if caret_line == srcline {
+                    need_row.push(k);
+                } else if let Some(rc) = row_cache.get(k, shape_key) {
+                    hit_map.insert(k, rc);
+                } else {
+                    need_row.push(k);
+                }
+            }
+            // 只物化 miss / caret 块（连续段合并）。
+            let mut rows_map: std::collections::HashMap<usize, DocRow> =
+                std::collections::HashMap::new();
+            let mut ni = 0usize;
+            while ni < need_row.len() {
+                let lo2 = need_row[ni];
+                let mut hi2 = lo2;
+                ni += 1;
+                while ni < need_row.len() && need_row[ni] == hi2 + 1 {
+                    hi2 += 1;
+                    ni += 1;
+                }
+                for (off, r) in doc.rows_in_block_window(lo2, hi2).into_iter().enumerate() {
+                    rows_map.insert(lo2 + off, r);
+                }
+            }
+            // 整带顺序装配（Pass3 依赖 `shaped` 与块序一致）：命中 → 浅克隆
+            // （heavy 数据都是 Arc/Rc，top 在 Pass3 现设）；否则从物化行 shape。
+            for k in lo..hi {
+                let srow = if let Some(rc) = hit_map.remove(&k) {
+                    (*rc).clone()
+                } else {
+                    let r = rows_map.remove(&k).expect("未命中 / caret 行应已被物化");
+                    let is_caret = !matches!(r.kind, IrKind::Code | IrKind::Table | IrKind::Image)
+                        && caret_line == r.src_line;
+                    #[cfg(test)]
+                    editor.bump_reshapes();
+                    if is_caret {
+                        shape_docrow(r, editor, window, width, avail, theme, &base_font)
+                    } else {
+                        let rc = row_cache.put(
+                            k,
+                            shape_key,
+                            shape_docrow(r, editor, window, width, avail, theme, &base_font),
+                        );
+                        (*rc).clone()
+                    }
+                };
                 base.borrow_mut().set(k, f32::from(srow.height));
                 shaped.push((k, srow));
             }

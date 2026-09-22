@@ -235,6 +235,13 @@ pub struct WyEditor {
     /// 键入复用；结构性/签名变化重建。`RefCell` 供编辑期对数学块 `source` 做局部修补
     /// （`replace_range`，避免键入大文档数学块内部也整篇重建）。
     derived: RefCell<Option<(u64, Rc<RefCell<WyDerived>>)>>,
+    /// 行整形内容缓存（按块下标；键含 `epoch`/`mgen`）：滚动/带重建复用已整形块，
+    /// 不再整带重 shape + 代码块重跑 syntect（大文档滚动「每档 65ms」的主因）。
+    /// 非结构性编辑只作废被编辑块，结构性/换源/字号变化整体清空。
+    shape_rows: RefCell<RowShapeCache>,
+    /// （仅测试）自上次读取以来 Pass2 实际发生的行整形次数（缓存未命中/光标行）。
+    #[cfg(test)]
+    reshapes: Cell<u64>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
     /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
@@ -406,6 +413,87 @@ fn region_line_sig(line: &str) -> u64 {
     h.finish()
 }
 
+/// 一整行（块）的**整形内容缓存**（按块下标）。滚动/带重建时复用已整形块，
+/// 不再把可视带整批重 shape（`shape_line` ）并为每个代码块重跑 syntect——
+/// 结构密集代码文档「滚动每档 65ms」的主因（对齐 `view` 的行虚拟化复用 +
+/// `editor` 「只重排变更区」的原则）。
+///
+/// - 键 = `(height_epoch ^ mgen)`：`epoch` 已含 `struct_ver`/图片代/宽度；`mgen` 单独
+///   加（公式 Loading→Ready 会改 spacer 宽/高，触发对应块重 shape）。
+/// - 非结构性编辑只作废**被编辑块**（内容变了但 `epoch` 不变 → 必须显式失效）；
+///   结构性编辑（块数/块序变）/ 换源 / 主题字号变化 → 整体 `clear`。
+/// - caret 严格落在**含行内公式的文本行**时会 reveal（shape 依赖光标）→ 该行不缓存
+///   （调用方 `caret_dep` 判定）。
+/// - 容量上限见 [`crate::config::limits::SHAPED_ROW_CACHE_CAP`]，超出按最近最少使用淘汰。
+struct RowShapeCache {
+    entries: std::collections::HashMap<usize, RowShapeEntry>,
+    cap: usize,
+    clock: u32,
+}
+
+struct RowShapeEntry {
+    key: u64,
+    last_seen: u32,
+    row: std::rc::Rc<element::ShapedRow>,
+}
+
+impl RowShapeCache {
+    fn new(cap: usize) -> Self {
+        Self { entries: std::collections::HashMap::new(), cap, clock: 0 }
+    }
+    /// 命中：更新访问钟并返回 `Rc`（浅克隆即可取得行，heavy 数据全是 Arc/Rc）。
+    fn get(&mut self, block: usize, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
+        match self.entries.get_mut(&block) {
+            Some(e) if e.key == key => {
+                e.last_seen = self.clock;
+                self.clock = self.clock.wrapping_add(1);
+                Some(e.row.clone())
+            }
+            _ => None,
+        }
+    }
+    /// 插入（新行）；容量满时淘汰 last_seen 最小的条目。返回缓存的 `Rc`。
+    fn put(
+        &mut self,
+        block: usize,
+        key: u64,
+        row: element::ShapedRow,
+    ) -> std::rc::Rc<element::ShapedRow> {
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&block) {
+            if let Some(old) = self.entries.values().map(|e| e.last_seen).min() {
+                if let Some(k) = self
+                    .entries
+                    .iter()
+                    .find(|(_, e)| e.last_seen == old)
+                    .map(|(k, _)| *k)
+                {
+                    self.entries.remove(&k);
+                }
+            }
+        }
+        let rc = std::rc::Rc::new(row);
+        self.entries.insert(
+            block,
+            RowShapeEntry { key, last_seen: self.clock, row: rc.clone() },
+        );
+        self.clock = self.clock.wrapping_add(1);
+        rc
+    }
+    /// 逐个作废（编辑后的受影响块）。
+    fn invalidate(&mut self, blocks: &[usize]) {
+        for &b in blocks {
+            self.entries.remove(&b);
+        }
+    }
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
@@ -430,6 +518,11 @@ impl WyEditor {
             math_dollar_cnt: Cell::new(0),
             alert_marker_cnt: Cell::new(0),
             derived: RefCell::new(None),
+            shape_rows: RefCell::new(RowShapeCache::new(
+                crate::config::limits::SHAPED_ROW_CACHE_CAP,
+            )),
+            #[cfg(test)]
+            reshapes: Cell::new(0),
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
@@ -459,6 +552,8 @@ impl WyEditor {
         // 基础布局存的是 px 真值，主题/字号变化量纲改变 → 代置失效位（否则带外沿用
         // 旧字号的固定 px 高，行高与带内新字号不一致，滚动跳变）。
         *self.block_layout.borrow_mut() = None;
+        // 整形行内容同样依赖主题（字号/颜色/字体）→ 整体清空。
+        self.shape_rows.borrow_mut().clear();
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
@@ -472,6 +567,8 @@ impl WyEditor {
         *self.frame.borrow_mut() = None;
         // 同 `set_theme`：字号变 → 基础布局（px）失效。
         *self.block_layout.borrow_mut() = None;
+        // 字号变 → 行整形（宽/高）也失效。
+        self.shape_rows.borrow_mut().clear();
     }
 
     /// 设置初始内容。
@@ -509,6 +606,7 @@ impl WyEditor {
         self.struct_ver.set(0);
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
     }
@@ -521,6 +619,7 @@ impl WyEditor {
         self.images_gen.set(self.images_gen.get().wrapping_add(1));
         self.preseed_image_sizes();
         *self.frame.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
     }
 
     /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
@@ -1103,6 +1202,30 @@ impl WyEditor {
     /// 取走待修补（重估高度）的块下标（编辑后一帧用；无则 None）。
     pub(crate) fn take_pending_patch_blocks(&self) -> Option<Vec<usize>> {
         self.pending_patch_blocks.borrow_mut().take()
+    }
+
+    /// （仅测试）自上次读取以来 Pass2 实际整形次数（缓存未命中 / 光标行），
+    /// 供回归断言「滚动/同带重建复用缓存、编辑只重排受影响块」。
+    #[cfg(test)]
+    pub(crate) fn take_reshapes(&self) -> u64 {
+        let v = self.reshapes.get();
+        self.reshapes.set(0);
+        v
+    }
+    /// （仅测试）行整形缓存当前条目数。
+    #[cfg(test)]
+    pub(crate) fn shape_rows_len(&self) -> usize {
+        self.shape_rows.borrow().len()
+    }
+    /// （仅测试）非结构性编辑后：被编辑块应从缓存剔除。
+    #[cfg(test)]
+    pub(crate) fn shape_rows_has(&self, block: usize) -> bool {
+        self.shape_rows.borrow().entries.contains_key(&block)
+    }
+    /// （仅测试）Pass2 光栅计数（缓存未命中/光标行时自增）。
+    #[cfg(test)]
+    pub(crate) fn bump_reshapes(&self) {
+        self.reshapes.set(self.reshapes.get() + 1);
     }
     /// 校验基础布局命中当前（代, 块数）：命中返回 `(false, Rc)` 供复用；未命中
     /// 建出空布局（build_frame 随即 O(n) 填估算/或 patch）并缓存，返回 `(true, Rc)`。
@@ -1689,6 +1812,10 @@ impl WyEditor {
         next.push_str(&s[..r.start]);
         next.push_str(text);
         next.push_str(&s[r.end..]);
+        // 零拷贝转 SharedString：`String → into_boxed_str → Arc<str>` 复用缓冲区
+        // （不新分配/不 memcpy），SmolStr 对长串直接包 Arc——6MB 文档每次键省掉
+        // 一次整串复制（旧 `SharedString::from(String)` 会再拷一份，debug ~5-6ms）。
+        let next_ss = SharedString::from(Arc::<str>::from(next.into_boxed_str()));
         // 增量重建 Doc：rope COW 编辑 + `scan_blocks_incremental_rope`（mid-line 插入
         // ~0.3ms）+ 增量行起始——替代旧 `Doc::open`（scan_blocks+build_ir+行表 ~2s /
         // 键，7MB 大文档「一编辑就卡死」的根因）。结构性变更自动回退（仍只一次，
@@ -1715,7 +1842,6 @@ impl WyEditor {
         let r_old = r.clone();
         let inserted_len = text.len();
         // 只 build 一次新缓冲：`reopen` 与 `self.content` 共享（免 6.4MB 再拷一次/键）。
-        let next_ss = SharedString::from(next);
         self.doc.reopen(&next_ss, prev_len, r_old, inserted_len);
         let cross_newline =
             text.contains('\n') || s[r.start..r.end].contains('\n') || text.contains('\r');
@@ -1725,10 +1851,14 @@ impl WyEditor {
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
+            // 块数/块序变化 → 块下标不再稳定 → 行整形缓存整体作废。
+            self.shape_rows.borrow_mut().clear();
         } else {
             // 非结构性：块下标稳定，记受影响的编辑行块。
             let blk = self.doc.block_index_for_line(edit_line);
             *self.pending_patch_blocks.borrow_mut() = Some(vec![blk]);
+            // 该块内容变了但 `epoch` 不变 → 必须显式作废其整形缓存（否则复用旧图）。
+            self.shape_rows.borrow_mut().invalidate(&[blk]);
         }
         let removed = &s[r.start..r.end];
         self.math_dollar_cnt.set(
@@ -1747,9 +1877,15 @@ impl WyEditor {
         // 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
         // （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
         if structural {
-            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生。
+            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生；
+            // 可编辑块区域（代码/表格）下标也变了 → 一并重建（否则导航判定错位）。
             self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            self.rebuild_block_regions();
         } else {
+            // 非结构性：代码/表格区域布局不变 → `block_regions` 复用，跳过
+            // `rebuild_block_regions` 的 O(块数) 整表扫描（6MB/6 万块 debug ~2.3ms/键，
+            // 是「输入"仍卡"」里仅次于整串复制的第二大头；`structural` 判定已保证
+            // 非结构性编辑既不跨行、也不在代码/表格块内 → 区域必然不变）。
             let new_line = self.doc.line_str(edit_line);
             if region_line_sig(&old_line) != region_line_sig(&new_line) {
                 // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）
@@ -1793,7 +1929,6 @@ impl WyEditor {
             }
         }
 
-        self.rebuild_block_regions();
         self.caret = (r.start + text.len()).min(self.content.len());
         self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
@@ -1919,6 +2054,7 @@ impl WyEditor {
         self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);

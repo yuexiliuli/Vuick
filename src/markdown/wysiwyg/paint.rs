@@ -3,21 +3,21 @@ use super::*;
 use gpui::{App, Bounds, Hsla, Point, SharedString, TextRun, Window, size, point, px};
 use crate::markdown::recognition::AlertKind;
 use crate::markdown::inline_style::MathAlign;
-use crate::markdown::parser::TableAlign;
 
 
-/// 把 mermaid `graph` **画成一张真图**：圆角节点框（判断/圆形用对应形状）+ 正交连线
-/// （带箭头与边标），不再只是文本行。
-pub(crate) fn paint_mermaid_diagram(
+/// 画 **已排好** 的 mermaid 布局：`placed`/`edges` 为**卡片相对坐标**（shape 期以
+/// area=(0,0) 排好并存进 `row.mm`——paint 不再每帧重排/重测标签宽），绘制时统一加
+/// 卡片原点 `(ox, oy)`。生产路径恒由 `row.mm` 携带此布局（`paint_card` 唯一入口）。
+pub(crate) fn paint_mermaid_placed(
     window: &mut Window,
     theme: &WyTheme,
-    source: &str,
-    area_x: f32,
-    area_y: f32,
+    placed: &[MmPlaced],
+    edges: &[(usize, usize, Option<String>)],
+    ox: f32,
+    oy: f32,
     area_w: f32,
     cx: &mut App,
 ) {
-    let (placed, edges) = mm_layout(window, theme, source, area_x, area_y, area_w);
     if placed.is_empty() {
         // 无可解析节点 → 弱化提示。
         let hint: SharedString = "空图 / 渲染器未接入".into();
@@ -27,7 +27,7 @@ pub(crate) fn paint_mermaid_diagram(
         let hline = window.text_system().shape_line(hint, px(12.), &hrun, None);
         let hw = f32::from(hline.width());
         let _ = hline.paint(
-            point(px(area_x + (area_w - hw) / 2.), px(area_y + 40.)),
+            point(px(ox + (area_w - hw) / 2.), px(oy + 40.)),
             px(16.),
             TextAlign::Left,
             None,
@@ -39,12 +39,12 @@ pub(crate) fn paint_mermaid_diagram(
     let label_h = px(18.);
     let edge_color = { let mut c = theme.muted; c.a = 0.85; c };
     // 先画边（线在框底下）。
-    for (ia, ib, elab) in &edges {
+    for (ia, ib, elab) in edges {
         let (pa, pb) = (&placed[*ia], &placed[*ib]);
-        let ax = pa.x + pa.w / 2.;
-        let ay = pa.y + pa.h;
-        let bx = pb.x + pb.w / 2.;
-        let by = pb.y;
+        let ax = ox + pa.x + pa.w / 2.;
+        let ay = oy + pa.y + pa.h;
+        let bx = ox + pb.x + pb.w / 2.;
+        let by = oy + pb.y;
         let mid_y = ay + (by - ay) / 2.;
         let mut pth = gpui::PathBuilder::stroke(px(1.6));
         pth.move_to(point(px(ax), px(ay)));
@@ -78,14 +78,14 @@ pub(crate) fn paint_mermaid_diagram(
     // 再画节点框 + 标签（“图”本体）。
     let box_bg = theme.code_bg;
     let box_border = { let mut c = theme.muted; c.a = 0.6; c };
-    for p in &placed {
+    for p in placed {
         let r = match p.shape {
             MmShape::Circle => p.h / 2.,
             MmShape::Round => 10.,
             MmShape::Diamond => 4.,
             MmShape::Rect => 6.,
         };
-        let b = Bounds::new(point(px(p.x), px(p.y)), size(px(p.w), px(p.h)));
+        let b = Bounds::new(point(px(ox + p.x), px(oy + p.y)), size(px(p.w), px(p.h)));
         window.paint_quad(gpui::PaintQuad {
             bounds: b,
             corner_radii: Corners::all(px(r)),
@@ -98,7 +98,7 @@ pub(crate) fn paint_mermaid_diagram(
         let ln = window.text_system().shape_line(p.label.clone().into(), theme.font_size, &run, None);
         let tw = f32::from(ln.width());
         let _ = ln.paint(
-            point(px(p.x + (p.w - tw) / 2.), px(p.y + (p.h - f32::from(label_h)) / 2.)),
+            point(px(ox + p.x + (p.w - tw) / 2.), px(oy + p.y + (p.h - f32::from(label_h)) / 2.)),
             label_h,
             TextAlign::Left,
             None,
@@ -110,60 +110,34 @@ pub(crate) fn paint_mermaid_diagram(
 
 
 
-/// 表格的一行单元格文本（表头加粗/浅色，按列对齐）。
-pub(crate) fn draw_table_row(
+/// paint 版表格单元格绘制（复用 [`super::TableCellLayout`] 在 shape 期排好的单行；
+/// 几何与 `shape_table_row` 的 `text_x`/纵向居中一致）——**不再每帧重 shape 单元格**。
+fn draw_table_row_cached(
     window: &mut Window,
     cx: &mut App,
-    cells: &[gpui::SharedString],
+    cells: &[super::TableCellLayout],
     widths: &[f32],
-    aligns: &[TableAlign],
     x0: f32,
     row_top_y: f32,
     row_h: f32,
-    is_header: bool,
     theme: &WyTheme,
 ) {
-    let font_size = theme.font_size;
+    let text_lh = f32::from(theme.para_line());
+    let ty = row_top_y + ((row_h - text_lh) / 2.).max(0.);
     let mut acc = 0f32;
-    for (ci, c) in cells.iter().enumerate() {
+    for (ci, cell) in cells.iter().enumerate() {
         let col_w = widths.get(ci).copied().unwrap_or(0.);
-        let mut font = theme.font.clone();
-        let text_col = if is_header {
-            let mut c = theme.text;
-            c.a = 0.9;
-            c
-        } else {
-            theme.text
-        };
-        if is_header {
-            font.weight = gpui::FontWeight::BOLD;
-        }
-        let run = gpui::TextRun { len: c.len(), font, color: text_col, ..Default::default() };
-        let line = window.text_system().shape_line(c.clone(), font_size, &[run], None);
-        {
-            let w = f32::from(line.width());
-            let x = match aligns.get(ci) {
-                Some(TableAlign::Center) => acc + ((col_w - w) / 2.).max(0.),
-                Some(TableAlign::Right) => acc + (col_w - w - 10.).max(0.),
-                _ => acc + 10.,
-            };
-            // 单元格纵向居中（预览 `items_center`）：文字块中点对齐行中点。
-            let text_lh = f32::from(theme.para_line());
-            let ty = row_top_y + ((row_h - text_lh) / 2.).max(0.);
-            let _ = line.paint(
-                point(px(x0 + x), px(ty)),
-                px(text_lh),
-                gpui::TextAlign::Left,
-                None,
-                window,
-                cx,
-            );
-        }
+        let _ = cell.line.paint(
+            point(px(x0 + acc + cell.text_x), px(ty)),
+            px(text_lh),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
         acc += col_w;
     }
 }
-
-
 
 /// 画表格块网格：外框 + 表头背景 + 行/列分隔线 + 单元格文本（配色对齐预览）。
 /// 内容超宽（`total_w` > 内容区宽）时裁剪在内容区内并按横向滚动偏移平移
@@ -230,20 +204,14 @@ pub(crate) fn paint_table_row(
             border_style: gpui::BorderStyle::Solid,
         });
         let mut cy = inner_lo;
-        draw_table_row(
-            window,
-            cx,
-            &t.header_texts,
-            &t.widths,
-            &t.aligns,
-            x0,
-            cy,
-            row_h_f,
-            true,
-            theme,
-        );
+        // 单元格文本画 shape 期排好的 `table_edit` 单行（免每帧重 shape）。`shape_table_row`
+        // 恒推表头行 → `table_edit` 恒 Some（不变量，无兜底重推对齐公式的漂移路径）。
+        let te = row.table_edit.as_ref().expect("表格行恒有逐单元格编辑排版");
+        if let Some(hrow) = te.rows.first() {
+            draw_table_row_cached(window, cx, &hrow.cells, &t.widths, x0, cy, row_h_f, theme);
+        }
         cy += row_h_f;
-        for cells in &t.rows_texts {
+        for (ri, _cells) in t.rows_texts.iter().enumerate() {
             // 行间分隔线（表头下 + 数据行之间）。
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
@@ -257,18 +225,9 @@ pub(crate) fn paint_table_row(
                 border_style: gpui::BorderStyle::Solid,
             });
             cy += 1.;
-            draw_table_row(
-                window,
-                cx,
-                cells,
-                &t.widths,
-                &t.aligns,
-                x0,
-                cy,
-                row_h_f,
-                false,
-                theme,
-            );
+            if let Some(drow) = te.rows.get(1 + ri) {
+                draw_table_row_cached(window, cx, &drow.cells, &t.widths, x0, cy, row_h_f, theme);
+            }
             cy += row_h_f;
         }
         // 列分隔竖线（内容区内）。
@@ -374,7 +333,7 @@ pub(crate) fn paint_code_row(
     // 顶空白带之后逐行画文本（x = 面板左 + 内衬 x_off − 滚动偏移）。
     window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
         let mut sub_top = row.top + theme.code_line();
-        for wl in &row.wrapped {
+        for wl in row.wrapped.iter() {
             let o = point(text_x - px(scroll), origin.y + sub_top);
             let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
             sub_top += row.lh * (wl.wrap_boundaries().len() + 1) as f32;
@@ -1048,7 +1007,7 @@ pub(crate) fn paint_card(
                 y += 22.;
             }
         }
-        BlockCard::Mermaid { source } => {
+        BlockCard::Mermaid { .. } => {
             // 左上角小标签（弱化）。
             let tag: SharedString = "mermaid".into();
             let mut muted = theme.muted;
@@ -1056,8 +1015,11 @@ pub(crate) fn paint_card(
             let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
             let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
             let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
-            // 矢量图渲染：圆角节点框 + 正交连线/箭头/边标。
-            paint_mermaid_diagram(window, theme, source, x0, top0, content_w, cx);
+            // 矢量图渲染：圆角节点框 + 正交连线/箭头/边标。`row.mm` 恒为 shape 期算好的
+            // 布局（卡片相对坐标，mermaid 卡片唯一构造点 `shape_code_row` 设之）——
+            // paint 不再每帧重排/重测全部标签宽，只加卡片原点绘制。
+            let mm = row.mm.as_ref().expect("mermaid 卡片恒有缓存的已排布局");
+            paint_mermaid_placed(window, theme, &mm.0, &mm.1, x0, top0, content_w, cx);
         }
     }
 }

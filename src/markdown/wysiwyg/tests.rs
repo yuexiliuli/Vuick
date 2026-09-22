@@ -3227,6 +3227,238 @@ A-->B
         });
     }
 
+    /// 行整形缓存（滚动复用）：同带重建不重 shape（仅光标行例外）、重叠带只 shape 新进块。
+    #[gpui::test]
+    fn shaped_row_cache_reuses_rows_across_band_rebuilds(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        for i in 0..120 {
+            text.push_str(&format!("para line {i} some more words here to wrap\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let n = text.len();
+            // 光标放文档末端（不在可见带内）→ 带内无「光标行 reveal」干扰。
+            ed.update(cx, |e, _| e.set_caret(n));
+            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+            let r1 = ed.read(cx).take_reshapes();
+            assert!(r1 > 0, "首帧应实际整形：{r1}");
+            let cached1 = ed.read(cx).shape_rows_len();
+            assert!(cached1 > 0, "首帧后缓存应有条目：{cached1}");
+            // 同带重建：全部命中缓存 → 不再整形。
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+            assert_eq!(
+                ed.read(cx).take_reshapes(),
+                0,
+                "同带重建应全部命中行整形缓存"
+            );
+            // 重叠带（下移 300px）：只 shape 新进块的少量行，远少于首帧。
+            let _f3 = build_frame(ed.read(cx), window, px(900.), (300., 1100.));
+            let r3 = ed.read(cx).take_reshapes();
+            assert!(
+                r3 < r1,
+                "重叠带只应重排新进块（{r3} < 首帧 {r1}）"
+            );
+        });
+    }
+
+    /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑整体清空。
+    #[gpui::test]
+    fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        for i in 0..80 {
+            text.push_str(&format!("paragraph number {i} here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(text.len()));
+            // 带限前 ~72 行（每段 ≈22px）；caret 在文末（带外）→ 不干扰缓存断言。
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            let cached = ed.read(cx).shape_rows_len();
+            assert!(cached > 0);
+            // 归零整形计数（只统计编辑后的重建）。
+            ed.read(cx).take_reshapes();
+            // 在「paragraph number 5」行内做一次**非结构性**单字符替换。
+            let at = text.find("number 5").unwrap() + 7;
+            let blk_edit = ed.read(cx).doc().block_index_for_line(ed.read(cx).row_col(at).0);
+            assert!(ed.read(cx).shape_rows_has(blk_edit), "编辑前该块应已缓存");
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "X", ecx));
+            // 被编辑块被剔除；其它块仍复用 → 缓存条目数不变（该块条目已被删）。
+            assert!(
+                !ed.read(cx).shape_rows_has(blk_edit),
+                "非结构性编辑应剔除被编辑块的整形缓存"
+            );
+            // 重建带：只有被编辑块被重排（其它块仍命中）。光标此刻在该行 → 也算光标行，
+            // 仍只重排 1 行。
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            let r = ed.read(cx).take_reshapes();
+            assert_eq!(r, 1, "只应重排被编辑块，实际 {r}");
+            // 结构性编辑（插入换行）→ 整体清空。
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+            assert_eq!(
+                ed.read(cx).shape_rows_len(),
+                0,
+                "结构性编辑（换行）应整体清空行整形缓存"
+            );
+        });
+    }
+
+    /// 字号/主题变化 → 行整形缓存整体清空（否则旧字号的行宽/高被复用）。
+    #[gpui::test]
+    fn font_change_clears_shape_cache(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+            assert!(ed.read(cx).shape_rows_len() > 0);
+            ed.update(cx, |e, _| e.set_font_size(px(18.)));
+            assert_eq!(
+                ed.read(cx).shape_rows_len(),
+                0,
+                "字号变化应整体清空行整形缓存"
+            );
+        });
+    }
+
+    /// 光标移动不触碰行整形缓存（仅清帧）→ 重建仍复用缓存。
+    #[gpui::test]
+    fn caret_move_keeps_shape_cache(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\npara line eee\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(text.len()));
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 600.));
+            let cached = ed.read(cx).shape_rows_len();
+            assert!(cached > 0);
+            ed.read(cx).take_reshapes();
+            // 光标移到带内文本行 → 只重排该行（caret reveal 守卫）；其余缓存行均复用。
+            ed.update(cx, |e, _| e.set_caret(0));
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 600.));
+            let r = ed.read(cx).take_reshapes();
+            assert!(
+                r <= 2,
+                "光标移动最多重排光标行 + 原光标行（均未缓存），其余行复用（实际 {r}）"
+            );
+            assert!(
+                ed.read(cx).shape_rows_len() >= 3,
+                "光标移动不应清空行整形缓存"
+            );
+        });
+    }
+
+    /// 手动性能基准：量化 A1「命中先行」的收益——缓存预热后**同带缓存重建**（只物化
+    /// miss / caret 块）对比旧行为的「整带 `rows_in_block_window` 物化」单次成本
+    /// （旧实现每帧/每带重建都先付整带物化再查缓存）。
+    #[gpui::test]
+    #[ignore]
+    fn bench_cached_band_rebuild_vs_materialize(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        for i in 0..3_000 {
+            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
+            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
+            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let band = (0., 800.);
+            let warm = build_frame(ed.read(cx), window, px(900.), band);
+            let nband_blocks = warm.rows.len().max(1);
+            // (a) 同带缓存重建（A1 后只物化 caret 行 + 未命中块）。
+            let mut t_a = 0u128;
+            for _ in 0..20 {
+                let t0 = std::time::Instant::now();
+                let f = build_frame(ed.read(cx), window, px(900.), band);
+                let _ = f.total;
+                t_a += t0.elapsed().as_millis();
+            }
+            // (b) 旧行为每重建必付的「整带物化」成本（同量级块数）。
+            let mut t_b = 0u128;
+            for _ in 0..20 {
+                let t0 = std::time::Instant::now();
+                let rows = ed
+                    .read(cx)
+                    .doc()
+                    .rows_in_block_window(0, nband_blocks.saturating_sub(1));
+                let _ = rows.len();
+                t_b += t0.elapsed().as_millis();
+            }
+            eprintln!(
+                "[bench] cached same-band rebuild: {:.2}ms; full-band materialize(旧每帧必付): {:.2}ms (band blocks={})",
+                t_a as f64 / 20.,
+                t_b as f64 / 20.,
+                nband_blocks
+            );
+            // 全文档带（`(0., 999999.)`，屏外/整表重建路径）：缓存预热后重建对比整带物化。
+            let band_all = (0., 999_999.);
+            let _warm_all = build_frame(ed.read(cx), window, px(900.), band_all);
+            let n_all = ed.read(cx).doc().block_count();
+            let mut t_a2 = 0u128;
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                let f = build_frame(ed.read(cx), window, px(900.), band_all);
+                let _ = f.total;
+                t_a2 += t0.elapsed().as_millis();
+            }
+            let mut t_b2 = 0u128;
+            for _ in 0..10 {
+                let t0 = std::time::Instant::now();
+                let rows = ed
+                    .read(cx)
+                    .doc()
+                    .rows_in_block_window(0, n_all.saturating_sub(1));
+                let _ = rows.len();
+                t_b2 += t0.elapsed().as_millis();
+            }
+            eprintln!(
+                "[bench] full-doc cached rebuild: {:.2}ms; full-doc materialize(旧每帧必付): {:.2}ms (blocks={})",
+                t_a2 as f64 / 10.,
+                t_b2 as f64 / 10.,
+                n_all
+            );
+        });
+    }
+
     /// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
     /// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
     #[gpui::test]
@@ -3335,5 +3567,198 @@ A-->B
                 t += t0.elapsed().as_millis();
             }
             eprintln!("[bench] 20 caret-move frame rebuilds: {t}ms ({:.1}ms/step)", t as f64 / 20.);
+        });
+    }
+
+    /// 编辑路径分项剖析：整串复制 / SharedString 转 / Doc::reopen / 通知 各占多少。
+    #[gpui::test]
+    #[ignore]
+    fn bench_edit_path_split(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+        while text.len() < 6_000_000 {
+            text.push_str(para);
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("one two three").unwrap() + 4;
+            let s = ed.read(cx).content();
+            let r = at..at + 1;
+            // (a) 整串复制。
+            let mut t = 0u128;
+            let mut next = String::new();
+            for _ in 0..20 {
+                let t0 = std::time::Instant::now();
+                let mut n = String::with_capacity(s.len() - r.len() + 1);
+                n.push_str(&s[..r.start]);
+                n.push_str("x");
+                n.push_str(&s[r.end..]);
+                next = n;
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] (a) full-string copy: {:.2}ms", t as f64 / 20.);
+            // (b) SharedString::from。
+            let mut t = 0u128;
+            for _ in 0..20 {
+                let t0 = std::time::Instant::now();
+                let _ss = gpui::SharedString::from(next.clone());
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] (b) SharedString::from(String): {:.2}ms", t as f64 / 20.);
+            // (c) Doc::reopen。
+            let mut t = 0u128;
+            let s_ss = ed.read(cx).text();
+            let mut doc = crate::markdown::doc::Doc::open(s_ss.clone());
+            let mut buf = String::from(&*s_ss);
+            for _ in 0..20 {
+                buf.replace_range(r.clone(), "x");
+                let ss = gpui::SharedString::from(buf.clone());
+                let t0 = std::time::Instant::now();
+                doc.reopen(&ss, s.len(), r.clone(), 1);
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] (c) Doc::reopen: {:.2}ms", t as f64 / 20.);
+            // (e) 新零拷贝路径：String → Box<str> → Arc<str> → SharedString。
+            let mut t = 0u128;
+            for _ in 0..20 {
+                let mut x = String::with_capacity(s.len());
+                x.push_str(&s[..r.start]);
+                x.push_str("x");
+                x.push_str(&s[r.end..]);
+                let t0 = std::time::Instant::now();
+                let _ss =
+                    gpui::SharedString::from(std::sync::Arc::<str>::from(x.into_boxed_str()));
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] (e) new zero-copy concat+SharedString: {:.2}ms", t as f64 / 20.);
+            // (f) rebuild_block_regions（replace_range 每键 O(块数) 扫描）。
+            let mut t = 0u128;
+            let mut doc2 = crate::markdown::doc::Doc::open(s_ss.clone());
+            let mut buf2 = String::from(&*s_ss);
+            for _ in 0..20 {
+                buf2.replace_range(r.clone(), "x");
+                let ss = gpui::SharedString::from(buf2.clone());
+                doc2.reopen(&ss, s.len(), r.clone(), 1);
+                let n = doc2.block_count();
+                let t0 = std::time::Instant::now();
+                let mut regions: usize = 0;
+                for i in 0..n {
+                    if let Some(m) = doc2.block_meta(i) {
+                        if matches!(
+                            m.kind,
+                            crate::markdown::parser::RowKind::Code
+                                | crate::markdown::parser::RowKind::Table
+                        ) {
+                            regions += 1;
+                        }
+                    }
+                }
+                let _ = regions;
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] (f) rebuild_block_regions scan (n={}): {:.2}ms", doc2.block_count(), t as f64 / 20.);
+            // (d) board emits 未计入（UI 层）。总 edit-only 对照。
+            let _ = window;
+            let _ = ed;
+        });
+    }
+
+    #[gpui::test]
+    #[ignore]
+    fn bench_scale_with_doc_size(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        // —— 1) 纯文本大文档：键入成本随字节数线性放大？——
+        let mut text = String::new();
+        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+        let mut mb = 0usize;
+        while mb < 6_000_000 {
+            text.push_str(para);
+            mb = text.len();
+        }
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = _vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("one two three").unwrap() + 4;
+            let mut t = 0u128;
+            // replace_range 单独（不 rebuild frame）→ 量化整串复制 + reopen。
+            for _ in 0..30 {
+                let t0 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!(
+                "[bench] plain-6MB edit-only: {t}ms ({:.1}ms/key, text={}B)",
+                t as f64 / 30.,
+                ed.read(cx).content().len()
+            );
+            // 完整键入周期（edit + band rebuild）。
+            let mut t2 = 0u128;
+            for k in 0..30 {
+                let t0 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
+                let band = (k as f32 * 20., k as f32 * 20. + 900.);
+                build_frame(ed.read(cx), window, px(1200.), band);
+                t2 += t0.elapsed().as_millis();
+            }
+            eprintln!(
+                "[bench] plain-6MB typing-cycle: {t2}ms ({:.1}ms/key)",
+                t2 as f64 / 30.
+            );
+        });
+
+        // —— 2) 代码密集文档：滚动重建里代码块占多少（语法高亮重解析）？——
+        let mut code = String::new();
+        for i in 0..2_000 {
+            code.push_str(&format!("```rust\nfn compute_{i}(a: u32, b: u32) -> u32 {{\n    let sum = a + b * {i};\n    let diff = a.saturating_sub(b);\n    if sum > diff {{ return sum; }}\n    diff\n}}\n```\n"));
+            code.push_str(&format!("some paragraph text {i} after code block\n"));
+        }
+        let (host2, _vcx2) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&code));
+            WyHost { ed }
+        });
+        let vcx2: &mut VisualTestContext = _vcx2;
+        let mut t3 = 0u128;
+        let mut t4 = 0u128;
+        vcx2.update(|window, cx: &mut App| {
+            let ed = host2.read(cx).ed.clone();
+            let n = ed.read(cx).doc().block_count();
+            let total = n;
+            let _ = ed.read(cx).derived();
+            // 预热基础布局 + 派生扫描。
+            build_frame(ed.read(cx), window, px(1200.), (0., 2400.));
+            for k in 0..12 {
+                let top = (total * k / 12).min(total.saturating_sub(1)) as f32;
+                let band = (top * 22., top * 22. + 2400.); // 每块 ~22px 的近似推进
+                let t0 = std::time::Instant::now();
+                let f = build_frame(ed.read(cx), window, px(1200.), band);
+                t3 += t0.elapsed().as_millis();
+                let _ = f.rows.len();
+                // 前进半个屏幕（512px 量程内不同带 → 命中 1 次重建）。
+                let t1 = std::time::Instant::now();
+                let band2 = (top * 22. + 300., top * 22. + 2700.);
+                let _ = build_frame(ed.read(cx), window, px(1200.), band2);
+                t4 += t1.elapsed().as_millis();
+            }
+            eprintln!(
+                "[bench] code-heavy band rebuild: fresh {:.1}ms, +300px-shift {:.1}ms (blocks={}, code blocks≈{})",
+                t3 as f64 / 12.,
+                t4 as f64 / 12.,
+                total,
+                total / 2
+            );
         });
     }
