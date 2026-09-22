@@ -204,10 +204,14 @@ pub struct WyEditor {
     /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
     /// `viewport_size` 推算并发布，measure 用上一帧的带做窗口化 shape。
     shape_band: Cell<Option<(f32, f32)>>,
-    /// 块「真实可视行数」缓存（关键：带宽滚动时带外块沿用**已整形过的真值**，
+    /// 块「真实高度（px）」缓存（关键：带宽滚动时带外块沿用**已整形过的真值**，
     /// 而非每次回到估算——否则行高在估算/真实间跳动，滚动时文字忽大忽小）。
-    /// 键 = `(gen, src_line, kind_tag, width_bits)` 的 hash；值 = 可视行数。
-    height_cache: RefCell<std::collections::HashMap<u64, u32>>,
+    /// 键 = `(gen, src_line, kind_tag, width_bits)` 的 hash；值 = 该块整形的实际高度 px。
+    /// **必须存 px 而不是「可视行数」**：行数重建 (`para_line × n`) 只对普通段落
+    /// 成立，标题（`heading_line` + 8px pad）、行内公式撑高行（`sub_heights[0]` > lh）
+    /// 重建会矮/高不实 → 带内/带外 total 不一致 → 滚动到文档先后端反复 clamp 跳变。
+    /// 字号/主题变化会改 px 量纲 → `set_theme`/`set_font_size` 必须清此缓存。
+    height_cache: RefCell<std::collections::HashMap<u64, f32>>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
     /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
@@ -335,6 +339,9 @@ impl WyEditor {
     pub fn set_theme(&mut self, theme: WyTheme) {
         self.theme = theme;
         *self.frame.borrow_mut() = None;
+        // 高度缓存存的是 px 真值，主题/字号变化量纲改变 → 必须清（否则带外沿用
+        // 旧字号的固定 px 高，行高与带内新字号不一致，滚动跳变）。
+        self.height_cache.borrow_mut().clear();
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
@@ -346,6 +353,8 @@ impl WyEditor {
         }
         self.theme.set_font_size(size);
         *self.frame.borrow_mut() = None;
+        // 同 `set_theme`：字号变 → 高度缓存（px）失效。
+        self.height_cache.borrow_mut().clear();
     }
 
     /// 设置初始内容。
@@ -859,11 +868,11 @@ impl WyEditor {
     pub(crate) fn shape_band(&self) -> Option<(f32, f32)> {
         self.shape_band.get()
     }
-    pub(crate) fn cached_height_lines(&self, key: u64) -> Option<u32> {
+    pub(crate) fn cached_height(&self, key: u64) -> Option<f32> {
         self.height_cache.borrow().get(&key).copied()
     }
-    pub(crate) fn cache_height_lines(&self, key: u64, lines: u32) {
-        self.height_cache.borrow_mut().insert(key, lines);
+    pub(crate) fn cache_height(&self, key: u64, height_px: f32) {
+        self.height_cache.borrow_mut().insert(key, height_px);
     }
 
     /// 图片加载缓存实体（元素在 paint 里 `load` 用）。

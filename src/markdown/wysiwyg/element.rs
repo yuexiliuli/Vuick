@@ -1752,6 +1752,17 @@ fn shape_table_row(
     }
 }
 
+/// 独立图片行的显示高（px）：已加载按真实宽高比换算（宽封顶 `IMAGE_MAX_W`，
+/// 由 `avail` 决定实际宽），未加载/失败用占位高。`build_frame` 的带外估算与
+/// `shape_image_row` 必须用同一函数 → 加载后带内/带外高度一致（滚动不跳）。
+fn image_row_height(editor: &WyEditor, src: &str, avail: f32) -> Pixels {
+    let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
+    match editor.image_size(src) {
+        Some(Some((iw, ih))) if iw > 0. && ih > 0. => px((max_w * ih / iw.max(1.)).max(1.)),
+        _ => px(crate::config::markdown::IMAGE_ROW_DEFAULT_H),
+    }
+}
+
 /// 独立图片行：shape 期定显示框（已加载按真实宽高比、未加载用占位高）。
 /// 非文本行（不可编辑）；图片内容在 paint 期异步加载后画出。
 fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
@@ -1762,30 +1773,25 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         _ => gpui::SharedString::default(),
     };
     let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
-    let (w, h) = match editor.image_size(src.as_ref()) {
-        Some(Some((iw, ih))) if iw > 0. && ih > 0. => {
-            let w = max_w;
-            (w, (w * ih / iw.max(1.)).max(1.))
-        }
-        _ => (max_w, crate::config::markdown::IMAGE_ROW_DEFAULT_H),
-    };
+    let h = image_row_height(editor, src.as_ref(), avail);
+    let w = max_w;
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped: Vec::new(),
-        sub_heights: vec![px(h)],
+        sub_heights: vec![h],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
         multi_offsets: Vec::new(),
         code_ranges: Vec::new(),
-        lh: px(h),
+        lh: h,
         x_off: px(0.),
-        height: px(h),
+        height: h,
         top: px(0.),
         kind,
         table: None,
         table_edit: None,
-        image: Some(ShapedImage { src, alt, w, h }),
+        image: Some(ShapedImage { src, alt, w, h: f32::from(h) }),
         extra: RowExtra::default(),
     }
 }
@@ -1991,10 +1997,10 @@ pub(crate) fn build_frame(
             None
         } else {
             match meta.kind {
-                // 折行文本块（段/标题/引述/列表）缓存**真实可视行数**（带外沿用真值防
+                // 折行文本块（段/标题/引述/列表）缓存**真实高度 px**（带外沿用真值防
                 // 滚动跳变）。代码/表格/图片**不入缓存**：它们不折行、`estimate_height`
-                // 与 shape 高同式（代码 = (行数+2)×code_line）——入缓存反而会用
-                // `line_h × 行数`（正文行高×n）重建出错误高度（比真实矮 2 行代码高）。
+                // 与 shape 高同式（代码 = (行数+2)×code_line；图片 = 见
+                // `image_row_height`）——入缓存反而会用错误行高重建。
                 RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
                     Some(height_cache_key(rgen, igen, mgen, meta.src_line, meta.kind, width_bits))
                 }
@@ -2015,9 +2021,18 @@ pub(crate) fn build_frame(
                 src.push_str(&doc.line_str(srcline + 1 + k as usize));
             }
             mermaid_card_height(&src)
+        } else if meta.kind == RowKind::Image {
+            // 图片行：用当前加载尺寸（或占位默认）按 `shape_image_row` 同式算高——
+            // 占位→真实尺寸由 `igen` 触发帧重建，但带内外必须用同一公式，否则
+            // 加载后真实高 ≠ 带外估算高，滚动（尤其到文档末端）会跳。不物化行，
+            // 直接行文本取 src（`parse_image_line`）。
+            let src = crate::markdown::parser::parse_image_line(doc.line_str(srcline).trim())
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            image_row_height(editor, &src, avail)
         } else {
-            match cache_key.and_then(|k| editor.cached_height_lines(k)) {
-                Some(lines) => line_h * lines as f32,
+            match cache_key.and_then(|k| editor.cached_height(k)) {
+                Some(h) => px(h),
                 None => {
                     let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
                     estimate_height(&meta, chars, ascii, theme, avail, line_h)
@@ -2038,7 +2053,10 @@ pub(crate) fn build_frame(
         y = bottom;
     }
 
-    // Pass 2：相邻带内块合并成窗口调用物化 + shape，并把真实可视行数写回缓存。
+    // Pass 2：相邻带内块合并成窗口调用物化 + shape，并把真实高度（px）写回缓存——
+    // 带外再遇此块时沿用**整形的真值高度**（标题 / 行内公式撑高行都算准了），
+    // 使带内/带外 total 完全一致 → 滚动不跳。折行代码/长段落会与「估算不折行」偏差，
+    // 缓存消除滚动跳变；代码/表格（无折行、估算同式）不入缓存。
     let mut shaped: Vec<Option<ShapedRow>> =
         std::iter::repeat_with(|| None).take(n).collect();
     let mut i = 0;
@@ -2055,16 +2073,8 @@ pub(crate) fn build_frame(
         let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
         for (j, r) in docrows.into_iter().enumerate() {
             let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
-            // 缓存该块真实可视行数（带外再遇此块时沿用真值 → 不跳）。折行代码/长段落
-            // 会与"估算不折行"偏差，缓存消除滚动跳变；表格（无折行、估算同式）不入缓存。
-            let visual = srow
-                .wrapped
-                .iter()
-                .map(|wl| wl.wrap_boundaries().len() + 1)
-                .sum::<usize>()
-                .max(1) as u32;
             if let Some(k) = plan[lo + j].cache_key {
-                editor.cache_height_lines(k, visual);
+                editor.cache_height(k, f32::from(srow.height));
             }
             shaped[lo + j] = Some(srow);
         }
@@ -4388,6 +4398,144 @@ mod tests {
             // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             assert_eq!(frame.rows[1].height, h_real);
+        });
+    }
+
+    #[gpui::test]
+    fn heading_off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        // 标题行**带外**高度必须沿用「整形真值」（heading_line×行 + 8px pad），不能按
+        // 正文行高重建——否则标题每次进出可视带 total 就变矮/变高，滚动到文档末端
+        // 被反复 clamp → 页面「突然跳上去 + 抖动」。这是用户实测症状的根因。
+        let text = "first paragraph line\n## Heading two\nsome more body text\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (h_real, idx) = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let idx = frame
+                .rows
+                .iter()
+                .position(|r| matches!(r.kind, IrKind::Heading(_)))
+                .expect("应有标题块");
+            let h_real = frame.rows[idx].height;
+            assert!(
+                f32::from(h_real) > f32::from(frame.line_h),
+                "标题块高应大于正文行高（heading_line + pad），实际 {}",
+                f32::from(h_real)
+            );
+            (h_real, idx)
+        });
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 窄带 (0,1)：首段在带内，标题被挤出带 → 未 shape，但高度沿用缓存真值。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
+            assert!(frame.rows[idx].wrapped.is_empty(), "标题应已带外（未 shape）");
+            assert!(
+                (f32::from(frame.rows[idx].height) - f32::from(h_real)).abs() < 0.5,
+                "带外标题高度应沿用整形真值 {h_real:?}，实际 {:?}",
+                frame.rows[idx].height
+            );
+            // 全带回来 → 仍一致。
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            assert_eq!(frame.rows[idx].height, h_real);
+        });
+    }
+
+    #[gpui::test]
+    fn inline_math_grown_row_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
+        use gpui::App;
+        cx.update(gpui_component::init);
+        // 行内公式撑高的行：带内高 = grew 的 sub_heights[0]（> 行高），带外也必须
+        // 沿用该真值，不能按「行数×正文行高」重建（否则缩回原高，滚动跳）。
+        let text = "a $\u{5c}int_0^1 x^2 dx$ b\nsome more body text that is longer\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let h_real = vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let buf = image::RgbaImage::from_raw(40, 140, vec![0u8; 40 * 140 * 4]).unwrap();
+            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+            ed.read(cx).math_slots().borrow_mut().insert(
+                super::super::inline_math_key("\\int_0^1 x^2 dx"),
+                super::super::MathSlot::Ready(img, 20., 70.),
+            );
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let row = &frame.rows[0];
+            let h = row.height;
+            assert!(
+                f32::from(h) > f32::from(row.lh) + 0.5,
+                "含超高公式的行应被撑高：h={h:?} > lh={:?}",
+                row.lh
+            );
+            h
+        });
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 窄带完全落在撑高行之下 → 第 0 行带外（未 shape），仍应沿用整形真值。
+            let lo = f32::from(h_real);
+            let frame = build_frame(ed.read(cx), window, px(300.), (lo, lo + 0.1));
+            assert!(frame.rows[0].wrapped.is_empty(), "撑高行已被挤出带（未 shape）");
+            assert!(
+                (f32::from(frame.rows[0].height) - f32::from(h_real)).abs() < 0.5,
+                "带外撑高行高度应沿用整形真值 {h_real:?}，实际 {:?}",
+                frame.rows[0].height
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn image_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        // 已加载图片行：带内真实高（按宽高比），带外估算也必须同式——否则加载后
+        // 图片行一进带就高/矮跳一次，滚动到文档末端现形。
+        let text = "![figure](x.png)\nfirst paragraph line\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let h_real = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 预置宽高比 2:1 的真实尺寸（模拟 preseed/加载完成）。
+            ed.update(cx, |e, _| {
+                e.set_image_size("x.png".into(), Some((200., 100.)));
+            });
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = &frame.rows[0];
+            assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
+            let img = row.image.as_ref().expect("图片行应有渲染数据");
+            let h = row.height;
+            assert_eq!(f32::from(h), img.h, "块高应等于显示图高");
+            assert!(
+                (f32::from(h)
+                    - crate::config::markdown::IMAGE_ROW_DEFAULT_H)
+                    .abs()
+                    > 1.,
+                "2:1 图片在此宽度下应高于占位默认高，h={h:?}"
+            );
+            h
+        });
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 窄带完全落在图片行之下 → 图片行带外（未 shape），仍沿用整形真值。
+            let lo = f32::from(h_real);
+            let frame = build_frame(ed.read(cx), window, px(600.), (lo, lo + 0.1));
+            let row = &frame.rows[0];
+            assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
+            assert!(row.wrapped.is_empty(), "图片行应带外（未 shape）");
+            assert!(
+                (f32::from(row.height) - f32::from(h_real)).abs() < 0.5,
+                "带外图片行高度应沿用整形真值 {h_real:?}，实际 {:?}",
+                row.height
+            );
         });
     }
 
