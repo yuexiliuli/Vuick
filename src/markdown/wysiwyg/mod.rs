@@ -1945,7 +1945,7 @@ impl WyEditor {
             EditKind::Atomic
         };
         let merges = match self.last_edit {
-            Some((k, s, e)) if k == intent => match intent {
+            Some((k, s, _e)) if k == intent => match intent {
                 // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
                 EditKind::Typing => r.start == s + inserted_len,
                 EditKind::Backspace => r.end == s,   // 向后退格首尾相接
