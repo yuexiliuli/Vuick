@@ -297,9 +297,28 @@ pub struct WyEditor {
     /// （代码 ``` 标记行、表格分隔行，只读）。导航/退格/删除据此避免光标落进
     /// 只读围栏（否则在隐藏围栏上输入会破坏结构）。随文本变更重建。
     block_regions: Vec<BlockRegion>,
-    /// 撤销栈（旧状态 → pop 后恢复）；重做栈。整份源文本快照（简单可靠，文档不大）。
+    /// 撤销栈（旧状态 → pop 后恢复）；重做栈。rope COW 快照（O(log n)/键），深度
+    /// [`Self::UNDO_LIMIT`]；**B2 合并**：连续同意图且邻接的编辑并入上一个事务,
+    /// 只在「新事务起点」push 快照——200 快照可覆盖远比 200 字符多的内容。
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    /// 上一个编辑（意图 + 源字节区间）：`replace_range` 用它判定是否与此编辑合并成
+    /// 同一撤销事务（连续打字 / 相邻退格 / 同点删除）；光标移动（`set_caret`/方向键
+    /// `moved`）与整篇内容替换打断。
+    last_edit: Option<(EditKind, usize, usize)>,
+}
+
+/// 编辑意图（决定撤销合并规则，纯无定时器确定性判定，同 editor/undo.rs）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditKind {
+    /// 纯字符插入（无换行、邻接续打 → 合并）。
+    Typing,
+    /// 退格（纯删除、首尾相接 → 合并）。
+    Backspace,
+    /// 正向删除（纯删除、同起点延伸 → 合并）。
+    Delete,
+    /// 原子编辑（Enter/Tab/粘贴/程序化写/任务框/折叠 → 永不合并并断层）。
+    Atomic,
 }
 
 /// 可编辑块区域（与块级编辑映射配套；围栏行不可落点）。
@@ -553,6 +572,7 @@ impl WyEditor {
             block_regions: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            last_edit: None,
         }
     }
 
@@ -609,6 +629,7 @@ impl WyEditor {
         self.caret = self.caret.min(self.doc.len());
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.last_edit = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         // 派生扫描的**标记计数器**（全篇一次 O(n)，之后增量维护 O(编辑)）——
@@ -737,6 +758,8 @@ impl WyEditor {
     pub(crate) fn set_caret(&mut self, off: usize) {
         self.caret = off.min(self.len());
         self.sel_anchor = None;
+        // 光标移动 → 打断撤销合并组（同 editor/undo.rs 的 cooperative=false）。
+        self.last_edit = None;
         *self.frame.borrow_mut() = None;
     }
 
@@ -1895,28 +1918,56 @@ impl WyEditor {
     /// 核心编辑：替换 `[start, end)` → `text`，重建模型、移光标、通知。
     /// 任意替换都会收敛选区（无选区）与 IME 组合区间（替换后由输入处理器重设）。
     /// **所有编辑**（输入/剪贴板/退格/任务框翻转/警报折叠）都从这里过——每笔真实
-    /// 内容变更先记入撤销栈（D1）。
+    /// 内容变更先记入撤销栈（D1）；**B2 事务合并**：连续同意图且邻接的编辑并入同一
+    /// 撤销单元（连续打字/相邻退格/同点删除），只在「新事务起点」push 快照。
     pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
         let len = self.len();
         let r = range.start.min(len)..range.end.min(len);
         if r.start == r.end && text.is_empty() {
             return;
         }
-        // 撤销快照：rope COW（O(log n) 共享底树），不再每键驻留整份全文（旧 200 深
-        // 最坏 200×6MB）。
-        self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
-        if self.undo_stack.len() > 200 {
-            self.undo_stack.remove(0);
+        // 编辑前被替换区间（cross_newline / 标记计数 / 撤销意图用；O(被删长)）。
+        let removed = self.doc.slice_str(r.clone());
+        let inserted_len = text.len();
+        // —— B2 撤销快照 + 事务合并（无定时器确定性判定，同 editor/undo.rs）——
+        // rope COW 快照 O(log n)；「同意图且邻接」→ 并入上一事务（不 push），200 深
+        // 快照可覆盖远多于 200 个字符的内容。
+        let intent = if removed.is_empty() && !text.is_empty() && !text.contains('\n') {
+            EditKind::Typing
+        } else if !removed.is_empty() && text.is_empty() {
+            // 纯删除：退格（r.end == 光标）vs 正向删除（r.start == 光标）。
+            if self.caret == r.end {
+                EditKind::Backspace
+            } else {
+                EditKind::Delete
+            }
+        } else {
+            EditKind::Atomic
+        };
+        let merges = match self.last_edit {
+            Some((k, s, e)) if k == intent => match intent {
+                // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
+                EditKind::Typing => r.start == s + inserted_len,
+                EditKind::Backspace => r.end == s,   // 向后退格首尾相接
+                EditKind::Delete => r.start == s,    // 同起点延伸
+                EditKind::Atomic => false,
+            },
+            _ => false,
+        };
+        if !merges {
+            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
+            if self.undo_stack.len() > 200 {
+                self.undo_stack.remove(0);
+            }
         }
         self.redo_stack.clear();
+        self.last_edit = Some((intent, r.start, r.start + inserted_len));
         // 原地 rope 编辑（`Doc::edit`：COW remove+insert + 增量块扫描 + 增量行起始）——
         // 不再每键拼一份 6MB 整串再分配/复制（旧 `next` String + Arc 包装是 6MB 文档
         // ~5-6ms/键的根因）；`content` 字段随之取消，rope 为唯一真源。
         let edit_line = self.row_col(r.start).0;
         // 编辑前该行内容（region 签名对比用；非结构性编辑行边界不变）。
         let old_line = self.doc.line_str(edit_line);
-        // 编辑前被替换区间（cross_newline / 标记计数用；O(被删长)）。
-        let removed = self.doc.slice_str(r.clone());
         let inserted_len = text.len();
         let prev_count = self.doc.block_count();
         let in_code_table = {
@@ -2135,6 +2186,7 @@ impl WyEditor {
         self.caret = s.caret.min(self.doc.len());
         self.sel_anchor = None;
         self.marked = None;
+        self.last_edit = None;
         *self.frame.borrow_mut() = None;
         // 快照是全新内容：标记计数 / 派生版本 / 基础布局全量失效（与 `set_source_text`
         // 同款；旧实现漏刷新这些，撤销到不同结构文档会命中陈旧派生/布局）。
@@ -2375,6 +2427,8 @@ impl WyEditor {
     }
 
     fn moved(&mut self) {
+        // 方向键移动 → 打断撤销合并组。
+        self.last_edit = None;
         // 表格内容行内：光标钳到最近单元格内容区间（不落在管道/空白上，避免输入破坏表）。
         let (line, col) = self.row_col(self.caret);
         if let Some(c) = self.clamp_caret_table(line, col) {

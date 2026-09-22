@@ -3421,6 +3421,78 @@ A-->B
         });
     }
 
+    /// B2 撤销事务合并：连续键入（同意图 + 邻接）并入一个撤销单元；光标移动打断
+    /// 组（移动后键入独立单元）；Enter/纸类编辑为原子单元。
+    #[gpui::test]
+    fn undo_b2_groups_typing_and_breaks_on_caret(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 连续键入 abc → 一个撤销单元。
+            for ch in ["a", "b", "c"] {
+                ed.update(cx, |e, ecx| {
+                    let at = e.caret();
+                    e.replace_range(at..at, ch, ecx);
+                });
+            }
+            assert_eq!(ed.read(cx).text().as_ref(), "abc");
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(
+                ed.read(cx).text().as_ref(),
+                "",
+                "连续键入一次撤销应整组回退（B2 合并）"
+            );
+            // 重做回 abc。
+            ed.update(cx, |e, ecx| e.redo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "abc");
+            // 光标移动 → 打断：移动后键入 z 是独立撤销单元。
+            ed.update(cx, |e, ecx| {
+                e.set_caret(0);
+                e.replace_range(0..0, "z", ecx);
+            });
+            assert_eq!(ed.read(cx).text().as_ref(), "zabc");
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "abc", "z 独立撤销");
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "", "光标移动后 z 与 abc 分属两个单元");
+        });
+    }
+
+    /// B2 撤销合并：连续退格经 `replace_range`（纯删除、首尾相接）合并成一个单元。
+    #[gpui::test]
+    fn undo_b2_groups_backspaces(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abcdef"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| {
+                e.set_caret(6);
+                // 连续退格 3 个字符（6→5, 5→4, 4→3）。
+                for _ in 0..3 {
+                    let at = e.caret();
+                    e.replace_range(at - 1..at, "", ecx);
+                }
+            });
+            assert_eq!(ed.read(cx).text().as_ref(), "abc");
+            // 一次撤销应还原全部 3 次退格。
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "abcdef", "相邻退格合并成一个撤销单元");
+        });
+    }
+
     /// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
     /// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
     /// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
