@@ -247,6 +247,12 @@ pub struct WyEditor {
     code_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
     /// 代码块横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
     code_h_drag: RefCell<Option<(usize, f32)>>,
+    /// 表格横向滚动偏移（px；键 = 表格块首源码行）。超宽表格（`total_w` > 内容宽）
+    /// 由底部横向滚动条驱动（paint 平移 + 命中/光标反向加回，参考代码块 `code_h_scroll`；
+    /// 对齐 preview `markdown/view` 的表格溢出横向滚动）。纯视图状态，不写源码、不进撤销栈。
+    table_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
+    /// 表格横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
+    table_h_drag: RefCell<Option<(usize, f32)>>,
     /// 已折叠的标题区块（视图本地状态，键 = 标题行 trim 后的文本，与 `live` 一致；
     /// markdown 没有标题折叠语法，折叠态**不写回源码**、不进撤销栈）。点击标题行
     /// 右缘的折叠箭头翻转（`▸` 展开 / `▾` 折叠）；折叠后该 section 的 body 行
@@ -327,6 +333,8 @@ impl WyEditor {
             dragging: false,
             code_h_scroll: RefCell::new(std::collections::HashMap::new()),
             code_h_drag: RefCell::new(None),
+            table_h_scroll: RefCell::new(std::collections::HashMap::new()),
+            table_h_drag: RefCell::new(None),
             folded_headings: RefCell::new(std::collections::HashSet::new()),
             block_regions: Vec::new(),
             undo_stack: Vec::new(),
@@ -658,6 +666,22 @@ impl WyEditor {
         };
         // 交互性命中（任务框/折叠箭头/链接）单双击都响应，展开→立即再点也能折叠回。
         if !ev.modifiers.shift && !ev.modifiers.control {
+            // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
+            // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
+            if let Some((blk, on_thumb, grab)) =
+                element::table_hscrollbar_hit(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                if on_thumb {
+                    *self.table_h_drag.borrow_mut() = Some((blk, grab));
+                    self.table_h_drag_apply(ev.position, cx);
+                } else {
+                    self.table_bar_jump_to(blk, ev.position);
+                    cx.notify();
+                }
+                return;
+            }
             // 代码块横向滚动条（内容超宽的块底部轨道）：点在**滑块**上 → 拖动；
             // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
             if let Some((blk, on_thumb, grab)) =
@@ -751,9 +775,13 @@ impl WyEditor {
 
     /// 拖拽中（左键已按下）。
     pub(crate) fn on_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
-        // 代码块横向滚动条拖动优先（不参与选区拖选）。
+        // 代码/表格横向滚动条拖动优先（不参与选区拖选）。
         if self.code_h_drag.borrow().is_some() {
             self.code_h_drag_apply(ev.position, cx);
+            return;
+        }
+        if self.table_h_drag.borrow().is_some() {
+            self.table_h_drag_apply(ev.position, cx);
             return;
         }
         if !self.dragging {
@@ -830,10 +858,63 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// 鼠标松开：结束拖选 / 代码块滚动条拖动。
+    /// 表格滚动条**轨道点击跳转**：滑块中心对准点击点（与 [`Self::code_bar_jump_to`] 同语义）。
+    fn table_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && r.table.is_some()) else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let p_local = f32::from(pos.x) - origin_x;
+        let travel = (bar_w - thumb_w).max(1.);
+        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_table_h_scroll(blk, rel * max_scroll);
+    }
+
+    /// 把指针位置应用到正在拖动的表格横向滚动条（抓取点相对滑块左缘，1:1 跟随）。
+    fn table_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((blk, grab)) = self.table_h_drag.borrow().clone() else {
+            return;
+        };
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && r.table.is_some()) else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let p_local = f32::from(pos.x) - origin_x;
+        let travel = (bar_w - thumb_w).max(1.);
+        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_table_h_scroll(blk, rel * max_scroll);
+        cx.notify();
+    }
+
+    /// 鼠标松开：结束拖选 / 代码块 & 表格横向滚动条拖动。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
         *self.code_h_drag.borrow_mut() = None;
+        *self.table_h_drag.borrow_mut() = None;
         cx.notify();
     }
 
@@ -848,6 +929,20 @@ impl WyEditor {
             self.code_h_scroll.borrow_mut().remove(&src_line);
         } else {
             self.code_h_scroll.borrow_mut().insert(src_line, v);
+        }
+    }
+
+    /// 表格横向滚动偏移（px；键 = 表格块首源码行）。
+    pub(crate) fn table_h_scroll_of(&self, src_line: usize) -> f32 {
+        self.table_h_scroll.borrow().get(&src_line).copied().unwrap_or(0.)
+    }
+    /// 设置表格横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    pub(crate) fn set_table_h_scroll(&self, src_line: usize, v: f32) {
+        let v = v.max(0.);
+        if v <= 0.01 {
+            self.table_h_scroll.borrow_mut().remove(&src_line);
+        } else {
+            self.table_h_scroll.borrow_mut().insert(src_line, v);
         }
     }
 

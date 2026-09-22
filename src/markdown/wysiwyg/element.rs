@@ -363,7 +363,12 @@ fn estimate_height(
     let est_rows = |cpl: f32, chars: usize| -> f32 { (chars as f32 / cpl.max(1.)).ceil().max(1.) };
     match meta.kind {
         RowKind::Code => theme.code_line() * (meta.aux.max(1) as f32 + 2.),
-        RowKind::Table => table_block_height(theme, meta.aux.max(1) as usize),
+        // 与 `shape_table_row` 同式：网格高 + 底部滚动条预留带（`table_hscroll` 用，
+        // 恒定常数，带内外一致 → 滚动不跳）。
+        RowKind::Table => {
+            table_block_height(theme, meta.aux.max(1) as usize)
+                + px(crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX)
+        }
         RowKind::Image => px(crate::config::markdown::IMAGE_ROW_DEFAULT_H),
         RowKind::Heading(n) => {
             let fs = theme.heading_fs(n);
@@ -1647,7 +1652,11 @@ fn shape_table_row(
     }
     let total_w = widths.iter().sum();
     let row_h = table_row_h(theme);
-    let height = table_block_height(theme, rows.len());
+    // 表格块总高 = 网格高 + 底部滚动条预留带（`TABLE_SCROLLBAR_RESERVE_PX`，与 preview
+    // `markdown/view` 的 `.pb()` 同）——滚动条画在网格**之下**、不遮内容。带内/带外同式
+    // （`estimate_height` 同加该带）→ 总高随可视带恒定、滚动不跳。
+    let height = table_block_height(theme, rows.len())
+        + px(crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX);
     let mut aligns2 = aligns.clone();
     aligns2.resize(ncols, TableAlign::Left);
     let rows2: Vec<Vec<gpui::SharedString>> = rows
@@ -2348,7 +2357,9 @@ fn caret_geometry(
             let caret_h = f32::from(editor.theme.para_line());
             let row_top = r.top + px(table_row_top(t, row_ix));
             let ctop = row_top + px(((f32::from(t.row_h) - caret_h) / 2.).max(0.));
-            return (true, px(12.) + px(cell_x0 + cell.text_x + col_x), ctop);
+            // 横向滚动时单元格内容随表平移 → 光标条反向减 scroll（paint 平移的逆映射）。
+            let scroll = table_hscroll_clamped(editor, f, r);
+            return (true, px(12.) + px(cell_x0 + cell.text_x + col_x - scroll), ctop);
         }
         if !r.multi_offsets.is_empty() {
             // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
@@ -2408,7 +2419,9 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 let Some(row_l) = te.rows.get(row_ix) else {
                     return editor.caret();
                 };
-                let rel_x = (f32::from(p.x) - f32::from(frame.padding)).max(0.);
+                // 横向滚动时内容坐标 = 视图坐标 + scroll（paint 平移的逆映射）。
+                let scroll = table_hscroll_clamped(editor, frame, r);
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) + scroll).max(0.);
                 let cell_ix = table_cell_index(&t.widths, rel_x)
                     .unwrap_or(t.widths.len().saturating_sub(1));
                 let Some(cell) = row_l.cells.get(cell_ix) else {
@@ -2758,7 +2771,10 @@ fn draw_table_row(
 }
 
 /// 画表格块网格：外框 + 表头背景 + 行/列分隔线 + 单元格文本（配色对齐预览）。
+/// 内容超宽（`total_w` > 内容区宽）时裁剪在内容区内并按横向滚动偏移平移
+/// （`table_h_scroll`，paint 平移 ↔ 命中/光标反向加回），底部覆横向滚动条。
 fn paint_table_row(
+    editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
@@ -2767,93 +2783,77 @@ fn paint_table_row(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let x0 = f32::from(origin.x) + f32::from(f.padding);
-    let top0 = f32::from(origin.y) + f32::from(row.top);
+    let (hgeo, scroll) = {
+        let ed = editor.read(cx);
+        (table_hscroll_geo(ed, f, row), table_hscroll_clamped(ed, f, row))
+    };
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
     let total_w = t.total_w.max(1.);
+    let x0 = f32::from(origin.x) + f32::from(f.padding) - scroll;
+    let top0 = f32::from(origin.y) + f32::from(row.top);
     let row_h_f = f32::from(t.row_h);
     let ncols = t.header_texts.len().max(1);
     let n_rows = t.rows_texts.len();
     let block_h = f32::from(table_block_height(theme, n_rows));
-    let border: gpui::Hsla = theme.divider;
-    // 外框（先画：内容随后的矩形都缩进 1px，不盖住外框线）。
-    window.paint_quad(gpui::PaintQuad {
-        bounds: Bounds::new(point(px(x0), px(top0)), size(px(total_w), px(block_h))),
-        corner_radii: gpui::Corners::all(px(6.)),
-        background: gpui::Hsla { h: 0., s: 0., l: 0., a: 0. }.into(),
-        border_widths: gpui::Edges::all(px(1.)),
-        border_color: border,
-        border_style: gpui::BorderStyle::Solid,
-    });
-    let inner_lo = top0 + 1.;
-    let inner_hi = top0 + block_h - 1.;
-    // 表头背景（圆角顶）。
-    window.paint_quad(gpui::PaintQuad {
-        bounds: Bounds::new(
-            point(px(x0 + 1.), px(inner_lo)),
-            size(px((total_w - 2.).max(0.)), px(row_h_f)),
-        ),
-        corner_radii: gpui::Corners {
-            top_left: px(5.),
-            top_right: px(5.),
-            bottom_left: px(0.),
-            bottom_right: px(0.),
-        },
-        background: theme.table_head_bg.into(),
-        border_widths: gpui::Edges::default(),
-        border_color: border,
-        border_style: gpui::BorderStyle::Solid,
-    });
-    let mut cy = inner_lo;
-    draw_table_row(
-        window,
-        cx,
-        &t.header_texts,
-        &t.widths,
-        &t.aligns,
-        x0,
-        cy,
-        row_h_f,
-        true,
-        theme,
+    // 网格裁剪在内容区内（横向滚动时把超出的网格/文字藏进内容区，不再溢到页面背景上），
+    // 只裁**网格高度**——底部滚动条预留带（`row.height − block_h`）不属于表格内容，
+    // 滚动条画在那里、不遮内容（preview `markdown/view` 的 `.pb` 同款）。
+    let content_rect = Bounds::new(
+        point(origin.x + f.padding, origin.y + row.top),
+        size(px(viewport), px(block_h)),
     );
-    cy += row_h_f;
-    for cells in &t.rows_texts {
-        // 行间分隔线（表头下 + 数据行之间）。
+    let border: gpui::Hsla = theme.divider;
+    // 超宽表格裁剪在内容区内（横向滚动时把超出的网格/文字藏进内容区，不再溢到
+    // 页面背景上），与代码块 `paint_code_row` 的 `with_content_mask` 同手法。
+    window.with_content_mask(Some(gpui::ContentMask { bounds: content_rect }), |window| {
+        // 外框（先画：内容随后的矩形都缩进 1px，不盖住外框线）。
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(point(px(x0), px(top0)), size(px(total_w), px(block_h))),
+            corner_radii: gpui::Corners::all(px(6.)),
+            background: gpui::Hsla { h: 0., s: 0., l: 0., a: 0. }.into(),
+            border_widths: gpui::Edges::all(px(1.)),
+            border_color: border,
+            border_style: gpui::BorderStyle::Solid,
+        });
+        let inner_lo = top0 + 1.;
+        let inner_hi = top0 + block_h - 1.;
+        // 表头背景（圆角顶）。
         window.paint_quad(gpui::PaintQuad {
             bounds: Bounds::new(
-                point(px(x0 + 1.), px(cy)),
-                size(px((total_w - 2.).max(0.)), px(1.)),
+                point(px(x0 + 1.), px(inner_lo)),
+                size(px((total_w - 2.).max(0.)), px(row_h_f)),
             ),
-            corner_radii: gpui::Corners::default(),
-            background: border.into(),
+            corner_radii: gpui::Corners {
+                top_left: px(5.),
+                top_right: px(5.),
+                bottom_left: px(0.),
+                bottom_right: px(0.),
+            },
+            background: theme.table_head_bg.into(),
             border_widths: gpui::Edges::default(),
             border_color: border,
             border_style: gpui::BorderStyle::Solid,
         });
-        cy += 1.;
+        let mut cy = inner_lo;
         draw_table_row(
             window,
             cx,
-            cells,
+            &t.header_texts,
             &t.widths,
             &t.aligns,
             x0,
             cy,
             row_h_f,
-            false,
+            true,
             theme,
         );
         cy += row_h_f;
-    }
-    // 列分隔竖线（内容区内）。
-    let mut acc = 0f32;
-    for ci in 0..ncols {
-        acc += t.widths.get(ci).copied().unwrap_or(0.);
-        if ci + 1 < ncols {
+        for cells in &t.rows_texts {
+            // 行间分隔线（表头下 + 数据行之间）。
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
-                    point(px(x0 + acc), px(inner_lo)),
-                    size(px(1.), px((inner_hi - inner_lo).max(0.))),
+                    point(px(x0 + 1.), px(cy)),
+                    size(px((total_w - 2.).max(0.)), px(1.)),
                 ),
                 corner_radii: gpui::Corners::default(),
                 background: border.into(),
@@ -2861,7 +2861,43 @@ fn paint_table_row(
                 border_color: border,
                 border_style: gpui::BorderStyle::Solid,
             });
+            cy += 1.;
+            draw_table_row(
+                window,
+                cx,
+                cells,
+                &t.widths,
+                &t.aligns,
+                x0,
+                cy,
+                row_h_f,
+                false,
+                theme,
+            );
+            cy += row_h_f;
         }
+        // 列分隔竖线（内容区内）。
+        let mut acc = 0f32;
+        for ci in 0..ncols {
+            acc += t.widths.get(ci).copied().unwrap_or(0.);
+            if ci + 1 < ncols {
+                window.paint_quad(gpui::PaintQuad {
+                    bounds: Bounds::new(
+                        point(px(x0 + acc), px(inner_lo)),
+                        size(px(1.), px((inner_hi - inner_lo).max(0.))),
+                    ),
+                    corner_radii: gpui::Corners::default(),
+                    background: border.into(),
+                    border_widths: gpui::Edges::default(),
+                    border_color: border,
+                    border_style: gpui::BorderStyle::Solid,
+                });
+            }
+        }
+    });
+    // 内容超宽 → 底部横向滚动条（与代码块同款）。
+    if let Some(geo) = hgeo {
+        paint_hscroll_thumb(origin, theme, row, geo, window);
     }
 }
 
@@ -2951,6 +2987,117 @@ pub(crate) fn code_hscrollbar_hit(
     None
 }
 
+/// 表格横向滚动条几何（内容超宽才返回）。
+/// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
+/// `(bar_x, bar_w, thumb_x, thumb_w, max_scroll)`。`viewport` = 内容区宽
+/// （帧宽 − 左右内边距 `padding`×2，与 `paint_table_row` 的网格同宽，表格无 x_off）；
+/// `max_scroll` = 表格总宽 − viewport。对齐 preview `markdown/view` 的表格横向滚动：
+/// 表格底部**恒定预留一条滚动条带**，滚动条始终可见（Always 语义）——不超宽时
+/// 滑块占满整条轨道（惰性、不可拖动），超宽时可拖/轨道跳转。不超宽只影响
+/// `max_scroll`/thumb，不影响 height/命中（预留带在网格之下、本无内容）。
+pub(crate) fn table_hscroll_geo(
+    editor: &WyEditor,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    let t = row.table.as_ref()?;
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let max_w = t.total_w.max(1.);
+    let max_scroll = (max_w - viewport).max(0.);
+    let scroll = editor.table_h_scroll_of(row.src_line).min(max_scroll).max(0.);
+    let frac = if max_scroll > 0. { scroll / max_scroll } else { 0. };
+    let bar_x = f32::from(f.padding);
+    let bar_w = viewport.max(1.);
+    // 与 view 的 gpui-component 同式：thumb = container/scroll_area × container，最小 48。
+    // 不超宽时 viewport ≥ max_w → thumb 被 clamp 成满宽（惰性轨道）。
+    let thumb_w = (bar_w * viewport / max_w)
+        .max(crate::config::layout::CODE_HSCROLL_THUMB_MIN)
+        .min(bar_w);
+    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
+    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+}
+
+/// 表格当前生效的横向滚动偏移（px）：内容不超宽 → 0（忽略陈旧滚动值，宽窗口下
+/// 表格不再偏移）；超宽 → 按 `max_scroll` clamp。paint / 命中 / 光标共用。
+pub(crate) fn table_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRow) -> f32 {
+    match table_hscroll_geo(editor, f, row) {
+        Some((_, _, _, _, max_scroll)) => editor
+            .table_h_scroll_of(row.src_line)
+            .min(max_scroll)
+            .max(0.),
+        None => 0.,
+    }
+}
+
+/// 表格横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
+/// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回 `(块首源行, 是否点在滑块上,
+/// 指针相对滑块左缘的水平偏移)`。语义与 [`code_hscrollbar_hit`] 一致
+/// （点在滑块 → 拖动；点在轨道 → 轨道跳转）。
+pub(crate) fn table_hscrollbar_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool, f32)> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || r.table.is_none() {
+            continue;
+        }
+        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = table_hscroll_geo(editor, frame, r) else {
+            continue;
+        };
+        // 底部滚动条带：轨道顶（块底 − `CODE_HSCROLL_BAND`）之间。
+        let band_top = f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        if py < band_top {
+            continue;
+        }
+        if px >= bar_x && px <= bar_x + bar_w {
+            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
+            let grab = px - thumb_x;
+            return Some((r.src_line, on_thumb, grab));
+        }
+    }
+    None
+}
+
+/// 画底部横向滚动条滑块（view 的 gpui-component 同款：圆角滑块 8 高/最小 48 宽；
+/// 轨道可点击跳转、滑块可拖）。代码块/表格共用。
+/// `geo` = `code_hscroll_geo`/`table_hscroll_geo` 的结果。
+/// **只画滑块，不画整条轨道背景**（用户要求滚动条区域无背景色——轨道区保持透明，
+/// 只有滑块/可交互带；轨道跳转命中仍按整条 `CODE_HSCROLL_BAND` 带判定）。
+fn paint_hscroll_thumb(
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    row: &ShapedRow,
+    geo: (f32, f32, f32, f32, f32),
+    window: &mut Window,
+) {
+    let (_bar_x, _bar_w, thumb_x, thumb_w, _) = geo;
+    let track_h = crate::config::layout::CODE_HSCROLL_BAND;
+    let track_top = f32::from(row.top) + f32::from(row.height) - track_h;
+    let inset = 4.;
+    let th = crate::config::layout::CODE_HSCROLL_THUMB_H;
+    let ty = track_top + inset;
+    // 滑块：圆角半透明 muted（比旧 2px 细条更易抓取）。
+    let mut thumb = theme.muted;
+    thumb.a = 0.6;
+    window.paint_quad(gpui::PaintQuad {
+        bounds: Bounds::new(
+            point(origin.x + px(thumb_x), origin.y + px(ty)),
+            size(px(thumb_w), px(th)),
+        ),
+        corner_radii: gpui::Corners::all(px(th / 2.)),
+        background: thumb.into(),
+        border_widths: gpui::Edges::default(),
+        border_color: gpui::Hsla::default(),
+        border_style: gpui::BorderStyle::Solid,
+    });
+}
+
 /// 代码块：圆角面板（对齐预览：外层 `px_3` → 面板贴**内容区左缘**（=content 边距，
 /// 与正文对齐），而非再缩进）；行文本再 `pl_3`（面板内 12px 内衬，走 `row.x_off`，
 /// 命中/光标/选区同 x）。首/末各留一个 code_line 空白带。
@@ -2999,41 +3146,8 @@ fn paint_code_row(
     });
     // 内容超宽 → 底部横向滚动条（view 的 gpui-component 同款：轨道 16 高 +
     // 内衬 4 + 圆角滑块 8 高/最小 48 宽；点击轨道跳转、滑块可拖）。覆在末空白带上。
-    if let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = hgeo {
-        let track_h = crate::config::layout::CODE_HSCROLL_BAND;
-        let track_top =
-            f32::from(row.top) + f32::from(row.height) - track_h;
-        let inset = 4.;
-        let th = crate::config::layout::CODE_HSCROLL_THUMB_H;
-        let ty = track_top + inset;
-        // 轨道：极淡分隔色（hover/拖动前也可见，像 view 的 Always 模式）。
-        let mut track = theme.divider;
-        track.a = 0.35;
-        window.paint_quad(gpui::PaintQuad {
-            bounds: Bounds::new(
-                point(origin.x + px(bar_x), origin.y + px(track_top)),
-                size(px(bar_w), px(track_h)),
-            ),
-            corner_radii: gpui::Corners::default(),
-            background: track.into(),
-            border_widths: gpui::Edges::default(),
-            border_color: gpui::Hsla::default(),
-            border_style: gpui::BorderStyle::Solid,
-        });
-        // 滑块：圆角半透明 muted（比旧 2px 细条更易抓取）。
-        let mut thumb = theme.muted;
-        thumb.a = 0.6;
-        window.paint_quad(gpui::PaintQuad {
-            bounds: Bounds::new(
-                point(origin.x + px(thumb_x), origin.y + px(ty)),
-                size(px(thumb_w), px(th)),
-            ),
-            corner_radii: gpui::Corners::all(px(th / 2.)),
-            background: thumb.into(),
-            border_widths: gpui::Edges::default(),
-            border_color: gpui::Hsla::default(),
-            border_style: gpui::BorderStyle::Solid,
-        });
+    if let Some(geo) = hgeo {
+        paint_hscroll_thumb(origin, theme, row, geo, window);
     }
 }
 
@@ -4082,7 +4196,7 @@ impl Element for WyEditorElement {
                 }
                 IrKind::Table => {
                     if let Some(t) = &row.table {
-                        paint_table_row(origin, &theme, f, row, t, window, cx);
+                        paint_table_row(&self.editor, origin, &theme, f, row, t, window, cx);
                     }
                     continue;
                 }
@@ -4620,8 +4734,12 @@ let c = 3;
             assert_eq!(te.rows[1].src_line, 8, "首数据行源行（隔开分隔行）");
             assert_eq!(te.rows[2].src_line, 9, "次数据行源行");
             assert!(
-                (f32::from(table.height) - f32::from(table_block_height(&theme, 2))).abs() < 1.,
-                "表格高与估算同式"
+                (f32::from(table.height)
+                    - (f32::from(table_block_height(&theme, 2))
+                        + crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX))
+                    .abs()
+                    < 1.,
+                "表格块高与估算同式（网格 + 滚动条预留带）"
             );
 
             // 图片块：占位框（未加载），带 src/alt。
@@ -4980,6 +5098,243 @@ let c = 333;
             );
             // 视图本地状态：源码未变。
             assert_eq!(ed.read(cx).text().as_ref(), text);
+        });
+    }
+
+    #[gpui::test]
+    fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
+        // 用户报「WYSIWYG 表格没有横向滚动条」→ 对齐 preview `markdown/view` 的表格
+        // 溢出横向滚动：超宽表格底部出滚动条，轨道点击跳转、滑块可拖（拖动不写源码）。
+        use crate::markdown::ir::IrKind;
+        use gpui::{
+            Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+        };
+        cx.update(gpui_component::init);
+        let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(300.), px(600.)),
+                )));
+            });
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let (blk, bar_x, bar_w, thumb_x, _thumb_w, max_scroll, ctop, ctop_h) = {
+                let tbl = frame
+                    .rows
+                    .iter()
+                    .find(|r| r.kind == IrKind::Table && r.table.is_some())
+                    .expect("应有表格");
+                let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
+                    super::table_hscroll_geo(ed.read(cx), &frame, tbl)
+                        .expect("宽表格应显示横向滚动条");
+                assert!(max_scroll > 100., "表格应显著超宽：max_scroll={max_scroll}");
+                assert!(thumb_x <= bar_x + 1., "初态滑块应在轨道左端");
+                (
+                    tbl.src_line,
+                    bar_x,
+                    bar_w,
+                    thumb_x,
+                    thumb_w,
+                    max_scroll,
+                    f32::from(tbl.top),
+                    f32::from(tbl.height),
+                )
+            };
+            assert!(thumb_x <= bar_x + 1., "初态滑块应在轨道左端");
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
+            let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
+            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+            // 轨道命中（远离左端滑块）→ 跳转（不进拖动态）。
+            let jump_x = bar_x + bar_w - 4.0;
+            let (blk_hit, on_thumb, _) = super::table_hscrollbar_hit(
+                ed.read(cx),
+                &ed
+                    .read(cx)
+                    .frame
+                    .borrow()
+                    .as_ref()
+                    .map(|f| &**f)
+                    .unwrap(),
+                point(px(jump_x), px(band_y)),
+            )
+            .expect("轨道末端应在滚动条带内");
+            assert_eq!(blk_hit, blk);
+            assert!(!on_thumb, "远离左端滑块的轨道点不应落在滑块上");
+            let ev = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(jump_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+            let jumped = ed.read(cx).table_h_scroll_of(blk);
+            assert!(jumped > 0., "点击轨道应立刻跳转：{jumped}");
+            assert!(jumped <= max_scroll, "{jumped} ≤ {max_scroll}");
+            assert!(
+                ed.read(cx).table_h_drag.borrow().is_none(),
+                "轨道跳转不应进入拖动态"
+            );
+            // 点滑块（滚动后滑块位置）→ 拖到最左 → 偏移归零；松开清态；源码不变。
+            let f2 = ed.read(cx).frame.borrow().clone().unwrap();
+            let geo2 = super::table_hscroll_geo(
+                ed.read(cx),
+                &f2,
+                &f2.rows.iter().find(|r| r.src_line == blk).unwrap(),
+            )
+            .unwrap();
+            let (_, _, thumb_x2, thumb_w2, _) = geo2;
+            let ev2 = MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(thumb_x2 + thumb_w2 / 2.), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+            assert!(
+                ed.read(cx).table_h_drag.borrow().is_some(),
+                "点滑块应进入拖动态"
+            );
+            let up_x = bar_x + bar_w * 0.05;
+            let ev_move = MouseMoveEvent {
+                position: point(px(up_x), px(band_y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+            let after = ed.read(cx).table_h_scroll_of(blk);
+            assert!(after < jumped, "拖到最左应减小偏移：{after} < {jumped}");
+            let ev_up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(up_x), px(band_y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+            assert!(
+                ed.read(cx).table_h_drag.borrow().is_none(),
+                "松开应清除拖拽态"
+            );
+            assert_eq!(
+                ed.read(cx).text().as_ref(),
+                text,
+                "表格横向滚动是视图本地状态，不应写源码"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn table_hscroll_shifts_hit_and_caret(cx: &mut TestAppContext) {
+        // 横向滚动后：同一可视 x 应命中**更后列**的单元格（命中反查 +scroll），
+        // 光标条 x 应按平移逆映射 −scroll 收敛（否则点击/光标错位）。
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let tbl = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table && r.table.is_some())
+                .expect("应有表格");
+            let blk = tbl.src_line;
+            let (_, _, _, _, max_scroll) =
+                super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("宽表格应超宽");
+            let pad = f32::from(frame.padding);
+            let t = tbl.table.as_ref().unwrap();
+            let row_ix = 1usize; // 数据行
+            let rh = f32::from(t.row_h);
+            let y = f32::from(tbl.top) + super::table_row_top(t, row_ix) + rh / 2.;
+            let view_x = pad + 40.;
+            let p = point(px(view_x), px(y));
+            let (line0, col0) = {
+                let off0 = super::source_offset_at(ed.read(cx), &frame, p);
+                let (l, c) = ed.read(cx).row_col(off0);
+                (l, c)
+            };
+            // 滚到最右 → 同一可视 x 应命中更后列的单元格。
+            ed.update(cx, |e, _| e.set_table_h_scroll(blk, max_scroll));
+            let f2 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let off1 = super::source_offset_at(ed.read(cx), &f2, p);
+            let (line1, col1) = ed.read(cx).row_col(off1);
+            assert_eq!(line0, line1, "横向滚动不应改变命中行");
+            assert!(col1 > col0, "同一 x 滚动后应命中更后列：col0={col0} col1={col1}");
+            // 光标几何：同一源列（off1 在最后一列的渲染列）在 scroll=0 与 scroll=max
+            // 下 x 应相差 ≈ max_scroll（paint 平移的逆映射）。
+            ed.update(cx, |e, _| e.set_caret(off1));
+            let (on_max, x_sc, _) = super::caret_geometry(ed.read(cx), &f2);
+            assert!(on_max, "滚动后该格应可放光标");
+            ed.update(cx, |e, _| e.set_table_h_scroll(blk, 0.));
+            let f0 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+            let (on0, x_un, _) = super::caret_geometry(ed.read(cx), &f0);
+            assert!(on0, "未滚动该格应可放光标");
+            let d = f32::from(x_un - x_sc);
+            assert!(
+                (d - max_scroll).abs() < 2.,
+                "滚动前后光标 x 差应 ≈ max_scroll（{max_scroll:.0}），实际 {d:.1}"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn table_short_has_inert_scrollbar_band(cx: &mut TestAppContext) {
+        // 窄表格：滚动条带恒定存在（preview `markdown/view` 的 Always 语义），但
+        // `max_scroll = 0` → 惰性不可滚动，陈旧滚动值被 `table_hscroll_clamped` 忽略，
+        // 且预留带位于网格之下（不遮内容）。
+        use crate::markdown::ir::IrKind;
+        cx.update(gpui_component::init);
+        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let tbl = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table && r.table.is_some())
+                .expect("应有表格");
+            let geo = super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("表格总有滚动条带");
+            let (_, _, thumb_x, thumb_w, max_scroll) = geo;
+            assert_eq!(max_scroll, 0., "窄表格不应有横向行程");
+            assert!(
+                (thumb_w - thumb_x).abs() > 0. && thumb_w >= 48.,
+                "窄表格滑块应占满轨道（惰性）"
+            );
+            ed.update(cx, |e, _| e.set_table_h_scroll(tbl.src_line, 999.));
+            assert_eq!(
+                super::table_hscroll_clamped(ed.read(cx), &frame, tbl),
+                0.,
+                "内容不超宽时应忽略陈旧滚动值"
+            );
+            // 预留带高度恒定：块高 = 网格高 + 预留带（带外 estimate 同式 → 滚动不跳）。
+            let grid_h = f32::from(super::table_block_height(
+                &ed.read(cx).theme,
+                tbl.table.as_ref().unwrap().rows_texts.len(),
+            ));
+            assert!(
+                (f32::from(tbl.height) - grid_h - crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX)
+                    .abs()
+                    < 0.5,
+                "表格块高应为网格高 + 滚动条预留带"
+            );
         });
     }
 
