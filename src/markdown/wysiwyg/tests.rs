@@ -3015,3 +3015,252 @@ A-->B
             );
         });
     }
+
+    #[gpui::test]
+    fn plain_edit_reuses_derived_cache(cx: &mut TestAppContext) {
+        // 纯文本键入（非结构、行签名不变、不在数学块内）不得触发派生整篇重建：
+        // `derived` Rc 指针不变 + regions/math 版本不递增——这是「输入不卡死」的
+        // 基石（老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text =
+            "$$\n\\int_x dx\n$$\n含有 $e^{i\\pi}$ 的一行\n末尾普通段落 here\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d = ed.read(cx).derived();
+            assert_eq!(d.borrow().math_regions.len(), 1, "应扫到这 1 个 $$ 块");
+            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+        });
+        // 在「末尾普通段落 here」行中间键入 'a'（纯文本，无 $ / > / ```）。
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("here").unwrap() + 2;
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "a", ecx));
+        });
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d1 = ed.read(cx).derived();
+            assert!(
+                std::rc::Rc::ptr_eq(&rc0, &d1),
+                "纯文本键入应复用 derived Rc（不整篇重建）"
+            );
+            assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
+            assert_eq!(ed.read(cx).math_ver(), mv0, "math 版本应不变");
+            assert_eq!(d1.borrow().math_regions.len(), 1, "块区域数不变");
+            assert_eq!(
+                d1.borrow().math_regions[0].source, "\\int_x dx",
+                "数学块 source 应保持"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn math_interior_edit_patches_block_source(cx: &mut TestAppContext) {
+        // 编辑 $$ 块**内部**（非边界行）：不整篇重建，只修补该块 `source`——离开块后
+        // 卡片显示更新后的公式（老实现要么整篇重建、要么卡片陈旧显示旧公式）。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "$$\n\\int_a dx\n$$\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d = ed.read(cx).derived();
+            assert_eq!(d.borrow().math_regions[0].source, "\\int_a dx");
+            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+        });
+        // 把内部行 `\int_a dx` 的 'a' 改成 'b'。
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("\\int_a").unwrap() + 5; // 落在 'a'
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "b", ecx));
+        });
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d1 = ed.read(cx).derived();
+            assert!(
+                std::rc::Rc::ptr_eq(&rc0, &d1),
+                "数学块内部编辑不应整篇重建"
+            );
+            assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
+            assert_eq!(
+                d1.borrow().math_regions[0].source, "\\int_b dx",
+                "块 source 应被单块修补为新公式"
+            );
+            assert_ne!(
+                ed.read(cx).math_ver(), mv0,
+                "块 source 变化 → sync 应重扫（新 latex 键光栅）"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn dollar_edit_rebuilds_derived_and_inventory(cx: &mut TestAppContext) {
+        // 键入 `$`（行签名变化）→ 派生整篇重建 + regions/math 版本递增 + 行内清单刷新。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d = ed.read(cx).derived();
+            assert!(ed.read(cx).inline_math_entries().is_empty());
+            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+        });
+        // 行首写入一个完整的行内公式 `$x$`。
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| e.replace_range(0..0, "$x$", ecx));
+        });
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d1 = ed.read(cx).derived();
+            assert!(
+                !std::rc::Rc::ptr_eq(&rc0, &d1),
+                "出现 `$` 使行签名变化 → 派生应整篇重建"
+            );
+            assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
+            assert_ne!(ed.read(cx).math_ver(), mv0, "math 版本应递增");
+            let inv = ed.read(cx).inline_math_entries();
+            assert_eq!(inv.len(), 1, "行内清单应含新的 $x$：{inv:?}");
+            assert_eq!(inv[0].1.as_ref(), "inline:x");
+        });
+    }
+
+    #[gpui::test]
+    fn inline_math_interior_edit_updates_inventory(cx: &mut TestAppContext) {
+        // 行内公式**内部**键入（不新增/删除 `$`）：派生不用整篇重建，但单行行内清单
+        // 要刷新为新槽键（否则 `sync_math` 吃旧键、新公式一直回退 Unicode）。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("text $x$ here\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (rc0, rv0, mv0) = vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d = ed.read(cx).derived();
+            assert_eq!(ed.read(cx).inline_math_entries().len(), 1);
+            (d, ed.read(cx).regions_ver(), ed.read(cx).math_ver())
+        });
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("$x$").unwrap() + 1;
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
+        });
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let d1 = ed.read(cx).derived();
+            assert!(
+                std::rc::Rc::ptr_eq(&rc0, &d1),
+                "行内公式内键入不应整篇重建"
+            );
+            assert_eq!(ed.read(cx).regions_ver(), rv0);
+            let inv = ed.read(cx).inline_math_entries();
+            assert_eq!(inv.len(), 1, "清单应只有一行一条：{inv:?}");
+            assert_eq!(inv[0].1.as_ref(), "inline:y", "清单应刷新为 $y$ 的槽键");
+            assert_ne!(
+                ed.read(cx).math_ver(), mv0,
+                "清单变化 → sync 应重扫以光栅新公式"
+            );
+        });
+    }
+
+    /// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
+    /// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
+    #[gpui::test]
+    #[ignore]
+    fn bench_dense_doc_edit_and_scroll(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        // 仿 `大文档测试2.md`：每 6 行一组「数学块 + 行内公式 + callout + 代码 + 表格」，
+        // 末尾附一个纯文本段（普通键入的落点）。
+        let mut text = String::new();
+        for i in 0..3_000 {
+            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
+            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
+            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
+        }
+        text.push_str("plain paragraph zone one\nplain paragraph zone two\n");
+        let nbytes = text.len();
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let t0 = std::time::Instant::now();
+            let f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+            let dt = t0.elapsed().as_millis();
+            let inv = ed.read(cx).inline_math_entries().len();
+            let nreg = ed.read(cx).derived().borrow().math_regions.len();
+            eprintln!("[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg}, inline_inv={inv})", f.block_count());
+        });
+
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let mut rebuilt = 0u32;
+            // 锚点只取一次（此后 1:1 字符替换，长度不变 → 锚点恒有效）。
+            let at = ed.read(cx).content().find("zone one").unwrap() + 5;
+            let t0 = std::time::Instant::now();
+            for _ in 0..30 {
+                let v0 = ed.read(cx).regions_ver();
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
+                if ed.read(cx).regions_ver() != v0 {
+                    rebuilt += 1;
+                }
+            }
+            let dt = t0.elapsed().as_millis();
+            eprintln!("[bench] 30 plain edits: {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/30)", dt as f64 / 30.);
+        });
+
+        vcx.update(|_w, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let mut rebuilt = 0u32;
+            let at = ed.read(cx).content().find("\\int_1 x dx").unwrap() + 5;
+            let t0 = std::time::Instant::now();
+            for _ in 0..10 {
+                let v0 = ed.read(cx).regions_ver();
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "2", ecx));
+                if ed.read(cx).regions_ver() != v0 {
+                    rebuilt += 1;
+                }
+            }
+            let dt = t0.elapsed().as_millis();
+            eprintln!("[bench] 10 math-interior edits: {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/10)", dt as f64 / 10.);
+        });
+
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let mut t = 0u128;
+            for k in 0..20 {
+                let t0 = std::time::Instant::now();
+                let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
+                let f = build_frame(ed.read(cx), window, px(900.), band);
+                let _ = f.total;
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] 20 band rebuilds: {t}ms ({:.1}ms/band)", t as f64 / 20.);
+        });
+    }

@@ -322,6 +322,21 @@ impl BlockLayout {
     }
 }
 
+/// 折叠/重排计划：与**可视带无关**（内容、caret reveal、数学就绪、宽度、结构版本
+/// 决定），按 `(epoch, regions_ver, caret_line, fold_ver)` 缓存，滚动/带移动复用——
+/// 旧实现把这些在 `build_frame` 里每档重算（结构密集大文档 ~40ms/档 → 滚动卡顿）。
+pub(crate) struct FoldPlan {
+    /// 数学块首源码行 → `math_regions` 下标（caret 不在块内的待折叠块）。
+    pub math_start: std::collections::HashMap<usize, usize>,
+    /// 数学块 body 行（折叠成 0 高）。
+    pub math_body: std::collections::HashSet<usize>,
+    /// 折叠 body 行（callout / 标题；折叠成 0 高）。
+    pub fold_lines: std::collections::HashSet<usize>,
+    /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高；块
+    /// `top/height/total` = 基础 + Δ。
+    pub deltas: std::rc::Rc<[(usize, f32)]>,
+}
+
 
 pub(crate) struct ShapedRow {
     pub src_line: usize,
@@ -1848,7 +1863,7 @@ fn math_display_lines(src: &str) -> Vec<String> {
 
 /// 数学块卡片高度：已排版就绪 → 顶部标签留白 + 图片逻辑高；否则回退
 /// Unicode 逐行（`20 + n×行高`）。两分支都与 `paint_card` 对应。
-fn math_card_height(editor: &WyEditor, reg: &MathRegion) -> Pixels {
+pub(crate) fn math_card_height(editor: &WyEditor, reg: &MathRegion) -> Pixels {
     if let Some(super::MathSlot::Ready(_, _, h)) =
         editor.math_slots().borrow().get(reg.source.as_str())
     {
@@ -1966,41 +1981,11 @@ pub(crate) fn build_frame(
         }
     }
 
-    // 结构扫描（derived 缓存 → O(1) Rc 复用）。
-    let content = editor.content();
+    // 结构扫描（derived 缓存 → O(1) Rc 复用）；`math_regions` 在 Pass3 卡片组装用。
+    let derived = editor.derived();
+    let math_regions = &derived.borrow().math_regions;
+    // 折叠/卡片 reveal 依赖 caret 所在行（`fold_plan` 缓存键的一部分）。
     let caret_line = editor.row_col(editor.caret()).0;
-    // 数学块（`$$…$$`）：首源码行 → 张卡片；其余行折叠成 0 高（caret 在块内则整块保留源码）。
-    let math_regions = &editor.derived().math_regions;
-    let mut math_start: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (idx, reg) in math_regions.iter().enumerate() {
-        if caret_line >= reg.range.start && caret_line < reg.range.end {
-            continue; // reveal-on-caret：光标在块内 → 不折叠，显示源码
-        }
-        math_start.insert(reg.range.start, idx);
-        math_body.extend(reg.range.start + 1..reg.range.end);
-    }
-    // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高。
-    let alert_fold = &editor.derived().alert_fold_regions;
-    let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (rnge, folded) in alert_fold {
-        if !*folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
-            continue;
-        }
-        fold_lines.extend(rnge.start + 1..rnge.end);
-    }
-    // 标题折叠（视图本地状态）。
-    {
-        let folded = editor.folded_headings.borrow();
-        if !folded.is_empty() {
-            for rnge in inline_style::heading_fold_regions(content, &folded) {
-                if caret_line >= rnge.start + 1 && caret_line < rnge.end {
-                    continue;
-                }
-                fold_lines.extend(rnge.start + 1..rnge.end);
-            }
-        }
-    }
 
     if rebuilt {
         // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关——折叠 body
@@ -2044,35 +2029,15 @@ pub(crate) fn build_frame(
         }
         base.borrow_mut().rebuild(heights, src_lines);
     }
-    // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高），每档按 caret/折叠态重算（通常很小）。
-    let mut dyn_map: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
-    {
-        let base_br = base.borrow();
-        let src_lines = base_br.src_lines();
-        let block_ix_of = |srcline: usize| -> usize {
-            src_lines
-                .partition_point(|&s| (s as usize) <= srcline)
-                .saturating_sub(1)
-                .min(src_lines.len() - 1)
-        };
-        for &srcline in fold_lines.iter() {
-            let ix = block_ix_of(srcline);
-            dyn_map.insert(ix, -base_br.height(ix));
-        }
-        for &srcline in math_body.iter() {
-            let ix = block_ix_of(srcline);
-            dyn_map.insert(ix, -base_br.height(ix));
-        }
-        for (&srcline, &ridx) in math_start.iter() {
-            let ix = block_ix_of(srcline);
-            let card_h = f32::from(math_card_height(editor, &math_regions[ridx]));
-            // 折叠优先：同一行若被折叠（0 高）则不装卡片。
-            dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
-        }
-    }
-    let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
-    deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
-    let deltas: std::rc::Rc<[(usize, f32)]> = deltas_vec.into_boxed_slice().into();
+    // 折叠/重排计划（与可视带无关，跨带缓存——滚动不重算 `math_start`/`fold_lines`/
+    // `deltas`，旧实现每档 ~40ms 重扫结构密集大文档 → 滚动「卡顿明显」）。
+    // ⚠️ 必须在 Pass1 之后调用：`deltas` 读基础布局当前高度（重建过的 epoch 使缓存键
+    // 变化 → 自动重建）。
+    let plan = editor.fold_plan(base.clone(), epoch, caret_line);
+    let math_start = &plan.math_start;
+    let math_body = &plan.math_body;
+    let fold_lines = &plan.fold_lines;
+    let deltas = plan.deltas.clone();
 
     // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
     let eff_top = |i: usize| -> f32 {
@@ -2574,7 +2539,7 @@ impl Element for WyEditorElement {
             let editor = self.editor.read(cx);
             editor.derived()
         };
-        let alert_kinds = &derived.alert_region_kinds;
+        let alert_kinds = &derived.borrow().alert_region_kinds;
         for row in &f.rows {
             if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
                 paint_quote_band(origin, &theme, f, row, alert_kinds, window);

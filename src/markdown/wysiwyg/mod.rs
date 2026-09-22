@@ -212,6 +212,25 @@ pub struct WyEditor {
     /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
     /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
     struct_ver: Cell<u64>,
+    /// 内容**派生版本**——`derived()` 缓存键：结构性编辑、编辑行 region 签名变化才
+    /// 递增；纯文本键入（非结构、签名不变、不在数学块内）不递增 → `derived` Rc
+    /// 跨键复用，不再每键对全篇 `math_regions`/`alert_*` 重扫（7MB/结构密集文档
+    /// 「输入卡死」的主因，旧实现每键 2 次全篇扫描 ≈1s）。
+    regions_ver: Cell<u64>,
+    /// 数学相关版本——`sync_math` 的守卫键：仅当编辑**确实**可能改变公式内容时递增
+    /// （`$`/围栏 编辑、数学块 source 修补、含 `$` 行单行修补）；纯文本键入不递增 →
+    /// paint 不再每键全篇重扫行内公式。
+    math_ver: Cell<u64>,
+    /// 行内公式清单 `(源码行, 槽键)`——`sync_math` 直接消费（迭代槽键、不再全篇
+    /// 重扫）。随编辑增量维护：结构/签名变化整表重建、行内含 `$` 的行被编辑单行重扫。
+    inline_math: Rc<RefCell<Vec<(usize, SharedString)>>>,
+    /// 标题折叠视图态版本：`toggle_heading_fold_at_line` 翻转 `folded_headings` 时递增
+    /// （纳入 `fold_plan` 缓存键，滚动不带折叠态重算）。
+    fold_ver: Cell<u64>,
+    /// 折叠/重排计划缓存：`(key, Rc<FoldPlan>)`——与可视带无关（内容、caret reveal、
+    /// 数学就绪、宽度、结构版本决定），滚动/带移动复用；build_frame 每档不再重建
+    /// ~万行 Hash 集合 + 逐块二分（大文档滚动「卡顿明显」：~40ms/档）。
+    fold_plan: RefCell<Option<(u64, Rc<element::FoldPlan>)>>,
     /// `$` 出现次数（内容级增量计数；`derived` 的数学预筛用，免全篇重扫）。
     math_dollar_cnt: Cell<usize>,
     /// `[!` 出现次数（`derived` 的警报/callout 预筛用，免全篇重扫）。
@@ -219,8 +238,10 @@ pub struct WyEditor {
     /// 最近一次编辑受影响（需重估高度）的块下标；`build_frame` 消费后清空。
     /// `None` = 无（或结构性编辑 → 整篇重建，不进此表）。
     pending_patch_blocks: RefCell<Option<Vec<usize>>>,
-    /// 内容派生扫描缓存：`(content_gen, Rc<WyDerived>)`——滚动/带移动复用，内容变更重建。
-    derived: RefCell<Option<(u64, Rc<WyDerived>)>>,
+    /// 内容派生扫描缓存：`(regions_ver, Rc<RefCell<WyDerived>>)`——滚动/带移动与纯文本
+    /// 键入复用；结构性/签名变化重建。`RefCell` 供编辑期对数学块 `source` 做局部修补
+    /// （`replace_range`，避免键入大文档数学块内部也整篇重建）。
+    derived: RefCell<Option<(u64, Rc<RefCell<WyDerived>>)>>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
     /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
@@ -337,6 +358,73 @@ pub(crate) struct WyDerived {
     pub alert_region_kinds: std::collections::HashMap<usize, crate::markdown::recognition::AlertKind>,
 }
 
+/// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——`sync_math` 消费，免每次 paint / 每次
+/// 数学相关编辑对全篇逐行 `$` 字节扫（旧实现每键一次 ≈400ms）。
+fn inline_inventory(content: &str) -> Vec<(usize, SharedString)> {
+    let mut out = Vec::new();
+    for (ix, line) in content.split('\n').enumerate() {
+        for span in crate::markdown::inline_style::inline_math_spans(line) {
+            let lx = crate::markdown::inline_style::inline_math_latex(line, &span).trim();
+            if !lx.is_empty() {
+                out.push((ix, inline_math_key(lx)));
+            }
+        }
+    }
+    out
+}
+
+fn alert_kind_tag(k: crate::markdown::recognition::AlertKind) -> u8 {
+    use crate::markdown::recognition::AlertKind::*;
+    match k {
+        Note => 0,
+        Tip => 1,
+        Important => 2,
+        Warning => 3,
+        Caution => 4,
+    }
+}
+
+/// 一行内容对 `derived`（数学块 / 警报区域）的**相关投影签名**——纯局部判定该行的
+/// region 结构是否可能变化，与 `math_regions` / `alert_regions` 的逐行判据逐条对应：
+/// 围栏、`$$`、单行 `$$…$$`（**不含内部文本**——内部变化走编辑期的数学 source 修补）、
+/// 警报/引述、对齐标记、行内 `$` 有无。编辑前/后签名相同 → 非结构性编辑不会改变任何
+/// 区域 → `derived` Rc 跨键复用（不再全篇重扫）；不同 → 整篇重建。
+fn region_line_sig(line: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if line.trim_start().starts_with("```") {
+        h.write_u8(1);
+    } else {
+        let t = line.trim();
+        if t == "$$" {
+            h.write_u8(2);
+        } else if crate::markdown::inline_style::one_line_math(line).is_some() {
+            h.write_u8(3);
+        } else if let Some(p) = crate::markdown::inline_style::blockquote_prefix(line) {
+            match crate::markdown::recognition::alert_prefix(&line[p..]) {
+                Some((kind, _, fold)) => {
+                    h.write_u8(4);
+                    alert_kind_tag(kind).hash(&mut h);
+                    fold.hash(&mut h);
+                }
+                None => h.write_u8(5),
+            }
+        } else if let Some(a) = crate::markdown::inline_style::math_align_marker(line) {
+            h.write_u8(6);
+            use crate::markdown::inline_style::MathAlign::*;
+            match a {
+                Left => h.write_u8(0),
+                Center => h.write_u8(1),
+                Right => h.write_u8(2),
+            }
+        } else {
+            h.write_u8(7);
+            line.as_bytes().contains(&b'$').hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
@@ -354,6 +442,11 @@ impl WyEditor {
             shape_band: Cell::new(None),
             block_layout: RefCell::new(None),
             struct_ver: Cell::new(0),
+            regions_ver: Cell::new(0),
+            math_ver: Cell::new(0),
+            inline_math: Rc::new(RefCell::new(Vec::new())),
+            fold_ver: Cell::new(0),
+            fold_plan: RefCell::new(None),
             pending_patch_blocks: RefCell::new(None),
             math_dollar_cnt: Cell::new(0),
             alert_marker_cnt: Cell::new(0),
@@ -436,6 +529,13 @@ impl WyEditor {
         self.math_dollar_cnt.set(text.bytes().filter(|&b| b == b'$').count());
         self.alert_marker_cnt.set(text.matches("[!").count());
         self.struct_ver.set(0);
+        // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
+        *self.block_layout.borrow_mut() = None;
+        self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+        if self.math_dollar_cnt.get() > 0 {
+            *self.inline_math.borrow_mut() = inline_inventory(text);
+        }
+        self.math_ver.set(self.math_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
     }
 
@@ -1012,6 +1112,26 @@ impl WyEditor {
     pub(crate) fn struct_ver(&self) -> u64 {
         self.struct_ver.get()
     }
+    /// 派生版本（`derived()` 缓存键；供回归断言「纯文本键入不重建派生」）。
+    pub(crate) fn regions_ver(&self) -> u64 {
+        self.regions_ver.get()
+    }
+    /// 数学重扫版本（`sync_math` 守卫键；供回归断言「纯文本键入不重扫数学」）。
+    #[cfg(test)]
+    pub(crate) fn math_ver(&self) -> u64 {
+        self.math_ver.get()
+    }
+    /// 行内公式清单快照（增量维护；供回归断言单行修补正确性）。
+    #[cfg(test)]
+    pub(crate) fn inline_math_entries(&self) -> Vec<(usize, SharedString)> {
+        self.inline_math.borrow().clone()
+    }
+
+    /// 标题折叠视图态版本（`fold_plan` 缓存键组成部分）。
+    pub(crate) fn fold_ver(&self) -> u64 {
+        self.fold_ver.get()
+    }
+
     /// 取走待修补（重估高度）的块下标（编辑后一帧用；无则 None）。
     pub(crate) fn take_pending_patch_blocks(&self) -> Option<Vec<usize>> {
         self.pending_patch_blocks.borrow_mut().take()
@@ -1036,38 +1156,147 @@ impl WyEditor {
         (true, l)
     }
 
-    /// 内容派生扫描缓存（全篇一遍，按 `content_gen` 缓存）——`build_frame` / paint 用，
+    /// 折叠/重排计划（缓存）：`math_start` / `math_body` / `fold_lines` / `deltas`——
+    /// 全部**与可视带无关**（由内容、caret reveal、数学就绪、宽度、结构版本决定），
+    /// 滚动/带移动复用同一 `Rc`。旧实现把这些放在 `build_frame` 里每档重算（结构密集
+    /// 大文档 ~15k 行 Hash 集合 + 逐块二分 ≈40ms/档 → 滚动「卡顿明显」）。
+    /// `pass1_delta = 基础布局本档是否刚整篇重建`（重建过的 epoch ≠ 缓存键 → 自会
+    /// 重建；此处仅防御性传 `base` 供 deltas 读当前高度）。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fold_plan(
+        &self,
+        base: Rc<std::cell::RefCell<element::BlockLayout>>,
+        epoch: u64,
+        caret_line: usize,
+    ) -> Rc<element::FoldPlan> {
+        let key = epoch
+            ^ self
+                .regions_ver()
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (caret_line as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ self.fold_ver().wrapping_mul(0x1656_67B1_9E37_79F9);
+        if let Some((k, p)) = &*self.fold_plan.borrow() {
+            if *k == key {
+                return p.clone();
+            }
+        }
+        let content = self.content.as_ref();
+        let derived = self.derived();
+        {
+            let d = derived.borrow();
+            let math_regions = &d.math_regions;
+            let mut math_start: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+            let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (idx, reg) in math_regions.iter().enumerate() {
+                if caret_line >= reg.range.start && caret_line < reg.range.end {
+                    continue; // reveal-on-caret：光标在块内 → 不折叠，显示源码
+                }
+                math_start.insert(reg.range.start, idx);
+                math_body.extend(reg.range.start + 1..reg.range.end);
+            }
+            // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高。
+            let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for (rnge, folded) in &d.alert_fold_regions {
+                if !*folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
+                    continue;
+                }
+                fold_lines.extend(rnge.start + 1..rnge.end);
+            }
+            // 标题折叠（视图本地状态）。
+            {
+                let folded = self.folded_headings.borrow();
+                if !folded.is_empty() {
+                    for rnge in inline_style::heading_fold_regions(content, &folded) {
+                        if caret_line >= rnge.start + 1 && caret_line < rnge.end {
+                            continue;
+                        }
+                        fold_lines.extend(rnge.start + 1..rnge.end);
+                    }
+                }
+            }
+            // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
+            let mut dyn_map: std::collections::HashMap<usize, f32> =
+                std::collections::HashMap::new();
+            {
+                let base_br = base.borrow();
+                let src_lines = base_br.src_lines();
+                let src_len = src_lines.len();
+                let block_ix_of = |srcline: usize| -> usize {
+                    src_lines
+                        .partition_point(|&s| (s as usize) <= srcline)
+                        .saturating_sub(1)
+                        .min(src_len.saturating_sub(1))
+                };
+                for &srcline in fold_lines.iter() {
+                    let ix = block_ix_of(srcline);
+                    dyn_map.insert(ix, -base_br.height(ix));
+                }
+                for &srcline in math_body.iter() {
+                    let ix = block_ix_of(srcline);
+                    dyn_map.insert(ix, -base_br.height(ix));
+                }
+                for (&srcline, &ridx) in math_start.iter() {
+                    let ix = block_ix_of(srcline);
+                    let card_h =
+                        f32::from(element::math_card_height(self, &math_regions[ridx]));
+                    dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
+                }
+            }
+            let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
+            deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
+            let plan = Rc::new(element::FoldPlan {
+                math_start,
+                math_body,
+                fold_lines,
+                deltas: deltas_vec.into_boxed_slice().into(),
+            });
+            *self.fold_plan.borrow_mut() = Some((key, plan.clone()));
+            plan
+        }
+    }
+
+    /// 内容派生扫描缓存（全篇一遍，按 `regions_ver` 缓存）——`build_frame` / paint 用，
     /// 避免滚动/每帧重复全篇扫描（大文档卡顿主因之一）。**标记计数器预筛**（增量维护，
     /// 见 `replace_range`）：无 `$` → `math_regions` 空；无 `[!` → 两个 alert 扫描空。
-    /// 7MB 大文档 `math_regions` 全篇行切分+扫描 ~390ms——无数学的文档（如大文档
-    /// 测试）编辑时每次内容变更都能省掉这 440ms。
-    pub(crate) fn derived(&self) -> Rc<WyDerived> {
-        let cgen = self.content_gen.get();
+    /// 7MB 大文档 `math_regions` 全篇行切分+扫描 ~390ms——**纯文本键入**（region 签名
+    /// 不变）不递增 `regions_ver` → 跨键复用 `Rc`，编辑每键省掉这些全篇扫描
+    /// （结构密集文档「输入卡死」的根因，旧实现每键重扫 ~1s）。
+    pub(crate) fn derived(&self) -> Rc<RefCell<WyDerived>> {
+        let ver = self.regions_ver.get();
         if let Some((g, d)) = &*self.derived.borrow() {
-            if *g == cgen {
+            if *g == ver {
                 return d.clone();
             }
         }
         let content = self.content.as_ref();
-        let d = WyDerived {
+        // 警报区域单遍扫描，两个公开查询由它派生（旧实现 `alert_fold_regions` +
+        // `alert_region_kinds` 各扫一遍全篇——重复 O(n)）。
+        let alerts = if self.alert_marker_cnt.get() > 0 {
+            inline_style::alert_regions(content)
+        } else {
+            Vec::new()
+        };
+        let alert_fold_regions = alerts
+            .iter()
+            .filter_map(|(r, _, fold)| fold.map(|f| (r.clone(), f)))
+            .collect();
+        let mut alert_region_kinds = std::collections::HashMap::new();
+        for (r, k, _) in &alerts {
+            for l in r.clone() {
+                alert_region_kinds.insert(l, *k);
+            }
+        }
+        let d = Rc::new(RefCell::new(WyDerived {
             math_regions: if self.math_dollar_cnt.get() > 0 {
                 inline_style::math_regions(content)
             } else {
                 Vec::new()
             },
-            alert_fold_regions: if self.alert_marker_cnt.get() > 0 {
-                inline_style::alert_fold_regions(content)
-            } else {
-                Vec::new()
-            },
-            alert_region_kinds: if self.alert_marker_cnt.get() > 0 {
-                inline_style::alert_region_kinds(content)
-            } else {
-                std::collections::HashMap::new()
-            },
-        };
-        let d = Rc::new(d);
-        *self.derived.borrow_mut() = Some((cgen, d.clone()));
+            alert_fold_regions,
+            alert_region_kinds,
+        }));
+        *self.derived.borrow_mut() = Some((ver, d.clone()));
         d
     }
 
@@ -1111,48 +1340,53 @@ impl WyEditor {
 
     /// 扫描当前内容里的 `$$…$$` 块 + `$…$` 行内公式，对尚未排版的发起离屏排版；
     /// 幂等（已占用槽的不重复发起），主题色变化清缓存。每次 paint 前调一次，
-    /// `math_scanned_gen` 挡掉同代重复扫描。
+    /// `math_scanned_gen` 挡掉同代重复扫描。块公式消费 `derived()`（缓存），行内公式
+    /// 消费增量维护的行内清单——**不再每次全篇逐行重扫**（旧实现每键 2 次全篇扫描）。
     pub(crate) fn sync_math(&mut self, cx: &mut Context<Self>) {
         let color = math_color(&self.theme);
-        let cgen = self.content_gen.get();
         let color_changed = self.math_color.borrow().as_ref() != Some(&color);
         if color_changed {
             self.math_color.borrow_mut().replace(color);
             self.math_slots.borrow_mut().clear();
         }
-        if !color_changed && self.math_scanned_gen.get() == cgen {
+        // 守卫键 = `math_ver`：仅数学相关编辑（`$`/围栏、数学 source 修补、含 `$` 行
+        // 单行修补）才递增；纯文本键入 / 滚动不重扫。主题色变化无条件重排。
+        let mver = self.math_ver.get();
+        if !color_changed && self.math_scanned_gen.get() == mver {
             return;
         }
-        self.math_scanned_gen.set(cgen);
+        self.math_scanned_gen.set(mver);
 
         // 收集块 + 行内公式 LaTeX 源码（键 = 去定界符后的源码，同 zorite 的 MathStore）。
-        let content = self.content.as_ref().to_string();
         // (槽键, 是否行内, 排版边距, 要排版的 LaTeX)：块用 `MATH_PAD`；行内用
         // `INLINE_MATH_PAD` 且键带 `inline:` 前缀 + `\textstyle` 包层（大算子转行内式，
         // 只压算子不缩正文——否则 `\int_0^1` 整图缩放会把 `x^2 dx` 也变小）。
         let mut sources: Vec<(SharedString, bool, f32, String)> = Vec::new();
-        for reg in inline_style::math_regions(&content) {
-            let s = reg.source.trim();
-            if !s.is_empty() && s != "$$" {
-                sources.push((
-                    s.to_string().into(),
-                    false,
-                    crate::config::math::MATH_PAD,
-                    s.to_string(),
-                ));
-            }
-        }
-        for line in content.split('\n') {
-            for span in inline_style::inline_math_spans(line) {
-                let lx = inline_style::inline_math_latex(line, &span).trim();
-                if !lx.is_empty() {
+        {
+            let d = self.derived();
+            for reg in d.borrow().math_regions.iter() {
+                let s = reg.source.trim();
+                if !s.is_empty() && s != "$$" {
                     sources.push((
-                        inline_math_key(lx),
-                        true,
-                        crate::config::math::INLINE_MATH_PAD,
-                        lx.to_string(),
+                        s.to_string().into(),
+                        false,
+                        crate::config::math::MATH_PAD,
+                        s.to_string(),
                     ));
                 }
+            }
+        }
+        {
+            let inv = self.inline_math.borrow();
+            for (_, key) in inv.iter() {
+                let ks = key.as_ref();
+                let lx = ks.strip_prefix("inline:").unwrap_or(ks);
+                sources.push((
+                    key.clone(),
+                    true,
+                    crate::config::math::INLINE_MATH_PAD,
+                    lx.to_string(),
+                ));
             }
         }
         for (key, is_inline, pad, latex) in sources {
@@ -1437,6 +1671,12 @@ impl WyEditor {
         // 待修补块（build_frame 只对该块 Fenwick 点更新高度，省掉整篇重估 ~400ms）；
         // 结构性（跨行/代码表格/围栏破坏块序）→ `struct_ver` 递增 → 整篇重建。
         let edit_line = self.row_col(r.start).0;
+        // 编辑前该行内容（region 签名对比用；非结构性编辑行边界不变）。
+        let old_line = {
+            let ls = self.line_start(edit_line);
+            let le = self.line_end(edit_line).max(ls).min(s.len());
+            s[ls..le].to_string()
+        };
         let prev_count = self.doc.block_count();
         let in_code_table = {
             let blk = self.doc.block_index_for_line(edit_line);
@@ -1447,7 +1687,10 @@ impl WyEditor {
             )
         };
         let r_old = r.clone();
-        self.doc.reopen(&next, prev_len, r_old, text.len());
+        let inserted_len = text.len();
+        // 只 build 一次新缓冲：`reopen` 与 `self.content` 共享（免 6.4MB 再拷一次/键）。
+        let next_ss = SharedString::from(next);
+        self.doc.reopen(&next_ss, prev_len, r_old, inserted_len);
         let cross_newline =
             text.contains('\n') || s[r.start..r.end].contains('\n') || text.contains('\r');
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
@@ -1470,7 +1713,85 @@ impl WyEditor {
         self.alert_marker_cnt.set(
             self.alert_marker_cnt.get() + text.matches("[!").count() - removed.matches("[!").count(),
         );
-        self.content = SharedString::from(next);
+        self.content = next_ss;
+
+        // —— 内容派生（derived / 行内清单 / 数学重扫）的增量判定（详见 `region_line_sig`）——
+        // 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`/`math_ver`
+        // → `derived` Rc 跨键复用、paint 不重扫——大文档（尤其结构密集）「输入卡死」的根因
+        // 是旧实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
+        if structural {
+            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生 + 行内清单。
+            self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            if self.math_dollar_cnt.get() > 0 {
+                *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
+            }
+            self.math_ver.set(self.math_ver.get().wrapping_add(1));
+        } else {
+            let new_line = self.doc.line_str(edit_line);
+            if region_line_sig(&old_line) != region_line_sig(&new_line) {
+                // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）
+                // → 区域结构可能变化 → 整篇重建派生 + 行内清单 + 数学重扫。
+                self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+                if self.math_dollar_cnt.get() > 0 {
+                    *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
+                }
+                self.math_ver.set(self.math_ver.get().wrapping_add(1));
+            } else {
+                // 快路径：区域结构不变，只做受影响点的小修补（都不全篇重建）。
+                let mut math_dirty = false;
+                // (a) 编辑行在 `$$…$$` 数学块内 → 重算该块 `source`（卡片 / 排版键正确，
+                //     否则离开块后卡片显示旧公式）。
+                {
+                    let derived = self.derived();
+                    let d = derived.borrow();
+                    if let Some(idx) = d
+                        .math_regions
+                        .iter()
+                        .position(|reg| edit_line >= reg.range.start && edit_line < reg.range.end)
+                    {
+                        let rng = d.math_regions[idx].range.clone();
+                        let old_src = d.math_regions[idx].source.clone();
+                        drop(d);
+                        let mut d2 = derived.borrow_mut();
+                        let new_source = if rng.end == rng.start + 1 {
+                            // 单行 `$$x^2$$`：source = 行内内层。
+                            inline_style::one_line_math(&new_line)
+                                .map(str::to_string)
+                                .unwrap_or(old_src)
+                        } else if rng.start + 1 < rng.end.saturating_sub(1) {
+                            let hi = rng.end.saturating_sub(1);
+                            (rng.start + 1..hi)
+                                .map(|l| self.doc.line_str(l))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        } else {
+                            String::new()
+                        };
+                        if d2.math_regions[idx].source != new_source {
+                            d2.math_regions[idx].source = new_source;
+                            math_dirty = true;
+                        }
+                    }
+                }
+                // (b) 行内含 `$`（新或旧）→ 单行重扫行内公式清单（增量维护，非全篇）。
+                if old_line.contains('$') || new_line.contains('$') {
+                    let mut inv = self.inline_math.borrow_mut();
+                    inv.retain(|(l, _)| *l != edit_line);
+                    for span in inline_style::inline_math_spans(&new_line) {
+                        let lx = inline_style::inline_math_latex(&new_line, &span).trim();
+                        if !lx.is_empty() {
+                            inv.push((edit_line, inline_math_key(lx)));
+                        }
+                    }
+                    math_dirty = true;
+                }
+                if math_dirty {
+                    // 数学内容确实变了（块 source / 行内清单）→ 下次 paint 消费新清单重扫一次。
+                    self.math_ver.set(self.math_ver.get().wrapping_add(1));
+                }
+            }
+        }
+
         self.rebuild_block_regions();
         self.caret = (r.start + text.len()).min(self.content.len());
         self.sel_anchor = None;
@@ -1530,6 +1851,8 @@ impl WyEditor {
                 folded.insert(key);
             }
         }
+        // 折叠态变化 → `fold_plan` 缓存失效（滚动/带移动间不重算，但折叠变必须重建）。
+        self.fold_ver.set(self.fold_ver.get().wrapping_add(1));
         *self.frame.borrow_mut() = None;
         cx.notify();
     }
@@ -1588,6 +1911,19 @@ impl WyEditor {
         self.sel_anchor = None;
         self.marked = None;
         *self.frame.borrow_mut() = None;
+        // 快照是全新内容：标记计数 / 派生版本 / 数学清单 / 基础布局全量失效
+        // （与 `set_source_text` 同款；旧实现漏刷新这些，撤销到不同结构文档会
+        // 命中陈旧派生/布局）。
+        self.math_dollar_cnt.set(self.content.as_ref().bytes().filter(|&b| b == b'$').count());
+        self.alert_marker_cnt.set(self.content.matches("[!").count());
+        self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
+        *self.pending_patch_blocks.borrow_mut() = None;
+        *self.block_layout.borrow_mut() = None;
+        self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+        if self.math_dollar_cnt.get() > 0 {
+            *self.inline_math.borrow_mut() = inline_inventory(self.content.as_ref());
+        }
+        self.math_ver.set(self.math_ver.get().wrapping_add(1));
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);
         cx.notify();

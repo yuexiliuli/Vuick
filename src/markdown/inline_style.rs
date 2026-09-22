@@ -133,7 +133,7 @@ pub(crate) use super::recognition::{AlertKind, alert_prefix};
 /// kind, and the fold state (`Some` only when the marker carries `-`/`+`).
 /// Marker recognition delegates to [`super::recognition::alert_prefix`] (single
 /// source); the two public queries below derive from here.
-fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> {
+pub(crate) fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> {
     fn marker(line: &str) -> Option<(AlertKind, Option<bool>)> {
         let p = blockquote_prefix(line)?;
         let (kind, _, fold) = alert_prefix(&line[p..])?;
@@ -163,6 +163,8 @@ fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> 
 /// Foldable-callout regions (`> [!NOTE]-` / `+`): the line range + fold state,
 /// derived from [`alert_regions`]. Body lines of a folded region collapse in
 /// the WYSIWYG view unless the caret is inside (reveal-on-caret).
+/// 生产路径经 `WyEditor::derived()` 直接消费 [`alert_regions`]；此薄壳仅测试用。
+#[cfg(test)]
 pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
     alert_regions(content)
         .into_iter()
@@ -172,7 +174,9 @@ pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
 
 /// 每个警报（callout）区域的 `AlertKind`（marker 行 + 连续 `>` body 行）——
 /// 供 WYSIWYG 把整段 callout 的左条统一画成警报色。键 = 源码行号；含/不含
-/// 折叠符的警报都覆盖（由 [`alert_regions`] 派生）。
+/// 折叠符的警报都覆盖（由 [`alert_regions`] 派生）。生产路径经
+/// `WyEditor::derived()` 消费；此薄壳仅测试用。
+#[cfg(test)]
 pub(crate) fn alert_region_kinds(content: &str) -> std::collections::HashMap<usize, AlertKind> {
     let mut out = std::collections::HashMap::new();
     for (r, kind, _) in alert_regions(content) {
@@ -406,7 +410,7 @@ pub(crate) fn math_regions(content: &str) -> Vec<MathRegion> {
 
 /// The inner LaTeX when the whole (trimmed) line is one `$$…$$` pair with
 /// non-empty content — the one-line display-math form.
-fn one_line_math(line: &str) -> Option<&str> {
+pub(crate) fn one_line_math(line: &str) -> Option<&str> {
     let t = line.trim();
     let inner = t.strip_prefix("$$")?.strip_suffix("$$")?;
     let inner = inner.trim();

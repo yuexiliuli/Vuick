@@ -152,30 +152,33 @@ impl Doc {
     /// 压到几十 ms。
     pub(crate) fn reopen(
         &mut self,
-        new_str: &str,
+        new_str: &SharedString,
         old_len: usize,
         edit_old: Range<usize>,
         inserted_len: usize,
     ) {
         let start = edit_old.start.min(old_len);
         let end = edit_old.end.min(old_len);
+        let s = new_str.as_ref();
         let mut new_rope = self.rope.clone();
         if end > start {
             new_rope.remove(start..end);
         }
-        let ins_end = (start + inserted_len).min(new_str.len());
+        let ins_end = (start + inserted_len).min(s.len());
         if ins_end > start {
-            new_rope.insert(start, &new_str[start..ins_end]);
+            new_rope.insert(start, &s[start..ins_end]);
         }
         let dirty = start..start + inserted_len;
         let new_index =
             parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
         let new_line_starts =
-            Self::incremental_line_starts(&self.line_starts, new_str.as_bytes(), old_len, edit_old);
+            Self::incremental_line_starts(&self.line_starts, s.as_bytes(), old_len, edit_old);
         self.rope = new_rope;
         self.index = new_index;
         self.line_starts = new_line_starts;
-        self.src = DocSrc::Str(SharedString::from(new_str));
+        // 与调用方共享同一缓冲（编辑后宿主 `content` = 同一个 SharedString），免 6.4MB
+        // 整份再拷贝一次（每键一次）。
+        self.src = DocSrc::Str(new_str.clone());
     }
 
     /// 增量行起始重建（见 [`Self::reopen`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
