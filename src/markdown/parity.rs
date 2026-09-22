@@ -1,5 +1,5 @@
 //! 奇偶（parity）测试：钉死「预览（`parser` 行扫描）与 WYSIWYG（`live` 的
-//! `markdown_syntax` 行判定）」两套 Markdown 理解层对同一段源码的判定一致。
+//! `inline_style` 行判定）」两套 Markdown 理解层对同一段源码的判定一致。
 //!
 //! 目标**不是两边全等**（taxonomy 本就不同：live 多 Todo/Callout/Math/折叠，
 //! 预览多 Rule/Blank/Image/EPUB 对齐指令），而是：
@@ -17,8 +17,8 @@ use std::collections::{HashMap, HashSet};
 use gpui::SharedString;
 
 use super::ir;
-use super::markdown_syntax::{
-    alert_kind, blockquote_prefix, heading_level, image_row, is_table_row, list_prefix,
+use super::inline_style::{
+    alert_prefix, blockquote_prefix, heading_level, image_row, is_table_row, list_prefix,
     math_regions, table_cells, table_regions, task_prefix, thematic_break,
 };
 use super::parser::{parse_to_rows, split_table_cells, RowKind, TableAlign};
@@ -96,7 +96,7 @@ fn quotes_and_callouts_agree() {
         if is_quote {
             // live 在 Quote 内再细分 Callout；预览仍按 Quote 渲染。
             let p = blockquote_prefix(line).unwrap_or(0);
-            let is_callout = alert_kind(&line[p..]).is_some();
+            let is_callout = alert_prefix(&line[p..]).is_some();
             if i == 1 {
                 assert!(is_callout, "line 1 应为 callout，live 只在引述基础上再加细分");
             }

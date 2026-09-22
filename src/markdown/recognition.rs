@@ -133,19 +133,6 @@ pub fn toggle_alert_fold_at(content: &str, offset: usize) -> Option<String> {
     Some(out)
 }
 
-/// Font-size multiplier for a heading of the given depth (h1 largest, h6 =
-/// body) — one scale for reading, editing, and export.
-pub fn heading_scale(depth: u8) -> f32 {
-    match depth {
-        1 => 1.8,
-        2 => 1.5,
-        3 => 1.3,
-        4 => 1.15,
-        5 => 1.05,
-        _ => 1.0,
-    }
-}
-
 /// The marker for ordered item `n` (1-based) at nesting `depth`, Word-style:
 /// `1.` -> `a.` -> `i.`, cycling for deeper levels. Both views paint ordered
 /// lists with this scheme (a deliberate divergence from CommonMark's
@@ -621,17 +608,6 @@ pub fn embed_line(line: &str) -> Option<&str> {
     let t = line.trim();
     let inner = t.strip_prefix("![[")?.strip_suffix("]]")?;
     (!inner.trim().is_empty() && !inner.contains("]]")).then(|| inner.trim())
-}
-
-/// Every standalone embed target in `content`, in order — what a host
-/// pre-resolves before rendering (recursing into resolved content itself for
-/// nested embeds).
-pub fn embed_targets(content: &str) -> Vec<String> {
-    content
-        .split('\n')
-        .filter_map(embed_line)
-        .map(str::to_string)
-        .collect()
 }
 
 /// The source range of the block carrying the anchor `^id` — its whole line —

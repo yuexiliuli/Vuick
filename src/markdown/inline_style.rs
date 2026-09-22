@@ -26,7 +26,7 @@ use gpui::{
 use crate::markdown::cells::{is_backslash_escaped, split_unescaped_pipes};
 
 /// A spell-check / diagnostic span to underline. 自 `markdown::live`（现移除）迁来，
-/// 原本是该编辑器的高亮 API 的附属类型；现为 `markdown_syntax` 自身的 `pub(crate)` 类型。
+/// 原本是该编辑器的高亮 API 的附属类型；现为 `inline_style` 自身的 `pub(crate)` 类型。
 #[derive(Clone)]
 pub(crate) struct Diagnostic {
     /// Byte range in the document.
@@ -588,11 +588,11 @@ fn scan_line(text: &str, start: usize, end: usize, st: &SyntaxStyle, out: &mut V
     // place (Logseq-style; the anchor hitbox/click emit `refs:^id`).
     // Hidden BEFORE the heading fast-path — heading lines carry anchors too
     // (`### Notes ^id` used to show the raw tail).
-    let end = match super::md_syntax::block_id(&text[start..end]) {
+    let end = match super::recognition::block_id(&text[start..end]) {
         Some((at, id)) => {
             let refs = st.block_ref_count.as_ref().map_or(0, |f| f(id));
             if refs > 0 {
-                let badge = format!(" {}", super::md_syntax::superscript(refs));
+                let badge = format!(" {}", super::recognition::superscript(refs));
                 out.push(Span {
                     range: start + at..end,
                     style: Style {
@@ -1135,7 +1135,7 @@ fn scan_inline(
         if (b[i..end].starts_with(b"http://") || b[i..end].starts_with(b"https://"))
             && (i == start || !is_word(b[i - 1]))
         {
-            let j = i + super::md_syntax::url_end(&text[i..end], 0);
+            let j = i + super::recognition::url_end(&text[i..end], 0);
             if j > i + 8 {
                 push(
                     out,
@@ -1257,7 +1257,7 @@ pub(crate) fn line_heading_level(line: &str) -> Option<(u8, Option<usize>)> {
 /// sections: `folded` holds the trimmed source lines of folded headings
 /// (`## Goals`). A top-level section runs from its heading to the next
 /// heading of the same or a higher level, fence-aware — mirrors
-/// [`super::md_syntax::extract_section`]. A LIST heading's section
+/// [`super::recognition::extract_section`]. A LIST heading's section
 /// (`- ### Notes`) is its indented children: it runs while lines sit deeper
 /// than the heading's own indent (blank lines included). Every line matching
 /// a folded key folds (duplicate headings fold together; the key is the line
@@ -1358,7 +1358,7 @@ pub(crate) fn html_block(line: &str) -> bool {
 // Alert recognition is shared with the reader (`gpui_markdown::syntax`) —
 // what a marker IS lives in one place; this crate only decides how to paint
 // it (hide the prefix, label + colored bar, reveal on caret).
-pub(crate) use super::md_syntax::{AlertKind, alert_prefix};
+pub(crate) use super::recognition::{AlertKind, alert_prefix};
 
 /// Per-kind SVG asset paths for the alert title icons.
 #[derive(Clone)]
@@ -1396,37 +1396,32 @@ impl SyntaxStyle {
     }
 }
 
-/// The alert kind if `body` — a blockquote line's text after its `>` prefix —
-/// starts with an alert marker (see [`super::md_syntax::alert_prefix`]).
-pub(crate) fn alert_kind(body: &str) -> Option<AlertKind> {
-    alert_prefix(body).map(|(kind, ..)| kind)
-}
-
-/// Foldable-callout regions: for each alert whose marker carries a fold char
-/// (`> [!NOTE]-` / `+`), the line range it spans (marker + its `>` continuation
-/// lines, ending at a blank/non-quote line or the next alert marker) and
-/// whether it's folded (`-`). Body lines of a folded region collapse in the
-/// WYSIWYG view unless the caret is inside (reveal-on-caret).
-pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
-    // `Some(fold)` when the line is an alert marker; fold = its fold char.
-    fn marker_fold(line: &str) -> Option<Option<bool>> {
+/// Each alert (callout) region in `content`: an alert marker line (with or
+/// without a fold char) plus its `>` continuation lines, ending at a blank /
+/// non-quote line or the next alert marker. Yields the source-line range, the
+/// kind, and the fold state (`Some` only when the marker carries `-`/`+`).
+/// Marker recognition delegates to [`super::recognition::alert_prefix`] (single
+/// source); the two public queries below derive from here.
+fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> {
+    fn marker(line: &str) -> Option<(AlertKind, Option<bool>)> {
         let p = blockquote_prefix(line)?;
-        alert_prefix(&line[p..]).map(|(_, _, fold)| fold)
+        let (kind, _, fold) = alert_prefix(&line[p..])?;
+        Some((kind, fold))
     }
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        if let Some(Some(folded)) = marker_fold(lines[i]) {
+        if let Some((kind, fold)) = marker(lines[i]) {
             let start = i;
             i += 1;
             while i < lines.len()
                 && blockquote_prefix(lines[i]).is_some()
-                && marker_fold(lines[i]).is_none()
+                && marker(lines[i]).is_none()
             {
                 i += 1;
             }
-            out.push((start..i, folded));
+            out.push((start..i, kind, fold));
         } else {
             i += 1;
         }
@@ -1434,33 +1429,24 @@ pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
     out
 }
 
-/// 每个警报（callout）区域（marker 行 + 其连续 `>` body 行）的 `AlertKind`——
-/// 供 WYSIWYG 把**整段** callout（含 body 行）的左条统一画成警报色（否则只有
-/// marker 行有彩条、body 行是灰条）。键 = 源码行号。含/不含折叠符的警报都覆盖
-/// （有折叠符 = `alert_fold_regions` 的子集，这里更宽）。
+/// Foldable-callout regions (`> [!NOTE]-` / `+`): the line range + fold state,
+/// derived from [`alert_regions`]. Body lines of a folded region collapse in
+/// the WYSIWYG view unless the caret is inside (reveal-on-caret).
+pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
+    alert_regions(content)
+        .into_iter()
+        .filter_map(|(r, _, fold)| fold.map(|f| (r, f)))
+        .collect()
+}
+
+/// 每个警报（callout）区域的 `AlertKind`（marker 行 + 连续 `>` body 行）——
+/// 供 WYSIWYG 把整段 callout 的左条统一画成警报色。键 = 源码行号；含/不含
+/// 折叠符的警报都覆盖（由 [`alert_regions`] 派生）。
 pub(crate) fn alert_region_kinds(content: &str) -> std::collections::HashMap<usize, AlertKind> {
-    fn line_kind(line: &str) -> Option<AlertKind> {
-        let p = blockquote_prefix(line)?;
-        alert_prefix(&line[p..]).map(|(kind, _, _)| kind)
-    }
-    let lines: Vec<&str> = content.split('\n').collect();
     let mut out = std::collections::HashMap::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if let Some(kind) = line_kind(lines[i]) {
-            let start = i;
-            i += 1;
-            while i < lines.len()
-                && blockquote_prefix(lines[i]).is_some()
-                && line_kind(lines[i]).is_none()
-            {
-                i += 1;
-            }
-            for l in start..i {
-                out.insert(l, kind);
-            }
-        } else {
-            i += 1;
+    for (r, kind, _) in alert_regions(content) {
+        for l in r {
+            out.insert(l, kind);
         }
     }
     out
@@ -1642,9 +1628,9 @@ pub(crate) fn toggle_task_checkbox(line: &str) -> Option<String> {
 /// return `(src, explicit_width)`. The editor renders such a line as the image
 /// (W4) when the caret is elsewhere; a line with any other trailing text stays
 /// plain source. Prefix recognition is shared with the preview parser
-/// (`crate::markdown::image::parse_ref`, parity-pinned).
+/// (`crate::markdown::parser::parse_ref`, parity-pinned).
 pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
-    let r = crate::markdown::image::parse_ref(line.trim())?;
+    let r = crate::markdown::parser::parse_ref(line.trim())?;
     let tail = r.tail.trim();
     let width = if tail.is_empty() {
         None
@@ -1716,16 +1702,6 @@ pub(crate) fn mermaid_blocks(content: &str) -> Vec<(Range<usize>, String)> {
         }
     }
     out
-}
-
-/// `$$…$$` math blocks: each entry is `(line_range, source)` — the range covering both
-/// `$$` fence lines (so it collapses) and the LaTeX between them. The fences are bare
-/// `$$` lines (markdown's `math_flow` form, no info word).
-pub(crate) fn math_blocks(content: &str) -> Vec<(Range<usize>, String)> {
-    math_regions(content)
-        .into_iter()
-        .map(|r| (r.range, r.source))
-        .collect()
 }
 
 /// Horizontal alignment of a display `$$…$$` block, chosen per-block via a
@@ -2133,12 +2109,12 @@ pub(crate) fn property_regions(content: &str) -> Vec<Range<usize>> {
             i += 1;
             continue;
         }
-        if !in_fence && super::md_syntax::prefixed_property(lines[i]).is_some() {
+        if !in_fence && super::recognition::prefixed_property(lines[i]).is_some() {
             let start = i;
             i += 1;
             while i < lines.len()
                 && !lines[i].trim_start().starts_with("```")
-                && super::md_syntax::prefixed_property(lines[i]).is_some()
+                && super::recognition::prefixed_property(lines[i]).is_some()
             {
                 i += 1;
             }
@@ -2180,13 +2156,13 @@ fn is_word(c: u8) -> bool {
 }
 
 // One tag grammar with the reader (namespaced `#a/b` included).
-use super::md_syntax::is_tag_char as is_tag;
+use super::recognition::is_tag_char as is_tag;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 链接识别自 `markdown::md_syntax`（原 live 时代经 `pub(crate) use` 再导出）。
-    use crate::markdown::md_syntax::{link_at, LinkHit};
+    // 链接识别自 `markdown::recognition`（原 live 时代经 `pub(crate) use` 再导出）。
+    use crate::markdown::recognition::{link_at, LinkHit};
 
     #[test]
     fn copies_renumber_to_displayed_positions() {
@@ -2808,12 +2784,14 @@ mod tests {
 
     #[test]
     fn alert_kinds_detected() {
-        assert_eq!(alert_kind("[!NOTE]"), Some(AlertKind::Note));
-        assert_eq!(alert_kind(" [!CAUTION] "), Some(AlertKind::Caution));
+        // 通过 recognition::alert_prefix 取 kind（构造层单一源）。
+        let kind = |s: &str| alert_prefix(s).map(|(k, ..)| k);
+        assert_eq!(kind("[!NOTE]"), Some(AlertKind::Note));
+        assert_eq!(kind(" [!CAUTION] "), Some(AlertKind::Caution));
         // Lenient form: body text on the marker line.
-        assert_eq!(alert_kind("[!NOTE] text after"), Some(AlertKind::Note));
+        assert_eq!(kind("[!NOTE] text after"), Some(AlertKind::Note));
         for s in ["[!note]", "[!NOTEXT]", "note", ""] {
-            assert_eq!(alert_kind(s), None, "{s:?}");
+            assert_eq!(kind(s), None, "{s:?}");
         }
     }
 

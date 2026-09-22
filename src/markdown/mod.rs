@@ -4,7 +4,7 @@
 //! - `view`：基于 gpui `List` 的行级虚拟化 + 置顶滚动条
 //! - `wysiwyg`：本项目自研 WYSIWYG 编辑器（[`WyEditor`]，auto-grow + 宿主滚动；
 //!   元素级所见即所得，直接编辑 `Doc` 数据源）。已取代 zorite 移植的 `live`。
-//! - `md_syntax` / `markdown_syntax`：markdown 构造识别 / 行内样式扫描（自 `live`
+//! - `recognition` / `inline_style`：markdown 构造识别 / 行内样式扫描（自 `live`
 //!   迁出，`wysiwyg` 与预览 `view` 共用同一套识别）。
 //!
 //! 相比直接使用 gpui-component 的 `TextView`：
@@ -16,10 +16,9 @@ pub(crate) mod view;
 
 mod cells;
 mod doc;
-mod image;
 mod ir;
-pub(crate) mod md_syntax;
-pub(crate) mod markdown_syntax;
+pub(crate) mod recognition;
+pub(crate) mod inline_style;
 pub(crate) mod wysiwyg;
 
 #[cfg(test)]

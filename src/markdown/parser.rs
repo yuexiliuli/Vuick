@@ -16,7 +16,6 @@ use gpui_component::input::Rope;
 use regex::Regex;
 
 use super::cells;
-use super::image;
 
 /// 渲染行类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,11 +752,42 @@ fn inline_strip(s: &str) -> SharedString {
     inline_style(s).0
 }
 
+/// `![alt](src)` 前缀识别核心（原 `markdown::image` 模块，并入 `parser` 减少零散文件；
+/// 与 preview/wysiwyg 的识别语义由 `parity::image_construct_edges_are_documented` 钉死）。
+pub(crate) struct ImgRef<'a> {
+    /// alt（原样，未 trim）。
+    pub(crate) alt: &'a str,
+    /// src（已 trim）。
+    pub(crate) src: &'a str,
+    /// `)` 之后的尾部（未 trim）。
+    pub(crate) tail: &'a str,
+    /// `](` 中 `]` 相对 `![` 之后的偏移（供解析器精确复刻其「首个 `]`」历史规则）。
+    pub(crate) close_alt_rel: usize,
+}
+
+/// 从行首解析 `![alt](src)`：要求 `![` 后第一个 `](` 成对、`(` 后有 `)`、src 非空。
+/// 只做前缀匹配；整行 / `{width=N}` / 列表前缀等策略由各调用方决定。
+pub(crate) fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
+    let rest = line.strip_prefix("![")?;
+    let close_alt = rest.find("](")?;
+    let alt = &rest[..close_alt];
+    let after = &rest[close_alt + 2..];
+    let close_src = after.find(')')?;
+    let src = after[..close_src].trim();
+    let tail = &after[close_src + 1..];
+    (!src.is_empty()).then_some(ImgRef {
+        alt,
+        src,
+        tail,
+        close_alt_rel: close_alt,
+    })
+}
+
 /// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
-/// 前缀识别复用共享核心 `image::parse_ref`（与 live 同一字节逻辑，见 parity），
-/// 这里叠加「整行」策略：`]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
+/// 前缀识别复用共享核心 [`parse_ref`]，这里叠加「整行」策略：
+/// `]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
 pub(crate) fn parse_image_line(t: &str) -> Option<(String, String)> {
-    let r = image::parse_ref(t)?;
+    let r = parse_ref(t)?;
     // 历史语义：alt 由「第一个 `]`」界定且必须紧跟 `(`。`parse_ref` 取的是第一处
     // `](`；仅当 `]` 出现在 `](` 之前时二者不同（如 `![a]b](c)`）→ 既有实现返回 None。
     let close_pos = 2 + r.close_alt_rel; // `](` 的 `]` 在 `t` 中的字节偏移

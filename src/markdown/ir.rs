@@ -12,7 +12,7 @@
 use std::ops::Range;
 
 use super::cells::{self, CellAlign};
-use super::markdown_syntax::{
+use super::inline_style::{
     blockquote_prefix, heading_level, image_row, list_prefix, table_regions, thematic_break,
 };
 
@@ -51,7 +51,7 @@ pub(crate) struct IrBlock {
 }
 
 /// 从源码产出一份块级 IR。围栏/表格判定与 live 一致（` ``` ` 围栏奇偶、
-/// `is_table_row` 表区域），行内构造识别复用 `markdown_syntax` 纯函数
+/// `is_table_row` 表区域），行内构造识别复用 `inline_style` 纯函数
 /// （见 parity 差异清单：`~~~`/math/缩进标题等已知不在此对齐子集）。
 pub(crate) fn build_ir(src: &str) -> Vec<IrBlock> {
     let lines: Vec<&str> = src.split('\n').collect();

@@ -2,7 +2,7 @@
 //!
 //! 以本项目自研管线（`parser`/`cells`/`ir`/`doc`）实现所见即所得编辑，
 //! 已取代 zorite 移植的 `markdown::live`（该模块已移除；其共享的
-//! `md_syntax` / `markdown_syntax` 识别层上移到 `markdown/` 顶层继续共用）。
+//! `recognition` / `inline_style` 识别层上移到 `markdown/` 顶层继续共用）。
 //!
 //! 本文件是第一步「初步实现」：
 //! - **文档模型完全来自本项目** [`super::doc::Doc`]：IR 语义 + `BlockIndex` + 源；
@@ -37,8 +37,8 @@ use gpui::{
 };
 
 use super::doc::Doc;
-use crate::markdown::md_syntax::{self, LinkHit};
-use crate::markdown::markdown_syntax;
+use crate::markdown::recognition::{self, LinkHit};
+use crate::markdown::inline_style;
 use crate::markdown::view::style::StyleParams;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
@@ -725,7 +725,7 @@ impl WyEditor {
                 drop(marker);
                 self.focus.focus(window, cx);
                 match hit {
-                    LinkHit::Url(u) if md_syntax::is_safe_external_url(&u) => {
+                    LinkHit::Url(u) if recognition::is_safe_external_url(&u) => {
                         let _ = cx.open_url(&u);
                     }
                     LinkHit::Url(u) | LinkHit::Page(u) => {
@@ -1030,7 +1030,7 @@ impl WyEditor {
         // `INLINE_MATH_PAD` 且键带 `inline:` 前缀 + `\textstyle` 包层（大算子转行内式，
         // 只压算子不缩正文——否则 `\int_0^1` 整图缩放会把 `x^2 dx` 也变小）。
         let mut sources: Vec<(SharedString, bool, f32, String)> = Vec::new();
-        for reg in markdown_syntax::math_regions(&content) {
+        for reg in inline_style::math_regions(&content) {
             let s = reg.source.trim();
             if !s.is_empty() && s != "$$" {
                 sources.push((
@@ -1042,8 +1042,8 @@ impl WyEditor {
             }
         }
         for line in content.split('\n') {
-            for span in markdown_syntax::inline_math_spans(line) {
-                let lx = markdown_syntax::inline_math_latex(line, &span).trim();
+            for span in inline_style::inline_math_spans(line) {
+                let lx = inline_style::inline_math_latex(line, &span).trim();
                 if !lx.is_empty() {
                     sources.push((
                         inline_math_key(lx),
@@ -1361,7 +1361,7 @@ impl WyEditor {
         let start = self.line_start(line);
         let end = self.line_end(line).max(start);
         let raw = self.content.as_ref()[start..end].to_string();
-        if let Some((at, cur)) = md_syntax::alert_fold_char(&raw) {
+        if let Some((at, cur)) = recognition::alert_fold_char(&raw) {
             let range = start + at..start + at + 1;
             let repl = if cur { "+" } else { "-" };
             if range.end <= end {
@@ -1385,7 +1385,7 @@ impl WyEditor {
             // 折叠前：光标若在 section body 内，先移到标题行末（否则 body 有光标被 reveal）。
             let single = std::collections::HashSet::from([key.clone()]);
             let crow = self.row_col(self.caret()).0;
-            if markdown_syntax::heading_fold_regions(&self.content, &single)
+            if inline_style::heading_fold_regions(&self.content, &single)
                 .iter()
                 .any(|r| crow > r.start && crow < r.end)
             {
@@ -1409,7 +1409,7 @@ impl WyEditor {
         let start = self.line_start(line);
         let end = self.line_end(line).max(start);
         let raw = self.content.as_ref()[start..end].to_string();
-        if let Some(new_line) = markdown_syntax::toggle_task_checkbox(&raw) {
+        if let Some(new_line) = inline_style::toggle_task_checkbox(&raw) {
             self.apply_edit(start..end, &new_line, cx);
         }
     }
