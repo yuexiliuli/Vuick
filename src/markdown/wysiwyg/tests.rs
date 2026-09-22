@@ -169,26 +169,27 @@
             let ed = host.read(cx).ed.clone();
             // 只覆盖顶部 ~80px 的窄带 → 真正 shape 的块应极少。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 80.));
-            let n = frame.rows.len();
+            let n = frame.block_count();
             assert!(n > 10_000, "应有大量块：{n}");
-            let shaped = frame.rows.iter().filter(|r| !r.wrapped.is_empty()).count();
+            let shaped = frame.rows.len();
             assert!(
                 shaped > 0 && shaped < 20,
-                "窄带只应 shape 极少量块，实际 {shaped}/{n}"
+                "窄带只应物化极少量带内整形行，实际 {shaped}/{n}"
+            );
+            // 带外块不再物化占位：`rows` 只含带内整形行（全非空 wrapped）。
+            assert!(
+                frame.rows.iter().all(|r| !r.wrapped.is_empty()),
+                "rows 只应有带内整形行"
             );
             assert!(
                 f32::from(frame.total) > 100_000.,
                 "总高应由估算铺满（>.1M px），实际 {:.0}",
                 f32::from(frame.total)
             );
-            assert!(
-                frame.rows.iter().any(|r| r.wrapped.is_empty()),
-                "带外块应保持未 shape（占位）"
-            );
         });
         vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            // 全篇带 → 全部 shape（与旧行为一致，小文档回归护栏）。
+            // 全篇带 → 全部块物化并 shape（与旧行为一致，小文档回归护栏）。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             assert_eq!(
                 frame.rows.iter().filter(|r| r.wrapped.is_empty()).count(),
@@ -227,14 +228,14 @@
         });
         vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            // 窄带 (0,1)：第一条短行（24px）之后即带外。
+            // 窄带 (0,1)：第一条短行（24px）之后即带外——带外块不物化，走布局 `block_*`。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
-            assert!(frame.rows[1].wrapped.is_empty(), "长段应已带外（未 shape）");
+            assert_eq!(frame.rows.len(), 1, "窄带 (0,1) 只应物化首行");
             assert_eq!(
-                frame.rows[1].height, h_real,
+                frame.block_height(1), f32::from(h_real),
                 "带外长段高度应沿用缓存真值（不跳回估算）"
             );
-            assert_eq!(frame.rows[1].top, top_real, "带外长段 top 也应一致");
+            assert_eq!(frame.block_top(1), f32::from(top_real), "带外长段 top 也应一致");
             // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
             assert_eq!(frame.rows[1].height, h_real);
@@ -272,13 +273,13 @@
         });
         vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            // 窄带 (0,1)：首段在带内，标题被挤出带 → 未 shape，但高度沿用缓存真值。
+            // 窄带 (0,1)：首段在带内，标题被挤出带 → 未物化，但布局高度沿用缓存真值。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
-            assert!(frame.rows[idx].wrapped.is_empty(), "标题应已带外（未 shape）");
+            assert!(frame.rows.len() <= 1, "标题在带外（不物化），rows 只含首段");
             assert!(
-                (f32::from(frame.rows[idx].height) - f32::from(h_real)).abs() < 0.5,
+                (frame.block_height(idx) - f32::from(h_real)).abs() < 0.5,
                 "带外标题高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                frame.rows[idx].height
+                frame.block_height(idx)
             );
             // 全带回来 → 仍一致。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
@@ -318,14 +319,17 @@
         });
         vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
-            // 窄带完全落在撑高行之下 → 第 0 行带外（未 shape），仍应沿用整形真值。
+            // 窄带完全落在撑高行之下 → 第 0 行带外（不物化），仍应沿用整形真值。
             let lo = f32::from(h_real);
             let frame = build_frame(ed.read(cx), window, px(300.), (lo, lo + 0.1));
-            assert!(frame.rows[0].wrapped.is_empty(), "撑高行已被挤出带（未 shape）");
             assert!(
-                (f32::from(frame.rows[0].height) - f32::from(h_real)).abs() < 0.5,
+                !frame.rows.iter().any(|r| r.src_line == 0),
+                "撑高行（块 0）应带外（不物化）"
+            );
+            assert!(
+                (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
                 "带外撑高行高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                frame.rows[0].height
+                frame.block_height(0)
             );
         });
     }
@@ -365,16 +369,17 @@
         });
         vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            // 窄带完全落在图片行之下 → 图片行带外（未 shape），仍沿用整形真值。
+            // 窄带完全落在图片行之下 → 图片行带外（不物化），仍沿用整形真值。
             let lo = f32::from(h_real);
             let frame = build_frame(ed.read(cx), window, px(600.), (lo, lo + 0.1));
-            let row = &frame.rows[0];
-            assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
-            assert!(row.wrapped.is_empty(), "图片行应带外（未 shape）");
             assert!(
-                (f32::from(row.height) - f32::from(h_real)).abs() < 0.5,
+                !frame.rows.iter().any(|r| r.src_line == 0),
+                "图片行（块 0）应带外（不物化）"
+            );
+            assert!(
+                (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
                 "带外图片行高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                row.height
+                frame.block_height(0)
             );
         });
     }
@@ -1492,28 +1497,27 @@ tail
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let shaped_h = vcx.update(|window, cx| {
+        let (shaped_h, code_ix) = vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let code = frame
+            let code_ix = frame
                 .rows
                 .iter()
-                .find(|r| r.kind == IrKind::Code)
+                .position(|r| r.kind == IrKind::Code)
                 .expect("应有代码块");
+            let code = &frame.rows[code_ix];
             assert!(code.editable);
-            f32::from(code.height)
+            (f32::from(code.height), code_ix)
         });
         let off_h = vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            // 窄带：长段 (~1000px) 全占，代码块与尾行在带外 → 占位（不 shape）。
+            // 窄带：长段 (~1000px) 全占，代码块与尾行在带外 → 不物化，走布局高度。
             let frame = build_frame(ed.read(cx), window, px(300.), (0., 300.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code)
-                .expect("应有代码块占位");
-            assert!(!code.editable, "带外代码块不 shape");
-            f32::from(code.height)
+            assert!(
+                !frame.rows.iter().any(|r| r.kind == IrKind::Code),
+                "带外代码块不物化"
+            );
+            frame.block_height(code_ix)
         });
         assert!(
             (off_h - shaped_h).abs() < 1.,
@@ -1810,12 +1814,9 @@ A-->B
                 .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
                 .expect("应有警报行");
             assert_eq!(alert.src_line, 5, "`> [!NOTE]-` marker 源行");
-            let folded = frame
-                .rows
-                .iter()
-                .find(|r| r.src_lines.contains(&6))
-                .expect("callout 主体行应存在");
-            assert_eq!(f32::from(folded.height), 0., "折叠 callout 主体应 0 高");
+            // 折叠 callout 主体（src 6）0 高不物化，高度经布局断言。
+            let folded_ix = frame.block_index_for_src_line(6).expect("callout 主体块应存在");
+            assert_eq!(frame.block_height(folded_ix), 0., "折叠 callout 主体应 0 高");
             // C5: 有可点击链接的行。
             let linkrow = frame
                 .rows
@@ -2067,9 +2068,10 @@ graph TD
             assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再点应折叠回");
             assert_eq!(ed.read(cx).text().as_ref(), text, "往返后内容还原");
             // 关键断言：折叠后 body 行必须真正折叠（0 高）——光标在 marker 行也不得被 reveal 弹开。
+            // 折叠 body 0 高不物化，高度经布局 `block_height` 断言。
             let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body = frame3.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(body.height), 0., "点击折叠后 body 应真正折叠（回归）");
+            let body_ix = frame3.block_index_for_src_line(1).expect("callout 主体块应存在");
+            assert_eq!(frame3.block_height(body_ix), 0., "点击折叠后 body 应真正折叠（回归）");
         });
     }
 
@@ -2089,18 +2091,21 @@ graph TD
             // 光标在 NOTE marker 行：两个 callout 的 body 都应折叠。
             ed.update(cx, |e, _| e.set_caret(0));
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let note = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(note.height), 0., "光标在 marker 行时 NOTE body 也应折叠");
-            let warn = frame.rows.iter().find(|r| r.src_lines.contains(&5)).unwrap();
-            assert_eq!(f32::from(warn.height), 0., "WARNING body 也应折叠");
+            let note_ix = frame.block_index_for_src_line(1).expect("NOTE 主体块");
+            let warn_ix = frame.block_index_for_src_line(5).expect("WARNING 主体块");
+            assert_eq!(frame.block_height(note_ix), 0., "光标在 marker 行时 NOTE body 也应折叠");
+            assert_eq!(frame.block_height(warn_ix), 0., "WARNING body 也应折叠");
             // 展开 NOTE → 再折叠（光标仍在 NOTE marker 行）。
             ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
             assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"), "先展开");
             ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
             assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再折叠回");
             let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let note2 = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(note2.height), 0., "折叠后 NOTE body 应真正折叠（不是 reveal）");
+            let note2_ix = frame2.block_index_for_src_line(1).expect("NOTE 主体块");
+            assert_eq!(
+                frame2.block_height(note2_ix), 0.,
+                "折叠后 NOTE body 应真正折叠（不是 reveal）"
+            );
             // 互不影响：折叠 WARNING 不应改动 NOTE。
             ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(4, cx));
             assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "NOTE 折叠态保持");
@@ -2158,8 +2163,8 @@ graph TD
                 "点击标题箭头应折叠"
             );
             let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(body.height), 0., "折叠后 body 应真正折叠");
+            let body_ix = frame2.block_index_for_src_line(1).expect("body 块");
+            assert_eq!(frame2.block_height(body_ix), 0., "折叠后 body 应真正折叠");
             let h2 = frame2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
             assert!(f32::from(h2.height) > 0., "标题行本身保留");
             // 展开回：body 高度恢复，文本不变（视图本地，不写源码）。
@@ -2202,8 +2207,8 @@ graph TD
             });
             // 光标默认在行首（标题行）→ 折叠保持。
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(body.height), 0., "光标在标题行时折叠保持");
+            let body_ix = frame.block_index_for_src_line(1).expect("body 块");
+            assert_eq!(frame.block_height(body_ix), 0., "光标在标题行时折叠保持");
             // 光标移到 body（源字节 6 = "body" 起点所在行）→ reveal：body 恢复高度。
             ed.update(cx, |e, _| e.set_caret(text.find("body").unwrap()));
             let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
@@ -2238,8 +2243,8 @@ graph TD
             let (line, _) = ed.read(cx).row_col(ed.read(cx).caret());
             assert_eq!(line, 0, "折叠时光标应移到标题行");
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(body.height), 0., "body 真正折叠");
+            let body_ix = frame.block_index_for_src_line(1).expect("body 块");
+            assert_eq!(frame.block_height(body_ix), 0., "body 真正折叠");
         });
     }
 
@@ -2282,9 +2287,9 @@ graph TD
                 "折叠标题后数学卡片不得残留绘制（{}）",
                 cards.len()
             );
-            // 原卡片行应折叠成 0 高（普通占位），不再是卡片。
-            let m1 = frame.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert_eq!(f32::from(m1.height), 0., "`\\$\\$` 起始行折叠成 0 高");
+            // 原卡片行应折叠成 0 高（不再装配卡片），折叠块不物化，高度经布局断言。
+            let m1_ix = frame.block_index_for_src_line(1).expect("`$x$` 起始行块");
+            assert_eq!(frame.block_height(m1_ix), 0., "`\\$\\$` 起始行折叠成 0 高");
         });
     }
 

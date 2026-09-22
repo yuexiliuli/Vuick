@@ -171,10 +171,24 @@ pub(crate) struct RowExtra {
 }
 
 /// 一次布局后的行网格（measure→prepaint→paint 跨阶段复用）。
+///
+/// **大文档窗口化**：`rows` 只含**带内**（可视带 + 缓冲）的整形行；带外块不物化
+/// `ShapedRow`，靠 `tops` / `block_src_lines` 紧凑布局索引定位（命中、光标、hscroll
+/// 只需带内行；带外光标/未来命中走 `src_line_top` 兜底）。基准：7MB/15.9 万块文档
+/// 旧实现每档滚动重建重建 15.9 万个占位 `ShapedRow`（~72MB/档）→ 只物化带内几十行。
 pub(crate) struct Frame {
     pub padding: Pixels,
     pub line_h: Pixels,
+    /// 仅带内的整形行（含块级卡片：数学/Mermaid；折叠 body 0 高不物化）。`top` 已填真实值。
     pub rows: Vec<ShapedRow>,
+    /// 全篇每块顶 y（元素局部 px，n = [`Self::block_count`]）——带外定位/量程用。
+    pub tops: Vec<f32>,
+    /// 全篇每块高（px，n 项；带内 = 整形真高、带外 = 高度缓存/估算）。
+    /// （生产命中/光标只读 `tops`；本字段供测试断言带外高沿用缓存真值。）
+    #[allow(dead_code)]
+    pub heights: Vec<f32>,
+    /// 全篇每块起始源码行（n 项，升序）——`src_line → 块` 二分映射。
+    pub block_src_lines: Vec<u32>,
     pub total: Pixels,
     /// 本帧可视带（元素局部 y）；帧缓存键之一。
     pub band: (f32, f32),
@@ -187,6 +201,42 @@ pub(crate) struct Frame {
     /// 本帧数学排版代数；帧缓存键之一（Loading→就绪后卡片高变大，必须重建）。
     pub mgen: u64,
 }
+
+impl Frame {
+    /// 全篇块总数（虚拟化量程 = `total`）。（供测试；生产用 `tops.len()`。）
+    #[allow(dead_code)]
+    pub(crate) fn block_count(&self) -> usize {
+        self.tops.len()
+    }
+    /// 第 `i` 块顶 y（元素局部 px）。
+    pub(crate) fn block_top(&self, i: usize) -> f32 {
+        self.tops.get(i).copied().unwrap_or(0.)
+    }
+    /// 第 `i` 块高（px）。（供测试断言带外高。）
+    #[allow(dead_code)]
+    pub(crate) fn block_height(&self, i: usize) -> f32 {
+        self.heights.get(i).copied().unwrap_or(0.)
+    }
+    /// 源码行 → 所在块下标（块按 `src_line` 升序连续覆盖源码行；越界归到首/末块）。
+    pub(crate) fn block_index_for_src_line(&self, line: usize) -> Option<usize> {
+        if self.block_src_lines.is_empty() {
+            return None;
+        }
+        let i = self
+            .block_src_lines
+            .partition_point(|&s| (s as usize) <= line)
+            .saturating_sub(1)
+            .min(self.block_src_lines.len() - 1);
+        Some(i)
+    }
+    /// 源码行所在块的顶 y（元素局部 px）——带外光标/命中（未物化行）的定位兜底。
+    pub(crate) fn src_line_top(&self, line: usize) -> f32 {
+        self.block_index_for_src_line(line)
+            .map(|i| self.block_top(i))
+            .unwrap_or(0.)
+    }
+}
+
 
 pub(crate) struct ShapedRow {
     pub src_line: usize,
@@ -296,41 +346,6 @@ fn runs_to_text_runs(
         });
     }
     out
-}
-
-/// `RowKind` → 稳定小整数（高度缓存键组成用，Heading 带级数）。
-fn kind_tag(k: RowKind) -> u8 {
-    match k {
-        RowKind::Paragraph => 0,
-        RowKind::Heading(n) => 1 + n.min(6),
-        RowKind::Code => 8,
-        RowKind::Quote => 9,
-        RowKind::Bullet => 10,
-        RowKind::Rule => 11,
-        RowKind::Table => 12,
-        RowKind::Image => 13,
-        RowKind::Blank => 14,
-    }
-}
-
-/// 文本块的高度缓存键：`(内容代数, 图片/数学加载代数, 源行, 类型, shaping 宽)`。
-fn height_cache_key(
-    rgen: u64,
-    igen: u64,
-    mgen: u64,
-    src_line: u32,
-    kind: RowKind,
-    width_bits: u32,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    rgen.hash(&mut h);
-    igen.hash(&mut h);
-    mgen.hash(&mut h);
-    src_line.hash(&mut h);
-    kind_tag(kind).hash(&mut h);
-    width_bits.hash(&mut h);
-    h.finish()
 }
 
 /// 表格块的总高（px）：与预览**实际渲染**同式 `(1 + 数据行数) × 行高 + 行分隔数 + 2`
@@ -1827,6 +1842,9 @@ pub(crate) fn build_frame(
                 image: None,
                 extra: RowExtra::default(),
             }],
+            tops: vec![0.],
+            heights: vec![f32::from(line_h)],
+            block_src_lines: vec![0],
             total: line_h,
             band,
             width,
@@ -1841,12 +1859,15 @@ pub(crate) fn build_frame(
     let width_bits = f32::from(width).to_bits();
     let igen = editor.images_gen();
     let mgen = editor.math_gen();
+    // 高度缓存：代（内容/图片/数学/宽度）+ 每块高度（下标即键）——估算与整形写回同表。
+    editor.height_cache_ensure(n, super::height_epoch(rgen, igen, mgen, width_bits));
 
     // 结构扫描（O(n) 行扫描，随内容代变化；build_frame 每代顶多跑一次）。
     let content = editor.content();
     let caret_line = editor.row_col(editor.caret()).0;
     // 数学块（`$$…$$`）：首源码行 → 张卡片；其余行折叠成 0 高（caret 在块内则整块保留源码）。
-    let math_regions = inline_style::math_regions(content);
+    // 内容派生扫描已按 content_gen 缓存：滚动/带移动复用，不重扫全篇（大文档主坑）。
+    let math_regions = &editor.derived().math_regions;
     let mut math_start: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (idx, reg) in math_regions.iter().enumerate() {
@@ -1860,9 +1881,10 @@ pub(crate) fn build_frame(
     // reveal-on-caret 仅当光标落在 **body 行**（start+1..end）时生效——光标在 marker
     // 行上正是点击折叠后的常态，若也算「区域内有光标」则刚点的折叠会被强制展开
     // （「点折叠却折不起来 + 多 callout 互相串」的根因）。
+    let alert_fold = &editor.derived().alert_fold_regions;
     let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (rnge, folded) in inline_style::alert_fold_regions(content) {
-        if !folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
+    for (rnge, folded) in alert_fold {
+        if !*folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
             continue;
         }
         fold_lines.extend(rnge.start + 1..rnge.end);
@@ -1884,14 +1906,13 @@ pub(crate) fn build_frame(
     }
     let collapsed = |srcline: usize| fold_lines.contains(&srcline) || math_body.contains(&srcline);
 
-    // Pass 1：决定每块高度（文本块：缓存真值优先，无则用真实字数估算）+ 是否入带。
-    #[derive(Clone, Copy)]
-    struct Plan {
-        shaped: bool,
-        h: Pixels,
-        cache_key: Option<u64>,
-    }
-    let mut plan: Vec<Plan> = Vec::with_capacity(n);
+    // Pass 1：全篇块高度（文本块：缓存真值优先，无则按真实字数估算——**估算也写回缓存**，
+    // 首次过后滚动/带移动不再逐块重扫源行算字数）+ 布局数组（tops/高）+ 带内判定。
+    let mut heights: Vec<f32> = Vec::with_capacity(n);
+    let mut block_src_lines: Vec<u32> = Vec::with_capacity(n);
+    let mut in_band: Vec<bool> = Vec::with_capacity(n);
+    let mut math_card_at: Vec<Option<usize>> = Vec::with_capacity(n);
+    let mut special: Vec<bool> = Vec::with_capacity(n);
     let mut y: f32 = 0.;
     for i in 0..n {
         let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
@@ -1906,25 +1927,18 @@ pub(crate) fn build_frame(
         let is_mermaid = meta.kind == RowKind::Code
             && doc.line_str(srcline).trim_start().starts_with("```mermaid");
         let math_card = math_start.get(&srcline).copied();
-        let special = collapsed(srcline) || math_card.is_some() || is_mermaid;
-        let cache_key = if special {
-            None
-        } else {
-            match meta.kind {
-                // 折行文本块（段/标题/引述/列表）缓存**真实高度 px**（带外沿用真值防
-                // 滚动跳变）。代码/表格/图片**不入缓存**：它们不折行、`estimate_height`
-                // 与 shape 高同式（代码 = (行数+2)×code_line；图片 = 见
-                // `image_row_height`）——入缓存反而会用错误行高重建。
-                RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet => {
-                    Some(height_cache_key(rgen, igen, mgen, meta.src_line, meta.kind, width_bits))
-                }
-                _ => None,
-            }
-        };
-        let h = if collapsed(srcline) {
-            px(0.)
+        let is_special = collapsed(srcline) || math_card.is_some() || is_mermaid;
+        // 仅折行文本块（段/标题/引述/列表）入高度缓存（下标 = 块号，代内稳定）。
+        // 代码/表格/图片**不入缓存**：它们不折行、`estimate_height` 与 shape 高同式
+        // （代码 = (行数+2)×code_line；图片 = 见 `image_row_height`）——入缓存反而会用
+        // 错误行高重建。
+        let cacheable = !is_special
+            && matches!(meta.kind,
+                RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet);
+        let h: f32 = if collapsed(srcline) {
+            0.
         } else if let Some(idx) = math_card {
-            math_card_height(editor, &math_regions[idx])
+            f32::from(math_card_height(editor, &math_regions[idx]))
         } else if is_mermaid {
             // 由围栏内容行重建源码算卡片高（与 shape_code_row 一致）。
             let mut src = String::new();
@@ -1934,7 +1948,7 @@ pub(crate) fn build_frame(
                 }
                 src.push_str(&doc.line_str(srcline + 1 + k as usize));
             }
-            mermaid_card_height(&src)
+            f32::from(mermaid_card_height(&src))
         } else if meta.kind == RowKind::Image {
             // 图片行：用当前加载尺寸（或占位默认）按 `shape_image_row` 同式算高——
             // 占位→真实尺寸由 `igen` 触发帧重建，但带内外必须用同一公式，否则
@@ -1943,120 +1957,109 @@ pub(crate) fn build_frame(
             let src = crate::markdown::parser::parse_image_line(doc.line_str(srcline).trim())
                 .map(|(_, s)| s)
                 .unwrap_or_default();
-            image_row_height(editor, &src, avail)
+            f32::from(image_row_height(editor, &src, avail))
         } else {
-            match cache_key.and_then(|k| editor.cached_height(k)) {
-                Some(h) => px(h),
+            match if cacheable { editor.cached_height(i) } else { None } {
+                Some(h) => h,
                 None => {
                     let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
-                    estimate_height(&meta, chars, ascii, theme, avail, line_h)
+                    let eh = f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h));
+                    // 估算也入缓存：滚动/带移动复用，避免逐块重扫源行（大文档主坑）。
+                    if cacheable {
+                        editor.cache_height(i, eh);
+                    }
+                    eh
                 }
             }
         };
-        let bottom = y + f32::from(h);
-        let mut shaped = bottom > band_lo && y < band_hi;
-        // 数学卡片块在 pass 3 直接装配（不入带内 shape）；body/callout 折叠块不 shape。
-        if math_card.is_some() || collapsed(srcline) {
-            shaped = false;
-        }
-        plan.push(Plan {
-            shaped,
-            h,
-            cache_key,
-        });
+        heights.push(h);
+        block_src_lines.push(meta.src_line);
+        let bottom = y + h;
+        in_band.push(bottom > band_lo && y < band_hi);
+        // 数学卡片块在 pass 2 不入带内 shape（pass 3 直接装配）；折叠 body 0 高不 shape。
+        special.push(collapsed(srcline) || math_card.is_some());
+        math_card_at.push(math_card);
         y = bottom;
     }
 
-    // Pass 2：相邻带内块合并成窗口调用物化 + shape，并把真实高度（px）写回缓存——
-    // 带外再遇此块时沿用**整形的真值高度**（标题 / 行内公式撑高行都算准了），
-    // 使带内/带外 total 完全一致 → 滚动不跳。折行代码/长段落会与「估算不折行」偏差，
-    // 缓存消除滚动跳变；代码/表格（无折行、估算同式）不入缓存。
-    let mut shaped: Vec<Option<ShapedRow>> =
-        std::iter::repeat_with(|| None).take(n).collect();
+    // Pass 2：带内非特殊块合并成窗口物化 + shape，真实高度（px）写回缓存——带外再遇
+    // 此块沿用**整形的真值高度**（标题 / 行内公式撑高行都算准了），带内/带外 total 完全
+    // 一致 → 滚动不跳。折行代码/长段落与「估算不折行」的偏差由缓存消除；代码/表格
+    // （无折行、估算同式）不入缓存。
+    let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     let mut i = 0;
     while i < n {
-        if !plan[i].shaped {
+        if !(in_band[i] && !special[i]) {
             i += 1;
             continue;
         }
         let lo = i;
-        while i < n && plan[i].shaped {
+        while i < n && in_band[i] && !special[i] {
             i += 1;
         }
         let hi = i;
         let docrows = doc.rows_in_block_window(lo, hi.saturating_sub(1));
         for (j, r) in docrows.into_iter().enumerate() {
+            let k = lo + j;
             let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
-            if let Some(k) = plan[lo + j].cache_key {
+            heights[k] = f32::from(srow.height);
+            if let Some(m) = doc.block_meta(k)
+                && matches!(m.kind,
+                    RowKind::Paragraph | RowKind::Heading(_) | RowKind::Quote | RowKind::Bullet)
+            {
+                // 真实整形高度写回缓存（覆盖估算）→ 带外沿用真值，滚动不跳。
                 editor.cache_height(k, f32::from(srow.height));
             }
-            shaped[lo + j] = Some(srow);
+            shaped.push((k, srow));
         }
     }
 
-    // Pass 3：按块序组装（真实 top 累加），带外块填占位。
-    let empty_bm: std::rc::Rc<Vec<usize>> = std::rc::Rc::new(Vec::new());
-    let mut rows: Vec<ShapedRow> = Vec::with_capacity(n);
-    let mut total = px(0.);
+    // Pass 3：按块序用**最终高度**（带内整形真值、带外缓存/估算）重算 tops，只物化带内行。
+    let mut tops: Vec<f32> = Vec::with_capacity(n);
+    let mut rows: Vec<ShapedRow> = Vec::new();
+    let mut shaped_iter = shaped.into_iter().peekable();
+    let mut total = 0f32;
     for i in 0..n {
-        let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
-            src_line: 0,
-            byte: 0,
-            kind: RowKind::Blank,
-            raw_len: 0,
-            aux: 1,
-        });
-        let srcline = meta.src_line as usize;
-        // 数学块卡片（A1）：在首源码行装配整张卡片，比整个块更高。
-        // 被折叠的行（标题/引述折叠，collapsed）不装配卡片——走下方普通 0 高占位，
-        // 否则 0 高的卡片行仍会经 `extra.card` 触发 paint_card 画出 "公式" 标签与
-        // 公式图（多个公式重叠堆在标题上方）。
-        if !collapsed(srcline) && let Some(&idx) = math_start.get(&srcline) {
-            let reg = &math_regions[idx];
-            let h = plan[i].h;
-            rows.push(build_math_card_row(reg, srcline, h, total));
+        tops.push(total);
+        let h = heights[i];
+        if !in_band[i] {
             total += h;
             continue;
         }
-        let sr = match shaped[i].take() {
-            Some(mut sr) => {
-                sr.top = total;
-                total += sr.height;
-                rows.push(sr);
-                continue;
-            }
-            None => {
-                let span = match meta.kind {
-                    RowKind::Code | RowKind::Table => meta.aux.max(1) as usize,
-                    _ => 1,
-                };
-                let src_line = meta.src_line as usize;
-                let h = plan[i].h;
-                ShapedRow {
-                    src_line,
-                    src_lines: src_line..src_line + span,
-                    wrapped: Vec::new(),
-                    sub_heights: vec![h],
-                    byte_map: empty_bm.clone(),
-                    editable: false,
-                    multi_offsets: Vec::new(),
-                    code_ranges: Vec::new(),
-                    lh: line_h,
-                    x_off: px(0.),
-                    height: h,
-                    top: total,
-                    kind: crate::markdown::doc::row_kind(meta.kind),
-                    table: None,
-                    table_edit: None,
-                    image: None,
-                    extra: RowExtra::default(),
-                }
-            }
-        };
-        total += sr.height;
-        rows.push(sr);
+        let srcline = block_src_lines[i] as usize;
+        // 数学块卡片（A1）：在首源码行装配整张卡片（折叠/0 高不装，避免画 label/图）。
+        if !collapsed(srcline)
+            && let Some(&idx) = math_card_at[i].as_ref()
+        {
+            let reg = &math_regions[idx];
+            rows.push(build_math_card_row(reg, srcline, px(h), px(total)));
+            total += h;
+            continue;
+        }
+        if shaped_iter.peek().map(|(k, _)| *k) == Some(i) {
+            let (_, mut srow) = shaped_iter.next().unwrap();
+            srow.top = px(total);
+            total += f32::from(srow.height);
+            rows.push(srow);
+        } else {
+            // 带内但未整形 = 折叠 body 0 高（不物化，无视觉范围）。
+            total += h;
+        }
     }
-    Frame { padding, line_h, rows, total, band, width, rgen, igen, mgen }
+    Frame {
+        padding,
+        line_h,
+        rows,
+        tops,
+        heights,
+        block_src_lines,
+        total: px(total),
+        band,
+        width,
+        rgen,
+        igen,
+        mgen,
+    }
 }
 
 /// 源列 → 渲染列（左界：首个 `byte_map[v] >= target`；与 `display_to_source` 互逆，
@@ -2449,13 +2452,15 @@ impl Element for WyEditorElement {
         // ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住
         // 前一行文字底部（引述第一行被第二行背景盖掉的 bug）。
         // callout 区域（marker + body 行）的左条统一用警报色，普通引述用灰条。
-        let alert_kinds = {
+        // `alert_region_kinds` 是内容纯函数 → 走 derived 缓存（滚动/每帧不重扫全篇）。
+        let derived = {
             let editor = self.editor.read(cx);
-            inline_style::alert_region_kinds(editor.content())
+            editor.derived()
         };
+        let alert_kinds = &derived.alert_region_kinds;
         for row in &f.rows {
             if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
-                paint_quote_band(origin, &theme, f, row, &alert_kinds, window);
+                paint_quote_band(origin, &theme, f, row, alert_kinds, window);
             }
         }
         for row in &f.rows {

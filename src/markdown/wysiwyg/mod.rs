@@ -206,12 +206,14 @@ pub struct WyEditor {
     shape_band: Cell<Option<(f32, f32)>>,
     /// 块「真实高度（px）」缓存（关键：带宽滚动时带外块沿用**已整形过的真值**，
     /// 而非每次回到估算——否则行高在估算/真实间跳动，滚动时文字忽大忽小）。
-    /// 键 = `(gen, src_line, kind_tag, width_bits)` 的 hash；值 = 该块整形的实际高度 px。
-    /// **必须存 px 而不是「可视行数」**：行数重建 (`para_line × n`) 只对普通段落
-    /// 成立，标题（`heading_line` + 8px pad）、行内公式撑高行（`sub_heights[0]` > lh）
-    /// 重建会矮/高不实 → 带内/带外 total 不一致 → 滚动到文档先后端反复 clamp 跳变。
-    /// 字号/主题变化会改 px 量纲 → `set_theme`/`set_font_size` 必须清此缓存。
-    height_cache: RefCell<std::collections::HashMap<u64, f32>>,
+    /// 稀疏结构：`(代, 每块高度 Option)`，代 = `height_epoch(rgen, igen, mgen, width)`；
+    /// 代或块数变 → 整表重建（估算/整形都写回这里）。**块下标即缓存键**（代内稳定），
+    /// 避免旧实现的每块 `DefaultHasher`(SipHash) 键构造 + HashMap 查找——15.9 万块
+    /// 每次重建键构造 ~200ms+（大文档滚动卡顿主因之一）。字号/主题会改 px 量纲 →
+    /// `set_theme`/`set_font_size` 把代置失效位强制重算。
+    height_cache: RefCell<(u64, Vec<Option<f32>>)>,
+    /// 内容派生扫描缓存：`(content_gen, Rc<WyDerived>)`——滚动/带移动复用，内容变更重建。
+    derived: RefCell<Option<(u64, Rc<WyDerived>)>>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
     /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
@@ -304,6 +306,28 @@ pub(crate) fn inline_math_key(latex: &str) -> SharedString {
     format!("inline:{latex}").into()
 }
 
+/// 高度缓存代：`(rgen, igen, mgen, shaping 宽)` 折成一个 u64——任一变 → 整表重算。
+/// 纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉 ~200ms）。
+pub(crate) fn height_epoch(rgen: u64, igen: u64, mgen: u64, width_bits: u32) -> u64 {
+    let a = rgen ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+    let x = a ^ b.rotate_left(32);
+    x ^ x >> 33
+}
+
+/// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `content_gen` 缓存，滚动 /
+/// 可视带移动（内容不变）直接复用 `Rc`，**不重扫全篇**——大文档每帧卡顿的主因之一
+/// （`math_regions` 7MB 全篇扫描 ~400ms、`alert_*` ~30ms，随每帧 paint / 每档 rebuild
+/// 重复执行）。
+pub(crate) struct WyDerived {
+    /// `$$…$$` 数学块区域（首源码行 → 卡片）。
+    pub math_regions: Vec<crate::markdown::inline_style::MathRegion>,
+    /// 可折叠 callout 区域 `(行区间, 是否折叠)`。
+    pub alert_fold_regions: Vec<(Range<usize>, bool)>,
+    /// 每个警报区域的 `AlertKind`（marker + body 行），paint 引述条着色用。
+    pub alert_region_kinds: std::collections::HashMap<usize, crate::markdown::recognition::AlertKind>,
+}
+
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
@@ -319,7 +343,8 @@ impl WyEditor {
             last_bounds: Cell::new(None),
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
-            height_cache: RefCell::new(std::collections::HashMap::new()),
+            height_cache: RefCell::new((u64::MAX, Vec::new())),
+            derived: RefCell::new(None),
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
@@ -347,9 +372,9 @@ impl WyEditor {
     pub fn set_theme(&mut self, theme: WyTheme) {
         self.theme = theme;
         *self.frame.borrow_mut() = None;
-        // 高度缓存存的是 px 真值，主题/字号变化量纲改变 → 必须清（否则带外沿用
+        // 高度缓存存的是 px 真值，主题/字号变化量纲改变 → 代置失效位（否则带外沿用
         // 旧字号的固定 px 高，行高与带内新字号不一致，滚动跳变）。
-        self.height_cache.borrow_mut().clear();
+        *self.height_cache.borrow_mut() = (u64::MAX, Vec::new());
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
@@ -362,7 +387,7 @@ impl WyEditor {
         self.theme.set_font_size(size);
         *self.frame.borrow_mut() = None;
         // 同 `set_theme`：字号变 → 高度缓存（px）失效。
-        self.height_cache.borrow_mut().clear();
+        *self.height_cache.borrow_mut() = (u64::MAX, Vec::new());
     }
 
     /// 设置初始内容。
@@ -963,11 +988,49 @@ impl WyEditor {
     pub(crate) fn shape_band(&self) -> Option<(f32, f32)> {
         self.shape_band.get()
     }
-    pub(crate) fn cached_height(&self, key: u64) -> Option<f32> {
-        self.height_cache.borrow().get(&key).copied()
+    pub(crate) fn cached_height(&self, block_ix: usize) -> Option<f32> {
+        self.height_cache
+            .borrow()
+            .1
+            .get(block_ix)
+            .copied()
+            .flatten()
     }
-    pub(crate) fn cache_height(&self, key: u64, height_px: f32) {
-        self.height_cache.borrow_mut().insert(key, height_px);
+    pub(crate) fn cache_height(&self, block_ix: usize, height_px: f32) {
+        let mut c = self.height_cache.borrow_mut();
+        if let Some(slot) = c.1.get_mut(block_ix) {
+            *slot = Some(height_px);
+        } else if block_ix < c.1.len() {
+            c.1[block_ix] = Some(height_px);
+        }
+    }
+    /// 确保高度缓存命中当前（代, 块数）——代或块数变则整表重建（估算/整形写回同表）。
+    pub(crate) fn height_cache_ensure(&self, n_blocks: usize, epoch: u64) {
+        let mut c = self.height_cache.borrow_mut();
+        if c.0 != epoch || c.1.len() != n_blocks {
+            c.0 = epoch;
+            c.1 = vec![None; n_blocks];
+        }
+    }
+
+    /// 内容派生扫描缓存（全篇一遍，按 `content_gen` 缓存）——`build_frame` / paint 用，
+    /// 避免滚动/每帧重复全篇扫描（大文档卡顿主因之一）。
+    pub(crate) fn derived(&self) -> Rc<WyDerived> {
+        let cgen = self.content_gen.get();
+        if let Some((g, d)) = &*self.derived.borrow() {
+            if *g == cgen {
+                return d.clone();
+            }
+        }
+        let content = self.content.as_ref();
+        let d = WyDerived {
+            math_regions: inline_style::math_regions(content),
+            alert_fold_regions: inline_style::alert_fold_regions(content),
+            alert_region_kinds: inline_style::alert_region_kinds(content),
+        };
+        let d = Rc::new(d);
+        *self.derived.borrow_mut() = Some((cgen, d.clone()));
+        d
     }
 
     /// 图片加载缓存实体（元素在 paint 里 `load` 用）。
@@ -1123,46 +1186,34 @@ impl WyEditor {
 
     /* ---------- 光标 ↔ 源辅助 ---------- */
 
-    /// 源字节偏移 → (源行, 行内字节偏移)。
+    /// 源字节偏移 → (源行, 行内字节偏移)。用 `Doc::line_starts` 二分（O(log n)），
+    /// 不再每帧线性扫整篇源文本（7MB 大文档每帧 ~100ms+）。
     pub(crate) fn row_col(&self, off: usize) -> (usize, usize) {
         let s = self.content.as_ref();
         let off = off.min(s.len());
-        let mut line = 0;
-        let mut last = 0;
-        for (i, b) in s.bytes().enumerate() {
-            if i >= off {
-                break;
-            }
-            if b == b'\n' {
-                line += 1;
-                last = i + 1;
-            }
-        }
-        (line, off - last)
+        let ls = self.doc.line_starts();
+        // 最后一个 `line_starts[i] <= off` 的行。
+        let line = ls.partition_point(|&st| st <= off).saturating_sub(1);
+        let start = ls.get(line).copied().unwrap_or(0);
+        (line, off - start)
     }
 
-    /// 源行 → 该行起始字节。
+    /// 源行 → 该行起始字节（O(log n)，`line_starts` 二分）。
     pub(crate) fn line_start(&self, line: usize) -> usize {
-        let s = self.content.as_ref();
-        let mut start = 0;
-        let mut n = 0;
-        for (i, b) in s.bytes().enumerate() {
-            if n == line {
-                return i;
-            }
-            if b == b'\n' {
-                n += 1;
-                start = i + 1;
-            }
-        }
-        start
+        self.doc
+            .line_starts()
+            .get(line)
+            .copied()
+            .unwrap_or(self.content.len())
     }
 
-    /// 源行 → 行尾字节（不含换行符）。
+    /// 源行 → 行尾字节（不含换行符；`line_starts[line+1]-1` = 行尾 `\n` 位置）。
+    /// 末行（无换行）返回内容尾。`CRLF` 下返回 `\n`（含 `\r`，与原文语义一致）。
     pub(crate) fn line_end(&self, line: usize) -> usize {
-        let start = self.line_start(line);
-        match self.content.as_ref()[start..].find('\n') {
-            Some(i) => start + i,
+        let ls = self.doc.line_starts();
+        let start = ls.get(line).copied().unwrap_or(self.content.len());
+        match ls.get(line + 1) {
+            Some(&next) => (next.saturating_sub(1)).min(self.content.len()).max(start),
             None => self.content.len(),
         }
     }

@@ -74,9 +74,10 @@ pub(crate) fn caret_geometry(
         // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
         return (true, px(12.) + r.x_off + p.x, r.top + px(text_row_shift(r)) + p.y);
     }
-    let fallback_lh = f.rows.first().map_or(px(20.), |r| r.lh);
-    let y = f.rows.last().map_or(fallback_lh, |r| r.top + r.height);
-    (true, px(12.), y)
+    // 带外（caret 所在块未物化 = 屏外）：用紧凑布局 `tops` 兜底定位，不画光标
+    // （屏外被容器裁剪）。`row_col`/`line_start` 此时查的仍是块内源码行。
+    let ctop = px(f.src_line_top(cl));
+    (true, px(12.), ctop)
 }
 
 

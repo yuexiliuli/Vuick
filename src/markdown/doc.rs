@@ -142,6 +142,12 @@ impl Doc {
         self.index.blocks.len()
     }
 
+    /// 每行起始字节偏移（`split('\n')` 语义，长度 = 行数）——`row_col`/`line_start`/
+    /// `line_end` 的 O(log n) 二分索引（替代每帧对整篇源文本的线性扫描）。
+    pub(crate) fn line_starts(&self) -> &[usize] {
+        &self.line_starts
+    }
+
     /// 第 `i` 块的轻量元数据（`BlockMeta`，≈20B，O(段数)）——窗口化 shaping 的
     /// 块高估算/带内判定只依赖它，**不物化行**。
     pub(crate) fn block_meta(&self, i: usize) -> Option<BlockMeta> {
