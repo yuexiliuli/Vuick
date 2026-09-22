@@ -1863,9 +1863,20 @@ pub fn scan_blocks_incremental_rope(
         prev.blocks.len()
     };
     let region_end = if pi < prev.blocks.len() {
-        // 第一条旧块边界 ≥ 尾部起点 → 新坐标行首即对齐点；夹紧到 [anchor_byte, new_len]
-        ((prev.blocks.at(pi).byte as i64 + delta).max(anchor_byte as i64)).min(new_len as i64)
-            as usize
+        // 变化区可能跨过围栏/表格边界使「首条旧块边界」与其后内容发生合并/分裂漂移，
+        // 直接把尾部对齐点定在这条边界上常命中不了（然后全量回退——6MB 文档
+        // `scan_blocks_rope` debug ~620ms）。向后放宽若干旧块边界做对齐检测区：
+        // 扫描经过的旧块边界越多，命中「编辑后仍存在的旧块边界」概率越高，把
+        // 全量回退变成小区域增量。放宽窗口外的尾部仍按字节精确对齐拼接。
+        let lo = (pi + 16).min(prev.blocks.len());
+        if lo < prev.blocks.len() {
+            // 对齐检测区终点的旧块边界（新坐标行首）
+            ((prev.blocks.at(lo).byte as i64 + delta).max(anchor_byte as i64))
+                .min(new_len as i64) as usize
+        } else {
+            // 尾部不足 16 条边界 → 直接放宽到文末，由扫描自行收尾（不复用也无回退）。
+            new_len
+        }
     } else {
         // 尾部没有可用块边界 → 扫到文末（不复用，等价全量重扫）
         new_len
