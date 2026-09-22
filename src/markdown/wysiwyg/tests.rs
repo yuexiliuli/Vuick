@@ -591,18 +591,18 @@ let c = 3;
             ed.update(cx, |e, cx| {
                 e.set_caret("你好".len());
                 e.replace_and_mark_utf16(None, "n", None, cx);
-                assert_eq!(e.content.as_ref(), "你好n", "组合首键插在光标后");
+                assert_eq!(e.text().as_ref(), "你好n", "组合首键插在光标后");
                 e.replace_and_mark_utf16(None, "ni", None, cx);
-                assert_eq!(e.content.as_ref(), "你好ni", "组合更新应替换旧 marked，不得残留 n");
+                assert_eq!(e.text().as_ref(), "你好ni", "组合更新应替换旧 marked，不得残留 n");
                 e.replace_and_mark_utf16(None, "nih", None, cx);
-                assert_eq!(e.content.as_ref(), "你好nih", "再次更新仍替换");
+                assert_eq!(e.text().as_ref(), "你好nih", "再次更新仍替换");
                 // 提交：`replace_text_utf16(None)` 落在 marked 上并清掉 marked。
                 e.replace_text_utf16(None, "你好", cx);
-                assert_eq!(e.content.as_ref(), "你好你好", "提交文本替换组合占位，不重复");
+                assert_eq!(e.text().as_ref(), "你好你好", "提交文本替换组合占位，不重复");
                 // 新组合不得再把“已提交中文”当旧 marked 替换。
                 e.replace_and_mark_utf16(None, "n", None, cx);
                 e.replace_and_mark_utf16(None, "ni", None, cx);
-                assert_eq!(e.content.as_ref(), "你好你好ni", "新组合不重复旧提交");
+                assert_eq!(e.text().as_ref(), "你好你好ni", "新组合不重复旧提交");
             });
         });
     }
@@ -622,7 +622,7 @@ let c = 3;
                 // AppKit setMarkedText 的 selectedRange 是**相对组合文本**的偏移，
                 // 不是文档绝对偏移——光标应落在偏移 1（“好”前），而非文档开头。
                 e.replace_and_mark_utf16(None, "你好", Some(1..2), cx);
-                assert_eq!(e.content.as_ref(), "你好abc", "无选区时组合插入光标处");
+                assert_eq!(e.text().as_ref(), "你好abc", "无选区时组合插入光标处");
                 assert_eq!(
                     e.caret(),
                     3,
@@ -648,13 +648,13 @@ let c = 3;
                 assert_eq!(e.selection(), Some(0.."一二三".len()), "拖选得源字节区间");
                 // 输入/删除应作用于选区。
                 e.backspace(cx);
-                assert_eq!(e.content.as_ref(), "五六", "Backspace 应删除整段选区");
+                assert_eq!(e.text().as_ref(), "五六", "Backspace 应删除整段选区");
                 assert_eq!(e.selection(), None);
                 // 全选 + 范围替换。
                 e.select_all();
                 assert_eq!(e.selection(), Some(0.."五六".len()));
                 e.replace_range(e.selection().unwrap(), "你", cx);
-                assert_eq!(e.content.as_ref(), "你", "全选范围替换");
+                assert_eq!(e.text().as_ref(), "你", "全选范围替换");
             });
         });
     }
@@ -679,15 +679,15 @@ let c = 3;
             assert!(quote.editable, "引述应可编辑（byte_map 非空）");
             assert!(f32::from(quote.x_off) > 0., "引述应有文本缩进");
             // 在引述渲染文本内落点 → 源字节在 “引用内容” 上，可正常输入。
-            let off = ed.read(cx).content.as_ref().find("引").unwrap();
+            let off = ed.read(cx).text().as_ref().find("引").unwrap();
             ed.update(cx, |e, cx| {
                 e.set_caret(off + 3);
                 e.replace_range(off + 3..off + 6, "X", cx);
             });
             assert!(
-                ed.read(cx).content.as_ref().contains("引X"),
+                ed.read(cx).text().as_ref().contains("引X"),
                 "引述行应可编辑：{}",
-                ed.read(cx).content.as_ref()
+                ed.read(cx).text().as_ref()
             );
         });
     }
@@ -732,7 +732,7 @@ let c = 333;
                 let ls = ed.read(cx).line_start(line);
                 let le = ed.read(cx).line_end(line);
                 assert_eq!(
-                    &ed.read(cx).content.as_ref()[ls..le],
+                    &ed.read(cx).text().as_ref()[ls..le],
                     expects,
                     "命中文本应为该行内容"
                 );
@@ -1401,14 +1401,14 @@ tail
                 e.set_caret(ls + 4);
                 e.replace_range(e.caret()..e.caret(), "X", cx);
                 assert!(
-                    e.content.as_ref().starts_with("```rust\nlet Xa = 1;"),
+                    e.text().as_ref().starts_with("```rust\nlet Xa = 1;"),
                     "围栏内输入生效：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 // 退格删去 X（插入后光标已在 X 之后）。
                 e.backspace(cx);
                 assert_eq!(
-                    &e.content.as_ref()[ls..ls + 9],
+                    &e.text().as_ref()[ls..ls + 9],
                     "let a = 1",
                     "退格删回原位，围栏未损坏"
                 );
@@ -1417,25 +1417,25 @@ tail
                 e.set_caret(e2);
                 e.delete(cx);
                 assert!(
-                    e.content.as_ref().contains("let b = 2;\n```"),
+                    e.text().as_ref().contains("let b = 2;\n```"),
                     "末内容行行尾删除应被守卫（闭合围栏不被吃掉）：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 let e2 = e.line_end(2);
                 e.set_caret(e2);
                 e.newline(cx);
                 assert!(
-                    e.content.as_ref().contains("let b = 2;\n\n```"),
+                    e.text().as_ref().contains("let b = 2;\n\n```"),
                     "回车应在闭合围栏前新起一代码行：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 // 首内容行行首退格是 no-op（保护开围栏）。
                 e.set_caret(e.line_start(1));
                 e.backspace(cx);
                 assert!(
-                    e.content.as_ref().starts_with("```rust\n"),
+                    e.text().as_ref().starts_with("```rust\n"),
                     "首内容行行首退格应被守卫（开围栏不被吃掉）：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
             });
         });
@@ -1618,7 +1618,7 @@ tail
                 let y = top + table_row_top(t, row_ix) + rh / 2.;
                 let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 1.;
                 let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
-                let c = ed.read(cx).content.as_ref()[off..]
+                let c = ed.read(cx).text().as_ref()[off..]
                     .chars()
                     .next()
                     .unwrap_or('_');
@@ -1693,36 +1693,36 @@ tail
                 e.set_caret(ls + 2);
                 e.replace_range(e.caret()..e.caret(), "X", cx);
                 assert!(
-                    e.content.as_ref().contains("| Xa | b |"),
+                    e.text().as_ref().contains("| Xa | b |"),
                     "格内输入生效：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 // 退格在格内容起点（'X'）→ no-op（守卫 `| ` 不被吃掉）。
                 e.set_caret(ls + 2);
                 e.backspace(cx);
                 assert!(
-                    e.content.as_ref().contains("| Xa | b |"),
+                    e.text().as_ref().contains("| Xa | b |"),
                     "格起点退格应被守卫：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 // 删除在格内容尾 → no-op（守卫 `|` 不被吃掉）。
                 let ls2 = e.line_start(2);
                 e.set_caret(ls2 + 4);
                 e.delete(cx);
                 assert!(
-                    e.content.as_ref().contains("| Xa | b |"),
+                    e.text().as_ref().contains("| Xa | b |"),
                     "格内容尾删除应被守卫：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
                 // 表格内回车 → no-op（不拆表）。
-                let before = e.content.as_ref().to_string();
+                let before = e.text().as_ref().to_string();
                 e.set_caret(ls2 + 3);
                 e.newline(cx);
                 assert_eq!(
-                    e.content.as_ref(),
+                    e.text().as_ref(),
                     &before,
                     "表格内回车应 no-op：{}",
-                    e.content.as_ref()
+                    e.text().as_ref()
                 );
             });
         });
@@ -2317,7 +2317,7 @@ graph TD
                 .filter(|r| r.kind == IrKind::Quote && r.src_line >= 1 && r.src_line <= 2)
                 .collect();
             assert_eq!(bodies.len(), 2, "callout body 行应存在");
-            let kinds = inline_style::alert_region_kinds(ed.read(cx).content());
+            let kinds = inline_style::alert_region_kinds(&ed.read(cx).content());
             for b in &bodies {
                 assert_eq!(
                     kinds.get(&b.src_line),
@@ -3377,6 +3377,65 @@ A-->B
         });
     }
 
+    /// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
+    /// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
+    /// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
+    #[gpui::test]
+    #[ignore]
+    fn bench_frame_str_vs_rope(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+        let mut text = String::new();
+        while text.len() < 6_000_000 {
+            text.push_str(para);
+        }
+        let ref_text = text.clone();
+        for band_h in [200f32, 900., 4000., 40_000.] {
+            // ── Str 对照：全新（未编辑）编辑器。
+            let (host_s, vcx_s) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
+                WyHost { ed }
+            });
+            let vcx_s: &mut VisualTestContext = vcx_s;
+            let mut ts = 0u128;
+            vcx_s.update(|window, cx: &mut App| {
+                for k in 0..6 {
+                    let band = (k as f32 * 20., k as f32 * 20. + band_h);
+                    let t0 = std::time::Instant::now();
+                    let f = build_frame(host_s.read(cx).ed.read(cx), window, px(1200.), band);
+                    let _ = f.total;
+                    ts += t0.elapsed().as_millis();
+                }
+            });
+            // ── Rope：同一文本，编辑一次 → 转 Rope 源。
+            let (host_r, vcx_r) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
+                WyHost { ed }
+            });
+            let vcx_r: &mut VisualTestContext = vcx_r;
+            let mut tr = 0u128;
+            vcx_r.update(|window, cx: &mut App| {
+                let ed = host_r.read(cx).ed.clone();
+                let at = ed.read(cx).text().as_ref().find("one two three").unwrap() + 4;
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
+                for k in 0..6 {
+                    let band = (k as f32 * 20., k as f32 * 20. + band_h);
+                    let t0 = std::time::Instant::now();
+                    let f = build_frame(ed.read(cx), window, px(1200.), band);
+                    let _ = f.total;
+                    tr += t0.elapsed().as_millis();
+                }
+            });
+            eprintln!(
+                "[bench] plain-6MB band_h={band_h}: Str {:.2}ms vs Rope {:.2}ms",
+                ts as f64 / 6.,
+                tr as f64 / 6.
+            );
+        }
+    }
+
     /// 手动性能基准：量化 A1「命中先行」的收益——缓存预热后**同带缓存重建**（只物化
     /// miss / caret 块）对比旧行为的「整带 `rows_in_block_window` 物化」单次成本
     /// （旧实现每帧/每带重建都先付整带物化再查缓存）。
@@ -3613,19 +3672,16 @@ A-->B
                 t += t0.elapsed().as_millis();
             }
             eprintln!("[bench] (b) SharedString::from(String): {:.2}ms", t as f64 / 20.);
-            // (c) Doc::reopen。
+            // (c) Doc::edit（原地 rope 编辑，替代旧 `reopen` 的整串拼接+重建）。
             let mut t = 0u128;
             let s_ss = ed.read(cx).text();
             let mut doc = crate::markdown::doc::Doc::open(s_ss.clone());
-            let mut buf = String::from(&*s_ss);
             for _ in 0..20 {
-                buf.replace_range(r.clone(), "x");
-                let ss = gpui::SharedString::from(buf.clone());
                 let t0 = std::time::Instant::now();
-                doc.reopen(&ss, s.len(), r.clone(), 1);
+                doc.edit(r.clone(), "x");
                 t += t0.elapsed().as_millis();
             }
-            eprintln!("[bench] (c) Doc::reopen: {:.2}ms", t as f64 / 20.);
+            eprintln!("[bench] (c) Doc::edit incremental: {:.2}ms", t as f64 / 20.);
             // (e) 新零拷贝路径：String → Box<str> → Arc<str> → SharedString。
             let mut t = 0u128;
             for _ in 0..20 {
@@ -3642,11 +3698,8 @@ A-->B
             // (f) rebuild_block_regions（replace_range 每键 O(块数) 扫描）。
             let mut t = 0u128;
             let mut doc2 = crate::markdown::doc::Doc::open(s_ss.clone());
-            let mut buf2 = String::from(&*s_ss);
             for _ in 0..20 {
-                buf2.replace_range(r.clone(), "x");
-                let ss = gpui::SharedString::from(buf2.clone());
-                doc2.reopen(&ss, s.len(), r.clone(), 1);
+                doc2.edit(r.clone(), "x");
                 let n = doc2.block_count();
                 let t0 = std::time::Instant::now();
                 let mut regions: usize = 0;

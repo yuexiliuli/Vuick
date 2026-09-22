@@ -40,6 +40,7 @@ use super::doc::Doc;
 use crate::markdown::recognition::{self, LinkHit};
 use crate::markdown::inline_style;
 use crate::markdown::view::style::StyleParams;
+use gpui_component::input::Rope;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, PartialEq, Debug)]
@@ -180,16 +181,16 @@ fn caret_vis() -> CaretVis {
     CARET_VIS.with(|c| c.get())
 }
 
-/// 撤销/重做快照（整份源文本 + 光标）。
+/// 撤销/重做快照：**rope COW 共享底树**（O(log n)）+ 光标——不再每键驻留整份全文
+/// （旧实现 200 深最坏驻留 200×6MB）；历史由 rope 结构共享，编辑仅在分叉处分摊成本。
 #[derive(Clone)]
 struct Snapshot {
-    text: SharedString,
+    text: Rope,
     caret: usize,
 }
 
-/// 项目管线的所见即所得编辑器：`Doc` 为唯一数据源，`caret` 是**源字节偏移**。
+/// 项目管线的所见即所得编辑器：`Doc`（内部 rope）为唯一数据源，`caret` 是**源字节偏移**。
 pub struct WyEditor {
-    content: SharedString,
     doc: Doc,
     focus: FocusHandle,
     caret: usize,
@@ -500,7 +501,6 @@ impl WyEditor {
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
         let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
         Self {
-            content: SharedString::default(),
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
             caret: 0,
@@ -577,9 +577,9 @@ impl WyEditor {
         self
     }
 
-    /// 当前完整源文本（宿主写回用）。
+    /// 当前完整源文本（宿主写回用；rope 单真源派生）。
     pub fn text(&self) -> SharedString {
-        self.content.clone()
+        self.doc.text_shared()
     }
 
     /// 聚焦句柄（元素命中/宿主聚焦用）。
@@ -587,13 +587,14 @@ impl WyEditor {
         self.focus.clone()
     }
 
-    /// 覆盖源并重建文档模型。
-    pub     fn set_source_text(&mut self, text: &str) {
-        self.content = SharedString::from(text);
-        self.doc = Doc::open(self.content.clone());
+    /// 覆盖源并重建文档模型（load 路径：一次性 O(n)）。rope COW 为唯一源，不再旁挂
+    /// 一份 `content` SharedString（每键整串复制的旧成本由此消掉）。
+    pub fn set_source_text(&mut self, text: &str) {
+        let ss = SharedString::from(text);
+        self.doc = Doc::open(ss);
         self.rebuild_block_regions();
         self.preseed_image_sizes();
-        self.caret = self.caret.min(self.content.len());
+        self.caret = self.caret.min(self.doc.len());
         self.undo_stack.clear();
         self.redo_stack.clear();
         *self.frame.borrow_mut() = None;
@@ -698,9 +699,14 @@ impl WyEditor {
         }
     }
 
-    /// 内部数据（元素读取）。
-    pub(crate) fn content(&self) -> &str {
-        self.content.as_ref()
+    /// （仅测试）整篇源文本（O(n) 复制）。产线元素访问一律走 [`Self::line_text`] / doc。
+    #[cfg(test)]
+    pub(crate) fn content(&self) -> String {
+        self.doc.text_shared().to_string()
+    }
+    /// 第 `line` 行的源码文本（O(行长)；`line_str` 同源）。
+    pub(crate) fn line_text(&self, line: usize) -> String {
+        self.doc.line_str(line)
     }
     pub(crate) fn doc(&self) -> &Doc {
         &self.doc
@@ -708,10 +714,14 @@ impl WyEditor {
     pub(crate) fn caret(&self) -> usize {
         self.caret
     }
+    /// 全文字节长（O(1)，rope 单真源）。
+    pub(crate) fn len(&self) -> usize {
+        self.doc.len()
+    }
 
     /// 直接放置光标（源字节偏移）。命中/测试/编程式定位共用。
     pub(crate) fn set_caret(&mut self, off: usize) {
-        self.caret = off.min(self.content.len());
+        self.caret = off.min(self.len());
         self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
     }
@@ -722,8 +732,8 @@ impl WyEditor {
     pub(crate) fn selection(&self) -> Option<Range<usize>> {
         match self.sel_anchor {
             Some(a) if a != self.caret => {
-                let s = a.min(self.caret).min(self.content.len());
-                let e = a.max(self.caret).min(self.content.len());
+                let s = a.min(self.caret).min(self.len());
+                let e = a.max(self.caret).min(self.len());
                 if s < e {
                     Some(s..e)
                 } else {
@@ -737,13 +747,13 @@ impl WyEditor {
     /// 选中的源文本（复制/Ctrl+C）。
     fn selected_text(&self) -> String {
         self.selection()
-            .map(|r| self.content.as_ref()[r].to_string())
+            .map(|r| self.doc.slice_str(r))
             .unwrap_or_default()
     }
 
     /// 鼠标按下：锚点 = 光标处（开始拖选）。
     pub(crate) fn begin_selection_at(&mut self, off: usize) {
-        let off = off.min(self.content.len());
+        let off = off.min(self.len());
         self.caret = off;
         self.sel_anchor = Some(off);
         self.dragging = true;
@@ -755,7 +765,7 @@ impl WyEditor {
         if !self.dragging {
             return;
         }
-        let off = off.min(self.content.len());
+        let off = off.min(self.len());
         self.caret = off;
         if self.sel_anchor.is_none() {
             self.sel_anchor = Some(off);
@@ -776,7 +786,7 @@ impl WyEditor {
     /// 全选。
     pub(crate) fn select_all(&mut self) {
         self.sel_anchor = Some(0);
-        self.caret = self.content.len();
+        self.caret = self.len();
         *self.frame.borrow_mut() = None;
     }
 
@@ -814,7 +824,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         let r = match range {
-            Some(r) => range_from_utf16(self.content.as_ref(), r),
+            Some(r) => range_from_utf16(self.doc.text_shared().as_ref(), r),
             None => self
                 .marked
                 .clone()
@@ -835,7 +845,7 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         let byte_range = match range {
-            Some(r) => range_from_utf16(self.content.as_ref(), r),
+            Some(r) => range_from_utf16(self.doc.text_shared().as_ref(), r),
             None => self
                 .marked
                 .clone()
@@ -845,10 +855,12 @@ impl WyEditor {
         if new_text.is_empty() {
             // 组合被取消：清掉 marked，光标回组合起点。
             self.marked = None;
-            self.caret = byte_range.start.min(self.content.len());
+            self.caret = byte_range.start.min(self.len());
         } else {
             self.marked = Some(
-                byte_range.start..byte_range.start + new_text.len().min(self.content.len() - byte_range.start),
+                byte_range.start
+                    ..byte_range.start
+                        + new_text.len().min(self.len() - byte_range.start),
             );
             // `new_selected_range` 是**相对 new_text 起点**的 UTF-16 偏移，不是文档
             // 绝对偏移（AppKit setMarkedText 的 selectedRange 语义）。
@@ -856,7 +868,7 @@ impl WyEditor {
                 Some(sel) => byte_range.start + offset_from_utf16(new_text, sel.start).min(new_text.len()),
                 None => byte_range.start + new_text.len(),
             };
-            self.caret = caret.min(self.content.len());
+            self.caret = caret.min(self.len());
         }
         cx.notify();
     }
@@ -1270,7 +1282,6 @@ impl WyEditor {
                 return p.clone();
             }
         }
-        let content = self.content.as_ref();
         let derived = self.derived();
         {
             let d = derived.borrow();
@@ -1292,11 +1303,13 @@ impl WyEditor {
                 fold_bodies.push(rnge.clone());
                 fold_lines.extend(rnge.start + 1..rnge.end);
             }
-            // 标题折叠（视图本地状态）。
+            // 标题折叠（视图本地状态）——仅在有折叠态时才需要全文扫描（纯文本/未折叠
+            // 时跳过 `text_shared` 的 O(n) 复制）。
             {
                 let folded = self.folded_headings.borrow();
                 if !folded.is_empty() {
-                    for rnge in inline_style::heading_fold_regions(content, &folded) {
+                    let content = self.doc.text_shared();
+                    for rnge in inline_style::heading_fold_regions(&content, &folded) {
                         fold_bodies.push(rnge.clone());
                         fold_lines.extend(rnge.start + 1..rnge.end);
                     }
@@ -1423,11 +1436,11 @@ impl WyEditor {
                 return d.clone();
             }
         }
-        let content = self.content.as_ref();
+        let content = self.doc.text_shared();
         // 警报区域单遍扫描，两个公开查询由它派生（旧实现 `alert_fold_regions` +
         // `alert_region_kinds` 各扫一遍全篇——重复 O(n)）。
         let alerts = if self.alert_marker_cnt.get() > 0 {
-            inline_style::alert_regions(content)
+            inline_style::alert_regions(&content)
         } else {
             Vec::new()
         };
@@ -1443,7 +1456,7 @@ impl WyEditor {
         }
         let d = Rc::new(RefCell::new(WyDerived {
             math_regions: if self.math_dollar_cnt.get() > 0 {
-                inline_style::math_regions(content)
+                inline_style::math_regions(&content)
             } else {
                 Vec::new()
             },
@@ -1610,8 +1623,7 @@ impl WyEditor {
     /// 源字节偏移 → (源行, 行内字节偏移)。用 `Doc::line_starts` 二分（O(log n)），
     /// 不再每帧线性扫整篇源文本（7MB 大文档每帧 ~100ms+）。
     pub(crate) fn row_col(&self, off: usize) -> (usize, usize) {
-        let s = self.content.as_ref();
-        let off = off.min(s.len());
+        let off = off.min(self.len());
         let ls = self.doc.line_starts();
         // 最后一个 `line_starts[i] <= off` 的行。
         let line = ls.partition_point(|&st| st <= off).saturating_sub(1);
@@ -1625,17 +1637,17 @@ impl WyEditor {
             .line_starts()
             .get(line)
             .copied()
-            .unwrap_or(self.content.len())
+            .unwrap_or(self.len())
     }
 
     /// 源行 → 行尾字节（不含换行符；`line_starts[line+1]-1` = 行尾 `\n` 位置）。
     /// 末行（无换行）返回内容尾。`CRLF` 下返回 `\n`（含 `\r`，与原文语义一致）。
     pub(crate) fn line_end(&self, line: usize) -> usize {
         let ls = self.doc.line_starts();
-        let start = ls.get(line).copied().unwrap_or(self.content.len());
+        let start = ls.get(line).copied().unwrap_or(self.len());
         match ls.get(line + 1) {
-            Some(&next) => (next.saturating_sub(1)).min(self.content.len()).max(start),
-            None => self.content.len(),
+            Some(&next) => (next.saturating_sub(1)).min(self.len()).max(start),
+            None => self.len(),
         }
     }
 
@@ -1644,7 +1656,7 @@ impl WyEditor {
         use crate::markdown::parser::RowKind;
         let start = self.line_start(line);
         let end = self.line_end(line);
-        let raw = &self.content.as_ref()[start..end];
+        let raw = self.doc.slice_str(start..end);
         let t = raw.trim_start();
         if t.is_empty() {
             RowKind::Blank
@@ -1679,8 +1691,8 @@ impl WyEditor {
         if self.in_block_content(line) {
             return Some((0, end - start));
         }
-        let raw = &self.content.as_ref()[start..end];
-        let seg = crate::markdown::parser::text_segment(raw, self.kind_for_line(line))?;
+        let raw = self.doc.slice_str(start..end);
+        let seg = crate::markdown::parser::text_segment(&raw, self.kind_for_line(line))?;
         Some((seg.0, raw.len()))
     }
 
@@ -1744,8 +1756,8 @@ impl WyEditor {
         if !matches!(self.region_content(line), Some(BlockRegion::Table { .. })) {
             return None;
         }
-        let raw = &self.content.as_ref()[self.line_start(line)..self.line_end(line)];
-        let cells = crate::markdown::parser::split_table_cells_mapped(raw);
+        let raw = self.line_text(line);
+        let cells = crate::markdown::parser::split_table_cells_mapped(&raw);
         if cells.is_empty() {
             return None;
         }
@@ -1782,7 +1794,7 @@ impl WyEditor {
 
     /// 从 `line` 向上找第一个**非围栏**行（可含当前行；跳过连续围栏行）。
     fn next_render_line(&self, line: usize) -> usize {
-        let total = self.content.as_ref().matches('\n').count() + 1;
+        let total = self.doc.line_starts().len();
         let mut l = line;
         while l + 1 < total && self.is_fence_line(l) {
             l += 1;
@@ -1797,39 +1809,27 @@ impl WyEditor {
     /// **所有编辑**（输入/剪贴板/退格/任务框翻转/警报折叠）都从这里过——每笔真实
     /// 内容变更先记入撤销栈（D1）。
     pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
-        let s = self.content.as_ref();
-        let r = range.start.min(s.len())..range.end.min(s.len());
+        let len = self.len();
+        let r = range.start.min(len)..range.end.min(len);
         if r.start == r.end && text.is_empty() {
             return;
         }
-        self.undo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+        // 撤销快照：rope COW（O(log n) 共享底树），不再每键驻留整份全文（旧 200 深
+        // 最坏 200×6MB）。
+        self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
         if self.undo_stack.len() > 200 {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
-        let prev_len = s.len();
-        let mut next = String::with_capacity(prev_len - r.len() + text.len());
-        next.push_str(&s[..r.start]);
-        next.push_str(text);
-        next.push_str(&s[r.end..]);
-        // 零拷贝转 SharedString：`String → into_boxed_str → Arc<str>` 复用缓冲区
-        // （不新分配/不 memcpy），SmolStr 对长串直接包 Arc——6MB 文档每次键省掉
-        // 一次整串复制（旧 `SharedString::from(String)` 会再拷一份，debug ~5-6ms）。
-        let next_ss = SharedString::from(Arc::<str>::from(next.into_boxed_str()));
-        // 增量重建 Doc：rope COW 编辑 + `scan_blocks_incremental_rope`（mid-line 插入
-        // ~0.3ms）+ 增量行起始——替代旧 `Doc::open`（scan_blocks+build_ir+行表 ~2s /
-        // 键，7MB 大文档「一编辑就卡死」的根因）。结构性变更自动回退（仍只一次，
-        // 且已省掉 build_ir 的 ~800ms）。
-        // 同时按「是否结构性」更新基础布局：非结构性编辑 → `struct_ver` 不变、记
-        // 待修补块（build_frame 只对该块 Fenwick 点更新高度，省掉整篇重估 ~400ms）；
-        // 结构性（跨行/代码表格/围栏破坏块序）→ `struct_ver` 递增 → 整篇重建。
+        // 原地 rope 编辑（`Doc::edit`：COW remove+insert + 增量块扫描 + 增量行起始）——
+        // 不再每键拼一份 6MB 整串再分配/复制（旧 `next` String + Arc 包装是 6MB 文档
+        // ~5-6ms/键的根因）；`content` 字段随之取消，rope 为唯一真源。
         let edit_line = self.row_col(r.start).0;
         // 编辑前该行内容（region 签名对比用；非结构性编辑行边界不变）。
-        let old_line = {
-            let ls = self.line_start(edit_line);
-            let le = self.line_end(edit_line).max(ls).min(s.len());
-            s[ls..le].to_string()
-        };
+        let old_line = self.doc.line_str(edit_line);
+        // 编辑前被替换区间（cross_newline / 标记计数用；O(被删长)）。
+        let removed = self.doc.slice_str(r.clone());
+        let inserted_len = text.len();
         let prev_count = self.doc.block_count();
         let in_code_table = {
             let blk = self.doc.block_index_for_line(edit_line);
@@ -1839,12 +1839,8 @@ impl WyEditor {
                     | Some(crate::markdown::parser::RowKind::Table)
             )
         };
-        let r_old = r.clone();
-        let inserted_len = text.len();
-        // 只 build 一次新缓冲：`reopen` 与 `self.content` 共享（免 6.4MB 再拷一次/键）。
-        self.doc.reopen(&next_ss, prev_len, r_old, inserted_len);
-        let cross_newline =
-            text.contains('\n') || s[r.start..r.end].contains('\n') || text.contains('\r');
+        self.doc.edit(r.clone(), text);
+        let cross_newline = text.contains('\n') || removed.contains('\n') || text.contains('\r');
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
         let count_same = self.doc.block_count() == prev_count;
         let structural = cross_newline || in_code_table || breaks_fence || !count_same;
@@ -1860,7 +1856,6 @@ impl WyEditor {
             // 该块内容变了但 `epoch` 不变 → 必须显式作废其整形缓存（否则复用旧图）。
             self.shape_rows.borrow_mut().invalidate(&[blk]);
         }
-        let removed = &s[r.start..r.end];
         self.math_dollar_cnt.set(
             self.math_dollar_cnt.get()
                 + text.bytes().filter(|&b| b == b'$').count()
@@ -1869,7 +1864,6 @@ impl WyEditor {
         self.alert_marker_cnt.set(
             self.alert_marker_cnt.get() + text.matches("[!").count() - removed.matches("[!").count(),
         );
-        self.content = next_ss;
 
         // —— 内容派生（derived）的增量判定（详见 `region_line_sig`）——
         // 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`
@@ -1929,7 +1923,7 @@ impl WyEditor {
             }
         }
 
-        self.caret = (r.start + text.len()).min(self.content.len());
+        self.caret = (r.start + inserted_len).min(self.len());
         self.sel_anchor = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
@@ -1947,7 +1941,7 @@ impl WyEditor {
     pub(crate) fn toggle_alert_fold_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
         let start = self.line_start(line);
         let end = self.line_end(line).max(start);
-        let raw = self.content.as_ref()[start..end].to_string();
+        let raw = self.doc.slice_str(start..end);
         if let Some((at, cur)) = recognition::alert_fold_char(&raw) {
             let range = start + at..start + at + 1;
             let repl = if cur { "+" } else { "-" };
@@ -1963,7 +1957,7 @@ impl WyEditor {
     pub(crate) fn toggle_heading_fold_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
         let start = self.line_start(line);
         let end = self.line_end(line).max(start);
-        let key = self.content.as_ref()[start..end].trim().to_string();
+        let key = self.doc.slice_str(start..end).trim().to_string();
         if key.is_empty() {
             return;
         }
@@ -1972,7 +1966,7 @@ impl WyEditor {
             // 折叠前：光标若在 section body 内，先移到标题行末（否则 body 有光标被 reveal）。
             let single = std::collections::HashSet::from([key.clone()]);
             let crow = self.row_col(self.caret()).0;
-            if inline_style::heading_fold_regions(&self.content, &single)
+            if inline_style::heading_fold_regions(&self.doc.text_shared(), &single)
                 .iter()
                 .any(|r| crow > r.start && crow < r.end)
             {
@@ -1997,7 +1991,7 @@ impl WyEditor {
     pub(crate) fn toggle_checkbox_at_line(&mut self, line: usize, cx: &mut Context<Self>) {
         let start = self.line_start(line);
         let end = self.line_end(line).max(start);
-        let raw = self.content.as_ref()[start..end].to_string();
+        let raw = self.doc.slice_str(start..end);
         if let Some(new_line) = inline_style::toggle_task_checkbox(&raw) {
             self.apply_edit(start..end, &new_line, cx);
         }
@@ -2025,7 +2019,7 @@ impl WyEditor {
     /// 撤销（D1）：弹出上一状态恢复；被撤销的状态进重做栈。
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = self.undo_stack.pop() {
-            self.redo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+            self.redo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
             self.restore_snapshot(s, cx);
         }
     }
@@ -2033,24 +2027,24 @@ impl WyEditor {
     /// 重做（D1）。
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = self.redo_stack.pop() {
-            self.undo_stack.push(Snapshot { text: self.content.clone(), caret: self.caret });
+            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
             self.restore_snapshot(s, cx);
         }
     }
 
     /// 恢复快照：重建模型 + 光标，通知宿主内容已变（返回 Changed，供镜像保存）。
     fn restore_snapshot(&mut self, s: Snapshot, cx: &mut Context<Self>) {
-        self.content = s.text;
-        self.doc = Doc::open(self.content.clone());
+        self.doc = Doc::open_rope(s.text);
         self.rebuild_block_regions();
-        self.caret = s.caret.min(self.content.len());
+        self.caret = s.caret.min(self.doc.len());
         self.sel_anchor = None;
         self.marked = None;
         *self.frame.borrow_mut() = None;
         // 快照是全新内容：标记计数 / 派生版本 / 基础布局全量失效（与 `set_source_text`
         // 同款；旧实现漏刷新这些，撤销到不同结构文档会命中陈旧派生/布局）。
-        self.math_dollar_cnt.set(self.content.as_ref().bytes().filter(|&b| b == b'$').count());
-        self.alert_marker_cnt.set(self.content.matches("[!").count());
+        let full = self.doc.text_shared();
+        self.math_dollar_cnt.set(full.as_ref().bytes().filter(|&b| b == b'$').count());
+        self.alert_marker_cnt.set(full.matches("[!").count());
         self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;
@@ -2066,8 +2060,7 @@ impl WyEditor {
         if let Some(range) = self.selection() {
             return self.replace_range(range, "", cx);
         }
-        let s = self.content.as_ref();
-        let at = self.caret.min(s.len());
+        let at = self.caret.min(self.len());
         if at == 0 {
             return;
         }
@@ -2077,8 +2070,9 @@ impl WyEditor {
         if self.backspace_blocked(bl, bcol) {
             return;
         }
-        let start = s[..at].char_indices().last().map(|(i, _)| i).unwrap_or(0);
-        self.replace_range(start..at, "", cx);
+        // 上一字符起点（rope char boundary 回溯，O(chars)，不复制前缀整串）。
+        let prev = self.doc.rope().floor_char_boundary(at - 1);
+        self.replace_range(prev..at, "", cx);
     }
 
     /// 退格是否被边界守卫拦截（代码首内容行行首 / 表格单元格内容起点）。
@@ -2096,9 +2090,8 @@ impl WyEditor {
         if let Some(range) = self.selection() {
             return self.replace_range(range, "", cx);
         }
-        let s = self.content.as_ref();
-        let at = self.caret.min(s.len());
-        if at >= s.len() {
+        let at = self.caret.min(self.len());
+        if at >= self.len() {
             return;
         }
         // 围栏/单元格边界守卫：删除不得删到代码块末内容行行尾（会把闭合围栏并进
@@ -2107,7 +2100,8 @@ impl WyEditor {
         if self.delete_blocked(dl, dcol) {
             return;
         }
-        let end = at + s[at..].chars().next().unwrap_or(' ').len_utf8();
+        // 下一字符尾（rope char boundary，O(chars)）。
+        let end = self.doc.rope().ceil_char_boundary(at + 1);
         self.replace_range(at..end, "", cx);
     }
 
@@ -2139,17 +2133,15 @@ impl WyEditor {
 
     fn move_left(&mut self) {
         let (line, col) = self.row_col(self.caret);
-        let s = self.content.as_ref();
         if let Some((lo, hi)) = self.editable_segment(line) {
             let seg_start = self.line_start(line) + lo;
             let seg_end = self.line_start(line) + hi;
             if col > lo {
-                // 段内退一字符。
-                self.caret = s[..self.caret]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
+                // 段内退一字符（rope char boundary，不复制前缀整串）。
+                self.caret = self
+                    .doc
+                    .rope()
+                    .floor_char_boundary(self.caret.saturating_sub(1))
                     .max(seg_start);
             } else if self.caret >= seg_start && self.caret < seg_end {
                 // 段首（光标坐在标记后/代码内容行行首）→ 回上一**可视**行段尾
@@ -2176,12 +2168,11 @@ impl WyEditor {
 
     fn move_right(&mut self) {
         let (line, _col) = self.row_col(self.caret);
-        let s = self.content.as_ref();
         if let Some((lo, hi)) = self.editable_segment(line) {
             let seg_start = self.line_start(line) + lo;
             let seg_end = self.line_start(line) + hi;
             if self.caret < seg_end {
-                let n = self.caret + s[self.caret..].chars().next().map_or(1, |c| c.len_utf8());
+                let n = self.doc.rope().ceil_char_boundary(self.caret + 1);
                 self.caret = n.min(seg_end).max(seg_start + 1);
             } else {
                 // 段尾 → 下一**可视**行段首（跳过围栏行）。
@@ -2194,7 +2185,7 @@ impl WyEditor {
     }
 
     fn next_segment_start(&self, line: usize) -> usize {
-        let total = self.content.as_ref().matches('\n').count() + 1;
+        let total = self.doc.line_starts().len();
         if line + 1 < total {
             // 下一行是围栏（代码块边界）→ 跳到围栏之后的内容/段落行段首。
             let n = if self.is_fence_line(line + 1) {
@@ -2205,7 +2196,7 @@ impl WyEditor {
             self.editable_segment(n)
                 .map_or(self.line_end(n), |(lo, _)| self.line_start(n) + lo)
         } else {
-            self.content.len()
+            self.len()
         }
     }
 
@@ -2231,11 +2222,11 @@ impl WyEditor {
 
     fn move_down(&mut self) {
         let (line, _) = self.row_col(self.caret);
-        let total = self.content.as_ref().matches('\n').count() + 1;
+        let total = self.doc.line_starts().len();
         self.caret = if line + 1 < total {
             self.place_in_line(self.down_target(line), self.visual_col())
         } else {
-            self.content.len()
+            self.len()
         };
         self.moved();
     }
@@ -2397,10 +2388,11 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        let s = self.content.as_ref();
-        let range = range_from_utf16(s, range_utf16);
-        *actual_range = Some(range_to_utf16(s, range.clone()));
-        Some(s[range].to_string())
+        let s = self.doc.text_shared();
+        let s_str: &str = s.as_ref();
+        let range = range_from_utf16(s_str, range_utf16);
+        *actual_range = Some(range_to_utf16(s_str, range.clone()));
+        Some(s_str[range].to_string())
     }
 
     fn selected_text_range(
@@ -2409,14 +2401,15 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let s = self.content.as_ref();
+        let s = self.doc.text_shared();
+        let s_str: &str = s.as_ref();
         match self.selection() {
             Some(r) => Some(UTF16Selection {
-                range: range_to_utf16(s, r),
+                range: range_to_utf16(s_str, r),
                 reversed: self.caret < self.sel_anchor.unwrap_or(self.caret),
             }),
             None => Some(UTF16Selection {
-                range: range_to_utf16(s, self.caret..self.caret),
+                range: range_to_utf16(s_str, self.caret..self.caret),
                 reversed: false,
             }),
         }
@@ -2425,7 +2418,7 @@ impl EntityInputHandler for WyEditor {
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
         self.marked
             .as_ref()
-            .map(|r| range_to_utf16(self.content.as_ref(), r.clone()))
+            .map(|r| range_to_utf16(self.doc.text_shared().as_ref(), r.clone()))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
@@ -2459,9 +2452,9 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
-        let r = range_from_utf16(self.content.as_ref(), range_utf16);
-        self.caret = r.end.min(self.content.len());
-        self.sel_anchor = Some(r.start.min(self.content.len()));
+        let r = range_from_utf16(self.doc.text_shared().as_ref(), range_utf16);
+        self.caret = r.end.min(self.len());
+        self.sel_anchor = Some(r.start.min(self.len()));
         *self.frame.borrow_mut() = None;
     }
 
@@ -2476,7 +2469,7 @@ impl EntityInputHandler for WyEditor {
         // `caret_vis` 是元素局部坐标（`paint` 时相对元素原点记录），需叠回元素在
         // 窗口中的原点，IME/输入法候选窗才落在光标处（否则整体偏移元素原点）。
         // 组合时画在标记文本上（从 marked 起点到本次输入终点），否则画光标竖条。
-        let r = range_from_utf16(self.content.as_ref(), range_utf16);
+        let r = range_from_utf16(self.doc.text_shared().as_ref(), range_utf16);
         let w = if self.marked.as_ref().map_or(false, |m| r == *m) && r.end > r.start {
             // 组合候选：让候选窗落在整个标记文本宽度上，而不是零宽竖条。
             // 真实几何很难按字符溯源，这里用“应盖住的位置”转成可见块（至少一字符宽）。
@@ -2501,7 +2494,7 @@ impl EntityInputHandler for WyEditor {
         let f = marker.as_ref().map(|r| &**r)?;
         let off = element::source_offset_at_local(self, f, point);
         drop(marker);
-        Some(offset_to_utf16(self.content.as_ref(), off))
+        Some(offset_to_utf16(self.doc.text_shared().as_ref(), off))
     }
 
     fn text_length_utf16(
@@ -2509,7 +2502,7 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.content.as_ref().encode_utf16().count())
+        Some(self.doc.text_shared().encode_utf16().count())
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {

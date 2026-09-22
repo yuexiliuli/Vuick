@@ -127,69 +127,55 @@ impl Doc {
     }
 
     /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
-    /// 切片，不整份持有字符串——与预览一致。
+    /// 切片，不整份持有字符串——与预览一致。`line_starts` 用 chunks 单遍扫（O(n)，
+    /// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降）。
     #[allow(dead_code)]
     pub(crate) fn open_rope(rope: Rope) -> Self {
         let index = parser::scan_blocks_rope(&rope);
-        let line_starts = {
-            let mut v = vec![0usize];
-            for i in 0..rope.len() {
-                if rope.get_byte(i) == Some(b'\n') {
-                    v.push(i + 1);
-                }
-            }
-            v
-        };
+        let line_starts = build_line_starts_rope(&rope);
         let src = DocSrc::Rope(rope.clone());
         Self { src, index, rope, line_starts }
     }
 
-    /// **增量重开**（一次编辑后）：`new_str` 到 `self` 的替换 `[edit_old) → 新文本`。
-    /// - 块索引：`scan_blocks_incremental_rope`（mid-line 插入 O(变化区+尾部平移)，
-    ///   行首/结构性编辑自动回退全量）。
-    /// - 行起始：增量重建（未变前缀 + 变化区重扫 + 尾部整体平移），不做全篇逐字节扫。
-    /// 同步于 UI 线程，把大文档每键 ~2s 的 `Doc::open`（scan_blocks+build_ir+行表）
-    /// 压到几十 ms。
-    pub(crate) fn reopen(
-        &mut self,
-        new_str: &SharedString,
-        old_len: usize,
-        edit_old: Range<usize>,
-        inserted_len: usize,
-    ) {
-        let start = edit_old.start.min(old_len);
-        let end = edit_old.end.min(old_len);
-        let s = new_str.as_ref();
+    /// 原地编辑（字节区间替换）：rope COW remove+insert + 增量块扫描 + 增量行起始。
+    /// 替代旧 `reopen`（需先拼好**全新整串**再全量索引）——编辑后 rope 为唯一增量源
+    /// `src`，O(log n + 变化区)，删掉每键 O(n) 整串复制分配（6MB 文档每键省一次
+    /// 6MB memcpy）。
+    pub(crate) fn edit(&mut self, range: Range<usize>, text: &str) {
+        let old_len = self.len();
+        let start = range.start.min(old_len);
+        let end = range.end.min(old_len);
+        let inserted_len = text.len();
         let mut new_rope = self.rope.clone();
         if end > start {
             new_rope.remove(start..end);
         }
-        let ins_end = (start + inserted_len).min(s.len());
-        if ins_end > start {
-            new_rope.insert(start, &s[start..ins_end]);
+        if inserted_len > 0 {
+            new_rope.insert(start, text);
         }
         let dirty = start..start + inserted_len;
         let new_index =
             parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
         let new_line_starts =
-            Self::incremental_line_starts(&self.line_starts, s.as_bytes(), old_len, edit_old);
+            Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range);
         self.rope = new_rope;
         self.index = new_index;
         self.line_starts = new_line_starts;
-        // 与调用方共享同一缓冲（编辑后宿主 `content` = 同一个 SharedString），免 6.4MB
-        // 整份再拷贝一次（每键一次）。
-        self.src = DocSrc::Str(new_str.clone());
+        // rope 为唯一源；原 Str 快路径（load 后首次编辑起）不再保留整份 SharedString。
+        self.src = DocSrc::Rope(self.rope.clone());
     }
 
-    /// 增量行起始重建（见 [`Self::reopen`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
-    /// 重扫 + 尾部（start > 编辑终点）整体平移 `delta`。O(变化区 + 尾部 memcpy)。
+    /// 增量行起始重建（见 [`Self::edit`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
+    /// 重扫（rope 小切片，不做全串复制）+ 尾部（start > 编辑终点）整体平移 `delta`。
+    /// O(变化区 + 尾部 memcpy)。
     fn incremental_line_starts(
         old: &[usize],
-        new_bytes: &[u8],
+        new: &Rope,
         old_len: usize,
         edit_old: Range<usize>,
     ) -> Vec<usize> {
-        let delta = new_bytes.len() as i64 - old_len as i64;
+        let new_len = new.len();
+        let delta = new_len as i64 - old_len as i64;
         // 前缀：所有 start ≤ 编辑起点 的行（其行首字节不变）。
         let keep = old.partition_point(|&s| s <= edit_old.start);
         let mut out: Vec<usize> = old[..keep].to_vec();
@@ -197,24 +183,25 @@ impl Doc {
         let j = old.partition_point(|&s| s <= edit_old.end.min(old_len));
         let region_start = old.get(keep.saturating_sub(1)).copied().unwrap_or(0);
         let region_end = if j < old.len() {
-            (old[j] as i64 + delta).clamp(region_start as i64, new_bytes.len() as i64) as usize
+            (old[j] as i64 + delta).clamp(region_start as i64, new_len as i64) as usize
         } else {
-            new_bytes.len().max(region_start)
+            new_len.max(region_start)
         };
-        // 变化区重扫 '\n' → 各行首字节（到对齐点；不重复 push `region_start` 本身）。
-        // 边界处理：区域尾部对齐点的行起始由「尾部整体平移」产出（= region_end），
-        // 区域扫描要**跳过恰落在 region_end 的 '\n' 行起始**（否则该行起始重复一遍）；
-        // 仅当没有尾部（编辑近文末，j==len → region_end==new_len）时才保留它
-        // （延续 `build_line_starts` 对末尾空行的语义）。
-        let mut i = region_start;
-        while i < region_end {
-            if new_bytes[i] == b'\n' {
-                let s = i + 1;
+        // 变化区新行起始：只从 rope 切成小窗口（单行规模）重扫 '\n'。边界处理同旧：
+        // 区域尾部对齐点的行起始由「尾部整体平移」产出（= region_end），区域扫描要
+        // 跳过恰落在 region_end 的 '\n' 行起始（否则重复一遍）；仅当没有尾部（编辑
+        // 近文末）时才保留它（延续 `build_line_starts` 对末尾空行的语义）。
+        let region = new.slice(region_start..region_end).to_string();
+        let rb = region.as_bytes();
+        let mut k = 0usize;
+        while k < rb.len() {
+            if rb[k] == b'\n' {
+                let s = region_start + k + 1;
                 if s < region_end || j >= old.len() {
                     out.push(s);
                 }
             }
-            i += 1;
+            k += 1;
         }
         // 尾部整体平移。
         for &s in &old[j..] {
@@ -289,20 +276,26 @@ impl Doc {
                 (n, ascii)
             }
             DocSrc::Rope(r) => {
+                // rope 单切出 `RopeSlice`（不复制）+ 逐字符数——与 Str 分支同语义。
+                // 避免每块 `slice().to_string()` 的堆分配：Pass1 逐块 `line_chars_ascii`
+                // 时 Rope 每次切串分配（debug 6 万块 ~190ms）vs `RopeSlice::chars`
+                // 零分配遍历（chunk 迭代）；`\r/\n` 处理同 Str 分支。
                 let mut ascii = true;
                 let mut n = 0usize;
-                for bi in s..e {
-                    let b = r.get_byte(bi).unwrap_or(0);
-                    if b == b'\n' || b == b'\r' {
-                        if b == b'\n' {
+                let e = e.min(r.len());
+                if e > s {
+                    for c in r.slice(s..e).chars() {
+                        if c == '\n' {
                             break;
                         }
-                        continue;
+                        if c == '\r' {
+                            continue;
+                        }
+                        if c.len_utf8() > 1 {
+                            ascii = false;
+                        }
+                        n += 1;
                     }
-                    if b >= 0x80 {
-                        ascii = false;
-                    }
-                    n += 1;
                 }
                 (n, ascii)
             }
@@ -479,6 +472,50 @@ impl Doc {
             DocSrc::Rope(r) => r.len(),
         }
     }
+
+    /// 底层 rope（快照 / COW 编辑用）。
+    pub(crate) fn rope(&self) -> &Rope {
+        &self.rope
+    }
+
+    /// 全文字节长（编辑/光标边界钳位用；rope 单真源，O(1)）。
+    pub(crate) fn len(&self) -> usize {
+        self.rope.len()
+    }
+
+    /// 全文（宿主镜像/测试/派生全量扫描用）。Str 源（load 后）O(1) 克隆；rope 源
+    /// O(n) 一次（仅宿主写回 / 结构编辑派生 / 测试断言，不在键入热路径）。
+    pub(crate) fn text_shared(&self) -> SharedString {
+        match &self.src {
+            DocSrc::Str(s) => s.clone(),
+            DocSrc::Rope(r) => SharedString::from(r.to_string()),
+        }
+    }
+
+    /// 字节区间切片（O(区间长)；边界钳到 [0, len]，rope 单切一次）。
+    pub(crate) fn slice_str(&self, range: Range<usize>) -> String {
+        let r = range.start.min(self.len())..range.end.min(self.len());
+        if r.end <= r.start {
+            return String::new();
+        }
+        self.rope.slice(r).to_string()
+    }
+}
+
+/// rope 的行起始字节偏移表（`split('\n')` 语义）：chunks 单遍扫（每字节一次，O(n)），
+/// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降。
+fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
+    let mut v = vec![0usize];
+    let mut pos = 0usize;
+    for chunk in rope.chunks() {
+        for (i, b) in chunk.bytes().enumerate() {
+            if b == b'\n' {
+                v.push(pos + i + 1);
+            }
+        }
+        pos += chunk.len();
+    }
+    v
 }
 
 /// 预览 `RowKind` → IR 语义（对齐子集上恒等；parity 保证二者一致）。

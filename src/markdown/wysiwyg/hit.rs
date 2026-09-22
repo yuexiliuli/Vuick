@@ -273,9 +273,7 @@ pub(crate) fn heading_chevron_hit(
             continue;
         };
         if px >= cx0 && px <= cx0 + cw {
-            let key = editor.content()[editor.line_start(r.src_line)..editor.line_end(r.src_line)]
-                .trim()
-                .to_string();
+            let key = editor.line_text(r.src_line).trim().to_string();
             let folded = editor.folded_headings.borrow().contains(&key);
             return Some((r.src_line, folded));
         }

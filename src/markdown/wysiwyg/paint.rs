@@ -749,11 +749,7 @@ pub(crate) fn paint_heading_chevron(
     if row.wrapped.is_empty() {
         return;
     }
-    let key = editor
-        .read(cx)
-        .content()[editor.read(cx).line_start(row.src_line)..editor.read(cx).line_end(row.src_line)]
-        .trim()
-        .to_string();
+    let key = editor.read(cx).line_text(row.src_line).trim().to_string();
     let folded = editor.read(cx).folded_headings.borrow().contains(&key);
     let gx = origin.x + f.padding + px(GUTTER_MARK_X);
     let cy = f32::from(origin.y) + f32::from(row.top) + f32::from(row.lh) * 0.5;
