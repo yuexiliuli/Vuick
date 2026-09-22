@@ -322,19 +322,48 @@ impl BlockLayout {
     }
 }
 
-/// 折叠/重排计划：与**可视带无关**（内容、caret reveal、数学就绪、宽度、结构版本
-/// 决定），按 `(epoch, regions_ver, caret_line, fold_ver)` 缓存，滚动/带移动复用——
-/// 旧实现把这些在 `build_frame` 里每档重算（结构密集大文档 ~40ms/档 → 滚动卡顿）。
+/// 折叠/重排计划：与**可视带无关且不含 caret**（内容、数学就绪、宽度、结构版本决定，
+/// 键 = `(epoch, regions_ver, mgen, fold_ver)`），滚动/带移动/**光标移动/纯文本键入**都
+/// 复用——旧实现把 caret 纳入键，每次光标动/每键都整算折叠增量（结构密集大文档
+/// ~40-100ms/次 → 输入/方向键「巨大延迟」）。caret 的 reveal 由 `fold_reveal` 按带价
+/// 优惠叠加（最多一个数学块 + 一个折叠体）。
 pub(crate) struct FoldPlan {
-    /// 数学块首源码行 → `math_regions` 下标（caret 不在块内的待折叠块）。
+    /// 数学块首源码行 → `math_regions` 下标（全部块；reveal 由 `RevealPlan` 覆盖）。
     pub math_start: std::collections::HashMap<usize, usize>,
     /// 数学块 body 行（折叠成 0 高）。
     pub math_body: std::collections::HashSet<usize>,
     /// 折叠 body 行（callout / 标题；折叠成 0 高）。
     pub fold_lines: std::collections::HashSet<usize>,
-    /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高；块
-    /// `top/height/total` = 基础 + Δ。
+    /// 各折叠体的 body 行区间（reveal 找「caret 所在折叠体」用）。
+    pub fold_bodies: Vec<Range<usize>>,
+    /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高。
     pub deltas: std::rc::Rc<[(usize, f32)]>,
+    /// `deltas` 求和（total = base.total + sum(deltas) - reveal；免每档 O(k) 重加）。
+    pub delta_sum: f32,
+}
+
+/// caret 所在区域被「展开显示源码」（reveal-on-caret）：由 `fold_plan` 的全折叠基准
+/// 上**按带现算**（最多一个数学块 + 一个折叠体，O(区域数) 线性扫 + 少量 block 查）。
+pub(crate) struct RevealPlan {
+    /// 被 reveal 的源码行区间（≤2 个：数学块区间 + 折叠体区间）。
+    pub(crate) ranges: Vec<Range<usize>>,
+    /// 块下标 → Δ 归 0 的块（reveal 的那块不再折叠成 0 / 卡片）。
+    pub(crate) zeroed: Vec<usize>,
+    /// 被归零的静态 Δ 之和（total 减去）。
+    pub(crate) reveal_delta_sum: f32,
+}
+
+impl RevealPlan {
+    pub(crate) fn empty() -> Self {
+        Self { ranges: Vec::new(), zeroed: Vec::new(), reveal_delta_sum: 0. }
+    }
+    /// 该源码行是否被 reveal（不再折叠 / 不装卡片）。
+    pub(crate) fn contains(&self, line: usize) -> bool {
+        self.ranges.iter().any(|r| r.contains(&line))
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.zeroed.is_empty()
+    }
 }
 
 
@@ -1965,7 +1994,7 @@ pub(crate) fn build_frame(
     // 基础布局：代 = `(struct_ver, 图片/数学/宽度)`。滚动/带移动与**非结构性编辑**
     // 都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
     // 数组重算前缀和（旧实现在内容代变化时重扫全篇 ~400ms，是「一编辑就卡」之一）。
-    let epoch = super::height_epoch(editor.struct_ver(), igen, mgen, width_bits);
+    let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits);
     let (rebuilt, base) = editor.ensure_block_layout(n, epoch);
     // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
     if !rebuilt
@@ -1984,8 +2013,6 @@ pub(crate) fn build_frame(
     // 结构扫描（derived 缓存 → O(1) Rc 复用）；`math_regions` 在 Pass3 卡片组装用。
     let derived = editor.derived();
     let math_regions = &derived.borrow().math_regions;
-    // 折叠/卡片 reveal 依赖 caret 所在行（`fold_plan` 缓存键的一部分）。
-    let caret_line = editor.row_col(editor.caret()).0;
 
     if rebuilt {
         // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关——折叠 body
@@ -2029,15 +2056,31 @@ pub(crate) fn build_frame(
         }
         base.borrow_mut().rebuild(heights, src_lines);
     }
-    // 折叠/重排计划（与可视带无关，跨带缓存——滚动不重算 `math_start`/`fold_lines`/
-    // `deltas`，旧实现每档 ~40ms 重扫结构密集大文档 → 滚动「卡顿明显」）。
-    // ⚠️ 必须在 Pass1 之后调用：`deltas` 读基础布局当前高度（重建过的 epoch 使缓存键
-    // 变化 → 自动重建）。
-    let plan = editor.fold_plan(base.clone(), epoch, caret_line);
+    // 折叠/重排计划（与可视带无关、不含 caret，跨带/跨光标复用——滚动与输入不再重算
+    // `math_start`/`fold_lines`/`deltas`）。caret 所在区域的 reveal 由 `fold_reveal`
+    // 按带现算叠加（最多一个数学块 + 一个折叠体）。⚠️ 必须在 Pass1 之后调用：
+    // `deltas` 读基础布局当前高度（重建过的 epoch 使缓存键变化 → 自动重建）。
+    let caret_line = editor.row_col(editor.caret()).0;
+    let plan = editor.fold_plan(base.clone(), epoch, mgen);
+    let reveal = editor.fold_reveal(caret_line, &plan, &base);
     let math_start = &plan.math_start;
     let math_body = &plan.math_body;
     let fold_lines = &plan.fold_lines;
-    let deltas = plan.deltas.clone();
+    // 有效增量：无 reveal（常见：光标在普通行）→ 直接复用计划 deltas（零拷贝）；
+    // 有 reveal → 过滤掉被归零的块（最多几个），每带一次 O(k) 拷贝。
+    let (deltas, delta_sum): (std::rc::Rc<[(usize, f32)]>, f32) = if reveal.is_empty() {
+        (plan.deltas.clone(), plan.delta_sum)
+    } else {
+        let eff: Vec<(usize, f32)> = plan
+            .deltas
+            .iter()
+            .copied()
+            .filter(|(ix, _)| !reveal.zeroed.contains(ix))
+            .collect();
+        let s: f32 = eff.iter().map(|&(_, v)| v).sum();
+        (eff.into_boxed_slice().into(), s)
+    };
+    let revealed = |srcline: usize| reveal.contains(srcline);
 
     // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
     let eff_top = |i: usize| -> f32 {
@@ -2063,14 +2106,16 @@ pub(crate) fn build_frame(
     let i1 = count_true(&|k: usize| eff_top(k) < band_hi).min(n);
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
+    // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     {
         let mut i = i0;
         while i < i1 {
             let srcline = base.borrow().src_lines()[i] as usize;
-            let blocked = fold_lines.contains(&srcline)
-                || math_body.contains(&srcline)
-                || math_start.contains_key(&srcline);
+            let blocked = !revealed(srcline)
+                && (fold_lines.contains(&srcline)
+                    || math_body.contains(&srcline)
+                    || math_start.contains_key(&srcline));
             if blocked {
                 i += 1;
                 continue;
@@ -2078,7 +2123,11 @@ pub(crate) fn build_frame(
             let lo = i;
             while i < i1 {
                 let s = base.borrow().src_lines()[i] as usize;
-                if fold_lines.contains(&s) || math_body.contains(&s) || math_start.contains_key(&s) {
+                if !revealed(s)
+                    && (fold_lines.contains(&s)
+                        || math_body.contains(&s)
+                        || math_start.contains_key(&s))
+                {
                     break;
                 }
                 i += 1;
@@ -2100,7 +2149,7 @@ pub(crate) fn build_frame(
     let total = {
         let b = base.borrow();
         b.total()
-    } + deltas.iter().map(|&(_, v)| v).sum::<f32>();
+    } + delta_sum;
     // 各路行按 top 从 base+deltas 现算；total 已含全部。
     for i in i0..i1 {
         let srcline = base.borrow().src_lines()[i] as usize;
@@ -2114,8 +2163,11 @@ pub(crate) fn build_frame(
         if h <= 0. {
             continue; // 折叠 body / 数学 body：0 高不物化
         }
-        let folded_here = fold_lines.contains(&srcline) || math_body.contains(&srcline);
+        let shown_source = revealed(srcline); // caret 在此区域 → 显示源码而非卡片/折叠
+        let folded_here = !shown_source
+            && (fold_lines.contains(&srcline) || math_body.contains(&srcline));
         if !folded_here
+            && !shown_source
             && let Some(&ridx) = math_start.get(&srcline)
         {
             // 数学块卡片（A1）。

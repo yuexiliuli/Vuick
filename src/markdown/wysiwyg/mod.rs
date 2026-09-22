@@ -334,12 +334,15 @@ pub(crate) fn inline_math_key(latex: &str) -> SharedString {
     format!("inline:{latex}").into()
 }
 
-/// 基础布局代：`(struct_ver, igen, mgen, shaping 宽)` 折成一个 u64——**结构性内容**
-/// /图片/数学/宽度 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，
-/// 只做 Fenwick 点更新（编辑每键省掉旧实现在内容代变化时对全篇的估计重扫 ~400ms）。
+/// 基础布局代：`(struct_ver, igen, shaping 宽)` 折成一个 u64——**结构性内容**/图片/宽度
+/// 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，只做 Fenwick
+/// 点更新（编辑每键省掉旧实现在内容代变化时对全篇的估计重扫 ~400ms）。
+/// **不含 `mgen`**：数学排版就绪只改**卡片高**（走 `fold_plan` 稀疏 delta），基础布局里
+/// 数学块的 base 是普通段估算高，与就绪无关——把 `mgen` 放这里会让每个公式光栅完成都
+/// 触发全 139k 块 Pass1 重建（结构密集文档 ~13k 公式 → 连续 300-500ms 卡死）。
 /// 纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉 ~200ms）。
-pub(crate) fn height_epoch(struct_ver: u64, igen: u64, mgen: u64, width_bits: u32) -> u64 {
-    let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32) -> u64 {
+    let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
     let x = a ^ b.rotate_left(32);
     x ^ x >> 33
@@ -1131,6 +1134,11 @@ impl WyEditor {
     pub(crate) fn fold_ver(&self) -> u64 {
         self.fold_ver.get()
     }
+    /// 当前缓存的折叠计划 Rc（回归断言「仅移动光标/纯文本键入不重建折叠计划」）。
+    #[cfg(test)]
+    pub(crate) fn fold_plan_rc(&self) -> Option<Rc<element::FoldPlan>> {
+        self.fold_plan.borrow().as_ref().map(|(_, p)| p.clone())
+    }
 
     /// 取走待修补（重估高度）的块下标（编辑后一帧用；无则 None）。
     pub(crate) fn take_pending_patch_blocks(&self) -> Option<Vec<usize>> {
@@ -1157,24 +1165,23 @@ impl WyEditor {
     }
 
     /// 折叠/重排计划（缓存）：`math_start` / `math_body` / `fold_lines` / `deltas`——
-    /// 全部**与可视带无关**（由内容、caret reveal、数学就绪、宽度、结构版本决定），
-    /// 滚动/带移动复用同一 `Rc`。旧实现把这些放在 `build_frame` 里每档重算（结构密集
-    /// 大文档 ~15k 行 Hash 集合 + 逐块二分 ≈40ms/档 → 滚动「卡顿明显」）。
-    /// `pass1_delta = 基础布局本档是否刚整篇重建`（重建过的 epoch ≠ 缓存键 → 自会
-    /// 重建；此处仅防御性传 `base` 供 deltas 读当前高度）。
-    #[allow(clippy::too_many_arguments)]
+    /// 全部**与可视带无关且不含 caret**（键 = `epoch ^ regions_ver ^ mgen ^ fold_ver`），
+    /// 滚动/带移动/**光标移动/纯文本键入**都复用同一 `Rc`。caret 的 reveal-on-caret 由
+    /// [`Self::fold_reveal`] 按带现算叠加（最多一个数学块 + 一个折叠体）。
+    /// 旧实现把 caret 放进键——每次光标动/每键都整算（结构密集大文档 ~40-100ms → 输入/
+    /// 方向键「巨大延迟」）；更早是每档在 `build_frame` 里重算（滚动卡）。
     pub(crate) fn fold_plan(
         &self,
         base: Rc<std::cell::RefCell<element::BlockLayout>>,
         epoch: u64,
-        caret_line: usize,
+        mgen: u64,
     ) -> Rc<element::FoldPlan> {
         let key = epoch
             ^ self
                 .regions_ver()
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ (caret_line as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            ^ self.fold_ver().wrapping_mul(0x1656_67B1_9E37_79F9);
+            ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ self.fold_ver().wrapping_mul(0x517C_C1B7_2722_0A95);
         if let Some((k, p)) = &*self.fold_plan.borrow() {
             if *k == key {
                 return p.clone();
@@ -1189,18 +1196,17 @@ impl WyEditor {
                 std::collections::HashMap::new();
             let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
             for (idx, reg) in math_regions.iter().enumerate() {
-                if caret_line >= reg.range.start && caret_line < reg.range.end {
-                    continue; // reveal-on-caret：光标在块内 → 不折叠，显示源码
-                }
                 math_start.insert(reg.range.start, idx);
                 math_body.extend(reg.range.start + 1..reg.range.end);
             }
-            // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高。
+            // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高；记录 body 区间供 reveal。
             let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut fold_bodies: Vec<Range<usize>> = Vec::new();
             for (rnge, folded) in &d.alert_fold_regions {
-                if !*folded || (caret_line >= rnge.start + 1 && caret_line < rnge.end) {
+                if !*folded {
                     continue;
                 }
+                fold_bodies.push(rnge.clone());
                 fold_lines.extend(rnge.start + 1..rnge.end);
             }
             // 标题折叠（视图本地状态）。
@@ -1208,9 +1214,7 @@ impl WyEditor {
                 let folded = self.folded_headings.borrow();
                 if !folded.is_empty() {
                     for rnge in inline_style::heading_fold_regions(content, &folded) {
-                        if caret_line >= rnge.start + 1 && caret_line < rnge.end {
-                            continue;
-                        }
+                        fold_bodies.push(rnge.clone());
                         fold_lines.extend(rnge.start + 1..rnge.end);
                     }
                 }
@@ -1245,15 +1249,82 @@ impl WyEditor {
             }
             let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
             deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
+            let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
             let plan = Rc::new(element::FoldPlan {
                 math_start,
                 math_body,
                 fold_lines,
+                fold_bodies,
                 deltas: deltas_vec.into_boxed_slice().into(),
+                delta_sum,
             });
             *self.fold_plan.borrow_mut() = Some((key, plan.clone()));
             plan
         }
+    }
+
+    /// caret 所在区域「展开显示源码」（reveal-on-caret）覆盖，按带现算（O(区域数) 线性扫
+    /// + 少量块定位）——最多一个数学块 + 一个折叠体。`build_frame` 用它把全折叠基准里
+    /// 该区域的行恢复成可编辑源码显示。
+    pub(crate) fn fold_reveal(
+        &self,
+        caret_line: usize,
+        plan: &element::FoldPlan,
+        base: &std::cell::RefCell<element::BlockLayout>,
+    ) -> element::RevealPlan {
+        let mut reveal = element::RevealPlan::empty();
+        let base_br = base.borrow();
+        let src_lines = base_br.src_lines();
+        let src_len = src_lines.len();
+        let block_ix_of = |srcline: usize| -> usize {
+            src_lines
+                .partition_point(|&s| (s as usize) <= srcline)
+                .saturating_sub(1)
+                .min(src_len.saturating_sub(1))
+        };
+        let zero_ix = |zeroed: &mut Vec<usize>, ix: usize| {
+            if !zeroed.contains(&ix) {
+                zeroed.push(ix);
+            }
+        };
+        // 数学块：caret 在 [start, end) → 整块还原源码（不卡片、body 不折叠 0 高）。
+        {
+            let d = self.derived();
+            let d = d.borrow();
+            if let Some(reg) = d
+                .math_regions
+                .iter()
+                .find(|r| caret_line >= r.range.start && caret_line < r.range.end)
+            {
+                let rng = reg.range.clone();
+                reveal.ranges.push(rng.clone());
+                zero_ix(&mut reveal.zeroed, block_ix_of(rng.start));
+                for l in rng.start + 1..rng.end {
+                    zero_ix(&mut reveal.zeroed, block_ix_of(l));
+                }
+            }
+        }
+        // 折叠体：caret 在 body `[start+1, end)` → 该体行还原源码（不折叠成 0）。
+        if let Some(rnge) = plan
+            .fold_bodies
+            .iter()
+            .find(|r| caret_line >= r.start + 1 && caret_line < r.end)
+        {
+            let rng = rnge.clone();
+            reveal.ranges.push(rng.clone());
+            for l in rng.start + 1..rng.end {
+                zero_ix(&mut reveal.zeroed, block_ix_of(l));
+            }
+        }
+        // 被归零的静态 Δ 之和（total 减去）。
+        if !reveal.zeroed.is_empty() {
+            for &ix in &reveal.zeroed {
+                if let Some((_, v)) = plan.deltas.iter().find(|(i, _)| *i == ix) {
+                    reveal.reveal_delta_sum += v;
+                }
+            }
+        }
+        reveal
     }
 
     /// 内容派生扫描缓存（全篇一遍，按 `regions_ver` 缓存）——`build_frame` / paint 用，

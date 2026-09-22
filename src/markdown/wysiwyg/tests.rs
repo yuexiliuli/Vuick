@@ -3182,6 +3182,50 @@ A-->B
         });
     }
 
+    #[gpui::test]
+    fn fold_plan_reused_across_caret_move_and_reveal_applies(cx: &mut TestAppContext) {
+        // 折叠计划缓存**不含 caret**：光标在普通行间移动 → `fold_plan` Rc 复用（不再
+        // 每键/每次光标动整算折叠增量——旧实现 48ms/次）；但光标进数学块 → reveal 生效
+        // （该块还原源码、不装卡片），离开块又折叠回卡片。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "$$\n\\int_a dx\n$$\n普通段落 one\n普通段落 two\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (plan0, len0) = vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(0)); // 文档开头（`$$\n…`）
+            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+            let plan = ed.read(cx).fold_plan_rc().expect("build_frame 应已建折叠计划");
+            (
+                plan,
+                f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
+            )
+        });
+        assert_eq!(len0, 0, "caret 在数学块内 → 不装卡片（reveal 显示源码）");
+        // 移到普通行（caret 离开数学块）→ fold_plan 复用 + 卡片出现。
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let at = ed.read(cx).content().find("one").unwrap();
+            ed.update(cx, |e, _| e.set_caret(at));
+            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+            let plan1 = ed.read(cx).fold_plan_rc().expect("折叠计划应已缓存");
+            assert!(
+                std::rc::Rc::ptr_eq(&plan0, &plan1),
+                "仅移动光标不应重建折叠计划"
+            );
+            assert_eq!(
+                f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
+                1,
+                "caret 离开数学块 → 折叠为卡片"
+            );
+        });
+    }
+
     /// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
     /// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
     #[gpui::test]
@@ -3218,21 +3262,25 @@ A-->B
             eprintln!("[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg}, inline_inv={inv})", f.block_count());
         });
 
-        vcx.update(|_w, cx: &mut App| {
+        vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let mut rebuilt = 0u32;
             // 锚点只取一次（此后 1:1 字符替换，长度不变 → 锚点恒有效）。
             let at = ed.read(cx).content().find("zone one").unwrap() + 5;
             let t0 = std::time::Instant::now();
-            for _ in 0..30 {
+            // **真实逐键循环**：replace_range + 下一帧 build_frame（caret 每键前进，
+            // 与真实应用一致——`set_caret`/`replace_range` 都会清帧触发重建）。
+            for k in 0..30 {
                 let v0 = ed.read(cx).regions_ver();
                 ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
                 if ed.read(cx).regions_ver() != v0 {
                     rebuilt += 1;
                 }
+                let band = (k as f32 * 20., k as f32 * 20. + 800.);
+                build_frame(ed.read(cx), window, px(900.), band);
             }
             let dt = t0.elapsed().as_millis();
-            eprintln!("[bench] 30 plain edits: {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/30)", dt as f64 / 30.);
+            eprintln!("[bench] 30 typing full-cycles (edit+frame): {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/30)", dt as f64 / 30.);
         });
 
         vcx.update(|_w, cx: &mut App| {
@@ -3254,13 +3302,38 @@ A-->B
         vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let mut t = 0u128;
+            let mut t2 = 0u128;
             for k in 0..20 {
                 let t0 = std::time::Instant::now();
                 let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
                 let f = build_frame(ed.read(cx), window, px(900.), band);
                 let _ = f.total;
                 t += t0.elapsed().as_millis();
+                // 模拟「公式光栅逐个完成」：mgen 变化 → fold_plan 重算（基础布局不再整篇重建）。
+                let t1 = std::time::Instant::now();
+                let band2 = (k as f32 * 4000. + 2000., k as f32 * 4000. + 2800.);
+                let f2 = build_frame(ed.read(cx), window, px(900.), band2);
+                let _ = f2.total;
+                t2 += t1.elapsed().as_millis();
             }
             eprintln!("[bench] 20 band rebuilds: {t}ms ({:.1}ms/band)", t as f64 / 20.);
+            eprintln!("[bench] 20 near-band rebuilds (caret-in-band): {t2}ms ({:.1}ms/band)", t2 as f64 / 20.);
+        });
+
+        // 光标移动（不动内容）→ `set_caret` 清帧 → build_frame 每步成本。
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let n = ed.read(cx).content().len();
+            let mut t = 0u128;
+            for k in 0..20 {
+                let off = (n * k / 20).min(n.saturating_sub(1));
+                ed.update(cx, |e, _| e.set_caret(off));
+                let t0 = std::time::Instant::now();
+                let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
+                let f = build_frame(ed.read(cx), window, px(900.), band);
+                let _ = f.total;
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] 20 caret-move frame rebuilds: {t}ms ({:.1}ms/step)", t as f64 / 20.);
         });
     }
