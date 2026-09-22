@@ -322,6 +322,9 @@ impl BlockLayout {
     pub(crate) fn height(&self, i: usize) -> f32 {
         self.heights.get(i).copied().unwrap_or(0.)
     }
+    pub(crate) fn heights(&self) -> &[f32] {
+        &self.heights
+    }
     pub(crate) fn n(&self) -> usize {
         self.heights.len()
     }
@@ -1899,7 +1902,7 @@ fn shape_docrow(
 
 /// 数学块卡片的显示行：源码按换行 + LaTeX `\\`（行断）切成多行，逐段做 Unicode
 /// 排版。`math_card_height` 与 `paint_card` 必须用同一函数 → 高与绘制逐行对应。
-fn math_display_lines(src: &str) -> Vec<String> {
+pub(crate) fn math_display_lines(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for ln in src.split('\n') {
         for seg in ln.split("\\\\") {
@@ -1923,7 +1926,9 @@ pub(crate) fn math_card_height(editor: &WyEditor, reg: &MathRegion) -> Pixels {
     {
         return px(20. + h.max(16.));
     }
-    let n = math_display_lines(&reg.source).len();
+    // 回退：按**显示行数**估高。`math_display_lines` 对每源做 LaTeX→Unicode 转换，
+    // 结构编辑时 fold_plan 会对全篇数学块重复求高（3000 块 ~38ms）——走缓存计数。
+    let n = editor.math_line_count(reg.source.as_str());
     px(20. + n as f32 * 22.)
 }
 
@@ -2022,7 +2027,7 @@ pub(crate) fn build_frame(
     // 都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
     // 数组重算前缀和（旧实现在内容代变化时重扫全篇 ~400ms，是「一编辑就卡」之一）。
     let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits);
-    let (rebuilt, base) = editor.ensure_block_layout(n, epoch);
+    let (rebuilt, base, old_layout) = editor.ensure_block_layout(n, epoch);
     // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
     if !rebuilt
         && let Some(ixs) = editor.take_pending_patch_blocks()
@@ -2044,9 +2049,42 @@ pub(crate) fn build_frame(
     if rebuilt {
         // Pass 1（仅每内容/宽度代一次）：全块**基础高**（与折叠/卡片态无关——折叠 body
         // 与数学源行都用普通段高估算，动态覆盖走 deltas）+ 起始源码行，一次物化布局。
-        let mut heights = Vec::with_capacity(n);
-        let mut src_lines = Vec::with_capacity(n);
-        for i in 0..n {
+        //
+        // **增量**（B3）：结构编辑后块数组 = [未变前缀][变化中段][未变后缀]。编辑线
+        // （`struct_dirty_line`）之前的块内容/索引均未变 → 高度**沿用旧布局**（还是
+        // 收敛真值，比重新估算更准）；只从首个「受编辑影响的块」起 → 文尾重估，最后
+        // 一次性重建 Fenwick。Enter 贴文尾 = O(变化后缀)、贴文首 = O(n)（不劣化）。
+        let dirty_line = editor.struct_dirty_line();
+        let doc_lines = doc.line_starts().len();
+        // 前缀复用长度：块 k 完全落在 dirty_line 之上（块末行 = 下块首行-1 < dirty）
+        // → 内容不变、索引稳定。
+        let mut keep = 0usize;
+        while keep < n {
+            if doc.block_meta(keep).is_none() {
+                break;
+            }
+            let next_src = if keep + 1 < n {
+                doc.block_meta(keep + 1)
+                    .map(|m2| m2.src_line as usize)
+                    .unwrap_or(doc_lines)
+            } else {
+                doc_lines
+            };
+            if next_src <= dirty_line {
+                keep += 1;
+            } else {
+                break;
+            }
+        }
+        let (mut heights, mut src_lines) = match &old_layout {
+            Some(old) => {
+                let ob = old.borrow();
+                let k = keep.min(ob.n());
+                (ob.heights()[..k].to_vec(), ob.src_lines()[..k].to_vec())
+            }
+            None => (Vec::with_capacity(n), Vec::with_capacity(n)),
+        };
+        for i in heights.len()..n {
             let meta = doc.block_meta(i).unwrap_or_else(|| BlockMeta {
                 src_line: 0,
                 byte: 0,

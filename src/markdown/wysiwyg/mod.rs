@@ -213,6 +213,10 @@ pub struct WyEditor {
     /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
     /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
     struct_ver: Cell<u64>,
+    /// 结构性编辑影响的**首个源行**（Pass1 增量高度重估的起点）：编辑线之前的块
+    /// 内容未变 → 复用旧布局高度；只有「编辑线起 → 文尾」重新估算（Enter 贴近文尾时
+    /// O(变化后缀) 而非全篇）。非结构编辑不参与（无重建）。
+    struct_dirty_line: Cell<usize>,
     /// 内容**派生版本**——`derived()` 缓存键：结构性编辑、编辑行 region 签名变化才
     /// 递增；纯文本键入（非结构、签名不变、不在数学块内）不递增 → `derived` Rc
     /// 跨键复用，不再每键对全篇 `math_regions`/`alert_*` 重扫（7MB/结构密集文档
@@ -259,6 +263,8 @@ pub struct WyEditor {
     math_color: RefCell<Option<Hsla>>,
     /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
     math_gen: Cell<u64>,
+    /// 数学显示行数缓存（见字段声明）。
+    math_line_map: RefCell<std::collections::HashMap<String, usize>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
     /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
@@ -511,6 +517,7 @@ impl WyEditor {
             shape_band: Cell::new(None),
             block_layout: RefCell::new(None),
             struct_ver: Cell::new(0),
+            struct_dirty_line: Cell::new(0),
             regions_ver: Cell::new(0),
             fold_ver: Cell::new(0),
             fold_plan: RefCell::new(None),
@@ -529,6 +536,11 @@ impl WyEditor {
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
             math_gen: Cell::new(0),
+            // 数学**显示行数**缓存（键=去定界符源）：`math_card_height` 回退分支按行数
+            // 估高——`math_display_lines` 会对每个源做 LaTeX→Unicode 转换，3000 个数学
+            // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
+            // 清缓存。
+            math_line_map: RefCell::new(std::collections::HashMap::new()),
             base_dir: None,
             marked: None,
             sel_anchor: None,
@@ -605,6 +617,8 @@ impl WyEditor {
         self.math_dollar_cnt.set(text.bytes().filter(|&b| b == b'$').count());
         self.alert_marker_cnt.set(text.matches("[!").count());
         self.struct_ver.set(0);
+        self.struct_dirty_line.set(0);
+        self.math_line_map.borrow_mut().clear();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
@@ -1197,6 +1211,10 @@ impl WyEditor {
     pub(crate) fn struct_ver(&self) -> u64 {
         self.struct_ver.get()
     }
+    /// 结构编辑影响的首个源行（Pass1 增量前缀复用边界）。
+    pub(crate) fn struct_dirty_line(&self) -> usize {
+        self.struct_dirty_line.get()
+    }
     /// 派生版本（`derived()` 缓存键；供回归断言「纯文本键入不重建派生」）。
     pub(crate) fn regions_ver(&self) -> u64 {
         self.regions_ver.get()
@@ -1239,24 +1257,31 @@ impl WyEditor {
     pub(crate) fn bump_reshapes(&self) {
         self.reshapes.set(self.reshapes.get() + 1);
     }
-    /// 校验基础布局命中当前（代, 块数）：命中返回 `(false, Rc)` 供复用；未命中
-    /// 建出空布局（build_frame 随即 O(n) 填估算/或 patch）并缓存，返回 `(true, Rc)`。
+    /// 校验基础布局命中当前（代, 块数）：命中返回 `(false, 新布局)` 供复用；
+    /// 未命中建出空布局（build_frame 随即填估算/或 patch）并缓存，返回 `(true, 新)`
+    /// 及第三个元素 = **旧布局**（结构编辑增量 Pass1 里「编辑线之前未变前缀」的高度
+    /// 复用；首次打开/宽度变化旧布局为空 → `None`）。
     pub(crate) fn ensure_block_layout(
         &self,
         n_blocks: usize,
         epoch: u64,
-    ) -> (bool, Rc<std::cell::RefCell<element::BlockLayout>>) {
+    ) -> (
+        bool,
+        Rc<std::cell::RefCell<element::BlockLayout>>,
+        Option<Rc<std::cell::RefCell<element::BlockLayout>>>,
+    ) {
         if let Some((e, l)) = &*self.block_layout.borrow() {
             if *e == epoch && l.borrow().n() == n_blocks {
-                return (false, l.clone());
+                return (false, l.clone(), None);
             }
         }
+        let old = self.block_layout.borrow().as_ref().map(|(_, l)| l.clone());
         let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::new(
             vec![0.0; n_blocks],
             vec![0u32; n_blocks],
         )));
         *self.block_layout.borrow_mut() = Some((epoch, l.clone()));
-        (true, l)
+        (true, l, old)
     }
 
     /// 折叠/重排计划（缓存）：`math_start` / `math_body` / `fold_lines` / `deltas`——
@@ -1286,9 +1311,11 @@ impl WyEditor {
         {
             let d = derived.borrow();
             let math_regions = &d.math_regions;
+            // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
             let mut math_start: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
-            let mut math_body: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                std::collections::HashMap::with_capacity(math_regions.len());
+            let mut math_body: std::collections::HashSet<usize> =
+                std::collections::HashSet::with_capacity(math_regions.len() * 2);
             for (idx, reg) in math_regions.iter().enumerate() {
                 math_start.insert(reg.range.start, idx);
                 math_body.extend(reg.range.start + 1..reg.range.end);
@@ -1317,7 +1344,9 @@ impl WyEditor {
             }
             // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
             let mut dyn_map: std::collections::HashMap<usize, f32> =
-                std::collections::HashMap::new();
+                std::collections::HashMap::with_capacity(
+                    fold_lines.len() + math_body.len() + math_start.len(),
+                );
             {
                 let base_br = base.borrow();
                 let src_lines = base_br.src_lines();
@@ -1503,6 +1532,20 @@ impl WyEditor {
     /// 排版完成代数（Loading→Ready/Failed 自增，纳入帧缓存键）。
     pub(crate) fn math_gen(&self) -> u64 {
         self.math_gen.get()
+    }
+
+    /// 数学源码的**显示行数**（card 回退估高用）：`math_display_lines` 会对每源做
+    /// LaTeX→Unicode 转换，3000 块每次 `fold_plan` 重建重复转换 ≈38ms；按源缓存后
+    /// O(1) 复用（同一源显示行数确定不变）。
+    pub(crate) fn math_line_count(&self, src: &str) -> usize {
+        if let Some(&n) = self.math_line_map.borrow().get(src) {
+            return n;
+        }
+        let n = element::math_display_lines(src).len();
+        if self.math_line_map.borrow().len() < 10_000 {
+            self.math_line_map.borrow_mut().insert(src.to_string(), n);
+        }
+        n
     }
 
     /// 对**当前带内可见**公式发起离屏排版——按「只渲染窗口可见区域」原则（对齐
@@ -1699,6 +1742,51 @@ impl WyEditor {
     /* ---------- 可编辑块区域（代码/表格 + 围栏行判定） ---------- */
 
     /// 从块索引重建每个可编辑块区域（代码内容行 / 表格表头+数据行）。文本变更后调用。
+    /// 结构编辑后**派生区域行号平移**（B3 增量，替代整篇 `inline_style::math_regions`/
+    /// `alert_regions` 重扫）：编辑线**之上**（`end <= edit_line`）区域完全不变；**之下**
+    /// （`start > edit_line`）整体平移 `Δ`（source 内容未变，保留）。若派生未缓存或
+    /// 有区域**跨过**编辑线（内容变了，无法仅平移）→ 返回 `false`，调用方回退整篇
+    /// 重建（`regions_ver++`，`derived()` 懒重建）。
+    fn shift_derived_after_edit(&mut self, edit_line: usize, line_delta: i64) -> bool {
+        let cached = self.derived.borrow_mut();
+        let Some((_, rc)) = cached.as_ref() else {
+            return false;
+        };
+        let mut d = rc.borrow_mut();
+        // 跨线区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
+        if d
+            .math_regions
+            .iter()
+            .any(|r| r.range.start <= edit_line && edit_line < r.range.end)
+            || d
+                .alert_fold_regions
+                .iter()
+                .any(|(r, _)| r.start <= edit_line && edit_line < r.end)
+        {
+            return false;
+        }
+        let shift = |x: usize| -> usize { (x as i64 + line_delta).max(0) as usize };
+        for reg in &mut d.math_regions {
+            if reg.range.start > edit_line {
+                reg.range.start = shift(reg.range.start);
+                reg.range.end = shift(reg.range.end);
+            }
+        }
+        for (r, _) in &mut d.alert_fold_regions {
+            if r.start > edit_line {
+                *r = shift(r.start)..shift(r.end);
+            }
+        }
+        if line_delta != 0 {
+            let old = std::mem::take(&mut d.alert_region_kinds);
+            d.alert_region_kinds = std::collections::HashMap::with_capacity(old.len());
+            for (l, k) in old {
+                d.alert_region_kinds.insert(shift(l), k);
+            }
+        }
+        true
+    }
+
     fn rebuild_block_regions(&mut self) {
         use crate::markdown::parser::RowKind;
         let n = self.doc.block_count();
@@ -1844,6 +1932,9 @@ impl WyEditor {
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
         let count_same = self.doc.block_count() == prev_count;
         let structural = cross_newline || in_code_table || breaks_fence || !count_same;
+        // Pass1 增量高度重估起点：编辑行的**前一内容行**之后的块全部未变（编辑线之前
+        // 的块内容/索引稳定）——结构编辑只在「该行起 → 文尾」重估，前缀高度复用。
+        self.struct_dirty_line.set(edit_line);
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
@@ -1871,9 +1962,14 @@ impl WyEditor {
         // 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
         // （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
         if structural {
-            // 行索引 / 块结构变化 → 区域行号平移、source 变化 → 整篇重建派生；
-            // 可编辑块区域（代码/表格）下标也变了 → 一并重建（否则导航判定错位）。
-            self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            // 行索引 / 块结构变化：派生区域**行号平移**（B3 增量）——编辑线之上的区域
+            // 不变、之下平移 Δ；有区域跨线 / 派生未缓存才回退整篇重建。可编辑块区域
+            // （代码/表格）下标随之变化 → 一并重建（否则导航判定错位）。
+            let line_delta =
+                (text.matches('\n').count() as i64) - (removed.matches('\n').count() as i64);
+            if !self.shift_derived_after_edit(edit_line, line_delta) {
+                self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            }
             self.rebuild_block_regions();
         } else {
             // 非结构性：代码/表格区域布局不变 → `block_regions` 复用，跳过
@@ -2046,6 +2142,8 @@ impl WyEditor {
         self.math_dollar_cnt.set(full.as_ref().bytes().filter(|&b| b == b'$').count());
         self.alert_marker_cnt.set(full.matches("[!").count());
         self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
+        self.struct_dirty_line.set(0);
+        self.math_line_map.borrow_mut().clear();
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();

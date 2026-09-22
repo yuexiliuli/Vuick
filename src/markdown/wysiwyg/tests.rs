@@ -3377,6 +3377,50 @@ A-->B
         });
     }
 
+    /// B3 增量派生：结构编辑（Enter）后 math 区域**行号平移**而非整篇重扫——编辑线之上
+    /// 不变、之下平移 Δ；无区域跨线 → `regions_ver` 不递增（不重建 derived）；区域跨线
+    /// （编辑落在 $$ 块内）→ 回退整篇重建（regions_ver++）。
+    #[gpui::test]
+    fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let text = "para one\n$$\n\\int_a b dx\n$$\npara two\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let _f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let ranges =
+                |e: &gpui::Entity<WyEditor>, cx: &App| -> Vec<std::ops::Range<usize>> {
+                    e.read(cx).derived().borrow().math_regions.iter().map(|r| r.range.clone()).collect()
+                };
+            assert_eq!(ranges(&ed, cx), vec![1usize..4], "初始 $$ 块占行 1..4");
+            let v0 = ed.read(cx).regions_ver();
+            // 行 0（para one）末按 Enter → 整块 $$ 下移一行；无跨线 → 增量平移。
+            let at = ed.read(cx).text().as_ref().find('\n').unwrap();
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+            assert_eq!(ranges(&ed, cx), vec![2usize..5], "Enter 后 $$ 块整体下移一行");
+            assert_eq!(
+                ed.read(cx).regions_ver(),
+                v0,
+                "无区域跨线 → 只用行号平移，不重建派生（B3 增量）"
+            );
+            // 结构编辑落在 $$ 块内（跨线）→ 回退整篇重建（区域内容变了无法纯平移）。
+            let at2 = ed.read(cx).text().as_ref().find("\\int_a").unwrap() + 3;
+            let v1 = ed.read(cx).regions_ver();
+            ed.update(cx, |e, ecx| e.replace_range(at2..at2, "\n", ecx));
+            assert_eq!(
+                ed.read(cx).regions_ver(),
+                v1.wrapping_add(1),
+                "结构编辑落在 $$ 块内 → 区域内容变化 → 整篇重建派生"
+            );
+        });
+    }
+
     /// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
     /// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
     /// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
@@ -3434,6 +3478,59 @@ A-->B
                 tr as f64 / 6.
             );
         }
+    }
+
+    /// 手动性能基准：**结构编辑（插入换行 / Enter）**的完整周期成本（edit + build_frame）
+    /// ——B3 增量 Pass1 前后对比用：Enter 贴文尾时高度重估只扫「编辑线上」前缀复用；
+    /// 并行测「文首 Enter」（前缀少、重估近似全篇）作上界。
+    #[gpui::test]
+    #[ignore]
+    fn bench_structural_enter(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        for i in 0..3_000 {
+            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
+            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
+            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
+        }
+        text.push_str("\n\n");
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        // ── 文尾 Enter（前缀复用最多）。
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let mut at = ed.read(cx).text().as_ref().len();
+            // 预热一帧 + 2 次 Enter（把首次 Pass1/折叠计划/derived 全量重建跑掉），
+            // 之后计时的是**稳态 Enter**（增量路径）。
+            let _warm = build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+            for _ in 0..2 {
+                ed.update(cx, |e, ecx| {
+                    e.set_caret(at);
+                    e.replace_range(at..at, "\n", ecx);
+                    at = e.caret();
+                });
+                build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+            }
+            let mut t = 0u128;
+            for _ in 0..12 {
+                let t0 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| {
+                    e.set_caret(at);
+                    e.replace_range(at..at, "\n", ecx);
+                    at = e.caret();
+                });
+                build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+                t += t0.elapsed().as_millis();
+            }
+            eprintln!("[bench] Enter at TAIL+cycle: {:.2}ms/次", t as f64 / 12.);
+        });
     }
 
     /// 手动性能基准：量化 A1「命中先行」的收益——缓存预热后**同带缓存重建**（只物化
