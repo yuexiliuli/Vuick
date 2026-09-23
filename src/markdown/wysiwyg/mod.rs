@@ -585,6 +585,29 @@ impl WyEditor {
         let ts = window.text_style();
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
         let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
+        // Windows 冷启动字体回退预热：`gpui_windows` 的 `prewarm_fonts` 是空实现，字体
+        // 集合与回退映射纯惰性初始化——冷进程首次把 `❗⚠✅…` 这类**仅靠回退字体提供的
+        // 字形**排成 `.notdef` 豆腐块（空心矩形），且坏字形被形状缓存钉住整次运行；
+        // 第二次运行 OS/DW 字体缓存已温 → 回退解析正常。首次 WYSIWYG 在后台对含这些
+        // 字形的探针做一次 `shape_line`，把 DWrite 的回退解析/系统字体集合提前暖起来，
+        // 首帧即显示正确字形（此后无成本，仅一次）。
+        static FONT_FALLBACK_WARM: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FONT_FALLBACK_WARM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let probe_ts = window.text_system().clone();
+            let probe_font = ts.font();
+            cx.background_executor()
+                .spawn(async move {
+                    let probe: SharedString = "❗⚠✅✔♦★▶「」中文 abc123".into();
+                    let run = [gpui::TextRun {
+                        len: probe.len(),
+                        font: probe_font,
+                        ..Default::default()
+                    }];
+                    let _ = probe_ts.shape_line(probe, px(16.), &run, None);
+                })
+                .detach();
+        }
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
