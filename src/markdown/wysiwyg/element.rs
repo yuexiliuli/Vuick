@@ -2653,7 +2653,8 @@ fn table_cell_at_src(
 /// **D1 滚动预热**：把「当前带 + 滚动方向的下一量子带」内尚未整形的块提前 shape 进
 /// [`RowShapeCache`]（键 = `epoch ^ mgen`，与 band/帧键**无关**，与 `build_frame` Pass2
 /// 命中判据同式）→ 带穿越时 Pass2 直接命中缓存，每 512px 一次的 ~6.4ms/band shape
-/// 突发被摊平成每帧 1-3 块的 O(1) 摊销。
+/// 突发被摊平（预算按滚动速度自适应：静止 3 块/帧、快滚最高 24 块/帧，见
+/// [`super::Prewarm::effective_budget`]）。
 ///
 /// 硬约束：
 /// - **只 `put` 缓存、绝不 `base.set()`**——不提前改 total，滚动条量程/布局零抖动；
@@ -2661,13 +2662,20 @@ fn table_cell_at_src(
 /// - 跳过折叠/数学块（不自走整形缓存）与 caret 行（shape 依赖光标，进带时 Pass2 强制
 ///   重 shape）；fold_plan 无碍正确性——Pass2 的 `blocked` 判定始终以现算 plan 为准，
 ///   预热条目若因 reveal 变活跃也只是浅克隆复用。
-/// - 方向只由带序号跨界（`band.top/512` 取整变化）判定；预算按块数硬上限，滑动窗
-///   `bias` 每帧推进、回绕兜底——区间扫满即全部命中/跳过，空转开销≈HashMap 查找。
+/// - 方向只由带序号跨界（`band.top/512` 取整变化）判定；预算按速度自适应
+///   （`Prewarm::effective_budget`：基础 `blocks_per_frame` + 速度×4，硬上限 24），
+///   `bias` 滑动窗每帧推进、回绕兜底——区间扫满即全部命中/跳过，空转开销≈HashMap 查找。
 pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     let q = 512.;
     let mut st = e.prewarm.borrow_mut();
     let (blo, bhi) = frame.band;
     let bi = (blo / q) as i32;
+    // 滚动速度（带/帧）：本帧相对上一帧登记的带序号跳跃量。快滚（跳多档）时按速度放大
+    // 每帧预热预算，否则 3 块/帧追不上视口 → 落点带仍冷、每带穿越补 Pass2 突发。
+    let vel = st
+        .last_band_idx
+        .map(|lbi| bi.abs_diff(lbi) as usize)
+        .unwrap_or(1);
     if let Some(lbi) = st.last_band_idx {
         if bi != lbi {
             st.dir = if bi > lbi { 1 } else { -1 };
@@ -2699,7 +2707,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     let plan = e.fold_plan_rc();
     let doc = e.doc();
     let avail = (f32::from(frame.width) - f32::from(frame.padding) * 2.).max(1.);
-    let bpf = st.blocks_per_frame.max(1);
+    let bpf = st.effective_budget(vel);
     let mut rc = e.shape_rows.borrow_mut();
     let n = i1 - i0;
     if st.bias >= n {
@@ -2725,6 +2733,8 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         if !blocked && caret_line != srcline && rc.get(k, sk).is_none() {
             // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
             if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
+                #[cfg(test)]
+                e.bump_prewarm_shapes();
                 rc.put(
                     k,
                     sk,

@@ -3345,6 +3345,66 @@ A-->B
         });
     }
 
+    /// D1 速度自适应预算的公式单测：快滚（vel 大）时预算按比例放大、且硬封顶。
+    #[test]
+    fn prewarm_effective_budget_scales_with_velocity() {
+        use crate::markdown::wysiwyg::Prewarm;
+        let p = Prewarm::default();
+        assert_eq!(p.blocks_per_frame, 3, "基础预算默认 3 块/帧");
+        assert_eq!(p.effective_budget(0), 3, "静止/带内微滚只用基础预算");
+        assert_eq!(p.effective_budget(1), 7, "匀速 1 带/帧 → 预算 7");
+        assert_eq!(p.effective_budget(3), 15, "跨 3 带/帧 → 预算 15（近一档块数）");
+        assert_eq!(p.effective_budget(4), 19, "跨 4 带/帧 → 预算 19");
+        assert_eq!(p.effective_budget(100), Prewarm::MAX_BUDGET, "任意速度预算硬封顶");
+        assert!(p.effective_budget(4) >= 15, "快滚单帧预算应足以盖住一档的大部分块");
+    }
+
+    /// D1 速度自适应的接线回归：一次跨多带（快滚）后，下一帧预热应一次整形成倍块数
+    /// （非固定 3 块）——证明 `prewarm_band` 已用带序号跳跃算速度、按速度放大预算。
+    #[gpui::test]
+    fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!("paragraph number {i} with words here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let q = 512.;
+            let width = px(900.);
+            ed.update(cx, |e, _| e.set_caret(text.len()));
+
+            // 首帧登记带 0（无方向）；再对同一带预热 → dir 仍 0、直接返回（不整形）。
+            let f0 = build_frame(ed.read(cx), window, width, (0., q));
+            prewarm_band(ed.read(cx), &f0, window);
+            prewarm_band(ed.read(cx), &f0, window);
+
+            // 一次跳 3 个带（快滚）：方向置 +1、vel=3 → 预算 15。
+            let f1 = build_frame(ed.read(cx), window, width, (3. * q, 4. * q));
+            ed.read(cx).take_reshapes(); // 清 build_frame 自身的 Pass2 整形计数
+            prewarm_band(ed.read(cx), &f1, window);
+            let d1 = ed.read(cx).take_prewarm_shapes();
+            assert!(
+                (12..=15).contains(&d1),
+                "跨 3 带/帧应一次整形成倍块数（预算 15），实际 {d1}"
+            );
+
+            // 同一带再预热（vel=0）：回落到基础预算 3。
+            prewarm_band(ed.read(cx), &f1, window);
+            let d2 = ed.read(cx).take_prewarm_shapes();
+            assert!(
+                (1..=3).contains(&d2),
+                "静止时回落到基础预算 3，实际 {d2}"
+            );
+        });
+    }
+
     /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑**保留编辑线之前的块**、
     /// 作废受影响/位移后缀（比旧「整表清空」更进一步：Enter 后 Prefix 行仍命中缓存）。
     #[gpui::test]
