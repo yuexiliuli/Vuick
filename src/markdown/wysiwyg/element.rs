@@ -2824,7 +2824,7 @@ impl Element for WyEditorElement {
             let rgen = e.content_gen();
             let igen = e.images_gen();
             let mgen = e.math_gen();
-            let band = e.shape_band().unwrap_or((0., 6500.));
+            let band = e.shape_band().unwrap_or((0., 2048.));
             let cached_total = e
                 .frame
                 .borrow()
