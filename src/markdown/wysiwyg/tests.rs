@@ -3318,6 +3318,55 @@ A-->B
         });
     }
 
+    /// 表格/代码**内容行**的单字符键入按几何不变 → 非结构性：`struct_ver` 不递增
+    /// （不触发整篇 Pass1 + fold_plan 重建）、整形缓存整体保留、只重排被编辑块。
+    #[gpui::test]
+    fn table_cell_typing_is_non_structural(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        let mut text = String::from("| a | b |\n|---|---|\n");
+        for i in 0..60 {
+            text.push_str(&format!("| cell {i} | val |\n"));
+        }
+        text.push_str("para before\n");
+        text.push_str("para after\n");
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
+            let cached0 = ed.read(cx).shape_rows_len();
+            assert!(cached0 > 0);
+            ed.read(cx).take_reshapes();
+            let sv0 = ed.read(cx).struct_ver();
+            let at = text.find("cell 5").unwrap() + 3;
+            let blk = ed.read(cx).doc().block_index_for_line(ed.read(cx).row_col(at).0);
+            assert!(ed.read(cx).shape_rows_has(blk), "编辑前被编辑表块应已缓存");
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "X", ecx));
+            assert_eq!(
+                ed.read(cx).struct_ver(),
+                sv0,
+                "表内单字符键入不得递增 struct_ver（不得触发整篇 Pass1）"
+            );
+            assert!(
+                !ed.read(cx).shape_rows_has(blk),
+                "被编辑表块应从整形缓存剔除（局部作废）"
+            );
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
+            assert_eq!(
+                ed.read(cx).shape_rows_len(),
+                cached0,
+                "重建后缓存条目数应复原（其余块未被清除）"
+            );
+            let r = ed.read(cx).take_reshapes();
+            assert_eq!(r, 1, "只应重排被编辑的表块，实际 {r}");
+        });
+    }
+
     /// 字号/主题变化 → 行整形缓存整体清空（否则旧字号的行宽/高被复用）。
     #[gpui::test]
     fn font_change_clears_shape_cache(cx: &mut TestAppContext) {
@@ -4269,8 +4318,6 @@ A-->B
                 }
                 at2 += c.len_utf8();
             }
-            let mut t = 0u128;
-            let n = ins_seq.len().max(1);
             let ok = at2 < text.len()
                 && text.is_char_boundary(at2)
                 && text.is_char_boundary(at2 + 1)

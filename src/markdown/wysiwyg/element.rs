@@ -2026,7 +2026,8 @@ pub(crate) fn build_frame(
 
     // 基础布局：代 = `(struct_ver, 图片/数学/宽度)`。滚动/带移动与**非结构性编辑**
     // 都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
-    // 数组重算前缀和（旧实现在内容代变化时重扫全篇 ~400ms，是「一编辑就卡」之一）。
+    // 数组重算前缀和（旧实现在内容代变化时对全篇重扫 ~400ms，是「一编辑就卡」之一）。
+    let _t_setup = crate::prof::begin();
     let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits);
     let (rebuilt, base, old_layout) = editor.ensure_block_layout(n, epoch);
     // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
@@ -2046,6 +2047,7 @@ pub(crate) fn build_frame(
     // 结构扫描（derived 缓存 → O(1) Rc 复用）；`math_regions` 在 Pass3 卡片组装用。
     let derived = editor.derived();
     let math_regions = &derived.borrow().math_regions;
+    crate::prof::end("wy.bf.setup", _t_setup);
 
     if rebuilt {
         let _t_p1 = crate::prof::begin();
@@ -2184,6 +2186,7 @@ pub(crate) fn build_frame(
     // 按带现算叠加（最多一个数学块 + 一个折叠体）。⚠️ 必须在 Pass1 之后调用：
     // `deltas` 读基础布局当前高度（重建过的 epoch 使缓存键变化 → 自动重建）。
     let caret_line = editor.row_col(editor.caret()).0;
+    let _t_plan = crate::prof::begin();
     let plan = editor.fold_plan(base.clone(), epoch, mgen);
     let reveal = editor.fold_reveal(caret_line, &plan, &base);
     let math_start = &plan.math_start;
@@ -2204,12 +2207,28 @@ pub(crate) fn build_frame(
         (eff.into_boxed_slice().into(), s)
     };
     let revealed = |srcline: usize| reveal.contains(srcline);
+    crate::prof::end("wy.bf.plan", _t_plan);
 
     // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
+    let _t_bis = crate::prof::begin();
+    // `deltas` 前缀和表：`delta_pref[p]` = 前 p 项增量之和（p ∈ [0, len]），一次
+    // O(len) 建成 → 任意 `eff_top(i)` 只需 O(log len) 定位（partition_point 找
+    // 首个 `ix >= i`），旧实现每个二分步都对前缀现算 O(len) 求和：带内 3000 条增量
+    // 时 bisect ~2.8ms/帧、Pass3 逐行 O(rows×len) ~27ms/帧。
+    let delta_pref: Vec<f32> = {
+        let mut v = Vec::with_capacity(deltas.len() + 1);
+        let mut s = 0f32;
+        v.push(0.);
+        for &(_, d) in deltas.iter() {
+            s += d;
+            v.push(s);
+        }
+        v
+    };
     let eff_top = |i: usize| -> f32 {
         let b = base.borrow();
         let k = deltas.partition_point(|&(ix, _)| ix < i);
-        b.top(i) + deltas[..k].iter().map(|&(_, v)| v).sum::<f32>()
+        b.top(i) + delta_pref[k]
     };
     // 二分终止右闭（k ∈ [0, n]）：返回有效前缀满足谓词的 k 计数。
     let count_true = |pred: &dyn Fn(usize) -> bool| -> usize {
@@ -2227,6 +2246,7 @@ pub(crate) fn build_frame(
     };
     let i0 = count_true(&|k: usize| eff_top(k) <= band_lo).saturating_sub(1);
     let i1 = count_true(&|k: usize| eff_top(k) < band_hi).min(n);
+    crate::prof::end("wy.bf.bisect", _t_bis);
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
@@ -2283,6 +2303,7 @@ pub(crate) fn build_frame(
             // 只物化 miss / caret 块（连续段合并）。
             let mut rows_map: std::collections::HashMap<usize, DocRow> =
                 std::collections::HashMap::new();
+            let _t_parse = crate::prof::begin();
             let mut ni = 0usize;
             while ni < need_row.len() {
                 let lo2 = need_row[ni];
@@ -2296,8 +2317,10 @@ pub(crate) fn build_frame(
                     rows_map.insert(lo2 + off, r);
                 }
             }
+            crate::prof::end("wy.bf.blockparse", _t_parse);
             // 整带顺序装配（Pass3 依赖 `shaped` 与块序一致）：命中 → 浅克隆
             // （heavy 数据都是 Arc/Rc，top 在 Pass3 现设）；否则从物化行 shape。
+            let _t_shape = crate::prof::begin();
             for k in lo..hi {
                 let srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
@@ -2321,11 +2344,13 @@ pub(crate) fn build_frame(
                 base.borrow_mut().set(k, f32::from(srow.height));
                 shaped.push((k, srow));
             }
+            crate::prof::end("wy.bf.shape", _t_shape);
         }
     }
     crate::prof::end("wy.pass2", _t_p2);
 
     // Pass 3：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
+    let _t_pass3 = crate::prof::begin();
     let mut rows: Vec<ShapedRow> = Vec::new();
     let mut shaped_iter = shaped.into_iter().peekable();
     let total = {
@@ -2333,14 +2358,25 @@ pub(crate) fn build_frame(
         b.total()
     } + delta_sum;
     // 各路行按 top 从 base+deltas 现算；total 已含全部。
+    // `deltas` 按下标升序 → 用滚动指针 + 累加器：每行 O(1) 摊还拿到「ix<i 的增量和」
+    // 与「ix==i 的命中增量」，替代旧实现的逐行 `partition_point`+O(k) 求和+线性
+    // `find`（带 3000 条增量时 Pass3 ~27ms/帧 → ~2ms）。
+    let mut di = 0usize;
+    let mut acc = 0f32;
     for i in i0..i1 {
+        while di < deltas.len() && deltas[di].0 < i {
+            acc += deltas[di].1;
+            di += 1;
+        }
         let srcline = base.borrow().src_lines()[i] as usize;
         let b = base.borrow();
-        let h = b.height(i) + deltas.iter().find(|(ix, _)| *ix == i).map(|&(_, v)| v).unwrap_or(0.);
-        let top = {
-            let k = deltas.partition_point(|&(ix, _)| ix < i);
-            b.top(i) + deltas[..k].iter().map(|&(_, v)| v).sum::<f32>()
+        let d_here = if di < deltas.len() && deltas[di].0 == i {
+            Some(deltas[di].1)
+        } else {
+            None
         };
+        let h = b.height(i) + d_here.unwrap_or(0.);
+        let top = b.top(i) + acc;
         drop(b);
         if h <= 0. {
             continue; // 折叠 body / 数学 body：0 高不物化
@@ -2363,6 +2399,7 @@ pub(crate) fn build_frame(
             rows.push(srow);
         }
     }
+    crate::prof::end("wy.pass3", _t_pass3);
     crate::prof::end("wy.build_frame", _t_bf);
     Frame {
         padding,

@@ -369,11 +369,6 @@ impl Doc {
             .saturating_sub(1)
             .min(b.len() - 1)
     }
-    /// 第 `i` 块的类型（供 `replace_range` 判定编辑是否落在代码/表格块内——这类编辑
-    /// 走结构性重建，避免 patch 用到错误的块归属）。
-    pub(crate) fn block_kind_at_index(&self, i: usize) -> Option<RowKind> {
-        self.index.blocks.get(i).map(|m| m.kind)
-    }
 
     /// 每行起始字节偏移（`split('\n')` 语义，长度 = 行数）——`row_col`/`line_start`/
     /// `line_end` 的 O(log n) 二分索引（替代每帧对整篇源文本的线性扫描）。

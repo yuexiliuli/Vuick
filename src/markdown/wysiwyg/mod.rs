@@ -2006,19 +2006,23 @@ impl WyEditor {
         let old_line = self.doc.line_str(edit_line);
         let inserted_len = text.len();
         let prev_count = self.doc.block_count();
-        let in_code_table = {
-            let blk = self.doc.block_index_for_line(edit_line);
-            matches!(
-                self.doc.block_kind_at_index(blk),
-                Some(crate::markdown::parser::RowKind::Code)
-                    | Some(crate::markdown::parser::RowKind::Table)
-            )
-        };
+        // 编辑前被编辑块的几何（kind/src_line/aux）——用于判定是否需要降级为结构编辑：
+        // 代码/表格**内容行**的非换行键入块数/几何都变 → 走非结构路径（Patch + 局部
+        // 作废整形缓存），免整篇 Pass1 高度重建 + fold_plan 重建 + block_regions 整表
+        // 扫描（旧实现 `in_code_table` 一律 structural → 表内每键 ~140ms）。
+        let edit_blk = self.doc.block_index_for_line(edit_line);
+        let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
         self.doc.edit(r.clone(), text);
         let cross_newline = text.contains('\n') || removed.contains('\n') || text.contains('\r');
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
         let count_same = self.doc.block_count() == prev_count;
-        let structural = cross_newline || in_code_table || breaks_fence || !count_same;
+        // 几何不变 = 新块 meta 与编辑前 (kind, src_line, aux) 逐项一致；不一致（块被
+        // 吞并/分裂/变成表格/围栏等）必须结构重建。
+        let geo_same = match (self.doc.block_meta(edit_blk), prev_geo) {
+            (Some(nm), Some(om)) => nm.kind == om.0 && nm.src_line == om.1 && nm.aux == om.2,
+            _ => false,
+        };
+        let structural = cross_newline || breaks_fence || !count_same || !geo_same;
         // Pass1 增量高度重估起点：编辑行的**前一内容行**之后的块全部未变（编辑线之前
         // 的块内容/索引稳定）——结构编辑只在「该行起 → 文尾」重估，前缀高度复用。
         self.struct_dirty_line.set(edit_line);
