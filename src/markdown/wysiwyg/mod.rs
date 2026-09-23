@@ -1473,6 +1473,7 @@ impl WyEditor {
             // 标题折叠（视图本地状态）——仅在有折叠态时才需要全文扫描（纯文本/未折叠
             // 时跳过 `text_shared` 的 O(n) 复制）。
             {
+                let _t_head = crate::prof::begin();
                 let folded = self.folded_headings.borrow();
                 if !folded.is_empty() {
                     let content = self.doc.text_shared();
@@ -1481,38 +1482,46 @@ impl WyEditor {
                         fold_lines.extend(rnge.start + 1..rnge.end);
                     }
                 }
+                crate::prof::end("wy.fp.head", _t_head);
             }
             // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
+            // 用「命中标记 + 块值」双数组替代 FxHashMap+排序：块下标 ∈ [0,n)，填表
+            // O(1)、尾随按 0..n 升序扫出——免 30k 项 (ix,Δ) 全排序（实测 fp.tail
+            // debug ~14ms → O(n) 扫 ~1ms）。`or_insert` 语义保留：math_start 仅当块
+            // 未被 fold/math_body 标记时置卡高（fold/math_body 同为 -height，先置即赢）。
             let _t_dyn = crate::prof::begin();
-            let mut dyn_map: rustc_hash::FxHashMap<usize, f32> = rustc_hash::FxHashMap::with_capacity_and_hasher(
-                fold_lines.len() + math_body.len() + math_start.len(),
-                std::default::Default::default(),
-            );
-            {
-                // 行→块下标：用基表**稠密 `line_block`** 直达 O(1)（Pass1 rebuild 时已
-                // 填好），替代排序（6.7ms）+ 单调游标（3.4ms）或逐查询 partition_point
-                //（8ms）——9000 查询直查 + FxHash insert ≈ 1-2ms。fold/math_body 先插
-                //（负高），math_start 后 `or_insert` 不覆盖 → 与旧语义一致。
-                let base_br = base.borrow();
-                for &srcline in fold_lines.iter() {
-                    let ix = base_br.block_for_line(srcline);
-                    dyn_map.insert(ix, -base_br.height(ix));
-                }
-                for &srcline in math_body.iter() {
-                    let ix = base_br.block_for_line(srcline);
-                    dyn_map.insert(ix, -base_br.height(ix));
-                }
-                for (&srcline, &ridx) in math_start.iter() {
-                    let ix = base_br.block_for_line(srcline);
-                    let card_h =
-                        f32::from(element::math_card_height(self, &math_regions[ridx]));
-                    dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
+            let base_br = base.borrow();
+            let nb = base_br.n();
+            let mut marked: Vec<bool> = vec![false; nb];
+            let mut vals: Vec<f32> = vec![0.0; nb];
+            for &srcline in fold_lines.iter() {
+                let ix = base_br.block_for_line(srcline);
+                marked[ix] = true;
+                vals[ix] = -base_br.height(ix);
+            }
+            for &srcline in math_body.iter() {
+                let ix = base_br.block_for_line(srcline);
+                marked[ix] = true;
+                vals[ix] = -base_br.height(ix);
+            }
+            for (&srcline, &ridx) in math_start.iter() {
+                let ix = base_br.block_for_line(srcline);
+                if !marked[ix] {
+                    let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
+                    marked[ix] = true;
+                    vals[ix] = card_h - base_br.height(ix);
                 }
             }
             crate::prof::end("wy.fp.dyn", _t_dyn);
-            let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
-            deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
+            let _t_tail = crate::prof::begin();
+            let mut deltas_vec: Vec<(usize, f32)> = Vec::new();
+            for ix in 0..nb {
+                if marked[ix] {
+                    deltas_vec.push((ix, vals[ix]));
+                }
+            }
             let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
+            crate::prof::end("wy.fp.tail", _t_tail);
             let plan = Rc::new(element::FoldPlan {
                 math_start,
                 math_body,

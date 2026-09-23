@@ -2251,8 +2251,12 @@ pub(crate) fn build_frame(
     // `deltas` 读基础布局当前高度（重建过的 epoch 使缓存键变化 → 自动重建）。
     let caret_line = editor.row_col(editor.caret()).0;
     let _t_plan = crate::prof::begin();
+    let _t_fold = crate::prof::begin();
     let plan = editor.fold_plan(base.clone(), epoch, mgen);
+    crate::prof::end("wy.bf.plan.fold", _t_fold);
+    let _t_rv = crate::prof::begin();
     let reveal = editor.fold_reveal(caret_line, &plan, &base);
+    crate::prof::end("wy.bf.plan.reveal", _t_rv);
     let math_start = &plan.math_start;
     let math_body = &plan.math_body;
     let fold_lines = &plan.fold_lines;
