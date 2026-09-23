@@ -567,7 +567,7 @@ pub(crate) fn paint_quote_band(
     theme: &WyTheme,
     f: &Frame,
     row: &ShapedRow,
-    alert_kinds: &std::collections::HashMap<usize, AlertKind>,
+    alert_kinds: &rustc_hash::FxHashMap<usize, AlertKind>,
     window: &mut Window,
 ) {
     let x0 = origin.x + f.padding;

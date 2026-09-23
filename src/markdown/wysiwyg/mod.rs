@@ -392,7 +392,9 @@ pub(crate) struct WyDerived {
     /// 可折叠 callout 区域 `(行区间, 是否折叠)`。
     pub alert_fold_regions: Vec<(Range<usize>, bool)>,
     /// 每个警报区域的 `AlertKind`（marker + body 行），paint 引述条着色用。
-    pub alert_region_kinds: std::collections::HashMap<usize, crate::markdown::recognition::AlertKind>,
+    /// Fx 哈希：结构编辑 `shift_derived` 全量平移重插时省 SipHash（大文档几百到
+    /// 数千条 ≈ Enter 路径 1-2ms）。
+    pub alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::recognition::AlertKind>,
 }
 
 /// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——已被「可见带懒光栅」取代（`sync_math`
@@ -520,6 +522,16 @@ impl RowShapeCache {
         for &b in blocks {
             self.entries.remove(&b);
         }
+    }
+    /// **前缀保留**：结构编辑（块数/块序变化）时，编辑线之前的块（下标 < `keep`）
+    /// 内容/索引稳定，其整形缓存仍有效；只作废下标 ≥ `keep` 的（受影响/位移）块——
+    /// 替代整表 `clear`（防止 Enter 后 Pass2 把整带 74 行重 shape 一遍 ~7ms）。
+    fn retain_prefix(&mut self, keep: usize) {
+        if keep == 0 {
+            self.entries.clear();
+            return;
+        }
+        self.entries.retain(|&k, _| k < keep);
     }
     fn clear(&mut self) {
         self.entries.clear();
@@ -1356,9 +1368,11 @@ impl WyEditor {
             }
         }
         let old = self.block_layout.borrow().as_ref().map(|(_, l)| l.clone());
+        let doc_lines = self.doc().line_starts().len();
         let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::new(
             vec![0.0; n_blocks],
             vec![0u32; n_blocks],
+            doc_lines,
         )));
         *self.block_layout.borrow_mut() = Some((epoch, l.clone()));
         (true, l, old)
@@ -1436,40 +1450,24 @@ impl WyEditor {
                 std::default::Default::default(),
             );
             {
-                // 行→块下标：统一收集后按 `(行号, 阶段)` 排序，**单调游标一次走完**——
-                // 替代每个查询行 `partition_point` O(log n)（9000 行 × 17 步 = 大文档
-                // Enter 时 fp.dyn 的主成本）。fold/math_body = 阶段 0（负高）先行，
-                // math_start = 阶段 1（卡高）后用 `or_insert` 不覆盖 → 与旧语义一致。
-                let mut entries: Vec<(usize, u8, usize)> = Vec::with_capacity(
-                    fold_lines.len() + math_body.len() + math_start.len(),
-                );
-                for &s in fold_lines.iter() {
-                    entries.push((s, 0, 0));
-                }
-                for &s in math_body.iter() {
-                    entries.push((s, 0, 0));
-                }
-                for (&s, &r) in math_start.iter() {
-                    entries.push((s, 1, r));
-                }
-                entries.sort_unstable_by_key(|&(s, ph, _)| (s, ph));
-
+                // 行→块下标：用基表**稠密 `line_block`** 直达 O(1)（Pass1 rebuild 时已
+                // 填好），替代排序（6.7ms）+ 单调游标（3.4ms）或逐查询 partition_point
+                //（8ms）——9000 查询直查 + FxHash insert ≈ 1-2ms。fold/math_body 先插
+                //（负高），math_start 后 `or_insert` 不覆盖 → 与旧语义一致。
                 let base_br = base.borrow();
-                let src_lines = base_br.src_lines();
-                let src_len = src_lines.len();
-                // 单调游标：entries 按 srcline 升序 → block_ix 只进不退。
-                let mut cur = 0usize;
-                for &(srcline, ph, ridx) in entries.iter() {
-                    while cur + 1 < src_len && (src_lines[cur + 1] as usize) <= srcline {
-                        cur += 1;
-                    }
-                    let ix = cur;
-                    if ph == 0 {
-                        dyn_map.insert(ix, -base_br.height(ix));
-                    } else {
-                        let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
-                        dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
-                    }
+                for &srcline in fold_lines.iter() {
+                    let ix = base_br.block_for_line(srcline);
+                    dyn_map.insert(ix, -base_br.height(ix));
+                }
+                for &srcline in math_body.iter() {
+                    let ix = base_br.block_for_line(srcline);
+                    dyn_map.insert(ix, -base_br.height(ix));
+                }
+                for (&srcline, &ridx) in math_start.iter() {
+                    let ix = base_br.block_for_line(srcline);
+                    let card_h =
+                        f32::from(element::math_card_height(self, &math_regions[ridx]));
+                    dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
                 }
             }
             crate::prof::end("wy.fp.dyn", _t_dyn);
@@ -1578,7 +1576,8 @@ impl WyEditor {
             .iter()
             .filter_map(|(r, _, fold)| fold.map(|f| (r.clone(), f)))
             .collect();
-        let mut alert_region_kinds = std::collections::HashMap::new();
+        let mut alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::recognition::AlertKind> =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(alerts.len() * 2, Default::default());
         for (r, k, _) in &alerts {
             for l in r.clone() {
                 alert_region_kinds.insert(l, *k);
@@ -1896,7 +1895,8 @@ impl WyEditor {
         }
         if line_delta != 0 {
             let old = std::mem::take(&mut d.alert_region_kinds);
-            d.alert_region_kinds = std::collections::HashMap::with_capacity(old.len());
+            d.alert_region_kinds =
+                rustc_hash::FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
             for (l, k) in old {
                 d.alert_region_kinds.insert(shift(l), k);
             }
@@ -2093,8 +2093,11 @@ impl WyEditor {
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
-            // 块数/块序变化 → 块下标不再稳定 → 行整形缓存整体作废。
-            self.shape_rows.borrow_mut().clear();
+            // 块数/块序变化 → 编辑线之前的块（< edit_blk）下标/内容未变，其整形缓存
+            // 仍有效（保留）；≥ edit_blk 的块受影响/位移 → 作废。比整表 `clear` 让
+            // Pass2 复用前缀行，Enter 不再整带重 shape。`edit_blk` 是**编辑前**受影响块。
+            let prefix_keep = edit_blk.min(prev_count);
+            self.shape_rows.borrow_mut().retain_prefix(prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
             let mut pw = self.prewarm.borrow_mut();

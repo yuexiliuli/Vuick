@@ -3345,7 +3345,8 @@ A-->B
         });
     }
 
-    /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑整体清空。
+    /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑**保留编辑线之前的块**、
+    /// 作废受影响/位移后缀（比旧「整表清空」更进一步：Enter 后 Prefix 行仍命中缓存）。
     #[gpui::test]
     fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {        use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
@@ -3383,12 +3384,17 @@ A-->B
             let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
             let r = ed.read(cx).take_reshapes();
             assert_eq!(r, 1, "只应重排被编辑块，实际 {r}");
-            // 结构性编辑（插入换行）→ 整体清空。
+            // 结构性编辑（插入换行）→ 受影响/位移的后缀作废，编辑线之前的块保留
+            // （前缀复用，Pass2 免整带重 shape；旧实现整表 clear 后 Enter 每键重排整带）。
             ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
-            assert_eq!(
-                ed.read(cx).shape_rows_len(),
-                0,
-                "结构性编辑（换行）应整体清空行整形缓存"
+            let after = ed.read(cx).shape_rows_len();
+            assert!(
+                after > 0 && after < cached,
+                "结构编辑应保留前缀缓存、作废后缀（{after} 于 {cached}）"
+            );
+            assert!(
+                !ed.read(cx).shape_rows_has(blk_edit),
+                "结构编辑应剔除被编辑块"
             );
         });
     }
