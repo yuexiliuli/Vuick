@@ -1370,6 +1370,7 @@ impl WyEditor {
             let d = derived.borrow();
             let math_regions = &d.math_regions;
             // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
+            let _t_sets = crate::prof::begin();
             let mut math_start: std::collections::HashMap<usize, usize> =
                 std::collections::HashMap::with_capacity(math_regions.len());
             let mut math_body: std::collections::HashSet<usize> =
@@ -1388,6 +1389,7 @@ impl WyEditor {
                 fold_bodies.push(rnge.clone());
                 fold_lines.extend(rnge.start + 1..rnge.end);
             }
+            crate::prof::end("wy.fp.sets", _t_sets);
             // 标题折叠（视图本地状态）——仅在有折叠态时才需要全文扫描（纯文本/未折叠
             // 时跳过 `text_shared` 的 O(n) 复制）。
             {
@@ -1401,6 +1403,7 @@ impl WyEditor {
                 }
             }
             // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
+            let _t_dyn = crate::prof::begin();
             let mut dyn_map: std::collections::HashMap<usize, f32> =
                 std::collections::HashMap::with_capacity(
                     fold_lines.len() + math_body.len() + math_start.len(),
@@ -1430,6 +1433,7 @@ impl WyEditor {
                     dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
                 }
             }
+            crate::prof::end("wy.fp.dyn", _t_dyn);
             let mut deltas_vec: Vec<(usize, f32)> = dyn_map.into_iter().collect();
             deltas_vec.sort_unstable_by_key(|&(ix, _)| ix);
             let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
@@ -1703,9 +1707,10 @@ impl WyEditor {
                     None => MathSlot::Failed,
                 };
                 let slots2 = slots.clone();
+                let key2 = key.clone();
                 let should_bump = slots2.borrow_mut().insert(key.clone(), slot).is_none();
                 if should_bump {
-                    let _ = this.update(cx, |e, ecx| e.on_math_ready(ecx));
+                    let _ = this.update(cx, |e, ecx| e.on_math_ready(&key2, ecx));
                 }
             })
             .detach();
@@ -1713,10 +1718,25 @@ impl WyEditor {
     }
 
     /// 一个公式排版完成：自增代数 → 帧缓存失效（下次 measure 以真实高度重建）。
-    fn on_math_ready(&mut self, cx: &mut Context<Self>) {
+    /// **带门控**：完成的公式不在当前带内 → 只置代数（保持候选高度一致，滚动回带时由
+    /// 自然重建带上），不立即失效帧/重绘——滚过一片公式区时几十个后台光栅完成不再各自
+    /// 打断一帧（消除数学密集段的滚动/空转卡顿）。在带内才立即失效（本帧换真图）。
+    fn on_math_ready(&mut self, key: &str, cx: &mut Context<Self>) {
+        let in_band = self.frame.borrow().as_ref().is_some_and(|f| {
+            f.rows.iter().any(|r| {
+                if let Some(element::BlockCard::Math { latex, .. }) = &r.extra.card {
+                    if latex.trim() == key {
+                        return true;
+                    }
+                }
+                r.extra.inline_maths.iter().any(|m| m.key.as_ref() == key)
+            })
+        });
         self.math_gen.set(self.math_gen.get().wrapping_add(1));
-        *self.frame.borrow_mut() = None;
-        cx.notify();
+        if in_band {
+            *self.frame.borrow_mut() = None;
+            cx.notify();
+        }
     }
 
     /* ---------- 光标 ↔ 源辅助 ---------- */
