@@ -2718,13 +2718,34 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         st.bias = 0;
     }
     let _t = crate::prof::begin();
+    // 每帧预热**时间硬上限**：块数预算（最高 24 块/帧）× 昂贵块（debug 单块可就几十
+    // ms）能把单帧干到 1.3s（实测快滚跨新带）。按已过时间截断，再不阻塞主线程——
+    // 预热只是「提前整形、进带可浅克隆复用」，少预几张由进带 Pass2 补，不影响正确性。
+    let t0 = std::time::Instant::now();
+    let time_budget = std::time::Duration::from_millis(8);
     let mut done = 0usize;
     let mut k = i0 + st.bias;
     loop {
-        if done >= bpf {
+        if done >= bpf || t0.elapsed() > time_budget {
             break;
         }
         let srcline = frame.base.borrow().src_lines()[k] as usize;
+        // 大块跳过预热：单块 DocRow 覆盖整块源区间，`rows_in_block_window(k,k)` 会
+        // 一次性物化并整形整个块（debug 胖表格/长代码段可达 1.6s/块，实测快滚跨界时
+        // 单帧窒息）。预热只挑小/中块；大块进带时由 Pass2 权威整形（那时本来就要渲染）。
+        // 判定用「字节跨度 + 行跨度」双阈值——行数不反映行的宽度（胖表格多列），字节更准。
+        let big = {
+            let base_ref = frame.base.borrow();
+            let sl = base_ref.src_lines();
+            let s0 = sl.get(k).copied().unwrap_or(0) as usize;
+            let s1 = sl.get(k + 1).copied().map(|v| v as usize).unwrap_or(s0 + 1);
+            let span_lines = s1.saturating_sub(s0);
+            let span_bytes = doc
+                .block_meta(k)
+                .and_then(|m| doc.block_meta(k + 1).map(|n| n.byte as i64 - m.byte as i64))
+                .unwrap_or(0);
+            span_lines > 64 || span_bytes > 4096
+        };
         // 与 Pass2 `blocked` 同判据：折叠/math 块不物化整形行。
         let blocked = match &plan {
             Some(p) => {
@@ -2734,7 +2755,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
             }
             None => false,
         };
-        if !blocked && caret_line != srcline && rc.get(k, sk).is_none() {
+        if !blocked && !big && caret_line != srcline && rc.get(k, sk).is_none() {
             // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
             if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
                 #[cfg(test)]
