@@ -1393,16 +1393,21 @@ impl WyEditor {
             let math_regions = &d.math_regions;
             // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
             let _t_sets = crate::prof::begin();
-            let mut math_start: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::with_capacity(math_regions.len());
-            let mut math_body: std::collections::HashSet<usize> =
-                std::collections::HashSet::with_capacity(math_regions.len() * 2);
+            let mut math_start: rustc_hash::FxHashMap<usize, usize> =
+                rustc_hash::FxHashMap::with_capacity_and_hasher(
+                    math_regions.len(),
+                    std::default::Default::default(),
+                );
+            let mut math_body: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+                math_regions.len() * 2,
+                std::default::Default::default(),
+            );
             for (idx, reg) in math_regions.iter().enumerate() {
                 math_start.insert(reg.range.start, idx);
                 math_body.extend(reg.range.start + 1..reg.range.end);
             }
             // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高；记录 body 区间供 reveal。
-            let mut fold_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            let mut fold_lines: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
             let mut fold_bodies: Vec<Range<usize>> = Vec::new();
             for (rnge, folded) in &d.alert_fold_regions {
                 if !*folded {
@@ -1426,33 +1431,45 @@ impl WyEditor {
             }
             // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
             let _t_dyn = crate::prof::begin();
-            let mut dyn_map: std::collections::HashMap<usize, f32> =
-                std::collections::HashMap::with_capacity(
+            let mut dyn_map: rustc_hash::FxHashMap<usize, f32> = rustc_hash::FxHashMap::with_capacity_and_hasher(
+                fold_lines.len() + math_body.len() + math_start.len(),
+                std::default::Default::default(),
+            );
+            {
+                // 行→块下标：统一收集后按 `(行号, 阶段)` 排序，**单调游标一次走完**——
+                // 替代每个查询行 `partition_point` O(log n)（9000 行 × 17 步 = 大文档
+                // Enter 时 fp.dyn 的主成本）。fold/math_body = 阶段 0（负高）先行，
+                // math_start = 阶段 1（卡高）后用 `or_insert` 不覆盖 → 与旧语义一致。
+                let mut entries: Vec<(usize, u8, usize)> = Vec::with_capacity(
                     fold_lines.len() + math_body.len() + math_start.len(),
                 );
-            {
+                for &s in fold_lines.iter() {
+                    entries.push((s, 0, 0));
+                }
+                for &s in math_body.iter() {
+                    entries.push((s, 0, 0));
+                }
+                for (&s, &r) in math_start.iter() {
+                    entries.push((s, 1, r));
+                }
+                entries.sort_unstable_by_key(|&(s, ph, _)| (s, ph));
+
                 let base_br = base.borrow();
                 let src_lines = base_br.src_lines();
                 let src_len = src_lines.len();
-                let block_ix_of = |srcline: usize| -> usize {
-                    src_lines
-                        .partition_point(|&s| (s as usize) <= srcline)
-                        .saturating_sub(1)
-                        .min(src_len.saturating_sub(1))
-                };
-                for &srcline in fold_lines.iter() {
-                    let ix = block_ix_of(srcline);
-                    dyn_map.insert(ix, -base_br.height(ix));
-                }
-                for &srcline in math_body.iter() {
-                    let ix = block_ix_of(srcline);
-                    dyn_map.insert(ix, -base_br.height(ix));
-                }
-                for (&srcline, &ridx) in math_start.iter() {
-                    let ix = block_ix_of(srcline);
-                    let card_h =
-                        f32::from(element::math_card_height(self, &math_regions[ridx]));
-                    dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
+                // 单调游标：entries 按 srcline 升序 → block_ix 只进不退。
+                let mut cur = 0usize;
+                for &(srcline, ph, ridx) in entries.iter() {
+                    while cur + 1 < src_len && (src_lines[cur + 1] as usize) <= srcline {
+                        cur += 1;
+                    }
+                    let ix = cur;
+                    if ph == 0 {
+                        dyn_map.insert(ix, -base_br.height(ix));
+                    } else {
+                        let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
+                        dyn_map.entry(ix).or_insert(card_h - base_br.height(ix));
+                    }
                 }
             }
             crate::prof::end("wy.fp.dyn", _t_dyn);

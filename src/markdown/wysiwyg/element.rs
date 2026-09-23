@@ -365,11 +365,11 @@ impl BlockLayout {
 /// 优惠叠加（最多一个数学块 + 一个折叠体）。
 pub(crate) struct FoldPlan {
     /// 数学块首源码行 → `math_regions` 下标（全部块；reveal 由 `RevealPlan` 覆盖）。
-    pub math_start: std::collections::HashMap<usize, usize>,
+    pub math_start: rustc_hash::FxHashMap<usize, usize>,
     /// 数学块 body 行（折叠成 0 高）。
-    pub math_body: std::collections::HashSet<usize>,
+    pub math_body: rustc_hash::FxHashSet<usize>,
     /// 折叠 body 行（callout / 标题；折叠成 0 高）。
-    pub fold_lines: std::collections::HashSet<usize>,
+    pub fold_lines: rustc_hash::FxHashSet<usize>,
     /// 各折叠体的 body 行区间（reveal 找「caret 所在折叠体」用）。
     pub fold_bodies: Vec<Range<usize>>,
     /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高。
@@ -2128,22 +2128,29 @@ pub(crate) fn build_frame(
             None => 0,
         };
         // 新尾部起点 k：首个新块 src_line ≥ 旧尾部 src_line + 行数净增。旧布局缺失
-        // （首建）或编辑近文末（无旧尾部）时中段扫到底。
+        // （首建）或编辑近文末（无旧尾部）时中段扫到底。块 src_line 随下标单调 →
+        // 直接**二分**首个 `src_line ≥ tail_src`，替代旧实现对 `[keep, n)` 全部块逐个
+        // `doc.block_meta` + `collect` 成 Vec（中段编辑 57k 块 × O(log) 是 pass1 的
+        // 4-6ms 主成本）。
         let tail_src = match (old_src, old_src.and_then(|os| os.get(j).copied())) {
             (_, Some(s)) => s as i64 + line_delta,
             _ => doc_lines as i64,
         };
-        let new_src_lines: Vec<u32> = (keep..n)
-            .filter_map(|i| doc.block_meta(i).map(|m| m.src_line))
-            .collect();
         let k = if !old_exist {
             n
         } else if keep < n {
-            new_src_lines
-                .iter()
-                .position(|&s| (s as i64) >= tail_src)
-                .map(|off| keep + off)
-                .unwrap_or(n)
+            let mut lo = keep;
+            let mut hi = n;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let sl = doc.block_meta(mid).map(|m| m.src_line as i64).unwrap_or(i64::MAX);
+                if sl >= tail_src {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
         } else {
             keep
         };
