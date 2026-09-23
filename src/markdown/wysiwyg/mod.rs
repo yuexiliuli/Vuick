@@ -254,6 +254,11 @@ pub struct WyEditor {
     /// 不再整带重 shape + 代码块重跑 syntect（大文档滚动「每档 65ms」的主因）。
     /// 非结构性编辑只作废被编辑块，结构性/换源/字号变化整体清空。
     shape_rows: RefCell<RowShapeCache>,
+    /// 含 `.notdef`（glyph id=0，Windows 冷启动回退未命中）的块 → 连续坏帧数。
+    /// 见 [`RowShapeCache`] 文档「含 notdef 不缓存」：Pass2 命中判定/入缓存前都会
+    /// 检查，命中含 notdef 的缓存视作 miss、整形出 notdef 的不入缓存，并用扰动宽度
+    /// 的 token 打破 gpui 的 2-frame 行缓存，让重排真正打到平台直至回退解析成功。
+    notdef_retry: RefCell<rustc_hash::FxHashMap<usize, u32>>,
     /// （仅测试）自上次读取以来 Pass2 实际发生的行整形次数（缓存未命中/光标行）。
     #[cfg(test)]
     reshapes: Cell<u64>,
@@ -545,6 +550,11 @@ impl RowShapeCache {
     }
 }
 
+/// 含 `.notdef`（回退未命中）块的连续重试帧数上限：每帧以「新鲜 wrap-width token」
+/// 让 `shape_text` 真正打到 DWrite（破 gpui 的 2-frame 行缓存回喂旧坏布局）。超过
+/// 该上限仍坏 → 判定字符确实无字形（正确显示 tofu），从此正常入缓存不再空转。
+pub(crate) const NOTDEF_RETRY_FRAMES: u32 = 12;
+
 /// 跨帧滚动预热进度（见 [`element::prewarm_band`]）：方向只由带序号跨界
 /// （`band.top/512` 取整变化）决定，量子内小滚不换向；预算按块数硬上限；
 /// `bias` = 目标带内滑动窗起点，每帧推进、回绕兜底（保证总有进度、永不卡死）。
@@ -585,29 +595,6 @@ impl WyEditor {
         let ts = window.text_style();
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
         let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
-        // Windows 冷启动字体回退预热：`gpui_windows` 的 `prewarm_fonts` 是空实现，字体
-        // 集合与回退映射纯惰性初始化——冷进程首次把 `❗⚠✅…` 这类**仅靠回退字体提供的
-        // 字形**排成 `.notdef` 豆腐块（空心矩形），且坏字形被形状缓存钉住整次运行；
-        // 第二次运行 OS/DW 字体缓存已温 → 回退解析正常。首次 WYSIWYG 在后台对含这些
-        // 字形的探针做一次 `shape_line`，把 DWrite 的回退解析/系统字体集合提前暖起来，
-        // 首帧即显示正确字形（此后无成本，仅一次）。
-        static FONT_FALLBACK_WARM: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !FONT_FALLBACK_WARM.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let probe_ts = window.text_system().clone();
-            let probe_font = ts.font();
-            cx.background_executor()
-                .spawn(async move {
-                    let probe: SharedString = "❗⚠✅✔♦★▶「」中文 abc123".into();
-                    let run = [gpui::TextRun {
-                        len: probe.len(),
-                        font: probe_font,
-                        ..Default::default()
-                    }];
-                    let _ = probe_ts.shape_line(probe, px(16.), &run, None);
-                })
-                .detach();
-        }
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
@@ -633,6 +620,11 @@ impl WyEditor {
             shape_rows: RefCell::new(RowShapeCache::new(
                 crate::config::limits::SHAPED_ROW_CACHE_CAP,
             )),
+            // 含 `.notdef`（元字形，glyph id=0）的坏排板块：Windows 冷启动时回退字体
+            // （❗⚠✅ 等主字体缺的字形）首次解析可能给出 .notdef，且坏的 ShapedRow 若被
+            // 行缓存钉住整次运行不消失。此表登记「仍待新鲜重排」的块（值=连续坏帧数），
+            // Pass2 用扰动 wrap-width 破 gpui 的 2-frame 行缓存拿到真正的平台重排。
+            notdef_retry: RefCell::new(rustc_hash::FxHashMap::default()),
             #[cfg(test)]
             reshapes: Cell::new(0),
             #[cfg(test)]
@@ -674,6 +666,7 @@ impl WyEditor {
         *self.block_layout.borrow_mut() = None;
         // 整形行内容同样依赖主题（字号/颜色/字体）→ 整体清空。
         self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
@@ -689,6 +682,43 @@ impl WyEditor {
         *self.block_layout.borrow_mut() = None;
         // 字号变 → 行整形（宽/高）也失效。
         self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
+    }
+
+    // —— `.notdef`（回退未命中）坏行自愈 ——
+    // Windows 冷启动时 DWrite 对主字体缺的字形（❗⚠✅ 等，需走回退字体）首次解析可能
+    // 直接给出 .notdef（glyph id=0，空心矩形）。若这个坏 `ShapedRow` 被行缓存钉住，
+    // 整次运行都不消失——确认过的机制：只有「该行恰被重排」（点击/上光标）才换成正确
+    // 字形，其余行一直豆腐块。修复不走「加回退字体到缓存键」（键输入不含回退解析状态，
+    // 改了也没用）：命中判定/入缓存前扫出含 .notdef 的整行结果 → 不入缓存并重试重排，
+    // 直至平台回退解析成功（连续 `NOTDEF_RETRY_FRAMES` 帧仍坏才判定真无字形、接受入缓存）。
+
+    /// 该块是否处于 notdef 待重试：是 → 返回一个「新鲜 wrap-width token」（每帧一位
+    /// 小数增量）打破 gpui 2-frame 行缓存，让本次 `shape_text` 真正打到平台重排
+    /// （否则同一文本每帧重排时会从上一帧缓存回喂同一份旧坏布局，永远不收敛）。
+    pub(crate) fn notdef_shape_width(&self, block: usize, width: Pixels) -> Pixels {
+        match self.notdef_retry.borrow().get(&block).copied() {
+            Some(cnt) => width - px(0.001 * (cnt + 1) as f32),
+            None => width,
+        }
+    }
+
+    /// 登记一次 notdef 坏排（值 = 连续坏帧数，用作 token 递增）。返回 `true` 表示
+    /// 已达 `NOTDEF_RETRY_FRAMES` 上限 → 判定字符确无字形，本次结果应被接受入缓存。
+    pub(crate) fn note_notdef(&self, block: usize) -> bool {
+        let mut m = self.notdef_retry.borrow_mut();
+        let cnt = m.get(&block).copied().unwrap_or(0) + 1;
+        if cnt >= NOTDEF_RETRY_FRAMES {
+            m.remove(&block);
+            true
+        } else {
+            m.insert(block, cnt);
+            false
+        }
+    }
+
+    pub(crate) fn clear_notdef(&self, block: usize) {
+        self.notdef_retry.borrow_mut().remove(&block);
     }
 
     /// 设置初始内容。
@@ -749,6 +779,7 @@ impl WyEditor {
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
     }
@@ -762,6 +793,7 @@ impl WyEditor {
         self.preseed_image_sizes();
         *self.frame.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
     }
 
     /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
@@ -2177,6 +2209,8 @@ impl WyEditor {
             // Pass2 复用前缀行，Enter 不再整带重 shape。`edit_blk` 是**编辑前**受影响块。
             let prefix_keep = edit_blk.min(prev_count);
             self.shape_rows.borrow_mut().retain_prefix(prefix_keep);
+            // 结构与 notdef 重试表同口径：前缀块下标未变、重试状态保留；≥ keep 作废。
+            self.notdef_retry.borrow_mut().retain(|&k, _| k < prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
             let mut pw = self.prewarm.borrow_mut();
@@ -2189,6 +2223,7 @@ impl WyEditor {
             *self.pending_patch_blocks.borrow_mut() = Some(vec![blk]);
             // 该块内容变了但 `epoch` 不变 → 必须显式作废其整形缓存（否则复用旧图）。
             self.shape_rows.borrow_mut().invalidate(&[blk]);
+            self.notdef_retry.borrow_mut().remove(&blk);
         }
         self.math_dollar_cnt.set(
             self.math_dollar_cnt.get()
@@ -2398,6 +2433,7 @@ impl WyEditor {
         *self.pending_patch_blocks.borrow_mut() = None;
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         cx.emit(WyEvent::Changed);

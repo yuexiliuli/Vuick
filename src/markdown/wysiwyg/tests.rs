@@ -1,8 +1,9 @@
 //! `element` 的单元测试。原内联于 `element.rs`，抽取后经 `#[path]` 挂在
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
     use super::{
-        build_frame, caret_geometry, display_to_source, prewarm_band, source_offset_at,
-        source_to_display, table_block_height, table_cell_x0, table_row_top, WyEditor,
+        build_frame, caret_geometry, display_to_source, layout_has_notdef, prewarm_band,
+        source_offset_at, source_to_display, table_block_height, table_cell_x0, table_row_top,
+        WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -4675,4 +4676,93 @@ A-->B
             t2, t2 as f64 / n as f64, r2
         );
         crate::prof::dump("wy.scroll.warm");
+    }
+
+    #[test]
+    fn layout_has_notdef_flags_missing_glyph() {
+        // `.notdef`（元字形，glyph id=0）＝ Windows 冷启动回退未命中的「豆腐块」。
+        let mk = |ids: &[u32]| gpui::LineLayout {
+            font_size: px(16.),
+            width: px(10.),
+            ascent: px(12.),
+            descent: px(3.),
+            len: ids.len(),
+            runs: vec![gpui::ShapedRun {
+                font_id: gpui::FontId(0),
+                glyphs: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &id)| gpui::ShapedGlyph {
+                        id: gpui::GlyphId(id),
+                        position: point(px(i as f32), px(0.)),
+                        index: i,
+                        is_emoji: false,
+                    })
+                    .collect(),
+            }],
+        };
+        assert!(!layout_has_notdef(&mk(&[])));
+        assert!(!layout_has_notdef(&mk(&[1, 2, 3])));
+        assert!(
+            layout_has_notdef(&mk(&[1, 0, 3])),
+            "含 glyph 0 应判 notdef"
+        );
+        assert!(layout_has_notdef(&mk(&[0])));
+    }
+
+    #[gpui::test]
+    fn notdef_retry_state_machine(cx: &mut TestAppContext) {
+        // 直接驱动 notdef 重试表（不依赖平台回退）：
+        // - 未登记块 → notdef_shape_width 用原宽（不打扰正常 pass）；
+        // - 登记后 → 扰动 wrap-width token（破 gpui 2-frame 行缓存，每次重排真正上平台）；
+        // - 连续 NOTDEF_RETRY_FRAMES 帧仍坏 → note_notdef 返回「给出」并清登记（接受入缓存）；
+        // - clear_notdef 后恢复原宽。
+        use crate::markdown::wysiwyg::NOTDEF_RETRY_FRAMES;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let w0 = px(980.);
+        let width_at = |vcx: &mut VisualTestContext, block: usize| -> gpui::Pixels {
+            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_shape_width(block, w0))
+        };
+        assert_eq!(
+            width_at(vcx, 3),
+            w0,
+            "未登记块应原宽（不打扰正常 pass）"
+        );
+        // 连打坏帧：第 k 帧返回「未给出」（k < 上限）、第 N 帧返回「给出」并清登记。
+        let mut gave_up_at = None;
+        for k in 1..=NOTDEF_RETRY_FRAMES {
+            let ok = vcx.update(|_, cx| host.read(cx).ed.read(cx).note_notdef(3));
+            if ok && gave_up_at.is_none() {
+                gave_up_at = Some(k);
+            }
+            if k < NOTDEF_RETRY_FRAMES {
+                assert!(!ok, "第 {k} 帧应仍未给出");
+            } else {
+                assert!(ok, "第 {k} 帧应给出并清登记");
+            }
+        }
+        assert_eq!(gave_up_at, Some(NOTDEF_RETRY_FRAMES));
+        assert_eq!(
+            width_at(vcx, 3),
+            w0,
+            "给出后登记已清 → 恢复原宽"
+        );
+        // 登记中 → token 确实扰动（保证每次重排都打到平台）。
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).note_notdef(7));
+        assert_ne!(
+            width_at(vcx, 7),
+            w0,
+            "登记中应扰动宽度"
+        );
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).clear_notdef(7));
+        assert_eq!(
+            width_at(vcx, 7),
+            w0,
+            "clear 后恢复原宽"
+        );
     }

@@ -61,6 +61,14 @@ fn shaped_text_width(
         .into()
 }
 
+/// 一段排好的行布局是否含 `.notdef`（glyph id=0，元字形＝豆腐块）。Windows 冷启动时
+/// 主字体缺、需走回退字体才有的字形（❗⚠✅ 等）首次解析可能直接给 `.notdef`（空心
+/// 矩形）；含它的行若被 `RowShapeCache` 钉住则会整次运行不消失——Pass2/热身的命中
+/// 判定与入缓存前都据此剔除，让该行以「新鲜 wrap-width token」重新打到平台重排。
+pub(crate) fn layout_has_notdef(layout: &gpui::LineLayout) -> bool {
+    layout.runs.iter().any(|r| r.glyphs.iter().any(|g| g.id.0 == 0))
+}
+
 /// 一帧后的表格渲染数据（shape 期算好列宽/全量单元格文本，paint 直接画网格）。
 /// 与预览一致：列宽按内容自适应（不缩放、不省略），整表自然宽，超出由宿主裁剪。
 #[derive(Clone)]
@@ -442,6 +450,9 @@ pub(crate) struct ShapedRow {
     /// 带外块为空（未 shape，paint 跳过）。**`Rc`**：行整形缓存跨帧共享整形结果
     /// （`WrappedLine` 本身不可 Clone；Rc 浅克隆即共享字形数据，滚动复用零重排）。
     pub wrapped: std::rc::Rc<Vec<gpui::WrappedLine>>,
+    /// 渲染文本是否含非 ASCII 字节（回退字形候选）。纯 ASCII 行命中缓存时 `notdef`
+    /// 扫描可直接短路 → 新增的命中检查对大多数文档零开销。
+    pub has_non_ascii: bool,
     pub sub_heights: Vec<Pixels>,
     /// 编辑映射：渲染字节 → 源字节偏移（语义见 `DocRow::byte_map`）。
     /// 文本行为**相对该行**的局部映射；代码块为**相对块首**的块级映射。
@@ -473,6 +484,19 @@ pub(crate) struct ShapedRow {
     pub mm: Option<std::rc::Rc<(Vec<MmPlaced>, Vec<(usize, usize, Option<String>)>)>>,
     /// 每行的增强装饰/内嵌数据（列表 gutter、链接、行内数学/图片、块级卡片）。
     pub extra: RowExtra,
+}
+
+/// 整行整形结果是否含 `.notdef`（扫描全部折行布局的 glyph id=0）。命中缓存的行与
+/// 新整形入缓存的行都过此检查——含 notdef 的坏行不入缓存并进入重试（见
+/// [`super::WyEditor::notdef_shape_width`]），回退解析成功后的新鲜重排会自然取代它。
+/// 纯 ASCII 行（`has_non_ascii == false`）直接短路——命中检查对主流文档零开销。
+pub(crate) fn shaped_row_has_notdef(row: &ShapedRow) -> bool {
+    if !row.has_non_ascii {
+        return false;
+    }
+    row.wrapped
+        .iter()
+        .any(|wl| layout_has_notdef(&wl.unwrapped_layout))
 }
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
@@ -877,11 +901,13 @@ fn shape_text_row(
     let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
     let x_off = if kind == IrKind::Quote { px(15.) } else { px(0.) };
+    let has_non_ascii = wrapped.iter().any(|wl| !wl.text.is_ascii());
     let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped,
+        has_non_ascii,
         sub_heights,
         byte_map: std::rc::Rc::new(map2),
         editable,
@@ -1634,6 +1660,7 @@ fn shape_code_row(
             src_line: r.src_line,
             src_lines: r.lines.clone(),
             wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
             sub_heights: vec![height],
             byte_map: std::rc::Rc::new(Vec::new()),
             editable: false,
@@ -1727,11 +1754,13 @@ fn shape_code_row(
             acc += ln.len();
         }
     }
+    let has_non_ascii = wrapped.iter().any(|wl| !wl.text.is_ascii());
     let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped,
+        has_non_ascii,
         sub_heights,
         byte_map: std::rc::Rc::new(r.byte_map),
         editable,
@@ -1865,6 +1894,7 @@ fn shape_table_row(
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable,
@@ -1920,6 +1950,7 @@ fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
         sub_heights: vec![h],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
@@ -1994,6 +2025,7 @@ fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: P
         src_line,
         src_lines: reg.range.start..reg.range.end,
         wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
@@ -2044,6 +2076,7 @@ pub(crate) fn build_frame(
                 src_line: 0,
                 src_lines: 0..1,
                 wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
                 sub_heights: vec![line_h],
                 byte_map: std::rc::Rc::new(Vec::new()),
                 editable: false,
@@ -2363,7 +2396,13 @@ pub(crate) fn build_frame(
                 if caret_line == srcline {
                     need_row.push(k);
                 } else if let Some(rc) = row_cache.get(k, shape_key) {
-                    hit_map.insert(k, rc);
+                    if shaped_row_has_notdef(&rc) {
+                        // 命中但含 .notdef（此前冷启动坏字形被缓存/预热写入）：视作
+                        // miss，强制以新鲜平台重排——否则豆腐块被旧缓存钉住整次运行。
+                        need_row.push(k);
+                    } else {
+                        hit_map.insert(k, rc);
+                    }
                 } else {
                     need_row.push(k);
                 }
@@ -2398,15 +2437,29 @@ pub(crate) fn build_frame(
                         && caret_line == r.src_line;
                     #[cfg(test)]
                     editor.bump_reshapes();
+                    // notdef 待重试块：用「新鲜 wrap-width token」破 gpui 的 2-frame
+                    // 行缓存，让本次 shape 真正打到平台（否则每帧重排会从上一帧缓存
+                    // 回喂同一份旧坏布局，回退永远不收敛）。
+                    let shape_width = editor.notdef_shape_width(k, width);
                     if is_caret {
-                        shape_docrow(r, editor, window, width, avail, theme, &base_font)
+                        shape_docrow(r, editor, window, shape_width, avail, theme, &base_font)
                     } else {
-                        let rc = row_cache.put(
-                            k,
-                            shape_key,
-                            shape_docrow(r, editor, window, width, avail, theme, &base_font),
-                        );
-                        (*rc).clone()
+                        let srow =
+                            shape_docrow(r, editor, window, shape_width, avail, theme, &base_font);
+                        if shaped_row_has_notdef(&srow) {
+                            if editor.note_notdef(k) {
+                                // 连续 N 帧新鲜重排仍 .notdef → 字符确无字形
+                                // （tofu 即正确显示），从此正常入缓存，不再逐帧空转。
+                                let rc = row_cache.put(k, shape_key, srow);
+                                (*rc).clone()
+                            } else {
+                                srow // 不入缓存：下一帧带新 token 重排，等回退解析成功
+                            }
+                        } else {
+                            editor.clear_notdef(k);
+                            let rc = row_cache.put(k, shape_key, srow);
+                            (*rc).clone()
+                        }
                     }
                 };
                 base.borrow_mut().set(k, f32::from(srow.height));
@@ -2757,14 +2810,15 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         };
         if !blocked && !big && caret_line != srcline && rc.get(k, sk).is_none() {
             // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
+            // 含 .notdef 的坏行**不入缓存**——进带后由 Pass2 以新鲜 token 重排自愈。
             if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
                 #[cfg(test)]
                 e.bump_prewarm_shapes();
-                rc.put(
-                    k,
-                    sk,
-                    shape_docrow(r, e, window, frame.width, avail, &e.theme, &e.theme.font),
-                );
+                let row =
+                    shape_docrow(r, e, window, frame.width, avail, &e.theme, &e.theme.font);
+                if !shaped_row_has_notdef(&row) {
+                    rc.put(k, sk, row);
+                }
             }
             done += 1;
         }

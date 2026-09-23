@@ -17,5 +17,5 @@ pub const INLINE_MATH_PAD: f32 = 1.5;
 pub const INLINE_MATH_BAND: f32 = 1.35;
 /// 数学公式文字色（RGB 十六进制，不含 alpha）；暗色主题在 `mod::math_color` 提亮。
 pub const MATH_COLOR: u32 = 0x6d5bd0;
-/// 暗色主题下数学公式色的提亮量（HSL 亮度 channel 增加量）。
+/// 暗色主题下数学公式色的提亮量（HSL 亮度 channel 增加量）
 pub const MATH_COLOR_DARK_LIFT: f32 = 0.18;
