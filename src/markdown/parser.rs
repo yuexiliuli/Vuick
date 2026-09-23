@@ -319,6 +319,14 @@ fn inline_style(src: &str) -> (SharedString, Vec<(Range<usize>, RunKind)>) {
 pub(crate) fn inline_style_mapped(
     src: &str,
 ) -> (SharedString, Vec<(Range<usize>, RunKind)>, Vec<usize>) {
+    // 快路径：`inline_styles_re` 的每个匹配都以 `` ` `` / `*` / `~` / `[` 起始。
+    // 一行不含这些字节 → 正则恒无匹配 → 直拷原文 + 恒等映射（与慢路径零匹配
+    // 产物逐字节一致）。省掉 debug 下每行 `regex::captures_iter` 的常数开销——这是
+    // 大文档滚动每带新进块、输入每键重建可视行时 `shape_docrow` 单价的主成分。
+    if !src.bytes().any(|b| matches!(b, b'`' | b'*' | b'~' | b'[')) {
+        let map: Vec<usize> = (0..=src.len()).collect();
+        return (src.into(), Vec::new(), map);
+    }
     let mut out = String::with_capacity(src.len());
     let mut runs = Vec::new();
     let mut map: Vec<usize> = Vec::with_capacity(src.len() + 1);
@@ -2268,6 +2276,34 @@ mod tests {
         assert!(matches!(r.runs[0].1, RunKind::Strikethrough));
         assert!(matches!(r.runs[1].1, RunKind::Link));
         assert!(matches!(r.runs[2].1, RunKind::Image));
+    }
+
+    #[test]
+    fn inline_mapped_fast_path_equals_slow_for_no_markers() {
+        // 无内联记号起始字节（` * ~ [）→ 快路径：直拷 + 恒等映射，与慢路径零匹配
+        // 完全相同；含记号起始字节但无法匹配（孤立的 `[`）也走慢路径并保持一致。
+        for s in [
+            "alpha beta gamma",
+            "中文段落 数字 123，标点。",
+            "混合 alpha 中文 42",
+            "with [ bracket",
+            "just a backslash \\ and zero",
+        ] {
+            let (t, runs, map) = inline_style_mapped(s);
+            assert_eq!(t.as_ref(), s, "无匹配原文应原样保留: {s:?}");
+            assert!(runs.is_empty(), "{s:?} 不应有样式段");
+            assert_eq!(map.len(), s.len() + 1, "{s:?} 映射长度 = len+1");
+            for (r, &m) in map.iter().enumerate() {
+                assert_eq!(r, m, "{s:?} 映射应恒等");
+            }
+        }
+        // 有标记的行走慢路径（防快路径误伤）：`**x**` / `` `c` `` / `[a](u)`。
+        for s in ["**bold**", "`code`", "[link](https://a.b)", "a *em* b", "~~del~~", "![alt](x.png)"] {
+            let (t, runs, map) = inline_style_mapped(s);
+            assert_ne!(t.as_ref(), s, "有记号应被清理: {s:?}");
+            assert!(!runs.is_empty(), "{s:?} 应有样式段");
+            assert_eq!(map.len(), t.len() + 1);
+        }
     }
 
     #[test]

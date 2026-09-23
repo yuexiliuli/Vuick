@@ -4280,6 +4280,20 @@ A-->B
                 return;
             }
             eprintln!("[bench] realfile {name}: ascii_at={at2}");
+            // 预热：先打 2 键进稳态（首次 bf 含 cold Pass1/冷缓存、不代表逐键成本），
+            // 计时与 prof 都只覆盖预热后的稳态段。
+            let mut warm = |ins: &str| {
+                cx.update(|cx| {
+                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx)));
+                });
+                let _ = cx.refresh();
+            };
+            warm("q");
+            warm("w");
+            // 预热后把 prof 已累计的暖机开销清掉，只统计稳态。
+            crate::prof::dump(&format!("wy.realfile.{name}.warmup"));
+            let mut t = 0u128;
+            let n = ins_seq.len().max(1);
             for ins in ins_seq {
                 let t0 = std::time::Instant::now();
                 cx.update(|cx| {
@@ -4288,7 +4302,7 @@ A-->B
                 let _ = cx.refresh();
                 t += t0.elapsed().as_millis();
             }
-            eprintln!("[bench] realfile {name}: {}ms ({:.1}ms/键) at={at2}", t, t as f64 / n as f64);
+            eprintln!("[bench] realfile {name}: {}ms ({:.1}ms/键 稳态) at={at2}", t, t as f64 / n as f64);
             crate::prof::dump(&format!("wy.realfile.{name}"));
         };
         case(cx, "plain-x", plain_at, &["x", "y", "x", "y"]);
@@ -4296,4 +4310,76 @@ A-->B
         case(cx, "table-x", table_row, &["x", "y", "x", "y"]);
         case(cx, "math-$$-x", math_line, &["x", "y", "x", "y"]);
         case(cx, "enter-mid", text.len() / 2, &["\n", "\n", "\n", "\n"]);
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_scroll_bands(cx: &mut TestAppContext) {
+        // 真实文档滚动带重建基准：模拟 prepaint 的 512px 带量化，从顶部连续滚 24 档、
+        // 每档 400px（≈每 1-2 档触发一次带内重建），统计每档 build_frame 耗时 + Pass2
+        // 实际整形（缓存未命中）块数。KILO_PROF=1 时同时 dump 各阶段开销。
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+        let path = "target/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let width = px(980.);
+        let vh = 800.0f32;
+        let q = 512.0f32;
+        let n = 24;
+        let mut bands: Vec<(f32, f32)> = Vec::new();
+        for k in 0..n {
+            let top = 400.0 * (k + 1) as f32;
+            bands.push((
+                (((top - vh) / q).floor() * q).max(0.),
+                ((top + 2. * vh) / q).ceil() * q,
+            ));
+        }
+        // 阶段 A：首次滚过 24 个新带（每带含新进块整形）——真实滚动前沿成本。
+        let mut t = 0u128;
+        let mut reshapes = 0u64;
+        for &band in &bands {
+            let t0 = std::time::Instant::now();
+            vcx.update(|window, cx| {
+                let ed = host.read(cx).ed.clone();
+                let _ = build_frame(ed.read(cx), window, width, band);
+            });
+            t += t0.elapsed().as_millis();
+            vcx.update(|_window, cx| {
+                reshapes += host.read(cx).ed.read(cx).take_reshapes();
+            });
+        }
+        eprintln!(
+            "[bench] scroll-新带 {n} band-builds: {}ms ({:.1}ms/band, {} 次真实整形)",
+            t, t as f64 / n as f64, reshapes
+        );
+        crate::prof::dump("wy.scroll.fresh");
+        // 阶段 B：原样滚回（全部缓存命中、0 整形）——纯组装/折叠开销。
+        let mut t2 = 0u128;
+        let mut r2 = 0u64;
+        for &band in bands.iter().rev() {
+            let t0 = std::time::Instant::now();
+            vcx.update(|window, cx| {
+                let ed = host.read(cx).ed.clone();
+                let _ = build_frame(ed.read(cx), window, width, band);
+            });
+            t2 += t0.elapsed().as_millis();
+            vcx.update(|_window, cx| {
+                r2 += host.read(cx).ed.read(cx).take_reshapes();
+            });
+        }
+        eprintln!(
+            "[bench] scroll-全热 {n} band-builds: {}ms ({:.1}ms/band, {} 次真实整形)",
+            t2, t2 as f64 / n as f64, r2
+        );
+        crate::prof::dump("wy.scroll.warm");
     }
