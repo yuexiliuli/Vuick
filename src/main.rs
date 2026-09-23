@@ -32,7 +32,112 @@ use gpui_component_assets::Assets;
 
 use crate::actions::*;
 
+/// Windows 冷启动彩色 emoji 空白根治（纯应用层，不依赖仓库外补丁）。
+///
+/// 机制：DWrite 的系统字体系列是**异步枚举**的。冷启动早期集合未枚举完 → 回退表不完整，
+/// ❗⚠✅ 等被解析到无彩色字形的字体 → `TranslateColorGlyphRun` 返回
+/// `DWRITE_E_NOCOLOR(0x8898500C)` → 首个彩色光栅空白；约 20s 后枚举完成才可能画对。
+/// 这里在创建任何窗口/文本系统之前，把枚举**阻塞等完**，等效于把“等 ~20s”提前到启动
+/// 时一次性付清；进程级字体集合共享，之后 gpui_windows 首访必是完整集合，三视图
+/// 首帧即命中 COLR emoji 字体，无需手动滚动/点击/空等。
+///
+/// 可靠判据（这版做的改进，此前「连续 3 轮族数不变」会在枚举**间歇**（暂停 >300ms）误判
+/// 提前放行）：枚举是成簇推进的，途中可能停很久，所以完成条件同时要求：
+/// - 族数量**连续 20 轮（≈2s）稳定**（宽松窗口，跨过暂停期）；
+/// - 且回退必需的 emoji 字体族（"Segoe UI Emoji"）**已进入集合**（语义上的真需求：
+///   集合里没有它说明回退表不完整；它在本次实测于 index≈50 出现）。
+/// 极端机器上若族名解析不到，退化为「数量稳定 ≥60 轮（≈6s）」兜底放行；总轮数上限
+/// 800×100ms = 80s，不会无限卡死。`WY_ENUM_DEBUG=1` 打印每轮计数/emoji 族状态，
+/// 用于确认门禁到底在哪一步放行。
+#[cfg(target_os = "windows")]
+fn force_dwrite_font_enumeration() {
+    use windows::Win32::Graphics::DirectWrite::{
+        DWriteCreateFactory, IDWriteFactory5, IDWriteFontCollection1, DWRITE_FACTORY_TYPE_SHARED,
+    };
+
+    /// "Segoe UI Emoji" 是否已出现在系统字体集合里（回退表完整的必要条件）。
+    fn collection_has_emoji_family(coll: &IDWriteFontCollection1) -> bool {
+        let target: Vec<u16> = "Segoe UI Emoji".encode_utf16().collect();
+        let n = unsafe { coll.GetFontFamilyCount() };
+        for i in 0..n {
+            let Ok(fam) = (unsafe { coll.GetFontFamily(i) }) else {
+                continue;
+            };
+            let Ok(names) = (unsafe { fam.GetFamilyNames() }) else {
+                continue;
+            };
+            let count = unsafe { names.GetCount() };
+            for j in 0..count {
+                let Ok(len) = (unsafe { names.GetStringLength(j) }) else {
+                    continue;
+                };
+                // DWrite GetString 的 size 参数**含**结尾 NUL，长度必须 len+1，
+                // 否则返回 E_INVALIDARG（windows-rs 0.61 直接把 slice.len 传进去）。
+                let mut buf = vec![0u16; len as usize + 1];
+                if unsafe { names.GetString(j, &mut buf) }.is_ok()
+                    && &buf[..len as usize] == &target[..]
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    let Ok(factory) = (unsafe { DWriteCreateFactory::<IDWriteFactory5>(DWRITE_FACTORY_TYPE_SHARED) })
+    else {
+        return;
+    };
+    let debug = std::env::var_os("WY_ENUM_DEBUG").is_some();
+    let started = std::time::Instant::now();
+    let (mut last, mut stable) = (0u32, 0u32);
+    let mut emoji_loaded = false;
+    let mut scanned_at: u32 = 0;
+    for round in 0..800u32 {
+        let mut coll: Option<IDWriteFontCollection1> = None;
+        if unsafe { factory.GetSystemFontCollection(false, &mut coll, true) }.is_err() {
+            return;
+        }
+        let Some(c) = coll else { return; };
+        let n = unsafe { c.GetFontFamilyCount() };
+        if n != last {
+            last = n;
+            stable = 0;
+            emoji_loaded = collection_has_emoji_family(&c);
+            scanned_at = round;
+        } else {
+            stable += 1;
+            // 数量稳定的空窗里，每 25 轮重扫一次 emoji 族（防“族数不变但 emoji 族后到”）。
+            if round >= scanned_at + 25 {
+                emoji_loaded = collection_has_emoji_family(&c);
+                scanned_at = round;
+            }
+        }
+        if debug {
+            eprintln!(
+                "[WY-ENUM] round={round} families={n} stable={stable} emoji={emoji_loaded} t={:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+        }
+        // 完成判据：数量稳定 ≥2s 且 emoji 回退族已在集合；族名解析不到的机器，
+        // 稳定 ≥6s 兜底放行（数量不动 6s 基本可认定枚举已停）。
+        if n > 0 && stable >= 20 && (emoji_loaded || stable >= 60) {
+            if debug {
+                eprintln!(
+                    "[WY-ENUM] DONE families={n} emoji={emoji_loaded} t={:.1}s",
+                    started.elapsed().as_secs_f32()
+                );
+            }
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "windows")]
+    force_dwrite_font_enumeration();
+
     gpui_platform::application()
         .with_assets(Assets)
         .run(|cx: &mut App| {

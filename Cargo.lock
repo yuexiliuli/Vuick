@@ -2670,6 +2670,7 @@ dependencies = [
  "syntect",
  "unicode-bidi",
  "unicode-segmentation",
+ "windows 0.61.3",
  "zip",
 ]
 
