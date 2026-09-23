@@ -237,16 +237,43 @@ impl Doc {
             parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
         crate::prof::end("doc.scanblocks", _t_sc);
         let _t_ul = crate::prof::begin();
-        let new_line_starts =
-            Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range.clone());
-        let new_line_utf16_starts = Self::incremental_line_utf16_starts(
-            &self.line_utf16_starts,
-            &self.line_starts,
-            &new_rope,
-            old_len,
-            range.clone(),
-            delta_u16,
-        );
+        // 纯行内编辑（insert/remove 都不含 '\n'）：行数/行首集合不变，只有「编辑点之后
+        // 的尾部」整体平移 `delta_bytes`/`delta_u16`——免 `incremental_line_starts` 的
+        // 「前缀拷贝 + 变化区重扫 + 尾部逐条重推」两次全量写（139k 行 ×2 索引，是
+        // debug 每键 4-7ms 的输入地板）。含 '\n'（Enter/换行粘贴/跨行删）才回退重建。
+        let removed_has_nl = end > start && self.rope.slice(start..end).chars().any(|c| c == '\n');
+        let has_nl = removed_has_nl || text.contains('\n');
+        let delta_bytes = inserted_len as i64 - (end - start) as i64;
+        let (new_line_starts, new_line_utf16_starts) = if !has_nl {
+            // 受影响起始行号：首个行首 > 编辑起点（无 '\n' ⇒ (start, end] 内无行首）。
+            // 字节/UTF-16 两条索引同形（行数未变）→ 同一 `start_idx` 适用。
+            let start_idx = self.line_starts.partition_point(|&x| x <= start);
+            let mut ls = self.line_starts.clone();
+            if delta_bytes != 0 {
+                for v in &mut ls[start_idx..] {
+                    *v = (*v as i64 + delta_bytes).max(0) as usize;
+                }
+            }
+            let mut ls16 = self.line_utf16_starts.clone();
+            if delta_u16 != 0 {
+                for v in &mut ls16[start_idx..] {
+                    *v = (*v as i64 + delta_u16).max(0) as usize;
+                }
+            }
+            (ls, ls16)
+        } else {
+            (
+                Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range.clone()),
+                Self::incremental_line_utf16_starts(
+                    &self.line_utf16_starts,
+                    &self.line_starts,
+                    &new_rope,
+                    old_len,
+                    range.clone(),
+                    delta_u16,
+                ),
+            )
+        };
         crate::prof::end("doc.linestarts", _t_ul);
         self.rope = new_rope;
         self.index = new_index;
