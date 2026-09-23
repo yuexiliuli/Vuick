@@ -1127,6 +1127,7 @@ impl EditorApp {
                 .map(|d| d.to_path_buf());
             ed.update(cx, |ed, _| ed.set_base_dir(base_dir));
             let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
+                let _t = crate::prof::begin();
                 match ev {
                     WyEvent::Changed => {
                         if let Some(tab) =
@@ -1150,6 +1151,7 @@ impl EditorApp {
                         this.status_ok = true;
                     }
                 }
+                crate::prof::end("wy.app.changed", _t);
             });
             let tab = &mut self.tabs[idx];
             tab.live2 = Some(ed.clone());
@@ -1427,6 +1429,7 @@ impl EditorApp {
 
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _t = crate::prof::begin();
         // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
         // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
         let live_edit = self
@@ -1521,7 +1524,7 @@ impl Render for EditorApp {
                 .into_any_element()
         };
 
-        div()
+        let root = div()
             .relative()
             .flex()
             .flex_col()
@@ -1629,6 +1632,8 @@ impl Render for EditorApp {
             .child(self.render_body_sidebar(body, cx))
             .child(self.render_status_bar(cx))
             // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
-            .children(gpui_component::Root::render_notification_layer(window, cx))
+            .children(gpui_component::Root::render_notification_layer(window, cx));
+        crate::prof::end("wy.app.render", _t);
+        root
     }
 }

@@ -2796,6 +2796,11 @@ impl Element for WyEditorElement {
         style.size.width = relative(1.).into();
         let id = window.request_measured_layout(style, move |known, available, window, cx| {
             let e = editor.read(cx);
+            let width_definite = matches!(
+                available.width,
+                gpui::AvailableSpace::Definite(w)
+                    if f32::from(w).is_finite() && f32::from(w) > 1.
+            );
             let width = match available.width {
                 gpui::AvailableSpace::Definite(w) => w,
                 _ => known.width.unwrap_or(px(800.)),
@@ -2805,6 +2810,11 @@ impl Element for WyEditorElement {
             } else {
                 px(800.)
             };
+            // 第一轮布局：available 为 Indefinite 且 known 宽也为空（探测性测量）。
+            // 此时构建的帧（默认 800px 宽）下一轮必被真实宽度替换——纯浪费
+            // （实测每键 ~100ms debug）。改为复用现成帧总高 / 行数估算，不建帧；
+            // 下一轮 definite 宽度到达时再真正构建一次。
+            let probe = !width_definite && known.width.is_none();
             // 帧缓存：内容/宽度/可视带/图片代数都没变 → 直接复用总高，不再整篇重建
             // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
             let rgen = e.content_gen();
@@ -2825,7 +2835,57 @@ impl Element for WyEditorElement {
                 .map(|f| f.total);
             let total = match cached_total {
                 Some(t) => t,
+                // 探测性测量：不建占位帧，直接返回现成总高 / 行数估算。
+                None if probe => e
+                    .frame
+                    .borrow()
+                    .as_ref()
+                    .map(|f| f.total)
+                    .unwrap_or(px((e.doc.line_count() as f32 * 18.).max(400.))),
                 None => {
+                    // 诊断：本次 measure 缓存未命中的原因（排查双重建/换宽；仅 WY_TRACE）。
+                    if crate::prof::trace_active() {
+                        let old = e.frame.borrow().clone();
+                        let reason = old
+                            .as_ref()
+                            .map(|f| {
+                                let mut v = Vec::new();
+                                if f.rgen != rgen {
+                                    v.push("rgen".into());
+                                }
+                                if f.igen != igen {
+                                    v.push("igen".into());
+                                }
+                                if f.mgen != mgen {
+                                    v.push("mgen".into());
+                                }
+                                if f.width != width {
+                                    v.push(format!(
+                                        "width:{:.0}!={:.0}",
+                                        f32::from(f.width),
+                                        f32::from(width)
+                                    ));
+                                }
+                                if f.band != band {
+                                    v.push(format!("band:{band:?}"));
+                                }
+                                v.join(",")
+                            })
+                            .unwrap_or_else(|| "no-frame".into());
+                        crate::prof::op_detail_append("mmiss", &reason);
+                    }
+                    // 操作级实时计时：首帧（frame 从未建成）在此登记 open，让这次
+                    // measure→prepaint 的整帧构建都计进同一次操作（输入类操作已在
+                    // 事件入口 op_start，这里只补 frame 为空的初始构建）。
+                    if std::env::var_os("WY_TRACE").is_some()
+                        && !crate::prof::op_pending()
+                        && e.frame.borrow().is_none()
+                    {
+                        crate::prof::op_start_detail(
+                            "open",
+                            &format!("band={band:?} width={:.0}", f32::from(width)),
+                        );
+                    }
                     let _t_bf = crate::prof::begin();
                     let frame = build_frame(e, window, width, band);
                     crate::prof::end("wy.measure.bf", _t_bf);
@@ -2882,6 +2942,41 @@ impl Element for WyEditorElement {
             })
         };
         if stale {
+            // 诊断：本次重建的诱因（排查 measure/prepaint 双重建；仅 WY_TRACE）。
+            if crate::prof::trace_active() {
+                let f = self.editor.read(cx).frame.borrow();
+                let reason = f.as_ref().map_or("no-frame".into(), |f| {
+                    let mut v = Vec::new();
+                    if f.rgen != rgen {
+                        v.push("rgen");
+                    }
+                    if f.igen != igen {
+                        v.push("igen");
+                    }
+                    if f.mgen != mgen {
+                        v.push("mgen");
+                    }
+                    if f.width != width {
+                        v.push("width");
+                    }
+                    if f.band != band {
+                        v.push("band");
+                    }
+                    v.join(",")
+                });
+                crate::prof::op_detail_append("stale", &reason);
+            }
+            // 操作级实时计时：无输入类操作在途时，按重建诱因标记 scroll/resize。
+            // 输入类操作已在事件处理入口 `op_start`（type/newline/backspace…）；
+            // 首帧（frame None）已在 measure 登记 open——这里只补纯滚动/尺寸帧。
+            if !crate::prof::op_pending() {
+                let old = self.editor.read(cx).frame.borrow().clone();
+                let kind = match old.as_ref() {
+                    Some(f) if f.rgen == rgen && f.band != band => "scroll",
+                    _ => "resize",
+                };
+                crate::prof::op_start_detail(kind, &format!("band={band:?} top={top:.0}"));
+            }
             let _t_bb = crate::prof::begin();
             let frame = build_frame(&*self.editor.read(cx), window, width, band);
             crate::prof::end("wy.prepaint.bf", _t_bb);
@@ -2963,6 +3058,7 @@ impl Element for WyEditorElement {
         cx: &mut App,
     ) {
         let _t_paint = crate::prof::begin();
+        crate::prof::paint_mark();
         let (focus, theme) = {
             let e = self.editor.read(cx);
             (e.focus_handle(), e.theme.clone())
@@ -3094,6 +3190,9 @@ impl Element for WyEditorElement {
             cx,
         );
         crate::prof::end("wy.paint", _t_paint);
+        // 操作级实时计时结算：本帧若含未结算操作（type/backspace/scroll/open…），
+        // 在此以「开始→绘制完成」的墙钟 + 帧内阶段 breakdown 落地一行 OP 记录。
+        crate::prof::op_finish_after_paint();
     }
 }
 

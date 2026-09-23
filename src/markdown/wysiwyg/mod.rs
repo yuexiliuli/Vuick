@@ -917,6 +917,7 @@ impl WyEditor {
 
     /// 剪切：复制 + 删除选区。
     fn cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::prof::op_start("cut");
         self.copy(window, cx);
         let range = self.selection().unwrap_or(self.caret..self.caret);
         self.replace_range(range, "", cx);
@@ -924,6 +925,7 @@ impl WyEditor {
 
     /// 粘贴：用剪贴板文本替换选区（若为空则插入光标处）。
     fn paste(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        crate::prof::op_start("paste");
         let text = cx
             .read_from_clipboard()
             .map(|i| i.text().unwrap_or_default())
@@ -943,6 +945,7 @@ impl WyEditor {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        crate::prof::op_start("type");
         let r = match range {
             // 显式 UTF-16 区间（macOS/部分平台）走行粒度索引换算，O(log n + 行长)。
             Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
@@ -965,6 +968,7 @@ impl WyEditor {
         new_selected_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        crate::prof::op_start("ime");
         let byte_range = match range {
             Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
             None => self
@@ -2316,6 +2320,7 @@ impl WyEditor {
 
     /// 撤销（D1）：弹出上一状态恢复；被撤销的状态进重做栈。
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
+        crate::prof::op_start("undo");
         if let Some(s) = self.undo_stack.pop() {
             self.redo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
             self.restore_snapshot(s, cx);
@@ -2324,6 +2329,7 @@ impl WyEditor {
 
     /// 重做（D1）。
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
+        crate::prof::op_start("redo");
         if let Some(s) = self.redo_stack.pop() {
             self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
             self.restore_snapshot(s, cx);
@@ -2359,6 +2365,7 @@ impl WyEditor {
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
+        crate::prof::op_start("backspace");
         // 有选区 → 直接删选区（等价退格删除选中文字）。
         if let Some(range) = self.selection() {
             return self.replace_range(range, "", cx);
@@ -2390,6 +2397,7 @@ impl WyEditor {
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
+        crate::prof::op_start("delete");
         if let Some(range) = self.selection() {
             return self.replace_range(range, "", cx);
         }
@@ -2423,6 +2431,7 @@ impl WyEditor {
     }
 
     fn newline(&mut self, cx: &mut Context<Self>) {
+        crate::prof::op_start("newline");
         // 表格内换行会拆坏表结构（MVP 先 no-op）；代码块内换行合法（分行）。
         let (nl, _) = self.row_col(self.caret);
         if matches!(self.region_content(nl), Some(BlockRegion::Table { .. })) {

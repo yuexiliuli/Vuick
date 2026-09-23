@@ -414,7 +414,7 @@ impl EditorApp {
                 // 最终：装算统计/预览索引 + 恢复「已打开」状态。
                 let hist_lines = cum_hist.values().sum::<usize>();
                 let p_fin = p.clone();
-                let _ = cx.update_window_entity(&entity, move |this, _window, cx| {
+                let _ = cx.update_window_entity(&entity, move |this, window, cx| {
                     this.finish_file_text(
                         idx,
                         &p_fin,
@@ -424,6 +424,15 @@ impl EditorApp {
                         resume_version,
                         cx,
                     );
+                    // 自动化测试钩子：大文档异步打开补齐完成后启动 WYSIWYG 左面板
+                    // （`new_impl` 的同步检查跑在 `tab.file_path` 就位之前，这里补齐；
+                    // 小文档走 `load_file_text` 同步挂载，由 `new_impl` 直接开启）。
+                    if std::env::var_os("WY_AUTOTEST").is_some()
+                        && idx == this.active_tab
+                        && this.tabs.get(idx).map_or(false, |t| t.live2.is_none())
+                    {
+                        this.toggle_live_test(window, cx);
+                    }
                     // 最终状态：内容就绪，恢复「已打开」（含大文档关闭软换行的提示）。
                     if let Some(tab) = this.tabs.get(idx).filter(|t| t.file_path.as_deref() == Some(p_fin.as_path())) {
                         this.status = SharedString::from(if is_md && tab.line_count > EDITOR_WRAP_MAX_LINES {
