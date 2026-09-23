@@ -942,16 +942,23 @@ pub(crate) fn paint_card(
                 .get(latex.as_str())
                 .cloned();
             if let Some(crate::markdown::wysiwyg::MathSlot::Ready(img, w, h)) = slot {
+                // 按卡片可用区域**等比收进**（不放大）：超高/超宽公式不越出灰底。
+                // 位图逻辑高（含排版边距）一般已由 `math_card_height` 计入卡片高
+                // （20+位图高），这里兜住宽度越界与旧的“高度未更新”残留情况。
                 let iw = w.max(1.);
                 let ih = h.max(1.);
+                let avail_w = content_w;
+                let avail_h = (f32::from(row.height) - 20.).max(1.);
+                let scale = (avail_w / iw).min(avail_h / ih).min(1.);
+                let d_w = iw * scale;
+                let d_h = ih * scale;
                 let x = match align {
                     MathAlign::Left => x0 + 16.,
-                    MathAlign::Center => x0 + ((content_w - iw) / 2.).max(8.),
-                    MathAlign::Right => x0 + (content_w - iw - 16.).max(8.),
+                    MathAlign::Center => x0 + ((content_w - d_w) / 2.).max(8.),
+                    MathAlign::Right => x0 + (content_w - d_w - 16.).max(8.),
                 };
-                let avail_h = (f32::from(row.height) - 20.).max(1.);
-                let y = top0 + 20. + ((avail_h - ih) / 2.).max(0.);
-                let b = Bounds::new(point(px(x), px(y)), size(px(iw), px(ih)));
+                let y = top0 + 20. + ((avail_h - d_h) / 2.).max(0.);
+                let b = Bounds::new(point(px(x), px(y)), size(px(d_w), px(d_h)));
                 let _ = window.paint_image(b, b, gpui::Corners::all(px(2.)), img, 0, false);
                 return;
             }

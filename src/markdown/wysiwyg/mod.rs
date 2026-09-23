@@ -1794,8 +1794,16 @@ impl WyEditor {
                 };
                 let slots2 = slots.clone();
                 let key2 = key.clone();
-                let should_bump = slots2.borrow_mut().insert(key.clone(), slot).is_none();
-                if should_bump {
+                // 完成时自增 `math_gen`（on_math_ready）使帧/折叠计划按**真实位图高**重建：
+                // 这里 key 必已以 `Loading` 占位 → `insert` 返回 `Some(Loading)`，用
+                // `map_or(false, …Loading)` 判定“排版完成”（旧的 `.is_none()` 恒假——
+                // 占位符永远在场，mgen 从不自增 → 卡片永远停在回退高 42px，68px 位图
+                // 越出灰底——本 bug 自 RaTeX 接入起即存在）。
+                let became_ready = slots2
+                    .borrow_mut()
+                    .insert(key.clone(), slot)
+                    .map_or(false, |old| matches!(old, MathSlot::Loading));
+                if became_ready {
                     let _ = this.update(cx, |e, ecx| e.on_math_ready(&key2, ecx));
                 }
             })

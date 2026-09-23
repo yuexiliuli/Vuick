@@ -2920,6 +2920,102 @@ A-->B
     }
 
     #[gpui::test]
+    fn math_ready_bumps_gen_and_rebuilds_card_height(cx: &mut TestAppContext) {
+        // 回归（样式 bug：单行数学块灰底比公式矮/公式越界）：`sync_math` 的
+        // Loading→Ready 完成必须自增 `math_gen`，使帧/折叠计划按**真实位图高**
+        // 重建。旧实现 `insert(key, Ready).is_none()` 判定恒假（key 必先以 Loading
+        // 占位 → insert 返回 Some(Loading)），`on_math_ready` 从不触发 → `math_gen`
+        // 恒 0 → 卡片永远停在 Unicode 回退高（42px），68px 位图越出灰底。
+        use crate::markdown::inline_style;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        // 与 `math_typeset::tests::rasterizes_to_nonempty_bgra` 同款——ratex 确定支持。
+        // 块后跟一行正文：光标放到文尾落在块外（否则落在闭合 `$$` 行会 reveal 成源码）。
+        let text = "$$\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n$$\n后文";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let frame = vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 光标放到文档尾（`$$` 之外）→ 数学块折叠成卡片（不 reveal）。
+            let n = ed.read(cx).content().len();
+            ed.update(cx, |e, _| e.set_caret(n));
+            let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert!(
+                f.rows.iter().any(|r| r.extra.card.is_some()),
+                "帧应含数学卡片行"
+            );
+            f
+        });
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
+            let slots = ed.read(cx).math_slots();
+            assert!(
+                slots
+                    .borrow()
+                    .contains_key(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}"),
+                "sync_math 应先以 Loading 占位"
+            );
+        });
+        // 驱动后台光栅 + 前台续体（on_math_ready 自增 math_gen）。
+        // 注意：`VisualTestContext::run_until_parked` 只排空后台 executor，
+        // `Context::spawn` 的续体（this.update → on_math_ready）要在前台 dispatcher
+        // 上跑——必须用 `TestAppContext::run_until_parked`，故先释放 vcx 再重取。
+        drop(vcx);
+        cx.run_until_parked();
+        let win = cx.windows()[0];
+        let mut vcx = VisualTestContext::from_window(win, cx);
+        let (mgenv, mch, row_h, slot_dbg) = vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let genv = ed.read(cx).math_gen();
+            let slots = ed.read(cx).math_slots();
+            let slot_dbg = format!(
+                "{:?}",
+                slots
+                    .borrow()
+                    .get(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}")
+                    .map(|s| match s {
+                        super::super::MathSlot::Loading => "Loading",
+                        super::super::MathSlot::Failed => "Failed",
+                        super::super::MathSlot::Ready(..) => "Ready",
+                    })
+            );
+            let reg = inline_style::math_regions(&ed.read(cx).content())
+                .into_iter()
+                .next()
+                .expect("应扫到一块公式");
+            assert_eq!(reg.source, r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}");
+            let h = f32::from(super::math_card_height(&ed.read(cx), &reg));
+            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row_h = f2
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_some())
+                .map(|r| f32::from(r.height))
+                .unwrap_or(0.);
+            (genv, h, row_h, slot_dbg)
+        });
+        assert!(
+            mgenv > 0,
+            "公式完成应自增 math_gen（旧 bug：恒 0）：mgen={mgenv} slot={slot_dbg}"
+        );
+        assert!(
+            mch > 42.0 + 1.,
+            "公式就绪后卡片应按位图高（> 42px 回退高）：mch={mch}"
+        );
+        assert!(
+            (row_h - mch).abs() < 1.0,
+            "重建帧的卡片行高应等于就绪高：row_h={row_h} mch={mch}"
+        );
+        assert!(
+            row_h > 42.0 + 1.0,
+            "重建帧不应再停在回退高：row_h={row_h}"
+        );
+    }
+
+    #[gpui::test]
     fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
         // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
         // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
