@@ -205,6 +205,10 @@ pub struct WyEditor {
     /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
     /// `viewport_size` 推算并发布，measure 用上一帧的带做窗口化 shape。
     shape_band: Cell<Option<(f32, f32)>>,
+    /// **滚动预热**状态（`element::prewarm_band`）：把下一量子带块提前 shape 进
+    /// `shape_rows` 缓存（键与 band 无关）→ 带穿越的 6.4ms/band shape 突发被摊平。
+    /// 方向由带序号跨界判定；结构编辑清空整形缓存后必须归零（见 `replace_range`）。
+    prewarm: RefCell<Prewarm>,
     /// 全篇**基础布局**缓存：`(代, Rc<RefCell<BlockLayout>>)`——rolling/带移动与
     /// **非结构性编辑**都复用（只对受影响块做 Fenwick 点更新），代 ≠ 内容代：
     /// 由 `struct_ver`/图片/数学/宽度组成。结构性变更（换行/围栏/表格等改了块数或
@@ -526,6 +530,23 @@ impl RowShapeCache {
     }
 }
 
+/// 跨帧滚动预热进度（见 [`element::prewarm_band`]）：方向只由带序号跨界
+/// （`band.top/512` 取整变化）决定，量子内小滚不换向；预算按块数硬上限；
+/// `bias` = 目标带内滑动窗起点，每帧推进、回绕兜底（保证总有进度、永不卡死）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Prewarm {
+    pub dir: i8,
+    pub blocks_per_frame: usize,
+    pub bias: usize,
+    pub last_band_idx: Option<i32>,
+}
+
+impl Default for Prewarm {
+    fn default() -> Self {
+        Self { dir: 0, blocks_per_frame: 3, bias: 0, last_band_idx: None }
+    }
+}
+
 impl WyEditor {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
@@ -540,6 +561,7 @@ impl WyEditor {
             last_bounds: Cell::new(None),
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
+            prewarm: RefCell::new(Prewarm::default()),
             block_layout: RefCell::new(None),
             struct_ver: Cell::new(0),
             struct_dirty_line: Cell::new(0),
@@ -1281,8 +1303,8 @@ impl WyEditor {
     pub(crate) fn fold_ver(&self) -> u64 {
         self.fold_ver.get()
     }
-    /// 当前缓存的折叠计划 Rc（回归断言「仅移动光标/纯文本键入不重建折叠计划」）。
-    #[cfg(test)]
+    /// 当前缓存的折叠计划 Rc（滚动预热读取同一份带无关缓存；测试断言「仅移动光标/
+    /// 纯文本键入不重建折叠计划」也用它）。
     pub(crate) fn fold_plan_rc(&self) -> Option<Rc<element::FoldPlan>> {
         self.fold_plan.borrow().as_ref().map(|(_, p)| p.clone())
     }
@@ -2056,6 +2078,12 @@ impl WyEditor {
             *self.pending_patch_blocks.borrow_mut() = None;
             // 块数/块序变化 → 块下标不再稳定 → 行整形缓存整体作废。
             self.shape_rows.borrow_mut().clear();
+            // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
+            // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
+            let mut pw = self.prewarm.borrow_mut();
+            pw.dir = 0;
+            pw.bias = 0;
+            pw.last_band_idx = None;
         } else {
             // 非结构性：块下标稳定，记受影响的编辑行块。
             let blk = self.doc.block_index_for_line(edit_line);

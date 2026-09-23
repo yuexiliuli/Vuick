@@ -231,6 +231,28 @@ impl Frame {
         let base = self.base.borrow();
         base.top(i) + self.delta_prefix(i)
     }
+
+    /// `[lo_px, hi_px)`（元素局部 y）内的块下标区间。有效 top = 基础前缀 + 增量前缀
+    /// 且单调 → 二分（与 `build_frame` 的 `eff_top`/`count_true` 同构；但用本帧已建好
+    /// 的 `base` + `deltas`，不重建）——供**滚动预热**定位「下一量子带」的块。
+    pub(crate) fn band_block_range(&self, lo_px: f32, hi_px: f32) -> (usize, usize) {
+        let n = self.base.borrow().n();
+        let count_true = |pred: &dyn Fn(usize) -> bool| -> usize {
+            let (mut l, mut r) = (0usize, n + 1);
+            while l < r {
+                let m = (l + r) / 2;
+                if pred(m) {
+                    l = m + 1;
+                } else {
+                    r = m;
+                }
+            }
+            l
+        };
+        let i0 = count_true(&|k| self.block_top(k) <= lo_px).saturating_sub(1);
+        let i1 = count_true(&|k| self.block_top(k) < hi_px).min(n);
+        (i0, i1)
+    }
     /// 第 `i` 块有效高（px）= 基础高 + 动态增量。（供测试断言带外高沿用收敛真值。）
     #[allow(dead_code)]
     pub(crate) fn block_height(&self, i: usize) -> f32 {
@@ -2589,6 +2611,101 @@ fn table_cell_at_src(
     Some((cell_ix, dcol))
 }
 
+/// **D1 滚动预热**：把「当前带 + 滚动方向的下一量子带」内尚未整形的块提前 shape 进
+/// [`RowShapeCache`]（键 = `epoch ^ mgen`，与 band/帧键**无关**，与 `build_frame` Pass2
+/// 命中判据同式）→ 带穿越时 Pass2 直接命中缓存，每 512px 一次的 ~6.4ms/band shape
+/// 突发被摊平成每帧 1-3 块的 O(1) 摊销。
+///
+/// 硬约束：
+/// - **只 `put` 缓存、绝不 `base.set()`**——不提前改 total，滚动条量程/布局零抖动；
+///   真高收敛仍由进带时 Pass2 的 `set` 完成。
+/// - 跳过折叠/数学块（不自走整形缓存）与 caret 行（shape 依赖光标，进带时 Pass2 强制
+///   重 shape）；fold_plan 无碍正确性——Pass2 的 `blocked` 判定始终以现算 plan 为准，
+///   预热条目若因 reveal 变活跃也只是浅克隆复用。
+/// - 方向只由带序号跨界（`band.top/512` 取整变化）判定；预算按块数硬上限，滑动窗
+///   `bias` 每帧推进、回绕兜底——区间扫满即全部命中/跳过，空转开销≈HashMap 查找。
+fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
+    let q = 512.;
+    let mut st = e.prewarm.borrow_mut();
+    let (blo, bhi) = frame.band;
+    let bi = (blo / q) as i32;
+    if let Some(lbi) = st.last_band_idx {
+        if bi != lbi {
+            st.dir = if bi > lbi { 1 } else { -1 };
+            st.bias = 0;
+        }
+    } else {
+        // 首帧：无方向可判，只登记带序号。
+        st.last_band_idx = Some(bi);
+        return;
+    }
+    st.last_band_idx = Some(bi);
+    if st.dir == 0 {
+        return;
+    }
+    // 目标量子带 = 当前带沿方向平移一个量子。
+    let (tlo, thi) = if st.dir > 0 { (bhi, bhi + q) } else { (blo - q, blo) };
+    if tlo < 0. || tlo >= thi {
+        return;
+    }
+    let (i0, i1) = frame.band_block_range(tlo, thi);
+    if i0 >= i1 {
+        return;
+    }
+    // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits）。
+    let width_bits = f32::from(frame.width).to_bits();
+    let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits);
+    let sk = epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let caret_line = e.row_col(e.caret()).0;
+    let plan = e.fold_plan_rc();
+    let doc = e.doc();
+    let avail = (f32::from(frame.width) - f32::from(frame.padding) * 2.).max(1.);
+    let bpf = st.blocks_per_frame.max(1);
+    let mut rc = e.shape_rows.borrow_mut();
+    let n = i1 - i0;
+    if st.bias >= n {
+        st.bias = 0;
+    }
+    let _t = crate::prof::begin();
+    let mut done = 0usize;
+    let mut k = i0 + st.bias;
+    loop {
+        if done >= bpf {
+            break;
+        }
+        let srcline = frame.base.borrow().src_lines()[k] as usize;
+        // 与 Pass2 `blocked` 同判据：折叠/math 块不物化整形行。
+        let blocked = match &plan {
+            Some(p) => {
+                p.fold_lines.contains(&srcline)
+                    || p.math_body.contains(&srcline)
+                    || p.math_start.contains_key(&srcline)
+            }
+            None => false,
+        };
+        if !blocked && caret_line != srcline && rc.get(k, sk).is_none() {
+            // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
+            if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
+                rc.put(
+                    k,
+                    sk,
+                    shape_docrow(r, e, window, frame.width, avail, &e.theme, &e.theme.font),
+                );
+            }
+            done += 1;
+        }
+        k += 1;
+        if k >= i1 {
+            k = i0;
+        }
+        if k == i0 + st.bias {
+            break; // 一圈完成（全命中/跳过）→ 本帧收工，防止空转
+        }
+    }
+    crate::prof::end("wy.prewarm", _t);
+    st.bias = (st.bias + bpf) % n;
+}
+
 /// 元素：auto-grow、宿主滚动。
 pub(crate) struct WyEditorElement {
     pub editor: Entity<WyEditor>,
@@ -2777,6 +2894,10 @@ impl Element for WyEditorElement {
                     }
                 }
             }
+        }
+        // D1：滚动预热——带穿越前把下一量子带块提前 shape 进缓存（预算内摊平突发）。
+        if let Some(f) = frame.as_ref() {
+            prewarm_band(&*self.editor.read(cx), f, window);
         }
         crate::prof::end("wy.prepaint", _t_pp);
         WyPrepaint { link_grips }
