@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use gpui::{
     Context, EntityInputHandler, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
-    UTF16Selection, Window, font, px,
+    UTF16Selection, Window, font, point, px,
 };
 
 use super::doc::Doc;
@@ -254,17 +254,19 @@ pub struct WyEditor {
     /// 不再整带重 shape + 代码块重跑 syntect（大文档滚动「每档 65ms」的主因）。
     /// 非结构性编辑只作废被编辑块，结构性/换源/字号变化整体清空。
     shape_rows: RefCell<RowShapeCache>,
-    /// 含 `.notdef`（glyph id=0，Windows 冷启动回退未命中）的块 → 连续坏帧数。
-    /// 见 [`RowShapeCache`] 文档「含 notdef 不缓存」：Pass2 命中判定/入缓存前都会
-    /// 检查，命中含 notdef 的缓存视作 miss、整形出 notdef 的不入缓存，并用扰动宽度
-    /// 的 token 打破 gpui 的 2-frame 行缓存，让重排真正打到平台直至回退解析成功。
-    notdef_retry: RefCell<rustc_hash::FxHashMap<usize, u32>>,
+    /// 含 `.notdef`（glyph id=0，Windows 冷启动回退未命中）的块 → 自愈状态机。
+    /// 见 [`NotdefRetry`] 文档「冷却一帧破 LineLayoutCache」：Pass2 命中/入缓存前都
+    /// 扫 .notdef，对坏块走「冷却一帧 → 新鲜平台重排」直至 DWrite 回退解析成功。
+    notdef_retry: RefCell<NotdefRetry>,
     /// （仅测试）自上次读取以来 Pass2 实际发生的行整形次数（缓存未命中/光标行）。
     #[cfg(test)]
     reshapes: Cell<u64>,
     /// （仅测试）自上次读取以来 D1 预热实际发生的行整形次数（`prewarm_band` 计数）。
     #[cfg(test)]
     prewarm_shapes: Cell<u64>,
+    /// （仅测试）Pass2 notdef 冷却帧数（复用旧几何、未调用 gpui shape）。
+    #[cfg(test)]
+    coolings: Cell<u64>,
     /// 图片异步加载缓存（gpui `ImageAssetLoader` 实体；命中返回 `Arc<RenderImage>`）。
     image_cache: gpui::Entity<gpui::RetainAllImageCache>,
     /// 独立图片行 src → 逻辑显示尺寸 `(w, h)`（按加载后的宽高比换算）。
@@ -550,10 +552,252 @@ impl RowShapeCache {
     }
 }
 
-/// 含 `.notdef`（回退未命中）块的连续重试帧数上限：每帧以「新鲜 wrap-width token」
-/// 让 `shape_text` 真正打到 DWrite（破 gpui 的 2-frame 行缓存回喂旧坏布局）。超过
-/// 该上限仍坏 → 判定字符确实无字形（正确显示 tofu），从此正常入缓存不再空转。
-pub(crate) const NOTDEF_RETRY_FRAMES: u32 = 12;
+/// 含 `.notdef`（回退未命中）块的**真实平台重排次数**上限。gpui 的 `LineLayoutCache`
+/// 把平台 `layout_line` 结果按 `(text, font, runs)` 键缓存、与 wrap-width 无关——扰动
+/// 宽度永远打不到 DWrite（115c131 的失败根因）。因此自愈改走「冷却一帧」：每次真实
+/// 重排后让该键一帧不被引用 → 两帧缓存自然淘汰 → 下一次重排才是新键、真打到平台。
+/// 连续 `NOTDEF_RETRY_ATTEMPTS` 次真实平台重排仍坏 → 判定字符确实无字形（正确显示
+/// tofu），落入 `settled` 从此不再重排空转。冷启动 DWrite 首次 shape 回退字形可能给
+/// .notdef、第二次同 (font,size) 即正常——3 帧内自愈；给 15 次余量（≈0.5s）。
+pub(crate) const NOTDEF_RETRY_ATTEMPTS: u32 = 15;
+
+/// `.notdef`（回退未命中）坏块的自愈状态机（被 [`element::build_frame`] Pass2 驱动）。
+/// 每次「真实平台重排」出 notdef 后登记一次并转冷却；冷却帧**不调用 gpui shape**——
+/// 让 `LineLayoutCache` 里该 (text,font,runs) 键自然过期（两帧缓存只在当前/上一帧存
+/// 活），下一次重排才是全新键、真的重新打到 DWrite。回退解析成功（或任何冷却行恢复）
+/// 即整体标记「回退已温」，此后 notdef = 确无字形、直接入缓存不再空转。
+#[derive(Default)]
+pub(crate) struct NotdefRetry {
+    /// 块 → 已做的真实平台重排次数（达到 [`NOTDEF_RETRY_ATTEMPTS`] 上限 → `settled`）。
+    pub attempts: rustc_hash::FxHashMap<usize, u32>,
+    /// 处于冷却帧的块（下一帧不 shape，复用 `last` 几何）。
+    pub cooling: rustc_hash::FxHashSet<usize>,
+    /// 已判定「确无字形」的块：命中缓存时不再当 miss 重排（稳定，避免空转）。
+    pub settled: rustc_hash::FxHashSet<usize>,
+    /// 冷却帧用于继续显示的上一份 notdef 行（几何与新鲜重排一致，不闪跳）。
+    pub last: rustc_hash::FxHashMap<usize, std::rc::Rc<element::ShapedRow>>,
+    /// 已做过「回退字形校验重排」的块：冷启动首次 shape 用到回退字体（❗⚠✅ 等）时，
+    /// DWrite 可能给非零但错误的占位字形（非 .notdef，glyph id≠0 检测不到）→ 冷却一次
+    /// 强制第二次真实重排并缓存那次结果；标记后直接走正常缓存。
+    pub verified: rustc_hash::FxHashSet<usize>,
+}
+
+impl NotdefRetry {
+    /// 单块状态整体作废（内容编辑/前缀保留外块）。
+    fn clear_block(&mut self, block: usize) {
+        self.attempts.remove(&block);
+        self.cooling.remove(&block);
+        self.settled.remove(&block);
+        self.verified.remove(&block);
+        self.last.remove(&block);
+    }
+
+    /// 前缀保留：结构编辑后下标 < `keep` 的块未位移，重试/冷却/settled 状态保留。
+    fn retain_prefix(&mut self, keep: usize) {
+        if keep == 0 {
+            self.clear();
+            return;
+        }
+        self.attempts.retain(|&k, _| k < keep);
+        self.cooling.retain(|&k| k < keep);
+        self.settled.retain(|&k| k < keep);
+        self.verified.retain(|&k| k < keep);
+        self.last.retain(|&k, _| k < keep);
+    }
+
+    fn clear(&mut self) {
+        self.attempts.clear();
+        self.cooling.clear();
+        self.settled.clear();
+        self.verified.clear();
+        self.last.clear();
+    }
+}
+
+/// 冷启动回退自愈诊断：`WY_NOTDEF_DEBUG=1` 时把首启探针/重试/给出的过程打到 stderr，
+/// 用于在真实 Windows 首启复现 `.notdef` 豆腐块问题时拿到确切证据（不开启则零开销）。
+#[inline]
+pub(crate) fn notdef_debug(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("WY_NOTDEF_DEBUG").is_some() {
+        eprintln!("[WY-NOTDEF] {args}");
+    }
+}
+
+/// Windows 冷启动字体回退**阻塞预热**（首帧前跑完）。实测行为：同一进程里「谁先 shape
+/// 回退字形谁拿到 .notdef，之后的 shape 才正常」，且按 (font, size) 组合独立——探针必须
+/// 覆盖真实行的字号/字体才有效（这就是此前探针 16px 全绿、真实行仍豆腐块的根源）。这里
+/// 在 [`WyEditor::new`] 里同步轮询：每次用**唯一文本**（附加 ASCII 尾巴）换取全新缓存键 →
+/// 真打到 DWrite 平台；正文/等宽 × 正文号/等宽号（`0.88*fs`）全部探针干净才置温，否则
+/// `~2s` 超时放行、由 Pass2「冷却一帧→新鲜重排」兜底。探针全绿只作诊断/首帧提速，不当作
+/// 「.notdef = 缺字形」的短路（真实行可能用未探到的字号）。
+fn poll_dwrite_fallback(tsys: &gpui::WindowTextSystem, body: &gpui::Font, mono: &gpui::Font, fs: f32) {
+    use std::time::{Duration, Instant};
+    const PROBE_BASE: &[&str] = &[
+        "❗⚠✅✔♦★▶「」中文 abc123",
+        "🚀😀🎉👍❤️🔥 ⅡⅫ ½¾ ①②③",
+        "€£¥°®™→↑↓♥★© ★☆",
+    ];
+    // 覆盖真实行可能的两个字号：正文（fs）与等宽/代码（0.88*fs）。
+    let sizes = [fs.max(9.0), (fs * 0.88).max(9.0), 16.0];
+    let fonts = [body, mono];
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(2000);
+    let mut i = 0u32;
+    while Instant::now() < deadline {
+        let mut all_clean = true;
+        'round: for (fi, font) in fonts.iter().enumerate() {
+            for (si, &size) in sizes.iter().enumerate() {
+                for (bi, base) in PROBE_BASE.iter().enumerate() {
+                    let probe = format!("{base} wk{i}-{fi}{si}{bi}");
+                    let run = [gpui::TextRun {
+                        len: probe.len(),
+                        font: (*font).clone(),
+                        ..Default::default()
+                    }];
+                    let line = tsys.shape_line(probe.into(), px(size), &run, None);
+                    if element::layout_has_notdef(&line) {
+                        all_clean = false;
+                        break 'round;
+                    }
+                }
+            }
+        }
+        if all_clean {
+            FALLBACK_WARM.store(true, std::sync::atomic::Ordering::Relaxed);
+            notdef_debug(format_args!(
+                "probe warm after {i} round(s) fonts=[{},{}] sizes={:?}",
+                body.family, mono.family, sizes
+            ));
+            return;
+        }
+        if i % 4 == 0 {
+            notdef_debug(format_args!("probe round {i} still notdef"));
+        }
+        i += 1;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    notdef_debug(format_args!(
+        "probe TIMEOUT after {i} rounds; warm={}",
+        FALLBACK_WARM.load(std::sync::atomic::Ordering::Relaxed)
+    ));
+}
+
+/// Windows 冷启动 color-emoji 光栅预热（一次/进程，**共享给所有文本窗格**：预览/
+/// WYSIWYG/源码编辑区）。实测：DWrite 在冷进程里**首次**光栅化彩色 COLR 字形时
+/// `rasterize_color` 失败，gpui 回退为单色（彩色 emoji 无单色轮廓 → 空白/方框），且
+/// `sprite_atlas` 按 (font,glyph,size) 把坏结果钉住整次运行（字符在文本里、复制正常、
+/// shape 正常——就是画不出）。各窗格在自己 `paint` 的**顶首**（画自己任何文字之前）
+/// 都调本函数；**先画的窗格**先在此把 DWrite/D3D 彩字管线打热（冷僻字号 7px、首个
+/// 可能失败、其后即成功），之后任何窗格的真实 emoji 首帧即正确，不再被某个先画窗格
+/// 毒化。探针字体取窗口缺省文本样式即可——回退按字符独立，emoji 字符必路由到回退彩
+/// 字字体。
+pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
+    // 冷启动 COLR 自愈：DWrite 彩色光栅在冷进程首次使用时失败/返回空白。平台层
+    //（gpui_windows rasterize_glyph）已保证「空白不写 atlas 缓存」（返回 Err 即不入缓存），
+    // 因此 paint_emoji 的 `.is_ok()` 从此“诚实”——失败 = 真的没彩出来。这里就借助它做
+    // 帧驱动重试：**逐帧轮流磨每个候选字号**（WYSIWYG/编辑器/预览真实字号不同：分别取自
+    // theme.font_size / font_size_px / window.text_style，默认 DEFAULT_FONT_SIZE=14），
+    // 每个字号全部 emoji 屏幕外画成功才推进下一个；全部字号磨完才 DONE。期间 window.refresh()
+    // 强制下一帧，任一失败不入缓存、自然重试；任一成功即把该字号 tile 写进 atlas，视图重绘直接命中。
+    // 给出总帧数上限，防 GPU/驱动彻底不行时无限自旋。
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static SIZES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    const MAX_ATTEMPTS: usize = 300;
+
+    if DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    let sizes = SIZES.get_or_init(|| {
+        let body_size = match window.text_style().font_size {
+            gpui::AbsoluteLength::Pixels(p) => p.as_f32(),
+            gpui::AbsoluteLength::Rems(r) => r.to_pixels(window.rem_size()).as_f32(),
+        };
+        let mut v: Vec<f32> = vec![body_size, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 24.0];
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v.dedup();
+        // 仅保留合理范围，避免把冷僻/超大字号也磨进去。
+        v.retain(|s| (10.0..=32.0).contains(s));
+        v
+    });
+
+    let probe = "⚠✅❗❌❤️🔥  🚀✨★☆➡  😀😅🤔💡📌";
+    let body = window.text_style().font();
+    loop {
+        let idx = IDX.load(std::sync::atomic::Ordering::Relaxed);
+        if idx >= sizes.len() {
+            DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        let fs = sizes[idx];
+        // 先 shape 完再画：shape 拿不可变借用，画要走 window 可变借用，分开时段避免 E0502。
+        let emojis: Vec<(gpui::FontId, gpui::GlyphId)> = {
+            let ts = window.text_system();
+            let run = [gpui::TextRun {
+                len: probe.len(),
+                font: body.clone(),
+                ..Default::default()
+            }];
+            let line = ts.shape_line(probe.into(), px(fs), &run, None);
+            line.runs
+                .iter()
+                .flat_map(|r| {
+                    r.glyphs
+                        .iter()
+                        .filter(|g| g.is_emoji)
+                        .map(move |g| (r.font_id, g.id))
+                })
+                .collect()
+        };
+        let mut all_ok = true;
+        let mut font_ids: Vec<u32> = Vec::new();
+        for (font_id, glyph_id) in emojis {
+            let fid = font_id.0 as u32;
+            if !font_ids.contains(&fid) {
+                font_ids.push(fid);
+            }
+            // 屏幕外绘制：仅触发 atlas 光栅化（图元被裁剪、无可见痕迹）。
+            if window
+                .paint_emoji(point(px(-1e7), px(-1e7)), font_id, glyph_id, px(fs))
+                .is_err()
+            {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            static R_SUCC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !R_SUCC.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[WY-WARM] size={fs:.0}px ok first_time font_ids={font_ids:?} (base={:?})",
+                    body.family
+                );
+            }
+            IDX.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
+            if idx + 1 < sizes.len() {
+                window.refresh();
+            } else {
+                eprintln!("[WY-WARM] ALL {n} SIZES DONE", n = sizes.len());
+            }
+        } else if ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_ATTEMPTS {
+            // 该字号还没暖起来（COLR 冷）：失败不入缓存，强制下一帧重试本字号。
+            eprintln!(
+                "[WY-WARM] size={fs:.0}px FAILED(attempt={}) font_ids={font_ids:?} -> refresh",
+                ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+            );
+            window.refresh();
+        } else {
+            // 到上限仍不行 → 放弃自旋，等用户滚动/其它重绘触发（平台不钉死空白，仍会自愈）。
+            DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
+}
+
+/// 进程级「DWrite 回退已温」闩：任一令我们起疑的字形（探针/冷却重排）成功解析后置位，
+/// 此后 notdef 判定为真缺失。见 [`WyEditor::fallback_warm`] / [`WyEditor::mark_fallback_warm`]。
+static FALLBACK_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 跨帧滚动预热进度（见 [`element::prewarm_band`]）：方向只由带序号跨界
 /// （`band.top/512` 取整变化）决定，量子内小滚不换向；预算按块数硬上限；
@@ -595,6 +839,22 @@ impl WyEditor {
         let ts = window.text_style();
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
         let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
+        // —— Windows 冷启动字体回退预热（同步，一次/进程）——
+        // `gpui_windows` 的 `prewarm_fonts` 是空实现，DirectWrite 的系统字体集合与回退
+        // 映射纯惰性初始化：冷进程首次把「仅靠回退字体提供的字形」（❗⚠✅ 等主字体缺）
+        // 排成 `.notdef` 空心方块，且该坏 layout 会被 gpui 按 (text,font,runs) 键缓存钉住。
+        // 这里在首帧前**同步**对含这些字形的探针做 shape（与 466c855 的异步版本不同：
+        // 它抢在竞态前完成，把 DWrite 的回退解析/系统字体枚举提前触发完）；若首支探针
+        // 仍 .notdef（枚举尚未就绪）则换下一支新文本（新键 = 又一次真实平台调用）。结果
+        // 只用于判定、不写入任何缓存（探针文本唯一、不会污染正常行）。
+        static FONT_FALLBACK_WARM: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FONT_FALLBACK_WARM.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            // 首帧前阻塞把 DWrite 回退预热到可用（见 [`poll_dwrite_fallback`]）。正文与
+            // 等宽字体、正文号与等宽号各探一遍，覆盖正文/代码块里的特殊符号。
+            let tsys = window.text_system();
+            poll_dwrite_fallback(&tsys, &ts.font(), &font(p.mono.clone()), f32::from(fs));
+        }
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
@@ -622,13 +882,16 @@ impl WyEditor {
             )),
             // 含 `.notdef`（元字形，glyph id=0）的坏排板块：Windows 冷启动时回退字体
             // （❗⚠✅ 等主字体缺的字形）首次解析可能给出 .notdef，且坏的 ShapedRow 若被
-            // 行缓存钉住整次运行不消失。此表登记「仍待新鲜重排」的块（值=连续坏帧数），
-            // Pass2 用扰动 wrap-width 破 gpui 的 2-frame 行缓存拿到真正的平台重排。
-            notdef_retry: RefCell::new(rustc_hash::FxHashMap::default()),
+            // 行缓存钉住整次运行不消失。此表登记「待新鲜重排」的块并驱动机器（见
+            // [`NotdefRetry`]）：Pass2 命中判定/入缓存前都扫 .notdef，命中坏缓存视作
+            // miss、出新 notdef 不入缓存，走「冷却一帧→重排」直至 DWrite 回退解析成功。
+            notdef_retry: RefCell::new(NotdefRetry::default()),
             #[cfg(test)]
             reshapes: Cell::new(0),
             #[cfg(test)]
             prewarm_shapes: Cell::new(0),
+            #[cfg(test)]
+            coolings: Cell::new(0),
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
@@ -688,37 +951,72 @@ impl WyEditor {
     // —— `.notdef`（回退未命中）坏行自愈 ——
     // Windows 冷启动时 DWrite 对主字体缺的字形（❗⚠✅ 等，需走回退字体）首次解析可能
     // 直接给出 .notdef（glyph id=0，空心矩形）。若这个坏 `ShapedRow` 被行缓存钉住，
-    // 整次运行都不消失——确认过的机制：只有「该行恰被重排」（点击/上光标）才换成正确
-    // 字形，其余行一直豆腐块。修复不走「加回退字体到缓存键」（键输入不含回退解析状态，
-    // 改了也没用）：命中判定/入缓存前扫出含 .notdef 的整行结果 → 不入缓存并重试重排，
-    // 直至平台回退解析成功（连续 `NOTDEF_RETRY_FRAMES` 帧仍坏才判定真无字形、接受入缓存）。
+    // 整次运行都不消失。实测确认的根因（115c131 失败点）：gpui 的 `LineLayoutCache`
+    // 把平台 `layout_line` 结果按 `(text, font, runs)` 键缓存，**与 wrap-width 无关**——
+    // 只扰动宽度永远打不到 DWrite，重试 N 帧 → 给出 → 豆腐块钉住。这里改为：命中/入
+    // 缓存前扫 .notdef → 坏行不入缓存，进入「冷却一帧 → 新鲜重排」循环（冷却帧不调用
+    // gpui shape，让被钉的键自然过期），每次重排都真正打到平台，直到回退解析成功；
+    // 连续 [`NOTDEF_RETRY_ATTEMPTS`] 次仍坏才判定字符确无字形（tofu 即正确显示）。
+    //
+    // **不要**把「回退已温」当作「.notdef = 确无字形」的短路：探针只覆盖少数 (font,size)
+    // 组合，真实行的字号/字体可能未探到而首排仍 .notdef（实测首排坏、次排好）——所以
+    // 一律走重试，由同位（font,size）的若干次真实重排自行恢复，绝不静默缓存成豆腐块。
 
-    /// 该块是否处于 notdef 待重试：是 → 返回一个「新鲜 wrap-width token」（每帧一位
-    /// 小数增量）打破 gpui 2-frame 行缓存，让本次 `shape_text` 真正打到平台重排
-    /// （否则同一文本每帧重排时会从上一帧缓存回喂同一份旧坏布局，永远不收敛）。
-    pub(crate) fn notdef_shape_width(&self, block: usize, width: Pixels) -> Pixels {
-        match self.notdef_retry.borrow().get(&block).copied() {
-            Some(cnt) => width - px(0.001 * (cnt + 1) as f32),
-            None => width,
+    /// 冷却帧取上一份 notdef 行几何（不调用 gpui shape → 被钉的 LineLayoutCache 键
+    /// 本帧不被引用、帧末自然淘汰）。返回 `Some` 表示本块处于冷却帧、应直接复用返回行。
+    pub(crate) fn cooling_row(&self, block: usize) -> Option<std::rc::Rc<element::ShapedRow>> {
+        let mut m = self.notdef_retry.borrow_mut();
+        if !m.cooling.remove(&block) {
+            return None;
         }
+        m.last.remove(&block)
     }
 
-    /// 登记一次 notdef 坏排（值 = 连续坏帧数，用作 token 递增）。返回 `true` 表示
-    /// 已达 `NOTDEF_RETRY_FRAMES` 上限 → 判定字符确无字形，本次结果应被接受入缓存。
-    pub(crate) fn note_notdef(&self, block: usize) -> bool {
+    /// 登记一次 notdef（推进真实平台重排计数 + 置冷却）。返回 `true` 表示已达
+    /// [`NOTDEF_RETRY_ATTEMPTS`] 上限 → 判定字符确无字形（settled），本次结果应入缓存。
+    pub(crate) fn cool_start(&self, block: usize) -> bool {
         let mut m = self.notdef_retry.borrow_mut();
-        let cnt = m.get(&block).copied().unwrap_or(0) + 1;
-        if cnt >= NOTDEF_RETRY_FRAMES {
-            m.remove(&block);
+        let cnt = m.attempts.get(&block).copied().unwrap_or(0) + 1;
+        if cnt >= NOTDEF_RETRY_ATTEMPTS {
+            m.attempts.remove(&block);
+            m.cooling.remove(&block);
+            m.last.remove(&block);
+            m.settled.insert(block);
             true
         } else {
-            m.insert(block, cnt);
+            m.attempts.insert(block, cnt);
+            m.cooling.insert(block);
             false
         }
     }
 
+    /// notdef 后保存本帧几何（供随后的冷却帧 [`Self::cooling_row`] 显示复用）。
+    pub(crate) fn cool_keep_last(&self, block: usize, row: std::rc::Rc<element::ShapedRow>) {
+        self.notdef_retry.borrow_mut().last.insert(block, row);
+    }
+
+    /// 该块是否已判定「确无字形」（settled）：是 → 命中含 notdef 的缓存不再当 miss。
+    pub(crate) fn notdef_settled(&self, block: usize) -> bool {
+        self.notdef_retry.borrow().settled.contains(&block)
+    }
+
     pub(crate) fn clear_notdef(&self, block: usize) {
-        self.notdef_retry.borrow_mut().remove(&block);
+        self.notdef_retry.borrow_mut().clear_block(block);
+    }
+
+    /// 该块是否已做过「回退字形校验重排」（见 [`NotdefRetry::verified`]）。
+    pub(crate) fn fallback_verified(&self, block: usize) -> bool {
+        self.notdef_retry.borrow().verified.contains(&block)
+    }
+
+    pub(crate) fn mark_fallback_verified(&self, block: usize) {
+        self.notdef_retry.borrow_mut().verified.insert(block);
+    }
+
+    /// 回退校验冷却：只置冷却标志（不占 notdef 重试次数）——下一帧不 shape、让被钉的
+    /// LineLayoutCache 键淘汰，再下一帧带新键真打到平台拿到稳定回退字形。
+    pub(crate) fn verify_cool(&self, block: usize) {
+        self.notdef_retry.borrow_mut().cooling.insert(block);
     }
 
     /// 设置初始内容。
@@ -1430,6 +1728,11 @@ impl WyEditor {
     #[cfg(test)]
     pub(crate) fn bump_reshapes(&self) {
         self.reshapes.set(self.reshapes.get() + 1);
+    }
+    /// （仅测试）Pass2 notdef 冷却帧计数（复用旧几何、未调用 gpui shape）。
+    #[cfg(test)]
+    pub(crate) fn bump_coolings(&self) {
+        self.coolings.set(self.coolings.get() + 1);
     }
     /// （仅测试）D1 预热整形计数（`prewarm_band` 每实际 shape 一块自增）。
     #[cfg(test)]
@@ -2210,7 +2513,7 @@ impl WyEditor {
             let prefix_keep = edit_blk.min(prev_count);
             self.shape_rows.borrow_mut().retain_prefix(prefix_keep);
             // 结构与 notdef 重试表同口径：前缀块下标未变、重试状态保留；≥ keep 作废。
-            self.notdef_retry.borrow_mut().retain(|&k, _| k < prefix_keep);
+            self.notdef_retry.borrow_mut().retain_prefix(prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
             let mut pw = self.prewarm.borrow_mut();
@@ -2223,7 +2526,7 @@ impl WyEditor {
             *self.pending_patch_blocks.borrow_mut() = Some(vec![blk]);
             // 该块内容变了但 `epoch` 不变 → 必须显式作废其整形缓存（否则复用旧图）。
             self.shape_rows.borrow_mut().invalidate(&[blk]);
-            self.notdef_retry.borrow_mut().remove(&blk);
+            self.notdef_retry.borrow_mut().clear_block(blk);
         }
         self.math_dollar_cnt.set(
             self.math_dollar_cnt.get()

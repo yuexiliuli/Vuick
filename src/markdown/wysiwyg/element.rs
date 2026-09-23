@@ -25,7 +25,7 @@ const ALERT_GUTTER_W: f32 = 84.;
 /// gutter 点击区即 [padding, padding+此宽]；与 `heading_chevron_hit`/`paint_heading_chevron` 共用。
 const HEADING_GUTTER_W: f32 = 20.;
 
-use super::{CaretVis, WyEditor, WyTheme};
+use super::{notdef_debug, CaretVis, WyEditor, WyTheme};
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
 use crate::markdown::recognition::{self, AlertKind, LinkHit};
@@ -488,7 +488,8 @@ pub(crate) struct ShapedRow {
 
 /// 整行整形结果是否含 `.notdef`（扫描全部折行布局的 glyph id=0）。命中缓存的行与
 /// 新整形入缓存的行都过此检查——含 notdef 的坏行不入缓存并进入重试（见
-/// [`super::WyEditor::notdef_shape_width`]），回退解析成功后的新鲜重排会自然取代它。
+/// [`super::WyEditor`] 的 notdef 自愈状态机：冷却一帧 → 新鲜平台重排），回退解析成功
+/// 后的新鲜重排会自然取代它。
 /// 纯 ASCII 行（`has_non_ascii == false`）直接短路——命中检查对主流文档零开销。
 pub(crate) fn shaped_row_has_notdef(row: &ShapedRow) -> bool {
     if !row.has_non_ascii {
@@ -497,6 +498,103 @@ pub(crate) fn shaped_row_has_notdef(row: &ShapedRow) -> bool {
     row.wrapped
         .iter()
         .any(|wl| layout_has_notdef(&wl.unwrapped_layout))
+}
+
+/// 该行是否用到了**回退字体**：同时存在「应用解析过的 run（`get_font_for_id` 有值，
+/// 正文/粗斜体/等宽）」与「平台内部新建的 run（查不到，即 DWrite 回退字形）」。
+/// 冷启动首次 shape 回退字形（❗⚠✅ 等）时 DWrite 可能给「错误回退字体的非零占位字形」
+/// （glyph id≠0，逃过 `.notdef` 检测）→ 渲染方框且会被直接缓存（caret 行正常 / 非
+/// caret 行方框的翻转就是它）。用它识别这些行 → 先校验重排再入缓存。纯 CJK（全 Some）、
+/// 测试 mock（全 None，其 layout 恒 FontId(0)）与纯 emoji 行不触发。
+fn row_uses_fallback(ts: &gpui::WindowTextSystem, _base: &gpui::Font, srow: &ShapedRow) -> bool {
+    if !srow.has_non_ascii {
+        return false;
+    }
+    let mut known = false;
+    let mut unknown = false;
+    for wl in srow.wrapped.iter() {
+        for r in &wl.unwrapped_layout.runs {
+            if ts.get_font_for_id(r.font_id).is_some() {
+                known = true;
+            } else {
+                unknown = true;
+            }
+            if known && unknown {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 诊断：`WY_NOTDEF_DEBUG=1` 时输出含非 ASCII 字形的行的真实整形结果（每 run 的
+/// 字体名/font_id/is_emoji/glyph id）。只在「字形签名变化」时打印一次，配合点击复现
+/// 「caret 行正常 / 非 caret 行方框」的翻转——方框行与正常行的 run 字体/glyph 差异会
+/// 直接暴露（例如冷启动错误回退字体 vs 正确的 Segoe UI Emoji，glyph id 都非 0）。
+static LAST_SPECIAL_ROW: std::sync::Mutex<Option<(usize, String)>> =
+    std::sync::Mutex::new(None);
+fn debug_special_row(
+    editor: &WyEditor,
+    window: &Window,
+    rl: usize,
+    srow: &ShapedRow,
+    base_font: &gpui::Font,
+) {
+    if std::env::var_os("WY_NOTDEF_DEBUG").is_none() {
+        return;
+    }
+    let txt = editor.doc().line_str(rl);
+    if txt.bytes().all(|b| b.is_ascii()) {
+        return;
+    }
+    let ts = window.text_system();
+    let base_id = ts.resolve_font(base_font);
+    let mut sig = String::new();
+    let mut parts = Vec::new();
+    for wl in srow.wrapped.iter() {
+        for run in &wl.unwrapped_layout.runs {
+            let fam = ts
+                .get_font_for_id(run.font_id)
+                .map(|f| f.family.to_string())
+                .unwrap_or_else(|| format!("#{}", run.font_id.0));
+            let fb = if run.font_id != base_id { "*FB" } else { "" };
+            let mut glyphs = String::new();
+            let mut last_idx = None;
+            for g in &run.glyphs {
+                if last_idx == Some(g.index) {
+                    continue;
+                }
+                last_idx = Some(g.index);
+                if !glyphs.is_empty() {
+                    glyphs.push(',');
+                }
+                glyphs.push_str(&format!("{}:{}", g.index, g.id.0));
+            }
+            sig.push_str(&format!("|{}:{}:{}", run.font_id.0, fam, glyphs));
+            parts.push(format!(
+                "{} id={} emo={}{} [{}]",
+                fam,
+                run.font_id.0,
+                run.glyphs.iter().any(|g| g.is_emoji),
+                fb,
+                glyphs
+            ));
+        }
+    }
+    {
+        let mut last = LAST_SPECIAL_ROW.lock().unwrap();
+        if last.as_ref().is_some_and(|(lr, ls)| *lr == rl && *ls == sig) {
+            return;
+        }
+        *last = Some((rl, sig));
+    }
+    let sample: String = txt.chars().take(40).collect();
+    notdef_debug(format_args!(
+        "row rl={rl} base=#{} {}",
+        base_id.0,
+        parts.join(" | ")
+    ));
+    notdef_debug(format_args!("  text={sample:?}"));
 }
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
@@ -2396,9 +2494,10 @@ pub(crate) fn build_frame(
                 if caret_line == srcline {
                     need_row.push(k);
                 } else if let Some(rc) = row_cache.get(k, shape_key) {
-                    if shaped_row_has_notdef(&rc) {
+                    if shaped_row_has_notdef(&rc) && !editor.notdef_settled(k) {
                         // 命中但含 .notdef（此前冷启动坏字形被缓存/预热写入）：视作
                         // miss，强制以新鲜平台重排——否则豆腐块被旧缓存钉住整次运行。
+                        // 已 `settled`（判定确无字形）的块例外：tofu 即正确显示，正常命中。
                         need_row.push(k);
                     } else {
                         hit_map.insert(k, rc);
@@ -2431,37 +2530,93 @@ pub(crate) fn build_frame(
             for k in lo..hi {
                 let srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
+                } else if let Some(last) = editor.cooling_row(k) {
+                    // 冷却帧：不调用 gpui shape（被钉的 `LineLayoutCache` 键本帧不被
+                    // 引用 → 帧末自然淘汰），复用上一份 notdef 行几何继续显示。次帧
+                    // 重排才是新键、真打到平台（DWrite 回退自愈的必要条件）。
+                    // 强制下一帧：静态视图不会再自渲染，若不请求重绘则自愈停摆。
+                    window.refresh();
+                    #[cfg(test)]
+                    editor.bump_coolings();
+                    (*last).clone()
                 } else {
                     let r = rows_map.remove(&k).expect("未命中 / caret 行应已被物化");
                     let is_caret = !matches!(r.kind, IrKind::Code | IrKind::Table | IrKind::Image)
                         && caret_line == r.src_line;
+                    let rl = r.src_line;
                     #[cfg(test)]
                     editor.bump_reshapes();
-                    // notdef 待重试块：用「新鲜 wrap-width token」破 gpui 的 2-frame
-                    // 行缓存，让本次 shape 真正打到平台（否则每帧重排会从上一帧缓存
-                    // 回喂同一份旧坏布局，回退永远不收敛）。
-                    let shape_width = editor.notdef_shape_width(k, width);
-                    if is_caret {
-                        shape_docrow(r, editor, window, shape_width, avail, theme, &base_font)
-                    } else {
-                        let srow =
-                            shape_docrow(r, editor, window, shape_width, avail, theme, &base_font);
-                        if shaped_row_has_notdef(&srow) {
-                            if editor.note_notdef(k) {
-                                // 连续 N 帧新鲜重排仍 .notdef → 字符确无字形
-                                // （tofu 即正确显示），从此正常入缓存，不再逐帧空转。
+                    let srow = shape_docrow(r, editor, window, width, avail, theme, &base_font);
+                    if shaped_row_has_notdef(&srow) {
+                        // —— 冷启动回退未命中（glyph id=0）→「冷却一帧 → 新鲜平台重排」——
+                        // 一律重试（**不**因“回退已温”就静默缓存成豆腐块：探针只覆盖少数
+                        // (font,size)，真实行字号/字体可能未探到而首排仍坏——实测首排坏、
+                        // 次排好；冷却一帧让被钉的 LineLayoutCache 键淘汰，次排才是新键、
+                        // 真打到 DWrite 平台）。
+                        if editor.notdef_settled(k) {
+                            // 已判定缺字形（仅 caret 行会到此处，非 caret 行在 settled 时
+                            // 已入缓存、走命中路径）：直接显示，不再冷却空转。
+                            srow
+                        } else if editor.cool_start(k) {
+                            // 连续 N 次真实平台重排仍 .notdef → 判定字符确无字形
+                            // （tofu 即正确显示），从此不再重排空转。
+                            notdef_debug(format_args!(
+                                "pass2 give-up k={} src={} caret={is_caret}",
+                                k, rl
+                            ));
+                            if is_caret {
+                                srow
+                            } else {
                                 let rc = row_cache.put(k, shape_key, srow);
                                 (*rc).clone()
-                            } else {
-                                srow // 不入缓存：下一帧带新 token 重排，等回退解析成功
                             }
                         } else {
-                            editor.clear_notdef(k);
+                            // 入冷却：本帧几何留作下帧显示、且下帧不 shape（被钉的
+                            // LineLayoutCache 键不被引用 → 帧末淘汰 → 再下帧重排才是
+                            // 新键、真重新打到 DWrite）。caret 行同样受益（否则首行 ❗
+                            // 每帧命中旧坏键，豆腐块永不消失）。强制下一帧推进自愈。
+                            window.refresh();
+                            editor.cool_keep_last(k, std::rc::Rc::new(srow.clone()));
+                            notdef_debug(format_args!(
+                                "pass2 notdef k={} src={} caret={is_caret} -> cooling",
+                                k, rl
+                            ));
+                            srow
+                        }
+                    } else if row_uses_fallback(window.text_system(), &base_font, &srow)
+                        && !editor.fallback_verified(k)
+                    {
+                        // —— 冷启动回退占位字形（glyph id≠0，检测不到 .notdef）——
+                        // 首次遇到用到回退字体（字体族 ≠ 基字体）的行，DWrite 首次 shape
+                        // 可能给「错误回退字体里的非零占位字形」→ 渲染成方框，且因 glyph
+                        // id≠0 逃过上面的 notdef 检测、会被直接缓存钉住（caret 行正常 /
+                        // 非 caret 行方框的翻转就是它）。不缓存首次结果：标记已校验 + 冷却
+                        // 一帧强制第二次真实重排（实测第二次即正常），次排走正常缓存路径。
+                        editor.mark_fallback_verified(k);
+                        editor.verify_cool(k);
+                        window.refresh();
+                        editor.cool_keep_last(k, std::rc::Rc::new(srow.clone()));
+                        notdef_debug(format_args!(
+                            "pass2 fallback-verify k={} src={} caret={is_caret}",
+                            k, rl
+                        ));
+                        srow
+                    } else {
+                        // 干净排（无回退，或已校验过回退字形）：清掉本块此前任何重试/
+                        // settled 状态。caret 行若**无行内数学**（reveal 不依赖光标）也入
+                        // 缓存——用新鲜的正确答案覆盖早期冷启动缓存的坏行：用户点击该行
+                        // 一次后永久修复（否则每次点击离开又回到旧坏行 = “点击翻转”）。
+                        editor.clear_notdef(k);
+                        if is_caret && !srow.extra.inline_maths.is_empty() {
+                            srow // reveal 依赖光标 → 保持不缓存
+                        } else {
                             let rc = row_cache.put(k, shape_key, srow);
                             (*rc).clone()
                         }
                     }
                 };
+                let srcl = base.borrow().src_lines()[k] as usize;
+                debug_special_row(editor, window, srcl, &srow, &base_font);
                 base.borrow_mut().set(k, f32::from(srow.height));
                 shaped.push((k, srow));
             }
@@ -2810,7 +2965,8 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         };
         if !blocked && !big && caret_line != srcline && rc.get(k, sk).is_none() {
             // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
-            // 含 .notdef 的坏行**不入缓存**——进带后由 Pass2 以新鲜 token 重排自愈。
+            // 含 .notdef 的坏行**不入缓存**——进带后由 Pass2 以「冷却一帧 → 新鲜重排」
+            // 自愈（一律重试，不为“回退已温”静默缓存）。
             if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
                 #[cfg(test)]
                 e.bump_prewarm_shapes();
@@ -2832,6 +2988,16 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     }
     crate::prof::end("wy.prewarm", _t);
     st.bias = (st.bias + bpf) % n;
+}
+
+/// Windows 冷启动 color-emoji 光栅预热（一次/进程）。实测：DWrite 在冷进程里**首次**
+/// 光栅化彩色 COLR 字形时 `rasterize_color` 失败，gpui 回退为单色（彩色 emoji 没有
+/// 单色轮廓 → 空白/方框），且 `sprite_atlas` 会按 (font,glyph,size) 把这份坏结果钉住
+/// 整次运行。这里在 WYSIWYG 首帧 paint 阶段（任何真实行打印之前）打热彩字管线；
+/// 具体实现见 [`super::warm_emoji_rasterizer`]（共享给预览/源码编辑区，先画的窗格先
+/// 预热，杜绝被先画窗格毒化）。
+fn warm_emoji_rasterizer(window: &mut Window) {
+    super::warm_emoji_rasterizer(window);
 }
 
 /// 元素：auto-grow、宿主滚动。
@@ -3160,6 +3326,11 @@ impl Element for WyEditorElement {
             .update(cx, |e, ecx| e.sync_math(ecx, f));
         crate::prof::end("wy.paint.synmath", _t_sm);
         let origin = bounds.origin;
+        // 首帧光栅预热（一次/进程）：先打热 DWrite 彩字管线再画真实行（见
+        // [`warm_emoji_rasterizer`]——冷进程首次 COLR 光栅失败 → emoji 变空白/方框）。
+        let _t_warm = crate::prof::begin();
+        warm_emoji_rasterizer(window);
+        crate::prof::end("wy.paint.warmemoji", _t_warm);
         // 背景层：先给所有可见引述行画灰底带 + 左指示条（`py_1` 上下各越 4px，相邻带连片）。
         // ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住
         // 前一行文字底部（引述第一行被第二行背景盖掉的 bug）。

@@ -4712,57 +4712,46 @@ A-->B
 
     #[gpui::test]
     fn notdef_retry_state_machine(cx: &mut TestAppContext) {
-        // 直接驱动 notdef 重试表（不依赖平台回退）：
-        // - 未登记块 → notdef_shape_width 用原宽（不打扰正常 pass）；
-        // - 登记后 → 扰动 wrap-width token（破 gpui 2-frame 行缓存，每次重排真正上平台）；
-        // - 连续 NOTDEF_RETRY_FRAMES 帧仍坏 → note_notdef 返回「给出」并清登记（接受入缓存）；
-        // - clear_notdef 后恢复原宽。
-        use crate::markdown::wysiwyg::NOTDEF_RETRY_FRAMES;
+        // 直接驱动 notdef 重试状态机（不依赖平台回退）：
+        // - 未登记块 → notdef_settled=false、cooling_row=None（不打扰正常 pass）；
+        // - cool_start 推进真实平台重排计数，达 NOTDEF_RETRY_ATTEMPTS 上限返回「给出」
+        //   并置 settled（判定确无字形 → 之后命中含 notdef 的缓存不再当 miss 重排）；
+        // - clear_notdef 后 settled 清空、恢复原态。
+        use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
         cx.update(gpui_component::init);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx));
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
-        let w0 = px(980.);
-        let width_at = |vcx: &mut VisualTestContext, block: usize| -> gpui::Pixels {
-            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_shape_width(block, w0))
+        let settled = |vcx: &mut VisualTestContext, block: usize| -> bool {
+            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(block))
         };
-        assert_eq!(
-            width_at(vcx, 3),
-            w0,
-            "未登记块应原宽（不打扰正常 pass）"
+        assert!(!settled(vcx, 3), "未登记块不应 settled");
+        assert!(
+            vcx.update(|_, cx| host.read(cx).ed.read(cx).cooling_row(3))
+                .is_none(),
+            "未登记块不应处于冷却"
         );
-        // 连打坏帧：第 k 帧返回「未给出」（k < 上限）、第 N 帧返回「给出」并清登记。
+        // 连打坏重排：第 k 次返回「未给出」（k < 上限）、第 N 次返回「给出」并 settled。
         let mut gave_up_at = None;
-        for k in 1..=NOTDEF_RETRY_FRAMES {
-            let ok = vcx.update(|_, cx| host.read(cx).ed.read(cx).note_notdef(3));
+        for k in 1..=NOTDEF_RETRY_ATTEMPTS {
+            let ok = vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(3));
             if ok && gave_up_at.is_none() {
                 gave_up_at = Some(k);
             }
-            if k < NOTDEF_RETRY_FRAMES {
-                assert!(!ok, "第 {k} 帧应仍未给出");
-            } else {
-                assert!(ok, "第 {k} 帧应给出并清登记");
-            }
         }
-        assert_eq!(gave_up_at, Some(NOTDEF_RETRY_FRAMES));
         assert_eq!(
-            width_at(vcx, 3),
-            w0,
-            "给出后登记已清 → 恢复原宽"
+            gave_up_at,
+            Some(NOTDEF_RETRY_ATTEMPTS),
+            "恰在上限次给出（长期坏块不再空转）"
         );
-        // 登记中 → token 确实扰动（保证每次重排都打到平台）。
-        vcx.update(|_, cx| host.read(cx).ed.read(cx).note_notdef(7));
-        assert_ne!(
-            width_at(vcx, 7),
-            w0,
-            "登记中应扰动宽度"
+        assert!(settled(vcx, 3), "给出后应标记 settled（确无字形）");
+        // 单次登记（未达上限）：应不给出；clear 后 settled 清空。
+        assert!(
+            !vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(7)),
+            "未达上限不应给出"
         );
         vcx.update(|_, cx| host.read(cx).ed.read(cx).clear_notdef(7));
-        assert_eq!(
-            width_at(vcx, 7),
-            w0,
-            "clear 后恢复原宽"
-        );
+        assert!(!settled(vcx, 7), "clear 后应清 settled");
     }
