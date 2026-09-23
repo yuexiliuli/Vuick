@@ -1,8 +1,8 @@
 //! `element` 的单元测试。原内联于 `element.rs`，抽取后经 `#[path]` 挂在
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
     use super::{
-        build_frame, caret_geometry, display_to_source, source_offset_at, source_to_display,
-        table_block_height, table_cell_x0, table_row_top, WyEditor,
+        build_frame, caret_geometry, display_to_source, prewarm_band, source_offset_at,
+        source_to_display, table_block_height, table_cell_x0, table_row_top, WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -3269,10 +3269,85 @@ A-->B
         });
     }
 
+    /// D1 滚动预热：每次带穿越前把「下一量子带」提前 shape 进缓存 → 穿越时 Pass2
+    /// 命中（整形数 ≈ 0），冷态对照组则每穿越都整形成本。只 put 缓存、不动 base 高度。
+    #[gpui::test]
+    fn prewarm_band_makes_band_cross_near_cache_hit(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::Prewarm;
+        use gpui::App;
+        cx.update(gpui_component::init);
+        // 连续短段：512px 量子带 ≈ 20+ 块；预热 3 块/帧 × 10 帧覆盖整带。
+        let mut text = String::new();
+        for i in 0..4000 {
+            text.push_str(&format!("paragraph number {i} with words here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let q = 512.;
+            let width = px(900.);
+            // caret 放文末（任何带外），排除 reveal 干扰。
+            ed.update(cx, |e, _| e.set_caret(text.len()));
+
+            // —— 对照组：连续 6 次带穿越（全冷、无预热）——
+            let mut cold: Vec<u64> = Vec::new();
+            for i in 0..6usize {
+                build_frame(ed.read(cx), window, width, (i as f32 * q, i as f32 * q + 512.));
+                cold.push(ed.read(cx).take_reshapes());
+            }
+            let cold_sum: u64 = cold.iter().sum();
+            assert!(cold_sum > 0, "冷态穿越应有整形：{cold:?}");
+            assert!(
+                cold.iter().all(|&c| c > 0),
+                "冷态每一穿越都应整形：{cold:?}"
+            );
+
+            // —— 预热组：同一 editor 清缓存/清预热状态后重来 ——
+            ed.update(cx, |e, _| {
+                e.shape_rows.borrow_mut().clear();
+                *e.prewarm.borrow_mut() = Prewarm::default();
+                e.set_caret(text.len());
+            });
+            let mut warm: Vec<u64> = Vec::new();
+            for i in 0..8usize {
+                let bw = i as f32 * q;
+                let f = build_frame(ed.read(cx), window, width, (bw, bw + 512.));
+                if i == 0 {
+                    // 首带冷建（不计入穿越整形）；随后对带 1 建立方向并预热。
+                    ed.read(cx).take_reshapes();
+                    prewarm_band(ed.read(cx), &f, window);
+                    continue;
+                }
+                // 本带穿越整形（上一帧已对带 i-1 执行过 10 次预热 → 命中应接近 0）。
+                warm.push(ed.read(cx).take_reshapes());
+                // 对本带 frame 预热下一带（i+1）：3 块/帧 × 10 帧覆盖整带。
+                for _ in 0..10 {
+                    prewarm_band(ed.read(cx), &f, window);
+                }
+            }
+            let warm_sum: u64 = warm.iter().sum();
+            println!(
+                "[prewarm] cold={cold:?} (sum {cold_sum}) vs warm={warm:?} (sum {warm_sum})"
+            );
+            // 预热后每带穿越只应补极少量整形（首个冷带除外）：总计应远小于冷态总和。
+            assert!(
+                warm_sum < cold_sum / 3,
+                "预热后穿越应接近缓存命中：warm {warm:?} ({warm_sum}) vs cold {cold:?} ({cold_sum})"
+            );
+            assert!(
+                warm[1..].iter().all(|&c| c <= 2),
+                "进入稳态后每次穿越至多补 2 次整形：{warm:?}"
+            );
+        });
+    }
+
     /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑整体清空。
     #[gpui::test]
-    fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
+    fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {        use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
         cx.update(gpui_component::init);
         let mut text = String::new();

@@ -2624,7 +2624,7 @@ fn table_cell_at_src(
 ///   预热条目若因 reveal 变活跃也只是浅克隆复用。
 /// - 方向只由带序号跨界（`band.top/512` 取整变化）判定；预算按块数硬上限，滑动窗
 ///   `bias` 每帧推进、回绕兜底——区间扫满即全部命中/跳过，空转开销≈HashMap 查找。
-fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
+pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     let q = 512.;
     let mut st = e.prewarm.borrow_mut();
     let (blo, bhi) = frame.band;
