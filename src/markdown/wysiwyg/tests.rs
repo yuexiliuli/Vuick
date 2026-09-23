@@ -4352,10 +4352,10 @@ A-->B
             eprintln!("[bench] realfile {name}: {}ms ({:.1}ms/键 稳态) at={at2}", t, t as f64 / n as f64);
             crate::prof::dump(&format!("wy.realfile.{name}"));
         };
-        case(cx, "plain-x", plain_at, &["x", "y", "x", "y"]);
-        case(cx, "fence-x", fence_mid, &["x", "y", "x", "y"]);
-        case(cx, "table-x", table_row, &["x", "y", "x", "y"]);
-        case(cx, "math-$$-x", math_line, &["x", "y", "x", "y"]);
+        case(cx, "plain-x", plain_at, &["x", "y", "x", "y", "x", "y", "x", "y"]);
+        case(cx, "fence-x", fence_mid, &["x", "y", "x", "y", "x", "y", "x", "y"]);
+        case(cx, "table-x", table_row, &["x", "y", "x", "y", "x", "y", "x", "y"]);
+        case(cx, "math-$$-x", math_line, &["x", "y", "x", "y", "x", "y", "x", "y"]);
         case(cx, "enter-mid", text.len() / 2, &["\n", "\n", "\n", "\n"]);
     }
     #[gpui::test]
@@ -4384,6 +4384,7 @@ A-->B
         let q = 512.0f32;
         let n = 24;
         let mut bands: Vec<(f32, f32)> = Vec::new();
+        // 前段：文档上部（普通文本/标题/列表）；后段：~30k px 起的数学/表格密集区。
         for k in 0..n {
             let top = 400.0 * (k + 1) as f32;
             bands.push((
@@ -4391,7 +4392,15 @@ A-->B
                 ((top + 2. * vh) / q).ceil() * q,
             ));
         }
-        // 阶段 A：首次滚过 24 个新带（每带含新进块整形）——真实滚动前沿成本。
+        for k in 0..n {
+            let top = 30_000.0 + 400.0 * (k + 1) as f32;
+            bands.push((
+                (((top - vh) / q).floor() * q).max(0.),
+                ((top + 2. * vh) / q).ceil() * q,
+            ));
+        }
+        let n = bands.len();
+        // 阶段 A：首次滚过全部新带（每带含新进块整形）——真实滚动前沿成本。
         let mut t = 0u128;
         let mut reshapes = 0u64;
         for &band in &bands {
