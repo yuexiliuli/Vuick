@@ -3283,10 +3283,10 @@ impl Element for EditorElement {
         cx: &mut App,
     ) {
         // 首帧光栅预热（一次/进程）：先打热 DWrite 彩字管线再画任何文字——冷进程首次
-        // COLR 彩字光栅失败 → emoji 变空白/方框且被 sprite_atlas 钉住。源码编辑区若先
-        // 于预览/WYSIWYG 画文本，也必须先预热（见
+        // COLR 彩字光栅失败 → emoji 变空白/方框且被 sprite_atlas 钉住。
+        // 源码编辑区若先于预览/WYSIWYG 画文本，也必须先预热
         // `crate::markdown::wysiwyg::warm_emoji_rasterizer`）。
-        crate::markdown::wysiwyg::warm_emoji_rasterizer(window);
+        crate::markdown::wysiwyg::warm_emoji_rasterizer(window,"editor");
         self.inner.paint(window, cx);
         let focus = self.editor.read(cx).focus_handle();
         window.handle_input(

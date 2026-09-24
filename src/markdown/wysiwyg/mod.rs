@@ -649,7 +649,7 @@ pub(crate) fn notdef_debug(args: std::fmt::Arguments<'_>) {
 /// 可能失败、其后即成功），之后任何窗格的真实 emoji 首帧即正确，不再被某个先画窗格
 /// 毒化。探针字体取窗口缺省文本样式即可——回退按字符独立，emoji 字符必路由到回退彩
 /// 字字体。
-pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
+pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
     // 冷启动 COLR 自愈：DWrite 彩色光栅在冷进程首次使用时失败/返回空白。平台层
     //（gpui_windows rasterize_glyph）已保证「空白不写 atlas 缓存」（返回 Err 即不入缓存），
     // 因此 paint_emoji 的 `.is_ok()` 从此“诚实”——失败 = 真的没彩出来。这里就借助它做
@@ -665,6 +665,7 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
     const MAX_ATTEMPTS: usize = 60;
 
     if DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[WY-WARM] already done -> skip ({tag})");
         return;
     }
 
@@ -733,7 +734,7 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
     if all_ok {
         DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "[WY-WARM] all {:?} sizes ok in {:.0}ms (base={:?})",
+            "[WY-WARM] all {:?} sizes ok in {:.0}ms (base={:?}) done-by={tag}",
             sizes,
             started.elapsed().as_millis(),
             body.family
@@ -744,7 +745,7 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
         let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if attempt < MAX_ATTEMPTS {
             eprintln!(
-                "[WY-WARM] partial fail(attempt={attempt}) sizes={sizes:?} font_ids={font_ids:?} -> refresh",
+                "[WY-WARM] partial fail(attempt={attempt}) sizes={sizes:?} font_ids={font_ids:?} from={tag} -> refresh",
             );
             window.refresh();
         } else {
