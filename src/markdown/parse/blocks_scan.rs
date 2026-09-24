@@ -10,11 +10,8 @@ use std::ops::Range;
 use gpui::{Image, SharedString};
 use gpui_component::input::Rope;
 
-use super::blocks::{scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
-use super::rows::{
-    fence_len, inline_strip, is_rule, list_prefix, parse_image_line, try_parse_table,
-    parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData,
-};
+use super::blocks::{classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
+use super::rows::{inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData};
 
 /// 全量扫描一个 **ropey Rope** 文本（打开/首同步/大变化兜底用）。
 ///
@@ -182,135 +179,28 @@ pub fn scan_blocks_incremental_rope(
             }
         }
 
-        // —— 否则与 `scan_blocks` 完全相同的切块逻辑（逐块消费 `idx`）——
+        // —— 否则与 `scan_blocks` 相同的切块逻辑（逐块消费 `idx`）——
         let row_start = anchor + idx; // 文档绝对行号
         let line = new_lines[idx].trim_end_matches('\r');
         let t = line.trim_start();
         let raw_len = line.len() as u32;
         let blk_byte = (anchor_byte as u32).wrapping_add(cur_byte); // 文档绝对字节
-        if let Some((fc, _)) = fence_len(t) {
-            let mut code_lines = 0u32;
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            while idx < new_lines.len() {
-                let l = new_lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start())
-                    && c == fc {
-                        idx += 1;
-                        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-                        break;
-                    }
-                code_lines += 1;
-                idx += 1;
-                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            }
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Code,
-                raw_len,
-                aux: code_lines,
-            });
-            continue;
-        }
-        if t.is_empty() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Blank,
-                raw_len: 0,
-                aux: 0,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        let hashes = t.chars().take_while(|&c| c == '#').count();
-        if (1..=6).contains(&hashes) && t.len() > hashes {
-            let text = inline_strip(t[hashes..].trim_start()).to_string();
-            toc.push((row_start, hashes as u8, text));
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Heading(hashes as u8),
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        if t.starts_with('>') {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Quote,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        if list_prefix(t).is_some() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Bullet,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        if is_rule(t) {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Rule,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        if parse_image_line(t).is_some() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Image,
-                raw_len,
-                aux: 1,
-            });
-            idx += 1;
-            cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            continue;
-        }
-        if let Some((table, consumed)) = try_parse_table(&new_lines, idx) {
-            for _ in 0..consumed {
-                idx += 1;
-                cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
-            }
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte: blk_byte,
-                kind: RowKind::Table,
-                raw_len,
-                aux: table.rows.len() as u32,
-            });
-            continue;
+        let c = classify_block(&new_lines, idx, t);
+        if let RowKind::Heading(h) = c.kind {
+            let text = inline_strip(t[h as usize..].trim_start()).to_string();
+            toc.push((row_start, h, text));
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
             byte: blk_byte,
-            kind: RowKind::Paragraph,
-            raw_len,
-            aux: 0,
+            kind: c.kind,
+            raw_len: if c.kind == RowKind::Blank { 0 } else { raw_len },
+            aux: c.aux,
         });
-        idx += 1;
-        cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
+        for k in idx..idx + c.consumed {
+            cur_byte = next_line_byte(&new_lines, cur_byte, k, region_bytes);
+        }
+        idx += c.consumed;
     }
     debug_assert!(
         reused || idx >= new_lines.len(),

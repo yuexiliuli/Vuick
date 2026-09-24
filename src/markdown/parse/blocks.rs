@@ -271,6 +271,85 @@ pub(crate) fn build_line_starts_u32(src: &str) -> Vec<u32> {
     starts
 }
 
+/// 一个源码块的**切块判定**结果：类型 + 消费行数 + 辅助计数。
+///
+/// “切块判定”指「当前行属于哪种块、吃几行源码」：围栏 / 空行 / 标题 / 引述 /
+/// 列表 / 分隔线 / 独立图片 / 表格 / 段落，判定顺序与 [`parse_to_rows`] 完全一致。
+/// [`scan_blocks`] 与 `blocks_scan::scan_blocks_incremental_rope` 共用本函数，
+/// 免去两份“与 scan_blocks 完全相同”的重复切块逻辑漂移；各调用方自行负责行级
+/// 前置处理（EPUB `%%ALIGN:` 剥离与否）与字节游标推进。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockClass {
+    pub(crate) kind: RowKind,
+    /// 该块消费的源码行数（围栏含开门/关门行；表格含表头+分隔+数据行）。
+    pub(crate) consumed: usize,
+    /// Code：代码行数；Table：数据行数；Image：1；其余：0。
+    pub(crate) aux: u32,
+    /// 标题级别（非标题为 0），供调用方据此构建目录文本。
+    pub(crate) hashes: u8,
+}
+
+pub(crate) fn classify_block(lines: &[&str], idx: usize, t: &str) -> BlockClass {
+    if let Some((fc, _)) = fence_len(t) {
+        let mut code_lines = 0u32;
+        let mut j = idx + 1;
+        while j < lines.len() {
+            let l = lines[j].trim_end_matches('\r');
+            if let Some((c, _)) = fence_len(l.trim_start())
+                && c == fc {
+                j += 1;
+                break;
+            }
+            code_lines += 1;
+            j += 1;
+        }
+        return BlockClass {
+            kind: RowKind::Code,
+            consumed: j - idx,
+            aux: code_lines,
+            hashes: 0,
+        };
+    }
+    if t.is_empty() {
+        return BlockClass {
+            kind: RowKind::Blank,
+            consumed: 1,
+            aux: 0,
+            hashes: 0,
+        };
+    }
+    let hashes = t.chars().take_while(|&c| c == '#').count() as u8;
+    if (1..=6).contains(&hashes) && t.len() > hashes as usize {
+        return BlockClass {
+            kind: RowKind::Heading(hashes),
+            consumed: 1,
+            aux: 0,
+            hashes,
+        };
+    }
+    if t.starts_with('>') {
+        return BlockClass { kind: RowKind::Quote, consumed: 1, aux: 0, hashes: 0 };
+    }
+    if list_prefix(t).is_some() {
+        return BlockClass { kind: RowKind::Bullet, consumed: 1, aux: 0, hashes: 0 };
+    }
+    if is_rule(t) {
+        return BlockClass { kind: RowKind::Rule, consumed: 1, aux: 0, hashes: 0 };
+    }
+    if parse_image_line(t).is_some() {
+        return BlockClass { kind: RowKind::Image, consumed: 1, aux: 1, hashes: 0 };
+    }
+    if let Some((table, consumed)) = try_parse_table(lines, idx) {
+        return BlockClass {
+            kind: RowKind::Table,
+            consumed,
+            aux: table.rows.len() as u32,
+            hashes: 0,
+        };
+    }
+    BlockClass { kind: RowKind::Paragraph, consumed: 1, aux: 0, hashes: 0 }
+}
+
 /// 一次遍历产出整篇轻量块索引（不复制文本，不建 [`Row`]）。
 ///
 /// 判定顺序与 [`parse_to_rows`] 完全一致（围栏 / 空行 / 标题 / 引述 / 列表 /
@@ -292,117 +371,19 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         // 与 parse_to_rows 一致的 EPUB 对齐指令剥离（kind 判定对同一份内容做）。
         let (_, line) = strip_align_directive(raw_line);
         let t = line.trim_start();
-
-        if let Some((fc, _)) = fence_len(t) {
-            let mut code_lines = 0u32;
-            idx += 1;
-            while idx < lines.len() {
-                let l = lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start())
-                    && c == fc {
-                        idx += 1;
-                        break;
-                    }
-                code_lines += 1;
-                idx += 1;
-            }
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Code,
-                raw_len,
-                aux: code_lines,
-            });
-            continue;
-        }
-        if t.is_empty() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Blank,
-                raw_len: 0,
-                aux: 0,
-            });
-            idx += 1;
-            continue;
-        }
-        let hashes = t.chars().take_while(|&c| c == '#').count();
-        if (1..=6).contains(&hashes) && t.len() > hashes {
-            let text = inline_strip(t[hashes..].trim_start()).to_string();
-            toc.push((row_start, hashes as u8, text));
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Heading(hashes as u8),
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            continue;
-        }
-        if t.starts_with('>') {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Quote,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            continue;
-        }
-        if list_prefix(t).is_some() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Bullet,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            continue;
-        }
-        if is_rule(t) {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Rule,
-                raw_len,
-                aux: 0,
-            });
-            idx += 1;
-            continue;
-        }
-        if parse_image_line(t).is_some() {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Image,
-                raw_len,
-                aux: 1,
-            });
-            idx += 1;
-            continue;
-        }
-        if let Some((table, consumed)) = try_parse_table(&lines, idx) {
-            blocks.push(BlockMeta {
-                src_line: row_start as u32,
-                byte,
-                kind: RowKind::Table,
-                raw_len,
-                aux: table.rows.len() as u32,
-            });
-            idx += consumed;
-            continue;
+        let c = classify_block(&lines, idx, t);
+        if let RowKind::Heading(h) = c.kind {
+            let text = inline_strip(t[h as usize..].trim_start()).to_string();
+            toc.push((row_start, h, text));
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
             byte,
-            kind: RowKind::Paragraph,
-            raw_len,
-            aux: 0,
+            kind: c.kind,
+            raw_len: if c.kind == RowKind::Blank { 0 } else { raw_len },
+            aux: c.aux,
         });
-        idx += 1;
+        idx += c.consumed;
     }
     BlockIndex {
         blocks: Blocks::from_vec(blocks),
