@@ -31,11 +31,8 @@ use crate::markdown::ir::IrKind;
 use crate::markdown::parse::recognition::{AlertKind, LinkHit};
 use crate::markdown::parse::inline_style::MathAlign;
 
-#[path = "paint.rs"]
 mod paint;
-#[path = "hit.rs"]
 mod hit;
-#[path = "geom.rs"]
 mod geom;
 pub(crate) use geom::*;
 pub(crate) use paint::*;
@@ -925,7 +922,6 @@ impl Element for WyEditorElement {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
 mod tests;
 
 
