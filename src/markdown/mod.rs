@@ -18,6 +18,7 @@ mod cells;
 mod rows;
 mod citations;
 mod blocks;
+mod blocks_scan;
 mod doc;
 mod ir;
 pub(crate) mod recognition;
