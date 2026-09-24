@@ -15,6 +15,7 @@ mod parser;
 pub(crate) mod view;
 
 mod cells;
+mod rows;
 mod doc;
 mod ir;
 pub(crate) mod recognition;
