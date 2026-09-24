@@ -16,6 +16,7 @@ pub(crate) mod view;
 
 mod cells;
 mod rows;
+mod citations;
 mod doc;
 mod ir;
 pub(crate) mod recognition;
