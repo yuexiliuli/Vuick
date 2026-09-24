@@ -64,7 +64,8 @@ fn shaped_text_width(
 /// 一段排好的行布局是否含 `.notdef`（glyph id=0，元字形＝豆腐块）。Windows 冷启动时
 /// 主字体缺、需走回退字体才有的字形（❗⚠✅ 等）首次解析可能直接给 `.notdef`（空心
 /// 矩形）；含它的行若被 `RowShapeCache` 钉住则会整次运行不消失——Pass2/热身的命中
-/// 判定与入缓存前都据此剔除，让该行以「新鲜 wrap-width token」重新打到平台重排。
+/// 判定与入缓存前都据此剔除，把该块转交 [`super::NotdefRetry`]「冷却一帧 → 新鲜平台
+/// 重排」自愈（参见 `mod.rs` 中该类型的文档：扰动 wrap-width 已被证伪，勿再用）。
 pub(crate) fn layout_has_notdef(layout: &gpui::LineLayout) -> bool {
     layout.runs.iter().any(|r| r.glyphs.iter().any(|g| g.id.0 == 0))
 }

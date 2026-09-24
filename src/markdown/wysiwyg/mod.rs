@@ -640,65 +640,6 @@ pub(crate) fn notdef_debug(args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Windows 冷启动字体回退**阻塞预热**（首帧前跑完）。实测行为：同一进程里「谁先 shape
-/// 回退字形谁拿到 .notdef，之后的 shape 才正常」，且按 (font, size) 组合独立——探针必须
-/// 覆盖真实行的字号/字体才有效（这就是此前探针 16px 全绿、真实行仍豆腐块的根源）。这里
-/// 在 [`WyEditor::new`] 里同步轮询：每次用**唯一文本**（附加 ASCII 尾巴）换取全新缓存键 →
-/// 真打到 DWrite 平台；正文/等宽 × 正文号/等宽号（`0.88*fs`）全部探针干净才置温，否则
-/// `~2s` 超时放行、由 Pass2「冷却一帧→新鲜重排」兜底。探针全绿只作诊断/首帧提速，不当作
-/// 「.notdef = 缺字形」的短路（真实行可能用未探到的字号）。
-fn poll_dwrite_fallback(tsys: &gpui::WindowTextSystem, body: &gpui::Font, mono: &gpui::Font, fs: f32) {
-    use std::time::{Duration, Instant};
-    const PROBE_BASE: &[&str] = &[
-        "❗⚠✅✔♦★▶「」中文 abc123",
-        "🚀😀🎉👍❤️🔥 ⅡⅫ ½¾ ①②③",
-        "€£¥°®™→↑↓♥★© ★☆",
-    ];
-    // 覆盖真实行可能的两个字号：正文（fs）与等宽/代码（0.88*fs）。
-    let sizes = [fs.max(9.0), (fs * 0.88).max(9.0), 16.0];
-    let fonts = [body, mono];
-    let started = Instant::now();
-    let deadline = started + Duration::from_millis(2000);
-    let mut i = 0u32;
-    while Instant::now() < deadline {
-        let mut all_clean = true;
-        'round: for (fi, font) in fonts.iter().enumerate() {
-            for (si, &size) in sizes.iter().enumerate() {
-                for (bi, base) in PROBE_BASE.iter().enumerate() {
-                    let probe = format!("{base} wk{i}-{fi}{si}{bi}");
-                    let run = [gpui::TextRun {
-                        len: probe.len(),
-                        font: (*font).clone(),
-                        ..Default::default()
-                    }];
-                    let line = tsys.shape_line(probe.into(), px(size), &run, None);
-                    if element::layout_has_notdef(&line) {
-                        all_clean = false;
-                        break 'round;
-                    }
-                }
-            }
-        }
-        if all_clean {
-            FALLBACK_WARM.store(true, std::sync::atomic::Ordering::Relaxed);
-            notdef_debug(format_args!(
-                "probe warm after {i} round(s) fonts=[{},{}] sizes={:?}",
-                body.family, mono.family, sizes
-            ));
-            return;
-        }
-        if i % 4 == 0 {
-            notdef_debug(format_args!("probe round {i} still notdef"));
-        }
-        i += 1;
-        std::thread::sleep(Duration::from_millis(15));
-    }
-    notdef_debug(format_args!(
-        "probe TIMEOUT after {i} rounds; warm={}",
-        FALLBACK_WARM.load(std::sync::atomic::Ordering::Relaxed)
-    ));
-}
-
 /// Windows 冷启动 color-emoji 光栅预热（一次/进程，**共享给所有文本窗格**：预览/
 /// WYSIWYG/源码编辑区）。实测：DWrite 在冷进程里**首次**光栅化彩色 COLR 字形时
 /// `rasterize_color` 失败，gpui 回退为单色（彩色 emoji 无单色轮廓 → 空白/方框），且
@@ -820,10 +761,6 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
     }
 }
 
-/// 进程级「DWrite 回退已温」闩：任一令我们起疑的字形（探针/冷却重排）成功解析后置位，
-/// 此后 notdef 判定为真缺失。见 [`WyEditor::fallback_warm`] / [`WyEditor::mark_fallback_warm`]。
-static FALLBACK_WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// 跨帧滚动预热进度（见 [`element::prewarm_band`]）：方向只由带序号跨界
 /// （`band.top/512` 取整变化）决定，量子内小滚不换向；预算按块数硬上限；
 /// `bias` = 目标带内滑动窗起点，每帧推进、回绕兜底（保证总有进度、永不卡死）。
@@ -864,22 +801,6 @@ impl WyEditor {
         let ts = window.text_style();
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
         let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
-        // —— Windows 冷启动字体回退预热（同步，一次/进程）——
-        // `gpui_windows` 的 `prewarm_fonts` 是空实现，DirectWrite 的系统字体集合与回退
-        // 映射纯惰性初始化：冷进程首次把「仅靠回退字体提供的字形」（❗⚠✅ 等主字体缺）
-        // 排成 `.notdef` 空心方块，且该坏 layout 会被 gpui 按 (text,font,runs) 键缓存钉住。
-        // 这里在首帧前**同步**对含这些字形的探针做 shape（与 466c855 的异步版本不同：
-        // 它抢在竞态前完成，把 DWrite 的回退解析/系统字体枚举提前触发完）；若首支探针
-        // 仍 .notdef（枚举尚未就绪）则换下一支新文本（新键 = 又一次真实平台调用）。结果
-        // 只用于判定、不写入任何缓存（探针文本唯一、不会污染正常行）。
-        static FONT_FALLBACK_WARM: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !FONT_FALLBACK_WARM.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            // 首帧前阻塞把 DWrite 回退预热到可用（见 [`poll_dwrite_fallback`]）。正文与
-            // 等宽字体、正文号与等宽号各探一遍，覆盖正文/代码块里的特殊符号。
-            let tsys = window.text_system();
-            poll_dwrite_fallback(&tsys, &ts.font(), &font(p.mono.clone()), f32::from(fs));
-        }
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),

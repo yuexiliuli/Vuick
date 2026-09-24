@@ -2964,7 +2964,7 @@ A-->B
         // 注意：`VisualTestContext::run_until_parked` 只排空后台 executor，
         // `Context::spawn` 的续体（this.update → on_math_ready）要在前台 dispatcher
         // 上跑——必须用 `TestAppContext::run_until_parked`，故先释放 vcx 再重取。
-        drop(vcx);
+        let _ = vcx;
         cx.run_until_parked();
         let win = cx.windows()[0];
         let mut vcx = VisualTestContext::from_window(win, cx);
