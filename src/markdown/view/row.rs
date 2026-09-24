@@ -1162,13 +1162,13 @@ fn render_table_row(
             )
             .into_any_element();
     }
-    return div()
+    div()
         .w_full()
         .flex_shrink_0()
         .px_3()
         .py_1()
         .child(render_table(table, p))
-        .into_any_element();
+        .into_any_element()
 }
 
 
@@ -1249,7 +1249,7 @@ fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
             .min_h(px(IMAGE_ROW_DEFAULT_H))
             .debug_selector(|| "md-img-box".into()),
     };
-    return div()
+    div()
         .w_full()
         .flex_shrink_0()
         .px_3()
@@ -1258,7 +1258,7 @@ fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
         .justify_center()
         .items_center()
         .child(box_.child(img_el))
-        .into_any_element();
+        .into_any_element()
 }
 
 #[cfg(test)]
