@@ -3006,7 +3006,9 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
 /// 具体实现见 [`super::warm_emoji_rasterizer`]（共享给预览/源码编辑区，先画的窗格先
 /// 预热，杜绝被先画窗格毒化）。
 fn warm_emoji_rasterizer(window: &mut Window) {
-    super::warm_emoji_rasterizer(window, "wysiwyg");
+    if !super::warm_emoji_is_done() {
+        super::warm_emoji_rasterizer(window, "wysiwyg");
+    }
 }
 
 /// 元素：auto-grow、宿主滚动。

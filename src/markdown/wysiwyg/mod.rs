@@ -640,6 +640,18 @@ pub(crate) fn notdef_debug(args: std::fmt::Arguments<'_>) {
     }
 }
 
+/// 进程级 warm 状态（一次/进程）：`WARM_DONE` 置位后，各窗格 paint 顶首先查
+/// [`warm_emoji_is_done`] 快速短路，**不再进入** [`warm_emoji_rasterizer`] 本体。
+static WARM_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WARM_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WARM_SIZES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+const WARM_MAX_ATTEMPTS: usize = 60;
+
+/// warm 是否已完成：各窗格 paint 前调用，完成后直接跳过 warm，零重复访问。
+pub(crate) fn warm_emoji_is_done() -> bool {
+    WARM_DONE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Windows 冷启动 color-emoji 光栅预热（一次/进程，**共享给所有文本窗格**：预览/
 /// WYSIWYG/源码编辑区）。实测：DWrite 在冷进程里**首次**光栅化彩色 COLR 字形时
 /// `rasterize_color` 失败，gpui 回退为单色（彩色 emoji 无单色轮廓 → 空白/方框），且
@@ -659,17 +671,19 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
     // 1 帧收工、不再被逐帧 window.refresh() 拖住启动；任一字号失败 → 强制下一帧整批重试
     //（失败不入缓存、自然自愈），直到全成功或帧数上限；给出总帧数上限，防 GPU/驱动
     // 彻底不行时无限自旋。
-    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static SIZES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-    const MAX_ATTEMPTS: usize = 60;
-
-    if DONE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("[WY-WARM] already done -> skip ({tag})");
+    if WARM_DONE.load(std::sync::atomic::Ordering::Relaxed) {
+        // 高频重绘下每帧都打会刷屏 → 仅 WY_WARM_DEBUG=1 时打，且每进程**只打一次**
+        //（「哪个窗格命中已完成的守卫」这一诊断目标达成后，默认路径不再喷日志）。
+        static LOGGED_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if std::env::var_os("WY_WARM_DEBUG").is_some()
+            && !LOGGED_SKIP.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("[WY-WARM] already done -> skip ({tag})");
+        }
         return;
     }
 
-    let sizes = SIZES.get_or_init(|| {
+    let sizes = WARM_SIZES.get_or_init(|| {
         let body_size = match window.text_style().font_size {
             gpui::AbsoluteLength::Pixels(p) => p.as_f32(),
             gpui::AbsoluteLength::Rems(r) => r.to_pixels(window.rem_size()).as_f32(),
@@ -732,7 +746,7 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
         }
     }
     if all_ok {
-        DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        WARM_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "[WY-WARM] all {:?} sizes ok in {:.0}ms (base={:?}) done-by={tag}",
             sizes,
@@ -742,15 +756,15 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
     } else {
         // 仍有字号没磨热（COLR 冷 / 突发失败）：失败不入缓存 → 必须强制下一帧整批重试，
         // 否则该字号真实首光栅冷失败被原生 atlas 钉成豆腐块（旧逐帧版即靠这自愈）。
-        let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if attempt < MAX_ATTEMPTS {
+        let attempt = WARM_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if attempt < WARM_MAX_ATTEMPTS {
             eprintln!(
                 "[WY-WARM] partial fail(attempt={attempt}) sizes={sizes:?} font_ids={font_ids:?} from={tag} -> refresh",
             );
             window.refresh();
         } else {
             // 到上限仍不行 → 放弃自旋，等用户滚动/其它重绘触发（原生仍可能自愈）。
-            DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+            WARM_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

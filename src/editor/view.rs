@@ -3286,7 +3286,9 @@ impl Element for EditorElement {
         // COLR 彩字光栅失败 → emoji 变空白/方框且被 sprite_atlas 钉住。
         // 源码编辑区若先于预览/WYSIWYG 画文本，也必须先预热
         // `crate::markdown::wysiwyg::warm_emoji_rasterizer`）。
-        crate::markdown::wysiwyg::warm_emoji_rasterizer(window,"editor");
+        if !crate::markdown::wysiwyg::warm_emoji_is_done() {
+            crate::markdown::wysiwyg::warm_emoji_rasterizer(window, "editor");
+        }
         self.inner.paint(window, cx);
         let focus = self.editor.read(cx).focus_handle();
         window.handle_input(

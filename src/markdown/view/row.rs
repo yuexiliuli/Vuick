@@ -577,7 +577,9 @@ impl Element for TextTrack {
         // COLR 彩字光栅失败 → emoji 变空白/方框且被 sprite_atlas 钉住（见
         // `crate::markdown::wysiwyg::warm_emoji_rasterizer`）。预览若先于其它窗格画文本，
         // 也必须先预热，否则会先于其它窗格共享光栅状态。
-        crate::markdown::wysiwyg::warm_emoji_rasterizer(window, "preview");
+        if !crate::markdown::wysiwyg::warm_emoji_is_done() {
+            crate::markdown::wysiwyg::warm_emoji_rasterizer(window, "preview");
+        }
         // 1) 记录文本命中（layout 与可见文本一致；bounds.origin 已含滚动/布局变换）。
         //    每行必有 `st`（含行内代码的行也不例外）→ 字符级点选对两类行一致可用。
         let layout = self.st.layout();
