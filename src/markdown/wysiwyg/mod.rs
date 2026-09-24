@@ -500,6 +500,11 @@ impl RowShapeCache {
             _ => None,
         }
     }
+    /// 该块存在**但键已换代**（内容/图片/数学/宽度变化把旧行逐出）——与"从未缓存"区分：
+    /// 换代重排时旧 `settled/verified/attempts` 判决对应的是上一代结果，应作废重来。
+    fn key_mismatch(&self, block: usize, key: u64) -> bool {
+        self.entries.get(&block).is_some_and(|e| e.key != key)
+    }
     /// 插入（新行）；容量满时淘汰 last_seen 最小的条目。返回缓存的 `Rc`。
     fn put(
         &mut self,
@@ -587,6 +592,18 @@ impl NotdefRetry {
     fn clear_block(&mut self, block: usize) {
         self.attempts.remove(&block);
         self.cooling.remove(&block);
+        self.settled.remove(&block);
+        self.verified.remove(&block);
+        self.last.remove(&block);
+    }
+
+    /// 「换代」作废：块被**新代**键重新整形前，清掉上一代的判决（attempts/settled/
+    /// verified/last），**保留**冷却位——冷却帧仍复用上一份几何，换代重排不闪跳。
+    /// 作用：图片解码完成触发 `igen` 换代重建时，若某块曾在 DWrite 退化期（解码卡顿
+    /// 窗口）被误判 `settled`（预算烧光）或 `verified`（非零占位字形），换代后重新
+    /// 校验/重试即可自愈，不再整次运行永久豆腐块。
+    fn clear_stale(&mut self, block: usize) {
+        self.attempts.remove(&block);
         self.settled.remove(&block);
         self.verified.remove(&block);
         self.last.remove(&block);
@@ -725,6 +742,13 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
 
     let probe = "⚠✅❗❌❤️🔥  🚀✨★☆➡  😀😅🤔💡📌";
     let body = window.text_style().font();
+    let mut body_bold = body.clone();
+    body_bold.weight = gpui::FontWeight::BOLD;
+    // 标题（## 等）形体 = 正文**粗体**（element.rs `text_style_for` 对 Heading 置 BOLD）：
+    // emoji 回退落到的 FontId 可能与常规体不同 → atlas 键 (font,glyph,size) 不同 → 必须把
+    // 粗体也一起磨热，否则「标题里的 ❗ 首次真实光栅」冷失败被钉成空白（图片后的标题恰是
+    // 首见者——图片只是恰好排前面，非图片自身问题）。
+    let bases: Vec<gpui::Font> = vec![body.clone(), body_bold];
     loop {
         let idx = IDX.load(std::sync::atomic::Ordering::Relaxed);
         if idx >= sizes.len() {
@@ -733,24 +757,25 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
         }
         let fs = sizes[idx];
         // 先 shape 完再画：shape 拿不可变借用，画要走 window 可变借用，分开时段避免 E0502。
-        let emojis: Vec<(gpui::FontId, gpui::GlyphId)> = {
+        // 常规 + 粗体分别 shape，合并 emoji 后再统一屏幕外 paint。
+        let mut emojis: Vec<(gpui::FontId, gpui::GlyphId)> = Vec::new();
+        {
             let ts = window.text_system();
-            let run = [gpui::TextRun {
-                len: probe.len(),
-                font: body.clone(),
-                ..Default::default()
-            }];
-            let line = ts.shape_line(probe.into(), px(fs), &run, None);
-            line.runs
-                .iter()
-                .flat_map(|r| {
+            for font in &bases {
+                let run = [gpui::TextRun {
+                    len: probe.len(),
+                    font: font.clone(),
+                    ..Default::default()
+                }];
+                let line = ts.shape_line(probe.into(), px(fs), &run, None);
+                emojis.extend(line.runs.iter().flat_map(|r| {
                     r.glyphs
                         .iter()
                         .filter(|g| g.is_emoji)
                         .map(move |g| (r.font_id, g.id))
-                })
-                .collect()
-        };
+                }));
+            }
+        }
         let mut all_ok = true;
         let mut font_ids: Vec<u32> = Vec::new();
         for (font_id, glyph_id) in emojis {
@@ -1002,6 +1027,12 @@ impl WyEditor {
 
     pub(crate) fn clear_notdef(&self, block: usize) {
         self.notdef_retry.borrow_mut().clear_block(block);
+    }
+
+    /// 换代自愈：块被新代键重排前清掉上一代判决（attempts/settled/verified/last），
+    /// 保留冷却。由 Pass2 在检测到 `RowShapeCache` 键换代时调用（见 build_frame）。
+    pub(crate) fn clear_stale_verdicts(&self, block: usize) {
+        self.notdef_retry.borrow_mut().clear_stale(block);
     }
 
     /// 该块是否已做过「回退字形校验重排」（见 [`NotdefRetry::verified`]）。

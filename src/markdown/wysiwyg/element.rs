@@ -2503,6 +2503,14 @@ pub(crate) fn build_frame(
                         hit_map.insert(k, rc);
                     }
                 } else {
+                    // 缓存 miss。若存在**旧键**条目（内容/图片/数学/宽度换代把旧行逐出），
+                    // 旧 `settled/verified/attempts` 判决对应的是上一代结果——可能在图片
+                    // 解码卡顿窗口里留下（.notdef 预算烧光→settled / 非零占位字形→verified），
+                    // 换代重排前作废，让本块按新代重新校验/重试。图片加载完成的 `igen` 换代
+                    // 重建会走到这里 → 自愈，不再整次运行永久豆腐块。保留冷却帧不闪跳。
+                    if row_cache.key_mismatch(k, shape_key) {
+                        editor.clear_stale_verdicts(k);
+                    }
                     need_row.push(k);
                 }
             }

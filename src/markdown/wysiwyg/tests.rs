@@ -4755,3 +4755,72 @@ A-->B
         vcx.update(|_, cx| host.read(cx).ed.read(cx).clear_notdef(7));
         assert!(!settled(vcx, 7), "clear 后应清 settled");
     }
+
+    #[gpui::test]
+    fn stale_verdicts_cleared_on_generation_change(cx: &mut TestAppContext) {
+        // 换代自愈语义：图片解码完成触发 `igen` 换代重建时，若块在上代（DWrite 退化期）
+        // 被误判 settled（预算烧光）/ verified（非零占位字形），`clear_stale_verdicts`
+        // 应作废这些上一代判决，让本块按新代重新校验/重试——不再整次运行永久豆腐块。
+        use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
+        cx.update(gpui_component::init);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let settled = |vcx: &mut VisualTestContext, b: usize| -> bool {
+            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(b))
+        };
+        let verified = |vcx: &mut VisualTestContext, b: usize| -> bool {
+            vcx.update(|_, cx| host.read(cx).ed.read(cx).fallback_verified(b))
+        };
+        // 构造"上一代判决"：块 5 被置 verified；块 7 被置 settled（15 次重排仍坏）。
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).mark_fallback_verified(5));
+        for _ in 0..NOTDEF_RETRY_ATTEMPTS {
+            vcx.update(|_, cx| {
+                host.read(cx).ed.read(cx).cool_start(7);
+            });
+        }
+        assert!(verified(vcx, 5), "上代：fallback 已校验");
+        assert!(settled(vcx, 7), "上代：notdef 已确无字形");
+        // 换代：逐块作废，重置后恢复"未判决"。
+        vcx.update(|_, cx| {
+            host.read(cx).ed.read(cx).clear_stale_verdicts(5);
+            host.read(cx).ed.read(cx).clear_stale_verdicts(7);
+        });
+        assert!(!verified(vcx, 5), "换代后重新校验");
+        assert!(!settled(vcx, 7), "换代后重新重试");
+    }
+
+    #[gpui::test]
+    #[ignore]
+    fn bench_img_band_geometry(cx: &mut TestAppContext) {
+        // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
+        // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(gpui_component::init);
+        let path = "target/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[diag] skip: {e}");
+                return;
+            }
+        };
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(980.), (0., 6000.));
+            eprintln!("[diag] rows materialized: {}", frame.rows.len());
+            for r in frame.rows.iter().filter(|r| (50..=112).contains(&r.src_line)) {
+                eprintln!(
+                    "[diag] src={} kind={:?} top={:.1} h={:.1}",
+                    r.src_line, r.kind, f32::from(r.top), f32::from(r.height)
+                );
+            }
+        });
+    }
