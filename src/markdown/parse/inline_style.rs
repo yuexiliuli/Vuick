@@ -7,7 +7,9 @@ use std::ops::Range;
 
 use gpui::TextRun;
 
-use super::cells::{is_backslash_escaped, split_unescaped_pipes};
+use super::cells::is_backslash_escaped;
+#[cfg(test)]
+use super::cells::split_unescaped_pipes;
 
 /// ATX heading depth (1–6) if `line` is a heading: 1–6 leading `#` followed by
 /// a space or end-of-line. `None` otherwise.
@@ -624,6 +626,7 @@ pub(crate) fn splice_inline_math(
 /// tables (they show as source); this stays because `markdown::ir` and
 /// `markdown::parity` read `lines` to model/verify tables in the reader.
 #[derive(Clone)]
+#[cfg(test)]
 pub(crate) struct TableRegion {
     pub lines: Range<usize>,
 }
@@ -631,6 +634,7 @@ pub(crate) struct TableRegion {
 /// Detect GFM table regions in `content` (W4c). A region is a row line (trimmed
 /// text starts with `|`) immediately followed by a separator row
 /// (`| --- | :--: |`), then any further row lines. Returns regions in order.
+#[cfg(test)]
 pub(crate) fn table_regions(content: &str) -> Vec<TableRegion> {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out = Vec::new();
@@ -662,12 +666,14 @@ pub(crate) fn table_regions(content: &str) -> Vec<TableRegion> {
 }
 
 /// A table row is a line whose trimmed text starts with `|`.
+#[cfg(test)]
 pub(crate) fn is_table_row(line: &str) -> bool {
     line.trim_start().starts_with('|')
 }
 
 /// Split a `| a | b |` row into trimmed cell strings (the bounding pipes drop the
 /// empty leading/trailing cells they'd otherwise create).
+#[cfg(test)]
 pub(crate) fn table_cells(line: &str) -> Vec<&str> {
     let t = line.trim();
     let t = t.strip_prefix('|').unwrap_or(t);
@@ -683,6 +689,7 @@ pub(crate) fn table_cells(line: &str) -> Vec<&str> {
 /// alignment colons)? Alignment semantics are the single implementation
 /// `super::cells::parse_aligns` (shared with the preview parser and
 /// the semantic IR — parity-pinned).
+#[cfg(test)]
 fn is_separator_row(line: &str) -> bool {
     if !is_table_row(line) {
         return false;
