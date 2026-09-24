@@ -19,7 +19,7 @@ use crate::config::markdown::{
     IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH_PX,
     TABLE_SCROLLBAR_RESERVE_PX,
 };
-use crate::markdown::parser::{Row, RowAlign, RowKind, RunKind};
+use crate::markdown::parse::{Row, RowAlign, RowKind, RunKind};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
@@ -246,6 +246,7 @@ pub(crate) fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> 
 ///   有行内样式/搜索/选区的行沿用主题默认作为基（旧观感）。
 /// - `selection`：本行选中的 (字节区间, 背景色)；None = 无选区。
 /// - `marker_hl`：跳转定位 (注记号, 是否定义, 背景色)；命中该行的对应 `[n]` 标记加亮。
+#[allow(clippy::too_many_arguments)] // 文本行叶子助手：输入互为正交
 fn text_child(
     text: &gpui::SharedString,
     runs: &[(Range<usize>, RunKind)],
@@ -623,22 +624,57 @@ impl Element for TextTrack {
 /// `marker_hl`：引用双向跳转的定位 (注记号, 是否定义)；本行是被定位目标时由 `text_child`
 /// 给对应 `[n]` 标记加亮（背景色按主题取）。
 /// `row_ix`：全局块下标（注记/文本命中表行标识）。
+///
+/// 渲染上下文：同一帧内对所有行恒定的预览级参数汇总（`render_row`/`text_child`
+/// 共用，替代 14 参长签名）。
+pub(crate) struct RowRenderCtx<'a> {
+    pub p: &'a Rc<StyleParams>,
+    pub wrap: bool,
+    pub code_handle: Option<ScrollHandle>,
+    pub code_hl: Option<Rc<CodeLineRuns>>,
+    pub table_handle: Option<ScrollHandle>,
+    pub search: Option<(Range<usize>, Hsla)>,
+    pub epub: bool,
+    pub note_ctx: &'a Rc<NoteCtx>,
+    pub text_ctx: &'a Rc<TextCtx>,
+    pub selection: Option<(Range<usize>, Hsla)>,
+    pub marker_hl: Option<(usize, bool)>,
+    pub row_ix: usize,
+}
+
 pub(crate) fn render_row(
     row: &Row,
-    p: &Rc<StyleParams>,
-    wrap: bool,
-    code_handle: Option<ScrollHandle>,
-    code_hl: Option<Rc<CodeLineRuns>>,
-    table_handle: Option<ScrollHandle>,
-    search: Option<(Range<usize>, Hsla)>,
-    epub: bool,
-    note_ctx: &Rc<NoteCtx>,
-    text_ctx: &Rc<TextCtx>,
-    selection: Option<(Range<usize>, Hsla)>,
-    marker_hl: Option<(usize, bool)>,
-    row_ix: usize,
+    ctx: &RowRenderCtx,
     cx: &mut App,
 ) -> gpui::AnyElement {
+    // 解构回原参数名：身体与旧签名逐字节等价（p/wrap/search/epub/selection/marker_hl/row_ix 为
+    // 拷贝或引用；code_hl 为 Rc 需 clone）。
+    let RowRenderCtx {
+        p,
+        wrap,
+        code_handle,
+        code_hl,
+        table_handle,
+        search,
+        epub,
+        note_ctx,
+        text_ctx,
+        selection,
+        marker_hl,
+        row_ix,
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let wrap: bool = *wrap;
+    let code_handle: Option<ScrollHandle> = code_handle.clone();
+    let code_hl: Option<Rc<CodeLineRuns>> = code_hl.clone();
+    let table_handle: Option<ScrollHandle> = table_handle.clone();
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let epub: bool = *epub;
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
     // 当前主题明/暗（代码块语法着色色板随主题）。
     let dark = gpui_component::Theme::global(cx).is_dark();
     // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。

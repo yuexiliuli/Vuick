@@ -8,6 +8,7 @@ use crate::markdown::parse::inline_style::MathAlign;
 /// 画 **已排好** 的 mermaid 布局：`placed`/`edges` 为**卡片相对坐标**（shape 期以
 /// area=(0,0) 排好并存进 `row.mm`——paint 不再每帧重排/重测标签宽），绘制时统一加
 /// 卡片原点 `(ox, oy)`。生产路径恒由 `row.mm` 携带此布局（`paint_card` 唯一入口）。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
 pub(crate) fn paint_mermaid_placed(
     window: &mut Window,
     theme: &WyTheme,
@@ -112,6 +113,7 @@ pub(crate) fn paint_mermaid_placed(
 
 /// paint 版表格单元格绘制（复用 [`super::TableCellLayout`] 在 shape 期排好的单行；
 /// 几何与 `shape_table_row` 的 `text_x`/纵向居中一致）——**不再每帧重 shape 单元格**。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(window/cx/theme) + 几何参数互为正交
 fn draw_table_row_cached(
     window: &mut Window,
     cx: &mut App,
@@ -142,6 +144,7 @@ fn draw_table_row_cached(
 /// 画表格块网格：外框 + 表头背景 + 行/列分隔线 + 单元格文本（配色对齐预览）。
 /// 内容超宽（`total_w` > 内容区宽）时裁剪在内容区内并按横向滚动偏移平移
 /// （`table_h_scroll`，paint 平移 ↔ 命中/光标反向加回），底部覆横向滚动条。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
 pub(crate) fn paint_table_row(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
@@ -395,6 +398,7 @@ pub(crate) fn paint_image_fallback(
 /// 画图片行：经 `AnyImageCache` 异步加载已就绪的 `RenderImage` 后画出；
 /// 加载中/失败画 alt 占位卡片。加载成功（或已预读固有尺寸）即把真实宽高比尺寸
 /// 写回 `WyEditor`（`images_gen` 自增 → 下帧重建帧以真实行高布局）。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
 pub(crate) fn paint_image_row(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
@@ -902,6 +906,7 @@ pub(crate) fn paint_inline_images(
 
 
 /// 块级卡片（数学块 / Mermaid 图）的绘制：圆角面板 + 居中排版 / 占位提示。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
 pub(crate) fn paint_card(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,

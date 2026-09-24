@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gpui::{div, px, Div, FontWeight, Hsla, InteractiveElement, ParentElement, Pixels, SharedString, Styled};
 
-use crate::markdown::parser::{TableAlign, TableData};
+use crate::markdown::parse::{TableAlign, TableData};
 use crate::markdown::view::dimensions::table_column_widths;
 use crate::markdown::view::style::StyleParams;
 

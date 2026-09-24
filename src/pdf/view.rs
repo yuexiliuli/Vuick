@@ -43,6 +43,9 @@ use gpui::{
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
+/// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
+pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
+
 use crate::config::pdf::{
     COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
     TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
@@ -91,7 +94,7 @@ pub struct PdfViewer {
     pub(crate) mid_lru: VecDeque<usize>,
     /// 在途**瓦片**请求：`(页, row, col)` → (请求时密度 scale, 结果通道)。
     /// `scale` 用于结果到达时的密度守卫：缩放/换 DPI 后旧密度瓦片直接丢弃。
-    pub(crate) pending_tiles: HashMap<(usize, u32, u32), (f32, mpsc::Receiver<Option<TileResult>>)>,
+    pub(crate) pending_tiles: HashMap<(usize, u32, u32), PendingTileEntry>,
     /// 在途**封面**（首屏整页锐化）请求：`页` → (密度 scale, 结果通道)。
     pub(crate) pending_cover: HashMap<usize, (f32, mpsc::Receiver<Option<RenderResult>>)>,
     /// 当前已驻留瓦片的估算字节（近似 RGBA 内存；淘汰时重算自愈漂移）。
@@ -1037,9 +1040,10 @@ impl PdfViewer {
     /// 超预算时从最远瓦片开始移除，旧纹理走 `pending_drops` 显式下线 GPU 纹理。
     /// **每帧全局清理（同密度封面瓦片冗余 + 过期密度瓦片）**：`schedule_tiles` 只对窗内
     /// 页做密度失效，窗外页的旧密度瓦片会滞留到 32MB 预算满——这里对**所有页**统一清：
-    /// - 同密度整页封面在位（`cover_scale≈当前密度`）→ 瓦片冗余，清（封面即全页锐化底图）；
-    /// - `tile_scale` 与当前密度不符 → 瓦片已过期（回看也必重渲），清。
-    /// 只留下「无封面、当前密度」的窗外页瓦片作滚动回看缓存，受 [`TILE_CACHE_BYTES`] 约束。
+/// - 同密度整页封面在位（`cover_scale≈当前密度`）→ 瓦片冗余，清（封面即全页锐化底图）；
+/// - `tile_scale` 与当前密度不符 → 瓦片已过期（回看也必重渲），清。
+///
+/// 只留下「无封面、当前密度」的窗外页瓦片作滚动回看缓存，受 [`TILE_CACHE_BYTES`] 约束。
     fn evict_tiles(&mut self, start: usize, end: usize, scale_factor: f32) {
         let pw = self.page_width();
         {
@@ -1079,7 +1083,7 @@ impl PdfViewer {
                 candidates.push((d, page, row, col));
             }
         }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0)); // 最远优先
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.0)); // 最远优先
         for (_, page, row, col) in candidates {
             if self.tile_bytes <= TILE_CACHE_BYTES {
                 break;
@@ -1563,7 +1567,7 @@ impl PdfViewer {
         }
         self.search_matches = results.hits;
         self.search_truncated = results.truncated;
-        self.search_active = if self.search_matches.is_empty() { 0 } else { 0 };
+        self.search_active = 0;
         true
     }
 
@@ -1662,6 +1666,7 @@ fn search_active_color() -> Hsla {
 
 /// 某页的检索命中高亮元素（**卡片局部**坐标，原点 = 卡片左上角，Y 向下）。
 /// 命中区间经 [`selection_spans_pt`] 按行合并；激活命中（`idx == active`）用橙，其余用蓝。
+#[allow(clippy::too_many_arguments)] // 检索叠加纯函数：几何/颜色参数互为正交
 fn search_overlays_for_page(
     page: usize,
     matches: &[PdfSearchHit],
@@ -1763,10 +1768,9 @@ impl Render for PdfViewer {
             let scale_factor = window.scale_factor();
 
             let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
-            for i in start..=end {
+            for (i, &top) in tops.iter().enumerate().skip(start).take(end - start + 1) {
                 let dim = self.dims[i];
                 let disp_h = display_height(dim, page_width);
-                let top = tops[i];
                 // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
                 // 文本高亮（`pt_to_local` 同源）逐像素对齐。
                 let scale = render_scale(page_width, scale_factor, dim.0);

@@ -2,7 +2,7 @@
 //!
 //! 从 `parser`（行扫描器 + 块索引 + 引用索引 + 增量分析）拆出的「引用索引」部分
 //! （2026-09-24 重构）：只依赖 `rows`（行解析）产出的 `Row`，无状态、无增量；
-//! `parser` 门面经重导出保持 `parser::CitationIndex` 等路径不变。
+//! 经 `parse` 顶层重导出为 `parse::CitationIndex` 等路径。
 
 use std::ops::Range;
 
@@ -109,9 +109,7 @@ pub fn scan_citations(src: &str) -> CitationIndex {
                 let (_, content) = strip_align_directive(content);
                 let (cleaned, m) = extract_citation_markers(inline_style(content).0.as_ref());
                 (cleaned, m, 1)
-            } else if is_rule(t) {
-                (SharedString::default(), Vec::new(), 1)
-            } else if parse_image_line(t).is_some() {
+            } else if is_rule(t) || parse_image_line(t).is_some() {
                 (SharedString::default(), Vec::new(), 1)
             } else if let Some((_table, consumed)) = try_parse_table(&lines, i) {
                 (SharedString::default(), Vec::new(), consumed)

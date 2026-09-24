@@ -265,7 +265,7 @@ pub(crate) fn heading_chevron_hit(
     for r in &frame.rows {
         let top = f32::from(r.top);
         let bottom = top + f32::from(r.height);
-        if !(py >= top && py < bottom) || !matches!(r.kind, IrKind::Heading(_)) {
+        if !(py >= top && py < bottom && matches!(r.kind, IrKind::Heading(_))) {
             continue;
         }
         let Some((cx0, cw)) = heading_chevron_box(frame, r) else {

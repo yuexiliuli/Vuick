@@ -2,7 +2,7 @@
 //! - 估算每行渲染宽度（决定横向滚动容器的内容宽）；
 //! - 解析常见图片格式的文件头得到固有尺寸（不整图解码，快）。
 
-use crate::markdown::parser::{BlockMeta, Row, RowKind, TableData};
+use crate::markdown::parse::{BlockMeta, Row, RowKind, TableData};
 use crate::markdown::view::style::StyleParams;
 
 /// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。

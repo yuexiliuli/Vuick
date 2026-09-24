@@ -2441,7 +2441,7 @@ A-->B
         let mono = gpui::font("Consolas");
         let text = "点 示例 你";
         // 渲染字节 [2..4) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。
-        let runs = vec![((2..8), crate::markdown::parser::RunKind::Link)];
+        let runs = vec![((2..8), crate::markdown::parse::RunKind::Link)];
         let accent = gpui::Hsla::default();
         let link: gpui::Hsla = gpui::rgb(0x0969da).into();
         let code_inline_fg = gpui::Hsla::default();
@@ -4163,8 +4163,8 @@ A-->B
                     if let Some(m) = doc2.block_meta(i) {
                         if matches!(
                             m.kind,
-                            crate::markdown::parser::RowKind::Code
-                                | crate::markdown::parser::RowKind::Table
+                            crate::markdown::parse::RowKind::Code
+                                | crate::markdown::parse::RowKind::Table
                         ) {
                             regions += 1;
                         }

@@ -54,7 +54,7 @@ use crate::config::limits::{
 };
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
-use crate::markdown::parser::{
+use crate::markdown::parse::{
     citation_index_from_rows, parse_block_window, parse_block_window_rope, parse_to_rows,
     rows_memory_estimate, scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row,
     RowKind, RowPayload,
@@ -62,7 +62,7 @@ use crate::markdown::parser::{
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
 use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
-use row::render_row;
+use row::{render_row, RowRenderCtx};
 use style::StyleParams;
 
 /// EPUB 脚注悬浮命中：一行内某个 `[n]` 标记在**上一帧**的画面矩形 + 对应注释正文。
@@ -947,7 +947,7 @@ impl MarkdownPreview {
             }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
                 let n = index.blocks.len();
-                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
+                let index_b = n * std::mem::size_of::<crate::markdown::parse::BlockMeta>();
                 eprintln!(
                     "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 固定窗口 {} 条",
                     src.len(),
@@ -1361,7 +1361,7 @@ impl MarkdownPreview {
             Some(idx) => {
                 let (_, win_b) = rows_memory_estimate(&self.win_rows);
                 let n = idx.blocks.len();
-                let index_b = n * std::mem::size_of::<crate::markdown::parser::BlockMeta>();
+                let index_b = n * std::mem::size_of::<crate::markdown::parse::BlockMeta>();
                 // 源：`Str` 是预览自持副本（小文档 / EPUB 全量路径）如实计入；
                 // `Rope` 与编辑器共享同一棵 Arc 树（O(1) 克隆、不物化），**不重复
                 // 计入**预览驻留——大 md 的「源」不是第二份文本。
@@ -1909,10 +1909,6 @@ impl Render for MarkdownPreview {
         let marker_hl = self.marker_hl;
         let content = {
             let p = p.clone();
-            let code_scroll = code_scroll;
-            let code_hl = code_hl;
-            let table_scroll = table_scroll;
-            let search_highlight = search_highlight;
             // 列表 item_ix 是窗口内**相对**下标：绝对块 = `win_base + ix`（行数据窗口
             // `win_rows`/`rows` 用绝对块下标）。超出已物化窗口渲染空占位。
             list(list_state.clone(), move |ix, _window, cx| {
@@ -1955,18 +1951,20 @@ impl Render for MarkdownPreview {
                     .map(|(_, n, is_def)| (n, is_def));
                 render_row(
                     row,
-                    &p,
-                    wrap,
-                    ch,
-                    chr,
-                    th,
-                    search,
-                    epub,
-                    &note_ctx,
-                    &text_ctx,
-                    sel,
-                    marker_hl,
-                    abs,
+                    &RowRenderCtx {
+                        p: &p,
+                        wrap,
+                        code_handle: ch,
+                        code_hl: chr,
+                        table_handle: th,
+                        search,
+                        epub,
+                        note_ctx: &note_ctx,
+                        text_ctx: &text_ctx,
+                        selection: sel,
+                        marker_hl,
+                        row_ix: abs,
+                    },
                     cx,
                 )
             })
@@ -2204,6 +2202,7 @@ fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
 ///   拖拽只写共享 `desired`（px，render 逐帧 `apply_desired` 落窗口重定位）——
 ///   确定性、无坍缩、拖到底必到全文末尾。
 /// - **小文档**：仍走 ListState 的 summary 量程 + 拖拽前 O(n) 校准冻结（原路径）。
+///
 /// 滚轮滚动由容器级处理器驱动（窗口模式），与本滚动条无关。
 #[derive(Clone)]
 struct PreviewVerticalScrollHandle {

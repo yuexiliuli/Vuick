@@ -13,6 +13,15 @@ use regex::Regex;
 
 use super::cells;
 
+/// 样式段列表：`(字节区间, 样式类别)`（行内解析的通用产物）。
+pub(crate) type StyledRuns = Vec<(Range<usize>, RunKind)>;
+/// [`inline_style_mapped`] 的返回：渲染文本 + 样式段 + 渲染→源字节映射表。
+pub(crate) type MappedStyleResult = (SharedString, StyledRuns, Vec<usize>);
+/// 脚注标记：`(字节区间, 注记号)`。
+pub(crate) type NoteMarkers = Vec<(Range<usize>, usize)>;
+/// [`extract_notes`] 的返回：清理文本 + 样式段 + 正文引用 + 定义标记。
+pub(crate) type ExtractNotesResult = (SharedString, StyledRuns, NoteMarkers, NoteMarkers);
+
 /// 渲染行类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -314,7 +323,7 @@ pub(crate) fn inline_style(src: &str) -> (SharedString, Vec<(Range<usize>, RunKi
 /// `pub(crate)`：底座 `markdown::doc` 复用它给统一行 [`DocRow`] 装配编辑映射。
 pub(crate) fn inline_style_mapped(
     src: &str,
-) -> (SharedString, Vec<(Range<usize>, RunKind)>, Vec<usize>) {
+) -> MappedStyleResult {
     // 快路径：`inline_styles_re` 的每个匹配都以 `` ` `` / `*` / `~` / `[` 起始。
     // 一行不含这些字节 → 正则恒无匹配 → 直拷原文 + 恒等映射（与慢路径零匹配
     // 产物逐字节一致）。省掉 debug 下每行 `regex::captures_iter` 的常数开销——这是
@@ -393,17 +402,13 @@ pub(crate) fn strip_align_directive(line: &str) -> (Option<RowAlign>, &str) {
 /// 把行内脚注标记从文本中识别出来：
 /// - `[^<数字>]`：正文脚注引用（`Row.notes`，悬浮/跳到注释章）；
 /// - `[!<数字>]`：注释**定义**（`Row.note_defs`，跳到文内对应位置）。
+///
 /// 显示文本都剥掉标记字符（`[^1]`/`[!1]` → `[1]`），记录 `(字节区间, 注记号)`；
 /// marker 之后的既有样式段区间整体左移 1 字节（被剥字符删掉）。
 pub(crate) fn extract_notes(
     text: SharedString,
     mut runs: Vec<(Range<usize>, RunKind)>,
-) -> (
-    SharedString,
-    Vec<(Range<usize>, RunKind)>,
-    Vec<(Range<usize>, usize)>,
-    Vec<(Range<usize>, usize)>,
-) {
+) -> ExtractNotesResult {
     let src = text.as_ref();
     let mut out = String::with_capacity(src.len());
     let mut notes: Vec<(Range<usize>, usize)> = Vec::new();

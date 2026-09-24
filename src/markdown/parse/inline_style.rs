@@ -221,11 +221,6 @@ pub(crate) fn list_prefix(line: &str) -> Option<(usize, usize, bool, u32)> {
     None
 }
 
-/// `(position, nesting level)` of every ordered list item, both 0-based-
-/// level / 1-based-position. Word-style, NOT CommonMark: every list counts
-
-/// A copied slice with its ordered markers rewritten to their DISPLAYED
-
 /// If `line` is a GFM task item — a list item whose body starts with `[ ]`,
 /// `[x]`, or `[X]` then a space — return `(prefix_len, indent, checked)`, where
 /// `prefix_len` covers the list marker plus the checkbox. The editor hides this
@@ -260,10 +255,10 @@ pub(crate) fn toggle_task_checkbox(line: &str) -> Option<String> {
 /// return `(src, explicit_width)`. The editor renders such a line as the image
 /// (W4) when the caret is elsewhere; a line with any other trailing text stays
 /// plain source. Prefix recognition is shared with the preview parser
-/// (`crate::markdown::parser::parse_ref`, parity-pinned).
+/// (`crate::markdown::parse::parse_ref`, parity-pinned).
 #[allow(dead_code)]
 pub(crate) fn image_line(line: &str) -> Option<(&str, Option<f32>)> {
-    let r = crate::markdown::parser::parse_ref(line.trim())?;
+    let r = crate::markdown::parse::parse_ref(line.trim())?;
     let tail = r.tail.trim();
     let width = if tail.is_empty() {
         None
@@ -363,13 +358,10 @@ pub(crate) fn math_regions(content: &str) -> Vec<MathRegion> {
             let source = lines[start + 1..j].join("\n");
             let end = (j + 1).min(lines.len()); // include the closing fence
             // An alignment marker on the line directly above the opening fence.
-            let align = match start
+            let align = start
                 .checked_sub(1)
                 .and_then(|m| math_align_marker(lines[m]))
-            {
-                Some(a) => a,
-                None => MathAlign::default(),
-            };
+                .unwrap_or_default();
             out.push(MathRegion {
                 range: start..end,
                 source,
@@ -381,10 +373,7 @@ pub(crate) fn math_regions(content: &str) -> Vec<MathRegion> {
             // treatment (size, centering, alignment marker). Lines mixing
             // words with a pair are normalized apart at edit time (see
             // `apply_auto_replace`) — never hidden.
-            let align = match i.checked_sub(1).and_then(|m| math_align_marker(lines[m])) {
-                Some(a) => a,
-                None => MathAlign::default(),
-            };
+            let align = i.checked_sub(1).and_then(|m| math_align_marker(lines[m])).unwrap_or_default();
             out.push(MathRegion {
                 range: i..i + 1,
                 source: inner.to_string(),

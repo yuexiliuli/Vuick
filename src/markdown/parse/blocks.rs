@@ -48,6 +48,7 @@ pub struct BlockIndex {
 /// - 前缀复用 = 对前段做 O(1) 子区间裁剪，零拷贝；
 /// - 尾部复用 = 子区间裁剪 + 叠加 (byte_delta, line_shift) 平移（各块统一平移，可在读取时算）；
 /// - 只重建「变化中段」（通常极小）。
+///
 /// 段数超 [`BLOCKS_MAX_SEGS`] 时合并且 amortize：合并是 O(n)，但每数轮才一次。
 /// 用 `Arc`（非 `Rc`）→ `BlockIndex` 仍 `Send`，可整份交给后台线程继续增量（顺带把
 /// 同步循环里 `Rc<BlockIndex> → 后台` 的整份拷贝从 O(n) 降到 O(1) 引用共享）。

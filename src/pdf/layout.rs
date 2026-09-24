@@ -483,15 +483,9 @@ pub(crate) fn search_snippet(text: &PageText, start: usize, end: usize, ctx: usi
     let a = m0.saturating_sub(ctx);
     let b = (m1 + ctx).min(visible.len());
     let mut s = String::new();
-    for k in a..m0 {
-        s.push(visible[k].1);
-    }
-    for k in m0..m1 {
-        s.push(visible[k].1);
-    }
-    for k in m1..b {
-        s.push(visible[k].1);
-    }
+    s.extend(visible[a..m0].iter().map(|(_, ch)| *ch));
+    s.extend(visible[m0..m1].iter().map(|(_, ch)| *ch));
+    s.extend(visible[m1..b].iter().map(|(_, ch)| *ch));
     s
 }
 

@@ -116,8 +116,9 @@ struct RowView {
 /// - 目标超出当前窗口即 `reset(WINDOW)` 重定位（O(窗口)，一刀切重定位、无需分帧）；
 /// - 量程/clamp 全部按**全文** `scroll_item_count()×行高` 算（与窗口无关）；
 /// - 打开大文件瞬时 O(1)：不再需要「两段式 + 分帧增长」机制。
+///
 /// 条目高度仍全部按需实测（不预铺 uniform），纵向量程由像素级确定性滚动条承担。
-
+///
 /// 固定窗口条目数：需 ≥ 最高分辨率的可见行 + 过扫余量（512 × 行高 ≈ 上万 px 视口）。
 const LIST_WINDOW_ROWS: usize = crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS;
 
@@ -1677,9 +1678,10 @@ impl CodeEditor {
     /// 缩进启发式折叠块：从 `start` 行起向后找到块结束行（**开区间** end）。
     /// - 首个缩进 `< start 行缩进` 的行 → 块结束（dedent）；
     /// - 同缩进且以闭/尾记号（`}` `)` `]` `#` `` ` ``）开头 → 块结束；
-    /// - 空行跳过；
-    /// - 到文件尾 → 结束。
-    /// 至少需隐藏 1 行（`end ≥ start+2`）才视为可折叠。
+/// - 空行跳过；
+/// - 到文件尾 → 结束。
+///
+/// 至少需隐藏 1 行（`end ≥ start+2`）才视为可折叠。
     fn fold_block_end(&self, start: usize) -> Option<usize> {
         if self.row_count == 0 || start >= self.row_count {
             return None;

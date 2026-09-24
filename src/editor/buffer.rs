@@ -10,6 +10,7 @@
 //! （Unicode 标量数），与渲染的等宽列同向。
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::Range;
 
 /// 大文档「先瞬时显示」占位横向量程的**采样步长**：均匀每隔这么多行算一次行宽。
@@ -443,13 +444,11 @@ impl Buffer {
         let ls = self.line_start(line);
         let le = self.line_end(line);
         let mut bytes = 0usize;
-        let mut n = 0usize;
-        for ch in self.text.slice(ls..le).chars() {
+        for (n, ch) in self.text.slice(ls..le).chars().enumerate() {
             if n >= column {
                 break;
             }
             bytes += ch.len_utf8();
-            n += 1;
         }
         ls + bytes
     }
@@ -548,9 +547,12 @@ impl Buffer {
         self.refresh_lines(old_widths, old_line_a, new_line_b);
     }
 
+}
+
+impl fmt::Display for Buffer {
     /// 整篇文本（测试/导出用；O(n) 物化）。
-    pub fn to_string(&self) -> String {
-        self.text.to_string()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.text)
     }
 }
 

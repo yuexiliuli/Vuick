@@ -39,6 +39,9 @@ use gpui_component::input::{
 };
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
+/// 窗口内高亮结果：各行片段与折叠区间（`compute_window_doc` 与高亮 API 共用）。
+type HighlightWindowDoc = (Vec<(Range<usize>, &'static str)>, Vec<FoldRange>);
+
 use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES, SYNC_MAX_PARSE_LINES, WINDOW_PAD};
 
 /// 编辑器编辑侧通道：最近一次 `InputEdit` 的字节区间 `(start, old_end, new_end)`。
@@ -184,7 +187,7 @@ fn compute_window_doc(
     req_hi: usize,
     language: &str,
     folding: bool,
-) -> Option<((Vec<(Range<usize>, &'static str)>, Vec<FoldRange>), usize, usize)> {
+) -> Option<(HighlightWindowDoc, usize, usize)> {
     if rope.len() == 0 || line_starts.is_empty() {
         return None;
     }

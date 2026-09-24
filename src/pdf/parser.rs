@@ -32,6 +32,11 @@ use pdfium_render::prelude::*;
 /// 进程级单例：pdfium 动态库路径（只定位一次）。
 static PDFIUM_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
+/// 页尺寸对（宽, 高）。
+type PageDims = Vec<(f32, f32)>;
+/// 打开成功载荷：页尺寸 + 书签条目。
+type OpenPayload = (PageDims, Vec<PdfOutlineEntry>);
+
 /// pdfium 版本号文件名（与 `resources/pdfium/` 内实际文件、`build.rs` 保持一致）。
 ///
 /// 用**带版本号**的文件名（`pdfium-<版本>.dll`）替代裸 `pdfium.dll`：
@@ -287,7 +292,7 @@ enum WorkerMsg {
     Open(
         DocId,
         Vec<u8>,
-        mpsc::Sender<Result<(Vec<(f32, f32)>, Vec<PdfOutlineEntry>)>>,
+        mpsc::Sender<Result<OpenPayload>>,
     ),
     #[allow(dead_code)] // 回归测试渲染整页（文本对齐、贴片比对）使用
     Render(DocId, RenderRequest, mpsc::Sender<Option<RenderResult>>),
@@ -335,7 +340,7 @@ fn shared_worker() -> Result<&'static PdfWorker> {
 impl PdfWorker {
     /// 打开文档并取每页尺寸（结构解析，快）。成功则返回 (DocId, dims)，
     /// 便于调用方同时得到文档句柄与页面布局数据。书签目录由 [`Self::open_and_dims_full`] 取。
-    pub fn open_and_dims(bytes: Vec<u8>) -> Result<(Self, DocId, Vec<(f32, f32)>)> {
+    pub fn open_and_dims(bytes: Vec<u8>) -> Result<(Self, DocId, PageDims)> {
         let (w, id, dims, _outlines) = Self::open_and_dims_full(bytes)?;
         Ok((w, id, dims))
     }
@@ -344,7 +349,7 @@ impl PdfWorker {
     /// 成功则返回 (DocId, dims, outlines)，便于调用方同时得到文档句柄与页面布局、目录。
     pub fn open_and_dims_full(
         bytes: Vec<u8>,
-    ) -> Result<(Self, DocId, Vec<(f32, f32)>, Vec<PdfOutlineEntry>)> {
+    ) -> Result<(Self, DocId, PageDims, Vec<PdfOutlineEntry>)> {
         let worker = shared_worker()?;
         let (tx, rx) = mpsc::channel();
         let doc_id = next_doc_id();

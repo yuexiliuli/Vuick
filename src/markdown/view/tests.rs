@@ -1942,7 +1942,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     /// 落款行右对齐、`[n]` 注记悬停浮现注释卡片。
     #[gpui::test]
     fn epub_note_hover_shows_annotation_card(cx: &mut TestAppContext) {
-        use crate::markdown::parser::RowAlign;
+        use crate::markdown::parse::RowAlign;
         cx.update(gpui_component::init);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));

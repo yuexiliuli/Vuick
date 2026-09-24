@@ -893,9 +893,8 @@ impl EditorApp {
             && let Some(tab) = self.tabs.get(self.active_tab) {
                 if tab.readonly_preview {
                     let content: &str = tab.content.as_ref();
-                    let mut li = 0usize;
                     let mut doc_offset = 0usize;
-                    for line in content.split('\n') {
+                    for (li, line) in content.split('\n').enumerate() {
                         if let Some(r) = find_ci(line, q) {
                             line_hits.push(SearchLineHit {
                                 line: li,
@@ -906,7 +905,6 @@ impl EditorApp {
                                 break;
                             }
                         }
-                        li += 1;
                         doc_offset += line.len() + 1;
                     }
                 } else {

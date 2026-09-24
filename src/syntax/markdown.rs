@@ -9,7 +9,7 @@
 //! - 跨行只有一种状态：**围栏代码块**（``` / ~~~）。围栏内容复用
 //!   [`crate::syntax::parse_code_lines`]（syntect / TOML，opt-level 3）按块着色；
 //!   lookback 前缀外已开未闭合的围栏（开栏离可见区 > LOOKBACK 行）按普通文本处理
-//!  （对绝大多数 Markdown 无感；极端超长围栏属可接受的取舍）。
+//!   （对绝大多数 Markdown 无感；极端超长围栏属可接受的取舍）。
 //!
 //! 其余语言仍走 [`super::SyntectHighlighter`]（syntect 窗口式解析 + 折叠）。
 
@@ -406,8 +406,8 @@ fn read_link(line: &str, open: usize) -> Option<(usize, usize)> {
     let b = line.as_bytes();
     let mut depth = 0usize;
     let mut ci = None;
-    for k in open + 1..b.len() {
-        match b[k] {
+    for (k, &c) in b.iter().enumerate().skip(open + 1) {
+        match c {
             b'[' => depth += 1,
             b']' => {
                 if depth == 0 {

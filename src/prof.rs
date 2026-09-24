@@ -36,7 +36,7 @@ fn snapshot_rows() -> Vec<(&'static str, u64, Duration)> {
             .iter()
             .map(|(k, (n, d))| (*k, *n, *d))
             .collect();
-        rows.sort_by(|a, b| b.2.cmp(&a.2));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
         rows
     })
 }
@@ -308,7 +308,7 @@ pub fn dump(tag: &str) {
             .map(|(k, (n, d))| (*k, *n, *d))
             .collect()
     });
-    rows.sort_by(|a, b| b.2.cmp(&a.2));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.2));
     eprintln!("===== [PROF] {tag} =====");
     if rows.is_empty() {
         eprintln!("  (无累计)");

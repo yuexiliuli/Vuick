@@ -3,9 +3,9 @@
 //! 目标（用户路线）：以本项目的 Markdown 预览底座（行级虚拟化、窗口化块索引、恒定内存）
 //! 为基干，抽象出一个 preview 与 live（WYSIWYG）都从其上衍生的统一文档层：
 //! - **语义** = [`ir::IrKind`]（`markdown::ir`，金标准）；
-//! - **结构索引** = [`parser::BlockIndex`]（`scan_blocks`/`scan_blocks_rope`，
+//! - **结构索引** = [`parse::BlockIndex`]（`scan_blocks`/`scan_blocks_rope`，
 //!   O(1) 打开、窗口物化，与预览同一增量机制）；
-//! - **行物化** = [`parser::parse_block_window`(_rope)]（与预览**同一份**
+//! - **行物化** = [`parse::parse_block_window`(_rope)]（与预览**同一份**
 //!   文本/行内段，保证两分支渲染一致）。
 //!
 //! [`DocRow`] 是两分支的**统一行**：合并「IR 语义 + 预览文本 + 行号 + 行区间」。
@@ -20,10 +20,10 @@ use gpui::SharedString;
 use gpui_component::input::Rope;
 
 use super::ir::IrKind;
-use super::parser::{
+use super::parse::{
     parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind, TableData,
 };
-use super::parser;
+use super::parse;
 
 /// 块级渲染负载（非纯文本块的渲染数据，统一行 [`DocRow`] 的伴生字段）。
 ///
@@ -80,7 +80,7 @@ pub(crate) struct DocRow {
     pub(crate) runs: Vec<(Range<usize>, RunKind)>,
     /// 编辑映射：渲染字节 → **源字节偏移**。
     /// - 文本行（段落/标题/列表/引述）：相对**该行**行首，长度 = `text.len()+1`，
-    ///   末项为哨兵 = 源段尾；由 `parser::text_segment` + `parser::inline_style_mapped`
+    ///   末项为哨兵 = 源段尾；由 `parse::text_segment` + `parse::inline_style_mapped`
     ///   装配（与预览同一段派生）。
     /// - 代码块（围栏内内容行可编辑）：相对**块首**（`src_line` 围栏行起始），
     ///   渲染文本 = 各代码行以 `\n` 连接（围栏标记本身只读不渲染）。
@@ -106,7 +106,7 @@ enum DocSrc {
 /// O(n) 扫描（7MB/15.9 万块 ~800ms）。
 pub(crate) struct Doc {
     src: DocSrc,
-    index: parser::BlockIndex,
+    index: parse::BlockIndex,
     /// 与 `src` 同步的 rope 快照（COW）——`reopen` 用
     /// `scan_blocks_incremental_rope`（mid-line 插入 0.3ms，替代全量 `scan_blocks`
     /// 的 ~1.2s）与自维护行起始。
@@ -134,8 +134,8 @@ pub(crate) struct Doc {
 impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
-        let index = parser::scan_blocks(src.as_ref());
-        let line_starts: Vec<usize> = parser::build_line_starts_u32(src.as_ref())
+        let index = parse::scan_blocks(src.as_ref());
+        let line_starts: Vec<usize> = parse::build_line_starts_u32(src.as_ref())
             .into_iter()
             .map(|b| b as usize)
             .collect();
@@ -167,7 +167,7 @@ impl Doc {
     /// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降）。
     #[allow(dead_code)]
     pub(crate) fn open_rope(rope: Rope) -> Self {
-        let index = parser::scan_blocks_rope(&rope);
+        let index = parse::scan_blocks_rope(&rope);
         let line_starts = build_line_starts_rope(&rope);
         let char_count = rope.chars().count();
         let line_utf16_starts = build_line_utf16_starts(
@@ -234,7 +234,7 @@ impl Doc {
         let dirty = start..start + inserted_len;
         let _t_sc = crate::prof::begin();
         let new_index =
-            parser::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
+            parse::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
         crate::prof::end("doc.scanblocks", _t_sc);
         let _t_ul = crate::prof::begin();
         // 纯行内编辑（insert/remove 都不含 '\n'）：行数/行首集合不变，只有「编辑点之后
@@ -586,9 +586,9 @@ impl Doc {
             | RowKind::Bullet
             | RowKind::Quote => {
                 let line = self.line_str(r.src_line);
-                parser::text_segment(&line, r.kind)
+                parse::text_segment(&line, r.kind)
                     .map(|(off, seg)| {
-                        parser::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
+                        parse::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
                     })
                     .unwrap_or_default()
             }
@@ -626,7 +626,7 @@ impl Doc {
     }
 
     /// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用
-    /// [`parser::split_table_cells_mapped`] 装配单元格编辑映射。
+    /// [`parse::split_table_cells_mapped`] 装配单元格编辑映射。
     fn table_row_maps(
         &self,
         src_line: usize,
@@ -637,7 +637,7 @@ impl Doc {
             // k=0 表头（src_line）；数据行 i（0 基，k=i+1）源行 = src_line + 1 + k。
             let line_ix = if k == 0 { src_line } else { src_line + 1 + k };
             let line = self.line_str(line_ix);
-            let cells = parser::split_table_cells_mapped(&line)
+            let cells = parse::split_table_cells_mapped(&line)
                 .into_iter()
                 .map(|(src, text, map)| TableCellMap { src, text, map })
                 .collect();

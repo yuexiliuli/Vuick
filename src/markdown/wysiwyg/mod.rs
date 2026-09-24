@@ -9,7 +9,7 @@
 //!   行物化 `rows_in_block_window` + 编辑映射 [`DocRow::byte_map`]（与预览逐字节
 //!   一致，`parity` 钉死）。
 //! - 编辑器 = auto-grow 自绘 [`element::WyEditorElement`]（宿主滚动，与 `live` 同宿主
-//!   范式）；行内样式来自 `DocRow.runs`（`parser::RunKind`）。
+//!   范式）；行内样式来自 `DocRow.runs`（`parse::RunKind`）。
 //! - 非文本块已按类型渲染：代码围栏（等宽 + 语法高亮 + 圆角面板，**内容行可编辑**）、
 //!   GFM 表格（网格，列宽自适应）、引述（灰底 + 左侧指示条）、独立图片行
 //!   （`AnyImageCache` 异步加载，占位/失败回退 alt）；样式统一抄自预览
@@ -24,7 +24,17 @@
 //!   测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
 
 mod element;
+mod input;
+pub(crate) mod frame;
+pub(crate) mod math;
 mod math_typeset;
+pub(crate) mod shape;
+
+// 子模块扁平重导出：`element::*` 把布局类型 + geom/math/shape 的 pub(crate) 项一并带进
+// mod.rs 命名空间，frame/shape/math 以 `use super::*` 共享（对应 `element::*` 路径原样保留）。
+// frame 不整块重导出（其内部 `warm_emoji_rasterizer` 与根级同名函数冲突），由 element.rs
+// 经 `pub(crate) use super::frame::{…}` 精确暴露。
+pub(crate) use element::*;
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -32,12 +42,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Context, EntityInputHandler, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
-    UTF16Selection, Window, font, point, px,
+    Context, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
+    Window, font, point, px,
 };
 
 use super::doc::Doc;
 use crate::markdown::parse::recognition::{self, LinkHit};
+
+/// 块布局的可变引用（`ensure_block_layout` 返回 / 缓存槽共用）。
+pub(crate) type BlockLayoutRef = Rc<std::cell::RefCell<element::BlockLayout>>;
 use crate::markdown::parse::inline_style;
 use crate::markdown::view::style::StyleParams;
 use gpui_component::input::Rope;
@@ -1092,7 +1105,7 @@ impl WyEditor {
     /// 打开文档后预读图片行的固有尺寸（与预览一致：本地文件按宽高比显示，
     /// 首帧即用真实行高，避免「占位 → 真实」跳动）。只读文件头，O(行数，廉价)。
     ///
-    /// 从原始源码行直接取 src（`parser::parse_image_line`），不物化 [`DocRow`]——
+    /// 从原始源码行直接取 src（`parse::parse_image_line`），不物化 [`DocRow`]——
     /// 逐块 `rows_in_block_window(i, i)` 会命中 `parse_block_window` 的「末块含尾
     /// 换行 ≠ 块数」边界（debug 断言），且为读个 src 物化整行纯属浪费。
     fn preseed_image_sizes(&self) {
@@ -1101,11 +1114,11 @@ impl WyEditor {
             let Some(meta) = self.doc.block_meta(i) else {
                 continue;
             };
-            if meta.kind != crate::markdown::parser::RowKind::Image {
+            if meta.kind != crate::markdown::parse::RowKind::Image {
                 continue;
             }
             let line = self.doc.line_str(meta.src_line as usize);
-            let Some((_, src)) = crate::markdown::parser::parse_image_line(line.trim()) else {
+            let Some((_, src)) = crate::markdown::parse::parse_image_line(line.trim()) else {
                 continue;
             };
             let key: SharedString = src.clone().into();
@@ -1299,7 +1312,7 @@ impl WyEditor {
             // `new_selected_range` 是**相对 new_text 起点**的 UTF-16 偏移，不是文档
             // 绝对偏移（AppKit setMarkedText 的 selectedRange 语义）。
             let caret = match new_selected_range {
-                Some(sel) => byte_range.start + offset_from_utf16(new_text, sel.start).min(new_text.len()),
+                Some(sel) => byte_range.start + input::offset_from_utf16(new_text, sel.start).min(new_text.len()),
                 None => byte_range.start + new_text.len(),
             };
             self.caret = caret.min(self.len());
@@ -1711,8 +1724,8 @@ impl WyEditor {
         epoch: u64,
     ) -> (
         bool,
-        Rc<std::cell::RefCell<element::BlockLayout>>,
-        Option<Rc<std::cell::RefCell<element::BlockLayout>>>,
+        BlockLayoutRef,
+        Option<BlockLayoutRef>,
     ) {
         if let Some((e, l)) = &*self.block_layout.borrow()
             && *e == epoch && l.borrow().n() == n_blocks {
@@ -1847,7 +1860,7 @@ impl WyEditor {
     }
 
     /// caret 所在区域「展开显示源码」（reveal-on-caret）覆盖，按带现算（O(区域数) 线性扫
-    /// + 少量块定位）——最多一个数学块 + 一个折叠体。`build_frame` 用它把全折叠基准里
+    ///   加少量块定位）——最多一个数学块 + 一个折叠体。`build_frame` 用它把全折叠基准里
     /// 该区域的行恢复成可编辑源码显示。
     pub(crate) fn fold_reveal(
         &self,
@@ -2176,8 +2189,8 @@ impl WyEditor {
     }
 
     /// 该行的粗略 `RowKind`（行首启发，实体内部导航用；渲染以 `DocRow` 为准）。
-    fn kind_for_line(&self, line: usize) -> crate::markdown::parser::RowKind {
-        use crate::markdown::parser::RowKind;
+    fn kind_for_line(&self, line: usize) -> crate::markdown::parse::RowKind {
+        use crate::markdown::parse::RowKind;
         let start = self.line_start(line);
         let end = self.line_end(line);
         let raw = self.doc.slice_str(start..end);
@@ -2216,7 +2229,7 @@ impl WyEditor {
             return Some((0, end - start));
         }
         let raw = self.doc.slice_str(start..end);
-        let seg = crate::markdown::parser::text_segment(&raw, self.kind_for_line(line))?;
+        let seg = crate::markdown::parse::text_segment(&raw, self.kind_for_line(line))?;
         Some((seg.0, raw.len()))
     }
 
@@ -2270,7 +2283,7 @@ impl WyEditor {
     }
 
     fn rebuild_block_regions(&mut self) {
-        use crate::markdown::parser::RowKind;
+        use crate::markdown::parse::RowKind;
         let n = self.doc.block_count();
         let mut regions: Vec<BlockRegion> = Vec::new();
         for i in 0..n {
@@ -2327,7 +2340,7 @@ impl WyEditor {
             return None;
         }
         let raw = self.line_text(line);
-        let cells = crate::markdown::parser::split_table_cells_mapped(&raw);
+        let cells = crate::markdown::parse::split_table_cells_mapped(&raw);
         if cells.is_empty() {
             return None;
         }
@@ -2995,154 +3008,6 @@ pub fn bind_keys(cx: &mut gpui::App) {
     ])
 }
 
-/* ---------- UTF16 ↔ 字节（IME/选择器用） ---------- */
-
-/// 小串内（组合文本 `new_text`，`new_selected_range` 是相对它起点的 UTF-16 偏移）的
-/// UTF-16 → 字节扫描，O(串长)（组合文本只有几个字符，不需要行索引）。
-fn offset_from_utf16(s: &str, utf16: usize) -> usize {
-    let mut count = 0usize;
-    for (i, c) in s.char_indices() {
-        if count >= utf16 {
-            return i;
-        }
-        count += c.len_utf16();
-    }
-    s.len()
-}
-
-impl EntityInputHandler for WyEditor {
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        actual_range: &mut Option<Range<usize>>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<String> {
-        // 行粒度 UTF-16 前缀索引换算（O(log n + 行长)）+ 区间切片——不再物化全文。
-        let range =
-            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
-        *actual_range = Some(self.doc.byte_to_utf16(range.start)..self.doc.byte_to_utf16(range.end));
-        Some(self.doc.slice_str(range))
-    }
-
-    fn selected_text_range(
-        &mut self,
-        _: bool,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        match self.selection() {
-            Some(r) => Some(UTF16Selection {
-                range: self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end),
-                reversed: self.caret < self.sel_anchor.unwrap_or(self.caret),
-            }),
-            None => Some(UTF16Selection {
-                range: {
-                    let b = self.doc.byte_to_utf16(self.caret.min(self.len()));
-                    b..b
-                },
-                reversed: false,
-            }),
-        }
-    }
-
-    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked
-            .as_ref()
-            .map(|r| self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end))
-    }
-
-    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked = None;
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        text: &str,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.replace_text_utf16(range, text, cx);
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range: Option<Range<usize>>,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.replace_and_mark_utf16(range, new_text, new_selected_range, cx);
-    }
-
-    fn set_selected_text_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) {
-        let r =
-            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
-        self.caret = r.end.min(self.len());
-        self.sel_anchor = Some(r.start.min(self.len()));
-        *self.frame.borrow_mut() = None;
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        element_bounds: gpui::Bounds<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<gpui::Bounds<Pixels>> {
-        let v = caret_vis();
-        // `caret_vis` 是元素局部坐标（`paint` 时相对元素原点记录），需叠回元素在
-        // 窗口中的原点，IME/输入法候选窗才落在光标处（否则整体偏移元素原点）。
-        // 组合时画在标记文本上（从 marked 起点到本次输入终点），否则画光标竖条。
-        // 换算走行索引（O(log n)），不再为判等物化全文。
-        let r =
-            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
-        let w = if self.marked.as_ref().is_some_and(|m| r == *m) && r.end > r.start {
-            // 组合候选：让候选窗落在整个标记文本宽度上，而不是零宽竖条。
-            // 真实几何很难按字符溯源，这里用“应盖住的位置”转成可见块（至少一字符宽）。
-            px(24.)
-        } else {
-            px(2.)
-        };
-        Some(gpui::Bounds::new(
-            gpui::point(element_bounds.origin.x + v.x, element_bounds.origin.y + v.top),
-            gpui::size(w, v.line_height),
-        ))
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        point: gpui::Point<Pixels>,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        // 真实命中：经 frame 反查源偏移（平台 IME/辅助功能用，坐标元素局部）。
-        let marker = self.frame.borrow();
-        let f = marker.as_ref().map(|r| &**r)?;
-        let off = element::source_offset_at_local(self, f, point);
-        drop(marker);
-        Some(self.doc.byte_to_utf16(off))
-    }
-
-    fn text_length_utf16(
-        &mut self,
-        _: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        Some(self.doc.total_utf16())
-    }
-
-    fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        true
-    }
-}
 
 impl Focusable for WyEditor {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {

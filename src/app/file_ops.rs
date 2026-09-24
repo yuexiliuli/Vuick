@@ -239,6 +239,7 @@ impl EditorApp {
     ///    滚动/撤销/光标保留，横向量程随块精确补齐；
     /// 3. **收尾**：md 后台 `scan_blocks` 建索引 → `finish_file_text` O(1) 装预览 +
     ///    最终状态。
+    ///
     /// `idx` 处须已存在选项卡（`open_file` 新建 / `open_file_in_tab` 复用）。
     fn spawn_progressive_open(
         &mut self,

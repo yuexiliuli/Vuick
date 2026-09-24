@@ -4,7 +4,7 @@
 //!
 //! 模块布局（2026-09-24 目录重组）：原 `parser.rs`（3327 行，4 套职责混杂）按职责拆成
 //! 子模块后整体迁入本目录；`markdown/parser.rs` 保留为**兼容门面**，外部
-//! `crate::markdown::parser::*` /
+//! `crate::markdown::parse::*` /
 //! `crate::markdown::parse::inline_style::*` 等路径不变。
 
 mod blocks;

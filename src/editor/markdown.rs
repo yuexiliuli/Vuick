@@ -175,8 +175,8 @@ fn read_link(line: &str, open: usize) -> Option<(usize, usize)> {
     let b = line.as_bytes();
     let mut depth = 0usize;
     let mut ci = None;
-    for k in open + 1..b.len() {
-        match b[k] {
+    for (k, &c) in b.iter().enumerate().skip(open + 1) {
+        match c {
             b'[' => depth += 1,
             b']' => {
                 if depth == 0 {

@@ -2,7 +2,7 @@
 //!
 //! 两套管线对「`|` 单元格边界」的判定一致（`markdown::parity::tables_cells_agree` 已钉死），
 //! 但对**单元格内容**有文档化差异（`known_differences_are_documented` #7）：
-//! - 预览（`parser::split_table_cells`）把 `\|`→`|`、`\\`→`\` 解义（显示）；
+//! - 预览（`parse::split_table_cells`）把 `\|`→`|`、`\\`→`\` 解义（显示）；
 //! - live（`table_cells`）保留转义原样（源码逐字节，光标/IME 映射用）。
 //!
 //! 本模块只共享**边界判定**（最易错的部分：反斜杠奇偶转义），内容清理由各自消费方决定，
