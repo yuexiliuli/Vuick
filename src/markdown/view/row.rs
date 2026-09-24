@@ -644,153 +644,13 @@ pub(crate) fn render_row(
     // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。
     let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
     let code_runs = code_hl.as_deref();
-    // 表格是带 id 的有状态元素，直接整体转换，不参与下方 Div 匹配；
-    // 外层加 px_3 内缩，避免表格网格顶到左边缘（与正文对齐）。
+    // 表格行（GFM pipe table 整体折叠成一渲染行；换行模式自带横向滚动容器）。
     if let RowKind::Table = row.kind {
-        let table = row.table().expect("Table 行必须携带表格结构");
-        // 换行模式（默认，预览视口不横向撑宽）：表格自带横向滚动容器 + Always 滚动条，
-        // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
-        // 非换行模式仍交外层 md-harea 统一横向滚动。
-        if wrap {
-            let h = table_handle.unwrap_or_default();
-            return div()
-                .w_full()
-                .flex_shrink_0()
-                .px_3()
-                .py_1()
-                .child(
-                    div()
-                        .debug_selector(|| "md-table-hscroll".into())
-                        // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
-                        // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
-                        .w_full()
-                        .relative()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("md-table-scroll")
-                                .w_full()
-                                .flex()
-                                .flex_row()
-                                .overflow_x_scroll()
-                                // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
-                                .restrict_scroll_to_axis()
-                                .track_scroll(&h)
-                                // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
-                                .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
-                                .child(render_table(table, p)),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "md-table-scrollbar".into())
-                                .absolute()
-                                .inset_0()
-                                .child(
-                                    Scrollbar::horizontal(&h)
-                                        .mode(ScrollbarMode::Always)
-                                        .viewport_from_layout(),
-                                ),
-                        ),
-                )
-                .into_any_element();
-        }
-        return div()
-            .w_full()
-            .flex_shrink_0()
-            .px_3()
-            .py_1()
-            .child(render_table(table, p))
-            .into_any_element();
+        return render_table_row(row, p, wrap, table_handle);
     }
-    // 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。
-    // 宽不超过 IMAGE_MAX_W；未知尺寸（URL/不可读）回退固定 IMAGE_ROW_DEFAULT_H。
-    // src 为空/加载失败时显示 alt 作为 fallback。
+    // 独立图片行：按固有比例显示，高度随可用宽度自适应。
     if let RowKind::Image = row.kind {
-        let info = row.image();
-        let src = info.map(|i| i.src.to_string()).unwrap_or_default();
-        let alt = row.text.clone();
-        let fallback_color = p.muted_fg;
-
-        let img_el = match info.and_then(|i| i.img_data.cloned()) {
-            // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
-            Some(image) => img(gpui::ImageSource::Image(image))
-                .object_fit(ObjectFit::Contain)
-                .w_full()
-                .h_full()
-                .with_fallback(move || {
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(13.))
-                        .text_color(fallback_color)
-                        .child(alt.clone())
-                        .into_any_element()
-                })
-                .into_any_element(),
-            None if src.is_empty() => div()
-                .text_size(px(13.))
-                .text_color(fallback_color)
-                .child(alt)
-                .into_any_element(),
-            None => {
-                // 本地绝对路径 → PathBuf（ImageAssetLoader 走 Resource::Path = fs::read）；
-                // URL → &str（走向 Resource::Uri，经 HTTP 加载）。
-                let src_is_url = src.starts_with("http://")
-                    || src.starts_with("https://")
-                    || src.starts_with("file://");
-                let source: gpui::ImageSource = if src_is_url {
-                    src.as_str().into()
-                } else {
-                    std::path::PathBuf::from(&src).into()
-                };
-                img(source)
-                    .object_fit(ObjectFit::Contain)
-                    .w_full()
-                    .h_full()
-                    .with_fallback(move || {
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(13.))
-                            .text_color(fallback_color)
-                            .child(alt.clone())
-                            .into_any_element()
-                    })
-                    .into_any_element()
-            }
-        };
-
-        // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
-        //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
-        // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
-        let (img_w, img_h) = match row.image() {
-            Some(i) => (i.img_w, i.img_h),
-            None => (None, None),
-        };        let box_ = match (img_w, img_h) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => div()
-                .w_full()
-                .max_w(px(IMAGE_MAX_W))
-                .aspect_ratio(w as f32 / h as f32)
-                .debug_selector(|| "md-img-box".into()),
-            _ => div()
-                .w(px(IMAGE_MAX_W))
-                .max_w_full()
-                .h(px(IMAGE_ROW_DEFAULT_H))
-                .min_h(px(IMAGE_ROW_DEFAULT_H))
-                .debug_selector(|| "md-img-box".into()),
-        };
-        return div()
-            .w_full()
-            .flex_shrink_0()
-            .px_3()
-            .py_1()
-            .flex()
-            .justify_center()
-            .items_center()
-            .child(box_.child(img_el))
-            .into_any_element();
+        return render_image_row(row, p);
     }
 
     // ---------- 自动换行模式：仅对文本行生效，代码/规则/空行保持原样 ----------
@@ -1244,6 +1104,161 @@ pub(crate) fn render_row(
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
     el.into_any_element()
+}
+
+/** 表格行（GFM pipe table 整体折叠成一渲染行）。
+/// 换行模式（默认）：表格自带横向滚动容器 + Always 滚动条，超宽表格在块内横向滚动，
+/// 不再被视口裁剪遮挡（对齐代码块方案）；非换行模式仍交外层 md-harea 统一横向滚动。 */
+fn render_table_row(
+    row: &Row,
+    p: &Rc<StyleParams>,
+    wrap: bool,
+    table_handle: Option<ScrollHandle>,
+) -> gpui::AnyElement {
+    let table = row.table().expect("Table 行必须携带表格结构");
+    // 换行模式（默认，预览视口不横向撑宽）：表格自带横向滚动容器 + Always 滚动条，
+    // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
+    // 非换行模式仍交外层 md-harea 统一横向滚动。
+    if wrap {
+        let h = table_handle.unwrap_or_default();
+        return div()
+            .w_full()
+            .flex_shrink_0()
+            .px_3()
+            .py_1()
+            .child(
+                div()
+                    .debug_selector(|| "md-table-hscroll".into())
+                    // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
+                    // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
+                    .w_full()
+                    .relative()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("md-table-scroll")
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .overflow_x_scroll()
+                            // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
+                            .restrict_scroll_to_axis()
+                            .track_scroll(&h)
+                            // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
+                            .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
+                            .child(render_table(table, p)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "md-table-scrollbar".into())
+                            .absolute()
+                            .inset_0()
+                            .child(
+                                Scrollbar::horizontal(&h)
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    ),
+            )
+            .into_any_element();
+    }
+    return div()
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .py_1()
+        .child(render_table(table, p))
+        .into_any_element();
+}
+
+
+/** 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。 */
+fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
+    let info = row.image();
+    let src = info.map(|i| i.src.to_string()).unwrap_or_default();
+    let alt = row.text.clone();
+    let fallback_color = p.muted_fg;
+
+    let img_el = match info.and_then(|i| i.img_data.cloned()) {
+        // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
+        Some(image) => img(gpui::ImageSource::Image(image))
+            .object_fit(ObjectFit::Contain)
+            .w_full()
+            .h_full()
+            .with_fallback(move || {
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(13.))
+                    .text_color(fallback_color)
+                    .child(alt.clone())
+                    .into_any_element()
+            })
+            .into_any_element(),
+        None if src.is_empty() => div()
+            .text_size(px(13.))
+            .text_color(fallback_color)
+            .child(alt)
+            .into_any_element(),
+        None => {
+            // 本地绝对路径 → PathBuf（ImageAssetLoader 走 Resource::Path = fs::read）；
+            // URL → &str（走向 Resource::Uri，经 HTTP 加载）。
+            let src_is_url = src.starts_with("http://")
+                || src.starts_with("https://")
+                || src.starts_with("file://");
+            let source: gpui::ImageSource = if src_is_url {
+                src.as_str().into()
+            } else {
+                std::path::PathBuf::from(&src).into()
+            };
+            img(source)
+                .object_fit(ObjectFit::Contain)
+                .w_full()
+                .h_full()
+                .with_fallback(move || {
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(13.))
+                        .text_color(fallback_color)
+                        .child(alt.clone())
+                        .into_any_element()
+                })
+                .into_any_element()
+        }
+    };
+
+    // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
+    //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
+    // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
+    let (img_w, img_h) = match row.image() {
+        Some(i) => (i.img_w, i.img_h),
+        None => (None, None),
+    };        let box_ = match (img_w, img_h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => div()
+            .w_full()
+            .max_w(px(IMAGE_MAX_W))
+            .aspect_ratio(w as f32 / h as f32)
+            .debug_selector(|| "md-img-box".into()),
+        _ => div()
+            .w(px(IMAGE_MAX_W))
+            .max_w_full()
+            .h(px(IMAGE_ROW_DEFAULT_H))
+            .min_h(px(IMAGE_ROW_DEFAULT_H))
+            .debug_selector(|| "md-img-box".into()),
+    };
+    return div()
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .py_1()
+        .flex()
+        .justify_center()
+        .items_center()
+        .child(box_.child(img_el))
+        .into_any_element();
 }
 
 #[cfg(test)]
