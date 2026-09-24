@@ -653,16 +653,16 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
     // 冷启动 COLR 自愈：DWrite 彩色光栅在冷进程首次使用时失败/返回空白。平台层
     //（gpui_windows rasterize_glyph）已保证「空白不写 atlas 缓存」（返回 Err 即不入缓存），
     // 因此 paint_emoji 的 `.is_ok()` 从此“诚实”——失败 = 真的没彩出来。这里就借助它做
-    // 帧驱动重试：**逐帧轮流磨每个候选字号**（WYSIWYG/编辑器/预览真实字号不同：分别取自
+    // 帧驱动重试：**单帧内磨完全部字号**（WYSIWYG/编辑器/预览真实字号不同：分别取自
     // theme.font_size / font_size_px / window.text_style，默认 DEFAULT_FONT_SIZE=14），
-    // 每个字号全部 emoji 屏幕外画成功才推进下一个；全部字号磨完才 DONE。期间 window.refresh()
-    // 强制下一帧，任一失败不入缓存、自然重试；任一成功即把该字号 tile 写进 atlas，视图重绘直接命中。
-    // 给出总帧数上限，防 GPU/驱动彻底不行时无限自旋。
+    // 常规+粗体各自 shape 一遍合并 emoji 后统一屏幕外光栅；全部成功即 DONE，正常冷启动
+    // 1 帧收工、不再被逐帧 window.refresh() 拖住启动；任一字号失败 → 强制下一帧整批重试
+    //（失败不入缓存、自然自愈），直到全成功或帧数上限；给出总帧数上限，防 GPU/驱动
+    // 彻底不行时无限自旋。
     static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static SIZES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-    const MAX_ATTEMPTS: usize = 300;
+    const MAX_ATTEMPTS: usize = 60;
 
     if DONE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -690,18 +690,17 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
     // 粗体也一起磨热，否则「标题里的 ❗ 首次真实光栅」冷失败被钉成空白（图片后的标题恰是
     // 首见者——图片只是恰好排前面，非图片自身问题）。
     let bases: Vec<gpui::Font> = vec![body.clone(), body_bold];
-    loop {
-        let idx = IDX.load(std::sync::atomic::Ordering::Relaxed);
-        if idx >= sizes.len() {
-            DONE.store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
-        }
-        let fs = sizes[idx];
-        // 先 shape 完再画：shape 拿不可变借用，画要走 window 可变借用，分开时段避免 E0502。
-        // 常规 + 粗体分别 shape，合并 emoji 后再统一屏幕外 paint。
-        let mut emojis: Vec<(gpui::FontId, gpui::GlyphId)> = Vec::new();
-        {
-            let ts = window.text_system();
+
+    // —— 单帧内磨完全部字号；任一字号失败即整批下一帧重试（保留 COLR 冷自愈）——
+    let started = std::time::Instant::now();
+    let mut all_ok = true;
+    let mut font_ids: Vec<u32> = Vec::new();
+    // 先 shape 完再画：shape 拿不可变借用，画要走 window 可变借用，分开时段避免 E0502。
+    // 常规 + 粗体分别 shape，合并 emoji（含各自字号）后再统一屏幕外 paint。
+    let mut emojis: Vec<(gpui::FontId, gpui::GlyphId, f32)> = Vec::new();
+    {
+        let ts = window.text_system();
+        for &fs in sizes.iter() {
             for font in &bases {
                 let run = [gpui::TextRun {
                     len: probe.len(),
@@ -713,51 +712,45 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
                     r.glyphs
                         .iter()
                         .filter(|g| g.is_emoji)
-                        .map(move |g| (r.font_id, g.id))
+                        .map(move |g| (r.font_id, g.id, fs))
                 }));
             }
         }
-        let mut all_ok = true;
-        let mut font_ids: Vec<u32> = Vec::new();
-        for (font_id, glyph_id) in emojis {
-            let fid = font_id.0 as u32;
-            if !font_ids.contains(&fid) {
-                font_ids.push(fid);
-            }
-            // 屏幕外绘制：仅触发 atlas 光栅化（图元被裁剪、无可见痕迹）。
-            if window
-                .paint_emoji(point(px(-1e7), px(-1e7)), font_id, glyph_id, px(fs))
-                .is_err()
-            {
-                all_ok = false;
-            }
+    }
+    for (font_id, glyph_id, fs) in emojis {
+        let fid = font_id.0 as u32;
+        if !font_ids.contains(&fid) {
+            font_ids.push(fid);
         }
-        if all_ok {
-            static R_SUCC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !R_SUCC.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[WY-WARM] size={fs:.0}px ok first_time font_ids={font_ids:?} (base={:?})",
-                    body.family
-                );
-            }
-            IDX.store(idx + 1, std::sync::atomic::Ordering::Relaxed);
-            if idx + 1 < sizes.len() {
-                window.refresh();
-            } else {
-                eprintln!("[WY-WARM] ALL {n} SIZES DONE", n = sizes.len());
-            }
-        } else if ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MAX_ATTEMPTS {
-            // 该字号还没暖起来（COLR 冷）：失败不入缓存，强制下一帧重试本字号。
+        // 屏幕外绘制：仅触发 atlas 光栅化（图元被裁剪、无可见痕迹）。
+        if window
+            .paint_emoji(point(px(-1e7), px(-1e7)), font_id, glyph_id, px(fs))
+            .is_err()
+        {
+            all_ok = false;
+        }
+    }
+    if all_ok {
+        DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[WY-WARM] all {:?} sizes ok in {:.0}ms (base={:?})",
+            sizes,
+            started.elapsed().as_millis(),
+            body.family
+        );
+    } else {
+        // 仍有字号没磨热（COLR 冷 / 突发失败）：失败不入缓存 → 必须强制下一帧整批重试，
+        // 否则该字号真实首光栅冷失败被原生 atlas 钉成豆腐块（旧逐帧版即靠这自愈）。
+        let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if attempt < MAX_ATTEMPTS {
             eprintln!(
-                "[WY-WARM] size={fs:.0}px FAILED(attempt={}) font_ids={font_ids:?} -> refresh",
-                ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+                "[WY-WARM] partial fail(attempt={attempt}) sizes={sizes:?} font_ids={font_ids:?} -> refresh",
             );
             window.refresh();
         } else {
-            // 到上限仍不行 → 放弃自旋，等用户滚动/其它重绘触发（平台不钉死空白，仍会自愈）。
+            // 到上限仍不行 → 放弃自旋，等用户滚动/其它重绘触发（原生仍可能自愈）。
             DONE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        return;
     }
 }
 
