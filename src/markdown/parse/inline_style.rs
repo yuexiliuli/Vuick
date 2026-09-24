@@ -19,7 +19,7 @@ use std::ops::Range;
 
 use gpui::TextRun;
 
-use crate::markdown::cells::{is_backslash_escaped, split_unescaped_pipes};
+use super::cells::{is_backslash_escaped, split_unescaped_pipes};
 
 /// ATX heading depth (1–6) if `line` is a heading: 1–6 leading `#` followed by
 /// a space or end-of-line. `None` otherwise.
@@ -688,19 +688,19 @@ pub(crate) fn table_cells(line: &str) -> Vec<&str> {
 }
 
 /// The unescaped-pipe splitter and backslash-escape check live in
-/// [`crate::markdown::cells`] — shared byte machinery with the preview parser
+/// [`super::cells`] — shared byte machinery with the preview parser
 /// (edge semantics pinned by `markdown::parity`).
 
 /// Is `line` a table separator row (every cell is dashes with optional
 /// alignment colons)? Alignment semantics are the single implementation
-/// `crate::markdown::cells::parse_aligns` (shared with the preview parser and
+/// `super::cells::parse_aligns` (shared with the preview parser and
 /// the semantic IR — parity-pinned).
 fn is_separator_row(line: &str) -> bool {
     if !is_table_row(line) {
         return false;
     }
     let cells = table_cells(line);
-    !cells.is_empty() && crate::markdown::cells::parse_aligns(&cells).is_some()
+    !cells.is_empty() && super::cells::parse_aligns(&cells).is_some()
 }
 
 #[cfg(test)]

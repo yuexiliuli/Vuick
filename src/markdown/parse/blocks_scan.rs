@@ -10,8 +10,8 @@ use std::ops::Range;
 use gpui::{Image, SharedString};
 use gpui_component::input::Rope;
 
-use crate::markdown::blocks::{scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
-use crate::markdown::rows::{
+use super::blocks::{scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
+use super::rows::{
     fence_len, inline_strip, is_rule, list_prefix, parse_image_line, try_parse_table,
     parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData,
 };

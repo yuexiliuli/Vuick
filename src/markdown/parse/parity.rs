@@ -16,12 +16,12 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::SharedString;
 
-use super::ir;
+use crate::markdown::ir;
 use super::inline_style::{
     alert_prefix, blockquote_prefix, heading_level, image_row, is_table_row, list_prefix,
     math_regions, table_cells, table_regions, task_prefix, thematic_break,
 };
-use super::parser::{parse_to_rows, split_table_cells, RowKind, TableAlign};
+use super::rows::{parse_to_rows, split_table_cells, RowKind, TableAlign};
 
 /// 复刻 live 的围栏奇偶规则（`scan_data` 里的 4 行循环，live.rs:1688-1695）：
 /// 行首（允许缩进）以 ` ``` ` 开头则翻转；`odd` 表示「该行起点已在围栏内部」。
@@ -444,7 +444,7 @@ fn doc_model_agrees_with_preview_and_ir() {
     let n_lines = src.split('\n').count();
 
     // Doc 全量物化：kind 与 IR 逐行一致、text 与预览 parse_to_rows 逐块一致。
-    let doc = super::doc::Doc::open(SharedString::from(src));
+    let doc = crate::markdown::doc::Doc::open(SharedString::from(src));
     let rows = doc.rows_in_line_window(0, n_lines);
     let ir_blocks = ir::build_ir(src);
     for r in &rows {
@@ -481,9 +481,9 @@ fn doc_rope_path_matches_str_path() {
     let src = "# 标题\n正文 **加粗** `代码`\n\n- 列表\n  - 嵌套\n1) 数字\n> 引述\n---\n```rust\nlet a = 1;\n```\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n![图](a.png)\n";
     let n_lines = src.split('\n').count();
 
-    let str_doc = super::doc::Doc::open(SharedString::from(src));
+    let str_doc = crate::markdown::doc::Doc::open(SharedString::from(src));
     let rope = gpui_component::input::Rope::from(src);
-    let rope_doc = super::doc::Doc::open_rope(rope);
+    let rope_doc = crate::markdown::doc::Doc::open_rope(rope);
 
     assert_eq!(str_doc.block_count(), rope_doc.block_count(), "两源块数应一致");
     let sc = str_doc.rows_in_line_window(0, n_lines);
@@ -505,7 +505,7 @@ fn doc_rope_path_matches_str_path() {
 fn doc_byte_map_maps_render_back_to_line_source() {
     // 语料不含尾随换行：行数与 `rows_in_line_window` 的窗口一一对应。
     let src = "标题\n前 **加粗** 后\n- 任务 **粗体** 尾\n> 引用 `代码`";
-    let doc = super::doc::Doc::open(SharedString::from(src));
+    let doc = crate::markdown::doc::Doc::open(SharedString::from(src));
     let rows = doc.rows_in_line_window(0, 4);
 
     let para = &rows[1]; // 行 0="标题"；行 1="前 **加粗** 后"

@@ -8,7 +8,7 @@ use std::ops::Range;
 
 use gpui::SharedString;
 
-use crate::markdown::rows::{
+use super::rows::{
     extract_notes, fence_len, inline_style, is_rule, list_prefix, parse_image_line,
     strip_align_directive, trim_paragraph, try_parse_table, Row,
 };

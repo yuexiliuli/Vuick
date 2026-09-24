@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use gpui::{Image, SharedString};
 use regex::Regex;
 
-use crate::markdown::cells;
+use super::cells;
 
 /// 渲染行类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

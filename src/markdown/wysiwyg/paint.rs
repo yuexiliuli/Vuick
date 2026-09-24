@@ -1,8 +1,8 @@
 //! WYSIWYG 绘制层：把 [`super::Frame`] 里已 shape 的行画到窗口（文本/代码面板/表格网格/图片/卡片/选区/横向滚动条）。与 `element` 共用几何，超宽裁剪 + 横向滚动平移同源。
 use super::*;
 use gpui::{App, Bounds, Hsla, Point, SharedString, TextRun, Window, size, point, px};
-use crate::markdown::recognition::AlertKind;
-use crate::markdown::inline_style::MathAlign;
+use crate::markdown::parse::recognition::AlertKind;
+use crate::markdown::parse::inline_style::MathAlign;
 
 
 /// 画 **已排好** 的 mermaid 布局：`placed`/`edges` 为**卡片相对坐标**（shape 期以

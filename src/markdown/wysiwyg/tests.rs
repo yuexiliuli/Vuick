@@ -2299,8 +2299,8 @@ graph TD
         // 回归：展开的 callout，其 body 行左条应与 marker 同色（警报色），不是灰条。
         // 检查 frame 里 callout body 行的 bar 配色走 alert 路径（间接断言：
         // `alert_region_kinds` 把 marker + body 行都标上 kind，paint 据此取警报色）。
-        use crate::markdown::inline_style;
-        use crate::markdown::recognition::AlertKind;
+        use crate::markdown::parse::inline_style;
+        use crate::markdown::parse::recognition::AlertKind;
         use crate::markdown::ir::IrKind;
         cx.update(gpui_component::init);
         let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
@@ -2885,7 +2885,7 @@ A-->B
     fn math_card_height_uses_typeset_size_when_slot_ready(cx: &mut TestAppContext) {
         // 数学排版切 RaTeX 后：公式就绪 → 卡片高按排版位图逻辑高（`20 + h`），
         // 不再按 Unicode 行数（`20 + n×22`）——上限的分式/根号终于有足够高度。
-        use crate::markdown::inline_style;
+        use crate::markdown::parse::inline_style;
         use gpui::App;
         cx.update(gpui_component::init);
         let text = "$$\na \\\\ b\n$$"; // 两行 → Unicode 回退高 = 20+44=64
@@ -2927,7 +2927,7 @@ A-->B
         // 重建。旧实现 `insert(key, Ready).is_none()` 判定恒假（key 必先以 Loading
         // 占位 → insert 返回 Some(Loading)），`on_math_ready` 从不触发 → `math_gen`
         // 恒 0 → 卡片永远停在 Unicode 回退高（42px），68px 位图越出灰底。
-        use crate::markdown::inline_style;
+        use crate::markdown::parse::inline_style;
         use gpui::App;
         cx.update(gpui_component::init);
         // 与 `math_typeset::tests::rasterizes_to_nonempty_bgra` 同款——ratex 确定支持。

@@ -28,8 +28,8 @@ const HEADING_GUTTER_W: f32 = 20.;
 use super::{notdef_debug, CaretVis, WyEditor, WyTheme};
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::recognition::{self, AlertKind, LinkHit};
-use crate::markdown::inline_style::{self, MathAlign, MathRegion};
+use crate::markdown::parse::recognition::{self, AlertKind, LinkHit};
+use crate::markdown::parse::inline_style::{self, MathAlign, MathRegion};
 use crate::markdown::parser::{BlockMeta, RowKind, RunKind, TableAlign};
 use crate::syntax::{github_theme_cached, parse_code_lines, resolve_line_styles_with};
 

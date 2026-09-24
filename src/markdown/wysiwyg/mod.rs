@@ -37,8 +37,8 @@ use gpui::{
 };
 
 use super::doc::Doc;
-use crate::markdown::recognition::{self, LinkHit};
-use crate::markdown::inline_style;
+use crate::markdown::parse::recognition::{self, LinkHit};
+use crate::markdown::parse::inline_style;
 use crate::markdown::view::style::StyleParams;
 use gpui_component::input::Rope;
 
@@ -398,19 +398,19 @@ pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32) -> u64 {
 /// 重复执行）。
 pub(crate) struct WyDerived {
     /// `$$…$$` 数学块区域（首源码行 → 卡片）。
-    pub math_regions: Vec<crate::markdown::inline_style::MathRegion>,
+    pub math_regions: Vec<crate::markdown::parse::inline_style::MathRegion>,
     /// 可折叠 callout 区域 `(行区间, 是否折叠)`。
     pub alert_fold_regions: Vec<(Range<usize>, bool)>,
     /// 每个警报区域的 `AlertKind`（marker + body 行），paint 引述条着色用。
     /// Fx 哈希：结构编辑 `shift_derived` 全量平移重插时省 SipHash（大文档几百到
     /// 数千条 ≈ Enter 路径 1-2ms）。
-    pub alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::recognition::AlertKind>,
+    pub alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind>,
 }
 
 /// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——已被「可见带懒光栅」取代（`sync_math`
 /// 改从窗口化 `frame.rows` 拿带内公式，见约定）。此函数保留一则可应急回退。
-fn alert_kind_tag(k: crate::markdown::recognition::AlertKind) -> u8 {
-    use crate::markdown::recognition::AlertKind::*;
+fn alert_kind_tag(k: crate::markdown::parse::recognition::AlertKind) -> u8 {
+    use crate::markdown::parse::recognition::AlertKind::*;
     match k {
         Note => 0,
         Tip => 1,
@@ -434,10 +434,10 @@ fn region_line_sig(line: &str) -> u64 {
         let t = line.trim();
         if t == "$$" {
             h.write_u8(2);
-        } else if crate::markdown::inline_style::one_line_math(line).is_some() {
+        } else if crate::markdown::parse::inline_style::one_line_math(line).is_some() {
             h.write_u8(3);
-        } else if let Some(p) = crate::markdown::inline_style::blockquote_prefix(line) {
-            match crate::markdown::recognition::alert_prefix(&line[p..]) {
+        } else if let Some(p) = crate::markdown::parse::inline_style::blockquote_prefix(line) {
+            match crate::markdown::parse::recognition::alert_prefix(&line[p..]) {
                 Some((kind, _, fold)) => {
                     h.write_u8(4);
                     alert_kind_tag(kind).hash(&mut h);
@@ -445,9 +445,9 @@ fn region_line_sig(line: &str) -> u64 {
                 }
                 None => h.write_u8(5),
             }
-        } else if let Some(a) = crate::markdown::inline_style::math_align_marker(line) {
+        } else if let Some(a) = crate::markdown::parse::inline_style::math_align_marker(line) {
             h.write_u8(6);
-            use crate::markdown::inline_style::MathAlign::*;
+            use crate::markdown::parse::inline_style::MathAlign::*;
             match a {
                 Left => h.write_u8(0),
                 Center => h.write_u8(1),
@@ -1942,7 +1942,7 @@ impl WyEditor {
             .iter()
             .filter_map(|(r, _, fold)| fold.map(|f| (r.clone(), f)))
             .collect();
-        let mut alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::recognition::AlertKind> =
+        let mut alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind> =
             rustc_hash::FxHashMap::with_capacity_and_hasher(alerts.len() * 2, Default::default());
         for (r, k, _) in &alerts {
             for l in r.clone() {

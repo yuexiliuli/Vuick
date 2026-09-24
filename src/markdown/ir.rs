@@ -11,8 +11,8 @@
 
 use std::ops::Range;
 
-use super::cells::{self, CellAlign};
-use super::inline_style::{
+use super::parse::cells::{self, CellAlign};
+use super::parse::inline_style::{
     blockquote_prefix, heading_level, image_row, list_prefix, table_regions, thematic_break,
 };
 

@@ -2,7 +2,7 @@
 use super::*;
 use gpui::{Pixels, Point, px, point};
 use crate::markdown::ir::IrKind;
-use crate::markdown::recognition::LinkHit;
+use crate::markdown::parse::recognition::LinkHit;
 
 
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。

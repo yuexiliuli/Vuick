@@ -4,7 +4,7 @@
 //! 全量扫描」部分（2026-09-24 重构）：依赖 `rows`（行解析的切块判定函数）；
 //! 增量扫描 / 窗口物化见 `parser`（`blocks_scan`，经门面重导出）。
 
-use crate::markdown::rows::{
+use super::rows::{
     fence_len, inline_strip, is_rule, list_prefix, parse_image_line, strip_align_directive,
     try_parse_table, RowKind,
 };
