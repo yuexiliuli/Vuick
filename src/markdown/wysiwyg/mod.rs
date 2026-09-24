@@ -512,9 +512,9 @@ impl RowShapeCache {
         key: u64,
         row: element::ShapedRow,
     ) -> std::rc::Rc<element::ShapedRow> {
-        if self.entries.len() >= self.cap && !self.entries.contains_key(&block) {
-            if let Some(old) = self.entries.values().map(|e| e.last_seen).min() {
-                if let Some(k) = self
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&block)
+            && let Some(old) = self.entries.values().map(|e| e.last_seen).min()
+                && let Some(k) = self
                     .entries
                     .iter()
                     .find(|(_, e)| e.last_seen == old)
@@ -522,8 +522,6 @@ impl RowShapeCache {
                 {
                     self.entries.remove(&k);
                 }
-            }
-        }
         let rc = std::rc::Rc::new(row);
         self.entries.insert(
             block,
@@ -1118,15 +1116,13 @@ impl WyEditor {
             if !resolved.starts_with("http://")
                 && !resolved.starts_with("https://")
                 && !resolved.starts_with("file://")
-            {
-                if let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
+                && let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
                     std::path::Path::new(&resolved),
                 ) {
                     self.image_sizes
                         .borrow_mut()
                         .insert(key, Some((w as f32, h as f32)));
                 }
-            }
         }
     }
 
@@ -1394,7 +1390,7 @@ impl WyEditor {
                 self.focus.focus(window, cx);
                 match hit {
                     LinkHit::Url(u) if recognition::is_safe_external_url(&u) => {
-                        let _ = cx.open_url(&u);
+                        cx.open_url(&u);
                     }
                     LinkHit::Url(u) | LinkHit::Page(u) => {
                         cx.emit(WyEvent::OpenPage(u));
@@ -1424,15 +1420,14 @@ impl WyEditor {
                 }
                 return;
             }
-            if dbl {
-                if let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
+            if dbl
+                && let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
                     drop(marker);
                     self.focus.focus(window, cx);
                     self.set_caret(src.start + 1);
                     cx.notify();
                     return;
                 }
-            }
         }
         let off = element::source_offset_at(self, f, ev.position);
         drop(marker);
@@ -1499,7 +1494,7 @@ impl WyEditor {
     /// 把指针位置应用到正在拖动的代码块横向滚动条（保持**抓取点相对滑块左缘**：
     /// `thumb_x = px - grab`，按下瞬间 scroll 不变、拖动时滑块钉住抓取点 1:1 跟随）。
     fn code_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((blk, grab)) = self.code_h_drag.borrow().clone() else {
+        let Some((blk, grab)) = *self.code_h_drag.borrow() else {
             return;
         };
         let marker = self.frame.borrow();
@@ -1552,7 +1547,7 @@ impl WyEditor {
 
     /// 把指针位置应用到正在拖动的表格横向滚动条（抓取点相对滑块左缘，1:1 跟随）。
     fn table_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
-        let Some((blk, grab)) = self.table_h_drag.borrow().clone() else {
+        let Some((blk, grab)) = *self.table_h_drag.borrow() else {
             return;
         };
         let marker = self.frame.borrow();
@@ -1719,11 +1714,10 @@ impl WyEditor {
         Rc<std::cell::RefCell<element::BlockLayout>>,
         Option<Rc<std::cell::RefCell<element::BlockLayout>>>,
     ) {
-        if let Some((e, l)) = &*self.block_layout.borrow() {
-            if *e == epoch && l.borrow().n() == n_blocks {
+        if let Some((e, l)) = &*self.block_layout.borrow()
+            && *e == epoch && l.borrow().n() == n_blocks {
                 return (false, l.clone(), None);
             }
-        }
         let old = self.block_layout.borrow().as_ref().map(|(_, l)| l.clone());
         let doc_lines = self.doc().line_starts().len();
         let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::new(
@@ -1753,11 +1747,10 @@ impl WyEditor {
                 .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ self.fold_ver().wrapping_mul(0x517C_C1B7_2722_0A95);
-        if let Some((k, p)) = &*self.fold_plan.borrow() {
-            if *k == key {
+        if let Some((k, p)) = &*self.fold_plan.borrow()
+            && *k == key {
                 return p.clone();
             }
-        }
         let derived = self.derived();
         {
             let d = derived.borrow();
@@ -1898,7 +1891,7 @@ impl WyEditor {
         if let Some(rnge) = plan
             .fold_bodies
             .iter()
-            .find(|r| caret_line >= r.start + 1 && caret_line < r.end)
+            .find(|r| caret_line > r.start && caret_line < r.end)
         {
             let rng = rnge.clone();
             reveal.ranges.push(rng.clone());
@@ -1925,11 +1918,10 @@ impl WyEditor {
     /// （结构密集文档「输入卡死」的根因，旧实现每键重扫 ~1s）。
     pub(crate) fn derived(&self) -> Rc<RefCell<WyDerived>> {
         let ver = self.regions_ver.get();
-        if let Some((g, d)) = &*self.derived.borrow() {
-            if *g == ver {
+        if let Some((g, d)) = &*self.derived.borrow()
+            && *g == ver {
                 return d.clone();
             }
-        }
         let content = self.doc.text_shared();
         // 警报区域单遍扫描，两个公开查询由它派生（旧实现 `alert_fold_regions` +
         // `alert_region_kinds` 各扫一遍全篇——重复 O(n)）。
@@ -2120,7 +2112,7 @@ impl WyEditor {
                 let became_ready = slots2
                     .borrow_mut()
                     .insert(key.clone(), slot)
-                    .map_or(false, |old| matches!(old, MathSlot::Loading));
+                    .is_some_and(|old| matches!(old, MathSlot::Loading));
                 if became_ready {
                     let _ = this.update(cx, |e, ecx| e.on_math_ready(&key2, ecx));
                 }
@@ -2136,11 +2128,10 @@ impl WyEditor {
     fn on_math_ready(&mut self, key: &str, cx: &mut Context<Self>) {
         let in_band = self.frame.borrow().as_ref().is_some_and(|f| {
             f.rows.iter().any(|r| {
-                if let Some(element::BlockCard::Math { latex, .. }) = &r.extra.card {
-                    if latex.trim() == key {
+                if let Some(element::BlockCard::Math { latex, .. }) = &r.extra.card
+                    && latex.trim() == key {
                         return true;
                     }
-                }
                 r.extra.inline_maths.iter().any(|m| m.key.as_ref() == key)
             })
         });
@@ -2345,11 +2336,7 @@ impl WyEditor {
                 let r = &cells[i].0;
                 if col < r.start {
                     r.start - col
-                } else if col > r.end {
-                    col - r.end
-                } else {
-                    0
-                }
+                } else { col.saturating_sub(r.end) }
             })
             .unwrap_or(0);
         let r = &cells[idx].0;
@@ -3117,7 +3104,7 @@ impl EntityInputHandler for WyEditor {
         // 换算走行索引（O(log n)），不再为判等物化全文。
         let r =
             self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
-        let w = if self.marked.as_ref().map_or(false, |m| r == *m) && r.end > r.start {
+        let w = if self.marked.as_ref().is_some_and(|m| r == *m) && r.end > r.start {
             // 组合候选：让候选窗落在整个标记文本宽度上，而不是零宽竖条。
             // 真实几何很难按字符溯源，这里用“应盖住的位置”转成可见块（至少一字符宽）。
             px(24.)

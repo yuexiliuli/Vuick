@@ -46,7 +46,7 @@ pub(crate) fn caret_geometry(
             // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
             // 经块级 byte_map 映射到该代码行的渲染列与垂直偏移；围栏行上不画。
             let n = r.multi_offsets.len();
-            if cl >= r.src_line + 1 && cl <= r.src_line + n {
+            if cl > r.src_line && cl <= r.src_line + n {
                 let block_start = editor.line_start(r.src_line);
                 let target = (line_start + col).saturating_sub(block_start);
                 let rend = source_to_display(&r.byte_map, target);
@@ -327,11 +327,9 @@ pub(crate) fn inline_math_hit_at(
                 && py < y0 + f32::from(r.lh)
                 && px >= x0
                 && px <= x1.max(x0 + 1.)
-            {
-                if !im.source.is_empty() {
+                && !im.source.is_empty() {
                     return Some(im.source.clone());
                 }
-            }
         }
     }
     None

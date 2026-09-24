@@ -298,12 +298,11 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
             idx += 1;
             while idx < lines.len() {
                 let l = lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start()) {
-                    if c == fc {
+                if let Some((c, _)) = fence_len(l.trim_start())
+                    && c == fc {
                         idx += 1;
                         break;
                     }
-                }
                 code_lines += 1;
                 idx += 1;
             }

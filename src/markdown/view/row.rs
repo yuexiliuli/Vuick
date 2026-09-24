@@ -47,19 +47,17 @@ pub(crate) fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Ran
     let mut end = range.end;
     if start > 0 {
         let prev = text[..start].chars().next_back();
-        if let Some(c) = prev {
-            if c.is_whitespace() {
+        if let Some(c) = prev
+            && c.is_whitespace() {
                 start -= c.len_utf8();
             }
-        }
     }
     if end < text.len() {
         let next = text[end..].chars().next();
-        if let Some(c) = next {
-            if c.is_whitespace() {
+        if let Some(c) = next
+            && c.is_whitespace() {
                 end += c.len_utf8();
             }
-        }
     }
     start..end
 }
@@ -560,7 +558,7 @@ impl Element for TextTrack {
     ) -> Self::PrepaintState {
         self.st
             .prepaint(id, inspector_id, bounds, request_layout, window, cx);
-        ()
+        
     }
 
     fn paint(
@@ -654,7 +652,7 @@ pub(crate) fn render_row(
         // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
         // 非换行模式仍交外层 md-harea 统一横向滚动。
         if wrap {
-            let h = table_handle.unwrap_or_else(ScrollHandle::new);
+            let h = table_handle.unwrap_or_default();
             return div()
                 .w_full()
                 .flex_shrink_0()
@@ -725,7 +723,7 @@ pub(crate) fn render_row(
                         .items_center()
                         .justify_center()
                         .text_size(px(13.))
-                        .text_color(fallback_color.clone())
+                        .text_color(fallback_color)
                         .child(alt.clone())
                         .into_any_element()
                 })
@@ -756,7 +754,7 @@ pub(crate) fn render_row(
                             .items_center()
                             .justify_center()
                             .text_size(px(13.))
-                            .text_color(fallback_color.clone())
+                            .text_color(fallback_color)
                             .child(alt.clone())
                             .into_any_element()
                     })
@@ -805,7 +803,7 @@ pub(crate) fn render_row(
             let p_ = p.clone();
             let runs = code_runs;
             let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
-            let h = code_handle.unwrap_or_else(ScrollHandle::new);
+            let h = code_handle.unwrap_or_default();
             let column = div()
                 .debug_selector(|| "md-code-row".into())
                 .flex()
@@ -861,7 +859,7 @@ pub(crate) fn render_row(
                 let t = text_child(
                     &row.text,
                     &row.runs,
-                    &p,
+                    p,
                     search,
                     selection,
                     &TextStyle {
@@ -897,11 +895,11 @@ pub(crate) fn render_row(
                 // EPUB 章/节标题居中（行内也可显式指定对齐）。
                 let h_align = row
                     .align
-                    .or_else(|| if epub { Some(RowAlign::Center) } else { None });
+                    .or(if epub { Some(RowAlign::Center) } else { None });
                 let t = text_child(
                     &row.text,
                     &row.runs,
-                    &p,
+                    p,
                     search,
                     selection,
                     &TextStyle {
@@ -945,7 +943,7 @@ pub(crate) fn render_row(
                 let t = text_child(
                     &row.text,
                     &row.runs,
-                    &p,
+                    p,
                     search,
                     selection,
                     &TextStyle {
@@ -1011,7 +1009,7 @@ pub(crate) fn render_row(
                 let t = text_child(
                     &display,
                     &runs,
-                    &p,
+                    p,
                     shift_search(&search, shift),
                     selection2,
                     &TextStyle {
@@ -1081,7 +1079,7 @@ pub(crate) fn render_row(
             let t = text_child(
                 &row.text,
                 &row.runs,
-                &p,
+                p,
                 search,
                 selection,
                 &TextStyle {
@@ -1116,7 +1114,7 @@ pub(crate) fn render_row(
             let t = text_child(
                 &row.text,
                 &row.runs,
-                &p,
+                p,
                 search,
                 selection,
                 &TextStyle {
@@ -1184,7 +1182,7 @@ pub(crate) fn render_row(
             let t = text_child(
                 &display,
                 &runs,
-                &p,
+                p,
                 shift_search(&search, shift),
                 selection2,
                 &TextStyle {
@@ -1226,7 +1224,7 @@ pub(crate) fn render_row(
                 text_child(
                     &row.text,
                     &row.runs,
-                    &p,
+                    p,
                     search,
                     selection,
                     &TextStyle {

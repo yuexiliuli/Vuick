@@ -172,7 +172,7 @@ impl EditorApp {
             });
             tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
             if let Some(pdf) = tab.pdf_preview.take() {
-                let _ = pdf.update(cx, |view, cx| view.release(window, cx));
+                pdf.update(cx, |view, cx| view.release(window, cx));
             }
             tab.file_path = None;
             tab.dirty = false;
@@ -192,7 +192,7 @@ impl EditorApp {
             return;
         }
         if let Some(pdf) = self.tabs[idx].pdf_preview.take() {
-            let _ = pdf.update(cx, |view, cx| view.release(window, cx));
+            pdf.update(cx, |view, cx| view.release(window, cx));
         }
         self.tabs.remove(idx);
         if idx < self.active_tab {
@@ -285,7 +285,7 @@ impl EditorApp {
 
             let mut el = div()
                 .id(SharedString::from(format!("tab-{idx}")))
-                .debug_selector(move || format!("tab-{idx}").into())
+                .debug_selector(move || format!("tab-{idx}"))
                 .h_full()
                 .px_2()
                 .flex()

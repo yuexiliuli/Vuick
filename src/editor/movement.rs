@@ -127,10 +127,7 @@ pub fn move_vertical(
         return (0, 0);
     }
     let target_row = (row as isize + row_delta).clamp(0, total as isize - 1) as usize;
-    let col = preferred_column.map_or_else(
-        || buffer.char_column(offset) as u32,
-        |c| c,
-    );
+    let col = preferred_column.unwrap_or_else(|| buffer.char_column(offset) as u32);
     let new_offset = buffer.offset_for_char_column(target_row, col as usize);
     (new_offset, col)
 }

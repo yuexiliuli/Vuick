@@ -1,15 +1,3 @@
-//! Inline-markdown styling for live-preview ("WYSIWYG") editing — W1.
-//!
-//! A fast, line-scoped scanner that turns markdown source into styled text runs
-//! **without changing the byte buffer**: syntax markers (`**`, `` ` ``, `[` …)
-//! are kept in the text and merely dimmed, so the displayed characters still
-//! match the buffer one-to-one and the caret/offset model is untouched.
-//!
-//! Scope (W1): inline constructs at the editor's normal text size — bold,
-//! italic, strikethrough, inline code, links, wiki-links, and tags. Heading
-//! sizes need per-line font sizes (variable line heights) and are deferred to
-//! W2; block widgets (images, fenced code, tables, …) to W4.
-//!
 //! 自 `markdown::live`（已移除）迁至 `markdown` 顶层，与 `wysiwyg`/`view`/`ir`/`parity`
 //! 共用识别层。本文件 = 行内样式/块级区域识别：标题/警报/数学/表格/折叠/图片行等，
 //! 供当前各消费方；曾是 W1 行内扫描引擎主体（`styled_runs`/`hidden_runs` 等）已随

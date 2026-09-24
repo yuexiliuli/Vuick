@@ -808,11 +808,10 @@ fn splice_math_text(
         }
         // reveal-on-caret：光标严格落在 `$…$` 内（不碰定界符不算数，与块公式一致的
         // “单击停在边上、双击进去编辑”语义）→ 不 splice，显示可编辑的原始源码。
-        if let Some(c) = caret_disp {
-            if c > span.start && c < span.end {
+        if let Some(c) = caret_disp
+            && c > span.start && c < span.end {
                 continue;
             }
-        }
         let latex = inline_style::inline_math_latex(rtext, &span);
         if latex.trim().is_empty() {
             continue;
@@ -1056,13 +1055,12 @@ fn shape_text_row_decorated(
     }
     let mut srow = shape_text_row(editor, r.clone(), window, width, theme, base_font);
     // C1: 列表/任务行首装饰 + 正文缩进（与预览一致：正文色符号 + 缩进）。
-    if r.kind == IrKind::Bullet {
-        if let Some(g) = bullet_gutter(&raw) {
+    if r.kind == IrKind::Bullet
+        && let Some(g) = bullet_gutter(&raw) {
             let is_check = matches!(g, RowGutter::Check { .. });
             srow.extra.gutter = Some(g);
             srow.x_off = if is_check { px(24.) } else { px(18.) };
         }
-    }
     if let Some(g @ RowGutter::Alert { .. }) = &gutter {
         srow.extra.gutter = Some(g.clone());
         srow.x_off = px(84.);
@@ -1111,11 +1109,10 @@ fn bullet_gutter(raw: &str) -> Option<RowGutter> {
     let t = raw.trim_start();
     for b in ["- ", "* ", "+ "] {
         for (mark, checked) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
-            if let Some(rest) = t.strip_prefix(&format!("{b}{mark}")) {
-                if !rest.is_empty() {
+            if let Some(rest) = t.strip_prefix(&format!("{b}{mark}"))
+                && !rest.is_empty() {
                     return Some(RowGutter::Check { checked });
                 }
-            }
         }
     }
     if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
@@ -1324,17 +1321,14 @@ fn math_to_segments(src: &str) -> Vec<MathSeg> {
                     "sqrt" => {
                         buf.push('√');
                         let (g, ni) = read_group_opt(&cs, j);
-                        match g {
-                            Some(g) => {
-                                if g.chars().count() > 1 {
-                                    buf.push('(');
-                                    buf.push_str(&math_to_unicode(&g));
-                                    buf.push(')');
-                                } else {
-                                    buf.push_str(&math_to_unicode(&g));
-                                }
+                        if let Some(g) = g {
+                            if g.chars().count() > 1 {
+                                buf.push('(');
+                                buf.push_str(&math_to_unicode(&g));
+                                buf.push(')');
+                            } else {
+                                buf.push_str(&math_to_unicode(&g));
                             }
-                            None => {}
                         }
                         i = ni;
                     }
@@ -1465,11 +1459,10 @@ fn mermaid_graph(source: &str) -> MmGraph {
         if let Some(n) = nodes.iter_mut().find(|(nid, _, _)| nid == id) {
             // 已有定义：只有本次给出**显式标签**才更新，裸 id 引用（`B -->` 里的 `B`）
             // 不得用回退的「id 本身」覆盖之前的 `B{判断}` → 判断。
-            if let Some(l) = lab {
-                if !l.is_empty() {
+            if let Some(l) = lab
+                && !l.is_empty() {
                     n.1 = l;
                 }
-            }
             return;
         }
         let lab = lab.filter(|l| !l.is_empty()).unwrap_or_else(|| id.to_string());
@@ -2358,13 +2351,12 @@ pub(crate) fn build_frame(
         }
         // 尾部复用：旧 [j..] 高度原样搬入新 [k..]（长度恰好吻合时才成立）。
         let mut tail_reused = false;
-        if let (Some(oh), Some(os)) = (old_heights, old_src) {
-            if k <= n && j <= os.len() && os.len() - j == n - k {
+        if let (Some(oh), Some(os)) = (old_heights, old_src)
+            && k <= n && j <= os.len() && os.len() - j == n - k {
                 src_lines.extend(os[j..].iter().map(|&s| (s as i64 + line_delta).max(0) as u32));
                 heights.extend_from_slice(&oh[j..]);
                 tail_reused = true;
             }
-        }
         // 兜底：尾部未复用（首建 / 对齐异常）→ 剩余块照旧逐块重估（正确 > 快）。
         if !tail_reused {
             for i in heights.len()..n {
@@ -2731,7 +2723,7 @@ fn text_row_shift(row: &ShapedRow) -> f32 {
     let Some(w0) = row.wrapped.first() else {
         return 0.0;
     };
-    let band = row.sub_heights.get(0).copied().unwrap_or(row.lh);
+    let band = row.sub_heights.first().copied().unwrap_or(row.lh);
     let orig = row.lh * (w0.wrap_boundaries().len() + 1) as f32;
     ((f32::from(band) - f32::from(orig)) / 2.).max(0.)
 }
@@ -3189,7 +3181,7 @@ impl Element for WyEditorElement {
         };
         let stale = {
             let f = self.editor.read(cx).frame.borrow();
-            f.as_ref().map_or(true, |f| {
+            f.as_ref().is_none_or(|f| {
                 f.rgen != rgen
                     || f.igen != igen
                     || f.mgen != mgen
@@ -3234,7 +3226,7 @@ impl Element for WyEditorElement {
                 crate::prof::op_start_detail(kind, &format!("band={band:?} top={top:.0}"));
             }
             let _t_bb = crate::prof::begin();
-            let frame = build_frame(&*self.editor.read(cx), window, width, band);
+            let frame = build_frame(self.editor.read(cx), window, width, band);
             crate::prof::end("wy.prepaint.bf", _t_bb);
             self.editor.update(cx, |e, _| {
                 *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
@@ -3248,7 +3240,7 @@ impl Element for WyEditorElement {
         };
         if let Some(f) = frame.as_ref() {
             let editor = self.editor.read(cx);
-            let (on, x, ctop) = caret_geometry(&*editor, f);
+            let (on, x, ctop) = caret_geometry(editor, f);
             super::set_caret_vis(CaretVis {
                 x,
                 top: if on { ctop } else { px(0.) },
@@ -3297,7 +3289,7 @@ impl Element for WyEditorElement {
         }
         // D1：滚动预热——带穿越前把下一量子带块提前 shape 进缓存（预算内摊平突发）。
         if let Some(f) = frame.as_ref() {
-            prewarm_band(&*self.editor.read(cx), f, window);
+            prewarm_band(self.editor.read(cx), f, window);
         }
         crate::prof::end("wy.prepaint", _t_pp);
         WyPrepaint { link_grips }
@@ -3430,7 +3422,7 @@ impl Element for WyEditorElement {
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);
-            caret_geometry(&*e, f)
+            caret_geometry(e, f)
         };
         if caret_on && focus.is_focused(window) {
             window.paint_quad(gpui::PaintQuad {

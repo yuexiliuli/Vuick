@@ -73,11 +73,10 @@ fn normalize_language(lang: &str) -> &str {
 /// 按语言 token 或扩展名定位语法（带结果缓存）；找不到返回 `None`（不产出高亮）。
 fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
     let lang = normalize_language(language).to_owned();
-    if let Ok(cache) = SYNTAX_CACHE.lock() {
-        if let Some(r) = cache.get(&lang) {
+    if let Ok(cache) = SYNTAX_CACHE.lock()
+        && let Some(r) = cache.get(&lang) {
             return *r;
         }
-    }
     let r = SYNTAX_SET
         .find_syntax_by_token(&lang)
         .or_else(|| SYNTAX_SET.find_syntax_by_extension(&lang));
@@ -406,19 +405,17 @@ fn compute_window(
             let line_start = line_starts[li];
             let mut cursor = 0;
             for (index, operation) in operations {
-                if cursor < index {
-                    if let Some(name) = find_name(&mut semantic_names, &scopes) {
+                if cursor < index
+                    && let Some(name) = find_name(&mut semantic_names, &scopes) {
                         highlights.push((line_start + cursor..line_start + index, name));
                     }
-                }
                 let _ = scopes.apply(&operation);
                 cursor = index;
             }
-            if cursor < line.len() {
-                if let Some(name) = find_name(&mut semantic_names, &scopes) {
+            if cursor < line.len()
+                && let Some(name) = find_name(&mut semantic_names, &scopes) {
                     highlights.push((line_start + cursor..line_start + line.len(), name));
                 }
-            }
         }
     }
 
@@ -510,19 +507,17 @@ pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRun
         if let Ok(operations) = parser.parse_line(line, &SYNTAX_SET) {
             let mut cursor = 0;
             for (index, operation) in operations {
-                if cursor < index {
-                    if let Some(name) = find_name(&mut semantic_names, &scopes) {
+                if cursor < index
+                    && let Some(name) = find_name(&mut semantic_names, &scopes) {
                         runs.push((cursor..index, name));
                     }
-                }
                 let _ = scopes.apply(&operation);
                 cursor = index;
             }
-            if cursor < line.len() {
-                if let Some(name) = find_name(&mut semantic_names, &scopes) {
+            if cursor < line.len()
+                && let Some(name) = find_name(&mut semantic_names, &scopes) {
                     runs.push((cursor..line.len(), name));
                 }
-            }
         }
         out.push(runs);
     }
@@ -912,16 +907,14 @@ fn brace_fold_ranges(text: &str, base_line: usize) -> Vec<FoldRange> {
                 quoted = !quoted;
             } else if !quoted && character == '{' {
                 starts.push(line_number);
-            } else if !quoted && character == '}' {
-                if let Some(start_line) = starts.pop() {
-                    if start_line < line_number {
+            } else if !quoted && character == '}'
+                && let Some(start_line) = starts.pop()
+                    && start_line < line_number {
                         ranges.push(FoldRange::new(
                             base_line + start_line,
                             base_line + line_number,
                         ));
                     }
-                }
-            }
             escaped = quoted && character == '\\' && !escaped;
             if character != '\\' {
                 escaped = false;

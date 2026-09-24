@@ -430,11 +430,10 @@ pub(crate) fn page_segment_text(text: &PageText, lo: usize, hi: usize) -> String
         if let Some((pr, py)) = prev {
             if c.origin_y < py - LINE_EPS_PT {
                 out.push('\n');
-            } else if avg_w > 0.0 && avg_w.is_finite() && c.origin_y >= py - LINE_EPS_PT - 0.5 {
-                if c.left - pr > SPACE_GAP_RATIO * avg_w {
+            } else if avg_w > 0.0 && avg_w.is_finite() && c.origin_y >= py - LINE_EPS_PT - 0.5
+                && c.left - pr > SPACE_GAP_RATIO * avg_w {
                     out.push(' ');
                 }
-            }
         }
         out.push(c.ch);
         prev = Some((c.right.max(c.left), c.origin_y));

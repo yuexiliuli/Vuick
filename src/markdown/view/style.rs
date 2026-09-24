@@ -110,7 +110,7 @@ impl StyleParams {
             para_line: line,
             para_gap: px(4.),
             code_size: code,
-            code_line: code_line,
+            code_line,
             blank_h: px(12.),
             rule_h: px(18.),
             is_dark,

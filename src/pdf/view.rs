@@ -62,7 +62,7 @@ use crate::pdf::{
 fn timing_view() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").map_or(false, |v| v == "1" || v == "true")
+        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 
@@ -292,7 +292,7 @@ impl PdfViewer {
         if gpui_component::Theme::global(cx).is_dark() {
             (rgb(0x1f2937).into(), rgb(0x374151).into())
         } else {
-            (gpui::white().into(), rgb(0xd1d5db).into())
+            (gpui::white(), rgb(0xd1d5db).into())
         }
     }
 
@@ -316,12 +316,11 @@ impl PdfViewer {
         for arc in drops {
             cx.drop_image(arc, Some(window));
         }
-        if let Some(worker) = &self.worker {
-            if self.doc_id != 0 {
+        if let Some(worker) = &self.worker
+            && self.doc_id != 0 {
                 worker.close(self.doc_id);
                 self.doc_id = 0;
             }
-        }
         // 文本层与选区随文档一起释放
         self.text_pages.clear();
         self.text_lru.clear();
@@ -437,7 +436,7 @@ impl PdfViewer {
         // 内存水位巡检（仅计时模式）：每 ~30 帧打一行构成，供定位内存大头
         if timing_view() {
             static MEM_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if MEM_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 30 == 0 {
+            if MEM_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(30) {
                 self.log_memory_waterline(scale_factor);
             }
         }
@@ -488,11 +487,10 @@ impl PdfViewer {
             let excess = thumb_retained - THUMB_CACHE_PAGES;
             let mut dropped: Vec<Arc<RenderImage>> = Vec::new();
             for (i, _) in th_candidates.into_iter().take(excess) {
-                if let Some(slot) = self.slots.get_mut(i) {
-                    if let Some(arc) = slot.thumb.take() {
+                if let Some(slot) = self.slots.get_mut(i)
+                    && let Some(arc) = slot.thumb.take() {
                         dropped.push(arc);
                     }
-                }
             }
             for arc in dropped {
                 cx.drop_image(arc, Some(window));
@@ -504,7 +502,7 @@ impl PdfViewer {
         if mid_retained > MID_CACHE_PAGES {
             // LRU 先与槽同步（删除即丢引用，保证预算与队列一致），再按 LRU 淘汰。
             self.mid_lru
-                .retain(|&p| self.slots.get(p).map_or(false, |s| s.mid.is_some()));
+                .retain(|&p| self.slots.get(p).is_some_and(|s| s.mid.is_some()));
             let excess = mid_retained - MID_CACHE_PAGES;
             let mut evicted = 0usize;
             let mut dropped: Vec<Arc<RenderImage>> = Vec::new();
@@ -722,8 +720,8 @@ impl PdfViewer {
                     {
                         continue;
                     }
-                    let d = (page as i64 - center as i64).unsigned_abs() as u64 * 1_000_000
-                        + (row as i64 - mid_row as i64).unsigned_abs() as u64;
+                    let d = (page as i64 - center as i64).unsigned_abs() * 1_000_000
+                        + (row as i64 - mid_row as i64).unsigned_abs();
                     need.push((page, row, col, d));
                 }
             }
@@ -773,11 +771,10 @@ impl PdfViewer {
             // 缩放过期（缩放/DPI 已变）→ 丢弃旧封面
             if let Some(slot) = self.slots.get_mut(page) {
                 let stale = slot.cover.is_some() && (slot.cover_scale - cscale).abs() > 1e-4;
-                if stale {
-                    if let Some(old) = slot.cover.take() {
+                if stale
+                    && let Some(old) = slot.cover.take() {
                         self.pending_drops.push(old);
                     }
-                }
             }
             // 整页不超预算 且 无封面 且 未在途 → 派发
             if cover_affordable(dim, cscale)
@@ -935,9 +932,9 @@ impl PdfViewer {
                             {
                                 continue;
                             }
-                            let d = (page as i64 - center_vis as i64).unsigned_abs() as u64
+                            let d = (page as i64 - center_vis as i64).unsigned_abs()
                                 * 1_000_000
-                                + (row as i64 - mid_row as i64).unsigned_abs() as u64;
+                                + (row as i64 - mid_row as i64).unsigned_abs();
                             need.push((page, row, col, d));
                         }
                     }
@@ -1077,7 +1074,7 @@ impl PdfViewer {
         let mut candidates: Vec<(u64, usize, u32, u32)> = Vec::new();
         for (page, slot) in self.slots.iter().enumerate() {
             for &(row, col) in slot.tiles.keys() {
-                let d = (page as i64 - center as i64).unsigned_abs() as u64 * 1_000_000
+                let d = (page as i64 - center as i64).unsigned_abs() * 1_000_000
                     + row as u64;
                 candidates.push((d, page, row, col));
             }
@@ -1087,12 +1084,11 @@ impl PdfViewer {
             if self.tile_bytes <= TILE_CACHE_BYTES {
                 break;
             }
-            if let Some(slot) = self.slots.get_mut(page) {
-                if let Some(ts) = slot.tiles.remove(&(row, col)) {
+            if let Some(slot) = self.slots.get_mut(page)
+                && let Some(ts) = slot.tiles.remove(&(row, col)) {
                     self.tile_bytes = self.tile_bytes.saturating_sub(ts.bytes());
                     self.pending_drops.push(ts.image);
                 }
-            }
         }
     }
 
@@ -1156,11 +1152,10 @@ impl PdfViewer {
     fn evict_covers(&mut self, wanted_first: usize, wanted_last: usize) {
         let mut drops: Vec<Arc<RenderImage>> = Vec::new();
         for (page, slot) in self.slots.iter_mut().enumerate() {
-            if slot.cover.is_some() && (page < wanted_first || page > wanted_last) {
-                if let Some(old) = slot.cover.take() {
+            if slot.cover.is_some() && (page < wanted_first || page > wanted_last)
+                && let Some(old) = slot.cover.take() {
                     drops.push(old);
                 }
-            }
         }
         self.pending_drops.extend(drops);
     }
@@ -1329,12 +1324,11 @@ impl PdfViewer {
             return;
         }
         let pos = window.mouse_position();
-        if let Some(cur) = self.hit_test(window, pos) {
-            if self.sel_active != Some(cur) {
+        if let Some(cur) = self.hit_test(window, pos)
+            && self.sel_active != Some(cur) {
                 self.sel_active = Some(cur);
                 cx.notify();
             }
-        }
     }
 
     /// 松开：拖拽结束（`selecting` 复位），**选区保留**（anchor + active 都在，可 Ctrl+C）。

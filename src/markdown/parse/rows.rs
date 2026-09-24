@@ -535,7 +535,7 @@ fn fence_language(t: &str) -> Option<&str> {
         .trim_start_matches('{')
         .trim_end_matches('}')
         .trim()
-        .trim_end_matches(|c: char| matches!(c, ',' | ';' | '.' | ':' | '!' | '?'));
+        .trim_end_matches([',', ';', '.', ':', '!', '?']);
     if lang.is_empty() {
         None
     } else {
@@ -686,7 +686,7 @@ pub(crate) fn split_table_cells_mapped(
         if let Some(last) = map.last_mut() {
             *last = src_end;
         }
-        out.push((src_base..src_end, render.into(), map));
+        out.push((src_base..src_end, render, map));
     }
     out
 }
@@ -822,12 +822,11 @@ pub fn parse_to_rows(src: &str) -> Vec<Row> {
             idx += 1;
             while idx < lines.len() {
                 let l = lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start()) {
-                    if c == fc {
+                if let Some((c, _)) = fence_len(l.trim_start())
+                    && c == fc {
                         idx += 1;
                         break;
                     }
-                }
                 code_lines.push(SharedString::from(l));
                 idx += 1;
             }

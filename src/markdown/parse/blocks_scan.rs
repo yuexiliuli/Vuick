@@ -168,18 +168,17 @@ pub fn scan_blocks_incremental_rope(
             if (0..=old_len as i64).contains(&prev_off) {
                 let prev_off = prev_off as usize;
                 let pii = prev.blocks.partition_point(|b| (b.byte as usize) < prev_off);
-                if let Some(pb) = prev.blocks.get(pii) {
-                    if pb.byte as usize == prev_off {
+                if let Some(pb) = prev.blocks.get(pii)
+                    && pb.byte as usize == prev_off {
                         let prev_line = pb.src_line as usize;
                         let line_shift = (anchor + idx) as i64 - prev_line as i64;
                         suffix_segs = prev.blocks.shares_suffix(pii, delta, line_shift);
-                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
+                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
                             toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
                         }
                         reused = true;
                         break;
                     }
-                }
             }
         }
 
@@ -195,13 +194,12 @@ pub fn scan_blocks_incremental_rope(
             cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
             while idx < new_lines.len() {
                 let l = new_lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start()) {
-                    if c == fc {
+                if let Some((c, _)) = fence_len(l.trim_start())
+                    && c == fc {
                         idx += 1;
                         cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
                         break;
                     }
-                }
                 code_lines += 1;
                 idx += 1;
                 cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, region_bytes);
@@ -443,7 +441,7 @@ pub(crate) fn rows_memory_estimate(rows: &[Row]) -> (usize, usize) {
         ALLOC_OVERHEAD + s.len()
     }
     fn string_vec_bytes(v: &[SharedString]) -> usize {
-        v.len() * std::mem::size_of::<SharedString>()
+        std::mem::size_of_val(v)
             + v.iter().map(string_bytes).sum::<usize>()
     }
 

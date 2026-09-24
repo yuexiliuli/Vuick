@@ -78,7 +78,7 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         let chapter_html = read_zip_entry(&mut archive, &entry_path)
             .with_context(|| format!("读取章节失败：{entry_path}"))?;
         let chapter_dir = {
-            let s = href.rsplitn(2, '/').nth(1).unwrap_or("").to_string();
+            let s = href.rsplit_once('/').map(|x| x.0).unwrap_or("").to_string();
             if s.is_empty() {
                 base_dir.clone()
             } else {
@@ -101,10 +101,7 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
             }
             img_counter += 1;
             // 以文件真实签名推断格式（扩展名可能误导：如 00001.jpeg 实为 PNG）
-            let format = match image_format_for_bytes(&bytes) {
-                Some(f) => f,
-                None => return None, // 未知格式 → 走 alt 占位
-            };
+            let format = image_format_for_bytes(&bytes)?;
             let ext = format_ext(format);
             let vsrc = format!("{EPUB_IMG_SCHEME}{img_counter}.{ext}");
             // 内存持有字节：Image::from_bytes(format, bytes)
@@ -200,13 +197,11 @@ fn read_zip_entry<R: Read + std::io::Seek>(
 fn find_opf_path(container_xml: &str) -> Result<String> {
     let doc = roxmltree::Document::parse(container_xml).context("解析 container.xml 失败")?;
     for node in doc.descendants() {
-        if node.has_tag_name("rootfile") {
-            if let Some(full) = node.attribute("full-path") {
-                if !full.trim().is_empty() {
+        if node.has_tag_name("rootfile")
+            && let Some(full) = node.attribute("full-path")
+                && !full.trim().is_empty() {
                     return Ok(full.trim().to_string());
                 }
-            }
-        }
     }
     bail!("container.xml 里找不到 rootfile/full-path")
 }
@@ -236,27 +231,24 @@ fn parse_opf(opf_xml: &str, opf_path: &str) -> Result<(String, String, Vec<Strin
     // manifest：id → href
     let mut manifest: std::collections::HashMap<String, String> = Default::default();
     for node in doc.descendants() {
-        if node.has_tag_name("item") {
-            if let (Some(id), Some(href)) = (node.attribute("id"), node.attribute("href")) {
+        if node.has_tag_name("item")
+            && let (Some(id), Some(href)) = (node.attribute("id"), node.attribute("href")) {
                 manifest.insert(id.to_string(), href.to_string());
             }
-        }
     }
 
     // spine：itemref idref 顺序 = 阅读顺序
     let mut spine_hrefs: Vec<String> = Vec::new();
     for node in doc.descendants() {
-        if node.has_tag_name("itemref") {
-            if let Some(idref) = node.attribute("idref") {
-                if let Some(href) = manifest.get(idref) {
+        if node.has_tag_name("itemref")
+            && let Some(idref) = node.attribute("idref")
+                && let Some(href) = manifest.get(idref) {
                     // 过滤掉 ncx/封面等非 xhtml 项，只保留章节
                     if href.ends_with(".html") || href.ends_with(".xhtml") || href.ends_with(".htm")
                     {
                         spine_hrefs.push(href.clone());
                     }
                 }
-            }
-        }
     }
 
     if spine_hrefs.is_empty() {
@@ -345,21 +337,19 @@ fn walk_body(
             // → 改写成 `[!N]`（渲染层识别为定义标记，可逆跳到文内对应位置）；
             // 同时抽出 (注记号 → 注释正文) 进 `notes`（悬浮卡片数据源）。
             let note_def = leading_footnote_id(node).is_some();
-            if note_def {
-                if let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty()) {
-                    if let Some(rel) = first.find('[') {
+            if note_def
+                && let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty())
+                    && let Some(rel) = first.find('[') {
                         let after = &first[rel + 1..];
                         let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
                         if d > 0 && after[d..].starts_with(']') {
                             first.insert(rel + 1, '!');
                         }
                     }
-                }
-            }
             let joined = segs.join("\n");
             let t = joined.trim().to_string();
-            if note_def {
-                if let Some(n) = leading_footnote_id(node) {
+            if note_def
+                && let Some(n) = leading_footnote_id(node) {
                     let marker = format!("[{n}]");
                     if let Some(rest) = t.strip_prefix(marker.as_str()) {
                         notes
@@ -367,7 +357,6 @@ fn walk_body(
                             .or_insert_with(|| rest.trim_start_matches('\u{3000}').trim().to_string());
                     }
                 }
-            }
             // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：
             // 行首前置两个全角空格，渲染时折行后天然「首行缩进、次行顶格」；
             // 对齐行（落款/浮段）与引述/注释等段落不缩进。
@@ -530,11 +519,10 @@ fn quote_prefix(text: &str, quoted: usize) -> String {
 fn node_text(node: &roxmltree::Node) -> String {
     let mut s = String::new();
     for n in node.descendants() {
-        if n.is_text() {
-            if let Some(t) = n.text() {
+        if n.is_text()
+            && let Some(t) = n.text() {
                 s.push_str(t);
             }
-        }
     }
     s
 }
@@ -550,12 +538,11 @@ fn node_text_epub(node: &roxmltree::Node) -> String {
                 s.push_str(t);
             }
         } else if child.is_element() {
-            if child.has_tag_name("a") {
-                if let Some(n) = note_ref_at(&child) {
+            if child.has_tag_name("a")
+                && let Some(n) = note_ref_at(&child) {
                     s.push_str(&format!(" [^{n}] "));
                     continue; // 跳过其 `<sup>[N]</sup>` 子节点
                 }
-            }
             s.push_str(&node_text_epub(&child));
         }
     }
@@ -585,12 +572,11 @@ fn walk_text_lines(node: &roxmltree::Node, segs: &mut Vec<String>) {
                 }
                 continue;
             }
-            if child.has_tag_name("a") {
-                if let Some(n) = note_ref_at(&child) {
+            if child.has_tag_name("a")
+                && let Some(n) = note_ref_at(&child) {
                     segs.last_mut().unwrap().push_str(&format!(" [^{n}] "));
                     continue;
                 }
-            }
             walk_text_lines(&child, segs);
         }
     }

@@ -366,12 +366,11 @@ impl EditorApp {
         }
 
         // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）
-        if self.sidebar_width_auto {
-            if let Some(w) = self.compute_sidebar_toc_width(cx) {
+        if self.sidebar_width_auto
+            && let Some(w) = self.compute_sidebar_toc_width(cx) {
                 self.sidebar_width = (crate::config::layout::SIDEBAR_ACTIVITY_W + w + 12.0)
                     .clamp(crate::config::layout::SIDEBAR_WIDTH_MIN, crate::config::layout::SIDEBAR_WIDTH_MAX);
             }
-        }
 
         let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
             Some(tab) => {
@@ -410,7 +409,7 @@ impl EditorApp {
                                 active_bg,
                                 move |_, _w, cx| {
                                     if page != usize::MAX {
-                                        let _ = wk.update(cx, |v, cx| {
+                                        wk.update(cx, |v, cx| {
                                             v.scroll_to_page(page);
                                             cx.notify();
                                         });
@@ -456,7 +455,7 @@ impl EditorApp {
                                 muted,
                                 active_bg,
                                 move |_, _w, cx| {
-                                    let _ = wk.update(cx, |v, cx| {
+                                    wk.update(cx, |v, cx| {
                                         v.scroll_to_row(row_ix);
                                         cx.notify();
                                     });
@@ -661,7 +660,7 @@ impl EditorApp {
                             let ed = tab.editor.clone();
                             ed.update(cx, |ed, cx| {
                                 // 先落光标（滚动到该行），再选中命中文本作为高亮
-                                let start = ed.offset_for_line_col(li as usize, 0);
+                                let start = ed.offset_for_line_col(li, 0);
                                 ed.set_caret_to(start);
                                 ed.set_selection_range(match_range.clone(), cx);
                             });
@@ -866,11 +865,10 @@ impl EditorApp {
     /// 匹配用无分配 ASCII 大小写不敏感查找（非 ASCII 查询词回退字符级扫描）。
     /// 结果在 [`EditorApp::search_scan`] 缓存，编辑/加载/切文档时清空重扫。
     fn sidebar_search_scan(&mut self, q: &str, cx: &App) -> Rc<SidebarSearchScan> {
-        if let Some(s) = &self.search_scan {
-            if s.tab == self.active_tab && s.query == q {
+        if let Some(s) = &self.search_scan
+            && s.tab == self.active_tab && s.query == q {
                 return s.clone();
             }
-        }
         self.search_scan_count += 1;
 
         let mut file_tabs: Vec<usize> = Vec::new();
@@ -891,8 +889,8 @@ impl EditorApp {
             }
         }
         // 行内容命中（仅当前活动文档；readonly 走 content，可编辑走编辑器 Rope）
-        if file_tabs.len() < SEARCH_RESULT_CAP {
-            if let Some(tab) = self.tabs.get(self.active_tab) {
+        if file_tabs.len() < SEARCH_RESULT_CAP
+            && let Some(tab) = self.tabs.get(self.active_tab) {
                 if tab.readonly_preview {
                     let content: &str = tab.content.as_ref();
                     let mut li = 0usize;
@@ -936,7 +934,6 @@ impl EditorApp {
                     }
                 }
             }
-        }
 
         let scan = std::rc::Rc::new(SidebarSearchScan {
             query: q.to_string(),

@@ -28,11 +28,10 @@ static SYNTAX_CACHE: LazyLock<Mutex<HashMap<String, Option<&'static SyntaxRefere
 
 fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
     let lang = language.to_owned();
-    if let Ok(cache) = SYNTAX_CACHE.lock() {
-        if let Some(r) = cache.get(&lang) {
+    if let Ok(cache) = SYNTAX_CACHE.lock()
+        && let Some(r) = cache.get(&lang) {
             return *r;
         }
-    }
     let r = SYNTAX_SET
         .find_syntax_by_token(&lang)
         .or_else(|| SYNTAX_SET.find_syntax_by_extension(&lang));
@@ -199,7 +198,7 @@ impl Highlighter {
         if let Some((v, _a, b)) = self.key {
             if v == version && lo >= self.base && hi < self.base + self.lines.len() {
                 let rel = lo - self.base;
-                if rel + (hi - lo) + 1 <= self.lines.len() {
+                if rel + (hi - lo) < self.lines.len() {
                     return &self.lines[rel..rel + (hi - lo) + 1];
                 }
             }
@@ -258,11 +257,10 @@ impl Highlighter {
                 return;
             }
             let name = active.iter().rev().find_map(semantic_name);
-            if let Some(name) = name {
-                if let Some(color) = name_color(name, dark) {
+            if let Some(name) = name
+                && let Some(color) = name_color(name, dark) {
                     out.push((from..to, color));
                 }
-            }
         };
         for (index, operation) in operations {
             if cursor < index {

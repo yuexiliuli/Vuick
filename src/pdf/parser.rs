@@ -632,13 +632,13 @@ fn extract_outline(doc: &PdfDocument<'_>) -> Vec<PdfOutlineEntry> {
 fn timing() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EN.get_or_init(|| {
-        std::env::var_os("GPUI_EDITOR_PDF_TIMING").map_or(false, |v| v == "1" || v == "true")
+        std::env::var_os("GPUI_EDITOR_PDF_TIMING").is_some_and(|v| v == "1" || v == "true")
     })
 }
 
 fn render_page(doc: &PdfDocument<'_>, req: RenderRequest) -> Option<RenderResult> {
     let page = doc.pages().get(req.page as i32).ok()?;
-    let (pw, ph) = (page.width().value as f32, page.height().value as f32);
+    let (pw, ph) = (page.width().value, page.height().value);
     let w = (pw * req.scale).ceil().max(1.0) as i32;
     let h = (ph * req.scale).ceil().max(1.0) as i32;
     let t1 = std::time::Instant::now();
@@ -678,7 +678,7 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
     let t0 = std::time::Instant::now();
     let page = doc.pages().get(req.page as i32).ok()?;
     let t_get = std::time::Instant::now();
-    let (pw, ph) = (page.width().value as f32, page.height().value as f32);
+    let (pw, ph) = (page.width().value, page.height().value);
     let bmp = crate::pdf::layout::page_bitmap_size((pw, ph), req.scale);
     let (x0, y0, w, h) =
         crate::pdf::layout::tile_rect(req.col, req.row, req.tile_size, crate::config::pdf::TILE_BLEED, bmp)?;
@@ -725,7 +725,7 @@ fn render_tile(doc: &PdfDocument<'_>, req: TileRequest) -> Option<TileResult> {
 /// `[0.1, 1.0]`（防止超大页 / 极小页产生荒谬分辨率）；pdfium 下采样极快（~1ms/张）。
 fn render_thumb(doc: &PdfDocument<'_>, page_index: usize) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
-    let pw = page.width().value.max(1.0) as f32;
+    let pw = page.width().value.max(1.0);
     let scale = (crate::config::pdf::THUMB_WIDTH / pw).clamp(0.1, 1.0);
     render_page(doc, RenderRequest {
         page: page_index,
@@ -744,7 +744,7 @@ fn render_mid(
     scale_factor: f32,
 ) -> Option<RenderResult> {
     let page = doc.pages().get(page_index as i32).ok()?;
-    let pw = page.width().value.max(1.0) as f32;
+    let pw = page.width().value.max(1.0);
     let target_w = crate::config::pdf::MID_WIDTH * scale_factor.max(1.0);
     let scale = (target_w / pw).clamp(0.1, 1.0);
     render_page(doc, RenderRequest {
@@ -781,7 +781,7 @@ fn char_box_from_rect(r: PdfRect) -> CharBox {
 /// - 页面无文本（扫描件）返回 `Some(PageText { chars: [] })`；页/文档不存在返回 `None`。
 fn extract_page_text(doc: &PdfDocument<'_>, page_index: usize) -> Option<PageText> {
     let page = doc.pages().get(page_index as i32).ok()?;
-    let (page_w, page_h) = (page.width().value as f32, page.height().value as f32);
+    let (page_w, page_h) = (page.width().value, page.height().value);
     let text = page.text().ok()?;
     let mut chars = Vec::with_capacity(text.len().max(0) as usize);
     let mut synthetic_count = 0usize;

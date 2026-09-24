@@ -206,8 +206,8 @@ impl EditorApp {
         tab.editor.update(cx, |ed, _| {
             ed.apply_stats(max_line_chars, line_width_histogram);
         });
-        if let Some(index) = index {
-            if Self::is_markdown_path(p) && tab.preview_on {
+        if let Some(index) = index
+            && Self::is_markdown_path(p) && tab.preview_on {
                 let rc = std::rc::Rc::new(index);
                 let rope = tab.editor.read(cx).rope().clone();
                 tab.preview_prev = Some((rope.clone(), rc.clone()));
@@ -215,7 +215,6 @@ impl EditorApp {
                     view.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope), rc, cx);
                 });
             }
-        }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后两栏纵向量程总高。编辑器精确时应 ≈
             // 行数×行高；预览(精确平均高) 应 ≈ 全篇块高之和。值远小于预期 → 该栏量程坍缩。
@@ -429,7 +428,7 @@ impl EditorApp {
                     // 小文档走 `load_file_text` 同步挂载，由 `new_impl` 直接开启）。
                     if std::env::var_os("WY_AUTOTEST").is_some()
                         && idx == this.active_tab
-                        && this.tabs.get(idx).map_or(false, |t| t.live2.is_none())
+                        && this.tabs.get(idx).is_some_and(|t| t.live2.is_none())
                     {
                         this.toggle_live_test(window, cx);
                     }

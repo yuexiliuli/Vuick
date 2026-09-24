@@ -633,7 +633,7 @@ impl CodeEditor {
         let dark = theme.is_dark();
 
         let mono = typo.mono.clone();
-        let mono_md = typo.mono_md.clone();
+        let mono_md = typo.mono_md;
         // 字号覆盖：应用 Ctrl+=/- 调节（默认 None = 主题字号）
         let (font_size, line_height) = match self.font_override {
             Some(px_override) => {
@@ -1581,11 +1581,9 @@ impl CodeEditor {
             match k.key.to_ascii_lowercase().as_str() {
                 "[" => {
                     self.fold_under_caret(cx);
-                    return;
                 }
                 "]" => {
                     self.unfold_under_caret(cx);
-                    return;
                 }
                 _ => {}
             }
@@ -2195,11 +2193,10 @@ impl CodeEditor {
     }
 
     fn paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            if let Some(text) = item.text() {
+        if let Some(item) = cx.read_from_clipboard()
+            && let Some(text) = item.text() {
                 self.paste_text(&text, cx);
             }
-        }
     }
 
     /// 在选区处粘贴（归一化 CRLF→LF；程序化/应用侧调用）。
@@ -2647,7 +2644,7 @@ impl Render for CodeEditor {
         // 折叠后 gutter 按**视觉行**取逻辑行号（隐藏行不占视觉行 → 行号呈缺口，
         // 折叠首行渲染「▾」指示器）。先快照（closure 不捕获 self）。
         let gutter_start = g_top_abs;
-        let gutter_count = (((view_h / lh) as f32).ceil() as usize).clamp(1, 4096) + 1;
+        let gutter_count = ((view_h / lh).ceil() as usize).clamp(1, 4096) + 1;
         let gutter_items: Vec<Option<(usize, bool)>> = (gutter_start..gutter_start + gutter_count)
             .map(|vix| {
                 if vix < gutter_rows {
@@ -3034,12 +3031,11 @@ pub(crate) fn merge_highlights(
         bounds.push(s);
         bounds.push(e);
     }
-    if let Some(s) = &sel {
-        if s.end > s.start {
+    if let Some(s) = &sel
+        && s.end > s.start {
             bounds.push(s.start);
             bounds.push(s.end);
         }
-    }
     bounds.sort_unstable();
     bounds.dedup();
 

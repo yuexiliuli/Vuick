@@ -161,17 +161,11 @@ impl Render for TabDragGhost {
 /// 所有 `EditorApp` 窗口的注册表（全局）：记录每个窗口的弱实体句柄与窗口句柄。
 /// 「拖出拆分」创建的子窗口带 `is_detached=true`，把选项卡拖回主窗口时据此找到
 /// 主窗口（第一个非 detached 的 EditorApp 窗口）。
+#[derive(Default)]
 struct EditorAppRegistry {
     windows: Vec<(gpui::WeakEntity<EditorApp>, AnyWindowHandle)>,
 }
 
-impl Default for EditorAppRegistry {
-    fn default() -> Self {
-        Self {
-            windows: Vec::new(),
-        }
-    }
-}
 
 impl gpui::Global for EditorAppRegistry {}
 
@@ -386,12 +380,11 @@ impl EditorApp {
         let Some(tab) = self.tabs.get(idx) else {
             return self.focus_handle.clone();
         };
-        if tab.live_edit {
-            if let Some(l2) = &tab.live2 {
+        if tab.live_edit
+            && let Some(l2) = &tab.live2 {
                 let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
                 return h;
             }
-        }
         tab.editor.read(cx).focus_handle()
     }
 
@@ -410,8 +403,8 @@ impl EditorApp {
     ) -> Subscription {
         let ed = editor.clone();
         cx.subscribe(&ed, |this, emitter, ev: &crate::editor::EditorEvent, cx| {
-            if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter) {
-                if ev == &crate::editor::EditorEvent::Edited {
+            if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter)
+                && ev == &crate::editor::EditorEvent::Edited {
                     let _t_change = crate::prof::begin();
                     // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
                     this.search_scan = None;
@@ -576,7 +569,6 @@ impl EditorApp {
                     cx.notify();
                     crate::prof::end("tab_change", _t_change);
                 }
-            }
         })
     }
 
@@ -939,13 +931,11 @@ impl EditorApp {
             .get(idx)
             .map(|t| !t.preview_fullscreen)
             .unwrap_or(true)
-        {
-            if let Some(tab) = self.tabs.get(idx) {
+            && let Some(tab) = self.tabs.get(idx) {
                 tab.editor.update(cx, |ed, _cx| {
                     ed.set_soft_wrap(wrap_enabled);
                 });
             }
-        }
         cx.notify();
     }
 

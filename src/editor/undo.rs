@@ -91,16 +91,13 @@ impl UndoManager {
         if self.cooperative {
             let intent = self.pending.as_ref().unwrap().intent;
             let last_clone = self.pending.as_ref().and_then(|p| p.edits.last().cloned());
-            if let Some(last) = last_clone {
-                if let Some(merged) = self.try_merge(intent, &last, &edit) {
-                    if let Some(p) = self.pending.as_mut() {
-                        if let Some(slot) = p.edits.last_mut() {
+            if let Some(last) = last_clone
+                && let Some(merged) = self.try_merge(intent, &last, &edit)
+                    && let Some(p) = self.pending.as_mut()
+                        && let Some(slot) = p.edits.last_mut() {
                             *slot = merged;
                             return;
                         }
-                    }
-                }
-            }
         }
 
         // 不合并 → 刷新旧事务，新事务沿用同意图（连续删除/粘贴的下一段），把本条放入。

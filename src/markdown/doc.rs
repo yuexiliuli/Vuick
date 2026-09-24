@@ -171,13 +171,13 @@ impl Doc {
         let line_starts = build_line_starts_rope(&rope);
         let char_count = rope.chars().count();
         let line_utf16_starts = build_line_utf16_starts(
-            |s, e| rope.slice(s..e).chars().map(|c| c.len_utf16() as usize).sum(),
+            |s, e| rope.slice(s..e).chars().map(|c| c.len_utf16()).sum(),
             &line_starts,
             rope.len(),
         );
         let total_utf16: usize = rope
             .chars()
-            .map(|c| c.len_utf16() as usize)
+            .map(|c| c.len_utf16())
             .sum::<usize>();
         let src = DocSrc::Rope(rope.clone());
         Self {
@@ -217,7 +217,7 @@ impl Doc {
             self.rope
                 .slice(start..end)
                 .chars()
-                .map(|c| c.len_utf16() as usize)
+                .map(|c| c.len_utf16())
                 .sum::<usize>()
         } else {
             0
@@ -451,7 +451,7 @@ impl Doc {
                 .rope
                 .slice(line_start..byte)
                 .chars()
-                .map(|c| c.len_utf16() as usize)
+                .map(|c| c.len_utf16())
                 .sum::<usize>()
     }
 
@@ -729,11 +729,10 @@ impl Doc {
     pub(crate) fn text_shared(&self) -> SharedString {
         #[cfg(test)]
         self.text_shared_calls.set(self.text_shared_calls.get() + 1);
-        if let Some((ver, s)) = &*self.text_cache.borrow() {
-            if *ver == self.edit_ver {
+        if let Some((ver, s)) = &*self.text_cache.borrow()
+            && *ver == self.edit_ver {
                 return s.clone();
             }
-        }
         let s = match &self.src {
             DocSrc::Str(s) => s.clone(),
             DocSrc::Rope(r) => SharedString::from(r.to_string()),

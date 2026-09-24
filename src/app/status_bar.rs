@@ -101,8 +101,7 @@ impl EditorApp {
         // 换行开关按钮：仅非只读预览（非 PDF/EPUB）且非 Markdown 时显示。
         // Markdown 编辑区与预览区默认/始终自动换行，不提供切换（隐藏该按钮）。
         let is_markdown = tab
-            .map(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
-            .flatten()
+            .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
             .unwrap_or(false);
         if !readonly_preview && !is_markdown {
             let btn = div()

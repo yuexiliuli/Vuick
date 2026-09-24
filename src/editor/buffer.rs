@@ -381,7 +381,7 @@ impl Buffer {
     pub fn display_line_count(&self) -> usize {
         let n = self.text.lines_len();
         // 非空文本的末行为空 ⟺ 以换行结尾（ropey 幻影空行 = str::lines 丢弃的尾段；"\r\n" 同理）。
-        let trailing_newline = self.len() > 0 && self.text.line_len(n - 1) == 0;
+        let trailing_newline = !self.is_empty() && self.text.line_len(n - 1) == 0;
         (n - usize::from(trailing_newline)).max(1)
     }
 

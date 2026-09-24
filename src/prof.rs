@@ -60,11 +60,11 @@ struct OpState {
 }
 
 thread_local! {
-    static OP: RefCell<Option<OpState>> = RefCell::new(None);
-    static TRACE_FILE: RefCell<Option<std::io::BufWriter<std::fs::File>>> = RefCell::new(None);
-    static OP_SEQ: RefCell<u64> = RefCell::new(0);
+    static OP: RefCell<Option<OpState>> = const { RefCell::new(None) };
+    static TRACE_FILE: RefCell<Option<std::io::BufWriter<std::fs::File>>> = const { RefCell::new(None) };
+    static OP_SEQ: RefCell<u64> = const { RefCell::new(0) };
     /// WyEditorElement::paint 的全局次数（跨 op 累计，供 paint 计数诊断）。
-    static G_PAINT_N: RefCell<u64> = RefCell::new(0);
+    static G_PAINT_N: RefCell<u64> = const { RefCell::new(0) };
 }
 
 /// WyEditorElement::paint 每次调用时递增（诊断一次操作跨几帧）。

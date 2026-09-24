@@ -190,12 +190,11 @@ fn read_link(line: &str, open: usize) -> Option<(usize, usize)> {
     }
     let ci = ci?;
     let after = ci + 1;
-    if after < b.len() && b[after] == b'(' {
-        if let Some(mut d) = b[after + 1..].iter().position(|&x| x == b')') {
+    if after < b.len() && b[after] == b'('
+        && let Some(mut d) = b[after + 1..].iter().position(|&x| x == b')') {
             d += after + 1;
             return Some((ci, d));
         }
-    }
     Some((ci, ci))
 }
 
@@ -317,8 +316,8 @@ fn scan_inline(text: &str, from: usize, out: &mut Vec<(Range<usize>, Deco)>) {
                 i += 1;
                 continue;
             }
-            if let Some((cs, ce)) = find_run_from(text, i + t, ch) {
-                if ce - cs >= t {
+            if let Some((cs, ce)) = find_run_from(text, i + t, ch)
+                && ce - cs >= t {
                     // 闭号的词边界要求（`_` 关号后不能紧跟词字符）
                     if ch == b'_' && ce < n && is_word(b[ce]) {
                         i += t;
@@ -335,32 +334,29 @@ fn scan_inline(text: &str, from: usize, out: &mut Vec<(Range<usize>, Deco)>) {
                     i = cs + t;
                     continue;
                 }
-            }
             i += t;
             continue;
         }
         // 删除线 ~~~~
         if ch == b'~' && i + 1 < n && b[i + 1] == b'~' {
-            if let Some((cs, ce)) = find_run_from(text, i + 2, b'~') {
-                if ce - cs >= 2 {
+            if let Some((cs, ce)) = find_run_from(text, i + 2, b'~')
+                && ce - cs >= 2 {
                     out.push((i..i + 2, Deco::Marker));
                     scan_emph_content(text, i + 2, cs, Deco::Strike, out);
                     out.push((cs..cs + 2, Deco::Marker));
                     i = ce;
                     continue;
                 }
-            }
             i += 2;
             continue;
         }
         // 图片 ![alt](url)
-        if ch == b'!' && i + 1 < n && b[i + 1] == b'[' {
-            if let Some((ci, cp)) = read_link(text, i + 1) {
+        if ch == b'!' && i + 1 < n && b[i + 1] == b'['
+            && let Some((ci, cp)) = read_link(text, i + 1) {
                 emit_link(i + 1, ci, cp, true, out);
                 i = (cp + 1).min(n);
                 continue;
             }
-        }
         // 链接 / 任务复选框
         if ch == b'[' {
             // 任务复选框 [ ] / [x] / [X]
@@ -559,14 +555,13 @@ impl MarkdownDecor {
         let hi = hi.min(line_count - 1);
         let version = buffer.version();
 
-        if let Some((v, _l, _h, d)) = self.key {
-            if v == version && d == self.dark && lo >= self.base_row {
+        if let Some((v, _l, _h, d)) = self.key
+            && v == version && d == self.dark && lo >= self.base_row {
                 let rel = lo - self.base_row;
-                if rel + (hi - lo) + 1 <= self.lines.len() {
+                if rel + (hi - lo) < self.lines.len() {
                     return &self.lines[rel..rel + (hi - lo) + 1];
                 }
             }
-        }
 
         let start = lo.saturating_sub(lookback);
         let mut fence: Option<Fence> = None;

@@ -154,9 +154,9 @@ impl CodeHlCache {
     }
 
     fn insert(&mut self, key: usize, value: Rc<CodeLineRuns>) {
-        if self.map.contains_key(&key) {
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.map.entry(key) {
             // 已存在：更新内容并视为最近使用（移到队尾）
-            self.map.insert(key, value);
+            e.insert(value);
             if let Some(pos) = self.lru.iter().position(|&k| k == key) {
                 self.lru.remove(pos);
                 self.lru.push_back(key);
@@ -609,12 +609,11 @@ impl MarkdownPreview {
         cx: &mut Context<Self>,
     ) {
         self.focus_handle.focus(window, cx);
-        if event.button == MouseButton::Left {
-            if let Some(hit) = self.note_hit_at(event.position) {
+        if event.button == MouseButton::Left
+            && let Some(hit) = self.note_hit_at(event.position) {
                 self.navigate_marker(hit, cx);
                 return;
             }
-        }
         let pos = event.position;
         match self.hit_test(pos) {
             Some((row, byte)) => {
@@ -715,8 +714,8 @@ impl MarkdownPreview {
     ) {
         let pos = window.mouse_position();
         if event.pressed_button == Some(MouseButton::Left) {
-            if let Some(anchor) = self.select_anchor {
-                if let Some(cur) = self.hit_test(pos) {
+            if let Some(anchor) = self.select_anchor
+                && let Some(cur) = self.hit_test(pos) {
                     let (s, e) = if (anchor.0, anchor.1) <= (cur.0, cur.1) {
                         (anchor, cur)
                     } else {
@@ -727,7 +726,6 @@ impl MarkdownPreview {
                         cx.notify();
                     }
                 }
-            }
             return;
         }
         let found = self.note_hit_at(pos);
@@ -1070,12 +1068,10 @@ impl MarkdownPreview {
             if !resolved.starts_with("http://")
                 && !resolved.starts_with("https://")
                 && !resolved.starts_with("file://")
-            {
-                if let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
+                && let Some((w, h)) = image_dimensions(std::path::Path::new(&resolved)) {
                     *img_w = Some(w);
                     *img_h = Some(h);
                 }
-            }
             *src = resolved.into();
         }
     }
@@ -1867,8 +1863,7 @@ impl Render for MarkdownPreview {
                 .highlight_search
                 .as_ref()
                 .map(|(l, q)| (*l, q.clone()))
-            {
-                if let Some(row_ix) = self.row_for_line(line) {
+                && let Some(row_ix) = self.row_for_line(line) {
                     let text = match &self.index {
                         None => self.rows.get(row_ix).map(|r| r.text.clone()),
                         Some(_) => {
@@ -1883,13 +1878,11 @@ impl Render for MarkdownPreview {
                             }
                         }
                     };
-                    if let Some(t) = text {
-                        if let Some(range) = find_text_range(&t, &query) {
+                    if let Some(t) = text
+                        && let Some(range) = find_text_range(&t, &query) {
                             hit = Some((row_ix, range));
                         }
-                    }
                 }
-            }
             let color = if hit.is_some() {
                 Some(if gpui_component::Theme::global(cx).is_dark() {
                     rgba(0xf59e0b47).into()
@@ -1953,7 +1946,7 @@ impl Render for MarkdownPreview {
                     let b = if er == abs { eb } else { rl };
                     let a = a.min(rl);
                     let b = b.min(rl);
-                    (b > a).then(|| (a..b, sel_color))
+                    (b > a).then_some((a..b, sel_color))
                 });
                 // 跳转加亮：本行是被定位的目标行 → 把 (注记号, 是否定义) 交给 render_row，
                 // 给该行对应的 `[n]` 标记加亮。

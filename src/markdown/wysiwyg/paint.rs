@@ -1010,7 +1010,7 @@ pub(crate) fn paint_card(
                 y += 22.;
             }
         }
-        BlockCard::Mermaid { .. } => {
+        BlockCard::Mermaid => {
             // 左上角小标签（弱化）。
             let tag: SharedString = "mermaid".into();
             let mut muted = theme.muted;

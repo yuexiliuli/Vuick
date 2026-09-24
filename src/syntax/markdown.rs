@@ -236,11 +236,10 @@ fn find_fence_close(text: &Rope, from_row: usize, fence: Fence) -> Option<usize>
     let n = text.lines_len();
     for r in from_row..n {
         let line = line_string(text, r);
-        if let Some((f, _lang)) = scan_block_marker(&line) {
-            if f.ch == fence.ch && f.n >= fence.n {
+        if let Some((f, _lang)) = scan_block_marker(&line)
+            && f.ch == fence.ch && f.n >= fence.n {
                 return Some(r);
             }
-        }
     }
     None
 }
@@ -378,14 +377,13 @@ fn scan_inline(line: &str, from: usize) -> LineRuns {
                 }
             }
             b'!' => {
-                if i + 1 < n && b[i + 1] == b'[' {
-                    if let Some((ci, cp)) = read_link(line, i + 1) {
+                if i + 1 < n && b[i + 1] == b'['
+                    && let Some((ci, cp)) = read_link(line, i + 1) {
                         runs.push((i..ci + 1, "string"));
                         runs.push((ci + 1..cp + 1, "function"));
                         i = cp + 1;
                         continue;
                     }
-                }
                 i += 1;
             }
             b'[' => {
@@ -423,11 +421,10 @@ fn read_link(line: &str, open: usize) -> Option<(usize, usize)> {
     }
     let ci = ci?;
     let after = ci + 1;
-    if after < b.len() && b[after] == b'(' {
-        if let Some(cp) = b[after + 1..].iter().position(|&x| x == b')') {
+    if after < b.len() && b[after] == b'('
+        && let Some(cp) = b[after + 1..].iter().position(|&x| x == b')') {
             return Some((ci, after + 1 + cp));
         }
-    }
     Some((ci, ci))
 }
 
@@ -516,12 +513,11 @@ fn normalize_runs(mut runs: LineRuns, core: usize) -> LineRuns {
         if s >= e {
             continue;
         }
-        if let Some(last) = out.last_mut() {
-            if last.1 == name && last.0.end == s {
+        if let Some(last) = out.last_mut()
+            && last.1 == name && last.0.end == s {
                 last.0 = last.0.start..e;
                 continue;
             }
-        }
         out.push((s..e, name));
     }
     out
