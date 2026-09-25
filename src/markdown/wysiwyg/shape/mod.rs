@@ -16,7 +16,9 @@ use crate::markdown::ir::IrKind;
 use crate::markdown::parse::inline_style::{self, MathRegion};
 use crate::markdown::parse::recognition;
 use crate::markdown::parse::{BlockMeta, RowKind, RunKind, TableAlign};
-use crate::syntax::{github_theme_cached, parse_code_lines, resolve_line_styles_with};
+use crate::syntax::{
+    CodeLineRuns, github_theme_cached, parse_code_lines, resolve_line_styles_with,
+};
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
 /// 行内代码：等宽字体 + `code_inline_fg` 文字色（**无 run 背景**——圆角 pill 由
@@ -528,6 +530,7 @@ pub(crate) fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<
 /// 文字再内衬 12 —— 命中/光标/选区经通用 `r.x_off` 对齐，与预览逐像素一致。
 pub(crate) fn shape_code_row(
     r: DocRow,
+    editor: &WyEditor,
     window: &mut Window,
     theme: &WyTheme,
     width: Pixels,
@@ -575,20 +578,29 @@ pub(crate) fn shape_code_row(
     let lh = theme.code_line();
     let mono = theme.mono.clone();
     let base = theme.text;
-    // 语法高亮：按围栏语言整块解析一次（与预览同源）。
-    let hl_runs = match lang.as_deref() {
+    // 语法高亮：小/廉价块同步整块解析（首帧即上色）；大中型块（>8 内容行，非 TOML）
+    // 走后台解析缓存——debug 下 syntect 整块解析可达 ~300ms/块，绝不能在主线程串行做；
+    // 缓存未就绪先按纯文本渲染（`request_code_parse` 触发后台解析，就绪后下一帧自动
+    // 上色），首次滚动进视野不再冻结一帧。
+    let t_parse = crate::prof::begin();
+    let code_join = code_lines.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join("\n");
+    let hl_runs: Option<CodeLineRuns> = match lang.as_deref() {
         Some(l) if !l.is_empty() && !code_lines.is_empty() => {
-            let mut code = String::new();
-            for (i, l) in code_lines.iter().enumerate() {
-                if i > 0 {
-                    code.push('\n');
+            if code_lines.len() > 8 && !l.eq_ignore_ascii_case("toml") {
+                match editor.code_parse_lookup(l, &code_join) {
+                    CodeParseLookup::Ready(runs) => runs,
+                    CodeParseLookup::NotReady => {
+                        editor.request_code_parse(l, &code_join);
+                        None
+                    }
                 }
-                code.push_str(l.as_ref());
+            } else {
+                parse_code_lines(l, &code_join)
             }
-            parse_code_lines(l, &code)
         }
         _ => None,
     };
+    crate::prof::end("wy.code.parse", t_parse);
     let resolver = hl_runs.as_ref().map(|_| github_theme_cached(theme.is_dark));
     let mut wrapped = Vec::new();
     let mut sub_heights = Vec::with_capacity(code_lines.len().max(1));
@@ -619,11 +631,13 @@ pub(crate) fn shape_code_row(
         } else {
             vec![gpui::TextRun { len: line.len(), font: mono.clone(), color: base, ..Default::default() }]
         };
+        let t_st = crate::prof::begin();
         let v = window
             .text_system()
             .shape_text(line.clone(), fs, &runs, None, None)
             .map(|ls| ls.into_vec())
             .unwrap_or_default();
+        crate::prof::end("wy.code.shapetext", t_st);
         let rows = v.iter().map(|wl| wl.wrap_boundaries().len() + 1).sum::<usize>().max(1);
         let sh = lh * rows as f32;
         height += sh;
@@ -870,7 +884,7 @@ pub(crate) fn shape_docrow(
     base_font: &gpui::Font,
 ) -> ShapedRow {
     match r.kind {
-        IrKind::Code => shape_code_row(r, window, theme, width),
+        IrKind::Code => shape_code_row(r, editor, window, theme, width),
         IrKind::Table => shape_table_row(r, window, theme.font_size, theme, base_font),
         IrKind::Image => shape_image_row(r, editor, avail),
         _ => shape_text_row_decorated(r, editor, window, width, theme, base_font),

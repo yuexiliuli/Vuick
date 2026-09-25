@@ -296,6 +296,14 @@ pub struct WyEditor {
     math_color: RefCell<Option<Hsla>>,
     /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
     math_gen: Cell<u64>,
+    /// 代码块高亮解析缓存（后台 syntect 整块解析；`request_code_parse` 置 Pending、
+    /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。`code_parse_gen`
+    /// 进 shape_key → 就绪后按下帧重建用高亮行替换占位纯文本行。
+    code_parse: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
+    /// 本帧登记的待后台解析队列 `(语言, 代码)`（`sync_code_parse` 每帧清空消费）。
+    code_parse_need: RefCell<Vec<CodeParseKey>>,
+    /// 代码高亮就绪代数：进 shape_key（同 `math_gen`）。
+    code_parse_gen: Cell<u64>,
     /// 数学显示行数缓存（见字段声明）。
     math_line_map: RefCell<std::collections::HashMap<String, usize>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
@@ -780,6 +788,29 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
     }
 }
 
+/// 代码块高亮解析缓存键：`(语言名, 代码全文)`。`parse_code_lines` 是纯计算
+/// （与预览共用全局 `SYNTAX_SET`/`SYNTAX_CACHE`，不依赖 window/平台）→ 可在
+/// background executor 跑；就绪后 `code_parse_gen++` 进 shape_key，旧「纯文本行」
+/// 缓存自然 miss 重排上色（对齐 `math_gen` 的地位）。
+pub(crate) type CodeParseKey = (SharedString, SharedString);
+
+/// [`CodeParseKey`] 对应的缓存条目（后台线程写、主线程读）。
+#[derive(Clone)]
+pub(crate) enum CodeParseState {
+    /// 解析在途（防重复发起）。
+    Pending,
+    /// 已解析；`None` = 该语言无高亮（按纯文本渲染）。
+    Done(Option<crate::syntax::CodeLineRuns>),
+}
+
+/// [`WyEditor::code_parse_lookup`] 的返回（shape 期用）。
+pub(crate) enum CodeParseLookup {
+    /// 已就绪：直接用其着色（`None` = 纯文本）。
+    Ready(Option<crate::syntax::CodeLineRuns>),
+    /// 未就绪：登记后台解析，本帧先按纯文本渲染（就绪后自动上色）。
+    NotReady,
+}
+
 /// 跨帧滚动预热进度（见 [`element::prewarm_band`]）：方向只由带序号跨界
 /// （`band.top/512` 取整变化）决定，量子内小滚不换向；预算按块数硬上限；
 /// `bias` = 目标带内滑动窗起点，每帧推进、回绕兜底（保证总有进度、永不卡死）。
@@ -863,6 +894,11 @@ impl WyEditor {
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
             math_gen: Cell::new(0),
+            code_parse: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            code_parse_need: RefCell::new(Vec::new()),
+            code_parse_gen: Cell::new(0),
             // 数学**显示行数**缓存（键=去定界符源）：`math_card_height` 回退分支按行数
             // 估高——`math_display_lines` 会对每个源做 LaTeX→Unicode 转换，3000 个数学
             // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
@@ -2017,6 +2053,78 @@ impl WyEditor {
             self.math_line_map.borrow_mut().insert(src.to_string(), n);
         }
         n
+    }
+
+    /* ---------- 代码块高亮：后台 syntect 整块解析（把 debug 下 ~300ms/块移出主线程） ---------- */
+
+    /// 查代码块高亮解析缓存：就绪返回高亮 run，否则按 NotReady 处理。
+    pub(crate) fn code_parse_lookup(&self, lang: &str, code: &str) -> CodeParseLookup {
+        let m = self.code_parse.lock().unwrap();
+        let key = (lang.into(), code.into());
+        match m.get(&key) {
+            Some(CodeParseState::Done(runs)) => CodeParseLookup::Ready(runs.clone()),
+            _ => CodeParseLookup::NotReady,
+        }
+    }
+
+    /// shape 期登记一个需要后台解析的代码块（幂等：已在途/已就绪则跳过）。
+    pub(crate) fn request_code_parse(&self, lang: &str, code: &str) {
+        let key: CodeParseKey = (lang.into(), code.into());
+        {
+            let mut m = self.code_parse.lock().unwrap();
+            if m.contains_key(&key) {
+                return;
+            }
+            m.insert(key.clone(), CodeParseState::Pending);
+        }
+        let mut need = self.code_parse_need.borrow_mut();
+        if !need.iter().any(|k| k == &key) {
+            need.push(key);
+        }
+    }
+
+    /// 代码块高亮就绪代数（进 shape_key → 缓存内的旧纯文本行 miss 重排上色）。
+    pub(crate) fn code_parse_gen(&self) -> u64 {
+        self.code_parse_gen.get()
+    }
+
+    /// 消费本帧登记的代码块后台解析请求（paint 期调用，对齐 `sync_math` 的可见带
+    /// 懒解析）。syntect 整块解析是纯计算 → background executor 跑，完成后写缓存
+    /// + 代数自增 + 失效帧 → 主线程下一帧用高亮行重建（不再 ~300ms 阻塞滚动/整形帧）。
+    pub(crate) fn sync_code_parse(&mut self, cx: &mut Context<Self>) {
+        let jobs = std::mem::take(&mut *self.code_parse_need.borrow_mut());
+        if jobs.is_empty() {
+            return;
+        }
+        for (lang, code) in jobs {
+            let cache = self.code_parse.clone();
+            cx.spawn(async move |this, cx| {
+                // 内层 async move 需要 'static 自有值：克隆一份进去，外层保留原值插缓存。
+                let lang2 = lang.clone();
+                let code2 = code.clone();
+                let result: Option<crate::syntax::CodeLineRuns> = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::syntax::parse_code_lines(lang2.as_ref(), code2.as_ref())
+                    })
+                    .await;
+                {
+                    let mut m = cache.lock().unwrap();
+                    m.insert((lang.clone(), code.clone()), CodeParseState::Done(result));
+                }
+                let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(ecx));
+            })
+            .detach();
+        }
+    }
+
+    /// 一个代码块高亮就绪：代数+1（旧纯文本行缓存失效）+ 帧缓存置空，强制下帧重建。
+    /// 批量完成集中失效一次，避免逐块打断帧（对齐 `on_math_ready`）。
+    fn on_code_parse_ready(&mut self, cx: &mut Context<Self>) {
+        self.code_parse_gen
+            .set(self.code_parse_gen.get().wrapping_add(1));
+        *self.frame.borrow_mut() = None;
+        cx.notify();
     }
 
     /// 对**当前带内可见**公式发起离屏排版——按「只渲染窗口可见区域」原则（对齐

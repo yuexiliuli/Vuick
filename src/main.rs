@@ -61,6 +61,12 @@ fn main() {
             crate::markdown::wysiwyg::bind_keys(cx);
             // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
             crate::syntax::install_github_theme(cx);
+            // 后台预热 syntect 全局语法集与明暗色板（A2）：把「首次代码块同步
+            // 反序列化几 MB」的一次性成本移出滚动路径 → 首张图片附近不再卡那一下。
+            // LazyLock 并发安全，主线程先命中只会短暂阻塞。
+            cx.background_executor()
+                .spawn(async move { crate::syntax::prewarm() })
+                .detach();
             // 覆盖组件库默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，
             // 否则回车符会作为普通字符参与代码编辑器的布局。
             cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);

@@ -419,7 +419,7 @@ pub(crate) fn build_frame(
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
     // 行整形缓存（滚动/带重建复用）：键 = epoch ^ mgen；caret 严格落在含行内公式的
     // 文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由 `replace_range` 负责。
-    let shape_key = epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let shape_key = (epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) ^ editor.code_parse_gen();
     let _t_p2 = crate::prof::begin();
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     {
@@ -721,7 +721,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits）。
     let width_bits = f32::from(frame.width).to_bits();
     let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits);
-    let sk = epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let sk = (epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) ^ e.code_parse_gen();
     let caret_line = e.row_col(e.caret()).0;
     let plan = e.fold_plan_rc();
     let doc = e.doc();
@@ -759,7 +759,14 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
                 .block_meta(k)
                 .and_then(|m| doc.block_meta(k + 1).map(|n| n.byte as i64 - m.byte as i64))
                 .unwrap_or(0);
-            span_lines > 64 || span_bytes > 4096
+            // 中大型代码块（≥8 行）也按「大块」跳过预热：syntect 整块解析是 debug 下
+            // 的主要单块成本（实测 14 行 rust 块 ~300ms），预热 8ms 预算拦不住它——
+            // 交进带时 Pass2 权威整形（那时本来要渲染），滚动帧不被投机整形拖垮。
+            let is_medium_code = doc
+                .block_meta(k)
+                .map(|m| m.kind == RowKind::Code && s1.saturating_sub(s0) > 8)
+                .unwrap_or(false);
+            span_lines > 64 || span_bytes > 4096 || is_medium_code
         };
         // 与 Pass2 `blocked` 同判据：折叠/math 块不物化整形行。
         let blocked = match &plan {

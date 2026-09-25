@@ -800,6 +800,12 @@ impl Element for WyEditorElement {
         self.editor
             .update(cx, |e, ecx| e.sync_math(ecx, f));
         crate::prof::end("wy.paint.synmath", _t_sm);
+        // 代码块高亮后台解析（可见带懒加载）：消费本帧登记的 `request_code_parse`，
+        // 后台跑 syntect 整块解析；就绪后 `code_parse_gen++` → 下帧高亮行重建。
+        let _t_sp = crate::prof::begin();
+        self.editor
+            .update(cx, |e, ecx| e.sync_code_parse(ecx));
+        crate::prof::end("wy.paint.syncparse", _t_sp);
         let origin = bounds.origin;
         // 首帧光栅预热（一次/进程）：先打热 DWrite 彩字管线再画真实行（见
         // [`warm_emoji_rasterizer`]——冷进程首次 COLR 光栅失败 → emoji 变空白/方框）。

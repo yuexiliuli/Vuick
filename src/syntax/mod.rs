@@ -1035,6 +1035,27 @@ pub(crate) fn github_theme_cached(dark: bool) -> &'static HighlightTheme {
     if dark { &DARK } else { &LIGHT }
 }
 
+/// 启动期后台预热（A2）：语法高亮的一次性同步成本从「首次滚到带语言代码块」的
+/// 那一帧挪到启动后台线程——
+/// - `SYNTAX_SET`：`SyntaxSet::load_defaults_newlines` 反序列化几 MB 默认语法集
+///   （已实测是首次滚动到 ` ```rust ` 附近卡顿的主因，见 git/仓库分析）；
+/// - `SYNTAX_CACHE`：预填常用语言 → 首个代码块不再对全集做首次 `find_syntax` 扫描；
+/// - `github_theme_cached`：明/暗两张色板各一份，首次上色不再现场构建主题。
+/// `LazyLock`/`Mutex` 并发安全：可在后台线程调用，主线程若抢先命中只会短暂阻塞。
+pub(crate) fn prewarm() {
+    // 触发全局语法集加载（进程内仅一次）。
+    let _ = &*SYNTAX_SET;
+    // 预填常用语言映射；未知/无命中（如 js 走扩展名）返回 None，无害。
+    for lang in [
+        "rust", "sh", "bash", "python", "json", "yaml", "c", "cpp", "go", "typescript",
+    ] {
+        let _ = find_syntax(lang);
+    }
+    // 明暗 GitHub 色板。
+    let _ = github_theme_cached(false);
+    let _ = github_theme_cached(true);
+}
+
 /// 项目代码块实现的**对外形状**：给围栏语言与块内文本（`\n` 连接、无尾换行），
 /// 返回**块级字节偏移**、无缝隙的 [`HighlightStyle`] run —— 供 WYSIWYG live 的
 /// `set_code_highlighter` 钩子使用，语义/配色与预览代码块完全一致
