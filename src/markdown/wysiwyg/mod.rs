@@ -300,8 +300,9 @@ pub struct WyEditor {
     /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。`code_parse_gen`
     /// 进 shape_key → 就绪后按下帧重建用高亮行替换占位纯文本行。
     code_parse: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
-    /// 本帧登记的待后台解析队列 `(语言, 代码)`（`sync_code_parse` 每帧清空消费）。
-    code_parse_need: RefCell<Vec<CodeParseKey>>,
+    /// 本帧登记的待后台解析队列 `((语言, 代码), 块 src_line)`（`sync_code_parse` 每帧
+    /// 清空消费）。`src_line` 用于完成时的**带内门控**（块还在带内才立即重建帧上色）。
+    code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
     /// 代码高亮就绪代数：进 shape_key（同 `math_gen`）。
     code_parse_gen: Cell<u64>,
     /// 数学显示行数缓存（见字段声明）。
@@ -2068,7 +2069,8 @@ impl WyEditor {
     }
 
     /// shape 期登记一个需要后台解析的代码块（幂等：已在途/已就绪则跳过）。
-    pub(crate) fn request_code_parse(&self, lang: &str, code: &str) {
+    /// `src_line` 供完成时的带内门控使用。
+    pub(crate) fn request_code_parse(&self, lang: &str, code: &str, src_line: usize) {
         let key: CodeParseKey = (lang.into(), code.into());
         {
             let mut m = self.code_parse.lock().unwrap();
@@ -2078,8 +2080,8 @@ impl WyEditor {
             m.insert(key.clone(), CodeParseState::Pending);
         }
         let mut need = self.code_parse_need.borrow_mut();
-        if !need.iter().any(|k| k == &key) {
-            need.push(key);
+        if !need.iter().any(|(k, _)| k == &key) {
+            need.push((key, src_line));
         }
     }
 
@@ -2096,7 +2098,7 @@ impl WyEditor {
         if jobs.is_empty() {
             return;
         }
-        for (lang, code) in jobs {
+        for ((lang, code), src_line) in jobs {
             let cache = self.code_parse.clone();
             cx.spawn(async move |this, cx| {
                 // 内层 async move 需要 'static 自有值：克隆一份进去，外层保留原值插缓存。
@@ -2112,19 +2114,28 @@ impl WyEditor {
                     let mut m = cache.lock().unwrap();
                     m.insert((lang.clone(), code.clone()), CodeParseState::Done(result));
                 }
-                let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(ecx));
+                let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(src_line, ecx));
             })
             .detach();
         }
     }
 
-    /// 一个代码块高亮就绪：代数+1（旧纯文本行缓存失效）+ 帧缓存置空，强制下帧重建。
-    /// 批量完成集中失效一次，避免逐块打断帧（对齐 `on_math_ready`）。
-    fn on_code_parse_ready(&mut self, cx: &mut Context<Self>) {
+    /// 一个代码块高亮就绪：`code_parse_gen` **总是自增**（使缓存的旧纯文本行在 shape_key
+    /// 层面失效，滚回时可重排上色）；仅当块仍在本帧带内（`frame.rows` 含其 src_line）
+    /// 才立即 `frame=None + notify` 强制本帧换高亮——带外完成只自增、不打断帧
+    /// （对齐 `on_math_ready` 的带内门控，消除多块并发完成时的重建 churn）。
+    fn on_code_parse_ready(&mut self, src_line: usize, cx: &mut Context<Self>) {
         self.code_parse_gen
             .set(self.code_parse_gen.get().wrapping_add(1));
-        *self.frame.borrow_mut() = None;
-        cx.notify();
+        let in_band = self
+            .frame
+            .borrow()
+            .as_ref()
+            .is_some_and(|f| f.rows.iter().any(|r| r.src_line == src_line));
+        if in_band {
+            *self.frame.borrow_mut() = None;
+            cx.notify();
+        }
     }
 
     /// 对**当前带内可见**公式发起离屏排版——按「只渲染窗口可见区域」原则（对齐

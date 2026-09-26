@@ -590,7 +590,7 @@ pub(crate) fn shape_code_row(
                 match editor.code_parse_lookup(l, &code_join) {
                     CodeParseLookup::Ready(runs) => runs,
                     CodeParseLookup::NotReady => {
-                        editor.request_code_parse(l, &code_join);
+                        editor.request_code_parse(l, &code_join, r.src_line);
                         None
                     }
                 }
