@@ -705,6 +705,20 @@ impl Element for WyEditorElement {
             });
         }
 
+        // 字号缩放**视口锚定**（WyEditor 自驱动）：字号变化后 frame 逐帧把「估计高」
+        // 细化为「整形真值」，`block_top` 缓慢变动——这里在 WY 自己的每帧 prepaint 里
+        // 重钉视口顶，直到恢复目标收敛才消费锚点（对齐 `markdown/view`、`editor` 的
+        // Ctrl+滚轮缩放不滚动）。`done` 前 `window.refresh()` 保证被钉的目标逐帧生效；
+        // 收敛（`done`）后不再请求帧，避免空转。
+        if let Some((target, done)) = self.editor.read(cx).advance_zoom_restore() {
+            if let Some((vh, pad_y)) = self.editor.read(cx).host_scroll() {
+                vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(target + pad_y))));
+                if !done {
+                    window.refresh();
+                }
+            }
+        }
+
         // 光标可视位置（元素局部）→ IME bounds。
         let frame = {
             let e = self.editor.read(cx);

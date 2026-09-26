@@ -44,6 +44,20 @@ pub(crate) fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
     (px(fs * 1.45), px(fs * 0.88), px(fs * 1.3))
 }
 
+/// 由正文字号推导第 n 级标题的字号与行高（预览与 WYSIWYG 共用，见
+/// [`StyleParams::heading_metrics`]）。设计字号基准集中在
+/// `config::markdown::HEADING_DESIGN_SIZES` / `HEADING_DESIGN_BASE` / `HEADING_LINE_RATIO`
+/// （正文 14px 参考字号下 h1=20 h2=18 h3/4=16 其余 15），其余字号按
+/// `body_fs / HEADING_DESIGN_BASE` 等比缩放，标题相对正文的比例保持不变。
+pub(crate) fn heading_metrics_for_size(body_fs: f32, level: u8) -> (Pixels, Pixels) {
+    let design = match level {
+        1..=6 => crate::config::markdown::HEADING_DESIGN_SIZES[level as usize],
+        _ => crate::config::markdown::HEADING_DESIGN_SIZES[6],
+    };
+    let fs = body_fs / crate::config::markdown::HEADING_DESIGN_BASE * design;
+    (px(fs), px(fs * crate::config::markdown::HEADING_LINE_RATIO))
+}
+
 impl StyleParams {
     /// 从主题构建排版参数；`font_override` 可覆盖正文/代码字号（EPUB 缩放字号用）。
     pub(crate) fn from_theme_with_font(cx: &mut App, font_override: Option<f32>) -> Self {
@@ -51,22 +65,12 @@ impl StyleParams {
         let tokens = theme.semantic_tokens();
         let colors = tokens.colors;
         let typo = tokens.typography;
-        let sm = typo.sm;
-        let mono = typo.mono_md;
-        // 正文基准字号：默认用主题 sm；有覆盖时按其缩放等宽字体（等宽按 0.85 比例）
-        let (para, line, code, code_line) = match font_override {
-            Some(fs) => {
-                let fs = fs.max(9.0);
-                let (pl, cs, cl) = typography_for_size(fs);
-                (px(fs), pl, cs, cl)
-            }
-            None => (
-                sm.size,
-                sm.line_height,
-                mono.size,
-                mono.line_height,
-            ),
-        };
+        // 正文基准字号：默认与编辑区 / WYSIWYG 对齐（layout::DEFAULT_FONT_SIZE），不再取
+        // 主题 sm——否则预览默认字号与编辑器不一致，三处无法统一调节。有覆盖时按覆盖值缩放；
+        // 正文字号一变，代码/行高系数统一走 `typography_for_size`（同一缩放来源）。
+        let fs = font_override.unwrap_or(crate::config::layout::DEFAULT_FONT_SIZE).max(9.0);
+        let (pl, cs, cl) = typography_for_size(fs);
+        let (para, line, code, code_line) = (px(fs), pl, cs, cl);
         let is_dark = theme.is_dark();
         // 引用旧 render.rs：引述 = 浅灰底 + 粗左边框；表头 = 浅灰底。暗色模式配深色变体。
         let (quote_bg, table_head_bg) = if is_dark {
@@ -117,15 +121,12 @@ impl StyleParams {
         }
     }
 
-    /// 第 n 级标题的字号与行高（借鉴旧 render.rs：h1=20 h2=18 h3=16 其余 15）。
+    /// 第 n 级标题的字号与行高（基准同旧 render.rs：正文 14px 时 h1=20 h2=18 h3/4=16 其余 15）。
+    /// 随正文字号 **等比缩放**——编辑区/预览/WYSIWYG 的 Ctrl+滚轮/菜单调字号时标题一起
+    /// 变大变小，保持标题相对正文的比例固定。WYSIWYG 的 `WyTheme::set_font_size` 也走
+    /// [`heading_metrics_for_size`] 同步重算，两处标题永远一致。
     pub(crate) fn heading_metrics(&self, level: u8) -> (Pixels, Pixels) {
-        let fs = match level {
-            1 => px(20.),
-            2 => px(18.),
-            3 | 4 => px(16.),
-            _ => px(15.),
-        };
-        (fs, px(fs.as_f32() * 1.45))
+        heading_metrics_for_size(self.para_size.as_f32(), level)
     }
 
     /// 普通正文行的估算高度（px）：段落/列表/引述等多数行的实际高度都接近这个值。

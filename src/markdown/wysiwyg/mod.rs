@@ -143,14 +143,21 @@ impl WyTheme {
     }
 
     /// 由正文字号覆盖更新尺寸相关字段（缩放系数同样只来自
-    /// [`crate::markdown::view::style::typography_for_size`]，不在此重复定义）。
+    /// [`crate::markdown::view::style`] 的 `typography_for_size` / `heading_metrics_for_size`，
+    /// 不在此重复定义）。标题字号/行高也随正文字号等比缩放——预览/WYSIWYG 的 Ctrl+滚轮、
+    /// 菜单调字号时 #/##/### 一起变大变小。
     pub(crate) fn set_font_size(&mut self, size: Pixels) {
         self.font_size = size;
-        let (pl, cs, cl) =
-            crate::markdown::view::style::typography_for_size(f32::from(size).max(9.));
+        let body = f32::from(size).max(9.);
+        let (pl, cs, cl) = crate::markdown::view::style::typography_for_size(body);
         self.para_line = pl;
         self.code_size = cs;
         self.code_line = cl;
+        for lv in 1..=6u8 {
+            let (fs, lh) = crate::markdown::view::style::heading_metrics_for_size(body, lv);
+            self.heading_fs[lv as usize] = fs;
+            self.heading_lh[lv as usize] = lh;
+        }
     }
 
     /// 正文行高（预览 `para_line`）。
@@ -213,6 +220,25 @@ pub struct WyEditor {
     frame: RefCell<Option<std::rc::Rc<element::Frame>>>,
     /// 本帧元素在窗口中的布局 bounds（paint 写入；鼠标命中时全局坐标 → 元素局部）。
     last_bounds: Cell<Option<gpui::Bounds<Pixels>>>,
+    /// 字号变化的**缩放锚点** `(块下标, 块内比例)`：`set_font_size` 重排前用
+    /// [`Self::viewport_top_px`]（宿主推入的视口顶部）捕捉，帧按新字号重建后由
+    /// `advance_zoom_restore`（element prepaint 自驱动）换算出新的滚动目标并写回
+    /// `ScrollHandle`——Ctrl+滚轮缩放不带动滚动位置（对齐 `markdown/view`、`editor`
+    /// 的视口锚定）。
+    zoom_anchor: RefCell<Option<(usize, f32)>>,
+    /// 宿主每帧推入的「当前视口顶部 px」（元素局部 y，来自 `#live-scroll` 的
+    /// `ScrollHandle::offset` + #live-body 顶部内衬换算）。
+    viewport_top_px: Cell<f32>,
+    /// 缩放恢复**收敛状态**：`advance_zoom_restore` 逐帧随 `block_top/height` 细化重新计算
+    /// 目标（高度估计→整形真值逐帧收敛），直到目标位移 < [`Self::ZOOM_ANCHOR_EPS`] 或
+    /// 超过 [`Self::ZOOM_ANCHOR_MAX_APPLIES`] 帧才消费锚点——避免一次性按未收敛高度
+    /// 恢复导致视口继续漂移。
+    zoom_last_target: Cell<Option<f32>>,
+    zoom_applies: Cell<u32>,
+    /// 宿主 WYSIWYG 滚动容器句柄 + 内容顶部内衬（`#live-body` py）。注入后
+    /// `advance_zoom_restore` 才能在 element prepaint 逐帧把缩放恢复写回 `ScrollHandle`；
+    /// 未注入（独立测试）时缩放锚点直接丢弃。
+    host_scroll: RefCell<Option<(gpui::ScrollHandle, f32)>>,
     /// 内容代数：任何文本变更自增；`request_layout` 用它判断帧缓存是否仍有效。
     content_gen: Cell<u64>,
     /// 可视带（窗口坐标→元素局部 y，量程化）：prepaint 用 `bounds.origin.y` +
@@ -412,6 +438,15 @@ pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32) -> u64 {
     let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
     let x = a ^ b.rotate_left(32);
     x ^ x >> 33
+}
+
+/// 与 element prepaint 同式的可视带量程（q=512）：缩放锚定偏移写回后据此推导新带，
+/// 保证 `prepare_font_zoom` 重建的帧与 measure/prepaint 一致（避免跨界二次重建与
+/// `shape_band` 瞬态不一致）。`top` = 元素局部 y 的视口顶部（内容坐标）。
+pub(crate) fn zoom_band_for_top(top: f32, viewport_h: Pixels) -> (f32, f32) {
+    let q = 512.;
+    let vh = viewport_h.as_f32().max(1.);
+    ((((top - vh) / q).floor() * q).max(0.), ((top + 2. * vh) / q).ceil() * q)
 }
 
 /// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `content_gen` 缓存，滚动 /
@@ -848,6 +883,12 @@ impl Prewarm {
 }
 
 impl WyEditor {
+    /// 缩放锚点收敛判定：相邻两帧恢复目标位移小于此值（px）即视为高度已稳定并消费锚点。
+    pub(crate) const ZOOM_ANCHOR_EPS: f32 = 0.5;
+    /// 缩放锚点收敛兜底：最多逐帧施加这么多次后强制消费（防高度持续细化的极端文档上
+    /// 锚点永不收敛、宿主每帧覆盖用户滚动）。
+    pub(crate) const ZOOM_ANCHOR_MAX_APPLIES: u32 = 30;
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let ts = window.text_style();
         let fs: Pixels = ts.font_size.to_pixels(window.rem_size());
@@ -859,6 +900,11 @@ impl WyEditor {
             theme: WyTheme::from_style(&p, ts.font(), fs),
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
+            zoom_anchor: RefCell::new(None),
+            viewport_top_px: Cell::new(0.0),
+            zoom_last_target: Cell::new(None),
+            zoom_applies: Cell::new(0),
+            host_scroll: RefCell::new(None),
             content_gen: Cell::new(0),
             shape_band: Cell::new(None),
             prewarm: RefCell::new(Prewarm::default()),
@@ -935,12 +981,16 @@ impl WyEditor {
     }
 
     /// 显式设置字号（应用把全局字号同步进来；变更新帧缓存）。不读窗口 text_style，
-    /// 保证 measure/prepaint 两阶段一致。字号只影响正文/代码尺寸，标题按
-    /// [`StyleParams::heading_metrics`] 固定；缩放系数见 `typography_for_size`。
+    /// 保证 measure/prepaint 两阶段一致。字号不只影响正文/代码尺寸，标题也按
+    /// `StyleParams::heading_metrics` 等比缩放（见 `WyTheme::set_font_size`）。
     pub fn set_font_size(&mut self, size: Pixels) {
         if self.theme.font_size == size {
             return;
         }
+        // 缩放锚点：重排前记录视口顶部内容点，帧按新字号重建后由 element prepaint
+        // 自驱动滚回（`advance_zoom_restore`）——Ctrl+滚轮缩放不带动滚动位置，
+        // 对齐 view/editor。
+        self.capture_zoom_anchor();
         self.theme.set_font_size(size);
         *self.frame.borrow_mut() = None;
         // 同 `set_theme`：字号变 → 基础布局（px）失效。
@@ -948,6 +998,161 @@ impl WyEditor {
         // 字号变 → 行整形（宽/高）也失效。
         self.shape_rows.borrow_mut().clear();
         self.notdef_retry.borrow_mut().clear();
+    }
+
+    /// 字号变化的**渲染期精确锚定**：在宿主 render（prepaint 读宿主滚动偏移**之前**）
+    /// 按新字号重建窗口化帧，并把新布局里锚点块（缩放前视口顶部内容点）的精确位置
+    /// 立即写回宿主 `ScrollHandle`——重排帧一开始就精确定位，不产生「旧偏移 × 新高度」
+    /// 的中间错位帧（消除放大/缩小时的向上/向下跳动）。
+    ///
+    /// prepaint 的 stale 判定（rgen/igen/mgen/width/band）不含字号，帧已在此重建 →
+    /// 本帧 prepaint 复用该帧不二次重建。锚点保留给 `advance_zoom_restore` 做带边缘/
+    /// 细化的小幅收敛（带内块 build_frame 已整形真值，通常立即收敛）。
+    pub(crate) fn prepare_font_zoom(&mut self, new_fs: Pixels, window: &mut Window) {
+        if self.theme.font_size == new_fs {
+            return;
+        }
+        // 1) 用旧帧捕捉缩放锚点（宿主已推入 viewport_top）。
+        self.capture_zoom_anchor();
+        // 2) 记住当前宽/带，应用新字号并作废字号相关缓存（同 set_font_size）。
+        let width = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f.width)
+            .unwrap_or(px(800.));
+        let band = self.shape_band().unwrap_or((0., 5000.));
+        self.theme.set_font_size(new_fs);
+        *self.block_layout.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
+        // 3) 渲染期重建窗口化帧 → 拿到新布局的精确块 top/height。
+        let frame = element::build_frame(&*self, window, width, band);
+        // 4) 锚点块在新布局里的精确位置 = 恢复目标（元素局部 y）。
+        let target = {
+            let anchor = *self.zoom_anchor.borrow();
+            match anchor {
+                Some((block, frac)) => {
+                    let count = frame.block_count();
+                    let block = block.min(count.saturating_sub(1));
+                    let h = frame.block_height(block).max(1.);
+                    frame.block_top(block) + frac * h
+                }
+                None => 0.0,
+            }
+        };
+        // 5) 写回宿主滚动句柄，并按「锚定后的内容顶」推导新可视带（与 element prepaint
+        //    的 band 计算同式）——若带跨界，直接以新带再建一帧并发布给 `shape_band`，
+        //    让本帧 measure/prepaint 复用的都是同一帧：既避免「prepare 用旧带 / prepaint
+        //    用新带」的冗余重建，也消除两者之间 `shape_band` 的瞬态不一致。
+        let host = self.host_scroll.borrow().clone();
+        let final_band = if let Some((vh, pad_y)) = host {
+            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(target + pad_y))));
+            zoom_band_for_top(target + pad_y, window.viewport_size().height)
+        } else {
+            band
+        };
+        let frame = if final_band != band {
+            self.set_shape_band(Some(final_band));
+            element::build_frame(&*self, window, width, final_band)
+        } else {
+            frame
+        };
+        *self.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+    }
+
+    /// 宿主每帧推入当前视口顶部 px（元素局部 y，>=0）。缩放锚点 `capture_zoom_anchor`
+    /// 以此为准；宿主用 `#live-scroll` 的 `ScrollHandle::offset()` 减去 #live-body 顶部
+    /// 内衬（见 app::panes）得到。
+    pub(crate) fn set_viewport_top(&self, top_px: f32) {
+        self.viewport_top_px.set(top_px.max(0.));
+    }
+
+    /// 第 `top_px`（元素局部 y）落在的块 + 块内比例：`(块下标, (top − 块顶)/块高)`。
+    /// 供缩放锚点捕捉与（测试）断言缩放后视口顶部内容点不变。
+    pub(crate) fn block_of_px(&self, top_px: f32) -> Option<(usize, f32)> {
+        let f = self.frame.borrow().clone()?;
+        let n = f.block_count();
+        if n == 0 {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if f.block_top(mid) <= top_px {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let block = lo.saturating_sub(1).min(n - 1);
+        let h = f.block_height(block).max(1.);
+        Some((block, ((top_px - f.block_top(block)) / h).clamp(0.0, 1.0)))
+    }
+
+    /// 重排前捕捉缩放锚点：当前视口顶部 px → 落在的块 + 块内比例。
+    fn capture_zoom_anchor(&self) {
+        if let Some(a) = self.block_of_px(self.viewport_top_px.get()) {
+            *self.zoom_anchor.borrow_mut() = Some(a);
+        }
+    }
+
+    /// 宿主把 WYSIWYG 宿主滚动容器（`ScrollHandle`）与内容顶部内衬注入；`None` =
+    /// 非宿主（独立测试/未进入 live）时缩放恢复不驱动滚轮。句柄与内衬已被当前值覆盖
+    /// 时直接早退——宿主每帧都调，避免反复 RefCell 写 + Rc 克隆。
+    pub(crate) fn set_host_scroll(&mut self, handle: Option<gpui::ScrollHandle>, pad_y: f32) {
+        if handle.is_some()
+            && self.host_scroll.borrow().as_ref().is_some_and(|(_, p)| *p == pad_y)
+        {
+            return;
+        }
+        *self.host_scroll.borrow_mut() = handle.map(|h| (h, pad_y));
+    }
+
+    /// 当前宿主滚动句柄（供元素 prepaint 写回缩放恢复目标）。
+    pub(crate) fn host_scroll(&self) -> Option<(gpui::ScrollHandle, f32)> {
+        self.host_scroll.borrow().clone()
+    }
+
+    /// 推进（并最终消费）缩放恢复：返回 `Some((目标局部 y, done))`，`done` = 是否已收敛
+    /// 消费锚点。**由 WyEditor 自身在 element prepaint 每帧驱动**（宿主应用只负责注入
+    /// 句柄 + 推视口顶 + 改字号）——因为字号变化后 frame 逐帧把「估计高」细化为「整形
+    /// 真值」，`block_top/height` 缓慢变动；必须在本编辑器自己的重排帧里逐帧重钉，直到
+    /// 目标位移 < [`Self::ZOOM_ANCHOR_EPS`] 或超过 [`Self::ZOOM_ANCHOR_MAX_APPLIES`] 帧
+    /// 才停（防极端文档高度持续细化时锚点永不收敛、永远覆盖用户滚动）。
+    ///
+    /// 帧未就绪返回 `None`（下帧再取）；未注入宿主句柄时直接丢弃锚点（不进死循环）。
+    pub(crate) fn advance_zoom_restore(&self) -> Option<(f32, bool)> {
+        // 先查锚点（绝大多数帧为 None，最早退出）；再查宿主句柄，缺则丢弃锚点（不进死循环）。
+        let anchor = self.zoom_anchor.borrow().clone()?;
+        if self.host_scroll.borrow().is_none() {
+            *self.zoom_anchor.borrow_mut() = None;
+            self.zoom_last_target.set(None);
+            self.zoom_applies.set(0);
+            return None;
+        }
+        let f = self.frame.borrow().clone()?;
+        let (block, frac) = anchor;
+        let count = f.block_count();
+        let block = block.min(count.saturating_sub(1));
+        let h = f.block_height(block).max(1.);
+        let target = f.block_top(block) + frac * h;
+        let applies = self.zoom_applies.get();
+        let done = if let Some(prev) = self.zoom_last_target.get() {
+            (target - prev).abs() < Self::ZOOM_ANCHOR_EPS
+                || applies + 1 >= Self::ZOOM_ANCHOR_MAX_APPLIES
+        } else {
+            false
+        };
+        self.zoom_last_target.set(Some(target));
+        self.zoom_applies.set(applies + 1);
+        if done {
+            *self.zoom_anchor.borrow_mut() = None;
+            self.zoom_last_target.set(None);
+            self.zoom_applies.set(0);
+        }
+        Some((target, done))
     }
 
     // —— `.notdef`（回退未命中）坏行自愈 ——

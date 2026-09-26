@@ -1230,6 +1230,86 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// WYSIWYG Ctrl+滚轮缩放：字号放大/缩小后视图顶部**内容点**保持不变（视口锚定，
+    /// 对齐 src/markdown/view 与 src/editor），而不是整体滚动偏离。
+    #[gpui::test]
+    async fn wysiwyg_zoom_keeps_viewport_anchored(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(600.), px(600.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 内容足够高 → 真实需要纵向滚动，且缩放后还有双向余量。
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-zoom-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, format!("{}\n", "# 标题\n正文段落内容用于缩放锚定验证。\n\n".repeat(200))).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let vhand = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].live_vscroll.clone()
+        });
+        // 滚到中深部（留出双向余量且让「无锚定漂移」足够大到可分辨）。
+        vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(-1500.)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let pad_y = crate::app::panes::LIVE_BODY_PAD_Y;
+        let local_top = |y: f32| y.max(0.0) - pad_y;
+        let read_anchor = |cx: &mut VisualTestContext| -> Option<(usize, f32)> {
+            cx.update(|_, cx| {
+                let a = app.read(cx);
+                a.tabs[a.active_tab]
+                    .live2
+                    .as_ref()
+                    .expect("live2 应就绪")
+                    .read(cx)
+                    .block_of_px(local_top(vhand.offset().y.as_f32().abs()))
+            })
+        };
+        // 读**缩放前**视口顶部的 WYSIWYG 内容点（旧字号旧 frame）。
+        let before = read_anchor(&mut *cx).expect("缩放前应有可识别锚点块");
+        // 放大 3 档（等价 Ctrl+向上滚 3 次），多泵几帧让「估计高→整形真值」收敛完成。
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| app.change_font_size(3.0, cx));
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 读缩放后视口顶部内容点；线性锚点近似允许 ±1 块（对齐 markdown/view ±2 容差）。
+        let after = read_anchor(&mut *cx).expect("缩放后也应能识别锚点块");
+        assert!(
+            (before.0 as i64 - after.0 as i64).abs() <= 1,
+            "缩放不应明显改变视口顶部块：{before:?} → {after:?}"
+        );
+        assert!(
+            (before.1 - after.1).abs() < 0.3,
+            "缩放后块内比例应基本不变：{:.3} → {:.3}",
+            before.1,
+            after.1
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// 选项卡过多时，选项卡栏应可横向滚动（出现横向滚动条），最新选项卡不再被遮挡。
     #[gpui::test]
     async fn tab_bar_scrolls_when_tabs_overflow(cx: &mut TestAppContext) {

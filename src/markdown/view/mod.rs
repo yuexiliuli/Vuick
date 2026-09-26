@@ -493,12 +493,17 @@ impl MarkdownPreview {
         self.invalidate_height_hint();
     }
 
-    /// 在当前字号基础上增减（EPUB 滚动缩放）；返回新的字号覆盖。
-    pub fn bump_font_size(&mut self, delta: f32, cx: &mut App, current_default: f32) {
-        let base = self.font_override.unwrap_or(current_default);
-        // 缩放前先记录视口锚点：字号变化高度模型重建后,视口顶部内容点不随之跳走。
+    /// 带视口锚定的**绝对**字号设置（宿主 `app` 全局字号推进的统一落点）。
+    /// 改字号前先记录视口锚点，高度模型重建后视口顶部内容点不随之跳走——与缩放时的
+    /// 相对增减共用同一套锚定机制，但这里直接设绝对值，使预览与编辑区 / WYSIWYG 共用
+    /// 同一全局字号。`size` 应为已按 `FONT_MIN/FONT_MAX` 约束的全局字号。
+    pub fn set_font_size_anchored(&mut self, size: f32, cx: &mut App) {
+        if self.font_override.is_some_and(|cur| (cur - size).abs() < 0.001) {
+            return;
+        }
+        // 缩放前先记录视口锚点：字号变化高度模型重建后，视口顶部内容点不随之跳走。
         self.capture_zoom_anchor();
-        self.set_font_override(Some((base + delta).clamp(9.0, 32.0)), cx);
+        self.set_font_override(Some(size), cx);
     }
 
     /// 捕获当前视口顶部的内容点锚点 `(块号, 块内比例)`。比例 = 块内偏移 ÷ 块高，
@@ -2081,8 +2086,11 @@ impl Render for MarkdownPreview {
         }
         .into_any_element();
 
-        // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动
-        // （Ctrl 滚轮缩放由下方 `md-zoom-overlay` 拦截，这里只处理普通滚轮的像素滚动）。
+        // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动。
+        // **Ctrl+滚轮缩放不再由预览自持**——统一入口在宿主（app::panes 的 zoom_overlay
+        // → change_font_size），预览字号由宿主渲染期 set_font_override 推进，避免两处
+        // 各自调字号互相打架。`set_font_size_anchored` 即宿主推进全局字号时用的带锚定
+        // 绝对落点（EPUB 等外部调用方直接缩放同样走它）。
         let root = div()
             .id("md-preview-root")
             .debug_selector(|| "md-preview-root".into())
@@ -2104,36 +2112,7 @@ impl Render for MarkdownPreview {
                     }
                 },
             ))
-            .child(core)
-            // Ctrl+滚轮缩放字号（EPUB 阅读）：挂在整个预览区之上的覆盖层（最后绘制、
-            // 命中测试最靠前 → bubble 先于内部 List 的原生滚动运行），Ctrl 时
-            // stop_propagation → 缩放不带动页面滚动；普通滚轮不拦截，仍按原路径滚动。
-            .child(
-                div()
-                    .id("md-zoom-overlay")
-                    .debug_selector(|| "md-zoom-overlay".into())
-                    .absolute()
-                    .inset_0()
-                    .on_scroll_wheel(cx.listener(
-                        |this: &mut MarkdownPreview, event: &ScrollWheelEvent, _w, cx| {
-                            if !event.modifiers.control {
-                                return;
-                            }
-                            let delta_y = match event.delta {
-                                ScrollDelta::Lines(lines) => lines.y,
-                                ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-                            };
-                            let step = delta_y.clamp(-1.0, 1.0);
-                            if step != 0.0 {
-                                let default =
-                                    StyleParams::from_theme_with_font(cx, None).para_size.as_f32();
-                                this.bump_font_size(step * 1.5, cx, default);
-                                cx.notify();
-                            }
-                            cx.stop_propagation();
-                        },
-                    )),
-            );
+            .child(core);
 
         let out = root;
         crate::prof::end("md_render", _t_render);

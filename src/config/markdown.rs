@@ -18,3 +18,20 @@ pub const QUOTE_BAR_WIDTH_PX: f32 = 3.0;
 pub const QUOTE_BAR_COLOR: u32 = 0xa8b1bd;
 /// EPUB 内存图片的虚拟协议前缀（注册表键，预览解析相对路径图片的依据）。
 pub const EPUB_IMG_SCHEME: &str = "epubimg://";
+
+// ---------------------------------------------------------------------------
+// 标题排版（预览 view / WYSIWYG 共用，见 `markdown::view::style::heading_metrics_for_size`）
+// ---------------------------------------------------------------------------
+
+/// 各级标题的**设计字号**（px）：在 [`HEADING_DESIGN_BASE`](=14) 这一**参考正文字号**下的
+/// 取值，实际渲染时按正文字号等比缩放（`body / HEADING_DESIGN_BASE × 设计值`），使编辑区/
+/// 预览/WYSIWYG 调字号时 #/##/### 成比例一起变大变小。索引 1..=6 对应 # ~ ######（0 位不用）。
+///
+/// 注意：设计基准固定为 14，与运行期默认字号 `layout::DEFAULT_FONT_SIZE` **解耦**——
+/// 否则调大默认字号（如 24）会把标题基准一起带偏，标题反而小于正文。
+pub const HEADING_DESIGN_SIZES: [f32; 7] = [0.0, 20.0, 18.0, 16.0, 16.0, 15.0, 15.0];
+/// 标题设计字号所对应的**参考正文字号**（px）：`HEADING_DESIGN_SIZES` 在该字号下成立，
+/// 其余正文按 `body / 此值` 等比缩放标题。
+pub const HEADING_DESIGN_BASE: f32 = 14.0;
+/// 标题行高系数（× 标题字号）。
+pub const HEADING_LINE_RATIO: f32 = 1.45;

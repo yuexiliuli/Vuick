@@ -3,6 +3,10 @@
 use super::*;
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 
+/// WYSIWYG 宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主 ScrollHandle 偏移 ↔
+/// WyEditor 元素局部 y」换算时使用，必须与下方 `.py(px(LIVE_BODY_PAD_Y))` 保持一致。
+pub(crate) const LIVE_BODY_PAD_Y: f32 = 8.0;
+
 impl EditorApp {
     /// 当前选项卡的预览视图：PDF 选项卡用 `PdfViewer`（整页原样），
     /// 其余用 `MarkdownPreview`。
@@ -15,6 +19,7 @@ impl EditorApp {
 
     pub(super) fn render_editor_pane(
         &mut self,
+        window: &mut Window,
         grow: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -60,6 +65,21 @@ impl EditorApp {
         }
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
+        // 渲染期把全局字号推进到 WYSIWYG，并做**缩放视口锚定**（对齐 view / editor）：
+        // 注入宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = scroll 偏移 −
+        // 顶部内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号
+        // 重建帧并把锚点块的精确位置写回宿主滚动句柄（prepaint 读偏移之前完成），
+        // Ctrl+滚轮缩放**无缝**、不带动滚动位置。
+        if let Some(ed) = self.tabs[self.active_tab].live2.clone() {
+            let fs = self.font_size;
+            let vhand = self.tabs[self.active_tab].live_vscroll.clone();
+            let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
+            ed.update(cx, |ed, _| {
+                ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
+                ed.set_viewport_top(local_top); // 用缩放前旧顶捕捉锚点
+                ed.prepare_font_zoom(gpui::px(fs), window);
+            });
+        }
         let live_any: Option<gpui::AnyElement> = self.tabs[self.active_tab]
             .live2
             .clone()
@@ -94,7 +114,7 @@ impl EditorApp {
                                 .debug_selector(|| "live-body".into())
                                 .w_full()
                                 .px(px(12.))
-                                .py(px(8.))
+                                .py(px(LIVE_BODY_PAD_Y))
                                 .text_size(px(fs))
                                 .text_color(text_color)
                                 .child(live_any),
@@ -142,11 +162,13 @@ impl EditorApp {
             .child(Self::zoom_overlay(cx))
     }
 
-    /// 编辑区顶部的透明滚轮缩放覆盖层（Ctrl+滚轮改字号；普通滚轮透传）。
+    /// 编辑区 / 预览区共用的 Ctrl+滚轮缩放覆盖层（Ctrl+滚轮改全局字号；普通滚轮透传）。
+    /// 挂在整个内容区之上（最后绘制、命中测试最靠前），让编辑区与预览区都以同一个
+    /// `change_font_size` 为唯一缩放入口，三处（编辑/预览/WYSIWYG）字号保持一致。
     fn zoom_overlay(cx: &mut Context<Self>) -> gpui::AnyElement {
         div()
-            .id("editor-zoom-overlay")
-            .debug_selector(|| "editor-zoom-overlay".into())
+            .id("zoom-overlay")
+            .debug_selector(|| "zoom-overlay".into())
             .absolute()
             .left(px(0.))
             .right(px(0.))
@@ -216,6 +238,12 @@ impl EditorApp {
         grow: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // 渲染期把全局字号推进到 Markdown 预览（与编辑区 set_font_override 同套路：
+        // 值不变早退，变化才重测量/重锚定，任何全局字号入口对预览都即时生效）。
+        let fs = self.font_size;
+        self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
+            view.set_font_size_anchored(fs, cx)
+        });
         div()
             .flex()
             .flex_row()
@@ -237,9 +265,12 @@ impl EditorApp {
                     .flex_1()
                     .min_w(px(0.))
                     .bg(self.panel_bg())
+                    .relative()
                     // PDF → PdfViewer（整页原样）；其余 → Markdown 渲染器。
                     // Entity 直接作为子元素渲染（内部 size_full）。
-                    .child(Self::preview_element(&self.tabs[self.active_tab])),
+                    .child(Self::preview_element(&self.tabs[self.active_tab]))
+                    // Ctrl+滚轮缩放（同一入口 change_font_size）：预览区也参与全局字号调节。
+                    .child(Self::zoom_overlay(cx)),
             )
     }
 
@@ -247,14 +278,21 @@ impl EditorApp {
     pub(super) fn render_fullscreen_preview(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
+        let fs = self.font_size;
+        self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
+            view.set_font_size_anchored(fs, cx)
+        });
         let tab = &self.tabs[self.active_tab];
         div()
             .id("fullscreen-preview")
             .debug_selector(|| "fullscreen-preview".into())
             .size_full()
+            .relative()
             .bg(self.panel_bg())
             .child(Self::preview_element(tab))
+            .child(Self::zoom_overlay(cx))
     }
 }

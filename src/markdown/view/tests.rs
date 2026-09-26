@@ -451,7 +451,7 @@ fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
     assert_eq!(checked, 4, "应检查到 4 个文本行（2 段+1 列表+1 引述）");
 }
 
-/// EPUB 阅读：Ctrl+滚轮缩放应更新正文字号覆盖（基数 = 主题默认）。
+/// EPUB 阅读 / 宿主全局字号：缩放应更新正文字号覆盖（基数 = 主题默认）。
 #[gpui::test]
 fn font_zoom_updates_override(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -475,28 +475,93 @@ fn font_zoom_updates_override(cx: &mut TestAppContext) {
     let none = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
     assert!(none.is_none(), "初始应无字号覆盖");
 
-    // 模拟 Ctrl+滚轮向上（放大 1 档）
+    // 模拟宿主推进全局字号（放大 1.5）
     cx.update(|window, cx| {
         let md = host.read(cx).md.clone();
-        md.update(cx, |md, cx| md.bump_font_size(1.5, cx, default));
+        md.update(cx, |md, cx| md.set_font_size_anchored(default + 1.5, cx));
         window.refresh();
     });
     settle(cx);
     let after = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
-    assert!(after.is_some(), "滚动后应产生字号覆盖");
+    assert!(after.is_some(), "缩放后应产生字号覆盖");
     assert!(
         (after.unwrap() - (default + 1.5)).abs() < 0.001,
         "字号应增大 1.5，实际={after:?}"
     );
 }
 
-/// Ctrl+滚轮（EPUB 阅读）：缩放字号**不带动页面滚动**（同 PDF 视口锚定）。
-///
-/// 覆盖层（md-zoom-overlay）最后绘制 → bubble 先于内部 List 的原生滚动运行，
-/// Ctrl 时 stop_propagation：字体放大而滚动位置（视口顶部块）保持不动；
-/// 普通滚轮（非 Ctrl）不被该覆盖层拦截，仍照常滚动、字号不变。
+/// 标题字号应随正文字号等比缩放（#/##/### 一起变大变小，子级始终小于父级）。
+/// 设计基准 `HEADING_DESIGN_BASE`(=14) 下 h1=20 h2=18 h3/4=16 h5/6=15；其余字号按
+/// `body / 基准` 等比放大，最多只放大 2 倍。与运行期默认字号 `layout::DEFAULT_FONT_SIZE`
+/// 无耦合（默认字号调大时基准不变）。
 #[gpui::test]
-fn ctrl_wheel_zooms_font_without_scrolling(cx: &mut TestAppContext) {
+fn heading_metrics_scale_with_body_font(cx: &mut TestAppContext) {
+    let h = |body: f32| -> [f32; 7] {
+        let mut out = [0.0f32; 7];
+        for lv in 1..=6u8 {
+            out[lv as usize] =
+                crate::markdown::view::style::heading_metrics_for_size(body, lv).0.as_f32();
+        }
+        out
+    };
+    // 参考字号 14px：标题等于设计值。
+    let ref14 = h(14.0);
+    assert_eq!(
+        &ref14[1..],
+        &[20.0, 18.0, 16.0, 16.0, 15.0, 15.0],
+        "14px 时标题应等于设计值：{ref14:?}"
+    );
+    // 等比放大：正文翻倍 → 各标题也翻倍（比例不随 DEFAULT_FONT_SIZE 变化）。
+    let big = h(28.0);
+    for lv in 1..=6u8 {
+        assert!(
+            (big[lv as usize] - ref14[lv as usize] * 2.0).abs() < 0.001,
+            "h{lv} 应放大 2 倍：{} vs {}",
+            big[lv as usize],
+            ref14[lv as usize] * 2.0
+        );
+    }
+    // 任意正文字号下：标题始终大于正文、子级小于父级（h1>h2>h3>h6）。
+    for &body in &[14.0f32, 24.0, 28.0] {
+        let hb = h(body);
+        for lv in 1..=6u8 {
+            assert!(
+                hb[lv as usize] > body,
+                "h{lv} 应大于正文字号 {body}：{}",
+                hb[lv as usize]
+            );
+        }
+        assert!(
+            hb[1] > hb[2] && hb[2] > hb[3] && hb[3] > hb[5],
+            "h1>h2>h3>h6 @ {body}：{hb:?}"
+        );
+    }
+    // 绑定默认值：预览默认正文 = layout::DEFAULT_FONT_SIZE，标题随之缩放。
+    cx.update(gpui_component::init);
+    let p = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
+    assert_eq!(
+        p.para_size.as_f32(),
+        crate::config::layout::DEFAULT_FONT_SIZE,
+        "预览默认正文字号应与 layout 一致"
+    );
+    for lv in 1..=6u8 {
+        let expect = crate::markdown::view::style::heading_metrics_for_size(
+            crate::config::layout::DEFAULT_FONT_SIZE,
+            lv,
+        )
+        .0;
+        assert_eq!(p.heading_metrics(lv).0, expect, "h{lv} 默认字号下应随正文缩放");
+    }
+}
+
+/// 字号缩放（EPUB 阅读 / 宿主 set_font_override）：缩放**不带动页面滚动**（同 PDF 视口锚定）。
+///
+/// 预览自身的 Ctrl 滚轮缩放覆盖层已移除——缩放入口统一在宿主（app::panes zoom_overlay →
+/// change_font_size），这里验证底层原语 `set_font_size_anchored`（宿主推进全局字号时
+/// 的绝对落点/外部调用方都经它落地）：
+/// 视口顶部块锚定不动；普通滚轮（非 Ctrl）照常滚动、字号不变。
+#[gpui::test]
+fn font_zoom_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
@@ -536,9 +601,30 @@ fn ctrl_wheel_zooms_font_without_scrolling(cx: &mut TestAppContext) {
     });
     settle(cx);
     let def = cx.update(|_, cx| StyleParams::from_theme_with_font(cx, None).para_size.as_f32());
-    let (before_block, _before_off) = cx.update(|_, cx| host.read(cx).md.read(cx).test_abs_scroll_top());
-    assert!(before_block > 100, "应已滚到中部（block={before_block}）");
+    let before = cx.update(|_, cx| host.read(cx).md.read(cx).test_abs_scroll_top().0);
+    assert!(before > 100, "应已滚到中部（block={before}）");
 
+    // 缩放字号（+1.5）：字号变大，且滚动位置（视口顶部块）不变（不滚动）。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_font_size_anchored(def + 1.5, cx);
+            cx.notify();
+        });
+    });
+    settle(cx);
+    let (f1, after_block) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (md.font_override, md.test_abs_scroll_top().0)
+    });
+    assert!(f1.is_some() && f1.unwrap() > def, "缩放应放大字号：{f1:?}");
+    assert!(
+        (after_block as i64 - before as i64).abs() <= 2,
+        "缩放不应滚动：视口顶部块 {before} → {after_block}"
+    );
+
+    // 普通滚轮（非 Ctrl）：照常滚动、字号不变。
+    let f_before_plain = f1.unwrap();
     let pos = {
         let b = cx.debug_bounds("md-preview-root").expect("预览根应渲染");
         point(
@@ -546,24 +632,6 @@ fn ctrl_wheel_zooms_font_without_scrolling(cx: &mut TestAppContext) {
             px(b.origin.y.as_f32() + b.size.height.as_f32() * 0.5),
         )
     };
-    // Ctrl+向上滚（放大）：字号变大，且滚动位置（视口顶部块）不变（不滚动）。
-    cx.simulate_event(gpui::ScrollWheelEvent {
-        position: pos,
-        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(240.))),
-        modifiers: Modifiers { control: true, ..Default::default() },
-        ..Default::default()
-    });
-    settle(cx);
-    let f1 = cx.update(|_, cx| host.read(cx).md.read(cx).font_override);
-    assert!(f1.is_some() && f1.unwrap() > def, "Ctrl+向上滚应放大字号：{f1:?}");
-    let (after_block, _after_off) = cx.update(|_, cx| host.read(cx).md.read(cx).test_abs_scroll_top());
-    assert!(
-        (after_block as i64 - before_block as i64).abs() <= 2,
-        "Ctrl 缩放不应滚动：视口顶部块 {before_block} → {after_block}"
-    );
-
-    // 普通滚轮（非 Ctrl）：不被覆盖层拦截，照常滚动、字号不变。
-    let f_before_plain = f1.unwrap();
     cx.simulate_event(gpui::ScrollWheelEvent {
         position: pos,
         delta: gpui::ScrollDelta::Pixels(point(px(0.), px(240.))),

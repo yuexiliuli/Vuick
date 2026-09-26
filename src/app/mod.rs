@@ -1436,7 +1436,7 @@ impl Render for EditorApp {
                 .min_h(px(0.))
                 .min_w(px(0.))
                 .overflow_hidden()
-                .child(self.render_editor_pane(1.0, cx))
+                .child(self.render_editor_pane(window, 1.0, cx))
                 .into_any_element()
         } else if self.show_preview() {
             let ratio = self.split_ratio;
@@ -1495,7 +1495,7 @@ impl Render for EditorApp {
                             },
                         ),
                     )
-                    .child(self.render_editor_pane(ratio, cx))
+                    .child(self.render_editor_pane(window, ratio, cx))
                     .child(self.render_splitter(cx))
                     .child(self.render_preview_pane(window, 1.0 - ratio, cx))
                     .into_any_element()
@@ -1510,7 +1510,7 @@ impl Render for EditorApp {
                 .min_h(px(0.))
                 .min_w(px(0.))
                 .overflow_hidden()
-                .child(self.render_editor_pane(1.0, cx))
+                .child(self.render_editor_pane(window, 1.0, cx))
                 .into_any_element()
         };
 
