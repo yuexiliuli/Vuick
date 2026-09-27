@@ -135,6 +135,11 @@ pub struct CodeEditor {
     list_state: ListState,
     h_handle: ScrollHandle,
     highlighter: Highlighter,
+    /// 最近一次编辑对高亮的影响范围（`(min_row, tail_new, delta)`，见
+    /// [`Highlighter::set_dirty`]）：由 `apply_edit_synced` 写、`build_rows` 取走喂给
+    /// `Highlighter` 做「局部重解析 + 收敛早退」，避免逐键把整窗重跑 syntect。
+    /// 整篇替换/打开/撤销重做置 `None`（走整段重解析）。
+    hl_dirty: Option<(usize, usize, i64)>,
     /// Markdown「所见即所得」滤镜：.md 时替代 syntect 行高亮，把记号画淡、正文
     /// 应用加粗/斜体/代码/链接/标题等富样式（只改样式，文本/光标/选区不变）。
     md_decor: MarkdownDecor,
@@ -257,6 +262,7 @@ impl CodeEditor {
             list_state,
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
+            hl_dirty: None,
             md_decor: MarkdownDecor::default(),
             md_mode: false,
             language: None,
@@ -321,6 +327,8 @@ impl CodeEditor {
         // 但仍保留 syntect 用于其余语言）。`.md` 由 app 统一以 "markdown" 接入。
         self.md_mode = matches!(language, Some("markdown"));
         self.highlighter.set_language(language);
+        // 语言切换：高亮缓存将整段重解析，滞留的增量登记一并清除（防跨语言误用）。
+        self.hl_dirty = None;
     }
 
     /// 设置文档文本（清空撤销/重做与选区）。
@@ -378,6 +386,10 @@ impl CodeEditor {
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
+        // 整篇替换：高亮增量登记 + 高亮缓存一并作废（下一帧整段重解析；
+        // 防「新旧文档同 version=0」命中上一份文档的颜色）。
+        self.hl_dirty = None;
+        self.highlighter.invalidate();
         // 整篇替换：点亮标尺清除（内容已变，旧“所属块”提示无意义）。
         self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
@@ -703,6 +715,8 @@ impl CodeEditor {
         self.pixel_scroll = true;
         self.window_base = 0;
         self.desired_scroll.set(0.);
+        // 整段重挂：滞留的高亮增量登记作废（撤销/重做后走整段重解析）。
+        self.hl_dirty = None;
         // 折叠投影总行数跟随文档行数（区间越界由 FoldMap 侧裁剪）。
         self.folds.set_total(new_n);
         if defer_scans {
@@ -734,6 +748,15 @@ impl CodeEditor {
         let line_b = self.buffer.line_of_offset(range.end);
         let edit = self.buffer.apply_edit(range, text);
         self.row_count = self.buffer.line_count().max(1);
+        // 高亮增量登记：编辑前最小受影响行 + 编辑后首个未变尾部行 + 净行增量。
+        // （一次性消费；`Highlighter` 据此从 `line_a - 回看` 局部重解析并收敛早退。）
+        let insert_rows = text.matches('\n').count() + 1;
+        let removed_rows = line_b.saturating_sub(line_a) + 1;
+        self.hl_dirty = Some((
+            line_a,
+            line_a.saturating_add(insert_rows),
+            insert_rows as i64 - removed_rows as i64,
+        ));
         // 折叠同步：编辑进折叠体 → 自动展开；折叠后整体平移；锚被删 → 丢弃。
         self.folds.sync_edit(line_a, line_b, text, self.row_count);
         // 折叠候选 / 括号配对：**不再同步整篇重扫**（大文档逐键卡顿）。行数变了或
@@ -976,6 +999,8 @@ impl CodeEditor {
                 .scan_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
                 .to_vec()
         } else {
+            // 把最近编辑的增量登记喂给高亮器（局部重解析 + 收敛早退），只取走一次。
+            self.highlighter.set_dirty(self.hl_dirty.take());
             self.highlighter
                 .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
                 .to_vec()

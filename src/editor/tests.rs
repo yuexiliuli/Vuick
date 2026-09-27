@@ -349,6 +349,207 @@ fn highlight_window_aligned_to_base_for_batched_indexing() {
     }
 }
 
+/// 辅助：全量重解析（独立 Highlighter）+ set_dirty 增量路径 对照同一 buffer 的
+/// `[lo, hi]` 高亮，断言完全一致（增量正确性金标准）。
+fn assert_incremental_matches_full(src: &str, edit: impl FnOnce(&mut Buffer) -> (usize, usize, i64)) {
+    let mut b = Buffer::new(src);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let hay: Vec<_> = hl.highlight_window(&b, 0, 40, 16).to_vec();
+    assert!(!hay.is_empty(), "暖缓存应有产出");
+
+    let (min_row, tail_new, delta) = edit(&mut b);
+    hl.set_dirty(Some((min_row, tail_new, delta)));
+    let after: Vec<_> = hl.highlight_window(&b, 0, 40, 16).to_vec();
+
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 40, 16).to_vec();
+    assert_eq!(
+        after, truth_rows,
+        "增量高亮应与全量重解析一致（min_row={min_row} tail_new={tail_new} delta={delta}）"
+    );
+}
+
+/// 纯行内编辑（无换行）：只有编辑行的局部重解析，且输出与全量一致。
+#[test]
+fn incremental_edit_inline_matches_full() {
+    // 结尾**不带**换行（避免尾幻影空行——在尾行行首编辑会误当「新行替换幻影」，
+    // 覆盖真实「行内编辑」场景的干净样本）。
+    let src = "fn main() {\n    let a = 1; // 注释\n    let s = \"str\";\n    call();\n}";
+    for k in 0..src.lines().count() {
+        let s = src.to_string();
+        let want = |b: &mut Buffer| -> (usize, usize, i64) {
+            let line = k.min(b.line_count().saturating_sub(1));
+            let start = b.line_start(line);
+            b.apply_edit(start..start, "XYZ");
+            (line, line + 1, 0)
+        };
+        assert_incremental_matches_full(&s, want);
+    }
+}
+
+/// 行内插入多处重复（连续打字合并场景）仍与全量一致。
+#[test]
+fn incremental_edit_repeated_inline_matches_full() {
+    let src = "let q = \"abc\";\nlet r = 42; // x\nfn f() {}\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 1;
+        let start = b.line_start(l);
+        for _ in 0..3 {
+            b.apply_edit(start..start, "注入");
+        }
+        (l, l + 1, 0)
+    });
+}
+
+/// 换行插入（行数 +1，下方整体位移）：增量必须逐位移对照、与全量一致。
+#[test]
+fn incremental_edit_insert_newline_matches_full() {
+    let src = "aa\nbb\ncc\ndd\nee\n// tail\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 2; // 在第 3 行（cc）行尾插入两段换行 → 3 行新内容
+        let pos = b.line_end(l); // 行尾字节偏移（不含换行符）→ 在旧 `\n` 前插入
+        b.apply_edit(pos..pos, "\n#{mid}\n");
+        (l, l + 3, 2)
+    });
+}
+
+/// 删除换行（行数 -1，下方整体上移）：增量必须逐位移对照、与全量一致。
+#[test]
+fn incremental_edit_delete_newline_matches_full() {
+    let src = "aa\nbb\ncc\ndd\nee\n// tail\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 2;
+        // 删除第 3 行行尾换行（line_end 不含换行符 → [line_end, line_end+1) 即 `\n`）
+        let pos = b.line_end(l);
+        b.apply_edit(pos..pos + 1, "");
+        (l, l + 1, -1)
+    });
+}
+
+/// 编辑**开启了新的多行作用域**（块注释）：下方着色会变，增量必须继续解析到
+/// 作用域闭合，绝不提前在「样式巧合一致」处收敛（防过度收敛回归）。
+#[test]
+fn incremental_edit_opens_scope_propagates_down() {
+    let src = "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;\nlet f = 6;\nlet g = 7;\nlet h = 8;\nlet i = 9;\nlet j = 10;\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 1;
+        let start = b.line_start(l);
+        // 第 2 行插入未闭合块注释开头：第 2 行起下方全部变注释色。
+        b.apply_edit(start..start, "/*");
+        (l, l + 1, 0)
+    });
+}
+
+/// 编辑处于既有多行块注释内部（下方仍在同一作用域 → 状态不变，可合法提前收敛）：
+/// 增量结果仍与全量一致。
+#[test]
+fn incremental_edit_inside_multiline_comment_matches_full() {
+    let src = "/* 多行注释头部\n第二行内容 abc\n第三行内容 def\n第四行 */\nlet after = 1;\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 1;
+        let start = b.line_start(l) + 3;
+        b.apply_edit(start..start, "XYZ");
+        (l, l + 1, 0)
+    });
+}
+
+/// 撤回再重写同一行（编辑行视觉输出回到旧样子）：增量在编辑行本身即收敛，
+/// 下方复用旧缓存，仍与全量一致。
+#[test]
+fn incremental_edit_restores_same_style_converges_at_edit_row() {
+    let src = "let v = \"str\";\nlet w = 42;\nlet z = 1;\n";
+    assert_incremental_matches_full(src, |b| {
+        let l = 1;
+        let start = b.line_start(l);
+        b.apply_edit(start..start, "X"); // 行 1 变为 string
+        (l, l + 1, 0)
+    });
+}
+
+/// 回归：编辑 + 同帧请求窗口下移超出旧缓存上界 —— 增量收敛后尾部按位移复制必须
+/// 做界校验（超出旧缓存时回落整段重解析），否则 `old_lines[or - old_base]` 越界 panic。
+#[test]
+fn incremental_edit_grows_window_beyond_cache_matches_full() {
+    let src = (0..80)
+        .map(|i| format!("line{i} // c{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut b = Buffer::new(&src);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    // 暖缓存：小窗口 [0,20]（缓存只覆盖 0..≈36）
+    let _ = hl.highlight_window(&b, 0, 20, 16).to_vec();
+    // 编辑第 0 行行首插入换行（净行 +1）
+    let pos = b.line_start(0);
+    b.apply_edit(pos..pos, "\n");
+    hl.set_dirty(Some((0, 2, 1)));
+    // 请求窗口大幅下移 [0,60]：底超出旧缓存上界 + delta → 尾部位移行越出旧缓存。
+    let after: Vec<_> = hl.highlight_window(&b, 0, 60, 16).to_vec();
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 60, 16).to_vec();
+    assert_eq!(
+        after, truth_rows,
+        "编辑+窗口下移超出旧缓存后应回落整段重解析，不得越界 panic"
+    );
+}
+
+/// 回归：同一帧发生多次编辑（版本 +N）才高亮 —— 单槽 `hl_dirty` 只反映最后一次编辑
+/// 的 delta/位移，不可信 → 必须回落整段重解析（否则位移映射失真可能错误收敛）。
+#[test]
+fn coalesced_edits_before_highlight_match_full() {
+    let src = "aa\nbb\ncc\ndd\nee\nff\ngg\nhh\nii\njj\n";
+    let mut b = Buffer::new(src);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let _ = hl.highlight_window(&b, 0, 12, 16).to_vec();
+    // 编辑 1：第 2 行行尾插入换行（净行 +1）
+    let pos1 = b.line_end(2);
+    b.apply_edit(pos1..pos1, "\nX");
+    // 编辑 2：第 4 行行首插入（同帧，覆盖 single-slot dirty）
+    let pos2 = b.line_start(4);
+    b.apply_edit(pos2..pos2, "Y");
+    // 只做一次高亮（hl_dirty 只剩最后一次编辑的信息）
+    hl.set_dirty(Some((4, 5, 0)));
+    let after: Vec<_> = hl.highlight_window(&b, 0, 12, 16).to_vec();
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 12, 16).to_vec();
+    assert_eq!(
+        after, truth_rows,
+        "多连编辑后单次高亮应等于全量（path B 守卫 version==gated+1 → 回落整段重解析）"
+    );
+}
+
+/// 回归：整篇替换文档（新 Buffer 同为 version 0）后必须整段重解析，不得命中上一份
+/// 文档的缓存颜色（`Highlighter::invalidate` 防 version-0 冲突）。
+#[test]
+fn highlighter_invalidate_prevents_version_zero_collision() {
+    let doc_a = "// only a comment\nlet x = 1;\n";
+    let doc_b = "let s = \"str\" + \"ing\";\nlet n = 99;\n";
+    let truth_b = {
+        let mut truth = Highlighter::new();
+        truth.set_language(Some("rust"));
+        truth.highlight_window(&Buffer::new(doc_b), 0, 1, 16).to_vec()
+    };
+    // 修复路径：invalidate 后才切源 → 与全量一致（不残留 doc_a 颜色）。
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let _ = hl.highlight_window(&Buffer::new(doc_a), 0, 1, 16).to_vec();
+    hl.invalidate();
+    let b1: Vec<_> = hl.highlight_window(&Buffer::new(doc_b), 0, 1, 16).to_vec();
+    assert_eq!(b1, truth_b, "invalidate 后新文档应与全量一致");
+    // 对照：不 invalidate 时同 version0 会命中旧缓存（证明该修复必要）。
+    let mut hl2 = Highlighter::new();
+    hl2.set_language(Some("rust"));
+    let a0: Vec<_> = hl2.highlight_window(&Buffer::new(doc_a), 0, 1, 16).to_vec();
+    let stale: Vec<_> = hl2.highlight_window(&Buffer::new(doc_b), 0, 1, 16).to_vec();
+    assert_eq!(stale, a0, "未 invalidate 时应残留旧文档颜色（version0 冲突路径）");
+    assert_ne!(a0, truth_b, "doc_a 与 doc_b 首行颜色应不同（否则测试无意义）");
+}
+
 /// 复现 gpui `StyledText::compute_runs` 的长度求和逻辑，验证「选区叠在语法段上」
 /// 是否把 run 总量撑爆（run 总长 > 文本长 → shape_text 按行尾截断 → 选区底色丢失）。
 /// 这正是 .rs（Rust 每行多段高亮）无法鼠标选择、而 .txt/.md（同字节无高亮）正常的原因。
@@ -1728,3 +1929,4 @@ fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
         "粘贴后固定窗口条目数应保持 = {WINDOW}（实际 {win}）——否则只渲染首行"
     );
 }
+
