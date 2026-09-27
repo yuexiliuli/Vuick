@@ -4117,3 +4117,193 @@
             "主窗口选项卡应保持原样"
         );
     }
+
+    /// 大文档交互延迟基准（`BIGDOC_BENCH=1` 才跑，不打断言，只打印每操作墙钟）。
+    /// 用 `target/大文档测试.rs`（编辑器）与 `target/大文档测试2.md`（预览）实测
+    /// 「输入字符 / 滚动」的单次感知延迟（`dispatch/simulate + run_until_parked` 墙钟）。
+    /// 对比 HEAD：`git stash -u` 跑本测试，再 `git stash pop` 复跑。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_bigdoc_interactive(cx: &mut TestAppContext) {
+        if std::env::var_os("BIGDOC_BENCH").is_none() {
+            return;
+        }
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let show = |kind: &str, ms: f64| {
+            eprintln!("[BENCH] {kind} = {ms:.1} ms");
+        };
+        let md_path =
+            std::env::var("BIGDOC_MD").unwrap_or_else(|_| "target/大文档测试2.md".to_string());
+        let rs_path =
+            std::env::var("BIGDOC_RS").unwrap_or_else(|_| "target/大文档测试.rs".to_string());
+
+        // ---------- 打开 .rs（代码编辑器）并等就绪 ----------
+        let t0 = std::time::Instant::now();
+        let rs_path = rs_path.clone();
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| {
+                a.open_file(&rs_path, window, cx);
+            });
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                !a.tabs[i].editor_pending
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 600 {
+                panic!("编辑器打开超时");
+            }
+        }
+        show("open_rust_file", t0.elapsed().as_secs_f64() * 1000.0);
+
+        let editor = cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+            app.read(cx).tabs[app.read(cx).active_tab].editor.clone()
+        });
+
+        // ---------- 编辑器输入（insert_text × 6，拆「insert」与「draw/渲染」） ----------
+        let sample = "x";
+        for k in 0..6 {
+            let t0 = std::time::Instant::now();
+            cx.update(|_w, cx| editor.update(cx, |e, cx| e.insert_text(sample, cx)));
+            let t1 = std::time::Instant::now();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let t2 = std::time::Instant::now();
+            show(
+                &format!("editor_ins_{k}"),
+                t2.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  editor_ins_{k}.ins"),
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  editor_ins_{k}.draw"),
+                t2.duration_since(t1).as_secs_f64() * 1000.0,
+            );
+        }
+        crate::prof::dump("editor_insert_text");
+
+        // ---------- 编辑器滚动（滚轮下滚，拆「事件」与「渲染」） ----------
+        for k in 0..6 {
+            let t0 = std::time::Instant::now();
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::Point::new(px(700.), px(400.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::Point::new(px(0.), px(-120.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            let t1 = std::time::Instant::now();
+            for _ in 0..4 {
+                cx.run_until_parked();
+            }
+            let t2 = std::time::Instant::now();
+            show(
+                &format!("editor_scroll_{k}"),
+                t2.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  editor_scroll_{k}.evt"),
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  editor_scroll_{k}.parks"),
+                t2.duration_since(t1).as_secs_f64() * 1000.0,
+            );
+        }
+        crate::prof::dump("editor_scroll");
+
+        // ---------- 打开 .md（预览）并等两段就绪 ----------
+        let t1 = std::time::Instant::now();
+        let md_path = md_path.clone();
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| {
+                a.open_file(&md_path, window, cx);
+            });
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                !a.tabs[i].editor_pending
+                    && a.tabs[i].md_preview.read(cx).memory_estimate().0 > 0
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 900 {
+                panic!("预览打开超时");
+            }
+        }
+        show("open_md_file", t1.elapsed().as_secs_f64() * 1000.0);
+
+        // ---------- 预览滚动（预览在右半区，拆「事件」与「渲染」） ----------
+        for k in 0..6 {
+            let t0 = std::time::Instant::now();
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::Point::new(px(900.), px(400.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::Point::new(px(0.), px(-120.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            let t1 = std::time::Instant::now();
+            for _ in 0..4 {
+                cx.run_until_parked();
+            }
+            let t2 = std::time::Instant::now();
+            show(
+                &format!("preview_scroll_{k}"),
+                t2.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  preview_scroll_{k}.evt"),
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  preview_scroll_{k}.parks"),
+                t2.duration_since(t1).as_secs_f64() * 1000.0,
+            );
+        }
+        crate::prof::dump("preview_scroll");
+
+        // ---------- 预览编辑区输入（md 编辑区 insert_text，拆 ins/draw） ----------
+        let md_editor = cx.update(|_, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        for k in 0..4 {
+            let t0 = std::time::Instant::now();
+            cx.update(|_, cx| md_editor.update(cx, |e, cx| e.insert_text("y", cx)));
+            let t1 = std::time::Instant::now();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let t2 = std::time::Instant::now();
+            show(
+                &format!("md_editor_ins_{k}"),
+                t2.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  md_editor_ins_{k}.ins"),
+                t1.duration_since(t0).as_secs_f64() * 1000.0,
+            );
+            show(
+                &format!("  md_editor_ins_{k}.draw"),
+                t2.duration_since(t1).as_secs_f64() * 1000.0,
+            );
+        }
+        crate::prof::dump("md_editor_insert_text");
+    }
