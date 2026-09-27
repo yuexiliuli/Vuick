@@ -181,6 +181,8 @@ pub struct EditorApp {
     /// 顶部状态文字与是否"正常"
     status: SharedString,
     status_ok: bool,
+    /// 通知 toasts（自研 `ui::notification`，App 自持容器与生命周期）。
+    notifications: Vec<crate::ui::notification::Notification>,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
     /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）。
@@ -303,6 +305,7 @@ impl EditorApp {
             tab_hscroll_seq: 0,
             status: SharedString::from("就绪"),
             status_ok: true,
+            notifications: Vec::new(),
             font_size: DEFAULT_FONT_SIZE,
             preview_pending: false,
             preview_syncing: false,
@@ -1414,6 +1417,39 @@ impl EditorApp {
                 close.into_any_element(),
             ])
     }
+
+    /// 右上角 toast 层：卡片可见即渲染，点击卡片按「类型 + key」精确关闭。
+    fn render_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.notifications.is_empty() {
+            return div().into_any_element();
+        }
+        let cards = self
+            .notifications
+            .iter()
+            .map(|n| {
+                let id_type = n.id_type();
+                let key = n.key().clone();
+                n.render_card(window, cx)
+                    .on_click(cx.listener(move |this, _, _window, cx| {
+                        this.notifications
+                            .retain(|it| it.id_type() == id_type && it.key() == &key);
+                        cx.notify();
+                    }))
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("notification-layer")
+            .absolute()
+            .top_0()
+            .right_0()
+            .mt_1()
+            .mr_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(cards)
+            .into_any_element()
+    }
 }
 
 impl Render for EditorApp {
@@ -1621,7 +1657,7 @@ impl Render for EditorApp {
             .child(self.render_body_sidebar(body, cx))
             .child(self.render_status_bar(cx))
             // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
-            .children(gpui_component::Root::render_notification_layer(window, cx));
+            .child(self.render_notifications(window, cx));
         crate::prof::end("wy.app.render", _t);
         root
     }

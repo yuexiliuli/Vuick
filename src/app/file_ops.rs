@@ -1,8 +1,7 @@
 //! file_ops.
 
 use super::*;
-use gpui_component::notification::{Notification, NotificationType};
-use gpui_component::WindowExt as _;
+use crate::ui::notification::{Notification, NotificationKind};
 
 use crate::app::open_progress::TextChunk;
 use crate::config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES};
@@ -46,14 +45,13 @@ impl EditorApp {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         )));
-        window.push_notification(
+        self.push_notification(
             Notification::new()
                 .id1::<OpenFailureNotification>(key.clone())
                 .title("打开失败")
                 .message(format!("无法读取文件内容：{}\n{e}", p.display()))
-                .with_type(NotificationType::Error)
+                .with_type(NotificationKind::Error)
                 .autohide(false),
-            cx,
         );
         let entity = cx.entity();
         window
@@ -62,12 +60,24 @@ impl EditorApp {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(OPEN_FAILURE_AUTOHIDE_SECS))
                     .await;
-                let _ = cx.update_window_entity(&entity, |_, window, cx| {
-                    window.remove_notification1::<OpenFailureNotification>(key, cx)
+                let _ = cx.update_window_entity(&entity, |app, _window, _cx| {
+                    app.remove_notification1::<OpenFailureNotification>(key)
                 });
             })
             .detach();
         cx.notify();
+    }
+
+    /// 推送一条通知（App 自持容器；调用方自行 `cx.notify()`）。
+    pub(crate) fn push_notification(&mut self, note: Notification) {
+        self.notifications.push(note);
+    }
+
+    /// 按「类型 + key」精确移除一条通知（供卡片关闭与自托管计时共用）。
+    pub(crate) fn remove_notification1<T: 'static>(&mut self, key: gpui::ElementId) {
+        let id_type = std::any::TypeId::of::<T>();
+        self.notifications
+            .retain(|n| !(n.id_type() == id_type && n.key() == &key));
     }
 
     /// 把已读取并预处理好的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。

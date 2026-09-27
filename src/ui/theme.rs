@@ -48,6 +48,8 @@ pub struct ColorScheme {
     pub accent: Rgba,
     /// 链接（原 `config::colors::LINK_LIGHT/DARK`）
     pub link: Rgba,
+    /// 错误/危险色（打开失败通知等）
+    pub error: Rgba,
 }
 
 impl ColorScheme {
@@ -60,6 +62,7 @@ impl ColorScheme {
             border: rgb(0xd1d5db),
             accent: rgb(0x0078d4),
             link: rgb(0x0969da),
+            error: rgb(0xd1242f),
         }
     }
 
@@ -72,6 +75,7 @@ impl ColorScheme {
             border: rgb(0x1f2937),
             accent: rgb(0x0078d4),
             link: rgb(0x79c0ff),
+            error: rgb(0xff7b72),
         }
     }
 }
