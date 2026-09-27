@@ -41,7 +41,7 @@ use gpui::{
     MouseUpEvent, ParentElement, Point, Pixels, Render, RenderImage, ScrollHandle, ScrollWheelEvent,
     SharedString, StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 /// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
 pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
@@ -283,7 +283,7 @@ impl PdfViewer {
 
     /// 画布默认底色：浅色模式浅灰、深色模式深灰。
     fn default_canvas(cx: &App) -> Hsla {
-        if gpui_component::Theme::global(cx).is_dark() {
+        if crate::ui::theme::Theme::global(cx).is_dark() {
             rgb(0x111827).into()
         } else {
             rgb(0xe5e7eb).into()
@@ -292,7 +292,7 @@ impl PdfViewer {
 
     /// 页面“卡片”配色：纸面白 / 深色纸面，配边框。
     fn page_card_colors(cx: &App) -> (Hsla, Hsla) {
-        if gpui_component::Theme::global(cx).is_dark() {
+        if crate::ui::theme::Theme::global(cx).is_dark() {
             (rgb(0x1f2937).into(), rgb(0x374151).into())
         } else {
             (gpui::white(), rgb(0xd1d5db).into())
@@ -1589,7 +1589,7 @@ impl PdfViewer {
 
 /// 选区背景色（半透蓝；深浅两版，与 markdown 预览同一套色值，视觉统一）。
 fn selection_color(cx: &App) -> Hsla {
-    if gpui_component::Theme::global(cx).is_dark() {
+    if crate::ui::theme::Theme::global(cx).is_dark() {
         rgba(0x4d6bfe61).into()
     } else {
         rgba(0x4d6bfe42).into()
@@ -1652,7 +1652,7 @@ fn selection_overlays_for_page(
 
 /// 检索命中（非激活）高亮色：半透蓝（与选区蓝区分度低一些）。
 fn search_hit_color(cx: &App) -> Hsla {
-    if gpui_component::Theme::global(cx).is_dark() {
+    if crate::ui::theme::Theme::global(cx).is_dark() {
         rgba(0x60a5fab0).into()
     } else {
         rgba(0x60a5fa70).into()

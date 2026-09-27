@@ -46,7 +46,7 @@ use gpui::{
     Window,
 };
 use gpui_component::input::Rope;
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
+use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use crate::config::limits::{
     CODE_HL_LRU_CAP, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_FACTOR,
@@ -1889,7 +1889,7 @@ impl Render for MarkdownPreview {
                         }
                 }
             let color = if hit.is_some() {
-                Some(if gpui_component::Theme::global(cx).is_dark() {
+                Some(if crate::ui::theme::Theme::global(cx).is_dark() {
                     rgba(0xf59e0b47).into()
                 } else {
                     rgba(0xfef08a8c).into()
@@ -2123,7 +2123,7 @@ impl Render for MarkdownPreview {
 /// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）。
 /// WYSIWYG(`markdown/wysiwyg`) 也共用同一款，保证「选择区背景色」全局一致。
 pub(crate) fn selection_color(cx: &App) -> Hsla {
-    if gpui_component::Theme::global(cx).is_dark() {
+    if crate::ui::theme::Theme::global(cx).is_dark() {
         gpui::rgba(0x4d6bfe61).into()
     } else {
         gpui::rgba(0x4d6bfe42).into()

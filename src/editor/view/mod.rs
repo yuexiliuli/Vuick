@@ -1035,7 +1035,7 @@ impl CodeEditor {
     /// 宁可多留白半行也绝不出现 0.5px 的渲染模糊。
     fn vscroll_bottom_pad_px(&self) -> f32 {
         let lh = self.line_height.as_f32().max(1.);
-        let raw = gpui_component::scroll::Scrollbar::width().as_f32()
+        let raw = crate::ui::scrollbar::scrollbar_width().as_f32()
             + EDITOR_VSCROLL_BOTTOM_EXTRA_LINES as f32 * lh;
         (raw / lh).ceil() * lh
     }

@@ -13,7 +13,7 @@ use gpui::{
     div, px, rgb, App, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::{Icon, IconName};
+use crate::ui::icon::{Icon, IconName};
 
 /// 断言 pre-order 条目 `idx` 是否有下级（可折叠）：紧邻下一项层级更深即有子项。
 pub(crate) fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {

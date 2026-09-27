@@ -12,7 +12,7 @@ use gpui::{
     LayoutId, ObjectFit, ParentElement, Pixels, ScrollHandle, StatefulInteractiveElement,
     StrikethroughStyle, Styled, StyledImage, StyledText, TextStyle, WrappedLineLayout, Window,
 };
-use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::config::colors::RESIZE_ACCENT;
 use crate::config::markdown::{
@@ -676,7 +676,7 @@ pub(crate) fn render_row(
     let marker_hl: Option<(usize, bool)> = *marker_hl;
     let row_ix: usize = *row_ix;
     // 当前主题明/暗（代码块语法着色色板随主题）。
-    let dark = gpui_component::Theme::global(cx).is_dark();
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
     // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。
     let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
     let code_runs = code_hl.as_deref();

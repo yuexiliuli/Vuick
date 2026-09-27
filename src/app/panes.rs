@@ -1,7 +1,7 @@
 ﻿//! panes.
 
 use super::*;
-use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 /// WYSIWYG 宿主 `#live-body` 的顶部内衬（px）：缩放锚点在做「宿主 ScrollHandle 偏移 ↔
 /// WyEditor 元素局部 y」换算时使用，必须与下方 `.py(px(LIVE_BODY_PAD_Y))` 保持一致。

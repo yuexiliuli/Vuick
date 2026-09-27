@@ -25,9 +25,10 @@ mod prof;
 mod scrollbar;
 mod syntax;
 mod toc;
+mod ui;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-use gpui_component::{Root, Theme, ThemeMode};
+use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 use crate::actions::*;
@@ -53,10 +54,10 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
 
-            // 初始化 gpui-component（主题、键盘映射、Input 等）。
-            // 这里强制浅色主题，与现有界面的亮色调保持一致。
+            // 初始化 gpui-component（主题、键盘映射、Input 等），再种入自研主题
+            // （`Theme::set` 双轨：写入 ui::theme 的同时驱动组件主题，Wallpaper 一致）。
             gpui_component::init(cx);
-            Theme::change(ThemeMode::Light, None, cx);
+            crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx);
             // 「预览编辑测试」（本项目 Doc 管线 WYSIWYG）快捷键（作用域 wy-editor）。
             crate::markdown::wysiwyg::bind_keys(cx);
             // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）

@@ -18,7 +18,7 @@ use gpui_component::input::{
     Redo, SelectAll, SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart,
     SelectToStart, SelectToStartOfLine, Undo,
 };
-use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarMode};
+use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use crate::config::layout::{
     BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
@@ -302,7 +302,7 @@ impl CodeEditor {
         self.visible_chars = self.visible_chars_from_width(avail_w);
 
         // 高亮语言（主题明暗同步）
-        let dark = gpui_component::Theme::global(cx).is_dark();
+        let dark = crate::ui::theme::Theme::global(cx).is_dark();
         self.highlighter.set_dark(dark);
         self.md_decor.set_dark(dark);
 
