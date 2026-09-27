@@ -10,9 +10,10 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, Pixels,
-    SharedString, TextAlign, Window, fill, point, px, relative, size,
+    App, Bounds, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
+    ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, LayoutId, Pixels, ScrollWheelEvent, SharedString, TextAlign, Window, fill, point,
+    px, relative, size,
 };
 
 /// 行首 gutter 几何常量（paint 与 hit-test 共用，不得分开改）。
@@ -25,6 +26,7 @@ pub(crate) const HEADING_GUTTER_W: f32 = 20.;
 
 pub(crate) use super::frame::{build_frame, prewarm_band, warm_emoji_rasterizer};
 pub(crate) use super::math::*;
+pub(crate) use super::mermaid::*;
 pub(crate) use super::shape::*;
 use super::{CaretVis, WyEditor, WyTheme};
 use crate::markdown::ir::IrKind;
@@ -189,6 +191,8 @@ pub(crate) struct Frame {
     pub igen: u64,
     /// 本帧数学排版代数；帧缓存键之一（Loading→就绪后卡片高变大，必须重建）。
     pub mgen: u64,
+    /// 本帧 mermaid 缩放代数；帧缓存键之一（滚轮缩放后卡高/几何按新比例重建）。
+    pub zgen: u64,
 }
 
 impl Frame {
@@ -540,6 +544,7 @@ impl Element for WyEditorElement {
             let rgen = e.content_gen();
             let igen = e.images_gen();
             let mgen = e.math_gen();
+            let zgen = e.mermaid_zoom_gen();
             let band = e.shape_band().unwrap_or((0., 2048.));
             let cached_total = e
                 .frame
@@ -549,6 +554,7 @@ impl Element for WyEditorElement {
                     f.rgen == rgen
                         && f.igen == igen
                         && f.mgen == mgen
+                        && f.zgen == zgen
                         && f.width == width
                         && f.band == band
                 })
@@ -578,6 +584,9 @@ impl Element for WyEditorElement {
                                 }
                                 if f.mgen != mgen {
                                     v.push("mgen".into());
+                                }
+                                if f.zgen != zgen {
+                                    v.push("zgen".into());
                                 }
                                 if f.width != width {
                                     v.push(format!(
@@ -643,10 +652,11 @@ impl Element for WyEditorElement {
         );
         self.editor.update(cx, |e, _| e.set_shape_band(Some(band)));
 
-        // 带移动 / 内容 / 宽度 / 图片/数学加载变化 → 按新状态重建窗口化帧。
+        // 带移动 / 内容 / 宽度 / 图片/数学/mermaid缩放 变化 → 按新状态重建窗口化帧。
         let rgen = self.editor.read(cx).content_gen();
         let igen = self.editor.read(cx).images_gen();
         let mgen = self.editor.read(cx).math_gen();
+        let zgen = self.editor.read(cx).mermaid_zoom_gen();
         let width = {
             let f = self.editor.read(cx).frame.borrow();
             f.as_ref().map(|f| f.width).unwrap_or(px(800.))
@@ -657,6 +667,7 @@ impl Element for WyEditorElement {
                 f.rgen != rgen
                     || f.igen != igen
                     || f.mgen != mgen
+                    || f.zgen != zgen
                     || f.width != width
                     || f.band != band
             })
@@ -675,6 +686,9 @@ impl Element for WyEditorElement {
                     }
                     if f.mgen != mgen {
                         v.push("mgen");
+                    }
+                    if f.zgen != zgen {
+                        v.push("zgen");
                     }
                     if f.width != width {
                         v.push("width");
@@ -934,6 +948,21 @@ impl Element for WyEditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
+        // 滚轮：**在宿主 zoom_overlay / 滚动容器之前**（bubble）拦截——光标悬停在某张
+        // mermaid 卡片上时，普通滚轮=整卡缩放（`WyEditor::on_scroll_wheel` 返回 true →
+        // `stop_propagation`，宿主不滚动）；其余位置放行（Ctrl 归全局字号缩放；
+        // 非 Ctrl 归宿主滚动）。必须走 `window.on_mouse_event`：元素在宿主 `zoom_overlay`
+        // 顶层兄弟之下，元素级 `.on_scroll_wheel` 会被遮罩吞掉（对比 `editor/view/render.rs`）。
+        let wzeditor = self.editor.clone();
+        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+            if !matches!(phase, DispatchPhase::Bubble) {
+                return;
+            }
+            let consumed = wzeditor.update(cx, |e, c| e.on_scroll_wheel(event, window, c));
+            if consumed {
+                cx.stop_propagation();
+            }
+        });
         crate::prof::end("wy.paint", _t_paint);
         // 操作级实时计时结算：本帧若含未结算操作（type/backspace/scroll/open…），
         // 在此以「开始→绘制完成」的墙钟 + 帧内阶段 breakdown 落地一行 OP 记录。

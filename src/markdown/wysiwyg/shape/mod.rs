@@ -543,12 +543,16 @@ pub(crate) fn shape_code_row(
     // A2: ```mermaid 围栏折叠成「图卡片」——画一张节点/连线的矢量图。
     if lang.as_deref() == Some("mermaid") {
         let source = code_lines.join("\n");
-        let height = mermaid_card_height(&source);
+        // 滚轮逐卡缩放：卡高与布局同步乘 `zoom`（几何在 `mm_layout` 后等比缩放，paint
+        // 按 `layout.zoom` 等比缩放字号——见 `scale_mm_layout`/`paint_mermaid_placed`）。
+        let zoom = editor.mermaid_zoom(r.src_line);
+        let height = px(f32::from(mermaid_card_height(&source)) * zoom);
         // 布局（`MmPlaced` 卡片相对坐标，area=(0,0)）在 **shape 期**算好缓存——paint
         // 不再每帧重排/重测全部标签宽（否则滚动/键入时可见的 mermaid 卡片每帧整套
-        // 解析+排版；行整形缓存使其只在内容/宽度/主题变化时重算一次）。
+        // 解析+排版；行整形缓存使其只在内容/宽度/主题/缩放变化时重算一次）。
         let area_w = (f32::from(width) - 2. * f32::from(px(12.))).max(1.);
-        let mm = mm_layout(window, theme, &source, 0., 0., area_w);
+        let mut mm = mm_layout(window, theme, &source, 0., 0., area_w);
+        scale_mm_layout(&mut mm, zoom, area_w);
         return ShapedRow {
             src_line: r.src_line,
             src_lines: r.lines.clone(),

@@ -1872,7 +1872,8 @@ A-->B
         // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
         // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
         use super::{BlockCard, mm_layout};
-        let _ = std::fs::create_dir_all(r"C:\Users\C22500~1\AppData\Local\Temp\kilo");
+        let out_dir = std::env::temp_dir().join("kilo");
+        let _ = std::fs::create_dir_all(&out_dir);
         const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
         cx.update(gpui_component::init);
         let text = "\
@@ -1903,13 +1904,17 @@ graph TD
                     .expect("应有 mermaid 卡片");
                 let card_h = f32::from(mm.height);
                 let theme = ed.read(cx).theme.clone();
-                let (placed, edges) = mm_layout(window, &theme, SRC, 0., 0., 560.);
-                let (img, ink) = rasterize_mm_png(&placed, &edges);
-                let path = r"C:\Users\C22500~1\AppData\Local\Temp\kilo\mermaid_check.png".to_string();
+                let layout = mm_layout(window, &theme, SRC, 0., 0., 560.);
+                let (placed, edges) = match &layout {
+                    super::MmLayout::Flow(f) => (&f.placed, &f.edges),
+                    _ => panic!("应为 flowchart 布局"),
+                };
+                let (img, ink) = rasterize_mm_png(placed, edges);
+                let path = out_dir.join("mermaid_check.png");
                 let saved = img.save(&path).is_ok();
                 assert!(saved, "应能保存 PNG");
                 let size = (img.width(), img.height());
-                (card_h, placed.len(), edges.len(), path, ink, size)
+                (card_h, placed.len(), edges.len(), path.to_string_lossy().to_string(), ink, size)
             });
         assert!(card_h >= 100., "卡片高按层数计算：{card_h}");
         assert_eq!(n_nodes, 4, "4 个节点");
@@ -1918,11 +1923,191 @@ graph TD
         eprintln!("mermaid PNG 已导出：{png_path}（{size:?}，涂墨 {ink}px）");
     }
 
+    #[gpui::test]
+    fn mermaid_sequence_renders_card(cx: &mut TestAppContext) {
+        // sequenceDiagram 围栏 → 序列图卡片：参与者在首见顺序、消息行数、激活条。
+        use super::BlockCard;
+        cx.update(gpui_component::init);
+        let text = "\
+# 标题
+
+```mermaid
+sequenceDiagram
+    actor 用户
+    participant 服务 as API 网关
+    用户->>+服务: 登录
+    服务-->>-用户: 成功
+```
+
+尾段
+";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let mm = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                .expect("应有 mermaid 序列图卡片");
+            let laid = mm.mm.as_ref().expect("有缓存布局");
+            match &**laid {
+                super::MmLayout::Seq(s) => {
+                    assert_eq!(s.seq.messages.len(), 2, "两条消息");
+                    assert_eq!(s.columns.len(), 2, "两个参与者");
+                    assert!(s.columns[0].is_actor, "用户是 actor");
+                    assert_eq!(s.columns[1].label, "API 网关", "participant … as 别名");
+                    assert_eq!(s.activations.len(), 1, "一条激活条（含 + / - 配对）");
+                    assert!(f32::from(mm.height) >= 46. + 2. * 26., "卡高按行数");
+                    assert!(s.columns[1].x > s.columns[0].x, "列从左到右排");
+                }
+                other => panic!("应为序列图布局，实际 {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn mermaid_flow_lr_orders_columns(cx: &mut TestAppContext) {
+        // LR 方向：层沿 +x 增长 → A.x < B.x < C.x（方向参数化生效）。
+        use super::{mm_layout, MmLayout};
+        cx.update(gpui_component::init);
+        const SRC: &str = "flowchart LR\nA-->B\nB-->C";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("```mermaid\ngraph LR\nA-->B\n```"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            match mm_layout(window, &theme, SRC, 0., 0., 800.) {
+                MmLayout::Flow(f) => {
+                    let node = |id: &str| f.placed.iter().find(|p| p.id == id && !p.virtual_node).expect("节点");
+                    let (ax, aw, bx, bw, cx, cw_) = (node("A").x, node("A").w, node("B").x, node("B").w, node("C").x, node("C").w);
+                    assert!(ax < bx && bx < cx, "LR: A<B<C 沿 x");
+                    // 相邻列不再重叠（05 左挤修复：列宽按该列最宽节点推进）。
+                    assert!(ax + aw <= bx, "LR: A 右边不与 B 重叠（{ax}+{aw} vs {bx}）");
+                    assert!(bx + bw <= cx, "LR: B 右边不与 C 重叠");
+                    let _ = (cx, cw_);
+                    assert_eq!(f.edges.len(), 2, "两条边");
+                }
+                other => panic!("应为 flowchart 布局，实际 {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn mermaid_lr_edges_attach_to_node_edges(cx: &mut TestAppContext) {
+        // 回归「连线歪斜」：LR 边钉在节点**右/左边缘中心**，同行边为水平直线，
+        // 异行边为水平-垂直-水平直角折线（起终点都在边缘、直线段与行对齐）。
+        use super::{mm_layout, MmLayout};
+        cx.update(gpui_component::init);
+        const SRC: &str = "flowchart LR\nX[引擎] --> Y[阶段1] & Z[阶段2]\nY --> W\nZ --> W";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let theme = ed.read(cx).theme.clone();
+            match mm_layout(window, &theme, SRC, 0., 0., 800.) {
+                MmLayout::Flow(f) => {
+                    let node = |id: &str| f.placed.iter().find(|p| p.id == id && !p.virtual_node).unwrap();
+                    let edge = |from: &str, to: &str| {
+                        f.edges.iter().find(|e| f.placed[e.a].id == from && f.placed[e.b].id == to).expect("边")
+                    };
+                    // X→Y 同行：起点= X 右缘中心，终点= Y 左缘中心，全程同一 y → 水平直线。
+                    let xy = edge("X", "Y");
+                    let (xp, yp) = (node("X"), node("Y"));
+                    assert_eq!(xy.points.first().unwrap().0, xp.x + xp.w, "X→Y 起点钉 X 右缘");
+                    assert_eq!(xy.points.first().unwrap().1, xp.y + xp.h / 2., "X→Y 起点钉行中线");
+                    assert_eq!(xy.points.last().unwrap().0, yp.x, "X→Y 终点钉 Y 左缘");
+                    assert!(xy.points.iter().all(|p| (p.1 - (xp.y + xp.h / 2.)).abs() < 0.01), "X→Y 水平直线");
+                    // X→Z 异行：直角折线，中间两段共享同一 x（竖直段），两端钉边缘。
+                    let xz = edge("X", "Z");
+                    let zp = node("Z");
+                    assert_eq!(xz.points.first().unwrap().0, xp.x + xp.w, "X→Z 起点钉 X 右缘");
+                    assert_eq!(xz.points.last().unwrap().0, zp.x, "X→Z 终点钉 Z 左缘");
+                    assert_eq!(xz.points.len(), 4, "X→Z 为 4 段直角折线");
+                    assert_eq!(xz.points[1].0, xz.points[2].0, "竖直段 x 对齐");
+                    // Y→W 同行水平直线；Z→W 异行直角。
+                    let yw = edge("Y", "W");
+                    let wp = node("W");
+                    assert_eq!(yw.points.first().unwrap().0, yp.x + yp.w);
+                    assert_eq!(yw.points.last().unwrap().0, wp.x);
+                    assert!(yw.points.iter().all(|p| (p.1 - (yp.y + yp.h / 2.)).abs() < 0.01));
+                    assert_eq!(xz.points.last().unwrap().1, zp.y + zp.h / 2., "X→Z 终点水平段在 Z 行");
+                }
+                other => panic!("应为 flowchart 布局，实际 {other:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
+        // 滚轮悬停在 mermaid 卡片上 → 逐卡缩放；Ctrl+滚轮不放行给 mermaid（归宿主全局缩放）。
+        use super::BlockCard;
+        cx.update(gpui_component::init);
+        let text = "# 标题\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let mrow = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+                .expect("应有 mermaid 卡片");
+            let block = mrow.src_line;
+            // 元素 bounds 占满 600×2000（手工置 last_bounds，模拟 paint 期产物）。
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(gpui::Bounds::new(
+                    gpui::point(px(0.), px(0.)),
+                    gpui::size(px(600.), px(2000.)),
+                )));
+            });
+            let card_y = f32::from(mrow.top) + 10.;
+            let wheel = |ctrl: bool| gpui::ScrollWheelEvent {
+                position: gpui::point(px(300.), px(card_y)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(120.))),
+                modifiers: gpui::Modifiers { control: ctrl, ..Default::default() },
+                ..Default::default()
+            };
+            let before = ed.read(cx).mermaid_zoom(block);
+            let consumed = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+            let after = ed.read(cx).mermaid_zoom(block);
+            assert!(consumed, "悬停在卡片上应消费滚轮");
+            assert!(after > before, "普通滚轮应放大 mermaid 卡：{before} → {after}");
+            // Ctrl 滚轮：mermaid 不放行（宿主 zoom_overlay 管全局字号）。
+            let consumed_ctrl = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(true), window, c));
+            assert!(!consumed_ctrl, "Ctrl 滚轮不放行给 mermaid");
+            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "Ctrl 滚轮不改 mermaid 缩放");
+            // 非卡片区域滚轮：不改任何 mermaid 缩放。
+            let miss = gpui::ScrollWheelEvent {
+                position: gpui::point(px(300.), px(10.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(120.))),
+                ..Default::default()
+            };
+            let consumed_miss = ed.update(cx, |e, c| e.on_scroll_wheel(&miss, window, c));
+            assert!(!consumed_miss, "卡片外滚轮不应消费");
+            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "卡片外滚轮不改缩放");
+        });
+    }
+
     /// 把布局几何光栅化成 PNG（盒子边框 + 连线 + 箭头；中文标签不进位图，
     /// 由「框 + 箭头」结构本身表明这是一张流程图）。
     fn rasterize_mm_png(
         placed: &[super::MmPlaced],
-        edges: &[(usize, usize, Option<String>)],
+        edges: &[super::MmPolylineEdge],
     ) -> (image::RgbaImage, usize) {
         const PAD: i32 = 40;
         if placed.is_empty() {
@@ -1951,8 +2136,8 @@ graph TD
         let dark = [40u8, 45, 60, 255];
         let fill = [235u8, 238, 245, 255];
         // 边：三层折线 + 箭头。
-        for (ia, ib, _) in edges {
-            let (pa, pb) = (&placed[*ia], &placed[*ib]);
+        for e in edges {
+            let (pa, pb) = (&placed[e.a], &placed[e.b]);
             let ax = (pa.x + pa.w / 2.) as i32 + ox;
             let ay = (pa.y + pa.h) as i32 + oy;
             let bx = (pb.x + pb.w / 2.) as i32 + ox;
@@ -2395,18 +2580,18 @@ A-->B
         let g = mermaid_graph(src);
         assert_eq!(g.nodes.len(), 4, "4 节点");
         assert_eq!(g.edges.len(), 3, "3 边");
-        assert!(g.nodes.iter().any(|(id, lab, _)| id == "A" && lab == "开始"), "A=开始");
-        assert!(g.nodes.iter().any(|(id, lab, _)| id == "C" && lab == "完成"), "C=完成");
+        assert!(g.nodes.iter().any(|n| n.id == "A" && n.label == "开始"), "A=开始");
+        assert!(g.nodes.iter().any(|n| n.id == "C" && n.label == "完成"), "C=完成");
         // 回归：`B{判断}` 的定义不能被后续裸引用 `B -->` 覆盖成 “B”。
         assert!(
-            g.nodes.iter().any(|(id, lab, _)| id == "B" && lab == "判断"),
+            g.nodes.iter().any(|n| n.id == "B" && n.label == "判断"),
             "B 的标签应保持为「判断」，却被后续裸引用覆盖：{:?}",
-            g.nodes.iter().filter(|(id, _, _)| id == "B").collect::<Vec<_>>()
+            g.nodes.iter().filter(|n| n.id == "B").collect::<Vec<_>>()
         );
-        let (id, _, shp) = g.nodes.iter().find(|(id, _, _)| id == "B").unwrap();
-        assert!(id == "B" && *shp == MmShape::Diamond, "B 为判断（菱形）");
-        let (a, b, lab) = &g.edges[1];
-        assert!(a == "B" && b == "C" && lab.as_deref() == Some("是"), "边 B→C(是)");
+        let b = g.nodes.iter().find(|n| n.id == "B").unwrap();
+        assert_eq!(b.shape, MmShape::Diamond, "B 为判断（菱形）");
+        let e = g.edges.iter().find(|e| e.from == "B" && e.to == "C").unwrap();
+        assert_eq!(e.label.as_deref(), Some("是"), "边 B→C(是)");
     }
 
     #[gpui::test]

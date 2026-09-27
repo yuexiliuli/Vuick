@@ -4,112 +4,8 @@ use gpui::{App, Bounds, Hsla, Point, SharedString, TextRun, Window, size, point,
 use crate::markdown::parse::recognition::AlertKind;
 use crate::markdown::parse::inline_style::MathAlign;
 
-
-/// 画 **已排好** 的 mermaid 布局：`placed`/`edges` 为**卡片相对坐标**（shape 期以
-/// area=(0,0) 排好并存进 `row.mm`——paint 不再每帧重排/重测标签宽），绘制时统一加
-/// 卡片原点 `(ox, oy)`。生产路径恒由 `row.mm` 携带此布局（`paint_card` 唯一入口）。
-#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
-pub(crate) fn paint_mermaid_placed(
-    window: &mut Window,
-    theme: &WyTheme,
-    placed: &[MmPlaced],
-    edges: &[(usize, usize, Option<String>)],
-    ox: f32,
-    oy: f32,
-    area_w: f32,
-    cx: &mut App,
-) {
-    if placed.is_empty() {
-        // 无可解析节点 → 弱化提示。
-        let hint: SharedString = "空图 / 渲染器未接入".into();
-        let mut reduced = theme.muted;
-        reduced.a = 0.55;
-        let hrun = [TextRun { len: hint.len(), font: theme.mono.clone(), color: reduced, ..Default::default() }];
-        let hline = window.text_system().shape_line(hint, px(12.), &hrun, None);
-        let hw = f32::from(hline.width());
-        let _ = hline.paint(
-            point(px(ox + (area_w - hw) / 2.), px(oy + 40.)),
-            px(16.),
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
-        return;
-    }
-    let label_h = px(18.);
-    let edge_color = { let mut c = theme.muted; c.a = 0.85; c };
-    // 先画边（线在框底下）。
-    for (ia, ib, elab) in edges {
-        let (pa, pb) = (&placed[*ia], &placed[*ib]);
-        let ax = ox + pa.x + pa.w / 2.;
-        let ay = oy + pa.y + pa.h;
-        let bx = ox + pb.x + pb.w / 2.;
-        let by = oy + pb.y;
-        let mid_y = ay + (by - ay) / 2.;
-        let mut pth = gpui::PathBuilder::stroke(px(1.6));
-        pth.move_to(point(px(ax), px(ay)));
-        if (bx - ax).abs() < 1. {
-            pth.line_to(point(px(bx), px(by - 4.)));
-        } else {
-            pth.line_to(point(px(ax), px(mid_y)));
-            pth.line_to(point(px(bx), px(mid_y)));
-            pth.line_to(point(px(bx), px(by - 4.)));
-        }
-        if let Ok(path) = pth.build() {
-            window.paint_path(path, edge_color);
-        }
-        // 箭头。
-        let mut ah = gpui::PathBuilder::stroke(px(1.6));
-        ah.move_to(point(px(bx - 4.), px(by - 5.)));
-        ah.line_to(point(px(bx), px(by - 1.)));
-        ah.line_to(point(px(bx + 4.), px(by - 5.)));
-        if let Ok(path) = ah.build() {
-            window.paint_path(path, edge_color);
-        }
-        // 边标（画在折线水平段中点右侧）。
-        if let Some(l) = elab {
-            let lx = (ax + bx) / 2. + 7.;
-            let ly = mid_y - f32::from(label_h) - 3.;
-            let run = [TextRun { len: l.len(), font: theme.mono.clone(), color: theme.muted, ..Default::default() }];
-            let ln = window.text_system().shape_line(l.clone().into(), px(12.), &run, None);
-            let _ = ln.paint(point(px(lx), px(ly)), px(14.), TextAlign::Left, None, window, cx);
-        }
-    }
-    // 再画节点框 + 标签（“图”本体）。
-    let box_bg = theme.code_bg;
-    let box_border = { let mut c = theme.muted; c.a = 0.6; c };
-    for p in placed {
-        let r = match p.shape {
-            MmShape::Circle => p.h / 2.,
-            MmShape::Round => 10.,
-            MmShape::Diamond => 4.,
-            MmShape::Rect => 6.,
-        };
-        let b = Bounds::new(point(px(ox + p.x), px(oy + p.y)), size(px(p.w), px(p.h)));
-        window.paint_quad(gpui::PaintQuad {
-            bounds: b,
-            corner_radii: Corners::all(px(r)),
-            background: box_bg.into(),
-            border_widths: Edges::all(px(1.2)),
-            border_color: box_border,
-            border_style: gpui::BorderStyle::Solid,
-        });
-        let run = [TextRun { len: p.label.len(), font: theme.font.clone(), color: theme.text, ..Default::default() }];
-        let ln = window.text_system().shape_line(p.label.clone().into(), theme.font_size, &run, None);
-        let tw = f32::from(ln.width());
-        let _ = ln.paint(
-            point(px(ox + p.x + (p.w - tw) / 2.), px(oy + p.y + (p.h - f32::from(label_h)) / 2.)),
-            label_h,
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        );
-    }
-}
-
-
+// Mermaid 绘制已迁至 [`super::mermaid::paint`]（`paint_mermaid_layout` 为统一入口，
+// shape 期缓存的布局经 `row.mm` 携带，见 `paint_card`）。
 
 /// paint 版表格单元格绘制（复用 [`super::TableCellLayout`] 在 shape 期排好的单行；
 /// 几何与 `shape_table_row` 的 `text_x`/纵向居中一致）——**不再每帧重 shape 单元格**。
@@ -1023,11 +919,10 @@ pub(crate) fn paint_card(
             let trun = [TextRun { len: tag.len(), font: theme.font.clone(), color: muted, ..Default::default() }];
             let tline = window.text_system().shape_line(tag, px(11.), &trun, None);
             let _ = tline.paint(point(px(x0 + 12.), px(top0 + 6.)), px(14.), TextAlign::Left, None, window, cx);
-            // 矢量图渲染：圆角节点框 + 正交连线/箭头/边标。`row.mm` 恒为 shape 期算好的
-            // 布局（卡片相对坐标，mermaid 卡片唯一构造点 `shape_code_row` 设之）——
-            // paint 不再每帧重排/重测全部标签宽，只加卡片原点绘制。
+            // 布局已在 shape 期算好缓存进 `row.mm`（flowchart / sequence / 空），
+            // paint 不再每帧重排，只加卡片原点绘制（统一入口 `paint_mermaid_layout`）。
             let mm = row.mm.as_ref().expect("mermaid 卡片恒有缓存的已排布局");
-            paint_mermaid_placed(window, theme, &mm.0, &mm.1, x0, top0, content_w, cx);
+            paint_mermaid_layout(window, theme, mm, x0, top0, content_w, cx);
         }
     }
 }

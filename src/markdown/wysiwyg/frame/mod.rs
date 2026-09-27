@@ -172,6 +172,7 @@ pub(crate) fn build_frame(
             rgen,
             igen: editor.images_gen(),
             mgen: editor.math_gen(),
+            zgen: editor.mermaid_zoom_gen(),
         };
     }
 
@@ -181,11 +182,11 @@ pub(crate) fn build_frame(
     let igen = editor.images_gen();
     let mgen = editor.math_gen();
 
-    // 基础布局：代 = `(struct_ver, 图片/数学/宽度)`。滚动/带移动与**非结构性编辑**
-    // 都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
+    // 基础布局：代 = `(struct_ver, 图片/数学/宽度/mermaid缩放)`。滚动/带移动与**非结构性
+    // 编辑**都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
     // 数组重算前缀和（旧实现在内容代变化时对全篇重扫 ~400ms，是「一编辑就卡」之一）。
     let _t_setup = crate::prof::begin();
-    let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits);
+    let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits, editor.mermaid_zoom_gen());
     let (rebuilt, base, old_layout) = editor.ensure_block_layout(n, epoch);
     // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
     if !rebuilt
@@ -305,7 +306,7 @@ pub(crate) fn build_frame(
                     }
                     src.push_str(&doc.line_str(srcline + 1 + k as usize));
                 }
-                f32::from(mermaid_card_height(&src))
+                f32::from(mermaid_card_height(&src)) * editor.mermaid_zoom(srcline)
             } else if meta.kind == RowKind::Image {
                 // 图片行：用当前加载尺寸按 `shape_image_row` 同式算高（占位→真实由
                 // `igen` 触发整表重建，带内外必须同一公式防滚动跳）。
@@ -665,6 +666,7 @@ pub(crate) fn build_frame(
         rgen,
         igen,
         mgen,
+        zgen: editor.mermaid_zoom_gen(),
     }
 }
 
@@ -720,7 +722,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     }
     // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits）。
     let width_bits = f32::from(frame.width).to_bits();
-    let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits);
+    let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits, e.mermaid_zoom_gen());
     let sk = (epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) ^ e.code_parse_gen();
     let caret_line = e.row_col(e.caret()).0;
     let plan = e.fold_plan_rc();

@@ -27,6 +27,7 @@ mod element;
 mod input;
 pub(crate) mod frame;
 pub(crate) mod math;
+pub(crate) mod mermaid;
 mod math_typeset;
 pub(crate) mod shape;
 
@@ -322,6 +323,10 @@ pub struct WyEditor {
     math_color: RefCell<Option<Hsla>>,
     /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
     math_gen: Cell<u64>,
+    /// mermaid 图逐块滚轮缩放：键 = 围栏块首源码行。
+    mermaid_zoom: std::cell::RefCell<std::collections::HashMap<usize, f32>>,
+    /// mermaid 缩放代数：缩放变化自增，纳入帧缓存键 + 基础布局代（同 `math_gen`，强迫重排）。
+    mermaid_zoom_gen: Cell<u64>,
     /// 代码块高亮解析缓存（后台 syntect 整块解析；`request_code_parse` 置 Pending、
     /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。`code_parse_gen`
     /// 进 shape_key → 就绪后按下帧重建用高亮行替换占位纯文本行。
@@ -426,16 +431,18 @@ pub(crate) fn inline_math_key(latex: &str) -> SharedString {
     format!("inline:{latex}").into()
 }
 
-/// 基础布局代：`(struct_ver, igen, shaping 宽)` 折成一个 u64——**结构性内容**/图片/宽度
-/// 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，只做 Fenwick
-/// 点更新（编辑每键省掉旧实现在内容代变化时对全篇的估计重扫 ~400ms）。
+/// 基础布局代：`(struct_ver, igen, mermaid_zoom, shaping 宽)` 折成一个 u64——**结构性内容**/
+/// 图片/宽度 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，只做
+/// Fenwick 点更新。mermaid 缩放（`zgen`）也进代：缩放只影响单张卡片高，但块高存在基础
+/// 布局数组里，必须整篇重建一次才一致（缩放是低频操作，可接受；不复用 `mgen` 的稀疏
+/// delta 路线）。
 /// **不含 `mgen`**：数学排版就绪只改**卡片高**（走 `fold_plan` 稀疏 delta），基础布局里
 /// 数学块的 base 是普通段估算高，与就绪无关——把 `mgen` 放这里会让每个公式光栅完成都
-/// 触发全 139k 块 Pass1 重建（结构密集文档 ~13k 公式 → 连续 300-500ms 卡死）。
-/// 纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉 ~200ms）。
-pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32) -> u64 {
+/// 触发全 139k 块 Pass1 重建。纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉
+/// ~200ms）。
+pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32, zgen: u64) -> u64 {
     let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95);
+    let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95) ^ zgen.wrapping_mul(0x243F_6A88_85A3_08D3);
     let x = a ^ b.rotate_left(32);
     x ^ x >> 33
 }
@@ -941,6 +948,8 @@ impl WyEditor {
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
             math_gen: Cell::new(0),
+            mermaid_zoom: RefCell::new(std::collections::HashMap::new()),
+            mermaid_zoom_gen: Cell::new(0),
             code_parse: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1836,6 +1845,111 @@ impl WyEditor {
         cx.notify();
     }
 
+    /// 滚轮：**仅在光标悬停在 mermaid 卡片上时**拦截（普通滚轮 = 整卡缩放），其余位置
+    /// 返回 `false` 放行给宿主滚动/`zoom_overlay`。由元素 paint 期 `window.on_mouse_event`
+    /// （bubble）驱动——元素在宿主 `zoom_overlay`（顶层兄弟）之下，元素级 `.on_scroll_wheel`
+    /// 会被兄弟遮罩吞掉，必须走窗口级事件监听。
+    ///
+    /// 缩放走 `zoom_mermaid_at`：先捕捉视口锚点、重排后再写回宿主 `ScrollHandle`——页面
+    /// **不同步滚动**（缩放改的是卡高，内容随锚点原地钉住）。
+    pub(crate) fn on_scroll_wheel(
+        &mut self,
+        ev: &gpui::ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if ev.modifiers.control {
+            return false; // Ctrl 放行给宿主 zoom_overlay（全局字号缩放）。
+        }
+        let Some(b) = self.last_bounds() else {
+            return false;
+        };
+        if !b.contains(&ev.position) {
+            return false;
+        }
+        let local_y = f32::from(ev.position.y) - f32::from(b.origin.y);
+        let hit_mermaid = self
+            .frame
+            .borrow()
+            .as_ref()
+            .and_then(|f| {
+                f.rows.iter().find(|r| {
+                    local_y >= f32::from(r.top) && local_y < f32::from(r.top) + f32::from(r.height)
+                })
+            })
+            .filter(|r| matches!(&r.extra.card, Some(element::BlockCard::Mermaid)))
+            .map(|r| r.src_line);
+        let Some(block) = hit_mermaid else {
+            return false;
+        };
+        let delta_y = match ev.delta {
+            gpui::ScrollDelta::Lines(l) => l.y,
+            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
+        };
+        let step = delta_y.clamp(-1.0, 1.0);
+        if step == 0.0 {
+            return false;
+        }
+        self.zoom_mermaid_at(block, step, window, cx);
+        true
+    }
+
+    /// mermaid 卡滚轮缩放 + **视口锚定**：改缩放（`mermaid_zoom_gen` 自增 → 帧/块高按新
+    /// 比例失效）→ 渲染期重建窗口化帧 → 把「缩放前视口顶部的内容点」在新布局里的位置
+    /// 写回宿主 `ScrollHandle`（同 `prepare_font_zoom` 的锚定恢复，一次性：mermaid 块
+    /// 估计高与整形高同式 `×zoom`，无收敛过程）。未注入宿主句柄（独立测试）时只重建帧。
+    pub(crate) fn zoom_mermaid_at(
+        &self,
+        block: usize,
+        step: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 1) 重排前捕捉缩放锚点（当前视口顶部 → 块 + 块内比例）。
+        self.capture_zoom_anchor();
+        // 2) 应用新缩放（zgen++ → 帧缓存与基础布局代都失效）。
+        let z = (self.mermaid_zoom(block) + step * 0.12).clamp(0.5, 3.0);
+        self.set_mermaid_zoom(block, z);
+        // 3) 渲染期重建窗口化帧 → 新布局的精确块 top/height。
+        let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+        let band = self.shape_band().unwrap_or((0., 5000.));
+        let frame = element::build_frame(&*self, window, width, band);
+        // 4) 锚点块在新布局里的精确位置 = 恢复目标（元素局部 y）。
+        let target = {
+            let anchor = *self.zoom_anchor.borrow();
+            match anchor {
+                Some((blk, frac)) => {
+                    let count = frame.block_count();
+                    let blk = blk.min(count.saturating_sub(1));
+                    let h = frame.block_height(blk).max(1.);
+                    if count > 0 {
+                        frame.block_top(blk) + frac * h
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            }
+        };
+        // 5) 写回宿主滚动句柄并按锚定后内容顶推导新带（与 element prepaint 同式）。
+        let host = self.host_scroll.borrow().clone();
+        let final_band = if let Some((vh, pad_y)) = host {
+            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(target + pad_y))));
+            zoom_band_for_top(target + pad_y, window.viewport_size().height)
+        } else {
+            band
+        };
+        let frame = if final_band != band {
+            self.set_shape_band(Some(final_band));
+            element::build_frame(&*self, window, width, final_band)
+        } else {
+            frame
+        };
+        *self.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+        cx.notify();
+    }
+
+
     /// 代码块横向滚动偏移（键 = 代码块首源码行）。视图本地状态（不写源码）。
     pub(crate) fn code_h_scroll_of(&self, src_line: usize) -> f32 {
         self.code_h_scroll.borrow().get(&src_line).copied().unwrap_or(0.)
@@ -2245,6 +2359,24 @@ impl WyEditor {
     /// 排版完成代数（Loading→Ready/Failed 自增，纳入帧缓存键）。
     pub(crate) fn math_gen(&self) -> u64 {
         self.math_gen.get()
+    }
+
+    /* ---------- Mermaid 图：滚轮逐块缩放（缩放值随块源码行存，重排用） ---------- */
+
+    /// 某 mermaid 围栏块的缩放（缺省 1.0）。
+    pub(crate) fn mermaid_zoom(&self, src_line: usize) -> f32 {
+        self.mermaid_zoom.borrow().get(&src_line).copied().unwrap_or(1.0)
+    }
+
+    /// 设置某围栏块缩放并自增缩放代（纳入帧缓存/基础布局代 → 整帧+块高按新比例重建）。
+    pub(crate) fn set_mermaid_zoom(&self, src_line: usize, z: f32) {
+        self.mermaid_zoom.borrow_mut().insert(src_line, z);
+        self.mermaid_zoom_gen.set(self.mermaid_zoom_gen.get().wrapping_add(1));
+    }
+
+    /// mermaid 缩放代数（进帧缓存键 + 基础布局代）。
+    pub(crate) fn mermaid_zoom_gen(&self) -> u64 {
+        self.mermaid_zoom_gen.get()
     }
 
     /// 数学源码的**显示行数**（card 回退估高用）：`math_display_lines` 会对每源做
