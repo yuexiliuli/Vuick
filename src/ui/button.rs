@@ -5,18 +5,13 @@
 //! 与 gpui-component 对齐：`Button::new(id).label("文件").ghost().w(px(56.)).h(MENU_BAR_H)`，
 //! 样式走 gpui 的 [`Styled`] 链（`flex/items_center/px_2/rounded_md/text_size/text_color`）。
 //! 交互：点击经 [`Button::on_click`]；禁用经 [`Button::disabled`]（`opacity` 淡化 + 鼠标
-//! 激活阻断）；菜单弹层打开时由 popover 置 `.selected(true)` 呈现按压态。
+//! 激活阻断）；下拉菜单经 `crate::ui::menu::{DropdownMenu}`（`.dropdown_menu(..)` 挂
+//! `ui::menu::Dropdown`）。
 //!
 //! # 变体配色（单一来源）
 //! 全部取 `theme::ColorScheme` 语义字段，禁止硬编码 `rgba()`：Primary=accent、Link=link、
 //! 其余=fg（悬浮/按压背底用 fg 的低透明着染，深色下加深）。目前实现 App 实际用到的
 //! 变体：默认 / Primary / Ghost / Link / Text。
-//!
-//! # 下拉菜单过渡
-//! `#7 menu` 落地前，`.dropdown_menu(...)` 复用 `gpui_component::menu::DropdownMenu` trait
-//! （要求 `Styled + Selectable + InteractiveElement + IntoElement`）；本模块对 `Button`
-//! 实现了 `gpui_component::Selectable` 兼容垫片（弹出层用它设选中态），#7 完成后随
-//! `gpui_component::menu` 一起删除。
 
 use std::rc::Rc;
 
@@ -159,6 +154,11 @@ impl Button {
         self
     }
 
+    /// 元素 id（宿主组件如下拉菜单据此派生独立 id）。
+    pub fn element_id(&self) -> ElementId {
+        self.id.clone()
+    }
+
     /// 注册点击回调（指针 + 聚焦后的 Enter/Space）。
     #[allow(dead_code)] // 公开 API：测试使用；App 菜单栏按钮现经下拉菜单触发，后续调用点接入
     pub fn on_click(
@@ -229,22 +229,6 @@ impl ButtonVariants for Button {
         self
     }
 }
-
-// 过渡垫片：#7 menu 落地后随 `gpui_component::menu` 一起删除（见模块文档）。
-impl gpui_component::Selectable for Button {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-/// 让自绘按钮可挂 gpui_component 的下拉菜单（`DropdownMenu::dropdown_menu` 有默认实现，
-/// 只要求 `Styled + Selectable + InteractiveElement + IntoElement + 'static`）。#7 落地后删除。
-impl gpui_component::menu::DropdownMenu for Button {}
 
 impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
