@@ -35,6 +35,13 @@ use syntect::parsing::{ParseState, Scope, ScopeStackOp, SyntaxReference, SyntaxS
 
 use crate::editor::buffer::Buffer;
 
+/// 向下滚动「缺口」超过此值（目标窗口底 − 缓存上界 + 1）时，放弃逐行 `extend_down`
+/// 改走**有界重锚**（`full_reparse`，O(窗口+回看)）：大文档 `.rs` 拖滚动条时滑块极短，
+/// 1 鼠标像素 ≈ 数千行，若逐行把整个缺口重跑 syntect 会把 UI 线程卡死数百毫秒
+/// （表现成「内容只有松开才动」）。缺口小（滚轮/小幅拖拽）仍走 extend_down，作用域栈
+/// 完整、颜色正确。
+const REANCHOR_GAP: usize = 1_024;
+
 /// 共享语法集（默认语法集几 MB，进程级共享一次）。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
@@ -162,6 +169,11 @@ pub struct Highlighter {
     dirty: Option<(usize, usize, i64)>,
     /// 语言/色板切换强制整窗重解析（跳过增量路径）。
     force_full: bool,
+    /// 滚动（拖拽/快滚）期间被延后的高亮窗口 `(lo, hi, lookback)`：大文档上拖滚动条
+    /// 每提交一跳都远超缓存，若每帧同步 `full_reparse`（DEBUG 下 syntect ~百 ms/次）
+    /// 会把帧率压到个位数，滑块/内容跟不紧鼠标。先登记 pending、本帧用空样式渲染
+    /// （帧廉价），滚动停住（相邻帧窗口一致）再由 `settle_pending` 补一次有界重锚。
+    pending: Option<(usize, usize, usize)>,
 }
 
 impl Highlighter {
@@ -175,7 +187,18 @@ impl Highlighter {
             gated_version: 0,
             dirty: None,
             force_full: true,
+            pending: None,
         }
+    }
+
+    /// 语言/色板等切换后丢弃全部增量缓存，下一请求整段重解析（整篇替换文档 / 换语言时
+    /// 调用——清空缓存并把 `force_full` 置位，避免「新旧文档同为 version 0」命中旧颜色）。
+    pub fn invalidate(&mut self) {
+        self.lines.clear();
+        self.saves.clear();
+        self.dirty = None;
+        self.pending = None;
+        self.force_full = true;
     }
 
     /// 切换语言（按 token/扩展名找语法；`None` 无高亮）。
@@ -190,15 +213,6 @@ impl Highlighter {
             self.syntax = syntax;
             self.invalidate();
         }
-    }
-
-    /// 丢弃全部增量缓存，下一请求整段重解析（整篇替换文档 / 换语言时调用——
-    /// 清空缓存并把 `force_full` 置位，避免「新旧文档同为 version 0」命中旧颜色）。
-    pub fn invalidate(&mut self) {
-        self.lines.clear();
-        self.saves.clear();
-        self.dirty = None;
-        self.force_full = true;
     }
 
     /// 切换明/暗色板（拖主题时调用）。
@@ -226,6 +240,51 @@ impl Highlighter {
     /// 缓存是否已覆盖 `[lo, hi]`（只读判定）。
     fn covered(&self, lo: usize, hi: usize) -> bool {
         lo >= self.base && hi.saturating_add(1) <= self.base.saturating_add(self.lines.len())
+    }
+
+    /// 滚动相关的「快速路径」判定：缓存覆盖请求窗口（直接命中），或缺口小到走
+    /// `extend_down` 即可（廉价且作用域栈完整）→ 返回 `true`，调用方继续走
+    /// `highlight_window`（命中/小扩展两路径）。
+    ///
+    /// 否则（大缺口下跳 / 上移越过 base，需要有界重锚 `full_reparse`）→ 返回 `false`，
+    /// 并把窗口登记为 `pending`（本帧不重锚，帧廉价）；滚动停住后由
+    /// [`Self::settle_pending`] 补一次重锚。见 [`Self::pending`] 字段说明。
+    pub fn accept_deferred(&mut self, lo: usize, hi: usize, lookback: usize) -> bool {
+        if self.covered(lo, hi) {
+            self.pending = None;
+            return true;
+        }
+        let needs_reanchor = if lo >= self.base {
+            let cached_end = self.base + self.lines.len();
+            hi.saturating_add(1) > cached_end
+                && hi.saturating_sub(cached_end).saturating_add(1) > REANCHOR_GAP
+        } else {
+            // 上移出缓存：`highlight_window` 也会走整段重解析，同样贵 → 同样延后。
+            true
+        };
+        if needs_reanchor {
+            self.pending = Some((lo, hi, lookback));
+            false
+        } else {
+            true
+        }
+    }
+
+    /// 消费并执行一次被延后的有界重锚（`full_reparse`），返回是否已补齐缓存。
+    /// 滚动安定（相邻帧请求窗口一致）时由调用方触发：本帧用真颜色、之后命中缓存。
+    pub fn settle_pending(&mut self, buffer: &Buffer) -> bool {
+        let Some((lo, hi, lookback)) = self.pending.take() else {
+            return false;
+        };
+        let version = buffer.version();
+        let line_count = buffer.line_count();
+        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+        self.covered(lo, hi)
+    }
+
+    /// 当前被延后的高亮窗口（滚动中为 `Some`；供调用方判断「相邻帧窗口一致→滚动已停」）。
+    pub fn pending(&self) -> Option<(usize, usize, usize)> {
+        self.pending
     }
 
     /// 请求可见行窗口 `[lo, hi]`（含两端）的高亮。返回**与请求窗口对齐**的
@@ -302,6 +361,13 @@ impl Highlighter {
             if lo >= self.base {
                 let cached_end = self.base + self.lines.len();
                 if hi + 1 > cached_end {
+                    // 缺口巨大（拖滚动条在大文档上暴跳）→ 有界重锚，避免逐行解析整个
+                    // 前缀卡死 UI 线程；缺口小则正常向下扩展（作用域栈完整）。
+                    let gap = hi.saturating_sub(cached_end).saturating_add(1);
+                    if gap > REANCHOR_GAP {
+                        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+                        return;
+                    }
                     self.extend_down(buffer, cached_end, hi);
                     if self.covered(lo, hi) {
                         return;
@@ -335,6 +401,23 @@ impl Highlighter {
 
         // D) 整段重解析：从 lo - lookback 起建缓存（打开/整篇替换/滚动上移出缓存/
         // 编辑在缓存起点之上等）。代价 O(窗口 + 回看)，与文档总大小无关。
+        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+    }
+
+    /// 整段重解析建缓存：锚点 = `lo - lookback`，覆盖到请求窗口底 `hi`。
+    /// 代价 O(窗口 + 回看)，与文档/缺口总大小无关；供打开/整篇替换/滚动上下移出缓存/
+    /// 大缺口下跳回锚共用。**注意**：从文档深处用全新 `ParseState` 起锚，多行构造
+    /// （块注释/多行字符串）的着色在作用域栈落定前是近似值——与「向上滚出缓存→整段
+    /// 重解析」既有的取舍一致。
+    fn full_reparse(
+        &mut self,
+        buffer: &Buffer,
+        lo: usize,
+        hi: usize,
+        lookback: usize,
+        version: u64,
+        line_count: usize,
+    ) {
         let start = lo.saturating_sub(lookback).min(line_count.saturating_sub(1));
         let mut lines: Vec<Vec<(Range<usize>, Hsla)>> = Vec::with_capacity(hi - start + 1);
         let mut saves: Vec<ParseState> = Vec::with_capacity(hi - start + 1);
@@ -365,6 +448,7 @@ impl Highlighter {
         self.base = start;
         self.gated_version = version;
         self.dirty = None;
+        self.pending = None;
         self.force_full = false;
     }
 

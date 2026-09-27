@@ -310,6 +310,117 @@ fn highlight_rust_keyword_comment_string() {
 }
 
 #[test]
+fn far_down_jump_reanchors_bounded_not_full_prefix() {
+    // 回归：大文档 `.rs` 拖滚动条时滑块极短，1 鼠标像素 ≈ 数千行，缺口（目标窗口底 −
+    // 缓存上界）巨大。修复前 `extend_down` 会把整个缺口逐行重跑 syntect（16 万行级 →
+    // 数百毫秒），UI 线程卡死 → 内容只有松开才动。修复后缺口 >`REANCHOR_GAP` 改走
+    // **有界重锚**（O(窗口+回看) ≈ 百行级）。测试用 wall-clock 兜底 + 切片/锚点断言：
+    // 重锚后 base = lo − lookback、返回切片仍与请求窗口对齐。
+    let text: String = (0..120_000)
+        .map(|i| match i % 6 {
+            0 => format!("fn foo{i}() {{ // 注释\n"),
+            1 => format!("let x: u32 = {i} + 1; // tail\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            3 => format!("struct S{i} {{ a: u32, }}\n"),
+            4 => format!("impl S{i} {{ fn m(&self) -> &Self {{ self }} }}\n"),
+            _ => format!("let s = \"str{i}\"; /* block comment {i} */\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    // 预热（不计入计时，真实 App 打开/首滚时已发生）：全局语法集懒加载、ropey 大文行索引、顶部缓存。
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(top.len(), 109);
+    let _deep_probe = b.line_text(72_000);
+
+    // 纯 syntect 基线：另一次等价「有界重锚」的开销（~141 行新解析，Load 已预热）。
+    // 作为相对阈值——debug/release 下 per-line syntect 成本差 ~30×，绝对 ms 阈值必然
+    // 偏脆；只要远跳不超过基线 ~30×，就证明它没在逐行扫整个 7.2 万行缺口（那会是
+    // ~500×+）。
+    let base_us = {
+        let t = std::time::Instant::now();
+        hl.highlight_window(&b, 30_000, 30_124, 16).to_vec();
+        t.elapsed().as_micros()
+    };
+    assert_eq!(hl.base(), 30_000 - 16);
+
+    // 远跳到 ~60% 处（滚动条拖动）。
+    let t = std::time::Instant::now();
+    let rows = hl.highlight_window(&b, 72_000, 72_108, 16).to_vec();
+    let far_us = t.elapsed().as_micros();
+    assert_eq!(rows.len(), 72_108 - 72_000 + 1, "返回切片应与请求窗口对齐");
+    assert_eq!(hl.base(), 72_000 - 16, "应重锚到 lo − lookback，而非把缓存建到 0");
+    assert!(
+        far_us < base_us.saturating_mul(30),
+        "远跳高亮应≈一次有界重锚（基线 {base_us}µs，实测 {far_us}µs）——疑似仍在逐行扫整个缺口"
+    );
+
+    // 重锚后小幅向下滚：缺口小 → 正常 `extend_down`（只解析新增 ~92 行，不整前缀）。
+    // 相对基线（~141 行重锚）校验：该成本应是「缺口行数」级别而非前缀（~500×）。
+    let t2 = std::time::Instant::now();
+    let again = hl.highlight_window(&b, 72_100, 72_200, 16).to_vec();
+    let hit_us = t2.elapsed().as_micros();
+    assert_eq!(again.len(), 101);
+    assert!(
+        hit_us < base_us.saturating_mul(2),
+        "重锚后小幅滚动应只支付缺口行（基线 {base_us}µs，实测 {hit_us}µs）"
+    );
+}
+
+#[test]
+fn deferred_scroll_skips_syntect_until_settled() {
+    // 回归：大文档 `.rs` 拖滚动条时，滚动中的每一帧都不能同步做 syntect 有界重锚
+    // （DEBUG 下 ~百 ms/次 → 帧率个位数 → 滑块/内容跟不紧鼠标）。`build_rows` 的
+    // 快路径把窗口登记为 `pending`、本帧用空样式渲染；窗口稳定（相邻帧一致）后
+    // `settle_pending` 补一次重锚上色。这里验证 Highlighter 的延后 API 契约：
+    // 覆盖/小缺口 → 快路径；大缺口 → 延后；settle → 有颜色且对齐。
+    let text: String = (0..120_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // 注释 {i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+
+    // 首帧：顶部窗口（快路径，覆盖/小扩展）。
+    assert!(hl.accept_deferred(0, 108, 16), "顶部窗口应走快速路径");
+    assert_eq!(hl.pending(), None, "快路径不登记 pending");
+    let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert!(!top[0].is_empty(), "快速路径应有颜色");
+
+    // 大缺口：注册 pending，且**不**立刻重锚（本帧空样式渲染的前提）。
+    let quick = hl.accept_deferred(72_000, 72_108, 16);
+    assert!(!quick, "大缺口应延后（本帧跳过 syntect）");
+    assert_eq!(hl.pending(), Some((72_000, 72_108, 16)));
+
+    // 下一帧同一窗口 → 滚动已停 → settle 补重锚 → 之后有颜色且切片对齐。
+    let prev = hl.pending();
+    let quick2 = hl.accept_deferred(72_000, 72_108, 16);
+    assert!(!quick2);
+    assert_eq!(prev, Some((72_000, 72_108, 16)), "相邻帧窗口一致 → 满足 settle 前提");
+    assert!(hl.settle_pending(&b), "settle 应补齐缓存");
+    let rows = hl.highlight_window(&b, 72_000, 72_108, 16).to_vec();
+    assert_eq!(rows.len(), 109);
+    assert!(!rows[0].is_empty(), "settle 后窗口应有颜色");
+    assert_eq!(hl.pending(), None, "settle 消耗掉 pending");
+
+    // 滚动停住后（缓存深锚在 71984）切回顶部小窗：上移越出缓存同样要重锚 → 一致延后
+    //（不引入「上滚一键瞬卡」）。窗口稳定后 settle 同样能补齐。
+    assert!(!hl.accept_deferred(0, 60, 16), "上移出缓存应同样延后");
+    assert_eq!(hl.pending(), Some((0, 60, 16)));
+    let prev2 = hl.pending();
+    assert!(!hl.accept_deferred(0, 60, 16));
+    assert_eq!(prev2, Some((0, 60, 16)));
+    assert!(hl.settle_pending(&b), "上移的 settle 也应补齐缓存");
+    assert_eq!(hl.highlight_window(&b, 0, 60, 16).len(), 61);
+}
+
+#[test]
 fn highlight_window_aligned_to_base_for_batched_indexing() {
     // 视图 `build_rows` 依赖 `highlight_window(lo, hi, lookback)` 返回**与请求
     // 窗口对齐**的切片：第 0 项 = `lo` 行、总长 = hi − lo + 1，可用 `rows[r - lo]`

@@ -1001,24 +1001,42 @@ impl CodeEditor {
         } else {
             // 把最近编辑的增量登记喂给高亮器（局部重解析 + 收敛早退），只取走一次。
             self.highlighter.set_dirty(self.hl_dirty.take());
-            self.highlighter
-                .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
-                .to_vec()
-                .into_iter()
-                .map(|runs| {
-                    runs.into_iter()
-                        .map(|(r, c)| {
-                            (
-                                r,
-                                HighlightStyle {
-                                    color: Some(c),
-                                    ..Default::default()
-                                },
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<Vec<_>>()
+            // 大文档拖滚动条：窗口未覆盖且需有界重锚时，**本帧先用空样式渲染**
+            // （syntect 解析延后：帧廉价 → 滑块/内容紧跟鼠标）；滚动停住（相邻帧
+            // 窗口一致）由 `settle_pending` 补一次有界重锚，颜色随后落位。
+            let prev_pending = self.highlighter.pending();
+            let quick = self.highlighter.accept_deferred(lo_l, hi_l, HL_LOOKBACK_LINES);
+            let settle = !quick
+                && prev_pending == Some((lo_l, hi_l, HL_LOOKBACK_LINES));
+            if quick || settle {
+                if settle {
+                    self.highlighter.settle_pending(&self.buffer);
+                }
+                self.highlighter
+                    .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
+                    .to_vec()
+                    .into_iter()
+                    .map(|runs| {
+                        runs.into_iter()
+                            .map(|(r, c)| {
+                                (
+                                    r,
+                                    HighlightStyle {
+                                        color: Some(c),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                // 延后：本窗空样式（文本/光标/选区仍正确，仅颜色下一帧补齐）。
+                // 预约下一帧：滚动停住（窗口不再变）让 `settle` 补一次有界重锚上色；
+                // 覆盖后不再预约，自动静止（无空转帧）。
+                window.request_animation_frame();
+                std::iter::repeat_n(Vec::new(), hi_l - lo_l + 1).collect()
+            }
         };
         // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
