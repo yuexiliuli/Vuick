@@ -1,8 +1,9 @@
 //! menu：顶部菜单栏 + 下拉菜单（gpui_component DropdownMenu / PopupMenu）。
 
 use super::*;
-use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use crate::ui::button::{Button, ButtonVariants as _};
+// `.dropdown_menu(...)` 暂复用 gpui_component menu（#7 落地后移除）。
+use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 
 impl EditorApp {
     /// 构造一个带右侧快捷键提示的菜单项；点击后通过弱引用更新本应用状态。

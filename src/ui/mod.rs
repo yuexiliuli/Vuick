@@ -9,6 +9,7 @@
 //! - [`theme`]：自研主题（ColorScheme/ThemeMode/Theme global），替换 `gpui_component::Theme`
 //! - [`icon`]：自绘图标（`IconName` + `Icon`），替换 `gpui_component::{Icon, IconName}`
 //! - [`scrollbar`]：滚动条（`Scrollbar`/`ScrollbarHandle`/`ScrollbarMode`），替换 `gpui_component::scroll`
+//! - [`button`]：按钮（`Button`/`ButtonVariant`/`ButtonVariants`），替换 `gpui_component::button`
 //!
 //! # 组件约定（新组件照此执行）
 //! 1. **一文件一组件**，文件放在本目录（或独立子目录），公开面收敛到 `ui::<模块>`，
@@ -28,6 +29,7 @@
 //! - `theme::Theme::set` 期间保留对 `gpui_component::Theme` 的兼容桥（双轨同色），
 //!   彻底移除 gpui-component 后删桥。
 
+pub mod button;
 pub mod icon;
 pub mod scrollbar;
 pub mod theme;
