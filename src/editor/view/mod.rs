@@ -35,7 +35,7 @@ use gpui::{
     KeyDownEvent, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, ScrollHandle, SharedString, Window,
 };
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 use crate::config::layout::{BRACKET_GUIDE_CLOSE_TAIL_LINES, BRACKET_GUIDE_OPEN_HEAD_LINES};
 use crate::editor::markdown::MarkdownDecor;
@@ -603,7 +603,7 @@ impl CodeEditor {
         self.font_size.as_f32()
     }
 
-    pub fn buffer_text(&self) -> &gpui_component::input::Rope {
+    pub fn buffer_text(&self) -> &ropey::Rope {
         self.buffer.text()
     }
 

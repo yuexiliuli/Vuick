@@ -482,7 +482,7 @@ fn doc_rope_path_matches_str_path() {
     let n_lines = src.split('\n').count();
 
     let str_doc = crate::markdown::doc::Doc::open(SharedString::from(src));
-    let rope = gpui_component::input::Rope::from(src);
+    let rope = ropey::Rope::from(src);
     let rope_doc = crate::markdown::doc::Doc::open_rope(rope);
 
     assert_eq!(str_doc.block_count(), rope_doc.block_count(), "两源块数应一致");
@@ -544,7 +544,7 @@ fn doc_byte_map_maps_render_back_to_line_source() {
 fn window_rows_match_blocks_for_all_windows() {
     use crate::markdown::doc::Doc;
     use gpui::SharedString;
-    use gpui_component::input::Rope;
+    use ropey::Rope;
     let content = "# 标题\r\n正文 **粗**\r\n\r\n```rust\r\nlet a = 1;\r\nlet b = 2;\r\n```\r\n\r\n| A | B |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\n> 引用\r\n\r\n![图](x.png)\r\n图片后段落\r\n";
     let str_doc = Doc::open(SharedString::from(content));
     let rope_doc = Doc::open_rope(Rope::from(content));
@@ -669,7 +669,7 @@ fn ref_offset_from_utf16(s: &str, utf16: usize) -> usize {
 fn doc_utf16_index_matches_full_recompute() {
     use crate::markdown::doc::Doc;
     use gpui::SharedString;
-    use gpui_component::input::Rope;
+    use ropey::Rope;
 
     let docs = [
         "",

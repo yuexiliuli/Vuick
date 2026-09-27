@@ -6,8 +6,8 @@
 //! - **zed**：编辑事务是撤销/重做的最小单位，光标随事务一起恢复（见 [`crate::editor::undo`]）。
 //!
 //! 坐标约定：对外一律 **UTF-8 字节偏移**（Rope 切片天然按字节）；行/列换算由
-//! [`RopeExt`]（`gpui_component::input::RopeExt`）提供，列在本模块里指「字符列」
-//! （Unicode 标量数），与渲染的等宽列同向。
+//! [`RopeExt`]（`crate::editor::rope_ext`，收编自 gpui-component）提供，列在本模块里
+//! 指「字符列」（Unicode 标量数），与渲染的等宽列同向。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,8 +20,10 @@ pub(crate) const LINE_SAMPLE_STRIDE: usize = 256;
 pub(crate) const LINE_SAMPLE_SAFETY: f32 = 1.2;
 
 use gpui::SharedString;
-use gpui_component::input::{Rope, RopeExt};
+use ropey::Rope;
 use ropey::LineType;
+
+use super::rope_ext::RopeExt;
 
 /// 一条已应用的文本编辑（可逆），撤销/重做的原子单位。
 ///

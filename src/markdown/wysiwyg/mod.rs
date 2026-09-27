@@ -54,7 +54,7 @@ use crate::markdown::parse::recognition::{self, LinkHit};
 pub(crate) type BlockLayoutRef = Rc<std::cell::RefCell<element::BlockLayout>>;
 use crate::markdown::parse::inline_style;
 use crate::markdown::view::style::StyleParams;
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, PartialEq, Debug)]

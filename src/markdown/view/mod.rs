@@ -45,7 +45,7 @@ use gpui::{
     ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
     Window,
 };
-use gpui_component::input::Rope;
+use ropey::Rope;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use crate::config::limits::{
@@ -219,7 +219,7 @@ impl PreviewSrc {
         match self {
             PreviewSrc::Str(s) => s.lines().count(),
             PreviewSrc::Rope(r) => {
-                use gpui_component::input::RopeExt;
+                use crate::editor::rope_ext::RopeExt;
                 r.lines_len()
             }
         }

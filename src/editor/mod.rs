@@ -39,6 +39,7 @@ pub mod fold;
 pub mod highlight;
 mod markdown;
 pub mod movement;
+pub mod rope_ext;
 pub mod selection;
 pub mod undo;
 mod view;

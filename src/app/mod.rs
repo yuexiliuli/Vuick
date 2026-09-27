@@ -36,7 +36,8 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, VisualContext, Window, WindowBounds,
     WindowOptions,
 };
-use gpui_component::input::{InputEvent, InputState, Rope};
+use gpui_component::input::{InputEvent, InputState};
+use ropey::Rope;
 use crate::ui::icon::{Icon, IconName};
 
 // WYSIWYG 预览编辑——本项目 `crate::markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。

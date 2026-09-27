@@ -134,7 +134,7 @@ fn buffer_sample_line_stats_placeholder_estimate() {
     // 滚动条不至于坍缩成视口宽。要求：恒采样第 0 行；估计 ≥ 采样最宽（×1.2 取整）；
     // 全空行返回空直方图（无内容 → 无横向量程）。
     use crate::editor::buffer::{sample_line_stats, LINE_SAMPLE_SAFETY};
-    use gpui_component::input::Rope;
+    use ropey::Rope;
 
     // 最宽行恰在第 0 行（恒采样）：8 格 / 8 字符
     let rope = Rope::from("zzzzzzzz\nxy\nhi\n");

@@ -5,7 +5,8 @@
 //! （选项卡栏之下、状态栏之上）。
 
 use super::*;
-use gpui_component::input::{Input, RopeExt};
+use gpui_component::input::Input;
+use crate::editor::rope_ext::RopeExt;
 
 use crate::config::limits::SEARCH_RESULT_CAP;
 

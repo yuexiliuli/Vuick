@@ -1947,7 +1947,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         });
         let cx: &mut VisualTestContext = cx;
         // 窗口模式的源文本（块数 > WINDOWED_MIN_BLOCKS）。
-        use gpui_component::input::Rope;
+        use ropey::Rope;
         let iters = crate::config::limits::WINDOWED_MIN_BLOCKS + 600;
         let mut src = String::new();
         for i in 0..iters {

@@ -7,7 +7,7 @@ use super::rows::{
 };
 use std::ops::Range;
 use gpui::{Image, SharedString};
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 /// 两字符串从前向后相同的字节数（公共前缀长度）。
 ///

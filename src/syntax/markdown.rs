@@ -19,8 +19,11 @@ use std::ops::Range;
 
 use gpui::{Context, HighlightStyle, SharedString, Window};
 use gpui_component::input::{
-    EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope, RopeExt,
+    EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter,
 };
+use ropey::Rope;
+
+use crate::editor::rope_ext::RopeExt;
 
 use crate::config::limits::{LOOKBACK_LINES, MAX_TEXT_BYTES};
 use crate::syntax::{resolve_styles, EditTracker};

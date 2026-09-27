@@ -5,7 +5,8 @@
 //! 通知**容器与计时由调用方（App）自持**：`EditorApp::notifications` 保存 `Notification` 数据，
 //! 渲染时经 [`Notification::render_card`] 产出卡片；点击关闭 / 定时移除走 App 自己的
 //! `remove_notification1::<T>(key)`（自托管 `spawn` 计时，不依赖通知层窗口激活倒计时）。
-//! 这样组件与 gpui-component 的 `Root`/`WindowExt` 完全解耦（#9/#11 落地即彻底断开）。
+//! 这样组件与 gpui-component 的 `Root`/`WindowExt` 完全解耦（#9/#11 落地即彻底断开；
+//! `WindowExt` 现已确认全仓零引用，随 #9 一并关闭）。
 
 use std::any::TypeId;
 

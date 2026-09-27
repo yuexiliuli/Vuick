@@ -5,7 +5,7 @@
 //! 抗等宽/混排与行长度差异。
 
 use crate::editor::buffer::Buffer;
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 /// 上一个字符的起始字节（已在偏移处或越界则不变）。
 pub fn char_left(rope: &Rope, offset: usize) -> usize {

@@ -8,7 +8,7 @@
 use std::ops::Range;
 
 use gpui::{Image, SharedString};
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 use super::blocks::{classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
 use super::rows::{inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData};

@@ -2011,7 +2011,8 @@
     #[test]
     #[ignore]
     fn bench_edit_sync_counts_old_materialize_vs_rope() {
-        use gpui_component::input::{Rope, RopeExt};
+        use crate::editor::rope_ext::RopeExt;
+        use ropey::Rope;
         use std::time::Instant;
         let line = "普通段落内容 alpha beta 关键字 shanghai 你好\n";
         let mut doc = String::with_capacity(line.len() * 160_000);
@@ -2324,8 +2325,8 @@
         let content = (0..12_000)
             .map(|i| format!("{line} {i:010}\n"))
             .collect::<String>();
-        use gpui_component::input::RopeExt as _;
-        let rope = gpui_component::input::Rope::from(content.as_str());
+        use crate::editor::rope_ext::RopeExt as _;
+        let rope = ropey::Rope::from(content.as_str());
         let line_count = rope.lines_len();
         assert!(line_count > 4_096, "测试应远超固定窗口（512），实际 {line_count} 行");
 
@@ -2548,8 +2549,8 @@
         let content = (0..90_000)
             .map(|i| format!("{line} {i:010}\n"))
             .collect::<String>();
-        use gpui_component::input::RopeExt as _;
-        let rope = gpui_component::input::Rope::from(content.as_str());
+        use crate::editor::rope_ext::RopeExt as _;
+        let rope = ropey::Rope::from(content.as_str());
         let line_count = rope.lines_len();
 
         let ed_ent = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
@@ -3871,11 +3872,11 @@
         };
 
         let t0 = std::time::Instant::now();
-        let rope_oneshot = gpui_component::input::Rope::from(full.as_str());
+        let rope_oneshot = ropey::Rope::from(full.as_str());
         let ms_oneshot = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t0 = std::time::Instant::now();
-        let mut rope_incr = gpui_component::input::Rope::new();
+        let mut rope_incr = ropey::Rope::new();
         let chunk = 1 << 20;
         let mut i = 0usize;
         while i < full.len() {
@@ -4091,7 +4092,7 @@
 
         // —— C. 探针：裸 ropey Rope.insert vs 编辑器 insert，分离引擎/回调 ——
         {
-            use gpui_component::input::Rope;
+            use ropey::Rope;
             let text = cx.update(|_, cx| editor.read(cx).value().to_string());
             let mid = text.len() / 2;
             let mut rope = Rope::from(text.as_str());

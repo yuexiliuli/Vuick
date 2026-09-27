@@ -240,7 +240,7 @@ pub(crate) fn produce_open_chunks(
 mod tests {
     use super::*;
     use crate::editor::buffer::{compute_line_stats, LineWidthHistogram};
-    use gpui_component::input::Rope;
+    use ropey::Rope;
 
     fn collect(path: &std::path::Path, read_buf: usize) -> (String, LineWidthHistogram, usize) {
         let mut text = String::new();

@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 
 use gpui::SharedString;
-use gpui_component::input::Rope;
+use ropey::Rope;
 
 use super::ir::IrKind;
 use super::parse::{

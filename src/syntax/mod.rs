@@ -35,8 +35,9 @@ use gpui_component::highlighter::{
 };
 use gpui_component::input::{
     EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter,
-    InputHighlighterFactory, Rope,
+    InputHighlighterFactory,
 };
+use ropey::Rope;
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxReference, SyntaxSet};
 
 /// 窗口内高亮结果：各行片段与折叠区间（`compute_window_doc` 与高亮 API 共用）。
@@ -349,7 +350,7 @@ fn build_line_starts(text: &str) -> Vec<usize> {
 /// 从 ropey Rope 构建行首字节索引（行首调用 `lazy` 求字节偏移，O(行数)，
 /// 不对全文做字符串复制）。
 fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
-    use gpui_component::input::RopeExt;
+    use crate::editor::rope_ext::RopeExt;
     let mut starts = Vec::with_capacity(rope.lines_len());
     for row in 0..rope.lines_len() {
         starts.push(rope.line_start_offset(row));
@@ -1345,7 +1346,7 @@ mod tests {
     /// 而不是窗口内的小偏移（漏平移会让中部/末尾窗口的高亮与折叠坐标错乱）。
     #[test]
     fn window_doc_produces_document_coordinates() {
-        use gpui_component::input::RopeExt;
+        use crate::editor::rope_ext::RopeExt;
 
         // ~1000 行、含注释/字符串/花括号的 rust 文档
         let mut src = String::new();
