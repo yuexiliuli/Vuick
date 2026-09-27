@@ -1020,9 +1020,15 @@ pub(crate) fn github_theme(dark: bool) -> HighlightTheme {
 
 /// 把 GitHub 语法配色装进当前主题（明/暗随 `Theme.mode`）。启动与切换主题后调用，
 /// 因为 [`gpui_component::Theme::change`] 会用配置重置 `highlight_theme`。
+/// 编辑器底色/前景取自 `crate::ui::theme` 语义色板（第 3 波迁移：取代原缩死的
+/// #111827/#c9d1d9/#24292f），语法 token 色保持 GitHub（Primer）色板不变。
 pub(crate) fn install_github_theme(cx: &mut gpui::App) {
-    let theme = gpui_component::Theme::global_mut(cx);
-    theme.highlight_theme = Arc::new(github_theme(theme.mode.is_dark()));
+    let app_theme = crate::ui::theme::Theme::global(cx);
+    let mut theme = github_theme(app_theme.is_dark());
+    theme.style.editor_background = Some(app_theme.colors.bg.into());
+    theme.style.editor_foreground = Some(app_theme.colors.fg.into());
+    let component = gpui_component::Theme::global_mut(cx);
+    component.highlight_theme = Arc::new(theme);
 }
 
 /// 明/暗 GitHub 语法色板（各静态缓存一份）。代码块渲染**每帧**都要把逐行语义名

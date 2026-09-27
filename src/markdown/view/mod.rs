@@ -2132,18 +2132,16 @@ pub(crate) fn selection_color(cx: &App) -> Hsla {
 
 /// EPUB 脚注悬浮卡片：主题配色的 popover 样小卡片，展示一条注释正文。
 fn note_card(text: SharedString, _at: Point<Pixels>, cx: &App) -> gpui::AnyElement {
-    let theme = gpui_component::Theme::global(cx);
-    let colors = theme.semantic_tokens().colors;
-    let card_bg: Hsla = if theme.is_dark() {
-        gpui::rgb(0x1e2430).into()
-    } else {
-        gpui::rgb(0xffffff).into()
-    };
+    let theme = crate::ui::theme::Theme::global(cx);
+    let colors = theme.colors;
+    let card_bg: Hsla = colors.popover_bg.into();
+    let border: Hsla = colors.border.into();
+    let fg: Hsla = colors.fg.into();
     div()
         .debug_selector(|| "md-note-card".into())
         .bg(card_bg)
         .border_1()
-        .border_color(colors.border)
+        .border_color(border)
         .rounded_md()
         .p_3()
         .max_w(px(460.))
@@ -2151,7 +2149,7 @@ fn note_card(text: SharedString, _at: Point<Pixels>, cx: &App) -> gpui::AnyEleme
             div()
                 .whitespace_normal()
                 .text_size(px(12.5))
-                .text_color(colors.foreground)
+                .text_color(fg)
                 .child(text),
         )
         .into_any_element()

@@ -17,21 +17,13 @@
 
 use std::ops::Range;
 
-use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, StrikethroughStyle, UnderlineStyle, px, rgb};
+use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, StrikethroughStyle, UnderlineStyle, px};
 
-use crate::config::colors::{LINK_DARK, LINK_LIGHT};
 use crate::editor::buffer::Buffer;
 
 /// 记号淡化强度（gpui `fade_out`：alpha × (1 − 值)）。0.75 → 保留 25% 透明度，
 /// 依稀可见但明显弱于正文；想完全隐藏记号改成 1.0 即可（底稿仍占位、仍可编辑）。
 const MARKER_FADE: f32 = 0.75;
-/// 行内代码/围栏内容背景（GitHub 浅/暗）。
-const CODE_BG_LIGHT: u32 = 0xeff1f3;
-const CODE_BG_DARK: u32 = 0x2b3340;
-
-/// 标题文字色（GitHub markup.heading 浅/暗，与 syntax 高亮一致）。
-const HEADING_LIGHT: u32 = 0x0550ae;
-const HEADING_DARK: u32 = 0x79c0ff;
 
 /// 行内装饰类型：决定一段字形画什么富样式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -442,19 +434,17 @@ fn scan_line(line: &str) -> Vec<(Range<usize>, Deco)> {
 }
 
 /// 把装饰 run 解析成最终 `HighlightStyle`（颜色/加粗/斜体/删除线/底/淡化），
-/// 明暗随 `dark`。
+/// 明暗随 `dark`。颜色单一来源 `crate::ui::theme::ColorScheme`（第 3 波迁移：
+/// 原 `CODE_BG_*/HEADING_*/LINK_*` 硬编码收编进语义色板，值逐字节不变）。
 fn resolve_runs(runs: &[(Range<usize>, Deco)], dark: bool) -> Vec<(Range<usize>, HighlightStyle)> {
-    let code_bg: Hsla = if dark {
-        rgb(CODE_BG_DARK).into()
+    let cs = if dark {
+        crate::ui::theme::ColorScheme::dark()
     } else {
-        rgb(CODE_BG_LIGHT).into()
+        crate::ui::theme::ColorScheme::light()
     };
-    let link: Hsla = if dark { rgb(LINK_DARK).into() } else { rgb(LINK_LIGHT).into() };
-    let heading: Hsla = if dark {
-        rgb(HEADING_DARK).into()
-    } else {
-        rgb(HEADING_LIGHT).into()
-    };
+    let code_bg: Hsla = cs.editor_code_bg.into();
+    let link: Hsla = cs.link.into();
+    let heading: Hsla = cs.heading.into();
 
     let mut out = Vec::with_capacity(runs.len());
     for (r, deco) in runs {

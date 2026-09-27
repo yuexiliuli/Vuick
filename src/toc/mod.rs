@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, px, rgb, App, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
+    div, px, App, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use crate::ui::icon::{Icon, IconName};
@@ -71,6 +71,7 @@ pub(crate) fn toc_item_frame(
     fg: Hsla,
     muted: Hsla,
     hover_bg: Hsla,
+    accent: Hsla,
     on_select: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_collapse: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
@@ -100,7 +101,7 @@ pub(crate) fn toc_item_frame(
         .left(px(2.))
         .w(px(2.))
         .rounded_full()
-        .bg(rgb(crate::config::colors::RESIZE_ACCENT))
+        .bg(accent)
         .opacity(0.0)
         .group_hover("toc-item", |style| style.opacity(1.0));
     row = row.child(indicator);
@@ -143,7 +144,7 @@ pub(crate) fn toc_item_frame(
                 .rounded_full()
                 .flex_shrink_0()
                 .bg(if top_accent {
-                    rgb(crate::config::colors::RESIZE_ACCENT).into()
+                    accent
                 } else {
                     muted
                 }),

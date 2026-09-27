@@ -14,7 +14,6 @@ use gpui::{
 };
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
-use crate::config::colors::RESIZE_ACCENT;
 use crate::config::markdown::{
     IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH_PX,
     TABLE_SCROLLBAR_RESERVE_PX,
@@ -296,10 +295,9 @@ fn text_child(
             RunKind::Link | RunKind::Image => {}
         }
     }
-    // 引用标记 `[n]`（文内 `[^n]` 与末尾定义 `[!n]` 都显示成 `[n]`）→ 全局强调色
-    // RESIZE_ACCENT，与正文区分开、醒目地表明它是可点击的链接（点击做
-    // 「文内 ↔ 末尾定义」双向跳转）。
-    let link_color: Hsla = gpui::rgb(RESIZE_ACCENT).into();
+    // 引用标记 `[n]`（文内 `[^n]` 与末尾定义 `[!n]` 都显示成 `[n]`）→ 语义强调色
+    // （`StyleParams::accent`，与拖拽强调线同源 #0078d4，醒目地表明它是可点击的链接）。
+    let link_color: Hsla = p.accent;
     for (range, _) in notes.iter().chain(note_defs.iter()) {
         let end = range.end.min(text.len());
         if range.start < end {

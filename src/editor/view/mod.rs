@@ -630,24 +630,26 @@ impl CodeEditor {
     // -----------------------------------------------------------------
 
     fn refresh_metrics(&mut self, window: &mut Window, cx: &mut App) {
-        let theme = gpui_component::Theme::global(cx);
-        let typo = theme.semantic_tokens().typography;
-        let colors = theme.semantic_tokens().colors;
+        // 第 3 波迁移：typography/语义色单一来自 `crate::ui::theme`（不再读
+        // gpui-component 主题 token）。等宽字体族与行高比例、缺省正文字号都由
+        // `Theme::typography` 收敛（统一缩放架构，见 docs/ui-migration.md）。
+        let theme = crate::ui::theme::Theme::global(cx);
+        let typo = &theme.typography;
+        let colors = theme.colors;
         let dark = theme.is_dark();
 
         let mono = typo.mono.clone();
-        let mono_md = typo.mono_md;
-        // 字号覆盖：应用 Ctrl+=/- 调节（默认 None = 主题字号）
+        // 字号覆盖：应用 Ctrl+=/- 调节（默认 None = 编辑器等宽缺省字号/行高，保留
+        // gpui-component `mono_md` 的 13/20 既有默认；应用侧恒有 override=14）。
         let (font_size, line_height) = match self.font_override {
-            Some(px_override) => {
-                let ratio = if mono_md.size.as_f32() > 0. {
-                    mono_md.line_height.as_f32() / mono_md.size.as_f32()
-                } else {
-                    1.3
-                };
-                (px(px_override), px(px_override * ratio))
-            }
-            None => (mono_md.size, mono_md.line_height),
+            Some(px_override) => (
+                px(px_override),
+                px(px_override * typo.editor_line_height_ratio),
+            ),
+            None => (
+                px(typo.editor_default_size),
+                px(typo.editor_default_size * typo.editor_line_height_ratio),
+            ),
         };
 
         let text_system = window.text_system();
@@ -671,21 +673,20 @@ impl CodeEditor {
         self.font_size = font_size;
         self.line_height = line_height;
         self.char_width = char_width;
-        self.bg = colors.background;
-        self.fg = colors.foreground;
-        self.gutter_fg = colors.muted_foreground;
+        self.bg = colors.bg.into();
+        self.fg = colors.fg.into();
+        self.gutter_fg = colors.fg_muted.into();
         // 垂直标尺线：次要前景（与行号同源、已验证明暗主题都可见；不用 `border`——
         // 主题默认可能为透明）。细微参考线不刺眼。
-        self.ruler_color = colors.muted_foreground.opacity(0.55);
+        self.ruler_color = colors.fg_muted.opacity(0.55).into();
         // 括号标尺竖线：更淡，纯视觉参考不干扰阅读。
-        self.guide_color = colors.muted_foreground.opacity(0.4);
+        self.guide_color = colors.fg_muted.opacity(0.4).into();
         // 点亮竖线（guide click highlight）：硬编码强调蓝（用户口径，勿抽 config）。
         self.active_guide_color = rgb(0x0078d4).opacity(0.9).into();
-        // 光标不能用 colors.accent：本应用 Light 主题的 accent=l≈0.961（#f5f5f5），
-        // 白底上画白光标=看不见（用户反馈“点击无闪烁光标”就是这个）。用前景墨色，
-        // 明/暗主题下都一定可见。
-        self.caret_color = colors.foreground;
-        // 选区底色同样避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
+        // 光标不能用 colors.accent：Light 主题 accent = #0078d4 蓝，白底上对比足够，
+        // 但沿用既有口径用前景墨色，明/暗主题下都一定可见。
+        self.caret_color = colors.fg.into();
+        // 选区底色避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
         self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
         self.metrics_ready = true;
 

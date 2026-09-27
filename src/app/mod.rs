@@ -144,14 +144,15 @@ struct TabDragGhost {
 }
 
 impl Render for TabDragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
         div()
             .id("tab-drag-ghost")
             .debug_selector(|| "tab-drag-ghost".into())
             .px_3()
             .py_1()
             .rounded_md()
-            .bg(rgb(crate::config::colors::RESIZE_ACCENT))
+            .bg(accent)
             .text_color(white())
             .text_size(px(12.))
             .child(self.name.clone())

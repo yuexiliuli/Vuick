@@ -1578,13 +1578,12 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
 }
 
 /// 回归：代码块背景按主题定制——白 #F3F4F4、黑 #282936（用户指定色板）。
+/// 明暗切换走 `ui::theme::Theme::set`（第 3 波后 `StyleParams` 从 `ui::theme` 取色）。
 #[gpui::test]
 fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     // 浅色主题
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
     assert_eq!(
         light,
@@ -1592,9 +1591,7 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
         "白主题代码块背景应为 #F3F4F4"
     );
     // 深色主题
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx));
     let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
     assert_eq!(
         dark,
@@ -1602,9 +1599,7 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
         "黑主题代码块背景应为 #282936"
     );
     // 恢复浅色（主题为全局共享，避免影响后续测试）
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
 }
 
 /// 行内代码（反引号）pill 配色单一源：白 #F3F4F4/#222222、黑 #3E3F40/#DADADA——
@@ -1613,21 +1608,15 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
 #[gpui::test]
 fn inline_code_palette_single_source(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
     assert_eq!(light.code_inline_fg, gpui::rgb(0x222222).into(), "白主题行内代码文字");
     assert_eq!(light.code_inline_bg, gpui::rgb(0xf3f4f4).into(), "白主题行内代码底");
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx));
     let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
     assert_eq!(dark.code_inline_fg, gpui::rgb(0xdadada).into(), "黑主题行内代码文字");
     assert_eq!(dark.code_inline_bg, gpui::rgb(0x3e3f40).into(), "黑主题行内代码底");
-    cx.update(|cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-    });
+    cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
 }
 
 /// 源码行 → 渲染行映射（EPUB 搜索跳转）：标题/空行/段落各占一渲染行，

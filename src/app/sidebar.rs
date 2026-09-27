@@ -141,7 +141,7 @@ impl EditorApp {
         if !self.sidebar_panel_open {
             return Vec::new();
         }
-        let accent = rgb(crate::config::colors::RESIZE_ACCENT);
+        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
         vec![
             div()
                 .id("sidebar-resize")
@@ -195,7 +195,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
-        let accent: gpui::Hsla = rgb(crate::config::colors::RESIZE_ACCENT).into();
+        let accent: gpui::Hsla = crate::ui::theme::Theme::global(cx).colors.accent.into();
         let specs = [
             (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc"),
             (SidebarView::Search, IconName::Search, "sidebar-btn-search"),
@@ -356,6 +356,7 @@ impl EditorApp {
     fn render_sidebar_toc(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
+        let accent = crate::ui::theme::Theme::global(cx).colors.accent.into();
 
         // 折叠状态按文档缓存：切换文档即清空，并重新按新文档内容自适应宽度
         let active = self.active_tab;
@@ -407,6 +408,7 @@ impl EditorApp {
                                 fg,
                                 muted,
                                 active_bg,
+                                accent,
                                 move |_, _w, cx| {
                                     if page != usize::MAX {
                                         wk.update(cx, |v, cx| {
@@ -454,6 +456,7 @@ impl EditorApp {
                                 fg,
                                 muted,
                                 active_bg,
+                                accent,
                                 move |_, _w, cx| {
                                     wk.update(cx, |v, cx| {
                                         v.scroll_to_row(row_ix);

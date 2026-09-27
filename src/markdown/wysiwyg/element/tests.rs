@@ -2677,13 +2677,14 @@ A-->B
             let theme = ed.read(cx).theme.clone();
             let p = StyleParams::from_theme_with_font(cx, Some(f32::from(theme.font_size)));
             assert_eq!(theme.link, p.link, "WyTheme.link 抄自 StyleParams.link");
-            // 浅色主题（main.rs 强制 Light）：应与编辑器 LINK_LIGHT #0969da 逐字节一致。
-            let expect = if p.is_dark {
-                gpui::rgb(crate::config::colors::LINK_DARK).into()
+            // 浅色主题（main.rs 强制 Light）：应编辑器 LINK 蓝 #0969da 逐字节一致。
+            let cs = if p.is_dark {
+                crate::ui::theme::ColorScheme::dark()
             } else {
-                gpui::rgb(crate::config::colors::LINK_LIGHT).into()
+                crate::ui::theme::ColorScheme::light()
             };
-            assert_eq!(theme.link, expect, "链接蓝单一源 config::colors::LINK_*");
+            let expect: gpui::Hsla = cs.link.into();
+            assert_eq!(theme.link, expect, "链接蓝单一源 ColorScheme::link");
         });
     }
 

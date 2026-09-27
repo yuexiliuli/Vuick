@@ -236,6 +236,7 @@ impl EditorApp {
             self.bar_bg(),
             self.panel_bg(),
         );
+        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
             let is_active = i == active;
@@ -268,10 +269,10 @@ impl EditorApp {
                     }),
                 );
 
-            // 激活选项卡顶部 2px 蓝色强调线（色 = scrollbar::RESIZE_ACCENT）。
+            // 激活选项卡顶部 2px 蓝色强调线（色 = 语义 `accent`）。
             // 用绝对定位细条绘制：本版 gpui 的 border_color 是整圈一个色，
             // 没有“只染某一边”的 API，无法用 border 实现顶蓝其余透明。
-            let accent = is_active.then(|| {
+            let accent_line = is_active.then(|| {
                 div()
                     .id(SharedString::from(format!("tab-accent-{idx}")))
                     .absolute()
@@ -279,7 +280,7 @@ impl EditorApp {
                     .left(px(0.))
                     .right(px(0.))
                     .h(px(1.))
-                    .bg(rgb(crate::config::colors::RESIZE_ACCENT))
+                    .bg(accent)
                     .into_any_element()
             });
 
@@ -304,8 +305,8 @@ impl EditorApp {
                 .child(if dirty { "● " } else { "" })
                 .child(SharedString::from(name.clone()))
                 .child(close);
-            if let Some(accent) = accent {
-                el = el.child(accent);
+            if let Some(accent_line) = accent_line {
+                el = el.child(accent_line);
             }
             // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
             // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。

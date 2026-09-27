@@ -2,6 +2,10 @@
 //! 所有取值都对齐 gpui_component `node.rs` 的 Markdown 渲染风格：
 //! 段落用 `sm`，标题用语义字号 + 加粗，代码块用 `muted` 底 + 等宽字体，
 //! 引述用浅灰底 + 强调色左边框。
+//!
+//! 第 3 波迁移后：**颜色/等宽字体单一来源 `crate::ui::theme`**（语义色板 +
+//! `Typography`），不再读 gpui-component 主题语义 token；正文/标题字号体系仍由
+//! `config::layout::DEFAULT_FONT_SIZE` 驱动（统一缩放架构）。
 
 use gpui::{px, App, Hsla, Pixels, SharedString};
 
@@ -19,7 +23,7 @@ pub(crate) struct StyleParams {
     pub(crate) divider: Hsla,
     pub(crate) accent: Hsla,
     /// 链接色（`[t](u)` / wiki / tag / 裸 URL；明 #0969da / 暗 #79c0ff，单一源
-    /// `config::colors::LINK_LIGHT/LINK_DARK`——预览 / WYSIWYG / 源码编辑器一个蓝）。
+    /// `ColorScheme::link`——预览 / WYSIWYG / 源码编辑器一个蓝）。
     pub(crate) link: Hsla,
     pub(crate) bg: Hsla,
     /// 引述块背景（浅灰卡片感）。
@@ -60,56 +64,34 @@ pub(crate) fn heading_metrics_for_size(body_fs: f32, level: u8) -> (Pixels, Pixe
 
 impl StyleParams {
     /// 从主题构建排版参数；`font_override` 可覆盖正文/代码字号（EPUB 缩放字号用）。
+    /// 颜色/等宽字体单一来自 `crate::ui::theme`（语义色板 + `Typography`）。
     pub(crate) fn from_theme_with_font(cx: &mut App, font_override: Option<f32>) -> Self {
-        let theme = gpui_component::Theme::global(cx);
-        let tokens = theme.semantic_tokens();
-        let colors = tokens.colors;
-        let typo = tokens.typography;
-        // 正文基准字号：默认与编辑区 / WYSIWYG 对齐（layout::DEFAULT_FONT_SIZE），不再取
-        // 主题 sm——否则预览默认字号与编辑器不一致，三处无法统一调节。有覆盖时按覆盖值缩放；
-        // 正文字号一变，代码/行高系数统一走 `typography_for_size`（同一缩放来源）。
-        let fs = font_override.unwrap_or(crate::config::layout::DEFAULT_FONT_SIZE).max(9.0);
+        let theme = crate::ui::theme::Theme::global(cx);
+        let colors = theme.colors;
+        // 正文基准字号：默认与编辑区 / WYSIWYG 对齐（theme.typography 的缺省正文，=
+        // layout::DEFAULT_FONT_SIZE，见统一缩放架构）。有覆盖时按覆盖值缩放；正文字号
+        // 一变，代码/行高系数统一走 `typography_for_size`（同一缩放来源）。
+        let fs = font_override
+            .unwrap_or(theme.typography.default_body_size)
+            .max(9.0);
         let (pl, cs, cl) = typography_for_size(fs);
         let (para, line, code, code_line) = (px(fs), pl, cs, cl);
         let is_dark = theme.is_dark();
-        // 引用旧 render.rs：引述 = 浅灰底 + 粗左边框；表头 = 浅灰底。暗色模式配深色变体。
-        let (quote_bg, table_head_bg) = if is_dark {
-            (gpui::rgb(0x1b2431).into(), gpui::rgb(0x1f2937).into())
-        } else {
-            (gpui::rgb(0xf9fafb).into(), gpui::rgb(0xf3f4f6).into())
-        };
-        // 代码块背景按主题定制：白 = #F3F4F4，黑 = #282936。
-        let code_bg = if is_dark {
-            gpui::rgb(0x282936).into()
-        } else {
-            gpui::rgb(0xf3f4f4).into()
-        };
-        // 行内代码（反引号）pill 配色按主题定制：白 = 底 #F3F4F4 + 文字 #222222，
-        // 黑 = 底 #3E3F40 + 文字 #DADADA（文字近正文，靠底色 + 等宽字体区分）。
-        let (code_inline_fg, code_inline_bg) = if is_dark {
-            (gpui::rgb(0xdadada).into(), gpui::rgb(0x3e3f40).into())
-        } else {
-            (gpui::rgb(0x222222).into(), gpui::rgb(0xf3f4f4).into())
-        };
-        // 链接蓝：单一源 `config::colors::LINK_LIGHT/DARK`（与源码编辑器同值）。
-        let link = if is_dark {
-            gpui::rgb(crate::config::colors::LINK_DARK).into()
-        } else {
-            gpui::rgb(crate::config::colors::LINK_LIGHT).into()
-        };
+        // 代码块/行内代码/引述/表头/链接等语义色：全部取自色板（第 3 波把
+        // 原硬编码 rgb() 收编进色板，值逐字节不变）。
         Self {
-            mono: typo.mono.clone(),
-            fg: colors.foreground,
-            muted_fg: colors.muted_foreground,
-            code_bg,
-            code_inline_fg,
-            code_inline_bg,
-            divider: colors.border,
-            accent: colors.accent,
-            link,
-            bg: colors.background,
-            quote_bg,
-            table_head_bg,
+            mono: theme.typography.mono.clone(),
+            fg: colors.fg.into(),
+            muted_fg: colors.fg_muted.into(),
+            code_bg: colors.code_block_bg.into(),
+            code_inline_fg: colors.code_inline_fg.into(),
+            code_inline_bg: colors.code_inline_bg.into(),
+            divider: colors.border.into(),
+            accent: colors.accent.into(),
+            link: colors.link.into(),
+            bg: colors.bg.into(),
+            quote_bg: colors.quote_bg.into(),
+            table_head_bg: colors.table_head_bg.into(),
             para_size: para,
             para_line: line,
             para_gap: px(4.),
