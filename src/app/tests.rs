@@ -1230,6 +1230,314 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// Markdown 预览（分屏）纵向滚动条拖拽：向下拖 -> 内容实时向下滚，向上拖 -> 实时反向。
+    /// 回归：预览窗口模式拖拽只写共享 `desired`，render 逐帧 `apply_desired` 落窗口；
+    /// 若该 Apply 在往下方向被 clamp/跳过，会出现「只有松开才动」（用户报告症状方向）。
+    #[gpui::test]
+    async fn md_preview_scrollbar_drag_follows_both_directions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-preview-drag-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, format!("{}\n", "# 标题\n正文段落。\n\n".repeat(600))).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let overlay = cx
+            .debug_bounds("md-vscrollbar-overlay")
+            .expect("预览纵向滚动条叠层应渲染");
+        let abs_top = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                a.tabs[a.active_tab]
+                    .md_preview
+                    .read(cx)
+                    .test_abs_scroll_top()
+            })
+        };
+
+        let before = abs_top(cx);
+        assert_eq!(before.0, 0, "预览初始应在顶部");
+
+        let x = overlay.right() - px(8.);
+        let grab_y = overlay.top() + px(14.);
+        cx.simulate_mouse_down(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+
+        // 未松开向下拖两步 → 预览必须边拖边向下滚。只走 run_until_parked（真实 App 路径）。
+        let mid1_y = overlay.top() + px(120.);
+        cx.simulate_mouse_move(
+            gpui::point(x, mid1_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s1 = abs_top(cx);
+        assert!(
+            s1.0 > before.0 || s1.1 > before.1,
+            "向下拖(1)预览应先实时滚动（abs={s1:?}）——不能等松开才动"
+        );
+
+        let mid2_y = overlay.top() + px(240.);
+        cx.simulate_mouse_move(
+            gpui::point(x, mid2_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s2 = abs_top(cx);
+        assert!(
+            s2.0 > s1.0 || (s2.0 == s1.0 && s2.1 > s1.1),
+            "继续向下拖(2)预览应继续实时滚动（abs={s2:?} vs {s1:?}）"
+        );
+
+        // 未松开向上拖回 → 实时反向。
+        cx.simulate_mouse_move(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s3 = abs_top(cx);
+        assert!(
+            s3.0 < s2.0 || (s3.0 == s2.0 && s3.1 < s2.1),
+            "向上拖预览应实时反向滚动（abs={s3:?} vs {s2:?}）"
+        );
+
+        cx.simulate_mouse_up(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// WYSIWYG（原生 `ScrollHandle` 宿主）滚动条拖拽：向下拖 -> 内容应**实时**向下滚，
+    /// 向上拖 -> 实时反向滚。回归：自绘滚动条拖动只写 `live_vscroll` + notify，若宿主
+    /// 原生滚动容器没有重渲染，内容会只在松开后才跳（用户报告「从上到下要松开才动」）。
+    #[gpui::test]
+    async fn wysiwyg_live_scrollbar_drag_follows_both_directions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(700.), px(700.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-live-drag-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, format!("{}\n", "# 标题\n正文。\n\n".repeat(400))).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let overlay = cx
+            .debug_bounds("live-vscrollbar-overlay")
+            .expect("live 滚动条叠层应渲染");
+        let vhand = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].live_vscroll.clone()
+        });
+        let scroll_px = |cx: &mut VisualTestContext| {
+            cx.update(|_w, _cx| (-vhand.offset().y).as_f32())
+        };
+
+        let before = scroll_px(cx);
+        assert_eq!(before, 0.0, "初始应在顶部");
+
+        let x = overlay.right() - px(8.);
+        let grab_y = overlay.top() + px(14.);
+        // 压下 thumb，**未松开**向下拖（分两步），内容必须边拖边滚。
+        cx.simulate_mouse_down(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let mid1_y = overlay.top() + px(120.);
+        cx.simulate_mouse_move(
+            gpui::point(x, mid1_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        // 只走 run_until_parked，不手动 refresh —— 真实 App 里同样只靠 notify 触发重绘。
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s1 = scroll_px(cx);
+        assert!(
+            s1 > before + 1.0,
+            "向下拖(1)应先实时滚动（s1={s1:.0}）——不能等松开才动"
+        );
+
+        let mid2_y = overlay.top() + px(220.);
+        cx.simulate_mouse_move(
+            gpui::point(x, mid2_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s2 = scroll_px(cx);
+        assert!(
+            s2 > s1 + 1.0,
+            "继续向下拖(2)应继续实时滚动（s2={s2:.0} vs s1={s1:.0}）"
+        );
+
+        // 未松开向上拖回 → 实时反向滚动。
+        cx.simulate_mouse_move(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let s3 = scroll_px(cx);
+        assert!(
+            s3 < s2 - 1.0,
+            "向上拖应实时反向滚动（s3={s3:.0} vs s2={s2:.0}）"
+        );
+
+        cx.simulate_mouse_up(
+            gpui::point(x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 拖动编辑器纵向滚动条滑块：内容必须**跟随拖动**实时滚动，禁止「只有松开才跳」。
+    /// 回归：自绘滚动条拖动只写 desired_scroll，若 `notify` 没让编辑器重渲染，
+    /// 内容会停在原位直到 mouseup 后别的路径触发重绘。
+    #[gpui::test]
+    async fn scrollbar_drag_follows_content_live(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let f = std::env::temp_dir().join(format!(
+            "gpui-scrollbar-drag-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(
+            &f,
+            (0..800)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(f.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+
+        let overlay = cx
+            .debug_bounds("ce-vscrollbar-overlay")
+            .expect("编辑器纵向滚动条叠层应渲染");
+        let (before_top, before_desired) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = a.tabs[a.active_tab].editor.read(cx);
+            (ed.test_text_scroll_top(), ed.test_desired_scroll_px())
+        });
+        assert_eq!(before_top, (0, 0.0), "初始应在顶部");
+        assert_eq!(before_desired, 0.0);
+
+        // 点住滑块（右缘 16px 轨道，滑块顶部 = overlay.top + inset 4）…
+        let thumb_x = overlay.right() - px(8.);
+        let grab_y = overlay.top() + px(14.);
+        cx.simulate_mouse_down(
+            gpui::point(thumb_x, grab_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        // …未松开就向下拖 100px → 内容必须已经跟随滚动。
+        let drag_y = overlay.top() + px(114.);
+        cx.simulate_mouse_move(
+            gpui::point(thumb_x, drag_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        // 只走 run_until_parked，**不手动 refresh**——真实 App 里同样只靠 notify 触发重绘；
+        // 若 notify 没把视图标脏，这里就会复现「拖动中内容不动，只有松开才跳」。
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let mid = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = a.tabs[a.active_tab].editor.read(cx);
+            (ed.test_text_scroll_top(), ed.test_desired_scroll_px())
+        });
+        assert!(
+            mid.1 > before_desired + 1.0 || mid.0 != before_top,
+            "拖动中内容应实时跟随（scroll_top={:?}, desired={:.1}）——不能等松开才动",
+            mid.0,
+            mid.1
+        );
+
+        cx.simulate_mouse_up(
+            gpui::point(thumb_x, drag_y),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+
     /// WYSIWYG Ctrl+滚轮缩放：字号放大/缩小后视图顶部**内容点**保持不变（视口锚定，
     /// 对齐 src/markdown/view 与 src/editor），而不是整体滚动偏离。
     #[gpui::test]

@@ -5,6 +5,12 @@
 //! 点击跳转、拖拽写回 [`ScrollbarHandle::set_offset`]）。App 内全部调用点原为
 //! `ScrollbarMode::Always`，此处 Always 全量实现；`Auto` 提供「滚动后 IDLE 隐藏」的基础版。
 //!
+//! # 视觉
+//! 滑块为胶囊形 + 轴向微渐变（玻璃质感）；悬停/拖拽时滑块由 6px 平滑放大到 8px、
+//! 透明度抬升、轨道胶囊淡入，拖拽态切换为 accent 强调色。插值在 `prepaint` 用
+//! 指数平滑自驱动收敛（`Window::request_animation_frame` 逐帧推进，收敛即静止，
+//! 尊重 `App::reduce_motion`）。轨道/滑块的激活透明度不会盖住正文（顶部叠加层）。
+//!
 //! # 用法
 //! 与 gpui-component 对齐：`Scrollbar::vertical(&handle).mode(ScrollbarMode::Always)
 //! .viewport_from_layout()`；容器内作为唯一子元素铺满视口（`request_layout` 填满父级）。
@@ -13,6 +19,13 @@
 //! 编辑器/预览的「确定性量程」句柄（`VerticalScrollHandle`/`PreviewVerticalScrollHandle`）
 //! 只需把 `impl gpui_component::scroll::ScrollbarHandle` 换成 `impl crate::ui::scrollbar::
 //! ScrollbarHandle`——契约方法完全相同。也内置了对 `gpui::ScrollHandle` / `ListState` 的实现。
+//!
+//! # 交互（对齐 gpui-component 的优化）
+//! 拖动提交带双重门控：>1px 差值门控（拖到轨道尽头被 clamp 住时不空转重建）、`max_fps`
+//! 节流（高频 `MouseMoveEvent` 合并到最近节奏，默认 120=不限速，重视图用 `.max_fps(30)`
+//! 收敛）。不用 `event.dragging()` 门控：平台逐事件上报 `pressed_button` 在部分设备/驱动
+//! 上偶发 `None`，高频拖拽会因此偶尔跳过提交、显得不跟手；以元素自身 `drag_grab`
+//! （mousedown 设 / mouseup 清）为「按住中」的权威信号。
 //!
 //! # 生命周期（gpui 约束）
 //! 几何在 `prepaint` 计算（读句柄量程、读写元素级状态），鼠标监听在 `paint` 注册——
@@ -29,7 +42,7 @@ use gpui::{
     App, Bounds, ContentMask, CursorStyle, Element, ElementId, Entity, EntityId,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
     ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Point, Pixels, ScrollHandle,
-    ScrollWheelEvent, Size, Window, fill, point, px, size,
+    ScrollWheelEvent, Size, Window, fill, linear_color_stop, linear_gradient, point, px, size,
 };
 
 /// 轨道厚（垂直=宽 / 水平=高）。
@@ -44,6 +57,20 @@ const THUMB_INSET: f32 = 4.;
 const MIN_THUMB_SIZE: f32 = 48.;
 /// `Auto` 模式隐藏前的不滚动时长。
 const AUTO_HIDE_IDLE: Duration = Duration::from_secs(2);
+/// 滑块常态不透明度。
+const THUMB_ALPHA_REST: f32 = 0.35;
+/// 滑块悬停不透明度。
+const THUMB_ALPHA_HOVER: f32 = 0.62;
+/// 拖拽中滑块不透明度（改用 accent 色）。
+const THUMB_ALPHA_DRAG: f32 = 0.85;
+/// 轨道胶囊不透明度上限（悬停后淡入）。
+const TRACK_ALPHA: f32 = 0.20;
+/// 轨道胶囊粗细（比激活滑块略宽，呈现包裹效果）。
+const TRACK_PILL_WIDTH: f32 = 10.;
+/// 滑块纵向微渐变：尾部相对头部的淡化系数（玻璃质感）。
+const THUMB_GRADIENT_TAPER: f32 = 0.7;
+/// 悬停/拖拽插值的指数平滑时间常数。
+const SMOOTH_TIME: Duration = Duration::from_millis(90);
 
 /// 静态轨道宽度（px），与 gpui-component 的 `Scrollbar::width()` 语义一致
 /// （编辑器/预览用它预留底部滚动条厚度）。
@@ -150,6 +177,12 @@ struct UiState {
     last_scroll: Option<Instant>,
     /// `Auto` 模式是否已隐藏。
     hidden: bool,
+    /// 悬停/拖拽插值（0..1）：宽度、轨道、透明度随它平滑过渡。
+    present: f32,
+    /// 动画推进用的上一帧时间。
+    last_frame: Option<Instant>,
+    /// 拖拽上次提交偏移到句柄的时间（`max_fps` 节流依据；None=立即提交）。
+    last_update: Option<Instant>,
 }
 
 /// 单帧几何（prepaint 计算，paint/事件闭包共用；位置/边界为 Pixel、量程为 f32 标量）。
@@ -157,9 +190,11 @@ struct UiState {
 struct Geom {
     /// 轨道条（垂直=右缘 16px，水平=底缘 16px）。
     track: Bounds<Pixels>,
+    /// 轨道胶囊（悬停后淡入的细条，宽于滑块并与之同轴居中）。
+    track_pill: Bounds<Pixels>,
     /// 滑块命中区（整轨宽，含 inset）。
     thumb_hit: Bounds<Pixels>,
-    /// 滑块着色区（滑块宽）。
+    /// 滑块着色区（滑块宽，随悬停/拖拽插值伸缩）。
     thumb_fill: Bounds<Pixels>,
     /// 滑块命中长度（px 标量）。
     thumb_len: f32,
@@ -178,6 +213,9 @@ pub struct Scrollbar<H: ScrollbarHandle + Clone> {
     mode: ScrollbarMode,
     id: ElementId,
     layout_viewport: bool,
+    /// 拖拽提交上限（fps，30..=120）：把高频 `MouseMoveEvent` 合并在最近的节奏上
+    /// `set_offset`+`notify`，避免重视图（大文档编辑器整窗重建）被拖动事件风暴打满。
+    max_fps: usize,
 }
 
 impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
@@ -191,6 +229,7 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             mode: ScrollbarMode::Always,
             id: ElementId::CodeLocation(*caller),
             layout_viewport: false,
+            max_fps: 120,
         }
     }
 
@@ -222,6 +261,18 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         self
     }
 
+    /// 设置拖拽提交上限 FPS（可用 30..=120）。重视图（大文档编辑器整窗重建）拖拽卡顿时
+    /// 调低（如 30）可显著降 CPU/帧率抖动，代价是内容跟随略降频；与 gpui-component 对齐，
+    /// 其文档即建议重交互场景下调到 30。
+    ///
+    /// 默认 120：相对 60Hz 显示器等效「不限速」，仅在拖动事件风暴超过帧率时收敛提交频率；
+    /// 是否下沉由各调用点按视图成本自行决定（同 gpui-component 的暴露方式）。
+    #[allow(dead_code)] // 公开调频 API，调用点按需启用（与 theme.rs 迁移期预留字段同约定）
+    pub fn max_fps(mut self, max_fps: usize) -> Self {
+        self.max_fps = max_fps.clamp(30, 120);
+        self
+    }
+
     fn resolved_viewport(&self, layout_bounds: Bounds<Pixels>) -> Bounds<Pixels> {
         if self.layout_viewport {
             layout_bounds
@@ -231,7 +282,9 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
     }
 
     /// 几何计算（量程标量 f32；位置/边界 Pixel）。
-    fn geom(&self, viewport: Bounds<Pixels>, hovering: bool) -> Option<Geom> {
+    ///
+    /// `present` 为悬停/拖拽插值（0..1），控制滑块粗细（6→8px）与轨道胶囊显示。
+    fn geom(&self, viewport: Bounds<Pixels>, present: f32) -> Option<Geom> {
         let is_v = self.axis.is_vertical();
         let track_w = px(TRACK_WIDTH);
         let track = if is_v {
@@ -243,6 +296,21 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             Bounds::new(
                 point(viewport.left(), viewport.bottom() - track_w),
                 size(viewport.size.width, track_w),
+            )
+        };
+
+        // 轨道胶囊：与轨道同轴居中、宽于激活滑块，悬停后淡入。
+        let pill_w = px(TRACK_PILL_WIDTH);
+        let track_center = track.center();
+        let track_pill = if is_v {
+            Bounds::new(
+                point(track_center.x - pill_w / 2., viewport.top()),
+                size(pill_w, viewport.size.height),
+            )
+        } else {
+            Bounds::new(
+                point(viewport.left(), track_center.y - pill_w / 2.),
+                size(viewport.size.width, pill_w),
             )
         };
 
@@ -278,24 +346,38 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
         // 命中/着色长度：两端各缩进 inset（与 gpui-component 一致）
         let hit_len = (thumb_end - thumb_start - THUMB_INSET * 2.).max(0.);
 
-        let fill_w = if hovering { px(THUMB_ACTIVE_WIDTH) } else { px(THUMB_WIDTH) };
+        // 滑块粗细随悬停/拖拽插值伸缩。
+        let fill_w =
+            px(THUMB_WIDTH + (THUMB_ACTIVE_WIDTH - THUMB_WIDTH) * present.clamp(0., 1.));
+        // 命中/着色区锚定 rail 内缘（含 inset）：
+        // - 垂直：右对齐到 track.right()-inset，向**左**延展（滑块在轨道内）。
+        // - 水平：下对齐到 track.bottom()-inset，向**上**延展。
+        // 用 `Bounds::new`（左上锚）时不能直接拿 `top_right()/bottom_left()+(-inset,...)`
+        // 当左上角——那是 TopRight/BottomLeft 锚的算法，会整块滑到轨道外，导致点不到滑块。
         let (thumb_hit, thumb_fill) = if is_v {
-            let origin = track.top_right() + point(px(-THUMB_INSET), px(THUMB_INSET + thumb_start));
+            let top = track.top() + px(THUMB_INSET + thumb_start);
+            let hit_right = track.right() - px(THUMB_INSET);
             (
-                Bounds::new(origin, size(track_w, px(hit_len))),
-                Bounds::new(origin, size(fill_w, px(hit_len))),
+                Bounds::new(point(hit_right - track_w, top), size(track_w, px(hit_len))),
+                Bounds::new(point(hit_right - fill_w, top), size(fill_w, px(hit_len))),
             )
         } else {
-            let origin =
-                track.bottom_left() + point(px(THUMB_INSET + thumb_start), px(-THUMB_INSET));
+            let left = track.left() + px(THUMB_INSET + thumb_start);
             (
-                Bounds::new(origin, size(px(hit_len), track_w)),
-                Bounds::new(origin, size(px(hit_len), fill_w)),
+                Bounds::new(
+                    point(left, track.bottom() - px(THUMB_INSET) - track_w),
+                    size(px(hit_len), track_w),
+                ),
+                Bounds::new(
+                    point(left, track.bottom() - px(THUMB_INSET) - fill_w),
+                    size(px(hit_len), fill_w),
+                ),
             )
         };
 
         Some(Geom {
             track,
+            track_pill,
             thumb_hit,
             thumb_fill,
             thumb_len: hit_len,
@@ -318,6 +400,10 @@ struct UiStateSnapshot {
 pub struct PrepaintState<H> {
     geom: Option<Geom>,
     hidden: bool,
+    /// 本帧悬停/拖拽插值（0..1）。
+    present: f32,
+    /// 拖拽提交节流间隔（= 1000ms / max_fps）。
+    drag_throttle: Duration,
     track_hitbox: Hitbox,
     handle: H,
     axis: ScrollbarAxis,
@@ -377,7 +463,11 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                 if thumb_hit.contains(&event.position) {
                     let grab = event.position - thumb_hit.origin;
                     handle.start_drag();
-                    state.update(cx, |s, _| s.drag_grab = Some(grab));
+                    state.update(cx, |s, _| {
+                        s.drag_grab = Some(grab);
+                        // 新拖拽的第一个提交立即生效（不受上一条手势残留节流影响）。
+                        s.last_update = None;
+                    });
                 } else {
                     // 点击跳转：滑块中心对准点击位。
                     let (pos, denom) = if is_v {
@@ -405,10 +495,15 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
             }
         });
 
-        // 移动：更新悬停 + 拖拽写回 offset。
+        // 移动：更新悬停 + 拖拽写回 offset（对齐 gpui-component 的优化：>1px 差值门控、
+        // max_fps 节流，避免高频事件风暴打满重视图重建）。
+        // 注意：**不**用 `event.dragging()` 门控——drag_grab 只在本滚动条 mousedown 设、
+        // mouseup 清，已是我们自己的「按住中」权威信号；平台逐事件上报的 pressed_button
+        // 在部分设备/驱动上会间歇性为 None，用它门控会把高频拖拽偶尔跳过提交、显得不跟手。
         window.on_mouse_event({
             let handle = handle.clone();
             let state = state.clone();
+            let throttle = self.drag_throttle;
             move |event: &MouseMoveEvent, _phase, _window, cx| {
                 let hovered = track.contains(&event.position);
                 let mut notify = false;
@@ -439,12 +534,29 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                     let pct = ((pos - grab_axis - origin) / denom).clamp(0., 1.);
                     let target = (-((scroll_area - container) * pct)).max(safe_min);
                     let offset = handle.offset();
-                    if is_v {
-                        handle.set_offset(point(offset.x, px(target)));
+                    let cur = if is_v {
+                        offset.y.as_f32()
                     } else {
-                        handle.set_offset(point(px(target), offset.y));
+                        offset.x.as_f32()
+                    };
+                    // >1px 门控：未真正移动（如拖到轨道尽头被 clamp 住）就跳过。
+                    if (target - cur).abs() > 1.0 {
+                        // max_fps 节流：高频拖动事件合并到最近的提交节奏。
+                        let now = Instant::now();
+                        let due = state
+                            .read(cx)
+                            .last_update
+                            .is_none_or(|t| now.saturating_duration_since(t) >= throttle);
+                        if due {
+                            if is_v {
+                                handle.set_offset(point(offset.x, px(target)));
+                            } else {
+                                handle.set_offset(point(px(target), offset.y));
+                            }
+                            state.update(cx, |s, _| s.last_update = Some(now));
+                            notify = true;
+                        }
                     }
-                    notify = true;
                 } else if hovered {
                     notify = true;
                 }
@@ -543,10 +655,41 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             st.hidden
         };
 
-        let geom = self.geom(viewport, st.hovering);
+        // 悬停/拖拽插值：指数平滑朝目标收敛（自驱动逐帧推进，收敛后静止）。
+        let now = Instant::now();
+        let (present, animating) = {
+            let s = state.read(cx);
+            let target = if s.hovering || s.drag_grab.is_some() { 1. } else { 0. };
+            if cx.reduce_motion() || (s.present - target).abs() < 0.001 {
+                (target, false)
+            } else {
+                let dt = s
+                    .last_frame
+                    .map(|t| now.saturating_duration_since(t))
+                    .unwrap_or(SMOOTH_TIME)
+                    .as_secs_f32()
+                    .max(1. / 60.); // 极小 dt 防数值异常
+                let k = 1. - (-dt / SMOOTH_TIME.as_secs_f32()).exp();
+                let p = s.present + (target - s.present) * k;
+                (p, (p - target).abs() >= 0.001)
+            }
+        };
+        state.update(cx, |s, _| {
+            s.present = present;
+            s.last_frame = Some(now);
+        });
+
+        let geom = self.geom(viewport, present);
+        // 未收敛且可见 → 预约下一帧继续动画（收敛后自动静止，无空转帧）。
+        if animating && !hidden && geom.is_some() {
+            window.request_animation_frame();
+        }
+
         PrepaintState {
             geom,
             hidden,
+            present,
+            drag_throttle: Duration::from_millis((1000 / self.max_fps) as u64),
             track_hitbox,
             handle: self.handle.clone(),
             axis: self.axis,
@@ -570,20 +713,51 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
         prepaint.register_listeners(window, cx);
 
         let theme = crate::ui::theme::Theme::global(cx);
-        let thumb_bg: Hsla = theme.colors.fg.into();
-        let thumb_bg = if prepaint.state.read(cx).hovering {
-            thumb_bg.opacity(0.55)
-        } else {
-            thumb_bg.opacity(0.35)
-        };
+        let is_v = prepaint.axis.is_vertical();
+        let present = prepaint.present;
+
+        // 轨道胶囊：仅悬停/拖拽时随插值淡入（常态不干扰阅读）。
+        if let Some(geom) = &prepaint.geom {
+            let track_alpha = (TRACK_ALPHA * present).clamp(0., 1.);
+            if track_alpha > 0. {
+                let track_bg: Hsla = theme.colors.border.into();
+                let radius = geom.track_pill.size.width.min(geom.track_pill.size.height) / 2.;
+                window.paint_quad(
+                    fill(geom.track_pill, track_bg.opacity(track_alpha))
+                        .corner_radii(radius.max(px(0.))),
+                );
+            }
+        }
 
         if !prepaint.hidden
             && let Some(geom) = &prepaint.geom
         {
-            let radius =
-                (geom.thumb_fill.size.width.min(geom.thumb_fill.size.height) / 2.0).max(px(0.));
-            // 滑块
-            window.paint_quad(fill(geom.thumb_fill, thumb_bg).corner_radii(radius));
+            // 拖拽 → accent 强调色；否则 fg 悬停加亮（透明度随插值过渡）。
+            let dragging = prepaint.state.read(cx).drag_grab.is_some();
+            let alpha = if dragging {
+                THUMB_ALPHA_DRAG
+            } else {
+                THUMB_ALPHA_REST + (THUMB_ALPHA_HOVER - THUMB_ALPHA_REST) * present
+            };
+            let base: Hsla = if dragging {
+                theme.colors.accent.into()
+            } else {
+                theme.colors.fg.into()
+            };
+            // 胶囊滑块 + 轴向微渐变（玻璃质感：头部实、尾部淡）。
+            let head = base.opacity(alpha);
+            let tail = base.opacity(alpha * THUMB_GRADIENT_TAPER);
+            let bg = if is_v {
+                linear_gradient(
+                    180.,
+                    linear_color_stop(head, 0.),
+                    linear_color_stop(tail, 1.),
+                )
+            } else {
+                linear_gradient(90., linear_color_stop(head, 0.), linear_color_stop(tail, 1.))
+            };
+            let radius = geom.thumb_fill.size.width.min(geom.thumb_fill.size.height) / 2.;
+            window.paint_quad(fill(geom.thumb_fill, bg).corner_radii(radius.max(px(0.))));
         }
         window.set_cursor_style(CursorStyle::PointingHand, &prepaint.track_hitbox);
     }
@@ -624,7 +798,7 @@ mod tests {
             offset: point(px(0.), px(0.)),
             content: size(px(200.), px(400.)),
         };
-        assert!(Scrollbar::vertical(&h).geom(vp(), false).is_none());
+        assert!(Scrollbar::vertical(&h).geom(vp(), 0.).is_none());
     }
 
     #[test]
@@ -638,7 +812,7 @@ mod tests {
             }
         };
 
-        let g0 = Scrollbar::vertical(&make(0.)).geom(vp(), false).expect("超长内容应显示");
+        let g0 = Scrollbar::vertical(&make(0.)).geom(vp(), 0.).expect("超长内容应显示");
         // 命中长 = (container/scroll_area*container).max(min) 再两端各缩进 inset
         let raw = (400.0_f32 / 1600.0 * 400.0).max(MIN_THUMB_SIZE);
         let expected_hit = (raw - 2.0 * THUMB_INSET).max(0.);
@@ -651,7 +825,7 @@ mod tests {
         assert!(g0.thumb_fill.origin.y.as_f32() >= THUMB_INSET - 0.001);
 
         // 滚动 25% → 拇指下移，且不越出视口
-        let g1 = Scrollbar::vertical(&make(-300.)).geom(vp(), false).expect("仍超长");
+        let g1 = Scrollbar::vertical(&make(-300.)).geom(vp(), 0.).expect("仍超长");
         assert!(
             g1.thumb_fill.origin.y > g0.thumb_fill.origin.y,
             "下滚后拇指应下移"
@@ -661,9 +835,79 @@ mod tests {
             "拇指不得越出视口底部"
         );
 
-        // 激活（悬停）比常态更粗
-        let g_hot = Scrollbar::vertical(&make(0.)).geom(vp(), true).expect("仍超长");
+        // 激活（悬停/拖拽，present=1）比常态更粗
+        let g_hot = Scrollbar::vertical(&make(0.)).geom(vp(), 1.).expect("仍超长");
         assert_eq!(g_hot.thumb_fill.size.width, px(THUMB_ACTIVE_WIDTH));
         assert_eq!(g0.thumb_fill.size.width, px(THUMB_WIDTH));
+        // 轨道胶囊与轨道同轴居中、宽于激活滑块
+        assert!(g_hot.track_pill.size.width > g_hot.thumb_fill.size.width);
+        assert!(
+            (g_hot.track_pill.center().x - g_hot.track.center().x).as_f32().abs() < 0.5,
+            "轨道胶囊应居中于 16px 轨道条"
+        );
+        assert_eq!(g_hot.track_pill.size.height, g_hot.track.size.height);
+    }
+
+    #[test]
+    fn thumb_width_interpolates_with_present() {
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let mid = THUMB_WIDTH + (THUMB_ACTIVE_WIDTH - THUMB_WIDTH) * 0.5;
+        let g = Scrollbar::vertical(&h).geom(vp(), 0.5).expect("仍超长");
+        assert!(
+            (g.thumb_fill.size.width.as_f32() - mid).abs() < 0.001,
+            "滑块宽度应随插值 0..1 线性过渡"
+        );
+    }
+
+    #[test]
+    fn thumb_hit_and_fill_stay_inside_track() {
+        // 回归：旧实现拿 `Bounds::new(top_right()+(-inset,..))` 当左上锚——那是
+        // TopRight/BottomLeft 锚算法，整块命中区被外推到轨道外（垂直右越 4px、
+        // 水平下越 4px），导致点不到滑块、拖拽永不触发（内容只有松开才跳）。
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(200.), px(1600.)),
+        };
+        let gv = Scrollbar::vertical(&h).geom(vp(), 0.).expect("仍超长");
+        // 回归性质：命中/着色区必须锚在轨道**内缘**（垂直右 = track.right - inset），
+        // 不得用左上锚把 TopRight 算法整块外推出轨道右缘。
+        let v_hit_right = gv.track.right() - px(THUMB_INSET);
+        assert!(
+            (gv.thumb_hit.right() - v_hit_right).as_f32().abs() < 0.5,
+            "垂直命中区右缘应锚在轨道右缘-inset（拖拽可点中）"
+        );
+        assert!(
+            gv.thumb_fill.right() <= v_hit_right + px(0.5),
+            "垂直滑块右缘应内缩 inset"
+        );
+        assert!(
+            gv.thumb_fill.left() >= gv.track.left() - px(0.5),
+            "垂直滑块着色区应位于轨道附近"
+        );
+
+        let hh = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(1600.), px(400.)),
+        };
+        let gh = Scrollbar::horizontal(&hh).geom(vp(), 0.).expect("仍超宽");
+        let h_bottom_inset = gh.track.bottom() - px(THUMB_INSET);
+        assert!(
+            (gh.thumb_hit.bottom() - h_bottom_inset).as_f32().abs() < 0.5,
+            "水平命中区下缘应锚在轨道下缘-inset"
+        );
+        assert!(
+            gh.thumb_fill.bottom() <= h_bottom_inset + px(0.5),
+            "水平滑块下缘应内缩 inset"
+        );
+        assert!(
+            gh.thumb_fill.top() >= gh.track.top() - px(0.5),
+            "水平滑块着色区应位于轨道附近"
+        );
     }
 }
