@@ -3,16 +3,16 @@
 //! 布局（自上而下）：
 //! - 菜单栏：文件 / 编辑 / 查看 / 帮助，点击弹出下拉菜单（[`EditorApp::render_menu_bar`]）
 //! - 选项卡栏：每个文件一个选项卡，可新建（+）、切换、关闭（未保存时弹窗提示保存）
-//! - 编辑区：**gpui-component 的 `Input`（CodeEditor 模式）**，内置语法高亮、
-//!   行号、缩进参考线、搜索面板、撤销重做与滚动（替换原先自研 `TextArea`）
+//! - 编辑区：自研 [`crate::editor::CodeEditor`]，内置语法高亮、行号、括号标尺、
+//!   垂直标尺、撤销重做与折叠
 //! - 预览区（开启预览时）：右侧分屏实时渲染 Markdown（复用 [`markdown`]）
 //! - 状态栏：文件名 / 脏标记 / 语言徽标 / 行列 / 行数 / 字数 / 字号调节
 //!
 //! 打开 / 保存 / 另存为均调用**系统原生文件对话框**（`rfd`），无需手动输入路径；
 //! 也支持把文件从资源管理器拖拽到窗口/编辑区打开。
 //!
-//! 文本编辑动作（backspace/ctrl-v/undo…）由 gpui-component 的 `Input` 在 `Input`
-//! 键上下文中自行处理，这里只订阅其 `InputEvent::Change` 刷新状态栏与脏标记。
+//! 文本编辑动作由编辑区在 `Input` 键上下文中自行处理，这里只订阅其编辑事件
+//! （`EditorEvent::Edited`）刷新状态栏、脏标记与预览增量。
 
 mod file_ops;
 mod open_progress;
@@ -49,6 +49,58 @@ use crate::config::layout::{
     SPLIT_RATIO_MIN,
 };
 use crate::scrollbar::TableScrollState;
+
+/// 把上一帧的预览 dirty 区间平移到本帧（编辑点之前不变、之后随 δ 平移）再并入
+/// `[s, ne)`（新增变化区间），取 bounding box（当前文本字节坐标）；`None` = 首次编辑。
+fn merge_preview_dirty(
+    prev: Option<(usize, usize)>,
+    s: usize,
+    oe: usize,
+    ne: usize,
+) -> Option<(usize, usize)> {
+    match prev {
+        None => Some((s, ne)),
+        Some((lo, hi)) => {
+            let delta = ne as i64 - oe as i64;
+            let hi_shifted = if hi > oe {
+                hi as i64 + delta
+            } else if hi >= s {
+                ne as i64
+            } else {
+                hi as i64
+            };
+            Some((lo.min(s), hi_shifted.max(ne as i64).max(0) as usize))
+        }
+    }
+}
+
+#[cfg(test)]
+mod merge_preview_dirty_tests {
+    use super::merge_preview_dirty;
+
+    #[test]
+    fn first_edit_creates_interval() {
+        assert_eq!(merge_preview_dirty(None, 5, 2, 8), Some((5, 8)));
+    }
+
+    #[test]
+    fn edit_before_old_range_shifts_it() {
+        // prev=[20,30)，插入使 [5,8)→[5,13)（δ=+5）→ 旧区间平移成 [25,35)，并入 → [5,35)。
+        assert_eq!(merge_preview_dirty(Some((20, 30)), 5, 3, 8), Some((5, 35)));
+    }
+
+    #[test]
+    fn edit_inside_old_range_merges_upper_bound() {
+        // hi 落在 [s, oe]：上界直接折叠取新编辑终点的 ne。
+        assert_eq!(merge_preview_dirty(Some((0, 5)), 5, 7, 9), Some((0, 9)));
+    }
+
+    #[test]
+    fn edit_after_old_range_still_takes_bounding_box() {
+        // prev=[0,4)，后续编辑 [5,9) → 两区间取并的 bounding box。
+        assert_eq!(merge_preview_dirty(Some((0, 4)), 5, 7, 9), Some((0, 9)));
+    }
+}
 
 /// 一个文件选项卡：独立持有自研编辑器组件状态、文件路径与脏标记。
 struct EditorTab {
@@ -406,22 +458,7 @@ impl EditorApp {
                     if let Some((s, oe, ne)) =
                         tab.editor.update(cx, |ed, _| ed.take_last_edit())
                     {
-                        let delta = ne as i64 - oe as i64;
-                        tab.preview_dirty = Some(match tab.preview_dirty {
-                            None => (s, ne),
-                            Some((lo, hi)) => {
-                                // 把上一帧的 dirty 平移到本帧（编辑点之前不变、之后随 δ 平移）
-                                // 再并入 [s, ne)（新增变化区间），取 bounding box。
-                                let hi_shifted = if hi > oe {
-                                    hi as i64 + delta
-                                } else if hi >= s {
-                                    ne as i64
-                                } else {
-                                    hi as i64
-                                };
-                                (lo.min(s), hi_shifted.max(ne as i64).max(0) as usize)
-                            }
-                        });
+                        tab.preview_dirty = merge_preview_dirty(tab.preview_dirty, s, oe, ne);
                     }
                     // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
                     // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
