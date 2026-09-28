@@ -949,3 +949,57 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window) {
         super::warm_emoji_rasterizer(window, "wysiwyg");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用「等高块 + src_line = 块下标」构造合成布局（与 `build_frame` 首建同构）。
+    fn blk(heights: Vec<f32>) -> Rc<RefCell<BlockLayout>> {
+        let n = heights.len();
+        let src: Vec<u32> = (0..n as u32).collect();
+        Rc::new(RefCell::new(BlockLayout::new(heights, src, n)))
+    }
+
+    #[test]
+    fn band_mid_spans_visible_blocks() {
+        // 4×100px 块，band 50..250 → 覆盖块 0/1/2（块 3 top=300 在带外）。
+        let base = blk(vec![100., 100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[], 50., 250., 4), (0, 3));
+    }
+
+    #[test]
+    fn band_start_at_boundary_includes_start_block() {
+        // band 0..300：块 3 top=300 不含（< band_hi 严格），块 0 因 top<=0 计入。
+        let base = blk(vec![100., 100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[], 0., 300., 4), (0, 3));
+    }
+
+    #[test]
+    fn band_above_all_blocks_starts_at_first() {
+        // band 顶部在首块内（负区），i0 饱和到 0；只含块 0。
+        let base = blk(vec![100., 100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[], -100., 50., 4), (0, 1));
+    }
+
+    #[test]
+    fn band_below_all_blocks_returns_empty_span() {
+        // band 在整个文档之下（滚到底）→ 空区间 (4, 4)。
+        let base = blk(vec![100., 100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[], 500., 600., 4), (4, 4));
+    }
+
+    #[test]
+    fn delta_shifts_later_block_tops() {
+        // 块 1 增量 +50 → 块 2 有效 top = 200+50 = 250 …band 250..260 恰好罩住块 2。
+        let base = blk(vec![100., 100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[(1, 50.)], 250., 260., 4), (2, 3));
+    }
+
+    #[test]
+    fn band_hi_beyond_total_clamps_to_n() {
+        // deltas 使 total 增大到 400，band 超高 → i1 夹到 n 而不是多算。
+        let base = blk(vec![100., 100., 100.]);
+        assert_eq!(find_band_range(&base, &[(2, 100.)], 0., 1e9, 3), (0, 3));
+    }
+}

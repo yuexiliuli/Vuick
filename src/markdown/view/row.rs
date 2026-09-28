@@ -1326,4 +1326,34 @@ mod tests {
         // 越界安全。
         assert_eq!(char_align_range(text, 18..999), 18..text.len());
     }
+
+    #[test]
+    fn shift_runs_zero_shift_is_identity() {
+        let runs = vec![
+            (0..3, RunKind::Bold),
+            (5..9, RunKind::InlineCode),
+            (9..13, RunKind::Italic),
+        ];
+        assert_eq!(shift_runs(&runs, 0), runs);
+    }
+
+    #[test]
+    fn shift_runs_moves_all_byte_ranges_by_prefix_len() {
+        let runs = vec![(0..3, RunKind::Bold), (5..9, RunKind::Link)];
+        // 列表项前缀「- 」占 2 字节 → 所有区间右移 2。
+        assert_eq!(
+            shift_runs(&runs, 2),
+            vec![(2..5, RunKind::Bold), (7..11, RunKind::Link)]
+        );
+    }
+
+    #[test]
+    fn shift_search_none_stays_none_and_some_shifts() {
+        assert!(shift_search(&None, 3).is_none());
+        let hsla = gpui::rgb(0xFF0000u32).into();
+        let s = Some((4..9, hsla));
+        let out = shift_search(&s, 2).expect("有命中应平移");
+        assert_eq!(out.0, 6..11);
+        assert_eq!(out.1, hsla, "高亮色原样保留");
+    }
 }
