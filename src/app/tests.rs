@@ -727,7 +727,7 @@
         );
 
         // 右缘拖拽调宽：start → update → end，宽度按位移更新，且关闭自适应
-        let w0 = cx.update(|_w, cx| app.read(cx).sidebar_width);
+        let w0 = cx.update(|_w, cx| app.read(cx).sidebar.width);
         cx.update(|_w, cx| {
             app.update(cx, |app, cx| {
                 app.start_sidebar_resize(300.0, cx);
@@ -740,7 +740,7 @@
         }
         let (w1, auto) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.sidebar_width, a.sidebar_width_auto)
+            (a.sidebar.width, a.sidebar.width_auto)
         });
         assert!(
             (w1 - w0 - 20.0).abs() < 1.0,
@@ -750,7 +750,7 @@
 
         // 「目录」按钮开关逻辑：再点一次只收起目录面板，侧边栏（活动栏）保留为窄条
         assert!(
-            cx.update(|_w, cx| app.read(cx).sidebar_open),
+            cx.update(|_w, cx| app.read(cx).sidebar.open),
             "打开文件后侧边栏应处于展开"
         );
         cx.update(|_w, cx| {
@@ -763,7 +763,7 @@
         }
         let (open, panel) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.sidebar_open, a.sidebar_panel_open)
+            (a.sidebar.open, a.sidebar.panel_open)
         });
         assert!(open && !panel, "再点「目录」应收起目录面板、侧边栏仍展开");
         assert!(
@@ -796,7 +796,7 @@
         );
 
         // 回归：再次拖窄目录后，条目不得溢出侧边栏右缘（否则其 hover/点击会延伸到编辑器区）
-        let wnow = cx.update(|_w, cx| app.read(cx).sidebar_width);
+        let wnow = cx.update(|_w, cx| app.read(cx).sidebar.width);
         cx.update(|_w, cx| {
             app.update(cx, |app, cx| {
                 app.start_sidebar_resize(wnow + 50.0, cx);

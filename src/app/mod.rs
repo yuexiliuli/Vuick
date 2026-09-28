@@ -206,26 +206,11 @@ pub struct EditorApp {
     split_drag: Option<(f32, f32)>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
     splitter_hovered: bool,
-    /// 侧边栏是否展开。
-    sidebar_open: bool,
-    /// 侧边栏当前视图（目录 / 搜索）。
-    sidebar_view: sidebar::SidebarView,
-    /// 侧边栏内容面板是否展开（false = 只留窄活动栏，目录/搜索面板收起）。
-    sidebar_panel_open: bool,
+    /// 侧边栏「外壳」状态：可见性 / 视图 / 目录折叠 / 宽度与右缘拖拽
+    /// （检索输入 + 扫描缓存等仍在此处，见 [`sidebar::SidebarChromeState`]）。
+    sidebar: sidebar::SidebarChromeState,
     /// 侧边栏「搜索」关键字输入控件。
     search_state: gpui::Entity<InputState>,
-    /// 侧边栏目录折叠集合（仅当前激活文档，切换文档时清空）。
-    sidebar_toc_collapsed: std::collections::HashSet<usize>,
-    /// 侧边栏目录折叠集合对应的选项卡下标（切换文档即失效清空）。
-    sidebar_toc_tab: Option<usize>,
-    /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
-    sidebar_width: f32,
-    /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。
-    sidebar_width_auto: bool,
-    /// 侧边栏右缘拖拽：`Some((起始 x, 起始宽))`。
-    sidebar_resize: Option<(f32, f32)>,
-    /// 侧边栏右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
-    sidebar_resize_hovered: bool,
     /// 监听搜索框输入变化 → 刷新搜索结果。
     _search_sub: Subscription,
     /// 监听 PDF 阅读器 `notify()`（检索结果/加载进度到达）→ 刷新 app（侧边栏计数）。
@@ -318,18 +303,20 @@ impl EditorApp {
             wrap_enabled: false,
             split_drag: None,
             splitter_hovered: false,
-            sidebar_open: true,
-            sidebar_view: sidebar::SidebarView::Toc,
-            // 目录面板默认收起（仅留 46px 活动栏，不挤占正文）；
-            // 点活动栏「目录」按钮再展开。
-            sidebar_panel_open: false,
+            sidebar: sidebar::SidebarChromeState {
+                open: true,
+                view: sidebar::SidebarView::Toc,
+                // 目录面板默认收起（仅留 46px 活动栏，不挤占正文）；
+                // 点活动栏「目录」按钮再展开。
+                panel_open: false,
+                toc_collapsed: Default::default(),
+                toc_tab: None,
+                width: SIDEBAR_WIDTH,
+                width_auto: true,
+                resize: None,
+                resize_hovered: false,
+            },
             search_state,
-            sidebar_toc_collapsed: Default::default(),
-            sidebar_toc_tab: None,
-            sidebar_width: SIDEBAR_WIDTH,
-            sidebar_width_auto: true,
-            sidebar_resize: None,
-            sidebar_resize_hovered: false,
             _search_sub: search_sub,
             _pdf_observe: None,
             pdf_search: None,
@@ -1160,7 +1147,7 @@ impl EditorApp {
 
     /// 切换侧边栏「展开/收起」。
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_open = !self.sidebar_open;
+        self.sidebar.open = !self.sidebar.open;
         cx.notify();
     }
 
@@ -1331,7 +1318,7 @@ impl EditorApp {
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(self.bar_border()))
-            .child(icon_style(if self.sidebar_open {
+            .child(icon_style(if self.sidebar.open {
                 IconName::PanelLeftClose
             } else {
                 IconName::PanelLeftOpen

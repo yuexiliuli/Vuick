@@ -21,17 +21,49 @@ pub(super) enum SidebarView {
     Search,
 }
 
+/// 侧边栏「外壳」状态：可见性、当前视图与目录（TOC）面板的宽度/折叠/右缘拖拽。
+/// 与「检索输入 + 缓存 + 订阅」分属（后者仍在 `EditorApp`，后续洋葱继续剥）。
+/// 全部 `pub(crate)`：跨 `app` 子模块读写 + `app::tests` 直读。
+pub(crate) struct SidebarChromeState {
+    /// 侧边栏是否展开。
+    pub(crate) open: bool,
+    /// 侧边栏当前视图（目录 / 搜索）。
+    pub(crate) view: SidebarView,
+    /// 侧边栏内容面板是否展开（false = 只留窄活动栏，目录/搜索面板收起）。
+    pub(crate) panel_open: bool,
+    /// 侧边栏目录折叠集合（仅当前激活文档，切换文档时清空）。
+    pub(crate) toc_collapsed: std::collections::HashSet<usize>,
+    /// 侧边栏目录折叠集合对应的选项卡下标（切换文档即失效清空）。
+    pub(crate) toc_tab: Option<usize>,
+    /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
+    pub(crate) width: f32,
+    /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。
+    pub(crate) width_auto: bool,
+    /// 侧边栏右缘拖拽：`Some((起始 x, 起始宽))`。
+    pub(crate) resize: Option<(f32, f32)>,
+    /// 侧边栏右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
+    pub(crate) resize_hovered: bool,
+}
+
+impl SidebarChromeState {
+    /// 切换视图：未在该面板 → 展开并切到；已在该面板再点 → 只收起面板。
+    /// （折叠/展开逻辑此前栖身在 `toggle_sidebar_view`，随状态一起收编。）
+    pub(super) fn toggle_view(&mut self, view: SidebarView) {
+        if self.panel_open && self.view == view {
+            self.panel_open = false;
+        } else {
+            self.open = true;
+            self.panel_open = true;
+            self.view = view;
+        }
+    }
+}
+
 impl EditorApp {
     /// 活动栏按钮点按：未在该面板 → 展开并切到该面板；
     /// 已在该面板再点一次 → **只收起面板**，侧边栏保留为窄活动栏（不留空白宽区）。
     pub(super) fn toggle_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
-        if self.sidebar_panel_open && self.sidebar_view == view {
-            self.sidebar_panel_open = false;
-        } else {
-            self.sidebar_open = true;
-            self.sidebar_panel_open = true;
-            self.sidebar_view = view;
-        }
+        self.sidebar.toggle_view(view);
         cx.notify();
     }
 
@@ -42,7 +74,7 @@ impl EditorApp {
         body: gpui::AnyElement,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if !self.sidebar_open {
+        if !self.sidebar.open {
             return body;
         }
         div()
@@ -82,16 +114,16 @@ impl EditorApp {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let (side_bg, border) = (self.bar_bg(), self.bar_border());
         // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
-        let content: Option<gpui::AnyElement> = if self.sidebar_panel_open {
-            Some(match self.sidebar_view {
+        let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
+            Some(match self.sidebar.view {
                 SidebarView::Toc => self.render_sidebar_toc(cx),
                 SidebarView::Search => self.render_sidebar_search(cx),
             })
         } else {
             None
         };
-        let width_px = if self.sidebar_panel_open {
-            self.sidebar_width
+        let width_px = if self.sidebar.panel_open {
+            self.sidebar.width
         } else {
             crate::config::layout::SIDEBAR_ACTIVITY_W
         };
@@ -114,15 +146,15 @@ impl EditorApp {
 
     /// 开始拖拽侧边栏右缘：记录 (起始 x, 起始宽)，关闭自适应由用户接管。
     pub(super) fn start_sidebar_resize(&mut self, start_x: f32, cx: &mut Context<Self>) {
-        self.sidebar_resize = Some((start_x, self.sidebar_width));
-        self.sidebar_width_auto = false;
+        self.sidebar.resize = Some((start_x, self.sidebar.width));
+        self.sidebar.width_auto = false;
         cx.notify();
     }
 
     /// 拖拽中：按鼠标位移更新侧边栏宽（自变量窗口坐标 x）。宽度 clamp 在 [MIN, MAX]。
     pub(super) fn update_sidebar_resize(&mut self, x: f32, cx: &mut Context<Self>) {
-        if let Some((start_x, start_w)) = self.sidebar_resize {
-            self.sidebar_width = (start_w + (x - start_x))
+        if let Some((start_x, start_w)) = self.sidebar.resize {
+            self.sidebar.width = (start_w + (x - start_x))
                 .clamp(crate::config::layout::SIDEBAR_WIDTH_MIN, crate::config::layout::SIDEBAR_WIDTH_MAX);
             cx.notify();
         }
@@ -130,8 +162,8 @@ impl EditorApp {
 
     /// 结束拖拽。
     pub(super) fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_resize.is_some() {
-            self.sidebar_resize = None;
+        if self.sidebar.resize.is_some() {
+            self.sidebar.resize = None;
             cx.notify();
         }
     }
@@ -139,7 +171,7 @@ impl EditorApp {
     /// 侧边栏右缘拖拽手柄：宽 6px 命中区，视觉 2px 强调细线（悬停/拖拽时显现）。
     /// 面板收起时返回空（无拖拽意义）。
     fn render_sidebar_resize_handle(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        if !self.sidebar_panel_open {
+        if !self.sidebar.panel_open {
             return Vec::new();
         }
         let accent = crate::ui::theme::Theme::global(cx).colors.accent;
@@ -155,7 +187,7 @@ impl EditorApp {
                 .cursor(CursorStyle::ResizeColumn)
                 .on_hover(cx.listener(
                     |this: &mut EditorApp, hovered: &bool, _w, cx| {
-                        this.sidebar_resize_hovered = *hovered;
+                        this.sidebar.resize_hovered = *hovered;
                         cx.notify();
                     },
                 ))
@@ -175,7 +207,7 @@ impl EditorApp {
                         .w(px(2.))
                         .rounded_full()
                         .opacity(
-                            if self.sidebar_resize.is_some() || self.sidebar_resize_hovered {
+                            if self.sidebar.resize.is_some() || self.sidebar.resize_hovered {
                                 1.0
                             } else {
                                 0.0
@@ -203,7 +235,7 @@ impl EditorApp {
         ];
         let mut btns: Vec<gpui::AnyElement> = Vec::with_capacity(2);
         for (view, icon, id) in specs {
-            let is_active = self.sidebar_panel_open && self.sidebar_view == view;
+            let is_active = self.sidebar.panel_open && self.sidebar.view == view;
             // 活动项图标用主前景色（深色主题下近白），不变蓝
             let col = if is_active { fg } else { muted };
             let id_owned = id.to_string();
@@ -285,8 +317,8 @@ impl EditorApp {
         if !has_child {
             return;
         }
-        if !self.sidebar_toc_collapsed.remove(&idx) {
-            self.sidebar_toc_collapsed.insert(idx);
+        if !self.sidebar.toc_collapsed.remove(&idx) {
+            self.sidebar.toc_collapsed.insert(idx);
         }
         cx.notify();
     }
@@ -361,16 +393,16 @@ impl EditorApp {
 
         // 折叠状态按文档缓存：切换文档即清空，并重新按新文档内容自适应宽度
         let active = self.active_tab;
-        if self.sidebar_toc_tab != Some(active) {
-            self.sidebar_toc_tab = Some(active);
-            self.sidebar_toc_collapsed.clear();
-            self.sidebar_width_auto = true;
+        if self.sidebar.toc_tab != Some(active) {
+            self.sidebar.toc_tab = Some(active);
+            self.sidebar.toc_collapsed.clear();
+            self.sidebar.width_auto = true;
         }
 
         // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）
-        if self.sidebar_width_auto
+        if self.sidebar.width_auto
             && let Some(w) = self.compute_sidebar_toc_width(cx) {
-                self.sidebar_width = (crate::config::layout::SIDEBAR_ACTIVITY_W + w + 12.0)
+                self.sidebar.width = (crate::config::layout::SIDEBAR_ACTIVITY_W + w + 12.0)
                     .clamp(crate::config::layout::SIDEBAR_WIDTH_MIN, crate::config::layout::SIDEBAR_WIDTH_MAX);
             }
 
@@ -385,7 +417,7 @@ impl EditorApp {
                     } else {
                         let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
                         let visible =
-                            crate::toc::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                            crate::toc::toc_visibility(&levels, &self.sidebar.toc_collapsed);
                         let wk = pdf.clone();
                         for (i, e) in outlines.iter().enumerate() {
                             if !visible[i] {
@@ -395,7 +427,7 @@ impl EditorApp {
                             let wk = wk.clone();
                             let has_child = crate::toc::toc_node_has_child(&levels, i);
                             let is_collapsed =
-                                has_child && self.sidebar_toc_collapsed.contains(&i);
+                                has_child && self.sidebar.toc_collapsed.contains(&i);
                             let idx = i;
                             rows.push(crate::toc::toc_item_frame(
                                 format!("sidebar-toc-pdf-{i}"),
@@ -434,7 +466,7 @@ impl EditorApp {
                     } else {
                         let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
                         let visible =
-                            crate::toc::toc_visibility(&levels, &self.sidebar_toc_collapsed);
+                            crate::toc::toc_visibility(&levels, &self.sidebar.toc_collapsed);
                         let wk = tab.md_preview.clone();
                         for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
                             if !visible[i] {
@@ -443,7 +475,7 @@ impl EditorApp {
                             let wk = wk.clone();
                             let has_child = crate::toc::toc_node_has_child(&levels, i);
                             let is_collapsed =
-                                has_child && self.sidebar_toc_collapsed.contains(&i);
+                                has_child && self.sidebar.toc_collapsed.contains(&i);
                             let idx = i;
                             rows.push(crate::toc::toc_item_frame(
                                 format!("sidebar-toc-md-{i}"),
