@@ -4,6 +4,19 @@ use super::*;
 use crate::config::timing::TAB_HSCROLL_HIDE_MS;
 use crate::scrollbar::horizontal_scrollbar;
 
+/// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
+struct TabBarColors {
+    text_primary: gpui::Hsla,
+    text_minor: gpui::Hsla,
+    tab_active_bg: gpui::Hsla,
+    tab_active_border: gpui::Hsla,
+    chip_bg: gpui::Hsla,
+    chip_text: gpui::Hsla,
+    bar_bg: gpui::Hsla,
+    panel_bg: gpui::Hsla,
+    accent: gpui::Hsla,
+}
+
 impl EditorApp {
     pub(super) fn make_tab(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> usize {
         // 自研编辑器组件：创建即空文档；语法高亮语言在打开文件时 set_language。
@@ -224,119 +237,124 @@ impl EditorApp {
         .detach();
     }
 
-    pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active_tab;
-        let (text_primary, text_minor, tab_active_bg, tab_active_border, chip_bg, chip_text, bar_bg, panel_bg) = (
-            self.text_primary(),
-            self.text_minor(),
-            self.tab_active_bg(),
-            self.tab_active_border(),
-            self.chip_bg(),
-            self.chip_text(),
-            self.bar_bg(),
-            self.panel_bg(),
-        );
-        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
-        let mut tabs: Vec<gpui::AnyElement> = Vec::new();
-        for (i, tab) in self.tabs.iter().enumerate() {
-            let is_active = i == active;
-            let name = tab
-                .file_path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "未命名".to_string());
-            let dirty = tab.dirty;
-            let idx = i;
-
-            let close = div()
-                .id(SharedString::from(format!("tab-close-{idx}")))
-                .w(px(18.))
-                .h(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_md()
-                .text_size(px(13.))
-                .text_color(text_minor)
-                .cursor(CursorStyle::PointingHand)
-                .child("×")
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                        this.close_tab(idx, window, cx);
-                        cx.stop_propagation();
-                    }),
-                );
-
-            // 激活选项卡顶部 2px 蓝色强调线（色 = 语义 `accent`）。
-            // 用绝对定位细条绘制：本版 gpui 的 border_color 是整圈一个色，
-            // 没有“只染某一边”的 API，无法用 border 实现顶蓝其余透明。
-            let accent_line = is_active.then(|| {
-                div()
-                    .id(SharedString::from(format!("tab-accent-{idx}")))
-                    .absolute()
-                    .top(px(0.))
-                    .left(px(0.))
-                    .right(px(0.))
-                    .h(px(1.))
-                    .bg(accent)
-                    .into_any_element()
-            });
-
-            let mut el = div()
-                .id(SharedString::from(format!("tab-{idx}")))
-                .debug_selector(move || format!("tab-{idx}"))
-                .h_full()
-                .px_2()
-                .flex()
-                .items_center()
-                .gap_1()
-                .flex_shrink(1.)
-                .relative()
-                .bg(if is_active {
-                    panel_bg
-                } else {
-                    rgba(0x00000000).into()
-                })
-                .cursor(CursorStyle::PointingHand)
-                .text_size(px(12.))
-                .text_color(text_primary)
-                .child(if dirty { "● " } else { "" })
-                .child(SharedString::from(name.clone()))
-                .child(close);
-            if let Some(accent_line) = accent_line {
-                el = el.child(accent_line);
-            }
-            // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
-            // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
-            let drag_data = TabDragData {
-                idx,
-                name: SharedString::from(name),
-            };
-            let ghost_name = drag_data.name.clone();
-            tabs.push(
-                el.on_drag(
-                    drag_data,
-                    move |_value: &TabDragData, _offset, _window, cx| {
-                        cx.new(|_| TabDragGhost {
-                            name: ghost_name.clone(),
-                        })
-                    },
-                )
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                        this.activate_tab(idx, window, cx);
-                    }),
-                )
-                .into_any_element(),
-            );
+    /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
+    fn tab_bar_colors(&self, cx: &mut Context<Self>) -> TabBarColors {
+        TabBarColors {
+            text_primary: self.text_primary(),
+            text_minor: self.text_minor(),
+            tab_active_bg: self.tab_active_bg(),
+            tab_active_border: self.tab_active_border(),
+            chip_bg: self.chip_bg(),
+            chip_text: self.chip_text(),
+            bar_bg: self.bar_bg(),
+            panel_bg: self.panel_bg(),
+            accent: crate::ui::theme::Theme::global(cx).colors.accent.into(),
         }
+    }
 
-        // 新建(+)：手绘「＋」形图标（横/竖两条圆角细条居中），替代文本 "+"，
-        // 避免不同字体下粗细/偏移不一显得歪斜；带 hover/按下交互反馈。
-        let add = div()
+    /// 单个选项卡元素：名称/脏标记/关闭钮/激活顶线 + 拖拽幽灵 + 点击激活。
+    fn tab_bar_item(
+        tab: &EditorTab,
+        idx: usize,
+        is_active: bool,
+        colors: &TabBarColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let name = tab
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "未命名".to_string());
+        let dirty = tab.dirty;
+
+        let close = div()
+            .id(SharedString::from(format!("tab-close-{idx}")))
+            .w(px(18.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .text_size(px(13.))
+            .text_color(colors.text_minor)
+            .cursor(CursorStyle::PointingHand)
+            .child("×")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                    this.close_tab(idx, window, cx);
+                    cx.stop_propagation();
+                }),
+            );
+
+        // 激活选项卡顶部 2px 蓝色强调线（色 = 语义 `accent`）。
+        // 用绝对定位细条绘制：本版 gpui 的 border_color 是整圈一个色，
+        // 没有“只染某一边”的 API，无法用 border 实现顶蓝其余透明。
+        let accent_line = is_active.then(|| {
+            div()
+                .id(SharedString::from(format!("tab-accent-{idx}")))
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .h(px(1.))
+                .bg(colors.accent)
+                .into_any_element()
+        });
+
+        let mut el = div()
+            .id(SharedString::from(format!("tab-{idx}")))
+            .debug_selector(move || format!("tab-{idx}"))
+            .h_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink(1.)
+            .relative()
+            .bg(if is_active {
+                colors.panel_bg
+            } else {
+                rgba(0x00000000).into()
+            })
+            .cursor(CursorStyle::PointingHand)
+            .text_size(px(12.))
+            .text_color(colors.text_primary)
+            .child(if dirty { "● " } else { "" })
+            .child(SharedString::from(name.clone()))
+            .child(close);
+        if let Some(accent_line) = accent_line {
+            el = el.child(accent_line);
+        }
+        // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
+        // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
+        let drag_data = TabDragData {
+            idx,
+            name: SharedString::from(name),
+        };
+        let ghost_name = drag_data.name.clone();
+        el.on_drag(
+            drag_data,
+            move |_value: &TabDragData, _offset, _window, cx| {
+                cx.new(|_| TabDragGhost {
+                    name: ghost_name.clone(),
+                })
+            },
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                this.activate_tab(idx, window, cx);
+            }),
+        )
+        .into_any_element()
+    }
+
+    /// 新建(+)：手绘「＋」形图标（横/竖两条圆角细条居中），替代文本 "+"，
+    /// 避免不同字体下粗细/偏移不一显得歪斜；带 hover/按下交互反馈。
+    fn tab_add_button(colors: &TabBarColors, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
             .id("tab-add")
             .debug_selector(|| "tab-add".into())
             .w(px(24.))
@@ -345,12 +363,14 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .rounded_md()
-            .bg(chip_bg)
+            .bg(colors.chip_bg)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(tab_active_bg))
-            .active(|style| style.bg(tab_active_border))
+            .hover(|style| style.bg(colors.tab_active_bg))
+            .active(|style| style.bg(colors.tab_active_border))
             .on_click(
-                cx.listener(|this: &mut EditorApp, _ev, window, cx| this.new_tab(window, cx)),
+                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                    this.new_tab(window, cx)
+                }),
             )
             .child(
                 div()
@@ -368,7 +388,7 @@ impl EditorApp {
                             .right(px(0.))
                             .h(px(2.))
                             .rounded_full()
-                            .bg(chip_text),
+                            .bg(colors.chip_text),
                     )
                     // 竖条：居中垂直线（盖在横条之上）
                     .child(
@@ -379,73 +399,69 @@ impl EditorApp {
                             .bottom(px(0.))
                             .w(px(2.))
                             .rounded_full()
-                            .bg(chip_text),
+                            .bg(colors.chip_text),
                     ),
-            );
+            )
+            .into_any_element()
+    }
 
-        // 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
-        // 时才显示，点击切换当前选项卡的 Markdown 预览（与「查看 → 预览」一致）。
-        // 用纯 div 画出（椭圆外框 + 中心瞳孔），避免依赖 emoji 字体；蓝色=已开，灰色=已关。
+    /// 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
+    /// 时才显示，点击切换当前选项卡的 Markdown 预览（与「查看 → 预览」一致）。
+    /// 用纯 div 画出（椭圆外框 + 中心瞳孔），避免依赖 emoji 字体；蓝色=已开，灰色=已关。
+    fn tab_eye_button(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let active_is_md = self
             .tabs
             .get(self.active_tab)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| Self::is_markdown_path(p))
             .unwrap_or(false);
-
-        let eye = if active_is_md {
-            let on = self.show_preview();
-            let eye_color = if on { rgb(0x4338ca) } else { rgb(0x9ca3af) };
-            Some(
-                div()
-                    .id("tab-bar-eye")
-                    .debug_selector(|| "tab-bar-eye".into())
-                    .w(px(22.))
-                    .h(px(22.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .cursor(CursorStyle::PointingHand)
-                    .child(
-                        div()
-                            .w(px(16.))
-                            .h(px(10.))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(eye_color)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(div().w(px(5.)).h(px(5.)).rounded_full().bg(eye_color)),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
-                            let idx = this.active_tab;
-                            this.toggle_preview_for_tab(idx, window, cx);
-                        }),
-                    )
-                    .into_any_element(),
-            )
-        } else {
-            None
-        };
-
-        // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
-        let mut right: Vec<gpui::AnyElement> = Vec::new();
-        if let Some(eye) = eye {
-            right.push(eye);
+        if !active_is_md {
+            return None;
         }
+        let on = self.show_preview();
+        let eye_color = if on { rgb(0x4338ca) } else { rgb(0x9ca3af) };
+        Some(
+            div()
+                .id("tab-bar-eye")
+                .debug_selector(|| "tab-bar-eye".into())
+                .w(px(22.))
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor(CursorStyle::PointingHand)
+                .child(
+                    div()
+                        .w(px(16.))
+                        .h(px(10.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(eye_color)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(div().w(px(5.)).h(px(5.)).rounded_full().bg(eye_color)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
+                        let idx = this.active_tab;
+                        this.toggle_preview_for_tab(idx, window, cx);
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
 
-        // 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现；
-        // 半透明、贴着标签底部、浮在上方（不额外占高度）。
-        let mut hscroll_overlay: Vec<gpui::AnyElement> = Vec::new();
+    /// 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现；
+    /// 半透明、贴着标签底部、浮在上方（不额外占高度）。
+    fn tab_bar_hscroll_overlay(&self) -> Option<gpui::AnyElement> {
         let hscroll_dragging = self.tab_bar_hscroll.drag.borrow().is_some();
         if self.tab_bar_hscroll.handle.max_offset().x > px(0.)
             && (*self.tab_bar_hscroll.visible.borrow() || hscroll_dragging)
         {
-            hscroll_overlay.push(
+            Some(
                 div()
                     .absolute()
                     .debug_selector(|| "tab-bar-hscroll-overlay".into())
@@ -458,7 +474,30 @@ impl EditorApp {
                         "tab-bar-hscroll",
                     ))
                     .into_any_element(),
-            );
+            )
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active_tab;
+        let colors = self.tab_bar_colors(cx);
+        let mut tabs: Vec<gpui::AnyElement> = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate() {
+            tabs.push(Self::tab_bar_item(tab, i, i == active, &colors, cx));
+        }
+
+        // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
+        let mut right: Vec<gpui::AnyElement> = Vec::new();
+        if let Some(eye) = self.tab_eye_button(cx) {
+            right.push(eye);
+        }
+
+        // 横向滚动条自动隐藏：只在标签超宽 + （最近滚动 / 正在拖拽滑块）时出现。
+        let mut hscroll_overlay: Vec<gpui::AnyElement> = Vec::new();
+        if let Some(o) = self.tab_bar_hscroll_overlay() {
+            hscroll_overlay.push(o);
         }
 
         div()
@@ -471,7 +510,7 @@ impl EditorApp {
             .flex()
             .items_center()
             .gap_1()
-            .bg(bar_bg)
+            .bg(colors.bar_bg)
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
             // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变整体高度。
             .child(
@@ -503,7 +542,7 @@ impl EditorApp {
                     )
                     .children(hscroll_overlay),
             )
-            .child(add)
+            .child(Self::tab_add_button(&colors, cx))
             .children(right)
     }
 }
