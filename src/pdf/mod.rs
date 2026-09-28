@@ -351,11 +351,12 @@ mod tests {
     #[test]
     fn worker_renders_many_pages_individually() {
         let _guard = pdf_lock().lock().unwrap();
-        // 长 PDF（当前 fixture 242 页）：抽查首/中/末各一页（模拟「滚动到哪渲染哪」）
+        // 长 PDF（当前 fixture = pdf测试.pdf，87 页文本型）：抽查首/中/末各一页
+        // （模拟「滚动到哪渲染哪」）
         let p = test_pdf_paths()[1].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let dims = parser::page_dims(&bytes).expect("解析应成功");
-        assert!(dims.len() >= 200, "长文档应有大量页，实际={}", dims.len());
+        assert!(dims.len() >= 50, "长文档应有足够页数抽查首/中/末，实际={}", dims.len());
         let (worker, doc_id, _dims2) =
             PdfWorker::open_and_dims(bytes).expect("启动 worker 应成功");
         for idx in [0usize, dims.len() / 2, dims.len() - 1] {

@@ -350,11 +350,17 @@ fn walk_body(
             let t = joined.trim().to_string();
             if note_def
                 && let Some(n) = leading_footnote_id(node) {
-                    let marker = format!("[{n}]");
-                    if let Some(rest) = t.strip_prefix(marker.as_str()) {
-                        notes
-                            .entry(n)
-                            .or_insert_with(|| rest.trim_start_matches('\u{3000}').trim().to_string());
+                    // 定义标记已被改写为 `[!N]`（上一段插入 `!`），正文提取要兼容
+                    // 改写后的前缀（先 `[!N]`、再回落裸 `[N]`），否则注释表永远为空。
+                    let def = format!("[!{n}]");
+                    let plain = format!("[{n}]");
+                    let rest = t
+                        .strip_prefix(def.as_str())
+                        .or_else(|| t.strip_prefix(plain.as_str()));
+                    if let Some(rest) = rest {
+                        notes.entry(n).or_insert_with(|| {
+                            rest.trim_start_matches('\u{3000}').trim().to_string()
+                        });
                     }
                 }
             // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：

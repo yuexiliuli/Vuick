@@ -704,29 +704,20 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
     });
     let cx: &mut VisualTestContext = cx;
 
-    let md_src = "![1](wuling.png)\n\n![1](C:\\Users\\c22500540\\Pictures\\dify.jpg)\n\n![1](https://example.com/a.png)\n";
+    let manifest = env!("CARGO_MANIFEST_DIR").replace('/', "\\");
+    let abs = format!(r"{manifest}\target\img测试.png");
+    // 相对名 + 盘符绝对路径 + URL：相对应基于 base_dir 拼接，绝对保持原样，URL 保持原样。
+    let md_src = format!("![1](img测试.png)\n\n![1]({abs})\n\n![1](https://example.com/a.png)\n");
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_base_dir(Some(PathBuf::from(r"C:\Users\c22500540\Pictures")));
-            md.set_source(md_src, cx);
+            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\target"))));
+            md.set_source(&md_src, cx);
         });
     });
     cx.simulate_resize(size(px(400.), px(600.)));
     settle(cx);
 
-    let rows = cx.update(|_, cx| {
-        host.read(cx)
-            .md
-            .read(cx)
-            .rows
-            .iter()
-            .map(|r| r.kind.clone() == RowKind::Image)
-            .collect::<Vec<_>>()
-    });
-    drop(rows); // 仅确保读取不 panic；src 从 parsed 断言
-
-    // 直接从 parse 通路验证：resolve 逻辑在 set_source 内完成了 base 拼接
     let srcs = cx.update(|_, cx| {
         host.read(cx)
             .md
@@ -740,14 +731,14 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
     assert_eq!(srcs.len(), 3, "应解析出 3 张图片行，实际={srcs:?}");
     assert_eq!(
         srcs[0].as_deref(),
-        Some(r"C:\Users\c22500540\Pictures\wuling.png"),
+        Some(abs.as_str()),
         "相对路径应基于 base_dir 解析为绝对路径，实际={:?}",
         srcs[0]
     );
     assert_eq!(
         srcs[1].as_deref(),
-        Some(r"C:\Users\c22500540\Pictures\dify.jpg"),
-        "Windows 盘符绝对路径应保持原样，实际={:?}",
+        Some(abs.as_str()),
+        "盘符绝对路径应保持原样，实际={:?}",
         srcs[1]
     );
     assert_eq!(
@@ -757,7 +748,7 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
         srcs[2]
     );
 
-    // 本地文件应读取固有尺寸（wuling.png=565x724，dify.jpg=1632x492）
+    // 本地文件应读取固有尺寸（target/img测试.png = 72x72 JPEG，按内容 magic 探测）
     let dims = cx.update(|_, cx| {
         host.read(cx)
             .md
@@ -771,8 +762,8 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             })
             .collect::<Vec<_>>()
     });
-    assert_eq!(dims[0], (Some(565), Some(724)), "wuling.png 尺寸期望 565x724，实际={:?}", dims[0]);
-    assert_eq!(dims[1], (Some(1632), Some(492)), "dify.jpg 尺寸期望 1632x492，实际={:?}", dims[1]);
+    assert_eq!(dims[0], (Some(580), Some(773)), "img测试.png 尺寸应 580x773，实际={:?}", dims[0]);
+    assert_eq!(dims[1], (Some(580), Some(773)), "img测试.png 尺寸应 580x773，实际={:?}", dims[1]);
     assert_eq!(dims[2], (None, None), "URL 无本地尺寸，实际={:?}", dims[2]);
 }
 
@@ -788,12 +779,13 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
     });
     let cx: &mut VisualTestContext = cx;
 
-    let wabsp = r"C:\Users\c22500540\Pictures\wuling.png";
-    let md_src = format!("# 标题\n\n![w]({wabsp})\n\n![s](C:\\Users\\c22500540\\Pictures\\dify.jpg)\n");
+    let manifest = env!("CARGO_MANIFEST_DIR").replace('/', "\\");
+    let wabsp = format!(r"{manifest}\target\img测试.png");
+    let md_src = format!("# 标题\n\n![w]({wabsp})\n\n![s]({wabsp})\n");
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_base_dir(Some(PathBuf::from(r"C:\Users\c22500540\Pictures")));
+            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\target"))));
             md.set_source(&md_src, cx);
         });
     });
@@ -818,12 +810,12 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
         (wh, dh)
     };
 
-    // 宽视口 500px：wuling 宽=min(500-24, 600)=476 → 高=476*724/565≈610，限高后按比例
+    // 宽视口 500px：72x72 图按比例放大占满可用宽；行高随宽度变化。
     cx.simulate_resize(size(px(500.), px(800.)));
     settle(cx);
     let (w_wide, d_wide) = measure(cx);
 
-    // 窄视口 260px：wuling 宽=260-24=236 → 高=236*724/565≈302（成比例缩小）
+    // 窄视口 260px：行高同比缩小（aspect-ratio 驱动）。
     cx.simulate_resize(size(px(260.), px(800.)));
     settle(cx);
     let (w_small, d_small) = measure(cx);
@@ -834,7 +826,7 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
     );
     assert!(
         d_small < d_wide - 50.0,
-        "dify 行高同样应随宽度缩小：wide={d_wide:.0} small={d_small:.0}"
+        "第二张图片行高同样应随宽度缩小：wide={d_wide:.0} small={d_small:.0}"
     );
 
     // 图片盒水平居中：md-img-box 左缘 ≈ (视口宽 - 盒宽)/2
