@@ -313,154 +313,24 @@ fn walk_body(
     on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
 ) {
     match node.tag_name().name() {
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-            let level = node.tag_name().name()[1..].parse::<u8>().unwrap_or(1);
-            let text = node_text_epub(node);
-            out.push('\n');
-            out.push_str(&"#".repeat(level as usize));
-            out.push(' ');
-            out.push_str(text.trim());
-            out.push_str("\n\n");
-            return;
-        }
-        "p" => {
-            let cls = node.attribute("class").unwrap_or("");
-            // 落款（签名）段落右对齐；其余沿用祖先对齐（float-r→右 / float-l→左）。
-            let p_align = if cls.split_whitespace().any(|c| c == "signature") {
-                Some(RowAlign::Right)
-            } else {
-                align
-            };
-            // 按 `<br>` 切开成多行（落款“…恩格斯<br/>1882年1月21日于伦敦”分行显示）。
-            let mut segs = node_text_epub_lines(node);
-            // 「注释」章：`p.note` 段落的 leading `<a id="footnoteN">[N]</a>` 是「注释定义」标记
-            // → 改写成 `[!N]`（渲染层识别为定义标记，可逆跳到文内对应位置）；
-            // 同时抽出 (注记号 → 注释正文) 进 `notes`（悬浮卡片数据源）。
-            let note_def = leading_footnote_id(node).is_some();
-            if note_def
-                && let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty())
-                    && let Some(rel) = first.find('[') {
-                        let after = &first[rel + 1..];
-                        let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
-                        if d > 0 && after[d..].starts_with(']') {
-                            first.insert(rel + 1, '!');
-                        }
-                    }
-            let joined = segs.join("\n");
-            let t = joined.trim().to_string();
-            if note_def
-                && let Some(n) = leading_footnote_id(node) {
-                    // 定义标记已被改写为 `[!N]`（上一段插入 `!`），正文提取要兼容
-                    // 改写后的前缀（先 `[!N]`、再回落裸 `[N]`），否则注释表永远为空。
-                    let def = format!("[!{n}]");
-                    let plain = format!("[{n}]");
-                    let rest = t
-                        .strip_prefix(def.as_str())
-                        .or_else(|| t.strip_prefix(plain.as_str()));
-                    if let Some(rest) = rest {
-                        notes.entry(n).or_insert_with(|| {
-                            rest.trim_start_matches('\u{3000}').trim().to_string()
-                        });
-                    }
-                }
-            // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：
-            // 行首前置两个全角空格，渲染时折行后天然「首行缩进、次行顶格」；
-            // 对齐行（落款/浮段）与引述/注释等段落不缩进。
-            let is_body_text = quoted == 0
-                && (cls.split_whitespace().any(|c| c == "text") || cls.trim().is_empty());
-            for seg in segs.into_iter().map(|s| s.trim().to_string()) {
-                if seg.is_empty() {
-                    continue;
-                }
-                // 对齐段落每一 `br` 行都带对齐指令（多行落款整块靠右）。
-                let line = match (p_align, is_body_text) {
-                    (Some(a), _) => {
-                        let mut s = String::with_capacity(seg.len() + 16);
-                        s.push_str(align_directive(a));
-                        s.push_str(&seg);
-                        s
-                    }
-                    (None, true) => format!("\u{3000}\u{3000}{seg}"),
-                    _ => seg,
-                };
-                if !line.trim().is_empty() {
-                    out.push_str(&quote_prefix(&line, quoted));
-                    out.push('\n');
-                }
-            }
-            return;
-        }
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => return emit_heading(node, out),
+        "p" => return emit_paragraph(node, out, quoted, align, notes),
         "blockquote" => {
             out.push('\n');
         }
         "ul" | "ol" => {}
-        "li" => {
-            let t = node_text_epub(node);
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                let line = match align {
-                    Some(a) => {
-                        let mut s = String::with_capacity(t.len() + 16);
-                        s.push_str(align_directive(a));
-                        s.push_str(&t);
-                        s
-                    }
-                    None => t,
-                };
-                let marker = if parent_is_ordered(node) { "- " } else { "• " };
-                out.push_str(marker);
-                out.push_str(&quote_prefix(&line, quoted));
-                out.push('\n');
-            }
-            return;
-        }
+        "li" => return emit_list_item(node, out, quoted, align),
         "a" => {
-            // 正文脚注标记：`<a id="noteN" href="...#footnoteN"><sup>[N]</sup></a>`
-            // → `[^N]`（渲染层做悬浮卡片；通常已在 p/标题内被 [`node_text_epub`]
-            // 处理，此处兜底裸露在 div/块外的锚）；普通链接原样走子节点文本。
-            if let Some(n) = note_ref_at(node) {
-                out.push_str(&format!(" [^{n}] "));
+            if emit_link_note(node, out) {
                 return;
             }
         }
-        "img" | "image" => {
-            let alt = node.attribute("alt").unwrap_or("").to_string();
-            // `<img src>` 与 SVG `<image xlink:href>` 两种取址方式。
-            // 命名空间属性（href/xlink:href）逐个扫描，避免依赖限定名解析。
-            let mut src = node.attribute("src").unwrap_or("").to_string();
-            if src.is_empty() {
-                for a in node.attributes() {
-                    let name = a.name();
-                    if name == "href" || name.ends_with(":href") || name == "xlink:href" {
-                        src = a.value().to_string();
-                        break;
-                    }
-                }
-            }
-            match on_img(&src, &alt) {
-                Some(path) => {
-                    let alt_esc = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
-                    out.push_str(&format!("\n\n![{alt_esc}]({path})\n\n"));
-                }
-                None => {
-                    let label = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
-                    out.push_str(&format!("\n\n> [图片：{label}]\n\n"));
-                }
-            }
-            return;
-        }
+        "img" | "image" => return emit_image(node, out, on_img),
         "br" => {
             out.push('\n');
             return;
         }
-        "sup" => {
-            let t = node_text(node);
-            let t = t.trim().to_string();
-            if !t.is_empty() {
-                out.push_str(&format!(" [{t}] "));
-            }
-            return;
-        }
+        "sup" => return emit_sup(node, out),
         "title" | "style" | "script" | "head" | "meta" | "link" | "#comment" => return,
         _ => {}
     }
@@ -482,6 +352,171 @@ fn walk_body(
         if child.is_element() || child.is_text() {
             walk_body(&child, out, child_quoted, child_align, notes, on_img);
         }
+    }
+}
+
+/// `h1..h6` → markdown 标题行。
+fn emit_heading(node: &roxmltree::Node, out: &mut String) {
+    let level = node.tag_name().name()[1..].parse::<u8>().unwrap_or(1);
+    let text = node_text_epub(node);
+    out.push('\n');
+    out.push_str(&"#".repeat(level as usize));
+    out.push(' ');
+    out.push_str(text.trim());
+    out.push_str("\n\n");
+}
+
+/// `p` → 段落：落款右对齐/`<br>` 分行/「注释定义」改写 `[N]`→`[!N]` 并登记 `notes`/
+/// 正文首行缩进 2 全角空格（引述/对齐行不缩进）。
+fn emit_paragraph(
+    node: &roxmltree::Node,
+    out: &mut String,
+    quoted: usize,
+    align: Option<RowAlign>,
+    notes: &mut std::collections::BTreeMap<usize, String>,
+) {
+    let cls = node.attribute("class").unwrap_or("");
+    // 落款（签名）段落右对齐；其余沿用祖先对齐（float-r→右 / float-l→左）。
+    let p_align = if cls.split_whitespace().any(|c| c == "signature") {
+        Some(RowAlign::Right)
+    } else {
+        align
+    };
+    // 按 `<br>` 切开成多行（落款“…恩格斯<br/>1882年1月21日于伦敦”分行显示）。
+    let mut segs = node_text_epub_lines(node);
+    // 「注释」章：`p.note` 段落的 leading `<a id="footnoteN">[N]</a>` 是「注释定义」标记
+    // → 改写成 `[!N]`（渲染层识别为定义标记，可逆跳到文内对应位置）；
+    // 同时抽出 (注记号 → 注释正文) 进 `notes`（悬浮卡片数据源）。
+    let note_def = leading_footnote_id(node).is_some();
+    if note_def
+        && let Some(first) = segs.iter_mut().find(|s| !s.trim().is_empty())
+        && let Some(rel) = first.find('[') {
+            let after = &first[rel + 1..];
+            let d = after.chars().take_while(|c| c.is_ascii_digit()).count();
+            if d > 0 && after[d..].starts_with(']') {
+                first.insert(rel + 1, '!');
+            }
+        }
+    let joined = segs.join("\n");
+    let t = joined.trim().to_string();
+    if note_def
+        && let Some(n) = leading_footnote_id(node) {
+            // 定义标记已被改写为 `[!N]`（上一段插入 `!`），正文提取要兼容
+            // 改写后的前缀（先 `[!N]`、再回落裸 `[N]`），否则注释表永远为空。
+            let def = format!("[!{n}]");
+            let plain = format!("[{n}]");
+            let rest = t
+                .strip_prefix(def.as_str())
+                .or_else(|| t.strip_prefix(plain.as_str()));
+            if let Some(rest) = rest {
+                notes.entry(n).or_insert_with(|| {
+                    rest.trim_start_matches('\u{3000}').trim().to_string()
+                });
+            }
+        }
+    // 正文（`class="text"` 或空 class、且不在引述块内）首行缩进 2 字符：
+    // 行首前置两个全角空格，渲染时折行后天然「首行缩进、次行顶格」；
+    // 对齐行（落款/浮段）与引述/注释等段落不缩进。
+    let is_body_text = quoted == 0
+        && (cls.split_whitespace().any(|c| c == "text") || cls.trim().is_empty());
+    for seg in segs.into_iter().map(|s| s.trim().to_string()) {
+        if seg.is_empty() {
+            continue;
+        }
+        // 对齐段落每一 `br` 行都带对齐指令（多行落款整块靠右）。
+        let line = match (p_align, is_body_text) {
+            (Some(a), _) => {
+                let mut s = String::with_capacity(seg.len() + 16);
+                s.push_str(align_directive(a));
+                s.push_str(&seg);
+                s
+            }
+            (None, true) => format!("\u{3000}\u{3000}{seg}"),
+            _ => seg,
+        };
+        if !line.trim().is_empty() {
+            out.push_str(&quote_prefix(&line, quoted));
+            out.push('\n');
+        }
+    }
+}
+
+/// `li` → 列表项（有序 `- ` / 无序 `• `，可带祖先对齐）。
+fn emit_list_item(
+    node: &roxmltree::Node,
+    out: &mut String,
+    quoted: usize,
+    align: Option<RowAlign>,
+) {
+    let t = node_text_epub(node);
+    let t = t.trim().to_string();
+    if !t.is_empty() {
+        let line = match align {
+            Some(a) => {
+                let mut s = String::with_capacity(t.len() + 16);
+                s.push_str(align_directive(a));
+                s.push_str(&t);
+                s
+            }
+            None => t,
+        };
+        let marker = if parent_is_ordered(node) { "- " } else { "• " };
+        out.push_str(marker);
+        out.push_str(&quote_prefix(&line, quoted));
+        out.push('\n');
+    }
+}
+
+/// `a` → 返回 true 表示它是正文脚注锚（已输出 `[^N]`，调用方不再下钻）；
+/// false 表示普通链接，交给子节点递归。
+fn emit_link_note(node: &roxmltree::Node, out: &mut String) -> bool {
+    // 正文脚注标记：`<a id="noteN" href="...#footnoteN"><sup>[N]</sup></a>`
+    // → `[^N]`（渲染层做悬浮卡片；通常已在 p/标题内被 [`node_text_epub`]
+    // 处理，此处兜底裸露在 div/块外的锚）；普通链接原样走子节点文本。
+    if let Some(n) = note_ref_at(node) {
+        out.push_str(&format!(" [^{n}] "));
+        return true;
+    }
+    false
+}
+
+/// `img` / SVG `image` → 内/外取址解析后交给 `on_img` 落 markdown 图片（失败退化为引用块）。
+fn emit_image(
+    node: &roxmltree::Node,
+    out: &mut String,
+    on_img: &mut dyn FnMut(&str, &str) -> Option<String>,
+) {
+    let alt = node.attribute("alt").unwrap_or("").to_string();
+    // `<img src>` 与 SVG `<image xlink:href>` 两种取址方式。
+    // 命名空间属性（href/xlink:href）逐个扫描，避免依赖限定名解析。
+    let mut src = node.attribute("src").unwrap_or("").to_string();
+    if src.is_empty() {
+        for a in node.attributes() {
+            let name = a.name();
+            if name == "href" || name.ends_with(":href") || name == "xlink:href" {
+                src = a.value().to_string();
+                break;
+            }
+        }
+    }
+    match on_img(&src, &alt) {
+        Some(path) => {
+            let alt_esc = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+            out.push_str(&format!("\n\n![{alt_esc}]({path})\n\n"));
+        }
+        None => {
+            let label = if alt.is_empty() { "图片".to_string() } else { alt.clone() };
+            out.push_str(&format!("\n\n> [图片：{label}]\n\n"));
+        }
+    }
+}
+
+/// `sup` → 可读文本（如 `[N]` 上标，转换为 ` [N] `）。
+fn emit_sup(node: &roxmltree::Node, out: &mut String) {
+    let t = node_text(node);
+    let t = t.trim().to_string();
+    if !t.is_empty() {
+        out.push_str(&format!(" [{t}] "));
     }
 }
 
