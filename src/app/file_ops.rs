@@ -17,6 +17,58 @@ enum ChunkApply {
     Stale,
 }
 
+/// 生产者 → 消费者的消息（大文档分块打开的异步通道）。
+enum OpenMsg {
+    Chunk(TextChunk),
+    Eof { src_len: u64 },
+    Err(std::io::Error),
+}
+
+/// 后台分块读盘 + 归一化 + 逐块统计的生产者：`send().await` 背压外推（读满让出），
+/// EOF / 出错 / 消费端放弃即收尾关闭通道。
+async fn read_chunks_async(
+    mut prod_tx: futures::channel::mpsc::Sender<OpenMsg>,
+    prod_p: std::path::PathBuf,
+) {
+    use futures::SinkExt as _;
+    let t = std::time::Instant::now();
+    let mut reader = match crate::app::open_progress::ChunkReader::open(&prod_p) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = prod_tx.send(OpenMsg::Err(e)).await;
+            prod_tx.close_channel();
+            return;
+        }
+    };
+    loop {
+        match reader.next_chunk() {
+            Ok(Some(chunk)) => {
+                if prod_tx.send(OpenMsg::Chunk(chunk)).await.is_err() {
+                    return; // 消费端已放弃 → 停止读盘
+                }
+            }
+            Ok(None) => {
+                if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                    eprintln!(
+                        "[MD_OPEN_DEBUG] 后台 分块读盘+归一化+逐块统计 合计: {} ms",
+                        t.elapsed().as_millis()
+                    );
+                }
+                let _ = prod_tx
+                    .send(OpenMsg::Eof { src_len: reader.total_bytes() })
+                    .await;
+                prod_tx.close_channel();
+                return;
+            }
+            Err(e) => {
+                let _ = prod_tx.send(OpenMsg::Err(e)).await;
+                prod_tx.close_channel();
+                return;
+            }
+        }
+    }
+}
+
 /// 首块挂载的行数提示（`str::lines()` 口径）。首块可能不含完整文件，这只是过渡值，
 /// 后续块追加后 [`CodeEditor::append_mounted_chunk`] 会经 `display_line_count()` 校正。
 fn prep_first_lines_hint(text: &str) -> usize {
@@ -263,63 +315,18 @@ impl EditorApp {
         let is_md = Self::is_markdown_path(&p);
         let entity = cx.entity();
 
-        /// 生产者 → 消费者的消息。
-        enum OpenMsg {
-            Chunk(crate::app::open_progress::TextChunk),
-            Eof { src_len: u64 },
-            Err(std::io::Error),
-        }
-
         // 异步**有界**通道（容量 4）：消费端 `next()` 空时让出调度，生产端 `send()`
         // 满时也 `await` 让出（背压）——既不物化整篇 String，也不让通道囤积整篇
         // （测试的协作式调度器下，blocking recv 会卡死，故绝不用 std::sync::mpsc）。
         let (tx, rx) = futures::channel::mpsc::channel::<OpenMsg>(4);
         window
             .spawn(cx, async move |cx| {
-                use futures::{SinkExt as _, StreamExt as _};
-                // ---- 生产者（后台线程；逐块读盘 → `send().await` 背压外推）----
-                let mut prod_tx = tx.clone();
+                use futures::StreamExt as _;
+                // ---- 生产者（后台线程；逐块读盘 → `send().await` 背压外推，见 `read_chunks_async`）----
+                let prod_tx = tx.clone();
                 let prod_p = p.clone();
                 cx.background_executor()
-                    .spawn(async move {
-                        let t = std::time::Instant::now();
-                        let mut reader =
-                            match crate::app::open_progress::ChunkReader::open(&prod_p) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    let _ = prod_tx.send(OpenMsg::Err(e)).await;
-                                    prod_tx.close_channel();
-                                    return;
-                                }
-                            };
-                        loop {
-                            match reader.next_chunk() {
-                                Ok(Some(chunk)) => {
-                                    if prod_tx.send(OpenMsg::Chunk(chunk)).await.is_err() {
-                                        return; // 消费端已放弃 → 停止读盘
-                                    }
-                                }
-                                Ok(None) => {
-                                    if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                                        eprintln!(
-                                            "[MD_OPEN_DEBUG] 后台 分块读盘+归一化+逐块统计 合计: {} ms",
-                                            t.elapsed().as_millis()
-                                        );
-                                    }
-                                    let _ = prod_tx
-                                        .send(OpenMsg::Eof { src_len: reader.total_bytes() })
-                                        .await;
-                                    prod_tx.close_channel();
-                                    return;
-                                }
-                                Err(e) => {
-                                    let _ = prod_tx.send(OpenMsg::Err(e)).await;
-                                    prod_tx.close_channel();
-                                    return;
-                                }
-                            }
-                        }
-                    })
+                    .spawn(read_chunks_async(prod_tx, prod_p))
                     .detach();
 
                 // ---- 消费者：逐块取（空时让出调度），再到主线程追加装配 ----
