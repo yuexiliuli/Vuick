@@ -734,34 +734,16 @@ pub(crate) fn render_row(
 ) -> gpui::AnyElement {
     // 解构回原参数名：身体与旧签名逐字节等价（p/wrap/search/epub/selection/marker_hl/row_ix 为
     // 拷贝或引用；code_hl 为 Rc 需 clone）。
+    // 派发所需的最小解构；各 `render_wrapped_*` / `render_plain_*` 助手自行从 ctx 取参。
     let RowRenderCtx {
         p,
         wrap,
-        code_hl,
         table_handle,
-        search,
-        note_ctx,
-        text_ctx,
-        selection,
-        marker_hl,
-        row_ix,
         ..
     } = ctx;
     let p: &Rc<StyleParams> = p;
     let wrap: bool = *wrap;
-    let code_hl: Option<Rc<CodeLineRuns>> = code_hl.clone();
     let table_handle: Option<ScrollHandle> = table_handle.clone();
-    let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let note_ctx: &Rc<NoteCtx> = note_ctx;
-    let text_ctx: &Rc<TextCtx> = text_ctx;
-    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
-    let marker_hl: Option<(usize, bool)> = *marker_hl;
-    let row_ix: usize = *row_ix;
-    // 当前主题明/暗（代码块语法着色色板随主题）。
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    // 跳转加亮：本行是目标行时把 (注记号, 是否定义, 背景色) 交给 text_child。
-    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    let code_runs = code_hl.as_deref();
     // 表格行（GFM pipe table 整体折叠成一渲染行；换行模式自带横向滚动容器）。
     if let RowKind::Table = row.kind {
         return render_table_row(row, p, wrap, table_handle);
@@ -788,8 +770,8 @@ pub(crate) fn render_row(
         }
     }
 
-    let el: gpui::Div = match row.kind {
-        RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0(),
+    match row.kind {
+        RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0().into_any_element(),
         RowKind::Rule => div()
             .h(p.rule_h)
             .w_full()
@@ -797,154 +779,254 @@ pub(crate) fn render_row(
             .flex()
             .items_center()
             .px_3()
-            .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
-        RowKind::Code => {
-            // 代码块：整栏折叠为一行的所有代码行按 h(code_line) 纵向堆叠成连续块，
-            // 上下各补一行空白带（同背景），使背景在首/末行之外多出一行呼吸空间。
-            // 每行浅灰背景带（左右内缩 px_3 与正文对齐），等宽字体 + 语法着色。超宽由外层横向滚动。
-            let lines = row.code_lines().to_vec();
-            let p_ = p.clone();
-            let runs = code_runs;
-            let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
+            .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full())
+            .into_any_element(),
+        RowKind::Code => render_plain_code(row, ctx, cx),
+        RowKind::Heading(_) => render_plain_heading(row, ctx, cx),
+        RowKind::Quote => render_plain_quote(row, ctx, cx),
+        RowKind::Bullet => render_plain_bullet(row, ctx, cx),
+        RowKind::Paragraph => render_plain_paragraph(row, ctx, cx),
+        RowKind::Table => unreachable!("表格已在上方提前返回"),
+        RowKind::Image => unreachable!("图片行已在上方提前返回"),
+    }
+}
+
+/// 非换行模式：代码块（整栏折叠 → 逐行堆叠连续块 + 上下呼吸带；超宽由外层横向滚动）。
+fn render_plain_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx { p, code_hl, .. } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let code_runs = code_hl.as_deref();
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let lines = row.code_lines().to_vec();
+    let p_ = p.clone();
+    let runs = code_runs;
+    let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
+    div()
+        .h(px(block_h))
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .child(
             div()
-                .h(px(block_h))
+                .debug_selector(|| "md-code-row".into())
+                .h_full()
                 .w_full()
-                .flex_shrink_0()
-                .px_3()
-                .child(
-                    div()
-                        .debug_selector(|| "md-code-row".into())
-                        .h_full()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .children(code_block_bands(&lines, runs, dark, &p_)),
-                )
-        }
-        RowKind::Heading(n) => {
-            let (fs, lh) = p.heading_metrics(n);
-            let t = text_child_for_row(
-                row,
-                p,
-                search,
-                selection,
-                &TextStyle {
-                    font_size: fs.into(),
-                    color: p.fg,
-                    font_weight: FontWeight::BOLD,
-                    ..TextStyle::default()
-                },
-                marker_hl,
-                row_ix,
-                text_ctx,
-                note_ctx,
-            );
+                .flex()
+                .flex_col()
+                .children(code_block_bands(&lines, runs, dark, &p_)),
+        )
+        .into_any_element()
+}
+
+/// 非换行模式：标题（1-6 级，BOLD、单行裁剪）。
+fn render_plain_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let RowKind::Heading(n) = row.kind else {
+        unreachable!("只应在 Heading 行调用")
+    };
+    let (fs, lh) = p.heading_metrics(n);
+    let t = text_child_for_row(
+        row,
+        p,
+        search,
+        selection,
+        &TextStyle {
+            font_size: fs.into(),
+            color: p.fg,
+            font_weight: FontWeight::BOLD,
+            ..TextStyle::default()
+        },
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    );
+    div()
+        .h(lh)
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(fs)
+        .text_color(p.fg)
+        .font_weight(FontWeight::BOLD)
+        .child(t)
+        .into_any_element()
+}
+
+/// 非换行模式：引述（背景带/左边框在内层，单行裁剪）。
+fn render_plain_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let t = text_child_for_row(
+        row,
+        p,
+        search,
+        selection,
+        &TextStyle {
+            font_size: p.para_size.into(),
+            color: p.muted_fg,
+            ..TextStyle::default()
+        },
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    );
+    div()
+        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(
             div()
-                .h(lh)
+                .debug_selector(|| "md-quote-band".into())
+                .h_full()
                 .w_full()
-                .flex_shrink_0()
+                .pl_3()
+                .pr_3()
+                // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
+                // 与换行分支 / WYSIWYG 完全一致（旧实现此处误用 accent2px）。
+                .border_l(px(QUOTE_BAR_WIDTH_PX))
+                .border_color(gpui::rgb(QUOTE_BAR_COLOR))
+                .bg(p.quote_bg)
                 .flex()
                 .items_center()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .text_size(fs)
-                .text_color(p.fg)
-                .font_weight(FontWeight::BOLD)
-                .child(t)
-        }
-        RowKind::Quote => {
-            // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
-            // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = text_child_for_row(
+                .text_size(p.para_size)
+                .text_color(p.muted_fg)
+                .child(t),
+        )
+        .into_any_element()
+}
+
+/// 非换行模式：列表项（项目符号接正文，单行裁剪）。
+fn render_plain_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
+    div()
+        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
+        .w_full()
+        .flex_shrink_0()
+        .ml_3()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(p.para_size)
+        .text_color(p.fg)
+        .child(t)
+        .into_any_element()
+}
+
+/// 非换行模式：正文段（单行裁剪）。
+fn render_plain_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    div()
+        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(p.para_size)
+        .text_color(p.fg)
+        .child(
+            text_child_for_row(
                 row,
                 p,
                 search,
                 selection,
                 &TextStyle {
                     font_size: p.para_size.into(),
-                    color: p.muted_fg,
+                    color: p.fg,
                     ..TextStyle::default()
                 },
                 marker_hl,
                 row_ix,
                 text_ctx,
                 note_ctx,
-            );
-            div()
-                .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-                .w_full()
-                .flex_shrink_0()
-                .px_3()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .debug_selector(|| "md-quote-band".into())
-                        .h_full()
-                        .w_full()
-                        .pl_3()
-                        .pr_3()
-                        // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
-                        // 与换行分支 / WYSIWYG 完全一致（旧实现此处误用 accent2px）。
-                        .border_l(px(QUOTE_BAR_WIDTH_PX))
-                        .border_color(gpui::rgb(QUOTE_BAR_COLOR))
-                        .bg(p.quote_bg)
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(p.para_size)
-                        .text_color(p.muted_fg)
-                        .child(t),
-                )
-        }
-        RowKind::Bullet => {
-            let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
-            div()
-                .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-                .w_full()
-                .flex_shrink_0()
-                .ml_3()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_size(p.para_size)
-                .text_color(p.fg)
-                .child(t)
-        }
-        RowKind::Paragraph => div()
-            .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-            .w_full()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .text_size(p.para_size)
-            .text_color(p.fg)
-            .child(
-                text_child_for_row(
-                    row,
-                    p,
-                    search,
-                    selection,
-                    &TextStyle {
-                        font_size: p.para_size.into(),
-                        color: p.fg,
-                        ..TextStyle::default()
-                    },
-                    marker_hl,
-                    row_ix,
-                    text_ctx,
-                    note_ctx,
-                ),
             ),
-        RowKind::Table => unreachable!("表格已在上方提前返回"),
-        RowKind::Image => unreachable!("图片行已在上方提前返回"),
-    };
-    el.into_any_element()
+        )
+        .into_any_element()
 }
 
 /// 换行模式：围栏代码块折叠成连续块（逐行堆叠）+ 自带头部横向滚动容器（正文折行、
