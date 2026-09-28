@@ -350,9 +350,7 @@ fn pass2_shape_band(
     let math_body = &plan.math_body;
     let math_start = &plan.math_start;
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
-    {
-        let mut row_cache = editor.shape_rows.borrow_mut();
-        let mut i = i0;
+    let mut i = i0;
         while i < i1 {
             let srcline = base.borrow().src_lines()[i] as usize;
             let blocked = !reveal.contains(srcline)
@@ -376,58 +374,10 @@ fn pass2_shape_band(
                 i += 1;
             }
             let hi = i;
-            // A1「命中先行」：整带内先判哪些块**不需要**物化 DocRow——命中 = 缓存键
-            // 匹配且非 caret 行（caret 行 shape 依赖光标，即便已在缓存也必须强制物化
-            // 重 shape、不缓存；逐帧至多一行）。只对「未命中 ∪ caret 行」批量物化
-            // （连续段合并复用批量 parse），命中块免去 `rows_in_block_window` 的整带
-            // parse+assemble（byte_map / 表格 / code payload 装配）——每键/每带重建
-            // 从「整带物化」降到「仅 miss 块」。
-            let mut need_row: Vec<usize> = Vec::new();
-            let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
-                std::collections::HashMap::new();
-            for k in lo..hi {
-                let srcline = base.borrow().src_lines()[k] as usize;
-                if caret_line == srcline {
-                    need_row.push(k);
-                } else if let Some(rc) = row_cache.get(k, shape_key) {
-                    if shaped_row_has_notdef(&rc) && !editor.notdef_settled(k) {
-                        // 命中但含 .notdef（此前冷启动坏字形被缓存/预热写入）：视作
-                        // miss，强制以新鲜平台重排——否则豆腐块被旧缓存钉住整次运行。
-                        // 已 `settled`（判定确无字形）的块例外：tofu 即正确显示，正常命中。
-                        need_row.push(k);
-                    } else {
-                        hit_map.insert(k, rc);
-                    }
-                } else {
-                    // 缓存 miss。若存在**旧键**条目（内容/图片/数学/宽度换代把旧行逐出），
-                    // 旧 `settled/verified/attempts` 判决对应的是上一代结果——可能在图片
-                    // 解码卡顿窗口里留下（.notdef 预算烧光→settled / 非零占位字形→verified），
-                    // 换代重排前作废，让本块按新代重新校验/重试。图片加载完成的 `igen` 换代
-                    // 重建会走到这里 → 自愈，不再整次运行永久豆腐块。保留冷却帧不闪跳。
-                    if row_cache.key_mismatch(k, shape_key) {
-                        editor.clear_stale_verdicts(k);
-                    }
-                    need_row.push(k);
-                }
-            }
-            // 只物化 miss / caret 块（连续段合并）。
-            let mut rows_map: std::collections::HashMap<usize, DocRow> =
-                std::collections::HashMap::new();
-            let _t_parse = crate::prof::begin();
-            let mut ni = 0usize;
-            while ni < need_row.len() {
-                let lo2 = need_row[ni];
-                let mut hi2 = lo2;
-                ni += 1;
-                while ni < need_row.len() && need_row[ni] == hi2 + 1 {
-                    hi2 += 1;
-                    ni += 1;
-                }
-                for (off, r) in doc.rows_in_block_window(lo2, hi2).into_iter().enumerate() {
-                    rows_map.insert(lo2 + off, r);
-                }
-            }
-            crate::prof::end("wy.bf.blockparse", _t_parse);
+            // A1「命中先行」+ 只物化 miss/caret 块（连续段合并批量 parse）。
+            let (need_row, mut hit_map) =
+                band_hit_test(editor, base, lo, hi, caret_line, shape_key);
+            let mut rows_map = band_parse_rows(doc, &need_row);
             // 整带顺序装配（Pass3 依赖 `shaped` 与块序一致）：命中 → 浅克隆
             // （heavy 数据都是 Arc/Rc，top 在 Pass3 现设）；否则从物化行 shape。
             let _t_shape = crate::prof::begin();
@@ -471,7 +421,7 @@ fn pass2_shape_band(
                             if is_caret {
                                 srow
                             } else {
-                                let rc = row_cache.put(k, shape_key, srow);
+                                let rc = editor.shape_rows.borrow_mut().put(k, shape_key, srow);
                                 (*rc).clone()
                             }
                         } else {
@@ -514,7 +464,7 @@ fn pass2_shape_band(
                         if is_caret && !srow.extra.inline_maths.is_empty() {
                             srow // reveal 依赖光标 → 保持不缓存
                         } else {
-                            let rc = row_cache.put(k, shape_key, srow);
+                            let rc = editor.shape_rows.borrow_mut().put(k, shape_key, srow);
                             (*rc).clone()
                         }
                     }
@@ -526,9 +476,74 @@ fn pass2_shape_band(
             }
             crate::prof::end("wy.bf.shape", _t_shape);
         }
-    }
     crate::prof::end("wy.pass2", _t_p2);
     shaped
+}
+
+/// A1「命中先行」：整带内判哪些块**不需要**物化 DocRow——命中 = 缓存键匹配且非 caret 行
+/// （caret 行 shape 依赖光标，即便已在缓存也必须强制物化重 shape、不缓存；逐帧至多一行）。
+/// 只对「未命中 ∪ caret 行」批量物化（连续段合并复用批量 parse）。本函数内部临时借用
+/// `shape_rows` 缓存做命中判定，返回 (need_row, hit_map)。
+#[allow(clippy::type_complexity)]
+fn band_hit_test(
+    editor: &WyEditor,
+    base: &Rc<RefCell<BlockLayout>>,
+    lo: usize,
+    hi: usize,
+    caret_line: usize,
+    shape_key: u64,
+) -> (Vec<usize>, std::collections::HashMap<usize, std::rc::Rc<ShapedRow>>) {
+    let mut row_cache = editor.shape_rows.borrow_mut();
+    let mut need_row: Vec<usize> = Vec::new();
+    let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
+        std::collections::HashMap::new();
+    for k in lo..hi {
+        let srcline = base.borrow().src_lines()[k] as usize;
+        if caret_line == srcline {
+            need_row.push(k);
+        } else if let Some(rc) = row_cache.get(k, shape_key) {
+            if shaped_row_has_notdef(&rc) && !editor.notdef_settled(k) {
+                // 命中但含 .notdef（此前冷启动坏字形被缓存/预热写入）：视作 miss，强制以
+                // 新鲜平台重排——否则豆腐块被旧缓存钉住整次运行。已 `settled`（判定确无
+                // 字形）的块例外：tofu 即正确显示，正常命中。
+                need_row.push(k);
+            } else {
+                hit_map.insert(k, rc);
+            }
+        } else {
+            // 缓存 miss。若存在**旧键**条目（内容/图片/数学/宽度换代把旧行逐出），旧
+            // `settled/verified/attempts` 判决对应的是上一代结果——可能在图片解码卡顿窗口
+            // 里留下（.notdef 预算烧光→settled / 非零占位字形→verified），换代重排前作废，
+            // 让本块按新代重新校验/重试。图片加载完成的 `igen` 换代重建会走到这里 → 自愈。
+            if row_cache.key_mismatch(k, shape_key) {
+                editor.clear_stale_verdicts(k);
+            }
+            need_row.push(k);
+        }
+    }
+    (need_row, hit_map)
+}
+
+/// 只物化 miss / caret 块（连续段合并为一次 `rows_in_block_window` 批量 parse）。
+fn band_parse_rows(doc: &Doc, need_row: &[usize]) -> std::collections::HashMap<usize, DocRow> {
+    let _t_parse = crate::prof::begin();
+    let mut rows_map: std::collections::HashMap<usize, DocRow> =
+        std::collections::HashMap::new();
+    let mut ni = 0usize;
+    while ni < need_row.len() {
+        let lo2 = need_row[ni];
+        let mut hi2 = lo2;
+        ni += 1;
+        while ni < need_row.len() && need_row[ni] == hi2 + 1 {
+            hi2 += 1;
+            ni += 1;
+        }
+        for (off, r) in doc.rows_in_block_window(lo2, hi2).into_iter().enumerate() {
+            rows_map.insert(lo2 + off, r);
+        }
+    }
+    crate::prof::end("wy.bf.blockparse", _t_parse);
+    rows_map
 }
 
 /// **Pass 3**：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
