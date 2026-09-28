@@ -1,0 +1,10 @@
+# code-review-graph 忽略文件（gitignore 风格）——这些目录/文件不入图。
+#
+# fixtures/：大文档基准输入（含 6MB+ 的「伪 Rust」文档文本 fixtures/大文档测试.rs，
+#   实为拼接的测试文本、被打开的文档），tree-sitter 会把它们解析成上万伪节点，
+#   曾占满 hub/untested-hotspots/bridge 排行、淹没真实信号。改/删此处文件不入图。
+# .kilo/：Agent Manager worktree 副本（.gitignore 已忽略，但 CRG 仍会扫描目录树）。
+# target/：构建产物。
+fixtures/
+.kilo/
+target/

@@ -140,10 +140,8 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 
 | fixture | 说明 |
 | --- | --- |
-| `fixtures/pdf测试.pdf` | 87 页文本型 PDF（长文档 / 遍历 / 搜索用例） |
-| `fixtures/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf` | 更长 PDF（长文遍历用例，`pdf测试.pdf` 的副本） |
+| `fixtures/pdf测试.pdf` | 87 页文本型 PDF（长文档 / 遍历 / 搜索用例；长文遍历用例共用此份） |
 | `fixtures/xy.epub` | 《共产党宣言》6 图 EPUB |
-| `fixtures/epub测试.epub` | EPUB 副本文档 |
 | `fixtures/img测试.png` | 实为 580x773 JPEG（magic 探测） |
 | `fixtures/大文档测试.rs` / `fixtures/大文档测试2.md` | 6.4MB 大文档（编辑器 / 预览交互与 `BIGDOC_BENCH=1` 延迟基准） |
 

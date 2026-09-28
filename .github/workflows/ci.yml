@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 已知风险：gpui 视觉测试依赖本机字体/像素环境，headless runner 上个别
+      # 字体/像素断言可能失败——此类用例可按项目备注补 #[ignore]（future-work T0）。
+      - name: cargo test
+        run: cargo test --all-features
+
+  clippy:
+    name: clippy (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # 当前基线仍 ~26 条存量告警（见评审 P2：clippy 债务清零）。
+      # 待基线清零后收紧为硬门禁：cargo clippy --all-targets --all-features -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features

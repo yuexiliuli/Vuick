@@ -87,9 +87,11 @@ mod tests {
 
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        // 「长文/遍历」用例此前用 fixtures/17.….pdf.pdf——实为 pdf测试.pdf 的逐字节副本
+        // （已去重删除）。保留两元素索引形状，两处都指向同一份 87 页文本型 fixture。
         vec![
             manifest.join("pdf测试.pdf"),
-            manifest.join("17. 道路机动车辆产品准入审查要求1.0.pdf.pdf"),
+            manifest.join("pdf测试.pdf"),
         ]
     }
 

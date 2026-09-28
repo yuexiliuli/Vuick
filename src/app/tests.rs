@@ -3310,8 +3310,9 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        // 长文 fixture 曾是 17.….pdf（pdf测试.pdf 的逐字节副本，已去重）——直接用副本本体。
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf");
+            .join("fixtures/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
