@@ -12,6 +12,7 @@
 //! - [`button`]：按钮（`Button`/`ButtonVariant`/`ButtonVariants`），替换 `gpui_component::button`
 //! - [`menu`]：下拉菜单（`PopupMenu`/`PopupMenuItem`/`Dropdown`/`DropdownMenu`），替换 `gpui_component::menu`
 //! - [`notification`]：通知（`Notification`/`NotificationKind`），替换 `gpui_component::notification`
+//! - [`root`]：窗口根视图（每窗口第一层宿主），替换 `gpui_component::Root`
 //!
 //! # 组件约定（新组件照此执行）
 //! 1. **一文件一组件**，文件放在本目录（或独立子目录），公开面收敛到 `ui::<模块>`，
@@ -35,5 +36,6 @@ pub mod button;
 pub mod icon;
 pub mod menu;
 pub mod notification;
+pub mod root;
 pub mod scrollbar;
 pub mod theme;

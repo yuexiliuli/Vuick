@@ -266,7 +266,7 @@ impl EditorApp {
     }
 
     /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
-    /// `gpui_component::Root` 包裹）。
+    /// `crate::ui::root::Root` 宿主包裹）。
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
         Self::new_impl(window, cx, None, false)
     }
@@ -781,7 +781,7 @@ impl EditorApp {
             },
             |new_window, cx| {
                 let view = cx.new(|cx| EditorApp::new_detached(new_window, cx, payload));
-                cx.new(|cx| gpui_component::Root::new(view, new_window, cx))
+                cx.new(|cx| crate::ui::root::Root::new(view, new_window, cx))
             },
         );
         cx.notify();
@@ -804,11 +804,9 @@ impl EditorApp {
             Some((entity, wh)) => {
                 // 把选项卡交给主窗口（数据收纳 + 不抢焦点），随后在主窗口里聚焦编辑区
                 entity.update(cx, |app, cx| app.adopt_tab(payload, None, cx));
-                if let Some(root_handle) = wh.downcast::<gpui_component::Root>() {
-                    let _ = root_handle.update(cx, |_root, window, cx| {
-                        window.focus(&focus_handle, cx);
-                    });
-                }
+                let _ = wh.update(cx, |_root, window, cx| {
+                    window.focus(&focus_handle, cx);
+                });
             }
             None => {
                 // 主窗口已不存在（例如被关闭）→ 本窗口转正为主窗口，选项卡原地保留

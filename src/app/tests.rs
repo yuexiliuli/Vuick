@@ -9,7 +9,7 @@
         cx.update(gpui_component::init);
     }
 
-    /// 创建一个以 `gpui_component::Root` 为窗口根视图的编辑应用，
+    /// 创建一个以 `crate::ui::root::Root` 为窗口根视图的编辑应用，
     /// 返回视图实体与该窗口的 `VisualTestContext`（后续用其驱动渲染/事件）。
     fn add_app(cx: &mut TestAppContext) -> (Entity<EditorApp>, &mut VisualTestContext) {
         let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<EditorApp>>>> =
@@ -17,7 +17,7 @@
         let (root, cx) = cx.add_window_view(|window, cx| {
             let app = cx.new(|cx| EditorApp::new(window, cx));
             *holder.borrow_mut() = Some(app.clone());
-            gpui_component::Root::new(app, window, cx)
+            crate::ui::root::Root::new(app, window, cx)
         });
         let _ = root;
         let app = holder.borrow().clone().unwrap();
@@ -275,7 +275,7 @@
             let editor = cx.new(|cx| crate::editor::CodeEditor::new(cx));
             *holder.borrow_mut() = Some(editor.clone());
             let view = cx.new(|_cx| BareEditor { editor });
-            gpui_component::Root::new(view, window, cx)
+            crate::ui::root::Root::new(view, window, cx)
         });
         let _ = root;
         let editor = holder.borrow().clone().unwrap();
@@ -451,7 +451,7 @@
         // 另起一个窗口：打开非 .md 文件，选项卡栏最右侧不应出现眼睛（该窗口从未渲染过眼睛）
         let (view, cx) = cx.add_window_view(|window, cx| {
             let app = cx.new(|cx| EditorApp::new(window, cx));
-            gpui_component::Root::new(app, window, cx)
+            crate::ui::root::Root::new(app, window, cx)
         });
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
@@ -4293,8 +4293,7 @@
         let det_origin = windows
             .iter()
             .find(|(detached, _)| *detached)
-            .and_then(|(_, wh)| wh.downcast::<gpui_component::Root>())
-            .and_then(|h| cx.update(|_w, cx| h.update(cx, |_, w, _| w.bounds()).ok()))
+            .and_then(|(_, wh)| cx.update(|_w, cx| wh.update(cx, |_, w, _| w.bounds()).ok()))
             .map(|b| b.origin)
             .expect("应有独立窗口");
         let expected = src_origin + outside;
@@ -4332,7 +4331,7 @@
             .expect("应有可拔出的选项卡");
         let (_det_root, cx) = cx.add_window_view(|window, cx| {
             let app = cx.new(|cx| EditorApp::new_detached(window, cx, payload));
-            gpui_component::Root::new(app, window, cx)
+            crate::ui::root::Root::new(app, window, cx)
         });
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..5 {

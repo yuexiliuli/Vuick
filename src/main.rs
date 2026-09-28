@@ -1,11 +1,11 @@
 ﻿//! 程序入口：初始化 GPUI + GPUI-Component、注册应用级快捷键、
-//! 创建主窗口并把窗口根视图包上 [`gpui_component::Root`]。
+//! 创建主窗口并把窗口根视图包上自研 `ui::root` 视图。
 //!
 //! 模块结构：
 //! - [`app`]：主视图 `EditorApp`（自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）
-//! - `gpui_component::text::TextView`：Markdown 解析、排版与选择
+//! - `gpui_component::text::TextView`：Markdown 预览（text 管线，未迁移部分）
 //! - [`scrollbar`]：自绘横向滚动条（选项卡栏用）
-//! - [`actions`]：应用级动作类型
+//! - [`actions`]：应用级动作类型与编辑区输入动作/键位
 //!
 //! 文本（代码）编辑区使用 **gpui-component 的 `Input`（CodeEditor 模式）**：
 //! 底层的 `EditorState` 用 ropey 存储文本、内置语法高亮（tree-sitter）、行号、
@@ -28,7 +28,6 @@ mod toc;
 mod ui;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-use gpui_component::Root;
 use gpui_component_assets::Assets;
 
 use crate::actions::*;
@@ -61,6 +60,8 @@ fn main() {
             // 自绑编辑区输入快捷键（本地 action 替换组件库 Input keymap；顺序要求见
             // bind_input_keys 文档：在 gpui_component::init 之后、PasteNormalized 之前）。
             crate::actions::bind_input_keys(cx);
+            // 窗口根视图的 Tab / Shift+Tab 焦点循环（遮蔽组件库 root keymap）。
+            crate::ui::root::bind_keys(cx);
             // 「预览编辑测试」（本项目 Doc 管线 WYSIWYG）快捷键（作用域 wy-editor）。
             crate::markdown::wysiwyg::bind_keys(cx);
             // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
@@ -93,8 +94,8 @@ fn main() {
                         window.set_window_title("GPUI 编辑器");
                         let view = cx.new(|cx| app::EditorApp::new(window, cx));
                         created = Some(view.clone());
-                        // 窗口第一层必须是 gpui_component::Root
-                        cx.new(|cx| Root::new(view, window, cx))
+                        // 窗口第一层是自研根视图（ui::root，替代 gpui_component::Root）
+                        cx.new(|cx| crate::ui::root::Root::new(view, window, cx))
                     },
                 )
                 .unwrap();
