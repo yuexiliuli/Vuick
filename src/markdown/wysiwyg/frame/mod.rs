@@ -644,44 +644,7 @@ pub(crate) fn build_frame(
     let rgen = editor.content_gen();
 
     if n == 0 {
-        return Frame {
-            padding,
-            line_h,
-            rows: vec![ShapedRow {
-                src_line: 0,
-                src_lines: 0..1,
-                wrapped: std::rc::Rc::new(Vec::new()),
-            has_non_ascii: false,
-                sub_heights: vec![line_h],
-                byte_map: std::rc::Rc::new(Vec::new()),
-                editable: false,
-                multi_offsets: Vec::new(),
-                code_ranges: Vec::new(),
-                lh: line_h,
-                x_off: px(0.),
-                height: line_h,
-                top: px(0.),
-                kind: IrKind::Blank,
-                table: None,
-                table_edit: None,
-                image: None,
-                mm: None,
-                extra: RowExtra::default(),
-            }],
-            base: std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
-                vec![f32::from(line_h)],
-                vec![0],
-                doc.line_starts().len(),
-            ))),
-            deltas: std::rc::Rc::from(vec![]),
-            total: line_h,
-            band,
-            width,
-            rgen,
-            igen: editor.images_gen(),
-            mgen: editor.math_gen(),
-            zgen: editor.mermaid_zoom_gen(),
-        };
+        return empty_frame(editor, doc, line_h, padding, rgen, band, width);
     }
 
     let (band_lo, band_hi) = band;
@@ -813,6 +776,57 @@ pub(crate) fn build_frame(
         rgen,
         igen,
         mgen,
+        zgen: editor.mermaid_zoom_gen(),
+    }
+}
+
+/// 空文档（0 块）占位帧：单个空行 ShapedRow + 单元素 BlockLayout，量程 = 单行高。
+#[allow(clippy::too_many_arguments)] // 构建空帧所需的既有上下文参数
+fn empty_frame(
+    editor: &WyEditor,
+    doc: &Doc,
+    line_h: Pixels,
+    padding: Pixels,
+    rgen: u64,
+    band: (f32, f32),
+    width: Pixels,
+) -> Frame {
+    Frame {
+        padding,
+        line_h,
+        rows: vec![ShapedRow {
+            src_line: 0,
+            src_lines: 0..1,
+            wrapped: std::rc::Rc::new(Vec::new()),
+            has_non_ascii: false,
+            sub_heights: vec![line_h],
+            byte_map: std::rc::Rc::new(Vec::new()),
+            editable: false,
+            multi_offsets: Vec::new(),
+            code_ranges: Vec::new(),
+            lh: line_h,
+            x_off: px(0.),
+            height: line_h,
+            top: px(0.),
+            kind: IrKind::Blank,
+            table: None,
+            table_edit: None,
+            image: None,
+            mm: None,
+            extra: RowExtra::default(),
+        }],
+        base: std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
+            vec![f32::from(line_h)],
+            vec![0],
+            doc.line_starts().len(),
+        ))),
+        deltas: std::rc::Rc::from(vec![]),
+        total: line_h,
+        band,
+        width,
+        rgen,
+        igen: editor.images_gen(),
+        mgen: editor.math_gen(),
         zgen: editor.mermaid_zoom_gen(),
     }
 }
