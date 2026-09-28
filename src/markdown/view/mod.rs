@@ -39,11 +39,11 @@ use std::cell::Cell;
 use std::cell::RefCell;
 
 use gpui::{
-    anchored, deferred, div, list, point, px, rgba, App, Bounds, ClipboardItem, Context, FocusHandle,
-    Hsla, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset, ListState,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    Window,
+    anchored, deferred, div, list, point, px, rgba, App, Bounds, ClipboardItem, Context, Div,
+    FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset,
+    ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window,
 };
 use ropey::Rope;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
@@ -1774,6 +1774,175 @@ fn est_wrap_len(bytes: usize, avail: f32, font_size: f32) -> usize {
     ((w / avail).ceil() as usize).max(1)
 }
 
+impl MarkdownPreview {
+    /// 渲染期预铺：刷新统一行高/窗口模型量程，并预物化可见窗口（构造 list 闭包前；
+    /// 闭包内只读窗口数据，避免在元素构造期改 `self`）。
+    fn prepare_render(&mut self, p: &StyleParams, pane_w: f32, cx: &mut Context<Self>) {
+        let _t_hint = crate::prof::begin();
+        if self.index.is_some() {
+            // 窗口模式：重建（如失效）抽样块高模型 + 把固定窗口对齐到用户目标
+            // （滚动条拖动只写 desired；滚轮/跳转的 scroll_to_px 已同步，此处幂等兜底）。
+            if self.est_hint_width < 0.0 || (self.est_hint_width - pane_w).abs() >= 2.0 {
+                self.rebuild_height_model(p, pane_w);
+            }
+            // 字号缩放后：模型已按新字号重建，把缩放前的视口锚点换算出新的滚动目标，
+            // 再落窗口（在 apply_desired 之前），保证 Ctrl+滚轮放大/缩小不带动页面滚动。
+            self.restore_zoom_anchor();
+            self.apply_desired(self.desired_scroll.get());
+        } else {
+            // 小文档：原来的统一高度提示量程路径不变。
+            if self.update_height_hint(cx, pane_w) {
+                cx.notify();
+            }
+            // 字号缩放后：平均行高已按新字号刷新 → 把视口锚点恢复为新的滚动位置。
+            self.restore_zoom_anchor();
+        }
+        crate::prof::end("md_hint", _t_hint);
+
+        if self.index.is_some() {
+            let (lo_vis, _off) = self.abs_scroll_top();
+            let view_h = self.list_state.viewport_bounds().size.height.as_f32();
+            let hint = self.est_hint.max(20.0);
+            let vis_base = ((view_h / hint).ceil() as usize).max(1);
+            // 自适应过扫：余量随可见块数增长（高视口/快速滚动早日命中「窗口已覆盖」）。
+            self.overdraw_margin = adaptive_overdraw(vis_base);
+            let vis_n = vis_base.saturating_add(self.overdraw_margin);
+            let last = self.item_count().saturating_sub(1);
+            let need_lo = lo_vis.saturating_sub(self.overdraw_margin);
+            let need_hi = lo_vis.saturating_add(vis_n).min(last);
+            let _t_ensure = crate::prof::begin();
+            self.ensure_window(need_lo, need_hi);
+            // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
+            // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。
+            self.bump_content_width_to_cover(p);
+            crate::prof::end("md_ensure_call", _t_ensure);
+        }
+    }
+
+    /// 调试：把渲染期关键量追加到 `%TEMP%/kilo/mdhdebug.txt`（仅 debug_assertions）。
+    fn debug_dump_render_state(&self) {
+        if cfg!(debug_assertions) {
+            let h = &self.h_handle;
+            let file = std::env::temp_dir().join("kilo").join("mdhdebug.txt");
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "render: wrap={} content_w={:.0} max_off=({:.0},{:.0}) bounds={:?}",
+                    self.wrap,
+                    self.content_w,
+                    h.max_offset().x.as_f32(),
+                    h.max_offset().y.as_f32(),
+                    h.bounds(),
+                );
+            }
+        }
+    }
+
+    /// 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
+    /// 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色返回。
+    fn compute_search_highlight(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(usize, std::ops::Range<usize>, Hsla)> {
+        let mut hit: Option<(usize, std::ops::Range<usize>)> = None;
+        if let Some((line, query)) = self
+            .highlight_search
+            .as_ref()
+            .map(|(l, q)| (*l, q.clone()))
+            && let Some(row_ix) = self.row_for_line(line)
+        {
+            let text = match &self.index {
+                None => self.rows.get(row_ix).map(|r| r.text.clone()),
+                Some(_) => {
+                    // 窗口模式：先把命中块纳入窗口，再取文本
+                    self.ensure_window(row_ix, row_ix);
+                    if row_ix >= self.win_lo && row_ix - self.win_lo < self.win_rows.len() {
+                        Some(self.win_rows[row_ix - self.win_lo].text.clone())
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(t) = text
+                && let Some(range) = find_text_range(&t, &query)
+            {
+                hit = Some((row_ix, range));
+            }
+        }
+        let color = if hit.is_some() {
+            Some(if crate::ui::theme::Theme::global(cx).is_dark() {
+                rgba(0xf59e0b47).into()
+            } else {
+                rgba(0xfef08a8c).into()
+            })
+        } else {
+            None
+        };
+        hit.map(|(row_ix, range)| (row_ix, range, color.expect("命中则有背景色")))
+    }
+
+    /// 悬浮详情卡片：鼠标停在 `[n]` 标记（文内引用 / 末尾定义皆可）上时，浮出该引用
+    /// 的详情正文。正文优先用 EPUB 注记表（`set_epub` 注入）；非 EPUB 的 markdown 用
+    /// `cit.details`（定义 `[!n]` 行剥掉 `[n]` 标记后的文本）。
+    fn with_hover_note_card(&self, core: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+        let hit = self.hover_hit;
+        match hit {
+            Some(hit) => {
+                let text = self
+                    .note_ctx
+                    .notes
+                    .get(&hit.n)
+                    .cloned()
+                    .or_else(|| self.cit.details.get(&hit.n).cloned());
+                match text {
+                    Some(text) => {
+                        let at = self.note_card_point(&hit);
+                        let card = note_card(text, at, cx);
+                        core.child(
+                            deferred(
+                                anchored()
+                                    .snap_to_window_with_margin(px(8.))
+                                    .position(at)
+                                    .child(card),
+                            )
+                            .with_priority(1),
+                        )
+                    }
+                    None => core,
+                }
+            }
+            None => core,
+        }
+    }
+
+    /// 纵向滚动条：确定性量程句柄 + 拖拽前重铺（拖到底必到全文末尾）。
+    fn vertical_scrollbar(&self, list_state: &ListState) -> Stateful<Div> {
+        let n = self.item_count();
+        let eh = self.est_hint.max(0.0);
+        let windowed = self.index.is_some();
+        let v = PreviewVerticalScrollHandle {
+            list: list_state.clone(),
+            content_width: self.content_w,
+            content_height: if windowed { self.total_h() } else { n as f32 * eh },
+            est_hint: eh,
+            n,
+            windowed,
+            desired: self.desired_scroll.clone(),
+        };
+        div()
+            .id("md-vscrollbar-overlay")
+            .debug_selector(|| "md-vscrollbar-overlay".into())
+            .absolute()
+            .inset_0()
+            .child(
+                Scrollbar::vertical(&v)
+                    .mode(ScrollbarMode::Always)
+                    .viewport_from_layout(),
+            )
+    }
+}
+
 impl Render for MarkdownPreview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _t_render = crate::prof::begin();
@@ -1792,46 +1961,9 @@ impl Render for MarkdownPreview {
                 window.bounds().size.width.as_f32() * 0.5
             }
         };
-        let _t_hint = crate::prof::begin();
-        if self.index.is_some() {
-            // 窗口模式：重建（如失效）抽样块高模型 + 把固定窗口对齐到用户目标
-            // （滚动条拖动只写 desired；滚轮/跳转的 scroll_to_px 已同步，此处幂等兜底）。
-            if self.est_hint_width < 0.0 || (self.est_hint_width - pane_w).abs() >= 2.0 {
-                self.rebuild_height_model(&p, pane_w);
-            }
-            // 字号缩放后：模型已按新字号重建，把缩放前的视口锚点换算出新的滚动目标，
-            // 再落窗口（在 apply_desired 之前），保证 Ctrl+滚轮放大/缩小不带动页面滚动。
-            self.restore_zoom_anchor();
-            self.apply_desired(self.desired_scroll.get());
-        } else {
-            // 小文档：原来的统一高度提示量程路径不变。
-            if self.update_height_hint(cx, pane_w) {
-                cx.notify();
-            }
-            // 字号缩放后：平均行高已按新字号刷新 → 把视口锚点恢复为新的滚动位置。
-            self.restore_zoom_anchor();
-        }
-        crate::prof::end("md_hint", _t_hint);
-        // 窗口模式：按当前可见范围预物化行的窗口。必须在构造 list 闭包前完成，
-        // 闭包内只读窗口数据（Rc），以避免在元素构造期改 `self`。
-        if self.index.is_some() {
-            let (lo_vis, _off) = self.abs_scroll_top();
-            let view_h = self.list_state.viewport_bounds().size.height.as_f32();
-            let hint = self.est_hint.max(20.0);
-            let vis_base = ((view_h / hint).ceil() as usize).max(1);
-            // 自适应过扫：余量随可见块数增长（高视口/快速滚动早日命中「窗口已覆盖」）。
-            self.overdraw_margin = adaptive_overdraw(vis_base);
-            let vis_n = vis_base.saturating_add(self.overdraw_margin);
-            let last = self.item_count().saturating_sub(1);
-            let need_lo = lo_vis.saturating_sub(self.overdraw_margin);
-            let need_hi = lo_vis.saturating_add(vis_n).min(last);
-            let _t_ensure = crate::prof::begin();
-            self.ensure_window(need_lo, need_hi);
-            // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
-            // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。
-            self.bump_content_width_to_cover(&p);
-            crate::prof::end("md_ensure_call", _t_ensure);
-        }
+        // 窗口模式：刷新统一行高/窗口模型量程 + 预物化可见窗口（构造 list 闭包前，
+        // 闭包内只读窗口数据，避免在元素构造期改 `self`）。
+        self.prepare_render(&p, pane_w, cx);
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
         let wrap = self.wrap;
@@ -1839,66 +1971,11 @@ impl Render for MarkdownPreview {
         let code_hl = self.code_hl.clone();
         let table_scroll = self.table_scroll.clone();
 
-        if cfg!(debug_assertions) {
-            let h = &self.h_handle;
-            let file = std::env::temp_dir()
-                .join("kilo")
-                .join("mdhdebug.txt");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&file)
-            {
-                use std::io::Write;
-                let _ = writeln!(
-                    f,
-                    "render: wrap={wrap} content_w={content_w:.0} max_off=({:.0},{:.0}) bounds={:?}",
-                    h.max_offset().x.as_f32(),
-                    h.max_offset().y.as_f32(),
-                    h.bounds(),
-                );
-            }
-        }
+        self.debug_dump_render_state();
 
         // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
         // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
-        let search_highlight = {
-            let mut hit: Option<(usize, std::ops::Range<usize>)> = None;
-            if let Some((line, query)) = self
-                .highlight_search
-                .as_ref()
-                .map(|(l, q)| (*l, q.clone()))
-                && let Some(row_ix) = self.row_for_line(line) {
-                    let text = match &self.index {
-                        None => self.rows.get(row_ix).map(|r| r.text.clone()),
-                        Some(_) => {
-                            // 窗口模式：先把命中块纳入窗口，再取文本
-                            self.ensure_window(row_ix, row_ix);
-                            if row_ix >= self.win_lo
-                                && row_ix - self.win_lo < self.win_rows.len()
-                            {
-                                Some(self.win_rows[row_ix - self.win_lo].text.clone())
-                            } else {
-                                None
-                            }
-                        }
-                    };
-                    if let Some(t) = text
-                        && let Some(range) = find_text_range(&t, &query) {
-                            hit = Some((row_ix, range));
-                        }
-                }
-            let color = if hit.is_some() {
-                Some(if crate::ui::theme::Theme::global(cx).is_dark() {
-                    rgba(0xf59e0b47).into()
-                } else {
-                    rgba(0xfef08a8c).into()
-                })
-            } else {
-                None
-            };
-            hit.map(|(row_ix, range)| (row_ix, range, color.expect("命中则有背景色")))
-        };
+        let search_highlight = self.compute_search_highlight(cx);
 
         // 行数据源：全量路径用整篇 `rows`；窗口路径用已物化的 `win_rows`（Rc，O(1) 克隆）。
         let rows = self.rows.clone();
@@ -2022,69 +2099,11 @@ impl Render for MarkdownPreview {
                     ),
             )
             // 纵向滚动条：确定性量程句柄 + 拖拽前重铺（拖到底必到全文末尾）。
-            .child(
-                div()
-                    .id("md-vscrollbar-overlay")
-                    .debug_selector(|| "md-vscrollbar-overlay".into())
-                    .absolute()
-                    .inset_0()
-                    .child({
-                        let n = self.item_count();
-                        let eh = self.est_hint.max(0.0);
-                        let windowed = self.index.is_some();
-                        let v = PreviewVerticalScrollHandle {
-                            list: list_state.clone(),
-                            content_width: self.content_w,
-                            content_height: if windowed {
-                                self.total_h()
-                            } else {
-                                n as f32 * eh
-                            },
-                            est_hint: eh,
-                            n,
-                            windowed,
-                            desired: self.desired_scroll.clone(),
-                        };
-                        Scrollbar::vertical(&v)
-                            .mode(ScrollbarMode::Always)
-                            .viewport_from_layout()
-                    }),
-            );
+            .child(self.vertical_scrollbar(&list_state));
 
-        // 悬浮详情卡片：鼠标停在一个 `[n]` 标记（文内引用 / 末尾定义皆可）上时，
-        // 浮出该引用的详情正文。正文优先用 EPUB 注记表（`set_epub` 注入）；非 EPUB
-        // 的 markdown 用 `cit.details`（定义 `[!n]` 行剥掉 `[n]` 标记后的文本）。
-        let core = {
-            let hit = self.hover_hit;
-            match hit {
-                Some(hit) => {
-                    let text = self
-                        .note_ctx
-                        .notes
-                        .get(&hit.n)
-                        .cloned()
-                        .or_else(|| self.cit.details.get(&hit.n).cloned());
-                    match text {
-                        Some(text) => {
-                            let at = self.note_card_point(&hit);
-                            let card = note_card(text, at, cx);
-                            core.child(
-                                deferred(
-                                    anchored()
-                                        .snap_to_window_with_margin(px(8.))
-                                        .position(at)
-                                        .child(card),
-                                )
-                                .with_priority(1),
-                            )
-                        }
-                        None => core,
-                    }
-                }
-                None => core,
-            }
-        }
-        .into_any_element();
+        // 悬浮详情卡片：鼠标停在 `[n]` 标记（文内引用 / 末尾定义皆可）上时，浮出该引用
+        // 的详情正文（EPUB 注记表 / markdown 的 `cit.details` 二选一）。
+        let core = self.with_hover_note_card(core, cx).into_any_element();
 
         // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动。
         // **Ctrl+滚轮缩放不再由预览自持**——统一入口在宿主（app::panes 的 zoom_overlay
