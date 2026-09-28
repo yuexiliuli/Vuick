@@ -1,14 +1,9 @@
-//! 自研主题系统：替换 `gpui_component::Theme` 作为本应用 UI 配色/明暗的唯一来源。
+//! 自研主题系统：本应用 UI 配色/明暗的唯一来源（`gpui_component::Theme` 已随依赖移除）。
 //!
 //! # 获取
 //! - [`Theme::global(cx)`] / [`Theme::global_mut(cx)`]：未初始化时回落到内置 Light 主题
 //!   （`try_global` 兜底——测试里不显式初始化也能零成本使用）。
 //! - 启动时调用 [`Theme::init(cx)`] 显式种入默认主题；切换走 [`Theme::set`]。
-//!
-//! # 迁移期双轨
-//! [`Theme::set`] 在写入本主题的同时驱动 `gpui_component::Theme::change`，让仍残留的
-//! gpui-component 组件（Input/菜单/语法高亮）配色与自绘 UI 保持一致；彻底移除
-//! gpui-component 依赖后删除兼容桥。
 //!
 //! # 语义色板
 //! 颜色统一从这里取语义字段，禁止在组件里新写硬编码 `rgba()`。第 3 波迁移后，
@@ -199,24 +194,13 @@ impl Theme {
         cx.try_global::<Theme>().unwrap_or(&DEFAULT_LIGHT)
     }
 
-    /// 切换主题：写本全局 + 驱动 gpui-component 兼容桥 + 刷新窗口。
-    ///
-    /// 迁移期双轨：残留组件仍读组件主题，这里同步推过去保证配色一致。
+    /// 切换主题：写本全局 + 刷新窗口。
     pub fn set(mode: ThemeMode, cx: &mut App) {
         let theme = match mode {
             ThemeMode::Light => Self::light(),
             ThemeMode::Dark => Self::dark(),
         };
         cx.set_global(theme);
-        // 兼容桥：彻底移除 gpui-component 后删除。
-        gpui_component::Theme::change(
-            match mode {
-                ThemeMode::Dark => gpui_component::ThemeMode::Dark,
-                ThemeMode::Light => gpui_component::ThemeMode::Light,
-            },
-            None,
-            cx,
-        );
         cx.refresh_windows();
     }
 }
@@ -236,17 +220,14 @@ mod tests {
     }
 
     #[gpui::test]
-    fn set_writes_mode_and_drives_component_theme(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+    fn set_writes_mode_and_refreshes(cx: &mut TestAppContext) {
         cx.update(|cx| Theme::set(ThemeMode::Dark, cx));
         cx.update(|cx| {
             assert!(Theme::global(cx).is_dark());
-            assert!(gpui_component::Theme::global(cx).is_dark());
         });
         cx.update(|cx| Theme::set(ThemeMode::Light, cx));
         cx.update(|cx| {
             assert!(!Theme::global(cx).is_dark());
-            assert!(!gpui_component::Theme::global(cx).is_dark());
         });
     }
 

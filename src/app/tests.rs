@@ -6,7 +6,7 @@
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
     fn init_test(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
     }
 
     /// 创建一个以 `crate::ui::root::Root` 为窗口根视图的编辑应用，

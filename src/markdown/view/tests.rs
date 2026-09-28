@@ -19,7 +19,7 @@ impl Render for PreviewHost {
 /// 以 300x400 视口打开空预览，再把源码设为 500 个字符的超宽行。
 /// 顺序：先 `set_source` 再 `resize` —— resize 触发一帧完整重绘，让布局/滚动条就绪。
 fn setup_wide(cx: &mut TestAppContext) -> (Entity<PreviewHost>, &mut VisualTestContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -119,7 +119,7 @@ fn hscrollbar_overlay_covers_preview_when_overflow(cx: &mut TestAppContext) {
 /// 内容不超宽时横向不可滚动（不产出多余横向滚动范围）。
 #[gpui::test]
 fn no_hscroll_when_content_fits(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -150,7 +150,7 @@ fn no_hscroll_when_content_fits(cx: &mut TestAppContext) {
 /// 回归：背景必须画在内层元素上，外层仅用 px_3 留白（bg 会铺满含 padding 的整盒）。
 #[gpui::test]
 fn code_band_and_table_inset_from_left_edge(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -191,7 +191,7 @@ fn code_band_and_table_inset_from_left_edge(cx: &mut TestAppContext) {
 /// set_source → 建缓存 → 渲染时按主题解析颜色的完整链路。
 #[gpui::test]
 fn code_block_syntax_highlight_cache(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -308,7 +308,7 @@ fn code_hl_cache_lru_semantics() {
 /// render 在那里建房：当前窗口每个代码块在 `code_hl` 里按全局键都能查到。
 #[gpui::test]
 fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -377,7 +377,7 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
 /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。
 #[gpui::test]
 fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -409,7 +409,7 @@ fn renders_markdown_table_as_grid(cx: &mut TestAppContext) {
 /// 复现：多个标题各带若干段，逐个用 `bounds_for_item` 检查文本 item 高度。
 #[gpui::test]
 fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -454,7 +454,7 @@ fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
 /// EPUB 阅读 / 宿主全局字号：缩放应更新正文字号覆盖（基数 = 主题默认）。
 #[gpui::test]
 fn font_zoom_updates_override(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -537,7 +537,7 @@ fn heading_metrics_scale_with_body_font(cx: &mut TestAppContext) {
         );
     }
     // 绑定默认值：预览默认正文 = layout::DEFAULT_FONT_SIZE，标题随之缩放。
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let p = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
     assert_eq!(
         p.para_size.as_f32(),
@@ -562,7 +562,7 @@ fn heading_metrics_scale_with_body_font(cx: &mut TestAppContext) {
 /// 视口顶部块锚定不动；普通滚轮（非 Ctrl）照常滚动、字号不变。
 #[gpui::test]
 fn font_zoom_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -653,7 +653,7 @@ fn font_zoom_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
 /// EPUB 目录数据：标题行应进入 toc；scroll_to_row 定位不 panic（目录跳转由侧边栏提供）。
 #[gpui::test]
 fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -697,7 +697,7 @@ fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
 #[gpui::test]
 fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
     use std::path::PathBuf;
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -781,7 +781,7 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
 #[gpui::test]
 fn image_rows_height_follows_width(cx: &mut TestAppContext) {
     use std::path::PathBuf;
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -895,7 +895,7 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
         .unwrap_or_else(|| "epubimg://1.jpeg".to_string());
     let md_src = format!("![图]({first})");
 
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -939,7 +939,7 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
 /// 内部一个横向滚动容器 + 底部单一 Always 滚动条，句柄跨帧稳定（set_offset 能真正滚动）。
 #[gpui::test]
 fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1055,7 +1055,7 @@ fn wide_code_line_makes_harea_overflow(cx: &mut TestAppContext) {
 /// 且强引用计数不随渲染增长。指针变化说明渲染路径在重建/深拷贝地图，即为回归。
 #[gpui::test]
 fn md_preview_block_extras_are_shared_rc_across_renders(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1100,7 +1100,7 @@ fn md_preview_block_extras_are_shared_rc_across_renders(cx: &mut TestAppContext)
 /// 重建 ListState 时，必须恢复到更新前的滚动位置——否则预览每次编辑都跳回开头。
 #[gpui::test]
 fn large_preview_keeps_scroll_across_source_replacement(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1213,7 +1213,7 @@ fn bench_block_extras_clone_vs_rc_share() {
 #[ignore]
 fn bench_windowed_scroll_highlight_cache(cx: &mut TestAppContext) {
     use std::time::Instant;
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1375,7 +1375,7 @@ fn bench_list_uniform_height_cost(cx: &mut TestAppContext) {
 /// 句柄跨帧稳定（set_offset 能把表格真正向左滚动）——对齐代码块方案。
 #[gpui::test]
 fn wide_table_scrolls_in_wrap_mode(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1487,7 +1487,7 @@ fn wide_table_scrolls_in_wrap_mode(cx: &mut TestAppContext) {
 /// 使各代码块视觉宽度统一；且不产生（无溢出的）横向滚动条。
 #[gpui::test]
 fn code_block_bg_spans_pane_width_in_wrap(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1523,7 +1523,7 @@ fn code_block_bg_spans_pane_width_in_wrap(cx: &mut TestAppContext) {
 /// 验证 3 行代码的代码块渲染出 5 个相同高度的背景带，且首末两个空白带与代码行等高。
 #[gpui::test]
 fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1581,7 +1581,7 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
 /// 明暗切换走 `ui::theme::Theme::set`（第 3 波后 `StyleParams` 从 `ui::theme` 取色）。
 #[gpui::test]
 fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     // 浅色主题
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
@@ -1607,7 +1607,7 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
 /// 在 `theme_mirrors_style_params_single_source` 验证抄自同源）。
 #[gpui::test]
 fn inline_code_palette_single_source(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
     assert_eq!(light.code_inline_fg, gpui::rgb(0x222222).into(), "白主题行内代码文字");
@@ -1623,7 +1623,7 @@ fn inline_code_palette_single_source(cx: &mut TestAppContext) {
 /// 代码围栏折叠成单个渲染行覆盖多源码行，命中的源码行应定位到对应渲染行。
 #[gpui::test]
 fn row_for_line_maps_source_lines(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1660,7 +1660,7 @@ fn row_for_line_maps_source_lines(cx: &mut TestAppContext) {
 /// 时钟推进超过 [`HIGHLIGHT_MS`] 后自动消失。
 #[gpui::test]
 fn search_jump_highlight_appears_and_clears(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1714,7 +1714,7 @@ fn search_jump_highlight_appears_and_clears(cx: &mut TestAppContext) {
 /// `update_height_hint` 在无布局（summary=0）时会把统一高度提示填满整列表。
 #[gpui::test]
 fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let mut md = cx.update(|cx| MarkdownPreview::new(cx));
     let mut src = String::new();
     // 多种行型混合 + 一个大代码块：若平均行高漏算代码块，量程会严重偏小
@@ -1756,7 +1756,7 @@ fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
 /// [`HINT_REAPPLY_INTERVAL_MS`] 一次，拖动期间不会每帧卡一下。首次建立不节流。
 #[gpui::test]
 fn hint_reapply_throttle_on_rapid_width_change(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let mut md = cx.update(|cx| MarkdownPreview::new(cx));
     // 换行（wrap）文档：不同视口宽 → 折行数不同 → 平均行高不同 → 每次换宽都要重建提示
     let mut src = String::new();
@@ -1782,7 +1782,7 @@ fn hint_reapply_throttle_on_rapid_width_change(cx: &mut TestAppContext) {
 /// 统一高度提示未被破坏（量程仍在），且窗口外未物化行保持占位。
 #[gpui::test]
 fn source_reapply_same_count_only_remeasures_window(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1839,7 +1839,7 @@ fn source_reapply_same_count_only_remeasures_window(cx: &mut TestAppContext) {
 /// - 目录齐全、row_for_line 基于块索引可查、滚动到深处会移动窗口
 #[gpui::test]
 fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
-    cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let md = cx.new(|cx| MarkdownPreview::new(cx));
         PreviewHost { md }
@@ -1940,7 +1940,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     ///   （ropey 沿编辑路径 `Arc::make_mut`，未编辑子树仍共享）。
     #[gpui::test]
     fn windowed_preview_shares_editor_rope(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2000,7 +2000,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     #[gpui::test]
     fn epub_note_hover_shows_annotation_card(cx: &mut TestAppContext) {
         use crate::markdown::parse::RowAlign;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2073,7 +2073,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     /// 引用标记**双向跳转**：点击文内 `[n]` → 定位末尾定义 `[!n]` 并加亮；再点定义 → 跳回文内引用。
     #[gpui::test]
     fn click_citation_marker_navigates_both_ways(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2157,7 +2157,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     /// （取自定义 `[!n]` 行剥掉 `[n]` 标记后的文本，`cit.details`）。
     #[gpui::test]
     fn hover_citation_marker_shows_detail_text_without_epub(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2219,7 +2219,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     /// 无白色分割。单个引述文本内部折行由带内 `py_1` 提供行距。
     #[gpui::test]
     fn consecutive_quotes_render_as_one_band(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2263,7 +2263,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     /// 复制文本含两段内容并以换行连接。
     #[gpui::test]
     fn mouse_drag_selects_text_and_copies(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2335,7 +2335,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         // 回归：选区字节偏移切进多字节字符（CJK `。`）时，旧代码 `push_bg` 直接
         // 用该区间喂 StyledText → shaping 时 run 边界非字符边界 → direct_write
         // panic（byte index not a char boundary）。修复：`char_align_range` 吸收。
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
@@ -2375,7 +2375,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         // 回归：含行内代码（反引号）的行**可以**鼠标拖选字符。旧实现把 StyledText
         // 移进 RoundedInlineText（st=None），不写文本命中表 → hit_test 找不到该行，
         // 选区建立不了。现统一 TextTrack 始终持有 st，两类行一致可点选。
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, mut cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }

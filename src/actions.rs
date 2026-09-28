@@ -114,3 +114,14 @@ pub fn bind_input_keys(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-right", MoveToNextWord, Some(CONTEXT)),
     ])
 }
+
+/// 安装全部本地快捷键（编辑区 Input + 窗口根 Root + WYSIWYG wy-editor 三种键上下文）。
+///
+/// 替代已移除的 `gpui_component::init` 的按键映射职责，供 `main.rs` 与测试初始化共用。
+/// 调用方须在随后注册比 `Input` 上下文更高优先级的覆盖绑定（如 `ctrl-v` →
+/// `PasteNormalized`），顺序＝优先级。
+pub fn bind_local_keymaps(cx: &mut gpui::App) {
+    bind_input_keys(cx);
+    crate::ui::root::bind_keys(cx);
+    crate::markdown::wysiwyg::bind_keys(cx);
+}

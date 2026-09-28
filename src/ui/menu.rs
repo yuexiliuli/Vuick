@@ -568,7 +568,7 @@ mod tests {
 
     #[gpui::test]
     fn click_trigger_opens_and_item_activates(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (cx, clicks) = harness(cx);
 
         // 关闭态点触发按钮 → 打开菜单。
@@ -589,7 +589,7 @@ mod tests {
 
     #[gpui::test]
     fn keyboard_select_and_enter_activates(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (cx, clicks) = harness(cx);
 
         cx.simulate_click(point(px(TRIGGER.0), px(TRIGGER.1)), Modifiers::default());
@@ -603,7 +603,7 @@ mod tests {
 
     #[gpui::test]
     fn escape_and_click_outside_dismiss(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (cx, clicks) = harness(cx);
 
         // 打开 → Esc 关闭。关闭后点首项位置回到触发按钮（打开），不再触发回调。

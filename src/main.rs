@@ -28,18 +28,15 @@ mod toc;
 mod ui;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-use gpui_component_assets::Assets;
 
 use crate::actions::*;
 
 fn main() {
-    gpui_platform::application()
-        .with_assets(Assets)
-        .run(|cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(980.), px(720.)), cx);
+    gpui_platform::application().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(980.), px(720.)), cx);
 
-            // gpui-component 初始化会重建按键映射，因此先注册应用动作。
-            cx.bind_keys([
+        // 应用级快捷键（全局，None 上下文）。
+        cx.bind_keys([
                 KeyBinding::new("ctrl-n", NewFile, None),
                 KeyBinding::new("ctrl-o", OpenFile, None),
                 KeyBinding::new("ctrl-s", Save, None),
@@ -53,27 +50,19 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
 
-            // 初始化 gpui-component（主题、键盘映射、Input 等），再种入自研主题
-            // （`Theme::set` 双轨：写入 ui::theme 的同时驱动组件主题，Wallpaper 一致）。
-            gpui_component::init(cx);
+            // 种入自研主题（已无 gpui-component 双轨，只写 ui::theme）。
             crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx);
-            // 自绑编辑区输入快捷键（本地 action 替换组件库 Input keymap；顺序要求见
-            // bind_input_keys 文档：在 gpui_component::init 之后、PasteNormalized 之前）。
-            crate::actions::bind_input_keys(cx);
-            // 窗口根视图的 Tab / Shift+Tab 焦点循环（遮蔽组件库 root keymap）。
-            crate::ui::root::bind_keys(cx);
-            // 「预览编辑测试」（本项目 Doc 管线 WYSIWYG）快捷键（作用域 wy-editor）。
-            crate::markdown::wysiwyg::bind_keys(cx);
-            // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
-            crate::syntax::install_github_theme(cx);
+            // 本地快捷键全集：编辑区 Input + 窗口根 Root + WYSIWYG wy-editor。
+            crate::actions::bind_local_keymaps(cx);
             // 后台预热 syntect 全局语法集与明暗色板（A2）：把「首次代码块同步
             // 反序列化几 MB」的一次性成本移出滚动路径 → 首张图片附近不再卡那一下。
             // LazyLock 并发安全，主线程先命中只会短暂阻塞。
             cx.background_executor()
                 .spawn(async move { crate::syntax::prewarm() })
                 .detach();
-            // 覆盖组件库默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，
+            // 覆盖默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，
             // 否则回车符会作为普通字符参与代码编辑器的布局。
+            // （须在 bind_local_keymaps 之后注册：优先级更高，Ctrl+V 只走归一化粘贴。）
             cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);
 
             let mut created: Option<gpui::Entity<app::EditorApp>> = None;

@@ -56,7 +56,7 @@
         // 行内代码（反引号）在 shape 期记录渲染字节区间（已扩展空白）供 paint 自绘圆角
         // pill——与预览 `TextTrack::paint_code_ranges` 同一行为源。用贴题原句验证 `we`。
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "我们`we`可以将它理解成一个**标识接口**\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -94,7 +94,7 @@
 
     #[gpui::test]
     fn wrapped_row_click_on_second_visual_line_lands_in_second_half(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
         let words = "1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678";
         let (host, vcx) = cx.add_window_view(|window, cx| {
@@ -151,7 +151,7 @@
     #[gpui::test]
     fn large_doc_windowed_shaping_shapes_only_band(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 首个超长折行段 + 大量单行段（≈2 万块）：**窄带只 shape 带内块**，
         // 其余用 BlockMeta 估算占位——大文档再也不会整篇每帧 shape。
         let head = "一二三四五六七八九十 ".repeat(300); // 长中文行，必然折行
@@ -203,7 +203,7 @@
     #[gpui::test]
     fn off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 短行 + 必折行的长段：先全带 shape（记录真实高），再窄带（长段被挤到带外）
         // ——带外高度必须复用缓存真值，而不是跳回估算（滚动“字体大小抖动”的根因）。
         let text = format!(
@@ -246,7 +246,7 @@
     #[gpui::test]
     fn heading_off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 标题行**带外**高度必须沿用「整形真值」（heading_line×行 + 8px pad），不能按
         // 正文行高重建——否则标题每次进出可视带 total 就变矮/变高，滚动到文档末端
         // 被反复 clamp → 页面「突然跳上去 + 抖动」。这是用户实测症状的根因。
@@ -291,7 +291,7 @@
     #[gpui::test]
     fn inline_math_grown_row_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 行内公式撑高的行：带内高 = grew 的 sub_heights[0]（> 行高），带外也必须
         // 沿用该真值，不能按「行数×正文行高」重建（否则缩回原高，滚动跳）。
         let text = "a $\u{5c}int_0^1 x^2 dx$ b\nsome more body text that is longer\n";
@@ -338,7 +338,7 @@
     #[gpui::test]
     fn image_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 已加载图片行：带内真实高（按宽高比），带外估算也必须同式——否则加载后
         // 图片行一进带就高/矮跳一次，滚动到文档末端现形。
         let text = "![figure](x.png)\nfirst paragraph line\n";
@@ -388,7 +388,7 @@
     #[gpui::test]
     fn code_table_image_blocks_shape_with_payload(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 ```rust
 let a = 1;
@@ -490,7 +490,7 @@ let c = 3;
 
     #[gpui::test]
     fn theme_mirrors_style_params_single_source(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# t\n"));
             WyHost { ed }
@@ -530,7 +530,7 @@ let c = 3;
 
     #[gpui::test]
     fn image_load_updates_size_and_rebuilds_frame(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "![图](x.png)\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -579,7 +579,7 @@ let c = 3;
 
     #[gpui::test]
     fn ime_composition_replaces_previous_marked_text(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 回归「输入“你好”→ “nnini'hni'hao你好”」：Windows 组合更新不携带区间，
         // 必须替换上一次 marked，而不是一前一后堆叠。
         let (host, vcx) = cx.add_window_view(|window, cx| {
@@ -610,7 +610,7 @@ let c = 3;
 
     #[gpui::test]
     fn ime_new_selected_range_is_relative_to_marked(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
             WyHost { ed }
@@ -635,7 +635,7 @@ let c = 3;
 
     #[gpui::test]
     fn selection_drag_delete_and_select_all(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("一二三五六"));
             WyHost { ed }
@@ -663,7 +663,7 @@ let c = 3;
     #[gpui::test]
     fn quote_blocks_are_editable_with_indent(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# 标题\n> 引用内容\n正文"));
             WyHost { ed }
@@ -696,7 +696,7 @@ let c = 3;
     #[gpui::test]
     fn code_block_click_lands_on_correct_source_line(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 ```rust
 let a = 1;
@@ -747,7 +747,7 @@ let c = 333;
         // 命中更多源列（paint 平移的逆映射）；拖动滚动条更新偏移（视图本地，不写源码）。
         use crate::markdown::ir::IrKind;
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
@@ -841,7 +841,7 @@ let c = 333;
         use gpui::{
             Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
         };
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -968,7 +968,7 @@ let c = 333;
         // 横向滚动后：同一可视 x 应命中**更后列**的单元格（命中反查 +scroll），
         // 光标条 x 应按平移逆映射 −scroll 收敛（否则点击/光标错位）。
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1028,7 +1028,7 @@ let c = 333;
         // `max_scroll = 0` → 惰性不可滚动，陈旧滚动值被 `table_hscroll_clamped` 忽略，
         // 且预留带位于网格之下（不遮内容）。
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1075,7 +1075,7 @@ let c = 333;
         // 短代码行不超宽 → 无横向滚动条（`code_hscroll_geo` None），且陈旧滚动值被
         // `code_hscroll_clamped` 忽略（宽窗口下长行不再偏移）。防「内容超出代码块」回归。
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "```rust\nlet a = 1;\nlet b = 22;\n```\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1111,7 +1111,7 @@ let c = 333;
         // 旧实现点轨道空白处无反应（手感差），此处回归点击轨道即跳转。
         use crate::markdown::ir::IrKind;
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
@@ -1231,7 +1231,7 @@ let c = 333;
         use gpui::{
             Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
         };
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
@@ -1339,7 +1339,7 @@ let c = 333;
     #[gpui::test]
     fn code_block_caret_tracks_clicked_content_line(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 ```py
 one
@@ -1387,7 +1387,7 @@ tail
 
     #[gpui::test]
     fn code_block_edit_typing_backspace_enter(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "```rust\nlet a = 1;\nlet b = 2;\n```\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1444,7 +1444,7 @@ tail
 
     #[gpui::test]
     fn code_block_arrow_nav_skips_fences(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "前段\n```rust\nlet a = 1;\nlet b = 2;\n```\n后段\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1489,7 +1489,7 @@ tail
     #[gpui::test]
     fn code_block_off_band_height_matches_shaped(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 一长段把代码块推到 300px 带之外 → 带外估算高必须与整形式高度一致（防滚动跳变）。
         let head = "the quick brown fox jumps over the lazy dog ".repeat(300);
         let text = format!("{head}\n```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n尾行\n");
@@ -1529,7 +1529,7 @@ tail
     #[gpui::test]
     fn code_block_caret_aligns_with_click_x(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 回归「点击 (x,y) 实际输入在 (x+n,y)/光标盖住字符」：代码行文本内衬 = 12px
         // （`x_off`，面板 pl_3），命中/光标必须都从 `padding + x_off`(24) 起算。
         let text = "```rust\nlet a = 1;\n```\n";
@@ -1592,7 +1592,7 @@ tail
     #[gpui::test]
     fn table_click_lands_in_correct_cell(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1631,7 +1631,7 @@ tail
     #[gpui::test]
     fn table_caret_aligns_with_clicked_cell(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1679,7 +1679,7 @@ tail
 
     #[gpui::test]
     fn table_cell_edit_typing_and_boundary_guards(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "| 1 | 2 |\n| --- | --- |\n| a | b |\n尾\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1731,7 +1731,7 @@ tail
 
     #[gpui::test]
     fn table_arrow_nav_skips_delimiter(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n尾\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -1772,7 +1772,7 @@ tail
     fn new_features_shape_gutters_cards_links(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
         use super::{BlockCard, LinkHit, RowGutter};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 # 标题
 
@@ -1875,7 +1875,7 @@ A-->B
         let out_dir = std::env::temp_dir().join("kilo");
         let _ = std::fs::create_dir_all(&out_dir);
         const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 # 标题
 
@@ -1927,7 +1927,7 @@ graph TD
     fn mermaid_sequence_renders_card(cx: &mut TestAppContext) {
         // sequenceDiagram 围栏 → 序列图卡片：参与者在首见顺序、消息行数、激活条。
         use super::BlockCard;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 # 标题
 
@@ -1974,7 +1974,7 @@ sequenceDiagram
     fn mermaid_flow_lr_orders_columns(cx: &mut TestAppContext) {
         // LR 方向：层沿 +x 增长 → A.x < B.x < C.x（方向参数化生效）。
         use super::{mm_layout, MmLayout};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         const SRC: &str = "flowchart LR\nA-->B\nB-->C";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("```mermaid\ngraph LR\nA-->B\n```"));
@@ -2005,7 +2005,7 @@ sequenceDiagram
         // 回归「连线歪斜」：LR 边钉在节点**右/左边缘中心**，同行边为水平直线，
         // 异行边为水平-垂直-水平直角折线（起终点都在边缘、直线段与行对齐）。
         use super::{mm_layout, MmLayout};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         const SRC: &str = "flowchart LR\nX[引擎] --> Y[阶段1] & Z[阶段2]\nY --> W\nZ --> W";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x"));
@@ -2052,7 +2052,7 @@ sequenceDiagram
     fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
         // 滚轮悬停在 mermaid 卡片上 → 逐卡缩放；Ctrl+滚轮不放行给 mermaid（归宿主全局缩放）。
         use super::BlockCard;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "# 标题\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2205,7 +2205,7 @@ sequenceDiagram
     fn callout_fold_click_path_round_trips(cx: &mut TestAppContext) {
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
         use super::{Frame, RowGutter};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "> [!NOTE]- 甲\n> 乙\n> 丙\n尾";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2265,7 +2265,7 @@ sequenceDiagram
     fn two_callouts_fold_independently_with_caret_on_marker(cx: &mut TestAppContext) {
         // 回归：两个 callout 相邻（中间空行）。各自折叠/展开应互不影响；
         // 尤其「光标落在 marker 行（点击折叠后的常态）」时，该 callout 仍要真正折叠。
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "> [!NOTE]- 点击箭头折叠\n> 主体一\n> 主体二\n\n> [!WARNING]- 警告\n> 警告内容。\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2310,7 +2310,7 @@ sequenceDiagram
         // reveal 弹开（与 callout 的坑 P 同一教训）。
         use super::Frame;
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "## 甲\nbody 一\nbody 二\n## 乙\n尾";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2379,7 +2379,7 @@ sequenceDiagram
     fn heading_fold_stays_folded_with_caret_on_heading_line(cx: &mut TestAppContext) {
         // 回归（坑 P 同款）：点击折叠后光标停在标题行，该 section 不得被 reveal 弹开；
         // 光标严格落在 body 行内才 reveal。
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "# A\nbody\n## B\nmore\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2407,7 +2407,7 @@ sequenceDiagram
     fn toggle_heading_fold_moves_caret_out_when_folding_from_body(cx: &mut TestAppContext) {
         // 折叠时若光标在 section body 内，先把光标移到标题行末（否则 body 被 reveal，
         // 折叠无效）——与 live 的 `move_to(end)` 同款。
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "## Goals\n- 任务一\n- 任务二\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2439,7 +2439,7 @@ sequenceDiagram
         // 回归：折叠标题，其 section 内的 `$$…$$` 数学块卡片（“公式”标签 + 公式图）
         // 必须一并折叠成 0 高，不得因 `extra.card` 继续绘制而重叠堆在标题上方。
         use super::BlockCard;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "# 公式区\n$$\nx^2\n$$\n$$\n\\int dx\n$$\n尾\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2487,7 +2487,7 @@ sequenceDiagram
         use crate::markdown::parse::inline_style;
         use crate::markdown::parse::recognition::AlertKind;
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2522,7 +2522,7 @@ sequenceDiagram
     fn paint_smoke_all_new_features(cx: &mut TestAppContext) {
         // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
         use super::BlockCard;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "\
 - [ ] 待办
 
@@ -2596,7 +2596,7 @@ A-->B
 
     #[gpui::test]
     fn undo_redo_round_trip(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
             WyHost { ed }
@@ -2666,7 +2666,7 @@ A-->B
         // 回检测试（坑 D 单一源）：WyTheme.link ← StyleParams.link ← 明/暗主题蓝，
         // 且与源码编辑器 `editor/markdown.rs` 的 LINK_LIGHT/LINK_DARK 同值。
         use crate::markdown::view::style::StyleParams;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("none"));
             WyHost { ed }
@@ -2695,7 +2695,7 @@ A-->B
         // `!`），且显示区间按整段源跨度算、越出 shaped 行 → `position_for_index` 落空。
         // 现在：src 起点从 `!` 反查，显示区间收在 alt 内。
         use crate::markdown::ir::IrKind;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "前文 ![内联蓝块](shot_blue.png) 后文\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2810,7 +2810,7 @@ A-->B
         // B2 双击编辑：双击 `$…$` spacer → 光标进公式（`$` 后 1 字节）→ shape 期
         // reveal 显示可编辑的原始 LaTeX（不再 splice 成 spacer）；光标移走恢复。
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "前置文字 $x^2+\\alpha$ 后置文字\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2890,7 +2890,7 @@ A-->B
         // 源码字符串）；**双击**把光标放进块首 → 整块 reveal 源码进入编辑。
         use super::BlockCard;
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -2966,7 +2966,7 @@ A-->B
         // 现在放 `$$` 行内容内 1 字节 → 块 reveal 与行内 splice reveal 同时满足。
         use super::BlockCard;
         use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n尾行\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3034,7 +3034,7 @@ A-->B
         // 两块都占为 Loading（真正位图由后台 executor 光栅；CPU 级正确性已由
         // math_typeset 单测覆盖）。
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\n\\int_0^1 x^2 dx\n$$\n内联 $e^{i\\pi}+1=0$ 结束";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3073,7 +3073,7 @@ A-->B
         // 不再按 Unicode 行数（`20 + n×22`）——上限的分式/根号终于有足够高度。
         use crate::markdown::parse::inline_style;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\na \\\\ b\n$$"; // 两行 → Unicode 回退高 = 20+44=64
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3115,7 +3115,7 @@ A-->B
         // 恒 0 → 卡片永远停在 Unicode 回退高（42px），68px 位图越出灰底。
         use crate::markdown::parse::inline_style;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 与 `math_typeset::tests::rasterizes_to_nonempty_bgra` 同款——ratex 确定支持。
         // 块后跟一行正文：光标放到文尾落在块外（否则落在闭合 `$$` 行会 reveal 成源码）。
         let text = "$$\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n$$\n后文";
@@ -3207,7 +3207,7 @@ A-->B
         // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
         // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "a $\\int_0^1 x^2 dx$ b";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3258,7 +3258,7 @@ A-->B
         // `modifiers.platform`（= Win 键）→ 旧实现 Ctrl+C/V/A 全部失效。现在与
         // `live.rs` 一样显式补 `ctrl-a/c/v` 绑定，经真实键位派发验证整条链路。
         use gpui::{App, Keystroke};
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
             WyHost { ed }
@@ -3312,7 +3312,7 @@ A-->B
         // （老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text =
             "$$\n\\int_x dx\n$$\n含有 $e^{i\\pi}$ 的一行\n末尾普通段落 here\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
@@ -3354,7 +3354,7 @@ A-->B
         // 卡片显示更新后的公式（老实现要么整篇重建、要么卡片陈旧显示旧公式）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\n\\int_a dx\n$$\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3394,7 +3394,7 @@ A-->B
         // 由「可见带懒光栅」在下一帧 shape 后经 frame.rows claim，见 sync_math 集成）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\n"));
             WyHost { ed }
@@ -3428,7 +3428,7 @@ A-->B
         // 光栅）按 `inline:y` claim 占槽（不再需要全篇行内清单）。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("text $x$ here\n"));
             WyHost { ed }
@@ -3473,7 +3473,7 @@ A-->B
         // （该块还原源码、不装卡片），离开块又折叠回卡片。
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "$$\n\\int_a dx\n$$\n普通段落 one\n普通段落 two\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3515,7 +3515,7 @@ A-->B
     fn shaped_row_cache_reuses_rows_across_band_rebuilds(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         for i in 0..120 {
             text.push_str(&format!("para line {i} some more words here to wrap\n"));
@@ -3558,7 +3558,7 @@ A-->B
     fn prewarm_band_makes_band_cross_near_cache_hit(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::Prewarm;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 连续短段：512px 量子带 ≈ 20+ 块；预热 3 块/帧 × 10 帧覆盖整带。
         let mut text = String::new();
         for i in 0..4000 {
@@ -3647,7 +3647,7 @@ A-->B
     #[gpui::test]
     fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         for i in 0..4000 {
             text.push_str(&format!("paragraph number {i} with words here\n"));
@@ -3693,7 +3693,7 @@ A-->B
     #[gpui::test]
     fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {        use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         for i in 0..80 {
             text.push_str(&format!("paragraph number {i} here\n"));
@@ -3748,7 +3748,7 @@ A-->B
     fn table_cell_typing_is_non_structural(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::from("| a | b |\n|---|---|\n");
         for i in 0..60 {
             text.push_str(&format!("| cell {i} | val |\n"));
@@ -3796,7 +3796,7 @@ A-->B
     fn font_change_clears_shape_cache(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3821,7 +3821,7 @@ A-->B
     fn caret_move_keeps_shape_cache(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\npara line eee\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3857,7 +3857,7 @@ A-->B
     fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let text = "para one\n$$\n\\int_a b dx\n$$\npara two\n";
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
@@ -3900,7 +3900,7 @@ A-->B
     fn undo_b2_groups_typing_and_breaks_on_caret(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
             WyHost { ed }
@@ -3943,7 +3943,7 @@ A-->B
     fn undo_b2_groups_backspaces(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abcdef"));
             WyHost { ed }
@@ -3974,7 +3974,7 @@ A-->B
     fn bench_frame_str_vs_rope(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
         let mut text = String::new();
         while text.len() < 6_000_000 {
@@ -4033,7 +4033,7 @@ A-->B
     fn bench_structural_enter(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         for i in 0..3_000 {
             text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
@@ -4086,7 +4086,7 @@ A-->B
     fn bench_cached_band_rebuild_vs_materialize(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         for i in 0..3_000 {
             text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
@@ -4167,7 +4167,7 @@ A-->B
     fn bench_dense_doc_edit_and_scroll(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 仿 `大文档测试2.md`：每 6 行一组「数学块 + 行内公式 + callout + 代码 + 表格」，
         // 末尾附一个纯文本段（普通键入的落点）。
         let mut text = String::new();
@@ -4277,7 +4277,7 @@ A-->B
     fn bench_edit_path_split(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let mut text = String::new();
         let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
         while text.len() < 6_000_000 {
@@ -4371,7 +4371,7 @@ A-->B
     fn bench_scale_with_doc_size(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         use gpui::App;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // —— 1) 纯文本大文档：键入成本随字节数线性放大？——
         let mut text = String::new();
         let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
@@ -4461,7 +4461,7 @@ A-->B
     #[gpui::test]
     fn handler_large_doc_cjk_roundtrip_no_full_materialize(cx: &mut TestAppContext) {
         use gpui::EntityInputHandler;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         // 大文档：8000 行混合 ASCII/中文/emoji——行索引目标落在文档中后部（半篇~整篇）。
         // 同时含尾随换行（幻影尾行）与多字节字符，覆盖 UTF-16 换算的边界。
         let mut text = String::new();
@@ -4553,7 +4553,7 @@ A-->B
     #[ignore]
     fn bench_rw_dense(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
 
         fn doc_dense() -> String {
             let mut t = String::new();
@@ -4602,7 +4602,7 @@ A-->B
     #[gpui::test]
     #[ignore]
     fn bench_rw_plain(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         fn doc_plain() -> String {
             let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
             let mut t = String::new();
@@ -4632,7 +4632,7 @@ A-->B
     #[gpui::test]
     #[ignore]
     fn bench_rw_code(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         fn doc_code() -> String {
             let mut t = String::from("```\n");
             let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
@@ -4664,7 +4664,7 @@ A-->B
     #[ignore]
     fn bench_rw_realfile(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let path = "target/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -4789,7 +4789,7 @@ A-->B
         // 每档 400px（≈每 1-2 档触发一次带内重建），统计每档 build_frame 耗时 + Pass2
         // 实际整形（缓存未命中）块数。KILO_PROF=1 时同时 dump 各阶段开销。
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let path = "target/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -4904,7 +4904,7 @@ A-->B
         //   并置 settled（判定确无字形 → 之后命中含 notdef 的缓存不再当 miss 重排）；
         // - clear_notdef 后 settled 清空、恢复原态。
         use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx));
             WyHost { ed }
@@ -4948,7 +4948,7 @@ A-->B
         // 被误判 settled（预算烧光）/ verified（非零占位字形），`clear_stale_verdicts`
         // 应作废这些上一代判决，让本块按新代重新校验/重试——不再整次运行永久豆腐块。
         use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let (host, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx));
             WyHost { ed }
@@ -4984,7 +4984,7 @@ A-->B
         // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
         // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
         use crate::markdown::wysiwyg::WyEditor;
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let path = "target/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,

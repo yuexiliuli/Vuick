@@ -970,7 +970,7 @@ mod tests {
         }
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
 
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/pdf测试.pdf");
@@ -1055,7 +1055,7 @@ mod tests {
         }
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/pdf测试.pdf");
         let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
@@ -1190,7 +1190,7 @@ mod tests {
         use std::rc::Rc;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
@@ -1405,7 +1405,7 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
@@ -1569,7 +1569,7 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
@@ -1781,7 +1781,7 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
@@ -1948,7 +1948,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(gpui_component::init);
+        cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
