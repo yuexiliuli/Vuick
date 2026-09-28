@@ -640,6 +640,93 @@ pub(crate) struct RowRenderCtx<'a> {
     pub row_ix: usize,
 }
 
+/// 行内文本子元素的浓缩调用：Paragraph / Heading / Quote 三种纯文本行类型共享的
+/// `text_child` 参数表几乎完全一致（`&row.text`/`&row.runs`/`&row.notes`/
+/// `&row.note_defs` 都来自 row），仅 `base` TextStyle 随行种不同。
+/// 提取该助手以消除 `render_row` 双分支间的 13 参重复。
+#[inline]
+#[allow(clippy::too_many_arguments)] // 行内文本子元素：输入互为正交
+fn text_child_for_row(
+    row: &Row,
+    p: &Rc<StyleParams>,
+    search: Option<(Range<usize>, Hsla)>,
+    selection: Option<(Range<usize>, Hsla)>,
+    base: &TextStyle,
+    marker_hl: Option<(usize, bool, Hsla)>,
+    row_ix: usize,
+    text_ctx: &Rc<TextCtx>,
+    note_ctx: &Rc<NoteCtx>,
+) -> gpui::AnyElement {
+    text_child(
+        &row.text,
+        &row.runs,
+        p,
+        search,
+        selection,
+        base,
+        &row.notes,
+        &row.note_defs,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    )
+}
+
+/// 列表项（Bullet）行的行内内容：将「前缀 + 文本」拼接为显示串，将 runs / notes /
+/// note_defs / search / selection 的字节区间整体右移 `shift`（前缀占位长度），
+/// 然后交给 `text_child` 渲染。用于消除 `render_row` 中 wrap 与非 wrap 双分支的重复。
+#[allow(clippy::too_many_arguments)] // 行内文本子元素：输入互为正交
+fn bullet_text_child(
+    row: &Row,
+    p: &Rc<StyleParams>,
+    search: Option<(Range<usize>, Hsla)>,
+    selection: Option<(Range<usize>, Hsla)>,
+    marker_hl: Option<(usize, bool, Hsla)>,
+    row_ix: usize,
+    text_ctx: &Rc<TextCtx>,
+    note_ctx: &Rc<NoteCtx>,
+) -> gpui::AnyElement {
+    let mut text = row.text.to_string();
+    if let Some(prefix) = &row.prefix {
+        text = format!("{prefix} {text}");
+    }
+    let display = gpui::SharedString::from(text);
+    let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
+    let runs = shift_runs(&row.runs, shift);
+    let notes: Vec<(Range<usize>, usize)> = row
+        .notes
+        .iter()
+        .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+        .collect();
+    let note_defs: Vec<(Range<usize>, usize)> = row
+        .note_defs
+        .iter()
+        .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
+        .collect();
+    let selection2 = selection
+        .as_ref()
+        .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c));
+    text_child(
+        &display,
+        &runs,
+        p,
+        shift_search(&search, shift),
+        selection2,
+        &TextStyle {
+            font_size: p.para_size.into(),
+            color: p.fg,
+            ..TextStyle::default()
+        },
+        &notes,
+        &note_defs,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    )
+}
+
 pub(crate) fn render_row(
     row: &Row,
     ctx: &RowRenderCtx,
@@ -750,9 +837,8 @@ pub(crate) fn render_row(
         match row.kind {
             RowKind::Paragraph => {
                 // 正文首行缩进 2 字符由 EPUB 转换器在行首前置「　　」实现（本行只负责对齐）。
-                let t = text_child(
-                    &row.text,
-                    &row.runs,
+                let t = text_child_for_row(
+                    row,
                     p,
                     search,
                     selection,
@@ -761,8 +847,6 @@ pub(crate) fn render_row(
                         color: p.fg,
                         ..TextStyle::default()
                     },
-                    &row.notes,
-                    &row.note_defs,
                     marker_hl,
                     row_ix,
                     text_ctx,
@@ -790,9 +874,8 @@ pub(crate) fn render_row(
                 let h_align = row
                     .align
                     .or(if epub { Some(RowAlign::Center) } else { None });
-                let t = text_child(
-                    &row.text,
-                    &row.runs,
+                let t = text_child_for_row(
+                    row,
                     p,
                     search,
                     selection,
@@ -802,8 +885,6 @@ pub(crate) fn render_row(
                         font_weight: FontWeight::BOLD,
                         ..TextStyle::default()
                     },
-                    &row.notes,
-                    &row.note_defs,
                     marker_hl,
                     row_ix,
                     text_ctx,
@@ -834,9 +915,8 @@ pub(crate) fn render_row(
                 // 块内行距由每行灰带的 `py_1`（背景内衬）提供。
                 // 行内对齐（EPUB 引述里的落款 `%%ALIGN:RIGHT%%` 等）作用于引述带内容。
                 let bar_color: Hsla = gpui::rgb(QUOTE_BAR_COLOR).into();
-                let t = text_child(
-                    &row.text,
-                    &row.runs,
+                let t = text_child_for_row(
+                    row,
                     p,
                     search,
                     selection,
@@ -845,8 +925,6 @@ pub(crate) fn render_row(
                         color: p.muted_fg,
                         ..TextStyle::default()
                     },
-                    &row.notes,
-                    &row.note_defs,
                     marker_hl,
                     row_ix,
                     text_ctx,
@@ -880,44 +958,7 @@ pub(crate) fn render_row(
                     .into_any_element();
             }
             RowKind::Bullet => {
-                let mut text = row.text.to_string();
-                if let Some(prefix) = &row.prefix {
-                    text = format!("{prefix} {text}");
-                }
-                let display = gpui::SharedString::from(text);
-                let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
-                let runs = shift_runs(&row.runs, shift);
-                let notes: Vec<(Range<usize>, usize)> = row
-                    .notes
-                    .iter()
-                    .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
-                    .collect();
-                let note_defs: Vec<(Range<usize>, usize)> = row
-                    .note_defs
-                    .iter()
-                    .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
-                    .collect();
-                let selection2 = selection
-                    .as_ref()
-                    .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c));
-                let t = text_child(
-                    &display,
-                    &runs,
-                    p,
-                    shift_search(&search, shift),
-                    selection2,
-                    &TextStyle {
-                        font_size: p.para_size.into(),
-                        color: p.fg,
-                        ..TextStyle::default()
-                    },
-                    &notes,
-                    &note_defs,
-                    marker_hl,
-                    row_ix,
-                    text_ctx,
-                    note_ctx,
-                );
+                let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
                 return div()
                     .w_full()
                     .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
@@ -970,9 +1011,8 @@ pub(crate) fn render_row(
         }
         RowKind::Heading(n) => {
             let (fs, lh) = p.heading_metrics(n);
-            let t = text_child(
-                &row.text,
-                &row.runs,
+            let t = text_child_for_row(
+                row,
                 p,
                 search,
                 selection,
@@ -982,8 +1022,6 @@ pub(crate) fn render_row(
                     font_weight: FontWeight::BOLD,
                     ..TextStyle::default()
                 },
-                &row.notes,
-                &row.note_defs,
                 marker_hl,
                 row_ix,
                 text_ctx,
@@ -1005,9 +1043,8 @@ pub(crate) fn render_row(
         RowKind::Quote => {
             // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
             // 避免背景带和“>”边条顶到左边缘（同代码块做法）。
-            let t = text_child(
-                &row.text,
-                &row.runs,
+            let t = text_child_for_row(
+                row,
                 p,
                 search,
                 selection,
@@ -1016,8 +1053,6 @@ pub(crate) fn render_row(
                     color: p.muted_fg,
                     ..TextStyle::default()
                 },
-                &row.notes,
-                &row.note_defs,
                 marker_hl,
                 row_ix,
                 text_ctx,
@@ -1053,44 +1088,7 @@ pub(crate) fn render_row(
                 )
         }
         RowKind::Bullet => {
-            let mut text = row.text.to_string();
-            if let Some(prefix) = &row.prefix {
-                text = format!("{prefix} {text}");
-            }
-            let display = gpui::SharedString::from(text);
-            let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
-            let runs = shift_runs(&row.runs, shift);
-            let notes: Vec<(Range<usize>, usize)> = row
-                .notes
-                .iter()
-                .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
-                .collect();
-            let note_defs: Vec<(Range<usize>, usize)> = row
-                .note_defs
-                .iter()
-                .map(|(r, n)| ((r.start + shift)..(r.end + shift), *n))
-                .collect();
-            let selection2 = selection
-                .as_ref()
-                .map(|(r, c)| ((r.start + shift)..(r.end + shift), *c));
-            let t = text_child(
-                &display,
-                &runs,
-                p,
-                shift_search(&search, shift),
-                selection2,
-                &TextStyle {
-                    font_size: p.para_size.into(),
-                    color: p.fg,
-                    ..TextStyle::default()
-                },
-                &notes,
-                &note_defs,
-                marker_hl,
-                row_ix,
-                text_ctx,
-                note_ctx,
-            );
+            let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
             div()
                 .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
                 .w_full()
@@ -1115,9 +1113,8 @@ pub(crate) fn render_row(
             .text_size(p.para_size)
             .text_color(p.fg)
             .child(
-                text_child(
-                    &row.text,
-                    &row.runs,
+                text_child_for_row(
+                    row,
                     p,
                     search,
                     selection,
@@ -1126,8 +1123,6 @@ pub(crate) fn render_row(
                         color: p.fg,
                         ..TextStyle::default()
                     },
-                    &row.notes,
-                    &row.note_defs,
                     marker_hl,
                     row_ix,
                     text_ctx,
