@@ -48,7 +48,7 @@ impl Render for CodeEditor {
         // 行级数据窗口（可见 + 过扫）——vis_top 用**绝对视觉行号**（窗口基址 + 相对
         // 滚动；折叠后视觉行 = 逻辑行 − 其前隐藏行数，行窗口以视觉行为上界）。
         let lh = self.line_height.as_f32().max(1.);
-        let (vis_top, _vis_off) = self.abs_scroll_top();
+        let (vis_top, vis_off) = self.abs_scroll_top();
         let view_h = self.list_state.viewport_bounds().size.height.as_f32();
         let nrows = ((view_h / lh).ceil() as usize).max(MIN_VISIBLE_ROWS);
         let lo = vis_top.saturating_sub(nrows);
@@ -73,10 +73,69 @@ impl Render for CodeEditor {
         let bg = self.bg;
         let fg = self.fg;
 
+        // 文本区（List 文本 + 横向滚动容器）、行号列、标尺/括号竖线叠层 → 各自 &self 助手
+        // （`vscrollbar_overlay` 之后仍需 `list_state`，故此处给 text_area_layer 传克隆）。
+        let harea = self.text_area_layer(rv, content_w_px, self.list_state.clone());
+
+        // 行号 gutter：固定编辑区左缘、不随内容横向滚动；同一帧反推绝对行号叠层
+        // （不建独立 O(N) 树，见 `gutter_overlay`）。
+        let gv = std::rc::Rc::new(GutterView {
+            line_height: self.line_height,
+            mono: self.mono.clone(),
+            font_size: self.font_size,
+            fg: self.gutter_fg,
+        });
+        let gutter = self.gutter_overlay(view_h, lh, bg, gv);
+
+        // 垂直标尺（margin guide）：纯视觉覆盖层（见 `ruler_overlay`）。
+        let ruler = self.ruler_overlay(avail_w);
+
+        // 括号标尺（bracket guides）：跨行括号配对竖线叠层（见 `bracket_guide_overlay`）。
+        let guides = self.bracket_guide_overlay(vis_top, vis_off, lh, harea_w, view_h);
+
+        let core = div()
+            .id("code-editor")
+            .debug_selector(|| "code-editor".into())
+            .size_full()
+            .relative()
+            .bg(bg)
+            .text_color(fg)
+            .key_context("Input")
+            .track_focus(&self.focus_handle);
+        let core = attach_input_actions(core, &entity, window);
+        let core = core
+            // 垂直标尺叠层：第一个子元素 → 位于文本/选区/滚动条之下（经典后台参考线）。
+            .child(ruler)
+            // 括号标尺竖线叠层：也在文本之下（与标尺同级序），盖在背景上、不挡文本。
+            .child(guides)
+            .child(harea)
+            // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
+            // 竖向滚动与文本逐行一致。
+            .child(gutter)
+            // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
+            // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
+            // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
+            // 空闲 2s 自动隐藏，用户误以为滚动条“时有时无/不准确”）。
+            .child(self.vscrollbar_overlay(list_state, content_w_px))
+            .child(self.hscrollbar_overlay());
+
+        EditorElement::new(entity, core.into_any_element())
+    }
+}
+
+impl CodeEditor {
+    /// 文本区：List 文本列表（窗口内相对下标 → 绝对行取 `RowView.rows`，超窗空行）+
+    /// 横向滚动容器（只包文本区，`left=gutter_width_px`；行号在下方固定叠层不横移）。
+    fn text_area_layer(
+        &self,
+        rv: std::rc::Rc<RowView>,
+        content_w_px: f32,
+        list_state: ListState,
+    ) -> gpui::Stateful<gpui::Div> {
+        let window_base = self.window_base;
         // 列表 item_ix 是窗口内**相对**下标：绝对行 = `window_base + ix`。行数据窗口
         // (`rv.lo..rv.rows`) 用绝对行，超出窗口/文档末尾（含底部预留区）渲染空行。
-        let window_base = self.window_base;
-        let content = list(list_state.clone(), move |ix, _window, _cx| {
+        let content = list(list_state, move |ix, _window, _cx| {
             let abs = window_base + ix;
             let rd = if abs >= rv.lo && abs - rv.lo < rv.rows.len() {
                 &rv.rows[abs - rv.lo]
@@ -89,7 +148,6 @@ impl Render for CodeEditor {
         // 不加会走 List 的 Infer 测量——高度=内容高（一行 ~22px），视口≈0，
         // 列表永远不渲染任何行（md 预览正是这样挂的，见 markdown/view/mod.rs）。
         .size_full();
-
         let inner = div()
             .id("ce-list-wrap")
             .debug_selector(|| "ce-list-wrap".into())
@@ -99,7 +157,7 @@ impl Render for CodeEditor {
             .child(content);
         // 横向滚动容器只包住「文本区」：`absolute left=gutter_width` 使内容从行号
         // 列右缘开始滚动；行号本身在下方固定叠层（`gutter`）里，不随内容横移。
-        let harea = div()
+        div()
             .id("ce-harea")
             .debug_selector(|| "ce-harea".into())
             .absolute()
@@ -110,20 +168,20 @@ impl Render for CodeEditor {
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .track_scroll(&self.h_handle)
-            .child(inner);
+            .child(inner)
+    }
 
-        // 行号 gutter：固定编辑区左缘、不随内容横向滚动。**不是独立的 O(N) ListState**
-        // ——126MB/3.2M 行时那棵「纯行号树」白占 ~300MB。改为同一帧用文本列表的
-        // **绝对滚动顶**（`window_base + 相对 item_ix`）反推出可见行号、绝对定位叠层
-        // 渲染：与 List 行绘制共用同一滚动状态、同一帧（无新旧半拍差异 → 序号不翻/
-        // 不闪/不晃），末尾的底部预留区（ix ≥ row_count）自然不显示行号。视口外部分
-        // 被 `overflow_hidden` 裁掉。
-        let gv = std::rc::Rc::new(GutterView {
-            line_height: self.line_height,
-            mono: self.mono.clone(),
-            font_size: self.font_size,
-            fg: self.gutter_fg,
-        });
+    /// 行号 gutter：固定左缘、不随内容横移。**不是独立的 O(N) ListState**——126MB/3.2M
+    /// 行时那棵「纯行号树」白占 ~300MB。同一帧用文本列表的**绝对滚动顶**反推可见行号、
+    /// 绝对定位叠层渲染：与 List 行绘制共用同一滚动状态/帧（序号不翻/不闪/不晃），
+    /// 底部预留区自然不显示行号，视口外被 `overflow_hidden` 裁掉。
+    fn gutter_overlay(
+        &self,
+        view_h: f32,
+        lh: f32,
+        bg: Hsla,
+        gv: std::rc::Rc<GutterView>,
+    ) -> gpui::Stateful<gpui::Div> {
         let (g_top_abs, gutter_offset) = self.abs_scroll_top();
         let gutter_rows = self.folds.visual_line_count().max(1);
         // 可见行号 = 绝对顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
@@ -144,7 +202,7 @@ impl Render for CodeEditor {
                 }
                 None => div().h(gv.line_height).into_any_element(),
             }));
-        let gutter_wrap = div()
+        div()
             .id("ce-gutter")
             .debug_selector(|| "ce-gutter".into())
             .absolute()
@@ -154,13 +212,15 @@ impl Render for CodeEditor {
             .w(self.gutter_width_px)
             .bg(bg)
             .overflow_hidden()
-            .child(gutter_col);
+            .child(gutter_col)
+    }
 
-        // 垂直标尺（margin guide）：**纯视觉覆盖层**。坐标 = 行号列右缘 + 列×字宽
-        // − 横向滚动像素（随内容横移、左移出文本区即被 overflow_hidden 裁掉，行为同
-        // VS Code 方案 A）。不参与文本布局、不依赖 ListState——折叠/滚动/分帧都无关。
-        // 放在 `core` 第一个子元素 → 画在编辑器背景之上、文本/选区/滚动条之下。
-        let ruler_wrap = EDITOR_RULER_COLUMNS.iter().fold(
+    /// 垂直标尺（margin guide）：**纯视觉覆盖层**。坐标 = 行号列右缘 + 列×字宽 − 横向
+    /// 滚动像素（随内容横移、左移出文本区即被 overflow_hidden 裁掉，行为同 VS Code
+    /// 方案 A）。不参与文本布局、不依赖 ListState——折叠/滚动/分帧都无关。放在 `core`
+    /// 第一个子元素 → 画在编辑器背景之上、文本/选区/滚动条之下。
+    fn ruler_overlay(&self, avail_w: f32) -> gpui::Stateful<gpui::Div> {
+        EDITOR_RULER_COLUMNS.iter().fold(
             div()
                 .id("ce-rulers")
                 .debug_selector(|| "ce-rulers".into())
@@ -183,19 +243,27 @@ impl Render for CodeEditor {
                 ),
                 None => wrap,
             },
-        );
+        )
+    }
 
-        // 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
-        // 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
-        // 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
-        // 最内层块竖线（`active_guide_open`）用强调蓝加宽（粗细见
-        // [`crate::config::layout::BRACKET_GUIDE_ACTIVE_WIDTH`]）。
+    /// 括号标尺（bracket guides）：每个跨行括号配对一条竖线，从开括号列画到闭行。
+    /// 坐标在**文本区本地**（x 含横向滚动换算、y 含纵向滚动换算），随内容滚动；
+    /// 与标尺一样是纯视觉覆盖层，放在文本之下（`harea` 之前）。点击代码区域点亮的
+    /// 最内层块竖线（`active_guide_open`）用强调蓝加宽。
+    fn bracket_guide_overlay(
+        &self,
+        vis_top: usize,
+        vis_off: f32,
+        lh: f32,
+        harea_w: f32,
+        view_h: f32,
+    ) -> gpui::Stateful<gpui::Div> {
         let guide_segments = self.bracket_guide_segments_flagged(
-            vis_top, _vis_off, lh, harea_w, view_h, self.active_guide_open,
+            vis_top, vis_off, lh, harea_w, view_h, self.active_guide_open,
         );
         let guide_color = self.guide_color;
         let active_guide_color = self.active_guide_color;
-        let guide_layer = div()
+        div()
             .id("ce-bracket-guides")
             .debug_selector(|| "ce-bracket-guides".into())
             .absolute()
@@ -217,39 +285,9 @@ impl Render for CodeEditor {
                     }))
                     .h(px(h.max(0.)))
                     .bg(if active { active_guide_color } else { guide_color })
-            }));
-
-        let core = div()
-            .id("code-editor")
-            .debug_selector(|| "code-editor".into())
-            .size_full()
-            .relative()
-            .bg(bg)
-            .text_color(fg)
-            .key_context("Input")
-            .track_focus(&self.focus_handle);
-        let core = attach_input_actions(core, &entity, window);
-        let core = core
-            // 垂直标尺叠层：第一个子元素 → 位于文本/选区/滚动条之下（经典后台参考线）。
-            .child(ruler_wrap)
-            // 括号标尺竖线叠层：也在文本之下（与标尺同级序），盖在背景上、不挡文本。
-            .child(guide_layer)
-            .child(harea)
-            // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
-            // 竖向滚动与文本逐行一致。
-            .child(gutter_wrap)
-            // 常显滚动条（Always）：编辑器需要可随时拖动的量程正确的滚动条。
-            // 用显式 Scrollbar 叠层（同 md 预览的横向条），而不是
-            // `ScrollableElement::vertical_scrollbar`（默认 Scrolling 模式，
-            // 空闲 2s 自动隐藏，用户误以为滚动条“时有时无/不准确”）。
-            .child(self.vscrollbar_overlay(list_state, content_w_px))
-            .child(self.hscrollbar_overlay());
-
-        EditorElement::new(entity, core.into_any_element())
+            }))
     }
-}
 
-impl CodeEditor {
     /// render 每帧的状态同步：焦点注册/对齐、度量刷新、后台折叠/括号扫描挂起、
     /// 窗口对齐用户滚动目标、量程自愈重挂、横向滚动位置回读、可见字符数与主题明暗。
     /// 返回 `avail_w`（编辑区可视宽：上一帧元素宽，首帧退窗口宽）。
