@@ -311,7 +311,7 @@ pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRun
 }
 
 /// TOML 字符串类型：basic `"..."` / literal `'...'` 与其三引号多行变体。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TomlStr {
     Basic,
     Literal,
@@ -757,5 +757,89 @@ mod tests {
             github_theme_cached(false).style("comment").map(|s| s.font_style),
             "现建与缓存实例的斜体标记一致"
         );
+    }
+
+    // —— 自研 TOML 行扫描器直测（评审 P2 可测性：多字节 / 空行 / 转义 / 跨行边界）——
+
+    #[test]
+    fn toml_section_header_and_comment() {
+        let (runs, out) = scan_toml_line("[server]\n", None);
+        assert!(out.is_none());
+        assert_eq!(runs, vec![(0..8, "function")], "表头整段染 function");
+        // 注释到行尾：未闭合引号不进入字符串状态
+        let (runs, out) = scan_toml_line("# 注释 \"x", None);
+        assert!(out.is_none());
+        assert_eq!(runs, vec![(0..11, "comment")], "注释含引号也只是 comment");
+    }
+
+    #[test]
+    fn toml_key_value_number_and_operator() {
+        let (runs, _) = scan_toml_line("port = 8080x\n", None);
+        let mut names: Vec<&str> = runs.iter().map(|(_, n)| *n).collect();
+        names.sort();
+        assert_eq!(names, vec!["number", "operator", "property"], "键=数值着色");
+    }
+
+    #[test]
+    fn toml_string_escaped_quote_closes_at_real_end() {
+        // `"a\"b"` 的 `\"` 是转义，闭合点应为行内最后一个引号
+        let src = r#"x = "a\"b""#;
+        let (runs, out) = scan_toml_line(src, None);
+        assert!(out.is_none(), "转义串应在本行闭合");
+        assert!(
+            runs.iter().any(|(r, n)| *n == "string" && r.start == 4 && r.end == 10),
+            "string run 覆盖整串（含闭合引号）"
+        );
+        assert!(runs.iter().any(|(_, n)| *n == "string.escape"), "转义拆出 escape");
+    }
+
+    #[test]
+    fn toml_multiline_string_carries_and_closes_state() {
+        // 三引号未闭合 → 跨行状态传给下一行
+        let (runs, out) = scan_toml_line("s = \"\"\"a\n", None);
+        assert_eq!(out, Some(TomlStr::Basic3), "未闭合三引号 → outgoing 状态");
+        assert!(runs.iter().any(|(_, n)| *n == "string"), "未闭合串也着色可见部分");
+        // 下一行续接并闭合（含跨行边界）
+        let (runs2, out2) = scan_toml_line("b\n\"\"\"\n", out);
+        assert_eq!(out2, None, "续接行应闭合三引号");
+        assert!(runs2.iter().any(|(_, n)| *n == "string"), "续接段也着色");
+    }
+
+    #[test]
+    fn toml_scanner_multibyte_and_empty_boundaries_do_not_panic() {
+        // 多字节字符在数字/标识符后：停在字符边界、绝无越界 panic
+        assert_eq!(scan_number("3代", 0, 3), (0, 1), "数字后接多字节 → 停在边界");
+        assert_eq!(scan_word("abc中文", 0, 5), (0, 3), "标识符后接多字节 → 停在边界");
+        assert_eq!(scan_number("0x1F", 0, 4), (0, 4), "十六进制全吞");
+        assert_eq!(scan_number("1e10z", 0, 5), (0, 4), "非十六进制字母停住");
+        // 空行 / 仅换行 / 行尾无换行
+        assert!(scan_toml_line("", None).0.is_empty());
+        assert!(scan_toml_line("\r\n", None).0.is_empty(), "换行不落入着色");
+        let (runs, _) = scan_toml_line("tail = 1", None); // 无尾换行
+        assert!(runs.iter().any(|(_, n)| *n == "number"));
+    }
+
+    #[test]
+    fn toml_lookahead_distinguishes_key_from_constant() {
+        assert!(lookahead_is_key("foo =", 3, 5), "词后 `=` → 键");
+        assert!(lookahead_is_key("foo.bar = 1", 3, 11), "点分键 → 键");
+        assert!(!lookahead_is_key("foo, bar", 3, 9), "`,` → 非键");
+        assert!(!lookahead_is_key("foo", 3, 3), "到行尾无 `=` → 非键");
+        assert!(lookahead_is_key("a.\"k\" = 1", 2, 11), "引号键段 → 键");
+    }
+
+    #[test]
+    fn toml_find_string_close_handles_escaping() {
+        assert_eq!(find_string_close(r#""a\"b""#, 1, TomlStr::Basic), Some(6), "basic 串要跳过转义引号");
+        assert_eq!(find_string_close("'ab'x", 1, TomlStr::Literal), Some(4), "literal 串不转义");
+        assert_eq!(find_string_close("\"abc", 1, TomlStr::Basic), None, "未闭合 → None");
+    }
+
+    #[test]
+    fn toml_detect_string_kind_kinds() {
+        assert_eq!(detect_string_kind("\"x", 0).0, TomlStr::Basic);
+        assert_eq!(detect_string_kind("\"\"\"x", 0).0, TomlStr::Basic3);
+        assert_eq!(detect_string_kind("'x", 0).0, TomlStr::Literal);
+        assert_eq!(detect_string_kind("'''x", 0).0, TomlStr::Literal3);
     }
 }
