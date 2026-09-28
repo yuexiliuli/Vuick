@@ -232,12 +232,33 @@ fn layout_flow(
     area_y: f32,
     area_w: f32,
 ) -> MmFlowLayout {
+    // 分阶段装配：元素链 → 交叉最小化次序 → 尺寸/坐标 → placed → 边 → 分组盒。
+    let fe = flow_elements(g);
+    let order = barycenter_order(&fe.elements, &fe.virtual_layers, &fe.layer_of, &fe.chain, fe.n_layers);
+    let sizes = flow_sizes(window, theme, &fe.elements, &fe.virtual_layers);
+    let geom = flow_positions(g, &fe.elements, &order, sizes, area_x, area_w);
+    let placed = assemble_placed(g, &fe.elements, area_x, area_y, geom);
+    let edges = route_edges(g, &fe.chain, &placed);
+    let subgraphs = flow_subgraph_boxes(g, &fe.real_index, &placed, area_x, area_y);
+
+    let content_h = placed.iter().map(|p| p.y + p.h).fold(area_y, f32::max) - area_y;
+    MmFlowLayout { placed, edges, subgraphs, content_w: area_w, content_h, zoom: 1. }
+}
+
+/// 元素链装配结果：元素表、实节点索引、虚节点层、链、分层、层数。
+struct FlowElements {
+    elements: Vec<(String, String, MmShape)>,
+    real_index: HashMap<String, usize>,
+    virtual_layers: Vec<Option<usize>>,
+    chain: Vec<(usize, usize, MmEdgeKind, Option<String>)>,
+    layer_of: HashMap<String, usize>,
+    n_layers: usize,
+}
+
+/// 元素装配：实节点 + 长边插桩虚节点，产出链、分层与索引。
+fn flow_elements(g: &MmGraph) -> FlowElements {
     let layer_of = layer_map(g);
     let n_layers = layer_of.values().copied().max().unwrap_or(0) + 1;
-    let avail = (area_w - 2. * MM_EDGE_X).max(1.);
-    let xc = area_x + MM_EDGE_X;
-
-    // 元素 = 实节点 + 长边插桩虚节点。
     let mut elements: Vec<(String, String, MmShape)> = g.nodes.iter().map(|n| (n.id.clone(), n.label.clone(), n.shape)).collect();
     let real_index: HashMap<String, usize> = g.nodes.iter().enumerate().map(|(i, n)| (n.id.clone(), i)).collect();
     let mut virtual_layers: Vec<Option<usize>> = vec![None; elements.len()];
@@ -260,17 +281,59 @@ fn layout_flow(
             chain.push((a, b, e.kind, e.label.clone()));
         }
     }
+    FlowElements { elements, real_index, virtual_layers, chain, layer_of, n_layers }
+}
+
+/// 重算 `(层下标, 行内下标)` 编码位置。
+fn refresh_positions(order: &[Vec<usize>], pos: &mut HashMap<usize, usize>) {
+    pos.clear();
+    for (li, o) in order.iter().enumerate() {
+        for (j, &ei) in o.iter().enumerate() {
+            pos.insert(ei, li * 100_000 + j);
+        }
+    }
+}
+
+/// 单层按邻点 barycenter 稳定重排（无邻点 `usize::MAX` 垫底）。
+fn sort_layer_by_barycenter(
+    layer: &[usize],
+    adj: &[Vec<usize>],
+    pos_in_layer: &HashMap<usize, usize>,
+) -> Vec<usize> {
+    let mut with_bary: Vec<(usize, usize)> = Vec::new();
+    for &ei in layer {
+        let mut sum = 0usize;
+        let mut cnt = 0usize;
+        for &nb in &adj[ei] {
+            if let Some(p) = pos_in_layer.get(&nb) {
+                sum += *p;
+                cnt += 1;
+            }
+        }
+        let bary = if cnt > 0 { sum.checked_div(cnt).unwrap_or(0) } else { usize::MAX };
+        with_bary.push((ei, bary));
+    }
+    let mut sorted: Vec<usize> = layer.to_vec();
+    sorted.sort_by_key(|&ei| with_bary.iter().find(|(e, _)| *e == ei).map(|(_, b)| *b).unwrap_or(usize::MAX));
+    sorted
+}
+
+/// 逐层元素序 + barycenter 交叉最小化（下/上交替 4 轮）。
+fn barycenter_order(
+    elements: &[(String, String, MmShape)],
+    virtual_layers: &[Option<usize>],
+    layer_of: &HashMap<String, usize>,
+    chain: &[(usize, usize, MmEdgeKind, Option<String>)],
+    n_layers: usize,
+) -> Vec<Vec<usize>> {
     let n_elem = elements.len();
     let el_layer = |ei: usize| virtual_layers[ei].unwrap_or_else(|| layer_of.get(&elements[ei].0).copied().unwrap_or(0));
-    let el_sub = |ei: usize| node_sub_depth(g, &elements[ei].0);
-
-    // 逐层元素序（barycenter 交叉最小化）。
     let mut order: Vec<Vec<usize>> = vec![Vec::new(); n_layers];
     for ei in 0..n_elem {
         order[el_layer(ei)].push(ei);
     }
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n_elem];
-    for (a, b, _, _) in &chain {
+    for (a, b, _, _) in chain {
         let (a, b) = (*a, *b);
         if !adj[a].contains(&b) {
             adj[a].push(b);
@@ -279,66 +342,39 @@ fn layout_flow(
             adj[b].push(a);
         }
     }
-    // barycenter（下/上交替 4 轮）。
     let mut pos_in_layer: HashMap<usize, usize> = HashMap::new();
-    let refresh_pos = |order: &[Vec<usize>], pos: &mut HashMap<usize, usize>| {
-        pos.clear();
-        for (li, o) in order.iter().enumerate() {
-            for (j, &ei) in o.iter().enumerate() {
-                pos.insert(ei, li * 100_000 + j);
-            }
-        }
-    };
     for _ in 0..4 {
         // 下向
-        for li in 1..n_layers {
-            let below: Vec<usize> = order[li].to_vec();
-            let mut with_bary: Vec<(usize, usize)> = Vec::new();
-            for &ei in &below {
-                let mut sum = 0usize;
-                let mut cnt = 0usize;
-                for &nb in &adj[ei] {
-                    if let Some(p) = pos_in_layer.get(&nb) {
-                        sum += *p;
-                        cnt += 1;
-                    }
-                }
-                let bary = if cnt > 0 { sum.checked_div(cnt).unwrap_or(0) } else { usize::MAX };
-                with_bary.push((ei, bary));
-            }
-            // 稳定排序（含 `MAX` 垫底）。
-            let mut sorted: Vec<usize> = below.clone();
-            sorted.sort_by_key(|&ei| with_bary.iter().find(|(e, _)| *e == ei).map(|(_, b)| *b).unwrap_or(usize::MAX));
-            order[li] = sorted;
+        for layer in order.iter_mut().skip(1) {
+            let sorted = sort_layer_by_barycenter(layer, &adj, &pos_in_layer);
+            *layer = sorted;
         }
-        refresh_pos(&order, &mut pos_in_layer);
+        refresh_positions(&order, &mut pos_in_layer);
         // 上向
-        for li in (0..n_layers.saturating_sub(1)).rev() {
-            let above: Vec<usize> = order[li].to_vec();
-            let mut with_bary: Vec<(usize, usize)> = Vec::new();
-            for &ei in &above {
-                let mut sum = 0usize;
-                let mut cnt = 0usize;
-                for &nb in &adj[ei] {
-                    if let Some(p) = pos_in_layer.get(&nb) {
-                        sum += *p;
-                        cnt += 1;
-                    }
-                }
-                let bary = if cnt > 0 { sum.checked_div(cnt).unwrap_or(0) } else { usize::MAX };
-                with_bary.push((ei, bary));
-            }
-            let mut sorted: Vec<usize> = above.clone();
-            sorted.sort_by_key(|&ei| with_bary.iter().find(|(e, _)| *e == ei).map(|(_, b)| *b).unwrap_or(usize::MAX));
-            order[li] = sorted;
+        for layer in order.iter_mut().rev().skip(1) {
+            let sorted = sort_layer_by_barycenter(layer, &adj, &pos_in_layer);
+            *layer = sorted;
         }
-        refresh_pos(&order, &mut pos_in_layer);
+        refresh_positions(&order, &mut pos_in_layer);
     }
+    order
+}
 
-    // 节点位置（先在 TB 规范空间：axis=+y 层下标，cross=+x 行内居中）。
-    let max_sub = g.nodes.iter().map(|n| node_sub_depth(g, &n.id)).max().unwrap_or(0);
-    let mut cx: Vec<f32> = vec![0.; n_elem];
-    let mut cy: Vec<f32> = vec![0.; n_elem];
+/// 节点尺寸（TB 规范空间前的宽度度量；虚节点给固定小尺寸）。
+struct FlowSizes {
+    cw: Vec<f32>,
+    ch: Vec<f32>,
+    widths: Vec<f32>,
+    virtual_flag: Vec<bool>,
+}
+
+fn flow_sizes(
+    window: &Window,
+    theme: &WyTheme,
+    elements: &[(String, String, MmShape)],
+    virtual_layers: &[Option<usize>],
+) -> FlowSizes {
+    let n_elem = elements.len();
     let mut cw: Vec<f32> = vec![0.; n_elem];
     let mut ch: Vec<f32> = vec![MM_NODE_H; n_elem];
     let mut widths: Vec<f32> = vec![0.; n_elem];
@@ -354,6 +390,36 @@ fn layout_flow(
             cw[ei] = widths[ei];
         }
     }
+    FlowSizes { cw, ch, widths, virtual_flag }
+}
+
+/// TB 规范空间节点几何（方向变换前）：层轴位、行内居中坐标与变换基准。
+struct FlowGeometry {
+    cx: Vec<f32>,
+    cy: Vec<f32>,
+    cw: Vec<f32>,
+    ch: Vec<f32>,
+    virtual_flag: Vec<bool>,
+    axis_ref: f32,
+}
+
+fn flow_positions(
+    g: &MmGraph,
+    elements: &[(String, String, MmShape)],
+    order: &[Vec<usize>],
+    sizes: FlowSizes,
+    area_x: f32,
+    area_w: f32,
+) -> FlowGeometry {
+    let n_layers = order.len();
+    let n_elem = elements.len();
+    let el_sub = |ei: usize| node_sub_depth(g, &elements[ei].0);
+    let avail = (area_w - 2. * MM_EDGE_X).max(1.);
+    let xc = area_x + MM_EDGE_X;
+    let max_sub = g.nodes.iter().map(|n| node_sub_depth(g, &n.id)).max().unwrap_or(0);
+
+    let mut cx: Vec<f32> = vec![0.; n_elem];
+    let mut cy: Vec<f32> = vec![0.; n_elem];
     // 层下标→轴线位（flow axis，规范空间 +y）：TB/BT 固定秩距；LR/RL 按每列最宽节点
     // 推进——宽节点不再挤进下一列（02/03 实测的左挤症状）。
     let mut axis_pos: Vec<f32> = vec![0.; n_layers];
@@ -365,9 +431,9 @@ fn layout_flow(
         }
         MmDirection::LR | MmDirection::RL => {
             let mut acc = MM_TOP_PAD;
-            for li in 0..n_layers {
-                axis_pos[li] = acc;
-                let maxw = order[li].iter().map(|&ei| widths[ei]).fold(0.0_f32, f32::max);
+            for (li, slot) in axis_pos.iter_mut().enumerate() {
+                *slot = acc;
+                let maxw = order[li].iter().map(|&ei| sizes.widths[ei]).fold(0.0_f32, f32::max);
                 acc += maxw + MM_H_GAP;
             }
         }
@@ -382,35 +448,43 @@ fn layout_flow(
                 cy[ei] = axis_pos[li] + sub as f32 * MM_SUB_TITLE_H;
             }
         } else {
-            let row_total: f32 = row.iter().map(|&ei| cw[ei]).sum::<f32>() + MM_SEP * (row.len().saturating_sub(1)) as f32;
+            let row_total: f32 = row.iter().map(|&ei| sizes.cw[ei]).sum::<f32>() + MM_SEP * (row.len().saturating_sub(1)) as f32;
             let mut x = xc + ((avail - row_total) / 2.).max(0.);
             for &ei in row {
                 let sub = el_sub(ei);
                 cx[ei] = x;
                 cy[ei] = axis_pos[li] + sub as f32 * MM_SUB_TITLE_H;
-                x += cw[ei] + MM_SEP;
+                x += sizes.cw[ei] + MM_SEP;
             }
         }
     }
 
-    // 方向变换（整体坐标系）。
-    let axis_ref_or: f32 = match g.direction {
+    // 方向变换（整体坐标系）基准。
+    let axis_ref: f32 = match g.direction {
         MmDirection::BT => {
             axis_pos[n_layers - 1] + MM_RANK_TB + max_sub as f32 * MM_SUB_TITLE_H + MM_NODE_H + 8.
         }
         MmDirection::RL => {
-            let last_w = order[n_layers - 1].iter().map(|&ei| widths[ei]).fold(0.0_f32, f32::max);
+            let last_w = order[n_layers - 1].iter().map(|&ei| sizes.widths[ei]).fold(0.0_f32, f32::max);
             axis_pos[n_layers - 1] + last_w + MM_H_GAP
         }
         _ => 0.,
     };
 
-    // 最终 placed。
-    let mut placed: Vec<MmPlaced> = Vec::with_capacity(n_elem);
+    FlowGeometry { cx, cy, cw: sizes.cw, ch: sizes.ch, virtual_flag: sizes.virtual_flag, axis_ref }
+}
+
+/// 方向变换并装配 placed（整体坐标系）。
+fn assemble_placed(
+    g: &MmGraph,
+    elements: &[(String, String, MmShape)],
+    area_x: f32,
+    area_y: f32,
+    geom: FlowGeometry,
+) -> Vec<MmPlaced> {
+    let mut placed: Vec<MmPlaced> = Vec::with_capacity(elements.len());
     for (ei, (id, lab, shp)) in elements.iter().enumerate() {
-        let ew = cw[ei];
-        let eh = ch[ei];
-        let (fx, fy) = orient(g.direction, cx[ei], cy[ei], axis_ref_or);
+        let (fx, fy) = orient(g.direction, geom.cx[ei], geom.cy[ei], geom.axis_ref);
         let st = g.styles.get(id).copied().unwrap_or(MmStyle::default());
         placed.push(MmPlaced {
             id: id.clone(),
@@ -418,22 +492,28 @@ fn layout_flow(
             shape: *shp,
             x: area_x + fx,
             y: area_y + fy,
-            w: ew,
-            h: eh,
+            w: geom.cw[ei],
+            h: geom.ch[ei],
             fill: st.fill,
             stroke: st.stroke,
             stroke_width: st.stroke_width,
-            virtual_node: virtual_flag[ei],
+            virtual_node: geom.virtual_flag[ei],
         });
-        let _ = (ew, eh);
     }
+    placed
+}
 
-    // 边折线：**在最终坐标**里按方向装配——起终点钉在**节点边缘中心**（TB/BT 顶/底、
-    // LR/RL 右/左），生成横/纵直角折线。旧的「规范空间纵向路由 + 方向变换」在 LR/RL 下
-    // 起终点钉在节点中心，节点宽度不同就歪斜。
+/// 边折线：**在最终坐标**里按方向装配——起终点钉在**节点边缘中心**（TB/BT 顶/底、
+/// LR/RL 右/左），生成横/纵直角折线。旧的「规范空间纵向路由 + 方向变换」在 LR/RL 下
+/// 起终点钉在节点中心，节点宽度不同就歪斜。
+fn route_edges(
+    g: &MmGraph,
+    chain: &[(usize, usize, MmEdgeKind, Option<String>)],
+    placed: &[MmPlaced],
+) -> Vec<MmPolylineEdge> {
     let vertical_flow = matches!(g.direction, MmDirection::TB | MmDirection::BT);
     let mut edges_out: Vec<MmPolylineEdge> = Vec::with_capacity(chain.len());
-    for (a, b, kind, label) in &chain {
+    for (a, b, kind, label) in chain {
         let pa = &placed[*a];
         let pb = &placed[*b];
         let (pts, label_anchor) = if vertical_flow {
@@ -470,8 +550,17 @@ fn layout_flow(
         };
         edges_out.push(MmPolylineEdge { a: *a, b: *b, kind: *kind, points: pts, label: label_anchor, label_text: label.clone() });
     }
+    edges_out
+}
 
-    // subgraph 盒（最终坐标）。
+/// subgraph 盒（最终坐标，取成员包围盒加内边距）。
+fn flow_subgraph_boxes(
+    g: &MmGraph,
+    real_index: &HashMap<String, usize>,
+    placed: &[MmPlaced],
+    area_x: f32,
+    area_y: f32,
+) -> Vec<MmSubgraphBox> {
     let mut sub_out: Vec<MmSubgraphBox> = Vec::new();
     for sg in &g.subgraphs {
         let members: Vec<usize> = sg.nodes.iter().filter_map(|id| real_index.get(id).copied()).collect();
@@ -500,9 +589,7 @@ fn layout_flow(
         let by = (y0 - pad).max(area_y + MM_TOP_PAD);
         sub_out.push(MmSubgraphBox { title: sg.title.clone(), x: bx, y: by, w: (x1 - x0 + 2. * pad).max(0.), h: (y1 - y0 + 2. * pad).max(0.) });
     }
-
-    let content_h = placed.iter().map(|p| p.y + p.h).fold(area_y, f32::max) - area_y;
-    MmFlowLayout { placed, edges: edges_out, subgraphs: sub_out, content_w: area_w, content_h, zoom: 1. }
+    sub_out
 }
 
 // ---------------------------------------------------------------------------
