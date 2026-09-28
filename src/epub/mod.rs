@@ -647,7 +647,7 @@ mod tests {
     use super::*;
 
     fn test_epub_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub")
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub")
     }
 
     #[test]

@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     fn target_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         vec![
             manifest.join("pdf测试.pdf"),
             manifest.join("17. 道路机动车辆产品准入审查要求1.0.pdf.pdf"),

@@ -533,10 +533,10 @@ mod tests {
             );
             // 真实（若有）+ benchdata
             for name in ["SKILL.md", "大文档测试.md", "bench_20k.md", "bench_160k.md"] {
-                if let Ok(s) = std::fs::read_to_string(format!("target/{name}")) {
+                if let Ok(s) = std::fs::read_to_string(format!("fixtures/{name}")) {
                     v.push(s);
                 }
-                if let Ok(s) = std::fs::read_to_string(format!("target/benchdata/{name}")) {
+                if let Ok(s) = std::fs::read_to_string(format!("fixtures/benchdata/{name}")) {
                     v.push(s);
                 }
             }
@@ -695,12 +695,12 @@ mod tests {
         // 跑 --ignored 且文件存在才打印，避免路径依赖。
         let mut cases: Vec<(String, String)> = Vec::new();
         for name in ["SKILL.md", "SKILL.txt", "大文档测试.md", "大文档测试.txt"] {
-            if let Ok(s) = std::fs::read_to_string(format!("target/{name}")) {
-                cases.push((format!("target/{name}"), s));
+            if let Ok(s) = std::fs::read_to_string(format!("fixtures/{name}")) {
+                cases.push((format!("fixtures/{name}"), s));
             }
         }
-        // 自动扫描 target/benchdata/*.md（生成脚本同目录即可自动纳入对比）
-        if let Ok(dir) = std::fs::read_dir("target/benchdata") {
+        // 自动扫描 fixtures/benchdata/*.md（生成脚本同目录即可自动纳入对比）
+        if let Ok(dir) = std::fs::read_dir("fixtures/benchdata") {
             let mut paths: Vec<_> = dir
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
@@ -1175,7 +1175,7 @@ mod tests {
         );
     }
 
-    /// 基准（--ignored）：复刻 handoff §3.1 的方法——对参考文件 `target/大文档测试.md`
+    /// 基准（--ignored）：复刻 handoff §3.1 的方法——对参考文件 `fixtures/大文档测试.md`
     /// （6.4MB / ≈17 万行）连续做 **1000 次文末插入**，对比 str 路径（`value()`
     /// String 物化 + 增量扫描全串 split）与新 rope 路径（Rope::clone O(1) + 增量
     /// 扫描区域切片），每轮取 dirty，最终与全量扫描逐字节校验。打印、不断言。
@@ -1185,7 +1185,7 @@ mod tests {
         use std::time::Instant;
         let path = std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/target/大文档测试.md"
+            "/fixtures/大文档测试.md"
         ));
         if !path.exists() {
             eprintln!("跳过：缺少参考文件 {path:?}");

@@ -705,13 +705,13 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
     let cx: &mut VisualTestContext = cx;
 
     let manifest = env!("CARGO_MANIFEST_DIR").replace('/', "\\");
-    let abs = format!(r"{manifest}\target\img测试.png");
+    let abs = format!(r"{manifest}\fixtures\img测试.png");
     // 相对名 + 盘符绝对路径 + URL：相对应基于 base_dir 拼接，绝对保持原样，URL 保持原样。
     let md_src = format!("![1](img测试.png)\n\n![1]({abs})\n\n![1](https://example.com/a.png)\n");
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\target"))));
+            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\fixtures"))));
             md.set_source(&md_src, cx);
         });
     });
@@ -748,7 +748,7 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
         srcs[2]
     );
 
-    // 本地文件应读取固有尺寸（target/img测试.png = 72x72 JPEG，按内容 magic 探测）
+    // 本地文件应读取固有尺寸（fixtures/img测试.png = 72x72 JPEG，按内容 magic 探测）
     let dims = cx.update(|_, cx| {
         host.read(cx)
             .md
@@ -780,12 +780,12 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
     let cx: &mut VisualTestContext = cx;
 
     let manifest = env!("CARGO_MANIFEST_DIR").replace('/', "\\");
-    let wabsp = format!(r"{manifest}\target\img测试.png");
+    let wabsp = format!(r"{manifest}\fixtures\img测试.png");
     let md_src = format!("# 标题\n\n![w]({wabsp})\n\n![s]({wabsp})\n");
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, cx| {
-            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\target"))));
+            md.set_base_dir(Some(PathBuf::from(format!(r"{manifest}\fixtures"))));
             md.set_source(&md_src, cx);
         });
     });
@@ -874,7 +874,7 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
 /// set_source 应把字节挂到图片行（img_data）并解析出固有尺寸，渲染出图片盒。
 #[gpui::test]
 fn epub_in_memory_images_render(cx: &mut TestAppContext) {
-    let doc = crate::epub::parse_epub_file(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub"))
+    let doc = crate::epub::parse_epub_file(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub"))
         .expect("解析 xy.epub 应成功");
     let vsrcs: Vec<String> = doc.images.keys().cloned().collect();
     assert!(!vsrcs.is_empty(), "xy.epub 应提取到内存图片");

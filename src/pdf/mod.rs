@@ -86,7 +86,7 @@ mod tests {
     }
 
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         vec![
             manifest.join("pdf测试.pdf"),
             manifest.join("17. 道路机动车辆产品准入审查要求1.0.pdf.pdf"),
@@ -646,12 +646,12 @@ mod tests {
         );
     }
 
-    /// 用 `target/pdf测试.pdf` 实测 P2 文本层管线：行列合并、单行/跨行复制（含换行），
+    /// 用 `fixtures/pdf测试.pdf` 实测 P2 文本层管线：行列合并、单行/跨行复制（含换行），
     /// 并打印最稠密页的首行文本样本便于人工核对抽取质量。
     #[test]
     fn configure_sheet_selection_pipeline() {
         let _guard = pdf_lock().lock().unwrap();
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(p.exists(), "测试文件应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
@@ -974,7 +974,7 @@ mod tests {
         cx.update(crate::actions::bind_local_keymaps);
 
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("fixtures/pdf测试.pdf");
         // 宽区（可完全容纳）与窄区（窄于页宽+边距）各验证一次
         for pane_w in [1200.0f32, 600.0] {
             let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
@@ -1058,7 +1058,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("fixtures/pdf测试.pdf");
         let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
         let (_root, cx) = cx.add_window_view(|_window, cx| {
             let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
@@ -1193,7 +1193,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1408,7 +1408,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1572,7 +1572,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1784,7 +1784,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1951,7 +1951,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {

@@ -56,7 +56,7 @@ GPUI 应用内**全部 UI 组件均为自研**，替代已移除的 `gpui-compon
 | EPUB / 压缩 | `roxmltree` · `zip` |
 | 图像 | `image`（+ webp） |
 | 序列化 | `serde` · `serde_json` |
-| 测试 | GPUI `test-support`（`cargo test`，456 通过 / 0 失败） |
+| 测试 | GPUI `test-support`（`cargo test`，465 通过 / 0 失败） |
 
 ## 目录结构（主要代码作用）
 
@@ -136,17 +136,18 @@ cargo clippy --all-targets
 
 ### 测试 fixture 说明
 
-部分测试（PDF / EPUB / 图片 / 大文档）依赖 fixture 文件，**未提交至仓库**（`target/` 被 gitignore，`CARGO_MANIFEST_DIR/target`），首次跑 `cargo test` 前需手动放置：
+PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtures/`，不入 `target/`），fresh clone 后 `cargo test` 直接全绿，无需手动放置：
 
 | fixture | 说明 |
 | --- | --- |
-| `target/pdf测试.pdf` | 87 页文本型 PDF（长文档 / 遍历 / 搜索用例） |
-| `target/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf` | 更长 PDF（长文遍历用例，`pdf测试.pdf` 的副本） |
-| `target/xy.epub` | 《共产党宣言》6 图 EPUB |
-| `target/img测试.png` | 实为 580x773 JPEG（magic 探测） |
-| `target/大文档测试.md` / `大文档测试*.txt` | 大文档交互 / 基准用例（含 23MB / 116MB / 126MB 档） |
+| `fixtures/pdf测试.pdf` | 87 页文本型 PDF（长文档 / 遍历 / 搜索用例） |
+| `fixtures/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf` | 更长 PDF（长文遍历用例，`pdf测试.pdf` 的副本） |
+| `fixtures/xy.epub` | 《共产党宣言》6 图 EPUB |
+| `fixtures/epub测试.epub` | EPUB 副本文档 |
+| `fixtures/img测试.png` | 实为 580x773 JPEG（magic 探测） |
+| `fixtures/大文档测试.rs` / `fixtures/大文档测试2.md` | 6.4MB 大文档（编辑器 / 预览交互与 `BIGDOC_BENCH=1` 延迟基准） |
 
-> 若缺 fixture，将有 38 条环境性测试失败（与代码无关）。`cargo test` 的回归护栏覆盖：滚动条拖动、WYSIWYG 实时滚动、Markdown 预览滚动、编辑器远跳 / 延迟滚动、CJK 字符边界点击、撤销 / 重做、全选替换等。
+> 超大文档档位（`大文档测试.md` / `大文档测试23MB*` / `大文档测试116MB.txt` / `大文档测试126MB.txt` 等）体积过大不入库，仅供 `#[ignore]` 手动 / 基准用例按需放置至 `fixtures/`。`cargo test` 的回归护栏覆盖：滚动条拖动、WYSIWYG 实时滚动、Markdown 预览滚动、编辑器远跳 / 延迟滚动、CJK 字符边界点击、撤销 / 重做、全选替换等。
 
 ## 已知限制与后续方向
 

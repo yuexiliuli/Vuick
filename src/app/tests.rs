@@ -2729,10 +2729,10 @@
         }
         unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
         for path in [
-            r"target/大文档测试.md",
-            r"target/大文档测试23MB.md",
-            r"target/大文档测试23MB.txt",
-            r"target/大文档测试116MB.txt",
+            r"fixtures/大文档测试.md",
+            r"fixtures/大文档测试23MB.md",
+            r"fixtures/大文档测试23MB.txt",
+            r"fixtures/大文档测试116MB.txt",
         ] {
             println!("========== {path} ==========");
             let t0 = std::time::Instant::now();
@@ -2974,7 +2974,7 @@
     }
 
     /// 诊断（临时，手工跑）：真机大文档上对比编辑器/预览双层量程 + 模拟拖到底。
-    /// 依赖 `target/大文档测试.md` 存在；正常跑套件时跳过。#[ignore] 手动：
+    /// 依赖 `fixtures/大文档测试.md` 存在；正常跑套件时跳过。#[ignore] 手动：
     /// `cargo test -- --ignored diag_drag_bottom_real_file --nocapture`
     #[gpui::test]
     #[ignore]
@@ -2988,7 +2988,7 @@
         }
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_file(r"target/大文档测试.md", window, cx);
+                app.open_file(r"fixtures/大文档测试.md", window, cx);
             });
         });
         for _ in 0..20 {
@@ -3095,7 +3095,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
         assert!(epub.exists(), "测试 EPUB 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -3172,7 +3172,7 @@
             cx.run_until_parked();
         }
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("fixtures/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -3246,7 +3246,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
@@ -3311,7 +3311,7 @@
             cx.run_until_parked();
         }
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf");
+            .join("fixtures/17. 道路机动车辆产品准入审查要求1.0.pdf.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
@@ -3366,7 +3366,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_file(epub.to_str().unwrap(), window, cx)
@@ -3462,7 +3462,7 @@
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_file(r"target/大文档测试.md", window, cx);
+                app.open_file(r"fixtures/大文档测试.md", window, cx);
             });
         });
         let sync_ms = t0.elapsed().as_millis();
@@ -3522,7 +3522,7 @@
         let t_txt = std::time::Instant::now();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_file(r"target/大文档测试.txt", window, cx);
+                app.open_file(r"fixtures/大文档测试.txt", window, cx);
             });
         });
         println!("【txt 打开：open_file 返回】(对照) {} ms", t_txt.elapsed().as_millis());
@@ -3556,9 +3556,9 @@
             })
             .unwrap_or_else(|_| {
                 vec![
-                    r"target/大文档测试.md".to_string(),
-                    r"target/SKILL.md".to_string(),
-                    r"target/SKILL.txt".to_string(),
+                    r"fixtures/大文档测试.md".to_string(),
+                    r"fixtures/SKILL.md".to_string(),
+                    r"fixtures/SKILL.txt".to_string(),
                 ]
             });
 
@@ -3693,7 +3693,7 @@
         nl + usize::from(last == b'\n')
     }
 
-    /// 基准：打开大文档（默认 `target/大文档测试126MB.txt`，可用 `BENCH_OPEN_FILE`
+    /// 基准：打开大文档（默认 `fixtures/大文档测试126MB.txt`，可用 `BENCH_OPEN_FILE`
     /// 覆盖）的分阶段墙钟 + 进程私有内存峰值。
     /// - 「首屏可见」= 编辑器首次出现内容（旧：整篇读完一次性挂载才非空；
     ///   新：分块读盘首块 256KB 即挂）。
@@ -3714,7 +3714,7 @@
             cx.run_until_parked();
         }
         let path = std::env::var("BENCH_OPEN_FILE").unwrap_or_else(|_| {
-            r"target/大文档测试126MB.txt".to_string()
+            r"fixtures/大文档测试126MB.txt".to_string()
         });
         if !std::path::Path::new(&path).is_file() {
             // 资产缺失：现场生成一份 ~120MB LF 文本（保证可复现基准）。
@@ -3912,7 +3912,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(r"target/大文档测试.md", window, cx));
+            app.update(cx, |app, cx| app.open_file(r"fixtures/大文档测试.md", window, cx));
         });
         let mut frames = 0;
         loop {
@@ -4009,7 +4009,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(r"target/大文档测试.md", window, cx));
+            app.update(cx, |app, cx| app.open_file(r"fixtures/大文档测试.md", window, cx));
         });
         let mut frames = 0;
         loop {
@@ -4422,7 +4422,7 @@
     }
 
     /// 大文档交互延迟基准（`BIGDOC_BENCH=1` 才跑，不打断言，只打印每操作墙钟）。
-    /// 用 `target/大文档测试.rs`（编辑器）与 `target/大文档测试2.md`（预览）实测
+    /// 用 `fixtures/大文档测试.rs`（编辑器）与 `fixtures/大文档测试2.md`（预览）实测
     /// 「输入字符 / 滚动」的单次感知延迟（`dispatch/simulate + run_until_parked` 墙钟）。
     /// 对比 HEAD：`git stash -u` 跑本测试，再 `git stash pop` 复跑。
     #[gpui::test]
@@ -4441,9 +4441,9 @@
             eprintln!("[BENCH] {kind} = {ms:.1} ms");
         };
         let md_path =
-            std::env::var("BIGDOC_MD").unwrap_or_else(|_| "target/大文档测试2.md".to_string());
+            std::env::var("BIGDOC_MD").unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
         let rs_path =
-            std::env::var("BIGDOC_RS").unwrap_or_else(|_| "target/大文档测试.rs".to_string());
+            std::env::var("BIGDOC_RS").unwrap_or_else(|_| "fixtures/大文档测试.rs".to_string());
 
         // ---------- 打开 .rs（代码编辑器）并等就绪 ----------
         let t0 = std::time::Instant::now();

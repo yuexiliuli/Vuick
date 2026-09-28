@@ -4665,7 +4665,7 @@ A-->B
     fn bench_rw_realfile(cx: &mut TestAppContext) {
         use crate::markdown::wysiwyg::WyEditor;
         cx.update(crate::actions::bind_local_keymaps);
-        let path = "target/大文档测试2.md";
+        let path = "fixtures/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
@@ -4790,7 +4790,7 @@ A-->B
         // 实际整形（缓存未命中）块数。KILO_PROF=1 时同时 dump 各阶段开销。
         use crate::markdown::wysiwyg::WyEditor;
         cx.update(crate::actions::bind_local_keymaps);
-        let path = "target/大文档测试2.md";
+        let path = "fixtures/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
@@ -4985,7 +4985,7 @@ A-->B
         // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
         use crate::markdown::wysiwyg::WyEditor;
         cx.update(crate::actions::bind_local_keymaps);
-        let path = "target/大文档测试2.md";
+        let path = "fixtures/大文档测试2.md";
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {

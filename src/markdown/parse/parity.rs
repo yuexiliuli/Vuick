@@ -538,7 +538,7 @@ fn doc_byte_map_maps_render_back_to_line_source() {
 /// 历史事故：`parse_block_window` 只在 `end < src.len()` 时裁尾 '\n'，文档以
 /// `\r?\n` 结尾时——窗口收束在最后一个真实文本块（EOF 幻影空行块在其后）→ 切片
 /// 多留 1 个换行 → `split('\n')` 多造 1 行 → 调试断言 `70 vs 69` 应用运行时崩溃
-/// （`target/测试.md` 打开即死）。修复：末块若不是 EOF 幻影空行块（`byte==len`）
+/// （`fixtures/测试.md` 打开即死）。修复：末块若不是 EOF 幻影空行块（`byte==len`）
 /// 也要裁尾 '\n'；全档窗口（末块=幻影）保留该 '\n'（它就是幻影块本体）。
 #[test]
 fn window_rows_match_blocks_for_all_windows() {
