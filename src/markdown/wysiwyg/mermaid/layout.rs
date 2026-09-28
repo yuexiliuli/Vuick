@@ -714,3 +714,210 @@ fn close_activation(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::wysiwyg::mermaid::{MmEdge, MmNode, MmSubgraph};
+    use std::collections::HashMap;
+
+    /// 手工构造最小 flowchart 图（方向 TB，节点/边按给定序——序号即元素下标）。
+    fn mini_flow(nodes: &[&str], edges: &[(&str, &str)]) -> MmGraph {
+        MmGraph {
+            direction: MmDirection::TB,
+            nodes: nodes
+                .iter()
+                .map(|id| MmNode {
+                    id: id.to_string(),
+                    label: id.to_string(),
+                    shape: MmShape::Rect,
+                })
+                .collect(),
+            edges: edges
+                .iter()
+                .map(|(f, t)| MmEdge {
+                    from: f.to_string(),
+                    to: t.to_string(),
+                    kind: MmEdgeKind::Arrow,
+                    label: None,
+                })
+                .collect(),
+            subgraphs: vec![],
+            styles: HashMap::new(),
+        }
+    }
+
+    fn placed_node(id: &str, x: f32, y: f32) -> MmPlaced {
+        MmPlaced {
+            id: id.to_string(),
+            label: id.to_string(),
+            shape: MmShape::Rect,
+            x,
+            y,
+            w: 40.,
+            h: 30.,
+            fill: None,
+            stroke: None,
+            stroke_width: None,
+            virtual_node: false,
+        }
+    }
+
+    /// `flow_elements`：跨层长边（层差 ≥2）插虚节点到中间层并钉进链；相邻层直边不插。
+    #[test]
+    fn flow_elements_inserts_virtual_nodes_for_long_edges() {
+        let g = mini_flow(&["A", "B", "C"], &[("A", "B"), ("B", "C"), ("A", "C")]);
+        let fe = flow_elements(&g);
+        assert_eq!(fe.n_layers, 3);
+        // 3 实节点 + 1 虚节点（A→C 跨 2 层）。
+        assert_eq!(fe.elements.len(), 4);
+        let (vi, v_layer) = fe
+            .elements
+            .iter()
+            .enumerate()
+            .find(|(_, (id, _, _))| id.starts_with("~v"))
+            .map(|(i, _)| (i, fe.virtual_layers[i]))
+            .expect("应有虚节点");
+        assert_eq!(v_layer, Some(1), "虚节点落在中间层");
+        // 链把 A→v→C 串起来，另两条直边原样入链。
+        let idx = |id: &str| fe.elements.iter().position(|(e, _, _)| e.as_str() == id).unwrap();
+        assert!(fe.chain.contains(&(idx("A"), vi, MmEdgeKind::Line, None)));
+        assert!(fe.chain.contains(&(vi, idx("C"), MmEdgeKind::Arrow, None)));
+        assert!(fe.chain.contains(&(idx("A"), idx("B"), MmEdgeKind::Arrow, None)));
+    }
+
+    /// `flow_elements`：全是相邻层边不产生虚节点。
+    #[test]
+    fn flow_elements_adds_no_virtual_for_adjacent_layers() {
+        let g = mini_flow(&["A", "B", "C"], &[("A", "B"), ("B", "C")]);
+        let fe = flow_elements(&g);
+        assert_eq!(fe.elements.len(), 3);
+        assert!(!fe.elements.iter().any(|(id, _, _)| id.starts_with("~v")));
+    }
+
+    /// `barycenter_order`：每元素恰在其层一次；起步空位置时首轮下向为稳定 no-op，
+    /// 上向把 layer0 镜像到 layer1 源码序消化跨层逆序配对（交叉数降为 0）并收敛为固定点。
+    #[test]
+    fn barycenter_order_minimizes_layer_crossings() {
+        // 声明序 a1 a2 b1 b2：layer0=[a1,a2]、layer1=[b1,b2]，边 a1→b2 / a2→b1 初始 1 交叉。
+        let g = mini_flow(&["a1", "a2", "b1", "b2"], &[("a1", "b2"), ("a2", "b1")]);
+        let fe = flow_elements(&g);
+        let order = barycenter_order(&fe.elements, &fe.virtual_layers, &fe.layer_of, &fe.chain, fe.n_layers);
+        assert_eq!(order.len(), 2);
+        // 每元素恰好出现一次且落在自己的层。
+        let mut seen = 0usize;
+        for (li, layer) in order.iter().enumerate() {
+            for &ei in layer {
+                seen += 1;
+                assert_eq!(fe.layer_of.get(&fe.elements[ei].0).copied().unwrap_or(0), li);
+            }
+        }
+        assert_eq!(seen, fe.elements.len());
+        // 固定点：layer0 镜像为 [a2,a1]、layer1 保持 [b1,b2] → 两配对同向、交叉数 0。
+        let ids = |layer: &[usize]| layer.iter().map(|&ei| fe.elements[ei].0.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids(&order[0]), vec!["a2", "a1"]);
+        assert_eq!(ids(&order[1]), vec!["b1", "b2"]);
+        // 交叉判定：a1→b2 与 a2→b1 的层内相对序同向 → 0 交叉。
+        let p = |id: &str| order[0].iter().position(|&ei| fe.elements[ei].0 == id).unwrap();
+        let q = |id: &str| order[1].iter().position(|&ei| fe.elements[ei].0 == id).unwrap();
+        assert_eq!((p("a1") < p("a2")), (q("b2") < q("b1")), "不应有反向交叉");
+    }
+
+    /// `sort_layer_by_barycenter`：按邻点位置 barycenter 升序稳定排序，无邻点垫底。
+    #[test]
+    fn sort_layer_by_barycenter_orders_by_neighbor_positions() {
+        let adj: Vec<Vec<usize>> = vec![vec![4], vec![5], vec![4, 5], vec![], vec![], vec![]];
+        let pos = HashMap::from([(4usize, 100usize), (5usize, 200usize)]);
+        // 0→bary100；1→bary200；2→bary150；3 无邻 → MAX 垫底。
+        assert_eq!(sort_layer_by_barycenter(&[0, 1, 2, 3], &adj, &pos), vec![0, 2, 1, 3]);
+        // 稳定：同 bary 保持原相对序。
+        let mut adj2: Vec<Vec<usize>> = vec![Vec::new(); 9];
+        adj2[7] = vec![4];
+        adj2[6] = vec![4, 5];
+        adj2[8] = vec![5];
+        let pos2 = HashMap::from([(4usize, 10usize), (5usize, 10usize)]);
+        assert_eq!(sort_layer_by_barycenter(&[7, 6, 8], &adj2, &pos2), vec![7, 6, 8]);
+    }
+
+    /// `refresh_positions`：编码 `层下标*100_000 + 行内下标`。
+    #[test]
+    fn refresh_positions_encodes_layer_and_index() {
+        let order = vec![vec![1, 0], vec![3]];
+        let mut pos = HashMap::new();
+        refresh_positions(&order, &mut pos);
+        assert_eq!(pos.get(&1), Some(&0));
+        assert_eq!(pos.get(&0), Some(&1));
+        assert_eq!(pos.get(&3), Some(&100_000));
+    }
+
+    /// `flow_positions`：TB 层轴位固定秩距、单节点行内居中。
+    #[test]
+    fn flow_positions_centers_single_nodes_per_layer() {
+        let g = mini_flow(&["A", "B"], &[("A", "B")]);
+        let order = vec![vec![0usize], vec![1usize]];
+        let sizes = FlowSizes {
+            cw: vec![40., 40.],
+            ch: vec![30., 30.],
+            widths: vec![40., 40.],
+            virtual_flag: vec![false, false],
+        };
+        let geom = flow_positions(
+            &g,
+            &[("A".into(), "A".into(), MmShape::Rect), ("B".into(), "B".into(), MmShape::Rect)],
+            &order,
+            sizes,
+            0.,
+            200.,
+        );
+        // TB：层0 轴位 30、层1 轴位 106（MM_TOP_PAD + li*MM_RANK_TB，均无 sub 偏移）。
+        assert_eq!(geom.cx, vec![80., 80.]);
+        assert_eq!(geom.cy, vec![30., 106.]);
+        assert_eq!(geom.axis_ref, 0.);
+    }
+
+    /// `route_edges`：TB 垂直流——A 底出 B 顶进，直角折线 + 标签锚点。
+    #[test]
+    fn route_edges_tb_stays_vertical() {
+        let g = mini_flow(&["A", "B"], &[("A", "B")]);
+        let fe = flow_elements(&g);
+        let placed = vec![placed_node("A", 10., 20.), placed_node("B", 70., 80.)];
+        let edges = route_edges(&g, &fe.chain, &placed);
+        assert_eq!(edges.len(), 1);
+        let e = &edges[0];
+        assert_eq!((e.a, e.b), (0, 1));
+        // B 在 A 之下：A 底(50)出、B 顶(80)进，中转折 65 → 4 点直角折线。
+        assert_eq!(e.points, vec![(30., 50.), (30., 65.), (90., 65.), (90., 80.)]);
+        assert_eq!(e.label, Some((60., 57.)));
+        assert_eq!(e.kind, MmEdgeKind::Arrow);
+    }
+
+    /// `route_edges`：LR 水平流——A 右出 B 左进，先水平再竖直。
+    #[test]
+    fn route_edges_lr_stays_horizontal() {
+        let mut g = mini_flow(&["A", "B"], &[("A", "B")]);
+        g.direction = MmDirection::LR;
+        let fe = flow_elements(&g);
+        let placed = vec![placed_node("A", 10., 20.), placed_node("B", 70., 80.)];
+        let edges = route_edges(&g, &fe.chain, &placed);
+        assert_eq!(edges.len(), 1);
+        let e = &edges[0];
+        // 水平流：A 右(50)出、B 左(70)进；A/B 纵中线 35/95 差大 → 中转折 60。
+        assert_eq!(e.points, vec![(50., 35.), (60., 35.), (60., 95.), (70., 95.)]);
+        assert_eq!(e.label, Some((68., 65.)));
+    }
+
+    /// `flow_subgraph_boxes`：成员包围盒加 8px 内边距，并夹到内容区。
+    #[test]
+    fn flow_subgraph_boxes_bounds_members_with_pad() {
+        let mut g = mini_flow(&["A", "B"], &[("A", "B")]);
+        g.subgraphs = vec![MmSubgraph { id: "s0".into(), title: "s0".into(), depth: 0, nodes: vec!["A".into(), "B".into()] }];
+        let fe = flow_elements(&g);
+        let placed = vec![placed_node("A", 100., 100.), placed_node("B", 180., 100.)];
+        let boxes = flow_subgraph_boxes(&g, &fe.real_index, &placed, 0., 0.);
+        assert_eq!(boxes.len(), 1);
+        let b = &boxes[0];
+        assert_eq!(b.title, "s0");
+        // A(100,100)、B 右缘 220、下缘 130。内边距 8，夹内容区（MM_EDGE_X=14 / MM_TOP_PAD=30）。
+        assert_eq!((b.x, b.y, b.w, b.h), (92., 92., 136., 46.));
+    }
+}
