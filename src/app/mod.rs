@@ -1478,12 +1478,25 @@ impl Render for EditorApp {
         let _t = crate::prof::begin();
         // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
         // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
+        let body = self.render_body(window, cx);
+
+        let root = self.render_root(body, window, cx);
+        crate::prof::end("wy.app.render", _t);
+        root
+    }
+}
+
+impl EditorApp {
+    /// 内容区三态：实时编辑占满 / 预览分屏（EPUB 等可全屏预览）/ 纯编辑占满。
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let live_edit = self
             .tabs
             .get(self.active_tab)
             .map(|t| t.live_edit)
             .unwrap_or(false);
-        let body = if live_edit {
+        if live_edit {
+            // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
+            // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
             div()
                 .id("app-live-body")
                 .debug_selector(|| "app-live-body".into())
@@ -1568,9 +1581,18 @@ impl Render for EditorApp {
                 .overflow_hidden()
                 .child(self.render_editor_pane(window, 1.0, cx))
                 .into_any_element()
-        };
+        }
+    }
 
-        let root = div()
+    /// 根视图：顶部栏 + 选项卡栏 + 内容区 + 状态栏 + 通知叠层，并挂载「拖入文件打开 /
+    /// 多窗口选项卡拖拽 / 12 个快捷键动作」监听（一次组装完，render 保持薄分发）。
+    fn render_root(
+        &mut self,
+        body: gpui::AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
             .relative()
             .flex()
             .flex_col()
@@ -1678,8 +1700,6 @@ impl Render for EditorApp {
             .child(self.render_body_sidebar(body, cx))
             .child(self.render_status_bar(cx))
             // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
-            .child(self.render_notifications(window, cx));
-        crate::prof::end("wy.app.render", _t);
-        root
+            .child(self.render_notifications(window, cx))
     }
 }
