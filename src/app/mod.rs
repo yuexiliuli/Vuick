@@ -595,7 +595,10 @@ impl EditorApp {
                     if !tab.dirty {
                         tab.dirty = true;
                     }
-                    cx.notify();
+                    // 不再 `cx.notify()`：编辑侧的 `notify` 已令窗口把**本视图及其祖先**
+                    // （含 app 根视图）标脏（gpui `mark_view_dirty`），下一帧必重渲染，
+                    // 状态栏/选项卡脏点/预览都在同一帧读到最新值——重复通知只是
+                    // 多走一遍 invalidation 簿记（大文档逐键该项 ~10ms+，见 prof）。
                     crate::prof::end("tab_change", _t_change);
                 }
         })

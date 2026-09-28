@@ -1301,31 +1301,45 @@ impl MarkdownPreview {
     fn build_window_scroll_handles(&mut self) {
         let win_rows = self.win_rows.clone(); // 借 win_rows 的同时要 &mut self（缓存）
         let win_lo = self.win_lo;
+        let win_hi = win_lo.saturating_add(win_rows.len());
         let mut cs_old = std::mem::take(&mut self.code_scroll);
         let mut ts_old = std::mem::take(&mut self.table_scroll);
         {
             let cs = Rc::make_mut(&mut cs_old);
             let ts = Rc::make_mut(&mut ts_old);
-            cs.clear();
-            ts.clear();
-            for (j, _r) in win_rows.iter().enumerate() {
+            // 窗口移动只给**新进窗口**的代码/表格块新建句柄，仍在窗口内的块复用旧句柄
+            // —— 保留这些块的横向滚动位置（旧逻辑每次重建全部 new，纵向一滚宽代码块
+            // 的横向位置即回零）。句柄键 = 全局块下标，跨窗口重叠稳定，语义不变。
+            cs.retain(|ix, _| *ix >= win_lo && *ix < win_hi);
+            ts.retain(|ix, _| *ix >= win_lo && *ix < win_hi);
+            for (j, r) in win_rows.iter().enumerate() {
                 let ix = win_lo + j;
-                match _r.kind {
+                match r.kind {
                     RowKind::Code => {
-                        cs.insert(ix, ScrollHandle::new());
+                        cs.entry(ix).or_default();
                     }
                     RowKind::Table => {
-                        ts.insert(ix, ScrollHandle::new());
+                        ts.entry(ix).or_default();
                     }
                     _ => {}
                 }
             }
         }
-        // 窗口内代码行 → 高亮（缓存优先）
+        // 窗口内代码行 → 高亮（先继承旧窗口中仍在窗口内的解析结果，其余按缓存优先
+        // 补新进块——避免每次重建对重叠块重走一遍 LRU 查找与再插入）。
         let mut window_hl: std::collections::HashMap<usize, Rc<CodeLineRuns>> =
             std::collections::HashMap::new();
+        let old_hl = std::mem::take(&mut self.code_hl);
+        for (ix, runs) in old_hl.iter() {
+            if *ix >= win_lo && *ix < win_hi {
+                window_hl.insert(*ix, runs.clone());
+            }
+        }
         for (j, r) in win_rows.iter().enumerate() {
             let ix = win_lo + j;
+            if window_hl.contains_key(&ix) {
+                continue;
+            }
             if let Some(runs) = self.code_hl_for_row(ix, r) {
                 window_hl.insert(ix, runs);
             }
