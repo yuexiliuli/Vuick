@@ -2855,45 +2855,13 @@ impl WyEditor {
         let removed = self.doc.slice_str(r.clone());
         let inserted_len = text.len();
         // —— B2 撤销快照 + 事务合并（无定时器确定性判定，同 editor/undo.rs）——
-        // rope COW 快照 O(log n)；「同意图且邻接」→ 并入上一事务（不 push），200 深
-        // 快照可覆盖远多于 200 个字符的内容。
-        let intent = if removed.is_empty() && !text.is_empty() && !text.contains('\n') {
-            EditKind::Typing
-        } else if !removed.is_empty() && text.is_empty() {
-            // 纯删除：退格（r.end == 光标）vs 正向删除（r.start == 光标）。
-            if self.caret == r.end {
-                EditKind::Backspace
-            } else {
-                EditKind::Delete
-            }
-        } else {
-            EditKind::Atomic
-        };
-        let merges = match self.last_edit {
-            Some((k, s, _e)) if k == intent => match intent {
-                // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
-                EditKind::Typing => r.start == s + inserted_len,
-                EditKind::Backspace => r.end == s,   // 向后退格首尾相接
-                EditKind::Delete => r.start == s,    // 同起点延伸
-                EditKind::Atomic => false,
-            },
-            _ => false,
-        };
-        if !merges {
-            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
-            if self.undo_stack.len() > 200 {
-                self.undo_stack.remove(0);
-            }
-        }
-        self.redo_stack.clear();
-        self.last_edit = Some((intent, r.start, r.start + inserted_len));
+        self.record_undo_snapshot(&r, &removed, text);
         // 原地 rope 编辑（`Doc::edit`：COW remove+insert + 增量块扫描 + 增量行起始）——
         // 不再每键拼一份 6MB 整串再分配/复制（旧 `next` String + Arc 包装是 6MB 文档
         // ~5-6ms/键的根因）；`content` 字段随之取消，rope 为唯一真源。
         let edit_line = self.row_col(r.start).0;
         // 编辑前该行内容（region 签名对比用；非结构性编辑行边界不变）。
         let old_line = self.doc.line_str(edit_line);
-        let inserted_len = text.len();
         let prev_count = self.doc.block_count();
         // 编辑前被编辑块的几何（kind/src_line/aux）——用于判定是否需要降级为结构编辑：
         // 代码/表格**内容行**的非换行键入块数/几何都变 → 走非结构路径（Patch + 局部
@@ -2912,11 +2880,72 @@ impl WyEditor {
             _ => false,
         };
         let structural = cross_newline || breaks_fence || !count_same || !geo_same;
-        // Pass1 增量高度重估起点：编辑行的**前一内容行**之后的块全部未变（编辑线之前
-        // 的块内容/索引稳定）——结构编辑只在「该行起 → 文尾」重估，前缀高度复用。
+        // Pass1 增量重估定位 + 整形/预热缓存作废（结构 vs 非结构两路，见 `invalidate_after_edit`）。
+        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, &removed, text);
+        // —— 内容派生（derived）的增量判定（详见 `update_derived_after_edit`）——
+        self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
+
+        self.caret = (r.start + inserted_len).min(self.len());
+        self.sel_anchor = None;
+        *self.frame.borrow_mut() = None;
+        self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        crate::prof::end("wy.replace_range", _t_rr);
+        cx.emit(WyEvent::Changed);
+        cx.notify();
+    }
+
+    /// B2 撤销快照 + 事务合并（无定时器确定性判定，同 editor/undo.rs）：rope COW 快照
+    /// O(log n)；「同意图且邻接」→ 并入上一事务（不 push），200 深快照可覆盖远多于
+    /// 200 个字符的内容。返回是否并入上一事务。
+    fn record_undo_snapshot(&mut self, r: &Range<usize>, removed: &str, text: &str) -> bool {
+        let inserted_len = text.len();
+        let intent = if removed.is_empty() && !text.is_empty() && !text.contains('\n') {
+            EditKind::Typing
+        } else if !removed.is_empty() && text.is_empty() {
+            // 纯删除：退格（r.end == 光标）vs 正向删除（r.start == 光标）。
+            if self.caret == r.end {
+                EditKind::Backspace
+            } else {
+                EditKind::Delete
+            }
+        } else {
+            EditKind::Atomic
+        };
+        let merges = match self.last_edit {
+            Some((k, s, _e)) if k == intent => match intent {
+                // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
+                EditKind::Typing => r.start == s + inserted_len,
+                EditKind::Backspace => r.end == s, // 向后退格首尾相接
+                EditKind::Delete => r.start == s,  // 同起点延伸
+                EditKind::Atomic => false,
+            },
+            _ => false,
+        };
+        if !merges {
+            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
+            if self.undo_stack.len() > 200 {
+                self.undo_stack.remove(0);
+            }
+        }
+        self.redo_stack.clear();
+        self.last_edit = Some((intent, r.start, r.start + inserted_len));
+        merges
+    }
+
+    /// Pass1 增量重估定位 + 整形/预热缓存作废：编辑行的**前一内容行**之后的块全部未变
+    /// （前缀高度复用，不整篇重估）；结构编辑保留 < edit_blk 前缀的整形/重试缓存并归零
+    /// 预热，非结构编辑只作废受影响块（块下标稳定）。
+    fn invalidate_after_edit(
+        &mut self,
+        edit_line: usize,
+        edit_blk: usize,
+        prev_count: usize,
+        structural: bool,
+        removed: &str,
+        text: &str,
+    ) {
+        // Pass1 增量高度重估起点；三段式（前缀 / 变化中段 / 尾部复用）定位用。
         self.struct_dirty_line.set(edit_line);
-        // Pass1 三段式（前缀 / 变化中段 / 尾部复用）的定位用：编辑影响的旧区间终点与
-        // 源行净增——尾部块内容未变 → 高度直接沿用，不再对整段后缀重估。
         self.struct_old_end_line.set(edit_line + removed.matches('\n').count());
         self.struct_line_delta
             .set(text.matches('\n').count() as i64 - removed.matches('\n').count() as i64);
@@ -2944,6 +2973,23 @@ impl WyEditor {
             self.shape_rows.borrow_mut().invalidate(&[blk]);
             self.notdef_retry.borrow_mut().clear_block(blk);
         }
+    }
+
+    /// 内容派生（derived）的增量判定（详见 `region_line_sig`）：更新 math/alert 标记计数；
+    /// 结构编辑把派生区域**行号平移**（B3 增量）并重建 block_regions；非结构编辑比对行
+    /// 签名，签名不变即区域结构不变 → 走数学块 source 小修补（都不全篇重建）。
+    /// 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`
+    /// → `derived` Rc 跨键复用——大文档（尤其结构密集）「输入卡死」的根因是旧实现
+    /// 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
+    /// （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
+    fn update_derived_after_edit(
+        &mut self,
+        edit_line: usize,
+        old_line: &str,
+        structural: bool,
+        text: &str,
+        removed: &str,
+    ) {
         self.math_dollar_cnt.set(
             self.math_dollar_cnt.get()
                 + text.bytes().filter(|&b| b == b'$').count()
@@ -2952,16 +2998,10 @@ impl WyEditor {
         self.alert_marker_cnt.set(
             self.alert_marker_cnt.get() + text.matches("[!").count() - removed.matches("[!").count(),
         );
-
-        // —— 内容派生（derived）的增量判定（详见 `region_line_sig`）——
-        // 目标：**纯文本键入**（非结构、行签名不变、不在数学块内）不动 `regions_ver`
-        // → `derived` Rc 跨键复用——大文档（尤其结构密集）「输入卡死」的根因是旧实现
-        // 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
-        // （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
         if structural {
-            // 行索引 / 块结构变化：派生区域**行号平移**（B3 增量）——编辑线之上的区域
-            // 不变、之下平移 Δ；有区域跨线 / 派生未缓存才回退整篇重建。可编辑块区域
-            // （代码/表格）下标随之变化 → 一并重建（否则导航判定错位）。
+            // 行索引 / 块结构变化：派生区域**行号平移**——编辑线之上的区域不变、之下
+            // 平移 Δ；有区域跨线 / 派生未缓存才回退整篇重建。可编辑块区域（代码/表格）
+            // 下标随之变化 → 一并重建（否则导航判定错位）。
             let line_delta =
                 (text.matches('\n').count() as i64) - (removed.matches('\n').count() as i64);
             if !self.shift_derived_after_edit(edit_line, line_delta) {
@@ -2974,7 +3014,7 @@ impl WyEditor {
             // 是「输入"仍卡"」里仅次于整串复制的第二大头；`structural` 判定已保证
             // 非结构性编辑既不跨行、也不在代码/表格块内 → 区域必然不变）。
             let new_line = self.doc.line_str(edit_line);
-            if region_line_sig(&old_line) != region_line_sig(&new_line) {
+            if region_line_sig(old_line) != region_line_sig(&new_line) {
                 // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）
                 // → 区域结构可能变化 → 整篇重建派生。
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
@@ -3017,14 +3057,6 @@ impl WyEditor {
                 crate::prof::end("wy.rr.math", _t_m);
             }
         }
-
-        self.caret = (r.start + inserted_len).min(self.len());
-        self.sel_anchor = None;
-        *self.frame.borrow_mut() = None;
-        self.content_gen.set(self.content_gen.get().wrapping_add(1));
-        crate::prof::end("wy.replace_range", _t_rr);
-        cx.emit(WyEvent::Changed);
-        cx.notify();
     }
 
     /// 记录撤销快照并做一次文本替换（任务框 toggle / 警报折叠共用）。
