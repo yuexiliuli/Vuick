@@ -1966,143 +1966,14 @@ impl Render for MarkdownPreview {
         self.prepare_render(&p, pane_w, cx);
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
-        let wrap = self.wrap;
-        let code_scroll = self.code_scroll.clone();
-        let code_hl = self.code_hl.clone();
-        let table_scroll = self.table_scroll.clone();
 
         self.debug_dump_render_state();
 
-        // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
-        // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
-        let search_highlight = self.compute_search_highlight(cx);
+        // 行数据源与滚动/滚动条层（各自 &self 方法，详见 `build_list_content`/`render_core`）。
+        let content = self.build_list_content(p.clone(), list_state.clone(), cx);
 
-        // 行数据源：全量路径用整篇 `rows`；窗口路径用已物化的 `win_rows`（Rc，O(1) 克隆）。
-        let rows = self.rows.clone();
-        let win_rows = self.win_rows.clone();
-        let win_lo = self.win_lo;
-        let win_base = self.win_base;
-        let windowed = self.index.is_some();
-        let epub = self.epub_mode;
-        let note_ctx = self.note_ctx.clone();
-        let text_ctx = self.text_ctx.clone();
-        let selection = self.selection;
-        let sel_color = selection_color(cx);
-        let marker_hl = self.marker_hl;
-        let content = {
-            let p = p.clone();
-            // 列表 item_ix 是窗口内**相对**下标：绝对块 = `win_base + ix`（行数据窗口
-            // `win_rows`/`rows` 用绝对块下标）。超出已物化窗口渲染空占位。
-            list(list_state.clone(), move |ix, _window, cx| {
-                let abs = if windowed { win_base + ix } else { ix };
-                let ch = code_scroll.get(&abs).cloned();
-                let chr = code_hl.get(&abs).cloned();
-                let th = table_scroll.get(&abs).cloned();
-                let search = search_highlight
-                    .as_ref()
-                    .filter(|(row_ix, _, _)| *row_ix == abs)
-                    .map(|(_, range, color)| (range.clone(), *color));
-                let row = if !windowed {
-                    rows.get(abs)
-                } else if abs >= win_lo && abs - win_lo < win_rows.len() {
-                    win_rows.get(abs - win_lo)
-                } else {
-                    None
-                };
-                let Some(row) = row else {
-                    // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
-                    // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
-                    return div().size_full().into_any_element();
-                };
-                // 本行在选择区间内 → 截出 (区间, 背景色)。
-                let sel = selection.and_then(|((sr, sb), (er, eb))| {
-                    if sr > abs || abs > er {
-                        return None;
-                    }
-                    let rl = row.text.len();
-                    let a = if sr == abs { sb } else { 0 };
-                    let b = if er == abs { eb } else { rl };
-                    let a = a.min(rl);
-                    let b = b.min(rl);
-                    (b > a).then_some((a..b, sel_color))
-                });
-                // 跳转加亮：本行是被定位的目标行 → 把 (注记号, 是否定义) 交给 render_row，
-                // 给该行对应的 `[n]` 标记加亮。
-                let marker_hl = marker_hl
-                    .filter(|(row, _, _)| *row == abs)
-                    .map(|(_, n, is_def)| (n, is_def));
-                render_row(
-                    row,
-                    &RowRenderCtx {
-                        p: &p,
-                        wrap,
-                        code_handle: ch,
-                        code_hl: chr,
-                        table_handle: th,
-                        search,
-                        epub,
-                        note_ctx: &note_ctx,
-                        text_ctx: &text_ctx,
-                        selection: sel,
-                        marker_hl,
-                        row_ix: abs,
-                    },
-                    cx,
-                )
-            })
-        }
-        .size_full();
-
-        // 预览核心：换行（宽随视口）或非换行（横向滚动）共用外层横向滚动容器。
-        // 换行模式：宽包装层保持视口宽（正文按视口折行），超宽的代码带溢出交由 harea 统一横向滚动；
-        // 非换行模式：宽包装层 = max(估算最宽内容, 视口宽)，超宽产生横向溢出。
-        let inner = div()
-            .id("md-list-wrap")
-            .debug_selector(|| "md-list-wrap".into())
-            .w(px(content_w))
-            .min_w_full()
-            .h_full()
-            .child(content);
-        // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
-        let harea = div()
-            .id("md-harea")
-            .debug_selector(|| "md-harea".into())
-            .size_full()
-            .overflow_x_scroll()
-            .restrict_scroll_to_axis()
-            .track_scroll(&self.h_handle)
-            .child(inner);
-        let core = div()
-            .id("md-preview")
-            .debug_selector(|| "md-preview".into())
-            .size_full()
-            .relative()
-            .bg(bg)
-            // 鼠标点选 + Ctrl/Cmd+C 复制：预览获得键盘焦点，拖拽选择文本。
-            .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_mouse_down))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
-            .on_key_down(cx.listener(Self::on_preview_key_down))
-            // 悬浮脚注命中：鼠标移动 → 判定「上帧注记矩形」→ 显示注释卡片。
-            .on_mouse_move(cx.listener(Self::on_preview_mouse_move))
-            .child(harea)
-            .child(
-                div()
-                    .id("md-hscrollbar-overlay")
-                    .debug_selector(|| "md-hscrollbar-overlay".into())
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        Scrollbar::horizontal(&self.h_handle)
-                            .mode(ScrollbarMode::Always)
-                            .viewport_from_layout(),
-                    ),
-            )
-            // 纵向滚动条：确定性量程句柄 + 拖拽前重铺（拖到底必到全文末尾）。
-            .child(self.vertical_scrollbar(&list_state));
-
-        // 悬浮详情卡片：鼠标停在 `[n]` 标记（文内引用 / 末尾定义皆可）上时，浮出该引用
-        // 的详情正文（EPUB 注记表 / markdown 的 `cit.details` 二选一）。
+        // 预览核心：内容上下滚动容器 + 双滚动条 + 点选/悬浮监听（见 `render_core`）。
+        let core = self.render_core(content, bg, list_state, content_w, cx);
         let core = self.with_hover_note_card(core, cx).into_any_element();
 
         // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动。
@@ -2136,6 +2007,155 @@ impl Render for MarkdownPreview {
         let out = root;
         crate::prof::end("md_render", _t_render);
         out
+    }
+}
+
+impl MarkdownPreview {
+    /// 行数据源 List（窗口/全量两路）内容元素：按绝对块下标取行数据 → 搜索/选区/跳转
+    /// 加亮定位 → 交 `render_row`。行源只读快照在构造闭包前取好（元素构造期不改 `self`）。
+    fn build_list_content(
+        &mut self,
+        p: Rc<StyleParams>,
+        list_state: ListState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
+        // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
+        let search_highlight = self.compute_search_highlight(cx);
+        let sel_color = selection_color(cx);
+        let wrap = self.wrap;
+        let code_scroll = self.code_scroll.clone();
+        let code_hl = self.code_hl.clone();
+        let table_scroll = self.table_scroll.clone();
+        // 行数据源：全量路径用整篇 `rows`；窗口路径用已物化的 `win_rows`（Rc，O(1) 克隆）。
+        let rows = self.rows.clone();
+        let win_rows = self.win_rows.clone();
+        let win_lo = self.win_lo;
+        let win_base = self.win_base;
+        let windowed = self.index.is_some();
+        let epub = self.epub_mode;
+        let note_ctx = self.note_ctx.clone();
+        let text_ctx = self.text_ctx.clone();
+        let selection = self.selection;
+        let marker_hl = self.marker_hl;
+        list(list_state, move |ix, _window, cx| {
+            // 列表 item_ix 是窗口内**相对**下标：绝对块 = `win_base + ix`（行数据窗口
+            // `win_rows`/`rows` 用绝对块下标）。超出已物化窗口渲染空占位。
+            let abs = if windowed { win_base + ix } else { ix };
+            let ch = code_scroll.get(&abs).cloned();
+            let chr = code_hl.get(&abs).cloned();
+            let th = table_scroll.get(&abs).cloned();
+            let search = search_highlight
+                .as_ref()
+                .filter(|(row_ix, _, _)| *row_ix == abs)
+                .map(|(_, range, color)| (range.clone(), *color));
+            let row = if !windowed {
+                rows.get(abs)
+            } else if abs >= win_lo && abs - win_lo < win_rows.len() {
+                win_rows.get(abs - win_lo)
+            } else {
+                None
+            };
+            let Some(row) = row else {
+                // 尚未物化（跳出了当前窗口的过扫范围）：占位空元素，
+                // 滚动会触发下一帧 `ensure_window` 把窗口移过来。
+                return div().size_full().into_any_element();
+            };
+            // 本行在选择区间内 → 截出 (区间, 背景色)。
+            let sel = selection.and_then(|((sr, sb), (er, eb))| {
+                if sr > abs || abs > er {
+                    return None;
+                }
+                let rl = row.text.len();
+                let a = if sr == abs { sb } else { 0 };
+                let b = if er == abs { eb } else { rl };
+                let a = a.min(rl);
+                let b = b.min(rl);
+                (b > a).then_some((a..b, sel_color))
+            });
+            // 跳转加亮：本行是被定位的目标行 → 把 (注记号, 是否定义) 交给 render_row，
+            // 给该行对应的 `[n]` 标记加亮。
+            let marker_hl = marker_hl
+                .filter(|(row, _, _)| *row == abs)
+                .map(|(_, n, is_def)| (n, is_def));
+            render_row(
+                row,
+                &RowRenderCtx {
+                    p: &p,
+                    wrap,
+                    code_handle: ch,
+                    code_hl: chr,
+                    table_handle: th,
+                    search,
+                    epub,
+                    note_ctx: &note_ctx,
+                    text_ctx: &text_ctx,
+                    selection: sel,
+                    marker_hl,
+                    row_ix: abs,
+                },
+                cx,
+            )
+        })
+        .size_full()
+        .into_any_element()
+    }
+
+    /// 预览核心：换行（宽随视口）或非换行（横向滚动）共用外层横向滚动容器（换行模式宽
+    /// 包装层保持视口宽、超宽代码带由 harea 统一横滚；非换行模式 = max(最宽内容,视口宽)）+
+    /// 常显横向/纵向量程滚动条 + 点选复制/悬浮脚注监听挂载。
+    fn render_core(
+        &self,
+        content: gpui::AnyElement,
+        bg: Hsla,
+        list_state: ListState,
+        content_w: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let inner = div()
+            .id("md-list-wrap")
+            .debug_selector(|| "md-list-wrap".into())
+            .w(px(content_w))
+            .min_w_full()
+            .h_full()
+            .child(content);
+        // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
+        let harea = div()
+            .id("md-harea")
+            .debug_selector(|| "md-harea".into())
+            .size_full()
+            .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .track_scroll(&self.h_handle)
+            .child(inner);
+        div()
+            .id("md-preview")
+            .debug_selector(|| "md-preview".into())
+            .size_full()
+            .relative()
+            .bg(bg)
+            // 鼠标点选 + Ctrl/Cmd+C 复制：预览获得键盘焦点，拖拽选择文本。
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_preview_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_preview_mouse_up))
+            .on_key_down(cx.listener(Self::on_preview_key_down))
+            // 悬浮脚注命中：鼠标移动 → 判定「上帧注记矩形」→ 显示注释卡片。
+            .on_mouse_move(cx.listener(Self::on_preview_mouse_move))
+            .child(harea)
+            .child(
+                div()
+                    .id("md-hscrollbar-overlay")
+                    .debug_selector(|| "md-hscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::horizontal(&self.h_handle)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
+            // 纵向滚动条：确定性量程句柄 + 拖拽前重铺（拖到底必到全文末尾）。
+            .child(self.vertical_scrollbar(&list_state))
     }
 }
 
