@@ -737,24 +737,21 @@ pub(crate) fn render_row(
     let RowRenderCtx {
         p,
         wrap,
-        code_handle,
         code_hl,
         table_handle,
         search,
-        epub,
         note_ctx,
         text_ctx,
         selection,
         marker_hl,
         row_ix,
+        ..
     } = ctx;
     let p: &Rc<StyleParams> = p;
     let wrap: bool = *wrap;
-    let code_handle: Option<ScrollHandle> = code_handle.clone();
     let code_hl: Option<Rc<CodeLineRuns>> = code_hl.clone();
     let table_handle: Option<ScrollHandle> = table_handle.clone();
     let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let epub: bool = *epub;
     let note_ctx: &Rc<NoteCtx> = note_ctx;
     let text_ctx: &Rc<TextCtx> = text_ctx;
     let selection: Option<(Range<usize>, Hsla)> = selection.clone();
@@ -780,198 +777,13 @@ pub(crate) fn render_row(
         // 该块按内容宽撑开（content_w 计入最宽代码行 → 外层 md-harea 统一横向滚动，
         // 底部单一横向滚动条可拖动）；正文仍限制在视口宽内折行。
         if row.kind == RowKind::Code {
-            let lines = row.code_lines().to_vec();
-            let p_ = p.clone();
-            let runs = code_runs;
-            let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
-            let h = code_handle.unwrap_or_default();
-            let column = div()
-                .debug_selector(|| "md-code-row".into())
-                .flex()
-                .flex_col()
-                .flex_shrink_0()
-                .min_w_full()
-                .children(code_block_bands(&lines, runs, dark, &p_));
-            return div()
-                .debug_selector(|| "md-code-hscroll".into())
-                .h(px(block_h))
-                .w_full()
-                .flex_shrink_0()
-                .px_3()
-                .child(
-                    div()
-                        .debug_selector(|| "md-code-hscroll-inner".into())
-                        .w_full()
-                        .h_full()
-                        .relative()
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .id("md-code-scroll")
-                                .w_full()
-                                .h_full()
-                                .flex()
-                                .flex_row()
-                                .overflow_x_scroll()
-                                // 只允许鼠标左键拖动滚动条，禁止滚轮滚动代码块：
-                                // restrict_scroll_to_axis 使纵向滚轮不被本容器横向消费（delta_x=0），
-                                // 事件继续冒泡给页面做纵向滚动。
-                                .restrict_scroll_to_axis()
-                                .track_scroll(&h)
-                                .child(column),
-                        )
-                        .child(
-                            div()
-                                .debug_selector(|| "md-code-scrollbar".into())
-                                .absolute()
-                                .inset_0()
-                                .child(
-                                    Scrollbar::horizontal(&h)
-                                        .mode(ScrollbarMode::Always)
-                                        .viewport_from_layout(),
-                                ),
-                        ),
-                )
-                .into_any_element();
+            return render_wrapped_code(row, ctx, cx);
         }
         match row.kind {
-            RowKind::Paragraph => {
-                // 正文首行缩进 2 字符由 EPUB 转换器在行首前置「　　」实现（本行只负责对齐）。
-                let t = text_child_for_row(
-                    row,
-                    p,
-                    search,
-                    selection,
-                    &TextStyle {
-                        font_size: p.para_size.into(),
-                        color: p.fg,
-                        ..TextStyle::default()
-                    },
-                    marker_hl,
-                    row_ix,
-                    text_ctx,
-                    note_ctx,
-                );
-                let mut el = div()
-                    .w_full()
-                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_1()
-                    .whitespace_normal()
-                    .text_size(p.para_size)
-                    .text_color(p.fg);
-                match row.align {
-                    Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
-                    Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
-                    _ => {}
-                }
-                return el.child(t).into_any_element();
-            }
-            RowKind::Heading(n) => {
-                let (fs, lh) = p.heading_metrics(n);
-                // EPUB 章/节标题居中（行内也可显式指定对齐）。
-                let h_align = row
-                    .align
-                    .or(if epub { Some(RowAlign::Center) } else { None });
-                let t = text_child_for_row(
-                    row,
-                    p,
-                    search,
-                    selection,
-                    &TextStyle {
-                        font_size: fs.into(),
-                        color: p.fg,
-                        font_weight: FontWeight::BOLD,
-                        ..TextStyle::default()
-                    },
-                    marker_hl,
-                    row_ix,
-                    text_ctx,
-                    note_ctx,
-                );
-                let mut el = div()
-                    .w_full()
-                    .min_h(lh)
-                    .flex_shrink_0()
-                    .px_3()
-                    .py_1()
-                    .whitespace_normal()
-                    .text_size(fs)
-                    .text_color(p.fg)
-                    .font_weight(FontWeight::BOLD);
-                match h_align {
-                    Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
-                    Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
-                    _ => {}
-                }
-                return el.child(t).into_any_element();
-            }
-            RowKind::Quote => {
-                // 引述：外层 px_3 内缩（与正文对齐），背景带/左边框移到内层元素，
-                // 避免背景带顶到左边缘（同代码块做法）。
-                // 引述块**连续化**：去掉每行的外层纵向外衬与段落行距——相邻引述行的
-                // 灰带紧贴 → 整段引述（跨多行/多段）呈现一整片背景，无白色分割。
-                // 块内行距由每行灰带的 `py_1`（背景内衬）提供。
-                // 行内对齐（EPUB 引述里的落款 `%%ALIGN:RIGHT%%` 等）作用于引述带内容。
-                let bar_color: Hsla = gpui::rgb(QUOTE_BAR_COLOR).into();
-                let t = text_child_for_row(
-                    row,
-                    p,
-                    search,
-                    selection,
-                    &TextStyle {
-                        font_size: p.para_size.into(),
-                        color: p.muted_fg,
-                        ..TextStyle::default()
-                    },
-                    marker_hl,
-                    row_ix,
-                    text_ctx,
-                    note_ctx,
-                );
-                let mut band = div()
-                    .debug_selector(|| "md-quote-band".into())
-                    .w_full()
-                    .pl_3()
-                    .pr_3()
-                    .py_1()
-                    // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
-                    // 比灰底略深，标识引用块。
-                    .border_l(px(QUOTE_BAR_WIDTH_PX))
-                    .border_color(bar_color)
-                    .bg(p.quote_bg)
-                    .whitespace_normal()
-                    .text_size(p.para_size)
-                    .text_color(p.muted_fg);
-                match row.align {
-                    Some(RowAlign::Center) => band = band.flex().flex_row().justify_center(),
-                    Some(RowAlign::Right) => band = band.flex().flex_row().justify_end(),
-                    _ => {}
-                }
-                return div()
-                    .w_full()
-                    .min_h(px(p.para_line.as_f32()))
-                    .flex_shrink_0()
-                    .px_3()
-                    .child(band.child(t))
-                    .into_any_element();
-            }
-            RowKind::Bullet => {
-                let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
-                return div()
-                    .w_full()
-                    .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
-                    .flex_shrink_0()
-                    .pl_5()
-                    .pr_3()
-                    .py_1()
-                    .whitespace_normal()
-                    .text_size(p.para_size)
-                    .text_color(p.fg)
-                    .child(t)
-                    .into_any_element();
-            }
+            RowKind::Paragraph => return render_wrapped_paragraph(row, ctx, cx),
+            RowKind::Heading(_) => return render_wrapped_heading(row, ctx, cx),
+            RowKind::Quote => return render_wrapped_quote(row, ctx, cx),
+            RowKind::Bullet => return render_wrapped_bullet(row, ctx, cx),
             _ => {}
         }
     }
@@ -1133,6 +945,290 @@ pub(crate) fn render_row(
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     };
     el.into_any_element()
+}
+
+/// 换行模式：围栏代码块折叠成连续块（逐行堆叠）+ 自带头部横向滚动容器（正文折行、
+/// 代码不折；底部单一横向滚动条方便长行）。
+fn render_wrapped_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        code_handle,
+        code_hl,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let code_handle: Option<ScrollHandle> = code_handle.clone();
+    let code_runs = code_hl.as_deref();
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let lines = row.code_lines().to_vec();
+    let p_ = p.clone();
+    let runs = code_runs;
+    let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
+    let h = code_handle.unwrap_or_default();
+    let column = div()
+        .debug_selector(|| "md-code-row".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .min_w_full()
+        .children(code_block_bands(&lines, runs, dark, &p_));
+    div()
+        .debug_selector(|| "md-code-hscroll".into())
+        .h(px(block_h))
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .child(
+            div()
+                .debug_selector(|| "md-code-hscroll-inner".into())
+                .w_full()
+                .h_full()
+                .relative()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("md-code-scroll")
+                        .w_full()
+                        .h_full()
+                        .flex()
+                        .flex_row()
+                        .overflow_x_scroll()
+                        // 只允许鼠标左键拖动滚动条，禁止滚轮滚动代码块：
+                        // restrict_scroll_to_axis 使纵向滚轮不被本容器横向消费（delta_x=0），
+                        // 事件继续冒泡给页面做纵向滚动。
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&h)
+                        .child(column),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "md-code-scrollbar".into())
+                        .absolute()
+                        .inset_0()
+                        .child(
+                            Scrollbar::horizontal(&h)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 换行模式：正文段（可含行内对齐）；行首缩进 2 字符由 EPUB 转换器前置「　　」。
+fn render_wrapped_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let t = text_child_for_row(
+        row,
+        p,
+        search,
+        selection,
+        &TextStyle {
+            font_size: p.para_size.into(),
+            color: p.fg,
+            ..TextStyle::default()
+        },
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    );
+    let mut el = div()
+        .w_full()
+        .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+        .flex_shrink_0()
+        .px_3()
+        .py_1()
+        .whitespace_normal()
+        .text_size(p.para_size)
+        .text_color(p.fg);
+    match row.align {
+        Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
+        Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
+        _ => {}
+    }
+    el.child(t).into_any_element()
+}
+
+/// 换行模式：标题（1-6 级）；EPUB 章/节标题默认居中（行内可显式指定对齐）。
+fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        epub,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let epub: bool = *epub;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let RowKind::Heading(n) = row.kind else {
+        unreachable!("只应在 Heading 行调用")
+    };
+    let (fs, lh) = p.heading_metrics(n);
+    // EPUB 章/节标题居中（行内也可显式指定对齐）。
+    let h_align = row.align.or(if epub { Some(RowAlign::Center) } else { None });
+    let t = text_child_for_row(
+        row,
+        p,
+        search,
+        selection,
+        &TextStyle {
+            font_size: fs.into(),
+            color: p.fg,
+            font_weight: FontWeight::BOLD,
+            ..TextStyle::default()
+        },
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    );
+    let mut el = div()
+        .w_full()
+        .min_h(lh)
+        .flex_shrink_0()
+        .px_3()
+        .py_1()
+        .whitespace_normal()
+        .text_size(fs)
+        .text_color(p.fg)
+        .font_weight(FontWeight::BOLD);
+    match h_align {
+        Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
+        Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
+        _ => {}
+    }
+    el.child(t).into_any_element()
+}
+
+/// 换行模式：引述行（背景/左边框移到内层，灰带紧贴成整片；行内对齐作用于引述带内容）。
+fn render_wrapped_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let bar_color: Hsla = gpui::rgb(QUOTE_BAR_COLOR).into();
+    let t = text_child_for_row(
+        row,
+        p,
+        search,
+        selection,
+        &TextStyle {
+            font_size: p.para_size.into(),
+            color: p.muted_fg,
+            ..TextStyle::default()
+        },
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+    );
+    let mut band = div()
+        .debug_selector(|| "md-quote-band".into())
+        .w_full()
+        .pl_3()
+        .pr_3()
+        .py_1()
+        // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
+        .border_l(px(QUOTE_BAR_WIDTH_PX))
+        .border_color(bar_color)
+        .bg(p.quote_bg)
+        .whitespace_normal()
+        .text_size(p.para_size)
+        .text_color(p.muted_fg);
+    match row.align {
+        Some(RowAlign::Center) => band = band.flex().flex_row().justify_center(),
+        Some(RowAlign::Right) => band = band.flex().flex_row().justify_end(),
+        _ => {}
+    }
+    div()
+        .w_full()
+        .min_h(px(p.para_line.as_f32()))
+        .flex_shrink_0()
+        .px_3()
+        .child(band.child(t))
+        .into_any_element()
+}
+
+/// 换行模式：列表项（项目符号接正文）。
+fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let marker_hl: Option<(usize, bool)> = *marker_hl;
+    let row_ix: usize = *row_ix;
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
+    div()
+        .w_full()
+        .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
+        .flex_shrink_0()
+        .pl_5()
+        .pr_3()
+        .py_1()
+        .whitespace_normal()
+        .text_size(p.para_size)
+        .text_color(p.fg)
+        .child(t)
+        .into_any_element()
 }
 
 /** 表格行（GFM pipe table 整体折叠成一渲染行）。
