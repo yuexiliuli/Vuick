@@ -36,7 +36,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, VisualContext, Window, WindowBounds,
     WindowOptions,
 };
-use gpui_component::input::{InputEvent, InputState};
+use crate::ui::input::{InputEvent, InputState};
 use ropey::Rope;
 use crate::ui::icon::{Icon, IconName};
 
@@ -296,8 +296,8 @@ impl EditorApp {
         });
         let search_state = search.clone();
         let search_sub = cx.subscribe(&search, |_this, _emitter, ev: &InputEvent, cx| {
-            if let InputEvent::Change = ev {
-                cx.notify();
+            match ev {
+                InputEvent::Change => cx.notify(),
             }
         });
         let mut app = EditorApp {
