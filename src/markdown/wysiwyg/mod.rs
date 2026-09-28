@@ -1134,7 +1134,7 @@ impl WyEditor {
     /// 帧未就绪返回 `None`（下帧再取）；未注入宿主句柄时直接丢弃锚点（不进死循环）。
     pub(crate) fn advance_zoom_restore(&self) -> Option<(f32, bool)> {
         // 先查锚点（绝大多数帧为 None，最早退出）；再查宿主句柄，缺则丢弃锚点（不进死循环）。
-        let anchor = self.zoom_anchor.borrow().clone()?;
+        let anchor = (*self.zoom_anchor.borrow())?;
         if self.host_scroll.borrow().is_none() {
             *self.zoom_anchor.borrow_mut() = None;
             self.zoom_last_target.set(None);
@@ -1913,7 +1913,7 @@ impl WyEditor {
         // 3) 渲染期重建窗口化帧 → 新布局的精确块 top/height。
         let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
         let band = self.shape_band().unwrap_or((0., 5000.));
-        let frame = element::build_frame(&*self, window, width, band);
+        let frame = element::build_frame(self, window, width, band);
         // 4) 锚点块在新布局里的精确位置 = 恢复目标（元素局部 y）。
         let target = {
             let anchor = *self.zoom_anchor.borrow();
@@ -1941,7 +1941,7 @@ impl WyEditor {
         };
         let frame = if final_band != band {
             self.set_shape_band(Some(final_band));
-            element::build_frame(&*self, window, width, final_band)
+            element::build_frame(self, window, width, final_band)
         } else {
             frame
         };

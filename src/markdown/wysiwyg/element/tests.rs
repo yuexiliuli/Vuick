@@ -111,7 +111,7 @@
                 .first()
                 .expect("行应有 shaped 结果");
             assert!(
-                w0.wrap_boundaries().len() >= 1,
+                !w0.wrap_boundaries().is_empty(),
                 "长文本应折行：wrap 边界 {} 个",
                 w0.wrap_boundaries().len()
             );
@@ -459,7 +459,7 @@ let c = 3;
             // 编辑排版：表头(1) + 数据行(2) = 3 个可见行，每行 2 格，源行号与块一致。
             let te = table.table_edit.as_ref().expect("表格应有编辑排版");
             assert_eq!(te.rows.len(), 3, "表头 + 2 数据行");
-            for (_, row) in te.rows.iter().enumerate() {
+            for row in te.rows.iter() {
                 assert_eq!(row.cells.len(), 2, "每行 2 格");
             }
             assert_eq!(te.rows[0].src_line, 6, "表头源行");
@@ -887,7 +887,7 @@ let c = 333;
             let jump_x = bar_x + bar_w - 4.0;
             let (blk_hit, on_thumb, _) = super::table_hscrollbar_hit(
                 ed.read(cx),
-                &ed
+                ed
                     .read(cx)
                     .frame
                     .borrow()
@@ -919,7 +919,7 @@ let c = 333;
             let geo2 = super::table_hscroll_geo(
                 ed.read(cx),
                 &f2,
-                &f2.rows.iter().find(|r| r.src_line == blk).unwrap(),
+                f2.rows.iter().find(|r| r.src_line == blk).unwrap(),
             )
             .unwrap();
             let (_, _, thumb_x2, thumb_w2, _) = geo2;
@@ -1158,7 +1158,7 @@ let c = 333;
             // 断言**点击前**命中的是轨道（非滑块）。
             let (blk_pre, on_thumb_pre, _) = super::code_hscrollbar_hit(
                 ed.read(cx),
-                &ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+                ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
                 point(px(jump_x), px(jump_y)),
             )
             .expect("轨道末应在滚动条带内");
@@ -1185,8 +1185,8 @@ let c = 333;
             // 再点滑块中心 → 进入拖动态，拖动到左端归零。
             let geo2 = super::code_hscroll_geo(
                 ed.read(cx),
-                &ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
-                &ed.read(cx).frame.borrow().as_ref().unwrap().rows.iter().find(|r| r.src_line == blk).unwrap(),
+                ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+                ed.read(cx).frame.borrow().as_ref().unwrap().rows.iter().find(|r| r.src_line == blk).unwrap(),
             ).unwrap();
             let (_, _, thumb_x2, thumb_w2, _) = geo2;
             let thumb_cx = thumb_x2 + thumb_w2 / 2.;
@@ -1856,7 +1856,7 @@ A-->B
             let mm = frame
                 .rows
                 .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
                 .expect("应有 mermaid 卡片");
             assert!(
                 f32::from(mm.height) >= 100.,
@@ -1900,7 +1900,7 @@ graph TD
                 let mm = frame
                     .rows
                     .iter()
-                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
                     .expect("应有 mermaid 卡片");
                 let card_h = f32::from(mm.height);
                 let theme = ed.read(cx).theme.clone();
@@ -1952,7 +1952,7 @@ sequenceDiagram
             let mm = frame
                 .rows
                 .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid { .. })))
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
                 .expect("应有 mermaid 序列图卡片");
             let laid = mm.mm.as_ref().expect("有缓存布局");
             match &**laid {
@@ -2554,7 +2554,7 @@ A-->B
             let ed = host.read(cx).ed.clone();
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
             assert!(
-                frame.rows.iter().any(|r| matches!(r.extra.card, Some(BlockCard::Mermaid { .. }))),
+                frame.rows.iter().any(|r| matches!(r.extra.card, Some(BlockCard::Mermaid))),
                 "应渲染出 mermaid 卡片"
             );
             ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
@@ -3097,11 +3097,11 @@ A-->B
                 .expect("应扫到一块公式");
             assert_eq!(reg.source, "a \\\\ b");
             // 就绪后高 = 20 + max(h,16) = 20+16 = 36（而非 Unicode 两行的 64）。
-            let h = super::math_card_height(&e, &reg);
+            let h = super::math_card_height(e, &reg);
             assert_eq!(f32::from(h), 36.0, "就绪应占位排版高度，而非 Unicode 行高");
             // 未就绪（新公式）→ 回退 Unicode 行高 = 20 + 2×22 = 64。
             e.math_slots().borrow_mut().clear();
-            let h2 = super::math_card_height(&e, &reg);
+            let h2 = super::math_card_height(e, &reg);
             assert_eq!(f32::from(h2), 64.0, "未就绪应回退 Unicode 逐行高");
         });
     }
@@ -3174,7 +3174,7 @@ A-->B
                 .next()
                 .expect("应扫到一块公式");
             assert_eq!(reg.source, r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}");
-            let h = f32::from(super::math_card_height(&ed.read(cx), &reg));
+            let h = f32::from(super::math_card_height(ed.read(cx), &reg));
             let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
             let row_h = f2
                 .rows
@@ -4300,7 +4300,7 @@ A-->B
                 let t0 = std::time::Instant::now();
                 let mut n = String::with_capacity(s.len() - r.len() + 1);
                 n.push_str(&s[..r.start]);
-                n.push_str("x");
+                n.push('x');
                 n.push_str(&s[r.end..]);
                 next = n;
                 t += t0.elapsed().as_millis();
@@ -4329,7 +4329,7 @@ A-->B
             for _ in 0..20 {
                 let mut x = String::with_capacity(s.len());
                 x.push_str(&s[..r.start]);
-                x.push_str("x");
+                x.push('x');
                 x.push_str(&s[r.end..]);
                 let t0 = std::time::Instant::now();
                 let _ss =
@@ -4346,15 +4346,14 @@ A-->B
                 let t0 = std::time::Instant::now();
                 let mut regions: usize = 0;
                 for i in 0..n {
-                    if let Some(m) = doc2.block_meta(i) {
-                        if matches!(
+                    if let Some(m) = doc2.block_meta(i)
+                        && matches!(
                             m.kind,
                             crate::markdown::parse::RowKind::Code
                                 | crate::markdown::parse::RowKind::Table
                         ) {
                             regions += 1;
                         }
-                    }
                 }
                 let _ = regions;
                 t += t0.elapsed().as_millis();
@@ -4768,7 +4767,7 @@ A-->B
             for ins in ins_seq {
                 let t0 = std::time::Instant::now();
                 cx.update(|cx| {
-                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, *ins, ecx)));
+                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx)));
                 });
                 let _ = cx.refresh();
                 t += t0.elapsed().as_millis();

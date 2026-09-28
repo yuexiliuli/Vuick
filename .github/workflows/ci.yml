@@ -29,7 +29,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # 当前基线仍 ~26 条存量告警（见评审 P2：clippy 债务清零）。
-      # 待基线清零后收紧为硬门禁：cargo clippy --all-targets --all-features -- -D warnings
+      # clippy 全目标全 feature 告警已清零（评审 P2 收尾）——硬门禁：任何新告警直接红。
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings

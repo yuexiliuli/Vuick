@@ -96,7 +96,7 @@ mod tests {
         assert_eq!(bytes.len(), w as usize * h as usize * 4, "BGRA buffer matches dims");
         // 极限/分式/根号应该真的排出来（上下标不再是正文大小、分式有横线）——
         // 至少位图里有非全透明像素（不是纯空）。
-        assert!(bytes.chunks_exact(4).any(|px| px[3] > 0), "glyph pixels present");
+        assert!(bytes.as_chunks::<4>().0.iter().any(|px| px[3] > 0), "glyph pixels present");
     }
 
     #[test]

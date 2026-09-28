@@ -1764,7 +1764,7 @@ impl PdfViewer {
             let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
             if tile_ok {
                 tiles.reserve(slot.tiles.len());
-                for (_, ts) in slot.tiles.iter() {
+                for ts in slot.tiles.values() {
                     tiles.push((
                         ts.x0 as f32 * sx,
                         ts.y0 as f32 * sy,

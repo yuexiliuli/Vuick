@@ -425,8 +425,8 @@ fn flow_positions(
     let mut axis_pos: Vec<f32> = vec![0.; n_layers];
     match g.direction {
         MmDirection::TB | MmDirection::BT => {
-            for li in 0..n_layers {
-                axis_pos[li] = MM_TOP_PAD + li as f32 * MM_RANK_TB;
+            for (li, slot) in axis_pos.iter_mut().enumerate() {
+                *slot = MM_TOP_PAD + li as f32 * MM_RANK_TB;
             }
         }
         MmDirection::LR | MmDirection::RL => {
@@ -708,11 +708,10 @@ fn close_activation(
     y_now: f32,
     activations: &mut Vec<MmSeqActivation>,
 ) {
-    if let Some(start) = active_start.remove(id) {
-        if y_now > start + 1. {
+    if let Some(start) = active_start.remove(id)
+        && y_now > start + 1. {
             activations.push(MmSeqActivation { id: id.to_string(), y0: start, y1: y_now });
         }
-    }
 }
 
 #[cfg(test)]

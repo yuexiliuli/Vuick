@@ -1306,7 +1306,7 @@ mod tests {
             background_color: Some(gpui::rgba(0x4d6bfe42).into()),
             ..Default::default()
         };
-        let merged = merge_highlights(vec![(2..6, bold.clone()), (0..8, sel_bg.clone())]);
+        let merged = merge_highlights(vec![(2..6, bold), (0..8, sel_bg)]);
         // [0,2) 仅背景；[2,6) 粗体+背景；[6,8) 仅背景。
         let seg = merged
             .iter()

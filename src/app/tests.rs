@@ -2578,7 +2578,7 @@
         });
         assert!(!deferred, "固定窗口挂载即就绪（无两段式中间态）");
         assert!(
-            win <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            win <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS,
             "固定窗口应为小窗口，实际 {win}"
         );
         assert_eq!(base0, 0, "未滚动前窗口基址应为 0");
@@ -2605,7 +2605,7 @@
         );
         assert!(base > 0, "窗口基址应重定位到大行号：base={base}");
         assert!(
-            top.saturating_sub(base) < crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            top.saturating_sub(base) < crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS,
             "目标行应在窗口内：abs_top={top} base={base}"
         );
     }
@@ -2671,7 +2671,7 @@
         // 固定窗口虚拟化：条目数恒为小窗口（与全文行数无关），量程按全文
         // `scroll_item_count` 计算——底部预留随量程存在于滚动最底端。
         assert!(
-            item_count <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as usize,
+            item_count <= crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS,
             "固定窗口应是小窗口：item_count={item_count} ≤ {}",
             crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS
         );
@@ -2698,7 +2698,7 @@
         // 顶行的偏移；底部空白 = 视口高 − 该 y。基底预留应 ≈ pad 且 ≥ pad − 1 行。
         let last_top_px = (row_count as f32 - ix as f32) * lh - off;
         let last_bottom = last_top_px + lh;
-        let blank_valid = (view2 - last_bottom) as f32;
+        let blank_valid = view2 - last_bottom;
         // gpui 对「填充不满一屏」会回退一行把视口填满（浮点舍入所致），实际空白可能
         // 比 pad 少约 1 行；断言「可见空白 ≥ pad − 行高 − 余量」即可证明预留区真实渲染、
         // 最后一行未被横向滚动条盖住。

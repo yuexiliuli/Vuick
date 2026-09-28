@@ -720,7 +720,7 @@ mod tests {
         let html = "<html><body><h1>第一章</h1><p>正文内容。</p><blockquote><p>引述。</p></blockquote></body></html>";
         let no_img: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no_img.clone(), &mut notes);
+        let md = xhtml_to_markdown(html, &mut |_s, _a| no_img.clone(), &mut notes);
         assert!(md.contains("# 第一章"));
         assert!(md.contains("正文内容。"));
         assert!(md.contains("> 引述。"));
@@ -737,7 +737,7 @@ mod tests {
 </body></html>";
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
         assert!(md.contains("%%ALIGN:RIGHT%%卡尔·马克思"), "签名应带右对齐指令：{md}");
         // `<br>` 应把签名拆成两行，且每行都带右对齐指令（日期单独成行）。
         assert!(
@@ -763,7 +763,7 @@ mod tests {
 </body></html>";
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
         assert!(md.contains("[^2]"), "正文脚注应转成 [^2] 标记：{md}");
         assert_eq!(
             notes.get(&2).map(|s| s.as_str()),
@@ -787,7 +787,7 @@ mod tests {
                 Some("/tmp/x/p1.jpeg".to_string())
             };
             let mut notes = std::collections::BTreeMap::new();
-            xhtml_to_markdown(&html, &mut on_img, &mut notes)
+            xhtml_to_markdown(html, &mut on_img, &mut notes)
         };
         assert!(md.contains("![插图一](/tmp/x/p1.jpeg)"), "图片应转成 markdown 图片，实际={md:?}");
     }
@@ -797,7 +797,7 @@ mod tests {
         let html = "<html><body><img src=\"x.png\" alt=\"图A\"/></body></html>";
         let no: Option<String> = None;
         let mut notes = std::collections::BTreeMap::new();
-        let md = xhtml_to_markdown(&html, &mut |_s, _a| no.clone(), &mut notes);
+        let md = xhtml_to_markdown(html, &mut |_s, _a| no.clone(), &mut notes);
         assert!(md.contains("[图片：图A]"), "无解析结果应输出占位，实际={md:?}");
     }
 
@@ -811,7 +811,7 @@ mod tests {
                 Some("epubimg://1.jpeg".to_string())
             };
             let mut notes = std::collections::BTreeMap::new();
-            xhtml_to_markdown(&html, &mut on_img, &mut notes)
+            xhtml_to_markdown(html, &mut on_img, &mut notes)
         };
         assert!(
             md.contains("![图片](epubimg://1.jpeg)"),

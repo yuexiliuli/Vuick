@@ -129,6 +129,7 @@ fn muted_faded(theme: &WyTheme) -> Hsla {
     c
 }
 
+#[allow(clippy::too_many_arguments)] // 低层画图原语：显式标量参数比打包结构更直白
 fn paint_quad(window: &mut Window, x: f32, y: f32, w: f32, h: f32, r: f32, fill: Hsla, border: Hsla, bw: f32) {
     window.paint_quad(gpui::PaintQuad {
         bounds: Bounds::new(point(px(x), px(y)), size_wh(w, h)),
@@ -171,6 +172,7 @@ fn polygon(window: &mut Window, pts: &[(f32, f32)], fill: Hsla, stroke: Hsla, wi
 }
 
 /// 椭圆/圆（多边形近似）。
+#[allow(clippy::too_many_arguments)] // 低层画图原语：显式标量参数比打包结构更直白
 fn circle(window: &mut Window, cx_: f32, cy_: f32, rx: f32, ry: f32, fill: Hsla, stroke: Hsla, width: f32) {
     let n = 28;
     let pts: Vec<(f32, f32)> = (0..n)
@@ -295,11 +297,10 @@ fn paint_edge_label(
     z: f32,
     cx: &mut App,
 ) {
-    if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text) {
-        if !lt.is_empty() {
+    if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text)
+        && !lt.is_empty() {
             text_centered(window, lx + ox, ly + oy, lt, theme.mono.clone(), 12. * z, theme.muted, 14. * z, cx);
         }
-    }
 }
 
 fn arrow_head(window: &mut Window, tip: (f32, f32), dir: (f32, f32), color: Hsla, width: f32, s: f32) {
@@ -333,6 +334,7 @@ fn text(
 }
 
 /// 居中文本（按整行宽把起点左移一半；边标签/序列消息用）。
+#[allow(clippy::too_many_arguments)] // 低层画图原语：显式标量参数比打包结构更直白
 fn text_centered(
     window: &mut Window,
     x: f32,
@@ -507,11 +509,10 @@ pub(crate) fn paint_mermaid_seq(
     for (ry, row) in &seq.rows {
         match row {
             MmSeqRow::Message(mi) => {
-                if let Some(m) = seq.seq.messages.get(*mi) {
-                    if let (Some(fc), Some(tc)) = (col_of(cols, &m.from), col_of(cols, &m.to)) {
+                if let Some(m) = seq.seq.messages.get(*mi)
+                    && let (Some(fc), Some(tc)) = (col_of(cols, &m.from), col_of(cols, &m.to)) {
                         paint_message(window, theme, fc, tc, m.arrow, &m.text, ox, oy + ry, z, cx);
                     }
-                }
             }
             MmSeqRow::Note(ni) => {
                 if let Some(no) = seq.seq.notes.get(*ni) {
@@ -522,11 +523,10 @@ pub(crate) fn paint_mermaid_seq(
                 let by = oy + ry;
                 let bx = ox + 6.;
                 stroke_seg(window, (bx, by), (bx + seq.content_w - 12., by), { let mut c = band_border; c.a = 0.8; c }, 1.);
-                if let Some(t) = title {
-                    if !t.is_empty() {
+                if let Some(t) = title
+                    && !t.is_empty() {
                         text(window, theme, bx + 10., by + 4. * z, t, theme.mono.clone(), 11. * z, muted_faded(theme), 15. * z, cx);
                     }
-                }
             }
             _ => {}
         }

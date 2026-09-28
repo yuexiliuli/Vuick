@@ -673,7 +673,6 @@ pub(crate) fn table_cells(line: &str) -> Vec<&str> {
 /// The unescaped-pipe splitter and backslash-escape check live in
 /// [`super::cells`] — shared byte machinery with the preview parser
 /// (edge semantics pinned by `markdown::parity`).
-
 /// Is `line` a table separator row (every cell is dashes with optional
 /// alignment colons)? Alignment semantics are the single implementation
 /// `super::cells::parse_aligns` (shared with the preview parser and

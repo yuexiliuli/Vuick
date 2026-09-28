@@ -298,7 +298,7 @@ impl BlockLayout {
         for (i, &h) in heights.iter().enumerate() {
             let ti = i + 1;
             fen[ti] += h as f64;
-            let parent = ti + (ti & ti.wrapping_neg()); // lowbit(ti)，与查询/点更新的 `j & (!j+1)` 同构
+            let parent = ti + ti.isolate_lowest_one(); // lowbit(ti)，与查询/点更新的 `j & (!j+1)` 同构
             if parent <= n {
                 fen[parent] += fen[ti];
             }
@@ -724,14 +724,13 @@ impl Element for WyEditorElement {
         // 重钉视口顶，直到恢复目标收敛才消费锚点（对齐 `markdown/view`、`editor` 的
         // Ctrl+滚轮缩放不滚动）。`done` 前 `window.refresh()` 保证被钉的目标逐帧生效；
         // 收敛（`done`）后不再请求帧，避免空转。
-        if let Some((target, done)) = self.editor.read(cx).advance_zoom_restore() {
-            if let Some((vh, pad_y)) = self.editor.read(cx).host_scroll() {
+        if let Some((target, done)) = self.editor.read(cx).advance_zoom_restore()
+            && let Some((vh, pad_y)) = self.editor.read(cx).host_scroll() {
                 vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(target + pad_y))));
                 if !done {
                     window.refresh();
                 }
             }
-        }
 
         // 光标可视位置（元素局部）→ IME bounds。
         let frame = {

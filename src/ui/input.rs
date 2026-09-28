@@ -536,6 +536,7 @@ fn line_height() -> Pixels {
 pub struct Input;
 
 impl Input {
+    #[allow(clippy::new_ret_no_self)] // API 兼容垫片：返回的就是传入的实体，非新建
     pub fn new(state: &Entity<InputState>) -> Entity<InputState> {
         state.clone()
     }

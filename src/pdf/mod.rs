@@ -140,8 +140,7 @@ mod tests {
             }
         }
         // 纯逻辑：outline 条目字段一致性（标题非空、层级有限）
-        let entries = vec![
-            crate::pdf::PdfOutlineEntry {
+        let entries = [crate::pdf::PdfOutlineEntry {
                 title: "章节一".into(),
                 level: 0,
                 page_index: 0,
@@ -150,8 +149,7 @@ mod tests {
                 title: "子节".into(),
                 level: 1,
                 page_index: 1,
-            },
-        ];
+            }];
         assert!(entries.iter().all(|e| !e.title.trim().is_empty() && e.level <= 6));
     }
 
@@ -372,7 +370,7 @@ mod tests {
             let bgra = &res.bgra;
             let mut min_px = u8::MAX;
             let mut max_px = 0u8;
-            for px in bgra.chunks_exact(4) {
+            for px in bgra.as_chunks::<4>().0 {
                 let lum = (px[0] as u16 + px[1] as u16 + px[2] as u16) / 3;
                 if (lum as u8) < min_px { min_px = lum as u8; }
                 if (lum as u8) > max_px { max_px = lum as u8; }
@@ -414,7 +412,7 @@ mod tests {
         // 找一张内容稠密页（≥40 个可测字符），避免封面/空白页样本量不足
         let max_scan = dims.len().min(10);
         let mut chosen: Option<(usize, PageText, (f32, f32), f32)> = None;
-        for page_idx in 0..max_scan {
+        for (page_idx, &page_pt) in dims.iter().enumerate().take(max_scan) {
             let rx_text = worker.request_text(doc_id, page_idx);
             let text = rx_text
                 .recv_timeout(std::time::Duration::from_secs(30))
@@ -426,7 +424,6 @@ mod tests {
                 .filter(|c| !c.synthetic && !c.ch.is_whitespace())
                 .count();
             if usable >= 40 {
-                let page_pt = dims[page_idx];
                 let scale = layout::render_scale(display_w, 1.0, page_pt.0);
                 chosen = Some((page_idx, text, page_pt, scale));
                 break;
@@ -678,7 +675,7 @@ mod tests {
                 text.synthetic_count,
                 usable
             );
-            if best.as_ref().map_or(true, |(_, t)| {
+            if best.as_ref().is_none_or(|(_, t)| {
                 t.chars.iter()
                     .filter(|c| !c.synthetic && c.right > c.left)
                     .count()
@@ -727,7 +724,7 @@ mod tests {
         assert_eq!(spans.len(), 1, "第一行应合并为 1 矩形, 实际 {}", spans.len());
         let one = layout::page_segment_text(&text, first, line_hi);
         assert!(!one.contains('\n'), "单行复制不应有换行：{one:?}");
-        eprintln!("pdf测试.pdf 第 {} 页首行复制样本: {:?}", page_idx + 1, &one);
+        eprintln!("pdf测试.pdf 第 {} 页首行复制样本: {:?}", page_idx + 1, one);
 
         // 跨到第二行：复制应含 \n 边界（换行启发式触发）
         let second = text.chars[first..]
@@ -1524,7 +1521,7 @@ mod tests {
                 let pw = v.page_width();
                 let off_y = f32::from(-v.scroll.offset().y);
                 let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
-                let vis = pdf_visible_pages(&*v, pw, off_y, vh);
+                let vis = pdf_visible_pages(v, pw, off_y, vh);
                 let miss: Vec<usize> = vis
                     .iter()
                     .copied()
@@ -1654,7 +1651,7 @@ mod tests {
                 let off_y = f32::from(-v.scroll.offset().y);
                 let pw = v.page_width();
                 let vh = f32::from(v.scroll.bounds().size.height).max(1.0);
-                let vis = pdf_visible_pages(&*v, pw, off_y, vh);
+                let vis = pdf_visible_pages(v, pw, off_y, vh);
                 let vis_sharp = !vis.is_empty()
                     && vis.iter().all(|&p| {
                         let slot = &v.slots[p];

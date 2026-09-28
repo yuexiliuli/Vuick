@@ -129,7 +129,7 @@ fn no_hscroll_when_content_fits(cx: &mut TestAppContext) {
     let short = "短文本\n第二行\n结束";
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
-        md.update(cx, |md, cx| md.set_source(&short, cx));
+        md.update(cx, |md, cx| md.set_source(short, cx));
     });
     cx.simulate_resize(size(px(300.), px(400.)));
     settle(cx);
@@ -355,7 +355,7 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
         let md = md.read(cx);
         assert!(md.win_lo > 0, "窗口应已移离顶部 win_lo={}", md.win_lo);
         let hl = md.code_hl.clone();
-        assert!(hl.len() > 0, "窗口内应有代码高亮");
+        assert!(!hl.is_empty(), "窗口内应有代码高亮");
         let code_keys: Vec<usize> = (0..md.win_rows.len())
             .filter(|&j| md.win_rows[j].kind == RowKind::Code)
             .map(|j| md.win_lo + j)
@@ -758,7 +758,7 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             .filter(|r| r.kind == RowKind::Image)
             .map(|r| {
                 let i = r.image();
-                (i.map_or(None, |i| i.img_w), i.map_or(None, |i| i.img_h))
+                (i.and_then(|i| i.img_w), i.and_then(|i| i.img_h))
             })
             .collect::<Vec<_>>()
     });
@@ -911,8 +911,8 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
         let r = img_rows[0];
         let i = r.image();
         (
-            i.map_or(false, |i| i.img_data.is_some()),
-            i.map_or(false, |i| i.img_w.is_some() && i.img_h.is_some()),
+            i.is_some_and(|i| i.img_data.is_some()),
+            i.is_some_and(|i| i.img_w.is_some() && i.img_h.is_some()),
         )
     });
     assert!(has_data, "EPUB 内存图片应挂到图片行(img_data)");
@@ -1707,7 +1707,7 @@ fn search_jump_highlight_appears_and_clears(cx: &mut TestAppContext) {
 #[gpui::test]
 fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
     cx.update(crate::actions::bind_local_keymaps);
-    let mut md = cx.update(|cx| MarkdownPreview::new(cx));
+    let mut md = cx.update(MarkdownPreview::new);
     let mut src = String::new();
     // 多种行型混合 + 一个大代码块：若平均行高漏算代码块，量程会严重偏小
     src.push_str("```rs\n");
@@ -1749,7 +1749,7 @@ fn uniform_hint_seeds_full_scroll_range(cx: &mut TestAppContext) {
 #[gpui::test]
 fn hint_reapply_throttle_on_rapid_width_change(cx: &mut TestAppContext) {
     cx.update(crate::actions::bind_local_keymaps);
-    let mut md = cx.update(|cx| MarkdownPreview::new(cx));
+    let mut md = cx.update(MarkdownPreview::new);
     // 换行（wrap）文档：不同视口宽 → 折行数不同 → 平均行高不同 → 每次换宽都要重建提示
     let mut src = String::new();
     for i in 0..1200 {
@@ -1858,7 +1858,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.win_lo,
             md.win_rows.len(),
             md.memory_estimate(),
-            md.row_for_line(src.lines().count() / 2).map(|i| i),
+            md.row_for_line(src.lines().count() / 2),
             md.toc.len(),
         )
     });
@@ -1993,7 +1993,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     fn epub_note_hover_shows_annotation_card(cx: &mut TestAppContext) {
         use crate::markdown::parse::RowAlign;
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2008,7 +2008,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(700.), px(500.)));
-        settle(&mut cx);
+        settle(cx);
 
         // 行数据语义：标题含注记 [1]；正文首行缩进「　　」且含 [2]；落款右对齐。
         let (heading_ok, body_ok, sig_align) = cx.update(|_, cx| {
@@ -2050,14 +2050,14 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
 
         // 鼠标悬停到注记 → 悬浮注记命中置位 + 卡片出现。
         cx.simulate_mouse_move(point(px(c.x.as_f32()), px(c.y.as_f32())), None, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let hover = cx.update(|_, cx| host.read(cx).md.read(cx).hover_hit.map(|h| h.n));
         assert_eq!(hover, Some(n), "悬停在注记 {n} 上应置 hover_hit");
         assert!(cx.debug_bounds("md-note-card").is_some(), "悬浮注释卡片应出现");
 
         // 移开注记 → 卡片消失。
         cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let hover = cx.update(|_, cx| host.read(cx).md.read(cx).hover_hit.map(|h| h.n));
         assert_eq!(hover, None, "移开注记应清除 hover");
     }
@@ -2066,7 +2066,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     #[gpui::test]
     fn click_citation_marker_navigates_both_ways(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2078,7 +2078,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(600.), px(400.)));
-        settle(&mut cx);
+        settle(cx);
 
         // 行结构：0=标题([^1]),1=空行,2=正文([^1]),3=空行,4=定义[!1]。
         let (ref1_row, def1_row) = cx.update(|_, cx| {
@@ -2111,7 +2111,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
                 .center()
         });
         cx.simulate_mouse_down(ref1_center, MouseButton::Left, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let (hl, sel, def_hit) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
             let def_hit = md
@@ -2140,7 +2140,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
                 .center()
         });
         cx.simulate_mouse_down(def1_center, MouseButton::Left, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let hl = cx.update(|_, cx| host.read(cx).md.read(cx).marker_hl);
         assert_eq!(hl, Some((ref1_row, 1, false)), "点定义应跳回文内引用并加亮引用标记");
     }
@@ -2150,7 +2150,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     #[gpui::test]
     fn hover_citation_marker_shows_detail_text_without_epub(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2161,7 +2161,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(600.), px(400.)));
-        settle(&mut cx);
+        settle(cx);
 
         // 悬浮文内引用 [1]（标题行）→ 详情卡片浮现。
         let c = cx.update(|_, cx| {
@@ -2177,7 +2177,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
                 .center()
         });
         cx.simulate_mouse_move(c, None, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let (hover, detail) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
             (
@@ -2198,7 +2198,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
 
         // 移开 → 卡片消失。
         cx.simulate_mouse_move(point(px(10.), px(10.)), None, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let hover = cx.update(|_, cx| host.read(cx).md.read(cx).hover_hit.map(|h| h.n));
         assert_eq!(hover, None, "移开应清除悬浮");
         assert!(
@@ -2212,7 +2212,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     #[gpui::test]
     fn consecutive_quotes_render_as_one_band(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2223,7 +2223,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(700.), px(500.)));
-        settle(&mut cx);
+        settle(cx);
 
         let (kinds, tops, heights) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
@@ -2256,7 +2256,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
     #[gpui::test]
     fn mouse_drag_selects_text_and_copies(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2267,7 +2267,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(700.), px(500.)));
-        settle(&mut cx);
+        settle(cx);
 
         // 找两个正文段的行框（0=标题,2=第一段,4=第二段），在其行框内按下并拖到第二段。
         let (b0, b2) = cx.update(|_, cx| {
@@ -2282,7 +2282,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         cx.simulate_mouse_down(p0, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_move(p2, Some(MouseButton::Left), Modifiers::default());
         cx.simulate_mouse_up(p2, MouseButton::Left, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
 
         let (sel, text) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
@@ -2317,7 +2317,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             MouseButton::Left,
             Modifiers::default(),
         );
-        settle(&mut cx);
+        settle(cx);
         let sel = cx.update(|_, cx| host.read(cx).md.read(cx).selection);
         assert_eq!(sel, None, "点空白应清除选择");
     }
@@ -2328,7 +2328,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         // 用该区间喂 StyledText → shaping 时 run 边界非字符边界 → direct_write
         // panic（byte index not a char boundary）。修复：`char_align_range` 吸收。
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2339,7 +2339,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(700.), px(500.)));
-        settle(&mut cx);
+        settle(cx);
         // 注入选区：终点 19 落在 `。`（字节 18..21）中间——旧代码渲染即崩。
         let mid = "你说得对，好。".find('。').unwrap() + 1;
         assert_eq!(mid, 19, "句号起于 18，切半偏移 19");
@@ -2353,7 +2353,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             });
         });
         // 渲染带该选区高亮的行 + 复制：均不 panic 即修复生效。
-        settle(&mut cx);
+        settle(cx);
         let text = cx.update(|_, cx| host.read(cx).md.read(cx).selected_text());
         assert_eq!(
             text.as_deref(),
@@ -2368,7 +2368,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         // 移进 RoundedInlineText（st=None），不写文本命中表 → hit_test 找不到该行，
         // 选区建立不了。现统一 TextTrack 始终持有 st，两类行一致可点选。
         cx.update(crate::actions::bind_local_keymaps);
-        let (host, mut cx) = cx.add_window_view(|_window, cx| {
+        let (host, cx) = cx.add_window_view(|_window, cx| {
             let md = cx.new(|cx| MarkdownPreview::new(cx));
             PreviewHost { md }
         });
@@ -2379,7 +2379,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
             md.set_source(src, cx);
         });
         cx.simulate_resize(size(px(700.), px(500.)));
-        settle(&mut cx);
+        settle(cx);
         let (b1, b2) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
             (
@@ -2393,7 +2393,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         cx.simulate_mouse_down(p0, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_move(p2, Some(MouseButton::Left), Modifiers::default());
         cx.simulate_mouse_up(p2, MouseButton::Left, Modifiers::default());
-        settle(&mut cx);
+        settle(cx);
         let sel = cx.update(|_, cx| host.read(cx).md.read(cx).selection);
         let sel = sel.expect("含行内代码的行应可拖选");
         assert_eq!(sel.0 .0, 2, "选择应从含代码段开始（实际 {sel:?}）");

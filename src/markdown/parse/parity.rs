@@ -690,7 +690,7 @@ fn doc_utf16_index_matches_full_recompute() {
                 "UTF-16 行索引与行表应同形"
             );
             assert_eq!(d.total_utf16(), s.encode_utf16().count(), "total_utf16 不一致");
-            if d.line_starts().len() > 0 {
+            if !d.line_starts().is_empty() {
                 assert_eq!(
                     d.line_utf16_starts()[0],
                     0,

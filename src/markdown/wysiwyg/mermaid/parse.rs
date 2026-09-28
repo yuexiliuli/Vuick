@@ -125,8 +125,8 @@ fn mm_node(s: &str) -> (String, Option<String>, MmShape) {
         }
     }
     // 不对称旗形 `> … ]`。
-    if let Some(oi) = s.find('>') {
-        if oi > 0 {
+    if let Some(oi) = s.find('>')
+        && oi > 0 {
             let id = s[..oi].trim().to_string();
             let rest = &s[oi + 1..];
             return match rest.find(']') {
@@ -134,7 +134,6 @@ fn mm_node(s: &str) -> (String, Option<String>, MmShape) {
                 None => (id, None, MmShape::Asymmetric),
             };
         }
-    }
     // 菱形 `{ … }`。
     if let Some(oi) = s.find('{') {
         let id = s[..oi].trim().to_string();
@@ -243,11 +242,10 @@ const EDGE_SPECS: &[(&str, &str, MmEdgeKind)] = &[
 fn earliest_op(s: &str) -> Option<(usize, &'static str, &'static str, MmEdgeKind)> {
     let mut best: Option<(usize, &'static str, &'static str, MmEdgeKind)> = None;
     for (end, start, kind) in EDGE_SPECS {
-        if let Some(i) = s.find(end) {
-            if best.map_or(true, |(bi, _, _, _)| i < bi) {
+        if let Some(i) = s.find(end)
+            && best.is_none_or(|(bi, _, _, _)| i < bi) {
                 best = Some((i, end, start, *kind));
             }
-        }
     }
     best
 }
@@ -316,11 +314,10 @@ fn register_node(
         nodes.push(MmNode { id: id.to_string(), label, shape: shp });
     }
     for &si in open_sub {
-        if let Some(sg) = subgraphs.get_mut(si) {
-            if !sg.nodes.iter().any(|x| x == id) {
+        if let Some(sg) = subgraphs.get_mut(si)
+            && !sg.nodes.iter().any(|x| x == id) {
                 sg.nodes.push(id.to_string());
             }
-        }
     }
 }
 
@@ -339,11 +336,7 @@ fn parse_single_chain(
     }
     let mut first_from: Option<String> = None;
     let mut prev: Option<(String, Option<String>, MmShape)> = None;
-    loop {
-        let (i, end, start, kind) = match earliest_op(s) {
-            Some(x) => x,
-            None => break,
-        };
+    while let Some((i, end, start, kind)) = earliest_op(s) {
         if i == 0 {
             // 链式续接：上一 to 节点作为本段 from。
             let p = match prev.take() {
@@ -352,12 +345,11 @@ fn parse_single_chain(
             };
             let mut rhs_raw = &s[end.len()..];
             let mut pipe = None;
-            if let Some(r) = rhs_raw.strip_prefix('|') {
-                if let Some(cj) = r.find('|') {
+            if let Some(r) = rhs_raw.strip_prefix('|')
+                && let Some(cj) = r.find('|') {
                     pipe = Some(r[..cj].trim().to_string());
                     rhs_raw = &r[cj + 1..];
                 }
-            }
             let (to_part, rest) = split_to_node(rhs_raw);
             let b = mm_node(to_part);
             if b.0.is_empty() {
@@ -384,12 +376,11 @@ fn parse_single_chain(
             break;
         }
         let mut pipe = None;
-        if let Some(r) = rhs_raw.strip_prefix('|') {
-            if let Some(cj) = r.find('|') {
+        if let Some(r) = rhs_raw.strip_prefix('|')
+            && let Some(cj) = r.find('|') {
                 pipe = Some(r[..cj].trim().to_string());
                 rhs_raw = &r[cj + 1..];
             }
-        }
         let (to_part, rest) = split_to_node(rhs_raw);
         let a = mm_node(lhs);
         let b = mm_node(to_part);
@@ -562,11 +553,10 @@ pub(crate) fn mermaid_graph(source: &str) -> MmGraph {
     for n in &nodes {
         let mut st = MmStyle::default();
         for (ids, cls) in &class_assign {
-            if ids.iter().any(|x| x == &n.id) {
-                if let Some(c) = class_defs.get(cls) {
+            if ids.iter().any(|x| x == &n.id)
+                && let Some(c) = class_defs.get(cls) {
                     st = *c;
                 }
-            }
         }
         if let Some(ov) = node_style.get(&n.id) {
             st.merge(*ov);
@@ -717,15 +707,14 @@ pub(crate) fn mermaid_seq(source: &str) -> MmSeq {
             open_fragment(&mut fragments, &mut frag_stack, &mut rows, MmSeqFragmentKind::Par, rest.trim());
             continue;
         }
-        if t.starts_with("else") {
-            if let Some(&fi) = frag_stack.last() {
-                if let Some(f) = fragments.get_mut(fi) {
-                    let title = t[4..].trim().to_string();
-                    let title = if title.is_empty() { None } else { Some(title) };
+        if let Some(stripped) = t.strip_prefix("else") {
+            if let Some(&fi) = frag_stack.last()
+                && let Some(f) = fragments.get_mut(fi) {
+                    let title = stripped.trim();
+                    let title = if title.is_empty() { None } else { Some(title.to_string()) };
                     f.else_titles.push(title.clone());
                     rows.push(MmSeqRow::FragElse(title));
                 }
-            }
             continue;
         }
         if t == "end" {

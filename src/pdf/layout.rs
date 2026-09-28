@@ -593,7 +593,7 @@ mod tests {
         let (s, e) = keep_window(&dims, 840.0, scroll_y, 600.0);
         // 第 10 页应可见，区间含 MARGIN 缓冲且不越界
         assert!(s <= 10 && 10 <= e, "第 10 页应在可见区间 [{s},{e}]");
-        assert!(e - s + 1 >= 2 * MARGIN + 1, "区间宽度应至少为可见页 + 2*MARGIN");
+        assert!(e - s + 1 > 2 * MARGIN, "区间宽度应至少为可见页 + 2*MARGIN");
         assert!(e <= 29, "末页不越界");
     }
 
@@ -993,9 +993,9 @@ mod tests {
         let t0 = Instant::now();
         let mut sink = 0usize;
         for _ in 0..runs {
-            let r: Vec<bool> = rendered.iter().copied().collect();
-            let l: Vec<bool> = loading.iter().copied().collect();
-            let g: Vec<u64> = gens.iter().copied().collect();
+            let r: Vec<bool> = rendered.to_vec();
+            let l: Vec<bool> = loading.to_vec();
+            let g: Vec<u64> = gens.to_vec();
             let (tr, _ev) = plan_page_work(
                 n,
                 start,

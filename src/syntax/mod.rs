@@ -627,7 +627,7 @@ fn lookahead_is_key(line: &str, mut k: usize, vis: usize) -> bool {
 /// - `SYNTAX_SET`：`SyntaxSet::load_defaults_newlines` 反序列化几 MB 默认语法集；
 /// - `SYNTAX_CACHE`：预填常用语言 → 首个代码块不再对全集做首次 `find_syntax` 扫描；
 /// - `github_theme_cached`：明/暗两张色板各一份，首次上色不再现场构建主题。
-/// `LazyLock`/`Mutex` 并发安全：可在后台线程调用，主线程若抢先命中只会短暂阻塞。
+///   `LazyLock`/`Mutex` 并发安全：可在后台线程调用，主线程若抢先命中只会短暂阻塞。
 pub(crate) fn prewarm() {
     // 触发全局语法集加载（进程内仅一次）。
     let _ = &*SYNTAX_SET;
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn line_starts_and_byte_mapping() {
         let src = "ab\ncd\n最后一行无换行";
-        let starts = build_line_starts(&src);
+        let starts = build_line_starts(src);
         assert_eq!(starts, vec![0, 3, 6]);
         assert_eq!(parse_code_lines("rust", "fn main() {}\n").map(|r| r.len()), Some(2));
     }

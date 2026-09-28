@@ -28,7 +28,7 @@ fn common_prefix_bytes(a: &str, b: &str) -> usize {
     let n = aa.len().min(bb.len());
     let mut i = 0;
     while i + BLK <= n {
-        if &aa[i..i + BLK] != &bb[i..i + BLK] {
+        if aa[i..i + BLK] != bb[i..i + BLK] {
             break;
         }
         i += BLK;
@@ -155,8 +155,8 @@ pub fn scan_blocks_incremental(
             if (0..=old_len as i64).contains(&prev_off) {
                 let prev_off = prev_off as usize;
                 let pi = prev.blocks.partition_point(|b| (b.byte as usize) < prev_off);
-                if let Some(pb) = prev.blocks.get(pi) {
-                    if pb.byte as usize == prev_off {
+                if let Some(pb) = prev.blocks.get(pi)
+                    && pb.byte as usize == prev_off {
                         // 同字节尾部 + 块首 Normal 态 → 旧尾部块逐字有效，行号与字节
                         // 同时平移（byte 平移 = 总字节增量 delta，源后缀整体平移）。
                         // 分段持久化：O(1) 共享 + 读取时施加 (delta, line_shift)。
@@ -164,13 +164,12 @@ pub fn scan_blocks_incremental(
                         let line_shift = idx as i64 - prev_line as i64;
                         suffix_segs = prev.blocks.shares_suffix(pi, delta, line_shift);
                         // toc 尾部：与 `scan_blocks` 一致的「源码行」坐标 → 随行号偏移
-                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r as usize >= prev_line) {
+                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
                             toc.push((( *r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
                         }
                         reused = true;
                         break;
                     }
-                }
             }
         }
 
@@ -186,13 +185,12 @@ pub fn scan_blocks_incremental(
             cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
             while idx < new_lines.len() {
                 let l = new_lines[idx].trim_end_matches('\r');
-                if let Some((c, _)) = fence_len(l.trim_start()) {
-                    if c == fc {
+                if let Some((c, _)) = fence_len(l.trim_start())
+                    && c == fc {
                         idx += 1;
                         cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
                         break;
                     }
-                }
                 code_lines += 1;
                 idx += 1;
                 cur_byte = next_line_byte(&new_lines, cur_byte, idx - 1, new_len);
@@ -315,7 +313,7 @@ pub fn scan_blocks_incremental(
     }
 }
 #[cfg(test)]
-mod tests {
+mod dt {
     use super::*;
 
     #[test]
@@ -568,7 +566,7 @@ mod tests {
             assert_eq!(idx.toc.len(), rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_))).count());
             for ((li, lv, tx), r) in idx.toc.iter().zip(rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_)))) {
                 assert_eq!(*li, r.src_line);
-                assert_eq!(*lv as u8, match r.kind { RowKind::Heading(n) => n, _ => 0 });
+                assert_eq!(*lv, match r.kind { RowKind::Heading(n) => n, _ => 0 });
                 assert_eq!(tx.as_str(), r.text.as_ref());
             }
 
@@ -576,7 +574,7 @@ mod tests {
             let n = idx.blocks.len();
             assert!(n > 0);
             for (lo, hi) in [
-                (0, (5.min(n) + 0) as usize),
+                (0, 5.min(n)),
                 (n / 2 - 2, n / 2 + 3),
                 (n.saturating_sub(6), n - 1),
             ] {
@@ -884,9 +882,9 @@ mod tests {
         let mut frame1 = base.clone();
         let mut frame2 = base.clone();
         let a = frame1.find("fn f").unwrap() + 4;
-        frame1.insert_str(a, "g");
+        frame1.insert(a, 'g');
         let a = frame2.find("fn f").unwrap() + 4;
-        frame2.insert_str(a, "g");
+        frame2.insert(a, 'g');
         frame2.insert_str(frame2.find("结尾").unwrap(), "XYZ");
         run("两帧累积", frame1, frame2);
 
@@ -903,7 +901,7 @@ mod tests {
         run("中部删字", base.clone(), { let mut v = base.clone(); v.remove(v.find("结尾").unwrap()); v });
         run("中部插字", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "XYZ"); v });
         run("插整段", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n\n新段落\n"); v });
-        run("拆行", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n"); v });
+        run("拆行", base.clone(), { let mut v = base.clone(); v.insert(v.find("结尾").unwrap(), '\n'); v });
         run("合并行", base.clone(), { let mut v = base.clone(); let at = v.rfind('\n').unwrap(); v.remove(at); v });
         run("表头改", base.clone(), { let mut v = base.clone(); let at = v.find("| a ").unwrap(); v.replace_range(at..at + 4, "| ah"); v });
         run("围栏内改", base.clone(), { let mut v = base.clone(); v.replace_range(v.find("fn f").unwrap() + 4..v.find("fn f").unwrap() + 7, "g()"); v });
@@ -957,9 +955,9 @@ mod tests {
         let mut frame1 = base.clone();
         let mut frame2 = base.clone();
         let a = frame1.find("fn f").unwrap() + 4;
-        frame1.insert_str(a, "g");
+        frame1.insert(a, 'g');
         let a = frame2.find("fn f").unwrap() + 4;
-        frame2.insert_str(a, "g");
+        frame2.insert(a, 'g');
         frame2.insert_str(frame2.find("结尾").unwrap(), "XYZ");
         run("两帧累积", frame1, frame2);
 
@@ -976,7 +974,7 @@ mod tests {
         run("中部删字", base.clone(), { let mut v = base.clone(); v.remove(v.find("结尾").unwrap()); v });
         run("中部插字", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "XYZ"); v });
         run("插整段", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n\n新段落\n"); v });
-        run("拆行", base.clone(), { let mut v = base.clone(); v.insert_str(v.find("结尾").unwrap(), "\n"); v });
+        run("拆行", base.clone(), { let mut v = base.clone(); v.insert(v.find("结尾").unwrap(), '\n'); v });
         run("合并行", base.clone(), { let mut v = base.clone(); let at = v.rfind('\n').unwrap(); v.remove(at); v });
         run("表头改", base.clone(), { let mut v = base.clone(); let at = v.find("| a ").unwrap(); v.replace_range(at..at + 4, "| ah"); v });
         run("围栏内改", base.clone(), { let mut v = base.clone(); v.replace_range(v.find("fn f").unwrap() + 4..v.find("fn f").unwrap() + 7, "g()"); v });
@@ -1377,7 +1375,7 @@ mod tests {
         let (r, n) = &rows[1].note_defs[0];
         assert_eq!(*n, 2);
         assert_eq!(&rows[1].text[r.clone()], "[2]");
-        assert_eq!(rows[1].text.starts_with("[2]"), true);
+        assert!(rows[1].text.starts_with("[2]"));
         assert_eq!(rows[2].note_defs[0].1, 33);
     }
 
@@ -1408,7 +1406,7 @@ mod tests {
         // （字节区间：「标题」=6B → [1] 在 [6..9)；「正文」=6B → [2] 在 [6..9)。）
         assert_eq!(idx.refs.get(&1), Some(&(0, 6..9)), "文内 [1] 在第 0 块");
         assert_eq!(idx.refs.get(&2), Some(&(2, 6..9)), "文内 [2] 在第 2 块");
-        assert_eq!(idx.refs.contains_key(&9), false, "代码块里的 [^9] 不是引用");
+        assert!(!idx.refs.contains_key(&9), "代码块里的 [^9] 不是引用");
         assert_eq!(idx.defs.get(&1), Some(&(6, 0..3)), "定义 [1] 在第 6 块");
         assert_eq!(idx.defs.get(&2), Some(&(7, 0..3)), "定义 [2] 在第 7 块");
         assert_eq!(idx.details.get(&1).map(|s| s.as_ref()), Some("定1。"));
