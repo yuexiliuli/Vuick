@@ -258,10 +258,17 @@ mod tests {
         (text, hist, mx_chars)
     }
 
+    /// 进程内并发测试的唯一后缀：同一 pid 且落在同一 Windows 100ns 时钟 tick 内的两次
+    /// `SystemTime::now()` 会返回相同 nanos → 文件名相同 → 后写覆盖前读（跨测试污染，
+    /// 见 `chunks_reassemble_to_normalized_text` 曾读到别家内容）。用原子计数器保证每次
+    /// 调用唯一；跨进程仍由 pid 区分。
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn with_temp(content: &str, f: impl FnOnce(&std::path::Path)) {
         let dir = std::env::temp_dir().join(format!(
-            "gpui-progress-{}-{}.txt",
+            "gpui-progress-{}-{}-{}.txt",
             std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
