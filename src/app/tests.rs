@@ -1,6 +1,7 @@
 //! 单元测试（自 mod.rs 拆出，仅测试编译）。
 
     use super::*;
+    use crate::actions::{Paste, Redo, SelectAll, Undo};
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
@@ -86,7 +87,7 @@
 
         // 粘贴：写入剪贴板后 Ctrl+V 应把内容插入（这是历史上出现“整行消失”的路径）
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("world".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         for _ in 0..3 {
             cx.run_until_parked();
         }
@@ -97,7 +98,7 @@
         );
 
         // 撤销：应撤销粘贴 → 回到插入前（set_value 不进撤销栈，撤销对象是粘贴）
-        cx.dispatch_action(gpui_component::input::Undo);
+        cx.dispatch_action(Undo);
         for _ in 0..3 {
             cx.run_until_parked();
         }
@@ -108,7 +109,7 @@
         );
 
         // 重做：应恢复粘贴
-        cx.dispatch_action(gpui_component::input::Redo);
+        cx.dispatch_action(Redo);
         for _ in 0..3 {
             cx.run_until_parked();
         }
@@ -119,7 +120,7 @@
         );
 
         // 全选：Ctrl+A 应选中全部内容
-        cx.dispatch_action(gpui_component::input::SelectAll);
+        cx.dispatch_action(SelectAll);
         for _ in 0..3 {
             cx.run_until_parked();
         }
@@ -156,7 +157,7 @@
         // 连续粘贴多次（历史上的触发路径）
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
+            cx.dispatch_action(Paste);
             cx.run_until_parked();
         }
         for _ in 0..3 {
@@ -194,7 +195,7 @@
         let chunk_line = "use std::sync::Arc;\n";
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(chunk_line.to_string()));
         for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
+            cx.dispatch_action(Paste);
             cx.run_until_parked();
         }
         for _ in 0..3 {
@@ -296,7 +297,7 @@
         let expected = chunk.len() * 5;
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(chunk));
         for _ in 0..5 {
-            cx.dispatch_action(gpui_component::input::Paste);
+            cx.dispatch_action(Paste);
             cx.run_until_parked();
         }
         for _ in 0..3 {
@@ -315,7 +316,7 @@
         let line = "use std::sync::Arc;\n";
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(line.to_string()));
         for _ in 0..4 {
-            cx.dispatch_action(gpui_component::input::Paste);
+            cx.dispatch_action(Paste);
             cx.run_until_parked();
         }
         for _ in 0..3 {
@@ -1883,7 +1884,7 @@
             window.focus(&focus, cx);
         });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("新增段落".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         // 同步在后台扫描、尽可能多地驱动到完成
         for _ in 0..30 {
             cx.run_until_parked();
@@ -1926,14 +1927,14 @@
         });
         // 第一次编辑 → 250ms（第一轮计时到点，开始后台扫描）
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("B".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         cx.executor().advance_clock(std::time::Duration::from_millis(250));
         for _ in 0..10 {
             cx.run_until_parked();
         }
         // 第二次编辑 → 再 250ms（第二轮接管），最终预览应含 B、C 且不为旧内容覆盖
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("C".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         for _ in 0..2 {
             cx.run_until_parked();
         }
@@ -1990,14 +1991,14 @@
             window.focus(&focus, cx);
         });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("第三行".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         for _ in 0..5 {
             cx.run_until_parked();
         }
         assert_counts(cx, &app, "粘贴编辑后");
         // 再粘贴带换行的内容，行数应增加且仍与 str 语义一致
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("A\nB".to_string()));
-        cx.dispatch_action(gpui_component::input::Paste);
+        cx.dispatch_action(Paste);
         for _ in 0..5 {
             cx.run_until_parked();
         }

@@ -11,7 +11,7 @@ use gpui::{
     Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
     StyledText, Window, prelude::FluentBuilder as _,
 };
-use gpui_component::input::{
+use crate::actions::{
     Backspace, Copy, Cut, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, Enter,
     IndentInline, MoveDown, MoveEnd, MoveHome, MoveLeft, MovePageDown, MovePageUp, MoveRight,
     MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, MoveUp, OutdentInline, Paste,
@@ -422,8 +422,8 @@ impl CodeEditor {
     }
 }
 
-/// 把键盘/鼠标/输入 action 挂到核心元素上（keymap 由 gpui_component::init 在
-/// "Input" 上下文绑定，与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler）。
+/// 把键盘/鼠标/输入 action 挂到核心元素上（keymap 由 `crate::actions::bind_input_keys`
+/// 在 "Input" 上下文绑定，与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler）。
 fn attach_input_actions(
     core: gpui::Stateful<gpui::Div>,
     entity: &Entity<CodeEditor>,
@@ -434,7 +434,7 @@ fn attach_input_actions(
         .on_mouse_down(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_down))
         .on_mouse_move(window.listener_for(entity, CodeEditor::on_mouse_move))
         .on_mouse_up(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_up))
-        // —— 输入 action（keymap 由 gpui_component::init 在 "Input" 上下文绑定，
+        // —— 输入 action（keymap 由 crate::actions::bind_input_keys 在 "Input" 上下文绑定，
         // 与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler ——
         .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveLeft, _w, cx| {
             ed.arrow(false, -1, 0, cx);

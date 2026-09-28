@@ -807,6 +807,7 @@ impl Render for Host {
 
 fn open<'a>(cx: &'a mut TestAppContext, text: &str) -> (Entity<Host>, &'a mut VisualTestContext) {
     cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_input_keys);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let ed = cx.new(|cx| CodeEditor::new(cx));
         ed.update(cx, |ed, _| ed.set_text(text));
@@ -2007,6 +2008,7 @@ fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
     // 修复：`new()` 直接以固定窗口 `LIST_WINDOW_ROWS` 初始化。
     use crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS as WINDOW;
     cx.update(gpui_component::init);
+    cx.update(crate::actions::bind_input_keys);
     let (host, cx) = cx.add_window_view(|_window, cx| {
         let ed = cx.new(|cx| CodeEditor::new(cx));
         Host { ed }

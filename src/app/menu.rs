@@ -1,6 +1,7 @@
 //! menu：顶部菜单栏 + 下拉菜单（gpui_component DropdownMenu / PopupMenu）。
 
 use super::*;
+use crate::actions::{Copy, Cut, Redo, SelectAll, Undo};
 use crate::ui::button::{Button, ButtonVariants as _};
 use crate::ui::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 
@@ -73,7 +74,7 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
+                window.dispatch_action(Box::new(Undo), cx);
             },
         ))
         .item(Self::menu_action_item(
@@ -82,7 +83,7 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::Redo), cx);
+                window.dispatch_action(Box::new(Redo), cx);
             },
         ))
         .separator()
@@ -92,7 +93,7 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::Cut), cx);
+                window.dispatch_action(Box::new(Cut), cx);
             },
         ))
         .item(Self::menu_action_item(
@@ -101,7 +102,7 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::Copy), cx);
+                window.dispatch_action(Box::new(Copy), cx);
             },
         ))
         .item(Self::menu_action_item(
@@ -117,7 +118,7 @@ impl EditorApp {
             weak,
             |this, window, cx| {
                 Self::focus_active_editor(this, window, cx);
-                window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+                window.dispatch_action(Box::new(SelectAll), cx);
             },
         ))
     }

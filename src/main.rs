@@ -58,6 +58,9 @@ fn main() {
             // （`Theme::set` 双轨：写入 ui::theme 的同时驱动组件主题，Wallpaper 一致）。
             gpui_component::init(cx);
             crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx);
+            // 自绑编辑区输入快捷键（本地 action 替换组件库 Input keymap；顺序要求见
+            // bind_input_keys 文档：在 gpui_component::init 之后、PasteNormalized 之前）。
+            crate::actions::bind_input_keys(cx);
             // 「预览编辑测试」（本项目 Doc 管线 WYSIWYG）快捷键（作用域 wy-editor）。
             crate::markdown::wysiwyg::bind_keys(cx);
             // 编辑器代码高亮配色：GitHub Light（启动即安装，切换主题时 toggle_theme 会重装）
