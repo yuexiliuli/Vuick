@@ -4433,6 +4433,9 @@
             return;
         }
         init_test(cx);
+        // 对齐生产：启动后台预热语法集/缓存（否则首次各语言代码块冷扫 ~200-250ms，
+        // 会污染「稳态滚动/编辑」测量——生产里 prewarm 在 main.rs 后台线程早已完成）。
+        crate::syntax::prewarm();
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(1200.), px(800.)));
         for _ in 0..3 {

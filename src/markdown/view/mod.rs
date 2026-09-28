@@ -49,8 +49,9 @@ use ropey::Rope;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 
 use crate::config::limits::{
-    CODE_HL_LRU_CAP, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_FACTOR,
-    WINDOWED_OVERDRAW_MAX,
+    CODE_HL_DEFER_BLOCKS, CODE_HL_DEFER_BYTES, CODE_HL_LRU_CAP, CODE_HL_PARSE_BLOCKS_PER_FRAME,
+    CODE_HL_PARSE_BYTES_PER_FRAME, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS,
+    WINDOWED_OVERDRAW_FACTOR, WINDOWED_OVERDRAW_MAX,
 };
 use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
 use crate::config::timing::HIGHLIGHT_MS;
@@ -107,6 +108,9 @@ pub(crate) struct TextHit {
 pub(crate) struct TextCtx {
     pub(crate) hits: Rc<RefCell<Vec<TextHit>>>,
 }
+
+/// 延后分片解析的一批代码块现场：`(源码代, 待解析队列)`，队列项 `(全局块下标, 语言, 代码快照)`。
+type PendingCodeHl = (u64, std::collections::VecDeque<(usize, String, String)>);
 
 /// 窗口模式代码块语法高亮的小型 LRU：键 = **全局块下标** → `Rc<CodeLineRuns>`。
 ///
@@ -353,6 +357,12 @@ pub struct MarkdownPreview {
     /// 重建后，据此把缩放前视口顶部的内容点放回原位（同 PDF 视口锚定）。
     /// `None` = 无待恢复的锚点；由字号变化捕获、render 重建模型后消费。
     zoom_anchor: Option<(usize, f32)>,
+    /// 大跳转的**延后分片解析**现场：触发时源码代 + 待解析代码块队列
+    /// `(全局块下标, 语言, 代码文本快照)`。建房时新进代码块文本累计超
+    /// [`CODE_HL_DEFER_BYTES`] 则入队、本帧先纯文本/继承上色；后续帧由
+    /// `dispatch_pending_code_hl` 按字节预算逐批解析并入 `code_hl`/LRU（见
+    /// [`CODE_HL_PARSE_BYTES_PER_FRAME`]）。源码代不符（编辑/换源）即作废。
+    pending_code_hl: Option<PendingCodeHl>,
 }
 
 impl MarkdownPreview {
@@ -405,6 +415,7 @@ impl MarkdownPreview {
             height_pref: Vec::new(),
             height_stride: 1,
             zoom_anchor: None,
+            pending_code_hl: None,
         }
     }
 
@@ -916,6 +927,7 @@ impl MarkdownPreview {
         self.marker_hl_seq = self.marker_hl_seq.wrapping_add(1);
         self.cit_gen = self.cit_gen.wrapping_add(1);
         self.code_hl_cache.clear();
+        self.pending_code_hl = None;
         self.clear_note_state();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
@@ -1280,6 +1292,10 @@ impl MarkdownPreview {
             return;
         }
         let _t = crate::prof::begin();
+        // 首建判定：进入时窗口为空 = 打开/换源后的**第一次建房** → 同步全量解析
+        // （打开即有颜色）；滚动触发的重建且新进代码块过多 → 由
+        // `build_window_scroll_handles` 决定延后分片（廉价帧）。
+        let first_build = self.win_rows.is_empty();
         let margin = self.overdraw_margin.min(n / 2);
         let w_lo = want_lo.saturating_sub(margin);
         let w_hi = (want_hi + margin).min(n - 1);
@@ -1290,7 +1306,7 @@ impl MarkdownPreview {
         self.resolve_image_rows(&mut rows);
         self.win_lo = w_lo;
         self.win_rows = Rc::new(rows);
-        self.build_window_scroll_handles();
+        self.build_window_scroll_handles(first_build);
         crate::prof::end("md_ensure_window", _t);
     }
 
@@ -1298,7 +1314,11 @@ impl MarkdownPreview {
     /// 与渲染按 `ix` 查表一致）。代码块高亮不再每次都整窗重跑 syntect：先查
     /// [`CodeHlCache`]（滚动时相邻窗口大半块重叠 → 直接复用 `Rc`，O(1)），仅新进入
     /// 窗口的块才解析并写入缓存。
-    fn build_window_scroll_handles(&mut self) {
+    ///
+    /// `first_build`：打开/换源后的首次建房 → 同步全量解析（打开即有颜色）；否则若
+    /// 新进代码块文本累计超 [`CODE_HL_DEFER_BYTES`]（大跳转），延后到 `pending_code_hl`
+    /// 队列由后续帧按字节预算分片补色——本帧这些块先纯文本/继承上色，帧不卡。
+    fn build_window_scroll_handles(&mut self, first_build: bool) {
         let win_rows = self.win_rows.clone(); // 借 win_rows 的同时要 &mut self（缓存）
         let win_lo = self.win_lo;
         let win_hi = win_lo.saturating_add(win_rows.len());
@@ -1335,13 +1355,51 @@ impl MarkdownPreview {
                 window_hl.insert(*ix, runs.clone());
             }
         }
+        // 统一收口「新进代码块」：命中 LRU 直接并入；未命中记候选（语言+代码快照，
+        // 供同步解析或延后队列两用，避免为计数多串一遍块文本）。
+        let mut candid: Vec<(usize, String, String)> = Vec::new();
+        let mut candid_bytes = 0usize;
         for (j, r) in win_rows.iter().enumerate() {
             let ix = win_lo + j;
-            if window_hl.contains_key(&ix) {
+            if window_hl.contains_key(&ix) || r.kind != RowKind::Code {
                 continue;
             }
-            if let Some(runs) = self.code_hl_for_row(ix, r) {
-                window_hl.insert(ix, runs);
+            if let Some(hit) = self.code_hl_cache.get(ix) {
+                window_hl.insert(ix, hit);
+                continue;
+            }
+            let Some(lang) = r.code_language() else {
+                continue;
+            };
+            if lang.is_empty() {
+                continue;
+            }
+            let mut code = String::new();
+            for (i, l) in r.code_lines().iter().enumerate() {
+                if i > 0 {
+                    code.push('\n');
+                }
+                code.push_str(l.as_ref());
+            }
+            candid_bytes += code.len();
+            candid.push((ix, lang.to_owned(), code));
+        }
+        if !first_build
+            && !candid.is_empty()
+            && (candid.len() > CODE_HL_DEFER_BLOCKS || candid_bytes > CODE_HL_DEFER_BYTES)
+        {
+            // 大跳转：新进代码块多/大 → 本帧先不解析（块暂纯文本/继承上色），
+            // 交 `dispatch_pending_code_hl` 按字节×块数预算分片补色；源码代快照防串源。
+            let src_gen = self.cit_gen;
+            self.pending_code_hl = Some((src_gen, candid.into()));
+        } else if !candid.is_empty() {
+            // 首次建房 / 小步滚动：同步解析（现状；块级 LRU 已兜底重叠复用）。
+            for (ix, lang, code) in candid {
+                if let Some(runs) = parse_code_lines(&lang, &code) {
+                    let runs = Rc::new(runs);
+                    self.code_hl_cache.insert(ix, runs.clone());
+                    window_hl.insert(ix, runs);
+                }
             }
         }
         self.code_scroll = cs_old;
@@ -1349,28 +1407,37 @@ impl MarkdownPreview {
         self.code_hl = Rc::new(window_hl);
     }
 
-    /// 取第 `ix` 个块的代码高亮：命中 LRU 直接复用；未命中则按语言整块解析并写入缓存。
-    fn code_hl_for_row(&mut self, ix: usize, r: &Row) -> Option<Rc<CodeLineRuns>> {
-        if r.kind != RowKind::Code {
-            return None;
+    /// 延后代码块高亮的**分片补色**：每帧从队列前部取出代码块，按字节预算
+    /// （[`CODE_HL_PARSE_BYTES_PER_FRAME`]）同步解析并入 `code_hl`/LRU；预算用尽或队空
+    /// 即止，未清空则 `notify()` 预约下一帧续。源码代不符（编辑/换源）整队列作废。
+    fn dispatch_pending_code_hl(&mut self, cx: &mut Context<Self>) {
+        let Some((src_gen, mut queue)) = self.pending_code_hl.take() else {
+            return;
+        };
+        if src_gen != self.cit_gen {
+            return; // 源码已变：结果作废；换源路径已清缓存，下一次建房重新解析
         }
-        if let Some(hit) = self.code_hl_cache.get(ix) {
-            return Some(hit);
-        }
-        let lang = r.code_language()?;
-        if lang.is_empty() {
-            return None;
-        }
-        let mut code = String::new();
-        for (i, l) in r.code_lines().iter().enumerate() {
-            if i > 0 {
-                code.push('\n');
+        let mut budget = CODE_HL_PARSE_BYTES_PER_FRAME;
+        let mut budget_blocks = CODE_HL_PARSE_BLOCKS_PER_FRAME;
+        while budget > 0 && budget_blocks > 0 {
+            let Some((ix, lang, code)) = queue.pop_front() else {
+                break;
+            };
+            budget = budget.saturating_sub(code.len());
+            budget_blocks -= 1;
+            if let Some(runs) = parse_code_lines(&lang, &code) {
+                let runs = Rc::new(runs);
+                self.code_hl_cache.insert(ix, runs.clone());
+                // 只并入仍在当前窗口的块（窗口可能又移走；移走的由队列/缓存兜底）。
+                if ix >= self.win_lo && ix - self.win_lo < self.win_rows.len() {
+                    Rc::make_mut(&mut self.code_hl).insert(ix, runs);
+                }
             }
-            code.push_str(l.as_ref());
         }
-        let runs = Rc::new(parse_code_lines(lang, &code)?);
-        self.code_hl_cache.insert(ix, runs.clone());
-        Some(runs)
+        if !queue.is_empty() {
+            self.pending_code_hl = Some((src_gen, queue));
+        }
+        cx.notify();
     }
 
     /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
@@ -1825,6 +1892,9 @@ impl MarkdownPreview {
             let need_lo = lo_vis.saturating_sub(self.overdraw_margin);
             let need_hi = lo_vis.saturating_add(vis_n).min(last);
             let _t_ensure = crate::prof::begin();
+            // 先派发**上一帧**延后的代码块队列（本帧建房可能再产生新的延后，留到下帧
+            // 补色——保证「大跳转」所在的输入/滚动帧不因 syntect 解析而停驻）。
+            self.dispatch_pending_code_hl(cx);
             self.ensure_window(need_lo, need_hi);
             // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
             // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。

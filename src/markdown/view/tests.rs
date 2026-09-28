@@ -345,10 +345,27 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
         cx.run_until_parked();
         let _ = cx.cx.refresh();
     }
-    for _ in 0..3 {
+    // 滚动结束：大跳转的新进代码块走延后分片补色，泵渲染直到窗口内带语言代码块全部
+    // 上色（有界；延后是本设计语义，不是丢色——见 `windowed_code_highlight_defers_*`）。
+    let mut guard = 0;
+    loop {
+        let done = cx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            let md = md.read(cx);
+            (0..md.win_rows.len()).all(|j| {
+                md.win_rows[j].kind != RowKind::Code
+                    || md.win_rows[j].code_language().is_none()
+                    || md.code_hl.get(&(md.win_lo + j)).is_some()
+            })
+        });
+        if done || guard > 32 {
+            break;
+        }
         cx.run_until_parked();
         let _ = cx.cx.refresh();
+        guard += 1;
     }
+    assert!(guard <= 32, "延后补色 32 帧内未收敛");
 
     let win_lo = cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
@@ -372,6 +389,103 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
         md.win_lo
     });
     assert!(win_lo > 0);
+}
+
+/// 回归：大跳转重建时新进代码块（文本超 [`CODE_HL_DEFER_BYTES`]）走「延后分片补色」
+/// ——建房当帧该块暂不入 `code_hl`（大跳转/滚动帧不因 syntect 停驻，廉价帧），随后
+/// 帧由 `dispatch_pending_code_hl` 按字节预算并入；最终窗口内所有代码块都有高亮。
+#[gpui::test]
+fn windowed_code_highlight_defers_big_jump_then_converges(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    // 窗口级大文档：前部小代码块（首次建房同步），尾部一个远超延后阈值的大代码块。
+    let mut src = String::new();
+    for _ in 0..2000 {
+        src.push_str("```rust\nfn f() { let s = \"x\"; }\n```\n\n正文段\n\n");
+    }
+    src.push_str("```rust\n");
+    for _ in 0..1200 {
+        src.push_str("let v = 0123456789abcdef;\n");
+    }
+    src.push_str("```\n\n");
+    let index = std::rc::Rc::new(crate::markdown::scan_blocks(&src));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(
+                PreviewSrc::from(SharedString::from(src)),
+                index,
+                cx,
+            )
+        });
+    });
+    cx.simulate_resize(size(px(600.), px(600.)));
+    settle(cx);
+
+    // 一步大跳 → 窗口重建到覆盖大代码块的区域（> DEFER_BYTES → 延后）。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.scroll_vertical(-2_000_000.);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let _ = cx.cx.refresh();
+
+    // 大跳转后的第一帧：窗口内应有带语言代码块命中延后队列（不在 code_hl、pending 挂起）。
+    let (deferred_missing, pending) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        let missing = (0..md.win_rows.len())
+            .filter(|&j| {
+                md.win_rows[j].kind == RowKind::Code
+                    && md.win_rows[j].code_language().is_some()
+                    && md.code_hl.get(&(md.win_lo + j)).is_none()
+            })
+            .count();
+        (missing, md.pending_code_hl.is_some())
+    });
+    assert!(
+        deferred_missing > 0 && pending,
+        "大跳转后第一帧应有延后未上色的代码块（missing={deferred_missing}, pending={pending}）"
+    );
+
+    // 后续帧分片补色：泵渲染直到延后队列清空（有界），再断言窗口内所有带语言代码块
+    // 都有高亮。分片按帧推进，具体帧数取决于字节/块数预算，故不能写死帧数。
+    let mut guard = 0;
+    loop {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        let still_pending = cx
+            .update(|_, cx| host.read(cx).md.read(cx).pending_code_hl.is_some());
+        guard += 1;
+        if !still_pending || guard > 32 {
+            break;
+        }
+    }
+    assert!(guard <= 32, "延后队列 32 帧内未收敛（怀疑死循环）");
+    let (missing, pending) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        let missing = (0..md.win_rows.len())
+            .filter(|&j| {
+                md.win_rows[j].kind == RowKind::Code
+                    && md.win_rows[j].code_language().is_some()
+                    && md.code_hl.get(&(md.win_lo + j)).is_none()
+            })
+            .count();
+        (missing, md.pending_code_hl.as_ref().map(|q| q.1.len()))
+    });
+    assert!(
+        missing == 0 && pending.is_none(),
+        "延后补色应收敛：仍缺 {missing} 个带语言块、队列挂起 {pending:?}"
+    );
 }
 
 /// GFM 表格应渲染成有实际宽高的网格，且其宽度计入横向滚动内容宽估算。

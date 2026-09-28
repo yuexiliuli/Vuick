@@ -39,17 +39,34 @@ fn normalize_language(lang: &str) -> &str {
 /// 按语言 token 或扩展名定位语法（带结果缓存）；找不到返回 `None`（不产出高亮）。
 fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
     let lang = normalize_language(language).to_owned();
+    let key = lang.to_lowercase();
     if let Ok(cache) = SYNTAX_CACHE.lock()
-        && let Some(r) = cache.get(&lang) {
+        && let Some(r) = cache.get(&key) {
             return *r;
         }
     let r = SYNTAX_SET
         .find_syntax_by_token(&lang)
         .or_else(|| SYNTAX_SET.find_syntax_by_extension(&lang));
     if let Ok(mut cache) = SYNTAX_CACHE.lock() {
-        cache.insert(lang, r);
+        cache.insert(key, r);
     }
     r
+}
+
+/// 把默认语法集的**全部**语言名与文件扩展名（小写）预填进 [`SYNTAX_CACHE`]：
+/// 之后任意围栏语言只要是已知语法名或扩展名，`find_syntax` 直接命中缓存，不再触发
+/// `find_syntax_by_token` 的全量扫描——该扫描**每次语言首次调用约 200-250ms**
+/// （debug 实测 rust 250ms / python 200ms / json 7ms），是首个代码块渲染/滚动冻结的
+/// 主要来源。一次性建表成本与单次扫描相当，放在启动后台线程（[`prewarm`]）。
+fn prefill_syntax_cache() {
+    if let Ok(mut cache) = SYNTAX_CACHE.lock() {
+        for s in SYNTAX_SET.syntaxes() {
+            cache.insert(s.name.to_lowercase(), Some(s));
+            for ext in &s.file_extensions {
+                cache.insert(ext.to_lowercase(), Some(s));
+            }
+        }
+    }
 }
 
 /// 构建行首字节索引：`ret[i]` = 第 i 行的行首字节；末行结束 = `text.len()`。
@@ -637,6 +654,9 @@ pub(crate) fn prewarm() {
     ] {
         let _ = find_syntax(lang);
     }
+    // 全量预填：所有语法名+扩展名 → 缓存，首个任意语言代码块不再冷扫语法集
+    // （`find_syntax_by_token` ~200-250ms/语言，见 `prefill_syntax_cache`）。
+    prefill_syntax_cache();
     // 明暗 GitHub 色板。
     let _ = github_theme_cached(false);
     let _ = github_theme_cached(true);
