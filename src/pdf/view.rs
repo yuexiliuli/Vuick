@@ -1714,6 +1714,175 @@ fn search_overlays_for_page(
     out
 }
 
+impl PdfViewer {
+    /// 把「可视窗口内 [start, end] 的页」逐个铺成**绝对定位**的页卡片列表
+    /// （页列虚拟化的核心，被 [`Render::render`] 的已加载分支调用）。
+    ///
+    /// 每页：按显示密度 1:1 取瓦片，算出位图→CSS 的分轴缩放（`pt_to_local` 同源，
+    /// 瓦片与文本高亮逐像素对齐）；三层合成——底图（封面→中清→缩略图，先瞬时锐化
+    /// 铺满首屏、占位兜底）→ 瓦片（逐片绝对定位、opaque 覆盖底图）→ 选区/检索高亮。
+    /// 卡片自身保持 `absolute` 定位（页列虚拟化的根基，⚠️ 不可改 `.relative()`）。
+    #[allow(clippy::too_many_arguments)] // 页卡片上下文互为正交
+    fn build_visible_page_cards(
+        &self,
+        start: usize,
+        end: usize,
+        page_width: f32,
+        scale_factor: f32,
+        selection: Option<((usize, usize), (usize, usize))>,
+        sel_color: Hsla,
+        searching: bool,
+        hit_color: Hsla,
+        active_color: Hsla,
+        page_bg: Hsla,
+        page_border: Hsla,
+    ) -> Vec<gpui::AnyElement> {
+        let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
+        for (i, &top) in self.page_tops.iter().enumerate().skip(start).take(end - start + 1) {
+            let dim = self.dims[i];
+            let disp_h = display_height(dim, page_width);
+            // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
+            // 文本高亮（`pt_to_local` 同源）逐像素对齐。
+            let scale = render_scale(page_width, scale_factor, dim.0);
+            let bmp = page_bitmap_size(dim, scale);
+            let (sx, sy) = bitmap_display_scales(bmp, page_width, disp_h);
+
+            // 收集该页在**当前密度**下已就绪的瓦片（Arc 克隆 + 卡片局部定位）。
+            let slot = &self.slots[i];
+            let tile_ok = (slot.tile_scale - scale).abs() <= 1e-4;
+            let slot_thumb = slot.thumb.clone();
+            let slot_mid = slot.mid.clone();
+            // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已丢弃，顶层保险）。
+            let slot_cover = if (slot.cover_scale - cover_scale(dim, page_width, scale_factor))
+                .abs()
+                <= 1e-4
+            {
+                slot.cover.clone()
+            } else {
+                None
+            };
+            let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
+            if tile_ok {
+                tiles.reserve(slot.tiles.len());
+                for (_, ts) in slot.tiles.iter() {
+                    tiles.push((
+                        ts.x0 as f32 * sx,
+                        ts.y0 as f32 * sy,
+                        ts.w as f32 * sx,
+                        ts.h as f32 * sy,
+                        ts.image.clone(),
+                    ));
+                }
+            }
+            let mut overlays = selection_overlays_for_page(
+                i,
+                selection,
+                dim,
+                page_width,
+                scale,
+                self.text_pages.get(&i),
+                sel_color,
+            );
+            if searching {
+                overlays.extend(search_overlays_for_page(
+                    i,
+                    &self.search_matches,
+                    self.search_active,
+                    self.text_pages.get(&i),
+                    dim,
+                    page_width,
+                    scale,
+                    hit_color,
+                    active_color,
+                ));
+            }
+            // 卡片保持 **absolute 定位**（页列虚拟化的根基）。⚠️ 不可改成
+            // `.relative()`：`absolute`/`relative` 同是 position 设置器、后调用者胜，
+            // 一旦覆盖成 relative，页列绝对定位整体失效 → 页距被拉远、滚动跳页、
+            // 滚动条量程错乱。选区高亮需要"定位祖先"做锚点 → 改在**卡片内部**包一层
+            // `size_full().relative()` 容器：它不影响卡片自身盒定位，又给绝对定位
+            // 的子元素提供以卡片左上角为原点的坐标系。
+            let mut card = div()
+                .id(SharedString::from(format!("pdf-page-{i}")))
+                .absolute()
+                .top(px(top))
+                .left(px(0.))
+                .flex_shrink_0()
+                .w(px(page_width))
+                .h(px(disp_h))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(page_border)
+                .overflow_hidden();
+
+            // 三层合成：底图（封面 → 中清 → 缩略图，先瞬时锐化铺满首屏、占位兜底）
+            // → 瓦片（逐片绝对定位，opaque 覆盖底图）→ 选区/检索高亮。
+            let base = slot_cover
+                .clone()
+                .or_else(|| slot_mid.clone())
+                .or_else(|| slot_thumb.clone());
+            let inner: gpui::AnyElement = if !tiles.is_empty() {
+                let mut c = div().size_full().relative();
+                if let Some(base) = base {
+                    c = c.child(
+                        img(ImageSource::Render(base.clone()))
+                            .w(px(page_width))
+                            .h(px(disp_h)),
+                    );
+                }
+                for (x, y, w, h, tile_img) in tiles {
+                    c = c.child(
+                        div()
+                            .absolute()
+                            .left(px(x))
+                            .top(px(y))
+                            .w(px(w))
+                            .h(px(h))
+                            .child(img(ImageSource::Render(tile_img)).size_full()),
+                    );
+                }
+                c.into_any_element()
+            } else if let Some(base) = base {
+                // 瓦片尚未就绪：占位底图铺满（快速拖动/首帧过渡）
+                div()
+                    .size_full()
+                    .relative()
+                    .child(
+                        img(ImageSource::Render(base))
+                            .w(px(page_width))
+                            .h(px(disp_h)),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .size_full()
+                    .relative()
+                    .bg(page_bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(page_border)
+                            .child(format!("第 {} 页 加载中…", i + 1)),
+                    )
+                    .into_any_element()
+            };
+            // 外挂定位祖先：给选区/检索高亮提供以卡片左上角为原点的坐标系。
+            card = card.child(
+                div()
+                    .size_full()
+                    .relative()
+                    .child(inner)
+                    .children(overlays),
+            );
+            cards.push(card.into_any_element());
+        }
+        cards
+    }
+}
+
 impl Render for PdfViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_window(window, cx);
@@ -1756,7 +1925,6 @@ impl Render for PdfViewer {
             if !self.prev_fast {
                 self.prefetch_texts(start, end);
             }
-            let tops = &self.page_tops;
             let total = self.total_height;
             // P2 选区：render 帧内稳定的快照（高亮渲染用）
             let selection = self.selection();
@@ -1767,148 +1935,19 @@ impl Render for PdfViewer {
             let searching = !self.search_query.trim().is_empty();
             let scale_factor = window.scale_factor();
 
-            let mut cards: Vec<gpui::AnyElement> = Vec::with_capacity(end - start + 1);
-            for (i, &top) in tops.iter().enumerate().skip(start).take(end - start + 1) {
-                let dim = self.dims[i];
-                let disp_h = display_height(dim, page_width);
-                // 瓦片按显示密度 1:1 渲染；这里算出位图→CSS 的分轴缩放，放置瓦片与
-                // 文本高亮（`pt_to_local` 同源）逐像素对齐。
-                let scale = render_scale(page_width, scale_factor, dim.0);
-                let bmp = page_bitmap_size(dim, scale);
-                let (sx, sy) = bitmap_display_scales(bmp, page_width, disp_h);
-
-                // 收集该页在**当前密度**下已就绪的瓦片（Arc 克隆 + 卡片局部定位）。
-                let slot = &self.slots[i];
-                let tile_ok = (slot.tile_scale - scale).abs() <= 1e-4;
-                let slot_thumb = slot.thumb.clone();
-                let slot_mid = slot.mid.clone();
-                // 首屏整页锐化封面（满显示密度；缩放过期时 schedule_tiles 已丢弃，顶层保险）。
-                let slot_cover = if (slot.cover_scale - cover_scale(dim, page_width, scale_factor))
-                    .abs()
-                    <= 1e-4
-                {
-                    slot.cover.clone()
-                } else {
-                    None
-                };
-                let mut tiles: Vec<(f32, f32, f32, f32, Arc<RenderImage>)> = Vec::new();
-                if tile_ok {
-                    tiles.reserve(slot.tiles.len());
-                    for (_, ts) in slot.tiles.iter() {
-                        tiles.push((
-                            ts.x0 as f32 * sx,
-                            ts.y0 as f32 * sy,
-                            ts.w as f32 * sx,
-                            ts.h as f32 * sy,
-                            ts.image.clone(),
-                        ));
-                    }
-                }
-                let mut overlays = selection_overlays_for_page(
-                    i,
-                    selection,
-                    dim,
-                    page_width,
-                    scale,
-                    self.text_pages.get(&i),
-                    sel_color,
-                );
-                if searching {
-                    overlays.extend(search_overlays_for_page(
-                        i,
-                        &self.search_matches,
-                        self.search_active,
-                        self.text_pages.get(&i),
-                        dim,
-                        page_width,
-                        scale,
-                        hit_color,
-                        active_color,
-                    ));
-                }
-                // 卡片保持 **absolute 定位**（页列虚拟化的根基）。⚠️ 不可改成
-                // `.relative()`：`absolute`/`relative` 同是 position 设置器、后调用者胜，
-                // 一旦覆盖成 relative，页列绝对定位整体失效 → 页距被拉远、滚动跳页、
-                // 滚动条量程错乱。选区高亮需要"定位祖先"做锚点 → 改在**卡片内部**包一层
-                // `size_full().relative()` 容器：它不影响卡片自身盒定位，又给绝对定位
-                // 的子元素提供以卡片左上角为原点的坐标系。
-                let mut card = div()
-                    .id(SharedString::from(format!("pdf-page-{i}")))
-                    .absolute()
-                    .top(px(top))
-                    .left(px(0.))
-                    .flex_shrink_0()
-                    .w(px(page_width))
-                    .h(px(disp_h))
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(page_border)
-                    .overflow_hidden();
-
-                // 三层合成：底图（封面 → 中清 → 缩略图，先瞬时锐化铺满首屏、占位兜底）
-                // → 瓦片（逐片绝对定位，opaque 覆盖底图）→ 选区/检索高亮。
-                let base = slot_cover
-                    .clone()
-                    .or_else(|| slot_mid.clone())
-                    .or_else(|| slot_thumb.clone());
-                let inner: gpui::AnyElement = if !tiles.is_empty() {
-                    let mut c = div().size_full().relative();
-                    if let Some(base) = base {
-                        c = c.child(
-                            img(ImageSource::Render(base.clone()))
-                                .w(px(page_width))
-                                .h(px(disp_h)),
-                        );
-                    }
-                    for (x, y, w, h, tile_img) in tiles {
-                        c = c.child(
-                            div()
-                                .absolute()
-                                .left(px(x))
-                                .top(px(y))
-                                .w(px(w))
-                                .h(px(h))
-                                .child(img(ImageSource::Render(tile_img)).size_full()),
-                        );
-                    }
-                    c.into_any_element()
-                } else if let Some(base) = base {
-                    // 瓦片尚未就绪：占位底图铺满（快速拖动/首帧过渡）
-                    div()
-                        .size_full()
-                        .relative()
-                        .child(
-                            img(ImageSource::Render(base))
-                                .w(px(page_width))
-                                .h(px(disp_h)),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .size_full()
-                        .relative()
-                        .bg(page_bg)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(page_border)
-                                .child(format!("第 {} 页 加载中…", i + 1)),
-                        )
-                        .into_any_element()
-                };
-                // 外挂定位祖先：给选区/检索高亮提供以卡片左上角为原点的坐标系。
-                card = card.child(
-                    div()
-                        .size_full()
-                        .relative()
-                        .child(inner)
-                        .children(overlays),
-                );
-                cards.push(card.into_any_element());
-            }
+            let cards = self.build_visible_page_cards(
+                start,
+                end,
+                page_width,
+                scale_factor,
+                selection,
+                sel_color,
+                searching,
+                hit_color,
+                active_color,
+                page_bg,
+                page_border,
+            );
 
             let content = div()
                 .id("pdf-pages")
