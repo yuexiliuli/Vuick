@@ -30,8 +30,7 @@
 //!
 //! # 迁移纪律
 //! - 每个组件做完必须连同「调用点迁移 + 测试 + 视觉无回归」一起提交，不留下半截状态。
-//! - `theme::Theme::set` 期间保留对 `gpui_component::Theme` 的兼容桥（双轨同色），
-//!   彻底移除 gpui-component 后删桥。
+//! - 依赖已移除：不再有 `gpui_component` 兼容桥（`Theme::change` 等）。
 
 pub mod button;
 pub mod icon;
