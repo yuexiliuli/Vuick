@@ -135,7 +135,7 @@ pub fn scan_blocks_incremental(
     let prefix_segs = prev.blocks.shares_prefix(bi);
     let mut blocks: Vec<BlockMeta> = Vec::new(); // 新扫描的变化中段（通常极小）
     let mut suffix_segs: Vec<BlocksSeg> = Vec::new();
-    let mut toc: Vec<(usize, u8, String)> = prev
+    let mut toc: Vec<(usize, u8, SharedString)> = prev
         .toc
         .iter()
         .filter(|(r, _, _)| *r < anchor)
@@ -218,7 +218,7 @@ pub fn scan_blocks_incremental(
         }
         let hashes = t.chars().take_while(|&c| c == '#').count();
         if (1..=6).contains(&hashes) && t.len() > hashes {
-            let text = inline_strip(t[hashes..].trim_start()).to_string();
+            let text = inline_strip(t[hashes..].trim_start());
             toc.push((row_start, hashes as u8, text));
             blocks.push(BlockMeta {
                 src_line: row_start as u32,
@@ -1275,6 +1275,102 @@ mod dt {
             t0.elapsed().as_secs_f64(),
             mid_total.as_secs_f64() * 1000.0 / 200.0,
             prev.blocks.seg_count(),
+        );
+    }
+
+    /// 基准（--ignored）：WYSIWYG 每键 `doc.scanblocks` 的确定性拆账。真实
+    /// `fixtures/大文档测试2.md`，在**同一固定位置**连续单字符插入（模拟一处连续打字），
+    /// 每轮 `scan_blocks_incremental_rope(Some(dirty))`，记录段数增长/合并频率、toc 大小、
+    /// 每轮墙钟。打印、不断言。
+    #[test]
+    #[ignore]
+    fn bench_scanblocks_rope_per_key_on_reference_doc() {
+        use std::time::Instant;
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/大文档测试2.md"
+        ));
+        if !path.exists() {
+            eprintln!("跳过：缺少参考文件 {path:?}");
+            return;
+        }
+        let text = std::fs::read_to_string(path).expect("参考文件读取失败");
+        let mut cur = Rope::from(text.as_str());
+        let mut prev = scan_blocks_rope(&cur);
+        let toc0 = prev.toc.len();
+        let n = 120usize;
+        // 固定锚点：取首段中部的字节位置（打字场景：同一处连续插入）。
+        let anchor = cur.byte_to_char_idx(
+            (cur.len() / 16).min(cur.len_chars().saturating_sub(2)),
+        );
+        let at = cur.char_to_byte_idx(anchor as usize);
+        let (mut sum, mut max, mut min) = (0.0f64, f64::MIN, f64::MAX);
+        let mut merges = 0usize;
+        let mut seg_hist: std::collections::HashMap<usize, usize> = Default::default();
+        let mut seg = prev.blocks.seg_count();
+        for i in 0..n {
+            let mut next = cur.clone();
+            next.insert(at, "x");
+            let dirty = at..at + 1;
+            let t = Instant::now();
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &next, Some(dirty));
+            let d = t.elapsed().as_secs_f64() * 1000.0;
+            sum += d;
+            max = max.max(d);
+            min = min.min(d);
+            if i % 20 == 19 {
+                let full = scan_blocks_rope(&next);
+                assert!(inc.blocks == full.blocks && inc.toc == full.toc, "第 {i} 轮不一致");
+            }
+            let ns = inc.blocks.seg_count();
+            if ns < seg {
+                merges += 1;
+            }
+            seg = ns;
+            *seg_hist.entry(ns).or_insert(0) += 1;
+            cur = next;
+            prev = inc;
+        }
+        let mut hist: Vec<_> = seg_hist.into_iter().collect();
+        hist.sort();
+        crate::prof::dump("scanblocks.perkey");
+
+        // —— WYSIWYG 真实路径（`Doc::edit` 用的 blocks-only 增量）：同一序列对比 ——
+        {
+            let mut cur = Rope::from(text.as_str());
+            let mut prev = scan_blocks_rope(&cur);
+            let (mut sum, mut max) = (0.0f64, f64::MIN);
+            for i in 0..n {
+                let mut next = cur.clone();
+                next.insert(at, "x");
+                let t = Instant::now();
+                let inc = scan_blocks_incremental_rope_blocks_only(&cur, &prev, &next, Some(at..at + 1));
+                let d = t.elapsed().as_secs_f64() * 1000.0;
+                sum += d;
+                max = max.max(d);
+                if i % 20 == 19 {
+                    let full = scan_blocks_rope(&next);
+                    assert!(inc.blocks == full.blocks, "blocks-only 第 {i} 轮 blocks 不一致");
+                }
+                cur = next;
+                prev = inc;
+            }
+            eprintln!(
+                "[bench] blocks-only（WYSIWYG doc.scanblocks 实际路径）每键：avg {:.3}ms max {:.3}ms",
+                sum / n as f64,
+                max,
+            );
+        }
+
+        eprintln!(
+            "[bench] scanblocks 每键（6.4MB 版 2，固定位置单字插入，n={n}，toc={toc0}）\n\
+             \x20 每轮：avg {:.3}ms min {:.3}ms max {:.3}ms\n\
+             \x20 段数合并 {} 次；段数直方图 {:?}",
+            sum / n as f64,
+            min,
+            max,
+            merges,
+            hist,
         );
     }
 

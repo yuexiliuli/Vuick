@@ -72,6 +72,33 @@ pub fn scan_blocks_incremental_rope(
     new_src: &Rope,
     dirty: Option<Range<usize>>,
 ) -> BlockIndex {
+    scan_blocks_incremental_rope_impl(prev_src, prev, new_src, dirty, true)
+}
+
+/// [`scan_blocks_incremental_rope`] 的裁减版（WYSIWYG `Doc::edit` 每键专用）：
+/// 只重扫/装配 `blocks`，**跳过整表目录重建**。
+///
+/// WYSIWYG 编辑路径从不消费 `index.toc`（目录/侧边栏由预览侧独立索引提供），而
+/// 目录重建是全表逐条深克隆（6.4MB/1.6 万标题文档实测 ~1.7ms/键；文本 `SharedString`
+/// 化后仍 ~0.7ms/键）——跳过后 `doc.scanblocks` 从 ~1.7ms 落到 ~0.03ms（仅区域切块）。
+/// 返回的 `BlockIndex.toc` 为**空**（消费方不读）；需要正确目录的业务必须走完整版。
+/// 对齐假设与兜底逻辑与完整版一致（兜底全量扫描会连目录一起重建，保证正确性）。
+pub(crate) fn scan_blocks_incremental_rope_blocks_only(
+    prev_src: &Rope,
+    prev: &BlockIndex,
+    new_src: &Rope,
+    dirty: Option<Range<usize>>,
+) -> BlockIndex {
+    scan_blocks_incremental_rope_impl(prev_src, prev, new_src, dirty, false)
+}
+
+fn scan_blocks_incremental_rope_impl(
+    prev_src: &Rope,
+    prev: &BlockIndex,
+    new_src: &Rope,
+    dirty: Option<Range<usize>>,
+    rebuild_toc: bool,
+) -> BlockIndex {
     let old_len = prev_src.len();
     let new_len = new_src.len();
     let (tail_start_new, changed, b_first) = match dirty {
@@ -114,12 +141,17 @@ pub fn scan_blocks_incremental_rope(
     let prefix_segs = prev.blocks.shares_prefix(bi);
     let mut blocks: Vec<BlockMeta> = Vec::new(); // 新扫描的变化中段（通常极小）
     let mut suffix_segs: Vec<BlocksSeg> = Vec::new();
-    let mut toc: Vec<(usize, u8, String)> = prev
-        .toc
-        .iter()
-        .filter(|(r, _, _)| *r < anchor)
-        .cloned()
-        .collect();
+    let _t_tp = crate::prof::begin();
+    let mut toc: Vec<(usize, u8, SharedString)> = if rebuild_toc {
+        prev.toc
+            .iter()
+            .filter(|(r, _, _)| *r < anchor)
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    crate::prof::end("ss.toc.prefix", _t_tp);
 
     // —— 只从 rope 切出「锚点到尾部对齐点」的变化区域（O(k)），不对全串 split ——
     let tail_old = tail_start_new as i64 - delta; // 尾部起点映射到旧坐标
@@ -171,9 +203,13 @@ pub fn scan_blocks_incremental_rope(
                         let prev_line = pb.src_line as usize;
                         let line_shift = (anchor + idx) as i64 - prev_line as i64;
                         suffix_segs = prev.blocks.shares_suffix(pii, delta, line_shift);
-                        for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
-                            toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
+                        let _t_ts = crate::prof::begin();
+                        if rebuild_toc {
+                            for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
+                                toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
+                            }
                         }
+                        crate::prof::end("ss.toc.suffix", _t_ts);
                         reused = true;
                         break;
                     }
@@ -187,8 +223,10 @@ pub fn scan_blocks_incremental_rope(
         let raw_len = line.len() as u32;
         let blk_byte = (anchor_byte as u32).wrapping_add(cur_byte); // 文档绝对字节
         let c = classify_block(&new_lines, idx, t);
-        if let RowKind::Heading(h) = c.kind {
-            let text = inline_strip(t[h as usize..].trim_start()).to_string();
+        if rebuild_toc
+            && let RowKind::Heading(h) = c.kind
+        {
+            let text = inline_strip(t[h as usize..].trim_start());
             toc.push((row_start, h, text));
         }
         blocks.push(BlockMeta {

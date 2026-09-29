@@ -35,5 +35,6 @@ pub(crate) use blocks::build_line_starts_u32;
 pub use blocks_scan::{
     parse_block_window, parse_block_window_rope, scan_blocks_incremental_rope, scan_blocks_rope,
 };
+pub(crate) use blocks_scan::scan_blocks_incremental_rope_blocks_only;
 pub(crate) use blocks_scan::rows_memory_estimate;
 #[cfg(test)] pub(crate) use blocks_scan::next_line_byte;

@@ -258,8 +258,9 @@ pub struct MarkdownPreview {
     wrap: bool,
     /// 正文字号覆盖（None = 用主题默认；EPUB 缩放字号时设置）。
     font_override: Option<f32>,
-    /// 目录：文档内标题行的 (行号, 级别, 文本)。
-    toc: Arc<Vec<(usize, u8, String)>>,
+    /// 目录：文档内标题行的 (行号, 级别, 文本)。文本用 [`SharedString`]（`Arc<str>`）
+    /// 与索引共享同一份标题串，侧边栏按需读取；`Arc<Vec<…>>` 使源同步 O(1) 引用共享。
+    toc: Arc<Vec<(usize, u8, SharedString)>>,
     /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
     base_dir: Option<std::path::PathBuf>,
     /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
@@ -864,7 +865,7 @@ impl MarkdownPreview {
     }
 
     /// 目录条目：(行号, 标题级别, 标题文本)。供侧边栏目录视图使用。
-    pub(crate) fn toc_entries(&self) -> &[(usize, u8, String)] {
+    pub(crate) fn toc_entries(&self) -> &[(usize, u8, SharedString)] {
         &self.toc
     }
 
@@ -1013,7 +1014,7 @@ impl MarkdownPreview {
             rows.iter()
                 .enumerate()
                 .filter_map(|(ix, r)| match r.kind {
-                    RowKind::Heading(level) => Some((ix, level, r.text.to_string())),
+                    RowKind::Heading(level) => Some((ix, level, r.text.clone())),
                     _ => None,
                 })
                 .collect(),

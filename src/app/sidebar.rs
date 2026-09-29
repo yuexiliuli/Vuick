@@ -481,7 +481,7 @@ impl EditorApp {
                                 format!("sidebar-toc-md-{i}"),
                                 format!("sidebar-toc-caret-{i}"),
                                 lvl as usize,
-                                text.clone(),
+                                text.to_string(),
                                 has_child,
                                 is_collapsed,
                                 lvl == 1,

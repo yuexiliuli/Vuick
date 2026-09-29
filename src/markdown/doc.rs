@@ -233,8 +233,14 @@ impl Doc {
         }
         let dirty = start..start + inserted_len;
         let _t_sc = crate::prof::begin();
-        let new_index =
-            parse::scan_blocks_incremental_rope(&self.rope, &self.index, &new_rope, Some(dirty));
+        // blocks-only 增量（toc 跳过：WYSIWYG 从不消费 index.toc，整表目录重建是
+        // 每键 ~1.7ms 的真热点；预览/侧边栏目录由预览侧独立索引维护，不经本层）。
+        let new_index = parse::scan_blocks_incremental_rope_blocks_only(
+            &self.rope,
+            &self.index,
+            &new_rope,
+            Some(dirty),
+        );
         crate::prof::end("doc.scanblocks", _t_sc);
         let _t_ul = crate::prof::begin();
         // 纯行内编辑（insert/remove 都不含 '\n'）：行数/行首集合不变，只有「编辑点之后
