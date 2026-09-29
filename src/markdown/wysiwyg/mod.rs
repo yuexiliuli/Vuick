@@ -1306,7 +1306,6 @@ impl WyEditor {
         let ss = SharedString::from(text);
         self.doc = Doc::open(ss);
         self.rebuild_block_regions();
-        self.preseed_image_sizes();
         self.caret = self.caret.min(self.doc.len());
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -1338,10 +1337,10 @@ impl WyEditor {
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     pub fn set_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
         self.base_dir = dir;
-        // 基准目录变化 → 重新解析图片尺寸（此前按旧基准解析的作废）。
+        // 基准目录变化 → 重新解析图片尺寸（此前按旧基准解析的作废；真实尺寸由图片行
+        // 首次进带惰性重读，见 `lazy_ensure_image_size`）。
         self.image_sizes.borrow_mut().clear();
         self.images_gen.set(self.images_gen.get().wrapping_add(1));
-        self.preseed_image_sizes();
         *self.frame.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
         self.notdef_retry.borrow_mut().clear();
@@ -1390,34 +1389,25 @@ impl WyEditor {
     /// 从原始源码行直接取 src（`parse::parse_image_line`），不物化 [`DocRow`]——
     /// 逐块 `rows_in_block_window(i, i)` 会命中 `parse_block_window` 的「末块含尾
     /// 换行 ≠ 块数」边界（debug 断言），且为读个 src 物化整行纯属浪费。
-    fn preseed_image_sizes(&self) {
-        let n = self.doc.block_count();
-        for i in 0..n {
-            let Some(meta) = self.doc.block_meta(i) else {
-                continue;
-            };
-            if meta.kind != crate::markdown::parse::RowKind::Image {
-                continue;
-            }
-            let line = self.doc.line_str(meta.src_line as usize);
-            let Some((_, src)) = crate::markdown::parse::parse_image_line(line.trim()) else {
-                continue;
-            };
-            let key: SharedString = src.clone().into();
-            if self.image_sizes.borrow().contains_key(&key) {
-                continue;
-            }
-            let resolved = self.resolve_image_src(&src);
-            if !resolved.starts_with("http://")
-                && !resolved.starts_with("https://")
-                && !resolved.starts_with("file://")
-                && let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
-                    std::path::Path::new(&resolved),
-                ) {
-                    self.image_sizes
-                        .borrow_mut()
-                        .insert(key, Some((w as f32, h as f32)));
-                }
+    /// A-4 冷开惰性化：图片行**首次进带 shape** 时按需读一次真实尺寸并入缓存。
+    /// 替代旧 `preseed_image_sizes`（set_source_text/set_base_dir 时同步读**全篇**图片
+    /// 尺寸——6.4MB/3456 图参考文档 ~130ms 阻塞首帧；且 O(图片数) 随文档图片量线性
+    /// 膨胀）。`image_sizes` 是持久缓存 → 之后进带 O(1)；HTTP/已达尺寸/读取失败均短路，
+    /// paint 的异步 asset 加载照常（带内图尺寸已知后只画、不重复校正）。
+    pub(crate) fn lazy_ensure_image_size(&self, src: &str) {
+        if self.image_sizes.borrow().get(src).is_some() {
+            return;
+        }
+        let resolved = self.resolve_image_src(src);
+        if !resolved.starts_with("http://")
+            && !resolved.starts_with("https://")
+            && !resolved.starts_with("file://")
+            && let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
+                std::path::Path::new(&resolved),
+            ) {
+            self.image_sizes
+                .borrow_mut()
+                .insert(src.into(), Some((w as f32, h as f32)));
         }
     }
 

@@ -851,6 +851,9 @@ pub(crate) fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> Shape
         DocPayload::Image { src } => src.clone(),
         _ => gpui::SharedString::default(),
     };
+    // A-4 冷开惰性化：仅**带内**图片行首次 shape 才读一次真实尺寸（不在 load 路径
+    // 同步读全篇；pass1 估算走 `image_row_height` 的占位高，进带由本行 shape 修正）。
+    editor.lazy_ensure_image_size(src.as_ref());
     let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
     let h = image_row_height(editor, src.as_ref(), avail);
     let w = max_w;

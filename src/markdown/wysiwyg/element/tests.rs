@@ -386,6 +386,51 @@
     }
 
     #[gpui::test]
+    fn image_size_lazy_detected_on_first_in_band_shape(cx: &mut TestAppContext) {
+        // 回归（A-4）：图片尺寸不再于 load 路径（set_source_text）预读全篇——打开后
+        // 带外图片保持「未测」；图片行**首次进带 shape** 才按需读一次真实尺寸并入缓存
+        // （大文档 3456 图参考 ~75-130ms 首帧阻塞的根因）。
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/img测试.png");
+        // 图片推到首帧带（0..2048）之外：验证 open 不清扫、滚到时才惰性读。
+        let mut text = String::new();
+        for i in 0..120 {
+            text.push_str(&format!("普通第 {i} 行正文足够长让每行的折行也占高一点 no wrap words\n"));
+        }
+        text.push_str(&format!("![a]({p})\n![b]({p})\n"));
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 打开 + 首帧（图片在带外）：image_sizes 应仍为「未尝试」。
+            assert_eq!(
+                ed.read(cx).image_size(p),
+                None,
+                "open/首帧不应预读带外图片尺寸"
+            );
+        });
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 建覆盖全篇的带 → 图片行首次 shape 惰性读到真实尺寸（72×72 JPEG）。
+            let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert_eq!(
+                f.rows.iter().filter(|r| r.image.is_some()).count(),
+                2,
+                "两行图片都应物化"
+            );
+            let got = ed.read(cx).image_size(p);
+            assert!(
+                matches!(got, Some(Some((w, h))) if w > 0. && h > 0.),
+                "图片行首次进带 shape 应读到真实尺寸（fixtures/img测试.png），实际 {got:?}"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn code_table_image_blocks_shape_with_payload(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
         cx.update(crate::actions::bind_local_keymaps);
@@ -5523,8 +5568,60 @@ A-->B
 
     #[gpui::test]
     #[ignore]
-    fn bench_img_band_geometry(cx: &mut TestAppContext) {
-        // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
+    fn bench_wysiwyg_cold_open_realfile(cx: &mut TestAppContext) {
+        // A-4 首帧空白诊断：真实 6.4MB 文档冷开逐段墙钟 + KILO_PROF 拆账。拆 4 段：
+        // ① Doc::open 全量解析（scan_blocks 6.4MB→16 万块）② WyEditor+with_text（load：
+        // set_source_text = 再解析 + rebuild_block_regions + preseed_image_sizes 逐图读尺寸）
+        // ③ 首帧真实 element 管线（measure→prepaint→paint，冷 pass1+layout+带整形+warmemoji）
+        // ④ 后续同带 build_frame（应命中缓存）。定位 10-30s 首帧空白的真实大头。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        // ① Doc::open 解析拆账。
+        let t0 = std::time::Instant::now();
+        let doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
+        let _ = doc.line_count();
+        let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
+        // ② WyEditor 构造（= load 路径；with_text 内部再走一遍 set_source_text）。
+        let t0 = std::time::Instant::now();
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let loader = t0.elapsed().as_secs_f64() * 1000.0;
+        // ③ 首帧真实 element 管线（不放 vcx 借用，用外层 cx 驱动 refresh）。
+        let t0 = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        let elem_first = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
+        crate::prof::dump("wy.cold.open");
+        // ④ 后续同带 build_frame（命中缓存）。从窗口重建 vcx。
+        let win = cx.windows()[0];
+        let mut vcx = VisualTestContext::from_window(win, cx);
+        let t0 = std::time::Instant::now();
+        let f0 = vcx.update(|window, cx: &mut App| {
+            build_frame(host.read(cx).ed.read(cx), window, px(980.), (0., 1600.))
+        });
+        let _ = f0.rows.len();
+        let warm_bf = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[bench] cold-open: Doc::open={doc_open:.1}ms, with_text(load)={loader:.1}ms, 首3帧element={elem_first:.1}ms/帧, 同带bf={warm_bf:.3}ms/帧"
+        );
+    }
+
+    #[gpui::test]
+    #[ignore]
+    fn bench_img_band_geometry(cx: &mut TestAppContext) {        // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
         // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
         use crate::markdown::wysiwyg::WyEditor;
         cx.update(crate::actions::bind_local_keymaps);
