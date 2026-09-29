@@ -288,6 +288,12 @@ pub(crate) struct BlockLayout {
 }
 
 impl BlockLayout {
+    /// 空布局（O(1)）：给「即将被 Pass1 整表重建」的草稿占位——`ensure_block_layout`
+    /// 重建分支用它，省掉先建一份全量零点 Fenwick/line_block 又一帧被 `rebuild` 覆盖的
+    /// 双重 O(n) 构造（Enter/结构编辑每键 ~0.8ms）。
+    pub(crate) fn empty() -> Self {
+        Self { heights: Vec::new(), fen: Vec::new(), block_src_lines: Vec::new(), line_block: Vec::new() }
+    }
     /// 由整块高度 + 起始源码行建（**O(n)** Fenwick 建表：每个元素只做一次祖先上推，
     /// 替代每元素 while 爬整条祖先链的 O(n log n)——10.7 万块每次 Pass1 重建 ~40ms→~1ms）。
     /// `doc_lines`：源文档总行数（稠密 `line_block` 的范围）。

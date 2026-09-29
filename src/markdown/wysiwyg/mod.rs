@@ -2124,12 +2124,9 @@ impl WyEditor {
                 return (false, l.clone(), None);
             }
         let old = self.block_layout.borrow().as_ref().map(|(_, l)| l.clone());
-        let doc_lines = self.doc().line_starts().len();
-        let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::new(
-            vec![0.0; n_blocks],
-            vec![0u32; n_blocks],
-            doc_lines,
-        )));
+        // 重建分支给 **空** 草稿（O(1)）：Pass1 紧随其后整表重建真正填充——不先建一份
+        // 全量零点 Fenwick/line_block 又立刻被覆盖（双重 O(n)，Enter/结构编辑每键 ~0.8ms）。
+        let l = Rc::new(std::cell::RefCell::new(element::BlockLayout::empty()));
         *self.block_layout.borrow_mut() = Some((epoch, l.clone()));
         (true, l, old)
     }
