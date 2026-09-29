@@ -901,9 +901,12 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // WY_TRACE breakdown：编辑器 prepaint/布局段（元素 bounds 回写 + 内部树）。
+        let _t_pp = crate::prof::begin();
         self.editor
             .update(cx, |editor, _| editor.element_bounds = bounds);
         self.inner.prepaint(window, cx);
+        crate::prof::end("ed.prepaint", _t_pp);
     }
 
     fn paint(
@@ -916,6 +919,11 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // WY_TRACE：编辑器 paint 段（帧内 editor 自身绘制）+ 操作级实时计时结算——
+        // 与 WyEditorElement::paint 同构，编辑/滚动/撤销重做在此以「开始→绘制完成」
+        // 墙钟结算一行 OP 记录。
+        let _t_paint = crate::prof::begin();
+        crate::prof::paint_mark();
         // 首帧光栅预热（一次/进程）：先打热 DWrite 彩字管线再画任何文字——冷进程首次
         // COLR 彩字光栅失败 → emoji 变空白/方框且被 sprite_atlas 钉住。
         // 源码编辑区若先于预览/WYSIWYG 画文本，也必须先预热
@@ -968,6 +976,10 @@ impl Element for EditorElement {
             });
             cx.stop_propagation();
         });
+        crate::prof::end("ed.paint", _t_paint);
+        // 操作级实时计时结算：本帧若含未结算操作（ed_edit/ed_undo/ed_redo/ed_scroll…），
+        // 在此以「开始→绘制完成」的墙钟 + 帧内阶段 breakdown 落地一行 OP 记录。
+        crate::prof::op_finish_after_paint();
     }
 }
 

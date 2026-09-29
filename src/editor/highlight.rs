@@ -312,6 +312,8 @@ impl Highlighter {
         let lo = lo.min(line_count - 1);
         let hi = hi.min(line_count - 1);
         let version = buffer.version();
+        // WY_TRACE breakdown：语法高亮窗口解析段（命中/扩展/编辑增量/整段重解析）。
+        let _t_hl = crate::prof::begin();
 
         // 全部可变操作集中在 prepare（命中 / 扩展 / 编辑增量 / 整段重解析），
         // 结束后才借 `self.lines` 返回切片——避免「返回切片潜伏借用」与可变操作冲突。
@@ -320,6 +322,7 @@ impl Highlighter {
         // 读取对齐切片（prepare 保证缓存覆盖 [lo, hi] 且 base ≤ lo）。
         let rel = lo - self.base;
         let need = hi - lo + 1;
+        crate::prof::end("ed.hl_window", _t_hl);
         &self.lines[rel..rel + need]
     }
 

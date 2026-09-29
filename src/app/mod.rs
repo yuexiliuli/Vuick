@@ -1478,6 +1478,11 @@ impl EditorApp {
 
 impl Render for EditorApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // WY_TRACE 归因：操作（按键/滚动）起点 → 本帧 render 开始的等待，单独记账
+        // 供「每键真实延迟」拆账——多为 60Hz vsync/帧调度，不是 CPU 段。
+        if let Some(d) = crate::prof::op_elapsed() {
+            crate::prof::add_absolute("app.frame_delay", d);
+        }
         let _t = crate::prof::begin();
         // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
         // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。

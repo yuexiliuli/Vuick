@@ -134,6 +134,15 @@ pub fn op_pending() -> bool {
     OP.with(|o| o.borrow().is_some())
 }
 
+/// 当前未结算操作会话已流逝的墙钟时长（帧调度/事件链归因用：op 起点 → 本帧
+/// render/paint 段之间的等待，多为 60Hz vsync 帧调度，非 CPU 段）；无会话返回 `None`。
+pub fn op_elapsed() -> Option<Duration> {
+    if !trace_gate() {
+        return None;
+    }
+    OP.with(|o| o.borrow().as_ref().map(|s| s.start.elapsed()))
+}
+
 /// 开始一个操作计时会话（输入/删除/滚动等）。若上一会话未在 `paint` 结算
 /// （例如操作没触发重绘帧），在此紧急结算为 `dropped`，避免串账。
 pub fn op_start(kind: &'static str) {

@@ -741,6 +741,8 @@ impl CodeEditor {
     /// 无关，无需 splice——只更新 `row_count`；后续 `reveal_caret` 会按新光标行
     /// 重新定位窗口。
     fn apply_edit_synced(&mut self, range: Range<usize>, text: &str) -> crate::editor::buffer::Edit {
+        // WY_TRACE breakdown：编辑主链「缓冲应用」段（O(log n) Rope 编辑 + 高亮增量登记）。
+        let _t_apply = crate::prof::begin();
         // 编辑会改变块结构/跨度：清除熄灭点亮标尺（语义见 guide click highlight）。
         self.active_guide_open = None;
         // 先取被替换区间的**编辑前**行跨度（折叠区间同步需要，编辑后行号已变）。
@@ -769,6 +771,7 @@ impl CodeEditor {
                     .bytes()
                     .any(|b| matches!(b, b'{' | b'}' | b'(' | b')' | b'[' | b']'));
         self.scan_dirty_edit = self.scan_dirty_edit || self.row_count != prev_rows || has_bracket;
+        crate::prof::end("ed.apply_sync", _t_apply);
         edit
     }
 
@@ -990,6 +993,8 @@ impl CodeEditor {
         // 把窗口两端映射成逻辑行，供高亮整窗批量解析与行文本提取。
         let lo_l = self.folds.logical_row(lo);
         let hi_l = self.folds.logical_row(hi);
+        // WY_TRACE breakdown：整窗行数据构建段（含语法/滤镜高亮解析 + 行内样式合并）。
+        let _t_br = crate::prof::begin();
         // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
         // 借用，否则后续 `self.row_data` 与高亮窗口的借用冲突）。
         // 返回切片约定：第 0 项 = `lo_l` 行（两级缓存均统一对齐到请求窗口）。
@@ -1046,6 +1051,7 @@ impl CodeEditor {
             let styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
             out.push(self.row_data(window, logical, show_caret, styles));
         }
+        crate::prof::end("ed.build_rows", _t_br);
         out
     }
 
@@ -1173,6 +1179,11 @@ impl CodeEditor {
 
     /// 滚轮竖向滚动（dy = 滚轮 delta，负=向下）。
     fn scroll_vertical(&mut self, dy: f32) {
+        // WY_TRACE：滚轮竖向滚动登记一次 scroll 操作；编辑已在 insert_edit 起会话，
+        // 不重复起（避免滚轮同帧把编辑会话误标成 scroll）。
+        if !crate::prof::op_pending() {
+            crate::prof::op_start("ed_scroll");
+        }
         self.scroll_to_px(self.scroll_top_px() - dy);
     }
 
@@ -1194,6 +1205,8 @@ impl CodeEditor {
     }
 
     fn reveal_caret(&mut self) {
+        // WY_TRACE breakdown：编辑/移动后的「把光标滚进可视区」段（纵向 + 横向）。
+        let _t_reveal = crate::prof::begin();
         let head = self.selection.head();
         let row = self.buffer.line_of_offset(head);
         self.reveal_row(row);
@@ -1217,6 +1230,7 @@ impl CodeEditor {
             };
             self.set_hscroll(target);
         }
+        crate::prof::end("ed.reveal", _t_reveal);
     }
 
     /// 仅竖向 reveal（鼠标点击/拖动用）。点击必落在可视区内，无需横向自动滚动；
@@ -1240,6 +1254,10 @@ impl CodeEditor {
         let cw = self.char_width.as_f32().max(1.);
         if dx_px.abs() < cw * 0.5 {
             return;
+        }
+        // WY_TRACE：横向滚动同竖向；有在途会话（编辑/竖向滚轮同帧）不重复起。
+        if !crate::prof::op_pending() {
+            crate::prof::op_start("ed_scroll");
         }
         let view_w = (self.element_bounds.size.width.as_f32() - self.gutter_width_px.as_f32())
             .max(0.);
@@ -2076,6 +2094,12 @@ impl CodeEditor {
     // -----------------------------------------------------------------
 
     fn insert_edit(&mut self, range: Range<usize>, text: &str, intent: EditIntent, cx: &mut Context<Self>) {
+        // 操作级实时追踪（WY_TRACE）：一切编辑主链的单一漏斗——打字/IME/退格/删除/
+        // 换行/Tab/粘贴/剪切/程序化 insert_text 都经此，在此登记 per-key 事件链起点，
+        // 到 EditorElement::paint 结算「按键→绘制完成」的真实感知延迟与阶段 breakdown。
+        if crate::prof::trace_active() {
+            crate::prof::op_start_detail("ed_edit", &format!("intent={intent:?}"));
+        }
         self.undo
             .start_tx(intent, (self.selection.anchor, self.selection.head));
         let edit = self.apply_edit_synced(range, text);
@@ -2239,6 +2263,7 @@ impl CodeEditor {
         let Some(tx) = self.undo.undo() else {
             return;
         };
+        crate::prof::op_start("ed_undo");
         for edit in tx.edits.iter().rev() {
             // 撤销前该编辑处于「新文本已插入」状态：被替换区 = inserted_range。
             let la = self.buffer.line_of_offset(edit.start);
@@ -2271,6 +2296,7 @@ impl CodeEditor {
         let Some(tx) = self.undo.redo() else {
             return;
         };
+        crate::prof::op_start("ed_redo");
         for edit in tx.edits.iter() {
             // 重做前该编辑处于「旧文本被移除」状态：被替换区 = replaced_range。
             let la = self.buffer.line_of_offset(edit.start);

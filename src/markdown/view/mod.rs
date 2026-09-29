@@ -33,6 +33,7 @@ pub(crate) use row::expand_bg_over_whitespace;
 mod tests;
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use std::cell::Cell;
 
@@ -201,8 +202,9 @@ const HEIGHT_FULL_BLOCKS_MAX: usize = 262_144;
 /// 预览的原始文本源。窗口级懒解析在滚动/重解析时要反复对**原文**切片，
 /// 因此预览侧保存的源可以是：
 /// - [`Self::Str`]：小文档/一次性喂入的 `SharedString`；
-/// - [`Self::Rope`]：编辑器正文 rope 的 O(1) COW 克隆（打字同步的主路径）——
-///   与编辑器共享底层块，不物化全文，快照可安全交后台线程。
+/// - [`Self::Rope`]：编辑器正文 rope 的 O(1) 克隆（打字同步的主路径）——
+///   ropey 2.0 `Rope::clone` 共享同一棵根节点 Arc（引用计数 +1），不拷贝文本，
+///   快照可安全交后台线程。
 #[derive(Clone)]
 pub enum PreviewSrc {
     Str(SharedString),
@@ -257,7 +259,7 @@ pub struct MarkdownPreview {
     /// 正文字号覆盖（None = 用主题默认；EPUB 缩放字号时设置）。
     font_override: Option<f32>,
     /// 目录：文档内标题行的 (行号, 级别, 文本)。
-    toc: Vec<(usize, u8, String)>,
+    toc: Arc<Vec<(usize, u8, String)>>,
     /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
     base_dir: Option<std::path::PathBuf>,
     /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
@@ -317,6 +319,9 @@ pub struct MarkdownPreview {
     est_hint: f32,
     /// 生成 `est_hint` 时的视口宽度（px）；<0 表示尚未按宽度估算（需要重算）。
     est_hint_width: f32,
+    /// 抽样块高模型对应的**块数**：与 `item_count()`（当前块索引）不一致（换行/删改
+    /// 改变块数）时在 render 重建模型；打字不改块数则模型跨键保留（省掉每键 O(N) 重建）。
+    height_model_n: usize,
     /// 上一次 `update_height_hint` 收到的渲染宽度（px）：连续宽度变化（拖分屏）期间
     /// 做重挂去抖；宽度安定（<2px 抖动）后坍缩**立即**重挂自愈，不受 120ms 精确估算
     /// 节流影响（否则打开/换宽后的前 120ms 里滚动条量程坍缩，立刻拖动会拖不到底）。
@@ -376,7 +381,7 @@ impl MarkdownPreview {
             h_handle: ScrollHandle::new(),
             wrap: false,
             font_override: None,
-            toc: Vec::new(),
+            toc: Arc::new(Vec::new()),
             base_dir: None,
             memory_images: Default::default(),
             code_scroll: Default::default(),
@@ -401,6 +406,7 @@ impl MarkdownPreview {
             select_anchor: None,
             est_hint: 0.0,
             est_hint_width: -1.0,
+            height_model_n: 0,
             last_render_width: -1.0,
             last_hint_estimate: std::time::Instant::now(),
             hint_applied: None,
@@ -920,6 +926,9 @@ impl MarkdownPreview {
     /// 物化、也不整份拷贝索引**。打字同步主路径传 [`PreviewSrc::Rope`]（编辑器正文
     /// 快照，O(1)），窗口模式按可见窗口从 rope 切片，驻留不随文档增长。
     pub fn set_source_with_index(&mut self, src: PreviewSrc, index: Rc<BlockIndex>, cx: &mut App) {
+        // WY_TRACE breakdown：预览数据同步段（编辑后增量装配：窗口模式懒解析 / 小文档
+        // 全量重建 + 高度模型失效）。事件链里随编辑 op 结算进同一行 breakdown。
+        let _t_src = crate::prof::begin();
         // 内容变了，旧的跳转高亮随之失效；代码块高亮缓存键依赖块号/内容，一并作废
         // （否则旧源的高亮会按新源的块号被误复用）。
         self.clear_highlight();
@@ -939,12 +948,24 @@ impl MarkdownPreview {
             // ListState 恒 [`PREVIEW_LIST_WINDOW`] 条（O(1)，不再是 O(块数) 的大树）；
             // 滚动由自持像素模型（`rebuild_height_model` 抽样块高）驱动 + 窗口重定位。
             let prev_abs = self.abs_scroll_top();
+            // WY_TRACE breakdown：源同步窗口分支内部拆账（toc 克隆 / 状态复位 /
+            // 高度模型失效），定位 set_source 每键 ~2ms 的落点。
+            let _t_toc = crate::prof::begin();
+            self.toc = index.toc.clone();
+            crate::prof::end("md.ss.toc", _t_toc);
+            let _t_reset = crate::prof::begin();
+            let _t_set = crate::prof::begin();
             self.index = Some(index.clone());
-            self.src_buf = Some(src.clone());
+            let src_len = src.len();
+            let src_lines = src.line_count();
+            // 直接移动（`src` 按值入参）：Rope 克隆在 ropey 2.0 是 O(节点树)（6.4MB
+            // ≈0.9ms），不是 O(1) 引用共享——移动省掉每键一次整树克隆。
+            self.src_buf = Some(src);
+            crate::prof::end("md.ss.set", _t_set);
+            let _t_drops = crate::prof::begin();
             self.win_lo = 0;
             self.win_rows = Rc::new(Vec::new());
             self.rows = Rc::new(Vec::new());
-            self.toc = index.toc.clone();
             self.code_scroll = Default::default();
             self.code_hl = Default::default();
             self.table_scroll = Default::default();
@@ -953,8 +974,10 @@ impl MarkdownPreview {
             self.win_base = 0;
             self.hint_applied = None;
             self.hint_recovered = false;
-            // 高度/块宽模型失效：下次 render（宽度已知）按新源重建。
-            self.invalidate_height_model();
+            crate::prof::end("md.ss.drops", _t_drops);
+            crate::prof::end("md.ss.reset", _t_reset);
+            // 高度/块宽模型：不在此失效（否则每键打字的下一帧都 O(N) 重建）。小编辑只改
+            // 局部块高，模型近似仍可用；块数/宽度/字号变化由 render 里的 n/width 判据重建。
             if self.content_w <= 0.0 {
                 self.remeasure_dimensions(cx);
             }
@@ -967,13 +990,14 @@ impl MarkdownPreview {
                 let index_b = n * std::mem::size_of::<crate::markdown::parse::BlockMeta>();
                 eprintln!(
                     "[MD_MEM_DEBUG] preview set_source(窗口模式): 源 {} B / {} 行 → {} 块, 索引≈{} KB, 固定窗口 {} 条",
-                    src.len(),
-                    src.line_count(),
+                    src_len,
+                    src_lines,
                     n,
                     index_b / 1024,
                     PREVIEW_LIST_WINDOW,
                 );
             }
+            crate::prof::end("md.set_source", _t_src);
             return;
         }
 
@@ -985,14 +1009,15 @@ impl MarkdownPreview {
         self.resolve_image_rows(&mut parsed);
         let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）
-        self.toc = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, r)| match r.kind {
-                RowKind::Heading(level) => Some((ix, level, r.text.to_string())),
-                _ => None,
-            })
-            .collect();
+        self.toc = Arc::new(
+            rows.iter()
+                .enumerate()
+                .filter_map(|(ix, r)| match r.kind {
+                    RowKind::Heading(level) => Some((ix, level, r.text.to_string())),
+                    _ => None,
+                })
+                .collect(),
+        );
         // 代码行 → 稳定的横向滚动句柄（供块内滚动条拖动）
         self.code_scroll = Rc::new(
             rows.iter()
@@ -1044,6 +1069,7 @@ impl MarkdownPreview {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();
         }
+        crate::prof::end("md.set_source", _t_src);
     }
 
     /// 图片行后处理：解析内存图/本地图尺寸（全量路径与窗口路径共用）。
@@ -1110,15 +1136,10 @@ impl MarkdownPreview {
         }
     }
 
-    /// 「像素↔块」模型已按当前宽度/换行/字号失效（换源/换行/字号/宽度变化时置 -1，
-    /// render 依宽度重建，重建时顺带刷新 `est_hint` 平均高）。
-    fn invalidate_height_model(&mut self) {
-        self.est_hint_width = -1.0;
-    }
-
     /// 重建全篇块高抽样模型（窗口模式专用）：O(N/stride) 纯算术，替代原先 O(N)
     /// 的 `estimated_avg_row_height`（20~40ms），换宽/换源成本降到 <1ms。
     fn rebuild_height_model(&mut self, p: &StyleParams, width: f32) {
+        let _t_hm = crate::prof::begin();
         let Some(idx) = self.index.clone() else {
             return;
         };
@@ -1156,7 +1177,9 @@ impl MarkdownPreview {
         self.height_pref = pref;
         self.height_stride = stride;
         self.est_hint = self.total_h() / n.max(1) as f32;
+        self.height_model_n = n;
         self.est_hint_width = width;
+        crate::prof::end("md.hm.rebuild", _t_hm);
     }
 
     /// 块 → 像素（抽样模型近似；未建模型退化为 平均高×块号）。
@@ -1539,7 +1562,7 @@ impl MarkdownPreview {
         self.rows = Rc::new(Vec::new());
         self.list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX));
         self.content_w = 0.0;
-        self.toc.clear();
+        self.toc = Arc::new(Vec::new());
         self.code_scroll = Default::default();
         self.code_hl = Default::default();
         self.code_hl_cache.clear();
@@ -1863,7 +1886,12 @@ impl MarkdownPreview {
         if self.index.is_some() {
             // 窗口模式：重建（如失效）抽样块高模型 + 把固定窗口对齐到用户目标
             // （滚动条拖动只写 desired；滚轮/跳转的 scroll_to_px 已同步，此处幂等兜底）。
-            if self.est_hint_width < 0.0 || (self.est_hint_width - pane_w).abs() >= 2.0 {
+            // 失效判据 = 未建/宽度变化/**块数变化**：打字（块数不变、宽度不变）跳过
+            // 重建、跨键复用模型——否则每键 O(N) 全篇块高重算（6.4MB 实测 ~2.1ms）。
+            if self.est_hint_width < 0.0
+                || (self.est_hint_width - pane_w).abs() >= 2.0
+                || self.item_count() != self.height_model_n
+            {
                 self.rebuild_height_model(p, pane_w);
             }
             // 字号缩放后：模型已按新字号重建，把缩放前的视口锚点换算出新的滚动目标，

@@ -2518,6 +2518,89 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         );
     }
 
+    /// 基准（--ignored）：源码编辑区每键 → 预览同步（source+预览链）的确定性拆账。
+    /// 真实 `fixtures/大文档测试2.md`（窗口模式），在一个 `md.update` 闭包内循环
+    /// N 轮「rope 插字符 + 重扫 + set_source_with_index + prepare_render（窗口路径）」，
+    /// 杜绝 gpui harness 每轮 update 开销污染；各段耗时由 `prof::` 标签累计、dump 输出
+    /// 每轮均摊：md.set_source / md.ss.toc / md.ss.reset / md_hint / md.hm.rebuild /
+    /// md_ensure_window。打印、不断言；`--ignored` 运行。
+    #[gpui::test]
+    #[ignore]
+    fn bench_preview_edit_sync_stage_cost(cx: &mut TestAppContext) {
+        use std::time::Instant;
+        crate::prof::enable();
+        cx.update(crate::actions::bind_local_keymaps);
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        let (host, vcx) = cx.add_window_view(|_window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            PreviewHost { md }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let rope0 = ropey::Rope::from_str(&text);
+        let idx0 = std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope0));
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope0), idx0, cx);
+            });
+        });
+        vcx.simulate_resize(size(px(980.), px(760.)));
+        settle(vcx);
+        let n_items = vcx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+        assert!(
+            n_items > crate::config::limits::WINDOWED_MIN_BLOCKS,
+            "需窗口模式（块数 {n_items}）"
+        );
+
+        let p = vcx.update(|_window, cx| Rc::new(StyleParams::from_theme_with_font(cx, None)));
+        let n = 120usize;
+        let t0 = Instant::now();
+        let mut rope = ropey::Rope::from_str(&text);
+        let at = n_items / 2;
+        let mut scans_ms = 0.0f64;
+        // 保留每轮快照引用：真实 app 里预览 src_buf 与编辑器 rope 共享引用、替换时
+        // 旧快照 drop 只是 O(1) 减引用计数；不保留会被 ropey COW 整份释放（伪影 ~1ms）。
+        let mut keep: Vec<crate::markdown::PreviewSrc> = Vec::with_capacity(n);
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |m, cx| {
+                for i in 0..n {
+                    // 把「单字符输入」建模在文档中部附近几个点轮转插入（近似逐键但避免
+                    // 让同一段无限增长）。扫描是 app 后台职责，这里仅计时作参照。
+                    let len = rope.len_chars();
+                    let off_chars = ((at + (i % 12) * 2) % len.max(1)).min(len) as usize;
+                    let off = rope.char_to_byte_idx(off_chars.min(rope.len_chars()));
+                    let ts = Instant::now();
+                    rope.insert(off, "x");
+                    let idx =
+                        std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope));
+                    scans_ms += ts.elapsed().as_secs_f64() * 1000.0;
+                    let src = crate::markdown::PreviewSrc::Rope(rope.clone());
+                    keep.push(src.clone());
+                    m.set_source_with_index(src, idx, cx);
+                    m.prepare_render(&p, 980.0, cx);
+                }
+            });
+        });
+        let wall = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[bench] 预览每键同步（窗口模式，{n} 轮，真实大文档）：总 {}ms（{:.2}ms/轮）；其中消费端扫描（不含在预览内）{:.2}ms/轮；预览侧（set_source+prepare_render）{:.2}ms/轮",
+            wall,
+            wall / n as f64,
+            scans_ms / n as f64,
+            (wall - scans_ms) / n as f64,
+        );
+        // prof::dump 重新计算每标签总耗时（不含扫描），给出每轮均摊的精确拆账。
+        crate::prof::dump("preview.edit.sync");
+    }
+
 
 
 

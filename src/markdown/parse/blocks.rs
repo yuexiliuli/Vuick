@@ -4,6 +4,8 @@
 //! 全量扫描」部分（2026-09-24 重构）：依赖 `rows`（行解析的切块判定函数）；
 //! 增量扫描 / 窗口物化见 `parser`（`blocks_scan`，经门面重导出）。
 
+use std::sync::Arc;
+
 use super::rows::{
     fence_len, inline_strip, is_rule, list_prefix, parse_image_line, strip_align_directive,
     try_parse_table, RowKind,
@@ -36,7 +38,9 @@ pub struct BlockIndex {
     /// 增量扫描 O(1) 共享未变前后缀，只重建变化段（见 [`Blocks`]）。
     pub blocks: Blocks,
     /// 目录：(渲染行号, 标题级别, 标题文本)。窗口模式下照常全量可用。
-    pub toc: Vec<(usize, u8, String)>,
+    /// `Arc` 共享（同 `blocks`）：源同步每键 `set_source_with_index` 只需 O(1) 引用
+    /// 共享，不再逐键深拷贝整张目录表（实测 2.2ms/键）。
+    pub toc: Arc<Vec<(usize, u8, String)>>,
 }
 
 /// 分段持久化的轻量块列表。
@@ -388,6 +392,6 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     }
     BlockIndex {
         blocks: Blocks::from_vec(blocks),
-        toc,
+        toc: Arc::new(toc),
     }
 }

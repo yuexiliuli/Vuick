@@ -309,7 +309,7 @@ pub fn scan_blocks_incremental(
     );
     BlockIndex {
         blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
-        toc,
+        toc: std::sync::Arc::new(toc),
     }
 }
 #[cfg(test)]

@@ -6,6 +6,7 @@
 //! 保留在 `parser`（测试基础设施），本模块只保留生产路径。
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{Image, SharedString};
 use ropey::Rope;
@@ -213,7 +214,7 @@ pub fn scan_blocks_incremental_rope(
     }
     BlockIndex {
         blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
-        toc,
+        toc: Arc::new(toc),
     }
 }
 
