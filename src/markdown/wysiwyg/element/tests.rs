@@ -3226,6 +3226,98 @@ A-->B
     }
 
     #[gpui::test]
+    fn math_ready_invalidates_only_affected_rows_still_renders_ready(cx: &mut TestAppContext) {
+        // 回归（A-3）：公式就绪不得再让整带无关块全 miss 重排——旧方案 `mgen` 进全局
+        // shape_key，头less 实测每个公式完成整带 67/68 行全重排一次。改动后：行内公式
+        // 行因 spacer 换代由 `on_math_ready` **定向作废**重排（且必须真的换真图）、
+        // `$$` 卡行在 Pass2 blocked 不入缓存无需作废、其余段落保持命中。同时正确性不丢：
+        // 行内行就绪后帧挂 `ready` 位图、`$$` 卡高按真位图（> 42px 回退高）。
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "para0 some words here\npara1 some more words\n$$\nu = v^2\n$$\ninline $a+b$ tail\npara2 words enough\npara3 words enough\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let buf = image::RgbaImage::from_raw(60, 40, vec![0u8; 60 * 40 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        let block_key = vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(0));
+            let f = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+            let block_key = f
+                .rows
+                .iter()
+                .find_map(|r| match &r.extra.card {
+                    Some(super::BlockCard::Math { latex, .. }) => Some(latex.trim().to_string()),
+                    _ => None,
+                })
+                .expect("$$ 卡");
+            let inline_key = f
+                .rows
+                .iter()
+                .find_map(|r| r.extra.inline_maths.first())
+                .map(|m| m.key.to_string())
+                .expect("行内公式");
+            // 真实管线：sync_math 登记「行内公式→行」并占位 Loading（无窗口下 spawn 不跑，
+            // 下面的手动 Ready + on_math_ready 就是那个「后台完成」）。
+            ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
+            let _ = ed.read(cx).take_reshapes();
+            // 行内公式就绪：只该行重排（其余命中），且新帧该行挂 Ready 位图。
+            ed.update(cx, |e, ecx| {
+                e.math_slots().borrow_mut().insert(
+                    inline_key.as_str().into(),
+                    super::super::MathSlot::Ready(img.clone(), 30., 40.),
+                );
+                e.on_math_ready(&inline_key, ecx);
+            });
+            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+            let resh = ed.read(cx).take_reshapes();
+            assert!(
+                resh <= 3,
+                "行内公式就绪应只重排该行/边界（修复前整带全 miss）：resh={resh}"
+            );
+            let ready_row = f2
+                .rows
+                .iter()
+                .find(|r| r.extra.inline_maths.iter().any(|m| m.ready.is_some()));
+            assert!(
+                ready_row.is_some(),
+                "行内公式就绪后帧应挂 Ready 位图（定向作废把旧 Loading 行换掉了）"
+            );
+            block_key
+        });
+        // `$$` 卡就绪：Pass2 blocked 不入缓存 → 无行可作废，但卡高必须按真位图重建。
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, ecx| {
+                e.math_slots().borrow_mut().insert(
+                    block_key.as_str().into(),
+                    super::super::MathSlot::Ready(img.clone(), 30., 40.),
+                );
+                e.on_math_ready(&block_key, ecx);
+            });
+            let f3 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+            let card_h = f3
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_some())
+                .map(|r| f32::from(r.height))
+                .unwrap_or(0.);
+            let resh = ed.read(cx).take_reshapes();
+            assert!(
+                card_h > 42. + 1.,
+                "$$ 卡就绪高应按真位图（>42px 回退）：{card_h}"
+            );
+            assert!(
+                resh <= 3,
+                "$$ 卡就绪不应整带重排（Pass2 blocked 行不缓存）：resh={resh}"
+            );
+        });
+    }
+
+    #[gpui::test]
     fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
         // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
         // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
@@ -4951,6 +5043,83 @@ A-->B
     }
     #[gpui::test]
     #[ignore]
+    fn bench_per_key_math_completion(cx: &mut TestAppContext) {
+        // 量化「公式排版就绪（on_math_ready）→ 下一帧」的稳态重排次数（对齐 code 修复
+        // 前的 `bench_per_key_code_highlight_completion`：43.2 次/键整带重排）。修复前
+        // `mgen` 进全局 shape_key——每个公式完成都让整带所有块（含无关段落）全 miss 重排
+        // 一次（肉眼 = 公式就绪时整片闪烁）；修复后 `on_math_ready` 只定向作废该公式
+        // 所在行 → 就绪帧只见该行/带边界重排。显示块（`$$…$$`，Pass2 blocked 不入缓存）
+        // 与行内公式（行正常入 `shape_rows`）两例各测 12 轮。
+        use crate::markdown::wysiwyg::MathSlot;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let mut text = String::new();
+        for i in 0..6 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        text.push_str("$$\nx + y = 2^5\n$$\n");
+        text.push_str("inline math $E=mc^2$ here ends\n");
+        for i in 6..90 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_raw(200, 40, vec![0u8; 200 * 40 * 4]).unwrap(),
+        )]));
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 光标停在正文（数学块被折叠成卡、行内行以常规行入 `shape_rows`；光标外行可缓存）。
+            ed.update(cx, |e, _| e.set_caret(0));
+            let f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            // 从首帧摘键：块卡 latex（trimmed）与行内公式 key（"inline:…"）。
+            let block_key = f
+                .rows
+                .iter()
+                .find_map(|r| match &r.extra.card {
+                    Some(super::BlockCard::Math { latex, .. }) => Some(latex.trim().to_string()),
+                    _ => None,
+                })
+                .expect("应有 $$ 显示块卡片");
+            let inline_key = f
+                .rows
+                .iter()
+                .find_map(|r| r.extra.inline_maths.first())
+                .map(|m| m.key.to_string())
+                .expect("应有行内公式");
+            let _ = ed.read(cx).take_reshapes();
+            let band_blocks = f.rows.len();
+            let mut completion_case = |label: &str, key: &str, h_img: f32| {
+                let mut resh = 0u64;
+                let mut t_ms = 0u128;
+                let n = 12;
+                for _ in 0..n {
+                    ed.update(cx, |e, ecx| {
+                        e.math_slots()
+                            .borrow_mut()
+                            .insert(key.into(), MathSlot::Ready(img.clone(), 200., h_img));
+                        e.on_math_ready(key, ecx);
+                    });
+                    let t0 = std::time::Instant::now();
+                    build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+                    t_ms += t0.elapsed().as_millis();
+                    resh += ed.read(cx).take_reshapes();
+                }
+                eprintln!(
+                    "[bench] math-completion {label}: {:.2} 次/键重排, {:.3}ms/键（band blocks={band_blocks}，修复前≈整带 67 行 + 带重建）",
+                    resh as f64 / n as f64,
+                    t_ms as f64 / n as f64,
+                );
+            };
+            completion_case("block", &block_key, 40.);
+            completion_case("inline", &inline_key, 24.);
+        });
+    }
+    #[gpui::test]
+    #[ignore]
     fn bench_undo_redo_cycle(cx: &mut TestAppContext) {
         // 真实文件 undo/redo 循环稳态成本：恢复快照（Doc::open_rope 全量重建 +
         // rebuild_block_regions + text_shared 整串）+ restore 后 build_frame 的
@@ -5193,7 +5362,7 @@ A-->B
         }
         let n = bands.len();
         // 阶段 A：首次滚过全部新带（每带含新进块整形）——真实滚动前沿成本。
-        let mut t = 0u128;
+        let mut t = 0.0f64;
         let mut reshapes = 0u64;
         for &band in &bands {
             let t0 = std::time::Instant::now();
@@ -5201,18 +5370,21 @@ A-->B
                 let ed = host.read(cx).ed.clone();
                 let _ = build_frame(ed.read(cx), window, width, band);
             });
-            t += t0.elapsed().as_millis();
+            t += t0.elapsed().as_secs_f64() * 1000.0;
             vcx.update(|_window, cx| {
                 reshapes += host.read(cx).ed.read(cx).take_reshapes();
             });
         }
         eprintln!(
-            "[bench] scroll-新带 {n} band-builds: {}ms ({:.1}ms/band, {} 次真实整形)",
-            t, t as f64 / n as f64, reshapes
+            "[bench] scroll-新带 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
+            total = t,
+            avg = t / n as f64,
+            resh = reshapes,
+            per = reshapes as f64 / n as f64,
         );
         crate::prof::dump("wy.scroll.fresh");
         // 阶段 B：原样滚回（全部缓存命中、0 整形）——纯组装/折叠开销。
-        let mut t2 = 0u128;
+        let mut t2 = 0.0f64;
         let mut r2 = 0u64;
         for &band in bands.iter().rev() {
             let t0 = std::time::Instant::now();
@@ -5220,14 +5392,17 @@ A-->B
                 let ed = host.read(cx).ed.clone();
                 let _ = build_frame(ed.read(cx), window, width, band);
             });
-            t2 += t0.elapsed().as_millis();
+            t2 += t0.elapsed().as_secs_f64() * 1000.0;
             vcx.update(|_window, cx| {
                 r2 += host.read(cx).ed.read(cx).take_reshapes();
             });
         }
         eprintln!(
-            "[bench] scroll-全热 {n} band-builds: {}ms ({:.1}ms/band, {} 次真实整形)",
-            t2, t2 as f64 / n as f64, r2
+            "[bench] scroll-全热 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
+            total = t2,
+            avg = t2 / n as f64,
+            resh = r2,
+            per = r2 as f64 / n as f64,
         );
         crate::prof::dump("wy.scroll.warm");
     }

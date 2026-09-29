@@ -731,9 +731,11 @@ pub(crate) fn build_frame(
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
-    // 行整形缓存（滚动/带重建复用）：键 = epoch ^ mgen；caret 严格落在含行内公式的
-    // 文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由 `replace_range` 负责。
-    let shape_key = epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    // 行整形缓存（滚动/带重建复用）：键 = **epoch（不含 `mgen`）**；caret 严格落在
+    // 含行内公式的文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由
+    // `replace_range` 负责，公式就绪对 `$$` 卡 / 行内 spacer 的换代由 `on_math_ready`
+    // **定向作废**该行——不再让整带无关块随每个公式完成全 miss 重排（对齐 code 修复）。
+    let shape_key = epoch;
     let shaped = pass2_shape_band(
         editor,
         window,
@@ -881,10 +883,11 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     if i0 >= i1 {
         return;
     }
-    // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits）。
+    // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits ^ zgen；
+    // 不含 mgen——公式就绪支持定向作废，见 `build_frame`）。
     let width_bits = f32::from(frame.width).to_bits();
     let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits, e.mermaid_zoom_gen());
-    let sk = epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let sk = epoch;
     let caret_line = e.row_col(e.caret()).0;
     let plan = e.fold_plan_rc();
     let doc = e.doc();

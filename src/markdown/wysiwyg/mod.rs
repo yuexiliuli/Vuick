@@ -352,6 +352,11 @@ pub struct WyEditor {
     code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
     /// 数学显示行数缓存（见字段声明）。
     math_line_map: RefCell<std::collections::HashMap<String, usize>>,
+    /// 行内公式键（`"inline:…"`）→ 包含它的行 src_line（`sync_math` claim 时登记）。
+    /// `on_math_ready` 完成时**定向作废**这些行整形缓存条目——替代 mgen 进全局 shape_key
+    /// 的整带 miss（`$$` 显示块在 Pass2 被 blocked、不入 `shape_rows`，无需作废）。
+    /// 换源清空（行号随源失效）；轻微过期只多作废一两个无关块（无害，正确性不受影响）。
+    inline_math_rows: RefCell<std::collections::HashMap<SharedString, Vec<usize>>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
     /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
@@ -980,6 +985,7 @@ impl WyEditor {
             // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
             // 清缓存。
             math_line_map: RefCell::new(std::collections::HashMap::new()),
+            inline_math_rows: RefCell::new(std::collections::HashMap::new()),
             base_dir: None,
             marked: None,
             sel_anchor: None,
@@ -1319,6 +1325,8 @@ impl WyEditor {
         self.struct_old_end_line.set(0);
         self.struct_line_delta.set(0);
         self.math_line_map.borrow_mut().clear();
+        // 换源：行的 src_line 全变 → 行内公式→行的登记作废（重新 claim 时再登记）。
+        self.inline_math_rows.borrow_mut().clear();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
@@ -2553,8 +2561,9 @@ impl WyEditor {
         // (槽键, 是否行内, 排版边距, 要排版的 LaTeX)：块用 `MATH_PAD`；行内用
         // `INLINE_MATH_PAD` 且键带 `inline:` 前缀 + `\textstyle` 包层（大算子转行内式，
         // 只压算子不缩正文——否则 `\int_0^1` 整图缩放会把 `x^2 dx` 也变小）。
-        let mut sources: Vec<(SharedString, bool, f32, String)> = Vec::new();
+        let mut sources: Vec<(SharedString, bool, f32, String, usize)> = Vec::new();
         for row in &frame.rows {
+            let src_line = row.src_line;
             if let Some(element::BlockCard::Math { latex, .. }) = &row.extra.card {
                 let s = latex.trim();
                 if !s.is_empty() && s != "$$" {
@@ -2563,6 +2572,7 @@ impl WyEditor {
                         false,
                         crate::config::math::MATH_PAD,
                         s.to_string(),
+                        src_line,
                     ));
                 }
             }
@@ -2574,11 +2584,21 @@ impl WyEditor {
                         true,
                         crate::config::math::INLINE_MATH_PAD,
                         lx.to_string(),
+                        src_line,
                     ));
                 }
             }
         }
-        for (key, is_inline, pad, latex) in sources {
+        for (key, is_inline, pad, latex, src_line) in sources {
+            // 行内公式登记「所在行」→ 完成时定向作废该行整形缓存（见 `inline_math_rows`）。
+            if is_inline {
+                let mut rows = self.inline_math_rows.borrow_mut();
+                let v = rows.entry(key.clone()).or_default();
+                if !v.contains(&src_line) {
+                    v.push(src_line);
+                }
+                drop(rows);
+            }
             let mut slots = self.math_slots.borrow_mut();
             if slots.contains_key(key.as_ref()) {
                 continue;
@@ -2648,10 +2668,35 @@ impl WyEditor {
     }
 
     /// 一个公式排版完成：自增代数 → 帧缓存失效（下次 measure 以真实高度重建）。
-    /// **带门控**：完成的公式不在当前带内 → 只置代数（保持候选高度一致，滚动回带时由
-    /// 自然重建带上），不立即失效帧/重绘——滚过一片公式区时几十个后台光栅完成不再各自
-    /// 打断一帧（消除数学密集段的滚动/空转卡顿）。在带内才立即失效（本帧换真图）。
+    /// **定向作废**：行内公式（`"inline:…"`）→ 删除包含它的行整形缓存条目（行内
+    /// spacer 宽/撑高依赖 slot 由 Loading→Ready 换代，不删则滚回带内命中旧行永不换
+    /// 真图）。`$$` 显示块行在 Pass2 被 blocked、不入 `shape_rows`，无需作废。替代旧
+    /// 「`mgen` 进全局 shape_key」——每个公式完成会让整带所有块（含无关段落）全 miss
+    /// 重排一次（headless 实测 67/68 行整带重排）。
+    /// **带门控**：完成的公式不在当前带内 → 只置代数 + 定向作废（保持候选高度一致，
+    /// 滚动回带时由自然重建带上），不立即失效帧/重绘——滚过一片公式区时几十个后台光栅
+    /// 完成不再各自打断一帧（消除数学密集段的滚动/空转卡顿）。在带内才立即失效（本帧换真图）。
     fn on_math_ready(&mut self, key: &str, cx: &mut Context<Self>) {
+        if key.starts_with("inline:") {
+            let mut lines: Vec<usize> = Vec::new();
+            if let Some(v) = self.inline_math_rows.borrow().get(key) {
+                lines.extend(v.iter().copied());
+            }
+            if let Some(f) = self.frame.borrow().as_ref() {
+                for r in &f.rows {
+                    if r.extra.inline_maths.iter().any(|m| m.key.as_ref() == key) {
+                        lines.push(r.src_line);
+                    }
+                }
+            }
+            if !lines.is_empty() {
+                lines.sort_unstable();
+                lines.dedup();
+                let blocks: Vec<usize> =
+                    lines.into_iter().map(|s| self.doc.block_index_for_line(s)).collect();
+                self.shape_rows.borrow_mut().invalidate(&blocks);
+            }
+        }
         let in_band = self.frame.borrow().as_ref().is_some_and(|f| {
             f.rows.iter().any(|r| {
                 if let Some(element::BlockCard::Math { latex, .. }) = &r.extra.card
