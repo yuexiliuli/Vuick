@@ -4075,6 +4075,97 @@ A-->B
         });
     }
 
+    /// 逆操作撤销：**结构性**编辑（Enter 拆段）撤销走增量 pass1，块结构与内容全还原。
+    #[gpui::test]
+    fn undo_after_enter_restores_merged_paragraph(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\ndef"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let n_before = ed.read(cx).doc().block_count();
+            ed.update(cx, |e, ecx| {
+                e.set_caret(3);
+                e.replace_range(3..3, "\n", ecx); // 拆成 `abc` / `def` 两段（结构编辑）
+            });
+            assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(
+                ed.read(cx).text().as_ref(),
+                "abc\ndef",
+                "撤销结构编辑应还原文本"
+            );
+            assert_eq!(
+                ed.read(cx).doc().block_count(),
+                n_before,
+                "撤销结构编辑应还原块结构"
+            );
+            ed.update(cx, |e, ecx| e.redo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
+        });
+    }
+
+    /// 逆操作撤销：**原子**替换（选区替换为文本）撤销换回被删原文（Atomic 独立单元）。
+    #[gpui::test]
+    fn undo_selection_replace_restores_removed(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 假装选区替换：6..11 "world" → "rust"（removed 非空 + 插入 → Atomic）。
+            ed.update(cx, |e, ecx| {
+                e.set_caret(11);
+                e.replace_range(6..11, "rust", ecx);
+            });
+            assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "hello world", "撤销应还原被替换原文");
+            ed.update(cx, |e, ecx| e.redo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
+        });
+    }
+
+    /// 逆操作撤销：大块粘帖（结构多段）撤销/重做内容完整（净逆操作按坐标精确回退）。
+    #[gpui::test]
+    fn undo_redo_large_paste_circle(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("start\nend\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            let paste = (0..300).map(|i| format!("para {i} xyz\n")).collect::<String>();
+            ed.update(cx, |e, ecx| {
+                e.set_caret("start\n".len());
+                e.replace_range("start\n".len().."start\n".len(), &paste, ecx);
+            });
+            let after_paste = ed.read(cx).text().as_ref().to_string();
+            ed.update(cx, |e, ecx| e.undo(ecx));
+            assert_eq!(ed.read(cx).text().as_ref(), "start\nend\n", "撤销应完整移除大块粘帖");
+            ed.update(cx, |e, ecx| e.redo(ecx));
+            assert_eq!(
+                ed.read(cx).text().as_ref(),
+                &after_paste,
+                "重做应完整复原大块粘帖"
+            );
+        });
+    }
+
     /// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
     /// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
     /// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
@@ -4833,6 +4924,85 @@ A-->B
                 t_ready_bf as f64 / n as f64,
                 resh as f64 / n as f64,
             );
+        });
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_undo_redo_cycle(cx: &mut TestAppContext) {
+        // 真实文件 undo/redo 循环稳态成本：恢复快照（Doc::open_rope 全量重建 +
+        // rebuild_block_regions + text_shared 整串）+ restore 后 build_frame 的
+        // pass1(pass1_base_layout 全量重估) / setup(derived 重建) / pass2(带内重排)。
+        // restore（=ed.undo/redo 内部）与 build_frame 分拆计时；KILO_PROF=1 时 dump 拆账。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 顶部一个 ASCII 字节位置（行 1 的 `#` 后首个字母——`## C1 ·` 之前），
+            // 替换成单字符制造一个撤销单元；基准改造前后同口径（旧整篇快照 vs 逆操作）。
+            let mut at = 0usize;
+            for _ in 0..4096 {
+                if at >= text.len() {
+                    break;
+                }
+                let c = text[at..].chars().next().unwrap();
+                if c.is_ascii() && c.is_alphabetic() {
+                    break;
+                }
+                at += c.len_utf8();
+            }
+            ed.update(cx, |e, _| e.set_caret(at));
+            // 暖机：首帧 + 3 次 build_frame（首帧 Pass1/冷缓存不计）。
+            let _w0 = build_frame(ed.read(cx), window, px(910.), (0., 1536.));
+            for _ in 0..3 {
+                build_frame(ed.read(cx), window, px(910.), (0., 1536.));
+            }
+            // 制造一个撤销单元：base 快照入栈，doc 变为 base+insert。
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "z", ecx));
+            build_frame(ed.read(cx), window, px(910.), (0., 1536.));
+            crate::prof::dump("wy.undo.prewarm");
+            let mut restore_undo = 0u128;
+            let mut bf_undo = 0u128;
+            let mut restore_redo = 0u128;
+            let mut bf_redo = 0u128;
+            let n = 10;
+            for _ in 0..n {
+                let t0 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.undo(ecx)); // 恢复 base
+                restore_undo += t0.elapsed().as_micros();
+                let t1 = std::time::Instant::now();
+                build_frame(ed.read(cx), window, px(910.), (0., 1536.));
+                bf_undo += t1.elapsed().as_micros();
+                let t2 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.redo(ecx)); // 前向恢复 base+insert
+                restore_redo += t2.elapsed().as_micros();
+                let t3 = std::time::Instant::now();
+                build_frame(ed.read(cx), window, px(910.), (0., 1536.));
+                bf_redo += t3.elapsed().as_micros();
+            }
+            eprintln!(
+                "[bench] undo: restore {:.3}ms + build_frame {:.3}ms = {:.3}ms/次; redo: restore {:.3}ms + build_frame {:.3}ms = {:.3}ms/次",
+                restore_undo as f64 / n as f64 / 1000.0,
+                bf_undo as f64 / n as f64 / 1000.0,
+                (restore_undo + bf_undo) as f64 / n as f64 / 1000.0,
+                restore_redo as f64 / n as f64 / 1000.0,
+                bf_redo as f64 / n as f64 / 1000.0,
+                (restore_redo + bf_redo) as f64 / n as f64 / 1000.0,
+            );
+            crate::prof::dump("wy.undo.current");
         });
     }
     #[gpui::test]

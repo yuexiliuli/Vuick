@@ -54,7 +54,6 @@ use crate::markdown::parse::recognition::{self, LinkHit};
 pub(crate) type BlockLayoutRef = Rc<std::cell::RefCell<element::BlockLayout>>;
 use crate::markdown::parse::inline_style;
 use crate::markdown::view::style::StyleParams;
-use ropey::Rope;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, PartialEq, Debug)]
@@ -202,12 +201,24 @@ fn caret_vis() -> CaretVis {
     CARET_VIS.with(|c| c.get())
 }
 
-/// 撤销/重做快照：**rope COW 共享底树**（O(log n)）+ 光标——不再每键驻留整份全文
-/// （旧实现 200 深最坏驻留 200×6MB）；历史由 rope 结构共享，编辑仅在分叉处分摊成本。
+/// 撤销/重做单元：**精确逆操作**（整组净一次编辑）——撤销/重做走 `replace_range` 同款
+/// 增量管道（`Doc::edit` 增量块扫描 + Pass1 三段式 + derived 小修补 + 单块整形作废），
+/// 不再像旧快照那样整体重建模型（`Doc::open_rope` 全量重索引 + 全毁派生/布局 → 实测
+/// 6.4MB 撤销 ~467ms/次：恢复 355ms + build_frame pass1 全量重估 88ms）。
+/// `insert` 当前占据 `range`；`delete` 是撤销时要换回的原文（对应单元前状态）。
+/// B2 事务合并：连续同意图且邻接的编辑并入同一单元（`insert`/`delete` 累积成净一次替换）。
 #[derive(Clone)]
-struct Snapshot {
-    text: Rope,
-    caret: usize,
+struct UndoUnit {
+    /// 当前文档中 `insert` 所占区间（撤销 = 把它替换回 `delete`）。
+    range: Range<usize>,
+    /// 该单元净插入（当前在 `range` 处）。
+    insert: String,
+    /// 该单元前该区间原本的文本（撤销后回到它）。
+    delete: String,
+    /// 单元起始光标（撤销恢复位）。
+    caret_before: usize,
+    /// 前向恢复光标（**按下撤销瞬间**的光标；`undo` 写入、`redo` 读取，同行 `editor/undo.rs`）。
+    forward_caret: usize,
 }
 
 /// 项目管线的所见即所得编辑器：`Doc`（内部 rope）为唯一数据源，`caret` 是**源字节偏移**。
@@ -369,12 +380,15 @@ pub struct WyEditor {
     /// （代码 ``` 标记行、表格分隔行，只读）。导航/退格/删除据此避免光标落进
     /// 只读围栏（否则在隐藏围栏上输入会破坏结构）。随文本变更重建。
     block_regions: Vec<BlockRegion>,
-    /// 撤销栈（旧状态 → pop 后恢复）；重做栈。rope COW 快照（O(log n)/键），深度
-    /// [`Self::UNDO_LIMIT`]；**B2 合并**：连续同意图且邻接的编辑并入上一个事务,
-    /// 只在「新事务起点」push 快照——200 快照可覆盖远比 200 字符多的内容。
-    undo_stack: Vec<Snapshot>,
-    redo_stack: Vec<Snapshot>,
-    /// 上一个编辑（意图 + 源字节区间）：`replace_range` 用它判定是否与此编辑合并成
+    /// 撤销栈（pop → 应用于当前内容）；重做栈。**精确逆操作**（净一次编辑 / 单元），
+    /// 深度 [`UNDO_LIMIT`]；**B2 合并**：连续同意图且邻接的编辑并入当前打开的
+    /// 单元（`open_unit`），撤销把净逆操作经增量管道打回——不再整体重建模型。
+    undo_stack: Vec<UndoUnit>,
+    redo_stack: Vec<UndoUnit>,
+    /// 正在累积的撤销单元（最后一批并入它的编辑尚未固化；下次非合并编辑或 undo/redo
+    /// 时关闭并入栈）。
+    open_unit: Option<UndoUnit>,
+    /// 上一个编辑（意图 + 源字节区间）：`replace_range` 用它判定是否与当前单元合并成
     /// 同一撤销事务（连续打字 / 相邻退格 / 同点删除）；光标移动（`set_caret`/方向键
     /// `moved`）与整篇内容替换打断。
     last_edit: Option<(EditKind, usize, usize)>,
@@ -707,6 +721,8 @@ static WARM_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 static WARM_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static WARM_SIZES: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
 const WARM_MAX_ATTEMPTS: usize = 60;
+/// 撤销/重做栈深度上限（超出丢最旧）。
+const UNDO_LIMIT: usize = 200;
 
 /// warm 是否已完成：各窗格 paint 前调用，完成后直接跳过 warm，零重复访问。
 pub(crate) fn warm_emoji_is_done() -> bool {
@@ -971,6 +987,7 @@ impl WyEditor {
             block_regions: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            open_unit: None,
             last_edit: None,
         }
     }
@@ -1282,6 +1299,7 @@ impl WyEditor {
         self.caret = self.caret.min(self.doc.len());
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.open_unit = None;
         self.last_edit = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
@@ -2867,8 +2885,8 @@ impl WyEditor {
         // 编辑前被替换区间（cross_newline / 标记计数 / 撤销意图用；O(被删长)）。
         let removed = self.doc.slice_str(r.clone());
         let inserted_len = text.len();
-        // —— B2 撤销快照 + 事务合并（无定时器确定性判定，同 editor/undo.rs）——
-        self.record_undo_snapshot(&r, &removed, text);
+        // —— B2 撤销单元 + 事务合并（无定时器确定性判定，同 editor/undo.rs）——
+        self.record_undo_unit(&r, &removed, text);
         // 原地 rope 编辑（`Doc::edit`：COW remove+insert + 增量块扫描 + 增量行起始）——
         // 不再每键拼一份 6MB 整串再分配/复制（旧 `next` String + Arc 包装是 6MB 文档
         // ~5-6ms/键的根因）；`content` 字段随之取消，rope 为唯一真源。
@@ -2907,10 +2925,11 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// B2 撤销快照 + 事务合并（无定时器确定性判定，同 editor/undo.rs）：rope COW 快照
-    /// O(log n)；「同意图且邻接」→ 并入上一事务（不 push），200 深快照可覆盖远多于
-    /// 200 个字符的内容。返回是否并入上一事务。
-    fn record_undo_snapshot(&mut self, r: &Range<usize>, removed: &str, text: &str) -> bool {
+    /// B2 撤销单元 + 事务合并（无定时器确定性判定，同 `editor/undo.rs`）：
+    /// 「同意图且邻接」→ 并入当前打开的单元（净 `insert`/`delete` 累积成一次替换），
+    /// 否则关闭上一个单元并入栈并开新单元；200 深可覆盖远多于 200 字符的内容。
+    /// 返回是否并入上一事务。
+    fn record_undo_unit(&mut self, r: &Range<usize>, removed: &str, text: &str) -> bool {
         let inserted_len = text.len();
         let intent = if removed.is_empty() && !text.is_empty() && !text.contains('\n') {
             EditKind::Typing
@@ -2934,15 +2953,48 @@ impl WyEditor {
             },
             _ => false,
         };
-        if !merges {
-            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
-            if self.undo_stack.len() > 200 {
-                self.undo_stack.remove(0);
+        if merges {
+            // 并入打开单元：净区间/文本按意图累积（逆操作坐标不变形，见 UndoUnit）。
+            let u = self
+                .open_unit
+                .as_mut()
+                .expect("能合并必已有打开的单元");
+            u.insert.push_str(text);
+            match intent {
+                EditKind::Backspace => {
+                    // 新增删除在左侧：`removed` 前插、区间起点左移（退格序列自右向左）。
+                    u.delete = format!("{removed}{}", u.delete);
+                    u.range.start = u.range.start.saturating_sub(removed.len());
+                }
+                // 同点删除延伸：删除文本按序追加。
+                EditKind::Delete => u.delete.push_str(removed),
+                _ => {} // 纯键入：insert 已追加，delete 保持（纯键入时为空）。
             }
+            u.range.end = u.range.start + u.insert.len();
+        } else {
+            // 关闭上一个打开的单元（撤销单元自此固化）并入栈，开新单元。
+            if let Some(prev) = self.open_unit.take() {
+                self.push_undo_unit(prev);
+            }
+            self.open_unit = Some(UndoUnit {
+                range: r.start..(r.start + inserted_len),
+                insert: text.to_string(),
+                delete: removed.to_string(),
+                caret_before: self.caret,
+                forward_caret: 0, // undo 时再写
+            });
         }
         self.redo_stack.clear();
         self.last_edit = Some((intent, r.start, r.start + inserted_len));
         merges
+    }
+
+    /// 入撤销栈（深度上限 [`UNDO_LIMIT`]，超出丢最旧）。
+    fn push_undo_unit(&mut self, u: UndoUnit) {
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(u);
     }
 
     /// Pass1 增量重估定位 + 整形/预热缓存作废：编辑行的**前一内容行**之后的块全部未变
@@ -3157,49 +3209,81 @@ impl WyEditor {
         true
     }
 
-    /// 撤销（D1）：弹出上一状态恢复；被撤销的状态进重做栈。
+    /// 撤销（D1）：把当前打开的撤销单元固化入栈，弹出上一单元并沿增量管道打回其
+    /// **净逆操作**（不再整体重建模型）；被撤销的单元（带撤销瞬间光标）进重做栈。
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
         crate::prof::op_start("undo");
-        if let Some(s) = self.undo_stack.pop() {
-            self.redo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
-            self.restore_snapshot(s, cx);
+        if let Some(u) = self.open_unit.take() {
+            self.push_undo_unit(u);
         }
+        if let Some(mut u) = self.undo_stack.pop() {
+            // 重做恢复位定格为「按下撤销瞬间」的光标（同 `editor/undo.rs`）。
+            u.forward_caret = self.caret;
+            self.redo_stack.push(u.clone());
+            let target = u.caret_before;
+            self.apply_raw_edit(u.range.clone(), &u.delete, target, cx);
+        }
+        self.last_edit = None;
     }
 
     /// 重做（D1）。
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
         crate::prof::op_start("redo");
-        if let Some(s) = self.redo_stack.pop() {
-            self.undo_stack.push(Snapshot { text: self.doc.rope().clone(), caret: self.caret });
-            self.restore_snapshot(s, cx);
+        if let Some(u) = self.open_unit.take() {
+            self.push_undo_unit(u);
         }
+        if let Some(u) = self.redo_stack.pop() {
+            self.undo_stack.push(u.clone());
+            let target = u.forward_caret;
+            // 前向：当前文档在 `[range.start, range.start+delete.len())` 处是 `delete`，
+            // 用 `insert` 换回（撤销的逆）。
+            let r = u.range.start..(u.range.start + u.delete.len());
+            self.apply_raw_edit(r, &u.insert, target, cx);
+        }
+        self.last_edit = None;
     }
 
-    /// 恢复快照：重建模型 + 光标，通知宿主内容已变（返回 Changed，供镜像保存）。
-    fn restore_snapshot(&mut self, s: Snapshot, cx: &mut Context<Self>) {
-        self.doc = Doc::open_rope(s.text);
-        self.rebuild_block_regions();
-        self.caret = s.caret.min(self.doc.len());
+    /// 撤销/重做共用增量编辑：与 `replace_range` 完全同款（`Doc::edit` 增量块扫描 +
+    /// Pass1 三段式重估 + derived 小修补 + 单块整形作废 + 结构判定），**唯二区别**：
+    /// 不写撤销单元（本调用由 undo/redo 发起）、光标按目标位放置。UndoUnit 的
+    /// `range`/`insert`/`delete` 组合即自带精确坐标，直接复用这套增量管线——
+    /// 大文档撤销从「整体重建 6.4MB」降到「一次局部增量编辑」。
+    fn apply_raw_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        target_caret: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let len = self.len();
+        let r = range.start.min(len)..range.end.min(len);
+        if r.start == r.end && text.is_empty() {
+            return;
+        }
+        let _t_rr = crate::prof::begin();
+        let removed = self.doc.slice_str(r.clone());
+        let edit_line = self.row_col(r.start).0;
+        let old_line = self.doc.line_str(edit_line);
+        let prev_count = self.doc.block_count();
+        let edit_blk = self.doc.block_index_for_line(edit_line);
+        let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
+        self.doc.edit(r.clone(), text);
+        let cross_newline = text.contains('\n') || removed.contains('\n') || text.contains('\r');
+        let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
+        let count_same = self.doc.block_count() == prev_count;
+        let geo_same = match (self.doc.block_meta(edit_blk), prev_geo) {
+            (Some(nm), Some(om)) => nm.kind == om.0 && nm.src_line == om.1 && nm.aux == om.2,
+            _ => false,
+        };
+        let structural = cross_newline || breaks_fence || !count_same || !geo_same;
+        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, &removed, text);
+        self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
+        self.caret = target_caret.min(self.len());
         self.sel_anchor = None;
         self.marked = None;
-        self.last_edit = None;
         *self.frame.borrow_mut() = None;
-        // 快照是全新内容：标记计数 / 派生版本 / 基础布局全量失效（与 `set_source_text`
-        // 同款；旧实现漏刷新这些，撤销到不同结构文档会命中陈旧派生/布局）。
-        let full = self.doc.text_shared();
-        self.math_dollar_cnt.set(full.as_ref().bytes().filter(|&b| b == b'$').count());
-        self.alert_marker_cnt.set(full.matches("[!").count());
-        self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
-        self.struct_dirty_line.set(0);
-        self.struct_old_end_line.set(0);
-        self.struct_line_delta.set(0);
-        self.math_line_map.borrow_mut().clear();
-        *self.pending_patch_blocks.borrow_mut() = None;
-        *self.block_layout.borrow_mut() = None;
-        self.shape_rows.borrow_mut().clear();
-        self.notdef_retry.borrow_mut().clear();
-        self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
+        crate::prof::end("wy.replace_range", _t_rr);
         cx.emit(WyEvent::Changed);
         cx.notify();
     }
