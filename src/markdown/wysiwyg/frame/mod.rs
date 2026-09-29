@@ -733,7 +733,7 @@ pub(crate) fn build_frame(
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
     // 行整形缓存（滚动/带重建复用）：键 = epoch ^ mgen；caret 严格落在含行内公式的
     // 文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由 `replace_range` 负责。
-    let shape_key = (epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) ^ editor.code_parse_gen();
+    let shape_key = epoch ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let shaped = pass2_shape_band(
         editor,
         window,
@@ -884,7 +884,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits）。
     let width_bits = f32::from(frame.width).to_bits();
     let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits, e.mermaid_zoom_gen());
-    let sk = (epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F)) ^ e.code_parse_gen();
+    let sk = epoch ^ e.math_gen().wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     let caret_line = e.row_col(e.caret()).0;
     let plan = e.fold_plan_rc();
     let doc = e.doc();

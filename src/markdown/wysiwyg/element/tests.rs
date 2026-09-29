@@ -3552,6 +3552,115 @@ A-->B
         });
     }
 
+    /// 代码块高亮完成不得让**整带**缓存 miss：旧实现 `code_parse_gen` 恒自增并进全局
+    /// `shape_key` → 在代码块内每键打字（内容变 → 新内容解析完成 → gen++）时整带所有
+    /// 块（含无关段落）全部 miss 重排（真实窗口顶部密集带 24-34ms/键 → bf.shape 6-8ms）。
+    /// 修复后：`on_code_parse_ready` 只**定向作废该代码块的缓存条目**，段落行全部命中，
+    /// 每键只重排被编辑/就绪的这一个代码块。
+    #[gpui::test]
+    fn code_parse_ready_does_not_reshuffle_whole_band(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        // 顶部密集带：代码块前 6 段 + 一个大代码块（>8 行走后台高亮路径）+ 后 4 段。
+        // 段落行在代码块解析就绪时内容未变 → 必须命中缓存、不得被全局键换代而重排。
+        let mut text = String::new();
+        for i in 0..6 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        text.push_str("```rust\n");
+        for i in 0..12 {
+            text.push_str(&format!("fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"));
+        }
+        text.push_str("```\n");
+        for i in 6..10 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        // 追加大量尾部段落：把光标（文末）推到 (0., 1600.) 带外，排除「光标行
+        // reveal 必重排」的干扰（与其它缓存复用测试同法）。
+        for i in 10..90 {
+            text.push_str(&format!("tail para line {i} some more words to wrap here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(text.len()));
+            // 首帧：带覆盖代码块（全物化 → 整带入缓存）；随后归零整形计数。
+            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            let r1 = ed.read(cx).take_reshapes();
+            assert!(r1 > 0, "首帧应实际整形：{r1}");
+            // 模拟代码块后台高亮就绪（`on_code_parse_ready` 只带该代码块首源行）。
+            let code_src_line = 6; // ```rust 围栏所在源行
+            assert_eq!(
+                ed.read(cx).doc().line_str(code_src_line),
+                "```rust",
+                "测试前提：第 {code_src_line} 行应为代码围栏"
+            );
+            ed.update(cx, |e, ecx| e.on_code_parse_ready(&[code_src_line], ecx));
+            // 修复后：只有代码块本身被定向作废重排；段落块全部命中缓存。
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            let r2 = ed.read(cx).take_reshapes();
+            assert_eq!(
+                r2, 1,
+                "代码高亮就绪只应重排该代码块（段落行命中缓存），实际 {r2}/首帧 {r1}"
+            );
+        });
+    }
+
+    /// 内容完全相同的**重复代码块**共享同一解析键：就绪时必须对**每个**副本块定向作废
+    /// 缓存（`on_code_parse_ready` 收全部副本的 src_line）——否则旧全局键被移除后第二个
+    /// 副本滚回带内会永久保持纯文本（旁路上色）。
+    #[gpui::test]
+    fn code_parse_ready_rehighlights_identical_duplicate_blocks(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        // 两个内容逐字节相同的 >8 行 rust 代码块（同一 (lang, code) 键 → 后台只解析一次）。
+        let mut text = String::new();
+        for i in 0..4 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        let mut code_block = String::from("```rust\n");
+        for i in 0..12i32 {
+            code_block.push_str(&format!("fn dup_{i}(a: u32) -> u32 {{\n    a + {i}\n}}\n"));
+        }
+        code_block.push_str("```\n");
+        let fence_a = text.len();
+        text.push_str(&code_block);
+        let fence_b = text.len();
+        text.push_str(&code_block);
+        for i in 4..90 {
+            text.push_str(&format!("tail para line {i} some more words to wrap here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(text.len())); // 文末 → 带外
+            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            ed.read(cx).take_reshapes();
+            // 两个围栏首源行（fence_a/B 是字节偏移 → 转为行号）。
+            let la = ed.read(cx).row_col(fence_a).0;
+            let lb = ed.read(cx).row_col(fence_b).0;
+            assert_ne!(la, lb, "测试前提：两个代码块应位于不同源行");
+            // 一次解析就绪 → 对两个相同副本块一并定向作废 → 下帧两个块都重排上色。
+            ed.update(cx, |e, ecx| e.on_code_parse_ready(&[la, lb], ecx));
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            let r2 = ed.read(cx).take_reshapes();
+            assert_eq!(
+                r2, 2,
+                "两个相同代码块副本都应被重排上色（旧全局键/旧单块作废只会上一个），实际 {r2}"
+            );
+        });
+    }
+
     /// D1 滚动预热：每次带穿越前把「下一量子带」提前 shape 进缓存 → 穿越时 Pass2
     /// 命中（整形数 ≈ 0），冷态对照组则每穿越都整形成本。只 put 缓存、不动 base 高度。
     #[gpui::test]
@@ -4658,6 +4767,73 @@ A-->B
         }
         eprintln!("[bench] code type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
         crate::prof::dump("wyreal.code.type");
+    }
+    #[gpui::test]
+    #[ignore]
+    fn bench_per_key_code_highlight_completion(cx: &mut TestAppContext) {
+        // 量化「代码块内每键打字」的稳态成本（真实窗口顶部密集带 24-34ms/键的表现路径）：
+        // 每键 = replace_range（非结构，块内单字符）→ build_frame（新内容纯文本行）→
+        // `on_code_parse_ready`（模拟后台高亮就绪）→ 紧接 build_frame。
+        // 修复前：on_code_parse_ready 全局 code_parse_gen++ → 整带缓存全 miss → 最后一帧
+        // 重排整个带（含无关段落）；修复后：只定向重排该代码块。这里测的就是「就绪帧」。
+        use crate::markdown::wysiwyg::WyEditor;
+        use gpui::App;
+        cx.update(crate::actions::bind_local_keymaps);
+        let mut text = String::new();
+        for i in 0..6 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        text.push_str("```rust\n");
+        for i in 0..12 {
+            text.push_str(&format!("fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"));
+        }
+        text.push_str("```\n");
+        for i in 6..90 {
+            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let code_src_line = 6; // ```rust 围栏源行
+        // 代码块内一个 ASCII 字节位置（首行 fn 后或函数体内）；反复用同一位置替换。
+        let at = text.find("fn compute_0").unwrap();
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(at));
+            // 首帧：带覆盖代码块（全物化 + 请求后台解析）；随后归零整形计数。
+            let _f0 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            ed.read(cx).take_reshapes();
+            // 2 次暖机（首帧 Pass1/脏状态）。
+            for ins in ["q", "w"] {
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx));
+                build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+                ed.update(cx, |e, ecx| e.on_code_parse_ready(&[code_src_line], ecx));
+                build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            }
+            let mut t_edit_bf = 0u128;
+            let mut t_ready_bf = 0u128;
+            let mut resh = 0u64;
+            let n = 12;
+            for k in 0..n {
+                let ins = if k % 2 == 0 { "x" } else { "y" };
+                let t0 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx));
+                build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+                t_edit_bf += t0.elapsed().as_millis();
+                let t1 = std::time::Instant::now();
+                ed.update(cx, |e, ecx| e.on_code_parse_ready(&[code_src_line], ecx));
+                build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+                t_ready_bf += t1.elapsed().as_millis();
+                resh += ed.read(cx).take_reshapes();
+            }
+            eprintln!(
+                "[bench] code-per-key: edit-frame {:.2}ms/键, ready-frame {:.2}ms/键, {} 次/键重排 (band blocks, 修复前≈整带)",
+                t_edit_bf as f64 / n as f64,
+                t_ready_bf as f64 / n as f64,
+                resh as f64 / n as f64,
+            );
+        });
     }
     #[gpui::test]
     #[ignore]

@@ -328,14 +328,13 @@ pub struct WyEditor {
     /// mermaid 缩放代数：缩放变化自增，纳入帧缓存键 + 基础布局代（同 `math_gen`，强迫重排）。
     mermaid_zoom_gen: Cell<u64>,
     /// 代码块高亮解析缓存（后台 syntect 整块解析；`request_code_parse` 置 Pending、
-    /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。`code_parse_gen`
-    /// 进 shape_key → 就绪后按下帧重建用高亮行替换占位纯文本行。
+    /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。解析就绪由
+    /// `on_code_parse_ready` **定向作废该代码块的行整形缓存条目**（非全局代数）→ 下帧
+    /// 重建用高亮行替换占位纯文本行。
     code_parse: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
     /// 本帧登记的待后台解析队列 `((语言, 代码), 块 src_line)`（`sync_code_parse` 每帧
     /// 清空消费）。`src_line` 用于完成时的**带内门控**（块还在带内才立即重建帧上色）。
     code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
-    /// 代码高亮就绪代数：进 shape_key（同 `math_gen`）。
-    code_parse_gen: Cell<u64>,
     /// 数学显示行数缓存（见字段声明）。
     math_line_map: RefCell<std::collections::HashMap<String, usize>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
@@ -833,8 +832,9 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
 
 /// 代码块高亮解析缓存键：`(语言名, 代码全文)`。`parse_code_lines` 是纯计算
 /// （与预览共用全局 `SYNTAX_SET`/`SYNTAX_CACHE`，不依赖 window/平台）→ 可在
-/// background executor 跑；就绪后 `code_parse_gen++` 进 shape_key，旧「纯文本行」
-/// 缓存自然 miss 重排上色（对齐 `math_gen` 的地位）。
+/// background executor 跑；就绪后 `on_code_parse_ready` **定向作废该代码块的整形缓存**
+/// （不参与全局 shape_key）→ 该块按下帧重建用高亮行替换占位纯文本行，其余块保持命中
+/// （对齐 `math_gen` 只影响本身块的语义，避免代码块内每键打字把整带缓存全量 miss）。
 pub(crate) type CodeParseKey = (SharedString, SharedString);
 
 /// [`CodeParseKey`] 对应的缓存条目（后台线程写、主线程读）。
@@ -954,7 +954,6 @@ impl WyEditor {
                 std::collections::HashMap::new(),
             )),
             code_parse_need: RefCell::new(Vec::new()),
-            code_parse_gen: Cell::new(0),
             // 数学**显示行数**缓存（键=去定界符源）：`math_card_height` 回退分支按行数
             // 估高——`math_display_lines` 会对每个源做 LaTeX→Unicode 转换，3000 个数学
             // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
@@ -2411,31 +2410,39 @@ impl WyEditor {
         let key: CodeParseKey = (lang.into(), code.into());
         {
             let mut m = self.code_parse.lock().unwrap();
-            if m.contains_key(&key) {
-                return;
+            if !m.contains_key(&key) {
+                m.insert(key.clone(), CodeParseState::Pending);
             }
-            m.insert(key.clone(), CodeParseState::Pending);
         }
+        // 记录**每个**请求块的 src_line：同一内容键可被多个内容完全相同的代码块请求
+        // （sync_code_parse 按键分组、就绪时对全部同内容块定向作废缓存，否则滚回带内
+        // 第二个相同副本因 request 去重永不重上色、永久保持纯文本）。
         let mut need = self.code_parse_need.borrow_mut();
-        if !need.iter().any(|(k, _)| k == &key) {
+        if !need.iter().any(|(k, s)| k == &key && *s == src_line) {
             need.push((key, src_line));
         }
     }
 
-    /// 代码块高亮就绪代数（进 shape_key → 缓存内的旧纯文本行 miss 重排上色）。
-    pub(crate) fn code_parse_gen(&self) -> u64 {
-        self.code_parse_gen.get()
-    }
-
     /// 消费本帧登记的代码块后台解析请求（paint 期调用，对齐 `sync_math` 的可见带
     /// 懒解析）。syntect 整块解析是纯计算 → background executor 跑，完成后写缓存
-    /// + 代数自增 + 失效帧 → 主线程下一帧用高亮行重建（不再 ~300ms 阻塞滚动/整形帧）。
+    /// 并定向作废该块整形缓存 + 失效帧 → 主线程下一帧用高亮行重建该块（不再
+    /// ~300ms 阻塞滚动/整形帧）。
     pub(crate) fn sync_code_parse(&mut self, cx: &mut Context<Self>) {
         let jobs = std::mem::take(&mut *self.code_parse_need.borrow_mut());
         if jobs.is_empty() {
             return;
         }
-        for ((lang, code), src_line) in jobs {
+        // 按内容键分组（同一键可由多个相同代码块请求）：每个键只 spawn 一个解析任务，
+        // 完成时对全部同内容块的 src_line 一并定向作废再上色。
+        let mut groups: Vec<(CodeParseKey, Vec<usize>)> = Vec::new();
+        for (key, src_line) in jobs {
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, lines)) if !lines.contains(&src_line) => lines.push(src_line),
+                Some(_) => {}
+                None => groups.push((key, vec![src_line])),
+            }
+        }
+        for ((lang, code), src_lines) in groups {
             let cache = self.code_parse.clone();
             cx.spawn(async move |this, cx| {
                 // 内层 async move 需要 'static 自有值：克隆一份进去，外层保留原值插缓存。
@@ -2451,24 +2458,30 @@ impl WyEditor {
                     let mut m = cache.lock().unwrap();
                     m.insert((lang.clone(), code.clone()), CodeParseState::Done(result));
                 }
-                let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(src_line, ecx));
+                let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(&src_lines, ecx));
             })
             .detach();
         }
     }
 
-    /// 一个代码块高亮就绪：`code_parse_gen` **总是自增**（使缓存的旧纯文本行在 shape_key
-    /// 层面失效，滚回时可重排上色）；仅当块仍在本帧带内（`frame.rows` 含其 src_line）
-    /// 才立即 `frame=None + notify` 强制本帧换高亮——带外完成只自增、不打断帧
-    /// （对齐 `on_math_ready` 的带内门控，消除多块并发完成时的重建 churn）。
-    fn on_code_parse_ready(&mut self, src_line: usize, cx: &mut Context<Self>) {
-        self.code_parse_gen
-            .set(self.code_parse_gen.get().wrapping_add(1));
+    /// 一个/多个代码块高亮就绪：**定向作废这些块的行整形缓存条目**（替代旧
+    /// 「`code_parse_gen` 恒自增 + 进全局 shape_key」：全局键在代码块内每键打字（内容变 →
+    /// 新内容解析完成 → gen++）时会让**整带所有块**（含无关段落）全量 miss 重排，真实
+    /// 窗口顶部密集带 24-34ms/键、`bf.shape` 6-8ms）。改动后仅这些代码块（的旧纯文本
+    /// 缓存行）被删，本帧/滚回带内由 Pass2 以新高亮重排该块，其余块保持命中。
+    /// `src_lines` 可能是多个（内容完全相同的重复代码块共享同一解析键）。仅当任一
+    /// src_line 仍在本帧带内（`frame.rows` 含它）才立即 `frame=None + notify` 强制本帧
+    /// 换高亮——带外完成只删缓存、不打断帧（对齐 `on_math_ready` 的带内门控，消除多块
+    /// 并发完成时的重建 churn）。
+    fn on_code_parse_ready(&mut self, src_lines: &[usize], cx: &mut Context<Self>) {
+        let block_indices: Vec<usize> =
+            src_lines.iter().map(|&s| self.doc.block_index_for_line(s)).collect();
+        self.shape_rows.borrow_mut().invalidate(&block_indices);
         let in_band = self
             .frame
             .borrow()
             .as_ref()
-            .is_some_and(|f| f.rows.iter().any(|r| r.src_line == src_line));
+            .is_some_and(|f| f.rows.iter().any(|r| src_lines.contains(&r.src_line)));
         if in_band {
             *self.frame.borrow_mut() = None;
             cx.notify();

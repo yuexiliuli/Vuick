@@ -828,7 +828,7 @@ impl Element for WyEditorElement {
             .update(cx, |e, ecx| e.sync_math(ecx, f));
         crate::prof::end("wy.paint.synmath", _t_sm);
         // 代码块高亮后台解析（可见带懒加载）：消费本帧登记的 `request_code_parse`，
-        // 后台跑 syntect 整块解析；就绪后 `code_parse_gen++` → 下帧高亮行重建。
+        // 后台跑 syntect 整块解析；就绪后定向作废该块整形缓存 → 下帧高亮行重建该块。
         let _t_sp = crate::prof::begin();
         self.editor
             .update(cx, |e, ecx| e.sync_code_parse(ecx));
