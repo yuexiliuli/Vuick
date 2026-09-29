@@ -338,6 +338,10 @@ pub struct WyEditor {
     mermaid_zoom: std::cell::RefCell<std::collections::HashMap<usize, f32>>,
     /// mermaid 缩放代数：缩放变化自增，纳入帧缓存键 + 基础布局代（同 `math_gen`，强迫重排）。
     mermaid_zoom_gen: Cell<u64>,
+    /// 当前获得焦点的 mermaid 卡（`src_line`）：**点击卡片**置位、点击其它处清除。
+    /// 仅聚焦的 mermaid 用滚轮缩放（`on_scroll_wheel` 只消费聚焦卡上的滚轮），未聚焦时
+    /// 滚轮一律放行给宿主正常滚动——避免「往下滚遇到 mermaid 就缩图」。视图本地态，不进撤销栈。
+    focused_mermaid: Option<usize>,
     /// 代码块高亮解析缓存（后台 syntect 整块解析；`request_code_parse` 置 Pending、
     /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。解析就绪由
     /// `on_code_parse_ready` **定向作废该代码块的行整形缓存条目**（非全局代数）→ 下帧
@@ -966,6 +970,7 @@ impl WyEditor {
             math_gen: Cell::new(0),
             mermaid_zoom: RefCell::new(std::collections::HashMap::new()),
             mermaid_zoom_gen: Cell::new(0),
+            focused_mermaid: None,
             code_parse: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -1301,6 +1306,7 @@ impl WyEditor {
         self.redo_stack.clear();
         self.open_unit = None;
         self.last_edit = None;
+        self.focused_mermaid = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         // 派生扫描的**标记计数器**（全篇一次 O(n)，之后增量维护 O(编辑)）——
@@ -1609,6 +1615,16 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
+        // **mermaid 卡点击 → 聚焦**：聚焦后滚轮才缩放该卡（交互见图文，未聚焦时滚轮
+        // 一律正常滚动）。点击**任何其它地方**（含选中/链接/任务框）→ 清除聚焦。
+        if let Some(mline) = element::mermaid_card_hit(self, f, ev.position) {
+            drop(marker);
+            self.focus.focus(window, cx);
+            self.focused_mermaid = Some(mline);
+            cx.notify();
+            return;
+        }
+        self.focused_mermaid = None;
         // 交互性命中（任务框/折叠箭头/链接）单双击都响应，展开→立即再点也能折叠回。
         if !ev.modifiers.shift && !ev.modifiers.control {
             // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
@@ -1899,6 +1915,11 @@ impl WyEditor {
         let Some(block) = hit_mermaid else {
             return false;
         };
+        // **仅聚焦的 mermaid 消费滚轮**（点击卡片后才可缩放）：未聚焦 → 放行宿主正常
+        // 滚动（否则鼠标往下滚遇到 mermaid 会变成缩图）。
+        if self.focused_mermaid != Some(block) {
+            return false;
+        }
         let delta_y = match ev.delta {
             gpui::ScrollDelta::Lines(l) => l.y,
             gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
@@ -2394,6 +2415,11 @@ impl WyEditor {
     /// mermaid 缩放代数（进帧缓存键 + 基础布局代）。
     pub(crate) fn mermaid_zoom_gen(&self) -> u64 {
         self.mermaid_zoom_gen.get()
+    }
+
+    /// 当前获得焦点的 mermaid 卡（`src_line`）；`None` = 无（滚轮在 mermaid 上将继续滚动）。
+    pub(crate) fn focused_mermaid(&self) -> Option<usize> {
+        self.focused_mermaid
     }
 
     /// 数学源码的**显示行数**（card 回退估高用）：`math_display_lines` 会对每源做

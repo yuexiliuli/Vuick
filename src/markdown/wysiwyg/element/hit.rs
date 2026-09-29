@@ -366,6 +366,33 @@ pub(crate) fn math_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) 
 
 
 
+/// Mermaid 卡点击命中（**聚焦**用）：窗口坐标 → 该卡 `src_line`。点击后该卡获得焦点，
+/// 此后**只有它**响应滚轮缩放；未聚焦时滚轮一律放行给宿主正常滚动。
+pub(crate) fn mermaid_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> Option<usize> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) {
+            continue;
+        }
+        if !matches!(&r.extra.card, Some(BlockCard::Mermaid)) {
+            continue;
+        }
+        // 卡片铺满内容宽：左 = padding，右 = padding + 内容宽。
+        let x0 = f32::from(frame.padding);
+        let x1 = f32::from(frame.width) - f32::from(frame.padding);
+        if px >= x0 && px <= x1 {
+            return Some(r.src_line);
+        }
+    }
+    None
+}
+
+
+
 /// 命中的可点击链接目标（C5）：窗口坐标 → 行内链接显示区间集合，命中的返回 `LinkHit`。
 pub(crate) fn link_hit_at(
     editor: &WyEditor,

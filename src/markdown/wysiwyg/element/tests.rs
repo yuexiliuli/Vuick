@@ -2050,7 +2050,9 @@ sequenceDiagram
 
     #[gpui::test]
     fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
-        // 滚轮悬停在 mermaid 卡片上 → 逐卡缩放；Ctrl+滚轮不放行给 mermaid（归宿主全局缩放）。
+        // 滚轮缩放须**先点击聚焦该 mermaid 卡**：未聚焦时滚轮放行（给宿主正常滚动，
+        // 不再「往下滚遇到 mermaid 就缩图」）；点击卡置聚焦后才缩放；点击它处解除聚焦。
+        // Ctrl 滚轮放行给宿主全局缩放；非卡区域滚轮不改缩放。
         use super::BlockCard;
         cx.update(crate::actions::bind_local_keymaps);
         let text = "# 标题\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n";
@@ -2060,6 +2062,7 @@ sequenceDiagram
         });
         let vcx: &mut VisualTestContext = vcx;
         vcx.update(|window, cx| {
+            use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
             let ed = host.read(cx).ed.clone();
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
             let mrow = frame
@@ -2070,31 +2073,51 @@ sequenceDiagram
             let block = mrow.src_line;
             // 元素 bounds 占满 600×2000（手工置 last_bounds，模拟 paint 期产物）。
             ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(gpui::Bounds::new(
-                    gpui::point(px(0.), px(0.)),
-                    gpui::size(px(600.), px(2000.)),
-                )));
+                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(2000.)))));
             });
             let card_y = f32::from(mrow.top) + 10.;
             let wheel = |ctrl: bool| gpui::ScrollWheelEvent {
-                position: gpui::point(px(300.), px(card_y)),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(120.))),
+                position: point(px(300.), px(card_y)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
                 modifiers: gpui::Modifiers { control: ctrl, ..Default::default() },
                 ..Default::default()
             };
+            let down_at = |y: f32| MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(300.), px(y)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            // 1) 未聚焦：悬停卡片滚轮 → 不消费（正常滚动），不改缩放。
             let before = ed.read(cx).mermaid_zoom(block);
-            let consumed = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+            let consumed0 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+            assert!(!consumed0, "未聚焦时滚轮应放行（正常滚动）");
+            assert_eq!(ed.read(cx).mermaid_zoom(block), before, "未聚焦滚轮不改缩放");
+            // 2) 点击卡片 → 聚焦。
+            let d = down_at(card_y);
+            ed.update(cx, |e, c| e.on_mouse_down(&d, window, c));
+            assert_eq!(ed.read(cx).focused_mermaid(), Some(block), "点击卡片应聚焦该 mermaid");
+            // 3) 聚焦后：滚轮 → 消费并放大。
+            let consumed1 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
             let after = ed.read(cx).mermaid_zoom(block);
-            assert!(consumed, "悬停在卡片上应消费滚轮");
+            assert!(consumed1, "聚焦后悬停卡片滚轮应消费");
             assert!(after > before, "普通滚轮应放大 mermaid 卡：{before} → {after}");
-            // Ctrl 滚轮：mermaid 不放行（宿主 zoom_overlay 管全局字号）。
+            // 4) Ctrl 滚轮：mermaid 不放行（宿主 zoom_overlay 管全局字号）。
             let consumed_ctrl = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(true), window, c));
             assert!(!consumed_ctrl, "Ctrl 滚轮不放行给 mermaid");
             assert_eq!(ed.read(cx).mermaid_zoom(block), after, "Ctrl 滚轮不改 mermaid 缩放");
-            // 非卡片区域滚轮：不改任何 mermaid 缩放。
+            // 5) 点击卡片外（普通文本区）→ 清除聚焦 → 滚轮再次放行。
+            let dm = down_at(8.0);
+            ed.update(cx, |e, c| e.on_mouse_down(&dm, window, c));
+            assert_eq!(ed.read(cx).focused_mermaid(), None, "点击卡片外应清除聚焦");
+            let consumed2 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+            assert!(!consumed2, "清除聚焦后滚轮应再次放行（正常滚动）");
+            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "清除聚焦后滚轮不改缩放");
+            // 6) 完全没聚焦时的非卡区域滚轮：不消费、不改缩放（历史分支仍成立）。
             let miss = gpui::ScrollWheelEvent {
-                position: gpui::point(px(300.), px(10.)),
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(120.))),
+                position: point(px(300.), px(8.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
                 ..Default::default()
             };
             let consumed_miss = ed.update(cx, |e, c| e.on_scroll_wheel(&miss, window, c));

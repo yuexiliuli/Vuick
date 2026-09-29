@@ -912,6 +912,17 @@ pub(crate) fn paint_card(
             }
         }
         BlockCard::Mermaid => {
+            // 聚焦态（点击过该卡 → 滚轮才缩放它）：accent 描边提示。
+            if editor.read(cx).focused_mermaid() == Some(row.src_line) {
+                window.paint_quad(gpui::PaintQuad {
+                    bounds: Bounds::new(point(px(x0), px(top0)), size(px(content_w), row.height)),
+                    corner_radii: Corners::all(px(8.)),
+                    background: Hsla::default().into(),
+                    border_widths: gpui::Edges::all(px(2.)),
+                    border_color: theme.accent,
+                    border_style: gpui::BorderStyle::Solid,
+                });
+            }
             // 左上角小标签（弱化）。
             let tag: SharedString = "mermaid".into();
             let mut muted = theme.muted;
