@@ -18,6 +18,17 @@
         }
     }
 
+    /// 双编辑器宿主：同步 `set_source_text` 对照机 vs 后台 `install_open` 装配机。
+    struct DualWyHost {
+        sync: Entity<WyEditor>,
+        bg: Entity<WyEditor>,
+    }
+    impl Render for DualWyHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            self.sync.clone()
+        }
+    }
+
     #[test]
     fn byte_map_round_trip_is_identity_for_plain_text() {
         // 普通段落：渲染 == 源（map[k] = k，末位哨兵 = len）。
@@ -5617,6 +5628,118 @@ A-->B
         eprintln!(
             "[bench] cold-open: Doc::open={doc_open:.1}ms, with_text(load)={loader:.1}ms, 首3帧element={elem_first:.1}ms/帧, 同带bf={warm_bf:.3}ms/帧"
         );
+    }
+
+    #[gpui::test]
+    #[ignore]
+    fn bench_doc_open_internal_distribution(cx: &mut TestAppContext) {
+        // A 区残余结构性优化：headless 拆 Doc::open + set_source_text 内部逐段墙钟
+        // （scan_blocks 内部分布：line_starts 行内段 / split / classify 构建；Doc::open 其余：
+        // 二次 line_starts / Rope / 字符计数+UTF-16；set_source_text 的 marker_cnt / regions）。
+        // 并测新后台 load 路径的 **UI 线程成本**（`install_open` 装配，O(块) 级别）——
+        // 证明整篇 O(n) 解析已挪出 UI 线程。
+        // 跑法：cargo test --release --bin gpui-editor bench_doc_open_internal_distribution -- --ignored --nocapture，KILO_PROF=1 环境变量。
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        let t0 = std::time::Instant::now();
+        let _doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
+        let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
+        crate::prof::dump("doc.open");
+        // set_source_text 的额外段（doc 已完成，只剩 marker 计数 + regions 重建 + 帧作废）。
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
+            WyHost { ed }
+        });
+        let t0 = std::time::Instant::now();
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |ed, _| ed.set_source_text(&text))
+        });
+        let set_src = t0.elapsed().as_secs_f64() * 1000.0;
+        crate::prof::dump("set_source_text");
+        // 新后台 load 路径拆账：后台全量（open_from_rope） vs UI 线程装配（install_open）。
+        let rope = ropey::Rope::from_str(&text);
+        let t0 = std::time::Instant::now();
+        let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
+        let bg_parse = t0.elapsed().as_secs_f64() * 1000.0;
+        let (host2, vcx2) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
+            WyHost { ed }
+        });
+        let t0 = std::time::Instant::now();
+        vcx2.update(|_, cx| {
+            let ed = host2.read(cx).ed.clone();
+            ed.update(cx, |ed, _| ed.install_open(r));
+        });
+        let install = t0.elapsed().as_secs_f64() * 1000.0;
+        crate::prof::dump("install_open");
+        eprintln!(
+            "[bench] Doc::open={doc_open:.1}ms, set_source_text(extra)={set_src:.1}ms, 后台open_from_rope={bg_parse:.1}ms, **UI装配install_open={install:.3}ms**"
+        );
+    }
+
+    #[gpui::test]
+    fn async_open_rope_install_matches_sync_set_source(cx: &mut TestAppContext) {
+        // A 区残余结构性优化：App 大文档后台 load（`open_from_rope` 后台建 Doc +
+        // `install_open` UI 装配）的产物必须与同步 `set_source_text` 完全一致——文本/
+        // 行数/字符数/块索引/渲染行数/loaded 标志。覆盖混合内容：标题、段落行内样式、
+        // 列表、引用、代码围栏、表格、独立图片、数学、警报。
+        use ropey::Rope;
+        let text = "# 标题\n\n正文段落 **加粗** `代码`\n\n- 项目一\n- 项目二\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![img](/x.png)\n\n$E=mc^2$\n\n> [!WARNING]\n> 警告\n";
+        let rope = Rope::from_str(text);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let sync = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            let bg = cx.new(|cx| WyEditor::new(window, cx));
+            DualWyHost { sync, bg }
+        });
+        vcx.update(|window, cx| {
+            let sync = host.read(cx).sync.clone();
+            let bg = host.read(cx).bg.clone();
+            // 后台解析 + 装配（App 大文档 load 的等价两步）。
+            let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
+            bg.update(cx, |ed, _| ed.install_open(r));
+            assert!(
+                sync.read(cx).is_loaded() && bg.read(cx).is_loaded(),
+                "两条路径都应收敛到已装载"
+            );
+            assert_eq!(
+                sync.read(cx).text().to_string(),
+                bg.read(cx).text().to_string(),
+                "全文一致"
+            );
+            assert_eq!(sync.read(cx).line_count(), bg.read(cx).line_count(), "行数一致");
+            assert_eq!(sync.read(cx).char_count(), bg.read(cx).char_count(), "字符数一致");
+            assert_eq!(
+                sync.read(cx).doc().block_count(),
+                bg.read(cx).doc().block_count(),
+                "块数一致"
+            );
+            for i in 0..sync.read(cx).doc().block_count() {
+                assert_eq!(
+                    sync.read(cx).doc().block_meta(i),
+                    bg.read(cx).doc().block_meta(i),
+                    "块 {i} 元数据一致"
+                );
+            }
+            // 全篇窗口渲染行数一致（消费同一 BlockIndex → 同一行网格）。
+            let rows_sync = build_frame(sync.read(cx), window, px(600.), (0., 1.0e9)).rows.len();
+            let rows_bg = build_frame(bg.read(cx), window, px(600.), (0., 1.0e9)).rows.len();
+            assert_eq!(rows_sync, rows_bg, "渲染行数一致");
+        });
+        // 从未装载的空壳编辑器（App load 在途窗口）也应如约报告未装载。
+        let (host2, vcx2) = cx.add_window_view(|window, cx| {
+            let empty = cx.new(|cx| WyEditor::new(window, cx));
+            WyHost { ed: empty }
+        });
+        vcx2.update(|_, cx| {
+            assert!(!host2.read(cx).ed.read(cx).is_loaded(), "新建空编辑器未装载");
+        });
     }
 
     #[gpui::test]

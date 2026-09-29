@@ -1892,105 +1892,11 @@ impl Render for PdfViewer {
 
         // 错误 / 加载中 / 已加载三种状态
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
-            div()
-                .h_full()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(14.))
-                .text_color(page_border)
-                .child(format!("无法打开 PDF：{err}"))
-                .into_any_element()
+            Self::pdf_placeholder_body(&format!("无法打开 PDF：{err}"), page_border)
         } else if self.loading || self.dims.is_empty() {
-            div()
-                .h_full()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(14.))
-                .text_color(page_border)
-                .child("正在解析 PDF…")
-                .into_any_element()
+            Self::pdf_placeholder_body("正在解析 PDF…", page_border)
         } else {
-            // **页列 DOM 虚拟化**：scroll 容器里放一个「全文档总高」的定位容器，
-            // 只把可见页 ± MARGIN 的卡片以绝对定位铺进去。整列高度 = total_height，
-            // 所以滚动条范围从一开始就正确；远页（几千页时）不参与本帧 DOM/布局。
-            let scroll_y = f32::from(-self.scroll.offset().y);
-            let viewport_h = f32::from(self.scroll.bounds().size.height);
-            let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
-            // 预取可见窗口文本层（低优先级懒加载）：交互时命中测试/复制/高亮已就绪。
-            // 快速拖动时**跳过**——正在飞掠的页文本提取纯属浪费；停止后恢复预取。
-            if !self.prev_fast {
-                self.prefetch_texts(start, end);
-            }
-            let total = self.total_height;
-            // P2 选区：render 帧内稳定的快照（高亮渲染用）
-            let selection = self.selection();
-            let sel_color = selection_color(cx);
-            // P3 检索：命中高亮色 + 是否正在检索（非空查询才叠加命中高亮）
-            let hit_color = search_hit_color(cx);
-            let active_color = search_active_color();
-            let searching = !self.search_query.trim().is_empty();
-            let scale_factor = window.scale_factor();
-
-            let cards = self.build_visible_page_cards(
-                start,
-                end,
-                page_width,
-                scale_factor,
-                selection,
-                sel_color,
-                searching,
-                hit_color,
-                active_color,
-                page_bg,
-                page_border,
-            );
-
-            let content = div()
-                .id("pdf-pages")
-                .debug_selector(|| "pdf-pages".into())
-                .relative()
-                .w(px(page_width))
-                .h(px(total))
-                .children(cards);
-
-            // 横向+竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
-            // wrap 不写死宽度：`w_full` 铺满滚动容器可视区 → 内容 justify_center 即
-            // 真正居中（不再依赖 window.bounds / scroll.bounds，首帧与每次布局都正确，
-            // 侧边栏/分屏等使可视区窄于窗口的形态也不会右偏）；
-            // `min_w(页宽+边距)` 保证可视区更窄时 wrap 宽于视口 → 触发横向滚动条，
-            // 可滚到全部页面不被左边裁剪。
-            div()
-                .id("pdf-scroll")
-                .debug_selector(|| "pdf-scroll".into())
-                .size_full()
-                .overflow_y_scroll()
-                .overflow_x_scroll()
-                .track_scroll(&self.scroll)
-                // P2 文本层交互：点选聚焦 → 拖拽选区 → Ctrl/Cmd+C 复制（坐标链见 hit_test）
-                .track_focus(&self.focus_handle)
-                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                .on_mouse_move(cx.listener(Self::on_mouse_move))
-                .on_key_down(cx.listener(Self::on_key_down))
-                .child(
-                    div()
-                        .id("pdf-column-wrap")
-                        .w_full()
-                        .min_w(px(page_width + 2.0 * PAGE_PAD_X))
-                        .flex()
-                        .flex_row()
-                        .justify_center()
-                        // Ctrl+滚轮缩放：挂在 wrap（pdf-scroll 的子树）上，bubble 期先于
-                        // pdf-scroll 的内置滚动处理 → Ctrl 时 stop_propagation 可阻止滚动；
-                        // 普通滚轮不拦截，仍回落到滚动容器。覆盖整个可视区（含页边距）。
-                        .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-                        .child(content),
-                )
-                .into_any_element()
+            self.render_pdf_pages(window, cx, page_width, page_bg, page_border)
         };
 
         // 外层：PDF 主体铺满画布。目录已统一由侧边栏提供，此处不再有内部目录面板。
@@ -2034,5 +1940,108 @@ impl Render for PdfViewer {
                             ),
                     ),
             )
+    }
+}
+
+impl PdfViewer {
+    /// 错误 / 加载中的居中占位文本（两分支同构，仅文案不同）。
+    fn pdf_placeholder_body(text: &str, page_border: Hsla) -> gpui::AnyElement {
+        div()
+            .h_full()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(14.))
+            .text_color(page_border)
+            .child(text.to_string())
+            .into_any_element()
+    }
+
+    /// 已加载正文：**页列 DOM 虚拟化**——scroll 容器里放一个「全文档总高」的定位容器，
+    /// 只把可见页 ± MARGIN 的卡片以绝对定位铺进去（`build_visible_page_cards`）。
+    /// 整列高度 = total_height，滚动条范围从一开始就正确；远页不参与本帧 DOM/布局。
+    fn render_pdf_pages(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        page_width: f32,
+        page_bg: Hsla,
+        page_border: Hsla,
+    ) -> gpui::AnyElement {
+        let scroll_y = f32::from(-self.scroll.offset().y);
+        let viewport_h = f32::from(self.scroll.bounds().size.height);
+        let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
+        // 预取可见窗口文本层（低优先级懒加载）：交互时命中测试/复制/高亮已就绪。
+        // 快速拖动时**跳过**——正在飞掠的页文本提取纯属浪费；停止后恢复预取。
+        if !self.prev_fast {
+            self.prefetch_texts(start, end);
+        }
+        let total = self.total_height;
+        // P2 选区：render 帧内稳定的快照（高亮渲染用）
+        let selection = self.selection();
+        let sel_color = selection_color(cx);
+        // P3 检索：命中高亮色 + 是否正在检索（非空查询才叠加命中高亮）
+        let hit_color = search_hit_color(cx);
+        let active_color = search_active_color();
+        let searching = !self.search_query.trim().is_empty();
+        let scale_factor = window.scale_factor();
+
+        let cards = self.build_visible_page_cards(
+            start,
+            end,
+            page_width,
+            scale_factor,
+            selection,
+            sel_color,
+            searching,
+            hit_color,
+            active_color,
+            page_bg,
+            page_border,
+        );
+
+        let content = div()
+            .id("pdf-pages")
+            .debug_selector(|| "pdf-pages".into())
+            .relative()
+            .w(px(page_width))
+            .h(px(total))
+            .children(cards);
+
+        // 横向+竖向滚动容器 + 定位页列（水平居中，宽 = 页宽，高 = 全文档总高）
+        // wrap 不写死宽度：`w_full` 铺满滚动容器可视区 → 内容 justify_center 即
+        // 真正居中（不再依赖 window.bounds / scroll.bounds，首帧与每次布局都正确，
+        // 侧边栏/分屏等使可视区窄于窗口的形态也不会右偏）；
+        // `min_w(页宽+边距)` 保证可视区更窄时 wrap 宽于视口 → 触发横向滚动条，
+        // 可滚到全部页面不被左边裁剪。
+        div()
+            .id("pdf-scroll")
+            .debug_selector(|| "pdf-scroll".into())
+            .size_full()
+            .overflow_y_scroll()
+            .overflow_x_scroll()
+            .track_scroll(&self.scroll)
+            // P2 文本层交互：点选聚焦 → 拖拽选区 → Ctrl/Cmd+C 复制（坐标链见 hit_test）
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .child(
+                div()
+                    .id("pdf-column-wrap")
+                    .w_full()
+                    .min_w(px(page_width + 2.0 * PAGE_PAD_X))
+                    .flex()
+                    .flex_row()
+                    .justify_center()
+                    // Ctrl+滚轮缩放：挂在 wrap（pdf-scroll 的子树）上，bubble 期先于
+                    // pdf-scroll 的内置滚动处理 → Ctrl 时 stop_propagation 可阻止滚动；
+                    // 普通滚轮不拦截，仍回落到滚动容器。覆盖整个可视区（含页边距）。
+                    .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .child(content),
+            )
+            .into_any_element()
     }
 }

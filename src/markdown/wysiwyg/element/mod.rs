@@ -682,28 +682,15 @@ impl Element for WyEditorElement {
             // 诊断：本次重建的诱因（排查 measure/prepaint 双重建；仅 WY_TRACE）。
             if crate::prof::trace_active() {
                 let f = self.editor.read(cx).frame.borrow();
-                let reason = f.as_ref().map_or("no-frame".into(), |f| {
-                    let mut v = Vec::new();
-                    if f.rgen != rgen {
-                        v.push("rgen");
-                    }
-                    if f.igen != igen {
-                        v.push("igen");
-                    }
-                    if f.mgen != mgen {
-                        v.push("mgen");
-                    }
-                    if f.zgen != zgen {
-                        v.push("zgen");
-                    }
-                    if f.width != width {
-                        v.push("width");
-                    }
-                    if f.band != band {
-                        v.push("band");
-                    }
-                    v.join(",")
-                });
+                let reason = Self::frame_stale_reason(
+                    f.as_ref().map(|v| &**v),
+                    rgen,
+                    igen,
+                    mgen,
+                    zgen,
+                    width,
+                    band,
+                );
                 crate::prof::op_detail_append("stale", &reason);
             }
             // 操作级实时计时：无输入类操作在途时，按重建诱因标记 scroll/resize。
@@ -757,40 +744,7 @@ impl Element for WyEditorElement {
         // `link_hit_at` 一致（wrapped 首行的字形几何头/尾两段）。
         let mut link_grips = Vec::new();
         if let Some(f) = frame.as_ref() {
-            for row in &f.rows {
-                if row.extra.links.is_empty() || row.wrapped.is_empty() {
-                    continue;
-                }
-                let Some(w0) = row.wrapped.first() else {
-                    continue;
-                };
-                let ox = bounds.origin.x + f.padding + row.x_off;
-                let oy = bounds.origin.y + row.top + px(text_row_shift(row));
-                for lk in &row.extra.links {
-                    let (Some(p0), Some(p1)) = (
-                        w0.position_for_index(lk.disp.start, row.lh),
-                        w0.position_for_index(lk.disp.end, row.lh),
-                    ) else {
-                        continue;
-                    };
-                    if p0.y == p1.y {
-                        let hit = Bounds::new(
-                            point(ox + p0.x, oy + p0.y),
-                            size((p1.x - p0.x).max(px(2.)), row.lh),
-                        );
-                        link_grips.push(window.insert_hitbox(hit, HitboxBehavior::Normal));
-                    } else {
-                        // 折行链接：头段到行尾、尾段从行首起。
-                        let head = Bounds::new(
-                            point(ox + p0.x, oy + p0.y),
-                            size((w0.width() - p0.x).max(px(2.)), row.lh),
-                        );
-                        let tail = Bounds::new(point(ox, oy + p1.y), size(p1.x.max(px(2.)), row.lh));
-                        link_grips.push(window.insert_hitbox(head, HitboxBehavior::Normal));
-                        link_grips.push(window.insert_hitbox(tail, HitboxBehavior::Normal));
-                    }
-                }
-            }
+            link_grips = Self::link_hit_grips(f, bounds, window);
         }
         // D1：滚动预热——带穿越前把下一量子带块提前 shape 进缓存（预算内摊平突发）。
         if let Some(f) = frame.as_ref() {
@@ -855,73 +809,7 @@ impl Element for WyEditorElement {
             editor.derived()
         };
         let alert_kinds = &derived.borrow().alert_region_kinds;
-        let _t_row = crate::prof::begin();
-        for row in &f.rows {
-            if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
-                paint_quote_band(origin, &theme, f, row, alert_kinds, window);
-            }
-        }
-        for row in &f.rows {
-            // 块级卡片（数学块 / Mermaid 图）优先自绘，跳过普通文本/代码路径。
-            if let Some(card) = &row.extra.card {
-                paint_card(&self.editor, origin, &theme, f, row, card, window, cx);
-                continue;
-            }
-            // 非文本块按类型自绘：代码面板 / 表格网格 / 图片。
-            match row.kind {
-                IrKind::Code => {
-                    // 带外（未 shape）代码块不画（占位无内容）。
-                    if row.wrapped.is_empty() {
-                        continue;
-                    }
-                    paint_code_row(&self.editor, origin, &theme, f, row, window, cx);
-                    continue;
-                }
-                IrKind::Table => {
-                    if let Some(t) = &row.table {
-                        paint_table_row(&self.editor, origin, &theme, f, row, t, window, cx);
-                    }
-                    continue;
-                }
-                IrKind::Image => {
-                    if let Some(img) = &row.image {
-                        paint_image_row(
-                            &self.editor,
-                            origin,
-                            &theme,
-                            f,
-                            row,
-                            img,
-                            window,
-                            cx,
-                        );
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            // 带外（未 shape）行不可见：跳过文本与背景，避免为整篇占位块画屏。
-            if row.wrapped.is_empty() {
-                continue;
-            }
-            // 行首装饰（列表符号 / 任务框 / 有序号）画在 gutter；警报 chrome 稍后叠画。
-            paint_row_gutter(origin, &theme, f, row, window, cx);
-            // 引述块背景已在上面预画；这里只画文字 + 警报 chrome（标签/箭头叠在文字上）。
-            if row.kind == IrKind::Quote {
-                paint_text_row(origin, &theme, f, row, window, cx);
-                paint_alert_chrome(origin, &theme, f, row, window, cx);
-            } else {
-                paint_text_row(origin, &theme, f, row, window, cx);
-                // 标题折叠箭头（标题保留行右缘 muted 小三角；点击翻转视图本地折叠态）。
-                if matches!(row.kind, IrKind::Heading(_)) {
-                    paint_heading_chevron(&self.editor, origin, &theme, f, row, window, cx);
-                }
-            }
-            // 行内数学 / 行内图片叠加（B1/B2）。
-            paint_inline_maths(&self.editor, origin, &theme, f, row, window, cx);
-            paint_inline_images(&self.editor, origin, f, row, window, cx);
-        }
-        crate::prof::end("wy.paint.rowloop", _t_row);
+        self.paint_band_rows(origin, &theme, f, alert_kinds, window, cx);
         // C5: 悬浮在可点击链接上 → hand 光标。
         for hb in &prepaint.link_grips {
             window.set_cursor_style(CursorStyle::PointingHand, hb);
@@ -972,6 +860,166 @@ impl Element for WyEditorElement {
         // 操作级实时计时结算：本帧若含未结算操作（type/backspace/scroll/open…），
         // 在此以「开始→绘制完成」的墙钟 + 帧内阶段 breakdown 落地一行 OP 记录。
         crate::prof::op_finish_after_paint();
+    }
+}
+
+impl WyEditorElement {
+    /// 本帧带重建的诱因（WY_TRACE 诊断）：frame `None` → `"no-frame"`，否则以逗号连接
+    /// 变化的代标签（rgen/igen/mgen/zgen/width/band）。
+    #[allow(clippy::too_many_arguments)] // 各代数标签 + 宽 + 带，纯只读诊断
+    fn frame_stale_reason(
+        old: Option<&Frame>,
+        rgen: u64,
+        igen: u64,
+        mgen: u64,
+        zgen: u64,
+        width: gpui::Pixels,
+        band: (f32, f32),
+    ) -> String {
+        old.map_or("no-frame".into(), |f| {
+            let mut v = Vec::new();
+            if f.rgen != rgen {
+                v.push("rgen");
+            }
+            if f.igen != igen {
+                v.push("igen");
+            }
+            if f.mgen != mgen {
+                v.push("mgen");
+            }
+            if f.zgen != zgen {
+                v.push("zgen");
+            }
+            if f.width != width {
+                v.push("width");
+            }
+            if f.band != band {
+                v.push("band");
+            }
+            v.join(",")
+        })
+    }
+
+    /// 行内链接的 hand 光标 hitbox（paint 期 `set_cursor_style`）。几何与 `link_hit_at`
+    /// 一致（wrapped 首行的字形几何头/尾两段）——折行时头段到行尾、尾段从行首起。
+    fn link_hit_grips(
+        f: &Frame,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        window: &mut Window,
+    ) -> Vec<gpui::Hitbox> {
+        let mut link_grips = Vec::new();
+        for row in &f.rows {
+            if row.extra.links.is_empty() || row.wrapped.is_empty() {
+                continue;
+            }
+            let Some(w0) = row.wrapped.first() else {
+                continue;
+            };
+            let ox = bounds.origin.x + f.padding + row.x_off;
+            let oy = bounds.origin.y + row.top + px(text_row_shift(row));
+            for lk in &row.extra.links {
+                let (Some(p0), Some(p1)) = (
+                    w0.position_for_index(lk.disp.start, row.lh),
+                    w0.position_for_index(lk.disp.end, row.lh),
+                ) else {
+                    continue;
+                };
+                if p0.y == p1.y {
+                    let hit = Bounds::new(
+                        point(ox + p0.x, oy + p0.y),
+                        size((p1.x - p0.x).max(px(2.)), row.lh),
+                    );
+                    link_grips.push(window.insert_hitbox(hit, HitboxBehavior::Normal));
+                } else {
+                    // 折行链接：头段到行尾、尾段从行首起。
+                    let head = Bounds::new(
+                        point(ox + p0.x, oy + p0.y),
+                        size((w0.width() - p0.x).max(px(2.)), row.lh),
+                    );
+                    let tail = Bounds::new(point(ox, oy + p1.y), size(p1.x.max(px(2.)), row.lh));
+                    link_grips.push(window.insert_hitbox(head, HitboxBehavior::Normal));
+                    link_grips.push(window.insert_hitbox(tail, HitboxBehavior::Normal));
+                }
+            }
+        }
+        link_grips
+    }
+
+    /// 逐行绘制：先给所有可见引述行画灰底带 + 左指示条，再逐行按类型自绘。
+    /// ⚠️ 必须**先画全部背景再画全部文字**——若逐行「带 + 文字」连画，后一行的带会盖住
+    /// 前一行文字底部（引述第一行被第二行背景盖掉的 bug）。
+    /// callout 区域（marker + body 行）的左条统一用警报色，普通引述用灰条。
+    #[allow(clippy::too_many_arguments)] // 原点 + 主题 + 帧 + 警报表 + 窗口 + ctx，自绘管线固有
+    fn paint_band_rows(
+        &self,
+        origin: gpui::Point<gpui::Pixels>,
+        theme: &WyTheme,
+        f: &Frame,
+        alert_kinds: &rustc_hash::FxHashMap<
+            usize,
+            crate::markdown::parse::recognition::AlertKind,
+        >,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let _t_row = crate::prof::begin();
+        for row in &f.rows {
+            if row.kind == IrKind::Quote && !row.wrapped.is_empty() {
+                paint_quote_band(origin, theme, f, row, alert_kinds, window);
+            }
+        }
+        for row in &f.rows {
+            // 块级卡片（数学块 / Mermaid 图）优先自绘，跳过普通文本/代码路径。
+            if let Some(card) = &row.extra.card {
+                paint_card(&self.editor, origin, theme, f, row, card, window, cx);
+                continue;
+            }
+            // 非文本块按类型自绘：代码面板 / 表格网格 / 图片。
+            match row.kind {
+                IrKind::Code => {
+                    // 带外（未 shape）代码块不画（占位无内容）。
+                    if row.wrapped.is_empty() {
+                        continue;
+                    }
+                    paint_code_row(&self.editor, origin, theme, f, row, window, cx);
+                    continue;
+                }
+                IrKind::Table => {
+                    if let Some(t) = &row.table {
+                        paint_table_row(&self.editor, origin, theme, f, row, t, window, cx);
+                    }
+                    continue;
+                }
+                IrKind::Image => {
+                    if let Some(img) = &row.image {
+                        paint_image_row(&self.editor, origin, theme, f, row, img, window, cx);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            // 带外（未 shape）行不可见：跳过文本与背景，避免为整篇占位块画屏。
+            if row.wrapped.is_empty() {
+                continue;
+            }
+            // 行首装饰（列表符号 / 任务框 / 有序号）画在 gutter；警报 chrome 稍后叠画。
+            paint_row_gutter(origin, theme, f, row, window, cx);
+            // 引述块背景已在上面预画；这里只画文字 + 警报 chrome（标签/箭头叠在文字上）。
+            if row.kind == IrKind::Quote {
+                paint_text_row(origin, theme, f, row, window, cx);
+                paint_alert_chrome(origin, theme, f, row, window, cx);
+            } else {
+                paint_text_row(origin, theme, f, row, window, cx);
+                // 标题折叠箭头（标题保留行右缘 muted 小三角；点击翻转视图本地折叠态）。
+                if matches!(row.kind, IrKind::Heading(_)) {
+                    paint_heading_chevron(&self.editor, origin, theme, f, row, window, cx);
+                }
+            }
+            // 行内数学 / 行内图片叠加（B1/B2）。
+            paint_inline_maths(&self.editor, origin, theme, f, row, window, cx);
+            paint_inline_images(&self.editor, origin, f, row, window, cx);
+        }
+        crate::prof::end("wy.paint.rowloop", _t_row);
     }
 }
 

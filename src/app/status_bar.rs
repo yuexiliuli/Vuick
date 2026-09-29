@@ -19,8 +19,75 @@ impl EditorApp {
             self.bar_border(),
         );
 
-        // 左侧：文件名 + 脏标记 + 语言徽标
-        let left = div()
+        let left = self.status_bar_left(dirty, text_primary, language);
+
+        // 右侧：阅读/统计按钮
+        // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
+        let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
+        // 只读预览文档（按后缀识别为 PDF/EPUB 时置位）→ 隐藏阅读控制按钮
+        let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
+        let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
+        let wrap_on = tab
+            .map(|t| t.md_preview.read(cx).is_wrap())
+            .unwrap_or(false);
+        let mut right = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0();
+
+        // 全屏/还原按钮：仅在开启预览且非只读预览（PDF/EPUB）时显示
+        if preview_on && !readonly_preview {
+            right = right.child(self.status_fullscreen_btn(fullscreen, cx));
+        }
+
+        // 换行开关按钮：仅非只读预览（非 PDF/EPUB）且非 Markdown 时显示。
+        // Markdown 编辑区与预览区默认/始终自动换行，不提供切换（隐藏该按钮）。
+        let is_markdown = tab
+            .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
+            .unwrap_or(false);
+        if !readonly_preview && !is_markdown {
+            right = right.child(self.status_wrap_btn(wrap_on, cx));
+        }
+
+        let right = right
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(chip_text)
+                    .child(format!("Ln {ln}, Col {col}")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(text_minor)
+                    .child(format!("{line_count} 行")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(text_minor)
+                    .child(format!("{char_count} 字")),
+            );
+
+        div()
+            .h(px(28.))
+            .bg(surface_bg)
+            .border_t_1()
+            .border_color(bar_border)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .px_3()
+            .child(left)
+            .child(right)
+    }
+
+    /// 状态栏左侧：文件名 + 脏标记 + 语言徽标。
+    fn status_bar_left(&self, dirty: bool, text_primary: gpui::Hsla, language: String) -> gpui::Div {
+        div()
             .flex()
             .flex_row()
             .items_center()
@@ -56,105 +123,48 @@ impl EditorApp {
                     .text_size(px(11.))
                     .text_color(rgb(0x4338ca))
                     .child(language),
-            );
-
-        // 右侧：阅读/统计按钮
-        // PDF / EPUB 等只读预览自带全屏阅读，不适用「全屏/还原」「换行」切换，故隐藏。
-        let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
-        // 只读预览文档（按后缀识别为 PDF/EPUB 时置位）→ 隐藏阅读控制按钮
-        let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
-        let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
-        let wrap_on = tab
-            .map(|t| t.md_preview.read(cx).is_wrap())
-            .unwrap_or(false);
-        let mut right = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .flex_shrink_0();
-
-        // 全屏/还原按钮：仅在开启预览且非只读预览（PDF/EPUB）时显示
-        if preview_on && !readonly_preview {
-            let btn = div()
-                .id("status-fullscreen-btn")
-                .debug_selector(|| "status-fullscreen-btn".into())
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(0xeef2ff))
-                .text_size(px(12.))
-                .text_color(rgb(0x4338ca))
-                .cursor(CursorStyle::PointingHand)
-                .child(if fullscreen { "还原" } else { "全屏" })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(
-                        |this: &mut EditorApp, _ev, window, cx| {
-                            this.toggle_preview_fullscreen(window, cx);
-                        },
-                    ),
-                );
-            right = right.child(btn);
-        }
-
-        // 换行开关按钮：仅非只读预览（非 PDF/EPUB）且非 Markdown 时显示。
-        // Markdown 编辑区与预览区默认/始终自动换行，不提供切换（隐藏该按钮）。
-        let is_markdown = tab
-            .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
-            .unwrap_or(false);
-        if !readonly_preview && !is_markdown {
-            let btn = div()
-                .id("status-wrap-btn")
-                .debug_selector(|| "status-wrap-btn".into())
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(rgb(0xeef2ff))
-                .text_size(px(12.))
-                .text_color(rgb(0x4338ca))
-                .cursor(CursorStyle::PointingHand)
-                .child(if wrap_on { "换行" } else { "不换行" })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this: &mut EditorApp, _ev, window, cx| {
-                        this.toggle_wrap(window, cx);
-                    }),
-                );
-            right = right.child(btn);
-        }
-
-        let right = right
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(chip_text)
-                    .child(format!("Ln {ln}, Col {col}")),
             )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(text_minor)
-                    .child(format!("{line_count} 行")),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(text_minor)
-                    .child(format!("{char_count} 字")),
-            );
+    }
 
+    /// 状态栏右侧「全屏/还原」切换按钮（仅开启预览且非只读预览时挂载）。
+    fn status_fullscreen_btn(&self, fullscreen: bool, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .h(px(28.))
-            .bg(surface_bg)
-            .border_t_1()
-            .border_color(bar_border)
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap_3()
-            .px_3()
-            .child(left)
-            .child(right)
+            .id("status-fullscreen-btn")
+            .debug_selector(|| "status-fullscreen-btn".into())
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0xeef2ff))
+            .text_size(px(12.))
+            .text_color(rgb(0x4338ca))
+            .cursor(CursorStyle::PointingHand)
+            .child(if fullscreen { "还原" } else { "全屏" })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                    this.toggle_preview_fullscreen(window, cx);
+                }),
+            )
+    }
+
+    /// 状态栏右侧「换行/不换行」切换按钮（仅非只读预览且非 Markdown 时挂载）。
+    fn status_wrap_btn(&self, wrap_on: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("status-wrap-btn")
+            .debug_selector(|| "status-wrap-btn".into())
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(0xeef2ff))
+            .text_size(px(12.))
+            .text_color(rgb(0x4338ca))
+            .cursor(CursorStyle::PointingHand)
+            .child(if wrap_on { "换行" } else { "不换行" })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
+                    this.toggle_wrap(window, cx);
+                }),
+            )
     }
 }

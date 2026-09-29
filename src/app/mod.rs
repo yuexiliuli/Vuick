@@ -447,161 +447,176 @@ impl EditorApp {
     ) -> Subscription {
         let ed = editor.clone();
         cx.subscribe(&ed, |this, emitter, ev: &crate::editor::EditorEvent, cx| {
-            if let Some(tab) = this.tabs.iter_mut().find(|t| t.editor == emitter)
-                && ev == &crate::editor::EditorEvent::Edited {
-                    let _t_change = crate::prof::begin();
-                    // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
-                    this.search_scan = None;
-                    tab.edit_version = tab.edit_version.wrapping_add(1);
-                    // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
-                    // CodeEditor 记录最近一次编辑区间（字节），每轮 Change 1:1 取走。
-                    if let Some((s, oe, ne)) =
-                        tab.editor.update(cx, |ed, _| ed.take_last_edit())
-                    {
-                        tab.preview_dirty = merge_preview_dirty(tab.preview_dirty, s, oe, ne);
-                    }
-                    // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
-                    // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
-                    // 不用含幻影尾行的编辑器模型 `line_count()`。
-                    let (line_count, char_count, cursor_row, cursor_col) = {
-                        let st = tab.editor.read(cx);
-                        let cursor = st.cursor_position();
-                        (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
-                    };
-                    // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**：
-                    // 一次同步任务里循环「快照 → 后台扫描 → 装配 → 检查版本是否有新编辑」，
-                    // 有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
-                    // （`preview_syncing` 闸门），从「最后一次按键」起该轮扫描结束即收敛。
-                    if tab.preview_on && !this.preview_pending && !this.preview_syncing {
-                        this.preview_pending = true;
-                        this.preview_syncing = true;
-                        this.preview_seq = this.preview_seq.wrapping_add(1);
-                        let seq = this.preview_seq;
-                        cx.spawn(async move |this, cx| {
-                            loop {
-                                let Some((snapshot, panel_bg, base_dir, prev, version, dirty)) =
-                                    this
-                                        .update(cx, |this, cx| {
-                                            let panel_bg = this.panel_bg();
-                                            let base_dir = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .and_then(|t| t.file_path.as_ref())
-                                                .and_then(|p| p.parent())
-                                                .map(|d| d.to_path_buf());
-                                            let snapshot = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .filter(|t| t.preview_on)
-                                                .map(|t| t.editor.read(cx).text().clone());
-                                            let prev = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .and_then(|t| t.preview_prev.clone());
-                                            let version = this
-                                                .tabs
-                                                .get(this.active_tab)
-                                                .map(|t| t.edit_version)
-                                                .unwrap_or(0);
-                                            let dirty = this
-                                                .tabs
-                                                .get_mut(this.active_tab)
-                                                .and_then(|t| t.preview_dirty.take());
-                                            snapshot.map(|snap| {
-                                                (snap, panel_bg, base_dir, prev, version, dirty)
-                                            })
-                                        })
-                                        .ok()
-                                        .flatten()
-                                else {
-                                    break;
-                                };
-                                let index = match &prev {
-                                    Some((p_src, p_idx)) => {
-                                        let p_src = p_src.clone();
-                                        let p_idx = (**p_idx).clone();
-                                        let snap = snapshot.clone();
-                                        let dirty = dirty.map(|(a, b)| a..b);
-                                        cx.background_executor()
-                                            .spawn(async move {
-                                                crate::markdown::scan_blocks_incremental_rope(
-                                                    &p_src,
-                                                    &p_idx,
-                                                    &snap,
-                                                    dirty,
-                                                )
-                                            })
-                                            .await
-                                    }
-                                    None => {
-                                        let snap = snapshot.clone();
-                                        cx.background_executor()
-                                            .spawn(async move {
-                                                crate::markdown::scan_blocks_rope(&snap)
-                                            })
-                                            .await
-                                    }
-                                };
-                                let index = std::rc::Rc::new(index);
-                                let keep = this
-                                    .update(cx, |this, cx| {
-                                        if this.preview_seq != seq {
-                                            return false;
-                                        }
-                                        let mut keep = false;
-                                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
-                                            if tab.preview_on {
-                                                tab.md_preview.update(cx, |view, cx| {
-                                                    view.set_background(panel_bg);
-                                                    view.set_base_dir(base_dir);
-                                                    view.set_source_with_index(
-                                                        crate::markdown::PreviewSrc::Rope(
-                                                            snapshot.clone(),
-                                                        ),
-                                                        index.clone(),
-                                                        cx,
-                                                    );
-                                                });
-                                                cx.notify();
-                                            }
-                                            tab.preview_prev =
-                                                Some((snapshot.clone(), index.clone()));
-                                            keep = tab.preview_on && tab.edit_version != version;
-                                        }
-                                        keep
-                                    })
-                                    .unwrap_or(false);
-                                if !keep {
-                                    break;
-                                }
-                            }
-                            let _ = this.update(cx, |this, _| {
-                                this.preview_pending = false;
-                                this.preview_syncing = false;
-                            });
-                        })
-                        .detach();
-                    }
-                    // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
-                    // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
-                    if tab.readonly_preview {
-                        let content = tab.editor.read(cx).text().to_string();
-                        tab.content = SharedString::from(content);
-                    }
-                    tab.line_count = line_count;
-                    tab.char_count = char_count;
-                    tab.cursor_row = cursor_row;
-                    tab.cursor_col = cursor_col;
-                    if !tab.dirty {
-                        tab.dirty = true;
-                    }
-                    // 不再 `cx.notify()`：编辑侧的 `notify` 已令窗口把**本视图及其祖先**
-                    // （含 app 根视图）标脏（gpui `mark_view_dirty`），下一帧必重渲染，
-                    // 状态栏/选项卡脏点/预览都在同一帧读到最新值——重复通知只是
-                    // 多走一遍 invalidation 簿记（大文档逐键该项 ~10ms+，见 prof）。
-                    crate::prof::end("tab_change", _t_change);
-                }
+            if ev == &crate::editor::EditorEvent::Edited
+                && let Some(t) = this.tabs.iter().position(|t| t.editor == emitter)
+            {
+                this.on_editor_edited(t, cx);
+            }
         })
+    }
+
+    /// 编辑事件：失效搜索缓存、推进版本、更新脏区间/计数，并按需触发一轮预览同步。
+    /// 用 **选项卡下标** 而非长借 `&mut tab`——中途要调 `start_preview_sync`（整 `self` 可变）。
+    fn on_editor_edited(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
+        let _t_change = crate::prof::begin();
+        // 内容被编辑 → 侧边栏搜索缓存失效 + 版本号推进
+        self.search_scan = None;
+        // 编辑侧通道 → dirty 区间（bounding box，当前文本字节坐标）：
+        // CodeEditor 记录最近一次编辑区间（字节），每轮 Change 1:1 取走。
+        let dirty_range = {
+            let tab = &mut self.tabs[tab_ix];
+            tab.edit_version = tab.edit_version.wrapping_add(1);
+            tab.editor.update(cx, |ed, _| ed.take_last_edit())
+        };
+        if let Some((s, oe, ne)) = dirty_range {
+            let tab = &mut self.tabs[tab_ix];
+            tab.preview_dirty = merge_preview_dirty(tab.preview_dirty, s, oe, ne);
+        }
+        // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
+        // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
+        // 不用含幻影尾行的编辑器模型 `line_count()`。
+        let (line_count, char_count, cursor_row, cursor_col) = {
+            let st = self.tabs[tab_ix].editor.read(cx);
+            let cursor = st.cursor_position();
+            (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
+        };
+        // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**（见 `start_preview_sync`）。
+        if self.tabs[tab_ix].preview_on {
+            self.start_preview_sync(cx);
+        }
+        let tab = &mut self.tabs[tab_ix];
+        // 只对 readonly_preview（EPUB/PDF，编辑区为空）镜像全文到 content；
+        // 普通文本/Markdown 以编辑器 Rope 为准，不做整份副本（省内存）。
+        if tab.readonly_preview {
+            let content = tab.editor.read(cx).text().to_string();
+            tab.content = SharedString::from(content);
+        }
+        tab.line_count = line_count;
+        tab.char_count = char_count;
+        tab.cursor_row = cursor_row;
+        tab.cursor_col = cursor_col;
+        if !tab.dirty {
+            tab.dirty = true;
+        }
+        // 不再 `cx.notify()`：编辑侧的 `notify` 已令窗口把**本视图及其祖先**
+        // （含 app 根视图）标脏（gpui `mark_view_dirty`），下一帧必重渲染，
+        // 状态栏/选项卡脏点/预览都在同一帧读到最新值——重复通知只是
+        // 多走一遍 invalidation 簿记（大文档逐键该项 ~10ms+，见 prof）。
+        crate::prof::end("tab_change", _t_change);
+    }
+
+    /// 开启 **一轮** Markdown 预览同步：循环「快照 → 后台扫描 → 装配 → 检查版本是否有
+    /// 新编辑」，有新编辑就续跑，直到追上最新内容才停——打字期间**不会叠起多轮后台扫描**
+    /// （`preview_syncing` 闸门），从「最后一次按键」起该轮扫描结束即收敛。
+    fn start_preview_sync(&mut self, cx: &mut Context<Self>) {
+        if self.preview_pending || self.preview_syncing {
+            return;
+        }
+        self.preview_pending = true;
+        self.preview_syncing = true;
+        self.preview_seq = self.preview_seq.wrapping_add(1);
+        let seq = self.preview_seq;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let Some((snapshot, panel_bg, base_dir, prev, version, dirty)) =
+                    this
+                        .update(cx, |this, cx| {
+                            let panel_bg = this.panel_bg();
+                            let base_dir = this
+                                .tabs
+                                .get(this.active_tab)
+                                .and_then(|t| t.file_path.as_ref())
+                                .and_then(|p| p.parent())
+                                .map(|d| d.to_path_buf());
+                            let snapshot = this
+                                .tabs
+                                .get(this.active_tab)
+                                .filter(|t| t.preview_on)
+                                .map(|t| t.editor.read(cx).text().clone());
+                            let prev = this
+                                .tabs
+                                .get(this.active_tab)
+                                .and_then(|t| t.preview_prev.clone());
+                            let version = this
+                                .tabs
+                                .get(this.active_tab)
+                                .map(|t| t.edit_version)
+                                .unwrap_or(0);
+                            let dirty = this
+                                .tabs
+                                .get_mut(this.active_tab)
+                                .and_then(|t| t.preview_dirty.take());
+                            snapshot.map(|snap| {
+                                (snap, panel_bg, base_dir, prev, version, dirty)
+                            })
+                        })
+                        .ok()
+                        .flatten()
+                else {
+                    break;
+                };
+                let index = match &prev {
+                    Some((p_src, p_idx)) => {
+                        let p_src = p_src.clone();
+                        let p_idx = (**p_idx).clone();
+                        let snap = snapshot.clone();
+                        let dirty = dirty.map(|(a, b)| a..b);
+                        cx.background_executor()
+                            .spawn(async move {
+                                crate::markdown::scan_blocks_incremental_rope(
+                                    &p_src,
+                                    &p_idx,
+                                    &snap,
+                                    dirty,
+                                )
+                            })
+                            .await
+                    }
+                    None => {
+                        let snap = snapshot.clone();
+                        cx.background_executor()
+                            .spawn(async move {
+                                crate::markdown::scan_blocks_rope(&snap)
+                            })
+                            .await
+                    }
+                };
+                let index = std::rc::Rc::new(index);
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.preview_seq != seq {
+                            return false;
+                        }
+                        let mut keep = false;
+                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                            if tab.preview_on {
+                                tab.md_preview.update(cx, |view, cx| {
+                                    view.set_background(panel_bg);
+                                    view.set_base_dir(base_dir);
+                                    view.set_source_with_index(
+                                        crate::markdown::PreviewSrc::Rope(snapshot.clone()),
+                                        index.clone(),
+                                        cx,
+                                    );
+                                });
+                                cx.notify();
+                            }
+                            tab.preview_prev = Some((snapshot.clone(), index.clone()));
+                            keep = tab.preview_on && tab.edit_version != version;
+                        }
+                        keep
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, _| {
+                this.preview_pending = false;
+                this.preview_syncing = false;
+            });
+        })
+        .detach();
     }
 
     /// 从本窗口「拔出」一个选项卡：移除选项卡（**不**释放 PDF 纹理、不重置编辑器——
@@ -1092,10 +1107,17 @@ impl EditorApp {
     /// 选项卡的「有效内容」：`live2`（WyEditor，实时）开启时读它，否则读源码编辑区。
     /// 保存/关闭/写回统一走此口径——**live 期间源码编辑区不镜像**（去 O(n)），直接读
     /// WyEditor 的 rope 才不丢内容（大文档 close→保存 若读旧编辑区会整段丢失）。
+    /// 大文档后台解析**未完成**（`is_loaded() == false`）时 live2 是空壳，回退源码编辑区。
     pub(super) fn tab_effective_text(&self, idx: usize, cx: &App) -> String {
         match self.tabs.get(idx) {
             Some(t) => match &t.live2 {
-                Some(l2) => l2.read(cx).text().to_string(),
+                Some(l2) => {
+                    if l2.read(cx).is_loaded() {
+                        l2.read(cx).text().to_string()
+                    } else {
+                        t.editor.read(cx).value().to_string()
+                    }
+                }
                 None => t.editor.read(cx).value().to_string(),
             },
             None => String::new(),
@@ -1108,6 +1130,13 @@ impl EditorApp {
         tab.live_edit = false;
         tab._live2_sub = None;
         let Some(l2) = tab.live2.take() else { return };
+        // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
+        // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
+        if !l2.read(cx).is_loaded() {
+            self.status = SharedString::from("预览编辑测试：关（加载中退出，未写回编辑区）");
+            self.status_ok = false;
+            return;
+        }
         let text = l2.read(cx).text().to_string();
         tab.content = SharedString::from(text);
         let content = tab.content.clone();
@@ -1133,9 +1162,20 @@ impl EditorApp {
         if self.tabs[idx].live2.is_some() {
             self.commit_live(idx, cx);
         } else {
-            let text = self.tabs[idx].editor.read(cx).text_string();
-            let text_seed = text.clone();
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text_seed.as_str()));
+            // 源快照：O(1) COW Rope。大文档走**后台解析**（与预览的后台 scan_blocks 同构）：
+            // UI 线程只做 O(1) 快照 + 空壳编辑器创建 + 完成装配；整篇 O(n) 解析
+            // （`Doc::open` 6.4MB 实测 ~200ms）在 `background_executor`。小文档保持同步
+            // （无「空白→内容」闪烁）。加载完成前 `is_loaded()==false`，宿主读写文本
+            // （保存/退出）回退源码编辑区（`tab_effective_text` / `commit_live` 已守卫）。
+            const ASYNC_LOAD_MIN_BYTES: usize = 512 * 1024;
+            let rope = self.tabs[idx].editor.read(cx).text().clone();
+            let async_load = rope.len() >= ASYNC_LOAD_MIN_BYTES;
+            let ed = if async_load {
+                cx.new(|cx| WyEditor::new(window, cx))
+            } else {
+                let text = SharedString::from(rope.to_string());
+                cx.new(|cx| WyEditor::new(window, cx).with_text(text.as_ref()))
+            };
             // 同步全局字号（新建即套用；WY 字号由编辑器自持，measure/prepaint 一致）
             let fs = self.font_size;
             ed.update(cx, |ed, _| ed.set_font_size(gpui::px(fs)));
@@ -1177,6 +1217,38 @@ impl EditorApp {
             tab.live2 = Some(ed.clone());
             tab._live2_sub = Some(ed_sub);
             tab.live_edit = true;
+            if async_load {
+                let tab_idx = idx;
+                let ed_install = ed.clone();
+                cx.spawn(async move |this, cx| {
+                    let t0 = std::time::Instant::now();
+                    let result =
+                        cx.background_executor()
+                            .spawn(async move {
+                                crate::markdown::wysiwyg::WyEditor::open_from_rope(rope)
+                            })
+                            .await;
+                    crate::prof::add_absolute(
+                        "wy.app.load_async_parse",
+                        t0.elapsed(),
+                    );
+                    let _ = this.update(cx, |this, cx| {
+                        // 只装配仍挂在原 tab 的 live2（用户在解析期间切换/退出则丢弃）。
+                        if this
+                            .tabs
+                            .get(tab_idx)
+                            .is_some_and(|t| t.live2.as_ref() == Some(&ed_install))
+                        {
+                            ed_install.update(cx, |ed, _| ed.install_open(result));
+                            let tab = &mut this.tabs[tab_idx];
+                            tab.line_count = ed_install.read(cx).line_count();
+                            tab.char_count = ed_install.read(cx).char_count();
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
             self.status = SharedString::from("预览编辑测试：开（本项目 Doc 管线 WYSIWYG，初步实现）");
             self.status_ok = true;
             let focus = gpui::Focusable::focus_handle(ed.read(cx), cx);

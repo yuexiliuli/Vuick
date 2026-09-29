@@ -335,12 +335,19 @@ pub(crate) struct Doc {
 impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
+        let _t = crate::prof::begin();
         let index = parse::scan_blocks(src.as_ref());
+        crate::prof::end("doc.open.scan_blocks", _t);
+        let _t = crate::prof::begin();
         let line_starts: Vec<usize> = parse::build_line_starts_u32(src.as_ref())
             .into_iter()
             .map(|b| b as usize)
             .collect();
+        crate::prof::end("doc.open.line_starts", _t);
+        let _t = crate::prof::begin();
         let rope = Rope::from(&*src);
+        crate::prof::end("doc.open.rope", _t);
+        let _t = crate::prof::begin();
         let char_count = src.chars().count();
         let line_utf16_starts = build_line_utf16_starts(
             |s, e| src.as_ref()[s..e].encode_utf16().count(),
@@ -348,6 +355,7 @@ impl Doc {
             src.len(),
         );
         let total_utf16 = src.encode_utf16().count();
+        crate::prof::end("doc.open.counts_utf16", _t);
         Self {
             src: DocSrc::Str(src),
             index,

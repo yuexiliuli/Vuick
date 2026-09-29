@@ -22,7 +22,7 @@ impl EditorApp {
         window: &mut Window,
         grow: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         // PDF / EPUB 等只读预览文档不生成编辑区（即使处于分屏/编辑-only 布局也直接跳过）。
         let readonly = self
             .tabs
@@ -30,7 +30,7 @@ impl EditorApp {
             .map(|t| t.readonly_preview)
             .unwrap_or(false);
         if readonly {
-            return div().id("editor-area").size_full();
+            return div().id("editor-area").size_full().into_any_element();
         }
         // 大文档异步打开：编辑器内容已就绪，但让预览先把内容画出来。
         // 这一帧渲染轻量占位（不含 16 万行编辑器 → 布局轻快），并复位标记请求
@@ -39,101 +39,118 @@ impl EditorApp {
         if self.tabs[self.active_tab].editor_pending {
             self.tabs[self.active_tab].editor_pending = false;
             cx.notify();
-            let panel_bg = self.panel_bg();
-            let muted = self.text_minor();
-            // 占位与正式编辑区使用**同一套 flex 布局参数**（flex_1/grow/min_w(0)/
-            // overflow_hidden），否则 `.size_full()`（w:100%）在分屏 flex 行里会占满
-            // 整行，把预览顶出窗口——用户看到"编辑区一打开就很宽、不与预览平分"。
-            return div()
-                .id("editor-area")
-                .debug_selector(|| "editor-area".into())
-                .flex_1()
-                .flex_grow(grow)
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .overflow_hidden()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(panel_bg)
-                .child(
-                    div()
-                        .text_color(muted)
-                        .text_size(px(13.))
-                        .child("正在载入编辑区…（预览已就绪）"),
-                );
+            return self.render_editor_pending(grow);
         }
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
-        // 渲染期把全局字号推进到 WYSIWYG，并做**缩放视口锚定**（对齐 view / editor）：
-        // 注入宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = scroll 偏移 −
-        // 顶部内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号
-        // 重建帧并把锚点块的精确位置写回宿主滚动句柄（prepaint 读偏移之前完成），
-        // Ctrl+滚轮缩放**无缝**、不带动滚动位置。
         if let Some(ed) = self.tabs[self.active_tab].live2.clone() {
-            let fs = self.font_size;
-            let vhand = self.tabs[self.active_tab].live_vscroll.clone();
-            let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
-            ed.update(cx, |ed, _| {
-                ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
-                ed.set_viewport_top(local_top); // 用缩放前旧顶捕捉锚点
-                ed.prepare_font_zoom(gpui::px(fs), window);
-            });
+            return self.render_live_area(&ed, window, grow, cx);
         }
-        let live_any: Option<gpui::AnyElement> = self.tabs[self.active_tab]
-            .live2
-            .clone()
-            .map(|e| e.into_any_element());
-        if let Some(live_any) = live_any {
-            let text_color = self.text_primary();
-            let fs = self.font_size;
-            // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
-            // GPUI 不绘制可见滚动条，右侧 `Scrollbar::vertical` 自绘跟随它。
-            let vhand = self.tabs[self.active_tab].live_vscroll.clone();
-            return div()
-                .id("editor-area")
-                .debug_selector(|| "editor-area".into())
-                .relative()
-                .flex_1()
-                .flex_grow(grow)
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .bg(self.panel_bg())
-                .overflow_hidden()
-                .child(
-                    div()
-                        .id("live-scroll")
-                        .debug_selector(|| "live-scroll".into())
-                        .relative()
-                        .size_full()
-                        .overflow_y_scroll()
-                        .track_scroll(&vhand)
-                        .child(
-                            div()
-                                .id("live-body")
-                                .debug_selector(|| "live-body".into())
-                                .w_full()
-                                .px(px(12.))
-                                .py(px(LIVE_BODY_PAD_Y))
-                                .text_size(px(fs))
-                                .text_color(text_color)
-                                .child(live_any),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("live-vscrollbar-overlay")
-                        .debug_selector(|| "live-vscrollbar-overlay".into())
-                        .absolute()
-                        .inset_0()
-                        .child(
-                            Scrollbar::vertical(&vhand)
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                )
-                .child(Self::zoom_overlay(cx));
-        }
+        self.render_plain_editor(grow, cx)
+    }
+
+    /// 大文档异步打开中的编辑区轻量占位（与正式编辑区**同一套 flex 布局参数**——
+    /// `flex_1/grow/min_w(0)/overflow_hidden`，否则 `.size_full()` 在分屏 flex 行里会占满
+    /// 整行，把预览顶出窗口）。
+    fn render_editor_pending(&self, grow: f32) -> gpui::AnyElement {
+        let panel_bg = self.panel_bg();
+        let muted = self.text_minor();
+        div()
+            .id("editor-area")
+            .debug_selector(|| "editor-area".into())
+            .flex_1()
+            .flex_grow(grow)
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(panel_bg)
+            .child(
+                div()
+                    .text_color(muted)
+                    .text_size(px(13.))
+                    .child("正在载入编辑区…（预览已就绪）"),
+            )
+            .into_any_element()
+    }
+
+    /// WYSIWYG（live2）左面板：宿主滚动容器 + 自绘纵向滚动条 + Ctrl+滚轮缩放。
+    /// 渲染期把全局字号推进到 WYSIWYG，并做**缩放视口锚定**（对齐 view / editor）：
+    /// 注入宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = scroll 偏移 −
+    /// 顶部内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号
+    /// 重建帧并把锚点块的精确位置写回宿主滚动句柄（prepaint 读偏移之前完成），
+    /// Ctrl+滚轮缩放**无缝**、不带动滚动位置。
+    fn render_live_area(
+        &mut self,
+        ed: &gpui::Entity<crate::markdown::wysiwyg::WyEditor>,
+        window: &mut Window,
+        grow: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let fs = self.font_size;
+        let vhand = self.tabs[self.active_tab].live_vscroll.clone();
+        let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
+        ed.update(cx, |ed, _| {
+            ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
+            ed.set_viewport_top(local_top); // 用缩放前旧顶捕捉锚点
+            ed.prepare_font_zoom(gpui::px(fs), window);
+        });
+        let live_any = ed.clone().into_any_element();
+        let text_color = self.text_primary();
+        let fs = self.font_size;
+        // 纵向滚动句柄（跨帧稳定）：`#live-scroll` 原生 `overflow_y_scroll` 在此
+        // GPUI 不绘制可见滚动条，右侧 `Scrollbar::vertical` 自绘跟随它。
+        let vhand = self.tabs[self.active_tab].live_vscroll.clone();
+        div()
+            .id("editor-area")
+            .debug_selector(|| "editor-area".into())
+            .relative()
+            .flex_1()
+            .flex_grow(grow)
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .bg(self.panel_bg())
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("live-scroll")
+                    .debug_selector(|| "live-scroll".into())
+                    .relative()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&vhand)
+                    .child(
+                        div()
+                            .id("live-body")
+                            .debug_selector(|| "live-body".into())
+                            .w_full()
+                            .px(px(12.))
+                            .py(px(LIVE_BODY_PAD_Y))
+                            .text_size(px(fs))
+                            .text_color(text_color)
+                            .child(live_any),
+                    ),
+            )
+            .child(
+                div()
+                    .id("live-vscrollbar-overlay")
+                    .debug_selector(|| "live-vscrollbar-overlay".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::vertical(&vhand)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
+            .child(Self::zoom_overlay(cx))
+            .into_any_element()
+    }
+
+    /// 普通源码编辑区（非只读 / 非挂载占位 / 非 WYSIWYG）。
+    fn render_plain_editor(&mut self, grow: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
         let editor = self.tabs[self.active_tab].editor.clone();
         // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
         let font_size = self.font_size;
@@ -160,6 +177,7 @@ impl EditorApp {
             .child(editor)
             // 透明覆盖层（画在编辑器之上，命中测试最靠前)：拦截 Ctrl+滚轮缩放。
             .child(Self::zoom_overlay(cx))
+            .into_any_element()
     }
 
     /// 编辑区 / 预览区共用的 Ctrl+滚轮缩放覆盖层（Ctrl+滚轮改全局字号；普通滚轮透传）。

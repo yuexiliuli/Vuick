@@ -408,54 +408,17 @@ impl EditorApp {
 
         let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
             Some(tab) => {
-                let mut rows: Vec<gpui::AnyElement> = Vec::new();
+                let collapsed = self.sidebar.toc_collapsed.clone();
                 // PDF 书签目录
                 if let Some(pdf) = &tab.pdf_preview {
                     let outlines = pdf.read(cx).outlines().to_vec();
                     if outlines.is_empty() {
                         self.sidebar_empty_hint("当前 PDF 无书签目录")
                     } else {
-                        let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
-                        let visible =
-                            crate::toc::toc_visibility(&levels, &self.sidebar.toc_collapsed);
-                        let wk = pdf.clone();
-                        for (i, e) in outlines.iter().enumerate() {
-                            if !visible[i] {
-                                continue;
-                            }
-                            let page = e.page_index;
-                            let wk = wk.clone();
-                            let has_child = crate::toc::toc_node_has_child(&levels, i);
-                            let is_collapsed =
-                                has_child && self.sidebar.toc_collapsed.contains(&i);
-                            let idx = i;
-                            rows.push(crate::toc::toc_item_frame(
-                                format!("sidebar-toc-pdf-{i}"),
-                                format!("sidebar-toc-caret-{i}"),
-                                e.level,
-                                e.title.clone(),
-                                has_child,
-                                is_collapsed,
-                                e.level == 0,
-                                (page != usize::MAX).then(|| (page + 1).to_string()),
-                                fg,
-                                muted,
-                                active_bg,
-                                accent,
-                                move |_, _w, cx| {
-                                    if page != usize::MAX {
-                                        wk.update(cx, |v, cx| {
-                                            v.scroll_to_page(page);
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_sidebar_toc_collapse(idx, cx);
-                                }),
-                            ));
-                        }
+                        let rows = self.sidebar_toc_pdf_rows(
+                            &outlines, &collapsed, fg, muted, active_bg, accent,
+                            pdf.clone(), cx,
+                        );
                         div().flex().flex_col().py_1().children(rows).into_any_element()
                     }
                 } else {
@@ -464,44 +427,10 @@ impl EditorApp {
                     if entries.is_empty() {
                         self.sidebar_empty_hint("当前文件无目录（无标题）")
                     } else {
-                        let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
-                        let visible =
-                            crate::toc::toc_visibility(&levels, &self.sidebar.toc_collapsed);
-                        let wk = tab.md_preview.clone();
-                        for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
-                            if !visible[i] {
-                                continue;
-                            }
-                            let wk = wk.clone();
-                            let has_child = crate::toc::toc_node_has_child(&levels, i);
-                            let is_collapsed =
-                                has_child && self.sidebar.toc_collapsed.contains(&i);
-                            let idx = i;
-                            rows.push(crate::toc::toc_item_frame(
-                                format!("sidebar-toc-md-{i}"),
-                                format!("sidebar-toc-caret-{i}"),
-                                lvl as usize,
-                                text.to_string(),
-                                has_child,
-                                is_collapsed,
-                                lvl == 1,
-                                None,
-                                fg,
-                                muted,
-                                active_bg,
-                                accent,
-                                move |_, _w, cx| {
-                                    wk.update(cx, |v, cx| {
-                                        v.scroll_to_row(row_ix);
-                                        cx.notify();
-                                    });
-                                },
-                                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.toggle_sidebar_toc_collapse(idx, cx);
-                                }),
-                            ));
-                        }
+                        let rows = self.sidebar_toc_md_rows(
+                            &entries, &collapsed, fg, muted, active_bg, accent,
+                            tab.md_preview.clone(), cx,
+                        );
                         div().flex().flex_col().py_1().children(rows).into_any_element()
                     }
                 }
@@ -532,6 +461,113 @@ impl EditorApp {
                     .child(inner),
             )
             .into_any_element()
+    }
+
+    /// PDF 书签目录条目（可折叠树；可见性按当前折叠集合过滤，点击跳转页码）。
+    #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
+    fn sidebar_toc_pdf_rows(
+        &self,
+        outlines: &[crate::pdf::PdfOutlineEntry],
+        collapsed: &std::collections::HashSet<usize>,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        accent: gpui::Hsla,
+        pdf: gpui::Entity<crate::pdf::PdfViewer>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
+        let visible = crate::toc::toc_visibility(&levels, collapsed);
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (i, e) in outlines.iter().enumerate() {
+            if !visible[i] {
+                continue;
+            }
+            let page = e.page_index;
+            let wk = pdf.clone();
+            let has_child = crate::toc::toc_node_has_child(&levels, i);
+            let is_collapsed = has_child && collapsed.contains(&i);
+            let idx = i;
+            rows.push(crate::toc::toc_item_frame(
+                format!("sidebar-toc-pdf-{i}"),
+                format!("sidebar-toc-caret-{i}"),
+                e.level,
+                e.title.clone(),
+                has_child,
+                is_collapsed,
+                e.level == 0,
+                (page != usize::MAX).then(|| (page + 1).to_string()),
+                fg,
+                muted,
+                active_bg,
+                accent,
+                move |_, _w, cx| {
+                    if page != usize::MAX {
+                        wk.update(cx, |v, cx| {
+                            v.scroll_to_page(page);
+                            cx.notify();
+                        });
+                    }
+                },
+                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.toggle_sidebar_toc_collapse(idx, cx);
+                }),
+            ));
+        }
+        rows
+    }
+
+    /// Markdown 标题目录条目（可折叠树；可见性按当前折叠集合过滤，点击滚动到行）。
+    #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
+    fn sidebar_toc_md_rows(
+        &self,
+        entries: &[(usize, u8, SharedString)],
+        collapsed: &std::collections::HashSet<usize>,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        accent: gpui::Hsla,
+        md: gpui::Entity<crate::markdown::view::MarkdownPreview>,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
+        let visible = crate::toc::toc_visibility(&levels, collapsed);
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
+            if !visible[i] {
+                continue;
+            }
+            let wk = md.clone();
+            let has_child = crate::toc::toc_node_has_child(&levels, i);
+            let is_collapsed = has_child && collapsed.contains(&i);
+            let idx = i;
+            rows.push(crate::toc::toc_item_frame(
+                format!("sidebar-toc-md-{i}"),
+                format!("sidebar-toc-caret-{i}"),
+                lvl as usize,
+                text.to_string(),
+                has_child,
+                is_collapsed,
+                lvl == 1,
+                None,
+                fg,
+                muted,
+                active_bg,
+                accent,
+                move |_, _w, cx| {
+                    wk.update(cx, |v, cx| {
+                        v.scroll_to_row(row_ix);
+                        cx.notify();
+                    });
+                },
+                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                    cx.stop_propagation();
+                    this.toggle_sidebar_toc_collapse(idx, cx);
+                }),
+            ));
+        }
+        rows
     }
 
     /// 「搜索」视图：关键字输入框 + 当前文档的匹配结果（文件名跨打开文件匹配）。
@@ -609,12 +645,33 @@ impl EditorApp {
             return self.render_sidebar_pdf_search(&pdf, q, cx);
         }
         let scan = self.sidebar_search_scan(q, cx);
-
-        let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
-        let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
         let hits = scan.file_tabs.len() + scan.line_hits.len();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        rows.extend(self.sidebar_search_file_rows(&scan, fg, muted, active_bg, cx));
+        rows.extend(self.sidebar_search_line_rows(&scan, muted, active_bg, cx));
 
-        // 文件名匹配（跨所有打开文件）：相当于「打开文件」快速选择器
+        div()
+            .id("sidebar-search-results")
+            .debug_selector(|| "sidebar-search-results".into())
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(self.sidebar_search_summary(hits, muted))
+            .child(div().flex().flex_col().py_1().children(rows))
+            .into_any_element()
+    }
+
+    /// 文件名命中（跨所有打开文件）：相当于「打开文件」快速选择器，点击激活选项卡。
+    fn sidebar_search_file_rows(
+        &self,
+        scan: &SidebarSearchScan,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut file_rows: Vec<gpui::AnyElement> = Vec::new();
         for ti in scan.file_tabs.iter().copied() {
             let name = self.tabs[ti]
                 .file_path
@@ -654,11 +711,21 @@ impl EditorApp {
                 );
             file_rows.push(r.into_any_element());
         }
+        file_rows
+    }
 
-        // 行内容命中：只在「当前活动文档」内搜索——若仍扫描所有打开的选项卡，
-        // 在 PDF 预览（PDF 无可搜索文本，content 为空）下会冒出别的文件
-        // （如 EPUB 完整正文）的内容，看起来像搜索到了错误文档。
+    /// 行内容命中（只在「当前活动文档」内搜索）——若仍扫描所有打开的选项卡，
+    /// 在 PDF 预览（无可搜索文本，content 为空）下会冒出别的文件（如 EPUB 完整正文）
+    /// 的内容，看起来像搜索到了错误文档。点击：激活文档 + 光标/预览滚到命中行并高亮。
+    fn sidebar_search_line_rows(
+        &self,
+        scan: &SidebarSearchScan,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let ti = self.active_tab;
+        let mut line_rows: Vec<gpui::AnyElement> = Vec::new();
         for hit in &scan.line_hits {
             let li = hit.line;
             let match_range = hit.range.clone();
@@ -714,9 +781,12 @@ impl EditorApp {
                 );
             line_rows.push(r.into_any_element());
         }
+        line_rows
+    }
 
-        let total = hits;
-        let summary = if total == 0 {
+    /// 搜索结果头：0 命中提示 / n 处匹配。
+    fn sidebar_search_summary(&self, total: usize, muted: gpui::Hsla) -> gpui::AnyElement {
+        if total == 0 {
             div()
                 .px_3()
                 .py_2()
@@ -732,22 +802,7 @@ impl EditorApp {
                 .text_color(muted)
                 .child(format!("{total} 处匹配"))
                 .into_any_element()
-        };
-
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        rows.extend(file_rows);
-        rows.extend(line_rows);
-
-        div()
-            .id("sidebar-search-results")
-            .debug_selector(|| "sidebar-search-results".into())
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(summary)
-            .child(div().flex().flex_col().py_1().children(rows))
-            .into_any_element()
+        }
     }
 
     /// PDF 标签的搜索视图：顶部一行「n 处匹配」计数（右侧为 ↑/↓ 导航），
@@ -764,40 +819,76 @@ impl EditorApp {
         let (count, truncated, active) = pdf.read(cx).search_summary();
         let snippets: Vec<(usize, String)> = pdf.read(cx).search_snippets();
 
-        // 计数 + ↑/↓ 导航同行排布于顶部一行（计数在左、导航靠右；计数过长尾部省略）
-        let mk_nav = |symbol: &'static str,
-                      delta: i64,
-                      target: gpui::Entity<crate::pdf::PdfViewer>,
-                      cx: &mut Context<Self>| {
-            let id = if delta < 0 {
-                "sidebar-search-pdf-prev"
-            } else {
-                "sidebar-search-pdf-next"
-            };
-            div()
-                .id(SharedString::from(id))
-                .debug_selector(move || SharedString::from(id).into())
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(28.))
-                .h(px(24.))
-                .mx(px(2.))
-                .rounded_md()
-                .text_size(px(16.))
-                .text_color(fg)
-                .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(active_bg))
-                .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
-                    target.update(cx, |v, cx| v.move_match(delta, cx));
-                    cx.notify();
-                }))
-                .child(symbol)
-        };
-        let prev_btn = mk_nav("↑", -1, pdf.clone(), cx);
-        let next_btn = mk_nav("↓", 1, pdf.clone(), cx);
+        let prev_btn = self.sidebar_pdf_nav_btn("↑", -1, pdf.clone(), fg, active_bg, cx);
+        let next_btn = self.sidebar_pdf_nav_btn("↓", 1, pdf.clone(), fg, active_bg, cx);
 
-        let summary: gpui::AnyElement = if count == 0 {
+        let summary = Self::sidebar_pdf_search_summary(
+            count, truncated, q, fg, muted, prev_btn, next_btn,
+        );
+        let hit_rows = self.sidebar_pdf_hit_rows(pdf, &snippets, active, fg, muted, active_bg, cx);
+
+        div()
+            .id("sidebar-search-results-pdf")
+            .debug_selector(|| "sidebar-search-results-pdf".into())
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .child(summary)
+            .child(div().flex().flex_col().py_1().children(hit_rows))
+            .into_any_element()
+    }
+
+    /// PDF 搜索头部「上一处 / 下一处」导航按钮（↑/↓，点击在命中间移动）。
+    /// 返回 owned `AnyElement`（避免 RPIT 捕获 `cx` 生命周期导致连续两按钮借用冲突）。
+    fn sidebar_pdf_nav_btn(
+        &self,
+        symbol: &'static str,
+        delta: i64,
+        target: gpui::Entity<crate::pdf::PdfViewer>,
+        fg: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = if delta < 0 {
+            "sidebar-search-pdf-prev"
+        } else {
+            "sidebar-search-pdf-next"
+        };
+        div()
+            .id(SharedString::from(id))
+            .debug_selector(move || SharedString::from(id).into())
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(28.))
+            .h(px(24.))
+            .mx(px(2.))
+            .rounded_md()
+            .text_size(px(16.))
+            .text_color(fg)
+            .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(active_bg))
+            .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
+                target.update(cx, |v, cx| v.move_match(delta, cx));
+                cx.notify();
+            }))
+            .child(symbol)
+            .into_any_element()
+    }
+
+    /// PDF 搜索头部「n 处匹配」计数（计数在左、导航靠右；计数过长尾部省略）；
+    /// 无匹配时给出提示文案。
+    fn sidebar_pdf_search_summary(
+        count: usize,
+        truncated: bool,
+        q: &str,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        prev: impl IntoElement,
+        next: impl IntoElement,
+    ) -> gpui::AnyElement {
+        if count == 0 {
             let hint = if q.trim().is_empty() {
                 "在 PDF 全文检索；输入关键字"
             } else {
@@ -842,15 +933,29 @@ impl EditorApp {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .child(prev_btn)
-                        .child(next_btn),
+                        .child(prev)
+                        .child(next),
                 )
                 .into_any_element()
-        };
+        }
+    }
 
-        // 命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；当前激活命中高亮
+    /// PDF 搜索命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；
+    /// 当前激活命中高亮，点击跳转到该命中页。
+    #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 命中列表，与 render_* 同构
+    fn sidebar_pdf_hit_rows(
+        &self,
+        pdf: &gpui::Entity<crate::pdf::PdfViewer>,
+        snippets: &[(usize, String)],
+        active: usize,
+        fg: gpui::Hsla,
+        muted: gpui::Hsla,
+        active_bg: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
         let mut hit_rows: Vec<gpui::AnyElement> = Vec::new();
-        for (idx, (page, snippet)) in snippets.into_iter().enumerate() {
+        for (idx, (page, snippet)) in snippets.iter().enumerate() {
+            let page = *page;
             let color = if idx == active { fg } else { muted };
             let row_pdf = pdf.clone();
             let r = div()
@@ -882,17 +987,7 @@ impl EditorApp {
                 );
             hit_rows.push(r.into_any_element());
         }
-
-        div()
-            .id("sidebar-search-results-pdf")
-            .debug_selector(|| "sidebar-search-results-pdf".into())
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(summary)
-            .child(div().flex().flex_col().py_1().children(hit_rows))
-            .into_any_element()
+        hit_rows
     }
 
     /// 侧边栏搜索「扫描并缓存」：查询词 + 活动文档未变时命中缓存（O(1) Rc 克隆，

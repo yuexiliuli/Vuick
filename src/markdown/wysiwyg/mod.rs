@@ -49,6 +49,7 @@ use gpui::{
 
 use super::doc::Doc;
 use crate::markdown::parse::recognition::{self, LinkHit};
+use ropey::Rope;
 
 /// 块布局的可变引用（`ensure_block_layout` 返回 / 缓存槽共用）。
 pub(crate) type BlockLayoutRef = Rc<std::cell::RefCell<element::BlockLayout>>;
@@ -226,6 +227,10 @@ pub struct WyEditor {
     doc: Doc,
     focus: FocusHandle,
     caret: usize,
+    /// 是否已装入过完整源（`set_source_text`/`install_open` 置真）。App 大文档 load 走
+    /// 后台解析时，`new()` 产生**空**编辑器——在 `install_open` 完成前该编辑器没有内容，
+    /// 宿主读取 `text()` 写回必须回退到源码编辑区（否则加载窗口内保存/退出会丢内容）。
+    loaded: bool,
     theme: WyTheme,
     /// 本帧行网格（measure→prepaint→paint 复用；**窗口化**：仅带内块被真正 shape，
     /// 带外块用 `BlockMeta` 估算高度占位，避免大文档整篇每帧 shape 卡死）。
@@ -914,6 +919,14 @@ impl Prewarm {
     }
 }
 
+/// 后台装载结果：整篇 O(n) 解析（Doc::open + 派生标记计数）的**纯输出**。`Send`，
+/// 可在 `background_executor` 任意线程构建、再回 UI 线程 [`WyEditor::install_open`]。
+pub(crate) struct WyOpenResult {
+    pub(crate) doc: Doc,
+    pub(crate) math_dollar_cnt: usize,
+    pub(crate) alert_marker_cnt: usize,
+}
+
 impl WyEditor {
     /// 缩放锚点收敛判定：相邻两帧恢复目标位移小于此值（px）即视为高度已稳定并消费锚点。
     pub(crate) const ZOOM_ANCHOR_EPS: f32 = 0.5;
@@ -929,6 +942,7 @@ impl WyEditor {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
             caret: 0,
+            loaded: false,
             theme: WyTheme::from_style(&p, ts.font(), fs),
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
@@ -1302,10 +1316,51 @@ impl WyEditor {
 
     /// 覆盖源并重建文档模型（load 路径：一次性 O(n)）。rope COW 为唯一源，不再旁挂
     /// 一份 `content` SharedString（每键整串复制的旧成本由此消掉）。
+    ///
+    /// 大文档（App load）不直接走这里：整篇 O(n) 解析挪到后台（[`Self::open_from_rope`]），
+    /// 完成后再 [`Self::install_open`] 装配——本函数只保留给同步路径（小文档/测试）。
     pub fn set_source_text(&mut self, text: &str) {
         let ss = SharedString::from(text);
-        self.doc = Doc::open(ss);
+        self.install_open(Self::open_from_str(ss));
+    }
+
+    /// 是否已装入完整源（见 [`Self::loaded`]）：`false` = App 大文档后台解析在途，
+    /// 编辑器内容为空，宿主读写文本必须回退源码编辑区。
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// 从 `SharedString` 完整构建（同步路径；`set_source_text` 直接用它）。
+    ///
+    /// 派生扫描的**标记计数器**（全篇各一次 O(n)，之后增量维护 O(编辑)）——`derived()`
+    /// 预筛用计数，避免每次内容变更对 7MB 全篇 `contains('$')` 重扫（debug 下 ~100ms/键）。
+    pub(crate) fn open_from_str(text: SharedString) -> WyOpenResult {
+        let _t = crate::prof::begin();
+        let doc = Doc::open(text.clone());
+        crate::prof::end("wy.open.doc", _t);
+        WyOpenResult {
+            doc,
+            math_dollar_cnt: text.as_ref().bytes().filter(|&b| b == b'$').count(),
+            alert_marker_cnt: text.as_ref().matches("[!").count(),
+        }
+    }
+
+    /// 从编辑器 `Rope`（O(1) COW 快照）完整构建——App 大文档 load 的后台段：
+    /// `Doc::open` 6.4MB 解析（~200ms）与标记计数全在这里，UI 线程只做快照 + 装配。
+    pub(crate) fn open_from_rope(rope: Rope) -> WyOpenResult {
+        let _t = crate::prof::begin();
+        let ss = SharedString::from(rope.to_string());
+        crate::prof::end("wy.open.to_string", _t);
+        Self::open_from_str(ss)
+    }
+
+    /// 装配后台结果（UI 线程）：整篇重活已发生（`WyOpenResult`），这里只剩换源后的
+    /// 状态重置/缓存失效（除 `rebuild_block_regions` 为 O(块) 外全 O(1)/微量）。
+    pub(crate) fn install_open(&mut self, r: WyOpenResult) {
+        self.doc = r.doc;
+        let _t = crate::prof::begin();
         self.rebuild_block_regions();
+        crate::prof::end("wy.set_source.regions", _t);
         self.caret = self.caret.min(self.doc.len());
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -1314,11 +1369,8 @@ impl WyEditor {
         self.focused_mermaid = None;
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
-        // 派生扫描的**标记计数器**（全篇一次 O(n)，之后增量维护 O(编辑)）——
-        // derived() 预筛用计数，避免每次内容变更对 7MB 全篇 `contains('$')` 重扫
-        // （debug 下 ~100ms/键）。
-        self.math_dollar_cnt.set(text.bytes().filter(|&b| b == b'$').count());
-        self.alert_marker_cnt.set(text.matches("[!").count());
+        self.math_dollar_cnt.set(r.math_dollar_cnt);
+        self.alert_marker_cnt.set(r.alert_marker_cnt);
         self.struct_ver.set(0);
         self.struct_dirty_line.set(0);
         self.struct_old_end_line.set(0);
@@ -1332,6 +1384,7 @@ impl WyEditor {
         self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
+        self.loaded = true;
     }
 
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。

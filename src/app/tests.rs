@@ -404,6 +404,75 @@
         );
     }
 
+    /// 状态栏右侧按钮的可见性跟随文档类型/预览状态（覆盖 `render_status_bar` 拆出的
+    /// 条件分支）：
+    /// - 非只读且非 Markdown（.txt）→ 显示「换行」按钮；预览未开 → 不显示「全屏」。
+    /// - Markdown（自动开预览、恒自动换行）→ 显示「全屏」，不显示「换行」。
+    /// - 只读预览（EPUB）→ 两个阅读控制按钮都隐藏（自带全屏阅读）。
+    #[gpui::test]
+    async fn status_bar_buttons_follow_doc_kind_and_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // .txt：非只读、非 Markdown → 换行按钮；预览未开 → 无全屏按钮。
+        let txt = std::env::temp_dir().join(format!("gpui-statusbar-{}.txt", std::process::id()));
+        std::fs::write(&txt, "hello\nworld\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_some(),
+            ".txt 非只读非 Markdown 应显示换行按钮"
+        );
+        assert!(
+            cx.debug_bounds("status-fullscreen-btn").is_none(),
+            ".txt 未开预览不应有全屏按钮"
+        );
+        // .md：自动开预览（非只读）→ 全屏按钮；Markdown 恒自动换行 → 无换行按钮。
+        let md = std::env::temp_dir().join(format!("gpui-statusbar-{}.md", std::process::id()));
+        std::fs::write(&md, "# 标题\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-fullscreen-btn").is_some(),
+            "Markdown 自动开预览应有全屏按钮"
+        );
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_none(),
+            "Markdown 恒自动换行不显示换行按钮"
+        );
+        // 只读预览（EPUB）：两个阅读控制按钮都隐藏（自带全屏阅读）。
+        let epub =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+        assert!(epub.exists(), "测试 EPUB 应存在");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-fullscreen-btn").is_none(),
+            "只读预览（EPUB）不应显示全屏按钮"
+        );
+        assert!(
+            cx.debug_bounds("status-wrap-btn").is_none(),
+            "只读预览（EPUB）不应显示换行按钮"
+        );
+        let _ = std::fs::remove_file(&txt);
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// 当前选中的文件是 .md 时，选项卡栏最右侧出现眼睛图标，点击切换预览；非 .md 文件不出现。
     #[gpui::test]
     async fn md_tab_bar_shows_eye_and_toggles_preview(cx: &mut TestAppContext) {

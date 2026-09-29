@@ -563,8 +563,13 @@ pub(crate) fn classify_block(lines: &[&str], idx: usize, t: &str) -> BlockClass 
 /// `list_prefix`、`is_rule`、`parse_image_line`、`try_parse_table`），
 /// 因此块边界与消耗行数与全量解析天然一致（有测试背书）。
 pub fn scan_blocks(src: &str) -> BlockIndex {
+    let _t = crate::prof::begin();
     let line_starts = build_line_starts_u32(src);
+    crate::prof::end("scan.blocks.line_starts", _t);
+    let _t = crate::prof::begin();
     let lines: Vec<&str> = src.split('\n').collect();
+    crate::prof::end("scan.blocks.split", _t);
+    let _t = crate::prof::begin();
     let mut blocks: Vec<BlockMeta> = Vec::with_capacity(lines.len());
     let mut toc: Vec<(usize, u8, SharedString)> = Vec::new();
     let mut idx = 0usize;
@@ -578,8 +583,10 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         let t = line.trim_start();
         let c = classify_block(&lines, idx, t);
         if let RowKind::Heading(h) = c.kind {
+            let _t = crate::prof::begin();
             let text = inline_strip(t[h as usize..].trim_start());
             toc.push((row_start, h, text));
+            crate::prof::end("scan.blocks.toc", _t);
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
@@ -590,6 +597,7 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
         });
         idx += c.consumed;
     }
+    crate::prof::end("scan.blocks.classify", _t);
     BlockIndex {
         blocks: Blocks::from_vec(blocks),
         toc: Toc::from_vec(toc),
