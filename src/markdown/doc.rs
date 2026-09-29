@@ -99,6 +99,205 @@ enum DocSrc {
     Rope(Rope),
 }
 
+/// 行起始表（`line_starts` / `line_utf16_starts` 共用）的**分段持久化**。
+///
+/// 与 [`parse::Blocks`] 同构：增量编辑只重建变化中段，未变前缀/后缀用 `Arc` 共享、
+/// 读取时叠加常量平移 `shift`（不逐条复制）。背景：Enter/换行路径的旧实现在每键
+/// 「前缀拷贝 + 尾部逐条平移」两个 O(n) 段（139k 行 ×2 索引实测 3.2~3.7ms/键），
+/// 分段后只需重扫变化区（通常极小），前后缀 O(1) 共享；段数超限合并且 amortize。
+#[derive(Clone, Debug)]
+pub(crate) struct LineStarts {
+    segs: std::sync::Arc<Vec<LineSeg>>,
+    len: usize,
+}
+
+/// 一段不可变行起始（`[start,end)` 于 `data`），读取时施加常量坐标平移。
+#[derive(Clone, Debug)]
+pub(crate) struct LineSeg {
+    data: std::sync::Arc<[usize]>,
+    start: usize,
+    end: usize,
+    shift: i64,
+}
+
+/// 段数上限：超过即合并成一段（amortize，读取仍是 O(段数)，段数很小）。
+pub(crate) const LINE_STARTS_MAX_SEGS: usize = 8;
+
+impl LineSeg {
+    fn new(data: std::sync::Arc<[usize]>) -> Self {
+        let len = data.len();
+        Self { data, start: 0, end: len, shift: 0 }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+    /// 段内第 `i` 个行起始的**当前值**（已施加平移）。
+    #[inline]
+    fn at(&self, i: usize) -> usize {
+        ((self.data[self.start + i] as i64 + self.shift).max(0)) as usize
+    }
+    /// 段内子区间 `[s,e)`（O(1)，保持原平移）。
+    fn sub(&self, s: usize, e: usize) -> Self {
+        debug_assert!(s <= e && e <= self.len());
+        Self {
+            data: self.data.clone(),
+            start: self.start + s,
+            end: self.start + e,
+            shift: self.shift,
+        }
+    }
+    /// 叠加常量平移（与已有平移合成：旧δ + 新δ）。
+    fn shifted(&self, delta: i64) -> Self {
+        let mut seg = self.clone();
+        seg.shift += delta;
+        seg
+    }
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |i| self.at(i))
+    }
+}
+
+impl LineStarts {
+    /// 由完整 `Vec` 建立（全量扫描 / 合并）：原地转成单个共享段，之后裁剪零拷贝。
+    fn from_vec(v: Vec<usize>) -> Self {
+        let len = v.len();
+        Self { segs: std::sync::Arc::new(vec![LineSeg::new(v.into())]), len }
+    }
+
+    /// 段数（读取路径的遍历代价，通常 ≤ [`LINE_STARTS_MAX_SEGS`]）。测试观测用。
+    #[cfg(test)]
+    pub(crate) fn seg_count(&self) -> usize {
+        self.segs.len()
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// 第 `i` 个行起始（O(段数) ≤ [`LINE_STARTS_MAX_SEGS`]）。
+    #[inline]
+    fn at(&self, mut i: usize) -> usize {
+        debug_assert!(i < self.len, "line_starts.at({i}) 越界 len={}", self.len);
+        for seg in self.segs.iter() {
+            let l = seg.len();
+            if i < l {
+                return seg.at(i);
+            }
+            i -= l;
+        }
+        unreachable!("line_starts.at({i}) 越界 len={}", self.len)
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, i: usize) -> Option<usize> {
+        if i >= self.len {
+            return None;
+        }
+        Some(self.at(i))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.segs.iter().flat_map(|s| s.iter())
+    }
+
+    /// 物化成平坦 `Vec`（测试/一致性校验用）。
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<usize> {
+        let mut v = Vec::with_capacity(self.len);
+        v.extend(self.iter());
+        v
+    }
+
+    /// 二分定位：`[..n]` 中最后一个满足 `pred` 的下标 + 1（行起始升序、平移保持单调，
+    /// 等价于原 `slice::partition_point`）。
+    pub(crate) fn partition_point<P: FnMut(&usize) -> bool>(&self, mut pred: P) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let v = self.at(mid);
+            if pred(&v) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// 增量组装：前缀（共享段）+ 中段（新扫描的 owned）+ 后缀（共享段）。段数超限合并且。
+    fn assemble(prefix: Vec<LineSeg>, middle: Vec<usize>, suffix: Vec<LineSeg>) -> Self {
+        let mut segs = prefix;
+        if !middle.is_empty() {
+            segs.push(LineSeg::new(middle.into()));
+        }
+        segs.extend(suffix);
+        segs.retain(|s| s.len() > 0);
+        let len = segs.iter().map(|s| s.len()).sum();
+        if segs.len() > LINE_STARTS_MAX_SEGS {
+            // amortize：合并成单一共享段（O(n) 一次，之后数轮裁剪零拷贝）
+            let mut flat = Vec::with_capacity(len);
+            for s in &segs {
+                flat.extend(s.iter());
+            }
+            return Self { segs: std::sync::Arc::new(vec![LineSeg::new(flat.into())]), len };
+        }
+        Self { segs: std::sync::Arc::new(segs), len }
+    }
+
+    /// 取出前 `k` 项的共享段（O(段数)）——编辑复用未变前缀，零拷贝。
+    fn shares_prefix(&self, k: usize) -> Vec<LineSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            if rem == 0 {
+                break;
+            }
+            let l = seg.len();
+            if rem >= l {
+                out.push(seg.clone());
+                rem -= l;
+            } else {
+                out.push(seg.sub(0, rem));
+                rem = 0;
+            }
+        }
+        out
+    }
+
+    /// 取出从第 `k` 项起的共享段并叠加平移 `delta`——复用旧尾部。
+    fn shares_suffix(&self, k: usize, delta: i64) -> Vec<LineSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            let l = seg.len();
+            if rem >= l {
+                rem -= l;
+                continue;
+            }
+            let seg = seg.sub(rem, l).shifted(delta);
+            out.push(seg);
+            rem = 0;
+        }
+        out
+    }
+}
+
+impl PartialEq for LineStarts {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+impl Eq for LineStarts {}
+
 /// 共享文档：BlockIndex（结构索引，含逐块字节/行号） + 源（窗口化物化）。
 ///
 /// 不存 `ir`（仅 kind/行区间，可从索引 + `row_kind` 同式推出；`build_ir` 只留在
@@ -112,11 +311,13 @@ pub(crate) struct Doc {
     /// 的 ~1.2s）与自维护行起始。
     rope: Rope,
     /// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义）——行源文本定位用。
-    line_starts: Vec<usize>,
+    /// 分段持久化（见 [`LineStarts`]）：Enter/换行增量不再整表重建，前后缀 Arc 共享 +
+    /// 读取时平移。
+    line_starts: LineStarts,
     /// 与 `line_starts` 平行、同长的**行粒度 UTF-16 前缀索引**：第 i 项 = `line_starts[i]`
     /// 前的累计 UTF-16 单元数。IME/`EntityInputHandler` 的 UTF-16↔字节换算靠它
     /// （O(log n + 行长)，替代全文扫描），`edit` 增量维护。
-    line_utf16_starts: Vec<usize>,
+    line_utf16_starts: LineStarts,
     /// 标量字符数（`chars().count()` 口径，状态栏显示用）——`edit` 增量维护，O(1)。
     char_count: usize,
     /// 全文 UTF-16 单元总数（`EntityInputHandler::text_length_utf16` 用，O(1)）——
@@ -151,8 +352,8 @@ impl Doc {
             src: DocSrc::Str(src),
             index,
             rope,
-            line_starts,
-            line_utf16_starts,
+            line_starts: LineStarts::from_vec(line_starts),
+            line_utf16_starts: LineStarts::from_vec(line_utf16_starts),
             char_count,
             total_utf16,
             edit_ver: 0,
@@ -184,8 +385,8 @@ impl Doc {
             src,
             index,
             rope,
-            line_starts,
-            line_utf16_starts,
+            line_starts: LineStarts::from_vec(line_starts),
+            line_utf16_starts: LineStarts::from_vec(line_utf16_starts),
             char_count,
             total_utf16,
             edit_ver: 0,
@@ -244,40 +445,34 @@ impl Doc {
         crate::prof::end("doc.scanblocks", _t_sc);
         let _t_ul = crate::prof::begin();
         // 纯行内编辑（insert/remove 都不含 '\n'）：行数/行首集合不变，只有「编辑点之后
-        // 的尾部」整体平移 `delta_bytes`/`delta_u16`——免 `incremental_line_starts` 的
-        // 「前缀拷贝 + 变化区重扫 + 尾部逐条重推」两次全量写（139k 行 ×2 索引，是
-        // debug 每键 4-7ms 的输入地板）。含 '\n'（Enter/换行粘贴/跨行删）才回退重建。
-        // 旧实现为「克隆全表 + 尾部平移」——`edit(&mut self)` 在 `&mut self` 下没有
-        // 并发读者，直接**原地**平移尾部即可，省掉两次约 139k 条目的整表拷贝
-        // （实测 doc.linestarts 10ms→~1ms/键）。同为升序平移，保持非递减序。
+        // 的尾部」整体平移 `delta_bytes`/`delta_u16`。分段持久化后连尾部都不复制
+        // （共享后缀段 + 读取时平移），O(段数)——旧实现在此仍逐条平移尾部（139k 行）。
+        // 含 '\n'（Enter/换行粘贴/跨行删）走区域重建（[`Self::line_starts_after_newline`]）。
         let removed_has_nl = end > start && self.rope.slice(start..end).chars().any(|c| c == '\n');
         let has_nl = removed_has_nl || text.contains('\n');
         let delta_bytes = inserted_len as i64 - (end - start) as i64;
         if !has_nl {
             // 受影响起始行号：首个行首 > 编辑起点（无 '\n' ⇒ (start, end] 内无行首）。
-            // 字节/UTF-16 两条索引同形（行数未变）→ 同一 `start_idx` 适用。
-            let start_idx = self.line_starts.partition_point(|&x| x <= start);
+            // 字节/UTF-16 两条索引同形（行数未变）→ 同一 `keep` 适用。
+            let keep = self.line_starts.partition_point(|&x| x <= start);
             if delta_bytes != 0 {
-                for v in &mut self.line_starts[start_idx..] {
-                    *v = (*v as i64 + delta_bytes).max(0) as usize;
-                }
+                let prefix = self.line_starts.shares_prefix(keep);
+                let suffix = self.line_starts.shares_suffix(keep, delta_bytes);
+                self.line_starts = LineStarts::assemble(prefix, Vec::new(), suffix);
             }
             if delta_u16 != 0 {
-                for v in &mut self.line_utf16_starts[start_idx..] {
-                    *v = (*v as i64 + delta_u16).max(0) as usize;
-                }
+                let prefix = self.line_utf16_starts.shares_prefix(keep);
+                let suffix = self.line_utf16_starts.shares_suffix(keep, delta_u16);
+                self.line_utf16_starts = LineStarts::assemble(prefix, Vec::new(), suffix);
             }
         } else {
-            let new_ls =
-                Self::incremental_line_starts(&self.line_starts, &new_rope, old_len, range.clone());
-            // 第二个索引的对齐点/变化区基线基于**旧**字节行表（旧坐标），须在
-            // `new_ls` 写回前算出，故先按旧表并行计算、再一起写回。
-            let new_ls16 = Self::incremental_line_utf16_starts(
-                &self.line_utf16_starts,
+            let (new_ls, new_ls16) = Self::line_starts_after_newline(
                 &self.line_starts,
+                &self.line_utf16_starts,
                 &new_rope,
                 old_len,
                 range.clone(),
+                delta_bytes,
                 delta_u16,
             );
             self.line_starts = new_ls;
@@ -297,94 +492,64 @@ impl Doc {
         crate::prof::end("doc.edit", _t_doc);
     }
 
-    /// 增量行起始重建（见 [`Self::edit`]）：前缀（start ≤ 编辑起点，不变）+ 变化区
-    /// 重扫（rope 小切片，不做全串复制）+ 尾部（start > 编辑终点）整体平移 `delta`。
-    /// O(变化区 + 尾部 memcpy)。
-    fn incremental_line_starts(
-        old: &[usize],
+    /// 换行编辑（含 `\n`）后的两条行索引（字节/UTF-16 前缀）增量重建——分段版。
+    ///
+    /// 与旧 flat `Vec` 版同三段式与边界语义（前缀沿用 + 变化区重扫 + 尾部平移），但
+    /// 前缀/后缀改为共享段（[`LineStarts::shares_prefix`] / [`LineStarts::shares_suffix`]），
+    /// 只真正物化「变化中段」，同一次区域遍历同时产出字节与 UTF-16 起始。旧版前缀
+    /// 拷贝 + 尾部逐条平移两个 O(n) 段（139k 行实测 3.2~3.7ms/键→O(变化区)）。
+    #[allow(clippy::too_many_arguments)]
+    fn line_starts_after_newline(
+        old: &LineStarts,
+        old_u16: &LineStarts,
         new: &Rope,
         old_len: usize,
         edit_old: Range<usize>,
-    ) -> Vec<usize> {
+        delta_bytes: i64,
+        delta_u16: i64,
+    ) -> (LineStarts, LineStarts) {
         let new_len = new.len();
-        let delta = new_len as i64 - old_len as i64;
         // 前缀：所有 start ≤ 编辑起点 的行（其行首字节不变）。
         let keep = old.partition_point(|&s| s <= edit_old.start);
-        let mut out: Vec<usize> = old[..keep].to_vec();
         // 对齐点 = 首个旧 start > 编辑终点（新坐标 +delta）。
         let j = old.partition_point(|&s| s <= edit_old.end.min(old_len));
-        let region_start = old.get(keep.saturating_sub(1)).copied().unwrap_or(0);
-        let region_end = if j < old.len() {
-            (old[j] as i64 + delta).clamp(region_start as i64, new_len as i64) as usize
-        } else {
-            new_len.max(region_start)
-        };
-        // 变化区新行起始：只从 rope 切成小窗口（单行规模）重扫 '\n'。边界处理同旧：
-        // 区域尾部对齐点的行起始由「尾部整体平移」产出（= region_end），区域扫描要
-        // 跳过恰落在 region_end 的 '\n' 行起始（否则重复一遍）；仅当没有尾部（编辑
-        // 近文末）时才保留它（延续 `build_line_starts` 对末尾空行的语义）。
-        let region = new.slice(region_start..region_end).to_string();
-        let rb = region.as_bytes();
-        let mut k = 0usize;
-        while k < rb.len() {
-            if rb[k] == b'\n' {
-                let s = region_start + k + 1;
-                if s < region_end || j >= old.len() {
-                    out.push(s);
-                }
-            }
-            k += 1;
-        }
-        // 尾部整体平移。
-        for &s in &old[j..] {
-            out.push((s as i64 + delta).max(0) as usize);
-        }
-        out
-    }
-
-    /// 增量 UTF-16 行前缀重建（见 [`Self::edit`]）：与 [`Self::incremental_line_starts`]
-    /// 同一套三段式与边界语义（前缀沿用 + 变化区重扫 + 尾部平移 `delta_u16`），只在
-    /// 重扫时同时累计「行起始前的 UTF-16 单元数」。O(变化区 + 尾部)。
-    fn incremental_line_utf16_starts(
-        old_u16: &[usize],
-        old_bytes: &[usize],
-        new: &Rope,
-        old_len: usize,
-        edit_old: Range<usize>,
-        delta_u16: i64,
-    ) -> Vec<usize> {
-        let new_len = new.len();
-        let delta = new_len as i64 - old_len as i64;
-        // 行表对齐点与字节版本完全相同——两条索引必须同形（行数一致）。
-        let keep = old_bytes.partition_point(|&s| s <= edit_old.start);
-        let mut out: Vec<usize> = old_u16[..keep].to_vec();
-        let j = old_bytes.partition_point(|&s| s <= edit_old.end.min(old_len));
-        let region_start = old_bytes.get(keep.saturating_sub(1)).copied().unwrap_or(0);
-        let region_end = if j < old_bytes.len() {
-            (old_bytes[j] as i64 + delta).clamp(region_start as i64, new_len as i64) as usize
+        let old_lines = old.len();
+        let region_start = old.get(keep.saturating_sub(1)).unwrap_or(0);
+        let region_end = if j < old_lines {
+            (old.at(j) as i64 + delta_bytes).clamp(region_start as i64, new_len as i64) as usize
         } else {
             new_len.max(region_start)
         };
         // 变化区起点基线 = 上一前缀行行首前的累计 UTF-16 数。
-        let base_u16 = if keep > 0 { out[keep - 1] } else { 0 };
-        // 变化区：按字符推进累计 UTF-16，对每个新行起始 push（同字节版的
-        // `s < region_end || j >= old.len()` 判据，保证两次索引行集一致）。
+        let base_u16 = if keep > 0 { old_u16.get(keep - 1).unwrap_or(0) } else { 0 };
+        // 变化区：单遍扫出新行起始（字节 + UTF-16 前缀，同一行集），只从 rope 切成
+        // 小窗口（单行/变化规模）。边界处理同旧：区域尾部对齐点的行起始由「后缀共享
+        // 段 + 平移」产出（= region_end），区域扫描要跳过恰落在 region_end 的 '\n' 行
+        // 起始（否则重复一遍）；仅当没有尾部（编辑近文末）时才保留它（延续
+        // `build_line_starts` 对末尾空行的语义）。
         let region = new.slice(region_start..region_end).to_string();
+        let no_suffix = j >= old_lines;
+        let mut byte_starts: Vec<usize> = Vec::new();
+        let mut u16_starts: Vec<usize> = Vec::new();
         let mut run_u16 = base_u16 as i64;
         for (i, c) in region.char_indices() {
             run_u16 += c.len_utf16() as i64;
             if c == '\n' {
                 let s = region_start + i + 1;
-                if s < region_end || j >= old_bytes.len() {
-                    out.push(run_u16 as usize);
+                if s < region_end || no_suffix {
+                    byte_starts.push(s);
+                    u16_starts.push(run_u16 as usize);
                 }
             }
         }
-        // 尾部整体平移（编辑在其之前 ⇒ 累计 UTF-16 全体 +Δ）。
-        for &v in &old_u16[j..] {
-            out.push((v as i64 + delta_u16).max(0) as usize);
-        }
-        out
+        let prefix = old.shares_prefix(keep);
+        let suffix = old.shares_suffix(j, delta_bytes);
+        let prefix16 = old_u16.shares_prefix(keep);
+        let suffix16 = old_u16.shares_suffix(j, delta_u16);
+        (
+            LineStarts::assemble(prefix, byte_starts, suffix),
+            LineStarts::assemble(prefix16, u16_starts, suffix16),
+        )
     }
 
     /// 块总数（虚拟化滚动条量程用，O(1)）。
@@ -406,7 +571,7 @@ impl Doc {
 
     /// 每行起始字节偏移（`split('\n')` 语义，长度 = 行数）——`row_col`/`line_start`/
     /// `line_end` 的 O(log n) 二分索引（替代每帧对整篇源文本的线性扫描）。
-    pub(crate) fn line_starts(&self) -> &[usize] {
+    pub(crate) fn line_starts(&self) -> &LineStarts {
         &self.line_starts
     }
 
@@ -415,7 +580,7 @@ impl Doc {
     /// O(1)，不物化全文。
     pub(crate) fn line_count(&self) -> usize {
         let n = self.line_starts.len();
-        if n > 0 && self.line_starts[n - 1] == self.len() {
+        if n > 0 && self.line_starts.get(n - 1) == Some(self.len()) {
             n - 1
         } else {
             n
@@ -435,7 +600,7 @@ impl Doc {
     /// 行粒度 UTF-16 前缀索引（与 `line_starts` 平行）：第 i 项 = `line_starts[i]` 前累计
     /// UTF-16 单元数。
     #[allow(dead_code)]
-    pub(crate) fn line_utf16_starts(&self) -> &[usize] {
+    pub(crate) fn line_utf16_starts(&self) -> &LineStarts {
         &self.line_utf16_starts
     }
 
@@ -447,8 +612,8 @@ impl Doc {
             .line_starts
             .partition_point(|&s| s <= byte)
             .saturating_sub(1);
-        let line_start = self.line_starts.get(i).copied().unwrap_or(0);
-        let base_u16 = self.line_utf16_starts.get(i).copied().unwrap_or(0);
+        let line_start = self.line_starts.get(i).unwrap_or(0);
+        let base_u16 = self.line_utf16_starts.get(i).unwrap_or(0);
         if byte <= line_start {
             return base_u16;
         }
@@ -469,9 +634,9 @@ impl Doc {
             .line_utf16_starts
             .partition_point(|&v| v <= utf16)
             .saturating_sub(1);
-        let line_start = self.line_starts.get(i).copied().unwrap_or(0);
-        let base_u16 = self.line_utf16_starts.get(i).copied().unwrap_or(0);
-        let line_end = self.line_starts.get(i + 1).copied().unwrap_or(self.len());
+        let line_start = self.line_starts.get(i).unwrap_or(0);
+        let base_u16 = self.line_utf16_starts.get(i).unwrap_or(0);
+        let line_end = self.line_starts.get(i + 1).unwrap_or(self.len());
         let mut acc = base_u16;
         let mut byte = line_start;
         for c in self.rope.slice(line_start..line_end).chars() {
@@ -493,11 +658,10 @@ impl Doc {
     /// 第 `ix` 源行的 `(字符数, 是否全 ASCII)`——窗口化 shaping 的块高估算用：
     /// 只读字节切片数 chars，不物化 `Row`、不 shape，O(行长)。
     pub(crate) fn line_chars_ascii(&self, ix: usize) -> (usize, bool) {
-        let s = self.line_starts.get(ix).copied().unwrap_or(0);
+        let s = self.line_starts.get(ix).unwrap_or(0);
         let e = self
             .line_starts
             .get(ix + 1)
-            .copied()
             .unwrap_or_else(|| self.src_len());
         match &self.src {
             DocSrc::Str(str) => {
@@ -658,7 +822,7 @@ impl Doc {
     /// 可对围栏内任意内容行做「渲染位置 ↔ 源字节」换算。末项哨兵 = 末内容行行尾
     /// （= 闭合围栏行起始）。`CRLF` 下分隔符映射到上一行的 `\n`（`line_starts` 已跳过 `\r\n`）。
     fn code_byte_map(&self, src_line: usize, code_lines: &[SharedString]) -> Vec<usize> {
-        let block_start = self.line_starts.get(src_line).copied().unwrap_or(0);
+        let block_start = self.line_starts.get(src_line).unwrap_or(0);
         let mut map = Vec::new();
         for (k, line) in code_lines.iter().enumerate() {
             // 行与行之间的渲染 `\n`（首行前无分隔符）。
@@ -666,7 +830,6 @@ impl Doc {
                 let prev_nl = self
                     .line_starts
                     .get(src_line + 1 + k)
-                    .copied()
                     .unwrap_or(block_start)
                     .saturating_sub(1);
                 map.push(prev_nl.saturating_sub(block_start));
@@ -674,7 +837,6 @@ impl Doc {
             let line_start = self
                 .line_starts
                 .get(src_line + 1 + k)
-                .copied()
                 .unwrap_or(block_start);
             for (i, _) in line.as_bytes().iter().enumerate() {
                 map.push(line_start.saturating_sub(block_start) + i);
@@ -683,7 +845,6 @@ impl Doc {
         let sentinel = self
             .line_starts
             .get(src_line + 1 + code_lines.len())
-            .copied()
             .unwrap_or_else(|| self.src_len())
             .saturating_sub(block_start);
         map.push(sentinel);
@@ -692,11 +853,10 @@ impl Doc {
 
     /// 第 `ix` 行的源码文本（仅该行切片，O(行长)）。
     pub(crate) fn line_str(&self, ix: usize) -> String {
-        let s = self.line_starts.get(ix).copied().unwrap_or(0);
+        let s = self.line_starts.get(ix).unwrap_or(0);
         let e = self
             .line_starts
             .get(ix + 1)
-            .copied()
             .unwrap_or_else(|| self.src_len());
         let mut t = match &self.src {
             DocSrc::Str(str) => str.as_ref()[s..e].to_string(),
@@ -812,3 +972,70 @@ pub(crate) fn row_kind(k: RowKind) -> IrKind {
         RowKind::Table => IrKind::Table,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_matches_full_rebuild(d: &Doc, ctx: &str) -> (usize, usize) {
+        let want: Vec<usize> =
+            crate::markdown::parse::build_line_starts_u32(&d.rope().to_string())
+                .into_iter()
+                .map(|b| b as usize)
+                .collect();
+        assert_eq!(
+            d.line_starts().to_vec(),
+            want,
+            "line_starts 与全量重建不一致（{ctx}）"
+        );
+        (d.line_starts().seg_count(), d.line_starts().len())
+    }
+
+    /// 分段行起始的摊销护栏 + 一致性：连续打字（no-'\n'）/ Enter（has-'\n'）/
+    /// 跨行替换后段数不超限，且逐值恒等于全量重建。
+    #[test]
+    fn line_starts_segment_amortize_and_consistency() {
+        let base = "行零\n行一\n普通段落正文\nAB\nCD\n末尾行\n";
+        let mut doc = Doc::open(SharedString::from(base));
+
+        let at = base.find("AB").unwrap() + 1;
+        for i in 0..40 {
+            doc.edit(at..at, "x"); // 打字：no-'\n'，只平移后缀
+            let (segs, _) = assert_matches_full_rebuild(&doc, &format!("打字 i={i}"));
+            assert!(segs <= LINE_STARTS_MAX_SEGS, "打字段数超限：{segs}");
+            doc.edit(at..at + 1, "\n"); // Enter：has-'\n'，区域重建
+            let (segs, _) = assert_matches_full_rebuild(&doc, &format!("Enter i={i}"));
+            assert!(segs <= LINE_STARTS_MAX_SEGS, "Enter 段数超限：{segs}");
+        }
+
+        // 跨行替换 / 删除压力（含中文换行插入、整行删除）。
+        for _ in 0..20 {
+            // 随机字节位先回退到字符边界（rope 编辑要求边界对齐）。
+            let len = doc.len();
+            let rope = doc.rope();
+            let seek = (at + len / 3) % len.max(1);
+            let a = rope.char_to_byte_idx(rope.byte_to_char_idx(seek));
+            let b = rope.char_to_byte_idx(rope.byte_to_char_idx((a + 3).min(len)));
+            doc.edit(a..b, "中\n文");
+            let (segs, _) = assert_matches_full_rebuild(&doc, "替换");
+            assert!(segs <= LINE_STARTS_MAX_SEGS, "替换段数超限：{segs}");
+            let len = doc.len();
+            let rope = doc.rope();
+            let e = rope.char_to_byte_idx(rope.byte_to_char_idx((a + 2).min(len)));
+            if e > a {
+                doc.edit(a..e, "");
+                let (segs, _) = assert_matches_full_rebuild(&doc, "删除");
+                assert!(segs <= LINE_STARTS_MAX_SEGS, "删除段数超限：{segs}");
+            }
+        }
+
+        // 文末追加（无后缀段 + 幻影尾行的语义路径）。
+        for _ in 0..12 {
+            let len = doc.len();
+            doc.edit(len..len, "\n# 尾部\n正文");
+            let (segs, _) = assert_matches_full_rebuild(&doc, "文末追加");
+            assert!(segs <= LINE_STARTS_MAX_SEGS, "文末追加段数超限：{segs}");
+        }
+    }
+}
+

@@ -2677,7 +2677,7 @@ impl WyEditor {
         let ls = self.doc.line_starts();
         // 最后一个 `line_starts[i] <= off` 的行。
         let line = ls.partition_point(|&st| st <= off).saturating_sub(1);
-        let start = ls.get(line).copied().unwrap_or(0);
+        let start = ls.get(line).unwrap_or(0);
         (line, off - start)
     }
 
@@ -2686,7 +2686,6 @@ impl WyEditor {
         self.doc
             .line_starts()
             .get(line)
-            .copied()
             .unwrap_or(self.len())
     }
 
@@ -2694,9 +2693,9 @@ impl WyEditor {
     /// 末行（无换行）返回内容尾。`CRLF` 下返回 `\n`（含 `\r`，与原文语义一致）。
     pub(crate) fn line_end(&self, line: usize) -> usize {
         let ls = self.doc.line_starts();
-        let start = ls.get(line).copied().unwrap_or(self.len());
+        let start = ls.get(line).unwrap_or(self.len());
         match ls.get(line + 1) {
-            Some(&next) => (next.saturating_sub(1)).min(self.len()).max(start),
+            Some(next) => (next.saturating_sub(1)).min(self.len()).max(start),
             None => self.len(),
         }
     }

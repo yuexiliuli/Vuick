@@ -1373,6 +1373,70 @@ mod dt {
         );
     }
 
+    /// 基准（--ignored）：`Doc::edit` 插入 `\n`（Enter）时的增量行起始成本。
+    /// 真实 `fixtures/大文档测试2.md`（6.4MB），在**同一固定位置**连续插入 `\n`
+    /// （中部 / 近顶部两种锚点），每轮墙钟 + `KILO_PROF=1` 下 `doc.linestarts` /
+    /// `doc.edit` 拆账；结尾与全量重建逐值校验（断言）。
+    #[test]
+    #[ignore]
+    fn bench_doc_enter_linestarts_on_reference_doc() {
+        use crate::markdown::doc::Doc;
+        use std::time::Instant;
+        let path = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/大文档测试2.md"
+        ));
+        if !path.exists() {
+            eprintln!("跳过：缺少参考文件 {path:?}");
+            return;
+        }
+        let text = std::fs::read_to_string(path).expect("参考文件读取失败");
+        let n = 200usize;
+        // 固定锚点（回退到字符边界）：中部 / 近顶部。
+        let cb = |mut i: usize| -> usize {
+            let b = text.as_bytes();
+            while i > 0 && i < text.len() && (b[i] & 0b1100_0000) == 0b1000_0000 {
+                i -= 1;
+            }
+            i.min(text.len())
+        };
+        let at_mid = cb(text.len() / 2);
+        let at_top = cb(40usize.min(text.len()));
+
+        let run = |doc: &mut Doc, label: &str, at: usize, n: usize| {
+            let (mut sum, mut max) = (0.0f64, f64::MIN);
+            for _ in 0..n {
+                let t = Instant::now();
+                doc.edit(at..at, "\n");
+                let d = t.elapsed().as_secs_f64() * 1000.0;
+                sum += d;
+                max = max.max(d);
+            }
+            eprintln!(
+                "[bench] doc.edit enter {label} (@{at}): n={n} 每键 avg {:.3}ms max {:.3}ms（rows={}）",
+                sum / n as f64,
+                max,
+                doc.line_starts().len(),
+            );
+            crate::prof::dump(&format!("wy.doc.enter.{label}"));
+        };
+
+        let mut doc = Doc::open_rope(Rope::from(text.as_str()));
+        eprintln!("[bench] open rows={}", doc.line_starts().len());
+        run(&mut doc, "mid", at_mid, n);
+        run(&mut doc, "top", at_top, n);
+
+        // 一致性：最终行起始表与全量重建逐值一致（独立真相 = 当前 rope 全文）。
+        let full = doc.rope().to_string();
+        let want: Vec<usize> = super::build_line_starts_u32(&full)
+            .into_iter()
+            .map(|b| b as usize)
+            .collect();
+        let got = doc.line_starts().to_vec();
+        assert_eq!(got.len(), want.len(), "行表长度不一致");
+        assert_eq!(got, want, "增量行表与全量重建不一致");
+    }
+
     /// 基准（--ignored）：大文档小编辑时，增量（dirty 侧通道 vs 快照 diff）vs
     /// 全量扫描耗时对比（打印、不断言）。
     #[test]

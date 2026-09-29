@@ -689,10 +689,21 @@ fn doc_utf16_index_matches_full_recompute() {
                 d.line_starts().len(),
                 "UTF-16 行索引与行表应同形"
             );
+            // 分段行起始表必须与全量重建逐值一致（Str / Rope 两源、每轮随机编辑后）。
+            let want_ls: Vec<usize> = crate::markdown::parse::build_line_starts_u32(s)
+                .into_iter()
+                .map(|b| b as usize)
+                .collect();
+            assert_eq!(
+                d.line_starts().to_vec(),
+                want_ls,
+                "line_starts 与全量重建不一致 for {:?}",
+                s
+            );
             assert_eq!(d.total_utf16(), s.encode_utf16().count(), "total_utf16 不一致");
             if !d.line_starts().is_empty() {
                 assert_eq!(
-                    d.line_utf16_starts()[0],
+                    d.line_utf16_starts().get(0).unwrap(),
                     0,
                     "首行 UTF-16 前缀应为 0"
                 );
