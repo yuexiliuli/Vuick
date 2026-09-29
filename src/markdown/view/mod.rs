@@ -33,7 +33,6 @@ pub(crate) use row::expand_bg_over_whitespace;
 mod tests;
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use std::cell::Cell;
 
@@ -59,7 +58,7 @@ use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parse::{
     citation_index_from_rows, parse_block_window, parse_block_window_rope, parse_to_rows,
     rows_memory_estimate, scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row,
-    RowKind, RowPayload,
+    RowKind, RowPayload, Toc,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
@@ -258,9 +257,9 @@ pub struct MarkdownPreview {
     wrap: bool,
     /// 正文字号覆盖（None = 用主题默认；EPUB 缩放字号时设置）。
     font_override: Option<f32>,
-    /// 目录：文档内标题行的 (行号, 级别, 文本)。文本用 [`SharedString`]（`Arc<str>`）
-    /// 与索引共享同一份标题串，侧边栏按需读取；`Arc<Vec<…>>` 使源同步 O(1) 引用共享。
-    toc: Arc<Vec<(usize, u8, SharedString)>>,
+    /// 目录：文档内标题行的 (行号, 级别, 文本)。分段持久化（[`Toc`]）与索引共享同一
+    /// 份标题数据：源同步 O(1) 引用共享 + 后缀行号随编辑整体平移，侧边栏按需物化。
+    toc: Toc,
     /// markdown 文件所在目录（用于解析相对路径图片；None = 仅绝对路径/URL 有效）。
     base_dir: Option<std::path::PathBuf>,
     /// 内存图片注册表：虚拟 src（`epubimg://...`）→ 图片字节（不落盘）。
@@ -382,7 +381,7 @@ impl MarkdownPreview {
             h_handle: ScrollHandle::new(),
             wrap: false,
             font_override: None,
-            toc: Arc::new(Vec::new()),
+            toc: Toc::default(),
             base_dir: None,
             memory_images: Default::default(),
             code_scroll: Default::default(),
@@ -865,8 +864,9 @@ impl MarkdownPreview {
     }
 
     /// 目录条目：(行号, 标题级别, 标题文本)。供侧边栏目录视图使用。
-    pub(crate) fn toc_entries(&self) -> &[(usize, u8, SharedString)] {
-        &self.toc
+    /// 每调物化一份（O(目录数)）——仅侧边栏渲染等低频消费走它，不做每键路径。
+    pub(crate) fn toc_entries(&self) -> Vec<(usize, u8, SharedString)> {
+        self.toc.to_vec()
     }
 
     /// 滚动到指定行（目录跳转）。窗口模式走自持像素模型（瞬时重定位窗口），
@@ -957,8 +957,6 @@ impl MarkdownPreview {
             let _t_reset = crate::prof::begin();
             let _t_set = crate::prof::begin();
             self.index = Some(index.clone());
-            let src_len = src.len();
-            let src_lines = src.line_count();
             // 直接移动（`src` 按值入参）：Rope 克隆在 ropey 2.0 是 O(节点树)（6.4MB
             // ≈0.9ms），不是 O(1) 引用共享——移动省掉每键一次整树克隆。
             self.src_buf = Some(src);
@@ -987,6 +985,8 @@ impl MarkdownPreview {
                 self.desired_scroll.set(self.px_of_block(prev_abs.0) + prev_abs.1);
             }
             if std::env::var_os("MD_MEM_DEBUG").is_some() {
+                let src_len = self.src_buf.as_ref().map_or(0, |s| s.len());
+                let src_lines = self.src_buf.as_ref().map_or(0, |s| s.line_count());
                 let n = index.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parse::BlockMeta>();
                 eprintln!(
@@ -1010,7 +1010,7 @@ impl MarkdownPreview {
         self.resolve_image_rows(&mut parsed);
         let rows = parsed;
         // 提取目录：标题行（行号, 级别, 清理后的文本）
-        self.toc = Arc::new(
+        self.toc = Toc::from_vec(
             rows.iter()
                 .enumerate()
                 .filter_map(|(ix, r)| match r.kind {
@@ -1563,7 +1563,7 @@ impl MarkdownPreview {
         self.rows = Rc::new(Vec::new());
         self.list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX));
         self.content_w = 0.0;
-        self.toc = Arc::new(Vec::new());
+        self.toc = Toc::default();
         self.code_scroll = Default::default();
         self.code_hl = Default::default();
         self.code_hl_cache.clear();

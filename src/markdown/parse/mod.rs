@@ -29,7 +29,7 @@ pub(crate) use rows::{
 };
 pub use citations::{CitationIndex, citation_index_from_rows, scan_citations};
 #[allow(unused_imports)] // 兼容重导出：BlocksIter 为公开类型但内部无人逐名引用；scan_blocks 供 markdown 级 #[cfg(test)] 重导出消费
-pub use blocks::{BlockIndex, BlockMeta, Blocks, BlocksIter, BlocksSeg, scan_blocks};
+pub use blocks::{BlockIndex, BlockMeta, Blocks, BlocksIter, BlocksSeg, Toc, scan_blocks};
 pub(crate) use blocks::build_line_starts_u32;
 #[cfg(test)] pub(crate) use blocks::BLOCKS_MAX_SEGS;
 pub use blocks_scan::{

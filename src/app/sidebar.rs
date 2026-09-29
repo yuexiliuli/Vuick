@@ -308,7 +308,7 @@ impl EditorApp {
                 crate::toc::toc_node_has_child(&levels, idx)
             }
             Some(t) => {
-                let entries = t.md_preview.read(cx).toc_entries().to_vec();
+                let entries = t.md_preview.read(cx).toc_entries();
                 let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
                 crate::toc::toc_node_has_child(&levels, idx)
             }
@@ -460,7 +460,7 @@ impl EditorApp {
                     }
                 } else {
                     // Markdown 标题
-                    let entries = tab.md_preview.read(cx).toc_entries().to_vec();
+                    let entries = tab.md_preview.read(cx).toc_entries();
                     if entries.is_empty() {
                         self.sidebar_empty_hint("当前文件无目录（无标题）")
                     } else {

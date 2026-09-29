@@ -781,7 +781,7 @@ fn toc_builds_and_scrolls(cx: &mut TestAppContext) {
     cx.simulate_resize(size(px(400.), px(600.)));
     settle(cx);
 
-    let toc = cx.update(|_, cx| host.read(cx).md.read(cx).toc.clone());
+    let toc = cx.update(|_, cx| host.read(cx).md.read(cx).toc_entries());
     assert_eq!(toc.len(), 3, "应有 3 个标题进入目录，实际={toc:?}");
     let (row0, lvl0, _) = &toc[0];
     assert_eq!(*row0, 0usize, "首个目录项应是第 0 行（# 第一章）");
@@ -2548,7 +2548,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         vcx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |md, cx| {
-                md.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope0), idx0, cx);
+                md.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope0), idx0.clone(), cx);
             });
         });
         vcx.simulate_resize(size(px(980.), px(760.)));
@@ -2563,11 +2563,13 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         let n = 120usize;
         let t0 = Instant::now();
         let mut rope = ropey::Rope::from_str(&text);
+        // 增量基底（镜像 app 的 `preview_prev`）：保留上一份 rope 快照 + 块索引，
+        // 每键用 `scan_blocks_incremental_rope`（与 app/mod.rs 后台路径同式）——
+        // 尾部分段共享 ⇒ 换源 drop 上一份索引只是 O(1) 减引用，不被 3.2MB 释放伪影污染。
+        let mut prev_rope = rope.clone();
+        let mut prev_idx = idx0.clone();
         let at = n_items / 2;
         let mut scans_ms = 0.0f64;
-        // 保留每轮快照引用：真实 app 里预览 src_buf 与编辑器 rope 共享引用、替换时
-        // 旧快照 drop 只是 O(1) 减引用计数；不保留会被 ropey COW 整份释放（伪影 ~1ms）。
-        let mut keep: Vec<crate::markdown::PreviewSrc> = Vec::with_capacity(n);
         vcx.update(|_, cx| {
             let md = host.read(cx).md.clone();
             md.update(cx, |m, cx| {
@@ -2579,11 +2581,16 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
                     let off = rope.char_to_byte_idx(off_chars.min(rope.len_chars()));
                     let ts = Instant::now();
                     rope.insert(off, "x");
-                    let idx =
-                        std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope));
+                    let idx = std::rc::Rc::new(crate::markdown::scan_blocks_incremental_rope(
+                        &prev_rope,
+                        &prev_idx,
+                        &rope,
+                        Some(off..off + 1),
+                    ));
                     scans_ms += ts.elapsed().as_secs_f64() * 1000.0;
+                    prev_rope = rope.clone();
+                    prev_idx = idx.clone();
                     let src = crate::markdown::PreviewSrc::Rope(rope.clone());
-                    keep.push(src.clone());
                     m.set_source_with_index(src, idx, cx);
                     m.prepare_render(&p, 980.0, cx);
                 }
@@ -2591,7 +2598,7 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         });
         let wall = t0.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "[bench] 预览每键同步（窗口模式，{n} 轮，真实大文档）：总 {}ms（{:.2}ms/轮）；其中消费端扫描（不含在预览内）{:.2}ms/轮；预览侧（set_source+prepare_render）{:.2}ms/轮",
+            "[bench] 预览每键同步（窗口模式，{n} 轮，真实大文档，增量扫描+保留预览基底）：总 {}ms（{:.2}ms/轮）；其中消费端扫描（不含在预览内）{:.2}ms/轮；预览侧（set_source+prepare_render）{:.2}ms/轮",
             wall,
             wall / n as f64,
             scans_ms / n as f64,

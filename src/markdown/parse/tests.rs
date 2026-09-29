@@ -139,7 +139,6 @@ pub fn scan_blocks_incremental(
         .toc
         .iter()
         .filter(|(r, _, _)| *r < anchor)
-        .cloned()
         .collect();
 
     let mut idx = anchor;
@@ -165,7 +164,7 @@ pub fn scan_blocks_incremental(
                         suffix_segs = prev.blocks.shares_suffix(pi, delta, line_shift);
                         // toc 尾部：与 `scan_blocks` 一致的「源码行」坐标 → 随行号偏移
                         for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
-                            toc.push((( *r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
+                            toc.push(((r as i64 + line_shift).max(0) as usize, lv, t));
                         }
                         reused = true;
                         break;
@@ -309,7 +308,7 @@ pub fn scan_blocks_incremental(
     );
     BlockIndex {
         blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
-        toc: std::sync::Arc::new(toc),
+        toc: Toc::from_vec(toc),
     }
 }
 #[cfg(test)]
@@ -565,8 +564,8 @@ mod dt {
             // 目录：标题行号/级别/文本一致
             assert_eq!(idx.toc.len(), rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_))).count());
             for ((li, lv, tx), r) in idx.toc.iter().zip(rows.iter().filter(|r| matches!(r.kind, RowKind::Heading(_)))) {
-                assert_eq!(*li, r.src_line);
-                assert_eq!(*lv, match r.kind { RowKind::Heading(n) => n, _ => 0 });
+                assert_eq!(li, r.src_line);
+                assert_eq!(lv, match r.kind { RowKind::Heading(n) => n, _ => 0 });
                 assert_eq!(tx.as_str(), r.text.as_ref());
             }
 
@@ -1100,7 +1099,7 @@ mod dt {
         src.push('\n');
         let base = scan_blocks(&src);
         assert!(
-            base.toc.iter().any(|(_, _, t)| t == "前置标题"),
+            base.toc.iter().any(|(_, _, t)| t.as_ref() == "前置标题"),
             "前置标题应在 toc"
         );
 

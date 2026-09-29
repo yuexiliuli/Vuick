@@ -4,8 +4,6 @@
 //! 全量扫描」部分（2026-09-24 重构）：依赖 `rows`（行解析的切块判定函数）；
 //! 增量扫描 / 窗口物化见 `parser`（`blocks_scan`，经门面重导出）。
 
-use std::sync::Arc;
-
 use gpui::SharedString;
 
 use super::rows::{
@@ -40,11 +38,10 @@ pub struct BlockIndex {
     /// 增量扫描 O(1) 共享未变前后缀，只重建变化段（见 [`Blocks`]）。
     pub blocks: Blocks,
     /// 目录：(渲染行号, 标题级别, 标题文本)。窗口模式下照常全量可用。
-    /// `Arc` 共享（同 `blocks`）：源同步每键 `set_source_with_index` 只需 O(1) 引用
-    /// 共享，不再逐键深拷贝整张目录表（实测 2.2ms/键）。标题文本用 [`SharedString`]
-    /// （`Arc<str>`）——增量扫描每键重建目录时 `clone` 是 O(1) 应用层引用计数递增，
-    /// 不再对全部标题做堆复制（6.4MB/1.6 万标题文档实测每键 1.74ms → ~0.1ms）。
-    pub toc: Arc<Vec<(usize, u8, SharedString)>>,
+    /// **分段持久化**（见 [`Toc`]）：增量扫描 O(1) 共享未变前缀/后缀、只重建变化
+    /// 中段，后缀行号随编辑整体平移——不再每键重建扁平表（6.4MB/1.6 万标题实测
+    /// ~1.7ms/键）；标题文本 `SharedString`（`Arc<str>`）克隆 O(1)。
+    pub toc: Toc,
 }
 
 /// 分段持久化的轻量块列表。
@@ -266,6 +263,206 @@ impl<'a> Iterator for BlocksIter<'a> {
     }
 }
 
+/// 目录（标题表）**分段持久化**：与 [`Blocks`] 同构——增量扫描只重建变化中段，
+/// 未变前缀 O(1) 共享、后缀 O(1) 共享并叠加随编辑整体平移的 `line_shift`（读取时
+/// 施加，不逐条复制）。标题文本用 [`SharedString`]（`Arc<str>`），经段共享后无需
+/// 每键深拷。
+///
+/// 背景：预览每键 `scan_blocks_incremental_rope` 若重建扁平表，需逐条深拷贝并在
+/// 行号上平移 1.6 万条标题（实测 ~0.85ms/键）——分段后每键只扫变化区（O(k)），
+/// 前后缀零拷贝，预热成本平摊到 `assemble` 的合并（段数超限才 O(toc)）。目录行号
+/// 按源码行升序严格递增（每个标题占一行），二分定位不依赖全表物化。
+#[derive(Clone, Debug)]
+pub struct Toc {
+    segs: std::sync::Arc<Vec<TocSeg>>,
+    len: usize,
+}
+
+/// 一段不可变标题元数据（`[start,end)` 于 `data`），读取时施加常量 `line_shift`。
+#[derive(Clone, Debug)]
+pub struct TocSeg {
+    data: std::sync::Arc<[(usize, u8, SharedString)]>,
+    start: usize,
+    end: usize,
+    line_shift: i64,
+}
+
+/// 目录段数上限（与 `blocks` 同一摊销策略：超限合并成单段，之后若干轮只裁剪）。
+pub(crate) const TOC_MAX_SEGS: usize = 8;
+
+impl TocSeg {
+    fn new(data: std::sync::Arc<[(usize, u8, SharedString)]>) -> Self {
+        let len = data.len();
+        Self { data, start: 0, end: len, line_shift: 0 }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+    /// 段内第 `i` 条标题的**当前值**（已施加 `line_shift`）。
+    #[inline]
+    fn at(&self, i: usize) -> (usize, u8, SharedString) {
+        let (r, lv, t) = &self.data[self.start + i];
+        ((*r as i64 + self.line_shift).max(0) as usize, *lv, t.clone())
+    }
+    fn sub(&self, s: usize, e: usize) -> Self {
+        debug_assert!(s <= e && e <= self.len());
+        Self { data: self.data.clone(), start: self.start + s, end: self.start + e, line_shift: self.line_shift }
+    }
+    fn shifted(&self, line_shift: i64) -> Self {
+        let mut seg = self.clone();
+        seg.line_shift += line_shift;
+        seg
+    }
+}
+
+impl Toc {
+    /// 由完整条目建立（全量扫描 / 合并）：原地转成单个共享段，之后裁剪零拷贝。
+    pub fn from_vec(v: Vec<(usize, u8, SharedString)>) -> Self {
+        let len = v.len();
+        Self { segs: std::sync::Arc::new(vec![TocSeg::new(v.into())]), len }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// 目录行号按源码行升序（标题各占一行）：统计 `row < line` 的条目数（二分，
+    /// 只读 `data` 原始行号 + 段内平移，不物化）。增量扫描用它按**行坐标**切前缀/
+    /// 后缀（与旧扁平 `filter(r < anchor)` / `filter(r >= prev_line)` 等价）。
+    pub(crate) fn count_before_line(&self, line: usize) -> usize {
+        let mut total = 0usize;
+        for seg in self.segs.iter() {
+            let mut lo = seg.start;
+            let mut hi = seg.end;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let (r, _, _) = &seg.data[mid];
+                if (*r as i64 + seg.line_shift) < line as i64 {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            total += lo - seg.start;
+        }
+        total
+    }
+
+    pub fn iter(&self) -> TocIter<'_> {
+        TocIter { toc: self, seg_i: 0, seg_off: 0 }
+    }
+
+    /// 物化整表（消费方按需：预览目录/侧边栏渲染时用，非每键路径）。
+    pub fn to_vec(&self) -> Vec<(usize, u8, SharedString)> {
+        let mut v = Vec::with_capacity(self.len());
+        for s in self.segs.iter() {
+            for i in 0..s.len() {
+                v.push(s.at(i));
+            }
+        }
+        v
+    }
+
+    /// 取出前 `k` 条的共享段（O(段数)）——增量扫描复用未变前缀，零拷贝。
+    pub(crate) fn shares_prefix(&self, k: usize) -> Vec<TocSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            if rem == 0 {
+                break;
+            }
+            let l = seg.len();
+            if rem >= l {
+                out.push(seg.clone());
+                rem -= l;
+            } else {
+                out.push(seg.sub(0, rem));
+                rem = 0;
+            }
+        }
+        out
+    }
+
+    /// 取出从第 `k` 条起的共享段并叠加平移 `line_shift`——复用旧后缀。
+    pub(crate) fn shares_suffix(&self, k: usize, line_shift: i64) -> Vec<TocSeg> {
+        let mut out = Vec::new();
+        let mut rem = k;
+        for seg in self.segs.iter() {
+            let l = seg.len();
+            if rem >= l {
+                rem -= l;
+                continue;
+            }
+            out.push(seg.sub(rem, l).shifted(line_shift));
+            rem = 0;
+        }
+        out
+    }
+
+    /// 增量组装：前缀（共享段）+ 中段（新扫描的 owned）+ 后缀（共享段）。段数超限合并且。
+    pub(crate) fn assemble(
+        prefix: Vec<TocSeg>,
+        middle: Vec<(usize, u8, SharedString)>,
+        suffix: Vec<TocSeg>,
+    ) -> Self {
+        let mut segs = prefix;
+        if !middle.is_empty() {
+            segs.push(TocSeg::new(middle.into()));
+        }
+        segs.extend(suffix);
+        segs.retain(|s| s.len() > 0);
+        let len = segs.iter().map(|s| s.len()).sum();
+        if segs.len() > TOC_MAX_SEGS {
+            let mut flat = Vec::with_capacity(len);
+            for s in &segs {
+                for i in 0..s.len() {
+                    flat.push(s.at(i));
+                }
+            }
+            return Self { segs: std::sync::Arc::new(vec![TocSeg::new(flat.into())]), len };
+        }
+        Self { segs: std::sync::Arc::new(segs), len }
+    }
+}
+
+impl Default for Toc {
+    fn default() -> Self {
+        Self { segs: std::sync::Arc::new(Vec::new()), len: 0 }
+    }
+}
+
+impl PartialEq for Toc {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+impl Eq for Toc {}
+
+/// 按序产出每条标题的当前值（值语义：平移段需即时计算，无法按引用借出）。
+pub struct TocIter<'a> {
+    toc: &'a Toc,
+    seg_i: usize,
+    seg_off: usize,
+}
+impl<'a> Iterator for TocIter<'a> {
+    type Item = (usize, u8, SharedString);
+    fn next(&mut self) -> Option<(usize, u8, SharedString)> {
+        while self.seg_i < self.toc.segs.len() {
+            let seg = &self.toc.segs[self.seg_i];
+            if self.seg_off < seg.len() {
+                let t = seg.at(self.seg_off);
+                self.seg_off += 1;
+                return Some(t);
+            }
+            self.seg_i += 1;
+            self.seg_off = 0;
+        }
+        None
+    }
+}
+
 /// 行 → 字节起始偏移表（与 `build_line_starts(&str)` 语义相同，但存 u32 省内存）。
 /// 每行起始字节偏移（n 行 → n 项；`split('\n')` 语义，含末段）。
 /// `pub(crate)`：底座 `markdown::doc` 用它定位任意行的源字节区间。
@@ -370,7 +567,6 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     let lines: Vec<&str> = src.split('\n').collect();
     let mut blocks: Vec<BlockMeta> = Vec::with_capacity(lines.len());
     let mut toc: Vec<(usize, u8, SharedString)> = Vec::new();
-
     let mut idx = 0usize;
     while idx < lines.len() {
         let row_start = idx;
@@ -396,6 +592,6 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     }
     BlockIndex {
         blocks: Blocks::from_vec(blocks),
-        toc: Arc::new(toc),
+        toc: Toc::from_vec(toc),
     }
 }

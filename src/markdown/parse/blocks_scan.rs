@@ -6,12 +6,13 @@
 //! 保留在 `parser`（测试基础设施），本模块只保留生产路径。
 
 use std::ops::Range;
-use std::sync::Arc;
 
 use gpui::{Image, SharedString};
 use ropey::Rope;
 
-use super::blocks::{classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg};
+use super::blocks::{
+    classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg, Toc, TocSeg,
+};
 use super::rows::{inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData};
 
 /// 全量扫描一个 **ropey Rope** 文本（打开/首同步/大变化兜底用）。
@@ -141,16 +142,17 @@ fn scan_blocks_incremental_rope_impl(
     let prefix_segs = prev.blocks.shares_prefix(bi);
     let mut blocks: Vec<BlockMeta> = Vec::new(); // 新扫描的变化中段（通常极小）
     let mut suffix_segs: Vec<BlocksSeg> = Vec::new();
+    // 目录分段：未变前缀共享（行号 < 重扫起点 `anchor`）；变化中段由区域扫描产出；
+    // 后缀在复用旧尾部时按 `prev_line` 切出并叠加 `line_shift`（读取时施加）。相比
+    // 原先整表深克隆 + 逐条平移（1.6 万标题 ≈0.85ms/键），此时 O(段数) 共享零拷贝。
     let _t_tp = crate::prof::begin();
-    let mut toc: Vec<(usize, u8, SharedString)> = if rebuild_toc {
-        prev.toc
-            .iter()
-            .filter(|(r, _, _)| *r < anchor)
-            .cloned()
-            .collect()
+    let toc_prefix_segs = if rebuild_toc {
+        prev.toc.shares_prefix(prev.toc.count_before_line(anchor))
     } else {
         Vec::new()
     };
+    let mut toc_mid: Vec<(usize, u8, SharedString)> = Vec::new();
+    let mut toc_suffix_segs: Vec<TocSeg> = Vec::new();
     crate::prof::end("ss.toc.prefix", _t_tp);
 
     // —— 只从 rope 切出「锚点到尾部对齐点」的变化区域（O(k)），不对全串 split ——
@@ -205,9 +207,8 @@ fn scan_blocks_incremental_rope_impl(
                         suffix_segs = prev.blocks.shares_suffix(pii, delta, line_shift);
                         let _t_ts = crate::prof::begin();
                         if rebuild_toc {
-                            for (r, lv, t) in prev.toc.iter().filter(|(r, _, _)| *r >= prev_line) {
-                                toc.push(((*r as i64 + line_shift).max(0) as usize, *lv, t.clone()));
-                            }
+                            toc_suffix_segs =
+                                prev.toc.shares_suffix(prev.toc.count_before_line(prev_line), line_shift);
                         }
                         crate::prof::end("ss.toc.suffix", _t_ts);
                         reused = true;
@@ -227,7 +228,7 @@ fn scan_blocks_incremental_rope_impl(
             && let RowKind::Heading(h) = c.kind
         {
             let text = inline_strip(t[h as usize..].trim_start());
-            toc.push((row_start, h, text));
+            toc_mid.push((row_start, h, text));
         }
         blocks.push(BlockMeta {
             src_line: row_start as u32,
@@ -250,9 +251,14 @@ fn scan_blocks_incremental_rope_impl(
         // [`scan_blocks`] 逐字节一致（区域切片只覆盖到假设对齐点，不能丢）。
         return scan_blocks_rope(new_src);
     }
+    let toc = if rebuild_toc {
+        Toc::assemble(toc_prefix_segs, toc_mid, toc_suffix_segs)
+    } else {
+        Toc::default()
+    };
     BlockIndex {
         blocks: Blocks::assemble(prefix_segs, blocks, suffix_segs),
-        toc: Arc::new(toc),
+        toc,
     }
 }
 
