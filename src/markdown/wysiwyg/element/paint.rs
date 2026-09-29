@@ -247,18 +247,15 @@ pub(crate) fn paint_code_row(
 
 
 
-/// 图片行占位/失败兜底：浅底细边框盒 + 居中 alt 文字（加载完成前的占位与加载失败体验）。
+/// 图片行占位/失败兜底：浅底细边框盒（加载完成前的占位与加载失败体验）。
+/// alt 文本不再在此叠画——图片行下方已有可编辑题注行（`paint_text_row`），
+/// 避免 alt 出现两遍。
 pub(crate) fn paint_image_fallback(
     theme: &WyTheme,
-    f: &Frame,
     bounds: Bounds<Pixels>,
-    img: &ShapedImage,
     window: &mut Window,
-    cx: &mut App,
 ) {
     let border: gpui::Hsla = { let mut c = theme.divider; c.a = 0.6; c };
-    let mut text = theme.muted;
-    text.a = 0.8;
     window.paint_quad(gpui::PaintQuad {
         bounds,
         corner_radii: gpui::Corners::all(px(4.)),
@@ -267,33 +264,14 @@ pub(crate) fn paint_image_fallback(
         border_color: border,
         border_style: gpui::BorderStyle::Solid,
     });
-    if img.alt.is_empty() {
-        return;
-    }
-    let run = gpui::TextRun {
-        len: img.alt.len(),
-        font: theme.font.clone(),
-        color: text,
-        ..Default::default()
-    };
-    let line = window
-        .text_system()
-        .shape_line(img.alt.clone(), theme.font_size, &[run], None);
-    {
-        let w = f32::from(line.width());
-        let h = f32::from(bounds.size.height);
-        let lh = f32::from(f.line_h);
-        let x = f32::from(bounds.origin.x) + (f32::from(bounds.size.width) - w) / 2.;
-        let y = f32::from(bounds.origin.y) + ((h - lh) / 2.).max(0.);
-        let _ = line.paint(point(px(x), px(y)), f.line_h, gpui::TextAlign::Left, None, window, cx);
-    }
 }
 
 
 
 /// 画图片行：经 `AnyImageCache` 异步加载已就绪的 `RenderImage` 后画出；
-/// 加载中/失败画 alt 占位卡片。加载成功（或已预读固有尺寸）即把真实宽高比尺寸
+/// 加载中/失败画占位框。加载成功（或已预读固有尺寸）即把真实宽高比尺寸
 /// 写回 `WyEditor`（`images_gen` 自增 → 下帧重建帧以真实行高布局）。
+/// 图片盒下方再由 [`paint_text_row`] 画可编辑题注（alt）文本行。
 #[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/window/cx) + 几何参数互为正交
 pub(crate) fn paint_image_row(
     editor: &gpui::Entity<WyEditor>,
@@ -309,47 +287,49 @@ pub(crate) fn paint_image_row(
     let x0 = f32::from(origin.x) + f32::from(f.padding) + ((content_w - img.w) / 2.).max(0.);
     let top0 = f32::from(origin.y) + f32::from(row.top);
     let bounds = Bounds::new(point(px(x0), px(top0)), size(px(img.w), px(img.h)));
-    // 已知加载失败：直接画 alt 兜底，不再反复发起加载。
+    // 已知加载失败：直接画占位框，不再反复发起加载。
     let state = {
         let e = editor.read(cx);
         e.image_size(img.src.as_ref())
     };
     if matches!(state, Some(None)) {
-        paint_image_fallback(theme, f, bounds, img, window, cx);
-        return;
-    }
-    let resource = {
-        let e = editor.read(cx);
-        e.image_load_resource(img.src.as_ref())
-    };
-    let cache = {
-        let e = editor.read(cx);
-        e.image_cache()
-    };
-    let anycache: gpui::AnyImageCache = cache.clone().into();
-    match anycache.load(&resource, window, cx) {
-        Some(Ok(data)) => {
-            let img_size = data.size(0);
-            let iw = img_size.width.0 as f32;
-            let ih = img_size.height.0 as f32;
-            if iw > 0. && ih > 0. {
-                let w = img.w.max(1.);
-                let h = (w * ih / iw).max(1.);
-                if state.is_none() {
-                    editor.update(cx, |e, _| e.set_image_size(img.src.clone(), Some((w, h))));
+        paint_image_fallback(theme, bounds, window);
+    } else {
+        let resource = {
+            let e = editor.read(cx);
+            e.image_load_resource(img.src.as_ref())
+        };
+        let cache = {
+            let e = editor.read(cx);
+            e.image_cache()
+        };
+        let anycache: gpui::AnyImageCache = cache.clone().into();
+        match anycache.load(&resource, window, cx) {
+            Some(Ok(data)) => {
+                let img_size = data.size(0);
+                let iw = img_size.width.0 as f32;
+                let ih = img_size.height.0 as f32;
+                if iw > 0. && ih > 0. {
+                    let w = img.w.max(1.);
+                    let h = (w * ih / iw).max(1.);
+                    if state.is_none() {
+                        editor.update(cx, |e, _| e.set_image_size(img.src.clone(), Some((w, h))));
+                    }
+                    let b = Bounds::new(point(px(x0), px(top0)), size(px(w), px(h)));
+                    let _ = window.paint_image(b, b, gpui::Corners::all(px(4.)), data, 0, false);
+                } else {
+                    paint_image_fallback(theme, bounds, window);
                 }
-                let b = Bounds::new(point(px(x0), px(top0)), size(px(w), px(h)));
-                let _ = window.paint_image(b, b, gpui::Corners::all(px(4.)), data, 0, false);
-            } else {
-                paint_image_fallback(theme, f, bounds, img, window, cx);
             }
+            Some(Err(_)) => {
+                editor.update(cx, |e, _| e.set_image_size(img.src.clone(), None));
+                paint_image_fallback(theme, bounds, window);
+            }
+            None => paint_image_fallback(theme, bounds, window),
         }
-        Some(Err(_)) => {
-            editor.update(cx, |e, _| e.set_image_size(img.src.clone(), None));
-            paint_image_fallback(theme, f, bounds, img, window, cx);
-        }
-        None => paint_image_fallback(theme, f, bounds, img, window, cx),
     }
+    // 题注（可编辑 alt）绘制在图片之下，经 `x_off` 水平居中。
+    paint_text_row(origin, theme, f, row, window, cx);
 }
 
 
@@ -435,7 +415,8 @@ pub(crate) fn paint_text_row(
 ) {
     // 行内代码圆角 pill 底先画（同一 layout 的像素几何），再画文字。
     paint_inline_code_pills(origin, theme, f, row, window);
-    let mut band_top = row.top;
+    // 图片行题注（alt）从图片盒之下开始（`text_y_off`；普通行为 0）。
+    let mut band_top = row.top + px(text_y_off(row));
     for (k, wl) in row.wrapped.iter().enumerate() {
         let band_h = row.sub_heights.get(k).copied().unwrap_or(row.lh);
         let orig = row.lh * (wl.wrap_boundaries().len() + 1) as f32;
@@ -949,10 +930,12 @@ pub(crate) fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &mut App) ->
 
 /// 选区高亮：对可编辑且与源选区相交的行，按字形几何逐可视行画半透明 accent 矩形。
 /// 与光标共用 `x_off`/`lh`，因此引述缩进里的选中文字也高亮对齐。
+/// **表格**（`table_edit`）逐可见行 × 逐格与选区求交集后按格内字形几何高亮；
+/// **图片行**题注（alt）按 `text_y_off` 偏移到图片盒之下再高亮。
 pub(crate) fn paint_selection(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
-    _theme: &WyTheme,
+    theme: &WyTheme,
     f: &Frame,
     range: &Range<usize>,
     window: &mut Window,
@@ -962,6 +945,62 @@ pub(crate) fn paint_selection(
     let hl = crate::markdown::view::selection_color(cx);
     let e = editor.read(cx);
     for r in &f.rows {
+        // 表格：逐可见行 × 逐格，与选区求交 → 格内字形几何高亮（源码级复制/删除
+        // 早已可用，这里把「选区面板高亮」补到表格单元格）。横向滚动反向平移 +
+        // 裁剪在内容区内（与 paint_table_row 同式）。
+        if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
+            if !r.editable {
+                continue;
+            }
+            let scroll = table_hscroll_clamped(editor.read(cx), f, r);
+            let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+            let grid_h = f32::from(table_block_height(theme, t.rows_texts.len()));
+            let content_rect = Bounds::new(
+                point(origin.x + f.padding, origin.y + r.top),
+                size(px(viewport), px(grid_h)),
+            );
+            let text_lh = f32::from(theme.para_line());
+            window
+                .with_content_mask(Some(gpui::ContentMask { bounds: content_rect }), |window| {
+                    for (row_ix, row_l) in te.rows.iter().enumerate() {
+                        let ls = e.line_start(row_l.src_line);
+                        let row_top = table_row_top(t, row_ix);
+                        let ty = f32::from(r.top) + row_top + ((f32::from(t.row_h) - text_lh) / 2.).max(0.);
+                        for (cell_ix, cell) in row_l.cells.iter().enumerate() {
+                            let Some((d0, d1)) = cell_selection_display(
+                                &cell.map,
+                                cell.line.len(),
+                                cell.src.clone(),
+                                ls,
+                                range,
+                            ) else {
+                                continue;
+                            };
+                            let p0 = cell.line.x_for_index(d0);
+                            let p1 = cell.line.x_for_index(d1);
+                            let x = f32::from(origin.x)
+                                + f32::from(f.padding)
+                                + table_cell_x0(&t.widths, cell_ix)
+                                + cell.text_x
+                                + f32::from(p0)
+                                - scroll;
+                            let w = (f32::from(p1) - f32::from(p0)).max(2.);
+                            window.paint_quad(gpui::PaintQuad {
+                                bounds: Bounds::new(
+                                    point(px(x), origin.y + px(ty)),
+                                    size(px(w), px(text_lh)),
+                                ),
+                                corner_radii: gpui::Corners::default(),
+                                background: hl.into(),
+                                border_widths: gpui::Edges::default(),
+                                border_color: gpui::Hsla::default(),
+                                border_style: gpui::BorderStyle::Solid,
+                            });
+                        }
+                    }
+                });
+            continue;
+        }
         if !r.editable || r.wrapped.is_empty() {
             continue;
         }
@@ -1072,7 +1111,7 @@ pub(crate) fn paint_selection(
                 None => continue,
             };
             let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
-            let y = r.top + px(text_row_shift(r)) + p1.y.min(p0.y);
+            let y = r.top + px(text_y_off(r) + text_row_shift(r)) + p1.y.min(p0.y);
             let w = f32::from(p1.x - p0.x).max(2.);
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(

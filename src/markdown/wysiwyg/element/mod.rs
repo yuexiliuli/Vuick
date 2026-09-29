@@ -81,11 +81,11 @@ pub(crate) struct ShapedTable {
     pub rows_texts: Vec<Vec<gpui::SharedString>>,
 }
 
-/// 一帧后的图片渲染数据（显示框 + 源 + alt 兜底）。
+/// 一帧后的图片渲染数据（显示框 + 源；题注文本经 `ShapedRow` 的 `wrapped`/`byte_map`
+/// 走普通文本路径——可编辑，源即 alt，不再重复驻留）。
 #[derive(Clone)]
 pub(crate) struct ShapedImage {
     pub src: gpui::SharedString,
-    pub alt: gpui::SharedString,
     pub w: f32,
     pub h: f32,
 }

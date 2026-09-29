@@ -1,9 +1,9 @@
 //! `element` 的单元测试。原内联于 `element.rs`，抽取后经 `#[path]` 挂在
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
     use super::{
-        build_frame, caret_geometry, display_to_source, layout_has_notdef, prewarm_band,
-        source_offset_at, source_to_display, table_block_height, table_cell_x0, table_row_top,
-        WyEditor,
+        build_frame, caret_geometry, cell_selection_display, display_to_source, layout_has_notdef,
+        prewarm_band, source_offset_at, source_to_display, table_block_height, table_cell_x0,
+        table_row_top, WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -60,6 +60,40 @@
         // 光标在段尾（源 6）→ 渲染列 4（行尾）；点行尾（渲染列 4）→ 源段尾 6。
         assert_eq!(source_to_display(&map, 6), 4);
         assert_eq!(display_to_source(&map, 4), 6);
+    }
+
+    #[test]
+    fn cell_selection_display_intersects_with_cell_src() {
+        // 单元格渲染 "abcd"，map = [8,9,10,11,12]（渲染字节→源，相对行首；哨兵 12）。
+        let map = vec![8, 9, 10, 11, 12];
+        // 选区完全落在格内 [9,11) → 渲染 [1,3)。
+        assert_eq!(
+            cell_selection_display(&map, 4, 8..12, 0, &(9..11)),
+            Some((1, 3)),
+            "格内选区应回渲染字节区间"
+        );
+        // 选区从格左侧跨入 → 钳到格起点，渲染 [0, …)。
+        assert_eq!(
+            cell_selection_display(&map, 4, 8..12, 0, &(5..11)),
+            Some((0, 3)),
+            "跨格起点选区应钳到格首"
+        );
+        // 选区跨出格终点 → 渲染 […, 4)（哨兵映射到格尾）。
+        assert_eq!(
+            cell_selection_display(&map, 4, 8..12, 0, &(10..20)),
+            Some((2, 4)),
+            "跨格终点选区应钳到格尾"
+        );
+        // 选区完全在格前 / 格后 / 空单元格 → 无交集。
+        assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(0..8)), None);
+        assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(12..15)), None);
+        assert_eq!(cell_selection_display(&map, 4, 12..12, 0, &(0..20)), None);
+        // 非零行首：绝对源区间 = 行首 + 格源区间。
+        assert_eq!(
+            cell_selection_display(&map, 4, 8..12, 100, &(109..111)),
+            Some((1, 3)),
+            "非零行首换算应正确"
+        );
     }
 
     #[gpui::test]
@@ -369,7 +403,14 @@
             assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
             let img = row.image.as_ref().expect("图片行应有渲染数据");
             let h = row.height;
-            assert_eq!(f32::from(h), img.h, "块高应等于显示图高");
+            // 块高 = 图片盒高 + 题注间隙 + 题注（alt 可编辑）行高（与 shape 同式）。
+            let expect_h = img.h
+                + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                + f32::from(ed.read(cx).theme.para_line());
+            assert!(
+                (f32::from(h) - expect_h).abs() < 0.5,
+                "块高应=图高+间隙+题注行高，实际 {h:?} 期望 {expect_h:?}"
+            );
             assert!(
                 (f32::from(h)
                     - crate::config::markdown::IMAGE_ROW_DEFAULT_H)
@@ -530,16 +571,27 @@ let c = 3;
                 "表格块高与估算同式（网格 + 滚动条预留带）"
             );
 
-            // 图片块：占位框（未加载），带 src/alt。
+            // 图片块：占位框（未加载），题注（alt）可编辑、带 src + 源码映射。
             let img_row = frame
                 .rows
                 .iter()
                 .find(|r| r.kind == IrKind::Image)
                 .expect("应有图片块");
-            assert!(!img_row.editable);
+            assert!(img_row.editable, "图片题注（alt）应可编辑");
             let im = img_row.image.as_ref().expect("图片应有渲染数据");
             assert_eq!(im.src.as_ref(), "x.png");
-            assert_eq!(im.alt.as_ref(), "图");
+            // 题注行 = alt 文本，shape 成可编辑 wrapped 单行；byte_map = 源 `![` 之后。
+            assert_eq!(
+                img_row.wrapped.first().map(|w| w.text.as_ref()),
+                Some("图"),
+                "题注行文本应为 alt"
+            );
+            assert_eq!(img_row.byte_map.len(), "图".len() + 1, "alt 显示↔源映射长度");
+            assert_eq!(
+                img_row.byte_map.first().copied(),
+                Some(2),
+                "alt 首显示字节应映射到源 `![` 之后（偏移 2）"
+            );
             assert!(f32::from(img_row.height) > 0.);
         });
     }
@@ -602,10 +654,16 @@ let c = 3;
                 .find(|r| r.image.is_some())
                 .expect("应有图片块");
             let img = img_row.image.as_ref().unwrap();
-            // 未加载：占位高 = IMAGE_ROW_DEFAULT_H。
-            assert_eq!(
-                f32::from(img_row.height),
-                crate::config::markdown::IMAGE_ROW_DEFAULT_H
+            // 未加载：块高 = 占位图高 + 题注间隙 + 题注行高。
+            assert!(
+                (f32::from(img_row.height)
+                    - (crate::config::markdown::IMAGE_ROW_DEFAULT_H
+                        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                        + f32::from(ed.read(cx).theme.para_line())))
+                    .abs()
+                    < 0.5,
+                "未加载块高应=占位图高+间隙+题注行高，实际 {:?}",
+                img_row.height
             );
             // 模拟加载完成：设定源像素尺寸（200×100 = 宽高比 2:1）→ 重建帧 →
             // 显示宽取内容宽、高按宽高比。
@@ -626,9 +684,173 @@ let c = 3;
                 img.h
             );
             assert!(
-                (f32::from(img_row.height) - img.h).abs() < 1.,
-                "块高应等于显示图高 {}",
+                (f32::from(img_row.height)
+                    - (img.h
+                        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                        + f32::from(ed.read(cx).theme.para_line())))
+                    .abs()
+                    < 0.5,
+                "块高应=图高+间隙+题注行高，实际 {} 图高 {}",
+                f32::from(img_row.height),
                 img.h
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn image_alt_editing_roundtrip(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "![图](x.png)\n尾\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                let ls = e.line_start(0);
+                // 光标置于 alt 起点（`![` 之后，ls+2）→ 输入应写进 alt、图片行保持。
+                e.set_caret(ls + 2);
+                e.replace_range(e.caret()..e.caret(), "X", cx);
+                assert!(
+                    e.text().as_ref().contains("![X图](x.png)"),
+                    "alt 前置输入生效：{}",
+                    e.text().as_ref()
+                );
+            });
+        });
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 重开帧：该行仍是图片块、题注文本 = 新 alt。
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Image)
+                .expect("编辑后仍应解析成图片块");
+            assert!(row.editable, "图片题注仍可编辑");
+            assert_eq!(
+                row.wrapped.first().map(|w| w.text.as_ref()),
+                Some("X图"),
+                "题注应显示新 alt"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn image_alt_selection_and_replace_roundtrip(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "![hello](x.png)\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                // `hello` 位于源 [2,7)：选 "ell"(3..6) 应映射正确、替换回源。
+                e.begin_selection_at(3);
+                e.extend_selection_to(6);
+                assert_eq!(e.selection(), Some(3..6), "alt 选区应落在源 [3,6)");
+                assert_eq!(e.selected_text(), "ell", "选中的源文本应为 alt 子串");
+                e.replace_range(e.selection().unwrap(), "o", cx);
+                assert!(
+                    e.text().as_ref().contains("![hoo](x.png)"),
+                    "alt 选区替换生效：{}",
+                    e.text().as_ref()
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn image_alt_backspace_delete_guards(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "![hello](x.png)\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                let ls = e.line_start(0);
+                // 退格在 alt 起点（ls+2）→ 守卫（不吃 `![` 的 `[`）。
+                e.set_caret(ls + 2);
+                e.backspace(cx);
+                assert!(
+                    e.text().as_ref().contains("![hello](x.png)"),
+                    "alt 起点退格应被守卫：{}",
+                    e.text().as_ref()
+                );
+                // 删除在 alt 尾（ls+7 = `]` 前）→ 守卫（不吃 `](` 的 `]`）。
+                e.set_caret(ls + 7);
+                e.delete(cx);
+                assert!(
+                    e.text().as_ref().contains("![hello](x.png)"),
+                    "alt 尾删除应被守卫：{}",
+                    e.text().as_ref()
+                );
+                // alt 内正常键入仍有效（`hello` 首字符前插 Y）。
+                e.set_caret(ls + 2);
+                e.replace_range(e.caret()..e.caret(), "Y", cx);
+                assert!(
+                    e.text().as_ref().contains("![Yhello](x.png)"),
+                    "alt 内输入生效：{}",
+                    e.text().as_ref()
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn image_alt_caption_click_and_caret_stay_aligned(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "![hello](x.png)\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Image)
+                .expect("应有图片块");
+            let pad = f32::from(frame.padding);
+            let top = f32::from(row.top);
+            // 题注（可编辑 alt 行）在图片盒之下：y = 图高 + 间隙，行内 x 走居中 x_off。
+            let img = row.image.as_ref().unwrap();
+            let caption_y = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
+            let x = pad + f32::from(row.x_off) + 1.;
+            let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(caption_y)));
+            assert_eq!(off, 2, "点击题注起始应命中 alt 起点（源 2），实际 {off}");
+            // 光标置于 alt 起点 → 光标条应落在题注行内（y ≥ 图高，x 对题注居中起点）。
+            ed.update(cx, |e, _| e.set_caret(2));
+            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
+            assert!(on, "题注应可放光标");
+            let img = row.image.as_ref().unwrap();
+            let caption_top = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX;
+            assert!(
+                f32::from(carety) >= caption_top - 0.5
+                    && f32::from(carety) <= caption_top + f32::from(frame.line_h) + 0.5,
+                "光标 y {} 应在题注行带 [{caption_top}, {}]",
+                f32::from(carety),
+                caption_top + f32::from(frame.line_h)
+            );
+            assert!(
+                (f32::from(caretx) - x).abs() < 12.,
+                "光标 x {} 应贴合题注点击 x {}",
+                f32::from(caretx),
+                x
             );
         });
     }
@@ -1782,6 +2004,59 @@ tail
                     e.text().as_ref()
                 );
             });
+        });
+    }
+
+    #[gpui::test]
+    fn table_selection_highlight_paints_and_intersects_cells(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let row = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table)
+                .expect("应有表格");
+            let te = row.table_edit.as_ref().expect("表格编辑排版");
+            // 源行：表头(0)、分隔(1)、数据(2~3)、段(4)。全选表头 + 两数据行。
+            ed.update(cx, |e, _| {
+                e.begin_selection_at(e.line_start(0));
+                e.extend_selection_to(e.line_end(3));
+            });
+            let sel = ed.read(cx).selection().expect("应有选区");
+            // 每个可见单元格源区间均与选区相交（选区盖住整个表格 → 2 列 × 3 行 = 6 格）。
+            let mut hit = 0usize;
+            for row_l in &te.rows {
+                let ls = ed.read(cx).line_start(row_l.src_line);
+                for cell in &row_l.cells {
+                    if cell_selection_display(
+                        &cell.map,
+                        cell.line.len(),
+                        cell.src.clone(),
+                        ls,
+                        &sel,
+                    )
+                    .is_some()
+                    {
+                        hit += 1;
+                    }
+                }
+            }
+            assert_eq!(hit, 6, "2 列 × 3 可见行 = 6 格全部与选区相交");
+            // 带选区注入帧并触发一次真实绘制（element 的 paint 会调用 paint_selection，
+            // 表格分支不 panic 即通过）。
+            ed.update(cx, |e, _| {
+                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+            });
+            let _ = window.draw(cx);
         });
     }
 

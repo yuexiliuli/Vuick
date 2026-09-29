@@ -842,9 +842,18 @@ pub(crate) fn image_row_height(editor: &WyEditor, src: &str, avail: f32) -> Pixe
     }
 }
 
-/// 独立图片行：shape 期定显示框（已加载按真实宽高比、未加载用占位高）。
-/// 非文本行（不可编辑）；图片内容在 paint 期异步加载后画出。
-pub(crate) fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> ShapedRow {
+/// 独立图片行：**可编辑**。布局 = 图片盒（顶部，按真实宽高比/占位高）+
+/// 题注（alt 文本行，置于图片之下、水平居中）。题注走与普通文本行同构的
+/// `byte_map`/`wrapped`/`x_off`（命中/光标/选区据此把屏幕位置换算成源字节，
+/// 编辑正确改写 `![alt](…)` 中的 alt）。图片内容在 paint 期异步加载后画出。
+pub(crate) fn shape_image_row(
+    r: DocRow,
+    editor: &WyEditor,
+    window: &mut Window,
+    theme: &WyTheme,
+    base_font: &gpui::Font,
+    avail: f32,
+) -> ShapedRow {
     let kind = r.kind;
     let alt = r.text.clone();
     let src = match &r.payload {
@@ -855,26 +864,58 @@ pub(crate) fn shape_image_row(r: DocRow, editor: &WyEditor, avail: f32) -> Shape
     // 同步读全篇；pass1 估算走 `image_row_height` 的占位高，进带由本行 shape 修正）。
     editor.lazy_ensure_image_size(src.as_ref());
     let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
-    let h = image_row_height(editor, src.as_ref(), avail);
-    let w = max_w;
+    let img_h = image_row_height(editor, src.as_ref(), avail);
+    // 题注（alt 可编辑文本）行：muted 色、正文行高，按内容宽折行（罕见超长 alt）。
+    let cap_run = [gpui::TextRun {
+        len: alt.len(),
+        font: base_font.clone(),
+        color: theme.muted,
+        ..Default::default()
+    }];
+    let cap_wrapped = window
+        .text_system()
+        .shape_text(alt.clone(), theme.font_size, &cap_run, Some(px(avail)), None)
+        .map(|ls| ls.into_vec())
+        .unwrap_or_default();
+    let cap_lh = theme.para_line();
+    let cap_h = cap_wrapped.iter().fold(0f32, |acc, wl| {
+        acc + f32::from(cap_lh) * (wl.wrap_boundaries().len() + 1) as f32
+    });
+    let cap_h = if cap_h <= 0. { f32::from(cap_lh) } else { cap_h };
+    let mut sub_heights: Vec<Pixels> = cap_wrapped
+        .iter()
+        .map(|wl| (f32::from(cap_lh) * (wl.wrap_boundaries().len() + 1) as f32).into())
+        .collect();
+    if sub_heights.is_empty() {
+        sub_heights.push(cap_lh);
+    }
+    let gap = crate::config::markdown::IMAGE_CAPTION_GAP_PX;
+    // 题注水平居中：x_off = (内容宽 − 首行宽)/2（折行的后续行仍左对齐，超长罕见）。
+    let x_off = cap_wrapped
+        .first()
+        .map(|wl| ((avail - f32::from(wl.width())) / 2.).max(0.))
+        .unwrap_or(0.);
+    let height = img_h + px(gap + cap_h);
+    let has_non_ascii = cap_wrapped.iter().any(|wl| !wl.text.is_ascii());
+    let editable = !r.byte_map.is_empty();
     ShapedRow {
         src_line: r.src_line,
         src_lines: r.lines.clone(),
-        wrapped: std::rc::Rc::new(Vec::new()),
-            has_non_ascii: false,
-        sub_heights: vec![h],
-        byte_map: std::rc::Rc::new(Vec::new()),
-        editable: false,
+        wrapped: std::rc::Rc::new(cap_wrapped),
+        has_non_ascii,
+        sub_heights,
+        byte_map: std::rc::Rc::new(r.byte_map),
+        editable,
         multi_offsets: Vec::new(),
         code_ranges: Vec::new(),
-        lh: h,
-        x_off: px(0.),
-        height: h,
+        lh: cap_lh,
+        x_off: px(x_off),
+        height,
         top: px(0.),
         kind,
         table: None,
         table_edit: None,
-        image: Some(ShapedImage { src, alt, w, h: f32::from(h) }),
+        image: Some(ShapedImage { src, w: max_w, h: f32::from(img_h) }),
         mm: None,
         extra: RowExtra::default(),
     }
@@ -893,7 +934,7 @@ pub(crate) fn shape_docrow(
     match r.kind {
         IrKind::Code => shape_code_row(r, editor, window, theme, width),
         IrKind::Table => shape_table_row(r, window, theme.font_size, theme, base_font),
-        IrKind::Image => shape_image_row(r, editor, avail),
+        IrKind::Image => shape_image_row(r, editor, window, theme, base_font, avail),
         _ => shape_text_row_decorated(r, editor, window, width, theme, base_font),
     }
 }

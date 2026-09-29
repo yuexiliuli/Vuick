@@ -229,11 +229,14 @@ fn pass1_base_layout(
             f32::from(mermaid_card_height(&src)) * editor.mermaid_zoom(srcline)
         } else if meta.kind == RowKind::Image {
             // 图片行：用当前加载尺寸按 `shape_image_row` 同式算高（占位→真实由
-            // `igen` 触发整表重建，带内外必须同一公式防滚动跳）。
+            // `igen` 触发整表重建，带内外必须同一公式防滚动跳）。块高 = 图片盒高 +
+            // 题注间隙 + 题注行高（alt 现为可编辑文本行，与 `shape_image_row` 同式）。
             let src = crate::markdown::parse::parse_image_line(doc.line_str(srcline).trim())
                 .map(|(_, s)| s)
                 .unwrap_or_default();
             f32::from(image_row_height(editor, &src, avail))
+                + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                + f32::from(theme.para_line())
         } else {
             let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
             f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h))

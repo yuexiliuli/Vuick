@@ -771,6 +771,12 @@ impl Doc {
                     .unwrap_or_default()
             }
             RowKind::Code => self.code_byte_map(r.src_line, &code_lines),
+            RowKind::Image => {
+                // 独立图片行 `![alt](src)`：alt 文本与源字节 1:1 连续（`!`/`[`
+                // 各占 1 字节，alt 自字节 2 起；末项哨兵 = 闭合 `]` 前 = 2+alt.len()）。
+                // 让图片题注成为与普通文本行同构的可编辑段（编辑正确映射回源）。
+                (0..=r.text.len()).map(|i| 2 + i).collect()
+            }
             _ => Vec::new(),
         };
         let payload = match r.kind {

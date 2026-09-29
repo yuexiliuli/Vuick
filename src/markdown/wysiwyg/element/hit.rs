@@ -72,7 +72,7 @@ pub(crate) fn caret_geometry(
         // 折行时 p.y 是子行偏移，叠加到块首 + 撑高下移才算准缓存所在的可视行。
         let p = render_point_of(&r.wrapped, r.lh, dcol);
         // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
-        return (true, px(12.) + r.x_off + p.x, r.top + px(text_row_shift(r)) + p.y);
+        return (true, px(12.) + r.x_off + p.x, r.top + px(text_y_off(r) + text_row_shift(r)) + p.y);
     }
     // 带外（caret 所在块未物化 = 屏外）：用紧凑布局 `tops` 兜底定位，不画光标
     // （屏外被容器裁剪）。`row_col`/`line_start` 此时查的仍是块内源码行。
@@ -153,7 +153,7 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 // 第几可视行——写成 0 或漏掉下移量会把撑高行上的点击映射错行/错列。
                 let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
                     .max(0.);
-                let sub_y = (rel_y - top - text_row_shift(r)).max(0.);
+                let sub_y = (rel_y - top - text_y_off(r) - text_row_shift(r)).max(0.);
                 let rel = point(px(rel_x), px(sub_y));
                 // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
                 // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。

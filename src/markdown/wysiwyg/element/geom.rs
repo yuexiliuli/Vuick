@@ -5,9 +5,11 @@
 //! 与 [`super::BlockLayout`] 的 Fenwick 前缀和、[`super::Frame`] 的 `deltas` 稀疏覆盖
 //! 分开：这里只管「单块内部的坐标换算」，块间定位在 `Frame`/`BlockLayout`。
 
+use std::ops::Range;
+
 use gpui::{Pixels, Point, point, px};
 
-use super::{ShapedRow, ShapedTable, TableRowCellsLayout};
+use super::{IrKind, ShapedRow, ShapedTable, TableRowCellsLayout};
 
 /// 源列 → 渲染列（左界：首个 `byte_map[v] >= target`；与 `display_to_source` 互逆，
 /// 光标才落回点击处——用 `>` 会整格右移一字符）。
@@ -42,6 +44,45 @@ pub(crate) fn text_row_shift(row: &ShapedRow) -> f32 {
     let band = row.sub_heights.first().copied().unwrap_or(row.lh);
     let orig = row.lh * (w0.wrap_boundaries().len() + 1) as f32;
     ((f32::from(band) - f32::from(orig)) / 2.).max(0.)
+}
+
+/// 可编辑文本在行内的**垂直起点**（相对 `row.top`，px）——图片行的题注（alt）在
+/// 图片盒之下（`image.h` + 题注间隙）；普通文本行为 0（其上再叠 [`text_row_shift`]
+/// 的行内公式撑高下移）。光标几何 / 点击命中 / 选区绘制 / 文本 paint 必须共用，
+/// 否则图片题注上的光标/选区会错位。
+pub(crate) fn text_y_off(row: &ShapedRow) -> f32 {
+    if row.kind == IrKind::Image {
+        row.image
+            .as_ref()
+            .map(|i| i.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX)
+            .unwrap_or(0.)
+    } else {
+        0.
+    }
+}
+
+/// 表格单元格源区间与选区的交集 → `(渲染内起始字节, 渲染内结束字节)`。
+/// `map` = 单元格 `TableCellLayout.map`（渲染字节→源字节，相对该行行首，末项哨兵）；
+/// `cell_src` 相对行首；`row_line_start` = 该源行的**绝对**行首；`sel` = 全局源选区
+///（归一化）。无交集返回 `None`。纯函数（不依赖 window），`paint_selection` 与单测共用。
+pub(crate) fn cell_selection_display(
+    map: &[usize],
+    cell_text_len: usize,
+    cell_src: Range<usize>,
+    row_line_start: usize,
+    sel: &Range<usize>,
+) -> Option<(usize, usize)> {
+    let start = row_line_start + cell_src.start;
+    let end = row_line_start + cell_src.end;
+    let from = sel.start.max(start).min(end);
+    let to = sel.end.max(start).min(end);
+    if to <= from {
+        return None;
+    }
+    let d0 = source_to_display(map, from - row_line_start).min(cell_text_len);
+    let d1 = source_to_display(map, to - row_line_start).min(cell_text_len);
+    let (d0, d1) = if d0 <= d1 { (d0, d1) } else { (d1, d0) };
+    (d1 > d0).then_some((d0, d1))
 }
 
 /// 代码块内 dy（相对块首 y）→ 源码行组序号（`sub_heights` 累积；块首 1 行空白带

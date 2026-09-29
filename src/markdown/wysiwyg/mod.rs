@@ -16,11 +16,13 @@
 //!   [`super::view::style::StyleParams`]。
 //! - 输入：普通文本/IME 组合命中（`marked` 区间追踪，修复重复串）、点击定位、
 //!   鼠标拖选 + Ctrl+C/X/V/A（选区替换/删除）。
-//! - 现状声明（留待逐步补齐）：代码块内容行、表格**单元格**已可编辑（代码走块级
+//! - 现状声明：代码块内容行、表格**单元格**、图片**题注（alt）**已可编辑（代码走块级
 //!   `byte_map` + `multi_offsets`；表格走逐行逐格的 `DocRow.table_rows` → `table_edit`
-//!   单元格排版，含对齐位移、渲染列↔源字节映射；导航跳过只读围栏/分隔行，退格/
-//!   删除有单元格边界守卫，表格内回车 no-op）。图片 alt 仍只读（可复用文本行映射）。
-//!   选区面板高亮尚未覆盖表格单元格（源码级复制/删除已可用）。仅作「预览编辑
+//!   单元格排版，含对齐位移、渲染列↔源字节映射；图片行 = 图片盒 + 居中可编辑 alt
+//!   题注行，题注走与普通文本行同构的 `byte_map`/`wrapped`/`x_off`；导航跳过只读
+//!   围栏/分隔行，退格/删除有代码围栏、单元格、alt 起点/尾边界守卫，表格与图片
+//!   alt 内回车 no-op）。选区面板高亮已覆盖：普通文本行、代码内容行、表格单元格
+//!   （逐可见行 × 逐格与选区求交后按字形几何绘制）、图片题注行。仅作「预览编辑
 //!   测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
 
 mod element;
@@ -2815,7 +2817,7 @@ impl WyEditor {
 
     /// 该行「可编辑段」的源局部区间 `(lo, hi)`：`lo` = 正文源偏移，`hi` = 行尾。
     /// 非文本行 → `None`（只读/不可编辑）。代码内容行 / 表格表头与数据行整行可编辑
-    /// （围栏标记行 / 表格分隔行仍 `None`）。
+    /// （围栏标记行 / 表格分隔行仍 `None`）。独立图片行 → alt（`![` 之后到 `](` 之前）。
     fn editable_segment(&self, line: usize) -> Option<(usize, usize)> {
         let start = self.line_start(line);
         let end = self.line_end(line);
@@ -2826,8 +2828,30 @@ impl WyEditor {
             return Some((0, end - start));
         }
         let raw = self.doc.slice_str(start..end);
+        // 独立图片行：可编辑段 = alt（`![` 之后到 `](` 之前），题注行可编辑。
+        if self.kind_for_line(line) == crate::markdown::parse::RowKind::Image {
+            return self.image_alt_segment(line);
+        }
         let seg = crate::markdown::parse::text_segment(&raw, self.kind_for_line(line))?;
         Some((seg.0, raw.len()))
+    }
+
+    /// 独立图片行的可编辑段（源局部区间，相对行首）：alt 内容 `[lo, hi)`。
+    /// 非图片行 / 解析失败 → `None`。与 `DocRow.byte_map`（图片题注映射）同构。
+    fn image_alt_segment(&self, line: usize) -> Option<(usize, usize)> {
+        if self.kind_for_line(line) != crate::markdown::parse::RowKind::Image {
+            return None;
+        }
+        let start = self.line_start(line);
+        let end = self.line_end(line);
+        if end <= start {
+            return None;
+        }
+        let raw = self.doc.slice_str(start..end);
+        let lead = raw.len() - raw.trim_start().len();
+        let r = crate::markdown::parse::parse_ref(raw.trim_start())?;
+        let lo = lead + 2;
+        Some((lo, lo + r.alt.len()))
     }
 
     /* ---------- 可编辑块区域（代码/表格 + 围栏行判定） ---------- */
@@ -3419,14 +3443,17 @@ impl WyEditor {
         self.replace_range(prev..at, "", cx);
     }
 
-    /// 退格是否被边界守卫拦截（代码首内容行行首 / 表格单元格内容起点）。
+    /// 退格是否被边界守卫拦截（代码首内容行行首 / 表格单元格内容起点 / 图片 alt 起点）。
     fn backspace_blocked(&self, line: usize, col: usize) -> bool {
         match self.region_content(line) {
             Some(BlockRegion::Code { lo, .. }) => line == lo && col == 0,
             Some(BlockRegion::Table { .. }) => {
                 self.table_cell_bounds(line, col).is_some_and(|(s, _)| col <= s)
             }
-            None => false,
+            None => {
+                // 图片行 alt：起点即 `![` 边界，退格不得吃到图片标记（行会变非图片）。
+                self.image_alt_segment(line).is_some_and(|(lo, _)| col <= lo)
+            }
         }
     }
 
@@ -3450,7 +3477,7 @@ impl WyEditor {
         self.replace_range(at..end, "", cx);
     }
 
-    /// 删除是否被边界守卫拦截（代码末内容行行尾 / 表格单元格内容尾）。
+    /// 删除是否被边界守卫拦截（代码末内容行行尾 / 表格单元格内容尾 / 图片 alt 尾）。
     fn delete_blocked(&self, line: usize, col: usize) -> bool {
         match self.region_content(line) {
             Some(BlockRegion::Code { hi, .. }) => {
@@ -3460,15 +3487,22 @@ impl WyEditor {
             Some(BlockRegion::Table { .. }) => {
                 self.table_cell_bounds(line, col).is_some_and(|(_, e)| col >= e)
             }
-            None => false,
+            None => {
+                // 图片行 alt：尾即 `](` 边界，删除不得吃到闭合中括号（行会变非图片）。
+                self.image_alt_segment(line).is_some_and(|(_, hi)| col >= hi)
+            }
         }
     }
 
     fn newline(&mut self, cx: &mut Context<Self>) {
         crate::prof::op_start("newline");
         // 表格内换行会拆坏表结构（MVP 先 no-op）；代码块内换行合法（分行）。
-        let (nl, _) = self.row_col(self.caret);
-        if matches!(self.region_content(nl), Some(BlockRegion::Table { .. })) {
+        // 图片行 alt（`![` 之后到 `](` 之前）内换行会拆坏图片语法 → 同样 no-op
+        // （光标在 alt 内或未越过 alt 尾；越过整行尾（`)(src)` 之后）才放行）。
+        let (nl, col) = self.row_col(self.caret);
+        if matches!(self.region_content(nl), Some(BlockRegion::Table { .. }))
+            || self.image_alt_segment(nl).is_some_and(|(_lo, hi)| col <= hi)
+        {
             return;
         }
         let range = self.selection().unwrap_or(self.caret..self.caret);
