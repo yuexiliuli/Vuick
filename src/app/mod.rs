@@ -196,6 +196,15 @@ pub(crate) struct DetachedTab {
     preview_dirty: Option<(usize, usize)>,
 }
 
+/// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
+/// - `Legacy` = `MarkdownPreview`（EPUB / 手动预览，条目为渲染行列，`scroll_to_row`）；
+/// - `Unified` = 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
+#[derive(Clone)]
+pub(crate) enum MdTocScroll {
+    Legacy(gpui::Entity<crate::markdown::view::MarkdownPreview>),
+    Unified(gpui::Entity<WyEditor>),
+}
+
 /// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名（拖拽幽灵视图用它画“小胶囊”）。
 #[derive(Clone, Debug)]
 pub(crate) struct TabDragData {
@@ -507,8 +516,10 @@ impl EditorApp {
             let cursor = st.cursor_position();
             (st.display_line_count(), st.char_count(), cursor.0, cursor.1)
         };
-        // 仅在开启预览时才同步 Markdown 预览，且**合成一轮**（见 `start_preview_sync`）。
-        if self.tabs[tab_ix].preview_on {
+        // A4 脱离：仅在非 Markdown（EPUB / 手动预览）时才同步 MarkdownPreview——
+        // MD 右栏预览已由逐键增量桥（`on_editor_edited` 上面的 bridge）实时跟随统一组件，
+        // 不再为 MD 调后台 scan_blocks/喂 MarkdownPreview（省每键一次扫块 + 一份源副本）。
+        if self.tabs[tab_ix].preview_on && !self.is_markdown_tab(tab_ix) {
             self.start_preview_sync(cx);
         }
         let tab = &mut self.tabs[tab_ix];
@@ -736,7 +747,11 @@ impl EditorApp {
         // 预览/PDF 主题背景刷新 + PDF 订阅重建
         let canvas_bg = self.window_bg();
         if self.tabs[idx].preview_on {
-            self.sync_md_preview(idx, cx);
+            // A4 脱离：MD（非只读）统一组件随选项卡搬家（已带内容），无需再喂预览；
+            // EPUB / 手动预览仍走 MarkdownPreview。
+            if !is_md || self.tabs[idx].readonly_preview {
+                self.sync_md_preview(idx, cx);
+            }
         }
         if let Some(pdf) = self.tabs[idx].pdf_preview.clone() {
             let pv = pdf.clone();
@@ -944,6 +959,23 @@ impl EditorApp {
         tab.md_wy.clone()
     }
 
+    /// A4：当前激活选项卡的 Markdown TOC 数据源 + 跳转目标（侧边栏目录共用）：
+    /// MD 统一预览（`md_wy` 在场，非只读）→ WyEditor（条目 = 源码行，点击滚动统一组件
+    /// 宿主）；EPUB / 手动预览（`md_wy` 缺席）→ `MarkdownPreview`（渲染行列，`scroll_to_row`）。
+    fn md_toc_source(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(crate::markdown::wysiwyg::TocEntries, MdTocScroll)> {
+        let tab = self.tabs.get(self.active_tab)?;
+        if let Some(wy) = &tab.md_wy {
+            return Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())));
+        }
+        Some((
+            tab.md_preview.read(cx).toc_entries(),
+            MdTocScroll::Legacy(tab.md_preview.clone()),
+        ))
+    }
+
     /// A2：确保某选项卡的右栏 WyEditor 预览已创建（懒创建 + A1 只读门控 + 全局字号/
     /// 基准目录）。`feed=true` 用当前编辑区文本**同步喂源**（小文档 / 切预览；
     /// 大文档异步走 `open_from_rope`(后台) + `finish_file_text` 的 `install_open`，
@@ -1020,11 +1052,12 @@ impl EditorApp {
             ed.set_soft_wrap(wrap);
         });
         if preview_on {
-            self.sync_md_preview(idx, cx);
-            // A2：MD 选项卡同步创建/喂源右栏 WyEditor 预览（EPUB 只读 / 非 md 跳过）。
-            let is_md_preview = is_md && !readonly;
-            if is_md_preview {
+            // A4 脱离：MD（非只读）只走统一组件 WyEditor（ensure_md_wy 同步喂源）；
+            // 仅 EPUB / 手动预览（readonly 或非 md）仍用 MarkdownPreview（sync_md_preview）。
+            if is_md && !readonly {
                 self.ensure_md_wy(idx, window, cx, true);
+            } else {
+                self.sync_md_preview(idx, cx);
             }
         } else {
             // 关闭预览：释放整篇解析出的行数据与测量缓存，内存回到基线

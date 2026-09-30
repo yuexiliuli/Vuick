@@ -73,6 +73,11 @@ pub enum WyEvent {
     OpenPage(String),
 }
 
+/// A4：标题目录条目 `(源码行, 标题级别, 标题文本)` 容器（WyEditor 目录 / 侧边栏共用）。
+pub(crate) type TocEntries = Vec<(usize, u8, SharedString)>;
+/// A4：目录缓存条目（`content_gen` + 条目；侧边栏目录每帧渲染消费用）。
+pub(crate) type TocCacheEntry = (u64, TocEntries);
+
 /// 行内样式调色（创建时注入；后续随主题切换重建）。
 ///
 /// **关键**：整份主题由预览的 [`StyleParams`] 一次性派生（`WyTheme::from_style`），
@@ -384,6 +389,9 @@ pub struct WyEditor {
     /// 文本选区的固定锚点（源字节）。`Some(anchor)` 时选区 = `anchor..caret`（caret
     /// 为活动端）；`None` = 无选区（仅光标）。拖拽/ Shift+方向 产生，Ctrl+C/A/V 消费。
     sel_anchor: Option<usize>,
+    /// A4：目录缓存 `(content_gen, 条目)`——内容变更才重扫 Doc 块（侧边栏目录每帧
+    /// 渲染消费，`toc_entries` 按此 O(1) 命中，避免大文档每帧 O(块数) 扫描）。
+    toc_cache: RefCell<Option<TocCacheEntry>>,
     /// 鼠标左键拖选进行中（on_mouse_move 延伸选区）。
     dragging: bool,
     /// 预览独有能力「搜索跳转高亮」（自 [`MarkdownPreview::highlight_search`] 搬入）：
@@ -1024,6 +1032,7 @@ impl WyEditor {
             marked: None,
             sel_anchor: None,
             dragging: false,
+            toc_cache: RefCell::new(None),
             highlight_search: None,
             highlight_seq: 0,
             code_h_scroll: RefCell::new(std::collections::HashMap::new()),
@@ -1093,6 +1102,67 @@ impl WyEditor {
     /// 当前是否可编辑（只读预览 = `false`）。
     pub fn is_editable(&self) -> bool {
         self.editable
+    }
+
+    /// A4：目录条目 `(源码行, 标题级别, 标题文本)`——与 `MarkdownPreview::toc_entries`
+    /// 同构，首字段语义 = **源码行**（统一组件宿主用 `scroll_to_line` 跳转）。遍历 Doc
+    /// 块（O(块数)，按 `content_gen` 缓存，仅内容变更重扫；侧边栏目录渲染低频消费）。
+    pub(crate) fn toc_entries(&self) -> TocEntries {
+        if let Some((g, t)) = &*self.toc_cache.borrow()
+            && *g == self.content_gen.get()
+        {
+            return t.clone();
+        }
+        let n = self.doc.block_count();
+        let mut out = Vec::with_capacity(n.min(1024));
+        for i in 0..n {
+            let Some(m) = self.doc.block_meta(i) else { continue };
+            if let crate::markdown::parse::RowKind::Heading(level) = m.kind {
+                let t = self.line_text(m.src_line as usize);
+                let clean = t.trim().trim_start_matches('#').trim_start();
+                out.push((m.src_line as usize, level, SharedString::from(clean)));
+            }
+        }
+        *self.toc_cache.borrow_mut() = Some((self.content_gen.get(), out.clone()));
+        out
+    }
+
+    /// A4：目录/搜索跳转 —— 把（只读）预览滚动到**源码第 `src_line` 行**所在块。
+    /// 镜像 `prepare_font_zoom` 渲染期重建套路：先以当前（或默认带建的）窗口化帧估块顶
+    /// → 定位目标可视带 → 在目标带重建窗口化帧读**精确**块顶 → 写回宿主 `ScrollHandle`
+    ///（内容坐标 top = −offset.y − pad_y → offset = −(top + pad_y)），并发布新带给下帧。
+    pub(crate) fn scroll_to_line(&mut self, src_line: usize, window: &mut Window) {
+        let n = self.doc.block_count();
+        if n == 0 || self.doc.len() == 0 {
+            return;
+        }
+        if src_line >= self.doc.line_count() {
+            return;
+        }
+        let block = self.doc.block_index_for_line(src_line).min(n - 1);
+        let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+        // 确保基础布局已建（未建则先建一次再读估计块顶；带外只取估算用于定位）。
+        if self.frame.borrow().is_none() {
+            let band = self.shape_band().unwrap_or((0., 5000.));
+            let f = element::build_frame(&*self, window, width, band);
+            *self.frame.borrow_mut() = Some(std::rc::Rc::new(f));
+        }
+        let est_top = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f.block_top(block))
+            .unwrap_or(0.);
+        let band = zoom_band_for_top(est_top, window.viewport_size().height);
+        if self.shape_band() != Some(band) {
+            self.set_shape_band(Some(band));
+        }
+        let frame = element::build_frame(&*self, window, width, band);
+        let exact_top = frame.block_top(block);
+        *self.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+        if let Some((vh, pad_y)) = self.host_scroll.borrow().clone() {
+            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(exact_top + pad_y))));
+        }
     }
 
     /// 字号变化的**渲染期精确锚定**：在宿主 render（prepaint 读宿主滚动偏移**之前**）

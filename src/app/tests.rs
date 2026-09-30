@@ -701,6 +701,66 @@
         );
     }
 
+    /// A4：侧边栏 Markdown 目录**点击跳转**——条目走统一组件 WyEditor（源码行）：
+    /// 点「# 大标题 18」（文中部）→ 右栏预览 `scroll_to_line` 滚动到该标题所在块
+    /// （宿主滚动句柄从顶部偏离到负向偏移，预览跟随跳转）。
+    #[gpui::test]
+    async fn sidebar_toc_click_scrolls_md_wy_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-mdwy-toc-{}.md", std::process::id()));
+        let mut doc = String::new();
+        for i in 0..40 {
+            doc.push_str(&format!("# 大标题 {i}\n\n正文 {i}\n\n"));
+        }
+        std::fs::write(&p, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let vhand = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_wy_vscroll.clone()
+        });
+        let before = cx.update(|_w, _cx| (-vhand.offset().y).as_f32());
+        assert_eq!(before, 0.0, "初始预览滚动在顶部");
+        let row = cx
+            .debug_bounds("sidebar-toc-md-18")
+            .expect("应渲染第 18 个目录条目（WyEditor TOC 驱动）");
+        let pt = gpui::Point::new(row.left() + px(6.), row.top() + px(2.));
+        cx.simulate_click(pt, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let after = cx.update(|_w, _cx| (-vhand.offset().y).as_f32());
+        assert!(
+            after > 10.0,
+            "点击目录应把右栏 WyEditor 预览滚动到对应标题（after scroll={after:.0}px）"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 回归：侧边栏「目录」视图的条目应带 PDF 书签目录同款样式——
     /// 有子级的条目渲染折叠箭头，点击折叠后隐藏其后代标题，再点恢复。
     #[gpui::test]
@@ -1454,11 +1514,12 @@
             cx.debug_bounds("status-wrap-btn").is_none(),
             "Markdown 文件预览时状态栏不应出现换行开关"
         );
-        let wraps = cx.update(|_w, cx| {
+        // A4：MD 预览走统一组件 WyEditor（自动换行由组件默认保障，不再有 md_preview 可查）。
+        let wy_active = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+            a.tabs[a.active_tab].md_wy.is_some()
         });
-        assert!(wraps, "刚打开 Markdown 预览应默认自动换行");
+        assert!(wy_active, "刚打开 Markdown 预览应走统一组件（WyEditor 自动换行）");
         let _ = std::fs::remove_file(&md);
 
         // 普通文本文件：应保留换行按钮
@@ -1496,52 +1557,43 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        // 初始：预览自动换行；全局编辑区换行偏好默认关闭（仅 md 编辑区默认换行）
-        let (w0, pref0) = cx.update(|_w, cx| {
+        // 初始：全局编辑区换行偏好默认关闭（仅 md 编辑区默认换行）；MD 预览走统一组件。
+        let (wy0, pref0) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
-                a.wrap_enabled,
-            )
+            (a.tabs[a.active_tab].md_wy.is_some(), a.wrap_enabled)
         });
-        assert!(w0, "initial 预览应自动换行，w0={w0}");
+        assert!(wy0, "initial: MD 预览应走统一组件 WyEditor（自动换行由组件保障）");
         assert!(!pref0, "全局编辑区换行偏好应默认关闭（仅 md 编辑区换行），pref0={pref0}");
 
-        // 切换换行：只作用编辑区 → 预览保持换行、全局偏好开启
+        // 切换换行：只作用编辑区 → 预览组件不变、全局偏好开启
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
         for _ in 0..5 {
             cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
         }
-        let (w1, pref1) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            (
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
-                a.wrap_enabled,
-            )
-        });
+        let pref1 = cx.update(|_w, cx| app.read(cx).wrap_enabled);
+        let host1 = cx.debug_bounds("preview-md-wy").is_some();
         assert!(
-            w1,
-            "切换「自动换行」不应改变 Markdown 预览（预览始终自动换行），实际 w1={w1}"
+            host1,
+            "切换「自动换行」不应动 Markdown 预览（统一组件宿主仍渲染）"
         );
         assert!(pref1, "切换一次后全局编辑区换行偏好应开启");
 
-        // 再切回：预览仍保持换行、偏好恢复关闭
+        // 再切回：预览仍渲染、偏好恢复关闭
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_wrap(window, cx));
         });
         for _ in 0..5 {
             cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
         }
-        let (w2, pref2) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            (
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
-                a.wrap_enabled,
-            )
-        });
-        assert!(w2, "预览应保持换行，w2={w2}");
+        let pref2 = cx.update(|_w, cx| app.read(cx).wrap_enabled);
+        let host2 = cx.debug_bounds("preview-md-wy").is_some();
+        assert!(host2, "再切换后预览应仍渲染");
         assert!(!pref2, "再切换后全局编辑区换行偏好应恢复关闭");
         let _ = std::fs::remove_file(&md);
     }
@@ -2213,8 +2265,9 @@
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Markdown 预览同步（无去抖，合成一轮立即同步）：编辑触发后同步完成并复位挂起，
-    /// 内容**真实落盘**到预览（后台 `scan_blocks` 路径，UI 线程只做快照 + 装配）。
+    /// Markdown 预览同步（A4：逐键增量桥）——编辑触发 `Edited` 后，右栏 WyEditor 预览
+    /// 立即（同步重放，非后台扫描）跟随编辑区，恒与编辑区逐字节一致。MD 分支已脱离
+    /// MarkdownPreview（不再喂 `md_preview`），此测试验证统一组件才是真正的「预览」。
     #[gpui::test]
     async fn preview_syncs_content_after_edit(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2231,36 +2284,59 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let preview = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.clone()
-        });
-        let t0 = cx.update(|_w, cx| preview.read(cx).rendered_text());
-        assert!(t0.contains("初始标题"), "打开时预览应含初始标题，实际 {t0:?}");
+        let preview_text = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                a.tabs[a.active_tab]
+                    .md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default()
+            })
+        };
+        let t0 = preview_text(cx);
+        assert!(t0.contains("初始标题"), "打开时预览应含初始标题（md_wy 同步喂源），实际 {t0:?}");
 
-        // 真实编辑：粘贴触发 InputEvent::Change → 立即进入合成一轮同步
+        // 真实编辑：粘贴触发 InputEvent::Change → 增量桥同步重放。
         cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
         });
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("新增段落".to_string()));
         cx.dispatch_action(Paste);
-        // 同步在后台扫描、尽可能多地驱动到完成
         for _ in 0..30 {
             cx.run_until_parked();
         }
-        let t1 = cx.update(|_w, cx| preview.read(cx).rendered_text());
+        let (t1, e1) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                t.editor.read(cx).value().to_string(),
+            )
+        });
         assert!(
             t1.contains("新增段落"),
-            "编辑后预览应同步到新内容（后台扫描路径），实际 {t1:?}"
+            "编辑后预览应跟随新内容（增量桥），实际 {t1:?}"
         );
-        let pending = cx.update(|_w, cx| app.read(cx).preview_pending);
-        assert!(!pending, "同步完成后应复位挂起状态");
+        assert_eq!(t1, e1, "预览应与编辑区逐字节一致");
+        // MD 分支脱离：MarkdownPreview 不再承载 MD 预览（EPUB/TOC 专用）。
+        let md_prev = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_preview.read(cx).rendered_text()
+        });
+        assert!(
+            !md_prev.contains("初始标题") && !md_prev.contains("新增段落"),
+            "MD 预览应已脱离 MarkdownPreview（不再喂源），实际 {md_prev:?}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
-    /// #4 回归：快速连续两次编辑（第一轮后台扫描可能被第二轮抢占/丢弃），最终预览
-    /// 必须收敛到**最新**内容，旧轮结果不得覆盖新编辑（`preview_seq` 代次守卫）。
+    /// 快速连续两次编辑：增量桥是同步逐键重放（无后台轮次/代次之争），最终预览必
+    /// 收敛 = 编辑区（含两次编辑内容），不可能被旧轮覆盖。
     #[gpui::test]
     async fn preview_sync_rapid_edits_converges_without_stale_override(cx: &mut TestAppContext) {
         init_test(cx);
@@ -2277,36 +2353,34 @@
         for _ in 0..5 {
             cx.run_until_parked();
         }
-        let preview = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.clone()
-        });
         cx.update(|window, cx| {
             let focus = app.read(cx).editor_focus_handle(cx);
             window.focus(&focus, cx);
         });
-        // 第一次编辑 → 250ms（第一轮计时到点，开始后台扫描）
+        // 连续两次快速编辑（无去抖间隔——桥无去抖，逐键即同步）。
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("B".to_string()));
         cx.dispatch_action(Paste);
-        cx.executor().advance_clock(std::time::Duration::from_millis(250));
-        for _ in 0..10 {
-            cx.run_until_parked();
-        }
-        // 第二次编辑 → 再 250ms（第二轮接管），最终预览应含 B、C 且不为旧内容覆盖
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("C".to_string()));
         cx.dispatch_action(Paste);
-        for _ in 0..2 {
-            cx.run_until_parked();
-        }
-        cx.executor().advance_clock(std::time::Duration::from_millis(250));
         for _ in 0..30 {
             cx.run_until_parked();
         }
-        let t = cx.update(|_w, cx| preview.read(cx).rendered_text());
+        let (t, e) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                t.editor.read(cx).value().to_string(),
+            )
+        });
         assert!(
             t.contains("C") && t.contains("B"),
             "最终预览应含两次编辑内容（收敛到最新），实际 {t:?}"
         );
+        assert_eq!(t, e, "预览应与编辑区一致");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -2644,7 +2718,10 @@
                 let tab = &a.tabs[i];
                 !tab.editor_pending
                     && tab.editor.read(cx).value() == content
-                    && tab.md_preview.read(cx).memory_estimate().0 > 0
+                    && tab.md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false)
             });
             if ready {
                 break;
@@ -2654,19 +2731,19 @@
                 panic!("大 md 完整流程超时：{} 帧", frames);
             }
         }
-        let (fast_count, finish_count, preview_blocks, status_ok) = cx.update(|_, cx| {
+        let (fast_count, finish_count, wy_loaded, status_ok) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
             (
                 a.open_fast_count,
                 a.open_finish_count,
-                a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                a.tabs[i].md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false),
                 a.status_ok,
             )
         });
         assert_eq!(fast_count, 1, "两段式快段应执行 1 次");
         assert_eq!(finish_count, 1, "两段式慢段应执行 1 次");
-        assert!(preview_blocks > 0, "预览块索引应就绪");
+        assert!(wy_loaded, "右栏 WyEditor 预览应装配完成");
         assert!(status_ok, "打开状态应成功");
         let _ = std::fs::remove_file(&dir);
     }
@@ -2826,11 +2903,12 @@
         let _ = std::fs::remove_file(&dir);
     }
 
-    /// 回归（第二步：预览与编辑器共享源 Rope）：大 md 打开（完整异步流水线 +
-    /// `finish_file_text` 装预览）后，预览源码与编辑区正文是**同一棵 Rope**（ropey
-    /// 2.0 Arc 树，`Clone` O(1)、写时复制）——大 md 预览不常驻第二份源文本副本。
+    /// A4（承接原“预览与编辑器共享源 Rope”回归）：大 md 打开（完整异步流水线 +
+    /// `finish_file_text` 装预览）后，右栏统一组件 WyEditor 由**同一棵编辑器 Rope**（ropey
+    /// 2.0 Arc 树，`Clone` O(1)）后台 `open_from_rope` 装配——不物化第二份源文本，
+    /// MD 现在只有这一份预览解析态（不再有 MarkdownPreview 的第二份扫描）。
     #[gpui::test]
-    async fn large_md_preview_shares_editor_rope(cx: &mut TestAppContext) {
+    async fn large_md_preview_covers_full_source(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -2845,7 +2923,7 @@
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        // 块数 > WINDOWED_MIN_BLOCKS 且 > 128KB → 走异步流水线（finish 装 PreviewSrc::Rope）。
+        // 块数 > WINDOWED_MIN_BLOCKS 且 > 128KB → 走异步流水线（finish 安装 md_wy）。
         let n = crate::config::limits::WINDOWED_MIN_BLOCKS + 800;
         let content = (0..n)
             .map(|i| {
@@ -2864,31 +2942,38 @@
         let mut frames = 0;
         loop {
             cx.run_until_parked();
-            let (blocks, pending) = cx.update(|_, cx| {
+            let loaded = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
-                (
-                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
-                    a.tabs[i].editor_pending,
-                )
+                let t = &a.tabs[i];
+                !t.editor_pending
+                    && t.md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false)
             });
-            if blocks > 0 && !pending {
+            if loaded {
                 break;
             }
             frames += 1;
             if frames > 300 {
-                panic!("大 md 打开/预览装配超时：{frames} 帧（blocks={blocks}）");
+                panic!("大 md 打开/预览装配超时：{frames} 帧");
             }
         }
-        let shared = cx.update(|_, cx| {
+        // 预览全文 = 编辑区正文（md_wy 从同一棵 Rope 装配，覆盖完整源；一份解析态）。
+        let (wy_text, ed_text, md_prev_blocks) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            let editor_rope = a.tabs[i].editor.read(cx).rope().clone();
-            a.tabs[i].md_preview.read(cx).test_src_rope_shared_with(&editor_rope)
+            (
+                a.tabs[i].md_wy.as_ref().unwrap().read(cx).text().to_string(),
+                a.tabs[i].editor.read(cx).value().to_string(),
+                a.tabs[i].md_preview.read(cx).memory_estimate().0,
+            )
         });
+        assert_eq!(wy_text, ed_text, "大 md WyEditor 预览应覆盖完整源（与编辑区一致）");
         assert!(
-            shared,
-            "异步打开 + finish 装预览后，预览源码应与编辑区共享同一棵 Rope（不物化第二份源）"
+            md_prev_blocks == 0,
+            "MD 分支脱离：MarkdownPreview 不再为大 md 建第二份索引（blocks={md_prev_blocks}）"
         );
         let _ = std::fs::remove_file(&dir);
     }
@@ -3895,10 +3980,10 @@
         println!("【txt 打开：open_file 返回】(对照) {} ms", t_txt.elapsed().as_millis());
     }
 
-    /// A2 基准（ignored，release）：大文档异步打开 + 右栏 WyEditor 预览装配的墙钟拆解。
-    /// 真实 `fixtures/大文档测试2.md`（6.4MB / ~14 万行）。测各阶段：同步返回（UI 不卡）→
-    /// 编辑区内容可见（D）→ md_preview 就绪（A，EPUB/TOC 用）→ 右栏 WyEditor 预览装配
-    /// （WY）。运行：
+    /// A2/A4 基准（ignored，release）：大文档异步打开 + 右栏 WyEditor 预览装配的墙钟拆解。
+    /// 真实 `fixtures/大文档测试2.md`（6.4MB / ~14 万行）。A4 后 MD 走统一组件：后台只做
+    /// 一份 `Doc::open`（不再 scan_blocks 喂 MarkdownPreview）。测同步返回（UI 不卡）→
+    /// 编辑区内容可见（D）→ 右栏 WyEditor 预览装配（WY）。运行：
     /// `cargo test --release -- --ignored bench_a2_md_wy_open_large --nocapture`
     #[gpui::test]
     #[ignore]
@@ -3918,16 +4003,14 @@
         });
         println!("【同步返回】(UI 不卡) {} ms", t0.elapsed().as_millis());
         let mut d_ready = false;
-        let mut a_ready = false;
         let mut wy_ready = false;
         let mut d_ms = 0usize;
-        let mut a_ms = 0usize;
         let mut wy_ms = 0usize;
         let mut frames = 0;
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (editor_lines, pending, wy_loaded, blocks) = cx.update(|_, cx| {
+            let (editor_lines, pending, wy_loaded) = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 (
@@ -3938,22 +4021,17 @@
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
                         .unwrap_or(false),
-                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
                 )
             });
             if !d_ready && !pending && editor_lines > 1000 {
                 d_ready = true;
                 d_ms = t0.elapsed().as_millis() as usize;
             }
-            if !a_ready && blocks > 0 {
-                a_ready = true;
-                a_ms = t0.elapsed().as_millis() as usize;
-            }
             if !wy_ready && wy_loaded {
                 wy_ready = true;
                 wy_ms = t0.elapsed().as_millis() as usize;
             }
-            if d_ready && a_ready && (wy_ready || frames > 90) {
+            if d_ready && (wy_ready || frames > 90) {
                 break;
             }
             if frames > 400 {
@@ -3961,7 +4039,6 @@
             }
         }
         println!("【D. 编辑区内容可见】 {d_ms} ms");
-        println!("【A. md_preview 就绪】(EPUB/TOC 用，对照) {a_ms} ms");
         println!(
             "【WY. 右栏 WyEditor 预览装配完成】 {} ms",
             if wy_ms > 0 {
@@ -3970,7 +4047,14 @@
                 "未装配".to_string()
             }
         );
-        println!("【B. 就绪总墙钟】 {} ms", t0.elapsed().as_millis());
+        let md_prev_blocks = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            a.tabs[i].md_preview.read(cx).memory_estimate().0
+        });
+        println!(
+            "【md_preview（EPUB/TOC 侧）】 MD 分支脱离后不应再为大 md 建索引（blocks={md_prev_blocks}）"
+        );
         // 首帧真实布局
         let tb = std::time::Instant::now();
         for i in 0..3 {
@@ -4081,7 +4165,8 @@
             model_ms as f64 / 200.0
         );
         println!(
-            "【真实逐键路径】 {N} 键合计 {real_total_ms} ms（含编辑器/帧/旧 md_preview 后台，不作断言）"
+            "【真实逐键路径】 {N} 键合计 {real_total_ms} ms（含编辑器/帧/headless 泵；
+            A4 已移除每键 md_preview 后台重索引，不作断言）"
         );
         assert!(
             model_ms as f64 / 200.0 < 2.0,

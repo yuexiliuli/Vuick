@@ -177,19 +177,12 @@ impl EditorApp {
         // 编辑器即刻挂载（大文档不再是「预览优先」：内容瞬时可见优先于预览/滚动条精度）。
         tab.editor_pending = false;
         let t_preview = std::time::Instant::now();
-        tab.md_preview.update(cx, |view, cx| {
+        tab.md_preview.update(cx, |view, _cx| {
             view.set_background(panel_bg);
             view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
-            if is_md {
-                // Markdown 默认/始终自动换行
-                view.set_wrap(true, cx);
-                if !defer_preview {
-                    // 同步小文档：直接全量解析（行块索引现算；文件小故可接受在 UI 线程）。
-                    view.set_source(&prep.text, cx);
-                }
-                // defer=true（大文档快速挂载）：预览留空，行块索引用 finish_file_text
-                // 的 set_source_with_index 补上（并登记增量基底 preview_prev）。
-            }
+            // A4 脱离：MD 预览已切统一组件 WyEditor（见下方 ensure_md_wy）——不再为
+            // MD 喂 MarkdownPreview（省第二次 scan_blocks / 一份源副本）；MarkdownPreview
+            // 仅留 EPUB 与手动预览（load_epub 另行喂源）。txt 无预览，两处 set 无害。
         });
         let elapsed_preview = t_preview.elapsed();
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
@@ -258,7 +251,6 @@ impl EditorApp {
         p: &std::path::Path,
         max_line_chars: usize,
         line_width_histogram: crate::editor::buffer::LineWidthHistogram,
-        index: Option<crate::markdown::BlockIndex>,
         md_wy_open: Option<crate::markdown::wysiwyg::WyOpenResult>,
         resume_version: Option<u64>,
         cx: &mut Context<Self>,
@@ -276,20 +268,14 @@ impl EditorApp {
         tab.editor.update(cx, |ed, _| {
             ed.apply_stats(max_line_chars, line_width_histogram);
         });
-        if let Some(index) = index
-            && Self::is_markdown_path(p) && tab.preview_on {
-                let rc = std::rc::Rc::new(index);
-                let rope = tab.editor.read(cx).rope().clone();
-                tab.preview_prev = Some((rope.clone(), rc.clone()));
-                tab.md_preview.update(cx, |view, cx| {
-                    view.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope), rc, cx);
-                });
-                // A2：右栏 WyEditor 预览（大文档空壳）由后台预建的 `WyOpenResult`
-                // 一次性 `install_open` 装配（UI 线程只做 O(块) 换源重置，不背 Doc::open）。
-                if let Some(ed) = tab.md_wy.clone()
-                    && let Some(wy) = md_wy_open {
-                        ed.update(cx, |ed, _| ed.install_open(wy));
-                    }
+        // A4 脱离：MD 不再喂 MarkdownPreview / 登记增量基底（预览统一走 md_wy）——
+        // 后台预建的 `WyOpenResult` 一次性 `install_open` 装配右栏 WyEditor 预览
+        // （UI 线程只做 O(块) 换源重置，不背 Doc::open）。
+        if Self::is_markdown_path(p)
+            && tab.preview_on
+            && let Some(ed) = tab.md_wy.clone()
+            && let Some(wy) = md_wy_open {
+                ed.update(cx, |ed, _| ed.install_open(wy));
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后两栏纵向量程总高。编辑器精确时应 ≈
@@ -411,9 +397,10 @@ impl EditorApp {
                         this.load_file_text(idx, &p_emp, prep, window, cx, true);
                     });
                 }
-                // md：后台扫块建预览索引（快照 rope O(1) 克隆，行块统计已逐块精确）+
-                // 右栏 WyEditor 预览（A2）的整篇 `Doc::open`——两者都 O(n)，一并放后台。
-                let (index, md_wy_open) = if is_md {
+                // A4：MD 后台预建右栏 WyEditor 预览的整篇 `Doc::open`（快照 rope O(1)
+                // 克隆）——**不再 scan_blocks 喂 MarkdownPreview**（MD 已走统一组件，
+                // 省第二次扫块 + 一份 BlockIndex/源副本；本份 Doc 即预览唯一解析态）。
+                let md_wy_open = if is_md {
                     let p_snap = p.clone();
                     let snap = cx
                         .update_window_entity(&entity, move |this, _w, cx| {
@@ -425,35 +412,25 @@ impl EditorApp {
                         .ok()
                         .flatten();
                     let Some(snap) = snap else { return };
-                    let t = std::time::Instant::now();
-                    let (index, wy_open) = cx
+                    let t_wy = std::time::Instant::now();
+                    let wy_open = cx
                         .background_executor()
                         .spawn(async move {
-                            let out = crate::markdown::scan_blocks_rope(&snap);
-                            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-                                eprintln!(
-                                    "[MD_OPEN_DEBUG] 后台 scan_blocks 合计: {} ms",
-                                    t.elapsed().as_millis()
-                                );
-                            }
-                            // A2：右栏 WyEditor 预览整篇 `Doc::open`（后台、与 scan_blocks
-                            // 同一批量线程）。EPUB/TOC 侧的 md_preview 仍保留（A4 脱离）。
-                            let t_wy = std::time::Instant::now();
-                            let wy_open = crate::markdown::wysiwyg::WyEditor::open_from_rope(snap);
+                            let wy = crate::markdown::wysiwyg::WyEditor::open_from_rope(snap);
                             if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                                 eprintln!(
                                     "[MD_OPEN_DEBUG] 后台 右栏WyEditor(Doc::open) 合计: {} ms",
                                     t_wy.elapsed().as_millis()
                                 );
                             }
-                            (out, wy_open)
+                            wy
                         })
                         .await;
-                    (Some(index), Some(wy_open))
+                    Some(wy_open)
                 } else {
-                    (None, None)
+                    None
                 };
-                // 最终：装算统计/预览索引 + 恢复「已打开」状态。
+                // 最终：装算统计/预览装配 + 恢复「已打开」状态。
                 let hist_lines = cum_hist.values().sum::<usize>();
                 let p_fin = p.clone();
                 let _ = cx.update_window_entity(&entity, move |this, window, cx| {
@@ -462,7 +439,6 @@ impl EditorApp {
                         &p_fin,
                         cum_mx,
                         cum_hist,
-                        index,
                         md_wy_open,
                         resume_version,
                         cx,
@@ -530,7 +506,6 @@ impl EditorApp {
             let chars = text.chars().count();
             let src_len = text.len();
             let prep = PreparedText {
-                text,
                 rope,
                 lines,
                 chars,
@@ -954,11 +929,9 @@ impl EditorApp {
 }
 
 /// 读盘→归一化→Rope→行宽统计 的打开预处理产物：UI 线程据此 O(1) 装配，
-/// 不在 UI 线程做任何 O(n) 重扫。可跨线程（`String`/`Rope`/`BTreeMap` 均 `Send`）。
+/// 不在 UI 线程做任何 O(n) 重扫。可跨线程（`Rope`/`BTreeMap` 均 `Send`）。
 struct PreparedText {
-    /// 归一化后的全文（同步小文档预览的 `set_source` 用；大文档预览走 Rope）。
-    text: String,
-    /// 全文 Rope（编辑器 + Markdown 预览共享，O(1) 克隆）。
+    /// 全文 Rope（编辑器 + WyEditor 预览共享，O(1) 克隆）。
     rope: Rope,
     /// 显示行数（`str::lines()` 语义，尾换行不追加行）。
     lines: usize,
@@ -993,7 +966,6 @@ fn prepare_text(text: String) -> PreparedText {
         );
     }
     PreparedText {
-        text,
         rope,
         lines,
         chars,

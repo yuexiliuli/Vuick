@@ -302,14 +302,17 @@ impl EditorApp {
     /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
     pub(super) fn toggle_sidebar_toc_collapse(&mut self, idx: usize, cx: &mut Context<Self>) {
         let has_child = match self.tabs.get(self.active_tab) {
-            Some(t) if t.pdf_preview.is_some() => {
-                let outlines = t.pdf_preview.as_ref().unwrap().read(cx).outlines().to_vec();
+            Some(_t) if self.tabs[self.active_tab].pdf_preview.is_some() => {
+                let outlines = self.tabs[self.active_tab].pdf_preview.as_ref().unwrap().read(cx).outlines().to_vec();
                 let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
                 crate::toc::toc_node_has_child(&levels, idx)
             }
-            Some(t) => {
-                let entries = t.md_preview.read(cx).toc_entries();
-                let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
+            Some(_t) => {
+                // A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview（同一数据源口径）。
+                let levels: Vec<usize> = self
+                    .md_toc_source(cx)
+                    .map(|(entries, _)| entries.iter().map(|&(_, l, _)| l as usize).collect())
+                    .unwrap_or_default();
                 crate::toc::toc_node_has_child(&levels, idx)
             }
             None => false,
@@ -353,7 +356,11 @@ impl EditorApp {
                 .map(|e| Self::toc_row_width(e.level, &e.title, font_px) + page_col_w)
                 .fold(0.0f32, f32::max)
         } else {
-            let entries = tab.md_preview.read(cx).toc_entries();
+            // A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview（同一数据源口径）。
+            let entries = self
+                .md_toc_source(cx)
+                .map(|(e, _)| e)
+                .unwrap_or_default();
             entries
                 .iter()
                 .map(|&(_, l, ref t)| Self::toc_row_width(l as usize, t, font_px))
@@ -422,16 +429,16 @@ impl EditorApp {
                         div().flex().flex_col().py_1().children(rows).into_any_element()
                     }
                 } else {
-                    // Markdown 标题
-                    let entries = tab.md_preview.read(cx).toc_entries();
-                    if entries.is_empty() {
-                        self.sidebar_empty_hint("当前文件无目录（无标题）")
-                    } else {
-                        let rows = self.sidebar_toc_md_rows(
-                            &entries, &collapsed, fg, muted, active_bg, accent,
-                            tab.md_preview.clone(), cx,
-                        );
-                        div().flex().flex_col().py_1().children(rows).into_any_element()
+                    // Markdown 标题（A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview）。
+                    match self.md_toc_source(cx) {
+                        Some((entries, scroll)) if !entries.is_empty() => {
+                            let rows = self.sidebar_toc_md_rows(
+                                &entries, &collapsed, fg, muted, active_bg, accent,
+                                scroll, cx,
+                            );
+                            div().flex().flex_col().py_1().children(rows).into_any_element()
+                        }
+                        _ => self.sidebar_empty_hint("当前文件无目录（无标题）"),
                     }
                 }
             }
@@ -518,7 +525,9 @@ impl EditorApp {
         rows
     }
 
-    /// Markdown 标题目录条目（可折叠树；可见性按当前折叠集合过滤，点击滚动到行）。
+    /// Markdown 标题目录条目（可折叠树；可见性按当前折叠集合过滤）。
+    /// A4：`scroll` 区分跳转目标——`Legacy`（MarkdownPreview，渲染行列）用 `scroll_to_row`，
+    /// `Unified`（右栏 WyEditor 只读预览，源码行）用 `scroll_to_line` 滚动统一组件宿主。
     #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
     fn sidebar_toc_md_rows(
         &self,
@@ -528,17 +537,17 @@ impl EditorApp {
         muted: gpui::Hsla,
         active_bg: gpui::Hsla,
         accent: gpui::Hsla,
-        md: gpui::Entity<crate::markdown::view::MarkdownPreview>,
+        scroll: MdTocScroll,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
         let visible = crate::toc::toc_visibility(&levels, collapsed);
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (i, &(row_ix, lvl, ref text)) in entries.iter().enumerate() {
+        for (i, &(tgt, lvl, ref text)) in entries.iter().enumerate() {
             if !visible[i] {
                 continue;
             }
-            let wk = md.clone();
+            let sc = scroll.clone();
             let has_child = crate::toc::toc_node_has_child(&levels, i);
             let is_collapsed = has_child && collapsed.contains(&i);
             let idx = i;
@@ -555,11 +564,19 @@ impl EditorApp {
                 muted,
                 active_bg,
                 accent,
-                move |_, _w, cx| {
-                    wk.update(cx, |v, cx| {
-                        v.scroll_to_row(row_ix);
-                        cx.notify();
-                    });
+                move |_, window, cx| match &sc {
+                    MdTocScroll::Legacy(md) => {
+                        md.update(cx, |v, cx| {
+                            v.scroll_to_row(tgt);
+                            cx.notify();
+                        });
+                    }
+                    MdTocScroll::Unified(wy) => {
+                        wy.update(cx, |v, cx| {
+                            v.scroll_to_line(tgt, window);
+                            cx.notify();
+                        });
+                    }
                 },
                 cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
                     cx.stop_propagation();
@@ -753,8 +770,10 @@ impl EditorApp {
                                 v.highlight_search(li, &q_owned, cx);
                             });
                         } else {
-                            // 预览可见（分屏/全屏）时同步高亮预览中的命中文本
-                            if tab.preview_on || tab.preview_fullscreen {
+                            // 预览可见（分屏/全屏）且仍是 MarkdownPreview（EPUB/手动预览，
+                            // md_wy 缺席）时高亮预览中的命中文本——MD 已切统一组件由下面
+                            // `md_wy.highlight_search` 承担（A4）。
+                            if (tab.preview_on || tab.preview_fullscreen) && tab.md_wy.is_none() {
                                 let md = tab.md_preview.clone();
                                 md.update(cx, |v, cx| {
                                     v.highlight_search(li, &q_owned, cx);
