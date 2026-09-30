@@ -1223,8 +1223,13 @@ impl CodeEditor {
         if col < self.hscroll_cols + margin
             || col >= self.hscroll_cols.saturating_add(right_edge)
         {
-            let target = if col < margin {
-                col
+            // 左缘触发（col 在视口左缘 margin 内，含已滚到最左、col≥margin 的情形）：
+            // 目标 = col - margin，让光标保留 margin 格左边上下文；col<margin 时为
+            // 0，不产生无意义的向右滚动——否则空行/行首打字会把内容逐格左移、到
+            // margin 边界又走右缘分支 snap 回 0，形成「界面往右弹又弹回」。
+            // 右缘触发（col ≥ hscroll+right_edge）：目标 = col - right_edge。
+            let target = if col < self.hscroll_cols + margin {
+                col.saturating_sub(margin)
             } else {
                 col.saturating_sub(right_edge)
             };

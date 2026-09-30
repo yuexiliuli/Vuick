@@ -1745,6 +1745,37 @@ fn gutter_scroll_locked_to_text_scroll(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn empty_line_typing_keeps_hscroll_zero(cx: &mut TestAppContext) {
+    // 回归（用户实测）：大文档里「空行输入内容时，界面会突然往右弹，然后又弹回」。
+    // 根因：`reveal_caret` 横向分支在 col < margin 时把 hscroll 设成 col（逐字左移
+    // 内容），等到 col=4 越过 margin 后走 col-right_edge 又 saturating 回 0 →
+    // 每 4 个字符一次「往右弹又弹回」。修复：左缘 reveal 目标 = col-margin（col<margin
+    // 时为 0，不动），右缘逻辑不变。
+    // 文档含超长行以撑起横向量程（content_w > 视口）——否则 hscroll 量程为 0，
+    // 弹跳被量程夹掉不可见。
+    let text = "x".repeat(600) + "\n\n短行";
+    let (host, cx) = open(cx, &text);
+    focus(&host, cx);
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let max0 = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(max0 > 0., "超长行应撑起横向量程（max={max0}）");
+    // 光标放到空行（行 1，0 基）行首
+    let off = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(1, 0));
+    ed.update(cx, |ed, _| ed.set_caret_to(off));
+    settle(cx);
+    let h0 = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert_eq!(h0, 0., "空行(未横向滚动)初始 hscroll 应为 0");
+    // 连续输入超 margin 个字符（跨过 0..3 的左缘 margin 区）→ hscroll 保持 0
+    for c in "abcde".chars() {
+        ed.update(cx, |ed, cx| ed.insert_text(&c.to_string(), cx));
+        settle(cx);
+        let h = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+        assert_eq!(h, 0., "空行输入 {c} 后不应触发横向滚动（hscroll={h}）");
+    }
+}
+
+#[gpui::test]
 fn hscroll_max_shrinks_after_deleting_widest_content(cx: &mut TestAppContext) {
     // 回归（用户实测）：横向滚动条拉到最右 → 末尾追加超宽内容（量程变大）→
     // 删除后量程不缩回。方案 A+B：删除置脏后（量程可见 + 首次/节流）精确重算使
