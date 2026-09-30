@@ -240,6 +240,10 @@ pub struct WyEditor {
     /// 后台解析时，`new()` 产生**空**编辑器——在 `install_open` 完成前该编辑器没有内容，
     /// 宿主读取 `text()` 写回必须回退到源码编辑区（否则加载窗口内保存/退出会丢内容）。
     loaded: bool,
+    /// 是否可编辑。默认 true（编辑核心用途）；`set_editable(false)` 切**只读预览**门控：
+    /// 输入/IME/删除/撤销/粘贴短路（`replace_range` 硬门控）、不画光标；保留光标移动、
+    /// 点选/复制、链接点击、折叠、搜索高亮、表格/代码纵向滚动条拖动。
+    editable: bool,
     theme: WyTheme,
     /// 本帧行网格（measure→prepaint→paint 复用；**窗口化**：仅带内块被真正 shape，
     /// 带外块用 `BlockMeta` 估算高度占位，避免大文档整篇每帧 shape 卡死）。
@@ -958,6 +962,7 @@ impl WyEditor {
             focus: cx.focus_handle(),
             caret: 0,
             loaded: false,
+            editable: true,
             theme: WyTheme::from_style(&p, ts.font(), fs),
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
@@ -1065,6 +1070,29 @@ impl WyEditor {
         // 字号变 → 行整形（宽/高）也失效。
         self.shape_rows.borrow_mut().clear();
         self.notdef_retry.borrow_mut().clear();
+    }
+
+    /// 切只读/可编辑门控（A1：MD 右栏预览用）。只读 = 输入/IME/删除/撤销/粘贴短路
+    /// （`replace_range` 硬门控）、不画光标；保留光标移动、点选/复制、链接点击、折叠、
+    /// 搜索高亮、表格/代码横向滚动条。切只读时丢弃 IME 组合态、收拢选区为光标（避免
+    /// 只读态下残留活动选区误导）。已处目标态则 no-op（不触发帧失效）。
+    #[allow(dead_code)] // A2 接线 app 右栏预览后移除
+    pub fn set_editable(&mut self, editable: bool) {
+        if self.editable == editable {
+            return;
+        }
+        self.editable = editable;
+        if !editable {
+            self.marked = None;
+            self.sel_anchor = None;
+            self.dragging = false;
+        }
+        *self.frame.borrow_mut() = None;
+    }
+
+    /// 当前是否可编辑（只读预览 = `false`）。
+    pub fn is_editable(&self) -> bool {
+        self.editable
     }
 
     /// 字号变化的**渲染期精确锚定**：在宿主 render（prepaint 读宿主滚动偏移**之前**）
@@ -1624,6 +1652,9 @@ impl WyEditor {
 
     /// 剪切：复制 + 删除选区。
     fn cut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("cut");
         self.copy(window, cx);
         let range = self.selection().unwrap_or(self.caret..self.caret);
@@ -1632,6 +1663,9 @@ impl WyEditor {
 
     /// 粘贴：用剪贴板文本替换选区（若为空则插入光标处）。
     fn paste(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("paste");
         let text = cx
             .read_from_clipboard()
@@ -1652,6 +1686,10 @@ impl WyEditor {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        // A1 只读门控：直输短路（`replace_range` 亦硬门控；这里提前返回省一次 op 账）。
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("type");
         let r = match range {
             // 显式 UTF-16 区间（macOS/部分平台）走行粒度索引换算，O(log n + 行长)。
@@ -1675,6 +1713,10 @@ impl WyEditor {
         new_selected_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
+        // A1 只读门控：IME 组合短路（不置 marked、不改文本）。
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("ime");
         let byte_range = match range {
             Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
@@ -3068,6 +3110,11 @@ impl WyEditor {
     /// 内容变更先记入撤销栈（D1）；**B2 事务合并**：连续同意图且邻接的编辑并入同一
     /// 撤销单元（连续打字/相邻退格/同点删除），只在「新事务起点」push 快照。
     pub fn replace_range(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        // 只读门控（A1）：`set_editable(false)` 后一律短路——输入/IME/粘贴/退格/删除/
+        // Enter/撤销/重做等一切内容变更都汇聚到本函数，这里硬门控即杜绝只读预览改动。
+        if !self.editable {
+            return;
+        }
         let len = self.len();
         let r = range.start.min(len)..range.end.min(len);
         if r.start == r.end && text.is_empty() {
@@ -3404,6 +3451,9 @@ impl WyEditor {
     /// 撤销（D1）：把当前打开的撤销单元固化入栈，弹出上一单元并沿增量管道打回其
     /// **净逆操作**（不再整体重建模型）；被撤销的单元（带撤销瞬间光标）进重做栈。
     pub(crate) fn undo(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("undo");
         if let Some(u) = self.open_unit.take() {
             self.push_undo_unit(u);
@@ -3420,6 +3470,9 @@ impl WyEditor {
 
     /// 重做（D1）。
     pub(crate) fn redo(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("redo");
         if let Some(u) = self.open_unit.take() {
             self.push_undo_unit(u);
@@ -3481,6 +3534,9 @@ impl WyEditor {
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("backspace");
         // 有选区 → 直接删选区（等价退格删除选中文字）。
         if let Some(range) = self.selection() {
@@ -3516,6 +3572,9 @@ impl WyEditor {
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("delete");
         if let Some(range) = self.selection() {
             return self.replace_range(range, "", cx);
@@ -3553,6 +3612,9 @@ impl WyEditor {
     }
 
     fn newline(&mut self, cx: &mut Context<Self>) {
+        if !self.editable {
+            return;
+        }
         crate::prof::op_start("newline");
         // 表格内换行会拆坏表结构（MVP 先 no-op）；代码块内换行合法（分行）。
         // 图片行 alt（`![` 之后到 `](` 之前）内换行会拆坏图片语法 → 同样 no-op

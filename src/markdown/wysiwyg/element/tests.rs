@@ -939,6 +939,89 @@ let c = 3;
     }
 
     #[gpui::test]
+    fn readonly_gates_all_edit_paths(cx: &mut TestAppContext) {
+        // A1：`set_editable(false)` 后一切内容变更路径短路（输入/IME/退格/删除/Enter/
+        // 撤销/重做/范围替换），切回 true 恢复编辑。
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.set_editable(false);
+                assert!(!e.is_editable(), "只读门控应生效");
+                e.set_caret(1);
+                // IME 组合（`replace_and_mark_utf16` 底层走 `replace_range`，被硬门控）。
+                e.replace_and_mark_utf16(None, "X", None, cx);
+                assert_eq!(e.text().as_ref(), "abc", "只读 IME 组合应短路");
+                assert!(e.marked.is_none(), "只读 IME 不应留下组合态");
+                // 平台直输（`replace_text_utf16`）。
+                e.replace_text_utf16(Some(1..2), "X", cx);
+                assert_eq!(e.text().as_ref(), "abc", "只读直输应短路");
+                // 范围替换 / 退格 / 删除 / Enter。
+                e.replace_range(1..1, "X", cx);
+                assert_eq!(e.text().as_ref(), "abc", "只读 replace_range 应短路");
+                e.backspace(cx);
+                e.delete(cx);
+                e.newline(cx);
+                assert_eq!(e.text().as_ref(), "abc", "只读退格/删除/换行应短路");
+                // 撤销/重做（走 `apply_raw_edit`，需单独门控）。
+                e.undo(cx);
+                e.redo(cx);
+                assert_eq!(e.text().as_ref(), "abc", "只读撤销/重做应短路");
+                // 切回可编辑 → 恢复正常编辑。
+                e.set_editable(true);
+                e.replace_range(1..1, "X", cx);
+                assert_eq!(e.text().as_ref(), "aXbc", "切回可编辑应恢复范围替换");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn readonly_keeps_selection_and_caret_moves(cx: &mut TestAppContext) {
+        // A1：只读下保留光标移动与点选/拖选（复制依赖它们）；只没收拢到光标的旧选区。
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _cx| {
+                e.set_caret(5);
+                assert_eq!(e.caret(), 5, "只读下仍可移动光标");
+                // 拖选 / 点选仍有效（复制读 `selected_text`）。
+                e.begin_selection_at(0);
+                e.extend_selection_to(5);
+                assert_eq!(e.selection(), Some(0..5), "只读下拖选应保留");
+                assert_eq!(e.selected_text(), "hello", "只读下选中文本可读（复制用）");
+                e.end_selection();
+                e.select_all();
+                assert_eq!(
+                    e.selection(),
+                    Some(0.."hello world".len()),
+                    "只读下全选应保留"
+                );
+                // 切只读会把残留活动选区收拢为光标（防止误导）。
+                e.begin_selection_at(5);
+                e.extend_selection_to(11);
+                assert_eq!(e.selection(), Some(5..11), "基线拖选成立");
+                e.set_editable(false);
+                assert_eq!(
+                    e.selection(),
+                    None,
+                    "切入只读应收拢旧活动选区（无选区），光标仍可移"
+                );
+                e.set_caret(3);
+                assert_eq!(e.caret(), 3, "只读下 set_caret 仍可用");
+            });
+        });
+    }
+    #[gpui::test]
     fn quote_blocks_are_editable_with_indent(cx: &mut TestAppContext) {
         use crate::markdown::ir::IrKind;
         cx.update(crate::actions::bind_local_keymaps);

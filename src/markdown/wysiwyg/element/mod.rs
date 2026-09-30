@@ -822,11 +822,12 @@ impl Element for WyEditorElement {
         }
         paint_search_highlight(&self.editor, origin, &theme, f, window, cx);
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
+        // A1 只读门控：`editable=false` 不画光标（光标移动/选区仍工作，只是无竖条）。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);
             caret_geometry(e, f)
         };
-        if caret_on && focus.is_focused(window) {
+        if self.editor.read(cx).is_editable() && caret_on && focus.is_focused(window) {
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
                     point(origin.x + caret_x, origin.y + caret_top),

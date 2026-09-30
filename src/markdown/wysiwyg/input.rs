@@ -72,6 +72,10 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A1 只读门控：输入短路（IME 与平台直送都走这里；`replace_range` 也硬门控）。
+        if !self.editable {
+            return;
+        }
         self.replace_text_utf16(range, text, cx);
     }
 
@@ -83,6 +87,9 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.editable {
+            return;
+        }
         self.replace_and_mark_utf16(range, new_text, new_selected_range, cx);
     }
 
@@ -149,6 +156,7 @@ impl EntityInputHandler for WyEditor {
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
-        true
+        // A1 只读门控：不接收 IME/文本输入（复制仍可用，走 selected_text_range）。
+        self.editable
     }
 }
