@@ -1093,7 +1093,9 @@
     }
 
     #[gpui::test]
-    async fn md_preview_hscroll_in_app(cx: &mut TestAppContext) {
+    async fn md_wy_preview_host_renders_for_md(cx: &mut TestAppContext) {
+        // A2：Markdown 右栏预览切统一组件 WyEditor（只读）——live-area 宿主（滚动容器 +
+        // 自绘纵向滚动条）应渲染，且 `md_wy` 实体被创建、只读门控生效、源文本就位。
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(500.), px(500.)));
@@ -1107,34 +1109,150 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
         });
-        for _ in 0..5 {
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
 
-        let preview = cx
-            .debug_bounds("md-preview")
-            .expect("md-preview 应渲染");
+        // 宿主三件套：分屏外框 + 滚动容器 + 自绘竖滚动条叠层。
         assert!(
-            preview.size.width > px(0.),
-            "预览视口应有宽度，实际={:?}",
-            preview.size.width
+            cx.debug_bounds("preview-md-wy").is_some(),
+            "MD WyEditor 预览外框 preview-md-wy 应渲染"
         );
-        // 超宽代码带应宽于预览视口（可横向滚动），滚动条叠层非零渲染
-        let band = cx
-            .debug_bounds("md-code-band")
-            .expect("代码背景带 md-code-band 应存在");
+        let scroll = cx
+            .debug_bounds("md-wy-scroll")
+            .expect("宿主滚动容器 md-wy-scroll 应渲染");
         assert!(
-            band.size.width > preview.size.width,
-            "代码带宽应宽于预览视口（可横向滚动），band={band:?} preview={preview:?}"
+            scroll.size.width > px(0.) && scroll.size.height > px(0.),
+            "宿主滚动容器应有非零尺寸，实际={scroll:?}"
         );
-        let sbar = cx
-            .debug_bounds("md-code-scrollbar")
-            .expect("代码块横向滚动条 md-code-scrollbar 应存在");
         assert!(
-            sbar.size.width > px(0.) && sbar.size.height > px(0.),
-            "横向滚动条不应塌缩成 0，实际={sbar:?}"
+            cx.debug_bounds("md-wy-vscrollbar-overlay").is_some(),
+            "自绘纵向滚动条叠层 md-wy-vscrollbar-overlay 应渲染"
         );
+        // 实体级：只读门控 + 源文本就位（含超宽代码行）。
+        let (editable, text) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            let ed = t.md_wy.clone().expect("md 打开应创建右栏 WyEditor 预览");
+            (ed.read(cx).is_editable(), ed.read(cx).text().to_string())
+        });
+        assert!(!editable, "右栏 WyEditor 预览应只读");
+        assert!(!text.is_empty(), "右栏 WyEditor 预览应收满源文本");
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// A2：右栏 WyEditor 预览的只读门控——`replace_range` 等编辑入口在预览实体上
+    /// 一律短路（第 #1 条：右栏只能看/选/复制，绝不能改到预览内容）。
+    #[gpui::test]
+    async fn md_wy_preview_readonly_blocks_editing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!("gpui-mdwy-ro-{}.md", std::process::id()));
+        std::fs::write(&md, "初始内容\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let wy = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_wy.clone().expect("应有右栏 WyEditor 预览")
+        });
+        let (editable, before) = cx.update(|_, cx| {
+            (wy.read(cx).is_editable(), wy.read(cx).text().to_string())
+        });
+        assert!(!editable, "右栏预览应只读");
+        // 各种编辑入口在只读预览上全部短路（内容不变）。
+        cx.update(|_, cx| {
+            wy.update(cx, |ed, cx| ed.replace_range(0..2, "X", cx));
+        });
+        let after = cx.update(|_, cx| wy.read(cx).text().to_string());
+        assert_eq!(before, after, "只读预览不应被 replace_range 改动");
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// A2：按眼睛/菜单翻转预览——开启时创建并喂源右栏 WyEditor 预览（源 = 编辑区文本），
+    /// 关闭时释放（`md_wy = None`，内存回基线），再开重建并重新喂源。
+    #[gpui::test]
+    async fn md_wy_preview_fed_on_open_and_released_on_toggle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!("gpui-mdwy-tog-{}.md", std::process::id()));
+        std::fs::write(&md, "第一段\n第二段\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 打开即创建 + 喂源（源 = 编辑区文本）。
+        let (fed, src) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                t.editor.read(cx).value().to_string(),
+            )
+        });
+        assert!(!fed.is_empty(), "打开 md 应创建右栏 WyEditor 预览");
+        assert_eq!(fed, src, "右栏 WyEditor 预览源应与编辑区一致");
+
+        // 关预览 → 释放（md_wy=None）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_preview_for_tab(app.active_tab, window, cx)
+            });
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let off = cx.update(|_, cx| app.read(cx).tabs[app.read(cx).active_tab].md_wy.is_none());
+        assert!(off, "关闭预览应释放右栏 WyEditor 预览实体");
+
+        // 再开 → 重建 + 重新喂源。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.toggle_preview_for_tab(app.active_tab, window, cx)
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (on, fed2, src2) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy.is_some(),
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                t.editor.read(cx).value().to_string(),
+            )
+        });
+        assert!(on, "再开预览应重建右栏 WyEditor 预览");
+        assert_eq!(fed2, src2, "重建预览应重新喂源（与编辑区一致）");
+        let _ = std::fs::remove_file(&md);
     }
 
     /// Markdown 编辑区与预览区默认/始终自动换行，不提供切换 → 状态栏隐藏「换行/不换行」按钮；
@@ -1300,11 +1418,11 @@
         let _ = std::fs::remove_file(&md);
     }
 
-    /// Markdown 预览（分屏）纵向滚动条拖拽：向下拖 -> 内容实时向下滚，向上拖 -> 实时反向。
-    /// 回归：预览窗口模式拖拽只写共享 `desired`，render 逐帧 `apply_desired` 落窗口；
-    /// 若该 Apply 在往下方向被 clamp/跳过，会出现「只有松开才动」（用户报告症状方向）。
+    /// Markdown 预览（分屏，统一组件 WyEditor 宿主）纵向滚动条拖拽：向下拖 -> 内容实时
+    /// 向下滚，向上拖 -> 实时反向。回归：预览窗口模式拖拽只写共享 `desired`，render 逐帧
+    /// `apply_desired` 落窗口；若该 Apply 在往下方向被 clamp/跳过，会出现「只有松开才动」。
     #[gpui::test]
-    async fn md_preview_scrollbar_drag_follows_both_directions(cx: &mut TestAppContext) {
+    async fn md_wy_preview_scrollbar_drag_follows_both_directions(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(1200.), px(800.)));
@@ -1325,20 +1443,18 @@
             cx.run_until_parked();
         }
         let overlay = cx
-            .debug_bounds("md-vscrollbar-overlay")
-            .expect("预览纵向滚动条叠层应渲染");
+            .debug_bounds("md-wy-vscrollbar-overlay")
+            .expect("MD WyEditor 预览纵向滚动条叠层应渲染");
+        let vhand = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_wy_vscroll.clone()
+        });
         let abs_top = |cx: &mut VisualTestContext| {
-            cx.update(|_w, cx| {
-                let a = app.read(cx);
-                a.tabs[a.active_tab]
-                    .md_preview
-                    .read(cx)
-                    .test_abs_scroll_top()
-            })
+            cx.update(|_w, _cx| (-vhand.offset().y).as_f32())
         };
 
         let before = abs_top(cx);
-        assert_eq!(before.0, 0, "预览初始应在顶部");
+        assert_eq!(before, 0.0, "预览初始应在顶部");
 
         let x = overlay.right() - px(8.);
         let grab_y = overlay.top() + px(14.);
@@ -1363,8 +1479,8 @@
         }
         let s1 = abs_top(cx);
         assert!(
-            s1.0 > before.0 || s1.1 > before.1,
-            "向下拖(1)预览应先实时滚动（abs={s1:?}）——不能等松开才动"
+            s1 > before + 1.0,
+            "向下拖(1)预览应先实时滚动（abs={s1:.0}）——不能等松开才动"
         );
 
         let mid2_y = overlay.top() + px(240.);
@@ -1378,8 +1494,8 @@
         }
         let s2 = abs_top(cx);
         assert!(
-            s2.0 > s1.0 || (s2.0 == s1.0 && s2.1 > s1.1),
-            "继续向下拖(2)预览应继续实时滚动（abs={s2:?} vs {s1:?}）"
+            s2 > s1 + 1.0,
+            "继续向下拖(2)预览应继续实时滚动（abs={s2:.0} vs {s1:.0}）"
         );
 
         // 未松开向上拖回 → 实时反向。
@@ -1393,8 +1509,8 @@
         }
         let s3 = abs_top(cx);
         assert!(
-            s3.0 < s2.0 || (s3.0 == s2.0 && s3.1 < s2.1),
-            "向上拖预览应实时反向滚动（abs={s3:?} vs {s2:?}）"
+            s3 < s2 - 1.0,
+            "向上拖预览应实时反向滚动（abs={s3:.0} vs {s2:.0}）"
         );
 
         cx.simulate_mouse_up(
@@ -2999,45 +3115,51 @@
             lines.saturating_sub(eix) <= 50,
             "编辑器拖到底应到达最后内容（滚动顶行 item_ix={eix}/{lines}）"
         );
-        // 预览侧量程同样须**精确**（≈ 全篇块高之和）：固定窗口虚拟化下用
-        // 抽样块高模型总高（`total_h`），不能缩到视口高——否则预览滚动条拖不到底部。
-        let (pv_total, blocks, est, applied) = cx.update(|_, cx| {
+        // 预览侧（A2：统一组件 WyEditor 宿主）量程同样须健康：大文档装好后宿主
+        // `#md-wy-scroll` 的量程必须远超视口（>0），不能坍缩——否则预览滚动条拖不到底。
+        let (wy_loaded, max_off, top_off) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            let pv = a.tabs[i].md_preview.read(cx);
+            let t = &a.tabs[i];
+            let vh = &t.md_wy_vscroll;
             (
-                pv.vertical_total_px(),
-                pv.memory_estimate().0,
-                pv.test_est_hint(),
-                pv.test_hint_applied(),
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).is_loaded())
+                    .unwrap_or(false),
+                vh.max_offset().y.as_f32(),
+                vh.offset().y.as_f32(),
             )
         });
+        assert!(wy_loaded, "大文档 WyEditor 预览应完成装配（下一帧渲染即出内容）");
         assert!(
-            pv_total > blocks as f32 * 15.0,
-            "预览纵向量程应精确（total={pv_total:.0}px / {blocks} 块，est_hint={est:.0}，applied={applied:?}，坍缩态≈{vh:.0}px）"
+            max_off > 50.0,
+            "预览纵向量程不应坍缩（max_off={max_off:.0}px，应≈全篇块高之和）"
+        );
+        assert!(
+            top_off >= -0.5,
+            "预览初始应在顶部（top_off={top_off:.0}px）"
         );
         // 确定性「拖到底」回归（用户实测：内置滚动条在量程坍缩/未自愈时开始拖会冻结
-        // 旧值 → 拖不到真正的底部）。窗口模式走 `scroll_to_row`（像素模型 + 窗口
-        // 重定位）；断言跳到底后绝对顶块落在末尾一个视口内。
-        let pv_ent = cx.update(|_, cx| {
+        // 旧值 → 拖不到真正的底部）。直接推宿主滚动句柄到底，断言实际落到了末端附近。
+        cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].md_preview.clone()
-        });
-        cx.update(|_, cx| {
-            pv_ent.update(cx, |md, _| md.scroll_to_row(blocks.saturating_sub(1)));
+            a.tabs[i]
+                .md_wy_vscroll
+                .set_offset(gpui::point(gpui::px(0.), gpui::px(-1_000_000.)));
         });
         cx.run_until_parked();
         let _ = cx.cx.refresh();
         cx.run_until_parked();
-        let top_ix = cx.update(|_, cx| {
+        let bottom_off = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].md_preview.read(cx).test_abs_scroll_top().0
+            a.tabs[i].md_wy_vscroll.offset().y.as_f32()
         });
         assert!(
-            blocks.saturating_sub(top_ix) <= 200,
-            "预览跳到底应到达最后内容（绝对顶块={top_ix}，共 {blocks}；应距末尾在一个视口内）"
+            bottom_off < -max_off * 0.9,
+            "预览拖到底应接近真正的底部（offset={bottom_off:.0}，max_off={max_off:.0}）"
         );
         let _ = std::fs::remove_file(&dir);
     }
@@ -3596,6 +3718,97 @@
             });
         });
         println!("【txt 打开：open_file 返回】(对照) {} ms", t_txt.elapsed().as_millis());
+    }
+
+    /// A2 基准（ignored，release）：大文档异步打开 + 右栏 WyEditor 预览装配的墙钟拆解。
+    /// 真实 `fixtures/大文档测试2.md`（6.4MB / ~14 万行）。测各阶段：同步返回（UI 不卡）→
+    /// 编辑区内容可见（D）→ md_preview 就绪（A，EPUB/TOC 用）→ 右栏 WyEditor 预览装配
+    /// （WY）。运行：
+    /// `cargo test --release -- --ignored bench_a2_md_wy_open_large --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_a2_md_wy_open_large(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
+        let p = r"fixtures/大文档测试2.md";
+        assert!(std::path::Path::new(p).is_file(), "{p} 缺失");
+        let t0 = std::time::Instant::now();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p, window, cx));
+        });
+        println!("【同步返回】(UI 不卡) {} ms", t0.elapsed().as_millis());
+        let mut d_ready = false;
+        let mut a_ready = false;
+        let mut wy_ready = false;
+        let mut d_ms = 0usize;
+        let mut a_ms = 0usize;
+        let mut wy_ms = 0usize;
+        let mut frames = 0;
+        loop {
+            frames += 1;
+            cx.run_until_parked();
+            let (editor_lines, pending, wy_loaded, blocks) = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                (
+                    a.tabs[i].editor.read(cx).line_count(),
+                    a.tabs[i].editor_pending,
+                    a.tabs[i]
+                        .md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false),
+                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                )
+            });
+            if !d_ready && !pending && editor_lines > 1000 {
+                d_ready = true;
+                d_ms = t0.elapsed().as_millis() as usize;
+            }
+            if !a_ready && blocks > 0 {
+                a_ready = true;
+                a_ms = t0.elapsed().as_millis() as usize;
+            }
+            if !wy_ready && wy_loaded {
+                wy_ready = true;
+                wy_ms = t0.elapsed().as_millis() as usize;
+            }
+            if d_ready && a_ready && (wy_ready || frames > 90) {
+                break;
+            }
+            if frames > 400 {
+                break;
+            }
+        }
+        println!("【D. 编辑区内容可见】 {d_ms} ms");
+        println!("【A. md_preview 就绪】(EPUB/TOC 用，对照) {a_ms} ms");
+        println!(
+            "【WY. 右栏 WyEditor 预览装配完成】 {} ms",
+            if wy_ms > 0 {
+                format!("{wy_ms} ms")
+            } else {
+                "未装配".to_string()
+            }
+        );
+        println!("【B. 就绪总墙钟】 {} ms", t0.elapsed().as_millis());
+        // 首帧真实布局
+        let tb = std::time::Instant::now();
+        for i in 0..3 {
+            let tf = std::time::Instant::now();
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            println!(
+                "【C. 挂载后第 {} 次 refresh】(真实布局) {} ms",
+                i + 1,
+                tf.elapsed().as_millis()
+            );
+        }
+        println!("【C. 前 3 次 refresh 合计】 {} ms", tb.elapsed().as_millis());
     }
 
     /// 基准：用编辑器本体追加同一段文本 1000 次所需耗时。

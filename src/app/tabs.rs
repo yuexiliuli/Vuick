@@ -43,6 +43,8 @@ impl EditorApp {
             live2: None,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
+            md_wy: None,
+            md_wy_vscroll: gpui::ScrollHandle::new(),
             preview_prev: None,
             edit_version: 0,
             preview_dirty: None,
@@ -187,6 +189,9 @@ impl EditorApp {
             if let Some(pdf) = tab.pdf_preview.take() {
                 pdf.update(cx, |view, cx| view.release(window, cx));
             }
+            // A2：右栏 WyEditor 预览随选项卡复位释放（同 md_preview 释放内存）。
+            tab.md_wy = None;
+            tab.md_wy_vscroll = gpui::ScrollHandle::new();
             tab.file_path = None;
             tab.dirty = false;
             tab.content = SharedString::default();

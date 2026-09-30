@@ -253,12 +253,44 @@ impl EditorApp {
 
     pub(super) fn render_preview_pane(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         grow: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        // 渲染期把全局字号推进到 Markdown 预览（与编辑区 set_font_override 同套路：
-        // 值不变早退，变化才重测量/重锚定，任何全局字号入口对预览都即时生效）。
+    ) -> gpui::AnyElement {
+        // A2：Markdown 右栏预览从 `MarkdownPreview`（元素树）切到统一组件 WyEditor
+        //（只读）——live-area 宿主滚动（复用 `set_host_scroll` / `prepare_font_zoom`）。
+        if self.md_wy_preview().is_some() {
+            let content = self.md_wy_host_children(window, cx);
+            return div()
+                .id("preview-pane")
+                .debug_selector(|| "preview-pane".into())
+                .flex()
+                .flex_row()
+                // grow = 预览区占宽比例
+                .flex_grow(grow)
+                .flex_shrink_1()
+                .flex_basis(px(0.))
+                .min_w(px(0.))
+                // 预览区也可接收文件拖放
+                .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
+                .on_drop(cx.listener(
+                    |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
+                        this.open_dropped_paths(paths, window, cx);
+                    },
+                ))
+                .child(
+                    div()
+                        .id("preview-md-wy")
+                        .debug_selector(|| "preview-md-wy".into())
+                        .flex_1()
+                        .min_w(px(0.))
+                        .bg(self.panel_bg())
+                        .relative()
+                        .children(content),
+                )
+                .into_any_element();
+        }
+        // EPUB / PDF / 旧预览（元素树 MarkdownPreview）。
         let fs = self.font_size;
         self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
             view.set_font_size_anchored(fs, cx)
@@ -291,14 +323,83 @@ impl EditorApp {
                     // Ctrl+滚轮缩放（同一入口 change_font_size）：预览区也参与全局字号调节。
                     .child(Self::zoom_overlay(cx)),
             )
+            .into_any_element()
+    }
+
+    /// A2：MD 右栏/全屏 WyEditor 预览宿主内容（三件套，放进调用方 `relative` 外框）：
+    /// 滚动容器 + 自绘纵向滚动条叠层 + Ctrl+滚轮缩放叠层。渲染期推进全局字号并做
+    /// **缩放视口锚定**（同左面板 `render_live_area`）：注入宿主滚动句柄 + 顶部内衬，
+    /// 推入当前视口顶部（元素局部 y），再 `prepare_font_zoom`——字号变化在 render 期
+    /// 按新字号重建帧并把锚点块精确位置写回 `ScrollHandle`。
+    fn md_wy_host_children(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let ed = self.md_wy_preview().expect("调用方已判定走 WyEditor 预览");
+        let fs = self.font_size;
+        let vhand = self.tabs[self.active_tab].md_wy_vscroll.clone();
+        let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
+        ed.update(cx, |ed, _| {
+            ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
+            ed.set_viewport_top(local_top);
+            ed.prepare_font_zoom(gpui::px(fs), window);
+        });
+        let any = ed.clone().into_any_element();
+        let text_color = self.text_primary();
+        vec![
+            div()
+                .id("md-wy-scroll")
+                .debug_selector(|| "md-wy-scroll".into())
+                .relative()
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&vhand)
+                .child(
+                    div()
+                        .id("md-wy-body")
+                        .debug_selector(|| "md-wy-body".into())
+                        .w_full()
+                        .px(px(12.))
+                        .py(px(LIVE_BODY_PAD_Y))
+                        .text_size(px(fs))
+                        .text_color(text_color)
+                        .child(any),
+                )
+                .into_any_element(),
+            div()
+                .id("md-wy-vscrollbar-overlay")
+                .debug_selector(|| "md-wy-vscrollbar-overlay".into())
+                .absolute()
+                .inset_0()
+                .child(
+                    Scrollbar::vertical(&vhand)
+                        .mode(ScrollbarMode::Always)
+                        .viewport_from_layout(),
+                )
+                .into_any_element(),
+            Self::zoom_overlay(cx),
+        ]
     }
 
     /// 全屏预览（EPUB / PDF 阅读模式）：渲染占满整个内容区，不显示编辑区/分割线。
+    /// A2：Markdown 全屏预览同样切统一组件 WyEditor（宿主滚动）。
     pub(super) fn render_fullscreen_preview(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        if self.md_wy_preview().is_some() {
+            let content = self.md_wy_host_children(window, cx);
+            return div()
+                .id("fullscreen-preview")
+                .debug_selector(|| "fullscreen-preview".into())
+                .size_full()
+                .relative()
+                .bg(self.panel_bg())
+                .children(content)
+                .into_any_element();
+        }
         // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
         let fs = self.font_size;
         self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
@@ -313,5 +414,6 @@ impl EditorApp {
             .bg(self.panel_bg())
             .child(Self::preview_element(tab))
             .child(Self::zoom_overlay(cx))
+            .into_any_element()
     }
 }

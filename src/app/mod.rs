@@ -140,6 +140,14 @@ struct EditorTab {
     /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源）。
     /// None = 未启用。启用即 `live_edit = true`。
     live2: Option<gpui::Entity<WyEditor>>,
+    /// A2：右栏 Markdown 预览统一组件（`WyEditor`，A1 只读门控）。MD 右栏/全屏预览
+    /// 从 `MarkdownPreview`（元素树）切到它（同一 `Doc` 管线的只读视图）；`None` =
+    /// 未创建（文本 / PDF / EPUB 选项卡，或 MD 预览已关闭）。EPUB/PDF 仍走旧预览。
+    md_wy: Option<gpui::Entity<WyEditor>>,
+    /// `md_wy` 右栏/全屏宿主的纵向滚动句柄：`#md-wy-scroll`（`overflow_y_scroll`）
+    /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
+    /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
+    md_wy_vscroll: gpui::ScrollHandle,
     /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
     /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
     /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
@@ -168,6 +176,10 @@ pub(crate) struct DetachedTab {
     editor: gpui::Entity<crate::editor::CodeEditor>,
     md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
+    /// A2：右栏 WyEditor 预览实体与宿主滚动句柄随选项卡搬迁（与 `md_preview` 同；
+    /// 实体与窗口无关，可直接跨窗口移动）。
+    md_wy: Option<gpui::Entity<WyEditor>>,
+    md_wy_vscroll: gpui::ScrollHandle,
     file_path: Option<PathBuf>,
     dirty: bool,
     content: SharedString,
@@ -636,6 +648,8 @@ impl EditorApp {
             editor: tab.editor,
             md_preview: tab.md_preview,
             pdf_preview: tab.pdf_preview,
+            md_wy: tab.md_wy,
+            md_wy_vscroll: tab.md_wy_vscroll,
             file_path: tab.file_path,
             dirty: tab.dirty,
             content: tab.content,
@@ -681,6 +695,8 @@ impl EditorApp {
             cursor_col: payload.cursor_col,
             md_preview: payload.md_preview,
             pdf_preview: payload.pdf_preview,
+            md_wy: payload.md_wy,
+            md_wy_vscroll: payload.md_wy_vscroll,
             preview_on: payload.preview_on,
             preview_fullscreen: payload.preview_fullscreen,
             readonly_preview: payload.readonly_preview,
@@ -898,6 +914,66 @@ impl EditorApp {
         });
     }
 
+    /// A2：当前激活选项卡的右栏 WyEditor 预览实体（仅当该选项卡**真正以 WyEditor 作
+    /// 预览渲染**时才返回：Markdown 文件 → 已建 → 非 PDF → 非只读预览（EPUB 仍走
+    /// `MarkdownPreview`））。`render_preview_pane` / `render_fullscreen_preview` 据此
+    /// 决定走统一组件宿主。
+    fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
+        if !self.is_markdown_tab(self.active_tab) {
+            return None;
+        }
+        let tab = self.tabs.get(self.active_tab)?;
+        if tab.md_wy.is_none() || tab.pdf_preview.is_some() || tab.readonly_preview {
+            return None;
+        }
+        tab.md_wy.clone()
+    }
+
+    /// A2：确保某选项卡的右栏 WyEditor 预览已创建（懒创建 + A1 只读门控 + 全局字号/
+    /// 基准目录）。`feed=true` 用当前编辑区文本**同步喂源**（小文档 / 切预览；
+    /// 大文档异步走 `open_from_rope`(后台) + `finish_file_text` 的 `install_open`，
+    /// 不在此做 O(n) UI 解析）。
+    fn ensure_md_wy(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        feed: bool,
+    ) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let fs = self.font_size;
+        let base_dir = self.tabs[idx]
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_path_buf());
+        if self.tabs[idx].md_wy.is_none() {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ed.update(cx, |ed, _| {
+                ed.set_editable(false); // A1 只读门控：右栏预览不可编辑
+                ed.set_font_size(gpui::px(fs));
+                ed.set_base_dir(base_dir.clone());
+            });
+            self.tabs[idx].md_wy = Some(ed.clone());
+        }
+        if feed {
+            // 同步喂源：源 = 编辑区规范文本（与 `sync_md_preview` 同口径）。
+            let text = {
+                let tab = &mut self.tabs[idx];
+                tab.editor.read(cx).value().to_string()
+            };
+            if let Some(ed) = self.tabs[idx].md_wy.clone() {
+                ed.update(cx, |ed, _| {
+                    ed.set_font_size(gpui::px(fs));
+                    ed.set_base_dir(base_dir);
+                    ed.set_source_text(&text);
+                });
+            }
+        }
+    }
+
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
     /// 会先激活该选项卡，再翻转其 `preview_on`。
     /// EPUB（`readonly_preview`）：正文只在预览区、编辑区为空，翻转预览无意义，
@@ -930,10 +1006,18 @@ impl EditorApp {
         });
         if preview_on {
             self.sync_md_preview(idx, cx);
+            // A2：MD 选项卡同步创建/喂源右栏 WyEditor 预览（EPUB 只读 / 非 md 跳过）。
+            let is_md_preview = is_md && !readonly;
+            if is_md_preview {
+                self.ensure_md_wy(idx, window, cx, true);
+            }
         } else {
             // 关闭预览：释放整篇解析出的行数据与测量缓存，内存回到基线
             // （否则隐藏的预览仍占着整篇文档，反复开关只涨不降）。
             self.tabs[idx].md_preview.update(cx, |view, cx| view.release(cx));
+            // A2：右栏 WyEditor 预览随预览开关释放（同款内存回收）。
+            self.tabs[idx].md_wy = None;
+            self.tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
         }
         cx.notify();
     }

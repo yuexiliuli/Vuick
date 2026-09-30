@@ -767,6 +767,13 @@ impl EditorApp {
                                     v.highlight_search(li, &q_owned, cx);
                                 });
                             }
+                            // A2：右栏 WyEditor 预览（MD 统一组件，只读）在场时同样高亮
+                            // 命中文本（预览从 MarkdownPreview 切到它之后的跳转高亮同步）。
+                            if let Some(wy) = tab.md_wy.clone() {
+                                wy.update(cx, |v, cx| {
+                                    v.highlight_search(li, &q_owned, cx);
+                                });
+                            }
                             let ed = tab.editor.clone();
                             ed.update(cx, |ed, cx| {
                                 // 先落光标（滚动到该行），再选中命中文本作为高亮

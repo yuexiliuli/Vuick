@@ -1533,12 +1533,6 @@ impl MarkdownPreview {
         self.est_hint
     }
 
-    /// 诊断：统一行高提示「已应用」记忆 `(块数, 提示值)`。None = 尚未应用（量程会坍缩）。
-    #[cfg(test)]
-    pub(crate) fn test_hint_applied(&self) -> Option<(usize, f32)> {
-        self.hint_applied
-    }
-
     /// 测试：暴露 ListState（共享 Rc）——测试拖拽路径（start_drag 重铺 + 冻结 + 拖底）。
     #[cfg(test)]
     pub(crate) fn test_list_state(&self) -> ListState {

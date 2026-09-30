@@ -144,7 +144,7 @@ impl EditorApp {
         idx: usize,
         p: &std::path::Path,
         prep: PreparedText,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         defer_preview: bool,
     ) {
@@ -237,6 +237,13 @@ impl EditorApp {
             format!("已打开：{}", p.display())
         });
         self.status_ok = true;
+        // A2：MD 选项卡右栏预览统一组件（WyEditor 只读）——创建并喂源。
+        //  - 同步小文档：就地 `set_source_text`（小，UI 可承受，与 md_preview.set_source 同）；
+        //  - 大文档快速挂载（defer=true）：只建空壳，整篇 `Doc::open` 由后台
+        //    `spawn_progressive_open` 算好、`finish_file_text` 里 `install_open`（不占 UI）。
+        if is_md {
+            self.ensure_md_wy(idx, window, cx, !defer_preview);
+        }
         cx.notify();
     }
 
@@ -252,6 +259,7 @@ impl EditorApp {
         max_line_chars: usize,
         line_width_histogram: crate::editor::buffer::LineWidthHistogram,
         index: Option<crate::markdown::BlockIndex>,
+        md_wy_open: Option<crate::markdown::wysiwyg::WyOpenResult>,
         resume_version: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -276,6 +284,12 @@ impl EditorApp {
                 tab.md_preview.update(cx, |view, cx| {
                     view.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope), rc, cx);
                 });
+                // A2：右栏 WyEditor 预览（大文档空壳）由后台预建的 `WyOpenResult`
+                // 一次性 `install_open` 装配（UI 线程只做 O(块) 换源重置，不背 Doc::open）。
+                if let Some(ed) = tab.md_wy.clone()
+                    && let Some(wy) = md_wy_open {
+                        ed.update(cx, |ed, _| ed.install_open(wy));
+                    }
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后两栏纵向量程总高。编辑器精确时应 ≈
@@ -397,8 +411,9 @@ impl EditorApp {
                         this.load_file_text(idx, &p_emp, prep, window, cx, true);
                     });
                 }
-                // md：后台扫块建预览索引（快照 rope O(1) 克隆，行块统计已逐块精确）。
-                let index = if is_md {
+                // md：后台扫块建预览索引（快照 rope O(1) 克隆，行块统计已逐块精确）+
+                // 右栏 WyEditor 预览（A2）的整篇 `Doc::open`——两者都 O(n)，一并放后台。
+                let (index, md_wy_open) = if is_md {
                     let p_snap = p.clone();
                     let snap = cx
                         .update_window_entity(&entity, move |this, _w, cx| {
@@ -411,7 +426,7 @@ impl EditorApp {
                         .flatten();
                     let Some(snap) = snap else { return };
                     let t = std::time::Instant::now();
-                    let index = cx
+                    let (index, wy_open) = cx
                         .background_executor()
                         .spawn(async move {
                             let out = crate::markdown::scan_blocks_rope(&snap);
@@ -421,12 +436,22 @@ impl EditorApp {
                                     t.elapsed().as_millis()
                                 );
                             }
-                            out
+                            // A2：右栏 WyEditor 预览整篇 `Doc::open`（后台、与 scan_blocks
+                            // 同一批量线程）。EPUB/TOC 侧的 md_preview 仍保留（A4 脱离）。
+                            let t_wy = std::time::Instant::now();
+                            let wy_open = crate::markdown::wysiwyg::WyEditor::open_from_rope(snap);
+                            if std::env::var_os("MD_OPEN_DEBUG").is_some() {
+                                eprintln!(
+                                    "[MD_OPEN_DEBUG] 后台 右栏WyEditor(Doc::open) 合计: {} ms",
+                                    t_wy.elapsed().as_millis()
+                                );
+                            }
+                            (out, wy_open)
                         })
                         .await;
-                    Some(index)
+                    (Some(index), Some(wy_open))
                 } else {
-                    None
+                    (None, None)
                 };
                 // 最终：装算统计/预览索引 + 恢复「已打开」状态。
                 let hist_lines = cum_hist.values().sum::<usize>();
@@ -438,6 +463,7 @@ impl EditorApp {
                         cum_mx,
                         cum_hist,
                         index,
+                        md_wy_open,
                         resume_version,
                         cx,
                     );
