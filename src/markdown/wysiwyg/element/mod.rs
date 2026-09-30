@@ -248,16 +248,7 @@ impl Frame {
     }
     /// 源码行 → 所在块下标（块按 `src_line` 升序连续覆盖源码行；越界归到首/末块）。
     pub(crate) fn block_index_for_src_line(&self, line: usize) -> Option<usize> {
-        let base = self.base.borrow();
-        let sl = base.src_lines();
-        if sl.is_empty() {
-            return None;
-        }
-        let i = sl
-            .partition_point(|&s| (s as usize) <= line)
-            .saturating_sub(1)
-            .min(sl.len() - 1);
-        Some(i)
+        self.base.borrow().block_index_for_src_line(line)
     }
     /// 源码行所在块的有效顶 y（元素局部 px）——带外光标/命中（未物化行）的定位兜底。
     pub(crate) fn src_line_top(&self, line: usize) -> f32 {
@@ -269,109 +260,366 @@ impl Frame {
 }
 
 /// 全篇块**基础布局**（按「内容/图片/数学/宽度」代每档重建一次，档内滚动/带移动
-/// **持久复用**）：`heights` 每块基础高（估算或整形真值），Fenwick 维护前缀和。
+/// **持久复用**）：**分块/绳**——块切分成定长 `Chunk`（S2 pass1 绳化），中段结构编辑
+/// 只动编辑边框块，尾块整块复用（只平移行偏移 `off`）+ 块级 Fenwick 前缀聚合 → 每键
+/// O(#编辑块 + C) 而非平铺数组的 O(n) 整表重建（6.4MB/~13 万块 Enter 的 Fenwick+复制
+/// ~7ms → 只走编辑邻域）。
 ///
 /// 动态高度（折叠 body→0、数学卡片→卡高）不走这个基表——由 [`Frame::deltas`] 稀疏
-/// 增量覆盖（按块下标升序），`block_top`/`block_height` 合并计算。好处：滚动/带移动
-/// **不再对整个 O(n) 高度数组重算前缀和**（旧实现 7MB/15.9 万块 ~40ms/档）。
-/// `set(i,h)` 点更新 O(log n)（新块整形真值收敛），`top/total` 查询 O(log n)。
+/// 增量覆盖（按块下标升序），`block_top`/`block_height` 合并计算。`set(i,h)` 点更新
+/// O(log C + 块长)，`top/total` 查询 O(log C)。
 pub(crate) struct BlockLayout {
-    heights: Vec<f32>,
-    fen: Vec<f64>,
-    block_src_lines: Vec<u32>,
+    /// 块切块（全局块下标 = 前缀块计数累计）。
+    chunks: Vec<Chunk>,
+    /// 块级计数 Fenwick（len = C+1）：定位全局块下标 → 所在 Chunk。
+    cnt_fen: Vec<usize>,
+    /// 块级高和 Fenwick（len = C+1）：`top/total` 前缀。
+    sum_fen: Vec<f64>,
+    /// 全局块总数。
+    n: usize,
 }
 
+/// 单个块 Chunk：稠密块数组（高 + 起始源行）+ 行偏移（结构编辑尾部平移累加，读时
+/// `s[i] + off`）+ 本地高前缀（`top` 的 O(1) 本地段）。`h/s/p` 用 `Rc` 背板：分块增量
+/// 重建时尾部 Chunk **浅克隆共享**（每 Chunk O(1)，不复制数组），旧布局帧末释放后
+/// 独享再被 `set` 就地写（COW）。
+#[derive(Clone)]
+struct Chunk {
+    h: std::rc::Rc<[f32]>,
+    s: std::rc::Rc<[u32]>,
+    off: i64,
+    p: std::rc::Rc<[f64]>,
+}
+
+impl Chunk {
+    fn from_owned(h: Vec<f32>, s: Vec<u32>, off: i64) -> Chunk {
+        let mut p = Vec::with_capacity(h.len() + 1);
+        let mut acc = 0f64;
+        p.push(0.0);
+        for &v in &h {
+            acc += v as f64;
+            p.push(acc);
+        }
+        Chunk { h: h.into(), s: s.into(), off, p: p.into() }
+    }
+    fn from_slices(h: &[f32], s: &[u32], off: i64) -> Chunk {
+        Chunk::from_owned(h.to_vec(), s.to_vec(), off)
+    }
+    fn eff_first(&self) -> usize {
+        (self.s.first().copied().unwrap_or(0) as i64 + self.off).max(0) as usize
+    }
+    fn len(&self) -> usize {
+        self.h.len()
+    }
+}
+
+/// 默认块 Chunk 容量（≥1：空块不落 Chunk，避免零长）。
+const CHUNK: usize = 128;
+
 impl BlockLayout {
-    /// 空布局（O(1)）：给「即将被 Pass1 整表重建」的草稿占位——`ensure_block_layout`
-    /// 重建分支用它，省掉先建一份全量零点 Fenwick 又一帧被 `rebuild` 覆盖的
-    /// 双重 O(n) 构造（Enter/结构编辑每键 ~0.8ms）。
+    /// 空布局（O(1)）：给「即将被 Pass1 重建」的草稿占位。
     pub(crate) fn empty() -> Self {
-        Self { heights: Vec::new(), fen: Vec::new(), block_src_lines: Vec::new() }
+        Self { chunks: Vec::new(), cnt_fen: Vec::new(), sum_fen: Vec::new(), n: 0 }
     }
-    /// 由整块高度 + 起始源码行建（**O(n)** Fenwick 建表：每个元素只做一次祖先上推，
-    /// 替代每元素 while 爬整条祖先链的 O(n log n)——10.7 万块每次 Pass1 重建 ~40ms→~1ms）。
-    /// 行→块改**二分**（`block_for_line`），不再维护 O(行数) 稠密 `line_block`——结构编辑
-    /// 每键省一次 ~139k 行填充（B5 前它服务 fp.dyn 的 9000 次 O(1) 查询，B5 增量平移后该
-    /// 路径退为回退分支，查询量降为回退/fold 少量 → 二分总成本 ≪ 稠密填充）。
+    /// 由整块高度 + 起始源码行建（首建/测试/宽度变化回退用；O(n) 打包成 Chunk）。
     pub(crate) fn new(heights: Vec<f32>, block_src_lines: Vec<u32>) -> Self {
-        let n = heights.len();
-        // 标准 O(n) 建树：tree[i] 累计 a[i-1] 后把部分和上推到父节点。
-        let mut fen = vec![0f64; n + 1];
-        for (i, &h) in heights.iter().enumerate() {
-            let ti = i + 1;
-            fen[ti] += h as f64;
-            let parent = ti + ti.isolate_lowest_one(); // lowbit(ti)，与查询/点更新的 `j & (!j+1)` 同构
-            if parent <= n {
-                fen[parent] += fen[ti];
-            }
-        }
-        Self {
-            heights,
-            fen,
-            block_src_lines,
-        }
+        debug_assert_eq!(heights.len(), block_src_lines.len());
+        let entries: Vec<(f32, u32)> = heights
+            .iter()
+            .zip(block_src_lines.iter())
+            .map(|(&h, &s)| (h, s))
+            .collect();
+        let mut b = Self::empty();
+        b.chunks = Self::pack(&entries);
+        b.rebuild_index();
+        b
     }
-    /// 整表重建（同代内容变更/首次打开用；O(n)）。
-    pub(crate) fn rebuild(
-        &mut self,
-        heights: Vec<f32>,
-        block_src_lines: Vec<u32>,
-    ) {
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
+    /// 整表重建（首建/宽度变化/尾部对齐回退；O(n) 平铺 → Chunk 打包）。
+    pub(crate) fn rebuild_from_flat(&mut self, heights: Vec<f32>, block_src_lines: Vec<u32>) {
         *self = BlockLayout::new(heights, block_src_lines);
     }
-    /// 含源行 `line` 的块下标（O(log n) 二分于 `block_src_lines`；越界归到首/末块）。
-    /// 块按 `src_line` 升序连续覆盖源码行——与 `block_index_for_src_line` 同式。
-    pub(crate) fn block_for_line(&self, line: usize) -> usize {
-        let sl = &self.block_src_lines;
-        if sl.is_empty() {
+    /// 物化 `[lo, hi)` 块的 (高度, 有效起始源行) 平铺（回退/测试用；O(hi-lo)）。
+    pub(crate) fn flat_range(&self, lo: usize, hi: usize) -> (Vec<f32>, Vec<u32>) {
+        let lo = lo.min(self.n);
+        let hi = hi.min(self.n).max(lo);
+        let mut h = Vec::with_capacity(hi - lo);
+        let mut s = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
+            h.push(self.height(i));
+            s.push(self.src_line(i));
+        }
+        (h, s)
+    }
+    pub(crate) fn height(&self, i: usize) -> f32 {
+        if i >= self.n {
+            return 0.;
+        }
+        let (c, l) = self.chunk_index_of(i);
+        self.chunks[c].h[l]
+    }
+    /// 第 `i` 块起始源行（块 s 原始值 + Chunk 行偏移）。
+    pub(crate) fn src_line(&self, i: usize) -> u32 {
+        if i >= self.n {
             return 0;
         }
-        sl.partition_point(|&s| (s as usize) <= line)
-            .saturating_sub(1)
-            .min(sl.len() - 1)
+        let (c, l) = self.chunk_index_of(i);
+        (self.chunks[c].s[l] as i64 + self.chunks[c].off).max(0) as u32
     }
-    /// 点更新第 `i` 块高（增量改前缀和；差 ~0 跳过）。
+    /// 点更新第 `i` 块高（增量改块级高和 Fenwick + 本地前缀；差 ~0 跳过；COW：共享的
+    /// 尾部 Chunk 首次写才克隆背板，之后就地）。
     pub(crate) fn set(&mut self, i: usize, h: f32) {
-        let old = self.heights[i];
+        if i >= self.n {
+            return;
+        }
+        let (c, l) = self.chunk_index_of(i);
+        let ch = &mut self.chunks[c];
+        let old = ch.h[l];
         let d = h - old;
         if d.abs() < 1e-6 {
             return;
         }
-        self.heights[i] = h;
-        let mut j = i + 1;
+        let hs = std::rc::Rc::make_mut(&mut ch.h);
+        hs[l] = h;
+        let ps = std::rc::Rc::make_mut(&mut ch.p);
+        for t in l..hs.len() {
+            ps[t + 1] = ps[t] + hs[t] as f64;
+        }
+        let mut j = c + 1;
         let dd = d as f64;
-        while j < self.fen.len() {
-            self.fen[j] += dd;
+        let len = self.sum_fen.len();
+        while j < len {
+            self.sum_fen[j] += dd;
             j += j & (!j + 1);
         }
     }
     /// 第 `i` 块 top（= 前 i 块高之和，px）。
     pub(crate) fn top(&self, i: usize) -> f32 {
-        let mut s = 0f64;
-        let mut j = i.min(self.heights.len());
-        while j > 0 {
-            s += self.fen[j];
-            j -= j & (!j + 1);
+        if i >= self.n || i == 0 {
+            return self.top_total(i);
         }
-        s as f32
+        let (c, l) = self.chunk_index_of(i);
+        (self.sum_prefix(c) + self.chunks[c].p[l]) as f32
+    }
+    fn top_total(&self, i: usize) -> f32 {
+        // i == 0 → 0；i >= n → total（块级高和 Fenwick 全量）。
+        if i == 0 {
+            0.
+        } else {
+            self.sum_prefix(self.chunks.len()) as f32
+        }
     }
     /// 总高（px）。
     pub(crate) fn total(&self) -> f32 {
-        self.top(self.heights.len())
+        self.sum_prefix(self.chunks.len()) as f32
     }
-    pub(crate) fn height(&self, i: usize) -> f32 {
-        self.heights.get(i).copied().unwrap_or(0.)
+    /// 含源行 `line` 的块下标（分块：按 Chunk 首行二分 + 块内二分；越界归到首/末块）。
+    pub(crate) fn block_for_line(&self, line: usize) -> usize {
+        self.block_index_for_src_line(line).unwrap_or(0)
     }
-    pub(crate) fn heights(&self) -> &[f32] {
-        &self.heights
+    /// 源码行 → 所在块（同上；空布局 None）。
+    pub(crate) fn block_index_for_src_line(&self, line: usize) -> Option<usize> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        let c = {
+            let mut lo = 0usize;
+            let mut hi = self.chunks.len();
+            while lo < hi {
+                let m = (lo + hi) / 2;
+                if self.chunks[m].eff_first() <= line {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            lo.saturating_sub(1)
+        };
+        let cs = &self.chunks[c];
+        let li = cs
+            .s
+            .partition_point(|&raw| (raw as i64 + cs.off).max(0) as usize <= line)
+            .saturating_sub(1)
+            .min(cs.s.len().saturating_sub(1));
+        Some(self.cnt_prefix(c) + li)
     }
-    pub(crate) fn n(&self) -> usize {
-        self.heights.len()
+
+    /// **结构编辑**：`self`（重建草稿，通常为空）← 旧[0..keep)(浅克隆) ++ middle(打包)
+    /// ++ 旧[j..)(尾部浅克隆 + Chunk 级 `off += line_delta`，O(1)/Chunk，不重排平铺数组)。
+    /// `n_exp` = 预期新块数（debug 断言）。只做前缀 [0..keep)、尾部 [j..) 的**结构级浅拷贝**
+    /// 与编辑边框块的 O(CHUNK) 切片——中段编辑 O(#编辑块 + C) 而非平铺 O(n)。
+    pub(crate) fn apply_structural_edit(
+        &mut self,
+        old: &BlockLayout,
+        keep: usize,
+        middle: &[(f32, u32)],
+        j: usize,
+        line_delta: i64,
+        n_exp: usize,
+    ) {
+        let n_old = old.n;
+        debug_assert!(
+            keep <= n_old && j <= n_old && keep <= j,
+            "apply_structural_edit pre: keep={keep} j={j} n_old={n_old} n_exp={n_exp} mid={}",
+            middle.len()
+        );
+        let mut chunks = old.chunks.clone();
+        let (ci, local) = if keep >= n_old {
+            (chunks.len(), 0)
+        } else {
+            let (cc, loc) = old.chunk_index_of(keep);
+            if loc == 0 {
+                (cc, 0)
+            } else {
+                (cc, loc)
+            }
+        };
+        // 前缀 [0..keep)：Chunk 浅克隆（Rc 背板共享，O(C) 小结构体）；编辑边框块切两半。
+        let mut tail = chunks.split_off(ci);
+        let mut pre = chunks;
+        if local > 0 {
+            let c = tail.remove(0);
+            pre.push(Chunk::from_slices(&c.h[..local], &c.s[..local], c.off));
+            let right = Chunk::from_slices(&c.h[local..], &c.s[local..], c.off);
+            tail.insert(0, right);
+        }
+        // 丢弃旧 [keep..j)（编辑区旧块），保留旧 [j..) 为尾部。
+        let mut drop = j.saturating_sub(keep);
+        let mut ti = 0usize;
+        while drop > 0 && ti < tail.len() {
+            let len = tail[ti].len();
+            if len > drop {
+                let (h, s, off) = {
+                    let c = &tail[ti];
+                    (c.h[drop..].to_vec(), c.s[drop..].to_vec(), c.off)
+                };
+                tail[ti] = Chunk::from_owned(h, s, off);
+                break;
+            }
+            drop -= len;
+            ti += 1;
+        }
+        if ti > 0 {
+            tail.drain(..ti);
+        }
+        // 尾部整块行号平移：只动旧尾部 Chunk 的 `off`（middle 是新块 src，不得平移）。
+        if line_delta != 0 {
+            for c in &mut tail {
+                c.off += line_delta;
+            }
+        }
+        // middle 插在尾部之前（新 [keep..k) 块，src 已是新文档行号）。
+        if !middle.is_empty() {
+            let mid = Self::pack(middle);
+            tail.splice(0..0, mid);
+        }
+        self.chunks = pre;
+        self.chunks.extend(tail);
+        self.rebalance();
+        self.rebuild_index();
+        debug_assert_eq!(self.n, n_exp);
     }
-    pub(crate) fn src_lines(&self) -> &[u32] {
-        &self.block_src_lines
+
+    fn pack(entries: &[(f32, u32)]) -> Vec<Chunk> {
+        let mut out = Vec::new();
+        let mut h = Vec::with_capacity(CHUNK);
+        let mut s = Vec::with_capacity(CHUNK);
+        for &(hh, ss) in entries {
+            h.push(hh);
+            s.push(ss);
+            if h.len() == CHUNK {
+                out.push(Chunk::from_owned(std::mem::take(&mut h), std::mem::take(&mut s), 0));
+            }
+        }
+        if !h.is_empty() {
+            out.push(Chunk::from_owned(h, s, 0));
+        }
+        out
+    }
+    /// 碎片化护栏：Chunk 数超过 `2*(n/CHUNK)+8`（多次中段 split 累积）→ 物化全部偏移后
+    /// 重新整包（摊还 O(CHUNK)/次编辑，保 C = O(n/CHUNK)，定位/前缀仍 O(log C)）。
+    fn rebalance(&mut self) {
+        let n = self.chunks.iter().map(|c| c.h.len()).sum::<usize>();
+        let cap = 2 * (n / CHUNK).max(1) + 8;
+        if self.chunks.len() <= cap {
+            return;
+        }
+        let mut entries = Vec::with_capacity(n);
+        for c in &self.chunks {
+            for i in 0..c.h.len() {
+                entries.push((c.h[i], (c.s[i] as i64 + c.off).max(0) as u32));
+            }
+        }
+        self.chunks = Self::pack(&entries);
+    }
+    /// 块级索引重建（O(C)）：计数/高和 Fenwick + 全局块数。
+    fn rebuild_index(&mut self) {
+        let c = self.chunks.len();
+        let mut cnt_fen = vec![0usize; c + 1];
+        let mut sum_fen = vec![0f64; c + 1];
+        let mut n = 0usize;
+        for (i, ch) in self.chunks.iter().enumerate() {
+            let sz = ch.h.len();
+            let hs = ch.p.last().copied().unwrap_or(0.0);
+            n += sz;
+            let ti = i + 1;
+            cnt_fen[ti] += sz;
+            sum_fen[ti] += hs;
+            let parent = ti + ti.isolate_lowest_one();
+            if parent <= c {
+                cnt_fen[parent] += cnt_fen[ti];
+                sum_fen[parent] += sum_fen[ti];
+            }
+        }
+        self.cnt_fen = cnt_fen;
+        self.sum_fen = sum_fen;
+        self.n = n;
+    }
+    /// Chunk 的块计数前缀：chunks[0..m) 的块数（m ∈ [0, C]）。
+    fn cnt_prefix(&self, m: usize) -> usize {
+        let mut s = 0usize;
+        let mut j = m.min(self.cnt_fen.len());
+        while j > 0 {
+            s += self.cnt_fen[j];
+            j -= j & (!j + 1);
+        }
+        s
+    }
+    /// Chunk 的高和前缀：chunks[0..m) 的高之和（m ∈ [0, C]）。
+    fn sum_prefix(&self, m: usize) -> f64 {
+        let mut s = 0f64;
+        let mut j = m.min(self.sum_fen.len());
+        while j > 0 {
+            s += self.sum_fen[j];
+            j -= j & (!j + 1);
+        }
+        s
+    }
+    /// 全局块下标 → (Chunk 下标, 块内偏移)。Fenwick **二进制抬升**（select）O(log C)——
+    /// 替代二分×Fenwick 查询的 O(log² C)（pass2/plan 逐块热路径的回归源）。
+    fn chunk_index_of(&self, i: usize) -> (usize, usize) {
+        let i = i.min(self.n.saturating_sub(1));
+        let len = self.cnt_fen.len(); // C+1
+        let mut pos = 0usize;
+        let mut k = i;
+        let mut bit = len.next_power_of_two() >> 1;
+        while bit > 0 {
+            let t = pos + bit;
+            if t < len && self.cnt_fen[t] <= k {
+                k -= self.cnt_fen[t];
+                pos = t;
+            }
+            bit >>= 1;
+        }
+        // pos = 满足 cnt_prefix(pos) ≤ 原 i 的最大块计数位；块 i 落在 chunk pos。
+        let c = pos;
+        let base = self.cnt_prefix(c);
+        (c, i.saturating_sub(base))
     }
 }
+
 
 /// 折叠/重排计划：与**可视带无关且不含 caret**（内容、数学就绪、宽度、结构版本决定，
 /// 键 = `(epoch, regions_ver, mgen, fold_ver)`），滚动/带移动/**光标移动/纯文本键入**都

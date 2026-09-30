@@ -6336,3 +6336,84 @@ A-->B
             );
         }
     }
+
+    /// S2：分块 `BlockLayout` 的结构编辑 `apply_structural_edit` 产出 == 平铺参考（逐块高/
+    /// src 全比）。覆盖中段插入/删除、块净增减、`line_delta` 尾部平移、跨多 Chunk 边框
+    /// 分裂与 `off` 累加。
+    #[gpui::test]
+    #[allow(clippy::type_complexity)]
+    fn chunked_layout_structural_edit_matches_flat_rebuild(_cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::element::BlockLayout;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        // 参考实现：结构编辑 = 旧块序列上 前缀 + 中段 + 尾段(src+delta)。
+        fn apply_flat(
+            old: &[(f32, u32)],
+            keep: usize,
+            middle: &[(f32, u32)],
+            j: usize,
+            delta: i64,
+        ) -> Vec<(f32, u32)> {
+            let mut out: Vec<(f32, u32)> = old[..keep].to_vec();
+            out.extend_from_slice(middle);
+            for &(h, s) in &old[j..] {
+                out.push((h, (s as i64 + delta).max(0) as u32));
+            }
+            out
+        }
+        // 300 块（>2 Chunk），src = 块下标；多次随机结构编辑驱动边框分裂 + off 累加。
+        let mut flat: Vec<(f32, u32)> = (0..300u32).map(|i| (10.0 + (i % 7) as f32, i)).collect();
+        let bl: Rc<RefCell<BlockLayout>> = {
+            let h: Vec<f32> = flat.iter().map(|&(hh, _)| hh).collect();
+            let s: Vec<u32> = flat.iter().map(|&(_, ss)| ss).collect();
+            Rc::new(RefCell::new(BlockLayout::new(h, s)))
+        };
+        // 3 次中段结构编辑（插入 2 块 / 插入 1 块 / 删除 2 块 + 负行偏移）。
+        let cases: Vec<(usize, Vec<(f32, u32)>, usize, i64)> = vec![
+            (100, vec![(12.0, 100), (13.0, 101)], 100, 1),
+            (60, vec![(15.0, 60)], 61, 1),
+            (10, vec![], 14, -2),
+        ];
+        for (keep, middle, j, delta) in cases {
+            flat = apply_flat(&flat, keep, &middle, j, delta);
+            let old_bor = bl.borrow();
+            let n_exp = flat.len();
+            let mut nb = BlockLayout::empty();
+            nb.apply_structural_edit(&old_bor, keep, &middle, j, delta, n_exp);
+            drop(old_bor);
+            *bl.borrow_mut() = nb;
+            let (hh, ss) = bl.borrow().flat_range(0, n_exp);
+            for i in 0..n_exp {
+                assert!(
+                    (hh[i] - flat[i].0).abs() < 1e-3 && ss[i] == flat[i].1,
+                    "i={i} 块不一致：chunked=({:?},{:?}) flat=({:?},{:?})",
+                    hh[i],
+                    ss[i],
+                    flat[i].0,
+                    flat[i].1
+                );
+            }
+            assert_eq!(bl.borrow().n(), n_exp, "块数应一致");
+            let total = bl.borrow().total();
+            let ref_total: f32 = flat.iter().map(|&(h, _)| h).sum();
+            assert!((total - ref_total).abs() < 1e-3, "total 应一致");
+        }
+        // 边界：文末追加（keep == n_old）。
+        let keep = bl.borrow().n();
+        let middle = vec![(99.0, 999u32)];
+        flat = apply_flat(&flat, keep, &middle, keep, 0);
+        let old_bor = bl.borrow();
+        let mut nb = BlockLayout::empty();
+        nb.apply_structural_edit(&old_bor, keep, &middle, keep, 0, flat.len());
+        drop(old_bor);
+        *bl.borrow_mut() = nb;
+        let (hh, ss) = bl.borrow().flat_range(0, flat.len());
+        let last = flat.len() - 1;
+        assert_eq!((hh[last], ss[last]), (99.0, 999u32), "文末追加块应就位");
+        // 边界：`new(flat)` 直接建（无 old）。
+        let b = BlockLayout::new(vec![5.0, 6.0], vec![0, 1]);
+        assert_eq!(b.n(), 2);
+        let (hh, ss) = b.flat_range(0, 2);
+        assert_eq!(hh.as_slice(), &[5.0, 6.0]);
+        assert_eq!(ss.as_slice(), &[0, 1]);
+    }

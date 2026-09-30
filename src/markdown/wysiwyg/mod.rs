@@ -2627,13 +2627,8 @@ impl WyEditor {
     ) -> element::RevealPlan {
         let mut reveal = element::RevealPlan::empty();
         let base_br = base.borrow();
-        let src_lines = base_br.src_lines();
-        let src_len = src_lines.len();
         let block_ix_of = |srcline: usize| -> usize {
-            src_lines
-                .partition_point(|&s| (s as usize) <= srcline)
-                .saturating_sub(1)
-                .min(src_len.saturating_sub(1))
+            base_br.block_index_for_src_line(srcline).unwrap_or(0)
         };
         let zero_ix = |zeroed: &mut Vec<usize>, ix: usize| {
             if !zeroed.contains(&ix) {

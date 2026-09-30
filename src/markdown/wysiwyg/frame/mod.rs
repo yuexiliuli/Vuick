@@ -162,34 +162,40 @@ fn pass1_base_layout(
     // 二分界内的块 0..=keep 下标稳定（内容/索引未变）→ 前缀高度沿用。
     let keep = p.saturating_sub(1);
     let old_holder = old_layout.cloned(); // 保活旧布局 Rc 以便借用
-    let old = old_holder.as_ref().map(|rc| rc.borrow());
-    let (old_heights, old_src): (Option<&[f32]>, Option<&[u32]>) = match &old {
-        Some(ob) => (Some(ob.heights()), Some(ob.src_lines())),
-        None => (None, None),
-    };
-    let (mut heights, mut src_lines) = match &old {
-        Some(ob) => {
-            let k = keep.min(ob.n());
-            (ob.heights()[..k].to_vec(), ob.src_lines()[..k].to_vec())
+    // 旧尾部起点 j：首个旧块 src_line > 编辑影响区间终点（二分于旧分块布局）。
+    let old_n = old_holder.as_ref().map(|rc| rc.borrow().n());
+    let j = match &old_holder {
+        Some(rc) => {
+            let ob = rc.borrow();
+            let mut lo = 0usize;
+            let mut hi = ob.n();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if ob.src_line(mid) as usize <= old_end_line {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
         }
-        None => (Vec::with_capacity(n), Vec::with_capacity(n)),
-    };
-    // 旧尾部起点 j：首个旧块 src_line > 编辑影响区间终点。
-    let old_exist = old_src.is_some();
-    let j = match old_src {
-        Some(os) => os.partition_point(|&s| (s as usize) <= old_end_line),
         None => 0,
     };
     // 新尾部起点 k：首个新块 src_line ≥ 旧尾部 src_line + 行数净增。旧布局缺失
     // （首建）或编辑近文末（无旧尾部）时中段扫到底。块 src_line 随下标单调 →
-    // 直接**二分**首个 `src_line ≥ tail_src`，替代旧实现对 `[keep, n)` 全部块逐个
-    // `doc.block_meta` + `collect` 成 Vec（中段编辑 57k 块 × O(log) 是 pass1 的
-    // 4-6ms 主成本）。
-    let tail_src = match (old_src, old_src.and_then(|os| os.get(j).copied())) {
-        (_, Some(s)) => s as i64 + line_delta,
-        _ => doc_lines as i64,
+    // 直接**二分**首个 `src_line ≥ tail_src`（4-6ms 主成本的旧实现被分块消除）。
+    let tail_src = match &old_holder {
+        Some(rc) => {
+            let ob = rc.borrow();
+            if j < ob.n() {
+                ob.src_line(j) as i64 + line_delta
+            } else {
+                doc_lines as i64
+            }
+        }
+        None => doc_lines as i64,
     };
-    let k = if !old_exist {
+    let k = if old_n.is_none() {
         n
     } else if keep < n {
         let mut lo = keep;
@@ -207,7 +213,11 @@ fn pass1_base_layout(
     } else {
         keep
     };
-    // 中段（编辑所在 → 新尾部起点）重新估算。
+    // 中段（编辑所在 → 新尾部起点）重新估算，收成 (高, src) 描述子。
+    let mid_start = old_holder
+        .as_ref()
+        .map(|rc| keep.min(rc.borrow().n()))
+        .unwrap_or(0);
     let est_block = |i: usize| -> (f32, u32) {
         let meta = if let Some(m) = doc.block_meta(i) {
             m
@@ -243,29 +253,35 @@ fn pass1_base_layout(
         };
         (h, meta.src_line)
     };
-    for i in heights.len()..k {
+    let mut middle: Vec<(f32, u32)> = Vec::with_capacity(k.saturating_sub(mid_start));
+    for i in mid_start..k {
+        middle.push(est_block(i));
+    }
+    // **分块增量路径**：前缀保持 + middle 就地替换 + 旧 [j..) 尾部 Chunk 整块复用
+    // （src 行号整体 +line_delta，只动 Chunk.off）→ 中段编辑 O(#编辑块 + C)，不再
+    // O(n) 平铺重排。仅在「尾部恰好对齐」时成立。
+    let tail_ok = matches!(old_n, Some(n_old) if k <= n && j <= n_old && n_old - j == n - k && keep <= n_old);
+    if tail_ok {
+        let old_ref = old_holder.as_ref().expect("tail_ok 蕴含旧布局在场").borrow();
+        base.borrow_mut().apply_structural_edit(&old_ref, keep, &middle, j, line_delta, n);
+        crate::prof::end("wy.pass1", _t_p1);
+        return;
+    }
+    // 兜底：平铺重建（首建/尾部对齐异常；正确 > 快）。
+    let (mut heights, mut src_lines) = if let Some(rc) = &old_holder {
+        rc.borrow().flat_range(0, mid_start)
+    } else {
+        (Vec::with_capacity(n), Vec::with_capacity(n))
+    };
+    heights.extend(middle.iter().map(|&(h, _)| h));
+    src_lines.extend(middle.iter().map(|&(_, s)| s));
+    for i in heights.len()..n {
         let (h, sl) = est_block(i);
         heights.push(h);
         src_lines.push(sl);
     }
-    // 尾部复用：旧 [j..] 高度原样搬入新 [k..]（长度恰好吻合时才成立）。
-    let mut tail_reused = false;
-    if let (Some(oh), Some(os)) = (old_heights, old_src)
-        && k <= n && j <= os.len() && os.len() - j == n - k {
-            src_lines.extend(os[j..].iter().map(|&s| (s as i64 + line_delta).max(0) as u32));
-            heights.extend_from_slice(&oh[j..]);
-            tail_reused = true;
-        }
-    // 兜底：尾部未复用（首建 / 对齐异常）→ 剩余块照旧逐块重估（正确 > 快）。
-    if !tail_reused {
-        for i in heights.len()..n {
-            let (h, sl) = est_block(i);
-            heights.push(h);
-            src_lines.push(sl);
-        }
-    }
     debug_assert_eq!(heights.len(), n, "Pass1 三段式产出的块数与新索引一致");
-    base.borrow_mut().rebuild(heights, src_lines);
+    base.borrow_mut().rebuild_from_flat(heights, src_lines);
     crate::prof::end("wy.pass1", _t_p1);
 }
 
@@ -355,7 +371,7 @@ fn pass2_shape_band(
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     let mut i = i0;
         while i < i1 {
-            let srcline = base.borrow().src_lines()[i] as usize;
+            let srcline = base.borrow().src_line(i) as usize;
             let blocked = !reveal.contains(srcline)
                 && (fold_lines.contains(&srcline)
                     || math_body.contains(&srcline)
@@ -366,7 +382,7 @@ fn pass2_shape_band(
             }
             let lo = i;
             while i < i1 {
-                let s = base.borrow().src_lines()[i] as usize;
+                let s = base.borrow().src_line(i) as usize;
                 if !reveal.contains(s)
                     && (fold_lines.contains(&s)
                         || math_body.contains(&s)
@@ -473,7 +489,7 @@ fn pass2_shape_band(
                         }
                     }
                 };
-                let srcl = base.borrow().src_lines()[k] as usize;
+                let srcl = base.borrow().src_line(k) as usize;
                 debug_special_row(editor, window, srcl, &srow, base_font);
                 base.borrow_mut().set(k, f32::from(srow.height));
                 shaped.push((k, srow));
@@ -504,7 +520,7 @@ fn band_hit_test(
     let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
         std::collections::HashMap::new();
     for k in lo..hi {
-        let srcline = base.borrow().src_lines()[k] as usize;
+        let srcline = base.borrow().src_line(k) as usize;
         let cid = block_content_id(doc, k);
         if caret_line == srcline {
             need_row.push(k);
@@ -594,7 +610,7 @@ fn pass3_assemble_rows(
             acc += deltas[di].1;
             di += 1;
         }
-        let srcline = base.borrow().src_lines()[i] as usize;
+        let srcline = base.borrow().src_line(i) as usize;
         let b = base.borrow();
         let d_here = if di < deltas.len() && deltas[di].0 == i {
             Some(deltas[di].1)
@@ -951,16 +967,23 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         if done >= bpf || t0.elapsed() > time_budget {
             break;
         }
-        let srcline = frame.base.borrow().src_lines()[k] as usize;
+        let srcline = frame.base.borrow().src_line(k) as usize;
         // 大块跳过预热：单块 DocRow 覆盖整块源区间，`rows_in_block_window(k,k)` 会
         // 一次性物化并整形整个块（debug 胖表格/长代码段可达 1.6s/块，实测快滚跨界时
         // 单帧窒息）。预热只挑小/中块；大块进带时由 Pass2 权威整形（那时本来就要渲染）。
         // 判定用「字节跨度 + 行跨度」双阈值——行数不反映行的宽度（胖表格多列），字节更准。
         let big = {
             let base_ref = frame.base.borrow();
-            let sl = base_ref.src_lines();
-            let s0 = sl.get(k).copied().unwrap_or(0) as usize;
-            let s1 = sl.get(k + 1).copied().map(|v| v as usize).unwrap_or(s0 + 1);
+            let s0 = if k < base_ref.n() {
+                base_ref.src_line(k) as usize
+            } else {
+                0
+            };
+            let s1 = if k + 1 < base_ref.n() {
+                base_ref.src_line(k + 1) as usize
+            } else {
+                s0 + 1
+            };
             let span_lines = s1.saturating_sub(s0);
             let span_bytes = doc
                 .block_meta(k)
