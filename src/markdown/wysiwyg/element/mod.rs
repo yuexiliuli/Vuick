@@ -540,11 +540,13 @@ impl Element for WyEditorElement {
             } else {
                 px(800.)
             };
-            // 第一轮布局：available 为 Indefinite 且 known 宽也为空（探测性测量）。
-            // 此时构建的帧（默认 800px 宽）下一轮必被真实宽度替换——纯浪费
-            // （实测每键 ~100ms debug）。改为复用现成帧总高 / 行数估算，不建帧；
-            // 下一轮 definite 宽度到达时再真正构建一次。
-            let probe = !width_definite && known.width.is_none();
+            // 非确定宽度（Indefinite / 探测性 / `Definite(0px)` 等占位）一律不建帧：
+            // 复用现成帧总高估算，只让真正的正 definite 宽度趟建帧。否则 0px/探测趟会
+            // 以 `known`/800 兜底建一帧，下一趟 definite 真实宽又重建——帧缓存永不命中
+            // （右栏 md_wy 宿主每键 ×N 次 build_frame，debug ~100-500ms/键，即 A2 引入
+            // 的卡顿根因；实测根治后每键降到单次重建）。旧版仅在 `known` 为空时才跳过，
+            // known 非空（如上一趟 800 兜底）时 0px 趟仍会建占位帧。
+            let probe = !width_definite;
             // 帧缓存：内容/宽度/可视带/图片代数都没变 → 直接复用总高，不再整篇重建
             // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
             let rgen = e.content_gen();

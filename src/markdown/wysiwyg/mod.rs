@@ -21,7 +21,7 @@
 //!   单元格排版，含对齐位移、渲染列↔源字节映射；图片行 = 图片盒 + 居中可编辑 alt
 //!   题注行，题注走与普通文本行同构的 `byte_map`/`wrapped`/`x_off`；导航跳过只读
 //!   围栏/分隔行，退格/删除有代码围栏、单元格、alt 起点/尾边界守卫，表格与图片
-//! alt 内回车 no-op）。选区面板高亮已覆盖：普通文本行、代码内容行、表格单元格
+//!   alt 内回车 no-op）。选区面板高亮已覆盖：普通文本行、代码内容行、表格单元格
 //!   （逐可见行 × 逐格与选区求交后按字形几何绘制）、图片题注行。仅作「预览编辑
 //!   测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
 //!
@@ -449,7 +449,7 @@ enum EditKind {
 }
 
 /// 可编辑块区域（与块级编辑映射配套；围栏行不可落点）。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BlockRegion {
     /// 代码围栏：内容行 `lo..=hi` 连续；围栏行 = `lo-1`（开）、`hi+1`（闭）。
     Code { lo: usize, hi: usize },
@@ -1085,7 +1085,6 @@ impl WyEditor {
     /// （`replace_range` 硬门控）、不画光标；保留光标移动、点选/复制、链接点击、折叠、
     /// 搜索高亮、表格/代码横向滚动条。切只读时丢弃 IME 组合态、收拢选区为光标（避免
     /// 只读态下残留活动选区误导）。已处目标态则 no-op（不触发帧失效）。
-    #[allow(dead_code)] // A2 接线 app 右栏预览后移除
     pub fn set_editable(&mut self, editable: bool) {
         if self.editable == editable {
             return;
@@ -3099,6 +3098,79 @@ impl WyEditor {
         self.block_regions = regions;
     }
 
+    /// B4：结构编辑后的 `block_regions` **增量更新**——替代每键 O(块数) 整表重建
+    /// [`Self::rebuild_block_regions`]（6MB/10 万块 debug ~5.9ms/键）。
+    ///
+    /// 结构编辑是**局部**的：只影响「编辑线所在块」及其直接后继（Enter 分裂、退格合并、
+    /// 围栏跨界至多涉及这两块）。做法：把既有区域按**所属块**（区域回到块 = 围栏开行/
+    /// 表头行，再经 `line_block` 稠密查）分类——窗口 `[edit_blk, edit_blk+2)` 内 → 丢弃、
+    /// 由新 doc 重算；窗口之前 → 原样保留（块内容/行号未变）；窗口之后 → 整行号平移
+    /// `line_delta`。序列仍按 src_line 升序（上方保留 < 窗口新派生 < 下方平移）。
+    /// 首建/整篇重置仍走 [`Self::rebuild_block_regions`]。
+    fn update_block_regions_after_edit(&mut self, edit_line: usize, line_delta: i64) {
+        use crate::markdown::parse::RowKind;
+        let doc = &self.doc;
+        let n = doc.block_count();
+        let span = |r: &BlockRegion| -> (usize, usize) {
+            match r {
+                BlockRegion::Code { lo, hi } => (*lo, *hi),
+                BlockRegion::Table { header, dlo, dhi } => (*header.min(dlo), *dhi),
+            }
+        };
+        let shift = |r: &BlockRegion, d: i64| -> BlockRegion {
+            let sh = |x: usize| (x as i64 + d).max(0) as usize;
+            match r {
+                BlockRegion::Code { lo, hi } => BlockRegion::Code {
+                    lo: sh(*lo),
+                    hi: sh(*hi),
+                },
+                BlockRegion::Table { header, dlo, dhi } => BlockRegion::Table {
+                    header: sh(*header),
+                    dlo: sh(*dlo),
+                    dhi: sh(*dhi),
+                },
+            }
+        };
+        // 1) 旧区域按**行号**分类（不查新 doc 块：编辑线下方的行号已平移，反查会错位）：
+        //    完全在编辑线上方 → 保留（内容/行号未变）；完全在下方 → 整行号平移；
+        //    跨编辑线（含编辑线）→ 只可能是被编辑块的区域 → 丢弃，交给 2) 重算。
+        let mut kept: Vec<BlockRegion> = Vec::with_capacity(self.block_regions.len());
+        for &r in &self.block_regions {
+            let (mn, mx) = span(&r);
+            if mx < edit_line {
+                kept.push(r);
+            } else if mn > edit_line {
+                kept.push(shift(&r, line_delta));
+            }
+            // else：跨编辑线 → 由窗口重算
+        }
+        // 2) 新 doc 重算受影响窗口块 [edit_blk, edit_blk+2)（Enter 分裂 / 删除合并 / 围栏
+        //    ——至多涉及编辑线所在块及其直接后继两 3 块）；块序升序，按首行插回排序序列。
+        let edit_blk = doc.block_index_for_line(edit_line).min(n.saturating_sub(1));
+        let win_hi = (edit_blk + 2).min(n);
+        for i in edit_blk..win_hi {
+            let Some(m) = doc.block_meta(i) else { continue };
+            let r = match m.kind {
+                RowKind::Code => {
+                    let lo = m.src_line as usize + 1;
+                    let hi = lo + m.aux.max(1) as usize - 1;
+                    BlockRegion::Code { lo, hi }
+                }
+                RowKind::Table => {
+                    let header = m.src_line as usize;
+                    let dlo = header + 2;
+                    let dhi = header + 1 + m.aux.max(1) as usize;
+                    BlockRegion::Table { header, dlo, dhi }
+                }
+                _ => continue,
+            };
+            let rl = span(&r).0;
+            let pos = kept.partition_point(|k| span(k).1 < rl);
+            kept.insert(pos, r);
+        }
+        self.block_regions = kept;
+    }
+
     /// `line` 所在的可编辑块区域（代码内容行 / 表格表头+数据行）。
     fn region_content(&self, line: usize) -> Option<BlockRegion> {
         self.block_regions.iter().copied().find(|r| match r {
@@ -3381,7 +3453,9 @@ impl WyEditor {
             if !self.shift_derived_after_edit(edit_line, line_delta) {
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
             }
-            self.rebuild_block_regions();
+            // B4：`block_regions` 增量更新（编辑线附近重算 + 其余平移），不再每键
+            // O(块数) 整表扫描（6MB/10 万块 debug ~5.9ms/键）。
+            self.update_block_regions_after_edit(edit_line, line_delta);
         } else {
             // 非结构性：代码/表格区域布局不变 → `block_regions` 复用，跳过
             // `rebuild_block_regions` 的 O(块数) 整表扫描（6MB/6 万块 debug ~2.3ms/键，

@@ -6201,3 +6201,68 @@ A-->B
             }
         });
     }
+
+    #[gpui::test]
+    fn update_block_regions_incremental_matches_full_rebuild(cx: &mut TestAppContext) {
+        // B4：结构编辑在多个上下文下，增量 `update_block_regions_after_edit` 产出的
+        // `block_regions` 必须与整表 `rebuild_block_regions`（`with_text` 全量路径）
+        // 完全一致——覆盖普通段落 Enter、表格内 Enter、围栏内容 Enter、内容删换行合并。
+        use crate::markdown::wysiwyg::BlockRegion;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = concat!(
+            "para before\n",
+            "| h | h |\n",
+            "|---|---|\n",
+            "| 1 | 2 |\n",
+            "| 3 | 4 |\n",
+            "para mid\n",
+            "```rust\n",
+            "let a = 1;\n",
+            "let b = 2;\n",
+            "```\n",
+            "para after\n",
+        );
+        let find = |needle: &str| text.find(needle).unwrap();
+        let cases: &[(usize, &str)] = &[
+            // (byte offset, 替换串)：插入 Enter / 删除换行（合并）
+            (find("para mid") + 4, "\n"),         // 普通段落内 Enter
+            (find("| 1 | 2 |") + 4, "\n"),        // 表格数据行内 Enter
+            (find("let a = 1;") + 4, "\n"),       // 围栏内容行内 Enter
+            (find("let a = 1;\nlet") + 9, ""),    // 围栏内容删换行（合并）
+            (find("| 3 | 4 |") + 4, ""),          // 表格内容删换行（合并）
+        ];
+        for &(at, rep) in cases {
+            let mut edited = String::from(text);
+            if rep.is_empty() {
+                edited.replace_range(at..at + 1, "");
+            } else {
+                edited.insert_str(at, rep);
+            }
+            // A：增量路径（replace_range 内部走 update_block_regions_after_edit）。
+            let (host_a, vcx) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+                WyHost { ed }
+            });
+            let _ = vcx;
+            host_a.update(cx, |w, cx| {
+                w.ed
+                    .update(cx, |ed2, ecx| ed2.replace_range(at..at + 1, rep, ecx));
+            });
+            // B：全量路径（with_text → rebuild_block_regions）。
+            let (host_b, vcx_b) = cx.add_window_view(|window, cx| {
+                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&edited));
+                WyHost { ed }
+            });
+            let _ = vcx_b;
+            let (inc_regions, full_regions): (Vec<BlockRegion>, Vec<BlockRegion>) =
+                cx.update(|cx| {
+                    let inc = host_a.read(cx).ed.read(cx).block_regions.clone();
+                    let full = host_b.read(cx).ed.read(cx).block_regions.clone();
+                    (inc, full)
+                });
+            assert_eq!(
+                inc_regions, full_regions,
+                "增量与全量 block_regions 不一致（at={at} rep={rep:?}）"
+            );
+        }
+    }

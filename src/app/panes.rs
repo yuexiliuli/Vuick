@@ -258,37 +258,12 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // A2：Markdown 右栏预览从 `MarkdownPreview`（元素树）切到统一组件 WyEditor
-        //（只读）——live-area 宿主滚动（复用 `set_host_scroll` / `prepare_font_zoom`）。
+        //（只读）——宿主滚动（复用 `set_host_scroll` / `prepare_font_zoom`）。宿主结构
+        // 对齐左栏活区 `render_live_area`（单一块容器 + `.overflow_hidden()` + 滚动容器/
+        // 叠层为直接子件），避免旧包裹（flex-row + 内层相对块）在 gpui 测量时为
+        // WyEditor 交替提供 definite 宽度（800↔388/440），导致帧缓存每键 ×7 重建。
         if self.md_wy_preview().is_some() {
-            let content = self.md_wy_host_children(window, cx);
-            return div()
-                .id("preview-pane")
-                .debug_selector(|| "preview-pane".into())
-                .flex()
-                .flex_row()
-                // grow = 预览区占宽比例
-                .flex_grow(grow)
-                .flex_shrink_1()
-                .flex_basis(px(0.))
-                .min_w(px(0.))
-                // 预览区也可接收文件拖放
-                .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
-                .on_drop(cx.listener(
-                    |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
-                        this.open_dropped_paths(paths, window, cx);
-                    },
-                ))
-                .child(
-                    div()
-                        .id("preview-md-wy")
-                        .debug_selector(|| "preview-md-wy".into())
-                        .flex_1()
-                        .min_w(px(0.))
-                        .bg(self.panel_bg())
-                        .relative()
-                        .children(content),
-                )
-                .into_any_element();
+            return self.md_wy_host_children(window, cx, false, grow);
         }
         // EPUB / PDF / 旧预览（元素树 MarkdownPreview）。
         let fs = self.font_size;
@@ -326,16 +301,19 @@ impl EditorApp {
             .into_any_element()
     }
 
-    /// A2：MD 右栏/全屏 WyEditor 预览宿主内容（三件套，放进调用方 `relative` 外框）：
-    /// 滚动容器 + 自绘纵向滚动条叠层 + Ctrl+滚轮缩放叠层。渲染期推进全局字号并做
-    /// **缩放视口锚定**（同左面板 `render_live_area`）：注入宿主滚动句柄 + 顶部内衬，
-    /// 推入当前视口顶部（元素局部 y），再 `prepare_font_zoom`——字号变化在 render 期
-    /// 按新字号重建帧并把锚点块精确位置写回 `ScrollHandle`。
+    /// A2：MD 右栏/全屏 WyEditor 预览宿主（对齐左栏活区 `render_live_area` 结构）：
+    /// 单一外层容器（`.overflow_hidden()`）+ 直接子件三件套（滚动容器 + 自绘纵向滚动条
+    /// 叠层 + Ctrl+滚轮缩放叠层）。渲染期推进全局字号并做**缩放视口锚定**（同左面板
+    /// `render_live_area`）：注入宿主滚动句柄 + 顶部内衬，推入当前视口顶部（元素局部
+    /// y），再 `prepare_font_zoom`——字号变化在 render 期按新字号重建帧并把锚点块精确
+    /// 位置写回 `ScrollHandle`。
     fn md_wy_host_children(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
+        fullscreen: bool,
+        grow: f32,
+    ) -> gpui::AnyElement {
         let ed = self.md_wy_preview().expect("调用方已判定走 WyEditor 预览");
         let fs = self.font_size;
         let vhand = self.tabs[self.active_tab].md_wy_vscroll.clone();
@@ -347,39 +325,70 @@ impl EditorApp {
         });
         let any = ed.clone().into_any_element();
         let text_color = self.text_primary();
-        vec![
-            div()
-                .id("md-wy-scroll")
-                .debug_selector(|| "md-wy-scroll".into())
-                .relative()
+        let scroll = div()
+            .id("md-wy-scroll")
+            .debug_selector(|| "md-wy-scroll".into())
+            .relative()
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&vhand)
+            .child(
+                div()
+                    .id("md-wy-body")
+                    .debug_selector(|| "md-wy-body".into())
+                    .w_full()
+                    .px(px(12.))
+                    .py(px(LIVE_BODY_PAD_Y))
+                    .text_size(px(fs))
+                    .text_color(text_color)
+                    .child(any),
+            );
+        let vscrollbar_overlay = div()
+            .id("md-wy-vscrollbar-overlay")
+            .debug_selector(|| "md-wy-vscrollbar-overlay".into())
+            .absolute()
+            .inset_0()
+            .child(
+                Scrollbar::vertical(&vhand)
+                    .mode(ScrollbarMode::Always)
+                    .viewport_from_layout(),
+            );
+        let zoom_overlay = Self::zoom_overlay(cx);
+        if fullscreen {
+            return div()
+                .id("fullscreen-preview")
+                .debug_selector(|| "fullscreen-preview".into())
                 .size_full()
-                .overflow_y_scroll()
-                .track_scroll(&vhand)
-                .child(
-                    div()
-                        .id("md-wy-body")
-                        .debug_selector(|| "md-wy-body".into())
-                        .w_full()
-                        .px(px(12.))
-                        .py(px(LIVE_BODY_PAD_Y))
-                        .text_size(px(fs))
-                        .text_color(text_color)
-                        .child(any),
-                )
-                .into_any_element(),
-            div()
-                .id("md-wy-vscrollbar-overlay")
-                .debug_selector(|| "md-wy-vscrollbar-overlay".into())
-                .absolute()
-                .inset_0()
-                .child(
-                    Scrollbar::vertical(&vhand)
-                        .mode(ScrollbarMode::Always)
-                        .viewport_from_layout(),
-                )
-                .into_any_element(),
-            Self::zoom_overlay(cx),
-        ]
+                .relative()
+                .bg(self.panel_bg())
+                .overflow_hidden()
+                .child(scroll)
+                .child(vscrollbar_overlay)
+                .child(zoom_overlay)
+                .into_any_element();
+        }
+        div()
+            .id("preview-md-wy")
+            .debug_selector(|| "preview-md-wy".into())
+            .relative()
+            // grow = 预览区占宽比例（与旧预览/左编辑区同为 flex 项：basis 0 + shrink 1）
+            .flex_grow(grow)
+            .flex_shrink_1()
+            .flex_basis(px(0.))
+            .min_w(px(0.))
+            .bg(self.panel_bg())
+            .overflow_hidden()
+            // 预览区也可接收文件拖放
+            .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
+            .on_drop(cx.listener(
+                |this: &mut EditorApp, paths: &ExternalPaths, window, cx| {
+                    this.open_dropped_paths(paths, window, cx);
+                },
+            ))
+            .child(scroll)
+            .child(vscrollbar_overlay)
+            .child(zoom_overlay)
+            .into_any_element()
     }
 
     /// 全屏预览（EPUB / PDF 阅读模式）：渲染占满整个内容区，不显示编辑区/分割线。
@@ -390,15 +399,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if self.md_wy_preview().is_some() {
-            let content = self.md_wy_host_children(window, cx);
-            return div()
-                .id("fullscreen-preview")
-                .debug_selector(|| "fullscreen-preview".into())
-                .size_full()
-                .relative()
-                .bg(self.panel_bg())
-                .children(content)
-                .into_any_element();
+            // A2：Markdown 全屏预览同样切统一组件 WyEditor（宿主滚动；结构与右栏同源）。
+            return self.md_wy_host_children(window, cx, true, 1.0);
         }
         // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
         let fs = self.font_size;
