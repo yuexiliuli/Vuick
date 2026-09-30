@@ -21,9 +21,16 @@
 //!   单元格排版，含对齐位移、渲染列↔源字节映射；图片行 = 图片盒 + 居中可编辑 alt
 //!   题注行，题注走与普通文本行同构的 `byte_map`/`wrapped`/`x_off`；导航跳过只读
 //!   围栏/分隔行，退格/删除有代码围栏、单元格、alt 起点/尾边界守卫，表格与图片
-//!   alt 内回车 no-op）。选区面板高亮已覆盖：普通文本行、代码内容行、表格单元格
+//! alt 内回车 no-op）。选区面板高亮已覆盖：普通文本行、代码内容行、表格单元格
 //!   （逐可见行 × 逐格与选区求交后按字形几何绘制）、图片题注行。仅作「预览编辑
 //!   测试」入口，验证「本项目流程能编辑 + 正确映射回源」。
+//!
+//! **#4 统一文档层（与预览合并）**：预览与 WYSIWYG 将合为一个组件（`editable` 门控
+//! 只读/可编辑，同一 `Doc` + 自绘管线）。跨管线基准（`bench_preview_vs_wy_readonly`）
+//! 已验证自绘滚动带 3.67ms/步 vs 预览元素树 6.71ms/步（release，真实 6.4MB 文档）——
+//! 合并方向滚动不劣反优。预览独有能力正逐个搬入：已搬**搜索跳转高亮**
+//! （[`Self::highlight_search`]，paint 复用选区几何画命中色；app 侧边栏搜索在统一
+//! 组件在场时同步高亮）。待搬：EPUB 阅读布局（标题居中/首行缩进/注记悬浮卡）。
 
 mod element;
 mod input;
@@ -375,6 +382,12 @@ pub struct WyEditor {
     sel_anchor: Option<usize>,
     /// 鼠标左键拖选进行中（on_mouse_move 延伸选区）。
     dragging: bool,
+    /// 预览独有能力「搜索跳转高亮」（自 [`MarkdownPreview::highlight_search`] 搬入）：
+    /// （源码行, 小写查询词）；`Some` 时 paint 只给该行中命中词的源区间画背景色，
+    /// [`crate::config::timing::HIGHLIGHT_MS`] 后自动消失（`highlight_seq` 防旧定时器误清）。
+    highlight_search: Option<(usize, String)>,
+    /// 高亮代序列号：每次发起/清除高亮 +1，定时器只清除同代高亮。
+    highlight_seq: u64,
     /// 代码块横向滚动偏移（px；键 = 代码块首源码行）。长代码行 nowrap 超宽时
     /// 由横向滚动条/拖动驱动（paint 平移 + 命中/光标/选区反向加回）。纯视图状态，
     /// 不写源码、不进撤销栈。
@@ -1006,6 +1019,8 @@ impl WyEditor {
             marked: None,
             sel_anchor: None,
             dragging: false,
+            highlight_search: None,
+            highlight_seq: 0,
             code_h_scroll: RefCell::new(std::collections::HashMap::new()),
             code_h_drag: RefCell::new(None),
             table_h_scroll: RefCell::new(std::collections::HashMap::new()),
@@ -1386,6 +1401,8 @@ impl WyEditor {
         self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
+        // 换源：搜索高亮行号/内容作废（同预览换源清高亮）。
+        self.clear_highlight();
         self.loaded = true;
     }
 
@@ -1557,6 +1574,47 @@ impl WyEditor {
         self.sel_anchor = Some(0);
         self.caret = self.len();
         *self.frame.borrow_mut() = None;
+    }
+
+    /* ---------- 搜索跳转高亮（预览独有能力，搬入统一组件） ---------- */
+
+    /// 搜索跳转后高亮「源码第 `line` 行」（0 基）内**第一个命中 `query` 的文本**，
+    /// 只给搜索词本身着色（不吃整行），[`crate::config::timing::HIGHLIGHT_MS`] 后
+    /// 自动消失（与 `MarkdownPreview::highlight_search` 同款语义）。对小程序否则
+    /// 仅登记状态，paint 逐个源区间在用搜索色调绘制（复用选区几何）。
+    pub fn highlight_search(&mut self, line: usize, query: &str, cx: &mut Context<Self>) {
+        self.highlight_search = Some((line, query.to_lowercase()));
+        self.highlight_seq = self.highlight_seq.wrapping_add(1);
+        let seq = self.highlight_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    crate::config::timing::HIGHLIGHT_MS,
+                ))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.highlight_seq == seq {
+                    view.highlight_search = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 清除搜索跳转高亮。
+    pub fn clear_highlight(&mut self) {
+        self.highlight_search = None;
+        self.highlight_seq = self.highlight_seq.wrapping_add(1);
+    }
+
+    /// 解析搜索高亮为**绝对源字节区间**（命中词在 `line` 源码内首次出现的字节范围）。
+    /// 无高亮 / 行内无命中返回 `None`。paint 与测试共用（区间语义同选区）。
+    pub(crate) fn search_highlight_range(&self) -> Option<std::ops::Range<usize>> {
+        let (line, query) = self.highlight_search.as_ref()?;
+        let text = self.line_text(*line);
+        let range = crate::markdown::view::find_text_range(&text, query)?;
+        Some(self.line_start(*line) + range.start..self.line_start(*line) + range.end)
     }
 
     /// 复制：写入平台剪贴板（由 `on_action(Copy)` 装配）。

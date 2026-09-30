@@ -928,21 +928,22 @@ pub(crate) fn editor_selection(editor: &gpui::Entity<WyEditor>, cx: &mut App) ->
 
 
 
-/// 选区高亮：对可编辑且与源选区相交的行，按字形几何逐可视行画半透明 accent 矩形。
+/// 选区高亮：对可编辑且与源选区相交的行，按字形几何逐可视行画 `hl` 背景矩形。
 /// 与光标共用 `x_off`/`lh`，因此引述缩进里的选中文字也高亮对齐。
 /// **表格**（`table_edit`）逐可见行 × 逐格与选区求交集后按格内字形几何高亮；
 /// **图片行**题注（alt）按 `text_y_off` 偏移到图片盒之下再高亮。
+/// `hl` 由调用方决定（普通选区 = 预览同款蓝；搜索跳转 = 琥珀/黄命中色）。
+#[allow(clippy::too_many_arguments)] // paint 图元：画布(editor/theme/f/window/cx) + 选区区间/背景色互为正交
 pub(crate) fn paint_selection(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
     theme: &WyTheme,
     f: &Frame,
     range: &Range<usize>,
+    hl: Hsla,
     window: &mut Window,
     cx: &mut App,
 ) {
-    // 选区背景统一用预览同款（`#4d6bfe` 蓝，暗 38% / 亮 26%），与右预览一致。
-    let hl = crate::markdown::view::selection_color(cx);
     let e = editor.read(cx);
     for r in &f.rows {
         // 表格：逐可见行 × 逐格，与选区求交 → 格内字形几何高亮（源码级复制/删除
@@ -1126,4 +1127,27 @@ pub(crate) fn paint_selection(
             });
         }
     }
+}
+
+/// 搜索跳转高亮（预览独有能力，搬入统一组件后由元素 paint 调用）：把 `WyEditor`
+/// 登记的搜索命中解析成**绝对源区间**，以「命中色」（暗琥珀 / 亮黄，与 preview
+/// `MarkdownPreview::compute_search_highlight` 同款）复用 [`paint_selection`] 的
+/// 几何（文本行 / 代码 / 表格单元格全覆盖）绘制。仅命中词着色、不吃整行。
+pub(crate) fn paint_search_highlight(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(range) = editor.read(cx).search_highlight_range() else {
+        return;
+    };
+    let hl: Hsla = if crate::ui::theme::Theme::global(cx).is_dark() {
+        gpui::rgba(0xf59e0b47).into()
+    } else {
+        gpui::rgba(0xfef08a8c).into()
+    };
+    paint_selection(editor, origin, theme, f, &range, hl, window, cx);
 }

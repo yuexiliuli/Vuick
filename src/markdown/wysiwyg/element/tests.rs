@@ -2061,6 +2061,76 @@ tail
     }
 
     #[gpui::test]
+    fn wy_search_highlight_resolves_query_range(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        // 预览独有能力搬入统一组件：`highlight_search(line, query)` → 命中的绝对源区间。
+        let text = "alpha beta\ngamma delta\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                // 命中第 0 行 "beta"（源字节 6..10），大小写不敏感（内部小写化）。
+                e.highlight_search(0, "BETA", cx);
+                assert_eq!(e.search_highlight_range(), Some(6..10), "命中词应解析为绝对源区间");
+                // 行内无命中 → None。
+                e.highlight_search(0, "zzz", cx);
+                assert_eq!(e.search_highlight_range(), None, "行内无命中 → None");
+                // 清除 → 无高亮。
+                e.highlight_search(0, "beta", cx);
+                assert_eq!(e.search_highlight_range(), Some(6..10));
+                e.clear_highlight();
+                assert_eq!(e.search_highlight_range(), None, "清除后应无高亮");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn wy_search_highlight_cleared_on_source_change(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("alpha beta\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| {
+                e.highlight_search(0, "beta", cx);
+                assert_eq!(e.search_highlight_range(), Some(6..10));
+                // 换源（如打开另一文件）→ 高亮清空。
+                e.set_source_text("gamma delta\n");
+                assert_eq!(e.search_highlight_range(), None, "换源应清高亮");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn wy_search_highlight_paints_without_panic(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "alpha beta\ncode block\n| A | beta |\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| e.highlight_search(0, "beta", cx));
+            // 带高亮状态注入帧并触发真实绘制（paint_search_highlight 走选区几何，
+            // 表格/文本分支均不 panic）。
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            ed.update(cx, |e, _| {
+                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+            });
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
     fn table_arrow_nav_skips_delimiter(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
         let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n尾\n";

@@ -760,6 +760,13 @@ impl EditorApp {
                                     v.highlight_search(li, &q_owned, cx);
                                 });
                             }
+                            // 统一组件（live2 WYSIWYG）也在场时：命中文本同步高亮
+                            // （预览独有能力搬入 `WyEditor::highlight_search`，同款语义）。
+                            if let Some(l2) = tab.live2.clone() {
+                                l2.update(cx, |v, cx| {
+                                    v.highlight_search(li, &q_owned, cx);
+                                });
+                            }
                             let ed = tab.editor.clone();
                             ed.update(cx, |ed, cx| {
                                 // 先落光标（滚动到该行），再选中命中文本作为高亮

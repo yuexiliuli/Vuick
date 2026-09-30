@@ -2608,6 +2608,174 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         crate::prof::dump("preview.edit.sync");
     }
 
+    /// 基准（--ignored）：**合并决策的跨管线对比**——同一个大文档（真实 6.4MB，
+    /// 窗口模式）上，`MarkdownPreview`（元素树 + ListState）vs `WyEditor` 只读等价
+    /// 渲染（自绘 build_frame 带内整形）的「首帧 / 滚动重定位」成本。
+    /// 目的（#4 统一文档层）：证明把预览迁到 WYSIWYG 自绘管线（`editable` 门控只读态）
+    /// 后，只读查看的打开/滚动不劣于旧预览元素树；给合并的每一步提供 before/after 锚点。
+    /// `scan_blocks_rope` 只作索引构建参照。打印、不断言；`--ignored` 运行。
+    #[gpui::test]
+    #[ignore]
+    fn bench_preview_vs_wy_readonly(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::{WyEditor, build_frame};
+        use std::time::Instant;
+        crate::prof::enable();
+        cx.update(crate::actions::bind_local_keymaps);
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[bench] skip realfile: {e}");
+                return;
+            }
+        };
+        let rope0 = ropey::Rope::from_str(&text);
+        let t_scan = Instant::now();
+        let idx0 = std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope0));
+        let scan_ms = t_scan.elapsed().as_secs_f64() * 1000.0;
+
+        struct DualHost {
+            md: Entity<MarkdownPreview>,
+            wy: Entity<WyEditor>,
+        }
+        impl Render for DualHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.md.clone()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let md = cx.new(|cx| MarkdownPreview::new(cx));
+            // WYSIWYG 用同步装配（小文档/测试路径）：本基准只关心 build_frame 的
+            // 整形/滚动成本，索引已由 `set_source_text` 现建，口径与预览同源。
+            let wy = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            DualHost { md, wy }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let p = vcx.update(|_w, cx| Rc::new(StyleParams::from_theme_with_font(cx, None)));
+        let wy = vcx.update(|_, cx| host.read(cx).wy.clone());
+        // —— Preview（元素树）首窗：紧接 set_source（未 resize/未 settle），冷物化
+        //    首个窗口 + 高度模型——否则 settle 期间真实渲染已建成缓存，测不到冷首帧。
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |m, cx| {
+                m.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope0), idx0, cx)
+            });
+        });
+        let preview_first_ms = vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |m, cx| {
+                let t0 = Instant::now();
+                m.prepare_render(&p, 980.0, cx);
+                t0.elapsed().as_secs_f64() * 1000.0
+            })
+        });
+        vcx.simulate_resize(size(px(980.), px(760.)));
+        settle(vcx);
+        let n_items = vcx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+        assert!(
+            n_items > crate::config::limits::WINDOWED_MIN_BLOCKS,
+            "需窗口模式（块数 {n_items}）"
+        );
+
+        // —— Preview（元素树）滚动重定位——
+        let n = 24usize;
+        let t0 = Instant::now();
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |m, cx| {
+                let total = m.total_h();
+                for i in 0..n {
+                    let target = total * (i as f32 + 1.0) / (n as f32 + 1.0);
+                    m.desired_scroll.set(target);
+                    m.prepare_render(&p, 980.0, cx);
+                }
+            });
+        });
+        let preview_scroll_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+        // —— WyEditor（自绘 build_frame）——
+        let wy_first_ms = vcx.update(|window, cx| {
+            // 首屏可视带（≈ 预览的初始窗口），不算全篇。
+            let t0 = Instant::now();
+            let _f = build_frame(wy.read(cx), window, px(980.), (0., 2048.));
+            t0.elapsed().as_secs_f64() * 1000.0
+        });
+        let wy_full_ms = vcx.update(|window, cx| {
+            // 全篇一次性整形（对照参考；预览不这样做）。
+            let t0 = Instant::now();
+            let f = build_frame(wy.read(cx), window, px(980.), (0., 999_999.));
+            let total = f32::from(f.total);
+            let _ = total;
+            t0.elapsed().as_secs_f64() * 1000.0
+        });
+        let wy_scroll_ms = vcx.update(|window, cx| {
+            let total = f32::from(build_frame(wy.read(cx), window, px(980.), (0., 999_999.)).total);
+            let t0 = Instant::now();
+            for i in 0..n {
+                let lo = total * (i as f32 + 1.0) / (n as f32 + 2.0);
+                let _f = build_frame(wy.read(cx), window, px(980.), (lo, lo + 1024.));
+            }
+            t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        });
+
+        eprintln!(
+            "[bench] 只读查看对比（{} 块 / 窗口模式，真实大文档，{n} 步滚动）：\n  \
+             索引构建(scan_blocks_rope) 参照 {scan_ms:.2}ms\n  \
+             Preview(元素树): 首帧 {preview_first_ms:.2}ms、滚动重定位 {preview_scroll_ms:.2}ms/步\n  \
+             WyEditor(自绘):  首屏带 {wy_first_ms:.2}ms、全篇整形 {wy_full_ms:.2}ms、滚动带 {wy_scroll_ms:.2}ms/步",
+            n_items
+        );
+        crate::prof::dump("preview.vs.wy.readonly");
+    }
+
+    /// 基准（--ignored）：**新搬入功能（搜索跳转高亮）的逐帧代价 A/B**——同一注入帧，
+    /// 无高亮 vs 有高亮各 `window.draw` N 帧，取差 = `paint_search_highlight` 的每帧
+    /// 开销（仅命中时存在）。量化「合并 + 搬运」相对改动前多出的真实成本。`--ignored` 运行。
+    #[gpui::test]
+    #[ignore]
+    fn bench_wy_search_highlight_paint_cost(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        use std::time::Instant;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "alpha beta 中文命中 beta again\nsecond line here\n";
+        struct WyOnlyHost {
+            ed: Entity<WyEditor>,
+        }
+        impl Render for WyOnlyHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.ed.clone()
+            }
+        }
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyOnlyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        // 不注入帧：让元素在绘制时自建（小文档很快），A/B 两侧完全同口径，
+        // 差值只含 `paint_search_highlight`（命中分支）的增量。
+        let n = 16usize;
+        let t_no = vcx.update(|window, cx| {
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = window.draw(cx);
+            }
+            t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        });
+        let t_hl = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, cx| e.highlight_search(0, "beta", cx));
+            let t0 = Instant::now();
+            for _ in 0..n {
+                let _ = window.draw(cx);
+            }
+            t0.elapsed().as_secs_f64() * 1000.0 / n as f64
+        });
+        eprintln!(
+            "[bench] WyEditor 每帧绘制（{n} 帧均摊）：无高亮 {t_no:.4}ms、搜索高亮命中 {t_hl:.4}ms、增量 Δ{:.4}ms/帧",
+            (t_hl - t_no).max(0.0)
+        );
+    }
+
 
 
 

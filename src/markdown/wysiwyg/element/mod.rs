@@ -815,9 +815,12 @@ impl Element for WyEditorElement {
             window.set_cursor_style(CursorStyle::PointingHand, hb);
         }
         // 选区高亮（可编辑行与源选区相交的部分，按字形几何逐个 WrappedLine 画）。
+        // 搜索跳转高亮（预览独有能力，搬入统一组件）：命中 → 以命中色复用同一几何。
+        let hl = crate::markdown::view::selection_color(cx);
         if let Some(range) = editor_selection(&self.editor, cx) {
-            paint_selection(&self.editor, origin, &theme, f, &range, window, cx);
+            paint_selection(&self.editor, origin, &theme, f, &range, hl, window, cx);
         }
+        paint_search_highlight(&self.editor, origin, &theme, f, window, cx);
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);

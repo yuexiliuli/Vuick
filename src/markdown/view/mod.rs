@@ -2309,7 +2309,9 @@ fn note_card(text: SharedString, _at: Point<Pixels>, cx: &App) -> gpui::AnyEleme
 
 /// 在 `text` 内查找第一个忽略大小写命中小写 `needle` 的字节区间；未命中返回 `None`。
 /// 用于搜索跳转为命中**文本**着色（非整行）。
-fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+/// `text` 内 `needle`（须已小写）**首次**出现的字节区间（逐字符取等长候选小写比较，
+/// 正确处理 UTF-8 多字节）。WYSIWYG 搜索跳转高亮（`WyEditor`）与预览共用。
+pub(crate) fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Range<usize>> {
     let needle_chars = needle.chars().count();
     if needle_chars == 0 {
         return None;
