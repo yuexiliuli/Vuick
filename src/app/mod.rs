@@ -483,6 +483,21 @@ impl EditorApp {
         if let Some((s, oe, ne)) = dirty_range {
             let tab = &mut self.tabs[tab_ix];
             tab.preview_dirty = merge_preview_dirty(tab.preview_dirty, s, oe, ne);
+            // A3 逐键增量桥：右栏 WyEditor 预览（若该选项卡有）重放**同一次**编辑
+            // （src 字节区间 `[s, oe)` → 编辑后新文本 `[s, ne)`），走 WyEditor 增量管线
+            //（Doc::edit + Pass1 + derived），大文档每键 ≈0.4ms——预览恒等于编辑区。
+            if let Some(wy) = tab.md_wy.clone() {
+                let ed = tab.editor.clone();
+                let new_text = ed.read(cx).rope().slice(s..ne).to_string();
+                if wy.read(cx).is_loaded() {
+                    wy.update(cx, |w, cx| w.preview_apply_edit(s..oe, &new_text, cx));
+                } else {
+                    // 自愈：异步装配尚未完成用户已编辑 → 一次性从当前编辑区全文补齐
+                    //（O(n) 仅此一次），此后退化到逐键增量（防空壳上重放错位）。
+                    let full = ed.read(cx).value().to_string();
+                    wy.update(cx, |w, _cx| w.set_source_text(&full));
+                }
+            }
         }
         // 行/字/光标走 CodeEditor 的 O(1) 计数，不再每键物化全文。
         // 行数用显示语义（`str::lines()` 口径，与文件打开/状态栏一致），
@@ -1230,6 +1245,11 @@ impl EditorApp {
         tab.char_count = n_chars;
         tab.editor.update(cx, |ed, _| ed.set_text(&content));
         tab.md_preview.update(cx, |v, cx| v.set_source(&content, cx));
+        // A2/A3：右栏 WyEditor 预览（若存在）随 WYSIWYG 写回全量刷新——
+        // 写回是整篇替换（非 Change 轨迹），增量桥不会替它补，这里一次性对正源。
+        if let Some(wy) = tab.md_wy.clone() {
+            wy.update(cx, |w, _cx| w.set_source_text(&content));
+        }
         self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
         self.status_ok = true;
     }

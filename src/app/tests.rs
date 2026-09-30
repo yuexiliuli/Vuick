@@ -1255,6 +1255,181 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// A3：逐键增量桥——编辑区每次编辑（Paste 触发 Change）都重放到右栏 WyEditor 预览，
+    /// 预览文本恒等于编辑区文本（实时跟随，非重装）。
+    #[gpui::test]
+    async fn md_wy_preview_follows_editor_edits_incrementally(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-mdwy-bridge-{}.md", std::process::id()));
+        std::fs::write(&p, "# 初始标题\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let par = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                (
+                    t.md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).text().to_string())
+                        .unwrap_or_default(),
+                    t.editor.read(cx).value().to_string(),
+                )
+            })
+        };
+        let (m0, e0) = par(cx);
+        assert_eq!(m0, e0, "初始预览应与编辑区一致");
+
+        // 聚焦编辑区 + 粘贴 → Change → 增量桥重放。
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("新增段落".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..20 {
+            cx.run_until_parked();
+        }
+        let (m1, e1) = par(cx);
+        assert_eq!(m1, e1, "粘贴后预览应实时跟随编辑区，md_wy={m1:?} editor={e1:?}");
+        assert!(m1.contains("新增段落"), "预览应含新贴入文本，实际 {m1:?}");
+
+        // 再贴一次 → 仍保持一致。
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("第二处".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..20 {
+            cx.run_until_parked();
+        }
+        let (m2, e2) = par(cx);
+        assert_eq!(m2, e2, "连续多次编辑后预览仍应与编辑区一致");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A3：增量桥随撤销/重做的逆编辑同步回退/重放——预览在每一步都与编辑区一致。
+    #[gpui::test]
+    async fn md_wy_preview_follows_editor_undo_and_redo(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-mdwy-undoredo-{}.md", std::process::id()));
+        std::fs::write(&p, "一行\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("X".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..20 {
+            cx.run_until_parked();
+        }
+        let md_text = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                a.tabs[a.active_tab]
+                    .md_wy
+                    .clone()
+                    .expect("应有 md_wy")
+                    .read(cx)
+                    .text()
+                    .to_string()
+            })
+        };
+        let ed_text = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.read(cx).value().to_string())
+        };
+        assert!(ed_text(cx).contains('X'), "基线：粘贴生效");
+        assert_eq!(md_text(cx), ed_text(cx), "粘贴后预览应含 X");
+
+        // 撤销：editor 与 md_wy 同步回退到无 X。
+        cx.dispatch_action(Undo);
+        for _ in 0..20 {
+            cx.run_until_parked();
+        }
+        assert!(!ed_text(cx).contains('X'), "撤销后编辑区不含 X");
+        assert_eq!(md_text(cx), ed_text(cx), "撤销后预览应与编辑区一致（同步回退）");
+
+        // 重做：同步恢复 X。
+        cx.dispatch_action(Redo);
+        for _ in 0..20 {
+            cx.run_until_parked();
+        }
+        assert!(ed_text(cx).contains('X'), "重做后编辑区含 X");
+        assert_eq!(md_text(cx), ed_text(cx), "重做后预览应与编辑区一致（同步恢复）");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A3：混合编辑（粘贴 + 换行结构变更 + 再次粘贴）后预览仍与编辑区逐字节一致——
+    /// 增量桥走 `Doc::edit` 结构/非结构两路都必须对齐。
+    #[gpui::test]
+    async fn md_wy_preview_bridge_parity_after_mixed_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-mdwy-mix-{}.md", std::process::id()));
+        std::fs::write(&p, "- 项目 A\n- 项目 B\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        let par = |cx: &mut VisualTestContext| {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                (
+                    t.md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).text().to_string())
+                        .unwrap_or_default(),
+                    t.editor.read(cx).value().to_string(),
+                )
+            })
+        };
+        // 粘贴（普通插入）→ 换行（结构变更）→ 粘贴（再次普通插入）。
+        for clip in ["追加甲", "\n", "追加乙"] {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(clip.to_string()));
+            cx.dispatch_action(Paste);
+            for _ in 0..20 {
+                cx.run_until_parked();
+            }
+            let (m, e) = par(cx);
+            assert_eq!(m, e, "混合编辑后预览仍应与编辑区逐字节一致，editor={e:?} md_wy={m:?}");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// Markdown 编辑区与预览区默认/始终自动换行，不提供切换 → 状态栏隐藏「换行/不换行」按钮；
     /// 普通文本文件仍保留该切换按钮。
     #[gpui::test]
@@ -3809,6 +3984,109 @@
             );
         }
         println!("【C. 前 3 次 refresh 合计】 {} ms", tb.elapsed().as_millis());
+    }
+
+    /// A3 基准（ignored，release）：大文档「增量桥」的真实成本拆解（真实 6.4MB / 139k 行）：
+    /// 1. 桥模型成本 = 直接对装配好的 WyEditor 逐键 `preview_apply_edit`（= undo/redo 的
+    ///    `apply_raw_edit` 增量管线：Doc::edit + Pass1 + derived + 单块作废），应亚毫秒；
+    /// 2. 真实逐键路径（Paste → insert_edit → Edited → 桥）200 键后预览必须与编辑区
+    ///    逐字节一致（正确性；墙钟含旧的 md_preview 后台重索引 headless 等待，不作断言）。
+    /// 运行：`cargo test --release -- --ignored bench_a3_incremental_bridge_per_key --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_a3_incremental_bridge_per_key(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = r"fixtures/大文档测试2.md";
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p, window, cx));
+        });
+        let mut wy_ready = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            wy_ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                a.tabs[i]
+                    .md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if wy_ready {
+                break;
+            }
+        }
+        assert!(wy_ready, "md_wy 应装配完成（大文档异步 install）");
+        const N: usize = 200;
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("啊".to_string()));
+        let t_real = std::time::Instant::now();
+        for _ in 0..N {
+            cx.dispatch_action(Paste);
+            // 只推到桥应用前后（不等后台 md_preview 重索引——那会混入旧管线头等待）。
+            for _ in 0..3 {
+                cx.run_until_parked();
+            }
+        }
+        let real_total_ms = t_real.elapsed().as_millis();
+        // 真实逐键路径一致性：预览必须恒等于编辑区（增量桥正确性）。
+        let (m, e) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                t.editor.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(m, e, "{N} 键后预览应仍与编辑区逐字节一致");
+        // 隔离测量桥模型成本（独立 WyEditor 副本，绝不污染已对齐的 md_wy）：
+        // ⚠️ 循环内不读 `text()`（O(n) 物化）；用 O(1) `len()` 取初始长后自行推进。
+        let scratch = cx.update(|window, cx| {
+            let rope = app.read(cx).tabs[app.read(cx).active_tab]
+                .editor
+                .read(cx)
+                .rope()
+                .clone();
+            let s = cx.new(|cx| WyEditor::new(window, cx));
+            s.update(cx, |w, _cx| {
+                w.install_open(crate::markdown::wysiwyg::WyEditor::open_from_rope(rope))
+            });
+            s
+        });
+        let start_len = cx.update(|_w, cx| scratch.read(cx).len());
+        let model_ms = cx
+            .update(|_w, cx| {
+                let t = std::time::Instant::now();
+                let mut at = start_len;
+                for _ in 0..200 {
+                    scratch.update(cx, |w, cx| w.preview_apply_edit(at..at, "啊", cx));
+                    at += 3; // "啊" 3 字节
+                }
+                t.elapsed()
+            })
+            .as_millis();
+        println!(
+            "【桥模型成本】 200 次 preview_apply_edit 合计 {model_ms} ms ≈ {:.3} ms/键",
+            model_ms as f64 / 200.0
+        );
+        println!(
+            "【真实逐键路径】 {N} 键合计 {real_total_ms} ms（含编辑器/帧/旧 md_preview 后台，不作断言）"
+        );
+        assert!(
+            model_ms as f64 / 200.0 < 2.0,
+            "桥模型成本应亚毫秒/键（6.4MB/139k 行，实际 {model_ms} ms/200 键）"
+        );
     }
 
     /// 基准：用编辑器本体追加同一段文本 1000 次所需耗时。

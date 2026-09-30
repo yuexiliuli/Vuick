@@ -3488,6 +3488,22 @@ impl WyEditor {
         self.last_edit = None;
     }
 
+    /// A3：只读右栏预览的**增量桥**——把左栏源码编辑区同一次增删（`CodeEditor::take_last_edit`
+    /// 的 `(start, old_end, head)` 轨迹）重放过来。复用 undo/redo 的增量管线
+    /// `apply_raw_edit`（`Doc::edit` 增量块扫描 + Pass1 三段式 + derived 小修补 + 单块整形
+    /// 作废），**不写撤销栈**（预览不参与撤销）、光标保持原位（只读光标不可见勿动）、
+    /// **绕过 `editable` 门控**（桥是宿主同步写，非用户编辑；用户的一切编辑入口仍被 A1
+    /// 短路）。同步保持：装配源与编辑区同源，此后逐键重放 → 预览恒等于编辑区文本。
+    pub fn preview_apply_edit(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let len = self.len();
+        let r = range.start.min(len)..range.end.min(len);
+        if r.start == r.end && text.is_empty() {
+            return;
+        }
+        let cur = self.caret;
+        self.apply_raw_edit(r, text, cur, cx);
+    }
+
     /// 撤销/重做共用增量编辑：与 `replace_range` 完全同款（`Doc::edit` 增量块扫描 +
     /// Pass1 三段式重估 + derived 小修补 + 单块整形作废 + 结构判定），**唯二区别**：
     /// 不写撤销单元（本调用由 undo/redo 发起）、光标按目标位放置。UndoUnit 的

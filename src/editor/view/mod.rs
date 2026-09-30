@@ -2274,15 +2274,17 @@ impl CodeEditor {
             self.row_count = self.buffer.line_count().max(1);
             self.folds.sync_edit(la, lb, &edit.old_text, self.row_count);
         }
-        // 撤销整组：dirty 用覆盖所有编辑的最小−最大区间（bounding box，保守）
-        if let (Some(a), Some(b)) = (
+        // 撤销整组：dirty 用覆盖所有编辑的最小−最大区间（bounding box，保守）。
+        // 撤销把「已插入的新文本」替换回「旧文本」：被替换区（撤销前坐标）
+        // = min start .. max(start + new_text.len)，恢复文本末 = start + 恢复字节和
+        // （旧实现误用 old_text.len 当被替换区长 → 纯插入的撤销得到零宽 (a,a,a)，
+        // App 增量桥/预览同步在撤销时收不到正确区间）。
+        if let (Some(a), Some(oe)) = (
             tx.edits.iter().map(|e| e.start).min(),
-            tx.edits
-                .iter()
-                .map(|e| e.start + e.old_text.len())
-                .max(),
+            tx.edits.iter().map(|e| e.start + e.new_text.len()).max(),
         ) {
-            self.last_edit = Some((a, b, a));
+            let restored = tx.edits.iter().map(|e| e.old_text.len()).sum::<usize>();
+            self.last_edit = Some((a, oe, a + restored));
         }
         self.selection = Selection::from_range(tx.before.0, tx.before.1);
         self.resync_list(true);
@@ -2307,14 +2309,19 @@ impl CodeEditor {
             self.row_count = self.buffer.line_count().max(1);
             self.folds.sync_edit(la, lb, &edit.new_text, self.row_count);
         }
-        if let (Some(a), Some(b)) = (
+        // 重做整组：把「旧文本」重新替换回「新文本」。被替换区（重做前坐标）
+        // = min start .. max(start + old_text.len)，新文本末 = start + 新文本字节和。
+        // （与撤销同款修正：旧实现误用 new_text.len 当被替换区，交叉删除/粘贴的重做
+        // 同样给不出正确区间。）
+        if let (Some(a), Some(oe)) = (
             tx.edits.iter().map(|e| e.start).min(),
             tx.edits
                 .iter()
-                .map(|e| e.start + e.new_text.len())
+                .map(|e| e.start + e.old_text.len())
                 .max(),
         ) {
-            self.last_edit = Some((a, a, b));
+            let inserted = tx.edits.iter().map(|e| e.new_text.len()).sum::<usize>();
+            self.last_edit = Some((a, oe, a + inserted));
         }
         self.selection = Selection::from_range(tx.after.0, tx.after.1);
         self.resync_list(true);
