@@ -301,15 +301,24 @@ pub struct WyEditor {
     struct_old_end_line: Cell<usize>,
     /// 编辑的源行净增（插入换行数 − 被删换行数）：尾部块 src_line 整体平移量。
     struct_line_delta: Cell<i64>,
+    /// 结构性编辑被编辑块的**旧块下标**（编辑前）与**块数净增**（编辑后 − 编辑前）：
+    /// `fold_plan` deltas 增量平移用（块下标 ≥ 旧块下标之后整体 + 块数净增）。
+    struct_blk_old: Cell<usize>,
+    struct_blk_span_delta: Cell<i64>,
+    /// 结构性编辑待消费标志：结构性分支置位、`fold_plan` 消费后清除——防止增量平移
+    /// 误用陈旧编辑信息（非结构编辑/宽度变化恰在结构编辑之后、其间无重建时）。
+    struct_edit_pending: Cell<bool>,
     /// 内容**派生版本**——`derived()` 缓存键：结构性编辑、编辑行 region 签名变化才
     /// 递增；纯文本键入（非结构、签名不变、不在数学块内）不递增 → `derived` Rc
     /// 跨键复用，不再每键对全篇 `math_regions`/`alert_*` 重扫（7MB/结构密集文档
     /// 「输入卡死」的主因，旧实现每键 2 次全篇扫描 ≈1s）。
     regions_ver: Cell<u64>,
-    /// 折叠/重排计划缓存：`(key, Rc<FoldPlan>)`——与可视带无关（内容、caret reveal、
-    /// 数学就绪、宽度、结构版本决定），滚动/带移动复用；build_frame 每档不再重建
-    /// ~万行 Hash 集合 + 逐块二分（大文档滚动「卡顿明显」：~40ms/档）。
-    fold_plan: RefCell<Option<(u64, Rc<element::FoldPlan>)>>,
+    /// 折叠/重排计划缓存：`(key, marker_key, Rc<FoldPlan>)`——与可视带无关（内容、caret
+    /// reveal、数学就绪、宽度、结构版本决定），滚动/带移动复用；build_frame 每档不再
+    /// 重建 ~万行 Hash 集合 + 逐块二分（大文档滚动「卡顿明显」：~40ms/档）。
+    /// `marker_key` = regions_ver^mgen^fold_ver：marker 身份在结构编辑间未变 → deltas
+    /// 可增量平移复用（`fold_plan_incremental`）。
+    fold_plan: RefCell<Option<(u64, u64, Rc<element::FoldPlan>)>>,
     /// 标题折叠视图态版本：`toggle_heading_fold_at_line` 翻转 `folded_headings` 时递增
     /// （纳入 `fold_plan` 缓存键，滚动不带折叠态重算）。
     fold_ver: Cell<u64>,
@@ -975,6 +984,9 @@ impl WyEditor {
             struct_dirty_line: Cell::new(0),
             struct_old_end_line: Cell::new(0),
             struct_line_delta: Cell::new(0),
+            struct_blk_old: Cell::new(0),
+            struct_blk_span_delta: Cell::new(0),
+            struct_edit_pending: Cell::new(false),
             regions_ver: Cell::new(0),
             fold_ver: Cell::new(0),
             fold_plan: RefCell::new(None),
@@ -1477,6 +1489,9 @@ impl WyEditor {
         self.struct_dirty_line.set(0);
         self.struct_old_end_line.set(0);
         self.struct_line_delta.set(0);
+        self.struct_blk_old.set(0);
+        self.struct_blk_span_delta.set(0);
+        self.struct_edit_pending.set(false);
         self.math_line_map.borrow_mut().clear();
         // 换源：行的 src_line 全变 → 行内公式→行的登记作废（重新 claim 时再登记）。
         self.inline_math_rows.borrow_mut().clear();
@@ -2270,7 +2285,7 @@ impl WyEditor {
     /// 当前缓存的折叠计划 Rc（滚动预热读取同一份带无关缓存；测试断言「仅移动光标/
     /// 纯文本键入不重建折叠计划」也用它）。
     pub(crate) fn fold_plan_rc(&self) -> Option<Rc<element::FoldPlan>> {
-        self.fold_plan.borrow().as_ref().map(|(_, p)| p.clone())
+        self.fold_plan.borrow().as_ref().map(|(_, _, p)| p.clone())
     }
 
     /// 取走待修补（重估高度）的块下标（编辑后一帧用；无则 None）。
@@ -2356,18 +2371,25 @@ impl WyEditor {
         epoch: u64,
         mgen: u64,
     ) -> Rc<element::FoldPlan> {
+        let regions_ver = self.regions_ver();
+        let fold_ver = self.fold_ver();
         let key = epoch
-            ^ self
-                .regions_ver()
-                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ regions_ver.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-            ^ self.fold_ver().wrapping_mul(0x517C_C1B7_2722_0A95);
-        if let Some((k, p)) = &*self.fold_plan.borrow()
+            ^ fold_ver.wrapping_mul(0x517C_C1B7_2722_0A95);
+        // marker 身份（不含结构代）：结构编辑后 marker 集合未变 → deltas 可平移复用。
+        let marker_key = regions_ver.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+            ^ fold_ver.wrapping_mul(0x517C_C1B7_2722_0A95);
+        if let Some((k, _m, p)) = &*self.fold_plan.borrow()
             && *k == key {
                 return p.clone();
             }
         let derived = self.derived();
-        {
+        // ———（一）marker 集合：从已增量平移的 `derived` 重建（O(#区域)；math/alert 区域
+        // 在 `update_derived_after_edit` 已行号平移，marker 无需再平移）。标题折叠态仅在
+        // 有折叠时才全文扫描。
+        let (math_start, math_body, fold_lines, fold_bodies) = {
             let d = derived.borrow();
             let math_regions = &d.math_regions;
             // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
@@ -2385,7 +2407,6 @@ impl WyEditor {
                 math_start.insert(reg.range.start, idx);
                 math_body.extend(reg.range.start + 1..reg.range.end);
             }
-            // 可折叠 callout（`> [!NOTE]-`）：body 行折叠成 0 高；记录 body 区间供 reveal。
             let mut fold_lines: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
             let mut fold_bodies: Vec<Range<usize>> = Vec::new();
             for (rnge, folded) in &d.alert_fold_regions {
@@ -2396,10 +2417,8 @@ impl WyEditor {
                 fold_lines.extend(rnge.start + 1..rnge.end);
             }
             crate::prof::end("wy.fp.sets", _t_sets);
-            // 标题折叠（视图本地状态）——仅在有折叠态时才需要全文扫描（纯文本/未折叠
-            // 时跳过 `text_shared` 的 O(n) 复制）。
+            let _t_head = crate::prof::begin();
             {
-                let _t_head = crate::prof::begin();
                 let folded = self.folded_headings.borrow();
                 if !folded.is_empty() {
                     let content = self.doc.text_shared();
@@ -2408,57 +2427,193 @@ impl WyEditor {
                         fold_lines.extend(rnge.start + 1..rnge.end);
                     }
                 }
-                crate::prof::end("wy.fp.head", _t_head);
             }
-            // 动态高度覆盖（折叠 body→0 高、数学卡片→卡高）。
-            // 用「命中标记 + 块值」双数组替代 FxHashMap+排序：块下标 ∈ [0,n)，填表
-            // O(1)、尾随按 0..n 升序扫出——免 30k 项 (ix,Δ) 全排序（实测 fp.tail
-            // debug ~14ms → O(n) 扫 ~1ms）。`or_insert` 语义保留：math_start 仅当块
-            // 未被 fold/math_body 标记时置卡高（fold/math_body 同为 -height，先置即赢）。
-            let _t_dyn = crate::prof::begin();
-            let base_br = base.borrow();
-            let nb = base_br.n();
-            let mut marked: Vec<bool> = vec![false; nb];
-            let mut vals: Vec<f32> = vec![0.0; nb];
-            for &srcline in fold_lines.iter() {
-                let ix = base_br.block_for_line(srcline);
-                marked[ix] = true;
-                vals[ix] = -base_br.height(ix);
-            }
-            for &srcline in math_body.iter() {
-                let ix = base_br.block_for_line(srcline);
-                marked[ix] = true;
-                vals[ix] = -base_br.height(ix);
-            }
-            for (&srcline, &ridx) in math_start.iter() {
-                let ix = base_br.block_for_line(srcline);
-                if !marked[ix] {
-                    let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
-                    marked[ix] = true;
-                    vals[ix] = card_h - base_br.height(ix);
-                }
-            }
-            crate::prof::end("wy.fp.dyn", _t_dyn);
-            let _t_tail = crate::prof::begin();
-            let mut deltas_vec: Vec<(usize, f32)> = Vec::new();
-            for ix in 0..nb {
-                if marked[ix] {
-                    deltas_vec.push((ix, vals[ix]));
-                }
-            }
-            let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
-            crate::prof::end("wy.fp.tail", _t_tail);
-            let plan = Rc::new(element::FoldPlan {
-                math_start,
-                math_body,
-                fold_lines,
-                fold_bodies,
-                deltas: deltas_vec.into_boxed_slice().into(),
-                delta_sum,
-            });
-            *self.fold_plan.borrow_mut() = Some((key, plan.clone()));
-            plan
+            crate::prof::end("wy.fp.head", _t_head);
+            (math_start, math_body, fold_lines, fold_bodies)
+        };
+        // ———（二）deltas：marker 身份未变 + 结构编辑待消费 → 增量平移（免 O(n) 双数组
+        // 标记 + 0..n 扫描）；否则整建（见 [`Self::fold_plan_deltas_full`]）。
+        if let Some(plan) = self.fold_plan_deltas_shifted(
+            &derived,
+            base.clone(),
+            key,
+            marker_key,
+            &math_start,
+            &math_body,
+            &fold_lines,
+            &fold_bodies,
+        ) {
+            return plan;
         }
+        self.fold_plan_deltas_full(
+            &derived,
+            base,
+            key,
+            marker_key,
+            math_start,
+            math_body,
+            fold_lines,
+            fold_bodies,
+        )
+    }
+
+    /// deltas **增量平移**（B5）：marker 集合已重建（O(#区域)，`fp.sets`），deltas 免
+    /// O(n) 双数组标记 + 0..n 扫描（`fp.dyn/fp.tail` ~3ms debug），改为平移旧计划：
+    /// 块下标 < 旧编辑块的不变、> 旧编辑块的整体 + 块数净增；被编辑块旧条目丢弃，按新
+    /// markers + 新 base 就地重算编辑邻域（折叠/数学 body → -height、数学 start →
+    /// 卡高-height；body 优先）。
+    /// 仅在：marker 身份与缓存一致、确有结构编辑待消费、无标题折叠态时走此路径；任何
+    /// 偏离回退 `None` 走整建（正确 > 快）。
+    #[allow(clippy::too_many_arguments)] // 折叠计划产出的正交输入
+    fn fold_plan_deltas_shifted(
+        &self,
+        derived: &Rc<std::cell::RefCell<WyDerived>>,
+        base: Rc<std::cell::RefCell<element::BlockLayout>>,
+        key: u64,
+        marker_key: u64,
+        math_start: &rustc_hash::FxHashMap<usize, usize>,
+        math_body: &rustc_hash::FxHashSet<usize>,
+        fold_lines: &rustc_hash::FxHashSet<usize>,
+        fold_bodies: &[Range<usize>],
+    ) -> Option<Rc<element::FoldPlan>> {
+        if !self.struct_edit_pending.get() || !self.folded_headings.borrow().is_empty() {
+            return None;
+        }
+        let old_plan = {
+            let old = self.fold_plan.borrow();
+            let (_, cm, _p) = old.as_ref()?;
+            if *cm != marker_key {
+                return None;
+            }
+            _p.clone()
+        };
+        let ed_blk_old = self.struct_blk_old.get();
+        let blk_delta = self.struct_blk_span_delta.get();
+        // 平移旧 deltas（块下标）；被编辑块旧条目丢弃，由编辑邻域重算补充。
+        let mut deltas: Vec<(usize, f32)> = Vec::with_capacity(old_plan.deltas.len() + 2);
+        for &(ix, v) in old_plan.deltas.iter() {
+            if ix < ed_blk_old {
+                deltas.push((ix, v));
+            } else if ix > ed_blk_old {
+                deltas.push(((ix as i64 + blk_delta).max(0) as usize, v));
+            }
+        }
+        // 编辑邻域（受影响的新块区间）就地重算。
+        let base_br = base.borrow();
+        let n = base_br.n();
+        let ed_blk_new = self
+            .doc
+            .block_index_for_line(self.struct_dirty_line())
+            .min(n.saturating_sub(1));
+        let member_delta = |ix: usize| -> Option<f32> {
+            let m = self.doc.block_meta(ix)?;
+            let s0 = m.src_line as usize;
+            let s1 = (s0 + m.aux.max(1) as usize).min(self.doc.line_starts().len());
+            let mut line = s0;
+            while line < s1 {
+                if fold_lines.contains(&line) || math_body.contains(&line) {
+                    return Some(-base_br.height(ix));
+                }
+                line += 1;
+            }
+            let mut line = s0;
+            while line < s1 {
+                if let Some(&ridx) = math_start.get(&line) {
+                    let card_h = {
+                        let d = derived.borrow();
+                        f32::from(element::math_card_height(self, &d.math_regions[ridx]))
+                    };
+                    return Some(card_h - base_br.height(ix));
+                }
+                line += 1;
+            }
+            None
+        };
+        let lo = ed_blk_new.saturating_sub(1);
+        let hi = (ed_blk_new + blk_delta.max(0) as usize + 2).min(n);
+        for ix in lo..hi {
+            if let Some(v) = member_delta(ix) {
+                if let Some(pos) = deltas.iter().position(|&(b, _)| b == ix) {
+                    deltas.remove(pos);
+                }
+                deltas.push((ix, v));
+            }
+        }
+        deltas.sort_unstable_by_key(|&(b, _)| b);
+        deltas.dedup_by_key(|&mut (b, _)| b);
+        let delta_sum: f32 = deltas.iter().map(|&(_, v)| v).sum();
+        let plan = Rc::new(element::FoldPlan {
+            math_start: math_start.clone(),
+            math_body: math_body.clone(),
+            fold_lines: fold_lines.clone(),
+            fold_bodies: fold_bodies.to_vec(),
+            deltas: deltas.into_boxed_slice().into(),
+            delta_sum,
+        });
+        self.struct_edit_pending.set(false); // 消费本次平移
+        *self.fold_plan.borrow_mut() = Some((key, marker_key, plan.clone()));
+        Some(plan)
+    }
+
+    /// deltas **整建**：marker 集合（已重建）→「命中标记 + 块值」双数组（块下标 ∈
+    /// [0,n)，填表 O(1)、尾随按 0..n 升序扫出——免 30k 项全排序；见 `fp.dyn/fp.tail`）。
+    #[allow(clippy::too_many_arguments)] // 与 fold_plan_deltas_shifted 同源的正交输入
+    fn fold_plan_deltas_full(
+        &self,
+        derived: &Rc<std::cell::RefCell<WyDerived>>,
+        base: Rc<std::cell::RefCell<element::BlockLayout>>,
+        key: u64,
+        marker_key: u64,
+        math_start: rustc_hash::FxHashMap<usize, usize>,
+        math_body: rustc_hash::FxHashSet<usize>,
+        fold_lines: rustc_hash::FxHashSet<usize>,
+        fold_bodies: Vec<Range<usize>>,
+    ) -> Rc<element::FoldPlan> {
+        let math_regions = &derived.borrow().math_regions;
+        let _t_dyn = crate::prof::begin();
+        let base_br = base.borrow();
+        let nb = base_br.n();
+        let mut marked: Vec<bool> = vec![false; nb];
+        let mut vals: Vec<f32> = vec![0.0; nb];
+        for &srcline in fold_lines.iter() {
+            let ix = base_br.block_for_line(srcline);
+            marked[ix] = true;
+            vals[ix] = -base_br.height(ix);
+        }
+        for &srcline in math_body.iter() {
+            let ix = base_br.block_for_line(srcline);
+            marked[ix] = true;
+            vals[ix] = -base_br.height(ix);
+        }
+        for (&srcline, &ridx) in math_start.iter() {
+            let ix = base_br.block_for_line(srcline);
+            if !marked[ix] {
+                let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
+                marked[ix] = true;
+                vals[ix] = card_h - base_br.height(ix);
+            }
+        }
+        crate::prof::end("wy.fp.dyn", _t_dyn);
+        let _t_tail = crate::prof::begin();
+        let mut deltas_vec: Vec<(usize, f32)> = Vec::new();
+        for ix in 0..nb {
+            if marked[ix] {
+                deltas_vec.push((ix, vals[ix]));
+            }
+        }
+        let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
+        crate::prof::end("wy.fp.tail", _t_tail);
+        let plan = Rc::new(element::FoldPlan {
+            math_start,
+            math_body,
+            fold_lines,
+            fold_bodies,
+            deltas: deltas_vec.into_boxed_slice().into(),
+            delta_sum,
+        });
+        self.struct_edit_pending.set(false);
+        *self.fold_plan.borrow_mut() = Some((key, marker_key, plan.clone()));
+        plan
     }
 
     /// caret 所在区域「展开显示源码」（reveal-on-caret）覆盖，按带现算（O(区域数) 线性扫
@@ -3388,6 +3543,8 @@ impl WyEditor {
         removed: &str,
         text: &str,
     ) {
+        // 每轮编辑先清「结构编辑待消费」标志；结构性分支再置位（见字段注释）。
+        self.struct_edit_pending.set(false);
         // 内容寻址整形缓存：被编辑块旧指纹行先剔除（内容已变，本帧起按新指纹重排）。
         self.shape_rows.borrow_mut().invalidate_ids(&[old_cid]);
         // Pass1 增量高度重估起点；三段式（前缀 / 变化中段 / 尾部复用）定位用。
@@ -3398,6 +3555,11 @@ impl WyEditor {
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
+            // fold_plan deltas 增量平移的编辑信息：被编辑块旧下标 + 块数净增。
+            self.struct_blk_old.set(edit_blk);
+            self.struct_blk_span_delta
+                .set(self.doc.block_count() as i64 - prev_count as i64);
+            self.struct_edit_pending.set(true);
             // 整形缓存**内容寻址**（`frame::block_content_id`）：位移但内容未变的块指纹
             // 不变 → Pass2 自动命中，无需 retain_prefix；只有内容真正变化的块（编辑块，
             // 指纹已变）自然 miss。（旧实现按块下标键，这里曾不得不 retain_prefix 保前缀

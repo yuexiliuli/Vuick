@@ -6266,3 +6266,73 @@ A-->B
             );
         }
     }
+
+    /// B5：折叠计划 deltas **增量平移** == 强制整建（逐字段比）。结构 Enter 后（marker
+    /// 身份未变）应走 `fold_plan_deltas_shifted` 平移路径，产出必须与整建完全一致。
+    #[gpui::test]
+    fn fold_plan_incremental_shift_matches_full_rebuild(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = concat!(
+            "para before\n",
+            "$$x^2$$\n",
+            "math body line\n",
+            "$$\n",
+            "> [!NOTE]-\n",
+            "alert body\n",
+            "alert body 2\n",
+            "> done\n",
+            "para mid\n",
+            "```rust\n",
+            "let a = 1;\n",
+            "```\n",
+            "para after\n",
+        );
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let cases = [("para mid", 4usize), ("para before", 4usize), ("alert body", 4usize)];
+        // 先做一次整建首穿（热缓存/基线）。
+        let _f0 = vcx.update(|window, cx| {
+            build_frame(host.read(cx).ed.read(cx), window, px(900.), (0., 999_999.))
+        });
+        for (needle, off) in cases {
+            let (inc, full) = vcx.update(|window, cx| {
+                let ed = host.read(cx).ed.clone();
+                // 结构编辑：插入换行。
+                ed.update(cx, |ed2, ecx| {
+                    let src = ed2.text();
+                    let at = src.find(needle).unwrap().min(src.len());
+                    let at = (at + off).min(src.len());
+                    ed2.replace_range(at..at, "\n", ecx);
+                });
+                let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+                // 增量路径产出的计划。
+                let inc = ed
+                    .read(cx)
+                    .fold_plan_rc()
+                    .expect("增量平移后应有折叠计划");
+                // 强制整建：清缓存 + 清待消费标志（增量条件不满足 → 走整建）。
+                ed.update(cx, |e, _| {
+                    *e.fold_plan.borrow_mut() = None;
+                    e.struct_edit_pending.set(false);
+                });
+                let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+                let full = ed.read(cx).fold_plan_rc().expect("整建后应有折叠计划");
+                (inc, full)
+            });
+            assert_eq!(inc.math_start, full.math_start, "{needle}: math_start 不一致");
+            assert_eq!(inc.math_body, full.math_body, "{needle}: math_body 不一致");
+            assert_eq!(inc.fold_lines, full.fold_lines, "{needle}: fold_lines 不一致");
+            assert_eq!(inc.fold_bodies, full.fold_bodies, "{needle}: fold_bodies 不一致");
+            assert_eq!(&*inc.deltas, &*full.deltas, "{needle}: deltas 不一致");
+            assert!(
+                (inc.delta_sum - full.delta_sum).abs() < 1e-3,
+                "{needle}: delta_sum 不一致 {} vs {}",
+                inc.delta_sum,
+                full.delta_sum
+            );
+        }
+    }
