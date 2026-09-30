@@ -265,7 +265,7 @@ fn pass1_base_layout(
         }
     }
     debug_assert_eq!(heights.len(), n, "Pass1 三段式产出的块数与新索引一致");
-    base.borrow_mut().rebuild(heights, src_lines, doc_lines);
+    base.borrow_mut().rebuild(heights, src_lines);
     crate::prof::end("wy.pass1", _t_p1);
 }
 
@@ -683,7 +683,7 @@ pub(crate) fn build_frame(
     let rgen = editor.content_gen();
 
     if n == 0 {
-        return empty_frame(editor, doc, line_h, padding, rgen, band, width);
+        return empty_frame(editor, line_h, padding, rgen, band, width);
     }
 
     let (band_lo, band_hi) = band;
@@ -829,7 +829,6 @@ pub(crate) fn build_frame(
 #[allow(clippy::too_many_arguments)] // 构建空帧所需的既有上下文参数
 fn empty_frame(
     editor: &WyEditor,
-    doc: &Doc,
     line_h: Pixels,
     padding: Pixels,
     rgen: u64,
@@ -863,7 +862,6 @@ fn empty_frame(
         base: std::rc::Rc::new(std::cell::RefCell::new(BlockLayout::new(
             vec![f32::from(line_h)],
             vec![0],
-            doc.line_starts().len(),
         ))),
         deltas: std::rc::Rc::from(vec![]),
         total: line_h,
@@ -1033,7 +1031,7 @@ mod tests {
     fn blk(heights: Vec<f32>) -> Rc<RefCell<BlockLayout>> {
         let n = heights.len();
         let src: Vec<u32> = (0..n as u32).collect();
-        Rc::new(RefCell::new(BlockLayout::new(heights, src, n)))
+        Rc::new(RefCell::new(BlockLayout::new(heights, src)))
     }
 
     #[test]

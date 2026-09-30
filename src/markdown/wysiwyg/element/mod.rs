@@ -279,25 +279,21 @@ pub(crate) struct BlockLayout {
     heights: Vec<f32>,
     fen: Vec<f64>,
     block_src_lines: Vec<u32>,
-    /// **稠密行→块索引**：`line_block[line]` = 含该源行的块下标（O(1) 查）。
-    /// 结构编辑（Pass1 rebuild）时随块表一次填充（O(行数)），跨结构编辑的 band 移动/
-    /// fold_plan 重建 / fold_reveal 全部复用——替代按查询行做 `partition_point`
-    /// O(log n)（9000 查询 × 17 步 ≈ Enter 时 fp.dyn 的 6-10ms 主成本，改为
-    /// 9000×O(1) + 一次 O(n) 填充 ≈ <1ms）。
-    line_block: Vec<u32>,
 }
 
 impl BlockLayout {
     /// 空布局（O(1)）：给「即将被 Pass1 整表重建」的草稿占位——`ensure_block_layout`
-    /// 重建分支用它，省掉先建一份全量零点 Fenwick/line_block 又一帧被 `rebuild` 覆盖的
+    /// 重建分支用它，省掉先建一份全量零点 Fenwick 又一帧被 `rebuild` 覆盖的
     /// 双重 O(n) 构造（Enter/结构编辑每键 ~0.8ms）。
     pub(crate) fn empty() -> Self {
-        Self { heights: Vec::new(), fen: Vec::new(), block_src_lines: Vec::new(), line_block: Vec::new() }
+        Self { heights: Vec::new(), fen: Vec::new(), block_src_lines: Vec::new() }
     }
     /// 由整块高度 + 起始源码行建（**O(n)** Fenwick 建表：每个元素只做一次祖先上推，
     /// 替代每元素 while 爬整条祖先链的 O(n log n)——10.7 万块每次 Pass1 重建 ~40ms→~1ms）。
-    /// `doc_lines`：源文档总行数（稠密 `line_block` 的范围）。
-    pub(crate) fn new(heights: Vec<f32>, block_src_lines: Vec<u32>, doc_lines: usize) -> Self {
+    /// 行→块改**二分**（`block_for_line`），不再维护 O(行数) 稠密 `line_block`——结构编辑
+    /// 每键省一次 ~139k 行填充（B5 前它服务 fp.dyn 的 9000 次 O(1) 查询，B5 增量平移后该
+    /// 路径退为回退分支，查询量降为回退/fold 少量 → 二分总成本 ≪ 稠密填充）。
+    pub(crate) fn new(heights: Vec<f32>, block_src_lines: Vec<u32>) -> Self {
         let n = heights.len();
         // 标准 O(n) 建树：tree[i] 累计 a[i-1] 后把部分和上推到父节点。
         let mut fen = vec![0f64; n + 1];
@@ -309,20 +305,10 @@ impl BlockLayout {
                 fen[parent] += fen[ti];
             }
         }
-        // 稠密行→块：块按 src_line 升序连续覆盖，游标一次填满。
-        let mut line_block = vec![0u32; doc_lines.max(1)];
-        let mut blk = 0usize;
-        for l in 0..doc_lines.min(line_block.len()) {
-            while blk + 1 < block_src_lines.len() && (block_src_lines[blk + 1] as usize) <= l {
-                blk += 1;
-            }
-            line_block[l] = blk as u32;
-        }
         Self {
             heights,
             fen,
             block_src_lines,
-            line_block,
         }
     }
     /// 整表重建（同代内容变更/首次打开用；O(n)）。
@@ -330,14 +316,19 @@ impl BlockLayout {
         &mut self,
         heights: Vec<f32>,
         block_src_lines: Vec<u32>,
-        doc_lines: usize,
     ) {
-        *self = BlockLayout::new(heights, block_src_lines, doc_lines);
+        *self = BlockLayout::new(heights, block_src_lines);
     }
-    /// 含源行 `line` 的块下标（O(1) 稠密查；越界归到首/末块）。
+    /// 含源行 `line` 的块下标（O(log n) 二分于 `block_src_lines`；越界归到首/末块）。
+    /// 块按 `src_line` 升序连续覆盖源码行——与 `block_index_for_src_line` 同式。
     pub(crate) fn block_for_line(&self, line: usize) -> usize {
-        let blk = self.line_block.get(line).copied().unwrap_or(0) as usize;
-        blk.min(self.heights.len().saturating_sub(1))
+        let sl = &self.block_src_lines;
+        if sl.is_empty() {
+            return 0;
+        }
+        sl.partition_point(|&s| (s as usize) <= line)
+            .saturating_sub(1)
+            .min(sl.len() - 1)
     }
     /// 点更新第 `i` 块高（增量改前缀和；差 ~0 跳过）。
     pub(crate) fn set(&mut self, i: usize, h: f32) {
