@@ -379,12 +379,13 @@ fn pass2_shape_band(
             let hi = i;
             // A1「命中先行」+ 只物化 miss/caret 块（连续段合并批量 parse）。
             let (need_row, mut hit_map) =
-                band_hit_test(editor, base, lo, hi, caret_line, shape_key);
+                band_hit_test(editor, doc, base, lo, hi, caret_line, shape_key);
             let mut rows_map = band_parse_rows(doc, &need_row);
             // 整带顺序装配（Pass3 依赖 `shaped` 与块序一致）：命中 → 浅克隆
             // （heavy 数据都是 Arc/Rc，top 在 Pass3 现设）；否则从物化行 shape。
             let _t_shape = crate::prof::begin();
             for k in lo..hi {
+                let cid = block_content_id(doc, k);
                 let srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
                 } else if let Some(last) = editor.cooling_row(k) {
@@ -424,7 +425,7 @@ fn pass2_shape_band(
                             if is_caret {
                                 srow
                             } else {
-                                let rc = editor.shape_rows.borrow_mut().put(k, shape_key, srow);
+                                let rc = editor.shape_rows.borrow_mut().put(cid, shape_key, srow);
                                 (*rc).clone()
                             }
                         } else {
@@ -467,7 +468,7 @@ fn pass2_shape_band(
                         if is_caret && !srow.extra.inline_maths.is_empty() {
                             srow // reveal 依赖光标 → 保持不缓存
                         } else {
-                            let rc = editor.shape_rows.borrow_mut().put(k, shape_key, srow);
+                            let rc = editor.shape_rows.borrow_mut().put(cid, shape_key, srow);
                             (*rc).clone()
                         }
                     }
@@ -483,13 +484,15 @@ fn pass2_shape_band(
     shaped
 }
 
-/// A1「命中先行」：整带内判哪些块**不需要**物化 DocRow——命中 = 缓存键匹配且非 caret 行
-/// （caret 行 shape 依赖光标，即便已在缓存也必须强制物化重 shape、不缓存；逐帧至多一行）。
-/// 只对「未命中 ∪ caret 行」批量物化（连续段合并复用批量 parse）。本函数内部临时借用
-/// `shape_rows` 缓存做命中判定，返回 (need_row, hit_map)。
+/// A1+「命中先行」（内容寻址）：整带内判哪些块**不需要**物化 DocRow——命中 = 缓存
+/// **内容指纹**键匹配且非 caret 行（caret 行 shape 依赖光标，即便已在缓存也必须强制物化
+/// 重 shape、不缓存；逐帧至多一行）。结构编辑后位移但内容未变的块指纹不变 → 命中旧行；
+/// 只有内容真正变化的块才 miss。只对「未命中 ∪ caret 行」批量物化（连续段合并复用批量
+/// parse）。本函数内部临时借用 `shape_rows` 缓存做命中判定，返回 (need_row, hit_map)。
 #[allow(clippy::type_complexity)]
 fn band_hit_test(
     editor: &WyEditor,
+    doc: &Doc,
     base: &Rc<RefCell<BlockLayout>>,
     lo: usize,
     hi: usize,
@@ -502,9 +505,10 @@ fn band_hit_test(
         std::collections::HashMap::new();
     for k in lo..hi {
         let srcline = base.borrow().src_lines()[k] as usize;
+        let cid = block_content_id(doc, k);
         if caret_line == srcline {
             need_row.push(k);
-        } else if let Some(rc) = row_cache.get(k, shape_key) {
+        } else if let Some(rc) = row_cache.get(cid, shape_key) {
             if shaped_row_has_notdef(&rc) && !editor.notdef_settled(k) {
                 // 命中但含 .notdef（此前冷启动坏字形被缓存/预热写入）：视作 miss，强制以
                 // 新鲜平台重排——否则豆腐块被旧缓存钉住整次运行。已 `settled`（判定确无
@@ -518,7 +522,7 @@ fn band_hit_test(
             // `settled/verified/attempts` 判决对应的是上一代结果——可能在图片解码卡顿窗口
             // 里留下（.notdef 预算烧光→settled / 非零占位字形→verified），换代重排前作废，
             // 让本块按新代重新校验/重试。图片加载完成的 `igen` 换代重建会走到这里 → 自愈。
-            if row_cache.key_mismatch(k, shape_key) {
+            if row_cache.key_mismatch(cid, shape_key) {
                 editor.clear_stale_verdicts(k);
             }
             need_row.push(k);
@@ -628,6 +632,38 @@ fn pass3_assemble_rows(
 /// 构建一帧：**窗口化**——仅 `band`（元素局部 y）内的块被物化 + shape，
 /// 带外块用 [`estimate_height`] 占位（空 `wrapped`、空 `byte_map`），块高循环
 /// 仍覆盖全篇以得到正确 total（滚动条量程）与行序。
+/// 块的**内容指纹**（整形缓存内容寻址键）：结构性编辑（Enter/合并/围栏）后，位移但
+/// 内容未变的块指纹不变 → Pass2 命中旧整形结果，免整带重排（结构 Enter 的带重整形
+/// ~6ms debug → 仅被编辑块重排）；只有内容真正变化的块才 miss。掺 kind/跨度/首末行
+/// 文本；同指纹碰撞要求「同 kind、同跨度、同首行、同末行」的**不同**块——视觉无碍。
+pub(crate) fn block_content_id(doc: &Doc, block: usize) -> u64 {
+    let Some(m) = doc.block_meta(block) else {
+        return block as u64; // 无 meta（安全带）：退化为按下标，永不跨编辑命中
+    };
+    use std::hash::Hasher as _;
+    let mut h = rustc_hash::FxHasher::default();
+    let kind = match m.kind {
+        crate::markdown::parse::RowKind::Paragraph => 1u64,
+        crate::markdown::parse::RowKind::Heading(_) => 2u64,
+        crate::markdown::parse::RowKind::Code => 3u64,
+        crate::markdown::parse::RowKind::Quote => 4u64,
+        crate::markdown::parse::RowKind::Bullet => 5u64,
+        crate::markdown::parse::RowKind::Rule => 6u64,
+        crate::markdown::parse::RowKind::Table => 7u64,
+        crate::markdown::parse::RowKind::Image => 8u64,
+        crate::markdown::parse::RowKind::Blank => 9u64,
+    };
+    h.write_u64(kind);
+    h.write_u64(m.aux as u64);
+    let src0 = m.src_line as usize;
+    h.write(doc.line_str(src0).as_bytes());
+    if m.aux > 1 {
+        let srcn = (src0 + m.aux as usize - 1).min(doc.line_starts().len().saturating_sub(1));
+        h.write(doc.line_str(srcn).as_bytes());
+    }
+    h.finish()
+}
+
 pub(crate) fn build_frame(
     editor: &WyEditor,
     window: &mut Window,
@@ -738,7 +774,11 @@ pub(crate) fn build_frame(
     // 含行内公式的文本行时（reveal，shape 依赖光标）该行不缓存；编辑作废由
     // `replace_range` 负责，公式就绪对 `$$` 卡 / 行内 spacer 的换代由 `on_math_ready`
     // **定向作废**该行——不再让整带无关块随每个公式完成全 miss 重排（对齐 code 修复）。
-    let shape_key = epoch;
+    // 行整形缓存键（内容寻址，见 `block_content_id`）：**只含宽度与 mermaid 缩放**——
+    // 内容变化由每块的指纹 miss 覆盖、图片就绪/字号/主题由 clear 覆盖、数学就绪由
+    // 定向作废覆盖。**不含 `struct_ver`**：结构编辑（Enter/合并）后位移但内容未变的块
+    // 指纹不变 → 命中旧行，免整带重排（这是「结构编辑后带重整形 ~6ms」的架构根因）。
+    let shape_key = (width_bits as u64) ^ editor.mermaid_zoom_gen();
     let shaped = pass2_shape_band(
         editor,
         window,
@@ -886,11 +926,11 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     if i0 >= i1 {
         return;
     }
-    // shape_key 与 `build_frame` 完全同式（epoch = struct_ver ^ igen ^ width_bits ^ zgen；
-    // 不含 mgen——公式就绪支持定向作废，见 `build_frame`）。
+    // shape_key 与 `build_frame` 完全同式（**宽基**：width_bits ^ mermaid_zoom_gen；
+    // 不含 mgen/struct_ver——内容变化由内容指纹 miss、公式就绪走定向作废，见
+    // `build_frame` 的 `block_content_id` 说明）。
     let width_bits = f32::from(frame.width).to_bits();
-    let epoch = super::height_epoch(e.struct_ver(), e.images_gen(), width_bits, e.mermaid_zoom_gen());
-    let sk = epoch;
+    let sk = (width_bits as u64) ^ e.mermaid_zoom_gen();
     let caret_line = e.row_col(e.caret()).0;
     let plan = e.fold_plan_rc();
     let doc = e.doc();
@@ -946,7 +986,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
             }
             None => false,
         };
-        if !blocked && !big && caret_line != srcline && rc.get(k, sk).is_none() {
+        if !blocked && !big && caret_line != srcline && rc.get(block_content_id(doc, k), sk).is_none() {
             // 与 Pass2 miss 分支同式：整形成功即入缓存（随后 Pass2 命中时浅克隆复用）。
             // 含 .notdef 的坏行**不入缓存**——进带后由 Pass2 以「冷却一帧 → 新鲜重排」
             // 自愈（一律重试，不为“回退已温”静默缓存）。
@@ -956,7 +996,7 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
                 let row =
                     shape_docrow(r, e, window, frame.width, avail, &e.theme, &e.theme.font);
                 if !shaped_row_has_notdef(&row) {
-                    rc.put(k, sk, row);
+                    rc.put(block_content_id(doc, k), sk, row);
                 }
             }
             done += 1;

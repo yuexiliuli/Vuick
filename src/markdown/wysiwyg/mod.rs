@@ -579,20 +579,23 @@ fn region_line_sig(line: &str) -> u64 {
     h.finish()
 }
 
-/// 一整行（块）的**整形内容缓存**（按块下标）。滚动/带重建时复用已整形块，
-/// 不再把可视带整批重 shape（`shape_line` ）并为每个代码块重跑 syntect——
-/// 结构密集代码文档「滚动每档 65ms」的主因（对齐 `view` 的行虚拟化复用 +
-/// `editor` 「只重排变更区」的原则）。
+/// 一整行（块）的**整形内容缓存**（内容寻址，键 = 块内容指纹 `block_content_id`）。
+/// 滚动/带重建时复用已整形块，不再把可视带整批重 shape（`shape_line` ）并为每个代码块
+/// 重跑 syntect——结构密集代码文档「滚动每档 65ms」的主因（对齐 `view` 的行虚拟化复用
+/// + `editor` 「只重排变更区」的原则）。
 ///
-/// - 键 = `(height_epoch ^ mgen)`：`epoch` 已含 `struct_ver`/图片代/宽度；`mgen` 单独
-///   加（公式 Loading→Ready 会改 spacer 宽/高，触发对应块重 shape）。
-/// - 非结构性编辑只作废**被编辑块**（内容变了但 `epoch` 不变 → 必须显式失效）；
-///   结构性编辑（块数/块序变）/ 换源 / 主题字号变化 → 整体 `clear`。
+/// - 键 = 内容指纹（kind/跨度/首末行文本）^ 换代键 `key`（宽度/mermaid 缩放）：
+///   **不随块下标/行号位移**——结构编辑（Enter/合并）后位移但内容未变的块指纹不变 →
+///   命中旧行，免整带重排（旧实现按块下标键，结构编辑让后缀块下标全位移 → 整带 miss
+///   重排 ~6ms debug）；内容真正变化的块指纹变 → 自然 miss。
+/// - 内容变化靠指纹覆盖；数学就绪/图片尺寸给特定块换高 → `invalidate_ids` 定向作废；
+///   换源/主题字号变化 → 整体 `clear`。
+/// - 结构性编辑（块数/块序变）/ 换源 / 主题字号变化 → 整体 `clear`。
 /// - caret 严格落在**含行内公式的文本行**时会 reveal（shape 依赖光标）→ 该行不缓存
 ///   （调用方 `caret_dep` 判定）。
 /// - 容量上限见 [`crate::config::limits::SHAPED_ROW_CACHE_CAP`]，超出按最近最少使用淘汰。
 struct RowShapeCache {
-    entries: std::collections::HashMap<usize, RowShapeEntry>,
+    entries: std::collections::HashMap<u64, RowShapeEntry>,
     cap: usize,
     clock: u32,
 }
@@ -608,8 +611,8 @@ impl RowShapeCache {
         Self { entries: std::collections::HashMap::new(), cap, clock: 0 }
     }
     /// 命中：更新访问钟并返回 `Rc`（浅克隆即可取得行，heavy 数据全是 Arc/Rc）。
-    fn get(&mut self, block: usize, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
-        match self.entries.get_mut(&block) {
+    fn get(&mut self, id: u64, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
+        match self.entries.get_mut(&id) {
             Some(e) if e.key == key => {
                 e.last_seen = self.clock;
                 self.clock = self.clock.wrapping_add(1);
@@ -618,19 +621,14 @@ impl RowShapeCache {
             _ => None,
         }
     }
-    /// 该块存在**但键已换代**（内容/图片/数学/宽度变化把旧行逐出）——与"从未缓存"区分：
+    /// 该块存在**但键已换代**（宽度/mermaid 缩放变化把旧行逐出）——与"从未缓存"区分：
     /// 换代重排时旧 `settled/verified/attempts` 判决对应的是上一代结果，应作废重来。
-    fn key_mismatch(&self, block: usize, key: u64) -> bool {
-        self.entries.get(&block).is_some_and(|e| e.key != key)
+    fn key_mismatch(&self, id: u64, key: u64) -> bool {
+        self.entries.get(&id).is_some_and(|e| e.key != key)
     }
     /// 插入（新行）；容量满时淘汰 last_seen 最小的条目。返回缓存的 `Rc`。
-    fn put(
-        &mut self,
-        block: usize,
-        key: u64,
-        row: element::ShapedRow,
-    ) -> std::rc::Rc<element::ShapedRow> {
-        if self.entries.len() >= self.cap && !self.entries.contains_key(&block)
+    fn put(&mut self, id: u64, key: u64, row: element::ShapedRow) -> std::rc::Rc<element::ShapedRow> {
+        if self.entries.len() >= self.cap && !self.entries.contains_key(&id)
             && let Some(old) = self.entries.values().map(|e| e.last_seen).min()
                 && let Some(k) = self
                     .entries
@@ -642,27 +640,17 @@ impl RowShapeCache {
                 }
         let rc = std::rc::Rc::new(row);
         self.entries.insert(
-            block,
+            id,
             RowShapeEntry { key, last_seen: self.clock, row: rc.clone() },
         );
         self.clock = self.clock.wrapping_add(1);
         rc
     }
-    /// 逐个作废（编辑后的受影响块）。
-    fn invalidate(&mut self, blocks: &[usize]) {
-        for &b in blocks {
+    /// 逐个作废（数学就绪/内容变化的受影响块；键 = 内容指纹）。
+    fn invalidate_ids(&mut self, ids: &[u64]) {
+        for &b in ids {
             self.entries.remove(&b);
         }
-    }
-    /// **前缀保留**：结构编辑（块数/块序变化）时，编辑线之前的块（下标 < `keep`）
-    /// 内容/索引稳定，其整形缓存仍有效；只作废下标 ≥ `keep` 的（受影响/位移）块——
-    /// 替代整表 `clear`（防止 Enter 后 Pass2 把整带 74 行重 shape 一遍 ~7ms）。
-    fn retain_prefix(&mut self, keep: usize) {
-        if keep == 0 {
-            self.entries.clear();
-            return;
-        }
-        self.entries.retain(|&k, _| k < keep);
     }
     fn clear(&mut self) {
         self.entries.clear();
@@ -2303,10 +2291,11 @@ impl WyEditor {
     pub(crate) fn shape_rows_len(&self) -> usize {
         self.shape_rows.borrow().len()
     }
-    /// （仅测试）非结构性编辑后：被编辑块应从缓存剔除。
+    /// （仅测试）非结构性编辑后：被编辑块（内容变了 → 指纹变）应从缓存剔除。
     #[cfg(test)]
     pub(crate) fn shape_rows_has(&self, block: usize) -> bool {
-        self.shape_rows.borrow().entries.contains_key(&block)
+        let cid = frame::block_content_id(&self.doc, block);
+        self.shape_rows.borrow().entries.contains_key(&cid)
     }
     /// （仅测试）Pass2 光栅计数（缓存未命中/光标行时自增）。
     #[cfg(test)]
@@ -2739,7 +2728,9 @@ impl WyEditor {
     fn on_code_parse_ready(&mut self, src_lines: &[usize], cx: &mut Context<Self>) {
         let block_indices: Vec<usize> =
             src_lines.iter().map(|&s| self.doc.block_index_for_line(s)).collect();
-        self.shape_rows.borrow_mut().invalidate(&block_indices);
+        let ids: Vec<u64> =
+            block_indices.iter().map(|&b| frame::block_content_id(&self.doc, b)).collect();
+        self.shape_rows.borrow_mut().invalidate_ids(&ids);
         let in_band = self
             .frame
             .borrow()
@@ -2905,7 +2896,9 @@ impl WyEditor {
                 lines.dedup();
                 let blocks: Vec<usize> =
                     lines.into_iter().map(|s| self.doc.block_index_for_line(s)).collect();
-                self.shape_rows.borrow_mut().invalidate(&blocks);
+                let ids: Vec<u64> =
+                    blocks.iter().map(|&b| frame::block_content_id(&self.doc, b)).collect();
+                self.shape_rows.borrow_mut().invalidate_ids(&ids);
             }
         }
         let in_band = self.frame.borrow().as_ref().is_some_and(|f| {
@@ -3281,6 +3274,9 @@ impl WyEditor {
         // 扫描（旧实现 `in_code_table` 一律 structural → 表内每键 ~140ms）。
         let edit_blk = self.doc.block_index_for_line(edit_line);
         let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
+        // 编辑前被编辑块的内容指纹（整形缓存**内容寻址**键）：编辑后内容已变 → 剔除
+        // 旧指纹行（否则旧条目滞留到被 LRU 淘汰；测试与内存卫生都要它即时消失）。
+        let old_cid = frame::block_content_id(&self.doc, edit_blk);
         self.doc.edit(r.clone(), text);
         let cross_newline = text.contains('\n') || removed.contains('\n') || text.contains('\r');
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
@@ -3293,7 +3289,7 @@ impl WyEditor {
         };
         let structural = cross_newline || breaks_fence || !count_same || !geo_same;
         // Pass1 增量重估定位 + 整形/预热缓存作废（结构 vs 非结构两路，见 `invalidate_after_edit`）。
-        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, &removed, text);
+        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, old_cid, &removed, text);
         // —— 内容派生（derived）的增量判定（详见 `update_derived_after_edit`）——
         self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
 
@@ -3381,15 +3377,19 @@ impl WyEditor {
     /// Pass1 增量重估定位 + 整形/预热缓存作废：编辑行的**前一内容行**之后的块全部未变
     /// （前缀高度复用，不整篇重估）；结构编辑保留 < edit_blk 前缀的整形/重试缓存并归零
     /// 预热，非结构编辑只作废受影响块（块下标稳定）。
+    #[allow(clippy::too_many_arguments)] // 编辑管线的正交输入
     fn invalidate_after_edit(
         &mut self,
         edit_line: usize,
         edit_blk: usize,
         prev_count: usize,
         structural: bool,
+        old_cid: u64,
         removed: &str,
         text: &str,
     ) {
+        // 内容寻址整形缓存：被编辑块旧指纹行先剔除（内容已变，本帧起按新指纹重排）。
+        self.shape_rows.borrow_mut().invalidate_ids(&[old_cid]);
         // Pass1 增量高度重估起点；三段式（前缀 / 变化中段 / 尾部复用）定位用。
         self.struct_dirty_line.set(edit_line);
         self.struct_old_end_line.set(edit_line + removed.matches('\n').count());
@@ -3398,12 +3398,11 @@ impl WyEditor {
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
-            // 块数/块序变化 → 编辑线之前的块（< edit_blk）下标/内容未变，其整形缓存
-            // 仍有效（保留）；≥ edit_blk 的块受影响/位移 → 作废。比整表 `clear` 让
-            // Pass2 复用前缀行，Enter 不再整带重 shape。`edit_blk` 是**编辑前**受影响块。
+            // 整形缓存**内容寻址**（`frame::block_content_id`）：位移但内容未变的块指纹
+            // 不变 → Pass2 自动命中，无需 retain_prefix；只有内容真正变化的块（编辑块，
+            // 指纹已变）自然 miss。（旧实现按块下标键，这里曾不得不 retain_prefix 保前缀
+            // 丢后缀，Enter 仍整带重排。）notdef 重试表仍按下标：前缀保留、≥ edit 作废。
             let prefix_keep = edit_blk.min(prev_count);
-            self.shape_rows.borrow_mut().retain_prefix(prefix_keep);
-            // 结构与 notdef 重试表同口径：前缀块下标未变、重试状态保留；≥ keep 作废。
             self.notdef_retry.borrow_mut().retain_prefix(prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
@@ -3415,8 +3414,7 @@ impl WyEditor {
             // 非结构性：块下标稳定，记受影响的编辑行块。
             let blk = self.doc.block_index_for_line(edit_line);
             *self.pending_patch_blocks.borrow_mut() = Some(vec![blk]);
-            // 该块内容变了但 `epoch` 不变 → 必须显式作废其整形缓存（否则复用旧图）。
-            self.shape_rows.borrow_mut().invalidate(&[blk]);
+            // 该块内容变了 → 指纹自然变 → 整形缓存自生效（无需显式作废）。
             self.notdef_retry.borrow_mut().clear_block(blk);
         }
     }
@@ -3672,6 +3670,8 @@ impl WyEditor {
         let prev_count = self.doc.block_count();
         let edit_blk = self.doc.block_index_for_line(edit_line);
         let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
+        // 与 `replace_range` 同：剔除被编辑块的旧内容指纹行（内容寻址缓存）。
+        let old_cid = frame::block_content_id(&self.doc, edit_blk);
         self.doc.edit(r.clone(), text);
         let cross_newline = text.contains('\n') || removed.contains('\n') || text.contains('\r');
         let breaks_fence = text.contains("```") || text.trim_start().starts_with('|');
@@ -3681,7 +3681,7 @@ impl WyEditor {
             _ => false,
         };
         let structural = cross_newline || breaks_fence || !count_same || !geo_same;
-        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, &removed, text);
+        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, old_cid, &removed, text);
         self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
         self.caret = target_caret.min(self.len());
         self.sel_anchor = None;
