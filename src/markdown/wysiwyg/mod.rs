@@ -453,6 +453,13 @@ pub struct WyEditor {
     /// 图片编辑卡片（打开时在图片旁渲染悬浮表单：链接 + 文本两个输入框）。
     /// `None` = 未打开。打开期间输入框获得焦点（IME 走 `InputState`，与文档输入互不干扰）。
     image_edit: Option<ImageEditPopup>,
+    /// 图片编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：paint 期用「本帧
+    /// `bounds.origin` + 本帧 frame」同代配对算出并缓存，render 只读它摆卡片。
+    /// 绝不能由 render 直接拿 frame/last_bounds 现算——`end_selection` 清帧后
+    /// `ensure_frame_for_input` 会用兜底 `px(800)` 宽重建一帧、随后 prepaint 又按真实宽
+    /// 重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧（「突然往左闪烁」）。
+    /// `None` = 无卡片 / 锚点未就绪。
+    image_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
 }
 
 /// 编辑意图（决定撤销合并规则，纯无定时器确定性判定，同 editor/undo.rs）。
@@ -1069,6 +1076,7 @@ impl WyEditor {
             hover_image: Cell::new(None),
             selected_image: Cell::new(None),
             image_edit: None,
+            image_edit_anchor: Cell::new(None),
         }
     }
 
@@ -1120,6 +1128,7 @@ impl WyEditor {
             self.dragging = false;
             // 只读：无编辑能力 → 收起图片编辑卡片与悬浮按钮态、图片选中态。
             self.image_edit = None;
+            self.image_edit_anchor.set(None);
             self.hover_image.set(None);
             self.selected_image.set(None);
         }
@@ -1511,6 +1520,7 @@ impl WyEditor {
         self.focused_mermaid = None;
         // 换源：图片编辑卡片/悬浮态/选中态随行号失效 → 关闭。
         self.image_edit = None;
+        self.image_edit_anchor.set(None);
         self.hover_image.set(None);
         self.selected_image.set(None);
         *self.frame.borrow_mut() = None;
@@ -3896,18 +3906,70 @@ impl WyEditor {
                 .default_value(alt)
         });
         self.image_edit = Some(ImageEditPopup { src_line, link, text });
+        // 计算并缓存卡片锚点：用**当前帧 + 上次 paint 的元素原点**（同代配对）。这保证
+        // 打开后的第 1 次 render（在 paint 之前）就有正确几何；此后每帧 paint 刷新。
+        // ⚠️ 不再依赖 render 期现算 frame——`end_selection` 清帧后 ensure 用 800px 宽
+        // 重建会让 render 读到一个宽度错误的帧，卡片横向跳一帧。
+        if let Some(f) = self.frame.borrow().as_ref().cloned() {
+            let origin = self
+                .last_bounds()
+                .map(|b| b.origin)
+                .unwrap_or_else(|| gpui::point(px(0.), px(0.)));
+            self.image_edit_anchor.set(self.image_edit_anchor_at(origin, &f));
+        }
         // 打开后立刻聚焦「链接」输入框（用户可直接键入/IME）。
         if let Some(p) = &self.image_edit {
             let fh = p.link.read(cx).focus_handle(cx);
             fh.focus(window, cx);
         }
-        *self.frame.borrow_mut() = None;
         cx.notify();
+    }
+
+    /// 图片编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：内容区水平居中 +
+    /// 顶对齐目标图片行的当前屏幕 y。帧行坐标是**文档局部**（`row.top` 含整篇偏移），
+    /// 窗口坐标 = 元素屏幕原点（`origin`）+ 帧局部。`origin` 必须与 `f` 同代（paint 期
+    /// 用 `bounds.origin` + 本帧 frame，open 期用 `last_bounds` + 保持的帧），否则换帧
+    /// 就闪。缺卡片/找不到图片行 → `None`。
+    pub(crate) fn image_edit_anchor_at(
+        &self,
+        origin: gpui::Point<Pixels>,
+        f: &element::Frame,
+    ) -> Option<gpui::Point<Pixels>> {
+        let popup = self.image_edit.as_ref()?;
+        let card_w = element::IMAGE_EDIT_CARD_W;
+        let content_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+        let l = f32::from(f.padding) + ((content_w - card_w) / 2.).max(0.);
+        let row_top = f
+            .rows
+            .iter()
+            .find(|r| {
+                r.src_line == popup.src_line && r.kind == crate::markdown::ir::IrKind::Image
+            })
+            .map(|r| f32::from(r.top))
+            .unwrap_or_else(|| {
+                let blk = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
+                f.block_top(blk)
+            });
+        Some(point(
+            px(f32::from(origin.x) + l),
+            px(f32::from(origin.y) + row_top),
+        ))
+    }
+
+    /// 设置图片编辑卡片锚点（`element::WyEditorElement::paint` 每帧刷新；`None` 清空）。
+    pub(crate) fn set_image_edit_anchor(&self, anchor: Option<gpui::Point<Pixels>>) {
+        self.image_edit_anchor.set(anchor);
+    }
+    /// 当前缓存的卡片锚点（测试访问器）。
+    #[cfg(test)]
+    pub(crate) fn image_edit_anchor(&self) -> Option<gpui::Point<Pixels>> {
+        self.image_edit_anchor.get()
     }
 
     /// 关闭图片编辑卡片（不写源码）。
     pub(crate) fn close_image_edit(&mut self, cx: &mut Context<Self>) {
         if self.image_edit.take().is_some() {
+            self.image_edit_anchor.set(None);
             cx.notify();
         }
     }
@@ -3994,29 +4056,37 @@ impl WyEditor {
         };
         use crate::ui::button::ButtonVariants as _;
         let popup = self.image_edit.as_ref()?;
-        // 卡片几何：局部坐标（内容区水平居中 + 顶对齐目标图片行）。
-        let (left, top) = {
-            let f = self.frame.borrow();
-            match f.as_ref() {
-                Some(f) => {
-                    let block = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
-                    let content_w =
-                        (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
-                    let card_w = element::IMAGE_EDIT_CARD_W;
-                    let l = f32::from(f.padding) + ((content_w - card_w) / 2.).max(0.);
-                    (l, f.block_top(block))
-                }
-                None => (12., 0.),
+        // 卡片几何（**窗口坐标**，供 `anchored(Window)` 定位）。**直接读 paint 期缓存好的
+        // 锚点**（`image_edit_anchor`：同代 origin+frame 算出的窗口 TopLeft）——render 期
+        // 现算 frame 会读到 `end_selection` 清帧后 `ensure_frame_for_input` 兜底 800 宽
+        // 重建的临时帧（与真实宽不同），卡片横向跳一帧（往左闪烁）。锚点未就绪才回退到
+        // 逐帧现算；再没有帧则本帧不画卡片（绝不画角落）。
+        let anchor = match self.image_edit_anchor.get() {
+            Some(a) => a,
+            None => {
+                let f = self.frame.borrow();
+                let f = f.as_ref()?;
+                let origin = self
+                    .last_bounds()
+                    .map(|b| b.origin)
+                    .unwrap_or_else(|| gpui::point(px(0.), px(0.)));
+                self.image_edit_anchor_at(origin, f)?
             }
         };
+        let (left, top) = (f32::from(anchor.x), f32::from(anchor.y));
         let ed = cx.entity();
         let ed_save = ed.clone();
+        let ed_close = ed.clone();
         let colors = crate::ui::theme::Theme::global(cx).colors;
         let link_input = popup.link.clone();
         let text_input = popup.text.clone();
         let card = gpui::div()
             .id("wy-image-edit-card")
             .debug_selector(|| "wy-image-edit-card".into())
+            // 点击**卡片外**任意处 → 关闭卡片（控件内点击不外发，不误关）。
+            .on_mouse_down_out(move |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {
+                ed_close.update(cx, |e, cx| e.close_image_edit(cx));
+            })
             .w(px(element::IMAGE_EDIT_CARD_W))
             .rounded_md()
             .border_1()
@@ -4090,9 +4160,9 @@ impl WyEditor {
         Some(
             gpui::deferred(
                 gpui::anchored()
-                    .position_mode(AnchoredPositionMode::Local)
+                    .position_mode(AnchoredPositionMode::Window)
                     .anchor(Anchor::TopLeft)
-                    .offset(gpui::point(px(left), px(top)))
+                    .position(gpui::point(px(left), px(top)))
                     .snap_to_window_with_margin(Edges::all(px(8.)))
                     .child(card),
             )
@@ -4570,7 +4640,9 @@ impl gpui::Render for WyEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         use gpui::{CursorStyle, InteractiveElement, ParentElement, Styled};
         // 图片编辑卡片浮层：在元素树根上**最后**叠加（最后绘制、命中最靠前），
-        // 锚定在目标图片旁渲染（打开时才有）。
+        // 锚定在目标图片旁渲染（打开时才有）。卡片几何取自 paint 期缓存的
+        // `image_edit_anchor`（同代 origin+frame），不在此现算帧（避免读到 ensure
+        // 兜底 800 宽重建的临时帧而横跳）。
         let image_edit_overlay = self.image_edit_card_element(window, cx);
         let mut root = gpui::div()
             .relative()

@@ -353,14 +353,29 @@ pub(crate) fn paint_image_row(
             border_color: gpui::hsla(0., 0., 1., 0.55),
             border_style: gpui::BorderStyle::Solid,
         });
-        // 竖向三个圆点：按钮水平居中、垂直三等分（间距 8px，圆点 4×4 圆角）。
-        let dot = size(px(4.), px(4.));
-        let dot_x = btn.left() + px((super::IMAGE_EDIT_BTN_SIZE - 4.) / 2.);
-        let dot_y0 = btn.top() + px(6.);
-        for k in 0..3 {
+        // ── ⋮ 三个圆点：可调参数（改这两处即可调视觉，其余由公式自动推导）──
+        //   DOT_N     圆点边长（px）：越小越细；默认 3。
+        //   DOT_GAP   相邻圆点的竖直间距（px）：越大越松散、越小越紧凑；默认 3。
+        // 布局公式（自动，不用改）：
+        //   三个圆点竖直排成一条线，整体在按钮盒内**垂直居中**：
+        //     总占用高 span = DOT_N*3 + DOT_GAP*(3−1)；
+        //     首点 y = 按钮顶 + (BTN − span)/2（上下留白各半，保证不偏出按钮）；
+        //     后续点依次下移 step = DOT_N + DOT_GAP。
+        //   水平居中：x = 按钮左 + (BTN − DOT_N)/2（左右留白各半）。
+        //   注意：DOT_N 改变了必须同步改 span/step 的推导（它们都以 DOT_N 为基准，
+        //   不要再用写死的旧值 4/8——那会让圆点在上方多偏半个圆点）。
+        let dot_size: f32 = 3.;
+        let dot_gap: f32 = 2.;
+        let dot_count: usize = 3;
+        let span = dot_count as f32 * dot_size + (dot_count - 1) as f32 * dot_gap;
+        let step = dot_size + dot_gap;
+        let dot = size(px(dot_size), px(dot_size));
+        let dot_x = btn.left() + px((super::IMAGE_EDIT_BTN_SIZE - dot_size) / 2.);
+        let dot_y0 = btn.top() + px((super::IMAGE_EDIT_BTN_SIZE - span) / 2.);
+        for k in 0..dot_count {
             window.paint_quad(gpui::PaintQuad {
-                bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * 8.)), dot),
-                corner_radii: gpui::Corners::all(px(2.)),
+                bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * step)), dot),
+                corner_radii: gpui::Corners::all(px(dot_size / 2.)),
                 background: gpui::hsla(0., 0., 0.22, 1.).into(),
                 border_widths: gpui::Edges::default(),
                 border_color: gpui::Hsla::default(),

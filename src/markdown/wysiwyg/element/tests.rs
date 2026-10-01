@@ -6438,6 +6438,14 @@ A-->B
             modifiers: Modifiers::default(),
         }
     }
+    fn img_up(x: f32, y: f32) -> gpui::MouseUpEvent {
+        gpui::MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }
+    }
 
     /// 图片编辑测试夹具：按**真实窗口内容宽**建帧并注入、`last_bounds` 置为原点。
     /// 返回 `(帧, 内容宽)`。注意：元素经 `notify` 触发重绘后会按真实宽重建帧，
@@ -6770,6 +6778,57 @@ A-->B
         });
     }
 
+    /// 打开后紧跟「鼠标抬起」：`on_mouse_up → end_selection` 会把帧置空——若 render 期
+    /// 缺帧就跳过卡片（或画到角落），卡片会「闪烁后失踪、鼠标再动才出现」。回归：抬起
+    /// 后同一帧重绘，卡片仍在且贴在图片上。
+    #[gpui::test]
+    fn image_edit_card_survives_mouse_up(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .unwrap()
+            .clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        // 悬浮 → 按下（打开）→ 抬起（end_selection 清帧）。
+        vcx.update(|window, cx| {
+            let ev = img_move(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+            let down = img_down(btn_x, btn_y);
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert!(ed.read(cx).image_edit_open(), "按下应打开卡片");
+            ed.update(cx, |e, c| e.on_mouse_up(&img_up(btn_x, btn_y), c));
+            assert!(ed.read(cx).image_edit_open(), "抬起不应关闭卡片");
+            let _ = window.draw(cx);
+        });
+        let card = vcx
+            .debug_bounds("wy-image-edit-card")
+            .expect("抬起后卡片仍应被绘制（不得因帧被清而消失/落角）");
+        assert!(
+            (f32::from(card.origin.y) - top).abs() < 8.,
+            "抬起后卡片 y {} 仍应贴图片行屏幕位 {top}",
+            f32::from(card.origin.y)
+        );
+    }
+
     /// 选中图片后 Delete → 删除整张图片行（与 Backspace 同一入口）。
     #[gpui::test]
     fn image_selected_delete_deletes_line(cx: &mut TestAppContext) {
@@ -6801,5 +6860,113 @@ A-->B
             assert_eq!(ed.read(cx).content(), "正文\n", "Delete 应删除整张图片行");
             assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
         });
+    }
+
+    /// 卡片锚点必须与「临时重建帧」解耦：打开后 `end_selection` 清帧、紧接着
+    /// `ensure_frame_for_input` 用兜底 800 宽重建的帧（与真实宽不同）**不得**让卡片
+    /// 横向移动（修复「卡片在某处突然往左闪烁」：render 期现算 frame 会读到宽度错误
+    /// 的临时帧）。断言：打开即缓存锚点（同代 origin+frame 得出），清帧 + 换 800 宽帧
+    /// 后锚点不变——render 永远只读缓存锚点。
+    #[gpui::test]
+    fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx
+                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .unwrap()
+            .clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        // 打开：锚点按「真实宽 W 的帧 + origin(0,0)」缓存。
+        vcx.update(|window, cx| {
+            let ev = img_move(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+            ed.update(cx, |e, c| e.on_mouse_down(&img_down(btn_x, btn_y), window, c));
+        });
+        let expected_l = 12. + (((width - 24.) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
+        let anchor0 = ed
+            .read_with(vcx, |e, _| e.image_edit_anchor())
+            .expect("打开即缓存锚点");
+        assert!(
+            (f32::from(anchor0.x) - expected_l).abs() < 1.
+                && (f32::from(anchor0.y) - top).abs() < 1.,
+            "打开锚点应贴图（x={:.1} 应≈{expected_l:.1}，y={:.1} 应≈{top:.1}）",
+            f32::from(anchor0.x),
+            f32::from(anchor0.y)
+        );
+        // 强制用「兜底 800 宽重建帧」覆盖当前帧（模拟 `ensure_frame_for_input` 在
+        // `end_selection` 清帧后的行为；不经过 paint，锚点不得跟着变）。
+        vcx.update(|window, cx| {
+            let f800 = build_frame(ed.read(cx), window, px(800.), (0., 2048.));
+            let rc = std::rc::Rc::new(f800);
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc));
+        });
+        let anchor1 = ed
+            .read_with(vcx, |e, _| e.image_edit_anchor())
+            .expect("锚点仍在");
+        assert!(
+            (f32::from(anchor1.x) - f32::from(anchor0.x)).abs() < 1.
+                && (f32::from(anchor1.y) - f32::from(anchor0.y)).abs() < 1.,
+            "锚点不得随临时 800 宽重建帧改变（防横向左跳）：({:.1},{:.1}) → ({:.1},{:.1})",
+            f32::from(anchor0.x),
+            f32::from(anchor0.y),
+            f32::from(anchor1.x),
+            f32::from(anchor1.y)
+        );
+    }
+
+    /// 点**卡片外**任意处 → 关闭卡片（对齐 `ui::menu` 的 on_mouse_down_out 语义）。
+    #[gpui::test]
+    fn image_edit_card_click_outside_closes(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        // 悬浮 + 点按钮打开卡片。
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let down = img_down(btn_x, btn_y);
+        vcx.update(|window, cx| {
+            let ev = img_move(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        });
+        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "点按钮应打开卡片");
+        // 点卡片外的空白区（图片右下方）→ 关闭。
+        vcx.simulate_click(point(px(50.), px(460.)), Modifiers::default());
+        vcx.run_until_parked();
+        assert!(
+            !ed.read_with(vcx, |e, _| e.image_edit_open()),
+            "点卡片外应关闭卡片"
+        );
     }
 

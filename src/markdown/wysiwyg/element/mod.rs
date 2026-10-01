@@ -1022,6 +1022,16 @@ impl Element for WyEditorElement {
         // `source_offset_at` 需用它把命中换算回元素局部坐标。
         self.editor
             .update(cx, |e, _| e.set_last_bounds(Some(bounds)));
+        // 图片编辑卡片锚点：以**本帧** `bounds.origin` + 当前帧几何**同代配对**算出并
+        // 缓存（render 只读缓存摆卡片）。⚠️ 不能由 render 现算 frame——`end_selection`
+        // 清帧后 `ensure_frame_for_input` 用兜底 800 宽重建的临时帧与真实帧宽不同，
+        // render 期每次读到不同宽度 → 卡片横向左右跳一帧。
+        self.editor
+            .update(cx, |e, _| {
+                e.set_image_edit_anchor(
+                    frame.as_ref().and_then(|f| e.image_edit_anchor_at(bounds.origin, f)),
+                );
+            });
         // 数学排版同步（可见带懒光栅）：只对**当前带内**公式发起排版（对齐
         // view/editor 只渲染可见区；不再开篇全量光栅 1.3 万公式占满后台 CPU）。
         let _t_sm = crate::prof::begin();
