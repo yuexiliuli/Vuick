@@ -21,6 +21,17 @@
 //!   解码从内存字节开始，不再等磁盘 IO；重解码/回看不重读盘；
 //! - **解码结果 LRU 缓存**（张数 + 字节双上限）：命中即 O(1) 瞬时上屏。
 //!
+//! # 大图打开/滚动（school 20MP 照片，CPU/内存双降 + 清晰）
+//! - **按展示像素解码（decode to display size）**：JPEG 走 `libjpeg-turbo`（纯 Rust SIMD：
+//!   AVX2/SSE2 IDCT 降档 + 直出 BGRA，无 `DynamicImage` 中间拷贝）按 [`Self::display_need`]
+//!   档位解码。选档规则 = **解码分辨率 ≥ 显示需要的像素**（上限 1/8，需要涨则分母落，
+//!   需要超过原图才全解）——GPU 只缩小不放大 → **显示不糊**；单帧内存 75MB→~20MB。
+//! - **内存/CPU 有界**：解码并发照旧 [`MAX_DECODE`]-1 预取封顶，且 [`Self::pump_prefetch`]
+//!   在解码缓存达到字节预算后**停止派发**（[`CACHE_MAX_BYTES`]）——不再把整个文件夹扫一遍
+//!   白算 CPU（此前 106 张全解 ≈ 8GB 像素量磨 8 核）。缓存能装 ~9 张显示档 → 滚动基本全命中。
+//! - **放大升档**：Ctrl+滚轮使 `display_need` 变大 → [`Self::escalate_display_denom`] 按需
+//!   重解更细档（只升不降，`in_flight` 去重防抖）——1:1 看细节时自动回到全解清晰图。
+//!
 //! 落盘守卫：一次解码结果只在「仍是当前显示目标（`self.path == decode_path`）」时才
 //! 上屏，乱序/过期的中间结果只进缓存不抢显示——彻底杜绝旧图覆盖新图。
 //!
@@ -43,6 +54,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 use image::{Frame, RgbaImage};
+use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
 /// 缩放下限 / 上限 / 步进（语义同 PDF 阅读器 Ctrl+滚轮缩放，区间更宽以支持图片 1:1 微调）。
 const ZOOM_MIN: f32 = 0.2;
@@ -50,6 +62,9 @@ const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
 /// 画布四边留白（px，适应视口时的外衬）。
 const PAD: f32 = 24.0;
+/// 展示像素需要初始值：窗口/视口数据未知（首个 render 前）时的合理猜测 ≈1080p，
+/// 保证首解就是「显示尺寸档」而非低清档；首个 render 立即用真实视口校正。
+const DISPLAY_NEED_INIT: (f32, f32) = (1920.0, 1080.0);
 
 use crate::config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
@@ -63,6 +78,9 @@ struct CacheEntry {
     render: Arc<RenderImage>,
     intrinsic: (f32, f32),
     bytes: usize,
+    /// JPEG 实际解码降档分母（1/8/4/2/1；非 JPEG 恒 1）。用于「升档判定」：
+    /// 展示分母 > 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
+    denom: u8,
 }
 
 /// 原始文件压缩字节（磁盘→RAM 预读层，LRU 字节预算缓存；解码从这里取字节免等磁盘）。
@@ -129,6 +147,15 @@ pub struct ImageViewer {
     fast_count: u32,
     /// 上一步滚动的时间戳（用于计算步间隔）。
     last_scroll_at: Option<std::time::Instant>,
+    /// 上一帧实测的可视视口尺寸（render 期记录；展示像素需要 / 显示尺寸据此）。
+    last_viewport: (f32, f32),
+    /// 展示像素需要（宽, 高）：由「适应视口尺寸 × zoom」算出，**JPEG 解码档位的下限**——
+    /// 解码分辨率 ≥ 该值（GPU 只缩小、不放大）→ 显示不糊。首个 render 前用
+    /// [`DISPLAY_NEED_INIT`] 兜底。
+    display_need: (f32, f32),
+    /// 当前安装展示的 JPEG 降档分母（1/8/4/2/1；非 JPEG 恒 1）。缩放放大且需要更细档时
+    /// 据此触发「升档」重解（[`Self::escalate_display_denom`]）。
+    display_denom: u8,
 }
 
 impl ImageViewer {
@@ -161,6 +188,9 @@ impl ImageViewer {
             last_scroll_dir: 1,
             fast_count: 0,
             last_scroll_at: None,
+            last_viewport: (0.0, 0.0),
+            display_need: DISPLAY_NEED_INIT,
+            display_denom: 1,
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
@@ -224,6 +254,8 @@ impl ImageViewer {
         self.byte_flight.clear();
         self.pending_target = None;
         self.prefetch_inflight = 0;
+        self.display_denom = 1;
+        self.display_need = DISPLAY_NEED_INIT;
     }
 
     /// 视口尺寸：`#image-scroll` 布局后的真实可视区；首帧未布局（bounds 为 0）
@@ -243,13 +275,31 @@ impl ImageViewer {
         (w, h)
     }
 
-    /// 显示尺寸 = 适应视口（Contain，含 PAD 留白）× 缩放倍数。
-    fn display_size(&self, iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
+    /// 适应视口（Contain，含 PAD 留白）基准尺寸（不含缩放；两轴任意一端贴边）。
+    fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
         let avail_w = (vw - 2.0 * PAD).max(16.0);
         let avail_h = (vh - 2.0 * PAD).max(16.0);
         let fit = (avail_w / iw).min(avail_h / ih).max(0.001);
-        let scale = fit * self.zoom;
-        (iw * scale, ih * scale)
+        (iw * fit, ih * fit)
+    }
+
+    /// 显示尺寸 = 适应视口（Contain，含 PAD 留白）× 缩放倍数。
+    fn display_size(&self, iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
+        let (fw, fh) = Self::contain_fit(iw, ih, vw, vh);
+        (fw * self.zoom, fh * self.zoom)
+    }
+
+    /// 刷新「展示像素需要」[`Self::display_need`]（= 适应视口尺寸 × zoom）：它就是 JPEG
+    /// 解码档位的**下限**——解码分辨率 ≥ 它，GPU 只会缩小不会放大，显示不糊、内存不浪费。
+    /// render 期与缩放/切图事件期调用；视口未布局（首帧）时保持 [`DISPLAY_NEED_INIT`]。
+    fn update_display_need(&mut self) {
+        let Some((iw, ih)) = self.intrinsic else {
+            self.display_need = DISPLAY_NEED_INIT;
+            return;
+        };
+        let (vw, vh) = self.last_viewport;
+        let (dw, dh) = Self::contain_fit(iw, ih, vw, vh);
+        self.display_need = ((dw * self.zoom).max(1.0), (dh * self.zoom).max(1.0));
     }
 
     /// 画布默认底色：浅色浅灰 / 深色深灰（与 PDF 阅读器一致）。
@@ -306,14 +356,17 @@ impl ImageViewer {
         cx.stop_propagation();
     }
 
-    /// 应用缩放因子并约束在 [ZOOM_MIN, ZOOM_MAX]。
+    /// 应用缩放因子并约束在 [ZOOM_MIN, ZOOM_MAX]。缩放会改变「展示像素需要」（放大需更细
+    /// 档），故刷新 [`Self::display_need`] 并在「当前展示比需要更粗」时升档重解。
     fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
         let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if (new_zoom - self.zoom).abs() < 1e-4 {
             return;
         }
         self.zoom = new_zoom;
+        self.update_display_need();
         cx.notify();
+        self.escalate_display_denom(cx);
     }
 
     /// 在同文件夹清单内切换（`dir` = ±1，取模循环）。切换本身 O(1)：目标立即写入
@@ -355,11 +408,13 @@ impl ImageViewer {
     }
 
     /// 显示入口（首图 / 切换共用）：`path` 已指向目标。缓存命中 → 瞬时落盘并启动级联
-    /// 预取；未中 → 置 loading 并进入「并行解码池」（去重 / 追最新）。
+    /// 预取；未中 → 置 loading 并进入「并行解码池」（去重 / 追最新）。命中后按当前
+    /// 展示需要判断是否需升档（缓存的可能是旧档位）。
     fn request_display(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         if let Some(entry) = self.cache_get(&path) {
             self.install_current(entry, &path, cx);
+            self.escalate_display_denom(cx);
             return;
         }
         self.loading = true;
@@ -390,7 +445,9 @@ impl ImageViewer {
     }
 
     /// 派发一次并行解码（解码池槽位之一）：优先用字节缓存里的内存字节，否则后台读盘并把
-    /// 字节回填缓存（重解码不重读盘）。结果只进缓存；仅当「仍是当前显示目标」才上屏。
+    /// 字节回填缓存（重解码不重读盘）。按当前「展示像素需要」解码（JPEG 走 libjpeg-turbo
+    /// SIMD 降档直出 BGRA；其它格式走 `image` 全解）。结果只进缓存；仅当「仍是当前显示
+    /// 目标」才上屏。
     fn spawn_decode(&mut self, path: PathBuf, is_prefetch: bool, cx: &mut Context<Self>) {
         self.in_flight.insert(path.clone());
         if is_prefetch {
@@ -399,8 +456,9 @@ impl ImageViewer {
         let bytes = self.byte_cache_get(&path);
         let decode_path = path;
         let read_path = decode_path.clone();
+        let need = self.display_need;
         cx.spawn(async move |weak, cx| {
-            // 后台：取字节（缓存命中直接用；未中读盘）→ 解码 → 返回 (原始字节, 解码结果)。
+            // 后台：取字节（缓存命中直接用；未中读盘）→ 按展示需要解码 → 返回 (原始字节, 结果)。
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
@@ -408,7 +466,7 @@ impl ImageViewer {
                         Some(b) => b,
                         None => Arc::new(std::fs::read(&read_path).map_err(|e| e.to_string())?),
                     };
-                    let decoded = decode_image_bytes(&raw);
+                    let decoded = decode_background(&raw, need);
                     Ok::<_, String>((raw, decoded))
                 })
                 .await;
@@ -428,14 +486,10 @@ impl ImageViewer {
                             },
                         );
                         match decoded {
-                            Ok((bgra, w, h)) => {
-                                if let Some(buf) = RgbaImage::from_raw(w, h, bgra) {
-                                    let entry = CacheEntry {
-                                        path: decode_path.clone(),
-                                        render: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
-                                        intrinsic: (w as f32, h as f32),
-                                        bytes: w as usize * h as usize * 4,
-                                    };
+                            Ok((bgra, w, h, den)) => {
+                                if let Some(entry) =
+                                    Self::build_entry(decode_path.clone(), bgra, w, h, den)
+                                {
                                     this.cache_put(decode_path.clone(), entry.clone());
                                     if this.path == decode_path {
                                         this.install_current(entry, &decode_path, cx);
@@ -475,11 +529,49 @@ impl ImageViewer {
     }
 
     /// 并发槽空出后的兜底：把「最新显示目标」重新入队（已在解 / 已缓存的情况下
-    /// `queue_decode` 自行处理）。
+    /// [`Self::queue_decode`] 自行处理）。
     fn drain_pending(&mut self, cx: &mut Context<Self>) {
         if let Some(p) = self.pending_target.take() {
             self.queue_decode(p, true, cx);
         }
+    }
+
+    /// 「升档」：当前展示是 JPEG 且降档分母比当前展示需要更粗（解码像素比显示小）时，
+    /// 重解更细档替换。直接派发（跳过 [`Self::queue_decode`] 的缓存短路——缓存里存的旧档位
+    /// 命中只会装回旧图）；`in_flight`/并发满则记 [`Self::pending_target`]。完成后新档
+    /// 经 `cache_put` 替换粗档并上屏，`display_denom` 收敛到 ≤ 需要 → 不再触发（只升不降）。
+    fn escalate_display_denom(&mut self, cx: &mut Context<Self>) {
+        if self.display_denom == 1 || !path_is_jpeg(&self.path) {
+            return;
+        }
+        let Some((iw, ih)) = self.intrinsic else {
+            return;
+        };
+        let desired = pick_jpeg_denom(iw as u32, ih as u32, self.display_need);
+        if self.display_denom <= desired {
+            return;
+        }
+        let path = self.path.clone();
+        if self.in_flight.contains(&path) {
+            return;
+        }
+        if self.in_flight.len() >= MAX_DECODE {
+            self.pending_target = Some(path);
+            return;
+        }
+        self.spawn_decode(path, false, cx);
+    }
+
+    /// 从 BGRA 像素构建缓存条目（`denom` 记入条目：展示档位 / 升档判定用）。
+    fn build_entry(path: PathBuf, bgra: Vec<u8>, w: u32, h: u32, denom: u8) -> Option<CacheEntry> {
+        let buf = RgbaImage::from_raw(w, h, bgra)?;
+        Some(CacheEntry {
+            path,
+            render: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
+            intrinsic: (w as f32, h as f32),
+            bytes: w as usize * h as usize * 4,
+            denom,
+        })
     }
 
     /// 方向感知的**双向级联预取**（滑动窗口）：
@@ -510,6 +602,10 @@ impl ImageViewer {
             && self.prefetch_inflight < MAX_DECODE - 1
             && (self.prefetch_pos - self.prefetch_origin).abs() <= forward_win
         {
+            // 解码缓存已满（字节预算）→ 预取一解即被 LRU 挤掉，纯白算 CPU：停止新派发
+            if self.cache_bytes >= CACHE_MAX_BYTES {
+                break;
+            }
             let ni = self.prefetch_pos.rem_euclid(n) as usize;
             let path = self.folder[ni].clone();
             self.prefetch_pos += self.prefetch_dir as i64;
@@ -525,7 +621,9 @@ impl ImageViewer {
         if !self.scroll_fast {
             let base = self.current as i64;
             for k in 1..=PREFETCH_BACKWARD as i64 {
-                if self.prefetch_inflight + 1 >= MAX_DECODE || self.cache.len() >= CACHE_MAX_ITEMS
+                if self.prefetch_inflight + 1 >= MAX_DECODE
+                    || self.cache.len() >= CACHE_MAX_ITEMS
+                    || self.cache_bytes >= CACHE_MAX_BYTES
                 {
                     break;
                 }
@@ -594,6 +692,8 @@ impl ImageViewer {
         self.path = path.to_path_buf();
         self.image = Some(entry.render);
         self.intrinsic = Some(entry.intrinsic);
+        self.display_denom = entry.denom;
+        self.update_display_need();
         self.loading = false;
         self.load_error = None;
         cx.notify();
@@ -720,7 +820,10 @@ impl Render for ImageViewer {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let muted: Hsla = theme.colors.fg_muted.into();
         let surface: Hsla = theme.colors.surface.into();
-        let (vw, vh) = self.viewport_size(window);
+        // 记录可视视口并刷新「展示像素需要」（JPEG 解码档位依据；缩放事件期也刷新）
+        self.last_viewport = self.viewport_size(window);
+        self.update_display_need();
+        let (vw, vh) = self.last_viewport;
 
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开图片：{err}"), muted)
@@ -796,10 +899,56 @@ impl Render for ImageViewer {
     }
 }
 
-/// 后台解码（输入内存字节）：`image` crate 解码 → **BGRA** 像素（GPUI 渲染格式；
-/// `image` crate 支持 png/jpg/gif/bmp/webp/ico/tiff 等）。返回 BGRA 字节 + 像素宽高。
-/// 与磁盘 IO 分离（[`decode_image_at`] 负责读盘），解码流水线可从字节缓存直接调用。
-fn decode_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+/// JPEG 魔数（FF D8 FF）检测：区分「JPEG 走 libjpeg-turbo 降档」与「其它格式走 image 全解」。
+/// 以字节为准，比扩展名可信（伪装成 .jpg 的其它格式不会被误当 JPEG 硬解）。
+fn is_jpeg_magic(b: &[u8]) -> bool {
+    b.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+/// 路径扩展名是否 jpg/jpeg（升档路由的廉价判据；最终仍以魔数 + `probe` 为准）。
+fn path_is_jpeg(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
+}
+
+/// 按「展示像素需要」选 JPEG 降档分母 {1,2,4,8}：取**最大**的、让解码尺寸 ≥ 需要尺寸的
+/// 分母（缺省 1 = 全解）。保证一张图只在「解码 ≥ 显示」的前提下尽量省内存——GPU 只会把
+/// 图缩小、绝不放大 → 显示**不糊**（这是行业「decode to display size」的地基：放大时
+/// 需要涨、分母自然下降，需要 > 原图时才落到全解）。
+fn pick_jpeg_denom(iw: u32, ih: u32, need: (f32, f32)) -> u8 {
+    let (nw, nh) = (need.0.max(1.0), need.1.max(1.0));
+    for den in [8u8, 4, 2, 1] {
+        let w = (iw as f32 / den as f32).ceil();
+        let h = (ih as f32 / den as f32).ceil();
+        if w >= nw && h >= nh {
+            return den;
+        }
+    }
+    1
+}
+
+/// JPEG 按展示需要**降档解码**（libjpeg-turbo SIMD，IDCT 缩放 + 直出 BGRA，无中间拷贝）：
+/// 返回 BGRA 字节 + 输出尺寸 + 实际降档分母。`probe` 先读头拿完整尺寸再选档。
+fn decode_jpeg_display(
+    bytes: &[u8],
+    need: (f32, f32),
+) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    let info = libjpeg_turbo_rs::probe(bytes)
+        .map_err(|e| format!("JPEG 读取头部失败：{e}"))?;
+    let (iw, ih) = (info.width as u32, info.height as u32);
+    let den = pick_jpeg_denom(iw, ih, need);
+    let mut dec = LtjDecoder::new(bytes).map_err(|e| format!("JPEG 解码器初始化失败：{e}"))?;
+    dec.set_scale(ScalingFactor::new(1, u32::from(den)));
+    dec.set_output_format(LtjPixelFormat::Bgra);
+    let img = dec
+        .decode_image()
+        .map_err(|e| format!("JPEG 解码失败：{e}"))?;
+    Ok((img.data, img.width as u32, img.height as u32, den))
+}
+
+/// 非 JPEG 全解 → **BGRA**（`image` crate 默认特性支持 png/gif/bmp/webp/ico/tiff…）。
+fn decode_generic(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -812,12 +961,40 @@ fn decode_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((bgra, w, h))
 }
 
-/// 读盘 + 解码（[`decode_image_bytes`]）。生产流水线走「字节缓存 / 后台 read + 解码」，
-/// 此包装仅测试（含 bench）与回退路径使用。
+/// 后台解码总入口：JPEG → libjpeg-turbo 按展示需要降档直出 BGRA（特殊 JPEG 如 CMYK / 12bit /
+/// lossless 解不动时回退 `image` 全解，绝不硬失败）；非 JPEG → `image` 全解。返回
+/// (BGRA 字节, 宽, 高, 降档分母)。
+fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    if is_jpeg_magic(bytes) {
+        match decode_jpeg_display(bytes, need) {
+            Ok(out) => Ok(out),
+            Err(_) => {
+                let (bgra, w, h) = decode_generic(bytes)?;
+                Ok((bgra, w, h, 1))
+            }
+        }
+    } else {
+        let (bgra, w, h) = decode_generic(bytes)?;
+        Ok((bgra, w, h, 1))
+    }
+}
+
+/// 读盘 + 全分辨率解码（旧链路；仅测试 / bench 对比「全解基准值」用，生产走
+/// [`decode_background`]）。
 #[cfg(test)]
 fn decode_image_at(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    decode_image_bytes(&bytes)
+    decode_generic(&bytes)
+}
+
+/// 读盘 + 按展示需要降档解码（bench / 测试验证「显示尺寸档」用）。
+#[cfg(test)]
+fn decode_display_at(
+    path: &Path,
+    need: (f32, f32),
+) -> Result<(Vec<u8>, u32, u32, u8), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    decode_background(&bytes, need)
 }
 
 /// 扫描当前图片所在文件夹的全部图片（扩展名过滤、文件名升序），返回
@@ -888,6 +1065,81 @@ mod tests {
         assert!(decode_image_at(&p).is_err());
     }
 
+    /// 写一张有内容（渐变）的 JPEG：保存走 `image` 内置 jpeg 编码（default features 支持）。
+    fn write_jpeg(path: &Path, w: u32, h: u32) {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let r = ((x * 255) / w) as u8;
+            let g = ((y * 255) / h) as u8;
+            let b = ((x + y) * 60 / (w + h)) as u8;
+            *px = image::Rgb([r, g, b]);
+        }
+        img.save(path).expect("写出渐变 JPEG 应成功");
+    }
+
+    #[test]
+    fn jpeg_scaled_decode_bgra_direct_and_sharp_boundary() {
+        let dir = tmp_dir("jpeg_disp");
+        let p = dir.join("big.jpg");
+        write_jpeg(&p, 400, 300);
+        let bytes = std::fs::read(&p).unwrap();
+        // 展示需要 (200,150) → 1/2 档 200×150；BGRA 直出
+        let (bgra, w, h, den) = decode_background(&bytes, (200.0, 150.0)).expect("JPEG 降档应成功");
+        assert_eq!((w, h, den), (200, 150, 2));
+        assert_eq!(bgra.len(), (200 * 150 * 4) as usize);
+        // 左上角 (0,0) 黑色 → BGRA [0,0,0,255]；右下角 (399,299) 渐变近
+        // B≈60,G≈254,R≈254 → BGRA [B,G,R,255]（libjpeg-turbo Bgra 直出 = GPUI 字节序）。
+        assert_eq!([bgra[0], bgra[1], bgra[2], bgra[3]], [0, 0, 0, 255]);
+        let tail = &bgra[(bgra.len() - 4)..];
+        assert!(tail[0] < 150 && tail[1] > 200 && tail[2] > 200, "右下应低蓝高红：{tail:?}");
+        // 展示需要 ≥ 原图 → 全解（1/1）
+        let (_b, w2, _h2, den2) = decode_background(&bytes, (400.0, 400.0)).unwrap();
+        assert_eq!((w2, den2), (400, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_jpeg_denom_never_below_display_pixels() {
+        // 20MP + 1080p 视口需要 (1376,1032)：1/2（2560×1920）恰好全cover、1/4（1280×960）
+        // 会低于 1376 → 必须选 1/2 —— 这就是「不糊」的边界。
+        assert_eq!(pick_jpeg_denom(5120, 3840, (1376.0, 1032.0)), 2);
+        assert_eq!(pick_jpeg_denom(5120, 3840, (1280.0, 960.0)), 4);
+        assert_eq!(pick_jpeg_denom(5120, 3840, (1281.0, 960.0)), 2, "超一像素也必须升 1/2");
+        // 缩小看（zoom<1）→ 需要变小 → 可压到 1/8（640×480 ≥ 275×206）
+        assert_eq!(pick_jpeg_denom(5120, 3840, (275.0, 206.0)), 8);
+        // 放大 2× → 需要 (2752,2064) > 1/2（2560×1920）→ 全解
+        assert_eq!(pick_jpeg_denom(5120, 3840, (2752.0, 2064.0)), 1);
+        // 小图不需要降档
+        assert_eq!(pick_jpeg_denom(800, 600, (1920.0, 1080.0)), 1);
+    }
+
+    /// 端到端：打开 20MP JPEG → 首解即「显示尺寸档」（1/2，不糊），而非低清 1/8；缓存也只
+    /// 存这份清晰档。测试执行器无窗口，用 [`DISPLAY_NEED_INIT`]（≈1080p）作为展示需要。
+    #[gpui::test]
+    async fn jpeg_cold_open_installs_sharp_display(cx: &mut TestAppContext) {
+        let dir = tmp_dir("sharp");
+        let p = dir.join("big.jpg");
+        write_jpeg(&p, 5120, 3840);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        let (den, w, h, cache_len) = cx.update(|app| {
+            let v = viewer.read(app);
+            let c = v.cache.len();
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+                c,
+            )
+        });
+        // 展示需要下限 = DISPLAY_NEED_INIT(1920×1080) → 1/2 档（2560×1920），分辨率 ≥ 显示，不糊
+        assert_eq!(den, 2, "首解应为 1/2 显示尺寸档，而非低清 1/8：{den}");
+        assert_eq!((w, h), (2560, 1920));
+        assert_eq!(cache_len, 1, "缓存应是唯一一份清晰档");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scan_folder_sorts_images_ignores_others_and_locates_current() {
         let dir = tmp_dir("scan");
@@ -919,10 +1171,11 @@ mod tests {
         assert_eq!(list[0], p);
     }
 
-    /// 实测「切换图片」耗时：对指定文件夹内每张图跑一次 `decode_image_at`（=冷缓存切换
-    /// 时查看器实际等待的解码链路：fs::read + image 解码 + BGRA 交换）。缓存命中时切换
-    /// 是 O(1) 瞬时（接近 0，主要剩首次 GPU 上传）。目录可用 `IMG_BENCH_DIR` 覆盖，
-    /// 默认测 `C:\Users\20294\Pictures\ave mujica`。用 `--ignored --nocapture` 运行。
+    /// 实测大图冷解码耗时：**全分辨率（旧链路 `image` 全解）vs 展示尺寸档（新链路
+    /// libjpeg-turbo SIMD 降档直出 BGRA）**。展示需要固定为 1080p 视口 contain 的真实量
+    /// （1376×1032）——验证 20MP 照片打开/切换由 debug ~7s 降到几十 ms、且解码分辨率 ≥ 显示
+    /// （不糊）。目录 `IMG_BENCH_DIR`（school 用 school），`IMG_BENCH_LIMIT` 前 N 张。
+    /// `--ignored --nocapture` 运行。
     #[test]
     #[ignore]
     fn bench_decode_folder() {
@@ -943,47 +1196,66 @@ mod tests {
         {
             files.truncate(n);
         }
+        // 1080p 视口 contain 需要的展示像素（≈ 结果「显示尺寸档」的选档基准）
+        let need = (1376.0, 1032.0);
         eprintln!(
-            "\n[IMG-BENCH] {} 张 · 每张冷解码耗时（fs::read + image 解码 + RGBA→BGRA）：",
-            files.len()
+            "\n[IMG-BENCH] {} 张 | 全解(旧 image) vs 展示尺寸(libjpeg-turbo SIMD 降档, 需要 {:.0}×{:.0})：",
+            files.len(),
+            need.0,
+            need.1
         );
-        let mut samples: Vec<(f64, u64)> = Vec::new();
-        let mut total_bytes = 0u64;
+        let mut full: Vec<f64> = Vec::new();
+        let mut disp: Vec<f64> = Vec::new();
         for p in &files {
-            let t = std::time::Instant::now();
-            let res = decode_image_at(p);
-            let ms = t.elapsed().as_secs_f64() * 1000.0;
             let meta = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-            total_bytes += meta;
-            match res {
-                Ok((_bgra, w, h)) => {
+            let t0 = std::time::Instant::now();
+            let full_res = decode_image_at(p);
+            let ms_full = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = std::time::Instant::now();
+            let disp_res = decode_display_at(p, need);
+            let ms_disp = t1.elapsed().as_secs_f64() * 1000.0;
+            match (full_res, disp_res) {
+                (Ok((_a, wf, hf)), Ok((_b, wd, hd, den))) => {
                     eprintln!(
-                        "  {:7.1}ms  {:>9} px  {:6.1} KB  {}",
-                        ms,
-                        w as usize * h as usize,
+                        "  旧 {:7.1}ms {:>9}px | 新 {:7.1}ms {:>9}px (1/{})  提速 {:6.1}×   {:6.1} KB  {}",
+                        ms_full,
+                        wf as usize * hf as usize,
+                        ms_disp,
+                        wd as usize * hd as usize,
+                        den,
+                        ms_full / ms_disp.max(0.001),
                         meta as f64 / 1024.0,
                         p.file_name().unwrap().to_string_lossy()
                     );
-                    samples.push((ms, meta));
+                    full.push(ms_full);
+                    disp.push(ms_disp);
                 }
-                Err(e) => eprintln!("  ERR {}: {e}", p.display()),
+                (Err(e), _) => eprintln!("  ERR（全解）{}: {e}", p.display()),
+                (_, Err(e)) => eprintln!("  ERR（展示）{}: {e}", p.display()),
             }
         }
-        if !samples.is_empty() {
-            let sum: f64 = samples.iter().map(|s| s.0).sum();
-            let min = samples.iter().map(|s| s.0).fold(f64::MAX, f64::min);
-            let max = samples.iter().map(|s| s.0).fold(f64::MIN, f64::max);
+        if !full.is_empty() && !disp.is_empty() {
+            let avg = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+            let mmin = |v: &Vec<f64>| v.iter().cloned().fold(f64::MAX, f64::min);
+            let mmax = |v: &Vec<f64>| v.iter().cloned().fold(f64::MIN, f64::max);
+            let f_avg = avg(&full);
+            let d_avg = avg(&disp);
             eprintln!(
-                "  --- 冷解码：均值 {:.1}ms / min {:.1}ms / max {:.1}ms / 共 {} 张 / 总 {:.1} MB",
-                sum / samples.len() as f64,
-                min,
-                max,
-                samples.len(),
-                total_bytes as f64 / (1024.0 * 1024.0)
+                "  --- 全解(旧)：均值 {:.1}ms / min {:.1}ms / max {:.1}ms",
+                f_avg,
+                mmin(&full),
+                mmax(&full)
             );
             eprintln!(
-                "  --- 切换体感：缓存命中 ≈ 0ms（瞬时 + 首次 GPU 上传）；缓存未中 ≈ 该图冷解码 ≈ {:.1}ms",
-                sum / samples.len() as f64
+                "  --- 展示尺寸(新)：均值 {:.1}ms / min {:.1}ms / max {:.1}ms （综合提速 {:.1}×）",
+                d_avg,
+                mmin(&disp),
+                mmax(&disp),
+                f_avg / d_avg.max(0.001)
+            );
+            eprintln!(
+                "  --- 切换体感：缓存命中 ≈ 0ms；冷目标按展示档解码 ≈ {:.0}ms，随后预取全命中",
+                d_avg
             );
         }
     }
