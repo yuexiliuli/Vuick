@@ -41,7 +41,10 @@
 //! # 滚轮手势（P1）
 //! - 行滚轮（鼠标）：1 事件 = 1 张；
 //! - 像素滚轮（触控板）：累计像素超过 [`WHEEL_PIXEL_STEP`] 才切一张，把洪水事件合并
-//!   成离散步进，不一次飞过多张。
+//!   成离散步进，不一次飞过多张；
+//! - **Ctrl+滚轮缩放 + 滚轮/拖拽浏览**：放大后滚轮**优先在图片内平移**（滚到边缘继续同向
+//!   外滚才切下/上一张），左键拖拽也可平移（开手/抓手光标）；**切图时缩放复位为适应视口
+//!   、平移归零**（每张从初始大小开始）。
 //!
 //! # 通知宿主
 //! `notify()` + `refresh_windows()` 双保险（实体未注册 window invalidator 时仅 notify
@@ -52,9 +55,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, img, px, rgb, App, Context, Hsla, InteractiveElement, IntoElement, ObjectFit,
-    ParentElement, Render, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Window,
+    div, img, px, rgb, App, Context, CursorStyle, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Render,
+    RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, Window,
 };
 use image::{Frame, RgbaImage};
 use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
@@ -65,6 +69,11 @@ const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
 /// 画布四边留白（px，适应视口时的外衬）。
 const PAD: f32 = 24.0;
+/// 放大态滚轮平移每格的视口比例（Lines 滚轮：一下滚轮平移多少视口高；直接切图的
+/// 未放大态此值无意义）。
+const WHEEL_LINE_PAN_FRACTION: f32 = 0.15;
+/// 像素滚轮：每累计一个 [`WHEEL_PIXEL_STEP`] 平移的像素 = 步长 × 本倍率（放大态平移步进）。
+const WHEEL_PIXEL_PAN_MULT: f32 = 4.0;
 /// 展示像素需要初始值：窗口/视口数据未知（首个 render 前）时的合理猜测 ≈1080p，
 /// 保证首解就是「显示尺寸档」而非低清档；首个 render 立即用真实视口校正。
 const DISPLAY_NEED_INIT: (f32, f32) = (1920.0, 1080.0);
@@ -162,6 +171,10 @@ pub struct ImageViewer {
     /// 当前安装展示的 JPEG 降档分母（1/8/4/2/1；非 JPEG 恒 1）。缩放放大且需要更细档时
     /// 据此触发「升档」重解（[`Self::escalate_display_denom`]）。
     display_denom: u8,
+    /// 平移（px）：放大后拖拽浏览其他区域，以视口中心为基准、每帧 clamp 到图始终覆盖视口。
+    pan: (f32, f32),
+    /// 拖拽平移进行中：(左键按下位置, 按下时 pan 起点)。
+    drag: Option<((f32, f32), (f32, f32))>,
 }
 
 impl ImageViewer {
@@ -198,6 +211,8 @@ impl ImageViewer {
             last_viewport: (0.0, 0.0),
             display_need: DISPLAY_NEED_INIT,
             display_denom: 1,
+            pan: (0.0, 0.0),
+            drag: None,
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
@@ -264,6 +279,8 @@ impl ImageViewer {
         self.prefetch_inflight = 0;
         self.display_denom = 1;
         self.display_need = DISPLAY_NEED_INIT;
+        self.pan = (0.0, 0.0);
+        self.drag = None;
     }
 
     /// 视口尺寸：`#image-scroll` 布局后的真实可视区；首帧未布局（bounds 为 0）
@@ -340,28 +357,73 @@ impl ImageViewer {
             let step = delta_y.clamp(-1.0, 1.0);
             self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
         } else {
-            // 单滚轮：向下滚（delta.y<0）→ 下一张；向上滚 → 上一张。
+            // 单滚轮：未放大 → 切图（向下滚 → 下一张，向上滚 → 上一张）；放大态 →
+            // 先在图片内平移，滚到边缘继续同向外滚才切图（[`Self::wheel_pan_or_switch`]）。
             match event.delta {
-                // 行滚轮（鼠标）：1 事件 = 1 张。
+                // 行滚轮（鼠标）：1 事件 = 1 格（放大态平移一格 = 视口高的一部分）。
                 ScrollDelta::Lines(_) => {
-                    self.switch(if delta_y < 0.0 { 1 } else { -1 }, cx);
+                    let (_, vh) = self.last_viewport;
+                    let pan_step = (vh * WHEEL_LINE_PAN_FRACTION).max(32.0);
+                    self.wheel_pan_or_switch(if delta_y < 0.0 { 1 } else { -1 }, pan_step, cx);
                 }
-                // 像素滚轮（触控板）：累计像素，超过一步门限才切（合并洪水事件）。
+                // 像素滚轮（触控板）：累计像素，超过一步门限才动作（未放大切图时合并
+                // 洪水事件；放大态按步进平移，可连续跟随）。
                 ScrollDelta::Pixels(_) => {
                     self.scroll_accum += delta_y;
                     let step = crate::config::image::WHEEL_PIXEL_STEP;
+                    let pan_step = step * WHEEL_PIXEL_PAN_MULT;
                     while self.scroll_accum >= step {
-                        self.switch(1, cx);
+                        self.wheel_pan_or_switch(1, pan_step, cx);
                         self.scroll_accum -= step;
                     }
                     while self.scroll_accum <= -step {
-                        self.switch(-1, cx);
+                        self.wheel_pan_or_switch(-1, pan_step, cx);
                         self.scroll_accum += step;
                     }
                 }
             }
         }
         cx.stop_propagation();
+    }
+
+    /// 滚轮分发（未放大 ↔ 放大态切换语义）：
+    /// - **未放大**（图两轴都 ≤ 视口）→ 保持原有「滚轮切图」：`dir=1`（向下滚）切下一张、
+    ///   `dir=-1` 切上一张；
+    /// - **放大态** → 优先**纵向平移**（`dir=1` = 看图片下方，`pan.y -= pan_step`），滚到该轴
+    ///   边缘且**继续同向外滚**（越界量）才触发切图——即「滚到底部才切下一张」；纵向不越界
+    ///   时才启用横向平移。切图由 [`Self::switch`] 统一复位（缩放→适应视口、平移/拖拽归零）。
+    fn wheel_pan_or_switch(&mut self, dir: i32, pan_step: f32, cx: &mut Context<Self>) {
+        let (vw, vh) = self.last_viewport;
+        if vw <= 0.0 || vh <= 0.0 {
+            // 视口未知（未布局）：退回切图语义
+            self.switch(dir, cx);
+            return;
+        }
+        let (dw, dh) = self
+            .intrinsic
+            .map(|(iw, ih)| self.display_size(iw, ih, vw, vh))
+            .unwrap_or((0.0, 0.0));
+        let ay = (dh - vh).max(0.0) * 0.5;
+        let ax = (dw - vw).max(0.0) * 0.5;
+        if ay <= 0.0 && ax <= 0.0 {
+            self.switch(dir, cx);
+            return;
+        }
+        let outward = if ay > 0.0 { &mut self.pan.1 } else { &mut self.pan.0 };
+        let limit = if ay > 0.0 { ay } else { ax };
+        let inc = if dir > 0 { -pan_step } else { pan_step };
+        let next = *outward + inc;
+        let clamped = next.clamp(-limit, limit);
+        *outward = clamped;
+        cx.notify();
+        let past_edge = if dir > 0 {
+            clamped <= -limit && next < -limit
+        } else {
+            clamped >= limit && next > limit
+        };
+        if past_edge {
+            self.switch(dir, cx);
+        }
     }
 
     /// 应用缩放因子并约束在 [ZOOM_MIN, ZOOM_MAX]。缩放会改变「展示像素需要」（放大需更细
@@ -412,6 +474,10 @@ impl ImageViewer {
             self.fast_count >= FAST_SCROLL_THRESHOLD || (self.scroll_fast && self.fast_count > 0);
         self.current = next;
         self.path = self.folder[next].clone();
+        // 切图：缩放复位为适应视口 + 平移/拖拽归零（每张都从初始大小开始）
+        self.zoom = 1.0;
+        self.pan = (0.0, 0.0);
+        self.drag = None;
         self.request_display(cx);
     }
 
@@ -484,6 +550,62 @@ impl ImageViewer {
         self.display_denom = 1;
         cx.notify();
         cx.refresh_windows();
+    }
+
+    // ---- 放大后拖拽平移（鼠标左键抓图滑动浏览其他区域） ----
+
+    /// 按下左键开始拖拽：记录起点鼠标位置 + 当前 `pan`（未放大时 clamp 恒 0，拖动无效果）。
+    fn on_pan_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ev.button == MouseButton::Left {
+            self.drag = Some((
+                (ev.position.x.as_f32(), ev.position.y.as_f32()),
+                self.pan,
+            ));
+            cx.notify();
+        }
+    }
+
+    /// 拖拽平移：按「当前鼠标 - 起点」增量更新 `pan`，clamp 到图始终覆盖视口。
+    fn on_pan_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_pos, start_pan)) = self.drag else {
+            return;
+        };
+        let dx = ev.position.x.as_f32() - start_pos.0;
+        let dy = ev.position.y.as_f32() - start_pos.1;
+        let (vw, vh) = self.last_viewport;
+        let (dw, dh) = self
+            .intrinsic
+            .map(|(iw, ih)| self.display_size(iw, ih, vw, vh))
+            .unwrap_or((0.0, 0.0));
+        self.pan = Self::clamp_pan((start_pan.0 + dx, start_pan.1 + dy), vw, vh, dw, dh);
+        cx.notify();
+    }
+
+    /// 拖拽结束（窗口内/外松开统一清态；`on_mouse_up` / `on_mouse_up_out` 共用）。
+    fn on_pan_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.is_some() {
+            self.drag = None;
+            cx.notify();
+        }
+    }
+
+    /// 平移 clamp：放大后（`dw>vw` 或 `dh>vh`）允许在图内滑动，范围 = ±(图-视口)/2；
+    /// 未放大时范围 0（永远居中，拖拽无效果）。以「视口中心 = 图中心」为 0 基准，
+    /// 缩放/切图后范围变化由 render 期逐帧重新 clamp 收敛。
+    fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
+        let ax = (dw - vw).max(0.0) * 0.5;
+        let ay = (dh - vh).max(0.0) * 0.5;
+        (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
     }
 
     /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`MAX_DECODE`]）
@@ -893,8 +1015,15 @@ impl Render for ImageViewer {
             Self::placeholder(&format!("无法打开图片：{err}"), muted)
         } else if let (Some(render), Some((iw, ih))) = (self.image.clone(), self.intrinsic) {
             let (dw, dh) = self.display_size(iw, ih, vw, vh);
+            // 放大后平移：clamp 到图始终覆盖视口（未放大时 pan 恒 0 = 居中；中心锚定缩放不变）
+            self.pan = Self::clamp_pan(self.pan, vw, vh, dw, dh);
+            let ox = (vw - dw) * 0.5 + self.pan.0;
+            let oy = (vh - dh) * 0.5 + self.pan.1;
             img(gpui::ImageSource::Render(render))
                 .object_fit(ObjectFit::Contain)
+                .absolute()
+                .left(px(ox))
+                .top(px(oy))
                 .w(px(dw))
                 .h(px(dh))
                 .into_any_element()
@@ -938,10 +1067,17 @@ impl Render for ImageViewer {
                         div()
                             .id("image-wrap")
                             .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
+                            .relative()
+                            .cursor(if self.drag.is_some() {
+                                CursorStyle::ClosedHand
+                            } else {
+                                CursorStyle::OpenHand
+                            })
                             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_pan_down))
+                            .on_mouse_move(cx.listener(Self::on_pan_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_pan_up))
+                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pan_up))
                             .child(body),
                     ),
             )
@@ -1324,6 +1460,82 @@ mod tests {
         write_jpeg(&dir.join("plain.jpg"), 64, 64);
         let bytes = std::fs::read(dir.join("plain.jpg")).unwrap();
         assert!(extract_exif_jpeg_thumbnail(&bytes).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clamp_pan_covers_viewport_and_stays_centered_when_unzoomed() {
+        let cp = ImageViewer::clamp_pan;
+        // 未放大（图适合视口）：任一轴 pan 都 clamp 到 0 → 保持居中，拖拽无效果
+        assert_eq!(cp((50.0, -30.0), 1000.0, 700.0, 500.0, 300.0), (0.0, 0.0));
+        // 横向放大（图 1500 > 视口 1000）：可滑范围 ±250，越界被裁剪；纵向仍适配 → y=0
+        assert_eq!(cp((1000.0, 999.0), 1000.0, 700.0, 1500.0, 700.0), (250.0, 0.0));
+        assert_eq!(cp((-1000.0, 0.0), 1000.0, 700.0, 1500.0, 700.0), (-250.0, 0.0));
+        // 两轴都放大：各轴独立 clamp 到 ±(图-视口)/2
+        assert_eq!(cp((-1000.0, 200.0), 1000.0, 700.0, 1500.0, 900.0), (-250.0, 100.0));
+        // 范围内不动
+        assert_eq!(cp((80.0, -40.0), 1000.0, 700.0, 1500.0, 900.0), (80.0, -40.0));
+    }
+
+    /// 放大态滚轮语义：先在图片内纵向平移，滚到边缘且继续同向外滚才切下一张；切图时
+    /// 缩放复位为适应视口（1.0）、平移归零。（直接构造状态，绕过真实解码/布局。）
+    #[gpui::test]
+    async fn wheel_zoomed_pans_within_then_switches_at_edge(cx: &mut TestAppContext) {
+        let dir = tmp_dir("wheel_pan");
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.folder = vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")];
+                v.current = 0;
+                v.last_viewport = (800.0, 600.0);
+                v.intrinsic = Some((200.0, 100.0));
+                v.zoom = 4.0; // 放大后 3008×1504 远超视口
+                v
+            })
+        });
+        // 放大态：向下滚 100px → 只平移（看下方），不切图
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.wheel_pan_or_switch(1, 100.0, cx);
+                assert_eq!(v.pan, (0.0, -100.0), "放大态应先纵向平移而非切图");
+                assert_eq!(v.current, 0);
+            })
+        });
+        // 一路滚到纵向边缘（ay=(1504-600)/2=452）再继续同向滚 → 才切下一张，且缩放复位
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.pan.1 = -452.0; // 已到边缘
+                v.wheel_pan_or_switch(1, 100.0, cx);
+                assert_eq!(v.current, 1, "滚到边缘继续同向外滚才切下一张");
+                assert_eq!(v.zoom, 1.0, "切图后缩放复位为适应视口");
+                assert_eq!(v.pan, (0.0, 0.0), "切图后平移归零");
+            })
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未放大滚轮语义：保持直接切图（不进入平移）。
+    #[gpui::test]
+    async fn wheel_unzoomed_switches_immediately(cx: &mut TestAppContext) {
+        let dir = tmp_dir("wheel_sw");
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.folder = vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")];
+                v.current = 0;
+                v.last_viewport = (800.0, 600.0);
+                v.intrinsic = Some((100.0, 50.0)); // 1× 适配视口（752×376 < 800×600）
+                v.zoom = 1.0;
+                v
+            })
+        });
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.wheel_pan_or_switch(1, 50.0, cx);
+                assert_eq!(v.current, 1, "未放大：滚轮仍直接切下一张");
+                assert_eq!(v.zoom, 1.0);
+            })
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 
