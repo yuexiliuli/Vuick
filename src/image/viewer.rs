@@ -31,6 +31,9 @@
 //!   白算 CPU（此前 106 张全解 ≈ 8GB 像素量磨 8 核）。缓存能装 ~9 张显示档 → 滚动基本全命中。
 //! - **放大升档**：Ctrl+滚轮使 `display_need` 变大 → [`Self::escalate_display_denom`] 按需
 //!   重解更细档（只升不降，`in_flight` 去重防抖）——1:1 看细节时自动回到全解清晰图。
+//! - **P1b 即时首帧（EXIF 嵌入缩略图，零依赖）**：冷打开 JPEG 先解出 APP1-Exif IFD1 内嵌
+//!   ~160px 缩略图立即上屏（几 ms），展示档真图解码完成后覆盖——首帧不再空等熵解码（school
+//!   已实测确实带缩略图；占位不升档/不抢预取槽/不进 LRU）。
 //!
 //! 落盘守卫：一次解码结果只在「仍是当前显示目标（`self.path == decode_path`）」时才
 //! 上屏，乱序/过期的中间结果只进缓存不抢显示——彻底杜绝旧图覆盖新图。
@@ -127,6 +130,9 @@ pub struct ImageViewer {
     byte_flight: HashSet<PathBuf>,
     /// 解码池并发满时记忆的「最新显示目标」：空位一放立即派发（追最新，跳过中间）。
     pending_target: Option<PathBuf>,
+    /// EXIF 嵌入缩略图「即时首帧」任务在途的路径（去重；完成后清空）。临时缩略图只占位
+    /// 首帧，真图落盘即被 [`Self::install_current`] 覆盖。
+    thumb_pending: Option<PathBuf>,
     /// 像素滚轮累计滚动（px）：超过 [`crate::config::image::WHEEL_PIXEL_STEP`] 才切一张。
     scroll_accum: f32,
     /// 级联预取方向（1 = 前进 / -1 = 回退；由最近一次切图方向决定）。
@@ -179,6 +185,7 @@ impl ImageViewer {
             in_flight: HashSet::new(),
             byte_flight: HashSet::new(),
             pending_target: None,
+            thumb_pending: None,
             scroll_accum: 0.0,
             prefetch_dir: 1,
             prefetch_pos: 1,
@@ -253,6 +260,7 @@ impl ImageViewer {
         self.in_flight.clear();
         self.byte_flight.clear();
         self.pending_target = None;
+        self.thumb_pending = None;
         self.prefetch_inflight = 0;
         self.display_denom = 1;
         self.display_need = DISPLAY_NEED_INIT;
@@ -419,7 +427,63 @@ impl ImageViewer {
         }
         self.loading = true;
         self.load_error = None;
+        // P1b「即时首帧」：冷目标若是 JPEG，先解出 EXIF 内嵌缩略图立即上屏（<5ms），
+        // 展示档真图解码完成后再覆盖——冷打开首帧不再空等熵解码。
+        self.maybe_show_exif_thumb(&path, cx);
         self.queue_decode(path, true, cx);
+    }
+
+    /// P1b：EXIF 嵌入缩略图「即时首帧」（零依赖；school 等手机照片在 APP1-Exif 的 IFD1 常嵌
+    /// 一张 ~160px 缩略 JPEG）。冷目标且是 JPEG 时派发：后台只读**文件头**（EXIF 段及其内嵌
+    /// 缩略图都位于头部，APP1 长度 16 位 ≤64KB，读 256KB 足够）→ 提取 → 解码 → 装成**临时
+    /// 占位**上屏。占位**不**升档（`display_denom` 置 1 短路 [`Self::escalate_display_denom`]）、
+    /// **不**重锚级联预取、**不**进 LRU——这些等真图 [`Self::install_current`] 再做（打开首图
+    /// 仍独占解码槽不抢跑）。`loading` 保持 true：真图未就绪前才够资格占位。
+    fn maybe_show_exif_thumb(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !path_is_jpeg(path) || self.thumb_pending.as_deref() == Some(path) {
+            return;
+        }
+        let cached = self.byte_cache_get(path);
+        self.thumb_pending = Some(path.to_path_buf());
+        let target = path.to_path_buf();
+        let probe = target.clone();
+        cx.spawn(async move |weak, cx| {
+            let thumb = cx
+                .background_executor()
+                .spawn(async move {
+                    let head = match cached {
+                        Some(b) => Some(b[..b.len().min(EXIF_PROBE_BYTES)].to_vec()),
+                        None => read_head(&probe, EXIF_PROBE_BYTES),
+                    };
+                    head.and_then(|h| extract_exif_jpeg_thumbnail(&h))
+                        .and_then(|tb| decode_jpeg_display(&tb, DISPLAY_NEED_INIT).ok())
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.thumb_pending.as_deref() == Some(target.as_path()) {
+                    this.thumb_pending = None;
+                }
+                if let Some((bgra, w, h, den)) = thumb
+                    && this.path == target
+                    && this.loading
+                    && let Some(entry) = Self::build_entry(target.clone(), bgra, w, h, den)
+                {
+                    this.install_provisional(entry, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 把临时占位（EXIF 缩略图）上屏：只替换 `image`/`intrinsic`，并置 `display_denom=1`
+    /// （临时小图不触发升档）。不动 `loading`、不重锚预取、不进 LRU——真图
+    /// [`Self::install_current`] 会覆盖这一切。
+    fn install_provisional(&mut self, entry: CacheEntry, cx: &mut Context<Self>) {
+        self.image = Some(entry.render);
+        self.intrinsic = Some(entry.intrinsic);
+        self.display_denom = 1;
+        cx.notify();
+        cx.refresh_windows();
     }
 
     /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`MAX_DECODE`]）
@@ -912,6 +976,121 @@ fn path_is_jpeg(p: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"))
 }
 
+/// EXIF APP1 探读上限（字节）：EXIF 段及其内嵌缩略图都位于文件头（APP1 长度 16 位、
+/// ≤64KB），读头即可提取，不必全量读盘。
+const EXIF_PROBE_BYTES: usize = 256 * 1024;
+
+/// 读文件头前 `n` 字节（免全量读盘；EXIF 提取只需头部）。
+fn read_head(path: &Path, n: usize) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(n.min(1 << 20));
+    f.take(n as u64).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// 从 JPEG 的 EXIF APP1（TIFF IFD1 的 0x0201/0x0202）提取嵌入缩略图 JPEG 字节。
+///
+/// 手机照片（school 已实测）在 APP1-Exif 的 TIFF IFD1 常嵌一张 ~160px 缩略 JPEG——冷打开
+/// 先显它（几 ms）再让展示档真图替换，消除「首帧空等熵解码」。仓库依赖 `libjpeg-turbo-rs`
+/// 的 `extract_embedded_jpeg` 只解 **TIFF-RAW** 容器、`extract_jfif_thumbnail` 只解 **APP0-JFIF**，
+/// 都不读 JPEG 的 EXIF APP1，故自实现最小「APP 段扫描 + TIFF-IFD 遍历」（纯字节、零依赖）。
+fn extract_exif_jpeg_thumbnail(data: &[u8]) -> Option<Vec<u8>> {
+    let mut i = 2usize; // 跳过 SOI（FFD8）
+    while i + 4 <= data.len() {
+        if data[i] != 0xFF {
+            return None;
+        }
+        let marker = data[i + 1];
+        match marker {
+            // 无长度段的独立标记（TEM / RSTn）：直接跳 2 字节
+            0x01 | 0xD0..=0xD7 => {
+                i += 2;
+                continue;
+            }
+            // SOS / EOI：段扫描到此结束；仍未见到 EXIF APP1 → 无缩略图
+            0xDA | 0xD9 => return None,
+            _ => {}
+        }
+        let len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+        if len < 2 || i + 2 + len > data.len() {
+            return None;
+        }
+        if marker == 0xE1 {
+            let payload = &data[(i + 4)..(i + 2 + len)];
+            if payload.starts_with(b"Exif\0\0") {
+                return exif_ifd_thumbnail(&payload[6..]);
+            }
+        }
+        i += 2 + len;
+    }
+    None
+}
+
+/// 在 APP1 的 TIFF 载荷里沿 IFD 链找 0x0201(JPEGInterchangeFormat)/0x0202(JPEGInterchangeFormatLength)
+/// 并切片出缩略 JPEG（校验 SOI 魔数）。同时支持小端「II」/ 大端「MM」；偏移以 TIFF 头起点为基准。
+fn exif_ifd_thumbnail(tiff: &[u8]) -> Option<Vec<u8>> {
+    if tiff.len() < 8 {
+        return None;
+    }
+    let le = match (tiff[0], tiff[1]) {
+        (0x49, 0x49) => true, // "II" 小端
+        (0x4D, 0x4D) => false, // "MM" 大端
+        _ => return None,
+    };
+    let u16at = |o: usize| -> Option<u16> {
+        let b = tiff.get(o..o + 2)?;
+        Some(if le {
+            u16::from_le_bytes([b[0], b[1]])
+        } else {
+            u16::from_be_bytes([b[0], b[1]])
+        })
+    };
+    let u32at = |o: usize| -> Option<u32> {
+        let b = tiff.get(o..o + 4)?;
+        Some(if le {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        })
+    };
+    if u16at(2)? != 42 {
+        return None; // TIFF 魔数不符
+    }
+    let mut ifd = u32at(4)? as usize;
+    for _ in 0..8 {
+        let n = u16at(ifd)? as usize;
+        let entries = ifd + 2;
+        let end = entries.checked_add(n * 12)?;
+        if end > tiff.len() {
+            return None;
+        }
+        let mut jpeg_off: Option<usize> = None;
+        let mut jpeg_len: Option<usize> = None;
+        for k in 0..n {
+            let e = entries + k * 12;
+            match u16at(e)? {
+                0x0201 => jpeg_off = u32at(e + 8).map(|v| v as usize),
+                0x0202 => jpeg_len = u32at(e + 8).map(|v| v as usize),
+                _ => {}
+            }
+        }
+        if let (Some(o), Some(l)) = (jpeg_off, jpeg_len)
+            && l > 0
+            && o.checked_add(l).is_some_and(|x| x <= tiff.len())
+        {
+            let blob = &tiff[o..o + l];
+            return blob.starts_with(&[0xFF, 0xD8, 0xFF]).then(|| blob.to_vec());
+        }
+        let next = u32at(end)? as usize;
+        if next == 0 {
+            return None;
+        }
+        ifd = next;
+    }
+    None
+}
+
 /// 按「展示像素需要」选 JPEG 降档分母 {1,2,4,8}：取**最大**的、让解码尺寸 ≥ 需要尺寸的
 /// 分母（缺省 1 = 全解）。保证一张图只在「解码 ≥ 显示」的前提下尽量省内存——GPU 只会把
 /// 图缩小、绝不放大 → 显示**不糊**（这是行业「decode to display size」的地基：放大时
@@ -1077,6 +1256,77 @@ mod tests {
         img.save(path).expect("写出渐变 JPEG 应成功");
     }
 
+    /// 组合「带 EXIF 嵌入缩略图」的合法 JPEG 字节（SOI + APP1-Exif（TIFF 内嵌缩略 JPEG），
+    /// 再接主图去 SOI 的其余段）。II 小端 TIFF，0x0201/0x0202 指向内嵌缩略 JPEG——免依赖地
+    /// 造出真实手机照片的 EXIF 结构（school 已实测确实带缩略图）。
+    fn wrap_exif_thumb(main: &[u8], thumb: &[u8]) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 @ 8
+        tiff.extend_from_slice(&0u16.to_le_bytes()); // IFD0 0 项 (8..10)
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next 占位 (10..14)
+        let ifd1 = tiff.len() as u32; // = 14
+        tiff[10..14].copy_from_slice(&ifd1.to_le_bytes()); // 回填 next → IFD1 @ 14
+        tiff.extend_from_slice(&2u16.to_le_bytes()); // IFD1 2 项 (14..16)
+        tiff.extend_from_slice(&0x0201u16.to_le_bytes()); // tag
+        tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        tiff.extend_from_slice(&1u32.to_le_bytes()); // count=1
+        let off_pos = tiff.len();
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // 占位：缩略图偏移
+        tiff.extend_from_slice(&0x0202u16.to_le_bytes());
+        tiff.extend_from_slice(&4u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        let len_pos = tiff.len();
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // 占位：缩略图长度
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        let thumb_off = tiff.len() as u32;
+        tiff[off_pos..off_pos + 4].copy_from_slice(&thumb_off.to_le_bytes());
+        tiff[len_pos..len_pos + 4].copy_from_slice(&(thumb.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(thumb);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(&tiff);
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0xFF, 0xD8]); // SOI（恰 2 字节）
+        out.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (payload.len() + 2) as u16;
+        out.extend_from_slice(&seg_len.to_be_bytes());
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&main[2..]); // 主图（去掉 2 字节 SOI）
+        out
+    }
+
+    #[test]
+    fn extract_exif_jpeg_thumbnail_reads_embedded_thumb() {
+        let dir = tmp_dir("exif");
+        write_jpeg(&dir.join("thumb.jpg"), 160, 120);
+        write_jpeg(&dir.join("main.jpg"), 800, 600);
+        let thumb = std::fs::read(dir.join("thumb.jpg")).unwrap();
+        let main = std::fs::read(dir.join("main.jpg")).unwrap();
+        let full = wrap_exif_thumb(&main, &thumb);
+        let got = extract_exif_jpeg_thumbnail(&full).expect("应提取到 EXIF 内嵌缩略图");
+        assert_eq!(got, thumb, "提取的应与写入的缩略 JPEG 完全一致");
+        // 提取结果能按 1/1 全解成 160×120 BGRA
+        let (bgra, w, h, den) = decode_jpeg_display(&got, DISPLAY_NEED_INIT).unwrap();
+        assert_eq!((w, h, den), (160, 120, 1));
+        assert_eq!(bgra.len(), (160 * 120 * 4) as usize);
+        // 加了 EXIF 段后主图仍是合法 JPEG：按展示需要 (400,300) → 1/2 档
+        let (_, w2, h2, d2) = decode_jpeg_display(&full, (400.0, 300.0)).unwrap();
+        assert_eq!((w2, h2, d2), (400, 300, 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_exif_jpeg_thumbnail_none_on_plain_jpeg() {
+        let dir = tmp_dir("exif_none");
+        write_jpeg(&dir.join("plain.jpg"), 64, 64);
+        let bytes = std::fs::read(dir.join("plain.jpg")).unwrap();
+        assert!(extract_exif_jpeg_thumbnail(&bytes).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn jpeg_scaled_decode_bgra_direct_and_sharp_boundary() {
         let dir = tmp_dir("jpeg_disp");
@@ -1137,6 +1387,49 @@ mod tests {
         assert_eq!(den, 2, "首解应为 1/2 显示尺寸档，而非低清 1/8：{den}");
         assert_eq!((w, h), (2560, 1920));
         assert_eq!(cache_len, 1, "缓存应是唯一一份清晰档");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1b 端到端：带 EXIF 嵌入缩略图的 JPEG 冷打开 → 立即有占位首帧（缩略图 160×120，
+    /// `loading` 保持 true，不升档、不进 LRU），随后展示档真图覆盖为清晰档（800×600）。
+    /// 验证「即时首帧」接线不破坏既有的落盘守卫与「首解即清晰档」路径。
+    #[gpui::test]
+    async fn jpeg_cold_open_exif_thumb_then_sharp(cx: &mut TestAppContext) {
+        let dir = tmp_dir("exif_e2e");
+        // 缩略图写进子目录：避免成为 big.jpg 同目录清单的第二个图片（否则会被级联预取、
+        // 污染 cache_len 断言）
+        let assets = dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        write_jpeg(&assets.join("thumb.jpg"), 160, 120);
+        write_jpeg(&dir.join("big.jpg"), 800, 600);
+        let thumb = std::fs::read(assets.join("thumb.jpg")).unwrap();
+        let main = std::fs::read(dir.join("big.jpg")).unwrap();
+        std::fs::write(
+            dir.join("big.jpg"),
+            wrap_exif_thumb(main.as_slice(), thumb.as_slice()),
+        )
+        .unwrap();
+        let p = dir.join("big.jpg");
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        let (w, h, den, loaded, cache_len, pending) = cx.update(|app| {
+            let v = viewer.read(app);
+            (
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+                v.display_denom,
+                !v.loading,
+                v.cache.len(),
+                v.thumb_pending.is_none(),
+            )
+        });
+        // 真图就绪后必须覆盖为清晰档；缩略图占位不留在 LRU 缓存里
+        assert_eq!((w, h), (800, 600), "EXIF 缩略图只是占位，最终应落 800×600 清晰档");
+        assert_eq!(den, 1, "800×600 < 展示需要 → 全解档");
+        assert!(loaded, "真图落盘后 loading 应为 false");
+        assert_eq!(cache_len, 1, "LRU 缓存只应有唯一一份真图，缩略图占位不入缓存");
+        assert!(pending, "缩略图任务完成后 thumb_pending 应清空");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
