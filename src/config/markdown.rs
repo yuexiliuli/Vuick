@@ -8,6 +8,8 @@ pub const WIDTH_BUFFER_PX: f32 = 24.0;
 pub const IMAGE_ROW_DEFAULT_H: f32 = 280.0;
 /// 图片行最大宽（px）。
 pub const IMAGE_MAX_W: f32 = 600.0;
+/// 图片行最小宽（px，拖拽调整条时钳制下限，避免缩没）。
+pub const IMAGE_MIN_W: f32 = 32.0;
 /// 图片行题注（可编辑 alt 文本行）与图片盒之间的垂直间隙（px）。
 pub const IMAGE_CAPTION_GAP_PX: f32 = 6.0;
 /// 表格横向滚动条底部预留条高度（px，与滚动条轨道高一致，避免遮挡表格内容）。

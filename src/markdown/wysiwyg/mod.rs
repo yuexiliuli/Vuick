@@ -359,6 +359,12 @@ pub struct WyEditor {
     /// 图片加载完成代数：任何图片从「占位尺寸」变成「真实尺寸」自增——
     /// 纳入帧缓存键，新图到达后必须重建整帧（否则缓存总高还是旧尺寸）。
     images_gen: Cell<u64>,
+    /// 用户拖拽调整的图片宽（px，按 src）：`None`（地图缺项）= 未调整 → 自然宽
+    /// `min(avail, IMAGE_MAX_W)`。值已钳在 `[IMAGE_MIN_W, IMAGE_MAX_W]` 内。
+    /// 改变 → `images_gen` 自增（帧/整形缓存失效 → 图片按新宽 + 原宽高比重排）。
+    image_widths: RefCell<std::collections::HashMap<SharedString, f32>>,
+    /// 进行中的图片调整条拖拽（右中边缘）。`Some` = 按住拖动中（随鼠标改宽，不改源码）。
+    image_resize_drag: RefCell<Option<ImageResizeDrag>>,
     /// LaTeX → 排版结果缓存（参考 zorite `<MathStore>` 按公式源码做键）。
     /// `Loading` 排版中 / `Ready` 就绪（位图 + 逻辑 px 尺寸）/ `Failed` 失败（回退 Unicode）。
     math_slots: Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>>,
@@ -492,6 +498,18 @@ struct ImageEditPopup {
     link: gpui::Entity<crate::ui::input::InputState>,
     /// 图片文本（alt / 题注）输入框。
     text: gpui::Entity<crate::ui::input::InputState>,
+}
+
+/// 图片调整条拖拽：按住右中边缘的条，随鼠标横向移动改图片宽（保持宽高比）。
+/// `grab_x` = 按下时指针的窗口 x；拖动中新宽 = `start_w + (mouse_x − grab_x)`。
+#[derive(Clone)]
+struct ImageResizeDrag {
+    /// 目标图片的 src。
+    src: gpui::SharedString,
+    /// 按下瞬间的图片显示宽（px）。
+    start_w: f32,
+    /// 按下瞬间指针的窗口 x（px）。
+    grab_x: f32,
 }
 
 /// 一个 LaTeX 公式的排版产物（键 = 公式源码 LaTeX；参考 zorite 的 `MathStore::Slot`）。
@@ -1040,6 +1058,8 @@ impl WyEditor {
             image_cache: gpui::RetainAllImageCache::new(cx),
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
+            image_widths: RefCell::new(std::collections::HashMap::new()),
+            image_resize_drag: RefCell::new(None),
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
             math_gen: Cell::new(0),
@@ -1906,6 +1926,32 @@ impl WyEditor {
                 self.open_image_edit(line, window, cx);
                 return;
             }
+            // 图片调整条（右中边缘）：按住 → 开始拖拽改宽（保持宽高比、不改源码）。
+            // 在「点图本体选中」之前判定（条在图片盒内）。
+            if self.editable
+                && let Some((line, grab_x)) =
+                    element::image_resize_handle_hit_at(self, f, ev.position)
+            {
+                let (src, start_w) = f
+                    .rows
+                    .iter()
+                    .find(|r| {
+                        r.src_line == line && r.kind == crate::markdown::ir::IrKind::Image
+                    })
+                    .and_then(|r| r.image.as_ref())
+                    .map(|i| (i.src.clone(), i.w))
+                    .unwrap_or((gpui::SharedString::default(), 0.));
+                drop(marker);
+                if src.is_empty() {
+                    return;
+                }
+                self.focus.focus(window, cx);
+                self.selected_image.set(Some(line));
+                self.begin_image_resize(src, start_w, grab_x);
+                *self.frame.borrow_mut() = None;
+                cx.notify();
+                return;
+            }
             // 点击图片**本体**（图片盒，不含下方题注行）→ 选中该图：不落光标进题注
             //（修掉「点图 → 光标跳到图片下方描述文本」）。选中后图片画 accent 描边 +
             // 编辑按钮常显；Backspace/Delete 删除整张图片行。
@@ -2025,6 +2071,11 @@ impl WyEditor {
 
     /// 拖拽中（左键已按下）。
     pub(crate) fn on_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
+        // 图片调整条拖拽优先：按住条 → 随鼠标横向改宽（不参与选区拖选/悬浮）。
+        if self.image_resize_drag.borrow().is_some() {
+            self.apply_image_resize(ev.position.x, cx);
+            return;
+        }
         // 代码/表格横向滚动条拖动优先（不参与选区拖选）。
         if self.code_h_drag.borrow().is_some() {
             self.code_h_drag_apply(ev.position, cx);
@@ -2038,6 +2089,10 @@ impl WyEditor {
         // 拖选中不更新（指针离开图片也不应隐藏按钮，避免拖到别处时误闪烁）。
         if !self.dragging {
             self.update_hover(ev.position, cx);
+            // 图片调整条 hover → 即时换 resize 光标（同 `on_window_mouse_move`）。
+            if self.notify_when_hover_grip(ev.position) {
+                cx.notify();
+            }
             return;
         }
         let marker = self.frame.borrow();
@@ -2075,18 +2130,43 @@ impl WyEditor {
         ev: &gpui::MouseMoveEvent,
         cx: &mut Context<Self>,
     ) {
+        // 图片调整条拖拽优先（顶层叠层会吞元素级 move，拖动期间走这里兜底）。
+        if self.image_resize_drag.borrow().is_some() {
+            self.apply_image_resize(ev.position.x, cx);
+            return;
+        }
         if self.dragging {
             return;
         }
         let Some(b) = self.last_bounds() else {
             return;
         };
-        if b.contains(&ev.position) {
+        let inside_image = b.contains(&ev.position);
+        if inside_image {
             self.update_hover(ev.position, cx);
         } else if self.hover_image.get().is_some() {
             self.hover_image.set(None);
             cx.notify();
         }
+        // 指针进入图片调整条（右中边缘）→ 立即重绘：paint 登记窗口级 resize 光标，
+        // `finish_frame` 按新帧当场解析——否则要等下一次输入/点击光标才变
+        //（「hover 不变 → 先点才显示」）。
+        if self.notify_when_hover_grip(ev.position) {
+            cx.notify();
+        }
+    }
+
+    /// 指针落在图片调整条（当前帧，可编辑）→ `true`（调用方 `notify` 触发一次重绘，
+    /// 让 resize 光标即时生效）。
+    fn notify_when_hover_grip(&self, pos: gpui::Point<Pixels>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        let marker = self.frame.borrow();
+        marker
+            .as_ref()
+            .and_then(|f| element::image_resize_handle_hit_at(self, f, pos))
+            .is_some()
     }
 
     /// 代码块滚动条**轨道点击跳转**：滑块中心对准点击点（view 语义：不在滑块上
@@ -2201,9 +2281,10 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// 鼠标松开：结束拖选 / 代码块 & 表格横向滚动条拖动。
+    /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格横向滚动条拖动。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
+        self.end_image_resize();
         *self.code_h_drag.borrow_mut() = None;
         *self.table_h_drag.borrow_mut() = None;
         cx.notify();
@@ -2847,6 +2928,61 @@ impl WyEditor {
 
     pub(crate) fn images_gen(&self) -> u64 {
         self.images_gen.get()
+    }
+
+    /// 用户拖拽调整的图片宽（px）；未调整返回 `None`（走自然宽）。
+    pub(crate) fn image_width(&self, src: &str) -> Option<f32> {
+        self.image_widths.borrow().get(src).copied()
+    }
+
+    /// 记录用户拖拽调整的图片宽（px，已钳制）；变化 → `images_gen` 自增使帧/整形缓存
+    /// 失效（下一帧图片按新宽 + 原宽高比重排）。不改源码。
+    pub(crate) fn set_image_width(&self, src: gpui::SharedString, w: f32) {
+        let clamped = w
+            .clamp(
+                crate::config::markdown::IMAGE_MIN_W,
+                crate::config::markdown::IMAGE_MAX_W,
+            )
+            .max(1.);
+        if self.image_widths.borrow().get(&src).copied() != Some(clamped) {
+            self.image_widths.borrow_mut().insert(src, clamped);
+            self.images_gen.set(self.images_gen.get().wrapping_add(1));
+        }
+    }
+
+    /// 当前进行中的图片调整条拖拽的 src（测试）。
+    #[cfg(test)]
+    pub(crate) fn image_resize_drag_src(&self) -> Option<gpui::SharedString> {
+        self.image_resize_drag
+            .borrow()
+            .as_ref()
+            .map(|d| d.src.clone())
+    }
+    /// 正在拖拽图片调整条（paint 期据此保持 resize 光标）。
+    pub(crate) fn image_resizing(&self) -> bool {
+        self.image_resize_drag.borrow().is_some()
+    }
+
+    /// 命中调整条 → 开始拖拽：记录按下时的图片宽 + 指针窗口 x，并选中该图。
+    fn begin_image_resize(&mut self, src: gpui::SharedString, start_w: f32, grab_x: f32) {
+        *self.image_resize_drag.borrow_mut() = Some(ImageResizeDrag { src, start_w, grab_x });
+    }
+
+    /// 拖拽中应用新宽：新宽 = `start_w + (mouse_x − grab_x)`（钳制），写回覆写表；
+    /// 帧/整形缓存失效 → 图片随鼠标实时缩放（保持宽高比）。
+    fn apply_image_resize(&mut self, mouse_x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(d) = self.image_resize_drag.borrow().clone() else {
+            return;
+        };
+        let new_w = d.start_w + (f32::from(mouse_x) - d.grab_x);
+        self.set_image_width(d.src.clone(), new_w);
+        *self.frame.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// 结束调整条拖拽。
+    fn end_image_resize(&mut self) {
+        self.image_resize_drag.borrow_mut().take();
     }
 
     /* ---------- 数学排版（LaTeX → RenderImage；参考 zorite 的 MathStore） ---------- */

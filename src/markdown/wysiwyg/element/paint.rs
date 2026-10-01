@@ -383,6 +383,23 @@ pub(crate) fn paint_image_row(
             });
         }
     }
+    // 图片调整条（**右中边缘内**：竖条、垂直居中）：可编辑且悬浮/选中时浮现。
+    // 按住 → 拖拽改宽（`hit.rs` 的 `image_resize_handle_hit_at`/`_window` 同几何）。
+    if editor.read(cx).is_editable()
+        && hovered_or_selected
+        && let Some(bb) = super::image_box_local(f, row)
+    {
+        let hb = super::image_resize_handle_window(origin, &bb);
+        // 透明灰白竖条 + 浅白描边（明暗主题都压得住图片）。
+        window.paint_quad(gpui::PaintQuad {
+            bounds: hb,
+            corner_radii: gpui::Corners::all(px(3.)),
+            background: gpui::hsla(0., 0., 0.9, 0.65).into(),
+            border_widths: gpui::Edges::all(px(1.)),
+            border_color: gpui::hsla(0., 0., 1., 0.55),
+            border_style: gpui::BorderStyle::Solid,
+        });
+    }
     // 选中态（点击图片本体）：accent 2px 圆角描边（与 mermaid 聚焦描边同色同宽）。
     if editor.read(cx).selected_image() == Some(row.src_line)
         && let Some(bb) = super::image_box_local(f, row)

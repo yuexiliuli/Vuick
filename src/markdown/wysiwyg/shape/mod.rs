@@ -831,13 +831,27 @@ pub(crate) fn shape_table_row(
     }
 }
 
-/// 独立图片行的显示高（px）：已加载按真实宽高比换算（宽封顶 `IMAGE_MAX_W`，
-/// 由 `avail` 决定实际宽），未加载/失败用占位高。`build_frame` 的带外估算与
-/// `shape_image_row` 必须用同一函数 → 加载后带内/带外高度一致（滚动不跳）。
+/// 独立图片行的显示宽（px）：有用户拖拽调整（`image_width` 覆写）→ 覆写值钳在
+/// `[IMAGE_MIN_W, IMAGE_MAX_W]` 内且不超可用宽；否则自然宽 = `min(avail, IMAGE_MAX_W)`。
+/// `image_row_height` / `shape_image_row` 必须用同一函数 → 带内/带外、拖拽后高度一致。
+pub(crate) fn effective_image_w(editor: &WyEditor, src: &str, avail: f32) -> f32 {
+    let natural = avail.min(crate::config::markdown::IMAGE_MAX_W);
+    match editor.image_width(src) {
+        Some(w) => w
+            .clamp(crate::config::markdown::IMAGE_MIN_W, crate::config::markdown::IMAGE_MAX_W)
+            .min(avail)
+            .max(1.),
+        None => natural,
+    }
+}
+
+/// 独立图片行的显示高（px）：已加载按真实宽高比换算（宽 = [`effective_image_w`]），
+/// 未加载/失败用占位高。`build_frame` 的带外估算与 `shape_image_row` 必须用同一函数
+/// → 加载后/拖拽后带内带外高度一致（滚动不跳）。
 pub(crate) fn image_row_height(editor: &WyEditor, src: &str, avail: f32) -> Pixels {
-    let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
+    let w = effective_image_w(editor, src, avail);
     match editor.image_size(src) {
-        Some(Some((iw, ih))) if iw > 0. && ih > 0. => px((max_w * ih / iw.max(1.)).max(1.)),
+        Some(Some((iw, ih))) if iw > 0. && ih > 0. => px((w * ih / iw.max(1.)).max(1.)),
         _ => px(crate::config::markdown::IMAGE_ROW_DEFAULT_H),
     }
 }
@@ -863,7 +877,7 @@ pub(crate) fn shape_image_row(
     // A-4 冷开惰性化：仅**带内**图片行首次 shape 才读一次真实尺寸（不在 load 路径
     // 同步读全篇；pass1 估算走 `image_row_height` 的占位高，进带由本行 shape 修正）。
     editor.lazy_ensure_image_size(src.as_ref());
-    let max_w = avail.min(crate::config::markdown::IMAGE_MAX_W);
+    let w = effective_image_w(editor, src.as_ref(), avail);
     let img_h = image_row_height(editor, src.as_ref(), avail);
     // 题注（alt 可编辑文本）行：muted 色、正文行高，按内容宽折行（罕见超长 alt）。
     let cap_run = [gpui::TextRun {
@@ -915,7 +929,7 @@ pub(crate) fn shape_image_row(
         kind,
         table: None,
         table_edit: None,
-        image: Some(ShapedImage { src, w: max_w, h: f32::from(img_h) }),
+        image: Some(ShapedImage { src, w, h: f32::from(img_h) }),
         mm: None,
         extra: RowExtra::default(),
     }

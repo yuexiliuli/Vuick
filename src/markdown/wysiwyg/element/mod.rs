@@ -733,6 +733,9 @@ pub(crate) struct WyEditorElement {
 #[derive(Default)]
 pub(crate) struct WyPrepaint {
     link_grips: Vec<Hitbox>,
+    /// 图片调整条（右中边缘）的 hitbox：既触发 hit_test 变化（进/出该区即刷新光标），
+    /// 也让 paint 用其 bounds 判定「指针落在调整区」→ 发窗口级 resize 光标。
+    resize_grips: Vec<Hitbox>,
 }
 
 impl IntoElement for WyEditorElement {
@@ -991,8 +994,29 @@ impl Element for WyEditorElement {
         if let Some(f) = frame.as_ref() {
             prewarm_band(self.editor.read(cx), f, window);
         }
+        // 图片调整条（右中边缘）hitbox：可编辑模式对所有可见图片行登记。作用有二：
+        // (a) 指针进/出该区时 `dispatch_mouse_event` 的 hit_test 变化 → 触发光标刷新；
+        // (b) paint 用其 bounds 判定「指针在调整区」→ 发窗口级 `ResizeLeftRight` 光标。
+        let mut resize_grips = Vec::new();
+        if self.editor.read(cx).is_editable()
+            && let Some(f) = frame.as_ref()
+        {
+            for row in &f.rows {
+                if row.kind != crate::markdown::ir::IrKind::Image {
+                    continue;
+                }
+                let Some(bb) = super::image_box_local(f, row) else {
+                    continue;
+                };
+                let hb = super::image_resize_handle_window(bounds.origin, &bb);
+                resize_grips.push(window.insert_hitbox(hb, HitboxBehavior::Normal));
+            }
+        }
         crate::prof::end("wy.prepaint", _t_pp);
-        WyPrepaint { link_grips }
+        WyPrepaint {
+            link_grips,
+            resize_grips,
+        }
     }
 
     fn paint(
@@ -1064,6 +1088,20 @@ impl Element for WyEditorElement {
         // C5: 悬浮在可点击链接上 → hand 光标。
         for hb in &prepaint.link_grips {
             window.set_cursor_style(CursorStyle::PointingHand, hb);
+        }
+        // 图片调整条：指针落在任一可见图片的右中边缘调整区（或正在拖拽）→
+        // **窗口级** `ew-resize`（←||→）光标。⚠️ 不用 per-hitbox `set_cursor_style`：
+        // hitbox 光标会被宿主 `#live-vscrollbar-overlay` 等顶层叠层 hitbox 压住而失效，
+        // 窗口级 `set_window_cursor_style` 优先级最高；且只在命中此区时才发，其余位置
+        // 沿用根元素的 IBeam。hitbox（`resize_grips`）负责触发进/出时的光标刷新。
+        let mouse = window.mouse_position();
+        let over_resize = self.editor.read(cx).image_resizing()
+            || prepaint
+                .resize_grips
+                .iter()
+                .any(|hb| hb.bounds.contains(&mouse));
+        if over_resize {
+            window.set_window_cursor_style(CursorStyle::ResizeLeftRight);
         }
         // 选区高亮（可编辑行与源选区相交的部分，按字形几何逐个 WrappedLine 画）。
         // 搜索跳转高亮（预览独有能力，搬入统一组件）：命中 → 以命中色复用同一几何。

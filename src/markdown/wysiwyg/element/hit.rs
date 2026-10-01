@@ -213,6 +213,61 @@ pub(crate) fn image_edit_button_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> 
     Bounds::new(point(x, y), size(px(IMAGE_EDIT_BTN_SIZE), px(IMAGE_EDIT_BTN_SIZE)))
 }
 
+/// 图片**右中边缘**的调整条（resize handle）几何：竖条贴在图片右内缘、垂直居中。
+/// paint/hit/光标共用，不得分开改。
+pub(crate) const IMAGE_RESIZE_HANDLE_W: f32 = 6.;
+/// 调整条高（px；超过图片盒高时按盒高内缩）。
+pub(crate) const IMAGE_RESIZE_HANDLE_H: f32 = 48.;
+/// 调整条右缘距图片右缘的边距（px，条「在图片内」不完全贴边）。
+pub(crate) const IMAGE_RESIZE_HANDLE_MARGIN_R: f32 = 4.;
+
+/// 图片调整条的元素局部矩形（右中边缘；盒高太矮时条高内缩）。
+pub(crate) fn image_resize_handle_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> {
+    let box_h = f32::from(box_b.size.height);
+    let h = IMAGE_RESIZE_HANDLE_H.min(box_h - 10.).max(12.);
+    let x = box_b.right() - px(IMAGE_RESIZE_HANDLE_W + IMAGE_RESIZE_HANDLE_MARGIN_R);
+    let y = box_b.top() + (box_b.size.height - px(h)) / 2.;
+    Bounds::new(point(x, y), size(px(IMAGE_RESIZE_HANDLE_W), px(h)))
+}
+
+/// 命中图片**调整条**（窗口坐标）→ `(src_line, 指针窗口 x)`；未命中 `None`。
+/// `grab_x` 供拖动换算新宽（`start_w + (mouse_x − grab_x)`）。几何与
+/// `paint_image_row` 画出的条一致。
+pub(crate) fn image_resize_handle_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, f32)> {
+    let grab_x = f32::from(p.x);
+    let p = to_local(editor, p);
+    for r in &frame.rows {
+        if r.kind != IrKind::Image {
+            continue;
+        }
+        let Some(bb) = image_box_local(frame, r) else {
+            continue;
+        };
+        let hb = image_resize_handle_local(&bb);
+        if hb.contains(&p) {
+            return Some((r.src_line, grab_x));
+        }
+    }
+    None
+}
+
+/// 图片调整条的**窗口**矩形（paint 加 `origin` 后对齐）：供字体/选区等一致几何使用。
+pub(crate) fn image_resize_handle_window(
+    origin: Point<Pixels>,
+    bb: &Bounds<Pixels>,
+) -> Bounds<Pixels> {
+    let local = image_resize_handle_local(bb);
+    Bounds::new(
+        point(origin.x + local.left(), origin.y + local.top()),
+        local.size,
+    )
+}
+
+
 /// 命中图片盒（窗口坐标）→ 其 `src_line`；未命中返回 `None`（悬浮按钮亮显判定）。
 pub(crate) fn image_box_hit_at(
     editor: &WyEditor,

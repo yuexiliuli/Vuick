@@ -6970,3 +6970,97 @@ A-->B
         );
     }
 
+    /// 图片调整条（右中边缘）：悬浮/点图本体不误触；按条 → 拖拽实时改宽（保持宽高比、
+    /// 不改源码），极端拖拽钳到 [MIN, MAX]，松开结束。
+    #[gpui::test]
+    fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        use crate::config::markdown::{IMAGE_MAX_W, IMAGE_MIN_W};
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx
+                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, _width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .unwrap()
+            .clone();
+        let bb = super::image_box_local(&frame, &img).expect("图片盒");
+        let hb = super::image_resize_handle_local(&bb);
+        let (hx, hy) = (
+            f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+            f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+        );
+        let w0 = img.image.as_ref().unwrap().w;
+        // 点**图片本体左中部**（远离右边缘）→ 只选中，不误触调整条。
+        vcx.update(|window, cx| {
+            let down = img_down(f32::from(bb.left()) + 20., f32::from(bb.top()) + 20.);
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert_eq!(ed.read(cx).selected_image(), Some(0));
+            assert!(
+                ed.read(cx).image_resize_drag_src().is_none(),
+                "点图片中部不应开始调整条拖拽"
+            );
+        });
+        // 点右中边缘调整条 → 开始拖拽 + 选中。
+        let down = img_down(hx, hy);
+        vcx.update(|window, cx| {
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert_eq!(
+                ed.read(cx)
+                    .image_resize_drag_src()
+                    .map(|s| s.to_string())
+                    .as_deref(),
+                Some("img测试.png"),
+                "按调整条应开始拖拽"
+            );
+            assert_eq!(ed.read(cx).selected_image(), Some(0), "拖拽应同时选中该图");
+        });
+        // 向左拖 60px → 宽缩 60（未触钳制）。
+        vcx.update(|_, cx| {
+            let mv = img_move(hx - 60., hy);
+            ed.update(cx, |e, c| e.on_mouse_move(&mv, c));
+        });
+        let w1 = vcx
+            .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+            .expect("拖拽后应有覆写宽");
+        assert!(
+            (w1 - (w0 - 60.)).abs() < 0.5,
+            "左拖 60px 应从 {w0} 缩到 {}（实际 {w1}）",
+            w0 - 60.
+        );
+        // 拖极右 → 钳到 MAX；拖极左 → 钳到 MIN。
+        vcx.update(|_, cx| {
+            ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx + 3000., hy), c));
+        });
+        assert_eq!(
+            vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+            Some(IMAGE_MAX_W),
+            "拖到极右应钳到最大宽"
+        );
+        vcx.update(|_, cx| {
+            ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 3000., hy), c));
+        });
+        assert_eq!(
+            vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+            Some(IMAGE_MIN_W),
+            "拖到极左应钳到最小宽"
+        );
+        // 松开 → 结束拖拽；源码未被改写。
+        vcx.update(|_window, cx| {
+            ed.update(cx, |e, c| e.on_mouse_up(&img_up(hx, hy), c));
+            assert!(
+                ed.read(cx).image_resize_drag_src().is_none(),
+                "松开应结束调整条拖拽"
+            );
+        });
+        let out = vcx.update(|_, cx| ed.read(cx).content());
+        assert_eq!(out, "![独立图片](img测试.png)\n", "拖拽改宽不得改写源码");
+    }
+
