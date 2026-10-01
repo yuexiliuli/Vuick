@@ -10,6 +10,7 @@
 //!   （如 `markdown::QUOTE_BAR_COLOR`）是跨预览/WYSIWYG 共享的少量几何配套色。
 //! - 惰性全局资源（语法集、pdfium 句柄等）不属于「配置值」，不抽到这里。
 
+pub mod image;
 pub mod layout;
 pub mod limits;
 pub mod markdown;
