@@ -52,7 +52,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    Context, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
+    AppContext, Context, FocusHandle, Focusable, Font, Hsla, Pixels, RenderImage, SharedString,
     Window, font, point, px,
 };
 
@@ -442,6 +442,17 @@ pub struct WyEditor {
     /// 同一撤销事务（连续打字 / 相邻退格 / 同点删除）；光标移动（`set_caret`/方向键
     /// `moved`）与整篇内容替换打断。
     last_edit: Option<(EditKind, usize, usize)>,
+    /// 当前悬浮的图片行 `src_line`（`on_mouse_move` 更新）。非 `None` 时该图片右上角
+    /// 浮现「编辑」铅笔按钮（仅可编辑模式绘制/响应）。纯视图态，不进撤销栈。
+    hover_image: Cell<Option<usize>>,
+    /// 点击图片**本体**时置位的选中图片行 `src_line`。非 `None` 时该图片画 accent
+    /// 描边 + 编辑按钮常显（不依赖指针悬浮）。与 `hover_image` 不同：选中态独立于
+    /// 指针，点击其它文本区 / 换源 / 只读 时清除；Backspace/Delete 删除整张图片行。
+    /// 纯视图态，不进撤销栈。
+    selected_image: Cell<Option<usize>>,
+    /// 图片编辑卡片（打开时在图片旁渲染悬浮表单：链接 + 文本两个输入框）。
+    /// `None` = 未打开。打开期间输入框获得焦点（IME 走 `InputState`，与文档输入互不干扰）。
+    image_edit: Option<ImageEditPopup>,
 }
 
 /// 编辑意图（决定撤销合并规则，纯无定时器确定性判定，同 editor/undo.rs）。
@@ -464,6 +475,16 @@ enum BlockRegion {
     Code { lo: usize, hi: usize },
     /// GFM 表格：表头行 + 数据行 `dlo..=dhi`；分隔行（围栏）= `dlo-1`。
     Table { header: usize, dlo: usize, dhi: usize },
+}
+
+/// 图片编辑卡片：两个单行输入框（链接 + 文本）锚定在目标图片旁。
+struct ImageEditPopup {
+    /// 目标图片行的源码行号。
+    src_line: usize,
+    /// 图片链接（`![alt](src)` 的 src）输入框。
+    link: gpui::Entity<crate::ui::input::InputState>,
+    /// 图片文本（alt / 题注）输入框。
+    text: gpui::Entity<crate::ui::input::InputState>,
 }
 
 /// 一个 LaTeX 公式的排版产物（键 = 公式源码 LaTeX；参考 zorite 的 `MathStore::Slot`）。
@@ -1045,6 +1066,9 @@ impl WyEditor {
             redo_stack: Vec::new(),
             open_unit: None,
             last_edit: None,
+            hover_image: Cell::new(None),
+            selected_image: Cell::new(None),
+            image_edit: None,
         }
     }
 
@@ -1094,6 +1118,10 @@ impl WyEditor {
             self.marked = None;
             self.sel_anchor = None;
             self.dragging = false;
+            // 只读：无编辑能力 → 收起图片编辑卡片与悬浮按钮态、图片选中态。
+            self.image_edit = None;
+            self.hover_image.set(None);
+            self.selected_image.set(None);
         }
         *self.frame.borrow_mut() = None;
     }
@@ -1481,6 +1509,10 @@ impl WyEditor {
         self.open_unit = None;
         self.last_edit = None;
         self.focused_mermaid = None;
+        // 换源：图片编辑卡片/悬浮态/选中态随行号失效 → 关闭。
+        self.image_edit = None;
+        self.hover_image.set(None);
+        self.selected_image.set(None);
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         self.math_dollar_cnt.set(r.math_dollar_cnt);
@@ -1840,6 +1872,9 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
+        // 任何点击都先清除旧图片选中（图片本体/编辑按钮分支随后重新置位）：
+        // 点文本/任务框/链接等 → 图片不再保持选中态。
+        self.selected_image.set(None);
         // **mermaid 卡点击 → 聚焦**：聚焦后滚轮才缩放该卡（交互见图文，未聚焦时滚轮
         // 一律正常滚动）。点击**任何其它地方**（含选中/链接/任务框）→ 清除聚焦。
         if let Some(mline) = element::mermaid_card_hit(self, f, ev.position) {
@@ -1852,6 +1887,26 @@ impl WyEditor {
         self.focused_mermaid = None;
         // 交互性命中（任务框/折叠箭头/链接）单双击都响应，展开→立即再点也能折叠回。
         if !ev.modifiers.shift && !ev.modifiers.control {
+            // 图片编辑铅笔按钮：仅可编辑模式——点击 → 打开/切换/关闭编辑卡片
+            // （不落光标、不进入选区）。只读预览不响应（不画按钮、这里也不拦截）。
+            if self.editable
+                && let Some(line) = element::image_edit_button_hit_at(self, f, ev.position)
+            {
+                drop(marker);
+                self.open_image_edit(line, window, cx);
+                return;
+            }
+            // 点击图片**本体**（图片盒，不含下方题注行）→ 选中该图：不落光标进题注
+            //（修掉「点图 → 光标跳到图片下方描述文本」）。选中后图片画 accent 描边 +
+            // 编辑按钮常显；Backspace/Delete 删除整张图片行。
+            if self.editable
+                && let Some(line) = element::image_box_hit_at(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.select_image(line, cx);
+                return;
+            }
             // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
             // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
             if let Some((blk, on_thumb, grab)) =
@@ -1969,7 +2024,10 @@ impl WyEditor {
             self.table_h_drag_apply(ev.position, cx);
             return;
         }
+        // 未拖选：更新图片悬浮态（命中图片盒 → 该图右上角浮现编辑按钮）。
+        // 拖选中不更新（指针离开图片也不应隐藏按钮，避免拖到别处时误闪烁）。
         if !self.dragging {
+            self.update_hover(ev.position, cx);
             return;
         }
         let marker = self.frame.borrow();
@@ -1981,6 +2039,44 @@ impl WyEditor {
         self.extend_selection_to(off);
         *self.frame.borrow_mut() = None;
         cx.notify();
+    }
+
+    /// 更新图片悬浮态（命中图片盒 → `hover_image`）。未命中（含指针移出元素）置 `None`。
+    fn update_hover(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let hovered = element::image_box_hit_at(self, f, pos);
+        drop(marker);
+        if self.hover_image.get() != hovered {
+            self.hover_image.set(hovered);
+            cx.notify();
+        }
+    }
+
+    /// 窗口级 mouse-move 的悬浮更新（图片编辑按钮亮显）：元素在宿主 `#live-vscrollbar-overlay`
+    /// 等顶层叠层之下时，元素级 `on_mouse_move` 会被遮罩吞掉（与滚轮同因），走
+    /// `window.on_mouse_event`（Bubble）由元素 paint 期注册驱动。指针在本元素
+    /// `last_bounds` 内才更新 `hover_image`，移出即清除。拖选中（鼠标按下）由元素级
+    /// 拖选事件驱动，这里跳过。
+    pub(crate) fn on_window_mouse_move(
+        &mut self,
+        ev: &gpui::MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dragging {
+            return;
+        }
+        let Some(b) = self.last_bounds() else {
+            return;
+        };
+        if b.contains(&ev.position) {
+            self.update_hover(ev.position, cx);
+        } else if self.hover_image.get().is_some() {
+            self.hover_image.set(None);
+            cx.notify();
+        }
     }
 
     /// 代码块滚动条**轨道点击跳转**：滑块中心对准点击点（view 语义：不在滑块上
@@ -3728,6 +3824,283 @@ impl WyEditor {
         }
     }
 
+    /* ---------- 图片编辑（悬浮铅笔按钮 + 卡片表单） ---------- */
+
+    /// 当前悬浮的图片行（`Some(src_line)` 时画铅笔按钮）。
+    pub(crate) fn hover_image(&self) -> Option<usize> {
+        self.hover_image.get()
+    }
+    /// 当前选中的图片行（`Some(src_line)` 时该图片画 accent 描边 + 编辑按钮常显）。
+    pub(crate) fn selected_image(&self) -> Option<usize> {
+        self.selected_image.get()
+    }
+    /// 图片编辑卡片当前锚定的图片行；`None` = 卡片未打开。（测试访问器）
+    #[cfg(test)]
+    pub(crate) fn image_edit_src_line(&self) -> Option<usize> {
+        self.image_edit.as_ref().map(|p| p.src_line)
+    }
+    /// 卡片是否打开。（测试访问器）
+    #[cfg(test)]
+    pub(crate) fn image_edit_open(&self) -> bool {
+        self.image_edit.is_some()
+    }
+    /// 卡片的「链接」输入框实体（render / 测试读值）。
+    #[cfg(test)]
+    pub(crate) fn image_edit_link_input(&self) -> Option<gpui::Entity<crate::ui::input::InputState>> {
+        self.image_edit.as_ref().map(|p| p.link.clone())
+    }
+    /// 卡片的「文本」输入框实体。
+    #[cfg(test)]
+    pub(crate) fn image_edit_text_input(&self) -> Option<gpui::Entity<crate::ui::input::InputState>> {
+        self.image_edit.as_ref().map(|p| p.text.clone())
+    }
+    /// 独立图片行 `src_line` 的当前 `(alt, src)`（`parse::parse_image_line` 反解）；
+    /// 非独立图片行返回 `None`。
+    fn image_line_alt_src(&self, src_line: usize) -> Option<(String, String)> {
+        let raw = self.line_text(src_line);
+        crate::markdown::parse::parse_image_line(raw.trim())
+    }
+
+    /// 打开 / 切换到 `src_line` 图片行的编辑卡片（仅可编辑模式）。输入框以当前
+    /// alt / src 预填，打开后焦点落在「链接」输入框。已在同一行 → 关闭。
+    pub(crate) fn open_image_edit(
+        &mut self,
+        src_line: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.editable {
+            return;
+        }
+        if self
+            .image_edit
+            .as_ref()
+            .is_some_and(|cur| cur.src_line == src_line)
+        {
+            self.close_image_edit(cx);
+            return;
+        }
+        let Some((alt, src)) = self.image_line_alt_src(src_line) else {
+            return;
+        };
+        // 打开编辑卡片也视为选中该图片（描边 + 按钮常显，与点图本体同效果）。
+        self.selected_image.set(Some(src_line));
+        let link = cx.new(|cx| {
+            crate::ui::input::InputState::new(window, cx)
+                .placeholder("图片链接（URL / 本地相对路径）")
+                .default_value(src)
+        });
+        let text = cx.new(|cx| {
+            crate::ui::input::InputState::new(window, cx)
+                .placeholder("图片文本（alt 题注）")
+                .default_value(alt)
+        });
+        self.image_edit = Some(ImageEditPopup { src_line, link, text });
+        // 打开后立刻聚焦「链接」输入框（用户可直接键入/IME）。
+        if let Some(p) = &self.image_edit {
+            let fh = p.link.read(cx).focus_handle(cx);
+            fh.focus(window, cx);
+        }
+        *self.frame.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// 关闭图片编辑卡片（不写源码）。
+    pub(crate) fn close_image_edit(&mut self, cx: &mut Context<Self>) {
+        if self.image_edit.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 点击图片本体 → 选中该图：清除文本选区/拖选，选中态独立于指针（移开后编辑
+    /// 按钮仍在，画 accent 描边）。再次点击同一图保持选中（不产生文本选区）。
+    fn select_image(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.selected_image.set(Some(line));
+        self.sel_anchor = None;
+        self.dragging = false;
+        *self.frame.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// 删除选中的整张图片行（含换行；末行无换行只删内容）。撤销栈统一
+    /// （`apply_edit`）。删除后关闭编辑卡片、清除悬浮/选中态。
+    fn delete_selected_image(&mut self, line: usize, cx: &mut Context<Self>) {
+        let start = self.line_start(line);
+        let end = self.line_start(line + 1);
+        self.selected_image.set(None);
+        self.image_edit = None;
+        self.hover_image.set(None);
+        if end > start {
+            self.apply_edit(start..end, "", cx);
+        } else {
+            self.sel_anchor = None;
+            *self.frame.borrow_mut() = None;
+            cx.notify();
+        }
+    }
+
+    /// 保存图片编辑卡片：以输入框值改写 `![alt](src)` → `![新文本](新链接)`。
+    /// 写入走 `replace_range`（撤销栈统一），随后关闭卡片。
+    pub(crate) fn save_image_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(popup) = self.image_edit.as_ref() else {
+            return;
+        };
+        let src_line = popup.src_line;
+        let link_text = popup.link.read(cx).value().to_string();
+        let text_text = popup.text.read(cx).value().to_string();
+        let saved = !link_text.is_empty();
+        self.apply_image_line_edit(src_line, text_text, if saved { link_text } else { "".into() }, cx);
+        self.close_image_edit(cx);
+    }
+
+    /// 程序化改写第 `src_line` 行独立图片的 alt 与 src（`![alt](src)`）。
+    /// 空 `src` 视为保留原 src。供图片编辑卡片保存 / 程序化测试调用。
+    pub(crate) fn apply_image_line_edit(
+        &mut self,
+        src_line: usize,
+        new_alt: String,
+        new_src: String,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.line_start(src_line);
+        let end = self.line_end(src_line).max(start);
+        let raw = self.doc.slice_str(start..end);
+        let (_, src) = match crate::markdown::parse::parse_image_line(raw.trim()) {
+            Some(pair) => pair,
+            None => return,
+        };
+        let src = if new_src.is_empty() { src } else { new_src };
+        let indent = raw.len() - raw.trim_start().len();
+        let new_line = format!(
+            "{}![{}]({})",
+            &raw[..indent],
+            new_alt.replace(']', "\\]").replace('\n', " "),
+            src.replace('(', "\\(").replace(')', "\\)").replace('\n', " ")
+        );
+        self.apply_edit(start..end, &new_line, cx);
+    }
+
+    /// 图片编辑卡片的悬浮浮层（打开时返回 `Some`）：`deferred(anchored(Local))` 锚定在
+    /// 目标图片顶部、内容区水平居中。浮层逃逸滚动容器裁剪/命中，随内容滚动跟手（对齐
+    /// `ui::menu` 的 Dropdown 浮层约定）。
+    fn image_edit_card_element(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use gpui::{
+            AnchoredPositionMode, Anchor, Edges, InteractiveElement, IntoElement, ParentElement,
+            Styled,
+        };
+        use crate::ui::button::ButtonVariants as _;
+        let popup = self.image_edit.as_ref()?;
+        // 卡片几何：局部坐标（内容区水平居中 + 顶对齐目标图片行）。
+        let (left, top) = {
+            let f = self.frame.borrow();
+            match f.as_ref() {
+                Some(f) => {
+                    let block = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
+                    let content_w =
+                        (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+                    let card_w = element::IMAGE_EDIT_CARD_W;
+                    let l = f32::from(f.padding) + ((content_w - card_w) / 2.).max(0.);
+                    (l, f.block_top(block))
+                }
+                None => (12., 0.),
+            }
+        };
+        let ed = cx.entity();
+        let ed_save = ed.clone();
+        let colors = crate::ui::theme::Theme::global(cx).colors;
+        let link_input = popup.link.clone();
+        let text_input = popup.text.clone();
+        let card = gpui::div()
+            .id("wy-image-edit-card")
+            .debug_selector(|| "wy-image-edit-card".into())
+            .w(px(element::IMAGE_EDIT_CARD_W))
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.surface)
+            .occlude()
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap_y(px(8.))
+            .child(
+                gpui::div()
+                    .text_size(px(13.))
+                    .text_color(colors.fg)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("编辑图片"),
+            )
+            .child(
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_y(px(4.))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(colors.fg_muted)
+                            .child("链接"),
+                    )
+                    .child(crate::ui::input::Input::new(&link_input)),
+            )
+            .child(
+                gpui::div()
+                    .flex()
+                    .flex_col()
+                    .gap_y(px(4.))
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(colors.fg_muted)
+                            .child("文本"),
+                    )
+                    .child(crate::ui::input::Input::new(&text_input)),
+            )
+            .child(
+                gpui::div()
+                    .flex()
+                    .flex_row()
+                    .gap_x(px(8.))
+                    .justify_end()
+                    .child(
+                        crate::ui::button::Button::new("wy-image-edit-cancel")
+                            .label("取消")
+                            .ghost()
+                            .h(px(26.))
+                            .px(px(12.))
+                            .on_click(move |_, _: &mut Window, cx: &mut gpui::App| {
+                                ed.update(cx, |e, cx| e.close_image_edit(cx));
+                            }),
+                    )
+                    .child(
+                        crate::ui::button::Button::new("wy-image-edit-save")
+                            .label("保存")
+                            .primary()
+                            .h(px(26.))
+                            .px(px(12.))
+                            .on_click(move |_, _: &mut Window, cx: &mut gpui::App| {
+                                ed_save.update(cx, |e, cx| e.save_image_edit(cx));
+                            }),
+                    ),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position_mode(AnchoredPositionMode::Local)
+                    .anchor(Anchor::TopLeft)
+                    .offset(gpui::point(px(left), px(top)))
+                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                    .child(card),
+            )
+            .with_priority(100)
+            .into_any_element(),
+        )
+    }
+
     /// 输入命中前确保帧存在（帧被置空后、下一次渲染还没重建时，点击才会落空——
     /// 这正是「展开后立刻再点折叠」偶发失效的来源）。缺帧则当场按当前可视带重建。
     fn ensure_frame_for_input(&mut self, window: &mut Window) -> bool {
@@ -3854,6 +4227,11 @@ impl WyEditor {
         if !self.editable {
             return;
         }
+        // 选中的图片对象：Backspace 删除整张图片行（含换行；记撤销栈）。
+        if let Some(line) = self.selected_image.get() {
+            self.delete_selected_image(line, cx);
+            return;
+        }
         crate::prof::op_start("backspace");
         // 有选区 → 直接删选区（等价退格删除选中文字）。
         if let Some(range) = self.selection() {
@@ -3890,6 +4268,11 @@ impl WyEditor {
 
     fn delete(&mut self, cx: &mut Context<Self>) {
         if !self.editable {
+            return;
+        }
+        // 选中的图片对象：Delete 删除整张图片行（含换行；记撤销栈）。
+        if let Some(line) = self.selected_image.get() {
+            self.delete_selected_image(line, cx);
             return;
         }
         crate::prof::op_start("delete");
@@ -4184,9 +4567,12 @@ impl Focusable for WyEditor {
 impl gpui::EventEmitter<WyEvent> for WyEditor {}
 
 impl gpui::Render for WyEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         use gpui::{CursorStyle, InteractiveElement, ParentElement, Styled};
-        gpui::div()
+        // 图片编辑卡片浮层：在元素树根上**最后**叠加（最后绘制、命中最靠前），
+        // 锚定在目标图片旁渲染（打开时才有）。
+        let image_edit_overlay = self.image_edit_card_element(window, cx);
+        let mut root = gpui::div()
             .relative()
             .key_context(CONTEXT)
             .track_focus(&self.focus)
@@ -4275,6 +4661,10 @@ impl gpui::Render for WyEditor {
             )
             .child(element::WyEditorElement {
                 editor: cx.entity(),
-            })
+            });
+        if let Some(overlay) = image_edit_overlay {
+            root = root.child(overlay);
+        }
+        root
     }
 }

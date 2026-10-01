@@ -12,8 +12,8 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
     ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, LayoutId, Pixels, ScrollWheelEvent, SharedString, TextAlign, Window, fill, point,
-    px, relative, size,
+    IntoElement, LayoutId, MouseMoveEvent, Pixels, ScrollWheelEvent, SharedString, TextAlign,
+    Window, fill, point, px, relative, size,
 };
 
 /// 行首 gutter 几何常量（paint 与 hit-test 共用，不得分开改）。
@@ -1100,6 +1100,17 @@ impl Element for WyEditorElement {
             if consumed {
                 cx.stop_propagation();
             }
+        });
+        // 图片悬浮态（编辑按钮亮显）：也走窗口级 mouse-move——元素在宿主
+        // `#live-vscrollbar-overlay`（inset_0）等顶层叠层之下，元素级 `.on_mouse_move`
+        // 会被遮罩吞掉（与上方滚轮同因）。Bubble 阶段读 `last_bounds` 判命中后更新
+        // `hover_image`。拖选中（鼠标按下）由元素级拖选事件驱动，这里跳过。
+        let wzed_hover = self.editor.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if !matches!(phase, DispatchPhase::Bubble) {
+                return;
+            }
+            wzed_hover.update(cx, |e, c| e.on_window_mouse_move(event, c));
         });
         crate::prof::end("wy.paint", _t_paint);
         // 操作级实时计时结算：本帧若含未结算操作（type/backspace/scroll/open…），

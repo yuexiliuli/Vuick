@@ -1,8 +1,15 @@
 //! WYSIWYG 交互/命中层：窗口坐标 ↔ 源字节（光标几何、点击命中）、代码/表格横向滚动条的几何/命中/跳转与拖拽换算。与 `element` 共用几何。
 use super::*;
-use gpui::{Pixels, Point, px, point};
+use gpui::{Bounds, Pixels, Point, px, point, size};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::recognition::LinkHit;
+
+/// 图片右上角编辑按钮的边长（px）。命中与 paint 共用，不得分开改。
+pub(crate) const IMAGE_EDIT_BTN_SIZE: f32 = 24.;
+/// 编辑按钮距图片右上角的边距（px）。
+pub(crate) const IMAGE_EDIT_BTN_MARGIN: f32 = 6.;
+/// 图片编辑卡片的宽（px；卡片水平居中于内容区）。
+pub(crate) const IMAGE_EDIT_CARD_W: f32 = 320.;
 
 
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
@@ -187,6 +194,66 @@ pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels
 pub(crate) fn to_local(editor: &WyEditor, p: Point<Pixels>) -> Point<Pixels> {
     let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
     point(p.x - origin.x, p.y - origin.y)
+}
+
+/// 独立图片行的**图片盒**元素局部 bounds（图片本身，不含下方题注行）。
+/// `paint_image_row` / 命中（悬浮、编辑按钮） / 表单定位共用同一几何。
+pub(crate) fn image_box_local(f: &Frame, row: &ShapedRow) -> Option<Bounds<Pixels>> {
+    let img = row.image.as_ref()?;
+    let content_w = f32::from(f.width) - f32::from(f.padding) * 2.;
+    let x0 = f32::from(f.padding) + ((content_w - img.w) / 2.).max(0.);
+    let top0 = f32::from(row.top);
+    Some(Bounds::new(point(px(x0), px(top0)), size(px(img.w), px(img.h))))
+}
+
+/// 图片编辑按钮的元素局部矩形：钉在图片盒**右上角**（右缘内收、顶缘下移）。
+pub(crate) fn image_edit_button_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> {
+    let x = box_b.right() - px(IMAGE_EDIT_BTN_SIZE + IMAGE_EDIT_BTN_MARGIN);
+    let y = box_b.top() + px(IMAGE_EDIT_BTN_MARGIN);
+    Bounds::new(point(x, y), size(px(IMAGE_EDIT_BTN_SIZE), px(IMAGE_EDIT_BTN_SIZE)))
+}
+
+/// 命中图片盒（窗口坐标）→ 其 `src_line`；未命中返回 `None`（悬浮按钮亮显判定）。
+pub(crate) fn image_box_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<usize> {
+    let p = to_local(editor, p);
+    for r in &frame.rows {
+        if r.kind != IrKind::Image {
+            continue;
+        }
+        let Some(b) = image_box_local(frame, r) else {
+            continue;
+        };
+        if b.contains(&p) {
+            return Some(r.src_line);
+        }
+    }
+    None
+}
+
+/// 命中图片**编辑按钮**（窗口坐标）→ 其 `src_line`；未命中返回 `None`。
+/// 几何与 `paint_image_row` 画出的按钮一致（图片盒右上角）。
+pub(crate) fn image_edit_button_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<usize> {
+    let p = to_local(editor, p);
+    for r in &frame.rows {
+        if r.kind != IrKind::Image {
+            continue;
+        }
+        let Some(b) = image_box_local(frame, r).map(|b| image_edit_button_local(&b)) else {
+            continue;
+        };
+        if b.contains(&p) {
+            return Some(r.src_line);
+        }
+    }
+    None
 }
 
 

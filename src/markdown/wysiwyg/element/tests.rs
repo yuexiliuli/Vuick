@@ -6417,3 +6417,389 @@ A-->B
         assert_eq!(hh.as_slice(), &[5.0, 6.0]);
         assert_eq!(ss.as_slice(), &[0, 1]);
     }
+
+    /* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
+
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, size};
+
+    fn img_down(x: f32, y: f32) -> MouseDownEvent {
+        MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }
+    }
+    fn img_move(x: f32, y: f32) -> MouseMoveEvent {
+        MouseMoveEvent {
+            position: point(px(x), px(y)),
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    /// 图片编辑测试夹具：按**真实窗口内容宽**建帧并注入、`last_bounds` 置为原点。
+    /// 返回 `(帧, 内容宽)`。注意：元素经 `notify` 触发重绘后会按真实宽重建帧，
+    /// 因此测试几何一律从返回的帧/宽推导，不硬编码内容宽。
+    fn image_harness(
+        vcx: &mut VisualTestContext,
+        ed: &gpui::Entity<WyEditor>,
+    ) -> (std::rc::Rc<super::Frame>, f32) {
+        vcx.update(|window, cx| {
+            let width = f32::from(window.viewport_size().width).max(1.);
+            let frame = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+            assert!(
+                frame.rows.iter().any(|r| r.kind == crate::markdown::ir::IrKind::Image),
+                "夹具应含独立图片行"
+            );
+            let bounds_h = f32::from(frame.total).max(600.);
+            ed.update(cx, |e, _| {
+                e.set_last_bounds(Some(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(width), px(bounds_h)),
+                )));
+            });
+            let rc = std::rc::Rc::new(frame);
+            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc.clone()));
+            (rc, width)
+        })
+    }
+
+    /// 悬浮到图片盒内 → 编辑按钮亮显（hover_image = 该行）；移出 → 清除。
+    #[gpui::test]
+    fn image_hover_toggles_edit_button_line(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
+        assert_eq!(img.src_line, 0);
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        // 图片盒：x0 = padding(12) + (content_w − w)/2。
+        let avail = width - 24.;
+        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        // 图片中心 → 命中。
+        let mut ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0), "悬浮在图片盒内应记录该行");
+        // 移到远离图片处 → 清除。
+        ev = img_move(width - 5., 0.);
+        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "移出图片盒应清除悬浮");
+        // 图片盒之外但行内（题注区）→ 不命中图片盒（不亮按钮）。
+        ev = img_move(cx0, top + h + 40.);
+        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "题注区不应命中图片盒");
+    }
+
+    /// 窗口级 mouse-move（元素级 `on_mouse_move` 被顶层叠层覆盖时的回退路径）：
+    /// 指针在 `last_bounds` 内 → 更新悬浮；移出元素 → 清除。
+    #[gpui::test]
+    fn image_hover_via_window_mouse_move(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        // 指针在元素内（图片中心）→ 悬浮记录该行。
+        let ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0), "窗口级移动应记录悬浮图片");
+        // 移出元素（last_bounds 之外）→ 清除。
+        let ev = img_move(width + 200., 50.);
+        ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "指针移出元素应清除悬浮");
+    }
+
+    /// 点击图片右上角编辑按钮 → 打开编辑卡片（锚定该行、输入框预填当前 alt/src）。
+    #[gpui::test]
+    fn image_edit_button_click_opens_card(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let avail = width - 24.;
+        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        // 先悬浮（亮起按钮），再点按钮中心（右上角内收 margin+size 的方钮）。
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0));
+        // 未打开时点按钮 → 打开。
+        let down = img_down(btn_x, btn_y);
+        let hit = vcx.update(|_, cx| {
+            let f = ed.read(cx).frame.borrow().clone();
+            super::image_edit_button_hit_at(
+                ed.read(cx),
+                f.as_deref().unwrap(),
+                point(px(btn_x), px(btn_y)),
+            )
+        });
+        assert_eq!(hit, Some(0), "点按钮位置应命中编辑按钮（btn={btn_x},{btn_y}）");
+        vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
+        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "点编辑按钮应打开卡片");
+        assert_eq!(ed.read_with(vcx, |e, _| e.image_edit_src_line()), Some(0), "卡片应锚定该图片行");
+        // 输入框预填当前 alt / src。
+        vcx.update(|_, cx| {
+            let link = ed.read(cx).image_edit_link_input().expect("应有链接输入框");
+            let text = ed.read(cx).image_edit_text_input().expect("应有文本输入框");
+            assert_eq!(link.read(cx).value().to_string(), "img测试.png");
+            assert_eq!(text.read(cx).value().to_string(), "独立图片");
+        });
+        // 再点同一按钮 → 关闭（toggle）。
+        vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
+        assert!(!ed.read_with(vcx, |e, _| e.image_edit_open()), "再点编辑按钮应关闭卡片");
+    }
+
+    /// 保存卡片：把输入框的链接/文本写回 `![alt](src)`，并关闭卡片。
+    #[gpui::test]
+    fn image_edit_card_save_rewrites_source(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        vcx.update(|window, cx| {
+            ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+        });
+        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "程序化打开卡片");
+        // 填新值：链接 + 文本。
+        vcx.update(|window, cx| {
+            let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+            link.update(cx, |s, cx| s.set_value("assets/new图.png", window, cx));
+            let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+            text.update(cx, |s, cx| s.set_value("新描述文本", window, cx));
+        });
+        vcx.update(|_window, cx| {
+            ed.update(cx, |e, cx| e.save_image_edit(cx));
+        });
+        let out = vcx.update(|_w, cx| ed.read(cx).content());
+        assert_eq!(out, "![新描述文本](assets/new图.png)\n", "保存应改写 alt+src");
+        assert!(!ed.read_with(vcx, |e, _| e.image_edit_open()), "保存后卡片应关闭");
+    }
+
+    /// 不填链接（空 src）保存 → 保留原 src，只改文本。
+    #[gpui::test]
+    fn image_edit_save_with_empty_link_keeps_src(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        vcx.update(|window, cx| {
+            ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+        });
+        vcx.update(|window, cx| {
+            let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+            text.update(cx, |s, cx| s.set_value("只改文本", window, cx));
+        });
+        vcx.update(|_window, cx| {
+            ed.update(cx, |e, cx| e.save_image_edit(cx));
+        });
+        let out = vcx.update(|_w, cx| ed.read(cx).content());
+        assert_eq!(out, "![只改文本](img测试.png)\n", "空链接应保留原 src");
+    }
+
+    /// 渲染层：打开卡片后 draw，浮层卡片（wy-image-edit-card）真实出现。
+    #[gpui::test]
+    fn image_edit_card_renders_as_drawable_overlay(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap().clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let avail = width - 24.;
+        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        // 悬浮 + 点按钮 → 打开卡片。
+        vcx.update(|window, cx| {
+            let ev = img_move(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, cx| e.on_mouse_move(&ev, cx));
+            let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+            let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+            let down = img_down(btn_x, btn_y);
+            ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+            assert!(ed.read(cx).image_edit_open(), "悬浮+点按钮应打开卡片");
+            // 绘制一帧 → 浮层卡片出现（deferred anchored 逃逸裁剪、随内容滚动）。
+            let _ = window.draw(cx);
+        });
+        assert!(
+            vcx.debug_bounds("wy-image-edit-card").is_some(),
+            "编辑卡片浮层应被绘制（debug_bounds 命中）"
+        );
+    }
+
+    /// 点图片**本体** → 选中该图（不落光标进题注文本）；点题注 → 清除选中、光标进 alt。
+    #[gpui::test]
+    fn image_click_body_selects_image_not_caption(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx
+                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+            .unwrap()
+            .clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        // 点图片中心 → 选中（selected_image=该行、无文本选区、光标不进题注）。
+        vcx.update(|window, cx| {
+            let down = img_down(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert_eq!(ed.read(cx).selected_image(), Some(0), "点图片本体应选中该图");
+            assert_eq!(ed.read(cx).selection(), None, "选中图片不应产生文本选区");
+        });
+        // 点题注行（图片盒之下）→ 清除选中，且构成对准 alt 起点的源选区。
+        vcx.update(|window, cx| {
+            let caption_y = top + h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
+            let down2 = img_down(cx0, caption_y);
+            ed.update(cx, |e, c| e.on_mouse_down(&down2, window, c));
+            assert_eq!(ed.read(cx).selected_image(), None, "点题注应清除图片选中");
+            // 光标/锚点落在题注内即 alt 源字节（不在图片盒里「跳进题注」的对立面——
+            // 点题注本来就该能编辑 alt）。
+            assert_eq!(ed.read(cx).caret(), 2, "点题注应把光标放进 alt 起点");
+        });
+        // 再点图片本体 → 恢复选中（指针移开也不受影响：选中态独立于悬浮）。
+        vcx.update(|window, cx| {
+            let down3 = img_down(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_down(&down3, window, c));
+            assert_eq!(ed.read(cx).selected_image(), Some(0), "再点图片应重新选中");
+            // 模块级 mouse-move 到别处只清 hover 不清选中 → 按钮仍常显。
+            let ev = img_move(width + 200., 50.);
+            ed.update(cx, |e, c| e.on_window_mouse_move(&ev, c));
+            assert_eq!(ed.read(cx).hover_image(), None, "移出应清悬浮");
+            assert_eq!(ed.read(cx).selected_image(), Some(0), "选中不随指针移出消失");
+        });
+    }
+
+    /// 选中图片后 Backspace → 删除整张图片行（含换行），记撤销栈，清除选中态。
+    #[gpui::test]
+    fn image_selected_backspace_deletes_line(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+            .unwrap()
+            .clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        vcx.update(|window, cx| {
+            let down = img_down(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert_eq!(ed.read(cx).selected_image(), Some(0));
+            ed.update(cx, |e, c| e.backspace(c));
+            assert_eq!(ed.read(cx).content(), "正文\n", "Backspace 应删除整张图片行");
+            assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
+        });
+    }
+
+    /// 选中图片后 Delete → 删除整张图片行（与 Backspace 同一入口）。
+    #[gpui::test]
+    fn image_selected_delete_deletes_line(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let ed = host.read_with(vcx, |h, _| h.ed.clone());
+        let (frame, width) = image_harness(vcx, &ed);
+        let img = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+            .unwrap()
+            .clone();
+        let (top, w, h) = (
+            f32::from(img.top),
+            img.image.as_ref().unwrap().w,
+            img.image.as_ref().unwrap().h,
+        );
+        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        vcx.update(|window, cx| {
+            let down = img_down(cx0 + w / 2., top + h / 2.);
+            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            assert_eq!(ed.read(cx).selected_image(), Some(0));
+            ed.update(cx, |e, c| e.delete(c));
+            assert_eq!(ed.read(cx).content(), "正文\n", "Delete 应删除整张图片行");
+            assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
+        });
+    }
+

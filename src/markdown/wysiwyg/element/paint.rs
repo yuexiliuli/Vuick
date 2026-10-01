@@ -328,6 +328,63 @@ pub(crate) fn paint_image_row(
             None => paint_image_fallback(theme, bounds, window),
         }
     }
+    // 编辑按钮：可编辑模式且鼠标悬浮在这张图片上（或图片被选中）时，在图片**右上角**
+    // 浮现「⋮」选项按钮（命中/几何与 `hit.rs` 的 `image_edit_button_hit_at`/
+    // `image_edit_button_local` 共用）。样式：透明灰白圆角方框 + 竖向三个圆点（纯
+    // `paint_quad` 绘制，不依赖 SVG 光栅）。⚠️ 局部坐标 → 窗口坐标**必须加 `origin`**
+    //（与图片本体同式）——否则元素不在窗口原点时按钮会画到错误位置（修掉「悬浮不出现」）。
+    let hovered_or_selected = editor.read(cx).hover_image() == Some(row.src_line)
+        || editor.read(cx).selected_image() == Some(row.src_line);
+    if editor.read(cx).is_editable()
+        && hovered_or_selected
+        && let Some(bb) = super::image_box_local(f, row)
+    {
+        let btn_local = super::image_edit_button_local(&bb);
+        let btn = Bounds::new(
+            point(origin.x + btn_local.left(), origin.y + btn_local.top()),
+            btn_local.size,
+        );
+        // 透明灰白底（无论明暗主题都压得住图片），浅白描边。
+        window.paint_quad(gpui::PaintQuad {
+            bounds: btn,
+            corner_radii: gpui::Corners::all(px(6.)),
+            background: gpui::hsla(0., 0., 0.9, 0.6).into(),
+            border_widths: gpui::Edges::all(px(1.)),
+            border_color: gpui::hsla(0., 0., 1., 0.55),
+            border_style: gpui::BorderStyle::Solid,
+        });
+        // 竖向三个圆点：按钮水平居中、垂直三等分（间距 8px，圆点 4×4 圆角）。
+        let dot = size(px(4.), px(4.));
+        let dot_x = btn.left() + px((super::IMAGE_EDIT_BTN_SIZE - 4.) / 2.);
+        let dot_y0 = btn.top() + px(6.);
+        for k in 0..3 {
+            window.paint_quad(gpui::PaintQuad {
+                bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * 8.)), dot),
+                corner_radii: gpui::Corners::all(px(2.)),
+                background: gpui::hsla(0., 0., 0.22, 1.).into(),
+                border_widths: gpui::Edges::default(),
+                border_color: gpui::Hsla::default(),
+                border_style: gpui::BorderStyle::Solid,
+            });
+        }
+    }
+    // 选中态（点击图片本体）：accent 2px 圆角描边（与 mermaid 聚焦描边同色同宽）。
+    if editor.read(cx).selected_image() == Some(row.src_line)
+        && let Some(bb) = super::image_box_local(f, row)
+    {
+        let sel_b = Bounds::new(
+            point(origin.x + bb.left(), origin.y + bb.top()),
+            bb.size,
+        );
+        window.paint_quad(gpui::PaintQuad {
+            bounds: sel_b,
+            corner_radii: gpui::Corners::all(px(4.)),
+            background: gpui::Hsla::default().into(),
+            border_widths: gpui::Edges::all(px(2.)),
+            border_color: theme.accent,
+            border_style: gpui::BorderStyle::Solid,
+        });
+    }
     // 题注（可编辑 alt）绘制在图片之下，经 `x_off` 水平居中。
     paint_text_row(origin, theme, f, row, window, cx);
 }
