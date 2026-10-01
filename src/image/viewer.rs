@@ -1140,6 +1140,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 升档（评审补测，CRG 风险 0.71）：放大使展示像素需要超过 1/2 档时，按需重解 1/1 全解
+    /// 替换（1:1 看细节仍清晰），且只升不降、不再重复触发（去重）。
+    #[gpui::test]
+    async fn zoom_in_escalates_display_to_full_resolution(cx: &mut TestAppContext) {
+        let dir = tmp_dir("escalate");
+        let p = dir.join("big.jpg");
+        write_jpeg(&p, 5120, 3840);
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        assert_eq!(cx.update(|app| viewer.read(app).display_denom), 2, "首解 1/2");
+        // 模拟放大 ≥2×：展示像素需要 (2752,2064) > 1/2(2560×1920) → 应升到 1/1 全解
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.display_need = (2752.0, 2064.0);
+                v.escalate_display_denom(cx);
+            })
+        });
+        flush(cx);
+        let (d1, w1, h1, cached) = cx.update(|app| {
+            let v = viewer.read(app);
+            let c: Vec<(u8, u32, u32)> = v
+                .cache
+                .iter()
+                .map(|e| (e.denom, e.intrinsic.0 as u32, e.intrinsic.1 as u32))
+                .collect();
+            (
+                v.display_denom,
+                v.intrinsic.map(|i| i.0 as u32).unwrap_or(0),
+                v.intrinsic.map(|i| i.1 as u32).unwrap_or(0),
+                c,
+            )
+        });
+        assert_eq!(d1, 1, "放大 2× 后应升档到 1/1 全解，而非停在 1/2");
+        assert_eq!((w1, h1), (5120, 3840));
+        assert_eq!(cached, vec![(1, 5120, 3840)], "缓存应升级为唯一全解档");
+        // 再次触发（无需升档）应为空操作：不新增解码、档位不变
+        cx.update(|app| viewer.update(app, |v, cx| v.escalate_display_denom(cx)));
+        let stable = cx.update(|app| viewer.read(app).display_denom);
+        assert_eq!(stable, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn scan_folder_sorts_images_ignores_others_and_locates_current() {
         let dir = tmp_dir("scan");
