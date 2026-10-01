@@ -3,15 +3,21 @@
 //! 设计（对齐 [`crate::pdf::PdfViewer`] 的「自包含阅读器」姿势）：
 //! - **打开即显**：`image` crate 在后台线程解码（不阻塞 UI），主线程把 **BGRA** 像素
 //!   （GPUI 渲染格式）包成 [`gpui::RenderImage`] 上屏；
-//! - **单滚轮切换**：打开时同步扫描**同文件夹**的全部图片（扩展名过滤、文件名升序），
+//! - **单滚轮切换**：打开时扫描**同文件夹**的全部图片（扩展名过滤、文件名升序），
 //!   此后单滚轮在清单内循环切换（向下滚 → 下一张，向上滚 → 上一张）；
 //! - **Ctrl+滚轮缩放**：缩放倍率作用于「适应视口（Contain）」的基准尺寸，图片始终
 //!   水平居中；缩放锚点为图像中心；
-//! - **加载守卫**：每次切换自增代序号，只有最新一代解密结果允许落盘（快速连滚时
-//!   旧在途解码直接丢弃，不会覆盖新图）；
+//! - **流畅切换（缓存 + 预取 + 单 worker 合并最新目标）**：
+//!   - 解码结果进 **LRU 缓存**（张数 + 字节双上限），滚动即切时多数是 O(1) 缓存命中、
+//!     瞬时上屏；
+//!   - 当前图加载完立刻**后台预取相邻 ±1 张**（含循环回绕），正向/反向浏览几乎零等待；
+//!   - **单解码 worker**只追「最新显示目标」：快速连滚时中间图只解最新一张、乱序的
+//!     旧结果不落盘，且 `in_flight` 去重避免同一路径重复解码——不再有「每步必等解码 /
+//!     重复解码白耗 CPU+IO」的卡顿；
 //! - **通知宿主**：`notify()` + `refresh_windows()` 双保险（实体未注册 window
 //!   invalidator 时仅 notify 是空操作），宿主 `EditorApp` 据此同步标签标题与状态栏。
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,6 +34,19 @@ const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
 /// 画布四边留白（px，适应视口时的外衬）。
 const PAD: f32 = 24.0;
+/// 解码缓存上限（张数）：超出按 LRU 淘汰（配合字节预算，见 [`CACHE_MAX_BYTES`]）。
+const CACHE_MAX_ITEMS: usize = 4;
+/// 解码缓存字节预算（RGBA 近似内存）：超出按 LRU 淘汰，避免大图缓存无界膨胀。
+const CACHE_MAX_BYTES: usize = 96 * 1024 * 1024;
+
+/// 一张已解码可立即上屏的图片（LRU 缓存条目）。
+#[derive(Clone)]
+struct CacheEntry {
+    path: PathBuf,
+    render: Arc<RenderImage>,
+    intrinsic: (f32, f32),
+    bytes: usize,
+}
 
 /// 图片查看器：自包含的图片浏览视图。
 pub struct ImageViewer {
@@ -52,12 +71,19 @@ pub struct ImageViewer {
     viewport: ScrollHandle,
     /// 画布背景（None → 主题推导；宿主 `EditorApp` 通常显式设置）。
     bg: Option<Hsla>,
-    /// 解码代序号：每次 `load_path` 自增；只允许最新代结果落盘。
-    load_seq: u64,
+    /// 解码结果 LRU 缓存（队首最旧 / 队尾最近用；命中与写入都移到队尾）。
+    cache: VecDeque<CacheEntry>,
+    /// 缓存总字节（RGBA 近似内存，淘汰预算 [`CACHE_MAX_BYTES`]）。
+    cache_bytes: usize,
+    /// 已在后台解码中的路径去重（当前目标 worker + 预取共用，防同一路径重复解码）。
+    in_flight: HashSet<PathBuf>,
+    /// 当前目标解码 worker 是否在途（串行：一次只解「最新显示目标」一张；其余快速
+    /// 连滚的中间目标被合并，等本次落盘后再追最新）。
+    decoding: bool,
 }
 
 impl ImageViewer {
-    /// 创建查看器并异步加载 `path`（解码 + 同文件夹扫描在后台，UI 不阻塞）。
+    /// 创建查看器并异步加载 `path`（同文件夹扫描在后台；首图经缓存/worker 流程加载）。
     pub fn new(path: PathBuf, cx: &mut Context<Self>) -> Self {
         let this = Self {
             path: path.clone(),
@@ -70,34 +96,22 @@ impl ImageViewer {
             load_error: None,
             viewport: ScrollHandle::new(),
             bg: None,
-            load_seq: 0,
+            cache: VecDeque::new(),
+            cache_bytes: 0,
+            in_flight: HashSet::new(),
+            decoding: false,
         };
         let scan_at = path.clone();
-        let decode_at = path.clone();
         cx.spawn(async move |weak, cx| {
-            let result = cx
+            let (folder, current) = cx
                 .background_executor()
-                .spawn(async move {
-                    let decoded = decode_image_at(&decode_at);
-                    let folder = scan_folder(&scan_at);
-                    (decoded, folder)
-                })
+                .spawn(async move { scan_folder(&scan_at) })
                 .await;
             let _ = weak.update(cx, |this, cx| {
-                let (decoded, (folder, current)) = result;
                 this.folder = folder;
                 this.current = current;
-                match decoded {
-                    Ok((bgra, w, h)) => {
-                        this.install_image(this.path.clone(), bgra, w, h, cx);
-                    }
-                    Err(e) => {
-                        this.loading = false;
-                        this.load_error = Some(e);
-                        cx.notify();
-                        cx.refresh_windows();
-                    }
-                }
+                // 统一入口：缓存命中瞬时落盘 / 未中由 worker 解码并预取 ±1。
+                this.request_display(cx);
             });
         })
         .detach();
@@ -130,11 +144,16 @@ impl ImageViewer {
         self.bg = Some(bg);
     }
 
-    /// 释放已上屏的 GPU 纹理（关闭标签页时调用，与 PDF 阅读器同款）。
+    /// 释放已上屏与缓存的 GPU 纹理（关闭标签页时调用，与 PDF 阅读器同款）。
     pub fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(img) = self.image.take() {
             cx.drop_image(img, Some(window));
         }
+        for entry in std::mem::take(&mut self.cache).into_iter() {
+            cx.drop_image(entry.render, Some(window));
+        }
+        self.cache_bytes = 0;
+        self.in_flight.clear();
     }
 
     /// 视口尺寸：`#image-scroll` 布局后的真实可视区；首帧未布局（bounds 为 0）
@@ -209,7 +228,9 @@ impl ImageViewer {
         cx.notify();
     }
 
-    /// 在同文件夹清单内切换（`dir` = ±1，取模循环）。
+    /// 在同文件夹清单内切换（`dir` = ±1，取模循环）。切换本身 O(1)：目标立即写入
+    /// `path`（标题/状态栏跟着走），显示由 `request_display` 决定「缓存命中秒切 / 未中
+    /// worker 追最新」。
     fn switch(&mut self, dir: i32, cx: &mut Context<Self>) {
         let n = self.folder.len();
         if n <= 1 || dir == 0 {
@@ -220,61 +241,192 @@ impl ImageViewer {
             return;
         }
         self.current = next;
-        let p = self.folder[next].clone();
-        self.load_path(p, cx);
+        self.path = self.folder[next].clone();
+        self.request_display(cx);
     }
 
-    /// 载入指定路径：后台解码（带代序守卫），期间保留旧图避免闪白。
-    fn load_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.path = path.clone();
+    /// 显示入口（首图 / 切换 / 预取完成共用）：`path` 已指向目标。缓存命中 → 瞬时
+    /// 落盘并预取邻居；未中 → 置 loading 并交给单 worker 解码。
+    fn request_display(&mut self, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        if let Some(entry) = self.cache_get(&path) {
+            self.install_current(entry, &path, cx);
+            return;
+        }
         self.loading = true;
         self.load_error = None;
-        self.load_seq += 1;
-        let seq = self.load_seq;
-        let decode_path = path.clone();
+        self.pump_decode(cx);
+    }
+
+    /// 单解码 worker：一次只解「最新显示目标」一张；快速连滚时中间目标被合并（落盘时
+    /// 已非当前 → 只进缓存不显示），旧结果不会覆盖新图。`in_flight` 去重防重复解码。
+    fn pump_decode(&mut self, cx: &mut Context<Self>) {
+        if self.decoding {
+            return; // 上一张在途：落盘后会自动续追最新目标
+        }
+        let path = self.path.clone();
+        // 可能已被预取填进缓存（等它到达期间切到该图）→ 直接秒切
+        if let Some(entry) = self.cache_get(&path) {
+            self.install_current(entry, &path, cx);
+            return;
+        }
+        if self.in_flight.contains(&path) {
+            return; // 预取正在解该图：其完成回调会 `request_display` 落盘
+        }
+        self.decoding = true;
+        self.in_flight.insert(path.clone());
+        let decode_path = path;
+        let decode_inner = decode_path.clone();
         cx.spawn(async move |weak, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { decode_image_at(&decode_path) })
+                .spawn(async move { decode_image_at(&decode_inner) })
                 .await;
             let _ = weak.update(cx, |this, cx| {
-                if this.load_seq != seq {
-                    return; // 已有更新代在途 → 本代结果丢弃
-                }
+                this.in_flight.remove(&decode_path);
+                this.decoding = false;
                 match result {
-                    Ok((bgra, w, h)) => this.install_image(path, bgra, w, h, cx),
-                    Err(e) => {
-                        this.loading = false;
-                        this.load_error = Some(e);
-                        cx.notify();
-                        cx.refresh_windows();
+                    Ok((bgra, w, h)) => {
+                        if let Some(buf) = RgbaImage::from_raw(w, h, bgra) {
+                            let entry = CacheEntry {
+                                path: decode_path.clone(),
+                                render: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
+                                intrinsic: (w as f32, h as f32),
+                                bytes: w as usize * h as usize * 4,
+                            };
+                            this.cache_put(decode_path.clone(), entry.clone());
+                            // 仍旧是「最新目标」才落盘显示（否则仅供缓存）
+                            if this.path == decode_path {
+                                this.install_current(entry, &decode_path, cx);
+                            }
+                        } else if this.path == decode_path {
+                            this.load_error = Some("解码结果尺寸异常".into());
+                            this.loading = false;
+                            cx.notify();
+                            cx.refresh_windows();
+                        }
                     }
+                    Err(e) => {
+                        if this.path == decode_path {
+                            this.load_error = Some(e);
+                            this.loading = false;
+                            cx.notify();
+                            cx.refresh_windows();
+                        }
+                    }
+                }
+                // 解码期间目标又移动 → 续追最新（否则停在旧图）
+                if this.path != decode_path {
+                    this.pump_decode(cx);
                 }
             });
         })
         .detach();
     }
 
-    /// 解码完成落盘：包 `RenderImage`、复位加载态、通知宿主。
-    /// `bgra` 为 **BGRA** 字节序（GPUI 渲染格式；见 [`decode_image_at`]）。
-    fn install_image(&mut self, path: PathBuf, bgra: Vec<u8>, w: u32, h: u32, cx: &mut Context<Self>) {
-        self.path = path;
+    /// 后台预取相邻 ±1 张（含循环回绕）：只填缓存不抢显示；回来后若恰是当前显示目标
+    /// 则立即经 `request_display` 秒切。去重：已在缓存 / 已在解码中则跳过。
+    fn prefetch_neighbors(&mut self, cx: &mut Context<Self>) {
+        let n = self.folder.len();
+        if n <= 1 {
+            return;
+        }
+        for off in [1i64, -1i64] {
+            let ni = ((self.current as i64 + off).rem_euclid(n as i64)) as usize;
+            let path = self.folder[ni].clone();
+            if self.cache_contains(&path) || self.in_flight.contains(&path) {
+                continue;
+            }
+            self.in_flight.insert(path.clone());
+            let p = path;
+            let p_inner = p.clone();
+            cx.spawn(async move |weak, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { decode_image_at(&p_inner) })
+                    .await;
+                let _ = weak.update(cx, |this, cx| {
+                    this.in_flight.remove(&p);
+                    // 预取结果恰是当前显示目标（loading 中）→ 成功经缓存落盘；失败须
+                    // 亮错误并结束 loading，否则会一直停在旧图/占位。
+                    let is_current = this.loading && this.path == p;
+                    match result {
+                        Ok((bgra, w, h)) => {
+                            if let Some(buf) = RgbaImage::from_raw(w, h, bgra) {
+                                let entry = CacheEntry {
+                                    path: p.clone(),
+                                    render: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
+                                    intrinsic: (w as f32, h as f32),
+                                    bytes: w as usize * h as usize * 4,
+                                };
+                                this.cache_put(p.clone(), entry);
+                                if is_current {
+                                    this.request_display(cx);
+                                }
+                            } else if is_current {
+                                this.load_error = Some("解码结果尺寸异常".into());
+                                this.loading = false;
+                                cx.notify();
+                                cx.refresh_windows();
+                            }
+                        }
+                        Err(e) => {
+                            if is_current {
+                                this.load_error = Some(e);
+                                this.loading = false;
+                                cx.notify();
+                                cx.refresh_windows();
+                            }
+                        }
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 把缓存条目落盘为当前显示 + 通知宿主 + 预取邻居。
+    fn install_current(&mut self, entry: CacheEntry, path: &Path, cx: &mut Context<Self>) {
+        self.path = path.to_path_buf();
+        self.image = Some(entry.render);
+        self.intrinsic = Some(entry.intrinsic);
         self.loading = false;
         self.load_error = None;
-        match RgbaImage::from_raw(w, h, bgra) {
-            Some(buf) => {
-                let render = Arc::new(RenderImage::new(vec![Frame::new(buf)]));
-                self.image = Some(render);
-                self.intrinsic = Some((w as f32, h as f32));
-            }
-            None => {
-                self.image = None;
-                self.intrinsic = None;
-                self.load_error = Some("解码结果尺寸异常".into());
-            }
-        }
         cx.notify();
         cx.refresh_windows();
+        self.prefetch_neighbors(cx);
+    }
+
+    /// 缓存查询并移到队尾（MRU）。命中返回克隆（Arc 浅拷贝），未中 `None`。
+    fn cache_get(&mut self, path: &Path) -> Option<CacheEntry> {
+        if let Some(pos) = self.cache.iter().position(|e| e.path == path) {
+            let entry = self.cache.remove(pos).unwrap();
+            self.cache.push_back(entry.clone());
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// 缓存是否已含某路径（只读，不改变 LRU 顺序）。
+    fn cache_contains(&self, path: &Path) -> bool {
+        self.cache.iter().any(|e| e.path == path)
+    }
+
+    /// 写入缓存（已存在则移到队尾），超出张数/字节预算按 LRU 从队首淘汰。
+    fn cache_put(&mut self, path: PathBuf, entry: CacheEntry) {
+        if let Some(pos) = self.cache.iter().position(|e| e.path == path) {
+            self.cache_bytes -= self.cache[pos].bytes;
+            self.cache.remove(pos);
+        }
+        self.cache_bytes += entry.bytes;
+        self.cache.push_back(entry);
+        while self.cache.len() > CACHE_MAX_ITEMS || self.cache_bytes > CACHE_MAX_BYTES {
+            let Some(old) = self.cache.pop_front() else {
+                break;
+            };
+            self.cache_bytes -= old.bytes;
+        }
     }
 
     /// 居中占位文本（加载中 / 加载失败共用）。
