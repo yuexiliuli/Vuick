@@ -8,9 +8,12 @@ use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 pub(crate) const LIVE_BODY_PAD_Y: f32 = 8.0;
 
 impl EditorApp {
-    /// 当前选项卡的预览视图：PDF 选项卡用 `PdfViewer`（整页原样），
-    /// 其余用 `MarkdownPreview`。
+    /// 当前选项卡的预览视图：图片选项卡用 `ImageViewer`（自处理滚轮），
+    /// PDF 选项卡用 `PdfViewer`（整页原样），其余用 `MarkdownPreview`。
     fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
+        if let Some(img) = &tab.image_viewer {
+            return img.clone().into_any_element();
+        }
         match &tab.pdf_preview {
             Some(pdf) => pdf.clone().into_any_element(),
             None => tab.md_preview.clone().into_any_element(),
@@ -402,20 +405,29 @@ impl EditorApp {
             // A2：Markdown 全屏预览同样切统一组件 WyEditor（宿主滚动；结构与右栏同源）。
             return self.md_wy_host_children(window, cx, true, 1.0);
         }
+        // 图片查看器：切换/解码完成后把标签标题与状态栏跟到当前图片（渲染期幂等同步，
+        // 无图片则跳过）。
+        if self.sync_active_image_meta(cx) {
+            cx.notify();
+        }
         // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
         let fs = self.font_size;
         self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
             view.set_font_size_anchored(fs, cx)
         });
         let tab = &self.tabs[self.active_tab];
-        div()
+        let mut el = div()
             .id("fullscreen-preview")
             .debug_selector(|| "fullscreen-preview".into())
             .size_full()
             .relative()
             .bg(self.panel_bg())
-            .child(Self::preview_element(tab))
-            .child(Self::zoom_overlay(cx))
-            .into_any_element()
+            .child(Self::preview_element(tab));
+        // 图片查看器：自处理滚轮（单滚切换 / Ctrl+滚轮缩放），不再挂全局 zoom_overlay
+        //（否则 Ctrl+滚轮会被全局字号缩放抢走，图片缩放失效）。
+        if tab.image_viewer.is_none() {
+            el = el.child(Self::zoom_overlay(cx));
+        }
+        el.into_any_element()
     }
 }

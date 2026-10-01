@@ -35,6 +35,7 @@ impl EditorApp {
             cursor_col: 0,
             md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             pdf_preview: None,
+            image_viewer: None,
             preview_on: false,
             preview_fullscreen: false,
             readonly_preview: false,
@@ -189,6 +190,9 @@ impl EditorApp {
             if let Some(pdf) = tab.pdf_preview.take() {
                 pdf.update(cx, |view, cx| view.release(window, cx));
             }
+            if let Some(img) = tab.image_viewer.take() {
+                img.update(cx, |view, cx| view.release(window, cx));
+            }
             // A2：右栏 WyEditor 预览随选项卡复位释放（同 md_preview 释放内存）。
             tab.md_wy = None;
             tab.md_wy_vscroll = gpui::ScrollHandle::new();
@@ -211,6 +215,9 @@ impl EditorApp {
         }
         if let Some(pdf) = self.tabs[idx].pdf_preview.take() {
             pdf.update(cx, |view, cx| view.release(window, cx));
+        }
+        if let Some(img) = self.tabs[idx].image_viewer.take() {
+            img.update(cx, |view, cx| view.release(window, cx));
         }
         self.tabs.remove(idx);
         if idx < self.active_tab {

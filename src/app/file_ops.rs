@@ -650,6 +650,50 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 把一个新图片查看器载入指定选项卡：编辑区置空、全屏只读预览。
+    /// 解码由 [`crate::image::ImageViewer`] 自己在后台完成，窗口不阻塞。
+    fn load_image(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        // 阅读画布用灰色系（非白面板），让图片与画布形成分隔（同 PDF 阅读器）
+        let canvas_bg = self.window_bg();
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        // 编辑区置为提示文本（图片只读，不参与文本编辑）
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text("");
+            ed.set_language(Some("markdown"));
+        });
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(canvas_bg);
+            view.set_source("", cx);
+        });
+        // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
+        let viewer = cx.new(|cx| crate::image::ImageViewer::new(p.to_path_buf(), cx));
+        viewer.update(cx, |view, _| view.set_background(canvas_bg));
+        tab.image_viewer = Some(viewer);
+        tab.file_path = Some(p.to_path_buf());
+        tab.content = SharedString::default();
+        tab.line_count = 0;
+        tab.char_count = 0;
+        tab.cursor_row = 0;
+        tab.cursor_col = 0;
+        tab.dirty = false;
+        tab.preview_on = true;
+        tab.preview_fullscreen = true;
+        // 图片正文只存在于查看器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
+        tab.readonly_preview = true;
+        self.status = SharedString::from(format!("已打开图片：{}", p.display()));
+        self.status_ok = true;
+        cx.notify();
+    }
+
     /// 打开 PDF：立即建标签页并创建自包含的 PdfViewer（在后台加载解析），
     /// 窗口保持响应；解析完成/失败由阅读器内部呈现。
     fn open_pdf_async(
@@ -686,6 +730,10 @@ impl EditorApp {
         }
         if Self::is_pdf_path(&p) {
             self.open_pdf_async(idx, p.clone(), window, cx);
+            return;
+        }
+        if Self::is_image_path(&p) {
+            self.load_image(idx, &p, window, cx);
             return;
         }
         // 大文件（按字节阈值判断）：后台打开（复用已有选项卡），
@@ -731,6 +779,14 @@ impl EditorApp {
             let idx = self.make_tab(window, cx);
             self.open_pdf_async(idx, p.clone(), window, cx);
             let focus = self.tab_focus_handle(idx, cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        if Self::is_image_path(&p) {
+            // 先建标签页、立即返回：解码放到后台（ImageViewer 自包含）
+            let idx = self.make_tab(window, cx);
+            self.load_image(idx, &p, window, cx);
+            let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
             return;
         }

@@ -124,6 +124,8 @@ struct EditorTab {
     md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     /// PDF 阅读器（打开 .pdf 时创建）：整页原样显示；None = 非 PDF 选项卡。
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
+    /// 图片查看器（打开图片时创建）：None = 非图片选项卡。
+    image_viewer: Option<gpui::Entity<crate::image::ImageViewer>>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
     /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
@@ -176,6 +178,8 @@ pub(crate) struct DetachedTab {
     editor: gpui::Entity<crate::editor::CodeEditor>,
     md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
+    /// 图片查看器实体（随选项卡跨窗口搬迁）。
+    image_viewer: Option<gpui::Entity<crate::image::ImageViewer>>,
     /// A2：右栏 WyEditor 预览实体与宿主滚动句柄随选项卡搬迁（与 `md_preview` 同；
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
@@ -674,6 +678,7 @@ impl EditorApp {
             editor: tab.editor,
             md_preview: tab.md_preview,
             pdf_preview: tab.pdf_preview,
+            image_viewer: tab.image_viewer,
             md_wy: tab.md_wy,
             md_wy_vscroll: tab.md_wy_vscroll,
             file_path: tab.file_path,
@@ -721,6 +726,7 @@ impl EditorApp {
             cursor_col: payload.cursor_col,
             md_preview: payload.md_preview,
             pdf_preview: payload.pdf_preview,
+            image_viewer: payload.image_viewer,
             md_wy: payload.md_wy,
             md_wy_vscroll: payload.md_wy_vscroll,
             preview_on: payload.preview_on,
@@ -759,6 +765,9 @@ impl EditorApp {
             self._pdf_observe = Some(cx.observe(&pdf, |_this, _e, cx| {
                 cx.notify();
             }));
+        }
+        if let Some(img) = self.tabs[idx].image_viewer.clone() {
+            img.update(cx, |view, _| view.set_background(canvas_bg));
         }
         self.pdf_search = None; // 重新推送检索查询
         if let Some(window) = window.as_mut() {
@@ -942,6 +951,38 @@ impl EditorApp {
             view.set_wrap(true, cx);
             view.set_source(&value, cx);
         });
+    }
+
+    /// 图片查看器切换/加载后的标签标题与状态栏同步（**渲染期调用**，见
+    /// `render_fullscreen_preview`）：查看器切换图片后 `refresh_windows` 触发本窗口重绘，
+    /// 全屏预览渲染前据此把选项卡 `file_path` 与状态栏跟到当前图片（标签标题跟着图走，
+    /// 状态栏显示「图片 n/m：路径」）。仅在激活选项卡持有图片查看器时更新；
+    /// **幂等**：路径未变返回 false（调用方不 notify，无重绘循环）。
+    fn sync_active_image_meta(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(handle) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.image_viewer.clone())
+        else {
+            return false;
+        };
+        let (cur, idx, total) = {
+            let v = handle.read(cx);
+            (v.current_path(), v.current_index(), v.folder_len())
+        };
+        let Some(cur) = cur else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return false;
+        };
+        if tab.file_path.as_deref() == Some(cur.as_path()) {
+            return false;
+        }
+        self.status = SharedString::from(format!("图片 {}/{}：{}", idx + 1, total, cur.display()));
+        self.status_ok = true;
+        tab.file_path = Some(cur);
+        true
     }
 
     /// A2：当前激活选项卡的右栏 WyEditor 预览实体（仅当该选项卡**真正以 WyEditor 作
@@ -1148,6 +1189,11 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
+    /// 是否图片文件（按扩展名识别；清单见 [`crate::image::IMAGE_EXTENSIONS`]）。
+    fn is_image_path(p: &Path) -> bool {
+        crate::image::is_image_extension(p)
+    }
+
     /// 按扩展名推断 gpui-component 语法高亮的语言名（未知扩展名回退 "text"）。
     fn language_id(p: &Path) -> &'static str {
         let ext = p
@@ -1204,6 +1250,7 @@ impl EditorApp {
             "md" | "markdown" => "Markdown",
             "epub" => "EPUB",
             "pdf" => "PDF",
+            "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico" | "tif" | "tiff" => "图片",
             "rs" => "Rust",
             "toml" => "TOML",
             "json" => "JSON",

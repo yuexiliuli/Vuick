@@ -19,6 +19,7 @@ mod app;
 mod config;
 mod editor;
 mod epub;
+mod image;
 mod markdown;
 mod pdf;
 mod prof;
