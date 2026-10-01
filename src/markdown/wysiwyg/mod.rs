@@ -4251,7 +4251,21 @@ impl WyEditor {
                             .text_color(colors.fg_muted)
                             .child("链接"),
                     )
-                    .child(crate::ui::input::Input::new(&link_input)),
+                    // 输入框样式：内凹底色 + 圆角描边，标识「可输入」区域（区别于卡片
+                    // 表面与纯文字）。聚焦态边框提亮在保存时由卡片统一不变，此处只供样式。
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .h(px(28.))
+                            .w_full()
+                            .px_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.bg)
+                            .child(crate::ui::input::Input::new(&link_input)),
+                    ),
             )
             .child(
                 gpui::div()
@@ -4264,7 +4278,19 @@ impl WyEditor {
                             .text_color(colors.fg_muted)
                             .child("文本"),
                     )
-                    .child(crate::ui::input::Input::new(&text_input)),
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .h(px(28.))
+                            .w_full()
+                            .px_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border)
+                            .bg(colors.bg)
+                            .child(crate::ui::input::Input::new(&text_input)),
+                    ),
             )
             .child(
                 gpui::div()
