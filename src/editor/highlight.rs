@@ -389,10 +389,19 @@ impl Highlighter {
             && !self.lines.is_empty()
             && lo >= self.base
             && let Some((min_row, tail_new, delta)) = self.dirty
-            && min_row.saturating_sub(lookback) >= self.base
+            && min_row > self.base
             && min_row.saturating_sub(lookback) < self.base + self.lines.len()
         {
-            let reenter = min_row.saturating_sub(lookback);
+            // 编辑增量：从 `min_row`（编辑行）直接用**编辑前一行保存点**
+            // `old_saves[min_row-1]` 恢复作用域（min_row-1 及之前内容未变，快照即准确），
+            // 不再从 `min_row - lookback` 重解析回看行——普通字符输入一行的重解析即可
+            // 收敛（lookback 只在窗口顶 base 边界才需要，此时 min_row == base 用全新状态）。
+            // 原实现每键重解析 16 行回看 + 窗口行，debug 下 syntect 逐行 parse 是
+            // 大文档 .rs 输入卡顿主因（hl_reparse_ok ~36ms/次）。
+            // 注意：条件用**严格 `min_row > base`**——若编辑恰在缓存起点行（min_row==base），
+            // 上一行保存点 `min_row-1` 不存在，用全新 ParseState 会丢多行注释/字符串
+            // 作用域，此时落 full_reparse（从 lo-lookback 重建，上下文完整，与原实现一致）。
+            let reenter = min_row;
             let ok = self.reparse_after_edit(buffer, reenter, hi, min_row, tail_new, delta);
             if ok && self.covered(lo, hi) {
                 self.gated_version = version;
