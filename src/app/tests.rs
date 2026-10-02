@@ -91,7 +91,7 @@
         cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
         cx.run_until_parked();
         assert!(
-            cx.update(|_w, cx| app.read(cx).image_lock_menu_pos.is_some()),
+            cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
             "图片右键应在光标处弹出锁定菜单"
         );
         // 点菜单首项（菜单窗口锚定在该处；面板内边距 4 + 项高 26 → 项中心约 y+17）
@@ -104,7 +104,7 @@
             let a = app.read(cx);
             (
                 a.active_image_locked(cx),
-                a.image_lock_menu_pos.is_none(),
+                a.media_lock_menu_pos.is_none(),
                 a.tabs[a.active_tab]
                     .image_viewer
                     .as_ref()
@@ -123,7 +123,75 @@
         }
         let unlocked = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.active_image_locked(cx), a.image_lock_menu_pos.is_none())
+            (a.active_image_locked(cx), a.media_lock_menu_pos.is_none())
+        });
+        assert!(unlocked.1, "再次点菜单后仍应关闭");
+        assert!(!unlocked.0, "再次点「锁定」应解锁回归");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 视频右键「锁定」：右键在光标处弹菜单 → 点「锁定」→ 进入纯视频（外壳隐藏、视频
+    /// 充满窗口）；再右键 → 点「锁定」→ 解锁回归。解码失败（假字节）不影响锁定状态机。
+    #[cfg(feature = "video")]
+    #[gpui::test]
+    async fn video_right_click_lock_menu_toggles(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-vid-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.mp4");
+        std::fs::write(&p, b"not really a video").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.load_video(0, &p, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        // 右键（视频区任一点）→ 菜单在光标处弹出
+        let menu_at = gpui::Point::new(px(400.), px(360.));
+        cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
+            "视频右键应在光标处弹出锁定菜单"
+        );
+        // 点菜单首项（菜单窗口锚定在该处；面板内边距 4 + 项高 26 → 项中心约 y+17）
+        let item = gpui::Point::new(px(400. + 8.), px(360. + 4. + 13.));
+        cx.simulate_click(item, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let state = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.active_video_locked(cx),
+                a.media_lock_menu_pos.is_none(),
+                a.tabs[a.active_tab]
+                    .video_viewer
+                    .as_ref()
+                    .map(|v| v.read(cx).is_locked())
+                    .unwrap_or(false),
+            )
+        });
+        assert!(state.1, "点「锁定」后菜单应关闭");
+        assert!(state.0 && state.2, "点「锁定」应进入纯视频（外壳隐藏）");
+        // 再右键 → 再点「锁定」→ 解锁
+        cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        cx.simulate_click(item, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let unlocked = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.active_video_locked(cx), a.media_lock_menu_pos.is_none())
         });
         assert!(unlocked.1, "再次点菜单后仍应关闭");
         assert!(!unlocked.0, "再次点「锁定」应解锁回归");

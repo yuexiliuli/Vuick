@@ -319,13 +319,22 @@ pub struct EditorApp {
     /// 本窗口是否为「拖出拆分」生成的独立文件窗口。是 → 把选项卡拖出窗口 = 还原回主窗口；
     /// 否（主窗口）→ 把选项卡拖出窗口 = 拆分出新的独立窗口。
     is_detached: bool,
-    /// 图片右键「锁定/解锁」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
-    image_lock_menu_pos: Option<Point<Pixels>>,
-    /// 已打开的图片右键菜单实体（随位置同生同灭）。
-    image_lock_menu_entity: Option<gpui::Entity<crate::ui::menu::PopupMenu>>,
-    /// 图片右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
-    image_lock_menu_sub: Option<Subscription>,
+    /// 图片/视频右键「锁定/解锁」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    media_lock_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的媒体右键菜单实体（随位置同生同灭）。
+    media_lock_menu_entity: Option<gpui::Entity<crate::ui::menu::PopupMenu>>,
+    /// 媒体右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
+    media_lock_menu_sub: Option<Subscription>,
     focus_handle: FocusHandle,
+}
+
+/// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
+/// 一个选项卡只可能是其一（打开图片/视频时分别创建）。
+#[derive(Clone)]
+enum ActiveMedia {
+    Image(gpui::Entity<crate::image::ImageViewer>),
+    #[cfg(feature = "video")]
+    Video(gpui::Entity<crate::video::VideoViewer>),
 }
 
 impl Focusable for EditorApp {
@@ -416,9 +425,9 @@ impl EditorApp {
             open_finish_count: 0,
             tab_dragging: None,
             is_detached,
-            image_lock_menu_pos: None,
-            image_lock_menu_entity: None,
-            image_lock_menu_sub: None,
+            media_lock_menu_pos: None,
+            media_lock_menu_entity: None,
+            media_lock_menu_sub: None,
             focus_handle,
         };
         app.register_window(window, cx);
@@ -1047,46 +1056,79 @@ impl EditorApp {
             .is_some_and(|v| v.read(cx).is_locked())
     }
 
-    /// 图片右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片时生效）。
-    /// 锁定 = 隐藏全部非图片 UI、图片充满窗口；解锁回归。就地换掉旧的（若已打开）。
-    fn on_image_right_click(
+    /// 当前激活选项卡是否在「纯视频」干净播放模式（读视频查看器实体状态）。
+    #[cfg(feature = "video")]
+    fn active_video_locked(&self, cx: &App) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|t| t.video_viewer.as_ref())
+            .is_some_and(|v| v.read(cx).is_locked())
+    }
+
+    /// 当前激活选项卡的媒体查看器（图片或视频；均有则取图片）。无媒体 → None。
+    fn active_media_viewer(&self) -> Option<ActiveMedia> {
+        let tab = self.tabs.get(self.active_tab)?;
+        if let Some(img) = &tab.image_viewer {
+            return Some(ActiveMedia::Image(img.clone()));
+        }
+        #[cfg(feature = "video")]
+        if let Some(vid) = &tab.video_viewer {
+            return Some(ActiveMedia::Video(vid.clone()));
+        }
+        None
+    }
+
+    /// 图片/视频右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片/视频时
+    /// 生效）。锁定 = 隐藏全部非媒体 UI、媒体充满窗口；解锁回归。就地换掉旧的（若已打开）。
+    fn on_media_right_click(
         &mut self,
         ev: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.image_viewer.as_ref())
-            .is_none()
-        {
-            return;
-        }
-        // 先收掉上一份菜单（若有），再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）
-        self.image_lock_menu_entity = None;
-        self.image_lock_menu_pos = None;
-        self.image_lock_menu_sub = None;
-        let Some(viewer) = self.tabs[self.active_tab].image_viewer.clone() else {
+        let Some(media) = self.active_media_viewer() else {
             return;
         };
+        // 先收掉上一份菜单（若有），再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）
+        self.media_lock_menu_entity = None;
+        self.media_lock_menu_pos = None;
+        self.media_lock_menu_sub = None;
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-            let item = {
-                let viewer_render = viewer.clone();
-                PopupMenuItem::element(move |_window, cx| {
-                    let locked = viewer_render.read(cx).is_locked();
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
-                        .child("锁定图片视图")
-                })
-                .on_click(move |_click, window, cx| {
-                    viewer.update(cx, |v, cx| v.toggle_lock(cx));
-                    // 强制重绘：宿主重读图片查看器锁定态 → 隐藏/恢复外壳 → 图片自动填满/缩小
-                    window.refresh();
-                })
+            let item = match media.clone() {
+                ActiveMedia::Image(img) => {
+                    let viewer_render = img.clone();
+                    PopupMenuItem::element(move |_window, cx| {
+                        let locked = viewer_render.read(cx).is_locked();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
+                            .child("锁定图片视图")
+                    })
+                    .on_click(move |_click, window, cx| {
+                        img.update(cx, |v, cx| v.toggle_lock(cx));
+                        // 强制重绘：宿主重读媒体查看器锁定态 → 隐藏/恢复外壳 → 媒体自动填满/缩小
+                        window.refresh();
+                    })
+                }
+                #[cfg(feature = "video")]
+                ActiveMedia::Video(vid) => {
+                    let viewer_render = vid.clone();
+                    PopupMenuItem::element(move |_window, cx| {
+                        let locked = viewer_render.read(cx).is_locked();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
+                            .child("锁定视频视图")
+                    })
+                    .on_click(move |_click, window, cx| {
+                        vid.update(cx, |v, cx| v.toggle_lock(cx));
+                        window.refresh();
+                    })
+                }
             };
             menu.item(item)
         });
@@ -1098,20 +1140,20 @@ impl EditorApp {
         // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
         let menu_entity = menu.clone();
         let sub = cx.subscribe(&menu_entity, move |this, emitter, _: &DismissEvent, cx| {
-            if this.image_lock_menu_entity.as_ref() == Some(&emitter) {
-                this.image_lock_menu_entity = None;
-                this.image_lock_menu_pos = None;
+            if this.media_lock_menu_entity.as_ref() == Some(&emitter) {
+                this.media_lock_menu_entity = None;
+                this.media_lock_menu_pos = None;
             }
             cx.notify();
         });
-        self.image_lock_menu_pos = Some(ev.position);
-        self.image_lock_menu_entity = Some(menu);
-        self.image_lock_menu_sub = Some(sub);
+        self.media_lock_menu_pos = Some(ev.position);
+        self.media_lock_menu_entity = Some(menu);
+        self.media_lock_menu_sub = Some(sub);
         cx.notify();
     }
 
-    /// 外壳子元素：锁定图片视图时只放「图片铺满窗口」（藏菜单栏/选项卡栏/侧边栏/状态栏），
-    /// 否则齐全；始终带通知层与图片右键菜单 Overlay。
+    /// 外壳子元素：锁定图片/视频视图时只放「媒体铺满窗口」（藏菜单栏/选项卡栏/侧边栏/
+    /// 状态栏），否则齐全；始终带通知层与媒体右键菜单 Overlay。
     fn render_shell_children(
         &mut self,
         body: gpui::AnyElement,
@@ -1119,9 +1161,19 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let image_locked = self.active_image_locked(cx);
+        let video_locked = {
+            #[cfg(feature = "video")]
+            {
+                self.active_video_locked(cx)
+            }
+            #[cfg(not(feature = "video"))]
+            {
+                false
+            }
+        };
         let mut out: Vec<gpui::AnyElement> = Vec::new();
-        if image_locked {
-            // 锁定：正文（图片查看器）直接铺满窗口，其余全藏 —— 图片经重排后自动放大填满
+        if image_locked || video_locked {
+            // 锁定：正文（图片/视频查看器）直接铺满窗口，其余全藏 —— 媒体经重排后自动放大填满
             out.push(body);
         } else {
             out.push(self.render_title_bar(window, cx).into_any_element());
@@ -1129,32 +1181,28 @@ impl EditorApp {
             out.push(self.render_body_sidebar(body, cx).into_any_element());
             out.push(self.render_status_bar(cx).into_any_element());
         }
-        // 通知层（右上角 toast）与图片右键菜单 Overlay 恒在最上层
+        // 通知层（右上角 toast）与媒体右键菜单 Overlay 恒在最上层
         out.push(self.render_notifications(window, cx).into_any_element());
-        out.push(self.render_image_lock_menu(window, cx).into_any_element());
+        out.push(self.render_media_lock_menu(window, cx).into_any_element());
         out
     }
 
-    /// 图片「锁定」右键菜单 Overlay：按截图时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
-    fn render_image_lock_menu(
+    /// 图片/视频「锁定」右键菜单 Overlay：按右键时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
+    fn render_media_lock_menu(
         &mut self,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let still_image = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.image_viewer.as_ref())
-            .is_some();
-        if !still_image {
-            // 切走/关闭了图片选项卡 → 一并收起右键菜单
-            self.image_lock_menu_entity = None;
-            self.image_lock_menu_pos = None;
+        let still_media = self.active_media_viewer().is_some();
+        if !still_media {
+            // 切走/关闭了媒体选项卡 → 一并收起右键菜单
+            self.media_lock_menu_entity = None;
+            self.media_lock_menu_pos = None;
         }
-        let Some(pos) = self.image_lock_menu_pos else {
+        let Some(pos) = self.media_lock_menu_pos else {
             return div().into_any_element();
         };
-        let Some(menu) = self.image_lock_menu_entity.clone() else {
+        let Some(menu) = self.media_lock_menu_entity.clone() else {
             return div().into_any_element();
         };
         deferred(
@@ -2096,10 +2144,10 @@ impl EditorApp {
                     this.release_tab_drag_outside(window, ev.position, cx);
                 }),
             )
-            // 图片选项卡：右键 → 「锁定/解锁」干净看图菜单（气泡到根统一处理）
+            // 图片/视频选项卡：右键 → 「锁定/解锁」干净查看/播放菜单（气泡到根统一处理）
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(Self::on_image_right_click),
+                cx.listener(Self::on_media_right_click),
             )
             .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {
                 this.save(window, cx)

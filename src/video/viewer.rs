@@ -192,6 +192,15 @@ pub struct VideoViewer {
     pan: (f32, f32),
     /// 拖拽平移进行中：`(左键按下位置, 按下时 pan 起点)`。
     drag: Option<((f32, f32), (f32, f32))>,
+    // --- 纯视频模式（参考纯图片锁定）：控制条为浮层，按需浮现 / 自隐 ---
+    /// 是否「纯视频」干净播放模式（宿主据此隐藏全部非视频 UI，视频充满窗口）。
+    locked: bool,
+    /// 底部控制条是否可见（锁定模式：进锁定默认可见、切视频 / 悬停浮现，离开 1s 自隐）。
+    controls_visible: bool,
+    /// 控制条自隐定时器的代序号（悬停 / 切视频刷新，防旧定时器误清）。
+    controls_seq: u32,
+    /// 是否悬停在查看器上（`#video-viewer` 根 hover；悬停期间不自动隐藏）。
+    controls_hovering: bool,
     /// seek 进度条自身在**窗口坐标**下的盒（每次 prepaint 由 canvas 子元素刷新；
     /// 事件回调读它做屏 x→分数。**不**用 `use_keyed_state`——那只能在渲染期调用）。
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -241,11 +250,17 @@ impl VideoViewer {
             zoom: 1.0,
             pan: (0.0, 0.0),
             drag: None,
+            locked: false,
+            controls_visible: true,
+            controls_seq: 0,
+            controls_hovering: false,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
         };
         this.start(cx);
+        // 初始浮现控制条、无悬停 1s 后自隐（hover 会作废本次隐藏）
+        this.show_controls_temporarily(cx);
         this
     }
 
@@ -646,6 +661,8 @@ impl VideoViewer {
             drop(old);
         }
         self.start(cx);
+        // 切视频：控制条浮现（锁定模式默认可见随后自隐；普通模式常驻）
+        self.show_controls_temporarily(cx);
         cx.notify();
     }
 
@@ -852,7 +869,11 @@ impl VideoViewer {
     /// 当前图在**画布区**（视口高 − 控制条高）内的 contain 显示尺寸（× 缩放）。
     /// 拖拽平移与 render 共用同一套尺寸，保证 clamp 与画面一致。
     fn display_size(&self, vw: f32, vh: f32) -> (f32, f32) {
-        let area_h = (vh - CONTROL_BAR_H).max(1.0);
+        let area_h = if self.locked {
+            vh.max(1.0)
+        } else {
+            (vh - CONTROL_BAR_H).max(1.0)
+        };
         let (iw, ih) = self.intrinsic.unwrap_or((0.0, 0.0));
         let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
         (dw * self.zoom, dh * self.zoom)
@@ -885,7 +906,11 @@ impl VideoViewer {
             return;
         };
         let (vw, vh) = self.viewport_size(window);
-        let area_h = (vh - CONTROL_BAR_H).max(1.0);
+        let area_h = if self.locked {
+            vh.max(1.0)
+        } else {
+            (vh - CONTROL_BAR_H).max(1.0)
+        };
         let (dw, dh) = self.display_size(vw, vh);
         let dx = ev.position.x.as_f32() - start_pos.0;
         let dy = ev.position.y.as_f32() - start_pos.1;
@@ -908,6 +933,64 @@ impl VideoViewer {
         let ax = (dw - vw).max(0.0) * 0.5;
         let ay = (dh - vh).max(0.0) * 0.5;
         (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
+    }
+
+    // ---- 纯视频模式（参考纯图片锁定）：隐藏外壳、视频充满窗口、控制条为浮层 ----
+
+    /// 是否「纯视频」干净播放模式（宿主据此隐藏菜单栏/选项卡栏/侧边栏/状态栏，视频充满窗口）。
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// 切换纯视频模式：锁定 = 隐藏非视频 UI、视频充满窗口（宿主壳体重排后自动缩放填满）、
+    /// 控制条浮层按需浮现；解锁回归。切换时平移/拖拽归零。
+    pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
+        self.locked = !self.locked;
+        self.pan = (0.0, 0.0);
+        self.drag = None;
+        // 进/出锁定都让控制条浮现一次（锁定态随即 1s 自隐）
+        self.show_controls_temporarily(cx);
+        cx.notify();
+    }
+
+    // ---- 控制条浮现 / 自隐（锁定模式浮层；普通模式常驻） ----
+
+    /// 控制条浮现并排队「离开 1s 后自隐」（切视频 / hover 离开时调用；悬停中不隐藏）。
+    /// 带代序号防旧定时器误清新浮现。
+    fn show_controls_temporarily(&mut self, cx: &mut Context<Self>) {
+        self.controls_visible = true;
+        cx.notify();
+        self.controls_seq = self.controls_seq.wrapping_add(1);
+        let seq = self.controls_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.controls_seq == seq && !this.controls_hovering {
+                    this.controls_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 查看器悬停态：`#video-viewer` 根 hover。进入 → 浮现且不隐藏；离开 → 1s 后自隐。
+    fn on_controls_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_controls_hover(*hovered, cx);
+    }
+
+    /// 悬停态设置（独立于窗口，便于测试）：悬停期间不受自动隐藏影响。
+    fn set_controls_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.controls_hovering = hovered;
+        if hovered {
+            self.controls_seq = self.controls_seq.wrapping_add(1); // 作废排队中的隐藏
+            self.controls_visible = true;
+            cx.notify();
+        } else {
+            self.show_controls_temporarily(cx);
+        }
     }
 
     /// 居中占位文本（加载中 / 加载失败共用）：铺满画布再 flex 居中。
@@ -975,7 +1058,24 @@ impl VideoViewer {
 
     /// 底部全屏控制条：上一支 / 播放·暂停 / 下一支 / 时间 / seek 进度条 /
     /// 静音 + 音量条 / 倍速循环 / 清单位置。
+    ///
+    /// 普通模式**常驻**显示。纯视频（锁定）模式为浮层：恒挂一根底部热区（`#video-controls`），
+    /// `controls_visible` 时渲染整条，隐藏时是透明热区——hover **只挂在这根条带**上（进入即
+    /// 浮现且不隐藏，离开 1s 后自隐；鼠标在条带之外的画面区域不触发，锁定的初始自隐不会被
+    /// 画面内停留的鼠标打断）。
     fn control_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let strip = div()
+            .id("video-controls")
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(CONTROL_BAR_H))
+            .on_hover(cx.listener(Self::on_controls_hover));
+        if self.locked && !self.controls_visible {
+            // 纯视频模式隐藏：透明热区（继续占底部、可接收 hover 触发浮现）
+            return strip.into_any_element();
+        }
         let colors = crate::ui::theme::Theme::global(cx).colors;
         let fg: Hsla = colors.fg.into();
         let muted: Hsla = colors.fg_muted.into();
@@ -1025,18 +1125,12 @@ impl VideoViewer {
             IconName::Volume
         };
 
-        div()
-            .id("video-controls")
-            .absolute()
-            .bottom_0()
-            .left_0()
-            .right_0()
-            .px_3()
-            .py_2()
+        strip
             .bg(surface)
             .flex()
             .items_center()
             .gap_x(px(8.))
+            .px_3()
             .child(control_icon_button(
                 "video-prev",
                 IconName::SkipBack,
@@ -1220,8 +1314,13 @@ impl Render for VideoViewer {
         let muted: Hsla = theme.colors.fg_muted.into();
 
         let (vw, vh) = self.viewport_size(window);
-        // 预留底部控制条：视频 contain 到「视口高 − 控制条高」，底部不被浮层遮挡
-        let area_h = (vh - CONTROL_BAR_H).max(1.0);
+        // 普通模式预留底部控制条高度（控制条常驻，画面 contain 到其上）；
+        // 纯视频（锁定）模式控制条是浮层 → 画面充满整个画布区。
+        let area_h = if self.locked {
+            vh.max(1.0)
+        } else {
+            (vh - CONTROL_BAR_H).max(1.0)
+        };
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted)
         } else {
@@ -1253,7 +1352,7 @@ impl Render for VideoViewer {
             }
         };
 
-        div()
+        let mut root = div()
             .id("video-viewer")
             .size_full()
             .relative()
@@ -1278,8 +1377,11 @@ impl Render for VideoViewer {
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_pan_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pan_up))
                     .child(body),
-            )
-            .child(self.control_bar(window, cx))
+            );
+        // 控制条：普通模式常驻（画面预留底部高度）；纯视频（锁定）模式为浮层按需浮现，
+        // 画面充满整个画布区。
+        root = root.child(self.control_bar(window, cx));
+        root
     }
 }
 
@@ -1382,6 +1484,10 @@ mod tests {
             zoom: 1.0,
             pan: (0.0, 0.0),
             drag: None,
+            locked: false,
+            controls_visible: true,
+            controls_seq: 0,
+            controls_hovering: false,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
@@ -1946,6 +2052,83 @@ mod tests {
             MouseButton::Left,
             Default::default(),
         );
+        cx.run_until_parked();
+    }
+
+    /// 纯视频（锁定）切换：`toggle_lock` 翻转 `is_locked` 并把放大后的平移/拖拽归零（干净播放）。
+    #[gpui::test]
+    async fn toggle_lock_flips_state_and_resets_pan(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.zoom = 4.0;
+            v.pan = (100.0, -50.0); // 放大平移中
+            v
+        }));
+        assert!(!cx.update(|app| ent.read(app).is_locked()));
+        cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(cx.update(|app| ent.read(app).is_locked()));
+        assert_eq!(cx.update(|app| ent.read(app).pan), (0.0, 0.0), "锁定应归零平移");
+        assert!(
+            cx.update(|app| ent.read(app).controls_visible),
+            "进锁定控制条默认可见"
+        );
+        cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(!cx.update(|app| ent.read(app).is_locked()));
+        cx.run_until_parked();
+    }
+
+    /// 纯视频（锁定）模式控制条浮层时序：进锁定默认可见 → 无悬停 1s 自隐 → 悬停不隐藏 →
+    /// 移开 1s 隐藏 → 切视频浮现。普通模式控制条常驻（`controls_visible` 不参与渲染判断）。
+    #[gpui::test]
+    async fn locked_controls_bar_floats_on_hover_and_auto_hides(cx: &mut TestAppContext) {
+        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-a-lock.mp4");
+        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-b-lock.mp4");
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(a.clone(), cx);
+            v.folder = vec![a, b];
+            v.current = 0;
+            v
+        }));
+        // 进入锁定 → 控制条默认可见（随后无悬停 1s 自隐）
+        cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(cx.update(|app| ent.read(app).is_locked()));
+        assert!(cx.update(|app| ent.read(app).controls_visible), "进锁定默认可见");
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|app| ent.read(app).controls_visible),
+            "无悬停 1s 后应自隐"
+        );
+        // 悬停 → 浮现，且 2s 内不隐藏
+        cx.update(|app| ent.update(app, |v, cx| v.set_controls_hover(true, cx)));
+        assert!(cx.update(|app| ent.read(app).controls_visible));
+        cx.executor().advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+        assert!(
+            cx.update(|app| ent.read(app).controls_visible),
+            "悬停期间不自动隐藏"
+        );
+        // 移开 → 1s 后隐藏
+        cx.update(|app| ent.update(app, |v, cx| v.set_controls_hover(false, cx)));
+        assert!(
+            cx.update(|app| ent.read(app).controls_visible),
+            "刚移开仍可见（排队 1s）"
+        );
+        cx.executor().advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|app| ent.read(app).controls_visible),
+            "移开后 1s 应隐藏"
+        );
+        // 切视频 → 浮现
+        cx.update(|app| ent.update(app, |v, cx| v.open_folder_index(1, cx)));
+        assert!(
+            cx.update(|app| ent.read(app).controls_visible),
+            "切视频应浮现控制条"
+        );
+        // 解锁 → 普通模式常驻（可见性标志不再影响渲染；只确认切换不炸状态机）
+        cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(!cx.update(|app| ent.read(app).is_locked()));
         cx.run_until_parked();
     }
 
