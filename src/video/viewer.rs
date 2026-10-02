@@ -269,6 +269,19 @@ impl VideoViewer {
     fn start(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         cx.spawn(async move |weak, cx| {
+            // 视频运行库缺失（主 exe 不再静态导入 FFmpeg，缺库也能启动）：不触碰任何
+            // 解码 FFI，直接在窗口内报错提示。
+            if !crate::video::decode::available() {
+                let _ = weak.update(cx, |this, cx| {
+                    this.loading = false;
+                    this.load_error = Some(
+                        "缺少视频运行库（video_ffmpeg.dll 或 avcodec-63.dll / avformat-63.dll 等 FFmpeg 运行库），视频功能不可用。请把它们放到程序 exe 同目录后重新打开。"
+                            .to_string(),
+                    );
+                    cx.notify();
+                });
+                return;
+            }
             let (folder, current) = cx
                 .background_executor()
                 .spawn(async move { scan_folder(&path) })

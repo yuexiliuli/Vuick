@@ -17,6 +17,7 @@
 - **Markdown 虚拟化预览**（自研 `src/markdown/`）：把源码按行扫描成渲染行（标题 / 代码围栏 / 引述 / 列表 / 表格 / 图片 / 分隔线 / 行内样式），用 **GPUI `List` 做行级虚拟化**——只构建 / 绘制可见行，滚动与文档大小解耦；滚动条叠加在内容之上，不会被不透明背景盖住。
 - **Markdown 实时编辑预览（WYSIWYG）**（`src/markdown/wysiwyg/`）：所见即所得编辑，打字时以「廉价帧」策略（有界重锚 + 滚动延后上色）保障滚动条跟手；支持 **Mermaid 矢量渲染**（流程图 / 时序图）与 **LaTeX / KaTeX 数学排版**（`$$…$$` / `$…$` / `\begin{...}`）。
 - **PDF 阅读器**（`src/pdf/`）：基于 `pdfium-render` 的后台 worker 栅格化，页码缓存 + 视口瓦片虚拟化 + 文本层对齐 + 全文档搜索（搜索期间冻结渲染探针）。
+- **视频播放器**（`src/video/`，FFmpeg 9.0 解码）：支持多格式（MP4 / AVI / MOV…）播放与同文件夹切换；音频时钟 A/V 对齐、音量 / 静音、倍速（0.5–2×）、底部控制条（可拖 seek 进度条 / 音量条 / 倍速循环）；Ctrl+滚轮缩放 + 左键拖拽平移。右键「锁定」进入**纯视频模式**——隐藏全部外壳、画面充满窗口，控制条为浮层（悬停条带浮现、离开 1s 自隐、切视频浮现）。
 - **EPUB 阅读器**（`src/epub/`）：HTML 解析（`roxmltree`）+ 排版 + 文本渲染，脚注标记 `[!N]` 兼容。
 - **目录 / 大纲**（`src/toc/`）：Markdown 标题层级与折叠可见性。
 - **编辑可用性增强**：
@@ -55,8 +56,9 @@ GPUI 应用内**全部 UI 组件均为自研**，替代已移除的 `gpui-compon
 | PDF | `pdfium-render` |
 | EPUB / 压缩 | `roxmltree` · `zip` |
 | 图像 | `image`（+ webp） |
+| 视频 | `ffmpeg-next`（FFmpeg 9.0 解码 / 重采样）· `cpal`（音频输出） |
 | 序列化 | `serde` · `serde_json` |
-| 测试 | GPUI `test-support`（`cargo test`，465 通过 / 0 失败） |
+| 测试 | GPUI `test-support`（`cargo test`，584 通过 / 0 失败） |
 
 ## 目录结构（主要代码作用）
 
@@ -73,6 +75,7 @@ src/
 │   └── wysiwyg/         # 实时编辑预览（element / frame / shape / mermaid / math / input / math_typeset）
 ├── syntax/              # 语法高亮：GitHubTheme + SemanticStyleResolver + 预暖和缓存
 ├── pdf/                 # PDF 阅读（后台 worker 栅格化 + 瓦片虚拟化 + 搜索）
+├── video/               # 视频播放（decode/audio/viewer；纯视频锁定模式 + 浮层控制条）
 ├── epub/                # EPUB 阅读（HTML 解析 + 排版）
 ├── toc/                 # 目录 / 大纲
 ├── ui/                  # 自研 UI 组件库（theme / icon / button / input / menu / notification / root / scrollbar）
@@ -118,7 +121,15 @@ src/
 
 ## 构建与运行
 
-PDF 预览依赖 pdfium 动态库：前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到 `pdfium.dll`，重命名并放于 `resources/pdfium/pdfium-154.0.8035.0.dll`。
+**视频功能依赖 FFmpeg 开发环境**（`ffmpeg-sys-next` 链接期需要）：
+- `FFMPEG_DIR` → 指向含 `include/` `lib/` `bin/` 的 FFmpeg **win64 shared** 构建（gyan / BtbN，9.x）；
+- `LIBCLANG_PATH` → 指向含 `libclang.dll` 的目录（bindgen 必需，装 LLVM 即得）。
+
+一键装环境：`pwsh scripts/setup-ffmpeg.ps1`（下载 / 配置提示、写用户环境变量，新终端生效）。
+跳过视频功能可 `cargo build --workspace --no-default-features --exclude video-ffmpeg`（不编译
+`src/video/`，也不构建 `video-ffmpeg` cdylib——否则默认 workspace 构建仍需要 FFmpeg 环境）。
+
+PDF 预览依赖 pdfium 动态库：前往 https://github.com/bblanchon/pdfium-binaries/releases 下载，解压得到 `pdfium.dll`，重命名并放于 `resources/pdfium/pdfium-154.0.8035.0.dll`（构建时若探测到会**内嵌进 exe**，分发免带）。
 
 ```bash
 # 运行（开发）
@@ -127,11 +138,14 @@ cargo run
 # 发布（Release profile 已配 opt-level=z / LTO / strip / panic=abort）
 cargo build --release
 
+# 分发打包（release exe + video_ffmpeg.dll + FFmpeg 运行库 → dist\gpui-editor-win64\）
+pwsh scripts/package.ps1
+
 # 全量测试
 cargo test
 
 # Lint
-cargo clippy --all-targets
+cargo clippy --workspace --all-targets
 ```
 
 ### 测试 fixture 说明
@@ -146,6 +160,28 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 | `fixtures/大文档测试.rs` / `fixtures/大文档测试2.md` | 6.4MB 大文档（编辑器 / 预览交互与 `BIGDOC_BENCH=1` 延迟基准） |
 
 > 超大文档档位（`大文档测试.md` / `大文档测试23MB*` / `大文档测试116MB.txt` / `大文档测试126MB.txt` 等）体积过大不入库，仅供 `#[ignore]` 手动 / 基准用例按需放置至 `fixtures/`。`cargo test` 的回归护栏覆盖：滚动条拖动、WYSIWYG 实时滚动、Markdown 预览滚动、编辑器远跳 / 延迟滚动、CJK 字符边界点击、撤销 / 重做、全选替换等。
+
+## 发布 / 打包分发
+
+视频解码内核已拆成独立 cdylib（`video-ffmpeg` 工作区成员，产物 `video_ffmpeg.dll`）：
+主 exe **不静态导入**任何 FFmpeg dll，只在打开视频时经 libloading **运行时**加载它。
+所以：
+- **exe 缺 `video_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；
+- 要让视频功能可用，分发时必须把 `video_ffmpeg.dll` 及 FFmpeg dll（`avcodec-63.dll` / `avformat-63.dll` / `avutil-61.dll` / `swscale-10.dll` / `swresample-7.dll` 及 `avdevice` / `avfilter`）与 exe **放到同一目录**。一键打包：
+
+```bash
+# 构建 release 并导出「exe + video_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\gpui-editor-win64\
+# 脚本自动校验：exe 无 FFmpeg 静态导入、video_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
+pwsh scripts/package.ps1
+```
+
+- **必须用 release**：debug 版还依赖 `vcruntime140d.dll` / `ucrtbased.dll` 等调试 CRT，他人机器也没有；
+- 把 `dist\gpui-editor-win64\` 整个目录（或打成 zip）发给对方，**exe 必须与这些 dll 同目录**；
+- 其余依赖（`VCRUNTIME140.dll`、`api-ms-win-crt-*`、`d3dcompiler_47.dll`、`icuuc.dll`）均为
+  Windows 10/11 系统自带，无需打包；对方是精简版 / 旧版系统缺 `VCRUNTIME140.dll` 时，安装
+  「Microsoft Visual C++ 2015–2022 Redistributable (x64)」即可；
+- DLL 须与编译期是**同一个** FFmpeg 构建（脚本直接从 `FFMPEG_DIR\bin` 取，版本号一致，不会 ABI 错位）；
+- **PDF 无需额外分发**：pdfium dll 构建时已内嵌进 exe（`embed_pdfium`），运行时自动解出。
 
 ## 已知限制与后续方向
 

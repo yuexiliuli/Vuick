@@ -49,20 +49,29 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "regex-fancy",
 ] }
 libjpeg-turbo-rs = "0.8"
-# 视频查看器（src/video/）解码内核：ffmpeg-next 9.0 高层封装，配 gyan FFmpeg 9.0.2
-# shared 构建。构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），
-# 开发机一键装填见 scripts/setup-ffmpeg.ps1；无 FFmpeg 环境的源码构建方可用
-# `cargo build --no-default-features` 绕过（视频功能关闭）。
-ffmpeg-next = { version = "9.0", optional = true }
+# FFmpeg 解码内核搬进独立 cdylib 工作区成员 `video-ffmpeg`（见下注释与 [workspace]）：
+# 主 exe 不再静态链接 FFmpeg → 缺 FFmpeg 运行库也能启动，只在用到视频时经 libloading
+# 运行时加载；加载失败（缺 video_ffmpeg.dll 或 FFmpeg dll）就在窗口内报错。
+# 无 FFmpeg 环境的源码构建：`cargo build --workspace --no-default-features --exclude video-ffmpeg`。
+libloading = "0.8"
 cpal = "0.18.2"
-
-[dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
 
 [features]
 default = ["video"]
 test-support = ["gpui/test-support"]
-video = ["dep:ffmpeg-next"]
+video = []
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+
+[workspace]
+resolver = "2"
+members = ["video-ffmpeg"]
+# 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
+# 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
+# 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
+# 无 FFmpeg 环境的源码构建仍可用 `cargo build --workspace --no-default-features --exclude video-ffmpeg` 绕过。
+default-members = [".", "video-ffmpeg"]
 
 
 [profile.release]

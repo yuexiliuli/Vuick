@@ -1,0 +1,18 @@
+[package]
+name = "video-ffmpeg"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "FFmpeg 视频/音频解码内核（cdylib），供 gpui-editor 主程序运行时经 libloading 动态加载"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+# 构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），见仓库 scripts/setup-ffmpeg.ps1。
+ffmpeg-next = "9.0"
+
+# MSVC 链接 cdylib 时会打印「正在创建库 ... .lib 和对象 ... .exp」（信息性，非错误），压掉以守零告警纪律。
+[lints.rust]
+linker_messages = "allow"

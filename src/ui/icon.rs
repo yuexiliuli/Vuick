@@ -24,16 +24,22 @@ pub enum IconName {
     ChevronRight,
     ChevronDown,
     /// 播放（视频控制条）。
+    #[cfg(feature = "video")]
     Play,
     /// 暂停（视频控制条）。
+    #[cfg(feature = "video")]
     Pause,
     /// 音量（视频控制条）。
+    #[cfg(feature = "video")]
     Volume,
     /// 静音（视频控制条）。
+    #[cfg(feature = "video")]
     VolumeX,
     /// 上一支（视频控制条）。
+    #[cfg(feature = "video")]
     SkipBack,
     /// 下一支（视频控制条）。
+    #[cfg(feature = "video")]
     SkipForward,
 }
 
@@ -72,20 +78,26 @@ impl IconName {
             IconName::ChevronRight => "<path d=\"m9 18 6-6-6-6\"/>",
             IconName::ChevronDown => "<path d=\"m6 9 6 6 6-6\"/>",
             // 播放/暂停（Feather 风格实心多边形，stroke 描边统一）
+            #[cfg(feature = "video")]
             IconName::Play => "<polygon points=\"6 3 20 12 6 21 6 3\"/>",
+            #[cfg(feature = "video")]
             IconName::Pause => {
                 "<line x1=\"6\" y1=\"4\" x2=\"6\" y2=\"20\"/><line x1=\"18\" y1=\"4\" x2=\"18\" y2=\"20\"/>"
             }
             // 音量：喇叭 + 声波弧；静音把声波换成「×」
+            #[cfg(feature = "video")]
             IconName::Volume => {
                 "<polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><path d=\"M15.54 8.46a5 5 0 0 1 0 7.07\"/><path d=\"M19.07 4.93a10 10 0 0 1 0 14.14\"/>"
             }
+            #[cfg(feature = "video")]
             IconName::VolumeX => {
                 "<polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><line x1=\"23\" y1=\"9\" x2=\"17\" y2=\"15\"/><line x1=\"17\" y1=\"9\" x2=\"23\" y2=\"15\"/>"
             }
+            #[cfg(feature = "video")]
             IconName::SkipBack => {
                 "<polygon points=\"19 20 9 12 19 4 19 20\"/><line x1=\"5\" y1=\"19\" x2=\"5\" y2=\"5\"/>"
             }
+            #[cfg(feature = "video")]
             IconName::SkipForward => {
                 "<polygon points=\"5 4 15 12 5 20 5 4\"/><line x1=\"19\" y1=\"5\" x2=\"19\" y2=\"19\"/>"
             }
@@ -198,7 +210,7 @@ mod tests {
 
     #[test]
     fn markup_is_wellformed_and_tintable() {
-        for name in [
+        let mut names = vec![
             IconName::PanelLeftClose,
             IconName::PanelLeftOpen,
             IconName::WindowMinimize,
@@ -210,13 +222,17 @@ mod tests {
             IconName::File,
             IconName::ChevronRight,
             IconName::ChevronDown,
+        ];
+        #[cfg(feature = "video")]
+        names.extend([
             IconName::Play,
             IconName::Pause,
             IconName::Volume,
             IconName::VolumeX,
             IconName::SkipBack,
             IconName::SkipForward,
-        ] {
+        ]);
+        for name in names {
             let m = name.svg_markup();
             assert!(m.contains("<svg"), "{:?} 应产出 svg 标记", name);
             assert!(m.contains("currentColor"), "{:?} 应收 currentColor 统一上色", name);
