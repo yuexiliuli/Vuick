@@ -263,7 +263,7 @@ impl ImageViewer {
     }
 
     /// 切换锁定：锁定 = 隐藏非图片 UI、图片充满窗口（宿主壳体重排后自动缩放填满）；
-    /// 解锁回归。切换时平移/拖拽归零 + 隐藏底部信息条。
+    /// 解锁回归。切换时平移/拖拽归零（底部信息条始终显示）。
     pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
         self.locked = !self.locked;
         self.pan = (0.0, 0.0);
@@ -1045,14 +1045,9 @@ impl Render for ImageViewer {
             Self::placeholder("正在加载图片…", muted)
         };
 
-        // 底部信息条：文件名 · 第几张/共几张 · 缩放百分比。
-        let name = self
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // 底部信息条：第几张/共几张 · 缩放百分比（含锁定模式；名称不显示）。
         let info = SharedString::from(format!(
-            "{name} · {}/{} · {:.0}%",
+            "{}/{} · {:.0}%",
             self.current + 1,
             self.folder.len(),
             self.zoom * 100.0
@@ -1095,23 +1090,21 @@ impl Render for ImageViewer {
                             .child(body),
                     ),
             );
-        // 锁定模式：隐藏底部信息条，保持画面干净（右键解锁后回归）
-        if !self.locked {
-            root = root.child(
-                div()
-                    .id("image-info")
-                    .absolute()
-                    .left(px(12.))
-                    .bottom(px(12.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(surface)
-                    .text_size(px(12.))
-                    .text_color(muted)
-                    .child(info),
-            );
-        }
+        // 底部信息条：第几张/共几张 · 缩放百分比（含锁定模式，始终显示）。
+        root = root.child(
+            div()
+                .id("image-info")
+                .absolute()
+                .left(px(12.))
+                .bottom(px(12.))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(surface)
+                .text_size(px(12.))
+                .text_color(muted)
+                .child(info),
+        );
         root
     }
 }
