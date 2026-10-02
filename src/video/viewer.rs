@@ -45,10 +45,10 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, img, px,
-    prelude::FluentBuilder as _, rgb,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollHandle,
+    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div,
+    img, px, prelude::FluentBuilder as _, rgb,
 };
 use image::{Frame, RgbaImage};
 
@@ -188,6 +188,10 @@ pub struct VideoViewer {
     speed: f32,
     /// 显示缩放（1.0 = 适应视口；Ctrl+滚轮 ±[`ZOOM_STEP`] 档，钳位 [`ZOOM_MIN`..[`ZOOM_MAX`]）。
     zoom: f32,
+    /// 放大后的拖拽平移偏移（px；以「视口中心 = 图中心」为 0 基准，未放大恒 0）。
+    pan: (f32, f32),
+    /// 拖拽平移进行中：`(左键按下位置, 按下时 pan 起点)`。
+    drag: Option<((f32, f32), (f32, f32))>,
     /// seek 进度条自身在**窗口坐标**下的盒（每次 prepaint 由 canvas 子元素刷新；
     /// 事件回调读它做屏 x→分数。**不**用 `use_keyed_state`——那只能在渲染期调用）。
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -235,6 +239,8 @@ impl VideoViewer {
             muted: false,
             speed: 1.0,
             zoom: 1.0,
+            pan: (0.0, 0.0),
+            drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
@@ -623,6 +629,8 @@ impl VideoViewer {
         self.overflow = None;
         self.pending_seek = None;
         self.zoom = 1.0; // 切文件：缩放复位为适应视口
+        self.pan = (0.0, 0.0); // 平移同步归零（拖拽中的惯性也清掉）
+        self.drag = None;
         // —— 切换窗口期（`start` 的异步任务先 await scan_folder、再跑 start_decoder_at
         // 之前）立即切断旧媒体的时钟与输入：否则 pump 一拍可能仍按旧音频时钟把
         // playhead 带回旧位置、或把旧媒体残留帧重新上屏，而新媒体的音频 worker 已
@@ -837,6 +845,69 @@ impl VideoViewer {
         }
         self.zoom = new_zoom;
         cx.notify();
+    }
+
+    // ---- 放大后左键按住拖动画面（平移；未放大时 clamp 恒 0 = 无效果） ----
+
+    /// 当前图在**画布区**（视口高 − 控制条高）内的 contain 显示尺寸（× 缩放）。
+    /// 拖拽平移与 render 共用同一套尺寸，保证 clamp 与画面一致。
+    fn display_size(&self, vw: f32, vh: f32) -> (f32, f32) {
+        let area_h = (vh - CONTROL_BAR_H).max(1.0);
+        let (iw, ih) = self.intrinsic.unwrap_or((0.0, 0.0));
+        let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
+        (dw * self.zoom, dh * self.zoom)
+    }
+
+    /// 左键按下开始拖拽：记录起点鼠标位置 + 当前 `pan`（未放大时 clamp 恒 0，拖动无效果）。
+    fn on_pan_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ev.button == MouseButton::Left {
+            self.drag = Some((
+                (ev.position.x.as_f32(), ev.position.y.as_f32()),
+                self.pan,
+            ));
+            cx.notify();
+        }
+    }
+
+    /// 拖拽平移：按「当前鼠标 − 起点」增量更新 `pan`，clamp 到图始终覆盖画布区。
+    fn on_pan_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((start_pos, start_pan)) = self.drag else {
+            return;
+        };
+        let (vw, vh) = self.viewport_size(window);
+        let area_h = (vh - CONTROL_BAR_H).max(1.0);
+        let (dw, dh) = self.display_size(vw, vh);
+        let dx = ev.position.x.as_f32() - start_pos.0;
+        let dy = ev.position.y.as_f32() - start_pos.1;
+        self.pan = Self::clamp_pan((start_pan.0 + dx, start_pan.1 + dy), vw, area_h, dw, dh);
+        cx.notify();
+    }
+
+    /// 拖拽结束（窗口内/外松开统一清态；`on_mouse_up` / `on_mouse_up_out` 共用）。
+    fn on_pan_up(&mut self, _ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.is_some() {
+            self.drag = None;
+            cx.notify();
+        }
+    }
+
+    /// 平移 clamp：放大后（`dw>vw` 或 `dh>vh`）允许在图内滑动，范围 = ±(图−视口)/2；
+    /// 未放大时范围 0（永远居中，拖拽无效果）。以「视口中心 = 图中心」为 0 基准，
+    /// 缩放/切图后范围变化由 render 逐帧重新 clamp 收敛（同 ImageViewer）。
+    fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
+        let ax = (dw - vw).max(0.0) * 0.5;
+        let ay = (dh - vh).max(0.0) * 0.5;
+        (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
     }
 
     /// 居中占位文本（加载中 / 加载失败共用）：铺满画布再 flex 居中。
@@ -1162,7 +1233,10 @@ impl Render for VideoViewer {
                     // 视口时由 `#video-viewer overflow_hidden` 裁剪在画布内。
                     let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
                     let (dw, dh) = (dw * self.zoom, dh * self.zoom);
-                    let (ox, oy) = ((vw - dw) * 0.5, (area_h - dh) * 0.5);
+                    // 放大后拖拽平移：clamp 收敛到图覆盖画布区（未放大时 pan 恒 0 =
+                    // 居中；中心锚定缩放），再把偏移并到像素框坐标。
+                    self.pan = Self::clamp_pan(self.pan, vw, area_h, dw, dh);
+                    let (ox, oy) = ((vw - dw) * 0.5 + self.pan.0, (area_h - dh) * 0.5 + self.pan.1);
                     img(gpui::ImageSource::Render(render))
                         .object_fit(ObjectFit::Contain)
                         .absolute()
@@ -1192,8 +1266,17 @@ impl Render for VideoViewer {
                     .relative()
                     .track_scroll(&self.viewport)
                     .track_focus(&self.focus_handle)
+                    .cursor(if self.drag.is_some() {
+                        CursorStyle::ClosedHand
+                    } else {
+                        CursorStyle::OpenHand
+                    })
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_pan_down))
+                    .on_mouse_move(cx.listener(Self::on_pan_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_pan_up))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pan_up))
                     .child(body),
             )
             .child(self.control_bar(window, cx))
@@ -1297,6 +1380,8 @@ mod tests {
             muted: false,
             speed: 1.0,
             zoom: 1.0,
+            pan: (0.0, 0.0),
+            drag: None,
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
@@ -1450,6 +1535,9 @@ mod tests {
             }
             viewer.update(cx, |v, _| v.tick());
             cx.run_until_parked();
+            // 让常驻 worker 有真实时间解码（并行视频测试在 FFMPEG_LOCK 上会互相竞争，
+            // 纯 tick 自旋可能在 worker 没出首帧前就把 guard 跑完 → 偶发超时）
+            cx.background_executor.timer(Duration::from_millis(5)).await;
             guard += 1;
             assert!(guard < 6000, "等待视频首帧上屏超时");
         };
@@ -1762,6 +1850,102 @@ mod tests {
         // Shift+滚轮向下 → 下一支
         ent.update(cx, |v, cx| v.handle_wheel(-1.0, false, true, cx));
         assert_eq!(cx.update(|app| ent.read(app).current), 1, "Shift 向下切下一支");
+        cx.run_until_parked();
+    }
+
+    /// 平移 clamp（同 ImageViewer）：未放大（图适合画布区）恒居中、拖拽无效果；
+    /// 放大后按 ±(图−画布区)/2 各轴独立 clamp，界内不动。
+    #[test]
+    fn clamp_pan_covers_viewport_and_stays_centered_when_unzoomed() {
+        let cp = VideoViewer::clamp_pan;
+        // 未放大（图 500×300 适合画布区 1000×700）：任一轴 pan 都 clamp 到 0 → 居中
+        assert_eq!(cp((50.0, -30.0), 1000.0, 700.0, 500.0, 300.0), (0.0, 0.0));
+        // 横向放大（图 1500 > 视口 1000）：可滑 ±250，越界裁剪；纵向仍适配 → y=0
+        assert_eq!(cp((1000.0, 999.0), 1000.0, 700.0, 1500.0, 700.0), (250.0, 0.0));
+        assert_eq!(cp((-1000.0, 0.0), 1000.0, 700.0, 1500.0, 700.0), (-250.0, 0.0));
+        // 两轴都放大：各轴独立 clamp 到 ±(图−视口)/2；界内保持
+        assert_eq!(cp((-1000.0, 200.0), 1000.0, 700.0, 1500.0, 900.0), (-250.0, 100.0));
+        assert_eq!(cp((80.0, -40.0), 1000.0, 700.0, 1500.0, 900.0), (80.0, -40.0));
+    }
+
+    /// 左键按住拖动画面：放大态下 `#video-main` 拖拽 → `pan` 按鼠标增量跟随并 clamp 到
+    /// 图覆盖画布区；未放大（zoom=1）拖动无效果（clamp 归零）；松开清拖拽态。真窗口
+    /// 事件驱动（模拟 down/move/up），覆盖「读写 viewport 实测尺寸 + display_size 同步」链路。
+    #[gpui::test]
+    async fn drag_pans_when_zoomed_and_clamps(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            // 用不存在的路径：start 快速落错误、不开真实解码 → 不占 FFmpeg 锁
+            // （拖拽只依赖 intrinsic/zoom，毋需真实帧）
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-such-drag.mp4"),
+                cx,
+            )
+        });
+        // 定住放大态：intrinsic + zoom=4 让显示图远大于画布区（无需真实解码帧）
+        wcx.cx.update(|app| {
+            viewer.update(app, |v, _| {
+                v.intrinsic = Some((640.0, 360.0));
+                v.zoom = 4.0;
+                v.playing = false;
+            })
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+
+        let center = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            let s = v.viewport.bounds().size;
+            gpui::Point::new(px(s.width.as_f32() * 0.5), px(s.height.as_f32() * 0.5))
+        });
+        // 拖动增量 (120, 80) → pan 跟随（未放大拖柄起点 pan 0）
+        wcx.simulate_mouse_down(center, MouseButton::Left, Default::default());
+        wcx.simulate_mouse_move(
+            gpui::Point::new(center.x + px(120.), center.y + px(80.)),
+            Some(MouseButton::Left),
+            Default::default(),
+        );
+        wcx.run_until_parked();
+        let pan = wcx.cx.read(|app| viewer.read(app).pan);
+        assert!(
+            (pan.0 - 120.0).abs() < 1e-3 && (pan.1 - 80.0).abs() < 1e-3,
+            "拖动应平移，实得 pan={pan:?}"
+        );
+        // 松开：清拖拽态
+        wcx.simulate_mouse_up(
+            gpui::Point::new(center.x + px(120.), center.y + px(80.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        wcx.run_until_parked();
+        assert!(
+            wcx.cx.read(|app| viewer.read(app).drag.is_none()),
+            "松开后拖拽应结束"
+        );
+        // 再次按下（起点 pan 沿上一段拖拽结果）+ 小增量拖动 → pan 继续累积（平移跨拖拽保持）
+        wcx.simulate_mouse_down(
+            gpui::Point::new(center.x + px(120.), center.y + px(80.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        wcx.simulate_mouse_move(
+            gpui::Point::new(center.x + px(160.), center.y + px(110.)),
+            Some(MouseButton::Left),
+            Default::default(),
+        );
+        wcx.run_until_parked();
+        let pan2 = wcx.cx.read(|app| viewer.read(app).pan);
+        assert!(
+            (pan2.0 - 160.0).abs() < 1e-3 && (pan2.1 - 110.0).abs() < 1e-3,
+            "再次拖动应从上次 pan 继续累积，实得 pan2={pan2:?}"
+        );
+        wcx.simulate_mouse_up(
+            gpui::Point::new(center.x + px(160.), center.y + px(110.)),
+            MouseButton::Left,
+            Default::default(),
+        );
         cx.run_until_parked();
     }
 
