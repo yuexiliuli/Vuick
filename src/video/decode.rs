@@ -30,10 +30,184 @@ pub struct VideoParams {
     pub duration: f64,
     /// 标称帧率 `(num, den)`。
     pub frame_rate: Option<(u32, u32)>,
+    /// 是否含音轨（查看器据此决定是否起音频播放）。
+    pub has_audio: bool,
 }
 
 /// 一帧解码结果：`(帧 pts 秒, 宽, 高, BGRA 像素)`（BGRA 字节序同 GPUI `RenderImage`）。
 pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
+
+/// 音频顶层参数。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioParams {
+    /// 输出采样率（统一重采样到该率）。
+    pub sample_rate: u32,
+    /// 输出声道数（统一 2，STERO 交错）。
+    pub channels: u32,
+    /// 音轨总时长（秒）。
+    pub duration: f64,
+}
+
+/// 可 seek 的音频解码器：把源音轨统一重采样为 **F32 交错立体声**（`out_rate` Hz）。
+///
+/// 与 [`VideoReader`] 同款姿势：调用方搬进后台线程逐块拉取。输出字节可直接喂
+/// 音频输出设备（CPAL 等）。
+pub struct AudioReader {
+    ictx: ffmpeg::format::context::Input,
+    stream_index: usize,
+    decoder: ffmpeg::codec::decoder::Audio,
+    resampler: ffmpeg::software::resampling::Context,
+    /// 已确定的输出规格（构造后仅供 [`Self::params`] 返回）。
+    #[allow(dead_code)] // 与 params() 配套，M4 输出规格入参时启用
+    params: AudioParams,
+    time_base: ffmpeg::Rational,
+    drained: bool,
+    last_pts: f64,
+}
+
+impl AudioReader {
+    /// 打开媒体音轨并重采样到 `sample_rate`/立体声/F32 交错。
+    pub fn open_pcm_f32(path: &Path, sample_rate: u32) -> Result<Self> {
+        use ffmpeg::channel_layout::ChannelLayout;
+        use ffmpeg::format::Sample;
+
+        ffmpeg::init().context("ffmpeg init 失败")?;
+        let ictx = ffmpeg::format::input(path)
+            .with_context(|| format!("打开媒体失败: {}", path.display()))?;
+        let stream = ictx
+            .streams()
+            .best(Type::Audio)
+            .ok_or_else(|| anyhow!("媒体中没有音轨: {}", path.display()))?;
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+        let params_for_decoder = stream.parameters();
+
+        let container_us = ictx.duration();
+        let duration = if container_us > 0 {
+            container_us as f64 / 1e6
+        } else {
+            0.0
+        };
+
+        let decoder = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
+            .context("解析音轨参数失败")?
+            .decoder()
+            .audio()
+            .context("该流不是音频")?;
+
+        let src_format = decoder.format();
+        let src_layout = decoder.channel_layout();
+        let src_rate = decoder.rate();
+        let resampler = ffmpeg::software::resampling::Context::get(
+            src_format,
+            src_layout,
+            src_rate,
+            Sample::F32(ffmpeg::format::sample::Type::Packed),
+            ChannelLayout::STEREO,
+            sample_rate,
+        )
+        .context("初始化音频重采样失败")?;
+
+        Ok(Self {
+            ictx,
+            stream_index,
+            decoder,
+            resampler,
+            params: AudioParams {
+                sample_rate,
+                channels: 2, // STEREO
+                duration: duration.max(0.0),
+            },
+            time_base,
+            drained: false,
+            last_pts: 0.0,
+        })
+    }
+
+    /// 已确定的输出参数（速率/声道/时长）。
+    #[allow(dead_code)] // 测试校验用；播放线程经构造参数可知规格
+    pub fn params(&self) -> AudioParams {
+        self.params
+    }
+
+    /// 跳转到 `seconds`：decode flush + drain 复位（与视频 reader 同款）。
+    pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        let ts = (seconds.max(0.0) * 1e6) as i64;
+        self.ictx
+            .seek(ts, i64::MIN..i64::MAX)
+            .context("音频 seek 失败")?;
+        self.decoder.flush();
+        self.drained = false;
+        Ok(())
+    }
+
+    /// 把重采样输出帧读成 F32 样本（空/未分配帧返回空，避免读 plane 越界）。
+    fn collect_f32(out: &ffmpeg::frame::Audio) -> Vec<f32> {
+        if out.planes() == 0 {
+            return Vec::new();
+        }
+        out.plane::<f32>(0).to_vec()
+    }
+
+    /// 推进到**下一块** F32 交错样本。`(pts 秒, 样本)`（样本数为偶数=立体声）；
+    /// `None` = EOF（之后可再 `seek` 复用）。
+    pub fn next_pcm_f32(&mut self) -> Result<Option<(f64, Vec<f32>)>> {
+        loop {
+            let packet = self.next_audio_packet();
+            let packet = match packet {
+                Some(p) => p,
+                None => {
+                    if !self.drained {
+                        self.decoder.send_eof().ok();
+                        self.drained = true;
+                    }
+                    // 冲掉重采样器内部剩余样本
+                    loop {
+                        let mut out = ffmpeg::frame::Audio::empty();
+                        let no_more = match self.resampler.flush(&mut out) {
+                            Ok(Some(_)) => false, // 还有内部帧
+                            _ => true,
+                        };
+                        let samples = Self::collect_f32(&out);
+                        if !samples.is_empty() {
+                            return Ok(Some((self.last_pts, samples)));
+                        }
+                        if no_more {
+                            break;
+                        }
+                    }
+                    return Ok(None);
+                }
+            };
+            self.decoder
+                .send_packet(&packet)
+                .context("音频 decoder send_packet 失败")?;
+            let mut decoded = ffmpeg::frame::Audio::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                let pts = decoded.pts().unwrap_or(0) as f64
+                    * f64::from(self.time_base.numerator())
+                    / f64::from(self.time_base.denominator());
+                self.last_pts = pts;
+                let mut out = ffmpeg::frame::Audio::empty();
+                self.resampler.run(&decoded, &mut out).context("音频重采样失败")?;
+                let samples = Self::collect_f32(&out);
+                if !samples.is_empty() {
+                    return Ok(Some((pts, samples)));
+                }
+            }
+        }
+    }
+
+    /// 取属于本音轨的下一个 demux 包。
+    fn next_audio_packet(&mut self) -> Option<ffmpeg::packet::Packet> {
+        for (s, p) in self.ictx.packets() {
+            if s.index() == self.stream_index {
+                return Some(p);
+            }
+        }
+        None
+    }
+}
 
 /// 可 seek 的持久视频解码器。
 ///
@@ -85,6 +259,7 @@ impl VideoReader {
 
         let (width, height) = (decoder.width(), decoder.height());
         let frame_rate = decoder.frame_rate();
+        let has_audio = ictx.streams().best(Type::Audio).is_some();
         let scaler = ffmpeg::software::scaling::Context::get(
             decoder.format(),
             width,
@@ -106,6 +281,7 @@ impl VideoReader {
                 height,
                 duration: duration.max(0.0),
                 frame_rate: frame_rate.map(|r| (r.numerator() as u32, r.denominator() as u32)),
+                has_audio,
             },
             time_base,
             drained: false,
@@ -253,5 +429,50 @@ mod tests {
     fn rejects_missing_file() {
         let bad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-file.mp4");
         assert!(VideoReader::open(&bad).is_err());
+    }
+
+    fn audio_fixture() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("video测试有声.mp4")
+    }
+
+    #[test]
+    fn audio_open_and_decode() {
+        let mut r = AudioReader::open_pcm_f32(&audio_fixture(), 48000).unwrap();
+        let p = r.params();
+        assert_eq!(p.channels, 2);
+        assert_eq!(p.sample_rate, 48000);
+        assert!((1.5..=3.0).contains(&p.duration), "duration={}", p.duration);
+        let mut n = 0;
+        let mut last = -1.0f64;
+        while let Some((pts, samples)) = r.next_pcm_f32().unwrap() {
+            assert!(pts >= last - 1e-9, "音频 pts 单调");
+            last = pts;
+            assert_eq!(samples.len() % 2, 0, "立体声交错样本");
+            if n == 0 {
+                assert!(
+                    samples.iter().any(|&s| s != 0.0),
+                    "anoisesrc 应产出非静音样本"
+                );
+            }
+            n += 1;
+            assert!(n < 1000, "不该无限出音频块");
+        }
+        assert!(n > 5, "2s 音频应产出多块, 实得 {n}");
+    }
+
+    #[test]
+    fn audio_seek_lands_near_target() {
+        let mut r = AudioReader::open_pcm_f32(&audio_fixture(), 48000).unwrap();
+        r.seek(1.0).unwrap();
+        let (pts, _) = r.next_pcm_f32().unwrap().expect("seek 后应出音频");
+        assert!((pts - 1.0).abs() < 0.25, "音频 seek 落点偏差过大 pts={pts}");
+    }
+
+    #[test]
+    fn audio_rejects_missing() {
+        let bad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such.mp4");
+        assert!(AudioReader::open_pcm_f32(&bad, 48000).is_err());
     }
 }

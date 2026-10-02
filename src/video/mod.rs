@@ -15,6 +15,7 @@
 //! - [`decode`]：`VideoReader` —— 可 seek 的持久解码器（open/params/seek/next_frame_bgra）
 //! - [`viewer`]：`VideoViewer` 视图（后台解码线程 + 帧钟播放 + 控制 + 同文件夹切换）
 
+mod audio;
 mod decode;
 mod viewer;
 

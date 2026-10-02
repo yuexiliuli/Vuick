@@ -54,6 +54,7 @@ libjpeg-turbo-rs = "0.8"
 # 开发机一键装填见 scripts/setup-ffmpeg.ps1；无 FFmpeg 环境的源码构建方可用
 # `cargo build --no-default-features` 绕过（视频功能关闭）。
 ffmpeg-next = { version = "9.0", optional = true }
+cpal = "0.18.2"
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }

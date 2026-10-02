@@ -31,7 +31,8 @@ use gpui::{
 };
 use image::{Frame, RgbaImage};
 
-use super::decode::VideoReader;
+use super::audio::AudioSink;
+use super::decode::{AudioReader, VideoReader};
 
 /// 解码通道槽位数（帧数）：回压 + 内存有界；播放/seek 时缓冲少量前跳。
 const DECODE_AHEAD_FRAMES: usize = 2;
@@ -41,6 +42,8 @@ const SEEK_STEP_SEC: f64 = 5.0;
 const WHEEL_SEEK_SEC: f64 = 10.0;
 /// 播放推进周期（≈60Hz，对齐 PDF 瓦片泵）。
 const PUMP_MS: u64 = 16;
+/// 音频解码回压阈值（样本数 ≈ 1s × 立体声）：缓冲满则音频线程等待，不无限塞内存。
+const AUDIO_QUEUE_AIM: usize = 48_000 * 2;
 
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
@@ -84,6 +87,12 @@ pub struct VideoViewer {
     pump_running: bool,
     /// seek 落点待定（秒）：暂停态 seek 后仍需泵直到落点帧上屏。
     pending_seek: Option<f64>,
+    /// 音频输出（有音轨且设备可用时 Some；否则纯画面 + 墙钟）。
+    audio: Option<AudioSink>,
+    /// 音频解码线程换代号（seek/重开生效，旧音频线程自退）。
+    audio_gen: Arc<AtomicU64>,
+    /// 音频输出初始化失败标志（避免每次打开重试）。
+    audio_err: bool,
 }
 
 impl VideoViewer {
@@ -109,6 +118,9 @@ impl VideoViewer {
             generation: Arc::new(AtomicU64::new(0)),
             pump_running: false,
             pending_seek: None,
+            audio: None,
+            audio_gen: Arc::new(AtomicU64::new(0)),
+            audio_err: false,
         };
         this.start(cx);
         this
@@ -138,7 +150,13 @@ impl VideoViewer {
                         if this.intrinsic.is_none() {
                             this.intrinsic = Some((p.width as f32, p.height as f32));
                         }
+                        if p.has_audio {
+                            this.ensure_audio();
+                        }
                         this.start_decoder_at(0.0);
+                        if let Some(sink) = &this.audio {
+                            let _ = sink.play();
+                        }
                         this.ensure_pump(cx);
                     });
                 }
@@ -179,6 +197,65 @@ impl VideoViewer {
                         if tx.send(item).is_err() {
                             break; // 接收端已被换代/弃用
                         }
+                    }
+                    _ => break, // EOF / 解码错误：本代结束
+                }
+            }
+        });
+        self.start_audio_at(target);
+    }
+
+    /// 惰性打开音频输出（不可用则纯画面播放，只报错一次）。
+    fn ensure_audio(&mut self) {
+        if self.audio.is_some() || self.audio_err {
+            return;
+        }
+        match AudioSink::open() {
+            Ok(sink) => {
+                eprintln!(
+                    "[video] 音频输出就绪：{}Hz 立体声",
+                    sink.sample_rate()
+                );
+                self.audio = Some(sink);
+            }
+            Err(e) => {
+                self.audio_err = true;
+                eprintln!("[video] 音频输出不可用，纯画面播放：{e}");
+            }
+        }
+    }
+
+    /// 启动（或重开）音频解码线程，从 `target` 秒开始喂音。与视频线程各自的
+    /// 换代号独立；seek 前先 `flush`（缓冲清空 + 位置归零）。
+    fn start_audio_at(&mut self, target: f64) {
+        let Some(sink) = self.audio.clone() else {
+            return;
+        };
+        sink.flush();
+        let agen = self.audio_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.audio_gen.store(agen, Ordering::SeqCst);
+        let path = self.path.clone();
+        let rate = sink.sample_rate();
+        let ag = self.audio_gen.clone();
+        std::thread::spawn(move || {
+            let mut reader = match AudioReader::open_pcm_f32(&path, rate) {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+            let _ = reader.seek(target);
+            while ag.load(Ordering::SeqCst) == agen {
+                match reader.next_pcm_f32() {
+                    Ok(Some((_pts, samples))) => {
+                        // 回压：缓冲满时等待（不把整段音频预解码塞爆内存）
+                        while ag.load(Ordering::SeqCst) == agen
+                            && sink.queued_len() >= AUDIO_QUEUE_AIM
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(8));
+                        }
+                        if ag.load(Ordering::SeqCst) != agen {
+                            break;
+                        }
+                        sink.push(&samples);
                     }
                     _ => break, // EOF / 解码错误：本代结束
                 }
@@ -230,6 +307,9 @@ impl VideoViewer {
             if self.duration > 0.0 && self.playhead >= self.duration {
                 self.playhead = self.duration;
                 self.playing = false; // 播到结尾自动停
+                if let Some(sink) = &self.audio {
+                    sink.pause();
+                }
             }
         } else {
             self.last_tick = None;
@@ -306,6 +386,11 @@ impl VideoViewer {
         if self.playing {
             self.last_tick = None; // 恢复播放不随暂停跳变
             self.ensure_pump(cx);
+            if let Some(sink) = &self.audio {
+                let _ = sink.play();
+            }
+        } else if let Some(sink) = &self.audio {
+            sink.pause();
         }
         cx.notify();
     }
@@ -314,6 +399,12 @@ impl VideoViewer {
         let target = (self.playhead + delta).clamp(0.0, self.duration.max(0.0));
         self.playhead = target;
         self.start_decoder_at(target);
+        // seek 后如果仍在播放则恢复出声（pause 态保持静音、只预览画面）
+        if self.playing
+            && let Some(sink) = &self.audio
+        {
+            let _ = sink.play();
+        }
         self.ensure_pump(cx);
         cx.notify();
     }
@@ -401,6 +492,14 @@ impl VideoViewer {
         } else {
             rgb(0xe5e7eb).into()
         }
+    }
+}
+
+impl Drop for VideoViewer {
+    fn drop(&mut self) {
+        // 换代让还在跑的视频/音频解码线程下一趟自退，避免实体销毁后僵尸线程继续占核
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.audio_gen.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -522,6 +621,9 @@ mod tests {
             generation: Arc::new(AtomicU64::new(0)),
             pump_running: false,
             pending_seek: None,
+            audio: None,
+            audio_gen: Arc::new(AtomicU64::new(0)),
+            audio_err: false,
         }
     }
 
