@@ -167,13 +167,30 @@ PDF / EPUB / 图片 / 大文档测试的 fixture **已提交至仓库**（`fixtu
 主 exe **不静态导入**任何 FFmpeg dll，只在打开视频时经 libloading **运行时**加载它。
 所以：
 - **exe 缺 `video_ffmpeg.dll` / FFmpeg 运行库也能正常启动**——不开视频照常使用全部其它功能，开视频时在窗口内提示「缺少视频运行库」；
-- 要让视频功能可用，分发时必须把 `video_ffmpeg.dll` 及 FFmpeg dll（`avcodec-63.dll` / `avformat-63.dll` / `avutil-61.dll` / `swscale-10.dll` / `swresample-7.dll` 及 `avdevice` / `avfilter`）与 exe **放到同一目录**。一键打包：
+- 要让视频功能可用，分发时必须把 `video_ffmpeg.dll` 与全部 FFmpeg dll 和 exe **放到同一目录**（清单见下方「视频组件所需 DLL」）。一键打包：
 
 ```bash
 # 构建 release 并导出「exe + video_ffmpeg.dll + 全部 FFmpeg 运行库」到 dist\gpui-editor-win64\
 # 脚本自动校验：exe 无 FFmpeg 静态导入、video_ffmpeg.dll 所需的 FFmpeg dll 全部在包内
 pwsh scripts/package.ps1
 ```
+
+### 视频组件所需 DLL（与 exe 同目录）
+
+| 文件 | 来源 | 说明 |
+| --- | --- | --- |
+| `video_ffmpeg.dll` | 本仓库 `target\release\`（cdylib） | 视频解码内核：主 exe 打开视频时经 libloading **运行时**加载它 |
+| `avcodec-63.dll` | `FFMPEG_DIR\bin` | 音视频编解码 |
+| `avformat-63.dll` | `FFMPEG_DIR\bin` | 容器格式（MP4 / MKV / AVI / MOV…）解封装 |
+| `avutil-61.dll` | `FFMPEG_DIR\bin` | 通用工具库（内存 / 数学 / 字典…） |
+| `swscale-10.dll` | `FFMPEG_DIR\bin` | 图像缩放与像素格式转换（→ BGRA 上屏） |
+| `swresample-7.dll` | `FFMPEG_DIR\bin` | 音频重采样（→ F32 立体声） |
+| `avdevice-63.dll` | `FFMPEG_DIR\bin` | 输入设备接入 |
+| `avfilter-12.dll` | `FFMPEG_DIR\bin` | 音视频滤镜（debug 构建需要；release 构建由 LTO 裁掉、缺了也能用） |
+
+缺其中任何 / 全部 → **exe 照常启动**，打开视频时窗口内提示「缺少视频运行库」。
+`scripts/package.ps1` 把 `FFMPEG_DIR\bin` 下全部 `*.dll` 一并拷入包内（以上 7 个 FFmpeg dll 全含），
+手工分发请以**与编译期同一 FFmpeg 构建**（版本号一致，防 ABI 错位）为准补全。
 
 - **必须用 release**：debug 版还依赖 `vcruntime140d.dll` / `ucrtbased.dll` 等调试 CRT，他人机器也没有；
 - 把 `dist\gpui-editor-win64\` 整个目录（或打成 zip）发给对方，**exe 必须与这些 dll 同目录**；
