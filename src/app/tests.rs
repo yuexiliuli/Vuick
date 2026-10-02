@@ -63,6 +63,73 @@
         assert_eq!(tab0_content.to_string(), "hello", "第 1 个选项卡内容应保留");
     }
 
+    /// 图片右键「锁定」：右键在光标处弹菜单 → 点「锁定」→ 进入干净看图（外壳隐藏）；
+    /// 再右键 → 点「锁定」→ 解锁回归。解码失败（假字节）不影响锁定状态机。
+    #[gpui::test]
+    async fn image_right_click_lock_menu_toggles(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-img-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.jpg");
+        std::fs::write(&p, b"not really a jpeg").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.load_image(0, &p, window, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        // 右键（图片区任一点）→ 菜单在光标处弹出
+        let menu_at = gpui::Point::new(px(400.), px(360.));
+        cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        assert!(
+            cx.update(|_w, cx| app.read(cx).image_lock_menu_pos.is_some()),
+            "图片右键应在光标处弹出锁定菜单"
+        );
+        // 点菜单首项（菜单窗口锚定在该处；面板内边距 4 + 项高 26 → 项中心约 y+17）
+        let item = gpui::Point::new(px(400. + 8.), px(360. + 4. + 13.));
+        cx.simulate_click(item, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let state = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.active_image_locked(cx),
+                a.image_lock_menu_pos.is_none(),
+                a.tabs[a.active_tab]
+                    .image_viewer
+                    .as_ref()
+                    .map(|v| v.read(cx).is_locked())
+                    .unwrap_or(false),
+            )
+        });
+        assert!(state.1, "点「锁定」后菜单应关闭");
+        assert!(state.0 && state.2, "点「锁定」应进入锁定（外壳隐藏）");
+        // 再右键 → 再点「锁定」→ 解锁
+        cx.simulate_mouse_down(menu_at, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        cx.simulate_click(item, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let unlocked = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.active_image_locked(cx), a.image_lock_menu_pos.is_none())
+        });
+        assert!(unlocked.1, "再次点菜单后仍应关闭");
+        assert!(!unlocked.0, "再次点「锁定」应解锁回归");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 编辑菜单/快捷键的动作：撤销、重做、粘贴、全选应能到达聚焦的编辑区。
     #[gpui::test]
     async fn edit_actions_dispatch(cx: &mut TestAppContext) {

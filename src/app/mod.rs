@@ -30,13 +30,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, px, rgb, rgba, white, AnyWindowHandle, App, AppContext, Bounds, Context, CursorStyle,
-    DragMoveEvent, ExternalPaths, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, PromptLevel, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, VisualContext, Window, WindowBounds,
-    WindowOptions,
+    anchored, deferred, div, px, rgb, rgba, white, Anchor, AnyWindowHandle, App, AppContext,
+    Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Point, PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    VisualContext, Window, WindowBounds, WindowOptions,
 };
 use crate::ui::input::{InputEvent, InputState};
+use crate::ui::menu::{PopupMenu, PopupMenuItem};
 use ropey::Rope;
 use crate::ui::icon::{Icon, IconName};
 
@@ -312,6 +313,12 @@ pub struct EditorApp {
     /// 本窗口是否为「拖出拆分」生成的独立文件窗口。是 → 把选项卡拖出窗口 = 还原回主窗口；
     /// 否（主窗口）→ 把选项卡拖出窗口 = 拆分出新的独立窗口。
     is_detached: bool,
+    /// 图片右键「锁定/解锁」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    image_lock_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的图片右键菜单实体（随位置同生同灭）。
+    image_lock_menu_entity: Option<gpui::Entity<crate::ui::menu::PopupMenu>>,
+    /// 图片右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
+    image_lock_menu_sub: Option<Subscription>,
     focus_handle: FocusHandle,
 }
 
@@ -403,6 +410,9 @@ impl EditorApp {
             open_finish_count: 0,
             tab_dragging: None,
             is_detached,
+            image_lock_menu_pos: None,
+            image_lock_menu_entity: None,
+            image_lock_menu_sub: None,
             focus_handle,
         };
         app.register_window(window, cx);
@@ -983,6 +993,136 @@ impl EditorApp {
         self.status_ok = true;
         tab.file_path = Some(cur);
         true
+    }
+
+    /// 当前激活选项卡是否在「锁定」干净看图模式（读图片查看器实体状态）。
+    fn active_image_locked(&self, cx: &App) -> bool {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|t| t.image_viewer.as_ref())
+            .is_some_and(|v| v.read(cx).is_locked())
+    }
+
+    /// 图片右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片时生效）。
+    /// 锁定 = 隐藏全部非图片 UI、图片充满窗口；解锁回归。就地换掉旧的（若已打开）。
+    fn on_image_right_click(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.image_viewer.as_ref())
+            .is_none()
+        {
+            return;
+        }
+        // 先收掉上一份菜单（若有），再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）
+        self.image_lock_menu_entity = None;
+        self.image_lock_menu_pos = None;
+        self.image_lock_menu_sub = None;
+        let Some(viewer) = self.tabs[self.active_tab].image_viewer.clone() else {
+            return;
+        };
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            let item = {
+                let viewer_render = viewer.clone();
+                PopupMenuItem::element(move |_window, cx| {
+                    let locked = viewer_render.read(cx).is_locked();
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
+                        .child("锁定图片视图")
+                })
+                .on_click(move |_click, window, cx| {
+                    viewer.update(cx, |v, cx| v.toggle_lock(cx));
+                    // 强制重绘：宿主重读图片查看器锁定态 → 隐藏/恢复外壳 → 图片自动填满/缩小
+                    window.refresh();
+                })
+            };
+            menu.item(item)
+        });
+        // 聚焦并记住开菜单前的焦点（关闭后归还）
+        let previous_focus = window.focused(cx);
+        let focus_handle = menu.read(cx).focus_handle(cx);
+        menu.update(cx, |m, _| m.set_previous_focus(previous_focus));
+        window.focus(&focus_handle, cx);
+        // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
+        let menu_entity = menu.clone();
+        let sub = cx.subscribe(&menu_entity, move |this, emitter, _: &DismissEvent, cx| {
+            if this.image_lock_menu_entity.as_ref() == Some(&emitter) {
+                this.image_lock_menu_entity = None;
+                this.image_lock_menu_pos = None;
+            }
+            cx.notify();
+        });
+        self.image_lock_menu_pos = Some(ev.position);
+        self.image_lock_menu_entity = Some(menu);
+        self.image_lock_menu_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 外壳子元素：锁定图片视图时只放「图片铺满窗口」（藏菜单栏/选项卡栏/侧边栏/状态栏），
+    /// 否则齐全；始终带通知层与图片右键菜单 Overlay。
+    fn render_shell_children(
+        &mut self,
+        body: gpui::AnyElement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let image_locked = self.active_image_locked(cx);
+        let mut out: Vec<gpui::AnyElement> = Vec::new();
+        if image_locked {
+            // 锁定：正文（图片查看器）直接铺满窗口，其余全藏 —— 图片经重排后自动放大填满
+            out.push(body);
+        } else {
+            out.push(self.render_title_bar(window, cx).into_any_element());
+            out.push(self.render_tab_bar(cx).into_any_element());
+            out.push(self.render_body_sidebar(body, cx).into_any_element());
+            out.push(self.render_status_bar(cx).into_any_element());
+        }
+        // 通知层（右上角 toast）与图片右键菜单 Overlay 恒在最上层
+        out.push(self.render_notifications(window, cx).into_any_element());
+        out.push(self.render_image_lock_menu(window, cx).into_any_element());
+        out
+    }
+
+    /// 图片「锁定」右键菜单 Overlay：按截图时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
+    fn render_image_lock_menu(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let still_image = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.image_viewer.as_ref())
+            .is_some();
+        if !still_image {
+            // 切走/关闭了图片选项卡 → 一并收起右键菜单
+            self.image_lock_menu_entity = None;
+            self.image_lock_menu_pos = None;
+        }
+        let Some(pos) = self.image_lock_menu_pos else {
+            return div().into_any_element();
+        };
+        let Some(menu) = self.image_lock_menu_entity.clone() else {
+            return div().into_any_element();
+        };
+        deferred(
+            anchored()
+                .position_mode(gpui::AnchoredPositionMode::Window)
+                .anchor(Anchor::TopLeft)
+                .offset(pos)
+                .snap_to_window_with_margin(Edges::all(px(8.)))
+                .child(menu),
+        )
+        .with_priority(100)
+        .into_any_element()
     }
 
     /// A2：当前激活选项卡的右栏 WyEditor 预览实体（仅当该选项卡**真正以 WyEditor 作
@@ -1906,6 +2046,11 @@ impl EditorApp {
                     this.release_tab_drag_outside(window, ev.position, cx);
                 }),
             )
+            // 图片选项卡：右键 → 「锁定/解锁」干净看图菜单（气泡到根统一处理）
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::on_image_right_click),
+            )
             .on_action(cx.listener(|this: &mut EditorApp, _: &Save, window, cx| {
                 this.save(window, cx)
             }))
@@ -1959,11 +2104,6 @@ impl EditorApp {
                     this.toggle_wrap(window, cx);
                 }),
             )
-            .child(self.render_title_bar(window, cx))
-            .child(self.render_tab_bar(cx))
-            .child(self.render_body_sidebar(body, cx))
-            .child(self.render_status_bar(cx))
-            // 通知层（右上角 toast）：叠加在最上层，用于"无法读取文件"等提示
-            .child(self.render_notifications(window, cx))
+            .children(self.render_shell_children(body, window, cx))
     }
 }

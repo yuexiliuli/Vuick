@@ -173,6 +173,8 @@ pub struct ImageViewer {
     pan: (f32, f32),
     /// 拖拽平移进行中：(左键按下位置, 按下时 pan 起点)。
     drag: Option<((f32, f32), (f32, f32))>,
+    /// 「锁定」干净看图模式：隐藏全部非图片 UI、图片充满整个窗口（宿主读取决定外壳取舍）。
+    locked: bool,
 }
 
 impl ImageViewer {
@@ -211,6 +213,7 @@ impl ImageViewer {
             display_denom: 1,
             pan: (0.0, 0.0),
             drag: None,
+            locked: false,
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
@@ -252,6 +255,20 @@ impl ImageViewer {
     #[allow(dead_code)]
     pub fn is_loaded(&self) -> bool {
         !self.loading && self.image.is_some()
+    }
+
+    /// 是否「锁定」干净看图模式（宿主据此隐藏菜单栏/选项卡栏/状态栏/侧边栏，图片充满窗口）。
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// 切换锁定：锁定 = 隐藏非图片 UI、图片充满窗口（宿主壳体重排后自动缩放填满）；
+    /// 解锁回归。切换时平移/拖拽归零 + 隐藏底部信息条。
+    pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
+        self.locked = !self.locked;
+        self.pan = (0.0, 0.0);
+        self.drag = None;
+        cx.notify();
     }
 
     /// 设置画布背景色（宿主按主题传入）。
@@ -1077,8 +1094,10 @@ impl Render for ImageViewer {
                             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pan_up))
                             .child(body),
                     ),
-            )
-            .child(
+            );
+        // 锁定模式：隐藏底部信息条，保持画面干净（右键解锁后回归）
+        if !self.locked {
+            root = root.child(
                 div()
                     .id("image-info")
                     .absolute()
@@ -1092,6 +1111,7 @@ impl Render for ImageViewer {
                     .text_color(muted)
                     .child(info),
             );
+        }
         root
     }
 }
@@ -1534,6 +1554,27 @@ mod tests {
                 assert_eq!(v.zoom, 1.0);
             })
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 锁定态切换：`toggle_lock` 翻转 `is_locked` 并把放大后的平移/拖拽归零（干净看图）。
+    #[gpui::test]
+    async fn toggle_lock_flips_state_and_resets_pan(cx: &mut TestAppContext) {
+        let dir = tmp_dir("lock");
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.zoom = 4.0;
+                v.pan = (100.0, -50.0); // 放大平移中
+                v
+            })
+        });
+        assert!(!cx.update(|app| viewer.read(app).is_locked()));
+        cx.update(|app| viewer.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(cx.update(|app| viewer.read(app).is_locked()));
+        assert_eq!(cx.update(|app| viewer.read(app).pan), (0.0, 0.0), "锁定应归零平移");
+        cx.update(|app| viewer.update(app, |v, cx| v.toggle_lock(cx)));
+        assert!(!cx.update(|app| viewer.read(app).is_locked()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -652,7 +652,7 @@ impl EditorApp {
 
     /// 把一个新图片查看器载入指定选项卡：编辑区置空、全屏只读预览。
     /// 解码由 [`crate::image::ImageViewer`] 自己在后台完成，窗口不阻塞。
-    fn load_image(
+    pub(super) fn load_image(
         &mut self,
         idx: usize,
         p: &std::path::Path,

@@ -153,6 +153,12 @@ impl PopupMenu {
         self
     }
 
+    /// 记下打开菜单前的焦点句柄（关闭时归还）。`Dropdown` 在元素内直接写字段；宿主在
+    /// 窗口直接挂右键菜单时用它显式设置。
+    pub fn set_previous_focus(&mut self, handle: Option<FocusHandle>) {
+        self.previous_focus = handle;
+    }
+
     /// 菜单最小宽度（默认 160px，保证「标签……快捷键」两栏不挤）。
     #[allow(dead_code)] // 公开 API，App 现用默认宽度
     pub fn min_w(mut self, width: impl Into<Pixels>) -> Self {
