@@ -67,8 +67,6 @@ use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, Sca
 const ZOOM_MIN: f32 = 0.2;
 const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
-/// 画布四边留白（px，适应视口时的外衬）。
-const PAD: f32 = 24.0;
 /// 放大态滚轮平移每格的视口比例（Lines 滚轮：一下滚轮平移多少视口高；直接切图的
 /// 未放大态此值无意义）。
 const WHEEL_LINE_PAN_FRACTION: f32 = 0.15;
@@ -300,15 +298,14 @@ impl ImageViewer {
         (w, h)
     }
 
-    /// 适应视口（Contain，含 PAD 留白）基准尺寸（不含缩放；两轴任意一端贴边）。
+    /// 适应视口（Contain，**贴边无留白**）基准尺寸（不含缩放）：取较小缩放比，两轴任意
+    /// 一端**正好贴住窗口上/下或左/右边缘**、保持原始比例（另一端居中留白）。
     fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
-        let avail_w = (vw - 2.0 * PAD).max(16.0);
-        let avail_h = (vh - 2.0 * PAD).max(16.0);
-        let fit = (avail_w / iw).min(avail_h / ih).max(0.001);
+        let fit = (vw / iw).min(vh / ih).max(0.001);
         (iw * fit, ih * fit)
     }
 
-    /// 显示尺寸 = 适应视口（Contain，含 PAD 留白）× 缩放倍数。
+    /// 显示尺寸 = 适应视口（Contain，贴边）× 缩放倍数。
     fn display_size(&self, iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
         let (fw, fh) = Self::contain_fit(iw, ih, vw, vh);
         (fw * self.zoom, fh * self.zoom)
@@ -1501,10 +1498,11 @@ mod tests {
                 assert_eq!(v.current, 0);
             })
         });
-        // 一路滚到纵向边缘（ay=(1504-600)/2=452）再继续同向滚 → 才切下一张，且缩放复位
+        // 一路滚到纵向边缘（贴边 contain：缩放 4× → 3200×1600，ay=(1600-600)/2=500）再继续
+        // 同向滚 → 才切下一张，且缩放复位
         cx.update(|app| {
             viewer.update(app, |v, cx| {
-                v.pan.1 = -452.0; // 已到边缘
+                v.pan.1 = -500.0; // 已到边缘
                 v.wheel_pan_or_switch(1, 100.0, cx);
                 assert_eq!(v.current, 1, "滚到边缘继续同向外滚才切下一张");
                 assert_eq!(v.zoom, 1.0, "切图后缩放复位为适应视口");
