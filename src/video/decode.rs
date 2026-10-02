@@ -13,11 +13,19 @@
 //! `LIBCLANG_PATH`（bindgen 用）。开发机一键装填见 `scripts/setup-ffmpeg.ps1`。
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::media::Type;
+
+/// 进程级 FFmpeg 闸：本构建（ffmpeg 9.0 gyan）里**并发的 FFmpeg 操作**会互相占死——
+/// 实测切 72.MP4：新视频线程 `avformat_open_input` 与音频线程解码/再打开并行时直接卡死
+/// 在 `format::input`（开放闸只串 open 无效，open 与解码也会互相卡）。因此**所有 FFI
+/// 调用**（open / seek / next_frame / next_pcm）都过此互斥量串行；单次操作毫秒级，
+/// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
+static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 
 /// 视频顶层参数（打开即得，无需逐帧解码）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,11 +60,16 @@ pub struct AudioParams {
 ///
 /// 与 [`VideoReader`] 同款姿势：调用方搬进后台线程逐块拉取。输出字节可直接喂
 /// 音频输出设备（CPAL 等）。
+///
+/// **释放纪律**：`Drop` 把 FFmpeg 成员（`Input`/decoder/resampler）手动 drop 并持有
+/// [`FFMPEG_LOCK`] —— 实测一侧线程正 `avformat_close_input` 释放某文件、另一线程同时
+/// `avformat_open_input` 同文件会 deadlock（72.MP4 切换复现）。open/seek/decode/free 全部
+/// 过同一互斥量，进程内 FFmpeg FFI 严格串行。
 pub struct AudioReader {
-    ictx: ffmpeg::format::context::Input,
+    ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
     stream_index: usize,
-    decoder: ffmpeg::codec::decoder::Audio,
-    resampler: ffmpeg::software::resampling::Context,
+    decoder: std::mem::ManuallyDrop<ffmpeg::codec::decoder::Audio>,
+    resampler: std::mem::ManuallyDrop<ffmpeg::software::resampling::Context>,
     /// 已确定的输出规格（构造后仅供 [`Self::params`] 返回）。
     #[allow(dead_code)] // 与 params() 配套，M4 输出规格入参时启用
     params: AudioParams,
@@ -65,12 +78,24 @@ pub struct AudioReader {
     last_pts: f64,
 }
 
+impl Drop for AudioReader {
+    fn drop(&mut self) {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.resampler);
+            std::mem::ManuallyDrop::drop(&mut self.decoder);
+            std::mem::ManuallyDrop::drop(&mut self.ictx);
+        }
+    }
+}
+
 impl AudioReader {
     /// 打开媒体音轨并重采样到 `sample_rate`/立体声/F32 交错。
     pub fn open_pcm_f32(path: &Path, sample_rate: u32) -> Result<Self> {
         use ffmpeg::channel_layout::ChannelLayout;
         use ffmpeg::format::Sample;
 
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
         let ictx = ffmpeg::format::input(path)
             .with_context(|| format!("打开媒体失败: {}", path.display()))?;
@@ -109,10 +134,10 @@ impl AudioReader {
         .context("初始化音频重采样失败")?;
 
         Ok(Self {
-            ictx,
+            ictx: std::mem::ManuallyDrop::new(ictx),
             stream_index,
-            decoder,
-            resampler,
+            decoder: std::mem::ManuallyDrop::new(decoder),
+            resampler: std::mem::ManuallyDrop::new(resampler),
             params: AudioParams {
                 sample_rate,
                 channels: 2, // STEREO
@@ -132,6 +157,7 @@ impl AudioReader {
 
     /// 跳转到 `seconds`：decode flush + drain 复位（与视频 reader 同款）。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ts = (seconds.max(0.0) * 1e6) as i64;
         self.ictx
             .seek(ts, i64::MIN..i64::MAX)
@@ -152,6 +178,7 @@ impl AudioReader {
     /// 推进到**下一块** F32 交错样本。`(pts 秒, 样本)`（样本数为偶数=立体声）；
     /// `None` = EOF（之后可再 `seek` 复用）。
     pub fn next_pcm_f32(&mut self) -> Result<Option<(f64, Vec<f32>)>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let packet = self.next_audio_packet();
             let packet = match packet {
@@ -219,10 +246,10 @@ impl AudioReader {
 /// 每次解码成本 ~输出像素数，4K 源封顶 1920 即省 ~4×。「≤输出尺寸」时按源码解，
 /// 行为与 [`Self::open`] 完全一致，但 `params()` 与逐帧尺寸始终反映**实际输出**。
 pub struct VideoReader {
-    ictx: ffmpeg::format::context::Input,
+    ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
     stream_index: usize,
-    decoder: ffmpeg::codec::decoder::Video,
-    scaler: ffmpeg::software::scaling::Context,
+    decoder: std::mem::ManuallyDrop<ffmpeg::codec::decoder::Video>,
+    scaler: std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>,
     params: VideoParams,
     /// sws 输出宽（decode-to-display 下采样目标；`params.width` 为源宽）。
     out_width: u32,
@@ -234,8 +261,22 @@ pub struct VideoReader {
     drained: bool,
 }
 
+/// 释放持 [`FFMPEG_LOCK`]（见 [`AudioReader`] 同款说明）：`avformat_close_input` 与
+/// 另一线程同时 `avformat_open_input` 同文件会 deadlock，故 free 也过同一闸。
+impl Drop for VideoReader {
+    fn drop(&mut self) {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.scaler);
+            std::mem::ManuallyDrop::drop(&mut self.decoder);
+            std::mem::ManuallyDrop::drop(&mut self.ictx);
+        }
+    }
+}
+
 impl VideoReader {
     /// 打开媒体并定位视频流（失败返回带原因的 [Error] 链）；按源码全尺寸解码。
+    #[allow(dead_code)] // 测试与外部语义入口用；查看器走 `open_scaled`（不额外预开 reader）
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_scaled(path, u32::MAX)
     }
@@ -244,6 +285,7 @@ impl VideoReader {
     /// 输出至少 1×1；`max_dim=u32::MAX` 即全尺寸）。`params()` 仍报告源宽高——上层
     /// 用它保持原始宽高比做显示适配；逐帧输出尺寸见 [`DecodedFrame`] 的 w/h。
     pub fn open_scaled(path: &Path, max_dim: u32) -> Result<Self> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
 
         let ictx = ffmpeg::format::input(path)
@@ -289,10 +331,10 @@ impl VideoReader {
         .context("初始化 sws 缩放失败")?;
 
         Ok(Self {
-            ictx,
+            ictx: std::mem::ManuallyDrop::new(ictx),
             stream_index,
-            decoder,
-            scaler,
+            decoder: std::mem::ManuallyDrop::new(decoder),
+            scaler: std::mem::ManuallyDrop::new(scaler),
             params: VideoParams {
                 width,
                 height,
@@ -315,6 +357,7 @@ impl VideoReader {
     /// 跳转到 `seconds`（µs 级、回拉关键帧）：解码器 flush 后从 keyframe 前继续解，
     /// 调用方应丢弃 `pts < 目标` 的帧直至越过目标（或直接取首个可用帧，容忍轻微回拉）。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ts = (seconds.max(0.0) * 1e6) as i64;
         self.ictx
             .seek(ts, i64::MIN..i64::MAX)
@@ -327,6 +370,7 @@ impl VideoReader {
     /// 推进到**下一帧**并转成 BGRA。返回 [`DecodedFrame`]；
     /// `None` = 已到流末尾（之后可再 `seek` 复用）。
     pub fn next_frame_bgra(&mut self) -> Result<Option<DecodedFrame>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let packet = self.next_video_packet();
             let packet = match packet {

@@ -1009,6 +1009,36 @@ impl EditorApp {
         true
     }
 
+    /// 同 [`Self::sync_active_image_meta`]，视频版：查看器同文件夹切换后把选项卡
+    /// 标题/状态栏跟到新视频（渲染期幂等调用；路径未变返回 false）。
+    #[cfg(feature = "video")]
+    fn sync_active_video_meta(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(handle) = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.video_viewer.clone())
+        else {
+            return false;
+        };
+        let (cur, idx, total) = {
+            let v = handle.read(cx);
+            (v.current_path(), v.current_index(), v.folder_len())
+        };
+        let Some(cur) = cur else {
+            return false;
+        };
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return false;
+        };
+        if tab.file_path.as_deref() == Some(cur.as_path()) {
+            return false;
+        }
+        self.status = SharedString::from(format!("视频 {}/{}：{}", idx + 1, total, cur.display()));
+        self.status_ok = true;
+        tab.file_path = Some(cur);
+        true
+    }
+
     /// 当前激活选项卡是否在「锁定」干净看图模式（读图片查看器实体状态）。
     fn active_image_locked(&self, cx: &App) -> bool {
         self.tabs

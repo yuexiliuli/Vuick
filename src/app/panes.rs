@@ -415,6 +415,11 @@ impl EditorApp {
         if self.sync_active_image_meta(cx) {
             cx.notify();
         }
+        // 视频查看器：同文件夹切换后标签标题/状态栏跟到当前视频。
+        #[cfg(feature = "video")]
+        if self.sync_active_video_meta(cx) {
+            cx.notify();
+        }
         // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
         let fs = self.font_size;
         self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {

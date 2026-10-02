@@ -39,7 +39,7 @@ use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,27 @@ const ZOOM_STEP: f32 = 0.12;
 
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
+
+/// 投递给常驻视频解码线程的命令（切换/seek）：内层循环以 `generation` 判定换代。
+/// `result_tx` 只在开媒体（非 seek）时挂：worker 开成功后回送 `Ok(params)` 或失败
+/// `Err(msg)`，供宿主补齐时长/尺寸/音轨或落错误（替代会污染后续 open 的“预开参数 reader”）。
+struct DecodeCmd {
+    generation: u64,
+    path: PathBuf,
+    target: f64,
+    tx: std::sync::mpsc::SyncSender<FrameItem>,
+    result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
+}
+
+/// 投递给常驻音频解码线程的命令（同视频；worker 持 sink 克隆、命令开头统一 flush）。
+struct AudioCmd {
+    generation: u64,
+    path: PathBuf,
+    target: f64,
+    out_rate: u32,
+    ready: Arc<AtomicBool>,
+    sink: AudioSink,
+}
 
 /// 把条的**窗口坐标**盒 + 屏幕 x 映射成 0..=1 的进度（钳位）。盒从未布局过
 ///（bounds=0，即某窗口从未画过本条）时返回 `None`。
@@ -146,6 +167,18 @@ pub struct VideoViewer {
     audio_err: bool,
     /// 音频健康诊断节拍（每 ~60 tick ≈1s 打一行 stats；播放无音频时不用）。
     diag_ticks: u32,
+    /// 常驻视频解码线程的命令通道。worker 一生一个，切换/seek 全投命令；新文件在
+    /// **同一线程内**串行重开旧 reader —— 实测“新线程在上一解码器 teardown 后立刻
+    /// `avformat_open_input`”会卡死（72.MP4 复现），单 worker 串行重开则稳定。
+    decode_cmd: Option<std::sync::mpsc::Sender<DecodeCmd>>,
+    /// 常驻音频解码线程的命令通道（同 `decode_cmd` 的收尾理由）。
+    audio_cmd: Option<std::sync::mpsc::Sender<AudioCmd>>,
+    /// 本媒体音频是否已真正开喂（音频 worker 开成功置 true；切媒体/seek 复位 false）。
+    /// 为 false 时播放时钟走墙钟（静音/无声轨的媒体也能前进，不再冻结）。
+    audio_ready: Arc<AtomicBool>,
+    /// 音频时钟锚定待执行：音频一上线就把 `audio_base` 锚到当前墙钟进度（无跳变），
+    /// 否则开新媒体的静音间隙会被设备消费计入 `position()`，把 playhead 带飞 → 音画错位。
+    audio_anchor_pending: bool,
     // --- M5 播放体验 ---
     /// 音量（0..=1）。静音时不改此值，只让生效音量归零。
     volume: f32,
@@ -194,6 +227,10 @@ impl VideoViewer {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            decode_cmd: None,
+            audio_cmd: None,
+            audio_ready: Arc::new(AtomicBool::new(false)),
+            audio_anchor_pending: true,
             volume: 1.0,
             muted: false,
             speed: 1.0,
@@ -211,39 +248,53 @@ impl VideoViewer {
     fn start(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         cx.spawn(async move |weak, cx| {
-            let (opened_params, (folder, current)) = cx
+            let (folder, current) = cx
+                .background_executor()
+                .spawn(async move { scan_folder(&path) })
+                .await;
+            // 不单独预开 VideoReader 取参数（实测同一文件稍后被 worker 再 open 会
+            // 卡死在 avformat_open_input）——改为给首个命令挂 outcome 通道，由 worker
+            // 开成功回送参数 / 失败回送错误，本任务异步等结果再补齐时长/尺寸/音轨。
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<Result<super::decode::VideoParams, String>>();
+            let _ = weak.update(cx, |this, cx| {
+                this.folder = folder;
+                this.current = current;
+                this.start_decoder_at(0.0, Some(out_tx));
+                this.ensure_pump(cx);
+            });
+            let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let opened = VideoReader::open(&path).map(|r| r.params());
-                    let folder = scan_folder(&path);
-                    (opened, folder)
+                    out_rx.recv_timeout(std::time::Duration::from_secs(8))
                 })
                 .await;
-            match opened_params {
-                Ok(p) => {
+            match outcome {
+                Ok(Ok(p)) => {
                     let _ = weak.update(cx, |this, cx| {
-                        this.folder = folder;
-                        this.current = current;
                         this.loading = false;
                         this.duration = p.duration.max(0.001);
                         this.fps = p.frame_rate;
-                        if this.intrinsic.is_none() {
-                            this.intrinsic = Some((p.width as f32, p.height as f32));
-                        }
+                        this.intrinsic.get_or_insert((p.width as f32, p.height as f32));
                         if p.has_audio {
                             this.ensure_audio();
                         }
-                        this.start_decoder_at(0.0);
                         if let Some(sink) = &this.audio {
                             let _ = sink.play();
                         }
-                        this.ensure_pump(cx);
+                        cx.notify();
                     });
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = weak.update(cx, |this, cx| {
                         this.loading = false;
-                        this.load_error = Some(e.to_string());
+                        this.load_error = Some(e);
+                        cx.notify();
+                    });
+                }
+                Err(_) => {
+                    // 超时：至少把 loading 关掉（画面静态，不卡佔位）
+                    let _ = weak.update(cx, |this, cx| {
+                        this.loading = false;
                         cx.notify();
                     });
                 }
@@ -252,39 +303,82 @@ impl VideoViewer {
         .detach();
     }
 
-    /// 启动（或重开）解码线程，从 `target` 秒开始解码。换代取消旧线程。
-    fn start_decoder_at(&mut self, target: f64) {
+    /// 启动（或重开）解码，从 `target` 秒开始。向**常驻视频 worker** 投新命令换代：
+    /// 旧命令内层循环按 `generation` 立即停，worker 在**同一线程**内 drop 旧 reader 后
+    /// 串行重开新文件——实测规避“新线程在上一解码器 teardown 后 avformat_open_input 卡死”
+    ///（72.MP4 复现；同线程串行重开稳定：见 diag6）。
+    fn start_decoder_at(
+        &mut self,
+        target: f64,
+        result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
+    ) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.generation.store(generation, Ordering::SeqCst);
         let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
-        // 换掉旧接收端 → 旧线程下一次 send 失联自退（与 generation 双保险）
+        // 换掉旧接收端 → worker 若正阻塞在 send 会收到失联错误、本命令内层循环退出
         self.overflow = None;
         if let Some(old) = self.rx.replace(rx) {
             drop(old);
         }
         self.pending_seek = Some(target);
-        let path = self.path.clone();
+        self.ensure_video_worker();
+        let cmd = DecodeCmd {
+            generation,
+            path: self.path.clone(),
+            target,
+            tx,
+            result_tx,
+        };
+        if let Some(tx) = &self.decode_cmd {
+            let _ = tx.send(cmd);
+        }
+        self.start_audio_at(target);
+    }
+
+    /// 惰性启动常驻视频解码 worker（一生一个；viewer Drop 时命令发送端被弃，
+    /// worker 的 `recv()` 返回 Err 即退出）。
+    fn ensure_video_worker(&mut self) {
+        if self.decode_cmd.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<DecodeCmd>();
         let gen_arc = self.generation.clone();
-        std::thread::spawn(move || {
-            // decode-to-display：sws 输出长边封顶 DECODE_MAX_DIM（4K 源降载），
-            // params 仍报源尺寸；帧包 w/h 即输出尺寸，上屏/内存与之一致。
-            let mut reader = match VideoReader::open_scaled(&path, DECODE_MAX_DIM) {
+        std::thread::spawn(move || Self::video_worker(rx, gen_arc));
+        self.decode_cmd = Some(tx);
+    }
+
+    /// 常驻视频 worker 主循环：逐条执行命令（打开 → seek → 解码推帧，直到换代/EOF）。
+    fn video_worker(
+        rx: std::sync::mpsc::Receiver<DecodeCmd>,
+        gen_arc: Arc<AtomicU64>,
+    ) {
+        while let Ok(cmd) = rx.recv() {
+            // decode-to-display：sws 输出长边封顶 DECODE_MAX_DIM（4K 源降载）；
+            // 上一命令的 reader 在循环本轮开头已被 drop（同线程串行，无并发 FFmpeg）
+            let mut reader = match VideoReader::open_scaled(&cmd.path, DECODE_MAX_DIM) {
                 Ok(r) => r,
-                Err(_) => return,
+                Err(e) => {
+                    if let Some(out) = &cmd.result_tx {
+                        let _ = out.send(Err(e.to_string()));
+                    }
+                    continue;
+                }
             };
-            let _ = reader.seek(target);
-            while gen_arc.load(Ordering::SeqCst) == generation {
+            if let Some(out) = &cmd.result_tx {
+                let _ = out.send(Ok(reader.params()));
+            }
+            let _ = reader.seek(cmd.target);
+            while gen_arc.load(Ordering::SeqCst) == cmd.generation {
                 match reader.next_frame_bgra() {
                     Ok(Some(item)) => {
-                        if tx.send(item).is_err() {
+                        if cmd.tx.send(item).is_err() {
                             break; // 接收端已被换代/弃用
                         }
                     }
                     _ => break, // EOF / 解码错误：本代结束
                 }
             }
-        });
-        self.start_audio_at(target);
+        }
     }
 
     /// 惰性打开音频输出（不可用则纯画面播放，只报错一次）。
@@ -308,49 +402,75 @@ impl VideoViewer {
         }
     }
 
-    /// 启动（或重开）音频解码线程，从 `target` 秒开始喂音。与视频线程各自的
-    /// 换代号独立；seek 前先 `flush`（缓冲清空 + 位置归零），并把音频时钟基准
-    /// 定为 `target`。
-    ///
-    /// **倍速**：重采样输出率 = `设备率÷speed`——设备固定以 `device_rate` 消费，
-    /// 1 源秒 = `out_rate` 个样本，播完需 `out_rate/device_rate = 1/speed` 墙秒，
-    /// 即源以 `speed` 倍播放（变速变调，resample 方案）。音频时钟
-    /// `playhead = audio_base + 设备位置 × speed`。倍速切换即带新速率重开本线程。
+    /// 启动（或重开）音频解码：向**常驻音频 worker** 投新命令。命令开头由 worker 统一
+    /// `flush`（清残音 + 位置归零）——worker 是唯一推音者，顺序处理命令，无并发竞态。
+    /// `audio_ready` 复位待 worker 开成功再置位；倍速=重采样输出率 `设备率÷speed`
+    ///（变速变调）；音频时钟 `playhead = audio_base + 设备位置 × speed`。
     fn start_audio_at(&mut self, target: f64) {
         let Some(sink) = self.audio.clone() else {
             return;
         };
         self.audio_base = target;
-        sink.flush();
+        self.audio_ready.store(false, Ordering::Relaxed);
+        self.audio_anchor_pending = true;
         let agen = self.audio_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.audio_gen.store(agen, Ordering::SeqCst);
-        let path = self.path.clone();
+        self.ensure_audio_worker();
         let out_rate = audio_read_rate(sink.sample_rate(), self.speed);
-        let ag = self.audio_gen.clone();
-        std::thread::spawn(move || {
-            let mut reader = match AudioReader::open_pcm_f32(&path, out_rate) {
+        let cmd = AudioCmd {
+            generation: agen,
+            path: self.path.clone(),
+            target,
+            out_rate,
+            ready: self.audio_ready.clone(),
+            sink,
+        };
+        if let Some(tx) = &self.audio_cmd {
+            let _ = tx.send(cmd);
+        }
+    }
+
+    /// 惰性启动常驻音频解码 worker（同视频 worker 的收尾理由）。
+    fn ensure_audio_worker(&mut self) {
+        if self.audio_cmd.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<AudioCmd>();
+        let gen_arc = self.audio_gen.clone();
+        std::thread::spawn(move || Self::audio_worker(rx, gen_arc));
+        self.audio_cmd = Some(tx);
+    }
+
+    /// 常驻音频 worker 主循环：命令开头 flush（旧音残余清掉、位置归零），打开音轨 →
+    /// 重采样成 F32 立体声推入 sink（回压守 1s 缓冲）。`ready` 开成功置 true（无声轨/
+    /// 开失败保持 false → 主线程走墙钟，画面照常前进）。
+    fn audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>, gen_arc: Arc<AtomicU64>) {
+        while let Ok(cmd) = rx.recv() {
+            cmd.sink.flush();
+            let mut reader = match AudioReader::open_pcm_f32(&cmd.path, cmd.out_rate) {
                 Ok(r) => r,
-                Err(_) => return,
+                Err(_) => continue,
             };
-            let _ = reader.seek(target);
-            while ag.load(Ordering::SeqCst) == agen {
+            cmd.ready.store(true, Ordering::Relaxed);
+            let _ = reader.seek(cmd.target);
+            while gen_arc.load(Ordering::SeqCst) == cmd.generation {
                 match reader.next_pcm_f32() {
                     Ok(Some((_pts, samples))) => {
                         // 回压：缓冲满时等待（不把整段音频预解码塞爆内存）
-                        while ag.load(Ordering::SeqCst) == agen
-                            && sink.queued_len() >= AUDIO_QUEUE_AIM
+                        while gen_arc.load(Ordering::SeqCst) == cmd.generation
+                            && cmd.sink.queued_len() >= AUDIO_QUEUE_AIM
                         {
                             std::thread::sleep(std::time::Duration::from_millis(8));
                         }
-                        if ag.load(Ordering::SeqCst) != agen {
+                        if gen_arc.load(Ordering::SeqCst) != cmd.generation {
                             break;
                         }
-                        sink.push(&samples);
+                        cmd.sink.push(&samples);
                     }
                     _ => break, // EOF / 解码错误：本代结束
                 }
             }
-        });
+        }
     }
 
     /// 每 ~16ms 一拍的播放泵是否仍需运行。
@@ -386,8 +506,10 @@ impl VideoViewer {
 
     /// 播放泵单拍（纯状态推进 + 上屏；调用方负责重绘）。
     fn tick(&mut self) {
-        // 以音频时钟为播放进度（有音轨时），否则墙钟
-        let audio_pos = self.audio.as_ref().map(|s| s.position());
+        // 以音频时钟为播放进度（**仅当本媒体音频真在喂**；否则/未上线走墙钟——无声轨
+        // 或切媒体后音频未就绪时画面也要前进，否则冻结）
+        let audio_pos = (self.audio.is_some() && self.audio_ready.load(Ordering::Relaxed))
+            .then(|| self.audio.as_ref().map(|s| s.position()).unwrap_or(0.0));
         self.advance_playhead(audio_pos);
 
         // 音频健康诊断：仅 `GPUI_EDITOR_VIDEO_AUDIO_DIAG=1` 时每 ~1s 打一行喂送统计
@@ -436,8 +558,10 @@ impl VideoViewer {
         }
     }
 
-    /// 推进 `playhead`：`audio_pos` 有值 → 音频时钟（`audio_base + 设备已播位置 × speed`，
-    /// A/V 对齐；seek 后基准重置、位置归零）；`None` → 墙钟（按真实经过 × speed 累加）。
+    /// 推进 `playhead`：`audio_pos` 有值（= 音频线程已上线并喂音）→ 音频时钟
+    /// `audio_base + 设备已播位置 × speed`，A/V 对齐；`None` → 墙钟（`dt × speed`）。
+    /// 音频**刚上线那一刻锚定** `audio_base = 当前 playhead − 位置 × speed`：设备在开新
+    /// 媒体的静音间隙里也累计 `position()`，不锚定会把 playhead 带飞（音画错位）。
     /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。
     fn advance_playhead(&mut self, audio_pos: Option<f64>) {
         if !self.playing {
@@ -446,7 +570,13 @@ impl VideoViewer {
         }
         let speed = f64::from(self.speed);
         match audio_pos {
-            Some(pos) => self.playhead = self.audio_base + pos * speed,
+            Some(pos) => {
+                if self.audio_anchor_pending {
+                    self.audio_anchor_pending = false;
+                    self.audio_base = self.playhead - pos * speed;
+                }
+                self.playhead = self.audio_base + pos * speed;
+            }
             None => {
                 let now = Instant::now();
                 let dt = self
@@ -493,6 +623,20 @@ impl VideoViewer {
         self.overflow = None;
         self.pending_seek = None;
         self.zoom = 1.0; // 切文件：缩放复位为适应视口
+        // —— 切换窗口期（`start` 的异步任务先 await scan_folder、再跑 start_decoder_at
+        // 之前）立即切断旧媒体的时钟与输入：否则 pump 一拍可能仍按旧音频时钟把
+        // playhead 带回旧位置、或把旧媒体残留帧重新上屏，而新媒体的音频 worker 已
+        // 独立开喂 → 「画面暂停但声音还在放」（间歇出现）。
+        self.audio_ready.store(false, Ordering::Relaxed);
+        self.audio_anchor_pending = true;
+        self.audio_base = 0.0;
+        // 换代 + 换全新空接收端：pump 无法再取到旧媒体的未消费帧（worker 的旧命令
+        // 会因 generation 不匹配立即退出，随后由 start_decoder_at 的新命令接手）。
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let (_tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
+        if let Some(old) = self.rx.replace(rx) {
+            drop(old);
+        }
         self.start(cx);
         cx.notify();
     }
@@ -522,8 +666,8 @@ impl VideoViewer {
 
     fn seek(&mut self, delta: f64, cx: &mut Context<Self>) {
         let target = (self.playhead + delta).clamp(0.0, self.duration.max(0.0));
-        self.playhead = target;
-        self.start_decoder_at(target);
+            self.playhead = target;
+            self.start_decoder_at(target, None);
         // seek 后如果仍在播放则恢复出声（pause 态保持静音、只预览画面）
         if self.playing
             && let Some(sink) = &self.audio
@@ -593,10 +737,19 @@ impl VideoViewer {
         self.set_speed(SPEED_STEPS[next], cx);
     }
 
-    /// 当前视频路径（宿主 `EditorApp` 同步标签标题用）。
-    #[allow(dead_code)] // M3 标签标题/状态栏接入后删除
+    /// 当前视频路径（宿主 `EditorApp` 同步标签标题 / 状态栏用；同文件夹切换后即为新路径）。
     pub fn current_path(&self) -> Option<PathBuf> {
         Some(self.path.clone())
+    }
+
+    /// 当前视频在同文件夹清单中的下标（0 基）。
+    pub fn current_index(&self) -> usize {
+        self.current
+    }
+
+    /// 同文件夹视频总数。
+    pub fn folder_len(&self) -> usize {
+        self.folder.len()
     }
 
     /// 是否在播放（状态栏 / 测试用）。
@@ -773,7 +926,7 @@ impl VideoViewer {
             self.vol_bounds.clone(),
             self.effective_volume(),
             muted,
-            fg,
+            accent,
             false,
             cx,
         );
@@ -1136,6 +1289,10 @@ mod tests {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            decode_cmd: None,
+            audio_cmd: None,
+            audio_ready: Arc::new(AtomicBool::new(false)),
+            audio_anchor_pending: true,
             volume: 1.0,
             muted: false,
             speed: 1.0,
@@ -1231,6 +1388,7 @@ mod tests {
             v.audio_base = 2.0;
             v.playhead = 9.0; // 将被音频时钟覆盖
             v.duration = 100.0;
+            v.audio_anchor_pending = false; // 手动给定基准：跳过「上线锚定」
             v
         }));
         ent.update(cx, |v, _| v.advance_playhead(Some(3.5)));
@@ -1439,6 +1597,7 @@ mod tests {
             v.audio_base = 2.0;
             v.speed = 2.0;
             v.duration = 100.0;
+            v.audio_anchor_pending = false; // 手动给定基准：跳过「上线锚定」
             v
         }));
         ent.update(cx, |v, _| v.advance_playhead(Some(3.5)));
@@ -1451,6 +1610,37 @@ mod tests {
         ent.update(cx, |v, _| v.playing = false);
         ent.update(cx, |v, _| v.advance_playhead(Some(50.0)));
         assert_eq!(cx.update(|app| ent.read(app).playhead), 9.0, "暂停不推进");
+        cx.run_until_parked();
+    }
+
+    /// **上线锚定**（修复切视频音画错位）：音频一上线时把 `audio_base` 锚到当前墙钟进度
+    /// `playhead − 位置×speed`——切新媒体后设备在静音间隙也累积 `position()`，不锚定会把
+    /// playhead 带飞（画面快于声音）。本拍与锚定前 playhead 严格连续（无跳变）。
+    #[gpui::test]
+    async fn audio_clock_anchors_on_first_sighted(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.playhead = 9.0; // 墙钟已推进到 9s（音频未上线期间）
+            v.speed = 2.0;
+            v.duration = 100.0;
+            v.audio_anchor_pending = true; // 本拍音频首上线 → 触发锚定
+            v
+        }));
+        ent.update(cx, |v, _| v.advance_playhead(Some(3.5)));
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.audio_base, v.playhead, v.audio_anchor_pending)
+        });
+        assert_eq!(s.0, 9.0 - 3.5 * 2.0, "audio_base 锚到墙钟（消掉启动间隙）");
+        assert_eq!(s.1, 9.0, "playhead 无跳变（连续）");
+        assert!(!s.2, "锚定只执行一次");
+        // 后续走音频时钟（不再重锚）
+        ent.update(cx, |v, _| v.advance_playhead(Some(4.0)));
+        assert!(
+            (cx.update(|app| ent.read(app).playhead) - (9.0 - 3.5 * 2.0 + 4.0 * 2.0)).abs() < 1e-6,
+            "锚定后按音频时钟推进"
+        );
         cx.run_until_parked();
     }
 
@@ -1626,5 +1816,109 @@ mod tests {
         });
         assert!(w > 100.0, "video-main 应布局出宽 {w}");
         assert!(h > 100.0, "video-main 应布局出高 {h}");
+    }
+
+    /// 回归：**同文件夹切换不再冻结/卡死**（用户 72.MP4 复现：切换后画面静止）。
+    /// 根因 = 每次开媒体先「预开一次 VideoReader 取参数」再丢弃，会污染其后的 worker
+    /// open（`avformat_open_input` 卡死）→ 已改为 worker 开成功后回送参数、不再预开，
+    /// 且视频/音频改为**常驻单 worker 线程**（同线程串行重开，规避“新线程在上一解码器
+    /// teardown 后立刻 open”的卡死）。真文件存在才跑（CI/他机跳过）。
+    #[gpui::test]
+    async fn switch_reopens_next_video_cleanly(cx: &mut TestAppContext) {
+        let root = std::path::PathBuf::from(r"C:\Users\20294\Videos\school");
+        let a = root.join("73.MP4");
+        let b = root.join("72.MP4");
+        if !a.exists() || !b.exists() {
+            eprintln!("[video-test] 缺真实文件，跳过切换回归");
+            return;
+        }
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(a.clone(), cx)));
+        let s0 = wait_ready(&viewer, cx).await;
+        assert!(s0.0 && s0.1, "首支应出帧且拿到参数 err={:?}", s0.2);
+        // 切到 72
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.folder = vec![a.clone(), b.clone()];
+                v.current = 0;
+                v.open_folder_index(1, cx);
+            })
+        });
+        let sb = wait_ready(&viewer, cx).await;
+        let final_s = cx.update(|app| {
+            let v = viewer.read(app);
+            (v.frame.is_some(), v.intrinsic, v.current)
+        });
+        eprintln!(
+            "[video-test] 切换后 frame={} intrinsic={:?} cur={} err={:?}",
+            final_s.0, final_s.1, final_s.2, sb.2
+        );
+        assert!(
+            final_s.0,
+            "切换后应能上到新视频帧（不再冻结）err={:?}",
+            sb.2
+        );
+        assert!(final_s.1.is_some(), "切换后应仍持新视频参数 intrinsic");
+    }
+
+    /// 回归「切换后间歇出现画面暂停但声音还在放」：`open_folder_index` 必须**同步**（在
+    /// `start` 异步任务跑起来之前）切断旧媒体的音频时钟（`audio_ready`/`audio_base`/
+    /// `audio_anchor_pending`）与输入通道（旧接收端里的未消费帧），否则 pump 一拍会用
+    /// 旧音频时钟把 playhead 带回旧位置、或把旧帧重新上屏，而新媒体音频已独立开喂。
+    #[gpui::test]
+    async fn switch_synchronously_clears_stale_audio_clock_and_input(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.folder = vec![fixture(), fixture()];
+            // 旧媒体残留态：音频时钟已锚、ready 仍为 true，旧接收端里还卡着未消费帧
+            v.audio_ready.store(true, Ordering::Relaxed);
+            v.audio_base = 10.0;
+            v.audio_anchor_pending = false;
+            let (tx, rx) = sync_channel::<FrameItem>(4);
+            tx.send(frame_of(9.9, 1)).unwrap();
+            v.rx = Some(rx);
+            v
+        }));
+        ent.update(cx, |v, cx| v.open_folder_index(1, cx));
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            let old_frame_still_queued = match &v.rx {
+                Some(rx) => rx.try_recv().is_ok(),
+                None => false,
+            };
+            (
+                v.audio_ready.load(Ordering::Relaxed),
+                v.audio_base,
+                v.audio_anchor_pending,
+                old_frame_still_queued,
+                (v.playhead - 0.0).abs() < 1e-6,
+            )
+        });
+        assert!(!s.0, "切换后音频时钟应立即失效（不再用旧媒体位置推 playhead）");
+        assert!((s.1 - 0.0).abs() < 1e-9, "audio_base 应归零");
+        assert!(s.2, "应重新进入「音频上线锚定」待执行态");
+        assert!(!s.3, "旧媒体残留帧不应再从接收端取到（pump 无法把旧帧重新上屏）");
+        assert!(s.4, "playhead 不应在窗口期起跳");
+        cx.run_until_parked();
+    }
+
+    /// 等视频出帧 + intrinsic 就绪（真实时间推进让常驻 worker 干活），最多 ~30s。
+    async fn wait_ready(v: &gpui::Entity<VideoViewer>, cx: &mut TestAppContext) -> (bool, bool, Option<String>) {
+        for _ in 0..3000 {
+            let s = cx.update(|app| {
+                let v = v.read(app);
+                (v.frame.is_some(), v.intrinsic.is_some(), v.load_error.clone())
+            });
+            if (s.0 && s.1) || s.2.is_some() {
+                return s;
+            }
+            v.update(cx, |v, _| v.tick());
+            cx.background_executor.timer(std::time::Duration::from_millis(10)).await;
+        }
+        cx.update(|app| {
+            let v = v.read(app);
+            (v.frame.is_some(), v.intrinsic.is_some(), v.load_error.clone())
+        })
     }
 }
