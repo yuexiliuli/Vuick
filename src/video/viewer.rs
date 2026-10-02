@@ -65,10 +65,17 @@ const DECODE_AHEAD_FRAMES: usize = 2;
 const SEEK_STEP_SEC: f64 = 5.0;
 /// 播放推进周期（≈60Hz，对齐 PDF 瓦片泵）。
 const PUMP_MS: u64 = 16;
+/// 无新帧的闲置拍最长重绘间隔（ms）：播放中帧暂缺（VFR / 解码卡顿）时仍低频刷新
+/// 进度条/控制条，不再每 16ms 强刷整窗（62Hz 全窗重绘是播放 CPU 大头之一）。
+const COARSE_REPAINT_MS: u64 = 200;
 /// 音频解码回压阈值（样本数 ≈ 1s × 立体声）：缓冲满则音频线程等待，不无限塞内存。
 const AUDIO_QUEUE_AIM: usize = 48_000 * 2;
 /// decode-to-display 下采样：sws 输出长边封顶（4K 源只解 ~1080p，省 ~4× 解码/内存/上屏）。
 const DECODE_MAX_DIM: u32 = 1920;
+/// 解码封顶下限（px）：窗口极小/截图预览时也不低于此，保留可读画面。
+const DECODE_MIN_DIM: u32 = 256;
+/// 解码封顶的「桶」对齐粒度（px）：窗口拖动按桶变化才重开解码器，避免逐像素重开。
+const CAP_BUCKET: u32 = 256;
 /// 循环可选的播放倍速（按钮逐档循环 + `[`/`]` 步进）。
 const SPEED_STEPS: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
 /// `-`/`=` 音量步进。
@@ -91,6 +98,7 @@ struct DecodeCmd {
     generation: u64,
     path: PathBuf,
     target: f64,
+    cap: u32,
     tx: std::sync::mpsc::SyncSender<FrameItem>,
     result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
 }
@@ -210,6 +218,9 @@ pub struct VideoViewer {
     /// 子级里会退化为 auto → img 落到固有尺寸，竖屏被放大只露顶部；改按实测尺寸
     /// 手动 contain 适配，同 ImageViewer 的姿势）。
     viewport: ScrollHandle,
+    /// 当前视频解码输出的长边封顶（px）：按显示尺寸自适应（render 里窗口变化时经
+    /// `start_decoder_at(…, restart_audio=false)` 重开解码器而不打断音频）。
+    decode_cap: u32,
 }
 
 impl VideoViewer {
@@ -227,6 +238,7 @@ impl VideoViewer {
             playhead: 0.0,
             duration: 1.0,
             fps: None,
+            decode_cap: DECODE_MAX_DIM,
             last_tick: None,
             folder: vec![path.clone()],
             current: 0,
@@ -293,7 +305,7 @@ impl VideoViewer {
             let _ = weak.update(cx, |this, cx| {
                 this.folder = folder;
                 this.current = current;
-                this.start_decoder_at(0.0, Some(out_tx));
+                this.start_decoder_at(0.0, Some(out_tx), true);
                 this.ensure_pump(cx);
             });
             let outcome = cx
@@ -341,10 +353,13 @@ impl VideoViewer {
     /// 旧命令内层循环按 `generation` 立即停，worker 在**同一线程**内 drop 旧 reader 后
     /// 串行重开新文件——实测规避“新线程在上一解码器 teardown 后 avformat_open_input 卡死”
     ///（72.MP4 复现；同线程串行重开稳定：见 diag6）。
+    /// `restart_audio`：seek/切换为 true（音频随命令重开、flush 归零）；纯「按显示尺寸
+    /// 重开视频解码器」为 false（音频保持、播放进度不中断）。
     fn start_decoder_at(
         &mut self,
         target: f64,
         result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
+        restart_audio: bool,
     ) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.generation.store(generation, Ordering::SeqCst);
@@ -360,13 +375,16 @@ impl VideoViewer {
             generation,
             path: self.path.clone(),
             target,
+            cap: self.decode_cap,
             tx,
             result_tx,
         };
         if let Some(tx) = &self.decode_cmd {
             let _ = tx.send(cmd);
         }
-        self.start_audio_at(target);
+        if restart_audio {
+            self.start_audio_at(target);
+        }
     }
 
     /// 惰性启动常驻视频解码 worker（一生一个；viewer Drop 时命令发送端被弃，
@@ -387,9 +405,10 @@ impl VideoViewer {
         gen_arc: Arc<AtomicU64>,
     ) {
         while let Ok(cmd) = rx.recv() {
-            // decode-to-display：sws 输出长边封顶 DECODE_MAX_DIM（4K 源降载）；
-            // 上一命令的 reader 在循环本轮开头已被 drop（同线程串行，无并发 FFmpeg）
-            let mut reader = match VideoReader::open_scaled(&cmd.path, DECODE_MAX_DIM) {
+            // decode-to-display：sws 输出长边封顶 `cmd.cap`（按显示尺寸自适应，省
+            // 内存带宽/上传；4K 源降载）；上一命令的 reader 在循环本轮开头已被 drop
+            //（同线程串行，无并发 FFmpeg）
+            let mut reader = match VideoReader::open_scaled(&cmd.path, cmd.cap) {
                 Ok(r) => r,
                 Err(e) => {
                     if let Some(out) = &cmd.result_tx {
@@ -507,9 +526,30 @@ impl VideoViewer {
         }
     }
 
-    /// 每 ~16ms 一拍的播放泵是否仍需运行。
+    /// 播放泵是否仍需运行。
     fn pump_wanted(&self) -> bool {
         self.playing || self.pending_seek.is_some()
+    }
+
+    /// 泵节拍：按内容帧率自适应（30fps→~33ms、60fps→16ms、25fps→40ms），下限
+    /// 8ms（120fps）、上限 50ms（20fps 兜底未知/异常帧率）。旧版恒 16ms（62Hz）：
+    /// 多出的拍没有新帧、纯为推进度条而强刷整窗，是播放 CPU 大头之一。
+    fn pump_interval(&self) -> Duration {
+        let ms = self
+            .fps
+            .filter(|(n, d)| *n > 0 && *d > 0)
+            .map(|(n, d)| 1000 * u64::from(d) / u64::from(n))
+            .unwrap_or(PUMP_MS);
+        Duration::from_millis(ms.clamp(8, 50))
+    }
+
+    /// 按显示尺寸定解码长边封顶（px）：`视口最大轴 × 缩放` 向上对齐到 `CAP_BUCKET`
+    /// 桶、钳进 `[DECODE_MIN_DIM, DECODE_MAX_DIM]`。缩放后画面可能超出视口，仍受上限约束；
+    /// 桶对齐避免窗口拖动时逐像素重开解码器（省 decode/swscale/纹理上传）。
+    fn desired_decode_cap(&self, vw: f32, area_h: f32) -> u32 {
+        let longest = (vw.max(area_h).max(1.0) * self.zoom).ceil() as u32;
+        let snapped = longest.saturating_add(CAP_BUCKET - 1) / CAP_BUCKET * CAP_BUCKET;
+        snapped.clamp(DECODE_MIN_DIM, DECODE_MAX_DIM)
     }
 
     fn ensure_pump(&mut self, cx: &mut Context<Self>) {
@@ -518,14 +558,33 @@ impl VideoViewer {
         }
         self.pump_running = true;
         cx.spawn(async move |this, cx| {
+            // 上次强制重绘时刻：仅「有新帧落屏」才每拍重绘；无新帧的闲置拍最多每
+            // COARSE_REPAINT_MS 一次（推进度条/控制条），不再 16ms 把整窗全刷一遍。
+            let mut last_paint: Option<Instant> = None;
             loop {
-                cx.background_executor().timer(Duration::from_millis(PUMP_MS)).await;
+                let interval = this
+                    .update(cx, |v, _| v.pump_interval())
+                    .unwrap_or(Duration::from_millis(PUMP_MS));
+                cx.background_executor()
+                    .timer(interval)
+                    .await;
+                let now = Instant::now();
                 let keep = this
                     .update(cx, |v, cx| {
-                        v.tick();
-                        // 关键：每拍强制重绘（单靠 notify 在实体未被窗口 tracking 时可能
-                        // 空操作）——否则播放只在状态里推进、画面停在首帧占位。见 pdf 瓦片泵。
-                        cx.refresh_windows();
+                        let new_frame = v.tick();
+                        let coarse_due = last_paint
+                            .map(|t| {
+                                now.duration_since(t)
+                                    >= Duration::from_millis(COARSE_REPAINT_MS)
+                            })
+                            .unwrap_or(true);
+                        if new_frame || coarse_due {
+                            // 关键：新帧/粗粒度推进时强制重绘（单靠 notify 在实体未被
+                            // 窗口 tracking 时可能空操作）——否则播放只在状态里推进、画面
+                            // 停在首帧占位。见 pdf 瓦片泵。
+                            last_paint = Some(now);
+                            cx.refresh_windows();
+                        }
                         v.pump_wanted()
                     })
                     .unwrap_or(false);
@@ -538,8 +597,9 @@ impl VideoViewer {
         .detach();
     }
 
-    /// 播放泵单拍（纯状态推进 + 上屏；调用方负责重绘）。
-    fn tick(&mut self) {
+    /// 播放泵单拍（纯状态推进 + 上屏；调用方负责重绘）。返回本拍是否把**新帧上屏**
+    ///（调用方据此只在有新帧时强制重绘，闲置拍不再每 16ms 全刷）。
+    fn tick(&mut self) -> bool {
         // 以音频时钟为播放进度（**仅当本媒体音频真在喂**；否则/未上线走墙钟——无声轨
         // 或切媒体后音频未就绪时画面也要前进，否则冻结）
         let audio_pos = (self.audio.is_some() && self.audio_ready.load(Ordering::Relaxed))
@@ -589,6 +649,9 @@ impl VideoViewer {
         if let Some((_pts, w, h, bgra)) = latest {
             self.install_bgra(w, h, bgra);
             self.pending_seek = None; // 落点已上屏（首个可用帧）
+            true
+        } else {
+            false
         }
     }
 
@@ -705,7 +768,7 @@ impl VideoViewer {
     fn seek(&mut self, delta: f64, cx: &mut Context<Self>) {
         let target = (self.playhead + delta).clamp(0.0, self.duration.max(0.0));
             self.playhead = target;
-            self.start_decoder_at(target, None);
+            self.start_decoder_at(target, None, true);
         // seek 后如果仍在播放则恢复出声（pause 态保持静音、只预览画面）
         if self.playing
             && let Some(sink) = &self.audio
@@ -1334,6 +1397,22 @@ impl Render for VideoViewer {
         } else {
             (vh - CONTROL_BAR_H).max(1.0)
         };
+        // 按显示尺寸自适应解码封顶：画面已上屏且窗口尺寸落进新的 256px「桶」时，只
+        // 重开视频解码器（restart_audio=false 不打断音频/进度），把 sws 输出与逐帧
+        // 上传切成显示所需像素数（省 decode/swscale/纹理上传，播放 CPU 大头之一）。
+        if self.frame.is_some()
+            && !self.loading
+            && self.pending_seek.is_none()
+            && vw > 0.0
+            && area_h > 0.0
+        {
+            let wanted = self.desired_decode_cap(vw, area_h);
+            if wanted != self.decode_cap {
+                self.decode_cap = wanted;
+                let t = self.playhead;
+                self.start_decoder_at(t, None, false);
+            }
+        }
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted)
         } else {
@@ -1474,6 +1553,7 @@ mod tests {
             playhead: 0.0,
             duration: 2.0,
             fps: None,
+            decode_cap: DECODE_MAX_DIM,
             last_tick: None,
             folder: vec![fixture()],
             current: 0,
