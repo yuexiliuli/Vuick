@@ -13,8 +13,10 @@ use anyhow::{Context as _, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, I24, U24};
 
-/// 环形缓冲上限（样本数）：约 1 秒 × 声道，防止解码线程提前跑完整个文件塞爆内存。
-const QUEUE_MAX_SAMPLES: usize = 48_000 * 2;
+/// 环形缓冲上限（样本数）：约 2 秒 × 声道。**必须显著大于解码线程的回压阈值
+///（1s）**——否则队列一满 backpressure 还没触发，`push` 就先丢最旧样本 = 持续
+/// 丢音频（卡顿/碎裂声）。
+const QUEUE_MAX_SAMPLES: usize = 48_000 * 2 * 2;
 
 /// 音频输出流句柄（可跨线程引用内部缓冲/计数）。
 #[derive(Clone)]
@@ -32,6 +34,12 @@ struct SinkInner {
     /// 输出声道数。
     #[allow(dead_code)] // M4 音频时钟/多声道接入后启用
     channels: u32,
+    /// 回调累计次数。
+    cb_calls: Arc<AtomicU64>,
+    /// 累计欠载样本数（回调时队列已空，填了静音）。
+    cb_underrun: Arc<AtomicU64>,
+    /// 累计锁竞争失败次数（整块静音）。
+    cb_lockfail: Arc<AtomicU64>,
 }
 
 impl AudioSink {
@@ -48,25 +56,31 @@ impl AudioSink {
         let sample_rate = supported.sample_rate();
         let mut config: cpal::StreamConfig = supported.into();
         config.channels = 2; // 与解码输出（立体声交错）一致；绝大多数设备支持 2ch
+        // 显式给足设备缓冲（约 2048 帧 ≈ 40ms+）：默认值在某些 WASAPI 端点上极小，
+        // 一旦欠载即整块静音 → 滋滋/碎裂
+        config.buffer_size = cpal::BufferSize::Fixed(2048);
 
         let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
         let played = Arc::new(AtomicU64::new(0));
+        let cb_calls = Arc::new(AtomicU64::new(0));
+        let cb_underrun = Arc::new(AtomicU64::new(0));
+        let cb_lockfail = Arc::new(AtomicU64::new(0));
         let err_fn = |e: cpal::Error| eprintln!("[video] 音频输出流错误：{e}");
 
         let format = supported.sample_format();
         let stream: cpal::Stream = match format {
-            SampleFormat::F32 => build::<f32>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::F64 => build::<f64>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::I8 => build::<i8>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::I16 => build::<i16>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::I24 => build::<I24>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::I32 => build::<i32>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::I64 => build::<i64>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::U8 => build::<u8>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::U16 => build::<u16>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::U24 => build::<U24>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::U32 => build::<u32>(&device, config, &queue, &played, err_fn)?,
-            SampleFormat::U64 => build::<u64>(&device, config, &queue, &played, err_fn)?,
+            SampleFormat::F32 => build::<f32>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::F64 => build::<f64>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::I8 => build::<i8>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::I16 => build::<i16>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::I24 => build::<I24>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::I32 => build::<i32>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::I64 => build::<i64>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::U8 => build::<u8>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::U16 => build::<u16>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::U24 => build::<U24>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::U32 => build::<u32>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
+            SampleFormat::U64 => build::<u64>(&device, config, &queue, &played, &cb_calls, &cb_underrun, &cb_lockfail, err_fn)?,
             other => return Err(anyhow!("不支持的输出采样格式：{other:?}")),
         };
 
@@ -77,6 +91,9 @@ impl AudioSink {
                 played_frames: played,
                 sample_rate,
                 channels: 2,
+                cb_calls,
+                cb_underrun,
+                cb_lockfail,
             }),
         })
     }
@@ -122,6 +139,17 @@ impl AudioSink {
         self.inner.played_frames.store(0, Ordering::Relaxed);
     }
 
+    /// 播放进度/健康统计：`(回调次数, 欠载样本, 锁失败次数, 已播帧数)`。
+    pub fn stats(&self) -> (u64, u64, u64, u64) {
+        let i = &self.inner;
+        (
+            i.cb_calls.load(Ordering::Relaxed),
+            i.cb_underrun.load(Ordering::Relaxed),
+            i.cb_lockfail.load(Ordering::Relaxed),
+            i.played_frames.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn play(&self) -> Result<()> {
         let s = self.inner.stream.lock().unwrap();
         s.play().context("音频输出 play 失败")
@@ -134,11 +162,15 @@ impl AudioSink {
 }
 
 /// 按目标采样格式建输出流（回调统一从 F32 队列取值并转目标格式）。
+#[allow(clippy::too_many_arguments)]
 fn build<T>(
     device: &cpal::Device,
     config: cpal::StreamConfig,
     queue: &Arc<Mutex<VecDeque<f32>>>,
     played: &Arc<AtomicU64>,
+    cb_calls: &Arc<AtomicU64>,
+    cb_underrun: &Arc<AtomicU64>,
+    cb_lockfail: &Arc<AtomicU64>,
     err_fn: impl Fn(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream>
 where
@@ -146,11 +178,14 @@ where
 {
     let q = queue.clone();
     let p = played.clone();
+    let cc = cb_calls.clone();
+    let cu = cb_underrun.clone();
+    let cl = cb_lockfail.clone();
     let channels = config.channels as usize;
     let stream = device.build_output_stream(
         config,
         move |output: &mut [T], _: &cpal::OutputCallbackInfo| {
-            pump::<T>(output, &q, &p, channels);
+            pump::<T>(output, &q, &p, &cc, &cu, &cl, channels);
         },
         err_fn,
         None,
@@ -158,19 +193,41 @@ where
     Ok(stream)
 }
 
-/// CPAL 输出回调：从队列 pop 样本送到设备（耗尽回填静音），并累加已播帧数。
-/// 用 `try_lock` 避免在实时回调线程上阻塞；拿不到锁时输出静音、不计数。
-fn pump<T>(data: &mut [T], queue: &Arc<Mutex<VecDeque<f32>>>, played: &Arc<AtomicU64>, channels: usize)
-where
-    T: SizedSample + FromSample<f32> + Copy,
+/// CPAL 输出回调：从队列 pop 样本送到设备（耗尽回填静音），并累加已播帧数与
+/// 健康计数。用 `try_lock` 避免在实时回调线程上阻塞；**拿不到锁时整块填静音**。
+fn pump<T>(
+    data: &mut [T],
+    queue: &Arc<Mutex<VecDeque<f32>>>,
+    played: &Arc<AtomicU64>,
+    cb_calls: &Arc<AtomicU64>,
+    cb_underrun: &Arc<AtomicU64>,
+    cb_lockfail: &Arc<AtomicU64>,
+    channels: usize,
+) where
+    T: cpal::Sample + SizedSample + FromSample<f32> + Copy,
 {
     let frame_count = data.len() / channels;
+    cb_calls.fetch_add(1, Ordering::Relaxed);
     let Ok(mut q) = queue.try_lock() else {
-        return; // 主线程持锁中：本拍静音并跳过计数
+        // 竞态（主线程推送/清空持锁短暂窗口）：本拍静音，不计数
+        for slot in data.iter_mut() {
+            *slot = T::EQUILIBRIUM;
+        }
+        cb_lockfail.fetch_add(1, Ordering::Relaxed);
+        return;
     };
-    for slot in data {
-        let v = q.pop_front().unwrap_or(0.0_f32);
-        *slot = T::from_sample(v);
+    let mut underrun = 0u64;
+    for slot in data.iter_mut() {
+        match q.pop_front() {
+            Some(v) => *slot = T::from_sample(v),
+            None => {
+                *slot = T::from_sample(0.0);
+                underrun += 1;
+            }
+        }
+    }
+    if underrun > 0 {
+        cb_underrun.fetch_add(underrun, Ordering::Relaxed);
     }
     played.fetch_add(frame_count as u64, Ordering::Relaxed);
 }

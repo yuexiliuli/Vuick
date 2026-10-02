@@ -89,10 +89,14 @@ pub struct VideoViewer {
     pending_seek: Option<f64>,
     /// 音频输出（有音轨且设备可用时 Some；否则纯画面 + 墙钟）。
     audio: Option<AudioSink>,
+    /// 音频时钟基准：seek 落点（秒）。有音频播放时 `playhead = audio_base + 设备已播位置`。
+    audio_base: f64,
     /// 音频解码线程换代号（seek/重开生效，旧音频线程自退）。
     audio_gen: Arc<AtomicU64>,
     /// 音频输出初始化失败标志（避免每次打开重试）。
     audio_err: bool,
+    /// 音频健康诊断节拍（每 ~60 tick ≈1s 打一行 stats；播放无音频时不用）。
+    diag_ticks: u32,
 }
 
 impl VideoViewer {
@@ -119,8 +123,10 @@ impl VideoViewer {
             pump_running: false,
             pending_seek: None,
             audio: None,
+            audio_base: 0.0,
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
+            diag_ticks: 0,
         };
         this.start(cx);
         this
@@ -226,11 +232,13 @@ impl VideoViewer {
     }
 
     /// 启动（或重开）音频解码线程，从 `target` 秒开始喂音。与视频线程各自的
-    /// 换代号独立；seek 前先 `flush`（缓冲清空 + 位置归零）。
+    /// 换代号独立；seek 前先 `flush`（缓冲清空 + 位置归零），并把音频时钟基准
+    /// 定为 `target`。
     fn start_audio_at(&mut self, target: f64) {
         let Some(sink) = self.audio.clone() else {
             return;
         };
+        self.audio_base = target;
         sink.flush();
         let agen = self.audio_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.audio_gen.store(agen, Ordering::SeqCst);
@@ -296,23 +304,26 @@ impl VideoViewer {
 
     /// 播放泵单拍（纯状态推进 + 上屏；调用方负责重绘）。
     fn tick(&mut self) {
-        let now = Instant::now();
-        if self.playing {
-            let dt = self
-                .last_tick
-                .map(|t| now.duration_since(t).as_secs_f64())
-                .unwrap_or_else(|| 1.0 / 60.0);
-            self.last_tick = Some(now);
-            self.playhead += dt;
-            if self.duration > 0.0 && self.playhead >= self.duration {
-                self.playhead = self.duration;
-                self.playing = false; // 播到结尾自动停
+        // 以音频时钟为播放进度（有音轨时），否则墙钟
+        let audio_pos = self.audio.as_ref().map(|s| s.position());
+        self.advance_playhead(audio_pos);
+
+        // 音频健康诊断：仅 `GPUI_EDITOR_VIDEO_AUDIO_DIAG=1` 时每 ~1s 打一行喂送统计
+        //（欠载/锁竞争是滋滋声的根源形态；默认静默）
+        const DIAG_ENV: &str = "GPUI_EDITOR_VIDEO_AUDIO_DIAG";
+        if self.audio.is_some()
+            && std::env::var_os(DIAG_ENV).is_some()
+        {
+            self.diag_ticks += 1;
+            if self.diag_ticks >= 60 {
+                self.diag_ticks = 0;
                 if let Some(sink) = &self.audio {
-                    sink.pause();
+                    let (calls, underrun, lockfail, played) = sink.stats();
+                    eprintln!(
+                        "[video-audio] calls={calls} underrun_samples={underrun} lockfail={lockfail} played_frames={played}"
+                    );
                 }
             }
-        } else {
-            self.last_tick = None;
         }
 
         // 排空「pts ≤ playhead」的帧取最新上屏；越过 playhead 的下一帧保留在 overflow
@@ -340,6 +351,35 @@ impl VideoViewer {
         if let Some((_pts, w, h, bgra)) = latest {
             self.install_bgra(w, h, bgra);
             self.pending_seek = None; // 落点已上屏（首个可用帧）
+        }
+    }
+
+    /// 推进 `playhead`：`audio_pos` 有值 → 音频时钟（`audio_base + 设备已播位置`，
+    /// A/V 对齐；seek 后基准重置、位置归零）；`None` → 墙钟（按真实经过累加）。
+    /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。
+    fn advance_playhead(&mut self, audio_pos: Option<f64>) {
+        if !self.playing {
+            self.last_tick = None;
+            return;
+        }
+        match audio_pos {
+            Some(pos) => self.playhead = self.audio_base + pos,
+            None => {
+                let now = Instant::now();
+                let dt = self
+                    .last_tick
+                    .map(|t| now.duration_since(t).as_secs_f64())
+                    .unwrap_or_else(|| 1.0 / 60.0);
+                self.last_tick = Some(now);
+                self.playhead += dt;
+            }
+        }
+        if self.duration > 0.0 && self.playhead >= self.duration {
+            self.playhead = self.duration;
+            self.playing = false; // 播到结尾自动停
+            if let Some(sink) = &self.audio {
+                sink.pause();
+            }
         }
     }
 
@@ -622,8 +662,10 @@ mod tests {
             pump_running: false,
             pending_seek: None,
             audio: None,
+            audio_base: 0.0,
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
+            diag_ticks: 0,
         }
     }
 
@@ -702,6 +744,43 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// 音频时钟是主时钟：播放中 `playhead = audio_base + 设备已播位置`；暂停不推进；
+    /// 越过时长自动停（有音频时此即 A/V 对齐的帧钟）。
+    #[gpui::test]
+    async fn playhead_uses_audio_clock_when_present(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.audio_base = 2.0;
+            v.playhead = 9.0; // 将被音频时钟覆盖
+            v.duration = 100.0;
+            v
+        }));
+        ent.update(cx, |v, _| v.advance_playhead(Some(3.5)));
+        assert_eq!(
+            cx.update(|app| ent.read(app).playhead),
+            5.5,
+            "音频时钟 playhead = audio_base + 设备已播位置"
+        );
+        // 暂停：不推进
+        ent.update(cx, |v, _| v.playing = false);
+        ent.update(cx, |v, _| v.advance_playhead(Some(50.0)));
+        assert_eq!(cx.update(|app| ent.read(app).playhead), 5.5, "暂停不推进");
+        // 越过时长：自动停并钳到 duration
+        ent.update(cx, |v, _| {
+            v.playing = true;
+            v.duration = 3.0;
+            v.advance_playhead(Some(4.0));
+        });
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.playing, v.playhead)
+        });
+        assert!(!s.0, "音频时钟越过时长应自动停");
+        assert_eq!(s.1, 3.0);
+        cx.run_until_parked();
+    }
+
     /// seek 钳位：负超/正超都被限制在 [0, duration]。
     #[gpui::test]
     async fn seek_clamps_to_duration(cx: &mut TestAppContext) {
@@ -741,18 +820,19 @@ mod tests {
         };
         assert!(frame_ok, "首帧应上屏, load_error={err:?}");
         assert!(intrinsic.is_some(), "应取得视频像素尺寸");
-        // 多喂几拍：播放状态保持、不上屏帧被正确消费而不堆积 overflow
+        // 多喂几拍：播放状态保持、画面持续在屏（overflow 的排空语义由
+        // `pump_installs_latest_frame_in_window` 确定性覆盖；真实解码速度与手动
+        // tick 时序不同，不在此断言 overflow 是否为空）
         for _ in 0..60 {
             viewer.update(cx, |v, _| v.tick());
             cx.run_until_parked();
         }
         let s = cx.update(|app| {
             let v = viewer.read(app);
-            (v.is_playing(), v.overflow.is_none(), v.frame.is_some())
+            (v.is_playing(), v.frame.is_some())
         });
         assert!(s.0, "打开即自动播放且持续在播");
-        assert!(s.1, "常规播放不该滞留 overflow（帧不超前投递）");
-        assert!(s.2, "画面持续在屏");
+        assert!(s.1, "画面持续在屏");
     }
 
     /// M1 保留：打开损坏 / 不存在文件：落错误占位不死等。

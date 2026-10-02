@@ -446,20 +446,38 @@ mod tests {
         assert!((1.5..=3.0).contains(&p.duration), "duration={}", p.duration);
         let mut n = 0;
         let mut last = -1.0f64;
+        let mut all: Vec<f32> = Vec::new();
         while let Some((pts, samples)) = r.next_pcm_f32().unwrap() {
             assert!(pts >= last - 1e-9, "音频 pts 单调");
             last = pts;
             assert_eq!(samples.len() % 2, 0, "立体声交错样本");
-            if n == 0 {
-                assert!(
-                    samples.iter().any(|&s| s != 0.0),
-                    "anoisesrc 应产出非静音样本"
-                );
-            }
+            assert!(
+                samples.iter().all(|&s| s.is_finite() && s.abs() <= 2.0),
+                "解码样本应有限且有界"
+            );
+            all.extend_from_slice(&samples);
             n += 1;
             assert!(n < 1000, "不该无限出音频块");
         }
         assert!(n > 5, "2s 音频应产出多块, 实得 {n}");
+        // 全段 440Hz 正弦「形状」断言（AAC 编码会把电平压低，故不断言绝对幅度，
+        // 只断言它是音调而非静态噪音）：过零率 ≈ 2×440/秒（静噪≈48000/秒），
+        // 峰值与 RMS 有正弦特征（peak ≥ 1.4×rms）。
+        let len = all.len();
+        let rms = (all.iter().map(|s| s * s).sum::<f32>() / len as f32).sqrt();
+        let peak = all.iter().fold(0.0f32, |a, &s| a.max(s.abs()));
+        let zc = all.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count();
+        let secs = len as f32 / (2.0 * 48000.0);
+        let zc_s = zc as f32 / secs;
+        eprintln!("audio stats: rms={rms:.4} peak={peak:.4} zc/s={zc_s:.0}");
+        assert!(
+            (400.0..=1400.0).contains(&zc_s),
+            "440Hz 音调过零率≈880/s，实得 {zc_s:.0}（静噪≈48000/s）"
+        );
+        assert!(
+            peak > rms * 1.2 && rms > peak * 0.2,
+            "正弦峰值/均方根应具正弦特征 (peak={peak:.4}, rms={rms:.4})"
+        );
     }
 
     #[test]
