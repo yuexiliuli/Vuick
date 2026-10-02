@@ -10,26 +10,51 @@
 //! - **seek**：重开解码线程（文件再 open + seek），`pending_seek` 挂起 pump 直到
 //!   落点帧上屏（暂停态也能预览跳转后的画面）。
 //!
+//! ## 音频（M3/M4）
+//! - `AudioReader` 把音轨重采样成 F32 立体声喂 CPAL 输出（`AudioSink`）；有音轨时
+//!   播放进度以**音频时钟**为主（`playhead = audio_base + 设备已播位置`），墙钟兜底。
+//! - **音量/静音（M5）**：`AudioSink::set_volume` 在回调内逐样本乘音量（无锁原子）；
+//!   静音 = 生效音量 0。
+//! - **播放速度（M5）**：按 `speed` 降低重采样输出率（`设备率÷speed`）重开音频线程 +
+//!   音频时钟乘 `speed`（变速变调，resample 方案；不变调需时间拉伸，留待后续）；
+//!   纯画面走墙钟 `dt×speed`，视频帧按「源秒」时间轴排空，A/V 始终同速对齐。
+//!
+//! ## 降载/M5
+//! - **decode-to-display**：解码线程用 `open_scaled` 把 sws 输出按 [`DECODE_MAX_DIM`]
+//!   长边封顶（4K 源只解 ~1080p），`params` 仍报源尺寸保宽高比。
+//! - **控制条（全屏底部浮层）**：上一支 / 播放·暂停 / 下一支 / 时间 / 可拖 seek 进度条 /
+//!   静音 + 音量条 / 倍速循环 / 清单位置。
+//!
 //! ## 控制（焦点落在本视图时）
 //! - `Space`：播放 / 暂停；`←`/`→`：±[`SEEK_STEP_SEC`] 秒；
-//! - 滚轮：±[`WHEEL_SEEK_SEC`] 秒（向上滚 = 前进）；`Shift+滚轮`：同文件夹切换
-//!   （向下滚 = 下一支）；`PageDown`/`PageUp`：下一支 / 上一支。
+//! - `Ctrl+滚轮`：放大 / 缩小（[`ZOOM_STEP`] 档，钳位 [`ZOOM_MIN`..=[`ZOOM_MAX`]）；
+//!   `Shift+滚轮`：同文件夹切换（向下滚 = 下一支）；普通滚轮**不控制进度**；
+//!   `PageDown`/`PageUp`：下一支 / 上一支；
+//! - `m`：静音切换；`-`/`=`：减/加音量（±[`VOLUME_STEP`]）；`[`/`]`：降/升倍速。
 //!
 //! 对齐 [`crate::image::ImageViewer`] 的「自包含阅读器」姿势；上屏字节序 BGRA
 //! 同 PDF 模块 [`crate::pdf::render_image_from_bgra`]。
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Context, Hsla, InteractiveElement, IntoElement, KeyDownEvent, ObjectFit, ParentElement,
-    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Styled, StyledImage, Window,
-    div, img, px, rgb,
+    App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
+    Point, Render, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, img, px,
+    prelude::FluentBuilder as _, rgb,
 };
 use image::{Frame, RgbaImage};
+
+use crate::ui::button::Button;
+use crate::ui::button::ButtonVariants as _;
+use crate::ui::icon::{Icon, IconName};
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
@@ -38,15 +63,39 @@ use super::decode::{AudioReader, VideoReader};
 const DECODE_AHEAD_FRAMES: usize = 2;
 /// ←/→ seek 步进（秒）。
 const SEEK_STEP_SEC: f64 = 5.0;
-/// 滚轮 seek 步进（秒）。
-const WHEEL_SEEK_SEC: f64 = 10.0;
 /// 播放推进周期（≈60Hz，对齐 PDF 瓦片泵）。
 const PUMP_MS: u64 = 16;
 /// 音频解码回压阈值（样本数 ≈ 1s × 立体声）：缓冲满则音频线程等待，不无限塞内存。
 const AUDIO_QUEUE_AIM: usize = 48_000 * 2;
+/// decode-to-display 下采样：sws 输出长边封顶（4K 源只解 ~1080p，省 ~4× 解码/内存/上屏）。
+const DECODE_MAX_DIM: u32 = 1920;
+/// 循环可选的播放倍速（按钮逐档循环 + `[`/`]` 步进）。
+const SPEED_STEPS: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
+/// `-`/`=` 音量步进。
+const VOLUME_STEP: f32 = 0.1;
+/// 底部控制条预留高度（px）：视频 contain 适配到「视口高 − 此值」，避免画面底部被
+/// 浮层控制条遮住。值略大于控制条实际高度（py 8×2 + 按钮 28 ≈ 44）。
+const CONTROL_BAR_H: f32 = 52.0;
+/// Ctrl+滚轮缩放区间 / 步进（语义同图片/PDF 阅读器）。
+const ZOOM_MIN: f32 = 0.25;
+const ZOOM_MAX: f32 = 8.0;
+const ZOOM_STEP: f32 = 0.12;
 
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
+
+/// 把条的**窗口坐标**盒 + 屏幕 x 映射成 0..=1 的进度（钳位）。盒从未布局过
+///（bounds=0，即某窗口从未画过本条）时返回 `None`。
+fn fraction_at(bounds: &Cell<Bounds<Pixels>>, point: Point<Pixels>) -> Option<f32> {
+    let b = bounds.get();
+    let width = f32::from(b.size.width);
+    if width <= 0.0 {
+        return None;
+    }
+    let x = f32::from(point.x);
+    let origin_x = f32::from(b.origin.x);
+    Some(((x - origin_x) / width).clamp(0.0, 1.0))
+}
 
 /// 视频查看器：自包含的（无声）视频播放视图。
 pub struct VideoViewer {
@@ -97,6 +146,24 @@ pub struct VideoViewer {
     audio_err: bool,
     /// 音频健康诊断节拍（每 ~60 tick ≈1s 打一行 stats；播放无音频时不用）。
     diag_ticks: u32,
+    // --- M5 播放体验 ---
+    /// 音量（0..=1）。静音时不改此值，只让生效音量归零。
+    volume: f32,
+    /// 是否静音（生效音量 = `volume` 或 0）。
+    muted: bool,
+    /// 播放倍速（`SPEED_STEPS` 之一；音频时钟/墙钟均按此推进）。
+    speed: f32,
+    /// 显示缩放（1.0 = 适应视口；Ctrl+滚轮 ±[`ZOOM_STEP`] 档，钳位 [`ZOOM_MIN`..[`ZOOM_MAX`]）。
+    zoom: f32,
+    /// seek 进度条自身在**窗口坐标**下的盒（每次 prepaint 由 canvas 子元素刷新；
+    /// 事件回调读它做屏 x→分数。**不**用 `use_keyed_state`——那只能在渲染期调用）。
+    seek_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// 音量条盒（同 `seek_bounds`）。
+    vol_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// `#video-main` 的滚动句柄：读它拿到**布局后**的可视区尺寸（百分比高度在 flex
+    /// 子级里会退化为 auto → img 落到固有尺寸，竖屏被放大只露顶部；改按实测尺寸
+    /// 手动 contain 适配，同 ImageViewer 的姿势）。
+    viewport: ScrollHandle,
 }
 
 impl VideoViewer {
@@ -127,6 +194,13 @@ impl VideoViewer {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            volume: 1.0,
+            muted: false,
+            speed: 1.0,
+            zoom: 1.0,
+            seek_bounds: Rc::new(Cell::new(Bounds::default())),
+            vol_bounds: Rc::new(Cell::new(Bounds::default())),
+            viewport: ScrollHandle::new(),
         };
         this.start(cx);
         this
@@ -192,7 +266,9 @@ impl VideoViewer {
         let path = self.path.clone();
         let gen_arc = self.generation.clone();
         std::thread::spawn(move || {
-            let mut reader = match VideoReader::open(&path) {
+            // decode-to-display：sws 输出长边封顶 DECODE_MAX_DIM（4K 源降载），
+            // params 仍报源尺寸；帧包 w/h 即输出尺寸，上屏/内存与之一致。
+            let mut reader = match VideoReader::open_scaled(&path, DECODE_MAX_DIM) {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -223,6 +299,7 @@ impl VideoViewer {
                     sink.sample_rate()
                 );
                 self.audio = Some(sink);
+                self.apply_volume();
             }
             Err(e) => {
                 self.audio_err = true;
@@ -234,6 +311,11 @@ impl VideoViewer {
     /// 启动（或重开）音频解码线程，从 `target` 秒开始喂音。与视频线程各自的
     /// 换代号独立；seek 前先 `flush`（缓冲清空 + 位置归零），并把音频时钟基准
     /// 定为 `target`。
+    ///
+    /// **倍速**：重采样输出率 = `设备率÷speed`——设备固定以 `device_rate` 消费，
+    /// 1 源秒 = `out_rate` 个样本，播完需 `out_rate/device_rate = 1/speed` 墙秒，
+    /// 即源以 `speed` 倍播放（变速变调，resample 方案）。音频时钟
+    /// `playhead = audio_base + 设备位置 × speed`。倍速切换即带新速率重开本线程。
     fn start_audio_at(&mut self, target: f64) {
         let Some(sink) = self.audio.clone() else {
             return;
@@ -243,10 +325,10 @@ impl VideoViewer {
         let agen = self.audio_gen.fetch_add(1, Ordering::SeqCst) + 1;
         self.audio_gen.store(agen, Ordering::SeqCst);
         let path = self.path.clone();
-        let rate = sink.sample_rate();
+        let out_rate = audio_read_rate(sink.sample_rate(), self.speed);
         let ag = self.audio_gen.clone();
         std::thread::spawn(move || {
-            let mut reader = match AudioReader::open_pcm_f32(&path, rate) {
+            let mut reader = match AudioReader::open_pcm_f32(&path, out_rate) {
                 Ok(r) => r,
                 Err(_) => return,
             };
@@ -354,16 +436,17 @@ impl VideoViewer {
         }
     }
 
-    /// 推进 `playhead`：`audio_pos` 有值 → 音频时钟（`audio_base + 设备已播位置`，
-    /// A/V 对齐；seek 后基准重置、位置归零）；`None` → 墙钟（按真实经过累加）。
+    /// 推进 `playhead`：`audio_pos` 有值 → 音频时钟（`audio_base + 设备已播位置 × speed`，
+    /// A/V 对齐；seek 后基准重置、位置归零）；`None` → 墙钟（按真实经过 × speed 累加）。
     /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。
     fn advance_playhead(&mut self, audio_pos: Option<f64>) {
         if !self.playing {
             self.last_tick = None;
             return;
         }
+        let speed = f64::from(self.speed);
         match audio_pos {
-            Some(pos) => self.playhead = self.audio_base + pos,
+            Some(pos) => self.playhead = self.audio_base + pos * speed,
             None => {
                 let now = Instant::now();
                 let dt = self
@@ -371,7 +454,7 @@ impl VideoViewer {
                     .map(|t| now.duration_since(t).as_secs_f64())
                     .unwrap_or_else(|| 1.0 / 60.0);
                 self.last_tick = Some(now);
-                self.playhead += dt;
+                self.playhead += dt * speed;
             }
         }
         if self.duration > 0.0 && self.playhead >= self.duration {
@@ -383,11 +466,12 @@ impl VideoViewer {
         }
     }
 
-    /// 把 BGRA 包成 `RenderImage` 上屏。
+    /// 把 BGRA 包成 `RenderImage` 上屏。`intrinsic` 优先保留打开期从 `params` 读到的
+    /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
     fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>) {
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
         self.frame = Some(Arc::new(RenderImage::new(vec![Frame::new(buf)])));
-        self.intrinsic = Some((w as f32, h as f32));
+        self.intrinsic.get_or_insert((w as f32, h as f32));
     }
 
     /// 关闭当前媒体、打开 `folder[current]`（同文件夹切换共用）。
@@ -408,6 +492,7 @@ impl VideoViewer {
         self.last_tick = None;
         self.overflow = None;
         self.pending_seek = None;
+        self.zoom = 1.0; // 切文件：缩放复位为适应视口
         self.start(cx);
         cx.notify();
     }
@@ -449,6 +534,65 @@ impl VideoViewer {
         cx.notify();
     }
 
+    /// 进度条/音量条共用：分数 → 秒数 seek（进度条比例 × 总时长）。
+    /// 进度条把 `fraction` 夹到 [0, 1] 再换算；本方法对绝对值 cur 也做钳位。
+    fn seek_to_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let target = f64::from(fraction.clamp(0.0, 1.0)) * self.duration.max(0.0);
+        self.seek(target - self.playhead, cx);
+    }
+
+    /// 生效音量：静音 → 0，否则 `volume`（只改一条路径，供 `AudioSink::set_volume`）。
+    fn effective_volume(&self) -> f32 {
+        if self.muted {
+            0.0
+        } else {
+            self.volume
+        }
+    }
+
+    /// 把当前生效音量推给音频输出（打开/调节/静音切换后调用；无音频时空操作）。
+    fn apply_volume(&mut self) {
+        if let Some(sink) = &self.audio {
+            sink.set_volume(self.effective_volume());
+        }
+    }
+
+    /// 设置音量（钳位 0..=1，不改静音态；静音时仅记录，恢复后生效）。
+    fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.apply_volume();
+        cx.notify();
+    }
+
+    /// 静音切换：生效音量 0 ⇄ 原音量。
+    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.muted = !self.muted;
+        self.apply_volume();
+        cx.notify();
+    }
+
+    /// 设置倍速：音频时钟进程不变（`audio_base` 保持当前进度），只换重采样速率
+    /// 重启音频线程；视频帧按源秒时间轴照旧排空，A/V 同速。纯画面（无音频）只需
+    /// 更新 `speed`（墙钟按 `dt×speed`）。
+    fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
+        self.speed = speed.clamp(0.25, 4.0);
+        if self.audio.is_some() {
+            self.start_audio_at(self.playhead);
+        }
+        cx.notify();
+    }
+
+    /// 倍速档位循环步进（`dir` = +1 下一档 / -1 上一档）。
+    fn speed_step(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let n = SPEED_STEPS.len() as i64;
+        let idx = SPEED_STEPS
+            .iter()
+            .position(|&s| (s - self.speed).abs() < 1e-6)
+            .unwrap_or_else(|| SPEED_STEPS.iter().position(|&s| (s - 1.0).abs() < 1e-6).unwrap_or(1));
+        let next = (idx as i64 + i64::from(dir)).rem_euclid(n) as usize;
+        self.set_speed(SPEED_STEPS[next], cx);
+    }
+
     /// 当前视频路径（宿主 `EditorApp` 同步标签标题用）。
     #[allow(dead_code)] // M3 标签标题/状态栏接入后删除
     pub fn current_path(&self) -> Option<PathBuf> {
@@ -484,11 +628,19 @@ impl VideoViewer {
             "right" => self.seek(SEEK_STEP_SEC, cx),
             "pagedown" => self.switch_file(1, cx),
             "pageup" => self.switch_file(-1, cx),
+            "m" => self.toggle_mute(cx),
+            "-" => self.set_volume(self.volume - VOLUME_STEP, cx),
+            "=" => self.set_volume(self.volume + VOLUME_STEP, cx),
+            "[" => self.speed_step(-1, cx),
+            "]" => self.speed_step(1, cx),
             _ => return, // 其余键不拦截
         }
         cx.stop_propagation();
     }
 
+    /// 滚轮处理（视频画布自己吃掉，不参与进度）：`Ctrl+滚轮` → 缩放；`Shift+滚轮` →
+    /// 同文件夹切换；普通滚轮**不做任何事**（不再控制进度）。`stop_propagation` 保持
+    /// 「视频占满整区、滚轮不滚动任何东西」的既有语义。
     fn on_scroll_wheel(
         &mut self,
         ev: &ScrollWheelEvent,
@@ -499,23 +651,45 @@ impl VideoViewer {
             ScrollDelta::Lines(lines) => lines.y,
             ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
         };
-        if delta_y == 0.0 {
-            return;
-        }
-        if ev.modifiers.shift {
-            // Shift+滚轮：同文件夹切换（向下滚 = 下一支）
-            self.switch_file(if delta_y < 0.0 { 1 } else { -1 }, cx);
-        } else {
-            // 滚轮：seek（向上滚 = 前进）
-            let step = f64::from(delta_y.clamp(-1.0, 1.0)) * WHEEL_SEEK_SEC;
-            self.seek(step, cx);
-        }
+        self.handle_wheel(delta_y, ev.modifiers.control, ev.modifiers.shift, cx);
         cx.stop_propagation();
     }
 
-    /// 居中占位文本（加载中 / 加载失败共用）。
+    /// 滚轮分发（可单测）：`ctrl` → 缩放；`shift` → 同文件夹切换；否则空操作。
+    fn handle_wheel(
+        &mut self,
+        delta_y: f32,
+        ctrl: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if delta_y == 0.0 {
+            return;
+        }
+        if ctrl {
+            // Ctrl+滚轮：放大/缩小（向上滚 = 放大，向下 = 缩小；与图片/PDF 阅读器一致）
+            let step = delta_y.clamp(-1.0, 1.0);
+            self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
+        } else if shift {
+            // Shift+滚轮：同文件夹切换（向下滚 = 下一支）
+            self.switch_file(if delta_y < 0.0 { 1 } else { -1 }, cx);
+        }
+    }
+
+    /// 应用缩放因子并约束在 [`ZOOM_MIN`..=`ZOOM_MAX`]；变化才 notify 重绘。
+    fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - self.zoom).abs() < 1e-4 {
+            return;
+        }
+        self.zoom = new_zoom;
+        cx.notify();
+    }
+
+    /// 居中占位文本（加载中 / 加载失败共用）：铺满画布再 flex 居中。
     fn placeholder(text: &str, color: Hsla) -> gpui::AnyElement {
         div()
+            .size_full()
             .flex()
             .items_center()
             .justify_center()
@@ -533,6 +707,278 @@ impl VideoViewer {
             rgb(0xe5e7eb).into()
         }
     }
+
+    // --- M5 控制条 ---
+
+    /// 可视区尺寸：`#video-main` 布局后的真实尺寸（`track_scroll` 记录）；首帧未布局
+    /// （bounds 为 0）回退到窗口尺寸（对齐 ImageViewer `viewport_size` 的既有做法）。
+    fn viewport_size(&self, window: &Window) -> (f32, f32) {
+        let s = self.viewport.bounds().size;
+        let w = if s.width.as_f32() > 0.0 {
+            s.width.as_f32()
+        } else {
+            window.bounds().size.width.as_f32()
+        };
+        let h = if s.height.as_f32() > 0.0 {
+            s.height.as_f32()
+        } else {
+            window.bounds().size.height.as_f32()
+        };
+        (w, h)
+    }
+
+    /// 适应视口（Contain，**贴边无留白**）：取较小缩放比，一端正好贴住宽/高、另一端
+    /// 居中留白（同 ImageViewer `contain_fit`——竖屏/横屏都保持原始比例缩放）。
+    fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
+        let fit = (vw / iw).min(vh / ih).max(0.001);
+        (iw * fit, ih * fit)
+    }
+
+    /// 播放进度比例（0..=1；未知时长时 0）。
+    fn ratio(&self) -> f32 {
+        if self.duration > 0.0 {
+            (self.playhead / self.duration) as f32
+        } else {
+            0.0
+        }
+    }
+
+    /// `秒` → `m:ss`（控制条时间显示）。
+    fn fmt_time(secs: f64) -> String {
+        let s = secs.max(0.0) as u64;
+        format!("{:01}:{:02}", s / 60, s % 60)
+    }
+
+    /// 底部全屏控制条：上一支 / 播放·暂停 / 下一支 / 时间 / seek 进度条 /
+    /// 静音 + 音量条 / 倍速循环 / 清单位置。
+    fn control_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let colors = crate::ui::theme::Theme::global(cx).colors;
+        let fg: Hsla = colors.fg.into();
+        let muted: Hsla = colors.fg_muted.into();
+        let surface: Hsla = colors.surface.into();
+        let accent: Hsla = colors.accent.into();
+        let entity = cx.entity();
+
+        let seek_strip = Self::strip_element(
+            "video-seek",
+            self.seek_bounds.clone(),
+            self.ratio(),
+            muted,
+            accent,
+            true,
+            cx,
+        );
+        let vol_strip = Self::strip_element(
+            "video-vol",
+            self.vol_bounds.clone(),
+            self.effective_volume(),
+            muted,
+            fg,
+            false,
+            cx,
+        );
+
+        let time = format!(
+            "{} / {}",
+            Self::fmt_time(self.playhead),
+            Self::fmt_time(self.duration)
+        );
+        let playlist = format!(
+            "{}/{} · {:.0}%",
+            self.current + 1,
+            self.folder.len(),
+            self.zoom * 100.0
+        );
+
+        let play_icon = if self.playing {
+            IconName::Pause
+        } else {
+            IconName::Play
+        };
+        let vol_icon = if self.muted || self.effective_volume() <= 0.001 {
+            IconName::VolumeX
+        } else {
+            IconName::Volume
+        };
+
+        div()
+            .id("video-controls")
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .px_3()
+            .py_2()
+            .bg(surface)
+            .flex()
+            .items_center()
+            .gap_x(px(8.))
+            .child(control_icon_button(
+                "video-prev",
+                IconName::SkipBack,
+                fg,
+                entity.clone(),
+                |v, cx| v.switch_file(-1, cx),
+            ))
+            .child(control_icon_button(
+                "video-play",
+                play_icon,
+                accent,
+                entity.clone(),
+                |v, cx| v.toggle_play(cx),
+            ))
+            .child(control_icon_button(
+                "video-next",
+                IconName::SkipForward,
+                fg,
+                entity.clone(),
+                |v, cx| v.switch_file(1, cx),
+            ))
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(time),
+            )
+            .child(seek_strip)
+            .child(control_icon_button(
+                "video-mute",
+                vol_icon,
+                fg,
+                entity.clone(),
+                |v, cx| v.toggle_mute(cx),
+            ))
+            .child(vol_strip)
+            .child(
+                Button::new("video-speed")
+                    .ghost()
+                    .label(format!("{:.2}×", self.speed))
+                    .w(px(40.))
+                    .h(px(28.))
+                    .text_size(px(11.))
+                    .on_click(move |_, _w, app| {
+                        entity.update(app, |v, cx| v.speed_step(1, cx));
+                    }),
+            )
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(playlist),
+            )
+            .into_any_element()
+    }
+
+    /// 可交互横向条（seek 进度条 / 音量条共用）：轨道 + 填充（宽度=分数×父宽）+ 无绘制
+    /// canvas 记录**窗口坐标**盒到 `bounds`（渲染期写入；事件回调读）。`seek=true`
+    /// 时 `flex_1` 拉伸并走 seek 处理器，否则固定宽走音量处理器。
+    fn strip_element(
+        id: &'static str,
+        bounds: Rc<Cell<Bounds<Pixels>>>,
+        fraction: f32,
+        track: Hsla,
+        fill: Hsla,
+        seek: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let f = fraction.clamp(0.0, 1.0);
+        let mut el = div()
+            .id(id)
+            .h(px(16.))
+            .relative()
+            .cursor(CursorStyle::PointingHand)
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .rounded_full()
+                    .bg(track),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(DefiniteLength::Fraction(f))
+                    .rounded_full()
+                    .bg(fill),
+            )
+            .child(canvas(
+                move |b, _w, _app| {
+                    bounds.set(b);
+                },
+                |_, _, _, _| {},
+            ))
+            .when(seek, |this| this.flex_1())
+            .when(!seek, |this| this.w(px(56.)));
+        if seek {
+            el = el
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_seek_down))
+                .on_mouse_move(cx.listener(Self::on_seek_move));
+        } else {
+            el = el
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_vol_down))
+                .on_mouse_move(cx.listener(Self::on_vol_move));
+        }
+        el.into_any_element()
+    }
+
+    /// seek 点按：屏 x → 分数 → seek。
+    fn on_seek_down(
+        &mut self,
+        e: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
+            self.seek_to_fraction(f, cx);
+        }
+    }
+
+    /// seek 拖拽（左键按住才推进；移出条后松开无后续）。
+    fn on_seek_move(
+        &mut self,
+        e: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !e.dragging() {
+            return;
+        }
+        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
+            self.seek_to_fraction(f, cx);
+        }
+    }
+
+    /// 音量条点按：屏 x → 分数 → 音量。
+    fn on_vol_down(
+        &mut self,
+        e: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(f) = fraction_at(&self.vol_bounds, e.position) {
+            self.set_volume(f, cx);
+        }
+    }
+
+    /// 音量条拖拽。
+    fn on_vol_move(
+        &mut self,
+        e: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !e.dragging() {
+            return;
+        }
+        if let Some(f) = fraction_at(&self.vol_bounds, e.position) {
+            self.set_volume(f, cx);
+        }
+    }
 }
 
 impl Drop for VideoViewer {
@@ -544,65 +990,89 @@ impl Drop for VideoViewer {
 }
 
 impl Render for VideoViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let theme = crate::ui::theme::Theme::global(cx);
         let muted: Hsla = theme.colors.fg_muted.into();
-        let surface: Hsla = theme.colors.surface.into();
 
+        let (vw, vh) = self.viewport_size(window);
+        // 预留底部控制条：视频 contain 到「视口高 − 控制条高」，底部不被浮层遮挡
+        let area_h = (vh - CONTROL_BAR_H).max(1.0);
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted)
         } else {
-            match self.frame.clone() {
-                Some(render) => img(gpui::ImageSource::Render(render))
-                    .object_fit(ObjectFit::Contain)
-                    .w_full()
-                    .h_full()
-                    .into_any_element(),
-                None if self.playing || self.loading => Self::placeholder("正在打开视频…", muted),
-                None => Self::placeholder("暂停", muted),
+            match (self.frame.clone(), self.intrinsic) {
+                (Some(render), Some((iw, ih))) => {
+                    // 手动 contain 适配 × 缩放（绝对定位 + 显式像素框，**不用 100% 尺寸**）：
+                    // 竖屏/横屏都等比缩放居中，不会因 flex 子级百分比高度失效而按固有
+                    // 尺寸放大只露局部（对齐 ImageViewer 的 display_size 姿势）。放大超出
+                    // 视口时由 `#video-viewer overflow_hidden` 裁剪在画布内。
+                    let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
+                    let (dw, dh) = (dw * self.zoom, dh * self.zoom);
+                    let (ox, oy) = ((vw - dw) * 0.5, (area_h - dh) * 0.5);
+                    img(gpui::ImageSource::Render(render))
+                        .object_fit(ObjectFit::Contain)
+                        .absolute()
+                        .left(px(ox))
+                        .top(px(oy))
+                        .w(px(dw))
+                        .h(px(dh))
+                        .into_any_element()
+                }
+                (_, _) if self.playing || self.loading => {
+                    Self::placeholder("正在打开视频…", muted)
+                }
+                _ => Self::placeholder("暂停", muted),
             }
         };
-
-        // 底部信息条：播放时间 / 总时长 · 进度为同文件夹第几支
-        let info = SharedString::from(format!(
-            "{:>5.1}s / {:.1}s · {}/{}",
-            self.playhead,
-            self.duration,
-            self.current + 1,
-            self.folder.len(),
-        ));
 
         div()
             .id("video-viewer")
             .size_full()
             .relative()
+            .overflow_hidden()
             .bg(canvas)
             .child(
                 div()
                     .id("video-main")
                     .size_full()
                     .relative()
+                    .track_scroll(&self.viewport)
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .child(body),
             )
-            .child(
-                div()
-                    .id("video-info")
-                    .absolute()
-                    .left(px(12.))
-                    .bottom(px(12.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(surface)
-                    .text_size(px(12.))
-                    .text_color(muted)
-                    .child(info),
-            )
+            .child(self.control_bar(window, cx))
     }
+}
+
+/// 控制条图标按钮：ghost 变体 + 指定图标，点击回调经 `entity.update` 落到查看器方法
+///（`Button::on_click` 收 `&mut App`，故经实体中转）。
+fn control_icon_button(
+    id: &'static str,
+    icon: IconName,
+    tint: Hsla,
+    entity: gpui::Entity<VideoViewer>,
+    action: impl Fn(&mut VideoViewer, &mut Context<VideoViewer>) + 'static,
+) -> gpui::AnyElement {
+    Button::new(id)
+        .ghost()
+        .w(px(28.))
+        .h(px(28.))
+        .child(Icon::new(icon).size(px(16.)).text_color(tint))
+        .on_click(move |_, _w, app| {
+            entity.update(app, |v, cx| action(v, cx));
+        })
+        .into_any_element()
+}
+
+/// 倍速下喂给 `AudioReader` 的重采样输出率：`设备率 ÷ speed`（钳位 0.25..=4，至少 1）。
+/// 证明：1 源秒 = `out_rate` 个样本，设备每秒消费 `device_rate` 个 → 1 源秒播
+/// `out_rate/device_rate = 1/speed` 墙秒，即源以 `speed` 倍播放。
+fn audio_read_rate(device_rate: u32, speed: f32) -> u32 {
+    let speed = speed.clamp(0.25, 4.0);
+    (f64::from(device_rate) / f64::from(speed)).round().max(1.0) as u32
 }
 
 /// 扫描当前视频所在文件夹的全部视频（扩展名过滤、文件名升序），返回
@@ -666,6 +1136,13 @@ mod tests {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            volume: 1.0,
+            muted: false,
+            speed: 1.0,
+            zoom: 1.0,
+            seek_bounds: Rc::new(Cell::new(Bounds::default())),
+            vol_bounds: Rc::new(Cell::new(Bounds::default())),
+            viewport: ScrollHandle::new(),
         }
     }
 
@@ -856,5 +1333,298 @@ mod tests {
         };
         assert!(ready);
         assert!(err.is_some(), "应报告打开错误，而不是挂起");
+    }
+
+    // ---- M5：音量 / 静音 / 倍速 / 进度条 ----
+
+    /// 音量钳位到 0..=1；静音切换让生效音量 0 ⇄ 原音量（不动 `volume`）。
+    #[gpui::test]
+    async fn volume_clamps_and_mute_switches(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        ent.update(cx, |v, cx| v.set_volume(2.0, cx));
+        assert_eq!(cx.update(|app| ent.read(app).volume), 1.0, "音量钳到 1");
+        ent.update(cx, |v, cx| v.set_volume(-1.0, cx));
+        assert_eq!(cx.update(|app| ent.read(app).volume), 0.0, "音量钳到 0");
+        ent.update(cx, |v, cx| v.set_volume(0.6, cx));
+        assert_eq!(cx.update(|app| ent.read(app).effective_volume()), 0.6);
+        // 静音：生效音量 0，`volume` 保留
+        ent.update(cx, |v, cx| v.toggle_mute(cx));
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.muted, v.effective_volume(), v.volume)
+        });
+        assert!(s.0, "静音开关置位");
+        assert_eq!(s.1, 0.0, "静音时生效音量 0");
+        assert_eq!(s.2, 0.6, "volume 保留以便恢复");
+        // 恢复
+        ent.update(cx, |v, cx| v.toggle_mute(cx));
+        assert_eq!(
+            cx.update(|app| ent.read(app).effective_volume()),
+            0.6,
+            "取消静音恢复原音量"
+        );
+        cx.run_until_parked();
+    }
+
+    /// 倍速档位循环（0.5→1.0→1.5→2.0→0.5）。
+    #[gpui::test]
+    async fn speed_clamps_and_step_cycles(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 1.0, "默认 1×");
+        ent.update(cx, |v, cx| v.set_speed(99.0, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 4.0, "倍速上限钳位");
+        ent.update(cx, |v, cx| v.set_speed(-3.0, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 0.25, "倍速下限钳位");
+        ent.update(cx, |v, cx| v.set_speed(1.0, cx));
+        // 循环：1.0 → 1.5 → 2.0 → 0.5（+1），0.5 → 2.0（-1）
+        ent.update(cx, |v, cx| v.speed_step(1, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 1.5);
+        ent.update(cx, |v, cx| v.speed_step(1, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 2.0);
+        ent.update(cx, |v, cx| v.speed_step(1, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 0.5, "2.0 后循环回 0.5");
+        ent.update(cx, |v, cx| v.speed_step(-1, cx));
+        assert_eq!(cx.update(|app| ent.read(app).speed), 2.0, "0.5 回退到 2.0");
+        cx.run_until_parked();
+    }
+
+    /// 音频重采样输出率 = 设备率 ÷ 倍速（2× → 半采样率，0.5× → 双倍），并钳位。
+    #[test]
+    fn audio_read_rate_scales_with_speed() {
+        assert_eq!(audio_read_rate(48000, 1.0), 48000, "1× 原采样率");
+        assert_eq!(audio_read_rate(48000, 2.0), 24000, "2× 半采样率");
+        assert_eq!(audio_read_rate(48000, 0.5), 96000, "0.5× 双倍采样率");
+        assert_eq!(audio_read_rate(48000, 4.0), 12000, "4× 四分之一");
+        assert_eq!(audio_read_rate(48000, 99.0), 12000, "超上限按 4×");
+        assert_eq!(audio_read_rate(48000, 0.001), 192000, "超下限按 0.25×");
+        assert!(audio_read_rate(8000, 16.0) >= 1, "至少 1Hz 兜底");
+    }
+
+    /// 墙钟（无音频）推进 × 倍速：speed=2 比 speed=1 前进快一倍。
+    /// 以 100ms 为「上次 tick」基准，容忍 ≤10ms 计时游走（真实经过略大于设定值）。
+    #[gpui::test]
+    async fn wall_clock_advances_at_speed(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.duration = 100.0;
+            v
+        }));
+        ent.update(cx, |v, _| {
+            v.playhead = 0.0;
+            v.speed = 1.0;
+            v.last_tick = Some(Instant::now() - Duration::from_millis(100));
+            v.advance_playhead(None);
+        });
+        let p1 = cx.update(|app| ent.read(app).playhead);
+        assert!((p1 - 0.1).abs() < 0.01, "speed=1 100ms 前进 ~0.1s, 实得 {p1}");
+        ent.update(cx, |v, _| {
+            v.playhead = 0.0;
+            v.speed = 2.0;
+            v.last_tick = Some(Instant::now() - Duration::from_millis(100));
+            v.advance_playhead(None);
+        });
+        let p2 = cx.update(|app| ent.read(app).playhead);
+        assert!((p2 - 0.2).abs() < 0.01, "speed=2 100ms 前进 ~0.2s, 实得 {p2}");
+        assert!(p2 > p1 * 1.9, "2× 应比 1× 快近一倍");
+        cx.run_until_parked();
+    }
+
+    /// 音频时钟 × 倍速：`playhead = audio_base + 设备位置 × speed`。
+    #[gpui::test]
+    async fn audio_clock_scales_with_speed(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.audio_base = 2.0;
+            v.speed = 2.0;
+            v.duration = 100.0;
+            v
+        }));
+        ent.update(cx, |v, _| v.advance_playhead(Some(3.5)));
+        assert_eq!(
+            cx.update(|app| ent.read(app).playhead),
+            2.0 + 3.5 * 2.0,
+            "2× 下设备播 3.5s → 源进度 7s"
+        );
+        // 暂停不推进（倍速不影响暂停判定）
+        ent.update(cx, |v, _| v.playing = false);
+        ent.update(cx, |v, _| v.advance_playhead(Some(50.0)));
+        assert_eq!(cx.update(|app| ent.read(app).playhead), 9.0, "暂停不推进");
+        cx.run_until_parked();
+    }
+
+    /// 进度条点按/拖拽共用：分数 → 秒数 seek（钳位到 [0, duration]）。
+    #[gpui::test]
+    async fn seek_to_fraction_clamps(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playhead = 1.0;
+            v.duration = 2.0;
+            v.intrinsic = Some((320.0, 240.0));
+            v
+        }));
+        ent.update(cx, |v, cx| v.seek_to_fraction(0.5, cx));
+        assert!(
+            (cx.update(|app| ent.read(app).playhead) - 1.0).abs() < 1e-6,
+            "0.5×2s = 1.0s"
+        );
+        ent.update(cx, |v, cx| v.seek_to_fraction(3.0, cx));
+        assert_eq!(cx.update(|app| ent.read(app).playhead), 2.0, "超 1 夹到 duration");
+        ent.update(cx, |v, _| v.playing = false);
+        cx.run_until_parked();
+    }
+
+    /// 条的窗口坐标 → 分数映射：左缘=0、右缘=1、越界钳位、未布局返回 None。
+    #[gpui::test]
+    async fn strip_fraction_maps_window_position(cx: &mut TestAppContext) {
+        let bounds = Cell::new(Bounds::default());
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(5.), px(5.))),
+            None,
+            "未布局（bounds=0）不应出分数"
+        );
+        bounds.set(Bounds::new(
+            gpui::point(px(10.), px(0.)),
+            gpui::size(px(100.), px(16.)),
+        ));
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(10.), px(8.))),
+            Some(0.0),
+            "左缘=0"
+        );
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(35.), px(8.))),
+            Some(0.25)
+        );
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(110.), px(8.))),
+            Some(1.0),
+            "右缘=1"
+        );
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(5.), px(8.))),
+            Some(0.0),
+            "越左钳 0"
+        );
+        assert_eq!(
+            fraction_at(&bounds, gpui::point(px(200.), px(8.))),
+            Some(1.0),
+            "越右钳 1"
+        );
+        cx.update(|_| {});
+    }
+
+    /// contain 适配（手动像素框）：竖屏在宽视口里高度贴边、两侧居中留白（不再按固有
+    /// 尺寸放大只露顶部）；横屏宽度贴边、上下留白；任意比例保持原 aspect。
+    #[test]
+    fn contain_fit_preserves_aspect_and_letterboxes() {
+        // 竖屏 720×1280 @ 1200×600 视口（预留控制条后 area_h=548）
+        let (dw, dh) = VideoViewer::contain_fit(720.0, 1280.0, 1200.0, 548.0);
+        assert!((dw / dh - 720.0 / 1280.0).abs() < 1e-3, "保持竖屏比例");
+        assert!((dh - 548.0).abs() < 0.001, "高度贴边 dh={dh}");
+        assert!(dw < 1200.0, "宽度留白（两侧黑边）dw={dw}");
+        assert!(dw > 100.0, "仍有可见宽度");
+        // 横屏 1280×720 @ 同视口
+        let (dw, dh) = VideoViewer::contain_fit(1280.0, 720.0, 1200.0, 548.0);
+        assert!((dw / dh - 1280.0 / 720.0).abs() < 1e-3, "保持横屏比例");
+        assert!((dh - 548.0).abs() < 0.001, "横屏高度贴边 dh={dh}");
+        // 超宽再验证两轴都 ≤ 视口
+        let (dw, dh) = VideoViewer::contain_fit(4096.0, 2160.0, 800.0, 548.0);
+        assert!(dw <= 800.0 && dh <= 548.0 + 0.001, "两轴都不超视口");
+        // 方形视口里竖屏：高度贴边、左右留白（取较小缩放比 48…）
+        let (dw, dh) = VideoViewer::contain_fit(720.0, 1280.0, 548.0, 548.0);
+        assert!((dh - 548.0).abs() < 0.001, "方形视口竖屏高度贴边 dh={dh}");
+        assert!(dw < 548.0, "方形视口竖屏左右留白 dw={dw}");
+        assert!((dw / dh - 720.0 / 1280.0).abs() < 1e-3, "比例保持");
+    }
+
+    /// 滚轮语义：普通滚轮**不控制进度**（也不再切文件），Ctrl 放大/缩小（钳位），
+    /// Shift 同文件夹切换。
+    #[gpui::test]
+    async fn wheel_semantics_zoom_not_seek(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.folder = vec![fixture(), fixture()];
+            v.playhead = 0.7;
+            v.zoom = 1.0;
+            v
+        }));
+        // 普通滚轮：playhead / current 都不动
+        ent.update(cx, |v, cx| v.handle_wheel(1.0, false, false, cx));
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.playhead, v.current)
+        });
+        assert_eq!(s, (0.7, 0), "普通滚轮不应 seek / 切文件");
+        // Ctrl+滚轮向上 → 放大
+        ent.update(cx, |v, cx| v.handle_wheel(1.0, true, false, cx));
+        assert!((cx.update(|app| ent.read(app).zoom) - 1.12).abs() < 1e-5, "1 档放大");
+        // Ctrl+滚轮向下 → 缩小，并钳到下限
+        for _ in 0..200 {
+            ent.update(cx, |v, cx| v.handle_wheel(-1.0, true, false, cx));
+        }
+        assert_eq!(cx.update(|app| ent.read(app).zoom), ZOOM_MIN, "缩到下限");
+        for _ in 0..200 {
+            ent.update(cx, |v, cx| v.handle_wheel(1.0, true, false, cx));
+        }
+        assert_eq!(cx.update(|app| ent.read(app).zoom), ZOOM_MAX, "放大到上限");
+        // Shift+滚轮向下 → 下一支
+        ent.update(cx, |v, cx| v.handle_wheel(-1.0, false, true, cx));
+        assert_eq!(cx.update(|app| ent.read(app).current), 1, "Shift 向下切下一支");
+        cx.run_until_parked();
+    }
+
+    /// 控制条渲染 + 进度条点按回归：真窗口里 draw 一帧后，**在 seek 条中点模拟点击**，
+    /// 应把 `playhead` seek 到 ≈ 50% 时长（覆盖「canvas 记录盒 → 屏 x→分数 → seek」全链路，
+    /// 且不触 `use_keyed_state` 渲染期限制的闪退路径）。
+    #[gpui::test]
+    async fn control_bar_seek_click_seeks(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| VideoViewer::new(fixture(), cx));
+        // 定住已知时长，解耦后台解码线程时序；先画一帧让 canvas 把 seek 条盒写进 seek_bounds
+        wcx.cx.update(|app| {
+            viewer.update(app, |v, _| {
+                v.duration = 2.0;
+                v.playhead = 0.3;
+            })
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let strip = wcx.cx.read(|app| viewer.read(app).seek_bounds.get());
+        assert!(f32::from(strip.size.width) > 0.0, "seek 条应已布局出宽（>0）");
+        assert!(
+            f32::from(strip.size.width) >= 20.0,
+            "seek 条应拉伸出可见宽度，实得 {}",
+            f32::from(strip.size.width)
+        );
+        // 点击条中点 → 应 seek ≈50%
+        wcx.simulate_click(strip.center(), Default::default());
+        wcx.run_until_parked();
+        let playhead = wcx.cx.read(|app| viewer.read(app).playhead);
+        assert!(
+            (playhead - 1.0).abs() < 0.11,
+            "中点点击应 seek 到≈50%×2s=1s，实得 {playhead}"
+        );
+    }
+
+    /// 视口测量接线：draw 一帧后 `#video-main`（`track_scroll` 绑定）给出**真实布局尺寸**
+    ///（>0），供 contain 适配使用——回归「百分比高度在 flex 子级失效 → 竖屏放大只露
+    /// 顶部」的根因。
+    #[gpui::test]
+    async fn viewport_handle_reports_real_size(cx: &mut TestAppContext) {
+        let (viewer, wcx) =
+            cx.add_window_view(|_window, cx| VideoViewer::new(fixture(), cx));
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let (w, h) = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            let s = v.viewport.bounds().size;
+            (f32::from(s.width), f32::from(s.height))
+        });
+        assert!(w > 100.0, "video-main 应布局出宽 {w}");
+        assert!(h > 100.0, "video-main 应布局出高 {h}");
     }
 }

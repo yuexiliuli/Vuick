@@ -23,6 +23,18 @@ pub enum IconName {
     File,
     ChevronRight,
     ChevronDown,
+    /// 播放（视频控制条）。
+    Play,
+    /// 暂停（视频控制条）。
+    Pause,
+    /// 音量（视频控制条）。
+    Volume,
+    /// 静音（视频控制条）。
+    VolumeX,
+    /// 上一支（视频控制条）。
+    SkipBack,
+    /// 下一支（视频控制条）。
+    SkipForward,
 }
 
 impl IconName {
@@ -59,6 +71,24 @@ impl IconName {
             }
             IconName::ChevronRight => "<path d=\"m9 18 6-6-6-6\"/>",
             IconName::ChevronDown => "<path d=\"m6 9 6 6 6-6\"/>",
+            // 播放/暂停（Feather 风格实心多边形，stroke 描边统一）
+            IconName::Play => "<polygon points=\"6 3 20 12 6 21 6 3\"/>",
+            IconName::Pause => {
+                "<line x1=\"6\" y1=\"4\" x2=\"6\" y2=\"20\"/><line x1=\"18\" y1=\"4\" x2=\"18\" y2=\"20\"/>"
+            }
+            // 音量：喇叭 + 声波弧；静音把声波换成「×」
+            IconName::Volume => {
+                "<polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><path d=\"M15.54 8.46a5 5 0 0 1 0 7.07\"/><path d=\"M19.07 4.93a10 10 0 0 1 0 14.14\"/>"
+            }
+            IconName::VolumeX => {
+                "<polygon points=\"11 5 6 9 2 9 2 15 6 15 11 19 11 5\"/><line x1=\"23\" y1=\"9\" x2=\"17\" y2=\"15\"/><line x1=\"17\" y1=\"9\" x2=\"23\" y2=\"15\"/>"
+            }
+            IconName::SkipBack => {
+                "<polygon points=\"19 20 9 12 19 4 19 20\"/><line x1=\"5\" y1=\"19\" x2=\"5\" y2=\"5\"/>"
+            }
+            IconName::SkipForward => {
+                "<polygon points=\"5 4 15 12 5 20 5 4\"/><line x1=\"19\" y1=\"5\" x2=\"19\" y2=\"19\"/>"
+            }
         };
         format!("{H}{inner}{T}")
     }
@@ -180,6 +210,12 @@ mod tests {
             IconName::File,
             IconName::ChevronRight,
             IconName::ChevronDown,
+            IconName::Play,
+            IconName::Pause,
+            IconName::Volume,
+            IconName::VolumeX,
+            IconName::SkipBack,
+            IconName::SkipForward,
         ] {
             let m = name.svg_markup();
             assert!(m.contains("<svg"), "{:?} 应产出 svg 标记", name);

@@ -213,12 +213,21 @@ impl AudioReader {
 ///
 /// 构造即打开文件并定位视频流、建好 sws（BGRA 输出）。调用方负责线程：把
 /// 该类型搬进后台线程逐帧拉取，主线程只按渲染节奏消费（配合时钟丢弃迟到帧）。
+///
+/// **decode-to-display（降载）**：可用 [`Self::open_scaled`] 把 sws 输出尺寸
+/// 按最长边封顶下采样（如 4K 源只解 1080p）——解码/内存/上屏均按输出尺寸来的。
+/// 每次解码成本 ~输出像素数，4K 源封顶 1920 即省 ~4×。「≤输出尺寸」时按源码解，
+/// 行为与 [`Self::open`] 完全一致，但 `params()` 与逐帧尺寸始终反映**实际输出**。
 pub struct VideoReader {
     ictx: ffmpeg::format::context::Input,
     stream_index: usize,
     decoder: ffmpeg::codec::decoder::Video,
     scaler: ffmpeg::software::scaling::Context,
     params: VideoParams,
+    /// sws 输出宽（decode-to-display 下采样目标；`params.width` 为源宽）。
+    out_width: u32,
+    /// sws 输出高（见 `out_width`）。
+    out_height: u32,
     /// 帧 pts 使用的 time_base（秒 = pts × num/den）。
     time_base: ffmpeg::Rational,
     /// 是否已进入 EOF drain 模式（send_eof 已发）。
@@ -226,8 +235,15 @@ pub struct VideoReader {
 }
 
 impl VideoReader {
-    /// 打开媒体并定位视频流（失败返回带原因的 [Error] 链）。
+    /// 打开媒体并定位视频流（失败返回带原因的 [Error] 链）；按源码全尺寸解码。
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_scaled(path, u32::MAX)
+    }
+
+    /// 同 [`Self::open`]，但 sws 输出按「长边 ≤ `max_dim`」封顶下采样（保持宽高比、
+    /// 输出至少 1×1；`max_dim=u32::MAX` 即全尺寸）。`params()` 仍报告源宽高——上层
+    /// 用它保持原始宽高比做显示适配；逐帧输出尺寸见 [`DecodedFrame`] 的 w/h。
+    pub fn open_scaled(path: &Path, max_dim: u32) -> Result<Self> {
         ffmpeg::init().context("ffmpeg init 失败")?;
 
         let ictx = ffmpeg::format::input(path)
@@ -260,13 +276,14 @@ impl VideoReader {
         let (width, height) = (decoder.width(), decoder.height());
         let frame_rate = decoder.frame_rate();
         let has_audio = ictx.streams().best(Type::Audio).is_some();
+        let (out_width, out_height) = scaled_dims(width, height, max_dim);
         let scaler = ffmpeg::software::scaling::Context::get(
             decoder.format(),
             width,
             height,
             ffmpeg::format::Pixel::BGRA,
-            width,
-            height,
+            out_width,
+            out_height,
             ffmpeg::software::scaling::Flags::BILINEAR,
         )
         .context("初始化 sws 缩放失败")?;
@@ -283,6 +300,8 @@ impl VideoReader {
                 frame_rate: frame_rate.map(|r| (r.numerator() as u32, r.denominator() as u32)),
                 has_audio,
             },
+            out_width,
+            out_height,
             time_base,
             drained: false,
         })
@@ -350,7 +369,8 @@ impl VideoReader {
         None
     }
 
-    /// 把解码帧转 BGRA；无 pts 的帧跳过（返回 `None`）。
+    /// 把解码帧转 BGRA；无 pts 的帧跳过（返回 `None`）。尺寸用 sws 输出
+    /// （decode-to-display 下采样目标），与 `out_width/out_height` 一致。
     fn convert_bgra(&mut self, f: &ffmpeg::frame::Video) -> Result<Option<DecodedFrame>> {
         let Some(pts) = f.pts() else {
             return Ok(None);
@@ -361,11 +381,28 @@ impl VideoReader {
             / f64::from(self.time_base.denominator());
         Ok(Some((
             secs,
-            self.params.width,
-            self.params.height,
+            self.out_width,
+            self.out_height,
             bgra.data(0).to_vec(),
         )))
     }
+}
+
+/// 按「长边 ≤ `max_dim`」下采样保持宽高比：源码已在界内则原样返回；
+/// `max_dim=0` 视为不限制。输出至少 1×1（避免 sws 空输出）。
+fn scaled_dims(width: u32, height: u32, max_dim: u32) -> (u32, u32) {
+    if max_dim == 0 {
+        return (width, height);
+    }
+    let longest = width.max(height);
+    if longest <= max_dim {
+        return (width, height);
+    }
+    let scale = f64::from(max_dim) / f64::from(longest);
+    (
+        (f64::from(width) * scale).round().max(1.0) as u32,
+        (f64::from(height) * scale).round().max(1.0) as u32,
+    )
 }
 
 #[cfg(test)]
@@ -385,6 +422,39 @@ mod tests {
         assert_eq!((p.width, p.height), (320, 240));
         assert!((1.9..=2.5).contains(&p.duration), "duration={}", p.duration);
         assert!(p.frame_rate.is_some(), "应识别出帧率");
+    }
+
+    /// decode-to-display 下采样：长边封顶后保持宽高比（320×240 → 160×120），
+    /// 逐帧输出与内存按输出尺寸走；`params()` 仍报源宽高供显示适配。
+    #[test]
+    fn open_scaled_caps_longest_side_and_keeps_source_params() {
+        let mut r = VideoReader::open_scaled(&fixture(), 160).unwrap();
+        let p = r.params();
+        assert_eq!((p.width, p.height), (320, 240), "params 保持源尺寸");
+        let (pts, w, h, bgra) = r.next_frame_bgra().unwrap().expect("缩放后应出帧");
+        assert!(pts >= 0.0);
+        assert_eq!((w, h), (160, 120), "输出按长边封顶下采样");
+        assert_eq!(bgra.len(), (160 * 120 * 4) as usize, "内存按输出尺寸分配");
+    }
+
+    /// 封顶 ≥ 源长边时与全尺寸一致（320×240 原样）。
+    #[test]
+    fn open_scaled_with_huge_cap_is_identity() {
+        let r = VideoReader::open_scaled(&fixture(), 4096).unwrap();
+        assert_eq!(r.params(), VideoReader::open(&fixture()).unwrap().params());
+        let mut r = VideoReader::open_scaled(&fixture(), 4096).unwrap();
+        let (w, h) = { let f = r.next_frame_bgra().unwrap().unwrap(); (f.1, f.2) };
+        assert_eq!((w, h), (320, 240), "封顶超源应按源尺寸输出");
+    }
+
+    #[test]
+    fn scaled_dims_preserves_aspect_and_floor() {
+        assert_eq!(scaled_dims(320, 240, 0), (320, 240), "max_dim=0 不限制");
+        assert_eq!(scaled_dims(320, 240, u32::MAX), (320, 240));
+        assert_eq!(scaled_dims(320, 240, 160), (160, 120), "等比减半");
+        assert_eq!(scaled_dims(200, 100, 50), (50, 25), "等比 1/4");
+        assert_eq!(scaled_dims(3, 2, 6), (3, 2), "界内原样");
+        assert!((scaled_dims(1, 1, 0)).0 >= 1, "输出至少 1×1");
     }
 
     #[test]
