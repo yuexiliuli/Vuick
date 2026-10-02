@@ -27,6 +27,111 @@ use ffmpeg::media::Type;
 /// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
 static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 
+// ---------------- 硬件解码（D3D11VA / DXVA2）----------------
+
+/// FFmpeg `AVBufferRef` 所有权包装：Drop 时 `av_buffer_unref` 释放引用。
+struct AvBuf(*mut ffmpeg::ffi::AVBufferRef);
+
+impl Drop for AvBuf {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffmpeg::ffi::av_buffer_unref(&mut self.0) }
+        }
+    }
+}
+
+/// 已激活的硬件解码状态：持有一份 GPU 设备上下文引用，保证设备在 decoder 生命期内存活。
+///
+/// 解码器 avctx 在 open 时另持一份引用（`hw_device_ctx`），本引用只是兜底保活；
+/// `VideoReader::Drop` 先关解码器（`avcodec_free_context` 释放 avctx 的引用），
+/// 字段自动 drop 时再 `av_buffer_unref` 本引用，顺序安全。
+struct HardwareDecode {
+    /// 仅作 RAII 保活（Drop 时 `av_buffer_unref`）；「读取」即持有引用的副作用。
+    #[allow(dead_code)]
+    device: AvBuf,
+}
+
+/// 硬件解码是否启用（**默认关**，软件为本机实测更优基线）：`VFF_VIDEO_HW=1|on|true` 显式开启。
+/// 硬件路径（D3D11VA/DXVA2）把解码搬上 GPU，但 GPUI 需 CPU 像素 → 每帧整帧回读，
+/// 在强 CPU 上收益被回读抵销（实测反略高）；弱 CPU / 4K / 高码率机器可显式开启。
+fn hw_enabled() -> bool {
+    matches!(
+        std::env::var("VFF_VIDEO_HW"),
+        Ok(v)
+            if v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("true")
+    )
+}
+
+/// 尝试用硬件打开视频解码器：依次尝试 D3D11VA → DXVA2，任一环节失败（设备不可用 / 编解码器
+/// 不支持 / 无帧池）返回 `None`，由调用方回落软件路径或报错。`force` 为测试/诊断用——
+/// 绕过默认开关强制试硬件（保证硬件回归测试不被默认关策略屏蔽）。
+///
+/// `ffmpeg-next` 9.0 已移除 `hw_decode` 安全封装，这里直接操作 `ffmpeg::ffi` 原始符号，
+/// 只在 open 期做「设备创建 + 挂接」；逐帧仍走受管 `scaler`，输出路径与软件版一致。
+fn try_open_hw_decoder(
+    parameters: &ffmpeg::codec::Parameters,
+    force: bool,
+) -> Option<(ffmpeg::codec::decoder::Video, HardwareDecode)> {
+    use ffmpeg::ffi::{
+        AVBufferRef, AVHWDeviceType, av_buffer_ref, av_hwdevice_ctx_create,
+    };
+    if !force && !hw_enabled() {
+        return None;
+    }
+    const HW_TYPES: [AVHWDeviceType; 2] = [
+        AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+        AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2,
+    ];
+    for hw_type in HW_TYPES {
+        let mut device_ptr: *mut AVBufferRef = std::ptr::null_mut();
+        let rc = unsafe {
+            av_hwdevice_ctx_create(
+                &mut device_ptr,
+                hw_type,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc < 0 || device_ptr.is_null() {
+            continue;
+        }
+        let device = AvBuf(device_ptr);
+        let context = match ffmpeg::codec::context::Context::from_parameters(parameters.clone())
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut decoder = context.decoder();
+        unsafe {
+            (*decoder.as_mut_ptr()).hw_device_ctx = av_buffer_ref(device.0);
+        }
+        if unsafe { (*decoder.as_ptr()).hw_device_ctx }.is_null() {
+            continue;
+        }
+        let opened = match decoder.video() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        return Some((opened, HardwareDecode { device }));
+    }
+    None
+}
+
+/// 解码帧是否为硬件（opaque）帧：按像素格式描述符的 `AV_PIX_FMT_FLAG_HWACCEL` 判定，
+/// 不依赖具体像素格式名（D3D11 / DXVA2_VLD / ... 一概覆盖）。
+fn is_hw_frame(frame: &ffmpeg::frame::Video) -> bool {
+    unsafe {
+        // AVFrame.format 在绑定里展开成底层 i32；repr(i32) 枚举按位重建判别值再查描述符。
+        let fmt: ffmpeg::ffi::AVPixelFormat =
+            std::mem::transmute((*frame.as_ptr()).format);
+        let desc = ffmpeg::ffi::av_pix_fmt_desc_get(fmt);
+        !desc.is_null() && (*(desc)).flags & (ffmpeg::ffi::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0
+    }
+}
+
 /// 视频顶层参数（打开即得，无需逐帧解码）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VideoParams {
@@ -249,7 +354,9 @@ pub struct VideoReader {
     ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
     stream_index: usize,
     decoder: std::mem::ManuallyDrop<ffmpeg::codec::decoder::Video>,
-    scaler: std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>,
+    /// sws 缩放器（sws 输入 → BGRA 输出）；首帧后按**实际帧格式**惰性创建：
+    /// 硬件路径回读帧的软件格式（如 NV12/P010）到首个解码帧才确定，软件路径用解码器输出格式。
+    scaler: Option<std::mem::ManuallyDrop<ffmpeg::software::scaling::Context>>,
     params: VideoParams,
     /// sws 输出宽（decode-to-display 下采样目标；`params.width` 为源宽）。
     out_width: u32,
@@ -259,15 +366,20 @@ pub struct VideoReader {
     time_base: ffmpeg::Rational,
     /// 是否已进入 EOF drain 模式（send_eof 已发）。
     drained: bool,
+    /// 硬件解码状态（`None` = 软件路径）。
+    hw: Option<HardwareDecode>,
 }
 
 /// 释放持 [`FFMPEG_LOCK`]（见 [`AudioReader`] 同款说明）：`avformat_close_input` 与
 /// 另一线程同时 `avformat_open_input` 同文件会 deadlock，故 free 也过同一闸。
+/// 手动 drop `scaler/decoder/ictx`；`hw` 字段随后自动 drop（设备引用在解码器释放后才 `unref`）。
 impl Drop for VideoReader {
     fn drop(&mut self) {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.scaler);
+            if let Some(scaler) = &mut self.scaler {
+                std::mem::ManuallyDrop::drop(scaler);
+            }
             std::mem::ManuallyDrop::drop(&mut self.decoder);
             std::mem::ManuallyDrop::drop(&mut self.ictx);
         }
@@ -284,7 +396,20 @@ impl VideoReader {
     /// 同 [`Self::open`]，但 sws 输出按「长边 ≤ `max_dim`」封顶下采样（保持宽高比、
     /// 输出至少 1×1；`max_dim=u32::MAX` 即全尺寸）。`params()` 仍报告源宽高——上层
     /// 用它保持原始宽高比做显示适配；逐帧输出尺寸见 [`DecodedFrame`] 的 w/h。
+    ///
+    /// 默认软件解码（本机实测更优）；设 `VFF_VIDEO_HW=1|on|true` 走硬件
+    /// （D3D11VA → DXVA2，见 [`try_open_hw_decoder`]），硬件不可用自动回退软件。
     pub fn open_scaled(path: &Path, max_dim: u32) -> Result<Self> {
+        Self::open_scaled_impl(path, max_dim, false)
+    }
+
+    /// 仅硬件解码打开（无软件回退）——测试/诊断用；硬件不可用即 `Err`。
+    #[cfg(test)]
+    fn open_hw_only(path: &Path, max_dim: u32) -> Result<Self> {
+        Self::open_scaled_impl(path, max_dim, true)
+    }
+
+    fn open_scaled_impl(path: &Path, max_dim: u32, hw_required: bool) -> Result<Self> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
 
@@ -304,37 +429,37 @@ impl VideoReader {
         let duration = if container_us > 0 {
             container_us as f64 / 1e6
         } else if stream_dur > 0 {
-            stream_dur as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
+            stream_dur as f64
+                * f64::from(time_base.numerator())
+                / f64::from(time_base.denominator())
         } else {
             0.0
         };
 
-        let decoder = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
-            .context("解析视频流参数失败")?
-            .decoder()
-            .video()
-            .context("该流不是视频")?;
+        // 解码器：默认软件（本机实测更优），`hw_required` 时强制硬件（测试路径，失败直接 Err）。
+        let (decoder, hw) = match try_open_hw_decoder(&params_for_decoder, hw_required) {
+            Some((video, hw)) => (video, Some(hw)),
+            None if hw_required => return Err(anyhow!("硬件解码不可用")),
+            None => (
+                ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
+                    .context("解析视频流参数失败")?
+                    .decoder()
+                    .video()
+                    .context("该流不是视频")?,
+                None,
+            ),
+        };
 
         let (width, height) = (decoder.width(), decoder.height());
         let frame_rate = decoder.frame_rate();
         let has_audio = ictx.streams().best(Type::Audio).is_some();
         let (out_width, out_height) = scaled_dims(width, height, max_dim);
-        let scaler = ffmpeg::software::scaling::Context::get(
-            decoder.format(),
-            width,
-            height,
-            ffmpeg::format::Pixel::BGRA,
-            out_width,
-            out_height,
-            ffmpeg::software::scaling::Flags::BILINEAR,
-        )
-        .context("初始化 sws 缩放失败")?;
 
         Ok(Self {
             ictx: std::mem::ManuallyDrop::new(ictx),
             stream_index,
             decoder: std::mem::ManuallyDrop::new(decoder),
-            scaler: std::mem::ManuallyDrop::new(scaler),
+            scaler: None,
             params: VideoParams {
                 width,
                 height,
@@ -346,6 +471,7 @@ impl VideoReader {
             out_height,
             time_base,
             drained: false,
+            hw,
         })
     }
 
@@ -413,14 +539,61 @@ impl VideoReader {
         None
     }
 
+    /// 取（或惰性创建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =
+    /// `out_width×out_height` BGRA。首个解码帧调用时建一次，之后复用。
+    fn scaler_for(
+        &mut self,
+        src_format: ffmpeg::format::Pixel,
+        src_w: u32,
+        src_h: u32,
+    ) -> Result<&mut ffmpeg::software::scaling::Context> {
+        if self.scaler.is_none() {
+            let scaler = ffmpeg::software::scaling::Context::get(
+                src_format,
+                src_w,
+                src_h,
+                ffmpeg::format::Pixel::BGRA,
+                self.out_width,
+                self.out_height,
+                ffmpeg::software::scaling::Flags::BILINEAR,
+            )
+            .context("初始化 sws 缩放失败")?;
+            self.scaler = Some(std::mem::ManuallyDrop::new(scaler));
+        }
+        Ok(self.scaler.as_mut().expect("scaler 已就绪"))
+    }
+
     /// 把解码帧转 BGRA；无 pts 的帧跳过（返回 `None`）。尺寸用 sws 输出
     /// （decode-to-display 下采样目标），与 `out_width/out_height` 一致。
+    ///
+    /// 硬件路径：解码帧为 opaque GPU 帧 → `av_hwframe_transfer_data` 回读到系统内存
+    /// （NV12/P010 等软件格式）→ 按该真实格式惰性建 sws → 转 BGRA。
+    /// 软件路径：直接按解码器输出格式建 sws（首个软件帧触发）。
     fn convert_bgra(&mut self, f: &ffmpeg::frame::Video) -> Result<Option<DecodedFrame>> {
         let Some(pts) = f.pts() else {
             return Ok(None);
         };
         let mut bgra = ffmpeg::frame::Video::empty();
-        self.scaler.run(f, &mut bgra).context("sws 转换失败")?;
+        if self.hw.is_some() && is_hw_frame(f) {
+            // 回读：dst 为空帧即可（transfer 内部按 sw_format 分配数据；Drop 时 av_frame_free）。
+            let mut sw = ffmpeg::frame::Video::empty();
+            let rc =
+                unsafe { ffmpeg::ffi::av_hwframe_transfer_data(sw.as_mut_ptr(), f.as_ptr(), 0) };
+            if rc < 0 {
+                return Err(anyhow!("硬件帧回读失败 (err={rc})"));
+            }
+            let fmt = sw.format();
+            let (w, h) = (sw.width(), sw.height());
+            self.scaler_for(fmt, w, h)?
+                .run(&sw, &mut bgra)
+                .context("sws 转换失败")?;
+        } else {
+            let fmt = f.format();
+            let (w, h) = (f.width(), f.height());
+            self.scaler_for(fmt, w, h)?
+                .run(f, &mut bgra)
+                .context("sws 转换失败")?;
+        }
         let secs = pts as f64 * f64::from(self.time_base.numerator())
             / f64::from(self.time_base.denominator());
         Ok(Some((
@@ -606,5 +779,93 @@ mod tests {
     fn audio_rejects_missing() {
         let bad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such.mp4");
         assert!(AudioReader::open_pcm_f32(&bad, 48000).is_err());
+    }
+
+    /// 双路径（硬件优先 / 软件回退）都必须产出尺寸正确、alpha 不透明的 BGRA 帧。
+    #[test]
+    fn hw_or_sw_path_both_output_valid_bgra() {
+        let mut r = VideoReader::open_scaled(&fixture(), 160).unwrap();
+        eprintln!(
+            "video-ffmpeg 解码路径: {}",
+            if r.hw.is_some() { "硬件" } else { "软件回退" }
+        );
+        let (pts, w, h, bgra) = r.next_frame_bgra().unwrap().expect("帧应可解码");
+        assert!(pts >= 0.0);
+        assert_eq!((w, h), (160, 120));
+        assert_eq!(bgra.len(), 160 * 120 * 4);
+        assert!(
+            bgra.as_chunks::<4>().0.iter().all(|px| px[3] == 255),
+            "sws 输出应全不透明"
+        );
+    }
+
+    /// 仅硬件路径（无软件回退）：本机支持硬件解码时逐帧解码 + seek 全通过；
+    /// 不支持（无 GPU / 驱动 / 编解码器）则打印跳过，避免 CI 误红。
+    #[test]
+    fn hw_only_path_decodes_when_available() {
+        match VideoReader::open_hw_only(&fixture(), u32::MAX) {
+            Ok(mut r) => {
+                assert!(r.hw.is_some(), "open_hw_only 必须启用硬件");
+                for _ in 0..16 {
+                    let (pts, w, h, bgra) =
+                        r.next_frame_bgra().unwrap().expect("硬件帧应可解码");
+                    assert!(pts >= 0.0);
+                    assert_eq!((w, h), (320, 240), "硬件路径输出应按源尺寸");
+                    assert_eq!(bgra.len(), 320 * 240 * 4);
+                }
+                r.seek(1.0).unwrap();
+                assert!(
+                    r.next_frame_bgra().unwrap().is_some(),
+                    "硬件路径 seek 后应出帧"
+                );
+            }
+            Err(e) => eprintln!("本机硬件解码不可用，跳过: {e:#}"),
+        }
+    }
+
+    /// 解码吞吐测量（非回归，默认忽略手动跑）：`VFF_BENCH_VIDEO` 指定文件
+    /// （缺省 `%TEMP%\gpui-cpu\bench-1080p30.mp4`，再缺回落仓库 fixture），
+    /// `VFF_BENCH_FRAMES` 控制解码帧数（默认 1200，便于外部按进程 CPU 采样忙核）。
+    /// 硬件/软件对照：默认（`VFF_VIDEO_HW` 未关）= 硬件，`VFF_VIDEO_HW=0` = 软件。
+    #[test]
+    #[ignore = "手动测量用"]
+    fn bench_decode_throughput() {
+        let candidate = std::env::var("VFF_BENCH_VIDEO")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                let p = std::path::PathBuf::from(std::env::var("TEMP").unwrap_or_default())
+                    .join("gpui-cpu")
+                    .join("bench-1080p30.mp4");
+                p.is_file().then_some(p)
+            })
+            .unwrap_or_else(fixture);
+        let frames: u32 = std::env::var("VFF_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200);
+        let mut r = VideoReader::open_scaled(&candidate, 1920).unwrap();
+        eprintln!(
+            "bench 路径={} 尺寸={}x{} 硬件={} 帧数={frames}",
+            candidate.display(),
+            r.params().width,
+            r.params().height,
+            r.hw.is_some()
+        );
+        let t0 = std::time::Instant::now();
+        let mut decoded = 0u32;
+        while decoded < frames {
+            if r.next_frame_bgra().unwrap().is_none() {
+                r.seek(0.0).unwrap();
+                continue;
+            }
+            decoded += 1;
+        }
+        let el = t0.elapsed();
+        eprintln!(
+            "解码 {frames} 帧: {el:?} ({:.2} ms/帧, {:.0} fps)",
+            el.as_secs_f64() * 1000.0 / frames as f64,
+            frames as f64 / el.as_secs_f64()
+        );
     }
 }
