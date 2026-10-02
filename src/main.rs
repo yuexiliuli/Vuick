@@ -28,6 +28,9 @@ mod syntax;
 mod toc;
 mod ui;
 
+#[cfg(feature = "video")]
+mod video;
+
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 
 use crate::actions::*;

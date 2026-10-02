@@ -9,10 +9,15 @@ pub(crate) const LIVE_BODY_PAD_Y: f32 = 8.0;
 
 impl EditorApp {
     /// 当前选项卡的预览视图：图片选项卡用 `ImageViewer`（自处理滚轮），
-    /// PDF 选项卡用 `PdfViewer`（整页原样），其余用 `MarkdownPreview`。
+    /// 视频选项卡用 `VideoViewer`（M1 首帧静态阅读），PDF 选项卡用 `PdfViewer`
+    /// （整页原样），其余用 `MarkdownPreview`。
     fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
         if let Some(img) = &tab.image_viewer {
             return img.clone().into_any_element();
+        }
+        #[cfg(feature = "video")]
+        if let Some(vid) = &tab.video_viewer {
+            return vid.clone().into_any_element();
         }
         match &tab.pdf_preview {
             Some(pdf) => pdf.clone().into_any_element(),
@@ -423,9 +428,13 @@ impl EditorApp {
             .relative()
             .bg(self.panel_bg())
             .child(Self::preview_element(tab));
-        // 图片查看器：自处理滚轮（单滚切换 / Ctrl+滚轮缩放），不再挂全局 zoom_overlay
-        //（否则 Ctrl+滚轮会被全局字号缩放抢走，图片缩放失效）。
-        if tab.image_viewer.is_none() {
+        // 图片/视频查看器：自处理滚轮（图片：单滚切换 / Ctrl+滚轮缩放），不再挂全局
+        // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）。
+        #[cfg(feature = "video")]
+        let media_self_wheel = tab.image_viewer.is_none() && tab.video_viewer.is_none();
+        #[cfg(not(feature = "video"))]
+        let media_self_wheel = tab.image_viewer.is_none();
+        if media_self_wheel {
             el = el.child(Self::zoom_overlay(cx));
         }
         el.into_any_element()

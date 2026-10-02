@@ -694,6 +694,56 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 把一个新视频查看器载入指定选项卡：编辑区置空、全屏只读预览。
+    /// 首帧解码由 [`crate::video::VideoViewer`] 自己在后台完成，窗口不阻塞。
+    #[cfg(feature = "video")]
+    pub(super) fn load_video(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        // 阅读画布用灰色系（非白面板），让视频与画布形成分隔（同 PDF / 图片阅读器）
+        let canvas_bg = self.window_bg();
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        // 编辑区置为提示文本（视频只读，不参与文本编辑）
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text("");
+            ed.set_language(Some("markdown"));
+        });
+        tab.md_preview.update(cx, |view, cx| {
+            view.set_background(canvas_bg);
+            view.set_source("", cx);
+        });
+        // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
+        let viewer = cx.new(|cx| crate::video::VideoViewer::new(p.to_path_buf(), cx));
+        viewer.update(cx, |view, _| view.set_background(canvas_bg));
+        // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
+        {
+            let fh = viewer.read(cx).focus_handle();
+            window.focus(&fh, cx);
+        }
+        tab.video_viewer = Some(viewer);
+        tab.file_path = Some(p.to_path_buf());
+        tab.content = SharedString::default();
+        tab.line_count = 0;
+        tab.char_count = 0;
+        tab.cursor_row = 0;
+        tab.cursor_col = 0;
+        tab.dirty = false;
+        tab.preview_on = true;
+        tab.preview_fullscreen = true;
+        // 视频正文只存在于查看器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
+        tab.readonly_preview = true;
+        self.status = SharedString::from(format!("已打开视频：{}", p.display()));
+        self.status_ok = true;
+        cx.notify();
+    }
+
     /// 打开 PDF：立即建标签页并创建自包含的 PdfViewer（在后台加载解析），
     /// 窗口保持响应；解析完成/失败由阅读器内部呈现。
     fn open_pdf_async(
@@ -734,6 +784,11 @@ impl EditorApp {
         }
         if Self::is_image_path(&p) {
             self.load_image(idx, &p, window, cx);
+            return;
+        }
+        #[cfg(feature = "video")]
+        if Self::is_video_path(&p) {
+            self.load_video(idx, &p, window, cx);
             return;
         }
         // 大文件（按字节阈值判断）：后台打开（复用已有选项卡），
@@ -786,6 +841,15 @@ impl EditorApp {
             // 先建标签页、立即返回：解码放到后台（ImageViewer 自包含）
             let idx = self.make_tab(window, cx);
             self.load_image(idx, &p, window, cx);
+            let focus = self.focus_handle(cx);
+            window.focus(&focus, cx);
+            return;
+        }
+        #[cfg(feature = "video")]
+        if Self::is_video_path(&p) {
+            // 先建标签页、立即返回：解码放到后台（VideoViewer 自包含）
+            let idx = self.make_tab(window, cx);
+            self.load_video(idx, &p, window, cx);
             let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
             return;

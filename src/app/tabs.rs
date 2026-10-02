@@ -36,6 +36,8 @@ impl EditorApp {
             md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             pdf_preview: None,
             image_viewer: None,
+            #[cfg(feature = "video")]
+            video_viewer: None,
             preview_on: false,
             preview_fullscreen: false,
             readonly_preview: false,

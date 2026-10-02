@@ -127,6 +127,9 @@ struct EditorTab {
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
     /// 图片查看器（打开图片时创建）：None = 非图片选项卡。
     image_viewer: Option<gpui::Entity<crate::image::ImageViewer>>,
+    /// 视频查看器（打开视频时创建，M1 首帧静态阅读）：None = 非视频选项卡。
+    #[cfg(feature = "video")]
+    video_viewer: Option<gpui::Entity<crate::video::VideoViewer>>,
     /// 是否开启 Markdown 预览
     preview_on: bool,
     /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
@@ -181,6 +184,9 @@ pub(crate) struct DetachedTab {
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
     /// 图片查看器实体（随选项卡跨窗口搬迁）。
     image_viewer: Option<gpui::Entity<crate::image::ImageViewer>>,
+    /// 视频查看器实体（随选项卡跨窗口搬迁）。
+    #[cfg(feature = "video")]
+    video_viewer: Option<gpui::Entity<crate::video::VideoViewer>>,
     /// A2：右栏 WyEditor 预览实体与宿主滚动句柄随选项卡搬迁（与 `md_preview` 同；
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
@@ -689,6 +695,8 @@ impl EditorApp {
             md_preview: tab.md_preview,
             pdf_preview: tab.pdf_preview,
             image_viewer: tab.image_viewer,
+            #[cfg(feature = "video")]
+            video_viewer: tab.video_viewer,
             md_wy: tab.md_wy,
             md_wy_vscroll: tab.md_wy_vscroll,
             file_path: tab.file_path,
@@ -737,6 +745,8 @@ impl EditorApp {
             md_preview: payload.md_preview,
             pdf_preview: payload.pdf_preview,
             image_viewer: payload.image_viewer,
+            #[cfg(feature = "video")]
+            video_viewer: payload.video_viewer,
             md_wy: payload.md_wy,
             md_wy_vscroll: payload.md_wy_vscroll,
             preview_on: payload.preview_on,
@@ -778,6 +788,10 @@ impl EditorApp {
         }
         if let Some(img) = self.tabs[idx].image_viewer.clone() {
             img.update(cx, |view, _| view.set_background(canvas_bg));
+        }
+        #[cfg(feature = "video")]
+        if let Some(vid) = self.tabs[idx].video_viewer.clone() {
+            vid.update(cx, |view, _| view.set_background(canvas_bg));
         }
         self.pdf_search = None; // 重新推送检索查询
         if let Some(window) = window.as_mut() {
@@ -1332,6 +1346,12 @@ impl EditorApp {
     /// 是否图片文件（按扩展名识别；清单见 [`crate::image::IMAGE_EXTENSIONS`]）。
     fn is_image_path(p: &Path) -> bool {
         crate::image::is_image_extension(p)
+    }
+
+    /// 是否视频文件（按扩展名识别；清单见 [`crate::video::VIDEO_EXTENSIONS`]）。
+    #[cfg(feature = "video")]
+    fn is_video_path(p: &Path) -> bool {
+        crate::video::is_video_extension(p)
     }
 
     /// 按扩展名推断 gpui-component 语法高亮的语言名（未知扩展名回退 "text"）。
