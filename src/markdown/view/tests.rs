@@ -208,6 +208,70 @@ fn small_doc_scrollbar_follows_list_summary_when_taller_than_estimate(
     handle.end_drag();
 }
 
+/// 回归：「小文档预览拖滚动条不跟鼠标」——thumb 与拖拽目标的映射必须**逐 px 线性**，
+/// 不得读 ListState 实测树（拖拽中标签逐帧重测量 → 同一逻辑位置映射的 px 逐帧漂移
+/// → thumb 从抓点滑开）。现在 thumb 轴 = 共享 `desired`（px），`set_offset` 写 desired，
+/// `offset()` 读 desired ⇒ 无论树如何变化始终 1:1。
+#[gpui::test]
+fn small_doc_scrollbar_thumb_tracks_drag_linearly(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    // 混合行型（真实测量高度 ≠ 统一提示），多段 → 有量程。
+    let mut doc = String::new();
+    for i in 0..80 {
+        doc.push_str(&format!(
+            "## 第{i}节\n\n正文段落{i}，内容内容内容。\n- 列表{i}\n\n`code`\n\n"
+        ));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_epub(true, Default::default(), cx);
+            md.set_source(&doc, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let (n, hint, ls, view) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        (m.item_count(), m.est_hint, m.test_list_state(), m.list_state.viewport_bounds())
+    });
+    assert!(n > 0 && hint > 0.0, "小文档应就绪（n={n} hint={hint:.1}）");
+    let handle = PreviewVerticalScrollHandle {
+        list: ls.clone(),
+        content_width: 300.0,
+        content_height: n as f32 * hint,
+        est_hint: hint,
+        n,
+        windowed: false,
+        desired: std::rc::Rc::new(std::cell::Cell::new(0.)),
+    };
+    handle.start_drag(); // 冻结 → 拖拽全程 content_size 稳定
+    let vh = view.size.height.as_f32();
+    let content_h = handle.content_size().height.as_f32();
+    let max_scroll = (content_h - vh).max(0.);
+    assert!(max_scroll > 1.0, "内容应有可拖量程（content_h={content_h:.0} vh={vh:.0}）");
+    for pct in [0.1, 0.25, 0.5, 0.75, 1.0] {
+        let target = max_scroll * pct;
+        handle.set_offset(point(px(0.), px(-target)));
+        let off = -handle.offset().y.as_f32();
+        assert!(
+            (off - target).abs() < 0.001,
+            "thumb 与拖拽目标应逐 px 一致（pct={pct}：off={off:.2} target={target:.2}）"
+        );
+    }
+    handle.end_drag();
+}
+
 /// 回归（统一口径）：小文档 `total_h()` 跟随 ListState 实测（而非估算），且页码用
 /// 「底部到达页」语义——真机实测 > 估算时，拖到底必须「第 N/N 页」，滚轮到底也与
 /// 滚动条同一「底」。旧实现：total_h 用 `行数×平均高` → 拖到底页码停在 < 总页数。
@@ -1715,7 +1779,380 @@ fn bench_list_uniform_height_cost(cx: &mut TestAppContext) {
     let _ = cx;
 }
 
-/// 回归：超宽表格在换行模式（默认）下应自带横向滚动条，而不是被视口裁剪遮挡。
+/// 基准（--ignored）：预览纵向滚动条**拖拽每步成本**（真机「预览拖滚动条明显滞后，
+/// 编辑器正常」的定位用）。两种模式各量：小文档（混合行型、真实测量高度）与窗口
+/// 模式（fixtures/大文档测试2.md）。每步 = 快照句柄 set_offset 拖一个 pct + 一帧
+/// 完整 render/layout/prepaint（cx.refresh），量 K 步均摊墙钟（release 为准）。
+/// 打印、不断言。
+#[gpui::test]
+#[ignore]
+fn bench_preview_scrollbar_drag_step_cost(cx: &mut TestAppContext) {
+    use std::time::Instant;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+
+    // —— 小文档：混合行型（行高差异大 → 真实测量 ≠ 统一提示）——
+    let mut src = String::new();
+    for i in 0..60 {
+        src.push_str(&format!(
+            "# 标题 {i} 内容内容内容内容内容\n\n普通段落行 {i} 内容内容内容内容内容内容\n\n"
+        ));
+        src.push_str(&format!("- 列表项 {i} 内容内容内容内容\n\n"));
+        src.push_str(&format!("> 引述 {i} 内容内容内容内容内容内容内容\n\n"));
+        if i % 6 == 0 {
+            src.push_str(&format!(
+                "```rs\nlet x = {i};\nfn f() {{ g() }}\n```\n\n"
+            ));
+        }
+    }
+    vcx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(&src, cx));
+    });
+    vcx.simulate_resize(size(px(980.), px(760.)));
+    settle(vcx);
+
+    let small = vcx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        (m.item_count(), m.index.is_some())
+    });
+    eprintln!("[drag-bench] small: items={} windowed={}", small.0, small.1);
+    let steps_n = 120usize;
+    let mut t_set = 0.0f64;
+    let mut t_pp = 0.0f64;
+    let mut t_frame = 0.0f64;
+    let p_small = vcx.update(|_w, cx| Rc::new(StyleParams::from_theme_with_font(cx, None)));
+    for k in 1..=steps_n {
+        let pct = k as f32 / (steps_n as f32 + 1.0);
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, _cx| {
+                let list = md.list_state.clone();
+                let view = list.viewport_bounds();
+                let handle = PreviewVerticalScrollHandle {
+                    list,
+                    content_width: md.content_w,
+                    content_height: md.total_h(),
+                    est_hint: md.est_hint,
+                    n: md.item_count(),
+                    windowed: md.index.is_some(),
+                    desired: md.desired_scroll.clone(),
+                };
+                let c = handle.content_size().height.as_f32();
+                let target = -((c - view.size.height.as_f32()) * pct);
+                let t = Instant::now();
+                handle.set_offset(point(px(0.), px(target)));
+                t_set += t.elapsed().as_secs_f64() * 1000.0;
+                let t = Instant::now();
+                md.prepare_render(&p_small, 980.0, _cx);
+                t_pp += t.elapsed().as_secs_f64() * 1000.0;
+                _cx.notify();
+            });
+        });
+        let t = Instant::now();
+        vcx.run_until_parked();
+        let _ = vcx.cx.refresh();
+        vcx.run_until_parked();
+        t_frame += t.elapsed().as_secs_f64() * 1000.0;
+    }
+    eprintln!(
+        "[drag-bench] small-doc: set_offset 均摊 {:.3} ms/步 | prepare_render 均摊 {:.3} ms/步 | 整帧(含布局) 均摊 {:.3} ms/步",
+        t_set / steps_n as f64,
+        t_pp / steps_n as f64,
+        t_frame / steps_n as f64
+    );
+
+    // —— 窗口模式（真实大文档，存在才测）——
+    let path = "fixtures/大文档测试2.md";
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let rope0 = ropey::Rope::from_str(&text);
+        let idx0 = std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope0));
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                md.set_source_with_index(
+                    crate::markdown::PreviewSrc::Rope(rope0),
+                    idx0.clone(),
+                    cx,
+                );
+            });
+        });
+        vcx.simulate_resize(size(px(980.), px(760.)));
+        for _ in 0..6 {
+            vcx.run_until_parked();
+            let _ = vcx.cx.refresh();
+        }
+        let win = vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            let m = md.read(cx);
+            (m.item_count(), m.index.is_some())
+        });
+        eprintln!("[drag-bench] windowed: items={} windowed={}", win.0, win.1);
+        let p_win = vcx.update(|_w, cx| Rc::new(StyleParams::from_theme_with_font(cx, None)));
+        let mut t_set = 0.0f64;
+        let mut t_pp = 0.0f64;
+        let mut t_draw = 0.0f64;
+        for k in 1..=steps_n {
+            let pct = k as f32 / (steps_n as f32 + 1.0);
+            vcx.update(|_, cx| {
+                let md = host.read(cx).md.clone();
+                md.update(cx, |md, _cx| {
+                    let list = md.list_state.clone();
+                    let view = list.viewport_bounds();
+                    let handle = PreviewVerticalScrollHandle {
+                        list,
+                        content_width: md.content_w,
+                        content_height: md.total_h(),
+                        est_hint: md.est_hint,
+                        n: md.item_count(),
+                        windowed: md.index.is_some(),
+                        desired: md.desired_scroll.clone(),
+                    };
+                    let c = handle.content_size().height.as_f32();
+                    let target = -((c - view.size.height.as_f32()) * pct);
+                    let t = Instant::now();
+                    handle.set_offset(point(px(0.), px(target)));
+                    t_set += t.elapsed().as_secs_f64() * 1000.0;
+                    let t = Instant::now();
+                    md.prepare_render(&p_win, 980.0, _cx);
+                    t_pp += t.elapsed().as_secs_f64() * 1000.0;
+                    _cx.notify();
+                });
+            });
+            // 第一次 park 消费 notify → 走完整 render/layout/prepaint/paint（整帧）。
+            let t = Instant::now();
+            vcx.run_until_parked();
+            t_draw += t.elapsed().as_secs_f64() * 1000.0;
+            let _ = vcx.cx.refresh();
+            vcx.run_until_parked();
+        }
+        eprintln!(
+            "[drag-bench] windowed: set_offset 均摊 {:.3} ms/步 | prepare_render 均摊 {:.3} ms/步 | 帧(含布局/绘制，first park) 均摊 {:.3} ms/步",
+            t_set / steps_n as f64,
+            t_pp / steps_n as f64,
+            t_draw / steps_n as f64
+        );
+
+        // —— 拆账：窗口模式拖动帧的成本 = apply_desired(重建 ListState) + ensure_window(解析窗口行)？
+        let (mut t_app, mut t_win, app_cnt, win_cnt) = vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            let p = Rc::new(StyleParams::from_theme_with_font(cx, md.read(cx).font_override));
+            let mut t_app = 0.0f64;
+            let mut t_win = 0.0f64;
+            let mut app_cnt = 0u32;
+            let mut win_cnt = 0u32;
+            md.update(cx, |md, _cx| {
+                let total = md.total_h();
+                let view = md.list_state.viewport_bounds().size.height.as_f32();
+                let n = md.item_count();
+                for k in 1..=steps_n {
+                    let pct = k as f32 / (steps_n as f32 + 1.0);
+                    let target = (total - view).max(0.0) * pct;
+                    let t = Instant::now();
+                    md.desired_scroll.set(target);
+                    md.restore_zoom_anchor();
+                    md.apply_desired(md.desired_scroll.get());
+                    t_app += t.elapsed().as_secs_f64() * 1000.0;
+                    app_cnt += 1;
+                    // 与 prepare_render 同口径的窗口区间
+                    let (lo_vis, _off) = md.abs_scroll_top();
+                    let hint = md.est_hint.max(20.0);
+                    let vis_base = ((view / hint).ceil() as usize).max(1);
+                    let overdraw = adaptive_overdraw(vis_base);
+                    let vis_n = vis_base + overdraw;
+                    let last = n.saturating_sub(1);
+                    let need_lo = lo_vis.saturating_sub(overdraw);
+                    let need_hi = lo_vis.saturating_add(vis_n).min(last);
+                    let t = Instant::now();
+                    md.ensure_window(need_lo, need_hi);
+                    md.bump_content_width_to_cover(&p);
+                    t_win += t.elapsed().as_secs_f64() * 1000.0;
+                    win_cnt += 1;
+                }
+            });
+            (t_app, t_win, app_cnt, win_cnt)
+        });
+        eprintln!(
+            "[drag-bench] windowed 拆账: apply_desired(重定位) 均摊 {:.3} ms/步 ×{app_cnt} | ensure_window+bump(解析窗口) 均摊 {:.3} ms/步 ×{win_cnt}",
+            t_app / app_cnt as f64,
+            t_win / win_cnt as f64
+        );
+        let _ = &mut t_app;
+        let _ = &mut t_win;
+
+        // —— 拆账 2：dispatch_pending_code_hl（延后补色）单步成本——
+        let (t_disp, disp_cnt) = vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            let mut t_disp = 0.0f64;
+            let mut disp_cnt = 0u32;
+            md.update(cx, |md, cx| {
+                for _k in 1..=steps_n {
+                    let t = Instant::now();
+                    md.dispatch_pending_code_hl(cx);
+                    t_disp += t.elapsed().as_secs_f64() * 1000.0;
+                    disp_cnt += 1;
+                }
+            });
+            (t_disp, disp_cnt)
+        });
+        eprintln!(
+            "[drag-bench] windowed dispatch_pending_code_hl 均摊 {:.3} ms/步 ×{disp_cnt}",
+            t_disp / disp_cnt as f64
+        );
+
+        // —— 慢速拖拽（相邻窗口重叠 → 增量窗口生效）——
+        let (t_slow, slow_cnt) = vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            let p = Rc::new(StyleParams::from_theme_with_font(cx, md.read(cx).font_override));
+            let mut t_slow = 0.0f64;
+            let mut slow_cnt = 0u32;
+            md.update(cx, |md, cx| {
+                let total = md.total_h();
+                let view = md.list_state.viewport_bounds().size.height.as_f32();
+                let hint = md.est_hint.max(20.0);
+                // 每次前移约 30 块（贴近真实慢拖）：窗口高度 ~112 块，必然相邻重叠。
+                let step_px = 30.0 * hint;
+                let mut target = 0.0f32;
+                md.desired_scroll.set(0.0);
+                md.prepare_render(&p, 980.0, cx);
+                while target < (total - view).max(0.0) {
+                    target += step_px;
+                    let t = Instant::now();
+                    md.desired_scroll.set(target);
+                    md.restore_zoom_anchor();
+                    md.apply_desired(md.desired_scroll.get());
+                    md.prepare_render(&p, 980.0, cx);
+                    t_slow += t.elapsed().as_secs_f64() * 1000.0;
+                    slow_cnt += 1;
+                }
+            });
+            (t_slow, slow_cnt)
+        });
+        eprintln!(
+            "[drag-bench] windowed 慢速拖拽(Δ≈30块): prepare_render 均摊 {:.3} ms/步 ×{slow_cnt}",
+            t_slow / slow_cnt as f64
+        );
+
+        // —— 拆账 3：parse_block_window_rope 增量带（Δ40）vs 全窗（Δ150）——
+        vcx.update(|_, cx| {
+            let md = host.read(cx).md.clone();
+            md.update(cx, |md, cx| {
+                let Some(src) = md.src_buf.clone() else { return };
+                let Some(idx) = md.index.clone() else { return };
+                let mut t_d40 = 0.0f64;
+                let mut t_d150 = 0.0f64;
+                let lo0 = md.win_lo.min(idx.blocks.len().saturating_sub(150));
+                for k in 0..60usize {
+                    let base = (idx.blocks.len() as f32 * (k as f32 / 60.0)) as usize;
+                    let t = Instant::now();
+                    let _ = match &src {
+                        PreviewSrc::Str(s) => crate::markdown::parse::parse_block_window(s, &idx, base, base + 40),
+                        PreviewSrc::Rope(r) => crate::markdown::parse::parse_block_window_rope(r, &idx, base, base + 40),
+                    };
+                    t_d40 += t.elapsed().as_secs_f64() * 1000.0;
+                    let t = Instant::now();
+                    let _ = match &src {
+                        PreviewSrc::Str(s) => crate::markdown::parse::parse_block_window(s, &idx, base, base + 150),
+                        PreviewSrc::Rope(r) => crate::markdown::parse::parse_block_window_rope(r, &idx, base, base + 150),
+                    };
+                    t_d150 += t.elapsed().as_secs_f64() * 1000.0;
+                }
+                let _ = lo0;
+                eprintln!(
+                    "[drag-bench] parse_block_window_rope 均摊：Δ40={:.3} ms | Δ150={:.3} ms",
+                    t_d40 / 60.0,
+                    t_d150 / 60.0
+                );
+                let _ = cx;
+            });
+        });
+    } else {
+        eprintln!("[drag-bench] skip windowed: 缺 {path}");
+    }
+}
+
+/// 回归：「快速来回拖滚动条，滚动块停在旧位、要晃几下才跟上」——一帧内的高频
+/// `MouseMoveEvent` 突发必须**帧级合并、绝不丢最后位置**。旧代码按 `max_fps` 节流
+/// 丢弃未到期事件：突发里只有第一单生效，随后停住不产生新事件 → `desired` 停在
+/// 第一单（如 30%），滚到轨道底也到不了；「晃几下」才补。现改为事件记
+/// `pending_target`（永远最新）、`prepaint` 每帧落地。
+#[gpui::test]
+fn scrollbar_fast_drag_never_drops_final_target(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let mut doc = String::new();
+    for i in 0..80 {
+        doc.push_str(&format!(
+            "## 第{i}节\n\n正文段落{i}，内容内容内容内容。\n- 列表{i} 内容内容。\n\n`code {i}`\n\n"
+        ));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_epub(true, Default::default(), cx);
+            md.set_source(&doc, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let ov = cx
+        .debug_bounds("md-vscrollbar-overlay")
+        .expect("纵向滚动条 overlay 应有布局 bounds");
+    let n = cx.update(|_, cx| host.read(cx).md.read(cx).item_count());
+    assert!(n > 0, "预览应有内容");
+    let container = ov.size.height.as_f32();
+    let track_top = ov.origin.y.as_f32();
+    // 轨道右侧 16px；滑块初始在顶部：thumb_start=0、thumb_len=48（MIN 下限）。
+    let track_right = ov.right() - px(4.5);
+    let thumb_center = point(track_right, px(track_top + 4.0 + 24.0));
+    let bottom_pt = point(track_right, px(ov.bottom().as_f32() - 1.0));
+
+    // 按下（滑块顶部）。fast 突发：30% → 60% → 轨道底，**中间不停帧**。
+    cx.simulate_mouse_down(thumb_center, MouseButton::Left, Modifiers::default());
+    let mut y = track_top + container * 0.30;
+    cx.simulate_mouse_move(
+        point(track_right, px(y)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    y = track_top + container * 0.60;
+    cx.simulate_mouse_move(
+        point(track_right, px(y)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        bottom_pt,
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    // 停住（不再产生事件）：帧级落地应把「在底部」的最后一单补上。
+    settle(cx);
+    cx.simulate_mouse_up(bottom_pt, MouseButton::Left, Modifiers::default());
+    settle(cx);
+
+    let (desired, max_scroll) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        let ls = m.test_list_state();
+        let max_off = ls.max_offset_for_scrollbar().y.as_f32();
+        (m.desired_scroll.get(), max_off)
+    });
+    assert!(
+        desired >= max_scroll * 0.98,
+        "突发拖到底后最终目标不得被丢弃（desired 应近 {max_scroll:.0}，实际 {desired:.0}）；旧节流会停在第一单 ~30%"
+    );
+}
 /// 表格滚动容器 = 预览视口宽；内部固定宽表格超宽时块内可横向滚动、滚动条真实渲染，
 /// 句柄跨帧稳定（set_offset 能把表格真正向左滚动）——对齐代码块方案。
 #[gpui::test]
@@ -2275,6 +2712,92 @@ fn large_doc_uses_windowed_lazy_parse(cx: &mut TestAppContext) {
         "窗口应覆盖可见范围，win_lo={win_lo2} len={win_len2} abs_top={scroll_top}"
     );
     assert!(win_len2 < 200, "任一时刻窗口应保持有界，win_len={win_len2}");
+}
+
+/// 回归：窗口模式 **增量窗口扩展**（拖滚动条/慢滚只解析新进入的带头/尾带、拼接复用
+/// 既有行）必须与「整窗重解析」逐行一致——防拼接错位/丢行/顺序颠倒。用与
+/// `prepare_render` 同步的目标序列驱动（apply_desired + ensure_window 交替前进），
+/// 几次相邻重叠的重建后，把最终窗口文本与一次性整窗重解析对拍。
+#[gpui::test]
+fn windowed_incremental_window_matches_full_reparse(cx: &mut TestAppContext) {
+    use crate::markdown::parse::parse_block_window_rope;
+    use ropey::Rope;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let iters = crate::config::limits::WINDOWED_MIN_BLOCKS + 500;
+    let mut src = String::new();
+    for i in 0..iters {
+        src.push_str(&format!(
+            "# 标题{i}\n\n正文段落 {i}，含一些文字。\n\n- 列表 {i}\n\n```rs\nlet a = {i};\n```\n\n"
+        ));
+    }
+    let rope0 = Rope::from_str(&src);
+    let idx0 = std::rc::Rc::new(crate::markdown::scan_blocks_rope(&rope0));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(crate::markdown::PreviewSrc::Rope(rope0.clone()), idx0.clone(), cx)
+        });
+    });
+    cx.simulate_resize(size(px(980.), px(760.)));
+    settle(cx);
+    assert!(
+        cx.update(|_, cx| host.read(cx).md.read(cx).index.is_some()),
+        "应启用窗口模式"
+    );
+
+    // 用一家家重叠的小步前进驱动多次增量重建（模拟慢速拖滚动条），覆盖
+    // 「仅尾带追加」「仅首带前插」「首尾双伸」三种拼接分支。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _cx| {
+            let view = md.list_state.viewport_bounds().size.height.as_f32();
+            let hint = md.est_hint.max(20.0);
+            let step = 18.0 * hint;
+            let total = md.total_h();
+            let mut target = 0.0f32;
+            let n = md.item_count();
+            let last = n.saturating_sub(1);
+            // 依次推进，每次按 prepare_render 同口径建房（apply + ensure 交替，
+            // 覆盖「仅尾带」「仅首带」「首尾双伸」三种增量拼接分支）。
+            while target < (total - view).max(0.0) {
+                target += step;
+                md.desired_scroll.set(target);
+                md.restore_zoom_anchor();
+                md.apply_desired(md.desired_scroll.get());
+                let (cur_lo_vis, _off) = md.abs_scroll_top();
+                let h = md.est_hint.max(20.0);
+                let vis_base = ((view / h).ceil() as usize).max(1);
+                md.overdraw_margin = adaptive_overdraw(vis_base);
+                let vis_n = vis_base.saturating_add(md.overdraw_margin);
+                let need_lo = cur_lo_vis.saturating_sub(md.overdraw_margin);
+                let need_hi = cur_lo_vis.saturating_add(vis_n).min(last);
+                md.ensure_window(need_lo, need_hi);
+            }
+        });
+    });
+    // 对拍：最终窗口 [win_lo, +len) 与整窗重解析逐行文本一致。
+    let (win_lo, win_rows, ref_rows) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let md = md.read(cx);
+        let lo = md.win_lo;
+        let hi = lo.saturating_add(md.win_rows.len()).saturating_sub(1);
+        let ref_rows = parse_block_window_rope(&rope0, &idx0, lo, hi);
+        (lo, md.win_rows.clone(), ref_rows)
+    });
+    let join = |rs: &[crate::markdown::parse::Row]| -> String {
+        rs.iter().map(|r| r.text.as_ref()).collect::<Vec<_>>().join("\n")
+    };
+    assert!(!win_rows.is_empty(), "应有窗口行");
+    assert_eq!(
+        join(&win_rows),
+        join(&ref_rows),
+        "增量拼接窗口（win_lo={win_lo}）应与整窗重解析逐行一致"
+    );
 }
 
     /// 预览与编辑器共享源 Rope（第二步）：

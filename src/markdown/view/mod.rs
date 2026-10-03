@@ -368,6 +368,13 @@ pub struct MarkdownPreview {
     /// `dispatch_pending_code_hl` 按字节预算逐批解析并入 `code_hl`/LRU（见
     /// [`CODE_HL_PARSE_BYTES_PER_FRAME`]）。源码代不符（编辑/换源）即作废。
     pending_code_hl: Option<PendingCodeHl>,
+    /// 上一帧**窗口顶部块**（窗口模式用；`None` = 尚未建房）。连续滚动（拖滚动条/
+    /// 快速滚轮）期窗口顶部逐帧变化 → `prepare_render` 判定「扫动中」，跳过
+    /// `dispatch_pending_code_hl`（零 syntect 帧、滑块/内容紧跟鼠标）；停稳
+    /// （相邻帧窗口一致）再派发补齐着色——与编辑器 06f6013「滚动持续时延后上色、
+    /// 停稳后补齐」同手法。不能用 `is_scrollbar_dragging()`：窗口模式 `apply_desired`
+    /// 重建 ListState 会清掉冻结值，且窗口模式本不冻结。
+    last_sweep_lo: Option<usize>,
 }
 
 impl MarkdownPreview {
@@ -422,6 +429,7 @@ impl MarkdownPreview {
             height_stride: 1,
             zoom_anchor: None,
             pending_code_hl: None,
+            last_sweep_lo: None,
         }
     }
 
@@ -994,6 +1002,7 @@ impl MarkdownPreview {
         self.cit_gen = self.cit_gen.wrapping_add(1);
         self.code_hl_cache.clear();
         self.pending_code_hl = None;
+        self.last_sweep_lo = None;
         self.clear_note_state();
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
@@ -1373,7 +1382,8 @@ impl MarkdownPreview {
         let want_lo = lo.min(n - 1);
         let want_hi = hi.clamp(want_lo, n - 1);
         let cur_lo = self.win_lo;
-        let cur_hi = cur_lo.saturating_add(self.win_rows.len()).saturating_sub(1);
+        let cur_len = self.win_rows.len();
+        let cur_hi = cur_lo.saturating_add(cur_len).saturating_sub(1);
         // 命中：当前窗口已覆盖所需区间（含上下过扫余量）→ 不重解析。
         // 注意不能要求 |want_lo-cur_lo| 很小：带余量重建后 cur_lo 本就比
         // 需求靠前 24 块，那样会每帧都判"没命中"而反复重解析。
@@ -1388,13 +1398,74 @@ impl MarkdownPreview {
         let margin = self.overdraw_margin.min(n / 2);
         let w_lo = want_lo.saturating_sub(margin);
         let w_hi = (want_hi + margin).min(n - 1);
-        let mut rows = match &src {
-            PreviewSrc::Str(s) => parse_block_window(s, &idx, w_lo, w_hi),
-            PreviewSrc::Rope(r) => parse_block_window_rope(r, &idx, w_lo, w_hi),
-        };
-        self.resolve_image_rows(&mut rows);
-        self.win_lo = w_lo;
-        self.win_rows = Rc::new(rows);
+        let w_len = w_hi.saturating_sub(w_lo).saturating_add(1);
+
+        // 增量扩展：拖滚动条/滚轮滚动时，新窗口基本与当前窗口重叠，只有一两段新带
+        // 露出。**只解析新增带头/尾并拼接复用**，整窗重解析只在每次拖动帧都发生时
+        // 逐帧重物化几百行（这是「预览拖滚动条明显滞后·需多拖几次」的主因）。
+        // 条件：非首建、新旧窗口有真实重叠（同带滚动）、拼接后不超 ListState 窗口
+        // 上限；不满足（首建 / 大跳转 / 重叠极小）回退整窗重解析（原路径）。
+        let overlap_lo = cur_lo.max(w_lo);
+        let overlap_hi = cur_hi.min(w_hi);
+        let incremental = !self.win_rows.is_empty()
+            && overlap_lo <= overlap_hi
+            && w_len <= PREVIEW_LIST_WINDOW;
+        if incremental {
+            let head_band = (w_lo < overlap_lo).then(|| {
+                let lo = w_lo;
+                let hi = overlap_lo.saturating_sub(1);
+                let mut r = match &src {
+                    PreviewSrc::Str(s) => parse_block_window(s, &idx, lo, hi),
+                    PreviewSrc::Rope(rp) => parse_block_window_rope(rp, &idx, lo, hi),
+                };
+                self.resolve_image_rows(&mut r);
+                r
+            });
+            let tail_band = (overlap_hi < w_hi).then(|| {
+                let lo = overlap_hi.saturating_add(1);
+                let mut r = match &src {
+                    PreviewSrc::Str(s) => parse_block_window(s, &idx, lo, w_hi),
+                    PreviewSrc::Rope(rp) => parse_block_window_rope(rp, &idx, lo, w_hi),
+                };
+                self.resolve_image_rows(&mut r);
+                r
+            });
+            let span_lo = if head_band.is_some() {
+                w_lo
+            } else {
+                overlap_lo
+            };
+            let span_hi = if tail_band.is_some() {
+                w_hi
+            } else {
+                overlap_hi
+            };
+            let span_len = span_hi.saturating_sub(span_lo).saturating_add(1);
+            // 复用段（当前窗口与 [span_lo, span_hi] 的交集）用严格 slice 索引，避免
+            // 越界：from/to 都按「当前窗口内相对下标」夹取。
+            let cur_from = overlap_lo.saturating_sub(cur_lo).min(cur_len);
+            let cur_to = overlap_hi.saturating_sub(cur_lo).min(cur_len).saturating_add(1);
+            let mut rows = Vec::with_capacity(w_len);
+            if let Some(r) = head_band {
+                rows.extend_from_slice(&r);
+            }
+            rows.extend_from_slice(&self.win_rows[cur_from..cur_to.min(cur_len)]);
+            if let Some(r) = tail_band {
+                rows.extend_from_slice(&r);
+            }
+            debug_assert_eq!(rows.len(), span_len, "增量窗口拼接长度应等于跨度");
+            let _ = span_len;
+            self.win_lo = span_lo;
+            self.win_rows = Rc::new(rows);
+        } else {
+            let mut rows = match &src {
+                PreviewSrc::Str(s) => parse_block_window(s, &idx, w_lo, w_hi),
+                PreviewSrc::Rope(r) => parse_block_window_rope(r, &idx, w_lo, w_hi),
+            };
+            self.resolve_image_rows(&mut rows);
+            self.win_lo = w_lo;
+            self.win_rows = Rc::new(rows);
+        }
         self.build_window_scroll_handles(first_build);
         crate::prof::end("md_ensure_window", _t);
     }
@@ -1976,6 +2047,22 @@ impl MarkdownPreview {
             }
             // 字号缩放后：平均行高已按新字号刷新 → 把视口锚点恢复为新的滚动位置。
             self.restore_zoom_anchor();
+            // 滚动条 thumb 与内容统一经共享 `desired`（px）：
+            // - **拖拽中**（`is_scrollbar_dragging` 冻结期）：set_offset 已同步写
+            //   desired + 落到 ListState；这里兜底再落一次，保证同帧内 update_height_hint
+            //   重铺/恢复滚动后两者仍一致。thumb 读 desired ⇒ 1:1 跟手，绝不因标签
+            //   逐帧重测量而滑开。
+            // - **非拖拽**（换轮/目录跳转/测量自愈）：从 ListState 实测 px 回填
+            //   desired，让 thumb 与内容保持一致。
+            if self.list_state.is_scrollbar_dragging() {
+                self.list_state.set_offset_from_scrollbar(point(
+                    px(0.),
+                    px(-self.desired_scroll.get()),
+                ));
+            } else {
+                let cur = -self.list_state.scroll_px_offset_for_scrollbar().y.as_f32();
+                self.desired_scroll.set(cur.max(0.));
+            }
         }
         crate::prof::end("md_hint", _t_hint);
 
@@ -1991,9 +2078,15 @@ impl MarkdownPreview {
             let need_lo = lo_vis.saturating_sub(self.overdraw_margin);
             let need_hi = lo_vis.saturating_add(vis_n).min(last);
             let _t_ensure = crate::prof::begin();
-            // 先派发**上一帧**延后的代码块队列（本帧建房可能再产生新的延后，留到下帧
-            // 补色——保证「大跳转」所在的输入/滚动帧不因 syntect 解析而停驻）。
-            self.dispatch_pending_code_hl(cx);
+            // 连续滚动（拖滚动条/快速滚轮）期窗口顶部逐帧变化 → **扫动帧不派发代码块
+            // 补色**（syntect 零消耗，帧廉价、滑块/内容紧跟鼠标）；停稳（相邻帧窗口
+            // 顶部一致）再派发补齐着色。这比 `is_scrollbar_dragging` 可靠：窗口模式
+            // `apply_desired` 重建 ListState 会清冻结值、且本不冻结，无法作拖拽信号。
+            let sweeping = self.last_sweep_lo.is_some_and(|lo| lo != lo_vis);
+            self.last_sweep_lo = Some(lo_vis);
+            if !sweeping {
+                self.dispatch_pending_code_hl(cx);
+            }
             self.ensure_window(need_lo, need_hi);
             // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
             // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。
@@ -2427,17 +2520,27 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
             // 用「用户目标」而非固定窗口的实际位置：窗口只是渲染切片，量程是全文的。
             point(px(0.), px(-self.desired.get()))
         } else {
-            self.list.scroll_px_offset_for_scrollbar()
+            // 小文档同样经共享 `desired`（px）表达 thumb —— **不读 ListState 实测树**：
+            // 拖拽中标签会逐帧重测量（真实行高替换统一提示）→ 同一逻辑位置映射的 px
+            // 逐帧漂移 → thumb 从抓点滑开、显得「不跟鼠标」。用 desired 作轴则 thumb
+            // 恒 1:1，内容由 prepare 每帧按 desired 落位（见 prepare_render）。
+            point(px(0.), px(-self.desired.get()))
         }
     }
 
     fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
+        let view = self.list.viewport_bounds().size.height.as_f32();
         if self.windowed {
-            let view = self.list.viewport_bounds().size.height.as_f32();
             let off = (-offset.y.as_f32()).max(0.).min((self.content_height - view).max(0.));
             self.desired.set(off);
         } else {
-            self.list.set_offset_from_scrollbar(offset);
+            // 小文档：写共享 desired（thumb 轴），并立即落到 ListState（内容跟随）。
+            // 上限 = 实测可滚上限（拖拽中被冻结 → 稳定且准确，拖到底必到真实末尾），
+            // 不用 `content_height`（n×est_hint 估算，真机可能欠估 → 拖不到底）。
+            let max_off = self.list.max_offset_for_scrollbar().y.as_f32();
+            let off = (-offset.y.as_f32()).max(0.).min(max_off.max(0.));
+            self.desired.set(off);
+            self.list.set_offset_from_scrollbar(point(px(0.), px(-off)));
         }
     }
 

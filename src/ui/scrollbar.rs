@@ -21,10 +21,11 @@
 //! ScrollbarHandle`——契约方法完全相同。也内置了对 `gpui::ScrollHandle` / `ListState` 的实现。
 //!
 //! # 交互（对齐 gpui-component 的优化）
-//! 拖动提交带双重门控：>1px 差值门控（拖到轨道尽头被 clamp 住时不空转重建）、`max_fps`
-//! 节流（高频 `MouseMoveEvent` 合并到最近节奏，默认 120=不限速，重视图用 `.max_fps(30)`
-//! 收敛）。不用 `event.dragging()` 门控：平台逐事件上报 `pressed_button` 在部分设备/驱动
-//! 上偶发 `None`，高频拖拽会因此偶尔跳过提交、显得不跟手；以元素自身 `drag_grab`
+//! 拖动提交带双重门控：>1px 差值门控（拖到轨道尽头被 clamp 住时不空转重建）＋**帧级
+//! 合并节流**（`MouseMoveEvent` 只把最新目标记进 `pending_target`，`prepaint` 每帧落地
+//! 一次——重视图慢帧下也不丢"最后一次在底部"的移动，来回拖不卡滞）。不用
+//! `event.dragging()` 门控：平台逐事件上报 `pressed_button` 在部分设备/驱动上偶发
+//! `None`，高频拖拽会因此偶尔跳过提交、显得不跟手；以元素自身 `drag_grab`
 //! （mousedown 设 / mouseup 清）为「按住中」的权威信号。
 //!
 //! # 生命周期（gpui 约束）
@@ -171,6 +172,12 @@ impl ScrollbarHandle for ListState {
 struct UiState {
     /// 拖拽中：鼠标按下点相对滑块命中区原点的偏移。
     drag_grab: Option<Point<Pixels>>,
+    /// 拖拽中**最新一次尚未落地的目标偏移 px**（`>1px` 门控通过即记录）。事件可能
+    /// 比帧快得多（尤其预览这类 20-30ms/帧的重视图）：旧实现按 `max_fps` 节流**丢弃**
+    /// 未到期事件 → 快速来回拖时「最后一次在底部的移动」被丢、thumb 停在旧位、要晃
+    /// 几下才跟上。改为事件只记 `pending_target`（永远最新）并预约一帧，`prepaint`
+    /// 每帧落地一次——**帧率合并、绝不丢最新位置**。
+    pending_target: Option<f32>,
     /// 是否悬停在轨道上（激活更宽）。
     hovering: bool,
     /// 最近一次滚动发生时间（`Auto` 模式隐藏依据）。
@@ -181,8 +188,6 @@ struct UiState {
     present: f32,
     /// 动画推进用的上一帧时间。
     last_frame: Option<Instant>,
-    /// 拖拽上次提交偏移到句柄的时间（`max_fps` 节流依据；None=立即提交）。
-    last_update: Option<Instant>,
 }
 
 /// 单帧几何（prepaint 计算，paint/事件闭包共用；位置/边界为 Pixel、量程为 f32 标量）。
@@ -213,9 +218,6 @@ pub struct Scrollbar<H: ScrollbarHandle + Clone> {
     mode: ScrollbarMode,
     id: ElementId,
     layout_viewport: bool,
-    /// 拖拽提交上限（fps，30..=120）：把高频 `MouseMoveEvent` 合并在最近的节奏上
-    /// `set_offset`+`notify`，避免重视图（大文档编辑器整窗重建）被拖动事件风暴打满。
-    max_fps: usize,
 }
 
 impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
@@ -229,7 +231,6 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
             mode: ScrollbarMode::Always,
             id: ElementId::CodeLocation(*caller),
             layout_viewport: false,
-            max_fps: 120,
         }
     }
 
@@ -258,18 +259,6 @@ impl<H: ScrollbarHandle + Clone + 'static> Scrollbar<H> {
     /// 用元素自身布局边界作为视口（覆盖句柄的 `viewport_bounds`）。
     pub fn viewport_from_layout(mut self) -> Self {
         self.layout_viewport = true;
-        self
-    }
-
-    /// 设置拖拽提交上限 FPS（可用 30..=120）。重视图（大文档编辑器整窗重建）拖拽卡顿时
-    /// 调低（如 30）可显著降 CPU/帧率抖动，代价是内容跟随略降频；与 gpui-component 对齐，
-    /// 其文档即建议重交互场景下调到 30。
-    ///
-    /// 默认 120：相对 60Hz 显示器等效「不限速」，仅在拖动事件风暴超过帧率时收敛提交频率；
-    /// 是否下沉由各调用点按视图成本自行决定（同 gpui-component 的暴露方式）。
-    #[allow(dead_code)] // 公开调频 API，调用点按需启用（与 theme.rs 迁移期预留字段同约定）
-    pub fn max_fps(mut self, max_fps: usize) -> Self {
-        self.max_fps = max_fps.clamp(30, 120);
         self
     }
 
@@ -402,8 +391,6 @@ pub struct PrepaintState<H> {
     hidden: bool,
     /// 本帧悬停/拖拽插值（0..1）。
     present: f32,
-    /// 拖拽提交节流间隔（= 1000ms / max_fps）。
-    drag_throttle: Duration,
     track_hitbox: Hitbox,
     handle: H,
     axis: ScrollbarAxis,
@@ -465,8 +452,8 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                     handle.start_drag();
                     state.update(cx, |s, _| {
                         s.drag_grab = Some(grab);
-                        // 新拖拽的第一个提交立即生效（不受上一条手势残留节流影响）。
-                        s.last_update = None;
+                        // 新拖拽从干净状态开始（清掉上一条手势残留的未落地目标）。
+                        s.pending_target = None;
                     });
                 } else {
                     // 点击跳转：滑块中心对准点击位。
@@ -495,15 +482,14 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
             }
         });
 
-        // 移动：更新悬停 + 拖拽写回 offset（对齐 gpui-component 的优化：>1px 差值门控、
-        // max_fps 节流，避免高频事件风暴打满重视图重建）。
+        // 移动：更新悬停 + 拖拽写回 offset（>1px 差值门控 + 每帧 prepaint 落地最新目标，
+        // 替代旧的 max_fps 丢弃式节流——避免快速来回拖把最后位置丢掉、thumb 停在旧位）。
         // 注意：**不**用 `event.dragging()` 门控——drag_grab 只在本滚动条 mousedown 设、
         // mouseup 清，已是我们自己的「按住中」权威信号；平台逐事件上报的 pressed_button
         // 在部分设备/驱动上会间歇性为 None，用它门控会把高频拖拽偶尔跳过提交、显得不跟手。
         window.on_mouse_event({
             let handle = handle.clone();
             let state = state.clone();
-            let throttle = self.drag_throttle;
             move |event: &MouseMoveEvent, _phase, _window, cx| {
                 let hovered = track.contains(&event.position);
                 let mut notify = false;
@@ -540,22 +526,12 @@ impl<H: ScrollbarHandle + Clone + 'static> PrepaintState<H> {
                         offset.x.as_f32()
                     };
                     // >1px 门控：未真正移动（如拖到轨道尽头被 clamp 住）就跳过。
+                    // 通过后**只记最新目标**（不直接提交）：事件可能比帧快得多，若按
+                    // max_fps 扔未到期事件，快速来回拖时最后位置会被丢弃、thumb 停在
+                    // 旧位。prepaint 每帧把 pending_target 落地一次（帧率合并、不丢）。
                     if (target - cur).abs() > 1.0 {
-                        // max_fps 节流：高频拖动事件合并到最近的提交节奏。
-                        let now = Instant::now();
-                        let due = state
-                            .read(cx)
-                            .last_update
-                            .is_none_or(|t| now.saturating_duration_since(t) >= throttle);
-                        if due {
-                            if is_v {
-                                handle.set_offset(point(offset.x, px(target)));
-                            } else {
-                                handle.set_offset(point(px(target), offset.y));
-                            }
-                            state.update(cx, |s, _| s.last_update = Some(now));
-                            notify = true;
-                        }
+                        state.update(cx, |s, _| s.pending_target = Some(target));
+                        notify = true;
                     }
                 } else if hovered {
                     notify = true;
@@ -679,7 +655,34 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             s.last_frame = Some(now);
         });
 
+        // 拖拽目标**帧级落地**：mousemove 只把最新目标记进 `pending_target`（事件可能比
+        // 帧快得多，尤其预览这类重视图），prepaint 这里每帧落地一次——帧率合并、绝不丢
+        // 最后位置（旧 max_fps 节流会在快速来回拖时丢掉"在底部"的最后一单 → thumb 停在
+        // 旧位、要晃几下才跟上）。落地后约下一帧，让内容在新滚动位置重绘。
+        let mut flushed = false;
+        if let Some(target) = state.read(cx).pending_target {
+            let cur_off = self.handle.offset();
+            let is_v = self.axis.is_vertical();
+            let cur = if is_v {
+                cur_off.y.as_f32()
+            } else {
+                cur_off.x.as_f32()
+            };
+            if (target - cur).abs() > 1.0 {
+                if is_v {
+                    self.handle.set_offset(point(cur_off.x, px(target)));
+                } else {
+                    self.handle.set_offset(point(px(target), cur_off.y));
+                }
+                flushed = true;
+            }
+            state.update(cx, |s, _| s.pending_target = None);
+        }
+
         let geom = self.geom(viewport, present);
+        if flushed {
+            cx.notify(view_id);
+        }
         // 未收敛且可见 → 预约下一帧继续动画（收敛后自动静止，无空转帧）。
         if animating && !hidden && geom.is_some() {
             window.request_animation_frame();
@@ -689,7 +692,6 @@ impl<H: ScrollbarHandle + Clone + 'static> Element for Scrollbar<H> {
             geom,
             hidden,
             present,
-            drag_throttle: Duration::from_millis((1000 / self.max_fps) as u64),
             track_hitbox,
             handle: self.handle.clone(),
             axis: self.axis,
