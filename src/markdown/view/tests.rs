@@ -208,6 +208,82 @@ fn small_doc_scrollbar_follows_list_summary_when_taller_than_estimate(
     handle.end_drag();
 }
 
+/// 回归（统一口径）：小文档 `total_h()` 跟随 ListState 实测（而非估算），且页码用
+/// 「底部到达页」语义——真机实测 > 估算时，拖到底必须「第 N/N 页」，滚轮到底也与
+/// 滚动条同一「底」。旧实现：total_h 用 `行数×平均高` → 拖到底页码停在 < 总页数。
+#[gpui::test]
+fn small_doc_total_h_follows_list_and_page_reaches_end(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let mut doc = String::new();
+    for i in 0..80 {
+        doc.push_str(&format!("## 第{i}节\n\n正文段落{i}，内容内容内容。\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_epub(true, Default::default(), cx);
+            md.set_source(&doc, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let (n, hint, ls, view) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        (m.item_count(), m.est_hint, m.test_list_state(), m.list_state.viewport_bounds())
+    });
+    let estimate = n as f32 * hint;
+    let vh = view.size.height.as_f32();
+    // 模拟真机实测更高：summary 铺成 1.5×估算。
+    ls.reset_with_uniform_height(n, px(hint * 1.5));
+
+    // ① total_h() 必须跟随 ListState 实测（= vertical_total_px），而非估算。
+    let (total, measured) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        (m.total_h(), m.vertical_total_px())
+    });
+    assert!(
+        (total - measured).abs() < 1.0 && total > estimate * 1.4,
+        "total_h 应跟随实测（total={total:.0} 实测={measured:.0} 估算={estimate:.0}）"
+    );
+
+    // ② 拖到底（与滚动条同一[底]：start_drag 冻结 → thumb 到底）→ 页码 = 第 N/N 页。
+    let handle = PreviewVerticalScrollHandle {
+        list: ls.clone(),
+        content_width: 300.0,
+        content_height: estimate,
+        est_hint: hint,
+        n,
+        windowed: false,
+        desired: std::rc::Rc::new(std::cell::Cell::new(0.)),
+    };
+    handle.start_drag();
+    let content_h = handle.content_size().height.as_f32();
+    handle.set_offset(point(px(0.), px(-(content_h - vh))));
+    handle.end_drag();
+    let (page, total_pages) = cx.update(|_, cx| {
+        host.read(cx)
+            .md
+            .read(cx)
+            .viewport_page_bounds()
+            .expect("epub 应有页码读数")
+    });
+    assert_eq!(
+        page, total_pages,
+        "拖到底应到第 N/N 页：current={page}/{total_pages}，total_h={total:.0} 估={estimate:.0}"
+    );
+}
+
 /// 超宽内容应让横向滚动句柄产生正向 max_offset（可滚动范围正确）。
 #[gpui::test]
 fn wide_source_makes_harea_overflow(cx: &mut TestAppContext) {

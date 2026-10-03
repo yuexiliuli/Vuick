@@ -615,9 +615,10 @@ impl MarkdownPreview {
     }
 
     /// EPUB 轻量视口分页读数：`(当前页, 总页数)`（1 基）——按「内容总高 / 视口高」
-    /// 切页，当前页以**视口中心**落在的页计（clamp 到 `[1, 总页数]`）。口径与纵向
-    /// 滚动条量程同源（窗口模式 = `desired_scroll`＋抽样块高模型总高；小文档 =
-    /// `list_state` px 滚动＋行数×平均高），故字号调整/换宽后页码自动跟随。
+    /// 切页，当前页以视口**底部到达**的页计（clamp 到 `[1, 总页数]`）。口径与纵向
+    /// 滚动条量程同源（窗口模式 = `desired_scroll`＋抽样块高模型总高；小文档 = 实测
+    /// ListState px 滚动＋实测总高，见 `total_h`），故**拖到底必然「第 N/N 页」**、
+    /// 字号调整/换宽后页码自动跟随。
     /// 非 EPUB / 无源返回 `None`（不显示页码）。纯展示读数，无翻页交互。
     pub(crate) fn viewport_page_bounds(&self) -> Option<(usize, usize)> {
         // 有源判定：小文档 `rows` 物化全量；窗口模式懒物化 `rows` 恒空，以 `index`
@@ -653,12 +654,19 @@ impl MarkdownPreview {
         let top_px = if self.index.is_some() {
             self.desired_scroll.get().max(0.)
         } else {
-            let (row, off_px) = self.abs_scroll_top();
-            row as f32 * self.est_hint.max(1.0) + off_px
+            // 小文档：与量程同源的**实测**滚动 px（`scroll_px_offset_for_scrollbar`，
+            // 已由 `update_height_hint` 铺 uniform 高度 → summary 完备、取值为真实 px）。
+            // 用估算（行×平均高）会停在估算末尾——真机实测>估算时拖到底页码永远
+            // < 总页数；实测 px 保证「拖到底 = 第 N/N 页」。
+            -self.list_state.scroll_px_offset_for_scrollbar().y.as_f32()
         };
-        // 当前页 = 视口顶部落在的页（顶部页语义：滚到某页顶才算翻页；
-        // 滚到底 `top_px=content_h-view_h` → `floor((c-v)/v)+1 = ceil(c/v)` = 总页数）。
-        let page = (top_px / view_h).floor() as usize;
+        // 当前页 = 视口**底部到达**的页（底部到达页语义）：某页顶部滚进视口底边才算
+        // 「翻到那页」。这与「拖到底 = 第 N/N 页」自洽——视口底 = 内容底时当前页必然
+        // = 总页数；若用「顶部到达页」语义，最后不满一屏时顶部永远停在 `floor(C/v)`
+        // 页、到不了总页数（真机实测「44/47」的来源之一），也无法滚过末尾补上那页。
+        // `-0.5` 为亚像素护栏：恰好落在页边界时钳回前一页，不把末页顶进下一页。
+        let bottom = top_px + view_h;
+        let page = ((bottom - 0.5) / view_h).floor().max(0.) as usize;
         Some((page.min(total - 1) + 1, total))
     }
 
@@ -1176,12 +1184,21 @@ impl MarkdownPreview {
         }
     }
 
-    /// 纵向滚动目标总量程（px，窗口模式 = 抽样块高模型总高；小文档 = 行数×平均高）。
+    /// 纵向滚动目标总量程（px，窗口模式 = 抽样块高模型总高；小文档 = **跟随
+    /// ListState 实测** `max_offset + 视口`，与滚动条/拖拽/页码同源——真机实测可能
+    /// 高于估算 `行数×平均高`，估算欠估会让滚轮/页码够不到真实底部）。布局未就绪
+    /// （实测为 0）时回退估算，避免把 0 当总量程钳死滚动。
     fn total_h(&self) -> f32 {
         if self.index.is_some() {
             self.height_pref.last().copied().unwrap_or(0.0)
         } else {
-            self.rows.len() as f32 * self.est_hint.max(1.0)
+            let measured = self.list_state.max_offset_for_scrollbar().y.as_f32()
+                + self.list_state.viewport_bounds().size.height.as_f32();
+            if measured >= 1.0 {
+                measured
+            } else {
+                self.rows.len() as f32 * self.est_hint.max(1.0)
+            }
         }
     }
 
