@@ -4195,7 +4195,8 @@
             }
         }
         let page_el = page_el.expect("EPUB 状态栏应显示页码（status-epub-page）");
-        assert!(page_el.size.width > px(0.), "页码元素应有宽度");        let (p1, n) = cx.update(|_, cx| {
+        assert!(page_el.size.width > px(0.), "页码元素应有宽度");
+        let (p1, n) = cx.update(|_, cx| {
             let a = app.read(cx);
             let md = &a.tabs[a.active_tab].md_preview;
             md.read(cx)

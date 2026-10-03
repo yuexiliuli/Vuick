@@ -1651,8 +1651,11 @@ impl MarkdownPreview {
     fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
         let avail = (width - 24.0).max(40.0); // px_3 左右内缩
         let wrap = self.wrap;
-        let (n, total) = match &self.index {
-            Some(idx) => {
+        // 小文档恒走 rows 逐行口径（行类型精确）；只有**大文档/窗口模式**（rows 懒物化
+        // 为空）才走块索引口径——避免「首帧 index 在场、随后丢弃」导致平均行高在两种
+        // 口径间跳变（EPUB 实测 77.6 ↔ 52，量程/总页数随之抖动）。
+        let (n, total) = match (&self.index, self.rows.is_empty()) {
+            (Some(idx), true) => {
                 if idx.blocks.is_empty() {
                     return p.body_row_hint().as_f32();
                 }
@@ -1669,7 +1672,7 @@ impl MarkdownPreview {
                     .sum::<f32>();
                 (n, total)
             }
-            None => {
+            _ => {
                 if self.rows.is_empty() {
                     return p.body_row_hint().as_f32();
                 }
@@ -1776,7 +1779,7 @@ impl MarkdownPreview {
         let summary_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
             + self.list_state.viewport_bounds().size.height.as_f32();
         let expected = n as f32 * hint;
-        if summary_h >= expected * 0.5 {
+        if summary_h >= expected * 0.9 {
             // 量程健康：清除「重挂保护」痕迹——宽度安定后若提示再被清空，要立即可自愈，
             // 不能残留 `hint_recovered=true` 永远卡死不重挂（“拖到底不到底”的持久根因）。
             self.hint_recovered = false;
@@ -1797,7 +1800,15 @@ impl MarkdownPreview {
         // prepaint 清掉属于常态，每帧 O(n) 是卡顿源；宽度安定后坍缩立即重铺一次。
         let width_active = (self.last_render_width - width).abs() >= 2.0;
         self.last_render_width = width;
-        if self.hint_recovered && width_active {
+        // 宽度逐帧变化期间刚铺过又立刻被清 → 去抖那几帧（避免每帧 O(n)）。**仅在
+        // 「宽仍在动」且「刚铺过」时跳过一次**；稳定宽度（打开/静止）下绝不因去抖拒铺
+        // （否则打开 EPUB 量程保持坍缩、必须拖一次才自愈——“无法一次滚到底”根因）。
+        if self.hint_recovered
+            && width_active
+            && self.last_hint_apply.is_some_and(|t| {
+                (t.elapsed().as_millis() as u64) < crate::config::timing::HINT_REAPPLY_INTERVAL_MS
+            })
+        {
             return false;
         }
         let prev_scroll = self.list_state.logical_scroll_top();
@@ -2374,7 +2385,8 @@ pub(crate) fn find_text_range(text: &str, needle: &str) -> Option<std::ops::Rang
 /// - **窗口模式**：量程 = 抽样块高模型总高（`content_height`，与窗口大小无关），
 ///   拖拽只写共享 `desired`（px，render 逐帧 `apply_desired` 落窗口重定位）——
 ///   确定性、无坍缩、拖到底必到全文末尾。
-/// - **小文档**：仍走 ListState 的 summary 量程 + 拖拽前 O(n) 校准冻结（原路径）。
+/// - **小文档**：量程跟随 `list` 自身（实时/冻结 summary + 视口），与 gpui 内置
+///   ListState 滚动条同口径；拖拽前若检测到真坍缩，先 O(n) 统一重铺再冻结（原路径）。
 ///
 /// 滚轮滚动由容器级处理器驱动（窗口模式），与本滚动条无关。
 #[derive(Clone)]
@@ -2413,7 +2425,19 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
     }
 
     fn content_size(&self) -> gpui::Size<gpui::Pixels> {
-        gpui::size(px(self.content_width), px(self.content_height))
+        if self.windowed {
+            // 窗口模式：量程 = 抽样块高模型总高（确定性，与列表测量无关）。
+            gpui::size(px(self.content_width), px(self.content_height))
+        } else {
+            // 小文档：量程**跟随 ListState 自身**（实时总高 / 拖拽时被冻结的
+            // `scrollbar_drag_start_height` + 视口），与 gpui 内置
+            // `ListState::ScrollbarHandle` 同口径。这样 thumb 的可走全程恰好等于
+            // `set_offset_from_scrollbar` 映射所用的可滚域，拖到底必到真实末尾。
+            // 不能用小文档的「估算」`n×est_hint`：真机布局（真实字体/DPI）若比估算高，
+            // thumb 拖到底只到 `n×est_hint−视口`，离真正底部差一段——“无法一次拖到底”。
+            let view = self.list.viewport_bounds();
+            gpui::size(view.size.width, view.size.height + self.list.max_offset_for_scrollbar().y)
+        }
     }
 
     fn start_drag(&self) {
@@ -2424,6 +2448,9 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
         // 小文档：拖拽开始前把量程铺到「确定性正确」再冻结（O(n) 仅在坍缩时一次）：
         // `items.summary().height` 会被冻结进 `scrollbar_drag_start_height`，
         // 若此时仍是坍缩值，整次拖拽都会被夹在旧量程 → 拖不到底、只能滚轮兜底。
+        // 坍缩判定对照「期望全篇高」`n×est_hint`——只有**真坍缩**（summary 明显低于
+        // 估算）才重铺；真实布局更高（估算偏小）时保持现值不重铺，content_size 随
+        // ListState 走，拖到底仍是真实末尾。
         let total = self.list.max_offset_for_scrollbar().y.as_f32()
             + self.list.viewport_bounds().size.height.as_f32();
         if self.n > 0 && self.est_hint > 0.0 && total < self.content_height * 0.97 {

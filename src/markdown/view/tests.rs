@@ -84,6 +84,22 @@ fn epub_viewport_page_bounds(cx: &mut TestAppContext) {
     });
     assert_eq!(p1, 1, "初始应为第 1 页");
     assert!(n >= 2, "多段内容应分多页（总页数={n}）");
+    // 量程健康：打开后（无任何拖拽/交互）滚动条量程应立即 ≈ 全文（不坍缩）——否则
+    // 用户「无法一次拖到底」（需先拖一次 start_drag 才重铺）。小文档视口 200。
+    let (maxoff, view, total_h) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let v = md.read(cx);
+        (
+            v.list_state.max_offset_for_scrollbar().y.as_f32(),
+            v.list_state.viewport_bounds().size.height.as_f32(),
+            v.total_h(),
+        )
+    });
+    let sum_h = maxoff + view;
+    assert!(
+        sum_h >= total_h * 0.9,
+        "打开即量程不坍缩（summary~={sum_h:.0} vs total={total_h:.0}）"
+    );
     // 滚到底（公开跳转入口 scroll_to_row，小文档走 ListState reveal）→ 末页。
     let last = cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
@@ -109,6 +125,87 @@ fn epub_viewport_page_bounds(cx: &mut TestAppContext) {
     // 注：窗口模式（> WINDOWED_MIN_BLOCKS）的页码依赖宿主布局后的视口高/高度模型；
     // 单元环境的固定窗口 ListState 不测视口（viewport 高度为 0），此路径留真机/集成
     // 验证。小文档主路径（上图）已覆盖「初始页 / 滚动前进 / 页码合法」。
+}
+
+/// 回归：「EPUB 滚动条无法一次拖到底」的真机根因——真机字体/DPI 渲染后的列表实测
+/// 总高可能**高于**启发式估算 `n×est_hint`（CJK 0.55×字号等近似偏乐观）。旧实现
+/// 小文档的滚动条 `content_size` 用的是估算值 → thumb 拖到底只发 `-(n×hint−视口)`，
+/// 被 `set_offset_from_scrollbar` 夹在 `n×hint−视口`，离真实底部差一段 → 拖不到底。
+/// 修复：小文档量程跟随 ListState 自身（`max_offset + 视口`，与 gpui 内置同口径），
+/// thumb 全程 == 可滚域，拖到底必到真实末尾。
+#[gpui::test]
+fn small_doc_scrollbar_follows_list_summary_when_taller_than_estimate(
+    cx: &mut TestAppContext,
+) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let mut doc = String::new();
+    for i in 0..80 {
+        doc.push_str(&format!("## 第{i}节\n\n正文段落{i}，内容内容内容。\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_epub(true, Default::default(), cx);
+            md.set_source(&doc, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    let (n, hint, ls, view) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        (
+            m.item_count(),
+            m.est_hint,
+            m.test_list_state(),
+            m.list_state.viewport_bounds(),
+        )
+    });
+    assert!(n > 0 && hint > 0.0, "小文档应有位齐全（n={n} hint={hint:.1}）");
+    // 模拟真机：实测总高 = 1.5×估算（真实排版比启发式估算高）。
+    let real_h = n as f32 * hint * 1.5;
+    ls.reset_with_uniform_height(n, px(hint * 1.5));
+
+    // 与 `vertical_scrollbar` 完全同构地构造句柄（content_height 仍传估算以复刻旧缺陷）。
+    let handle = PreviewVerticalScrollHandle {
+        list: ls.clone(),
+        content_width: 300.0,
+        content_height: n as f32 * hint,
+        est_hint: hint,
+        n,
+        windowed: false,
+        desired: std::rc::Rc::new(std::cell::Cell::new(0.)),
+    };
+    // ① 量程必须跟随 ListState 实测（而非估算）——旧实现会断言失败。
+    let content_h = handle.content_size().height.as_f32();
+    let expect = view.size.height.as_f32() + ls.max_offset_for_scrollbar().y.as_f32();
+    assert!(
+        (content_h - expect).abs() < 1.0,
+        "小文档量程应跟随 ListState 实测：content_h={content_h:.0} expect={expect:.0}（估算 n×hint={:.0}）",
+        n as f32 * hint
+    );
+    // ② 拖到底（start_drag 冻结 → thumb 到底发 -(量程−视口)）必须到达真实末尾：
+    // 视口顶部不再停在「估算末尾」附近，而是末段——最后一行须落进可见窗口。
+    handle.start_drag();
+    handle.set_offset(point(px(0.), px(-(content_h - view.size.height.as_f32()))));
+    let bottom_ix = ls.logical_scroll_top().item_ix;
+    let item_h = real_h / n.max(1) as f32;
+    let visible = (view.size.height.as_f32() / item_h).ceil() as usize;
+    assert!(
+        bottom_ix + visible >= n - 1,
+        "拖到底后末行应在视口内（top_ix={bottom_ix}，可见≈{visible}，共{n}，content_h={content_h:.0} real_h={real_h:.0}）；旧实现缩在估算末尾 ⇒ 末行不可达"
+    );
+    // 清理冻结值，避免影响测试后段。
+    handle.end_drag();
 }
 
 /// 超宽内容应让横向滚动句柄产生正向 max_offset（可滚动范围正确）。
