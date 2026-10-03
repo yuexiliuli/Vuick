@@ -264,6 +264,17 @@ pub struct WyEditor {
     /// 宿主每帧推入的「当前视口顶部 px」（元素局部 y，来自 `#live-scroll` 的
     /// `ScrollHandle::offset` + #live-body 顶部内衬换算）。
     viewport_top_px: Cell<f32>,
+    /// 编辑区⇄预览滚动同步的目标块**源码行**（宿主渲染期写入；WY 元素 prepaint 经
+    /// [`Self::advance_pending_scroll`] 逐帧重钉宿主偏移直到稳住再清——仿缩放恢复的
+    /// 收敛语义，规避「单次写宿主偏移被后续布局复位」）。
+    scroll_target: Cell<Option<usize>>,
+    /// 上次重钉写进的 `(目标源码行, 目标绝对偏移)`：prepaint 每帧先读宿主当前偏移，
+    /// 与它一致才判「已稳住并清除」；否则重写并更新。
+    last_pin: Cell<Option<(usize, f32)>>,
+    /// 重钉已施加的帧数：每次 `set_scroll_target` 清零，`advance_pending_scroll` 每帧
+    /// +1；超 [`Self::SCROLL_TARGET_MAX_APPLIES`] 强制清除（防宿主偏移被滚动条/布局
+    /// 持续复位的病态下永不收敛 → 每帧满载重排，仿 `zoom_applies` 的兜底）。
+    scroll_applies: Cell<u32>,
     /// 缩放恢复**收敛状态**：`advance_zoom_restore` 逐帧随 `block_top/height` 细化重新计算
     /// 目标（高度估计→整形真值逐帧收敛），直到目标位移 < [`Self::ZOOM_ANCHOR_EPS`] 或
     /// 超过 [`Self::ZOOM_ANCHOR_MAX_APPLIES`] 帧才消费锚点——避免一次性按未收敛高度
@@ -1019,6 +1030,9 @@ impl WyEditor {
             last_bounds: Cell::new(None),
             zoom_anchor: RefCell::new(None),
             viewport_top_px: Cell::new(0.0),
+            scroll_target: Cell::new(None),
+            last_pin: Cell::new(None),
+            scroll_applies: Cell::new(0),
             zoom_last_target: Cell::new(None),
             zoom_applies: Cell::new(0),
             host_scroll: RefCell::new(None),
@@ -1188,12 +1202,19 @@ impl WyEditor {
     /// → 定位目标可视带 → 在目标带重建窗口化帧读**精确**块顶 → 写回宿主 `ScrollHandle`
     ///（内容坐标 top = −offset.y − pad_y → offset = −(top + pad_y)），并发布新带给下帧。
     pub(crate) fn scroll_to_line(&mut self, src_line: usize, window: &mut Window) {
+        let _ = self.scroll_to_line_impl(src_line, window);
+    }
+
+    /// [`Self::scroll_to_line_impl`] 的精确落地（含宿主偏移写入），返回写入的目标
+    /// **绝对偏移** `-(exact_top + pad_y)`；空文档/无宿主时返回 `f32::NAN`。编辑区⇄
+    /// 预览同步的 `advance_pending_scroll` 复用同一落点，并以返回值逐帧核对是否稳住。
+    fn scroll_to_line_impl(&mut self, src_line: usize, window: &mut Window) -> f32 {
         let n = self.doc.block_count();
         if n == 0 || self.doc.len() == 0 {
-            return;
+            return f32::NAN;
         }
         if src_line >= self.doc.line_count() {
-            return;
+            return f32::NAN;
         }
         let block = self.doc.block_index_for_line(src_line).min(n - 1);
         let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
@@ -1217,7 +1238,82 @@ impl WyEditor {
         let exact_top = frame.block_top(block);
         *self.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
         if let Some((vh, pad_y)) = self.host_scroll.borrow().clone() {
-            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(-(exact_top + pad_y))));
+            let target = -(exact_top + pad_y);
+            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(target)));
+            return target;
+        }
+        f32::NAN
+    }
+
+    /// 编辑区⇄预览滚动同步：把目标块**源码行**记入 `scroll_target`（宿主渲染期写入，
+    /// 只存 Cell 不做任何布局/滚动）。WyEditor 元素 prepaint 经 [`Self::advance_pending_scroll`]
+    /// 逐帧重钉宿主偏移直到稳住——提前在宿主 render 期调 `scroll_to_line` 会被本帧
+    /// 布局复位，必须借 WY 自己的重钉循环（同缩放恢复收敛）。
+    pub(crate) fn set_scroll_target(&self, src_line: usize) {
+        self.scroll_target.set(Some(src_line));
+        self.last_pin.set(None);
+        self.scroll_applies.set(0);
+    }
+
+    /// 是否有待落地的滚动目标（prepaint 据此驱动重钉 + 刷帧）。
+    pub(crate) fn scroll_target_active(&self) -> bool {
+        self.scroll_target.get().is_some()
+    }
+
+    /// 编辑区⇄预览滚动同步的**重钉兜底**：最多逐帧施加这么多次后强制清除（防宿主
+    /// 偏移被滚动条/布局持续复位的病态下永不收敛 → 每帧 `window.refresh()` + 重排
+    /// 满载忙循环；对齐缩放恢复 [`Self::ZOOM_ANCHOR_MAX_APPLIES`]）。
+    pub(crate) const SCROLL_TARGET_MAX_APPLIES: u32 = 30;
+
+    /// 推进待落地滚动（WyEditor 元素 prepaint 每帧调用）：目标块**精确**顶经
+    /// `scroll_to_line_impl` 写回宿主句柄。先读宿主当前偏移，若与上次写入的目标一致
+    /// （说明布局未复位、已稳住）则清除目标停止重钉，否则重写并继续。
+    ///
+    /// - **后续帧复用 `last_pin` 缓存目标只写不重建**（首帧经 `scroll_to_line_impl`
+    ///   已在目标带整形真值）：确认帧零成本，避免大文档上每帧 band 重建放大 CPU。
+    /// - **[`Self::SCROLL_TARGET_MAX_APPLIES`] 兜底**：超限强制清除，绝不无限重钉。
+    /// - 宿主未注入（live2 / 元素卸载期）：**丢弃残留目标**，宿主回归后按陈旧块号
+    ///   重钉（仿缩放恢复宿主缺失即弃锚点）。
+    pub(crate) fn advance_pending_scroll(&mut self, window: &mut Window) {
+        let Some(sl) = self.scroll_target.get() else {
+            return;
+        };
+        let applies = self.scroll_applies.get();
+        if applies + 1 >= Self::SCROLL_TARGET_MAX_APPLIES {
+            // 超限兜底：强制停止（最后一次 `scroll_to_line_impl` 已把精确目标写进宿主）。
+            self.scroll_target.set(None);
+            self.last_pin.set(None);
+            self.scroll_applies.set(0);
+            return;
+        }
+        self.scroll_applies.set(applies + 1);
+        let Some((vh, _pad_y)) = self.host_scroll.borrow().clone() else {
+            self.scroll_target.set(None);
+            self.last_pin.set(None);
+            self.scroll_applies.set(0);
+            return;
+        };
+        let cur = (-vh.offset().y).as_f32();
+        // 首帧（或目标块变化）经 `scroll_to_line_impl` 精确重建并写目标；后续帧复用
+        // `last_pin` 缓存的目标偏移只重写（确认帧零成本，避免大文档每帧 band 重建）。
+        let target = match self.last_pin.get() {
+            Some((psl, pt)) if psl == sl => pt,
+            _ => self.scroll_to_line_impl(sl, window),
+        };
+        if !target.is_finite() {
+            self.scroll_target.set(None);
+            self.last_pin.set(None);
+            self.scroll_applies.set(0);
+            return;
+        }
+        if self.last_pin.get() == Some((sl, target)) && (cur - target).abs() < 1.5 {
+            // 上一帧写入的目标在再次写入前仍被宿主持有 → 布局未复位，稳定落地。
+            self.scroll_target.set(None);
+            self.last_pin.set(None);
+            self.scroll_applies.set(0);
+        } else {
+            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(target)));
+            self.last_pin.set(Some((sl, target)));
         }
     }
 
@@ -1310,6 +1406,27 @@ impl WyEditor {
         let block = lo.saturating_sub(1).min(n - 1);
         let h = f.block_height(block).max(1.);
         Some((block, ((top_px - f.block_top(block)) / h).clamp(0.0, 1.0)))
+    }
+
+    /// 当前视口顶部落点块的**起始源码行**（0 基；帧未就绪返回 `None`）。编辑区⇄
+    /// 预览滚动同步用——预览侧同步键 = 该行所在块的起点，与 [`Self::block_start_of_line`]
+    /// 同口径（都以块对齐：块内微滚动不拉动对端）。
+    pub(crate) fn top_source_line(&self) -> Option<usize> {
+        let f = self.frame.borrow().clone()?;
+        let (block, _) = self.block_of_px(self.viewport_top_px.get())?;
+        Some(f.base.borrow().src_line(block) as usize)
+    }
+
+    /// 源码行 → 所在块的**起始源码行**（0 基；块按 `src_line` 升序连续覆盖，越界归
+    /// 首/末块；0 块时原样返回）。滚动同步把「编辑器顶行」归一成块起点，与预览顶
+    /// 块比较——同一段落/代码块内微滚动双方键不变，不互相拉动。
+    pub(crate) fn block_start_of_line(&self, line: usize) -> usize {
+        let n = self.doc.block_count();
+        if n == 0 {
+            return line;
+        }
+        let ix = self.doc.block_index_for_line(line).min(n.saturating_sub(1));
+        self.doc.block_meta(ix).map(|m| m.src_line as usize).unwrap_or(line)
     }
 
     /// 重排前捕捉缩放锚点：当前视口顶部 px → 落在的块 + 块内比例。

@@ -255,6 +255,32 @@ struct EditorAppRegistry {
 
 impl gpui::Global for EditorAppRegistry {}
 
+/// 编辑区⇄预览滚动同步基线（见 [`EditorApp::sync_editor_preview_scroll`]）。记录
+/// 当前选项卡 + 编辑器内容版本 + 上次已同步的双方「块起点」键，渲染帧比对后由动了
+/// 的那一侧驱动对端。切换选项卡 / 同一选项卡内换文档 / 编辑使内容版本变化 → 重建。
+#[derive(Clone, Copy)]
+struct MdScrollSync {
+    tab: usize,
+    editor_version: Option<u64>,
+    editor_block: Option<usize>,
+    preview_block: Option<usize>,
+    /// 我方（编辑器主导时）最近一次要求预览到达的目标块：预览重钉落位到该块是「按
+    /// 我方命令跟上」，不得反被当成用户滚动预览而把编辑器拽回（来回跳动）。
+    driven_preview_target: Option<usize>,
+}
+
+impl Default for MdScrollSync {
+    fn default() -> Self {
+        Self {
+            tab: usize::MAX,
+            editor_version: None,
+            editor_block: None,
+            preview_block: None,
+            driven_preview_target: None,
+        }
+    }
+}
+
 pub struct EditorApp {
     /// 所有文件选项卡
     tabs: Vec<EditorTab>,
@@ -326,6 +352,10 @@ pub struct EditorApp {
     /// 媒体右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     media_lock_menu_sub: Option<Subscription>,
     focus_handle: FocusHandle,
+    /// 编辑区⇄预览（MD 统一组件 WyEditor）滚动同步基线：当前选项卡 + 上次已同步的
+    /// 双方块起点键。每帧渲染开头比对、由「动了的那一侧」驱动对端；切换选项卡/换
+    /// 文档（块号失义）即重置。
+    md_scroll_sync: MdScrollSync,
 }
 
 /// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
@@ -429,6 +459,7 @@ impl EditorApp {
             media_lock_menu_entity: None,
             media_lock_menu_sub: None,
             focus_handle,
+            md_scroll_sync: MdScrollSync::default(),
         };
         app.register_window(window, cx);
         if let Some(first_tab) = first_tab {
@@ -1232,6 +1263,80 @@ impl EditorApp {
         tab.md_wy.clone()
     }
 
+    /// 编辑区⇄预览滚动同步（每帧渲染开头调用）。只在「活动选项卡以 WyEditor 作 MD
+    /// 预览且在**非 live2 实时编辑**的分屏（非全屏 / 非只读 + 预览开启）」时生效——
+    /// live2 下右栏预览不在元素树，驱动隐藏实体只会残留陈旧目标。
+    ///
+    /// 同步单位 = 源码行所在**块起点**（两侧都经 [`WyEditor::block_start_of_line`] /
+    /// [`WyEditor::top_source_line`] 归一成块）：同一块（段落/代码块/标题）内微滚动
+    /// 双方键不变、不互拉，避免反馈抖动；跨块才驱动对端。
+    /// 逻辑：编辑器顶行块变了 → 预览 `scroll_to_line` 到该块；预览顶块变了（且编辑器
+    /// 未同时动）→ 编辑器滚动到该块起点。双侧收敛到同一块后静止。
+    ///
+    /// 注意：两侧键读取的是**上一帧**的滚动/视口状态（`top_source_line` 读 `panes`
+    /// 上一帧渲染期推入的 `viewport_top_px`）——本帧推入发生在 sync 之后，故同步天然
+    /// 滞后一帧；对逐帧收敛无影响，反而更稳。
+    fn sync_editor_preview_scroll(&mut self, cx: &mut Context<Self>) {
+        let idx = self.active_tab;
+        if self.md_wy_preview().is_none() {
+            return;
+        }
+        let tab = &self.tabs[idx];
+        if tab.readonly_preview || tab.preview_fullscreen || !self.show_preview() || tab.live_edit {
+            return;
+        }
+        let Some(md) = tab.md_wy.clone() else { return };
+        let editor = tab.editor.clone();
+
+        // 读两侧当前块起点键（预览帧未就绪 → None，本帧不动）。
+        let preview_block = md.read(cx).top_source_line();
+        let editor_block = Some(md.read(cx).block_start_of_line(editor.read(cx).viewport_top_line()));
+
+        // 首次进入该选项卡 / 换文档（块号失义）/ 编辑器内容已编辑（块映射变）：
+        // 重建基线，只记录不驱动。
+        let ev = Some(editor.read(cx).version());
+        if self.md_scroll_sync.tab != idx || self.md_scroll_sync.editor_version != ev {
+        self.md_scroll_sync = MdScrollSync {
+            tab: idx,
+            editor_version: ev,
+            editor_block,
+            preview_block,
+            driven_preview_target: None,
+        };
+        return;
+    }
+    let prev = self.md_scroll_sync;
+    self.md_scroll_sync.editor_block = editor_block;
+    self.md_scroll_sync.preview_block = preview_block;
+    let Some(eb) = editor_block else { return };
+    if preview_block == Some(eb) {
+        // 两侧同一块，已同步：作废「等待预览到达」的驱动目标（已对齐）。
+        self.md_scroll_sync.driven_preview_target = None;
+        return;
+    }
+    if prev.editor_block != editor_block {
+        // 编辑器先动 → 预览跟到编辑器顶行所在块。**不能在本帧 render 直接调**
+        // `scroll_to_line`（宿主 `ScrollHandle::set_offset` 在渲染期会被本帧布局
+        // 复位）：只把目标行写进 WY 的 `scroll_target`，由其元素 prepaint 逐帧重钉
+        // 宿主偏移直到稳住（有 [`WyEditor::SCROLL_TARGET_MAX_APPLIES`] 兜底）。
+        // 记录「等待预览到达」目标：预览重钉落位到它时不被误判为预览用户滚动。
+        md.update(cx, |v, _| v.set_scroll_target(eb));
+        self.md_scroll_sync.driven_preview_target = Some(eb);
+    } else if let Some(pb) = preview_block
+        && prev.preview_block != preview_block
+        // 预览落位到「我方正在驱动的预览目标」= 编辑器主导下的跟随，不反向拉动。
+        && preview_block != self.md_scroll_sync.driven_preview_target
+    {
+        // 预览先动 → 编辑器跟到预览顶块起点。
+        editor.update(cx, |ed, _| ed.scroll_to_line(pb));
+        // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
+        // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
+        // 目标作废。
+        self.md_scroll_sync.editor_block = Some(pb);
+        self.md_scroll_sync.driven_preview_target = None;
+    }
+}
+
     /// A4：当前激活选项卡的 Markdown TOC 数据源 + 跳转目标（侧边栏目录共用）：
     /// MD 统一预览（`md_wy` 在场，非只读）→ WyEditor（条目 = 源码行，点击滚动统一组件
     /// 宿主）；EPUB / 手动预览（`md_wy` 缺席）→ `MarkdownPreview`（渲染行列，`scroll_to_row`）。
@@ -1978,6 +2083,8 @@ impl Render for EditorApp {
             crate::prof::add_absolute("app.frame_delay", d);
         }
         let _t = crate::prof::begin();
+        // 编辑区⇄预览滚动同步：动了的一侧驱动另一侧到对应块（仅 MD 分屏、非 live2）。
+        self.sync_editor_preview_scroll(cx);
         // 实时预览编辑（WYSIWYG）本身即「所见即所得」，右侧 Markdown 预览冗余 →
         // 编辑区占满整块（不显示分割线与预览区），退出实时模式后恢复原分屏。
         let body = self.render_body(window, cx);

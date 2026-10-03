@@ -969,6 +969,14 @@ impl Element for WyEditorElement {
                 }
             }
 
+        // 编辑区⇄预览滚动同步（WY 自驱动落地）：宿主把目标行写进 `scroll_target`，
+        // 在此每帧经 `advance_pending_scroll` 重钉宿主偏移直至稳住（仿缩放恢复收敛，
+        // 规避「单次写宿主偏移被后续布局复位」）。目标在或刚清除都要刷下一帧。
+        if self.editor.read(cx).scroll_target_active() {
+            self.editor.update(cx, |e, _| e.advance_pending_scroll(window));
+            window.refresh();
+        }
+
         // 光标可视位置（元素局部）→ IME bounds。
         let frame = {
             let e = self.editor.read(cx);

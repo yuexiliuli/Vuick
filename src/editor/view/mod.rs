@@ -1119,6 +1119,21 @@ impl CodeEditor {
         (self.window_base + s.item_ix, s.offset_in_item.as_f32())
     }
 
+    /// 视口顶部的**源码行**（0 基；绝对视觉行经折叠映射回逻辑行）。编辑区⇄预览
+    /// 滚动同步用——同步单位 = 源码行，两侧都以它对齐。
+    pub(crate) fn viewport_top_line(&self) -> usize {
+        let (vis, _) = self.abs_scroll_top();
+        self.folds.logical_row(vis)
+    }
+
+    /// 滚动到目标**源码行**置于视口顶部（统一行高模型；逻辑行经折叠映射成视觉行，
+    /// 再换算像素交给 `scroll_to_px`——夹到量程内，底部预留让末行停在横向条上方）。
+    pub(crate) fn scroll_to_line(&mut self, line: usize) {
+        let lh = self.line_height.as_f32().max(1.);
+        let vis = self.folds.visual_row(line);
+        self.scroll_to_px(vis as f32 * lh);
+    }
+
     /// ListState **实际**滚动位置（px，绝对坐标；读窗口合成，不读 `desired_scroll`）。
     /// 用于重建后把「用户目标」重新对齐 ListState（见 `resync_list`），以及常规读数。
     fn list_scroll_top_px(&self) -> f32 {
