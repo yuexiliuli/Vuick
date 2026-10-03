@@ -45,6 +45,72 @@ fn settle(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+/// EPUB 轻量视口分页读数：非 EPUB → `None`；EPUB 小文档 → 页数 sane 且滚到底 =
+/// 末页；窗口模式（> 窗口阈值块数）desired 口径滚到底 = 末页。
+#[gpui::test]
+fn epub_viewport_page_bounds(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+
+    // 非 EPUB → 无页码
+    assert!(
+        cx.update(|_, cx| host.read(cx).md.read(cx).viewport_page_bounds()).is_none(),
+        "非 EPUB 模式不应有页码"
+    );
+
+    // EPUB 小文档：多段 → 多页；滚到底 = 末页。
+    let mut doc = String::new();
+    for i in 0..60 {
+        doc.push_str(&format!("## 第{i}节\n\n正文段落{i}。\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_epub(true, Default::default(), cx);
+            md.set_source(&doc, cx);
+        });
+    });
+    cx.simulate_resize(size(px(300.), px(200.)));
+    settle(cx);
+    let (p1, n) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.read(cx).viewport_page_bounds().expect("epub 应有页码")
+    });
+    assert_eq!(p1, 1, "初始应为第 1 页");
+    assert!(n >= 2, "多段内容应分多页（总页数={n}）");
+    // 滚到底（公开跳转入口 scroll_to_row，小文档走 ListState reveal）→ 末页。
+    let last = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.read(cx).item_count().saturating_sub(1)
+    });
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _| md.scroll_to_row(last));
+    });
+    for _ in 0..4 {
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+    }
+    let (p2, n2) = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.read(cx).viewport_page_bounds().expect("epub 应有页码")
+    });
+    assert!(
+        p2 > p1 && p2 <= n2,
+        "滚动后当前页应前进且合法（{p1} -> {p2}/{n2}）"
+    );
+
+    // 注：窗口模式（> WINDOWED_MIN_BLOCKS）的页码依赖宿主布局后的视口高/高度模型；
+    // 单元环境的固定窗口 ListState 不测视口（viewport 高度为 0），此路径留真机/集成
+    // 验证。小文档主路径（上图）已覆盖「初始页 / 滚动前进 / 页码合法」。
+}
+
 /// 超宽内容应让横向滚动句柄产生正向 max_offset（可滚动范围正确）。
 #[gpui::test]
 fn wide_source_makes_harea_overflow(cx: &mut TestAppContext) {

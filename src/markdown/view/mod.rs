@@ -614,6 +614,54 @@ impl MarkdownPreview {
         self.invalidate_height_hint();
     }
 
+    /// EPUB 轻量视口分页读数：`(当前页, 总页数)`（1 基）——按「内容总高 / 视口高」
+    /// 切页，当前页以**视口中心**落在的页计（clamp 到 `[1, 总页数]`）。口径与纵向
+    /// 滚动条量程同源（窗口模式 = `desired_scroll`＋抽样块高模型总高；小文档 =
+    /// `list_state` px 滚动＋行数×平均高），故字号调整/换宽后页码自动跟随。
+    /// 非 EPUB / 无源返回 `None`（不显示页码）。纯展示读数，无翻页交互。
+    pub(crate) fn viewport_page_bounds(&self) -> Option<(usize, usize)> {
+        // 有源判定：小文档 `rows` 物化全量；窗口模式懒物化 `rows` 恒空，以 `index`
+        // 为准（否则大 EPUB 会误判为无源而不显示页码）。
+        if !self.epub_mode || (self.index.is_none() && self.rows.is_empty()) {
+            return None;
+        }
+        let view_h = self
+            .list_state
+            .viewport_bounds()
+            .size
+            .height
+            .as_f32()
+            .max(1.);
+        // **就绪门控**：视口尚未布局 / 小文档平均行高未估（render 节流后才估）/
+        // 窗口高度模型未建（render 后才有）时返回 `None`——宁可不显示，也不让首帧
+        // 乱值（视口 0 / est_hint 0 时页数会被算成假值）造成「1/45 跳 1/55」跳动。
+        if view_h < 16.0 {
+            return None;
+        }
+        if self.index.is_none() && self.est_hint <= 0.0 {
+            return None;
+        }
+        if self.index.is_some() && self.height_pref.is_empty() {
+            return None;
+        }
+        let content_h = self.total_h().max(view_h);
+        let total = ((content_h / view_h).ceil()).max(1.) as usize;
+        // 滚动 top（px，与量程同源）：
+        // - 窗口模式：像素模型用户目标 `desired_scroll`；
+        // - 小文档：绝对逻辑行 × 统一行高 + 行内偏移（`list_state.scroll_px_offset_*`
+        //   在 summary 未就绪时常恒 0，不能用于页码）。
+        let top_px = if self.index.is_some() {
+            self.desired_scroll.get().max(0.)
+        } else {
+            let (row, off_px) = self.abs_scroll_top();
+            row as f32 * self.est_hint.max(1.0) + off_px
+        };
+        // 当前页 = 视口顶部落在的页（顶部页语义：滚到某页顶才算翻页；
+        // 滚到底 `top_px=content_h-view_h` → `floor((c-v)/v)+1 = ceil(c/v)` = 总页数）。
+        let page = (top_px / view_h).floor() as usize;
+        Some((page.min(total - 1) + 1, total))
+    }
+
     /// 清空上帧注记/文本命中与悬浮状态（换源 / 换滚动位置 / 关 EPUB 排版时调用）。
     fn clear_note_state(&mut self) {
         self.note_ctx.hits.borrow_mut().clear();

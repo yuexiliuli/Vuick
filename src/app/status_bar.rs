@@ -30,12 +30,28 @@ impl EditorApp {
         let wrap_on = tab
             .map(|t| t.md_preview.read(cx).is_wrap())
             .unwrap_or(false);
+        // EPUB 轻量视口分页：底部显示「第 x / N 页」，随滚动实时（只读预览的 PDF 无
+        // md_preview 源 → page_bounds 返回 None，不显示）。
+        let epub_page = tab
+            .and_then(|t| t.md_preview.read(cx).viewport_page_bounds());
         let mut right = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
             .flex_shrink_0();
+
+        // 只读预览（EPUB）的阅读位：页码顶到最前，替代无意义的 Ln/Col。
+        if let Some((page, total)) = epub_page {
+            right = right.child(
+                div()
+                    .id("status-epub-page")
+                    .debug_selector(|| "status-epub-page".into())
+                    .text_size(px(12.))
+                    .text_color(chip_text)
+                    .child(format!("第 {page} / {total} 页")),
+            );
+        }
 
         // 全屏/还原按钮：仅在开启预览且非只读预览（PDF/EPUB）时显示
         if preview_on && !readonly_preview {
@@ -51,25 +67,28 @@ impl EditorApp {
             right = right.child(self.status_wrap_btn(wrap_on, cx));
         }
 
-        let right = right
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(chip_text)
-                    .child(format!("Ln {ln}, Col {col}")),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(text_minor)
-                    .child(format!("{line_count} 行")),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(text_minor)
-                    .child(format!("{char_count} 字")),
-            );
+        // 非只读文档右侧保留行列/统计；EPUB 只读时上述信息无意义（0/0），已让位给页码。
+        if epub_page.is_none() {
+            right = right
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(chip_text)
+                        .child(format!("Ln {ln}, Col {col}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(text_minor)
+                        .child(format!("{line_count} 行")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(text_minor)
+                        .child(format!("{char_count} 字")),
+                );
+        }
 
         div()
             .h(px(28.))

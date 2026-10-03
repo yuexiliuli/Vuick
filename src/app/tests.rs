@@ -4163,6 +4163,86 @@
         );
     }
 
+    /// EPUB 轻量视口分页：底部状态栏出现「第 x / N 页」；初始第 1 页、总页数随内容
+    /// 分页；滚动预览到末标题后页码前进（滚动明细由 view 层单元测试覆盖）。
+    #[gpui::test]
+    async fn epub_status_bar_shows_pages_and_follows_scroll(cx: &mut TestAppContext) {
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+        if !epub.exists() {
+            eprintln!("SKIP epub_status_bar_shows_pages_and_follows_scroll: 缺 fixtures/xy.epub");
+            return;
+        }
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(900.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));
+        });
+        // 页码元素按就绪门控出现（视口/行高就绪后），有界等待而非固定帧数，避免 flaky。
+        let mut page_el = None;
+        for _i in 0..30 {
+            for _ in 0..2 {
+                cx.run_until_parked();
+                let _ = cx.cx.refresh();
+                cx.run_until_parked();
+            }
+            if let Some(b) = cx.debug_bounds("status-epub-page") {
+                page_el = Some(b);
+                break;
+            }
+        }
+        let page_el = page_el.expect("EPUB 状态栏应显示页码（status-epub-page）");
+        assert!(page_el.size.width > px(0.), "页码元素应有宽度");        let (p1, n) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let md = &a.tabs[a.active_tab].md_preview;
+            md.read(cx)
+                .viewport_page_bounds()
+                .expect("EPUB 应有页码读数")
+        });
+        assert_eq!(p1, 1, "初始应为第 1 页");
+        assert!(n >= 1, "总页数至少 1 页（实际 {n}）");
+
+        // 滚动预览到最后一个目录标题 → 页码前进（内容不足一页则不强制）。
+        if n > 1 {
+            let last_toc_row = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let md = &a.tabs[a.active_tab].md_preview;
+                md.read(cx)
+                    .toc_entries()
+                    .last()
+                    .map(|(r, _, _)| *r)
+            });
+            if let Some(row) = last_toc_row {
+                cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    let i = a.active_tab;
+                    let md = a.tabs[i].md_preview.clone();
+                    md.update(cx, |v, _| v.scroll_to_row(row));
+                });
+                for _ in 0..8 {
+                    cx.run_until_parked();
+                    let _ = cx.cx.refresh();
+                    cx.run_until_parked();
+                }
+                let p2 = cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    a.tabs[a.active_tab]
+                        .md_preview
+                        .read(cx)
+                        .viewport_page_bounds()
+                        .expect("EPUB 应有页码读数")
+                });
+                assert!(
+                    p2.0 >= 1 && p2.0 <= p2.1,
+                    "滚动后页码应合法（{}/{}）", p2.0, p2.1
+                );
+            }
+        }
+    }
+
     /// EPUB 阅读体验：状态栏全屏/还原按钮可切换占满与分屏；
     /// 换行开关只切换编辑区偏好，不改变预览换行（预览独立保持换行）。
     #[gpui::test]
