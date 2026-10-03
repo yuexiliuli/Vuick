@@ -1895,6 +1895,15 @@ mod tests {
             .join("video测试.mp4")
     }
 
+    /// 真解码测试共用闸：FFMPEG_LOCK（cdylib 内）全局串行所有 FFmpeg 操作，多个真解码测试
+    /// **并行**跑会让各自 worker 在锁上排队，`loads_first_frame`/`switch_reopens_*` 等 guard
+    /// 循环在排队等待里耗尽 → 偶发超时（已知 flake）。持锁把这些视频测试串行化后不再竞争
+    ///（同 pdf 的 `test_util::lock()` 姿势；`MutexGuard` 跨 gpui::test await 可持，见 pdf 用例）。
+    fn ffmpeg_guard_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     fn blank(path: PathBuf, cx: &mut Context<VideoViewer>) -> VideoViewer {
         VideoViewer {
             path,
@@ -2079,7 +2088,9 @@ mod tests {
     /// 注意：测试环境不驱动 16ms 定时器泵，这里**手动喂 tick**（与 pump 同一条
     /// `tick()→通道→上屏` 路径），证明「解码线程 → 有界通道 → 主线程上屏」端到端。
     #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持锁跨 await：测试锁与 FFMPEG_LOCK 独立，await 的是定时器而非锁，无死锁风险
     async fn loads_first_frame(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
         let viewer: gpui::Entity<VideoViewer> =
             cx.update(|app| app.new(|cx| VideoViewer::new(fixture(), cx)));
         let mut guard = 0;
@@ -2118,7 +2129,9 @@ mod tests {
 
     /// M1 保留：打开损坏 / 不存在文件：落错误占位不死等。
     #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持锁跨 await：测试锁与 FFMPEG_LOCK 独立，await 的是定时器而非锁，无死锁风险
     async fn missing_file_reports_error(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
         let bad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such-video.mp4");
         let viewer: gpui::Entity<VideoViewer> =
             cx.update(|app| app.new(|cx| VideoViewer::new(bad, cx)));
@@ -2588,7 +2601,9 @@ mod tests {
     /// 应把 `playhead` seek 到 ≈ 50% 时长（覆盖「canvas 记录盒 → 屏 x→分数 → seek」全链路，
     /// 且不触 `use_keyed_state` 渲染期限制的闪退路径）。
     #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持锁跨 await：测试锁与 FFMPEG_LOCK 独立，await 的是定时器而非锁，无死锁风险
     async fn control_bar_seek_click_seeks(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
         cx.update(|cx| {
             crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx);
         });
@@ -2623,7 +2638,9 @@ mod tests {
     ///（>0），供 contain 适配使用——回归「百分比高度在 flex 子级失效 → 竖屏放大只露
     /// 顶部」的根因。
     #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持锁跨 await：测试锁与 FFMPEG_LOCK 独立，await 的是定时器而非锁，无死锁风险
     async fn viewport_handle_reports_real_size(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (viewer, wcx) =
             cx.add_window_view(|_window, cx| VideoViewer::new(fixture(), cx));
         let _ = wcx.refresh();
@@ -2643,6 +2660,7 @@ mod tests {
     /// 且视频/音频改为**常驻单 worker 线程**（同线程串行重开，规避“新线程在上一解码器
     /// teardown 后立刻 open”的卡死）。真文件存在才跑（CI/他机跳过）。
     #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持锁跨 await：测试锁与 FFMPEG_LOCK 独立，await 的是定时器而非锁，无死锁风险
     async fn switch_reopens_next_video_cleanly(cx: &mut TestAppContext) {
         let root = std::path::PathBuf::from(r"C:\Users\20294\Videos\school");
         let a = root.join("73.MP4");
@@ -2651,6 +2669,7 @@ mod tests {
             eprintln!("[video-test] 缺真实文件，跳过切换回归");
             return;
         }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
         let viewer: gpui::Entity<VideoViewer> =
             cx.update(|app| app.new(|cx| VideoViewer::new(a.clone(), cx)));
         let s0 = wait_ready(&viewer, cx).await;

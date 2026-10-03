@@ -1035,188 +1035,234 @@ pub(crate) fn paint_selection(
 ) {
     let e = editor.read(cx);
     for r in &f.rows {
-        // 表格：逐可见行 × 逐格，与选区求交 → 格内字形几何高亮（源码级复制/删除
-        // 早已可用，这里把「选区面板高亮」补到表格单元格）。横向滚动反向平移 +
-        // 裁剪在内容区内（与 paint_table_row 同式）。
-        if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
-            if !r.editable {
-                continue;
-            }
-            let scroll = table_hscroll_clamped(editor.read(cx), f, r);
-            let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
-            let grid_h = f32::from(table_block_height(theme, t.rows_texts.len()));
-            let content_rect = Bounds::new(
-                point(origin.x + f.padding, origin.y + r.top),
-                size(px(viewport), px(grid_h)),
-            );
-            let text_lh = f32::from(theme.para_line());
-            window
-                .with_content_mask(Some(gpui::ContentMask { bounds: content_rect }), |window| {
-                    for (row_ix, row_l) in te.rows.iter().enumerate() {
-                        let ls = e.line_start(row_l.src_line);
-                        let row_top = table_row_top(t, row_ix);
-                        let ty = f32::from(r.top) + row_top + ((f32::from(t.row_h) - text_lh) / 2.).max(0.);
-                        for (cell_ix, cell) in row_l.cells.iter().enumerate() {
-                            let Some((d0, d1)) = cell_selection_display(
-                                &cell.map,
-                                cell.line.len(),
-                                cell.src.clone(),
-                                ls,
-                                range,
-                            ) else {
-                                continue;
-                            };
-                            let p0 = cell.line.x_for_index(d0);
-                            let p1 = cell.line.x_for_index(d1);
-                            let x = f32::from(origin.x)
-                                + f32::from(f.padding)
-                                + table_cell_x0(&t.widths, cell_ix)
-                                + cell.text_x
-                                + f32::from(p0)
-                                - scroll;
-                            let w = (f32::from(p1) - f32::from(p0)).max(2.);
-                            window.paint_quad(gpui::PaintQuad {
-                                bounds: Bounds::new(
-                                    point(px(x), origin.y + px(ty)),
-                                    size(px(w), px(text_lh)),
-                                ),
-                                corner_radii: gpui::Corners::default(),
-                                background: hl.into(),
-                                border_widths: gpui::Edges::default(),
-                                border_color: gpui::Hsla::default(),
-                                border_style: gpui::BorderStyle::Solid,
-                            });
-                        }
-                    }
-                });
+        // 三种行形态各走一套几何口径（分拆后互不纠缠，便于单独校对横向滚动/裁剪/换行）：
+        // 表格逐可见行×逐格、代码块逐源码行、普通文本逐可视行。
+        if r.table_edit.is_some() && r.table.is_some() {
+            paint_table_selection_hl(e, origin, theme, f, r, range, hl, window);
             continue;
         }
         if !r.editable || r.wrapped.is_empty() {
             continue;
         }
         if !r.multi_offsets.is_empty() {
-            // 代码块：逐源码行求与选区的交集，按字形几何画高亮（每行一条）。
-            // 横向滚动时高亮随内容平移（−scroll），并裁剪在面板内（不溢到页面背景）。
-            let block_start = e.line_start(r.src_line);
-            let g_count = r.multi_offsets.len();
-            let scroll = code_hscroll_clamped(editor.read(cx), f, r);
-            let panel_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
-            let panel_rect = Bounds::new(
-                point(origin.x + f.padding, origin.y + r.top),
-                size(px(panel_w), r.height),
-            );
-            window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
-                for g in 0..g_count {
-                    let ls = e.line_start(r.src_line + 1 + g);
-                    let le = e.line_end(r.src_line + 1 + g).max(ls);
-                    let from = range.start.max(ls).min(le);
-                    let to = range.end.max(ls).min(le);
-                    if to > from {
-                        let rd0 = source_to_display(&r.byte_map, from - block_start);
-                        let rd1 = source_to_display(&r.byte_map, to - block_start);
-                        let span = group_len(r, g);
-                        let mut c0 = rd0.saturating_sub(r.multi_offsets[g]).min(span);
-                        let mut c1 = rd1.saturating_sub(r.multi_offsets[g]).min(span);
-                        if c0 > c1 {
-                            std::mem::swap(&mut c0, &mut c1);
-                        }
-                        if let Some(wl) = r.wrapped.get(g)
-                            && let Some(p0) = wl.position_for_index(c0, r.lh)
-                            && let Some(p1) = wl.position_for_index(c1, r.lh)
-                        {
-                            let w = f32::from(p1.x - p0.x).max(2.);
-                            let y = r.top + px(code_group_top(r, g));
-                            let h = r.sub_heights.get(g).copied().unwrap_or(r.lh);
-                            window.paint_quad(gpui::PaintQuad {
-                                bounds: Bounds::new(
-                                    point(
-                                        origin.x + f.padding + r.x_off + p0.x - px(scroll),
-                                        origin.y + y,
-                                    ),
-                                    size(px(w), h),
-                                ),
-                                corner_radii: gpui::Corners::default(),
-                                background: hl.into(),
-                                border_widths: gpui::Edges::default(),
-                                border_color: gpui::Hsla::default(),
-                                border_style: gpui::BorderStyle::Solid,
-                            });
-                        }
-                    }
-                }
-            });
-            continue;
-        }
-        let ls = e.line_start(r.src_line);
-        let le = e.line_end(r.src_line).max(ls);
-        let from = range.start.max(ls).min(le);
-        let to = range.end.max(ls).min(le);
-        if to <= from {
-            continue;
-        }
-        let d0 = source_to_display(&r.byte_map, from - ls);
-        let d1 = source_to_display(&r.byte_map, to - ls);
-        let Some(w0) = r.wrapped.first() else {
-            continue;
-        };
-        let len = w0.len().max(1);
-        let d0 = d0.min(len);
-        let d1 = d0.max(d1.min(len));
-        if d1 <= d0 {
-            continue;
-        }
-        // 逐换行边界组成的可视行字节区间：换行点字节 = 边界前最后 glyph 的起点。
-        let runs = &w0.unwrapped_layout.runs;
-        let mut rows: Vec<(usize, usize)> = Vec::new();
-        let mut prev = 0usize;
-        for b in w0.wrap_boundaries() {
-            let mut byte = 0usize;
-            for (ri, run) in runs.iter().enumerate() {
-                let last = run.glyphs.len().saturating_sub(1);
-                if ri < b.run_ix {
-                    byte = run.glyphs.get(last).map(|g| g.index + 1).unwrap_or(byte);
-                } else if ri == b.run_ix {
-                    byte = run
-                        .glyphs
-                        .get(b.glyph_ix.min(last))
-                        .map(|g| g.index)
-                        .unwrap_or(byte);
-                    break;
-                }
-            }
-            if byte > prev {
-                rows.push((prev, byte));
-                prev = byte;
-            }
-        }
-        rows.push((prev, len));
-        for (a, b2) in rows {
-            let c0 = d0.max(a);
-            let c1 = d1.min(b2);
-            if c1 <= c0 {
-                continue;
-            }
-            let p0 = match w0.position_for_index(c0, r.lh) {
-                Some(p) => p,
-                None => continue,
-            };
-            let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
-            let y = r.top + px(text_y_off(r) + text_row_shift(r)) + p1.y.min(p0.y);
-            let w = f32::from(p1.x - p0.x).max(2.);
-            window.paint_quad(gpui::PaintQuad {
-                bounds: Bounds::new(
-                    point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
-                    size(px(w), r.lh),
-                ),
-                corner_radii: gpui::Corners::default(),
-                background: hl.into(),
-                border_widths: gpui::Edges::default(),
-                border_color: gpui::Hsla::default(),
-                border_style: gpui::BorderStyle::Solid,
-            });
+            paint_code_selection_hl(e, origin, f, r, range, hl, window);
+        } else {
+            paint_text_selection_hl(e, origin, f, r, range, hl, window);
         }
     }
 }
+
+/// 表格行选区高亮：逐可见行 × 逐格与选区求交 → 格内字形几何背景（源码级复制/删除早已
+/// 可用，这里把「选区面板高亮」补到表格单元格）。横向滚动反向平移 + 裁剪在内容区内
+///（与 paint_table_row 同式）。
+#[allow(clippy::too_many_arguments)] // 画布(e/theme/origin/f/window) 与 行/区间/背景色正交
+fn paint_table_selection_hl(
+    e: &WyEditor,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    r: &ShapedRow,
+    range: &Range<usize>,
+    hl: Hsla,
+    window: &mut Window,
+) {
+    let (Some(te), Some(t)) = (&r.table_edit, &r.table) else {
+        return;
+    };
+    if !r.editable {
+        return;
+    }
+    let scroll = table_hscroll_clamped(e, f, r);
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let grid_h = f32::from(table_block_height(theme, t.rows_texts.len()));
+    let content_rect = Bounds::new(
+        point(origin.x + f.padding, origin.y + r.top),
+        size(px(viewport), px(grid_h)),
+    );
+    let text_lh = f32::from(theme.para_line());
+    window
+        .with_content_mask(Some(gpui::ContentMask { bounds: content_rect }), |window| {
+            for (row_ix, row_l) in te.rows.iter().enumerate() {
+                let ls = e.line_start(row_l.src_line);
+                let row_top = table_row_top(t, row_ix);
+                let ty = f32::from(r.top) + row_top + ((f32::from(t.row_h) - text_lh) / 2.).max(0.);
+                for (cell_ix, cell) in row_l.cells.iter().enumerate() {
+                    let Some((d0, d1)) = cell_selection_display(
+                        &cell.map,
+                        cell.line.len(),
+                        cell.src.clone(),
+                        ls,
+                        range,
+                    ) else {
+                        continue;
+                    };
+                    let p0 = cell.line.x_for_index(d0);
+                    let p1 = cell.line.x_for_index(d1);
+                    let x = f32::from(origin.x)
+                        + f32::from(f.padding)
+                        + table_cell_x0(&t.widths, cell_ix)
+                        + cell.text_x
+                        + f32::from(p0)
+                        - scroll;
+                    let w = (f32::from(p1) - f32::from(p0)).max(2.);
+                    window.paint_quad(gpui::PaintQuad {
+                        bounds: Bounds::new(
+                            point(px(x), origin.y + px(ty)),
+                            size(px(w), px(text_lh)),
+                        ),
+                        corner_radii: gpui::Corners::default(),
+                        background: hl.into(),
+                        border_widths: gpui::Edges::default(),
+                        border_color: gpui::Hsla::default(),
+                        border_style: gpui::BorderStyle::Solid,
+                    });
+                }
+            }
+        });
+}
+
+/// 代码块行选区高亮：逐源码行求与选区的交集，按字形几何画高亮（每行一条）。
+/// 横向滚动时高亮随内容平移（−scroll），并裁剪在面板内（不溢到页面背景）。
+fn paint_code_selection_hl(
+    e: &WyEditor,
+    origin: Point<Pixels>,
+    f: &Frame,
+    r: &ShapedRow,
+    range: &Range<usize>,
+    hl: Hsla,
+    window: &mut Window,
+) {
+    let block_start = e.line_start(r.src_line);
+    let g_count = r.multi_offsets.len();
+    let scroll = code_hscroll_clamped(e, f, r);
+    let panel_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let panel_rect = Bounds::new(
+        point(origin.x + f.padding, origin.y + r.top),
+        size(px(panel_w), r.height),
+    );
+    window.with_content_mask(Some(gpui::ContentMask { bounds: panel_rect }), |window| {
+        for g in 0..g_count {
+            let ls = e.line_start(r.src_line + 1 + g);
+            let le = e.line_end(r.src_line + 1 + g).max(ls);
+            let from = range.start.max(ls).min(le);
+            let to = range.end.max(ls).min(le);
+            if to > from {
+                let rd0 = source_to_display(&r.byte_map, from - block_start);
+                let rd1 = source_to_display(&r.byte_map, to - block_start);
+                let span = group_len(r, g);
+                let mut c0 = rd0.saturating_sub(r.multi_offsets[g]).min(span);
+                let mut c1 = rd1.saturating_sub(r.multi_offsets[g]).min(span);
+                if c0 > c1 {
+                    std::mem::swap(&mut c0, &mut c1);
+                }
+                if let Some(wl) = r.wrapped.get(g)
+                    && let Some(p0) = wl.position_for_index(c0, r.lh)
+                    && let Some(p1) = wl.position_for_index(c1, r.lh)
+                {
+                    let w = f32::from(p1.x - p0.x).max(2.);
+                    let y1 = r.top + px(code_group_top(r, g));
+                    let h = r.sub_heights.get(g).copied().unwrap_or(r.lh);
+                    window.paint_quad(gpui::PaintQuad {
+                        bounds: Bounds::new(
+                            point(
+                                origin.x + f.padding + r.x_off + p0.x - px(scroll),
+                                origin.y + y1,
+                            ),
+                            size(px(w), h),
+                        ),
+                        corner_radii: gpui::Corners::default(),
+                        background: hl.into(),
+                        border_widths: gpui::Edges::default(),
+                        border_color: gpui::Hsla::default(),
+                        border_style: gpui::BorderStyle::Solid,
+                    });
+                }
+            }
+        }
+    });
+}
+
+/// 普通文本行选区高亮：与源选区求交后按字形几何逐可视行画背景（共享 `x_off`/`lh`，
+/// 引述缩进里的选中文字也对齐高亮）。
+fn paint_text_selection_hl(
+    e: &WyEditor,
+    origin: Point<Pixels>,
+    f: &Frame,
+    r: &ShapedRow,
+    range: &Range<usize>,
+    hl: Hsla,
+    window: &mut Window,
+) {
+    let ls = e.line_start(r.src_line);
+    let le = e.line_end(r.src_line).max(ls);
+    let from = range.start.max(ls).min(le);
+    let to = range.end.max(ls).min(le);
+    if to <= from {
+        return;
+    }
+    let d0 = source_to_display(&r.byte_map, from - ls);
+    let d1 = source_to_display(&r.byte_map, to - ls);
+    let Some(w0) = r.wrapped.first() else {
+        return;
+    };
+    let len = w0.len().max(1);
+    let d0 = d0.min(len);
+    let d1 = d0.max(d1.min(len));
+    if d1 <= d0 {
+        return;
+    }
+    // 逐换行边界组成的可视行字节区间：换行点字节 = 边界前最后 glyph 的起点。
+    let runs = &w0.unwrapped_layout.runs;
+    let mut rows: Vec<(usize, usize)> = Vec::new();
+    let mut prev = 0usize;
+    for b in w0.wrap_boundaries() {
+        let mut byte = 0usize;
+        for (ri, run) in runs.iter().enumerate() {
+            let last = run.glyphs.len().saturating_sub(1);
+            if ri < b.run_ix {
+                byte = run.glyphs.get(last).map(|g| g.index + 1).unwrap_or(byte);
+            } else if ri == b.run_ix {
+                byte = run
+                    .glyphs
+                    .get(b.glyph_ix.min(last))
+                    .map(|g| g.index)
+                    .unwrap_or(byte);
+                break;
+            }
+        }
+        if byte > prev {
+            rows.push((prev, byte));
+            prev = byte;
+        }
+    }
+    rows.push((prev, len));
+    for (a, b2) in rows {
+        let c0 = d0.max(a);
+        let c1 = d1.min(b2);
+        if c1 <= c0 {
+            continue;
+        }
+        let p0 = match w0.position_for_index(c0, r.lh) {
+            Some(p) => p,
+            None => continue,
+        };
+        let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
+        let y = r.top + px(text_y_off(r) + text_row_shift(r)) + p1.y.min(p0.y);
+        let w = f32::from(p1.x - p0.x).max(2.);
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(
+                point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
+                size(px(w), r.lh),
+            ),
+            corner_radii: gpui::Corners::default(),
+            background: hl.into(),
+            border_widths: gpui::Edges::default(),
+            border_color: gpui::Hsla::default(),
+            border_style: gpui::BorderStyle::Solid,
+        });
+    }
+}
+
 
 /// 搜索跳转高亮（预览独有能力，搬入统一组件后由元素 paint 调用）：把 `WyEditor`
 /// 登记的搜索命中解析成**绝对源区间**，以「命中色」（暗琥珀 / 亮黄，与 preview
