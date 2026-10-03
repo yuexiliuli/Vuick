@@ -25,12 +25,21 @@
 //! - **控制条（全屏底部浮层）**：上一支 / 播放·暂停 / 下一支 / 时间 / 可拖 seek 进度条 /
 //!   静音 + 音量条 / 倍速循环 / 清单位置。
 //!
+//! ## M6（播放模式 / 截图）
+//! - **播放模式三态**（控制条按钮循环）：顺序播放（播完停）/ 列表循环（播完自动切下一支、
+//!   结尾回绕首支）/ 随机播放（播完随机挑一支，不含当前）；单文件时循环/随机退化为
+//!   seek 0 重播（保留缩放/平移）。
+//! - **截图当前帧**：`s` / 控制条相机按钮 → 点截图时才把当前帧 BGRA 经 `RenderImage::as_bytes`
+//!   拷贝一份（**零每帧开销**）存 PNG（视频同目录，只读时回退系统临时目录），右上角瞬时
+//!   浮层提示保存路径。
+//!
 //! ## 控制（焦点落在本视图时）
 //! - `Space`：播放 / 暂停；`←`/`→`：±[`SEEK_STEP_SEC`] 秒；
 //! - `Ctrl+滚轮`：放大 / 缩小（[`ZOOM_STEP`] 档，钳位 [`ZOOM_MIN`..=[`ZOOM_MAX`]）；
 //!   `Shift+滚轮`：同文件夹切换（向下滚 = 下一支）；普通滚轮**不控制进度**；
 //!   `PageDown`/`PageUp`：下一支 / 上一支；
-//! - `m`：静音切换；`-`/`=`：减/加音量（±[`VOLUME_STEP`]）；`[`/`]`：降/升倍速。
+//! - `m`：静音切换；`-`/`=`：减/加音量（±[`VOLUME_STEP`]）；`[`/`]`：降/升倍速；
+//!   `s`：截图当前帧存 PNG。
 //!
 //! 对齐 [`crate::image::ImageViewer`] 的「自包含阅读器」姿势；上屏字节序 BGRA
 //! 同 PDF 模块 [`crate::pdf::render_image_from_bgra`]。
@@ -88,6 +97,39 @@ const CONTROL_BAR_H: f32 = 52.0;
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
+/// 右上角瞬时状态浮层（截图结果提示等）的显示时长（ms），到期自动清除。
+const STATUS_MS: u64 = 2500;
+
+/// 播放模式三态（控制条按钮循环切换；播完「自然结尾」时的去向）：
+/// - [`PlaybackMode::Sequential`]：顺序播放——播完当前自动停（默认，保持历史行为）；
+/// - [`PlaybackMode::Loop`]：列表循环——播完自动切下一支，列表结尾回绕首支（可无限循环）；
+/// - [`PlaybackMode::Shuffle`]：随机播放——播完随机挑一支（不含当前）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PlaybackMode {
+    Sequential,
+    Loop,
+    Shuffle,
+}
+
+impl PlaybackMode {
+    /// 三态循环的下一个（顺序 → 循环 → 随机 → 顺序）。
+    fn next(self) -> Self {
+        match self {
+            Self::Sequential => Self::Loop,
+            Self::Loop => Self::Shuffle,
+            Self::Shuffle => Self::Sequential,
+        }
+    }
+
+    /// 控制条按钮上的短标签（中文两字，与倍速按钮同款紧凑布局）。
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sequential => "顺序",
+            Self::Loop => "循环",
+            Self::Shuffle => "随机",
+        }
+    }
+}
 
 /// 播放管线拆账剖析（`VPROF=1` 开启）：video worker 每 ~2s 打一行「解码/推帧背压」墙钟，
 /// 主线程 `install_bgra` 每 120 帧打一行「上屏装配」耗时；默认关闭、不改变行为。
@@ -138,6 +180,17 @@ fn fraction_at(bounds: &Cell<Bounds<Pixels>>, point: Point<Pixels>) -> Option<f3
     let x = f32::from(point.x);
     let origin_x = f32::from(b.origin.x);
     Some(((x - origin_x) / width).clamp(0.0, 1.0))
+}
+
+/// 随机播放的初始种子：系统墙钟时钟与栈地址位混合（仅用于随机选曲，不需要密码学强度；
+/// 每开一个查看器不同，会话内确定性演进）。
+fn seed_rng() -> u64 {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0) as u64;
+    let addr = (&t as *const _) as usize as u64;
+    t.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(addr)
 }
 
 /// 视频查看器：自包含的（无声）视频播放视图。
@@ -235,6 +288,15 @@ pub struct VideoViewer {
     /// 当前视频解码输出的长边封顶（px）：按显示尺寸自适应（render 里窗口变化时经
     /// `start_decoder_at(…, restart_audio=false)` 重开解码器而不打断音频）。
     decode_cap: u32,
+    // --- M6 播放模式 / 截图 ---
+    /// 播放模式三态（播完去向；控制条按钮循环切换）。
+    playback_mode: PlaybackMode,
+    /// 随机播放的 PRNG 状态（xorshift64*；`pick_shuffle_index` 自推进，测试可注入定值）。
+    rng_state: u64,
+    /// 瞬时状态浮层（右上角）：「文本, 出现时刻」；[`STATUS_MS`] 后自动清除。
+    status: Option<(String, Instant)>,
+    /// 状态浮层清空任务的代序号（防旧定时器误清新浮层，同 `controls_seq` 姿势）。
+    status_seq: u32,
 }
 
 impl VideoViewer {
@@ -283,6 +345,10 @@ impl VideoViewer {
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
+            playback_mode: PlaybackMode::Sequential,
+            rng_state: seed_rng(),
+            status: None,
+            status_seq: 0,
         };
         this.start(cx);
         // 初始浮现控制条、无悬停 1s 后自隐（hover 会作废本次隐藏）
@@ -613,7 +679,7 @@ impl VideoViewer {
                 let now = Instant::now();
                 let keep = this
                     .update(cx, |v, cx| {
-                        let new_frame = v.tick();
+                        let new_frame = v.tick(cx);
                         let coarse_due = last_paint
                             .map(|t| {
                                 now.duration_since(t)
@@ -640,13 +706,14 @@ impl VideoViewer {
     }
 
     /// 播放泵单拍（纯状态推进 + 上屏；调用方负责重绘）。返回本拍是否把**新帧上屏**
-    ///（调用方据此只在有新帧时强制重绘，闲置拍不再每 16ms 全刷）。
-    fn tick(&mut self) -> bool {
+    ///（调用方据此只在有新帧时强制重绘，闲置拍不再每 16ms 全刷）。`hit_end` 也要重绘
+    ///（控制条播放/暂停图标、以及循环/随机模式切到下一支的加载占位都要反映出来）。
+    fn tick(&mut self, cx: &mut Context<Self>) -> bool {
         // 以音频时钟为播放进度（**仅当本媒体音频真在喂**；否则/未上线走墙钟——无声轨
         // 或切媒体后音频未就绪时画面也要前进，否则冻结）
         let audio_pos = (self.audio.is_some() && self.audio_ready.load(Ordering::Relaxed))
             .then(|| self.audio.as_ref().map(|s| s.position()).unwrap_or(0.0));
-        self.advance_playhead(audio_pos);
+        let hit_end = self.advance_playhead(audio_pos);
 
         // 音频健康诊断：仅 `GPUI_EDITOR_VIDEO_AUDIO_DIAG=1` 时每 ~1s 打一行喂送统计
         //（欠载/锁竞争是滋滋声的根源形态；默认静默）
@@ -688,24 +755,32 @@ impl VideoViewer {
                 None => break,
             }
         }
-        if let Some((_pts, w, h, bgra)) = latest {
+        let new_frame = if let Some((_pts, w, h, bgra)) = latest {
             self.install_bgra(w, h, bgra);
             self.pending_seek = None; // 落点已上屏（首个可用帧）
             true
         } else {
             false
+        };
+        // 自然播完的自动去向（顺序 = 停住；循环/随机 = 切换）在排空之后执行：先让结尾帧
+        // 尽量上屏，再切换下一支（open_folder_index 内部换代 + 起新解码）。
+        if hit_end {
+            self.handle_end(cx);
         }
+        // 命中结尾也要强制重绘（顺序模式停住：控制条播放图标翻转；循环/随机：进入下一支）
+        new_frame || hit_end
     }
 
     /// 推进 `playhead`：`audio_pos` 有值（= 音频线程已上线并喂音）→ 音频时钟
     /// `audio_base + 设备已播位置 × speed`，A/V 对齐；`None` → 墙钟（`dt × speed`）。
     /// 音频**刚上线那一刻锚定** `audio_base = 当前 playhead − 位置 × speed`：设备在开新
     /// 媒体的静音间隙里也累计 `position()`，不锚定会把 playhead 带飞（音画错位）。
-    /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。
-    fn advance_playhead(&mut self, audio_pos: Option<f64>) {
+    /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。返回是否「这一拍撞到结尾」，
+    /// 供 [`Self::tick`] 决定是否执行 [`Self::handle_end`] 的自动切换。
+    fn advance_playhead(&mut self, audio_pos: Option<f64>) -> bool {
         if !self.playing {
             self.last_tick = None;
-            return;
+            return false;
         }
         let speed = f64::from(self.speed);
         match audio_pos {
@@ -732,13 +807,191 @@ impl VideoViewer {
             if let Some(sink) = &self.audio {
                 sink.pause();
             }
+            true
+        } else {
+            false
         }
+    }
+
+    /// 「自然播完」后的下一支决策（随机模式会推进 PRNG，故收 `&mut self`）：
+    /// - `None` = 停住不切换（顺序播放，保持历史「播完自动停」行为）；
+    /// - `Some(idx)` = 切到 `folder[idx]`；`idx == current`（单文件循环/随机）时由
+    ///   [`Self::handle_end`] 走 seek 0 重播而非重开同一文件（保住缩放/平移）。
+    fn natural_end_target(&mut self) -> Option<usize> {
+        let n = self.folder.len();
+        if n <= 1 {
+            return match self.playback_mode {
+                PlaybackMode::Sequential => None,
+                _ => Some(self.current),
+            };
+        }
+        match self.playback_mode {
+            PlaybackMode::Sequential => None,
+            PlaybackMode::Loop => Some((self.current + 1) % n),
+            PlaybackMode::Shuffle => Some(self.pick_shuffle_index()),
+        }
+    }
+
+    /// 随机挑一个「≠ current」的下标（调用前须 `folder.len() ≥ 2`）：xorshift64* 自推进，
+    /// `(x % n)` 撞上当前则顺移一位——结果恒在 `[0, n)` 且不等于 `current`；`rng_state`
+    /// 可注入定值做确定性测试。
+    fn pick_shuffle_index(&mut self) -> usize {
+        let n = self.folder.len();
+        debug_assert!(n >= 2, "随机播放仅在多文件清单下调用");
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        let mut idx = (x % n as u64) as usize;
+        if idx == self.current {
+            idx = (idx + 1) % n;
+        }
+        idx
+    }
+
+    /// 自然播完的处理：按 [`PlaybackMode`] 切换到下一支 / 重播自身 / 保持暂停。
+    fn handle_end(&mut self, cx: &mut Context<Self>) {
+        match self.natural_end_target() {
+            // 顺序播放：停在结尾（既有行为）
+            None => {}
+            // 单文件循环/随机：seek 0 重播（保留缩放/平移，不重开文件）
+            Some(idx) if idx == self.current => self.seek(-self.duration, cx),
+            Some(idx) => self.open_folder_index(idx, cx),
+        }
+    }
+
+    /// 播放模式三态循环切换（控制条按钮）。
+    fn cycle_playback_mode(&mut self, cx: &mut Context<Self>) {
+        self.playback_mode = self.playback_mode.next();
+        cx.notify();
+    }
+
+    // ---- M6：截图当前帧存 PNG ----
+
+    /// 把当前上屏帧转成 PNG 用的 RGBA 像素（**点截图这次才拷贝**——`self.frame` 的
+    /// `RenderImage` 始终持帧 BGRA，`as_bytes` 直接取回、不另存每帧副本）。返回 `None` =
+    /// 尚无可截图画面。
+    fn snapshot_rgba(frame: &gpui::RenderImage) -> Option<(u32, u32, Vec<u8>)> {
+        let s = frame.size(0);
+        let (w, h) = (s.width.0.max(0) as u32, s.height.0.max(0) as u32);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let mut rgba = frame.as_bytes(0)?.to_vec();
+        // BGRA → RGBA（PNG 字节序；上屏字节序 BGRA 同 GPUI RenderImage，见 decode.rs 注释）
+        for px in rgba.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        Some((w, h, rgba))
+    }
+
+    /// 截图当前帧存 PNG：点截图时才从 `self.frame` 拷贝一份（零每帧开销），BGRA → RGBA
+    /// 后写视频同目录（不可写回退系统临时目录）。PNG 编码放后台线程（1080p ~几十 ms，
+    /// 不卡主线程播放泵）；完成经 [`Self::show_status`] 右上角浮层提示路径。
+    fn screenshot_png(&mut self, cx: &mut Context<Self>) {
+        let Some(frame) = self.frame.clone() else {
+            self.show_status("暂无画面可截图：视频尚未解码出帧".to_string(), cx);
+            return;
+        };
+        let Some((w, h, rgba)) = Self::snapshot_rgba(&frame) else {
+            self.show_status("暂无画面可截图：视频尚未解码出帧".to_string(), cx);
+            return;
+        };
+        let path = self.screenshot_path();
+        let display = path.display().to_string();
+        self.show_status("正在保存截图…".to_string(), cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    image::save_buffer_with_format(
+                        &path,
+                        &rgba,
+                        w,
+                        h,
+                        image::ExtendedColorType::Rgba8,
+                        image::ImageFormat::Png,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => this.show_status(format!("已保存截图：{display}"), cx),
+                Err(e) => this.show_status(format!("截图保存失败：{e}"), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// 截图落盘路径：视频同目录 `<片名>-截图-<UTC时间戳>.png`；同目录不可写时回退系统
+    /// 临时目录（截图像素已按显示尺寸 cap 好，不随 PNG 增大）。
+    fn screenshot_path(&self) -> PathBuf {
+        let name = format!(
+            "{}-截图-{}.png",
+            self.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "视频".to_string()),
+            Self::utc_timestamp()
+        );
+        let dir = self
+            .path
+            .parent()
+            .filter(|d| d.is_dir())
+            .map(|d| d.to_path_buf())
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join(name)
+    }
+
+    /// 当前 UTC 时间的 `YYYYMMDD-HHMMSS`（截图文件名用）：Howard Hinnant 民用算法从
+    /// Unix 秒直接算日历，不依赖 chrono——唯一且可排序，够截图命名。
+    fn utc_timestamp() -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let days = secs / 86400;
+        let rem = secs % 86400;
+        let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!("{y:04}{m:02}{d:02}-{hh:02}{mm:02}{ss:02}")
+    }
+
+    /// 右上角瞬时状态浮层：显示 `text`，[`STATUS_MS`] 后自动清除（带代序号防旧定时器
+    /// 误清新浮层，同 `show_controls_temporarily` 姿势）。
+    fn show_status(&mut self, text: String, cx: &mut Context<Self>) {
+        self.status = Some((text, Instant::now()));
+        cx.notify();
+        self.status_seq = self.status_seq.wrapping_add(1);
+        let seq = self.status_seq;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(STATUS_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.status_seq == seq {
+                    this.status = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// 把 BGRA 包成 `RenderImage` 上屏。`intrinsic` 优先保留打开期从 `params` 读到的
     /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
     fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>) {
         let t0 = Instant::now();
+        // 帧字节移入 RenderImage（零拷贝）即持有时；截图在点击时经 `frame.as_bytes` 取回
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
         self.frame = Some(Arc::new(RenderImage::new(vec![Frame::new(buf)])));
         self.intrinsic.get_or_insert((w as f32, h as f32));
@@ -943,6 +1196,7 @@ impl VideoViewer {
             "=" => self.set_volume(self.volume + VOLUME_STEP, cx),
             "[" => self.speed_step(-1, cx),
             "]" => self.speed_step(1, cx),
+            "s" => self.screenshot_png(cx),
             _ => return, // 其余键不拦截
         }
         cx.stop_propagation();
@@ -1300,7 +1554,21 @@ impl VideoViewer {
                 |v, cx| v.toggle_mute(cx),
             ))
             .child(vol_strip)
-            .child(
+            .child({
+                // 模式按钮在 speed/clone 之外单独 clone：后文 camera 按钮仍需用 entity
+                let entity = entity.clone();
+                Button::new("video-mode")
+                    .ghost()
+                    .label(self.playback_mode.label())
+                    .w(px(44.))
+                    .h(px(28.))
+                    .text_size(px(11.))
+                    .on_click(move |_, _w, app| {
+                        entity.update(app, |v, cx| v.cycle_playback_mode(cx));
+                    })
+            })
+            .child({
+                let entity = entity.clone();
                 Button::new("video-speed")
                     .ghost()
                     .label(format!("{:.2}×", self.speed))
@@ -1309,8 +1577,8 @@ impl VideoViewer {
                     .text_size(px(11.))
                     .on_click(move |_, _w, app| {
                         entity.update(app, |v, cx| v.speed_step(1, cx));
-                    }),
-            )
+                    })
+            })
             .child(
                 div()
                     .whitespace_nowrap()
@@ -1318,6 +1586,13 @@ impl VideoViewer {
                     .text_color(muted)
                     .child(playlist),
             )
+            .child(control_icon_button(
+                "video-shot",
+                IconName::Camera,
+                accent,
+                entity.clone(),
+                |v, cx| v.screenshot_png(cx),
+            ))
             .into_any_element()
     }
 
@@ -1444,6 +1719,10 @@ impl Render for VideoViewer {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let theme = crate::ui::theme::Theme::global(cx);
         let muted: Hsla = theme.colors.fg_muted.into();
+        // 状态浮层（右上角）配色：Copy 抽出，避免在 `control_bar(&mut cx)` 之后借用 theme
+        let toast_surface: Hsla = theme.colors.surface.into();
+        let toast_border: Hsla = theme.colors.border.into();
+        let toast_fg: Hsla = theme.colors.fg.into();
 
         let (vw, vh) = self.viewport_size(window);
         // 普通模式预留底部控制条高度（控制条常驻，画面 contain 到其上）；
@@ -1529,6 +1808,26 @@ impl Render for VideoViewer {
         // 控制条：普通模式常驻（画面预留底部高度）；纯视频（锁定）模式为浮层按需浮现，
         // 画面充满整个画布区。
         root = root.child(self.control_bar(window, cx));
+        // 右上角瞬时状态浮层（截图结果提示等）：在期内才挂，过期由定时器清除兜底。
+        if let Some((text, at)) = &self.status
+            && at.elapsed() < std::time::Duration::from_millis(STATUS_MS)
+        {
+            root = root.child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .right_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(toast_border)
+                    .bg(toast_surface)
+                    .text_size(px(12.))
+                    .text_color(toast_fg)
+                    .child(text.clone()),
+            );
+        }
         root
     }
 }
@@ -1640,6 +1939,10 @@ mod tests {
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
             viewport: ScrollHandle::new(),
+            playback_mode: PlaybackMode::Sequential,
+            rng_state: 42, // 固定种子：随机播放测试可预期
+            status: None,
+            status_seq: 0,
         }
     }
 
@@ -1657,10 +1960,10 @@ mod tests {
         tx.send(frame_of(0.4, 2)).unwrap();
         tx.send(frame_of(1.5, 3)).unwrap();
         /* 设置 playhead 0.5 后 tick：0.0/0.4 ≤0.5 → 取 0.4 上屏；1.5 越线进 overflow */
-        ent.update(cx, |v, _| {
+        ent.update(cx, |v, cx| {
             v.rx = Some(rx);
             v.playhead = 0.5;
-            v.tick();
+            v.tick(cx);
         });
         let s = cx.update(|app| {
             let v = ent.read(app);
@@ -1670,9 +1973,9 @@ mod tests {
         assert_eq!(s.1, Some(1.5), "越线帧保留在 overflow");
         // playhead 越过 1.5：旧 overflow(1.5) 移交上屏、通道里的 1.6 进位为 overflow
         tx.send(frame_of(1.6, 4)).unwrap();
-        ent.update(cx, |v, _| {
+        ent.update(cx, |v, cx| {
             v.playhead = 1.55;
-            v.tick();
+            v.tick(cx);
         });
         let o = cx.update(|app| ent.read(app).overflow.as_ref().map(|f| f.0));
         assert_eq!(o, Some(1.6), "越过旧 overflow 后新越线帧进位");
@@ -1689,25 +1992,25 @@ mod tests {
             v
         }));
         // 暂停：tick 不前
-        ent.update(cx, |v, _| {
+        ent.update(cx, |v, cx| {
             v.last_tick = Some(Instant::now() - Duration::from_millis(100));
-            v.tick();
+            v.tick(cx);
         });
         let p0 = cx.update(|app| ent.read(app).playhead);
         assert!((p0 - 1.0).abs() < 1e-9, "暂停不该前进");
         // 播放：前进
-        ent.update(cx, |v, _| {
+        ent.update(cx, |v, cx| {
             v.playing = true;
             v.last_tick = None;
-            v.tick();
+            v.tick(cx);
         });
         assert!(cx.update(|app| ent.read(app).playhead) > 1.0, "播放应前进");
         // 到结尾：自动停
-        ent.update(cx, |v, _| {
+        ent.update(cx, |v, cx| {
             v.playhead = 2.0;
             v.last_tick = None;
             v.playing = true;
-            v.tick();
+            v.tick(cx);
         });
         let s = cx.update(|app| {
             let v = ent.read(app);
@@ -1788,7 +2091,7 @@ mod tests {
             if s.0 || s.2.is_some() {
                 break s;
             }
-            viewer.update(cx, |v, _| v.tick());
+            viewer.update(cx, |v, cx| v.tick(cx));
             cx.run_until_parked();
             // 让常驻 worker 有真实时间解码（并行视频测试在 FFMPEG_LOCK 上会互相竞争，
             // 纯 tick 自旋可能在 worker 没出首帧前就把 guard 跑完 → 偶发超时）
@@ -1802,7 +2105,7 @@ mod tests {
         // `pump_installs_latest_frame_in_window` 确定性覆盖；真实解码速度与手动
         // tick 时序不同，不在此断言 overflow 是否为空）
         for _ in 0..60 {
-            viewer.update(cx, |v, _| v.tick());
+            viewer.update(cx, |v, cx| v.tick(cx));
             cx.run_until_parked();
         }
         let s = cx.update(|app| {
@@ -2419,6 +2722,258 @@ mod tests {
         cx.run_until_parked();
     }
 
+    // ---- M6：播放模式三态 ----
+
+    // ---- M6：播放模式三态 ----
+
+    /// 播放模式三态循环（顺序 → 循环 → 随机 → 顺序）与按钮标签。
+    #[test]
+    fn playback_mode_three_state_cycle() {
+        assert_eq!(PlaybackMode::Sequential.next(), PlaybackMode::Loop);
+        assert_eq!(PlaybackMode::Loop.next(), PlaybackMode::Shuffle);
+        assert_eq!(PlaybackMode::Shuffle.next(), PlaybackMode::Sequential);
+        assert_eq!(PlaybackMode::Sequential.label(), "顺序");
+        assert_eq!(PlaybackMode::Loop.label(), "循环");
+        assert_eq!(PlaybackMode::Shuffle.label(), "随机");
+    }
+
+    /// 播完去向的纯决策：顺序 = 停住（None）；循环 = 下一支（结尾回绕首支）；
+    /// 随机 = 挑 ≠ current 的下标（多文件）；单文件循环/随机退化为回自身（重播）。
+    #[gpui::test]
+    async fn natural_end_target_decides_next_index(cx: &mut TestAppContext) {
+        let read_target = |cx: &mut TestAppContext, e: &gpui::Entity<VideoViewer>| {
+            cx.update(|app| e.update(app, |v, _| v.natural_end_target()))
+        };
+        let seq = {
+            let e = cx.update(|app| app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playback_mode = PlaybackMode::Sequential;
+                v.current = 0;
+                v.folder = vec![fixture().with_file_name("f0.mp4"), fixture().with_file_name("f1.mp4")];
+                v
+            }));
+            read_target(cx, &e)
+        };
+        assert!(seq.is_none(), "顺序播放多文件也停住");
+        // 循环：0→1、末位→0 回绕
+        for (cur, want) in [(0usize, 1), (1, 0)] {
+            let e = cx.update(|app| app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playback_mode = PlaybackMode::Loop;
+                v.current = cur;
+                v.folder = vec![fixture().with_file_name("f0.mp4"), fixture().with_file_name("f1.mp4")];
+                v
+            }));
+            assert_eq!(read_target(cx, &e), Some(want), "循环 current={cur} 应切到 {want}");
+        }
+        // 单文件循环 / 随机：回自身（走 seek 0 重播）
+        for mode in [PlaybackMode::Loop, PlaybackMode::Shuffle] {
+            let e = cx.update(|app| app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playback_mode = mode;
+                v.current = 0;
+                v.folder = vec![fixture()];
+                v
+            }));
+            assert_eq!(read_target(cx, &e), Some(0), "{mode:?} 单文件重播自身");
+        }
+        // 随机多文件：结果 ≠ current 且在清单内
+        let e = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playback_mode = PlaybackMode::Shuffle;
+            v.current = 0;
+            v.folder = (0..3).map(|i| fixture().with_file_name(format!("s{i}.mp4"))).collect();
+            v
+        }));
+        let got = read_target(cx, &e).expect("随机多文件应出下标");
+        assert!(got < 3 && got != 0, "随机结果应在 [0,3) 且 ≠ current，实得 {got}");
+        cx.run_until_parked();
+    }
+
+    /// 随机下标：xorshift 自推进下 64 连抽全部 ∈ [0,n) 且 ≠ current；去向多样化（不卡死
+    /// 在某个下标）。同一实体连续抽 = 模拟多次自然结尾随机切。
+    #[gpui::test]
+    async fn pick_shuffle_index_never_repeats_current(cx: &mut TestAppContext) {
+        let e = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playback_mode = PlaybackMode::Shuffle;
+            v.rng_state = 0x1234_5678_9ABC_DEF0;
+            v.current = 0;
+            v.folder = (0..5).map(|i| fixture().with_file_name(format!("d{i}.mp4"))).collect();
+            v
+        }));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let i = cx.update(|app| e.update(app, |v, _| v.pick_shuffle_index()));
+            assert!((1..5).contains(&i), "随机下标应在 [1,5)（≠0），实得 {i}");
+            seen.insert(i);
+        }
+        assert!(seen.len() > 1, "随机去向应多样化，实得 {seen:?}");
+        cx.run_until_parked();
+    }
+
+    /// tick 到结尾的自动去向接线：循环模式撞结尾 → 切下一支（current/路径变、继续播放）；
+    /// 顺序模式撞结尾 → 停下（current 不变、playing=false）。用不存在的路径，解码在后台
+    /// 落错误占位，不影响同步状态断言（open_folder_index 同步切状态后才 spawn）。
+    #[gpui::test]
+    async fn tick_natural_end_respects_playback_mode(cx: &mut TestAppContext) {
+        // 循环：撞结尾 → 自动切下一支
+        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-a-mode.mp4");
+        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-b-mode.mp4");
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(a.clone(), cx);
+            v.playback_mode = PlaybackMode::Loop;
+            v.folder = vec![a, b];
+            v.current = 0;
+            v.duration = 2.0;
+            v.playhead = 2.0; // 已到结尾，下一拍 tick 触发自然完
+            v.playing = true;
+            v
+        }));
+        ent.update(cx, |v, cx| {
+            v.tick(cx);
+        });
+        // 同步断言：open_folder_index 在 spawn start 之前就已同步切好 current/path/playing
+        //（后台 start 会对【不存在的】路径重扫 folder 并归一 current=0，故不能等 park 后再断言）
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.current, v.playing, v.path.file_name().map(|n| n.to_string_lossy().into_owned()))
+        });
+        assert_eq!(s.0, 1, "列表循环撞结尾应切下一支");
+        assert!(s.1, "循环模式切换后继续播放");
+        assert_eq!(s.2.as_deref(), Some("no-b-mode.mp4"), "路径应更新");
+        cx.run_until_parked(); // 让后台 start 任务收尾（不存在路径落错误占位，无碍）
+        // 顺序：撞结尾 → 停住
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playback_mode = PlaybackMode::Sequential;
+            v.folder = vec![fixture(), fixture()];
+            v.current = 0;
+            v.duration = 2.0;
+            v.playhead = 2.0;
+            v.playing = true;
+            v
+        }));
+        ent.update(cx, |v, cx| {
+            v.tick(cx);
+        });
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.playing, v.current, v.playhead)
+        });
+        assert!(!s.0, "顺序播放撞结尾应停下");
+        assert_eq!(s.1, 0, "顺序播放不切文件");
+        assert_eq!(s.2, 2.0, "playhead 停在结尾");
+        cx.run_until_parked();
+    }
+
+    // ---- M6：截图当前帧存 PNG ----
+
+    /// 截图字节序正确性：4×2 纯红（BGRA = B0 G0 R255）互换 R/B 成 RGBA 存 PNG，读回像素
+    /// 应为 [255,0,0,255]。这是截图路径唯一容易出错的环节（PNG 是 RGBA、上屏是 BGRA）。
+    #[test]
+    fn screenshot_bgra_to_png_keeps_correct_rgb() {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-video-shot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("red.png");
+        // BGRA 纯红 + 一个青色点（G255 B255 R0）验证逐像素互换
+        let mut buf: Vec<u8> = (0..(4 * 2 * 4)).map(|_| 0).collect();
+        for px in buf.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[0, 0, 255, 255]); // BGRA 红
+        }
+        buf[8..12].copy_from_slice(&[255, 255, 0, 255]); // BGRA 青
+        // —— 与 screenshot_png 一致的互换（BGRA → RGBA）——
+        for px in buf.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        image::save_buffer_with_format(
+            &path,
+            &buf,
+            4,
+            2,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        let img = image::open(&path).unwrap().to_rgba8();
+        assert_eq!(img.dimensions(), (4, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255], "红点应还原为 RGBA 红");
+        assert_eq!(img.get_pixel(2, 0).0, [0, 255, 255, 255], "青点 BGR→RGB 应为 (0,255,255)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 截图时间戳与落盘路径：`YYYYMMDD-HHMMSS`（15 字符）、落在视频同目录、后缀 .png 且
+    /// 带「-截图-」段。
+    #[gpui::test]
+    async fn screenshot_path_and_timestamp_shape(cx: &mut TestAppContext) {
+        let ts = VideoViewer::utc_timestamp();
+        assert_eq!(ts.len(), 15, "应为 YYYYMMDD-HHMMSS，实得 {ts}");
+        assert!(ts.as_bytes().iter().all(|b| b.is_ascii_digit() || *b == b'-'));
+        let dir = std::env::temp_dir().join("gpui-video-shot-name");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.path = dir.join("课.mp4");
+            v
+        }));
+        let shot = cx.update(|app| ent.read(app).screenshot_path());
+        assert_eq!(
+            shot.parent().map(|d| d.to_path_buf()),
+            Some(dir.clone()),
+            "截图应落在视频同目录"
+        );
+        assert_eq!(shot.extension().and_then(|e| e.to_str()), Some("png"));
+        let name = shot.file_name().and_then(|n| n.to_str()).unwrap().to_string();
+        assert!(
+            name.starts_with("课-截图-") && name.ends_with(".png"),
+            "命名应为 片名-截图-时间戳.png，实得 {name}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        cx.run_until_parked();
+    }
+
+    /// 无画面时截图：不拷贝、不写文件、不打后台任务，只提示状态浮层（screenshot 早退路径）。
+    #[gpui::test]
+    async fn screenshot_without_frame_just_flashes_status(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx))); // frame = None
+        ent.update(cx, |v, cx| v.screenshot_png(cx));
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.status.is_some(), v.frame.is_none())
+        });
+        assert!(s.0, "无画面应提示「暂无画面可截图」");
+        assert!(s.1, "frame 仍为空（未解码）");
+        cx.run_until_parked();
+    }
+
+    /// 零每帧开销的按需截图提取：把合成的 RenderImage（BGRA 红/青）→ RGBA（点截图才拷贝），
+    /// 尺寸取回帧真实像素。覆盖「snapshot_rgba 只读当前帧、不做每帧 clone」的正确性。
+    #[test]
+    fn snapshot_rgba_reads_current_frame_bgra_on_demand() {
+        let (w, h) = (4u32, 2u32);
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        for px in bgra.as_chunks_mut::<4>().0 {
+            px.copy_from_slice(&[0, 0, 255, 255]); // BGRA 红
+        }
+        bgra[8..12].copy_from_slice(&[255, 255, 0, 255]); // BGRA 青
+        let frame = gpui::RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::from_raw(w, h, bgra).unwrap(),
+        )]);
+        // 提取调用前确认 size/as_bytes 可及（一旦 gpui 改 API 这里先红）
+        assert_eq!(frame.size(0).width.0, 4);
+        assert_eq!(frame.as_bytes(0).unwrap().len(), w as usize * h as usize * 4);
+        let got = VideoViewer::snapshot_rgba(&frame).expect("有帧应能提取");
+        assert_eq!((got.0, got.1), (w, h), "尺寸应取回帧真实像素");
+        assert_eq!(&got.2[0..4], &[255, 0, 0, 255], "BGRA 红应转成 RGBA 红");
+        assert_eq!(&got.2[8..12], &[0, 255, 255, 255], "BGRA 青应转成 RGBA (0,255,255)");
+    }
+
     /// 等视频出帧 + intrinsic 就绪（真实时间推进让常驻 worker 干活），最多 ~30s。
     async fn wait_ready(v: &gpui::Entity<VideoViewer>, cx: &mut TestAppContext) -> (bool, bool, Option<String>) {
         for _ in 0..3000 {
@@ -2429,7 +2984,7 @@ mod tests {
             if (s.0 && s.1) || s.2.is_some() {
                 return s;
             }
-            v.update(cx, |v, _| v.tick());
+            v.update(cx, |v, cx| v.tick(cx));
             cx.background_executor.timer(std::time::Duration::from_millis(10)).await;
         }
         cx.update(|app| {

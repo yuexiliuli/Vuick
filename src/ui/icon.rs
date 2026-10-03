@@ -41,6 +41,9 @@ pub enum IconName {
     /// 下一支（视频控制条）。
     #[cfg(feature = "video")]
     SkipForward,
+    /// 截图当前帧（视频控制条）。
+    #[cfg(feature = "video")]
+    Camera,
 }
 
 impl IconName {
@@ -100,6 +103,10 @@ impl IconName {
             #[cfg(feature = "video")]
             IconName::SkipForward => {
                 "<polygon points=\"5 4 15 12 5 20 5 4\"/><line x1=\"19\" y1=\"5\" x2=\"19\" y2=\"19\"/>"
+            }
+            #[cfg(feature = "video")]
+            IconName::Camera => {
+                "<path d=\"M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z\"/><circle cx=\"12\" cy=\"13\" r=\"4\"/>"
             }
         };
         format!("{H}{inner}{T}")
@@ -231,6 +238,7 @@ mod tests {
             IconName::VolumeX,
             IconName::SkipBack,
             IconName::SkipForward,
+            IconName::Camera,
         ]);
         for name in names {
             let m = name.svg_markup();
