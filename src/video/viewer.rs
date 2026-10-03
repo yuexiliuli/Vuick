@@ -88,6 +88,19 @@ const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 8.0;
 const ZOOM_STEP: f32 = 0.12;
 
+/// 播放管线拆账剖析（`VPROF=1` 开启）：video worker 每 ~2s 打一行「解码/推帧背压」墙钟，
+/// 主线程 `install_bgra` 每 120 帧打一行「上屏装配」耗时；默认关闭、不改变行为。
+fn vprof_enabled() -> bool {
+    std::env::var_os("VPROF").is_some()
+}
+
+// 主线程上屏装配累计（`install_bgra` 写；`VPROF=1` 才写，普通运行零成本空置）。
+thread_local! {
+    static VPROF_PRESENT: std::cell::RefCell<(u64, std::time::Duration)> = const {
+        std::cell::RefCell::new((0, std::time::Duration::ZERO))
+    };
+}
+
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
 
@@ -421,14 +434,42 @@ impl VideoViewer {
                 let _ = out.send(Ok(reader.params()));
             }
             let _ = reader.seek(cmd.target);
+            // VPROF=1 拆账：解码（FFI 内 decode+sws+to_vec）与推帧背压（tx.send，bounded
+            // 通道满=主线程没在及时消费）的每帧墙钟，每 ~2s 打一行忙核。
+            let vp_on = vprof_enabled();
+            let mut vp_decode = Duration::ZERO;
+            let mut vp_send = Duration::ZERO;
+            let mut vp_frames: u64 = 0;
+            let mut vp_window = Instant::now();
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
-                match reader.next_frame_bgra() {
-                    Ok(Some(item)) => {
-                        if cmd.tx.send(item).is_err() {
-                            break; // 接收端已被换代/弃用
-                        }
+                let t0 = Instant::now();
+                let item = reader.next_frame_bgra();
+                let t1 = Instant::now();
+                let keep = match item {
+                    Ok(Some(item)) => cmd.tx.send(item).is_ok(),
+                    _ => false, // EOF / 解码错误：本代结束
+                };
+                let t2 = Instant::now();
+                if vp_on {
+                    vp_decode += t1 - t0;
+                    vp_send += t2 - t1;
+                    vp_frames += 1;
+                    if Instant::now().duration_since(vp_window) >= Duration::from_secs(2) {
+                        let wall = vp_window.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[VPROF] worker {vp_frames}帧: decode={:.3}ms/f send={:.3}ms/f 忙核≈{:.2}",
+                            vp_decode.as_secs_f64() * 1000.0 / vp_frames as f64,
+                            vp_send.as_secs_f64() * 1000.0 / vp_frames as f64,
+                            (vp_decode.as_secs_f64() + vp_send.as_secs_f64()) / wall
+                        );
+                        vp_decode = Duration::ZERO;
+                        vp_send = Duration::ZERO;
+                        vp_frames = 0;
+                        vp_window = Instant::now();
                     }
-                    _ => break, // EOF / 解码错误：本代结束
+                }
+                if !keep {
+                    break; // 接收端已被换代/弃用
                 }
             }
         }
@@ -696,9 +737,23 @@ impl VideoViewer {
     /// 把 BGRA 包成 `RenderImage` 上屏。`intrinsic` 优先保留打开期从 `params` 读到的
     /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
     fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>) {
+        let t0 = Instant::now();
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
         self.frame = Some(Arc::new(RenderImage::new(vec![Frame::new(buf)])));
         self.intrinsic.get_or_insert((w as f32, h as f32));
+        if vprof_enabled() {
+            VPROF_PRESENT.with(|acc| {
+                let mut acc = acc.borrow_mut();
+                acc.0 += 1;
+                acc.1 += t0.elapsed();
+                if acc.0 % 120 == 0 {
+                    eprintln!(
+                        "[VPROF] main present: {:.3}ms/帧（Frame/RenderImage 装配）",
+                        acc.1.as_secs_f64() * 1000.0 / acc.0 as f64
+                    );
+                }
+            });
+        }
     }
 
     /// 关闭当前媒体、打开 `folder[current]`（同文件夹切换共用）。
