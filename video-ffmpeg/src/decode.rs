@@ -148,6 +148,7 @@ pub struct VideoParams {
 }
 
 /// 一帧解码结果：`(帧 pts 秒, 宽, 高, BGRA 像素)`（BGRA 字节序同 GPUI `RenderImage`）。
+#[allow(dead_code)] // 便捷壳 [`VideoReader::next_frame_bgra`] 用；FFI 走 `next_frame_bgra_into`
 pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
 
 /// 音频顶层参数。
@@ -508,7 +509,30 @@ impl VideoReader {
 
     /// 推进到**下一帧**并转成 BGRA。返回 [`DecodedFrame`]；
     /// `None` = 已到流末尾（之后可再 `seek` 复用）。
+    ///
+    /// 便捷壳：内部临时缓冲 + 委托 [`Self::next_frame_bgra_into`]（测试/旧调用点用）。
+    #[allow(dead_code)] // 测试与语义入口；播放 FFI 走 `next_frame_bgra_into`（省一次 to_vec）
     pub fn next_frame_bgra(&mut self) -> Result<Option<DecodedFrame>> {
+        let cap = (self.params.width as usize)
+            .saturating_mul(self.params.height as usize)
+            .saturating_mul(4)
+            .max(1);
+        let mut out = vec![0u8; cap];
+        match self.next_frame_bgra_into(&mut out)? {
+            Some((p, w, h)) => {
+                out.truncate((w as usize) * (h as usize) * 4);
+                Ok(Some((p, w, h, out)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 推进到**下一帧**并把 BGRA 直接写进调用方提供的 `out`（须 ≥ 输出 w×h×4，一般用
+    /// 源尺寸预分配即可）。返回 `(pts 秒, 宽, 高)`；`None` = 流末尾。
+    ///
+    /// 相比 [`Self::next_frame_bgra`] 省掉内部 `to_vec` 的一次分配+整帧拷贝——播放每帧
+    /// 一次（release 下输出 ~2.3MB），是解码→上屏路径里的冗余复制之一。
+    pub fn next_frame_bgra_into(&mut self, out: &mut [u8]) -> Result<Option<(f64, u32, u32)>> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let packet = self.next_video_packet();
@@ -522,8 +546,8 @@ impl VideoReader {
                     }
                     let mut f = ffmpeg::frame::Video::empty();
                     while self.decoder.receive_frame(&mut f).is_ok() {
-                        if let Some(buf) = self.convert_bgra(&f)? {
-                            return Ok(Some(buf));
+                        if let Some(r) = self.convert_bgra_into(&f, out)? {
+                            return Ok(Some(r));
                         }
                     }
                     return Ok(None);
@@ -535,8 +559,8 @@ impl VideoReader {
             // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
             let mut f = ffmpeg::frame::Video::empty();
             while self.decoder.receive_frame(&mut f).is_ok() {
-                if let Some(buf) = self.convert_bgra(&f)? {
-                    return Ok(Some(buf));
+                if let Some(r) = self.convert_bgra_into(&f, out)? {
+                    return Ok(Some(r));
                 }
             }
         }
@@ -576,13 +600,17 @@ impl VideoReader {
         Ok(self.scaler.as_mut().expect("scaler 已就绪"))
     }
 
-    /// 把解码帧转 BGRA；无 pts 的帧跳过（返回 `None`）。尺寸用 sws 输出
-    /// （decode-to-display 下采样目标），与 `out_width/out_height` 一致。
+    /// 把解码帧转 BGRA 并写进 `out`（须 ≥ 输出 w×h×4）；无 pts 的帧跳过（返回 `None`）。
+    /// 尺寸用 sws 输出（decode-to-display 下采样目标），与 `out_width/out_height` 一致。
     ///
     /// 硬件路径：解码帧为 opaque GPU 帧 → `av_hwframe_transfer_data` 回读到系统内存
     /// （NV12/P010 等软件格式）→ 按该真实格式惰性建 sws → 转 BGRA。
     /// 软件路径：直接按解码器输出格式建 sws（首个软件帧触发）。
-    fn convert_bgra(&mut self, f: &ffmpeg::frame::Video) -> Result<Option<DecodedFrame>> {
+    fn convert_bgra_into(
+        &mut self,
+        f: &ffmpeg::frame::Video,
+        out: &mut [u8],
+    ) -> Result<Option<(f64, u32, u32)>> {
         let Some(pts) = f.pts() else {
             return Ok(None);
         };
@@ -607,14 +635,14 @@ impl VideoReader {
                 .run(f, &mut bgra)
                 .context("sws 转换失败")?;
         }
+        let need = (self.out_width as usize) * (self.out_height as usize) * 4;
+        if out.len() < need {
+            return Err(anyhow!("解码输出缓冲过小: {} < 需要 {}", out.len(), need));
+        }
+        out[..need].copy_from_slice(&bgra.data(0)[..need]);
         let secs = pts as f64 * f64::from(self.time_base.numerator())
             / f64::from(self.time_base.denominator());
-        Ok(Some((
-            secs,
-            self.out_width,
-            self.out_height,
-            bgra.data(0).to_vec(),
-        )))
+        Ok(Some((secs, self.out_width, self.out_height)))
     }
 }
 

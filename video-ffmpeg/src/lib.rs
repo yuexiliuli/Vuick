@@ -108,14 +108,15 @@ pub unsafe extern "C" fn vff_video_frame(
     w: *mut u32,
     hh: *mut u32,
 ) -> c_int {
+    if out_buf.is_null() {
+        return -1;
+    }
     let r = reader::<VideoReader>(h);
-    match r.next_frame_bgra() {
-        Ok(Some((p, ww, hhh, data))) => {
-            if out_buf.is_null() || data.len() > out_cap {
-                return -1;
-            }
+    // 直接写进调用方预分配缓冲（`next_frame_bgra_into` 内部不再 to_vec，省一次整帧分配+拷贝）
+    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+    match r.next_frame_bgra_into(out) {
+        Ok(Some((p, ww, hhh))) => {
             unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
                 *pts = p;
                 *w = ww;
                 *hh = hhh;
