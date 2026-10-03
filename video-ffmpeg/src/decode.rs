@@ -440,14 +440,27 @@ impl VideoReader {
         let (decoder, hw) = match try_open_hw_decoder(&params_for_decoder, hw_required) {
             Some((video, hw)) => (video, Some(hw)),
             None if hw_required => return Err(anyhow!("硬件解码不可用")),
-            None => (
-                ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
+            None => {
+                let mut dec = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
                     .context("解析视频流参数失败")?
-                    .decoder()
-                    .video()
-                    .context("该流不是视频")?,
-                None,
-            ),
+                    .decoder();
+                // 软件解码默认单线程 = 每帧最少 CPU（headless release 实测：1080p30 单线程
+                // ≈11.3ms/帧 ≈0.33 核@30fps，余量 3×；帧线程 4 核虽然墙钟 8.1ms 但忙核 1.67，
+                // 每帧 CPU 反而 +20%——对本机「省 CPU」目标有害）。
+                // `VFF_DECODE_THREADS=N` 可开到帧线程：仅当单线程解码跟不上实时（如 4K/
+                // 高帧率源）才需要，代价是 CPU 略升。
+                let threads: usize = std::env::var("VFF_DECODE_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                if threads > 1 {
+                    dec.set_threading(ffmpeg::codec::threading::Config {
+                        kind: ffmpeg::codec::threading::Type::Frame,
+                        count: threads,
+                    });
+                }
+                (dec.video().context("该流不是视频")?, None)
+            }
         };
 
         let (width, height) = (decoder.width(), decoder.height());
