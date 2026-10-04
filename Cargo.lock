@@ -2345,11 +2345,8 @@ dependencies = [
  "ropey",
  "roxmltree 0.21.1",
  "rustc-hash 1.1.0",
- "serde",
  "serde_json",
  "syntect",
- "unicode-bidi",
- "unicode-segmentation",
  "zip",
 ]
 

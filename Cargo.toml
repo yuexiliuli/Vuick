@@ -8,17 +8,12 @@ edition = "2024"
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
 memchr = "2"
 # 快速非加密哈希（默认 SipHash 在 debug 下对 3000-9000 条容器重建慢 5-10×）：
 # fold_plan 重建的 math_start/math_body/fold_lines/dyn_map 全部换 Fx（无迭代序依赖）。
 rustc-hash = "1.1"
-# 实时预览编辑（WYSIWYG，src/markdown/live）需要的两个小依赖：
-# Unicode 字素簇边界（光标移动）与 UAX#9 bidi（RTL 视觉光标/点击映射）。
-unicode-segmentation = "1"
-unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data"] }
 # 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
 # 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
 futures = "0.3"
