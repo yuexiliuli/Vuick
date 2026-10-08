@@ -119,7 +119,7 @@ impl Notification {
             .px_3()
             .py_2()
             .gap_1()
-            .rounded_md()
+            .rounded_lg()
             .border_1()
             .border_color(border)
             .bg(surface)

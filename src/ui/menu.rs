@@ -325,7 +325,7 @@ impl Render for PopupMenu {
                         .items_center()
                         .min_h(ITEM_HEIGHT)
                         .px(ITEM_PADDING)
-                        .rounded_md()
+                        .rounded_sm()
                         .gap_2()
                         .text_color(if *disabled { fg_muted } else { fg })
                         .when(is_selected, |d| d.bg(selected_bg))
@@ -357,7 +357,7 @@ impl Render for PopupMenu {
             .bg(colors.surface)
             .border_1()
             .border_color(colors.border)
-            .rounded_md()
+            .rounded_lg()
             .text_color(fg)
             .occlude()
             .child(

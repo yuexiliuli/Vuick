@@ -13,8 +13,7 @@ struct TabBarColors {
     chip_bg: gpui::Hsla,
     chip_text: gpui::Hsla,
     bar_bg: gpui::Hsla,
-    panel_bg: gpui::Hsla,
-    accent: gpui::Hsla,
+    hover_fill: gpui::Hsla,
 }
 
 impl EditorApp {
@@ -252,7 +251,8 @@ impl EditorApp {
     }
 
     /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
-    fn tab_bar_colors(&self, cx: &mut Context<Self>) -> TabBarColors {
+    fn tab_bar_colors(&self, _cx: &mut Context<Self>) -> TabBarColors {
+        let c = self.chrome();
         TabBarColors {
             text_primary: self.text_primary(),
             text_minor: self.text_minor(),
@@ -261,8 +261,7 @@ impl EditorApp {
             chip_bg: self.chip_bg(),
             chip_text: self.chip_text(),
             bar_bg: self.bar_bg(),
-            panel_bg: self.panel_bg(),
-            accent: crate::ui::theme::Theme::global(cx).colors.accent.into(),
+            hover_fill: c.hover_fill.into(),
         }
     }
 
@@ -293,6 +292,7 @@ impl EditorApp {
             .text_size(px(13.))
             .text_color(colors.text_minor)
             .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(colors.hover_fill))
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -302,45 +302,33 @@ impl EditorApp {
                 }),
             );
 
-        // 激活选项卡顶部 2px 蓝色强调线（色 = 语义 `accent`）。
-        // 用绝对定位细条绘制：本版 gpui 的 border_color 是整圈一个色，
-        // 没有“只染某一边”的 API，无法用 border 实现顶蓝其余透明。
-        let accent_line = is_active.then(|| {
-            div()
-                .id(SharedString::from(format!("tab-accent-{idx}")))
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .right(px(0.))
-                .h(px(1.))
-                .bg(colors.accent)
-                .into_any_element()
-        });
-
         let mut el = div()
             .id(SharedString::from(format!("tab-{idx}")))
             .debug_selector(move || format!("tab-{idx}"))
-            .h_full()
+            .h(px(26.))
+            .my(px(3.))
             .px_2()
             .flex()
             .items_center()
             .gap_1()
             .flex_shrink(1.)
             .relative()
-            .bg(if is_active {
-                colors.panel_bg
-            } else {
-                rgba(0x00000000).into()
-            })
             .cursor(CursorStyle::PointingHand)
             .text_size(px(12.))
             .text_color(colors.text_primary)
             .child(if dirty { "● " } else { "" })
             .child(SharedString::from(name.clone()))
             .child(close);
-        if let Some(accent_line) = accent_line {
-            el = el.child(accent_line);
-        }
+        // 激活项 = VS Code 卡片式：26px 圆角白卡浮在灰带上（浅色下）；
+        // 非激活项透明底 + hover 填充。
+        el = if is_active {
+            el.rounded_md()
+                .bg(colors.tab_active_bg)
+                .border_1()
+                .border_color(colors.tab_active_border)
+        } else {
+            el.hover(|style| style.bg(colors.hover_fill))
+        };
         // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
         // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
         let drag_data = TabDragData {
@@ -379,7 +367,7 @@ impl EditorApp {
             .rounded_md()
             .bg(colors.chip_bg)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(colors.tab_active_bg))
+            .hover(|style| style.bg(colors.hover_fill))
             .active(|style| style.bg(colors.tab_active_border))
             .on_click(
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| {
@@ -438,6 +426,7 @@ impl EditorApp {
         } else {
             self.chrome().text_tertiary.into()
         };
+        let hover_fill: gpui::Hsla = self.chrome().hover_fill.into();
         Some(
             div()
                 .id("tab-bar-eye")
@@ -449,6 +438,7 @@ impl EditorApp {
                 .justify_center()
                 .rounded_md()
                 .cursor(CursorStyle::PointingHand)
+                .hover(|style| style.bg(hover_fill))
                 .child(
                     div()
                         .w(px(16.))
@@ -546,7 +536,7 @@ impl EditorApp {
                             .h_full()
                             .flex()
                             .flex_row()
-                            .items_stretch()
+                            .items_center()
                             .gap_1()
                             .overflow_x_scroll()
                             .track_scroll(&self.tab_bar_hscroll.handle)

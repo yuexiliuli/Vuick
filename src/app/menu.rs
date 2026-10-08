@@ -265,7 +265,7 @@ impl EditorApp {
                 .flex()
                 .items_center()
                 .px_2()
-                .rounded_md()
+                .rounded_sm()
                 .text_size(px(13.))
                 .text_color(text_primary)
                 .dropdown_menu(move |menu, _, _| items(menu, weak.clone()))

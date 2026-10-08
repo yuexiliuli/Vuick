@@ -13,7 +13,7 @@
 
 use std::sync::LazyLock;
 
-use gpui::{App, Global, Rgba, SharedString, rgb};
+use gpui::{App, Global, Rgba, SharedString, rgb, rgba};
 
 /// 明暗模式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,9 +158,9 @@ impl ColorScheme {
 /// 外壳（App 框架）配色：标题栏/菜单栏/选项卡栏/侧边栏/状态栏等**窗口外壳**的语义色，
 /// 与 [`ColorScheme`]（内容渲染色板）平行——前者管「框」，后者管「内容」。
 ///
-/// 第 1 步从 `src/app/mod.rs` 的 11 个 `dark_mode` 分支 helper 收编而来，字段值与收编前
-/// **逐字节一致**（含亮暗同值的 `pill_*`/`dirty`/`text_tertiary`）；本步纯来源重构、视觉
-/// 不变，后续 Win11 Fluent / VS Code 风格化步骤再基于此演进。
+/// **Win11 Fluent 中性外壳色板**：以中性灰（亮 #F3F3F3 / 暗 #202020）打底，配合
+/// VS Code 工作台层次（灰带 + 白色卡片选项卡 + 8px 圆角浮动层）。hover / 按压 / 关闭
+/// 三档交互色单独成字段，统一由组件像素级消费，禁止在组件里新写硬编码 `rgba()`。
 #[derive(Clone, Copy, Debug)]
 pub struct ChromeColors {
     /// 编辑区以外的画布背景（＝窗口底色）
@@ -187,52 +187,64 @@ pub struct ChromeColors {
     pub tab_active_bg: Rgba,
     /// 激活选项卡边框
     pub tab_active_border: Rgba,
-    /// 状态栏语言徽标 / 全屏按钮等的 pill 底色（亮暗同值）
+    /// 状态栏语言徽标 / 全屏按钮等的 pill 底色（＝芯片底，随 `chip_*` 令牌）
     pub pill_bg: Rgba,
-    /// pill 前景文字（亮暗同值）
+    /// pill 前景文字（＝芯片字）
     pub pill_fg: Rgba,
     /// 文件脏标记点（亮暗同值）
     pub dirty: Rgba,
+    /// 通用悬停填充（列表行 / 图标钮 / 选项卡 hover）
+    pub hover_fill: Rgba,
+    /// 通用按压填充（比 hover 深一档）
+    pub pressed_fill: Rgba,
+    /// 关闭按钮悬停填充（危险红，亮暗同值）
+    pub close_hover: Rgba,
 }
 
 impl ChromeColors {
     pub fn light() -> Self {
         Self {
-            window_bg: rgb(0xf3f4f6),
-            bar_bg: rgb(0xf3f4f6),
-            bar_border: rgb(0xe5e7eb),
+            window_bg: rgb(0xf3f3f3),
+            bar_bg: rgb(0xf3f3f3),
+            bar_border: rgba(0x0000001c),
             panel_bg: rgb(0xffffff),
             surface_bg: rgb(0xffffff),
-            text_primary: rgb(0x111827),
-            text_minor: rgb(0x6b7280),
+            text_primary: rgb(0x1f1f1f),
+            text_minor: rgb(0x5f5f5f),
             text_tertiary: rgb(0x9ca3af),
-            chip_bg: rgb(0xe5e7eb),
-            chip_text: rgb(0x374151),
+            chip_bg: rgb(0xe5e5e5),
+            chip_text: rgb(0x1f1f1f),
             tab_active_bg: rgb(0xffffff),
-            tab_active_border: rgb(0xd1d5db),
-            pill_bg: rgb(0xeef2ff),
-            pill_fg: rgb(0x4338ca),
+            tab_active_border: rgba(0x0000001c),
+            pill_bg: rgb(0xe5e5e5),
+            pill_fg: rgb(0x1f1f1f),
             dirty: rgb(0xdc2626),
+            hover_fill: rgba(0x0000000d),
+            pressed_fill: rgba(0x0000001a),
+            close_hover: rgb(0xe81123),
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            window_bg: rgb(0x111827),
-            bar_bg: rgb(0x1f2937),
-            bar_border: rgb(0x374151),
-            panel_bg: rgb(0x111827),
-            surface_bg: rgb(0x111b2a),
-            text_primary: rgb(0xe5e7eb),
-            text_minor: rgb(0x9ca3af),
+            window_bg: rgb(0x202020),
+            bar_bg: rgb(0x202020),
+            bar_border: rgba(0xffffff1f),
+            panel_bg: rgb(0x2b2b2b),
+            surface_bg: rgb(0x202020),
+            text_primary: rgb(0xe5e5e5),
+            text_minor: rgb(0x9d9d9d),
             text_tertiary: rgb(0x9ca3af),
-            chip_bg: rgb(0x374151),
-            chip_text: rgb(0xe5e7eb),
-            tab_active_bg: rgb(0x374151),
-            tab_active_border: rgb(0x4b5563),
-            pill_bg: rgb(0xeef2ff),
-            pill_fg: rgb(0x4338ca),
+            chip_bg: rgb(0x3d3d3d),
+            chip_text: rgb(0xe5e5e5),
+            tab_active_bg: rgb(0x2b2b2b),
+            tab_active_border: rgba(0xffffff1f),
+            pill_bg: rgb(0x3d3d3d),
+            pill_fg: rgb(0xe5e5e5),
             dirty: rgb(0xdc2626),
+            hover_fill: rgba(0xffffff14),
+            pressed_fill: rgba(0xffffff24),
+            close_hover: rgb(0xe81123),
         }
     }
 
@@ -370,18 +382,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn chrome_palette_pins_original_shell_values(_cx: &mut TestAppContext) {
-        // 回归：外壳色值必须逐字节等于收编前 app/mod.rs 的硬编码（含亮暗同值的
-        // pill / dirty / text_tertiary），后续 Win11 Fluent / VS Code 风格化步骤再改。
+    fn chrome_palette_pins_win11_shell_values(_cx: &mut TestAppContext) {
+        // 回归：Win11 Fluent 中性外壳关键值钉死（第 2 步换色后的新色板）。
         let light = ChromeColors::light();
         let dark = ChromeColors::dark();
         assert_eq!(light.panel_bg, rgb(0xffffff), "亮面板背景=白");
-        assert_eq!(light.pill_bg, rgb(0xeef2ff), "亮 pill 底色");
-        assert_eq!(dark.window_bg, rgb(0x111827), "暗窗口背景");
-        // 亮暗同值字段（现状即如此，钉住防漂移）
-        assert_eq!(light.pill_fg, dark.pill_fg, "pill 前景亮暗同值");
-        assert_eq!(light.text_tertiary, rgb(0x9ca3af), "三级文字亮度");
-        assert_eq!(dark.text_tertiary, light.text_tertiary, "三级文字亮暗同值");
+        assert_eq!(light.pill_bg, rgb(0xe5e5e5), "亮 pill 底色=chip 底");
+        assert_eq!(dark.window_bg, rgb(0x202020), "暗窗口背景");
+        assert_eq!(dark.bar_border, rgba(0xffffff1f), "暗工具条分隔边框");
+        // pill 跟随 chip 令牌（不再是旧的主蓝高亮胶囊）
+        assert_eq!(light.pill_bg, light.chip_bg, "亮 pill=chip 底");
+        assert_eq!(light.pill_fg, light.chip_text, "亮 pill=chip 字");
+        assert_eq!(dark.pill_bg, dark.chip_bg, "暗 pill=chip 底");
+        assert_eq!(dark.pill_fg, dark.chip_text, "暗 pill=chip 字");
+        // 交互三档：hover / pressed 亮暗分离、pressed 与 hover 不同、关闭红亮暗同值
+        assert_ne!(light.hover_fill, dark.hover_fill, "hover 填充随明暗");
+        assert_ne!(light.pressed_fill, dark.pressed_fill, "按压填充随明暗");
+        assert_ne!(light.hover_fill, light.pressed_fill, "hover 与按压深浅不同");
+        assert_eq!(light.close_hover, dark.close_hover, "关闭红亮暗同值");
         assert_eq!(light.dirty, dark.dirty, "脏标记点亮暗同值");
     }
 

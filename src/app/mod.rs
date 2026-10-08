@@ -241,7 +241,7 @@ impl Render for TabDragGhost {
             .debug_selector(|| "tab-drag-ghost".into())
             .px_3()
             .py_1()
-            .rounded_md()
+            .rounded_lg()
             .bg(accent)
             .text_color(white())
             .text_size(px(12.))
@@ -1965,8 +1965,14 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (bar_bg, bar_border, text_minor) =
-            (self.bar_bg(), self.bar_border(), self.text_minor());
+        let bar_bg = self.bar_bg();
+        let text_minor = self.text_minor();
+        let c = self.chrome();
+        let hover_fill: gpui::Hsla = c.hover_fill.into();
+        let pressed_fill: gpui::Hsla = c.pressed_fill.into();
+        let close_hover: gpui::Hsla = c.close_hover.into();
+        // 关闭钮按压色：close_hover 的深一档局部派生（本步唯一局部派生色，勿挪进色板）。
+        let close_pressed: gpui::Hsla = rgba(0xa70d1aff).into();
         let icon_style = |icon: IconName| {
             Icon::new(icon).size(px(14.)).text_color(text_minor)
         };
@@ -1984,7 +1990,7 @@ impl EditorApp {
             .rounded_md()
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(self.bar_border()))
+            .hover(|style| style.bg(hover_fill))
             .child(icon_style(if self.sidebar.open {
                 IconName::PanelLeftClose
             } else {
@@ -2005,54 +2011,55 @@ impl EditorApp {
 
         let minimize = div()
             .id("title-minimize")
-            .w(px(30.))
-            .h(px(24.))
+            .w(px(40.))
+            .h(px(32.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(hover_fill))
+            .active(|style| style.bg(pressed_fill))
             .child(icon_style(IconName::WindowMinimize))
             .window_control_area(gpui::WindowControlArea::Min);
 
         let maximize = div()
             .id("title-maximize")
-            .w(px(30.))
-            .h(px(24.))
+            .w(px(40.))
+            .h(px(32.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(hover_fill))
+            .active(|style| style.bg(pressed_fill))
             .child(icon_style(maximize_icon))
             .window_control_area(gpui::WindowControlArea::Max);
 
         let close = div()
             .id("title-close")
-            .w(px(30.))
-            .h(px(24.))
+            .w(px(40.))
+            .h(px(32.))
             .flex()
             .items_center()
             .justify_center()
-            .rounded_md()
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
+            .hover(|style| style.bg(close_hover))
+            .active(|style| style.bg(close_pressed))
             .child(icon_style(IconName::WindowClose))
             .window_control_area(gpui::WindowControlArea::Close);
 
         div()
             .id("title-bar")
-            .h(px(30.))
+            .h(px(32.))
             .w_full()
             .flex()
             .items_center()
             .gap_1()
             .px_2()
             .bg(bar_bg)
-            .border_b_1()
-            .border_color(bar_border)
             .child(self.render_menu_buttons(cx))
             .child(
                 div()

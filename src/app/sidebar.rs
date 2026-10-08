@@ -229,6 +229,9 @@ impl EditorApp {
     ) -> impl IntoElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let accent: gpui::Hsla = crate::ui::theme::Theme::global(cx).colors.accent.into();
+        let c = self.chrome();
+        let hover_fill: gpui::Hsla = c.hover_fill.into();
+        let pressed_fill: gpui::Hsla = c.pressed_fill.into();
         let specs = [
             (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc"),
             (SidebarView::Search, IconName::Search, "sidebar-btn-search"),
@@ -250,11 +253,12 @@ impl EditorApp {
                 .justify_center()
                 .mx(px(3.))
                 .my(px(1.))
-                .rounded_md()
+                .rounded_sm()
                 // 背景不随活动状态变化，仅图标着色区分
                 .text_color(col)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(border))
+                .hover(|style| style.bg(hover_fill))
+                .active(|style| style.bg(pressed_fill))
                 // 活动项：最左侧蓝色竖条（同目录条目左侧指示条）
                 .child(
                     div()
