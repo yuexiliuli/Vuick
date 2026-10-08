@@ -1947,7 +1947,9 @@ impl EditorApp {
         let top: gpui::Hsla = chrome.material_top.into();
         let bottom: gpui::Hsla = chrome.material_bottom.into();
         let h = window.bounds().size.height.as_f32();
-        const N: usize = 8;
+        // 分带数取 64：每根带跳变 <0.5/255 灰度，肉眼不可辨；
+        // 若段数太少（如 8），明暗阶梯会透过半透明侧栏/工具条显现为横向分带。
+        const N: usize = 64;
         let band_h = h / N as f32;
         let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
         for i in 0..N {
@@ -1955,15 +1957,16 @@ impl EditorApp {
             // 材质色是近中性灰（h/s≈0），直接对 lightness 插值即可
             let lum = top.l + (bottom.l - top.l) * t;
             let band = gpui::hsla(0.0, 0.0, lum, 1.0);
-            layer = layer.child(
-                div()
-                    .absolute()
-                    .top(px(i as f32 * band_h))
-                    .left_0()
-                    .right_0()
-                    .h(px(band_h))
-                    .bg(band),
-            );
+            let mut b = div().absolute().left_0().right_0().bg(band);
+            if i == N - 1 {
+                // 最后一根锚到底，保证渐变终点精确等于 bottom 色
+                b = b.top(px(i as f32 * band_h)).bottom_0();
+            } else {
+                // 每根向下多叠 1px：N 段取整会在带间留 0~1px 缝透出底色成细线，
+                // 多叠 1px 且后画者在上一层，彻底消除缝隙。
+                b = b.top(px(i as f32 * band_h)).h(px(band_h + 1.0));
+            }
+            layer = layer.child(b);
         }
         layer
     }
