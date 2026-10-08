@@ -1265,6 +1265,11 @@ impl WyEditor {
     /// 满载忙循环；对齐缩放恢复 [`Self::ZOOM_ANCHOR_MAX_APPLIES`]）。
     pub(crate) const SCROLL_TARGET_MAX_APPLIES: u32 = 30;
 
+    /// 同步重钉在「复用态」下判定「用户已接管本窗滚动」的偏移阈值（px）：宿主当前偏移
+    /// 偏离我方上次钉定目标超过该值 = 用户切过来滚了（一节滚轮 ≈ 54px+，绝无歧义）。
+    /// 一旦判定即放弃重钉，避免与用户滚轮互搏（面板交接处上下跳动的直接根因）。
+    pub(crate) const USER_TAKEOVER_PX: f32 = 8.0;
+
     /// 推进待落地滚动（WyEditor 元素 prepaint 每帧调用）：目标块**精确**顶经
     /// `scroll_to_line_impl` 写回宿主句柄。先读宿主当前偏移，若与上次写入的目标一致
     /// （说明布局未复位、已稳住）则清除目标停止重钉，否则重写并继续。
@@ -1294,11 +1299,15 @@ impl WyEditor {
             return;
         };
         let cur = (-vh.offset().y).as_f32();
-        // 首帧（或目标块变化）经 `scroll_to_line_impl` 精确重建并写目标；后续帧复用
-        // `last_pin` 缓存的目标偏移只重写（确认帧零成本，避免大文档每帧 band 重建）。
-        let target = match self.last_pin.get() {
-            Some((psl, pt)) if psl == sl => pt,
-            _ => self.scroll_to_line_impl(sl, window),
+        // 复用上次钉定目标（`last_pin` 与当前 `sl` 同源）则直接收敛，不再重建；
+        // 首帧 / 目标块变化则经 `scroll_to_line_impl` 精确重建。
+        let reused = match self.last_pin.get() {
+            Some((psl, pt)) if psl == sl => Some(pt),
+            _ => None,
+        };
+        let target = match reused {
+            Some(pt) => pt,
+            None => self.scroll_to_line_impl(sl, window),
         };
         if !target.is_finite() {
             self.scroll_target.set(None);
@@ -1306,15 +1315,30 @@ impl WyEditor {
             self.scroll_applies.set(0);
             return;
         }
-        if self.last_pin.get() == Some((sl, target)) && (cur - target).abs() < 1.5 {
-            // 上一帧写入的目标在再次写入前仍被宿主持有 → 布局未复位，稳定落地。
-            self.scroll_target.set(None);
-            self.last_pin.set(None);
-            self.scroll_applies.set(0);
-        } else {
-            vh.set_offset(gpui::point(gpui::px(0.), gpui::px(target)));
-            self.last_pin.set(Some((sl, target)));
+        if reused.is_some() {
+            // 复用态的收敛判定（不重建，避免大文档每帧 band 重建放大 CPU）：
+            let diff = cur - target;
+            if diff.abs() < 1.5 {
+                // 上一帧写入的目标在再次写入前仍被宿主持有 → 布局未复位，稳定落地。
+                self.scroll_target.set(None);
+                self.last_pin.set(None);
+                self.scroll_applies.set(0);
+                return;
+            }
+            if diff.abs() > Self::USER_TAKEOVER_PX {
+                // 宿主已偏离目标超过「用户接管」阈值 = 用户在两边面板间切着滚（或其它
+                // 控制流）抢走了本窗滚动 → 我方同步重钉立即放弃，**绝不与用户滚轮互搏**。
+                // 这是「编辑区滚完切去预览区滚 / 反方向」上下跳动的直接根因：在途重钉
+                // 每帧把用户刚滚的分量改写回目标。放弃后由 app 层 sync 正常接管（预览
+                // 动了 → 驱动编辑器；两侧收敛由幂等回拉完成）。
+                self.scroll_target.set(None);
+                self.last_pin.set(None);
+                self.scroll_applies.set(0);
+                return;
+            }
         }
+        vh.set_offset(gpui::point(gpui::px(0.), gpui::px(target)));
+        self.last_pin.set(Some((sl, target)));
     }
 
     /// 字号变化的**渲染期精确锚定**：在宿主 render（prepaint 读宿主滚动偏移**之前**）

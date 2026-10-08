@@ -567,7 +567,7 @@ impl BlockLayout {
             let ti = i + 1;
             cnt_fen[ti] += sz;
             sum_fen[ti] += hs;
-            let parent = ti + ti.isolate_lowest_one();
+            let parent = ti + (ti & ti.wrapping_neg());
             if parent <= c {
                 cnt_fen[parent] += cnt_fen[ti];
                 sum_fen[parent] += sum_fen[ti];

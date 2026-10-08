@@ -207,6 +207,10 @@ pub(crate) struct DetachedTab {
     preview_dirty: Option<(usize, usize)>,
 }
 
+/// 编辑器被预览驱动后的落位收敛宽限（帧）：边界块（表格等）顶行读取可能滞后/抖动
+/// 一两帧，此期内「编辑器落位」不回显为「编辑器主动滚动」；超过才放手由正常双向同步接管。
+const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
+
 /// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
 /// - `Legacy` = `MarkdownPreview`（EPUB / 手动预览，条目为渲染行列，`scroll_to_row`）；
 /// - `Unified` = 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
@@ -267,6 +271,14 @@ struct MdScrollSync {
     /// 我方（编辑器主导时）最近一次要求预览到达的目标块：预览重钉落位到该块是「按
     /// 我方命令跟上」，不得反被当成用户滚动预览而把编辑器拽回（来回跳动）。
     driven_preview_target: Option<usize>,
+    /// 我方（预览主导时）最近一次要求编辑器到达的目标块：编辑器落位到该块是「按
+    /// 我方命令跟上」，与 `driven_preview_target` 对称——否则编辑器跟随落位会被
+    /// 误判成「编辑器先动 → 驱动预览」的反馈回声，把预览拽回（来回跳动/滚不下去）。
+    driven_editor_target: Option<usize>,
+    /// `driven_editor_target` 的收敛宽限帧数：编辑器落位通常同步、但边界块（表格等）
+    /// 顶行读取可能滞后/抖动一帧到数帧，期间回显必须被抑制；超过宽限才放手让正常
+    /// 双向同步接管（防编辑器永远到不了目标时同步停摆）。
+    driven_editor_await: u32,
 }
 
 impl Default for MdScrollSync {
@@ -277,6 +289,8 @@ impl Default for MdScrollSync {
             editor_block: None,
             preview_block: None,
             driven_preview_target: None,
+            driven_editor_target: None,
+            driven_editor_await: 0,
         }
     }
 }
@@ -1302,6 +1316,8 @@ impl EditorApp {
             editor_block,
             preview_block,
             driven_preview_target: None,
+            driven_editor_target: None,
+            driven_editor_await: 0,
         };
         return;
     }
@@ -1310,16 +1326,35 @@ impl EditorApp {
     self.md_scroll_sync.preview_block = preview_block;
     let Some(eb) = editor_block else { return };
     if preview_block == Some(eb) {
-        // 两侧同一块，已同步：作废「等待预览到达」的驱动目标（已对齐）。
+        // 两侧同一块，已同步：作废「等待预览到达」与「等待编辑器到达」的驱动目标（已对齐）。
         self.md_scroll_sync.driven_preview_target = None;
+        self.md_scroll_sync.driven_editor_target = None;
+        self.md_scroll_sync.driven_editor_await = 0;
         return;
     }
+    // 我方正在驱动编辑器到达 `driven_editor_target`：期间 editor_block 的连续变化是
+    // 跟随落位（边界块顶行读取还会滞后/抖动一两帧），**不是**用户主动滚动 → 不得触发
+    // 下方「编辑器先动 → 驱动预览」回声，否则预览会被编辑器落位拽回（来回跳动）。
+    // 宽限期内只计数，超限才放手交给正常双向同步（防永远到不了目标时停摆）。
     if prev.editor_block != editor_block {
-        // 编辑器先动 → 预览跟到编辑器顶行所在块。**不能在本帧 render 直接调**
-        // `scroll_to_line`（宿主 `ScrollHandle::set_offset` 在渲染期会被本帧布局
-        // 复位）：只把目标行写进 WY 的 `scroll_target`，由其元素 prepaint 逐帧重钉
-        // 宿主偏移直到稳住（有 [`WyEditor::SCROLL_TARGET_MAX_APPLIES`] 兜底）。
-        // 记录「等待预览到达」目标：预览重钉落位到它时不被误判为预览用户滚动。
+        if self.md_scroll_sync.driven_editor_target.is_some() {
+            // 我方驱动编辑器落位中：抑制回声，只给宽限计数；超限才放手交给正常双向同步。
+            // 注意：放手时**不得**顺便重钉预览（会把预览拉回，重蹈回声之弊）——清标后由
+            // 后续帧的正常判定接管（真用户滚编辑器 → 下一帧 editor_block 再变 → 正常驱动
+            // 预览；边界块卡住 → 编辑器不再变 → 安静保持，不再互拉）。
+            if self.md_scroll_sync.driven_editor_await >= DRIVEN_EDITOR_MAX_AWAIT {
+                self.md_scroll_sync.driven_editor_target = None;
+                self.md_scroll_sync.driven_editor_await = 0;
+            } else {
+                self.md_scroll_sync.driven_editor_await += 1;
+            }
+            return;
+        }
+        // 编辑器先动（无我方驱动在途 = 用户滚动）→ 预览跟到编辑器顶行所在块。
+        // **不能在本帧 render 直接调** `scroll_to_line`（宿主 `ScrollHandle::set_offset`
+        // 在渲染期会被本帧布局复位）：只把目标行写进 WY 的 `scroll_target`，由其元素
+        // prepaint 逐帧重钉宿主偏移直到稳住（有 [`WyEditor::SCROLL_TARGET_MAX_APPLIES`]
+        // 兜底）。记录「等待预览到达」目标：预览重钉落位到它时不被误判为预览用户滚动。
         md.update(cx, |v, _| v.set_scroll_target(eb));
         self.md_scroll_sync.driven_preview_target = Some(eb);
     } else if let Some(pb) = preview_block
@@ -1332,8 +1367,34 @@ impl EditorApp {
         // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
         // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
         // 目标作废。
+        self.md_scroll_sync.driven_editor_target = Some(pb);
+        self.md_scroll_sync.driven_editor_await = 0;
         self.md_scroll_sync.editor_block = Some(pb);
         self.md_scroll_sync.driven_preview_target = None;
+    } else if self.md_scroll_sync.driven_preview_target.is_none()
+        // 预览已稳定（上帧到本帧未变）：
+        && prev.preview_block == preview_block
+    {
+        if self.md_scroll_sync.driven_editor_target.is_some() {
+            // 编辑器落位标记悬挂在「两侧静态未对齐」态（如大跳过冲）：推进宽限计数，
+            // 超限清标（不重钉预览）后在下一帧走收敛。
+            if self.md_scroll_sync.driven_editor_await >= DRIVEN_EDITOR_MAX_AWAIT {
+                self.md_scroll_sync.driven_editor_target = None;
+                self.md_scroll_sync.driven_editor_await = 0;
+            } else {
+                self.md_scroll_sync.driven_editor_await += 1;
+            }
+        } else if let Some(pb) = preview_block
+            && Some(pb) != editor_block
+        {
+            // 以（用户当前所在的）静态预览为准回拉编辑器：幂等收敛「大跳后编辑器过冲
+            // 未对齐」，不再依赖原「编辑器→预览」回声把预览拽回（那正是来回跳动/滚不
+            // 下去的根因）。
+            editor.update(cx, |ed, _| ed.scroll_to_line(pb));
+            self.md_scroll_sync.driven_editor_target = Some(pb);
+            self.md_scroll_sync.driven_editor_await = 0;
+            self.md_scroll_sync.editor_block = Some(pb);
+        }
     }
 }
 

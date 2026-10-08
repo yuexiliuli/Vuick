@@ -5695,3 +5695,275 @@
         }
         crate::prof::dump("md_editor_insert_text");
     }
+
+    /// 回归（用户实测 2026-10-08）：真实大文档分屏下，鼠标滚轮在**预览**上快速下滚，
+    /// 滚到第一个表格块（块 99 附近）时预览「上来回跳动、滚不下去」（宿主偏移被反复
+    /// 拽回 ~93px）——根因 = sync 把「编辑器跟随预览的落位」误判成「用户滚动编辑器」，
+    /// 反向驱动预览（editor→preview 回声），每帧重钉预览偏移回编辑器所在块。
+    ///
+    /// 修复 = `MdScrollSync` 新增 `driven_editor_target` 对称护栏（+ 宽限计数）：我方
+    /// 驱动编辑器落位的宽限期内，编辑器顶块变化不回显为「编辑器先动」，预览不再被拽回。
+    ///
+    /// 断言：预览偏移单调前进（回退 >2px 计为 bounce，且必须为 0），并能滚过表格块
+    /// （修复前卡在 ~2607px，max_off 应 >3200），且最终两侧对齐（E 顶行 = 预览顶块）。
+    #[gpui::test]
+    async fn preview_wheel_sync_no_bounce_past_table(cx: &mut TestAppContext) {
+        init_test(cx);
+        crate::syntax::prewarm();
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md_path = std::env::var("BIGDOC_MD")
+            .unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
+        let md_path = md_path.clone();
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(&md_path, window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                !a.tabs[a.tabs.len().saturating_sub(1)].editor_pending
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 1500 {
+                return;
+            }
+        }
+        let (editor, mdw, vhand) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            (
+                a.tabs[i].editor.clone(),
+                a.tabs[i].md_wy.clone().expect("预览应在场"),
+                a.tabs[i].md_wy_vscroll.clone(),
+            )
+        });
+        let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
+            cx.update(|_, cx| {
+                let et = editor.read(cx).viewport_top_line();
+                let ps = mdw.read(cx).top_source_line();
+                let off = (-vhand.offset().y).as_f32();
+                (et, ps, off)
+            })
+        };
+        let mut guard = 0;
+        while read(cx).1.is_none() {
+            let _ = cx.cx.refresh();
+            guard += 1;
+            if guard > 400 {
+                return;
+            }
+        }
+
+        // 预览区滚轮下滚 30 次，逐帧检查：预览偏移不得回退 >2px（一旦前进了 >50px）；
+        // 且必须滚过第一个表格块（修复前 max_off 恒卡在 ~2607 / 来回跳动）。
+        let mut max_off = read(cx).2;
+        let mut bounced = 0usize;
+        let mut max_regress = 0f32;
+        for _ in 0..30 {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::Point::new(px(900.), px(400.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::Point::new(px(0.), px(-150.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            for _ in 0..4 {
+                let (et, _ps, off) = read(cx);
+                if off < max_off - 2.0 && max_off > 50.0 {
+                    bounced += 1;
+                    max_regress = (max_off - off).max(max_regress);
+                }
+                max_off = max_off.max(off);
+                let _ = cx.cx.refresh();
+            }
+        }
+        assert_eq!(
+            bounced, 0,
+            "预览滚轮不得回跳（bounce={bounced}，最大回退 {max_regress:.1}px；修复前每步"
+        );
+        assert!(
+            max_off > 3200.0,
+            "预览应滚过第一个表格块（max_off={max_off:.1}px；修复前卡在 ~2607px）"
+        );
+        let (et, ps, _off) = read(cx);
+        let ps = ps.expect("预览帧应就绪");
+        assert_eq!(
+            et, ps,
+            "最终两侧应对齐到同一块（editor top={et}, preview block={ps}）"
+        );
+
+        // ===== 面板交接（用户实测 2026-10-08 追加）：编辑区↔预览区**切着滚**不得跳动 =====
+        // 修复前：编辑区滚后切预览区滚 → 预览 off 在表格块处 2606.9↔2756.9 来回拽
+        // （46 次回跳）；预览区滚后切编辑区滚 → sync 彻底卡死（编辑器再也滚不动）。
+        let wheel_at = |x: f32, cx: &mut VisualTestContext| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::Point::new(px(x), px(400.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::Point::new(px(0.), px(-150.))),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+        };
+
+        // -- H1) 编辑区滚 → 切预览区滚：预览 off 单调前进 --
+        for _ in 0..8 {
+            wheel_at(700., cx);
+            for _ in 0..2 {
+                let _ = cx.cx.refresh();
+            }
+        }
+        let mut max_off1 = read(cx).2;
+        let mut h1 = 0usize;
+        for _ in 0..15 {
+            wheel_at(900., cx);
+            for _ in 0..3 {
+                let (_, _ps, off) = read(cx);
+                if off < max_off1 - 3.0 && max_off1 > 50.0 {
+                    h1 += 1;
+                }
+                max_off1 = max_off1.max(off);
+                let _ = cx.cx.refresh();
+            }
+        }
+        assert_eq!(
+            h1, 0,
+            "编辑区滚后切预览区滚，预览不得回跳（修复前 46 次）"
+        );
+
+        // -- H2) 预览区滚 → 切编辑区滚：编辑器顶行单调前进（且不得被 sync 卡死） --
+        for _ in 0..8 {
+            wheel_at(900., cx);
+            for _ in 0..2 {
+                let _ = cx.cx.refresh();
+            }
+        }
+        let mut max_et = read(cx).0;
+        let mut h2 = 0usize;
+        for _ in 0..15 {
+            wheel_at(700., cx);
+            for _ in 0..3 {
+                let (et, _ps, _off) = read(cx);
+                if et < max_et && max_et > 10 {
+                    h2 += 1;
+                }
+                max_et = max_et.max(et);
+                let _ = cx.cx.refresh();
+            }
+        }
+        assert_eq!(
+            h2, 0,
+            "预览区滚后切编辑区滚，编辑器顶行不得回跳且不得锁死（修复前卡死 max_et=98）"
+        );
+        eprintln!(
+            "[regression] preview_wheel_sync_no_bounce_past_table OK: max_off={max_off:.1} H1={h1} H2={h2} max_et={max_et}"
+        );
+    }
+
+    /// 诊断（#[ignore]）：真实 Windows 滚轮口径（Lines ±3）+ 1 帧切换 × 「多滚后换区」模式，
+    /// 逐帧检查「编辑区→预览区」「预览区→编辑区」交接处 E/off 是否回跳（修复前用户实测）。
+    #[gpui::test]
+    #[ignore]
+    async fn diag_handoff2(cx: &mut TestAppContext) {
+        init_test(cx);
+        crate::syntax::prewarm();
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md_path = std::env::var("BIGDOC_MD")
+            .unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
+        let md_path = md_path.clone();
+        cx.update(|window, cx| {
+            app.update(cx, |a, cx| a.open_file(&md_path, window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                !a.tabs[a.tabs.len().saturating_sub(1)].editor_pending
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 1500 {
+                return;
+            }
+        }
+        let (editor, mdw, vhand) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            (
+                a.tabs[i].editor.clone(),
+                a.tabs[i].md_wy.clone().expect("预览应在场"),
+                a.tabs[i].md_wy_vscroll.clone(),
+            )
+        });
+        let read = |cx: &mut VisualTestContext| -> (usize, Option<usize>, f32) {
+            cx.update(|_, cx| {
+                let et = editor.read(cx).viewport_top_line();
+                let ps = mdw.read(cx).top_source_line();
+                let off = (-vhand.offset().y).as_f32();
+                (et, ps, off)
+            })
+        };
+        let mut guard = 0;
+        while read(cx).1.is_none() {
+            let _ = cx.cx.refresh();
+            guard += 1;
+            if guard > 400 {
+                return;
+            }
+        }
+        let wheel_lines = |x: f32, cx: &mut VisualTestContext| {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::Point::new(px(x), px(400.)),
+                delta: gpui::ScrollDelta::Lines(gpui::Point::new(0.0, -3.0)),
+                modifiers: gpui::Modifiers::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+        };
+        let mut max_off = read(cx).2;
+        let mut max_et = read(cx).0;
+        let mut bounce = 0usize;
+        let mut seq = [('E', 12), ('P', 12), ('E', 12), ('P', 12), ('E', 12), ('P', 12)];
+        let mut step = 0usize;
+        for (which, n) in seq.into_iter() {
+            for k in 0..n {
+                let x = if which == 'E' { 700. } else { 900. };
+                wheel_lines(x, cx);
+                // 1 帧即刻读（不沉淀），模拟“切过去马上滚”
+                let (et, ps, off) = read(cx);
+                if off < max_off - 3.0 && max_off > 50.0 {
+                    bounce += 1;
+                    eprintln!(
+                        "[h2] !!OFF-BOUNCE seq={step} {which}{k} off={off:.1} <- max={max_off:.1} E={et} P={ps:?}"
+                    );
+                }
+                if et < max_et && max_et > 10 {
+                    bounce += 1;
+                    eprintln!(
+                        "[h2] !!ET-BOUNCE seq={step} {which}{k} E={et} <- maxE={max_et} P={ps:?} off={off:.1}"
+                    );
+                }
+                max_off = max_off.max(off);
+                max_et = max_et.max(et);
+                let _ = cx.cx.refresh();
+            }
+            step += 1;
+            let (et, ps, off) = read(cx);
+            eprintln!(
+                "[h2] seq#{step}({which} x{n}) E={et} P={ps:?} off={off:.1} bounces={bounce}"
+            );
+        }
+        eprintln!("[h2] DONE bounces={bounce} max_off={max_off:.1} max_et={max_et}");
+    }
+
