@@ -156,10 +156,7 @@ impl EditorApp {
             "重置字号",
             "Ctrl+0",
             weak.clone(),
-            |this, _window, cx| {
-                this.font_size = DEFAULT_FONT_SIZE;
-                cx.notify();
-            },
+            |this, _window, cx| this.reset_font_size(cx),
         ))
         .separator()
         .item(Self::wrap_menu_item(weak.clone()))
@@ -167,8 +164,14 @@ impl EditorApp {
         .item(Self::menu_action_item(
             "黑白切换",
             "",
-            weak,
+            weak.clone(),
             |this, window, cx| this.toggle_theme(window, cx),
+        ))
+        .item(Self::menu_action_item(
+            "跟随系统主题",
+            "Ctrl+Shift+T",
+            weak,
+            |this, _window, cx| this.follow_system_theme(cx),
         ))
     }
 

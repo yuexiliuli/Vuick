@@ -50,6 +50,7 @@ use crate::config::layout::{
     DEFAULT_FONT_SIZE, FONT_MAX, FONT_MIN, MENU_BAR_H, SIDEBAR_WIDTH, SPLIT_RATIO_MAX,
     SPLIT_RATIO_MIN,
 };
+use crate::config::user::{ThemePref, UserPrefs};
 use crate::scrollbar::TableScrollState;
 
 /// 把上一帧的预览 dirty 区间平移到本帧（编辑点之前不变、之后随 δ 平移）再并入
@@ -322,6 +323,8 @@ pub struct EditorApp {
     preview_seq: u64,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
+    /// 主题偏好三态：Follow=跟随系统 / Light / Dark（手动切亮/暗会覆盖「跟随」）。
+    theme_pref: ThemePref,
     /// 编辑区 / 预览区分屏比例（0..1，= 编辑区占宽比例）
     split_ratio: f32,
     /// 编辑区是否自动换行（默认换行）。开关只作用编辑区；Markdown 预览
@@ -371,6 +374,9 @@ pub struct EditorApp {
     /// 双方块起点键。每帧渲染开头比对、由「动了的那一侧」驱动对端；切换选项卡/换
     /// 文档（块号失义）即重置。
     md_scroll_sync: MdScrollSync,
+    /// 「跟随系统主题」时的外观变化订阅（`Window::observe_window_appearance`）；
+    /// 离开跟随模式后回调只是空返，切换回跟随会立即按当前系统落地一次。
+    _appearance_sub: Option<Subscription>,
 }
 
 /// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
@@ -429,6 +435,14 @@ impl EditorApp {
                 InputEvent::Change => cx.notify(),
             }
         });
+        // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
+        let prefs = UserPrefs::load();
+        // 初始主题：按偏好解析（Follow → 当前系统明暗；Light/Dark → 强制）。
+        let start_dark = prefs.theme.resolved_dark(cx.window_appearance());
+        let start_font = prefs
+            .font_size
+            .map(|v| v.clamp(FONT_MIN, FONT_MAX))
+            .unwrap_or(DEFAULT_FONT_SIZE);
         let mut app = EditorApp {
             tabs: Vec::new(),
             active_tab: 0,
@@ -437,11 +451,13 @@ impl EditorApp {
             status: SharedString::from("就绪"),
             status_ok: true,
             notifications: Vec::new(),
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: start_font,
             preview_pending: false,
             preview_syncing: false,
             preview_seq: 0,
-            dark_mode: false,
+            dark_mode: start_dark,
+            // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
+            theme_pref: prefs.theme,
             split_ratio: 0.5,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
             wrap_enabled: false,
@@ -455,8 +471,9 @@ impl EditorApp {
                 panel_open: false,
                 toc_collapsed: Default::default(),
                 toc_tab: None,
-                width: SIDEBAR_WIDTH,
-                width_auto: true,
+                // 有持久化宽度 → 恢复并固定为手动宽度；否则保持随内容自适应。
+                width: prefs.sidebar_width.unwrap_or(SIDEBAR_WIDTH),
+                width_auto: prefs.sidebar_width.is_none(),
                 resize: None,
                 resize_hovered: false,
             },
@@ -475,8 +492,39 @@ impl EditorApp {
             media_lock_menu_sub: None,
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
+            _appearance_sub: None,
         };
         app.register_window(window, cx);
+        // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
+        // 首帧前完成，避免「先亮后暗」闪一下）。
+        crate::ui::theme::Theme::set(
+            if app.dark_mode {
+                crate::ui::theme::ThemeMode::Dark
+            } else {
+                crate::ui::theme::ThemeMode::Light
+            },
+            cx,
+        );
+        // 运行中跟随系统深浅色：事件订阅（Windows 经 WM_SETTINGCHANGE 驱动）。
+        // 仅在「跟随」模式生效；强制档下外观变化被忽略，切回跟随由
+        // `follow_system_theme` 立即按当前系统落地。
+        let weak = cx.weak_entity();
+        app._appearance_sub = Some(window.observe_window_appearance(
+            move |_window: &mut Window, cx: &mut App| {
+                if let Some(entity) = weak.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        let dark = matches!(
+                            cx.window_appearance(),
+                            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                        );
+                        if this.theme_pref == ThemePref::Follow && this.dark_mode != dark {
+                            this.dark_mode = dark;
+                            this.refresh_theme_ui(cx);
+                        }
+                    });
+                }
+            },
+        ));
         if let Some(first_tab) = first_tab {
             app.adopt_tab(first_tab, Some(window), cx);
         } else {
@@ -1678,8 +1726,17 @@ impl EditorApp {
     /// 调节编辑器字号并刷新预览（范围约束见 FONT_MIN/FONT_MAX）。
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         self.font_size = (self.font_size + delta).clamp(FONT_MIN, FONT_MAX);
+        // 字号用户自调后持久化（文件极小 + 原子写，每步一次可接受）。
+        self.persist_prefs();
         // 实时预览编辑（WYSIWYG）字号：EditorState 继承外层 text_size（宿主容器渲染时
         // 读取 self.font_size），无需像旧的 MarkdownLivePreview 那样内部 set_font_override。
+        cx.notify();
+    }
+
+    /// 重置正文字号到默认值并持久化。
+    fn reset_font_size(&mut self, cx: &mut Context<Self>) {
+        self.font_size = DEFAULT_FONT_SIZE;
+        self.persist_prefs();
         cx.notify();
     }
 
@@ -1961,11 +2018,32 @@ impl EditorApp {
         self.chrome().surface_bg.into()
     }
 
-    /// 切换黑白（深色/浅色）主题：驱动自研主题（`ui::theme`）与残留组件主题
-    /// （`Theme::set` 双轨同色）。编辑器语法配色随明暗切换为 GitHub Light / Dark
-    /// （见 [`crate::syntax`]）。
+    /// 切换黑白（深色/浅色）主题：作为 light↔dark 两态切换（退出「跟随」），
+    /// 偏好记为当前生效的强制档。驱动自研主题（`ui::theme`）双轨同色；
+    /// 编辑器语法配色随明暗切换为 GitHub Light / Dark（见 [`crate::syntax`]）。
     fn toggle_theme(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.dark_mode = !self.dark_mode;
+        // 手动切换 = 退出跟随：记为强制档并写盘。
+        self.theme_pref = if self.dark_mode {
+            ThemePref::Dark
+        } else {
+            ThemePref::Light
+        };
+        self.refresh_theme_ui(cx);
+        self.persist_prefs();
+    }
+
+    /// 进入「跟随系统」模式：主题改由系统深浅色决定，并立即按当前系统落地一次。
+    fn follow_system_theme(&mut self, cx: &mut Context<Self>) {
+        self.theme_pref = ThemePref::Follow;
+        self.dark_mode = ThemePref::Follow.resolved_dark(cx.window_appearance());
+        self.refresh_theme_ui(cx);
+        self.persist_prefs();
+    }
+
+    /// 把当前 `dark_mode` 落地到全局主题 + 刷新所有预览背景
+    /// （toggle / 跟随系统 / 启动恢复共用同一入口）。
+    fn refresh_theme_ui(&mut self, cx: &mut Context<Self>) {
         crate::ui::theme::Theme::set(
             if self.dark_mode {
                 crate::ui::theme::ThemeMode::Dark
@@ -1995,6 +2073,22 @@ impl EditorApp {
             }
         }
         cx.notify();
+    }
+
+    /// 把当前偏好（主题三态 / 字号 / 侧栏宽度）原子写盘。
+    /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
+    /// 否则下次启动仍保持随内容自适应。
+    fn persist_prefs(&self) {
+        UserPrefs {
+            theme: self.theme_pref,
+            font_size: Some(self.font_size),
+            sidebar_width: if self.sidebar.width_auto {
+                None
+            } else {
+                Some(self.sidebar.width)
+            },
+        }
+        .save();
     }
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
     /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，
@@ -2445,8 +2539,12 @@ impl EditorApp {
             )
             .on_action(
                 cx.listener(|this: &mut EditorApp, _: &ResetFontSize, _w, cx| {
-                    this.font_size = DEFAULT_FONT_SIZE;
-                    cx.notify();
+                    this.reset_font_size(cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &FollowSystemTheme, _w, cx| {
+                    this.follow_system_theme(cx);
                 }),
             )
             .on_action(

@@ -119,6 +119,7 @@ impl ColorScheme {
             fg: rgb(0x202020),
             fg_muted: rgb(0x5f5f5f),
             border: rgba(0x00000017),
+            // Fluent 亮色系统强调主色 = #005FB8（亮底深一档默认蓝，白底文字/图标对比达标）
             accent: rgb(0x005fb8),
             link: rgb(0x0b57d0),
             error: rgb(0xc42b1c),
@@ -140,7 +141,9 @@ impl ColorScheme {
             fg: rgb(0xe6e6e6),
             fg_muted: rgb(0x9d9d9d),
             border: rgba(0xffffff1a),
-            accent: rgb(0x005fb8),
+            // Fluent/Win11 暗色系统强调主色 = #60CDFF（暗底亮一档默认蓝，深底文字/图标对比达标；
+            // hover/active/selection 由消费方按本 accent 派生，自动跟随）
+            accent: rgb(0x60cdff),
             link: rgb(0x6fb1ff),
             error: rgb(0xf16a6a),
             code_block_bg: rgb(0x262626),
@@ -368,7 +371,10 @@ mod tests {
         assert_ne!(light.colors.bg, dark.colors.bg, "亮/暗主背景应不同");
         assert_ne!(light.colors.fg, dark.colors.fg, "亮/暗主文字应不同");
         assert_ne!(light.colors.fg, light.colors.fg_muted, "主次文字应不同");
-        assert_eq!(light.colors.accent, dark.colors.accent, "强调色全局统一");
+        // Fluent 双套强调色：亮底用深蓝、暗底用亮蓝（微软规范，保证两种底色下对比达标）。
+        assert_ne!(light.colors.accent, dark.colors.accent, "亮/暗强调色不再统一（Fluent 亮深蓝 vs 暗亮蓝）");
+        assert_eq!(light.colors.accent, rgb(0x005fb8), "亮主题强调色=#005FB8（Fluent 亮系默认蓝）");
+        assert_eq!(dark.colors.accent, rgb(0x60cdff), "暗主题强调色=#60CDFF（Win11 暗色亮蓝）");
         assert_ne!(light.colors.link, dark.colors.link, "链接色随明暗切换");
     }
 

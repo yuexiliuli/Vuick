@@ -22,6 +22,7 @@ actions!(
         IncreaseFontSize,
         DecreaseFontSize,
         ResetFontSize,
+        FollowSystemTheme,
         PasteNormalized,
         Quit,
     ]

@@ -165,10 +165,11 @@ impl EditorApp {
         }
     }
 
-    /// 结束拖拽。
+    /// 结束拖拽：宽度定稿后持久化（`width_auto` 已被关掉，存为手动宽度）。
     pub(super) fn end_sidebar_resize(&mut self, cx: &mut Context<Self>) {
         if self.sidebar.resize.is_some() {
             self.sidebar.resize = None;
+            self.persist_prefs();
             cx.notify();
         }
     }

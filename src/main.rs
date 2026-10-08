@@ -51,11 +51,23 @@ fn main() {
                 KeyBinding::new("ctrl-=", IncreaseFontSize, None),
                 KeyBinding::new("ctrl--", DecreaseFontSize, None),
                 KeyBinding::new("ctrl-0", ResetFontSize, None),
+                KeyBinding::new("ctrl-shift-t", FollowSystemTheme, None),
                 KeyBinding::new("ctrl-q", Quit, None),
             ]);
 
             // 种入自研主题（已无 gpui-component 双轨，只写 ui::theme）。
-            crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx);
+            // 启动跟随：按持久化偏好解析；从未手动选过（默认 follow）→ 由系统深浅色决定。
+            // EditorApp::new_impl 会用同一逻辑再落地一次（双保险 + 多窗口一致），
+            // 此处在首帧前先落定，避免窗口以错误主题闪现。
+            let prefs = crate::config::user::UserPrefs::load();
+            crate::ui::theme::Theme::set(
+                if prefs.theme.resolved_dark(cx.window_appearance()) {
+                    crate::ui::theme::ThemeMode::Dark
+                } else {
+                    crate::ui::theme::ThemeMode::Light
+                },
+                cx,
+            );
             // 本地快捷键全集：编辑区 Input + 窗口根 Root + WYSIWYG wy-editor。
             crate::actions::bind_local_keymaps(cx);
             // 后台预热 syntect 全局语法集与明暗色板（A2）：把「首次代码块同步
