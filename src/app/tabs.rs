@@ -12,7 +12,6 @@ struct TabBarColors {
     tab_active_border: gpui::Hsla,
     chip_bg: gpui::Hsla,
     chip_text: gpui::Hsla,
-    bar_bg: gpui::Hsla,
     hover_fill: gpui::Hsla,
 }
 
@@ -260,7 +259,6 @@ impl EditorApp {
             tab_active_border: self.tab_active_border(),
             chip_bg: self.chip_bg(),
             chip_text: self.chip_text(),
-            bar_bg: self.bar_bg(),
             hover_fill: c.hover_fill.into(),
         }
     }
@@ -539,7 +537,7 @@ impl EditorApp {
             .flex()
             .items_center()
             .gap_1()
-            .bg(colors.bar_bg)
+            .bg(self.mica_bar_bg())
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
             // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变整体高度。
             .child(

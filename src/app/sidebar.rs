@@ -117,7 +117,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (side_bg, border) = (self.bar_bg(), self.bar_border());
+        let (side_bg, border) = (self.mica_bar_bg(), self.bar_border());
         // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
         let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
             Some(match self.sidebar.view {

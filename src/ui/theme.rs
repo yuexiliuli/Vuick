@@ -170,6 +170,10 @@ impl ColorScheme {
 pub struct ChromeColors {
     /// 编辑区以外的画布背景（＝窗口底色）
     pub window_bg: Rgba,
+    /// 自绘材质（假 Mica/acrylic）：窗口基底垂向渐变的顶端色（应用内绘制，不依赖系统）
+    pub material_top: Rgba,
+    /// 自绘材质：垂向渐变底端色
+    pub material_bottom: Rgba,
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景
     pub bar_bg: Rgba,
     /// 工具条分隔边框
@@ -208,11 +212,21 @@ pub struct ChromeColors {
     pub menu_highlight: Rgba,
 }
 
+/// 自绘玻璃材质 chrome 透明度：标题栏/选项卡栏/侧栏/状态栏/窗口底用
+/// （半透明才能显出应用内自绘材质层，同时保留文字对比。不依赖系统 Mica/acrylic）。
+pub const MICA_CHROME_ALPHA_LIGHT: f32 = 0.86;
+pub const MICA_CHROME_ALPHA_DARK: f32 = 0.82;
+/// 浮动层（菜单/通知等）自绘玻璃材质透明度（不依赖系统 acrylic）。
+pub const FLOAT_ACRYLIC_ALPHA_LIGHT: f32 = 0.92;
+pub const FLOAT_ACRYLIC_ALPHA_DARK: f32 = 0.94;
+
 impl ChromeColors {
     pub fn light() -> Self {
         let c = ColorScheme::light();
         Self {
             window_bg: rgb(0xf5f5f5),
+            material_top: rgb(0xf8fafc),
+            material_bottom: rgb(0xedeff4),
             bar_bg: rgb(0xf5f5f5),
             bar_border: c.border,
             panel_bg: c.bg,
@@ -238,6 +252,8 @@ impl ChromeColors {
         let c = ColorScheme::dark();
         Self {
             window_bg: rgb(0x202020),
+            material_top: rgb(0x24262b),
+            material_bottom: rgb(0x1b1d21),
             bar_bg: rgb(0x202020),
             bar_border: c.border,
             panel_bg: c.bg,

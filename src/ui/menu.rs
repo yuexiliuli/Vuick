@@ -293,6 +293,7 @@ impl Render for PopupMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::global(cx);
         let (colors, is_dark) = (theme.colors, theme.is_dark());
+        let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
         let fg_muted: Hsla = colors.fg_muted.into();
         // Win11 中性菜单高亮：灰填充（非强调蓝 tint）。
@@ -354,12 +355,21 @@ impl Render for PopupMenu {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down_out(cx.listener(Self::on_mouse_down_out))
-            .bg(colors.surface)
+            .bg(surface.opacity(if is_dark {
+                crate::ui::theme::FLOAT_ACRYLIC_ALPHA_DARK
+            } else {
+                crate::ui::theme::FLOAT_ACRYLIC_ALPHA_LIGHT
+            }))
             .border_1()
             .border_color(colors.border)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
+                    .blur_radius(px(14.)),
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+                    .blur_radius(px(4.)),
+            ])
             .rounded_lg()
             .text_color(fg)
-            .occlude()
             .child(
                 div()
                     .id("items")

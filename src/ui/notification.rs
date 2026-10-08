@@ -105,6 +105,7 @@ impl Notification {
     /// 在返回的 `Stateful` 上 `.on_click(...)` 即可。
     pub fn render_card(&self, _window: &mut Window, cx: &mut App) -> Stateful<gpui::Div> {
         let colors = Theme::global(cx).colors;
+        let is_dark = Theme::global(cx).is_dark();
         let accent = self.kind.accent(&colors);
         let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
@@ -122,7 +123,17 @@ impl Notification {
             .rounded_lg()
             .border_1()
             .border_color(border)
-            .bg(surface)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(8.), gpui::hsla(0., 0., 0., 0.20))
+                    .blur_radius(px(14.)),
+                gpui::BoxShadow::new(px(0.), px(2.), gpui::hsla(0., 0., 0., 0.14))
+                    .blur_radius(px(4.)),
+            ])
+            .bg(surface.opacity(if is_dark {
+                crate::ui::theme::FLOAT_ACRYLIC_ALPHA_DARK
+            } else {
+                crate::ui::theme::FLOAT_ACRYLIC_ALPHA_LIGHT
+            }))
             .child(
                 div()
                     .flex()

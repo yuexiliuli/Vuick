@@ -11,11 +11,10 @@ impl EditorApp {
         let (line_count, char_count) = tab.map(|t| (t.line_count, t.char_count)).unwrap_or((0, 0));
         let dirty = tab.map(|t| t.dirty).unwrap_or(false);
         let language = self.language_label().to_string();
-        let (text_primary, text_minor, chip_text, surface_bg, bar_border) = (
+        let (text_primary, text_minor, chip_text, bar_border) = (
             self.text_primary(),
             self.text_minor(),
             self.chip_text(),
-            self.surface_bg(),
             self.bar_border(),
         );
 
@@ -92,7 +91,7 @@ impl EditorApp {
 
         div()
             .h(px(28.))
-            .bg(surface_bg)
+            .bg(self.mica_surface_bg())
             .border_t_1()
             .border_color(bar_border)
             .flex()

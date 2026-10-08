@@ -70,7 +70,8 @@ impl Render for Root {
             .on_action(cx.listener(Self::on_action_tab_prev))
             .relative()
             .size_full()
-            .bg(theme.colors.bg)
+            // 根层不铺不透明底色，最终底色由 EditorApp 的 Mica 半透明窗口底提供。
+            .bg(gpui::transparent_black())
             .text_color(theme.colors.fg)
             .child(self.view.clone())
     }

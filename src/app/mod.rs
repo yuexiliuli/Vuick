@@ -1227,8 +1227,7 @@ impl EditorApp {
             out.push(self.render_body_sidebar(body, window, cx).into_any_element());
             out.push(self.render_status_bar(cx).into_any_element());
         }
-        // 通知层（右上角 toast）与媒体右键菜单 Overlay 恒在最上层
-        out.push(self.render_notifications(window, cx).into_any_element());
+        // 媒体右键菜单 Overlay 恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());
         out
     }
@@ -1867,6 +1866,51 @@ impl EditorApp {
         self.chrome().window_bg.into()
     }
 
+    /// Win11 Mica chrome 透明度（亮 0.86 / 暗 0.82）：半透明才能透出系统 Mica 材质。
+    fn mica_alpha(&self) -> f32 {
+        if self.dark_mode {
+            crate::ui::theme::MICA_CHROME_ALPHA_DARK
+        } else {
+            crate::ui::theme::MICA_CHROME_ALPHA_LIGHT
+        }
+    }
+    /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版）。
+    fn mica_bar_bg(&self) -> gpui::Hsla {
+        self.bar_bg().opacity(self.mica_alpha())
+    }
+    /// 状态栏背景（Mica 半透明版）。
+    fn mica_surface_bg(&self) -> gpui::Hsla {
+        self.surface_bg().opacity(self.mica_alpha())
+    }
+
+    /// 自绘 Mica 材质层：窗口基底用 N 段半透明色带叠出柔和垂向渐变（纯应用内绘制，
+    /// 不调用系统 Mica/acrylic/DWM）。放在最底层，chrome 半透明表面叠其上形成玻璃感。
+    fn render_material_layer(&self, window: &Window) -> impl IntoElement {
+        let chrome = self.chrome();
+        let top: gpui::Hsla = chrome.material_top.into();
+        let bottom: gpui::Hsla = chrome.material_bottom.into();
+        let h = window.bounds().size.height.as_f32();
+        const N: usize = 8;
+        let band_h = h / N as f32;
+        let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
+        for i in 0..N {
+            let t = i as f32 / (N - 1) as f32;
+            // 材质色是近中性灰（h/s≈0），直接对 lightness 插值即可
+            let lum = top.l + (bottom.l - top.l) * t;
+            let band = gpui::hsla(0.0, 0.0, lum, 1.0);
+            layer = layer.child(
+                div()
+                    .absolute()
+                    .top(px(i as f32 * band_h))
+                    .left_0()
+                    .right_0()
+                    .h(px(band_h))
+                    .bg(band),
+            );
+        }
+        layer
+    }
+
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
     fn bar_bg(&self) -> gpui::Hsla {
         self.chrome().bar_bg.into()
@@ -1965,7 +2009,6 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let bar_bg = self.bar_bg();
         let text_minor = self.text_minor();
         let text_primary = self.text_primary();
         let c = self.chrome();
@@ -2118,7 +2161,7 @@ impl EditorApp {
             .items_center()
             .gap_1()
             .px_2()
-            .bg(bar_bg)
+            .bg(self.mica_bar_bg())
             .child(self.render_menu_buttons(cx))
             .child(
                 div()
@@ -2136,36 +2179,47 @@ impl EditorApp {
     }
 
     /// 右上角 toast 层：卡片可见即渲染，点击卡片按「类型 + key」精确关闭。
+    ///
+    /// 合成层纪律：浮层一律走 `deferred(...)` 独立绘制层（与菜单
+    /// `deferred(anchored())` 同款机制，见 src/ui/menu.rs），不要用裸 absolute。
+    /// 每张卡片按 left = 窗口宽 - 卡片宽 - 右缘、right = 右缘、top = 4 + i*92、h 固定
+    /// 显式定位（headless 与真机布局一致）；保留 .id + on_click 交互。
+    ///
+    /// 【已知平台层限制（2026-10-08 实测）】本仓 gpui_windows 的 D3D 合成路径无法绘制
+    /// 「左边原点超出窗口约前 1/4」的填充 rect（absolute 与 in-flow、deferred 与否均如此），
+    /// 故右上角 toast 目前在真机仍不显示、此前也从未显示过；需随平台层补丁一并修复
+    /// （见查证：left=8 可绘、left=150/244/312 均不可绘；文字 glyph 为 sprite 不受影响）。
     fn render_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.notifications.is_empty() {
             return div().into_any_element();
         }
-        let cards = self
-            .notifications
-            .iter()
-            .map(|n| {
-                let id_type = n.id_type();
-                let key = n.key().clone();
+        let width = window.bounds().size.width.as_f32();
+        const CARD_W: f32 = 320.;
+        const RIGHT: f32 = 4.;
+        const TOP: f32 = 4.;
+        const STEP: f32 = 92.;
+        const CARD_H: f32 = 84.;
+        let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
+        for (i, n) in self.notifications.iter().enumerate() {
+            let id_type = n.id_type();
+            let key = n.key().clone();
+            let left = width - CARD_W - RIGHT;
+            layer = layer.child(
                 n.render_card(window, cx)
                     .on_click(cx.listener(move |this, _, _window, cx| {
                         this.notifications
                             .retain(|it| it.id_type() == id_type && it.key() == &key);
                         cx.notify();
                     }))
-            })
-            .collect::<Vec<_>>();
-        div()
-            .id("notification-layer")
-            .absolute()
-            .top_0()
-            .right_0()
-            .mt_1()
-            .mr_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(cards)
-            .into_any_element()
+                    .absolute()
+                    .top(px(TOP + i as f32 * STEP))
+                    .left(px(left))
+                    .right(px(RIGHT))
+                    .h(px(CARD_H)),
+            );
+        }
+        // 不用 .with_priority(100)（菜单已用 100）：toast 恒在最上
+        gpui::deferred(layer).with_priority(200).into_any_element()
     }
 }
 
@@ -2297,10 +2351,7 @@ impl EditorApp {
     ) -> impl IntoElement {
         div()
             .relative()
-            .flex()
-            .flex_col()
             .size_full()
-            .bg(self.window_bg())
             .track_focus(&self.focus_handle(cx))
             // 从资源管理器拖入文件到窗口任意处 → 打开每个文件（目录跳过）
             .can_drop(|drag: &dyn Any, _w, _c| drag.downcast_ref::<ExternalPaths>().is_some())
@@ -2403,6 +2454,17 @@ impl EditorApp {
                     this.toggle_wrap(window, cx);
                 }),
             )
-            .children(self.render_shell_children(body, window, cx))
+            .child(self.render_material_layer(window))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .children(self.render_shell_children(body, window, cx)),
+            )
+            // 通知层提升为外层根的最后子元素（与材质层同级、画在最上）：作为 shell
+            // flex 内部容器的 absolute 子元素在真机合成路径一直不被绘制（历史遗留 bug）——
+            // 作为外层 relative 的直子（如材质层）才正常渲染。
+            .child(self.render_notifications(window, cx))
     }
 }
