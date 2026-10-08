@@ -2359,7 +2359,7 @@ fn code_block_has_blank_bands_above_and_below(cx: &mut TestAppContext) {
     assert_eq!(blank_top.origin.y.as_f32(), 0.0, "顶空白带应位于代码块渲染行顶端，实际={:?}", blank_top.origin.y);
 }
 
-/// 回归：代码块背景按主题定制——白 #F3F4F4、黑 #282936（用户指定色板）。
+/// 回归：代码块背景按主题定制——亮 #F5F5F5、暗 #262626（第 5 步谐波化的中性灰阶）。
 /// 明暗切换走 `ui::theme::Theme::set`（第 3 波后 `StyleParams` 从 `ui::theme` 取色）。
 #[gpui::test]
 fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
@@ -2369,22 +2369,22 @@ fn code_block_bg_matches_theme_palette(cx: &mut TestAppContext) {
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
     assert_eq!(
         light,
-        gpui::rgb(0xf3f4f4).into(),
-        "白主题代码块背景应为 #F3F4F4"
+        gpui::rgb(0xf5f5f5).into(),
+        "亮主题代码块背景应为 #F5F5F5"
     );
     // 深色主题
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx));
     let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None).code_bg);
     assert_eq!(
         dark,
-        gpui::rgb(0x282936).into(),
-        "黑主题代码块背景应为 #282936"
+        gpui::rgb(0x262626).into(),
+        "暗主题代码块背景应为 #262626"
     );
     // 恢复浅色（主题为全局共享，避免影响后续测试）
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
 }
 
-/// 行内代码（反引号）pill 配色单一源：白 #F3F4F4/#222222、黑 #3E3F40/#DADADA——
+/// 行内代码（反引号）pill 配色单一源：亮 #F0F0F0/#202020、暗 #3A3A3A/#E8E8E8——
 /// 预览与 WYSIWYG 都取 [`StyleParams::code_inline_bg`/`code_inline_fg`]（WYSIWYG 侧
 /// 在 `theme_mirrors_style_params_single_source` 验证抄自同源）。
 #[gpui::test]
@@ -2392,12 +2392,12 @@ fn inline_code_palette_single_source(cx: &mut TestAppContext) {
     cx.update(crate::actions::bind_local_keymaps);
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
     let light = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
-    assert_eq!(light.code_inline_fg, gpui::rgb(0x222222).into(), "白主题行内代码文字");
-    assert_eq!(light.code_inline_bg, gpui::rgb(0xf3f4f4).into(), "白主题行内代码底");
+    assert_eq!(light.code_inline_fg, gpui::rgb(0x202020).into(), "亮主题行内代码文字");
+    assert_eq!(light.code_inline_bg, gpui::rgb(0xf0f0f0).into(), "亮主题行内代码底");
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx));
     let dark = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
-    assert_eq!(dark.code_inline_fg, gpui::rgb(0xdadada).into(), "黑主题行内代码文字");
-    assert_eq!(dark.code_inline_bg, gpui::rgb(0x3e3f40).into(), "黑主题行内代码底");
+    assert_eq!(dark.code_inline_fg, gpui::rgb(0xe8e8e8).into(), "暗主题行内代码文字");
+    assert_eq!(dark.code_inline_bg, gpui::rgb(0x3a3a3a).into(), "暗主题行内代码底");
     cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
 }
 

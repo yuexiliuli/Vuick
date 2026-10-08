@@ -57,7 +57,7 @@ use gpui::{
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div,
-    img, px, prelude::FluentBuilder as _, rgb,
+    img, px, prelude::FluentBuilder as _,
 };
 use image::{Frame, RgbaImage};
 
@@ -1392,13 +1392,10 @@ impl VideoViewer {
             .into_any_element()
     }
 
-    /// 阅读画布底色（同 ImageViewer：非白色、与画布分隔的灰系）。
+    /// 阅读画布底色（同 ImageViewer：亮 #F5F5F5 / 暗 #202020，中性灰阶、与外壳 `window_bg` 同源）。
     fn default_canvas(cx: &App) -> Hsla {
-        if crate::ui::theme::Theme::global(cx).is_dark() {
-            rgb(0x111827).into()
-        } else {
-            rgb(0xe5e7eb).into()
-        }
+        let dark = crate::ui::theme::Theme::global(cx).is_dark();
+        crate::ui::theme::ChromeColors::for_mode(dark).window_bg.into()
     }
 
     // --- M5 控制条 ---

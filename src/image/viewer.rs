@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, img, px, rgb, App, Context, CursorStyle, Hsla, InteractiveElement, IntoElement,
+    div, img, px, App, Context, CursorStyle, Hsla, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Render,
     RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
     Styled, StyledImage, Window,
@@ -394,13 +394,10 @@ impl ImageViewer {
         self.display_need = ((dw * self.zoom).max(1.0), (dh * self.zoom).max(1.0));
     }
 
-    /// 画布默认底色：浅色浅灰 / 深色深灰（与 PDF 阅读器一致）。
+    /// 画布默认底色：亮 #F5F5F5 / 暗 #202020 中性灰阶（与外壳 `window_bg` 同源；与 PDF 阅读器一致）。
     fn default_canvas(cx: &App) -> Hsla {
-        if crate::ui::theme::Theme::global(cx).is_dark() {
-            rgb(0x111827).into()
-        } else {
-            rgb(0xe5e7eb).into()
-        }
+        let dark = crate::ui::theme::Theme::global(cx).is_dark();
+        crate::ui::theme::ChromeColors::for_mode(dark).window_bg.into()
     }
 
     /// 滚轮处理：Ctrl+滚轮 → 缩放；单滚轮 → 同文件夹切换。挂在内层 wrap

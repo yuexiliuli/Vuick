@@ -111,7 +111,7 @@ pub fn horizontal_scrollbar(
                 .w(thumb_w)
                 .h(px(2.))
                 .rounded(px(1.))
-                .bg(rgba(0x64748b4a)),
+                .bg(rgba(0x6060604a)),
         );
     }
 

@@ -695,7 +695,7 @@ fn selection_run_must_not_oversubscribe_row() {
     old.push((
         sel.clone(),
         gpui::HighlightStyle {
-            background_color: Some(gpui::rgb(0x0078d4).into()),
+            background_color: Some(gpui::rgb(0x005fb8).into()),
             ..Default::default()
         },
     ));
@@ -736,7 +736,7 @@ fn merge_highlights_keeps_selection_within_line_and_non_overlapping() {
         .map(|(r, c)| (r.clone(), HighlightStyle { color: Some(*c), ..Default::default() }))
         .collect();
 
-    let sel_bg = gpui::rgb(0x0078d4).opacity(0.28).into();
+    let sel_bg = gpui::rgb(0x005fb8).opacity(0.28).into();
     // 选区从中部到行尾（横跨多个语法段，正是旧的“重叠尾巴”场景）
     let sel = 6..text.len();
     let merged = crate::editor::view::merge_highlights(&runs, Some(sel.clone()), sel_bg);

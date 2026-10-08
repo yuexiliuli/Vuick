@@ -237,7 +237,7 @@ pub struct CodeEditor {
     /// 点击代码区域点亮的最内层括号块（`open_line`；`None` = 未点亮/已清除）。
     /// 编辑（`apply_edit_synced`）与整篇替换（`reset_document`）会复位为 `None`。
     active_guide_open: Option<usize>,
-    /// 点亮竖线颜色：硬编码强调蓝 `rgb(0x0078d4).opacity(0.9)`（`refresh_metrics` 设置；
+    /// 点亮竖线颜色：主题强调蓝 `colors.accent.opacity(0.9)`（`refresh_metrics` 设置；
     /// **勿抽进 config**——用户已明确回滚过颜色抽取）。
     active_guide_color: Hsla,
 }
@@ -681,13 +681,13 @@ impl CodeEditor {
         self.ruler_color = colors.fg_muted.opacity(0.55).into();
         // 括号标尺竖线：更淡，纯视觉参考不干扰阅读。
         self.guide_color = colors.fg_muted.opacity(0.4).into();
-        // 点亮竖线（guide click highlight）：硬编码强调蓝（用户口径，勿抽 config）。
-        self.active_guide_color = rgb(0x0078d4).opacity(0.9).into();
-        // 光标不能用 colors.accent：Light 主题 accent = #0078d4 蓝，白底上对比足够，
+        // 点亮竖线（guide click highlight）：主题强调蓝 `colors.accent`（用户口径，勿抽 config）。
+        self.active_guide_color = colors.accent.opacity(0.9).into();
+        // 光标不能用 colors.accent：Light 主题 accent = #005fb8 蓝，白底上对比足够，
         // 但沿用既有口径用前景墨色，明/暗主题下都一定可见。
         self.caret_color = colors.fg.into();
-        // 选区底色避开浅灰 accent，用固定蓝（与标题/菜单高亮同源）。
-        self.sel_bg = rgb(0x0078d4).opacity(if dark { 0.4 } else { 0.28 }).into();
+        // 选区底色用主题强调蓝（与括号点亮、标题/菜单高亮同源单点出口，改调色板只动 theme）。
+        self.sel_bg = colors.accent.opacity(if dark { 0.4 } else { 0.28 }).into();
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();

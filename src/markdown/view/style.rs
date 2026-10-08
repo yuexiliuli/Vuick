@@ -77,8 +77,8 @@ impl StyleParams {
         let (pl, cs, cl) = typography_for_size(fs);
         let (para, line, code, code_line) = (px(fs), pl, cs, cl);
         let is_dark = theme.is_dark();
-        // 代码块/行内代码/引述/表头/链接等语义色：全部取自色板（第 3 波把
-        // 原硬编码 rgb() 收编进色板，值逐字节不变）。
+        // 代码块/行内代码/引述/表头/链接等语义色：全部取自色板（第 5 步谐波化后换到
+        // 中性灰阶 + 蓝色系——值有意的演化，见 ui/theme.rs 钉死测试）。
         Self {
             mono: theme.typography.mono.clone(),
             fg: colors.fg.into(),

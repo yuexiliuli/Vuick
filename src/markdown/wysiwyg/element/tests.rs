@@ -3125,8 +3125,8 @@ A-->B
 
     #[test]
     fn link_runs_render_in_blue_with_underline() {
-        // C5 修复：WYSIWYG 链接不该用 `colors.accent`（浅色主题 = neutral-100 灰），
-        // 而是单一源 `StyleParams.link`（明 #0969da / 暗 #79c0ff，与源码编辑器同蓝）。
+        // C5 修复：WYSIWYG 链接不该用 `colors.accent`（浅色主题 = 中性灰），
+        // 而是单一源 `StyleParams.link`（亮 #0b57d0 / 暗 #6fb1ff，与源码编辑器同蓝）。
         use super::runs_to_text_runs;
         use gpui::FontWeight;
         let base = gpui::font("Arial");
@@ -3135,7 +3135,7 @@ A-->B
         // 渲染字节 [2..4) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。
         let runs = vec![((2..8), crate::markdown::parse::RunKind::Link)];
         let accent = gpui::Hsla::default();
-        let link: gpui::Hsla = gpui::rgb(0x0969da).into();
+        let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
         let code_inline_fg = gpui::Hsla::default();
         let out = runs_to_text_runs(
             text,
@@ -3184,7 +3184,7 @@ A-->B
             let theme = ed.read(cx).theme.clone();
             let p = StyleParams::from_theme_with_font(cx, Some(f32::from(theme.font_size)));
             assert_eq!(theme.link, p.link, "WyTheme.link 抄自 StyleParams.link");
-            // 浅色主题（main.rs 强制 Light）：应编辑器 LINK 蓝 #0969da 逐字节一致。
+            // 浅色主题（main.rs 强制 Light）：应编辑器 LINK 蓝 #0b57d0 逐字节一致。
             let cs = if p.is_dark {
                 crate::ui::theme::ColorScheme::dark()
             } else {

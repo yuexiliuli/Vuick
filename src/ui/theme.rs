@@ -93,21 +93,21 @@ pub struct ColorScheme {
     pub link: Rgba,
     /// 错误/危险色（打开失败通知等）
     pub error: Rgba,
-    /// 代码块背景（预览 / WYSIWYG 围栏底，明 #f3f4f4 / 暗 #282936）
+    /// 代码块背景（预览 / WYSIWYG 围栏底，明 #f5f5f5 / 暗 #262626）
     pub code_block_bg: Rgba,
-    /// 行内代码（反引号）文字色（明 #222222 / 暗 #dadada，近正文，靠底色+等宽区分）
+    /// 行内代码（反引号）文字色（明 #202020 / 暗 #e8e8e8，近正文，靠底色+等宽区分）
     pub code_inline_fg: Rgba,
-    /// 行内代码圆角 pill 底色（预览 / WYSIWYG，明 #f3f4f4 / 暗 #3e3f40）
+    /// 行内代码圆角 pill 底色（预览 / WYSIWYG，明 #f0f0f0 / 暗 #3a3a3a）
     pub code_inline_bg: Rgba,
-    /// 编辑器 Markdown 滤镜行内代码底色（明 #eff1f3 / 暗 #2b3340，与预览略异，保留原值）
+    /// 编辑器 Markdown 滤镜行内代码底色（明 #f2f2f2 / 暗 #2e2e2e，与预览略异）
     pub editor_code_bg: Rgba,
-    /// 公司块背景（明 #f9fafb / 暗 #1b2431）
+    /// 公司块背景（明 #f7f7f7 / 暗 #262626）
     pub quote_bg: Rgba,
-    /// 表头底色（明 #f3f4f6 / 暗 #1f2937）
+    /// 表头底色（明 #f2f2f2 / 暗 #323232）
     pub table_head_bg: Rgba,
-    /// Markdown 标题文字色（编辑器滤镜用，明 #0550ae / 暗 #79c0ff）
+    /// Markdown 标题文字色（编辑器滤镜用，明 #0b57d0 / 暗 #6fb1ff）
     pub heading: Rgba,
-    /// 悬浮小卡片/弹层背景（EPUB 脚注卡片等，明 #ffffff / 暗 #1e2430）
+    /// 悬浮小卡片/弹层背景（EPUB 脚注卡片等，明 #ffffff / 暗 #333333）
     pub popover_bg: Rgba,
 }
 
@@ -116,41 +116,41 @@ impl ColorScheme {
         Self {
             bg: rgb(0xffffff),
             surface: rgb(0xffffff),
-            fg: rgb(0x1f2328),
-            fg_muted: rgb(0x6b7280),
-            border: rgb(0xd1d5db),
-            accent: rgb(0x0078d4),
-            link: rgb(0x0969da),
-            error: rgb(0xd1242f),
-            code_block_bg: rgb(0xf3f4f4),
-            code_inline_fg: rgb(0x222222),
-            code_inline_bg: rgb(0xf3f4f4),
-            editor_code_bg: rgb(0xeff1f3),
-            quote_bg: rgb(0xf9fafb),
-            table_head_bg: rgb(0xf3f4f6),
-            heading: rgb(0x0550ae),
+            fg: rgb(0x202020),
+            fg_muted: rgb(0x5f5f5f),
+            border: rgba(0x00000017),
+            accent: rgb(0x005fb8),
+            link: rgb(0x0b57d0),
+            error: rgb(0xc42b1c),
+            code_block_bg: rgb(0xf5f5f5),
+            code_inline_fg: rgb(0x202020),
+            code_inline_bg: rgb(0xf0f0f0),
+            editor_code_bg: rgb(0xf2f2f2),
+            quote_bg: rgb(0xf7f7f7),
+            table_head_bg: rgb(0xf2f2f2),
+            heading: rgb(0x0b57d0),
             popover_bg: rgb(0xffffff),
         }
     }
 
     pub fn dark() -> Self {
         Self {
-            bg: rgb(0x0f172a),
-            surface: rgb(0x111b2a),
-            fg: rgb(0xe5e7eb),
-            fg_muted: rgb(0x94a3b8),
-            border: rgb(0x1f2937),
-            accent: rgb(0x0078d4),
-            link: rgb(0x79c0ff),
-            error: rgb(0xff7b72),
-            code_block_bg: rgb(0x282936),
-            code_inline_fg: rgb(0xdadada),
-            code_inline_bg: rgb(0x3e3f40),
-            editor_code_bg: rgb(0x2b3340),
-            quote_bg: rgb(0x1b2431),
-            table_head_bg: rgb(0x1f2937),
-            heading: rgb(0x79c0ff),
-            popover_bg: rgb(0x1e2430),
+            bg: rgb(0x2b2b2b),
+            surface: rgb(0x333333),
+            fg: rgb(0xe6e6e6),
+            fg_muted: rgb(0x9d9d9d),
+            border: rgba(0xffffff1a),
+            accent: rgb(0x005fb8),
+            link: rgb(0x6fb1ff),
+            error: rgb(0xf16a6a),
+            code_block_bg: rgb(0x262626),
+            code_inline_fg: rgb(0xe8e8e8),
+            code_inline_bg: rgb(0x3a3a3a),
+            editor_code_bg: rgb(0x2e2e2e),
+            quote_bg: rgb(0x262626),
+            table_head_bg: rgb(0x323232),
+            heading: rgb(0x6fb1ff),
+            popover_bg: rgb(0x333333),
         }
     }
 }
@@ -158,9 +158,14 @@ impl ColorScheme {
 /// 外壳（App 框架）配色：标题栏/菜单栏/选项卡栏/侧边栏/状态栏等**窗口外壳**的语义色，
 /// 与 [`ColorScheme`]（内容渲染色板）平行——前者管「框」，后者管「内容」。
 ///
-/// **Win11 Fluent 中性外壳色板**：以中性灰（亮 #F3F3F3 / 暗 #202020）打底，配合
+/// **Win11 Fluent 中性外壳色板**：以中性灰（亮 #F5F5F5 / 暗 #202020）打底，配合
 /// VS Code 工作台层次（灰带 + 白色卡片选项卡 + 8px 圆角浮动层）。hover / 按压 / 关闭
 /// 三档交互色单独成字段，统一由组件像素级消费，禁止在组件里新写硬编码 `rgba()`。
+///
+/// **与 [`ColorScheme`] 同源**：同名字段（`panel_bg`/`bar_border`/`text_primary`/
+/// `text_minor`/`chip_text`/`tab_active_bg`/`tab_active_border`/`pill_fg`/`dirty`）
+/// 直接引用 `ColorScheme` 对应字段，物理同值、不会漂移（见
+/// `chrome_and_color_scheme_share_ramp` 测试）。其余字段是外壳专属层，自定中性灰阶。
 #[derive(Clone, Copy, Debug)]
 pub struct ChromeColors {
     /// 编辑区以外的画布背景（＝窗口底色）
@@ -205,46 +210,48 @@ pub struct ChromeColors {
 
 impl ChromeColors {
     pub fn light() -> Self {
+        let c = ColorScheme::light();
         Self {
-            window_bg: rgb(0xf3f3f3),
-            bar_bg: rgb(0xf3f3f3),
-            bar_border: rgba(0x0000001c),
-            panel_bg: rgb(0xffffff),
-            surface_bg: rgb(0xffffff),
-            text_primary: rgb(0x1f1f1f),
-            text_minor: rgb(0x5f5f5f),
-            text_tertiary: rgb(0x9ca3af),
-            chip_bg: rgb(0xe5e5e5),
-            chip_text: rgb(0x1f1f1f),
-            tab_active_bg: rgb(0xffffff),
-            tab_active_border: rgba(0x0000001c),
-            pill_bg: rgb(0xe5e5e5),
-            pill_fg: rgb(0x1f1f1f),
-            dirty: rgb(0xdc2626),
+            window_bg: rgb(0xf5f5f5),
+            bar_bg: rgb(0xf5f5f5),
+            bar_border: c.border,
+            panel_bg: c.bg,
+            surface_bg: rgb(0xf5f5f5),
+            text_primary: c.fg,
+            text_minor: c.fg_muted,
+            text_tertiary: rgb(0x8a8a8a),
+            chip_bg: rgb(0xe8e8e8),
+            chip_text: c.fg,
+            tab_active_bg: c.bg,
+            tab_active_border: c.border,
+            pill_bg: rgb(0xe8e8e8),
+            pill_fg: c.fg,
+            dirty: c.error,
             hover_fill: rgba(0x0000000d),
-            pressed_fill: rgba(0x0000001a),
+            pressed_fill: rgba(0x00000017),
             close_hover: rgb(0xe81123),
             menu_highlight: rgba(0x00000014),
         }
     }
 
     pub fn dark() -> Self {
+        let c = ColorScheme::dark();
         Self {
             window_bg: rgb(0x202020),
             bar_bg: rgb(0x202020),
-            bar_border: rgba(0xffffff1f),
-            panel_bg: rgb(0x2b2b2b),
+            bar_border: c.border,
+            panel_bg: c.bg,
             surface_bg: rgb(0x202020),
-            text_primary: rgb(0xe5e5e5),
-            text_minor: rgb(0x9d9d9d),
-            text_tertiary: rgb(0x9ca3af),
-            chip_bg: rgb(0x3d3d3d),
-            chip_text: rgb(0xe5e5e5),
-            tab_active_bg: rgb(0x2b2b2b),
-            tab_active_border: rgba(0xffffff1f),
-            pill_bg: rgb(0x3d3d3d),
-            pill_fg: rgb(0xe5e5e5),
-            dirty: rgb(0xdc2626),
+            text_primary: c.fg,
+            text_minor: c.fg_muted,
+            text_tertiary: rgb(0x6e6e6e),
+            chip_bg: rgb(0x3a3a3a),
+            chip_text: c.fg,
+            tab_active_bg: c.bg,
+            tab_active_border: c.border,
+            pill_bg: rgb(0x3a3a3a),
+            pill_fg: c.fg,
+            dirty: c.error,
             hover_fill: rgba(0xffffff14),
             pressed_fill: rgba(0xffffff24),
             close_hover: rgb(0xe81123),
@@ -350,28 +357,33 @@ mod tests {
     }
 
     #[gpui::test]
-    fn markdown_semantic_palette_pins_original_values(_cx: &mut TestAppContext) {
-        // 回归：第 3 波把 markdown/view/style.rs 硬编码色收编进色板后，**逐字节保持原值**
-        //（预览/编辑器/WYSIWYG 依赖这些精确值，见各模块的从 theme 派生 / 单测）。
+    fn markdown_semantic_palette_pins_ms_v2_values(_cx: &mut TestAppContext) {
+        // 回归：第 5 步「亮暗双主题配色谐波化」把 Markdown 语义色板换到统一中性灰阶
+        // + 蓝色系（剔掉旧 GitHub/slate 蓝灰），逐字节钉死新值。
+        // 预览/编辑器/WYSIWYG 依赖这些精确值（见各模块从 theme 派生 / 单测）。
         let light = Theme::light();
         let dark = Theme::dark();
-        // 代码块背景（白 #F3F4F4 / 黑 #282936）
-        assert_eq!(light.colors.code_block_bg, rgb(0xf3f4f4), "白主题代码块底");
-        assert_eq!(dark.colors.code_block_bg, rgb(0x282936), "黑主题代码块底");
-        // 行内代码 pill（白 底 #F3F4F4 + 字 #222222 / 黑 底 #3E3F40 + 字 #DADADA）
-        assert_eq!(light.colors.code_inline_bg, rgb(0xf3f4f4));
-        assert_eq!(light.colors.code_inline_fg, rgb(0x222222));
-        assert_eq!(dark.colors.code_inline_bg, rgb(0x3e3f40));
-        assert_eq!(dark.colors.code_inline_fg, rgb(0xdadada));
-        // 编辑器滤镜行内代码底（白 #EFF1F3 / 黑 #2B3340，与预览略异，保留原值）
-        assert_eq!(light.colors.editor_code_bg, rgb(0xeff1f3));
-        assert_eq!(dark.colors.editor_code_bg, rgb(0x2b3340));
-        // 引述底 / 表头底随明暗切换
+        // 代码块背景（亮 #F5F5F5 / 暗 #262626）
+        assert_eq!(light.colors.code_block_bg, rgb(0xf5f5f5), "亮主题代码块底");
+        assert_eq!(dark.colors.code_block_bg, rgb(0x262626), "暗主题代码块底");
+        // 行内代码 pill（亮 底 #F0F0F0 + 字 #202020 / 暗 底 #3A3A3A + 字 #E8E8E8）
+        assert_eq!(light.colors.code_inline_bg, rgb(0xf0f0f0));
+        assert_eq!(light.colors.code_inline_fg, rgb(0x202020));
+        assert_eq!(dark.colors.code_inline_bg, rgb(0x3a3a3a));
+        assert_eq!(dark.colors.code_inline_fg, rgb(0xe8e8e8));
+        // 编辑器滤镜行内代码底（亮 #F2F2F2 / 暗 #2E2E2E，与预览略异）
+        assert_eq!(light.colors.editor_code_bg, rgb(0xf2f2f2));
+        assert_eq!(dark.colors.editor_code_bg, rgb(0x2e2e2e));
+        // 引述底 / 表头底随明暗切换，且同档里互不相同（层次可辨）
         assert_ne!(light.colors.quote_bg, dark.colors.quote_bg, "引述底色随明暗");
         assert_ne!(light.colors.table_head_bg, dark.colors.table_head_bg, "表头底色随明暗");
-        // 标题（编辑器滤镜）与链接（明/暗同源不改蓝）
+        assert_ne!(light.colors.quote_bg, light.colors.table_head_bg, "亮引述≠亮表头（#F7F7F7 vs #F2F2F2）");
+        assert_ne!(dark.colors.quote_bg, dark.colors.table_head_bg, "暗引述≠暗表头（#262626 vs #323232）");
+        // 标题/链接/弹层同源蓝系，随明暗切换
+        assert_eq!(light.colors.heading, light.colors.link, "亮标题=亮链接同蓝");
+        assert_eq!(dark.colors.heading, dark.colors.link, "暗标题=暗链接同蓝");
         assert_ne!(light.colors.heading, dark.colors.heading, "标题色随明暗");
-        // 悬浮卡片底随明暗
+        // 悬浮卡片底随明暗（亮 #FFFFFF / 暗 #333333）
         assert_ne!(light.colors.popover_bg, dark.colors.popover_bg, "弹层底色随明暗");
     }
 
@@ -386,27 +398,51 @@ mod tests {
     }
 
     #[gpui::test]
-    fn chrome_palette_pins_win11_shell_values(_cx: &mut TestAppContext) {
-        // 回归：Win11 Fluent 中性外壳关键值钉死（第 2 步换色后的新色板）。
+    fn chrome_palette_pins_ms_v2_shell_values(_cx: &mut TestAppContext) {
+        // 回归：第 5 步谐波化后的 Win11 Fluent 中性外壳关键值钉死（与 ColorScheme 同源）。
         let light = ChromeColors::light();
         let dark = ChromeColors::dark();
+        assert_eq!(light.window_bg, rgb(0xf5f5f5), "亮窗口背景=中性灰带");
+        assert_eq!(light.bar_bg, rgb(0xf5f5f5), "亮工具条背景=窗口底");
         assert_eq!(light.panel_bg, rgb(0xffffff), "亮面板背景=白");
-        assert_eq!(light.pill_bg, rgb(0xe5e5e5), "亮 pill 底色=chip 底");
+        assert_eq!(light.pill_bg, rgb(0xe8e8e8), "亮 pill 底色=chip 底");
         assert_eq!(dark.window_bg, rgb(0x202020), "暗窗口背景");
-        assert_eq!(dark.bar_border, rgba(0xffffff1f), "暗工具条分隔边框");
+        assert_eq!(dark.panel_bg, rgb(0x2b2b2b), "暗面板背景=内容 bg");
+        assert_eq!(dark.bar_border, rgba(0xffffff1a), "暗工具条分隔边框=内容 border");
         // pill 跟随 chip 令牌（不再是旧的主蓝高亮胶囊）
         assert_eq!(light.pill_bg, light.chip_bg, "亮 pill=chip 底");
         assert_eq!(light.pill_fg, light.chip_text, "亮 pill=chip 字");
         assert_eq!(dark.pill_bg, dark.chip_bg, "暗 pill=chip 底");
         assert_eq!(dark.pill_fg, dark.chip_text, "暗 pill=chip 字");
-        // 交互三档：hover / pressed 亮暗分离、pressed 与 hover 不同、关闭红亮暗同值
+        // 交互两档：hover / pressed 亮暗分离、pressed 与 hover 不同、关闭红亮暗同值
         assert_ne!(light.hover_fill, dark.hover_fill, "hover 填充随明暗");
         assert_ne!(light.pressed_fill, dark.pressed_fill, "按压填充随明暗");
         assert_ne!(light.hover_fill, light.pressed_fill, "hover 与按压深浅不同");
         assert_eq!(light.close_hover, dark.close_hover, "关闭红亮暗同值");
-        assert_eq!(light.dirty, dark.dirty, "脏标记点亮暗同值");
         // 菜单高亮：中性灰随明暗（亮半透明黑 / 暗半透明白）
         assert_ne!(light.menu_highlight, dark.menu_highlight, "菜单高亮随明暗");
+    }
+
+    #[gpui::test]
+    fn chrome_and_color_scheme_share_ramp(_cx: &mut TestAppContext) {
+        // 第 5 步核心不变式：外壳（ChromeColors）与内容（ColorScheme）**物理同源**，
+        // 同名字段必须逐字节相等——改调色板只改一处，双方一起变、永不漂移。
+        for (chrome, colors) in [
+            (ChromeColors::light(), ColorScheme::light()),
+            (ChromeColors::dark(), ColorScheme::dark()),
+        ] {
+            assert_eq!(chrome.panel_bg, colors.bg, "面板背景=内容 bg");
+            assert_eq!(chrome.bar_border, colors.border, "工具条边框=内容 border");
+            assert_eq!(chrome.text_primary, colors.fg, "外壳主文字=内容主文字");
+            assert_eq!(chrome.text_minor, colors.fg_muted, "外壳次文字=内容次文字");
+            assert_eq!(chrome.dirty, colors.error, "脏标记=错误色");
+            assert_eq!(colors.surface, colors.popover_bg, "浮动层=升一级表面（surface 同 popover 底）");
+        }
+        // 明暗双端各自钉死基座色（防回归到旧 GitHub/slate 蓝灰）。
+        let dark = ChromeColors::dark();
+        assert_eq!(dark.window_bg, rgb(0x202020), "暗窗口背景");
+        assert_eq!(ColorScheme::dark().bg, rgb(0x2b2b2b), "暗内容主背景");
+        assert_eq!(ColorScheme::light().bg, rgb(0xffffff), "亮内容主背景");
     }
 
     #[gpui::test]

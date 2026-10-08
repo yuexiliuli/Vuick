@@ -281,21 +281,19 @@ impl PdfViewer {
         self.bg = Some(bg);
     }
 
-    /// 画布默认底色：浅色模式浅灰、深色模式深灰。
+    /// 画布默认底色：亮 #F5F5F5 / 暗 #202020（中性灰阶，与外壳 `window_bg` 同源；
+    /// 应用启动后 `set_background` 会用 ChromeColors 覆盖，此处仅兜底）。
     fn default_canvas(cx: &App) -> Hsla {
-        if crate::ui::theme::Theme::global(cx).is_dark() {
-            rgb(0x111827).into()
-        } else {
-            rgb(0xe5e7eb).into()
-        }
+        let dark = crate::ui::theme::Theme::global(cx).is_dark();
+        crate::ui::theme::ChromeColors::for_mode(dark).window_bg.into()
     }
 
-    /// 页面“卡片”配色：纸面白 / 深色纸面，配边框。
+    /// 页面“卡片”配色：纸面白 / 深色纸面，配中性边框（只动 chrome 边框，纸面不改）。
     fn page_card_colors(cx: &App) -> (Hsla, Hsla) {
         if crate::ui::theme::Theme::global(cx).is_dark() {
-            (rgb(0x1f2937).into(), rgb(0x374151).into())
+            (rgb(0x1f2937).into(), rgb(0x484848).into())
         } else {
-            (gpui::white(), rgb(0xd1d5db).into())
+            (gpui::white(), rgb(0xe0e0e0).into())
         }
     }
 
