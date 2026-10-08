@@ -2282,10 +2282,9 @@ impl EditorApp {
     /// 每张卡片按 left = 窗口宽 - 卡片宽 - 右缘、right = 右缘、top = 4 + i*92、h 固定
     /// 显式定位（headless 与真机布局一致）；保留 .id + on_click 交互。
     ///
-    /// 【已知平台层限制（2026-10-08 实测）】本仓 gpui_windows 的 D3D 合成路径无法绘制
-    /// 「左边原点超出窗口约前 1/4」的填充 rect（absolute 与 in-flow、deferred 与否均如此），
-    /// 故右上角 toast 目前在真机仍不显示、此前也从未显示过；需随平台层补丁一并修复
-    /// （见查证：left=8 可绘、left=150/244/312 均不可绘；文字 glyph 为 sprite 不受影响）。
+    /// 位置：右上角、但**下移避开 chrome**（标题栏 32 + 选项卡栏 32 = 64）——
+    /// 卡片从 y=68 起叠在正文空内容区顶部，不遮挡右上角最小化/最大化/关闭按钮
+    /// 与选项卡栏。gpu 合成路径实测可正常绘制（此区无平台层障碍）。
     fn render_notifications(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.notifications.is_empty() {
             return div().into_any_element();
@@ -2293,9 +2292,10 @@ impl EditorApp {
         let width = window.bounds().size.width.as_f32();
         const CARD_W: f32 = 320.;
         const RIGHT: f32 = 4.;
-        const TOP: f32 = 4.;
-        const STEP: f32 = 92.;
-        const CARD_H: f32 = 84.;
+        // 标题栏(32) + 选项卡栏(32) + 4 边距 → 卡片落在正文空内容区顶部，避免遮挡按钮。
+        const TOP: f32 = 68.;
+        // 卡片高度由内容自适应（消息可多行换行），STEP 仅作多卡竖排间距下限。
+        const STEP: f32 = 104.;
         let mut layer = div().absolute().top_0().left_0().right_0().bottom_0();
         for (i, n) in self.notifications.iter().enumerate() {
             let id_type = n.id_type();
@@ -2311,8 +2311,7 @@ impl EditorApp {
                     .absolute()
                     .top(px(TOP + i as f32 * STEP))
                     .left(px(left))
-                    .right(px(RIGHT))
-                    .h(px(CARD_H)),
+                    .right(px(RIGHT)),
             );
         }
         // 不用 .with_priority(100)（菜单已用 100）：toast 恒在最上

@@ -2570,6 +2570,54 @@
         let _ = std::fs::remove_file(&p);
     }
 
+    /// 大二进制（>128KB 走后台分块路径）：非 UTF-8 必须同样弹失败通知，
+    /// 绝不「打开」成只剩少量合法前缀的乱码页（回归：异步分块路径曾静默吞尾）。
+    #[gpui::test]
+    async fn large_binary_shows_notification(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+
+        let p = std::env::temp_dir().join("gpui-binary-large.bin");
+        // 200_000 字节 > OPEN_ASYNC_MIN_BYTES(128KB) → 强制走 ChunkReader 异步分块路径
+        std::fs::write(&p, vec![0xFF; 200_000]).unwrap();
+        let tabs_before = cx.update(|_w, cx| app.read(cx).tabs.len());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        // 异步分块读取需多轮推进（读盘→通道→主线程装配）
+        for _ in 0..30 {
+            cx.run_until_parked();
+        }
+
+        let (status_ok, tabs_after, active_content) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.status_ok,
+                a.tabs.len(),
+                if a.tabs.is_empty() {
+                    None
+                } else {
+                    Some(a.tabs[a.active_tab].editor.read(cx).value().to_string())
+                },
+            )
+        });
+        assert!(!status_ok, "大二进制（非 UTF-8）应置状态为失败");
+        let count = cx.update(|_window, cx| app.read(cx).notifications.len());
+        assert_eq!(count, 1, "打开大二进制失败应推送一条通知");
+        // 大路径先建选项卡再异步失败：选项卡保留但必须为空（未挂任何非法内容）。
+        assert_eq!(tabs_after, tabs_before + 1, "大文件先建选项卡再失败");
+        assert_eq!(
+            active_content.as_deref(),
+            Some(""),
+            "编辑区不得装入非法内容（乱码前缀）"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// 大文档 Markdown 预览冒烟测试：上千行也应能渲染（走虚拟化列表），不 panic。
     #[gpui::test]
     async fn large_markdown_preview_renders(cx: &mut TestAppContext) {

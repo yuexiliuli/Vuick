@@ -105,8 +105,21 @@ impl ChunkReader {
         if n > 0 {
             self.total += n as u64;
             // 合并 UTF-8 残留，取最长合法前缀（≤3 字节不完整尾部留到下一块）。
+            // 与 fs::read_to_string 语义一致：整篇必须合法 UTF-8。此前只取合法前缀、
+            // 非法尾段则静默吞掉，导致大二进制（exe/dll）打开成只剩少量乱码前缀的页、
+            // 且永不弹「打开失败」。现改为：error_len() == Some（确定无效字节，
+            // 而非「读缓冲截断的多字节尾部」）→ 立即报 InvalidData。
             self.utf8_carry.extend_from_slice(&self.buf[..n]);
-            let valid_len = match std::str::from_utf8(&self.utf8_carry) {
+            let parsed = std::str::from_utf8(&self.utf8_carry);
+            if let Err(e) = &parsed {
+                if e.error_len().is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stream did not contain valid UTF-8",
+                    ));
+                }
+            }
+            let valid_len = match parsed {
                 Ok(_) => self.utf8_carry.len(),
                 Err(e) => e.valid_up_to(),
             };
@@ -121,8 +134,15 @@ impl ChunkReader {
             self.utf8_carry.drain(..valid_len);
             return Ok(());
         }
-        // EOF：收尾。
+        // EOF：收尾。若仍残留字节（文件在非法/截断多字节处结束），与 read_to_string
+        // 语义一致报 InvalidData，不再静默丢弃。
         self.done = true;
+        if !self.utf8_carry.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            ));
+        }
         if self.pending_cr {
             self.pending_cr = false;
             self.s.finish_line();
@@ -390,6 +410,60 @@ mod tests {
         with_temp("line1\r\nline2\rline3\nline4\r\n", |p| {
             let (text, ..) = collect(p, 5);
             assert_eq!(text, "line1\nline2\nline3\nline4\n");
+        });
+    }
+
+    fn with_temp_bytes(content: &[u8], f: impl FnOnce(&std::path::Path)) {
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-progress-{}-{}-{}.bin",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&dir, content).unwrap();
+        f(&dir);
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn invalid_utf8_stream_reports_invalid_data() {
+        // 大二进制（读分支即遇非法字节）：必须报 InvalidData，绝不静默吞尾喂出乱码页。
+        with_temp_bytes(&[0xFF; 300_000], |p| {
+            let err = produce_open_chunks(p, 128 * 1024, |_| Ok(())).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "非法 UTF-8 流应报 InvalidData（与 read_to_string 一致）"
+            );
+        });
+    }
+
+    #[test]
+    fn truncated_multibyte_at_eof_reports_invalid_data() {
+        // 文件在多字节序列被截断处结束：合法前缀照常喂出，EOF 残留（utf8_carry 非空）
+        // 必须报 InvalidData，不能静默丢弃。用极小读缓冲强制把尾字残留在 carry。
+        with_temp_bytes(b"abc\xF0\x9F\x98", |p| {
+            let err = produce_open_chunks(p, 8, |_| Ok(())).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::InvalidData,
+                "EOF 残留截断多字节应报 InvalidData"
+            );
+        });
+    }
+
+    #[test]
+    fn valid_multibyte_utf8_reads_at_any_buf() {
+        // 对照：合法多字节 UTF-8（含跨读块截断）在任意读缓冲下都不能误报，正常路径原样工作。
+        let raw = "中文😀好数据中abc\n第二行🚀\n".repeat(1_000);
+        with_temp(&raw, |p| {
+            let (got, ..) = collect(p, 7); // 极小读缓冲 → 多字节跨块频繁截断
+            assert_eq!(got, raw, "极小读缓冲下合法多字节应逐块完整拼接");
+            let (got2, ..) = collect(p, 128 * 1024); // 生产量级读缓冲
+            assert_eq!(got2, raw, "生产读缓冲下合法多字节应完整读出");
         });
     }
 }

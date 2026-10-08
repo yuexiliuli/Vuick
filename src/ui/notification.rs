@@ -145,7 +145,9 @@ impl Notification {
             .when(!self.message.is_empty(), |this| {
                 this.child(
                     div()
-                        .flex()
+                        // 必须是「块级」而非 flex：flex 行内文本按内容宽布局、不感知
+                        // 受限宽度 → 长消息不换行、溢出卡片。块级 + whitespace_normal 在
+                        // flex_col 拉伸出的有限宽内按断点（含路径 \ / 等）自动换行。
                         .text_size(px(13.))
                         .text_color(fg.opacity(0.82))
                         .whitespace_normal()
