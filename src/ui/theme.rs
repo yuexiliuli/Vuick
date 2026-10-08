@@ -199,6 +199,8 @@ pub struct ChromeColors {
     pub pressed_fill: Rgba,
     /// 关闭按钮悬停填充（危险红，亮暗同值）
     pub close_hover: Rgba,
+    /// 菜单项选中/悬停高亮（Win11 中性灰填充，替代强调蓝 tint）
+    pub menu_highlight: Rgba,
 }
 
 impl ChromeColors {
@@ -222,6 +224,7 @@ impl ChromeColors {
             hover_fill: rgba(0x0000000d),
             pressed_fill: rgba(0x0000001a),
             close_hover: rgb(0xe81123),
+            menu_highlight: rgba(0x00000014),
         }
     }
 
@@ -245,6 +248,7 @@ impl ChromeColors {
             hover_fill: rgba(0xffffff14),
             pressed_fill: rgba(0xffffff24),
             close_hover: rgb(0xe81123),
+            menu_highlight: rgba(0xffffff1a),
         }
     }
 
@@ -401,6 +405,8 @@ mod tests {
         assert_ne!(light.hover_fill, light.pressed_fill, "hover 与按压深浅不同");
         assert_eq!(light.close_hover, dark.close_hover, "关闭红亮暗同值");
         assert_eq!(light.dirty, dark.dirty, "脏标记点亮暗同值");
+        // 菜单高亮：中性灰随明暗（亮半透明黑 / 暗半透明白）
+        assert_ne!(light.menu_highlight, dark.menu_highlight, "菜单高亮随明暗");
     }
 
     #[gpui::test]

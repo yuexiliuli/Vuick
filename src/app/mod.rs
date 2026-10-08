@@ -1223,8 +1223,8 @@ impl EditorApp {
             out.push(body);
         } else {
             out.push(self.render_title_bar(window, cx).into_any_element());
-            out.push(self.render_tab_bar(cx).into_any_element());
-            out.push(self.render_body_sidebar(body, cx).into_any_element());
+            out.push(self.render_tab_bar(window, cx).into_any_element());
+            out.push(self.render_body_sidebar(body, window, cx).into_any_element());
             out.push(self.render_status_bar(cx).into_any_element());
         }
         // 通知层（右上角 toast）与媒体右键菜单 Overlay 恒在最上层
@@ -1967,12 +1967,15 @@ impl EditorApp {
     ) -> impl IntoElement {
         let bar_bg = self.bar_bg();
         let text_minor = self.text_minor();
+        let text_primary = self.text_primary();
         let c = self.chrome();
         let hover_fill: gpui::Hsla = c.hover_fill.into();
         let pressed_fill: gpui::Hsla = c.pressed_fill.into();
         let close_hover: gpui::Hsla = c.close_hover.into();
         // 关闭钮按压色：close_hover 的深一档局部派生（本步唯一局部派生色，勿挪进色板）。
         let close_pressed: gpui::Hsla = rgba(0xa70d1aff).into();
+        // 窗口控制钮跨帧 hover 状态对应的视图 id（元素级状态变更后通知重绘）。
+        let view_id = window.current_view();
         let icon_style = |icon: IconName| {
             Icon::new(icon).size(px(14.)).text_color(text_minor)
         };
@@ -2009,6 +2012,17 @@ impl EditorApp {
             IconName::WindowMaximize
         };
 
+        // 窗口控制钮：hover 时图标提亮/变白（Win11 观感）。图标色按元素级 hover
+        // 状态分支显式传 `Icon::text_color`——parent 的 text_color 不会级联覆盖
+        // 子元素 Icon 的显式色，必须在 state 分支里决定。`cx.notify(view_id)` 触发
+        // 状态变化后的重绘。
+        let minimize_hover =
+            window.use_keyed_state("title-minimize-hover", cx, |_, _| false);
+        let minimize_color: gpui::Hsla = if *minimize_hover.read(cx) {
+            text_primary
+        } else {
+            text_minor
+        };
         let minimize = div()
             .id("title-minimize")
             .w(px(40.))
@@ -2016,13 +2030,30 @@ impl EditorApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(hover_fill))
             .active(|style| style.bg(pressed_fill))
-            .child(icon_style(IconName::WindowMinimize))
+            .child(
+                Icon::new(IconName::WindowMinimize)
+                    .size(px(14.))
+                    .text_color(minimize_color),
+            )
+            .on_hover({
+                let st = minimize_hover.clone();
+                move |hovered, _window, cx| {
+                    st.update(cx, |h, _| *h = *hovered);
+                    cx.notify(view_id);
+                }
+            })
             .window_control_area(gpui::WindowControlArea::Min);
 
+        let maximize_hover =
+            window.use_keyed_state("title-maximize-hover", cx, |_, _| false);
+        let maximize_color: gpui::Hsla = if *maximize_hover.read(cx) {
+            text_primary
+        } else {
+            text_minor
+        };
         let maximize = div()
             .id("title-maximize")
             .w(px(40.))
@@ -2030,13 +2061,31 @@ impl EditorApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(hover_fill))
             .active(|style| style.bg(pressed_fill))
-            .child(icon_style(maximize_icon))
+            .child(
+                Icon::new(maximize_icon)
+                    .size(px(14.))
+                    .text_color(maximize_color),
+            )
+            .on_hover({
+                let st = maximize_hover.clone();
+                move |hovered, _window, cx| {
+                    st.update(cx, |h, _| *h = *hovered);
+                    cx.notify(view_id);
+                }
+            })
             .window_control_area(gpui::WindowControlArea::Max);
 
+        let close_hover_state =
+            window.use_keyed_state("title-close-hover", cx, |_, _| false);
+        // close：hover 时图标变白（Win11 危险钮观感）；非 hover 回落次要灰。
+        let close_icon_color: gpui::Hsla = if *close_hover_state.read(cx) {
+            white()
+        } else {
+            text_minor
+        };
         let close = div()
             .id("title-close")
             .w(px(40.))
@@ -2044,11 +2093,21 @@ impl EditorApp {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(close_hover))
             .active(|style| style.bg(close_pressed))
-            .child(icon_style(IconName::WindowClose))
+            .child(
+                Icon::new(IconName::WindowClose)
+                    .size(px(14.))
+                    .text_color(close_icon_color),
+            )
+            .on_hover({
+                let st = close_hover_state.clone();
+                move |hovered, _window, cx| {
+                    st.update(cx, |h, _| *h = *hovered);
+                    cx.notify(view_id);
+                }
+            })
             .window_control_area(gpui::WindowControlArea::Close);
 
         div()

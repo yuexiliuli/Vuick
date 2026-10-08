@@ -27,7 +27,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{ChromeColors, Theme};
 
 /// 菜单项点击处理器。
 type ItemHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -295,8 +295,8 @@ impl Render for PopupMenu {
         let (colors, is_dark) = (theme.colors, theme.is_dark());
         let fg: Hsla = colors.fg.into();
         let fg_muted: Hsla = colors.fg_muted.into();
-        let accent: Hsla = colors.accent.into();
-        let selected_bg = accent.opacity(if is_dark { 0.32 } else { 0.16 });
+        // Win11 中性菜单高亮：灰填充（非强调蓝 tint）。
+        let selected_bg: Hsla = ChromeColors::for_mode(is_dark).menu_highlight.into();
         let items_count = self.menu_items.len();
         let selected = self.selected_index;
 

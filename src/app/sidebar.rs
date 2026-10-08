@@ -72,6 +72,7 @@ impl EditorApp {
     pub(super) fn render_body_sidebar(
         &mut self,
         body: gpui::AnyElement,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if !self.sidebar.open {
@@ -104,20 +105,24 @@ impl EditorApp {
                     this.end_sidebar_resize(cx);
                 }),
             )
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(body)
             .into_any_element()
     }
 
     /// 侧边栏整体：左侧为常驻竖列切换栏（活动栏），右侧为可展开的内容面板
     /// （目录/搜索）。面板收起时仅剩 46px 活动栏，正文区随之占满，不留空白宽区。
-    pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let (side_bg, border) = (self.bar_bg(), self.bar_border());
         // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
         let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
             Some(match self.sidebar.view {
                 SidebarView::Toc => self.render_sidebar_toc(cx),
-                SidebarView::Search => self.render_sidebar_search(cx),
+                SidebarView::Search => self.render_sidebar_search(window, cx),
             })
         } else {
             None
@@ -592,19 +597,34 @@ impl EditorApp {
     }
 
     /// 「搜索」视图：关键字输入框 + 当前文档的匹配结果（文件名跨打开文件匹配）。
-    fn render_sidebar_search(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_sidebar_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let muted = self.text_minor();
         let query = self.search_state.read(cx).value().to_string();
         let search = self.search_state.clone();
+        // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
+        // 聚焦时边框点亮为强调色。
+        let focused = window.focused(cx) == Some(self.search_state.read(cx).focus_handle(cx));
+        let border_color: gpui::Hsla = if focused {
+            crate::ui::theme::Theme::global(cx).colors.accent.into()
+        } else {
+            self.bar_border()
+        };
         let input = div()
             .id("sidebar-search-input")
             .debug_selector(|| "sidebar-search-input".into())
-            .px_3()
+            .px_2()
             .py_1()
+            .mx_2()
+            .my_1()
             .w_full()
             .min_h(px(34.))
-            .border_b_1()
-            .border_color(self.bar_border())
+            .rounded_sm()
+            .border_1()
+            .border_color(border_color)
             .child(Input::new(&search));
 
         let q = query.trim().to_lowercase();

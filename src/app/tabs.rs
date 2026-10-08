@@ -271,6 +271,7 @@ impl EditorApp {
         idx: usize,
         is_active: bool,
         colors: &TabBarColors,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let name = tab
@@ -280,6 +281,12 @@ impl EditorApp {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未命名".to_string());
         let dirty = tab.dirty;
+
+        // 元素级 hover 状态：跨帧记住「该 tab 是否被悬停」，关闭 × 因此在
+        // 激活项恒定可见、非激活项悬停显现（VS Code 观感）。
+        let view_id = window.current_view();
+        let tab_hover = window.use_keyed_state(("tab", idx), cx, |_, _| false);
+        let hovered = *tab_hover.read(cx);
 
         let close = div()
             .id(SharedString::from(format!("tab-close-{idx}")))
@@ -293,6 +300,8 @@ impl EditorApp {
             .text_color(colors.text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(colors.hover_fill))
+            // 仅视觉：opacity 只影响绘制不阻断事件，模拟点击/命中不受影响。
+            .opacity(if is_active || hovered { 1.0 } else { 0.0 })
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -329,6 +338,14 @@ impl EditorApp {
         } else {
             el.hover(|style| style.bg(colors.hover_fill))
         };
+        // hover 状态跨帧记录，驱动关闭 × 悬停显现。
+        el = el.on_hover({
+            let st = tab_hover.clone();
+            move |hovered, _window, cx| {
+                st.update(cx, |h, _| *h = *hovered);
+                cx.notify(view_id);
+            }
+        });
         // 多窗口拖拽：按住选项卡拖动 → 跟出“胶囊”幽灵；
         // 在窗口外松开由 EditorApp 根视图决定「拆独立窗口 / 还原回主窗口」。
         let drag_data = TabDragData {
@@ -488,12 +505,16 @@ impl EditorApp {
         }
     }
 
-    pub(super) fn render_tab_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_tab_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let active = self.active_tab;
         let colors = self.tab_bar_colors(cx);
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
         for (i, tab) in self.tabs.iter().enumerate() {
-            tabs.push(Self::tab_bar_item(tab, i, i == active, &colors, cx));
+            tabs.push(Self::tab_bar_item(tab, i, i == active, &colors, window, cx));
         }
 
         // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
