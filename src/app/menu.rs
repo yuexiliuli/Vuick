@@ -16,7 +16,11 @@ impl EditorApp {
     where
         F: Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     {
-        PopupMenuItem::element(move |_, _| {
+        PopupMenuItem::element(move |_, cx| {
+            // 快捷键提示灰字：渲染期取当前明暗模式（外壳色单一来源）。
+            let chrome = crate::ui::theme::ChromeColors::for_mode(
+                crate::ui::theme::Theme::global(cx).is_dark(),
+            );
             let mut content = div()
                 .w_full()
                 .flex()
@@ -25,7 +29,7 @@ impl EditorApp {
                 .gap_3()
                 .child(label);
             if !shortcut.is_empty() {
-                content = content.child(div().text_color(rgb(0x9ca3af)).child(shortcut));
+                content = content.child(div().text_color(chrome.text_tertiary).child(shortcut));
             }
             content
         })
@@ -214,12 +218,16 @@ impl EditorApp {
     }
 
     /// "自动换行"菜单项：动态显示当前是否开启（前导 ☑/☐），点击切换。
-    fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {        let weak2 = weak.clone();
+    fn wrap_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
         PopupMenuItem::element(move |_, cx| {
             let on = weak
                 .upgrade()
                 .map(|e| e.read(cx).wrap_enabled)
                 .unwrap_or(true);
+            let chrome = crate::ui::theme::ChromeColors::for_mode(
+                crate::ui::theme::Theme::global(cx).is_dark(),
+            );
             div()
                 .w_full()
                 .flex()
@@ -227,7 +235,7 @@ impl EditorApp {
                 .justify_between()
                 .gap_3()
                 .child(if on { "☑ 自动换行" } else { "☐ 自动换行" })
-                .child(div().text_color(rgb(0x9ca3af)).child("Ctrl+Alt+W"))
+                .child(div().text_color(chrome.text_tertiary).child("Ctrl+Alt+W"))
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_wrap(window, cx));

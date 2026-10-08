@@ -433,7 +433,11 @@ impl EditorApp {
             return None;
         }
         let on = self.show_preview();
-        let eye_color = if on { rgb(0x4338ca) } else { rgb(0x9ca3af) };
+        let eye_color: gpui::Hsla = if on {
+            self.chrome().pill_fg.into()
+        } else {
+            self.chrome().text_tertiary.into()
+        };
         Some(
             div()
                 .id("tab-bar-eye")

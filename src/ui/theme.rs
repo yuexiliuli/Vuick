@@ -155,6 +155,97 @@ impl ColorScheme {
     }
 }
 
+/// 外壳（App 框架）配色：标题栏/菜单栏/选项卡栏/侧边栏/状态栏等**窗口外壳**的语义色，
+/// 与 [`ColorScheme`]（内容渲染色板）平行——前者管「框」，后者管「内容」。
+///
+/// 第 1 步从 `src/app/mod.rs` 的 11 个 `dark_mode` 分支 helper 收编而来，字段值与收编前
+/// **逐字节一致**（含亮暗同值的 `pill_*`/`dirty`/`text_tertiary`）；本步纯来源重构、视觉
+/// 不变，后续 Win11 Fluent / VS Code 风格化步骤再基于此演进。
+#[derive(Clone, Copy, Debug)]
+pub struct ChromeColors {
+    /// 编辑区以外的画布背景（＝窗口底色）
+    pub window_bg: Rgba,
+    /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景
+    pub bar_bg: Rgba,
+    /// 工具条分隔边框
+    pub bar_border: Rgba,
+    /// 编辑器/预览面板背景
+    pub panel_bg: Rgba,
+    /// 状态栏等整体面板背景
+    pub surface_bg: Rgba,
+    /// 主要文字
+    pub text_primary: Rgba,
+    /// 次要/弱化文字
+    pub text_minor: Rgba,
+    /// 三级文字（菜单快捷键 / 未激活图标，亮暗同值）
+    pub text_tertiary: Rgba,
+    /// 胶囊/小按钮等「芯片」背景
+    pub chip_bg: Rgba,
+    /// 芯片上的文字
+    pub chip_text: Rgba,
+    /// 激活选项卡背景
+    pub tab_active_bg: Rgba,
+    /// 激活选项卡边框
+    pub tab_active_border: Rgba,
+    /// 状态栏语言徽标 / 全屏按钮等的 pill 底色（亮暗同值）
+    pub pill_bg: Rgba,
+    /// pill 前景文字（亮暗同值）
+    pub pill_fg: Rgba,
+    /// 文件脏标记点（亮暗同值）
+    pub dirty: Rgba,
+}
+
+impl ChromeColors {
+    pub fn light() -> Self {
+        Self {
+            window_bg: rgb(0xf3f4f6),
+            bar_bg: rgb(0xf3f4f6),
+            bar_border: rgb(0xe5e7eb),
+            panel_bg: rgb(0xffffff),
+            surface_bg: rgb(0xffffff),
+            text_primary: rgb(0x111827),
+            text_minor: rgb(0x6b7280),
+            text_tertiary: rgb(0x9ca3af),
+            chip_bg: rgb(0xe5e7eb),
+            chip_text: rgb(0x374151),
+            tab_active_bg: rgb(0xffffff),
+            tab_active_border: rgb(0xd1d5db),
+            pill_bg: rgb(0xeef2ff),
+            pill_fg: rgb(0x4338ca),
+            dirty: rgb(0xdc2626),
+        }
+    }
+
+    pub fn dark() -> Self {
+        Self {
+            window_bg: rgb(0x111827),
+            bar_bg: rgb(0x1f2937),
+            bar_border: rgb(0x374151),
+            panel_bg: rgb(0x111827),
+            surface_bg: rgb(0x111b2a),
+            text_primary: rgb(0xe5e7eb),
+            text_minor: rgb(0x9ca3af),
+            text_tertiary: rgb(0x9ca3af),
+            chip_bg: rgb(0x374151),
+            chip_text: rgb(0xe5e7eb),
+            tab_active_bg: rgb(0x374151),
+            tab_active_border: rgb(0x4b5563),
+            pill_bg: rgb(0xeef2ff),
+            pill_fg: rgb(0x4338ca),
+            dirty: rgb(0xdc2626),
+        }
+    }
+
+    /// 按明暗模式取对应一套（无 App 上下文时的便捷入口）。
+    pub fn for_mode(dark: bool) -> Self {
+        if dark {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+}
+
 /// 全局主题：当前模式 + 对应语义色板 + 排版参数。
 #[derive(Clone, Debug)]
 pub struct Theme {
@@ -266,6 +357,32 @@ mod tests {
         assert_ne!(light.colors.heading, dark.colors.heading, "标题色随明暗");
         // 悬浮卡片底随明暗
         assert_ne!(light.colors.popover_bg, dark.colors.popover_bg, "弹层底色随明暗");
+    }
+
+    #[gpui::test]
+    fn chrome_palette_has_distinct_light_and_dark(_cx: &mut TestAppContext) {
+        // 第 1 步把 App 外壳 11 个 helper 收编为 ChromeColors：亮/暗外壳底色必须分离。
+        let light = ChromeColors::light();
+        let dark = ChromeColors::dark();
+        assert_ne!(light.window_bg, dark.window_bg, "亮/暗窗口背景应不同");
+        assert_ne!(light.bar_bg, dark.bar_bg, "亮/暗工具条背景应不同");
+        assert_ne!(light.panel_bg, dark.panel_bg, "亮/暗面板背景应不同");
+    }
+
+    #[gpui::test]
+    fn chrome_palette_pins_original_shell_values(_cx: &mut TestAppContext) {
+        // 回归：外壳色值必须逐字节等于收编前 app/mod.rs 的硬编码（含亮暗同值的
+        // pill / dirty / text_tertiary），后续 Win11 Fluent / VS Code 风格化步骤再改。
+        let light = ChromeColors::light();
+        let dark = ChromeColors::dark();
+        assert_eq!(light.panel_bg, rgb(0xffffff), "亮面板背景=白");
+        assert_eq!(light.pill_bg, rgb(0xeef2ff), "亮 pill 底色");
+        assert_eq!(dark.window_bg, rgb(0x111827), "暗窗口背景");
+        // 亮暗同值字段（现状即如此，钉住防漂移）
+        assert_eq!(light.pill_fg, dark.pill_fg, "pill 前景亮暗同值");
+        assert_eq!(light.text_tertiary, rgb(0x9ca3af), "三级文字亮度");
+        assert_eq!(dark.text_tertiary, light.text_tertiary, "三级文字亮暗同值");
+        assert_eq!(light.dirty, dark.dirty, "脏标记点亮暗同值");
     }
 
     #[gpui::test]

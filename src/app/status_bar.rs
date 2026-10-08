@@ -122,7 +122,11 @@ impl EditorApp {
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(if dirty { rgb(0xdc2626) } else { rgb(0x9ca3af) })
+                            .text_color(if dirty {
+                                self.chrome().dirty
+                            } else {
+                                self.chrome().text_minor
+                            })
                             .child(if dirty { "●" } else { "" }),
                     )
                     .child(
@@ -138,9 +142,9 @@ impl EditorApp {
                     .px_2()
                     .py_1()
                     .rounded_md()
-                    .bg(rgb(0xeef2ff))
+                    .bg(self.chrome().pill_bg)
                     .text_size(px(11.))
-                    .text_color(rgb(0x4338ca))
+                    .text_color(self.chrome().pill_fg)
                     .child(language),
             )
     }
@@ -153,9 +157,9 @@ impl EditorApp {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgb(0xeef2ff))
+            .bg(self.chrome().pill_bg)
             .text_size(px(12.))
-            .text_color(rgb(0x4338ca))
+            .text_color(self.chrome().pill_fg)
             .cursor(CursorStyle::PointingHand)
             .child(if fullscreen { "还原" } else { "全屏" })
             .on_mouse_down(
@@ -174,9 +178,9 @@ impl EditorApp {
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgb(0xeef2ff))
+            .bg(self.chrome().pill_bg)
             .text_size(px(12.))
-            .text_color(rgb(0x4338ca))
+            .text_color(self.chrome().pill_fg)
             .cursor(CursorStyle::PointingHand)
             .child(if wrap_on { "换行" } else { "不换行" })
             .on_mouse_down(

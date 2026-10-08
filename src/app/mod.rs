@@ -30,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    anchored, deferred, div, px, rgb, rgba, white, Anchor, AnyWindowHandle, App, AppContext,
+    anchored, deferred, div, px, rgba, white, Anchor, AnyWindowHandle, App, AppContext,
     Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths, FocusHandle,
     Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
     Point, PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
@@ -40,6 +40,7 @@ use crate::ui::input::{InputEvent, InputState};
 use crate::ui::menu::{PopupMenu, PopupMenuItem};
 use ropey::Rope;
 use crate::ui::icon::{Icon, IconName};
+use crate::ui::theme::ChromeColors;
 
 // WYSIWYG 预览编辑——本项目 `crate::markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
 use crate::markdown::{WyEditor, WyEvent};
@@ -1851,103 +1852,69 @@ impl EditorApp {
         cx.notify();
     }
 
+    /// 当前明暗模式对应的外壳配色（[`crate::ui::theme::ChromeColors`] 单一来源，
+    /// 值逐字节保持收编前硬编码；本系列后续步骤的配色地基）。
+    fn chrome(&self) -> ChromeColors {
+        if self.dark_mode {
+            ChromeColors::dark()
+        } else {
+            ChromeColors::light()
+        }
+    }
+
     /// 窗口整体背景（编辑区以外的画布）。
     fn window_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x111827).into()
-        } else {
-            rgb(0xf3f4f6).into()
-        }
+        self.chrome().window_bg.into()
     }
 
     /// 菜单栏 / 选项卡栏 / 状态栏等工具条背景。
     fn bar_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x1f2937).into()
-        } else {
-            rgb(0xf3f4f6).into()
-        }
+        self.chrome().bar_bg.into()
     }
 
     /// 工具条分隔边框。
     fn bar_border(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x374151).into()
-        } else {
-            rgb(0xe5e7eb).into()
-        }
+        self.chrome().bar_border.into()
     }
 
     /// 编辑器/预览面板背景。
     fn panel_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x111827).into()
-        } else {
-            white()
-        }
+        self.chrome().panel_bg.into()
     }
 
     /// 主要文字颜色。
     fn text_primary(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0xe5e7eb).into()
-        } else {
-            rgb(0x111827).into()
-        }
+        self.chrome().text_primary.into()
     }
 
     /// 次要/弱化文字颜色。
     fn text_minor(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x9ca3af).into()
-        } else {
-            rgb(0x6b7280).into()
-        }
+        self.chrome().text_minor.into()
     }
 
     /// 胶囊/小按钮等"芯片"背景。
     fn chip_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x374151).into()
-        } else {
-            rgb(0xe5e7eb).into()
-        }
+        self.chrome().chip_bg.into()
     }
 
     /// 芯片上的文字颜色。
     fn chip_text(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0xe5e7eb).into()
-        } else {
-            rgb(0x374151).into()
-        }
+        self.chrome().chip_text.into()
     }
 
     /// 激活选项卡背景。
     fn tab_active_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x374151).into()
-        } else {
-            white()
-        }
+        self.chrome().tab_active_bg.into()
     }
 
     /// 激活选项卡边框。
     fn tab_active_border(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x4b5563).into()
-        } else {
-            rgb(0xd1d5db).into()
-        }
+        self.chrome().tab_active_border.into()
     }
 
     /// 状态栏/其他整体面板背景。
     fn surface_bg(&self) -> gpui::Hsla {
-        if self.dark_mode {
-            rgb(0x111b2a).into()
-        } else {
-            white()
-        }
+        self.chrome().surface_bg.into()
     }
 
     /// 切换黑白（深色/浅色）主题：驱动自研主题（`ui::theme`）与残留组件主题
