@@ -608,6 +608,124 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// P2-11 状态栏分区化：三区布局 + 分隔线 + 语言徽标（含徽记色点 pill）。
+    /// - 未命名空选项卡：语言徽标（占位）显示、中间区（光标位置）省略、右侧主题/编码状态项恒在。
+    /// - `.md`：自动预览 → 右侧出现「预览」状态项；有内容 → 中间区出现 `status-cursor`。
+    /// 分区之间细分隔线 `status-bar-divider` 恒存在。
+    #[gpui::test]
+    async fn status_bar_sections_language_badge_and_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 未命名空选项卡：无编辑内容 → 中间区（光标位置）省略。
+        assert!(
+            cx.debug_bounds("status-language-badge").is_some(),
+            "语言徽标在未打开文件时也应显示（占位）"
+        );
+        assert!(
+            cx.debug_bounds("status-cursor").is_none(),
+            "未命名空文档无编辑内容，中间区应省略（status-cursor）"
+        );
+        assert!(cx.debug_bounds("status-theme").is_some(), "右侧主题状态项应恒在");
+        assert!(
+            cx.debug_bounds("status-encoding").is_some(),
+            "可编辑文档应显示 UTF-8 编码状态项"
+        );
+        assert!(
+            cx.debug_bounds("status-bar-divider").is_some(),
+            "分区之间应有细分隔线（status-bar-divider）"
+        );
+
+        // 打开 .md（自动预览、有内容）→ 语言徽标 / 预览 / 光标中间区齐全。
+        let md = std::env::temp_dir().join(format!("gpui-statusbar-p2-{}.md", std::process::id()));
+        std::fs::write(&md, "# 标题\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("status-mode-preview").is_some(),
+            "Markdown 自动预览应显示「预览」状态项"
+        );
+        let cursor_bounds = cx
+            .debug_bounds("status-cursor")
+            .expect("有内容的编辑区应显示光标位置（Ln, Col）");
+        assert!(cursor_bounds.size.width > px(0.), "光标中间区文本应有宽度");
+        assert!(
+            cx.debug_bounds("status-bar-divider").is_some(),
+            "打开 .md 后分隔线仍应存在"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// P2-11 光标位置数据源：编辑区输入推进 `cursor_col`，中间区随激活选项卡数据刷新；
+    /// 普通文本不显示「只读」状态项。
+    #[gpui::test]
+    async fn status_bar_cursor_data_follows_editing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let txt = std::env::temp_dir().join(format!(
+            "gpui-statusbar-cur-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&txt, "hello\nworld\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (row0, col0) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].cursor_row,
+                a.tabs[a.active_tab].cursor_col,
+            )
+        });
+        assert_eq!((row0, col0), (0, 0), "打开文件后光标应位于 (0,0)");
+        assert!(
+            cx.debug_bounds("status-cursor").is_some(),
+            "有内容的文件应显示光标位置（Ln 1, Col 1）"
+        );
+
+        // 聚焦编辑区 → 粘贴一个字符到光标处 → cursor_col 推进为 1，中间区随数据刷新。
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("A".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (row1, col1) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].cursor_row,
+                a.tabs[a.active_tab].cursor_col,
+            )
+        });
+        assert_eq!((row1, col1), (0, 1), "光标处粘贴后列号推进为 1");
+        assert!(
+            cx.debug_bounds("status-cursor").is_some(),
+            "输入后光标中间区仍存在（行:列随数据源刷新）"
+        );
+        assert!(
+            cx.debug_bounds("status-mode-readonly").is_none(),
+            "普通文本不应显示只读状态项"
+        );
+        let _ = std::fs::remove_file(&txt);
+    }
+
     /// 当前选中的文件是 .md 时，选项卡栏最右侧出现眼睛图标，点击切换预览；非 .md 文件不出现。
     #[gpui::test]
     async fn md_tab_bar_shows_eye_and_toggles_preview(cx: &mut TestAppContext) {

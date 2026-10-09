@@ -866,6 +866,35 @@ mod tests {
     }
 
     #[test]
+    fn thumb_width_interpolates_with_present_horizontal() {
+        // P2-11 补齐判据：水平滚动条的「轨道悬停扩展」与垂直同律——悬停/拖拽插值
+        // （`present` 0→1）驱动滑块由 6px 加粗到 8px、轨道胶囊淡入且与轨道同轴居中。
+        let h = FakeHandle {
+            viewport: vp(),
+            offset: point(px(0.), px(0.)),
+            content: size(px(1600.), px(200.)),
+        };
+        let rest = Scrollbar::horizontal(&h).geom(vp(), 0.).expect("仍超宽");
+        let hot = Scrollbar::horizontal(&h).geom(vp(), 1.).expect("仍超宽");
+        assert_eq!(rest.thumb_fill.size.height, px(THUMB_WIDTH), "常态滑块 6px");
+        assert_eq!(
+            hot.thumb_fill.size.height,
+            px(THUMB_ACTIVE_WIDTH),
+            "悬停/拖拽滑块加粗到 8px"
+        );
+        assert!(hot.track_pill.size.width > hot.thumb_fill.size.width, "轨道胶囊宽于滑块");
+        assert!(
+            (hot.track_pill.center().y - hot.track.center().y).as_f32().abs() < 0.5,
+            "水平轨道胶囊应居中于 16px 轨道条"
+        );
+        assert_eq!(
+            hot.track_pill.size.width,
+            hot.track.size.width,
+            "水平轨道胶囊铺满轨道长"
+        );
+    }
+
+    #[test]
     fn thumb_hit_and_fill_stay_inside_track() {
         // 回归：旧实现拿 `Bounds::new(top_right()+(-inset,..))` 当左上锚——那是
         // TopRight/BottomLeft 锚算法，整块命中区被外推到轨道外（垂直右越 4px、

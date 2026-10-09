@@ -13,7 +13,7 @@
 
 use std::sync::LazyLock;
 
-use gpui::{App, Global, Rgba, SharedString, rgb, rgba};
+use gpui::{App, Global, Hsla, Rgba, SharedString, hsla, rgb, rgba};
 
 /// 明暗模式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -338,6 +338,50 @@ impl Theme {
     }
 }
 
+/// 状态栏语言徽标的「徽记色点」色相（VS Code 式按语言类别分类着色）。
+/// 只存色相（0..=1 圈，见 [`gpui::Hsla::h`]），饱和度/亮度由
+/// [`language_badge_color`] 统一派生，避免在状态栏组件里散落硬编码 `rgba`。
+/// 第二项 `vivid`：有明确语言身份时用高饱和辨识色；纯文本/未知类别走中性灰蓝。
+fn language_badge_hue(label: &str) -> (f32, bool) {
+    match label {
+        "Markdown" => (0.60, true),   // 蓝
+        "Rust" => (0.08, true),       // 橙
+        "Python" => (0.55, true),     // 青
+        "JavaScript" => (0.14, true), // 黄
+        "HTML" => (0.06, true),       // 橙红
+        "CSS" => (0.68, true),        // 靛
+        "C" | "C++" => (0.04, true),  // 红橙
+        "Go" => (0.40, true),         // 绿
+        "Java" => (0.10, true),       // 琥珀
+        "Shell" => (0.58, true),      // 蓝
+        "YAML" => (0.94, true),       // 玫红
+        "SQL" => (0.76, true),        // 紫
+        "XML" => (0.64, true),        // 靛蓝
+        "TOML" => (0.30, true),       // 黄绿
+        "JSON" => (0.22, true),       // 土黄
+        "EPUB" => (0.78, true),       // 紫
+        "PDF" => (0.02, true),        // 红
+        "图片" => (0.86, true),        // 品红
+        _ => (0.60, false),           // 纯文本/文本：低饱和中性灰蓝
+    }
+}
+
+/// 状态栏语言徽标「徽记色点」颜色：VS Code 式浓郁辨识色，明/暗两种底色下都可辨。
+///
+/// 亮底 pill（`#E8E8E8`）取深一档亮度、暗底 pill（`#3A3A3A`）取亮一档亮度，保证
+/// 点在小圆底上轮廓分明；无语言身份（纯文本/未知）时降饱和为中性灰蓝。
+pub fn language_badge_color(label: &str, dark: bool) -> Hsla {
+    let (h, vivid) = language_badge_hue(label);
+    let (s, l) = if vivid {
+        if dark { (0.70, 0.70) } else { (0.68, 0.40) }
+    } else if dark {
+        (0.16, 0.72)
+    } else {
+        (0.16, 0.42)
+    };
+    hsla(h, s, l, 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,5 +527,31 @@ mod tests {
             20.0,
             "编辑器默认行高保留 20"
         );
+    }
+
+    #[gpui::test]
+    fn language_badge_colors_are_vivid_distinct_and_adapt_to_mode(_cx: &mut TestAppContext) {
+        // P2-11：状态栏语言徽标的「徽记色点」——不同语言必须可辨、同语言深浅两套亮度
+        // 拉开、纯文本类降饱和为中性（与语言类拉开层次）。
+        let rust_l = language_badge_color("Rust", false);
+        let rust_d = language_badge_color("Rust", true);
+        let md_d = language_badge_color("Markdown", true);
+        let txt_d = language_badge_color("纯文本", true);
+        assert_ne!(rust_l, rust_d, "同语言深浅底色亮度应不同");
+        assert_ne!(rust_d, md_d, "不同语言（Rust 橙 vs Markdown 蓝）应可辨");
+        assert_ne!(rust_d.h, md_d.h, "色相应不同");
+        assert!(
+            txt_d.s < rust_d.s - 0.2,
+            "纯文本类徽点应显著降饱和（中性灰蓝，s={} vs Rust s={}）",
+            txt_d.s,
+            rust_d.s
+        );
+        assert!(
+            (rust_l.l - rust_d.l).abs() > 0.2,
+            "亮/暗档亮度差应明显（brightness 可辨）"
+        );
+        // 未知语言回退到中性，绝不等同某语言辨识色。
+        let unknown_d = language_badge_color("文本", true);
+        assert!(unknown_d.s < 0.3, "未知类别应低饱和中性");
     }
 }

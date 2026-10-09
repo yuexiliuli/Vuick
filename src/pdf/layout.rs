@@ -86,6 +86,25 @@ pub(crate) fn compute_layout(dims: &[(f32, f32)], page_width: f32) -> (Vec<f32>,
     (tops, total)
 }
 
+/// 当前第一张**可见**页（0 基）：「页面底 > 视口顶」的首张页。
+/// 与 [`keep_window`] 的窗口起点不同——**不含 MARGIN 缓冲**，用于状态栏页码等
+/// 「如实反映视口」的读数；`scroll_y` 为内容已向下滚动的像素数（≥0）。
+pub(crate) fn first_visible_page(dims: &[(f32, f32)], page_width: f32, scroll_y: f32) -> usize {
+    if dims.is_empty() {
+        return 0;
+    }
+    let top = scroll_y.max(0.0);
+    let (tops, _) = compute_layout(dims, page_width);
+    let mut first = 0usize;
+    for (i, dim) in dims.iter().enumerate() {
+        if tops[i] + display_height(*dim, page_width) > top {
+            first = i;
+            break;
+        }
+    }
+    first
+}
+
 /// 可见页区间（含缓冲）：与页列布局镜像，纯函数便于测试。
 ///
 /// `scroll_y` 为内容已向下滚动的像素数（≥0）；`viewport_h` 为可见区高度。
@@ -600,6 +619,25 @@ mod tests {
     #[test]
     fn keep_window_empty_dims_returns_zero() {
         assert_eq!(keep_window(&[], 840.0, 0.0, 600.0), (0, 0));
+    }
+
+    #[test]
+    fn first_visible_page_tracks_viewport_not_margin_buffer() {
+        // 30 页 A4，页宽 840 → 每页高约 1189。滚到第 10 页（1 基）顶附近：首张**可见**
+        // 页正是页底越进视口顶的 0 基 9；keep_window 的窗口起点会再前移 MARGIN 张——
+        // 页码读数必须用前者（否则状态栏显示「第 1 / N 页」时实际已看到更后面的页）。
+        let dims: Vec<(f32, f32)> = vec![a4(); 30];
+        let step = page_step(840.0);
+        let scroll_y = 10.0 * step;
+        let visible = first_visible_page(&dims, 840.0, scroll_y);
+        assert_eq!(visible, 9, "第二十滚位=10 步：页底越过视口顶的首张页应 0 基 9");
+        let (s, _) = keep_window(&dims, 840.0, scroll_y, 600.0);
+        assert_eq!(s, visible - MARGIN, "keep_window 起点含 MARGIN 缓冲（≠ visible）");
+
+        // 顶部：第 0 页；空 dims / 负滚动安全。
+        assert_eq!(first_visible_page(&dims, 840.0, 0.0), 0);
+        assert_eq!(first_visible_page(&[], 840.0, 0.0), 0);
+        assert_eq!(first_visible_page(&dims, 840.0, -5.0), 0);
     }
 
     #[test]

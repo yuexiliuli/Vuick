@@ -1282,7 +1282,7 @@ impl EditorApp {
             out.push(self.render_title_bar(window, cx).into_any_element());
             out.push(self.render_tab_bar(window, cx).into_any_element());
             out.push(self.render_body_sidebar(body, window, cx).into_any_element());
-            out.push(self.render_status_bar(cx).into_any_element());
+            out.push(self.render_status_bar(window, cx).into_any_element());
         }
         // 媒体右键菜单 Overlay 恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());

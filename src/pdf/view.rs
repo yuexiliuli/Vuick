@@ -53,9 +53,9 @@ use crate::config::pdf::{
 };
 use crate::pdf::layout::{
     advance_match_index, bitmap_display_scales, column_left, compute_layout, content_to_local,
-    cover_affordable, cover_scale, display_height, hit_char, keep_window, local_to_pt,
-    page_bitmap_size, page_segment_text, pt_to_local, render_scale, selection_spans_pt,
-    visible_tile_range, Slot, TileSlot,
+    cover_affordable, cover_scale, display_height, first_visible_page, hit_char, keep_window,
+    local_to_pt, page_bitmap_size, page_segment_text, pt_to_local, render_scale,
+    selection_spans_pt, visible_tile_range, Slot, TileSlot,
 };
 use crate::pdf::{
     render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
@@ -268,6 +268,20 @@ impl PdfViewer {
     #[allow(dead_code)]
     pub fn page_count(&self) -> usize {
         self.dims.len()
+    }
+
+    /// 当前第一张可见页（1 基）与总页数（状态栏滚动位置显示用）。
+    /// 仅派生自既有滚动状态（`scroll` 偏移 + 页列布局 [`first_visible_page`]），不新增
+    /// 状态；文档未加载完成（`dims` 为空）时返回 `None`。与 EPUB 页码口径一致：
+    /// 「第一张可见页」如实反映视口，不含 `keep_window` 的 MARGIN 缓冲。
+    pub fn current_page(&self) -> Option<(usize, usize)> {
+        if self.dims.is_empty() {
+            return None;
+        }
+        // 首帧 `scroll` 偏移为 0 → `first_visible_page` 起始页即第 1 页，布局后精确。
+        let scroll_y = f32::from(-self.scroll.offset().y);
+        let first = first_visible_page(&self.dims, self.page_width(), scroll_y);
+        Some((first + 1, self.dims.len()))
     }
 
     /// 是否已加载完成（测试用）。
