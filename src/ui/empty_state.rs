@@ -6,8 +6,9 @@
 //! 与 P2 图标（1.5px Fluent 线性描边）共用同一套灰蓝语言。
 //!
 //! 两个入口：
-//! - [`empty_state_hero`]：正文区整屏空态（无标签页 / 未命名空文档）——160×120 固定
-//!   插图 + 主/副文案 + 可选「打开文件…」按钮；随窗口自适应居中，仅一次透明度淡入。
+//! - [`empty_state_hero`]：正文区整屏空态（零选项卡欢迎页）——160×120 固定
+//!   插图 + 主/副文案 + 可选提示行 + 可选入口按钮（「打开文件…」/「新建文件」）+ 可选
+//!   **双击**回调；随窗口自适应居中，仅一次透明度淡入。
 //! - [`compact_empty_state`]：侧栏窄面板空态（空目录 / 无搜索命中）——小号灰图标 +
 //!   弱化文案，与正文区空态同款灰阶视觉。
 
@@ -141,17 +142,26 @@ pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
         .into_any_element()
 }
 
-/// 正文区整屏空态：插图 + 主文案 + 副文案（快捷键提示）+ 可选入口按钮。
+/// 正文区整屏空态：插图 + 主文案 + 副文案（快捷键提示）+ 可选提示行 + 可选入口按钮。
 /// 铺满宿主并自适应居中；仅一次透明度淡入（克制——只动绘制、不碰布局）。
+/// - `hint`：主/副文案下方一行弱色小字提示（如「双击新建文件」），`None` 不渲染。
+/// - `on_double_click`：欢迎页根元素（`empty-state`）的鼠标左键**双击**回调
+///   （以 `MouseDownEvent.click_count >= 2` 判定，与编辑区双击同一套语义）。回调
+///   由旁路 `Entity::update` 驱动宿主状态，不应 `stop_propagation`（欢迎页是整屏
+///   覆盖元素，单击/按钮互不干扰）。
 pub(crate) fn empty_state_hero(
     main: &str,
     sub: &str,
     action: Option<gpui::AnyElement>,
+    hint: Option<&str>,
+    on_double_click: Option<Box<dyn Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App)>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let c = Theme::global(cx).colors;
     let fg: Hsla = c.fg.into();
     let muted: Hsla = c.fg_muted.into();
+    // 提示行取最弱一档灰（插图正文线的同款语义 token），字号再小一档。
+    let hint_color: Hsla = c.fg_disabled.into();
 
     let mut root = div()
         .id("empty-state")
@@ -178,8 +188,21 @@ pub(crate) fn empty_state_hero(
                 .text_color(muted)
                 .child(sub.to_string()),
         );
+    if let Some(h) = hint {
+        root = root.child(
+            div()
+                .id("empty-hint")
+                .debug_selector(|| "empty-hint".into())
+                .text_size(px(11.))
+                .text_color(hint_color)
+                .child(h.to_string()),
+        );
+    }
     if let Some(a) = action {
         root = root.child(a);
+    }
+    if let Some(dbl) = on_double_click {
+        root = root.on_mouse_down(gpui::MouseButton::Left, dbl);
     }
     root.with_spring(
         "empty-state-fade",
@@ -237,7 +260,7 @@ mod tests {
                 .w(px(400.))
                 .h(px(400.))
                 .child(empty_illustration(cx))
-                .child(empty_state_hero("主", "副", None, cx))
+                .child(empty_state_hero("主", "副", None, Some("双击新建文件"), None, cx))
                 .child(compact_empty_state("compact-test", IconName::Search, "无结果", cx))
         }
     }
@@ -274,6 +297,10 @@ mod tests {
             assert!(
                 cx.debug_bounds("empty-state").is_some(),
                 "英雄空态应渲染（{dark}）"
+            );
+            assert!(
+                cx.debug_bounds("empty-hint").is_some(),
+                "提示行应渲染（{dark}）"
             );
             assert!(
                 cx.debug_bounds("compact-test").is_some(),

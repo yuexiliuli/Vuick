@@ -605,24 +605,28 @@ impl EditorApp {
             },
         ));
         if let Some(first_tab) = first_tab {
+            // 拆出/拖拽产生的独立窗口：首个选项卡直接收纳（不额外建空选项卡）。
             app.adopt_tab(first_tab, Some(window), cx);
-        } else {
-            app.make_tab(window, cx);
         }
+        // 不再给普通窗口预建初始空选项卡：新模型下启动即「零选项卡 → 欢迎页」，
+        // 只有用户点了「新建文件」、双击欢迎页或打开文件（内部 `open_file` → `make_tab`）
+        // 才出现第一个选项卡（见 `render_body`：`tabs.is_empty()` 整屏欢迎页）。
 
-        // 命令行参数：第一个参数作为初始打开文件（复用首个空选项卡，不额外新建）
+        // 命令行参数：第一个参数作为初始打开文件（`open_file` 新建一个选项卡载入；
+        // 之前的「复用首个空选项卡」随零 tab 启动模型一并移除——效果等价，都是只留
+        // 打开的那个文件选项卡）。
         if !is_detached {
             let mut args = std::env::args_os();
             args.next(); // 跳过程序名
             if let Some(first) = args.next() {
                 let p = PathBuf::from(&first);
                 if p.is_file() {
-                    app.open_file_in_tab(0, &p.to_string_lossy(), window, cx);
+                    app.open_file(&p.to_string_lossy(), window, cx);
                 }
             }
             // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：打开文件后
             // 立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
-            if std::env::var_os("WY_AUTOTEST").is_some() && app.is_markdown_tab(0) {
+            if std::env::var_os("WY_AUTOTEST").is_some() && app.is_markdown_tab(app.active_tab) {
                 app.toggle_live_test(window, cx);
             }
         }
@@ -1074,7 +1078,8 @@ impl EditorApp {
     }
 
     /// 把选项卡拆进一个新开的独立窗口：窗口左上角跟随鼠标释放位置（屏幕坐标 =
-    /// 源窗口屏幕左上角 + 拖放点的窗口内坐标）；本窗口若已没有选项卡则补一个空选项卡。
+    /// 源窗口屏幕左上角 + 拖放点的窗口内坐标）；本窗口落下最后一个选项卡（`tabs`
+    /// 变空）即回到零选项卡「欢迎页」——不再补空选项卡（与关闭最后一项语义一致）。
     fn split_tab_to_new_window(
         &mut self,
         payload: DetachedTab,
@@ -1082,10 +1087,7 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.tabs.is_empty() {
-            self.make_tab(window, cx);
-        }
-        // 主窗口剩下的选项卡接管焦点（被拖走的选项卡已从 tabs 移除）
+        // 主窗口剩下的选项卡接管焦点；零选项卡时 `activate_tab` 空返回（欢迎页）。
         self.activate_tab(self.active_tab, window, cx);
         let src_bounds = window.bounds();
         let bounds = Bounds {
@@ -1608,12 +1610,16 @@ impl EditorApp {
         }
     }
 
-    /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单共用）。
+    /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单 / 命令面板共用）。
     /// 会先激活该选项卡，再翻转其 `preview_on`。
     /// EPUB（`readonly_preview`）：正文只在预览区、编辑区为空，翻转预览无意义，
     /// 点击仅重新同步内容（持久保持全屏预览，不会落入空白编辑区）。
     fn toggle_preview_for_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.activate_tab(idx, window, cx);
+        // 零选项卡（欢迎页）下「预览」无对象：菜单/命令面板都可达这里，先兜底返回。
+        if self.tabs.get(idx).is_none() {
+            return;
+        }
         let readonly = self.tabs.get(idx).map(|t| t.readonly_preview).unwrap_or(false);
         let preview_on = {
             let tab = &mut self.tabs[idx];
@@ -2465,27 +2471,13 @@ impl Render for EditorApp {
 }
 
 impl EditorApp {
-    /// 内容区三态：实时编辑占满 / 预览分屏（EPUB 等可全屏预览）/ 纯编辑占满。
+    /// 内容区三态：有选项卡 → 实时编辑占满 / 预览分屏（EPUB 等全屏预览）/ 纯编辑占满；
+    /// 零选项卡 → 欢迎页整屏占满正文区（不渲染编辑区）。
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        // 空态（无标签页 / 未命名空文档）：编辑区照常渲染作底层（保留元素树——键位、
-        // 焦点与动作分派行为与原有完全一致，绝不误伤编辑/预览路径），上面再铺一层
-        // 微软风欢迎页覆盖层（插图 + 文案 + 「打开文件…」按钮），纯视觉占位。
-        if self.is_empty_body(cx) {
-            let pane = if self.tabs.is_empty() {
-                // 防御：真正「无标签页」时不渲染编辑区（正常流程恒有 ≥1 个空选项卡）。
-                None
-            } else {
-                Some(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_h(px(0.))
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .child(self.render_editor_pane(window, 1.0, cx)),
-                )
-            };
-            let hero = self.render_empty_state(cx);
+        // 新模型：欢迎页只在「零选项卡」时呈现。只要有 ≥1 个选项卡——哪怕新建出的
+        // 空白未命名文档——就直接渲染编辑区（可键入），绝不叠欢迎页（原 `is_empty_body`
+        // 把「未命名空文档」也算空态的语义已被模型 3 取代：有 tab 即不显示欢迎页）。
+        if self.tabs.is_empty() {
             return div()
                 .id("app-empty-body")
                 .debug_selector(|| "app-empty-body".into())
@@ -2495,8 +2487,7 @@ impl EditorApp {
                 .min_h(px(0.))
                 .min_w(px(0.))
                 .overflow_hidden()
-                .children(pane)
-                .child(div().absolute().inset_0().child(hero))
+                .child(self.render_empty_state(cx))
                 .into_any_element();
         }
         let live_edit = self
@@ -2594,35 +2585,15 @@ impl EditorApp {
         }
     }
 
-    /// 正文区是否处于「无内容」空态：无任何选项卡，或当前选项卡是「未命名且从未动过」
-    /// 的空文档（无文件路径、未编辑、未开预览、无 PDF/图片/视频，编辑区正文为空——
-    /// 即用户第一次打开应用、或关闭全部选项卡后落到的状态）。有内容的路径一律原样
-    /// 渲染，绝不误伤：已命名（哪怕内容为空）的文件、编辑过（`dirty`）的未命名文档、
-    /// 只读预览（EPUB/PDF）、媒体查看器都不算空态。
-    fn is_empty_body(&self, cx: &App) -> bool {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
-            return true;
-        };
-        if tab.file_path.is_some()
-            || tab.dirty
-            || tab.preview_on
-            || tab.readonly_preview
-            || tab.pdf_preview.is_some()
-            || tab.image_viewer.is_some()
-        {
-            return false;
-        }
-        #[cfg(feature = "video")]
-        if tab.video_viewer.is_some() {
-            return false;
-        }
-        tab.editor.read(cx).text().len() == 0
-    }
-
-    /// 正文区空态占位（欢迎页）：自绘插图 + 主/副文案 + 「打开文件…」按钮。
-    /// 按钮直接触发系统打开对话框（`open_dialog`）——空态的唯一价值点是把用户
-    /// 一步带进阅读，不要求先知道快捷键。按钮外包一层同名 div 并挂 `debug_selector`：
-    /// `debug_bounds` 只收录 debug_selector（`Button` 内部 id 不可见），测试据此定位。
+    /// 正文区欢迎页：自绘插图 + 主/副文案 + 提示行 + 「打开文件…」+「新建文件」两个按钮。
+    /// 只在「零选项卡」时被 `render_body` 调用（新模型：只要有选项卡——哪怕空白未命名
+    /// 文档——就渲染编辑区，绝不叠欢迎页）。「打开文件…」直接触发系统打开对话框
+    /// （`open_dialog`）；「新建文件」/ 根元素**双击**都走 `new_tab`——新建即空未命名
+    /// 选项卡、编辑区聚焦、可立即键入（用户痛点「多一步双击」由双击/按钮消解，不
+    /// 再引入第二层「进入已存在空 tab」的旧语义）。按钮外包同名 div 并挂 `debug_selector`
+    /// 供测试定位（`debug_bounds` 只收录 debug_selector，`Button` 内部 id 不可见）。
+    /// 双击回调经 `Entity::update` 回写（`empty_state_hero` 是统计组件、无视图上下文，
+    /// 不能用 `cx.listener`）；不 `stop_propagation`，与编辑区单击/按钮点击互不干扰。
     fn render_empty_state(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let open_btn = div()
             .id("empty-open-btn")
@@ -2642,10 +2613,50 @@ impl EditorApp {
                     ),
             )
             .into_any_element();
+        let new_btn = div()
+            .id("empty-new-btn")
+            .debug_selector(|| "empty-new-btn".into())
+            .flex()
+            .child(
+                crate::ui::button::Button::new("empty-new-btn-action")
+                    .label("新建文件")
+                    .h(px(32.))
+                    .px_4()
+                    .rounded_md()
+                    .text_size(px(13.))
+                    .on_click(
+                        cx.listener(|this: &mut EditorApp, _: &gpui::ClickEvent, window, cx| {
+                            this.new_tab(window, cx);
+                        }),
+                    ),
+            )
+            .into_any_element();
+        // 两个按钮并排：保留「打开文件…」原位置，右侧新增「新建文件」。
+        let actions = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(open_btn)
+            .child(new_btn)
+            .into_any_element();
+        // 双击回调捕获实体句柄：事件在渲染之后的输入分发阶段才触发，经 `Entity::update`
+        // 回写（不能用 `cx.listener`——`empty_state_hero` 是统计组件、无视图上下文）。
+        let app = cx.entity();
         crate::ui::empty_state::empty_state_hero(
             "打开文件开始阅读",
             "按 Ctrl+O 打开文件 · Ctrl+P 打开文件快选",
-            Some(open_btn),
+            Some(actions),
+            Some("双击空白处新建文件"),
+            Some(Box::new(
+                move |ev: &gpui::MouseDownEvent, window: &mut gpui::Window, cx: &mut gpui::App| {
+                    if ev.click_count >= 2 {
+                        // 双击欢迎页 = 新建文件选项卡（`new_tab` 内部已 `make_tab`，
+                        // 并把焦点放到新编辑区，开箱即输入）。
+                        app.update(cx, |this, cx| this.new_tab(window, cx));
+                    }
+                },
+            )),
             cx,
         )
     }

@@ -2,7 +2,7 @@
 
     use super::*;
     use crate::actions::{
-        MoveDown, Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo,
+        MoveDown, NewFile, Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo,
     };
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
@@ -13,6 +13,10 @@
 
     /// 创建一个以 `crate::ui::root::Root` 为窗口根视图的编辑应用，
     /// 返回视图实体与该窗口的 `VisualTestContext`（后续用其驱动渲染/事件）。
+    ///
+    /// 新模型下启动为零选项卡（欢迎页），但绝大多数既有测试假定「初始有一个未命名空
+    /// 选项卡」可直接 `tabs[0]` 键入——此处显式 `make_tab` 补建这个空选项卡（行为与旧的
+    /// 启动即建 tab 一致）。真正要测「零 tab 欢迎页」的用 [`add_app_zero_tabs`]。
     fn add_app(cx: &mut TestAppContext) -> (Entity<EditorApp>, &mut VisualTestContext) {
         let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<EditorApp>>>> =
             std::rc::Rc::default();
@@ -23,6 +27,33 @@
         });
         let _ = root;
         let app = holder.borrow().clone().unwrap();
+        // 在首帧渲染前补建初始空选项卡（同款「窗口建立后、渲染前」模式，见既有测试
+        // 对 `new_tab` 的调用：窗口 + 实体上下文都已就绪，`make_tab` 只造待渲染实体）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.make_tab(window, cx);
+            });
+        });
+        (app, cx)
+    }
+
+    /// 创建**零选项卡**的编辑应用（真实启动路径）：同 `add_app` 装配，但**不**预建
+    /// 空选项卡——启动即「零 tab → 欢迎页」。零 tab 断言专用；需编辑区先 `new_tab`
+    /// / 点「新建文件」/ 双击欢迎页。
+    fn add_app_zero_tabs(cx: &mut TestAppContext) -> (Entity<EditorApp>, &mut VisualTestContext) {
+        let holder: std::rc::Rc<std::cell::RefCell<Option<Entity<EditorApp>>>> =
+            std::rc::Rc::default();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let app = cx.new(|cx| EditorApp::new(window, cx));
+            *holder.borrow_mut() = Some(app.clone());
+            crate::ui::root::Root::new(app, window, cx)
+        });
+        let _ = root;
+        let app = holder.borrow().clone().unwrap();
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            "零选项卡助手应保持零 tab"
+        );
         (app, cx)
     }
 
@@ -1739,23 +1770,22 @@
         let _ = std::fs::remove_file(&f);
     }
 
-    /// 空状态（无标签页 / 未命名空文档）：正文区渲染欢迎页占位——自绘插图（160×120）、
-    /// 主/副文案与「打开文件…」按钮都在；点击按钮触发 `open_dialog`（测试为 stub，
-    /// 只计数不真弹窗）；一旦输入内容，空态立即消失（绝不误伤有内容路径）。
+    /// 零选项卡欢迎页（回归 1）：正文区整屏渲染欢迎页——插图（160×120）、主/副文案、
+    /// 「打开文件…」与「新建文件」按钮都在，且**没有** `editor-area`（零 tab 不渲染编辑区）；
+    /// 点「打开文件…」触发 `open_dialog`（测试为 stub，只计数不真弹窗、不建 tab）。
     #[gpui::test]
-    async fn empty_state_hero_renders_and_button_opens_dialog(cx: &mut TestAppContext) {
+    async fn zero_tab_welcome_renders_and_open_button_opens_dialog(cx: &mut TestAppContext) {
         init_test(cx);
-        let (app, cx) = add_app(cx);
+        let (app, cx) = add_app_zero_tabs(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
-        for _ in 0..5 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-            cx.run_until_parked();
-        }
-        // 空态容器 + 插图 + 按钮都渲染且插图非零尺寸
+        settle_frames(cx, 5);
         assert!(
             cx.debug_bounds("empty-state").is_some(),
-            "未命名空文档应显示空态欢迎页"
+            "零选项卡应显示欢迎页"
+        );
+        assert!(
+            cx.debug_bounds("editor-area").is_none(),
+            "零选项卡不应渲染编辑区"
         );
         let illus = cx
             .debug_bounds("empty-illustration")
@@ -1769,7 +1799,14 @@
             .expect("应渲染「打开文件…」按钮");
         assert!(
             btn.size.width > px(0.) && btn.size.height > px(0.),
-            "按钮应有尺寸，实际={btn:?}"
+            "「打开文件…」按钮应有尺寸，实际={btn:?}"
+        );
+        let newbtn = cx
+            .debug_bounds("empty-new-btn")
+            .expect("应渲染「新建文件」按钮");
+        assert!(
+            newbtn.size.width > px(0.) && newbtn.size.height > px(0.),
+            "「新建文件」按钮应有尺寸，实际={newbtn:?}"
         );
         // 点击按钮 → 触发 open_dialog（计数断言；测试 stub 不弹原生对话框）
         cx.simulate_click(btn.center(), Default::default());
@@ -1778,23 +1815,184 @@
         }
         let calls = cx.update(|_w, cx| app.read(cx).open_dialog_calls);
         assert_eq!(calls, 1, "点击「打开文件…」应触发一次 open_dialog");
-        // 输入内容 → 空态消失（回到正常编辑区）。
-        // 用 insert_text（真实键入路径，会 notify 并置脏）而非 set_text（静默换缓冲、
-        // 不触发重渲染，无法断言「空态随内容消失」这个渲染行为）。
-        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
-        cx.update(|_, cx| {
-            editor.update(cx, |ed, cx| ed.insert_text("x", cx));
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            "点「打开文件…」只弹系统对话框、不应新建选项卡"
+        );
+    }
+
+    /// 向窗口派发一次**真实双击**（mousedown `click_count=2` + mouseup `click_count=2`）。
+    /// 走 `simulate_event` 的完整分发路径（`window.dispatch_event`），双击识别与编辑器
+    /// 同套语义（`MouseDownEvent.click_count >= 2`）；`simulate_click` 恒为单击，无法覆盖。
+    fn simulate_double_click(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
         });
-        for _ in 0..3 {
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+        });
+    }
+
+    /// 渲染若干帧（等动画/重绘收敛后再读 debug_bounds）。
+    fn settle_frames(cx: &mut VisualTestContext, n: usize) {
+        for _ in 0..n {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
+    }
+
+    /// 打开零选项卡时欢迎页的焦点句柄回归：零 tab 下 `editor_focus_handle` 回退到
+    /// 应用根焦点（不 Panic、可聚焦），保证 Ctrl+N 等在欢迎页可正常派发。
+    fn focus_app_root(cx: &mut VisualTestContext, app: &Entity<EditorApp>) {
+        cx.update(|window, cx| {
+            let h = app.read(cx).editor_focus_handle(cx);
+            window.focus(&h, cx);
+        });
+    }
+
+    /// 回归 2：点欢迎页「新建文件」→ 出现 1 个选项卡、欢迎页消失、编辑区渲染且可聚焦、
+    /// 真实键入生效。
+    #[gpui::test]
+    async fn new_file_button_creates_editable_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 5);
+        assert!(
+            cx.debug_bounds("empty-state").is_some(),
+            "初始应显示欢迎页"
+        );
+        // 点「新建文件」按钮（用其外包定位元素，真实点击路径）。
+        let btn = cx
+            .debug_bounds("empty-new-btn")
+            .expect("应渲染「新建文件」按钮");
+        cx.simulate_click(btn.center(), Default::default());
+        settle_frames(cx, 5);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "点「新建文件」应新建 1 个选项卡"
+        );
         assert!(
             cx.debug_bounds("empty-state").is_none(),
-            "有内容后空态应消失"
+            "欢迎页应消失（有 tab 即不再显示）"
+        );
+        assert!(
+            cx.debug_bounds("editor-area").is_some(),
+            "应渲染编辑区"
+        );
+        // 焦点应落在新编辑区（开箱即输入）。
+        let focused = cx.update(|window, cx| {
+            app.read(cx).tabs[0].editor.read(cx).focus_handle().is_focused(window)
+        });
+        assert!(focused, "新建后编辑区应获得焦点");
+        // 直接键入（真实键入路径）→ 内容写入且欢迎页不回来。
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("hi", cx)));
+        settle_frames(cx, 3);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs[0].editor.read(cx).value().to_string()),
+            "hi",
+            "新建选项卡应可直接键入"
+        );
+        assert!(
+            cx.debug_bounds("empty-state").is_none(),
+            "输入后欢迎页绝不出现（模型 3）"
         );
     }
+
+    /// 回归 3：**双击**欢迎页（空白处，避开按钮）＝新建文件选项卡——与「新建文件」
+    /// 按钮同语义（出现 tab、欢迎页消失、编辑区渲染）。
+    #[gpui::test]
+    async fn double_click_welcome_creates_tab(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 5);
+        assert!(cx.debug_bounds("empty-state").is_some(), "初始应显示欢迎页");
+        // 双击按钮上方的空白处（按钮行下面约在正文区中央；选偏上空白区避开按钮）
+        simulate_double_click(cx, gpui::Point::new(px(400.), px(200.)));
+        settle_frames(cx, 5);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "双击欢迎页应新建 1 个选项卡"
+        );
+        assert!(cx.debug_bounds("empty-state").is_none(), "欢迎页应消失");
+        assert!(cx.debug_bounds("editor-area").is_some(), "应渲染编辑区");
+    }
+
+    /// 回归 4：关闭**全部**选项卡 → 回到欢迎页（零 tab、无编辑区、不 panic、不退出）。
+    #[gpui::test]
+    async fn closing_last_tab_returns_to_welcome(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx); // add_app 预建 1 个空未命名选项卡
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 5);
+        assert!(cx.debug_bounds("editor-area").is_some(), "有 tab 时应渲染编辑区");
+        assert!(cx.debug_bounds("empty-state").is_none(), "有 tab 时绝不显示欢迎页");
+        // 未编辑不弹保存框：close_tab 直通 remove_tab（真实用户「关闭最后一个 tab」路径）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.close_tab(0, window, cx));
+        });
+        settle_frames(cx, 5);
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tabs.is_empty()),
+            "关闭最后一个选项卡后应零 tab"
+        );
+        assert!(cx.debug_bounds("empty-state").is_some(), "应回到欢迎页");
+        assert!(cx.debug_bounds("editor-area").is_none(), "零 tab 无编辑区");
+    }
+
+    /// 回归 5：**只要有 ≥1 个选项卡**（含新建出的空未命名文档）就绝不显示欢迎页——
+    /// 空未命名 tab 直接是编辑区（可键入），无第二层双击步骤。
+    #[gpui::test]
+    async fn any_tab_suppresses_welcome(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx); // 1 个空未命名选项卡
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 5);
+        assert_eq!(cx.update(|_w, cx| app.read(cx).tabs.len()), 1, "预建 1 个空未命名选项卡");
+        assert!(cx.debug_bounds("editor-area").is_some(), "空未命名 tab 也直接渲染编辑区");
+        assert!(cx.debug_bounds("empty-state").is_none(), "有 tab（哪怕空未命名）就不显示欢迎页");
+        // 键入后依旧不显示欢迎页（新模型没有「欢迎页盖在有内容上」的路径）。
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[0].editor.clone());
+        cx.update(|_, cx| editor.update(cx, |ed, cx| ed.insert_text("x", cx)));
+        settle_frames(cx, 3);
+        assert!(cx.debug_bounds("empty-state").is_none(), "输入后仍不显示欢迎页");
+    }
+
+    /// 回归 6：Ctrl+N（`NewFile` 动作）在欢迎页（零 tab、焦点在应用根）可用——
+    /// 新建选项卡、欢迎页消失、编辑区渲染。
+    #[gpui::test]
+    async fn ctrl_n_works_from_welcome(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 5);
+        assert!(cx.debug_bounds("empty-state").is_some(), "初始应显示欢迎页");
+        // 零 tab 下焦点回退到应用根（`editor_focus_handle` → 根句柄）
+        focus_app_root(cx, &app);
+        cx.run_until_parked();
+        cx.dispatch_action(NewFile);
+        settle_frames(cx, 5);
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).tabs.len()),
+            1,
+            "Ctrl+N 应从欢迎页新建选项卡"
+        );
+        assert!(cx.debug_bounds("empty-state").is_none(), "欢迎页应消失");
+        assert!(cx.debug_bounds("editor-area").is_some(), "应渲染编辑区");
+    }
+
 
     /// 目录空态：打开无任何标题的 Markdown（有内容但无目录节点）→ 侧栏目录面板
     /// 显示「灰色图标 + 文案」空态占位（跨无标题文档 / PDF 无书签 / 无文档三态共用）。

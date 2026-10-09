@@ -302,7 +302,7 @@ impl EditorApp {
     /// 3. **收尾**：md 后台 `scan_blocks` 建索引 → `finish_file_text` O(1) 装预览 +
     ///    最终状态。
     ///
-    /// `idx` 处须已存在选项卡（`open_file` 新建 / `open_file_in_tab` 复用）。
+    /// `idx` 处须已存在选项卡（由 `open_file` 先 `make_tab` 新建）。
     fn spawn_progressive_open(
         &mut self,
         idx: usize,
@@ -756,54 +756,6 @@ impl EditorApp {
         self.status = SharedString::from(format!("正在打开 PDF：{}…", p.display()));
         self.status_ok = true;
         self.load_pdf(idx, &p, window, cx);
-    }
-
-    /// 把文件内容载入已存在的选项卡（读取失败仅提示，保留原选项卡）。
-    pub(super) fn open_file_in_tab(
-        &mut self,
-        idx: usize,
-        path: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let p = PathBuf::from(path.trim());
-        if Self::is_epub_path(&p) {
-            match crate::epub::parse_epub_file(&p) {
-                Ok(doc) => self.load_epub(idx, &p, doc, window, cx),
-                Err(e) => {
-                    self.status = SharedString::from(format!("打开失败：{e}"));
-                    self.status_ok = false;
-                    cx.notify();
-                }
-            }
-            return;
-        }
-        if Self::is_pdf_path(&p) {
-            self.open_pdf_async(idx, p.clone(), window, cx);
-            return;
-        }
-        if Self::is_image_path(&p) {
-            self.load_image(idx, &p, window, cx);
-            return;
-        }
-        #[cfg(feature = "video")]
-        if Self::is_video_path(&p) {
-            self.load_video(idx, &p, window, cx);
-            return;
-        }
-        // 大文件（按字节阈值判断）：后台打开（复用已有选项卡），
-        // 分块读盘→归一化→按块统计→逐块装配 全在后台线程，UI 每块只做 O(块大小) 追加。
-        if is_large_path(&p) {
-            self.spawn_progressive_open(idx, p, window, cx);
-            return;
-        }
-        match fs::read_to_string(&p) {
-            Ok(text) => {
-                let prep = prepare_text(Self::normalize_newlines(&text));
-                self.load_file_text(idx, &p, prep, window, cx, false);
-            }
-            Err(e) => self.report_open_failure(&p, &e, window, cx),
-        }
     }
 
     /// 打开文件：新建一个文件选项卡并在其中载入文件内容，随后把焦点移到新选项卡的编辑区。

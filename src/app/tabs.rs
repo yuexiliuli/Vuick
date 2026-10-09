@@ -182,38 +182,7 @@ impl EditorApp {
             return;
         }
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
-        if self.tabs.len() == 1 {
-            let tab = &mut self.tabs[0];
-            tab.editor.update(cx, |ed, _cx| {
-                ed.set_text("");
-            });
-            tab.md_preview.update(cx, |view, cx| view.set_source("", cx));
-            if let Some(pdf) = tab.pdf_preview.take() {
-                pdf.update(cx, |view, cx| view.release(window, cx));
-            }
-            if let Some(img) = tab.image_viewer.take() {
-                img.update(cx, |view, cx| view.release(window, cx));
-            }
-            // A2：右栏 WyEditor 预览随选项卡复位释放（同 md_preview 释放内存）。
-            tab.md_wy = None;
-            tab.md_wy_vscroll = gpui::ScrollHandle::new();
-            tab.file_path = None;
-            tab.dirty = false;
-            tab.content = SharedString::default();
-            tab.line_count = 1;
-            tab.char_count = 0;
-            tab.cursor_row = 0;
-            tab.cursor_col = 0;
-            tab.preview_on = false;
-            tab.preview_fullscreen = false;
-            tab.readonly_preview = false;
-            let focus = tab.editor.read(cx).focus_handle();
-            window.focus(&focus, cx);
-            self.status = SharedString::from("已关闭");
-            self.status_ok = true;
-            cx.notify();
-            return;
-        }
+        // 释放被移除选项卡持有的重资源（PDF 纹理 / 图片解码），实体随后随之释放。
         if let Some(pdf) = self.tabs[idx].pdf_preview.take() {
             pdf.update(cx, |view, cx| view.release(window, cx));
         }
@@ -221,6 +190,17 @@ impl EditorApp {
             img.update(cx, |view, cx| view.release(window, cx));
         }
         self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            // 关闭最后一个选项卡 → 零选项卡，回到欢迎页：不退出、不新建空选项卡、
+            // 不 panic。此时没有编辑区可聚焦，焦点给应用根（窗口级快捷键照样可用）。
+            self.active_tab = 0;
+            let root = self.focus_handle(cx);
+            window.focus(&root, cx);
+            self.status = SharedString::from("已关闭");
+            self.status_ok = true;
+            cx.notify();
+            return;
+        }
         if idx < self.active_tab {
             self.active_tab -= 1;
         } else if self.active_tab >= self.tabs.len() {
