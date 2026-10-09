@@ -2041,10 +2041,6 @@ impl EditorApp {
     fn mica_bar_bg(&self) -> gpui::Hsla {
         self.bar_bg().opacity(self.mica_alpha())
     }
-    /// 状态栏背景（Mica 半透明版）。
-    fn mica_surface_bg(&self) -> gpui::Hsla {
-        self.surface_bg().opacity(self.mica_alpha())
-    }
 
     /// 自绘 Mica 材质层：窗口基底用 N 段半透明色带叠出柔和垂向渐变（纯应用内绘制，
     /// 不调用系统 Mica/acrylic/DWM）。放在最底层，chrome 半透明表面叠其上形成玻璃感。
@@ -2120,11 +2116,6 @@ impl EditorApp {
     /// 激活选项卡边框。
     fn tab_active_border(&self) -> gpui::Hsla {
         self.chrome().tab_active_border.into()
-    }
-
-    /// 状态栏/其他整体面板背景。
-    fn surface_bg(&self) -> gpui::Hsla {
-        self.chrome().surface_bg.into()
     }
 
     /// 切换黑白（深色/浅色）主题：作为 light↔dark 两态切换（退出「跟随」），

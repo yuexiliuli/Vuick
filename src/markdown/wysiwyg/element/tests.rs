@@ -2,7 +2,7 @@
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
     use super::{
         build_frame, caret_geometry, cell_selection_display, display_to_source, layout_has_notdef,
-        prewarm_band, source_offset_at, source_offset_at_local, source_to_display,
+        prewarm_band, source_offset_at_local, source_to_display,
         table_block_height, table_cell_x0, table_row_top, WyEditor,
     };
     use gpui::{

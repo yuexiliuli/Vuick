@@ -69,10 +69,18 @@ impl EditorApp {
         let middle = self.status_bar_middle(epub_page, pdf_page, cursor_pos);
 
         let mut root = div()
+            .id("status-bar")
+            .debug_selector(|| "status-bar".into())
             .h(px(28.))
-            .bg(self.mica_surface_bg())
-            .border_t_1()
-            .border_color(bar_border)
+            // 外壳卡片化：底缘贴窗直角（mb 0），左/右/上留卡间间距，上缘圆角、下缘直角。
+            .ml(px(crate::ui::shell::CARD_GAP))
+            .mr(px(crate::ui::shell::CARD_GAP))
+            .mt(px(crate::ui::shell::CARD_GAP))
+            .rounded_tl(px(crate::ui::shell::CARD_RADIUS))
+            .rounded_tr(px(crate::ui::shell::CARD_RADIUS))
+            .border_1()
+            .border_color(crate::ui::shell::card_border(cx))
+            .bg(crate::ui::shell::card_surface(cx))
             .flex()
             .flex_row()
             .items_center()

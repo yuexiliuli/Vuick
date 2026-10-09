@@ -215,8 +215,6 @@ pub struct ChromeColors {
     pub bar_border: Rgba,
     /// 编辑器/预览面板背景
     pub panel_bg: Rgba,
-    /// 状态栏等整体面板背景
-    pub surface_bg: Rgba,
     /// 主要文字
     pub text_primary: Rgba,
     /// 次要/弱化文字
@@ -269,7 +267,6 @@ impl ChromeColors {
             bar_bg: rgb(0xf5f5f5),
             bar_border: c.border,
             panel_bg: c.bg,
-            surface_bg: rgb(0xf5f5f5),
             text_primary: c.fg,
             text_minor: c.fg_muted,
             text_tertiary: rgb(0x8a8a8a),
@@ -298,7 +295,6 @@ impl ChromeColors {
             bar_bg: rgb(0x202020),
             bar_border: c.border,
             panel_bg: c.bg,
-            surface_bg: rgb(0x202020),
             text_primary: c.fg,
             text_minor: c.fg_muted,
             text_tertiary: rgb(0x6e6e6e),

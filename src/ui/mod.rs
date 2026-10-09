@@ -17,6 +17,7 @@
 //! - [`palette`]：命令面板（`CommandPalette`/`PaletteMode`/`PaletteItem`），居中浮层，命令 + 文件快选两用
 //! - [`root`]：窗口根视图（每窗口第一层宿主），替换 `gpui_component::Root`
 //! - [`input`]：单行文本输入框（搜索框），替换 `gpui_component::input::Input`/`InputState`
+//! - [`shell`]：外壳卡片化共享几何（卡间距/圆角）与「三点分隔手柄」（splitter/resize 复用）
 //!
 //! # 组件约定（新组件照此执行）
 //! 1. **一文件一组件**，文件放在本目录（或独立子目录），公开面收敛到 `ui::<模块>`，
@@ -45,5 +46,6 @@ pub mod notification;
 pub mod palette;
 pub mod root;
 pub mod scrollbar;
+pub mod shell;
 pub mod theme;
 pub mod tooltip;
