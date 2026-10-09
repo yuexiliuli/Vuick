@@ -43,3 +43,4 @@ pub mod palette;
 pub mod root;
 pub mod scrollbar;
 pub mod theme;
+pub mod tooltip;

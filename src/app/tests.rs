@@ -836,6 +836,111 @@
         );
     }
 
+    /// P2-9：活动栏「目录」图标悬停 → 200ms 防抖后出现 tooltip（浮在按钮右侧、不盖活动栏），
+    /// 移出立即消失。
+    #[gpui::test]
+    async fn activity_bar_tooltip_delayed_appear_and_hide(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let _ = app;
+        // 活动栏按钮中心（目录）
+        let btn = cx
+            .debug_bounds("sidebar-btn-toc")
+            .expect("活动栏应渲染目录按钮");
+        let c = btn.center();
+        // 初始无浮层
+        assert!(
+            cx.debug_bounds("tooltip-sidebar-btn-toc").is_none(),
+            "未悬停时不应渲染 tooltip"
+        );
+        // 悬停进入：防抖期内（< TOOLTIP_DELAY_MS=200ms）不显示
+        cx.simulate_mouse_move(c, None, Default::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(100));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-sidebar-btn-toc").is_none(),
+            "防抖期内（100ms<200ms）tooltip 不应出现"
+        );
+        // 时钟再推进超过防抖 → 浮层出现，且在按钮右缘（不盖活动栏本体）
+        cx.executor().advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let tip = cx
+            .debug_bounds("tooltip-sidebar-btn-toc")
+            .expect("延迟后 tooltip 应出现");
+        assert!(
+            tip.origin.x.as_f32() >= btn.origin.x.as_f32() + btn.size.width.as_f32(),
+            "tooltip 应贴按钮右缘（不盖活动栏），tip={tip:?} btn={btn:?}"
+        );
+        // 移出 → 立即消失
+        cx.simulate_mouse_move(gpui::point(px(8.), px(8.)), None, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-sidebar-btn-toc").is_none(),
+            "移出后 tooltip 应立即消失"
+        );
+    }
+
+    /// P2-9：tooltip 浮层不拦截点击——悬停显示 tooltip 后，点击活动栏「目录」按钮
+    /// 仍正常切换/收起目录面板（浮层无 hitbox、命中穿透）。
+    #[gpui::test]
+    async fn activity_bar_tooltip_does_not_block_click(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 悬停目录按钮 → 推进防抖 → tooltip 出现
+        let btn = cx
+            .debug_bounds("sidebar-btn-toc")
+            .expect("活动栏应渲染目录按钮");
+        cx.simulate_mouse_move(btn.center(), None, Default::default());
+        cx.executor().advance_clock(std::time::Duration::from_millis(400));
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("tooltip-sidebar-btn-toc").is_some(),
+            "tooltip 应已显示"
+        );
+        // tooltip 可见时点按钮本体 → 正常展开目录面板
+        cx.simulate_click(btn.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let mut panel_open = cx.update(|_w, cx| app.read(cx).sidebar.panel_open);
+        assert!(panel_open, "tooltip 可见时点击目录按钮仍应展开目录面板");
+        assert!(
+            cx.debug_bounds("sidebar-toc").is_some(),
+            "点击后应渲染目录面板"
+        );
+        // 再点一次 → 收起（往返可用，不因 tooltip 残留状态损坏点击）
+        cx.simulate_click(btn.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        panel_open = cx.update(|_w, cx| app.read(cx).sidebar.panel_open);
+        assert!(!panel_open, "再点一次应收起目录面板");
+    }
+
     /// A4：侧边栏 Markdown 目录**点击跳转**——条目走统一组件 WyEditor（源码行）：
     /// 点「# 大标题 18」（文中部）→ 右栏预览 `scroll_to_line` 滚动到该标题所在块
     /// （宿主滚动句柄从顶部偏离到负向偏移，预览跟随跳转）。

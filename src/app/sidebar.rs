@@ -247,11 +247,16 @@ impl EditorApp {
         let hover_fill: gpui::Hsla = c.hover_fill.into();
         let pressed_fill: gpui::Hsla = c.pressed_fill.into();
         let specs = [
-            (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc"),
-            (SidebarView::Search, IconName::Search, "sidebar-btn-search"),
+            (SidebarView::Toc, IconName::BookOpen, "sidebar-btn-toc", "目录"),
+            (
+                SidebarView::Search,
+                IconName::Search,
+                "sidebar-btn-search",
+                "搜索",
+            ),
         ];
         let mut btns: Vec<gpui::AnyElement> = Vec::with_capacity(2);
-        for (view, icon, id) in specs {
+        for (view, icon, id, label) in specs {
             let is_active = self.sidebar.panel_open && self.sidebar.view == view;
             // 活动项图标用主前景色（深色主题下近白），不变蓝
             let col = if is_active { fg } else { muted };
@@ -259,6 +264,9 @@ impl EditorApp {
             // P2-10：hover 状态跨帧记录 → 背景淡入。
             let btn_hover = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
             let btn_hovered = *btn_hover.read(cx);
+            // P2-9：tooltip 状态（同按钮 id 键控：延迟出现 300ms / 移出消失）。
+            let tip = crate::ui::tooltip::tooltip_state(id, window, cx);
+            let tip_on = crate::ui::tooltip::tooltip_visible(&tip, cx);
             let view_id = window.current_view();
             let btn = div()
                 .id(SharedString::from(id))
@@ -293,12 +301,18 @@ impl EditorApp {
                 }))
                 .on_hover({
                     let st = btn_hover.clone();
+                    let tip = tip.clone();
                     move |hovered, _w, cx| {
                         st.update(cx, |v, _| *v = *hovered);
+                        crate::ui::tooltip::tooltip_hover(&tip, *hovered, cx);
                         cx.notify(view_id);
                     }
                 })
-                .child(Icon::new(icon).size(px(22.)).text_color(col));
+                .child(Icon::new(icon).size(px(22.)).text_color(col))
+                // P2-9：tooltip 浮层（贴活动栏按钮右缘垂直居中；按钮 40×38）。
+                .child(crate::ui::tooltip::tooltip_layer(
+                    id, label, tip_on, 40.0, 38.0, cx,
+                ));
             btns.push(
                 hover_bg_fade(btn, format!("{id}-bg"), hover_fill, btn_hovered).into_any_element(),
             );
@@ -1000,9 +1014,14 @@ impl EditorApp {
         } else {
             "sidebar-search-pdf-next"
         };
+        // P2-9：tooltip 文案（上一处 / 下一处匹配）。
+        let label = if delta < 0 { "上一处匹配" } else { "下一处匹配" };
         // P2-10：hover 状态跨帧记录 → 背景淡入。
         let hover = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
         let hovered = *hover.read(cx);
+        // P2-9：tooltip 状态（同按钮 id 键控）。
+        let tip = crate::ui::tooltip::tooltip_state(id, window, cx);
+        let tip_on = crate::ui::tooltip::tooltip_visible(&tip, cx);
         let view_id = window.current_view();
         let btn = div()
             .id(SharedString::from(id))
@@ -1019,8 +1038,10 @@ impl EditorApp {
             .cursor(CursorStyle::PointingHand)
             .on_hover({
                 let st = hover.clone();
+                let tip = tip.clone();
                 move |h, _w, cx| {
                     st.update(cx, |v, _| *v = *h);
+                    crate::ui::tooltip::tooltip_hover(&tip, *h, cx);
                     cx.notify(view_id);
                 }
             })
@@ -1028,7 +1049,11 @@ impl EditorApp {
                 target.update(cx, |v, cx| v.move_match(delta, cx));
                 cx.notify();
             }))
-            .child(symbol);
+            .child(symbol)
+            // P2-9：tooltip 浮层（贴导航按钮右缘垂直居中；按钮 28×24）。
+            .child(crate::ui::tooltip::tooltip_layer(
+                id, label, tip_on, 28.0, 24.0, cx,
+            ));
         hover_bg_fade(btn, format!("{id}-bg"), active_bg, hovered).into_any_element()
     }
 
