@@ -1,7 +1,9 @@
 //! 单元测试（自 mod.rs 拆出，仅测试编译）。
 
     use super::*;
-    use crate::actions::{Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo};
+    use crate::actions::{
+        MoveDown, Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo,
+    };
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
@@ -726,6 +728,118 @@
         let _ = std::fs::remove_file(&txt);
     }
 
+    /// P2-11 Bug 回归：纯光标/选区移动（**不改文本**）后，状态栏中间区 `Ln x, Col y`
+    /// 数据源也必须即时刷新。此前只有文本变化（`EditorEvent::Edited`）才走
+    /// `on_editor_edited` 更新选项卡缓存；鼠标点击只发编辑器自身 `notify`、不发事件，
+    /// 状态栏重渲染时读到的还是旧缓存 → 行/列不变。
+    /// 本测试走真实路径：`simulate_mouse_down/up` 派发到编辑区元素 → `on_mouse_down`
+    /// 放下光标 → 新事件 `SelectionChanged` → app 订阅 `on_editor_selection_changed`
+    /// 刷新 `tabs[active].cursor_row/col`（状态栏 `Ln x, Col y` 由它 1:1 派生）。
+    #[gpui::test]
+    async fn status_bar_cursor_follows_mouse_click_and_arrow_and_tab_switch(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 多行文档：打开后光标在 (0,0)，随后点中段某行验证即时刷新。
+        let text = (0..60).map(|i| format!("行{i:02}")).collect::<Vec<_>>().join("\n");
+        let txt = std::env::temp_dir().join(format!(
+            "gpui-statusbar-click-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&txt, &text).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (row0, col0) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+        });
+        assert_eq!((row0, col0), (0, 0), "打开文件后光标应位于 (0,0)");
+        assert!(
+            cx.debug_bounds("status-cursor").is_some(),
+            "有内容文档应显示光标中间区"
+        );
+
+        // 鼠标点击第 20 行（0 基）行首偏 1 字符处 → 光标应落该行，状态栏数据源即刷。
+        let target_row = 20;
+        let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+        let (cw, lh, gutter) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = a.tabs[a.active_tab].editor.read(cx);
+            ed.test_metrics()
+        });
+        let click = gpui::Point::new(
+            gpui::px(ed_b.origin.x.as_f32() + gutter + cw),
+            gpui::px(ed_b.origin.y.as_f32() + (target_row as f32 + 0.5) * lh),
+        );
+        let mods = gpui::Modifiers::default();
+        cx.simulate_mouse_move(click, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_down(click, gpui::MouseButton::Left, mods);
+        cx.simulate_mouse_up(click, gpui::MouseButton::Left, mods);
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (row1, _col1) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+        });
+        assert_eq!(
+            row1, target_row,
+            "鼠标点击后光标行应即时跳到第 {target_row} 行（状态栏 Ln 数据源刷新）"
+        );
+        assert!(
+            cx.debug_bounds("status-cursor").is_some(),
+            "点击后状态栏光标中间区保持显示"
+        );
+
+        // 方向键向下：移动光标（不改文本）后仍即时刷新。
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.dispatch_action(MoveDown);
+        for _ in 0..4 {
+            cx.run_until_parked();
+        }
+        let (row2, _) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+        });
+        assert_eq!(row2, target_row + 1, "方向键下移后光标行应 +1（行数据刷新）");
+
+        // 切 tab：新打开的文件自动激活，其光标位置 (0,0) 即时落到状态栏数据源。
+        let md = std::env::temp_dir().join(format!(
+            "gpui-statusbar-switch-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, "# 新文件\n正文\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+        }
+        let (row3, col3) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs[a.active_tab].cursor_row, a.tabs[a.active_tab].cursor_col)
+        });
+        assert_eq!((row3, col3), (0, 0), "切到新选项卡后光标数据源应为其 (0,0)");
+        assert!(
+            cx.debug_bounds("status-cursor").is_some(),
+            "切 tab 后状态栏光标中间区仍显示"
+        );
+        let _ = std::fs::remove_file(&txt);
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// 当前选中的文件是 .md 时，选项卡栏最右侧出现眼睛图标，点击切换预览；非 .md 文件不出现。
     #[gpui::test]
     async fn md_tab_bar_shows_eye_and_toggles_preview(cx: &mut TestAppContext) {
@@ -1154,6 +1268,79 @@
             "移出后关闭图标应回落次要灰，实际 {:?}",
             away.close
         );
+    }
+
+    /// Win11 Fluent 行为：窗口控制钮组（最小化/最大化/关闭）右缘应**贴齐窗口右缘**，
+    /// 关闭钮右侧不得有可见 gap。回归：`render_title_bar` 根容器此前用 `px_2`（左+右
+    /// 各 8px），会在关闭钮右侧留下 8px 右内边距；改为仅左内边距 `pl_2` 后关闭钮右缘
+    /// == 标题栏右缘（`title-bar` 是 `w_full` 的根容器，其右缘即窗口右缘）。
+    /// 亮暗主题几何不变，但按验收要求两态都断言一次。
+    #[gpui::test]
+    async fn title_bar_window_controls_hug_right_edge(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 断言函数：关闭钮右缘贴齐标题栏右缘（gap ≤ 1px 容差）、且最右侧是关闭钮。
+        let assert_hug = |cx: &mut gpui::VisualTestContext| {
+            let bar = cx
+                .debug_bounds("title-bar")
+                .expect("标题栏应渲染");
+            let close = cx
+                .debug_bounds("title-close")
+                .expect("关闭钮应渲染");
+            let min_ctrl = cx
+                .debug_bounds("title-minimize")
+                .expect("最小化钮应渲染");
+            let bar_right = bar.origin.x.as_f32() + bar.size.width.as_f32();
+            let close_right = close.origin.x.as_f32() + close.size.width.as_f32();
+            let close_left = close.origin.x.as_f32();
+            let gap = (bar_right - close_right).max(0.);
+            assert!(
+                close_right <= bar_right + 1.0,
+                "关闭钮右缘不得超出窗口右缘：close_right={close_right:.1} bar_right={bar_right:.1}"
+            );
+            assert!(
+                gap <= 1.0,
+                "关闭钮右缘应贴齐窗口右缘（无可见 gap），实际 gap={gap:.1}px"
+            );
+            assert!(
+                close_left > min_ctrl.origin.x.as_f32(),
+                "关闭钮应在最小化钮右侧（三钮顺序未被破坏）"
+            );
+        };
+        // 默认主题（浅色）先断言。
+        assert_hug(cx);
+
+        // 切深色再断言（真主题切换路径 `refresh_theme_ui`，不写盘用户偏好）。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = true;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        for _ in 0..4 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_hug(cx);
+
+        // 再切回浅色（还原现场，避免污染后续测试的 theme 全局态）。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = false;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        for _ in 0..4 {
+            let _ = cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_hug(cx);
     }
 
     /// A4：侧边栏 Markdown 目录**点击跳转**——条目走统一组件 WyEditor（源码行）：

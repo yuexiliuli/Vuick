@@ -670,12 +670,33 @@ impl EditorApp {
     ) -> Subscription {
         let ed = editor.clone();
         cx.subscribe(&ed, |this, emitter, ev: &crate::editor::EditorEvent, cx| {
-            if ev == &crate::editor::EditorEvent::Edited
-                && let Some(t) = this.tabs.iter().position(|t| t.editor == emitter)
-            {
-                this.on_editor_edited(t, cx);
+            if let Some(t) = this.tabs.iter().position(|t| t.editor == emitter) {
+                match ev {
+                    crate::editor::EditorEvent::Edited => this.on_editor_edited(t, cx),
+                    // 纯光标/选区移动（鼠标点击/方向键/搜索跳转）不走重活，
+                    // 只刷新选项卡缓存的行/列 → 状态栏 `Ln x, Col y` 即时跟随。
+                    crate::editor::EditorEvent::SelectionChanged => {
+                        this.on_editor_selection_changed(t, cx)
+                    }
+                    _ => {}
+                }
             }
         })
+    }
+
+    /// 编辑器「光标 / 选区变化」（不修改文本）：刷新选项卡缓存的行/列。轻量路径——
+    /// 只做 O(1) 光标读数并写回缓存，不碰搜索缓存 / 脏区间 / 预览同步（与
+    /// `on_editor_edited` 的重活分开，避免鼠标选中拖动时触发逐次预览扫描）。
+    /// 不 `cx.notify()`：编辑侧 `notify` 已令窗口把本视图及其祖先（含 app 根视图）
+    /// 标脏（gpui `mark_view_dirty`，见 on_editor_edited 注解），状态栏同帧读到新值。
+    fn on_editor_selection_changed(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
+        let (row, col) = {
+            let st = self.tabs[tab_ix].editor.read(cx);
+            st.cursor_position()
+        };
+        let tab = &mut self.tabs[tab_ix];
+        tab.cursor_row = row;
+        tab.cursor_col = col;
     }
 
     /// 编辑事件：失效搜索缓存、推进版本、更新脏区间/计数，并按需触发一轮预览同步。
@@ -2358,12 +2379,15 @@ impl EditorApp {
 
         div()
             .id("title-bar")
+            .debug_selector(|| "title-bar".into())
             .h(px(32.))
             .w_full()
             .flex()
             .items_center()
             .gap_1()
-            .px_2()
+            // 只留左内边距：Win11 Fluent 自绘标题栏下，窗口控制钮（最小化/最大化/
+            // 关闭）右缘应贴齐窗口右缘，右内边距会在关闭钮右侧留 8px 可见 gap。
+            .pl_2()
             .bg(self.mica_bar_bg())
             .child(self.render_menu_buttons(cx))
             .child(

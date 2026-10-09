@@ -69,6 +69,9 @@ const GUTTER_RIGHT_PAD_PX: f32 = 6.;
 pub enum EditorEvent {
     /// 文本被修改（撤销/重做/输入/删除均触发）。
     Edited,
+    /// 光标位置 / 选区变化（不修改文本）：鼠标点击、方向键移动、程序化定位（搜索
+    /// 跳转 / 侧边栏目录）都发此事件——宿主据此刷新状态栏 `Ln x, Col y` 等派生数据。
+    SelectionChanged,
     Focus,
     Blur,
 }
@@ -574,6 +577,8 @@ impl CodeEditor {
         self.undo.set_cooperative(false);
         self.kick_caret();
         self.reveal_caret();
+        // 程序化定位（搜索跳转/侧边栏目录）也发光标变化事件，状态栏跟随。
+        cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -1598,6 +1603,8 @@ impl CodeEditor {
         self.dragging = true;
         self.kick_caret();
         self.reveal_caret_vertical();
+        // 鼠标点击移动光标（宿主刷新状态栏光标行列等派生数据）。
+        cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -1611,6 +1618,8 @@ impl CodeEditor {
         self.selection.remember_column(self.buffer.char_column(offset));
         self.kick_caret();
         self.reveal_caret_vertical();
+        // 拖拽扩选过程也实时刷新（状态栏选区头跟随鼠标）。
+        cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -1678,6 +1687,8 @@ impl CodeEditor {
         }
         self.kick_caret();
         self.reveal_caret();
+        // 方向键/Home/End/翻页等移动光标（宿主刷新状态栏光标行列等派生数据）。
+        cx.emit(EditorEvent::SelectionChanged);
         cx.notify();
     }
 
