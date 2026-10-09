@@ -361,6 +361,10 @@ pub struct EditorApp {
     pub(crate) open_fast_count: usize,
     /// 大文档「两段式打开」慢段（`finish_file_text` 应用统计 + 预览索引）执行次数。
     pub(crate) open_finish_count: usize,
+    /// 窗口控制钮最后渲染帧解析出的图标前景色（渲染阶段落盘，仅测试/调试可读）：
+    /// 断言「hover/按压注入色」确实经过真实渲染路径（由 hover/press keyed 态驱动）。
+    /// `None` = 标题栏尚未渲染过。
+    pub(crate) last_title_ctrl_fg: Option<TitleCtrlIconFg>,
     /// 正在拖拽的选项卡下标（None = 未在拖拽选项卡）：`on_drag_move<TabDragData>`
     /// 在拖拽确认后写入；鼠标在窗口内/外松开时据此决定还原原位还是拆分/还原窗口。
     tab_dragging: Option<usize>,
@@ -386,6 +390,65 @@ pub struct EditorApp {
     palette: Option<gpui::Entity<crate::ui::palette::CommandPalette>>,
     /// 面板关闭订阅（选择/Esc/点击外 → 清空 `palette` 并释放实体）。
     _palette_sub: Option<Subscription>,
+}
+
+/// 窗口控制钮（最小化/最大化/关闭）上一帧解析出的图标前景色。
+/// 渲染阶段 `title_ctrl_button` 落盘，供测试断言「注入色」经真实渲染路径生效。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct TitleCtrlIconFg {
+    pub minimize: gpui::Hsla,
+    pub maximize: gpui::Hsla,
+    pub close: gpui::Hsla,
+}
+
+/// 标题栏窗口控制钮类型：平台统一按 `window_control_area` 命中区走原生语义
+/// （WM_NCHITTEST → HTMINBUTTON/HTMAXBUTTON/HTCLOSE），这里只按类型分支
+/// 图标 / 底色 / 注入色。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WinCtrlKind {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+impl WinCtrlKind {
+    fn id(self) -> &'static str {
+        match self {
+            WinCtrlKind::Minimize => "title-minimize",
+            WinCtrlKind::Maximize => "title-maximize",
+            WinCtrlKind::Close => "title-close",
+        }
+    }
+
+    fn area(self) -> gpui::WindowControlArea {
+        match self {
+            WinCtrlKind::Minimize => gpui::WindowControlArea::Min,
+            WinCtrlKind::Maximize => gpui::WindowControlArea::Max,
+            WinCtrlKind::Close => gpui::WindowControlArea::Close,
+        }
+    }
+
+    fn is_close(self) -> bool {
+        matches!(self, WinCtrlKind::Close)
+    }
+
+    /// hover 背景淡入的填充色：关闭钮红（危险钮观感），其余灰（P2-10 统一弹簧）。
+    fn hover_bg(self, c: ChromeColors) -> gpui::Hsla {
+        if self.is_close() {
+            c.close_hover.into()
+        } else {
+            c.hover_fill.into()
+        }
+    }
+
+    /// 按压底色：关闭钮用 P1-7 `close_pressed` 深一档危险红，其余用通用按压灰。
+    fn active_bg(self, c: ChromeColors) -> gpui::Hsla {
+        if self.is_close() {
+            c.close_pressed.into()
+        } else {
+            c.pressed_fill.into()
+        }
+    }
 }
 
 /// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
@@ -494,6 +557,7 @@ impl EditorApp {
             search_scan_count: 0,
             open_fast_count: 0,
             open_finish_count: 0,
+            last_title_ctrl_fg: None,
             tab_dragging: None,
             is_detached,
             media_lock_menu_pos: None,
@@ -2104,6 +2168,105 @@ impl EditorApp {
         }
         .save();
     }
+    /// 窗口控制钮图标前景（Win11「注入感」）：只换色、粗细/几何不动。
+    /// - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 `close_pressed` 搭配）
+    /// - 最小化/最大化：空闲次要灰 → hover/按压 主前景（灰底对比前景）
+    /// 按压态独立于 hover 跟随（`pressed || hovered`），保证压住不放时图标保持注入色。
+    fn title_ctrl_fg(&self, is_close: bool, hovered: bool, pressed: bool) -> gpui::Hsla {
+        if hovered || pressed {
+            if is_close {
+                white()
+            } else {
+                self.text_primary()
+            }
+        } else {
+            self.text_minor()
+        }
+    }
+
+    /// 构建单个窗口控制钮（最小化/最大化/关闭共用）：
+    /// - 点击/双击/键盘语义由平台原生处理（`window_control_area` → WM_NCHITTEST 返回
+    ///   HTMINBUTTON / HTMAXBUTTON / HTCLOSE，系统完成动作，应用层不重复处理）；
+    /// - hover 背景淡入（P2-10 统一 spring，关闭钮红、其余灰）；
+    /// - 按压底色 `.active`（P1-7 `pressed_fill` / 关闭钮 `close_pressed`）；按压态另存
+    ///   keyed「press」供图标注入色跟随（测试平台等派发到元素的场景生效）。
+    ///
+    /// 图标色按元素级 hover/pressed 态分支显式传 `Icon::text_color`——parent 的
+    /// `text_color` 不会级联覆盖子元素 Icon 的显式色，必须在分支里决定；
+    /// `cx.notify(view_id)` 触发状态变化后的重绘。
+    fn title_ctrl_button(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        kind: WinCtrlKind,
+        icon: IconName,
+    ) -> gpui::AnyElement {
+        let c = self.chrome();
+        let hover_bg = kind.hover_bg(c);
+        let view_id = window.current_view();
+        let hover_key = format!("title-{}-hover", kind.id());
+        let press_key = format!("title-{}-press", kind.id());
+        let hovered_s = window.use_keyed_state(hover_key, cx, |_, _| false);
+        let pressed_s = window.use_keyed_state(press_key, cx, |_, _| false);
+        let hovered = *hovered_s.read(cx);
+        let pressed = *pressed_s.read(cx);
+        let icon_color = self.title_ctrl_fg(kind.is_close(), hovered, pressed);
+        // 测试可读：本帧解析出的图标前景色落盘到 app 实体（断言「注入」走真实渲染路径）。
+        let snap = self.last_title_ctrl_fg.get_or_insert_with(TitleCtrlIconFg::default);
+        match kind {
+            WinCtrlKind::Minimize => snap.minimize = icon_color,
+            WinCtrlKind::Maximize => snap.maximize = icon_color,
+            WinCtrlKind::Close => snap.close = icon_color,
+        }
+        div()
+            .id(kind.id())
+            .debug_selector(move || kind.id().to_string())
+            .w(px(40.))
+            .h(px(32.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor(CursorStyle::PointingHand)
+            .active(|style| style.bg(kind.active_bg(c)))
+            .child(Icon::new(icon).size(px(14.)).text_color(icon_color))
+            .on_hover({
+                let st = hovered_s.clone();
+                move |hovered, _window, cx| {
+                    st.update(cx, |h, _| *h = *hovered);
+                    cx.notify(view_id);
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let st = pressed_s.clone();
+                move |_ev, _window, cx| {
+                    st.update(cx, |p, _| *p = true);
+                    cx.notify(view_id);
+                }
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let st = pressed_s.clone();
+                move |_ev, _window, cx| {
+                    st.update(cx, |p, _| *p = false);
+                    cx.notify(view_id);
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let st = pressed_s.clone();
+                move |_ev, _window, cx| {
+                    st.update(cx, |p, _| *p = false);
+                    cx.notify(view_id);
+                }
+            })
+            .window_control_area(kind.area())
+            // P2-10：hover 背景淡入。
+            .with_spring(
+                format!("title-{}-bg", kind.id()),
+                hover_spring(if hovered { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(hover_bg.opacity(v)),
+            )
+            .into_any_element()
+    }
+
     /// 自绘标题栏：无边框窗口下代替原生标题栏，颜色跟随黑白主题。
     /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，
     /// 右侧为最小化 / 最大化 / 关闭按钮。
@@ -2118,13 +2281,8 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let text_minor = self.text_minor();
-        let text_primary = self.text_primary();
         let c = self.chrome();
         let hover_fill: gpui::Hsla = c.hover_fill.into();
-        let pressed_fill: gpui::Hsla = c.pressed_fill.into();
-        let close_hover: gpui::Hsla = c.close_hover.into();
-        // 关闭钮按压色：close_hover 的深一档（P1-7 收编为 chrome `close_pressed` token）。
-        let close_pressed: gpui::Hsla = c.close_pressed.into();
         // 窗口控制钮跨帧 hover 状态对应的视图 id（元素级状态变更后通知重绘）。
         let view_id = window.current_view();
         let icon_style = |icon: IconName| {
@@ -2177,118 +2335,22 @@ impl EditorApp {
             IconName::WindowMaximize
         };
 
-        // 窗口控制钮：hover 时图标提亮/变白（Win11 观感）。图标色按元素级 hover
-        // 状态分支显式传 `Icon::text_color`——parent 的 text_color 不会级联覆盖
-        // 子元素 Icon 的显式色，必须在 state 分支里决定。`cx.notify(view_id)` 触发
-        // 状态变化后的重绘。
-        let minimize_hover =
-            window.use_keyed_state("title-minimize-hover", cx, |_, _| false);
-        let minimize_color: gpui::Hsla = if *minimize_hover.read(cx) {
-            text_primary
-        } else {
-            text_minor
-        };
-        let minimize = div()
-            .id("title-minimize")
-            .w(px(40.))
-            .h(px(32.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .active(|style| style.bg(pressed_fill))
-            .child(
-                Icon::new(IconName::WindowMinimize)
-                    .size(px(14.))
-                    .text_color(minimize_color),
-            )
-            .on_hover({
-                let st = minimize_hover.clone();
-                move |hovered, _window, cx| {
-                    st.update(cx, |h, _| *h = *hovered);
-                    cx.notify(view_id);
-                }
-            })
-            .window_control_area(gpui::WindowControlArea::Min)
-            // P2-10：hover 背景淡入。
-            .with_spring(
-                "title-minimize-bg",
-                hover_spring(if *minimize_hover.read(cx) { 1.0 } else { 0.0 }),
-                move |this, v| this.bg(hover_fill.opacity(v)),
-            );
-
-        let maximize_hover =
-            window.use_keyed_state("title-maximize-hover", cx, |_, _| false);
-        let maximize_color: gpui::Hsla = if *maximize_hover.read(cx) {
-            text_primary
-        } else {
-            text_minor
-        };
-        let maximize = div()
-            .id("title-maximize")
-            .w(px(40.))
-            .h(px(32.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .active(|style| style.bg(pressed_fill))
-            .child(
-                Icon::new(maximize_icon)
-                    .size(px(14.))
-                    .text_color(maximize_color),
-            )
-            .on_hover({
-                let st = maximize_hover.clone();
-                move |hovered, _window, cx| {
-                    st.update(cx, |h, _| *h = *hovered);
-                    cx.notify(view_id);
-                }
-            })
-            .window_control_area(gpui::WindowControlArea::Max)
-            // P2-10：hover 背景淡入。
-            .with_spring(
-                "title-maximize-bg",
-                hover_spring(if *maximize_hover.read(cx) { 1.0 } else { 0.0 }),
-                move |this, v| this.bg(hover_fill.opacity(v)),
-            );
-
-        let close_hover_state =
-            window.use_keyed_state("title-close-hover", cx, |_, _| false);
-        // close：hover 时图标变白（Win11 危险钮观感）；非 hover 回落次要灰。
-        let close_icon_color: gpui::Hsla = if *close_hover_state.read(cx) {
-            white()
-        } else {
-            text_minor
-        };
-        let close = div()
-            .id("title-close")
-            .w(px(40.))
-            .h(px(32.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor(CursorStyle::PointingHand)
-            .active(|style| style.bg(close_pressed))
-            .child(
-                Icon::new(IconName::WindowClose)
-                    .size(px(14.))
-                    .text_color(close_icon_color),
-            )
-            .on_hover({
-                let st = close_hover_state.clone();
-                move |hovered, _window, cx| {
-                    st.update(cx, |h, _| *h = *hovered);
-                    cx.notify(view_id);
-                }
-            })
-            .window_control_area(gpui::WindowControlArea::Close)
-            // P2-10：hover 背景淡入。
-            .with_spring(
-                "title-close-bg",
-                hover_spring(if *close_hover_state.read(cx) { 1.0 } else { 0.0 }),
-                move |this, v| this.bg(close_hover.opacity(v)),
-            );
+        // 窗口控制钮（最小化/最大化/关闭）：工厂 `title_ctrl_button` 统一建，
+        // hover/按压时图标「注入」对比前景（Win11 实心按钮观感），只换色、几何不动：
+        // - 最小化/最大化：空闲次要灰 → hover/按压 主前景（灰底对比前景）
+        // - 关闭：空闲次要灰 → hover/按压 白 ×（红底白×，与 P1-7 close_pressed 搭配）
+        // 图标色按元素级 hover/pressed keyed 态分支显式传 `Icon::text_color`——
+        // parent 的 text_color 不会级联覆盖子元素 Icon 的显式色，必须在分支里决定。
+        let mut window_ctrl_children = vec![sidebar_toggle.into_any_element()];
+        window_ctrl_children.push(
+            self.title_ctrl_button(window, cx, WinCtrlKind::Minimize, IconName::WindowMinimize),
+        );
+        window_ctrl_children.push(
+            self.title_ctrl_button(window, cx, WinCtrlKind::Maximize, maximize_icon),
+        );
+        window_ctrl_children.push(
+            self.title_ctrl_button(window, cx, WinCtrlKind::Close, IconName::WindowClose),
+        );
 
         div()
             .id("title-bar")
@@ -2307,12 +2369,7 @@ impl EditorApp {
                     .h_full()
                     .window_control_area(gpui::WindowControlArea::Drag),
             )
-            .children([
-                sidebar_toggle.into_any_element(),
-                minimize.into_any_element(),
-                maximize.into_any_element(),
-                close.into_any_element(),
-            ])
+            .children(window_ctrl_children)
     }
 
     /// 右上角 toast 层：卡片可见即渲染，点击卡片按「类型 + key」精确关闭。

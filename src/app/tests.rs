@@ -1059,6 +1059,103 @@
         assert!(!panel_open, "再点一次应收起目录面板");
     }
 
+    /// P2-11「图标注入感」：窗口控制钮 hover/按压时图标前景由次要灰切到与底对应的
+    /// 对比前景（最小化/最大化→主前景、关闭→白×），移出回落。经真实渲染路径断言：
+    /// `simulate_mouse_move` 驱动 keyed hover/press 态 → `render_title_bar` 把本帧
+    /// 解析出的前景色落盘到 `last_title_ctrl_fg`。
+    #[gpui::test]
+    async fn titlebar_window_buttons_inject_icon_fg_on_hover(cx: &mut TestAppContext) {
+        fn same_color(a: gpui::Hsla, b: gpui::Hsla) -> bool {
+            (a.h - b.h).abs() < 1e-5
+                && (a.s - b.s).abs() < 1e-5
+                && (a.l - b.l).abs() < 1e-5
+                && (a.a - b.a).abs() < 1e-5
+        }
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let idle = cx
+            .update(|_w, cx| {
+                app.read(cx)
+                    .last_title_ctrl_fg
+                    .expect("标题栏渲染后应落盘窗口钮前景色")
+            });
+        let minor = cx.update(|_w, cx| app.read(cx).text_minor());
+        let primary = cx.update(|_w, cx| app.read(cx).text_primary());
+        assert!(
+            same_color(idle.minimize, minor) && same_color(idle.close, minor),
+            "空闲时窗口钮图标应为次要灰，实际 min={:?} close={:?}",
+            idle.minimize,
+            idle.close
+        );
+
+        // hover 最小化 → 注入主前景（灰底对比前景）
+        let min_btn = cx
+            .debug_bounds("title-minimize")
+            .expect("应渲染 title-minimize");
+        cx.simulate_mouse_move(min_btn.center(), None, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let hovered = cx.update(|_w, cx| app.read(cx).last_title_ctrl_fg.unwrap());
+        assert!(
+            same_color(hovered.minimize, primary),
+            "hover 最小化图标应注入主前景，实际 {:?}",
+            hovered.minimize
+        );
+
+        // hover 关闭 → 白 ×（危险钮观感）
+        let close_btn = cx
+            .debug_bounds("title-close")
+            .expect("应渲染 title-close");
+        cx.simulate_mouse_move(close_btn.center(), None, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let hovered_close = cx.update(|_w, cx| app.read(cx).last_title_ctrl_fg.unwrap());
+        assert!(
+            same_color(hovered_close.close, white()),
+            "hover 关闭图标应为白 ×，实际 {:?}",
+            hovered_close.close
+        );
+
+        // 按住：按压态独立跟随（图标仍注入）
+        cx.simulate_mouse_down(close_btn.center(), MouseButton::Left, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let pressed = cx.update(|_w, cx| app.read(cx).last_title_ctrl_fg.unwrap());
+        assert!(
+            same_color(pressed.close, white()),
+            "按压关闭图标应保持白 ×，实际 {:?}",
+            pressed.close
+        );
+
+        // 松开并移出 → 回落次要灰
+        cx.simulate_mouse_up(close_btn.center(), MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(gpui::point(px(30.), px(300.)), None, Default::default());
+        cx.run_until_parked();
+        for _ in 0..3 {
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let away = cx.update(|_w, cx| app.read(cx).last_title_ctrl_fg.unwrap());
+        assert!(
+            same_color(away.close, minor),
+            "移出后关闭图标应回落次要灰，实际 {:?}",
+            away.close
+        );
+    }
+
     /// A4：侧边栏 Markdown 目录**点击跳转**——条目走统一组件 WyEditor（源码行）：
     /// 点「# 大标题 18」（文中部）→ 右栏预览 `scroll_to_line` 滚动到该标题所在块
     /// （宿主滚动句柄从顶部偏离到负向偏移，预览跟随跳转）。
