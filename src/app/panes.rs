@@ -226,9 +226,10 @@ impl EditorApp {
     /// 编辑区 / 预览区之间的分割线（可拖拽调整分屏比例）。
     pub(super) fn render_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = self.bar_border();
-        let accent = crate::ui::theme::Theme::global(cx).colors.accent.into();
+        let drag_line: gpui::Hsla =
+            crate::ui::theme::Theme::global(cx).colors.drag_hover_border.into();
         let line_color: gpui::Hsla = if self.splitter_hovered || self.split_drag.is_some() {
-            accent
+            drag_line
         } else {
             border
         };

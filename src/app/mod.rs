@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    anchored, deferred, div, px, rgba, white, Anchor, AnimationExt, AnyWindowHandle, App,
+    anchored, deferred, div, px, white, Anchor, AnimationExt, AnyWindowHandle, App,
     AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths,
     FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, PromptLevel, Render, SharedString, StatefulInteractiveElement,
@@ -238,14 +238,16 @@ struct TabDragGhost {
 
 impl Render for TabDragGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
+        let theme = crate::ui::theme::Theme::global(cx);
+        let ghost_bg =
+            crate::ui::theme::ChromeColors::for_mode(theme.is_dark()).drag_ghost_bg;
         div()
             .id("tab-drag-ghost")
             .debug_selector(|| "tab-drag-ghost".into())
             .px_3()
             .py_1()
             .rounded_lg()
-            .bg(accent)
+            .bg(ghost_bg)
             .text_color(white())
             .text_size(px(12.))
             .child(self.name.clone())
@@ -2121,8 +2123,8 @@ impl EditorApp {
         let hover_fill: gpui::Hsla = c.hover_fill.into();
         let pressed_fill: gpui::Hsla = c.pressed_fill.into();
         let close_hover: gpui::Hsla = c.close_hover.into();
-        // 关闭钮按压色：close_hover 的深一档局部派生（本步唯一局部派生色，勿挪进色板）。
-        let close_pressed: gpui::Hsla = rgba(0xa70d1aff).into();
+        // 关闭钮按压色：close_hover 的深一档（P1-7 收编为 chrome `close_pressed` token）。
+        let close_pressed: gpui::Hsla = c.close_pressed.into();
         // 窗口控制钮跨帧 hover 状态对应的视图 id（元素级状态变更后通知重绘）。
         let view_id = window.current_view();
         let icon_style = |icon: IconName| {

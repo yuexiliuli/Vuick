@@ -353,7 +353,6 @@ impl Render for CommandPalette {
         let fg_muted: Hsla = colors.fg_muted.into();
         let chrome = ChromeColors::for_mode(is_dark);
         let selected_bg: Hsla = chrome.menu_highlight.into();
-        let accent: Hsla = colors.accent.into();
 
         // 面板高度 = 窗口 2/3：列表项多时不再撑出屏幕底部（超出部分列表区滚动）。
         let panel_h = window.bounds().size.height.as_f32() * (2.0 / 3.0);
@@ -361,9 +360,13 @@ impl Render for CommandPalette {
         // `Scrollbar::vertical` 自绘跟随（宿主在此 GPUI 不绘制可见滚动条）。
         let scroll_handle = self.scroll_handle.clone();
 
-        // 顶部查询框：聚焦时边框点亮为强调色（与侧栏搜索框同款 Fluent 视觉）。
+        // 顶部查询框：聚焦时边框点亮为主题 focus_ring（与侧栏搜索框同款 Fluent 视觉）。
         let focused = window.focused(cx) == Some(self.input.read(cx).focus_handle(cx));
-        let input_border: Hsla = if focused { accent } else { colors.border.into() };
+        let input_border: Hsla = if focused {
+            colors.focus_ring.into()
+        } else {
+            colors.border.into()
+        };
         let hint = match self.mode {
             PaletteMode::Commands => "命令面板",
             PaletteMode::Files => "打开文件",

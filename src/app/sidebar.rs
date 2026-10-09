@@ -181,7 +181,7 @@ impl EditorApp {
         if !self.sidebar.panel_open {
             return Vec::new();
         }
-        let accent = crate::ui::theme::Theme::global(cx).colors.accent;
+        let drag_line = crate::ui::theme::Theme::global(cx).colors.drag_hover_border;
         vec![
             div()
                 .id("sidebar-resize")
@@ -213,7 +213,7 @@ impl EditorApp {
                         .bottom(px(0.))
                         .w(px(2.))
                         .rounded_full()
-                        .bg(accent)
+                        .bg(drag_line)
                         // P2-10：悬停/拖拽时细线淡入（滚动条滑块同款指数平滑可接受，
                         // 这里用统一 hover 弹簧）。
                         .with_spring(
@@ -665,7 +665,7 @@ impl EditorApp {
         // 聚焦时边框点亮为强调色。
         let focused = window.focused(cx) == Some(self.search_state.read(cx).focus_handle(cx));
         let border_color: gpui::Hsla = if focused {
-            crate::ui::theme::Theme::global(cx).colors.accent.into()
+            crate::ui::theme::Theme::global(cx).colors.focus_ring.into()
         } else {
             self.bar_border()
         };

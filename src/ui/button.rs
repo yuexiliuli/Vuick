@@ -62,31 +62,28 @@ impl ButtonVariant {
         }
     }
 
-    /// 悬浮背底：基于语义前景色的低透明着染（深色下加深保对比），Primary 用 accent 微降。
-    fn hover_bg(&self, colors: &ColorScheme, is_dark: bool) -> Hsla {
-        let fg: Hsla = colors.fg.into();
-        let accent: Hsla = colors.accent.into();
+    /// 悬浮背底：中性前景低透明着染（亮/暗 alpha 已预置进 `selected_bg` token），
+    /// Primary 用 accent 微降（死变体，保留 accent 通路）。
+    fn hover_bg(&self, colors: &ColorScheme) -> Hsla {
         match self {
-            ButtonVariant::Primary => accent.opacity(0.9),
-            ButtonVariant::Link => transparent_black(),
-            _ => {
-                let alpha = if is_dark { 0.14 } else { 0.08 };
-                fg.opacity(alpha)
+            ButtonVariant::Primary => {
+                let accent: Hsla = colors.accent.into();
+                accent.opacity(0.9)
             }
+            ButtonVariant::Link => transparent_black(),
+            _ => colors.selected_bg.into(),
         }
     }
 
-    /// 按压/选中背底：比悬浮更深一档。
-    fn active_bg(&self, colors: &ColorScheme, is_dark: bool) -> Hsla {
-        let fg: Hsla = colors.fg.into();
-        let accent: Hsla = colors.accent.into();
+    /// 按压/选中背底：比悬浮更深一档（收编进 `pressed_bg` token）。
+    fn active_bg(&self, colors: &ColorScheme) -> Hsla {
         match self {
-            ButtonVariant::Primary => accent.opacity(0.75),
-            ButtonVariant::Link => transparent_black(),
-            _ => {
-                let alpha = if is_dark { 0.24 } else { 0.14 };
-                fg.opacity(alpha)
+            ButtonVariant::Primary => {
+                let accent: Hsla = colors.accent.into();
+                accent.opacity(0.75)
             }
+            ButtonVariant::Link => transparent_black(),
+            _ => colors.pressed_bg.into(),
         }
     }
 }
@@ -235,7 +232,7 @@ impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let focus_handle = self.focus_handle(window, cx);
         let theme = Theme::global(cx);
-        let (colors, is_dark) = (theme.colors, theme.is_dark());
+        let colors = theme.colors;
         let variant = self.variant;
         let disabled = self.disabled;
         let selected = self.selected && !disabled;
@@ -248,7 +245,7 @@ impl RenderOnce for Button {
         let hover_flag = window.use_keyed_state((self.id.clone(), "hover"), cx, |_, _| false);
         let hovered = *hover_flag.read(cx) && !disabled;
         let view_id = window.current_view();
-        let hover_bg = variant.hover_bg(&colors, is_dark);
+        let hover_bg = variant.hover_bg(&colors);
 
         let mut root = self
             .base
@@ -262,11 +259,11 @@ impl RenderOnce for Button {
             .text_color(fg)
             .when_some(border, |this, b| this.border_1().border_color(b))
             .when(selected, |this| {
-                this.bg(variant.active_bg(&colors, is_dark))
+                this.bg(variant.active_bg(&colors))
             })
             .when(!selected && !disabled, |this| {
                 // 按压仍即时反馈（active）；hover 背景由底部 with_spring 统一淡入。
-                this.active(|s| s.bg(variant.active_bg(&colors, is_dark)))
+                this.active(|s| s.bg(variant.active_bg(&colors)))
                     .on_hover({
                         let st = hover_flag.clone();
                         move |hovered, _window, cx| {

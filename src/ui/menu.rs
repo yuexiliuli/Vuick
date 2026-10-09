@@ -295,7 +295,8 @@ impl Render for PopupMenu {
         let (colors, is_dark) = (theme.colors, theme.is_dark());
         let surface: Hsla = colors.surface.into();
         let fg: Hsla = colors.fg.into();
-        let fg_muted: Hsla = colors.fg_muted.into();
+        // 禁用项文字走独立语义 token（比 fg_muted 更弱一档，见 P1-7）。
+        let fg_disabled: Hsla = colors.fg_disabled.into();
         // Win11 中性菜单高亮：灰填充（非强调蓝 tint）。
         let selected_bg: Hsla = ChromeColors::for_mode(is_dark).menu_highlight.into();
         let items_count = self.menu_items.len();
@@ -328,7 +329,7 @@ impl Render for PopupMenu {
                         .px(ITEM_PADDING)
                         .rounded_sm()
                         .gap_2()
-                        .text_color(if *disabled { fg_muted } else { fg })
+                        .text_color(if *disabled { fg_disabled } else { fg })
                         .when(!disabled, |d| {
                             d.cursor_pointer()
                                 .on_hover(cx.listener(move |this, hovered, _, cx| {

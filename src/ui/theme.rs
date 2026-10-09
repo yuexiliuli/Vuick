@@ -75,6 +75,8 @@ fn default_mono_font_family() -> SharedString {
 /// 供通用控件；`code_*`/`quote_bg`/`table_head_bg`/`heading`/`popover_bg` 供
 /// Markdown 预览 / WYSIWYG / 编辑器（原 `markdown/view/style.rs`、`note_card`、
 /// `editor/markdown.rs` 的硬编码 `rgb()` 收编于此，见 `docs/ui-migration.md`）。
+/// P1-7 起又收编状态语义色：`fg_disabled`（禁用）、`focus_ring`（聚焦描边）、
+/// `selected_bg`/`pressed_bg`（选中/按压基底）、`drag_hover_border`（拖拽强调线）。
 #[derive(Clone, Copy, Debug)]
 pub struct ColorScheme {
     /// 主背景（画布/正文底色）
@@ -93,6 +95,16 @@ pub struct ColorScheme {
     pub link: Rgba,
     /// 错误/危险色（打开失败通知等）
     pub error: Rgba,
+    /// 禁用态弱化文字（菜单项等置灰，明浅灰 / 暗深灰，比 fg_muted 更弱一档）
+    pub fg_disabled: Rgba,
+    /// 聚焦控件描边（侧栏搜索框 / 命令面板查询框等 Fluent 聚焦框，亮暗 = 对应档强调色）
+    pub focus_ring: Rgba,
+    /// 选中/悬停基底（按钮等控件 hover/selected 着染，fg 低透明：亮 ~8% / 暗 ~14%）
+    pub selected_bg: Rgba,
+    /// 按压/激活基底（比 selected_bg 深一档：亮 ~14% / 暗 ~24%）
+    pub pressed_bg: Rgba,
+    /// 拖拽/悬停强调线（分栏 splitter、侧栏右缘调宽等，亮暗 = 对应档强调色）
+    pub drag_hover_border: Rgba,
     /// 代码块背景（预览 / WYSIWYG 围栏底，明 #f5f5f5 / 暗 #262626）
     pub code_block_bg: Rgba,
     /// 行内代码（反引号）文字色（明 #202020 / 暗 #e8e8e8，近正文，靠底色+等宽区分）
@@ -123,6 +135,16 @@ impl ColorScheme {
             accent: rgb(0x005fb8),
             link: rgb(0x0b57d0),
             error: rgb(0xc42b1c),
+            // 禁用文字 = Fluent 40% 黑叠白底（约 #999），比 fg_muted(#5f5f5f) 更弱一档。
+            fg_disabled: rgb(0x9a9a9a),
+            // 聚焦框 = 亮档强调色同源（Fluent 亮底强调蓝）。
+            focus_ring: rgb(0x005fb8),
+            // 按钮选中/悬停 = 前景黑低透明（原 fg.opacity(0.08)，同值收编）。
+            selected_bg: rgba(0x00000014),
+            // 按压 = 再深一档（原 fg.opacity(0.14)）。
+            pressed_bg: rgba(0x00000024),
+            // 分栏/调宽强调线 = 亮档强调色同源。
+            drag_hover_border: rgb(0x005fb8),
             code_block_bg: rgb(0xf5f5f5),
             code_inline_fg: rgb(0x202020),
             code_inline_bg: rgb(0xf0f0f0),
@@ -146,6 +168,16 @@ impl ColorScheme {
             accent: rgb(0x60cdff),
             link: rgb(0x6fb1ff),
             error: rgb(0xf16a6a),
+            // 禁用文字 = Fluent 40% 白叠 #2b2b2b（约 #7d），比 fg_muted(#9d9d9d) 更弱一档。
+            fg_disabled: rgb(0x777777),
+            // 聚焦框 = 暗档强调色同源（Win11 暗底亮蓝）。
+            focus_ring: rgb(0x60cdff),
+            // 按钮选中/悬停 = 前景白低透明（原 fg.opacity(0.14)，同值收编）。
+            selected_bg: rgba(0xffffff24),
+            // 按压 = 再深一档（原 fg.opacity(0.24)）。
+            pressed_bg: rgba(0xffffff3d),
+            // 分栏/调宽强调线 = 暗档强调色同源。
+            drag_hover_border: rgb(0x60cdff),
             code_block_bg: rgb(0x262626),
             code_inline_fg: rgb(0xe8e8e8),
             code_inline_bg: rgb(0x3a3a3a),
@@ -162,8 +194,8 @@ impl ColorScheme {
 /// 与 [`ColorScheme`]（内容渲染色板）平行——前者管「框」，后者管「内容」。
 ///
 /// **Win11 Fluent 中性外壳色板**：以中性灰（亮 #F5F5F5 / 暗 #202020）打底，配合
-/// VS Code 工作台层次（灰带 + 白色卡片选项卡 + 8px 圆角浮动层）。hover / 按压 / 关闭
-/// 三档交互色单独成字段，统一由组件像素级消费，禁止在组件里新写硬编码 `rgba()`。
+/// VS Code 工作台层次（灰带 + 白色卡片选项卡 + 8px 圆角浮动层）。hover / 按压 / 关闭/
+/// 拖拽 等交互色单独成字段，统一由组件像素级消费，禁止在组件里新写硬编码 `rgba()`。
 ///
 /// **与 [`ColorScheme`] 同源**：同名字段（`panel_bg`/`bar_border`/`text_primary`/
 /// `text_minor`/`chip_text`/`tab_active_bg`/`tab_active_border`/`pill_fg`/`dirty`）
@@ -211,6 +243,10 @@ pub struct ChromeColors {
     pub pressed_fill: Rgba,
     /// 关闭按钮悬停填充（危险红，亮暗同值）
     pub close_hover: Rgba,
+    /// 关闭按钮按压填充（危险红深一档，亮暗同值）
+    pub close_pressed: Rgba,
+    /// 选项卡拖拽「幽灵」胶囊底色（亮暗 = 对应档强调色）
+    pub drag_ghost_bg: Rgba,
     /// 菜单项选中/悬停高亮（Win11 中性灰填充，替代强调蓝 tint）
     pub menu_highlight: Rgba,
 }
@@ -247,6 +283,8 @@ impl ChromeColors {
             hover_fill: rgba(0x0000000d),
             pressed_fill: rgba(0x00000017),
             close_hover: rgb(0xe81123),
+            close_pressed: rgb(0xa70d1a),
+            drag_ghost_bg: c.accent,
             menu_highlight: rgba(0x00000014),
         }
     }
@@ -274,6 +312,8 @@ impl ChromeColors {
             hover_fill: rgba(0xffffff14),
             pressed_fill: rgba(0xffffff24),
             close_hover: rgb(0xe81123),
+            close_pressed: rgb(0xa70d1a),
+            drag_ghost_bg: c.accent,
             menu_highlight: rgba(0xffffff1a),
         }
     }
@@ -487,6 +527,48 @@ mod tests {
         assert_eq!(light.close_hover, dark.close_hover, "关闭红亮暗同值");
         // 菜单高亮：中性灰随明暗（亮半透明黑 / 暗半透明白）
         assert_ne!(light.menu_highlight, dark.menu_highlight, "菜单高亮随明暗");
+    }
+
+    #[gpui::test]
+    fn state_colors_are_consistent_and_distinct(_cx: &mut TestAppContext) {
+        // P1-7：状态语义色——禁用/选中/按压/聚焦/拖拽各态亮暗两套可取、且与邻近色可辨。
+        let light = Theme::light();
+        let dark = Theme::dark();
+        let (lc, dc) = (light.colors, dark.colors);
+        // 禁用文字：亮暗不同，且比 fg_muted 更弱（亮度离得更远），又不能浅到与底色无别。
+        assert_ne!(lc.fg_disabled, dc.fg_disabled, "禁用文字随明暗");
+        assert_ne!(lc.fg_disabled, lc.fg_muted, "亮禁用 ≠ 亮次要文字");
+        assert_ne!(dc.fg_disabled, dc.fg_muted, "暗禁用 ≠ 暗次要文字");
+        assert_ne!(lc.fg_disabled, lc.fg, "亮禁用 ≠ 主文字");
+        assert_ne!(dc.fg_disabled, dc.fg, "暗禁用 ≠ 主文字");
+        // 聚焦框 = 各档强调色同源（Fluent 亮深蓝 / 暗亮蓝）。
+        assert_eq!(lc.focus_ring, lc.accent, "亮聚焦框 = 亮强调色");
+        assert_eq!(dc.focus_ring, dc.accent, "暗聚焦框 = 暗强调色");
+        assert_ne!(lc.focus_ring, dc.focus_ring, "聚焦框随明暗");
+        // 选中/按压基底：预置 alpha，按压比选中深一档、且亮暗分离（明黑 / 暗白）。
+        assert_ne!(lc.selected_bg, lc.pressed_bg, "亮选中与按压深浅不同");
+        assert_ne!(dc.selected_bg, dc.pressed_bg, "暗选中与按压深浅不同");
+        assert_ne!(lc.selected_bg, dc.selected_bg, "选中基底随明暗");
+        assert_ne!(lc.pressed_bg, dc.pressed_bg, "按压基底随明暗");
+        assert!(lc.selected_bg.a < lc.pressed_bg.a, "亮按压 alpha 应大于选中");
+        assert!(dc.selected_bg.a < dc.pressed_bg.a, "暗按压 alpha 应大于选中");
+        // 拖拽强调线 = 各档强调色同源。
+        assert_eq!(lc.drag_hover_border, lc.accent, "亮拖拽线 = 亮强调色");
+        assert_eq!(dc.drag_hover_border, dc.accent, "暗拖拽线 = 暗强调色");
+    }
+
+    #[gpui::test]
+    fn chrome_state_colors_are_pinned(_cx: &mut TestAppContext) {
+        // P1-7：外壳层状态色钉死——关闭按压红亮暗同值；拖拽幽灵随明暗且 = 强调色。
+        let light = ChromeColors::light();
+        let dark = ChromeColors::dark();
+        assert_eq!(light.close_pressed, rgb(0xa70d1a), "亮关闭按压红");
+        assert_eq!(dark.close_pressed, rgb(0xa70d1a), "暗关闭按压红 = 亮档（危险红同值）");
+        assert_eq!(light.close_pressed, dark.close_pressed, "关闭按压红亮暗同值");
+        assert_ne!(light.close_pressed, light.close_hover, "按压比 hover 深一档");
+        assert_eq!(light.drag_ghost_bg, ColorScheme::light().accent, "亮拖拽幽灵 = 亮强调色");
+        assert_eq!(dark.drag_ghost_bg, ColorScheme::dark().accent, "暗拖拽幽灵 = 暗强调色");
+        assert_ne!(light.drag_ghost_bg, dark.drag_ghost_bg, "拖拽幽灵随明暗");
     }
 
     #[gpui::test]
