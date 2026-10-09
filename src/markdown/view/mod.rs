@@ -43,7 +43,7 @@ use gpui::{
     FocusHandle, Hsla, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListOffset,
     ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window,
+    StatefulInteractiveElement, Styled, Window, prelude::FluentBuilder as _,
 };
 use ropey::Rope;
 use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
@@ -2242,6 +2242,17 @@ impl Render for MarkdownPreview {
         self.prepare_render(&p, pane_w, cx);
         let list_state = self.list_state.clone();
         let content_w = self.content_w;
+        // 居中阅读栏（wrap 模式共用单一来源 `config::markdown::reading_col_px`）：
+        // 列宽 = min(72ch, 视口宽)——窗口窄于 72ch 时退化为占满视口，不横向超界。
+        // 正文按列宽折行；宽块（代码/表格）在列内各自横向滚动（行为保持）。
+        let reading_col_w = if self.wrap && crate::config::markdown::READING_COL_ENABLED {
+            Some(
+                crate::config::markdown::reading_col_px(f32::from(p.para_size))
+                    .min(pane_w.max(1.0)),
+            )
+        } else {
+            None
+        };
 
         self.debug_dump_render_state();
 
@@ -2249,7 +2260,7 @@ impl Render for MarkdownPreview {
         let content = self.build_list_content(p.clone(), list_state.clone(), cx);
 
         // 预览核心：内容上下滚动容器 + 双滚动条 + 点选/悬浮监听（见 `render_core`）。
-        let core = self.render_core(content, bg, list_state, content_w, cx);
+        let core = self.render_core(content, bg, list_state, content_w, reading_col_w, cx);
         let core = self.with_hover_note_card(core, cx).into_any_element();
 
         // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动。
@@ -2377,24 +2388,37 @@ impl MarkdownPreview {
         .into_any_element()
     }
 
-    /// 预览核心：换行（宽随视口）或非换行（横向滚动）共用外层横向滚动容器（换行模式宽
-    /// 包装层保持视口宽、超宽代码带由 harea 统一横滚；非换行模式 = max(最宽内容,视口宽)）+
-    /// 常显横向/纵向量程滚动条 + 点选复制/悬浮脚注监听挂载。
+    /// 预览核心：换行（宽随视口 / 居中阅读栏）或非换行（横向滚动）共用外层横向滚动容器
+    /// （换行无阅读栏时宽包装层保持视口宽、超宽代码带由列内各自横向滚动；非换行模式 =
+    /// max(最宽内容,视口宽)）+ 常显横向/纵向量程滚动条 + 点选复制/悬浮脚注监听挂载。
+    ///
+    /// `reading_col_w = Some(w)` 表示启用居中阅读栏（wrap 模式）：内容列宽 = `min(72ch,
+    /// 视口)` 并水平居中，正文按列宽折行；代码/表格等宽块仍在列内横向滚动。`None` 走
+    /// 原语义（wrap = 撑满视口 / 非 wrap = 内容宽）。
     fn render_core(
         &self,
         content: gpui::AnyElement,
         bg: Hsla,
         list_state: ListState,
         content_w: f32,
+        reading_col_w: Option<f32>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let inner = div()
-            .id("md-list-wrap")
-            .debug_selector(|| "md-list-wrap".into())
-            .w(px(content_w))
-            .min_w_full()
-            .h_full()
-            .child(content);
+        let inner = match reading_col_w {
+            Some(col_w) => div()
+                .id("md-list-wrap")
+                .debug_selector(|| "md-list-wrap".into())
+                .w(px(col_w))
+                .h_full()
+                .child(content),
+            None => div()
+                .id("md-list-wrap")
+                .debug_selector(|| "md-list-wrap".into())
+                .w(px(content_w))
+                .min_w_full()
+                .h_full()
+                .child(content),
+        };
         // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。
         let harea = div()
             .id("md-harea")
@@ -2403,6 +2427,11 @@ impl MarkdownPreview {
             .overflow_x_scroll()
             .restrict_scroll_to_axis()
             .track_scroll(&self.h_handle)
+            // 居中阅读栏：列窄于视口 → flex 行居中；列 = 视口（窗口窄于 72ch）时无空余，
+            // 居中自然退化为占满，不引入横向超界。
+            .when(reading_col_w.is_some(), |d| {
+                d.flex().flex_row().justify_center()
+            })
             .child(inner);
         div()
             .id("md-preview")

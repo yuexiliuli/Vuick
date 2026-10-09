@@ -187,7 +187,7 @@ impl WyTheme {
     pub fn code_line(&self) -> Pixels {
         self.code_line
     }
-    /// 第 n 级标题字号（预览 `heading_metrics`：h1=20 h2=18 h3/4=16 其余 15）。
+    /// 第 n 级标题字号（预览 `heading_metrics`：h1=24 h2=20 h3=18 h4=16 h5/6=15）。
     pub fn heading_fs(&self, level: u8) -> Pixels {
         self.heading_fs[(level as usize).clamp(1, 6)]
     }
@@ -2332,7 +2332,12 @@ impl WyEditor {
             .last_bounds()
             .map(|b| f32::from(b.origin.x))
             .unwrap_or(0.);
-        let p_local = f32::from(pos.x) - origin_x;
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
         let travel = (bar_w - thumb_w).max(1.);
         // 滑块中心对准点击点：center = p_local → thumb_x = p_local − thumb_w/2。
         let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
@@ -2362,7 +2367,12 @@ impl WyEditor {
             .last_bounds()
             .map(|b| f32::from(b.origin.x))
             .unwrap_or(0.);
-        let p_local = f32::from(pos.x) - origin_x;
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
         let travel = (bar_w - thumb_w).max(1.);
         let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
         drop(marker);
@@ -2387,7 +2397,12 @@ impl WyEditor {
             .last_bounds()
             .map(|b| f32::from(b.origin.x))
             .unwrap_or(0.);
-        let p_local = f32::from(pos.x) - origin_x;
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
         let travel = (bar_w - thumb_w).max(1.);
         let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
         drop(marker);
@@ -2414,7 +2429,12 @@ impl WyEditor {
             .last_bounds()
             .map(|b| f32::from(b.origin.x))
             .unwrap_or(0.);
-        let p_local = f32::from(pos.x) - origin_x;
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
         let travel = (bar_w - thumb_w).max(1.);
         let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
         drop(marker);
@@ -2575,6 +2595,35 @@ impl WyEditor {
     }
     pub(crate) fn last_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
         self.last_bounds.get()
+    }
+
+    /// 居中阅读栏的**水平移位**（px）：`(元素可用宽 − 帧布局宽) ÷ 2`。
+    ///
+    /// 帧宽被 measure 钳到 ≤ 72ch（`READING_COL_ENABLED`），元素仍占满面板——内容列整列
+    /// （含 gutter/负缩进/引述条）需在面板内水平居中。所有把窗口坐标换算回**内容区内部**
+    /// 坐标系（`to_local`/`source_offset_at`/横向滚动条拖拽）都必须叠减该偏移；paint/hitbox
+    /// 把元素屏幕原点叠加该偏移。内容区内部的几何（`padding`/`x_off`/光标/选区）一律不变，
+    /// 拖拽/点击/光标对齐因此天然保持。未启用或窗口窄于列宽时 = 0（不破坏原语义）。
+    pub(crate) fn reading_col_shift(&self, elem_w: f32) -> f32 {
+        let fw = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f32::from(f.width))
+            .unwrap_or(elem_w);
+        ((elem_w - fw) / 2.).max(0.)
+    }
+
+    /// 内容列在**窗口坐标**中的屏幕原点（元素屏幕原点 + 阅读栏水平移位）。
+    /// open（非 paint 期）需要与帧同代摆卡片/命中时用（paint 期用传入的 `bounds.origin`
+    /// 现算，这里供 `image_edit_anchor` 等静态换算路径复用同一语义）。
+    fn content_origin(&self) -> gpui::Point<Pixels> {
+        let (origin, elem_w) = match self.last_bounds() {
+            Some(b) => (b.origin, f32::from(b.size.width)),
+            None => (gpui::point(px(0.), px(0.)), 0.),
+        };
+        let shift = self.reading_col_shift(elem_w);
+        gpui::point(origin.x + px(shift), origin.y)
     }
 
     pub(crate) fn content_gen(&self) -> u64 {
@@ -4188,10 +4237,7 @@ impl WyEditor {
         // ⚠️ 不再依赖 render 期现算 frame——`end_selection` 清帧后 ensure 用 800px 宽
         // 重建会让 render 读到一个宽度错误的帧，卡片横向跳一帧。
         if let Some(f) = self.frame.borrow().as_ref().cloned() {
-            let origin = self
-                .last_bounds()
-                .map(|b| b.origin)
-                .unwrap_or_else(|| gpui::point(px(0.), px(0.)));
+            let origin = self.content_origin();
             self.image_edit_anchor.set(self.image_edit_anchor_at(origin, &f));
         }
         // 打开后立刻聚焦「链接」输入框（用户可直接键入/IME）。
@@ -4343,10 +4389,7 @@ impl WyEditor {
             None => {
                 let f = self.frame.borrow();
                 let f = f.as_ref()?;
-                let origin = self
-                    .last_bounds()
-                    .map(|b| b.origin)
-                    .unwrap_or_else(|| gpui::point(px(0.), px(0.)));
+                let origin = self.content_origin();
                 self.image_edit_anchor_at(origin, f)?
             }
         };

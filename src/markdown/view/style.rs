@@ -50,16 +50,19 @@ pub(crate) fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
 
 /// 由正文字号推导第 n 级标题的字号与行高（预览与 WYSIWYG 共用，见
 /// [`StyleParams::heading_metrics`]）。设计字号基准集中在
-/// `config::markdown::HEADING_DESIGN_SIZES` / `HEADING_DESIGN_BASE` / `HEADING_LINE_RATIO`
-/// （正文 14px 参考字号下 h1=20 h2=18 h3/4=16 其余 15），其余字号按
+/// `config::markdown::HEADING_DESIGN_SIZES` / `HEADING_DESIGN_BASE`，
+/// 行高系数在 `config::markdown::HEADING_LINE_RATIOS`（分级别）
+/// （正文 14px 参考字号下 h1=24 h2=20 h3=18 h4=16 h5/6=15），其余字号按
 /// `body_fs / HEADING_DESIGN_BASE` 等比缩放，标题相对正文的比例保持不变。
 pub(crate) fn heading_metrics_for_size(body_fs: f32, level: u8) -> (Pixels, Pixels) {
-    let design = match level {
-        1..=6 => crate::config::markdown::HEADING_DESIGN_SIZES[level as usize],
-        _ => crate::config::markdown::HEADING_DESIGN_SIZES[6],
+    let lv = match level {
+        1..=6 => level as usize,
+        _ => 6,
     };
+    let design = crate::config::markdown::HEADING_DESIGN_SIZES[lv];
+    let line_ratio = crate::config::markdown::HEADING_LINE_RATIOS[lv];
     let fs = body_fs / crate::config::markdown::HEADING_DESIGN_BASE * design;
-    (px(fs), px(fs * crate::config::markdown::HEADING_LINE_RATIO))
+    (px(fs), px(fs * line_ratio))
 }
 
 impl StyleParams {
@@ -94,7 +97,7 @@ impl StyleParams {
             table_head_bg: colors.table_head_bg.into(),
             para_size: para,
             para_line: line,
-            para_gap: px(4.),
+            para_gap: px(6.),
             code_size: code,
             code_line,
             blank_h: px(12.),
@@ -103,7 +106,8 @@ impl StyleParams {
         }
     }
 
-    /// 第 n 级标题的字号与行高（基准同旧 render.rs：正文 14px 时 h1=20 h2=18 h3/4=16 其余 15）。
+    /// 第 n 级标题的字号与行高（基准同旧 render.rs：正文 14px 时 h1=24 h2=20 h3=18 h4=16
+    /// h5/6=15；行高系数分级 `HEADING_LINE_RATIOS`，大标题紧、小标题透气）。
     /// 随正文字号 **等比缩放**——编辑区/预览/WYSIWYG 的 Ctrl+滚轮/菜单调字号时标题一起
     /// 变大变小，保持标题相对正文的比例固定。WYSIWYG 的 `WyTheme::set_font_size` 也走
     /// [`heading_metrics_for_size`] 同步重算，两处标题永远一致。

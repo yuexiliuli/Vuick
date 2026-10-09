@@ -33,9 +33,38 @@ pub const EPUB_IMG_SCHEME: &str = "epubimg://";
 ///
 /// 注意：设计基准固定为 14，与运行期默认字号 `layout::DEFAULT_FONT_SIZE` **解耦**——
 /// 否则调大默认字号（如 24）会把标题基准一起带偏，标题反而小于正文。
-pub const HEADING_DESIGN_SIZES: [f32; 7] = [0.0, 20.0, 18.0, 16.0, 16.0, 15.0, 15.0];
+///
+/// 数值贴近 Win11 / 微软官网大头层级（正文 14px 参考下 h1=24 h2=20 h3=18 h4=16 h5/6=15），
+/// 层级差更清晰：h1 比正文大 ~1.7×，相邻两级差 ≥1px（旧值 20/18/16 层级偏挤）。
+pub const HEADING_DESIGN_SIZES: [f32; 7] = [0.0, 24.0, 20.0, 18.0, 16.0, 15.0, 15.0];
 /// 标题设计字号所对应的**参考正文字号**（px）：`HEADING_DESIGN_SIZES` 在该字号下成立，
 /// 其余正文按 `body / 此值` 等比缩放标题。
 pub const HEADING_DESIGN_BASE: f32 = 14.0;
-/// 标题行高系数（× 标题字号）。
-pub const HEADING_LINE_RATIO: f32 = 1.45;
+/// 各级标题行高系数（× 该级标题字号）。大标题收紧（微软官网大头 lot ~1.2-1.3 更利落）、
+/// 小级标题透气（~1.4-1.5），形成「越大越紧、越小越松」的现代排版节奏。索引 1..=6 对应
+/// # ~ ######（0 位不用）。
+pub const HEADING_LINE_RATIOS: [f32; 7] = [0.0, 1.3, 1.35, 1.4, 1.45, 1.5, 1.5];
+
+// ---------------------------------------------------------------------------
+// 居中阅读栏（预览 wrap 模式 + WYSIWYG md 预览共用单一来源）
+// ---------------------------------------------------------------------------
+
+/// 居中阅读栏开关：`true` 时正文内容宽度被钳到 [`READING_COL_CHARS`] 字符列宽并在面板内
+/// **水平居中**（预览 `markdown::view` 换行模式 + WYSIWYG `WyEditor` 同步生效；EPUB 阅读
+/// 走 `set_wrap(true)` 也自动套用）。代码/表格等宽块不裁剪——仍在列内各自横向滚动。
+pub const READING_COL_ENABLED: bool = true;
+/// 居中阅读栏目标**字符列数**（ch 单位）：正文排版宽度 ≈ `READING_COL_CHARS × 平均字宽`。
+/// 参考中英文阅读均适用的一栏 ~66-80ch（微软官网正文 ~70-75ch）。
+pub const READING_COL_CHARS: f32 = 72.;
+/// 平均字宽占正文字号的估算系数（em）：拉丁小写平均 ~0.5em、中文全角 ~1em，混合文档取
+/// 0.8 作贴近主文档的保守中间值——正文 14px 时 72ch ≈ 806px（典型阅读栏宽，窗口窄于此
+/// 时自动退化为可用宽，不会横向超界）。
+pub const READING_COL_AVG_CHAR_EM: f32 = 0.8;
+
+/// 阅读栏目标宽度（px）：`READING_COL_CHARS × body_fs × READING_COL_AVG_CHAR_EM`。
+/// 由**正文字号**驱动——预览/WYSIWYG 的 Ctrl+滚轮缩放、EPUB 字号覆盖变化时阅读栏
+/// 同步缩放；预览与 WYSIWYG 共用本函数，不再两处各写一套。
+#[inline]
+pub fn reading_col_px(body_fs: f32) -> f32 {
+    READING_COL_CHARS * body_fs * READING_COL_AVG_CHAR_EM
+}

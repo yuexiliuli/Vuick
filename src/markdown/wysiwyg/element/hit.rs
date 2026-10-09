@@ -182,18 +182,22 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
 /// 点命中（**窗口坐标**，`MouseDownEvent.position`）→ 源字节偏移。
 pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
     // window 坐标先换回元素局部（否则元素被 `live-body` 内边距/滚动/窗口位置偏移后，
-    // 点击会映射到错误的行/列），再走统一的局部命中。
-    let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
-    let local = point(p.x - origin.x, p.y - origin.y);
+    // 点击会映射到错误的行/列），再走统一的局部命中。居中阅读栏：还要叠减列水平移位
+    // （见 `to_local`），两类换算走同一函数保证一致。
+    let local = to_local(editor, p);
     source_offset_at_local(editor, frame, local)
 }
 
 
 
-/// 元素局部坐标（把窗口坐标减掉元素原点）。
+/// 元素局部坐标（把窗口坐标减掉元素原点 + 居中阅读栏水平移位）。
 pub(crate) fn to_local(editor: &WyEditor, p: Point<Pixels>) -> Point<Pixels> {
-    let origin = editor.last_bounds().map(|b| b.origin).unwrap_or_else(|| point(px(0.), px(0.)));
-    point(p.x - origin.x, p.y - origin.y)
+    let (origin, elem_w) = editor
+        .last_bounds()
+        .map(|b| (b.origin, f32::from(b.size.width)))
+        .unwrap_or_else(|| (point(px(0.), px(0.)), 0.));
+    let shift = editor.reading_col_shift(elem_w);
+    point(p.x - origin.x - px(shift), p.y - origin.y)
 }
 
 /// 独立图片行的**图片盒**元素局部 bounds（图片本身，不含下方题注行）。

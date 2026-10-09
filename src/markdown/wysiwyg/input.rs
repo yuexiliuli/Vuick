@@ -116,6 +116,8 @@ impl EntityInputHandler for WyEditor {
         let v = super::caret_vis();
         // `caret_vis` 是元素局部坐标（`paint` 时相对元素原点记录），需叠回元素在
         // 窗口中的原点，IME/输入法候选窗才落在光标处（否则整体偏移元素原点）。
+        // 居中阅读栏：内容列相对元素再平移 `reading_col_shift`，候选窗/竖条要与 paint
+        // 画到的光标位置一致（元素原点 + 列移位 + 帧内光标 x）。
         // 组合时画在标记文本上（从 marked 起点到本次输入终点），否则画光标竖条。
         // 换算走行索引（O(log n)），不再为判等物化全文。
         let r =
@@ -127,8 +129,9 @@ impl EntityInputHandler for WyEditor {
         } else {
             px(2.)
         };
+        let shift = self.reading_col_shift(f32::from(element_bounds.size.width));
         Some(gpui::Bounds::new(
-            gpui::point(element_bounds.origin.x + v.x, element_bounds.origin.y + v.top),
+            gpui::point(element_bounds.origin.x + px(shift) + v.x, element_bounds.origin.y + v.top),
             gpui::size(w, v.line_height),
         ))
     }
@@ -140,9 +143,14 @@ impl EntityInputHandler for WyEditor {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         // 真实命中：经 frame 反查源偏移（平台 IME/辅助功能用，坐标元素局部）。
+        // 居中阅读栏：平台给的是元素相对坐标，需再减掉内容列水平移位才落在帧内坐标系。
         let marker = self.frame.borrow();
         let f = marker.as_ref().map(|r| &**r)?;
-        let off = super::element::source_offset_at_local(self, f, point);
+        // 元素可用宽取最近一帧 `last_bounds`（paint 写入）；无则无移位（0）。
+        let elem_w = self.last_bounds().map(|b| f32::from(b.size.width)).unwrap_or(0.);
+        let shift = self.reading_col_shift(elem_w);
+        let p = gpui::point(point.x - gpui::px(shift), point.y);
+        let off = super::element::source_offset_at_local(self, f, p);
         drop(marker);
         Some(self.doc.byte_to_utf16(off))
     }

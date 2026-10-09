@@ -2,8 +2,8 @@
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
     use super::{
         build_frame, caret_geometry, cell_selection_display, display_to_source, layout_has_notdef,
-        prewarm_band, source_offset_at, source_to_display, table_block_height, table_cell_x0,
-        table_row_top, WyEditor,
+        prewarm_band, source_offset_at, source_offset_at_local, source_to_display,
+        table_block_height, table_cell_x0, table_row_top, WyEditor,
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
@@ -166,8 +166,8 @@
             // 第一可视行与第二可视行各自的「行内靠左」点击（x 相同、y 分属两个可视行）。
             let p1 = point(px(pad + 5.), px(top + line_h * 0.5));
             let p2 = point(px(pad + 5.), px(top + line_h * 1.5));
-            let o1 = source_offset_at(ed.read(cx), &frame, p1);
-            let o2 = source_offset_at(ed.read(cx), &frame, p2);
+            let o1 = source_offset_at_local(ed.read(cx), &frame, p1);
+            let o2 = source_offset_at_local(ed.read(cx), &frame, p2);
             // 第二可视行的点击必须落在第一可视行文本之后（而非被映射回第一行）。
             assert!(
                 o2 > o1,
@@ -636,6 +636,61 @@ let c = 3;
         });
     }
 
+    /// 居中阅读栏（WYSIWYG md 预览本体）：实测渲染后——帧宽被钳到 `min(72ch, 元素可用宽)`、
+    /// 居中移位 = 差值一半，且**窗口坐标命中**（叠回元素原点 + 列移位）与**元素局部命中**
+    /// 反查到同一源偏移（拖拽/点击/光标对齐不因居中而错位）。
+    #[gpui::test]
+    fn reading_column_clamps_frame_and_centers_hits(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| {
+                WyEditor::new(window, cx).with_text("# 标题\n一段正文文本，用于验证居中阅读栏。\n")
+            });
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let (fw, ew, shift) = vcx.update(|_window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let e = ed.read(cx);
+            let ew = e.last_bounds().map(|b| f32::from(b.size.width)).unwrap_or(0.);
+            let fw = e.frame.borrow().as_ref().map(|f| f32::from(f.width)).unwrap_or(0.);
+            (fw, ew, e.reading_col_shift(ew))
+        });
+        let body = vcx.update(|_window, cx| {
+            f32::from(host.read(cx).ed.read(cx).theme.font_size)
+        });
+        let col = crate::config::markdown::reading_col_px(body);
+        assert!(
+            (fw - col.min(ew)).abs() < 1.0,
+            "帧宽应钳到 min(72ch={col:.1}, 可用={ew:.1})，实际 {fw:.1}"
+        );
+        assert!(
+            (shift - (ew - fw) / 2.).abs() < 0.1,
+            "居中移位应为差值一半：{:.1}/2，实际 {shift:.1}",
+            ew - fw
+        );
+        // 有实际居中（宽窗）时：窗口坐标 = 元素原点 + 列移位 + 列内局部坐标，应反查到
+        // 与**直接局部命中**完全相同的源偏移。
+        if ew > fw + 1. {
+            vcx.update(|_window, cx| {
+                let ed = host.read(cx).ed.clone();
+                let e = ed.read(cx);
+                let frame = e.frame.borrow().clone().expect("真实渲染应已建帧");
+                let local = point(
+                    px(f32::from(frame.padding) + 10.),
+                    px(2.),
+                );
+                let win = point(local.x + px(shift), local.y);
+                let off_win = super::source_offset_at(&e, &frame, win);
+                let off_local = super::source_offset_at_local(&e, &frame, local);
+                assert_eq!(
+                    off_win, off_local,
+                    "窗口坐标叠加居中移位后应命中与局部坐标同一源偏移（off={off_local}）"
+                );
+            });
+        }
+    }
+
     #[gpui::test]
     fn image_load_updates_size_and_rebuilds_frame(cx: &mut TestAppContext) {
         cx.update(crate::actions::bind_local_keymaps);
@@ -831,7 +886,7 @@ let c = 3;
             let img = row.image.as_ref().unwrap();
             let caption_y = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
             let x = pad + f32::from(row.x_off) + 1.;
-            let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(caption_y)));
+            let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(caption_y)));
             assert_eq!(off, 2, "点击题注起始应命中 alt 起点（源 2），实际 {off}");
             // 光标置于 alt 起点 → 光标条应落在题注行内（y ≥ 图高，x 对题注居中起点）。
             ed.update(cx, |e, _| e.set_caret(2));
@@ -1088,7 +1143,7 @@ let c = 333;
                 [(0usize, "let a = 1;"), (1, "let b = 22;"), (2, "let c = 333;")]
             {
                 let p = point(px(pad + 30.), px(top + lh * 1.5 + lh * k as f32));
-                let off = source_offset_at(ed.read(cx), &frame, p);
+                let off = source_offset_at_local(ed.read(cx), &frame, p);
                 let (line, _) = ed.read(cx).row_col(off);
                 assert_eq!(line, 1 + k, "点击第 {k} 个代码行应命中源行 {}", 1 + k);
                 let ls = ed.read(cx).line_start(line);
@@ -1139,11 +1194,11 @@ let c = 333;
             let y = f32::from(code.top) + f32::from(code.lh) * 1.5;
             let view_x = f32::from(frame.padding) + f32::from(code.x_off) + 60.;
             let p = point(px(view_x), px(y));
-            let off0 = super::source_offset_at(ed.read(cx), &frame, p);
+            let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
             // 滚到最右（大偏移）→ 同一可视 x 命中更后的源列。
             ed.update(cx, |e, _| e.set_code_h_scroll(blk, max_scroll));
             let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let off1 = super::source_offset_at(ed.read(cx), &f2, p);
+            let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
             let (_, col0) = ed.read(cx).row_col(off0);
             let (_, col1) = ed.read(cx).row_col(off1);
             assert!(
@@ -1355,14 +1410,14 @@ let c = 333;
             let view_x = pad + 40.;
             let p = point(px(view_x), px(y));
             let (line0, col0) = {
-                let off0 = super::source_offset_at(ed.read(cx), &frame, p);
+                let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
                 let (l, c) = ed.read(cx).row_col(off0);
                 (l, c)
             };
             // 滚到最右 → 同一可视 x 应命中更后列的单元格。
             ed.update(cx, |e, _| e.set_table_h_scroll(blk, max_scroll));
             let f2 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let off1 = super::source_offset_at(ed.read(cx), &f2, p);
+            let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
             let (line1, col1) = ed.read(cx).row_col(off1);
             assert_eq!(line0, line1, "横向滚动不应改变命中行");
             assert!(col1 > col0, "同一 x 滚动后应命中更后列：col0={col0} col1={col1}");
@@ -1914,7 +1969,7 @@ tail
             let lh = f32::from(code.lh);
             let text_start = pad + off_x; // 24：代码文本起始 x（面板背景在 pad=12，与正文对齐）
             // 1) 点击文本起始处 → 光标 x == 文本起始 x（不右偏、不盖字）。
-            let off0 = source_offset_at(ed.read(cx), &frame, point(px(text_start), px(lh * 1.5)));
+            let off0 = source_offset_at_local(ed.read(cx), &frame, point(px(text_start), px(lh * 1.5)));
             let (line0, _) = ed.read(cx).row_col(off0);
             assert_eq!(line0, 1, "点击文本始应命中代码内容行，得行 {line0}");
             ed.update(cx, |e, _| e.set_caret(off0));
@@ -1926,7 +1981,7 @@ tail
                 f32::from(c0)
             );
             // 2) 点击面板内、文本左的内衬空白 → 光标收拢到行首（= 文本起始 x），不右偏。
-            let off1 = source_offset_at(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
+            let off1 = source_offset_at_local(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
             ed.update(cx, |e, _| e.set_caret(off1));
             let (on, c1, _) = caret_geometry(ed.read(cx), &frame);
             assert!(on);
@@ -1937,7 +1992,7 @@ tail
             );
             // 3) 文本中部点击 → 光标落点在 <1 字宽误差内贴合点击处。
             let cx_ = text_start + 28.;
-            let off2 = source_offset_at(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
+            let off2 = source_offset_at_local(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
             ed.update(cx, |e, _| e.set_caret(off2));
             let (on, c2, _) = caret_geometry(ed.read(cx), &frame);
             assert!(on);
@@ -1979,7 +2034,7 @@ tail
                 let tx = te.rows[row_ix].cells[cell_ix].text_x;
                 let y = top + table_row_top(t, row_ix) + rh / 2.;
                 let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 1.;
-                let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+                let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
                 let c = ed.read(cx).text().as_ref()[off..]
                     .chars()
                     .next()
@@ -2018,7 +2073,7 @@ tail
             let tx = te.rows[row_ix].cells[cell_ix].text_x;
             let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 20.;
             let y = top + table_row_top(t, row_ix) + rh / 2.;
-            let off = source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+            let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
             ed.update(cx, |e, _| e.set_caret(off));
             let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
             assert!(on, "表格单元格应可放光标");
@@ -3836,7 +3891,7 @@ A-->B
             // 点击文本带中部（正文 "a … b" 区域）→ 源偏移应落在行内。
             let y = shift + lh / 2.;
             let x = pad + 30.;
-            let off = super::source_offset_at(ed.read(cx), &frame, point(px(x), px(y)));
+            let off = super::source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
             let len = ed.read(cx).content().len() as f32;
             assert!(off as f32 <= len, "点击应解析到行内源偏移：off={off}");
             ed.update(cx, |e, _| e.set_caret(off));

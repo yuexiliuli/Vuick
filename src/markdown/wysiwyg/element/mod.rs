@@ -782,6 +782,17 @@ impl Element for WyEditorElement {
             } else {
                 px(800.)
             };
+            // 居中阅读栏：内容**布局宽**钳到 `min(72ch_px, 可用宽)`，整列（含 gutter）在
+            // 面板内水平居中。帧按 `build_w` 折行/整形，返回的**元素尺寸仍取 `width`**
+            // （= 面板可用宽）：元素占满面板，滚动/命中/IME 的窗口坐标语义不变；列居中
+            // 由 paint/hit 侧 `WyEditor::reading_col_shift` 平移完成，内容区内
+            // (`padding`/`x_off`/gutter) 坐标统一不变。72ch 由正文字号驱动缩放。
+            let build_w = if crate::config::markdown::READING_COL_ENABLED {
+                let body_fs = f32::from(e.theme.font_size);
+                px(crate::config::markdown::reading_col_px(body_fs).min(f32::from(width)))
+            } else {
+                width
+            };
             // 非确定宽度（Indefinite / 探测性 / `Definite(0px)` 等占位）一律不建帧：
             // 复用现成帧总高估算，只让真正的正 definite 宽度趟建帧。否则 0px/探测趟会
             // 以 `known`/800 兜底建一帧，下一趟 definite 真实宽又重建——帧缓存永不命中
@@ -805,7 +816,7 @@ impl Element for WyEditorElement {
                         && f.igen == igen
                         && f.mgen == mgen
                         && f.zgen == zgen
-                        && f.width == width
+                        && f.width == build_w
                         && f.band == band
                 })
                 .map(|f| f.total);
@@ -866,7 +877,7 @@ impl Element for WyEditorElement {
                         );
                     }
                     let _t_bf = crate::prof::begin();
-                    let frame = build_frame(e, window, width, band);
+                    let frame = build_frame(e, window, build_w, band);
                     crate::prof::end("wy.measure.bf", _t_bf);
                     let total = frame.total;
                     let _ = e;
@@ -891,6 +902,13 @@ impl Element for WyEditorElement {
         cx: &mut App,
     ) -> WyPrepaint {
         let _t_pp = crate::prof::begin();
+        // 居中阅读栏：内容列原点 = 元素屏幕原点 + 水平移位（见 `WyEditor::reading_col_shift`）。
+        // prepaint 期所有摆到窗口坐标的 hitbox / 卡片锚点都从「列原点」起算，与 paint 画到的
+        // 位置一致（否则命中/光标/卡片横向差一列）。
+        let col_origin = {
+            let shift = self.editor.read(cx).reading_col_shift(f32::from(bounds.size.width));
+            point(bounds.origin.x + px(shift), bounds.origin.y)
+        };
         // 可视带（窗口坐标 → 元素局部 y）：元素在滚动容器内的原点即滚动偏移；
         // 量程化使小滚动不动带（measure→prepaint 的带保持一致）。
         let vh = f32::from(window.viewport_size().height).max(1.);
@@ -996,7 +1014,7 @@ impl Element for WyEditorElement {
         // `link_hit_at` 一致（wrapped 首行的字形几何头/尾两段）。
         let mut link_grips = Vec::new();
         if let Some(f) = frame.as_ref() {
-            link_grips = Self::link_hit_grips(f, bounds, window);
+            link_grips = Self::link_hit_grips(f, col_origin, window);
         }
         // D1：滚动预热——带穿越前把下一量子带块提前 shape 进缓存（预算内摊平突发）。
         if let Some(f) = frame.as_ref() {
@@ -1016,7 +1034,7 @@ impl Element for WyEditorElement {
                 let Some(bb) = super::image_box_local(f, row) else {
                     continue;
                 };
-                let hb = super::image_resize_handle_window(bounds.origin, &bb);
+                let hb = super::image_resize_handle_window(col_origin, &bb);
                 resize_grips.push(window.insert_hitbox(hb, HitboxBehavior::Normal));
             }
         }
@@ -1050,6 +1068,14 @@ impl Element for WyEditorElement {
         let Some(f) = frame.as_ref() else {
             return;
         };
+        // 居中阅读栏：内容列在面板内水平居中——paint 原点 = 元素屏幕原点 + 列水平移位。
+        // 之后全部子绘制（行/背景/选区/搜索/光标/IME 竖条）+ 下方卡片锚点都相对列原点
+        // 起算，内容区内部坐标（padding/x_off/gutter）不变，拖拽/点击/光标天然对齐。
+        let shift = self
+            .editor
+            .read(cx)
+            .reading_col_shift(f32::from(bounds.size.width));
+        let origin = point(bounds.origin.x + px(shift), bounds.origin.y);
         // 记录本帧元素在窗口中的 bounds：`MouseDownEvent.position` 是窗口坐标，
         // `source_offset_at` 需用它把命中换算回元素局部坐标。
         self.editor
@@ -1061,7 +1087,7 @@ impl Element for WyEditorElement {
         self.editor
             .update(cx, |e, _| {
                 e.set_image_edit_anchor(
-                    frame.as_ref().and_then(|f| e.image_edit_anchor_at(bounds.origin, f)),
+                    frame.as_ref().and_then(|f| e.image_edit_anchor_at(origin, f)),
                 );
             });
         // 数学排版同步（可见带懒光栅）：只对**当前带内**公式发起排版（对齐
@@ -1076,7 +1102,6 @@ impl Element for WyEditorElement {
         self.editor
             .update(cx, |e, ecx| e.sync_code_parse(ecx));
         crate::prof::end("wy.paint.syncparse", _t_sp);
-        let origin = bounds.origin;
         // 首帧光栅预热（一次/进程）：先打热 DWrite 彩字管线再画真实行（见
         // [`warm_emoji_rasterizer`]——冷进程首次 COLR 光栅失败 → emoji 变空白/方框）。
         let _t_warm = crate::prof::begin();
@@ -1214,9 +1239,10 @@ impl WyEditorElement {
 
     /// 行内链接的 hand 光标 hitbox（paint 期 `set_cursor_style`）。几何与 `link_hit_at`
     /// 一致（wrapped 首行的字形几何头/尾两段）——折行时头段到行尾、尾段从行首起。
+    /// `origin` 传入**内容列原点**（元素屏幕原点 + 居中阅读栏移位），hitbox 与 paint 对齐。
     fn link_hit_grips(
         f: &Frame,
-        bounds: gpui::Bounds<gpui::Pixels>,
+        origin: gpui::Point<gpui::Pixels>,
         window: &mut Window,
     ) -> Vec<gpui::Hitbox> {
         let mut link_grips = Vec::new();
@@ -1227,8 +1253,8 @@ impl WyEditorElement {
             let Some(w0) = row.wrapped.first() else {
                 continue;
             };
-            let ox = bounds.origin.x + f.padding + row.x_off;
-            let oy = bounds.origin.y + row.top + px(text_row_shift(row));
+            let ox = origin.x + f.padding + row.x_off;
+            let oy = origin.y + row.top + px(text_row_shift(row));
             for lk in &row.extra.links {
                 let (Some(p0), Some(p1)) = (
                     w0.position_for_index(lk.disp.start, row.lh),

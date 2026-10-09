@@ -908,7 +908,7 @@ fn font_zoom_updates_override(cx: &mut TestAppContext) {
 }
 
 /// 标题字号应随正文字号等比缩放（#/##/### 一起变大变小，子级始终小于父级）。
-/// 设计基准 `HEADING_DESIGN_BASE`(=14) 下 h1=20 h2=18 h3/4=16 h5/6=15；其余字号按
+/// 设计基准 `HEADING_DESIGN_BASE`(=14) 下 h1=24 h2=20 h3=18 h4=16 h5/6=15；其余字号按
 /// `body / 基准` 等比放大，最多只放大 2 倍。与运行期默认字号 `layout::DEFAULT_FONT_SIZE`
 /// 无耦合（默认字号调大时基准不变）。
 #[gpui::test]
@@ -925,7 +925,7 @@ fn heading_metrics_scale_with_body_font(cx: &mut TestAppContext) {
     let ref14 = h(14.0);
     assert_eq!(
         &ref14[1..],
-        &[20.0, 18.0, 16.0, 16.0, 15.0, 15.0],
+        &[24.0, 20.0, 18.0, 16.0, 15.0, 15.0],
         "14px 时标题应等于设计值：{ref14:?}"
     );
     // 等比放大：正文翻倍 → 各标题也翻倍（比例不随 DEFAULT_FONT_SIZE 变化）。
@@ -968,6 +968,110 @@ fn heading_metrics_scale_with_body_font(cx: &mut TestAppContext) {
         )
         .0;
         assert_eq!(p.heading_metrics(lv).0, expect, "h{lv} 默认字号下应随正文缩放");
+    }
+}
+
+/// 居中阅读栏（wrap 模式）：内容列宽 = min(72ch, 视口) 且水平居中；窗口窄于 72ch 时
+/// 退化为占满视口（不横向超界）。宽块（代码/表格）仍在列内各自横向滚动（另一组测试钉死）。
+#[gpui::test]
+fn reading_column_caps_and_centers_wrap_list(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let md_src = "# 标题\n正文段落内容，用于验证居中阅读栏。\n\n- 列表项\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source(md_src, cx);
+            md.set_wrap(true, cx);
+        });
+    });
+    // 宽窗口（视口 > 72ch）：列宽 = 阅读栏宽，list-wrap 在面板内居中。
+    cx.simulate_resize(size(px(1400.), px(800.)));
+    settle(cx);
+    let wrap = cx.debug_bounds("md-list-wrap").expect("md-list-wrap 应渲染");
+    let pane = cx.debug_bounds("md-preview").expect("md-preview 应渲染");
+    let body_fs = cx.update(|_, cx| StyleParams::from_theme_with_font(cx, None).para_size.as_f32());
+    let col = crate::config::markdown::reading_col_px(body_fs);
+    let pane_w = pane.size.width.as_f32();
+    assert!(
+        (wrap.size.width.as_f32() - col).abs() < 3.0,
+        "宽窗下列宽应 = 72ch（{col:.0}），实际 {:.0}",
+        wrap.size.width.as_f32()
+    );
+    let expect_left = pane.origin.x.as_f32() + (pane_w - wrap.size.width.as_f32()) / 2.;
+    assert!(
+        (wrap.origin.x.as_f32() - expect_left).abs() < 3.0,
+        "列应水平居中：期望左缘 {expect_left:.0}，实际 {:?}",
+        wrap.origin
+    );
+    // 窄窗口（视口 < 72ch）：列宽退化为占满视口，不引入横向超界。
+    cx.simulate_resize(size(px(300.), px(800.)));
+    settle(cx);
+    let wrap_n = cx.debug_bounds("md-list-wrap").expect("窄窗 md-list-wrap 应渲染");
+    let pane_n = cx.debug_bounds("md-preview").expect("窄窗 md-preview 应渲染");
+    assert!(
+        (wrap_n.size.width.as_f32() - pane_n.size.width.as_f32()).abs() < 3.0,
+        "窄于 72ch 应占满视口：wrap={:.0} pane={:.0}",
+        wrap_n.size.width.as_f32(),
+        pane_n.size.width.as_f32()
+    );
+    // 非 wrap（手动预览横向滚动）不受阅读栏影响：列宽仍 = 内容宽（撑满视口）。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_wrap(false, cx));
+    });
+    cx.simulate_resize(size(px(1400.), px(800.)));
+    settle(cx);
+    let wrap_p = cx
+        .debug_bounds("md-list-wrap")
+        .expect("非 wrap md-list-wrap 应渲染");
+    assert!(
+        wrap_p.size.width.as_f32() >= 1397.,
+        "非 wrap 下列应保持撑满视口：{}",
+        wrap_p.size.width.as_f32()
+    );
+}
+
+/// 现代标题排版的配套常量（单一来源集中式断言）：
+/// - 阅读栏列宽 = `READING_COL_CHARS × body × READING_COL_AVG_CHAR_EM`（正文 14px ≈ 806px）；
+/// - 标题行高系数分级（h1 收紧 ~1.3 → h5/6 透气 ~1.5），大标题行高 < 小标题行高 < 正文 2×。
+#[gpui::test]
+fn reading_col_and_heading_line_ratio_constants(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let p = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
+    let body = p.para_size.as_f32();
+    let col = crate::config::markdown::reading_col_px(body);
+    assert_eq!(
+        col,
+        crate::config::markdown::READING_COL_CHARS
+            * body
+            * crate::config::markdown::READING_COL_AVG_CHAR_EM,
+        "阅读栏宽应 = 列数 × 正文字号 × 平均字宽系数"
+    );
+    // 正文 14px 参考：72ch ≈ 806px（典型阅读栏宽，符合「~800px 级」预期）。
+    assert!((crate::config::markdown::reading_col_px(14.0) - 806.4).abs() < 0.01);
+    assert!(
+        crate::config::markdown::READING_COL_ENABLED,
+        "阅读栏默认应开启"
+    );
+    // 行高系数分级：h1 < h2 < h3 < h4 < h5，且都 > 1、< 2（h1 收紧、小级透气）。
+    let ratios = crate::config::markdown::HEADING_LINE_RATIOS;
+    assert!(
+        ratios[1] < ratios[2] && ratios[2] < ratios[3] && ratios[3] < ratios[4] && ratios[4] < ratios[5],
+        "标题行高系数应由大到小分级：{ratios:?}"
+    );
+    for lv in 1..=6u8 {
+        let (fs, lh) = p.heading_metrics(lv);
+        let ratio = f32::from(lh) / f32::from(fs);
+        assert!(
+            (ratio - crate::config::markdown::HEADING_LINE_RATIOS[lv as usize]).abs() < 0.001,
+            "h{lv} 行高系数应等于分级常量 {}：得 {ratio:.2}",
+            crate::config::markdown::HEADING_LINE_RATIOS[lv as usize]
+        );
     }
 }
 
