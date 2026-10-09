@@ -3187,8 +3187,9 @@ A-->B
         let base = gpui::font("Arial");
         let mono = gpui::font("Consolas");
         let text = "点 示例 你";
-        // 渲染字节 [2..4) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。
-        let runs = vec![((2..8), crate::markdown::parse::RunKind::Link)];
+        // 渲染字节 [4..10) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。用**已对齐**的
+        // char 边界区间测正常路径；中切区间由 `runs_to_text_runs_clamps_*` 单独覆盖。
+        let runs = vec![((4..10), crate::markdown::parse::RunKind::Link)];
         let accent = gpui::Hsla::default();
         let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
         let code_inline_fg = gpui::Hsla::default();
@@ -3218,8 +3219,114 @@ A-->B
         // 非链接段保持预设底色（基色），不误伤。
         let _ = FontWeight::default();
         assert!(
-            out.iter().any(|r| r.len == 2),
-            "应有链接前导“点 ”（2 字节）段"
+            out.iter().any(|r| r.len == 4),
+            "应有链接前导“点 ”（4 字节，对齐后的字符边界段）"
+        );
+    }
+
+    #[test]
+    fn runs_to_text_runs_clamps_mid_char_ranges_to_char_boundaries() {
+        // 回归：run 边界落在多字节字符（CJK/emoji）内部时不得 panic，产出的每个
+        // gpui::TextRun 长度必须停在 `text` 的字符边界上并铺满全文——否则 GPUI
+        // `Text`/`StyledText` 在非字符边界切 run 会 panic
+        // （`elements/text.rs`：`assertion failed: self.text.is_char_boundary(run.start)`），
+        // 对应预览侧 `markdown::view::row::char_align_range` 的既有防御。
+        use super::runs_to_text_runs;
+        use crate::markdown::parse::RunKind;
+        let base = gpui::font("Arial");
+        let mono = gpui::font("Consolas");
+        let accent = gpui::Hsla::default();
+        let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
+        let code_inline_fg = gpui::Hsla::default();
+        // "测🍎试❗"：测=3B，🍎=4B，试=3B，❗=3B → 13 字节。
+        let text = "测🍎试❗";
+        assert_eq!(text.len(), 13);
+        let plain = gpui::Hsla::default();
+
+        // 校验输出：run 无空隙铺满全文，且每个 run 边界都是字符边界。
+        let verify_tiling = |text: &str, out: &[gpui::TextRun]| {
+            let mut off = 0usize;
+            for r in out {
+                assert!(r.len > 0, "不应产出空 run");
+                assert!(
+                    text.is_char_boundary(off),
+                    "run 起点 {off} 不是字符边界（len={}）",
+                    r.len
+                );
+                let end = off + r.len;
+                assert!(end <= text.len(), "run 越界：{end} > {}", text.len());
+                assert!(
+                    text.is_char_boundary(end),
+                    "run 终点 {end} 不是字符边界（len={}）",
+                    r.len
+                );
+                off = end;
+            }
+            assert_eq!(off, text.len(), "TextRun 必须无空隙铺满全文");
+        };
+
+        // —— 1) 起点切进『测』内部(b=1)、终点切进 🍎 内部(b=5) ——
+        // 吸收后应是 [0..3) 正文 + [3..7) 加粗(🍎) + [7..13) 正文。
+        let out = runs_to_text_runs(
+            text,
+            &[(1..5, RunKind::Bold)],
+            &base,
+            plain,
+            &mono,
+            accent,
+            link,
+            code_inline_fg,
+        );
+        verify_tiling(text, &out);
+        let bold = out.iter().filter(|r| r.font.weight == gpui::FontWeight::BOLD).collect::<Vec<_>>();
+        assert_eq!(bold.len(), 1, "应收敛出一个加粗 run: {out:?}");
+        assert_eq!(bold[0].len, 4, "加粗 run 应恰好覆盖 🍎（4 字节）");
+
+        // —— 2) 完全落在『测』内部的区间 [1..2)（两端都非边界）→ 坍缩为空、被丢弃 ——
+        let out = runs_to_text_runs(
+            text,
+            &[(1..2, RunKind::Bold), (10..13, RunKind::Italic)],
+            &base,
+            plain,
+            &mono,
+            accent,
+            link,
+            code_inline_fg,
+        );
+        verify_tiling(text, &out);
+        let italics = out.iter().filter(|r| r.font.style == gpui::FontStyle::Italic).collect::<Vec<_>>();
+        assert_eq!(italics.len(), 1, "斜体 run 应保留一个（❗）: {out:?}");
+        assert!(text.is_char_boundary(italics[0].len), "斜体 run 长度应为字符边界长");
+
+        // —— 3) 越界区间 + 反向区间 + 重叠区间：一律不 panic、输出仍然铺满 ——
+        let tricky = vec![
+            (20..30, RunKind::Bold),      // 整体越界 → 吸收到行尾/空
+            (9..2, RunKind::Italic),      // 反向 → 空
+            (1..13, RunKind::Link),       // 切进首字符 → 吸收成 [0..13) 整行链接
+        ];
+        let out = runs_to_text_runs(&text, &tricky, &base, plain, &mono, accent, link, code_inline_fg);
+        verify_tiling(text, &out);
+        assert!(
+            out.iter().any(|r| r.underline.is_some()),
+            "链接段应至少保留（整行）：{out:?}"
+        );
+
+        // —— 4) 行内代码 + 多字节：菱形/emoji 混排不被切半 ——
+        let text2 = "代码`测🍎`尾";
+        let out = runs_to_text_runs(
+            text2,
+            &[(3..8, RunKind::InlineCode)],
+            &base,
+            plain,
+            &mono,
+            accent,
+            link,
+            code_inline_fg,
+        );
+        verify_tiling(text2, &out);
+        assert!(
+            out.iter().any(|r| r.font == mono),
+            "行内代码段应走等宽字体：{out:?}"
         );
     }
 

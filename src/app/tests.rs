@@ -2716,6 +2716,225 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// 回归：用户报告的「编辑→切换」panic 路径（`toggle_live_test` ON → WYSIWYG 里
+    /// 编辑含 CJK/emoji 的行内样式文本 → 切 OFF（`commit_live` 写回源码编辑区与预览）
+    /// → 再切 ON）。历史上该往返在 run 边界非 UTF-8 字符边界时于 GPUI
+    /// `StyledText::with_highlights` 崩（`assertion failed: is_char_boundary(run.start)`，
+    /// 预览 `char_align_range` 已防御，WYSIWYG `runs_to_text_runs` 缺防御）。本测试用
+    /// 真实 `target/测试.md`（CJK/链接/粗体/emoji 满篇）走完整开关往返，确保不 panic
+    /// 且内容往返一致。
+    #[gpui::test]
+    async fn wysiwyg_toggle_edit_cjk_roundtrip_does_not_panic(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::current_dir()
+            .unwrap()
+            .join("target/测试.md");
+        let src_expected = std::fs::read_to_string(&md).expect("read 测试.md");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ON：进入 WYSIWYG（live2）实时编辑模式。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 在 WYSIWYG 文档开头插入一行含 CJK/emoji/行内样式的文本（编辑后的多字节内容）。
+        let inserted = "# 切换后新增❗🍎 **测试**\n";
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            live.update(cx, |e, cx| {
+                e.replace_range(0..0, inserted, cx);
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let live_text = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert!(live_text.starts_with("# 切换后新增❗🍎 **测试**\n"), "WYSIWYG 编辑应生效：{live_text:?}");
+        // OFF：commit_live 写回源码编辑区 + Markdown 预览（此步历史上触发 run 边界 panic）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let committed = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).value().to_string()
+        });
+        assert_eq!(committed, format!("{inserted}{src_expected}"), "切换 OFF 应把 WYSIWYG 全文写回编辑区");
+        // ON 再切回：WYSIWYG 以已提交文本重建，往复一致、不 panic。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let re_on = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab]
+                .live2
+                .as_ref()
+                .map(|w| w.read(cx).text().to_string())
+                .unwrap_or_default()
+        });
+        assert_eq!(re_on, committed, "再次切换 ON 后 WYSIWYG 内容应与写回内容一致");
+    }
+
+    /// 回归（用户确认）：WYSIWYG 区**删除标题记号 `#`**（标题行 → 普通段落，CJK 文本
+    /// 行变短/重排），再切「预览编辑测试」OFF（`commit_live` 整篇写回源码编辑区）与 ON。
+    /// 历史上源码编辑区 `styled_row_text` 把陈旧的 `rd.highlights`（按字节搬运的区间，
+    /// `end` 越过变短后的新行长 / 切进 CJK 字符内部）直接喂 `StyledText::with_highlights`
+    /// → gpui `elements/text.rs:446` 的 `is_char_boundary(run.end)` debug_assert 崩溃。
+    /// 本测试走真实 `target/测试.md`（找不到则造等价临时文件）删首个 `#` 记号后完整
+    /// 开关往返，确保不 panic 且内容往返一致。
+    #[gpui::test]
+    async fn wysiwyg_toggle_heading_delete_does_not_panic(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 候选源：真实 `target/测试.md`（不清写）；缺或无标题则造等价 CJK 临时文件。
+        let md = std::env::current_dir().unwrap().join("target/测试.md");
+        let (md, src_text) = match std::fs::read_to_string(&md) {
+            Ok(s) if s.contains("# ") => (md, s),
+            _ => {
+                let tmp = std::env::temp_dir().join(format!(
+                    "gpui-wy-head-del-{}.md",
+                    std::process::id()
+                ));
+                let fallback = "# 标题\n正文段落。\n\n## 二级\n\n- [ ] 待办\n".to_string();
+                std::fs::write(&tmp, &fallback).unwrap();
+                (tmp, fallback)
+            }
+        };
+        // 在原始源文本里定位首个行首 `# ` 记号，算「删掉该 `#` 后」的期望全文。
+        let del_at_full = {
+            let mut byte = 0usize;
+            let mut found = None;
+            for line in src_text.split('\n') {
+                if line.starts_with("# ") {
+                    found = Some(byte);
+                    break;
+                }
+                byte += line.len() + 1;
+            }
+            found.expect("src 应有行首 `# ` 标题记号")
+        };
+        let expected_after = {
+            let mut s = src_text.clone();
+            s.replace_range(del_at_full..del_at_full + 1, "");
+            s
+        };
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ON：进入 WYSIWYG（live2）实时编辑模式。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 在 WYSIWYG 文档里按同一偏移删掉该 `#`（标题 → 普通段落）。
+        let live = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+        });
+        let live_len = cx.update(|_w, cx| live.read(cx).text().len());
+        assert!(
+            del_at_full < live_len,
+            "WYSIWYG 文本字节应与源一致（标题记号偏移 {del_at_full} < {live_len}）"
+        );
+        live.update(cx, |e, cx| {
+            e.replace_range(del_at_full..del_at_full + 1, "", cx);
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // OFF：commit_live 写回源码编辑区（此步历史上触发 run.end 非字符边界 panic）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let committed = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].editor.read(cx).value().to_string()
+        });
+        assert_eq!(
+            committed, expected_after,
+            "切换 OFF 应把「删掉首个 `#` 记号」后的全文写回编辑区"
+        );
+        // ON 再切回：WYSIWYG 以已提交文本重建，往复一致、不 panic。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let re_on = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab]
+                .live2
+                .as_ref()
+                .map(|w| w.read(cx).text().to_string())
+                .unwrap_or_default()
+        });
+        assert_eq!(re_on, committed, "再次切换 ON 后 WYSIWYG 内容应与写回内容一致");
+    }
+
     /// Markdown 预览（分屏，统一组件 WyEditor 宿主）纵向滚动条拖拽：向下拖 -> 内容实时
     /// 向下滚，向上拖 -> 实时反向。回归：预览窗口模式拖拽只写共享 `desired`，render 逐帧
     /// `apply_desired` 落窗口；若该 Apply 在往下方向被 clamp/跳过，会出现「只有松开才动」。

@@ -654,7 +654,13 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
 }
 
 fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
-    StyledText::new(rd.text.clone()).with_highlights(rd.highlights.clone())
+    // 咽喉点兜底：`rd.highlights` 是行内字节区间（md 滤镜 / syntect 缓存 / 选区合并后），
+    // 编辑→重析后行文本变短或区间按字节切进 CJK/emoji 多字节字符内部时，gpui
+    // `StyledText::with_highlights` 的 `is_char_boundary(run.end)` debug_assert 会崩
+    // （`elements/text.rs`，dev 构建 panic）。这里把每个段吸收到 `rd.text` 的字符边界、
+    // 钳入行尾、空段丢弃、段间不重叠——`StyledText` 永不看到坏区间。
+    let highlights = char_align_highlights(rd.text.as_ref(), &rd.highlights);
+    StyledText::new(rd.text.clone()).with_highlights(highlights)
 }
 
 /// 把「着色/滤镜段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
@@ -720,6 +726,45 @@ pub(crate) fn merge_highlights(
         if style != HighlightStyle::default() {
             out.push((a..b, style));
         }
+    }
+    out
+}
+
+/// 把 `text` 上的一组样式段钳到 UTF-8 **字符边界**内（镜像预览
+/// `markdown::view::row::char_align_range`）、钳入行尾，空段丢弃，并保持段间**互不
+/// 重叠递增**（起点取 `max(对齐起点, 上一段终点)`、按 start 排序）。
+///
+/// 必要性：`StyledText::with_highlights` 在 gpui `elements/text.rs` 里有
+/// `debug_assert!(text.is_char_boundary(run.start/end))`——编辑→重析后行文本变短、
+/// 或上游（md 滤镜 / syntect 缓存 / 选区）按字节搬运的区间切进 CJK/emoji 多字节字符
+/// 内部时，直接喂 `StyledText` 会在 dev 下 panic（用户实测「WYSIWYG 删除标题记号 →
+/// 切换」即崩在 `run.end`）。本函数在 `styled_row_text` 的咽喉点兜底：返回的每个段
+/// 都是合法边界内的不重叠段，越界 / 反向 / 中切字符的区间被吸收或丢弃。
+pub(crate) fn char_align_highlights(
+    text: &str,
+    highlights: &[(Range<usize>, HighlightStyle)],
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let len = text.len();
+    // 向前进位吸收到最近的字符边界（同预览 `char_align_range`），再钳入行尾。
+    let align = |mut p: usize| -> usize {
+        p = p.min(len);
+        while p < len && !text.is_char_boundary(p) {
+            p += 1;
+        }
+        p
+    };
+    let mut sorted: Vec<&(Range<usize>, HighlightStyle)> = highlights.iter().collect();
+    sorted.sort_by_key(|(r, _)| (r.start, r.end));
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(sorted.len());
+    let mut cursor = 0usize;
+    for (r, style) in sorted {
+        let s = align(r.start).max(cursor);
+        let e = align(r.end).max(s);
+        if e <= s {
+            continue;
+        }
+        out.push((s..e, *style));
+        cursor = e;
     }
     out
 }

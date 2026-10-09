@@ -793,6 +793,98 @@ fn merge_highlights_keeps_selection_within_line_and_non_overlapping() {
     assert!(!plain.is_empty(), "无选区也应有语法段");
 }
 
+/// 回归（用户确认）：`styled_row_text` 用 `StyledText::with_highlights` 渲染 `rd.highlights`，
+/// gpui `elements/text.rs` 里对每个 run 都有 `is_char_boundary(start/end)` debug_assert
+/// ——编辑→重析后行文本变短、或上游按字节搬运的区间切进 CJK/emoji 多字节字符内部时
+/// （如「WYSIWYG 删除标题记号 `#` → 切换」令标题行变普通段落、区间端越过新行长或落在
+/// 字符中），会在 dev 构建直接 panic。`char_align_highlights` 是 `styled_row_text` 的咽喉
+/// 兜底：把陈旧/脏区间吸收到`text`字符边界、钳入行尾、空段丢弃、段间不重叠。
+#[test]
+fn char_align_highlights_survives_stale_ranges() {
+    use gpui::{HighlightStyle, SharedString, StyledText};
+
+    // "测🍎试❗"：测=3B，🍎=4B，试=3B，❗=3B → 13 字节。
+    let text = "测🍎试❗";
+    assert_eq!(text.len(), 13);
+
+    let bold = HighlightStyle {
+        font_weight: Some(gpui::FontWeight::BOLD),
+        ..Default::default()
+    };
+    let italic = HighlightStyle {
+        font_style: Some(gpui::FontStyle::Italic),
+        ..Default::default()
+    };
+
+    // 一把“脏”区间：越界 end / start-end 都切在多字节字符内 / 反向区间。
+    let stale = vec![
+        (1..20, bold),   // start 切进『测』(0..3) 内部，end 越界
+        (8..8, italic),  // 空区间
+        (4..8, bold),    // start=4、end=8 都不在字符边界
+        (13..1, italic), // 反向区间
+    ];
+
+    let clamped = crate::editor::view::char_align_highlights(text, &stale);
+
+    // 0) 机制证明：**不钳就直接喂** `StyledText::with_highlights`，坏区间会在 dev 构建
+    //    触发 gpui `elements/text.rs` 的 `is_char_boundary(run.end)` debug_assert（用户
+    //    报告的正是这条 panic 路径）——先确认机制存在，再证明钳后不再触发。
+    let raw_bad = vec![(4..8, bold)];
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _st = StyledText::new(SharedString::from(text)).with_highlights(raw_bad.clone());
+    }));
+    assert!(
+        panicked.is_err(),
+        "未钳的坏区间 {raw_bad:?} 喂 StyledText 应在 dev 构建 panic（复刻用户断言）"
+    );
+
+    // 1) 每个段都在字符边界内、互不重叠递增、总量不超行字节长。
+    let mut prev = 0usize;
+    let mut covered = 0usize;
+    for (r, _) in &clamped {
+        assert!(r.start >= prev, "段应递增不重叠: {clamped:?}");
+        assert!(r.end > r.start, "不应产出空段: {clamped:?}");
+        assert!(r.end <= text.len(), "end {r:?} 越界 {}", text.len());
+        assert!(
+            text.is_char_boundary(r.start),
+            "start {} 不是字符边界: {clamped:?}",
+            r.start
+        );
+        assert!(
+            text.is_char_boundary(r.end),
+            "end {} 不是字符边界: {clamped:?}",
+            r.end
+        );
+        prev = r.end;
+        covered += r.end - r.start;
+    }
+    assert!(covered <= text.len(), "覆盖总量 {covered} > {}", text.len());
+
+    // 2) 交给真实 `StyledText::with_highlights` 不 panic（走同一 debug_assert 咽喉）。
+    let _st = StyledText::new(SharedString::from(text)).with_highlights(clamped.clone());
+
+    // 3) 语义验证：越界+中切段应被吸收成整行加粗（[3..13) 覆盖全字），不丢样式。
+    assert!(
+        clamped.iter().any(|(r, s)| {
+            r.start == 3 && r.end == 13 && s.font_weight == bold.font_weight
+        }),
+        "被吸收的区间应收敛成 [3..13) 加粗段: {clamped:?}"
+    );
+
+    // 4) 已对齐输入幂等：merging_highlights 的正常输出原样保留。
+    let clean = vec![
+        (0..3, bold),
+        (3..7, italic), // 🍎
+        (7..10, bold),  // 试
+        (10..13, bold), // ❗
+    ];
+    assert_eq!(
+        crate::editor::view::char_align_highlights(text, &clean),
+        clean,
+        "已对齐输入应原样保留"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 视图
 // ---------------------------------------------------------------------------

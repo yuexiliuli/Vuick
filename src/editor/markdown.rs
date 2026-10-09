@@ -517,11 +517,13 @@ impl MarkdownDecor {
         }
     }
 
-    /// 清理缓存（整篇替换等场景；版本号变化时本会自动失效，此接口兜底）。
-    #[allow(dead_code)]
+    /// 清理缓存（整篇替换等场景；`CodeEditor::set_text/reset_document` 调，防新旧文档
+    /// 同 `version=0` 命中上一份文档的样式区间——版本号只在**缓存已建立**后才有防御
+    /// 意义，替换 Buffer 后必须显式清空，见 reset_document）。
     pub(crate) fn clear(&mut self) {
         self.key = None;
         self.lines.clear();
+        self.base_row = 0;
     }
 
     /// 请求可见行窗口 `[lo, hi]`（含两端）的装饰样式。返回**与请求窗口对齐**的
@@ -779,5 +781,56 @@ mod tests {
                 .any(|(_, s)| s.font_weight == Some(FontWeight::BOLD));
             assert!(bold, "行 {r} 应有加粗段: {text:?}");
         }
+    }
+
+    #[test]
+    fn clear_prevents_version_zero_stale_window_after_buffer_replacement() {
+        // 回归（用户确认的删除标题 `#` → 切换 panic 的色彩层根因）：`commit_live` 写回
+        // 用 `Buffer::new` 替换文档后 version 归零（新 Buffer 从 version=0 起），若不清
+        // `MarkdownDecor` 缓存，`scan_window` 会以 `(version=0, lo, hi)` **命中旧文档**的
+        // 样式区间——把「删掉标题 `#` 后」的短行（` 标题`）套上旧 `# 标题` 的高亮
+        // （区间端越过新行长），进编辑器 `StyledText::with_highlights` 即崩在
+        // `is_char_boundary(run.end)`（gpui `elements/text.rs`）。修复 = `reset_document`
+        // 里像 `Highlighter::invalidate` 一样显式 `MarkdownDecor::clear()`。
+        let src = Buffer::new("# 标题\n");
+        let mut dec = MarkdownDecor::new();
+        let before = dec.scan_window(&src, 0, 0, 16).to_vec();
+        assert!(
+            before[0].iter().any(|(_, s)| s.font_weight == Some(FontWeight::BOLD)),
+            "标题行应有样式（否则测试无意义）"
+        );
+        assert!(
+            before[0].iter().any(|(r, _)| r.end > " 标题".len()),
+            "旧文档标题样式应落在 ` 标题`（7B）之外，命中必崩: {:?}",
+            before[0]
+        );
+
+        // 替换文档（模拟 `commit_live::set_text`）：新旧 Buffer 都是 version=0（碰撞前提）。
+        let dst = Buffer::new(" 标题\n");
+        assert_eq!(
+            src.version(),
+            dst.version(),
+            "新旧 Buffer 都从 version=0 起（缓存键碰撞前提）"
+        );
+
+        // 不清缓存 → 命中旧文档样式（复刻 bug 的数据流）。
+        let stale = dec.scan_window(&dst, 0, 0, 16).to_vec();
+        assert_eq!(stale, before, "不清缓存时应命中旧文档样式（stale）");
+
+        // 修复：`reset_document` 调 `clear()` 后按新文本重扫，区间全部落回行内、无标题。
+        dec.clear();
+        let fresh = dec.scan_window(&dst, 0, 0, 16).to_vec();
+        assert!(
+            fresh[0].iter().all(|(r, _)| r.end <= " 标题".len()),
+            "清缓存后应按新文本重扫，全部区间在行内: {:?}",
+            fresh
+        );
+        assert!(
+            !fresh[0]
+                .iter()
+                .any(|(_, s)| s.font_weight == Some(FontWeight::BOLD)),
+            "「 标题」（无 `#`）不再是标题，不应有粗体样式: {:?}",
+            fresh
+        );
     }
 }
