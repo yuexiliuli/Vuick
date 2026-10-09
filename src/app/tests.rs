@@ -944,32 +944,26 @@
         let _ = std::fs::remove_file(&dir2);
     }
 
-    /// 选项卡栏最右侧的新建(+)按钮：应渲染出（非零尺寸）按钮 + 手绘「＋」图标，且可点击新建。
+    /// 回归：选项卡栏最右侧的「新建(+)」按钮已移除——不再渲染 `tab-add` / `tab-add-icon`；
+    /// 新建能力由右键菜单 / 菜单栏 / Ctrl+N 承担（此处直接调用 `new_tab`，与旧测试同意图）。
     #[gpui::test]
-    async fn tab_add_button_renders_plus_icon(cx: &mut TestAppContext) {
+    async fn tab_add_button_removed(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
+        assert!(
+            cx.debug_bounds("tab-add").is_none(),
+            "「+」新建按钮 tab-add 应已移除"
+        );
+        assert!(
+            cx.debug_bounds("tab-add-icon").is_none(),
+            "手绘 ＋ 图标 tab-add-icon 应已移除"
+        );
+        // 新建选项卡的能力仍在
         let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
-        // 按钮 + 图标都有非零尺寸
-        let btn = cx
-            .debug_bounds("tab-add")
-            .expect("新建按钮 tab-add 应存在");
-        let icon = cx
-            .debug_bounds("tab-add-icon")
-            .expect("手绘 ＋ 图标 tab-add-icon 应存在");
-        assert!(
-            btn.size.width > px(0.) && btn.size.height > px(0.),
-            "新建按钮应有实际尺寸，实际={btn:?}"
-        );
-        assert!(
-            icon.size.width > px(0.) && icon.size.height > px(0.),
-            "＋ 图标应有实际尺寸，实际={icon:?}"
-        );
-        // 点击 → 新建选项卡
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.new_tab(window, cx));
         });
@@ -977,7 +971,83 @@
             cx.run_until_parked();
         }
         let tabs1 = cx.update(|_w, cx| app.read(cx).tabs.len());
-        assert_eq!(tabs1, tabs0 + 1, "点击/调用新建后应增加 1 个选项卡");
+        assert_eq!(tabs1, tabs0 + 1, "新建应增加 1 个选项卡");
+    }
+
+    /// 选项卡栏右键上下文菜单（取代「+」按钮）：右键整条 tab-bar → 弹「新建文件 /
+    /// 打开文件」菜单（`tab-bar-menu` + 两个带 debug_selector 的菜单项）；点「新建文件」
+    /// → 新建选项卡且菜单关闭；再右键 → 点「打开文件」→ 触发 `open_dialog`
+    /// （测试为 stub，只计数不真弹窗）且菜单关闭。
+    #[gpui::test]
+    async fn tab_bar_right_click_menu_creates_tab_and_opens(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 3);
+        let tabs0 = cx.update(|_w, cx| app.read(cx).tabs.len());
+
+        // 右键选项卡栏内（栏左缘右侧 40px、垂直居中）→ 弹上下文菜单
+        let bar = cx
+            .debug_bounds("tab-bar")
+            .expect("选项卡栏 tab-bar 应渲染");
+        let right_click_at = gpui::Point::new(bar.origin.x + px(40.), bar.origin.y + px(16.));
+        cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
+        settle_frames(cx, 3);
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            "右键选项卡栏应弹出上下文菜单"
+        );
+        assert!(
+            cx.debug_bounds("tab-bar-menu").is_some(),
+            "应渲染选项卡栏右键菜单根 tab-bar-menu"
+        );
+        let item_new = cx
+            .debug_bounds("tab-bar-menu-item-new")
+            .expect("菜单应有「新建文件」项");
+        let item_open = cx
+            .debug_bounds("tab-bar-menu-item-open")
+            .expect("菜单应有「打开文件」项");
+        assert!(
+            item_new.size.width > px(0.) && item_open.size.width > px(0.),
+            "菜单项应有实际尺寸"
+        );
+
+        // 点「新建文件」→ 新建选项卡 + 菜单关闭
+        cx.simulate_click(item_new.center(), Default::default());
+        settle_frames(cx, 3);
+        let (tabs1, menu_closed) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.tabs.len(), a.tab_bar_menu_pos.is_none())
+        });
+        assert_eq!(tabs1, tabs0 + 1, "点「新建文件」应新建 1 个选项卡");
+        assert!(menu_closed, "点菜单项后菜单应关闭");
+        assert!(
+            cx.debug_bounds("tab-bar-menu-item-new").is_none(),
+            "关闭后菜单项不应再渲染"
+        );
+
+        // 再右键 → 点「打开文件」→ 触发 open_dialog（计数断言）且菜单关闭
+        let bar2 = cx
+            .debug_bounds("tab-bar")
+            .expect("新建后选项卡栏仍在");
+        let right_click_at2 = gpui::Point::new(bar2.origin.x + px(60.), bar2.origin.y + px(16.));
+        cx.simulate_mouse_down(right_click_at2, MouseButton::Right, Default::default());
+        settle_frames(cx, 3);
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            "再次右键应重新弹出菜单"
+        );
+        let item_open2 = cx
+            .debug_bounds("tab-bar-menu-item-open")
+            .expect("「打开文件」项应再次渲染");
+        cx.simulate_click(item_open2.center(), Default::default());
+        settle_frames(cx, 3);
+        let (calls, menu_closed2) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.open_dialog_calls, a.tab_bar_menu_pos.is_none())
+        });
+        assert_eq!(calls, 1, "点「打开文件」应触发一次 open_dialog");
+        assert!(menu_closed2, "点「打开文件」后菜单应关闭");
     }
 
     /// 侧边栏：默认仅收窄为活动栏（目录面板收起，占 46px 不挤正文）；
@@ -7133,6 +7203,102 @@
             max_off > px(0.),
             "列表溢出时应在容器内可滚动：max_offset={max_off:?}"
         );
+    }
+
+    /// 回归（用户报告 #3）：打开文件后 Ctrl+Shift+P 打开面板，面板输入框必须可聚焦与可键入，
+    /// 点击不得穿透到下层编辑器。
+    ///
+    /// 覆盖两条：
+    /// ① 打开真实文件（焦点在编辑区）→ 触发 Ctrl+P 路径动作 `ToggleCommandPalette` →
+    ///    面板打开时输入框持有焦点；随后键入字符确实写入查询框。
+    /// ② 焦点被夺回编辑器（模拟点击穿透后果）→ 鼠标点击面板输入框中心 →
+    ///    焦点应收纳到面板输入框（不得停留在编辑器）；随后键入仍写入查询框。
+    ///
+    /// 历史根因：面板浮层是 `deferred(absolute+flex)` 时 hitbox 位置失真（第一段探针
+    /// 最小结构复现），且浮层无 BlockMouse 屏障，点击命中面板元素后仍继续命中下方编辑器、
+    /// 编辑器 on_mouse_down 把焦点抢回。修复：全窗包裹去 flex、显式 left/top 定位 + `.occlude()`。
+    #[gpui::test]
+    async fn palette_input_focusable_and_clickable_after_open_file(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 真实文件（热键路径：先打开文件，焦点落在编辑区）
+        let p = std::env::temp_dir().join(format!("gpui-pal-reg-{}.rs", std::process::id()));
+        std::fs::write(&p, "fn main() {}\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+
+        // ① 打开面板（Ctrl+P 同一动作路径）→ 输入框持有焦点
+        cx.dispatch_action(ToggleCommandPalette);
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().expect("面板应已打开").clone());
+        let input_handle = cx.update(|_w, cx| palette.read(cx).input_handle(cx));
+        let focused_on_open = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused_on_open.as_ref(),
+            Some(&input_handle),
+            "打开面板时输入框应持有焦点"
+        );
+        cx.simulate_keystrokes("cop");
+        cx.run_until_parked();
+        let query_after_open = cx.update(|_w, cx| palette.read(cx).query().to_string());
+        assert_eq!(query_after_open, "cop", "打开后键入应写入查询框");
+
+        // ② 焦点夺回编辑器（模拟点击穿透的后果）→ 点击输入框应收纳焦点
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        let editor_handle = cx.update(|_w, cx| app.read(cx).editor_focus_handle(cx));
+        assert_eq!(
+            cx.update(|window, cx| window.focused(cx)).as_ref(),
+            Some(&editor_handle),
+            "前置：焦点应在编辑区"
+        );
+        let qb = cx.debug_bounds("command-palette-query").expect("查询框应渲染");
+        let click_point = gpui::Point::new(qb.origin.x + qb.size.width / 2., qb.origin.y + qb.size.height / 2.);
+        cx.simulate_click(click_point, Default::default());
+        cx.run_until_parked();
+        cx.run_until_parked();
+        let focused_after_click = cx.update(|window, cx| window.focused(cx));
+        assert_eq!(
+            focused_after_click.as_ref(),
+            Some(&input_handle),
+            "点击面板输入框应收纳焦点（不得因穿透停留在编辑器）"
+        );
+        cx.simulate_keystrokes("y");
+        cx.run_until_parked();
+        let query_after_click_typing = cx.update(|_w, cx| palette.read(cx).query().to_string());
+        assert_eq!(
+            query_after_click_typing, "copy",
+            "点击聚焦后键入应写入查询框"
+        );
+
+        // 收尾：Esc 关闭后焦点回落编辑区
+        cx.simulate_keystrokes("escape");
+        for _ in 0..6 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.update(|_w, cx| app.read(cx).palette.is_none()),
+            "Esc 应关闭面板"
+        );
+        let _ = std::fs::remove_file(&p);
     }
 
     /// 外壳无缝直连（阶段一回归）——三块方直角区块的「零缝隙」几何（真实渲染路径

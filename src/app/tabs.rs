@@ -3,7 +3,7 @@
 use super::*;
 use crate::config::timing::TAB_HSCROLL_HIDE_MS;
 use crate::scrollbar::horizontal_scrollbar;
-use crate::ui::motion::{hover_bg_fade, hover_spring};
+use crate::ui::motion::hover_spring;
 
 /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
 struct TabBarColors {
@@ -11,8 +11,6 @@ struct TabBarColors {
     text_minor: gpui::Hsla,
     tab_active_bg: gpui::Hsla,
     tab_active_border: gpui::Hsla,
-    chip_bg: gpui::Hsla,
-    chip_text: gpui::Hsla,
     hover_fill: gpui::Hsla,
 }
 
@@ -238,8 +236,6 @@ impl EditorApp {
             text_minor: self.text_minor(),
             tab_active_bg: self.tab_active_bg(),
             tab_active_border: self.tab_active_border(),
-            chip_bg: self.chip_bg(),
-            chip_text: self.chip_text(),
             hover_fill: c.hover_fill.into(),
         }
     }
@@ -364,81 +360,6 @@ impl EditorApp {
         .into_any_element()
     }
 
-    /// 新建(+)：手绘「＋」形图标（横/竖两条圆角细条居中），替代文本 "+"，
-    /// 避免不同字体下粗细/偏移不一显得歪斜；带 hover/按下交互反馈。
-    fn tab_add_button(
-        window: &mut Window,
-        colors: &TabBarColors,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        // P2-10：hover 状态跨帧记录 → 填充层淡入（不覆盖常态 chip_bg）。
-        let hover = window.use_keyed_state("tab-add-hover", cx, |_, _| false);
-        let hovered = *hover.read(cx);
-        let view_id = window.current_view();
-        div()
-            .id("tab-add")
-            .debug_selector(|| "tab-add".into())
-            .relative()
-            .w(px(24.))
-            .h(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .bg(colors.chip_bg)
-            .cursor(CursorStyle::PointingHand)
-            .active(|style| style.bg(colors.tab_active_border))
-            .on_hover({
-                let st = hover.clone();
-                move |h, _w, cx| {
-                    st.update(cx, |v, _| *v = *h);
-                    cx.notify(view_id);
-                }
-            })
-            .on_click(
-                cx.listener(|this: &mut EditorApp, _ev, window, cx| {
-                    this.new_tab(window, cx)
-                }),
-            )
-            .child(hover_bg_fade(
-                div().absolute().inset_0().rounded_md(),
-                "tab-add-bg",
-                colors.hover_fill,
-                hovered,
-            ))
-            .child(
-                div()
-                    .id("tab-add-icon")
-                    .debug_selector(|| "tab-add-icon".into())
-                    .relative()
-                    .w(px(10.))
-                    .h(px(10.))
-                    // 横条：居中水平线
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(4.))
-                            .left(px(0.))
-                            .right(px(0.))
-                            .h(px(2.))
-                            .rounded_full()
-                            .bg(colors.chip_text),
-                    )
-                    // 竖条：居中垂直线（盖在横条之上）
-                    .child(
-                        div()
-                            .absolute()
-                            .left(px(4.))
-                            .top(px(0.))
-                            .bottom(px(0.))
-                            .w(px(2.))
-                            .rounded_full()
-                            .bg(colors.chip_text),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
     /// 时才显示，点击切换当前选项卡的 Markdown 预览（与「查看 → 预览」一致）。
     /// 用纯 div 画出（椭圆外框 + 中心瞳孔），避免依赖 emoji 字体；蓝色=已开，灰色=已关。
@@ -539,13 +460,19 @@ impl EditorApp {
         }
     }
 
-    /// 选项卡栏：横跨右列顶部的选项卡行，左侧滚动区 + 新建/眼睛按钮。
+    /// 选项卡栏：横跨右列顶部的选项卡行，左侧滚动区 + （按需）眼睛按钮；
+    /// 右键整条栏弹「新建文件 / 打开文件」上下文菜单（取代已移除的「+」按钮）。
     /// 底边绘一条右列宽发丝线（`bar_border`），分隔下方编辑区正文。
+    /// 零选项卡（`tabs.is_empty()`，即欢迎页呈现时）提前返回空元素——选项卡栏
+    /// 在 flex 列中占零高度，欢迎页从标题栏下直接铺到状态栏。
     pub(super) fn render_tab_bar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        if self.tabs.is_empty() {
+            return div().into_any_element();
+        }
         let active = self.active_tab;
         let colors = self.tab_bar_colors(cx);
         let mut tabs: Vec<gpui::AnyElement> = Vec::new();
@@ -553,7 +480,7 @@ impl EditorApp {
             tabs.push(Self::tab_bar_item(tab, i, i == active, &colors, window, cx));
         }
 
-        // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
+        // 选项卡栏右侧：固定放（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
         let mut right: Vec<gpui::AnyElement> = Vec::new();
         if let Some(eye) = self.tab_eye_button(window, cx) {
             right.push(eye);
@@ -570,13 +497,18 @@ impl EditorApp {
             .debug_selector(|| "tab-bar".into())
             .relative()
             .w_full()
-            // 左侧不留内边距：第一个选项卡紧贴窗口左边缘；右侧保留 px_2 给新建/眼睛按钮
+            // 左侧不留内边距：第一个选项卡紧贴窗口左边缘；右侧保留 px_2 给眼睛按钮
             .pl_0()
             .pr_2()
             .flex()
             .items_center()
             .gap_1()
             .bg(self.mica_bar_bg())
+            // 右键整条栏（含点在各选项卡上，事件冒泡到这）→ 「新建文件 / 打开文件」上下文菜单
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::on_tab_bar_right_click),
+            )
             // 选项卡栏↔编辑区的发丝线由下方编辑区顶边绘制（见 render_body_card，
             // 此处不画底边框，避免被后绘制的编辑区面板盖住）。
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
@@ -610,7 +542,102 @@ impl EditorApp {
                     )
                     .children(hscroll_overlay),
             )
-            .child(Self::tab_add_button(window, &colors, cx))
             .children(right)
+            .into_any_element()
+    }
+
+    /// 选项卡栏右键 → 在光标处弹「新建文件 / 打开文件」上下文菜单（取代已移除的「+」
+    /// 按钮）。关闭（选择/Esc/点击外）经 `DismissEvent` 订阅清理；先收掉上一份菜单
+    /// （若有）再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）。
+    fn on_tab_bar_right_click(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 事件继续冒泡到树根会额外触发图片/视频右键「锁定」菜单（on_media_right_click），
+        // 此处拦截，保证右键选项卡栏只弹本菜单。
+        cx.stop_propagation();
+        self.tab_bar_menu_entity = None;
+        self.tab_bar_menu_pos = None;
+        self.tab_bar_menu_sub = None;
+        let weak = cx.weak_entity();
+        let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+            menu.item({
+                let weak = weak.clone();
+                PopupMenuItem::element(move |_, _| {
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .child("新建文件")
+                        .debug_selector(|| "tab-bar-menu-item-new".into())
+                })
+                .on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.new_tab(window, cx));
+                })
+            })
+            .item({
+                let weak = weak.clone();
+                PopupMenuItem::element(move |_, _| {
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .child("打开文件")
+                        .debug_selector(|| "tab-bar-menu-item-open".into())
+                })
+                .on_click(move |_, window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.open_dialog(window, cx));
+                })
+            })
+        });
+        // 聚焦并记住开菜单前的焦点（关闭后归还）
+        let previous_focus = window.focused(cx);
+        let focus_handle = menu.read(cx).focus_handle(cx);
+        menu.update(cx, |m, _| m.set_previous_focus(previous_focus));
+        window.focus(&focus_handle, cx);
+        // 关闭（选择/Esc/点击外）→ 清理；emitter 身份校验避免旧菜单的关闭误清新菜单
+        let menu_entity = menu.clone();
+        let sub = cx.subscribe(&menu_entity, move |this, emitter, _: &DismissEvent, cx| {
+            if this.tab_bar_menu_entity.as_ref() == Some(&emitter) {
+                this.tab_bar_menu_entity = None;
+                this.tab_bar_menu_pos = None;
+            }
+            cx.notify();
+        });
+        self.tab_bar_menu_pos = Some(ev.position);
+        self.tab_bar_menu_entity = Some(menu);
+        self.tab_bar_menu_sub = Some(sub);
+        cx.notify();
+    }
+
+    /// 选项卡栏右键菜单 Overlay：按右键时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
+    pub(super) fn render_tab_bar_menu(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(pos) = self.tab_bar_menu_pos else {
+            return div().into_any_element();
+        };
+        let Some(menu) = self.tab_bar_menu_entity.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("tab-bar-menu")
+            .debug_selector(|| "tab-bar-menu".into())
+            .child(
+                deferred(
+                    anchored()
+                        .position_mode(gpui::AnchoredPositionMode::Window)
+                        .anchor(Anchor::TopLeft)
+                        .offset(pos)
+                        .snap_to_window_with_margin(Edges::all(px(8.)))
+                        .child(menu),
+                )
+                .with_priority(100),
+            )
+            .into_any_element()
     }
 }

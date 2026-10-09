@@ -555,6 +555,18 @@ impl Render for CommandPalette {
 
         // 合成层纪律（同通知/菜单）：整层 deferred 独立绘制 + 全窗包裹做水平居中，
         // 面板自身挂 on_mouse_down_out（点击面板外关闭，机制与 PopupMenu 一致）。
+        //
+        // 命中测试警示：
+        // ① 全窗包裹必须是 absolute 的**非 flex** 容器。本 GPUI 版本下
+        //   `absolute + flex(items_start/justify_center)` 作为 deferred 直子时，其子元素
+        //   （面板/查询输入框/列表行）注册的 hitbox 位置失真，点击全穿透到下层编辑器
+        //   （2026-10-09 最小结构复现：v0 失败、显式 left/top 定位成功）。
+        // ② 全窗包裹要 `occlude()`（BlockMouse）——否则点击虽会命中面板元素，但仍会
+        //   继续命中其下方编辑器的 hitbox，编辑器 on_mouse_down 随后把焦点抢回去
+        //   （输入框 `on_mouse_down` 不 stop_propagation）。occlude 让 hit-test 停在
+        //   本层，点击不再穿透到编辑器。
+        let win_w = window.bounds().size.width.as_f32();
+        let x = ((win_w - 600.) / 2.).max(8.);
         gpui::deferred(
             div()
                 .absolute()
@@ -562,11 +574,8 @@ impl Render for CommandPalette {
                 .left_0()
                 .right_0()
                 .bottom_0()
-                .flex()
-                .items_start()
-                .justify_center()
-                .pt(px(96.))
-                .child(panel),
+                .occlude()
+                .child(div().absolute().left(px(x)).top(px(96.)).child(panel)),
         )
         .with_priority(210)
     }

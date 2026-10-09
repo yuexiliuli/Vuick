@@ -380,6 +380,12 @@ pub struct EditorApp {
     media_lock_menu_entity: Option<gpui::Entity<crate::ui::menu::PopupMenu>>,
     /// 媒体右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     media_lock_menu_sub: Option<Subscription>,
+    /// 选项卡栏右键「新建/打开」上下文菜单：弹出位置（窗口坐标）。None = 未打开。
+    tab_bar_menu_pos: Option<Point<Pixels>>,
+    /// 已打开的选项卡栏右键菜单实体（随位置同生同灭）。
+    tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,
+    /// 选项卡栏右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
+    tab_bar_menu_sub: Option<Subscription>,
     focus_handle: FocusHandle,
     /// 编辑区⇄预览（MD 统一组件 WyEditor）滚动同步基线：当前选项卡 + 上次已同步的
     /// 双方块起点键。每帧渲染开头比对、由「动了的那一侧」驱动对端；切换选项卡/换
@@ -567,6 +573,9 @@ impl EditorApp {
             media_lock_menu_pos: None,
             media_lock_menu_entity: None,
             media_lock_menu_sub: None,
+            tab_bar_menu_pos: None,
+            tab_bar_menu_entity: None,
+            tab_bar_menu_sub: None,
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
             _appearance_sub: None,
@@ -1285,7 +1294,11 @@ impl EditorApp {
         let Some(media) = self.active_media_viewer() else {
             return;
         };
-        // 先收掉上一份菜单（若有），再在光标处新建（旧订阅带 emitter 身份校验，不会误清新菜单）
+        // 先收掉选项卡栏右键菜单与上一份媒体菜单（若有），再在光标处新建
+        // （旧订阅带 emitter 身份校验，不会误清新菜单）
+        self.tab_bar_menu_entity = None;
+        self.tab_bar_menu_pos = None;
+        self.tab_bar_menu_sub = None;
         self.media_lock_menu_entity = None;
         self.media_lock_menu_pos = None;
         self.media_lock_menu_sub = None;
@@ -1350,7 +1363,7 @@ impl EditorApp {
 
     /// 外壳子元素：锁定图片/视频视图时只放「媒体铺满窗口」（藏菜单栏/选项卡栏/侧边栏/
     /// 状态栏），否则齐全；正常态为「标题栏 + [侧栏 | 右列(选项卡栏在上、编辑区在下)] +
-    /// 状态栏」；始终带通知层与媒体右键菜单 Overlay。
+    /// 状态栏」；始终带通知层与右键菜单（媒体锁定 + 选项卡栏）Overlay。
     fn render_shell_children(
         &mut self,
         body: gpui::AnyElement,
@@ -1379,8 +1392,9 @@ impl EditorApp {
             out.push(self.render_body_sidebar(body, window, cx).into_any_element());
             out.push(self.render_status_bar(window, cx).into_any_element());
         }
-        // 媒体右键菜单 Overlay 恒在最上层（通知层提升到外层根最后绘制，见 render_root）
+        // 右键菜单 Overlay（媒体锁定 + 选项卡栏）恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());
+        out.push(self.render_tab_bar_menu(window, cx).into_any_element());
         out
     }
 
@@ -2115,11 +2129,6 @@ impl EditorApp {
     /// 次要/弱化文字颜色。
     fn text_minor(&self) -> gpui::Hsla {
         self.chrome().text_minor.into()
-    }
-
-    /// 胶囊/小按钮等"芯片"背景。
-    fn chip_bg(&self) -> gpui::Hsla {
-        self.chrome().chip_bg.into()
     }
 
     /// 芯片上的文字颜色。
