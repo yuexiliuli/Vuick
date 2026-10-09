@@ -782,7 +782,7 @@ pub(crate) fn build_frame(
     crate::prof::end("wy.bf.plan", _t_plan);
 
     // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
-    let (i0, i1) = find_band_range(&base, &deltas, band_lo, band_hi, n);
+    let (i0, mut i1) = find_band_range(&base, &deltas, band_lo, band_hi, n);
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
@@ -795,7 +795,7 @@ pub(crate) fn build_frame(
     // 定向作废覆盖。**不含 `struct_ver`**：结构编辑（Enter/合并）后位移但内容未变的块
     // 指纹不变 → 命中旧行，免整带重排（这是「结构编辑后带重整形 ~6ms」的架构根因）。
     let shape_key = (width_bits as u64) ^ editor.mermaid_zoom_gen();
-    let shaped = pass2_shape_band(
+    let mut shaped = pass2_shape_band(
         editor,
         window,
         doc,
@@ -811,6 +811,43 @@ pub(crate) fn build_frame(
         &plan,
         &reveal,
     );
+    // 带覆盖自校正（滚动闪烁 / 首屏缺内容根治）：`find_band_range` 按**估算高**二分截断
+    // 带内块区间；Pass2 边 shape 边把**真实高** `set` 回 base（见 pass2 末尾）。估算过大于
+    // 真实（大块首屏尤甚）时，截断处 base 仍是估算 → 物化行底（真值坐标）远低于带高
+    // `band_hi` → 带下方一屏没有行可画：滚动时视口整屏空白（用户所见「内容出现后闪烁
+    // 消失」）、打开时下半屏缺内容。这里以已校正的 base 重算 `i1` 并补齐新块，直到物化
+    // 窗真值底到达 `band_hi` 或已到文末——在**同一帧 build 内**收敛，不产生中间空白帧。
+    // 收敛：真实高写回后 `find_band_range` 的上界单调不减（块数上界 n）；`CAP` 兜底
+    // 过估极端文档（每轮都向前推进带内块数，16 轮远超实际需要）。
+    const BAND_COVER_CAP: usize = 16;
+    let mut band_cover_steps = 0;
+    while i1 < n && band_cover_steps < BAND_COVER_CAP {
+        band_cover_steps += 1;
+        // 用「Pass2 已写回真实高后的 base」重算 [band_lo, band_hi) 的带内上界。
+        let (_, i1_next) = find_band_range(&base, &deltas, band_lo, band_hi, n);
+        if i1_next <= i1 {
+            break;
+        }
+        // 补齐 [i1, i1_next)：整带重跑 shape（前段命中整形缓存，代价≈仅新块），以覆盖
+        // [i0, i1_next) 的最新输出为准；base 再被新块写回真实高，下轮继续收窄差距。
+        i1 = i1_next;
+        shaped = pass2_shape_band(
+            editor,
+            window,
+            doc,
+            &base,
+            theme,
+            &base_font,
+            width,
+            avail,
+            i0,
+            i1,
+            shape_key,
+            caret_line,
+            &plan,
+            &reveal,
+        );
+    }
 
     // Pass 3：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
     let (rows, total) = pass3_assemble_rows(

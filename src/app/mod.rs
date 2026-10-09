@@ -2191,6 +2191,22 @@ impl EditorApp {
                 view.set_background(panel_bg);
                 cx.notify();
             });
+            // A2/A4：右栏统一 WyEditor 预览（md_wy）与 WYSIWYG 活区（live2）的调色主题
+            // 在创建时一次性派生并缓存（`WyTheme`←`StyleParams`，见 `WyEditor::new`）——
+            // 主题切换后必须重建，否则预览/WYSIWYG 的文字/代码块/链接等颜色保持旧主题色
+            // （原先只刷背景，内容色滞后 →“切换黑白后预览不完全重染色/用旧色”）。
+            if let Some(wy) = tab.md_wy.clone() {
+                wy.update(cx, |ed, cx| {
+                    ed.rebuild_theme_from_global(cx);
+                    cx.notify();
+                });
+            }
+            if let Some(ed) = tab.live2.clone() {
+                ed.update(cx, |ed, cx| {
+                    ed.rebuild_theme_from_global(cx);
+                    cx.notify();
+                });
+            }
             // PDF 阅读器同样刷新背景（主题色变化后与画布保持一致）
             if let Some(pdf) = &tab.pdf_preview {
                 let pv = pdf.clone();

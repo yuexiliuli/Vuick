@@ -1147,6 +1147,18 @@ impl WyEditor {
         self.notdef_retry.borrow_mut().clear();
     }
 
+    /// 从全局主题**重建整份调色主题**（应用「切换黑白主题」后调用）：WyTheme 在
+    /// `new()` 时由 [`StyleParams::from_theme_with_font`] 一次性派生并缓存（主题切换
+    /// 后如不重建，预览/WYSIWYG 的文字/代码块/链接等颜色会保持旧主题色）。正文字体与
+    /// 字号沿用本主题既有的（创建时从 `window.text_style()` 确定性取用），只重建色板。
+    /// `set_theme` 会清空帧/布局/整形缓存，下一帧按新色板重画。
+    pub(crate) fn rebuild_theme_from_global(&mut self, cx: &mut gpui::App) {
+        let fs = self.theme.font_size;
+        let body_font = self.theme.font.clone();
+        let p = StyleParams::from_theme_with_font(cx, Some(f32::from(fs)));
+        self.set_theme(WyTheme::from_style(&p, body_font, fs));
+    }
+
     /// 切只读/可编辑门控（A1：MD 右栏预览用）。只读 = 输入/IME/删除/撤销/粘贴短路
     /// （`replace_range` 硬门控）、不画光标；保留光标移动、点选/复制、链接点击、折叠、
     /// 搜索高亮、表格/代码横向滚动条。切只读时丢弃 IME 组合态、收拢选区为光标（避免
@@ -5084,5 +5096,20 @@ impl gpui::Render for WyEditor {
             root = root.child(overlay);
         }
         root
+    }
+}
+#[cfg(test)]
+impl WyEditor {
+    pub(crate) fn test_theme_fg(&self) -> gpui::Hsla {
+        self.theme.text
+    }
+    pub(crate) fn test_theme_code_bg(&self) -> gpui::Hsla {
+        self.theme.code_bg
+    }
+    pub(crate) fn test_theme_link(&self) -> gpui::Hsla {
+        self.theme.link
+    }
+    pub(crate) fn test_theme_is_dark(&self) -> bool {
+        self.theme.is_dark
     }
 }

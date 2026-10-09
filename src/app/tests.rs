@@ -2274,6 +2274,152 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 回归：切换黑白主题后，右栏统一 WyEditor 预览（`md_wy`）必须整份重染色。
+    /// `WyTheme` 在创建时从 [`crate::markdown::view::style::StyleParams`] 一次性派生并
+    /// 缓存（`WyEditor::new`）；若 `refresh_theme_ui` 不重建，亮→暗后预览文字/代码块/
+    /// 链接仍保持旧亮色版（黑字压 `EDITOR_BG_DARK #121314` 底上几乎不可见）——即
+    /// 用户报的「切换黑白后预览不完全重染色 / 用旧色」。用真切换路径断言预览主题
+    /// 逐项切换到暗色 `StyleParams`、再切回亮色板。
+    #[gpui::test]
+    async fn md_wy_preview_rethemes_on_theme_toggle(cx: &mut TestAppContext) {
+        init_test(cx);
+        // 固定亮色起（全局共享，避免污染其它测试）。
+        cx.update(|cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Light, cx));
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!("gpui-mdwy-theme-{}.md", std::process::id()));
+        std::fs::write(&md, "# 标题\n\n正文内容，以及 ```rs\nlet x = 1;\n``` 代码块\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let read_theme = |cx: &mut gpui::App| {
+            let a = app.read(cx);
+            let ed = a.tabs[a.active_tab].md_wy.clone()?;
+            let e = ed.read(cx);
+            Some((
+                e.test_theme_fg(),
+                e.test_theme_code_bg(),
+                e.test_theme_link(),
+                e.test_theme_is_dark(),
+            ))
+        };
+        let light = cx
+            .update(|_w, cx| read_theme(cx).expect("右栏预览应已创建（亮色）"));
+        assert!(!light.3, "初始应为亮主题");
+        // 切暗色（真切换路径 refresh_theme_ui）。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = true;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let dark = cx
+            .update(|_w, cx| read_theme(cx).expect("右栏预览应仍存在（暗色）"));
+        assert!(dark.3, "切换暗色后预览主题应标记 is_dark");
+        assert_ne!(
+            (dark.0, dark.1, dark.2),
+            (light.0, light.1, light.2),
+            "预览正文/代码/链接色必须随主题切换（不再是旧亮色板）"
+        );
+        // 新色板与暗色 StyleParams 单一来源逐项一致。
+        let sp_dark = cx.update(|_w, cx| {
+            crate::markdown::view::style::StyleParams::from_theme_with_font(cx, None)
+        });
+        assert_eq!(dark.0, sp_dark.fg, "预览正文色应=暗色 StyleParams.fg");
+        assert_eq!(dark.1, sp_dark.code_bg, "预览代码底色应=暗色 StyleParams.code_bg");
+        assert_eq!(dark.2, sp_dark.link, "预览链接色应=暗色 StyleParams.link");
+        // 切回亮色。
+        cx.update(|_w, cx| {
+            app.update(cx, |a, cx| {
+                a.dark_mode = false;
+                a.refresh_theme_ui(cx);
+                cx.notify();
+            });
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let light2 = cx
+            .update(|_w, cx| read_theme(cx).expect("右栏预览应仍存在（切回亮色）"));
+        assert!(!light2.3, "切回亮色后预览应标记非暗色");
+        assert_eq!(
+            (light2.0, light2.1, light2.2),
+            (light.0, light.1, light.2),
+            "切回亮色应回到亮色板"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 回归守卫（issue-2）：预览宿主容器应恰好铺满正文区视口高
+    /// （= 窗高 − 标题栏 − 选项卡栏 − 状态栏），滚动容器与预览外框等高、底不越到
+    /// 状态栏——不塌缩（内容不可见）也不超高（底部被状态栏/窗口裁剪）。
+    #[gpui::test]
+    async fn preview_pane_content_box_fills_viewport(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!("gpui-pane-h-{}.md", std::process::id()));
+        std::fs::write(&md, "正文行\n".repeat(300)).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (pv, sc, tb, st) = {
+            let pv = cx
+                .debug_bounds("preview-md-wy")
+                .expect("预览外框 preview-md-wy 应渲染");
+            let sc = cx
+                .debug_bounds("md-wy-scroll")
+                .expect("预览滚动容器 md-wy-scroll 应渲染");
+            let tb = cx
+                .debug_bounds("tab-bar")
+                .expect("选项卡栏应渲染");
+            let st = cx
+                .debug_bounds("status-bar")
+                .expect("状态栏应渲染");
+            (pv, sc, tb, st)
+        };
+        let win_h = 900.0f32;
+        let title_h = 32.0f32;
+        let expect_h = win_h - title_h - tb.size.height.as_f32() - st.size.height.as_f32();
+        assert!(
+            (pv.size.height.as_f32() - expect_h).abs() < 2.0,
+            "预览外框高应=正文区视口高({expect_h:.0})，实际 {pv:?}"
+        );
+        assert_eq!(
+            sc.size.height, pv.size.height,
+            "滚动容器应与预览外框等高（不塌缩/不超高），sc={sc:?} pv={pv:?}"
+        );
+        assert!(
+            pv.bottom().as_f32() <= win_h - st.size.height.as_f32() + 1.0,
+            "预览底不得越到状态栏（无裁剪），pv={pv:?}"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// A2：右栏 WyEditor 预览的只读门控——`replace_range` 等编辑入口在预览实体上
     /// 一律短路（第 #1 条：右栏只能看/选/复制，绝不能改到预览内容）。
     #[gpui::test]

@@ -6053,6 +6053,92 @@ A-->B
         crate::prof::dump("wy.scroll.warm");
     }
 
+    #[gpui::test]
+    fn window_rows_cover_every_band_realfile(cx: &mut TestAppContext) {
+        // 回归：滚动闪烁 / 首屏缺内容（GUI 实测：预览区滚轮后整屏空白、打开时下半屏
+        // 无内容）。根因 = `build_frame` 的带窗口用「估算高」二分截断 [`find_band_range`]，
+        // Pass2 把真实高 `set` 回 base 后，物化行底（真值坐标）可能远低于带高 `band_hi`
+        // → 带的下一屏没有任何行可画（视口空白一整帧/持续到下一次重建）。本测试断言
+        // **每个带的物化行（真值坐标）必须覆盖到 `band_hi`**（或带已越过文档末尾）——
+        // 覆盖视口的前提。用真实大文档 + 模拟 prepaint 的 512px 带量程逐档驱动。
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(crate::actions::bind_local_keymaps);
+        let path = "fixtures/大文档测试2.md";
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[test] skip realfile: {e}");
+                return;
+            }
+        };
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let width = px(980.);
+        let vh = 720.0f32;
+        let q = 512.0f32;
+        // 逐档推进的视口顶（元素局部 y）：从顶部连续滚 + 滚到 30k px 数学/表格密集区。
+        let mut tops: Vec<f32> = Vec::new();
+        for k in 0..24 {
+            tops.push(400.0 * (k + 1) as f32);
+        }
+        for k in 0..16 {
+            tops.push(30_000.0 + 400.0 * (k + 1) as f32);
+        }
+        let mut processed = 0usize;
+        for top in tops {
+            let band = (
+                (((top - vh) / q).floor() * q).max(0.),
+                ((top + 2. * vh) / q).ceil() * q,
+            );
+            // build_frame 是纯函数，返回的这一帧正是 prepaint 将存给 paint 用的帧——
+            // 直接断言它，而不是读编辑器里可能滞后的旧帧。
+            let frame = vcx.update(|window, cx| {
+                let ed = host.read(cx).ed.clone();
+                build_frame(ed.read(cx), window, width, band)
+            });
+            let (blo, bhi) = band;
+            let (max_bottom, total, rows) = {
+                let mb = frame
+                    .rows
+                    .iter()
+                    .map(|r| r.top.as_f32() + r.height.as_f32())
+                    .fold(0.0f32, f32::max);
+                (mb, frame.total.as_f32(), frame.rows.len())
+            };
+            processed += 1;
+            // 带未越过文档末尾（total > band_hi）时，物化行底必须 ≥ band_hi（+折叠尾部
+            // 容差）。这是「下一屏有行可画」= 视口不被空白穿帮的必要条件。
+            let over_end = total <= bhi + 1.0;
+            if !over_end {
+                assert!(
+                    max_bottom + 32.0 >= bhi,
+                    "band={band:?} top={top:.0}: materialized rows end at {max_bottom:.0}, \
+                     need >= {bhi:.0} (total={total:.0}, rows={rows}) — 改带下方没有行可画"
+                );
+            }
+            // 行区间必须覆盖带中点（bin:lo + 尾 block 可达 hi，但中间不得有物化空洞）。
+            let mid = (blo + bhi) / 2.0;
+            let mid_ok = frame
+                .rows
+                .iter()
+                .any(|r| {
+                    let rb = r.top.as_f32();
+                    let re = rb + r.height.as_f32();
+                    rb <= mid && re >= mid
+                });
+            if !over_end && max_bottom >= bhi - 32.0 {
+                assert!(
+                    mid_ok,
+                    "band={band:?} top={top:.0}: rows 未覆盖带中点 {mid:.0} (rows={rows})"
+                );
+            }
+        }
+        assert!(processed > 20, "应实际驱动了 >20 个带（processed={processed}）");
+    }
+
     #[test]
     fn layout_has_notdef_flags_missing_glyph() {
         // `.notdef`（元字形，glyph id=0）＝ Windows 冷启动回退未命中的「豆腐块」。
