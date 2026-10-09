@@ -7135,13 +7135,17 @@
         );
     }
 
-    /// 外壳卡片化（阶段一）——三张卡的浮层几何（真实渲染路径 `debug_bounds` 断言）：
-    /// - 贴边直角：侧栏卡左缘贴窗（`origin.x == 0`）、正文卡右缘贴窗（`right == 窗宽`）、
-    ///   状态栏底缘贴窗（`bottom == 窗高`）；
-    /// - 卡间间距 = `shell::CARD_GAP`（侧栏↔正文 6px、正文↔状态栏 6px、状态栏左右 6px）；
-    /// - 面板收起时侧栏↔正文之间保留 `sidebar-gap` 空间隔。
+    /// 外壳无缝直连（阶段一回归）——三块方直角区块的「零缝隙」几何（真实渲染路径
+    /// `debug_bounds` 断言）：
+    /// - 贴边直角：侧栏左缘贴窗（`origin.x == 0`）、正文块右缘贴窗（`right == 窗宽`）、
+    ///   状态栏左/右/底缘贴窗（`origin.x == 0`、`right == 窗宽`、`bottom == 窗高`）；
+    /// - 无缝直连（零间距）：侧栏右缘 ↔ 正文块左缘、正文块顶 ↔ 选项卡栏底、
+    ///   正文块底 ↔ 状态栏顶，三处间距均 ≈ 0；
+    /// - 面板收起时无右缘手柄（`sidebar-resize`）也无旧空间隔（`sidebar-gap`）；
+    ///   面板展开时右缘调宽手柄 `sidebar-resize` 渲染（绝对细线内嵌侧栏右缘，非分隔带）；
+    /// - 整体收起时 `app-body-with-sidebar` 包裹层一并消失（`sidebar-gap` 恒不存在）。
     #[gpui::test]
-    async fn shell_cards_floating_geometry(cx: &mut TestAppContext) {
+    async fn shell_seamless_geometry(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
@@ -7149,60 +7153,101 @@
             cx.run_until_parked();
         }
         let _ = app;
-        let gap = crate::ui::shell::CARD_GAP;
         let win_w = 980.0f32;
         let win_h = 720.0f32;
+
+        // —— 侧栏展开（默认：活动栏 + 面板收起）——
         let sb = cx
             .debug_bounds("sidebar")
-            .expect("侧栏卡 sidebar 应渲染");
+            .expect("侧边栏 sidebar 应渲染");
         let main = cx
             .debug_bounds("app-main-card")
-            .expect("正文卡 app-main-card 应渲染");
+            .expect("正文块 app-main-card 应渲染");
+        let tb = cx
+            .debug_bounds("tab-bar")
+            .expect("选项卡栏 tab-bar 应渲染");
         let st = cx
             .debug_bounds("status-bar")
-            .expect("状态栏卡 status-bar 应渲染");
-        // 贴边直角三处。
+            .expect("状态栏 status-bar 应渲染");
+        // 贴边直角四处。
         assert!(
             sb.origin.x.as_f32() <= 0.5,
-            "侧栏卡左缘应贴窗（直角），actual={sb:?}"
+            "侧栏左缘应贴窗（直角），sb={sb:?}"
         );
         assert!(
             (main.right().as_f32() - win_w).abs() < 1.0,
-            "正文卡右缘应贴窗（直角），main={main:?}"
+            "正文块右缘应贴窗（直角），main={main:?}"
+        );
+        assert!(
+            st.origin.x.as_f32() <= 0.5,
+            "状态栏左缘应贴窗（直角），st={st:?}"
+        );
+        assert!(
+            (st.right().as_f32() - win_w).abs() < 1.0,
+            "状态栏右缘应贴窗（直角），st={st:?}"
         );
         assert!(
             (st.bottom().as_f32() - win_h).abs() < 1.0,
             "状态栏底缘应贴窗（直角），st={st:?}"
         );
-        // 面板收起：无 sidebar-resize，保留 sidebar-gap 空间隔。
+        // 无缝直连（零间距）：侧栏右缘 → 正文块左缘、正文块顶 → 选项卡栏底、
+        // 正文块底 → 状态栏顶。
+        let seam_sb_main = main.origin.x.as_f32() - sb.right().as_f32();
+        assert!(
+            (seam_sb_main).abs() < 1.5,
+            "侧栏↔正文应无缝直连（无间距），实际={seam_sb_main}"
+        );
+        let seam_tb_main = main.origin.y.as_f32() - tb.bottom().as_f32();
+        assert!(
+            (seam_tb_main).abs() < 1.5,
+            "正文↔选项卡栏应无缝直连（无间距），实际={seam_tb_main}"
+        );
+        let seam_main_st = st.origin.y.as_f32() - main.bottom().as_f32();
+        assert!(
+            (seam_main_st).abs() < 1.5,
+            "正文↔状态栏应无缝直连（无间距），实际={seam_main_st}"
+        );
+        // 面板收起（默认）：无右缘调宽手柄，也无旧 sidebar-gap 空间隔元素。
         assert!(
             cx.debug_bounds("sidebar-resize").is_none(),
-            "面板收起不应有调宽分隔带"
+            "面板收起不应有无右缘调宽手柄"
         );
         assert!(
-            cx.debug_bounds("sidebar-gap").is_some(),
-            "面板收起应保留侧栏↔正文空间隔 sidebar-gap"
+            cx.debug_bounds("sidebar-gap").is_none(),
+            "无缝直连后不应再有 sidebar-gap 空间隔元素"
         );
-        // 卡间 6px：侧栏右缘 → 正文卡左缘恰好 CARD_GAP（分隔带承担）。
-        let gap_sb_main = main.origin.x.as_f32() - sb.right().as_f32();
+
+        // —— 面板展开：侧栏右缘调宽手柄渲染（内嵌细线，非分隔带）——
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
         assert!(
-            (gap_sb_main - gap).abs() < 1.5,
-            "侧栏↔正文间距应为 CARD_GAP，实际={gap_sb_main}"
-        );
-        // 正文卡底缘 → 状态栏顶缘恰好 CARD_GAP（状态栏 mt 单侧承担）。
-        let gap_main_st = st.origin.y.as_f32() - main.bottom().as_f32();
-        assert!(
-            (gap_main_st - gap).abs() < 1.5,
-            "正文↔状态栏垂直间距应为 CARD_GAP，实际={gap_main_st}"
-        );
-        // 状态栏左右也各留 CARD_GAP（浮层不贴侧边）。
-        assert!(
-            (st.origin.x.as_f32() - gap).abs() < 1.5,
-            "状态栏左缘应留 CARD_GAP，st={st:?}"
+            cx.debug_bounds("sidebar-resize").is_some(),
+            "面板展开时侧栏右缘应有调宽手柄 sidebar-resize"
         );
         assert!(
-            (win_w - st.right().as_f32() - gap).abs() < 1.5,
-            "状态栏右缘应留 CARD_GAP"
+            cx.debug_bounds("sidebar-gap").is_none(),
+            "面板展开也不应有 sidebar-gap 空间隔元素"
+        );
+
+        // —— 整体收起：内容区包裹层与旧间距元素都消失 ——
+        cx.update(|_w, cx| app.update(cx, |app, cx| app.toggle_sidebar(cx)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("app-body-with-sidebar").is_none(),
+            "整体收起后内容区包裹层不应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-gap").is_none(),
+            "整体收起后不应有 sidebar-gap"
         );
     }
 
@@ -7230,28 +7275,28 @@
         );
     }
 
-    /// 三点手柄落点（真实渲染路径）：
-    /// - 编辑↔预览分割条 → `splitter-grip-rest`/`-accent`；
-    /// - 侧栏右缘调宽分隔带（面板展开）→ `sidebar-resize-grip-rest`/`-accent`；
+    /// 拖拽手柄落点（真实渲染路径）：
+    /// - 编辑↔预览分割条 → `splitter`（居中 2px 细线，**无**三点手柄）；
+    /// - 侧栏右缘调宽手柄（面板展开）→ `sidebar-resize`（内嵌细线命中区）；
     /// - 未开预览 / 面板收起时对应手柄不出现。
     #[gpui::test]
-    async fn three_dot_handles_render_on_splitter_and_resize(cx: &mut TestAppContext) {
+    async fn splitter_and_sidebar_resize_handles_render(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(980.), px(720.)));
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 默认面板收起、预览未开：无分割条手柄、无调宽手柄。
+        // 默认面板收起、预览未开：无分割条、无调宽手柄。
         assert!(
             cx.debug_bounds("splitter").is_none(),
             "未开预览不应渲染分割条"
         );
         assert!(
             cx.debug_bounds("splitter-grip-rest").is_none(),
-            "未开预览不应有分割条三点手柄"
+            "分割条已无三点手柄"
         );
-        // 打开目录面板 → 调宽分隔带三点手柄出现。
+        // 打开目录面板 → 侧栏右缘调宽手柄出现（细线命中区）。
         cx.update(|_w, cx| {
             app.update(
                 cx,
@@ -7263,17 +7308,13 @@
         }
         assert!(
             cx.debug_bounds("sidebar-resize").is_some(),
-            "面板展开应有调宽分隔带"
+            "面板展开应有调宽手柄 sidebar-resize"
         );
         assert!(
-            cx.debug_bounds("sidebar-resize-grip-rest").is_some(),
-            "调宽分隔带应有三点手柄（常态圆点）"
+            cx.debug_bounds("sidebar-resize-grip-rest").is_none(),
+            "侧栏右缘手柄不再有三点圆点层"
         );
-        assert!(
-            cx.debug_bounds("sidebar-resize-grip-accent").is_some(),
-            "调宽分隔带应有高亮圆点层"
-        );
-        // 打开 .md（自动开预览）→ 分割条 + 三点手柄出现。
+        // 打开 .md（自动开预览）→ 分割条出现；三点手柄恒不出现。
         let md = std::env::temp_dir().join("gpui-card-split.md");
         std::fs::write(&md, "# 标题\n正文\n").unwrap();
         cx.update(|window, cx| {
@@ -7289,12 +7330,9 @@
             "md 预览分屏应渲染分割条"
         );
         assert!(
-            cx.debug_bounds("splitter-grip-rest").is_some(),
-            "分割条应有三点手柄（常态圆点）"
-        );
-        assert!(
-            cx.debug_bounds("splitter-grip-accent").is_some(),
-            "分割条应有高亮圆点层"
+            cx.debug_bounds("splitter-grip-rest").is_none()
+                && cx.debug_bounds("splitter-grip-accent").is_none(),
+            "分割条不再有三点手柄（三点分隔已移除）"
         );
         let _ = std::fs::remove_file(&md);
     }
@@ -7363,10 +7401,10 @@
         let _ = std::fs::remove_file(&md);
     }
 
-    /// 三点手柄不破坏侧栏右缘调宽（真实事件路径）：悬停分隔带 → `resize_hovered`；
+    /// 右缘调宽手柄不破坏侧栏调宽（真实事件路径）：悬停手柄 → `resize_hovered`；
     /// 按下 → `resize`；右拖 60px → 侧栏宽 +60 且关闭自适应；松开 → 结束。
     #[gpui::test]
-    async fn sidebar_resize_grip_still_resizes(cx: &mut TestAppContext) {
+    async fn sidebar_resize_handle_still_resizes(cx: &mut TestAppContext) {
         init_test(cx);
         let (app, cx) = add_app(cx);
         cx.simulate_resize(gpui::size(px(1200.), px(800.)));
@@ -7384,7 +7422,7 @@
         }
         let sp = cx
             .debug_bounds("sidebar-resize")
-            .expect("调宽分隔带应渲染（面板展开）");
+            .expect("调宽手柄应渲染（面板展开）");
         let at = sp.center();
         let w0 = cx.update(|_w, cx| app.read(cx).sidebar.width);
         // 悬停 → hover 态。
@@ -7394,7 +7432,7 @@
         }
         assert!(
             cx.update(|_w, cx| app.read(cx).sidebar.resize_hovered),
-            "悬停分隔带应打开调宽 hover 态"
+            "悬停调宽手柄应打开调宽 hover 态"
         );
         // 按下 → 拖拽开始；右移 60px → 宽度 +60、关闭自适应；松开 → 结束。
         cx.simulate_mouse_down(at, MouseButton::Left, Default::default());
@@ -7403,7 +7441,7 @@
         }
         assert!(
             cx.update(|_w, cx| app.read(cx).sidebar.resize.is_some()),
-            "按下分隔带应开始调宽"
+            "按下调宽手柄应开始调宽"
         );
         let target = gpui::point(at.x + px(60.), at.y);
         cx.simulate_mouse_move(target, MouseButton::Left, Default::default());

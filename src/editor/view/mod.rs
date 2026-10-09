@@ -678,7 +678,8 @@ impl CodeEditor {
         self.font_size = font_size;
         self.line_height = line_height;
         self.char_width = char_width;
-        self.bg = colors.bg.into();
+        // 编辑区画布底色：暗色取 config `EDITOR_BG_DARK`（与欢迎页/预览同一内容底色）。
+        self.bg = crate::ui::shell::content_bg(dark, colors.bg.into());
         self.fg = colors.fg.into();
         self.gutter_fg = colors.fg_muted.into();
         // 垂直标尺线：次要前景（与行号同源、已验证明暗主题都可见；不用 `border`——

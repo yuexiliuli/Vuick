@@ -92,7 +92,7 @@ impl StyleParams {
             divider: colors.border.into(),
             accent: colors.accent.into(),
             link: colors.link.into(),
-            bg: colors.bg.into(),
+            bg: crate::ui::shell::content_bg(is_dark, colors.bg.into()),
             quote_bg: colors.quote_bg.into(),
             table_head_bg: colors.table_head_bg.into(),
             para_size: para,

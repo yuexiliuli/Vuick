@@ -225,15 +225,18 @@ impl EditorApp {
 
     /// 编辑区 / 预览区之间的分割线（可拖拽调整分屏比例）。
     ///
-    /// 外壳卡片化：原 2px 强调细线改为居中**三点手柄**（[`crate::ui::shell::three_dot_grip`]）——
-    /// 常态弱化色，hover/拖拽 accent 淡入；命中区 / 拖拽逻辑完全不变（`w(6)` 命中带 +
+    /// 无缝直连：6px 命中带 + 居中 2px 细竖线——常态 `bar_border`，hover/拖拽时换
+    /// `drag_hover_border` 强调色；命中区 / 拖拽逻辑完全不变（`w(6)` 命中带 +
     /// 容器 `on_mouse_move/up` 换算分屏比例）。
     pub(super) fn render_splitter(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let grip = crate::ui::shell::three_dot_grip(
-            "splitter-grip",
-            self.splitter_hovered || self.split_drag.is_some(),
-            cx,
-        );
+        let border = self.bar_border();
+        let drag_line: gpui::Hsla =
+            crate::ui::theme::Theme::global(cx).colors.drag_hover_border.into();
+        let line_color: gpui::Hsla = if self.splitter_hovered || self.split_drag.is_some() {
+            drag_line
+        } else {
+            border
+        };
         div()
             .id("splitter")
             .debug_selector(|| "splitter".into())
@@ -243,9 +246,9 @@ impl EditorApp {
             .cursor(CursorStyle::ResizeColumn)
             .bg(gpui::transparent_black())
             .flex()
-            .items_center()
+            .items_stretch()
             .justify_center()
-            // 命中测试加宽（左右各 3px），视觉只留中央三点手柄
+            // 命中测试加宽（左右各 3px），视觉只有中间 2px 细线
             .on_hover(cx.listener(
                 |this: &mut EditorApp, hovered: &bool, _window, cx| {
                     this.splitter_hovered = *hovered;
@@ -258,7 +261,14 @@ impl EditorApp {
                     cx.notify();
                 },
             ))
-            .child(grip)
+            .child(
+                div()
+                    .h_full()
+                    .w(px(2.))
+                    .flex_none()
+                    .rounded(px(1.))
+                    .bg(line_color),
+            )
     }
 
     pub(super) fn render_preview_pane(

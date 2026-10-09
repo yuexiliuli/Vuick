@@ -158,6 +158,7 @@ pub(crate) fn empty_state_hero(
     cx: &mut App,
 ) -> gpui::AnyElement {
     let c = Theme::global(cx).colors;
+    let dark = Theme::global(cx).is_dark();
     let fg: Hsla = c.fg.into();
     let muted: Hsla = c.fg_muted.into();
     // 提示行取最弱一档灰（插图正文线的同款语义 token），字号再小一档。
@@ -168,7 +169,8 @@ pub(crate) fn empty_state_hero(
         .debug_selector(|| "empty-state".into())
         .size_full()
         .overflow_hidden()
-        .bg(c.bg)
+        // 欢迎页底色与编辑区同色（暗色 = config EDITOR_BG_DARK）。
+        .bg(crate::ui::shell::content_bg(dark, c.bg.into()))
         .flex()
         .flex_col()
         .items_center()

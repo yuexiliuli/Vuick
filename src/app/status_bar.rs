@@ -22,6 +22,12 @@ fn status_section_divider(color: gpui::Hsla) -> gpui::Div {
         .bg(color)
 }
 
+/// 状态栏内带底色小部件（语言徽标 / 全屏 / 换行按钮）统一高度（px）：
+/// 跟随 `STATUS_BAR_H` 收缩（上下各留 2px 内边距 + 12px 下限），保证底色不溢出状态栏。
+fn status_pill_h() -> f32 {
+    (crate::config::layout::STATUS_BAR_H - 4.0).max(12.0)
+}
+
 impl EditorApp {
     pub(super) fn render_status_bar(
         &mut self,
@@ -71,15 +77,12 @@ impl EditorApp {
         let mut root = div()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
-            .h(px(28.))
-            // 外壳卡片化：底缘贴窗直角（mb 0），左/右/上留卡间间距，上缘圆角、下缘直角。
-            .ml(px(crate::ui::shell::CARD_GAP))
-            .mr(px(crate::ui::shell::CARD_GAP))
-            .mt(px(crate::ui::shell::CARD_GAP))
-            .rounded_tl(px(crate::ui::shell::CARD_RADIUS))
-            .rounded_tr(px(crate::ui::shell::CARD_RADIUS))
+            .h(px(crate::config::layout::STATUS_BAR_H))
+            // 状态栏无缝直连正文与窗缘：左右/底缘贴窗（mb 0），顶部贴正文（mt 0），
+            // 仅保留顶部/四周发丝边框分隔。
+            .mt(px(0.))
             .border_1()
-            .border_color(crate::ui::shell::card_border(cx))
+            .border_color(self.hairline())
             .bg(crate::ui::shell::card_surface(cx))
             .flex()
             .flex_row()
@@ -207,7 +210,7 @@ impl EditorApp {
                 &path_hint,
                 has_path && tip_on,
                 name_block_w,
-                28.0,
+                crate::config::layout::STATUS_BAR_H,
                 cx,
             ))
             .on_hover({
@@ -240,7 +243,7 @@ impl EditorApp {
             .items_center()
             .gap_1()
             .px_2()
-            .py_1()
+            .h(px(status_pill_h()))
             .rounded_sm()
             .bg(self.chrome().pill_bg)
             .text_size(px(11.))
@@ -375,8 +378,11 @@ impl EditorApp {
         div()
             .id("status-fullscreen-btn")
             .debug_selector(|| "status-fullscreen-btn".into())
+            .flex()
+            .flex_row()
+            .items_center()
             .px_2()
-            .py_1()
+            .h(px(status_pill_h()))
             .rounded_sm()
             .bg(self.chrome().pill_bg)
             .text_size(px(12.))
@@ -396,8 +402,11 @@ impl EditorApp {
         div()
             .id("status-wrap-btn")
             .debug_selector(|| "status-wrap-btn".into())
+            .flex()
+            .flex_row()
+            .items_center()
             .px_2()
-            .py_1()
+            .h(px(status_pill_h()))
             .rounded_sm()
             .bg(self.chrome().pill_bg)
             .text_size(px(12.))

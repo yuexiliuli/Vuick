@@ -1,8 +1,9 @@
 //! 侧边栏：可折叠/展开，顶部左侧为一竖列「目录 / 搜索」切换栏，右侧为当前视图内容。
 //!
 //! 折叠/展开开关放在窗口标题栏右上角（见 [`EditorApp::render_title_bar`]）；
-//! 「目录」「搜索」两个按钮竖列排布，点击各自调用出对应界面。侧边栏只占据内容区
-//! （选项卡栏之下、状态栏之上）。
+//! 「目录」「搜索」两个按钮竖列排布，点击各自调用出对应界面。侧边栏为无缝 mica 底色
+//! 直连外壳：与选项卡栏+编辑区、状态栏全部直角贴缝（无浮层卡片/圆角/间距），右缘仅以
+//! 一条发丝线（`bar_border`）与正文区分隔。
 
 use super::*;
 use crate::ui::input::Input;
@@ -68,20 +69,32 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 内容区：侧边栏展开时在左侧停靠（占固定宽），右侧为原有正文 `body`；
-    /// 收起时仅返回正文本身。
+    /// 内容区整行：侧边栏展开时在左侧停靠（紧贴标题栏下），右侧为一「右列」——
+    /// 上方选项卡栏 + 下方正文 `body`（正文块承载）；收起时仅返回右列本身。
     ///
-    /// 外壳卡片化：正文 `body` 一律套「正文卡」（右缘贴窗直角、左/上/下圆角 + 间距）；
-    /// 侧边栏展开时在其与正文之间插一条 `CARD_GAP` 宽的**分隔带**（面板展开时带
-    /// 三点手柄 + 右缘调宽命中区）。
+    /// 无缝直连外壳：侧边栏（mica 底色）与右列（选项卡栏 + 正文块）之间无缝隙/圆角，
+    /// 仅靠侧边栏右缘一条发丝线分隔；正文右缘贴窗、编辑区直落选项卡栏之下，状态栏
+    /// 贴窗底部与正文块直连。右缘调宽手柄内嵌于侧边栏右缘（见 [`Self::render_sidebar`]）。
     pub(super) fn render_body_sidebar(
         &mut self,
         body: gpui::AnyElement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // 右列：上方选项卡栏 + 下方编辑区（正文块承载；列容器 flex_col flex_1）。
+        let right_col = div()
+            .id("app-right-column")
+            .debug_selector(|| "app-right-column".into())
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w(px(0.))
+            .min_h(px(0.))
+            .child(self.render_tab_bar(window, cx))
+            .child(self.render_body_card(body, window, cx));
+
         if !self.sidebar.open {
-            return self.render_body_card(body, window, cx);
+            return right_col.into_any_element();
         }
         div()
             .id("app-body-with-sidebar")
@@ -91,8 +104,7 @@ impl EditorApp {
             .flex_1()
             .min_h(px(0.))
             // 侧边栏右缘拖拽调宽：鼠标移动/松开事件冒泡到整个内容容器统一处理。
-            // 若挂在 sidebar 自身，指针一旦移出侧边栏右缘（进入正文区）就不再派发，
-            // 拖拽会“卡住不灵敏”；挂在整行容器上（与公共 toc 行、splitter 同款）即可全程跟踪。
+            // （原注释保留，说明不改动；此容器现也包裹右列选项卡栏+编辑区。）
             .on_mouse_move(cx.listener(
                 |this: &mut EditorApp, ev: &gpui::MouseMoveEvent, _w, cx| {
                     this.update_sidebar_resize(ev.position.x.as_f32(), cx);
@@ -111,21 +123,20 @@ impl EditorApp {
                 }),
             )
             .child(self.render_sidebar(window, cx))
-            .children(self.render_sidebar_resize_handle(cx))
-            .child(self.render_body_card(body, window, cx))
+            .child(right_col)
             .into_any_element()
     }
 
-    /// 正文区卡片：右缘贴窗直角、左/上/下圆角 + 与侧栏/状态栏的 `CARD_GAP` 间距，
-    /// 浮在自绘材质层之上。卡面用正文底色（`panel_bg`，与编辑器/预览无缝）；卡
-    /// 内边距会略缩「面板可用宽」（换行/滚动条按新可用宽走，属预期）。
+    /// 正文区无缝方块：右缘贴窗直角、其它三缘与侧栏/选项卡栏/状态栏零间距直连，
+    /// 无圆角、无边框（侧栏右缘发丝线、标题栏/选项卡栏底边发丝线与状态栏顶边负责分隔）。
+    /// 卡面用正文底色
+    /// （`panel_bg`，与编辑器/预览无缝）。
     fn render_body_card(
         &mut self,
         body: gpui::AnyElement,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        use crate::ui::shell::{CARD_GAP, CARD_RADIUS};
         div()
             .id("app-main-card")
             .debug_selector(|| "app-main-card".into())
@@ -136,19 +147,14 @@ impl EditorApp {
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            // 侧栏展开时 `app-body-with-sidebar` 已为其左侧留出分隔带（ml 0）；
-            // 收拢时正文卡左缘直接贴窗左侧的间距（ml = CARD_GAP）。
-            .ml(px(if self.sidebar.open { 0.0 } else { CARD_GAP }))
+            .ml(px(0.))
             .mr(px(0.))
-            .mt(px(CARD_GAP))
-            // 下缘间距由状态栏卡顶边（mt = CARD_GAP）单侧承担，避免 6+6=12px 双倍缝。
+            .mt(px(0.))
             .mb(px(0.))
-            .rounded_tl(px(CARD_RADIUS))
-            .rounded_bl(px(CARD_RADIUS))
-            .rounded_tr(px(0.))
-            .rounded_br(px(0.))
-            .border_1()
-            .border_color(crate::ui::shell::card_border(cx))
+            // 顶边 1px 发丝线 = 选项卡栏↔编辑区之分隔（由后绘制的编辑区绘制，
+            // 保证不受上层选项卡栏遮挡）；其余三边由侧栏右缘/状态栏顶边承担，不重复。
+            .border_t_1()
+            .border_color(self.hairline())
             .bg(crate::ui::shell::body_card_face(cx))
             .overflow_hidden()
             .child(body)
@@ -158,15 +164,16 @@ impl EditorApp {
     /// 侧边栏整体：左侧为常驻竖列切换栏（活动栏），右侧为可展开的内容面板
     /// （目录/搜索）。面板收起时仅剩 46px 活动栏，正文区随之占满，不留空白宽区。
     ///
-    /// 外壳卡片化：整块 = 一张「侧栏卡」（左缘贴窗直角、上/下/右缘圆角 + 与正文的
-    /// 间距），卡面用浮层表面 token（theme `surface`）而非半透明 mica。
+    /// 无缝 mica 直连外壳：整块 = 左侧活动栏 + 右侧面板（面板收起时仅活动栏），
+    /// 底色用半透明 mica（`mica_bar_bg`）、无圆角、无四周边框，右缘一条发丝线
+    /// （`bar_border`）与正文区分隔；右缘内嵌拖拽调宽手柄（见
+    /// [`Self::render_sidebar_resize_handle`]，外层 `app-body-with-sidebar` 统一收事件）。
     pub(super) fn render_sidebar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        use crate::ui::shell::{CARD_GAP, CARD_RADIUS};
-        let border = self.bar_border();
+        let (side_bg, border) = (self.mica_bar_bg(), self.bar_border());
         // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
         let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
             Some(match self.sidebar.view {
@@ -189,23 +196,19 @@ impl EditorApp {
             .relative()
             .flex()
             .flex_row()
-            // 贴窗左侧：左缘直角；上下留卡间间距（右缘间距由分隔带承担，见
-            // render_body_sidebar 的 render_sidebar_resize_handle）。
+            // 贴窗左上角：左缘直角、顶缘贴标题栏（mt 0，与选项卡栏对齐）；下缘贴
+            // 状态栏（mb 0）。右缘发丝线即与正文的分隔，无间距。
             .ml(px(0.))
-            .mt(px(CARD_GAP))
-            // 下缘间距由状态栏卡顶边（mt = CARD_GAP）单侧承担，避免 6+6=12px 双倍缝。
+            .mt(px(0.))
             .mb(px(0.))
-            .rounded_tl(px(0.))
-            .rounded_bl(px(0.))
-            .rounded_tr(px(CARD_RADIUS))
-            .rounded_br(px(CARD_RADIUS))
-            .border_1()
-            .border_color(crate::ui::shell::card_border(cx))
-            .bg(crate::ui::shell::card_surface(cx))
+            .bg(side_bg)
+            .border_r_1()
+            .border_color(self.hairline())
             .overflow_hidden()
             // 拖拽调宽事件由外层 app-body-with-sidebar 容器统一处理（见 render_body_sidebar）
             .child(self.render_sidebar_activity_bar(window, border, cx))
             .children(content)
+            .children(self.render_sidebar_resize_handle(cx))
     }
 
     /// 开始拖拽侧边栏右缘：记录 (起始 x, 起始宽)，关闭自适应由用户接管。
@@ -233,43 +236,27 @@ impl EditorApp {
         }
     }
 
-    /// 侧边栏右缘「分隔带」：`CARD_GAP` 宽的弹层留白（卡片化后它是「侧栏卡 ↔ 正文卡」
-    /// 之间的间距），本身即整条可拖拽命中区 + 居中三点手柄。
-    ///
-    /// - 面板展开（`panel_open`）：分隔带 = 调宽命中区（投影 `sidebar-resize`），中央挂
-    ///   [`crate::ui::shell::three_dot_grip`] 三点手柄（hover/拖拽 → accent 淡入）；
-    /// - 面板收起（仅活动栏）：只保留空间隔 `sidebar-gap`，无拖拽意义（与旧行为一致：
-    ///   右缘调宽只对目录/搜索面板展开时开放）。
+    /// 侧边栏右缘拖拽手柄：宽 6px 命中区，视觉 2px 强调细线（悬停/拖拽时经
+    /// `hover_spring` 淡入，贴右缘绝对定位——左侧留 4px 余量、右侧 2px 视觉线）。
+    /// 面板收起时返回空（无拖拽意义；不留任何 `<sidebar-gap>` 空间隔元素）。
     ///
     /// 命中/拖拽逻辑与现状完全一致：`start_sidebar_resize` 记 (起始窗口 x, 起始宽)、
     /// 外层 `app-body-with-sidebar` 的 `on_mouse_move/up(_out)` 全程跟踪（窗口坐标 δ，
     /// 与手柄位置无关）。
     fn render_sidebar_resize_handle(&mut self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
-        use crate::ui::shell::CARD_GAP;
         if !self.sidebar.panel_open {
-            return vec![
-                div()
-                    .id("sidebar-gap")
-                    .debug_selector(|| "sidebar-gap".into())
-                    .w(px(CARD_GAP))
-                    .flex_shrink_0()
-                    .into_any_element(),
-            ];
+            return Vec::new();
         }
-        let grip = crate::ui::shell::three_dot_grip(
-            "sidebar-resize-grip",
-            self.sidebar.resize.is_some() || self.sidebar.resize_hovered,
-            cx,
-        );
+        let drag_line = crate::ui::theme::Theme::global(cx).colors.drag_hover_border;
         vec![
             div()
                 .id("sidebar-resize")
                 .debug_selector(|| "sidebar-resize".into())
-                .w(px(CARD_GAP))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
+                .absolute()
+                .right(px(0.))
+                .top(px(0.))
+                .bottom(px(0.))
+                .w(px(6.))
                 .cursor(CursorStyle::ResizeColumn)
                 .on_hover(cx.listener(
                     |this: &mut EditorApp, hovered: &bool, _w, cx| {
@@ -283,7 +270,30 @@ impl EditorApp {
                         this.start_sidebar_resize(ev.position.x.as_f32(), cx);
                     }),
                 )
-                .child(grip.into_any_element())
+                .child(
+                    div()
+                        // 贴到右缘，不用 flex 居中（否则蓝色线离边缘差 ~2px 看着有缝）
+                        .absolute()
+                        .right(px(0.))
+                        .top(px(0.))
+                        .bottom(px(0.))
+                        .w(px(2.))
+                        .rounded_full()
+                        .bg(drag_line)
+                        // P2-10：悬停/拖拽时细线淡入（滚动条滑块同款指数平滑可接受，
+                        // 这里用统一 hover 弹簧）。
+                        .with_spring(
+                            "sidebar-resize-accent",
+                            hover_spring(if self.sidebar.resize.is_some()
+                                || self.sidebar.resize_hovered
+                            {
+                                1.0
+                            } else {
+                                0.0
+                            }),
+                            |this, v| this.opacity(v),
+                        ),
+                )
                 .into_any_element(),
         ]
     }

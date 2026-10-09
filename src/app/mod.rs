@@ -1349,7 +1349,8 @@ impl EditorApp {
     }
 
     /// 外壳子元素：锁定图片/视频视图时只放「媒体铺满窗口」（藏菜单栏/选项卡栏/侧边栏/
-    /// 状态栏），否则齐全；始终带通知层与媒体右键菜单 Overlay。
+    /// 状态栏），否则齐全；正常态为「标题栏 + [侧栏 | 右列(选项卡栏在上、编辑区在下)] +
+    /// 状态栏」；始终带通知层与媒体右键菜单 Overlay。
     fn render_shell_children(
         &mut self,
         body: gpui::AnyElement,
@@ -1373,7 +1374,8 @@ impl EditorApp {
             out.push(body);
         } else {
             out.push(self.render_title_bar(window, cx).into_any_element());
-            out.push(self.render_tab_bar(window, cx).into_any_element());
+            // 侧边栏与【选项卡栏 + 编辑区】并列：render_body_sidebar 组装整行
+            // [侧栏(紧贴标题栏下) + 分隔带 | 右列(选项卡栏在上、编辑区在下)]。
             out.push(self.render_body_sidebar(body, window, cx).into_any_element());
             out.push(self.render_status_bar(window, cx).into_any_element());
         }
@@ -2037,9 +2039,14 @@ impl EditorApp {
             crate::ui::theme::MICA_CHROME_ALPHA_LIGHT
         }
     }
-    /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版）。
+    /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 config
+    /// `CHROME_BG_DARK` 的不透明统一底色）。
     fn mica_bar_bg(&self) -> gpui::Hsla {
-        self.bar_bg().opacity(self.mica_alpha())
+        if self.dark_mode {
+            gpui::rgb(crate::config::layout::CHROME_BG_DARK).into()
+        } else {
+            self.bar_bg().opacity(self.mica_alpha())
+        }
     }
 
     /// 自绘 Mica 材质层：窗口基底用 N 段半透明色带叠出柔和垂向渐变（纯应用内绘制，
@@ -2083,9 +2090,21 @@ impl EditorApp {
         self.chrome().bar_border.into()
     }
 
-    /// 编辑器/预览面板背景。
+    /// 区域分隔发丝线（config 配置、按明暗主题取色，**不透明** —— 半透明叠不同底色
+    /// 会混出各自的灰色，这里统一成全屏一致的发丝线；标题栏底 / 编辑区顶边 /
+    /// 侧栏右缘 / 状态栏边框共用）。
+    fn hairline(&self) -> gpui::Hsla {
+        let hex = if self.dark_mode {
+            crate::config::layout::SEPARATOR_DARK
+        } else {
+            crate::config::layout::SEPARATOR_LIGHT
+        };
+        gpui::rgb(hex).into()
+    }
+
+    /// 编辑器/预览面板背景（暗色主题用 config `EDITOR_BG_DARK` 统一底色）。
     fn panel_bg(&self) -> gpui::Hsla {
-        self.chrome().panel_bg.into()
+        crate::ui::shell::content_bg(self.dark_mode, self.chrome().panel_bg.into())
     }
 
     /// 主要文字颜色。
@@ -2293,6 +2312,7 @@ impl EditorApp {
     /// 左侧为 文件/编辑/查看/帮助 菜单，中间空位为窗口拖拽区，
     /// 右侧为最小化 / 最大化 / 关闭按钮。
     ///
+    /// 标题栏底边绘一条通宽发丝线（`bar_border`），分隔下方侧栏/选项卡栏内容区。
     /// 拖拽与窗口控制全部交给平台原生处理：各元素标上
     /// [`gpui::WindowControlArea`]，GPUI 在 WM_NCHITTEST 里返回对应
     /// HTCAPTION / HTMINMAXBUTTON，由系统完成移动（贴边吸附）、
@@ -2386,6 +2406,8 @@ impl EditorApp {
             // 关闭）右缘应贴齐窗口右缘，右内边距会在关闭钮右侧留 8px 可见 gap。
             .pl_2()
             .bg(self.mica_bar_bg())
+            .border_b_1()
+            .border_color(self.hairline())
             .child(self.render_menu_buttons(cx))
             .child(
                 div()

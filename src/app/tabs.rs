@@ -539,6 +539,8 @@ impl EditorApp {
         }
     }
 
+    /// 选项卡栏：横跨右列顶部的选项卡行，左侧滚动区 + 新建/眼睛按钮。
+    /// 底边绘一条右列宽发丝线（`bar_border`），分隔下方编辑区正文。
     pub(super) fn render_tab_bar(
         &mut self,
         window: &mut Window,
@@ -565,6 +567,7 @@ impl EditorApp {
 
         div()
             .id("tab-bar")
+            .debug_selector(|| "tab-bar".into())
             .relative()
             .w_full()
             // 左侧不留内边距：第一个选项卡紧贴窗口左边缘；右侧保留 px_2 给新建/眼睛按钮
@@ -574,6 +577,8 @@ impl EditorApp {
             .items_center()
             .gap_1()
             .bg(self.mica_bar_bg())
+            // 选项卡栏↔编辑区的发丝线由下方编辑区顶边绘制（见 render_body_card，
+            // 此处不画底边框，避免被后绘制的编辑区面板盖住）。
             // 选项卡横向滚动区：占满剩余宽度；标签不收缩，过多即横向溢出可滚轮/拖拽滚动。
             // 横向滚动条浮在标签底部（见 hscroll_overlay），不改变整体高度。
             .child(
