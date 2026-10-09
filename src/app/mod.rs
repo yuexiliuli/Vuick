@@ -361,6 +361,9 @@ pub struct EditorApp {
     pub(crate) open_fast_count: usize,
     /// 大文档「两段式打开」慢段（`finish_file_text` 应用统计 + 预览索引）执行次数。
     pub(crate) open_finish_count: usize,
+    /// 「打开文件对话框」的调用次数（空态「打开文件…」按钮点击 / 文件菜单 / Ctrl+O
+    /// 共用 `open_dialog` 入口）。测试用：断言空态按钮触发 open（测试为 stub 不真弹窗）。
+    pub(crate) open_dialog_calls: usize,
     /// 窗口控制钮最后渲染帧解析出的图标前景色（渲染阶段落盘，仅测试/调试可读）：
     /// 断言「hover/按压注入色」确实经过真实渲染路径（由 hover/press keyed 态驱动）。
     /// `None` = 标题栏尚未渲染过。
@@ -557,6 +560,7 @@ impl EditorApp {
             search_scan_count: 0,
             open_fast_count: 0,
             open_finish_count: 0,
+            open_dialog_calls: 0,
             last_title_ctrl_fg: None,
             tab_dragging: None,
             is_detached,
@@ -2439,6 +2443,38 @@ impl Render for EditorApp {
 impl EditorApp {
     /// 内容区三态：实时编辑占满 / 预览分屏（EPUB 等可全屏预览）/ 纯编辑占满。
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // 空态（无标签页 / 未命名空文档）：编辑区照常渲染作底层（保留元素树——键位、
+        // 焦点与动作分派行为与原有完全一致，绝不误伤编辑/预览路径），上面再铺一层
+        // 微软风欢迎页覆盖层（插图 + 文案 + 「打开文件…」按钮），纯视觉占位。
+        if self.is_empty_body(cx) {
+            let pane = if self.tabs.is_empty() {
+                // 防御：真正「无标签页」时不渲染编辑区（正常流程恒有 ≥1 个空选项卡）。
+                None
+            } else {
+                Some(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(self.render_editor_pane(window, 1.0, cx)),
+                )
+            };
+            let hero = self.render_empty_state(cx);
+            return div()
+                .id("app-empty-body")
+                .debug_selector(|| "app-empty-body".into())
+                .relative()
+                .flex()
+                .flex_1()
+                .min_h(px(0.))
+                .min_w(px(0.))
+                .overflow_hidden()
+                .children(pane)
+                .child(div().absolute().inset_0().child(hero))
+                .into_any_element();
+        }
         let live_edit = self
             .tabs
             .get(self.active_tab)
@@ -2532,6 +2568,62 @@ impl EditorApp {
                 .child(self.render_editor_pane(window, 1.0, cx))
                 .into_any_element()
         }
+    }
+
+    /// 正文区是否处于「无内容」空态：无任何选项卡，或当前选项卡是「未命名且从未动过」
+    /// 的空文档（无文件路径、未编辑、未开预览、无 PDF/图片/视频，编辑区正文为空——
+    /// 即用户第一次打开应用、或关闭全部选项卡后落到的状态）。有内容的路径一律原样
+    /// 渲染，绝不误伤：已命名（哪怕内容为空）的文件、编辑过（`dirty`）的未命名文档、
+    /// 只读预览（EPUB/PDF）、媒体查看器都不算空态。
+    fn is_empty_body(&self, cx: &App) -> bool {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return true;
+        };
+        if tab.file_path.is_some()
+            || tab.dirty
+            || tab.preview_on
+            || tab.readonly_preview
+            || tab.pdf_preview.is_some()
+            || tab.image_viewer.is_some()
+        {
+            return false;
+        }
+        #[cfg(feature = "video")]
+        if tab.video_viewer.is_some() {
+            return false;
+        }
+        tab.editor.read(cx).text().len() == 0
+    }
+
+    /// 正文区空态占位（欢迎页）：自绘插图 + 主/副文案 + 「打开文件…」按钮。
+    /// 按钮直接触发系统打开对话框（`open_dialog`）——空态的唯一价值点是把用户
+    /// 一步带进阅读，不要求先知道快捷键。按钮外包一层同名 div 并挂 `debug_selector`：
+    /// `debug_bounds` 只收录 debug_selector（`Button` 内部 id 不可见），测试据此定位。
+    fn render_empty_state(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let open_btn = div()
+            .id("empty-open-btn")
+            .debug_selector(|| "empty-open-btn".into())
+            .flex()
+            .child(
+                crate::ui::button::Button::new("empty-open-btn-action")
+                    .label("打开文件…")
+                    .h(px(32.))
+                    .px_4()
+                    .rounded_md()
+                    .text_size(px(13.))
+                    .on_click(
+                        cx.listener(|this: &mut EditorApp, _: &gpui::ClickEvent, window, cx| {
+                            this.open_dialog(window, cx);
+                        }),
+                    ),
+            )
+            .into_any_element();
+        crate::ui::empty_state::empty_state_hero(
+            "打开文件开始阅读",
+            "按 Ctrl+O 打开文件 · Ctrl+P 打开文件快选",
+            Some(open_btn),
+            cx,
+        )
     }
 
     /// 根视图：顶部栏 + 选项卡栏 + 内容区 + 状态栏 + 通知叠层，并挂载「拖入文件打开 /

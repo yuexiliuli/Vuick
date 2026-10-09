@@ -331,18 +331,6 @@ impl EditorApp {
             .children(btns)
     }
 
-    /// 空态提示。
-    fn sidebar_empty_hint(&self, text: &str) -> gpui::AnyElement {
-        let muted = self.text_minor();
-        div()
-            .px_3()
-            .py_2()
-            .text_size(px(12.))
-            .text_color(muted)
-            .child(text.to_string())
-            .into_any_element()
-    }
-
     /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
     pub(super) fn toggle_sidebar_toc_collapse(&mut self, idx: usize, cx: &mut Context<Self>) {
         let has_child = match self.tabs.get(self.active_tab) {
@@ -468,7 +456,12 @@ impl EditorApp {
                 if let Some(pdf) = &tab.pdf_preview {
                     let outlines = pdf.read(cx).outlines().to_vec();
                     if outlines.is_empty() {
-                        self.sidebar_empty_hint("当前 PDF 无书签目录")
+                        crate::ui::empty_state::compact_empty_state(
+                            "sidebar-toc-empty",
+                            IconName::File,
+                            "当前 PDF 无书签目录",
+                            cx,
+                        )
                     } else {
                         let rows = self.sidebar_toc_pdf_rows(
                             window, &outlines, &collapsed, fg, muted, active_bg, accent,
@@ -486,11 +479,21 @@ impl EditorApp {
                             );
                             div().flex().flex_col().py_1().children(rows).into_any_element()
                         }
-                        _ => self.sidebar_empty_hint("当前文件无目录（无标题）"),
+                        _ => crate::ui::empty_state::compact_empty_state(
+                            "sidebar-toc-empty",
+                            IconName::BookOpen,
+                            "当前文件无目录（无标题）",
+                            cx,
+                        ),
                     }
                 }
             }
-            None => self.sidebar_empty_hint("当前无打开文档"),
+            None => crate::ui::empty_state::compact_empty_state(
+                "sidebar-toc-empty",
+                IconName::File,
+                "当前无打开文档",
+                cx,
+            ),
         };
 
         div()
@@ -750,6 +753,23 @@ impl EditorApp {
         }
         let scan = self.sidebar_search_scan(q, cx);
         let hits = scan.file_tabs.len() + scan.line_hits.len();
+        // 无命中 → 居中「灰色搜索图标 + 文案」空态占位（与目录/正文区空态同款视觉）。
+        if hits == 0 {
+            return div()
+                .id("sidebar-search-results")
+                .debug_selector(|| "sidebar-search-results".into())
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(crate::ui::empty_state::compact_empty_state(
+                    "sidebar-search-empty",
+                    IconName::Search,
+                    "未找到匹配内容",
+                    cx,
+                ))
+                .into_any_element();
+        }
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         rows.extend(self.sidebar_search_file_rows(
             window,
@@ -979,9 +999,22 @@ impl EditorApp {
         let prev_btn = self.sidebar_pdf_nav_btn(window, "↑", -1, pdf.clone(), fg, active_bg, cx);
         let next_btn = self.sidebar_pdf_nav_btn(window, "↓", 1, pdf.clone(), fg, active_bg, cx);
 
-        let summary = Self::sidebar_pdf_search_summary(
-            count, truncated, q, fg, muted, prev_btn, next_btn,
-        );
+        // 无匹配 → 居中空态占位（灰色搜索图标 + 提示文案），与普通搜索空态同款视觉。
+        let summary: gpui::AnyElement = if count == 0 {
+            let hint = if q.trim().is_empty() {
+                "在 PDF 全文检索；输入关键字"
+            } else {
+                "PDF 中没有匹配"
+            };
+            crate::ui::empty_state::compact_empty_state(
+                "sidebar-search-pdf-empty",
+                IconName::Search,
+                hint,
+                cx,
+            )
+        } else {
+            Self::sidebar_pdf_search_summary(count, truncated, fg, prev_btn, next_btn)
+        };
         let hit_rows =
             self.sidebar_pdf_hit_rows(window, pdf, &snippets, active, fg, muted, active_bg, cx);
 
@@ -1057,67 +1090,51 @@ impl EditorApp {
         hover_bg_fade(btn, format!("{id}-bg"), active_bg, hovered).into_any_element()
     }
 
-    /// PDF 搜索头部「n 处匹配」计数（计数在左、导航靠右；计数过长尾部省略）；
-    /// 无匹配时给出提示文案。
+    /// PDF 搜索头部「n 处匹配」计数（计数在左、导航靠右；计数过长尾部省略）。
+    /// 调用方已处理 `count == 0` 的空态分支，这里只渲染命中计数头。
+    #[allow(clippy::too_many_arguments)] // 双色 + 计数来源 + 导航按钮，与 render_* 同构
     fn sidebar_pdf_search_summary(
         count: usize,
         truncated: bool,
-        q: &str,
         fg: gpui::Hsla,
-        muted: gpui::Hsla,
         prev: impl IntoElement,
         next: impl IntoElement,
     ) -> gpui::AnyElement {
-        if count == 0 {
-            let hint = if q.trim().is_empty() {
-                "在 PDF 全文检索；输入关键字"
-            } else {
-                "PDF 中没有匹配"
-            };
-            div()
-                .px_3()
-                .py_2()
-                .text_size(px(12.))
-                .text_color(muted)
-                .child(hint)
-                .into_any_element()
+        let text = if truncated {
+            format!("{count} 处匹配（已截断）")
         } else {
-            let text = if truncated {
-                format!("{count} 处匹配（已截断）")
-            } else {
-                format!("{count} 处匹配")
-            };
-            div()
-                .id("sidebar-search-pdf-head")
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_overflow(gpui::TextOverflow::Truncate("…".into()))
-                        .text_size(px(12.))
-                        .text_color(fg)
-                        .child(text),
-                )
-                .child(
-                    div()
-                        .id("sidebar-search-pdf-nav")
-                        .flex_shrink_0()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(prev)
-                        .child(next),
-                )
-                .into_any_element()
-        }
+            format!("{count} 处匹配")
+        };
+        div()
+            .id("sidebar-search-pdf-head")
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_overflow(gpui::TextOverflow::Truncate("…".into()))
+                    .text_size(px(12.))
+                    .text_color(fg)
+                    .child(text),
+            )
+            .child(
+                div()
+                    .id("sidebar-search-pdf-nav")
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(prev)
+                    .child(next),
+            )
+            .into_any_element()
     }
 
     /// PDF 搜索命中行（每个命中一行）：`L N  前5字…目标…后5字`，单行显示、超出省略；

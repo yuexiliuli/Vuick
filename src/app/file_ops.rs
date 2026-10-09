@@ -921,23 +921,31 @@ impl EditorApp {
         }
     }
 
-    pub(super) fn open_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entity = cx.entity();
-        window
-            .spawn(cx, async move |cx| {
-                let Some(file) = rfd::AsyncFileDialog::new()
-                    .set_title("打开文件")
-                    .pick_file()
-                    .await
-                else {
-                    return;
-                };
-                let path = file.path().to_string_lossy().into_owned();
-                let _ = cx.update_window_entity(&entity, |this, window, cx| {
-                    this.open_file(&path, window, cx);
-                });
-            })
-            .detach();
+    pub(super) fn open_dialog(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        // 入口计数：空态「打开文件…」按钮 / 文件菜单 / Ctrl+O 都经此，测试据此断言
+        // 空态按钮确实触发 open（`open_dialog_calls`）。
+        self.open_dialog_calls = self.open_dialog_calls.wrapping_add(1);
+        // 测试构建不真的弹出原生对话框（无头顶窗口，会弹出真实文件选择框干扰/挂起
+        // 测试进程）；空态按钮的「触发 open」由上面的计数断言即可。
+        #[cfg(not(test))]
+        {
+            let entity = _cx.entity();
+            _window
+                .spawn(_cx, async move |cx| {
+                    let Some(file) = rfd::AsyncFileDialog::new()
+                        .set_title("打开文件")
+                        .pick_file()
+                        .await
+                    else {
+                        return;
+                    };
+                    let path = file.path().to_string_lossy().into_owned();
+                    let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                        this.open_file(&path, window, cx);
+                    });
+                })
+                .detach();
+        }
     }
 
     pub(super) fn write_to_path(

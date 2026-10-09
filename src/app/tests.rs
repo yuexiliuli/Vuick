@@ -1552,6 +1552,167 @@
         let _ = std::fs::remove_file(&f);
     }
 
+    /// 空状态（无标签页 / 未命名空文档）：正文区渲染欢迎页占位——自绘插图（160×120）、
+    /// 主/副文案与「打开文件…」按钮都在；点击按钮触发 `open_dialog`（测试为 stub，
+    /// 只计数不真弹窗）；一旦输入内容，空态立即消失（绝不误伤有内容路径）。
+    #[gpui::test]
+    async fn empty_state_hero_renders_and_button_opens_dialog(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 空态容器 + 插图 + 按钮都渲染且插图非零尺寸
+        assert!(
+            cx.debug_bounds("empty-state").is_some(),
+            "未命名空文档应显示空态欢迎页"
+        );
+        let illus = cx
+            .debug_bounds("empty-illustration")
+            .expect("应渲染空态插图");
+        assert!(
+            illus.size.width > px(0.) && illus.size.height > px(0.),
+            "插图应有固定尺寸，实际={illus:?}"
+        );
+        let btn = cx
+            .debug_bounds("empty-open-btn")
+            .expect("应渲染「打开文件…」按钮");
+        assert!(
+            btn.size.width > px(0.) && btn.size.height > px(0.),
+            "按钮应有尺寸，实际={btn:?}"
+        );
+        // 点击按钮 → 触发 open_dialog（计数断言；测试 stub 不弹原生对话框）
+        cx.simulate_click(btn.center(), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let calls = cx.update(|_w, cx| app.read(cx).open_dialog_calls);
+        assert_eq!(calls, 1, "点击「打开文件…」应触发一次 open_dialog");
+        // 输入内容 → 空态消失（回到正常编辑区）。
+        // 用 insert_text（真实键入路径，会 notify 并置脏）而非 set_text（静默换缓冲、
+        // 不触发重渲染，无法断言「空态随内容消失」这个渲染行为）。
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|_, cx| {
+            editor.update(cx, |ed, cx| ed.insert_text("x", cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("empty-state").is_none(),
+            "有内容后空态应消失"
+        );
+    }
+
+    /// 目录空态：打开无任何标题的 Markdown（有内容但无目录节点）→ 侧栏目录面板
+    /// 显示「灰色图标 + 文案」空态占位（跨无标题文档 / PDF 无书签 / 无文档三态共用）。
+    #[gpui::test]
+    async fn sidebar_toc_empty_state_placeholder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!("gpui-toc-empty-{}.md", std::process::id()));
+        std::fs::write(&md, "纯文本，没有标题\n第二行\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc").is_some(),
+            "应渲染目录面板"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-empty").is_some(),
+            "无标题文档应显示目录空态占位"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 搜索空态：打开有内容的文档、输入无匹配关键字 → 侧栏搜索显示
+    /// 「灰色搜索图标 + 文案」空态占位；命中时恢复正常结果列表。
+    #[gpui::test]
+    async fn sidebar_search_empty_state_placeholder(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let txt = std::env::temp_dir().join(format!("gpui-srch-empty-{}.txt", std::process::id()));
+        std::fs::write(&txt, "hello world\nthis is a file\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 无匹配 → 空态占位
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("zzz-无匹配", window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search-empty").is_some(),
+            "无匹配应显示搜索空态占位"
+        );
+        // 命中 → 恢复正常结果列表（不再有空态）
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("hello", window, cx));
+        });
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search").is_some(),
+            "命中搜索仍应显示结果面板"
+        );
+        let _ = std::fs::remove_file(&txt);
+    }
+
     /// 基准：侧边栏搜索「旧每帧全扫 vs 新缓存 + 无分配内核」的代价对比。
     /// 旧逻辑：渲染帧每帧 `to_string()` 物化全文 + 每行 `to_lowercase()` 分配 + `contains`；
     /// 新逻辑：查询变化才扫一次（无分配 [`find_ci`]），其余渲染帧走 O(1) 缓存键比较。

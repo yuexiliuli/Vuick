@@ -10,6 +10,8 @@
 //! - [`icon`]：自绘图标（`IconName` + `Icon`），替换 `gpui_component::{Icon, IconName}`
 //! - [`scrollbar`]：滚动条（`Scrollbar`/`ScrollbarHandle`/`ScrollbarMode`），替换 `gpui_component::scroll`
 //! - [`button`]：按钮（`Button`/`ButtonVariant`/`ButtonVariants`），替换 `gpui_component::button`
+//! - [`empty_state`]：空状态占位（`empty_illustration`/`empty_state_hero`/`compact_empty_state`），
+//!   无标签页 / 空目录 / 无搜索命中的自绘插图 + 文案
 //! - [`menu`]：下拉菜单（`PopupMenu`/`PopupMenuItem`/`Dropdown`/`DropdownMenu`），替换 `gpui_component::menu`
 //! - [`notification`]：通知（`Notification`/`NotificationKind`），替换 `gpui_component::notification`
 //! - [`palette`]：命令面板（`CommandPalette`/`PaletteMode`/`PaletteItem`），居中浮层，命令 + 文件快选两用
@@ -34,6 +36,7 @@
 //! - 依赖已移除：不再有 `gpui_component` 兼容桥（`Theme::change` 等）。
 
 pub mod button;
+pub mod empty_state;
 pub mod icon;
 pub mod input;
 pub mod menu;
