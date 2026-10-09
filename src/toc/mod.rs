@@ -10,10 +10,11 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, px, App, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
+    div, px, App, AnimationExt, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use crate::ui::icon::{Icon, IconName};
+use crate::ui::motion::hover_spring;
 
 /// 断言 pre-order 条目 `idx` 是否有下级（可折叠）：紧邻下一项层级更深即有子项。
 pub(crate) fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {
@@ -72,10 +73,17 @@ pub(crate) fn toc_item_frame(
     muted: Hsla,
     hover_bg: Hsla,
     accent: Hsla,
+    window: &mut Window,
+    cx: &mut App,
     on_select: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_collapse: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::AnyElement {
     let id2 = row_id.clone();
+    let row_key = row_id.clone();
+    // P2-10：hover 状态跨帧记录 → 行背景与左侧指示条淡入。
+    let hover = window.use_keyed_state(format!("toc-{row_key}"), cx, |_, _| false);
+    let hovered = *hover.read(cx);
+    let view_id = window.current_view();
     let mut row = div()
         .id(SharedString::from(row_id))
         .debug_selector(move || id2.clone())
@@ -90,10 +98,18 @@ pub(crate) fn toc_item_frame(
         .cursor(CursorStyle::PointingHand)
         .group("toc-item")
         .rounded(px(4.))
-        .hover(|style| style.bg(hover_bg).text_color(fg))
+        // hover 时的文字同色常驻（原 hover 把文字提到 fg，此处恒等消除闪变）
+        .text_color(fg)
+        .on_hover({
+            let st = hover.clone();
+            move |h, _w, cx| {
+                st.update(cx, |v, _| *v = *h);
+                cx.notify(view_id);
+            }
+        })
         .active(|style| style.bg(hover_bg).opacity(0.85));
 
-    // 左侧当前项指示条（hover 时显现，统一强调蓝）
+    // 左侧当前项指示条（hover 时淡入，统一强调蓝）
     let indicator = div()
         .absolute()
         .top(px(5.))
@@ -102,8 +118,11 @@ pub(crate) fn toc_item_frame(
         .w(px(2.))
         .rounded_full()
         .bg(accent)
-        .opacity(0.0)
-        .group_hover("toc-item", |style| style.opacity(1.0));
+        .with_spring(
+            format!("toc-ind-{row_key}"),
+            hover_spring(if hovered { 1.0 } else { 0.0 }),
+            |this, v| this.opacity(v),
+        );
     row = row.child(indicator);
 
     // 折叠箭头（有下级时）：点击只折叠/展开，不跳转
@@ -175,7 +194,14 @@ pub(crate) fn toc_item_frame(
         );
     }
 
-    row.on_click(on_select).into_any_element()
+    row.on_click(on_select)
+        // P2-10：hover 背景淡入。
+        .with_spring(
+            format!("toc-bg-{row_key}"),
+            hover_spring(if hovered { 1.0 } else { 0.0 }),
+            move |this, v| this.bg(hover_bg.opacity(v)),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

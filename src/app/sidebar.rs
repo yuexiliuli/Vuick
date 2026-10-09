@@ -9,6 +9,7 @@ use crate::ui::input::Input;
 use crate::editor::rope_ext::RopeExt;
 
 use crate::config::limits::SEARCH_RESULT_CAP;
+use crate::ui::motion::{hover_bg_fade, hover_spring};
 
 use std::rc::Rc;
 
@@ -121,7 +122,7 @@ impl EditorApp {
         // 先构建内容（目录视图会自适应更新 sidebar_width），再取宽，避免本帧用旧宽
         let content: Option<gpui::AnyElement> = if self.sidebar.panel_open {
             Some(match self.sidebar.view {
-                SidebarView::Toc => self.render_sidebar_toc(cx),
+                SidebarView::Toc => self.render_sidebar_toc(window, cx),
                 SidebarView::Search => self.render_sidebar_search(window, cx),
             })
         } else {
@@ -144,7 +145,7 @@ impl EditorApp {
             .border_r_1()
             .border_color(border)
             // 拖拽调宽事件由外层 app-body-with-sidebar 容器统一处理（见 render_body_sidebar）
-            .child(self.render_sidebar_activity_bar(border, cx))
+            .child(self.render_sidebar_activity_bar(window, border, cx))
             .children(content)
             .children(self.render_sidebar_resize_handle(cx))
     }
@@ -212,14 +213,20 @@ impl EditorApp {
                         .bottom(px(0.))
                         .w(px(2.))
                         .rounded_full()
-                        .opacity(
-                            if self.sidebar.resize.is_some() || self.sidebar.resize_hovered {
+                        .bg(accent)
+                        // P2-10：悬停/拖拽时细线淡入（滚动条滑块同款指数平滑可接受，
+                        // 这里用统一 hover 弹簧）。
+                        .with_spring(
+                            "sidebar-resize-accent",
+                            hover_spring(if self.sidebar.resize.is_some()
+                                || self.sidebar.resize_hovered
+                            {
                                 1.0
                             } else {
                                 0.0
-                            },
-                        )
-                        .bg(accent),
+                            }),
+                            |this, v| this.opacity(v),
+                        ),
                 )
                 .into_any_element(),
         ]
@@ -230,6 +237,7 @@ impl EditorApp {
     /// （与目录条目左侧指示条同款），便于快速识别当前面板。
     fn render_sidebar_activity_bar(
         &mut self,
+        window: &mut Window,
         border: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -248,6 +256,10 @@ impl EditorApp {
             // 活动项图标用主前景色（深色主题下近白），不变蓝
             let col = if is_active { fg } else { muted };
             let id_owned = id.to_string();
+            // P2-10：hover 状态跨帧记录 → 背景淡入。
+            let btn_hover = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
+            let btn_hovered = *btn_hover.read(cx);
+            let view_id = window.current_view();
             let btn = div()
                 .id(SharedString::from(id))
                 .debug_selector(move || id_owned.clone())
@@ -263,7 +275,6 @@ impl EditorApp {
                 // 背景不随活动状态变化，仅图标着色区分
                 .text_color(col)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(hover_fill))
                 .active(|style| style.bg(pressed_fill))
                 // 活动项：最左侧蓝色竖条（同目录条目左侧指示条）
                 .child(
@@ -280,8 +291,17 @@ impl EditorApp {
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
                     this.toggle_sidebar_view(view, cx);
                 }))
+                .on_hover({
+                    let st = btn_hover.clone();
+                    move |hovered, _w, cx| {
+                        st.update(cx, |v, _| *v = *hovered);
+                        cx.notify(view_id);
+                    }
+                })
                 .child(Icon::new(icon).size(px(22.)).text_color(col));
-            btns.push(btn.into_any_element());
+            btns.push(
+                hover_bg_fade(btn, format!("{id}-bg"), hover_fill, btn_hovered).into_any_element(),
+            );
         }
         div()
             .id("sidebar-activity-bar")
@@ -403,7 +423,11 @@ impl EditorApp {
 
     /// 「目录」视图：当前文档的标题大纲（Markdown 标题 / PDF 书签），
     /// 带面板头（「目录」+ 关闭）与页码，条目样式统一来自公共 [`crate::toc`]（可折叠树）。
-    fn render_sidebar_toc(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_sidebar_toc(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (fg, muted) = (self.text_primary(), self.text_minor());
         let active_bg = self.tab_active_bg();
         let accent = crate::ui::theme::Theme::global(cx).colors.accent.into();
@@ -433,7 +457,7 @@ impl EditorApp {
                         self.sidebar_empty_hint("当前 PDF 无书签目录")
                     } else {
                         let rows = self.sidebar_toc_pdf_rows(
-                            &outlines, &collapsed, fg, muted, active_bg, accent,
+                            window, &outlines, &collapsed, fg, muted, active_bg, accent,
                             pdf.clone(), cx,
                         );
                         div().flex().flex_col().py_1().children(rows).into_any_element()
@@ -443,7 +467,7 @@ impl EditorApp {
                     match self.md_toc_source(cx) {
                         Some((entries, scroll)) if !entries.is_empty() => {
                             let rows = self.sidebar_toc_md_rows(
-                                &entries, &collapsed, fg, muted, active_bg, accent,
+                                window, &entries, &collapsed, fg, muted, active_bg, accent,
                                 scroll, cx,
                             );
                             div().flex().flex_col().py_1().children(rows).into_any_element()
@@ -477,6 +501,13 @@ impl EditorApp {
                     .py_1()
                     .child(inner),
             )
+            // P2-10：面板开合轻淡入（宽度动画会让「自适应宽 + 布局断言」测试抖动，
+            // 改为只动绘制、不碰布局的透明度淡入）。
+            .with_spring(
+                "sidebar-toc-fade",
+                hover_spring(1.0).from(0.0),
+                |this, v| this.opacity(v),
+            )
             .into_any_element()
     }
 
@@ -484,6 +515,7 @@ impl EditorApp {
     #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
     fn sidebar_toc_pdf_rows(
         &self,
+        window: &mut Window,
         outlines: &[crate::pdf::PdfOutlineEntry],
         collapsed: &std::collections::HashSet<usize>,
         fg: gpui::Hsla,
@@ -505,6 +537,11 @@ impl EditorApp {
             let has_child = crate::toc::toc_node_has_child(&levels, i);
             let is_collapsed = has_child && collapsed.contains(&i);
             let idx = i;
+            // 折叠回调先物化（与下方 `window, cx` 参数不可同表达式借用 cx）。
+            let toggle_collapse = cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.toggle_sidebar_toc_collapse(idx, cx);
+            });
             rows.push(crate::toc::toc_item_frame(
                 format!("sidebar-toc-pdf-{i}"),
                 format!("sidebar-toc-caret-{i}"),
@@ -518,6 +555,8 @@ impl EditorApp {
                 muted,
                 active_bg,
                 accent,
+                window,
+                cx,
                 move |_, _w, cx| {
                     if page != usize::MAX {
                         wk.update(cx, |v, cx| {
@@ -526,10 +565,7 @@ impl EditorApp {
                         });
                     }
                 },
-                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                    cx.stop_propagation();
-                    this.toggle_sidebar_toc_collapse(idx, cx);
-                }),
+                toggle_collapse,
             ));
         }
         rows
@@ -541,6 +577,7 @@ impl EditorApp {
     #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
     fn sidebar_toc_md_rows(
         &self,
+        window: &mut Window,
         entries: &[(usize, u8, SharedString)],
         collapsed: &std::collections::HashSet<usize>,
         fg: gpui::Hsla,
@@ -561,6 +598,11 @@ impl EditorApp {
             let has_child = crate::toc::toc_node_has_child(&levels, i);
             let is_collapsed = has_child && collapsed.contains(&i);
             let idx = i;
+            // 折叠回调先物化（与下方 `window, cx` 参数不可同表达式借用 cx）。
+            let toggle_collapse = cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
+                cx.stop_propagation();
+                this.toggle_sidebar_toc_collapse(idx, cx);
+            });
             rows.push(crate::toc::toc_item_frame(
                 format!("sidebar-toc-md-{i}"),
                 format!("sidebar-toc-caret-{i}"),
@@ -574,6 +616,8 @@ impl EditorApp {
                 muted,
                 active_bg,
                 accent,
+                window,
+                cx,
                 move |_, window, cx| match &sc {
                     MdTocScroll::Legacy(md) => {
                         md.update(cx, |v, cx| {
@@ -588,10 +632,7 @@ impl EditorApp {
                         });
                     }
                 },
-                cx.listener(move |this: &mut EditorApp, _ev, _w, cx| {
-                    cx.stop_propagation();
-                    this.toggle_sidebar_toc_collapse(idx, cx);
-                }),
+                toggle_collapse,
             ));
         }
         rows
@@ -642,7 +683,7 @@ impl EditorApp {
                 .child("输入关键字，搜索当前文件内容；文件名匹配所有打开文件")
                 .into_any_element()
         } else {
-            self.render_sidebar_search_results(&q, cx)
+            self.render_sidebar_search_results(window, &q, cx)
         };
 
         div()
@@ -656,6 +697,12 @@ impl EditorApp {
             .overflow_hidden()
             .child(input)
             .child(result_area)
+            // P2-10：面板开合轻淡入（同目录面板，见 `sidebar-toc-fade`）。
+            .with_spring(
+                "sidebar-search-fade",
+                hover_spring(1.0).from(0.0),
+                |this, v| this.opacity(v),
+            )
             .into_any_element()
     }
 
@@ -665,6 +712,7 @@ impl EditorApp {
     /// 每行 `to_lowercase()` 分配）。
     fn render_sidebar_search_results(
         &mut self,
+        window: &mut Window,
         q: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -684,13 +732,20 @@ impl EditorApp {
                 let qo = q.to_string();
                 pdf.update(cx, |v, cx| v.set_search(&qo, cx));
             }
-            return self.render_sidebar_pdf_search(&pdf, q, cx);
+            return self.render_sidebar_pdf_search(window, &pdf, q, cx);
         }
         let scan = self.sidebar_search_scan(q, cx);
         let hits = scan.file_tabs.len() + scan.line_hits.len();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        rows.extend(self.sidebar_search_file_rows(&scan, fg, muted, active_bg, cx));
-        rows.extend(self.sidebar_search_line_rows(&scan, muted, active_bg, cx));
+        rows.extend(self.sidebar_search_file_rows(
+            window,
+            &scan,
+            fg,
+            muted,
+            active_bg,
+            cx,
+        ));
+        rows.extend(self.sidebar_search_line_rows(window, &scan, muted, active_bg, cx));
 
         div()
             .id("sidebar-search-results")
@@ -707,6 +762,7 @@ impl EditorApp {
     /// 文件名命中（跨所有打开文件）：相当于「打开文件」快速选择器，点击激活选项卡。
     fn sidebar_search_file_rows(
         &self,
+        window: &mut Window,
         scan: &SidebarSearchScan,
         fg: gpui::Hsla,
         muted: gpui::Hsla,
@@ -723,6 +779,10 @@ impl EditorApp {
                 .unwrap_or_else(|| "未命名".to_string());
             let row_fg = if ti == self.active_tab { fg } else { muted };
             let nm = name;
+            // P2-10：hover 状态跨帧记录 → 行背景淡入。
+            let hover = window.use_keyed_state(format!("ss-file-{ti}-hover"), cx, |_, _| false);
+            let hovered = *hover.read(cx);
+            let view_id = window.current_view();
             let r = div()
                 .id(SharedString::from(format!("sidebar-search-file-{ti}")))
                 .debug_selector(move || format!("sidebar-search-file-{ti}"))
@@ -736,7 +796,13 @@ impl EditorApp {
                 .rounded_md()
                 .text_color(row_fg)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(active_bg))
+                .on_hover({
+                    let st = hover.clone();
+                    move |h, _w, cx| {
+                        st.update(cx, |v, _| *v = *h);
+                        cx.notify(view_id);
+                    }
+                })
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                     this.activate_tab(ti, window, cx);
                 }))
@@ -751,7 +817,10 @@ impl EditorApp {
                         .text_color(row_fg)
                         .child(nm),
                 );
-            file_rows.push(r.into_any_element());
+            file_rows.push(
+                hover_bg_fade(r, format!("ss-file-{ti}-bg"), active_bg, hovered)
+                    .into_any_element(),
+            );
         }
         file_rows
     }
@@ -761,6 +830,7 @@ impl EditorApp {
     /// 的内容，看起来像搜索到了错误文档。点击：激活文档 + 光标/预览滚到命中行并高亮。
     fn sidebar_search_line_rows(
         &self,
+        window: &mut Window,
         scan: &SidebarSearchScan,
         muted: gpui::Hsla,
         active_bg: gpui::Hsla,
@@ -773,6 +843,11 @@ impl EditorApp {
             let match_range = hit.range.clone();
             let snippet = hit.snippet.clone();
             let q_owned = scan.query.clone();
+            // P2-10：hover 状态跨帧记录 → 行背景淡入。
+            let hover =
+                window.use_keyed_state(format!("ss-line-{ti}-{li}-hover"), cx, |_, _| false);
+            let hovered = *hover.read(cx);
+            let view_id = window.current_view();
             let r = div()
                 .id(SharedString::from(format!("sidebar-search-line-{ti}-{li}")))
                 .debug_selector(move || format!("sidebar-search-line-{ti}-{li}"))
@@ -783,7 +858,13 @@ impl EditorApp {
                 .text_size(px(12.))
                 .text_color(muted)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(active_bg))
+                .on_hover({
+                    let st = hover.clone();
+                    move |h, _w, cx| {
+                        st.update(cx, |v, _| *v = *h);
+                        cx.notify(view_id);
+                    }
+                })
                 .on_click(cx.listener(move |this: &mut EditorApp, _ev, window, cx| {
                     this.activate_tab(ti, window, cx);
                     if let Some(tab) = this.tabs.get(ti) {
@@ -837,7 +918,10 @@ impl EditorApp {
                         .whitespace_nowrap()
                         .child(format!("L{}  {}", li + 1, snippet)),
                 );
-            line_rows.push(r.into_any_element());
+            line_rows.push(
+                hover_bg_fade(r, format!("ss-line-{ti}-{li}-bg"), active_bg, hovered)
+                    .into_any_element(),
+            );
         }
         line_rows
     }
@@ -868,6 +952,7 @@ impl EditorApp {
     /// 检索本身由 [`crate::pdf::PdfViewer::set_search`] 在阅读器后台执行，这里只读状态并驱动跳转。
     fn render_sidebar_pdf_search(
         &mut self,
+        window: &mut Window,
         pdf: &gpui::Entity<crate::pdf::PdfViewer>,
         q: &str,
         cx: &mut Context<Self>,
@@ -877,13 +962,14 @@ impl EditorApp {
         let (count, truncated, active) = pdf.read(cx).search_summary();
         let snippets: Vec<(usize, String)> = pdf.read(cx).search_snippets();
 
-        let prev_btn = self.sidebar_pdf_nav_btn("↑", -1, pdf.clone(), fg, active_bg, cx);
-        let next_btn = self.sidebar_pdf_nav_btn("↓", 1, pdf.clone(), fg, active_bg, cx);
+        let prev_btn = self.sidebar_pdf_nav_btn(window, "↑", -1, pdf.clone(), fg, active_bg, cx);
+        let next_btn = self.sidebar_pdf_nav_btn(window, "↓", 1, pdf.clone(), fg, active_bg, cx);
 
         let summary = Self::sidebar_pdf_search_summary(
             count, truncated, q, fg, muted, prev_btn, next_btn,
         );
-        let hit_rows = self.sidebar_pdf_hit_rows(pdf, &snippets, active, fg, muted, active_bg, cx);
+        let hit_rows =
+            self.sidebar_pdf_hit_rows(window, pdf, &snippets, active, fg, muted, active_bg, cx);
 
         div()
             .id("sidebar-search-results-pdf")
@@ -901,6 +987,7 @@ impl EditorApp {
     /// 返回 owned `AnyElement`（避免 RPIT 捕获 `cx` 生命周期导致连续两按钮借用冲突）。
     fn sidebar_pdf_nav_btn(
         &self,
+        window: &mut Window,
         symbol: &'static str,
         delta: i64,
         target: gpui::Entity<crate::pdf::PdfViewer>,
@@ -913,7 +1000,11 @@ impl EditorApp {
         } else {
             "sidebar-search-pdf-next"
         };
-        div()
+        // P2-10：hover 状态跨帧记录 → 背景淡入。
+        let hover = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
+        let hovered = *hover.read(cx);
+        let view_id = window.current_view();
+        let btn = div()
             .id(SharedString::from(id))
             .debug_selector(move || SharedString::from(id).into())
             .flex()
@@ -926,13 +1017,19 @@ impl EditorApp {
             .text_size(px(16.))
             .text_color(fg)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(active_bg))
+            .on_hover({
+                let st = hover.clone();
+                move |h, _w, cx| {
+                    st.update(cx, |v, _| *v = *h);
+                    cx.notify(view_id);
+                }
+            })
             .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
                 target.update(cx, |v, cx| v.move_match(delta, cx));
                 cx.notify();
             }))
-            .child(symbol)
-            .into_any_element()
+            .child(symbol);
+        hover_bg_fade(btn, format!("{id}-bg"), active_bg, hovered).into_any_element()
     }
 
     /// PDF 搜索头部「n 处匹配」计数（计数在左、导航靠右；计数过长尾部省略）；
@@ -1003,6 +1100,7 @@ impl EditorApp {
     #[allow(clippy::too_many_arguments)] // 三色 + 数据源 + 命中列表，与 render_* 同构
     fn sidebar_pdf_hit_rows(
         &self,
+        window: &mut Window,
         pdf: &gpui::Entity<crate::pdf::PdfViewer>,
         snippets: &[(usize, String)],
         active: usize,
@@ -1016,6 +1114,10 @@ impl EditorApp {
             let page = *page;
             let color = if idx == active { fg } else { muted };
             let row_pdf = pdf.clone();
+            // P2-10：hover 状态跨帧记录 → 行背景淡入。
+            let hover = window.use_keyed_state(format!("ss-pdf-hit-{idx}-hover"), cx, |_, _| false);
+            let hovered = *hover.read(cx);
+            let view_id = window.current_view();
             let r = div()
                 .id(SharedString::from(format!("sidebar-search-pdf-hit-{idx}")))
                 .debug_selector(move || format!("sidebar-search-pdf-hit-{idx}"))
@@ -1029,7 +1131,13 @@ impl EditorApp {
                 .text_size(px(12.))
                 .text_color(color)
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(active_bg))
+                .on_hover({
+                    let st = hover.clone();
+                    move |h, _w, cx| {
+                        st.update(cx, |v, _| *v = *h);
+                        cx.notify(view_id);
+                    }
+                })
                 .on_click(cx.listener(move |_this: &mut EditorApp, _ev, _w, cx| {
                     row_pdf.update(cx, |v, cx| v.focus_match_on_page(page, cx));
                     cx.notify();
@@ -1043,7 +1151,10 @@ impl EditorApp {
                         .text_overflow(gpui::TextOverflow::Truncate("…".into()))
                         .child(format!("L{}  {}", page + 1, snippet)),
                 );
-            hit_rows.push(r.into_any_element());
+            hit_rows.push(
+                hover_bg_fade(r, format!("ss-pdf-hit-{idx}-bg"), active_bg, hovered)
+                    .into_any_element(),
+            );
         }
         hit_rows
     }

@@ -16,12 +16,13 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ClickEvent, CursorStyle, ElementId, FocusHandle, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Refineable, RenderOnce, SharedString, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, ViewElement, Window, div,
-    prelude::FluentBuilder as _, relative, transparent_black, white,
+    AnimationExt, AnyElement, App, ClickEvent, CursorStyle, ElementId, FocusHandle, Hsla,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Refineable, RenderOnce,
+    SharedString, Stateful, StatefulInteractiveElement, StyleRefinement, Styled, ViewElement,
+    Window, div, prelude::FluentBuilder as _, relative, transparent_black, white,
 };
 
+use crate::ui::motion::hover_spring;
 use crate::ui::theme::{ColorScheme, Theme};
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -237,11 +238,17 @@ impl RenderOnce for Button {
         let (colors, is_dark) = (theme.colors, theme.is_dark());
         let variant = self.variant;
         let disabled = self.disabled;
+        let selected = self.selected && !disabled;
         let caller_style = self.style.clone();
         let on_click = self.on_click;
         let label = self.label;
 
         let (bg, fg, border) = variant.rest(&colors);
+        // P2-10：元素级 hover 状态，驱动背景弹簧（`selected`/`disabled` 不参与）。
+        let hover_flag = window.use_keyed_state((self.id.clone(), "hover"), cx, |_, _| false);
+        let hovered = *hover_flag.read(cx) && !disabled;
+        let view_id = window.current_view();
+        let hover_bg = variant.hover_bg(&colors, is_dark);
 
         let mut root = self
             .base
@@ -254,12 +261,19 @@ impl RenderOnce for Button {
             .bg(bg)
             .text_color(fg)
             .when_some(border, |this, b| this.border_1().border_color(b))
-            .when(self.selected && !disabled, |this| {
+            .when(selected, |this| {
                 this.bg(variant.active_bg(&colors, is_dark))
             })
-            .when(!self.selected && !disabled, |this| {
-                this.hover(|s| s.bg(variant.hover_bg(&colors, is_dark)))
-                    .active(|s| s.bg(variant.active_bg(&colors, is_dark)))
+            .when(!selected && !disabled, |this| {
+                // 按压仍即时反馈（active）；hover 背景由底部 with_spring 统一淡入。
+                this.active(|s| s.bg(variant.active_bg(&colors, is_dark)))
+                    .on_hover({
+                        let st = hover_flag.clone();
+                        move |hovered, _window, cx| {
+                            st.update(cx, |v, _| *v = *hovered);
+                            cx.notify(view_id);
+                        }
+                    })
             })
             .when(disabled, |this| {
                 this.opacity(0.45).on_mouse_down(MouseButton::Left, |_, _, cx| {
@@ -278,13 +292,22 @@ impl RenderOnce for Button {
         // 其余（w/h/px/rounded/text_size/text_color…）由调用方决定。
         root.style().refine(&caller_style);
 
-        root.child(
-            div()
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .when_some(label, |this, l| this.child(l)),
-        )
-        .children(self.children)
+        let content = div()
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .when_some(label, |this, l| this.child(l));
+        if selected || disabled {
+            root.child(content).children(self.children).into_any_element()
+        } else {
+            root.with_spring(
+                (self.id.clone(), "bg"),
+                hover_spring(if hovered { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(hover_bg.opacity(v)),
+            )
+            .child(content)
+            .children(self.children)
+            .into_any_element()
+        }
     }
 }
 

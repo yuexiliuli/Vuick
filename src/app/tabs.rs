@@ -3,6 +3,7 @@
 use super::*;
 use crate::config::timing::TAB_HSCROLL_HIDE_MS;
 use crate::scrollbar::horizontal_scrollbar;
+use crate::ui::motion::{hover_bg_fade, hover_spring};
 
 /// 选项卡栏渲染色集（主题各色一次取齐，打包传给各子元素助手，避免逐个传参）。
 struct TabBarColors {
@@ -298,8 +299,6 @@ impl EditorApp {
             .text_color(colors.text_minor)
             .cursor(CursorStyle::PointingHand)
             .hover(|style| style.bg(colors.hover_fill))
-            // 仅视觉：opacity 只影响绘制不阻断事件，模拟点击/命中不受影响。
-            .opacity(if is_active || hovered { 1.0 } else { 0.0 })
             .child("×")
             .on_mouse_down(
                 MouseButton::Left,
@@ -307,6 +306,12 @@ impl EditorApp {
                     this.close_tab(idx, window, cx);
                     cx.stop_propagation();
                 }),
+            )
+            // P2-10：仅视觉的 × 悬停显现淡入（激活项恒定、非激活项随行 hover）。
+            .with_spring(
+                format!("tab-close-op-{idx}"),
+                hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
+                move |this, v| this.opacity(v),
             );
 
         let mut el = div()
@@ -327,16 +332,15 @@ impl EditorApp {
             .child(SharedString::from(name.clone()))
             .child(close);
         // 激活项 = VS Code 卡片式：26px 圆角白卡浮在灰带上（浅色下）；
-        // 非激活项透明底 + hover 填充。
+        // 非激活项透明底 + hover 填充（背景由底部弹簧统一淡入，P2-10）。
         el = if is_active {
             el.rounded_md()
-                .bg(colors.tab_active_bg)
                 .border_1()
                 .border_color(colors.tab_active_border)
         } else {
-            el.hover(|style| style.bg(colors.hover_fill))
+            el
         };
-        // hover 状态跨帧记录，驱动关闭 × 悬停显现。
+        // hover 状态跨帧记录，驱动关闭 × 悬停显现与行背景淡入。
         el = el.on_hover({
             let st = tab_hover.clone();
             move |hovered, _window, cx| {
@@ -351,6 +355,13 @@ impl EditorApp {
             name: SharedString::from(name),
         };
         let ghost_name = drag_data.name.clone();
+        // P2-10：背景弹簧——激活=白卡轻淡入、非激活=hover 填充淡入（同一曲线）；
+        // 激活底色 / hover 底色自带 alpha，`opacity` 乘性，v=1 即原色，语义不变。
+        let card = if is_active {
+            colors.tab_active_bg
+        } else {
+            colors.hover_fill
+        };
         el.on_drag(
             drag_data,
             move |_value: &TabDragData, _offset, _window, cx| {
@@ -365,15 +376,29 @@ impl EditorApp {
                 this.activate_tab(idx, window, cx);
             }),
         )
+        .with_spring(
+            format!("tab-bg-{idx}"),
+            hover_spring(if is_active || hovered { 1.0 } else { 0.0 }),
+            move |this, v| this.bg(card.opacity(v)),
+        )
         .into_any_element()
     }
 
     /// 新建(+)：手绘「＋」形图标（横/竖两条圆角细条居中），替代文本 "+"，
     /// 避免不同字体下粗细/偏移不一显得歪斜；带 hover/按下交互反馈。
-    fn tab_add_button(colors: &TabBarColors, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn tab_add_button(
+        window: &mut Window,
+        colors: &TabBarColors,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // P2-10：hover 状态跨帧记录 → 填充层淡入（不覆盖常态 chip_bg）。
+        let hover = window.use_keyed_state("tab-add-hover", cx, |_, _| false);
+        let hovered = *hover.read(cx);
+        let view_id = window.current_view();
         div()
             .id("tab-add")
             .debug_selector(|| "tab-add".into())
+            .relative()
             .w(px(24.))
             .h(px(24.))
             .flex()
@@ -382,13 +407,25 @@ impl EditorApp {
             .rounded_md()
             .bg(colors.chip_bg)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(colors.hover_fill))
             .active(|style| style.bg(colors.tab_active_border))
+            .on_hover({
+                let st = hover.clone();
+                move |h, _w, cx| {
+                    st.update(cx, |v, _| *v = *h);
+                    cx.notify(view_id);
+                }
+            })
             .on_click(
                 cx.listener(|this: &mut EditorApp, _ev, window, cx| {
                     this.new_tab(window, cx)
                 }),
             )
+            .child(hover_bg_fade(
+                div().absolute().inset_0().rounded_md(),
+                "tab-add-bg",
+                colors.hover_fill,
+                hovered,
+            ))
             .child(
                 div()
                     .id("tab-add-icon")
@@ -425,7 +462,11 @@ impl EditorApp {
     /// 整条选项卡栏最右侧的眼睛图标：仅当"当前选中的文件"是 Markdown（.md / .markdown）
     /// 时才显示，点击切换当前选项卡的 Markdown 预览（与「查看 → 预览」一致）。
     /// 用纯 div 画出（椭圆外框 + 中心瞳孔），避免依赖 emoji 字体；蓝色=已开，灰色=已关。
-    fn tab_eye_button(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    fn tab_eye_button(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
         let active_is_md = self
             .tabs
             .get(self.active_tab)
@@ -442,6 +483,10 @@ impl EditorApp {
             self.chrome().text_tertiary.into()
         };
         let hover_fill: gpui::Hsla = self.chrome().hover_fill.into();
+        // P2-10：hover 状态跨帧记录 → 背景淡入。
+        let hover = window.use_keyed_state("tab-eye-hover", cx, |_, _| false);
+        let hovered = *hover.read(cx);
+        let view_id = window.current_view();
         Some(
             div()
                 .id("tab-bar-eye")
@@ -453,7 +498,13 @@ impl EditorApp {
                 .justify_center()
                 .rounded_md()
                 .cursor(CursorStyle::PointingHand)
-                .hover(|style| style.bg(hover_fill))
+                .on_hover({
+                    let st = hover.clone();
+                    move |h, _w, cx| {
+                        st.update(cx, |v, _| *v = *h);
+                        cx.notify(view_id);
+                    }
+                })
                 .child(
                     div()
                         .w(px(16.))
@@ -472,6 +523,11 @@ impl EditorApp {
                         let idx = this.active_tab;
                         this.toggle_preview_for_tab(idx, window, cx);
                     }),
+                )
+                .with_spring(
+                    "tab-eye-bg",
+                    hover_spring(if hovered { 1.0 } else { 0.0 }),
+                    move |this, v| this.bg(hover_fill.opacity(v)),
                 )
                 .into_any_element(),
         )
@@ -517,7 +573,7 @@ impl EditorApp {
 
         // 选项卡栏右侧：固定放"新建(+)"与（按需）眼睛图标；标签过多时由左侧滚动区横向滚动
         let mut right: Vec<gpui::AnyElement> = Vec::new();
-        if let Some(eye) = self.tab_eye_button(cx) {
+        if let Some(eye) = self.tab_eye_button(window, cx) {
             right.push(eye);
         }
 
@@ -569,7 +625,7 @@ impl EditorApp {
                     )
                     .children(hscroll_overlay),
             )
-            .child(Self::tab_add_button(&colors, cx))
+            .child(Self::tab_add_button(window, &colors, cx))
             .children(right)
     }
 }

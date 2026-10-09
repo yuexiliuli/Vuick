@@ -30,17 +30,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    anchored, deferred, div, px, rgba, white, Anchor, AnyWindowHandle, App, AppContext,
-    Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
-    Point, PromptLevel, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    VisualContext, Window, WindowBounds, WindowOptions,
+    anchored, deferred, div, px, rgba, white, Anchor, AnimationExt, AnyWindowHandle, App,
+    AppContext, Bounds, Context, CursorStyle, DismissEvent, DragMoveEvent, Edges, ExternalPaths,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, PromptLevel, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, VisualContext, Window, WindowBounds, WindowOptions,
 };
 use crate::ui::input::{InputEvent, InputState};
 use crate::ui::menu::{PopupMenu, PopupMenuItem};
 use ropey::Rope;
 use crate::ui::icon::{Icon, IconName};
 use crate::ui::theme::ChromeColors;
+use crate::ui::motion::hover_spring;
 
 // WYSIWYG 预览编辑——本项目 `crate::markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
 use crate::markdown::{WyEditor, WyEvent};
@@ -2121,7 +2122,10 @@ impl EditorApp {
         };
 
         // 侧边栏「展开/收起」开关：收拢时显示打开图标（点击展开），展开时显示收起图标。
-        // 用自绘图标按钮（非 window_control_area，普通点击交互）。
+        // 用自绘图标按钮（非 window_control_area，普通点击交互）。P2-10：hover 淡入。
+        let sidebar_toggle_hover =
+            window.use_keyed_state("title-sidebar-toggle-hover", cx, |_, _| false);
+        let sidebar_toggle_hovered = *sidebar_toggle_hover.read(cx);
         let sidebar_toggle = div()
             .id("title-sidebar-toggle")
             .debug_selector(|| "title-sidebar-toggle".into())
@@ -2133,7 +2137,13 @@ impl EditorApp {
             .rounded_md()
             .text_color(text_minor)
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(hover_fill))
+            .on_hover({
+                let st = sidebar_toggle_hover.clone();
+                move |hovered, _window, cx| {
+                    st.update(cx, |h, _| *h = *hovered);
+                    cx.notify(view_id);
+                }
+            })
             .child(icon_style(if self.sidebar.open {
                 IconName::PanelLeftClose
             } else {
@@ -2144,6 +2154,11 @@ impl EditorApp {
                 cx.listener(|this: &mut EditorApp, _ev, _window, cx| {
                     this.toggle_sidebar(cx);
                 }),
+            )
+            .with_spring(
+                "title-sidebar-toggle-bg",
+                hover_spring(if sidebar_toggle_hovered { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(hover_fill.opacity(v)),
             );
 
         let maximize_icon = if window.is_maximized() {
@@ -2171,7 +2186,6 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(hover_fill))
             .active(|style| style.bg(pressed_fill))
             .child(
                 Icon::new(IconName::WindowMinimize)
@@ -2185,7 +2199,13 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .window_control_area(gpui::WindowControlArea::Min);
+            .window_control_area(gpui::WindowControlArea::Min)
+            // P2-10：hover 背景淡入。
+            .with_spring(
+                "title-minimize-bg",
+                hover_spring(if *minimize_hover.read(cx) { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(hover_fill.opacity(v)),
+            );
 
         let maximize_hover =
             window.use_keyed_state("title-maximize-hover", cx, |_, _| false);
@@ -2202,7 +2222,6 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(hover_fill))
             .active(|style| style.bg(pressed_fill))
             .child(
                 Icon::new(maximize_icon)
@@ -2216,7 +2235,13 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .window_control_area(gpui::WindowControlArea::Max);
+            .window_control_area(gpui::WindowControlArea::Max)
+            // P2-10：hover 背景淡入。
+            .with_spring(
+                "title-maximize-bg",
+                hover_spring(if *maximize_hover.read(cx) { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(hover_fill.opacity(v)),
+            );
 
         let close_hover_state =
             window.use_keyed_state("title-close-hover", cx, |_, _| false);
@@ -2234,7 +2259,6 @@ impl EditorApp {
             .items_center()
             .justify_center()
             .cursor(CursorStyle::PointingHand)
-            .hover(|style| style.bg(close_hover))
             .active(|style| style.bg(close_pressed))
             .child(
                 Icon::new(IconName::WindowClose)
@@ -2248,7 +2272,13 @@ impl EditorApp {
                     cx.notify(view_id);
                 }
             })
-            .window_control_area(gpui::WindowControlArea::Close);
+            .window_control_area(gpui::WindowControlArea::Close)
+            // P2-10：hover 背景淡入。
+            .with_spring(
+                "title-close-bg",
+                hover_spring(if *close_hover_state.read(cx) { 1.0 } else { 0.0 }),
+                move |this, v| this.bg(close_hover.opacity(v)),
+            );
 
         div()
             .id("title-bar")

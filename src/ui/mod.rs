@@ -36,6 +36,7 @@ pub mod button;
 pub mod icon;
 pub mod input;
 pub mod menu;
+pub mod motion;
 pub mod notification;
 pub mod root;
 pub mod scrollbar;

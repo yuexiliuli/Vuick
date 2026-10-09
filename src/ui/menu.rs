@@ -20,10 +20,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, DismissEvent, Edges, ElementId,
-    Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, RenderOnce,
-    StatefulInteractiveElement, Styled, Window, accesskit, anchored, deferred, div,
+    Anchor, AnyElement, AnimationExt, App, AppContext as _, ClickEvent, Context, DismissEvent,
+    Edges, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    RenderOnce, StatefulInteractiveElement, Styled, Window, accesskit, anchored, deferred, div,
     prelude::FluentBuilder as _, px,
 };
 
@@ -329,7 +329,6 @@ impl Render for PopupMenu {
                         .rounded_sm()
                         .gap_2()
                         .text_color(if *disabled { fg_muted } else { fg })
-                        .when(is_selected, |d| d.bg(selected_bg))
                         .when(!disabled, |d| {
                             d.cursor_pointer()
                                 .on_hover(cx.listener(move |this, hovered, _, cx| {
@@ -343,7 +342,13 @@ impl Render for PopupMenu {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.activate(ix, window, cx);
                                 }))
-                        });
+                        })
+                        // P2-10：选中/悬停高亮淡入（键盘↑↓ 与鼠标同一曲线）。
+                        .with_spring(
+                            format!("menu-item-bg-{ix}"),
+                            crate::ui::motion::hover_spring(if is_selected { 1.0 } else { 0.0 }),
+                            move |d, v| d.bg(selected_bg.opacity(v)),
+                        );
                     this.child((render)(window, cx)).into_any_element()
                 }
             })
