@@ -24,6 +24,9 @@ actions!(
         ResetFontSize,
         FollowSystemTheme,
         PasteNormalized,
+        // P2-8 命令面板：Ctrl+Shift+P 打开命令面板、Ctrl+P 打开文件快选。
+        ToggleCommandPalette,
+        QuickOpenFile,
         Quit,
     ]
 );

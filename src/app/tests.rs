@@ -1,7 +1,7 @@
 //! 单元测试（自 mod.rs 拆出，仅测试编译）。
 
     use super::*;
-    use crate::actions::{Paste, Redo, SelectAll, Undo};
+    use crate::actions::{Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo};
     use gpui::{Entity, TestAppContext, VisualTestContext};
 
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
@@ -6013,5 +6013,259 @@
             );
         }
         eprintln!("[h2] DONE bounces={bounce} max_off={max_off:.1} max_et={max_et}");
+    }
+
+    // ---------------------------------------------------------------------
+    // P2-8 命令面板：命令模式（Ctrl+Shift+P）+ 文件模式（Ctrl+P）
+    // ---------------------------------------------------------------------
+
+    /// 命令模式：Ctrl+Shift+P（ToggleCommandPalette）打开 → 键入过滤缩减命令 →
+    /// ↓ 导航 → Enter 执行「新建文件」→ 面板关闭（DismissEvent 清引用）；
+    /// 再开 → Esc 关闭且焦点归还打开前的编辑区。
+    #[gpui::test]
+    async fn command_palette_open_filter_run_and_escape(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 聚焦编辑区（应用级动作经焦点祖先链派发到 App 根 on_action）。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+
+        // Ctrl+Shift+P → 命令面板打开，初始列出全部命令并选中首项。
+        cx.dispatch_action(ToggleCommandPalette);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (total, sel) = cx.update(|_w, cx| {
+            let p = app.read(cx).palette.as_ref().unwrap().read(cx);
+            (p.visible_len(), p.selected())
+        });
+        assert!(total > 5, "命令面板应列出全部命令，实际={total}");
+        assert_eq!(sel, Some(0), "初始应选中首项");
+
+        // 键入「新建」→ 过滤后只剩「新建文件」一条。
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("新建", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (len, label, query) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            (
+                p.visible_len(),
+                p.visible_label(0).map(str::to_string),
+                p.query().to_string(),
+            )
+        });
+        assert_eq!(query, "新建", "查询词应写进面板状态");
+        assert_eq!(len, 1, "过滤「新建」应只剩 1 条命令，实际={len}");
+        assert_eq!(label.as_deref(), Some("新建文件"));
+
+        // ↓：过滤后仅 1 条 → 环绕回 0；再 Enter 执行「新建文件」。
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        let sel2 = cx.update(|_w, cx| palette.read(cx).selected());
+        assert_eq!(sel2, Some(0), "单条过滤下 ↓ 应环绕回 0，实际={sel2:?}");
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed, tabs_len) = cx.update(|_w, cx| {
+            (app.read(cx).palette.is_none(), app.read(cx).tabs.len())
+        });
+        assert!(closed, "Enter 执行后面板应关闭（DismissEvent 清引用）");
+        assert_eq!(tabs_len, 2, "「新建文件」应新增一个选项卡，实际={tabs_len}");
+
+        // 再开 → Esc 关闭，且焦点归还打开前的编辑区。
+        cx.update(|window, cx| {
+            let expected = app.read(cx).editor_focus_handle(cx);
+            window.focus(&expected, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleCommandPalette);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(cx.update(|_w, cx| app.read(cx).palette.is_some()), "Ctrl+Shift+P 应再打开面板");
+        cx.simulate_keystrokes("escape");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed2, focused_opt) = cx.update(|window, cx| {
+            (app.read(cx).palette.is_none(), window.focused(cx))
+        });
+        assert!(closed2, "Esc 应关闭面板");
+        let expected = cx.update(|_w, cx| app.read(cx).editor_focus_handle(cx));
+        assert_eq!(
+            focused_opt.as_ref(),
+            Some(&expected),
+            "关闭后焦点应归还打开前的编辑区"
+        );
+
+        // 点击面板外（中心 600px 面板之外的点）→ 关闭（deferred 层 on_mouse_down_out 路径）。
+        cx.dispatch_action(ToggleCommandPalette);
+        cx.run_until_parked();
+        assert!(cx.update(|_w, cx| app.read(cx).palette.is_some()), "面板应再次打开");
+        cx.simulate_click(gpui::Point::new(px(900.), px(400.)), Default::default());
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let closed3 = cx.update(|_w, cx| app.read(cx).palette.is_none());
+        assert!(closed3, "点击面板外应关闭命令面板");
+    }
+
+    /// 文件模式：Ctrl+P（QuickOpenFile）列出已打开文件（含路径提示）→
+    /// 键入文件名过滤 → Enter 切到对应选项卡并关闭面板。
+    #[gpui::test]
+    async fn quick_open_file_lists_and_switches_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 打开两个真实文件：A 先（下标 1）、B 后（下标 2，活动）。
+        let a = std::env::temp_dir().join("gpui-pal-a.md");
+        let b = std::env::temp_dir().join("gpui-pal-b.md");
+        std::fs::write(&a, "# A\nhello\n").unwrap();
+        std::fs::write(&b, "# B\nworld\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(a.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(b.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let tab_count = cx.update(|_w, cx| app.read(cx).tabs.len());
+        assert_eq!(tab_count, 3, "未命名 + A + B 共 3 个选项卡");
+
+        // 聚焦编辑区后 Ctrl+P → 文件模式面板，列出已打开文件（含「打开文件…」入口）。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(QuickOpenFile);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let palette = cx.update(|_w, cx| app.read(cx).palette.as_ref().unwrap().clone());
+        let (mode, n, first_label) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            (
+                p.mode(),
+                p.visible_len(),
+                p.visible_label(0).map(str::to_string),
+            )
+        });
+        assert_eq!(
+            mode,
+            crate::ui::palette::PaletteMode::Files,
+            "Ctrl+P 应为文件模式"
+        );
+        assert!(n >= 4, "应列出 未命名 + A + B + 打开文件… 至少 4 条，实际={n}");
+        assert_eq!(first_label.as_deref(), Some("未命名"), "首项应为首个打开的（未命名）选项卡");
+
+        // 键入 A 的文件名 → 过滤到只剩 A。
+        cx.update(|window, cx| {
+            let input = palette.read(cx).input_entity();
+            input.update(cx, |s, cx| s.set_value("gpui-pal-a.md", window, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (len, label) = cx.update(|_w, cx| {
+            let p = palette.read(cx);
+            (p.visible_len(), p.visible_label(0).map(str::to_string))
+        });
+        assert_eq!(len, 1, "过滤应只剩 A，实际={len}");
+        assert_eq!(label.as_deref(), Some("gpui-pal-a.md"));
+
+        // Enter → 切到 A 的选项卡（下标 1）并关闭面板。
+        cx.simulate_keystrokes("enter");
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let (closed, active) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.palette.is_none(), a.active_tab)
+        });
+        assert!(closed, "切换后面板应关闭");
+        assert_eq!(active, 1, "Enter 后应切回 A 的选项卡，实际={active}");
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// 面板高度 = 窗口 2/3：列表项多时面板不再探出屏幕底，列表区按剩余高度定高，
+    /// 过长内容在容器内内部滚动（右侧自绘滚动条随之出现，见 scrollbar 组件
+    /// `hides_when_content_fits`）。
+    #[gpui::test]
+    async fn command_palette_height_capped_and_list_scrolls(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        let win_h = 600.0_f32;
+        cx.simulate_resize(gpui::size(px(700.), px(win_h)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 聚焦编辑区（应用级动作经焦点祖先链派发到 App 根 on_action）。
+        cx.update(|window, cx| {
+            let f = app.read(cx).editor_focus_handle(cx);
+            window.focus(&f, cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(ToggleCommandPalette);
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        assert!(cx.update(|_w, cx| app.read(cx).palette.is_some()), "命令面板应打开");
+
+        // ① 面板高度 = 窗口 2/3（不随 16+ 条命令的总高增长）。
+        let panel = cx.debug_bounds("command-palette").expect("面板应渲染");
+        let expect_h = px(win_h * 2.0 / 3.0);
+        assert!(
+            (panel.size.height - expect_h).abs() < px(1.0),
+            "面板高度应为窗口 2/3（{expect_h:?}），实际={:?}",
+            panel.size.height
+        );
+        // 面板顶部 96px 偏移 + 2/3 高恒在窗口内。
+        assert!(
+            panel.bottom() <= px(win_h),
+            "面板不得探出窗口底部：bottom={:?}（窗口高 {win_h}）",
+            panel.bottom()
+        );
+
+        // ② 列表滚动容器有界（剩余高度）：16+ 条命令在容器内可滚动，而非把面板撑高。
+        let scroll = cx
+            .debug_bounds("command-palette-scroll")
+            .expect("列表滚动容器应渲染");
+        assert!(scroll.size.height > px(0.), "列表滚动容器应有正高度：{scroll:?}");
+        assert!(
+            scroll.size.height < panel.size.height - px(40.),
+            "列表滚动容器应为剩余高度并被钳在面板内：scroll={scroll:?} panel={panel:?}"
+        );
+        let max_off = cx.update(|_w, cx| {
+            let p = app.read(cx).palette.as_ref().unwrap().read(cx);
+            p.scroll_handle().max_offset().y
+        });
+        assert!(
+            max_off > px(0.),
+            "列表溢出时应在容器内可滚动：max_offset={max_off:?}"
+        );
     }
 

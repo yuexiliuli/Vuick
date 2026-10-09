@@ -131,7 +131,9 @@ impl EditorApp {
     fn view_items(menu: PopupMenu, weak: gpui::WeakEntity<Self>) -> PopupMenu {
         menu.item(Self::menu_action_item(
             "预览",
-            "Ctrl+P",
+            // P2-8：原 Ctrl+P = 预览切换已改开「打开文件快选」→ 提示清空，
+            // 预览切换现由标签栏眼睛按钮承担。
+            "",
             weak.clone(),
             |this, window, cx| {
                 let idx = this.active_tab;
@@ -246,7 +248,7 @@ impl EditorApp {
     }
 
     /// 把焦点还给当前激活选项卡的编辑区（编辑动作派发到 Input 上下文所需）。
-    fn focus_active_editor(this: &mut Self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_active_editor(this: &mut Self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = this.active_tab;
         let focus = this.tab_focus_handle(idx, cx);
         window.focus(&focus, cx);

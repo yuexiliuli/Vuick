@@ -12,6 +12,7 @@
 //! - [`button`]：按钮（`Button`/`ButtonVariant`/`ButtonVariants`），替换 `gpui_component::button`
 //! - [`menu`]：下拉菜单（`PopupMenu`/`PopupMenuItem`/`Dropdown`/`DropdownMenu`），替换 `gpui_component::menu`
 //! - [`notification`]：通知（`Notification`/`NotificationKind`），替换 `gpui_component::notification`
+//! - [`palette`]：命令面板（`CommandPalette`/`PaletteMode`/`PaletteItem`），居中浮层，命令 + 文件快选两用
 //! - [`root`]：窗口根视图（每窗口第一层宿主），替换 `gpui_component::Root`
 //! - [`input`]：单行文本输入框（搜索框），替换 `gpui_component::input::Input`/`InputState`
 //!
@@ -38,6 +39,7 @@ pub mod input;
 pub mod menu;
 pub mod motion;
 pub mod notification;
+pub mod palette;
 pub mod root;
 pub mod scrollbar;
 pub mod theme;

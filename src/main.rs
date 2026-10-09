@@ -46,7 +46,10 @@ fn main() {
                 KeyBinding::new("ctrl-s", Save, None),
                 KeyBinding::new("shift-ctrl-s", SaveAs, None),
                 KeyBinding::new("ctrl-w", CloseTab, None),
-                KeyBinding::new("ctrl-p", TogglePreview, None),
+                // P2-8 命令面板：Ctrl+P 改开「打开文件快选」；
+                // 原「预览切换」由标签栏眼睛按钮 + 查看菜单承担（菜单快捷键提示已去掉）。
+                KeyBinding::new("ctrl-p", QuickOpenFile, None),
+                KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, None),
                 KeyBinding::new("ctrl-alt-w", ToggleWordWrap, None),
                 KeyBinding::new("ctrl-=", IncreaseFontSize, None),
                 KeyBinding::new("ctrl--", DecreaseFontSize, None),

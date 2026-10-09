@@ -17,6 +17,7 @@
 mod file_ops;
 mod open_progress;
 mod menu;
+mod palette;
 mod panes;
 mod sidebar;
 mod status_bar;
@@ -378,6 +379,11 @@ pub struct EditorApp {
     /// 「跟随系统主题」时的外观变化订阅（`Window::observe_window_appearance`）；
     /// 离开跟随模式后回调只是空返，切换回跟随会立即按当前系统落地一次。
     _appearance_sub: Option<Subscription>,
+    /// 命令面板（P2-8）：打开时为 `Some`，选择/Esc/点击外（`DismissEvent`）关闭后清空。
+    /// 面板是独立 `CommandPalette` 实体（query/选中/模式/条目自持），新建即情境。
+    palette: Option<gpui::Entity<crate::ui::palette::CommandPalette>>,
+    /// 面板关闭订阅（选择/Esc/点击外 → 清空 `palette` 并释放实体）。
+    _palette_sub: Option<Subscription>,
 }
 
 /// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
@@ -494,6 +500,8 @@ impl EditorApp {
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
             _appearance_sub: None,
+            palette: None,
+            _palette_sub: None,
         };
         app.register_window(window, cx);
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
@@ -2584,6 +2592,20 @@ impl EditorApp {
                     this.toggle_wrap(window, cx);
                 }),
             )
+            // P2-8 命令面板：Ctrl+Shift+P 命令模式 / Ctrl+P 文件快选（动作经 `main.rs`
+            // 全局键位绑定 → 分发到根元素这两条 on_action）。
+            .on_action(
+                cx.listener(
+                    |this: &mut EditorApp, _: &ToggleCommandPalette, window, cx| {
+                        this.toggle_command_palette(window, cx);
+                    },
+                ),
+            )
+            .on_action(
+                cx.listener(|this: &mut EditorApp, _: &QuickOpenFile, window, cx| {
+                    this.quick_open_file(window, cx);
+                }),
+            )
             .child(self.render_material_layer(window))
             .child(
                 div()
@@ -2596,5 +2618,20 @@ impl EditorApp {
             // flex 内部容器的 absolute 子元素在真机合成路径一直不被绘制（历史遗留 bug）——
             // 作为外层 relative 的直子（如材质层）才正常渲染。
             .child(self.render_notifications(window, cx))
+            // 命令面板浮层（P2-8）：同样作为外层 relative 的直子挂载（合成层纪律同上）。
+            .child(self.render_palette(window, cx))
+    }
+
+    /// 命令面板浮层挂点：宿主持有面板实体时以根级直子渲染（面板自身包 `deferred`）；
+    /// 关闭后 `palette` 为空 → 返回空元素（不再有持续逐帧重绘）。
+    fn render_palette(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match self.palette.clone() {
+            Some(p) => p.into_any_element(),
+            None => div().into_any_element(),
+        }
     }
 }
