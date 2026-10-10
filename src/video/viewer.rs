@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollHandle,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div,
     img, px, prelude::FluentBuilder as _,
 };
@@ -67,6 +67,8 @@ use crate::ui::icon::{Icon, IconName};
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
+
+use crate::viewer::pan_zoom;
 
 /// 解码通道槽位数（帧数）：回压 + 内存有界；播放/seek 时缓冲少量前跳。
 const DECODE_AHEAD_FRAMES: usize = 2;
@@ -1199,10 +1201,7 @@ impl VideoViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta_y = match ev.delta {
-            ScrollDelta::Lines(lines) => lines.y,
-            ScrollDelta::Pixels(pixels) => f32::from(pixels.y),
-        };
+        let delta_y = pan_zoom::wheel_delta_y(ev);
         self.handle_wheel(delta_y, ev.modifiers.control, ev.modifiers.shift, cx);
         cx.stop_propagation();
     }
@@ -1220,21 +1219,19 @@ impl VideoViewer {
         }
         if ctrl {
             // Ctrl+滚轮：放大/缩小（向上滚 = 放大，向下 = 缩小；与图片/PDF 阅读器一致）
-            let step = delta_y.clamp(-1.0, 1.0);
-            self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
+            self.adjust_zoom(pan_zoom::zoom_factor(delta_y, ZOOM_STEP), cx);
         } else if shift {
             // Shift+滚轮：同文件夹切换（向下滚 = 下一支）
             self.switch_file(if delta_y < 0.0 { 1 } else { -1 }, cx);
         }
     }
 
-    /// 应用缩放因子并约束在 [`ZOOM_MIN`..=`ZOOM_MAX`]；变化才 notify 重绘。
+    /// 应用缩放因子并约束在 [`ZOOM_MIN`..=`ZOOM_MAX`]（钳位/无变化短路由
+    /// [`pan_zoom::apply_zoom`]）；变化才 notify 重绘。
     fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
-        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_zoom - self.zoom).abs() < 1e-4 {
+        if !pan_zoom::apply_zoom(&mut self.zoom, factor, ZOOM_MIN, ZOOM_MAX) {
             return;
         }
-        self.zoom = new_zoom;
         cx.notify();
     }
 
@@ -1261,7 +1258,7 @@ impl VideoViewer {
         cx: &mut Context<Self>,
     ) {
         if ev.button == MouseButton::Left {
-            self.drag = Some((
+            self.drag = Some(pan_zoom::pan_drag_begin(
                 (ev.position.x.as_f32(), ev.position.y.as_f32()),
                 self.pan,
             ));
@@ -1276,7 +1273,7 @@ impl VideoViewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((start_pos, start_pan)) = self.drag else {
+        let Some(drag) = self.drag else {
             return;
         };
         let (vw, vh) = self.viewport_size(window);
@@ -1286,9 +1283,9 @@ impl VideoViewer {
             (vh - CONTROL_BAR_H).max(1.0)
         };
         let (dw, dh) = self.display_size(vw, vh);
-        let dx = ev.position.x.as_f32() - start_pos.0;
-        let dy = ev.position.y.as_f32() - start_pos.1;
-        self.pan = Self::clamp_pan((start_pan.0 + dx, start_pan.1 + dy), vw, area_h, dw, dh);
+        let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
+        let (dx, dy) = pan_zoom::pan_drag_delta(&drag, pos);
+        self.pan = Self::clamp_pan((drag.1.0 + dx, drag.1.1 + dy), vw, area_h, dw, dh);
         cx.notify();
     }
 
@@ -1303,10 +1300,9 @@ impl VideoViewer {
     /// 平移 clamp：放大后（`dw>vw` 或 `dh>vh`）允许在图内滑动，范围 = ±(图−视口)/2；
     /// 未放大时范围 0（永远居中，拖拽无效果）。以「视口中心 = 图中心」为 0 基准，
     /// 缩放/切图后范围变化由 render 逐帧重新 clamp 收敛（同 ImageViewer）。
+    /// 逻辑收敛在 [`pan_zoom::clamp_pan`]。
     fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
-        let ax = (dw - vw).max(0.0) * 0.5;
-        let ay = (dh - vh).max(0.0) * 0.5;
-        (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
+        pan_zoom::clamp_pan(pan, vw, vh, dw, dh)
     }
 
     // ---- 纯视频模式（参考纯图片锁定）：隐藏外壳、视频充满窗口、控制条为浮层 ----
@@ -1407,9 +1403,9 @@ impl VideoViewer {
 
     /// 适应视口（Contain，**贴边无留白**）：取较小缩放比，一端正好贴住宽/高、另一端
     /// 居中留白（同 ImageViewer `contain_fit`——竖屏/横屏都保持原始比例缩放）。
+    /// 逻辑收敛在 [`pan_zoom::contain_fit`]。
     fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
-        let fit = (vw / iw).min(vh / ih).max(0.001);
-        (iw * fit, ih * fit)
+        pan_zoom::contain_fit(iw, ih, vw, vh)
     }
 
     /// 播放进度比例（0..=1；未知时长时 0）。

@@ -80,6 +80,7 @@ use crate::config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
     MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
+use crate::viewer::pan_zoom;
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
 #[derive(Clone)]
@@ -370,9 +371,9 @@ impl ImageViewer {
 
     /// 适应视口（Contain，**贴边无留白**）基准尺寸（不含缩放）：取较小缩放比，两轴任意
     /// 一端**正好贴住窗口上/下或左/右边缘**、保持原始比例（另一端居中留白）。
+    /// 逻辑收敛在 [`pan_zoom::contain_fit`]（image/video 共用同一几何）。
     fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
-        let fit = (vw / iw).min(vh / ih).max(0.001);
-        (iw * fit, ih * fit)
+        pan_zoom::contain_fit(iw, ih, vw, vh)
     }
 
     /// 显示尺寸 = 适应视口（Contain，贴边）× 缩放倍数。
@@ -409,17 +410,13 @@ impl ImageViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let delta_y = match event.delta {
-            ScrollDelta::Lines(v) => v.y,
-            ScrollDelta::Pixels(v) => f32::from(v.y),
-        };
+        let delta_y = pan_zoom::wheel_delta_y(event);
         if delta_y == 0.0 {
             return;
         }
         if event.modifiers.control {
             // 实测本平台：向上滚动 delta.y>0 → 放大；向下 <0 → 缩小（与编辑器字号缩放一致）
-            let step = delta_y.clamp(-1.0, 1.0);
-            self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
+            self.adjust_zoom(pan_zoom::zoom_factor(delta_y, ZOOM_STEP), cx);
         } else {
             // 单滚轮：未放大 → 切图（向下滚 → 下一张，向上滚 → 上一张）；放大态 →
             // 先在图片内平移，滚到边缘继续同向外滚才切图（[`Self::wheel_pan_or_switch`]）。
@@ -490,14 +487,13 @@ impl ImageViewer {
         }
     }
 
-    /// 应用缩放因子并约束在 [ZOOM_MIN, ZOOM_MAX]。缩放会改变「展示像素需要」（放大需更细
-    /// 档），故刷新 [`Self::display_need`] 并在「当前展示比需要更粗」时升档重解。
+    /// 应用缩放因子并约束在 [ZOOM_MIN, ZOOM_MAX]（钳位/无变化短路由 [`pan_zoom::apply_zoom`]）。
+    /// 缩放会改变「展示像素需要」（放大需更细档），故刷新 [`Self::display_need`] 并在
+    /// 「当前展示比需要更粗」时升档重解。
     fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
-        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_zoom - self.zoom).abs() < 1e-4 {
+        if !pan_zoom::apply_zoom(&mut self.zoom, factor, ZOOM_MIN, ZOOM_MAX) {
             return;
         }
-        self.zoom = new_zoom;
         self.update_display_need();
         cx.notify();
         self.escalate_display_denom(cx);
@@ -628,7 +624,7 @@ impl ImageViewer {
         cx: &mut Context<Self>,
     ) {
         if ev.button == MouseButton::Left {
-            self.drag = Some((
+            self.drag = Some(pan_zoom::pan_drag_begin(
                 (ev.position.x.as_f32(), ev.position.y.as_f32()),
                 self.pan,
             ));
@@ -643,17 +639,17 @@ impl ImageViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((start_pos, start_pan)) = self.drag else {
+        let Some(drag) = self.drag else {
             return;
         };
-        let dx = ev.position.x.as_f32() - start_pos.0;
-        let dy = ev.position.y.as_f32() - start_pos.1;
+        let pos = (ev.position.x.as_f32(), ev.position.y.as_f32());
+        let (dx, dy) = pan_zoom::pan_drag_delta(&drag, pos);
         let (vw, vh) = self.last_viewport;
         let (dw, dh) = self
             .intrinsic
             .map(|(iw, ih)| self.display_size(iw, ih, vw, vh))
             .unwrap_or((0.0, 0.0));
-        self.pan = Self::clamp_pan((start_pan.0 + dx, start_pan.1 + dy), vw, vh, dw, dh);
+        self.pan = Self::clamp_pan((drag.1.0 + dx, drag.1.1 + dy), vw, vh, dw, dh);
         cx.notify();
     }
 
@@ -668,10 +664,9 @@ impl ImageViewer {
     /// 平移 clamp：放大后（`dw>vw` 或 `dh>vh`）允许在图内滑动，范围 = ±(图-视口)/2；
     /// 未放大时范围 0（永远居中，拖拽无效果）。以「视口中心 = 图中心」为 0 基准，
     /// 缩放/切图后范围变化由 render 期逐帧重新 clamp 收敛。
+    /// 逻辑收敛在 [`pan_zoom::clamp_pan`]（image/video 共用）。
     fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
-        let ax = (dw - vw).max(0.0) * 0.5;
-        let ay = (dh - vh).max(0.0) * 0.5;
-        (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
+        pan_zoom::clamp_pan(pan, vw, vh, dw, dh)
     }
 
     /// 解码池入队：已在解 → 等其落盘追最新；已缓存 → 直接落盘；并发满（[`MAX_DECODE`]）
@@ -1553,6 +1548,58 @@ mod tests {
         assert_eq!(cp((-1000.0, 200.0), 1000.0, 700.0, 1500.0, 900.0), (-250.0, 100.0));
         // 范围内不动
         assert_eq!(cp((80.0, -40.0), 1000.0, 700.0, 1500.0, 900.0), (80.0, -40.0));
+    }
+
+    /// Ctrl+滚轮缩放边界（走 [`Self::adjust_zoom`]）：一档 = `1 ± ZOOM_STEP`，逐格放大/
+    /// 缩小分别钳到 [`ZOOM_MIN`] / [`ZOOM_MAX`]。缩放副作用 [`Self::escalate_display_denom`]
+    /// 在 `display_denom==1` 时直接返回、不派发解码，故可直接单测。
+    #[gpui::test]
+    async fn adjust_zoom_clamps_to_minmax_and_steps(cx: &mut TestAppContext) {
+        let dir = tmp_dir("zoom_clamp");
+        let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
+                v.intrinsic = Some((200.0, 100.0));
+                v.last_viewport = (800.0, 600.0);
+                v
+            })
+        });
+        // 一档 = 1 + ZOOM_STEP（走共享 controller 的档位生成）；再缩一档 = 1×0.88 =
+        // (1+s)(1-s)=1-s² ≈ 0.9856（非回到 1.0——原行为即如此，逐格独立算因子）。
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+                assert!((v.zoom - 1.12).abs() < 1e-6, "1 档放大: {}", v.zoom);
+                v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
+                assert!((v.zoom - 0.9856).abs() < 1e-4, "再缩一档: {}", v.zoom);
+            })
+        });
+        // 缩到下限 / 放大到上限
+        for _ in 0..200 {
+            cx.update(|app| {
+                viewer.update(app, |v, cx| {
+                    v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
+                })
+            });
+        }
+        assert_eq!(
+            cx.update(|app| viewer.read(app).zoom),
+            ZOOM_MIN,
+            "向下滚到底应钳到下限"
+        );
+        for _ in 0..200 {
+            cx.update(|app| {
+                viewer.update(app, |v, cx| {
+                    v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+                })
+            });
+        }
+        assert_eq!(
+            cx.update(|app| viewer.read(app).zoom),
+            ZOOM_MAX,
+            "向上滚到底应钳到上限"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 放大态滚轮语义：先在图片内纵向平移，滚到边缘且继续同向外滚才切下一张；切图时

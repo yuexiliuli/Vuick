@@ -28,6 +28,7 @@ mod syntax;
 mod toc;
 mod ui;
 mod util;
+mod viewer;
 
 #[cfg(feature = "video")]
 mod video;

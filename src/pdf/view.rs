@@ -61,6 +61,7 @@ use crate::pdf::{
     render_image_from_bgra, DocId, PageText, PdfOutlineEntry, PdfSearchHit, PdfSearchResults,
     PdfWorker, RenderRequest, RenderResult, TileRequest, TileResult,
 };
+use crate::viewer::pan_zoom;
 /// 是否开启视图侧计时日志（`GPUI_EDITOR_PDF_TIMING=1`，进程内缓存一次）。
 fn timing_view() -> bool {
     static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -374,27 +375,22 @@ impl PdfViewer {
         if !event.modifiers.control {
             return;
         }
-        let delta_y = match event.delta {
-            gpui::ScrollDelta::Lines(v) => v.y,
-            gpui::ScrollDelta::Pixels(v) => f32::from(v.y),
-        };
+        let delta_y = pan_zoom::wheel_delta_y(event);
         // 实测本平台：向上滚动 delta.y>0 → 放大；向下 <0 → 缩小（与编辑器字号缩放一致）
-        let step = delta_y.clamp(-1.0, 1.0);
-        self.adjust_zoom(1.0 + step * ZOOM_STEP, cx);
+        self.adjust_zoom(pan_zoom::zoom_factor(delta_y, ZOOM_STEP), cx);
         cx.stop_propagation();
     }
 
-    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。
+    /// 应用缩放因子并维护其后的一致性：锚定滚动偏移、重算页列布局。钳位/无变化短路走
+    /// [`pan_zoom::apply_zoom`]（区间 [ZOOM_MIN..=ZOOM_MAX] 来自 [`crate::config::pdf`]）。
     fn adjust_zoom(&mut self, factor: f32, cx: &mut Context<Self>) {
         if self.dims.is_empty() {
             return;
         }
         let old_w = self.page_width();
-        let new_zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_zoom - self.zoom).abs() < 1e-4 {
+        if !pan_zoom::apply_zoom(&mut self.zoom, factor, ZOOM_MIN, ZOOM_MAX) {
             return;
         }
-        self.zoom = new_zoom;
         let new_w = self.page_width();
         // 锚定视口：页列布局随 page_width 线性缩放 → 同一文档点的滚动偏移同比缩放。
         let ratio = new_w / old_w;
@@ -2055,5 +2051,130 @@ impl PdfViewer {
                     .child(content),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AppContext as _;
+    use gpui::TestAppContext;
+
+    /// 纯逻辑复现 minimal `PdfViewer`（**不触碰 pdfium**：不走 [`Self::new`]，无真实 PDF）。
+    /// 只喂一页占位 dims + 初始滚动偏移，验证 `adjust_zoom` 的四件事：
+    /// 1) 一档 = `1 + ZOOM_STEP`；2) 上下钳到 [`ZOOM_MIN`] / [`ZOOM_MAX`]（config::pdf 区间）；
+    /// 3) 缩放后滚动偏移同比重锚（`offset *= new_w / old_w`）；4) delta=0（factor=1）不变换。
+    #[gpui::test]
+    async fn ctrl_zoom_clamps_and_reanchors_scroll(cx: &mut TestAppContext) {
+        let viewer: gpui::Entity<PdfViewer> = cx.update(|app| {
+            app.new(|cx| {
+                let dims = vec![(612.0, 792.0)];
+                let (tops, total) = compute_layout(&dims, PAGE_WIDTH);
+                let v = PdfViewer {
+                    path: "dummy.pdf".into(),
+                    worker: None,
+                    doc_id: 0,
+                    dims: dims.clone(),
+                    page_tops: tops,
+                    total_height: total,
+                    slots: Vec::new(),
+                    pending_thumb: HashMap::new(),
+                    pending_mid: HashMap::new(),
+                    mid_lru: VecDeque::new(),
+                    pending_tiles: HashMap::new(),
+                    pending_cover: HashMap::new(),
+                    tile_bytes: 0,
+                    tile_pump_running: false,
+                    last_scroll_y: 0.0,
+                    scroll_velocity: 0.0,
+                    prev_fast: false,
+                    scroll: ScrollHandle::new(),
+                    loading: false,
+                    load_error: None,
+                    bg: None,
+                    pending_drops: Vec::new(),
+                    outlines: Vec::new(),
+                    focus_handle: cx.focus_handle(),
+                    text_pages: HashMap::new(),
+                    text_lru: VecDeque::new(),
+                    pending_text: HashMap::new(),
+                    sel_anchor: None,
+                    sel_active: None,
+                    selecting: false,
+                    search_query: String::new(),
+                    search_matches: Vec::new(),
+                    search_truncated: false,
+                    search_active: 0,
+                    search_pending: None,
+                    search_pending_seq: 0,
+                    search_seq: 0,
+                    zoom: 1.0,
+                };
+                // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准
+                v.scroll.set_offset(gpui::point(px(-40.0), px(-1200.0)));
+                assert!((v.total_height - total).abs() < 1e-3, "build 完 total_height");
+                v
+            })
+        });
+
+        // 一档放大：zoom / 整列高按 1+ZOOM_STEP 走，滚动偏移同比重锚
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                let w0 = v.page_width();
+                let x0 = v.scroll.offset().x.as_f32();
+                let y0 = v.scroll.offset().y.as_f32();
+                let total0 = v.total_height;
+                v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+                let ratio = v.page_width() / w0;
+                assert!((v.zoom - 1.12).abs() < 1e-6, "1 档放大 zoom={}", v.zoom);
+                assert!(
+                    (v.scroll.offset().x.as_f32() - x0 * ratio).abs() < 1e-3
+                        && (v.scroll.offset().y.as_f32() - y0 * ratio).abs() < 1e-3,
+                    "放大应同比重锚：x0={x0} x={} y0={y0} y={}",
+                    v.scroll.offset().x.as_f32(),
+                    v.scroll.offset().y.as_f32()
+                );
+                assert!(v.total_height > total0, "整列高随放大增大");
+            })
+        });
+
+        // delta=0（factor=1）：缩放不变、不重锚
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                let x_before = v.scroll.offset().x.as_f32();
+                let y_before = v.scroll.offset().y.as_f32();
+                v.adjust_zoom(1.0, cx);
+                assert!((v.zoom - 1.12).abs() < 1e-6, "delta=0 缩放不变");
+                assert_eq!(v.scroll.offset().x.as_f32(), x_before, "delta=0 不重锚 x");
+                assert_eq!(v.scroll.offset().y.as_f32(), y_before, "delta=0 不重锚 y");
+            })
+        });
+
+        // 反复放大 → 钳到上限
+        for _ in 0..200 {
+            cx.update(|app| {
+                viewer.update(app, |v, cx| {
+                    v.adjust_zoom(pan_zoom::zoom_factor(1.0, ZOOM_STEP), cx);
+                })
+            });
+        }
+        assert_eq!(
+            cx.update(|app| viewer.read(app).zoom),
+            ZOOM_MAX,
+            "放大到上限"
+        );
+        // 反复缩小 → 钳到下限
+        for _ in 0..200 {
+            cx.update(|app| {
+                viewer.update(app, |v, cx| {
+                    v.adjust_zoom(pan_zoom::zoom_factor(-1.0, ZOOM_STEP), cx);
+                })
+            });
+        }
+        assert_eq!(
+            cx.update(|app| viewer.read(app).zoom),
+            ZOOM_MIN,
+            "缩小到下限"
+        );
     }
 }
