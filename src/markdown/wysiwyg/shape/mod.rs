@@ -20,6 +20,11 @@ use crate::syntax::{
     CodeLineRuns, github_theme_cached, parse_code_lines, resolve_line_styles_with,
 };
 
+/// 引述（非警报）正文的**左缘缩进**（px，`x_off`）：= 内容边距(12) + 左侧指示条(3)
+/// + 带内左内衬(12) − 内容边距(12) = 15。正文起点在内容盒内再缩进，文字折行宽必须
+/// 一并扣除（`gutter_x` 与 `shape_text_row` 的行 `x_off` 同源），否则右缘越出内容盒。
+const QUOTE_TEXT_INDENT_PX: f32 = 15.0;
+
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
 /// 行内代码：等宽字体 + `code_inline_fg` 文字色（**无 run 背景**——圆角 pill 由
 /// [`paint_text_row`] 在 paint 阶段按像素几何自绘，与预览 [`TextTrack::paint_code_ranges`]
@@ -206,13 +211,18 @@ pub(crate) fn text_style_for(kind: IrKind, theme: &WyTheme) -> RowTextStyle {
 }
 
 /// 文本块（段落/标题/引述/列表/分隔线/空行）：按类型行样式形状成折行可视行。
+/// `wrap_w` 是该行**实际折行宽**（px）：调用方（`shape_text_row_decorated`）已按
+/// `帧宽 − 帧内衬 − 本行 gutter(x_off)` 算好——保证 `padding + x_off + wrap_w`
+/// 恰为内容盒右缘（`帧宽 − padding`），任一带 gutter 的行（项目符号/警报/标题）右缘
+/// 都不越出内容盒被裁、右侧留白与左侧对称。
 pub(crate) fn shape_text_row(
     editor: &WyEditor,
     r: DocRow,
     window: &mut Window,
-    width: Pixels,
+    _width: Pixels,
     theme: &WyTheme,
     base_font: &gpui::Font,
+    wrap_w: f32,
 ) -> ShapedRow {
     let kind = r.kind;
     let st = text_style_for(kind, theme);
@@ -266,9 +276,13 @@ pub(crate) fn shape_text_row(
         super::math_color(theme),
         &code_ranges,
     );
+    // 折行宽由调用方按「帧宽 − 帧内衬 − 本行 gutter」给定（见 `shape_text_row_decorated`）。
+    // 旧的 `Some(width)` 只裁左内衬，导致右侧文字一直排到帧右缘、右 gap 比左 gap 小
+    // 一个内衬（左右不对称、贴滚动条）；本版把 gutter 与右内衬一并计入，任意行型都留在
+    // 内容盒内，与预览 `markdown::view` 的 `avail` 语义一致（命中/光标/划线同源常量）。
     let wrapped = window
         .text_system()
-        .shape_text(rtext.clone().into(), st.fs, &runs2, Some(width), None)
+        .shape_text(rtext.clone().into(), st.fs, &runs2, Some(px(wrap_w.max(1.))), None)
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
     let mut height = st.pad;
@@ -298,7 +312,7 @@ pub(crate) fn shape_text_row(
     }
     let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
-    let x_off = if kind == IrKind::Quote { px(15.) } else { px(0.) };
+    let x_off = if kind == IrKind::Quote { px(QUOTE_TEXT_INDENT_PX) } else { px(0.) };
     let has_non_ascii = wrapped.iter().any(|wl| !wl.text.is_ascii());
     let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
@@ -338,8 +352,9 @@ pub(crate) fn shape_text_row_decorated(
     // C5: 让所有可点击链接（wiki/#tag/裸 URL）与 `[text](url)` 同色 + 下划线，
     // 与预览/阅读器视觉一致（在 alert 剥标记与数学 splice 之前合并进 runs）。
     style_links_in_runs(&mut r, &raw);
-    let mut gutter: Option<RowGutter> = None;
+    // —— 先定 gutter / x_off（折行宽必须按其扣除，否则带 gutter 的行右缘越出内容盒）——
     // C3: 警报（callout）——剥掉 `[!KIND]` 标记，paint 画彩条 + 粗体标签 + 折叠箭头。
+    let mut alert: Option<RowGutter> = None;
     if r.kind == IrKind::Quote
         && let Some(p) = inline_style::blockquote_prefix(&raw)
     {
@@ -350,20 +365,44 @@ pub(crate) fn shape_text_row_decorated(
         if let Some((akind, consumed, fold)) = inline_style::alert_prefix(trimmed) {
             let n = consumed.min(r.text.len());
             strip_prefix_bytes(&mut r, n);
-            gutter = Some(RowGutter::Alert { kind: akind, fold });
+            alert = Some(RowGutter::Alert { kind: akind, fold });
         }
     }
-    let mut srow = shape_text_row(editor, r.clone(), window, width, theme, base_font);
-    // C1: 列表/任务行首装饰 + 正文缩进（与预览一致：正文色符号 + 缩进）。
+    // C1: 列表/任务行左缘 gutter（项目符号 / 有序号码，正文右移 18/24px）。
+    let mut bullet_g: Option<RowGutter> = None;
     if r.kind == IrKind::Bullet
         && let Some(g) = bullet_gutter(&raw) {
-            let is_check = matches!(g, RowGutter::Check { .. });
-            srow.extra.gutter = Some(g);
-            srow.x_off = if is_check { px(24.) } else { px(18.) };
+            bullet_g = Some(g);
         }
-    if let Some(g @ RowGutter::Alert { .. }) = &gutter {
+    let pad = f32::from(px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX));
+    let gutter_x: f32 = if alert.is_some() {
+        84.
+    } else if let Some(g) = &bullet_g {
+        if matches!(g, RowGutter::Check { .. }) { 24. } else { 18. }
+    } else if matches!(r.kind, IrKind::Heading(_)) {
+        HEADING_GUTTER_W
+    } else if matches!(r.kind, IrKind::Quote) {
+        // 普通引述正文起点在内容盒内再缩进（`shape_text_row` 的 `x_off` 同源常量）。
+        QUOTE_TEXT_INDENT_PX
+    } else {
+        // 普通段落无 gutter（x_off=0，正文起点即内容盒左缘）。
+        0.
+    };
+    // 折行宽 = 帧宽 − 帧内衬×2 − gutter：文字从 `padding + x_off` 起画，折行宽补到
+    // `帧宽 − padding`（内容盒右缘）为止——左右内衬对称生效，任意带 gutter 行（项目
+    // 符号/警报/标题）右侧留白都与左侧一致、不越界被裁（与预览 `markdown::view` 同式）。
+    let wrap_w = (f32::from(width) - 2. * pad - gutter_x).max(1.);
+    let mut srow = shape_text_row(editor, r.clone(), window, width, theme, base_font, wrap_w);
+    // C3: 警报花括 gutter + 正文右移 84px。
+    if let Some(g @ RowGutter::Alert { .. }) = &alert {
         srow.extra.gutter = Some(g.clone());
         srow.x_off = px(84.);
+    }
+    // C1: 列表/任务行首装饰 + 正文缩进（与预览一致：正文色符号 + 缩进）。
+    if let Some(g) = bullet_g {
+        let is_check = matches!(g, RowGutter::Check { .. });
+        srow.extra.gutter = Some(g);
+        srow.x_off = if is_check { px(24.) } else { px(18.) };
     }
     // 标题折叠：为左缘折叠箭头预留 gutter（正文右移 `HEADING_GUTTER_W`；无折叠箭头时
     // 也统一留位，避免命中/光标在「有无箭头」间抖动）。
@@ -567,7 +606,11 @@ pub(crate) fn shape_code_row(
         // 布局（`MmPlaced` 卡片相对坐标，area=(0,0)）在 **shape 期**算好缓存——paint
         // 不再每帧重排/重测全部标签宽（否则滚动/键入时可见的 mermaid 卡片每帧整套
         // 解析+排版；行整形缓存使其只在内容/宽度/主题/缩放变化时重算一次）。
-        let area_w = (f32::from(width) - 2. * f32::from(px(12.))).max(1.);
+        // 卡面可用宽 = 帧宽 − 帧内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`，与 `avail`
+        // 同式）；缩放据此等比，paint 才不裁边。
+        let area_w = (f32::from(width)
+            - 2. * f32::from(px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX)))
+        .max(1.);
         let mut mm = mm_layout(window, theme, &source, 0., 0., area_w);
         scale_mm_layout(&mut mm, zoom, area_w);
         return ShapedRow {
@@ -692,7 +735,9 @@ pub(crate) fn shape_code_row(
         multi_offsets,
         code_ranges: Vec::new(),
         lh,
-        x_off: px(12.),
+        // 代码块行再内缩 `CONTENT_EDGE_PAD_X_PX`（= 预览 px_3 内衬；= paint/命中/光标的
+        // `r.x_off` 同源常量）。
+        x_off: px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX),
         height,
         top: px(0.),
         kind,

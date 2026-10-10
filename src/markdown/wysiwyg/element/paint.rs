@@ -542,8 +542,12 @@ pub(crate) fn paint_quote_band(
 ) {
     let x0 = origin.x + f.padding;
     let y0 = origin.y + row.top - px(4.);
-    // 外层等价 `px_3`（内容边距已含），带再内缩 12 → 带宽 = 内容宽 − 24。
-    let band_w = (f32::from(f.width) - f32::from(f.padding) * 2. - 24.).max(1.);
+    // 外层等价 `px_3`（内容边距已含），带再内缩 `CONTENT_EDGE_PAD_X_PX`×2（左右各一次，
+    // = 预览 px_3 行内内缩同源）→ 带宽 = 内容宽 − 2×内衬。
+    let band_w = (f32::from(f.width)
+        - f32::from(f.padding) * 2.
+        - 2. * crate::config::markdown::CONTENT_EDGE_PAD_X_PX)
+        .max(1.);
     let band_h = row.height + px(8.);
     let border: gpui::Hsla = { let mut c = theme.divider; c.a = 0.2; c };
     window.paint_quad(gpui::PaintQuad {

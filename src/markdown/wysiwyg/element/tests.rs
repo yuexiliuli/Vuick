@@ -7,6 +7,7 @@
     };
     use gpui::{
         AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
+        size,
     };
 
     struct WyHost {
@@ -143,7 +144,7 @@
         // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
         let words = "1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678";
         let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(words));
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&words));
             WyHost { ed }
         });
         let vcx: &mut VisualTestContext = vcx;
@@ -189,6 +190,49 @@
             assert!(
                 (top2 - (top + line_h)).abs() < 0.5,
                 "光标竖条应画在第二可视行：块首 top={top}，得到 {top2}"
+            );
+        });
+    }
+
+    /// 单一来源回归：WYSIWYG 帧内衬（`frame.padding`）必须等于 `CONTENT_EDGE_PAD_X_PX`
+    /// （与预览行内 px_3 同源，见 `config::markdown`）；命中/光标坐标（`caret_geometry`）
+    /// 从 `frame.padding` 推导——改内衬常量，命中/光标/划线/拖拽几何全站一致、不散落数值。
+    #[gpui::test]
+    fn frame_padding_single_source_and_caret_derives_from_it(cx: &mut TestAppContext) {
+        use crate::markdown::wysiwyg::WyEditor;
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "普通段落 abcdefghijklmnopqrstuvwxyz\n\n```\nlet x = 1;\n```\n";
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            assert_eq!(
+                f32::from(frame.padding),
+                crate::config::markdown::CONTENT_EDGE_PAD_X_PX,
+                "帧内衬应读单一来源 CONTENT_EDGE_PAD_X_PX"
+            );
+        });
+        // 光标 x 从同一内衬推导：段落行 caret=0 的 x = frame.padding + x_off（正文 x_off=0）。
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |e, _| e.set_caret(0));
+            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+            let (on, caret_x, _) = caret_geometry(ed.read(cx), &frame);
+            assert!(on, "段落行应有光标");
+            let para = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == crate::markdown::ir::IrKind::Paragraph)
+                .expect("应有段落行");
+            let expect_x = f32::from(frame.padding) + f32::from(para.x_off);
+            assert!(
+                (f32::from(caret_x) - expect_x).abs() < 0.5,
+                "光标 x 应 = frame.padding + x_off（同一内衬推导）：expect {expect_x:.1}，实测 {:.1}",
+                f32::from(caret_x)
             );
         });
     }
@@ -689,6 +733,63 @@ let c = 3;
                 );
             });
         }
+    }
+
+    /// WYSIWYG md 预览随窗口窄化：窗口缩窄 → 元素可用宽收窄 → 帧宽 = min(72ch, 可用宽)
+    /// 同步收窄（一直折行，永不横向超界）；窄于 72ch 后退化为占满可用宽（居中移位=0）。
+    #[gpui::test]
+    fn reading_column_narrows_with_window(cx: &mut TestAppContext) {
+        cx.update(crate::actions::bind_local_keymaps);
+        let text = "# 标题\n\n一段很长的正文内容用于验证窗口缩窄后随窗口宽度重排。"
+
+            .repeat(1);
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        let body = vcx.update(|_window, cx| {
+            f32::from(host.read(cx).ed.read(cx).theme.font_size)
+        });
+        let col = crate::config::markdown::reading_col_px(body);
+        let read = |vcx: &mut VisualTestContext| {
+            vcx.update(|_window, cx| {
+                let e = host.read(cx).ed.read(cx);
+                let ew = e.last_bounds().map(|b| f32::from(b.size.width)).unwrap_or(0.);
+                let fw = e.frame.borrow().as_ref().map(|f| f32::from(f.width)).unwrap_or(0.);
+                (ew, fw, e.reading_col_shift(ew))
+            })
+        };
+        let (ew0, fw0, _) = read(vcx);
+        assert!(ew0 > 1.0, "宽窗元素应有布局宽（ew0={ew0:.0}）");
+        assert!(
+            (fw0 - col.min(ew0)).abs() < 1.0,
+            "宽窗帧宽应 = min(72ch={col:.0}, 可用={ew0:.0})，实际 {fw0:.0}"
+        );
+        // 缩到 500px（< 72ch≈806px）→ 列宽应随窗口收窄并退化为可用宽。
+        vcx.simulate_resize(size(px(500.), px(800.)));
+        for _ in 0..6 {
+            vcx.run_until_parked();
+            let _ = vcx.cx.refresh();
+        }
+        let (ew1, fw1, shift1) = read(vcx);
+        assert!(
+            ew1 < ew0 - 1.0,
+            "窗口缩窄后元素可用宽应收窄：{ew0:.0} -> {ew1:.0}"
+        );
+        let target = col.min(ew1);
+        assert!(
+            (fw1 - target).abs() < 1.0,
+            "窄窗帧宽应 = min(72ch={col:.0}, 可用={ew1:.0})，实际 {fw1:.0}"
+        );
+        assert!(
+            fw1 < fw0 - 1.0,
+            "列宽应随窗口收窄重排：{fw0:.0} -> {fw1:.0}"
+        );
+        assert!(
+            shift1.abs() < 0.5,
+            "窄于 72ch 后无居中空余（移位应为 0），实际 {shift1:.0}"
+        );
     }
 
     #[gpui::test]
@@ -2090,6 +2191,60 @@ tail
                 f32::from(carety),
                 row_top_y + rh
             );
+        });
+    }
+
+    #[gpui::test]
+    fn all_text_rows_wrap_inside_content_box(cx: &mut TestAppContext) {
+        use crate::markdown::ir::IrKind;
+        cx.update(crate::actions::bind_local_keymaps);
+        // 回归（右侧留白对称的根因）：任意文本行（段落/标题/项目符号/引述/警报）的**折行宽**
+        // 必须 = 帧宽 − 帧内衬×2 − 本行 gutter(x_off)，使「padding + x_off + 折行宽」恰等于
+        // 内容盒右缘（`frame.width − padding`）。修复前正文折行拿 `frame.width`（只裁左内衬），
+        // 带 gutter 的行右缘越出内容盒被面板/滚动条裁——右侧留白比左侧小一个内衬/gutter。
+        // 与预览 `markdown::view` 的 `avail` 语义一致（命中/光标/划线同源）。
+        let text = format!(
+            "# {}\n\n- {}\n\n> [!NOTE] {}\n> {}\n\n> {}\n\n{}\n",
+            "很长标题".repeat(30),
+            "很长的项目符号内容".repeat(30),
+            "很长 callout 标题".repeat(30),
+            "callout 正文".repeat(30),
+            "很长引述".repeat(30),
+            "很长段落".repeat(30),
+        );
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            for w_px in [300.0, 500.0, 800.0] {
+                let frame = build_frame(ed.read(cx), window, px(w_px), (0., 999_999.));
+                let pad = f32::from(frame.padding);
+                // 内容盒右缘 = 帧右缘 − 帧内衬（左内衬由绘制起点 `padding + x_off` 保证）。
+                let content_right = f32::from(frame.width) - pad;
+                for row in frame.rows.iter() {
+                    if !matches!(
+                        row.kind,
+                        IrKind::Paragraph
+                            | IrKind::Heading(_)
+                            | IrKind::Bullet
+                            | IrKind::Quote
+                    ) {
+                        continue;
+                    }
+                    let off = f32::from(row.x_off);
+                    for wl in row.wrapped.iter() {
+                        let right = off + f32::from(wl.width());
+                        assert!(
+                            right <= content_right + 0.6,
+                            "帧宽 {w_px:.0}px {:?} 行右缘应 ≤ 内容盒右缘（{right:.1} > {content_right:.1}，x_off={off:.1}）",
+                            row.kind
+                        );
+                    }
+                }
+            }
         });
     }
 
@@ -6668,7 +6823,7 @@ A-->B
 
     /* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
 
-    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, size};
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent};
 
     fn img_down(x: f32, y: f32) -> MouseDownEvent {
         MouseDownEvent {
@@ -6743,8 +6898,8 @@ A-->B
             img.image.as_ref().unwrap().h,
         );
         // 图片盒：x0 = padding(12) + (content_w − w)/2。
-        let avail = width - 24.;
-        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        let avail = width - 2.0 * f32::from(frame.padding);
+        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
         // 图片中心 → 命中。
         let mut ev = img_move(cx0 + w / 2., top + h / 2.);
         ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
@@ -6779,7 +6934,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         // 指针在元素内（图片中心）→ 悬浮记录该行。
         let ev = img_move(cx0 + w / 2., top + h / 2.);
         ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
@@ -6809,8 +6964,8 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let avail = width - 24.;
-        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        let avail = width - 2.0 * f32::from(frame.padding);
+        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
         // 先悬浮（亮起按钮），再点按钮中心（右上角内收 margin+size 的方钮）。
         let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
         let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
@@ -6919,8 +7074,8 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let avail = width - 24.;
-        let cx0 = 12. + ((avail - w) / 2.).max(0.);
+        let avail = width - 2.0 * f32::from(frame.padding);
+        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
         // 悬浮 + 点按钮 → 打开卡片。
         vcx.update(|window, cx| {
             let ev = img_move(cx0 + w / 2., top + h / 2.);
@@ -6962,7 +7117,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         // 点图片中心 → 选中（selected_image=该行、无文本选区、光标不进题注）。
         vcx.update(|window, cx| {
             let down = img_down(cx0 + w / 2., top + h / 2.);
@@ -7015,7 +7170,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         vcx.update(|window, cx| {
             let down = img_down(cx0 + w / 2., top + h / 2.);
             ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
@@ -7053,7 +7208,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
         let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
         // 悬浮 → 按下（打开）→ 抬起（end_selection 清帧）。
@@ -7099,7 +7254,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         vcx.update(|window, cx| {
             let down = img_down(cx0 + w / 2., top + h / 2.);
             ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
@@ -7138,7 +7293,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
         let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
         // 打开：锚点按「真实宽 W 的帧 + origin(0,0)」缓存。
@@ -7147,7 +7302,8 @@ A-->B
             ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
             ed.update(cx, |e, c| e.on_mouse_down(&img_down(btn_x, btn_y), window, c));
         });
-        let expected_l = 12. + (((width - 24.) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
+        let expected_l = f32::from(frame.padding)
+            + (((width - 2.0 * f32::from(frame.padding)) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
         let anchor0 = ed
             .read_with(vcx, |e, _| e.image_edit_anchor())
             .expect("打开即缓存锚点");
@@ -7198,7 +7354,7 @@ A-->B
             img.image.as_ref().unwrap().w,
             img.image.as_ref().unwrap().h,
         );
-        let cx0 = 12. + ((width - 24. - w) / 2.).max(0.);
+        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
         // 悬浮 + 点按钮打开卡片。
         let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
         let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;

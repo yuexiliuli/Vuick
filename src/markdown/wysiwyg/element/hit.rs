@@ -26,17 +26,17 @@ pub(crate) fn caret_geometry(
             continue;
         }
         if !r.editable {
-            return (false, px(12.), r.top);
+            return (false, f.padding, r.top);
         }
         if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
             // 表格：caret 落在某个可见行（表头/数据行）→ 定位到单元格内容处。
             let Some(row_ix) = te.rows.iter().position(|rr| rr.src_line == cl) else {
-                return (false, px(12.), r.top);
+                return (false, f.padding, r.top);
             };
             let row_l = &te.rows[row_ix];
             let target = col.min(line_end.saturating_sub(line_start));
             let Some((cell_ix, dcol)) = table_cell_at_src(&te.rows, cl, target) else {
-                return (false, px(12.), r.top);
+                return (false, f.padding, r.top);
             };
             let cell = &row_l.cells[cell_ix];
             let cell_x0 = table_cell_x0(&t.widths, cell_ix);
@@ -47,7 +47,7 @@ pub(crate) fn caret_geometry(
             let ctop = row_top + px(((f32::from(t.row_h) - caret_h) / 2.).max(0.));
             // 横向滚动时单元格内容随表平移 → 光标条反向减 scroll（paint 平移的逆映射）。
             let scroll = table_hscroll_clamped(editor, f, r);
-            return (true, px(12.) + px(cell_x0 + cell.text_x + col_x - scroll), ctop);
+            return (true, f.padding + px(cell_x0 + cell.text_x + col_x - scroll), ctop);
         }
         if !r.multi_offsets.is_empty() {
             // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
@@ -68,9 +68,9 @@ pub(crate) fn caret_geometry(
                     .unwrap_or_else(|| point(px(0.), px(0.)));
                 let y = r.top + px(code_group_top(r, g) + f32::from(p.y));
                 let scroll = code_hscroll_clamped(editor, f, r);
-                return (true, px(12.) + r.x_off + p.x - px(scroll), y);
+                return (true, f.padding + r.x_off + p.x - px(scroll), y);
             }
-            return (false, px(12.), r.top);
+            return (false, f.padding, r.top);
         }
         // 单源码行文本块：源列 → 渲染列（`source_to_display`，左界）——与
         // `source_offset_at` 的反查互为逆映射，光标才落在点击处。
@@ -78,13 +78,14 @@ pub(crate) fn caret_geometry(
         let dcol = source_to_display(&r.byte_map, target);
         // 折行时 p.y 是子行偏移，叠加到块首 + 撑高下移才算准缓存所在的可视行。
         let p = render_point_of(&r.wrapped, r.lh, dcol);
-        // `px(12.)` = 内容边距；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
-        return (true, px(12.) + r.x_off + p.x, r.top + px(text_y_off(r) + text_row_shift(r)) + p.y);
+        // `f.padding` = 帧内衬（单一来源 `CONTENT_EDGE_PAD_X_PX`，与 paint 的
+        // `origin.x + f.padding` 同 x）；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
+        return (true, f.padding + r.x_off + p.x, r.top + px(text_y_off(r) + text_row_shift(r)) + p.y);
     }
     // 带外（caret 所在块未物化 = 屏外）：用紧凑布局 `tops` 兜底定位，不画光标
     // （屏外被容器裁剪）。`row_col`/`line_start` 此时查的仍是块内源码行。
     let ctop = px(f.src_line_top(cl));
-    (true, px(12.), ctop)
+    (true, f.padding, ctop)
 }
 
 

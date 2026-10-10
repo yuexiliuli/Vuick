@@ -15,8 +15,8 @@ use gpui::{
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::config::markdown::{
-    IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR, QUOTE_BAR_WIDTH_PX,
-    TABLE_SCROLLBAR_RESERVE_PX,
+    CONTENT_EDGE_PAD_X_PX, IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR,
+    QUOTE_BAR_WIDTH_PX, TABLE_SCROLLBAR_RESERVE_PX,
 };
 use crate::markdown::parse::{Row, RowAlign, RowKind, RunKind};
 use crate::markdown::view::style::StyleParams;
@@ -627,7 +627,6 @@ impl Element for TextTrack {
 /// 共用，替代 14 参长签名）。
 pub(crate) struct RowRenderCtx<'a> {
     pub p: &'a Rc<StyleParams>,
-    pub wrap: bool,
     pub code_handle: Option<ScrollHandle>,
     pub code_hl: Option<Rc<CodeLineRuns>>,
     pub table_handle: Option<ScrollHandle>,
@@ -732,45 +731,28 @@ pub(crate) fn render_row(
     ctx: &RowRenderCtx,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    // 解构回原参数名：身体与旧签名逐字节等价（p/wrap/search/epub/selection/marker_hl/row_ix 为
-    // 拷贝或引用；code_hl 为 Rc 需 clone）。
-    // 派发所需的最小解构；各 `render_wrapped_*` / `render_plain_*` 助手自行从 ctx 取参。
-    let RowRenderCtx {
-        p,
-        wrap,
-        table_handle,
-        ..
-    } = ctx;
+    // 页面恒换行：所有文本行（段落/标题/引述/列表）折行、代码/表格块内横向滚动。
+    // 旧「非换行自然宽 + 页面级横向滚动」渲染分支（`render_plain_*`）已随新模式移除。
+    let RowRenderCtx { p, table_handle, .. } = ctx;
     let p: &Rc<StyleParams> = p;
-    let wrap: bool = *wrap;
     let table_handle: Option<ScrollHandle> = table_handle.clone();
-    // 表格行（GFM pipe table 整体折叠成一渲染行；换行模式自带横向滚动容器）。
+    // 表格行（GFM pipe table 整体折叠成一渲染行；自带块内横向滚动容器）。
     if let RowKind::Table = row.kind {
-        return render_table_row(row, p, wrap, table_handle);
+        return render_table_row(row, p, table_handle);
     }
     // 独立图片行：按固有比例显示，高度随可用宽度自适应。
     if let RowKind::Image = row.kind {
         return render_image_row(row, p);
     }
 
-    // ---------- 自动换行模式：仅对文本行生效，代码/规则/空行保持原样 ----------
-    if wrap {
-        // 换行模式下代码保持不换行：整个围栏折叠成一个渲染行（多行紧贴相连成连续块）。
-        // 该块按内容宽撑开（content_w 计入最宽代码行 → 外层 md-harea 统一横向滚动，
-        // 底部单一横向滚动条可拖动）；正文仍限制在视口宽内折行。
-        if row.kind == RowKind::Code {
-            return render_wrapped_code(row, ctx, cx);
-        }
-        match row.kind {
-            RowKind::Paragraph => return render_wrapped_paragraph(row, ctx, cx),
-            RowKind::Heading(_) => return render_wrapped_heading(row, ctx, cx),
-            RowKind::Quote => return render_wrapped_quote(row, ctx, cx),
-            RowKind::Bullet => return render_wrapped_bullet(row, ctx, cx),
-            _ => {}
-        }
-    }
-
     match row.kind {
+        // 代码保持不换行：整个围栏折叠成一个渲染行（多行紧贴相连成连续块），
+        // 自带块内横向滚动容器（`md-code-scroll` + 句柄），不撑大页面列宽。
+        RowKind::Code => render_wrapped_code(row, ctx, cx),
+        RowKind::Paragraph => render_wrapped_paragraph(row, ctx, cx),
+        RowKind::Heading(_) => render_wrapped_heading(row, ctx, cx),
+        RowKind::Quote => render_wrapped_quote(row, ctx, cx),
+        RowKind::Bullet => render_wrapped_bullet(row, ctx, cx),
         RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0().into_any_element(),
         RowKind::Rule => div()
             .h(p.rule_h)
@@ -778,255 +760,12 @@ pub(crate) fn render_row(
             .flex_shrink_0()
             .flex()
             .items_center()
-            .px_3()
+            .px(px(CONTENT_EDGE_PAD_X_PX))
             .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full())
             .into_any_element(),
-        RowKind::Code => render_plain_code(row, ctx, cx),
-        RowKind::Heading(_) => render_plain_heading(row, ctx, cx),
-        RowKind::Quote => render_plain_quote(row, ctx, cx),
-        RowKind::Bullet => render_plain_bullet(row, ctx, cx),
-        RowKind::Paragraph => render_plain_paragraph(row, ctx, cx),
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     }
-}
-
-/// 非换行模式：代码块（整栏折叠 → 逐行堆叠连续块 + 上下呼吸带；超宽由外层横向滚动）。
-fn render_plain_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx { p, code_hl, .. } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let code_runs = code_hl.as_deref();
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    let lines = row.code_lines().to_vec();
-    let p_ = p.clone();
-    let runs = code_runs;
-    let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
-    div()
-        .h(px(block_h))
-        .w_full()
-        .flex_shrink_0()
-        .px_3()
-        .child(
-            div()
-                .debug_selector(|| "md-code-row".into())
-                .h_full()
-                .w_full()
-                .flex()
-                .flex_col()
-                .children(code_block_bands(&lines, runs, dark, &p_)),
-        )
-        .into_any_element()
-}
-
-/// 非换行模式：标题（1-6 级，BOLD、单行裁剪）。
-fn render_plain_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx {
-        p,
-        search,
-        selection,
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-        ..
-    } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
-    let note_ctx: &Rc<NoteCtx> = note_ctx;
-    let text_ctx: &Rc<TextCtx> = text_ctx;
-    let marker_hl: Option<(usize, bool)> = *marker_hl;
-    let row_ix: usize = *row_ix;
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    let RowKind::Heading(n) = row.kind else {
-        unreachable!("只应在 Heading 行调用")
-    };
-    let (fs, lh) = p.heading_metrics(n);
-    let t = text_child_for_row(
-        row,
-        p,
-        search,
-        selection,
-        &TextStyle {
-            font_size: fs.into(),
-            color: p.fg,
-            font_weight: FontWeight::BOLD,
-            ..TextStyle::default()
-        },
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-    );
-    div()
-        .h(lh)
-        .w_full()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_size(fs)
-        .text_color(p.fg)
-        .font_weight(FontWeight::BOLD)
-        .child(t)
-        .into_any_element()
-}
-
-/// 非换行模式：引述（背景带/左边框在内层，单行裁剪）。
-fn render_plain_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx {
-        p,
-        search,
-        selection,
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-        ..
-    } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
-    let note_ctx: &Rc<NoteCtx> = note_ctx;
-    let text_ctx: &Rc<TextCtx> = text_ctx;
-    let marker_hl: Option<(usize, bool)> = *marker_hl;
-    let row_ix: usize = *row_ix;
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    let t = text_child_for_row(
-        row,
-        p,
-        search,
-        selection,
-        &TextStyle {
-            font_size: p.para_size.into(),
-            color: p.muted_fg,
-            ..TextStyle::default()
-        },
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-    );
-    div()
-        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-        .w_full()
-        .flex_shrink_0()
-        .px_3()
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .child(
-            div()
-                .debug_selector(|| "md-quote-band".into())
-                .h_full()
-                .w_full()
-                .pl_3()
-                .pr_3()
-                // 左侧深色指示条：宽度/颜色常量在 config（QUOTE_BAR_WIDTH_PX / QUOTE_BAR_COLOR），
-                // 与换行分支 / WYSIWYG 完全一致（旧实现此处误用 accent2px）。
-                .border_l(px(QUOTE_BAR_WIDTH_PX))
-                .border_color(gpui::rgb(QUOTE_BAR_COLOR))
-                .bg(p.quote_bg)
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_size(p.para_size)
-                .text_color(p.muted_fg)
-                .child(t),
-        )
-        .into_any_element()
-}
-
-/// 非换行模式：列表项（项目符号接正文，单行裁剪）。
-fn render_plain_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx {
-        p,
-        search,
-        selection,
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-        ..
-    } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
-    let note_ctx: &Rc<NoteCtx> = note_ctx;
-    let text_ctx: &Rc<TextCtx> = text_ctx;
-    let marker_hl: Option<(usize, bool)> = *marker_hl;
-    let row_ix: usize = *row_ix;
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
-    div()
-        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-        .w_full()
-        .flex_shrink_0()
-        .ml_3()
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_size(p.para_size)
-        .text_color(p.fg)
-        .child(t)
-        .into_any_element()
-}
-
-/// 非换行模式：正文段（单行裁剪）。
-fn render_plain_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx {
-        p,
-        search,
-        selection,
-        marker_hl,
-        row_ix,
-        text_ctx,
-        note_ctx,
-        ..
-    } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let search: Option<(Range<usize>, Hsla)> = search.clone();
-    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
-    let note_ctx: &Rc<NoteCtx> = note_ctx;
-    let text_ctx: &Rc<TextCtx> = text_ctx;
-    let marker_hl: Option<(usize, bool)> = *marker_hl;
-    let row_ix: usize = *row_ix;
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
-    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    div()
-        .h(px(p.para_line.as_f32() + p.para_gap.as_f32()))
-        .w_full()
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_size(p.para_size)
-        .text_color(p.fg)
-        .child(
-            text_child_for_row(
-                row,
-                p,
-                search,
-                selection,
-                &TextStyle {
-                    font_size: p.para_size.into(),
-                    color: p.fg,
-                    ..TextStyle::default()
-                },
-                marker_hl,
-                row_ix,
-                text_ctx,
-                note_ctx,
-            ),
-        )
-        .into_any_element()
 }
 
 /// 换行模式：围栏代码块折叠成连续块（逐行堆叠）+ 自带头部横向滚动容器（正文折行、
@@ -1059,7 +798,7 @@ fn render_wrapped_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::Any
         .h(px(block_h))
         .w_full()
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .child(
             div()
                 .debug_selector(|| "md-code-hscroll-inner".into())
@@ -1137,7 +876,7 @@ fn render_wrapped_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui
         .w_full()
         .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .py_1()
         .whitespace_normal()
         .text_size(p.para_size)
@@ -1199,7 +938,7 @@ fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::
         .w_full()
         .min_h(lh)
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .py_1()
         .whitespace_normal()
         .text_size(fs)
@@ -1272,7 +1011,7 @@ fn render_wrapped_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::An
         .w_full()
         .min_h(px(p.para_line.as_f32()))
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .child(band.child(t))
         .into_any_element()
 }
@@ -1314,67 +1053,55 @@ fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::A
 }
 
 /** 表格行（GFM pipe table 整体折叠成一渲染行）。
-/// 换行模式（默认）：表格自带横向滚动容器 + Always 滚动条，超宽表格在块内横向滚动，
-/// 不再被视口裁剪遮挡（对齐代码块方案）；非换行模式仍交外层 md-harea 统一横向滚动。 */
+/// 页面恒换行下表格**始终**自带横向滚动容器 + Always 滚动条：超宽表格在块内横向滚动，
+/// 不再被视口裁剪遮挡（对齐代码块方案）。 */
 fn render_table_row(
     row: &Row,
     p: &Rc<StyleParams>,
-    wrap: bool,
     table_handle: Option<ScrollHandle>,
 ) -> gpui::AnyElement {
     let table = row.table().expect("Table 行必须携带表格结构");
-    // 换行模式（默认，预览视口不横向撑宽）：表格自带横向滚动容器 + Always 滚动条，
-    // 超宽表格在块内横向滚动，不再被视口裁剪遮挡（对齐代码块方案）；
-    // 非换行模式仍交外层 md-harea 统一横向滚动。
-    if wrap {
-        let h = table_handle.unwrap_or_default();
-        return div()
-            .w_full()
-            .flex_shrink_0()
-            .px_3()
-            .py_1()
-            .child(
-                div()
-                    .debug_selector(|| "md-table-hscroll".into())
-                    // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
-                    // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
-                    .w_full()
-                    .relative()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .id("md-table-scroll")
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .overflow_x_scroll()
-                            // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
-                            .restrict_scroll_to_axis()
-                            .track_scroll(&h)
-                            // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
-                            .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
-                            .child(render_table(table, p)),
-                    )
-                    .child(
-                        div()
-                            .debug_selector(|| "md-table-scrollbar".into())
-                            .absolute()
-                            .inset_0()
-                            .child(
-                                Scrollbar::horizontal(&h)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
-                            ),
-                    ),
-            )
-            .into_any_element();
-    }
+    // 块内横向滚动容器 + Always 滚动条：超宽表格在块内滚动，不撑大页面列宽。
+    let h = table_handle.unwrap_or_default();
     div()
         .w_full()
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .py_1()
-        .child(render_table(table, p))
+        .child(
+            div()
+                .debug_selector(|| "md-table-hscroll".into())
+                // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
+                // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
+                .w_full()
+                .relative()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("md-table-scroll")
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .overflow_x_scroll()
+                        // 禁止滚轮纵向滚动被本容器横向消费，事件冒泡给页面正常翻页
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&h)
+                        // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
+                        .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
+                        .child(render_table(table, p)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "md-table-scrollbar".into())
+                        .absolute()
+                        .inset_0()
+                        .child(
+                            Scrollbar::horizontal(&h)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                ),
+        )
         .into_any_element()
 }
 
@@ -1459,7 +1186,7 @@ fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
     div()
         .w_full()
         .flex_shrink_0()
-        .px_3()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
         .py_1()
         .flex()
         .justify_center()

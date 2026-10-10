@@ -22,7 +22,11 @@
 mod input;
 mod render;
 
-pub(crate) use render::{char_align_highlights, merge_highlights};
+pub(crate) use render::merge_highlights;
+// `char_align_highlights` 仅测试经此路径消费（`editor::tests`），非测试构建会触发
+// unused 警告 → 按测试门控（render.rs 内在用法直接引用同模块函数，不受影响）。
+#[cfg(test)]
+pub(crate) use render::char_align_highlights;
 
 use std::{
     cell::Cell,

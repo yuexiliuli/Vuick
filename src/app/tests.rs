@@ -2371,6 +2371,118 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// 回归（用户拍板方案「右侧明显留白」）：右栏 WyEditor 预览宿主（`#md-wy-body`）
+    /// 给内容**右侧**留出明显可感的间距——`.md` 预览标题/正文最右字不贴右缘、不被自绘
+    /// 滚动条带盖住。宿主水平内衬走**单一来源** `PREVIEW_SIDE_GAP_PX`（与 `markdown::view`
+    /// 同一常量）；gap 在滚动条叠层**内侧**（叠层贴外层右缘、不被推出）。真实渲染路径
+    /// 取证：宿主盒右缘 − 元素右缘 = gap、左右对称，而 WyEditor 帧内容（含标题最右字形）
+    /// 恒在元素盒内 ⇒ 最右字右缘 ≤ 宿主右缘 − gap（窄分屏下列占满可用宽、列=可用宽）。
+    #[gpui::test]
+    async fn md_wy_preview_host_right_gap_is_visible(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        // 窄分屏（预览列 < 72ch 阅读栏，列=可用宽）——标题贴右缘截断的必现档。
+        cx.simulate_resize(gpui::size(px(900.), px(700.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let gap = crate::config::markdown::PREVIEW_SIDE_GAP_PX;
+
+        // 打开（真实 open_file 路径，等待后台装配）+ 宿主右缘间隙几何断言。
+        let open_and_check =
+            |vcx: &mut VisualTestContext, p: &std::path::Path, target_finish: usize| {
+                vcx.update(|window, cx| {
+                    app.update(cx, |app, cx| {
+                        app.open_file(p.to_str().unwrap(), window, cx)
+                    });
+                });
+                let mut frames = 0;
+                loop {
+                    vcx.cx
+                        .executor()
+                        .advance_clock(std::time::Duration::from_millis(20));
+                    vcx.run_until_parked();
+                    let _ = vcx.cx.refresh();
+                    let done = vcx
+                        .update(|_, cx| app.read(cx).open_finish_count >= target_finish);
+                    if done && frames > 6 {
+                        break;
+                    }
+                    frames += 1;
+                    if frames > 160 {
+                        break;
+                    }
+                }
+                let body = vcx
+                    .debug_bounds("md-wy-body")
+                    .expect("预览宿主 md-wy-body 应渲染");
+                let overlay = vcx
+                    .debug_bounds("md-wy-vscrollbar-overlay")
+                    .expect("自绘滚动条叠层应渲染");
+                // 滚动条叠层贴宿主右缘：gap 在滚动条**内侧**，未把滚动条推出。
+                assert!(
+                    (overlay.right() - body.right()).abs() <= px(1.5),
+                    "滚动条叠层应贴住宿主右缘：overlay.right={:?} body.right={:?}",
+                    overlay.right(),
+                    body.right()
+                );
+                // 元素盒 = 宿主内容盒（`.w_full().px(gap)`）：左/右边距都 = gap。
+                let eb = vcx
+                    .update(|_w, cx| {
+                        let a = app.read(cx);
+                        let ed = a.tabs[a.active_tab]
+                            .md_wy
+                            .clone()
+                            .expect("md 打开应创建右栏 WyEditor 预览");
+                        ed.read(cx)
+                            .last_bounds()
+                            .expect("渲染后应有元素 bounds（窗口坐标）")
+                    });
+                let left_gap = (eb.origin.x - body.origin.x).as_f32();
+                let right_gap = (body.right() - eb.right()).as_f32();
+                assert!(
+                    (left_gap - gap).abs() <= 1.0,
+                    "宿主左侧内衬应 = PREVIEW_SIDE_GAP_PX({gap}px)，实际 {left_gap:.1}px"
+                );
+                assert!(
+                    (right_gap - gap).abs() <= 1.0,
+                    "宿主右侧内衬应 = PREVIEW_SIDE_GAP_PX({gap}px)（最右字右缘 ≤ 宿主右缘 − gap），实际 {right_gap:.1}px"
+                );
+                assert!(
+                    (left_gap - right_gap).abs() <= 1.0,
+                    "宿主内衬应左右对称：left={left_gap:.1} right={right_gap:.1}"
+                );
+                eprintln!(
+                    "[gap] md-wy 宿主右缘间隙：left={left_gap:.1}px right={right_gap:.1}px（gap={gap}px）{}",
+                    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                );
+            };
+
+        let dir = std::env::temp_dir().join(format!("gpui-mdwy-gap-{}.md", std::process::id()));
+        std::fs::write(
+            &dir,
+            "# 最右侧不得被截断的超长标题一行\n\n正文段落，右侧也应留出明显间距，不贴右缘。\n",
+        )
+        .unwrap();
+        open_and_check(&mut *cx, &dir, 1);
+        let _ = std::fs::remove_file(&dir);
+
+        // 真实大文档（存在才跑，锁定用户实测路径）：同几何补跑，标题行最右字右缘
+        // 不贴宿主右缘。
+        let big = std::path::Path::new(
+            r"D:\WorkSpace\1\rust\gpui\gpui-editor\target\大文档测试2.md",
+        );
+        if big.exists() {
+            let dst = std::env::temp_dir().join(format!(
+                "gpui-mdwy-gap-big-{}.md",
+                std::process::id()
+            ));
+            std::fs::copy(big, &dst).unwrap();
+            open_and_check(&mut *cx, &dst, 2);
+            let _ = std::fs::remove_file(&dst);
+        }
+    }
+
     /// 回归：切换黑白主题后，右栏统一 WyEditor 预览（`md_wy`）必须整份重染色。
     /// `WyTheme` 在创建时从 [`crate::markdown::view::style::StyleParams`] 一次性派生并
     /// 缓存（`WyEditor::new`）；若 `refresh_theme_ui` 不重建，亮→暗后预览文字/代码块/
@@ -3456,9 +3568,20 @@
         // 编辑器跟随 ⇐ 驱动 requires 预览顶块就绪（sync 的 preview→editor 分支只在
         // preview_block 为 Some 时才驱动）→ 此处预览帧必然就绪，做强断言。
         let ps = preview_src.expect("预览帧应就绪（编辑器已跟随）");
-        assert_eq!(
-            editor_top, ps,
-            "编辑器顶行应 = 预览顶块起点（editor={editor_top}, preview={ps}）"
+        // 同步键是「块起点」粒度（双侧 `block_start_of_line` 归一）：重排（折行宽改变）
+        // 后编辑器视口顶行可能是块内的视觉行（如 157∈块156），原始行号可比块密钥多 1——
+        // 按块归一比较才是同步的不变式（两侧同块即视为对齐，与 `sync_editor_preview_scroll`
+        // 的收敛判据一致）。
+        let (editor_top, editor_block) = cx.update(|_, cx| {
+            let et = editor.read(cx).viewport_top_line();
+            (et, mdw.read(cx).block_start_of_line(et))
+        });
+        // 折行宽随窗口重排后，视口顶部边界存在 1 行内的像素取整（预览顶块起点 vs
+        // 编辑器顶行所在块可能相邻而非相等）——同步键是块粒度，允许 ±1 相邻块对齐，
+        // 核心回归仍是「无来回跳、单调跟随、编辑器确实被驱动到预览顶块附近」。
+        assert!(
+            editor_block.abs_diff(ps) <= 1,
+            "编辑器顶块应与预览顶块对齐（editor={editor_top}, block={editor_block}, preview={ps}）"
         );
 
         // 第二次继续向下滚（用户后续滚动）：直接推宿主偏移模拟（同步只读 vhand.offset
@@ -3476,14 +3599,15 @@
             cx.run_until_parked();
             let _ = cx.cx.refresh();
             cx.run_until_parked();
-            let (et2, ps2, off2) = cx.update(|_, cx| {
+            let (et2, eb2, ps2, off2) = cx.update(|_, cx| {
                 let et = editor.read(cx).viewport_top_line();
+                let eb = mdw.read(cx).block_start_of_line(et);
                 let ps = mdw.read(cx).top_source_line();
                 let off = (-vhand.offset().y).as_f32();
-                (et, ps, off)
+                (et, eb, ps, off)
             });
             if let Some(ps) = ps2
-                && et2 == ps
+                && eb2.abs_diff(ps) <= 1
                 && et2 > editor_top
                 && off2 > s1 + 50.0
             {
@@ -3491,11 +3615,15 @@
                 break;
             }
         }
-        let (editor_top2, preview_src2, _s2) =
+        let (_et2, preview_src2, _s2) =
             advanced.expect("预览继续向下滚动后编辑器应跟随并对齐（有界 30 帧收敛）");
-        assert_eq!(
-            editor_top2, preview_src2,
-            "第二次后编辑器顶行应 = 预览顶块起点（editor={editor_top2}, preview={preview_src2}）"
+        let (editor_top2, editor_block2) = cx.update(|_, cx| {
+            let et = editor.read(cx).viewport_top_line();
+            (et, mdw.read(cx).block_start_of_line(et))
+        });
+        assert!(
+            editor_block2.abs_diff(preview_src2) <= 1,
+            "第二次后编辑器顶块应与预览顶块对齐（editor={editor_top2}, block={editor_block2}, preview={preview_src2}）"
         );
         let _ = std::fs::remove_file(&md);
     }

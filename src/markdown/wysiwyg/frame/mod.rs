@@ -695,7 +695,9 @@ pub(crate) fn build_frame(
     let base_font = theme.font.clone();
     let doc = editor.doc();
     let n = doc.block_count();
-    let padding = px(12.);
+    // 帧内衬 = 内容盒内衬**单一来源** `CONTENT_EDGE_PAD_X_PX`（与预览行内 px_3 同源；
+    // 命中/光标/划线/拖拽几何全部经 `frame.padding` 推导，改此值全站一致）。
+    let padding = px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX);
     let rgen = editor.content_gen();
 
     if n == 0 {

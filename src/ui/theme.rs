@@ -221,7 +221,9 @@ pub struct ChromeColors {
     pub text_minor: Rgba,
     /// 三级文字（菜单快捷键 / 未激活图标，亮暗同值）
     pub text_tertiary: Rgba,
-    /// 胶囊/小按钮等「芯片」背景
+    /// 胶囊/小按钮等「芯片」背景（写入于明/暗色构造；读取仅在测试断言 `pill_bg==chip_bg`，
+    /// 非测试构建不读 → 标记允许 dead_code 避免 unused 警告）
+    #[allow(dead_code)]
     pub chip_bg: Rgba,
     /// 芯片上的文字
     pub chip_text: Rgba,

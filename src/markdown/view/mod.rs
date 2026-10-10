@@ -6,12 +6,14 @@
 //! - **竖滚动条量程**：`measure_all()` 会首帧排版整篇（十万行一次 1GB+），所以改用
 //!   `with_uniform_item_height` 以「宽度感知的平均行高」铺设量程（见 `update_height_hint`）
 //!   ——行数 × 平均高 ≈ 真实总高，滚动条从一开始就能拖动到全文，内存只随可见窗口走；
-//! - 横向溢出走**原生滚动容器**：`List` 的内容宽（估算的最宽行 `content_w`）由
-//!   `w(content_w).min_w_full()` 在布局期一次算定（超宽行撑宽、普通文档撑满视口），
-//!   外面套一层 `overflow_x_scroll` + `track_scroll(&h_handle)`；
+//! - 页面内容**恒换行**（自适应窗口/面板宽度，左右对称留白统一走 config 的
+//!   `PREVIEW_SIDE_GAP_PX`）：列宽 = min(72ch 阅读栏, 可用宽)，正文/标题/引述/列表
+//!   一律按列宽折行，**没有页面级横向滚动**；只有超宽块（代码/表格/图片）在**块内**
+//!   各自 `overflow_x_scroll` 横向滚动（句柄见 `code_scroll` / `table_scroll`）。
+//!   旧「非换行自然宽 + 页面级横向滚动」模式已废弃（`set_wrap(false)` 不再生效）。
 //! - gpui_component 的滚动条都按官方叠层挂法（`absolute + inset_0` + 滚动条本体）
 //!   挂在 `md-preview` 上：横向跟踪 `h_handle`、竖向跟踪 `ListState`，组件自绘
-//!   （含拖拽、悬浮、自动隐藏），保证内容超宽时横条一定可见。
+//!   （含拖拽、悬浮、自动隐藏）；`h_handle` 只在块内宽内容溢出列宽时才有量程。
 //!
 //! 本目录按职责拆分（替代原先的单文件 `view.rs` 长文件）：
 //! - `style`：排版参数快照（[`style::StyleParams`]）
@@ -53,7 +55,9 @@ use crate::config::limits::{
     CODE_HL_PARSE_BYTES_PER_FRAME, WINDOWED_MIN_BLOCKS, WINDOWED_OVERDRAW_BLOCKS,
     WINDOWED_OVERDRAW_FACTOR, WINDOWED_OVERDRAW_MAX,
 };
-use crate::config::markdown::{IMAGE_ROW_DEFAULT_H, ROW_OVERDRAW_PX, WIDTH_BUFFER_PX};
+use crate::config::markdown::{
+    CONTENT_EDGE_PAD_X_PX, IMAGE_ROW_DEFAULT_H, PREVIEW_SIDE_GAP_PX, ROW_OVERDRAW_PX,
+};
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parse::{
     citation_index_from_rows, parse_block_window, parse_block_window_rope, parse_to_rows,
@@ -62,7 +66,7 @@ use crate::markdown::parse::{
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
-use dimensions::{est_row_width, est_row_width_meta, image_dimensions, image_dimensions_bytes};
+use dimensions::{image_dimensions, image_dimensions_bytes};
 use row::{render_row, RowRenderCtx};
 use style::StyleParams;
 
@@ -249,11 +253,11 @@ pub struct MarkdownPreview {
     list_state: ListState,
     /// 背景色覆盖（由应用传入，与编辑区保持一致；None 用主题背景）。
     bg: Option<Hsla>,
-    /// 估算的最宽内容（px，跨全部行），决定横向滚动范围。
-    content_w: f32,
     /// 横向滚动句柄（跟踪外层横向滚动容器，供 `horizontal_scrollbar` 使用）。
+    /// 页面内容恒换行后无页面级横向量程（只对块内宽内容保留量程）。
     h_handle: ScrollHandle,
-    /// 是否启用文本自动换行（true：段落/标题/引述/列表折行、无横向滚动；false：单行横向滚动）。
+    /// 页面是否恒换行：当前**恒为 true**（`set_wrap(false)` 已废弃为一律换行，
+    /// 内容宽度随窗口自适应、不再有「非换行自然宽 + 页面级横向滚动」模式）。
     wrap: bool,
     /// 正文字号覆盖（None = 用主题默认；EPUB 缩放字号时设置）。
     font_override: Option<f32>,
@@ -384,9 +388,8 @@ impl MarkdownPreview {
             rows: Rc::new(Vec::new()),
             list_state,
             bg: None,
-            content_w: 0.0,
             h_handle: ScrollHandle::new(),
-            wrap: false,
+            wrap: true,
             font_override: None,
             toc: Toc::default(),
             base_dir: None,
@@ -508,12 +511,11 @@ impl MarkdownPreview {
     }
 
     /// 设置正文字号覆盖（px）。None 使用主题默认；用于 EPUB 等阅读场景的缩放。
-    pub fn set_font_override(&mut self, size: Option<f32>, cx: &mut App) {
+    pub fn set_font_override(&mut self, size: Option<f32>, _cx: &mut App) {
         if self.font_override == size {
             return;
         }
         self.font_override = size;
-        self.remeasure_dimensions(cx);
         self.list_state.remeasure();
         self.invalidate_height_hint();
     }
@@ -566,47 +568,23 @@ impl MarkdownPreview {
         }
     }
 
-    /// 重建尺寸估算（换行/字号/内容变化后调用）。
-    fn remeasure_dimensions(&mut self, cx: &mut App) {
-        let p = StyleParams::from_theme_with_font(cx, self.font_override);
-        self.content_w = if self.wrap {
-            0.0
-        } else {
-            let max_w = match &self.index {
-                Some(idx) => idx
-                    .blocks
-                    .iter()
-                    .map(|b| est_row_width_meta(&b, &p))
-                    .fold(0.0, f32::max),
-                None => self
-                    .rows
-                    .iter()
-                    .map(|r| est_row_width(r, &p))
-                    .fold(0.0, f32::max),
-            };
-            max_w + WIDTH_BUFFER_PX
-        };
-    }
-
-    /// 设置是否文本自动换行（EPUB 阅读等场景）。切换后无需重解析，直接触发重渲染。
-    pub fn set_wrap(&mut self, wrap: bool, cx: &mut App) {
-        if self.wrap == wrap {
-            return;
-        }
-        self.wrap = wrap;
-        self.remeasure_dimensions(cx);
+    /// 设置是否文本自动换行（兼容入口，EPUB 阅读等场景调用）。
+    /// **非换行模式已废弃**：页面恒换行（内容宽度自适应窗口，无页面级横向滚动），
+    /// 无论入参如何都保持换行；仅保证切换后会重渲染。
+    pub fn set_wrap(&mut self, _wrap: bool, _cx: &mut App) {
+        self.wrap = true;
         self.list_state.remeasure();
         self.invalidate_height_hint();
     }
 
-    /// 当前是否文本自动换行。
+    /// 当前是否文本自动换行（恒为 true；旧非换行模式已废弃）。
     pub fn is_wrap(&self) -> bool {
         self.wrap
     }
 
     /// 开启/关闭 EPUB 阅读排版并注入脚注表（`load_epub` 调用）。
     /// 开启后：标题居中、正文首行缩进 2 字符、`[n]` 注记悬停显示卡片。
-    pub fn set_epub(&mut self, on: bool, notes: std::collections::BTreeMap<usize, String>, cx: &mut App) {
+    pub fn set_epub(&mut self, on: bool, notes: std::collections::BTreeMap<usize, String>, _cx: &mut App) {
         self.epub_mode = on;
         // 换新注记上下文（命中表也随之清空重来）。
         self.note_ctx = Rc::new(NoteCtx {
@@ -617,7 +595,6 @@ impl MarkdownPreview {
             hits: Rc::new(RefCell::new(Vec::new())),
         });
         self.hover_hit = None;
-        self.remeasure_dimensions(cx);
         self.list_state.remeasure();
         self.invalidate_height_hint();
     }
@@ -990,7 +967,7 @@ impl MarkdownPreview {
     /// `SharedString` 的 `Arc<str>`、`Rc<BlockIndex>` 共享读取）——**不把全文二次
     /// 物化、也不整份拷贝索引**。打字同步主路径传 [`PreviewSrc::Rope`]（编辑器正文
     /// 快照，O(1)），窗口模式按可见窗口从 rope 切片，驻留不随文档增长。
-    pub fn set_source_with_index(&mut self, src: PreviewSrc, index: Rc<BlockIndex>, cx: &mut App) {
+    pub fn set_source_with_index(&mut self, src: PreviewSrc, index: Rc<BlockIndex>, _cx: &mut App) {
         // WY_TRACE breakdown：预览数据同步段（编辑后增量装配：窗口模式懒解析 / 小文档
         // 全量重建 + 高度模型失效）。事件链里随编辑 op 结算进同一行 breakdown。
         let _t_src = crate::prof::begin();
@@ -1042,9 +1019,8 @@ impl MarkdownPreview {
             crate::prof::end("md.ss.reset", _t_reset);
             // 高度/块宽模型：不在此失效（否则每键打字的下一帧都 O(N) 重建）。小编辑只改
             // 局部块高，模型近似仍可用；块数/宽度/字号变化由 render 里的 n/width 判据重建。
-            if self.content_w <= 0.0 {
-                self.remeasure_dimensions(cx);
-            }
+            // 宽度模型：页面恒换行，无「非换行自然宽」需要重算（列宽 = min(72ch, 可用宽)，
+            // 由 render 按视口宽即时计算，不缓存）。
             // 恢复滚动：窗口重定位回旧绝对位置（px），render 的 apply_desired 落窗口。
             if prev_abs.0 > 0 || prev_abs.1 > 0.0 {
                 self.desired_scroll.set(self.px_of_block(prev_abs.0) + prev_abs.1);
@@ -1113,7 +1089,6 @@ impl MarkdownPreview {
                 bytes / 1024,
             );
         }
-        self.remeasure_dimensions(cx);
         // 行高估算只在视口宽度变化时由 render 里的 `update_height_hint` 重算；这里
         // 不主动作废，避免每次同步都迫使 O(n) 重建统一高度 SumTree（大文档逐键卡顿源）。
         if self.rows.len() != self.list_state.item_count() {
@@ -1226,7 +1201,9 @@ impl MarkdownPreview {
             self.est_hint = 0.0;
             return;
         }
-        let avail = (width - 24.0).max(40.0); // px_3 左右内缩，与旧估算一致
+        // 内容可用宽 = 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`，
+        // 与 row.rs 行渲染同源；旧硬编码 24）。
+        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
         // 抽样步长：中等文档（≤ 该阈值）**逐块精确**算高（几十万块 ≈ 几 ms，换源/换宽
         // 才发生）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度
         // 周期复用块」有偏差，故只在 N 大到精确成本不可接受时启用。
@@ -1689,10 +1666,9 @@ impl MarkdownPreview {
     /// 释放预览重资源（解析出的行数据 + 列表测量缓存），关闭预览时调用。
     /// 否则隐藏的预览仍占着整篇文档的解析结果；反复开关预览会积累内存。
     /// 下次开启预览时 [`Self::set_source`] 会重新解析，行为不变。
-    pub fn release(&mut self, cx: &mut App) {
+    pub fn release(&mut self, _cx: &mut App) {
         self.rows = Rc::new(Vec::new());
         self.list_state = ListState::new(0, ListAlignment::Top, px(ROW_OVERDRAW_PX));
-        self.content_w = 0.0;
         self.toc = Toc::default();
         self.code_scroll = Default::default();
         self.code_hl = Default::default();
@@ -1721,7 +1697,6 @@ impl MarkdownPreview {
         self.block_h = Vec::new();
         self.height_pref = Vec::new();
         self.height_stride = 1;
-        self.remeasure_dimensions(cx);
     }
 
     /// 标记「平均行高的宽度感知估算」已失效：换源 / 换行 / 字号变化后调用，
@@ -1737,7 +1712,8 @@ impl MarkdownPreview {
     /// 折算行数（CJK ≈ 字号，其余 ≈ 0.55 × 字号），微差只会让滚动条映射略微
     /// 非线性，随行真正渲染后逐步收敛。
     fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
-        let avail = (width - 24.0).max(40.0); // px_3 左右内缩
+        // 内容可用宽 = 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`）。
+        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
         let wrap = self.wrap;
         // 小文档恒走 rows 逐行口径（行类型精确）；只有**大文档/窗口模式**（rows 懒物化
         // 为空）才走块索引口径——避免「首帧 index 在场、随后丢弃」导致平均行高在两种
@@ -1907,25 +1883,6 @@ impl MarkdownPreview {
         self.hint_recovered = true;
         true
     }
-
-    /// 单调**上修** `content_w` 到能容纳当前窗口里最宽的行（只增不减）。
-    /// 文本编辑时 `content_w` 不重算全局最大行（避免 List 宽度抖动 → gpui 清空全部
-    /// size_hint → O(n) 重建统一高度提示，正是大文档逐键卡顿源）；这里按已物化窗口
-    /// 的行宽上限补齐横向溢出即可，更宽的行滚入窗口时再上修。真正的回拨只发生在
-    /// 换行 / 字号 / 换源重建（`remeasure_dimensions`）。
-    fn bump_content_width_to_cover(&mut self, p: &StyleParams) {
-        if self.wrap || self.win_rows.is_empty() {
-            return;
-        }
-        let mut w = self.content_w.max(0.0);
-        for r in self.win_rows.iter() {
-            let rw = est_row_width(r, p) + WIDTH_BUFFER_PX;
-            if rw > w {
-                w = rw;
-            }
-        }
-        self.content_w = w;
-    }
 }
 
 /// 为给定行集重建代码块语法高亮缓存：按围栏语言**整块**解析一次，返回
@@ -2034,7 +1991,17 @@ impl MarkdownPreview {
                 || (self.est_hint_width - pane_w).abs() >= 2.0
                 || self.item_count() != self.height_model_n
             {
+                // 面板/窗口**横向变窄**（拖分割条/缩放窗口）：ListState 缓存的条目宽/
+                // 位置仍是旧宽度布局的（超宽文本行/引述按旧宽排版 → 实际右缘超出阅读栏
+                // 与卡片右缘、被 `overflow` 裁掉，右侧无间距、左侧却有）。重建高度模型
+                // 之外，强制全部条目在下一帧按新宽度重测，恢复左右对称间距。
+                // 仅真宽变更才触发（O(窗口) 重测，稀释可忽略；打字不改变宽度，零影响）。
+                let width_changed = self.est_hint_width >= 0.0
+                    && (self.est_hint_width - pane_w).abs() >= 2.0;
                 self.rebuild_height_model(p, pane_w);
+                if width_changed {
+                    self.list_state.remeasure();
+                }
             }
             // 字号缩放后：模型已按新字号重建，把缩放前的视口锚点换算出新的滚动目标，
             // 再落窗口（在 apply_desired 之前），保证 Ctrl+滚轮放大/缩小不带动页面滚动。
@@ -2088,9 +2055,6 @@ impl MarkdownPreview {
                 self.dispatch_pending_code_hl(cx);
             }
             self.ensure_window(need_lo, need_hi);
-            // 文本编辑期间 content_w 保持稳定（不做全局最大行重算，避免 List 宽度抖动
-            // → gpui 清空 size_hint → O(n) 重建），只在窗口出现更宽行时单调上修。
-            self.bump_content_width_to_cover(p);
             crate::prof::end("md_ensure_call", _t_ensure);
         }
     }
@@ -2104,9 +2068,8 @@ impl MarkdownPreview {
                 use std::io::Write;
                 let _ = writeln!(
                     f,
-                    "render: wrap={} content_w={:.0} max_off=({:.0},{:.0}) bounds={:?}",
+                    "render: wrap={} max_off=({:.0},{:.0}) bounds={:?}",
                     self.wrap,
-                    self.content_w,
                     h.max_offset().x.as_f32(),
                     h.max_offset().y.as_f32(),
                     h.bounds(),
@@ -2199,7 +2162,7 @@ impl MarkdownPreview {
         let windowed = self.index.is_some();
         let v = PreviewVerticalScrollHandle {
             list: list_state.clone(),
-            content_width: self.content_w,
+            content_width: 0.0,
             content_height: if windowed { self.total_h() } else { n as f32 * eh },
             est_hint: eh,
             n,
@@ -2241,11 +2204,11 @@ impl Render for MarkdownPreview {
         // 闭包内只读窗口数据，避免在元素构造期改 `self`）。
         self.prepare_render(&p, pane_w, cx);
         let list_state = self.list_state.clone();
-        let content_w = self.content_w;
-        // 居中阅读栏（wrap 模式共用单一来源 `config::markdown::reading_col_px`）：
+        // 居中阅读栏（页面恒换行，单一来源 `config::markdown::reading_col_px`）：
         // 列宽 = min(72ch, 视口宽)——窗口窄于 72ch 时退化为占满视口，不横向超界。
         // 正文按列宽折行；宽块（代码/表格）在列内各自横向滚动（行为保持）。
-        let reading_col_w = if self.wrap && crate::config::markdown::READING_COL_ENABLED {
+        // 非换行「自然宽 + 页面级横向滚动」模式已废弃，列宽唯一由视口驱动。
+        let reading_col_w = if crate::config::markdown::READING_COL_ENABLED {
             Some(
                 crate::config::markdown::reading_col_px(f32::from(p.para_size))
                     .min(pane_w.max(1.0)),
@@ -2260,7 +2223,7 @@ impl Render for MarkdownPreview {
         let content = self.build_list_content(p.clone(), list_state.clone(), cx);
 
         // 预览核心：内容上下滚动容器 + 双滚动条 + 点选/悬浮监听（见 `render_core`）。
-        let core = self.render_core(content, bg, list_state, content_w, reading_col_w, cx);
+        let core = self.render_core(content, bg, list_state, reading_col_w, cx);
         let core = self.with_hover_note_card(core, cx).into_any_element();
 
         // 外层容器：相对定位承载目录浮层/面板开关；窗口模式普通滚轮走自持像素滚动。
@@ -2310,7 +2273,6 @@ impl MarkdownPreview {
         // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
         let search_highlight = self.compute_search_highlight(cx);
         let sel_color = selection_color(cx);
-        let wrap = self.wrap;
         let code_scroll = self.code_scroll.clone();
         let code_hl = self.code_hl.clone();
         let table_scroll = self.table_scroll.clone();
@@ -2369,7 +2331,6 @@ impl MarkdownPreview {
                 row,
                 &RowRenderCtx {
                     p: &p,
-                    wrap,
                     code_handle: ch,
                     code_hl: chr,
                     table_handle: th,
@@ -2388,19 +2349,18 @@ impl MarkdownPreview {
         .into_any_element()
     }
 
-    /// 预览核心：换行（宽随视口 / 居中阅读栏）或非换行（横向滚动）共用外层横向滚动容器
-    /// （换行无阅读栏时宽包装层保持视口宽、超宽代码带由列内各自横向滚动；非换行模式 =
-    /// max(最宽内容,视口宽)）+ 常显横向/纵向量程滚动条 + 点选复制/悬浮脚注监听挂载。
+    /// 预览核心（页面恒换行）：内容列宽 = `reading_col_w`（居中阅读栏，`min(72ch, 视口)`）
+    /// 并在面板内水平居中；未启用阅读栏时列宽 = 视口宽（正文照常折行）。两者都不产生
+    /// **页面级横向滚动**——超宽代码/表格带由列内各自横向滚动（`code_scroll`/`table_scroll`）。
+    /// + 常显横向/纵向量程滚动条 + 点选复制/悬浮脚注监听挂载。
     ///
-    /// `reading_col_w = Some(w)` 表示启用居中阅读栏（wrap 模式）：内容列宽 = `min(72ch,
-    /// 视口)` 并水平居中，正文按列宽折行；代码/表格等宽块仍在列内横向滚动。`None` 走
-    /// 原语义（wrap = 撑满视口 / 非 wrap = 内容宽）。
+    /// `reading_col_w = Some(w)`：内容列宽 = `min(72ch, 视口)` 并水平居中，宽块仍在列内
+    /// 横向滚动；`None` = 列宽 = 视口宽（窄窗退化档、或不启用阅读栏时的撑满模式）。
     fn render_core(
         &self,
         content: gpui::AnyElement,
         bg: Hsla,
         list_state: ListState,
-        content_w: f32,
         reading_col_w: Option<f32>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
@@ -2410,13 +2370,18 @@ impl MarkdownPreview {
                 .debug_selector(|| "md-list-wrap".into())
                 .w(px(col_w))
                 .h_full()
+                // 左右对称留白（单一来源 `PREVIEW_SIDE_GAP_PX`）：
+                // 内容列最右字距面板右缘 ≥ 该值，窄窗退化（列宽=可用宽）最右字
+                // 不被卡片/滚动条裁切；左侧同步对称。
+                .px(px(PREVIEW_SIDE_GAP_PX))
                 .child(content),
             None => div()
                 .id("md-list-wrap")
                 .debug_selector(|| "md-list-wrap".into())
-                .w(px(content_w))
-                .min_w_full()
+                .w_full()
                 .h_full()
+                // 同源左右对称留白：见上方阅读栏分支注释。
+                .px(px(PREVIEW_SIDE_GAP_PX))
                 .child(content),
         };
         // 横向滚动容器：原生 `overflow_x_scroll`，由 `h_handle` 跟踪。

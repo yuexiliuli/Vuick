@@ -357,7 +357,10 @@ impl EditorApp {
                     .id("md-wy-body")
                     .debug_selector(|| "md-wy-body".into())
                     .w_full()
-                    .px(px(12.))
+                    // 宿主水平内衬 = 预览内容列留白**单一来源** `PREVIEW_SIDE_GAP_PX`
+                    // （与 `markdown::view` 同源）：右侧留出肉眼可见间距，标题/正文最右字
+                    // 不贴右缘、不被自绘滚动条带盖住；滚动条叠层贴外层右缘，gap 在其内侧。
+                    .px(px(crate::config::markdown::PREVIEW_SIDE_GAP_PX))
                     .py(px(LIVE_BODY_PAD_Y))
                     .text_size(px(fs))
                     .text_color(text_color)

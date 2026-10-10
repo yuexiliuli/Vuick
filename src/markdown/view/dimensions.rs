@@ -1,8 +1,11 @@
 //! 内容/图片的尺寸估算与解析：
-//! - 估算每行渲染宽度（决定横向滚动容器的内容宽）；
+//! - 表格列宽估算（超宽表格在块内横向滚动，列宽决定其内容宽）；
 //! - 解析常见图片格式的文件头得到固有尺寸（不整图解码，快）。
+//!
+//! 注：页面已恒换行（无「非换行自然宽 + 页面级横向滚动」），单行文本宽估算
+//! （`est_row_width` / `est_row_width_meta`）已随该模式移除。
 
-use crate::markdown::parse::{BlockMeta, Row, RowKind, TableData};
+use crate::markdown::parse::TableData;
 use crate::markdown::view::style::StyleParams;
 
 /// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。
@@ -87,8 +90,7 @@ fn is_wide_char(c: char) -> bool {
         || (0xFF00..=0xFF60).contains(&cp) // 全角符号
 }
 
-/// 估算一段文本的渲染宽度（px）。行元素的真实宽度由元素布局决定，这里仅用来给
-/// 横向滚动容器定一个“足够放下超宽行”的内容宽。
+/// 估算一段文本的渲染宽度（px）。表格列宽估算用（`table_column_widths`）。
 fn est_text_width(text: &str, font_size: f32) -> f32 {
     text.chars().fold(0.0, |acc, c| {
         acc + if is_wide_char(c) {
@@ -97,65 +99,6 @@ fn est_text_width(text: &str, font_size: f32) -> f32 {
             font_size * 0.6
         }
     })
-}
-
-/// 估算一行的渲染宽度（px）。
-pub(crate) fn est_row_width(row: &Row, p: &StyleParams) -> f32 {
-    match row.kind {
-        RowKind::Blank | RowKind::Rule => 0.0,
-        RowKind::Image => {
-            // 图片行 by contain 撑满可用宽度 → 宽度由视口决定，不计入最宽内容
-            0.0
-        }
-        RowKind::Code => {
-            // 等宽字体按 0.65em/字符 + 内部 padding（pl_3 + pr_3 = 24px）+ 外层内缩（px_3 = 24px）
-            let widest = row
-                .code_lines()
-                .iter()
-                .map(|l| l.chars().count() as f32)
-                .fold(0.0f32, f32::max);
-            widest * p.code_size.as_f32() * 0.65 + 48.0
-        }
-        RowKind::Heading(n) => {
-            let (fs, _) = p.heading_metrics(n);
-            est_text_width(&row.text, fs.as_f32())
-        }
-        // 引述：外层 px_3 内缩(左右 24) + 内层 pl_3/pr_3(左右 24) + 左边框 2px（同代码块做法）
-        RowKind::Quote => est_text_width(&row.text, p.para_size.as_f32()) + 50.0,
-        RowKind::Bullet => {
-            let prefix_w = row
-                .prefix
-                .as_ref()
-                .map(|s| s.chars().count() as f32 * 8.0)
-                .unwrap_or(0.0);
-            est_text_width(&row.text, p.para_size.as_f32()) + prefix_w + 12.0
-        }
-        RowKind::Paragraph => est_text_width(&row.text, p.para_size.as_f32()),
-        RowKind::Table => row
-            .table()
-            .map(|t| table_column_widths(t, p).iter().sum())
-            .unwrap_or(0.0)
-            // 渲染时外层 px_3 内缩（左右共 24px）
-            + 24.0,
-    }
-}
-
-/// 估算一个块的渲染宽度（px）。窗口模式（大文档）用：块索引不含清理后文本，
-/// 按首行原始字节长度粗估（CJK 每字节 ≈ 0.2em，但这里统一按 0.6em/字节 取略宽，
-/// 宁可让横向滚动范围略宽也不截断）。
-pub(crate) fn est_row_width_meta(m: &BlockMeta, p: &StyleParams) -> f32 {
-    let bytes_w = |b: u32, font: f32| b as f32 * font * 0.6;
-    match m.kind {
-        // 围栏行本身很短，代码块宽由内部最宽行决定（无法无文本精确估算，
-        // 取 fence 行宽与 40 字符的较大者，够用的下限）
-        RowKind::Code => m.raw_len.max(40) as f32 * p.code_size.as_f32() * 0.65 + 48.0,
-        RowKind::Heading(n) => bytes_w(m.raw_len, p.heading_metrics(n).0.as_f32()),
-        RowKind::Quote => bytes_w(m.raw_len, p.para_size.as_f32()) + 50.0,
-        RowKind::Bullet => bytes_w(m.raw_len, p.para_size.as_f32()) + 20.0,
-        RowKind::Paragraph => bytes_w(m.raw_len, p.para_size.as_f32()),
-        RowKind::Table => m.raw_len as f32 * p.para_size.as_f32() * 0.6 + 24.0,
-        _ => 0.0,
-    }
 }
 
 /// 表格每列估算宽度（px）：逐格 `est_text_width` + 左右各 10px 内距，
