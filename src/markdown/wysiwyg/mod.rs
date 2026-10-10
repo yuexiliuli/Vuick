@@ -696,8 +696,14 @@ fn region_line_sig(line: &str) -> u64 {
 /// - caret 严格落在**含行内公式的文本行**时会 reveal（shape 依赖光标）→ 该行不缓存
 ///   （调用方 `caret_dep` 判定）。
 /// - 容量上限见 [`crate::config::limits::SHAPED_ROW_CACHE_CAP`]，超出按最近最少使用淘汰。
+///   淘汰用 `lru` 索引（`(last_seen, id)` 组合键升序 `BTreeSet`）取首元素 = 最久未用条目，
+///   O(log cap)/插——替代旧实现每次满缓存插入都全表扫 `min(last_seen)` 的 O(cap)（滚动超
+///   大文档 ≈14k 次插 × 16k 表项比较）。
 struct RowShapeCache {
-    entries: std::collections::HashMap<u64, RowShapeEntry>,
+    entries: rustc_hash::FxHashMap<u64, RowShapeEntry>,
+    /// `(last_seen, id)` 升序 LRU 索引：首元素即最久未用条目；组合键用 `id` 解 last_seen
+    /// 相同（u32 clock 回绕后）的歧义，淘汰顺序确定。
+    lru: std::collections::BTreeSet<(u32, u64)>,
     cap: usize,
     clock: u32,
 }
@@ -711,7 +717,8 @@ struct RowShapeEntry {
 impl RowShapeCache {
     fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: rustc_hash::FxHashMap::default(),
+            lru: std::collections::BTreeSet::new(),
             cap,
             clock: 0,
         }
@@ -720,7 +727,9 @@ impl RowShapeCache {
     fn get(&mut self, id: u64, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
         match self.entries.get_mut(&id) {
             Some(e) if e.key == key => {
+                self.lru.remove(&(e.last_seen, id));
                 e.last_seen = self.clock;
+                self.lru.insert((self.clock, id));
                 self.clock = self.clock.wrapping_add(1);
                 Some(e.row.clone())
             }
@@ -732,7 +741,7 @@ impl RowShapeCache {
     fn key_mismatch(&self, id: u64, key: u64) -> bool {
         self.entries.get(&id).is_some_and(|e| e.key != key)
     }
-    /// 插入（新行）；容量满时淘汰 last_seen 最小的条目。返回缓存的 `Rc`。
+    /// 插入（新行）；容量满时淘汰 LRU 索引首元素（最久未用条目）。返回缓存的 `Rc`。
     fn put(
         &mut self,
         id: u64,
@@ -741,16 +750,16 @@ impl RowShapeCache {
     ) -> std::rc::Rc<element::ShapedRow> {
         if self.entries.len() >= self.cap
             && !self.entries.contains_key(&id)
-            && let Some(old) = self.entries.values().map(|e| e.last_seen).min()
-            && let Some(k) = self
-                .entries
-                .iter()
-                .find(|(_, e)| e.last_seen == old)
-                .map(|(k, _)| *k)
+            && let Some(&(old, k)) = self.lru.iter().next()
         {
+            self.lru.remove(&(old, k));
             self.entries.remove(&k);
         }
         let rc = std::rc::Rc::new(row);
+        // 已存在同名条目（换代重插）：先把旧访问钟从 LRU 索引摘掉，避免残留过期键。
+        if let Some(e) = self.entries.get(&id) {
+            self.lru.remove(&(e.last_seen, id));
+        }
         self.entries.insert(
             id,
             RowShapeEntry {
@@ -759,17 +768,22 @@ impl RowShapeCache {
                 row: rc.clone(),
             },
         );
+        self.lru.insert((self.clock, id));
         self.clock = self.clock.wrapping_add(1);
         rc
     }
     /// 逐个作废（数学就绪/内容变化的受影响块；键 = 内容指纹）。
     fn invalidate_ids(&mut self, ids: &[u64]) {
         for &b in ids {
+            if let Some(e) = self.entries.get(&b) {
+                self.lru.remove(&(e.last_seen, b));
+            }
             self.entries.remove(&b);
         }
     }
     fn clear(&mut self) {
         self.entries.clear();
+        self.lru.clear();
     }
     #[cfg(test)]
     fn len(&self) -> usize {
