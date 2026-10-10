@@ -1162,18 +1162,6 @@ impl VideoViewer {
         self.folder.len()
     }
 
-    /// 是否在播放（状态栏 / 测试用）。
-    #[allow(dead_code)] // M3 状态栏接入后删除
-    pub fn is_playing(&self) -> bool {
-        self.playing
-    }
-
-    /// 是否仍在后台加载。
-    #[allow(dead_code)] // M3 状态栏接入后删除
-    pub fn is_loading(&self) -> bool {
-        self.loading
-    }
-
     /// 焦点句柄（宿主打开时把焦点落上来，按键才进本视图）。
     pub fn focus_handle(&self) -> gpui::FocusHandle {
         self.focus_handle.clone()
@@ -2118,7 +2106,7 @@ mod tests {
         }
         let s = cx.update(|app| {
             let v = viewer.read(app);
-            (v.is_playing(), v.frame.is_some())
+            (v.playing, v.frame.is_some())
         });
         assert!(s.0, "打开即自动播放且持续在播");
         assert!(s.1, "画面持续在屏");

@@ -31,9 +31,6 @@ struct SinkInner {
     /// 已交给设备播放的**帧数**（= 样本数 / 声道）。
     played_frames: Arc<AtomicU64>,
     sample_rate: u32,
-    /// 输出声道数。
-    #[allow(dead_code)] // M4 音频时钟/多声道接入后启用
-    channels: u32,
     /// 音量（0..=1 的 f32 位模式；静音=0）。回调线程无锁直读。
     volume: Arc<AtomicU32>,
     /// 回调累计次数。
@@ -93,7 +90,6 @@ impl AudioSink {
                 queue,
                 played_frames: played,
                 sample_rate,
-                channels: 2,
                 volume,
                 cb_calls,
                 cb_underrun,
@@ -105,12 +101,6 @@ impl AudioSink {
     /// 输出采样率（解码线程据此重采样）。
     pub fn sample_rate(&self) -> u32 {
         self.inner.sample_rate
-    }
-
-    /// 输出声道数。
-    #[allow(dead_code)] // M4 音频时钟/多声道接入后启用
-    pub fn channels(&self) -> u32 {
-        self.inner.channels
     }
 
     /// 播放位置（秒）= 已播帧数 / 采样率；seek 后 `flush` 归零。
