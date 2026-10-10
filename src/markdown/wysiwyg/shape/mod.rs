@@ -46,21 +46,15 @@ pub(crate) fn runs_to_text_runs(
     // 下，编辑→重析→`style_links_in_runs`/`strip_prefix_bytes` 等按字节搬运的区间
     // 可能把边界切进字符内部）——GPUI `Text`/`StyledText` 在非字符边界处切 run 会
     // panic（`text.rs` 的 `is_char_boundary(run.start)` assert / shaping 崩）。与预览
-    // `markdown::view::row::char_align_range` 同式：可将 start/end 分别吸收到最近
-    // 字符边界（向前进位、钳入 `text`），空区间丢弃。这使本渲染路径即便上游混入
-    // 坏区间也永不 panic。
-    let align = |mut p: usize| -> usize {
-        p = p.min(len);
-        while p < len && !text.is_char_boundary(p) {
-            p += 1;
-        }
-        p
-    };
+    // `markdown::view::row::char_align_range`、源码编辑器 `render::char_align_highlights`
+    // 三处合一的共享基元（`crate::util::char_align_byte`，M1.1-P5）：可将 start/end
+    // 分别向前进位吸收到最近字符边界、钳入 `text`，空区间丢弃。这使本渲染路径即便
+    // 上游混入坏区间也永不 panic。
     let mut out = Vec::new();
     let mut i = 0usize;
     for (range, kind) in runs {
-        let s = align(range.start).max(i);
-        let e = align(range.end);
+        let s = crate::util::char_align_byte(text, range.start).max(i);
+        let e = crate::util::char_align_byte(text, range.end);
         if e <= s {
             continue;
         }

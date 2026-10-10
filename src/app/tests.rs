@@ -5275,10 +5275,12 @@
     }
 
     /// 回归：两段式打开大 md 后，**纵向滚动条量程必须健康**（拖到底可到全文末尾）。
-    /// 根因曾为：gpui 在布局宽度变化时清空 ListState 全部 size_hint；编辑器统一高度
-    /// 提示虽在 render 里重挂，但被同帧 prepaint 再次抹掉、且没有请求后续帧 →
-    /// `max_offset_for_scrollbar()` 坍缩到 ~0，拖到底也滚不到底。修复：重挂时
-    /// `cx.notify()` 多画一帧，下一帧宽度对齐后提示才真正生效（与 Markdown 预览同手法）。
+    /// 历史根因：gpui 在布局宽度变化时清空 ListState 全部 size_hint，依赖
+    /// `max_offset_for_scrollbar()` 的量程坍缩到 ~0，拖到底也滚不到底（曾以「64px
+    /// 量化 + ensure_uniform_hint 重挂 + notify 多画一帧」绕开/自愈，均已删除）。
+    /// 现状（M1.3 P7）：编辑器恒走确定性像素模型（`list_max_offset` = 全文条目数 ×
+    /// 行高 − 视口），与 gpui 换宽清 size_hint **无关**，量程恒健康；本测试的
+    /// notify + refresh 只驱动一次真实布局让 `viewport_bounds` 落定，再读量程验证。
     #[gpui::test]
     async fn opens_large_md_keeps_vertical_scrollbar_healthy(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5333,9 +5335,9 @@
             let ed = a.tabs[i].editor.read(cx);
             (ed.line_count(), ed.test_metrics().1)
         });
-        // 编辑器「再次渲染后量程自愈」：idle 时 summary 可能被最后一次换宽清掉（gpui
-        // 只在实际布局时清），但只要再渲染一次（用户移动鼠标/滚轮即如此），
-        // `ensure_uniform_hint` 应重挂恢复。手动 notify 驱动一次渲染来验证。
+        // 量程 = 确定性像素模型（`list_max_offset` = 全文条目数 × 行高 − 视口），与
+        // gpui 换宽清 size_hint 无关（`ensure_uniform_hint` 已删除）。notify + refresh
+        // 只驱动一次真实布局让 `viewport_bounds` 落定，再读 `list_max_offset` 验证。
         let ed_ent = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
@@ -5481,19 +5483,16 @@
             ed_max + ed_vh,
             n_lines as f32 * lh
         );
-        let (ed_vw, ed_cw, ed_lastw) = cx.update(|_, cx| {
+        let (ed_vw, ed_cw) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
             let ed = a.tabs[i].editor.read(cx);
             (
                 ed.test_list_state().viewport_bounds().size.width.as_f32(),
                 ed.test_content_w_px(),
-                ed.test_last_list_width(),
             )
         });
-        println!(
-            "DIAG 编辑器宽: viewport_w={ed_vw:.1} content_w={ed_cw:.1} last_list_width={ed_lastw:.1}"
-        );
+        println!("DIAG 编辑器宽: viewport_w={ed_vw:.1} content_w={ed_cw:.1}");
         println!(
             "DIAG 预览: blocks={pv_blocks} est={pv_est:.1} 摘要total={pw_total:.1} 句柄高(blocks×est)={:.1}",
             pv_blocks as f32 * pv_est

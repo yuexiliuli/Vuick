@@ -1904,10 +1904,12 @@ impl EditorApp {
         // 按 `hitbox.is_hovered` 漏进编辑区置 `dragging=true`（不按 z-order 裁掉被菜单
         // 遮挡的区间）；对应的 MouseUp 又被菜单项 `activate` 的 `stop_propagation`
         // 截断派发、到不了编辑器 `on_mouse_up` → `dragging` 残留。切回后仅移动鼠标
-        // 就会从 anchor=0（`set_text` 收拢到行首）自动扩选到指针处。这里统一清干净：
-        // WYSIWYG 实体（随后即销毁）与源码编辑区（转前台显示）都不留拖选态。
+        // 就会从 anchor=0（`set_text` 收拢到行首）自动扩选到指针处。宿主在此「切回/
+        // 切离」生命周期边界触发编辑器的统一拖选复位钩子（`cancel_mouse_drag`），
+        // 并覆盖提前 return 路径（大文档未加载完不走 `set_text`）：WYSIWYG 实体
+        // （随后即销毁）与源码编辑区（转前台显示）都不留拖选态。
         l2.update(cx, |ed, _| ed.end_selection());
-        tab.editor.update(cx, |ed, _| ed.reset_mouse_drag());
+        tab.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
         // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
         // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
         if !l2.read(cx).is_loaded() {
@@ -2000,6 +2002,11 @@ impl EditorApp {
             tab.live2 = Some(ed.clone());
             tab._live2_sub = Some(ed_sub);
             tab.live_edit = true;
+            // 源编辑区即将被 WYSIWYG 取代（隐藏/切离）：在此「被隐藏」生命周期点复位
+            // 其鼠标拖选态（与 `commit_live` 同用 `cancel_mouse_drag` 统一钩子）。菜单
+            // 点击漏进的 MouseDown 恰在切离前把 `dragging` 置位过（见 `commit_live` 注释），
+            // 若不在此刻清掉，隐藏期的残留会在切回后仅移动鼠标时把选区从 anchor 拉长。
+            tab.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
             if async_load {
                 let tab_idx = idx;
                 let ed_install = ed.clone();

@@ -289,7 +289,7 @@ impl CodeEditor {
     }
 
     /// render 每帧的状态同步：焦点注册/对齐、度量刷新、后台折叠/括号扫描挂起、
-    /// 窗口对齐用户滚动目标、量程自愈重挂、横向滚动位置回读、可见字符数与主题明暗。
+    /// 窗口对齐用户滚动目标、横向滚动位置回读、可见字符数与主题明暗。
     /// 返回 `avail_w`（编辑区可视宽：上一帧元素宽，首帧退窗口宽）。
     fn sync_render_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> f32 {
         // 首次渲染注册焦点事件
@@ -319,11 +319,6 @@ impl CodeEditor {
         // 每个 render 把固定窗口对齐到用户目标（desired_scroll）：滚动条拖动只写
         // desired、由这里落窗口；滚轮/键盘/跳转的 scroll_to_px 已同步，此处为幂等兜底。
         self.apply_desired_to_window();
-        // 量程坍缩时重挂统一高度提示，并请求多画一帧让其真正生效（防「拖到底不到底」）。
-        // （pixel_scroll 大文档路径由 ensure_uniform_hint 内部直接短路，见其注释。）
-        if self.ensure_uniform_hint() {
-            cx.notify();
-        }
         // 横向滚动位置以容器（h_handle）为准（滚动条拖动直接改它）→ 回读对齐 hscroll_cols。
         if self.char_width.as_f32() > 0. {
             self.hscroll_cols = ((-self.h_handle.offset().x.as_f32())
@@ -347,35 +342,34 @@ impl CodeEditor {
         avail_w
     }
 
-    /// 横向内容宽度（整篇最长行估算，按 64px 量化防量程坍缩）+ 内容变短时夹紧 `h_handle`。
+    /// 横向内容宽度（整篇最长行，Buffer O(1) 精确，不再量化）+ 内容变短时夹紧 `h_handle`。
     /// 返回 `(content_w_px, harea_w)`（`harea_w` = 文本区可视宽，标尺/括号标尺共用）。
     fn compute_content_width(&mut self, avail_w: f32) -> (f32, f32) {
-        // 横向内容宽度 = 整篇最长行的字符数（Buffer O(1) 维护），按**文本区**计：
-        // 文本区可视宽 = 编辑区宽 − 行号列宽（横向滚动容器 `harea` 从行号列右缘
-        // 开始）。此前用整编辑区宽，会多出行号宽度的“幻影可滚范围”（量程/滚动到达
-        // 边界提前），也让首帧 `reveal_caret` 误以为可以横向滚动。
+        // 横向内容宽度 = 整篇最长行的宽度单位数（Buffer O(1) 精确维护的直方图）
+        // × 格宽，按**文本区**计：文本区可视宽 = 编辑区宽 − 行号列宽（横向滚动容器
+        // `harea` 从行号列右缘开始）。此前用整编辑区宽，会多出行号宽度的“幻影可滚
+        // 范围”（量程/滚动到达边界提前），也让首帧 `reveal_caret` 误以为可以横向滚动。
         // 此前提过：用「可见窗口的行 max + 单调上修」会在拖垂直滚动条经过首次出现
         // 的更长行时内容宽突跳；用全局最长行永远稳定，只在编辑产生更长行/窗口宽度/
         // 字号变化时才变化。
         let harea_w = (avail_w - self.gutter_width_px.as_f32()).max(0.);
         let cw_max = self.char_width.as_f32().max(1.);
         // `max_line_units` 由 Buffer 行宽直方图（multiset）维护，编辑后**始终精确**
-        // O(1) 读。内容宽按 64px 向上取整量化：gpui List 在「布局宽度变化」时会清空
-        // 全部 size_hint → 纵向量程坍缩（vertical 滚动条突然变长），需 `ensure_uniform_hint`
-        // 的 120ms 冷却后 O(n) 自愈。若内容宽逐键变化（在最宽行末尾打字），量程会一直
-        // 坍缩（滚动条变长再变短）。量化后只在每 ~8 字符（64px）才变化一次，冷却期间
-        // 即可自愈，纵向量程保持稳定。量化只加不减（= 上界），不影响不折行。
-        const HSCROLL_QUANTUM_PX: f32 = 64.;
+        // O(1) 读 → 内容宽就是最宽行的真实渲染宽（单调等宽：ASCII=1 格、全角=2 格、
+        // Tab=4 格，与 `char_width` 同一口径），**不量化、不浮余**。
+        //
+        // 不再需要「64px 量化 + 120ms 冷却（ensure_uniform_hint）」历史补丁：
+        // 纵向量程已由确定性像素模型承担（`VerticalScrollHandle.content_height =
+        // 全文行数 × 行高`，与 `reach_px` 同源），gpui List 换宽清空 size_hint 不再
+        // 导致量程坍缩；横向量程 = `h_handle.max_offset().x`——本容器按真实
+        // `content_w_px` 布局后的**实测**值，滚动条/滚轮夹紧同读它，随内容实时精确。
         let raw_max_w = self.buffer.max_line_units() as f32 * cw_max;
-        let content_w_px = if raw_max_w <= harea_w {
-            harea_w
-        } else {
-            (raw_max_w / HSCROLL_QUANTUM_PX).ceil() * HSCROLL_QUANTUM_PX
-        };
+        let content_w_px = raw_max_w.max(harea_w);
         self.content_w_px = content_w_px;
         // 内容变短（量程缩小时）把 `h_handle` 夹回新量程（O(1)）——删除长内容后
         // 横向滚动位置不再停在旧更远处的空白处。ScrollableElement 布局也会夹，
-        // 这里显式夹一遍即时生效。
+        // 这里显式夹一遍即时生效（本帧容器即将按新 `content_w_px` 布局，用当前值
+        // 夹最及时；量程口径与实测 `h_handle.max_offset().x` 一致）。
         let cur_px = self.hscroll_px();
         let max_px = (content_w_px - harea_w).max(0.);
         if cur_px > max_px + 1.0 {
@@ -472,6 +466,9 @@ fn attach_input_actions(
         .on_mouse_down(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_down))
         .on_mouse_move(window.listener_for(entity, CodeEditor::on_mouse_move))
         .on_mouse_up(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_up))
+        // 拖出元素/窗口外松开（Capture 阶段、`!is_hovered`）→ 同样收口拖选态，防
+        // `dragging` 残留（拖选生命周期终点之一，见 CodeEditor::cancel_mouse_drag）。
+        .on_mouse_up_out(MouseButton::Left, window.listener_for(entity, CodeEditor::on_mouse_up_out))
         // —— 输入 action（keymap 由 crate::actions::bind_input_keys 在 "Input" 上下文绑定，
         // 与菜单分发（dispatch_action Undo/Cut/…）共用同一套 handler ——
         .on_action(window.listener_for(entity, |ed: &mut CodeEditor, _: &MoveLeft, _w, cx| {
@@ -730,8 +727,9 @@ pub(crate) fn merge_highlights(
     out
 }
 
-/// 把 `text` 上的一组样式段钳到 UTF-8 **字符边界**内（镜像预览
-/// `markdown::view::row::char_align_range`）、钳入行尾，空段丢弃，并保持段间**互不
+/// 把 `text` 上的一组样式段钳到 UTF-8 **字符边界**内（向前进位 + 钳入行尾，基元
+/// [`crate::util::char_align_byte`]，与预览 `markdown::view::row::char_align_range`、
+/// WYSIWYG `shape::runs_to_text_runs` 三处合一）、空段丢弃，并保持段间**互不
 /// 重叠递增**（起点取 `max(对齐起点, 上一段终点)`、按 start 排序）。
 ///
 /// 必要性：`StyledText::with_highlights` 在 gpui `elements/text.rs` 里有
@@ -744,22 +742,13 @@ pub(crate) fn char_align_highlights(
     text: &str,
     highlights: &[(Range<usize>, HighlightStyle)],
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    let len = text.len();
-    // 向前进位吸收到最近的字符边界（同预览 `char_align_range`），再钳入行尾。
-    let align = |mut p: usize| -> usize {
-        p = p.min(len);
-        while p < len && !text.is_char_boundary(p) {
-            p += 1;
-        }
-        p
-    };
     let mut sorted: Vec<&(Range<usize>, HighlightStyle)> = highlights.iter().collect();
     sorted.sort_by_key(|(r, _)| (r.start, r.end));
     let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(sorted.len());
     let mut cursor = 0usize;
     for (r, style) in sorted {
-        let s = align(r.start).max(cursor);
-        let e = align(r.end).max(s);
+        let s = crate::util::char_align_byte(text, r.start).max(cursor);
+        let e = crate::util::char_align_byte(text, r.end).max(s);
         if e <= s {
             continue;
         }

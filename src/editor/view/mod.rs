@@ -167,18 +167,10 @@ pub struct CodeEditor {
     visible_chars: usize,
     gutter_chars: usize,
     gutter_width_px: Pixels,
+    /// 横向内容宽（px，Buffer O(1) 精确，不量化）：驱动 `harea` 容器/`h_handle`
+    /// 布局量程的唯一真源。横向滚动条读取实测 `h_handle.max_offset().x`（= 本宽 −
+    /// 文本区可视宽），二者同源且一致——不再有「估算 + 64px 量化」的第二份量程。
     content_w_px: f32,
-    /// 上次 render 时列表元素的布局宽（px）：gpui 按「宽度变化」清空 size_hint。
-    /// 用「宽度是否仍在变」替代纯 120ms 墙钟去抖——后者会在打开/换宽后的 120ms 内
-    /// 挡住自愈重挂（此时量程坍缩，立刻拖滚动条会拖不到底）。
-    last_list_width: f32,
-    uniform_applied: Option<Pixels>,
-    /// 统一高度提示最近一次重挂时间（节流：gpui 换宽会清空 size_hint，
-    /// 导致量程坍缩，检测到坍缩后重挂，但同一时间窗口内至多重挂一次）。
-    last_uniform_apply: Option<std::time::Instant>,
-    /// 是否已观察过一次「量程健康」帧。健康后才启用 120ms 重挂冷却；
-    /// 从未健康（首帧/新文档/紧跟其后的换宽坍缩）时不冷却，立即自愈。
-    hint_healthy: bool,
 
     // —— 主题色快照 ——
     bg: Hsla,
@@ -284,10 +276,6 @@ impl CodeEditor {
             gutter_chars: 3,
             gutter_width_px: px(0.),
             content_w_px: 0.,
-            last_list_width: 0.,
-            uniform_applied: None,
-            last_uniform_apply: None,
-            hint_healthy: false,
             bg: rgb(0xffffff).into(),
             fg: rgb(0x000000).into(),
             gutter_fg: rgb(0x9aa0a6).into(),
@@ -392,8 +380,9 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         // 整篇替换 = 文档在光标下被换掉：任何进行中的鼠标拖选都失去意义，一并取消。
         // （否则 `set_text` 只收拢选区、却残留 `dragging=true`，宿主切回视图后仅移动
-        // 鼠标就从 anchor=0 自动扩选——见 app::tests::*wysiwyg_toggle_off* 回归。）
-        self.dragging = false;
+        // 鼠标就从 anchor=0 自动扩选——见 app::tests::*wysiwyg_toggle_off* 回归。
+        // 走统一生命周期钩子，与 on_mouse_up/on_blur/on_mouse_up_out 同一复位语义。）
+        self.cancel_mouse_drag();
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
@@ -487,12 +476,6 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_list_state(&self) -> ListState {
         self.list_state.clone()
-    }
-
-    /// 测试/诊断：最近一次 render 记录的列表布局宽（px）。
-    #[cfg(test)]
-    pub(crate) fn test_last_list_width(&self) -> f32 {
-        self.last_list_width
     }
 
     /// 固定窗口虚拟化：列表始终是就绪的固定窗口（无两段式中间态），恒 false。
@@ -729,7 +712,6 @@ impl CodeEditor {
         self.row_count = new_n;
         let t = std::time::Instant::now();
         self.list_state.reset(LIST_WINDOW_ROWS);
-        self.uniform_applied = None;
         self.pixel_scroll = true;
         self.window_base = 0;
         self.desired_scroll.set(0.);
@@ -790,97 +772,6 @@ impl CodeEditor {
         self.scan_dirty_edit = self.scan_dirty_edit || self.row_count != prev_rows || has_bracket;
         crate::prof::end("ed.apply_sync", _t_apply);
         edit
-    }
-
-    /// 统一高度的量程提示：仅在行高/条目结构变化后重挂（避免每帧 O(n)）。返回
-    /// `true` 表示「本轮应用了统一高度提示」——调用方应 `cx.notify()` 请求多画一帧：
-    /// gpui 在**本次布局**（prepaint 按 `last_layout_bounds` 宽度比对）会再次清掉刚填的
-    /// size_hint，只有下一帧宽度对齐后才不会被清，提示才真正生效（与 Markdown 预览
-    /// `update_height_hint` 的「换宽自愈」同一手法）。量程健康/冷却中返回 `false`。
-    ///
-    /// gpui 在「宽度变化」时会把 ListState 所有条目的 `size_hint` 清空（未测
-    /// 条目高度按 0 计）→ `max_offset_for_scrollbar()` 坍缩，滚动条量程随之
-    /// 失真（表现为“内容长但滚动条极短/拖动失效”）。这里在**每次渲染**用
-    /// O(1) 读摘要判断量程是否坍缩，坍缩则重挂提示；健康时清掉重挂痕迹，
-    /// 保证换宽后的首次坍缩立即重挂；连续坍缩风暴（拖分屏）120ms 至多重挂一次
-    /// （`with_uniform_item_height` 是 O(n) SumTree 物化，不能每帧跑）。
-    fn ensure_uniform_hint(&mut self) -> bool {
-        if !self.metrics_ready {
-            return false;
-        }
-        // 像素两段式（pixel_scroll）：条目不预铺 uniform，量程由像素滚动 + 确定性
-        // ScrollbarHandle 承担，不存在 summary 坍缩问题——不要触发任何 O(N) 重铺。
-        if self.pixel_scroll {
-            return false;
-        }
-        let n = self.list_state.item_count();
-        if n == 0 {
-            return false;
-        }
-        let lh = self.line_height.as_f32();
-        let expected = n as f32 * lh.max(1.);
-        let content_h = self.list_state.max_offset_for_scrollbar().y.as_f32()
-            + self.list_state.viewport_bounds().size.height.as_f32();
-        // 量程坍缩：未测条目把总高压到远低于预期（<97%）。
-        let undercount = expected > 0. && content_h < expected * 0.97;
-
-        if !undercount {
-            // 量程健康：记录「已健康」，抹掉重挂痕迹。
-            self.hint_healthy = true;
-            self.last_uniform_apply = None;
-            if self.uniform_applied == Some(self.line_height) {
-                return false;
-            }
-            self.apply_uniform_hint();
-            return true;
-        }
-
-        // 坍缩：宽度变化把 size_hint 清了 → 重挂整棵 SumTree（O(n)）。
-        // 去抖只针对「宽度仍在连续变化」（拖分屏，刚重挂就被同帧 prepaint 清掉，
-        // 每帧 O(n) 会卡）：用列表自身布局宽 `last_list_width`（即 gpui 判断是否清空的
-        // 那个宽度）是否在变来判断。**宽度安定后坍缩立即重挂**——不再依赖 120ms 墙钟
-        // 冷却，避免打开/换宽后的 ~120ms 内量程坍缩、立刻拖滚动条拖不到底。
-        let list_w = self.list_state.viewport_bounds().size.width.as_f32();
-        let width_active = (self.last_list_width - list_w).abs() >= 2.0;
-        self.last_list_width = list_w;
-        if self.hint_healthy
-            && width_active
-            && self
-                .last_uniform_apply
-                .is_some_and(|t| t.elapsed().as_millis() < 120)
-        {
-            return false;
-        }
-
-        self.apply_uniform_hint();
-        true
-    }
-
-    /// 重挂统一行高提示。**必须用 `reset_with_uniform_height` 强制重铺**：它先
-    /// `reset`（splice 成全 None）再统一填高，覆盖任何陈旧 size_hint——gpui 布局会把
-    /// 窗口外条目戳上陈旧的小 `Some` 戳值，`with_uniform_item_height` 的
-    /// `unwrap_or` 会保留它们 → 量程永远恢复不上（实测大文档摘要总高被卡死在 ~视口）。
-    /// 滚动位置先保存再恢复（reset 会清零滚动顶）。
-    fn apply_uniform_hint(&mut self) {
-        let t = std::time::Instant::now();
-        let prev = self.list_state.logical_scroll_top();
-        let n = self.list_state.item_count();
-        self.list_state
-            .reset_with_uniform_height(n, self.line_height);
-        self.list_state.scroll_to(prev);
-        self.uniform_applied = Some(self.line_height);
-        self.last_uniform_apply = Some(std::time::Instant::now());
-        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-            let vb = self.list_state.viewport_bounds();
-            eprintln!(
-                "[MD_OPEN_DEBUG] 编辑器 reset_with_uniform_height({n} 行): {} ms 摘要总高={:.1} viewport_w={:.1} content_w={:.1}",
-                t.elapsed().as_millis(),
-                self.list_state.max_offset_for_scrollbar().y.as_f32()
-                    + self.list_state.viewport_bounds().size.height.as_f32(),
-                vb.size.width.as_f32(),
-                self.content_w_px,
-            );
-        }
     }
 
     fn visible_chars_from_width(&self, width_px: f32) -> usize {
@@ -1284,9 +1175,11 @@ impl CodeEditor {
     }
 
     /// 按像素横向滚动（容器滚到底/顶自动夹紧），并同步 `hscroll_cols`。
-    /// `view_w` = 文本区可视宽（编辑区宽 − 行号列宽），`content_w_px` 也按文本区计。
-    /// 亚格增量（<半格）直接丢弃：部分鼠标滚轮带轻微水平分量/倾斜轮噪声，若每帧
-    /// 量化成整格会令内容（行号右缘）左右跳一格、看起来像在“晃”。
+    /// 量程 = 容器**实测** `h_handle.max_offset().x`（= `content_w_px` − 文本区可视宽，
+    /// 与横向滚动条读取同一真源；上一帧布局值，下一帧 read-back 对齐，同竖向量程
+    /// `reach_px` 的确定性口径）。亚格增量（<半格）直接丢弃：部分鼠标滚轮带轻微
+    /// 水平分量/倾斜轮噪声，若每帧量化成整格会令内容（行号右缘）左右跳一格、
+    /// 看起来像在“晃”。
     fn scroll_horizontal_px(&mut self, dx_px: f32) {
         let cw = self.char_width.as_f32().max(1.);
         if dx_px.abs() < cw * 0.5 {
@@ -1296,9 +1189,7 @@ impl CodeEditor {
         if !crate::prof::op_pending() {
             crate::prof::op_start("ed_scroll");
         }
-        let view_w = (self.element_bounds.size.width.as_f32() - self.gutter_width_px.as_f32())
-            .max(0.);
-        let max_px = (self.content_w_px - view_w).max(0.);
+        let max_px = self.h_handle.max_offset().x.as_f32().max(0.);
         let cur_px = (-self.h_handle.offset().x.as_f32()).clamp(0.0, max_px);
         let target_px = (cur_px + dx_px).clamp(0.0, max_px);
         let cols = (target_px / cw).round() as usize;
@@ -1535,6 +1426,10 @@ impl CodeEditor {
 
     fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.focused = false;
+        // 失焦 = 编辑器离开活动态：进行中的鼠标拖选失去意义，随生命周期一并复位。
+        // 拖选只依赖「按下 → 移动」；松开/失焦/切走任一中断拖拽闭环都不能留
+        // `dragging` 残留（收敛到统一生命周期钩子，见 [`Self::cancel_mouse_drag`]）。
+        self.cancel_mouse_drag();
         self.undo.set_cooperative(false);
         self.marked_range = None;
         cx.emit(EditorEvent::Blur);
@@ -1596,7 +1491,7 @@ impl CodeEditor {
             let logical = self.folds.logical_row(vis);
             if self.has_fold_or_candidate(logical) {
                 self.toggle_fold_at(logical);
-                self.dragging = false;
+                self.cancel_mouse_drag();
                 return;
             }
         }
@@ -1636,17 +1531,29 @@ impl CodeEditor {
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.dragging = false;
+        self.cancel_mouse_drag();
     }
 
-    /// 复位鼠标拖选状态（仅清 `dragging`，不动光标/选区）。
+    /// 松开点落在元素 hitbox 外 / 顶层叠层 / 窗口外：元素级 `on_mouse_up`（受
+    /// `hitbox.is_hovered` 门控）不会派发，本钩子在 Capture 阶段无条件收口拖选态
+    /// （对齐本仓 scrollbar / video / image / wysiwyg 的 `on_mouse_up_out` 拖拽清态惯例）。
+    fn on_mouse_up_out(&mut self, _event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.cancel_mouse_drag();
+    }
+
+    /// 生命周期钩子：编辑器即将「失焦 / 隐藏 / 宿主切换」时统一复位鼠标拖选态
+    /// （仅清 `dragging`，不动光标 / 选区，不改变交互模型、不改键位）。
     ///
-    /// 宿主在「视图切换 / 整篇写回」边界调用：点菜单项时 GPUI 会把这个 MouseDown 按
-    /// `hitbox.is_hovered` 漏进编辑区（不按 z-order 裁掉被菜单遮挡的区间）置
-    /// `dragging=true`，而对应的 MouseUp 又常被菜单项 `activate` 的 `stop_propagation`
-    /// 截断派发、到不了 `on_mouse_up` → `dragging` 残留。切回编辑/预览后仅移动鼠标
-    /// 就会从 anchor 自动扩选，故在进入/退出这类视图前必须显式清掉。
-    pub(crate) fn reset_mouse_drag(&mut self) {
+    /// 拖选态生命周期：`on_mouse_down` 置位 → `on_mouse_up` / `on_mouse_up_out` /
+    /// `on_blur` / 整篇写回（`reset_document`）/ 宿主切离 任一终点复位，散落清位全部
+    /// 收敛到本钩子（宿主在编辑区被切离 / 隐藏的正确时机触发），取代历史 P4 的
+    /// 「调用点散落清位」补丁。
+    ///
+    /// 背景（P4）：点菜单项时 GPUI 把鼠标按下按 `hitbox.is_hovered` 漏进编辑区（不按
+    /// z-order 裁掉被菜单遮挡的区间）置 `dragging=true`；对应的 MouseUp 又被菜单项
+    /// `activate` 的 `stop_propagation` 截断派发、到不了 `on_mouse_up` → `dragging`
+    /// 残留，切回后仅移动鼠标就从 anchor 自动扩选。
+    pub(crate) fn cancel_mouse_drag(&mut self) {
         self.dragging = false;
     }
 

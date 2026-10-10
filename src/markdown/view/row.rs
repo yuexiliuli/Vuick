@@ -224,18 +224,11 @@ fn merge_highlights(
 /// 把字节区间边界逐一吸收到最近的**字符边界**（向前进位），防止多字节字符
 /// （CJK/emoji）被切半——任何非对齐偏移都会在 shaping 时崩（direct_write
 /// panic on non-char-boundary）。空/越界安全；区间可能缩小为 0 长（返回同边界）。
-pub(crate) fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> {
-    let len = text.len();
-    let mut start = range.start.min(len);
-    while start < len && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    let mut end = range.end.min(len);
-    while end < len && !text.is_char_boundary(end) {
-        end += 1;
-    }
-    start..end
-}
+///
+/// M1.1-P5 起实现收敛到共享基元 [`crate::util::char_align_byte`]（与 WYSIWYG
+/// `shape::runs_to_text_runs`、源码编辑器 `render::char_align_highlights` 三处合一），
+/// 此处保留 `pub(crate)` 路径重导出，既有调用点与本模块测试不变。
+pub(crate) use crate::util::char_align_range;
 
 /// 行内文本子元素（统一入口）：按需要构建 [`StyledText`]（行内样式/搜索高亮/
 /// 选区高亮/引用标记着色+跳转加亮），再包一层 [`TextTrack`]——paint 阶段把文本

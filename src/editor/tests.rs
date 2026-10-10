@@ -1631,6 +1631,51 @@ fn mouse_drag_selects_across_rows_rust_vs_plain(cx: &mut TestAppContext) {
     }
 }
 
+/// 回归（拖选生命周期终点之一，场景 c）：**拖到元素/窗口外松开**时元素级
+/// `on_mouse_up`（受 `hitbox.is_hovered` 门控）不会派发——必须由 Capture 阶段的
+/// `on_mouse_up_out` 复位 `dragging`，否则残留拖选态会让「后续仅移动鼠标」继续把
+/// 选区从 anchor 一路拉长（与 P4 菜单项 `stop_propagation` 截断 MouseUp 同源）。
+#[gpui::test]
+fn mouse_drag_released_outside_does_not_extend_on_next_move(cx: &mut TestAppContext) {
+    let text = "fn main() {\n    let s = \"hello\";\n    // 注释\n    let t = 1;\n}\n";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (_, lh, gutter) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let x1 = cx.update(|window, cx| {
+        px(gutter + ed.read(cx).test_char_boundary_x(window, 0, 2))
+    });
+    let x2 = cx.update(|window, cx| {
+        px(gutter + ed.read(cx).test_char_boundary_x(window, 2, 3))
+    });
+    let y1 = px(lh * 0.5);
+    let y2 = px(lh * 2.5);
+    let mods = Modifiers::default();
+    // 编辑区内按下 → 拖到第 3 行 → 形成跨行选区（此时 dragging=true）。
+    cx.simulate_mouse_move(point(x1, y1), MouseButton::Left, mods);
+    cx.simulate_mouse_down(point(x1, y1), MouseButton::Left, mods);
+    cx.simulate_mouse_move(point(x2, y2), MouseButton::Left, mods);
+    settle(cx);
+    let extended = editor_selection(&host, cx);
+    assert!(!extended.is_collapsed(), "拖选应已形成选区：{extended:?}");
+    // 在远离编辑区/窗口的「窗口外」松开：元素级 on_mouse_up（hitbox 门控）不派发，
+    // 走 on_mouse_up_out 复位拖选态。
+    let far = point(px(-1000.), px(-1000.));
+    cx.simulate_mouse_up(far, MouseButton::Left, mods);
+    settle(cx);
+    // 之后仅移动鼠标（不按任何键）到文档更深处：拖选态已复位 → 不得再把选区拉长。
+    let far_in = point(x2, px(lh * 3.5));
+    cx.simulate_mouse_move(far_in, MouseButton::Left, mods);
+    settle(cx);
+    let after = editor_selection(&host, cx);
+    assert_eq!(
+        (after.range().start, after.range().end),
+        (extended.range().start, extended.range().end),
+        "窗口外松开后仅移动鼠标不得继续扩选：{extended:?} → {after:?}"
+    );
+}
+
 #[gpui::test]
 fn caret_image_is_laid_out_when_focused(cx: &mut TestAppContext) {
     let (host, cx) = open(cx, "abc\nxyz");
@@ -1900,6 +1945,73 @@ fn hscroll_max_shrinks_after_deleting_widest_content(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn hscroll_range_is_exact_not_quantized_and_reaches_content_end(cx: &mut TestAppContext) {
+    // 回归（P7 治本）：历史补丁把横向量程按 64px 向上量化（每 ~8 字符一档），量程
+    // 最多比真实内容宽多 63px → 滚到“真底”后内容右缘停在可视区末端左侧一段空白，
+    // 且最宽行末尾输入要依赖「64px 量化 + 120ms 冷却」量程才不坍缩。
+    // 现状：量程 = 容器**实测** `h_handle.max_offset().x` =（Buffer O(1) 精确的最宽行
+    // 宽 − 文本区可视宽），不量化、无浮余：滚到最右恰好露出内容右缘（不缺内容），
+    // 量程随最宽行逐字符精确变化（无 64px 一档突跳、不闪烁）。
+    let text = "x".repeat(400) + "\n短行";
+    let (host, cx) = open(cx, &text);
+    focus(&host, cx);
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let cw = cx.update(|_, cx| ed.read(cx).test_metrics().0).max(1.0);
+    // 用实际布局出的文本区可视宽（`ce-harea` = 编辑区宽 − 行号列宽）做基准，
+    // 不依赖测试窗硬编码宽度。
+    let harea_w = cx
+        .debug_bounds("ce-harea")
+        .expect("文本区容器应渲染")
+        .size
+        .width
+        .as_f32();
+    let expected_exact = (400.0 * cw).max(harea_w) - harea_w;
+    assert!(expected_exact > 0., "超宽行应撑起横向量程（expected={expected_exact:.1}）");
+    let max_x = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    assert!(
+        (max_x - expected_exact).abs() < 2.0,
+        "横向量程应等于真实内容宽−可视宽（无 64px 量化上浮）：max={max_x:.1} 精确={expected_exact:.1}"
+    );
+    // 滚到最右（真实轮齿距事件）→ 应停在量程末端：内容右缘恰好落在可视区右缘
+    // （旧量化会留下一段空白：right=可视−63px）。
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑器应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + 30.),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(1_000_000.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(cx);
+    let h = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(
+        (h - max_x).abs() < 4.0,
+        "滚到最右应停在量程末端（h={h:.1} max={max_x:.1}）"
+    );
+    let right = 400.0 * cw - h;
+    assert!(
+        (right - harea_w).abs() < 8.0,
+        "滚到底后内容右缘应恰好落在可视区右缘（right={right:.1} harea_w={harea_w:.1}）；旧 64px 量化会留下大段空白"
+    );
+    // 最宽行末尾继续输入：量程应逐字符精确增长（= 10×格宽），不是 64px 一档突跳。
+    ed.update(cx, |ed, _| ed.set_caret_to(400));
+    for _ in 0..10 {
+        ed.update(cx, |ed, cx| ed.insert_text("x", cx));
+    }
+    settle(cx);
+    let max2 = cx.update(|_, cx| ed.read(cx).test_hscroll_max_px());
+    let grown_exact = expected_exact + 10.0 * cw;
+    assert!(
+        (max2 - grown_exact).abs() < 3.0,
+        "最宽行末尾打字量程应逐字符精确增长（max2={max2:.1} expected={grown_exact:.1}）"
+    );
+}
+
+#[gpui::test]
 fn click_near_line_start_keeps_horizontal_scroll(cx: &mut TestAppContext) {
     // 回归（用户实测）：点击行首/前几个字符曾把内容强行拉去最左（内容左右晃动）。
     // 根因：鼠标点击也走 `reveal_caret` 的横向 margin 规则（col<margin → hscroll=col）。
@@ -2007,9 +2119,12 @@ fn hscroll_bar_max_tracks_content_growth(cx: &mut TestAppContext) {
 #[gpui::test]
 fn vertical_range_stays_healthy_while_typing_in_widest_line(cx: &mut TestAppContext) {
     // 回归（用户实测）：在最宽长行末尾持续输入时，纵向滚动条“突然变长又变短”。
-    // 根因：内容宽逐键变化 → gpui List 布局宽度变化时清空全部 size_hint → 纵向量程
-    // 坍缩；`ensure_uniform_hint` 的 120ms 冷却阻止持续打字时自愈（量程一直缩成极小）。
-    // 修复：内容宽按 64px 向上量化，只在每 ~8 字符才变化一次，冷却期间即可自愈。
+    // 旧根因：内容宽逐键变化 → gpui List 布局宽度变化时清空全部 size_hint →
+    // 依赖 `max_offset_for_scrollbar()` 的量程坍缩，`ensure_uniform_hint` 的 120ms
+    // 冷却又会阻止持续打字时的自愈（量程一直缩成极小）；曾用「64px 量化」临时绕开。
+    // 现状（P7 治本）：纵向量程 = 确定性像素模型（`list_max_offset` = 全文行数 ×
+    // 行高 − 视口），与 gpui 换宽清 size_hint 无关；量程恒健康，**无需冷却、无需
+    // 量化**——持续输入最宽行末尾，量程立即正确（也无需 sleep 等自愈）。
     let mut text = "x".repeat(10000);
     for i in 1..=500 {
         text.push_str(&format!("\nline{i}"));
@@ -2022,14 +2137,12 @@ fn vertical_range_stays_healthy_while_typing_in_widest_line(cx: &mut TestAppCont
     assert!(healthy > 6000., "初始纵向量程应健康（{healthy}）");
     // 光标移到最宽行（第 1 行）末尾
     ed.update(cx, |ed, _| ed.set_caret_to(10000));
-    // 持续输入 80 字符（跨多个 64px 桶）
+    // 持续输入 80 字符（跨大量 64px 粒度）：量程必须始终健康（无坍缩、无冷却期）。
     for _ in 0..80 {
         ed.update(cx, |ed, cx| ed.insert_text("x", cx));
         settle(cx);
     }
-    // 补一拍冷却，确认自愈而非一直坍缩
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    settle(cx);
+    // 立即断言（不等任何冷却）——确定性量程随内容即时正确。
     let after = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
     assert!(after > 6000., "持续输入后纵向量程应保持健康（{after}）");
 }
@@ -2065,37 +2178,24 @@ fn reveal_keeps_caret_visible_while_typing_in_long_line(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
-    // 回归（2026-09-15 实机）：gpui 在宽度变化时清空全部 size_hint，
-    // 未测条目高度按 0 计 → `max_offset_for_scrollbar()` 坍缩，滚动条量程失真。
-    // 编辑器应在坍缩后重挂统一高度提示，量程不被换宽清掉。
-    //
-    // 注：横向内容宽度跟随窗口宽（短文档 content=avail_w），短文档每次换宽都会
-    // 触发 List 重测；`ensure_uniform_hint` 的 120ms 风暴冷却（防拖分屏每帧 O(n)）
-    // 用真实墙钟计。因此两次 resize 之间要留出冷却窗口，模拟真实人类换窗节奏
-    // （0.12s 内的连发 resize 属于“拖拽风暴”，量程暂时性失真本就是冷却的取舍）。
+    // 回归（2026-09-15 实机）：gpui 在宽度变化时清空全部 size_hint，未测条目高度按
+    // 0 计 → 依赖 `max_offset_for_scrollbar()` 的量程坍缩、滚动条量程失真。
+    // 现状（P7 治本）：纵向量程 = 确定性像素模型（`list_max_offset` = 全文行数 ×
+    // 行高 − 视口），与 gpui 换宽清 size_hint **无关**；已删除 `ensure_uniform_hint`
+    // 的 120ms 换宽冷却——换宽后量程**立即**健康，无需等冷却自愈。
     let text = (1..=300)
         .map(|i| format!("第{i}行"))
         .collect::<Vec<_>>()
         .join("\n");
     let (host, cx) = open(cx, &text);
-    // 横向内容宽度跟随窗口宽（短文档 content=avail_w），换宽会让 gpui List 在
-    // prepaint 里清空全部 size_hint → 量程坍缩；`ensure_uniform_hint` 重挂统一高度
-    // 会自愈，但其 120ms 风暴冷却（防拖分屏每帧 O(n)）用真实墙钟计，且换宽那一帧
-    // 的 heand 会被同帧 prepaint 再次抹掉。因此每轮换宽后以「等冷却→重渲染」循环
-    // 直到量程恢复，断言的是「换宽后量程最终自愈」而非瞬时（连发 resize 属拖拽风暴，
-    // 瞬时失真本就是冷却的取舍）。
+    // 横向内容宽度跟随窗口宽（短文档 content=avail_w），换宽让 gpui List 清空全部
+    // size_hint 也无所谓——量程是确定性 `reach_px`，resize 落定即正确（不等冷却）。
     fn reflow_and_assert(host: &Entity<Host>, cx: &mut VisualTestContext, w: f32) -> f32 {
         cx.simulate_resize(size(px(w), px(600.)));
-        let mut m = 0.0;
-        for _ in 0..8 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            settle(cx);
-            m = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
-            if m > 1000. {
-                break;
-            }
-        }
-        assert!(m > 1000., "换宽后量程应在冷却后自愈（m={m:.1} w={w}）");
+        // 多 pump 几帧等 viewport_bounds 布局落定，但不 sleep：无冷却可等。
+        settle(cx);
+        let m = cx.update(|_, cx| host.read(cx).ed.read(cx).list_max_offset());
+        assert!(m > 1000., "换宽后量程应立即健康（m={m:.1} w={w}）");
         m
     }
     let mut last_max = reflow_and_assert(&host, cx, 300.);
@@ -2103,7 +2203,7 @@ fn scroll_range_survives_width_change(cx: &mut TestAppContext) {
         last_max > 1000.,
         "首次渲染量程应接近 300 行（last_max={last_max:.1}）"
     );
-    // 再换两次宽 → 应自愈，量程保持。
+    // 再换两次宽 → 量程保持健康（无冷却依赖）。
     for w in [440., 520.] {
         last_max = reflow_and_assert(&host, cx, w);
     }

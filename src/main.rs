@@ -27,6 +27,7 @@ mod scrollbar;
 mod syntax;
 mod toc;
 mod ui;
+mod util;
 
 #[cfg(feature = "video")]
 mod video;
