@@ -2121,6 +2121,12 @@ impl WyEditor {
         if ev.button != gpui::MouseButton::Left {
             return;
         }
+        // 任何新左键按下都先清残留的图片调整条拖拽：上次松开若落在元素/顶层叠层外，
+        // 元素级 `on_mouse_up`（受 `hitbox.is_hovered` 门控）未被派发 → 状态残留，
+        // 之后「仅移动鼠标 / 点图片外」就会误触发 `apply_image_resize` 突然改宽。
+        // 这里一进 `mouse_down` 就清干净；若本次按下命中调整条，后面的 `begin_image_resize`
+        // 会重新建立（全新一次拖拽，抓取点/起始宽都不带旧状态）。
+        self.end_image_resize();
         // 输入命中前保证帧存在（缺帧当场重建，避免展开后立刻再点折叠时命中落空）。
         if !self.ensure_frame_for_input(window) {
             return;
@@ -2309,6 +2315,14 @@ impl WyEditor {
     /// 拖拽中（左键已按下）。
     pub(crate) fn on_mouse_move(&mut self, ev: &gpui::MouseMoveEvent, cx: &mut Context<Self>) {
         // 图片调整条拖拽优先：按住条 → 随鼠标横向改宽（不参与选区拖选/悬浮）。
+        // ⚠️ 不再做 `pressed_button == Some(Left)` 门控：`image_resize_drag` 只在真实
+        // 「按下命中句柄」的 `on_mouse_down` 里置位，松开/新按下由四条边界统一清位
+        //（元素内 `on_mouse_up` + 元素外 `on_mouse_up_out` + 窗口级 `on_window_mouse_up`
+        // + 任何新左键 `on_mouse_down` 顶部），状态自身即「本帧正在拖」的事实来源。
+        // 若再依赖平台按钮标志，Windows 上**第一次**拖拽经窗口级兜底路径的 move 拿不到
+        // 该标志（GPUI 派发到元素/窗口监听时标志首拍并不可靠）→ 首拖整段不 apply =
+        // 「第一次拖动无效、点别处才一次性应用」（用户真机复验症状）。去掉后首拖即跟手，
+        // 而「松开/点外后纯移动不改宽」仍由上述边界闭环保证（不依赖平台标志的可靠性）。
         if self.image_resize_drag.borrow().is_some() {
             self.apply_image_resize(ev.position.x, cx);
             return;
@@ -2372,6 +2386,9 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         // 图片调整条拖拽优先（顶层叠层会吞元素级 move，拖动期间走这里兜底）。
+        // 与元素级 `on_mouse_move` 同款语义：不依赖 `pressed_button`（首拖经此窗口级
+        // 路径时该标志不可靠，见 `on_mouse_move` 注释）；「松开/点外后纯移动不改宽」
+        // 由 `end_image_resize` 四条边界闭环保证。
         if self.image_resize_drag.borrow().is_some() {
             self.apply_image_resize(ev.position.x, cx);
             return;
@@ -2627,6 +2644,22 @@ impl WyEditor {
         *self.table_h_drag.borrow_mut() = None;
         *self.math_h_drag.borrow_mut() = None;
         cx.notify();
+    }
+
+    /// **窗口级鼠标松开兜底**（元素 paint 期 `window.on_mouse_event` 注册，无 hover 门控）：
+    /// 松开点落在元素 `hitbox` 外 / 顶层叠层上 / 窗口外时，元素级 `on_mouse_up`（受
+    /// `hitbox.is_hovered` 门控）不会被派发 → 图片调整条拖拽状态残留，后续任何移动都会
+    /// 触发 `apply_image_resize` 突然改宽。这里无论指针在哪、不读帧几何，只要有 MouseUp
+    /// 就无条件清掉残留的调整条拖拽（与元素级 `on_mouse_up` / `on_mouse_up_out` 重复执行
+    /// 幂等）。⚠️ 只清图片调整条：拖选/选区由元素级 `on_mouse_up` 管理（窗口级这里绕过
+    /// hover 门控，碰选区会与元素级重复/错序）。同时被元素级 `on_mouse_up_out`（元素外
+    /// 松开，Capture 阶段）复用，形成「松开/新按下」四条清态边界：
+    /// `on_mouse_down` 顶部 + 元素内 `on_mouse_up` + 元素外 `on_mouse_up_out` + 本窗口级。
+    pub(crate) fn on_window_mouse_up(&mut self, cx: &mut Context<Self>) {
+        if self.image_resize_drag.borrow().is_some() {
+            self.end_image_resize();
+            cx.notify();
+        }
     }
 
     /// 滚轮：**仅在光标悬停在 mermaid 卡片上时**拦截（普通滚轮 = 整卡缩放），其余位置
@@ -3337,6 +3370,10 @@ impl WyEditor {
     pub(crate) fn set_image_size(&self, src: SharedString, size: Option<(f32, f32)>) {
         let changed = self.image_sizes.borrow().get(&src).copied() != Some(size);
         if changed {
+            // 尺寸代换代：定向作废含该图的整形行（目标行缓存命中判据 = `block_content_id
+            // ^ (width_bits ^ zgen)`，不含 `images_gen`——不主动作废，重建帧就会命中旧尺寸
+            // 的整形行 → 图片按旧占位高/旧 `img.w` 画。见 `invalidate_image_row_cache`）。
+            self.invalidate_image_row_cache(&src);
             self.image_sizes.borrow_mut().insert(src, size);
             self.images_gen.set(self.images_gen.get().wrapping_add(1));
         }
@@ -3361,9 +3398,65 @@ impl WyEditor {
             )
             .max(1.);
         if self.image_widths.borrow().get(&src).copied() != Some(clamped) {
+            // 宽换代：定向作废含该图的整形行——**这是拖拽改宽实时跟手的直接前提**。
+            // 行整形缓存命中判据（`frame::build_frame` 的 `shape_key`）不含
+            // `images_gen`，且 `block_content_id` 只含源码文本（拖拽不改源码）→ 若这里
+            // 不作废，`apply_image_resize` 置 `frame=None` 后的重建帧会在 `band_hit_test`
+            // 命中旧宽整形行，paint 仍按旧 `img.w` 画 → 「首拖不跟手、点外/松手才跳」
+            // （真实渲染重宽 921.6 reading-col 恒定，缓存字面命中旧行；测试用视口宽
+            // 1920 恰与阅读栏 921.6 不同键 → 意外 miss 而漏测）。
+            self.invalidate_image_row_cache(&src);
             self.image_widths.borrow_mut().insert(src, clamped);
             self.images_gen.set(self.images_gen.get().wrapping_add(1));
         }
+    }
+
+    /// 图片宽/尺寸变化后，**定向作废**含该 `src` 图片行的行整形缓存条目。
+    ///
+    /// 替代「`images_gen` 进全局 shape_key」：全局键会把整带无关文本块随每幅图 / 每次
+    /// 改宽全量 miss 重排（对齐 code/math 的定向作废惯例——`on_code_parse_ready` /
+    /// `on_math_ready` 同式：src_line → 块 → `block_content_id` → `invalidate_ids`）。
+    ///
+    /// src → 块解析：优先走**当前帧行**（拖拽改宽 / paint 写尺寸时图片必在可视带内，
+    /// O(带内行数)）；帧缺失或 src 不在带内时退化为全块扫描兜底（O(块数)，仅发生在
+    /// 无帧首帧等罕见路径）。
+    fn invalidate_image_row_cache(&self, src: &str) {
+        let mut block_indices: Vec<usize> = Vec::new();
+        if let Some(f) = self.frame.borrow().as_ref() {
+            for row in &f.rows {
+                if let Some(img) = &row.image
+                    && img.src.as_ref() == src
+                {
+                    block_indices.push(self.doc.block_index_for_line(row.src_line));
+                }
+            }
+        }
+        if block_indices.is_empty() {
+            for b in 0..self.doc.block_count() {
+                let Some(m) = self.doc.block_meta(b) else {
+                    continue;
+                };
+                if m.kind != crate::markdown::parse::RowKind::Image {
+                    continue;
+                }
+                let parsed = crate::markdown::parse::parse_image_line(
+                    self.doc.line_str(m.src_line as usize).trim(),
+                )
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+                if parsed == src {
+                    block_indices.push(b);
+                }
+            }
+        }
+        if block_indices.is_empty() {
+            return;
+        }
+        let ids: Vec<u64> = block_indices
+            .iter()
+            .map(|&b| frame::block_content_id(&self.doc, b))
+            .collect();
+        self.shape_rows.borrow_mut().invalidate_ids(&ids);
     }
 
     /// 当前进行中的图片调整条拖拽的 src（测试）。
@@ -3390,6 +3483,10 @@ impl WyEditor {
 
     /// 拖拽中应用新宽：新宽 = `start_w + (mouse_x − grab_x)`（钳制），写回覆写表；
     /// 帧/整形缓存失效 → 图片随鼠标实时缩放（保持宽高比）。
+    ///
+    /// 坐标说明：`grab_x`（按下）与 `mouse_x`（移动）都取 **窗口 x**——两者同空间，
+    /// 差值即鼠标横向位移，天然不受居中阅读栏水平移位（`reading_col_shift`）影响
+    /// （移位在两项里同号抵消；且元素宽与帧宽在拖拽中不变，移位恒定）。
     fn apply_image_resize(&mut self, mouse_x: gpui::Pixels, cx: &mut Context<Self>) {
         let Some(d) = self.image_resize_drag.borrow().clone() else {
             return;
@@ -5393,6 +5490,20 @@ impl gpui::Render for WyEditor {
                      ev: &gpui::MouseUpEvent,
                      _: &mut Window,
                      cx: &mut Context<WyEditor>| { this.on_mouse_up(ev, cx) },
+                ),
+            )
+            // 鼠标**在元素外松开**（Capture 阶段、`!is_hovered`）：拖动到元素外松手时，
+            // 上面的 `on_mouse_up` 受 hitbox 门控不会派发——这里与 `on_window_mouse_up`
+            // 同语义清掉图片调整条拖拽（idempotent：未拖拽时无副作用）。这是「松开后
+            // 纯移动不改宽」四条边界之一（对齐本仓 scrollbar/video/image 的
+            // `on_mouse_up_out` 拖拽清态惯例）。
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(
+                    |this: &mut WyEditor,
+                     _ev: &gpui::MouseUpEvent,
+                     _: &mut Window,
+                     cx: &mut Context<WyEditor>| { this.on_window_mouse_up(cx) },
                 ),
             )
             .child(element::WyEditorElement {

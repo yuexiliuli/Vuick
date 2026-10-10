@@ -12,8 +12,8 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Corners, CursorStyle, DispatchPhase, Edges, Element, ElementId,
     ElementInputHandler, Entity, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, LayoutId, MouseMoveEvent, Pixels, ScrollWheelEvent, SharedString, TextAlign,
-    Window, fill, point, px, relative, size,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, ScrollWheelEvent, SharedString,
+    TextAlign, Window, fill, point, px, relative, size,
 };
 
 /// 行首 gutter 几何常量（paint 与 hit-test 共用，不得分开改）。
@@ -1192,6 +1192,17 @@ impl Element for WyEditorElement {
                 return;
             }
             wzed_hover.update(cx, |e, c| e.on_window_mouse_move(event, c));
+        });
+        // 鼠标松开兜底：元素级 `on_mouse_up` 受 `hitbox.is_hovered` 门控——松开点落在
+        // 元素外 / 顶层叠层（`#live-vscrollbar-overlay`/`#zoom-overlay`）上 / 窗口外时
+        // 不会被派发，图片调整条拖拽状态就会残留（后续移动突然改宽）。跟随上方
+        // mouse-move 同一窗口级注册路径，无 hover 门控、bubble 阶段无条件清残留。
+        let wzed_up = self.editor.clone();
+        window.on_mouse_event(move |_event: &MouseUpEvent, phase, _, cx| {
+            if !matches!(phase, DispatchPhase::Bubble) {
+                return;
+            }
+            wzed_up.update(cx, |e, c| e.on_window_mouse_up(c));
         });
         crate::prof::end("wy.paint", _t_paint);
         // 操作级实时计时结算：本帧若含未结算操作（type/backspace/scroll/open…），

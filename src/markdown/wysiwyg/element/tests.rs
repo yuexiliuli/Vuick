@@ -7455,6 +7455,15 @@ fn img_move(x: f32, y: f32) -> MouseMoveEvent {
         modifiers: Modifiers::default(),
     }
 }
+/// 与 `img_move` 同但标记**左键物理按住**（Windows 后端 `WM_MOUSEMOVE` 携带 MK_LBUTTON
+/// 时 `pressed_button = Some(Left)`）——真实拖拽中的 move 都带这个标记。
+fn img_move_held(x: f32, y: f32) -> MouseMoveEvent {
+    MouseMoveEvent {
+        position: point(px(x), px(y)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    }
+}
 fn img_up(x: f32, y: f32) -> gpui::MouseUpEvent {
     gpui::MouseUpEvent {
         button: MouseButton::Left,
@@ -8113,7 +8122,7 @@ fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
     });
     // 向左拖 60px → 宽缩 60（未触钳制）。
     vcx.update(|_, cx| {
-        let mv = img_move(hx - 60., hy);
+        let mv = img_move_held(hx - 60., hy);
         ed.update(cx, |e, c| e.on_mouse_move(&mv, c));
     });
     let w1 = vcx
@@ -8126,7 +8135,7 @@ fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
     );
     // 拖极右 → 钳到 MAX；拖极左 → 钳到 MIN。
     vcx.update(|_, cx| {
-        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx + 3000., hy), c));
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move_held(hx + 3000., hy), c));
     });
     assert_eq!(
         vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
@@ -8134,7 +8143,7 @@ fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
         "拖到极右应钳到最大宽"
     );
     vcx.update(|_, cx| {
-        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 3000., hy), c));
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move_held(hx - 3000., hy), c));
     });
     assert_eq!(
         vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
@@ -8151,6 +8160,367 @@ fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
     });
     let out = vcx.update(|_, cx| ed.read(cx).content());
     assert_eq!(out, "![独立图片](img测试.png)\n", "拖拽改宽不得改写源码");
+}
+
+/// 回归「首拖不跟手」（用户报告：按住调整条第一次拖动图片宽度不变，先拖一下再点图片
+/// 外/别处尺寸才突然改变）：
+/// 仅断言 `image_width` 覆写表不够——**重建的帧**必须真的按新宽重排图片行。若行整形
+/// 缓存不随图片宽换代失效，`build_frame` 会命中旧整形行（旧 `img.w`），图片仍按旧宽
+/// 画 → 首拖无效果；之后只有某次把它逐出缓存的时机才突然跳到目标宽。
+#[gpui::test]
+fn image_resize_first_drag_reflows_rendered_row(cx: &mut TestAppContext) {
+    use crate::config::markdown::IMAGE_MIN_W;
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("some leading paragraph.\n\n![alt](img测试.png)\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    // 图片位于 src_line 2（**非**光标所在行）——真实场景图片行绝大多数不在光标行，
+    // 整形行会进 `shape_rows` 缓存被复用；若缓存不随宽换代，首拖就会命中旧行。
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .expect("夹具应含独立图片行")
+        .clone();
+    assert_eq!(img.src_line, 2);
+    assert_ne!(
+        vcx.update(|_, cx| ed.read(cx).row_col(ed.read(cx).caret()).0),
+        2,
+        "前置：光标行 ≠ 图片行"
+    );
+    let bb = super::image_box_local(&frame, &img).expect("图片盒");
+    let hb = super::image_resize_handle_local(&bb);
+    let (hx, hy) = (
+        f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+        f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+    );
+    let w0 = img.image.as_ref().unwrap().w;
+    assert!(
+        w0 > IMAGE_MIN_W + 80.,
+        "夹具自然宽应能左拖缩窄（w0={w0}）"
+    );
+    // 首拖：按下调整条 → 向左移 60px。
+    // 故意用**不带按钮标志**的 move（`pressed_button: None`）：真实首拖经窗口级兜底路径
+    // 时该标志并不可靠（旧 `pressed_button` 门控正是因此把首拖整段吞掉 → 首拖无效；点
+    // 别处才一次性应用）。本回归要求首拖自身即生效，不依赖平台按钮标志。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 60., hy), c));
+    });
+    // 覆写表已按新宽写入（既有测试只断言到这里）……
+    let overlay = vcx
+        .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+        .expect("拖拽后应有覆写宽");
+    assert!(
+        (overlay - (w0 - 60.)).abs() < 0.5,
+        "覆写表应记录 {w0} - 60 = {}，实际 {overlay}",
+        w0 - 60.
+    );
+    // ……但**下一帧重建**必须按新宽重新整形图片行：否则命中的是旧整形行（旧 img.w），
+    // 渲染宽度不变 =「第一次拖动无效」。
+    let f2 = vcx.update(|window, cx| build_frame(ed.read(cx), window, px(width), (0., 999_999.)));
+    let img2 = f2
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .expect("重建帧应含图片行");
+    let w1 = img2.image.as_ref().unwrap().w;
+    assert!(
+        (w1 - (w0 - 60.)).abs() < 0.5,
+        "重建帧应按新宽 shape：期望 {} 实际 {w1}（命中旧整形缓存 → 首拖不跟手）",
+        w0 - 60.
+    );
+}
+
+/// 回归「首拖不实时重绘」**真失败条件版**（用户报告：按住调整条第一次拖动，事件层
+/// 每帧 `apply`+`set_image_width` 都执行、宽度覆写表也更新，但屏幕一直不动；点图片外/
+/// 松手后才「跳」到最终宽度；第二次起才实时跟手）。
+///
+/// **为何必须用固定渲染宽**：真实渲染路径（element measure/prepaint）恒定用居中阅读栏
+/// 宽度（`READING_COL_ENABLED`，body 16px → 921.6），每次拖拽重建帧都在同一宽度 →
+/// 行整形缓存**字面命中**旧宽整形行（键 = `block_content_id ^ (width_bits ^ zgen)`，
+/// **不含 `images_gen`**，且 `block_content_id` 只含源码文本、拖拽不改源码）→ 重建帧
+/// 里图片行的 `img.w` 还是旧值 → paint 画旧宽。上面的 `image_resize_first_drag_reflows_
+/// rendered_row` 用 `image_harness` 的**视口宽 1920** 建帧，恰与真实阅读栏 921.6 缓存键
+/// 不同 → 重建意外 miss 而漏测；本测试用**同宽两帧**（宽 921.6），先断言图片行真在缓存
+/// （同宽同带重建必须 0 整形），再拖拽改宽 → 下一帧同宽重建必须按新宽重排。
+///
+/// 失败条件 = 「拖拽改宽后，同宽重建的图片行 `img.w` 仍为旧值」；
+/// 修复 = `set_image_width`/`set_image_size` 里**定向作废**含该图的整形行缓存条目
+/// （`invalidate_image_row_cache`，替代 `images_gen` 进全局 shape_key）。
+#[gpui::test]
+fn image_resize_first_drag_same_width_rebuild_reflows(cx: &mut TestAppContext) {
+    use crate::config::markdown::IMAGE_MIN_W;
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("some leading paragraph.\n\n![alt](img测试.png)\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 光标放文档末端（不在可视带内）→ 排除「光标行 reveal 强制重排」对缓存命中判定的干扰
+    // （对齐 `shaped_row_cache_reuses_rows_across_band_rebuilds` 同法）。
+    vcx.update(|_, cx| {
+        let n = ed.read(cx).len();
+        ed.update(cx, |e, _| e.set_caret(n));
+    });
+    // 固定渲染宽 = **真实居中阅读栏宽度**（`reading_col_px(16.0)` = 72×16×0.8 =
+    // 921.59997…，必须用同一函数取到同一 f32 位模式——手写 `px(921.6)` 是 0x44666667，
+    // 与它 0x44666666 差 1 个 mantissa bit → `width_bits` 不同 → 行整形缓存键不同 →
+    // 拖拽后的重建（渲染路径同款宽）会意外 miss 重排，掩盖「命中旧整形行」这一失败
+    // 条件）。两帧同宽同带，且与真实渲染路径同一宽度。
+    let w = px(crate::config::markdown::reading_col_px(16.0));
+    let (w0, hx, hy, band) = vcx.update(|window, cx| {
+        let _g0 = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        ed.read(cx).take_reshapes(); // 清掉首次建帧的整形计数
+        let g1 = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let b_img = ed.read(cx).doc().block_index_for_line(2);
+        // 图片行必须先真正进入行整形缓存（否则重建走 miss 重排，掩盖「命中旧整形行」）。
+        assert!(
+            ed.read(cx).shape_rows_has(b_img),
+            "前置：图片行应先进入行整形缓存（block {b_img}）"
+        );
+        let rc = std::rc::Rc::new(g1);
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(rc.clone());
+            // 元素宽 = 帧宽（阅读栏宽）→ 阅读栏移位 = 0，窗口坐标与列内坐标一致
+            // （对齐 `image_harness` 的「last_bounds 宽 = 帧宽」做法；否则元素默认宽
+            // 1920 会把阅读栏居中右移 ~499px，命中几何与拖拽换算错轨）。
+            e.set_last_bounds(Some(gpui::Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(w, px(600.)),
+            )));
+        });
+        let img = rc
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("夹具应含独立图片行")
+            .clone();
+        assert_eq!(img.src_line, 2);
+        let w0 = img.image.as_ref().unwrap().w;
+        assert!(w0 > IMAGE_MIN_W + 80., "夹具自然宽应能左拖缩窄（w0={w0}）");
+        let bb = super::image_box_local(&rc, &img).expect("图片盒");
+        let hb = super::image_resize_handle_local(&bb);
+        let hx = f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.;
+        let hy = f32::from(hb.top()) + f32::from(hb.size.height) / 2.;
+        (w0, hx, hy, (0., 999_999.))
+    });
+    // 首拖：按调整条 → 左移 60px（事件层：begin + apply + 覆写表更新，均正常）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 60., hy), c));
+    });
+    let overlay = vcx
+        .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+        .expect("拖拽后应有覆写宽");
+    assert!(
+        (overlay - (w0 - 60.)).abs() < 0.5,
+        "覆写表应记录 {w0} - 60 = {}，实际 {overlay}",
+        w0 - 60.
+    );
+    // **失败条件**：下一帧**同宽同带**重建必须按新宽重新整形图片行。若行整形缓存未随
+    // 宽换代失效（命中旧整形行），重建帧的 `img.w` 仍是旧值 → 首拖不实时重绘。
+    let f2 = vcx.update(|window, cx| build_frame(ed.read(cx), window, w, band));
+    let img2 = f2
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .expect("重建帧应含图片行");
+    let w1 = img2.image.as_ref().unwrap().w;
+    assert!(
+        (w1 - (w0 - 60.)).abs() < 0.5,
+        "同宽重建应按新宽 shape：期望 {} 实际 {w1}（命中旧整形缓存 → 首拖不跟手）",
+        w0 - 60.
+    );
+}
+
+/// 回归（用户报告「点到图片外 → 尺寸突然改变」，残留状态清除边界①）：
+/// 按调整条后若松开点落在元素/叠层外，元素级 `on_mouse_up`（`hitbox.is_hovered` 门控）
+/// 未派发 → 状态残留。此刻**任何一次新左键按下**（如点图片外空白处）都必须在处理前把
+/// 残留调整条清掉（`on_mouse_down` 顶部 `end_image_resize`），之后移动绝不改宽。
+#[gpui::test]
+fn image_resize_click_elsewhere_clears_residual(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, _width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let bb = super::image_box_local(&frame, &img).expect("图片盒");
+    let hb = super::image_resize_handle_local(&bb);
+    let (hx, hy) = (
+        f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+        f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+    );
+    // 按调整条 → 开始拖拽。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+        assert!(
+            ed.read(cx).image_resize_drag_src().is_some(),
+            "按调整条应开始拖拽"
+        );
+    });
+    // 【不发 mouse_up】模拟松开点落空（元素级 on_mouse_up 未派发）→ 状态残留。
+    // 之后点图片外（左下方空白区，非调整条）→ 残留状态必须先被清除。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(40., 500.), window, c));
+        assert!(
+            ed.read(cx).image_resize_drag_src().is_none(),
+            "点图片外应先清残留的调整条状态"
+        );
+    });
+    // 随后任何移动（元素级 + 窗口级兜底两条路径）都不得改宽。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 200., hy), c));
+        ed.update(cx, |e, c| e.on_window_mouse_move(&img_move(hx - 200., hy), c));
+    });
+    assert_eq!(
+        vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+        None,
+        "点图片外后移动不得改宽"
+    );
+}
+
+/// 回归（「松开后移动仍改宽」的残留防护，替换旧的 `pressed_button` 门控断言）：
+/// 拖拽改宽只以 `image_resize_drag` 状态为准（按下命中句柄才置位）。真实的松开动作
+/// （元素内 `on_mouse_up` / 元素外 `on_mouse_up_out` / 窗口级 `on_window_mouse_up` / 任何
+/// 新左键 `on_mouse_down`）都会把状态清掉，之后**无论有无按键**的移动都不得再改宽。
+/// 不再依赖 `pressed_button` 标志（Windows 首拖经窗口级兜底路径该标志并不可靠——依赖它
+/// 会让首拖整段失效；清态改由上述边界闭环，对齐本仓 scrollbar/video/image 拖拽惯例）。
+#[gpui::test]
+fn image_resize_release_boundary_stops_moves(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, _width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let bb = super::image_box_local(&frame, &img).expect("图片盒");
+    let hb = super::image_resize_handle_local(&bb);
+    let (hx, hy) = (
+        f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+        f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+    );
+    let w0 = img.image.as_ref().unwrap().w;
+    // 按下调整条 → 拖拽开始。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+    });
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_resize_drag_src().is_some()),
+        "按调整条应开始拖拽"
+    );
+    // 按住拖动（窗口级兜底路径）→ 跟手改宽 = w0 − 60（首拖即生效，不等平台按钮标志）。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_window_mouse_move(&img_move_held(hx - 60., hy), c));
+    });
+    let w1 = vcx
+        .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+        .expect("按住移动后应有覆写宽");
+    assert!(
+        (w1 - (w0 - 60.)).abs() < 0.5,
+        "按住左键移动应从 {w0} 缩到 {}（实际 {w1}）",
+        w0 - 60.
+    );
+    // 拖拽结束的**真实边界**：松开点落在元素外（元素级 `on_mouse_up` 不派发）→
+    // `on_mouse_up_out` 清状态。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_window_mouse_up(c));
+    });
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_resize_drag_src().is_none()),
+        "松开（窗口级/up_out 边界）应清掉拖拽状态"
+    );
+    // 之后：无按键纯移动 + 按住移动，两条路径都不得再改宽。
+    let w_frozen = vcx
+        .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+        .expect("松开后覆写宽应保留已拖值");
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 200., hy), c));
+        ed.update(cx, |e, c| e.on_window_mouse_move(&img_move(hx - 200., hy), c));
+        ed.update(cx, |e, c| e.on_window_mouse_move(&img_move_held(hx - 300., hy), c));
+    });
+    assert_eq!(
+        vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+        Some(w_frozen),
+        "松开边界后移动（无论有无按键）不得再改宽"
+    );
+}
+
+/// 回归（残留状态清除边界④）：**窗口级 mouse-up 兜底**——松开点落在元素外/叠层上
+/// （元素级 `on_mouse_up` 未派发）时，窗口级 `on_window_mouse_up` 必须把残留调整条状态
+/// 清掉；之后即使按住左键移动，也不再改宽。
+#[gpui::test]
+fn image_resize_window_mouse_up_clears_state(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, _width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let bb = super::image_box_local(&frame, &img).expect("图片盒");
+    let hb = super::image_resize_handle_local(&bb);
+    let (hx, hy) = (
+        f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+        f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+    );
+    // 按调整条 → 拖拽中。此刻模拟「松开点在元素外」：只派发窗口级 MouseUp 兜底。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+        assert!(ed.read(cx).image_resize_drag_src().is_some(), "按下应拖拽");
+        ed.update(cx, |e, c| e.on_window_mouse_up(c));
+        assert!(
+            ed.read(cx).image_resize_drag_src().is_none(),
+            "窗口级 mouse-up 兜底应清残留调整条状态"
+        );
+    });
+    // 之后按住左键移动 → 状态已清 → 不得改宽。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_window_mouse_move(&img_move_held(hx - 200., hy), c));
+    });
+    assert_eq!(
+        vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+        None,
+        "mouse_up 兜底后移动不得改宽"
+    );
 }
 
 /// 回归（超长行内公式 + 后续键入「回弹」）：公式自然宽 > 内容盒时，spacer 宽 / 撑高 /
