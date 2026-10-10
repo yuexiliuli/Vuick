@@ -6,6 +6,8 @@
 //!   相接合并；Delete 同点延伸合并；Atomic/换行永远独立），光标移动即 `set_cooperative(false)` 断层。
 //! - 上限 [`MAX_UNDO_TXS`] 个事务，超出丢最早。
 
+use std::collections::VecDeque;
+
 use crate::editor::buffer::Edit;
 
 pub const MAX_UNDO_TXS: usize = 1000;
@@ -43,9 +45,13 @@ struct PendingTx {
 
 /// 撤销栈。文本本身的回放由调用方用 [`crate::editor::buffer::Buffer`] 的
 /// `undo_edit`/`redo_edit` 执行，本对象只负责分组、进出栈与选区快照。
+///
+/// `undo_stack` 用 [`VecDeque`]：超出上限丢**最早**（`pop_front` 删头 O(1)，Vec 的
+/// `remove(0)` 是 O(cap) 整段搬移）；`redo_stack` 只需压尾/弹尾（`push`/`pop`），
+/// 用 Vec 即可，不引入无关结构。
 #[derive(Default)]
 pub struct UndoManager {
-    undo_stack: Vec<Transaction>,
+    undo_stack: VecDeque<Transaction>,
     redo_stack: Vec<Transaction>,
     pending: Option<PendingTx>,
     cooperative: bool,
@@ -191,9 +197,10 @@ impl UndoManager {
             before: pending.before,
             after,
         };
-        self.undo_stack.push(tx);
+        self.undo_stack.push_back(tx);
         if self.undo_stack.len() > MAX_UNDO_TXS {
-            self.undo_stack.remove(0);
+            // 丢最早：VecDeque 删头 O(1)（原 Vec::remove(0) 是 O(cap) 整段搬移）。
+            self.undo_stack.pop_front();
         }
         self.redo_stack.clear();
     }
@@ -202,7 +209,7 @@ impl UndoManager {
     pub fn undo(&mut self) -> Option<Transaction> {
         self.commit_pending(None);
         self.cooperative = false;
-        let tx = self.undo_stack.pop()?;
+        let tx = self.undo_stack.pop_back()?;
         self.redo_stack.push(tx.clone());
         Some(tx)
     }
@@ -211,7 +218,7 @@ impl UndoManager {
     pub fn redo(&mut self) -> Option<Transaction> {
         self.cooperative = false;
         let tx = self.redo_stack.pop()?;
-        self.undo_stack.push(tx.clone());
+        self.undo_stack.push_back(tx.clone());
         Some(tx)
     }
 
