@@ -11,3 +11,6 @@ docs/
 /dist
 
 AGENTS.md
+
+# 测试夹具二进制/大文件——仅本地保留，不入库（曾误提交经历史重写移除，见 backup-pre-rewrite）
+fixtures/
