@@ -1314,6 +1314,7 @@ impl EditorApp {
                             .gap_2()
                             .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
                             .child("锁定图片视图")
+                            .debug_selector(|| "media-lock-menu-item".into())
                     })
                     .on_click(move |_click, window, cx| {
                         img.update(cx, |v, cx| v.toggle_lock(cx));
@@ -1332,6 +1333,7 @@ impl EditorApp {
                             .gap_2()
                             .child(div().w(px(18.)).child(if locked { "✓" } else { "" }))
                             .child("锁定视频视图")
+                            .debug_selector(|| "media-lock-menu-item".into())
                     })
                     .on_click(move |_click, window, cx| {
                         vid.update(cx, |v, cx| v.toggle_lock(cx));
@@ -1398,7 +1400,12 @@ impl EditorApp {
         out
     }
 
-    /// 图片/视频「锁定」右键菜单 Overlay：按右键时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
+    /// 图片/视频「锁定」右键菜单 Overlay：按右键时记录的**窗口坐标**定位
+    /// （`AnchoredPositionMode::Window` + `position(pos)`——`position()` 才是 gpui 语义里
+    /// 「窗口坐标」入参；旧的 `offset(pos)` 缺 `position()` 时会被当作「相对锚定元素自身
+    /// 静态布局位置的偏移」，而本菜单当前是外壳 flex 直子、静态位恰为 (0,0) 才幸免）。
+    /// 与选项卡栏菜单（tabs.rs `render_tab_bar_menu`）同法改用 `.position(pos)` 加固，
+    /// 防将来被包进盒子后锚定点被加成非零静态原点而沉底。
     fn render_media_lock_menu(
         &mut self,
         _window: &mut Window,
@@ -1420,7 +1427,7 @@ impl EditorApp {
             anchored()
                 .position_mode(gpui::AnchoredPositionMode::Window)
                 .anchor(Anchor::TopLeft)
-                .offset(pos)
+                .position(pos)
                 .snap_to_window_with_margin(Edges::all(px(8.)))
                 .child(menu),
         )

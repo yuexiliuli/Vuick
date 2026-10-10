@@ -612,7 +612,12 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 选项卡栏右键菜单 Overlay：按右键时记录的窗口坐标定位（`AnchoredPositionMode::Window`）。
+    /// 选项卡栏右键菜单 Overlay：按右键时记录的**窗口坐标**定位
+    /// （`AnchoredPositionMode::Window` + `position(pos)`——`position()` 才是 gpui 语义里
+    /// 「窗口坐标」入参；旧的 `offset(pos)` 缺 `position()` 时会被当作「相对锚定元素自身
+    /// 静态布局位置的偏移」，而本菜单包在 `#tab-bar-menu` 外壳 flex 流内、静态位在窗口
+    /// 底部 → 菜单被推出窗口再被 `snap_to_window_with_margin` 钳回底部（沉底 bug）。
+    /// 媒体右键菜单因直接作为外壳 flex 直子、静态位恰为 (0,0) 才表现出正常而已，同隐患。
     pub(super) fn render_tab_bar_menu(
         &mut self,
         _window: &mut Window,
@@ -632,7 +637,7 @@ impl EditorApp {
                     anchored()
                         .position_mode(gpui::AnchoredPositionMode::Window)
                         .anchor(Anchor::TopLeft)
-                        .offset(pos)
+                        .position(pos)
                         .snap_to_window_with_margin(Edges::all(px(8.)))
                         .child(menu),
                 )

@@ -127,6 +127,29 @@
             cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
             "图片右键应在光标处弹出锁定菜单"
         );
+        // 位置回归：菜单项应出现在右键点附近（非沉底）。若被 clamp 回窗口底部，dy 会接近
+        // 整窗高——阈值取窗口高 1/3 区分；debug_selector 见 on_media_right_click（图片/视频共用）。
+        let item_bounds = cx
+            .debug_bounds("media-lock-menu-item")
+            .expect("右键后应渲染「锁定」菜单项");
+        let viewport_h = 720.;
+        let dy = (item_bounds.origin.y - menu_at.y).as_f32();
+        assert!(
+            dy < viewport_h * 0.3,
+            "图片右键菜单应出现在光标附近（right_click y={}, 菜单项 y={}, dy={}，应当 <{}）",
+            menu_at.y.as_f32(),
+            item_bounds.origin.y.as_f32(),
+            dy,
+            viewport_h * 0.3
+        );
+        let dx = (item_bounds.origin.x - menu_at.x).as_f32();
+        assert!(
+            dx.abs() < 24.,
+            "图片右键菜单应水平跟随光标（right_click x={}, 菜单 x={}, dx={}，应 |dx|<24）",
+            menu_at.x.as_f32(),
+            item_bounds.origin.x.as_f32(),
+            dx
+        );
         // 点菜单首项（菜单窗口锚定在该处；面板内边距 4 + 项高 26 → 项中心约 y+17）
         let item = gpui::Point::new(px(400. + 8.), px(360. + 4. + 13.));
         cx.simulate_click(item, Default::default());
@@ -194,6 +217,29 @@
         assert!(
             cx.update(|_w, cx| app.read(cx).media_lock_menu_pos.is_some()),
             "视频右键应在光标处弹出锁定菜单"
+        );
+        // 位置回归：菜单项应出现在右键点附近（非沉底）。若被 clamp 回窗口底部，dy 会接近
+        // 整窗高——阈值取窗口高 1/3 区分；debug_selector 见 on_media_right_click（图片/视频共用）。
+        let item_bounds = cx
+            .debug_bounds("media-lock-menu-item")
+            .expect("右键后应渲染「锁定」菜单项");
+        let viewport_h = 720.;
+        let dy = (item_bounds.origin.y - menu_at.y).as_f32();
+        assert!(
+            dy < viewport_h * 0.3,
+            "视频右键菜单应出现在光标附近（right_click y={}, 菜单项 y={}, dy={}，应当 <{}）",
+            menu_at.y.as_f32(),
+            item_bounds.origin.y.as_f32(),
+            dy,
+            viewport_h * 0.3
+        );
+        let dx = (item_bounds.origin.x - menu_at.x).as_f32();
+        assert!(
+            dx.abs() < 24.,
+            "视频右键菜单应水平跟随光标（right_click x={}, 菜单 x={}, dx={}，应 |dx|<24）",
+            menu_at.x.as_f32(),
+            item_bounds.origin.x.as_f32(),
+            dx
         );
         // 点菜单首项（菜单窗口锚定在该处；面板内边距 4 + 项高 26 → 项中心约 y+17）
         let item = gpui::Point::new(px(400. + 8.), px(360. + 4. + 13.));
@@ -1048,6 +1094,57 @@
         });
         assert_eq!(calls, 1, "点「打开文件」应触发一次 open_dialog");
         assert!(menu_closed2, "点「打开文件」后菜单应关闭");
+    }
+
+    /// 选项卡栏右键菜单位置回归：菜单（以「新建文件」项 debug_bounds 代表）应出现在
+    /// **鼠标附近**（右键点处，几 px 容差），而不是被 `snap_to_window_with_margin` 钳到
+    /// 窗口底部。历史缺陷：`AnchoredPositionMode::Window` 下没给 `.position()`，`.offset(pos)`
+    /// 被 gpui 当作「相对锚定元素自身静态布局位置的偏移」；而本菜单包在 `#tab-bar-menu`
+    /// 外壳 flex 流内、静态位在窗口底部（0,720）→ 锚定点被加成 `(86,48)+(0,720)` → 沉底。
+    /// 修复用 gpui 的窗口坐标入参 `.position(pos)`（媒体右键菜单因静态位恰为 (0,0) 才幸免）。
+    #[gpui::test]
+    async fn tab_bar_right_click_menu_anchored_near_cursor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        settle_frames(cx, 3);
+
+        // 右键选项卡栏内（栏左缘右侧 40px、垂直中部）→ 菜单应弹在光标处
+        let bar = cx
+            .debug_bounds("tab-bar")
+            .expect("选项卡栏 tab-bar 应渲染");
+        let right_click_at = gpui::Point::new(bar.origin.x + px(40.), bar.origin.y + px(16.));
+        cx.simulate_mouse_down(right_click_at, MouseButton::Right, Default::default());
+        settle_frames(cx, 3);
+        assert!(
+            cx.update(|_w, cx| app.read(cx).tab_bar_menu_pos.is_some()),
+            "右键选项卡栏应弹出上下文菜单"
+        );
+        let item_new = cx
+            .debug_bounds("tab-bar-menu-item-new")
+            .expect("右键后应渲染「新建文件」菜单项");
+
+        // 「新建文件」菜单项即菜单本体（面板内边距 4 的左上角 ≈ 光标，几 px 容差）。
+        // 若菜单被钳到窗口底部，此处会差出近一整窗高——断言用 >= 窗口高的 1/3 阈值区分。
+        let viewport_h = 720.;
+        let dy = (item_new.origin.y - right_click_at.y).as_f32();
+        assert!(
+            dy < viewport_h * 0.3,
+            "选项卡栏右键菜单应出现在光标附近（right_click y={}, 菜单项 y={}, dy={}，应当 <{}）",
+            right_click_at.y.as_f32(),
+            item_new.origin.y.as_f32(),
+            dy,
+            viewport_h * 0.3
+        );
+        // 横向也应跟光标（±24px 容差）
+        let dx = (item_new.origin.x - right_click_at.x).as_f32();
+        assert!(
+            dx.abs() < 24.,
+            "选项卡栏右键菜单应水平跟随光标（right_click x={}, 菜单 x={}, dx={}，应 |dx|<24）",
+            right_click_at.x.as_f32(),
+            item_new.origin.x.as_f32(),
+            dx
+        );
     }
 
     /// 侧边栏：默认仅收窄为活动栏（目录面板收起，占 46px 不挤正文）；
@@ -5327,7 +5424,7 @@
             cx.run_until_parked();
         }
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/pdf测试.pdf");
+            .join("target/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -5401,7 +5498,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
@@ -5465,9 +5562,10 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 长文 fixture 曾是 17.….pdf（pdf测试.pdf 的逐字节副本，已去重）——直接用副本本体。
+        // 长 PDF 输入改用 target/pdf测试2.pdf（259 页文本型）：fixtures/ 下 PDF 在本机 Rust 进程
+        // 内无法解析（FormatError），且长度要 ≥50 页（opens_long_pdf_virtualized 断言）。
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/pdf测试.pdf");
+            .join("target/pdf测试2.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
@@ -5504,7 +5602,7 @@
         assert!(status_ok, "打开长 PDF 应成功");
         assert!(
             page_count >= 50,
-            "长 PDF 应列出完整页数（fixture = pdf测试.pdf，87 页），实际={page_count}"
+            "长 PDF 应列出完整页数（输入 target/pdf测试2.pdf，259 页），实际={page_count}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(20),

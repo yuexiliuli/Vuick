@@ -1017,10 +1017,12 @@ mod tests {
     }
 
     fn target_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        // 本机 Rust 进程内 pdfium 无法解析 fixtures/ 下的 PDF（FormatError），只用 target/ 下
+        // 生产路径可解析的文件：0=基础文本型、1=长文（≥50 页）。
         vec![
             manifest.join("pdf测试.pdf"),
-            manifest.join("pdf测试.pdf"),
+            manifest.join("pdf测试2.pdf"),
         ]
     }
 

@@ -86,12 +86,13 @@ mod tests {
     }
 
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        // 「长文/遍历」用例此前用 fixtures/17.….pdf.pdf——实为 pdf测试.pdf 的逐字节副本
-        // （已去重删除）。保留两元素索引形状，两处都指向同一份 87 页文本型 fixture。
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        // 本机 Rust 进程内 pdfium 对 fixtures/pdf测试.pdf 报 FormatError（PDF Complete 之外
+        // 风格无法解析），fixtures/ 下文件一律不用；target/ 下三个文件生产路径可解析。
+        // 保留两元素索引形状：0=基础文本型、1=长文（≥50 页）。
         vec![
             manifest.join("pdf测试.pdf"),
-            manifest.join("pdf测试.pdf"),
+            manifest.join("pdf测试2.pdf"),
         ]
     }
 
@@ -351,7 +352,7 @@ mod tests {
     #[test]
     fn worker_renders_many_pages_individually() {
         let _guard = pdf_lock().lock().unwrap();
-        // 长 PDF（当前 fixture = pdf测试.pdf，87 页文本型）：抽查首/中/末各一页
+        // 长 PDF（target/pdf测试2.pdf，259 页文本型）：抽查首/中/末各一页
         // （模拟「滚动到哪渲染哪」）
         let p = test_pdf_paths()[1].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -645,12 +646,12 @@ mod tests {
         );
     }
 
-    /// 用 `fixtures/pdf测试.pdf` 实测 P2 文本层管线：行列合并、单行/跨行复制（含换行），
+    /// 用 `target/pdf测试.pdf` 实测 P2 文本层管线：行列合并、单行/跨行复制（含换行），
     /// 并打印最稠密页的首行文本样本便于人工核对抽取质量。
     #[test]
     fn configure_sheet_selection_pipeline() {
         let _guard = pdf_lock().lock().unwrap();
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(p.exists(), "测试文件应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
@@ -803,14 +804,15 @@ mod tests {
     /// 回归探针（自动）：全文档检索必须**分片续跑**，不得整段冻结瓦片/封面渲染。
     /// 修复前：`WorkerMsg::Search` 一条消息就是全文档同步扫描（`parser::search_document`），
     /// worker 扫描期间无法处理任何 Render/RenderTile → 随机落在视口的页占位数百 ms 乃至
-    /// 数秒（本仓库 87 页文本 PDF 实测检索 ~440ms、期间渲染被堵到全文扫完）。
+    /// 数秒（本仓库 87 页文本型 PDF 实测检索 ~440ms、期间渲染被堵到全文扫完；
     /// 修复后：检索按片执行（数页/数 ms 一片），检索期间到达的渲染只等一片就轮到。
     #[test]
     fn whole_doc_search_freeze_blocks_renders_probe() {
         use std::time::{Duration, Instant};
         let _guard = pdf_lock().lock().unwrap();
-        // 只用文本型 PDF（pdf测试.pdf，87 页）复现；扫描件（242 页）检索本就 ≈0ms。
-        let p = test_pdf_paths()[0].clone();
+        // 必须用长文本型 PDF（target/pdf测试2.pdf，259 页）复现：18 页文本 PDF 整篇检索
+        // 实测 0ms（低于 >100ms 断言）；扫描件（242 页）检索本就 ≈0ms。
+        let p = test_pdf_paths()[1].clone();
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
@@ -973,7 +975,7 @@ mod tests {
         cx.update(crate::actions::bind_local_keymaps);
 
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/pdf测试.pdf");
+            .join("target/pdf测试.pdf");
         // 宽区（可完全容纳）与窄区（窄于页宽+边距）各验证一次
         for pane_w in [1200.0f32, 600.0] {
             let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
@@ -1057,7 +1059,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/pdf测试.pdf");
+            .join("target/pdf测试.pdf");
         let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
         let (_root, cx) = cx.add_window_view(|_window, cx| {
             let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
@@ -1192,7 +1194,7 @@ mod tests {
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1406,8 +1408,8 @@ mod tests {
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
-        let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1570,8 +1572,8 @@ mod tests {
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
-        let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1782,8 +1784,8 @@ mod tests {
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
-        let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1949,8 +1951,8 @@ mod tests {
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         cx.update(crate::actions::bind_local_keymaps);
-        let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/pdf测试.pdf");
+        let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
