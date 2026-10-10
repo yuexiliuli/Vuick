@@ -95,14 +95,23 @@ pub(crate) fn first_visible_page(dims: &[(f32, f32)], page_width: f32, scroll_y:
     }
     let top = scroll_y.max(0.0);
     let (tops, _) = compute_layout(dims, page_width);
-    let mut first = 0usize;
-    for (i, dim) in dims.iter().enumerate() {
-        if tops[i] + display_height(*dim, page_width) > top {
-            first = i;
-            break;
+
+    // 二分定位「页底 > 视口顶」的首张页（lower_bound）。
+    // `tops` 严格递增（每页叠加正页高 + PAGE_GAP，见 `compute_layout_is_monotonic_and_bounded`），
+    // 页底值 `tops[i] + display_height` 随之严格递增 → 谓词单调，可二分（千页 O(页数)→O(log 页数)）。
+    // 与旧线性扫逐例等价：谓词用同一套浮点运算，且无任何页命中时（已滚过末页）仍返回 0。
+    let n = dims.len();
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if tops[mid] + display_height(dims[mid], page_width) <= top {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    first
+    if lo == n { 0 } else { lo }
 }
 
 /// 可见页区间（含缓冲）：与页列布局镜像，纯函数便于测试。
@@ -122,24 +131,38 @@ pub(crate) fn keep_window(
     let bottom = top + vh;
     let (tops, _) = compute_layout(dims, page_width);
 
-    // 第一页「页面底 > 视口顶」
-    let mut first = 0usize;
-    for (i, dim) in dims.iter().enumerate() {
-        if tops[i] + display_height(*dim, page_width) > top {
-            first = i;
-            break;
+    // 二分首/尾两界（`tops` 严格递增 → 两个谓词都单调，见 `first_visible_page`）。与旧
+    // 线性扫逐例等价：`first` 无命中（滚过末页）与 `last` 无命中（视口在首页顶之上）都回退 0。
+    let n = dims.len();
+
+    // 第一页「页底 > 视口顶」
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if tops[mid] + display_height(dims[mid], page_width) <= top {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    // 最后一页「页面顶 < 视口底」
-    let mut last = 0usize;
-    for i in (0..dims.len()).rev() {
-        if tops[i] < bottom {
-            last = i;
-            break;
+    let first = if lo == n { 0 } else { lo };
+
+    // 最后一页「页顶 < 视口底」
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if tops[mid] < bottom {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
+    let last = if lo == 0 { 0 } else { lo - 1 };
+
     let start = first.saturating_sub(MARGIN);
-    let end = (last + MARGIN).min(dims.len() - 1);
+    let end = (last + MARGIN).min(n - 1);
     (start, end)
 }
 
@@ -638,6 +661,111 @@ mod tests {
         assert_eq!(first_visible_page(&dims, 840.0, 0.0), 0);
         assert_eq!(first_visible_page(&[], 840.0, 0.0), 0);
         assert_eq!(first_visible_page(&dims, 840.0, -5.0), 0);
+    }
+
+    /// 引用实现：旧线性扫 `first_visible_page`（用于与二分版逐例对拍）。
+    fn ref_first_visible_page(dims: &[(f32, f32)], page_width: f32, scroll_y: f32) -> usize {
+        if dims.is_empty() {
+            return 0;
+        }
+        let top = scroll_y.max(0.0);
+        let (tops, _) = compute_layout(dims, page_width);
+        let mut first = 0usize;
+        for (i, dim) in dims.iter().enumerate() {
+            if tops[i] + display_height(*dim, page_width) > top {
+                first = i;
+                break;
+            }
+        }
+        first
+    }
+
+    /// 引用实现：旧线性扫 `keep_window`（用于与二分版逐例对拍）。
+    fn ref_keep_window(
+        dims: &[(f32, f32)],
+        page_width: f32,
+        scroll_y: f32,
+        viewport_h: f32,
+    ) -> (usize, usize) {
+        if dims.is_empty() {
+            return (0, 0);
+        }
+        let vh = if viewport_h > 1.0 { viewport_h } else { 720.0 };
+        let top = scroll_y.max(0.0);
+        let bottom = top + vh;
+        let (tops, _) = compute_layout(dims, page_width);
+        let mut first = 0usize;
+        for (i, dim) in dims.iter().enumerate() {
+            if tops[i] + display_height(*dim, page_width) > top {
+                first = i;
+                break;
+            }
+        }
+        let mut last = 0usize;
+        for i in (0..dims.len()).rev() {
+            if tops[i] < bottom {
+                last = i;
+                break;
+            }
+        }
+        let start = first.saturating_sub(MARGIN);
+        let end = (last + MARGIN).min(dims.len() - 1);
+        (start, end)
+    }
+
+    #[test]
+    fn binary_search_matches_linear_reference_across_scroll_span() {
+        // 大页数二分正确性：构造混合尺寸页表（A4 + 信纸 + 宽 169 × 高 100 横页等，验证
+        // 页底/页顶序列仍严格递增），在稠密滚动位（页顶/页底/页间空白/越界）上与引用线性
+        // 实现逐例对拍——二分版与线性版用同一套浮点运算，边界语义（回退 0、MARGIN、夹取）必须分毫不差。
+        let mut dims: Vec<(f32, f32)> = Vec::new();
+        for i in 0..300 {
+            dims.push(match i % 3 {
+                0 => a4(),
+                1 => (612.0, 792.0), // 信纸（letter）
+                _ => (169.0, 100.0), // 横页小页（矮页：密集页顶/底）
+            });
+        }
+        let pw = 840.0_f32;
+        let (tops, total) = compute_layout(&dims, pw);
+
+        // 覆盖全部边界：每页顶/底 ± 0.5、页间间隙中间、起点与越界（含滚过末页 → 回退 0）。
+        let mut probes: Vec<f32> = vec![f32::MIN, -1000.0, -1.0, 0.0, 0.5, total, total + 100.0, 1e9, f32::MAX];
+        for i in 0..dims.len() {
+            let top = tops[i];
+            let bottom = top + display_height(dims[i], pw);
+            probes.push(top - 0.5);
+            probes.push(top);
+            probes.push(top + 0.5);
+            probes.push(bottom - 0.5);
+            probes.push(bottom);
+            probes.push(bottom + 0.5);
+            if i + 1 < dims.len() {
+                probes.push((bottom + tops[i + 1]) / 2.0); // 页间 gap 中间
+            }
+        }
+
+        for &scroll in &probes {
+            let expect_first = ref_first_visible_page(&dims, pw, scroll);
+            let got_first = first_visible_page(&dims, pw, scroll);
+            assert_eq!(
+                got_first, expect_first,
+                "first_visible_page 在 scroll={scroll} 处偏离线性版"
+            );
+            for &vh in &[600.0_f32, 720.0, 1.0, 0.5, 0.0, 2000.0] {
+                let expect_win = ref_keep_window(&dims, pw, scroll, vh);
+                let got_win = keep_window(&dims, pw, scroll, vh);
+                assert_eq!(
+                    got_win, expect_win,
+                    "keep_window 在 scroll={scroll}, viewport={vh} 处偏离线性版"
+                );
+            }
+        }
+
+        // 显式断言二分关键的「滚过末页回退 0」与「视口底压过末页」边界不退化。
+        assert_eq!(first_visible_page(&dims, pw, total + 1.0), 0, "滚过末页应回退 0");
+        assert_eq!(keep_window(&dims, pw, total + 1.0, 600.0).1, dims.len() - 1);
+        assert_eq!(keep_window(&dims, pw, 0.0, 0.5).0, 0, "视口高 ≤1 回退默认 720 时窗口起点仍为首页");
     }
 
     #[test]
