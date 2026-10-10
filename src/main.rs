@@ -20,6 +20,7 @@ mod config;
 mod editor;
 mod epub;
 mod image;
+mod ime;
 mod markdown;
 mod pdf;
 mod prof;

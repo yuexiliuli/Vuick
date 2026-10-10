@@ -5,6 +5,11 @@
 //! 占位符/光标）。键盘（Backspace/Delete/方向/Home/End/Ctrl 组合）走本地 `crate::actions`
 //! 的 "Input" keymap（#10 自绑）：元素 `key_context("Input")` + `on_action` 接线；
 //! 未实现的组合（如 Undo/Redo）按 gpui 分发语义静默不处理即可。
+//!
+//! IME 状态机本体已收敛到 `crate::ime`（M2.5 双份合一）：本文件只实现
+//! [`ImeTextHost`] 适配层（byte 语义、`&str` 遍历的 UTF-16 换算、经 `edit_range`
+//! 落地 + 发 `Change`），并**不维护 marked**——单行输入框不画组合下划线，
+//! `replace_and_mark` 按普通替换处理、忽略组合内光标（与收敛前行为一致）。
 
 use std::ops::Range;
 
@@ -20,6 +25,8 @@ use crate::actions::{
     MoveLeft, MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, SelectAll,
 };
 use crate::config::layout::DEFAULT_FONT_SIZE;
+use crate::editor::EditIntent;
+use crate::ime::{self, ImeTextHost};
 use crate::ui::theme::Theme;
 
 /// 单行输入框事件（仅实现 App 用到的最小面）。
@@ -384,6 +391,56 @@ impl Focusable for InputState {
 // 文本输入（IME）——单行，整行是一个 UTF-16 区段
 // -------------------------------------------------------------------------
 
+/// 共享 IME 状态机的 byte 语义宿主适配层：内部坐标本来就是 byte，`&str` 遍历
+/// 做 UTF-16 换算（单行框文本小，无需 rope 索引），落地经 `edit_range`（发
+/// `Change`）；**不维护 marked**（`supports_marked = false` → 组合按普通替换、
+/// 忽略组合内光标，与收敛前一致）。
+impl ImeTextHost for InputState {
+    fn len_utf16(&self) -> usize {
+        ime::utf16_len(self.text.as_str())
+    }
+
+    fn byte_to_utf16(&self, byte: usize) -> usize {
+        ime::byte_to_utf16(self.text.as_str(), byte)
+    }
+
+    fn utf16_to_byte(&self, offset_utf16: usize) -> usize {
+        ime::utf16_to_byte(self.text.as_str(), offset_utf16)
+    }
+
+    fn text_in_bytes(&self, range: Range<usize>) -> Option<String> {
+        self.text.get(range).map(str::to_string)
+    }
+
+    fn selection_bytes(&self) -> Range<usize> {
+        self.selection.clone()
+    }
+
+    fn set_selection_bytes(&mut self, range: Range<usize>) {
+        self.selection = range;
+    }
+
+    fn marked_bytes(&self) -> Option<Range<usize>> {
+        None
+    }
+
+    fn set_marked_bytes(&mut self, _range: Option<Range<usize>>) {}
+
+    fn supports_marked(&self) -> bool {
+        false
+    }
+
+    fn apply_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        _intent: EditIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_range(range, text, cx);
+    }
+}
+
 impl EntityInputHandler for InputState {
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
@@ -394,7 +451,7 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(utf16_len(self.text.as_str()))
+        Some(self.len_utf16())
     }
 
     fn selected_text_range(
@@ -403,12 +460,7 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let sel = self.selection.clone();
-        Some(UTF16Selection {
-            range: byte_to_utf16(self.text.as_str(), sel.start)
-                ..byte_to_utf16(self.text.as_str(), sel.end),
-            reversed: false,
-        })
+        Some(ime::selected_text_range(self))
     }
 
     fn marked_text_range(
@@ -416,7 +468,7 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        None
+        ime::marked_text_range(self)
     }
 
     fn text_for_range(
@@ -426,9 +478,7 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let s = utf16_to_byte(self.text.as_str(), range_utf16.start);
-        let e = utf16_to_byte(self.text.as_str(), range_utf16.end);
-        self.text.get(s..e).map(str::to_string)
+        ime::text_for_range(self, range_utf16)
     }
 
     fn replace_text_in_range(
@@ -438,34 +488,25 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let byte_range = match range {
-            Some(r) => {
-                utf16_to_byte(self.text.as_str(), r.start)..utf16_to_byte(self.text.as_str(), r.end)
-            }
-            None => self.selection.clone(),
-        };
-        self.edit_range(byte_range, text, cx);
+        ime::replace(self, range, text, None, false, cx);
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
         range: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 搜索框不画组合下划线，与 replace_text_in_range 等价。
-        let byte_range = match range {
-            Some(r) => {
-                utf16_to_byte(self.text.as_str(), r.start)..utf16_to_byte(self.text.as_str(), r.end)
-            }
-            None => self.selection.clone(),
-        };
-        self.edit_range(byte_range, new_text, cx);
+        // 搜索框不画组合下划线，与 `replace_text_in_range` 等价（共享核心经
+        // `supports_marked = false` 跳过 marked/组合内光标处理）。
+        ime::replace(self, range, new_text, new_selected_range, true, cx);
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        ime::unmark(self);
+    }
 
     fn bounds_for_range(
         &mut self,
@@ -474,7 +515,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let byte = utf16_to_byte(self.text.as_str(), range_utf16.start.min(range_utf16.end));
+        let byte = ime::utf16_to_byte(self.text.as_str(), range_utf16.start.min(range_utf16.end));
         let x = self.caret_px(byte, element_bounds, window);
         let line_h = line_height();
         Some(Bounds::new(
@@ -490,7 +531,7 @@ impl EntityInputHandler for InputState {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let x = (point.x - self.element_bounds.origin.x - px(PAD_PX)).max(px(0.));
-        Some(byte_to_utf16(
+        Some(ime::byte_to_utf16(
             self.text.as_str(),
             self.index_at_x_impl(x, window),
         ))
@@ -502,9 +543,7 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let s = utf16_to_byte(self.text.as_str(), range_utf16.start);
-        let e = utf16_to_byte(self.text.as_str(), range_utf16.end);
-        self.selection = s..e;
+        ime::set_selected_text_range(self, range_utf16);
         cx.notify();
     }
 
@@ -712,34 +751,8 @@ impl Element for InputElement {
     }
 }
 
-// -------------------------------------------------------------------------
-// UTF-16 换算辅助
-// -------------------------------------------------------------------------
-
-fn utf16_len(s: &str) -> usize {
-    s.encode_utf16().count()
-}
-
-fn byte_to_utf16(s: &str, byte: usize) -> usize {
-    s[..byte.min(s.len())].encode_utf16().count()
-}
-
-fn utf16_to_byte(s: &str, offset_utf16: usize) -> usize {
-    let mut bytes = 0usize;
-    let mut units = 0usize;
-    for ch in s.chars() {
-        if units >= offset_utf16 {
-            break;
-        }
-        let cu = ch.len_utf16();
-        if units + cu > offset_utf16 {
-            break;
-        }
-        units += cu;
-        bytes += ch.len_utf8();
-    }
-    bytes
-}
+// UTF-16 换算辅助（utf16_len / byte_to_utf16 / utf16_to_byte）已收敛到
+// `crate::ime`——见文件头与 [`crate::ime::ImeTextHost`] 适配层。
 
 #[cfg(test)]
 mod tests {
@@ -829,5 +842,38 @@ mod tests {
             wcx.update(|_w, cx| input.read(cx).value().to_string()),
             "中文！测试"
         );
+    }
+
+    /// IME 组合路径回归（M2.5 收敛护栏）：单行输入框不画组合下划线，
+    /// `replace_and_mark` 按普通替换处理——`None` 区间落到当前选区（框内不跟踪
+    /// marked，组合更新追加到光标后，这与编辑器路径 tracking-marked 不同，是
+    /// 单行输入框现状）；显式 UTF-16 区间精确替换；组合内光标被忽略、光标停在
+    /// 新文本末尾；提交（普通 `replace_text_in_range`）结束组合。
+    #[gpui::test]
+    async fn input_ime_composition_treated_as_replace(cx: &mut TestAppContext) {
+        let (input, wcx, changes) = add_input(cx, "ab");
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                // None 区间 = 当前 marked/选区：无 marked → 光标处插入
+                s.replace_and_mark_text_in_range(None, "中", None, window, cx);
+                // 第二次组合更新仍 None：框内不跟踪 marked → 追加到光标后
+                s.replace_and_mark_text_in_range(None, "文", None, window, cx);
+                // 显式 UTF-16 区间（macOS 风格 marked range）：精确替换 utf16[1..4]
+                // （=“b中文”，含代理对粒度换算，非字节偏移）
+                s.replace_and_mark_text_in_range(Some(1..4), "国", None, window, cx);
+                // 提交：普通置换成组合也结束（marked 清理在核心统一处理）
+                s.replace_text_in_range(None, "界", window, cx);
+            });
+        });
+        let (value, caret) = wcx.update(|_w, cx| {
+            (
+                input.read(cx).value().to_string(),
+                input.read(cx).selection.clone(),
+            )
+        });
+        // 轨迹：ab → ab中 → ab中文 → a国（utf16[1..4]=“b中文”被“国”替换）→ a国界
+        assert_eq!(value, "a国界");
+        assert_eq!(caret, "a国界".len().."a国界".len(), "光标停在提交文本末尾");
+        assert_eq!(*changes.borrow(), 4, "组合每步与提交各发一次 Change");
     }
 }

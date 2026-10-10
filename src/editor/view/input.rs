@@ -1,5 +1,9 @@
 //! 文本输入 / IME：`EntityInputHandler` 实现（经 `EditorElement::paint` 里的
-//! `window.handle_input` 挂钩）+ `paste_text` 程序化粘贴 + UTF-16 偏移换算。
+//! `window.handle_input` 挂钩）+ `paste_text` 程序化粘贴。
+//!
+//! IME 状态机本体已收敛到 `crate::ime`（M2.5 双份合一，按 byte 计算）：本文件只
+//! 实现 [`ImeTextHost`] 适配层（byte 语义、rope 支撑的 O(log n) UTF-16 换算、经
+//! `insert_edit` 落地 + undo 意图）+ 编辑器专属几何（组合窗口定位/点命中）。
 
 use std::ops::Range;
 
@@ -11,6 +15,7 @@ use gpui::{
 use crate::editor::undo::EditIntent;
 use crate::editor::Selection;
 use crate::editor::view::{CARET_WIDTH_PX, CodeEditor};
+use crate::ime::{self, ImeTextHost};
 
 impl CodeEditor {
     /// 在选区处粘贴（归一化 CRLF→LF；程序化/应用侧调用）。
@@ -24,6 +29,57 @@ impl CodeEditor {
 // IME / 文本输入
 // -------------------------------------------------------------------------
 
+/// 共享 IME 状态机的 byte 语义宿主适配层：编辑器内部坐标本来就是 byte，
+/// UTF-16 换算走 rope（O(log n)），编辑落地经 `insert_edit`（携带 undo 意图）。
+impl ImeTextHost for CodeEditor {
+    fn len_utf16(&self) -> usize {
+        self.buffer.len_utf16()
+    }
+
+    fn byte_to_utf16(&self, byte: usize) -> usize {
+        self.buffer.byte_to_utf16(byte)
+    }
+
+    fn utf16_to_byte(&self, offset_utf16: usize) -> usize {
+        self.buffer.utf16_to_byte(offset_utf16)
+    }
+
+    fn text_in_bytes(&self, range: Range<usize>) -> Option<String> {
+        Some(self.buffer.text_in_range(range).to_string())
+    }
+
+    fn selection_bytes(&self) -> Range<usize> {
+        self.selection.range()
+    }
+
+    fn selection_reversed(&self) -> bool {
+        self.selection.reversed()
+    }
+
+    fn set_selection_bytes(&mut self, range: Range<usize>) {
+        self.selection = Selection::from_range(range.start, range.end);
+        self.kick_caret();
+    }
+
+    fn marked_bytes(&self) -> Option<Range<usize>> {
+        self.marked_range.clone()
+    }
+
+    fn set_marked_bytes(&mut self, range: Option<Range<usize>>) {
+        self.marked_range = range;
+    }
+
+    fn apply_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        intent: EditIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_edit(range, text, intent, cx);
+    }
+}
+
 impl EntityInputHandler for CodeEditor {
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
@@ -34,7 +90,7 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.buffer.len_utf16())
+        Some(self.len_utf16())
     }
 
     fn selected_text_range(
@@ -43,18 +99,11 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let sel = self.selection;
-        Some(UTF16Selection {
-            range: self.buffer.byte_to_utf16(sel.start())..self.buffer.byte_to_utf16(sel.end()),
-            reversed: sel.reversed(),
-        })
+        Some(ime::selected_text_range(self))
     }
 
     fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range.as_ref().map(|r| {
-            self.buffer.byte_to_utf16(r.start).min(self.buffer.len_utf16())
-                ..self.buffer.byte_to_utf16(r.end).min(self.buffer.len_utf16())
-        })
+        ime::marked_text_range(self)
     }
 
     fn text_for_range(
@@ -64,9 +113,7 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let s = self.buffer.utf16_to_byte(range_utf16.start);
-        let e = self.buffer.utf16_to_byte(range_utf16.end);
-        Some(self.buffer.text_in_range(s..e).to_string())
+        ime::text_for_range(self, range_utf16)
     }
 
     fn replace_text_in_range(
@@ -76,19 +123,11 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let byte_range = match range {
-            Some(r) => self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
-                ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16())),
-            None => self
-                .marked_range
-                .clone()
-                .unwrap_or_else(|| self.selection.range()),
-        };
-        self.insert_edit(byte_range, text, EditIntent::Typing, cx);
         // 提交/直输会结束一次 IME 组合：Windows 提交候选时只发
-        // `replace_text_in_range(None, …)`（不调 unmark_text），不清掉
-        // marked_range 的话，下一次组合会把已提交文本当成旧 marked 区域再次替换。
-        self.marked_range = None;
+        // `replace_text_in_range(None, …)`（不调 unmark_text），共享核心在
+        // 提交后清掉 marked_range——否则下一次组合会把已提交文本当成旧 marked
+        // 区域再次替换（回归见 `editor::tests::view::ime_composition_*`）。
+        ime::replace(self, range, text, None, false, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -99,47 +138,14 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // `None` 区间 = 替换当前 marked（正在组合的）文本；只有没有任何 marked 时的
-        // 首个字符才落在普通 selection 上。以前用 selection 会让每次组合更新都
-        // 「追加」到旧组合后面 → 垃圾残留。
-        let byte_range = match range_utf16 {
-            Some(r) => self.buffer.utf16_to_byte(r.start.min(self.buffer.len_utf16()))
-                ..self.buffer.utf16_to_byte(r.end.min(self.buffer.len_utf16())),
-            None => self
-                .marked_range
-                .clone()
-                .unwrap_or_else(|| self.selection.range()),
-        };
-        self.insert_edit(byte_range.clone(), new_text, EditIntent::Atomic, cx);
-        if new_text.is_empty() {
-            // 组合被取消：清掉 marked，光标停在原地（等价于删掉刚标记的占位）。
-            self.marked_range = None;
-            self.selection = Selection::collapsed(byte_range.start);
-        } else {
-            self.marked_range = Some(byte_range.start..byte_range.start + new_text.len());
-            // `new_selected_range` 是**相对被标记文本（new_text）起点**的 UTF-16
-            // 偏移（AppKit setMarkedText 的 selectedRange 语义），不是文档绝对偏移。
-            // 以前当绝对偏移用 → 光标跳到文档开头附近（大文档任意位置输入中文时
-            // 若光标落点恰在多字节字符中间，后续 insert 直接撞 `byte index is not
-            // on a char boundary` 崩溃）。
-            let (s, e) = match new_selected_range {
-                Some(sel) => (
-                    byte_range.start + ime_utf16_offset_to_byte(new_text, sel.start),
-                    byte_range.start + ime_utf16_offset_to_byte(new_text, sel.end),
-                ),
-                None => (
-                    byte_range.start + new_text.len(),
-                    byte_range.start + new_text.len(),
-                ),
-            };
-            self.selection = Selection::from_range(s, e);
-            self.kick_caret();
-        }
-        cx.notify();
+        // `None` 区间 = 替换当前 marked（正在组合的）文本；没有任何 marked 时
+        // 首个字符才落在普通选区上。`new_selected_range` 相对组合文本起点，
+        // 语义与 AppKit setMarkedText 一致（见 `crate::ime::replace`）。
+        ime::replace(self, range_utf16, new_text, new_selected_range, true, cx);
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.marked_range = None;
+        ime::unmark(self);
     }
 
     fn bounds_for_range(
@@ -188,10 +194,8 @@ impl EntityInputHandler for CodeEditor {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        let s = self.buffer.utf16_to_byte(range_utf16.start.min(self.buffer.len_utf16()));
-        let e = self.buffer.utf16_to_byte(range_utf16.end.min(self.buffer.len_utf16()));
-        self.selection = Selection::from_range(s, e);
-        self.kick_caret();
+        // 编辑器现状不在此处 notify（`set_selection_bytes` 已负责光标），保持原样。
+        ime::set_selected_text_range(self, range_utf16);
     }
 
     fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
@@ -208,24 +212,4 @@ impl EntityInputHandler for CodeEditor {
     ) -> TextInputConfiguration {
         TextInputConfiguration::default()
     }
-}
-
-/// IME `new_selected_range` 辅助：把「相对被标记文本（`text`）起点」的 UTF-16
-/// 偏移换算成 `text` 内的字节偏移。偏到两半的代理对按字符边界取整（停在该字符
-/// 起点），越界夹到文本末尾。
-fn ime_utf16_offset_to_byte(text: &str, offset_utf16: usize) -> usize {
-    let mut bytes = 0usize;
-    let mut units = 0usize;
-    for ch in text.chars() {
-        if units >= offset_utf16 {
-            break;
-        }
-        let cu = ch.len_utf16();
-        if units + cu > offset_utf16 {
-            break;
-        }
-        units += cu;
-        bytes += ch.len_utf8();
-    }
-    bytes
 }
