@@ -1,8 +1,8 @@
 //! WYSIWYG 交互/命中层：窗口坐标 ↔ 源字节（光标几何、点击命中）、代码/表格横向滚动条的几何/命中/跳转与拖拽换算。与 `element` 共用几何。
 use super::*;
-use gpui::{Bounds, Pixels, Point, px, point, size};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::recognition::LinkHit;
+use gpui::{Bounds, Pixels, Point, point, px, size};
 
 /// 图片右上角编辑按钮的边长（px）。命中与 paint 共用，不得分开改。
 pub(crate) const IMAGE_EDIT_BTN_SIZE: f32 = 24.;
@@ -11,13 +11,9 @@ pub(crate) const IMAGE_EDIT_BTN_MARGIN: f32 = 6.;
 /// 图片编辑卡片的宽（px；卡片水平居中于内容区）。
 pub(crate) const IMAGE_EDIT_CARD_W: f32 = 320.;
 
-
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
 /// 行高用 `r.lh`（标题/代码等类型各自行高），否则光标会错位。
-pub(crate) fn caret_geometry(
-    editor: &WyEditor,
-    f: &Frame,
-) -> (bool, Pixels, Pixels) {
+pub(crate) fn caret_geometry(editor: &WyEditor, f: &Frame) -> (bool, Pixels, Pixels) {
     let (cl, col) = editor.row_col(editor.caret());
     let line_start = editor.line_start(cl);
     let line_end = editor.line_end(cl);
@@ -47,7 +43,11 @@ pub(crate) fn caret_geometry(
             let ctop = row_top + px(((f32::from(t.row_h) - caret_h) / 2.).max(0.));
             // 横向滚动时单元格内容随表平移 → 光标条反向减 scroll（paint 平移的逆映射）。
             let scroll = table_hscroll_clamped(editor, f, r);
-            return (true, f.padding + px(cell_x0 + cell.text_x + col_x - scroll), ctop);
+            return (
+                true,
+                f.padding + px(cell_x0 + cell.text_x + col_x - scroll),
+                ctop,
+            );
         }
         if !r.multi_offsets.is_empty() {
             // 代码块：caret 落在围栏内容行（`src_line+1 ..= src_line+n`）才画光标，
@@ -58,9 +58,7 @@ pub(crate) fn caret_geometry(
                 let target = (line_start + col).saturating_sub(block_start);
                 let rend = source_to_display(&r.byte_map, target);
                 let g = group_from_rend(r, rend);
-                let dcol = rend
-                    .saturating_sub(r.multi_offsets[g])
-                    .min(group_len(r, g));
+                let dcol = rend.saturating_sub(r.multi_offsets[g]).min(group_len(r, g));
                 let p = r
                     .wrapped
                     .get(g)
@@ -80,15 +78,17 @@ pub(crate) fn caret_geometry(
         let p = render_point_of(&r.wrapped, r.lh, dcol);
         // `f.padding` = 帧内衬（单一来源 `CONTENT_EDGE_PAD_X_PX`，与 paint 的
         // `origin.x + f.padding` 同 x）；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
-        return (true, f.padding + r.x_off + p.x, r.top + px(text_y_off(r) + text_row_shift(r)) + p.y);
+        return (
+            true,
+            f.padding + r.x_off + p.x,
+            r.top + px(text_y_off(r) + text_row_shift(r)) + p.y,
+        );
     }
     // 带外（caret 所在块未物化 = 屏外）：用紧凑布局 `tops` 兜底定位，不画光标
     // （屏外被容器裁剪）。`row_col`/`line_start` 此时查的仍是块内源码行。
     let ctop = px(f.src_line_top(cl));
     (true, f.padding, ctop)
 }
-
-
 
 /// 点命中（**元素局部坐标**）→ 源字节偏移（帧内 byte_map 反查）。
 /// 命中用的行/列全是元素局部（paint 以 `origin = bounds.origin` 为起点绘制）；
@@ -100,7 +100,9 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
         let bottom = top + f32::from(r.height);
         if rel_y >= top && rel_y < bottom {
             if !r.editable {
-                return editor.line_end(r.src_line).max(editor.line_start(r.src_line));
+                return editor
+                    .line_end(r.src_line)
+                    .max(editor.line_start(r.src_line));
             }
             if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
                 // 表格：y 定可见行（表头/数据行），x 定列，再按对齐位移映射列内渲染列
@@ -114,8 +116,8 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 // 横向滚动时内容坐标 = 视图坐标 + scroll（paint 平移的逆映射）。
                 let scroll = table_hscroll_clamped(editor, frame, r);
                 let rel_x = (f32::from(p.x) - f32::from(frame.padding) + scroll).max(0.);
-                let cell_ix = table_cell_index(&t.widths, rel_x)
-                    .unwrap_or(t.widths.len().saturating_sub(1));
+                let cell_ix =
+                    table_cell_index(&t.widths, rel_x).unwrap_or(t.widths.len().saturating_sub(1));
                 let Some(cell) = row_l.cells.get(cell_ix) else {
                     return editor.caret();
                 };
@@ -159,8 +161,8 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
                 // （`rel_y - top - 撑高下移`）：`closest_index_for_position` 据此选折行的
                 // 第几可视行——写成 0 或漏掉下移量会把撑高行上的点击映射错行/错列。
-                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off))
-                    .max(0.);
+                let rel_x =
+                    (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off)).max(0.);
                 let sub_y = (rel_y - top - text_y_off(r) - text_row_shift(r)).max(0.);
                 let rel = point(px(rel_x), px(sub_y));
                 // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
@@ -178,8 +180,6 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
     editor.caret()
 }
 
-
-
 /// 点命中（**窗口坐标**，`MouseDownEvent.position`）→ 源字节偏移。
 pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> usize {
     // window 坐标先换回元素局部（否则元素被 `live-body` 内边距/滚动/窗口位置偏移后，
@@ -188,8 +188,6 @@ pub(crate) fn source_offset_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels
     let local = to_local(editor, p);
     source_offset_at_local(editor, frame, local)
 }
-
-
 
 /// 元素局部坐标（把窗口坐标减掉元素原点 + 居中阅读栏水平移位）。
 pub(crate) fn to_local(editor: &WyEditor, p: Point<Pixels>) -> Point<Pixels> {
@@ -208,14 +206,20 @@ pub(crate) fn image_box_local(f: &Frame, row: &ShapedRow) -> Option<Bounds<Pixel
     let content_w = f32::from(f.width) - f32::from(f.padding) * 2.;
     let x0 = f32::from(f.padding) + ((content_w - img.w) / 2.).max(0.);
     let top0 = f32::from(row.top);
-    Some(Bounds::new(point(px(x0), px(top0)), size(px(img.w), px(img.h))))
+    Some(Bounds::new(
+        point(px(x0), px(top0)),
+        size(px(img.w), px(img.h)),
+    ))
 }
 
 /// 图片编辑按钮的元素局部矩形：钉在图片盒**右上角**（右缘内收、顶缘下移）。
 pub(crate) fn image_edit_button_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> {
     let x = box_b.right() - px(IMAGE_EDIT_BTN_SIZE + IMAGE_EDIT_BTN_MARGIN);
     let y = box_b.top() + px(IMAGE_EDIT_BTN_MARGIN);
-    Bounds::new(point(x, y), size(px(IMAGE_EDIT_BTN_SIZE), px(IMAGE_EDIT_BTN_SIZE)))
+    Bounds::new(
+        point(x, y),
+        size(px(IMAGE_EDIT_BTN_SIZE), px(IMAGE_EDIT_BTN_SIZE)),
+    )
 }
 
 /// 图片**右中边缘**的调整条（resize handle）几何：竖条贴在图片右内缘、垂直居中。
@@ -272,7 +276,6 @@ pub(crate) fn image_resize_handle_window(
     )
 }
 
-
 /// 命中图片盒（窗口坐标）→ 其 `src_line`；未命中返回 `None`（悬浮按钮亮显判定）。
 pub(crate) fn image_box_hit_at(
     editor: &WyEditor,
@@ -316,8 +319,6 @@ pub(crate) fn image_edit_button_hit_at(
     None
 }
 
-
-
 /// 命中任务框（C1）：返回 (源行, 是否已勾选)。击中「任务行 gutter（☐/☑ 字形区）」
 /// 才返回，否则 None（与 `paint_row_gutter` 的 GUTTER_MARK_X 几何一致）。
 pub(crate) fn checkbox_hit(
@@ -345,8 +346,6 @@ pub(crate) fn checkbox_hit(
     }
     None
 }
-
-
 
 /// 命中警报折叠箭头（C3）：击中警报行 gutter（[padding, padding+ALERT_GUTTER_W] × 行高）
 /// 返回 (源行, 当前是否折叠)。
@@ -377,8 +376,6 @@ pub(crate) fn alert_chevron_hit(
     None
 }
 
-
-
 /// 命中标题折叠箭头：击中标题行的 chevron 区（文本右缘 + 固定宽的命中盒）。
 /// 返回 (源行, 当前是否折叠)。几何与 `paint_heading_chevron` 共用。
 pub(crate) fn heading_chevron_hit(
@@ -408,15 +405,11 @@ pub(crate) fn heading_chevron_hit(
     None
 }
 
-
-
 /// 标题折叠箭头几何：画在**左缘 gutter**（[padding, padding+HEADING_GUTTER_W]，正文
 /// 已右移 `x_off = HEADING_GUTTER_W`）；返回元素局部坐标 (x0, w)。paint 与 hit-test 共用。
 pub(crate) fn heading_chevron_box(f: &Frame, _row: &ShapedRow) -> Option<(f32, f32)> {
     Some((f32::from(f.padding), HEADING_GUTTER_W))
 }
-
-
 
 /// 命中行内 `$…$` 公式的 spacer：击中其显示区 → 返回该公式的**绝对源字节区间**
 /// （含定界符 `$…$`，`InlineMathText.source`）。双击命中时把光标塞进区间起点 + 1
@@ -454,15 +447,14 @@ pub(crate) fn inline_math_hit_at(
                 && py < y0 + f32::from(r.lh)
                 && px >= x0
                 && px <= x1.max(x0 + 1.)
-                && !im.source.is_empty() {
-                    return Some(im.source.clone());
-                }
+                && !im.source.is_empty()
+            {
+                return Some(im.source.clone());
+            }
         }
     }
     None
 }
-
-
 
 /// 命中数学块卡片（A1，`$$…$$` 折叠成的 `BlockCard::Math` 行）：击中卡片范围 →
 /// 返回该块的**首源码行行首绝对字节**（把光标放进去即 reveal 源码进入编辑）。
@@ -491,11 +483,13 @@ pub(crate) fn math_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) 
     None
 }
 
-
-
 /// Mermaid 卡点击命中（**聚焦**用）：窗口坐标 → 该卡 `src_line`。点击后该卡获得焦点，
 /// 此后**只有它**响应滚轮缩放；未聚焦时滚轮一律放行给宿主正常滚动。
-pub(crate) fn mermaid_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> Option<usize> {
+pub(crate) fn mermaid_card_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<usize> {
     let p = to_local(editor, p);
     let px = f32::from(p.x);
     let py = f32::from(p.y);
@@ -518,14 +512,8 @@ pub(crate) fn mermaid_card_hit(editor: &WyEditor, frame: &Frame, p: Point<Pixels
     None
 }
 
-
-
 /// 命中的可点击链接目标（C5）：窗口坐标 → 行内链接显示区间集合，命中的返回 `LinkHit`。
-pub(crate) fn link_hit_at(
-    editor: &WyEditor,
-    frame: &Frame,
-    p: Point<Pixels>,
-) -> Option<LinkHit> {
+pub(crate) fn link_hit_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) -> Option<LinkHit> {
     let p = to_local(editor, p);
     let py = f32::from(p.y);
     for r in &frame.rows {
@@ -550,13 +538,18 @@ pub(crate) fn link_hit_at(
             let contains = if f32::from(p0.y) == f32::from(p1.y) {
                 let x0 = ox + f32::from(p0.x);
                 let x1 = ox + f32::from(p1.x);
-                py >= p0y && py < p0y + f32::from(r.lh) && f32::from(p.x) >= x0 && f32::from(p.x) <= x1
+                py >= p0y
+                    && py < p0y + f32::from(r.lh)
+                    && f32::from(p.x) >= x0
+                    && f32::from(p.x) <= x1
             } else {
                 // 折行：头段或尾段
-                let head_ok = py >= p0y && py < p0y + f32::from(r.lh)
+                let head_ok = py >= p0y
+                    && py < p0y + f32::from(r.lh)
                     && f32::from(p.x) >= ox + f32::from(p0.x)
                     && f32::from(p.x) <= ox + f32::from(w0.width());
-                let tail_ok = py >= p1y && py < p1y + f32::from(r.lh)
+                let tail_ok = py >= p1y
+                    && py < p1y + f32::from(r.lh)
                     && f32::from(p.x) >= ox
                     && f32::from(p.x) <= ox + f32::from(p1.x);
                 head_ok || tail_ok
@@ -568,8 +561,6 @@ pub(crate) fn link_hit_at(
     }
     None
 }
-
-
 
 /// 代码块横向滚动条几何（内容超宽才返回）。
 /// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
@@ -592,20 +583,24 @@ pub(crate) fn code_hscroll_geo(
         return None;
     }
     let max_scroll = max_w - viewport;
-    let scroll = editor.code_h_scroll_of(row.src_line).min(max_scroll).max(0.);
-    let frac = if max_scroll > 0. { scroll / max_scroll } else { 0. };
+    let scroll = editor
+        .code_h_scroll_of(row.src_line)
+        .min(max_scroll)
+        .max(0.);
+    let frac = if max_scroll > 0. {
+        scroll / max_scroll
+    } else {
+        0.
+    };
     let bar_x = f32::from(f.padding) + inset;
     let bar_w = viewport.max(1.);
     // 与 view 的 gpui-component 同式：thumb = container/scroll_area × container，最小 48。
-    let thumb_w =
-        (bar_w * viewport / max_w)
-            .max(crate::config::layout::CODE_HSCROLL_THUMB_MIN)
-            .min(bar_w);
+    let thumb_w = (bar_w * viewport / max_w)
+        .max(crate::config::layout::CODE_HSCROLL_THUMB_MIN)
+        .min(bar_w);
     let thumb_x = bar_x + (bar_w - thumb_w) * frac;
     Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
 }
-
-
 
 /// 代码块当前生效的横向滚动偏移（px）：内容不超宽 → 0（忽略陈旧滚动值，宽窗口下
 /// 长行不再偏移）；超宽 → 按 `max_scroll` clamp。paint / 命中 / 光标 / 选区共用。
@@ -618,8 +613,6 @@ pub(crate) fn code_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRow
         None => 0.,
     }
 }
-
-
 
 /// 代码块横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
 /// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回
@@ -646,7 +639,8 @@ pub(crate) fn code_hscrollbar_hit(
             continue;
         };
         // 底部滚动条带：轨道顶（面板底 − `CODE_HSCROLL_BAND`）之间。
-        let band_top = f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_top =
+            f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
         if py < band_top {
             continue;
         }
@@ -660,8 +654,6 @@ pub(crate) fn code_hscrollbar_hit(
     }
     None
 }
-
-
 
 /// 表格横向滚动条几何（内容超宽才返回）。
 /// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
@@ -680,8 +672,15 @@ pub(crate) fn table_hscroll_geo(
     let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
     let max_w = t.total_w.max(1.);
     let max_scroll = (max_w - viewport).max(0.);
-    let scroll = editor.table_h_scroll_of(row.src_line).min(max_scroll).max(0.);
-    let frac = if max_scroll > 0. { scroll / max_scroll } else { 0. };
+    let scroll = editor
+        .table_h_scroll_of(row.src_line)
+        .min(max_scroll)
+        .max(0.);
+    let frac = if max_scroll > 0. {
+        scroll / max_scroll
+    } else {
+        0.
+    };
     let bar_x = f32::from(f.padding);
     let bar_w = viewport.max(1.);
     // 与 view 的 gpui-component 同式：thumb = container/scroll_area × container，最小 48。
@@ -692,8 +691,6 @@ pub(crate) fn table_hscroll_geo(
     let thumb_x = bar_x + (bar_w - thumb_w) * frac;
     Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
 }
-
-
 
 /// 表格当前生效的横向滚动偏移（px）：内容不超宽 → 0（忽略陈旧滚动值，宽窗口下
 /// 表格不再偏移）；超宽 → 按 `max_scroll` clamp。paint / 命中 / 光标共用。
@@ -706,8 +703,6 @@ pub(crate) fn table_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRo
         None => 0.,
     }
 }
-
-
 
 /// 表格横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
 /// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回 `(块首源行, 是否点在滑块上,
@@ -731,7 +726,110 @@ pub(crate) fn table_hscrollbar_hit(
             continue;
         };
         // 底部滚动条带：轨道顶（块底 − `CODE_HSCROLL_BAND`）之间。
-        let band_top = f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_top =
+            f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        if py < band_top {
+            continue;
+        }
+        if px >= bar_x && px <= bar_x + bar_w {
+            let on_thumb = px >= thumb_x && px <= thumb_x + thumb_w;
+            let grab = px - thumb_x;
+            return Some((r.src_line, on_thumb, grab));
+        }
+    }
+    None
+}
+
+/// 数学卡内容**自然宽**（px）：位图就绪 → 排版位图逻辑宽（自然宽、**不缩小**）；
+/// 排版中（Loading/缺位）且有钉住的旧位图 → 旧位图逻辑宽（paint 正在画它，滚动条/
+/// 命中必须与绘制同源，不能退回 Unicode 测得宽）；都没有 → paint 侧测好的 Unicode 行
+/// 最大宽（`math_natural_w_of` 侧缓存）。画图与命中/滚动条共用同一推导 → 长公式超宽
+/// 才出横向滚动条（`math_hscroll_geo`）。
+pub(crate) fn math_natural_w(editor: &WyEditor, row: &ShapedRow) -> f32 {
+    let Some(BlockCard::Math { latex, .. }) = &row.extra.card else {
+        return 0.;
+    };
+    match math_card_display(editor, row.src_line, latex.trim()) {
+        MathCardDisplay::Ready(_, w, _) | MathCardDisplay::Pinned(_, w, _) => w.max(1.),
+        MathCardDisplay::Fallback => editor.math_natural_w_of(row.src_line).max(0.),
+    }
+}
+
+/// 数学卡横向滚动条几何（公式自然宽 > 内容盒才返回）。
+/// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
+/// `(bar_x, bar_w, thumb_x, thumb_w, max_scroll)`。`viewport` = 卡片内容盒宽
+/// （帧宽 − 左右内边距 `padding`×2，与 `paint_card` 的灰底同宽）；`natural_w` =
+/// [`math_natural_w`]（位图逻辑宽 / Unicode 行最大宽）——公式**不缩小**，超宽靠
+/// 该横向滚动条查看（掩码裁剪 + 平移，同代码块/表格）。
+pub(crate) fn math_hscroll_geo(
+    editor: &WyEditor,
+    f: &Frame,
+    row: &ShapedRow,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    if !matches!(&row.extra.card, Some(BlockCard::Math { .. })) {
+        return None;
+    }
+    let viewport = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
+    let natural_w = math_natural_w(editor, row);
+    if natural_w <= viewport + 1. {
+        return None; // 不超宽 → 无滚动（并忽略陈旧滚动值，宽窗口下公式不移位）
+    }
+    let max_scroll = natural_w - viewport;
+    let scroll = editor
+        .math_h_scroll_of(row.src_line)
+        .min(max_scroll)
+        .max(0.);
+    let frac = if max_scroll > 0. {
+        scroll / max_scroll
+    } else {
+        0.
+    };
+    let bar_x = f32::from(f.padding);
+    let bar_w = viewport.max(1.);
+    // 与 view 的 gpui-component 同式：thumb = container/scroll_area × container，最小 48。
+    let thumb_w = (bar_w * viewport / natural_w)
+        .max(crate::config::layout::CODE_HSCROLL_THUMB_MIN)
+        .min(bar_w);
+    let thumb_x = bar_x + (bar_w - thumb_w) * frac;
+    Some((bar_x, bar_w, thumb_x, thumb_w, max_scroll))
+}
+
+/// 数学卡当前生效的横向滚动偏移（px）：公式不超宽 → 0（忽略陈旧滚动值）；超宽 →
+/// 按 `max_scroll` clamp。paint / 命中 / 滚动条几何共用。
+pub(crate) fn math_hscroll_clamped(editor: &WyEditor, f: &Frame, row: &ShapedRow) -> f32 {
+    match math_hscroll_geo(editor, f, row) {
+        Some((_, _, _, _, max_scroll)) => editor
+            .math_h_scroll_of(row.src_line)
+            .min(max_scroll)
+            .max(0.),
+        None => 0.,
+    }
+}
+
+/// 数学卡横向滚动条命中（元素局部→窗口坐标）：命中**底部滚动条带**
+/// （轨道 ~`CODE_HSCROLL_BAND` 高）→ 返回 `(块首源行, 是否点在滑块上,
+/// 指针相对滑块左缘的水平偏移)`。语义与 [`code_hscrollbar_hit`]/[`table_hscrollbar_hit`]
+/// 一致（点在滑块 → 拖动；点在轨道 → 轨道跳转）。
+pub(crate) fn math_hscrollbar_hit(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<(usize, bool, f32)> {
+    let p = to_local(editor, p);
+    let px = f32::from(p.x);
+    let py = f32::from(p.y);
+    for r in &frame.rows {
+        let top = f32::from(r.top);
+        let bottom = top + f32::from(r.height);
+        if !(py >= top && py < bottom) || !matches!(&r.extra.card, Some(BlockCard::Math { .. })) {
+            continue;
+        }
+        let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = math_hscroll_geo(editor, frame, r) else {
+            continue;
+        };
+        // 底部滚动条带：轨道顶（块底 − `CODE_HSCROLL_BAND`）之间。
+        let band_top =
+            f32::from(r.top) + f32::from(r.height) - crate::config::layout::CODE_HSCROLL_BAND;
         if py < band_top {
             continue;
         }

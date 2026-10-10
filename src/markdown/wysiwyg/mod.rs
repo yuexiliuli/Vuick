@@ -33,11 +33,11 @@
 //! 组件在场时同步高亮）。待搬：EPUB 阅读布局（标题居中/首行缩进/注记悬浮卡）。
 
 mod element;
-mod input;
 pub(crate) mod frame;
+mod input;
 pub(crate) mod math;
-pub(crate) mod mermaid;
 mod math_typeset;
+pub(crate) mod mermaid;
 pub(crate) mod shape;
 
 // 子模块扁平重导出：`element::*` 把布局类型 + geom/math/shape 的 pub(crate) 项一并带进
@@ -395,17 +395,24 @@ pub struct WyEditor {
     /// `sync_code_parse` 后台跑 `parse_code_lines` 后落 Done）。解析就绪由
     /// `on_code_parse_ready` **定向作废该代码块的行整形缓存条目**（非全局代数）→ 下帧
     /// 重建用高亮行替换占位纯文本行。
-    code_parse: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
+    code_parse:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
     /// 本帧登记的待后台解析队列 `((语言, 代码), 块 src_line)`（`sync_code_parse` 每帧
     /// 清空消费）。`src_line` 用于完成时的**带内门控**（块还在带内才立即重建帧上色）。
     code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
     /// 数学显示行数缓存（见字段声明）。
-    math_line_map: RefCell<std::collections::HashMap<String, usize>>,
+    math_line_map: RefCell<std::collections::HashMap<String, f32>>,
     /// 行内公式键（`"inline:…"`）→ 包含它的行 src_line（`sync_math` claim 时登记）。
     /// `on_math_ready` 完成时**定向作废**这些行整形缓存条目——替代 mgen 进全局 shape_key
     /// 的整带 miss（`$$` 显示块在 Pass2 被 blocked、不入 `shape_rows`，无需作废）。
     /// 换源清空（行号随源失效）；轻微过期只多作废一两个无关块（无害，正确性不受影响）。
     inline_math_rows: RefCell<std::collections::HashMap<SharedString, Vec<usize>>>,
+    /// 块级 `$$` 卡「最近一次就绪位图」钉（键 = 块首源码行）：公式源逐键变化使当前键
+    /// 落在 Loading/缺位时，paint 用钉住的旧位图代替 Unicode 回退，新位图就绪时以同
+    /// 几何无缝替换——消除「Loading Unicode 回退 ↔ Ready 位图」两态闪跳（键入回弹）。
+    /// 结构编辑/换源/主题色变化清空（行号或颜色失效）；其余时间的钉是 Op(块数) 的有界
+    /// 缓存（每块至多一条，位图 `Arc` 与槽共享）。
+    math_pins: RefCell<std::collections::HashMap<usize, BlockMathPin>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
     /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
@@ -438,6 +445,16 @@ pub struct WyEditor {
     table_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
     /// 表格横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
     table_h_drag: RefCell<Option<(usize, f32)>>,
+    /// 数学卡横向滚动偏移（px；键 = 数学块首源码行）。公式自然宽 > 内容盒（长公式
+    /// **不缩小**）时由底部横向滚动条/拖动驱动（paint 平移 + 命中反向加回，同
+    /// 代码块 `code_h_scroll`）。纯视图状态，不写源码、不进撤销栈。
+    math_h_scroll: RefCell<std::collections::HashMap<usize, f32>>,
+    /// 数学卡横向滚动条拖拽进行中：`Some((块首源码行, 指针相对滑块左缘偏移))`。
+    math_h_drag: RefCell<Option<(usize, f32)>>,
+    /// 数学卡内容的**自然宽**侧缓存（px；键 = 数学块首源码行）：paint 每次画卡时
+    /// 测好（位图逻辑宽 / Unicode 行最大宽），命中/滚动条几何（`math_hscroll_geo`）
+    /// 读它——避免 hit 期无窗口无法排版 Unicode。与滚动偏移同源 `math_h_scroll`。
+    math_natural_w: RefCell<std::collections::HashMap<usize, f32>>,
     /// 已折叠的标题区块（视图本地状态，键 = 标题行 trim 后的文本，与 `live` 一致；
     /// markdown 没有标题折叠语法，折叠态**不写回源码**、不进撤销栈）。点击标题行
     /// 右缘的折叠箭头翻转（`▸` 展开 / `▾` 折叠）；折叠后该 section 的 body 行
@@ -498,7 +515,11 @@ enum BlockRegion {
     /// 代码围栏：内容行 `lo..=hi` 连续；围栏行 = `lo-1`（开）、`hi+1`（闭）。
     Code { lo: usize, hi: usize },
     /// GFM 表格：表头行 + 数据行 `dlo..=dhi`；分隔行（围栏）= `dlo-1`。
-    Table { header: usize, dlo: usize, dhi: usize },
+    Table {
+        header: usize,
+        dlo: usize,
+        dhi: usize,
+    },
 }
 
 /// 图片编辑卡片：两个单行输入框（链接 + 文本）锚定在目标图片旁。
@@ -534,6 +555,16 @@ pub(crate) enum MathSlot {
     Failed,
 }
 
+/// 一块 `$$` 卡最近一次**就绪位图**的钉（paint/sync_math 在 Ready 时录制；当前键
+/// Loading/缺位时改用它，防止 Unicode 回退闪跳）。尺寸与槽一致（位图逻辑 px）。
+#[derive(Clone)]
+pub(crate) struct BlockMathPin {
+    /// 位图 + 逻辑（pre-DPR）px 尺寸。
+    pub image: Arc<RenderImage>,
+    pub w: f32,
+    pub h: f32,
+}
+
 /// 数学文字色（单一源：位图着色 = Unicode 回退文本色 = 渲染 fallback 一致）。
 /// 取 `config::math::MATH_COLOR` 的紫（业界公式感），暗色主题提亮。
 pub(crate) fn math_color(theme: &WyTheme) -> Hsla {
@@ -562,7 +593,8 @@ pub(crate) fn inline_math_key(latex: &str) -> SharedString {
 /// ~200ms）。
 pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32, zgen: u64) -> u64 {
     let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95) ^ zgen.wrapping_mul(0x243F_6A88_85A3_08D3);
+    let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95)
+        ^ zgen.wrapping_mul(0x243F_6A88_85A3_08D3);
     let x = a ^ b.rotate_left(32);
     x ^ x >> 33
 }
@@ -573,7 +605,10 @@ pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32, zgen: u6
 pub(crate) fn zoom_band_for_top(top: f32, viewport_h: Pixels) -> (f32, f32) {
     let q = 512.;
     let vh = viewport_h.as_f32().max(1.);
-    ((((top - vh) / q).floor() * q).max(0.), ((top + 2. * vh) / q).ceil() * q)
+    (
+        (((top - vh) / q).floor() * q).max(0.),
+        ((top + 2. * vh) / q).ceil() * q,
+    )
 }
 
 /// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `content_gen` 缓存，滚动 /
@@ -588,7 +623,8 @@ pub(crate) struct WyDerived {
     /// 每个警报区域的 `AlertKind`（marker + body 行），paint 引述条着色用。
     /// Fx 哈希：结构编辑 `shift_derived` 全量平移重插时省 SipHash（大文档几百到
     /// 数千条 ≈ Enter 路径 1-2ms）。
-    pub alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind>,
+    pub alert_region_kinds:
+        rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind>,
 }
 
 /// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——已被「可见带懒光栅」取代（`sync_math`
@@ -674,7 +710,11 @@ struct RowShapeEntry {
 
 impl RowShapeCache {
     fn new(cap: usize) -> Self {
-        Self { entries: std::collections::HashMap::new(), cap, clock: 0 }
+        Self {
+            entries: std::collections::HashMap::new(),
+            cap,
+            clock: 0,
+        }
     }
     /// 命中：更新访问钟并返回 `Rc`（浅克隆即可取得行，heavy 数据全是 Arc/Rc）。
     fn get(&mut self, id: u64, key: u64) -> Option<std::rc::Rc<element::ShapedRow>> {
@@ -693,21 +733,31 @@ impl RowShapeCache {
         self.entries.get(&id).is_some_and(|e| e.key != key)
     }
     /// 插入（新行）；容量满时淘汰 last_seen 最小的条目。返回缓存的 `Rc`。
-    fn put(&mut self, id: u64, key: u64, row: element::ShapedRow) -> std::rc::Rc<element::ShapedRow> {
-        if self.entries.len() >= self.cap && !self.entries.contains_key(&id)
+    fn put(
+        &mut self,
+        id: u64,
+        key: u64,
+        row: element::ShapedRow,
+    ) -> std::rc::Rc<element::ShapedRow> {
+        if self.entries.len() >= self.cap
+            && !self.entries.contains_key(&id)
             && let Some(old) = self.entries.values().map(|e| e.last_seen).min()
-                && let Some(k) = self
-                    .entries
-                    .iter()
-                    .find(|(_, e)| e.last_seen == old)
-                    .map(|(k, _)| *k)
-                {
-                    self.entries.remove(&k);
-                }
+            && let Some(k) = self
+                .entries
+                .iter()
+                .find(|(_, e)| e.last_seen == old)
+                .map(|(k, _)| *k)
+        {
+            self.entries.remove(&k);
+        }
         let rc = std::rc::Rc::new(row);
         self.entries.insert(
             id,
-            RowShapeEntry { key, last_seen: self.clock, row: rc.clone() },
+            RowShapeEntry {
+                key,
+                last_seen: self.clock,
+                row: rc.clone(),
+            },
         );
         self.clock = self.clock.wrapping_add(1);
         rc
@@ -846,7 +896,8 @@ pub(crate) fn warm_emoji_rasterizer(window: &mut Window, tag: &'static str) {
     if WARM_DONE.load(std::sync::atomic::Ordering::Relaxed) {
         // 高频重绘下每帧都打会刷屏 → 仅 WY_WARM_DEBUG=1 时打，且每进程**只打一次**
         //（「哪个窗格命中已完成的守卫」这一诊断目标达成后，默认路径不再喷日志）。
-        static LOGGED_SKIP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static LOGGED_SKIP: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
         if std::env::var_os("WY_WARM_DEBUG").is_some()
             && !LOGGED_SKIP.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
@@ -979,7 +1030,12 @@ pub(crate) struct Prewarm {
 
 impl Default for Prewarm {
     fn default() -> Self {
-        Self { dir: 0, blocks_per_frame: 3, bias: 0, last_band_idx: None }
+        Self {
+            dir: 0,
+            blocks_per_frame: 3,
+            bias: 0,
+            last_band_idx: None,
+        }
     }
 }
 
@@ -1080,9 +1136,9 @@ impl WyEditor {
             mermaid_zoom: RefCell::new(std::collections::HashMap::new()),
             mermaid_zoom_gen: Cell::new(0),
             focused_mermaid: None,
-            code_parse: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            code_parse: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             code_parse_need: RefCell::new(Vec::new()),
             // 数学**显示行数**缓存（键=去定界符源）：`math_card_height` 回退分支按行数
             // 估高——`math_display_lines` 会对每个源做 LaTeX→Unicode 转换，3000 个数学
@@ -1090,6 +1146,7 @@ impl WyEditor {
             // 清缓存。
             math_line_map: RefCell::new(std::collections::HashMap::new()),
             inline_math_rows: RefCell::new(std::collections::HashMap::new()),
+            math_pins: RefCell::new(std::collections::HashMap::new()),
             base_dir: None,
             marked: None,
             sel_anchor: None,
@@ -1101,6 +1158,9 @@ impl WyEditor {
             code_h_drag: RefCell::new(None),
             table_h_scroll: RefCell::new(std::collections::HashMap::new()),
             table_h_drag: RefCell::new(None),
+            math_h_scroll: RefCell::new(std::collections::HashMap::new()),
+            math_h_drag: RefCell::new(None),
+            math_natural_w: RefCell::new(std::collections::HashMap::new()),
             folded_headings: RefCell::new(std::collections::HashSet::new()),
             block_regions: Vec::new(),
             undo_stack: Vec::new(),
@@ -1198,7 +1258,9 @@ impl WyEditor {
         let n = self.doc.block_count();
         let mut out = Vec::with_capacity(n.min(1024));
         for i in 0..n {
-            let Some(m) = self.doc.block_meta(i) else { continue };
+            let Some(m) = self.doc.block_meta(i) else {
+                continue;
+            };
             if let crate::markdown::parse::RowKind::Heading(level) = m.kind {
                 let t = self.line_text(m.src_line as usize);
                 let clean = t.trim().trim_start_matches('#').trim_start();
@@ -1229,7 +1291,12 @@ impl WyEditor {
             return f32::NAN;
         }
         let block = self.doc.block_index_for_line(src_line).min(n - 1);
-        let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+        let width = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f.width)
+            .unwrap_or(px(800.));
         // 确保基础布局已建（未建则先建一次再读估计块顶；带外只取估算用于定位）。
         if self.frame.borrow().is_none() {
             let band = self.shape_band().unwrap_or((0., 5000.));
@@ -1462,7 +1529,10 @@ impl WyEditor {
             return line;
         }
         let ix = self.doc.block_index_for_line(line).min(n.saturating_sub(1));
-        self.doc.block_meta(ix).map(|m| m.src_line as usize).unwrap_or(line)
+        self.doc
+            .block_meta(ix)
+            .map(|m| m.src_line as usize)
+            .unwrap_or(line)
     }
 
     /// 重排前捕捉缩放锚点：当前视口顶部 px → 落在的块 + 块内比例。
@@ -1477,7 +1547,11 @@ impl WyEditor {
     /// 时直接早退——宿主每帧都调，避免反复 RefCell 写 + Rc 克隆。
     pub(crate) fn set_host_scroll(&mut self, handle: Option<gpui::ScrollHandle>, pad_y: f32) {
         if handle.is_some()
-            && self.host_scroll.borrow().as_ref().is_some_and(|(_, p)| *p == pad_y)
+            && self
+                .host_scroll
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, p)| *p == pad_y)
         {
             return;
         }
@@ -1710,6 +1784,8 @@ impl WyEditor {
         self.math_line_map.borrow_mut().clear();
         // 换源：行的 src_line 全变 → 行内公式→行的登记作废（重新 claim 时再登记）。
         self.inline_math_rows.borrow_mut().clear();
+        // 换源：数学位图钉随行号作废（重新绘制/claim 时再录）。
+        self.clear_math_pins();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
@@ -1789,9 +1865,9 @@ impl WyEditor {
         if !resolved.starts_with("http://")
             && !resolved.starts_with("https://")
             && !resolved.starts_with("file://")
-            && let Some((w, h)) = crate::markdown::view::dimensions::image_dimensions(
-                std::path::Path::new(&resolved),
-            ) {
+            && let Some((w, h)) =
+                crate::markdown::view::dimensions::image_dimensions(std::path::Path::new(&resolved))
+        {
             self.image_sizes
                 .borrow_mut()
                 .insert(src.into(), Some((w as f32, h as f32)));
@@ -1835,11 +1911,7 @@ impl WyEditor {
             Some(a) if a != self.caret => {
                 let s = a.min(self.caret).min(self.len());
                 let e = a.max(self.caret).min(self.len());
-                if s < e {
-                    Some(s..e)
-                } else {
-                    None
-                }
+                if s < e { Some(s..e) } else { None }
             }
             _ => None,
         }
@@ -2020,13 +2092,15 @@ impl WyEditor {
         } else {
             self.marked = Some(
                 byte_range.start
-                    ..byte_range.start
-                        + new_text.len().min(self.len() - byte_range.start),
+                    ..byte_range.start + new_text.len().min(self.len() - byte_range.start),
             );
             // `new_selected_range` 是**相对 new_text 起点**的 UTF-16 偏移，不是文档
             // 绝对偏移（AppKit setMarkedText 的 selectedRange 语义）。
             let caret = match new_selected_range {
-                Some(sel) => byte_range.start + input::offset_from_utf16(new_text, sel.start).min(new_text.len()),
+                Some(sel) => {
+                    byte_range.start
+                        + input::offset_from_utf16(new_text, sel.start).min(new_text.len())
+                }
                 None => byte_range.start + new_text.len(),
             };
             self.caret = caret.min(self.len());
@@ -2088,9 +2162,7 @@ impl WyEditor {
                 let (src, start_w) = f
                     .rows
                     .iter()
-                    .find(|r| {
-                        r.src_line == line && r.kind == crate::markdown::ir::IrKind::Image
-                    })
+                    .find(|r| r.src_line == line && r.kind == crate::markdown::ir::IrKind::Image)
                     .and_then(|r| r.image.as_ref())
                     .map(|i| (i.src.clone(), i.w))
                     .unwrap_or((gpui::SharedString::default(), 0.));
@@ -2118,8 +2190,7 @@ impl WyEditor {
             }
             // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
             // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
-            if let Some((blk, on_thumb, grab)) =
-                element::table_hscrollbar_hit(self, f, ev.position)
+            if let Some((blk, on_thumb, grab)) = element::table_hscrollbar_hit(self, f, ev.position)
             {
                 drop(marker);
                 self.focus.focus(window, cx);
@@ -2134,8 +2205,7 @@ impl WyEditor {
             }
             // 代码块横向滚动条（内容超宽的块底部轨道）：点在**滑块**上 → 拖动；
             // 点在**轨道**上 → 滑块直接跳到点击处（view 的 gpui-component 语义）。
-            if let Some((blk, on_thumb, grab)) =
-                element::code_hscrollbar_hit(self, f, ev.position)
+            if let Some((blk, on_thumb, grab)) = element::code_hscrollbar_hit(self, f, ev.position)
             {
                 drop(marker);
                 self.focus.focus(window, cx);
@@ -2145,6 +2215,21 @@ impl WyEditor {
                 } else {
                     // 跳转：滑块中心对准点击点（·`rel = (px − bar_x − thumb_w/2)/travel`）。
                     self.code_bar_jump_to(blk, ev.position);
+                    cx.notify();
+                }
+                return;
+            }
+            // 数学卡横向滚动条（超宽公式卡的底部轨道）：滑块 → 拖；轨道 → 跳转
+            // （与代码块/表格同语义；长公式不缩小、块内横滚）。
+            if let Some((blk, on_thumb, grab)) = element::math_hscrollbar_hit(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                if on_thumb {
+                    *self.math_h_drag.borrow_mut() = Some((blk, grab));
+                    self.math_h_drag_apply(ev.position, cx);
+                } else {
+                    self.math_bar_jump_to(blk, ev.position);
                     cx.notify();
                 }
                 return;
@@ -2206,14 +2291,13 @@ impl WyEditor {
                 }
                 return;
             }
-            if dbl
-                && let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
-                    drop(marker);
-                    self.focus.focus(window, cx);
-                    self.set_caret(src.start + 1);
-                    cx.notify();
-                    return;
-                }
+            if dbl && let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.set_caret(src.start + 1);
+                cx.notify();
+                return;
+            }
         }
         let off = element::source_offset_at(self, f, ev.position);
         drop(marker);
@@ -2229,13 +2313,17 @@ impl WyEditor {
             self.apply_image_resize(ev.position.x, cx);
             return;
         }
-        // 代码/表格横向滚动条拖动优先（不参与选区拖选）。
+        // 代码/表格/数学卡横向滚动条拖动优先（不参与选区拖选）。
         if self.code_h_drag.borrow().is_some() {
             self.code_h_drag_apply(ev.position, cx);
             return;
         }
         if self.table_h_drag.borrow().is_some() {
             self.table_h_drag_apply(ev.position, cx);
+            return;
+        }
+        if self.math_h_drag.borrow().is_some() {
+            self.math_h_drag_apply(ev.position, cx);
             return;
         }
         // 未拖选：更新图片悬浮态（命中图片盒 → 该图右上角浮现编辑按钮）。
@@ -2367,7 +2455,10 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
-        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
+        let Some(r) = f
+            .rows
+            .iter()
+            .find(|r| r.src_line == blk && !r.multi_offsets.is_empty())
         else {
             return;
         };
@@ -2398,7 +2489,11 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
-        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && r.table.is_some()) else {
+        let Some(r) = f
+            .rows
+            .iter()
+            .find(|r| r.src_line == blk && r.table.is_some())
+        else {
             return;
         };
         let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
@@ -2430,7 +2525,11 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
-        let Some(r) = f.rows.iter().find(|r| r.src_line == blk && r.table.is_some()) else {
+        let Some(r) = f
+            .rows
+            .iter()
+            .find(|r| r.src_line == blk && r.table.is_some())
+        else {
             return;
         };
         let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::table_hscroll_geo(self, f, r)
@@ -2454,12 +2553,79 @@ impl WyEditor {
         cx.notify();
     }
 
-    /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格横向滚动条拖动。
+    /// 数学卡滚动条**轨道点击跳转**：滑块中心对准点击点（与 [`Self::code_bar_jump_to`] 同语义）。
+    fn math_bar_jump_to(&self, blk: usize, pos: gpui::Point<Pixels>) {
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f.rows.iter().find(|r| {
+            r.src_line == blk && matches!(&r.extra.card, Some(element::BlockCard::Math { .. }))
+        }) else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::math_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
+        let travel = (bar_w - thumb_w).max(1.);
+        let rel = ((p_local - bar_x - thumb_w / 2.0) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_math_h_scroll(blk, rel * max_scroll);
+    }
+
+    /// 把指针位置应用到正在拖动的数学卡横向滚动条（抓取点相对滑块左缘，1:1 跟随）。
+    fn math_h_drag_apply(&self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some((blk, grab)) = *self.math_h_drag.borrow() else {
+            return;
+        };
+        let marker = self.frame.borrow();
+        let Some(f) = marker.as_ref().map(|r| &**r) else {
+            return;
+        };
+        let Some(r) = f.rows.iter().find(|r| {
+            r.src_line == blk && matches!(&r.extra.card, Some(element::BlockCard::Math { .. }))
+        }) else {
+            return;
+        };
+        let Some((bar_x, bar_w, _, thumb_w, max_scroll)) = element::math_hscroll_geo(self, f, r)
+        else {
+            return;
+        };
+        let origin_x = self
+            .last_bounds()
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.);
+        let elem_w = self
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        // 居中阅读栏：元素屏幕原点外再减列移位，窗口坐标才落在内容区内部坐标系。
+        let p_local = f32::from(pos.x) - origin_x - self.reading_col_shift(elem_w);
+        let travel = (bar_w - thumb_w).max(1.);
+        let rel = ((p_local - bar_x - grab) / travel).clamp(0., 1.);
+        drop(marker);
+        self.set_math_h_scroll(blk, rel * max_scroll);
+        cx.notify();
+    }
+
+    /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格 & 数学卡横向滚动条拖动。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
         self.end_image_resize();
         *self.code_h_drag.borrow_mut() = None;
         *self.table_h_drag.borrow_mut() = None;
+        *self.math_h_drag.borrow_mut() = None;
         cx.notify();
     }
 
@@ -2534,7 +2700,12 @@ impl WyEditor {
         let z = (self.mermaid_zoom(block) + step * 0.12).clamp(0.5, 3.0);
         self.set_mermaid_zoom(block, z);
         // 3) 渲染期重建窗口化帧 → 新布局的精确块 top/height。
-        let width = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+        let width = self
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f.width)
+            .unwrap_or(px(800.));
         let band = self.shape_band().unwrap_or((0., 5000.));
         let frame = element::build_frame(self, window, width, band);
         // 4) 锚点块在新布局里的精确位置 = 恢复目标（元素局部 y）。
@@ -2572,10 +2743,13 @@ impl WyEditor {
         cx.notify();
     }
 
-
     /// 代码块横向滚动偏移（键 = 代码块首源码行）。视图本地状态（不写源码）。
     pub(crate) fn code_h_scroll_of(&self, src_line: usize) -> f32 {
-        self.code_h_scroll.borrow().get(&src_line).copied().unwrap_or(0.)
+        self.code_h_scroll
+            .borrow()
+            .get(&src_line)
+            .copied()
+            .unwrap_or(0.)
     }
     /// 设置代码块横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
     pub(crate) fn set_code_h_scroll(&self, src_line: usize, v: f32) {
@@ -2589,7 +2763,11 @@ impl WyEditor {
 
     /// 表格横向滚动偏移（px；键 = 表格块首源码行）。
     pub(crate) fn table_h_scroll_of(&self, src_line: usize) -> f32 {
-        self.table_h_scroll.borrow().get(&src_line).copied().unwrap_or(0.)
+        self.table_h_scroll
+            .borrow()
+            .get(&src_line)
+            .copied()
+            .unwrap_or(0.)
     }
     /// 设置表格横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
     pub(crate) fn set_table_h_scroll(&self, src_line: usize, v: f32) {
@@ -2599,6 +2777,40 @@ impl WyEditor {
         } else {
             self.table_h_scroll.borrow_mut().insert(src_line, v);
         }
+    }
+
+    /// 数学卡横向滚动偏移（px；键 = 数学块首源码行）。
+    pub(crate) fn math_h_scroll_of(&self, src_line: usize) -> f32 {
+        self.math_h_scroll
+            .borrow()
+            .get(&src_line)
+            .copied()
+            .unwrap_or(0.)
+    }
+    /// 设置数学卡横向滚动偏移（px；实际交由 paint 侧按内容宽 clamp）。调用方 notify。
+    pub(crate) fn set_math_h_scroll(&self, src_line: usize, v: f32) {
+        let v = v.max(0.);
+        if v <= 0.01 {
+            self.math_h_scroll.borrow_mut().remove(&src_line);
+        } else {
+            self.math_h_scroll.borrow_mut().insert(src_line, v);
+        }
+    }
+    /// 数学卡内容**自然宽**侧缓存（px；键 = 数学块首源码行）——paint 每次画卡时更新。
+    pub(crate) fn set_math_natural_w(&self, src_line: usize, w: f32) {
+        if w > 0.01 {
+            self.math_natural_w.borrow_mut().insert(src_line, w);
+        } else {
+            self.math_natural_w.borrow_mut().remove(&src_line);
+        }
+    }
+    /// 数学卡内容**自然宽**（px；键 = 数学块首源码行）：paint 侧缓存，未画过 = 0。
+    pub(crate) fn math_natural_w_of(&self, src_line: usize) -> f32 {
+        self.math_natural_w
+            .borrow()
+            .get(&src_line)
+            .copied()
+            .unwrap_or(0.)
     }
 
     /// 记录本帧元素在窗口中的 bounds（paint 调用；鼠标命中换算用）。
@@ -2731,15 +2943,13 @@ impl WyEditor {
         &self,
         n_blocks: usize,
         epoch: u64,
-    ) -> (
-        bool,
-        BlockLayoutRef,
-        Option<BlockLayoutRef>,
-    ) {
+    ) -> (bool, BlockLayoutRef, Option<BlockLayoutRef>) {
         if let Some((e, l)) = &*self.block_layout.borrow()
-            && *e == epoch && l.borrow().n() == n_blocks {
-                return (false, l.clone(), None);
-            }
+            && *e == epoch
+            && l.borrow().n() == n_blocks
+        {
+            return (false, l.clone(), None);
+        }
         let old = self.block_layout.borrow().as_ref().map(|(_, l)| l.clone());
         // 重建分支给 **空** 草稿（O(1)）：Pass1 紧随其后整表重建真正填充——不先建一份
         // 全量零点 Fenwick/line_block 又立刻被覆盖（双重 O(n)，Enter/结构编辑每键 ~0.8ms）。
@@ -2771,9 +2981,10 @@ impl WyEditor {
             ^ mgen.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
             ^ fold_ver.wrapping_mul(0x517C_C1B7_2722_0A95);
         if let Some((k, _m, p)) = &*self.fold_plan.borrow()
-            && *k == key {
-                return p.clone();
-            }
+            && *k == key
+        {
+            return p.clone();
+        }
         let derived = self.derived();
         // ———（一）marker 集合：从已增量平移的 `derived` 重建（O(#区域)；math/alert 区域
         // 在 `update_derived_after_edit` 已行号平移，marker 无需再平移）。标题折叠态仅在
@@ -2788,10 +2999,11 @@ impl WyEditor {
                     math_regions.len(),
                     std::default::Default::default(),
                 );
-            let mut math_body: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::with_capacity_and_hasher(
-                math_regions.len() * 2,
-                std::default::Default::default(),
-            );
+            let mut math_body: rustc_hash::FxHashSet<usize> =
+                rustc_hash::FxHashSet::with_capacity_and_hasher(
+                    math_regions.len() * 2,
+                    std::default::Default::default(),
+                );
             for (idx, reg) in math_regions.iter().enumerate() {
                 math_start.insert(reg.range.start, idx);
                 math_body.extend(reg.range.start + 1..reg.range.end);
@@ -3016,9 +3228,8 @@ impl WyEditor {
     ) -> element::RevealPlan {
         let mut reveal = element::RevealPlan::empty();
         let base_br = base.borrow();
-        let block_ix_of = |srcline: usize| -> usize {
-            base_br.block_index_for_src_line(srcline).unwrap_or(0)
-        };
+        let block_ix_of =
+            |srcline: usize| -> usize { base_br.block_index_for_src_line(srcline).unwrap_or(0) };
         let zero_ix = |zeroed: &mut Vec<usize>, ix: usize| {
             if !zeroed.contains(&ix) {
                 zeroed.push(ix);
@@ -3073,9 +3284,10 @@ impl WyEditor {
     pub(crate) fn derived(&self) -> Rc<RefCell<WyDerived>> {
         let ver = self.regions_ver.get();
         if let Some((g, d)) = &*self.derived.borrow()
-            && *g == ver {
-                return d.clone();
-            }
+            && *g == ver
+        {
+            return d.clone();
+        }
         let content = self.doc.text_shared();
         // 警报区域单遍扫描，两个公开查询由它派生（旧实现 `alert_fold_regions` +
         // `alert_region_kinds` 各扫一遍全篇——重复 O(n)）。
@@ -3088,8 +3300,10 @@ impl WyEditor {
             .iter()
             .filter_map(|(r, _, fold)| fold.map(|f| (r.clone(), f)))
             .collect();
-        let mut alert_region_kinds: rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind> =
-            rustc_hash::FxHashMap::with_capacity_and_hasher(alerts.len() * 2, Default::default());
+        let mut alert_region_kinds: rustc_hash::FxHashMap<
+            usize,
+            crate::markdown::parse::recognition::AlertKind,
+        > = rustc_hash::FxHashMap::with_capacity_and_hasher(alerts.len() * 2, Default::default());
         for (r, k, _) in &alerts {
             for l in r.clone() {
                 alert_region_kinds.insert(l, *k);
@@ -3167,7 +3381,11 @@ impl WyEditor {
 
     /// 命中调整条 → 开始拖拽：记录按下时的图片宽 + 指针窗口 x，并选中该图。
     fn begin_image_resize(&mut self, src: gpui::SharedString, start_w: f32, grab_x: f32) {
-        *self.image_resize_drag.borrow_mut() = Some(ImageResizeDrag { src, start_w, grab_x });
+        *self.image_resize_drag.borrow_mut() = Some(ImageResizeDrag {
+            src,
+            start_w,
+            grab_x,
+        });
     }
 
     /// 拖拽中应用新宽：新宽 = `start_w + (mouse_x − grab_x)`（钳制），写回覆写表；
@@ -3201,17 +3419,39 @@ impl WyEditor {
         self.math_gen.get()
     }
 
+    /// 读某块 `$$` 卡的「最近就绪位图」钉（`src_line` → 位图 + 尺寸）。
+    pub(crate) fn math_pin(&self, src_line: usize) -> Option<BlockMathPin> {
+        self.math_pins.borrow().get(&src_line).cloned()
+    }
+
+    /// 录制/更新某块 `$$` 卡的最近就绪位图钉（Ready 命中或就绪绘制时调用）。
+    pub(crate) fn set_math_pin(&self, src_line: usize, image: Arc<RenderImage>, w: f32, h: f32) {
+        self.math_pins
+            .borrow_mut()
+            .insert(src_line, BlockMathPin { image, w, h });
+    }
+
+    /// 清空数学卡位图钉（换源 / 结构编辑 / 主题色变化：行号或颜色失效）。
+    pub(crate) fn clear_math_pins(&self) {
+        self.math_pins.borrow_mut().clear();
+    }
+
     /* ---------- Mermaid 图：滚轮逐块缩放（缩放值随块源码行存，重排用） ---------- */
 
     /// 某 mermaid 围栏块的缩放（缺省 1.0）。
     pub(crate) fn mermaid_zoom(&self, src_line: usize) -> f32 {
-        self.mermaid_zoom.borrow().get(&src_line).copied().unwrap_or(1.0)
+        self.mermaid_zoom
+            .borrow()
+            .get(&src_line)
+            .copied()
+            .unwrap_or(1.0)
     }
 
     /// 设置某围栏块缩放并自增缩放代（纳入帧缓存/基础布局代 → 整帧+块高按新比例重建）。
     pub(crate) fn set_mermaid_zoom(&self, src_line: usize, z: f32) {
         self.mermaid_zoom.borrow_mut().insert(src_line, z);
-        self.mermaid_zoom_gen.set(self.mermaid_zoom_gen.get().wrapping_add(1));
+        self.mermaid_zoom_gen
+            .set(self.mermaid_zoom_gen.get().wrapping_add(1));
     }
 
     /// mermaid 缩放代数（进帧缓存键 + 基础布局代）。
@@ -3224,18 +3464,18 @@ impl WyEditor {
         self.focused_mermaid
     }
 
-    /// 数学源码的**显示行数**（card 回退估高用）：`math_display_lines` 会对每源做
-    /// LaTeX→Unicode 转换，3000 块每次 `fold_plan` 重建重复转换 ≈38ms；按源缓存后
-    /// O(1) 复用（同一源显示行数确定不变）。
-    pub(crate) fn math_line_count(&self, src: &str) -> usize {
-        if let Some(&n) = self.math_line_map.borrow().get(src) {
-            return n;
+    /// 数学源码**显示行→卡高估计**缓存（键=源）：`math_line_height_h` 对每源做
+    /// LaTeX→Unicode 转换与高算子扫描，3000 块每次 `fold_plan` 重建重复 ≈38ms；
+    /// 按源缓存后 O(1) 复用（同一源估计值确定不变）。
+    pub(crate) fn math_height_estimate(&self, src: &str) -> f32 {
+        if let Some(&h) = self.math_line_map.borrow().get(src) {
+            return h;
         }
-        let n = element::math_display_lines(src).len();
+        let h = element::math_line_height_h(src);
         if self.math_line_map.borrow().len() < 10_000 {
-            self.math_line_map.borrow_mut().insert(src.to_string(), n);
+            self.math_line_map.borrow_mut().insert(src.to_string(), h);
         }
-        n
+        h
     }
 
     /* ---------- 代码块高亮：后台 syntect 整块解析（把 debug 下 ~300ms/块移出主线程） ---------- */
@@ -3320,10 +3560,14 @@ impl WyEditor {
     /// 换高亮——带外完成只删缓存、不打断帧（对齐 `on_math_ready` 的带内门控，消除多块
     /// 并发完成时的重建 churn）。
     fn on_code_parse_ready(&mut self, src_lines: &[usize], cx: &mut Context<Self>) {
-        let block_indices: Vec<usize> =
-            src_lines.iter().map(|&s| self.doc.block_index_for_line(s)).collect();
-        let ids: Vec<u64> =
-            block_indices.iter().map(|&b| frame::block_content_id(&self.doc, b)).collect();
+        let block_indices: Vec<usize> = src_lines
+            .iter()
+            .map(|&s| self.doc.block_index_for_line(s))
+            .collect();
+        let ids: Vec<u64> = block_indices
+            .iter()
+            .map(|&b| frame::block_content_id(&self.doc, b))
+            .collect();
         self.shape_rows.borrow_mut().invalidate_ids(&ids);
         let in_band = self
             .frame
@@ -3352,6 +3596,8 @@ impl WyEditor {
         if color_changed {
             self.math_color.borrow_mut().replace(color);
             self.math_slots.borrow_mut().clear();
+            // 主题色变化：旧位图颜色失效 → 钉一并清空（否则 Loading 期会画旧色）。
+            self.clear_math_pins();
         }
         // 收集带内块 + 行内公式源（键 = 去定界符后的源码，同 zorite 的 MathStore）。
         // (槽键, 是否行内, 排版边距, 要排版的 LaTeX)：块用 `MATH_PAD`；行内用
@@ -3373,7 +3619,11 @@ impl WyEditor {
                 }
             }
             for m in &row.extra.inline_maths {
-                let lx = m.key.as_ref().strip_prefix("inline:").unwrap_or(m.key.as_ref());
+                let lx = m
+                    .key
+                    .as_ref()
+                    .strip_prefix("inline:")
+                    .unwrap_or(m.key.as_ref());
                 if !lx.is_empty() {
                     sources.push((
                         m.key.clone(),
@@ -3396,8 +3646,18 @@ impl WyEditor {
                 drop(rows);
             }
             let mut slots = self.math_slots.borrow_mut();
-            if slots.contains_key(key.as_ref()) {
-                continue;
+            match slots.get(key.as_ref()) {
+                Some(MathSlot::Ready(img, w, h)) => {
+                    // 已就绪（滚动回带/刷新帧）：同步录制该块「最近就绪位图」钉，
+                    // 使后续逐键 Loading 期有旧图可钉（防 Unicode 回退闪跳）。
+                    let pin = (img.clone(), *w, *h);
+                    drop(slots);
+                    self.set_math_pin(src_line, pin.0, pin.1, pin.2);
+                    continue;
+                }
+                // Loading/Failed 已占用：幂等不重复发起。
+                Some(_) => continue,
+                None => {}
             }
             slots.insert(key.clone(), MathSlot::Loading);
             drop(slots);
@@ -3488,19 +3748,24 @@ impl WyEditor {
             if !lines.is_empty() {
                 lines.sort_unstable();
                 lines.dedup();
-                let blocks: Vec<usize> =
-                    lines.into_iter().map(|s| self.doc.block_index_for_line(s)).collect();
-                let ids: Vec<u64> =
-                    blocks.iter().map(|&b| frame::block_content_id(&self.doc, b)).collect();
+                let blocks: Vec<usize> = lines
+                    .into_iter()
+                    .map(|s| self.doc.block_index_for_line(s))
+                    .collect();
+                let ids: Vec<u64> = blocks
+                    .iter()
+                    .map(|&b| frame::block_content_id(&self.doc, b))
+                    .collect();
                 self.shape_rows.borrow_mut().invalidate_ids(&ids);
             }
         }
         let in_band = self.frame.borrow().as_ref().is_some_and(|f| {
             f.rows.iter().any(|r| {
                 if let Some(element::BlockCard::Math { latex, .. }) = &r.extra.card
-                    && latex.trim() == key {
-                        return true;
-                    }
+                    && latex.trim() == key
+                {
+                    return true;
+                }
                 r.extra.inline_maths.iter().any(|m| m.key.as_ref() == key)
             })
         });
@@ -3526,10 +3791,7 @@ impl WyEditor {
 
     /// 源行 → 该行起始字节（O(log n)，`line_starts` 二分）。
     pub(crate) fn line_start(&self, line: usize) -> usize {
-        self.doc
-            .line_starts()
-            .get(line)
-            .unwrap_or(self.len())
+        self.doc.line_starts().get(line).unwrap_or(self.len())
     }
 
     /// 源行 → 行尾字节（不含换行符；`line_starts[line+1]-1` = 行尾 `\n` 位置）。
@@ -3625,12 +3887,10 @@ impl WyEditor {
         };
         let mut d = rc.borrow_mut();
         // 跨线区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
-        if d
-            .math_regions
+        if d.math_regions
             .iter()
             .any(|r| r.range.start <= edit_line && edit_line < r.range.end)
-            || d
-                .alert_fold_regions
+            || d.alert_fold_regions
                 .iter()
                 .any(|(r, _)| r.start <= edit_line && edit_line < r.end)
         {
@@ -3771,9 +4031,7 @@ impl WyEditor {
     /// `line` 是否为可编辑块区域的**围栏行**（代码 ``` 标记行 / 表格分隔行；只读）。
     fn is_fence_line(&self, line: usize) -> bool {
         self.block_regions.iter().any(|r| match r {
-            BlockRegion::Code { lo, hi } => {
-                (line + 1 == *lo) || (line > 0 && line - 1 == *hi)
-            }
+            BlockRegion::Code { lo, hi } => (line + 1 == *lo) || (line > 0 && line - 1 == *hi),
             BlockRegion::Table { dlo, .. } => line + 1 == *dlo,
         })
     }
@@ -3799,7 +4057,9 @@ impl WyEditor {
                 let r = &cells[i].0;
                 if col < r.start {
                     r.start - col
-                } else { col.saturating_sub(r.end) }
+                } else {
+                    col.saturating_sub(r.end)
+                }
             })
             .unwrap_or(0);
         let r = &cells[idx].0;
@@ -3867,7 +4127,10 @@ impl WyEditor {
         // 作废整形缓存），免整篇 Pass1 高度重建 + fold_plan 重建 + block_regions 整表
         // 扫描（旧实现 `in_code_table` 一律 structural → 表内每键 ~140ms）。
         let edit_blk = self.doc.block_index_for_line(edit_line);
-        let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
+        let prev_geo = self
+            .doc
+            .block_meta(edit_blk)
+            .map(|m| (m.kind, m.src_line, m.aux));
         // 编辑前被编辑块的内容指纹（整形缓存**内容寻址**键）：编辑后内容已变 → 剔除
         // 旧指纹行（否则旧条目滞留到被 LRU 淘汰；测试与内存卫生都要它即时消失）。
         let old_cid = frame::block_content_id(&self.doc, edit_blk);
@@ -3883,7 +4146,9 @@ impl WyEditor {
         };
         let structural = cross_newline || breaks_fence || !count_same || !geo_same;
         // Pass1 增量重估定位 + 整形/预热缓存作废（结构 vs 非结构两路，见 `invalidate_after_edit`）。
-        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, old_cid, &removed, text);
+        self.invalidate_after_edit(
+            edit_line, edit_blk, prev_count, structural, old_cid, &removed, text,
+        );
         // —— 内容派生（derived）的增量判定（详见 `update_derived_after_edit`）——
         self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
 
@@ -3926,10 +4191,7 @@ impl WyEditor {
         };
         if merges {
             // 并入打开单元：净区间/文本按意图累积（逆操作坐标不变形，见 UndoUnit）。
-            let u = self
-                .open_unit
-                .as_mut()
-                .expect("能合并必已有打开的单元");
+            let u = self.open_unit.as_mut().expect("能合并必已有打开的单元");
             u.insert.push_str(text);
             match intent {
                 EditKind::Backspace => {
@@ -3988,12 +4250,15 @@ impl WyEditor {
         self.shape_rows.borrow_mut().invalidate_ids(&[old_cid]);
         // Pass1 增量高度重估起点；三段式（前缀 / 变化中段 / 尾部复用）定位用。
         self.struct_dirty_line.set(edit_line);
-        self.struct_old_end_line.set(edit_line + removed.matches('\n').count());
+        self.struct_old_end_line
+            .set(edit_line + removed.matches('\n').count());
         self.struct_line_delta
             .set(text.matches('\n').count() as i64 - removed.matches('\n').count() as i64);
         if structural {
             self.struct_ver.set(self.struct_ver.get().wrapping_add(1));
             *self.pending_patch_blocks.borrow_mut() = None;
+            // 结构编辑：块行号/身份可能位移 → 数学位图钉随行号作废。
+            self.clear_math_pins();
             // fold_plan deltas 增量平移的编辑信息：被编辑块旧下标 + 块数净增。
             self.struct_blk_old.set(edit_blk);
             self.struct_blk_span_delta
@@ -4036,12 +4301,12 @@ impl WyEditor {
         removed: &str,
     ) {
         self.math_dollar_cnt.set(
-            self.math_dollar_cnt.get()
-                + text.bytes().filter(|&b| b == b'$').count()
+            self.math_dollar_cnt.get() + text.bytes().filter(|&b| b == b'$').count()
                 - removed.bytes().filter(|&b| b == b'$').count(),
         );
         self.alert_marker_cnt.set(
-            self.alert_marker_cnt.get() + text.matches("[!").count() - removed.matches("[!").count(),
+            self.alert_marker_cnt.get() + text.matches("[!").count()
+                - removed.matches("[!").count(),
         );
         if structural {
             // 行索引 / 块结构变化：派生区域**行号平移**——编辑线之上的区域不变、之下
@@ -4194,12 +4459,16 @@ impl WyEditor {
     }
     /// 卡片的「链接」输入框实体（render / 测试读值）。
     #[cfg(test)]
-    pub(crate) fn image_edit_link_input(&self) -> Option<gpui::Entity<crate::ui::input::InputState>> {
+    pub(crate) fn image_edit_link_input(
+        &self,
+    ) -> Option<gpui::Entity<crate::ui::input::InputState>> {
         self.image_edit.as_ref().map(|p| p.link.clone())
     }
     /// 卡片的「文本」输入框实体。
     #[cfg(test)]
-    pub(crate) fn image_edit_text_input(&self) -> Option<gpui::Entity<crate::ui::input::InputState>> {
+    pub(crate) fn image_edit_text_input(
+        &self,
+    ) -> Option<gpui::Entity<crate::ui::input::InputState>> {
         self.image_edit.as_ref().map(|p| p.text.clone())
     }
     /// 独立图片行 `src_line` 的当前 `(alt, src)`（`parse::parse_image_line` 反解）；
@@ -4243,14 +4512,19 @@ impl WyEditor {
                 .placeholder("图片文本（alt 题注）")
                 .default_value(alt)
         });
-        self.image_edit = Some(ImageEditPopup { src_line, link, text });
+        self.image_edit = Some(ImageEditPopup {
+            src_line,
+            link,
+            text,
+        });
         // 计算并缓存卡片锚点：用**当前帧 + 上次 paint 的元素原点**（同代配对）。这保证
         // 打开后的第 1 次 render（在 paint 之前）就有正确几何；此后每帧 paint 刷新。
         // ⚠️ 不再依赖 render 期现算 frame——`end_selection` 清帧后 ensure 用 800px 宽
         // 重建会让 render 读到一个宽度错误的帧，卡片横向跳一帧。
         if let Some(f) = self.frame.borrow().as_ref().cloned() {
             let origin = self.content_origin();
-            self.image_edit_anchor.set(self.image_edit_anchor_at(origin, &f));
+            self.image_edit_anchor
+                .set(self.image_edit_anchor_at(origin, &f));
         }
         // 打开后立刻聚焦「链接」输入框（用户可直接键入/IME）。
         if let Some(p) = &self.image_edit {
@@ -4277,9 +4551,7 @@ impl WyEditor {
         let row_top = f
             .rows
             .iter()
-            .find(|r| {
-                r.src_line == popup.src_line && r.kind == crate::markdown::ir::IrKind::Image
-            })
+            .find(|r| r.src_line == popup.src_line && r.kind == crate::markdown::ir::IrKind::Image)
             .map(|r| f32::from(r.top))
             .unwrap_or_else(|| {
                 let blk = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
@@ -4346,7 +4618,12 @@ impl WyEditor {
         let link_text = popup.link.read(cx).value().to_string();
         let text_text = popup.text.read(cx).value().to_string();
         let saved = !link_text.is_empty();
-        self.apply_image_line_edit(src_line, text_text, if saved { link_text } else { "".into() }, cx);
+        self.apply_image_line_edit(
+            src_line,
+            text_text,
+            if saved { link_text } else { "".into() },
+            cx,
+        );
         self.close_image_edit(cx);
     }
 
@@ -4372,7 +4649,9 @@ impl WyEditor {
             "{}![{}]({})",
             &raw[..indent],
             new_alt.replace(']', "\\]").replace('\n', " "),
-            src.replace('(', "\\(").replace(')', "\\)").replace('\n', " ")
+            src.replace('(', "\\(")
+                .replace(')', "\\)")
+                .replace('\n', " ")
         );
         self.apply_edit(start..end, &new_line, cx);
     }
@@ -4385,11 +4664,11 @@ impl WyEditor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        use crate::ui::button::ButtonVariants as _;
         use gpui::{
-            AnchoredPositionMode, Anchor, Edges, InteractiveElement, IntoElement, ParentElement,
+            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, ParentElement,
             Styled,
         };
-        use crate::ui::button::ButtonVariants as _;
         let popup = self.image_edit.as_ref()?;
         // 卡片几何（**窗口坐标**，供 `anchored(Window)` 定位）。**直接读 paint 期缓存好的
         // 锚点**（`image_edit_anchor`：同代 origin+frame 算出的窗口 TopLeft）——render 期
@@ -4416,9 +4695,11 @@ impl WyEditor {
             .id("wy-image-edit-card")
             .debug_selector(|| "wy-image-edit-card".into())
             // 点击**卡片外**任意处 → 关闭卡片（控件内点击不外发，不误关）。
-            .on_mouse_down_out(move |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {
-                ed_close.update(cx, |e, cx| e.close_image_edit(cx));
-            })
+            .on_mouse_down_out(
+                move |_: &gpui::MouseDownEvent, _: &mut Window, cx: &mut gpui::App| {
+                    ed_close.update(cx, |e, cx| e.close_image_edit(cx));
+                },
+            )
             .w(px(element::IMAGE_EDIT_CARD_W))
             .rounded_md()
             .border_1()
@@ -4536,7 +4817,12 @@ impl WyEditor {
             return true;
         }
         let width = {
-            let w = self.frame.borrow().as_ref().map(|f| f.width).unwrap_or(px(800.));
+            let w = self
+                .frame
+                .borrow()
+                .as_ref()
+                .map(|f| f.width)
+                .unwrap_or(px(800.));
             if f32::from(w) <= 1. {
                 return false;
             }
@@ -4627,7 +4913,10 @@ impl WyEditor {
         let old_line = self.doc.line_str(edit_line);
         let prev_count = self.doc.block_count();
         let edit_blk = self.doc.block_index_for_line(edit_line);
-        let prev_geo = self.doc.block_meta(edit_blk).map(|m| (m.kind, m.src_line, m.aux));
+        let prev_geo = self
+            .doc
+            .block_meta(edit_blk)
+            .map(|m| (m.kind, m.src_line, m.aux));
         // 与 `replace_range` 同：剔除被编辑块的旧内容指纹行（内容寻址缓存）。
         let old_cid = frame::block_content_id(&self.doc, edit_blk);
         self.doc.edit(r.clone(), text);
@@ -4639,7 +4928,9 @@ impl WyEditor {
             _ => false,
         };
         let structural = cross_newline || breaks_fence || !count_same || !geo_same;
-        self.invalidate_after_edit(edit_line, edit_blk, prev_count, structural, old_cid, &removed, text);
+        self.invalidate_after_edit(
+            edit_line, edit_blk, prev_count, structural, old_cid, &removed, text,
+        );
         self.update_derived_after_edit(edit_line, &old_line, structural, text, &removed);
         self.caret = target_caret.min(self.len());
         self.sel_anchor = None;
@@ -4684,12 +4975,13 @@ impl WyEditor {
     fn backspace_blocked(&self, line: usize, col: usize) -> bool {
         match self.region_content(line) {
             Some(BlockRegion::Code { lo, .. }) => line == lo && col == 0,
-            Some(BlockRegion::Table { .. }) => {
-                self.table_cell_bounds(line, col).is_some_and(|(s, _)| col <= s)
-            }
+            Some(BlockRegion::Table { .. }) => self
+                .table_cell_bounds(line, col)
+                .is_some_and(|(s, _)| col <= s),
             None => {
                 // 图片行 alt：起点即 `![` 边界，退格不得吃到图片标记（行会变非图片）。
-                self.image_alt_segment(line).is_some_and(|(lo, _)| col <= lo)
+                self.image_alt_segment(line)
+                    .is_some_and(|(lo, _)| col <= lo)
             }
         }
     }
@@ -4729,12 +5021,13 @@ impl WyEditor {
                 let len = self.line_end(line) - self.line_start(line);
                 line == hi && col >= len
             }
-            Some(BlockRegion::Table { .. }) => {
-                self.table_cell_bounds(line, col).is_some_and(|(_, e)| col >= e)
-            }
+            Some(BlockRegion::Table { .. }) => self
+                .table_cell_bounds(line, col)
+                .is_some_and(|(_, e)| col >= e),
             None => {
                 // 图片行 alt：尾即 `](` 边界，删除不得吃到闭合中括号（行会变非图片）。
-                self.image_alt_segment(line).is_some_and(|(_, hi)| col >= hi)
+                self.image_alt_segment(line)
+                    .is_some_and(|(_, hi)| col >= hi)
             }
         }
     }
@@ -4749,7 +5042,9 @@ impl WyEditor {
         // （光标在 alt 内或未越过 alt 尾；越过整行尾（`)(src)` 之后）才放行）。
         let (nl, col) = self.row_col(self.caret);
         if matches!(self.region_content(nl), Some(BlockRegion::Table { .. }))
-            || self.image_alt_segment(nl).is_some_and(|(_lo, hi)| col <= hi)
+            || self
+                .image_alt_segment(nl)
+                .is_some_and(|(_lo, hi)| col <= hi)
         {
             return;
         }
@@ -4930,7 +5225,9 @@ macro_rules! wy_action {
                 Box::new(self.clone())
             }
             fn partial_eq(&self, other: &dyn gpui::Action) -> bool {
-                (other as &dyn std::any::Any).downcast_ref::<Self>().is_some()
+                (other as &dyn std::any::Any)
+                    .downcast_ref::<Self>()
+                    .is_some()
             }
             fn name(&self) -> &'static str {
                 $s
@@ -4985,7 +5282,6 @@ pub fn bind_keys(cx: &mut gpui::App) {
     ])
 }
 
-
 impl Focusable for WyEditor {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus.clone()
@@ -5007,87 +5303,97 @@ impl gpui::Render for WyEditor {
             .key_context(CONTEXT)
             .track_focus(&self.focus)
             .cursor(CursorStyle::IBeam)
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Left, _: &mut Window, _: &mut Context<WyEditor>| {
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Left, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.move_left()
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Right, _: &mut Window, _: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Right, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.move_right()
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Up, _: &mut Window, _: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Up, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.move_up()
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Down, _: &mut Window, _: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Down, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.move_down()
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Backspace, _: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Backspace, _: &mut Window, cx: &mut Context<WyEditor>| {
                     this.backspace(cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Delete, _: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Delete, _: &mut Window, cx: &mut Context<WyEditor>| {
                     this.delete(cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Enter, _: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Enter, _: &mut Window, cx: &mut Context<WyEditor>| {
                     this.newline(cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &SelectAll, _: &mut Window, _: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &SelectAll, _: &mut Window, _: &mut Context<WyEditor>| {
                     this.select_all()
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Copy, window: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Copy, window: &mut Window, cx: &mut Context<WyEditor>| {
                     this.copy(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Cut, window: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Cut, window: &mut Window, cx: &mut Context<WyEditor>| {
                     this.cut(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Paste, window: &mut Window, cx: &mut Context<WyEditor>| {
-                    this.paste(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Undo, _: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor,
+                 _: &Paste,
+                 window: &mut Window,
+                 cx: &mut Context<WyEditor>| { this.paste(window, cx) },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Undo, _: &mut Window, cx: &mut Context<WyEditor>| {
                     this.undo(cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this: &mut WyEditor, _: &Redo, _: &mut Window, cx: &mut Context<WyEditor>| {
+                },
+            ))
+            .on_action(cx.listener(
+                |this: &mut WyEditor, _: &Redo, _: &mut Window, cx: &mut Context<WyEditor>| {
                     this.redo(cx)
-                }),
-            )
+                },
+            ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseDownEvent, window: &mut Window, cx: &mut Context<WyEditor>| {
-                    this.on_mouse_down(ev, window, cx)
-                }),
+                cx.listener(
+                    |this: &mut WyEditor,
+                     ev: &gpui::MouseDownEvent,
+                     window: &mut Window,
+                     cx: &mut Context<WyEditor>| {
+                        this.on_mouse_down(ev, window, cx)
+                    },
+                ),
             )
-            .on_mouse_move(
-                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseMoveEvent, _: &mut Window, cx: &mut Context<WyEditor>| {
-                    this.on_mouse_move(ev, cx)
-                }),
-            )
+            .on_mouse_move(cx.listener(
+                |this: &mut WyEditor,
+                 ev: &gpui::MouseMoveEvent,
+                 _: &mut Window,
+                 cx: &mut Context<WyEditor>| { this.on_mouse_move(ev, cx) },
+            ))
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(|this: &mut WyEditor, ev: &gpui::MouseUpEvent, _: &mut Window, cx: &mut Context<WyEditor>| {
-                    this.on_mouse_up(ev, cx)
-                }),
+                cx.listener(
+                    |this: &mut WyEditor,
+                     ev: &gpui::MouseUpEvent,
+                     _: &mut Window,
+                     cx: &mut Context<WyEditor>| { this.on_mouse_up(ev, cx) },
+                ),
             )
             .child(element::WyEditorElement {
                 editor: cx.entity(),

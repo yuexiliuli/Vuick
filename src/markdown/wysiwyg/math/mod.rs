@@ -32,12 +32,20 @@ pub(crate) struct InlineMathText {
     pub key: SharedString,
     /// 已就绪的排版位图 + 逻辑（typeset em）px 尺寸；`Some` 时 paint 画 `RenderImage`
     /// 覆盖 spacer（参考 zorite `shape_inline_math`），`None` = 排版中/失败 → 画斜体 Unicode。
-    /// `w`/`h` 是 22px 排版下的原始尺寸，画图按 `inline_math_fit_h` 再缩放。
+    /// `w`/`h` 是 22px 排版下的原始尺寸，画图按 `inline_math_fit` 再缩放。
     pub ready: Option<(Arc<RenderImage>, f32, f32)>,
     /// 所在 `row.wrapped` 的 BlockLine 索引（`shape_text_row` 撑高后填，paint 定位用）。
     pub line: usize,
+    /// 显示宽（px）= **spacer 实际空格宽**（shape 期算好）：超长公式的自然宽 > 内容盒时
+    /// 按 `inline_math_fit` 收进，paint 直接用它画图——measure 与 frame 布局同源**单值**，
+    /// 不再「自然宽折行 → 越界」与「钳到内容盒」两帧来回取大小（长公式后输入回弹根因）。
+    pub disp_w: f32,
+    /// 显示高（px）：撑高逻辑与 paint 用（按 `inline_math_fit` 的 `disp_w/自然宽` 同比，
+    /// 保纵横比、不超 `INLINE_MATH_BAND` 行高上限）。
+    pub disp_h: f32,
+    /// 宽度方向缩放系数（自然宽 → `disp_w`）：Unicode 兜底的 paint 按它缩字号对齐 spacer。
+    pub fit: f32,
 }
-
 
 /// 行内 `$…$` 数学：把 display 文本里的公式 splice 成空格 spacer（宽度≈排版后的
 /// latex 宽，`splice_inline_math` 把 spacer 映射回公式源位），paint 期再在 spacer 处
@@ -58,6 +66,7 @@ pub(crate) fn splice_math_text(
     map: Vec<usize>,
     fs: Pixels,
     lh: Pixels,
+    avail_w: f32,
     base_font: &gpui::Font,
     math_font: &gpui::Font,
     math_color: Hsla,
@@ -69,10 +78,25 @@ pub(crate) fn splice_math_text(
     }
     let line_start = editor.line_start(src_line);
     // 跳过完全落在行内代码里的 `$…$`（反引号内是字面量，不是数学）。
-    let in_code = |r: &Range<usize>| code_ranges.iter().any(|c| c.start < r.end && r.start < c.end);
+    let in_code = |r: &Range<usize>| {
+        code_ranges
+            .iter()
+            .any(|c| c.start < r.end && r.start < c.end)
+    };
     let space_w = {
-        let run = [TextRun { len: 1, font: base_font.clone(), color: math_color, ..Default::default() }];
-        f32::from(window.text_system().shape_line(" ".into(), fs, &run, None).width()).max(1.)
+        let run = [TextRun {
+            len: 1,
+            font: base_font.clone(),
+            color: math_color,
+            ..Default::default()
+        }];
+        f32::from(
+            window
+                .text_system()
+                .shape_line(" ".into(), fs, &run, None)
+                .width(),
+        )
+        .max(1.)
     };
     let slots = editor.math_slots();
     let mut formulas: Vec<(Range<usize>, usize)> = Vec::new();
@@ -84,9 +108,11 @@ pub(crate) fn splice_math_text(
         // reveal-on-caret：光标严格落在 `$…$` 内（不碰定界符不算数，与块公式一致的
         // “单击停在边上、双击进去编辑”语义）→ 不 splice，显示可编辑的原始源码。
         if let Some(c) = caret_disp
-            && c > span.start && c < span.end {
-                continue;
-            }
+            && c > span.start
+            && c < span.end
+        {
+            continue;
+        }
         let latex = inline_style::inline_math_latex(rtext, &span);
         if latex.trim().is_empty() {
             continue;
@@ -103,29 +129,41 @@ pub(crate) fn splice_math_text(
         };
         let shown = math_to_unicode(latex);
         let shown = shown.replace('\n', " ");
-        let (_w, n, paint_ready) = match ready {
+        let (n, disp_w, disp_h, fit, paint_ready) = match ready {
             Some((img, w, h)) => {
-                // spacer 宽 = 显示宽（`inline_math_fit_h` 缩放，供 paint 同式画图）。
-                let fit = inline_math_fit_h(fs, lh, h);
-                let scale = if h > 0.0 {
-                    fit / h
-                } else {
-                    f32::from(fs) / crate::config::math::MATH_FONT_SIZE
-                };
-                let lw = (w * scale).max(1.);
-                (lw.max(1.), (lw / space_w).ceil().max(1.0) as usize, Some((img, w, h)))
+                // 显示宽/高按统一缩放 `inline_math_fit`（高度优先、宽度钳到内容盒）：
+                // 超长公式单值收进；spacer 宽 = 显示宽。paint 同式推导 → 永不越界。
+                let fit = inline_math_fit(fs, lh, w, h, avail_w);
+                let disp_w = (w * fit).min(avail_w).max(1.);
+                let disp_h = (h * fit).max(1.);
+                let n = spacer_count(disp_w, space_w, avail_w);
+                (n, disp_w, disp_h, fit, Some((img, w, h)))
             }
             None => {
                 if shown.is_empty() {
                     continue;
                 }
-                let run = [TextRun { len: shown.len(), font: math_font.clone(), color: math_color, ..Default::default() }];
-                let w = f32::from(window.text_system().shape_line(shown.clone().into(), fs, &run, None).width());
-                let n = (w / space_w).ceil() as usize;
+                let run = [TextRun {
+                    len: shown.len(),
+                    font: math_font.clone(),
+                    color: math_color,
+                    ..Default::default()
+                }];
+                let wnat = f32::from(
+                    window
+                        .text_system()
+                        .shape_line(shown.clone().into(), fs, &run, None)
+                        .width(),
+                );
+                // Unicode 兜底：只做宽度钳制（正文字号，不平移高度）。
+                let fit = (avail_w / wnat.max(1.)).min(1.0);
+                let disp_w = (wnat * fit).min(avail_w).max(1.);
+                let disp_h = f32::from(lh);
+                let n = spacer_count(disp_w, space_w, avail_w);
                 if n == 0 {
                     continue;
                 }
-                (w, n.max(1), None)
+                (n, disp_w, disp_h, fit, None)
             }
         };
         if n > 0 {
@@ -134,7 +172,10 @@ pub(crate) fn splice_math_text(
             // 源区间（绝对）：span 渲染列 → 经 byte_map 反查源列 → 加行首。
             let src_lo = line_start + super::element::display_to_source(&map, span.start);
             let src_hi = line_start
-                + super::element::display_to_source(&map, span.end.saturating_sub(1).max(span.start));
+                + super::element::display_to_source(
+                    &map,
+                    span.end.saturating_sub(1).max(span.start),
+                );
             maths.push(InlineMathText {
                 display_off: 0,
                 len: n,
@@ -143,13 +184,21 @@ pub(crate) fn splice_math_text(
                 key: super::inline_math_key(latex.trim()),
                 ready: paint_ready,
                 line: 0,
+                disp_w,
+                disp_h,
+                fit,
             });
         }
     }
     if formulas.is_empty() {
         return (rtext.to_string(), runs, map, Vec::new());
     }
-    let gap = TextRun { len: 0, font: base_font.clone(), color: math_color, ..Default::default() };
+    let gap = TextRun {
+        len: 0,
+        font: base_font.clone(),
+        color: math_color,
+        ..Default::default()
+    };
     let (nd, nr, nm, places) =
         inline_style::splice_inline_math(rtext, &runs, &map, &formulas, &gap);
     let maths = places
@@ -173,6 +222,29 @@ pub(crate) fn inline_math_fit_h(fs: Pixels, lh: Pixels, h: f32) -> f32 {
     (base * h).clamp(1.0, cap)
 }
 
+/// 行内公式的**统一缩放系数**：先按高度（`inline_math_fit_h`，字号 + 行高上限），再按
+/// 宽度钳到内容盒可用宽（`avail_w`），取两者之小——**measure 与 paint 同源单值**。
+/// 超长公式（自然宽 > 内容盒）在此收进：spacer 个数 / 撑高 / paint 的画图宽全按同一
+/// `fit` 推导（`disp_w = w·fit`、`disp_h = h·fit`），不再让「自然宽」参与折行把后续
+/// 内容顶到 N 行、或换帧来回取大/小宽（回弹根因）。
+pub(crate) fn inline_math_fit(fs: Pixels, lh: Pixels, w: f32, h: f32, avail_w: f32) -> f32 {
+    let hf = if h > 0.0 {
+        inline_math_fit_h(fs, lh, h) / h
+    } else {
+        f32::from(fs) / crate::config::math::MATH_FONT_SIZE
+    };
+    let wf = (avail_w / w.max(1.)).min(1.0);
+    (hf.min(wf)).max(1e-4)
+}
+
+/// spacer 空格数：显示宽 `disp_w` → 空格数。钳到内容盒（`avail_w`）内，保证超长公式的
+/// spacer 不超一档折行宽（否则被折成整把空格行、后续内容被顶走）。
+fn spacer_count(disp_w: f32, space_w: f32, avail_w: f32) -> usize {
+    let n = (disp_w / space_w.max(1e-3)).ceil() as usize;
+    let n_max = (avail_w / space_w.max(1e-3)).floor() as usize;
+    n.clamp(1, n_max.max(1))
+}
+
 /// display_off 落在 `wrapped` 里的第几个 BlockLine。文本块一源码行 = 一个
 /// BlockLine（行内数学/折行都在其内，spacer 属于首个）→ 恒 0。
 pub(crate) fn visual_block_line_for_index(wrapped: &[gpui::WrappedLine], _off: usize) -> usize {
@@ -180,30 +252,94 @@ pub(crate) fn visual_block_line_for_index(wrapped: &[gpui::WrappedLine], _off: u
     0
 }
 
-
 const LATEX_SYMBOLS: &[(&str, char)] = &[
-    ("pi", 'π'), ("infty", '∞'), ("int", '∫'), ("iint", '∬'), ("oint", '∮'),
-    ("sum", '∑'), ("prod", '∏'), ("cdot", '·'), ("times", '×'), ("div", '÷'),
-    ("pm", '±'), ("mp", '∓'), ("neq", '≠'), ("leq", '≤'), ("geq", '≥'),
-    ("le", '≤'), ("ge", '≥'), ("ne", '≠'), ("approx", '≈'), ("equiv", '≡'),
-    ("sim", '∼'), ("partial", '∂'), ("nabla", '∇'),
-    ("alpha", 'α'), ("beta", 'β'), ("gamma", 'γ'), ("delta", 'δ'),
-    ("epsilon", 'ε'), ("zeta", 'ζ'), ("eta", 'η'), ("theta", 'θ'),
-    ("lambda", 'λ'), ("mu", 'μ'), ("nu", 'ν'), ("xi", 'ξ'),
-    ("rho", 'ρ'), ("sigma", 'σ'), ("tau", 'τ'), ("phi", 'φ'), ("chi", 'χ'),
-    ("psi", 'ψ'), ("omega", 'ω'), ("Gamma", 'Γ'), ("Delta", 'Δ'),
-    ("Theta", 'Θ'), ("Lambda", 'Λ'), ("Sigma", 'Σ'), ("Phi", 'Φ'),
-    ("Omega", 'Ω'), ("rightarrow", '→'), ("leftarrow", '←'),
-    ("leftrightarrow", '↔'), ("to", '→'), ("mapsto", '↦'),
-    ("Rightarrow", '⇒'), ("Leftrightarrow", '⇔'),
-    ("ldots", '…'), ("cdots", '⋯'), ("dots", '…'), ("in", '∈'), ("notin", '∉'),
-    ("subset", '⊂'), ("subseteq", '⊆'), ("cup", '∪'), ("cap", '∩'),
-    ("forall", '∀'), ("exists", '∃'), ("nexists", '∄'), ("propto", '∝'),
-    ("perp", '⊥'), ("parallel", '∥'), ("angle", '∠'), ("circ", '∘'),
-    ("degree", '°'), ("deg", '°'), ("oplus", '⊕'), ("otimes", '⊗'),
-    ("emptyset", '∅'), ("ell", 'ℓ'), ("hbar", 'ℏ'), ("bullet", '•'),
-    ("uparrow", '↑'), ("downarrow", '↓'), ("ast", '∗'), ("star", '⋆'),
-    ("dag", '†'), ("ddag", '‡'),
+    ("pi", 'π'),
+    ("infty", '∞'),
+    ("int", '∫'),
+    ("iint", '∬'),
+    ("oint", '∮'),
+    ("sum", '∑'),
+    ("prod", '∏'),
+    ("cdot", '·'),
+    ("times", '×'),
+    ("div", '÷'),
+    ("pm", '±'),
+    ("mp", '∓'),
+    ("neq", '≠'),
+    ("leq", '≤'),
+    ("geq", '≥'),
+    ("le", '≤'),
+    ("ge", '≥'),
+    ("ne", '≠'),
+    ("approx", '≈'),
+    ("equiv", '≡'),
+    ("sim", '∼'),
+    ("partial", '∂'),
+    ("nabla", '∇'),
+    ("alpha", 'α'),
+    ("beta", 'β'),
+    ("gamma", 'γ'),
+    ("delta", 'δ'),
+    ("epsilon", 'ε'),
+    ("zeta", 'ζ'),
+    ("eta", 'η'),
+    ("theta", 'θ'),
+    ("lambda", 'λ'),
+    ("mu", 'μ'),
+    ("nu", 'ν'),
+    ("xi", 'ξ'),
+    ("rho", 'ρ'),
+    ("sigma", 'σ'),
+    ("tau", 'τ'),
+    ("phi", 'φ'),
+    ("chi", 'χ'),
+    ("psi", 'ψ'),
+    ("omega", 'ω'),
+    ("Gamma", 'Γ'),
+    ("Delta", 'Δ'),
+    ("Theta", 'Θ'),
+    ("Lambda", 'Λ'),
+    ("Sigma", 'Σ'),
+    ("Phi", 'Φ'),
+    ("Omega", 'Ω'),
+    ("rightarrow", '→'),
+    ("leftarrow", '←'),
+    ("leftrightarrow", '↔'),
+    ("to", '→'),
+    ("mapsto", '↦'),
+    ("Rightarrow", '⇒'),
+    ("Leftrightarrow", '⇔'),
+    ("ldots", '…'),
+    ("cdots", '⋯'),
+    ("dots", '…'),
+    ("in", '∈'),
+    ("notin", '∉'),
+    ("subset", '⊂'),
+    ("subseteq", '⊆'),
+    ("cup", '∪'),
+    ("cap", '∩'),
+    ("forall", '∀'),
+    ("exists", '∃'),
+    ("nexists", '∄'),
+    ("propto", '∝'),
+    ("perp", '⊥'),
+    ("parallel", '∥'),
+    ("angle", '∠'),
+    ("circ", '∘'),
+    ("degree", '°'),
+    ("deg", '°'),
+    ("oplus", '⊕'),
+    ("otimes", '⊗'),
+    ("emptyset", '∅'),
+    ("ell", 'ℓ'),
+    ("hbar", 'ℏ'),
+    ("bullet", '•'),
+    ("uparrow", '↑'),
+    ("downarrow", '↓'),
+    ("ast", '∗'),
+    ("star", '⋆'),
+    ("dag", '†'),
+    ("ddag", '‡'),
 ];
 
 /// 把一个字符上标化（Unicode 上标），不可映射返回 `None`。
@@ -308,7 +444,10 @@ pub(crate) fn math_to_segments(src: &str) -> Vec<MathSeg> {
     let mut i = 0;
     let flush = |segs: &mut Vec<MathSeg>, buf: &mut String| {
         if !buf.is_empty() {
-            segs.push(MathSeg { text: std::mem::take(buf), pos: MathPos::Normal });
+            segs.push(MathSeg {
+                text: std::mem::take(buf),
+                pos: MathPos::Normal,
+            });
         }
     };
     while i < cs.len() {
@@ -322,7 +461,10 @@ pub(crate) fn math_to_segments(src: &str) -> Vec<MathSeg> {
                 for c in g.chars() {
                     t.push(sup_map(c).unwrap_or(c));
                 }
-                segs.push(MathSeg { text: t, pos: MathPos::Sup });
+                segs.push(MathSeg {
+                    text: t,
+                    pos: MathPos::Sup,
+                });
                 i = ni;
             }
             '_' => {
@@ -333,7 +475,10 @@ pub(crate) fn math_to_segments(src: &str) -> Vec<MathSeg> {
                 for c in g.chars() {
                     t.push(sub_map(c).unwrap_or(c));
                 }
-                segs.push(MathSeg { text: t, pos: MathPos::Sub });
+                segs.push(MathSeg {
+                    text: t,
+                    pos: MathPos::Sub,
+                });
                 i = ni;
             }
             '\\' => {
@@ -423,9 +568,5 @@ pub(crate) fn math_to_segments(src: &str) -> Vec<MathSeg> {
 /// 处理上下标（`^`/`_`，含 `{…}` 组）、`\frac`/`\sqrt`/`\text` 等、希腊字母与常用符号。
 /// 行内数学继续用这个扁平字符串版；**卡片**走 `math_to_segments`（细分段、可缩小+偏移）。
 pub(crate) fn math_to_unicode(src: &str) -> String {
-    math_to_segments(src)
-        .into_iter()
-        .map(|s| s.text)
-        .collect()
+    math_to_segments(src).into_iter().map(|s| s.text).collect()
 }
-

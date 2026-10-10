@@ -1,536 +1,668 @@
 //! `element` 的单元测试。原内联于 `element.rs`，抽取后经 `#[path]` 挂在
 //! [`element`] 下语义不变：`super::` 仍指 `element`。
-    use super::{
-        build_frame, caret_geometry, cell_selection_display, display_to_source, layout_has_notdef,
-        prewarm_band, source_offset_at_local, source_to_display,
-        table_block_height, table_cell_x0, table_row_top, WyEditor,
-    };
-    use gpui::{
-        AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px,
-        size,
-    };
+use super::{
+    WyEditor, build_frame, caret_geometry, cell_selection_display, display_to_source,
+    layout_has_notdef, prewarm_band, quote_band_w, source_offset_at_local, source_to_display,
+    table_block_height, table_cell_x0, table_row_top,
+};
+use gpui::{
+    AppContext, Context, Entity, Render, TestAppContext, VisualTestContext, Window, point, px, size,
+};
 
-    struct WyHost {
-        ed: Entity<WyEditor>,
+struct WyHost {
+    ed: Entity<WyEditor>,
+}
+impl Render for WyHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        self.ed.clone()
     }
-    impl Render for WyHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            self.ed.clone()
-        }
-    }
+}
 
-    /// 双编辑器宿主：同步 `set_source_text` 对照机 vs 后台 `install_open` 装配机。
-    struct DualWyHost {
-        sync: Entity<WyEditor>,
-        bg: Entity<WyEditor>,
+/// 双编辑器宿主：同步 `set_source_text` 对照机 vs 后台 `install_open` 装配机。
+struct DualWyHost {
+    sync: Entity<WyEditor>,
+    bg: Entity<WyEditor>,
+}
+impl Render for DualWyHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+        self.sync.clone()
     }
-    impl Render for DualWyHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
-            self.sync.clone()
-        }
-    }
+}
 
-    #[test]
-    fn byte_map_round_trip_is_identity_for_plain_text() {
-        // 普通段落：渲染 == 源（map[k] = k，末位哨兵 = len）。
-        let map: Vec<usize> = (0..=5).collect(); // "abcde" + 哨兵
-        for j in 0..=5 {
-            let src = display_to_source(&map, j);
-            assert_eq!(src, j);
-            assert_eq!(
-                source_to_display(&map, src),
-                j,
-                "点渲染列 {j} → 源 {src} → 应回渲染列 {j}"
-            );
-        }
-    }
-
-    #[test]
-    fn hidden_markers_map_round_trip() {
-        // `**bold**`：渲染文本 "bold"，map = [2,3,4,5,6]（哨兵 6 = 源段尾）。
-        let map: Vec<usize> = vec![2, 3, 4, 5, 6];
-        for j in 0..4 {
-            let src = display_to_source(&map, j);
-            assert_eq!(src, 2 + j);
-            assert_eq!(
-                source_to_display(&map, src),
-                j,
-                "点渲染列 {j} 与光标回渲染列应一致"
-            );
-        }
-        // 光标在段尾（源 6）→ 渲染列 4（行尾）；点行尾（渲染列 4）→ 源段尾 6。
-        assert_eq!(source_to_display(&map, 6), 4);
-        assert_eq!(display_to_source(&map, 4), 6);
-    }
-
-    #[test]
-    fn cell_selection_display_intersects_with_cell_src() {
-        // 单元格渲染 "abcd"，map = [8,9,10,11,12]（渲染字节→源，相对行首；哨兵 12）。
-        let map = vec![8, 9, 10, 11, 12];
-        // 选区完全落在格内 [9,11) → 渲染 [1,3)。
+#[test]
+fn byte_map_round_trip_is_identity_for_plain_text() {
+    // 普通段落：渲染 == 源（map[k] = k，末位哨兵 = len）。
+    let map: Vec<usize> = (0..=5).collect(); // "abcde" + 哨兵
+    for j in 0..=5 {
+        let src = display_to_source(&map, j);
+        assert_eq!(src, j);
         assert_eq!(
-            cell_selection_display(&map, 4, 8..12, 0, &(9..11)),
-            Some((1, 3)),
-            "格内选区应回渲染字节区间"
-        );
-        // 选区从格左侧跨入 → 钳到格起点，渲染 [0, …)。
-        assert_eq!(
-            cell_selection_display(&map, 4, 8..12, 0, &(5..11)),
-            Some((0, 3)),
-            "跨格起点选区应钳到格首"
-        );
-        // 选区跨出格终点 → 渲染 […, 4)（哨兵映射到格尾）。
-        assert_eq!(
-            cell_selection_display(&map, 4, 8..12, 0, &(10..20)),
-            Some((2, 4)),
-            "跨格终点选区应钳到格尾"
-        );
-        // 选区完全在格前 / 格后 / 空单元格 → 无交集。
-        assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(0..8)), None);
-        assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(12..15)), None);
-        assert_eq!(cell_selection_display(&map, 4, 12..12, 0, &(0..20)), None);
-        // 非零行首：绝对源区间 = 行首 + 格源区间。
-        assert_eq!(
-            cell_selection_display(&map, 4, 8..12, 100, &(109..111)),
-            Some((1, 3)),
-            "非零行首换算应正确"
+            source_to_display(&map, src),
+            j,
+            "点渲染列 {j} → 源 {src} → 应回渲染列 {j}"
         );
     }
+}
 
-    #[gpui::test]
-    fn inline_code_pill_ranges_expand_over_whitespace(cx: &mut TestAppContext) {
-        // 行内代码（反引号）在 shape 期记录渲染字节区间（已扩展空白）供 paint 自绘圆角
-        // pill——与预览 `TextTrack::paint_code_ranges` 同一行为源。用贴题原句验证 `we`。
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "我们`we`可以将它理解成一个**标识接口**\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+#[test]
+fn hidden_markers_map_round_trip() {
+    // `**bold**`：渲染文本 "bold"，map = [2,3,4,5,6]（哨兵 6 = 源段尾）。
+    let map: Vec<usize> = vec![2, 3, 4, 5, 6];
+    for j in 0..4 {
+        let src = display_to_source(&map, j);
+        assert_eq!(src, 2 + j);
+        assert_eq!(
+            source_to_display(&map, src),
+            j,
+            "点渲染列 {j} 与光标回渲染列应一致"
+        );
+    }
+    // 光标在段尾（源 6）→ 渲染列 4（行尾）；点行尾（渲染列 4）→ 源段尾 6。
+    assert_eq!(source_to_display(&map, 6), 4);
+    assert_eq!(display_to_source(&map, 4), 6);
+}
+
+#[test]
+fn cell_selection_display_intersects_with_cell_src() {
+    // 单元格渲染 "abcd"，map = [8,9,10,11,12]（渲染字节→源，相对行首；哨兵 12）。
+    let map = vec![8, 9, 10, 11, 12];
+    // 选区完全落在格内 [9,11) → 渲染 [1,3)。
+    assert_eq!(
+        cell_selection_display(&map, 4, 8..12, 0, &(9..11)),
+        Some((1, 3)),
+        "格内选区应回渲染字节区间"
+    );
+    // 选区从格左侧跨入 → 钳到格起点，渲染 [0, …)。
+    assert_eq!(
+        cell_selection_display(&map, 4, 8..12, 0, &(5..11)),
+        Some((0, 3)),
+        "跨格起点选区应钳到格首"
+    );
+    // 选区跨出格终点 → 渲染 […, 4)（哨兵映射到格尾）。
+    assert_eq!(
+        cell_selection_display(&map, 4, 8..12, 0, &(10..20)),
+        Some((2, 4)),
+        "跨格终点选区应钳到格尾"
+    );
+    // 选区完全在格前 / 格后 / 空单元格 → 无交集。
+    assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(0..8)), None);
+    assert_eq!(cell_selection_display(&map, 4, 8..12, 0, &(12..15)), None);
+    assert_eq!(cell_selection_display(&map, 4, 12..12, 0, &(0..20)), None);
+    // 非零行首：绝对源区间 = 行首 + 格源区间。
+    assert_eq!(
+        cell_selection_display(&map, 4, 8..12, 100, &(109..111)),
+        Some((1, 3)),
+        "非零行首换算应正确"
+    );
+}
+
+#[gpui::test]
+fn inline_code_pill_ranges_expand_over_whitespace(cx: &mut TestAppContext) {
+    // 行内代码（反引号）在 shape 期记录渲染字节区间（已扩展空白）供 paint 自绘圆角
+    // pill——与预览 `TextTrack::paint_code_ranges` 同一行为源。用贴题原句验证 `we`。
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "我们`we`可以将它理解成一个**标识接口**\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Paragraph)
+            .expect("应有段落行");
+        assert!(
+            !para.code_ranges.is_empty(),
+            "含行内代码的文本行应记录 pill 区间"
+        );
+        // 渲染文本 = `我们we可以将它理解成一个标识接口`，`we` 在字节 [6..8)
+        // （我们=2×3 字节）；两侧不是空白 → 不扩展。
+        assert_eq!(
+            para.code_ranges[0],
+            6..8,
+            "`we` pill 应恰好覆盖渲染字节 6..8"
+        );
+        // 圆角 pill 底色单一源：与预览 `StyleParams.code_inline_bg` 同值。
+        let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
+            cx,
+            Some(f32::from(theme.font_size)),
+        );
+        assert_eq!(
+            theme.code_inline_bg, p.code_inline_bg,
+            "pill 底色抄自 StyleParams"
+        );
+    });
+}
+
+#[gpui::test]
+fn wrapped_row_click_on_second_visual_line_lands_in_second_half(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
+    let words = "1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&words));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (_, o2) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        assert_eq!(frame.rows.len(), 1, "单段文档应只有一行（块）");
+        let w0 = frame.rows[0].wrapped.first().expect("行应有 shaped 结果");
+        assert!(
+            !w0.wrap_boundaries().is_empty(),
+            "长文本应折行：wrap 边界 {} 个",
+            w0.wrap_boundaries().len()
+        );
+        let line_h = f32::from(frame.line_h);
+        let pad = f32::from(frame.padding);
+        let top = f32::from(frame.rows[0].top);
+        // 第一可视行与第二可视行各自的「行内靠左」点击（x 相同、y 分属两个可视行）。
+        let p1 = point(px(pad + 5.), px(top + line_h * 0.5));
+        let p2 = point(px(pad + 5.), px(top + line_h * 1.5));
+        let o1 = source_offset_at_local(ed.read(cx), &frame, p1);
+        let o2 = source_offset_at_local(ed.read(cx), &frame, p2);
+        // 第二可视行的点击必须落在第一可视行文本之后（而非被映射回第一行）。
+        assert!(
+            o2 > o1,
+            "第二可视行点击的源偏移 {o2} 应大于第一可视行行尾 {o1}"
+        );
+        (o1, o2)
+    });
+    // 用 `source_offset_at` 反查出的第二可视行源偏移直接落光标，验证
+    // `caret_geometry` 把光标竖条画在第二可视行（top = 块首 + 一行高）。
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(o2));
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame);
+        let line_h = f32::from(frame.line_h);
+        let top = f32::from(frame.rows[0].top);
+        let top2 = f32::from(caret_top);
+        assert!(on, "折行行应可放置光标");
+        assert!(
+            (top2 - (top + line_h)).abs() < 0.5,
+            "光标竖条应画在第二可视行：块首 top={top}，得到 {top2}"
+        );
+    });
+}
+
+/// 单一来源回归：WYSIWYG 帧内衬（`frame.padding`）必须等于 `CONTENT_EDGE_PAD_X_PX`
+/// （与预览行内 px_3 同源，见 `config::markdown`）；命中/光标坐标（`caret_geometry`）
+/// 从 `frame.padding` 推导——改内衬常量，命中/光标/划线/拖拽几何全站一致、不散落数值。
+#[gpui::test]
+fn frame_padding_single_source_and_caret_derives_from_it(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "普通段落 abcdefghijklmnopqrstuvwxyz\n\n```\nlet x = 1;\n```\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(
+            f32::from(frame.padding),
+            crate::config::markdown::CONTENT_EDGE_PAD_X_PX,
+            "帧内衬应读单一来源 CONTENT_EDGE_PAD_X_PX"
+        );
+    });
+    // 光标 x 从同一内衬推导：段落行 caret=0 的 x = frame.padding + x_off（正文 x_off=0）。
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(0));
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let (on, caret_x, _) = caret_geometry(ed.read(cx), &frame);
+        assert!(on, "段落行应有光标");
+        let para = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == crate::markdown::ir::IrKind::Paragraph)
+            .expect("应有段落行");
+        let expect_x = f32::from(frame.padding) + f32::from(para.x_off);
+        assert!(
+            (f32::from(caret_x) - expect_x).abs() < 0.5,
+            "光标 x 应 = frame.padding + x_off（同一内衬推导）：expect {expect_x:.1}，实测 {:.1}",
+            f32::from(caret_x)
+        );
+    });
+}
+
+/// 防回归：f916fce 把文本折行宽改成「帧宽 − 帧内衬×2 − 行 gutter」后，引述/警报背景带
+/// 曾按「帧宽 − 内衬×2 − 再内缩」画宽 → 带右缘比内容盒右缘短 24px，窄窗折行时最右
+/// ~1.5 个汉字漏背景。本测试锁定渲染侧不变量（paint/shape 同源几何）：
+/// ① 背景带宽（`quote_band_w`，paint 唯一取值）== 内容盒宽（帧宽 − 2×内衬）；
+/// ② 每一折行可视行的文字右缘 ≤ 内容盒右缘（帧宽 − 内衬）——全宽背景带盖住全部文字；
+/// ③ 折叠/展开两种 `[!NOTE]` 态都对。窄窗（折行）与全屏（不折行）都断言。
+#[gpui::test]
+fn quote_band_covers_all_wrapped_text_right_edges(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 引述/警报正文：掺入 ASCII 高宽 token（测试环境 CJK 字宽≈0，ASCII 才撑起折行），
+    // 使窄窗（300/400）内每行必然折成 ≥2 可视行；后带 `[!NOTE]-`（默认折叠），
+    // 测试里先展开让 body 行参与带内整形、再折叠回验证 0 高不物化。
+    let body = "这是很长的一段引用文字，用来在窄窗口里触发折行，最右侧会出现被背景漏盖的字符与符号，比如箭头→ ref-1234567890 xyz@mail.com END。";
+    let long = body.repeat(8);
+    let text = format!(
+        "> {long}\n> {long}\n> [!NOTE]- 警报标题这一行也很长，会触发折行背景带检查 END\n> {long}\n"
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text.as_str()));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let para = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Paragraph)
-                .expect("应有段落行");
-            assert!(
-                !para.code_ranges.is_empty(),
-                "含行内代码的文本行应记录 pill 区间"
-            );
-            // 渲染文本 = `我们we可以将它理解成一个标识接口`，`we` 在字节 [6..8)
-            // （我们=2×3 字节）；两侧不是空白 → 不扩展。
-            assert_eq!(
-                para.code_ranges[0],
-                6..8,
-                "`we` pill 应恰好覆盖渲染字节 6..8"
-            );
-            // 圆角 pill 底色单一源：与预览 `StyleParams.code_inline_bg` 同值。
-            let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
-                cx,
-                Some(f32::from(theme.font_size)),
-            );
-            assert_eq!(theme.code_inline_bg, p.code_inline_bg, "pill 底色抄自 StyleParams");
-        });
-    }
-
-    #[gpui::test]
-    fn wrapped_row_click_on_second_visual_line_lands_in_second_half(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
-        let words = "1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&words));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (_, o2) = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            assert_eq!(frame.rows.len(), 1, "单段文档应只有一行（块）");
-            let w0 = frame.rows[0]
-                .wrapped
-                .first()
-                .expect("行应有 shaped 结果");
-            assert!(
-                !w0.wrap_boundaries().is_empty(),
-                "长文本应折行：wrap 边界 {} 个",
-                w0.wrap_boundaries().len()
-            );
-            let line_h = f32::from(frame.line_h);
+            // 展开 `[!NOTE]-`（`-` 默认折叠；预览里点箭头/光标 reveal 即此态），让 body 行
+            // 参与带内整形——折叠 body 不物化、无背景画。
+            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(2, cx));
+            assert!(ed.read(cx).text().contains("> [!NOTE]+"), "应已展开为 +");
+            for width in [300.0_f32, 400.0_f32, 800.0_f32, 1600.0_f32] {
+                let expect_wrap = width < 800.;
+                let frame = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+                let pad = f32::from(frame.padding);
+                let avail = f32::from(frame.width) - 2. * pad;
+                let content_right = f32::from(frame.width) - pad; // 内容盒右缘（= 带右缘合同）
+                // ① 背景带宽单一来源 helper == 内容盒宽（paint 与测试共用；回归 → 这里断）。
+                let band_w = quote_band_w(&frame);
+                assert!(
+                    (band_w - avail).abs() < 0.5,
+                    "宽 {width}: 带宽应为内容盒宽 avail={avail:.1}，实际 {band_w:.1}"
+                );
+                assert!(
+                    band_w + pad <= content_right + 0.5,
+                    "宽 {width}: 带右缘 {:.1} 不应越出内容盒右缘 {content_right:.1}",
+                    band_w + pad
+                );
+                let quotes: Vec<_> = frame
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == IrKind::Quote && !r.wrapped.is_empty())
+                    .collect();
+                assert!(
+                    quotes.len() >= 3,
+                    "宽 {width}: 展开态应含 2 引述 + 警报 marker + body，实际 {}",
+                    quotes.len()
+                );
+                // ② 每一条折行可视行的文字右缘 ≤ 内容盒右缘（全宽背景带必盖住；折行行
+                //    `wl.width()` 会被折行宽封顶 → 恰为 content_right，正是旧带漏盖的区间）。
+                let mut max_text_right = 0.0_f32;
+                let mut wrapped_rows = 0usize;
+                for row in &quotes {
+                    let x_off = f32::from(row.x_off);
+                    assert!(
+                        x_off >= 0.,
+                        "宽 {width}: 引述/警报 x_off 不应为负（{x_off:.1}）"
+                    );
+                    if row
+                        .wrapped
+                        .iter()
+                        .any(|wl| !wl.wrap_boundaries().is_empty())
+                    {
+                        wrapped_rows += 1;
+                    }
+                    // 一个源码行 = 一个 WrappedLine（子行在 wrap_boundaries 内）；折行行的
+                    // `wl.width()` 会被折行宽封顶 → tr = content_right，正是旧带漏盖的区间。
+                    for wl in row.wrapped.iter() {
+                        let tr = pad + x_off + f32::from(wl.width());
+                        max_text_right = max_text_right.max(tr);
+                        assert!(
+                            tr <= content_right + 0.5,
+                            "宽 {width}: 文字右缘 {tr:.1} 超出内容盒右缘 {content_right:.1}（带右缘 {band_w:.0}+{pad:.0}={:.1}），背景会漏盖",
+                            band_w + pad
+                        );
+                    }
+                }
+                if expect_wrap {
+                    assert!(
+                        wrapped_rows > 0,
+                        "窄窗（{width}）应有折行（scan wrap_boundaries）的引述块，测试才能锁定漏盖回归"
+                    );
+                    assert!(
+                        max_text_right > content_right - 120.,
+                        "窄窗文字右缘应接近内容盒右缘（折行确实顶到右缘），实际 max={max_text_right:.1}"
+                    );
+                }
+            }
+            // ③ 折叠回 `-`：body 隐藏（0 高不物化），marker 行自身带不变量照旧成立。
+            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(2, cx));
+            assert!(ed.read(cx).text().contains("> [!NOTE]-"), "应折叠回 -");
+            let frame = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
             let pad = f32::from(frame.padding);
-            let top = f32::from(frame.rows[0].top);
-            // 第一可视行与第二可视行各自的「行内靠左」点击（x 相同、y 分属两个可视行）。
-            let p1 = point(px(pad + 5.), px(top + line_h * 0.5));
-            let p2 = point(px(pad + 5.), px(top + line_h * 1.5));
-            let o1 = source_offset_at_local(ed.read(cx), &frame, p1);
-            let o2 = source_offset_at_local(ed.read(cx), &frame, p2);
-            // 第二可视行的点击必须落在第一可视行文本之后（而非被映射回第一行）。
+            let content_right = f32::from(frame.width) - pad;
             assert!(
-                o2 > o1,
-                "第二可视行点击的源偏移 {o2} 应大于第一可视行行尾 {o1}"
+                quote_band_w(&frame) + pad <= content_right + 0.5,
+                "折叠态带右缘 {:.1} 不越出内容盒右缘 {content_right:.1}",
+                quote_band_w(&frame) + pad
             );
-            (o1, o2)
-        });
-        // 用 `source_offset_at` 反查出的第二可视行源偏移直接落光标，验证
-        // `caret_geometry` 把光标竖条画在第二可视行（top = 块首 + 一行高）。
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(o2));
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let (on, _, caret_top) = caret_geometry(ed.read(cx), &frame);
-            let line_h = f32::from(frame.line_h);
-            let top = f32::from(frame.rows[0].top);
-            let top2 = f32::from(caret_top);
-            assert!(on, "折行行应可放置光标");
-            assert!(
-                (top2 - (top + line_h)).abs() < 0.5,
-                "光标竖条应画在第二可视行：块首 top={top}，得到 {top2}"
-            );
-        });
-    }
-
-    /// 单一来源回归：WYSIWYG 帧内衬（`frame.padding`）必须等于 `CONTENT_EDGE_PAD_X_PX`
-    /// （与预览行内 px_3 同源，见 `config::markdown`）；命中/光标坐标（`caret_geometry`）
-    /// 从 `frame.padding` 推导——改内衬常量，命中/光标/划线/拖拽几何全站一致、不散落数值。
-    #[gpui::test]
-    fn frame_padding_single_source_and_caret_derives_from_it(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "普通段落 abcdefghijklmnopqrstuvwxyz\n\n```\nlet x = 1;\n```\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert_eq!(
-                f32::from(frame.padding),
-                crate::config::markdown::CONTENT_EDGE_PAD_X_PX,
-                "帧内衬应读单一来源 CONTENT_EDGE_PAD_X_PX"
-            );
-        });
-        // 光标 x 从同一内衬推导：段落行 caret=0 的 x = frame.padding + x_off（正文 x_off=0）。
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(0));
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let (on, caret_x, _) = caret_geometry(ed.read(cx), &frame);
-            assert!(on, "段落行应有光标");
-            let para = frame
+            let marker = frame
                 .rows
                 .iter()
-                .find(|r| r.kind == crate::markdown::ir::IrKind::Paragraph)
-                .expect("应有段落行");
-            let expect_x = f32::from(frame.padding) + f32::from(para.x_off);
-            assert!(
-                (f32::from(caret_x) - expect_x).abs() < 0.5,
-                "光标 x 应 = frame.padding + x_off（同一内衬推导）：expect {expect_x:.1}，实测 {:.1}",
-                f32::from(caret_x)
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn large_doc_windowed_shaping_shapes_only_band(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 首个超长折行段 + 大量单行段（≈2 万块）：**窄带只 shape 带内块**，
-        // 其余用 BlockMeta 估算占位——大文档再也不会整篇每帧 shape。
-        let head = "一二三四五六七八九十 ".repeat(300); // 长中文行，必然折行
-        let body = "paragraph line of text 0123456789".to_string();
-        let mut text = head;
-        for _ in 0..20_000 {
-            text.push('\n');
-            text.push_str(&body);
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 只覆盖顶部 ~80px 的窄带 → 真正 shape 的块应极少。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 80.));
-            let n = frame.block_count();
-            assert!(n > 10_000, "应有大量块：{n}");
-            let shaped = frame.rows.len();
-            assert!(
-                shaped > 0 && shaped < 20,
-                "窄带只应物化极少量带内整形行，实际 {shaped}/{n}"
-            );
-            // 带外块不再物化占位：`rows` 只含带内整形行（全非空 wrapped）。
-            assert!(
-                frame.rows.iter().all(|r| !r.wrapped.is_empty()),
-                "rows 只应有带内整形行"
-            );
-            assert!(
-                f32::from(frame.total) > 100_000.,
-                "总高应由估算铺满（>.1M px），实际 {:.0}",
-                f32::from(frame.total)
-            );
-        });
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 全篇带 → 全部块物化并 shape（与旧行为一致，小文档回归护栏）。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+                .find(|r| r.kind == IrKind::Quote && r.extra.gutter.is_some())
+                .expect("折叠态应有警报 marker 行");
+            for wl in marker.wrapped.iter() {
+                let tr = pad + f32::from(marker.x_off) + f32::from(wl.width());
+                assert!(
+                    tr <= content_right + 0.5,
+                    "折叠态 marker 文字右缘 {tr:.1} 也应 ≤ 内容盒右缘 {content_right:.1}"
+                );
+            }
+            // body 高应为 0（真正折叠，非 reveal）。
+            let body_ix = frame.block_index_for_src_line(3).expect("警报 body 块");
             assert_eq!(
-                frame.rows.iter().filter(|r| r.wrapped.is_empty()).count(),
-                0,
-                "全带应全部 shape"
+                frame.block_height(body_ix),
+                0.,
+                "折叠后警报 body 应 0 高（不物化）"
             );
         });
-    }
+}
 
-    #[gpui::test]
-    fn off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 短行 + 必折行的长段：先全带 shape（记录真实高），再窄带（长段被挤到带外）
-        // ——带外高度必须复用缓存真值，而不是跳回估算（滚动“字体大小抖动”的根因）。
-        let text = format!(
-            "short line\n{}\n{}",
-            "the quick brown fox jumps over the lazy dog ".repeat(40),
-            "tail\n"
+#[gpui::test]
+fn large_doc_windowed_shaping_shapes_only_band(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 首个超长折行段 + 大量单行段（≈2 万块）：**窄带只 shape 带内块**，
+    // 其余用 BlockMeta 估算占位——大文档再也不会整篇每帧 shape。
+    let head = "一二三四五六七八九十 ".repeat(300); // 长中文行，必然折行
+    let body = "paragraph line of text 0123456789".to_string();
+    let mut text = head;
+    for _ in 0..20_000 {
+        text.push('\n');
+        text.push_str(&body);
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 只覆盖顶部 ~80px 的窄带 → 真正 shape 的块应极少。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 80.));
+        let n = frame.block_count();
+        assert!(n > 10_000, "应有大量块：{n}");
+        let shaped = frame.rows.len();
+        assert!(
+            shaped > 0 && shaped < 20,
+            "窄带只应物化极少量带内整形行，实际 {shaped}/{n}"
         );
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (h_real, top_real) = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let rows: Vec<_> = frame
-                .rows
-                .iter()
-                .map(|r| (r.height, r.top))
-                .collect();
-            assert!(rows.len() >= 3 && rows[1].0 > px(24.) * 3., "长段应多行：{:?}", rows[1]);
-            (rows[1].0, rows[1].1)
-        });
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 窄带 (0,1)：第一条短行（24px）之后即带外——带外块不物化，走布局 `block_*`。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
-            assert_eq!(frame.rows.len(), 1, "窄带 (0,1) 只应物化首行");
-            assert_eq!(
-                frame.block_height(1), f32::from(h_real),
-                "带外长段高度应沿用缓存真值（不跳回估算）"
-            );
-            assert_eq!(frame.block_top(1), f32::from(top_real), "带外长段 top 也应一致");
-            // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            assert_eq!(frame.rows[1].height, h_real);
-        });
-    }
+        // 带外块不再物化占位：`rows` 只含带内整形行（全非空 wrapped）。
+        assert!(
+            frame.rows.iter().all(|r| !r.wrapped.is_empty()),
+            "rows 只应有带内整形行"
+        );
+        assert!(
+            f32::from(frame.total) > 100_000.,
+            "总高应由估算铺满（>.1M px），实际 {:.0}",
+            f32::from(frame.total)
+        );
+    });
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 全篇带 → 全部块物化并 shape（与旧行为一致，小文档回归护栏）。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        assert_eq!(
+            frame.rows.iter().filter(|r| r.wrapped.is_empty()).count(),
+            0,
+            "全带应全部 shape"
+        );
+    });
+}
 
-    #[gpui::test]
-    fn heading_off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 标题行**带外**高度必须沿用「整形真值」（heading_line×行 + 8px pad），不能按
-        // 正文行高重建——否则标题每次进出可视带 total 就变矮/变高，滚动到文档末端
-        // 被反复 clamp → 页面「突然跳上去 + 抖动」。这是用户实测症状的根因。
-        let text = "first paragraph line\n## Heading two\nsome more body text\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (h_real, idx) = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let idx = frame
-                .rows
-                .iter()
-                .position(|r| matches!(r.kind, IrKind::Heading(_)))
-                .expect("应有标题块");
-            let h_real = frame.rows[idx].height;
-            assert!(
-                f32::from(h_real) > f32::from(frame.line_h),
-                "标题块高应大于正文行高（heading_line + pad），实际 {}",
-                f32::from(h_real)
-            );
-            (h_real, idx)
-        });
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 窄带 (0,1)：首段在带内，标题被挤出带 → 未物化，但布局高度沿用缓存真值。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
-            assert!(frame.rows.len() <= 1, "标题在带外（不物化），rows 只含首段");
-            assert!(
-                (frame.block_height(idx) - f32::from(h_real)).abs() < 0.5,
-                "带外标题高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                frame.block_height(idx)
-            );
-            // 全带回来 → 仍一致。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            assert_eq!(frame.rows[idx].height, h_real);
-        });
-    }
+#[gpui::test]
+fn off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 短行 + 必折行的长段：先全带 shape（记录真实高），再窄带（长段被挤到带外）
+    // ——带外高度必须复用缓存真值，而不是跳回估算（滚动“字体大小抖动”的根因）。
+    let text = format!(
+        "short line\n{}\n{}",
+        "the quick brown fox jumps over the lazy dog ".repeat(40),
+        "tail\n"
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (h_real, top_real) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let rows: Vec<_> = frame.rows.iter().map(|r| (r.height, r.top)).collect();
+        assert!(
+            rows.len() >= 3 && rows[1].0 > px(24.) * 3.,
+            "长段应多行：{:?}",
+            rows[1]
+        );
+        (rows[1].0, rows[1].1)
+    });
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 窄带 (0,1)：第一条短行（24px）之后即带外——带外块不物化，走布局 `block_*`。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
+        assert_eq!(frame.rows.len(), 1, "窄带 (0,1) 只应物化首行");
+        assert_eq!(
+            frame.block_height(1),
+            f32::from(h_real),
+            "带外长段高度应沿用缓存真值（不跳回估算）"
+        );
+        assert_eq!(
+            frame.block_top(1),
+            f32::from(top_real),
+            "带外长段 top 也应一致"
+        );
+        // 全带再回来 → 高度仍一致（缓存跨帧稳定）。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        assert_eq!(frame.rows[1].height, h_real);
+    });
+}
 
-    #[gpui::test]
-    fn inline_math_grown_row_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 行内公式撑高的行：带内高 = grew 的 sub_heights[0]（> 行高），带外也必须
-        // 沿用该真值，不能按「行数×正文行高」重建（否则缩回原高，滚动跳）。
-        let text = "a $\u{5c}int_0^1 x^2 dx$ b\nsome more body text that is longer\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let h_real = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let buf = image::RgbaImage::from_raw(40, 140, vec![0u8; 40 * 140 * 4]).unwrap();
-            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
-            ed.read(cx).math_slots().borrow_mut().insert(
-                super::super::inline_math_key("\\int_0^1 x^2 dx"),
-                super::super::MathSlot::Ready(img, 20., 70.),
-            );
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let row = &frame.rows[0];
-            let h = row.height;
-            assert!(
-                f32::from(h) > f32::from(row.lh) + 0.5,
-                "含超高公式的行应被撑高：h={h:?} > lh={:?}",
-                row.lh
-            );
-            h
-        });
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 窄带完全落在撑高行之下 → 第 0 行带外（不物化），仍应沿用整形真值。
-            let lo = f32::from(h_real);
-            let frame = build_frame(ed.read(cx), window, px(300.), (lo, lo + 0.1));
-            assert!(
-                !frame.rows.iter().any(|r| r.src_line == 0),
-                "撑高行（块 0）应带外（不物化）"
-            );
-            assert!(
-                (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
-                "带外撑高行高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                frame.block_height(0)
-            );
-        });
-    }
+#[gpui::test]
+fn heading_off_band_reuses_shaped_height_no_jump(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 标题行**带外**高度必须沿用「整形真值」（heading_line×行 + 8px pad），不能按
+    // 正文行高重建——否则标题每次进出可视带 total 就变矮/变高，滚动到文档末端
+    // 被反复 clamp → 页面「突然跳上去 + 抖动」。这是用户实测症状的根因。
+    let text = "first paragraph line\n## Heading two\nsome more body text\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (h_real, idx) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let idx = frame
+            .rows
+            .iter()
+            .position(|r| matches!(r.kind, IrKind::Heading(_)))
+            .expect("应有标题块");
+        let h_real = frame.rows[idx].height;
+        assert!(
+            f32::from(h_real) > f32::from(frame.line_h),
+            "标题块高应大于正文行高（heading_line + pad），实际 {}",
+            f32::from(h_real)
+        );
+        (h_real, idx)
+    });
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 窄带 (0,1)：首段在带内，标题被挤出带 → 未物化，但布局高度沿用缓存真值。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 1.));
+        assert!(frame.rows.len() <= 1, "标题在带外（不物化），rows 只含首段");
+        assert!(
+            (frame.block_height(idx) - f32::from(h_real)).abs() < 0.5,
+            "带外标题高度应沿用整形真值 {h_real:?}，实际 {:?}",
+            frame.block_height(idx)
+        );
+        // 全带回来 → 仍一致。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        assert_eq!(frame.rows[idx].height, h_real);
+    });
+}
 
-    #[gpui::test]
-    fn image_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 已加载图片行：带内真实高（按宽高比），带外估算也必须同式——否则加载后
-        // 图片行一进带就高/矮跳一次，滚动到文档末端现形。
-        let text = "![figure](x.png)\nfirst paragraph line\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let h_real = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 预置宽高比 2:1 的真实尺寸（模拟 preseed/加载完成）。
-            ed.update(cx, |e, _| {
-                e.set_image_size("x.png".into(), Some((200., 100.)));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = &frame.rows[0];
-            assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
-            let img = row.image.as_ref().expect("图片行应有渲染数据");
-            let h = row.height;
-            // 块高 = 图片盒高 + 题注间隙 + 题注（alt 可编辑）行高（与 shape 同式）。
-            let expect_h = img.h
-                + crate::config::markdown::IMAGE_CAPTION_GAP_PX
-                + f32::from(ed.read(cx).theme.para_line());
-            assert!(
-                (f32::from(h) - expect_h).abs() < 0.5,
-                "块高应=图高+间隙+题注行高，实际 {h:?} 期望 {expect_h:?}"
-            );
-            assert!(
-                (f32::from(h)
-                    - crate::config::markdown::IMAGE_ROW_DEFAULT_H)
-                    .abs()
-                    > 1.,
-                "2:1 图片在此宽度下应高于占位默认高，h={h:?}"
-            );
-            h
-        });
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 窄带完全落在图片行之下 → 图片行带外（不物化），仍沿用整形真值。
-            let lo = f32::from(h_real);
-            let frame = build_frame(ed.read(cx), window, px(600.), (lo, lo + 0.1));
-            assert!(
-                !frame.rows.iter().any(|r| r.src_line == 0),
-                "图片行（块 0）应带外（不物化）"
-            );
-            assert!(
-                (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
-                "带外图片行高度应沿用整形真值 {h_real:?}，实际 {:?}",
-                frame.block_height(0)
-            );
-        });
-    }
+#[gpui::test]
+fn inline_math_grown_row_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 行内公式撑高的行：带内高 = grew 的 sub_heights[0]（> 行高），带外也必须
+    // 沿用该真值，不能按「行数×正文行高」重建（否则缩回原高，滚动跳）。
+    let text = "a $\u{5c}int_0^1 x^2 dx$ b\nsome more body text that is longer\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let h_real = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let buf = image::RgbaImage::from_raw(40, 140, vec![0u8; 40 * 140 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        ed.read(cx).math_slots().borrow_mut().insert(
+            super::super::inline_math_key("\\int_0^1 x^2 dx"),
+            super::super::MathSlot::Ready(img, 20., 70.),
+        );
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let row = &frame.rows[0];
+        let h = row.height;
+        assert!(
+            f32::from(h) > f32::from(row.lh) + 0.5,
+            "含超高公式的行应被撑高：h={h:?} > lh={:?}",
+            row.lh
+        );
+        h
+    });
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 窄带完全落在撑高行之下 → 第 0 行带外（不物化），仍应沿用整形真值。
+        let lo = f32::from(h_real);
+        let frame = build_frame(ed.read(cx), window, px(300.), (lo, lo + 0.1));
+        assert!(
+            !frame.rows.iter().any(|r| r.src_line == 0),
+            "撑高行（块 0）应带外（不物化）"
+        );
+        assert!(
+            (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
+            "带外撑高行高度应沿用整形真值 {h_real:?}，实际 {:?}",
+            frame.block_height(0)
+        );
+    });
+}
 
-    #[gpui::test]
-    fn image_size_lazy_detected_on_first_in_band_shape(cx: &mut TestAppContext) {
-        // 回归（A-4）：图片尺寸不再于 load 路径（set_source_text）预读全篇——打开后
-        // 带外图片保持「未测」；图片行**首次进带 shape** 才按需读一次真实尺寸并入缓存
-        // （大文档 3456 图参考 ~75-130ms 首帧阻塞的根因）。
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let p = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/img测试.png");
-        // 图片推到首帧带（0..2048）之外：验证 open 不清扫、滚到时才惰性读。
-        let mut text = String::new();
-        for i in 0..120 {
-            text.push_str(&format!("普通第 {i} 行正文足够长让每行的折行也占高一点 no wrap words\n"));
-        }
-        text.push_str(&format!("![a]({p})\n![b]({p})\n"));
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+#[gpui::test]
+fn image_off_band_reuses_shaped_height(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 已加载图片行：带内真实高（按宽高比），带外估算也必须同式——否则加载后
+    // 图片行一进带就高/矮跳一次，滚动到文档末端现形。
+    let text = "![figure](x.png)\nfirst paragraph line\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let h_real = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 预置宽高比 2:1 的真实尺寸（模拟 preseed/加载完成）。
+        ed.update(cx, |e, _| {
+            e.set_image_size("x.png".into(), Some((200., 100.)));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 打开 + 首帧（图片在带外）：image_sizes 应仍为「未尝试」。
-            assert_eq!(
-                ed.read(cx).image_size(p),
-                None,
-                "open/首帧不应预读带外图片尺寸"
-            );
-        });
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 建覆盖全篇的带 → 图片行首次 shape 惰性读到真实尺寸（72×72 JPEG）。
-            let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert_eq!(
-                f.rows.iter().filter(|r| r.image.is_some()).count(),
-                2,
-                "两行图片都应物化"
-            );
-            let got = ed.read(cx).image_size(p);
-            assert!(
-                matches!(got, Some(Some((w, h))) if w > 0. && h > 0.),
-                "图片行首次进带 shape 应读到真实尺寸（fixtures/img测试.png），实际 {got:?}"
-            );
-        });
-    }
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = &frame.rows[0];
+        assert!(matches!(row.kind, IrKind::Image), "第 0 块应为图片行");
+        let img = row.image.as_ref().expect("图片行应有渲染数据");
+        let h = row.height;
+        // 块高 = 图片盒高 + 题注间隙 + 题注（alt 可编辑）行高（与 shape 同式）。
+        let expect_h = img.h
+            + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+            + f32::from(ed.read(cx).theme.para_line());
+        assert!(
+            (f32::from(h) - expect_h).abs() < 0.5,
+            "块高应=图高+间隙+题注行高，实际 {h:?} 期望 {expect_h:?}"
+        );
+        assert!(
+            (f32::from(h) - crate::config::markdown::IMAGE_ROW_DEFAULT_H).abs() > 1.,
+            "2:1 图片在此宽度下应高于占位默认高，h={h:?}"
+        );
+        h
+    });
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 窄带完全落在图片行之下 → 图片行带外（不物化），仍沿用整形真值。
+        let lo = f32::from(h_real);
+        let frame = build_frame(ed.read(cx), window, px(600.), (lo, lo + 0.1));
+        assert!(
+            !frame.rows.iter().any(|r| r.src_line == 0),
+            "图片行（块 0）应带外（不物化）"
+        );
+        assert!(
+            (frame.block_height(0) - f32::from(h_real)).abs() < 0.5,
+            "带外图片行高度应沿用整形真值 {h_real:?}，实际 {:?}",
+            frame.block_height(0)
+        );
+    });
+}
 
-    #[gpui::test]
-    fn code_table_image_blocks_shape_with_payload(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn image_size_lazy_detected_on_first_in_band_shape(cx: &mut TestAppContext) {
+    // 回归（A-4）：图片尺寸不再于 load 路径（set_source_text）预读全篇——打开后
+    // 带外图片保持「未测」；图片行**首次进带 shape** 才按需读一次真实尺寸并入缓存
+    // （大文档 3456 图参考 ~75-130ms 首帧阻塞的根因）。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let p = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/img测试.png");
+    // 图片推到首帧带（0..2048）之外：验证 open 不清扫、滚到时才惰性读。
+    let mut text = String::new();
+    for i in 0..120 {
+        text.push_str(&format!(
+            "普通第 {i} 行正文足够长让每行的折行也占高一点 no wrap words\n"
+        ));
+    }
+    text.push_str(&format!("![a]({p})\n![b]({p})\n"));
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 打开 + 首帧（图片在带外）：image_sizes 应仍为「未尝试」。
+        assert_eq!(
+            ed.read(cx).image_size(p),
+            None,
+            "open/首帧不应预读带外图片尺寸"
+        );
+    });
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 建覆盖全篇的带 → 图片行首次 shape 惰性读到真实尺寸（72×72 JPEG）。
+        let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(
+            f.rows.iter().filter(|r| r.image.is_some()).count(),
+            2,
+            "两行图片都应物化"
+        );
+        let got = ed.read(cx).image_size(p);
+        assert!(
+            matches!(got, Some(Some((w, h))) if w > 0. && h > 0.),
+            "图片行首次进带 shape 应读到真实尺寸（fixtures/img测试.png），实际 {got:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn code_table_image_blocks_shape_with_payload(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 ```rust
 let a = 1;
 let b = 2;
@@ -544,677 +676,698 @@ let c = 3;
 
 ![图](x.png)
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+
+        // 代码块：3 行逐行 shape、内容行可编辑、块高 = (行数+2)×code_line。
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code)
+            .expect("应有代码块");
+        assert!(code.editable, "代码内容行应可编辑");
+        assert_eq!(code.wrapped.len(), 3, "3 行代码应各一个 WrappedLine");
+        // 每源码行起始渲染字节偏移（"let a/ b/ c = 3;" 各 10 字节 + 2 个 '\n' 分隔）。
+        assert_eq!(code.multi_offsets, vec![0, 11, 22], "每行渲染起始字节");
+        assert_eq!(
+            code.byte_map.len(),
+            "let a = 1;\nlet b = 2;\nlet c = 3;".len() + 1,
+            "块级 byte_map = 整块渲染文本长 + 哨兵"
+        );
+        // 渲染「块级映射」往返：第 2 行中间列 → 块内源偏移 → 应指到 `let c = 3;`。
+        let line2 = "let c = 3;";
+        let ok = (0..line2.len()).all(|i| {
+            let src = display_to_source(&code.byte_map, 22 + i);
+            let col = src.saturating_sub(display_to_source(&code.byte_map, 22));
+            line2.as_bytes().get(col) == line2.as_bytes().get(i)
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(ok, "第 2 行渲染字节应回落到该行对应源字节");
+        let expect_h = f32::from(theme.code_line()) * 5.;
+        assert!(
+            (f32::from(code.height) - expect_h).abs() < 1.,
+            "代码块高=(行数+2)×code_line，实际 {}",
+            f32::from(code.height)
+        );
 
-            // 代码块：3 行逐行 shape、内容行可编辑、块高 = (行数+2)×code_line。
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code)
-                .expect("应有代码块");
-            assert!(code.editable, "代码内容行应可编辑");
-            assert_eq!(code.wrapped.len(), 3, "3 行代码应各一个 WrappedLine");
-            // 每源码行起始渲染字节偏移（"let a/ b/ c = 3;" 各 10 字节 + 2 个 '\n' 分隔）。
-            assert_eq!(code.multi_offsets, vec![0, 11, 22], "每行渲染起始字节");
-            assert_eq!(
-                code.byte_map.len(),
-                "let a = 1;\nlet b = 2;\nlet c = 3;".len() + 1,
-                "块级 byte_map = 整块渲染文本长 + 哨兵"
-            );
-            // 渲染「块级映射」往返：第 2 行中间列 → 块内源偏移 → 应指到 `let c = 3;`。
-            let line2 = "let c = 3;";
-            let ok = (0..line2.len()).all(|i| {
-                let src = display_to_source(&code.byte_map, 22 + i);
-                let col = src.saturating_sub(display_to_source(&code.byte_map, 22));
-                line2.as_bytes().get(col) == line2.as_bytes().get(i)
-            });
-            assert!(ok, "第 2 行渲染字节应回落到该行对应源字节");
-            let expect_h = f32::from(theme.code_line()) * 5.;
-            assert!(
-                (f32::from(code.height) - expect_h).abs() < 1.,
-                "代码块高=(行数+2)×code_line，实际 {}",
-                f32::from(code.height)
-            );
+        // 表格块：表头 2 列 × 数据 2 行，渲染数据齐备、单元格可编辑。
+        let table = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格块");
+        assert!(table.editable, "表格单元格应可编辑");
+        let t = table.table.as_ref().expect("表格应有渲染数据");
+        assert_eq!(t.header_texts.len(), 2);
+        assert_eq!(t.rows_texts.len(), 2);
+        assert_eq!(t.header_texts[0].as_ref(), "A");
+        assert_eq!(t.rows_texts[1][1].as_ref(), "4");
+        assert!(t.total_w > 0.);
+        // 编辑排版：表头(1) + 数据行(2) = 3 个可见行，每行 2 格，源行号与块一致。
+        let te = table.table_edit.as_ref().expect("表格应有编辑排版");
+        assert_eq!(te.rows.len(), 3, "表头 + 2 数据行");
+        for row in te.rows.iter() {
+            assert_eq!(row.cells.len(), 2, "每行 2 格");
+        }
+        assert_eq!(te.rows[0].src_line, 6, "表头源行");
+        assert_eq!(te.rows[1].src_line, 8, "首数据行源行（隔开分隔行）");
+        assert_eq!(te.rows[2].src_line, 9, "次数据行源行");
+        assert!(
+            (f32::from(table.height)
+                - (f32::from(table_block_height(&theme, 2))
+                    + crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX))
+                .abs()
+                < 1.,
+            "表格块高与估算同式（网格 + 滚动条预留带）"
+        );
 
-            // 表格块：表头 2 列 × 数据 2 行，渲染数据齐备、单元格可编辑。
-            let table = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table)
-                .expect("应有表格块");
-            assert!(table.editable, "表格单元格应可编辑");
-            let t = table.table.as_ref().expect("表格应有渲染数据");
-            assert_eq!(t.header_texts.len(), 2);
-            assert_eq!(t.rows_texts.len(), 2);
-            assert_eq!(t.header_texts[0].as_ref(), "A");
-            assert_eq!(t.rows_texts[1][1].as_ref(), "4");
-            assert!(t.total_w > 0.);
-            // 编辑排版：表头(1) + 数据行(2) = 3 个可见行，每行 2 格，源行号与块一致。
-            let te = table.table_edit.as_ref().expect("表格应有编辑排版");
-            assert_eq!(te.rows.len(), 3, "表头 + 2 数据行");
-            for row in te.rows.iter() {
-                assert_eq!(row.cells.len(), 2, "每行 2 格");
-            }
-            assert_eq!(te.rows[0].src_line, 6, "表头源行");
-            assert_eq!(te.rows[1].src_line, 8, "首数据行源行（隔开分隔行）");
-            assert_eq!(te.rows[2].src_line, 9, "次数据行源行");
-            assert!(
-                (f32::from(table.height)
-                    - (f32::from(table_block_height(&theme, 2))
-                        + crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX))
-                    .abs()
-                    < 1.,
-                "表格块高与估算同式（网格 + 滚动条预留带）"
-            );
+        // 图片块：占位框（未加载），题注（alt）可编辑、带 src + 源码映射。
+        let img_row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("应有图片块");
+        assert!(img_row.editable, "图片题注（alt）应可编辑");
+        let im = img_row.image.as_ref().expect("图片应有渲染数据");
+        assert_eq!(im.src.as_ref(), "x.png");
+        // 题注行 = alt 文本，shape 成可编辑 wrapped 单行；byte_map = 源 `![` 之后。
+        assert_eq!(
+            img_row.wrapped.first().map(|w| w.text.as_ref()),
+            Some("图"),
+            "题注行文本应为 alt"
+        );
+        assert_eq!(
+            img_row.byte_map.len(),
+            "图".len() + 1,
+            "alt 显示↔源映射长度"
+        );
+        assert_eq!(
+            img_row.byte_map.first().copied(),
+            Some(2),
+            "alt 首显示字节应映射到源 `![` 之后（偏移 2）"
+        );
+        assert!(f32::from(img_row.height) > 0.);
+    });
+}
 
-            // 图片块：占位框（未加载），题注（alt）可编辑、带 src + 源码映射。
-            let img_row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Image)
-                .expect("应有图片块");
-            assert!(img_row.editable, "图片题注（alt）应可编辑");
-            let im = img_row.image.as_ref().expect("图片应有渲染数据");
-            assert_eq!(im.src.as_ref(), "x.png");
-            // 题注行 = alt 文本，shape 成可编辑 wrapped 单行；byte_map = 源 `![` 之后。
-            assert_eq!(
-                img_row.wrapped.first().map(|w| w.text.as_ref()),
-                Some("图"),
-                "题注行文本应为 alt"
-            );
-            assert_eq!(img_row.byte_map.len(), "图".len() + 1, "alt 显示↔源映射长度");
-            assert_eq!(
-                img_row.byte_map.first().copied(),
-                Some(2),
-                "alt 首显示字节应映射到源 `![` 之后（偏移 2）"
-            );
-            assert!(f32::from(img_row.height) > 0.);
+#[gpui::test]
+fn theme_mirrors_style_params_single_source(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# t\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        // WYSIWYG 主题必须逐项抄自预览单一排版源 StyleParams（改样式只动一处）。
+        let p = crate::markdown::view::style::StyleParams::from_theme_with_font(
+            cx,
+            Some(f32::from(theme.font_size)),
+        );
+        assert_eq!(theme.text, p.fg, "正文色应抄自 StyleParams");
+        assert_eq!(theme.code_bg, p.code_bg, "代码块背景应抄自 StyleParams");
+        assert_eq!(
+            theme.code_inline_fg, p.code_inline_fg,
+            "行内代码文字色应抄自 StyleParams"
+        );
+        assert_eq!(
+            theme.code_inline_bg, p.code_inline_bg,
+            "行内代码 pill 底色应抄自 StyleParams"
+        );
+        assert_eq!(theme.divider, p.divider, "分隔线应抄自 StyleParams");
+        assert_eq!(
+            theme.table_head_bg, p.table_head_bg,
+            "表头底色应抄自 StyleParams"
+        );
+        assert_eq!(theme.para_line(), p.para_line, "正文行高应抄自 StyleParams");
+        assert_eq!(theme.code_size(), p.code_size, "代码字号应抄自 StyleParams");
+        assert_eq!(theme.code_line(), p.code_line, "代码行高应抄自 StyleParams");
+        for lv in 1..=6 {
+            let (fs, lh) = p.heading_metrics(lv);
+            assert_eq!(theme.heading_fs(lv), fs, "h{lv} 字号应抄自 StyleParams");
+            assert_eq!(theme.heading_line(lv), lh, "h{lv} 行高应抄自 StyleParams");
+        }
+    });
+}
+
+/// 居中阅读栏（WYSIWYG md 预览本体）：实测渲染后——帧宽被钳到 `min(72ch, 元素可用宽)`、
+/// 居中移位 = 差值一半，且**窗口坐标命中**（叠回元素原点 + 列移位）与**元素局部命中**
+/// 反查到同一源偏移（拖拽/点击/光标对齐不因居中而错位）。
+#[gpui::test]
+fn reading_column_clamps_frame_and_centers_hits(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("# 标题\n一段正文文本，用于验证居中阅读栏。\n")
         });
-    }
-
-    #[gpui::test]
-    fn theme_mirrors_style_params_single_source(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# t\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (fw, ew, shift) = vcx.update(|_window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let e = ed.read(cx);
+        let ew = e
+            .last_bounds()
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(0.);
+        let fw = e
+            .frame
+            .borrow()
+            .as_ref()
+            .map(|f| f32::from(f.width))
+            .unwrap_or(0.);
+        (fw, ew, e.reading_col_shift(ew))
+    });
+    let body = vcx.update(|_window, cx| f32::from(host.read(cx).ed.read(cx).theme.font_size));
+    let col = crate::config::markdown::reading_col_px(body);
+    assert!(
+        (fw - col.min(ew)).abs() < 1.0,
+        "帧宽应钳到 min(72ch={col:.1}, 可用={ew:.1})，实际 {fw:.1}"
+    );
+    assert!(
+        (shift - (ew - fw) / 2.).abs() < 0.1,
+        "居中移位应为差值一半：{:.1}/2，实际 {shift:.1}",
+        ew - fw
+    );
+    // 有实际居中（宽窗）时：窗口坐标 = 元素原点 + 列移位 + 列内局部坐标，应反查到
+    // 与**直接局部命中**完全相同的源偏移。
+    if ew > fw + 1. {
         vcx.update(|_window, cx| {
             let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            // WYSIWYG 主题必须逐项抄自预览单一排版源 StyleParams（改样式只动一处）。
-            let p =
-                crate::markdown::view::style::StyleParams::from_theme_with_font(
-                    cx,
-                    Some(f32::from(theme.font_size)),
-                );
-            assert_eq!(theme.text, p.fg, "正文色应抄自 StyleParams");
-            assert_eq!(theme.code_bg, p.code_bg, "代码块背景应抄自 StyleParams");
-            assert_eq!(
-                theme.code_inline_fg, p.code_inline_fg,
-                "行内代码文字色应抄自 StyleParams"
-            );
-            assert_eq!(
-                theme.code_inline_bg, p.code_inline_bg,
-                "行内代码 pill 底色应抄自 StyleParams"
-            );
-            assert_eq!(theme.divider, p.divider, "分隔线应抄自 StyleParams");
-            assert_eq!(theme.table_head_bg, p.table_head_bg, "表头底色应抄自 StyleParams");
-            assert_eq!(theme.para_line(), p.para_line, "正文行高应抄自 StyleParams");
-            assert_eq!(theme.code_size(), p.code_size, "代码字号应抄自 StyleParams");
-            assert_eq!(theme.code_line(), p.code_line, "代码行高应抄自 StyleParams");
-            for lv in 1..=6 {
-                let (fs, lh) = p.heading_metrics(lv);
-                assert_eq!(theme.heading_fs(lv), fs, "h{lv} 字号应抄自 StyleParams");
-                assert_eq!(theme.heading_line(lv), lh, "h{lv} 行高应抄自 StyleParams");
-            }
-        });
-    }
-
-    /// 居中阅读栏（WYSIWYG md 预览本体）：实测渲染后——帧宽被钳到 `min(72ch, 元素可用宽)`、
-    /// 居中移位 = 差值一半，且**窗口坐标命中**（叠回元素原点 + 列移位）与**元素局部命中**
-    /// 反查到同一源偏移（拖拽/点击/光标对齐不因居中而错位）。
-    #[gpui::test]
-    fn reading_column_clamps_frame_and_centers_hits(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("# 标题\n一段正文文本，用于验证居中阅读栏。\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (fw, ew, shift) = vcx.update(|_window, cx| {
-            let ed = host.read(cx).ed.clone();
             let e = ed.read(cx);
-            let ew = e.last_bounds().map(|b| f32::from(b.size.width)).unwrap_or(0.);
-            let fw = e.frame.borrow().as_ref().map(|f| f32::from(f.width)).unwrap_or(0.);
-            (fw, ew, e.reading_col_shift(ew))
-        });
-        let body = vcx.update(|_window, cx| {
-            f32::from(host.read(cx).ed.read(cx).theme.font_size)
-        });
-        let col = crate::config::markdown::reading_col_px(body);
-        assert!(
-            (fw - col.min(ew)).abs() < 1.0,
-            "帧宽应钳到 min(72ch={col:.1}, 可用={ew:.1})，实际 {fw:.1}"
-        );
-        assert!(
-            (shift - (ew - fw) / 2.).abs() < 0.1,
-            "居中移位应为差值一半：{:.1}/2，实际 {shift:.1}",
-            ew - fw
-        );
-        // 有实际居中（宽窗）时：窗口坐标 = 元素原点 + 列移位 + 列内局部坐标，应反查到
-        // 与**直接局部命中**完全相同的源偏移。
-        if ew > fw + 1. {
-            vcx.update(|_window, cx| {
-                let ed = host.read(cx).ed.clone();
-                let e = ed.read(cx);
-                let frame = e.frame.borrow().clone().expect("真实渲染应已建帧");
-                let local = point(
-                    px(f32::from(frame.padding) + 10.),
-                    px(2.),
-                );
-                let win = point(local.x + px(shift), local.y);
-                let off_win = super::source_offset_at(&e, &frame, win);
-                let off_local = super::source_offset_at_local(&e, &frame, local);
-                assert_eq!(
-                    off_win, off_local,
-                    "窗口坐标叠加居中移位后应命中与局部坐标同一源偏移（off={off_local}）"
-                );
-            });
-        }
-    }
-
-    /// WYSIWYG md 预览随窗口窄化：窗口缩窄 → 元素可用宽收窄 → 帧宽 = min(72ch, 可用宽)
-    /// 同步收窄（一直折行，永不横向超界）；窄于 72ch 后退化为占满可用宽（居中移位=0）。
-    #[gpui::test]
-    fn reading_column_narrows_with_window(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "# 标题\n\n一段很长的正文内容用于验证窗口缩窄后随窗口宽度重排。"
-
-            .repeat(1);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let body = vcx.update(|_window, cx| {
-            f32::from(host.read(cx).ed.read(cx).theme.font_size)
-        });
-        let col = crate::config::markdown::reading_col_px(body);
-        let read = |vcx: &mut VisualTestContext| {
-            vcx.update(|_window, cx| {
-                let e = host.read(cx).ed.read(cx);
-                let ew = e.last_bounds().map(|b| f32::from(b.size.width)).unwrap_or(0.);
-                let fw = e.frame.borrow().as_ref().map(|f| f32::from(f.width)).unwrap_or(0.);
-                (ew, fw, e.reading_col_shift(ew))
-            })
-        };
-        let (ew0, fw0, _) = read(vcx);
-        assert!(ew0 > 1.0, "宽窗元素应有布局宽（ew0={ew0:.0}）");
-        assert!(
-            (fw0 - col.min(ew0)).abs() < 1.0,
-            "宽窗帧宽应 = min(72ch={col:.0}, 可用={ew0:.0})，实际 {fw0:.0}"
-        );
-        // 缩到 500px（< 72ch≈806px）→ 列宽应随窗口收窄并退化为可用宽。
-        vcx.simulate_resize(size(px(500.), px(800.)));
-        for _ in 0..6 {
-            vcx.run_until_parked();
-            let _ = vcx.cx.refresh();
-        }
-        let (ew1, fw1, shift1) = read(vcx);
-        assert!(
-            ew1 < ew0 - 1.0,
-            "窗口缩窄后元素可用宽应收窄：{ew0:.0} -> {ew1:.0}"
-        );
-        let target = col.min(ew1);
-        assert!(
-            (fw1 - target).abs() < 1.0,
-            "窄窗帧宽应 = min(72ch={col:.0}, 可用={ew1:.0})，实际 {fw1:.0}"
-        );
-        assert!(
-            fw1 < fw0 - 1.0,
-            "列宽应随窗口收窄重排：{fw0:.0} -> {fw1:.0}"
-        );
-        assert!(
-            shift1.abs() < 0.5,
-            "窄于 72ch 后无居中空余（移位应为 0），实际 {shift1:.0}"
-        );
-    }
-
-    #[gpui::test]
-    fn image_load_updates_size_and_rebuilds_frame(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "![图](x.png)\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let img_row = frame
-                .rows
-                .iter()
-                .find(|r| r.image.is_some())
-                .expect("应有图片块");
-            let img = img_row.image.as_ref().unwrap();
-            // 未加载：块高 = 占位图高 + 题注间隙 + 题注行高。
-            assert!(
-                (f32::from(img_row.height)
-                    - (crate::config::markdown::IMAGE_ROW_DEFAULT_H
-                        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
-                        + f32::from(ed.read(cx).theme.para_line())))
-                    .abs()
-                    < 0.5,
-                "未加载块高应=占位图高+间隙+题注行高，实际 {:?}",
-                img_row.height
-            );
-            // 模拟加载完成：设定源像素尺寸（200×100 = 宽高比 2:1）→ 重建帧 →
-            // 显示宽取内容宽、高按宽高比。
-            ed.update(cx, |e, _| {
-                e.set_image_size(img.src.clone(), Some((200., 100.)));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let img_row = frame
-                .rows
-                .iter()
-                .find(|r| r.image.is_some())
-                .expect("应有图片块");
-            let img = img_row.image.as_ref().unwrap();
-            assert!(
-                (img.h - img.w / 2.).abs() < 1.,
-                "图高应保持宽高比 2:1，w={} h={}",
-                img.w,
-                img.h
-            );
-            assert!(
-                (f32::from(img_row.height)
-                    - (img.h
-                        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
-                        + f32::from(ed.read(cx).theme.para_line())))
-                    .abs()
-                    < 0.5,
-                "块高应=图高+间隙+题注行高，实际 {} 图高 {}",
-                f32::from(img_row.height),
-                img.h
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn image_alt_editing_roundtrip(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "![图](x.png)\n尾\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                let ls = e.line_start(0);
-                // 光标置于 alt 起点（`![` 之后，ls+2）→ 输入应写进 alt、图片行保持。
-                e.set_caret(ls + 2);
-                e.replace_range(e.caret()..e.caret(), "X", cx);
-                assert!(
-                    e.text().as_ref().contains("![X图](x.png)"),
-                    "alt 前置输入生效：{}",
-                    e.text().as_ref()
-                );
-            });
-        });
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 重开帧：该行仍是图片块、题注文本 = 新 alt。
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Image)
-                .expect("编辑后仍应解析成图片块");
-            assert!(row.editable, "图片题注仍可编辑");
+            let frame = e.frame.borrow().clone().expect("真实渲染应已建帧");
+            let local = point(px(f32::from(frame.padding) + 10.), px(2.));
+            let win = point(local.x + px(shift), local.y);
+            let off_win = super::source_offset_at(&e, &frame, win);
+            let off_local = super::source_offset_at_local(&e, &frame, local);
             assert_eq!(
-                row.wrapped.first().map(|w| w.text.as_ref()),
-                Some("X图"),
-                "题注应显示新 alt"
+                off_win, off_local,
+                "窗口坐标叠加居中移位后应命中与局部坐标同一源偏移（off={off_local}）"
             );
         });
     }
+}
 
-    #[gpui::test]
-    fn image_alt_selection_and_replace_roundtrip(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "![hello](x.png)\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                // `hello` 位于源 [2,7)：选 "ell"(3..6) 应映射正确、替换回源。
-                e.begin_selection_at(3);
-                e.extend_selection_to(6);
-                assert_eq!(e.selection(), Some(3..6), "alt 选区应落在源 [3,6)");
-                assert_eq!(e.selected_text(), "ell", "选中的源文本应为 alt 子串");
-                e.replace_range(e.selection().unwrap(), "o", cx);
-                assert!(
-                    e.text().as_ref().contains("![hoo](x.png)"),
-                    "alt 选区替换生效：{}",
-                    e.text().as_ref()
-                );
-            });
-        });
+/// WYSIWYG md 预览随窗口窄化：窗口缩窄 → 元素可用宽收窄 → 帧宽 = min(72ch, 可用宽)
+/// 同步收窄（一直折行，永不横向超界）；窄于 72ch 后退化为占满可用宽（居中移位=0）。
+#[gpui::test]
+fn reading_column_narrows_with_window(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "# 标题\n\n一段很长的正文内容用于验证窗口缩窄后随窗口宽度重排。".repeat(1);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let body = vcx.update(|_window, cx| f32::from(host.read(cx).ed.read(cx).theme.font_size));
+    let col = crate::config::markdown::reading_col_px(body);
+    let read = |vcx: &mut VisualTestContext| {
+        vcx.update(|_window, cx| {
+            let e = host.read(cx).ed.read(cx);
+            let ew = e
+                .last_bounds()
+                .map(|b| f32::from(b.size.width))
+                .unwrap_or(0.);
+            let fw = e
+                .frame
+                .borrow()
+                .as_ref()
+                .map(|f| f32::from(f.width))
+                .unwrap_or(0.);
+            (ew, fw, e.reading_col_shift(ew))
+        })
+    };
+    let (ew0, fw0, _) = read(vcx);
+    assert!(ew0 > 1.0, "宽窗元素应有布局宽（ew0={ew0:.0}）");
+    assert!(
+        (fw0 - col.min(ew0)).abs() < 1.0,
+        "宽窗帧宽应 = min(72ch={col:.0}, 可用={ew0:.0})，实际 {fw0:.0}"
+    );
+    // 缩到 500px（< 72ch≈806px）→ 列宽应随窗口收窄并退化为可用宽。
+    vcx.simulate_resize(size(px(500.), px(800.)));
+    for _ in 0..6 {
+        vcx.run_until_parked();
+        let _ = vcx.cx.refresh();
     }
+    let (ew1, fw1, shift1) = read(vcx);
+    assert!(
+        ew1 < ew0 - 1.0,
+        "窗口缩窄后元素可用宽应收窄：{ew0:.0} -> {ew1:.0}"
+    );
+    let target = col.min(ew1);
+    assert!(
+        (fw1 - target).abs() < 1.0,
+        "窄窗帧宽应 = min(72ch={col:.0}, 可用={ew1:.0})，实际 {fw1:.0}"
+    );
+    assert!(
+        fw1 < fw0 - 1.0,
+        "列宽应随窗口收窄重排：{fw0:.0} -> {fw1:.0}"
+    );
+    assert!(
+        shift1.abs() < 0.5,
+        "窄于 72ch 后无居中空余（移位应为 0），实际 {shift1:.0}"
+    );
+}
 
-    #[gpui::test]
-    fn image_alt_backspace_delete_guards(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "![hello](x.png)\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn image_load_updates_size_and_rebuilds_frame(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "![图](x.png)\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let img_row = frame
+            .rows
+            .iter()
+            .find(|r| r.image.is_some())
+            .expect("应有图片块");
+        let img = img_row.image.as_ref().unwrap();
+        // 未加载：块高 = 占位图高 + 题注间隙 + 题注行高。
+        assert!(
+            (f32::from(img_row.height)
+                - (crate::config::markdown::IMAGE_ROW_DEFAULT_H
+                    + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                    + f32::from(ed.read(cx).theme.para_line())))
+            .abs()
+                < 0.5,
+            "未加载块高应=占位图高+间隙+题注行高，实际 {:?}",
+            img_row.height
+        );
+        // 模拟加载完成：设定源像素尺寸（200×100 = 宽高比 2:1）→ 重建帧 →
+        // 显示宽取内容宽、高按宽高比。
+        ed.update(cx, |e, _| {
+            e.set_image_size(img.src.clone(), Some((200., 100.)));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                let ls = e.line_start(0);
-                // 退格在 alt 起点（ls+2）→ 守卫（不吃 `![` 的 `[`）。
-                e.set_caret(ls + 2);
-                e.backspace(cx);
-                assert!(
-                    e.text().as_ref().contains("![hello](x.png)"),
-                    "alt 起点退格应被守卫：{}",
-                    e.text().as_ref()
-                );
-                // 删除在 alt 尾（ls+7 = `]` 前）→ 守卫（不吃 `](` 的 `]`）。
-                e.set_caret(ls + 7);
-                e.delete(cx);
-                assert!(
-                    e.text().as_ref().contains("![hello](x.png)"),
-                    "alt 尾删除应被守卫：{}",
-                    e.text().as_ref()
-                );
-                // alt 内正常键入仍有效（`hello` 首字符前插 Y）。
-                e.set_caret(ls + 2);
-                e.replace_range(e.caret()..e.caret(), "Y", cx);
-                assert!(
-                    e.text().as_ref().contains("![Yhello](x.png)"),
-                    "alt 内输入生效：{}",
-                    e.text().as_ref()
-                );
-            });
-        });
-    }
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let img_row = frame
+            .rows
+            .iter()
+            .find(|r| r.image.is_some())
+            .expect("应有图片块");
+        let img = img_row.image.as_ref().unwrap();
+        assert!(
+            (img.h - img.w / 2.).abs() < 1.,
+            "图高应保持宽高比 2:1，w={} h={}",
+            img.w,
+            img.h
+        );
+        assert!(
+            (f32::from(img_row.height)
+                - (img.h
+                    + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+                    + f32::from(ed.read(cx).theme.para_line())))
+            .abs()
+                < 0.5,
+            "块高应=图高+间隙+题注行高，实际 {} 图高 {}",
+            f32::from(img_row.height),
+            img.h
+        );
+    });
+}
 
-    #[gpui::test]
-    fn image_alt_caption_click_and_caret_stay_aligned(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "![hello](x.png)\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Image)
-                .expect("应有图片块");
-            let pad = f32::from(frame.padding);
-            let top = f32::from(row.top);
-            // 题注（可编辑 alt 行）在图片盒之下：y = 图高 + 间隙，行内 x 走居中 x_off。
-            let img = row.image.as_ref().unwrap();
-            let caption_y = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
-            let x = pad + f32::from(row.x_off) + 1.;
-            let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(caption_y)));
-            assert_eq!(off, 2, "点击题注起始应命中 alt 起点（源 2），实际 {off}");
-            // 光标置于 alt 起点 → 光标条应落在题注行内（y ≥ 图高，x 对题注居中起点）。
-            ed.update(cx, |e, _| e.set_caret(2));
-            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
-            assert!(on, "题注应可放光标");
-            let img = row.image.as_ref().unwrap();
-            let caption_top = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX;
+#[gpui::test]
+fn image_alt_editing_roundtrip(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "![图](x.png)\n尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            let ls = e.line_start(0);
+            // 光标置于 alt 起点（`![` 之后，ls+2）→ 输入应写进 alt、图片行保持。
+            e.set_caret(ls + 2);
+            e.replace_range(e.caret()..e.caret(), "X", cx);
             assert!(
-                f32::from(carety) >= caption_top - 0.5
-                    && f32::from(carety) <= caption_top + f32::from(frame.line_h) + 0.5,
-                "光标 y {} 应在题注行带 [{caption_top}, {}]",
-                f32::from(carety),
-                caption_top + f32::from(frame.line_h)
+                e.text().as_ref().contains("![X图](x.png)"),
+                "alt 前置输入生效：{}",
+                e.text().as_ref()
             );
+        });
+    });
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 重开帧：该行仍是图片块、题注文本 = 新 alt。
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("编辑后仍应解析成图片块");
+        assert!(row.editable, "图片题注仍可编辑");
+        assert_eq!(
+            row.wrapped.first().map(|w| w.text.as_ref()),
+            Some("X图"),
+            "题注应显示新 alt"
+        );
+    });
+}
+
+#[gpui::test]
+fn image_alt_selection_and_replace_roundtrip(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "![hello](x.png)\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            // `hello` 位于源 [2,7)：选 "ell"(3..6) 应映射正确、替换回源。
+            e.begin_selection_at(3);
+            e.extend_selection_to(6);
+            assert_eq!(e.selection(), Some(3..6), "alt 选区应落在源 [3,6)");
+            assert_eq!(e.selected_text(), "ell", "选中的源文本应为 alt 子串");
+            e.replace_range(e.selection().unwrap(), "o", cx);
             assert!(
-                (f32::from(caretx) - x).abs() < 12.,
-                "光标 x {} 应贴合题注点击 x {}",
-                f32::from(caretx),
-                x
+                e.text().as_ref().contains("![hoo](x.png)"),
+                "alt 选区替换生效：{}",
+                e.text().as_ref()
             );
         });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn ime_composition_replaces_previous_marked_text(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        // 回归「输入“你好”→ “nnini'hni'hao你好”」：Windows 组合更新不携带区间，
-        // 必须替换上一次 marked，而不是一前一后堆叠。
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.set_caret("你好".len());
-                e.replace_and_mark_utf16(None, "n", None, cx);
-                assert_eq!(e.text().as_ref(), "你好n", "组合首键插在光标后");
-                e.replace_and_mark_utf16(None, "ni", None, cx);
-                assert_eq!(e.text().as_ref(), "你好ni", "组合更新应替换旧 marked，不得残留 n");
-                e.replace_and_mark_utf16(None, "nih", None, cx);
-                assert_eq!(e.text().as_ref(), "你好nih", "再次更新仍替换");
-                // 提交：`replace_text_utf16(None)` 落在 marked 上并清掉 marked。
-                e.replace_text_utf16(None, "你好", cx);
-                assert_eq!(e.text().as_ref(), "你好你好", "提交文本替换组合占位，不重复");
-                // 新组合不得再把“已提交中文”当旧 marked 替换。
-                e.replace_and_mark_utf16(None, "n", None, cx);
-                e.replace_and_mark_utf16(None, "ni", None, cx);
-                assert_eq!(e.text().as_ref(), "你好你好ni", "新组合不重复旧提交");
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn ime_new_selected_range_is_relative_to_marked(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.set_caret(0);
-                // AppKit setMarkedText 的 selectedRange 是**相对组合文本**的偏移，
-                // 不是文档绝对偏移——光标应落在偏移 1（“好”前），而非文档开头。
-                e.replace_and_mark_utf16(None, "你好", Some(1..2), cx);
-                assert_eq!(e.text().as_ref(), "你好abc", "无选区时组合插入光标处");
-                assert_eq!(
-                    e.caret(),
-                    3,
-                    "光标 = 组合起点 0 + 相对偏移 1 的字节（“好”前），而非文档绝对 1"
-                );
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn selection_drag_delete_and_select_all(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("一二三五六"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.begin_selection_at(0);
-                e.extend_selection_to("一二三".len());
-                assert_eq!(e.selection(), Some(0.."一二三".len()), "拖选得源字节区间");
-                // 输入/删除应作用于选区。
-                e.backspace(cx);
-                assert_eq!(e.text().as_ref(), "五六", "Backspace 应删除整段选区");
-                assert_eq!(e.selection(), None);
-                // 全选 + 范围替换。
-                e.select_all();
-                assert_eq!(e.selection(), Some(0.."五六".len()));
-                e.replace_range(e.selection().unwrap(), "你", cx);
-                assert_eq!(e.text().as_ref(), "你", "全选范围替换");
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn readonly_gates_all_edit_paths(cx: &mut TestAppContext) {
-        // A1：`set_editable(false)` 后一切内容变更路径短路（输入/IME/退格/删除/Enter/
-        // 撤销/重做/范围替换），切回 true 恢复编辑。
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.set_editable(false);
-                assert!(!e.is_editable(), "只读门控应生效");
-                e.set_caret(1);
-                // IME 组合（`replace_and_mark_utf16` 底层走 `replace_range`，被硬门控）。
-                e.replace_and_mark_utf16(None, "X", None, cx);
-                assert_eq!(e.text().as_ref(), "abc", "只读 IME 组合应短路");
-                assert!(e.marked.is_none(), "只读 IME 不应留下组合态");
-                // 平台直输（`replace_text_utf16`）。
-                e.replace_text_utf16(Some(1..2), "X", cx);
-                assert_eq!(e.text().as_ref(), "abc", "只读直输应短路");
-                // 范围替换 / 退格 / 删除 / Enter。
-                e.replace_range(1..1, "X", cx);
-                assert_eq!(e.text().as_ref(), "abc", "只读 replace_range 应短路");
-                e.backspace(cx);
-                e.delete(cx);
-                e.newline(cx);
-                assert_eq!(e.text().as_ref(), "abc", "只读退格/删除/换行应短路");
-                // 撤销/重做（走 `apply_raw_edit`，需单独门控）。
-                e.undo(cx);
-                e.redo(cx);
-                assert_eq!(e.text().as_ref(), "abc", "只读撤销/重做应短路");
-                // 切回可编辑 → 恢复正常编辑。
-                e.set_editable(true);
-                e.replace_range(1..1, "X", cx);
-                assert_eq!(e.text().as_ref(), "aXbc", "切回可编辑应恢复范围替换");
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn readonly_keeps_selection_and_caret_moves(cx: &mut TestAppContext) {
-        // A1：只读下保留光标移动与点选/拖选（复制依赖它们）；只没收拢到光标的旧选区。
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _cx| {
-                e.set_caret(5);
-                assert_eq!(e.caret(), 5, "只读下仍可移动光标");
-                // 拖选 / 点选仍有效（复制读 `selected_text`）。
-                e.begin_selection_at(0);
-                e.extend_selection_to(5);
-                assert_eq!(e.selection(), Some(0..5), "只读下拖选应保留");
-                assert_eq!(e.selected_text(), "hello", "只读下选中文本可读（复制用）");
-                e.end_selection();
-                e.select_all();
-                assert_eq!(
-                    e.selection(),
-                    Some(0.."hello world".len()),
-                    "只读下全选应保留"
-                );
-                // 切只读会把残留活动选区收拢为光标（防止误导）。
-                e.begin_selection_at(5);
-                e.extend_selection_to(11);
-                assert_eq!(e.selection(), Some(5..11), "基线拖选成立");
-                e.set_editable(false);
-                assert_eq!(
-                    e.selection(),
-                    None,
-                    "切入只读应收拢旧活动选区（无选区），光标仍可移"
-                );
-                e.set_caret(3);
-                assert_eq!(e.caret(), 3, "只读下 set_caret 仍可用");
-            });
-        });
-    }
-    #[gpui::test]
-    fn quote_blocks_are_editable_with_indent(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# 标题\n> 引用内容\n正文"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let quote = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Quote)
-                .expect("应有引述行");
-            assert!(quote.editable, "引述应可编辑（byte_map 非空）");
-            assert!(f32::from(quote.x_off) > 0., "引述应有文本缩进");
-            // 在引述渲染文本内落点 → 源字节在 “引用内容” 上，可正常输入。
-            let off = ed.read(cx).text().as_ref().find("引").unwrap();
-            ed.update(cx, |e, cx| {
-                e.set_caret(off + 3);
-                e.replace_range(off + 3..off + 6, "X", cx);
-            });
+#[gpui::test]
+fn image_alt_backspace_delete_guards(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "![hello](x.png)\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            let ls = e.line_start(0);
+            // 退格在 alt 起点（ls+2）→ 守卫（不吃 `![` 的 `[`）。
+            e.set_caret(ls + 2);
+            e.backspace(cx);
             assert!(
-                ed.read(cx).text().as_ref().contains("引X"),
-                "引述行应可编辑：{}",
-                ed.read(cx).text().as_ref()
+                e.text().as_ref().contains("![hello](x.png)"),
+                "alt 起点退格应被守卫：{}",
+                e.text().as_ref()
+            );
+            // 删除在 alt 尾（ls+7 = `]` 前）→ 守卫（不吃 `](` 的 `]`）。
+            e.set_caret(ls + 7);
+            e.delete(cx);
+            assert!(
+                e.text().as_ref().contains("![hello](x.png)"),
+                "alt 尾删除应被守卫：{}",
+                e.text().as_ref()
+            );
+            // alt 内正常键入仍有效（`hello` 首字符前插 Y）。
+            e.set_caret(ls + 2);
+            e.replace_range(e.caret()..e.caret(), "Y", cx);
+            assert!(
+                e.text().as_ref().contains("![Yhello](x.png)"),
+                "alt 内输入生效：{}",
+                e.text().as_ref()
             );
         });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn code_block_click_lands_on_correct_source_line(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn image_alt_caption_click_and_caret_stay_aligned(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "![hello](x.png)\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("应有图片块");
+        let pad = f32::from(frame.padding);
+        let top = f32::from(row.top);
+        // 题注（可编辑 alt 行）在图片盒之下：y = 图高 + 间隙，行内 x 走居中 x_off。
+        let img = row.image.as_ref().unwrap();
+        let caption_y = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
+        let x = pad + f32::from(row.x_off) + 1.;
+        let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(caption_y)));
+        assert_eq!(off, 2, "点击题注起始应命中 alt 起点（源 2），实际 {off}");
+        // 光标置于 alt 起点 → 光标条应落在题注行内（y ≥ 图高，x 对题注居中起点）。
+        ed.update(cx, |e, _| e.set_caret(2));
+        let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
+        assert!(on, "题注应可放光标");
+        let img = row.image.as_ref().unwrap();
+        let caption_top = top + img.h + crate::config::markdown::IMAGE_CAPTION_GAP_PX;
+        assert!(
+            f32::from(carety) >= caption_top - 0.5
+                && f32::from(carety) <= caption_top + f32::from(frame.line_h) + 0.5,
+            "光标 y {} 应在题注行带 [{caption_top}, {}]",
+            f32::from(carety),
+            caption_top + f32::from(frame.line_h)
+        );
+        assert!(
+            (f32::from(caretx) - x).abs() < 12.,
+            "光标 x {} 应贴合题注点击 x {}",
+            f32::from(caretx),
+            x
+        );
+    });
+}
+
+#[gpui::test]
+fn ime_composition_replaces_previous_marked_text(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    // 回归「输入“你好”→ “nnini'hni'hao你好”」：Windows 组合更新不携带区间，
+    // 必须替换上一次 marked，而不是一前一后堆叠。
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret("你好".len());
+            e.replace_and_mark_utf16(None, "n", None, cx);
+            assert_eq!(e.text().as_ref(), "你好n", "组合首键插在光标后");
+            e.replace_and_mark_utf16(None, "ni", None, cx);
+            assert_eq!(
+                e.text().as_ref(),
+                "你好ni",
+                "组合更新应替换旧 marked，不得残留 n"
+            );
+            e.replace_and_mark_utf16(None, "nih", None, cx);
+            assert_eq!(e.text().as_ref(), "你好nih", "再次更新仍替换");
+            // 提交：`replace_text_utf16(None)` 落在 marked 上并清掉 marked。
+            e.replace_text_utf16(None, "你好", cx);
+            assert_eq!(
+                e.text().as_ref(),
+                "你好你好",
+                "提交文本替换组合占位，不重复"
+            );
+            // 新组合不得再把“已提交中文”当旧 marked 替换。
+            e.replace_and_mark_utf16(None, "n", None, cx);
+            e.replace_and_mark_utf16(None, "ni", None, cx);
+            assert_eq!(e.text().as_ref(), "你好你好ni", "新组合不重复旧提交");
+        });
+    });
+}
+
+#[gpui::test]
+fn ime_new_selected_range_is_relative_to_marked(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret(0);
+            // AppKit setMarkedText 的 selectedRange 是**相对组合文本**的偏移，
+            // 不是文档绝对偏移——光标应落在偏移 1（“好”前），而非文档开头。
+            e.replace_and_mark_utf16(None, "你好", Some(1..2), cx);
+            assert_eq!(e.text().as_ref(), "你好abc", "无选区时组合插入光标处");
+            assert_eq!(
+                e.caret(),
+                3,
+                "光标 = 组合起点 0 + 相对偏移 1 的字节（“好”前），而非文档绝对 1"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn selection_drag_delete_and_select_all(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("一二三五六"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.begin_selection_at(0);
+            e.extend_selection_to("一二三".len());
+            assert_eq!(e.selection(), Some(0.."一二三".len()), "拖选得源字节区间");
+            // 输入/删除应作用于选区。
+            e.backspace(cx);
+            assert_eq!(e.text().as_ref(), "五六", "Backspace 应删除整段选区");
+            assert_eq!(e.selection(), None);
+            // 全选 + 范围替换。
+            e.select_all();
+            assert_eq!(e.selection(), Some(0.."五六".len()));
+            e.replace_range(e.selection().unwrap(), "你", cx);
+            assert_eq!(e.text().as_ref(), "你", "全选范围替换");
+        });
+    });
+}
+
+#[gpui::test]
+fn readonly_gates_all_edit_paths(cx: &mut TestAppContext) {
+    // A1：`set_editable(false)` 后一切内容变更路径短路（输入/IME/退格/删除/Enter/
+    // 撤销/重做/范围替换），切回 true 恢复编辑。
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_editable(false);
+            assert!(!e.is_editable(), "只读门控应生效");
+            e.set_caret(1);
+            // IME 组合（`replace_and_mark_utf16` 底层走 `replace_range`，被硬门控）。
+            e.replace_and_mark_utf16(None, "X", None, cx);
+            assert_eq!(e.text().as_ref(), "abc", "只读 IME 组合应短路");
+            assert!(e.marked.is_none(), "只读 IME 不应留下组合态");
+            // 平台直输（`replace_text_utf16`）。
+            e.replace_text_utf16(Some(1..2), "X", cx);
+            assert_eq!(e.text().as_ref(), "abc", "只读直输应短路");
+            // 范围替换 / 退格 / 删除 / Enter。
+            e.replace_range(1..1, "X", cx);
+            assert_eq!(e.text().as_ref(), "abc", "只读 replace_range 应短路");
+            e.backspace(cx);
+            e.delete(cx);
+            e.newline(cx);
+            assert_eq!(e.text().as_ref(), "abc", "只读退格/删除/换行应短路");
+            // 撤销/重做（走 `apply_raw_edit`，需单独门控）。
+            e.undo(cx);
+            e.redo(cx);
+            assert_eq!(e.text().as_ref(), "abc", "只读撤销/重做应短路");
+            // 切回可编辑 → 恢复正常编辑。
+            e.set_editable(true);
+            e.replace_range(1..1, "X", cx);
+            assert_eq!(e.text().as_ref(), "aXbc", "切回可编辑应恢复范围替换");
+        });
+    });
+}
+
+#[gpui::test]
+fn readonly_keeps_selection_and_caret_moves(cx: &mut TestAppContext) {
+    // A1：只读下保留光标移动与点选/拖选（复制依赖它们）；只没收拢到光标的旧选区。
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _cx| {
+            e.set_caret(5);
+            assert_eq!(e.caret(), 5, "只读下仍可移动光标");
+            // 拖选 / 点选仍有效（复制读 `selected_text`）。
+            e.begin_selection_at(0);
+            e.extend_selection_to(5);
+            assert_eq!(e.selection(), Some(0..5), "只读下拖选应保留");
+            assert_eq!(e.selected_text(), "hello", "只读下选中文本可读（复制用）");
+            e.end_selection();
+            e.select_all();
+            assert_eq!(
+                e.selection(),
+                Some(0.."hello world".len()),
+                "只读下全选应保留"
+            );
+            // 切只读会把残留活动选区收拢为光标（防止误导）。
+            e.begin_selection_at(5);
+            e.extend_selection_to(11);
+            assert_eq!(e.selection(), Some(5..11), "基线拖选成立");
+            e.set_editable(false);
+            assert_eq!(
+                e.selection(),
+                None,
+                "切入只读应收拢旧活动选区（无选区），光标仍可移"
+            );
+            e.set_caret(3);
+            assert_eq!(e.caret(), 3, "只读下 set_caret 仍可用");
+        });
+    });
+}
+#[gpui::test]
+fn quote_blocks_are_editable_with_indent(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("# 标题\n> 引用内容\n正文"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let quote = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Quote)
+            .expect("应有引述行");
+        assert!(quote.editable, "引述应可编辑（byte_map 非空）");
+        assert!(f32::from(quote.x_off) > 0., "引述应有文本缩进");
+        // 在引述渲染文本内落点 → 源字节在 “引用内容” 上，可正常输入。
+        let off = ed.read(cx).text().as_ref().find("引").unwrap();
+        ed.update(cx, |e, cx| {
+            e.set_caret(off + 3);
+            e.replace_range(off + 3..off + 6, "X", cx);
+        });
+        assert!(
+            ed.read(cx).text().as_ref().contains("引X"),
+            "引述行应可编辑：{}",
+            ed.read(cx).text().as_ref()
+        );
+    });
+}
+
+#[gpui::test]
+fn code_block_click_lands_on_correct_source_line(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 ```rust
 let a = 1;
 let b = 22;
@@ -1222,642 +1375,656 @@ let c = 333;
 ```
 尾段
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code)
-                .expect("应有代码块");
-            assert!(code.editable, "代码内容行应可编辑");
-            let lh = f32::from(code.lh);
-            let top = f32::from(code.top);
-            let pad = f32::from(frame.padding);
-            // 点击三个代码行的中部（y = 块首 + 首空白带 + k×行高）→ 逐行命中内容。
-            for (k, expects) in
-                [(0usize, "let a = 1;"), (1, "let b = 22;"), (2, "let c = 333;")]
-            {
-                let p = point(px(pad + 30.), px(top + lh * 1.5 + lh * k as f32));
-                let off = source_offset_at_local(ed.read(cx), &frame, p);
-                let (line, _) = ed.read(cx).row_col(off);
-                assert_eq!(line, 1 + k, "点击第 {k} 个代码行应命中源行 {}", 1 + k);
-                let ls = ed.read(cx).line_start(line);
-                let le = ed.read(cx).line_end(line);
-                assert_eq!(
-                    &ed.read(cx).text().as_ref()[ls..le],
-                    expects,
-                    "命中文本应为该行内容"
-                );
-            }
-        });
-    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code)
+            .expect("应有代码块");
+        assert!(code.editable, "代码内容行应可编辑");
+        let lh = f32::from(code.lh);
+        let top = f32::from(code.top);
+        let pad = f32::from(frame.padding);
+        // 点击三个代码行的中部（y = 块首 + 首空白带 + k×行高）→ 逐行命中内容。
+        for (k, expects) in [
+            (0usize, "let a = 1;"),
+            (1, "let b = 22;"),
+            (2, "let c = 333;"),
+        ] {
+            let p = point(px(pad + 30.), px(top + lh * 1.5 + lh * k as f32));
+            let off = source_offset_at_local(ed.read(cx), &frame, p);
+            let (line, _) = ed.read(cx).row_col(off);
+            assert_eq!(line, 1 + k, "点击第 {k} 个代码行应命中源行 {}", 1 + k);
+            let ls = ed.read(cx).line_start(line);
+            let le = ed.read(cx).line_end(line);
+            assert_eq!(
+                &ed.read(cx).text().as_ref()[ls..le],
+                expects,
+                "命中文本应为该行内容"
+            );
+        }
+    });
+}
 
-    #[gpui::test]
-    fn code_block_overflow_shows_hscroll_and_shifts_hit(cx: &mut TestAppContext) {
-        // 长代码行（nowrap 超出窄面板）→ 底部横向滚动条；滚动偏移使**同一可视 x**
-        // 命中更多源列（paint 平移的逆映射）；拖动滚动条更新偏移（视图本地，不写源码）。
-        use crate::markdown::ir::IrKind;
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+#[gpui::test]
+fn code_block_overflow_shows_hscroll_and_shifts_hit(cx: &mut TestAppContext) {
+    // 长代码行（nowrap 超出窄面板）→ 底部横向滚动条；滚动偏移使**同一可视 x**
+    // 命中更多源列（paint 平移的逆映射）；拖动滚动条更新偏移（视图本地，不写源码）。
+    use crate::markdown::ir::IrKind;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseUpEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
-                .expect("应有代码块");
-            let blk = code.src_line;
-            let (bar_x, bar_w, _, _, max_scroll) =
-                super::code_hscroll_geo(ed.read(cx), &frame, code)
-                    .expect("长行应超宽显示滚动条");
-            assert!(max_scroll > 50., "内容应显著超宽");
-            assert!(bar_w > 10., "滚动条轨道应有宽度");
-            // 首内容行中部 y（组 0 = 首空白带 + 首行）。
-            let y = f32::from(code.top) + f32::from(code.lh) * 1.5;
-            let view_x = f32::from(frame.padding) + f32::from(code.x_off) + 60.;
-            let p = point(px(view_x), px(y));
-            let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
-            // 滚到最右（大偏移）→ 同一可视 x 命中更后的源列。
-            ed.update(cx, |e, _| e.set_code_h_scroll(blk, max_scroll));
-            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
-            let (_, col0) = ed.read(cx).row_col(off0);
-            let (_, col1) = ed.read(cx).row_col(off1);
-            assert!(
-                col1 > col0,
-                "横向滚动后同一 x 应命中更后源列：col0={col0} col1={col1}"
-            );
-            // 拖动滚动条：点击轨道 90% → 偏移大；拖到 10% → 偏移小；松开清除拖拽态。
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(f2)));
-            let band_top = f32::from(code.top) + f32::from(code.height)
-                - crate::config::layout::CODE_HSCROLL_BAND;
-            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
-            let down_x = bar_x + bar_w * 0.9;
-            let up_x = bar_x + bar_w * 0.1;
-            let ev_down = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(down_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev_down, window, cx));
-            let scrolled = ed.read(cx).code_h_scroll_of(blk);
-            assert!(scrolled > 0., "按下轨道应产生滚动偏移：{scrolled}");
-            let ev_move = gpui::MouseMoveEvent {
-                position: point(px(up_x), px(band_y)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            };
-            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
-            let scrolled2 = ed.read(cx).code_h_scroll_of(blk);
-            assert!(
-                scrolled2 < scrolled,
-                "拖到 10% 应减小偏移：{scrolled2} < {scrolled}"
-            );
-            let ev_up = MouseUpEvent {
-                button: MouseButton::Left,
-                position: point(px(up_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
-            assert!(
-                ed.read(cx).code_h_drag.borrow().is_none(),
-                "松开应清除拖拽态"
-            );
-            // 视图本地状态：源码未变。
-            assert_eq!(ed.read(cx).text().as_ref(), text);
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+            .expect("应有代码块");
+        let blk = code.src_line;
+        let (bar_x, bar_w, _, _, max_scroll) =
+            super::code_hscroll_geo(ed.read(cx), &frame, code).expect("长行应超宽显示滚动条");
+        assert!(max_scroll > 50., "内容应显著超宽");
+        assert!(bar_w > 10., "滚动条轨道应有宽度");
+        // 首内容行中部 y（组 0 = 首空白带 + 首行）。
+        let y = f32::from(code.top) + f32::from(code.lh) * 1.5;
+        let view_x = f32::from(frame.padding) + f32::from(code.x_off) + 60.;
+        let p = point(px(view_x), px(y));
+        let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
+        // 滚到最右（大偏移）→ 同一可视 x 命中更后的源列。
+        ed.update(cx, |e, _| e.set_code_h_scroll(blk, max_scroll));
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
+        let (_, col0) = ed.read(cx).row_col(off0);
+        let (_, col1) = ed.read(cx).row_col(off1);
+        assert!(
+            col1 > col0,
+            "横向滚动后同一 x 应命中更后源列：col0={col0} col1={col1}"
+        );
+        // 拖动滚动条：点击轨道 90% → 偏移大；拖到 10% → 偏移小；松开清除拖拽态。
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(f2))
         });
-    }
-
-    #[gpui::test]
-    fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
-        // 用户报「WYSIWYG 表格没有横向滚动条」→ 对齐 preview `markdown/view` 的表格
-        // 溢出横向滚动：超宽表格底部出滚动条，轨道点击跳转、滑块可拖（拖动不写源码）。
-        use crate::markdown::ir::IrKind;
-        use gpui::{
-            Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+        let band_top =
+            f32::from(code.top) + f32::from(code.height) - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+        let down_x = bar_x + bar_w * 0.9;
+        let up_x = bar_x + bar_w * 0.1;
+        let ev_down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(down_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
         };
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev_down, window, cx));
+        let scrolled = ed.read(cx).code_h_scroll_of(blk);
+        assert!(scrolled > 0., "按下轨道应产生滚动偏移：{scrolled}");
+        let ev_move = gpui::MouseMoveEvent {
+            position: point(px(up_x), px(band_y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+        let scrolled2 = ed.read(cx).code_h_scroll_of(blk);
+        assert!(
+            scrolled2 < scrolled,
+            "拖到 10% 应减小偏移：{scrolled2} < {scrolled}"
+        );
+        let ev_up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(up_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+        assert!(
+            ed.read(cx).code_h_drag.borrow().is_none(),
+            "松开应清除拖拽态"
+        );
+        // 视图本地状态：源码未变。
+        assert_eq!(ed.read(cx).text().as_ref(), text);
+    });
+}
+
+#[gpui::test]
+fn table_overflow_shows_hscroll_and_track_drag(cx: &mut TestAppContext) {
+    // 用户报「WYSIWYG 表格没有横向滚动条」→ 对齐 preview `markdown/view` 的表格
+    // 溢出横向滚动：超宽表格底部出滚动条，轨道点击跳转、滑块可拖（拖动不写源码）。
+    use crate::markdown::ir::IrKind;
+    use gpui::{
+        Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+    };
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(300.), px(600.)),
+            )));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(300.), px(600.)),
-                )));
-            });
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let (blk, bar_x, bar_w, thumb_x, _thumb_w, max_scroll, ctop, ctop_h) = {
-                let tbl = frame
-                    .rows
-                    .iter()
-                    .find(|r| r.kind == IrKind::Table && r.table.is_some())
-                    .expect("应有表格");
-                let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
-                    super::table_hscroll_geo(ed.read(cx), &frame, tbl)
-                        .expect("宽表格应显示横向滚动条");
-                assert!(max_scroll > 100., "表格应显著超宽：max_scroll={max_scroll}");
-                assert!(thumb_x <= bar_x + 1., "初态滑块应在轨道左端");
-                (
-                    tbl.src_line,
-                    bar_x,
-                    bar_w,
-                    thumb_x,
-                    thumb_w,
-                    max_scroll,
-                    f32::from(tbl.top),
-                    f32::from(tbl.height),
-                )
-            };
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let (blk, bar_x, bar_w, thumb_x, _thumb_w, max_scroll, ctop, ctop_h) = {
+            let tbl = frame
+                .rows
+                .iter()
+                .find(|r| r.kind == IrKind::Table && r.table.is_some())
+                .expect("应有表格");
+            let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
+                super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("宽表格应显示横向滚动条");
+            assert!(max_scroll > 100., "表格应显著超宽：max_scroll={max_scroll}");
             assert!(thumb_x <= bar_x + 1., "初态滑块应在轨道左端");
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
-            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
-            // 轨道命中（远离左端滑块）→ 跳转（不进拖动态）。
-            let jump_x = bar_x + bar_w - 4.0;
-            let (blk_hit, on_thumb, _) = super::table_hscrollbar_hit(
-                ed.read(cx),
-                ed
-                    .read(cx)
-                    .frame
-                    .borrow()
-                    .as_ref()
-                    .map(|f| &**f)
-                    .unwrap(),
-                point(px(jump_x), px(band_y)),
+            (
+                tbl.src_line,
+                bar_x,
+                bar_w,
+                thumb_x,
+                thumb_w,
+                max_scroll,
+                f32::from(tbl.top),
+                f32::from(tbl.height),
             )
-            .expect("轨道末端应在滚动条带内");
-            assert_eq!(blk_hit, blk);
-            assert!(!on_thumb, "远离左端滑块的轨道点不应落在滑块上");
-            let ev = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(jump_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
-            let jumped = ed.read(cx).table_h_scroll_of(blk);
-            assert!(jumped > 0., "点击轨道应立刻跳转：{jumped}");
-            assert!(jumped <= max_scroll, "{jumped} ≤ {max_scroll}");
-            assert!(
-                ed.read(cx).table_h_drag.borrow().is_none(),
-                "轨道跳转不应进入拖动态"
-            );
-            // 点滑块（滚动后滑块位置）→ 拖到最左 → 偏移归零；松开清态；源码不变。
-            let f2 = ed.read(cx).frame.borrow().clone().unwrap();
-            let geo2 = super::table_hscroll_geo(
-                ed.read(cx),
-                &f2,
-                f2.rows.iter().find(|r| r.src_line == blk).unwrap(),
-            )
-            .unwrap();
-            let (_, _, thumb_x2, thumb_w2, _) = geo2;
-            let ev2 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(thumb_x2 + thumb_w2 / 2.), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-            assert!(
-                ed.read(cx).table_h_drag.borrow().is_some(),
-                "点滑块应进入拖动态"
-            );
-            let up_x = bar_x + bar_w * 0.05;
-            let ev_move = MouseMoveEvent {
-                position: point(px(up_x), px(band_y)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            };
-            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
-            let after = ed.read(cx).table_h_scroll_of(blk);
-            assert!(after < jumped, "拖到最左应减小偏移：{after} < {jumped}");
-            let ev_up = MouseUpEvent {
-                button: MouseButton::Left,
-                position: point(px(up_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
-            assert!(
-                ed.read(cx).table_h_drag.borrow().is_none(),
-                "松开应清除拖拽态"
-            );
-            assert_eq!(
-                ed.read(cx).text().as_ref(),
-                text,
-                "表格横向滚动是视图本地状态，不应写源码"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn table_hscroll_shifts_hit_and_caret(cx: &mut TestAppContext) {
-        // 横向滚动后：同一可视 x 应命中**更后列**的单元格（命中反查 +scroll），
-        // 光标条 x 应按平移逆映射 −scroll 收敛（否则点击/光标错位）。
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let tbl = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table && r.table.is_some())
-                .expect("应有表格");
-            let blk = tbl.src_line;
-            let (_, _, _, _, max_scroll) =
-                super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("宽表格应超宽");
-            let pad = f32::from(frame.padding);
-            let t = tbl.table.as_ref().unwrap();
-            let row_ix = 1usize; // 数据行
-            let rh = f32::from(t.row_h);
-            let y = f32::from(tbl.top) + super::table_row_top(t, row_ix) + rh / 2.;
-            let view_x = pad + 40.;
-            let p = point(px(view_x), px(y));
-            let (line0, col0) = {
-                let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
-                let (l, c) = ed.read(cx).row_col(off0);
-                (l, c)
-            };
-            // 滚到最右 → 同一可视 x 应命中更后列的单元格。
-            ed.update(cx, |e, _| e.set_table_h_scroll(blk, max_scroll));
-            let f2 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
-            let (line1, col1) = ed.read(cx).row_col(off1);
-            assert_eq!(line0, line1, "横向滚动不应改变命中行");
-            assert!(col1 > col0, "同一 x 滚动后应命中更后列：col0={col0} col1={col1}");
-            // 光标几何：同一源列（off1 在最后一列的渲染列）在 scroll=0 与 scroll=max
-            // 下 x 应相差 ≈ max_scroll（paint 平移的逆映射）。
-            ed.update(cx, |e, _| e.set_caret(off1));
-            let (on_max, x_sc, _) = super::caret_geometry(ed.read(cx), &f2);
-            assert!(on_max, "滚动后该格应可放光标");
-            ed.update(cx, |e, _| e.set_table_h_scroll(blk, 0.));
-            let f0 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let (on0, x_un, _) = super::caret_geometry(ed.read(cx), &f0);
-            assert!(on0, "未滚动该格应可放光标");
-            let d = f32::from(x_un - x_sc);
-            assert!(
-                (d - max_scroll).abs() < 2.,
-                "滚动前后光标 x 差应 ≈ max_scroll（{max_scroll:.0}），实际 {d:.1}"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn table_short_has_inert_scrollbar_band(cx: &mut TestAppContext) {
-        // 窄表格：滚动条带恒定存在（preview `markdown/view` 的 Always 语义），但
-        // `max_scroll = 0` → 惰性不可滚动，陈旧滚动值被 `table_hscroll_clamped` 忽略，
-        // 且预留带位于网格之下（不遮内容）。
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let tbl = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table && r.table.is_some())
-                .expect("应有表格");
-            let geo = super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("表格总有滚动条带");
-            let (_, _, thumb_x, thumb_w, max_scroll) = geo;
-            assert_eq!(max_scroll, 0., "窄表格不应有横向行程");
-            assert!(
-                (thumb_w - thumb_x).abs() > 0. && thumb_w >= 48.,
-                "窄表格滑块应占满轨道（惰性）"
-            );
-            ed.update(cx, |e, _| e.set_table_h_scroll(tbl.src_line, 999.));
-            assert_eq!(
-                super::table_hscroll_clamped(ed.read(cx), &frame, tbl),
-                0.,
-                "内容不超宽时应忽略陈旧滚动值"
-            );
-            // 预留带高度恒定：块高 = 网格高 + 预留带（带外 estimate 同式 → 滚动不跳）。
-            let grid_h = f32::from(super::table_block_height(
-                &ed.read(cx).theme,
-                tbl.table.as_ref().unwrap().rows_texts.len(),
-            ));
-            assert!(
-                (f32::from(tbl.height) - grid_h - crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX)
-                    .abs()
-                    < 0.5,
-                "表格块高应为网格高 + 滚动条预留带"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_short_lines_have_no_hscroll(cx: &mut TestAppContext) {
-        // 短代码行不超宽 → 无横向滚动条（`code_hscroll_geo` None），且陈旧滚动值被
-        // `code_hscroll_clamped` 忽略（宽窗口下长行不再偏移）。防「内容超出代码块」回归。
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "```rust\nlet a = 1;\nlet b = 22;\n```\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
-                .expect("应有代码块");
-            assert!(
-                super::code_hscroll_geo(ed.read(cx), &frame, code).is_none(),
-                "短行不应出现横向滚动条"
-            );
-            // 即便手动塞一个陈旧滚动值：paint/命中共用的 clamped 也应归 0。
-            ed.update(cx, |e, _| e.set_code_h_scroll(code.src_line, 999.));
-            assert_eq!(
-                super::code_hscroll_clamped(ed.read(cx), &frame, code),
-                0.,
-                "内容不超宽时应忽略陈旧滚动值"
-            );
-            assert!(super::code_hscroll_geo(ed.read(cx), &frame, code).is_none());
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
-        // view 语义：点击**轨道**（不在滑块上）→ 滑块跳到点击处；点击**滑块** → 拖动。
-        // 旧实现点轨道空白处无反应（手感差），此处回归点击轨道即跳转。
-        use crate::markdown::ir::IrKind;
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let (blk, ctop, ctop_h, bar_x, bar_w, _thumb_x, _thumb_w, max_scroll) = {
-                let code = frame
-                    .rows
-                    .iter()
-                    .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
-                    .expect("应有代码块");
-                let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
-                    super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
-                // 初始 scroll=0 → 滑块贴着轨道左端。
-                assert!(thumb_x <= bar_x + 1., "初态滑块应在左端");
-                (
-                    code.src_line,
-                    f32::from(code.top),
-                    f32::from(code.height),
-                    bar_x,
-                    bar_w,
-                    thumb_x,
-                    thumb_w,
-                    max_scroll,
-                )
-            };
-            // 把刚建的帧放入编辑器，供 `on_mouse_down`/命中读取。
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
-            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
-            // 点击轨道**末端**（远离初始左端滑块，必不在滑块上）→ 直接跳转（不进拖动态）。
-            let jump_x = bar_x + bar_w - 4.0;
-            let jump_y = band_y;
-            // 断言**点击前**命中的是轨道（非滑块）。
-            let (blk_pre, on_thumb_pre, _) = super::code_hscrollbar_hit(
-                ed.read(cx),
-                ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
-                point(px(jump_x), px(jump_y)),
-            )
-            .expect("轨道末应在滚动条带内");
-            assert_eq!(blk_pre, blk);
-            assert!(!on_thumb_pre, "点击末端的点不应落在初始滑块上");
-            let ev = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(jump_x), px(jump_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
-            let jumped = ed.read(cx).code_h_scroll_of(blk);
-            assert!(jumped > 0., "点击轨道应立刻跳转（不拖也动）：{jumped}");
-            assert!(
-                ed.read(cx).code_h_drag.borrow().is_none(),
-                "轨道跳转不应进入拖动态"
-            );
-            assert!(
-                jumped <= max_scroll,
-                "跳转偏移应不超过 max_scroll（{jumped} ≤ {max_scroll}）"
-            );
-            // 再点滑块中心 → 进入拖动态，拖动到左端归零。
-            let geo2 = super::code_hscroll_geo(
-                ed.read(cx),
-                ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
-                ed.read(cx).frame.borrow().as_ref().unwrap().rows.iter().find(|r| r.src_line == blk).unwrap(),
-            ).unwrap();
-            let (_, _, thumb_x2, thumb_w2, _) = geo2;
-            let thumb_cx = thumb_x2 + thumb_w2 / 2.;
-            let ev2 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(thumb_cx), px(jump_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-            assert!(
-                ed.read(cx).code_h_drag.borrow().is_some(),
-                "点滑块应进入拖动态"
-            );
-            let ev_move = MouseMoveEvent {
-                position: point(px(bar_x + 6.), px(jump_y)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            };
-            ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
-            let dragged = ed.read(cx).code_h_scroll_of(blk);
-            assert!(dragged < jumped, "拖到左端应减小偏移：{dragged} < {jumped}");
-            let ev_up = MouseUpEvent {
-                button: MouseButton::Left,
-                position: point(px(bar_x + 6.), px(jump_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
-            assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_hscroll_thumb_drag_tracks_pointer_without_jump(cx: &mut TestAppContext) {
-        // 回归「不跟手」：旧实现 grab 从滑块**中心**量、却按**左缘**参与换算 →
-        // 按下滑块瞬间 scroll 前跳半个滑块宽，拖动手感像「先在别处吸住再跑」。
-        // 修后语义（对齐 gpui-component drag_pos）：grab = 指针相对滑块**左缘**偏移，
-        // 按下不跳档、拖动时滑块钉住抓取点 1:1 跟随指针（thumb_x = px − grab）。
-        use crate::markdown::ir::IrKind;
-        use gpui::{
-            Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
         };
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+        assert!(thumb_x <= bar_x + 1., "初态滑块应在轨道左端");
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+        // 轨道命中（远离左端滑块）→ 跳转（不进拖动态）。
+        let jump_x = bar_x + bar_w - 4.0;
+        let (blk_hit, on_thumb, _) = super::table_hscrollbar_hit(
+            ed.read(cx),
+            ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+            point(px(jump_x), px(band_y)),
+        )
+        .expect("轨道末端应在滚动条带内");
+        assert_eq!(blk_hit, blk);
+        assert!(!on_thumb, "远离左端滑块的轨道点不应落在滑块上");
+        let ev = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(jump_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+        let jumped = ed.read(cx).table_h_scroll_of(blk);
+        assert!(jumped > 0., "点击轨道应立刻跳转：{jumped}");
+        assert!(jumped <= max_scroll, "{jumped} ≤ {max_scroll}");
+        assert!(
+            ed.read(cx).table_h_drag.borrow().is_none(),
+            "轨道跳转不应进入拖动态"
+        );
+        // 点滑块（滚动后滑块位置）→ 拖到最左 → 偏移归零；松开清态；源码不变。
+        let f2 = ed.read(cx).frame.borrow().clone().unwrap();
+        let geo2 = super::table_hscroll_geo(
+            ed.read(cx),
+            &f2,
+            f2.rows.iter().find(|r| r.src_line == blk).unwrap(),
+        )
+        .unwrap();
+        let (_, _, thumb_x2, thumb_w2, _) = geo2;
+        let ev2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(thumb_x2 + thumb_w2 / 2.), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+        assert!(
+            ed.read(cx).table_h_drag.borrow().is_some(),
+            "点滑块应进入拖动态"
+        );
+        let up_x = bar_x + bar_w * 0.05;
+        let ev_move = MouseMoveEvent {
+            position: point(px(up_x), px(band_y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+        let after = ed.read(cx).table_h_scroll_of(blk);
+        assert!(after < jumped, "拖到最左应减小偏移：{after} < {jumped}");
+        let ev_up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(up_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+        assert!(
+            ed.read(cx).table_h_drag.borrow().is_none(),
+            "松开应清除拖拽态"
+        );
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            text,
+            "表格横向滚动是视图本地状态，不应写源码"
+        );
+    });
+}
+
+#[gpui::test]
+fn table_hscroll_shifts_hit_and_caret(cx: &mut TestAppContext) {
+    // 横向滚动后：同一可视 x 应命中**更后列**的单元格（命中反查 +scroll），
+    // 光标条 x 应按平移逆映射 −scroll 收敛（否则点击/光标错位）。
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "|AAAAAAAAAAAAAAAAAAAAAA|BBBBBBBBBBBBBBBBBBBBBB|CCCCCCCCCCCCCCCCCCCCCC|DDDDDDDDDDDDDDDDDDDDDD|EEEEEEEEEEEEEEEEEEEEEEE|\n|---|---|---|---|---|\n|a1|b1|c1|d1|e1|\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let tbl = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table && r.table.is_some())
+            .expect("应有表格");
+        let blk = tbl.src_line;
+        let (_, _, _, _, max_scroll) =
+            super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("宽表格应超宽");
+        let pad = f32::from(frame.padding);
+        let t = tbl.table.as_ref().unwrap();
+        let row_ix = 1usize; // 数据行
+        let rh = f32::from(t.row_h);
+        let y = f32::from(tbl.top) + super::table_row_top(t, row_ix) + rh / 2.;
+        let view_x = pad + 40.;
+        let p = point(px(view_x), px(y));
+        let (line0, col0) = {
+            let off0 = super::source_offset_at_local(ed.read(cx), &frame, p);
+            let (l, c) = ed.read(cx).row_col(off0);
+            (l, c)
+        };
+        // 滚到最右 → 同一可视 x 应命中更后列的单元格。
+        ed.update(cx, |e, _| e.set_table_h_scroll(blk, max_scroll));
+        let f2 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let off1 = super::source_offset_at_local(ed.read(cx), &f2, p);
+        let (line1, col1) = ed.read(cx).row_col(off1);
+        assert_eq!(line0, line1, "横向滚动不应改变命中行");
+        assert!(
+            col1 > col0,
+            "同一 x 滚动后应命中更后列：col0={col0} col1={col1}"
+        );
+        // 光标几何：同一源列（off1 在最后一列的渲染列）在 scroll=0 与 scroll=max
+        // 下 x 应相差 ≈ max_scroll（paint 平移的逆映射）。
+        ed.update(cx, |e, _| e.set_caret(off1));
+        let (on_max, x_sc, _) = super::caret_geometry(ed.read(cx), &f2);
+        assert!(on_max, "滚动后该格应可放光标");
+        ed.update(cx, |e, _| e.set_table_h_scroll(blk, 0.));
+        let f0 = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let (on0, x_un, _) = super::caret_geometry(ed.read(cx), &f0);
+        assert!(on0, "未滚动该格应可放光标");
+        let d = f32::from(x_un - x_sc);
+        assert!(
+            (d - max_scroll).abs() < 2.,
+            "滚动前后光标 x 差应 ≈ max_scroll（{max_scroll:.0}），实际 {d:.1}"
+        );
+    });
+}
+
+#[gpui::test]
+fn table_short_has_inert_scrollbar_band(cx: &mut TestAppContext) {
+    // 窄表格：滚动条带恒定存在（preview `markdown/view` 的 Always 语义），但
+    // `max_scroll = 0` → 惰性不可滚动，陈旧滚动值被 `table_hscroll_clamped` 忽略，
+    // 且预留带位于网格之下（不遮内容）。
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| A | B |\n|---|---|\n| 1 | 2 |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let tbl = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table && r.table.is_some())
+            .expect("应有表格");
+        let geo = super::table_hscroll_geo(ed.read(cx), &frame, tbl).expect("表格总有滚动条带");
+        let (_, _, thumb_x, thumb_w, max_scroll) = geo;
+        assert_eq!(max_scroll, 0., "窄表格不应有横向行程");
+        assert!(
+            (thumb_w - thumb_x).abs() > 0. && thumb_w >= 48.,
+            "窄表格滑块应占满轨道（惰性）"
+        );
+        ed.update(cx, |e, _| e.set_table_h_scroll(tbl.src_line, 999.));
+        assert_eq!(
+            super::table_hscroll_clamped(ed.read(cx), &frame, tbl),
+            0.,
+            "内容不超宽时应忽略陈旧滚动值"
+        );
+        // 预留带高度恒定：块高 = 网格高 + 预留带（带外 estimate 同式 → 滚动不跳）。
+        let grid_h = f32::from(super::table_block_height(
+            &ed.read(cx).theme,
+            tbl.table.as_ref().unwrap().rows_texts.len(),
+        ));
+        assert!(
+            (f32::from(tbl.height) - grid_h - crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX)
+                .abs()
+                < 0.5,
+            "表格块高应为网格高 + 滚动条预留带"
+        );
+    });
+}
+
+#[gpui::test]
+fn code_block_short_lines_have_no_hscroll(cx: &mut TestAppContext) {
+    // 短代码行不超宽 → 无横向滚动条（`code_hscroll_geo` None），且陈旧滚动值被
+    // `code_hscroll_clamped` 忽略（宽窗口下长行不再偏移）。防「内容超出代码块」回归。
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "```rust\nlet a = 1;\nlet b = 22;\n```\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+            .expect("应有代码块");
+        assert!(
+            super::code_hscroll_geo(ed.read(cx), &frame, code).is_none(),
+            "短行不应出现横向滚动条"
+        );
+        // 即便手动塞一个陈旧滚动值：paint/命中共用的 clamped 也应归 0。
+        ed.update(cx, |e, _| e.set_code_h_scroll(code.src_line, 999.));
+        assert_eq!(
+            super::code_hscroll_clamped(ed.read(cx), &frame, code),
+            0.,
+            "内容不超宽时应忽略陈旧滚动值"
+        );
+        assert!(super::code_hscroll_geo(ed.read(cx), &frame, code).is_none());
+    });
+}
+
+#[gpui::test]
+fn code_block_hscroll_track_click_jumps(cx: &mut TestAppContext) {
+    // view 语义：点击**轨道**（不在滑块上）→ 滑块跳到点击处；点击**滑块** → 拖动。
+    // 旧实现点轨道空白处无反应（手感差），此处回归点击轨道即跳转。
+    use crate::markdown::ir::IrKind;
+    use gpui::{
+        Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+    };
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let (blk, ctop, ctop_h, bar_x, bar_w, _thumb_x, _thumb_w, max_scroll) = {
             let code = frame
                 .rows
                 .iter()
                 .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
                 .expect("应有代码块");
-            let code_top = f32::from(code.top);
-            let code_h = f32::from(code.height);
-            let blk = code.src_line;
-            let (_, _, _, _, max_scroll) = super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
-            // 滚动到中段，滑块离开左端（否则抓取点恒 0，测不出左缘语义）。
-            let mid = max_scroll * 0.5;
-            ed.update(cx, |e, _| {
-                e.set_code_h_scroll(blk, mid);
-                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
-            });
-            // geo 是纯函数（读实时 scroll），用编辑器里那份帧反复重算滑块几何。
-            let geo_of = |e: &WyEditor| -> (f32, f32, f32, f32, f32) {
-                let f = e.frame.borrow();
-                let fr = f.as_ref().map(|r| &**r).unwrap();
-                let r = fr.rows.iter().find(|r| r.src_line == blk).unwrap();
-                super::code_hscroll_geo(e, fr, r).unwrap()
-            };
-            let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) = geo_of(ed.read(cx));
-            let travel = bar_w - thumb_w;
-            let grab = thumb_w * 0.25; // 抓取点：滑块内距左缘 1/4 宽。
-            let p0_x = thumb_x + grab;
-            let band_top = code_top + code_h - crate::config::layout::CODE_HSCROLL_BAND;
-            let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
-
-            // 1) 按下滑块：scroll 必须**保持 mid**（不跳档），并进入拖动态。
-            let down = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(p0_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
-            assert_eq!(
-                ed.read(cx).code_h_scroll_of(blk),
-                mid,
-                "按下滑块瞬间不应跳档（old grab=中心导致前跳半个滑块宽）"
-            );
-            assert!(ed.read(cx).code_h_drag.borrow().is_some(), "应在拖动态");
-
-            // 2) 拖动 +Δ：滑块钉住抓取点 1:1 跟随 → thumb_x_new = p − grab（轨内 clamp）。
-            let p1_x = p0_x + 60.0;
-            let m1 = MouseMoveEvent {
-                position: point(px(p1_x), px(band_y)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            };
-            ed.update(cx, |e, cx| e.on_mouse_move(&m1, cx));
-            let (_, _, thumb_x2, _, _) = geo_of(ed.read(cx));
-            let expect_x = (p1_x - grab).clamp(bar_x, bar_x + travel);
-            assert!(
-                (thumb_x2 - expect_x).abs() < 0.5,
-                "拖动应钉住抓取点（thumb 应到 {expect_x:.1}，实际 {thumb_x2:.1}）"
-            );
-            let expect_scroll = (expect_x - bar_x) / travel * max_scroll;
-            let scrolled = ed.read(cx).code_h_scroll_of(blk);
-            assert!(
-                (scrolled - expect_scroll).abs() < max_scroll * 0.01,
-                "scroll 应与指针位移 1:1 对应：{scrolled:.1} ≈ {expect_scroll:.1}"
-            );
-
-            // 3) 继续拖出右端 → clamp 到 max_scroll（thumb 停在轨道端，参考语义）。
-            let far = MouseMoveEvent {
-                position: point(px(bar_x + bar_w + 100.), px(band_y)),
-                pressed_button: Some(MouseButton::Left),
-                modifiers: Modifiers::default(),
-            };
-            ed.update(cx, |e, cx| e.on_mouse_move(&far, cx));
-            assert!(
-                (ed.read(cx).code_h_scroll_of(blk) - max_scroll).abs() < 0.5,
-                "拖出右端应 clamp 到 max_scroll"
-            );
-
-            let up = MouseUpEvent {
-                button: MouseButton::Left,
-                position: point(px(p1_x), px(band_y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_up(&up, cx));
-            assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
+            let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) =
+                super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
+            // 初始 scroll=0 → 滑块贴着轨道左端。
+            assert!(thumb_x <= bar_x + 1., "初态滑块应在左端");
+            (
+                code.src_line,
+                f32::from(code.top),
+                f32::from(code.height),
+                bar_x,
+                bar_w,
+                thumb_x,
+                thumb_w,
+                max_scroll,
+            )
+        };
+        // 把刚建的帧放入编辑器，供 `on_mouse_down`/命中读取。
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
-    }
+        let band_top = ctop + ctop_h - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+        // 点击轨道**末端**（远离初始左端滑块，必不在滑块上）→ 直接跳转（不进拖动态）。
+        let jump_x = bar_x + bar_w - 4.0;
+        let jump_y = band_y;
+        // 断言**点击前**命中的是轨道（非滑块）。
+        let (blk_pre, on_thumb_pre, _) = super::code_hscrollbar_hit(
+            ed.read(cx),
+            ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+            point(px(jump_x), px(jump_y)),
+        )
+        .expect("轨道末应在滚动条带内");
+        assert_eq!(blk_pre, blk);
+        assert!(!on_thumb_pre, "点击末端的点不应落在初始滑块上");
+        let ev = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(jump_x), px(jump_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+        let jumped = ed.read(cx).code_h_scroll_of(blk);
+        assert!(jumped > 0., "点击轨道应立刻跳转（不拖也动）：{jumped}");
+        assert!(
+            ed.read(cx).code_h_drag.borrow().is_none(),
+            "轨道跳转不应进入拖动态"
+        );
+        assert!(
+            jumped <= max_scroll,
+            "跳转偏移应不超过 max_scroll（{jumped} ≤ {max_scroll}）"
+        );
+        // 再点滑块中心 → 进入拖动态，拖动到左端归零。
+        let geo2 = super::code_hscroll_geo(
+            ed.read(cx),
+            ed.read(cx).frame.borrow().as_ref().map(|f| &**f).unwrap(),
+            ed.read(cx)
+                .frame
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .find(|r| r.src_line == blk)
+                .unwrap(),
+        )
+        .unwrap();
+        let (_, _, thumb_x2, thumb_w2, _) = geo2;
+        let thumb_cx = thumb_x2 + thumb_w2 / 2.;
+        let ev2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(thumb_cx), px(jump_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+        assert!(
+            ed.read(cx).code_h_drag.borrow().is_some(),
+            "点滑块应进入拖动态"
+        );
+        let ev_move = MouseMoveEvent {
+            position: point(px(bar_x + 6.), px(jump_y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        ed.update(cx, |e, cx| e.on_mouse_move(&ev_move, cx));
+        let dragged = ed.read(cx).code_h_scroll_of(blk);
+        assert!(dragged < jumped, "拖到左端应减小偏移：{dragged} < {jumped}");
+        let ev_up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(bar_x + 6.), px(jump_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_up(&ev_up, cx));
+        assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
+    });
+}
 
-    #[gpui::test]
-    fn code_block_caret_tracks_clicked_content_line(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn code_block_hscroll_thumb_drag_tracks_pointer_without_jump(cx: &mut TestAppContext) {
+    // 回归「不跟手」：旧实现 grab 从滑块**中心**量、却按**左缘**参与换算 →
+    // 按下滑块瞬间 scroll 前跳半个滑块宽，拖动手感像「先在别处吸住再跑」。
+    // 修后语义（对齐 gpui-component drag_pos）：grab = 指针相对滑块**左缘**偏移，
+    // 按下不跳档、拖动时滑块钉住抓取点 1:1 跟随指针（thumb_x = px − grab）。
+    use crate::markdown::ir::IrKind;
+    use gpui::{
+        Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, size,
+    };
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = format!("```rust\n{}\nb\n```\n", "a".repeat(400));
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code && !r.multi_offsets.is_empty())
+            .expect("应有代码块");
+        let code_top = f32::from(code.top);
+        let code_h = f32::from(code.height);
+        let blk = code.src_line;
+        let (_, _, _, _, max_scroll) = super::code_hscroll_geo(ed.read(cx), &frame, code).unwrap();
+        // 滚动到中段，滑块离开左端（否则抓取点恒 0，测不出左缘语义）。
+        let mid = max_scroll * 0.5;
+        ed.update(cx, |e, _| {
+            e.set_code_h_scroll(blk, mid);
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
+        });
+        // geo 是纯函数（读实时 scroll），用编辑器里那份帧反复重算滑块几何。
+        let geo_of = |e: &WyEditor| -> (f32, f32, f32, f32, f32) {
+            let f = e.frame.borrow();
+            let fr = f.as_ref().map(|r| &**r).unwrap();
+            let r = fr.rows.iter().find(|r| r.src_line == blk).unwrap();
+            super::code_hscroll_geo(e, fr, r).unwrap()
+        };
+        let (bar_x, bar_w, thumb_x, thumb_w, max_scroll) = geo_of(ed.read(cx));
+        let travel = bar_w - thumb_w;
+        let grab = thumb_w * 0.25; // 抓取点：滑块内距左缘 1/4 宽。
+        let p0_x = thumb_x + grab;
+        let band_top = code_top + code_h - crate::config::layout::CODE_HSCROLL_BAND;
+        let band_y = band_top + crate::config::layout::CODE_HSCROLL_BAND / 2.;
+
+        // 1) 按下滑块：scroll 必须**保持 mid**（不跳档），并进入拖动态。
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(p0_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+        assert_eq!(
+            ed.read(cx).code_h_scroll_of(blk),
+            mid,
+            "按下滑块瞬间不应跳档（old grab=中心导致前跳半个滑块宽）"
+        );
+        assert!(ed.read(cx).code_h_drag.borrow().is_some(), "应在拖动态");
+
+        // 2) 拖动 +Δ：滑块钉住抓取点 1:1 跟随 → thumb_x_new = p − grab（轨内 clamp）。
+        let p1_x = p0_x + 60.0;
+        let m1 = MouseMoveEvent {
+            position: point(px(p1_x), px(band_y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        ed.update(cx, |e, cx| e.on_mouse_move(&m1, cx));
+        let (_, _, thumb_x2, _, _) = geo_of(ed.read(cx));
+        let expect_x = (p1_x - grab).clamp(bar_x, bar_x + travel);
+        assert!(
+            (thumb_x2 - expect_x).abs() < 0.5,
+            "拖动应钉住抓取点（thumb 应到 {expect_x:.1}，实际 {thumb_x2:.1}）"
+        );
+        let expect_scroll = (expect_x - bar_x) / travel * max_scroll;
+        let scrolled = ed.read(cx).code_h_scroll_of(blk);
+        assert!(
+            (scrolled - expect_scroll).abs() < max_scroll * 0.01,
+            "scroll 应与指针位移 1:1 对应：{scrolled:.1} ≈ {expect_scroll:.1}"
+        );
+
+        // 3) 继续拖出右端 → clamp 到 max_scroll（thumb 停在轨道端，参考语义）。
+        let far = MouseMoveEvent {
+            position: point(px(bar_x + bar_w + 100.), px(band_y)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        };
+        ed.update(cx, |e, cx| e.on_mouse_move(&far, cx));
+        assert!(
+            (ed.read(cx).code_h_scroll_of(blk) - max_scroll).abs() < 0.5,
+            "拖出右端应 clamp 到 max_scroll"
+        );
+
+        let up = MouseUpEvent {
+            button: MouseButton::Left,
+            position: point(px(p1_x), px(band_y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_up(&up, cx));
+        assert!(ed.read(cx).code_h_drag.borrow().is_none(), "松开应清拖拽态");
+    });
+}
+
+#[gpui::test]
+fn code_block_caret_tracks_clicked_content_line(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 ```py
 one
 two
@@ -1865,359 +2032,368 @@ three
 ```
 tail
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (offsets, code_top, lh) = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (offsets, code_top, lh) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code)
+            .expect("应有代码块");
+        assert!(code.editable);
+        let e = ed.read(cx);
+        let offs: Vec<usize> = (1usize..=3).map(|ln| e.line_start(ln) + 1).collect();
+        (offs, f32::from(code.top), f32::from(code.lh))
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        for (k, off) in offsets.iter().enumerate() {
+            ed.update(cx, |e, _| e.set_caret(*off));
             let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code)
-                .expect("应有代码块");
-            assert!(code.editable);
-            let e = ed.read(cx);
-            let offs: Vec<usize> = (1usize..=3).map(|ln| e.line_start(ln) + 1).collect();
-            (offs, f32::from(code.top), f32::from(code.lh))
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            for (k, off) in offsets.iter().enumerate() {
-                ed.update(cx, |e, _| e.set_caret(*off));
-                let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-                let (on, _, ctop) = caret_geometry(ed.read(cx), &frame);
-                assert!(on, "代码内容行应可放光标");
-                // caret 顶 = 块首 + 1 行首空白带 + k×行高。
-                let expect = code_top + lh * (1 + k) as f32;
-                assert!(
-                    (f32::from(ctop) - expect).abs() < 0.6,
-                    "k={k} 光标顶应 {expect}，得 {}",
-                    f32::from(ctop)
-                );
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_edit_typing_backspace_enter(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "```rust\nlet a = 1;\nlet b = 2;\n```\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                // 光标落在首个代码行内输入 → 源文本在围栏内更新。
-                let ls = e.line_start(1);
-                e.set_caret(ls + 4);
-                e.replace_range(e.caret()..e.caret(), "X", cx);
-                assert!(
-                    e.text().as_ref().starts_with("```rust\nlet Xa = 1;"),
-                    "围栏内输入生效：{}",
-                    e.text().as_ref()
-                );
-                // 退格删去 X（插入后光标已在 X 之后）。
-                e.backspace(cx);
-                assert_eq!(
-                    &e.text().as_ref()[ls..ls + 9],
-                    "let a = 1",
-                    "退格删回原位，围栏未损坏"
-                );
-                // 末内容行行尾的删除是 no-op（保护闭合围栏）；再回车在闭合围栏前新起代码行。
-                let e2 = e.line_end(2);
-                e.set_caret(e2);
-                e.delete(cx);
-                assert!(
-                    e.text().as_ref().contains("let b = 2;\n```"),
-                    "末内容行行尾删除应被守卫（闭合围栏不被吃掉）：{}",
-                    e.text().as_ref()
-                );
-                let e2 = e.line_end(2);
-                e.set_caret(e2);
-                e.newline(cx);
-                assert!(
-                    e.text().as_ref().contains("let b = 2;\n\n```"),
-                    "回车应在闭合围栏前新起一代码行：{}",
-                    e.text().as_ref()
-                );
-                // 首内容行行首退格是 no-op（保护开围栏）。
-                e.set_caret(e.line_start(1));
-                e.backspace(cx);
-                assert!(
-                    e.text().as_ref().starts_with("```rust\n"),
-                    "首内容行行首退格应被守卫（开围栏不被吃掉）：{}",
-                    e.text().as_ref()
-                );
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_arrow_nav_skips_fences(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "前段\n```rust\nlet a = 1;\nlet b = 2;\n```\n后段\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _cx| {
-                // 首内容行行首向上 → 「前段」段尾，光标不落进开围栏。
-                e.set_caret(e.line_start(2));
-                e.move_up();
-                let (l, _) = e.row_col(e.caret());
-                assert_eq!(l, 0, "首内容行向上应到行 0（前段），得 {l}");
-                // 「前段」行尾向右 → 跳过开围栏进代码首内容行（行 2）。
-                e.set_caret(e.line_end(0));
-                e.move_right();
-                let (l, col) = e.row_col(e.caret());
-                assert!(l == 2 && col == 0, "前段行尾向右应到首内容行行首，得 ({l},{col})");
-                // 内容行内上下移动 → 光标行始终在内容行 2/3。
-                e.set_caret(e.line_start(2) + 3);
-                e.move_down();
-                let (l, _) = e.row_col(e.caret());
-                assert_eq!(l, 3, "内容行内下移应在行 3，得 {l}");
-                e.move_up();
-                let (l, _) = e.row_col(e.caret());
-                assert_eq!(l, 2, "内容行内上移回行 2，得 {l}");
-                // 末内容行行尾向右 → 跳过闭合围栏到「后段」（行 5）段首。
-                e.set_caret(e.line_end(3));
-                e.move_right();
-                let (l, col) = e.row_col(e.caret());
-                assert!(l == 5 && col == 0, "末内容行行尾向右应到后段行首，得 ({l},{col})");
-                // 后段向上 → 进代码块末内容行（行 3）。
-                e.set_caret(e.line_start(5) + 2);
-                e.move_up();
-                let (l, _) = e.row_col(e.caret());
-                assert_eq!(l, 3, "后段向上应进代码块末内容行 3，得 {l}");
-            });
-        });
-    }
-
-    #[gpui::test]
-    fn code_block_off_band_height_matches_shaped(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 一长段把代码块推到 300px 带之外 → 带外估算高必须与整形式高度一致（防滚动跳变）。
-        let head = "the quick brown fox jumps over the lazy dog ".repeat(300);
-        let text = format!("{head}\n```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n尾行\n");
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (shaped_h, code_ix) = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
-            let code_ix = frame
-                .rows
-                .iter()
-                .position(|r| r.kind == IrKind::Code)
-                .expect("应有代码块");
-            let code = &frame.rows[code_ix];
-            assert!(code.editable);
-            (f32::from(code.height), code_ix)
-        });
-        let off_h = vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 窄带：长段 (~1000px) 全占，代码块与尾行在带外 → 不物化，走布局高度。
-            let frame = build_frame(ed.read(cx), window, px(300.), (0., 300.));
+            let (on, _, ctop) = caret_geometry(ed.read(cx), &frame);
+            assert!(on, "代码内容行应可放光标");
+            // caret 顶 = 块首 + 1 行首空白带 + k×行高。
+            let expect = code_top + lh * (1 + k) as f32;
             assert!(
-                !frame.rows.iter().any(|r| r.kind == IrKind::Code),
-                "带外代码块不物化"
+                (f32::from(ctop) - expect).abs() < 0.6,
+                "k={k} 光标顶应 {expect}，得 {}",
+                f32::from(ctop)
             );
-            frame.block_height(code_ix)
+        }
+    });
+}
+
+#[gpui::test]
+fn code_block_edit_typing_backspace_enter(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "```rust\nlet a = 1;\nlet b = 2;\n```\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            // 光标落在首个代码行内输入 → 源文本在围栏内更新。
+            let ls = e.line_start(1);
+            e.set_caret(ls + 4);
+            e.replace_range(e.caret()..e.caret(), "X", cx);
+            assert!(
+                e.text().as_ref().starts_with("```rust\nlet Xa = 1;"),
+                "围栏内输入生效：{}",
+                e.text().as_ref()
+            );
+            // 退格删去 X（插入后光标已在 X 之后）。
+            e.backspace(cx);
+            assert_eq!(
+                &e.text().as_ref()[ls..ls + 9],
+                "let a = 1",
+                "退格删回原位，围栏未损坏"
+            );
+            // 末内容行行尾的删除是 no-op（保护闭合围栏）；再回车在闭合围栏前新起代码行。
+            let e2 = e.line_end(2);
+            e.set_caret(e2);
+            e.delete(cx);
+            assert!(
+                e.text().as_ref().contains("let b = 2;\n```"),
+                "末内容行行尾删除应被守卫（闭合围栏不被吃掉）：{}",
+                e.text().as_ref()
+            );
+            let e2 = e.line_end(2);
+            e.set_caret(e2);
+            e.newline(cx);
+            assert!(
+                e.text().as_ref().contains("let b = 2;\n\n```"),
+                "回车应在闭合围栏前新起一代码行：{}",
+                e.text().as_ref()
+            );
+            // 首内容行行首退格是 no-op（保护开围栏）。
+            e.set_caret(e.line_start(1));
+            e.backspace(cx);
+            assert!(
+                e.text().as_ref().starts_with("```rust\n"),
+                "首内容行行首退格应被守卫（开围栏不被吃掉）：{}",
+                e.text().as_ref()
+            );
         });
+    });
+}
+
+#[gpui::test]
+fn code_block_arrow_nav_skips_fences(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "前段\n```rust\nlet a = 1;\nlet b = 2;\n```\n后段\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _cx| {
+            // 首内容行行首向上 → 「前段」段尾，光标不落进开围栏。
+            e.set_caret(e.line_start(2));
+            e.move_up();
+            let (l, _) = e.row_col(e.caret());
+            assert_eq!(l, 0, "首内容行向上应到行 0（前段），得 {l}");
+            // 「前段」行尾向右 → 跳过开围栏进代码首内容行（行 2）。
+            e.set_caret(e.line_end(0));
+            e.move_right();
+            let (l, col) = e.row_col(e.caret());
+            assert!(
+                l == 2 && col == 0,
+                "前段行尾向右应到首内容行行首，得 ({l},{col})"
+            );
+            // 内容行内上下移动 → 光标行始终在内容行 2/3。
+            e.set_caret(e.line_start(2) + 3);
+            e.move_down();
+            let (l, _) = e.row_col(e.caret());
+            assert_eq!(l, 3, "内容行内下移应在行 3，得 {l}");
+            e.move_up();
+            let (l, _) = e.row_col(e.caret());
+            assert_eq!(l, 2, "内容行内上移回行 2，得 {l}");
+            // 末内容行行尾向右 → 跳过闭合围栏到「后段」（行 5）段首。
+            e.set_caret(e.line_end(3));
+            e.move_right();
+            let (l, col) = e.row_col(e.caret());
+            assert!(
+                l == 5 && col == 0,
+                "末内容行行尾向右应到后段行首，得 ({l},{col})"
+            );
+            // 后段向上 → 进代码块末内容行（行 3）。
+            e.set_caret(e.line_start(5) + 2);
+            e.move_up();
+            let (l, _) = e.row_col(e.caret());
+            assert_eq!(l, 3, "后段向上应进代码块末内容行 3，得 {l}");
+        });
+    });
+}
+
+#[gpui::test]
+fn code_block_off_band_height_matches_shaped(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 一长段把代码块推到 300px 带之外 → 带外估算高必须与整形式高度一致（防滚动跳变）。
+    let head = "the quick brown fox jumps over the lazy dog ".repeat(300);
+    let text = format!("{head}\n```rust\nlet a = 1;\nlet b = 2;\nlet c = 3;\n```\n尾行\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (shaped_h, code_ix) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let code_ix = frame
+            .rows
+            .iter()
+            .position(|r| r.kind == IrKind::Code)
+            .expect("应有代码块");
+        let code = &frame.rows[code_ix];
+        assert!(code.editable);
+        (f32::from(code.height), code_ix)
+    });
+    let off_h = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 窄带：长段 (~1000px) 全占，代码块与尾行在带外 → 不物化，走布局高度。
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 300.));
         assert!(
-            (off_h - shaped_h).abs() < 1.,
-            "代码块带外估算高 {off_h} 应与整形高 {shaped_h} 一致（防滚动跳变）"
+            !frame.rows.iter().any(|r| r.kind == IrKind::Code),
+            "带外代码块不物化"
         );
-    }
+        frame.block_height(code_ix)
+    });
+    assert!(
+        (off_h - shaped_h).abs() < 1.,
+        "代码块带外估算高 {off_h} 应与整形高 {shaped_h} 一致（防滚动跳变）"
+    );
+}
 
-    #[gpui::test]
-    fn code_block_caret_aligns_with_click_x(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 回归「点击 (x,y) 实际输入在 (x+n,y)/光标盖住字符」：代码行文本内衬 = 12px
-        // （`x_off`，面板 pl_3），命中/光标必须都从 `padding + x_off`(24) 起算。
-        let text = "```rust\nlet a = 1;\n```\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let code = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Code)
-                .expect("应有代码块");
-            assert!(code.editable);
-            let pad = f32::from(frame.padding);
-            let off_x = f32::from(code.x_off);
-            assert!((off_x - 12.).abs() < 0.1, "代码行文本内衬 = 面板 pl_3（12px），得 {off_x}");
-            let lh = f32::from(code.lh);
-            let text_start = pad + off_x; // 24：代码文本起始 x（面板背景在 pad=12，与正文对齐）
-            // 1) 点击文本起始处 → 光标 x == 文本起始 x（不右偏、不盖字）。
-            let off0 = source_offset_at_local(ed.read(cx), &frame, point(px(text_start), px(lh * 1.5)));
-            let (line0, _) = ed.read(cx).row_col(off0);
-            assert_eq!(line0, 1, "点击文本始应命中代码内容行，得行 {line0}");
-            ed.update(cx, |e, _| e.set_caret(off0));
-            let (on, c0, _) = caret_geometry(ed.read(cx), &frame);
-            assert!(on);
-            assert!(
-                (f32::from(c0) - text_start).abs() < 0.6,
-                "光标 x {} 应 = 文本起始 x {text_start}",
-                f32::from(c0)
-            );
-            // 2) 点击面板内、文本左的内衬空白 → 光标收拢到行首（= 文本起始 x），不右偏。
-            let off1 = source_offset_at_local(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
-            ed.update(cx, |e, _| e.set_caret(off1));
-            let (on, c1, _) = caret_geometry(ed.read(cx), &frame);
-            assert!(on);
-            assert!(
-                (f32::from(c1) - text_start).abs() < 0.6,
-                "内衬空白点击应收拢到行首 {text_start}，得 {}",
-                f32::from(c1)
-            );
-            // 3) 文本中部点击 → 光标落点在 <1 字宽误差内贴合点击处。
-            let cx_ = text_start + 28.;
-            let off2 = source_offset_at_local(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
-            ed.update(cx, |e, _| e.set_caret(off2));
-            let (on, c2, _) = caret_geometry(ed.read(cx), &frame);
-            assert!(on);
-            assert!(
-                (f32::from(c2) - cx_).abs() < 14.,
-                "光标 x {} 应贴近点击 x {}（<1 字宽）",
-                f32::from(c2),
-                cx_
-            );
-        });
-    }
+#[gpui::test]
+fn code_block_caret_aligns_with_click_x(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 回归「点击 (x,y) 实际输入在 (x+n,y)/光标盖住字符」：代码行文本内衬 = 12px
+    // （`x_off`，面板 pl_3），命中/光标必须都从 `padding + x_off`(24) 起算。
+    let text = "```rust\nlet a = 1;\n```\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let code = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Code)
+            .expect("应有代码块");
+        assert!(code.editable);
+        let pad = f32::from(frame.padding);
+        let off_x = f32::from(code.x_off);
+        assert!(
+            (off_x - 12.).abs() < 0.1,
+            "代码行文本内衬 = 面板 pl_3（12px），得 {off_x}"
+        );
+        let lh = f32::from(code.lh);
+        let text_start = pad + off_x; // 24：代码文本起始 x（面板背景在 pad=12，与正文对齐）
+        // 1) 点击文本起始处 → 光标 x == 文本起始 x（不右偏、不盖字）。
+        let off0 = source_offset_at_local(ed.read(cx), &frame, point(px(text_start), px(lh * 1.5)));
+        let (line0, _) = ed.read(cx).row_col(off0);
+        assert_eq!(line0, 1, "点击文本始应命中代码内容行，得行 {line0}");
+        ed.update(cx, |e, _| e.set_caret(off0));
+        let (on, c0, _) = caret_geometry(ed.read(cx), &frame);
+        assert!(on);
+        assert!(
+            (f32::from(c0) - text_start).abs() < 0.6,
+            "光标 x {} 应 = 文本起始 x {text_start}",
+            f32::from(c0)
+        );
+        // 2) 点击面板内、文本左的内衬空白 → 光标收拢到行首（= 文本起始 x），不右偏。
+        let off1 = source_offset_at_local(ed.read(cx), &frame, point(px(pad + 6.), px(lh * 1.5)));
+        ed.update(cx, |e, _| e.set_caret(off1));
+        let (on, c1, _) = caret_geometry(ed.read(cx), &frame);
+        assert!(on);
+        assert!(
+            (f32::from(c1) - text_start).abs() < 0.6,
+            "内衬空白点击应收拢到行首 {text_start}，得 {}",
+            f32::from(c1)
+        );
+        // 3) 文本中部点击 → 光标落点在 <1 字宽误差内贴合点击处。
+        let cx_ = text_start + 28.;
+        let off2 = source_offset_at_local(ed.read(cx), &frame, point(px(cx_), px(lh * 1.5)));
+        ed.update(cx, |e, _| e.set_caret(off2));
+        let (on, c2, _) = caret_geometry(ed.read(cx), &frame);
+        assert!(on);
+        assert!(
+            (f32::from(c2) - cx_).abs() < 14.,
+            "光标 x {} 应贴近点击 x {}（<1 字宽）",
+            f32::from(c2),
+            cx_
+        );
+    });
+}
 
-    #[gpui::test]
-    fn table_click_lands_in_correct_cell(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table)
-                .expect("应有表格");
-            assert!(row.editable, "表格单元格应可编辑");
-            let t = row.table.as_ref().expect("表格渲染数据");
-            let te = row.table_edit.as_ref().expect("表格编辑排版");
-            let rh = f32::from(t.row_h);
-            let pad = f32::from(frame.padding);
-            let top = f32::from(row.top);
-            // (可见行, 列, 期望字符)：表头第一格 A；数据行2(源行3) 两格 3/4。
-            for (row_ix, cell_ix, want) in [(0usize, 0usize, 'A'), (2, 0, '3'), (2, 1, '4')] {
-                let tx = te.rows[row_ix].cells[cell_ix].text_x;
-                let y = top + table_row_top(t, row_ix) + rh / 2.;
-                let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 1.;
-                let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
-                let c = ed.read(cx).text().as_ref()[off..]
-                    .chars()
-                    .next()
-                    .unwrap_or('_');
-                assert_eq!(c, want, "单元格 (行{row_ix},列{cell_ix}) 应命中字符 {want}");
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn table_caret_aligns_with_clicked_cell(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table)
-                .expect("应有表格");
-            let t = row.table.as_ref().unwrap();
-            let te = row.table_edit.as_ref().unwrap();
-            let rh = f32::from(t.row_h);
-            let pad = f32::from(frame.padding);
-            let top = f32::from(row.top);
-            // 数据第 2 行第 2 格（"4"@源行3）：点击 → set_caret → caret x 应贴合点击 x。
-            let cell_ix = 1usize;
-            let row_ix = 2usize;
+#[gpui::test]
+fn table_click_lands_in_correct_cell(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格");
+        assert!(row.editable, "表格单元格应可编辑");
+        let t = row.table.as_ref().expect("表格渲染数据");
+        let te = row.table_edit.as_ref().expect("表格编辑排版");
+        let rh = f32::from(t.row_h);
+        let pad = f32::from(frame.padding);
+        let top = f32::from(row.top);
+        // (可见行, 列, 期望字符)：表头第一格 A；数据行2(源行3) 两格 3/4。
+        for (row_ix, cell_ix, want) in [(0usize, 0usize, 'A'), (2, 0, '3'), (2, 1, '4')] {
             let tx = te.rows[row_ix].cells[cell_ix].text_x;
-            let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 20.;
             let y = top + table_row_top(t, row_ix) + rh / 2.;
+            let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 1.;
             let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
-            ed.update(cx, |e, _| e.set_caret(off));
-            let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
-            assert!(on, "表格单元格应可放光标");
-            assert!(
-                (f32::from(caretx) - x).abs() < 12.,
-                "光标 x {} 应贴合点击 x {}（<1 字宽）",
-                f32::from(caretx),
-                x
-            );
-            let row_top_y = top + table_row_top(t, row_ix);
-            assert!(
-                f32::from(carety) >= row_top_y - 0.5 && f32::from(carety) <= row_top_y + rh + 0.5,
-                "光标 y {} 应在点击行带 [{row_top_y}, {}] 内",
-                f32::from(carety),
-                row_top_y + rh
-            );
-        });
-    }
+            let c = ed.read(cx).text().as_ref()[off..]
+                .chars()
+                .next()
+                .unwrap_or('_');
+            assert_eq!(c, want, "单元格 (行{row_ix},列{cell_ix}) 应命中字符 {want}");
+        }
+    });
+}
 
-    #[gpui::test]
-    fn all_text_rows_wrap_inside_content_box(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 回归（右侧留白对称的根因）：任意文本行（段落/标题/项目符号/引述/警报）的**折行宽**
-        // 必须 = 帧宽 − 帧内衬×2 − 本行 gutter(x_off)，使「padding + x_off + 折行宽」恰等于
-        // 内容盒右缘（`frame.width − padding`）。修复前正文折行拿 `frame.width`（只裁左内衬），
-        // 带 gutter 的行右缘越出内容盒被面板/滚动条裁——右侧留白比左侧小一个内衬/gutter。
-        // 与预览 `markdown::view` 的 `avail` 语义一致（命中/光标/划线同源）。
-        let text = format!(
-            "# {}\n\n- {}\n\n> [!NOTE] {}\n> {}\n\n> {}\n\n{}\n",
-            "很长标题".repeat(30),
-            "很长的项目符号内容".repeat(30),
-            "很长 callout 标题".repeat(30),
-            "callout 正文".repeat(30),
-            "很长引述".repeat(30),
-            "很长段落".repeat(30),
+#[gpui::test]
+fn table_caret_aligns_with_clicked_cell(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格");
+        let t = row.table.as_ref().unwrap();
+        let te = row.table_edit.as_ref().unwrap();
+        let rh = f32::from(t.row_h);
+        let pad = f32::from(frame.padding);
+        let top = f32::from(row.top);
+        // 数据第 2 行第 2 格（"4"@源行3）：点击 → set_caret → caret x 应贴合点击 x。
+        let cell_ix = 1usize;
+        let row_ix = 2usize;
+        let tx = te.rows[row_ix].cells[cell_ix].text_x;
+        let x = pad + table_cell_x0(&t.widths, cell_ix) + tx + 20.;
+        let y = top + table_row_top(t, row_ix) + rh / 2.;
+        let off = source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
+        ed.update(cx, |e, _| e.set_caret(off));
+        let (on, caretx, carety) = caret_geometry(ed.read(cx), &frame);
+        assert!(on, "表格单元格应可放光标");
+        assert!(
+            (f32::from(caretx) - x).abs() < 12.,
+            "光标 x {} 应贴合点击 x {}（<1 字宽）",
+            f32::from(caretx),
+            x
         );
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
+        let row_top_y = top + table_row_top(t, row_ix);
+        assert!(
+            f32::from(carety) >= row_top_y - 0.5 && f32::from(carety) <= row_top_y + rh + 0.5,
+            "光标 y {} 应在点击行带 [{row_top_y}, {}] 内",
+            f32::from(carety),
+            row_top_y + rh
+        );
+    });
+}
+
+#[gpui::test]
+fn all_text_rows_wrap_inside_content_box(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 回归（右侧留白对称的根因）：任意文本行（段落/标题/项目符号/引述/警报）的**折行宽**
+    // 必须 = 帧宽 − 帧内衬×2 − 本行 gutter(x_off)，使「padding + x_off + 折行宽」恰等于
+    // 内容盒右缘（`frame.width − padding`）。修复前正文折行拿 `frame.width`（只裁左内衬），
+    // 带 gutter 的行右缘越出内容盒被面板/滚动条裁——右侧留白比左侧小一个内衬/gutter。
+    // 与预览 `markdown::view` 的 `avail` 语义一致（命中/光标/划线同源）。
+    let text = format!(
+        "# {}\n\n- {}\n\n> [!NOTE] {}\n> {}\n\n> {}\n\n{}\n",
+        "很长标题".repeat(30),
+        "很长的项目符号内容".repeat(30),
+        "很长 callout 标题".repeat(30),
+        "callout 正文".repeat(30),
+        "很长引述".repeat(30),
+        "很长段落".repeat(30),
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
             let ed = host.read(cx).ed.clone();
             for w_px in [300.0, 500.0, 800.0] {
                 let frame = build_frame(ed.read(cx), window, px(w_px), (0., 999_999.));
@@ -2246,228 +2422,226 @@ tail
                 }
             }
         });
-    }
+}
 
-    #[gpui::test]
-    fn table_cell_edit_typing_and_boundary_guards(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| 1 | 2 |\n| --- | --- |\n| a | b |\n尾\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn table_cell_edit_typing_and_boundary_guards(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| 1 | 2 |\n| --- | --- |\n| a | b |\n尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            // 在数据行第一格 "a"（源行 2，位 2）内输入 X。
+            let ls = e.line_start(2);
+            e.set_caret(ls + 2);
+            e.replace_range(e.caret()..e.caret(), "X", cx);
+            assert!(
+                e.text().as_ref().contains("| Xa | b |"),
+                "格内输入生效：{}",
+                e.text().as_ref()
+            );
+            // 退格在格内容起点（'X'）→ no-op（守卫 `| ` 不被吃掉）。
+            e.set_caret(ls + 2);
+            e.backspace(cx);
+            assert!(
+                e.text().as_ref().contains("| Xa | b |"),
+                "格起点退格应被守卫：{}",
+                e.text().as_ref()
+            );
+            // 删除在格内容尾 → no-op（守卫 `|` 不被吃掉）。
+            let ls2 = e.line_start(2);
+            e.set_caret(ls2 + 4);
+            e.delete(cx);
+            assert!(
+                e.text().as_ref().contains("| Xa | b |"),
+                "格内容尾删除应被守卫：{}",
+                e.text().as_ref()
+            );
+            // 表格内回车 → no-op（不拆表）。
+            let before = e.text().as_ref().to_string();
+            e.set_caret(ls2 + 3);
+            e.newline(cx);
+            assert_eq!(
+                e.text().as_ref(),
+                &before,
+                "表格内回车应 no-op：{}",
+                e.text().as_ref()
+            );
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                // 在数据行第一格 "a"（源行 2，位 2）内输入 X。
-                let ls = e.line_start(2);
-                e.set_caret(ls + 2);
-                e.replace_range(e.caret()..e.caret(), "X", cx);
-                assert!(
-                    e.text().as_ref().contains("| Xa | b |"),
-                    "格内输入生效：{}",
-                    e.text().as_ref()
-                );
-                // 退格在格内容起点（'X'）→ no-op（守卫 `| ` 不被吃掉）。
-                e.set_caret(ls + 2);
-                e.backspace(cx);
-                assert!(
-                    e.text().as_ref().contains("| Xa | b |"),
-                    "格起点退格应被守卫：{}",
-                    e.text().as_ref()
-                );
-                // 删除在格内容尾 → no-op（守卫 `|` 不被吃掉）。
-                let ls2 = e.line_start(2);
-                e.set_caret(ls2 + 4);
-                e.delete(cx);
-                assert!(
-                    e.text().as_ref().contains("| Xa | b |"),
-                    "格内容尾删除应被守卫：{}",
-                    e.text().as_ref()
-                );
-                // 表格内回车 → no-op（不拆表）。
-                let before = e.text().as_ref().to_string();
-                e.set_caret(ls2 + 3);
-                e.newline(cx);
-                assert_eq!(
-                    e.text().as_ref(),
-                    &before,
-                    "表格内回车应 no-op：{}",
-                    e.text().as_ref()
-                );
-            });
-        });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn table_selection_highlight_paints_and_intersects_cells(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn table_selection_highlight_paints_and_intersects_cells(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格");
+        let te = row.table_edit.as_ref().expect("表格编辑排版");
+        // 源行：表头(0)、分隔(1)、数据(2~3)、段(4)。全选表头 + 两数据行。
+        ed.update(cx, |e, _| {
+            e.begin_selection_at(e.line_start(0));
+            e.extend_selection_to(e.line_end(3));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Table)
-                .expect("应有表格");
-            let te = row.table_edit.as_ref().expect("表格编辑排版");
-            // 源行：表头(0)、分隔(1)、数据(2~3)、段(4)。全选表头 + 两数据行。
-            ed.update(cx, |e, _| {
-                e.begin_selection_at(e.line_start(0));
-                e.extend_selection_to(e.line_end(3));
-            });
-            let sel = ed.read(cx).selection().expect("应有选区");
-            // 每个可见单元格源区间均与选区相交（选区盖住整个表格 → 2 列 × 3 行 = 6 格）。
-            let mut hit = 0usize;
-            for row_l in &te.rows {
-                let ls = ed.read(cx).line_start(row_l.src_line);
-                for cell in &row_l.cells {
-                    if cell_selection_display(
-                        &cell.map,
-                        cell.line.len(),
-                        cell.src.clone(),
-                        ls,
-                        &sel,
-                    )
+        let sel = ed.read(cx).selection().expect("应有选区");
+        // 每个可见单元格源区间均与选区相交（选区盖住整个表格 → 2 列 × 3 行 = 6 格）。
+        let mut hit = 0usize;
+        for row_l in &te.rows {
+            let ls = ed.read(cx).line_start(row_l.src_line);
+            for cell in &row_l.cells {
+                if cell_selection_display(&cell.map, cell.line.len(), cell.src.clone(), ls, &sel)
                     .is_some()
-                    {
-                        hit += 1;
-                    }
+                {
+                    hit += 1;
                 }
             }
-            assert_eq!(hit, 6, "2 列 × 3 可见行 = 6 格全部与选区相交");
-            // 带选区注入帧并触发一次真实绘制（element 的 paint 会调用 paint_selection，
-            // 表格分支不 panic 即通过）。
-            ed.update(cx, |e, _| {
-                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
-            });
-            let _ = window.draw(cx);
+        }
+        assert_eq!(hit, 6, "2 列 × 3 可见行 = 6 格全部与选区相交");
+        // 带选区注入帧并触发一次真实绘制（element 的 paint 会调用 paint_selection，
+        // 表格分支不 panic 即通过）。
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
         });
-    }
+        let _ = window.draw(cx);
+    });
+}
 
-    #[gpui::test]
-    fn wy_search_highlight_resolves_query_range(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        // 预览独有能力搬入统一组件：`highlight_search(line, query)` → 命中的绝对源区间。
-        let text = "alpha beta\ngamma delta\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn wy_search_highlight_resolves_query_range(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    // 预览独有能力搬入统一组件：`highlight_search(line, query)` → 命中的绝对源区间。
+    let text = "alpha beta\ngamma delta\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            // 命中第 0 行 "beta"（源字节 6..10），大小写不敏感（内部小写化）。
+            e.highlight_search(0, "BETA", cx);
+            assert_eq!(
+                e.search_highlight_range(),
+                Some(6..10),
+                "命中词应解析为绝对源区间"
+            );
+            // 行内无命中 → None。
+            e.highlight_search(0, "zzz", cx);
+            assert_eq!(e.search_highlight_range(), None, "行内无命中 → None");
+            // 清除 → 无高亮。
+            e.highlight_search(0, "beta", cx);
+            assert_eq!(e.search_highlight_range(), Some(6..10));
+            e.clear_highlight();
+            assert_eq!(e.search_highlight_range(), None, "清除后应无高亮");
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                // 命中第 0 行 "beta"（源字节 6..10），大小写不敏感（内部小写化）。
-                e.highlight_search(0, "BETA", cx);
-                assert_eq!(e.search_highlight_range(), Some(6..10), "命中词应解析为绝对源区间");
-                // 行内无命中 → None。
-                e.highlight_search(0, "zzz", cx);
-                assert_eq!(e.search_highlight_range(), None, "行内无命中 → None");
-                // 清除 → 无高亮。
-                e.highlight_search(0, "beta", cx);
-                assert_eq!(e.search_highlight_range(), Some(6..10));
-                e.clear_highlight();
-                assert_eq!(e.search_highlight_range(), None, "清除后应无高亮");
-            });
-        });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn wy_search_highlight_cleared_on_source_change(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("alpha beta\n"));
-            WyHost { ed }
+#[gpui::test]
+fn wy_search_highlight_cleared_on_source_change(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("alpha beta\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.highlight_search(0, "beta", cx);
+            assert_eq!(e.search_highlight_range(), Some(6..10));
+            // 换源（如打开另一文件）→ 高亮清空。
+            e.set_source_text("gamma delta\n");
+            assert_eq!(e.search_highlight_range(), None, "换源应清高亮");
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.highlight_search(0, "beta", cx);
-                assert_eq!(e.search_highlight_range(), Some(6..10));
-                // 换源（如打开另一文件）→ 高亮清空。
-                e.set_source_text("gamma delta\n");
-                assert_eq!(e.search_highlight_range(), None, "换源应清高亮");
-            });
-        });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn wy_search_highlight_paints_without_panic(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "alpha beta\ncode block\n| A | beta |\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn wy_search_highlight_paints_without_panic(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "alpha beta\ncode block\n| A | beta |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| e.highlight_search(0, "beta", cx));
+        // 带高亮状态注入帧并触发真实绘制（paint_search_highlight 走选区几何，
+        // 表格/文本分支均不 panic）。
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| e.highlight_search(0, "beta", cx));
-            // 带高亮状态注入帧并触发真实绘制（paint_search_highlight 走选区几何，
-            // 表格/文本分支均不 panic）。
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            ed.update(cx, |e, _| {
-                *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame));
-            });
-            let _ = window.draw(cx);
-        });
-    }
+        let _ = window.draw(cx);
+    });
+}
 
-    #[gpui::test]
-    fn table_arrow_nav_skips_delimiter(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n尾\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn table_arrow_nav_skips_delimiter(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |\n尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _cx| {
+            // 表头（行 0）down → 首数据行（行 2，跳过分隔行 1）。
+            e.set_caret(e.line_start(0) + 2);
+            e.move_down();
+            assert_eq!(e.row_col(e.caret()).0, 2, "表头 down 应到首数据行");
+            // 数据行 up → 上一数据行。
+            e.set_caret(e.line_start(3) + 4);
+            e.move_up();
+            assert_eq!(e.row_col(e.caret()).0, 2, "次数据行 up 应到首数据行");
+            // 首数据行 up → 表头（跳过分隔行）。
+            e.move_up();
+            assert_eq!(e.row_col(e.caret()).0, 0, "首数据行 up 应到表头");
+            // 末数据行 down → 出表到尾段（行 4）。
+            e.set_caret(e.line_start(3) + 4);
+            e.move_down();
+            assert_eq!(e.row_col(e.caret()).0, 4, "末数据行 down 应出表到尾段");
+            // 单元格内 Left：行首 Left 被钳在格内容（不落管道空白）。
+            e.set_caret(e.line_start(2) + 2); // "1"
+            e.move_left();
+            {
+                let (l, c) = e.row_col(e.caret());
+                assert_eq!(l, 2, "内容行 Left 不应出表");
+                assert_eq!(c, 2, "格内容起点 Left 被钳在格内（col {c}）");
+            }
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _cx| {
-                // 表头（行 0）down → 首数据行（行 2，跳过分隔行 1）。
-                e.set_caret(e.line_start(0) + 2);
-                e.move_down();
-                assert_eq!(e.row_col(e.caret()).0, 2, "表头 down 应到首数据行");
-                // 数据行 up → 上一数据行。
-                e.set_caret(e.line_start(3) + 4);
-                e.move_up();
-                assert_eq!(e.row_col(e.caret()).0, 2, "次数据行 up 应到首数据行");
-                // 首数据行 up → 表头（跳过分隔行）。
-                e.move_up();
-                assert_eq!(e.row_col(e.caret()).0, 0, "首数据行 up 应到表头");
-                // 末数据行 down → 出表到尾段（行 4）。
-                e.set_caret(e.line_start(3) + 4);
-                e.move_down();
-                assert_eq!(e.row_col(e.caret()).0, 4, "末数据行 down 应出表到尾段");
-                // 单元格内 Left：行首 Left 被钳在格内容（不落管道空白）。
-                e.set_caret(e.line_start(2) + 2); // "1"
-                e.move_left();
-                {
-                    let (l, c) = e.row_col(e.caret());
-                    assert_eq!(l, 2, "内容行 Left 不应出表");
-                    assert_eq!(c, 2, "格内容起点 Left 被钳在格内（col {c}）");
-                }
-            });
-        });
-    }
+    });
+}
 
-    #[gpui::test]
-    fn new_features_shape_gutters_cards_links(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        use super::{BlockCard, LinkHit, RowGutter};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn new_features_shape_gutters_cards_links(cx: &mut TestAppContext) {
+    use super::{BlockCard, LinkHit, RowGutter};
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 # 标题
 
 - [x] 完成
@@ -2487,90 +2661,100 @@ graph TD
 A-->B
 ```
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            // C1: 任务行 gutter = Check；未勾选行在 src 行 3。
-            let check = frame
-                .rows
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // C1: 任务行 gutter = Check；未勾选行在 src 行 3。
+        let check = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Check { checked: false })))
+            .expect("应有未勾选任务行");
+        assert_eq!(check.src_line, 3, "`- [ ] 待办` 的源行");
+        // C3: 警报 marker 行 gutter = Alert；其下 body 行折叠成 0 高。
+        let alert = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
+            .expect("应有警报行");
+        assert_eq!(alert.src_line, 5, "`> [!NOTE]-` marker 源行");
+        // 折叠 callout 主体（src 6）0 高不物化，高度经布局断言。
+        let folded_ix = frame
+            .block_index_for_src_line(6)
+            .expect("callout 主体块应存在");
+        assert_eq!(
+            frame.block_height(folded_ix),
+            0.,
+            "折叠 callout 主体应 0 高"
+        );
+        // C5: 有可点击链接的行。
+        let linkrow = frame
+            .rows
+            .iter()
+            .find(|r| !r.extra.links.is_empty())
+            .expect("应有链接行");
+        assert!(
+            linkrow
+                .extra
+                .links
                 .iter()
-                .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Check { checked: false })))
-                .expect("应有未勾选任务行");
-            assert_eq!(check.src_line, 3, "`- [ ] 待办` 的源行");
-            // C3: 警报 marker 行 gutter = Alert；其下 body 行折叠成 0 高。
-            let alert = frame
-                .rows
-                .iter()
-                .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
-                .expect("应有警报行");
-            assert_eq!(alert.src_line, 5, "`> [!NOTE]-` marker 源行");
-            // 折叠 callout 主体（src 6）0 高不物化，高度经布局断言。
-            let folded_ix = frame.block_index_for_src_line(6).expect("callout 主体块应存在");
-            assert_eq!(frame.block_height(folded_ix), 0., "折叠 callout 主体应 0 高");
-            // C5: 有可点击链接的行。
-            let linkrow = frame
-                .rows
-                .iter()
-                .find(|r| !r.extra.links.is_empty())
-                .expect("应有链接行");
-            assert!(
-                linkrow.extra.links.iter().any(|l| matches!(l.target, LinkHit::Url(_))),
-                "应命中 URL 链接"
-            );
-            // B2: 行内数学 splice 成 spacer 并翻译成 Unicode 排版（`x^2` → `x²`）。
-            let math_row = frame
-                .rows
-                .iter()
-                .find(|r| !r.extra.inline_maths.is_empty())
-                .expect("应有行内数学");
-            let im = &math_row.extra.inline_maths[0];
-            assert!(
-                im.latex.as_ref().contains('²') || im.latex.as_ref().contains('π'),
-                "行内数学应翻译成 Unicode：「{}」",
-                im.latex
-            );
-            assert!(
-                !math_row.extra.links.is_empty(),
-                "含 `[text](url)` 的行应为可点击链接"
-            );
-            // A1: 数学块折叠成 Math 卡片（整块一行）。
-            let mathcard = frame
-                .rows
-                .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
-                .expect("应有数学卡片");
-            assert!(f32::from(mathcard.height) >= 40., "数学卡片高");
-            assert_eq!(mathcard.src_lines, 10..13, "数学卡片覆盖 `$$…$$` 块");
-            // A2: mermaid 围栏 → Mermaid 卡片。
-            let mm = frame
-                .rows
-                .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
-                .expect("应有 mermaid 卡片");
-            assert!(
-                f32::from(mm.height) >= 100.,
-                "mermaid 卡片高按层数计算：{}",
-                f32::from(mm.height)
-            );
-            let _ = IrKind::Paragraph;
-        });
-    }
+                .any(|l| matches!(l.target, LinkHit::Url(_))),
+            "应命中 URL 链接"
+        );
+        // B2: 行内数学 splice 成 spacer 并翻译成 Unicode 排版（`x^2` → `x²`）。
+        let math_row = frame
+            .rows
+            .iter()
+            .find(|r| !r.extra.inline_maths.is_empty())
+            .expect("应有行内数学");
+        let im = &math_row.extra.inline_maths[0];
+        assert!(
+            im.latex.as_ref().contains('²') || im.latex.as_ref().contains('π'),
+            "行内数学应翻译成 Unicode：「{}」",
+            im.latex
+        );
+        assert!(
+            !math_row.extra.links.is_empty(),
+            "含 `[text](url)` 的行应为可点击链接"
+        );
+        // A1: 数学块折叠成 Math 卡片（整块一行）。
+        let mathcard = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+            .expect("应有数学卡片");
+        assert!(f32::from(mathcard.height) >= 40., "数学卡片高");
+        assert_eq!(mathcard.src_lines, 10..13, "数学卡片覆盖 `$$…$$` 块");
+        // A2: mermaid 围栏 → Mermaid 卡片。
+        let mm = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+            .expect("应有 mermaid 卡片");
+        assert!(
+            f32::from(mm.height) >= 100.,
+            "mermaid 卡片高按层数计算：{}",
+            f32::from(mm.height)
+        );
+        let _ = IrKind::Paragraph;
+    });
+}
 
-    #[gpui::test]
-    fn mermaid_renders_diagram_to_image(cx: &mut TestAppContext) {
-        // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
-        // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
-        use super::{BlockCard, mm_layout};
-        let out_dir = std::env::temp_dir().join("kilo");
-        let _ = std::fs::create_dir_all(&out_dir);
-        const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn mermaid_renders_diagram_to_image(cx: &mut TestAppContext) {
+    // mermaid 卡片：层式布局（4 节点 3 边）+ 高度按层数算 + 把**同一套几何**
+    // 光栅化成 PNG（盒子+连线+箭头），供外部识图核验“真图”。
+    use super::{BlockCard, mm_layout};
+    let out_dir = std::env::temp_dir().join("kilo");
+    let _ = std::fs::create_dir_all(&out_dir);
+    const SRC: &str = "A[开始] --> B{判断}\nB -->|是| C[完成]\nB -->|否| D[返回]";
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 # 标题
 
 ```mermaid
@@ -2582,47 +2766,53 @@ graph TD
 
 尾段
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (card_h, n_nodes, n_edges, png_path, ink, size) =
-            vcx.update(|window, cx| {
-                let ed = host.read(cx).ed.clone();
-                let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-                let mm = frame
-                    .rows
-                    .iter()
-                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
-                    .expect("应有 mermaid 卡片");
-                let card_h = f32::from(mm.height);
-                let theme = ed.read(cx).theme.clone();
-                let layout = mm_layout(window, &theme, SRC, 0., 0., 560.);
-                let (placed, edges) = match &layout {
-                    super::MmLayout::Flow(f) => (&f.placed, &f.edges),
-                    _ => panic!("应为 flowchart 布局"),
-                };
-                let (img, ink) = rasterize_mm_png(placed, edges);
-                let path = out_dir.join("mermaid_check.png");
-                let saved = img.save(&path).is_ok();
-                assert!(saved, "应能保存 PNG");
-                let size = (img.width(), img.height());
-                (card_h, placed.len(), edges.len(), path.to_string_lossy().to_string(), ink, size)
-            });
-        assert!(card_h >= 100., "卡片高按层数计算：{card_h}");
-        assert_eq!(n_nodes, 4, "4 个节点");
-        assert_eq!(n_edges, 3, "3 条边");
-        assert!(ink > 300, "PNG 应画出盒子/连线（非白像素 {ink}）");
-        eprintln!("mermaid PNG 已导出：{png_path}（{size:?}，涂墨 {ink}px）");
-    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (card_h, n_nodes, n_edges, png_path, ink, size) = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let mm = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+            .expect("应有 mermaid 卡片");
+        let card_h = f32::from(mm.height);
+        let theme = ed.read(cx).theme.clone();
+        let layout = mm_layout(window, &theme, SRC, 0., 0., 560.);
+        let (placed, edges) = match &layout {
+            super::MmLayout::Flow(f) => (&f.placed, &f.edges),
+            _ => panic!("应为 flowchart 布局"),
+        };
+        let (img, ink) = rasterize_mm_png(placed, edges);
+        let path = out_dir.join("mermaid_check.png");
+        let saved = img.save(&path).is_ok();
+        assert!(saved, "应能保存 PNG");
+        let size = (img.width(), img.height());
+        (
+            card_h,
+            placed.len(),
+            edges.len(),
+            path.to_string_lossy().to_string(),
+            ink,
+            size,
+        )
+    });
+    assert!(card_h >= 100., "卡片高按层数计算：{card_h}");
+    assert_eq!(n_nodes, 4, "4 个节点");
+    assert_eq!(n_edges, 3, "3 条边");
+    assert!(ink > 300, "PNG 应画出盒子/连线（非白像素 {ink}）");
+    eprintln!("mermaid PNG 已导出：{png_path}（{size:?}，涂墨 {ink}px）");
+}
 
-    #[gpui::test]
-    fn mermaid_sequence_renders_card(cx: &mut TestAppContext) {
-        // sequenceDiagram 围栏 → 序列图卡片：参与者在首见顺序、消息行数、激活条。
-        use super::BlockCard;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn mermaid_sequence_renders_card(cx: &mut TestAppContext) {
+    // sequenceDiagram 围栏 → 序列图卡片：参与者在首见顺序、消息行数、激活条。
+    use super::BlockCard;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 # 标题
 
 ```mermaid
@@ -2635,612 +2825,764 @@ sequenceDiagram
 
 尾段
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let mm = frame
-                .rows
-                .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
-                .expect("应有 mermaid 序列图卡片");
-            let laid = mm.mm.as_ref().expect("有缓存布局");
-            match &**laid {
-                super::MmLayout::Seq(s) => {
-                    assert_eq!(s.seq.messages.len(), 2, "两条消息");
-                    assert_eq!(s.columns.len(), 2, "两个参与者");
-                    assert!(s.columns[0].is_actor, "用户是 actor");
-                    assert_eq!(s.columns[1].label, "API 网关", "participant … as 别名");
-                    assert_eq!(s.activations.len(), 1, "一条激活条（含 + / - 配对）");
-                    assert!(f32::from(mm.height) >= 46. + 2. * 26., "卡高按行数");
-                    assert!(s.columns[1].x > s.columns[0].x, "列从左到右排");
-                }
-                other => panic!("应为序列图布局，实际 {other:?}"),
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let mm = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+            .expect("应有 mermaid 序列图卡片");
+        let laid = mm.mm.as_ref().expect("有缓存布局");
+        match &**laid {
+            super::MmLayout::Seq(s) => {
+                assert_eq!(s.seq.messages.len(), 2, "两条消息");
+                assert_eq!(s.columns.len(), 2, "两个参与者");
+                assert!(s.columns[0].is_actor, "用户是 actor");
+                assert_eq!(s.columns[1].label, "API 网关", "participant … as 别名");
+                assert_eq!(s.activations.len(), 1, "一条激活条（含 + / - 配对）");
+                assert!(f32::from(mm.height) >= 46. + 2. * 26., "卡高按行数");
+                assert!(s.columns[1].x > s.columns[0].x, "列从左到右排");
             }
-        });
-    }
-
-    #[gpui::test]
-    fn mermaid_flow_lr_orders_columns(cx: &mut TestAppContext) {
-        // LR 方向：层沿 +x 增长 → A.x < B.x < C.x（方向参数化生效）。
-        use super::{mm_layout, MmLayout};
-        cx.update(crate::actions::bind_local_keymaps);
-        const SRC: &str = "flowchart LR\nA-->B\nB-->C";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("```mermaid\ngraph LR\nA-->B\n```"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            match mm_layout(window, &theme, SRC, 0., 0., 800.) {
-                MmLayout::Flow(f) => {
-                    let node = |id: &str| f.placed.iter().find(|p| p.id == id && !p.virtual_node).expect("节点");
-                    let (ax, aw, bx, bw, cx, cw_) = (node("A").x, node("A").w, node("B").x, node("B").w, node("C").x, node("C").w);
-                    assert!(ax < bx && bx < cx, "LR: A<B<C 沿 x");
-                    // 相邻列不再重叠（05 左挤修复：列宽按该列最宽节点推进）。
-                    assert!(ax + aw <= bx, "LR: A 右边不与 B 重叠（{ax}+{aw} vs {bx}）");
-                    assert!(bx + bw <= cx, "LR: B 右边不与 C 重叠");
-                    let _ = (cx, cw_);
-                    assert_eq!(f.edges.len(), 2, "两条边");
-                }
-                other => panic!("应为 flowchart 布局，实际 {other:?}"),
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn mermaid_lr_edges_attach_to_node_edges(cx: &mut TestAppContext) {
-        // 回归「连线歪斜」：LR 边钉在节点**右/左边缘中心**，同行边为水平直线，
-        // 异行边为水平-垂直-水平直角折线（起终点都在边缘、直线段与行对齐）。
-        use super::{mm_layout, MmLayout};
-        cx.update(crate::actions::bind_local_keymaps);
-        const SRC: &str = "flowchart LR\nX[引擎] --> Y[阶段1] & Z[阶段2]\nY --> W\nZ --> W";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            match mm_layout(window, &theme, SRC, 0., 0., 800.) {
-                MmLayout::Flow(f) => {
-                    let node = |id: &str| f.placed.iter().find(|p| p.id == id && !p.virtual_node).unwrap();
-                    let edge = |from: &str, to: &str| {
-                        f.edges.iter().find(|e| f.placed[e.a].id == from && f.placed[e.b].id == to).expect("边")
-                    };
-                    // X→Y 同行：起点= X 右缘中心，终点= Y 左缘中心，全程同一 y → 水平直线。
-                    let xy = edge("X", "Y");
-                    let (xp, yp) = (node("X"), node("Y"));
-                    assert_eq!(xy.points.first().unwrap().0, xp.x + xp.w, "X→Y 起点钉 X 右缘");
-                    assert_eq!(xy.points.first().unwrap().1, xp.y + xp.h / 2., "X→Y 起点钉行中线");
-                    assert_eq!(xy.points.last().unwrap().0, yp.x, "X→Y 终点钉 Y 左缘");
-                    assert!(xy.points.iter().all(|p| (p.1 - (xp.y + xp.h / 2.)).abs() < 0.01), "X→Y 水平直线");
-                    // X→Z 异行：直角折线，中间两段共享同一 x（竖直段），两端钉边缘。
-                    let xz = edge("X", "Z");
-                    let zp = node("Z");
-                    assert_eq!(xz.points.first().unwrap().0, xp.x + xp.w, "X→Z 起点钉 X 右缘");
-                    assert_eq!(xz.points.last().unwrap().0, zp.x, "X→Z 终点钉 Z 左缘");
-                    assert_eq!(xz.points.len(), 4, "X→Z 为 4 段直角折线");
-                    assert_eq!(xz.points[1].0, xz.points[2].0, "竖直段 x 对齐");
-                    // Y→W 同行水平直线；Z→W 异行直角。
-                    let yw = edge("Y", "W");
-                    let wp = node("W");
-                    assert_eq!(yw.points.first().unwrap().0, yp.x + yp.w);
-                    assert_eq!(yw.points.last().unwrap().0, wp.x);
-                    assert!(yw.points.iter().all(|p| (p.1 - (yp.y + yp.h / 2.)).abs() < 0.01));
-                    assert_eq!(xz.points.last().unwrap().1, zp.y + zp.h / 2., "X→Z 终点水平段在 Z 行");
-                }
-                other => panic!("应为 flowchart 布局，实际 {other:?}"),
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
-        // 滚轮缩放须**先点击聚焦该 mermaid 卡**：未聚焦时滚轮放行（给宿主正常滚动，
-        // 不再「往下滚遇到 mermaid 就缩图」）；点击卡置聚焦后才缩放；点击它处解除聚焦。
-        // Ctrl 滚轮放行给宿主全局缩放；非卡区域滚轮不改缩放。
-        use super::BlockCard;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "# 标题\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let mrow = frame
-                .rows
-                .iter()
-                .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
-                .expect("应有 mermaid 卡片");
-            let block = mrow.src_line;
-            // 元素 bounds 占满 600×2000（手工置 last_bounds，模拟 paint 期产物）。
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(2000.)))));
-            });
-            let card_y = f32::from(mrow.top) + 10.;
-            let wheel = |ctrl: bool| gpui::ScrollWheelEvent {
-                position: point(px(300.), px(card_y)),
-                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
-                modifiers: gpui::Modifiers { control: ctrl, ..Default::default() },
-                ..Default::default()
-            };
-            let down_at = |y: f32| MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(300.), px(y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            // 1) 未聚焦：悬停卡片滚轮 → 不消费（正常滚动），不改缩放。
-            let before = ed.read(cx).mermaid_zoom(block);
-            let consumed0 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
-            assert!(!consumed0, "未聚焦时滚轮应放行（正常滚动）");
-            assert_eq!(ed.read(cx).mermaid_zoom(block), before, "未聚焦滚轮不改缩放");
-            // 2) 点击卡片 → 聚焦。
-            let d = down_at(card_y);
-            ed.update(cx, |e, c| e.on_mouse_down(&d, window, c));
-            assert_eq!(ed.read(cx).focused_mermaid(), Some(block), "点击卡片应聚焦该 mermaid");
-            // 3) 聚焦后：滚轮 → 消费并放大。
-            let consumed1 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
-            let after = ed.read(cx).mermaid_zoom(block);
-            assert!(consumed1, "聚焦后悬停卡片滚轮应消费");
-            assert!(after > before, "普通滚轮应放大 mermaid 卡：{before} → {after}");
-            // 4) Ctrl 滚轮：mermaid 不放行（宿主 zoom_overlay 管全局字号）。
-            let consumed_ctrl = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(true), window, c));
-            assert!(!consumed_ctrl, "Ctrl 滚轮不放行给 mermaid");
-            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "Ctrl 滚轮不改 mermaid 缩放");
-            // 5) 点击卡片外（普通文本区）→ 清除聚焦 → 滚轮再次放行。
-            let dm = down_at(8.0);
-            ed.update(cx, |e, c| e.on_mouse_down(&dm, window, c));
-            assert_eq!(ed.read(cx).focused_mermaid(), None, "点击卡片外应清除聚焦");
-            let consumed2 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
-            assert!(!consumed2, "清除聚焦后滚轮应再次放行（正常滚动）");
-            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "清除聚焦后滚轮不改缩放");
-            // 6) 完全没聚焦时的非卡区域滚轮：不消费、不改缩放（历史分支仍成立）。
-            let miss = gpui::ScrollWheelEvent {
-                position: point(px(300.), px(8.)),
-                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
-                ..Default::default()
-            };
-            let consumed_miss = ed.update(cx, |e, c| e.on_scroll_wheel(&miss, window, c));
-            assert!(!consumed_miss, "卡片外滚轮不应消费");
-            assert_eq!(ed.read(cx).mermaid_zoom(block), after, "卡片外滚轮不改缩放");
-        });
-    }
-
-    /// 把布局几何光栅化成 PNG（盒子边框 + 连线 + 箭头；中文标签不进位图，
-    /// 由「框 + 箭头」结构本身表明这是一张流程图）。
-    fn rasterize_mm_png(
-        placed: &[super::MmPlaced],
-        edges: &[super::MmPolylineEdge],
-    ) -> (image::RgbaImage, usize) {
-        const PAD: i32 = 40;
-        if placed.is_empty() {
-            return (image::RgbaImage::new(1, 1), 0);
+            other => panic!("应为序列图布局，实际 {other:?}"),
         }
-        let mut x0f = f32::MAX;
-        let mut y0f = f32::MAX;
-        let mut x1f = f32::MIN;
-        let mut y1f = f32::MIN;
-        for p in placed {
-            x0f = x0f.min(p.x);
-            y0f = y0f.min(p.y);
-            x1f = x1f.max(p.x + p.w);
-            y1f = y1f.max(p.y + p.h);
+    });
+}
+
+#[gpui::test]
+fn mermaid_flow_lr_orders_columns(cx: &mut TestAppContext) {
+    // LR 方向：层沿 +x 增长 → A.x < B.x < C.x（方向参数化生效）。
+    use super::{MmLayout, mm_layout};
+    cx.update(crate::actions::bind_local_keymaps);
+    const SRC: &str = "flowchart LR\nA-->B\nB-->C";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed =
+            cx.new(|cx| WyEditor::new(window, cx).with_text("```mermaid\ngraph LR\nA-->B\n```"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        match mm_layout(window, &theme, SRC, 0., 0., 800.) {
+            MmLayout::Flow(f) => {
+                let node = |id: &str| {
+                    f.placed
+                        .iter()
+                        .find(|p| p.id == id && !p.virtual_node)
+                        .expect("节点")
+                };
+                let (ax, aw, bx, bw, cx, cw_) = (
+                    node("A").x,
+                    node("A").w,
+                    node("B").x,
+                    node("B").w,
+                    node("C").x,
+                    node("C").w,
+                );
+                assert!(ax < bx && bx < cx, "LR: A<B<C 沿 x");
+                // 相邻列不再重叠（05 左挤修复：列宽按该列最宽节点推进）。
+                assert!(ax + aw <= bx, "LR: A 右边不与 B 重叠（{ax}+{aw} vs {bx}）");
+                assert!(bx + bw <= cx, "LR: B 右边不与 C 重叠");
+                let _ = (cx, cw_);
+                assert_eq!(f.edges.len(), 2, "两条边");
+            }
+            other => panic!("应为 flowchart 布局，实际 {other:?}"),
         }
-        let w = ((x1f - x0f) as i32 + 2 * PAD).max(8);
-        let h = ((y1f - y0f) as i32 + 2 * PAD).max(8);
-        let mut img = image::RgbaImage::from_pixel(
-            w as u32,
-            h as u32,
-            image::Rgba([255, 255, 255, 255]),
-        );
-        let ox = -x0f as i32 + PAD;
-        let oy = -y0f as i32 + PAD;
-        let mut ink = 0usize;
-        let dark = [40u8, 45, 60, 255];
-        let fill = [235u8, 238, 245, 255];
-        // 边：三层折线 + 箭头。
-        for e in edges {
-            let (pa, pb) = (&placed[e.a], &placed[e.b]);
-            let ax = (pa.x + pa.w / 2.) as i32 + ox;
-            let ay = (pa.y + pa.h) as i32 + oy;
-            let bx = (pb.x + pb.w / 2.) as i32 + ox;
-            let by = pb.y as i32 + oy;
-            let midy = (ay + by) / 2;
-            if (bx - ax).abs() < 2 {
-                mm_blit(&mut img, &mut ink, ax, ay, bx, by - 4, dark);
-            } else {
-                mm_blit(&mut img, &mut ink, ax, ay, ax, midy, dark);
-                mm_blit(&mut img, &mut ink, ax, midy, bx, midy, dark);
-                mm_blit(&mut img, &mut ink, bx, midy, bx, by - 4, dark);
-            }
-            mm_blit(&mut img, &mut ink, bx - 4, by - 6, bx, by - 1, dark);
-            mm_blit(&mut img, &mut ink, bx + 4, by - 6, bx, by - 1, dark);
-        }
-        // 节点：填充 + 边框。
-        for p in placed {
-            let (x0, y0) = (p.x as i32 + ox, p.y as i32 + oy);
-            let (x1, y1) = ((p.x + p.w) as i32 + ox, (p.y + p.h) as i32 + oy);
-            for yy in y0..=y1 {
-                for xx in x0..=x1 {
-                    if xx >= 0 && yy >= 0 && (xx as u32) < img.width() && (yy as u32) < img.height() {
-                        img.put_pixel(xx as u32, yy as u32, fill.into());
-                        ink += 1;
-                    }
-                }
-            }
-            mm_blit(&mut img, &mut ink, x0, y0, x1, y0, dark);
-            mm_blit(&mut img, &mut ink, x0, y1, x1, y1, dark);
-            mm_blit(&mut img, &mut ink, x0, y0, x0, y1, dark);
-            mm_blit(&mut img, &mut ink, x1, y0, x1, y1, dark);
-        }
-        (img, ink)
-    }
+    });
+}
 
-    fn mm_blit(img: &mut image::RgbaImage, ink: &mut usize, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 4]) {
-        let (w, h) = (img.width() as i32, img.height() as i32);
-        let (mut x0, mut y0) = (x0, y0);
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        loop {
-            if x0 >= 0 && y0 >= 0 && x0 < w && y0 < h {
-                img.put_pixel(x0 as u32, y0 as u32, c.into());
-                *ink += 1;
-            }
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
-
-    #[gpui::test]
-    fn callout_fold_click_path_round_trips(cx: &mut TestAppContext) {
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        use super::{Frame, RowGutter};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "> [!NOTE]- 甲\n> 乙\n> 丙\n尾";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(600.)))));
-            });
-            let chevron_point = |f: &Frame| {
-                let marker = f
-                    .rows
-                    .iter()
-                    .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
-                    .expect("应有警报 marker 行");
-                let y = f32::from(marker.top) + f32::from(marker.height) / 2.;
-                point(px(12. + 40.), px(y))
-            };
-            // 折叠态 → 点击展开。
-            let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1)));
-            let f1 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
-            let ev1 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: chevron_point(&f1),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
-            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"), "点击应展开");
-            // 展开态 → 再点折叠回。
-            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2)));
-            let f2 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
-            let ev2 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: chevron_point(&f2),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再点应折叠回");
-            assert_eq!(ed.read(cx).text().as_ref(), text, "往返后内容还原");
-            // 关键断言：折叠后 body 行必须真正折叠（0 高）——光标在 marker 行也不得被 reveal 弹开。
-            // 折叠 body 0 高不物化，高度经布局 `block_height` 断言。
-            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body_ix = frame3.block_index_for_src_line(1).expect("callout 主体块应存在");
-            assert_eq!(frame3.block_height(body_ix), 0., "点击折叠后 body 应真正折叠（回归）");
-        });
-    }
-
-    #[gpui::test]
-    fn two_callouts_fold_independently_with_caret_on_marker(cx: &mut TestAppContext) {
-        // 回归：两个 callout 相邻（中间空行）。各自折叠/展开应互不影响；
-        // 尤其「光标落在 marker 行（点击折叠后的常态）」时，该 callout 仍要真正折叠。
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "> [!NOTE]- 点击箭头折叠\n> 主体一\n> 主体二\n\n> [!WARNING]- 警告\n> 警告内容。\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 光标在 NOTE marker 行：两个 callout 的 body 都应折叠。
-            ed.update(cx, |e, _| e.set_caret(0));
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let note_ix = frame.block_index_for_src_line(1).expect("NOTE 主体块");
-            let warn_ix = frame.block_index_for_src_line(5).expect("WARNING 主体块");
-            assert_eq!(frame.block_height(note_ix), 0., "光标在 marker 行时 NOTE body 也应折叠");
-            assert_eq!(frame.block_height(warn_ix), 0., "WARNING body 也应折叠");
-            // 展开 NOTE → 再折叠（光标仍在 NOTE marker 行）。
-            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
-            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"), "先展开");
-            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
-            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "再折叠回");
-            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let note2_ix = frame2.block_index_for_src_line(1).expect("NOTE 主体块");
-            assert_eq!(
-                frame2.block_height(note2_ix), 0.,
-                "折叠后 NOTE body 应真正折叠（不是 reveal）"
-            );
-            // 互不影响：折叠 WARNING 不应改动 NOTE。
-            ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(4, cx));
-            assert!(ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"), "NOTE 折叠态保持");
-            assert!(
-                ed.read(cx).text().as_ref().find("> [!WARNING]+").is_some()
-                    || ed.read(cx).text().as_ref().find("> [!WARNING]-").is_some(),
-                "WARNING 折叠符存在"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn heading_chevron_click_round_trips(cx: &mut TestAppContext) {
-        // 标题折叠箭头 → 视图本地折叠态翻转（不写源码、不进撤销栈）：`## 甲` 的
-        // section body 行折叠成 0 高；再点展开还原。折叠后光标停在标题行，不得被
-        // reveal 弹开（与 callout 的坑 P 同一教训）。
-        use super::Frame;
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "## 甲\nbody 一\nbody 二\n## 乙\n尾";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(point(px(0.), px(0.)), size(px(600.), px(600.)))));
-            });
-            let chevron_point = |f: &Frame| {
-                let heading = f
-                    .rows
-                    .iter()
-                    .find(|r| matches!(r.kind, crate::markdown::ir::IrKind::Heading(_)))
-                    .expect("应有标题行");
-                let (cx0, _) = super::heading_chevron_box(f, heading).unwrap();
-                let y = f32::from(heading.top) + f32::from(heading.lh) / 2.;
-                point(px(cx0 + 8.), px(y))
-            };
-            // 折叠 `## 甲`（单击标题行左缘箭头）：body 行真正折叠（0 高）。
-            let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1)));
-            let f1 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
-            let ev1 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: chevron_point(&f1),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
-            assert!(
-                ed.read(cx).folded_headings.borrow().contains("## 甲"),
-                "点击标题箭头应折叠"
-            );
-            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body_ix = frame2.block_index_for_src_line(1).expect("body 块");
-            assert_eq!(frame2.block_height(body_ix), 0., "折叠后 body 应真正折叠");
-            let h2 = frame2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
-            assert!(f32::from(h2.height) > 0., "标题行本身保留");
-            // 展开回：body 高度恢复，文本不变（视图本地，不写源码）。
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2)));
-            let f2 = ed.read(cx).frame.borrow().as_ref().map(std::rc::Rc::clone).unwrap();
-            let ev2 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: chevron_point(&f2),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-            assert!(
-                !ed.read(cx).folded_headings.borrow().contains("## 甲"),
-                "再点应展开"
-            );
-            assert_eq!(ed.read(cx).text().as_ref(), text, "折叠/展开不写源码");
-            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body3 = frame3.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert!(f32::from(body3.height) > 0., "展开后 body 恢复高度");
-        });
-    }
-
-    #[gpui::test]
-    fn heading_fold_stays_folded_with_caret_on_heading_line(cx: &mut TestAppContext) {
-        // 回归（坑 P 同款）：点击折叠后光标停在标题行，该 section 不得被 reveal 弹开；
-        // 光标严格落在 body 行内才 reveal。
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "# A\nbody\n## B\nmore\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.toggle_heading_fold_at_line(0, cx);
-            });
-            // 光标默认在行首（标题行）→ 折叠保持。
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body_ix = frame.block_index_for_src_line(1).expect("body 块");
-            assert_eq!(frame.block_height(body_ix), 0., "光标在标题行时折叠保持");
-            // 光标移到 body（源字节 6 = "body" 起点所在行）→ reveal：body 恢复高度。
-            ed.update(cx, |e, _| e.set_caret(text.find("body").unwrap()));
-            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body2 = frame2.rows.iter().find(|r| r.src_lines.contains(&1)).unwrap();
-            assert!(f32::from(body2.height) > 0., "光标在 body 行内应 reveal");
-        });
-    }
-
-    #[gpui::test]
-    fn toggle_heading_fold_moves_caret_out_when_folding_from_body(cx: &mut TestAppContext) {
-        // 折叠时若光标在 section body 内，先把光标移到标题行末（否则 body 被 reveal，
-        // 折叠无效）——与 live 的 `move_to(end)` 同款。
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "## Goals\n- 任务一\n- 任务二\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 光标放在列表行（body 内）。
-            ed.update(cx, |e, _| e.set_caret(text.find("- 任务一").unwrap()));
-            let before = ed.read(cx).caret();
-            assert!(before > 6, "光标在 body 内");
-            ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
-            assert!(
-                ed.read(cx).folded_headings.borrow().contains("## Goals"),
-                "折叠成功"
-            );
-            // 折叠后光标在标题行内、不在 body（第 0 行），保证折叠不被 reveal 弹开。
-            let (line, _) = ed.read(cx).row_col(ed.read(cx).caret());
-            assert_eq!(line, 0, "折叠时光标应移到标题行");
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let body_ix = frame.block_index_for_src_line(1).expect("body 块");
-            assert_eq!(frame.block_height(body_ix), 0., "body 真正折叠");
-        });
-    }
-
-    #[gpui::test]
-    fn heading_fold_hides_math_cards_completely(cx: &mut TestAppContext) {
-        // 回归：折叠标题，其 section 内的 `$$…$$` 数学块卡片（“公式”标签 + 公式图）
-        // 必须一并折叠成 0 高，不得因 `extra.card` 继续绘制而重叠堆在标题上方。
-        use super::BlockCard;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "# 公式区\n$$\nx^2\n$$\n$$\n\\int dx\n$$\n尾\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // 展开时：两个数学卡片都在（src_lines 覆盖 `$$…$$`）。
-            let frame_open = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let open_cards: Vec<_> = frame_open
-                .rows
-                .iter()
-                .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
-                .collect();
-            assert_eq!(open_cards.len(), 2, "展开时应有 2 个数学卡片");
-            // 折叠标题：卡片行必须消失（fold 后 math_start 不装配卡片，走普通 0 高占位）。
-            ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
-            assert!(
-                ed.read(cx).folded_headings.borrow().contains("# 公式区"),
-                "已折叠"
-            );
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let cards: Vec<_> = frame
-                .rows
-                .iter()
-                .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
-                .collect();
-            assert!(
-                cards.is_empty(),
-                "折叠标题后数学卡片不得残留绘制（{}）",
-                cards.len()
-            );
-            // 原卡片行应折叠成 0 高（不再装配卡片），折叠块不物化，高度经布局断言。
-            let m1_ix = frame.block_index_for_src_line(1).expect("`$x$` 起始行块");
-            assert_eq!(frame.block_height(m1_ix), 0., "`\\$\\$` 起始行折叠成 0 高");
-        });
-    }
-
-    #[gpui::test]
-    fn callout_body_rows_share_alert_bar_color(cx: &mut TestAppContext) {
-        // 回归：展开的 callout，其 body 行左条应与 marker 同色（警报色），不是灰条。
-        // 检查 frame 里 callout body 行的 bar 配色走 alert 路径（间接断言：
-        // `alert_region_kinds` 把 marker + body 行都标上 kind，paint 据此取警报色）。
-        use crate::markdown::parse::inline_style;
-        use crate::markdown::parse::recognition::AlertKind;
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let bodies: Vec<_> = frame
-                .rows
-                .iter()
-                .filter(|r| r.kind == IrKind::Quote && r.src_line >= 1 && r.src_line <= 2)
-                .collect();
-            assert_eq!(bodies.len(), 2, "callout body 行应存在");
-            let kinds = inline_style::alert_region_kinds(&ed.read(cx).content());
-            for b in &bodies {
+#[gpui::test]
+fn mermaid_lr_edges_attach_to_node_edges(cx: &mut TestAppContext) {
+    // 回归「连线歪斜」：LR 边钉在节点**右/左边缘中心**，同行边为水平直线，
+    // 异行边为水平-垂直-水平直角折线（起终点都在边缘、直线段与行对齐）。
+    use super::{MmLayout, mm_layout};
+    cx.update(crate::actions::bind_local_keymaps);
+    const SRC: &str = "flowchart LR\nX[引擎] --> Y[阶段1] & Z[阶段2]\nY --> W\nZ --> W";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        match mm_layout(window, &theme, SRC, 0., 0., 800.) {
+            MmLayout::Flow(f) => {
+                let node = |id: &str| {
+                    f.placed
+                        .iter()
+                        .find(|p| p.id == id && !p.virtual_node)
+                        .unwrap()
+                };
+                let edge = |from: &str, to: &str| {
+                    f.edges
+                        .iter()
+                        .find(|e| f.placed[e.a].id == from && f.placed[e.b].id == to)
+                        .expect("边")
+                };
+                // X→Y 同行：起点= X 右缘中心，终点= Y 左缘中心，全程同一 y → 水平直线。
+                let xy = edge("X", "Y");
+                let (xp, yp) = (node("X"), node("Y"));
                 assert_eq!(
-                    kinds.get(&b.src_line),
-                    Some(&AlertKind::Note),
-                    "body 行 {} 左条应取警报色",
-                    b.src_line
+                    xy.points.first().unwrap().0,
+                    xp.x + xp.w,
+                    "X→Y 起点钉 X 右缘"
+                );
+                assert_eq!(
+                    xy.points.first().unwrap().1,
+                    xp.y + xp.h / 2.,
+                    "X→Y 起点钉行中线"
+                );
+                assert_eq!(xy.points.last().unwrap().0, yp.x, "X→Y 终点钉 Y 左缘");
+                assert!(
+                    xy.points
+                        .iter()
+                        .all(|p| (p.1 - (xp.y + xp.h / 2.)).abs() < 0.01),
+                    "X→Y 水平直线"
+                );
+                // X→Z 异行：直角折线，中间两段共享同一 x（竖直段），两端钉边缘。
+                let xz = edge("X", "Z");
+                let zp = node("Z");
+                assert_eq!(
+                    xz.points.first().unwrap().0,
+                    xp.x + xp.w,
+                    "X→Z 起点钉 X 右缘"
+                );
+                assert_eq!(xz.points.last().unwrap().0, zp.x, "X→Z 终点钉 Z 左缘");
+                assert_eq!(xz.points.len(), 4, "X→Z 为 4 段直角折线");
+                assert_eq!(xz.points[1].0, xz.points[2].0, "竖直段 x 对齐");
+                // Y→W 同行水平直线；Z→W 异行直角。
+                let yw = edge("Y", "W");
+                let wp = node("W");
+                assert_eq!(yw.points.first().unwrap().0, yp.x + yp.w);
+                assert_eq!(yw.points.last().unwrap().0, wp.x);
+                assert!(
+                    yw.points
+                        .iter()
+                        .all(|p| (p.1 - (yp.y + yp.h / 2.)).abs() < 0.01)
+                );
+                assert_eq!(
+                    xz.points.last().unwrap().1,
+                    zp.y + zp.h / 2.,
+                    "X→Z 终点水平段在 Z 行"
                 );
             }
-            // 普通引述行不进入警报色表。
-            let _ = frame.rows.iter().find(|r| r.src_line == 4).unwrap();
-            assert!(!kinds.contains_key(&4), "普通引述不应走警报色");
-        });
-    }
+            other => panic!("应为 flowchart 布局，实际 {other:?}"),
+        }
+    });
+}
 
-    #[gpui::test]
-    fn paint_smoke_all_new_features(cx: &mut TestAppContext) {
-        // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
-        use super::BlockCard;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "\
+#[gpui::test]
+fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
+    // 滚轮缩放须**先点击聚焦该 mermaid 卡**：未聚焦时滚轮放行（给宿主正常滚动，
+    // 不再「往下滚遇到 mermaid 就缩图」）；点击卡置聚焦后才缩放；点击它处解除聚焦。
+    // Ctrl 滚轮放行给宿主全局缩放；非卡区域滚轮不改缩放。
+    use super::BlockCard;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "# 标题\n\n```mermaid\ngraph TD\n    A[开始] --> B[结束]\n```\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let mrow = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+            .expect("应有 mermaid 卡片");
+        let block = mrow.src_line;
+        // 元素 bounds 占满 600×2000（手工置 last_bounds，模拟 paint 期产物）。
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(2000.)),
+            )));
+        });
+        let card_y = f32::from(mrow.top) + 10.;
+        let wheel = |ctrl: bool| gpui::ScrollWheelEvent {
+            position: point(px(300.), px(card_y)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
+            modifiers: gpui::Modifiers {
+                control: ctrl,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let down_at = |y: f32| MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(300.), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        // 1) 未聚焦：悬停卡片滚轮 → 不消费（正常滚动），不改缩放。
+        let before = ed.read(cx).mermaid_zoom(block);
+        let consumed0 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        assert!(!consumed0, "未聚焦时滚轮应放行（正常滚动）");
+        assert_eq!(
+            ed.read(cx).mermaid_zoom(block),
+            before,
+            "未聚焦滚轮不改缩放"
+        );
+        // 2) 点击卡片 → 聚焦。
+        let d = down_at(card_y);
+        ed.update(cx, |e, c| e.on_mouse_down(&d, window, c));
+        assert_eq!(
+            ed.read(cx).focused_mermaid(),
+            Some(block),
+            "点击卡片应聚焦该 mermaid"
+        );
+        // 3) 聚焦后：滚轮 → 消费并放大。
+        let consumed1 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        let after = ed.read(cx).mermaid_zoom(block);
+        assert!(consumed1, "聚焦后悬停卡片滚轮应消费");
+        assert!(
+            after > before,
+            "普通滚轮应放大 mermaid 卡：{before} → {after}"
+        );
+        // 4) Ctrl 滚轮：mermaid 不放行（宿主 zoom_overlay 管全局字号）。
+        let consumed_ctrl = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(true), window, c));
+        assert!(!consumed_ctrl, "Ctrl 滚轮不放行给 mermaid");
+        assert_eq!(
+            ed.read(cx).mermaid_zoom(block),
+            after,
+            "Ctrl 滚轮不改 mermaid 缩放"
+        );
+        // 5) 点击卡片外（普通文本区）→ 清除聚焦 → 滚轮再次放行。
+        let dm = down_at(8.0);
+        ed.update(cx, |e, c| e.on_mouse_down(&dm, window, c));
+        assert_eq!(ed.read(cx).focused_mermaid(), None, "点击卡片外应清除聚焦");
+        let consumed2 = ed.update(cx, |e, c| e.on_scroll_wheel(&wheel(false), window, c));
+        assert!(!consumed2, "清除聚焦后滚轮应再次放行（正常滚动）");
+        assert_eq!(
+            ed.read(cx).mermaid_zoom(block),
+            after,
+            "清除聚焦后滚轮不改缩放"
+        );
+        // 6) 完全没聚焦时的非卡区域滚轮：不消费、不改缩放（历史分支仍成立）。
+        let miss = gpui::ScrollWheelEvent {
+            position: point(px(300.), px(8.)),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), px(120.))),
+            ..Default::default()
+        };
+        let consumed_miss = ed.update(cx, |e, c| e.on_scroll_wheel(&miss, window, c));
+        assert!(!consumed_miss, "卡片外滚轮不应消费");
+        assert_eq!(ed.read(cx).mermaid_zoom(block), after, "卡片外滚轮不改缩放");
+    });
+}
+
+/// 把布局几何光栅化成 PNG（盒子边框 + 连线 + 箭头；中文标签不进位图，
+/// 由「框 + 箭头」结构本身表明这是一张流程图）。
+fn rasterize_mm_png(
+    placed: &[super::MmPlaced],
+    edges: &[super::MmPolylineEdge],
+) -> (image::RgbaImage, usize) {
+    const PAD: i32 = 40;
+    if placed.is_empty() {
+        return (image::RgbaImage::new(1, 1), 0);
+    }
+    let mut x0f = f32::MAX;
+    let mut y0f = f32::MAX;
+    let mut x1f = f32::MIN;
+    let mut y1f = f32::MIN;
+    for p in placed {
+        x0f = x0f.min(p.x);
+        y0f = y0f.min(p.y);
+        x1f = x1f.max(p.x + p.w);
+        y1f = y1f.max(p.y + p.h);
+    }
+    let w = ((x1f - x0f) as i32 + 2 * PAD).max(8);
+    let h = ((y1f - y0f) as i32 + 2 * PAD).max(8);
+    let mut img =
+        image::RgbaImage::from_pixel(w as u32, h as u32, image::Rgba([255, 255, 255, 255]));
+    let ox = -x0f as i32 + PAD;
+    let oy = -y0f as i32 + PAD;
+    let mut ink = 0usize;
+    let dark = [40u8, 45, 60, 255];
+    let fill = [235u8, 238, 245, 255];
+    // 边：三层折线 + 箭头。
+    for e in edges {
+        let (pa, pb) = (&placed[e.a], &placed[e.b]);
+        let ax = (pa.x + pa.w / 2.) as i32 + ox;
+        let ay = (pa.y + pa.h) as i32 + oy;
+        let bx = (pb.x + pb.w / 2.) as i32 + ox;
+        let by = pb.y as i32 + oy;
+        let midy = (ay + by) / 2;
+        if (bx - ax).abs() < 2 {
+            mm_blit(&mut img, &mut ink, ax, ay, bx, by - 4, dark);
+        } else {
+            mm_blit(&mut img, &mut ink, ax, ay, ax, midy, dark);
+            mm_blit(&mut img, &mut ink, ax, midy, bx, midy, dark);
+            mm_blit(&mut img, &mut ink, bx, midy, bx, by - 4, dark);
+        }
+        mm_blit(&mut img, &mut ink, bx - 4, by - 6, bx, by - 1, dark);
+        mm_blit(&mut img, &mut ink, bx + 4, by - 6, bx, by - 1, dark);
+    }
+    // 节点：填充 + 边框。
+    for p in placed {
+        let (x0, y0) = (p.x as i32 + ox, p.y as i32 + oy);
+        let (x1, y1) = ((p.x + p.w) as i32 + ox, (p.y + p.h) as i32 + oy);
+        for yy in y0..=y1 {
+            for xx in x0..=x1 {
+                if xx >= 0 && yy >= 0 && (xx as u32) < img.width() && (yy as u32) < img.height() {
+                    img.put_pixel(xx as u32, yy as u32, fill.into());
+                    ink += 1;
+                }
+            }
+        }
+        mm_blit(&mut img, &mut ink, x0, y0, x1, y0, dark);
+        mm_blit(&mut img, &mut ink, x0, y1, x1, y1, dark);
+        mm_blit(&mut img, &mut ink, x0, y0, x0, y1, dark);
+        mm_blit(&mut img, &mut ink, x1, y0, x1, y1, dark);
+    }
+    (img, ink)
+}
+
+fn mm_blit(
+    img: &mut image::RgbaImage,
+    ink: &mut usize,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    c: [u8; 4],
+) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let (mut x0, mut y0) = (x0, y0);
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        if x0 >= 0 && y0 >= 0 && x0 < w && y0 < h {
+            img.put_pixel(x0 as u32, y0 as u32, c.into());
+            *ink += 1;
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+#[gpui::test]
+fn callout_fold_click_path_round_trips(cx: &mut TestAppContext) {
+    use super::{Frame, RowGutter};
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "> [!NOTE]- 甲\n> 乙\n> 丙\n尾";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let chevron_point = |f: &Frame| {
+            let marker = f
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.gutter, Some(RowGutter::Alert { .. })))
+                .expect("应有警报 marker 行");
+            let y = f32::from(marker.top) + f32::from(marker.height) / 2.;
+            point(px(12. + 40.), px(y))
+        };
+        // 折叠态 → 点击展开。
+        let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1))
+        });
+        let f1 = ed
+            .read(cx)
+            .frame
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone)
+            .unwrap();
+        let ev1 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: chevron_point(&f1),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+        assert!(
+            ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"),
+            "点击应展开"
+        );
+        // 展开态 → 再点折叠回。
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2))
+        });
+        let f2 = ed
+            .read(cx)
+            .frame
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone)
+            .unwrap();
+        let ev2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: chevron_point(&f2),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+        assert!(
+            ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"),
+            "再点应折叠回"
+        );
+        assert_eq!(ed.read(cx).text().as_ref(), text, "往返后内容还原");
+        // 关键断言：折叠后 body 行必须真正折叠（0 高）——光标在 marker 行也不得被 reveal 弹开。
+        // 折叠 body 0 高不物化，高度经布局 `block_height` 断言。
+        let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body_ix = frame3
+            .block_index_for_src_line(1)
+            .expect("callout 主体块应存在");
+        assert_eq!(
+            frame3.block_height(body_ix),
+            0.,
+            "点击折叠后 body 应真正折叠（回归）"
+        );
+    });
+}
+
+#[gpui::test]
+fn two_callouts_fold_independently_with_caret_on_marker(cx: &mut TestAppContext) {
+    // 回归：两个 callout 相邻（中间空行）。各自折叠/展开应互不影响；
+    // 尤其「光标落在 marker 行（点击折叠后的常态）」时，该 callout 仍要真正折叠。
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "> [!NOTE]- 点击箭头折叠\n> 主体一\n> 主体二\n\n> [!WARNING]- 警告\n> 警告内容。\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 光标在 NOTE marker 行：两个 callout 的 body 都应折叠。
+        ed.update(cx, |e, _| e.set_caret(0));
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let note_ix = frame.block_index_for_src_line(1).expect("NOTE 主体块");
+        let warn_ix = frame.block_index_for_src_line(5).expect("WARNING 主体块");
+        assert_eq!(
+            frame.block_height(note_ix),
+            0.,
+            "光标在 marker 行时 NOTE body 也应折叠"
+        );
+        assert_eq!(frame.block_height(warn_ix), 0., "WARNING body 也应折叠");
+        // 展开 NOTE → 再折叠（光标仍在 NOTE marker 行）。
+        ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
+        assert!(
+            ed.read(cx).text().as_ref().starts_with("> [!NOTE]+"),
+            "先展开"
+        );
+        ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(0, cx));
+        assert!(
+            ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"),
+            "再折叠回"
+        );
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let note2_ix = frame2.block_index_for_src_line(1).expect("NOTE 主体块");
+        assert_eq!(
+            frame2.block_height(note2_ix),
+            0.,
+            "折叠后 NOTE body 应真正折叠（不是 reveal）"
+        );
+        // 互不影响：折叠 WARNING 不应改动 NOTE。
+        ed.update(cx, |e, cx| e.toggle_alert_fold_at_line(4, cx));
+        assert!(
+            ed.read(cx).text().as_ref().starts_with("> [!NOTE]-"),
+            "NOTE 折叠态保持"
+        );
+        assert!(
+            ed.read(cx).text().as_ref().find("> [!WARNING]+").is_some()
+                || ed.read(cx).text().as_ref().find("> [!WARNING]-").is_some(),
+            "WARNING 折叠符存在"
+        );
+    });
+}
+
+#[gpui::test]
+fn heading_chevron_click_round_trips(cx: &mut TestAppContext) {
+    // 标题折叠箭头 → 视图本地折叠态翻转（不写源码、不进撤销栈）：`## 甲` 的
+    // section body 行折叠成 0 高；再点展开还原。折叠后光标停在标题行，不得被
+    // reveal 弹开（与 callout 的坑 P 同一教训）。
+    use super::Frame;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "## 甲\nbody 一\nbody 二\n## 乙\n尾";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let chevron_point = |f: &Frame| {
+            let heading = f
+                .rows
+                .iter()
+                .find(|r| matches!(r.kind, crate::markdown::ir::IrKind::Heading(_)))
+                .expect("应有标题行");
+            let (cx0, _) = super::heading_chevron_box(f, heading).unwrap();
+            let y = f32::from(heading.top) + f32::from(heading.lh) / 2.;
+            point(px(cx0 + 8.), px(y))
+        };
+        // 折叠 `## 甲`（单击标题行左缘箭头）：body 行真正折叠（0 高）。
+        let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame1))
+        });
+        let f1 = ed
+            .read(cx)
+            .frame
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone)
+            .unwrap();
+        let ev1 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: chevron_point(&f1),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+        assert!(
+            ed.read(cx).folded_headings.borrow().contains("## 甲"),
+            "点击标题箭头应折叠"
+        );
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body_ix = frame2.block_index_for_src_line(1).expect("body 块");
+        assert_eq!(frame2.block_height(body_ix), 0., "折叠后 body 应真正折叠");
+        let h2 = frame2
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&0))
+            .unwrap();
+        assert!(f32::from(h2.height) > 0., "标题行本身保留");
+        // 展开回：body 高度恢复，文本不变（视图本地，不写源码）。
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame2))
+        });
+        let f2 = ed
+            .read(cx)
+            .frame
+            .borrow()
+            .as_ref()
+            .map(std::rc::Rc::clone)
+            .unwrap();
+        let ev2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: chevron_point(&f2),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+        assert!(
+            !ed.read(cx).folded_headings.borrow().contains("## 甲"),
+            "再点应展开"
+        );
+        assert_eq!(ed.read(cx).text().as_ref(), text, "折叠/展开不写源码");
+        let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body3 = frame3
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&1))
+            .unwrap();
+        assert!(f32::from(body3.height) > 0., "展开后 body 恢复高度");
+    });
+}
+
+#[gpui::test]
+fn heading_fold_stays_folded_with_caret_on_heading_line(cx: &mut TestAppContext) {
+    // 回归（坑 P 同款）：点击折叠后光标停在标题行，该 section 不得被 reveal 弹开；
+    // 光标严格落在 body 行内才 reveal。
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "# A\nbody\n## B\nmore\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.toggle_heading_fold_at_line(0, cx);
+        });
+        // 光标默认在行首（标题行）→ 折叠保持。
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body_ix = frame.block_index_for_src_line(1).expect("body 块");
+        assert_eq!(frame.block_height(body_ix), 0., "光标在标题行时折叠保持");
+        // 光标移到 body（源字节 6 = "body" 起点所在行）→ reveal：body 恢复高度。
+        ed.update(cx, |e, _| e.set_caret(text.find("body").unwrap()));
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body2 = frame2
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&1))
+            .unwrap();
+        assert!(f32::from(body2.height) > 0., "光标在 body 行内应 reveal");
+    });
+}
+
+#[gpui::test]
+fn toggle_heading_fold_moves_caret_out_when_folding_from_body(cx: &mut TestAppContext) {
+    // 折叠时若光标在 section body 内，先把光标移到标题行末（否则 body 被 reveal，
+    // 折叠无效）——与 live 的 `move_to(end)` 同款。
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "## Goals\n- 任务一\n- 任务二\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放在列表行（body 内）。
+        ed.update(cx, |e, _| e.set_caret(text.find("- 任务一").unwrap()));
+        let before = ed.read(cx).caret();
+        assert!(before > 6, "光标在 body 内");
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+        assert!(
+            ed.read(cx).folded_headings.borrow().contains("## Goals"),
+            "折叠成功"
+        );
+        // 折叠后光标在标题行内、不在 body（第 0 行），保证折叠不被 reveal 弹开。
+        let (line, _) = ed.read(cx).row_col(ed.read(cx).caret());
+        assert_eq!(line, 0, "折叠时光标应移到标题行");
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body_ix = frame.block_index_for_src_line(1).expect("body 块");
+        assert_eq!(frame.block_height(body_ix), 0., "body 真正折叠");
+    });
+}
+
+#[gpui::test]
+fn heading_fold_hides_math_cards_completely(cx: &mut TestAppContext) {
+    // 回归：折叠标题，其 section 内的 `$$…$$` 数学块卡片（“公式”标签 + 公式图）
+    // 必须一并折叠成 0 高，不得因 `extra.card` 继续绘制而重叠堆在标题上方。
+    use super::BlockCard;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "# 公式区\n$$\nx^2\n$$\n$$\n\\int dx\n$$\n尾\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // 展开时：两个数学卡片都在（src_lines 覆盖 `$$…$$`）。
+        let frame_open = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let open_cards: Vec<_> = frame_open
+            .rows
+            .iter()
+            .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+            .collect();
+        assert_eq!(open_cards.len(), 2, "展开时应有 2 个数学卡片");
+        // 折叠标题：卡片行必须消失（fold 后 math_start 不装配卡片，走普通 0 高占位）。
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+        assert!(
+            ed.read(cx).folded_headings.borrow().contains("# 公式区"),
+            "已折叠"
+        );
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let cards: Vec<_> = frame
+            .rows
+            .iter()
+            .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+            .collect();
+        assert!(
+            cards.is_empty(),
+            "折叠标题后数学卡片不得残留绘制（{}）",
+            cards.len()
+        );
+        // 原卡片行应折叠成 0 高（不再装配卡片），折叠块不物化，高度经布局断言。
+        let m1_ix = frame.block_index_for_src_line(1).expect("`$x$` 起始行块");
+        assert_eq!(frame.block_height(m1_ix), 0., "`\\$\\$` 起始行折叠成 0 高");
+    });
+}
+
+#[gpui::test]
+fn callout_body_rows_share_alert_bar_color(cx: &mut TestAppContext) {
+    // 回归：展开的 callout，其 body 行左条应与 marker 同色（警报色），不是灰条。
+    // 检查 frame 里 callout body 行的 bar 配色走 alert 路径（间接断言：
+    // `alert_region_kinds` 把 marker + body 行都标上 kind，paint 据此取警报色）。
+    use crate::markdown::ir::IrKind;
+    use crate::markdown::parse::inline_style;
+    use crate::markdown::parse::recognition::AlertKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "> [!NOTE]+ 提示\n> body一\n> body二\n\n> 普通引述\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let bodies: Vec<_> = frame
+            .rows
+            .iter()
+            .filter(|r| r.kind == IrKind::Quote && r.src_line >= 1 && r.src_line <= 2)
+            .collect();
+        assert_eq!(bodies.len(), 2, "callout body 行应存在");
+        let kinds = inline_style::alert_region_kinds(&ed.read(cx).content());
+        for b in &bodies {
+            assert_eq!(
+                kinds.get(&b.src_line),
+                Some(&AlertKind::Note),
+                "body 行 {} 左条应取警报色",
+                b.src_line
+            );
+        }
+        // 普通引述行不进入警报色表。
+        let _ = frame.rows.iter().find(|r| r.src_line == 4).unwrap();
+        assert!(!kinds.contains_key(&4), "普通引述不应走警报色");
+    });
+}
+
+#[gpui::test]
+fn paint_smoke_all_new_features(cx: &mut TestAppContext) {
+    // 把含任务框/警报折叠/链接/行内数学/数学块/mermaid 的内容画一遍，确保不 panic。
+    use super::BlockCard;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
 - [ ] 待办
 
 # 标题折叠
@@ -3262,1961 +3604,2102 @@ graph TD
 A-->B
 ```
 ";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|r| matches!(r.extra.card, Some(BlockCard::Mermaid))),
+            "应渲染出 mermaid 卡片"
+        );
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 触发一次真实绘制（measure→prepaint→paint），catch 任何渲染 panic。
+        let _ = window.draw(cx);
+    });
+}
+
+#[test]
+fn math_to_unicode_translates_superscripts_and_symbols() {
+    use super::math_to_unicode;
+    assert!(math_to_unicode("E=mc^2").contains('²'), "上标 2 → ²");
+    assert!(
+        math_to_unicode("\\int_0^1 x^2 dx").contains('∫'),
+        "积分符号"
+    );
+    assert!(math_to_unicode("\\sqrt{\\pi}").contains('√'), "根号");
+    assert!(math_to_unicode("\\sum_{i=1}^{n}").contains('∑'), "求和");
+    assert_eq!(math_to_unicode("\\tfrac{1}{3}"), "1/3", "分数 → a/b");
+}
+
+#[test]
+fn mermaid_graph_parses_nodes_and_edges() {
+    use super::{MmShape, mermaid_graph};
+    let src = "graph TD\n    A[开始] --> B{判断}\n    B -->|是| C[完成]\n    B -->|否| D[返回 A]\n";
+    let g = mermaid_graph(src);
+    assert_eq!(g.nodes.len(), 4, "4 节点");
+    assert_eq!(g.edges.len(), 3, "3 边");
+    assert!(
+        g.nodes.iter().any(|n| n.id == "A" && n.label == "开始"),
+        "A=开始"
+    );
+    assert!(
+        g.nodes.iter().any(|n| n.id == "C" && n.label == "完成"),
+        "C=完成"
+    );
+    // 回归：`B{判断}` 的定义不能被后续裸引用 `B -->` 覆盖成 “B”。
+    assert!(
+        g.nodes.iter().any(|n| n.id == "B" && n.label == "判断"),
+        "B 的标签应保持为「判断」，却被后续裸引用覆盖：{:?}",
+        g.nodes.iter().filter(|n| n.id == "B").collect::<Vec<_>>()
+    );
+    let b = g.nodes.iter().find(|n| n.id == "B").unwrap();
+    assert_eq!(b.shape, MmShape::Diamond, "B 为判断（菱形）");
+    let e = g
+        .edges
+        .iter()
+        .find(|e| e.from == "B" && e.to == "C")
+        .unwrap();
+    assert_eq!(e.label.as_deref(), Some("是"), "边 B→C(是)");
+}
+
+#[gpui::test]
+fn undo_redo_round_trip(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret(1);
+            e.replace_range(1..1, "X", cx);
+        });
+        assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
+        ed.update(cx, |e, cx| e.undo(cx));
+        assert_eq!(ed.read(cx).text().as_ref(), "abc");
+        ed.update(cx, |e, cx| e.redo(cx));
+        assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
+    });
+}
+
+#[test]
+fn link_runs_render_in_blue_with_underline() {
+    // C5 修复：WYSIWYG 链接不该用 `colors.accent`（浅色主题 = 中性灰），
+    // 而是单一源 `StyleParams.link`（亮 #0b57d0 / 暗 #6fb1ff，与源码编辑器同蓝）。
+    use super::runs_to_text_runs;
+    use gpui::FontWeight;
+    let base = gpui::font("Arial");
+    let mono = gpui::font("Consolas");
+    let text = "点 示例 你";
+    // 渲染字节 [4..10) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。用**已对齐**的
+    // char 边界区间测正常路径；中切区间由 `runs_to_text_runs_clamps_*` 单独覆盖。
+    let runs = vec![((4..10), crate::markdown::parse::RunKind::Link)];
+    let accent = gpui::Hsla::default();
+    let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
+    let code_inline_fg = gpui::Hsla::default();
+    let out = runs_to_text_runs(
+        text,
+        &runs,
+        &base,
+        gpui::Hsla::default(),
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    let link_run = out
+        .iter()
+        .find(|r| r.color == link && r.len == 6)
+        .expect("链接段应为蓝色 TextRun（len=6 汉字）");
+    assert_eq!(link_run.color, link, "链接文字色应等于 StyleParams.link 蓝");
+    assert!(link_run.underline.is_some(), "链接应有下划线");
+    let ul = link_run.underline.as_ref().unwrap();
+    assert_eq!(ul.color, Some(link), "下划线颜色与文字同蓝");
+    // 非链接段保持预设底色（基色），不误伤。
+    let _ = FontWeight::default();
+    assert!(
+        out.iter().any(|r| r.len == 4),
+        "应有链接前导“点 ”（4 字节，对齐后的字符边界段）"
+    );
+}
+
+#[test]
+fn runs_to_text_runs_clamps_mid_char_ranges_to_char_boundaries() {
+    // 回归：run 边界落在多字节字符（CJK/emoji）内部时不得 panic，产出的每个
+    // gpui::TextRun 长度必须停在 `text` 的字符边界上并铺满全文——否则 GPUI
+    // `Text`/`StyledText` 在非字符边界切 run 会 panic
+    // （`elements/text.rs`：`assertion failed: self.text.is_char_boundary(run.start)`），
+    // 对应预览侧 `markdown::view::row::char_align_range` 的既有防御。
+    use super::runs_to_text_runs;
+    use crate::markdown::parse::RunKind;
+    let base = gpui::font("Arial");
+    let mono = gpui::font("Consolas");
+    let accent = gpui::Hsla::default();
+    let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
+    let code_inline_fg = gpui::Hsla::default();
+    // "测🍎试❗"：测=3B，🍎=4B，试=3B，❗=3B → 13 字节。
+    let text = "测🍎试❗";
+    assert_eq!(text.len(), 13);
+    let plain = gpui::Hsla::default();
+
+    // 校验输出：run 无空隙铺满全文，且每个 run 边界都是字符边界。
+    let verify_tiling = |text: &str, out: &[gpui::TextRun]| {
+        let mut off = 0usize;
+        for r in out {
+            assert!(r.len > 0, "不应产出空 run");
             assert!(
-                frame.rows.iter().any(|r| matches!(r.extra.card, Some(BlockCard::Mermaid))),
-                "应渲染出 mermaid 卡片"
+                text.is_char_boundary(off),
+                "run 起点 {off} 不是字符边界（len={}）",
+                r.len
             );
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            // 触发一次真实绘制（measure→prepaint→paint），catch 任何渲染 panic。
-            let _ = window.draw(cx);
-        });
-    }
+            let end = off + r.len;
+            assert!(end <= text.len(), "run 越界：{end} > {}", text.len());
+            assert!(
+                text.is_char_boundary(end),
+                "run 终点 {end} 不是字符边界（len={}）",
+                r.len
+            );
+            off = end;
+        }
+        assert_eq!(off, text.len(), "TextRun 必须无空隙铺满全文");
+    };
 
-    #[test]
-    fn math_to_unicode_translates_superscripts_and_symbols() {
-        use super::math_to_unicode;
-        assert!(math_to_unicode("E=mc^2").contains('²'), "上标 2 → ²");
-        assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'), "积分符号");
-        assert!(math_to_unicode("\\sqrt{\\pi}").contains('√'), "根号");
-        assert!(math_to_unicode("\\sum_{i=1}^{n}").contains('∑'), "求和");
-        assert_eq!(math_to_unicode("\\tfrac{1}{3}"), "1/3", "分数 → a/b");
-    }
+    // —— 1) 起点切进『测』内部(b=1)、终点切进 🍎 内部(b=5) ——
+    // 吸收后应是 [0..3) 正文 + [3..7) 加粗(🍎) + [7..13) 正文。
+    let out = runs_to_text_runs(
+        text,
+        &[(1..5, RunKind::Bold)],
+        &base,
+        plain,
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    verify_tiling(text, &out);
+    let bold = out
+        .iter()
+        .filter(|r| r.font.weight == gpui::FontWeight::BOLD)
+        .collect::<Vec<_>>();
+    assert_eq!(bold.len(), 1, "应收敛出一个加粗 run: {out:?}");
+    assert_eq!(bold[0].len, 4, "加粗 run 应恰好覆盖 🍎（4 字节）");
 
-    #[test]
-    fn mermaid_graph_parses_nodes_and_edges() {
-        use super::{MmShape, mermaid_graph};
-        let src = "graph TD\n    A[开始] --> B{判断}\n    B -->|是| C[完成]\n    B -->|否| D[返回 A]\n";
-        let g = mermaid_graph(src);
-        assert_eq!(g.nodes.len(), 4, "4 节点");
-        assert_eq!(g.edges.len(), 3, "3 边");
-        assert!(g.nodes.iter().any(|n| n.id == "A" && n.label == "开始"), "A=开始");
-        assert!(g.nodes.iter().any(|n| n.id == "C" && n.label == "完成"), "C=完成");
-        // 回归：`B{判断}` 的定义不能被后续裸引用 `B -->` 覆盖成 “B”。
-        assert!(
-            g.nodes.iter().any(|n| n.id == "B" && n.label == "判断"),
-            "B 的标签应保持为「判断」，却被后续裸引用覆盖：{:?}",
-            g.nodes.iter().filter(|n| n.id == "B").collect::<Vec<_>>()
-        );
-        let b = g.nodes.iter().find(|n| n.id == "B").unwrap();
-        assert_eq!(b.shape, MmShape::Diamond, "B 为判断（菱形）");
-        let e = g.edges.iter().find(|e| e.from == "B" && e.to == "C").unwrap();
-        assert_eq!(e.label.as_deref(), Some("是"), "边 B→C(是)");
-    }
+    // —— 2) 完全落在『测』内部的区间 [1..2)（两端都非边界）→ 坍缩为空、被丢弃 ——
+    let out = runs_to_text_runs(
+        text,
+        &[(1..2, RunKind::Bold), (10..13, RunKind::Italic)],
+        &base,
+        plain,
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    verify_tiling(text, &out);
+    let italics = out
+        .iter()
+        .filter(|r| r.font.style == gpui::FontStyle::Italic)
+        .collect::<Vec<_>>();
+    assert_eq!(italics.len(), 1, "斜体 run 应保留一个（❗）: {out:?}");
+    assert!(
+        text.is_char_boundary(italics[0].len),
+        "斜体 run 长度应为字符边界长"
+    );
 
-    #[gpui::test]
-    fn undo_redo_round_trip(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, cx| {
-                e.set_caret(1);
-                e.replace_range(1..1, "X", cx);
-            });
-            assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
-            ed.update(cx, |e, cx| e.undo(cx));
-            assert_eq!(ed.read(cx).text().as_ref(), "abc");
-            ed.update(cx, |e, cx| e.redo(cx));
-            assert_eq!(ed.read(cx).text().as_ref(), "aXbc");
-        });
-    }
+    // —— 3) 越界区间 + 反向区间 + 重叠区间：一律不 panic、输出仍然铺满 ——
+    let tricky = vec![
+        (20..30, RunKind::Bold), // 整体越界 → 吸收到行尾/空
+        (9..2, RunKind::Italic), // 反向 → 空
+        (1..13, RunKind::Link),  // 切进首字符 → 吸收成 [0..13) 整行链接
+    ];
+    let out = runs_to_text_runs(
+        &text,
+        &tricky,
+        &base,
+        plain,
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    verify_tiling(text, &out);
+    assert!(
+        out.iter().any(|r| r.underline.is_some()),
+        "链接段应至少保留（整行）：{out:?}"
+    );
 
-    #[test]
-    fn link_runs_render_in_blue_with_underline() {
-        // C5 修复：WYSIWYG 链接不该用 `colors.accent`（浅色主题 = 中性灰），
-        // 而是单一源 `StyleParams.link`（亮 #0b57d0 / 暗 #6fb1ff，与源码编辑器同蓝）。
-        use super::runs_to_text_runs;
-        use gpui::FontWeight;
-        let base = gpui::font("Arial");
-        let mono = gpui::font("Consolas");
-        let text = "点 示例 你";
-        // 渲染字节 [4..10) 是链接（“示例”，两个 3 字节汉字 → 6 字节）。用**已对齐**的
-        // char 边界区间测正常路径；中切区间由 `runs_to_text_runs_clamps_*` 单独覆盖。
-        let runs = vec![((4..10), crate::markdown::parse::RunKind::Link)];
-        let accent = gpui::Hsla::default();
-        let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
-        let code_inline_fg = gpui::Hsla::default();
-        let out = runs_to_text_runs(
-            text,
-            &runs,
-            &base,
-            gpui::Hsla::default(),
-            &mono,
-            accent,
-            link,
-            code_inline_fg,
-        );
-        let link_run = out
-            .iter()
-            .find(|r| {
-                r.color == link && r.len == 6
-            })
-            .expect("链接段应为蓝色 TextRun（len=6 汉字）");
-        assert_eq!(link_run.color, link, "链接文字色应等于 StyleParams.link 蓝");
-        assert!(
-            link_run.underline.is_some(),
-            "链接应有下划线"
-        );
-        let ul = link_run.underline.as_ref().unwrap();
-        assert_eq!(ul.color, Some(link), "下划线颜色与文字同蓝");
-        // 非链接段保持预设底色（基色），不误伤。
-        let _ = FontWeight::default();
-        assert!(
-            out.iter().any(|r| r.len == 4),
-            "应有链接前导“点 ”（4 字节，对齐后的字符边界段）"
-        );
-    }
+    // —— 4) 行内代码 + 多字节：菱形/emoji 混排不被切半 ——
+    let text2 = "代码`测🍎`尾";
+    let out = runs_to_text_runs(
+        text2,
+        &[(3..8, RunKind::InlineCode)],
+        &base,
+        plain,
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    verify_tiling(text2, &out);
+    assert!(
+        out.iter().any(|r| r.font == mono),
+        "行内代码段应走等宽字体：{out:?}"
+    );
+}
 
-    #[test]
-    fn runs_to_text_runs_clamps_mid_char_ranges_to_char_boundaries() {
-        // 回归：run 边界落在多字节字符（CJK/emoji）内部时不得 panic，产出的每个
-        // gpui::TextRun 长度必须停在 `text` 的字符边界上并铺满全文——否则 GPUI
-        // `Text`/`StyledText` 在非字符边界切 run 会 panic
-        // （`elements/text.rs`：`assertion failed: self.text.is_char_boundary(run.start)`），
-        // 对应预览侧 `markdown::view::row::char_align_range` 的既有防御。
-        use super::runs_to_text_runs;
-        use crate::markdown::parse::RunKind;
-        let base = gpui::font("Arial");
-        let mono = gpui::font("Consolas");
-        let accent = gpui::Hsla::default();
-        let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
-        let code_inline_fg = gpui::Hsla::default();
-        // "测🍎试❗"：测=3B，🍎=4B，试=3B，❗=3B → 13 字节。
-        let text = "测🍎试❗";
-        assert_eq!(text.len(), 13);
-        let plain = gpui::Hsla::default();
-
-        // 校验输出：run 无空隙铺满全文，且每个 run 边界都是字符边界。
-        let verify_tiling = |text: &str, out: &[gpui::TextRun]| {
-            let mut off = 0usize;
-            for r in out {
-                assert!(r.len > 0, "不应产出空 run");
-                assert!(
-                    text.is_char_boundary(off),
-                    "run 起点 {off} 不是字符边界（len={}）",
-                    r.len
-                );
-                let end = off + r.len;
-                assert!(end <= text.len(), "run 越界：{end} > {}", text.len());
-                assert!(
-                    text.is_char_boundary(end),
-                    "run 终点 {end} 不是字符边界（len={}）",
-                    r.len
-                );
-                off = end;
-            }
-            assert_eq!(off, text.len(), "TextRun 必须无空隙铺满全文");
+#[gpui::test]
+fn link_theme_single_source_equals_editor_blue(cx: &mut TestAppContext) {
+    // 回检测试（坑 D 单一源）：WyTheme.link ← StyleParams.link ← 明/暗主题蓝，
+    // 且与源码编辑器 `editor/markdown.rs` 的 LINK_LIGHT/LINK_DARK 同值。
+    use crate::markdown::view::style::StyleParams;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("none"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        let p = StyleParams::from_theme_with_font(cx, Some(f32::from(theme.font_size)));
+        assert_eq!(theme.link, p.link, "WyTheme.link 抄自 StyleParams.link");
+        // 浅色主题（main.rs 强制 Light）：应编辑器 LINK 蓝 #0b57d0 逐字节一致。
+        let cs = if p.is_dark {
+            crate::ui::theme::ColorScheme::dark()
+        } else {
+            crate::ui::theme::ColorScheme::light()
         };
+        let expect: gpui::Hsla = cs.link.into();
+        assert_eq!(theme.link, expect, "链接蓝单一源 ColorScheme::link");
+    });
+}
 
-        // —— 1) 起点切进『测』内部(b=1)、终点切进 🍎 内部(b=5) ——
-        // 吸收后应是 [0..3) 正文 + [3..7) 加粗(🍎) + [7..13) 正文。
-        let out = runs_to_text_runs(
-            text,
-            &[(1..5, RunKind::Bold)],
-            &base,
-            plain,
-            &mono,
-            accent,
-            link,
-            code_inline_fg,
-        );
-        verify_tiling(text, &out);
-        let bold = out.iter().filter(|r| r.font.weight == gpui::FontWeight::BOLD).collect::<Vec<_>>();
-        assert_eq!(bold.len(), 1, "应收敛出一个加粗 run: {out:?}");
-        assert_eq!(bold[0].len, 4, "加粗 run 应恰好覆盖 🍎（4 字节）");
-
-        // —— 2) 完全落在『测』内部的区间 [1..2)（两端都非边界）→ 坍缩为空、被丢弃 ——
-        let out = runs_to_text_runs(
-            text,
-            &[(1..2, RunKind::Bold), (10..13, RunKind::Italic)],
-            &base,
-            plain,
-            &mono,
-            accent,
-            link,
-            code_inline_fg,
-        );
-        verify_tiling(text, &out);
-        let italics = out.iter().filter(|r| r.font.style == gpui::FontStyle::Italic).collect::<Vec<_>>();
-        assert_eq!(italics.len(), 1, "斜体 run 应保留一个（❗）: {out:?}");
-        assert!(text.is_char_boundary(italics[0].len), "斜体 run 长度应为字符边界长");
-
-        // —— 3) 越界区间 + 反向区间 + 重叠区间：一律不 panic、输出仍然铺满 ——
-        let tricky = vec![
-            (20..30, RunKind::Bold),      // 整体越界 → 吸收到行尾/空
-            (9..2, RunKind::Italic),      // 反向 → 空
-            (1..13, RunKind::Link),       // 切进首字符 → 吸收成 [0..13) 整行链接
-        ];
-        let out = runs_to_text_runs(&text, &tricky, &base, plain, &mono, accent, link, code_inline_fg);
-        verify_tiling(text, &out);
+#[gpui::test]
+fn inline_image_hit_is_found_and_within_display_range(cx: &mut TestAppContext) {
+    // B1 修复：`![alt](src)` 的 `RunKind::Image` 只覆盖 alt——byte_map[alt] 是
+    // **alt 起点**（不是 `!`）。旧实现在 alt 起点处查 `![` 永远找不到（tail 没有
+    // `!`），且显示区间按整段源跨度算、越出 shaped 行 → `position_for_index` 落空。
+    // 现在：src 起点从 `!` 反查，显示区间收在 alt 内。
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "前文 ![内联蓝块](shot_blue.png) 后文\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Paragraph)
+            .expect("应有段落行");
         assert!(
-            out.iter().any(|r| r.underline.is_some()),
-            "链接段应至少保留（整行）：{out:?}"
+            !para.extra.inline_images.is_empty(),
+            "行内图片应被命中（旧实现此处为空 → 永远不显示）"
         );
-
-        // —— 4) 行内代码 + 多字节：菱形/emoji 混排不被切半 ——
-        let text2 = "代码`测🍎`尾";
-        let out = runs_to_text_runs(
-            text2,
-            &[(3..8, RunKind::InlineCode)],
-            &base,
-            plain,
-            &mono,
-            accent,
-            link,
-            code_inline_fg,
-        );
-        verify_tiling(text2, &out);
+        let hit = &para.extra.inline_images[0];
+        assert_eq!(hit.src.as_ref(), "shot_blue.png", "src 取自 `!(…)`");
+        // 显示区间必须在 shaped 行长度内（否则 paint 的 position_for_index 返回 None）。
+        let dl = para.wrapped.first().map(|w| w.len()).unwrap_or(0);
         assert!(
-            out.iter().any(|r| r.font == mono),
-            "行内代码段应走等宽字体：{out:?}"
+            hit.display_off + hit.len <= dl,
+            "图片显示区间 {}..{} 须在 shaped 行 {} 内",
+            hit.display_off,
+            hit.display_off + hit.len,
+            dl
         );
-    }
+        assert_eq!(hit.len, "内联蓝块".len(), "显示区只覆盖 alt（不含标记）");
+    });
+}
 
-    #[gpui::test]
-    fn link_theme_single_source_equals_editor_blue(cx: &mut TestAppContext) {
-        // 回检测试（坑 D 单一源）：WyTheme.link ← StyleParams.link ← 明/暗主题蓝，
-        // 且与源码编辑器 `editor/markdown.rs` 的 LINK_LIGHT/LINK_DARK 同值。
-        use crate::markdown::view::style::StyleParams;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("none"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let theme = ed.read(cx).theme.clone();
-            let p = StyleParams::from_theme_with_font(cx, Some(f32::from(theme.font_size)));
-            assert_eq!(theme.link, p.link, "WyTheme.link 抄自 StyleParams.link");
-            // 浅色主题（main.rs 强制 Light）：应编辑器 LINK 蓝 #0b57d0 逐字节一致。
-            let cs = if p.is_dark {
-                crate::ui::theme::ColorScheme::dark()
-            } else {
-                crate::ui::theme::ColorScheme::light()
-            };
-            let expect: gpui::Hsla = cs.link.into();
-            assert_eq!(theme.link, expect, "链接蓝单一源 ColorScheme::link");
-        });
-    }
+#[test]
+fn math_block_env_and_line_breaks_render_cleanly() {
+    // A1 修复：结构化 LaTeX 不再泄漏 `\begin{...}`/字面 `\\`。
+    use super::{math_display_lines, math_to_unicode};
+    // `\\` 行断 → 拆成两行（矩阵/对齐环境也如此）。
+    let lines = math_display_lines("a = b \\\\ c = d");
+    assert_eq!(lines.len(), 2, "`\\\\`（LaTeX 行断）应拆成两行");
+    assert_eq!(lines[0], "a = b");
+    assert_eq!(lines[1], "c = d");
+    // `\begin{matrix}` 环境名剥掉、`&` 列分隔 → 空格。
+    let m = math_to_unicode("\\begin{matrix}1 & 2 \\\\ 3 & 4\\end{matrix}");
+    assert!(!m.contains("begin"), "不应泄漏 \\begin：{m}");
+    assert!(!m.contains('\\'), "不应残留反斜杠：{m}");
+    assert!(m.contains('1') && m.contains('2') && m.contains('3') && m.contains('4'));
+    // 既有的普通公式仍工作。
+    assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'));
+}
 
-    #[gpui::test]
-    fn inline_image_hit_is_found_and_within_display_range(cx: &mut TestAppContext) {
-        // B1 修复：`![alt](src)` 的 `RunKind::Image` 只覆盖 alt——byte_map[alt] 是
-        // **alt 起点**（不是 `!`）。旧实现在 alt 起点处查 `![` 永远找不到（tail 没有
-        // `!`），且显示区间按整段源跨度算、越出 shaped 行 → `position_for_index` 落空。
-        // 现在：src 起点从 `!` 反查，显示区间收在 alt 内。
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "前文 ![内联蓝块](shot_blue.png) 后文\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let para = frame
-                .rows
-                .iter()
-                .find(|r| r.kind == IrKind::Paragraph)
-                .expect("应有段落行");
-            assert!(
-                !para.extra.inline_images.is_empty(),
-                "行内图片应被命中（旧实现此处为空 → 永远不显示）"
-            );
-            let hit = &para.extra.inline_images[0];
-            assert_eq!(hit.src.as_ref(), "shot_blue.png", "src 取自 `!(…)`");
-            // 显示区间必须在 shaped 行长度内（否则 paint 的 position_for_index 返回 None）。
-            let dl = para.wrapped.first().map(|w| w.len()).unwrap_or(0);
-            assert!(
-                hit.display_off + hit.len <= dl,
-                "图片显示区间 {}..{} 须在 shaped 行 {} 内",
-                hit.display_off,
-                hit.display_off + hit.len,
-                dl
-            );
-            assert_eq!(hit.len, "内联蓝块".len(), "显示区只覆盖 alt（不含标记）");
-        });
-    }
+#[test]
+fn math_to_segments_split_sup_sub_for_limit_layout() {
+    // A1 回归：`∫_{-\infty}^{\infty}` 里 `∞` 没有 Unicode 上/下标码位，字符串版只能
+    // 正文大小平排（`∫₋∞∞`）。卡片现在把顶层 `^{…}`/`_{…}` 拆成 Sup/Sub 段 →
+    // 绘制时小字号 + 上下偏移，`∞` 也能正确显示成极限。
+    use super::{MathPos, math_to_segments, math_to_unicode};
+    let src = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}";
+    let segs = math_to_segments(src);
+    assert!(
+        segs.iter()
+            .any(|s| s.pos == MathPos::Sub && s.text.contains('∞')),
+        "下标组应拆出 Sub 段（含 ∞）：{segs:?}"
+    );
+    assert!(
+        segs.iter()
+            .any(|s| s.pos == MathPos::Sup && s.text.contains('∞')),
+        "上标组应拆出 Sup 段（含 ∞）：{segs:?}"
+    );
+    // 平铺后 = 旧的扁平字符串（行内数学/兼容路径输出不变）。
+    let flat: String = segs.iter().map(|s| s.text.as_str()).collect();
+    assert_eq!(
+        flat,
+        math_to_unicode(src),
+        "segments 平铺应与 math_to_unicode 一致"
+    );
+    // `e^{-x^2}` 的指数也应在 Sup 段里。
+    assert!(
+        segs.iter()
+            .any(|s| s.pos == MathPos::Sup && s.text.contains('²')),
+        "e^(-x^2) 的指数应在 Sup 段：{segs:?}"
+    );
+    // `\sum_{i=1}^{n}`：下标/上标各一段，且平铺含 ∑。
+    let sum_segs = math_to_segments(r"\sum_{i=1}^{n} i");
+    assert!(
+        sum_segs
+            .iter()
+            .any(|s| s.pos == MathPos::Sub && s.text.contains('ᵢ'))
+    );
+    assert!(
+        sum_segs
+            .iter()
+            .any(|s| s.pos == MathPos::Sup && s.text.contains('ⁿ'))
+    );
+}
 
-    #[test]
-    fn math_block_env_and_line_breaks_render_cleanly() {
-        // A1 修复：结构化 LaTeX 不再泄漏 `\begin{...}`/字面 `\\`。
-        use super::{math_display_lines, math_to_unicode};
-        // `\\` 行断 → 拆成两行（矩阵/对齐环境也如此）。
-        let lines = math_display_lines("a = b \\\\ c = d");
-        assert_eq!(lines.len(), 2, "`\\\\`（LaTeX 行断）应拆成两行");
-        assert_eq!(lines[0], "a = b");
-        assert_eq!(lines[1], "c = d");
-        // `\begin{matrix}` 环境名剥掉、`&` 列分隔 → 空格。
-        let m = math_to_unicode("\\begin{matrix}1 & 2 \\\\ 3 & 4\\end{matrix}");
-        assert!(!m.contains("begin"), "不应泄漏 \\begin：{m}");
-        assert!(!m.contains('\\'), "不应残留反斜杠：{m}");
-        assert!(m.contains('1') && m.contains('2') && m.contains('3') && m.contains('4'));
-        // 既有的普通公式仍工作。
-        assert!(math_to_unicode("\\int_0^1 x^2 dx").contains('∫'));
-    }
+#[test]
+fn inline_math_fit_h_keeps_readable_size_within_band() {
+    // 行内公式「不能太小也不能溢出」的平衡（撑高行方案）：
+    // - 矮公式按原生字号缩放（fs/FONT_SIZE），不做额外缩小；
+    // - 高公式（22px 排 `\int_0^1` 约 70px）显示高 = 1× 字号缩放值，但封顶
+    //   `INLINE_MATH_BAND × 行高`（撑高行容纳，而不是压扁到 0.95×行高）。
+    use super::inline_math_fit_h;
+    let fs = px(16.);
+    let lh = px(19.);
+    // 矮公式：按原生字号缩放（fs/FONT_SIZE×h），不被行高压扁。
+    let short = inline_math_fit_h(fs, lh, 25.0);
+    assert!(
+        (short - 16.0 / 22.0 * 25.0).abs() < 1e-3,
+        "矮公式按字号缩放：{short}"
+    );
+    assert!(short <= 19.0, "25px 高公式 × 字号缩放后仍在行高内：{short}");
+    // 中等公式：字号缩放略超行高 → 所在行会小幅撑高（不再压扁）。
+    let mid = inline_math_fit_h(fs, lh, 30.0);
+    assert!(
+        (mid - 16.0 / 22.0 * 30.0).abs() < 1e-3,
+        "仍按字号缩放：{mid}"
+    );
+    // 高公式（`\int_0^1 x^2 dx` 22px 下 h≈70.5）：比旧 `0.95×行高`（≈18）大得多，
+    // 且绝不超 `INLINE_MATH_BAND × 行高`（只压超高算子公式，其余保持字号缩放）。
+    let tall = inline_math_fit_h(fs, lh, 70.5);
+    assert!(tall > 19.0 * 0.95, "超高算子仍大于 0.95×行高：{tall}");
+    assert!(
+        tall <= 19.0 * crate::config::math::INLINE_MATH_BAND + 1e-3,
+        "不超 INLINE_MATH_BAND×行高上限：{tall}"
+    );
+    // 0 高兜底 ≥1px（不除零）。
+    assert!(inline_math_fit_h(fs, lh, 0.0) >= 1.0);
+}
 
-    #[test]
-    fn math_to_segments_split_sup_sub_for_limit_layout() {
-        // A1 回归：`∫_{-\infty}^{\infty}` 里 `∞` 没有 Unicode 上/下标码位，字符串版只能
-        // 正文大小平排（`∫₋∞∞`）。卡片现在把顶层 `^{…}`/`_{…}` 拆成 Sup/Sub 段 →
-        // 绘制时小字号 + 上下偏移，`∞` 也能正确显示成极限。
-        use super::{math_to_segments, math_to_unicode, MathPos};
-        let src = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}";
-        let segs = math_to_segments(src);
+#[gpui::test]
+fn inline_math_double_click_enters_edit(cx: &mut TestAppContext) {
+    // B2 双击编辑：双击 `$…$` spacer → 光标进公式（`$` 后 1 字节）→ shape 期
+    // reveal 显示可编辑的原始 LaTeX（不再 splice 成 spacer）；光标移走恢复。
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "前置文字 $x^2+\\alpha$ 后置文字\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para = frame
+            .rows
+            .iter()
+            .find(|r| !r.extra.inline_maths.is_empty())
+            .expect("应有行内公式行");
+        let im = para.extra.inline_maths[0].clone();
+        assert!(!im.source.is_empty(), "spacer 应带绝对源区间");
+        let w0 = para.wrapped.first().unwrap();
+        let p0 = w0.position_for_index(im.display_off, para.lh).unwrap();
+        let (src_line, x_off, top, lh) = (
+            para.src_line,
+            f32::from(para.x_off),
+            f32::from(para.top),
+            para.lh,
+        );
+        let x = f32::from(frame.padding) + x_off + f32::from(p0.x) + 2.0;
+        let y = top + f32::from(lh) / 2.;
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let ev = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+        let caret = ed.read(cx).caret();
         assert!(
-            segs.iter().any(|s| s.pos == MathPos::Sub && s.text.contains('∞')),
-            "下标组应拆出 Sub 段（含 ∞）：{segs:?}"
+            caret > im.source.start && caret < im.source.end,
+            "双击应把光标放进公式内：caret={caret} ∈ {:?}",
+            im.source
         );
+        // reveal：重建帧后该行公式不再 splice。
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para2 = frame2
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&src_line))
+            .unwrap();
         assert!(
-            segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('∞')),
-            "上标组应拆出 Sup 段（含 ∞）：{segs:?}"
+            para2.extra.inline_maths.is_empty(),
+            "光标在公式内应 reveal（不 splice spacer）"
         );
-        // 平铺后 = 旧的扁平字符串（行内数学/兼容路径输出不变）。
-        let flat: String = segs.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(flat, math_to_unicode(src), "segments 平铺应与 math_to_unicode 一致");
-        // `e^{-x^2}` 的指数也应在 Sup 段里。
+        // 光标移走 → 恢复 splice（公式感回来）。
+        ed.update(cx, |e, _| e.set_caret(0));
+        let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para3 = frame3
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&src_line))
+            .unwrap();
         assert!(
-            segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('²')),
-            "e^(-x^2) 的指数应在 Sup 段：{segs:?}"
+            !para3.extra.inline_maths.is_empty(),
+            "光标离开公式应恢复 splice"
         );
-        // `\sum_{i=1}^{n}`：下标/上标各一段，且平铺含 ∑。
-        let sum_segs = math_to_segments(r"\sum_{i=1}^{n} i");
-        assert!(sum_segs.iter().any(|s| s.pos == MathPos::Sub && s.text.contains('ᵢ')));
-        assert!(sum_segs.iter().any(|s| s.pos == MathPos::Sup && s.text.contains('ⁿ')));
-    }
+    });
+}
 
-    #[test]
-    fn inline_math_fit_h_keeps_readable_size_within_band() {
-        // 行内公式「不能太小也不能溢出」的平衡（撑高行方案）：
-        // - 矮公式按原生字号缩放（fs/FONT_SIZE），不做额外缩小；
-        // - 高公式（22px 排 `\int_0^1` 约 70px）显示高 = 1× 字号缩放值，但封顶
-        //   `INLINE_MATH_BAND × 行高`（撑高行容纳，而不是压扁到 0.95×行高）。
-        use super::inline_math_fit_h;
-        let fs = px(16.);
-        let lh = px(19.);
-        // 矮公式：按原生字号缩放（fs/FONT_SIZE×h），不被行高压扁。
-        let short = inline_math_fit_h(fs, lh, 25.0);
-        assert!((short - 16.0 / 22.0 * 25.0).abs() < 1e-3, "矮公式按字号缩放：{short}");
-        assert!(short <= 19.0, "25px 高公式 × 字号缩放后仍在行高内：{short}");
-        // 中等公式：字号缩放略超行高 → 所在行会小幅撑高（不再压扁）。
-        let mid = inline_math_fit_h(fs, lh, 30.0);
-        assert!((mid - 16.0 / 22.0 * 30.0).abs() < 1e-3, "仍按字号缩放：{mid}");
-        // 高公式（`\int_0^1 x^2 dx` 22px 下 h≈70.5）：比旧 `0.95×行高`（≈18）大得多，
-        // 且绝不超 `INLINE_MATH_BAND × 行高`（只压超高算子公式，其余保持字号缩放）。
-        let tall = inline_math_fit_h(fs, lh, 70.5);
-        assert!(tall > 19.0 * 0.95, "超高算子仍大于 0.95×行高：{tall}");
-        assert!(
-            tall <= 19.0 * crate::config::math::INLINE_MATH_BAND + 1e-3,
-            "不超 INLINE_MATH_BAND×行高上限：{tall}"
-        );
-        // 0 高兜底 ≥1px（不除零）。
-        assert!(inline_math_fit_h(fs, lh, 0.0) >= 1.0);
-    }
-
-    #[gpui::test]
-    fn inline_math_double_click_enters_edit(cx: &mut TestAppContext) {
-        // B2 双击编辑：双击 `$…$` spacer → 光标进公式（`$` 后 1 字节）→ shape 期
-        // reveal 显示可编辑的原始 LaTeX（不再 splice 成 spacer）；光标移走恢复。
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "前置文字 $x^2+\\alpha$ 后置文字\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext) {
+    // A1 交互语义修复：单击数学块卡片**不改光标**（不会因 caret 进块被 reveal 回
+    // 源码字符串）；**双击**把光标放进块首 → 整块 reveal 源码进入编辑。
+    use super::BlockCard;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let para = frame
-                .rows
-                .iter()
-                .find(|r| !r.extra.inline_maths.is_empty())
-                .expect("应有行内公式行");
-            let im = para.extra.inline_maths[0].clone();
-            assert!(!im.source.is_empty(), "spacer 应带绝对源区间");
-            let w0 = para.wrapped.first().unwrap();
-            let p0 = w0.position_for_index(im.display_off, para.lh).unwrap();
-            let (src_line, x_off, top, lh) = (
-                para.src_line,
-                f32::from(para.x_off),
-                f32::from(para.top),
-                para.lh,
-            );
-            let x = f32::from(frame.padding) + x_off + f32::from(p0.x) + 2.0;
-            let y = top + f32::from(lh) / 2.;
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            let ev = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(x), px(y)),
-                modifiers: Modifiers::default(),
-                click_count: 2,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
-            let caret = ed.read(cx).caret();
-            assert!(
-                caret > im.source.start && caret < im.source.end,
-                "双击应把光标放进公式内：caret={caret} ∈ {:?}",
-                im.source
-            );
-            // reveal：重建帧后该行公式不再 splice。
-            let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let para2 = frame2
-                .rows
-                .iter()
-                .find(|r| r.src_lines.contains(&src_line))
-                .unwrap();
-            assert!(
-                para2.extra.inline_maths.is_empty(),
-                "光标在公式内应 reveal（不 splice spacer）"
-            );
-            // 光标移走 → 恢复 splice（公式感回来）。
-            ed.update(cx, |e, _| e.set_caret(0));
-            let frame3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let para3 = frame3
-                .rows
-                .iter()
-                .find(|r| r.src_lines.contains(&src_line))
-                .unwrap();
-            assert!(
-                !para3.extra.inline_maths.is_empty(),
-                "光标离开公式应恢复 splice"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext) {
-        // A1 交互语义修复：单击数学块卡片**不改光标**（不会因 caret 进块被 reveal 回
-        // 源码字符串）；**双击**把光标放进块首 → 整块 reveal 源码进入编辑。
-        use super::BlockCard;
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            ed.update(cx, |e, _| {
-                e.set_caret(text.find("尾").unwrap())
-            }); // 光标在块外（末行）
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let x = f32::from(frame.padding) + 40.;
-            let y = {
-                let card = frame
-                    .rows
-                    .iter()
-                    .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
-                    .expect("应有数学卡片");
-                f32::from(card.top) + f32::from(card.height) / 2.
-            };
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            // 单击：光标不动，卡片保持（不 reveal）。
-            let ev1 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(x), px(y)),
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
-            let caret_before = ed.read(cx).caret();
-            assert_eq!(caret_before, text.find("尾").unwrap(), "单击卡片不得移动光标");
-            let f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert!(
-                f1.rows
-                    .iter()
-                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-                "单击后卡片仍在（未 reveal）"
-            );
-            // 双击：光标进块首（源码行 0）→ reveal 源码（不再有卡片）。
-            let ev2 = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(x), px(y)),
-                modifiers: Modifiers::default(),
-                click_count: 2,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-            let caret = ed.read(cx).caret();
-            assert!(ed.read(cx).row_col(caret).0 == 0, "双击应把光标放进块首");
-            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert!(
-                !f2.rows
-                    .iter()
-                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-                "双击后 reveal 源码（无卡片）"
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn math_block_single_line_double_click_reveals_immediately(cx: &mut TestAppContext) {
-        // 单行 `$$…$$` 数学块（`$$\sum…$$` 独占一行）：双击必须**直接**还原成源码
-        // 字符串，不得先变成行内小公式再双击一次。根因：光标放在行首 0 列时
-        // `splice_math_text` 的 `c > span.start` 不成立 → 仍被 splice 成小号行内公式；
-        // 现在放 `$$` 行内容内 1 字节 → 块 reveal 与行内 splice reveal 同时满足。
-        use super::BlockCard;
-        use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n尾行\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(600.), px(600.)),
-                )));
-            });
-            ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap())); // 光标在块外
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap())); // 光标在块外（末行）
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let x = f32::from(frame.padding) + 40.;
+        let y = {
             let card = frame
                 .rows
                 .iter()
                 .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
-                .expect("单行 `$$…$$` 也应是数学卡片");
-            let (x, y) = (
-                f32::from(frame.padding) + 40.,
-                f32::from(card.top) + f32::from(card.height) / 2.,
-            );
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame)));
-            let ev = MouseDownEvent {
-                button: MouseButton::Left,
-                position: point(px(x), px(y)),
-                modifiers: Modifiers::default(),
-                click_count: 2,
-                first_mouse: false,
-            };
-            ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
-            // 双击一次：光标在行内（>0 列），卡片消失、不再 splice（直接是字符串）。
-            let caret = ed.read(cx).caret();
-            let (_, col) = ed.read(cx).row_col(caret);
-            assert!(col > 0, "双击后光标应进入块行内部，col={col}");
-            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert!(
-                !f2.rows
-                    .iter()
-                    .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-                "双击后应无卡片（reveal 源码）"
-            );
-            let row0 = f2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
-            assert!(
-                row0.extra.inline_maths.is_empty(),
-                "单行块双击应直接还原字符串（不得再 splice 成行内公式）"
-            );
-            // 光标移出块（到尾行）后恢复卡片渲染。
-            ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap()));
-            let f3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert!(
-                f3.rows.iter().any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-                "光标移出后应恢复数学卡片（公式感）"
-            );
+                .expect("应有数学卡片");
+            f32::from(card.top) + f32::from(card.height) / 2.
+        };
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
-    }
-
-    #[gpui::test]
-    fn sync_math_claims_block_and_inline_slots(cx: &mut TestAppContext) {
-        // 数学排版集成（参考 zorite ensure_content_math）：内容含 `$$…$$` 块 + `$…$`
-        // 行内公式 → `sync_math`（**可见带懒光栅**）按「去定界符的 LaTeX」为键把当前带内
-        // 两块都占为 Loading（真正位图由后台 executor 光栅；CPU 级正确性已由
-        // math_typeset 单测覆盖）。
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\n\\int_0^1 x^2 dx\n$$\n内联 $e^{i\\pi}+1=0$ 结束";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let frame = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 光标放在文档末尾（离开数学块与行内公式）→ 块折叠成卡片、行内公式被
-            // splice 带出到 frame.rows → `sync_math` 才能按带内公式 claim 占槽。
-            let n = ed.read(cx).content().len();
-            ed.update(cx, |e, _| e.set_caret(n));
-            build_frame(ed.read(cx), window, px(600.), (0., 999_999.))
-        });
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
-            let slots = ed.read(cx).math_slots();
-            let b = slots.borrow();
-            assert!(
-                b.contains_key(r"\int_0^1 x^2 dx"),
-                "块公式应占位（Loading）：keys={:?}",
-                b.keys()
-            );
-            assert!(
-                b.contains_key(super::super::inline_math_key(r"e^{i\pi}+1=0").as_ref()),
-                "行内公式应占位（Loading，带 inline: 前缀键）：keys={:?}",
-                b.keys()
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn math_card_height_uses_typeset_size_when_slot_ready(cx: &mut TestAppContext) {
-        // 数学排版切 RaTeX 后：公式就绪 → 卡片高按排版位图逻辑高（`20 + h`），
-        // 不再按 Unicode 行数（`20 + n×22`）——上限的分式/根号终于有足够高度。
-        use crate::markdown::parse::inline_style;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\na \\\\ b\n$$"; // 两行 → Unicode 回退高 = 20+44=64
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            // 一个 40×24 的假位图逻辑尺寸 20×12（RenderImage 是纯数据构造，无需 GPU）。
-            let buf = image::RgbaImage::from_raw(40, 24, vec![0u8; 40 * 24 * 4]).unwrap();
-            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
-            let latex = "a \\\\ b"; // math_regions 的 source（fenced 去 `$$` 后）
-            let ed = host.read(cx).ed.clone();
-            ed.read(cx).math_slots().borrow_mut().insert(
-                latex.to_string().into(),
-                super::super::MathSlot::Ready(img, 20., 12.),
-            );
-            let e = ed.read(cx);
-            let reg = inline_style::math_regions(&e.content())
-                .into_iter()
-                .next()
-                .expect("应扫到一块公式");
-            assert_eq!(reg.source, "a \\\\ b");
-            // 就绪后高 = 20 + max(h,16) = 20+16 = 36（而非 Unicode 两行的 64）。
-            let h = super::math_card_height(e, &reg);
-            assert_eq!(f32::from(h), 36.0, "就绪应占位排版高度，而非 Unicode 行高");
-            // 未就绪（新公式）→ 回退 Unicode 行高 = 20 + 2×22 = 64。
-            e.math_slots().borrow_mut().clear();
-            let h2 = super::math_card_height(e, &reg);
-            assert_eq!(f32::from(h2), 64.0, "未就绪应回退 Unicode 逐行高");
-        });
-    }
-
-    #[gpui::test]
-    fn math_ready_bumps_gen_and_rebuilds_card_height(cx: &mut TestAppContext) {
-        // 回归（样式 bug：单行数学块灰底比公式矮/公式越界）：`sync_math` 的
-        // Loading→Ready 完成必须自增 `math_gen`，使帧/折叠计划按**真实位图高**
-        // 重建。旧实现 `insert(key, Ready).is_none()` 判定恒假（key 必先以 Loading
-        // 占位 → insert 返回 Some(Loading)），`on_math_ready` 从不触发 → `math_gen`
-        // 恒 0 → 卡片永远停在 Unicode 回退高（42px），68px 位图越出灰底。
-        use crate::markdown::parse::inline_style;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 与 `math_typeset::tests::rasterizes_to_nonempty_bgra` 同款——ratex 确定支持。
-        // 块后跟一行正文：光标放到文尾落在块外（否则落在闭合 `$$` 行会 reveal 成源码）。
-        let text = "$$\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n$$\n后文";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let frame = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 光标放到文档尾（`$$` 之外）→ 数学块折叠成卡片（不 reveal）。
-            let n = ed.read(cx).content().len();
-            ed.update(cx, |e, _| e.set_caret(n));
-            let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            assert!(
-                f.rows.iter().any(|r| r.extra.card.is_some()),
-                "帧应含数学卡片行"
-            );
-            f
-        });
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
-            let slots = ed.read(cx).math_slots();
-            assert!(
-                slots
-                    .borrow()
-                    .contains_key(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}"),
-                "sync_math 应先以 Loading 占位"
-            );
-        });
-        // 驱动后台光栅 + 前台续体（on_math_ready 自增 math_gen）。
-        // 注意：`VisualTestContext::run_until_parked` 只排空后台 executor，
-        // `Context::spawn` 的续体（this.update → on_math_ready）要在前台 dispatcher
-        // 上跑——必须用 `TestAppContext::run_until_parked`，故先释放 vcx 再重取。
-        let _ = vcx;
-        cx.run_until_parked();
-        let win = cx.windows()[0];
-        let mut vcx = VisualTestContext::from_window(win, cx);
-        let (mgenv, mch, row_h, slot_dbg) = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let genv = ed.read(cx).math_gen();
-            let slots = ed.read(cx).math_slots();
-            let slot_dbg = format!(
-                "{:?}",
-                slots
-                    .borrow()
-                    .get(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}")
-                    .map(|s| match s {
-                        super::super::MathSlot::Loading => "Loading",
-                        super::super::MathSlot::Failed => "Failed",
-                        super::super::MathSlot::Ready(..) => "Ready",
-                    })
-            );
-            let reg = inline_style::math_regions(&ed.read(cx).content())
-                .into_iter()
-                .next()
-                .expect("应扫到一块公式");
-            assert_eq!(reg.source, r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}");
-            let h = f32::from(super::math_card_height(ed.read(cx), &reg));
-            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row_h = f2
-                .rows
+        // 单击：光标不动，卡片保持（不 reveal）。
+        let ev1 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev1, window, cx));
+        let caret_before = ed.read(cx).caret();
+        assert_eq!(
+            caret_before,
+            text.find("尾").unwrap(),
+            "单击卡片不得移动光标"
+        );
+        let f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f1.rows
                 .iter()
-                .find(|r| r.extra.card.is_some())
-                .map(|r| f32::from(r.height))
-                .unwrap_or(0.);
-            (genv, h, row_h, slot_dbg)
-        });
-        assert!(
-            mgenv > 0,
-            "公式完成应自增 math_gen（旧 bug：恒 0）：mgen={mgenv} slot={slot_dbg}"
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "单击后卡片仍在（未 reveal）"
         );
+        // 双击：光标进块首（源码行 0）→ reveal 源码（不再有卡片）。
+        let ev2 = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
+        let caret = ed.read(cx).caret();
+        assert!(ed.read(cx).row_col(caret).0 == 0, "双击应把光标放进块首");
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            mch > 42.0 + 1.,
-            "公式就绪后卡片应按位图高（> 42px 回退高）：mch={mch}"
+            !f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "双击后 reveal 源码（无卡片）"
         );
-        assert!(
-            (row_h - mch).abs() < 1.0,
-            "重建帧的卡片行高应等于就绪高：row_h={row_h} mch={mch}"
-        );
-        assert!(
-            row_h > 42.0 + 1.0,
-            "重建帧不应再停在回退高：row_h={row_h}"
-        );
-    }
+    });
+}
 
-    #[gpui::test]
-    fn math_ready_invalidates_only_affected_rows_still_renders_ready(cx: &mut TestAppContext) {
-        // 回归（A-3）：公式就绪不得再让整带无关块全 miss 重排——旧方案 `mgen` 进全局
-        // shape_key，头less 实测每个公式完成整带 67/68 行全重排一次。改动后：行内公式
-        // 行因 spacer 换代由 `on_math_ready` **定向作废**重排（且必须真的换真图）、
-        // `$$` 卡行在 Pass2 blocked 不入缓存无需作废、其余段落保持命中。同时正确性不丢：
-        // 行内行就绪后帧挂 `ready` 位图、`$$` 卡高按真位图（> 42px 回退高）。
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "para0 some words here\npara1 some more words\n$$\nu = v^2\n$$\ninline $a+b$ tail\npara2 words enough\npara3 words enough\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
+#[gpui::test]
+fn math_block_single_line_double_click_reveals_immediately(cx: &mut TestAppContext) {
+    // 单行 `$$…$$` 数学块（`$$\sum…$$` 独占一行）：双击必须**直接**还原成源码
+    // 字符串，不得先变成行内小公式再双击一次。根因：光标放在行首 0 列时
+    // `splice_math_text` 的 `c > span.start` 不成立 → 仍被 splice 成小号行内公式；
+    // 现在放 `$$` 行内容内 1 字节 → 块 reveal 与行内 splice reveal 同时满足。
+    use super::BlockCard;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
         });
-        let vcx: &mut VisualTestContext = vcx;
-        let buf = image::RgbaImage::from_raw(60, 40, vec![0u8; 60 * 40 * 4]).unwrap();
+        ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap())); // 光标在块外
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let card = frame
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+            .expect("单行 `$$…$$` 也应是数学卡片");
+        let (x, y) = (
+            f32::from(frame.padding) + 40.,
+            f32::from(card.top) + f32::from(card.height) / 2.,
+        );
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let ev = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+        // 双击一次：光标在行内（>0 列），卡片消失、不再 splice（直接是字符串）。
+        let caret = ed.read(cx).caret();
+        let (_, col) = ed.read(cx).row_col(caret);
+        assert!(col > 0, "双击后光标应进入块行内部，col={col}");
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            !f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "双击后应无卡片（reveal 源码）"
+        );
+        let row0 = f2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
+        assert!(
+            row0.extra.inline_maths.is_empty(),
+            "单行块双击应直接还原字符串（不得再 splice 成行内公式）"
+        );
+        // 光标移出块（到尾行）后恢复卡片渲染。
+        ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap()));
+        let f3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f3.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "光标移出后应恢复数学卡片（公式感）"
+        );
+    });
+}
+
+#[gpui::test]
+fn sync_math_claims_block_and_inline_slots(cx: &mut TestAppContext) {
+    // 数学排版集成（参考 zorite ensure_content_math）：内容含 `$$…$$` 块 + `$…$`
+    // 行内公式 → `sync_math`（**可见带懒光栅**）按「去定界符的 LaTeX」为键把当前带内
+    // 两块都占为 Loading（真正位图由后台 executor 光栅；CPU 级正确性已由
+    // math_typeset 单测覆盖）。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n内联 $e^{i\\pi}+1=0$ 结束";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let frame = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放在文档末尾（离开数学块与行内公式）→ 块折叠成卡片、行内公式被
+        // splice 带出到 frame.rows → `sync_math` 才能按带内公式 claim 占槽。
+        let n = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(n));
+        build_frame(ed.read(cx), window, px(600.), (0., 999_999.))
+    });
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
+        let slots = ed.read(cx).math_slots();
+        let b = slots.borrow();
+        assert!(
+            b.contains_key(r"\int_0^1 x^2 dx"),
+            "块公式应占位（Loading）：keys={:?}",
+            b.keys()
+        );
+        assert!(
+            b.contains_key(super::super::inline_math_key(r"e^{i\pi}+1=0").as_ref()),
+            "行内公式应占位（Loading，带 inline: 前缀键）：keys={:?}",
+            b.keys()
+        );
+    });
+}
+
+#[gpui::test]
+fn math_card_height_is_single_value_across_slot_states(cx: &mut TestAppContext) {
+    // 块级卡高**单值**：只由源码显示行决定（普通行 `MATH_DISPLAY_LINE_H`、
+    // 高算子行 `MATH_DISPLAY_LINE_TALL_H`），排版槽 Loading/Ready/Failed 同高
+    // ——替换位图/回退不跳卡高（块级输入「大块异常↔正常块」两态回弹的根因是旧实现
+    // Ready 用 `20+位图高`、回退用 `20+n×22` 两个不同高来回跳）。
+    use crate::config::math;
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 高算子单行（∫ + √）→ 20 + 70 = 90，两态同值。
+    let text = "$$\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n$$\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let reg = inline_style::math_regions(&ed.read(cx).content())
+            .into_iter()
+            .next()
+            .expect("应扫到一块公式");
+        // 未就绪（回退）与就绪（任何位图）卡高必须**完全一致**。
+        let h_empty = f32::from(super::math_card_height(ed.read(cx), &reg));
+        let buf = image::RgbaImage::from_raw(40, 24, vec![0u8; 40 * 24 * 4]).unwrap();
         let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
-        let block_key = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(0));
-            let f = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
-            let block_key = f
-                .rows
-                .iter()
-                .find_map(|r| match &r.extra.card {
-                    Some(super::BlockCard::Math { latex, .. }) => Some(latex.trim().to_string()),
-                    _ => None,
+        ed.read(cx).math_slots().borrow_mut().insert(
+            reg.source.clone().into(),
+            super::super::MathSlot::Ready(img, 5000., 68.5),
+        );
+        let h_ready = f32::from(super::math_card_height(ed.read(cx), &reg));
+        assert!(
+            (h_empty - h_ready).abs() < 0.01,
+            "Loading 与 Ready 卡高必须同值：h_empty={h_empty} h_ready={h_ready}"
+        );
+        assert!(
+            (h_empty - (20. + math::MATH_DISPLAY_LINE_TALL_H)).abs() < 0.01,
+            "高算子单行估高 = 20 + 70 = 90（实测位图 68.5 高刚好放得下、不缩）: {h_empty}"
+        );
+        // 普通两行（`\\` 行断，无高算子）→ 20 + 2×40 = 100，同样两态同值。
+        ed.update(cx, |e, _| {
+            e.math_slots().borrow_mut().clear();
+            e.set_source_text("$$\na \\\\ b\n$$");
+        });
+        let reg2 = inline_style::math_regions(&ed.read(cx).content())
+            .into_iter()
+            .next()
+            .expect("第二块公式");
+        let he = f32::from(super::math_card_height(ed.read(cx), &reg2));
+        assert!(
+            (he - (20. + 2. * math::MATH_DISPLAY_LINE_H)).abs() < 0.01,
+            "普通两行估高 = 20 + 80 = 100: {he}"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_ready_bumps_gen_and_rebuilds_card_height(cx: &mut TestAppContext) {
+    // 回归（样式 bug：单行数学块灰底比公式矮/公式越界）：`sync_math` 的
+    // Loading→Ready 完成必须自增 `math_gen`，使帧/折叠计划重建（把卡上画的位图从
+    // Unicode 回退换成真位图、并按新自然宽启用横向滚动）。旧实现 `insert(key,
+    // Ready).is_none()` 判定恒假（key 必先以 Loading 占位 → insert 返回 Some(Loading)），
+    // `on_math_ready` 从不触发 → `math_gen` 恒 0 → 卡片永远停在 Unicode 回退绘制。
+    // （卡高本身改为与槽位无关的单值估计：`math_card_height` 不再需要就绪来换高，
+    // 换代只换图与宽，不再「大块异常↔正常」跳卡高。）
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 与 `math_typeset::tests::rasterizes_to_nonempty_bgra` 同款——ratex 确定支持。
+    // 块后跟一行正文：光标放到文尾落在块外（否则落在闭合 `$$` 行会 reveal 成源码）。
+    let text = "$$\n\\int_{-\\infty}^{\\infty} e^{-x^2} dx = \\sqrt{\\pi}\n$$\n后文";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let frame = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放到文档尾（`$$` 之外）→ 数学块折叠成卡片（不 reveal）。
+        let n = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(n));
+        let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f.rows.iter().any(|r| r.extra.card.is_some()),
+            "帧应含数学卡片行"
+        );
+        f
+    });
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &frame));
+        let slots = ed.read(cx).math_slots();
+        assert!(
+            slots
+                .borrow()
+                .contains_key(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}"),
+            "sync_math 应先以 Loading 占位"
+        );
+    });
+    // 驱动后台光栅 + 前台续体（on_math_ready 自增 math_gen）。
+    // 注意：`VisualTestContext::run_until_parked` 只排空后台 executor，
+    // `Context::spawn` 的续体（this.update → on_math_ready）要在前台 dispatcher
+    // 上跑——必须用 `TestAppContext::run_until_parked`，故先释放 vcx 再重取。
+    let _ = vcx;
+    cx.run_until_parked();
+    let win = cx.windows()[0];
+    let mut vcx = VisualTestContext::from_window(win, cx);
+    let (mgenv, mch, row_h, slot_dbg) = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let genv = ed.read(cx).math_gen();
+        let slots = ed.read(cx).math_slots();
+        let slot_dbg = format!(
+            "{:?}",
+            slots
+                .borrow()
+                .get(r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}")
+                .map(|s| match s {
+                    super::super::MathSlot::Loading => "Loading",
+                    super::super::MathSlot::Failed => "Failed",
+                    super::super::MathSlot::Ready(..) => "Ready",
                 })
-                .expect("$$ 卡");
-            let inline_key = f
-                .rows
-                .iter()
-                .find_map(|r| r.extra.inline_maths.first())
-                .map(|m| m.key.to_string())
-                .expect("行内公式");
-            // 真实管线：sync_math 登记「行内公式→行」并占位 Loading（无窗口下 spawn 不跑，
-            // 下面的手动 Ready + on_math_ready 就是那个「后台完成」）。
-            ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
-            let _ = ed.read(cx).take_reshapes();
-            // 行内公式就绪：只该行重排（其余命中），且新帧该行挂 Ready 位图。
-            ed.update(cx, |e, ecx| {
-                e.math_slots().borrow_mut().insert(
-                    inline_key.as_str().into(),
-                    super::super::MathSlot::Ready(img.clone(), 30., 40.),
-                );
-                e.on_math_ready(&inline_key, ecx);
-            });
-            let f2 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
-            let resh = ed.read(cx).take_reshapes();
-            assert!(
-                resh <= 3,
-                "行内公式就绪应只重排该行/边界（修复前整带全 miss）：resh={resh}"
+        );
+        let reg = inline_style::math_regions(&ed.read(cx).content())
+            .into_iter()
+            .next()
+            .expect("应扫到一块公式");
+        assert_eq!(
+            reg.source,
+            r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}"
+        );
+        let h = f32::from(super::math_card_height(ed.read(cx), &reg));
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row_h = f2
+            .rows
+            .iter()
+            .find(|r| r.extra.card.is_some())
+            .map(|r| f32::from(r.height))
+            .unwrap_or(0.);
+        (genv, h, row_h, slot_dbg)
+    });
+    assert!(
+        mgenv > 0,
+        "公式完成应自增 math_gen（旧 bug：恒 0）：mgen={mgenv} slot={slot_dbg}"
+    );
+    assert!(
+        mch > 42.0 + 1.,
+        "公式就绪后卡片应按位图高（> 42px 回退高）：mch={mch}"
+    );
+    assert!(
+        (row_h - mch).abs() < 1.0,
+        "重建帧的卡片行高应等于就绪高：row_h={row_h} mch={mch}"
+    );
+    assert!(row_h > 42.0 + 1.0, "重建帧不应再停在回退高：row_h={row_h}");
+}
+
+#[gpui::test]
+fn math_ready_invalidates_only_affected_rows_still_renders_ready(cx: &mut TestAppContext) {
+    // 回归（A-3）：公式就绪不得再让整带无关块全 miss 重排——旧方案 `mgen` 进全局
+    // shape_key，头less 实测每个公式完成整带 67/68 行全重排一次。改动后：行内公式
+    // 行因 spacer 换代由 `on_math_ready` **定向作废**重排（且必须真的换真图）、
+    // `$$` 卡行在 Pass2 blocked 不入缓存无需作废、其余段落保持命中。同时正确性不丢：
+    // 行内行就绪后帧挂 `ready` 位图、`$$` 卡高按真位图（> 42px 回退高）。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "para0 some words here\npara1 some more words\n$$\nu = v^2\n$$\ninline $a+b$ tail\npara2 words enough\npara3 words enough\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = image::RgbaImage::from_raw(60, 40, vec![0u8; 60 * 40 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    let block_key = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(0));
+        let f = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+        let block_key = f
+            .rows
+            .iter()
+            .find_map(|r| match &r.extra.card {
+                Some(super::BlockCard::Math { latex, .. }) => Some(latex.trim().to_string()),
+                _ => None,
+            })
+            .expect("$$ 卡");
+        let inline_key = f
+            .rows
+            .iter()
+            .find_map(|r| r.extra.inline_maths.first())
+            .map(|m| m.key.to_string())
+            .expect("行内公式");
+        // 真实管线：sync_math 登记「行内公式→行」并占位 Loading（无窗口下 spawn 不跑，
+        // 下面的手动 Ready + on_math_ready 就是那个「后台完成」）。
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
+        let _ = ed.read(cx).take_reshapes();
+        // 行内公式就绪：只该行重排（其余命中），且新帧该行挂 Ready 位图。
+        ed.update(cx, |e, ecx| {
+            e.math_slots().borrow_mut().insert(
+                inline_key.as_str().into(),
+                super::super::MathSlot::Ready(img.clone(), 30., 40.),
             );
-            let ready_row = f2
-                .rows
-                .iter()
-                .find(|r| r.extra.inline_maths.iter().any(|m| m.ready.is_some()));
-            assert!(
-                ready_row.is_some(),
-                "行内公式就绪后帧应挂 Ready 位图（定向作废把旧 Loading 行换掉了）"
-            );
-            block_key
+            e.on_math_ready(&inline_key, ecx);
         });
-        // `$$` 卡就绪：Pass2 blocked 不入缓存 → 无行可作废，但卡高必须按真位图重建。
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| {
-                e.math_slots().borrow_mut().insert(
-                    block_key.as_str().into(),
-                    super::super::MathSlot::Ready(img.clone(), 30., 40.),
-                );
-                e.on_math_ready(&block_key, ecx);
-            });
-            let f3 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
-            let card_h = f3
-                .rows
-                .iter()
-                .find(|r| r.extra.card.is_some())
-                .map(|r| f32::from(r.height))
-                .unwrap_or(0.);
-            let resh = ed.read(cx).take_reshapes();
-            assert!(
-                card_h > 42. + 1.,
-                "$$ 卡就绪高应按真位图（>42px 回退）：{card_h}"
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+        let resh = ed.read(cx).take_reshapes();
+        assert!(
+            resh <= 3,
+            "行内公式就绪应只重排该行/边界（修复前整带全 miss）：resh={resh}"
+        );
+        let ready_row = f2
+            .rows
+            .iter()
+            .find(|r| r.extra.inline_maths.iter().any(|m| m.ready.is_some()));
+        assert!(
+            ready_row.is_some(),
+            "行内公式就绪后帧应挂 Ready 位图（定向作废把旧 Loading 行换掉了）"
+        );
+        block_key
+    });
+    // `$$` 卡就绪：Pass2 blocked 不入缓存 → 无行可作废，但卡高必须按真位图重建。
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| {
+            e.math_slots().borrow_mut().insert(
+                block_key.as_str().into(),
+                super::super::MathSlot::Ready(img.clone(), 30., 40.),
             );
-            assert!(
-                resh <= 3,
-                "$$ 卡就绪不应整带重排（Pass2 blocked 行不缓存）：resh={resh}"
-            );
+            e.on_math_ready(&block_key, ecx);
         });
+        let f3 = build_frame(ed.read(cx), window, px(600.), (0., 9999.));
+        let card_h = f3
+            .rows
+            .iter()
+            .find(|r| r.extra.card.is_some())
+            .map(|r| f32::from(r.height))
+            .unwrap_or(0.);
+        let resh = ed.read(cx).take_reshapes();
+        assert!(
+            card_h > 42. + 1.,
+            "$$ 卡就绪高应按真位图（>42px 回退）：{card_h}"
+        );
+        assert!(
+            resh <= 3,
+            "$$ 卡就绪不应整带重排（Pass2 blocked 行不缓存）：resh={resh}"
+        );
+    });
+}
+
+#[gpui::test]
+fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
+    // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
+    // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "a $\\int_0^1 x^2 dx$ b";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 注入就绪位图（假数据，纯 CPU，无需 GPU）：40×70 逻辑 px（≈22px 排版的
+        // `\int_0^1` 高）→ 行内 fit = min(fs/22×70, 2.2×行高) ≈ 41.8px > 行高 19。
+        let buf = image::RgbaImage::from_raw(80, 140, vec![0u8; 80 * 140 * 4]).unwrap();
+        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+        ed.read(cx).math_slots().borrow_mut().insert(
+            super::super::inline_math_key("\\int_0^1 x^2 dx"),
+            super::super::MathSlot::Ready(img, 40., 70.),
+        );
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = &frame.rows[0];
+        let lh = f32::from(row.lh);
+        let band = f32::from(row.height);
+        assert!(band > lh + 1.0, "行内公式应撑高行：band={band} > lh={lh}");
+        // 文本带 = [shift, shift+lh]（撑高的下移量，与 paint/公式同源）。
+        let w0 = row.wrapped.first().unwrap();
+        let orig = lh * (w0.wrap_boundaries().len() + 1) as f32;
+        let shift = ((band - orig) / 2.).max(0.);
+        let pad = f32::from(frame.padding);
+        // 点击文本带中部（正文 "a … b" 区域）→ 源偏移应落在行内。
+        let y = shift + lh / 2.;
+        let x = pad + 30.;
+        let off = super::source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
+        let len = ed.read(cx).content().len() as f32;
+        assert!(off as f32 <= len, "点击应解析到行内源偏移：off={off}");
+        ed.update(cx, |e, _| e.set_caret(off));
+        let (on, _caretx, carety) = caret_geometry(ed.read(cx), &frame);
+        assert!(on, "该行可放光标");
+        assert!(
+            f32::from(carety) >= shift - 1.0 && f32::from(carety) <= shift + lh + 1.0,
+            "光标 y {} 应在撑高后的文本带 [{shift}, {}] 内，不能回到块顶空白",
+            f32::from(carety),
+            shift + lh
+        );
+    });
+}
+
+#[gpui::test]
+fn keys_ctrl_a_c_v_select_copy_paste_round_trip(cx: &mut TestAppContext) {
+    // D1/Ctrl 修复：Windows 上 Ctrl 报 `modifiers.control`，而 `cmd-*` 绑定是
+    // `modifiers.platform`（= Win 键）→ 旧实现 Ctrl+C/V/A 全部失效。现在与
+    // `live.rs` 一样显式补 `ctrl-a/c/v` 绑定，经真实键位派发验证整条链路。
+    use gpui::{App, Keystroke};
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    // 安装 WYSIWYG 键位（与 main.rs 的 bind_keys 装配一致）。
+    vcx.update(|_w, cx: &mut App| crate::markdown::wysiwyg::bind_keys(cx));
+    // 聚焦编辑器 → 键位上下文生效。
+    vcx.update(|window, cx| {
+        let fh = host.read(cx).ed.read(cx).focus_handle();
+        window.focus(&fh, cx);
+    });
+    let wh = vcx.windows().first().copied().expect("窗口句柄");
+
+    // Ctrl+A 全选。
+    vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-a").unwrap());
+    vcx.update(|_w, cx| {
+        assert_eq!(
+            host.read(cx).ed.read(cx).selection(),
+            Some(0.."hello world".len()),
+            "Ctrl+A 应全选"
+        );
+    });
+    // Ctrl+C 复制 → 剪贴板。
+    vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-c").unwrap());
+    let clip: Option<String> = vcx.update(|_w, cx: &mut App| {
+        cx.read_from_clipboard()
+            .map(|i| i.text().unwrap_or_default())
+    });
+    assert_eq!(clip.as_deref(), Some("hello world"), "Ctrl+C 应写入剪贴板");
+    // 光标置开头后 Ctrl+V 粘贴（选区替换为插入）。
+    vcx.update(|_w, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_caret(0);
+        });
+    });
+    vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
+    vcx.update(|_w, cx| {
+        assert_eq!(
+            host.read(cx).ed.read(cx).text().as_ref(),
+            "hello worldhello world",
+            "Ctrl+V 应在光标处粘贴剪贴板内容"
+        );
+    });
+}
+
+#[gpui::test]
+fn plain_edit_reuses_derived_cache(cx: &mut TestAppContext) {
+    // 纯文本键入（非结构、行签名不变、不在数学块内）不得触发派生整篇重建：
+    // `derived` Rc 指针不变 + regions 版本不递增——这是「输入不卡死」的基石
+    // （老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_x dx\n$$\n含有 $e^{i\\pi}$ 的一行\n末尾普通段落 here\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        assert_eq!(d.borrow().math_regions.len(), 1, "应扫到这 1 个 $$ 块");
+        (d, ed.read(cx).regions_ver())
+    });
+    // 在「末尾普通段落 here」行中间键入 'a'（纯文本，无 $ / > / ```）。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("here").unwrap() + 2;
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "a", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
+            std::rc::Rc::ptr_eq(&rc0, &d1),
+            "纯文本键入应复用 derived Rc（不整篇重建）"
+        );
+        assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
+        assert_eq!(d1.borrow().math_regions.len(), 1, "块区域数不变");
+        assert_eq!(
+            d1.borrow().math_regions[0].source,
+            "\\int_x dx",
+            "数学块 source 应保持"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_interior_edit_patches_block_source(cx: &mut TestAppContext) {
+    // 编辑 $$ 块**内部**（非边界行）：不整篇重建，只修补该块 `source`——离开块后
+    // 卡片显示更新后的公式（老实现要么整篇重建、要么卡片陈旧显示旧公式）。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_a dx\n$$\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        assert_eq!(d.borrow().math_regions[0].source, "\\int_a dx");
+        (d, ed.read(cx).regions_ver())
+    });
+    // 把内部行 `\int_a dx` 的 'a' 改成 'b'。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("\\int_a").unwrap() + 5; // 落在 'a'
+        ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "b", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(std::rc::Rc::ptr_eq(&rc0, &d1), "数学块内部编辑不应整篇重建");
+        assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
+        assert_eq!(
+            d1.borrow().math_regions[0].source,
+            "\\int_b dx",
+            "块 source 应被单块修补为新公式"
+        );
+    });
+}
+
+#[gpui::test]
+fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
+    // 键入 `$`（行签名变化）→ 派生整篇重建 + regions 版本递增（新 `$…$` 公式
+    // 由「可见带懒光栅」在下一帧 shape 后经 frame.rows claim，见 sync_math 集成）。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        (d, ed.read(cx).regions_ver())
+    });
+    // 行首写入一个完整的行内公式 `$x$`。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.replace_range(0..0, "$x$", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
+            !std::rc::Rc::ptr_eq(&rc0, &d1),
+            "出现 `$` 使行签名变化 → 派生应整篇重建"
+        );
+        assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
+    });
+}
+
+#[gpui::test]
+fn inline_math_interior_edit_reuses_derived(cx: &mut TestAppContext) {
+    // 行内公式**内部**键入（不新增/删除 `$`）：派生不用整篇重建；新公式（`$y$`）
+    // 由下一帧 shape 带出到 `frame.rows[].extra.inline_maths` → `sync_math`（可见带懒
+    // 光栅）按 `inline:y` claim 占槽（不再需要全篇行内清单）。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("text $x$ here\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        (d, ed.read(cx).regions_ver())
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("$x$").unwrap() + 1;
+        ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
+    });
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(std::rc::Rc::ptr_eq(&rc0, &d1), "行内公式内键入不应整篇重建");
+        assert_eq!(ed.read(cx).regions_ver(), rv0);
+        // 光标移出 `$y$`（否则 reveal 显示源码、不 splice）→ 下一帧带内整形行
+        // 带出 `$y$`（sync_math 据此 claim `inline:y`）。
+        let n = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(n));
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let lx: Vec<_> = frame
+            .rows
+            .iter()
+            .flat_map(|r| r.extra.inline_maths.iter().map(|m| m.latex.to_string()))
+            .collect();
+        assert_eq!(
+            lx,
+            vec!["y".to_string()],
+            "帧行内公式应已更新为 $y$：{lx:?}"
+        );
+    });
+}
+
+#[gpui::test]
+fn fold_plan_reused_across_caret_move_and_reveal_applies(cx: &mut TestAppContext) {
+    // 折叠计划缓存**不含 caret**：光标在普通行间移动 → `fold_plan` Rc 复用（不再
+    // 每键/每次光标动整算折叠增量——旧实现 48ms/次）；但光标进数学块 → reveal 生效
+    // （该块还原源码、不装卡片），离开块又折叠回卡片。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_a dx\n$$\n普通段落 one\n普通段落 two\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (plan0, len0) = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(0)); // 文档开头（`$$\n…`）
+        let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+        let plan = ed
+            .read(cx)
+            .fold_plan_rc()
+            .expect("build_frame 应已建折叠计划");
+        (
+            plan,
+            f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
+        )
+    });
+    assert_eq!(len0, 0, "caret 在数学块内 → 不装卡片（reveal 显示源码）");
+    // 移到普通行（caret 离开数学块）→ fold_plan 复用 + 卡片出现。
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("one").unwrap();
+        ed.update(cx, |e, _| e.set_caret(at));
+        let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+        let plan1 = ed.read(cx).fold_plan_rc().expect("折叠计划应已缓存");
+        assert!(
+            std::rc::Rc::ptr_eq(&plan0, &plan1),
+            "仅移动光标不应重建折叠计划"
+        );
+        assert_eq!(
+            f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
+            1,
+            "caret 离开数学块 → 折叠为卡片"
+        );
+    });
+}
+
+/// 行整形缓存（滚动复用）：同带重建不重 shape（仅光标行例外）、重叠带只 shape 新进块。
+#[gpui::test]
+fn shaped_row_cache_reuses_rows_across_band_rebuilds(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..120 {
+        text.push_str(&format!("para line {i} some more words here to wrap\n"));
     }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let n = text.len();
+        // 光标放文档末端（不在可见带内）→ 带内无「光标行 reveal」干扰。
+        ed.update(cx, |e, _| e.set_caret(n));
+        let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+        let r1 = ed.read(cx).take_reshapes();
+        assert!(r1 > 0, "首帧应实际整形：{r1}");
+        let cached1 = ed.read(cx).shape_rows_len();
+        assert!(cached1 > 0, "首帧后缓存应有条目：{cached1}");
+        // 同带重建：全部命中缓存 → 不再整形。
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+        assert_eq!(
+            ed.read(cx).take_reshapes(),
+            0,
+            "同带重建应全部命中行整形缓存"
+        );
+        // 重叠带（下移 300px）：只 shape 新进块的少量行，远少于首帧。
+        let _f3 = build_frame(ed.read(cx), window, px(900.), (300., 1100.));
+        let r3 = ed.read(cx).take_reshapes();
+        assert!(r3 < r1, "重叠带只应重排新进块（{r3} < 首帧 {r1}）");
+    });
+}
 
-    #[gpui::test]
-    fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
-        // 用户实测：行内公式把行撑高后，点击该行「闪烁光标位置不对」——光标几何与
-        // 点击映射必须都按撑高下移量（text_row_shift）定位，否则光标落在块顶空白处。
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "a $\\int_0^1 x^2 dx$ b";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 注入就绪位图（假数据，纯 CPU，无需 GPU）：40×70 逻辑 px（≈22px 排版的
-            // `\int_0^1` 高）→ 行内 fit = min(fs/22×70, 2.2×行高) ≈ 41.8px > 行高 19。
-            let buf = image::RgbaImage::from_raw(80, 140, vec![0u8; 80 * 140 * 4]).unwrap();
-            let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
-            ed.read(cx).math_slots().borrow_mut().insert(
-                super::super::inline_math_key("\\int_0^1 x^2 dx"),
-                super::super::MathSlot::Ready(img, 40., 70.),
-            );
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let row = &frame.rows[0];
-            let lh = f32::from(row.lh);
-            let band = f32::from(row.height);
-            assert!(band > lh + 1.0, "行内公式应撑高行：band={band} > lh={lh}");
-            // 文本带 = [shift, shift+lh]（撑高的下移量，与 paint/公式同源）。
-            let w0 = row.wrapped.first().unwrap();
-            let orig = lh * (w0.wrap_boundaries().len() + 1) as f32;
-            let shift = ((band - orig) / 2.).max(0.);
-            let pad = f32::from(frame.padding);
-            // 点击文本带中部（正文 "a … b" 区域）→ 源偏移应落在行内。
-            let y = shift + lh / 2.;
-            let x = pad + 30.;
-            let off = super::source_offset_at_local(ed.read(cx), &frame, point(px(x), px(y)));
-            let len = ed.read(cx).content().len() as f32;
-            assert!(off as f32 <= len, "点击应解析到行内源偏移：off={off}");
-            ed.update(cx, |e, _| e.set_caret(off));
-            let (on, _caretx, carety) = caret_geometry(ed.read(cx), &frame);
-            assert!(on, "该行可放光标");
-            assert!(
-                f32::from(carety) >= shift - 1.0 && f32::from(carety) <= shift + lh + 1.0,
-                "光标 y {} 应在撑高后的文本带 [{shift}, {}] 内，不能回到块顶空白",
-                f32::from(carety),
-                shift + lh
-            );
-        });
+/// 代码块高亮完成不得让**整带**缓存 miss：旧实现 `code_parse_gen` 恒自增并进全局
+/// `shape_key` → 在代码块内每键打字（内容变 → 新内容解析完成 → gen++）时整带所有
+/// 块（含无关段落）全部 miss 重排（真实窗口顶部密集带 24-34ms/键 → bf.shape 6-8ms）。
+/// 修复后：`on_code_parse_ready` 只**定向作废该代码块的缓存条目**，段落行全部命中，
+/// 每键只重排被编辑/就绪的这一个代码块。
+#[gpui::test]
+fn code_parse_ready_does_not_reshuffle_whole_band(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 顶部密集带：代码块前 6 段 + 一个大代码块（>8 行走后台高亮路径）+ 后 4 段。
+    // 段落行在代码块解析就绪时内容未变 → 必须命中缓存、不得被全局键换代而重排。
+    let mut text = String::new();
+    for i in 0..6 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
     }
-
-    #[gpui::test]
-    fn keys_ctrl_a_c_v_select_copy_paste_round_trip(cx: &mut TestAppContext) {
-        // D1/Ctrl 修复：Windows 上 Ctrl 报 `modifiers.control`，而 `cmd-*` 绑定是
-        // `modifiers.platform`（= Win 键）→ 旧实现 Ctrl+C/V/A 全部失效。现在与
-        // `live.rs` 一样显式补 `ctrl-a/c/v` 绑定，经真实键位派发验证整条链路。
-        use gpui::{App, Keystroke};
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        // 安装 WYSIWYG 键位（与 main.rs 的 bind_keys 装配一致）。
-        vcx.update(|_w, cx: &mut App| crate::markdown::wysiwyg::bind_keys(cx));
-        // 聚焦编辑器 → 键位上下文生效。
-        vcx.update(|window, cx| {
-            let fh = host.read(cx).ed.read(cx).focus_handle();
-            window.focus(&fh, cx);
-        });
-        let wh = vcx.windows().first().copied().expect("窗口句柄");
-
-        // Ctrl+A 全选。
-        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-a").unwrap());
-        vcx.update(|_w, cx| {
-            assert_eq!(
-                host.read(cx).ed.read(cx).selection(),
-                Some(0.."hello world".len()),
-                "Ctrl+A 应全选"
-            );
-        });
-        // Ctrl+C 复制 → 剪贴板。
-        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-c").unwrap());
-        let clip: Option<String> = vcx.update(|_w, cx: &mut App| {
-            cx.read_from_clipboard().map(|i| i.text().unwrap_or_default())
-        });
-        assert_eq!(clip.as_deref(), Some("hello world"), "Ctrl+C 应写入剪贴板");
-        // 光标置开头后 Ctrl+V 粘贴（选区替换为插入）。
-        vcx.update(|_w, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| {
-                e.set_caret(0);
-            });
-        });
-        vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
-        vcx.update(|_w, cx| {
-            assert_eq!(
-                host.read(cx).ed.read(cx).text().as_ref(),
-                "hello worldhello world",
-                "Ctrl+V 应在光标处粘贴剪贴板内容"
-            );
-        });
+    text.push_str("```rust\n");
+    for i in 0..12 {
+        text.push_str(&format!(
+            "fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"
+        ));
     }
-
-    #[gpui::test]
-    fn plain_edit_reuses_derived_cache(cx: &mut TestAppContext) {
-        // 纯文本键入（非结构、行签名不变、不在数学块内）不得触发派生整篇重建：
-        // `derived` Rc 指针不变 + regions 版本不递增——这是「输入不卡死」的基石
-        // （老实现每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s）。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text =
-            "$$\n\\int_x dx\n$$\n含有 $e^{i\\pi}$ 的一行\n末尾普通段落 here\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d = ed.read(cx).derived();
-            assert_eq!(d.borrow().math_regions.len(), 1, "应扫到这 1 个 $$ 块");
-            (d, ed.read(cx).regions_ver())
-        });
-        // 在「末尾普通段落 here」行中间键入 'a'（纯文本，无 $ / > / ```）。
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("here").unwrap() + 2;
-            ed.update(cx, |e, ecx| e.replace_range(at..at, "a", ecx));
-        });
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d1 = ed.read(cx).derived();
-            assert!(
-                std::rc::Rc::ptr_eq(&rc0, &d1),
-                "纯文本键入应复用 derived Rc（不整篇重建）"
-            );
-            assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
-            assert_eq!(d1.borrow().math_regions.len(), 1, "块区域数不变");
-            assert_eq!(
-                d1.borrow().math_regions[0].source, "\\int_x dx",
-                "数学块 source 应保持"
-            );
-        });
+    text.push_str("```\n");
+    for i in 6..10 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
     }
-
-    #[gpui::test]
-    fn math_interior_edit_patches_block_source(cx: &mut TestAppContext) {
-        // 编辑 $$ 块**内部**（非边界行）：不整篇重建，只修补该块 `source`——离开块后
-        // 卡片显示更新后的公式（老实现要么整篇重建、要么卡片陈旧显示旧公式）。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\n\\int_a dx\n$$\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d = ed.read(cx).derived();
-            assert_eq!(d.borrow().math_regions[0].source, "\\int_a dx");
-            (d, ed.read(cx).regions_ver())
-        });
-        // 把内部行 `\int_a dx` 的 'a' 改成 'b'。
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("\\int_a").unwrap() + 5; // 落在 'a'
-            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "b", ecx));
-        });
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d1 = ed.read(cx).derived();
-            assert!(
-                std::rc::Rc::ptr_eq(&rc0, &d1),
-                "数学块内部编辑不应整篇重建"
-            );
-            assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
-            assert_eq!(
-                d1.borrow().math_regions[0].source, "\\int_b dx",
-                "块 source 应被单块修补为新公式"
-            );
-        });
+    // 追加大量尾部段落：把光标（文末）推到 (0., 1600.) 带外，排除「光标行
+    // reveal 必重排」的干扰（与其它缓存复用测试同法）。
+    for i in 10..90 {
+        text.push_str(&format!(
+            "tail para line {i} some more words to wrap here\n"
+        ));
     }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(text.len()));
+        // 首帧：带覆盖代码块（全物化 → 整带入缓存）；随后归零整形计数。
+        let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        let r1 = ed.read(cx).take_reshapes();
+        assert!(r1 > 0, "首帧应实际整形：{r1}");
+        // 模拟代码块后台高亮就绪（`on_code_parse_ready` 只带该代码块首源行）。
+        let code_src_line = 6; // ```rust 围栏所在源行
+        assert_eq!(
+            ed.read(cx).doc().line_str(code_src_line),
+            "```rust",
+            "测试前提：第 {code_src_line} 行应为代码围栏"
+        );
+        ed.update(cx, |e, ecx| e.on_code_parse_ready(&[code_src_line], ecx));
+        // 修复后：只有代码块本身被定向作废重排；段落块全部命中缓存。
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        let r2 = ed.read(cx).take_reshapes();
+        assert_eq!(
+            r2, 1,
+            "代码高亮就绪只应重排该代码块（段落行命中缓存），实际 {r2}/首帧 {r1}"
+        );
+    });
+}
 
-    #[gpui::test]
-    fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
-        // 键入 `$`（行签名变化）→ 派生整篇重建 + regions 版本递增（新 `$…$` 公式
-        // 由「可见带懒光栅」在下一帧 shape 后经 frame.rows claim，见 sync_math 集成）。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d = ed.read(cx).derived();
-            (d, ed.read(cx).regions_ver())
-        });
-        // 行首写入一个完整的行内公式 `$x$`。
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| e.replace_range(0..0, "$x$", ecx));
-        });
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d1 = ed.read(cx).derived();
-            assert!(
-                !std::rc::Rc::ptr_eq(&rc0, &d1),
-                "出现 `$` 使行签名变化 → 派生应整篇重建"
-            );
-            assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
-        });
+/// 内容完全相同的**重复代码块**共享同一解析键：就绪时必须对**每个**副本块定向作废
+/// 缓存（`on_code_parse_ready` 收全部副本的 src_line）——否则旧全局键被移除后第二个
+/// 副本滚回带内会永久保持纯文本（旁路上色）。
+#[gpui::test]
+fn code_parse_ready_rehighlights_identical_duplicate_blocks(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 两个内容逐字节相同的 >8 行 rust 代码块（同一 (lang, code) 键 → 后台只解析一次）。
+    let mut text = String::new();
+    for i in 0..4 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
     }
-
-    #[gpui::test]
-    fn inline_math_interior_edit_reuses_derived(cx: &mut TestAppContext) {
-        // 行内公式**内部**键入（不新增/删除 `$`）：派生不用整篇重建；新公式（`$y$`）
-        // 由下一帧 shape 带出到 `frame.rows[].extra.inline_maths` → `sync_math`（可见带懒
-        // 光栅）按 `inline:y` claim 占槽（不再需要全篇行内清单）。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("text $x$ here\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d = ed.read(cx).derived();
-            (d, ed.read(cx).regions_ver())
-        });
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("$x$").unwrap() + 1;
-            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
-        });
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let d1 = ed.read(cx).derived();
-            assert!(
-                std::rc::Rc::ptr_eq(&rc0, &d1),
-                "行内公式内键入不应整篇重建"
-            );
-            assert_eq!(ed.read(cx).regions_ver(), rv0);
-            // 光标移出 `$y$`（否则 reveal 显示源码、不 splice）→ 下一帧带内整形行
-            // 带出 `$y$`（sync_math 据此 claim `inline:y`）。
-            let n = ed.read(cx).content().len();
-            ed.update(cx, |e, _| e.set_caret(n));
-            let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let lx: Vec<_> = frame
-                .rows
-                .iter()
-                .flat_map(|r| r.extra.inline_maths.iter().map(|m| m.latex.to_string()))
-                .collect();
-            assert_eq!(lx, vec!["y".to_string()], "帧行内公式应已更新为 $y$：{lx:?}");
-        });
+    let mut code_block = String::from("```rust\n");
+    for i in 0..12i32 {
+        code_block.push_str(&format!("fn dup_{i}(a: u32) -> u32 {{\n    a + {i}\n}}\n"));
     }
-
-    #[gpui::test]
-    fn fold_plan_reused_across_caret_move_and_reveal_applies(cx: &mut TestAppContext) {
-        // 折叠计划缓存**不含 caret**：光标在普通行间移动 → `fold_plan` Rc 复用（不再
-        // 每键/每次光标动整算折叠增量——旧实现 48ms/次）；但光标进数学块 → reveal 生效
-        // （该块还原源码、不装卡片），离开块又折叠回卡片。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "$$\n\\int_a dx\n$$\n普通段落 one\n普通段落 two\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let (plan0, len0) = vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(0)); // 文档开头（`$$\n…`）
-            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
-            let plan = ed.read(cx).fold_plan_rc().expect("build_frame 应已建折叠计划");
-            (
-                plan,
-                f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
-            )
-        });
-        assert_eq!(len0, 0, "caret 在数学块内 → 不装卡片（reveal 显示源码）");
-        // 移到普通行（caret 离开数学块）→ fold_plan 复用 + 卡片出现。
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("one").unwrap();
-            ed.update(cx, |e, _| e.set_caret(at));
-            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
-            let plan1 = ed.read(cx).fold_plan_rc().expect("折叠计划应已缓存");
-            assert!(
-                std::rc::Rc::ptr_eq(&plan0, &plan1),
-                "仅移动光标不应重建折叠计划"
-            );
-            assert_eq!(
-                f.rows.iter().filter(|r| r.extra.card.is_some()).count(),
-                1,
-                "caret 离开数学块 → 折叠为卡片"
-            );
-        });
+    code_block.push_str("```\n");
+    let fence_a = text.len();
+    text.push_str(&code_block);
+    let fence_b = text.len();
+    text.push_str(&code_block);
+    for i in 4..90 {
+        text.push_str(&format!(
+            "tail para line {i} some more words to wrap here\n"
+        ));
     }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(text.len())); // 文末 → 带外
+        let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        ed.read(cx).take_reshapes();
+        // 两个围栏首源行（fence_a/B 是字节偏移 → 转为行号）。
+        let la = ed.read(cx).row_col(fence_a).0;
+        let lb = ed.read(cx).row_col(fence_b).0;
+        assert_ne!(la, lb, "测试前提：两个代码块应位于不同源行");
+        // 一次解析就绪 → 对两个相同副本块一并定向作废 → 下帧两个块都重排上色。
+        ed.update(cx, |e, ecx| e.on_code_parse_ready(&[la, lb], ecx));
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        let r2 = ed.read(cx).take_reshapes();
+        assert_eq!(
+            r2, 2,
+            "两个相同代码块副本都应被重排上色（旧全局键/旧单块作废只会上一个），实际 {r2}"
+        );
+    });
+}
 
-    /// 行整形缓存（滚动复用）：同带重建不重 shape（仅光标行例外）、重叠带只 shape 新进块。
-    #[gpui::test]
-    fn shaped_row_cache_reuses_rows_across_band_rebuilds(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..120 {
-            text.push_str(&format!("para line {i} some more words here to wrap\n"));
+/// D1 滚动预热：每次带穿越前把「下一量子带」提前 shape 进缓存 → 穿越时 Pass2
+/// 命中（整形数 ≈ 0），冷态对照组则每穿越都整形成本。只 put 缓存、不动 base 高度。
+#[gpui::test]
+fn prewarm_band_makes_band_cross_near_cache_hit(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::Prewarm;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 连续短段：512px 量子带 ≈ 20+ 块；预热 3 块/帧 × 10 帧覆盖整带。
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!("paragraph number {i} with words here\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let q = 512.;
+        let width = px(900.);
+        // caret 放文末（任何带外），排除 reveal 干扰。
+        ed.update(cx, |e, _| e.set_caret(text.len()));
+
+        // —— 对照组：连续 6 次带穿越（全冷、无预热）——
+        let mut cold: Vec<u64> = Vec::new();
+        for i in 0..6usize {
+            build_frame(
+                ed.read(cx),
+                window,
+                width,
+                (i as f32 * q, i as f32 * q + 512.),
+            );
+            cold.push(ed.read(cx).take_reshapes());
         }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let n = text.len();
-            // 光标放文档末端（不在可见带内）→ 带内无「光标行 reveal」干扰。
-            ed.update(cx, |e, _| e.set_caret(n));
-            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
-            let r1 = ed.read(cx).take_reshapes();
-            assert!(r1 > 0, "首帧应实际整形：{r1}");
-            let cached1 = ed.read(cx).shape_rows_len();
-            assert!(cached1 > 0, "首帧后缓存应有条目：{cached1}");
-            // 同带重建：全部命中缓存 → 不再整形。
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 800.));
-            assert_eq!(
-                ed.read(cx).take_reshapes(),
-                0,
-                "同带重建应全部命中行整形缓存"
-            );
-            // 重叠带（下移 300px）：只 shape 新进块的少量行，远少于首帧。
-            let _f3 = build_frame(ed.read(cx), window, px(900.), (300., 1100.));
-            let r3 = ed.read(cx).take_reshapes();
-            assert!(
-                r3 < r1,
-                "重叠带只应重排新进块（{r3} < 首帧 {r1}）"
-            );
-        });
-    }
+        let cold_sum: u64 = cold.iter().sum();
+        assert!(cold_sum > 0, "冷态穿越应有整形：{cold:?}");
+        assert!(
+            cold.iter().all(|&c| c > 0),
+            "冷态每一穿越都应整形：{cold:?}"
+        );
 
-    /// 代码块高亮完成不得让**整带**缓存 miss：旧实现 `code_parse_gen` 恒自增并进全局
-    /// `shape_key` → 在代码块内每键打字（内容变 → 新内容解析完成 → gen++）时整带所有
-    /// 块（含无关段落）全部 miss 重排（真实窗口顶部密集带 24-34ms/键 → bf.shape 6-8ms）。
-    /// 修复后：`on_code_parse_ready` 只**定向作废该代码块的缓存条目**，段落行全部命中，
-    /// 每键只重排被编辑/就绪的这一个代码块。
-    #[gpui::test]
-    fn code_parse_ready_does_not_reshuffle_whole_band(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 顶部密集带：代码块前 6 段 + 一个大代码块（>8 行走后台高亮路径）+ 后 4 段。
-        // 段落行在代码块解析就绪时内容未变 → 必须命中缓存、不得被全局键换代而重排。
-        let mut text = String::new();
-        for i in 0..6 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        text.push_str("```rust\n");
-        for i in 0..12 {
-            text.push_str(&format!("fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"));
-        }
-        text.push_str("```\n");
-        for i in 6..10 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        // 追加大量尾部段落：把光标（文末）推到 (0., 1600.) 带外，排除「光标行
-        // reveal 必重排」的干扰（与其它缓存复用测试同法）。
-        for i in 10..90 {
-            text.push_str(&format!("tail para line {i} some more words to wrap here\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+        // —— 预热组：同一 editor 清缓存/清预热状态后重来 ——
+        ed.update(cx, |e, _| {
+            e.shape_rows.borrow_mut().clear();
+            *e.prewarm.borrow_mut() = Prewarm::default();
+            e.set_caret(text.len());
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(text.len()));
-            // 首帧：带覆盖代码块（全物化 → 整带入缓存）；随后归零整形计数。
-            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            let r1 = ed.read(cx).take_reshapes();
-            assert!(r1 > 0, "首帧应实际整形：{r1}");
-            // 模拟代码块后台高亮就绪（`on_code_parse_ready` 只带该代码块首源行）。
-            let code_src_line = 6; // ```rust 围栏所在源行
-            assert_eq!(
-                ed.read(cx).doc().line_str(code_src_line),
-                "```rust",
-                "测试前提：第 {code_src_line} 行应为代码围栏"
-            );
-            ed.update(cx, |e, ecx| e.on_code_parse_ready(&[code_src_line], ecx));
-            // 修复后：只有代码块本身被定向作废重排；段落块全部命中缓存。
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            let r2 = ed.read(cx).take_reshapes();
-            assert_eq!(
-                r2, 1,
-                "代码高亮就绪只应重排该代码块（段落行命中缓存），实际 {r2}/首帧 {r1}"
-            );
-        });
-    }
-
-    /// 内容完全相同的**重复代码块**共享同一解析键：就绪时必须对**每个**副本块定向作废
-    /// 缓存（`on_code_parse_ready` 收全部副本的 src_line）——否则旧全局键被移除后第二个
-    /// 副本滚回带内会永久保持纯文本（旁路上色）。
-    #[gpui::test]
-    fn code_parse_ready_rehighlights_identical_duplicate_blocks(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 两个内容逐字节相同的 >8 行 rust 代码块（同一 (lang, code) 键 → 后台只解析一次）。
-        let mut text = String::new();
-        for i in 0..4 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        let mut code_block = String::from("```rust\n");
-        for i in 0..12i32 {
-            code_block.push_str(&format!("fn dup_{i}(a: u32) -> u32 {{\n    a + {i}\n}}\n"));
-        }
-        code_block.push_str("```\n");
-        let fence_a = text.len();
-        text.push_str(&code_block);
-        let fence_b = text.len();
-        text.push_str(&code_block);
-        for i in 4..90 {
-            text.push_str(&format!("tail para line {i} some more words to wrap here\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(text.len())); // 文末 → 带外
-            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            ed.read(cx).take_reshapes();
-            // 两个围栏首源行（fence_a/B 是字节偏移 → 转为行号）。
-            let la = ed.read(cx).row_col(fence_a).0;
-            let lb = ed.read(cx).row_col(fence_b).0;
-            assert_ne!(la, lb, "测试前提：两个代码块应位于不同源行");
-            // 一次解析就绪 → 对两个相同副本块一并定向作废 → 下帧两个块都重排上色。
-            ed.update(cx, |e, ecx| e.on_code_parse_ready(&[la, lb], ecx));
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            let r2 = ed.read(cx).take_reshapes();
-            assert_eq!(
-                r2, 2,
-                "两个相同代码块副本都应被重排上色（旧全局键/旧单块作废只会上一个），实际 {r2}"
-            );
-        });
-    }
-
-    /// D1 滚动预热：每次带穿越前把「下一量子带」提前 shape 进缓存 → 穿越时 Pass2
-    /// 命中（整形数 ≈ 0），冷态对照组则每穿越都整形成本。只 put 缓存、不动 base 高度。
-    #[gpui::test]
-    fn prewarm_band_makes_band_cross_near_cache_hit(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::Prewarm;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 连续短段：512px 量子带 ≈ 20+ 块；预热 3 块/帧 × 10 帧覆盖整带。
-        let mut text = String::new();
-        for i in 0..4000 {
-            text.push_str(&format!("paragraph number {i} with words here\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let q = 512.;
-            let width = px(900.);
-            // caret 放文末（任何带外），排除 reveal 干扰。
-            ed.update(cx, |e, _| e.set_caret(text.len()));
-
-            // —— 对照组：连续 6 次带穿越（全冷、无预热）——
-            let mut cold: Vec<u64> = Vec::new();
-            for i in 0..6usize {
-                build_frame(ed.read(cx), window, width, (i as f32 * q, i as f32 * q + 512.));
-                cold.push(ed.read(cx).take_reshapes());
+        let mut warm: Vec<u64> = Vec::new();
+        for i in 0..8usize {
+            let bw = i as f32 * q;
+            let f = build_frame(ed.read(cx), window, width, (bw, bw + 512.));
+            if i == 0 {
+                // 首带冷建（不计入穿越整形）；随后对带 1 建立方向并预热。
+                ed.read(cx).take_reshapes();
+                prewarm_band(ed.read(cx), &f, window);
+                continue;
             }
-            let cold_sum: u64 = cold.iter().sum();
-            assert!(cold_sum > 0, "冷态穿越应有整形：{cold:?}");
-            assert!(
-                cold.iter().all(|&c| c > 0),
-                "冷态每一穿越都应整形：{cold:?}"
-            );
-
-            // —— 预热组：同一 editor 清缓存/清预热状态后重来 ——
-            ed.update(cx, |e, _| {
-                e.shape_rows.borrow_mut().clear();
-                *e.prewarm.borrow_mut() = Prewarm::default();
-                e.set_caret(text.len());
-            });
-            let mut warm: Vec<u64> = Vec::new();
-            for i in 0..8usize {
-                let bw = i as f32 * q;
-                let f = build_frame(ed.read(cx), window, width, (bw, bw + 512.));
-                if i == 0 {
-                    // 首带冷建（不计入穿越整形）；随后对带 1 建立方向并预热。
-                    ed.read(cx).take_reshapes();
-                    prewarm_band(ed.read(cx), &f, window);
-                    continue;
-                }
-                // 本带穿越整形（上一帧已对带 i-1 执行过 10 次预热 → 命中应接近 0）。
-                warm.push(ed.read(cx).take_reshapes());
-                // 对本带 frame 预热下一带（i+1）：3 块/帧 × 10 帧覆盖整带。
-                for _ in 0..10 {
-                    prewarm_band(ed.read(cx), &f, window);
-                }
+            // 本带穿越整形（上一帧已对带 i-1 执行过 10 次预热 → 命中应接近 0）。
+            warm.push(ed.read(cx).take_reshapes());
+            // 对本带 frame 预热下一带（i+1）：3 块/帧 × 10 帧覆盖整带。
+            for _ in 0..10 {
+                prewarm_band(ed.read(cx), &f, window);
             }
-            let warm_sum: u64 = warm.iter().sum();
-            println!(
-                "[prewarm] cold={cold:?} (sum {cold_sum}) vs warm={warm:?} (sum {warm_sum})"
-            );
-            // 预热后每带穿越只应补极少量整形（首个冷带除外）：总计应远小于冷态总和。
-            assert!(
-                warm_sum < cold_sum / 3,
-                "预热后穿越应接近缓存命中：warm {warm:?} ({warm_sum}) vs cold {cold:?} ({cold_sum})"
-            );
-            assert!(
-                warm[1..].iter().all(|&c| c <= 2),
-                "进入稳态后每次穿越至多补 2 次整形：{warm:?}"
-            );
-        });
-    }
-
-    /// D1 速度自适应预算的公式单测：快滚（vel 大）时预算按比例放大、且硬封顶。
-    #[test]
-    fn prewarm_effective_budget_scales_with_velocity() {
-        use crate::markdown::wysiwyg::Prewarm;
-        let p = Prewarm::default();
-        assert_eq!(p.blocks_per_frame, 3, "基础预算默认 3 块/帧");
-        assert_eq!(p.effective_budget(0), 3, "静止/带内微滚只用基础预算");
-        assert_eq!(p.effective_budget(1), 7, "匀速 1 带/帧 → 预算 7");
-        assert_eq!(p.effective_budget(3), 15, "跨 3 带/帧 → 预算 15（近一档块数）");
-        assert_eq!(p.effective_budget(4), 19, "跨 4 带/帧 → 预算 19");
-        assert_eq!(p.effective_budget(100), Prewarm::MAX_BUDGET, "任意速度预算硬封顶");
-        assert!(p.effective_budget(4) >= 15, "快滚单帧预算应足以盖住一档的大部分块");
-    }
-
-    /// D1 速度自适应的接线回归：一次跨多带（快滚）后，下一帧预热应一次整形成倍块数
-    /// （非固定 3 块）——证明 `prewarm_band` 已用带序号跳跃算速度、按速度放大预算。
-    #[gpui::test]
-    fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..4000 {
-            text.push_str(&format!("paragraph number {i} with words here\n"));
         }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let q = 512.;
-            let width = px(900.);
-            ed.update(cx, |e, _| e.set_caret(text.len()));
+        let warm_sum: u64 = warm.iter().sum();
+        println!("[prewarm] cold={cold:?} (sum {cold_sum}) vs warm={warm:?} (sum {warm_sum})");
+        // 预热后每带穿越只应补极少量整形（首个冷带除外）：总计应远小于冷态总和。
+        assert!(
+            warm_sum < cold_sum / 3,
+            "预热后穿越应接近缓存命中：warm {warm:?} ({warm_sum}) vs cold {cold:?} ({cold_sum})"
+        );
+        assert!(
+            warm[1..].iter().all(|&c| c <= 2),
+            "进入稳态后每次穿越至多补 2 次整形：{warm:?}"
+        );
+    });
+}
 
-            // 首帧登记带 0（无方向）；再对同一带预热 → dir 仍 0、直接返回（不整形）。
-            let f0 = build_frame(ed.read(cx), window, width, (0., q));
-            prewarm_band(ed.read(cx), &f0, window);
-            prewarm_band(ed.read(cx), &f0, window);
+/// D1 速度自适应预算的公式单测：快滚（vel 大）时预算按比例放大、且硬封顶。
+#[test]
+fn prewarm_effective_budget_scales_with_velocity() {
+    use crate::markdown::wysiwyg::Prewarm;
+    let p = Prewarm::default();
+    assert_eq!(p.blocks_per_frame, 3, "基础预算默认 3 块/帧");
+    assert_eq!(p.effective_budget(0), 3, "静止/带内微滚只用基础预算");
+    assert_eq!(p.effective_budget(1), 7, "匀速 1 带/帧 → 预算 7");
+    assert_eq!(
+        p.effective_budget(3),
+        15,
+        "跨 3 带/帧 → 预算 15（近一档块数）"
+    );
+    assert_eq!(p.effective_budget(4), 19, "跨 4 带/帧 → 预算 19");
+    assert_eq!(
+        p.effective_budget(100),
+        Prewarm::MAX_BUDGET,
+        "任意速度预算硬封顶"
+    );
+    assert!(
+        p.effective_budget(4) >= 15,
+        "快滚单帧预算应足以盖住一档的大部分块"
+    );
+}
 
-            // 一次跳 3 个带（快滚）：方向置 +1、vel=3 → 预算 15。
-            let f1 = build_frame(ed.read(cx), window, width, (3. * q, 4. * q));
-            ed.read(cx).take_reshapes(); // 清 build_frame 自身的 Pass2 整形计数
-            prewarm_band(ed.read(cx), &f1, window);
-            let d1 = ed.read(cx).take_prewarm_shapes();
-            assert!(
-                (12..=15).contains(&d1),
-                "跨 3 带/帧应一次整形成倍块数（预算 15），实际 {d1}"
-            );
-
-            // 同一带再预热（vel=0）：回落到基础预算 3。
-            prewarm_band(ed.read(cx), &f1, window);
-            let d2 = ed.read(cx).take_prewarm_shapes();
-            assert!(
-                (1..=3).contains(&d2),
-                "静止时回落到基础预算 3，实际 {d2}"
-            );
-        });
+/// D1 速度自适应的接线回归：一次跨多带（快滚）后，下一帧预热应一次整形成倍块数
+/// （非固定 3 块）——证明 `prewarm_band` 已用带序号跳跃算速度、按速度放大预算。
+#[gpui::test]
+fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!("paragraph number {i} with words here\n"));
     }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let q = 512.;
+        let width = px(900.);
+        ed.update(cx, |e, _| e.set_caret(text.len()));
 
-    /// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑**保留编辑线之前的块**、
-    /// 作废受影响/位移后缀（比旧「整表清空」更进一步：Enter 后 Prefix 行仍命中缓存）。
-    #[gpui::test]
-    fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..80 {
-            text.push_str(&format!("paragraph number {i} here\n"));
+        // 首帧登记带 0（无方向）；再对同一带预热 → dir 仍 0、直接返回（不整形）。
+        let f0 = build_frame(ed.read(cx), window, width, (0., q));
+        prewarm_band(ed.read(cx), &f0, window);
+        prewarm_band(ed.read(cx), &f0, window);
+
+        // 一次跳 3 个带（快滚）：方向置 +1、vel=3 → 预算 15。
+        let f1 = build_frame(ed.read(cx), window, width, (3. * q, 4. * q));
+        ed.read(cx).take_reshapes(); // 清 build_frame 自身的 Pass2 整形计数
+        prewarm_band(ed.read(cx), &f1, window);
+        let d1 = ed.read(cx).take_prewarm_shapes();
+        assert!(
+            (12..=15).contains(&d1),
+            "跨 3 带/帧应一次整形成倍块数（预算 15），实际 {d1}"
+        );
+
+        // 同一带再预热（vel=0）：回落到基础预算 3。
+        prewarm_band(ed.read(cx), &f1, window);
+        let d2 = ed.read(cx).take_prewarm_shapes();
+        assert!((1..=3).contains(&d2), "静止时回落到基础预算 3，实际 {d2}");
+    });
+}
+
+/// 非结构性编辑只作废**被编辑块**的整形缓存；结构性编辑**保留编辑线之前的块**、
+/// 作废受影响/位移后缀（比旧「整表清空」更进一步：Enter 后 Prefix 行仍命中缓存）。
+#[gpui::test]
+fn non_structural_edit_invalidates_only_edited_block(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..80 {
+        text.push_str(&format!("paragraph number {i} here\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(text.len()));
+        // 带限前 ~72 行（每段 ≈22px）；caret 在文末（带外）→ 不干扰缓存断言。
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        let cached = ed.read(cx).shape_rows_len();
+        assert!(cached > 0);
+        // 归零整形计数（只统计编辑后的重建）。
+        ed.read(cx).take_reshapes();
+        // 在「paragraph number 5」行内做一次**非结构性**单字符替换。
+        let at = text.find("number 5").unwrap() + 7;
+        let blk_edit = ed
+            .read(cx)
+            .doc()
+            .block_index_for_line(ed.read(cx).row_col(at).0);
+        assert!(ed.read(cx).shape_rows_has(blk_edit), "编辑前该块应已缓存");
+        ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "X", ecx));
+        // 被编辑块被剔除；其它块仍复用 → 缓存条目数不变（该块条目已被删）。
+        assert!(
+            !ed.read(cx).shape_rows_has(blk_edit),
+            "非结构性编辑应剔除被编辑块的整形缓存"
+        );
+        // 重建带：只有被编辑块被重排（其它块仍命中）。光标此刻在该行 → 也算光标行，
+        // 仍只重排 1 行。
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        let r = ed.read(cx).take_reshapes();
+        assert_eq!(r, 1, "只应重排被编辑块，实际 {r}");
+        // 结构性编辑（插入换行）→ 受影响/位移的后缀作废，编辑线之前的块保留
+        // （前缀复用，Pass2 免整带重 shape；旧实现整表 clear 后 Enter 每键重排整带）。
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        let after = ed.read(cx).shape_rows_len();
+        assert!(
+            after > 0 && after < cached,
+            "结构编辑应保留前缀缓存、作废后缀（{after} 于 {cached}）"
+        );
+        assert!(
+            !ed.read(cx).shape_rows_has(blk_edit),
+            "结构编辑应剔除被编辑块"
+        );
+    });
+}
+
+/// 表格/代码**内容行**的单字符键入按几何不变 → 非结构性：`struct_ver` 不递增
+/// （不触发整篇 Pass1 + fold_plan 重建）、整形缓存整体保留、只重排被编辑块。
+#[gpui::test]
+fn table_cell_typing_is_non_structural(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::from("| a | b |\n|---|---|\n");
+    for i in 0..60 {
+        text.push_str(&format!("| cell {i} | val |\n"));
+    }
+    text.push_str("para before\n");
+    text.push_str("para after\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
+        let cached0 = ed.read(cx).shape_rows_len();
+        assert!(cached0 > 0);
+        ed.read(cx).take_reshapes();
+        let sv0 = ed.read(cx).struct_ver();
+        let at = text.find("cell 5").unwrap() + 3;
+        let blk = ed
+            .read(cx)
+            .doc()
+            .block_index_for_line(ed.read(cx).row_col(at).0);
+        assert!(ed.read(cx).shape_rows_has(blk), "编辑前被编辑表块应已缓存");
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "X", ecx));
+        assert_eq!(
+            ed.read(cx).struct_ver(),
+            sv0,
+            "表内单字符键入不得递增 struct_ver（不得触发整篇 Pass1）"
+        );
+        assert!(
+            !ed.read(cx).shape_rows_has(blk),
+            "被编辑表块应从整形缓存剔除（局部作废）"
+        );
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
+        assert_eq!(
+            ed.read(cx).shape_rows_len(),
+            cached0,
+            "重建后缓存条目数应复原（其余块未被清除）"
+        );
+        let r = ed.read(cx).take_reshapes();
+        assert_eq!(r, 1, "只应重排被编辑的表块，实际 {r}");
+    });
+}
+
+/// 字号/主题变化 → 行整形缓存整体清空（否则旧字号的行宽/高被复用）。
+#[gpui::test]
+fn font_change_clears_shape_cache(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+        assert!(ed.read(cx).shape_rows_len() > 0);
+        ed.update(cx, |e, _| e.set_font_size(px(18.)));
+        assert_eq!(
+            ed.read(cx).shape_rows_len(),
+            0,
+            "字号变化应整体清空行整形缓存"
+        );
+    });
+}
+
+/// 光标移动不触碰行整形缓存（仅清帧）→ 重建仍复用缓存。
+#[gpui::test]
+fn caret_move_keeps_shape_cache(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\npara line eee\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| e.set_caret(text.len()));
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 600.));
+        let cached = ed.read(cx).shape_rows_len();
+        assert!(cached > 0);
+        ed.read(cx).take_reshapes();
+        // 光标移到带内文本行 → 只重排该行（caret reveal 守卫）；其余缓存行均复用。
+        ed.update(cx, |e, _| e.set_caret(0));
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 600.));
+        let r = ed.read(cx).take_reshapes();
+        assert!(
+            r <= 2,
+            "光标移动最多重排光标行 + 原光标行（均未缓存），其余行复用（实际 {r}）"
+        );
+        assert!(
+            ed.read(cx).shape_rows_len() >= 3,
+            "光标移动不应清空行整形缓存"
+        );
+    });
+}
+
+/// B3 增量派生：结构编辑（Enter）后 math 区域**行号平移**而非整篇重扫——编辑线之上
+/// 不变、之下平移 Δ；无区域跨线 → `regions_ver` 不递增（不重建 derived）；区域跨线
+/// （编辑落在 $$ 块内）→ 回退整篇重建（regions_ver++）。
+#[gpui::test]
+fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "para one\n$$\n\\int_a b dx\n$$\npara two\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let ranges = |e: &gpui::Entity<WyEditor>, cx: &App| -> Vec<std::ops::Range<usize>> {
+            e.read(cx)
+                .derived()
+                .borrow()
+                .math_regions
+                .iter()
+                .map(|r| r.range.clone())
+                .collect()
+        };
+        assert_eq!(ranges(&ed, cx), vec![1usize..4], "初始 $$ 块占行 1..4");
+        let v0 = ed.read(cx).regions_ver();
+        // 行 0（para one）末按 Enter → 整块 $$ 下移一行；无跨线 → 增量平移。
+        let at = ed.read(cx).text().as_ref().find('\n').unwrap();
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        assert_eq!(
+            ranges(&ed, cx),
+            vec![2usize..5],
+            "Enter 后 $$ 块整体下移一行"
+        );
+        assert_eq!(
+            ed.read(cx).regions_ver(),
+            v0,
+            "无区域跨线 → 只用行号平移，不重建派生（B3 增量）"
+        );
+        // 结构编辑落在 $$ 块内（跨线）→ 回退整篇重建（区域内容变了无法纯平移）。
+        let at2 = ed.read(cx).text().as_ref().find("\\int_a").unwrap() + 3;
+        let v1 = ed.read(cx).regions_ver();
+        ed.update(cx, |e, ecx| e.replace_range(at2..at2, "\n", ecx));
+        assert_eq!(
+            ed.read(cx).regions_ver(),
+            v1.wrapping_add(1),
+            "结构编辑落在 $$ 块内 → 区域内容变化 → 整篇重建派生"
+        );
+    });
+}
+
+/// B2 撤销事务合并：连续键入（同意图 + 邻接）并入一个撤销单元；光标移动打断
+/// 组（移动后键入独立单元）；Enter/纸类编辑为原子单元。
+#[gpui::test]
+fn undo_b2_groups_typing_and_breaks_on_caret(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 连续键入 abc → 一个撤销单元。
+        for ch in ["a", "b", "c"] {
+            ed.update(cx, |e, ecx| {
+                let at = e.caret();
+                e.replace_range(at..at, ch, ecx);
+            });
         }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+        assert_eq!(ed.read(cx).text().as_ref(), "abc");
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "",
+            "连续键入一次撤销应整组回退（B2 合并）"
+        );
+        // 重做回 abc。
+        ed.update(cx, |e, ecx| e.redo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "abc");
+        // 光标移动 → 打断：移动后键入 z 是独立撤销单元。
+        ed.update(cx, |e, ecx| {
+            e.set_caret(0);
+            e.replace_range(0..0, "z", ecx);
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(text.len()));
-            // 带限前 ~72 行（每段 ≈22px）；caret 在文末（带外）→ 不干扰缓存断言。
-            let _f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            let cached = ed.read(cx).shape_rows_len();
-            assert!(cached > 0);
-            // 归零整形计数（只统计编辑后的重建）。
-            ed.read(cx).take_reshapes();
-            // 在「paragraph number 5」行内做一次**非结构性**单字符替换。
-            let at = text.find("number 5").unwrap() + 7;
-            let blk_edit = ed.read(cx).doc().block_index_for_line(ed.read(cx).row_col(at).0);
-            assert!(ed.read(cx).shape_rows_has(blk_edit), "编辑前该块应已缓存");
-            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "X", ecx));
-            // 被编辑块被剔除；其它块仍复用 → 缓存条目数不变（该块条目已被删）。
-            assert!(
-                !ed.read(cx).shape_rows_has(blk_edit),
-                "非结构性编辑应剔除被编辑块的整形缓存"
-            );
-            // 重建带：只有被编辑块被重排（其它块仍命中）。光标此刻在该行 → 也算光标行，
-            // 仍只重排 1 行。
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
-            let r = ed.read(cx).take_reshapes();
-            assert_eq!(r, 1, "只应重排被编辑块，实际 {r}");
-            // 结构性编辑（插入换行）→ 受影响/位移的后缀作废，编辑线之前的块保留
-            // （前缀复用，Pass2 免整带重 shape；旧实现整表 clear 后 Enter 每键重排整带）。
-            ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
-            let after = ed.read(cx).shape_rows_len();
-            assert!(
-                after > 0 && after < cached,
-                "结构编辑应保留前缀缓存、作废后缀（{after} 于 {cached}）"
-            );
-            assert!(
-                !ed.read(cx).shape_rows_has(blk_edit),
-                "结构编辑应剔除被编辑块"
-            );
-        });
-    }
+        assert_eq!(ed.read(cx).text().as_ref(), "zabc");
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "abc", "z 独立撤销");
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "",
+            "光标移动后 z 与 abc 分属两个单元"
+        );
+    });
+}
 
-    /// 表格/代码**内容行**的单字符键入按几何不变 → 非结构性：`struct_ver` 不递增
-    /// （不触发整篇 Pass1 + fold_plan 重建）、整形缓存整体保留、只重排被编辑块。
-    #[gpui::test]
-    fn table_cell_typing_is_non_structural(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::from("| a | b |\n|---|---|\n");
-        for i in 0..60 {
-            text.push_str(&format!("| cell {i} | val |\n"));
-        }
-        text.push_str("para before\n");
-        text.push_str("para after\n");
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let _f = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
-            let cached0 = ed.read(cx).shape_rows_len();
-            assert!(cached0 > 0);
-            ed.read(cx).take_reshapes();
-            let sv0 = ed.read(cx).struct_ver();
-            let at = text.find("cell 5").unwrap() + 3;
-            let blk = ed.read(cx).doc().block_index_for_line(ed.read(cx).row_col(at).0);
-            assert!(ed.read(cx).shape_rows_has(blk), "编辑前被编辑表块应已缓存");
-            ed.update(cx, |e, ecx| e.replace_range(at..at, "X", ecx));
-            assert_eq!(
-                ed.read(cx).struct_ver(),
-                sv0,
-                "表内单字符键入不得递增 struct_ver（不得触发整篇 Pass1）"
-            );
-            assert!(
-                !ed.read(cx).shape_rows_has(blk),
-                "被编辑表块应从整形缓存剔除（局部作废）"
-            );
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 10_000.));
-            assert_eq!(
-                ed.read(cx).shape_rows_len(),
-                cached0,
-                "重建后缓存条目数应复原（其余块未被清除）"
-            );
-            let r = ed.read(cx).take_reshapes();
-            assert_eq!(r, 1, "只应重排被编辑的表块，实际 {r}");
-        });
-    }
-
-    /// 字号/主题变化 → 行整形缓存整体清空（否则旧字号的行宽/高被复用）。
-    #[gpui::test]
-    fn font_change_clears_shape_cache(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let _f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
-            assert!(ed.read(cx).shape_rows_len() > 0);
-            ed.update(cx, |e, _| e.set_font_size(px(18.)));
-            assert_eq!(
-                ed.read(cx).shape_rows_len(),
-                0,
-                "字号变化应整体清空行整形缓存"
-            );
-        });
-    }
-
-    /// 光标移动不触碰行整形缓存（仅清帧）→ 重建仍复用缓存。
-    #[gpui::test]
-    fn caret_move_keeps_shape_cache(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "para line aaa\npara line bbb\npara line ccc\npara line ddd\npara line eee\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, _| e.set_caret(text.len()));
-            let _f = build_frame(ed.read(cx), window, px(900.), (0., 600.));
-            let cached = ed.read(cx).shape_rows_len();
-            assert!(cached > 0);
-            ed.read(cx).take_reshapes();
-            // 光标移到带内文本行 → 只重排该行（caret reveal 守卫）；其余缓存行均复用。
-            ed.update(cx, |e, _| e.set_caret(0));
-            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 600.));
-            let r = ed.read(cx).take_reshapes();
-            assert!(
-                r <= 2,
-                "光标移动最多重排光标行 + 原光标行（均未缓存），其余行复用（实际 {r}）"
-            );
-            assert!(
-                ed.read(cx).shape_rows_len() >= 3,
-                "光标移动不应清空行整形缓存"
-            );
-        });
-    }
-
-    /// B3 增量派生：结构编辑（Enter）后 math 区域**行号平移**而非整篇重扫——编辑线之上
-    /// 不变、之下平移 Δ；无区域跨线 → `regions_ver` 不递增（不重建 derived）；区域跨线
-    /// （编辑落在 $$ 块内）→ 回退整篇重建（regions_ver++）。
-    #[gpui::test]
-    fn structural_enter_shifts_derived_math_regions(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = "para one\n$$\n\\int_a b dx\n$$\npara two\n";
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let _f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
-            let ranges =
-                |e: &gpui::Entity<WyEditor>, cx: &App| -> Vec<std::ops::Range<usize>> {
-                    e.read(cx).derived().borrow().math_regions.iter().map(|r| r.range.clone()).collect()
-                };
-            assert_eq!(ranges(&ed, cx), vec![1usize..4], "初始 $$ 块占行 1..4");
-            let v0 = ed.read(cx).regions_ver();
-            // 行 0（para one）末按 Enter → 整块 $$ 下移一行；无跨线 → 增量平移。
-            let at = ed.read(cx).text().as_ref().find('\n').unwrap();
-            ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
-            assert_eq!(ranges(&ed, cx), vec![2usize..5], "Enter 后 $$ 块整体下移一行");
-            assert_eq!(
-                ed.read(cx).regions_ver(),
-                v0,
-                "无区域跨线 → 只用行号平移，不重建派生（B3 增量）"
-            );
-            // 结构编辑落在 $$ 块内（跨线）→ 回退整篇重建（区域内容变了无法纯平移）。
-            let at2 = ed.read(cx).text().as_ref().find("\\int_a").unwrap() + 3;
-            let v1 = ed.read(cx).regions_ver();
-            ed.update(cx, |e, ecx| e.replace_range(at2..at2, "\n", ecx));
-            assert_eq!(
-                ed.read(cx).regions_ver(),
-                v1.wrapping_add(1),
-                "结构编辑落在 $$ 块内 → 区域内容变化 → 整篇重建派生"
-            );
-        });
-    }
-
-    /// B2 撤销事务合并：连续键入（同意图 + 邻接）并入一个撤销单元；光标移动打断
-    /// 组（移动后键入独立单元）；Enter/纸类编辑为原子单元。
-    #[gpui::test]
-    fn undo_b2_groups_typing_and_breaks_on_caret(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 连续键入 abc → 一个撤销单元。
-            for ch in ["a", "b", "c"] {
-                ed.update(cx, |e, ecx| {
-                    let at = e.caret();
-                    e.replace_range(at..at, ch, ecx);
-                });
+/// B2 撤销合并：连续退格经 `replace_range`（纯删除、首尾相接）合并成一个单元。
+#[gpui::test]
+fn undo_b2_groups_backspaces(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abcdef"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| {
+            e.set_caret(6);
+            // 连续退格 3 个字符（6→5, 5→4, 4→3）。
+            for _ in 0..3 {
+                let at = e.caret();
+                e.replace_range(at - 1..at, "", ecx);
             }
-            assert_eq!(ed.read(cx).text().as_ref(), "abc");
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(
-                ed.read(cx).text().as_ref(),
-                "",
-                "连续键入一次撤销应整组回退（B2 合并）"
-            );
-            // 重做回 abc。
-            ed.update(cx, |e, ecx| e.redo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "abc");
-            // 光标移动 → 打断：移动后键入 z 是独立撤销单元。
-            ed.update(cx, |e, ecx| {
-                e.set_caret(0);
-                e.replace_range(0..0, "z", ecx);
-            });
-            assert_eq!(ed.read(cx).text().as_ref(), "zabc");
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "abc", "z 独立撤销");
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "", "光标移动后 z 与 abc 分属两个单元");
         });
-    }
+        assert_eq!(ed.read(cx).text().as_ref(), "abc");
+        // 一次撤销应还原全部 3 次退格。
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "abcdef",
+            "相邻退格合并成一个撤销单元"
+        );
+    });
+}
 
-    /// B2 撤销合并：连续退格经 `replace_range`（纯删除、首尾相接）合并成一个单元。
-    #[gpui::test]
-    fn undo_b2_groups_backspaces(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abcdef"));
+/// 逆操作撤销：**结构性**编辑（Enter 拆段）撤销走增量 pass1，块结构与内容全还原。
+#[gpui::test]
+fn undo_after_enter_restores_merged_paragraph(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\ndef"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let n_before = ed.read(cx).doc().block_count();
+        ed.update(cx, |e, ecx| {
+            e.set_caret(3);
+            e.replace_range(3..3, "\n", ecx); // 拆成 `abc` / `def` 两段（结构编辑）
+        });
+        assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "abc\ndef",
+            "撤销结构编辑应还原文本"
+        );
+        assert_eq!(
+            ed.read(cx).doc().block_count(),
+            n_before,
+            "撤销结构编辑应还原块结构"
+        );
+        ed.update(cx, |e, ecx| e.redo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
+    });
+}
+
+/// 逆操作撤销：**原子**替换（选区替换为文本）撤销换回被删原文（Atomic 独立单元）。
+#[gpui::test]
+fn undo_selection_replace_restores_removed(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 假装选区替换：6..11 "world" → "rust"（removed 非空 + 插入 → Atomic）。
+        ed.update(cx, |e, ecx| {
+            e.set_caret(11);
+            e.replace_range(6..11, "rust", ecx);
+        });
+        assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "hello world",
+            "撤销应还原被替换原文"
+        );
+        ed.update(cx, |e, ecx| e.redo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
+    });
+}
+
+/// 逆操作撤销：大块粘帖（结构多段）撤销/重做内容完整（净逆操作按坐标精确回退）。
+#[gpui::test]
+fn undo_redo_large_paste_circle(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("start\nend\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let paste = (0..300)
+            .map(|i| format!("para {i} xyz\n"))
+            .collect::<String>();
+        ed.update(cx, |e, ecx| {
+            e.set_caret("start\n".len());
+            e.replace_range("start\n".len().."start\n".len(), &paste, ecx);
+        });
+        let after_paste = ed.read(cx).text().as_ref().to_string();
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            "start\nend\n",
+            "撤销应完整移除大块粘帖"
+        );
+        ed.update(cx, |e, ecx| e.redo(ecx));
+        assert_eq!(
+            ed.read(cx).text().as_ref(),
+            &after_paste,
+            "重做应完整复原大块粘帖"
+        );
+    });
+}
+
+/// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
+/// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
+/// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
+#[gpui::test]
+#[ignore]
+fn bench_frame_str_vs_rope(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+    let mut text = String::new();
+    while text.len() < 6_000_000 {
+        text.push_str(para);
+    }
+    let ref_text = text.clone();
+    for band_h in [200f32, 900., 4000., 40_000.] {
+        // ── Str 对照：全新（未编辑）编辑器。
+        let (host_s, vcx_s) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
             WyHost { ed }
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |e, ecx| {
-                e.set_caret(6);
-                // 连续退格 3 个字符（6→5, 5→4, 4→3）。
-                for _ in 0..3 {
-                    let at = e.caret();
-                    e.replace_range(at - 1..at, "", ecx);
-                }
-            });
-            assert_eq!(ed.read(cx).text().as_ref(), "abc");
-            // 一次撤销应还原全部 3 次退格。
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "abcdef", "相邻退格合并成一个撤销单元");
-        });
-    }
-
-    /// 逆操作撤销：**结构性**编辑（Enter 拆段）撤销走增量 pass1，块结构与内容全还原。
-    #[gpui::test]
-    fn undo_after_enter_restores_merged_paragraph(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("abc\ndef"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let n_before = ed.read(cx).doc().block_count();
-            ed.update(cx, |e, ecx| {
-                e.set_caret(3);
-                e.replace_range(3..3, "\n", ecx); // 拆成 `abc` / `def` 两段（结构编辑）
-            });
-            assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(
-                ed.read(cx).text().as_ref(),
-                "abc\ndef",
-                "撤销结构编辑应还原文本"
-            );
-            assert_eq!(
-                ed.read(cx).doc().block_count(),
-                n_before,
-                "撤销结构编辑应还原块结构"
-            );
-            ed.update(cx, |e, ecx| e.redo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "abc\n\ndef");
-        });
-    }
-
-    /// 逆操作撤销：**原子**替换（选区替换为文本）撤销换回被删原文（Atomic 独立单元）。
-    #[gpui::test]
-    fn undo_selection_replace_restores_removed(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("hello world"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            // 假装选区替换：6..11 "world" → "rust"（removed 非空 + 插入 → Atomic）。
-            ed.update(cx, |e, ecx| {
-                e.set_caret(11);
-                e.replace_range(6..11, "rust", ecx);
-            });
-            assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "hello world", "撤销应还原被替换原文");
-            ed.update(cx, |e, ecx| e.redo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "hello rust");
-        });
-    }
-
-    /// 逆操作撤销：大块粘帖（结构多段）撤销/重做内容完整（净逆操作按坐标精确回退）。
-    #[gpui::test]
-    fn undo_redo_large_paste_circle(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("start\nend\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|_window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let paste = (0..300).map(|i| format!("para {i} xyz\n")).collect::<String>();
-            ed.update(cx, |e, ecx| {
-                e.set_caret("start\n".len());
-                e.replace_range("start\n".len().."start\n".len(), &paste, ecx);
-            });
-            let after_paste = ed.read(cx).text().as_ref().to_string();
-            ed.update(cx, |e, ecx| e.undo(ecx));
-            assert_eq!(ed.read(cx).text().as_ref(), "start\nend\n", "撤销应完整移除大块粘帖");
-            ed.update(cx, |e, ecx| e.redo(ecx));
-            assert_eq!(
-                ed.read(cx).text().as_ref(),
-                &after_paste,
-                "重做应完整复原大块粘帖"
-            );
-        });
-    }
-
-    /// 手动性能基准：定位 B1 rope 单真源后 build_frame 的成本构成——同一大文档在
-    /// **编辑前（Str 源）** vs **编辑后（Rope 源）** 于不同**带高**下的重建成本：
-    /// 若随带线性 → 每块物化/装配；若恒定 → 帧内固定代价（整篇扫描/复制）。
-    #[gpui::test]
-    #[ignore]
-    fn bench_frame_str_vs_rope(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
-        let mut text = String::new();
-        while text.len() < 6_000_000 {
-            text.push_str(para);
-        }
-        let ref_text = text.clone();
-        for band_h in [200f32, 900., 4000., 40_000.] {
-            // ── Str 对照：全新（未编辑）编辑器。
-            let (host_s, vcx_s) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
-                WyHost { ed }
-            });
-            let vcx_s: &mut VisualTestContext = vcx_s;
-            let mut ts = 0u128;
-            vcx_s.update(|window, cx: &mut App| {
-                for k in 0..6 {
-                    let band = (k as f32 * 20., k as f32 * 20. + band_h);
-                    let t0 = std::time::Instant::now();
-                    let f = build_frame(host_s.read(cx).ed.read(cx), window, px(1200.), band);
-                    let _ = f.total;
-                    ts += t0.elapsed().as_millis();
-                }
-            });
-            // ── Rope：同一文本，编辑一次 → 转 Rope 源。
-            let (host_r, vcx_r) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
-                WyHost { ed }
-            });
-            let vcx_r: &mut VisualTestContext = vcx_r;
-            let mut tr = 0u128;
-            vcx_r.update(|window, cx: &mut App| {
-                let ed = host_r.read(cx).ed.clone();
-                let at = ed.read(cx).text().as_ref().find("one two three").unwrap() + 4;
-                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
-                for k in 0..6 {
-                    let band = (k as f32 * 20., k as f32 * 20. + band_h);
-                    let t0 = std::time::Instant::now();
-                    let f = build_frame(ed.read(cx), window, px(1200.), band);
-                    let _ = f.total;
-                    tr += t0.elapsed().as_millis();
-                }
-            });
-            eprintln!(
-                "[bench] plain-6MB band_h={band_h}: Str {:.2}ms vs Rope {:.2}ms",
-                ts as f64 / 6.,
-                tr as f64 / 6.
-            );
-        }
-    }
-
-    /// 手动性能基准：**结构编辑（插入换行 / Enter）**的完整周期成本（edit + build_frame）
-    /// ——B3 增量 Pass1 前后对比用：Enter 贴文尾时高度重估只扫「编辑线上」前缀复用；
-    /// 并行测「文首 Enter」（前缀少、重估近似全篇）作上界。
-    #[gpui::test]
-    #[ignore]
-    fn bench_structural_enter(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..3_000 {
-            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
-            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
-            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
-            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
-            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
-        }
-        text.push_str("\n\n");
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        // ── 文尾 Enter（前缀复用最多）。
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let mut at = ed.read(cx).text().as_ref().len();
-            // 预热一帧 + 2 次 Enter（把首次 Pass1/折叠计划/derived 全量重建跑掉），
-            // 之后计时的是**稳态 Enter**（增量路径）。
-            let _warm = build_frame(ed.read(cx), window, px(1200.), (0., 900.));
-            for _ in 0..2 {
-                ed.update(cx, |e, ecx| {
-                    e.set_caret(at);
-                    e.replace_range(at..at, "\n", ecx);
-                    at = e.caret();
-                });
-                build_frame(ed.read(cx), window, px(1200.), (0., 900.));
-            }
-            let mut t = 0u128;
-            for _ in 0..12 {
+        let vcx_s: &mut VisualTestContext = vcx_s;
+        let mut ts = 0u128;
+        vcx_s.update(|window, cx: &mut App| {
+            for k in 0..6 {
+                let band = (k as f32 * 20., k as f32 * 20. + band_h);
                 let t0 = std::time::Instant::now();
-                ed.update(cx, |e, ecx| {
-                    e.set_caret(at);
-                    e.replace_range(at..at, "\n", ecx);
-                    at = e.caret();
-                });
-                build_frame(ed.read(cx), window, px(1200.), (0., 900.));
-                t += t0.elapsed().as_millis();
+                let f = build_frame(host_s.read(cx).ed.read(cx), window, px(1200.), band);
+                let _ = f.total;
+                ts += t0.elapsed().as_millis();
             }
-            eprintln!("[bench] Enter at TAIL+cycle: {:.2}ms/次", t as f64 / 12.);
         });
-    }
-
-    /// 手动性能基准：量化 A1「命中先行」的收益——缓存预热后**同带缓存重建**（只物化
-    /// miss / caret 块）对比旧行为的「整带 `rows_in_block_window` 物化」单次成本
-    /// （旧实现每帧/每带重建都先付整带物化再查缓存）。
-    #[gpui::test]
-    #[ignore]
-    fn bench_cached_band_rebuild_vs_materialize(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..3_000 {
-            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
-            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
-            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
-            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
-            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        // ── Rope：同一文本，编辑一次 → 转 Rope 源。
+        let (host_r, vcx_r) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&ref_text));
             WyHost { ed }
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
+        let vcx_r: &mut VisualTestContext = vcx_r;
+        let mut tr = 0u128;
+        vcx_r.update(|window, cx: &mut App| {
+            let ed = host_r.read(cx).ed.clone();
+            let at = ed.read(cx).text().as_ref().find("one two three").unwrap() + 4;
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
+            for k in 0..6 {
+                let band = (k as f32 * 20., k as f32 * 20. + band_h);
+                let t0 = std::time::Instant::now();
+                let f = build_frame(ed.read(cx), window, px(1200.), band);
+                let _ = f.total;
+                tr += t0.elapsed().as_millis();
+            }
+        });
+        eprintln!(
+            "[bench] plain-6MB band_h={band_h}: Str {:.2}ms vs Rope {:.2}ms",
+            ts as f64 / 6.,
+            tr as f64 / 6.
+        );
+    }
+}
+
+/// 手动性能基准：**结构编辑（插入换行 / Enter）**的完整周期成本（edit + build_frame）
+/// ——B3 增量 Pass1 前后对比用：Enter 贴文尾时高度重估只扫「编辑线上」前缀复用；
+/// 并行测「文首 Enter」（前缀少、重估近似全篇）作上界。
+#[gpui::test]
+#[ignore]
+fn bench_structural_enter(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..3_000 {
+        text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+        text.push_str(&format!(
+            "text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"
+        ));
+        text.push_str(&format!(
+            "> [!NOTE]- alert body line {i}\n>   continuation {i}\n"
+        ));
+        text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+        text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
+    }
+    text.push_str("\n\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    // ── 文尾 Enter（前缀复用最多）。
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let mut at = ed.read(cx).text().as_ref().len();
+        // 预热一帧 + 2 次 Enter（把首次 Pass1/折叠计划/derived 全量重建跑掉），
+        // 之后计时的是**稳态 Enter**（增量路径）。
+        let _warm = build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+        for _ in 0..2 {
+            ed.update(cx, |e, ecx| {
+                e.set_caret(at);
+                e.replace_range(at..at, "\n", ecx);
+                at = e.caret();
+            });
+            build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+        }
+        let mut t = 0u128;
+        for _ in 0..12 {
+            let t0 = std::time::Instant::now();
+            ed.update(cx, |e, ecx| {
+                e.set_caret(at);
+                e.replace_range(at..at, "\n", ecx);
+                at = e.caret();
+            });
+            build_frame(ed.read(cx), window, px(1200.), (0., 900.));
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!("[bench] Enter at TAIL+cycle: {:.2}ms/次", t as f64 / 12.);
+    });
+}
+
+/// 手动性能基准：量化 A1「命中先行」的收益——缓存预热后**同带缓存重建**（只物化
+/// miss / caret 块）对比旧行为的「整带 `rows_in_block_window` 物化」单次成本
+/// （旧实现每帧/每带重建都先付整带物化再查缓存）。
+#[gpui::test]
+#[ignore]
+fn bench_cached_band_rebuild_vs_materialize(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..3_000 {
+        text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+        text.push_str(&format!(
+            "text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"
+        ));
+        text.push_str(&format!(
+            "> [!NOTE]- alert body line {i}\n>   continuation {i}\n"
+        ));
+        text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+        text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let band = (0., 800.);
             let warm = build_frame(ed.read(cx), window, px(900.), band);
@@ -5274,44 +5757,51 @@ A-->B
                 n_all
             );
         });
+}
+
+/// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
+/// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
+#[gpui::test]
+#[ignore]
+fn bench_dense_doc_edit_and_scroll(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 仿 `大文档测试2.md`：每 6 行一组「数学块 + 行内公式 + callout + 代码 + 表格」，
+    // 末尾附一个纯文本段（普通键入的落点）。
+    let mut text = String::new();
+    for i in 0..3_000 {
+        text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
+        text.push_str(&format!(
+            "text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"
+        ));
+        text.push_str(&format!(
+            "> [!NOTE]- alert body line {i}\n>   continuation {i}\n"
+        ));
+        text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
+        text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
     }
+    text.push_str("plain paragraph zone one\nplain paragraph zone two\n");
+    let nbytes = text.len();
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
 
-    /// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
-    /// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
-    #[gpui::test]
-    #[ignore]
-    fn bench_dense_doc_edit_and_scroll(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 仿 `大文档测试2.md`：每 6 行一组「数学块 + 行内公式 + callout + 代码 + 表格」，
-        // 末尾附一个纯文本段（普通键入的落点）。
-        let mut text = String::new();
-        for i in 0..3_000 {
-            text.push_str(&format!("$$\n\\int_{i} x dx\n$$\n"));
-            text.push_str(&format!("text line {i} with $e^{{i\\pi}}+1={i}$ inline math here\n"));
-            text.push_str(&format!("> [!NOTE]- alert body line {i}\n>   continuation {i}\n"));
-            text.push_str(&format!("```rust\nfn f{i}() {{}}\n```\n"));
-            text.push_str(&format!("| h{i} | h2 |\n| --- | --- |\n| c{i} | d |\n"));
-        }
-        text.push_str("plain paragraph zone one\nplain paragraph zone two\n");
-        let nbytes = text.len();
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let t0 = std::time::Instant::now();
+        let f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
+        let dt = t0.elapsed().as_millis();
+        let nreg = ed.read(cx).derived().borrow().math_regions.len();
+        eprintln!(
+            "[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg})",
+            f.block_count()
+        );
+    });
 
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let t0 = std::time::Instant::now();
-            let f = build_frame(ed.read(cx), window, px(900.), (0., 800.));
-            let dt = t0.elapsed().as_millis();
-            let nreg = ed.read(cx).derived().borrow().math_regions.len();
-            eprintln!("[bench] open+first band frame: {dt}ms ({nbytes}B, blocks={}, math_regions={nreg})", f.block_count());
-        });
-
-        vcx.update(|window, cx: &mut App| {
+    vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             let mut rebuilt = 0u32;
             // 锚点只取一次（此后 1:1 字符替换，长度不变 → 锚点恒有效）。
@@ -5332,218 +5822,240 @@ A-->B
             eprintln!("[bench] 30 typing full-cycles (edit+frame): {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/30)", dt as f64 / 30.);
         });
 
-        vcx.update(|_w, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let mut rebuilt = 0u32;
-            let at = ed.read(cx).content().find("\\int_1 x dx").unwrap() + 5;
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let mut rebuilt = 0u32;
+        let at = ed.read(cx).content().find("\\int_1 x dx").unwrap() + 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..10 {
+            let v0 = ed.read(cx).regions_ver();
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "2", ecx));
+            if ed.read(cx).regions_ver() != v0 {
+                rebuilt += 1;
+            }
+        }
+        let dt = t0.elapsed().as_millis();
+        eprintln!(
+            "[bench] 10 math-interior edits: {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/10)",
+            dt as f64 / 10.
+        );
+    });
+
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let mut t = 0u128;
+        let mut t2 = 0u128;
+        for k in 0..20 {
             let t0 = std::time::Instant::now();
-            for _ in 0..10 {
-                let v0 = ed.read(cx).regions_ver();
-                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "2", ecx));
-                if ed.read(cx).regions_ver() != v0 {
-                    rebuilt += 1;
+            let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
+            let f = build_frame(ed.read(cx), window, px(900.), band);
+            let _ = f.total;
+            t += t0.elapsed().as_millis();
+            // 模拟「公式光栅逐个完成」：mgen 变化 → fold_plan 重算（基础布局不再整篇重建）。
+            let t1 = std::time::Instant::now();
+            let band2 = (k as f32 * 4000. + 2000., k as f32 * 4000. + 2800.);
+            let f2 = build_frame(ed.read(cx), window, px(900.), band2);
+            let _ = f2.total;
+            t2 += t1.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] 20 band rebuilds: {t}ms ({:.1}ms/band)",
+            t as f64 / 20.
+        );
+        eprintln!(
+            "[bench] 20 near-band rebuilds (caret-in-band): {t2}ms ({:.1}ms/band)",
+            t2 as f64 / 20.
+        );
+    });
+
+    // 光标移动（不动内容）→ `set_caret` 清帧 → build_frame 每步成本。
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let n = ed.read(cx).content().len();
+        let mut t = 0u128;
+        for k in 0..20 {
+            let off = (n * k / 20).min(n.saturating_sub(1));
+            ed.update(cx, |e, _| e.set_caret(off));
+            let t0 = std::time::Instant::now();
+            let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
+            let f = build_frame(ed.read(cx), window, px(900.), band);
+            let _ = f.total;
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] 20 caret-move frame rebuilds: {t}ms ({:.1}ms/step)",
+            t as f64 / 20.
+        );
+    });
+}
+
+/// 编辑路径分项剖析：整串复制 / SharedString 转 / Doc::reopen / 通知 各占多少。
+#[gpui::test]
+#[ignore]
+fn bench_edit_path_split(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+    while text.len() < 6_000_000 {
+        text.push_str(para);
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("one two three").unwrap() + 4;
+        let s = ed.read(cx).content();
+        let r = at..at + 1;
+        // (a) 整串复制。
+        let mut t = 0u128;
+        let mut next = String::new();
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            let mut n = String::with_capacity(s.len() - r.len() + 1);
+            n.push_str(&s[..r.start]);
+            n.push('x');
+            n.push_str(&s[r.end..]);
+            next = n;
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!("[bench] (a) full-string copy: {:.2}ms", t as f64 / 20.);
+        // (b) SharedString::from。
+        let mut t = 0u128;
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            let _ss = gpui::SharedString::from(next.clone());
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] (b) SharedString::from(String): {:.2}ms",
+            t as f64 / 20.
+        );
+        // (c) Doc::edit（原地 rope 编辑，替代旧 `reopen` 的整串拼接+重建）。
+        let mut t = 0u128;
+        let s_ss = ed.read(cx).text();
+        let mut doc = crate::markdown::doc::Doc::open(s_ss.clone());
+        for _ in 0..20 {
+            let t0 = std::time::Instant::now();
+            doc.edit(r.clone(), "x");
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!("[bench] (c) Doc::edit incremental: {:.2}ms", t as f64 / 20.);
+        // (e) 新零拷贝路径：String → Box<str> → Arc<str> → SharedString。
+        let mut t = 0u128;
+        for _ in 0..20 {
+            let mut x = String::with_capacity(s.len());
+            x.push_str(&s[..r.start]);
+            x.push('x');
+            x.push_str(&s[r.end..]);
+            let t0 = std::time::Instant::now();
+            let _ss = gpui::SharedString::from(std::sync::Arc::<str>::from(x.into_boxed_str()));
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] (e) new zero-copy concat+SharedString: {:.2}ms",
+            t as f64 / 20.
+        );
+        // (f) rebuild_block_regions（replace_range 每键 O(块数) 扫描）。
+        let mut t = 0u128;
+        let mut doc2 = crate::markdown::doc::Doc::open(s_ss.clone());
+        for _ in 0..20 {
+            doc2.edit(r.clone(), "x");
+            let n = doc2.block_count();
+            let t0 = std::time::Instant::now();
+            let mut regions: usize = 0;
+            for i in 0..n {
+                if let Some(m) = doc2.block_meta(i)
+                    && matches!(
+                        m.kind,
+                        crate::markdown::parse::RowKind::Code
+                            | crate::markdown::parse::RowKind::Table
+                    )
+                {
+                    regions += 1;
                 }
             }
-            let dt = t0.elapsed().as_millis();
-            eprintln!("[bench] 10 math-interior edits: {dt}ms ({:.1}ms/key, rebuilt={rebuilt}/10)", dt as f64 / 10.);
-        });
+            let _ = regions;
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] (f) rebuild_block_regions scan (n={}): {:.2}ms",
+            doc2.block_count(),
+            t as f64 / 20.
+        );
+        // (d) board emits 未计入（UI 层）。总 edit-only 对照。
+        let _ = window;
+        let _ = ed;
+    });
+}
 
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let mut t = 0u128;
-            let mut t2 = 0u128;
-            for k in 0..20 {
-                let t0 = std::time::Instant::now();
-                let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
-                let f = build_frame(ed.read(cx), window, px(900.), band);
-                let _ = f.total;
-                t += t0.elapsed().as_millis();
-                // 模拟「公式光栅逐个完成」：mgen 变化 → fold_plan 重算（基础布局不再整篇重建）。
-                let t1 = std::time::Instant::now();
-                let band2 = (k as f32 * 4000. + 2000., k as f32 * 4000. + 2800.);
-                let f2 = build_frame(ed.read(cx), window, px(900.), band2);
-                let _ = f2.total;
-                t2 += t1.elapsed().as_millis();
-            }
-            eprintln!("[bench] 20 band rebuilds: {t}ms ({:.1}ms/band)", t as f64 / 20.);
-            eprintln!("[bench] 20 near-band rebuilds (caret-in-band): {t2}ms ({:.1}ms/band)", t2 as f64 / 20.);
-        });
-
-        // 光标移动（不动内容）→ `set_caret` 清帧 → build_frame 每步成本。
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let n = ed.read(cx).content().len();
-            let mut t = 0u128;
-            for k in 0..20 {
-                let off = (n * k / 20).min(n.saturating_sub(1));
-                ed.update(cx, |e, _| e.set_caret(off));
-                let t0 = std::time::Instant::now();
-                let band = (k as f32 * 4000., k as f32 * 4000. + 800.);
-                let f = build_frame(ed.read(cx), window, px(900.), band);
-                let _ = f.total;
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] 20 caret-move frame rebuilds: {t}ms ({:.1}ms/step)", t as f64 / 20.);
-        });
+#[gpui::test]
+#[ignore]
+fn bench_scale_with_doc_size(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // —— 1) 纯文本大文档：键入成本随字节数线性放大？——
+    let mut text = String::new();
+    let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+    let mut mb = 0usize;
+    while mb < 6_000_000 {
+        text.push_str(para);
+        mb = text.len();
     }
-
-    /// 编辑路径分项剖析：整串复制 / SharedString 转 / Doc::reopen / 通知 各占多少。
-    #[gpui::test]
-    #[ignore]
-    fn bench_edit_path_split(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
-        while text.len() < 6_000_000 {
-            text.push_str(para);
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = _vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("one two three").unwrap() + 4;
+        let mut t = 0u128;
+        // replace_range 单独（不 rebuild frame）→ 量化整串复制 + reopen。
+        for _ in 0..30 {
+            let t0 = std::time::Instant::now();
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
+            t += t0.elapsed().as_millis();
         }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("one two three").unwrap() + 4;
-            let s = ed.read(cx).content();
-            let r = at..at + 1;
-            // (a) 整串复制。
-            let mut t = 0u128;
-            let mut next = String::new();
-            for _ in 0..20 {
-                let t0 = std::time::Instant::now();
-                let mut n = String::with_capacity(s.len() - r.len() + 1);
-                n.push_str(&s[..r.start]);
-                n.push('x');
-                n.push_str(&s[r.end..]);
-                next = n;
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] (a) full-string copy: {:.2}ms", t as f64 / 20.);
-            // (b) SharedString::from。
-            let mut t = 0u128;
-            for _ in 0..20 {
-                let t0 = std::time::Instant::now();
-                let _ss = gpui::SharedString::from(next.clone());
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] (b) SharedString::from(String): {:.2}ms", t as f64 / 20.);
-            // (c) Doc::edit（原地 rope 编辑，替代旧 `reopen` 的整串拼接+重建）。
-            let mut t = 0u128;
-            let s_ss = ed.read(cx).text();
-            let mut doc = crate::markdown::doc::Doc::open(s_ss.clone());
-            for _ in 0..20 {
-                let t0 = std::time::Instant::now();
-                doc.edit(r.clone(), "x");
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] (c) Doc::edit incremental: {:.2}ms", t as f64 / 20.);
-            // (e) 新零拷贝路径：String → Box<str> → Arc<str> → SharedString。
-            let mut t = 0u128;
-            for _ in 0..20 {
-                let mut x = String::with_capacity(s.len());
-                x.push_str(&s[..r.start]);
-                x.push('x');
-                x.push_str(&s[r.end..]);
-                let t0 = std::time::Instant::now();
-                let _ss =
-                    gpui::SharedString::from(std::sync::Arc::<str>::from(x.into_boxed_str()));
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] (e) new zero-copy concat+SharedString: {:.2}ms", t as f64 / 20.);
-            // (f) rebuild_block_regions（replace_range 每键 O(块数) 扫描）。
-            let mut t = 0u128;
-            let mut doc2 = crate::markdown::doc::Doc::open(s_ss.clone());
-            for _ in 0..20 {
-                doc2.edit(r.clone(), "x");
-                let n = doc2.block_count();
-                let t0 = std::time::Instant::now();
-                let mut regions: usize = 0;
-                for i in 0..n {
-                    if let Some(m) = doc2.block_meta(i)
-                        && matches!(
-                            m.kind,
-                            crate::markdown::parse::RowKind::Code
-                                | crate::markdown::parse::RowKind::Table
-                        ) {
-                            regions += 1;
-                        }
-                }
-                let _ = regions;
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] (f) rebuild_block_regions scan (n={}): {:.2}ms", doc2.block_count(), t as f64 / 20.);
-            // (d) board emits 未计入（UI 层）。总 edit-only 对照。
-            let _ = window;
-            let _ = ed;
-        });
+        eprintln!(
+            "[bench] plain-6MB edit-only: {t}ms ({:.1}ms/key, text={}B)",
+            t as f64 / 30.,
+            ed.read(cx).content().len()
+        );
+        // 完整键入周期（edit + band rebuild）。
+        let mut t2 = 0u128;
+        for k in 0..30 {
+            let t0 = std::time::Instant::now();
+            ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
+            let band = (k as f32 * 20., k as f32 * 20. + 900.);
+            build_frame(ed.read(cx), window, px(1200.), band);
+            t2 += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] plain-6MB typing-cycle: {t2}ms ({:.1}ms/key)",
+            t2 as f64 / 30.
+        );
+    });
+
+    // —— 2) 代码密集文档：滚动重建里代码块占多少（语法高亮重解析）？——
+    let mut code = String::new();
+    for i in 0..2_000 {
+        code.push_str(&format!("```rust\nfn compute_{i}(a: u32, b: u32) -> u32 {{\n    let sum = a + b * {i};\n    let diff = a.saturating_sub(b);\n    if sum > diff {{ return sum; }}\n    diff\n}}\n```\n"));
+        code.push_str(&format!("some paragraph text {i} after code block\n"));
     }
-
-    #[gpui::test]
-    #[ignore]
-    fn bench_scale_with_doc_size(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        // —— 1) 纯文本大文档：键入成本随字节数线性放大？——
-        let mut text = String::new();
-        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
-        let mut mb = 0usize;
-        while mb < 6_000_000 {
-            text.push_str(para);
-            mb = text.len();
-        }
-        let (host, _vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = _vcx;
-        vcx.update(|window, cx: &mut App| {
-            let ed = host.read(cx).ed.clone();
-            let at = ed.read(cx).content().find("one two three").unwrap() + 4;
-            let mut t = 0u128;
-            // replace_range 单独（不 rebuild frame）→ 量化整串复制 + reopen。
-            for _ in 0..30 {
-                let t0 = std::time::Instant::now();
-                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "x", ecx));
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!(
-                "[bench] plain-6MB edit-only: {t}ms ({:.1}ms/key, text={}B)",
-                t as f64 / 30.,
-                ed.read(cx).content().len()
-            );
-            // 完整键入周期（edit + band rebuild）。
-            let mut t2 = 0u128;
-            for k in 0..30 {
-                let t0 = std::time::Instant::now();
-                ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "y", ecx));
-                let band = (k as f32 * 20., k as f32 * 20. + 900.);
-                build_frame(ed.read(cx), window, px(1200.), band);
-                t2 += t0.elapsed().as_millis();
-            }
-            eprintln!(
-                "[bench] plain-6MB typing-cycle: {t2}ms ({:.1}ms/key)",
-                t2 as f64 / 30.
-            );
-        });
-
-        // —— 2) 代码密集文档：滚动重建里代码块占多少（语法高亮重解析）？——
-        let mut code = String::new();
-        for i in 0..2_000 {
-            code.push_str(&format!("```rust\nfn compute_{i}(a: u32, b: u32) -> u32 {{\n    let sum = a + b * {i};\n    let diff = a.saturating_sub(b);\n    if sum > diff {{ return sum; }}\n    diff\n}}\n```\n"));
-            code.push_str(&format!("some paragraph text {i} after code block\n"));
-        }
-        let (host2, _vcx2) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&code));
-            WyHost { ed }
-        });
-        let vcx2: &mut VisualTestContext = _vcx2;
-        let mut t3 = 0u128;
-        let mut t4 = 0u128;
-        vcx2.update(|window, cx: &mut App| {
+    let (host2, _vcx2) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&code));
+        WyHost { ed }
+    });
+    let vcx2: &mut VisualTestContext = _vcx2;
+    let mut t3 = 0u128;
+    let mut t4 = 0u128;
+    vcx2.update(|window, cx: &mut App| {
             let ed = host2.read(cx).ed.clone();
             let n = ed.read(cx).doc().block_count();
             let total = n;
@@ -5571,241 +6083,274 @@ A-->B
                 total / 2
             );
         });
-    }
+}
 
-    #[gpui::test]
-    fn handler_large_doc_cjk_roundtrip_no_full_materialize(cx: &mut TestAppContext) {
-        use gpui::EntityInputHandler;
-        cx.update(crate::actions::bind_local_keymaps);
-        // 大文档：8000 行混合 ASCII/中文/emoji——行索引目标落在文档中后部（半篇~整篇）。
-        // 同时含尾随换行（幻影尾行）与多字节字符，覆盖 UTF-16 换算的边界。
-        let mut text = String::new();
-        for i in 0..8000 {
-            if i % 17 == 0 {
-                text.push('中');
-            }
-            if i % 31 == 0 {
-                text.push('\u{1f680}');
-            }
-            text.push_str(&format!("line {i}\n"));
+#[gpui::test]
+fn handler_large_doc_cjk_roundtrip_no_full_materialize(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 大文档：8000 行混合 ASCII/中文/emoji——行索引目标落在文档中后部（半篇~整篇）。
+    // 同时含尾随换行（幻影尾行）与多字节字符，覆盖 UTF-16 换算的边界。
+    let mut text = String::new();
+    for i in 0..8000 {
+        if i % 17 == 0 {
+            text.push('中');
         }
-        text.push_str("你好 target 尾\n");
-        let (host, vcx) = cx.add_window_view(|window, cx| {
+        if i % 31 == 0 {
+            text.push('\u{1f680}');
+        }
+        text.push_str(&format!("line {i}\n"));
+    }
+    text.push_str("你好 target 尾\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        // `reference` 逐编辑镜像 doc，作为全文比对与 UTF-16 换算的参照。
+        let mut reference = text.clone();
+        let tail = "你好 target 尾\n";
+        ed.update(cx, |e, cx| {
+            let calls0 = e.text_shared_calls();
+            // ---- 阶段 A：纯协议查询/编辑，全部不物化全文（期间不调 e.text()）----
+            // ① 总长 = 全文 UTF-16 单元数（O(1) 计数器）。
+            assert_eq!(
+                e.text_length_utf16(window, cx),
+                Some(reference.encode_utf16().count()),
+                "total_utf16 应等于全文 UTF-16 长"
+            );
+            // ② text_for_range：文档末尾一段（跨中文/emoji/换行），切片精确。
+            let total_u16 = reference.encode_utf16().count();
+            let start_u16 = total_u16 - tail.encode_utf16().count();
+            let mut actual = None;
+            let got = e
+                .text_for_range(start_u16..total_u16, &mut actual, window, cx)
+                .expect("text_for_range 应命中");
+            assert_eq!(got, tail, "text_for_range 切片应精确（含中文/emoji/换行）");
+            assert_eq!(actual, Some(start_u16..total_u16), "actual_range 应回填");
+            // ③ 选区：光标到文末 → UTF-16 末端零宽选区。
+            e.set_caret(reference.len());
+            let sel = e.selected_text_range(true, window, cx).unwrap();
+            assert_eq!(sel.range, total_u16..total_u16, "caret 在文末");
+            assert!(!sel.reversed);
+            // ④ set_selected_text_range 设置中后部，UTF-16 往返无损。
+            let mid_u16 = total_u16 / 2;
+            e.set_selected_text_range(mid_u16..mid_u16 + 1, window, cx);
+            assert!(e.caret() <= reference.len(), "caret 应钳在字节界内");
+            let sel2 = e.selected_text_range(true, window, cx).unwrap();
+            assert_eq!(sel2.range, mid_u16..mid_u16 + 1, "UTF-16 往返无损");
+            // ⑤ marked 组合：字节存储 → UTF-16 换算精确；取消（ESC）清占位。
+            let caret_byte = reference.len() - tail.len();
+            e.set_caret(caret_byte);
+            let mark_u16 = reference[..caret_byte].encode_utf16().count();
+            e.replace_and_mark_utf16(None, "组合", None, cx);
+            reference.insert_str(caret_byte, "组合");
+            let marked = e.marked_text_range(window, cx).expect("有 marked");
+            assert_eq!(marked.start, mark_u16, "marked 起点 UTF-16");
+            assert_eq!(marked.end - marked.start, "组合".encode_utf16().count());
+            e.replace_text_utf16(None, "", cx);
+            reference.replace_range(caret_byte..caret_byte + "组合".len(), "");
+            // ⑥ Windows 组合序列（range=None，替换旧 marked 不堆叠）：n→nih→提交"你好"。
+            e.set_caret(reference.len());
+            e.replace_and_mark_utf16(None, "n", None, cx);
+            e.replace_and_mark_utf16(None, "nih", None, cx);
+            e.replace_text_utf16(None, "你好", cx);
+            reference.push_str("你好");
+            // ⑦ 显式 UTF-16 区间（macOS 风格）走 utf16_to_byte 换算：文末插 X。
+            let pos_u16 = reference.encode_utf16().count();
+            e.replace_text_utf16(Some(pos_u16..pos_u16), "X", cx);
+            reference.push('X');
+            // ---- 断言：阶段 A 的查询/编辑全程零次 text_shared（O(n) 全拷）----
+            assert_eq!(
+                e.text_shared_calls(),
+                calls0,
+                "EntityInputHandler 的查询/编辑不得调用 text_shared——必须走行索引/切片/增量计数"
+            );
+            // ---- 收尾：全文精确比对（e.text() 触发 text_shared 属正常宿主写回路径）----
+            assert_eq!(
+                &e.text(),
+                &reference,
+                "大文档协议层编辑后全文与参照逐字节一致"
+            );
+        });
+    });
+}
+#[gpui::test]
+#[ignore]
+fn bench_rw_dense(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+
+    fn doc_dense() -> String {
+        let mut t = String::new();
+        let mut i = 0usize;
+        while t.len() < 6_000_000 {
+            t.push_str(&format!(
+                "# Heading {i}\n\n- list item a\n- list item b\n\n> quote {i}\n\n"
+            ));
+            i += 1;
+        }
+        t
+    }
+    fn single_case(cx: &mut TestAppContext, name: &str, text: String) {
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
             WyHost { ed }
         });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            // `reference` 逐编辑镜像 doc，作为全文比对与 UTF-16 换算的参照。
-            let mut reference = text.clone();
-            let tail = "你好 target 尾\n";
-            ed.update(cx, |e, cx| {
-                let calls0 = e.text_shared_calls();
-                // ---- 阶段 A：纯协议查询/编辑，全部不物化全文（期间不调 e.text()）----
-                // ① 总长 = 全文 UTF-16 单元数（O(1) 计数器）。
-                assert_eq!(
-                    e.text_length_utf16(window, cx),
-                    Some(reference.encode_utf16().count()),
-                    "total_utf16 应等于全文 UTF-16 长"
-                );
-                // ② text_for_range：文档末尾一段（跨中文/emoji/换行），切片精确。
-                let total_u16 = reference.encode_utf16().count();
-                let start_u16 = total_u16 - tail.encode_utf16().count();
-                let mut actual = None;
-                let got = e
-                    .text_for_range(start_u16..total_u16, &mut actual, window, cx)
-                    .expect("text_for_range 应命中");
-                assert_eq!(got, tail, "text_for_range 切片应精确（含中文/emoji/换行）");
-                assert_eq!(actual, Some(start_u16..total_u16), "actual_range 应回填");
-                // ③ 选区：光标到文末 → UTF-16 末端零宽选区。
-                e.set_caret(reference.len());
-                let sel = e.selected_text_range(true, window, cx).unwrap();
-                assert_eq!(sel.range, total_u16..total_u16, "caret 在文末");
-                assert!(!sel.reversed);
-                // ④ set_selected_text_range 设置中后部，UTF-16 往返无损。
-                let mid_u16 = total_u16 / 2;
-                e.set_selected_text_range(mid_u16..mid_u16 + 1, window, cx);
-                assert!(e.caret() <= reference.len(), "caret 应钳在字节界内");
-                let sel2 = e.selected_text_range(true, window, cx).unwrap();
-                assert_eq!(sel2.range, mid_u16..mid_u16 + 1, "UTF-16 往返无损");
-                // ⑤ marked 组合：字节存储 → UTF-16 换算精确；取消（ESC）清占位。
-                let caret_byte = reference.len() - tail.len();
-                e.set_caret(caret_byte);
-                let mark_u16 = reference[..caret_byte].encode_utf16().count();
-                e.replace_and_mark_utf16(None, "组合", None, cx);
-                reference.insert_str(caret_byte, "组合");
-                let marked = e.marked_text_range(window, cx).expect("有 marked");
-                assert_eq!(marked.start, mark_u16, "marked 起点 UTF-16");
-                assert_eq!(marked.end - marked.start, "组合".encode_utf16().count());
-                e.replace_text_utf16(None, "", cx);
-                reference.replace_range(
-                    caret_byte..caret_byte + "组合".len(),
-                    "",
-                );
-                // ⑥ Windows 组合序列（range=None，替换旧 marked 不堆叠）：n→nih→提交"你好"。
-                e.set_caret(reference.len());
-                e.replace_and_mark_utf16(None, "n", None, cx);
-                e.replace_and_mark_utf16(None, "nih", None, cx);
-                e.replace_text_utf16(None, "你好", cx);
-                reference.push_str("你好");
-                // ⑦ 显式 UTF-16 区间（macOS 风格）走 utf16_to_byte 换算：文末插 X。
-                let pos_u16 = reference.encode_utf16().count();
-                e.replace_text_utf16(Some(pos_u16..pos_u16), "X", cx);
-                reference.push('X');
-                // ---- 断言：阶段 A 的查询/编辑全程零次 text_shared（O(n) 全拷）----
-                assert_eq!(
-                    e.text_shared_calls(),
-                    calls0,
-                    "EntityInputHandler 的查询/编辑不得调用 text_shared——必须走行索引/切片/增量计数"
-                );
-                // ---- 收尾：全文精确比对（e.text() 触发 text_shared 属正常宿主写回路径）----
-                assert_eq!(&e.text(), &reference, "大文档协议层编辑后全文与参照逐字节一致");
-            });
-        });
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_rw_dense(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-
-        fn doc_dense() -> String {
-            let mut t = String::new();
-            let mut i = 0usize;
-            while t.len() < 6_000_000 {
-                t.push_str(&format!("# Heading {i}\n\n- list item a\n- list item b\n\n> quote {i}\n\n"));
-                i += 1;
-            }
-            t
-        }
-        fn single_case(cx: &mut TestAppContext, name: &str, text: String) {
-            let (host, _vcx) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-                WyHost { ed }
-            });
-            let _ = cx.refresh();
-            let at = text.len() / 2;
-            let mut t = 0u128;
-            let n = 12;
-            for k in 0..n {
-                let t0 = std::time::Instant::now();
-                let ins = if k % 2 == 0 { "x" } else { "y" };
-                cx.update(|cx| {
-                    host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx)));
-                });
-                let _ = cx.refresh();
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] {name} type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
-            crate::prof::dump(&format!("wyreal.{name}.type"));
-            let mut t2 = 0u128;
-            let n2 = 8;
-            for _k in 0..n2 {
-                let t0 = std::time::Instant::now();
-                cx.update(|cx| {
-                    host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "\n", ecx)));
-                });
-                let _ = cx.refresh();
-                t2 += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] {name} enter: {}ms ({:.1}ms/key)", t2, t2 as f64 / n2 as f64);
-            crate::prof::dump(&format!("wyreal.{name}.enter"));
-        }
-        single_case(cx, "dense", doc_dense());
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_rw_plain(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        fn doc_plain() -> String {
-            let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
-            let mut t = String::new();
-            while t.len() < 6_000_000 {
-                t.push_str(para);
-            }
-            t
-        }
-        let (host, _vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_plain()));
-            WyHost { ed }
-        });
         let _ = cx.refresh();
-        let at = 3_000_000usize;
+        let at = text.len() / 2;
         let mut t = 0u128;
         let n = 12;
         for k in 0..n {
             let t0 = std::time::Instant::now();
             let ins = if k % 2 == 0 { "x" } else { "y" };
-            cx.update(|cx| host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))));
+            cx.update(|cx| {
+                host.update(cx, |w, cx| {
+                    w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))
+                });
+            });
             let _ = cx.refresh();
             t += t0.elapsed().as_millis();
         }
-        eprintln!("[bench] plain type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
-        crate::prof::dump("wyreal.plain.type");
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_rw_code(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        fn doc_code() -> String {
-            let mut t = String::from("```\n");
-            let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
-            while t.len() < 6_000_000 {
-                t.push_str(line);
-            }
-            t.push_str("```\n");
-            t
+        eprintln!(
+            "[bench] {name} type-char: {}ms ({:.1}ms/key)",
+            t,
+            t as f64 / n as f64
+        );
+        crate::prof::dump(&format!("wyreal.{name}.type"));
+        let mut t2 = 0u128;
+        let n2 = 8;
+        for _k in 0..n2 {
+            let t0 = std::time::Instant::now();
+            cx.update(|cx| {
+                host.update(cx, |w, cx| {
+                    w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, "\n", ecx))
+                });
+            });
+            let _ = cx.refresh();
+            t2 += t0.elapsed().as_millis();
         }
-        let (host, _vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_code()));
-            WyHost { ed }
+        eprintln!(
+            "[bench] {name} enter: {}ms ({:.1}ms/key)",
+            t2,
+            t2 as f64 / n2 as f64
+        );
+        crate::prof::dump(&format!("wyreal.{name}.enter"));
+    }
+    single_case(cx, "dense", doc_dense());
+}
+#[gpui::test]
+#[ignore]
+fn bench_rw_plain(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    fn doc_plain() -> String {
+        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+        let mut t = String::new();
+        while t.len() < 6_000_000 {
+            t.push_str(para);
+        }
+        t
+    }
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_plain()));
+        WyHost { ed }
+    });
+    let _ = cx.refresh();
+    let at = 3_000_000usize;
+    let mut t = 0u128;
+    let n = 12;
+    for k in 0..n {
+        let t0 = std::time::Instant::now();
+        let ins = if k % 2 == 0 { "x" } else { "y" };
+        cx.update(|cx| {
+            host.update(cx, |w, cx| {
+                w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))
+            })
         });
         let _ = cx.refresh();
-        let at = 3_000_000usize;
-        let mut t = 0u128;
-        let n = 12;
-        for k in 0..n {
-            let t0 = std::time::Instant::now();
-            let ins = if k % 2 == 0 { "x" } else { "y" };
-            cx.update(|cx| host.update(cx, |w, cx| w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))));
-            let _ = cx.refresh();
-            t += t0.elapsed().as_millis();
-        }
-        eprintln!("[bench] code type-char: {}ms ({:.1}ms/key)", t, t as f64 / n as f64);
-        crate::prof::dump("wyreal.code.type");
+        t += t0.elapsed().as_millis();
     }
-    #[gpui::test]
-    #[ignore]
-    fn bench_per_key_code_highlight_completion(cx: &mut TestAppContext) {
-        // 量化「代码块内每键打字」的稳态成本（真实窗口顶部密集带 24-34ms/键的表现路径）：
-        // 每键 = replace_range（非结构，块内单字符）→ build_frame（新内容纯文本行）→
-        // `on_code_parse_ready`（模拟后台高亮就绪）→ 紧接 build_frame。
-        // 修复前：on_code_parse_ready 全局 code_parse_gen++ → 整带缓存全 miss → 最后一帧
-        // 重排整个带（含无关段落）；修复后：只定向重排该代码块。这里测的就是「就绪帧」。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..6 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
+    eprintln!(
+        "[bench] plain type-char: {}ms ({:.1}ms/key)",
+        t,
+        t as f64 / n as f64
+    );
+    crate::prof::dump("wyreal.plain.type");
+}
+#[gpui::test]
+#[ignore]
+fn bench_rw_code(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    fn doc_code() -> String {
+        let mut t = String::from("```\n");
+        let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
+        while t.len() < 6_000_000 {
+            t.push_str(line);
         }
-        text.push_str("```rust\n");
-        for i in 0..12 {
-            text.push_str(&format!("fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"));
-        }
-        text.push_str("```\n");
-        for i in 6..90 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
+        t.push_str("```\n");
+        t
+    }
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_code()));
+        WyHost { ed }
+    });
+    let _ = cx.refresh();
+    let at = 3_000_000usize;
+    let mut t = 0u128;
+    let n = 12;
+    for k in 0..n {
+        let t0 = std::time::Instant::now();
+        let ins = if k % 2 == 0 { "x" } else { "y" };
+        cx.update(|cx| {
+            host.update(cx, |w, cx| {
+                w.ed.update(cx, |e, ecx| e.replace_range(at..at + 1, ins, ecx))
+            })
         });
-        let code_src_line = 6; // ```rust 围栏源行
-        // 代码块内一个 ASCII 字节位置（首行 fn 后或函数体内）；反复用同一位置替换。
-        let at = text.find("fn compute_0").unwrap();
-        vcx.update(|window, cx: &mut App| {
+        let _ = cx.refresh();
+        t += t0.elapsed().as_millis();
+    }
+    eprintln!(
+        "[bench] code type-char: {}ms ({:.1}ms/key)",
+        t,
+        t as f64 / n as f64
+    );
+    crate::prof::dump("wyreal.code.type");
+}
+#[gpui::test]
+#[ignore]
+fn bench_per_key_code_highlight_completion(cx: &mut TestAppContext) {
+    // 量化「代码块内每键打字」的稳态成本（真实窗口顶部密集带 24-34ms/键的表现路径）：
+    // 每键 = replace_range（非结构，块内单字符）→ build_frame（新内容纯文本行）→
+    // `on_code_parse_ready`（模拟后台高亮就绪）→ 紧接 build_frame。
+    // 修复前：on_code_parse_ready 全局 code_parse_gen++ → 整带缓存全 miss → 最后一帧
+    // 重排整个带（含无关段落）；修复后：只定向重排该代码块。这里测的就是「就绪帧」。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..6 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
+    }
+    text.push_str("```rust\n");
+    for i in 0..12 {
+        text.push_str(&format!(
+            "fn compute_{i}(a: u32, b: u32) -> u32 {{\n    a + b + {i}\n}}\n"
+        ));
+    }
+    text.push_str("```\n");
+    for i in 6..90 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let code_src_line = 6; // ```rust 围栏源行
+    // 代码块内一个 ASCII 字节位置（首行 fn 后或函数体内）；反复用同一位置替换。
+    let at = text.find("fn compute_0").unwrap();
+    vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             ed.update(cx, |e, _| e.set_caret(at));
             // 首帧：带覆盖代码块（全物化 + 请求后台解析）；随后归零整形计数。
@@ -5841,37 +6386,37 @@ A-->B
                 resh as f64 / n as f64,
             );
         });
+}
+#[gpui::test]
+#[ignore]
+fn bench_per_key_math_completion(cx: &mut TestAppContext) {
+    // 量化「公式排版就绪（on_math_ready）→ 下一帧」的稳态重排次数（对齐 code 修复
+    // 前的 `bench_per_key_code_highlight_completion`：43.2 次/键整带重排）。修复前
+    // `mgen` 进全局 shape_key——每个公式完成都让整带所有块（含无关段落）全 miss 重排
+    // 一次（肉眼 = 公式就绪时整片闪烁）；修复后 `on_math_ready` 只定向作废该公式
+    // 所在行 → 就绪帧只见该行/带边界重排。显示块（`$$…$$`，Pass2 blocked 不入缓存）
+    // 与行内公式（行正常入 `shape_rows`）两例各测 12 轮。
+    use crate::markdown::wysiwyg::MathSlot;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..6 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
     }
-    #[gpui::test]
-    #[ignore]
-    fn bench_per_key_math_completion(cx: &mut TestAppContext) {
-        // 量化「公式排版就绪（on_math_ready）→ 下一帧」的稳态重排次数（对齐 code 修复
-        // 前的 `bench_per_key_code_highlight_completion`：43.2 次/键整带重排）。修复前
-        // `mgen` 进全局 shape_key——每个公式完成都让整带所有块（含无关段落）全 miss 重排
-        // 一次（肉眼 = 公式就绪时整片闪烁）；修复后 `on_math_ready` 只定向作废该公式
-        // 所在行 → 就绪帧只见该行/带边界重排。显示块（`$$…$$`，Pass2 blocked 不入缓存）
-        // 与行内公式（行正常入 `shape_rows`）两例各测 12 轮。
-        use crate::markdown::wysiwyg::MathSlot;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let mut text = String::new();
-        for i in 0..6 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        text.push_str("$$\nx + y = 2^5\n$$\n");
-        text.push_str("inline math $E=mc^2$ here ends\n");
-        for i in 6..90 {
-            text.push_str(&format!("para line {i} some more words to wrap here\n"));
-        }
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-            image::RgbaImage::from_raw(200, 40, vec![0u8; 200 * 40 * 4]).unwrap(),
-        )]));
-        vcx.update(|window, cx: &mut App| {
+    text.push_str("$$\nx + y = 2^5\n$$\n");
+    text.push_str("inline math $E=mc^2$ here ends\n");
+    for i in 6..90 {
+        text.push_str(&format!("para line {i} some more words to wrap here\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+        image::RgbaImage::from_raw(200, 40, vec![0u8; 200 * 40 * 4]).unwrap(),
+    )]));
+    vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             // 光标停在正文（数学块被折叠成卡、行内行以常规行入 `shape_rows`；光标外行可缓存）。
             ed.update(cx, |e, _| e.set_caret(0));
@@ -5918,31 +6463,31 @@ A-->B
             completion_case("block", &block_key, 40.);
             completion_case("inline", &inline_key, 24.);
         });
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_undo_redo_cycle(cx: &mut TestAppContext) {
-        // 真实文件 undo/redo 循环稳态成本：恢复快照（Doc::open_rope 全量重建 +
-        // rebuild_block_regions + text_shared 整串）+ restore 后 build_frame 的
-        // pass1(pass1_base_layout 全量重估) / setup(derived 重建) / pass2(带内重排)。
-        // restore（=ed.undo/redo 内部）与 build_frame 分拆计时；KILO_PROF=1 时 dump 拆账。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[bench] skip realfile: {e}");
-                return;
-            }
-        };
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx: &mut App| {
+}
+#[gpui::test]
+#[ignore]
+fn bench_undo_redo_cycle(cx: &mut TestAppContext) {
+    // 真实文件 undo/redo 循环稳态成本：恢复快照（Doc::open_rope 全量重建 +
+    // rebuild_block_regions + text_shared 整串）+ restore 后 build_frame 的
+    // pass1(pass1_base_layout 全量重估) / setup(derived 重建) / pass2(带内重排)。
+    // restore（=ed.undo/redo 内部）与 build_frame 分拆计时；KILO_PROF=1 时 dump 拆账。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();
             // 顶部一个 ASCII 字节位置（行 1 的 `#` 后首个字母——`## C1 ·` 之前），
             // 替换成单字符制造一个撤销单元；基准改造前后同口径（旧整篇快照 vs 逆操作）。
@@ -5997,1474 +6542,2046 @@ A-->B
             );
             crate::prof::dump("wy.undo.current");
         });
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_rw_realfile(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[bench] skip realfile: {e}");
-                return;
+}
+#[gpui::test]
+#[ignore]
+fn bench_rw_realfile(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    // 定位各类位置：围栏内部、表格行、数学行、普通文本行、文档中部。
+    let find_after = |needle: &str, from: usize| -> Option<usize> {
+        let rel = text[from..].find(needle)?;
+        Some(from + rel)
+    };
+    // 第一个 ``` 之后的内容位置（代码块内）。
+    let fence_open = find_after("```\n", 0)
+        .map(|i| i + 4)
+        .unwrap_or(text.len() / 2);
+    let fence_mid = {
+        let next = find_after("```\n", fence_open + 1).unwrap_or(text.len());
+        let mid = fence_open + 10 * ((next - fence_open) / 21).max(1);
+        if mid < next { mid } else { fence_open }
+    };
+    let table_row = find_after("\n|", 0)
+        .map(|i| i + 2)
+        .unwrap_or(text.len() / 2);
+    let math_line = find_after("\n$$", 0)
+        .map(|i| i + 3)
+        .unwrap_or(text.len() / 2);
+    let cb = |s: &str, i: usize| -> usize {
+        let i = i.min(s.len());
+        if i == 0 || s.is_char_boundary(i) {
+            return i;
+        }
+        let mut j = i;
+        let b = s.as_bytes();
+        while j > 0 && (b[j] & 0b1100_0000) == 0b1000_0000 {
+            j -= 1;
+        }
+        j
+    };
+    // 一个普通文本位置（避开 $ | # ` 前缀）。
+    let plain_at = (0..100)
+        .find_map(|k| {
+            let raw = text.len() / 2 + k * 97;
+            let i = cb(&text, raw.min(text.len()));
+            let line = text[i..].lines().next().unwrap_or("");
+            let at_line_start = i == 0 || text[..i].ends_with('\n');
+            if at_line_start
+                && !line.starts_with('#')
+                && !line.starts_with('|')
+                && !line.starts_with("```")
+                && !line.starts_with(">")
+                && !line.starts_with("- ")
+                && !line.starts_with('$')
+                && !line.contains('$')
+                && !line.is_empty()
+            {
+                Some(i)
+            } else {
+                None
             }
-        };
-        // 定位各类位置：围栏内部、表格行、数学行、普通文本行、文档中部。
-        let find_after = |needle: &str, from: usize| -> Option<usize> {
-            let rel = text[from..].find(needle)?;
-            Some(from + rel)
-        };
-        // 第一个 ``` 之后的内容位置（代码块内）。
-        let fence_open = find_after("```\n", 0).map(|i| i + 4).unwrap_or(text.len() / 2);
-        let fence_mid = {
-            let next = find_after("```\n", fence_open + 1).unwrap_or(text.len());
-            let mid = fence_open + 10 * ((next - fence_open) / 21).max(1);
-            if mid < next { mid } else { fence_open }
-        };
-        let table_row = find_after("\n|", 0).map(|i| i + 2).unwrap_or(text.len() / 2);
-        let math_line = find_after("\n$$", 0).map(|i| i + 3).unwrap_or(text.len() / 2);
-        let cb = |s: &str, i: usize| -> usize {
-            let i = i.min(s.len());
-            if i == 0 || s.is_char_boundary(i) {
-                return i;
-            }
-            let mut j = i;
-            let b = s.as_bytes();
-            while j > 0 && (b[j] & 0b1100_0000) == 0b1000_0000 {
-                j -= 1;
-            }
-            j
-        };
-        // 一个普通文本位置（避开 $ | # ` 前缀）。
-        let plain_at = (0..100)
-            .find_map(|k| {
-                let raw = text.len() / 2 + k * 97;
-                let i = cb(&text, raw.min(text.len()));
-                let line = text[i..].lines().next().unwrap_or("");
-                let at_line_start = i == 0 || text[..i].ends_with('\n');
-                if at_line_start
-                    && !line.starts_with('#')
-                    && !line.starts_with('|')
-                    && !line.starts_with("```")
-                    && !line.starts_with(">")
-                    && !line.starts_with("- ")
-                    && !line.starts_with('$')
-                    && !line.contains('$')
-                    && !line.is_empty()
-                {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(cb(&text, text.len() / 2));
+        })
+        .unwrap_or(cb(&text, text.len() / 2));
 
-        eprintln!("[bench] realfile len={} fence_mid={fence_mid} table_row={table_row} math_line={math_line} plain_at={plain_at}", text.len());
-        let case = |cx: &mut TestAppContext, name: &str, at: usize, ins_seq: &[&str]| {
-            let (host, _vcx) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-                WyHost { ed }
-            });
-            let _ = cx.refresh();
-            // 定位到 ASCII 字节：替换后仍是单字节 ASCII → 区间跨多次迭代恒在字符边界。
-            let mut at2 = cb(&text, at.min(text.len().saturating_sub(1)));
-            for _ in 0..4096 {
-                if at2 >= text.len() {
-                    break;
-                }
-                let c = text[at2..].chars().next().unwrap();
-                if c.is_ascii() {
-                    break;
-                }
-                at2 += c.len_utf8();
-            }
-            let ok = at2 < text.len()
-                && text.is_char_boundary(at2)
-                && text.is_char_boundary(at2 + 1)
-                && text[at2..].chars().next().map(|c| c.is_ascii()).unwrap_or(false);
-            if !ok {
-                eprintln!("[bench] realfile {name}: 跳过（4096 内无 ASCII）");
-                return;
-            }
-            eprintln!("[bench] realfile {name}: ascii_at={at2}");
-            // 预热：先打 2 键进稳态（首次 bf 含 cold Pass1/冷缓存、不代表逐键成本），
-            // 计时与 prof 都只覆盖预热后的稳态段。
-            let mut warm = |ins: &str| {
-                cx.update(|cx| {
-                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx)));
-                });
-                let _ = cx.refresh();
-            };
-            warm("q");
-            warm("w");
-            // 预热后把 prof 已累计的暖机开销清掉，只统计稳态。
-            crate::prof::dump(&format!("wy.realfile.{name}.warmup"));
-            let mut t = 0u128;
-            let n = ins_seq.len().max(1);
-            for ins in ins_seq {
-                let t0 = std::time::Instant::now();
-                cx.update(|cx| {
-                    host.update(cx, |w, cx| w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx)));
-                });
-                let _ = cx.refresh();
-                t += t0.elapsed().as_millis();
-            }
-            eprintln!("[bench] realfile {name}: {}ms ({:.1}ms/键 稳态) at={at2}", t, t as f64 / n as f64);
-            crate::prof::dump(&format!("wy.realfile.{name}"));
-        };
-        case(cx, "plain-x", plain_at, &["x", "y", "x", "y", "x", "y", "x", "y"]);
-        case(cx, "fence-x", fence_mid, &["x", "y", "x", "y", "x", "y", "x", "y"]);
-        case(cx, "table-x", table_row, &["x", "y", "x", "y", "x", "y", "x", "y"]);
-        case(cx, "math-$$-x", math_line, &["x", "y", "x", "y", "x", "y", "x", "y"]);
-        case(cx, "enter-mid", text.len() / 2, &["\n", "\n", "\n", "\n"]);
-    }
-    #[gpui::test]
-    #[ignore]
-    fn bench_scroll_bands(cx: &mut TestAppContext) {
-        // 真实文档滚动带重建基准：模拟 prepaint 的 512px 带量化，从顶部连续滚 24 档、
-        // 每档 400px（≈每 1-2 档触发一次带内重建），统计每档 build_frame 耗时 + Pass2
-        // 实际整形（缓存未命中）块数。KILO_PROF=1 时同时 dump 各阶段开销。
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[bench] skip realfile: {e}");
-                return;
-            }
-        };
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let width = px(980.);
-        let vh = 800.0f32;
-        let q = 512.0f32;
-        let n = 24;
-        let mut bands: Vec<(f32, f32)> = Vec::new();
-        // 前段：文档上部（普通文本/标题/列表）；后段：~30k px 起的数学/表格密集区。
-        for k in 0..n {
-            let top = 400.0 * (k + 1) as f32;
-            bands.push((
-                (((top - vh) / q).floor() * q).max(0.),
-                ((top + 2. * vh) / q).ceil() * q,
-            ));
-        }
-        for k in 0..n {
-            let top = 30_000.0 + 400.0 * (k + 1) as f32;
-            bands.push((
-                (((top - vh) / q).floor() * q).max(0.),
-                ((top + 2. * vh) / q).ceil() * q,
-            ));
-        }
-        let n = bands.len();
-        // 阶段 A：首次滚过全部新带（每带含新进块整形）——真实滚动前沿成本。
-        let mut t = 0.0f64;
-        let mut reshapes = 0u64;
-        for &band in &bands {
-            let t0 = std::time::Instant::now();
-            vcx.update(|window, cx| {
-                let ed = host.read(cx).ed.clone();
-                let _ = build_frame(ed.read(cx), window, width, band);
-            });
-            t += t0.elapsed().as_secs_f64() * 1000.0;
-            vcx.update(|_window, cx| {
-                reshapes += host.read(cx).ed.read(cx).take_reshapes();
-            });
-        }
-        eprintln!(
-            "[bench] scroll-新带 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
-            total = t,
-            avg = t / n as f64,
-            resh = reshapes,
-            per = reshapes as f64 / n as f64,
-        );
-        crate::prof::dump("wy.scroll.fresh");
-        // 阶段 B：原样滚回（全部缓存命中、0 整形）——纯组装/折叠开销。
-        let mut t2 = 0.0f64;
-        let mut r2 = 0u64;
-        for &band in bands.iter().rev() {
-            let t0 = std::time::Instant::now();
-            vcx.update(|window, cx| {
-                let ed = host.read(cx).ed.clone();
-                let _ = build_frame(ed.read(cx), window, width, band);
-            });
-            t2 += t0.elapsed().as_secs_f64() * 1000.0;
-            vcx.update(|_window, cx| {
-                r2 += host.read(cx).ed.read(cx).take_reshapes();
-            });
-        }
-        eprintln!(
-            "[bench] scroll-全热 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
-            total = t2,
-            avg = t2 / n as f64,
-            resh = r2,
-            per = r2 as f64 / n as f64,
-        );
-        crate::prof::dump("wy.scroll.warm");
-    }
-
-    #[gpui::test]
-    fn window_rows_cover_every_band_realfile(cx: &mut TestAppContext) {
-        // 回归：滚动闪烁 / 首屏缺内容（GUI 实测：预览区滚轮后整屏空白、打开时下半屏
-        // 无内容）。根因 = `build_frame` 的带窗口用「估算高」二分截断 [`find_band_range`]，
-        // Pass2 把真实高 `set` 回 base 后，物化行底（真值坐标）可能远低于带高 `band_hi`
-        // → 带的下一屏没有任何行可画（视口空白一整帧/持续到下一次重建）。本测试断言
-        // **每个带的物化行（真值坐标）必须覆盖到 `band_hi`**（或带已越过文档末尾）——
-        // 覆盖视口的前提。用真实大文档 + 模拟 prepaint 的 512px 带量程逐档驱动。
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[test] skip realfile: {e}");
-                return;
-            }
-        };
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let width = px(980.);
-        let vh = 720.0f32;
-        let q = 512.0f32;
-        // 逐档推进的视口顶（元素局部 y）：从顶部连续滚 + 滚到 30k px 数学/表格密集区。
-        let mut tops: Vec<f32> = Vec::new();
-        for k in 0..24 {
-            tops.push(400.0 * (k + 1) as f32);
-        }
-        for k in 0..16 {
-            tops.push(30_000.0 + 400.0 * (k + 1) as f32);
-        }
-        let mut processed = 0usize;
-        for top in tops {
-            let band = (
-                (((top - vh) / q).floor() * q).max(0.),
-                ((top + 2. * vh) / q).ceil() * q,
-            );
-            // build_frame 是纯函数，返回的这一帧正是 prepaint 将存给 paint 用的帧——
-            // 直接断言它，而不是读编辑器里可能滞后的旧帧。
-            let frame = vcx.update(|window, cx| {
-                let ed = host.read(cx).ed.clone();
-                build_frame(ed.read(cx), window, width, band)
-            });
-            let (blo, bhi) = band;
-            let (max_bottom, total, rows) = {
-                let mb = frame
-                    .rows
-                    .iter()
-                    .map(|r| r.top.as_f32() + r.height.as_f32())
-                    .fold(0.0f32, f32::max);
-                (mb, frame.total.as_f32(), frame.rows.len())
-            };
-            processed += 1;
-            // 带未越过文档末尾（total > band_hi）时，物化行底必须 ≥ band_hi（+折叠尾部
-            // 容差）。这是「下一屏有行可画」= 视口不被空白穿帮的必要条件。
-            let over_end = total <= bhi + 1.0;
-            if !over_end {
-                assert!(
-                    max_bottom + 32.0 >= bhi,
-                    "band={band:?} top={top:.0}: materialized rows end at {max_bottom:.0}, \
-                     need >= {bhi:.0} (total={total:.0}, rows={rows}) — 改带下方没有行可画"
-                );
-            }
-            // 行区间必须覆盖带中点（bin:lo + 尾 block 可达 hi，但中间不得有物化空洞）。
-            let mid = (blo + bhi) / 2.0;
-            let mid_ok = frame
-                .rows
-                .iter()
-                .any(|r| {
-                    let rb = r.top.as_f32();
-                    let re = rb + r.height.as_f32();
-                    rb <= mid && re >= mid
-                });
-            if !over_end && max_bottom >= bhi - 32.0 {
-                assert!(
-                    mid_ok,
-                    "band={band:?} top={top:.0}: rows 未覆盖带中点 {mid:.0} (rows={rows})"
-                );
-            }
-        }
-        assert!(processed > 20, "应实际驱动了 >20 个带（processed={processed}）");
-    }
-
-    #[test]
-    fn layout_has_notdef_flags_missing_glyph() {
-        // `.notdef`（元字形，glyph id=0）＝ Windows 冷启动回退未命中的「豆腐块」。
-        let mk = |ids: &[u32]| gpui::LineLayout {
-            font_size: px(16.),
-            width: px(10.),
-            ascent: px(12.),
-            descent: px(3.),
-            len: ids.len(),
-            runs: vec![gpui::ShapedRun {
-                font_id: gpui::FontId(0),
-                glyphs: ids
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &id)| gpui::ShapedGlyph {
-                        id: gpui::GlyphId(id),
-                        position: point(px(i as f32), px(0.)),
-                        index: i,
-                        is_emoji: false,
-                    })
-                    .collect(),
-            }],
-        };
-        assert!(!layout_has_notdef(&mk(&[])));
-        assert!(!layout_has_notdef(&mk(&[1, 2, 3])));
-        assert!(
-            layout_has_notdef(&mk(&[1, 0, 3])),
-            "含 glyph 0 应判 notdef"
-        );
-        assert!(layout_has_notdef(&mk(&[0])));
-    }
-
-    #[gpui::test]
-    fn notdef_retry_state_machine(cx: &mut TestAppContext) {
-        // 直接驱动 notdef 重试状态机（不依赖平台回退）：
-        // - 未登记块 → notdef_settled=false、cooling_row=None（不打扰正常 pass）；
-        // - cool_start 推进真实平台重排计数，达 NOTDEF_RETRY_ATTEMPTS 上限返回「给出」
-        //   并置 settled（判定确无字形 → 之后命中含 notdef 的缓存不再当 miss 重排）；
-        // - clear_notdef 后 settled 清空、恢复原态。
-        use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let settled = |vcx: &mut VisualTestContext, block: usize| -> bool {
-            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(block))
-        };
-        assert!(!settled(vcx, 3), "未登记块不应 settled");
-        assert!(
-            vcx.update(|_, cx| host.read(cx).ed.read(cx).cooling_row(3))
-                .is_none(),
-            "未登记块不应处于冷却"
-        );
-        // 连打坏重排：第 k 次返回「未给出」（k < 上限）、第 N 次返回「给出」并 settled。
-        let mut gave_up_at = None;
-        for k in 1..=NOTDEF_RETRY_ATTEMPTS {
-            let ok = vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(3));
-            if ok && gave_up_at.is_none() {
-                gave_up_at = Some(k);
-            }
-        }
-        assert_eq!(
-            gave_up_at,
-            Some(NOTDEF_RETRY_ATTEMPTS),
-            "恰在上限次给出（长期坏块不再空转）"
-        );
-        assert!(settled(vcx, 3), "给出后应标记 settled（确无字形）");
-        // 单次登记（未达上限）：应不给出；clear 后 settled 清空。
-        assert!(
-            !vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(7)),
-            "未达上限不应给出"
-        );
-        vcx.update(|_, cx| host.read(cx).ed.read(cx).clear_notdef(7));
-        assert!(!settled(vcx, 7), "clear 后应清 settled");
-    }
-
-    #[gpui::test]
-    fn stale_verdicts_cleared_on_generation_change(cx: &mut TestAppContext) {
-        // 换代自愈语义：图片解码完成触发 `igen` 换代重建时，若块在上代（DWrite 退化期）
-        // 被误判 settled（预算烧光）/ verified（非零占位字形），`clear_stale_verdicts`
-        // 应作废这些上一代判决，让本块按新代重新校验/重试——不再整次运行永久豆腐块。
-        use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let settled = |vcx: &mut VisualTestContext, b: usize| -> bool {
-            vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(b))
-        };
-        let verified = |vcx: &mut VisualTestContext, b: usize| -> bool {
-            vcx.update(|_, cx| host.read(cx).ed.read(cx).fallback_verified(b))
-        };
-        // 构造"上一代判决"：块 5 被置 verified；块 7 被置 settled（15 次重排仍坏）。
-        vcx.update(|_, cx| host.read(cx).ed.read(cx).mark_fallback_verified(5));
-        for _ in 0..NOTDEF_RETRY_ATTEMPTS {
-            vcx.update(|_, cx| {
-                host.read(cx).ed.read(cx).cool_start(7);
-            });
-        }
-        assert!(verified(vcx, 5), "上代：fallback 已校验");
-        assert!(settled(vcx, 7), "上代：notdef 已确无字形");
-        // 换代：逐块作废，重置后恢复"未判决"。
-        vcx.update(|_, cx| {
-            host.read(cx).ed.read(cx).clear_stale_verdicts(5);
-            host.read(cx).ed.read(cx).clear_stale_verdicts(7);
-        });
-        assert!(!verified(vcx, 5), "换代后重新校验");
-        assert!(!settled(vcx, 7), "换代后重新重试");
-    }
-
-    #[gpui::test]
-    #[ignore]
-    fn bench_wysiwyg_cold_open_realfile(cx: &mut TestAppContext) {
-        // A-4 首帧空白诊断：真实 6.4MB 文档冷开逐段墙钟 + KILO_PROF 拆账。拆 4 段：
-        // ① Doc::open 全量解析（scan_blocks 6.4MB→16 万块）② WyEditor+with_text（load：
-        // set_source_text = 再解析 + rebuild_block_regions + preseed_image_sizes 逐图读尺寸）
-        // ③ 首帧真实 element 管线（measure→prepaint→paint，冷 pass1+layout+带整形+warmemoji）
-        // ④ 后续同带 build_frame（应命中缓存）。定位 10-30s 首帧空白的真实大头。
-        use crate::markdown::wysiwyg::WyEditor;
-        use gpui::App;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[bench] skip realfile: {e}");
-                return;
-            }
-        };
-        // ① Doc::open 解析拆账。
-        let t0 = std::time::Instant::now();
-        let doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
-        let _ = doc.line_count();
-        let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
-        // ② WyEditor 构造（= load 路径；with_text 内部再走一遍 set_source_text）。
-        let t0 = std::time::Instant::now();
+    eprintln!(
+        "[bench] realfile len={} fence_mid={fence_mid} table_row={table_row} math_line={math_line} plain_at={plain_at}",
+        text.len()
+    );
+    let case = |cx: &mut TestAppContext, name: &str, at: usize, ins_seq: &[&str]| {
         let (host, _vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
             WyHost { ed }
         });
-        let loader = t0.elapsed().as_secs_f64() * 1000.0;
-        // ③ 首帧真实 element 管线（不放 vcx 借用，用外层 cx 驱动 refresh）。
-        let t0 = std::time::Instant::now();
-        for _ in 0..3 {
-            let _ = cx.refresh();
-            cx.run_until_parked();
+        let _ = cx.refresh();
+        // 定位到 ASCII 字节：替换后仍是单字节 ASCII → 区间跨多次迭代恒在字符边界。
+        let mut at2 = cb(&text, at.min(text.len().saturating_sub(1)));
+        for _ in 0..4096 {
+            if at2 >= text.len() {
+                break;
+            }
+            let c = text[at2..].chars().next().unwrap();
+            if c.is_ascii() {
+                break;
+            }
+            at2 += c.len_utf8();
         }
-        let elem_first = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
-        crate::prof::dump("wy.cold.open");
-        // ④ 后续同带 build_frame（命中缓存）。从窗口重建 vcx。
-        let win = cx.windows()[0];
-        let mut vcx = VisualTestContext::from_window(win, cx);
-        let t0 = std::time::Instant::now();
-        let f0 = vcx.update(|window, cx: &mut App| {
-            build_frame(host.read(cx).ed.read(cx), window, px(980.), (0., 1600.))
-        });
-        let _ = f0.rows.len();
-        let warm_bf = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[bench] cold-open: Doc::open={doc_open:.1}ms, with_text(load)={loader:.1}ms, 首3帧element={elem_first:.1}ms/帧, 同带bf={warm_bf:.3}ms/帧"
-        );
-    }
-
-    #[gpui::test]
-    #[ignore]
-    fn bench_doc_open_internal_distribution(cx: &mut TestAppContext) {
-        // A 区残余结构性优化：headless 拆 Doc::open + set_source_text 内部逐段墙钟
-        // （scan_blocks 内部分布：line_starts 行内段 / split / classify 构建；Doc::open 其余：
-        // 二次 line_starts / Rope / 字符计数+UTF-16；set_source_text 的 marker_cnt / regions）。
-        // 并测新后台 load 路径的 **UI 线程成本**（`install_open` 装配，O(块) 级别）——
-        // 证明整篇 O(n) 解析已挪出 UI 线程。
-        // 跑法：cargo test --release --bin gpui-editor bench_doc_open_internal_distribution -- --ignored --nocapture，KILO_PROF=1 环境变量。
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[bench] skip realfile: {e}");
-                return;
-            }
-        };
-        let t0 = std::time::Instant::now();
-        let _doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
-        let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
-        crate::prof::dump("doc.open");
-        // set_source_text 的额外段（doc 已完成，只剩 marker 计数 + regions 重建 + 帧作废）。
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
-            WyHost { ed }
-        });
-        let t0 = std::time::Instant::now();
-        vcx.update(|_, cx| {
-            let ed = host.read(cx).ed.clone();
-            ed.update(cx, |ed, _| ed.set_source_text(&text))
-        });
-        let set_src = t0.elapsed().as_secs_f64() * 1000.0;
-        crate::prof::dump("set_source_text");
-        // 新后台 load 路径拆账：后台全量（open_from_rope） vs UI 线程装配（install_open）。
-        let rope = ropey::Rope::from_str(&text);
-        let t0 = std::time::Instant::now();
-        let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
-        let bg_parse = t0.elapsed().as_secs_f64() * 1000.0;
-        let (host2, vcx2) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
-            WyHost { ed }
-        });
-        let t0 = std::time::Instant::now();
-        vcx2.update(|_, cx| {
-            let ed = host2.read(cx).ed.clone();
-            ed.update(cx, |ed, _| ed.install_open(r));
-        });
-        let install = t0.elapsed().as_secs_f64() * 1000.0;
-        crate::prof::dump("install_open");
-        eprintln!(
-            "[bench] Doc::open={doc_open:.1}ms, set_source_text(extra)={set_src:.1}ms, 后台open_from_rope={bg_parse:.1}ms, **UI装配install_open={install:.3}ms**"
-        );
-    }
-
-    #[gpui::test]
-    fn async_open_rope_install_matches_sync_set_source(cx: &mut TestAppContext) {
-        // A 区残余结构性优化：App 大文档后台 load（`open_from_rope` 后台建 Doc +
-        // `install_open` UI 装配）的产物必须与同步 `set_source_text` 完全一致——文本/
-        // 行数/字符数/块索引/渲染行数/loaded 标志。覆盖混合内容：标题、段落行内样式、
-        // 列表、引用、代码围栏、表格、独立图片、数学、警报。
-        use ropey::Rope;
-        let text = "# 标题\n\n正文段落 **加粗** `代码`\n\n- 项目一\n- 项目二\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![img](/x.png)\n\n$E=mc^2$\n\n> [!WARNING]\n> 警告\n";
-        let rope = Rope::from_str(text);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let sync = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-            let bg = cx.new(|cx| WyEditor::new(window, cx));
-            DualWyHost { sync, bg }
-        });
-        vcx.update(|window, cx| {
-            let sync = host.read(cx).sync.clone();
-            let bg = host.read(cx).bg.clone();
-            // 后台解析 + 装配（App 大文档 load 的等价两步）。
-            let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
-            bg.update(cx, |ed, _| ed.install_open(r));
-            assert!(
-                sync.read(cx).is_loaded() && bg.read(cx).is_loaded(),
-                "两条路径都应收敛到已装载"
-            );
-            assert_eq!(
-                sync.read(cx).text().to_string(),
-                bg.read(cx).text().to_string(),
-                "全文一致"
-            );
-            assert_eq!(sync.read(cx).line_count(), bg.read(cx).line_count(), "行数一致");
-            assert_eq!(sync.read(cx).char_count(), bg.read(cx).char_count(), "字符数一致");
-            assert_eq!(
-                sync.read(cx).doc().block_count(),
-                bg.read(cx).doc().block_count(),
-                "块数一致"
-            );
-            for i in 0..sync.read(cx).doc().block_count() {
-                assert_eq!(
-                    sync.read(cx).doc().block_meta(i),
-                    bg.read(cx).doc().block_meta(i),
-                    "块 {i} 元数据一致"
-                );
-            }
-            // 全篇窗口渲染行数一致（消费同一 BlockIndex → 同一行网格）。
-            let rows_sync = build_frame(sync.read(cx), window, px(600.), (0., 1.0e9)).rows.len();
-            let rows_bg = build_frame(bg.read(cx), window, px(600.), (0., 1.0e9)).rows.len();
-            assert_eq!(rows_sync, rows_bg, "渲染行数一致");
-        });
-        // 从未装载的空壳编辑器（App load 在途窗口）也应如约报告未装载。
-        let (host2, vcx2) = cx.add_window_view(|window, cx| {
-            let empty = cx.new(|cx| WyEditor::new(window, cx));
-            WyHost { ed: empty }
-        });
-        vcx2.update(|_, cx| {
-            assert!(!host2.read(cx).ed.read(cx).is_loaded(), "新建空编辑器未装载");
-        });
-    }
-
-    #[gpui::test]
-    #[ignore]
-    fn bench_img_band_geometry(cx: &mut TestAppContext) {        // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
-        // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let path = "fixtures/大文档测试2.md";
-        let text = match std::fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[diag] skip: {e}");
-                return;
-            }
-        };
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        vcx.update(|window, cx| {
-            let ed = host.read(cx).ed.clone();
-            let frame = build_frame(ed.read(cx), window, px(980.), (0., 6000.));
-            eprintln!("[diag] rows materialized: {}", frame.rows.len());
-            for r in frame.rows.iter().filter(|r| (50..=112).contains(&r.src_line)) {
-                eprintln!(
-                    "[diag] src={} kind={:?} top={:.1} h={:.1}",
-                    r.src_line, r.kind, f32::from(r.top), f32::from(r.height)
-                );
-            }
-        });
-    }
-
-    #[gpui::test]
-    fn update_block_regions_incremental_matches_full_rebuild(cx: &mut TestAppContext) {
-        // B4：结构编辑在多个上下文下，增量 `update_block_regions_after_edit` 产出的
-        // `block_regions` 必须与整表 `rebuild_block_regions`（`with_text` 全量路径）
-        // 完全一致——覆盖普通段落 Enter、表格内 Enter、围栏内容 Enter、内容删换行合并。
-        use crate::markdown::wysiwyg::BlockRegion;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = concat!(
-            "para before\n",
-            "| h | h |\n",
-            "|---|---|\n",
-            "| 1 | 2 |\n",
-            "| 3 | 4 |\n",
-            "para mid\n",
-            "```rust\n",
-            "let a = 1;\n",
-            "let b = 2;\n",
-            "```\n",
-            "para after\n",
-        );
-        let find = |needle: &str| text.find(needle).unwrap();
-        let cases: &[(usize, &str)] = &[
-            // (byte offset, 替换串)：插入 Enter / 删除换行（合并）
-            (find("para mid") + 4, "\n"),         // 普通段落内 Enter
-            (find("| 1 | 2 |") + 4, "\n"),        // 表格数据行内 Enter
-            (find("let a = 1;") + 4, "\n"),       // 围栏内容行内 Enter
-            (find("let a = 1;\nlet") + 9, ""),    // 围栏内容删换行（合并）
-            (find("| 3 | 4 |") + 4, ""),          // 表格内容删换行（合并）
-        ];
-        for &(at, rep) in cases {
-            let mut edited = String::from(text);
-            if rep.is_empty() {
-                edited.replace_range(at..at + 1, "");
-            } else {
-                edited.insert_str(at, rep);
-            }
-            // A：增量路径（replace_range 内部走 update_block_regions_after_edit）。
-            let (host_a, vcx) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
-                WyHost { ed }
-            });
-            let _ = vcx;
-            host_a.update(cx, |w, cx| {
-                w.ed
-                    .update(cx, |ed2, ecx| ed2.replace_range(at..at + 1, rep, ecx));
-            });
-            // B：全量路径（with_text → rebuild_block_regions）。
-            let (host_b, vcx_b) = cx.add_window_view(|window, cx| {
-                let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&edited));
-                WyHost { ed }
-            });
-            let _ = vcx_b;
-            let (inc_regions, full_regions): (Vec<BlockRegion>, Vec<BlockRegion>) =
-                cx.update(|cx| {
-                    let inc = host_a.read(cx).ed.read(cx).block_regions.clone();
-                    let full = host_b.read(cx).ed.read(cx).block_regions.clone();
-                    (inc, full)
+        let ok = at2 < text.len()
+            && text.is_char_boundary(at2)
+            && text.is_char_boundary(at2 + 1)
+            && text[at2..]
+                .chars()
+                .next()
+                .map(|c| c.is_ascii())
+                .unwrap_or(false);
+        if !ok {
+            eprintln!("[bench] realfile {name}: 跳过（4096 内无 ASCII）");
+            return;
+        }
+        eprintln!("[bench] realfile {name}: ascii_at={at2}");
+        // 预热：先打 2 键进稳态（首次 bf 含 cold Pass1/冷缓存、不代表逐键成本），
+        // 计时与 prof 都只覆盖预热后的稳态段。
+        let mut warm = |ins: &str| {
+            cx.update(|cx| {
+                host.update(cx, |w, cx| {
+                    w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx))
                 });
-            assert_eq!(
-                inc_regions, full_regions,
-                "增量与全量 block_regions 不一致（at={at} rep={rep:?}）"
+            });
+            let _ = cx.refresh();
+        };
+        warm("q");
+        warm("w");
+        // 预热后把 prof 已累计的暖机开销清掉，只统计稳态。
+        crate::prof::dump(&format!("wy.realfile.{name}.warmup"));
+        let mut t = 0u128;
+        let n = ins_seq.len().max(1);
+        for ins in ins_seq {
+            let t0 = std::time::Instant::now();
+            cx.update(|cx| {
+                host.update(cx, |w, cx| {
+                    w.ed.update(cx, |ed2, ecx| ed2.replace_range(at2..at2 + 1, ins, ecx))
+                });
+            });
+            let _ = cx.refresh();
+            t += t0.elapsed().as_millis();
+        }
+        eprintln!(
+            "[bench] realfile {name}: {}ms ({:.1}ms/键 稳态) at={at2}",
+            t,
+            t as f64 / n as f64
+        );
+        crate::prof::dump(&format!("wy.realfile.{name}"));
+    };
+    case(
+        cx,
+        "plain-x",
+        plain_at,
+        &["x", "y", "x", "y", "x", "y", "x", "y"],
+    );
+    case(
+        cx,
+        "fence-x",
+        fence_mid,
+        &["x", "y", "x", "y", "x", "y", "x", "y"],
+    );
+    case(
+        cx,
+        "table-x",
+        table_row,
+        &["x", "y", "x", "y", "x", "y", "x", "y"],
+    );
+    case(
+        cx,
+        "math-$$-x",
+        math_line,
+        &["x", "y", "x", "y", "x", "y", "x", "y"],
+    );
+    case(cx, "enter-mid", text.len() / 2, &["\n", "\n", "\n", "\n"]);
+}
+#[gpui::test]
+#[ignore]
+fn bench_scroll_bands(cx: &mut TestAppContext) {
+    // 真实文档滚动带重建基准：模拟 prepaint 的 512px 带量化，从顶部连续滚 24 档、
+    // 每档 400px（≈每 1-2 档触发一次带内重建），统计每档 build_frame 耗时 + Pass2
+    // 实际整形（缓存未命中）块数。KILO_PROF=1 时同时 dump 各阶段开销。
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let width = px(980.);
+    let vh = 800.0f32;
+    let q = 512.0f32;
+    let n = 24;
+    let mut bands: Vec<(f32, f32)> = Vec::new();
+    // 前段：文档上部（普通文本/标题/列表）；后段：~30k px 起的数学/表格密集区。
+    for k in 0..n {
+        let top = 400.0 * (k + 1) as f32;
+        bands.push((
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        ));
+    }
+    for k in 0..n {
+        let top = 30_000.0 + 400.0 * (k + 1) as f32;
+        bands.push((
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        ));
+    }
+    let n = bands.len();
+    // 阶段 A：首次滚过全部新带（每带含新进块整形）——真实滚动前沿成本。
+    let mut t = 0.0f64;
+    let mut reshapes = 0u64;
+    for &band in &bands {
+        let t0 = std::time::Instant::now();
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let _ = build_frame(ed.read(cx), window, width, band);
+        });
+        t += t0.elapsed().as_secs_f64() * 1000.0;
+        vcx.update(|_window, cx| {
+            reshapes += host.read(cx).ed.read(cx).take_reshapes();
+        });
+    }
+    eprintln!(
+        "[bench] scroll-新带 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
+        total = t,
+        avg = t / n as f64,
+        resh = reshapes,
+        per = reshapes as f64 / n as f64,
+    );
+    crate::prof::dump("wy.scroll.fresh");
+    // 阶段 B：原样滚回（全部缓存命中、0 整形）——纯组装/折叠开销。
+    let mut t2 = 0.0f64;
+    let mut r2 = 0u64;
+    for &band in bands.iter().rev() {
+        let t0 = std::time::Instant::now();
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let _ = build_frame(ed.read(cx), window, width, band);
+        });
+        t2 += t0.elapsed().as_secs_f64() * 1000.0;
+        vcx.update(|_window, cx| {
+            r2 += host.read(cx).ed.read(cx).take_reshapes();
+        });
+    }
+    eprintln!(
+        "[bench] scroll-全热 {n} band-builds: {total:.2}ms ({avg:.3}ms/band, {resh} 次真实整形, {per:.1} 次/band)",
+        total = t2,
+        avg = t2 / n as f64,
+        resh = r2,
+        per = r2 as f64 / n as f64,
+    );
+    crate::prof::dump("wy.scroll.warm");
+}
+
+#[gpui::test]
+fn window_rows_cover_every_band_realfile(cx: &mut TestAppContext) {
+    // 回归：滚动闪烁 / 首屏缺内容（GUI 实测：预览区滚轮后整屏空白、打开时下半屏
+    // 无内容）。根因 = `build_frame` 的带窗口用「估算高」二分截断 [`find_band_range`]，
+    // Pass2 把真实高 `set` 回 base 后，物化行底（真值坐标）可能远低于带高 `band_hi`
+    // → 带的下一屏没有任何行可画（视口空白一整帧/持续到下一次重建）。本测试断言
+    // **每个带的物化行（真值坐标）必须覆盖到 `band_hi`**（或带已越过文档末尾）——
+    // 覆盖视口的前提。用真实大文档 + 模拟 prepaint 的 512px 带量程逐档驱动。
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[test] skip realfile: {e}");
+            return;
+        }
+    };
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let width = px(980.);
+    let vh = 720.0f32;
+    let q = 512.0f32;
+    // 逐档推进的视口顶（元素局部 y）：从顶部连续滚 + 滚到 30k px 数学/表格密集区。
+    let mut tops: Vec<f32> = Vec::new();
+    for k in 0..24 {
+        tops.push(400.0 * (k + 1) as f32);
+    }
+    for k in 0..16 {
+        tops.push(30_000.0 + 400.0 * (k + 1) as f32);
+    }
+    let mut processed = 0usize;
+    for top in tops {
+        let band = (
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        );
+        // build_frame 是纯函数，返回的这一帧正是 prepaint 将存给 paint 用的帧——
+        // 直接断言它，而不是读编辑器里可能滞后的旧帧。
+        let frame = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            build_frame(ed.read(cx), window, width, band)
+        });
+        let (blo, bhi) = band;
+        let (max_bottom, total, rows) = {
+            let mb = frame
+                .rows
+                .iter()
+                .map(|r| r.top.as_f32() + r.height.as_f32())
+                .fold(0.0f32, f32::max);
+            (mb, frame.total.as_f32(), frame.rows.len())
+        };
+        processed += 1;
+        // 带未越过文档末尾（total > band_hi）时，物化行底必须 ≥ band_hi（+折叠尾部
+        // 容差）。这是「下一屏有行可画」= 视口不被空白穿帮的必要条件。
+        let over_end = total <= bhi + 1.0;
+        if !over_end {
+            assert!(
+                max_bottom + 32.0 >= bhi,
+                "band={band:?} top={top:.0}: materialized rows end at {max_bottom:.0}, \
+                     need >= {bhi:.0} (total={total:.0}, rows={rows}) — 改带下方没有行可画"
+            );
+        }
+        // 行区间必须覆盖带中点（bin:lo + 尾 block 可达 hi，但中间不得有物化空洞）。
+        let mid = (blo + bhi) / 2.0;
+        let mid_ok = frame.rows.iter().any(|r| {
+            let rb = r.top.as_f32();
+            let re = rb + r.height.as_f32();
+            rb <= mid && re >= mid
+        });
+        if !over_end && max_bottom >= bhi - 32.0 {
+            assert!(
+                mid_ok,
+                "band={band:?} top={top:.0}: rows 未覆盖带中点 {mid:.0} (rows={rows})"
             );
         }
     }
+    assert!(
+        processed > 20,
+        "应实际驱动了 >20 个带（processed={processed}）"
+    );
+}
 
-    /// B5：折叠计划 deltas **增量平移** == 强制整建（逐字段比）。结构 Enter 后（marker
-    /// 身份未变）应走 `fold_plan_deltas_shifted` 平移路径，产出必须与整建完全一致。
-    #[gpui::test]
-    fn fold_plan_incremental_shift_matches_full_rebuild(cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::WyEditor;
-        cx.update(crate::actions::bind_local_keymaps);
-        let text = concat!(
-            "para before\n",
-            "$$x^2$$\n",
-            "math body line\n",
-            "$$\n",
-            "> [!NOTE]-\n",
-            "alert body\n",
-            "alert body 2\n",
-            "> done\n",
-            "para mid\n",
-            "```rust\n",
-            "let a = 1;\n",
-            "```\n",
-            "para after\n",
+#[test]
+fn layout_has_notdef_flags_missing_glyph() {
+    // `.notdef`（元字形，glyph id=0）＝ Windows 冷启动回退未命中的「豆腐块」。
+    let mk = |ids: &[u32]| gpui::LineLayout {
+        font_size: px(16.),
+        width: px(10.),
+        ascent: px(12.),
+        descent: px(3.),
+        len: ids.len(),
+        runs: vec![gpui::ShapedRun {
+            font_id: gpui::FontId(0),
+            glyphs: ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| gpui::ShapedGlyph {
+                    id: gpui::GlyphId(id),
+                    position: point(px(i as f32), px(0.)),
+                    index: i,
+                    is_emoji: false,
+                })
+                .collect(),
+        }],
+    };
+    assert!(!layout_has_notdef(&mk(&[])));
+    assert!(!layout_has_notdef(&mk(&[1, 2, 3])));
+    assert!(layout_has_notdef(&mk(&[1, 0, 3])), "含 glyph 0 应判 notdef");
+    assert!(layout_has_notdef(&mk(&[0])));
+}
+
+#[gpui::test]
+fn notdef_retry_state_machine(cx: &mut TestAppContext) {
+    // 直接驱动 notdef 重试状态机（不依赖平台回退）：
+    // - 未登记块 → notdef_settled=false、cooling_row=None（不打扰正常 pass）；
+    // - cool_start 推进真实平台重排计数，达 NOTDEF_RETRY_ATTEMPTS 上限返回「给出」
+    //   并置 settled（判定确无字形 → 之后命中含 notdef 的缓存不再当 miss 重排）；
+    // - clear_notdef 后 settled 清空、恢复原态。
+    use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let settled = |vcx: &mut VisualTestContext, block: usize| -> bool {
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(block))
+    };
+    assert!(!settled(vcx, 3), "未登记块不应 settled");
+    assert!(
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).cooling_row(3))
+            .is_none(),
+        "未登记块不应处于冷却"
+    );
+    // 连打坏重排：第 k 次返回「未给出」（k < 上限）、第 N 次返回「给出」并 settled。
+    let mut gave_up_at = None;
+    for k in 1..=NOTDEF_RETRY_ATTEMPTS {
+        let ok = vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(3));
+        if ok && gave_up_at.is_none() {
+            gave_up_at = Some(k);
+        }
+    }
+    assert_eq!(
+        gave_up_at,
+        Some(NOTDEF_RETRY_ATTEMPTS),
+        "恰在上限次给出（长期坏块不再空转）"
+    );
+    assert!(settled(vcx, 3), "给出后应标记 settled（确无字形）");
+    // 单次登记（未达上限）：应不给出；clear 后 settled 清空。
+    assert!(
+        !vcx.update(|_, cx| host.read(cx).ed.read(cx).cool_start(7)),
+        "未达上限不应给出"
+    );
+    vcx.update(|_, cx| host.read(cx).ed.read(cx).clear_notdef(7));
+    assert!(!settled(vcx, 7), "clear 后应清 settled");
+}
+
+#[gpui::test]
+fn stale_verdicts_cleared_on_generation_change(cx: &mut TestAppContext) {
+    // 换代自愈语义：图片解码完成触发 `igen` 换代重建时，若块在上代（DWrite 退化期）
+    // 被误判 settled（预算烧光）/ verified（非零占位字形），`clear_stale_verdicts`
+    // 应作废这些上一代判决，让本块按新代重新校验/重试——不再整次运行永久豆腐块。
+    use crate::markdown::wysiwyg::NOTDEF_RETRY_ATTEMPTS;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let settled = |vcx: &mut VisualTestContext, b: usize| -> bool {
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).notdef_settled(b))
+    };
+    let verified = |vcx: &mut VisualTestContext, b: usize| -> bool {
+        vcx.update(|_, cx| host.read(cx).ed.read(cx).fallback_verified(b))
+    };
+    // 构造"上一代判决"：块 5 被置 verified；块 7 被置 settled（15 次重排仍坏）。
+    vcx.update(|_, cx| host.read(cx).ed.read(cx).mark_fallback_verified(5));
+    for _ in 0..NOTDEF_RETRY_ATTEMPTS {
+        vcx.update(|_, cx| {
+            host.read(cx).ed.read(cx).cool_start(7);
+        });
+    }
+    assert!(verified(vcx, 5), "上代：fallback 已校验");
+    assert!(settled(vcx, 7), "上代：notdef 已确无字形");
+    // 换代：逐块作废，重置后恢复"未判决"。
+    vcx.update(|_, cx| {
+        host.read(cx).ed.read(cx).clear_stale_verdicts(5);
+        host.read(cx).ed.read(cx).clear_stale_verdicts(7);
+    });
+    assert!(!verified(vcx, 5), "换代后重新校验");
+    assert!(!settled(vcx, 7), "换代后重新重试");
+}
+
+#[gpui::test]
+#[ignore]
+fn bench_wysiwyg_cold_open_realfile(cx: &mut TestAppContext) {
+    // A-4 首帧空白诊断：真实 6.4MB 文档冷开逐段墙钟 + KILO_PROF 拆账。拆 4 段：
+    // ① Doc::open 全量解析（scan_blocks 6.4MB→16 万块）② WyEditor+with_text（load：
+    // set_source_text = 再解析 + rebuild_block_regions + preseed_image_sizes 逐图读尺寸）
+    // ③ 首帧真实 element 管线（measure→prepaint→paint，冷 pass1+layout+带整形+warmemoji）
+    // ④ 后续同带 build_frame（应命中缓存）。定位 10-30s 首帧空白的真实大头。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    // ① Doc::open 解析拆账。
+    let t0 = std::time::Instant::now();
+    let doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
+    let _ = doc.line_count();
+    let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
+    // ② WyEditor 构造（= load 路径；with_text 内部再走一遍 set_source_text）。
+    let t0 = std::time::Instant::now();
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let loader = t0.elapsed().as_secs_f64() * 1000.0;
+    // ③ 首帧真实 element 管线（不放 vcx 借用，用外层 cx 驱动 refresh）。
+    let t0 = std::time::Instant::now();
+    for _ in 0..3 {
+        let _ = cx.refresh();
+        cx.run_until_parked();
+    }
+    let elem_first = t0.elapsed().as_secs_f64() * 1000.0 / 3.0;
+    crate::prof::dump("wy.cold.open");
+    // ④ 后续同带 build_frame（命中缓存）。从窗口重建 vcx。
+    let win = cx.windows()[0];
+    let mut vcx = VisualTestContext::from_window(win, cx);
+    let t0 = std::time::Instant::now();
+    let f0 = vcx.update(|window, cx: &mut App| {
+        build_frame(host.read(cx).ed.read(cx), window, px(980.), (0., 1600.))
+    });
+    let _ = f0.rows.len();
+    let warm_bf = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[bench] cold-open: Doc::open={doc_open:.1}ms, with_text(load)={loader:.1}ms, 首3帧element={elem_first:.1}ms/帧, 同带bf={warm_bf:.3}ms/帧"
+    );
+}
+
+#[gpui::test]
+#[ignore]
+fn bench_doc_open_internal_distribution(cx: &mut TestAppContext) {
+    // A 区残余结构性优化：headless 拆 Doc::open + set_source_text 内部逐段墙钟
+    // （scan_blocks 内部分布：line_starts 行内段 / split / classify 构建；Doc::open 其余：
+    // 二次 line_starts / Rope / 字符计数+UTF-16；set_source_text 的 marker_cnt / regions）。
+    // 并测新后台 load 路径的 **UI 线程成本**（`install_open` 装配，O(块) 级别）——
+    // 证明整篇 O(n) 解析已挪出 UI 线程。
+    // 跑法：cargo test --release --bin gpui-editor bench_doc_open_internal_distribution -- --ignored --nocapture，KILO_PROF=1 环境变量。
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    let t0 = std::time::Instant::now();
+    let _doc = crate::markdown::doc::Doc::open(gpui::SharedString::from(&*text));
+    let doc_open = t0.elapsed().as_secs_f64() * 1000.0;
+    crate::prof::dump("doc.open");
+    // set_source_text 的额外段（doc 已完成，只剩 marker 计数 + regions 重建 + 帧作废）。
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let t0 = std::time::Instant::now();
+    vcx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.set_source_text(&text))
+    });
+    let set_src = t0.elapsed().as_secs_f64() * 1000.0;
+    crate::prof::dump("set_source_text");
+    // 新后台 load 路径拆账：后台全量（open_from_rope） vs UI 线程装配（install_open）。
+    let rope = ropey::Rope::from_str(&text);
+    let t0 = std::time::Instant::now();
+    let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
+    let bg_parse = t0.elapsed().as_secs_f64() * 1000.0;
+    let (host2, vcx2) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let t0 = std::time::Instant::now();
+    vcx2.update(|_, cx| {
+        let ed = host2.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.install_open(r));
+    });
+    let install = t0.elapsed().as_secs_f64() * 1000.0;
+    crate::prof::dump("install_open");
+    eprintln!(
+        "[bench] Doc::open={doc_open:.1}ms, set_source_text(extra)={set_src:.1}ms, 后台open_from_rope={bg_parse:.1}ms, **UI装配install_open={install:.3}ms**"
+    );
+}
+
+#[gpui::test]
+fn async_open_rope_install_matches_sync_set_source(cx: &mut TestAppContext) {
+    // A 区残余结构性优化：App 大文档后台 load（`open_from_rope` 后台建 Doc +
+    // `install_open` UI 装配）的产物必须与同步 `set_source_text` 完全一致——文本/
+    // 行数/字符数/块索引/渲染行数/loaded 标志。覆盖混合内容：标题、段落行内样式、
+    // 列表、引用、代码围栏、表格、独立图片、数学、警报。
+    use ropey::Rope;
+    let text = "# 标题\n\n正文段落 **加粗** `代码`\n\n- 项目一\n- 项目二\n\n> 引用\n\n```rust\nlet x = 1;\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n![img](/x.png)\n\n$E=mc^2$\n\n> [!WARNING]\n> 警告\n";
+    let rope = Rope::from_str(text);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let sync = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        let bg = cx.new(|cx| WyEditor::new(window, cx));
+        DualWyHost { sync, bg }
+    });
+    vcx.update(|window, cx| {
+        let sync = host.read(cx).sync.clone();
+        let bg = host.read(cx).bg.clone();
+        // 后台解析 + 装配（App 大文档 load 的等价两步）。
+        let r = crate::markdown::wysiwyg::WyEditor::open_from_rope(rope);
+        bg.update(cx, |ed, _| ed.install_open(r));
+        assert!(
+            sync.read(cx).is_loaded() && bg.read(cx).is_loaded(),
+            "两条路径都应收敛到已装载"
         );
-        let (host, vcx) = cx.add_window_view(|window, cx| {
+        assert_eq!(
+            sync.read(cx).text().to_string(),
+            bg.read(cx).text().to_string(),
+            "全文一致"
+        );
+        assert_eq!(
+            sync.read(cx).line_count(),
+            bg.read(cx).line_count(),
+            "行数一致"
+        );
+        assert_eq!(
+            sync.read(cx).char_count(),
+            bg.read(cx).char_count(),
+            "字符数一致"
+        );
+        assert_eq!(
+            sync.read(cx).doc().block_count(),
+            bg.read(cx).doc().block_count(),
+            "块数一致"
+        );
+        for i in 0..sync.read(cx).doc().block_count() {
+            assert_eq!(
+                sync.read(cx).doc().block_meta(i),
+                bg.read(cx).doc().block_meta(i),
+                "块 {i} 元数据一致"
+            );
+        }
+        // 全篇窗口渲染行数一致（消费同一 BlockIndex → 同一行网格）。
+        let rows_sync = build_frame(sync.read(cx), window, px(600.), (0., 1.0e9))
+            .rows
+            .len();
+        let rows_bg = build_frame(bg.read(cx), window, px(600.), (0., 1.0e9))
+            .rows
+            .len();
+        assert_eq!(rows_sync, rows_bg, "渲染行数一致");
+    });
+    // 从未装载的空壳编辑器（App load 在途窗口）也应如约报告未装载。
+    let (host2, vcx2) = cx.add_window_view(|window, cx| {
+        let empty = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed: empty }
+    });
+    vcx2.update(|_, cx| {
+        assert!(
+            !host2.read(cx).ed.read(cx).is_loaded(),
+            "新建空编辑器未装载"
+        );
+    });
+}
+
+#[gpui::test]
+#[ignore]
+fn bench_img_band_geometry(cx: &mut TestAppContext) {
+    // 诊断：图片行（src≈62-64）与标题行（src≈98）在真机滚过图片带后的几何
+    // （top/height/kind 连续性）——验证"图片后看不到字"是不是布局把后续行挤出带/错位。
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[diag] skip: {e}");
+            return;
+        }
+    };
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(980.), (0., 6000.));
+        eprintln!("[diag] rows materialized: {}", frame.rows.len());
+        for r in frame
+            .rows
+            .iter()
+            .filter(|r| (50..=112).contains(&r.src_line))
+        {
+            eprintln!(
+                "[diag] src={} kind={:?} top={:.1} h={:.1}",
+                r.src_line,
+                r.kind,
+                f32::from(r.top),
+                f32::from(r.height)
+            );
+        }
+    });
+}
+
+#[gpui::test]
+fn update_block_regions_incremental_matches_full_rebuild(cx: &mut TestAppContext) {
+    // B4：结构编辑在多个上下文下，增量 `update_block_regions_after_edit` 产出的
+    // `block_regions` 必须与整表 `rebuild_block_regions`（`with_text` 全量路径）
+    // 完全一致——覆盖普通段落 Enter、表格内 Enter、围栏内容 Enter、内容删换行合并。
+    use crate::markdown::wysiwyg::BlockRegion;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = concat!(
+        "para before\n",
+        "| h | h |\n",
+        "|---|---|\n",
+        "| 1 | 2 |\n",
+        "| 3 | 4 |\n",
+        "para mid\n",
+        "```rust\n",
+        "let a = 1;\n",
+        "let b = 2;\n",
+        "```\n",
+        "para after\n",
+    );
+    let find = |needle: &str| text.find(needle).unwrap();
+    let cases: &[(usize, &str)] = &[
+        // (byte offset, 替换串)：插入 Enter / 删除换行（合并）
+        (find("para mid") + 4, "\n"),      // 普通段落内 Enter
+        (find("| 1 | 2 |") + 4, "\n"),     // 表格数据行内 Enter
+        (find("let a = 1;") + 4, "\n"),    // 围栏内容行内 Enter
+        (find("let a = 1;\nlet") + 9, ""), // 围栏内容删换行（合并）
+        (find("| 3 | 4 |") + 4, ""),       // 表格内容删换行（合并）
+    ];
+    for &(at, rep) in cases {
+        let mut edited = String::from(text);
+        if rep.is_empty() {
+            edited.replace_range(at..at + 1, "");
+        } else {
+            edited.insert_str(at, rep);
+        }
+        // A：增量路径（replace_range 内部走 update_block_regions_after_edit）。
+        let (host_a, vcx) = cx.add_window_view(|window, cx| {
             let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
             WyHost { ed }
         });
-        let vcx: &mut VisualTestContext = vcx;
-        let cases = [("para mid", 4usize), ("para before", 4usize), ("alert body", 4usize)];
-        // 先做一次整建首穿（热缓存/基线）。
-        let _f0 = vcx.update(|window, cx| {
-            build_frame(host.read(cx).ed.read(cx), window, px(900.), (0., 999_999.))
+        let _ = vcx;
+        host_a.update(cx, |w, cx| {
+            w.ed.update(cx, |ed2, ecx| ed2.replace_range(at..at + 1, rep, ecx));
         });
-        for (needle, off) in cases {
-            let (inc, full) = vcx.update(|window, cx| {
-                let ed = host.read(cx).ed.clone();
-                // 结构编辑：插入换行。
-                ed.update(cx, |ed2, ecx| {
-                    let src = ed2.text();
-                    let at = src.find(needle).unwrap().min(src.len());
-                    let at = (at + off).min(src.len());
-                    ed2.replace_range(at..at, "\n", ecx);
-                });
-                let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
-                // 增量路径产出的计划。
-                let inc = ed
-                    .read(cx)
-                    .fold_plan_rc()
-                    .expect("增量平移后应有折叠计划");
-                // 强制整建：清缓存 + 清待消费标志（增量条件不满足 → 走整建）。
-                ed.update(cx, |e, _| {
-                    *e.fold_plan.borrow_mut() = None;
-                    e.struct_edit_pending.set(false);
-                });
-                let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
-                let full = ed.read(cx).fold_plan_rc().expect("整建后应有折叠计划");
-                (inc, full)
-            });
-            assert_eq!(inc.math_start, full.math_start, "{needle}: math_start 不一致");
-            assert_eq!(inc.math_body, full.math_body, "{needle}: math_body 不一致");
-            assert_eq!(inc.fold_lines, full.fold_lines, "{needle}: fold_lines 不一致");
-            assert_eq!(inc.fold_bodies, full.fold_bodies, "{needle}: fold_bodies 不一致");
-            assert_eq!(&*inc.deltas, &*full.deltas, "{needle}: deltas 不一致");
-            assert!(
-                (inc.delta_sum - full.delta_sum).abs() < 1e-3,
-                "{needle}: delta_sum 不一致 {} vs {}",
-                inc.delta_sum,
-                full.delta_sum
-            );
-        }
+        // B：全量路径（with_text → rebuild_block_regions）。
+        let (host_b, vcx_b) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&edited));
+            WyHost { ed }
+        });
+        let _ = vcx_b;
+        let (inc_regions, full_regions): (Vec<BlockRegion>, Vec<BlockRegion>) = cx.update(|cx| {
+            let inc = host_a.read(cx).ed.read(cx).block_regions.clone();
+            let full = host_b.read(cx).ed.read(cx).block_regions.clone();
+            (inc, full)
+        });
+        assert_eq!(
+            inc_regions, full_regions,
+            "增量与全量 block_regions 不一致（at={at} rep={rep:?}）"
+        );
     }
+}
 
-    /// S2：分块 `BlockLayout` 的结构编辑 `apply_structural_edit` 产出 == 平铺参考（逐块高/
-    /// src 全比）。覆盖中段插入/删除、块净增减、`line_delta` 尾部平移、跨多 Chunk 边框
-    /// 分裂与 `off` 累加。
-    #[gpui::test]
-    #[allow(clippy::type_complexity)]
-    fn chunked_layout_structural_edit_matches_flat_rebuild(_cx: &mut TestAppContext) {
-        use crate::markdown::wysiwyg::element::BlockLayout;
-        use std::cell::RefCell;
-        use std::rc::Rc;
-        // 参考实现：结构编辑 = 旧块序列上 前缀 + 中段 + 尾段(src+delta)。
-        fn apply_flat(
-            old: &[(f32, u32)],
-            keep: usize,
-            middle: &[(f32, u32)],
-            j: usize,
-            delta: i64,
-        ) -> Vec<(f32, u32)> {
-            let mut out: Vec<(f32, u32)> = old[..keep].to_vec();
-            out.extend_from_slice(middle);
-            for &(h, s) in &old[j..] {
-                out.push((h, (s as i64 + delta).max(0) as u32));
-            }
-            out
+/// B5：折叠计划 deltas **增量平移** == 强制整建（逐字段比）。结构 Enter 后（marker
+/// 身份未变）应走 `fold_plan_deltas_shifted` 平移路径，产出必须与整建完全一致。
+#[gpui::test]
+fn fold_plan_incremental_shift_matches_full_rebuild(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = concat!(
+        "para before\n",
+        "$$x^2$$\n",
+        "math body line\n",
+        "$$\n",
+        "> [!NOTE]-\n",
+        "alert body\n",
+        "alert body 2\n",
+        "> done\n",
+        "para mid\n",
+        "```rust\n",
+        "let a = 1;\n",
+        "```\n",
+        "para after\n",
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let cases = [
+        ("para mid", 4usize),
+        ("para before", 4usize),
+        ("alert body", 4usize),
+    ];
+    // 先做一次整建首穿（热缓存/基线）。
+    let _f0 = vcx.update(|window, cx| {
+        build_frame(host.read(cx).ed.read(cx), window, px(900.), (0., 999_999.))
+    });
+    for (needle, off) in cases {
+        let (inc, full) = vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            // 结构编辑：插入换行。
+            ed.update(cx, |ed2, ecx| {
+                let src = ed2.text();
+                let at = src.find(needle).unwrap().min(src.len());
+                let at = (at + off).min(src.len());
+                ed2.replace_range(at..at, "\n", ecx);
+            });
+            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+            // 增量路径产出的计划。
+            let inc = ed.read(cx).fold_plan_rc().expect("增量平移后应有折叠计划");
+            // 强制整建：清缓存 + 清待消费标志（增量条件不满足 → 走整建）。
+            ed.update(cx, |e, _| {
+                *e.fold_plan.borrow_mut() = None;
+                e.struct_edit_pending.set(false);
+            });
+            let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+            let full = ed.read(cx).fold_plan_rc().expect("整建后应有折叠计划");
+            (inc, full)
+        });
+        assert_eq!(
+            inc.math_start, full.math_start,
+            "{needle}: math_start 不一致"
+        );
+        assert_eq!(inc.math_body, full.math_body, "{needle}: math_body 不一致");
+        assert_eq!(
+            inc.fold_lines, full.fold_lines,
+            "{needle}: fold_lines 不一致"
+        );
+        assert_eq!(
+            inc.fold_bodies, full.fold_bodies,
+            "{needle}: fold_bodies 不一致"
+        );
+        assert_eq!(&*inc.deltas, &*full.deltas, "{needle}: deltas 不一致");
+        assert!(
+            (inc.delta_sum - full.delta_sum).abs() < 1e-3,
+            "{needle}: delta_sum 不一致 {} vs {}",
+            inc.delta_sum,
+            full.delta_sum
+        );
+    }
+}
+
+/// S2：分块 `BlockLayout` 的结构编辑 `apply_structural_edit` 产出 == 平铺参考（逐块高/
+/// src 全比）。覆盖中段插入/删除、块净增减、`line_delta` 尾部平移、跨多 Chunk 边框
+/// 分裂与 `off` 累加。
+#[gpui::test]
+#[allow(clippy::type_complexity)]
+fn chunked_layout_structural_edit_matches_flat_rebuild(_cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::element::BlockLayout;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    // 参考实现：结构编辑 = 旧块序列上 前缀 + 中段 + 尾段(src+delta)。
+    fn apply_flat(
+        old: &[(f32, u32)],
+        keep: usize,
+        middle: &[(f32, u32)],
+        j: usize,
+        delta: i64,
+    ) -> Vec<(f32, u32)> {
+        let mut out: Vec<(f32, u32)> = old[..keep].to_vec();
+        out.extend_from_slice(middle);
+        for &(h, s) in &old[j..] {
+            out.push((h, (s as i64 + delta).max(0) as u32));
         }
-        // 300 块（>2 Chunk），src = 块下标；多次随机结构编辑驱动边框分裂 + off 累加。
-        let mut flat: Vec<(f32, u32)> = (0..300u32).map(|i| (10.0 + (i % 7) as f32, i)).collect();
-        let bl: Rc<RefCell<BlockLayout>> = {
-            let h: Vec<f32> = flat.iter().map(|&(hh, _)| hh).collect();
-            let s: Vec<u32> = flat.iter().map(|&(_, ss)| ss).collect();
-            Rc::new(RefCell::new(BlockLayout::new(h, s)))
-        };
-        // 3 次中段结构编辑（插入 2 块 / 插入 1 块 / 删除 2 块 + 负行偏移）。
-        let cases: Vec<(usize, Vec<(f32, u32)>, usize, i64)> = vec![
-            (100, vec![(12.0, 100), (13.0, 101)], 100, 1),
-            (60, vec![(15.0, 60)], 61, 1),
-            (10, vec![], 14, -2),
-        ];
-        for (keep, middle, j, delta) in cases {
-            flat = apply_flat(&flat, keep, &middle, j, delta);
-            let old_bor = bl.borrow();
-            let n_exp = flat.len();
-            let mut nb = BlockLayout::empty();
-            nb.apply_structural_edit(&old_bor, keep, &middle, j, delta, n_exp);
-            drop(old_bor);
-            *bl.borrow_mut() = nb;
-            let (hh, ss) = bl.borrow().flat_range(0, n_exp);
-            for i in 0..n_exp {
-                assert!(
-                    (hh[i] - flat[i].0).abs() < 1e-3 && ss[i] == flat[i].1,
-                    "i={i} 块不一致：chunked=({:?},{:?}) flat=({:?},{:?})",
-                    hh[i],
-                    ss[i],
-                    flat[i].0,
-                    flat[i].1
-                );
-            }
-            assert_eq!(bl.borrow().n(), n_exp, "块数应一致");
-            let total = bl.borrow().total();
-            let ref_total: f32 = flat.iter().map(|&(h, _)| h).sum();
-            assert!((total - ref_total).abs() < 1e-3, "total 应一致");
-        }
-        // 边界：文末追加（keep == n_old）。
-        let keep = bl.borrow().n();
-        let middle = vec![(99.0, 999u32)];
-        flat = apply_flat(&flat, keep, &middle, keep, 0);
+        out
+    }
+    // 300 块（>2 Chunk），src = 块下标；多次随机结构编辑驱动边框分裂 + off 累加。
+    let mut flat: Vec<(f32, u32)> = (0..300u32).map(|i| (10.0 + (i % 7) as f32, i)).collect();
+    let bl: Rc<RefCell<BlockLayout>> = {
+        let h: Vec<f32> = flat.iter().map(|&(hh, _)| hh).collect();
+        let s: Vec<u32> = flat.iter().map(|&(_, ss)| ss).collect();
+        Rc::new(RefCell::new(BlockLayout::new(h, s)))
+    };
+    // 3 次中段结构编辑（插入 2 块 / 插入 1 块 / 删除 2 块 + 负行偏移）。
+    let cases: Vec<(usize, Vec<(f32, u32)>, usize, i64)> = vec![
+        (100, vec![(12.0, 100), (13.0, 101)], 100, 1),
+        (60, vec![(15.0, 60)], 61, 1),
+        (10, vec![], 14, -2),
+    ];
+    for (keep, middle, j, delta) in cases {
+        flat = apply_flat(&flat, keep, &middle, j, delta);
         let old_bor = bl.borrow();
+        let n_exp = flat.len();
         let mut nb = BlockLayout::empty();
-        nb.apply_structural_edit(&old_bor, keep, &middle, keep, 0, flat.len());
+        nb.apply_structural_edit(&old_bor, keep, &middle, j, delta, n_exp);
         drop(old_bor);
         *bl.borrow_mut() = nb;
-        let (hh, ss) = bl.borrow().flat_range(0, flat.len());
-        let last = flat.len() - 1;
-        assert_eq!((hh[last], ss[last]), (99.0, 999u32), "文末追加块应就位");
-        // 边界：`new(flat)` 直接建（无 old）。
-        let b = BlockLayout::new(vec![5.0, 6.0], vec![0, 1]);
-        assert_eq!(b.n(), 2);
-        let (hh, ss) = b.flat_range(0, 2);
-        assert_eq!(hh.as_slice(), &[5.0, 6.0]);
-        assert_eq!(ss.as_slice(), &[0, 1]);
-    }
-
-    /* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
-
-    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent};
-
-    fn img_down(x: f32, y: f32) -> MouseDownEvent {
-        MouseDownEvent {
-            button: MouseButton::Left,
-            position: point(px(x), px(y)),
-            modifiers: Modifiers::default(),
-            click_count: 1,
-            first_mouse: false,
-        }
-    }
-    fn img_move(x: f32, y: f32) -> MouseMoveEvent {
-        MouseMoveEvent {
-            position: point(px(x), px(y)),
-            pressed_button: None,
-            modifiers: Modifiers::default(),
-        }
-    }
-    fn img_up(x: f32, y: f32) -> gpui::MouseUpEvent {
-        gpui::MouseUpEvent {
-            button: MouseButton::Left,
-            position: point(px(x), px(y)),
-            modifiers: Modifiers::default(),
-            click_count: 1,
-        }
-    }
-
-    /// 图片编辑测试夹具：按**真实窗口内容宽**建帧并注入、`last_bounds` 置为原点。
-    /// 返回 `(帧, 内容宽)`。注意：元素经 `notify` 触发重绘后会按真实宽重建帧，
-    /// 因此测试几何一律从返回的帧/宽推导，不硬编码内容宽。
-    fn image_harness(
-        vcx: &mut VisualTestContext,
-        ed: &gpui::Entity<WyEditor>,
-    ) -> (std::rc::Rc<super::Frame>, f32) {
-        vcx.update(|window, cx| {
-            let width = f32::from(window.viewport_size().width).max(1.);
-            let frame = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        let (hh, ss) = bl.borrow().flat_range(0, n_exp);
+        for i in 0..n_exp {
             assert!(
-                frame.rows.iter().any(|r| r.kind == crate::markdown::ir::IrKind::Image),
-                "夹具应含独立图片行"
+                (hh[i] - flat[i].0).abs() < 1e-3 && ss[i] == flat[i].1,
+                "i={i} 块不一致：chunked=({:?},{:?}) flat=({:?},{:?})",
+                hh[i],
+                ss[i],
+                flat[i].0,
+                flat[i].1
             );
-            let bounds_h = f32::from(frame.total).max(600.);
-            ed.update(cx, |e, _| {
-                e.set_last_bounds(Some(Bounds::new(
-                    point(px(0.), px(0.)),
-                    size(px(width), px(bounds_h)),
-                )));
-            });
-            let rc = std::rc::Rc::new(frame);
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc.clone()));
-            (rc, width)
-        })
+        }
+        assert_eq!(bl.borrow().n(), n_exp, "块数应一致");
+        let total = bl.borrow().total();
+        let ref_total: f32 = flat.iter().map(|&(h, _)| h).sum();
+        assert!((total - ref_total).abs() < 1e-3, "total 应一致");
     }
+    // 边界：文末追加（keep == n_old）。
+    let keep = bl.borrow().n();
+    let middle = vec![(99.0, 999u32)];
+    flat = apply_flat(&flat, keep, &middle, keep, 0);
+    let old_bor = bl.borrow();
+    let mut nb = BlockLayout::empty();
+    nb.apply_structural_edit(&old_bor, keep, &middle, keep, 0, flat.len());
+    drop(old_bor);
+    *bl.borrow_mut() = nb;
+    let (hh, ss) = bl.borrow().flat_range(0, flat.len());
+    let last = flat.len() - 1;
+    assert_eq!((hh[last], ss[last]), (99.0, 999u32), "文末追加块应就位");
+    // 边界：`new(flat)` 直接建（无 old）。
+    let b = BlockLayout::new(vec![5.0, 6.0], vec![0, 1]);
+    assert_eq!(b.n(), 2);
+    let (hh, ss) = b.flat_range(0, 2);
+    assert_eq!(hh.as_slice(), &[5.0, 6.0]);
+    assert_eq!(ss.as_slice(), &[0, 1]);
+}
 
-    /// 悬浮到图片盒内 → 编辑按钮亮显（hover_image = 该行）；移出 → 清除。
-    #[gpui::test]
-    fn image_hover_toggles_edit_button_line(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
-        assert_eq!(img.src_line, 0);
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        // 图片盒：x0 = padding(12) + (content_w − w)/2。
-        let avail = width - 2.0 * f32::from(frame.padding);
-        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
-        // 图片中心 → 命中。
-        let mut ev = img_move(cx0 + w / 2., top + h / 2.);
-        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0), "悬浮在图片盒内应记录该行");
-        // 移到远离图片处 → 清除。
-        ev = img_move(width - 5., 0.);
-        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "移出图片盒应清除悬浮");
-        // 图片盒之外但行内（题注区）→ 不命中图片盒（不亮按钮）。
-        ev = img_move(cx0, top + h + 40.);
-        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "题注区不应命中图片盒");
+/* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
+
+use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent};
+
+fn img_down(x: f32, y: f32) -> MouseDownEvent {
+    MouseDownEvent {
+        button: MouseButton::Left,
+        position: point(px(x), px(y)),
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
     }
+}
+fn img_move(x: f32, y: f32) -> MouseMoveEvent {
+    MouseMoveEvent {
+        position: point(px(x), px(y)),
+        pressed_button: None,
+        modifiers: Modifiers::default(),
+    }
+}
+fn img_up(x: f32, y: f32) -> gpui::MouseUpEvent {
+    gpui::MouseUpEvent {
+        button: MouseButton::Left,
+        position: point(px(x), px(y)),
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    }
+}
 
-    /// 窗口级 mouse-move（元素级 `on_mouse_move` 被顶层叠层覆盖时的回退路径）：
-    /// 指针在 `last_bounds` 内 → 更新悬浮；移出元素 → 清除。
-    #[gpui::test]
-    fn image_hover_via_window_mouse_move(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
+/// 图片编辑测试夹具：按**真实窗口内容宽**建帧并注入、`last_bounds` 置为原点。
+/// 返回 `(帧, 内容宽)`。注意：元素经 `notify` 触发重绘后会按真实宽重建帧，
+/// 因此测试几何一律从返回的帧/宽推导，不硬编码内容宽。
+fn image_harness(
+    vcx: &mut VisualTestContext,
+    ed: &gpui::Entity<WyEditor>,
+) -> (std::rc::Rc<super::Frame>, f32) {
+    vcx.update(|window, cx| {
+        let width = f32::from(window.viewport_size().width).max(1.);
+        let frame = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|r| r.kind == crate::markdown::ir::IrKind::Image),
+            "夹具应含独立图片行"
         );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        // 指针在元素内（图片中心）→ 悬浮记录该行。
+        let bounds_h = f32::from(frame.total).max(600.);
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(width), px(bounds_h)),
+            )));
+        });
+        let rc = std::rc::Rc::new(frame);
+        ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc.clone()));
+        (rc, width)
+    })
+}
+
+/// 悬浮到图片盒内 → 编辑按钮亮显（hover_image = 该行）；移出 → 清除。
+#[gpui::test]
+fn image_hover_toggles_edit_button_line(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap();
+    assert_eq!(img.src_line, 0);
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    // 图片盒：x0 = padding(12) + (content_w − w)/2。
+    let avail = width - 2.0 * f32::from(frame.padding);
+    let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
+    // 图片中心 → 命中。
+    let mut ev = img_move(cx0 + w / 2., top + h / 2.);
+    ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.hover_image()),
+        Some(0),
+        "悬浮在图片盒内应记录该行"
+    );
+    // 移到远离图片处 → 清除。
+    ev = img_move(width - 5., 0.);
+    ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.hover_image()),
+        None,
+        "移出图片盒应清除悬浮"
+    );
+    // 图片盒之外但行内（题注区）→ 不命中图片盒（不亮按钮）。
+    ev = img_move(cx0, top + h + 40.);
+    ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.hover_image()),
+        None,
+        "题注区不应命中图片盒"
+    );
+}
+
+/// 窗口级 mouse-move（元素级 `on_mouse_move` 被顶层叠层覆盖时的回退路径）：
+/// 指针在 `last_bounds` 内 → 更新悬浮；移出元素 → 清除。
+#[gpui::test]
+fn image_hover_via_window_mouse_move(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    // 指针在元素内（图片中心）→ 悬浮记录该行。
+    let ev = img_move(cx0 + w / 2., top + h / 2.);
+    ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.hover_image()),
+        Some(0),
+        "窗口级移动应记录悬浮图片"
+    );
+    // 移出元素（last_bounds 之外）→ 清除。
+    let ev = img_move(width + 200., 50.);
+    ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.hover_image()),
+        None,
+        "指针移出元素应清除悬浮"
+    );
+}
+
+/// 点击图片右上角编辑按钮 → 打开编辑卡片（锚定该行、输入框预填当前 alt/src）。
+#[gpui::test]
+fn image_edit_button_click_opens_card(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let avail = width - 2.0 * f32::from(frame.padding);
+    let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
+    // 先悬浮（亮起按钮），再点按钮中心（右上角内收 margin+size 的方钮）。
+    let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let ev = img_move(cx0 + w / 2., top + h / 2.);
+    ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
+    assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0));
+    // 未打开时点按钮 → 打开。
+    let down = img_down(btn_x, btn_y);
+    let hit = vcx.update(|_, cx| {
+        let f = ed.read(cx).frame.borrow().clone();
+        super::image_edit_button_hit_at(
+            ed.read(cx),
+            f.as_deref().unwrap(),
+            point(px(btn_x), px(btn_y)),
+        )
+    });
+    assert_eq!(
+        hit,
+        Some(0),
+        "点按钮位置应命中编辑按钮（btn={btn_x},{btn_y}）"
+    );
+    vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "点编辑按钮应打开卡片"
+    );
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.image_edit_src_line()),
+        Some(0),
+        "卡片应锚定该图片行"
+    );
+    // 输入框预填当前 alt / src。
+    vcx.update(|_, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("应有链接输入框");
+        let text = ed.read(cx).image_edit_text_input().expect("应有文本输入框");
+        assert_eq!(link.read(cx).value().to_string(), "img测试.png");
+        assert_eq!(text.read(cx).value().to_string(), "独立图片");
+    });
+    // 再点同一按钮 → 关闭（toggle）。
+    vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
+    assert!(
+        !ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "再点编辑按钮应关闭卡片"
+    );
+}
+
+/// 保存卡片：把输入框的链接/文本写回 `![alt](src)`，并关闭卡片。
+#[gpui::test]
+fn image_edit_card_save_rewrites_source(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+    });
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "程序化打开卡片"
+    );
+    // 填新值：链接 + 文本。
+    vcx.update(|window, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        link.update(cx, |s, cx| s.set_value("assets/new图.png", window, cx));
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        text.update(cx, |s, cx| s.set_value("新描述文本", window, cx));
+    });
+    vcx.update(|_window, cx| {
+        ed.update(cx, |e, cx| e.save_image_edit(cx));
+    });
+    let out = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(
+        out, "![新描述文本](assets/new图.png)\n",
+        "保存应改写 alt+src"
+    );
+    assert!(
+        !ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "保存后卡片应关闭"
+    );
+}
+
+/// 不填链接（空 src）保存 → 保留原 src，只改文本。
+#[gpui::test]
+fn image_edit_save_with_empty_link_keeps_src(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+    });
+    vcx.update(|window, cx| {
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        text.update(cx, |s, cx| s.set_value("只改文本", window, cx));
+    });
+    vcx.update(|_window, cx| {
+        ed.update(cx, |e, cx| e.save_image_edit(cx));
+    });
+    let out = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(out, "![只改文本](img测试.png)\n", "空链接应保留原 src");
+}
+
+/// 渲染层：打开卡片后 draw，浮层卡片（wy-image-edit-card）真实出现。
+#[gpui::test]
+fn image_edit_card_renders_as_drawable_overlay(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let avail = width - 2.0 * f32::from(frame.padding);
+    let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
+    // 悬浮 + 点按钮 → 打开卡片。
+    vcx.update(|window, cx| {
         let ev = img_move(cx0 + w / 2., top + h / 2.);
-        ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0), "窗口级移动应记录悬浮图片");
-        // 移出元素（last_bounds 之外）→ 清除。
+        ed.update(cx, |e, cx| e.on_mouse_move(&ev, cx));
+        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+        let down = img_down(btn_x, btn_y);
+        ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+        assert!(ed.read(cx).image_edit_open(), "悬浮+点按钮应打开卡片");
+        // 绘制一帧 → 浮层卡片出现（deferred anchored 逃逸裁剪、随内容滚动）。
+        let _ = window.draw(cx);
+    });
+    assert!(
+        vcx.debug_bounds("wy-image-edit-card").is_some(),
+        "编辑卡片浮层应被绘制（debug_bounds 命中）"
+    );
+}
+
+/// 点图片**本体** → 选中该图（不落光标进题注文本）；点题注 → 清除选中、光标进 alt。
+#[gpui::test]
+fn image_click_body_selects_image_not_caption(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    // 点图片中心 → 选中（selected_image=该行、无文本选区、光标不进题注）。
+    vcx.update(|window, cx| {
+        let down = img_down(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(
+            ed.read(cx).selected_image(),
+            Some(0),
+            "点图片本体应选中该图"
+        );
+        assert_eq!(ed.read(cx).selection(), None, "选中图片不应产生文本选区");
+    });
+    // 点题注行（图片盒之下）→ 清除选中，且构成对准 alt 起点的源选区。
+    vcx.update(|window, cx| {
+        let caption_y = top + h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
+        let down2 = img_down(cx0, caption_y);
+        ed.update(cx, |e, c| e.on_mouse_down(&down2, window, c));
+        assert_eq!(ed.read(cx).selected_image(), None, "点题注应清除图片选中");
+        // 光标/锚点落在题注内即 alt 源字节（不在图片盒里「跳进题注」的对立面——
+        // 点题注本来就该能编辑 alt）。
+        assert_eq!(ed.read(cx).caret(), 2, "点题注应把光标放进 alt 起点");
+    });
+    // 再点图片本体 → 恢复选中（指针移开也不受影响：选中态独立于悬浮）。
+    vcx.update(|window, cx| {
+        let down3 = img_down(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_down(&down3, window, c));
+        assert_eq!(ed.read(cx).selected_image(), Some(0), "再点图片应重新选中");
+        // 模块级 mouse-move 到别处只清 hover 不清选中 → 按钮仍常显。
         let ev = img_move(width + 200., 50.);
-        ed.update(vcx, |e, cx| e.on_window_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), None, "指针移出元素应清除悬浮");
-    }
-
-    /// 点击图片右上角编辑按钮 → 打开编辑卡片（锚定该行、输入框预填当前 alt/src）。
-    #[gpui::test]
-    fn image_edit_button_click_opens_card(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
+        ed.update(cx, |e, c| e.on_window_mouse_move(&ev, c));
+        assert_eq!(ed.read(cx).hover_image(), None, "移出应清悬浮");
+        assert_eq!(
+            ed.read(cx).selected_image(),
+            Some(0),
+            "选中不随指针移出消失"
         );
-        let avail = width - 2.0 * f32::from(frame.padding);
-        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
-        // 先悬浮（亮起按钮），再点按钮中心（右上角内收 margin+size 的方钮）。
-        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
-        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+    });
+}
+
+/// 选中图片后 Backspace → 删除整张图片行（含换行），记撤销栈，清除选中态。
+#[gpui::test]
+fn image_selected_backspace_deletes_line(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    vcx.update(|window, cx| {
+        let down = img_down(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(ed.read(cx).selected_image(), Some(0));
+        ed.update(cx, |e, c| e.backspace(c));
+        assert_eq!(
+            ed.read(cx).content(),
+            "正文\n",
+            "Backspace 应删除整张图片行"
+        );
+        assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
+    });
+}
+
+/// 打开后紧跟「鼠标抬起」：`on_mouse_up → end_selection` 会把帧置空——若 render 期
+/// 缺帧就跳过卡片（或画到角落），卡片会「闪烁后失踪、鼠标再动才出现」。回归：抬起
+/// 后同一帧重绘，卡片仍在且贴在图片上。
+#[gpui::test]
+fn image_edit_card_survives_mouse_up(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+    // 悬浮 → 按下（打开）→ 抬起（end_selection 清帧）。
+    vcx.update(|window, cx| {
         let ev = img_move(cx0 + w / 2., top + h / 2.);
-        ed.update(vcx, |e, cx| e.on_mouse_move(&ev, cx));
-        assert_eq!(ed.read_with(vcx, |e, _| e.hover_image()), Some(0));
-        // 未打开时点按钮 → 打开。
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
         let down = img_down(btn_x, btn_y);
-        let hit = vcx.update(|_, cx| {
-            let f = ed.read(cx).frame.borrow().clone();
-            super::image_edit_button_hit_at(
-                ed.read(cx),
-                f.as_deref().unwrap(),
-                point(px(btn_x), px(btn_y)),
-            )
-        });
-        assert_eq!(hit, Some(0), "点按钮位置应命中编辑按钮（btn={btn_x},{btn_y}）");
-        vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
-        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "点编辑按钮应打开卡片");
-        assert_eq!(ed.read_with(vcx, |e, _| e.image_edit_src_line()), Some(0), "卡片应锚定该图片行");
-        // 输入框预填当前 alt / src。
-        vcx.update(|_, cx| {
-            let link = ed.read(cx).image_edit_link_input().expect("应有链接输入框");
-            let text = ed.read(cx).image_edit_text_input().expect("应有文本输入框");
-            assert_eq!(link.read(cx).value().to_string(), "img测试.png");
-            assert_eq!(text.read(cx).value().to_string(), "独立图片");
-        });
-        // 再点同一按钮 → 关闭（toggle）。
-        vcx.update(|window, cx| ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx)));
-        assert!(!ed.read_with(vcx, |e, _| e.image_edit_open()), "再点编辑按钮应关闭卡片");
-    }
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(ed.read(cx).image_edit_open(), "按下应打开卡片");
+        ed.update(cx, |e, c| e.on_mouse_up(&img_up(btn_x, btn_y), c));
+        assert!(ed.read(cx).image_edit_open(), "抬起不应关闭卡片");
+        let _ = window.draw(cx);
+    });
+    let card = vcx
+        .debug_bounds("wy-image-edit-card")
+        .expect("抬起后卡片仍应被绘制（不得因帧被清而消失/落角）");
+    assert!(
+        (f32::from(card.origin.y) - top).abs() < 8.,
+        "抬起后卡片 y {} 仍应贴图片行屏幕位 {top}",
+        f32::from(card.origin.y)
+    );
+}
 
-    /// 保存卡片：把输入框的链接/文本写回 `![alt](src)`，并关闭卡片。
-    #[gpui::test]
-    fn image_edit_card_save_rewrites_source(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        vcx.update(|window, cx| {
-            ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
-        });
-        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "程序化打开卡片");
-        // 填新值：链接 + 文本。
-        vcx.update(|window, cx| {
-            let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
-            link.update(cx, |s, cx| s.set_value("assets/new图.png", window, cx));
-            let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
-            text.update(cx, |s, cx| s.set_value("新描述文本", window, cx));
-        });
-        vcx.update(|_window, cx| {
-            ed.update(cx, |e, cx| e.save_image_edit(cx));
-        });
-        let out = vcx.update(|_w, cx| ed.read(cx).content());
-        assert_eq!(out, "![新描述文本](assets/new图.png)\n", "保存应改写 alt+src");
-        assert!(!ed.read_with(vcx, |e, _| e.image_edit_open()), "保存后卡片应关闭");
-    }
+/// 选中图片后 Delete → 删除整张图片行（与 Backspace 同一入口）。
+#[gpui::test]
+fn image_selected_delete_deletes_line(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    vcx.update(|window, cx| {
+        let down = img_down(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(ed.read(cx).selected_image(), Some(0));
+        ed.update(cx, |e, c| e.delete(c));
+        assert_eq!(ed.read(cx).content(), "正文\n", "Delete 应删除整张图片行");
+        assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
+    });
+}
 
-    /// 不填链接（空 src）保存 → 保留原 src，只改文本。
-    #[gpui::test]
-    fn image_edit_save_with_empty_link_keeps_src(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
+/// 卡片锚点必须与「临时重建帧」解耦：打开后 `end_selection` 清帧、紧接着
+/// `ensure_frame_for_input` 用兜底 800 宽重建的帧（与真实宽不同）**不得**让卡片
+/// 横向移动（修复「卡片在某处突然往左闪烁」：render 期现算 frame 会读到宽度错误
+/// 的临时帧）。断言：打开即缓存锚点（同代 origin+frame 得出），清帧 + 换 800 宽帧
+/// 后锚点不变——render 永远只读缓存锚点。
+#[gpui::test]
+fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+    // 打开：锚点按「真实宽 W 的帧 + origin(0,0)」缓存。
+    vcx.update(|window, cx| {
+        let ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+        ed.update(cx, |e, c| {
+            e.on_mouse_down(&img_down(btn_x, btn_y), window, c)
         });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        vcx.update(|window, cx| {
-            ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
-        });
-        vcx.update(|window, cx| {
-            let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
-            text.update(cx, |s, cx| s.set_value("只改文本", window, cx));
-        });
-        vcx.update(|_window, cx| {
-            ed.update(cx, |e, cx| e.save_image_edit(cx));
-        });
-        let out = vcx.update(|_w, cx| ed.read(cx).content());
-        assert_eq!(out, "![只改文本](img测试.png)\n", "空链接应保留原 src");
-    }
+    });
+    let expected_l = f32::from(frame.padding)
+        + (((width - 2.0 * f32::from(frame.padding)) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
+    let anchor0 = ed
+        .read_with(vcx, |e, _| e.image_edit_anchor())
+        .expect("打开即缓存锚点");
+    assert!(
+        (f32::from(anchor0.x) - expected_l).abs() < 1. && (f32::from(anchor0.y) - top).abs() < 1.,
+        "打开锚点应贴图（x={:.1} 应≈{expected_l:.1}，y={:.1} 应≈{top:.1}）",
+        f32::from(anchor0.x),
+        f32::from(anchor0.y)
+    );
+    // 强制用「兜底 800 宽重建帧」覆盖当前帧（模拟 `ensure_frame_for_input` 在
+    // `end_selection` 清帧后的行为；不经过 paint，锚点不得跟着变）。
+    vcx.update(|window, cx| {
+        let f800 = build_frame(ed.read(cx), window, px(800.), (0., 2048.));
+        let rc = std::rc::Rc::new(f800);
+        ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc));
+    });
+    let anchor1 = ed
+        .read_with(vcx, |e, _| e.image_edit_anchor())
+        .expect("锚点仍在");
+    assert!(
+        (f32::from(anchor1.x) - f32::from(anchor0.x)).abs() < 1.
+            && (f32::from(anchor1.y) - f32::from(anchor0.y)).abs() < 1.,
+        "锚点不得随临时 800 宽重建帧改变（防横向左跳）：({:.1},{:.1}) → ({:.1},{:.1})",
+        f32::from(anchor0.x),
+        f32::from(anchor0.y),
+        f32::from(anchor1.x),
+        f32::from(anchor1.y)
+    );
+}
 
-    /// 渲染层：打开卡片后 draw，浮层卡片（wy-image-edit-card）真实出现。
-    #[gpui::test]
-    fn image_edit_card_renders_as_drawable_overlay(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap().clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        let avail = width - 2.0 * f32::from(frame.padding);
-        let cx0 = f32::from(frame.padding) + ((avail - w) / 2.).max(0.);
-        // 悬浮 + 点按钮 → 打开卡片。
-        vcx.update(|window, cx| {
-            let ev = img_move(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, cx| e.on_mouse_move(&ev, cx));
-            let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
-            let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
-            let down = img_down(btn_x, btn_y);
-            ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
-            assert!(ed.read(cx).image_edit_open(), "悬浮+点按钮应打开卡片");
-            // 绘制一帧 → 浮层卡片出现（deferred anchored 逃逸裁剪、随内容滚动）。
-            let _ = window.draw(cx);
-        });
+/// 点**卡片外**任意处 → 关闭卡片（对齐 `ui::menu` 的 on_mouse_down_out 语义）。
+#[gpui::test]
+fn image_edit_card_click_outside_closes(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
+        .unwrap();
+    let (top, w, h) = (
+        f32::from(img.top),
+        img.image.as_ref().unwrap().w,
+        img.image.as_ref().unwrap().h,
+    );
+    let cx0 =
+        f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
+    // 悬浮 + 点按钮打开卡片。
+    let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
+    let down = img_down(btn_x, btn_y);
+    vcx.update(|window, cx| {
+        let ev = img_move(cx0 + w / 2., top + h / 2.);
+        ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+    });
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "点按钮应打开卡片"
+    );
+    // 点卡片外的空白区（图片右下方）→ 关闭。
+    vcx.simulate_click(point(px(50.), px(460.)), Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        !ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "点卡片外应关闭卡片"
+    );
+}
+
+/// 图片调整条（右中边缘）：悬浮/点图本体不误触；按条 → 拖拽实时改宽（保持宽高比、
+/// 不改源码），极端拖拽钳到 [MIN, MAX]，松开结束。
+#[gpui::test]
+fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
+    use crate::config::markdown::{IMAGE_MAX_W, IMAGE_MIN_W};
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let (frame, _width) = image_harness(vcx, &ed);
+    let img = frame
+        .rows
+        .iter()
+        .find(|r| r.kind == IrKind::Image)
+        .unwrap()
+        .clone();
+    let bb = super::image_box_local(&frame, &img).expect("图片盒");
+    let hb = super::image_resize_handle_local(&bb);
+    let (hx, hy) = (
+        f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
+        f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
+    );
+    let w0 = img.image.as_ref().unwrap().w;
+    // 点**图片本体左中部**（远离右边缘）→ 只选中，不误触调整条。
+    vcx.update(|window, cx| {
+        let down = img_down(f32::from(bb.left()) + 20., f32::from(bb.top()) + 20.);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(ed.read(cx).selected_image(), Some(0));
         assert!(
-            vcx.debug_bounds("wy-image-edit-card").is_some(),
-            "编辑卡片浮层应被绘制（debug_bounds 命中）"
+            ed.read(cx).image_resize_drag_src().is_none(),
+            "点图片中部不应开始调整条拖拽"
         );
-    }
-
-    /// 点图片**本体** → 选中该图（不落光标进题注文本）；点题注 → 清除选中、光标进 alt。
-    #[gpui::test]
-    fn image_click_body_selects_image_not_caption(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx
-                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
-            .unwrap()
-            .clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
+    });
+    // 点右中边缘调整条 → 开始拖拽 + 选中。
+    let down = img_down(hx, hy);
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(
+            ed.read(cx)
+                .image_resize_drag_src()
+                .map(|s| s.to_string())
+                .as_deref(),
+            Some("img测试.png"),
+            "按调整条应开始拖拽"
         );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        // 点图片中心 → 选中（selected_image=该行、无文本选区、光标不进题注）。
-        vcx.update(|window, cx| {
-            let down = img_down(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-            assert_eq!(ed.read(cx).selected_image(), Some(0), "点图片本体应选中该图");
-            assert_eq!(ed.read(cx).selection(), None, "选中图片不应产生文本选区");
-        });
-        // 点题注行（图片盒之下）→ 清除选中，且构成对准 alt 起点的源选区。
-        vcx.update(|window, cx| {
-            let caption_y = top + h + crate::config::markdown::IMAGE_CAPTION_GAP_PX + 2.;
-            let down2 = img_down(cx0, caption_y);
-            ed.update(cx, |e, c| e.on_mouse_down(&down2, window, c));
-            assert_eq!(ed.read(cx).selected_image(), None, "点题注应清除图片选中");
-            // 光标/锚点落在题注内即 alt 源字节（不在图片盒里「跳进题注」的对立面——
-            // 点题注本来就该能编辑 alt）。
-            assert_eq!(ed.read(cx).caret(), 2, "点题注应把光标放进 alt 起点");
-        });
-        // 再点图片本体 → 恢复选中（指针移开也不受影响：选中态独立于悬浮）。
-        vcx.update(|window, cx| {
-            let down3 = img_down(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_down(&down3, window, c));
-            assert_eq!(ed.read(cx).selected_image(), Some(0), "再点图片应重新选中");
-            // 模块级 mouse-move 到别处只清 hover 不清选中 → 按钮仍常显。
-            let ev = img_move(width + 200., 50.);
-            ed.update(cx, |e, c| e.on_window_mouse_move(&ev, c));
-            assert_eq!(ed.read(cx).hover_image(), None, "移出应清悬浮");
-            assert_eq!(ed.read(cx).selected_image(), Some(0), "选中不随指针移出消失");
-        });
-    }
-
-    /// 选中图片后 Backspace → 删除整张图片行（含换行），记撤销栈，清除选中态。
-    #[gpui::test]
-    fn image_selected_backspace_deletes_line(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
-            .unwrap()
-            .clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
+        assert_eq!(ed.read(cx).selected_image(), Some(0), "拖拽应同时选中该图");
+    });
+    // 向左拖 60px → 宽缩 60（未触钳制）。
+    vcx.update(|_, cx| {
+        let mv = img_move(hx - 60., hy);
+        ed.update(cx, |e, c| e.on_mouse_move(&mv, c));
+    });
+    let w1 = vcx
+        .update(|_, cx| ed.read(cx).image_width("img测试.png"))
+        .expect("拖拽后应有覆写宽");
+    assert!(
+        (w1 - (w0 - 60.)).abs() < 0.5,
+        "左拖 60px 应从 {w0} 缩到 {}（实际 {w1}）",
+        w0 - 60.
+    );
+    // 拖极右 → 钳到 MAX；拖极左 → 钳到 MIN。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx + 3000., hy), c));
+    });
+    assert_eq!(
+        vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+        Some(IMAGE_MAX_W),
+        "拖到极右应钳到最大宽"
+    );
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 3000., hy), c));
+    });
+    assert_eq!(
+        vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
+        Some(IMAGE_MIN_W),
+        "拖到极左应钳到最小宽"
+    );
+    // 松开 → 结束拖拽；源码未被改写。
+    vcx.update(|_window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_up(&img_up(hx, hy), c));
+        assert!(
+            ed.read(cx).image_resize_drag_src().is_none(),
+            "松开应结束调整条拖拽"
         );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        vcx.update(|window, cx| {
-            let down = img_down(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-            assert_eq!(ed.read(cx).selected_image(), Some(0));
-            ed.update(cx, |e, c| e.backspace(c));
-            assert_eq!(ed.read(cx).content(), "正文\n", "Backspace 应删除整张图片行");
-            assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
-        });
-    }
+    });
+    let out = vcx.update(|_, cx| ed.read(cx).content());
+    assert_eq!(out, "![独立图片](img测试.png)\n", "拖拽改宽不得改写源码");
+}
 
-    /// 打开后紧跟「鼠标抬起」：`on_mouse_up → end_selection` 会把帧置空——若 render 期
-    /// 缺帧就跳过卡片（或画到角落），卡片会「闪烁后失踪、鼠标再动才出现」。回归：抬起
-    /// 后同一帧重绘，卡片仍在且贴在图片上。
-    #[gpui::test]
-    fn image_edit_card_survives_mouse_up(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
+/// 回归（超长行内公式 + 后续键入「回弹」）：公式自然宽 > 内容盒时，spacer 宽 / 撑高 /
+/// paint 必须共用**同一个钳制值**（`InlineMathText::disp_w`，源于 `inline_math_fit`）。
+/// 旧实现按「自然宽」把整条公式 spacer 折成 9~13 行空格、把后续内容顶到极远处并越出
+/// 画布；下一帧又「钳到内容盒」取小 → 两帧取不同宽、内容忽大忽小。本测试：
+/// ① 公式后连续键入 6 帧几何完全一致（无两帧振荡）；② 公式显示宽 ≤ 内容盒宽；
+/// ③ 行不再炸成一整把空格行（可视行 ≤ 3）；④ 后续块紧贴公式行、不再被顶远。
+#[gpui::test]
+fn long_inline_math_typed_after_single_value_within_box(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let latex = "a".repeat(160);
+    let text = format!("前 ${latex}$ 后尾 1234567890\n下一段 abcdef\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // Ready 位图：4000×40（自然宽远超 400px 窗口内容盒的可复原场景）。
+        ed.read(cx).math_slots().borrow_mut().insert(
+            super::super::inline_math_key(&latex),
+            super::super::MathSlot::Ready(img, 4000., 40.),
+        );
+        let mut caret = ed.read(cx).content().find("后尾").unwrap();
+        let mut frames: Vec<(f32, usize, f32, f32)> = Vec::new();
+        let mut last_following_top = 0.0;
+        for _ in 0..6 {
+            ed.update(cx, |e, ecx| {
+                e.set_caret(caret);
+                e.replace_range(caret..caret, "X", ecx);
             });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == IrKind::Image)
-            .unwrap()
-            .clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
-        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
-        // 悬浮 → 按下（打开）→ 抬起（end_selection 清帧）。
-        vcx.update(|window, cx| {
-            let ev = img_move(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
-            let down = img_down(btn_x, btn_y);
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-            assert!(ed.read(cx).image_edit_open(), "按下应打开卡片");
-            ed.update(cx, |e, c| e.on_mouse_up(&img_up(btn_x, btn_y), c));
-            assert!(ed.read(cx).image_edit_open(), "抬起不应关闭卡片");
-            let _ = window.draw(cx);
-        });
-        let card = vcx
-            .debug_bounds("wy-image-edit-card")
-            .expect("抬起后卡片仍应被绘制（不得因帧被清而消失/落角）");
-        assert!(
-            (f32::from(card.origin.y) - top).abs() < 8.,
-            "抬起后卡片 y {} 仍应贴图片行屏幕位 {top}",
-            f32::from(card.origin.y)
-        );
-    }
-
-    /// 选中图片后 Delete → 删除整张图片行（与 Backspace 同一入口）。
-    #[gpui::test]
-    fn image_selected_delete_deletes_line(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("![甲](a.png)\n正文\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == crate::markdown::ir::IrKind::Image)
-            .unwrap()
-            .clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        vcx.update(|window, cx| {
-            let down = img_down(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-            assert_eq!(ed.read(cx).selected_image(), Some(0));
-            ed.update(cx, |e, c| e.delete(c));
-            assert_eq!(ed.read(cx).content(), "正文\n", "Delete 应删除整张图片行");
-            assert_eq!(ed.read(cx).selected_image(), None, "删除后应清除选中态");
-        });
-    }
-
-    /// 卡片锚点必须与「临时重建帧」解耦：打开后 `end_selection` 清帧、紧接着
-    /// `ensure_frame_for_input` 用兜底 800 宽重建的帧（与真实宽不同）**不得**让卡片
-    /// 横向移动（修复「卡片在某处突然往左闪烁」：render 期现算 frame 会读到宽度错误
-    /// 的临时帧）。断言：打开即缓存锚点（同代 origin+frame 得出），清帧 + 换 800 宽帧
-    /// 后锚点不变——render 永远只读缓存锚点。
-    #[gpui::test]
-    fn image_edit_card_anchor_ignores_transient_frame_rebuild(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx
-                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == IrKind::Image)
-            .unwrap()
-            .clone();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
-        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
-        // 打开：锚点按「真实宽 W 的帧 + origin(0,0)」缓存。
-        vcx.update(|window, cx| {
-            let ev = img_move(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
-            ed.update(cx, |e, c| e.on_mouse_down(&img_down(btn_x, btn_y), window, c));
-        });
-        let expected_l = f32::from(frame.padding)
-            + (((width - 2.0 * f32::from(frame.padding)) - super::IMAGE_EDIT_CARD_W) / 2.).max(0.);
-        let anchor0 = ed
-            .read_with(vcx, |e, _| e.image_edit_anchor())
-            .expect("打开即缓存锚点");
-        assert!(
-            (f32::from(anchor0.x) - expected_l).abs() < 1.
-                && (f32::from(anchor0.y) - top).abs() < 1.,
-            "打开锚点应贴图（x={:.1} 应≈{expected_l:.1}，y={:.1} 应≈{top:.1}）",
-            f32::from(anchor0.x),
-            f32::from(anchor0.y)
-        );
-        // 强制用「兜底 800 宽重建帧」覆盖当前帧（模拟 `ensure_frame_for_input` 在
-        // `end_selection` 清帧后的行为；不经过 paint，锚点不得跟着变）。
-        vcx.update(|window, cx| {
-            let f800 = build_frame(ed.read(cx), window, px(800.), (0., 2048.));
-            let rc = std::rc::Rc::new(f800);
-            ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc));
-        });
-        let anchor1 = ed
-            .read_with(vcx, |e, _| e.image_edit_anchor())
-            .expect("锚点仍在");
-        assert!(
-            (f32::from(anchor1.x) - f32::from(anchor0.x)).abs() < 1.
-                && (f32::from(anchor1.y) - f32::from(anchor0.y)).abs() < 1.,
-            "锚点不得随临时 800 宽重建帧改变（防横向左跳）：({:.1},{:.1}) → ({:.1},{:.1})",
-            f32::from(anchor0.x),
-            f32::from(anchor0.y),
-            f32::from(anchor1.x),
-            f32::from(anchor1.y)
-        );
-    }
-
-    /// 点**卡片外**任意处 → 关闭卡片（对齐 `ui::menu` 的 on_mouse_down_out 语义）。
-    #[gpui::test]
-    fn image_edit_card_click_outside_closes(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx.new(|cx| {
-                WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n")
-            });
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, width) = image_harness(vcx, &ed);
-        let img = frame.rows.iter().find(|r| r.kind == crate::markdown::ir::IrKind::Image).unwrap();
-        let (top, w, h) = (
-            f32::from(img.top),
-            img.image.as_ref().unwrap().w,
-            img.image.as_ref().unwrap().h,
-        );
-        let cx0 = f32::from(frame.padding) + ((width - 2.0 * f32::from(frame.padding) - w) / 2.).max(0.);
-        // 悬浮 + 点按钮打开卡片。
-        let btn_x = cx0 + w - super::IMAGE_EDIT_BTN_MARGIN - super::IMAGE_EDIT_BTN_SIZE / 2.;
-        let btn_y = top + super::IMAGE_EDIT_BTN_MARGIN + super::IMAGE_EDIT_BTN_SIZE / 2.;
-        let down = img_down(btn_x, btn_y);
-        vcx.update(|window, cx| {
-            let ev = img_move(cx0 + w / 2., top + h / 2.);
-            ed.update(cx, |e, c| e.on_mouse_move(&ev, c));
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-        });
-        assert!(ed.read_with(vcx, |e, _| e.image_edit_open()), "点按钮应打开卡片");
-        // 点卡片外的空白区（图片右下方）→ 关闭。
-        vcx.simulate_click(point(px(50.), px(460.)), Modifiers::default());
-        vcx.run_until_parked();
-        assert!(
-            !ed.read_with(vcx, |e, _| e.image_edit_open()),
-            "点卡片外应关闭卡片"
-        );
-    }
-
-    /// 图片调整条（右中边缘）：悬浮/点图本体不误触；按条 → 拖拽实时改宽（保持宽高比、
-    /// 不改源码），极端拖拽钳到 [MIN, MAX]，松开结束。
-    #[gpui::test]
-    fn image_resize_handle_drag_resizes_width(cx: &mut TestAppContext) {
-        use crate::markdown::ir::IrKind;
-        use crate::config::markdown::{IMAGE_MAX_W, IMAGE_MIN_W};
-        cx.update(crate::actions::bind_local_keymaps);
-        let (host, vcx) = cx.add_window_view(|window, cx| {
-            let ed = cx
-                .new(|cx| WyEditor::new(window, cx).with_text("![独立图片](img测试.png)\n"));
-            WyHost { ed }
-        });
-        let vcx: &mut VisualTestContext = vcx;
-        let ed = host.read_with(vcx, |h, _| h.ed.clone());
-        let (frame, _width) = image_harness(vcx, &ed);
-        let img = frame
-            .rows
-            .iter()
-            .find(|r| r.kind == IrKind::Image)
-            .unwrap()
-            .clone();
-        let bb = super::image_box_local(&frame, &img).expect("图片盒");
-        let hb = super::image_resize_handle_local(&bb);
-        let (hx, hy) = (
-            f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.,
-            f32::from(hb.top()) + f32::from(hb.size.height) / 2.,
-        );
-        let w0 = img.image.as_ref().unwrap().w;
-        // 点**图片本体左中部**（远离右边缘）→ 只选中，不误触调整条。
-        vcx.update(|window, cx| {
-            let down = img_down(f32::from(bb.left()) + 20., f32::from(bb.top()) + 20.);
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
-            assert_eq!(ed.read(cx).selected_image(), Some(0));
-            assert!(
-                ed.read(cx).image_resize_drag_src().is_none(),
-                "点图片中部不应开始调整条拖拽"
-            );
-        });
-        // 点右中边缘调整条 → 开始拖拽 + 选中。
-        let down = img_down(hx, hy);
-        vcx.update(|window, cx| {
-            ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+            caret += 1;
+            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+            let r = &f.rows[0];
+            let w0 = r.wrapped.first().unwrap();
+            let disp_w = r
+                .extra
+                .inline_maths
+                .first()
+                .map(|im| im.disp_w)
+                .unwrap_or(0.);
+            let following_top = f.rows.get(1).map(|r2| f32::from(r2.top)).unwrap_or(0.);
+            frames.push((
+                f32::from(r.height),
+                w0.wrap_boundaries().len() + 1,
+                disp_w,
+                following_top,
+            ));
+            last_following_top = following_top;
+        }
+        let first = frames[0];
+        for (i, fr) in frames.iter().enumerate().skip(1) {
             assert_eq!(
-                ed.read(cx)
-                    .image_resize_drag_src()
-                    .map(|s| s.to_string())
-                    .as_deref(),
-                Some("img测试.png"),
-                "按调整条应开始拖拽"
+                *fr, first,
+                "公式后连续键入第 {i} 帧几何应等于首帧（回弹 = 两帧取不同宽）"
             );
-            assert_eq!(ed.read(cx).selected_image(), Some(0), "拖拽应同时选中该图");
-        });
-        // 向左拖 60px → 宽缩 60（未触钳制）。
-        vcx.update(|_, cx| {
-            let mv = img_move(hx - 60., hy);
-            ed.update(cx, |e, c| e.on_mouse_move(&mv, c));
-        });
-        let w1 = vcx
-            .update(|_, cx| ed.read(cx).image_width("img测试.png"))
-            .expect("拖拽后应有覆写宽");
+        }
+        // 公式显示宽钳到内容盒 400−2×12=376，绝不能以自然宽 4000 参与布局。
+        let avail = 400. - 2. * crate::config::markdown::CONTENT_EDGE_PAD_X_PX;
         assert!(
-            (w1 - (w0 - 60.)).abs() < 0.5,
-            "左拖 60px 应从 {w0} 缩到 {}（实际 {w1}）",
-            w0 - 60.
+            first.2 <= avail + 1.0,
+            "公式 disp_w {} 应 ≤ 内容盒宽 {avail}",
+            first.2
         );
-        // 拖极右 → 钳到 MAX；拖极左 → 钳到 MIN。
-        vcx.update(|_, cx| {
-            ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx + 3000., hy), c));
-        });
-        assert_eq!(
-            vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
-            Some(IMAGE_MAX_W),
-            "拖到极右应钳到最大宽"
+        // 行不炸成一整把空格行（旧实现 9~13 个可视行）：钳宽后 ≤ 3 个可视行。
+        assert!(
+            first.1 <= 3,
+            "超长公式行应按内容盒钳制：可视行 {} 应 ≤ 3",
+            first.1
         );
-        vcx.update(|_, cx| {
-            ed.update(cx, |e, c| e.on_mouse_move(&img_move(hx - 3000., hy), c));
-        });
-        assert_eq!(
-            vcx.update(|_, cx| ed.read(cx).image_width("img测试.png")),
-            Some(IMAGE_MIN_W),
-            "拖到极左应钳到最小宽"
+        // 后续块紧随公式行（top == 公式行高），不再被顶到极远。
+        assert!(
+            (last_following_top - first.0).abs() < 0.5,
+            "后续块 top {} 应紧贴公式行高 {}",
+            last_following_top,
+            first.0
         );
-        // 松开 → 结束拖拽；源码未被改写。
-        vcx.update(|_window, cx| {
-            ed.update(cx, |e, c| e.on_mouse_up(&img_up(hx, hy), c));
-            assert!(
-                ed.read(cx).image_resize_drag_src().is_none(),
-                "松开应结束调整条拖拽"
+    });
+}
+
+/// 回归（块级超宽公式不缩小 → 块内横向滚动）：位图就绪（自然宽 5000 ≫ 内容盒 376）
+/// → ① 公式自然宽 = 位图逻辑宽（未缩小）；② `math_hscroll_geo` 返回 Some 且
+/// `max_scroll > 0`（横向滚动条存在）；③ 滚动偏移按 max_scroll clamp、旧值不越界；
+/// ④ 底部滚动条带命中（轨道跳转/拖拽双语义）；⑤ 公式自然宽 ≤ 内容盒时无滚动条。
+#[gpui::test]
+fn block_math_wide_has_hscroll_and_natural_width(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let latex = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}".to_string() + &"1".repeat(60);
+    let text = format!("$$\n{latex}\n$$\n后文 xxxx\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放块外 → 折叠成卡片（非 reveal）。
+        let end = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(end));
+        // 超宽位图（自然宽 5000、高 60；内容盒 = 400 − 2×12 = 376）。
+        ed.read(cx).math_slots().borrow_mut().insert(
+            latex.clone().into(),
+            super::super::MathSlot::Ready(img, 5000., 60.),
+        );
+        let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+        let card = f
+            .rows
+            .iter()
+            .find(|r| matches!(&r.extra.card, Some(super::BlockCard::Math { .. })))
+            .expect("数学卡");
+        let viewport = 400. - 2. * crate::config::markdown::CONTENT_EDGE_PAD_X_PX;
+        // ① 公式自然宽 = 位图逻辑宽（不缩小）且 > 内容盒宽。
+        let nat = super::math_natural_w(ed.read(cx), card);
+        assert!(
+            nat > viewport + 1.,
+            "自然宽 {nat} 应远超内容盒 {viewport}（不缩小）"
+        );
+        assert_eq!(nat, 5000.0, "自然宽应取位图逻辑宽");
+        // ② 超宽 → 横向滚动条几何存在（max_scroll = 自然宽 − 内容盒）。
+        let (_, _, _, _, max_scroll) =
+            super::math_hscroll_geo(ed.read(cx), &f, card).expect("超宽公式应有横向滚动条");
+        assert!(max_scroll > 0., "max_scroll={max_scroll} 应 > 0");
+        assert!(
+            (max_scroll - (nat - viewport)).abs() < 1.0,
+            "max_scroll = 自然宽 − 内容盒"
+        );
+        // ③ 默认 0；写入超界值被 clamp 到 max_scroll；清回 0。
+        assert_eq!(super::math_hscroll_clamped(ed.read(cx), &f, card), 0.);
+        ed.read(cx).set_math_h_scroll(card.src_line, 999_999.);
+        assert!(
+            (super::math_hscroll_clamped(ed.read(cx), &f, card) - max_scroll).abs() < 0.5,
+            "应钳到 max_scroll"
+        );
+        ed.read(cx).set_math_h_scroll(card.src_line, 0.);
+        // ④ 底部滚动条带命中（点在轨道内、滑块外 → on_thumb=false，可轨道跳转）。
+        let (hit, on_thumb, _) = super::math_hscrollbar_hit(
+            ed.read(cx),
+            &f,
+            point(
+                px(f32::from(f.padding) + viewport * 0.9),
+                px(f32::from(card.top) + f32::from(card.height)
+                    - crate::config::layout::CODE_HSCROLL_BAND / 2.),
+            ),
+        )
+        .expect("超宽公式底部轨道应命中");
+        assert_eq!(hit, card.src_line, "命中该数学卡");
+        assert!(!on_thumb, "0.9 内容宽处应在轨道（非滑块）上");
+    });
+}
+
+/// 回归（块级公式键入「回弹」→ 排版槽换代单值稳定）：真实光栅异步换代——每键入
+/// 一帧，卡片先遇 Loading（回退）再换 Ready（同源新位图）。旧实现卡高 = `20+位图高`
+/// ↔ `20+n×22` 两态来回跳（用户所见「大块异常↔正常块」）。回归断言：连续键入
+/// N 帧、槽在 Loading 与 Ready 间交替，卡片行高与后续块 top 必须逐帧恒等。
+#[gpui::test]
+fn block_math_typing_geometry_stable_across_slot_flip(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let latex = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}".to_string() + &"1".repeat(60);
+    let text = format!("$$\n{latex}\n$$\n后文 xxxx\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标在后续段（块折叠成卡）：模拟「每键一次换代」——帧内交替 Loading/Ready。
+        let mut caret = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
+        let mut prev: Option<(f32, f32)> = None;
+        for k in 0..6 {
+            let slots = ed.read(cx).math_slots();
+            slots.borrow_mut().remove(latex.as_str());
+            if k % 2 == 0 {
+                // 奇偶交替：偶数帧 = Ready（新位图 5000×60），奇数帧 = Loading。
+                slots.borrow_mut().insert(
+                    latex.clone().into(),
+                    super::super::MathSlot::Ready(img.clone(), 5000., 60.),
+                );
+            }
+            ed.update(cx, |e, ecx| {
+                e.set_caret(caret);
+                e.replace_range(caret..caret, "X", ecx);
+            });
+            caret += 1;
+            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+            let card_h = f
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_some())
+                .map(|r| f32::from(r.height))
+                .unwrap_or(0.);
+            let para_top = f
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_none())
+                .map(|r| f32::from(r.top))
+                .unwrap_or(0.);
+            let key = (card_h, para_top);
+            if let Some(p) = prev {
+                assert_eq!(
+                    key,
+                    p,
+                    "第 {k} 帧：槽 {} 时卡高/后续段 top 必须与上一帧恒等（单值）",
+                    if k % 2 == 0 { "Ready" } else { "Loading" }
+                );
+            }
+            prev = Some(key);
+        }
+    });
+}
+
+/// 回归（块级 `$$…$$` 超宽公式后键入）：卡片行高不随逐键振荡、后续块位置稳定。
+/// 块卡 `math_card_height` 在 slot 就绪后取单值（20+位图高），paint 按内容盒等比
+/// 缩放；键入的是后续段落行（非 caret 的卡片行走缓存），几何必须逐帧一致。
+#[gpui::test]
+fn wide_block_math_followed_by_typing_stays_single_value(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let latex = "a".repeat(200);
+    let text = format!("$$\n{latex}\n$$\n后文 xxxx\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).math_slots().borrow_mut().insert(
+            latex.clone().into(),
+            super::super::MathSlot::Ready(img, 5000., 60.),
+        );
+        let mut caret = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
+        let mut prev: Option<(f32, f32)> = None;
+        for k in 0..5 {
+            ed.update(cx, |e, ecx| {
+                e.set_caret(caret);
+                e.replace_range(caret..caret, "X", ecx);
+            });
+            caret += 1;
+            let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
+            // 卡片行 = 唯一带 `extra.card` 的行；其高度 + 卡片下方后续段落 top 必须稳定。
+            let card_h = f
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_some())
+                .map(|r| f32::from(r.height))
+                .unwrap_or(0.);
+            let para_top = f
+                .rows
+                .iter()
+                .find(|r| r.extra.card.is_none())
+                .map(|r| f32::from(r.top))
+                .unwrap_or(0.);
+            let key = (card_h, para_top);
+            if let Some(p) = prev {
+                assert_eq!(
+                    key, p,
+                    "块级超宽公式后键入第 {k} 帧：卡高/后续段 top 应稳定"
+                );
+            }
+            prev = Some(key);
+        }
+    });
+}
+
+/// 回归（块级 `$$…$$` 键入「回弹」→ 渲染表示不闪变，含「缓存阈值」路径）：
+///
+/// 用户复现：公式就绪后逐个输入 `1` 每个都回弹（两态）；删光重输 1~10 不回弹
+/// （那些源串已缓存=Ready），第 11 个起又回弹（新键 miss → Loading）。
+/// 本测试沿**真实渲染管线**（`build_frame` + `sync_math` 占槽）逐键建模：
+/// 每键入一个 `1` 生成新键，尽力重现「旧键被 Ready 缓存、新键 Loading」的
+/// 阈值语义；随后删回重输全量。断言：
+///   - 首光栅（无钉）才允许一次 Unicode 回退（`Fallback`）；
+///   - 公式就绪后**每一帧**渲染表示 ∈ {Ready, Pinned}（**绝不回落 Unicode**），
+///     即 Loading↔Ready 两态闪跳被消除；
+///   - 卡高逐帧恒等；Loading（钉住旧图）帧的自然宽 = 钉宽（与绘制同源，滚动条
+///     不错位）；Ready 与 Pinned 的画图几何（等比收容）一致（换图无缝）。
+/// 回归守护：任何把「Loading 改回 Unicode 回退」的改动在此都会 FAIL。
+#[gpui::test]
+fn block_math_typing_representation_stable_across_threshold(cx: &mut TestAppContext) {
+    use super::paint::{MathCardDisplay, math_card_display};
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let base_latex = r"\int_{-\infty}^{\infty} e^{-x^2} dx = \sqrt{\pi}";
+    // 尾随段落：光标放这 → 卡折叠（不 reveal），与真实「看卡」场景一致。
+    let text = format!("$$\n{base_latex}\n$$\n后文 xxxx\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    // 假位图（纯 CPU）：就绪的“新位图”逐键换新引用，尺寸同源（逻辑 260×60）。
+    let buf = image::RgbaImage::from_raw(100, 60, vec![0u8; 100 * 60 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
+    let (pin_w, pin_h) = (260.0f32, 60.0f32);
+
+    // —— 复现/回归主体（一次函数内完成「就绪 → 逐键 → 删回 → 重输»）——
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // caret 放文尾（卡折叠）。
+        let end = ed.read(cx).content().len();
+        ed.update(cx, |e, _| e.set_caret(end));
+        let f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let card = f0
+            .rows
+            .iter()
+            .find(|r| r.extra.card.is_some())
+            .expect("应有余弦卡");
+        let src_line = card.src_line;
+        // 就绪：claim Loading → 手动注入 Ready（后台光栅成）→ sync_math 再命中
+        // Ready 分支录制「最近就绪位图」钉（与 paint 就绪录制同效）。
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &f0));
+        ed.update(cx, |e, _| {
+            e.math_slots().borrow_mut().insert(
+                base_latex.into(),
+                super::super::MathSlot::Ready(img.clone(), pin_w, pin_h),
             );
         });
-        let out = vcx.update(|_, cx| ed.read(cx).content());
-        assert_eq!(out, "![独立图片](img测试.png)\n", "拖拽改宽不得改写源码");
-    }
+        ed.update(cx, |e, ecx| e.sync_math(ecx, &f0));
+        let pin = ed
+            .read(cx)
+            .math_pin(src_line)
+            .expect("就绪后应录制本块位图钉");
+        assert!((pin.w - pin_w).abs() < 0.01 && (pin.h - pin_h).abs() < 0.01);
 
+        // 公式内容行末尾字节（闭围栏换行前）。
+        let insert_at = ed.read(cx).content().find("\n$$\n").unwrap();
+        let mut caret = insert_at;
+
+        // 辅助：追加一个 `1` 并重放帧，返回 (frame, 新键)。
+        let push_one =
+            |ed: &Entity<WyEditor>, window: &mut Window, caret: &mut usize, cx: &mut App| {
+                ed.update(cx, |e, ecx| e.replace_range(*caret..*caret, "1", ecx));
+                *caret = ed.read(cx).caret();
+                let end = ed.read(cx).content().len();
+                ed.update(cx, |e, _| e.set_caret(end));
+                let f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+                let card = f
+                    .rows
+                    .iter()
+                    .find(|r| r.extra.card.is_some())
+                    .expect("卡折叠");
+                let key = match &card.extra.card {
+                    Some(super::BlockCard::Math { latex, .. }) => latex.trim().to_string(),
+                    _ => unreachable!(),
+                };
+                (f, key)
+            };
+
+        // 前向：逐键 1..12（越阈值；每键新键 → miss → Loading — 必须被旧图钉住）。
+        let mut h_prev: Option<f32> = None;
+        for k in 1..=12 {
+            let (f, key) = push_one(&ed, window, &mut caret, cx);
+            // 真实管线：新键 miss → sync_math 占 Loading（无窗口下光栅不真跑，但
+            // Loading 立即入槽——正对应「光栅未回的那一帧」）。
+            ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
+            let disp = math_card_display(ed.read(cx), src_line, key.trim());
+            assert!(
+                !matches!(disp, MathCardDisplay::Fallback),
+                "第 {k} 键：公式就绪后渲染表示不得回退 Unicode（回弹）：{disp:?}"
+            );
+            let (d_w, d_h) = match disp {
+                MathCardDisplay::Ready(_, w, h) | MathCardDisplay::Pinned(_, w, h) => (w, h),
+                MathCardDisplay::Fallback => unreachable!(),
+            };
+            // Loading（钉住旧图）帧：绘制几何与「旧图就绪绘制」几何必须一致。
+            let row = f.rows.iter().find(|r| r.extra.card.is_some()).unwrap();
+            let avail_h = (f32::from(row.height) - 20.).max(1.);
+            let vs = (avail_h / d_h).min(1.0);
+            let (drawn_w, drawn_h) = (d_w * vs, d_h * vs);
+            if let Some(p) = h_prev {
+                assert!(
+                    (f32::from(row.height) - p).abs() < 0.01,
+                    "第 {k} 键：卡高必须逐帧恒等：{} vs {}",
+                    f32::from(row.height),
+                    p
+                );
+            }
+            h_prev = Some(f32::from(row.height));
+            assert!(
+                drawn_w > 0. && drawn_h > 0.,
+                "第 {k} 键：钉住/就绪位图应有可绘制几何"
+            );
+            // 就绪换图：手动把该键标记 Ready（后台完成），下帧同键直接 Ready。
+            ed.update(cx, |e, _| {
+                e.math_slots().borrow_mut().insert(
+                    key.as_str().into(),
+                    super::super::MathSlot::Ready(img.clone(), pin_w, pin_h),
+                );
+            });
+        }
+
+        // 删光回到原公式（每删一步出现过的键全在缓存=Ready → 不占 Loading）。
+        for _ in 0..12 {
+            let del = caret.checked_sub(1).expect("还有字符可删");
+            ed.update(cx, |e, ecx| e.replace_range(del..del + 1, "", ecx));
+            caret = del;
+            let end = ed.read(cx).content().len();
+            ed.update(cx, |e, _| e.set_caret(end));
+        }
+        assert_eq!(caret, insert_at, "删光后应回到原公式内末尾（不再有追加 1）");
+
+        // 重输 1..12：1..11 已缓存（Ready）直接命中；第 12 键新键 Loading → 钉住。
+        let mut caret = insert_at;
+        for k in 1..=12 {
+            let (f, key) = push_one(&ed, window, &mut caret, cx);
+            ed.update(cx, |e, ecx| e.sync_math(ecx, &f));
+            let disp = math_card_display(ed.read(cx), src_line, key.trim());
+            assert!(
+                !matches!(disp, MathCardDisplay::Fallback),
+                "重输第 {k} 键（含越阈值）：不得回退 Unicode：{disp:?}"
+            );
+            ed.update(cx, |e, _| {
+                e.math_slots().borrow_mut().insert(
+                    key.as_str().into(),
+                    super::super::MathSlot::Ready(img.clone(), pin_w, pin_h),
+                );
+            });
+        }
+    });
+}

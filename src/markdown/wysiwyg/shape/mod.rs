@@ -255,11 +255,7 @@ pub(crate) fn shape_text_row(
     // 原始 LaTeX）；他行/无 → 照常 splice 成 spacer。
     let caret_disp = {
         let (cl, col) = editor.row_col(editor.caret());
-        if cl == r.src_line {
-            Some(col)
-        } else {
-            None
-        }
+        if cl == r.src_line { Some(col) } else { None }
     };
     let (rtext, runs2, map2, mut inline_maths) = splice_math_text(
         editor,
@@ -271,6 +267,7 @@ pub(crate) fn shape_text_row(
         r.byte_map.clone(),
         st.fs,
         st.lh,
+        wrap_w.max(1.),
         &base,
         &math_font,
         super::math_color(theme),
@@ -282,7 +279,13 @@ pub(crate) fn shape_text_row(
     // 内容盒内，与预览 `markdown::view` 的 `avail` 语义一致（命中/光标/划线同源常量）。
     let wrapped = window
         .text_system()
-        .shape_text(rtext.clone().into(), st.fs, &runs2, Some(px(wrap_w.max(1.))), None)
+        .shape_text(
+            rtext.clone().into(),
+            st.fs,
+            &runs2,
+            Some(px(wrap_w.max(1.))),
+            None,
+        )
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
     let mut height = st.pad;
@@ -298,12 +301,12 @@ pub(crate) fn shape_text_row(
     }
     // 行内公式超行高：撑高所在 BlockLine（公式保持可读，不再压扁），paint 期按撑高后
     // 的 `sub_heights` 定位文本与公式——否则 `\int_0^1 x^2 dx` 会盖住上一行/或被缩太小。
+    // 高度用 splice 就已按内容盒宽钳好的 `disp_h`（与 paint 画图同源，单值一致）。
     for im in &mut inline_maths {
-        let Some((_, _, h)) = im.ready else { continue };
+        let Some((_, _, _)) = im.ready else { continue };
         let li = visual_block_line_for_index(&wrapped, im.display_off);
         im.line = li;
-        let fit = inline_math_fit_h(st.fs, st.lh, h);
-        let need = fit.max(f32::from(sub_heights[li]));
+        let need = im.disp_h.max(f32::from(sub_heights[li]));
         let old = f32::from(sub_heights[li]);
         if need > old {
             height += px(need - old);
@@ -312,7 +315,11 @@ pub(crate) fn shape_text_row(
     }
     let editable = !map2.is_empty();
     // 引述文本缩进 = 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12)。
-    let x_off = if kind == IrKind::Quote { px(QUOTE_TEXT_INDENT_PX) } else { px(0.) };
+    let x_off = if kind == IrKind::Quote {
+        px(QUOTE_TEXT_INDENT_PX)
+    } else {
+        px(0.)
+    };
     let has_non_ascii = wrapped.iter().any(|wl| !wl.text.is_ascii());
     let wrapped = std::rc::Rc::new(wrapped);
     ShapedRow {
@@ -334,7 +341,10 @@ pub(crate) fn shape_text_row(
         table_edit: None,
         image: None,
         mm: None,
-        extra: RowExtra { inline_maths, ..Default::default() },
+        extra: RowExtra {
+            inline_maths,
+            ..Default::default()
+        },
     }
 }
 
@@ -371,14 +381,19 @@ pub(crate) fn shape_text_row_decorated(
     // C1: 列表/任务行左缘 gutter（项目符号 / 有序号码，正文右移 18/24px）。
     let mut bullet_g: Option<RowGutter> = None;
     if r.kind == IrKind::Bullet
-        && let Some(g) = bullet_gutter(&raw) {
-            bullet_g = Some(g);
-        }
+        && let Some(g) = bullet_gutter(&raw)
+    {
+        bullet_g = Some(g);
+    }
     let pad = f32::from(px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX));
     let gutter_x: f32 = if alert.is_some() {
         84.
     } else if let Some(g) = &bullet_g {
-        if matches!(g, RowGutter::Check { .. }) { 24. } else { 18. }
+        if matches!(g, RowGutter::Check { .. }) {
+            24.
+        } else {
+            18.
+        }
     } else if matches!(r.kind, IrKind::Heading(_)) {
         HEADING_GUTTER_W
     } else if matches!(r.kind, IrKind::Quote) {
@@ -449,16 +464,18 @@ pub(crate) fn bullet_gutter(raw: &str) -> Option<RowGutter> {
     for b in ["- ", "* ", "+ "] {
         for (mark, checked) in [("[ ] ", false), ("[x] ", true), ("[X] ", true)] {
             if let Some(rest) = t.strip_prefix(&format!("{b}{mark}"))
-                && !rest.is_empty() {
-                    return Some(RowGutter::Check { checked });
-                }
+                && !rest.is_empty()
+            {
+                return Some(RowGutter::Check { checked });
+            }
         }
     }
     if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") {
         return Some(RowGutter::Bullet);
     }
     let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
-    if (1..4).contains(&digits) && (t[digits..].starts_with(". ") || t[digits..].starts_with(") ")) {
+    if (1..4).contains(&digits) && (t[digits..].starts_with(". ") || t[digits..].starts_with(") "))
+    {
         return Some(RowGutter::Ordered(format!("{}.", &t[..digits])));
     }
     None
@@ -522,7 +539,10 @@ pub(crate) fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {
         let d0 = source_to_display(byte_map, src.start);
         let d1 = source_to_display(byte_map, src.end);
         if d1 > d0 {
-            out.push(RowLink { disp: d0..d1, target });
+            out.push(RowLink {
+                disp: d0..d1,
+                target,
+            });
         }
     }
     out
@@ -557,8 +577,7 @@ pub(crate) fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<
             continue;
         }
         let start = alt_src - 2;
-        if raw.as_bytes().get(start) != Some(&b'!')
-            || raw.as_bytes().get(start + 1) != Some(&b'[')
+        if raw.as_bytes().get(start) != Some(&b'!') || raw.as_bytes().get(start + 1) != Some(&b'[')
         {
             continue;
         }
@@ -572,7 +591,11 @@ pub(crate) fn inline_image_hits(r: &DocRow, srow: &ShapedRow, raw: &str) -> Vec<
         let d0 = source_to_display(post, alt_src);
         let d1 = source_to_display(post, (alt_src + alt_len).min(raw.len()));
         if d1 > d0 {
-            out.push(InlineImageHit { display_off: d0, len: d1 - d0, src: src.into() });
+            out.push(InlineImageHit {
+                display_off: d0,
+                len: d1 - d0,
+                src: src.into(),
+            });
         }
     }
     out
@@ -593,7 +616,10 @@ pub(crate) fn shape_code_row(
 ) -> ShapedRow {
     let kind = r.kind;
     let (code_lines, lang) = match &r.payload {
-        DocPayload::Code { code_lines, language } => (code_lines.clone(), language.clone()),
+        DocPayload::Code {
+            code_lines,
+            language,
+        } => (code_lines.clone(), language.clone()),
         _ => (Vec::new(), None),
     };
     // A2: ```mermaid 围栏折叠成「图卡片」——画一张节点/连线的矢量图。
@@ -633,7 +659,7 @@ pub(crate) fn shape_code_row(
             image: None,
             mm: Some(std::rc::Rc::new(mm)),
             extra: RowExtra {
-                 card: Some(BlockCard::Mermaid),
+                card: Some(BlockCard::Mermaid),
                 ..Default::default()
             },
         };
@@ -647,7 +673,11 @@ pub(crate) fn shape_code_row(
     // 缓存未就绪先按纯文本渲染（`request_code_parse` 触发后台解析，就绪后下一帧自动
     // 上色），首次滚动进视野不再冻结一帧。
     let t_parse = crate::prof::begin();
-    let code_join = code_lines.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join("\n");
+    let code_join = code_lines
+        .iter()
+        .map(|s| s.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n");
     let hl_runs: Option<CodeLineRuns> = match lang.as_deref() {
         Some(l) if !l.is_empty() && !code_lines.is_empty() => {
             if code_lines.len() > 8 && !l.eq_ignore_ascii_case("toml") {
@@ -693,7 +723,12 @@ pub(crate) fn shape_code_row(
                 })
                 .collect()
         } else {
-            vec![gpui::TextRun { len: line.len(), font: mono.clone(), color: base, ..Default::default() }]
+            vec![gpui::TextRun {
+                len: line.len(),
+                font: mono.clone(),
+                color: base,
+                ..Default::default()
+            }]
         };
         let t_st = crate::prof::begin();
         let v = window
@@ -702,7 +737,11 @@ pub(crate) fn shape_code_row(
             .map(|ls| ls.into_vec())
             .unwrap_or_default();
         crate::prof::end("wy.code.shapetext", t_st);
-        let rows = v.iter().map(|wl| wl.wrap_boundaries().len() + 1).sum::<usize>().max(1);
+        let rows = v
+            .iter()
+            .map(|wl| wl.wrap_boundaries().len() + 1)
+            .sum::<usize>()
+            .max(1);
         let sh = lh * rows as f32;
         height += sh;
         sub_heights.push(sh);
@@ -769,9 +808,8 @@ pub(crate) fn shape_table_row(
     let ncols = header.len().max(1);
     let mut widths: Vec<f32> = (0..ncols).map(|_| 48.).collect();
     let mut measure = |window: &mut Window, c: &str, ci: usize| {
-        widths[ci] = widths[ci].max(
-            shaped_text_width(window, c, font_size, base_font, theme.text) + 20.,
-        );
+        widths[ci] =
+            widths[ci].max(shaped_text_width(window, c, font_size, base_font, theme.text) + 20.);
     };
     for (ci, c) in header.iter().enumerate() {
         measure(window, c.as_ref(), ci);
@@ -822,7 +860,9 @@ pub(crate) fn shape_table_row(
                 color,
                 ..Default::default()
             }];
-            let line = window.text_system().shape_line(c.clone(), font_size, &run, None);
+            let line = window
+                .text_system()
+                .shape_line(c.clone(), font_size, &run, None);
             let w = f32::from(line.width());
             let text_x = match aligns2.get(ci).copied().unwrap_or(TableAlign::Left) {
                 TableAlign::Center => ((col_w - w) / 2.).max(0.),
@@ -836,12 +876,20 @@ pub(crate) fn shape_table_row(
                 .get(m)
                 .map(|cm| std::rc::Rc::new(cm.map.clone()))
                 .unwrap_or_default();
-            cells.push(TableCellLayout { src, text_x, map, line });
+            cells.push(TableCellLayout {
+                src,
+                text_x,
+                map,
+                line,
+            });
         }
         TableRowCellsLayout { src_line, cells }
     };
     // 表头（源行 = r.src_line）。
-    let head_maps = mappings.as_ref().and_then(|r| r.first()).map(|m| m.cells.as_slice());
+    let head_maps = mappings
+        .as_ref()
+        .and_then(|r| r.first())
+        .map(|m| m.cells.as_slice());
     trow_edit.push(mk_row(
         window,
         r.src_line,
@@ -864,7 +912,7 @@ pub(crate) fn shape_table_row(
         src_line: r.src_line,
         src_lines: r.lines.clone(),
         wrapped: std::rc::Rc::new(Vec::new()),
-            has_non_ascii: false,
+        has_non_ascii: false,
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable,
@@ -900,7 +948,10 @@ pub(crate) fn effective_image_w(editor: &WyEditor, src: &str, avail: f32) -> f32
     let natural = avail.min(crate::config::markdown::IMAGE_MAX_W);
     match editor.image_width(src) {
         Some(w) => w
-            .clamp(crate::config::markdown::IMAGE_MIN_W, crate::config::markdown::IMAGE_MAX_W)
+            .clamp(
+                crate::config::markdown::IMAGE_MIN_W,
+                crate::config::markdown::IMAGE_MAX_W,
+            )
             .min(avail)
             .max(1.),
         None => natural,
@@ -950,14 +1001,24 @@ pub(crate) fn shape_image_row(
     }];
     let cap_wrapped = window
         .text_system()
-        .shape_text(alt.clone(), theme.font_size, &cap_run, Some(px(avail)), None)
+        .shape_text(
+            alt.clone(),
+            theme.font_size,
+            &cap_run,
+            Some(px(avail)),
+            None,
+        )
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
     let cap_lh = theme.para_line();
     let cap_h = cap_wrapped.iter().fold(0f32, |acc, wl| {
         acc + f32::from(cap_lh) * (wl.wrap_boundaries().len() + 1) as f32
     });
-    let cap_h = if cap_h <= 0. { f32::from(cap_lh) } else { cap_h };
+    let cap_h = if cap_h <= 0. {
+        f32::from(cap_lh)
+    } else {
+        cap_h
+    };
     let mut sub_heights: Vec<Pixels> = cap_wrapped
         .iter()
         .map(|wl| (f32::from(cap_lh) * (wl.wrap_boundaries().len() + 1) as f32).into())
@@ -991,7 +1052,11 @@ pub(crate) fn shape_image_row(
         kind,
         table: None,
         table_edit: None,
-        image: Some(ShapedImage { src, w, h: f32::from(img_h) }),
+        image: Some(ShapedImage {
+            src,
+            w,
+            h: f32::from(img_h),
+        }),
         mm: None,
         extra: RowExtra::default(),
     }
@@ -1033,27 +1098,72 @@ pub(crate) fn math_display_lines(src: &str) -> Vec<String> {
     out
 }
 
-/// 数学块卡片高度：已排版就绪 → 顶部标签留白 + 图片逻辑高；否则回退
-/// Unicode 逐行（`20 + n×行高`）。两分支都与 `paint_card` 对应。
+/// 数学块卡片高度：**只由源码显示行决定**（`20 + Σ每行排版高估计`）——与排版槽
+/// Loading/Ready/Failed 无关，**单值稳定**：替换位图/回退不改卡高（块级公式输入/
+/// 滚动时「大块异常↔正常块」两态回弹的根因 = 旧实现 Ready 用 `20+位图高`、回退用
+/// `20+n×22` 两个不同高来回跳）。就绪位图按「自然宽 + 块内横向滚动」画（见
+/// `paint_card`），纵向在 `height−20` 内等比收容，不会再让卡高被位图顶高。
 pub(crate) fn math_card_height(editor: &WyEditor, reg: &MathRegion) -> Pixels {
-    if let Some(super::MathSlot::Ready(_, _, h)) =
-        editor.math_slots().borrow().get(reg.source.as_str())
-    {
-        return px(20. + h.max(16.));
+    px(20. + editor.math_height_estimate(reg.source.as_str()))
+}
+
+/// 源码显示行的**排版高估计**：按 `math_display_lines` 同拆分（`\n`/`\\`）逐段，
+/// 含高算子（∫/∑/lim/frac/sqrt 等）的段用 `MATH_DISPLAY_LINE_TALL_H`、否则
+/// `MATH_DISPLAY_LINE_H`。与 `math_card_height` 单一来源（`mod` 侧缓存复用）。
+pub(crate) fn math_line_height_h(src: &str) -> f32 {
+    use crate::config::math;
+    let mut total = 0.0f32;
+    for ln in src.split('\n') {
+        for seg in ln.split("\\\\") {
+            if seg.trim().is_empty() {
+                continue;
+            }
+            let tall = [
+                "\\int",
+                "\\sum",
+                "\\prod",
+                "\\coprod",
+                "\\bigcup",
+                "\\bigcap",
+                "\\bigsqcup",
+                "\\bigoplus",
+                "\\bigotimes",
+                "\\lim",
+                "\\frac",
+                "\\sqrt",
+                "\\binom",
+                "\\oint",
+                "\\iint",
+                "\\iiint",
+                "\\left",
+                "\\right",
+                "\\cases",
+                "\\begin",
+            ]
+            .iter()
+            .any(|cmd| seg.contains(cmd));
+            total += if tall {
+                math::MATH_DISPLAY_LINE_TALL_H
+            } else {
+                math::MATH_DISPLAY_LINE_H
+            };
+        }
     }
-    // 回退：按**显示行数**估高。`math_display_lines` 对每源做 LaTeX→Unicode 转换，
-    // 结构编辑时 fold_plan 会对全篇数学块重复求高（3000 块 ~38ms）——走缓存计数。
-    let n = editor.math_line_count(reg.source.as_str());
-    px(20. + n as f32 * 22.)
+    total.max(math::MATH_DISPLAY_LINE_H)
 }
 
 /// 装配一张数学块卡片行（A1）：整块（含围栏）折叠成一张面板，占据 `height`。
-pub(crate) fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pixels, top: Pixels) -> ShapedRow {
+pub(crate) fn build_math_card_row(
+    reg: &MathRegion,
+    src_line: usize,
+    height: Pixels,
+    top: Pixels,
+) -> ShapedRow {
     ShapedRow {
         src_line,
         src_lines: reg.range.start..reg.range.end,
         wrapped: std::rc::Rc::new(Vec::new()),
-            has_non_ascii: false,
+        has_non_ascii: false,
         sub_heights: vec![height],
         byte_map: std::rc::Rc::new(Vec::new()),
         editable: false,
@@ -1069,7 +1179,10 @@ pub(crate) fn build_math_card_row(reg: &MathRegion, src_line: usize, height: Pix
         image: None,
         mm: None,
         extra: RowExtra {
-            card: Some(BlockCard::Math { align: reg.align, latex: reg.source.clone() }),
+            card: Some(BlockCard::Math {
+                align: reg.align,
+                latex: reg.source.clone(),
+            }),
             ..Default::default()
         },
     }
