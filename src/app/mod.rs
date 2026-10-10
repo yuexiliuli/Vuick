@@ -1899,6 +1899,15 @@ impl EditorApp {
         tab.live_edit = false;
         tab._live2_sub = None;
         let Some(l2) = tab.live2.take() else { return };
+        // 视图从 WYSIWYG 换回源码编辑区：先清空两端编辑器可能残留的鼠标拖选状态
+        // （须在任何提前 return 之前）。点击「预览编辑测试」菜单项时 GPUI 把 MouseDown
+        // 按 `hitbox.is_hovered` 漏进编辑区置 `dragging=true`（不按 z-order 裁掉被菜单
+        // 遮挡的区间）；对应的 MouseUp 又被菜单项 `activate` 的 `stop_propagation`
+        // 截断派发、到不了编辑器 `on_mouse_up` → `dragging` 残留。切回后仅移动鼠标
+        // 就会从 anchor=0（`set_text` 收拢到行首）自动扩选到指针处。这里统一清干净：
+        // WYSIWYG 实体（随后即销毁）与源码编辑区（转前台显示）都不留拖选态。
+        l2.update(cx, |ed, _| ed.end_selection());
+        tab.editor.update(cx, |ed, _| ed.reset_mouse_drag());
         // 大文档后台解析在途就退出：live2 尚无内容，不能写回（否则源码编辑区被清空）。
         // 源码编辑区仍是权威源，直接丢弃空壳实体即可。
         if !l2.read(cx).is_loaded() {

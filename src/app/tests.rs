@@ -3169,6 +3169,91 @@
         assert_eq!(re_on, committed, "再次切换 ON 后 WYSIWYG 内容应与写回内容一致");
     }
 
+    /// 回归（用户报告）：**仅移动鼠标**自动选中。复现：编辑/预览界面点「预览编辑测试」
+    /// 进 WYSIWYG，再点切回编辑/预览，随后不按任何键只移动鼠标 → 文本从 ln1 col1
+    /// （offset 0）被自动选中到指针处。
+    ///
+    /// 根因链路（GPUI 派发模型）：`dispatch_mouse_event`（gpui window.rs）对本帧所有已
+    /// 注册鼠标 listener 按 `hitbox.is_hovered` 逐个派发、**不按 z-order 裁掉被菜单遮挡
+    /// 的区间** → 点菜单项的 MouseDown 会漏进编辑区 `on_mouse_down` 置 `dragging=true`；
+    /// 而菜单项 `PopupMenu::activate`（src/ui/menu.rs）`stop_propagation()` 截断后续派发
+    /// → 编辑区 `on_mouse_up` 收不到，`dragging` 残留。`commit_live` 的 `set_text` 只把
+    /// 选区收拢到 0、不清 `dragging` → 切回后一次 MouseMove 就把选区拉长。
+    ///
+    /// 本测试走真实渲染/事件路径：在编辑区按下（模拟菜单项漏进来的 MouseDown，**不**
+    /// 派发 MouseUp）→ 切换 ON → 切换 OFF（`commit_live` 写回）→ 仅 MouseMove →
+    /// 断言选区仍为 0..0（拖选状态已被复位）。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_leaves_no_stale_mouse_drag(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-stale-drag-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, "# 标题\n正文段落。\n\n第二段内容。\n".repeat(3)).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        // 编辑区首格内按下：模拟菜单项 MouseDown 漏进编辑区。不派发 MouseUp，对应真实
+        // 场景里 MouseUp 被菜单项 `activate` 的 stop_propagation 截断、到不了编辑器。
+        let top_left = cx.debug_bounds("code-editor").expect("编辑区应渲染").origin;
+        let at = gpui::point(top_left.x + px(4.), top_left.y + px(4.));
+        let mods = gpui::Modifiers::default();
+        cx.simulate_mouse_move(at, MouseButton::Left, mods);
+        cx.simulate_mouse_down(at, MouseButton::Left, mods);
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let sel_before = cx.update(|_w, cx| editor.read(cx).selection());
+        assert_eq!(
+            (sel_before.anchor, sel_before.head),
+            (0, 0),
+            "按下后选区应落在 offset 0：{sel_before:?}"
+        );
+        // 切 ON → 切 OFF（真实 toggle 路径）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 切回后编辑区重新在树上；仅移动鼠标（不按任何键）→ 选区不得被拉长。
+        let ed_b = cx.debug_bounds("code-editor").expect("切回后编辑区应渲染");
+        let target = gpui::point(ed_b.origin.x + px(80.), ed_b.origin.y + px(40.));
+        cx.simulate_mouse_move(target, MouseButton::Left, mods);
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let sel_after = cx.update(|_w, cx| editor.read(cx).selection());
+        assert_eq!(
+            (sel_after.anchor, sel_after.head),
+            (0, 0),
+            "切回后仅移动鼠标不得改变选区（拖选状态残留）：{sel_after:?}"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// 回归（用户确认）：WYSIWYG 区**删除标题记号 `#`**（标题行 → 普通段落，CJK 文本
     /// 行变短/重排），再切「预览编辑测试」OFF（`commit_live` 整篇写回源码编辑区）与 ON。
     /// 历史上源码编辑区 `styled_row_text` 把陈旧的 `rd.highlights`（按字节搬运的区间，

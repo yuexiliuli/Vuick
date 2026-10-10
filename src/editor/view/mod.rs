@@ -390,6 +390,10 @@ impl CodeEditor {
     fn reset_document(&mut self) {
         self.undo.clear();
         self.selection = Selection::collapsed(0);
+        // 整篇替换 = 文档在光标下被换掉：任何进行中的鼠标拖选都失去意义，一并取消。
+        // （否则 `set_text` 只收拢选区、却残留 `dragging=true`，宿主切回视图后仅移动
+        // 鼠标就从 anchor=0 自动扩选——见 app::tests::*wysiwyg_toggle_off* 回归。）
+        self.dragging = false;
         self.hscroll_cols = 0;
         self.marked_range = None;
         self.last_edit = None;
@@ -1635,6 +1639,17 @@ impl CodeEditor {
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.dragging = false;
+    }
+
+    /// 复位鼠标拖选状态（仅清 `dragging`，不动光标/选区）。
+    ///
+    /// 宿主在「视图切换 / 整篇写回」边界调用：点菜单项时 GPUI 会把这个 MouseDown 按
+    /// `hitbox.is_hovered` 漏进编辑区（不按 z-order 裁掉被菜单遮挡的区间）置
+    /// `dragging=true`，而对应的 MouseUp 又常被菜单项 `activate` 的 `stop_propagation`
+    /// 截断派发、到不了 `on_mouse_up` → `dragging` 残留。切回编辑/预览后仅移动鼠标
+    /// 就会从 anchor 自动扩选，故在进入/退出这类视图前必须显式清掉。
+    pub(crate) fn reset_mouse_drag(&mut self) {
         self.dragging = false;
     }
 
