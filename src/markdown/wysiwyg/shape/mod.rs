@@ -801,27 +801,27 @@ pub(crate) fn shape_table_row(
     };
     let ncols = header.len().max(1);
     let mut widths: Vec<f32> = (0..ncols).map(|_| 48.).collect();
-    let mut measure = |window: &mut Window, c: &str, ci: usize| {
-        widths[ci] =
-            widths[ci].max(shaped_text_width(window, c, font_size, base_font, theme.text) + 20.);
+    // 表格缓存失效重排是本路径最重的开销：既有实现对同一文本 shape **两次**（先
+    // `shaped_text_width` 测宽、排版再 shape 一次）。这里改为每单元格只 shape 一次
+    // （测宽字体 = `base_font` 常规、`theme.text` 色，与既有 `shaped_text_width` 完全同
+    // 参数），列宽直接复用 `line.width()`；数据行（常规字体）的 shape 产物留存给下方
+    // 排版阶段按序搬用。表头排版用加粗是唯一例外——列宽分配仍按常规字宽（保持现状
+    // 像素级一致），仅表头一行重排，开销可忽略。
+    let shape_regular = |window: &mut Window, c: &gpui::SharedString| -> gpui::ShapedLine {
+        let run = [gpui::TextRun {
+            len: c.len(),
+            font: base_font.clone(),
+            color: theme.text,
+            ..Default::default()
+        }];
+        window
+            .text_system()
+            .shape_line(c.clone(), font_size, &run, None)
     };
     for (ci, c) in header.iter().enumerate() {
-        measure(window, c.as_ref(), ci);
+        let line = shape_regular(window, c);
+        widths[ci] = widths[ci].max(f32::from(line.width()) + 20.);
     }
-    for row in &rows {
-        for (ci, c) in row.iter().enumerate().take(ncols) {
-            measure(window, c.as_ref(), ci);
-        }
-    }
-    let total_w = widths.iter().sum();
-    let row_h = table_row_h(theme);
-    // 表格块总高 = 网格高 + 底部滚动条预留带（`TABLE_SCROLLBAR_RESERVE_PX`，与 preview
-    // `markdown/view` 的 `.pb()` 同）——滚动条画在网格**之下**、不遮内容。带内/带外同式
-    // （`estimate_height` 同加该带）→ 总高随可视带恒定、滚动不跳。
-    let height = table_block_height(theme, rows.len())
-        + px(crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX);
-    let mut aligns2 = aligns.clone();
-    aligns2.resize(ncols, TableAlign::Left);
     let rows2: Vec<Vec<gpui::SharedString>> = rows
         .into_iter()
         .map(|mut rr| {
@@ -829,34 +829,66 @@ pub(crate) fn shape_table_row(
             rr
         })
         .collect();
+    // 数据行同样各 shape 一次（含稀疏行补列后的空串——宽 0，`max` 不变）。`rows_shapes`
+    // 与 `rows2` 同构（每行 ncols），排版阶段逐行按序搬用。
+    let mut rows_shapes: Vec<Vec<gpui::ShapedLine>> = Vec::with_capacity(rows2.len());
+    for row in &rows2 {
+        let mut shapes = Vec::with_capacity(ncols);
+        for c in row {
+            shapes.push(shape_regular(window, c));
+        }
+        rows_shapes.push(shapes);
+    }
+    for row_lines in &rows_shapes {
+        for (ci, line) in row_lines.iter().enumerate() {
+            widths[ci] = widths[ci].max(f32::from(line.width()) + 20.);
+        }
+    }
+    let total_w = widths.iter().sum();
+    let row_h = table_row_h(theme);
+    // 表格块总高 = 网格高 + 底部滚动条预留带（`TABLE_SCROLLBAR_RESERVE_PX`，与 preview
+    // `markdown/view` 的 `.pb()` 同）——滚动条画在网格**之下**、不遮内容。带内/带外同式
+    // （`estimate_height` 同加该带）→ 总高随可视带恒定、滚动不跳。
+    let height = table_block_height(theme, rows2.len())
+        + px(crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX);
+    let mut aligns2 = aligns.clone();
+    aligns2.resize(ncols, TableAlign::Left);
     let mappings: Option<Vec<crate::markdown::doc::TableRowMap>> =
         r.table_rows.as_ref().map(|m| m.as_ref().clone());
 
-    // 逐可见行 shape 每个单元格（表头加粗、数据行常规，与 draw_table_row 同 runs/对齐）。
+    // 逐可见行排版每单元格（表头加粗重排、数据行搬用上面唯一一次 shape 产物；runs/对齐
+    // 与 `draw_table_row` 一致）。
     let mut trow_edit: Vec<TableRowCellsLayout> = Vec::new();
     let mk_row = |window: &mut Window,
                   src_line: usize,
                   texts: Vec<gpui::SharedString>,
                   maps: &[crate::markdown::doc::TableCellMap],
-                  is_header: bool| {
+                  lines: Option<Vec<gpui::ShapedLine>>| {
+        // 表头（`lines == None`）排版用加粗——列宽已按常规测宽（像素保真），此重排仅此一行。
+        let is_header = lines.is_none();
+        let mut lines = lines.unwrap_or_default().into_iter();
         let mut cells = Vec::with_capacity(texts.len());
         for (ci, c) in texts.iter().enumerate() {
             let col_w = widths.get(ci).copied().unwrap_or(0.);
-            let mut font = base_font.clone();
-            let mut color = theme.text;
-            if is_header {
+            let line = if is_header {
+                let mut font = base_font.clone();
+                let mut color = theme.text;
                 font.weight = gpui::FontWeight::BOLD;
                 color.a = 0.9;
-            }
-            let run = [gpui::TextRun {
-                len: c.len(),
-                font,
-                color,
-                ..Default::default()
-            }];
-            let line = window
-                .text_system()
-                .shape_line(c.clone(), font_size, &run, None);
+                let run = [gpui::TextRun {
+                    len: c.len(),
+                    font,
+                    color,
+                    ..Default::default()
+                }];
+                window
+                    .text_system()
+                    .shape_line(c.clone(), font_size, &run, None)
+            } else {
+                lines
+                    .next()
+                    .expect("数据行 shape 产物须与列数等长（`rows_shapes` 与 `rows2` 同构）")
+            };
             let w = f32::from(line.width());
             let text_x = match aligns2.get(ci).copied().unwrap_or(TableAlign::Left) {
                 TableAlign::Center => ((col_w - w) / 2.).max(0.),
@@ -889,9 +921,11 @@ pub(crate) fn shape_table_row(
         r.src_line,
         header.clone(),
         head_maps.unwrap_or(&[]),
-        true,
+        None,
     ));
     // 数据行：k=0 对应源行 = src_line + 2（分隔行为 src_line+1，不渲染、不可编辑）。
+    // 逐行搬用唯一一次 shape 产物（`rows_shapes` 与 `rows2` 每行同 ncols）。
+    let mut rows_shapes_iter = rows_shapes.into_iter();
     for (k, texts) in rows2.iter().enumerate() {
         let src_line = r.src_line + 1 + (k + 1);
         let maps = mappings
@@ -899,7 +933,13 @@ pub(crate) fn shape_table_row(
             .and_then(|r| r.get(k + 1))
             .map(|m| m.cells.as_slice())
             .unwrap_or(&[]);
-        trow_edit.push(mk_row(window, src_line, texts.clone(), maps, false));
+        trow_edit.push(mk_row(
+            window,
+            src_line,
+            texts.clone(),
+            maps,
+            Some(rows_shapes_iter.next().unwrap_or_default()),
+        ));
     }
     let editable = !trow_edit.is_empty();
     ShapedRow {
@@ -961,6 +1001,22 @@ pub(crate) fn image_row_height(editor: &WyEditor, src: &str, avail: f32) -> Pixe
         Some(Some((iw, ih))) if iw > 0. && ih > 0. => px((w * ih / iw.max(1.)).max(1.)),
         _ => px(crate::config::markdown::IMAGE_ROW_DEFAULT_H),
     }
+}
+
+/// 独立图片块的**基础布局高**（px）：图片盒高（[`image_row_height`]）+ 题注间隙 +
+/// 题注行高（`line_h` 按单行估算，整形后 Pass2 以真实折行高回写）。
+/// `pass1_base_layout` 与 `patch_pending_image_heights` 必须用**同一公式**——整篇重建
+/// 与稀疏定向覆写产出的带外块高一致，占位→真实 / 拖拽改宽后滚动不跳（带内/带外同一
+/// 公式防滚动跳，同 `image_row_height` 注释）。
+pub(crate) fn image_block_base_height(
+    editor: &WyEditor,
+    src: &str,
+    avail: f32,
+    line_h: Pixels,
+) -> f32 {
+    f32::from(image_row_height(editor, src, avail))
+        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+        + f32::from(line_h)
 }
 
 /// 独立图片行：**可编辑**。布局 = 图片盒（顶部，按真实宽高比/占位高）+

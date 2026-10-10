@@ -1,6 +1,6 @@
 use super::*;
 
-use gpui::AppContext;
+use gpui::{AppContext, Pixels};
 
 /// WyEditor 图片缓存 / 图片编辑卡片（M2.1 自 mod.rs 拆出）。
 impl WyEditor {
@@ -15,7 +15,10 @@ impl WyEditor {
         self.image_sizes.borrow().get(src).copied()
     }
 
-    /// 记录 `src` 的显示尺寸；尺寸变化（占位→真实）自增 `images_gen` 使帧缓存失效。
+    /// 记录 `src` 的显示尺寸；尺寸变化（占位→真实）自增 `images_gen` 使帧缓存失效，
+    /// 并把「含该图的块高」收录进 `pending_image_srcs`——下一帧 `build_frame` 在**基表
+    /// 复用**路径稀疏覆写受影响块高（M3 A4：图片高不再进 `height_epoch`，免占位→真实
+    /// 全量 Pass1 重建，见 [`Self::patch_pending_image_heights`]）。
     pub(crate) fn set_image_size(&self, src: SharedString, size: Option<(f32, f32)>) {
         let changed = self.image_sizes.borrow().get(&src).copied() != Some(size);
         if changed {
@@ -23,8 +26,9 @@ impl WyEditor {
             // ^ (width_bits ^ zgen)`，不含 `images_gen`——不主动作废，重建帧就会命中旧尺寸
             // 的整形行 → 图片按旧占位高/旧 `img.w` 画。见 `invalidate_image_row_cache`）。
             self.invalidate_image_row_cache(&src);
-            self.image_sizes.borrow_mut().insert(src, size);
+            self.image_sizes.borrow_mut().insert(src.clone(), size);
             self.images_gen.set(self.images_gen.get().wrapping_add(1));
+            self.pending_image_srcs.borrow_mut().insert(src);
         }
     }
 
@@ -38,7 +42,9 @@ impl WyEditor {
     }
 
     /// 记录用户拖拽调整的图片宽（px，已钳制）；变化 → `images_gen` 自增使帧/整形缓存
-    /// 失效（下一帧图片按新宽 + 原宽高比重排）。不改源码。
+    /// 失效（下一帧图片按新宽 + 原宽高比重排）+ 收录进 `pending_image_srcs`（下一帧
+    /// `build_frame` 在基表复用路径做为图片行高的**稀疏定向覆写**来源，免拖拽每 tick
+    /// 近全量 Pass1，见 [`Self::patch_pending_image_heights`]）。不改源码。
     pub(crate) fn set_image_width(&self, src: gpui::SharedString, w: f32) {
         let clamped = w
             .clamp(
@@ -55,8 +61,9 @@ impl WyEditor {
             // （真实渲染重宽 921.6 reading-col 恒定，缓存字面命中旧行；测试用视口宽
             // 1920 恰与阅读栏 921.6 不同键 → 意外 miss 而漏测）。
             self.invalidate_image_row_cache(&src);
-            self.image_widths.borrow_mut().insert(src, clamped);
+            self.image_widths.borrow_mut().insert(src.clone(), clamped);
             self.images_gen.set(self.images_gen.get().wrapping_add(1));
+            self.pending_image_srcs.borrow_mut().insert(src);
         }
     }
 
@@ -66,38 +73,31 @@ impl WyEditor {
     /// 改宽全量 miss 重排（对齐 code/math 的定向作废惯例——`on_code_parse_ready` /
     /// `on_math_ready` 同式：src_line → 块 → `block_content_id` → `invalidate_ids`）。
     ///
-    /// src → 块解析：优先走**当前帧行**（拖拽改宽 / paint 写尺寸时图片必在可视带内，
-    /// O(带内行数)）；帧缺失或 src 不在带内时退化为全块扫描兜底（O(块数)，仅发生在
-    /// 无帧首帧等罕见路径）。
+    /// **反向索引 O(1) 命中**：`image_src_blocks`（`src → 块下标`）直接定位相关块，
+    /// 替代旧实现的两段式「当前帧行扫描（O(带内行数)）→ 全块 `parse_image_line` 兜底
+    /// （O(块数)，仅缺帧/图不在带内时触发）」。索引 = 全量 Image 块扫描的**缓存结果**
+    /// （键 = `content_gen`，内容任一变更即陈旧重建）：内容未变 ↦ 块集与旧全量兜底
+    /// 逐块一致（判定同式：`kind == Image` 且 `parse_image_line` 反解 == `src`）；
+    /// 旧帧行路径只作废带内块，反向索引覆盖全篇同 src 块（带外旧缓存行本也应按新
+    /// 尺寸重排，属修复而非回归）。
     fn invalidate_image_row_cache(&self, src: &str) {
-        let mut block_indices: Vec<usize> = Vec::new();
-        if let Some(f) = self.frame.borrow().as_ref() {
-            for row in &f.rows {
-                if let Some(img) = &row.image
-                    && img.src.as_ref() == src
-                {
-                    block_indices.push(self.doc.block_index_for_line(row.src_line));
-                }
+        // 陈旧（`content_gen` 变化）才整表重建一次；命中后 O(1) 取块集。
+        let cur_gen = self.content_gen();
+        {
+            let cached = self.image_src_blocks.borrow();
+            if cached.as_ref().is_none_or(|(g, _)| *g != cur_gen) {
+                drop(cached);
+                let built = self.build_image_src_blocks();
+                *self.image_src_blocks.borrow_mut() = Some(built);
             }
         }
-        if block_indices.is_empty() {
-            for b in 0..self.doc.block_count() {
-                let Some(m) = self.doc.block_meta(b) else {
-                    continue;
-                };
-                if m.kind != crate::markdown::parse::RowKind::Image {
-                    continue;
-                }
-                let parsed = crate::markdown::parse::parse_image_line(
-                    self.doc.line_str(m.src_line as usize).trim(),
-                )
-                .map(|(_, s)| s)
-                .unwrap_or_default();
-                if parsed == src {
-                    block_indices.push(b);
-                }
-            }
-        }
+        let cached = self.image_src_blocks.borrow();
+        let Some((_, map)) = cached.as_ref() else {
+            return;
+        };
+        let Some(block_indices) = map.get(src) else {
+            return;
+        };
         if block_indices.is_empty() {
             return;
         }
@@ -106,6 +106,84 @@ impl WyEditor {
             .map(|&b| frame::block_content_id(&self.doc, b))
             .collect();
         self.shape_rows.borrow_mut().invalidate_ids(&ids);
+    }
+
+    /// 从当前 Doc 的块索引**全量**构建「`src → 块下标」反向表（O(块数) 一次，缓存于
+    /// `image_src_blocks`，内容任一变更即重建）：只登记独立 [`RowKind::Image`] 块（每
+    /// 块一行，源行经 `parse::parse_image_line` 反解出 `src`，失败记空串——与旧全量
+    /// 兜底的「跳过非 Image 块、`parsed == src` 判定」逐块一致）。
+    fn build_image_src_blocks(&self) -> ImageSrcBlocks {
+        let mut map: std::collections::HashMap<SharedString, Vec<usize>> =
+            std::collections::HashMap::new();
+        for b in 0..self.doc.block_count() {
+            let Some(m) = self.doc.block_meta(b) else {
+                continue;
+            };
+            if m.kind != crate::markdown::parse::RowKind::Image {
+                continue;
+            }
+            let src = crate::markdown::parse::parse_image_line(
+                self.doc.line_str(m.src_line as usize).trim(),
+            )
+            .map(|(_, s)| s)
+            .unwrap_or_default();
+            map.entry(src.into()).or_default().push(b);
+        }
+        (self.content_gen(), map)
+    }
+
+    /// **图片行高稀疏定向覆写**（M3 A4）：`build_frame` 在「基础布局复用」路径把
+    /// `pending_image_srcs` 收录的 src 涉及的所有**含图块**基础高，用与 pass1 同式的
+    /// [`image_block_base_height`] 逐个 Fenwick 点更新（O(#该 src 块 × log C)）。
+    ///
+    /// 图片占位→真实尺寸 / 拖拽改宽都走这里，而**不再进 `height_epoch`**——否则每一个
+    /// 图片就绪 / 每 tick 拖拽都会触发近全量 Pass1 估算重跑（2-5ms/10 万块）。与 mgen 的
+    /// 分工对齐：mgen 把数学卡高走 `fold_plan` 稀疏 delta、基础布局保持估算高；这里把
+    /// 图片块高走「基础布局稀疏覆写」、基础布局整体代（`height_epoch`）保持不变（同代戳
+    /// 纪律：一处构建 = `height_epoch` 的 pass1，一处失效 = 本方法，二者公式同源）。
+    ///
+    /// 由 `build_frame` 调用，**必须在 `find_band_range`/Pass2 之前**（二分与行高都读新
+    /// 基础高）。重建路径（结构性编辑/换宽/缩放 → `rebuilt=true`）由 pass1 按当前图片
+    /// 状态重估，无需本方法；残留的 src 在下次复用帧覆写（与 pass1 同式，幂等）。
+    pub(crate) fn patch_pending_image_heights(
+        &self,
+        base: &BlockLayoutRef,
+        avail: f32,
+        line_h: Pixels,
+    ) {
+        let srcs: Vec<SharedString> = self.pending_image_srcs.borrow_mut().drain().collect();
+        if srcs.is_empty() {
+            return;
+        }
+        // 陈旧（`content_gen` 变化）才整表重建反向索引一次；命中后 O(1) 取块集。
+        let cur_gen = self.content_gen();
+        {
+            let cached = self.image_src_blocks.borrow();
+            if cached.as_ref().is_none_or(|(g, _)| *g != cur_gen) {
+                drop(cached);
+                let built = self.build_image_src_blocks();
+                *self.image_src_blocks.borrow_mut() = Some(built);
+            }
+        }
+        let cached = self.image_src_blocks.borrow();
+        let Some((_, map)) = cached.as_ref() else {
+            return;
+        };
+        let mut b = base.borrow_mut();
+        for src in &srcs {
+            let Some(ixs) = map.get(src) else {
+                continue;
+            };
+            for &blk in ixs {
+                if blk >= b.n() {
+                    continue;
+                }
+                let h = crate::markdown::wysiwyg::shape::image_block_base_height(
+                    self, src, avail, line_h,
+                );
+                b.set(blk, h);
+            }
+        }
     }
     /* ---------- 图片编辑（悬浮铅笔按钮 + 卡片表单） ---------- */
 

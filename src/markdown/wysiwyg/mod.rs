@@ -70,8 +70,8 @@ pub(crate) use self::prewarm::Prewarm;
 pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 pub(crate) use self::types::{
     BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
-    MathSlot, TocCacheEntry, TocEntries, UNDO_LIMIT, UndoUnit, WyDerived, WyOpenResult,
-    inline_math_key, region_line_sig,
+    ImageSrcBlocks, MathSlot, TocCacheEntry, TocEntries, UNDO_LIMIT, UndoUnit, WyDerived,
+    WyOpenResult, inline_math_key, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -150,8 +150,10 @@ pub struct WyEditor {
     prewarm: RefCell<Prewarm>,
     /// 全篇**基础布局**缓存：`(代, Rc<RefCell<BlockLayout>>)`——rolling/带移动与
     /// **非结构性编辑**都复用（只对受影响块做 Fenwick 点更新），代 ≠ 内容代：
-    /// 由 `struct_ver`/图片/数学/宽度组成。结构性变更（换行/围栏/表格等改了块数或
-    /// 块序）才整篇重建。`set_theme`/`set_font_size` 把代置失效位强制重算。
+    /// 由 `struct_ver`/宽度/mermaid 缩放组成（**不含 `images_gen`/`mgen`**——图片/数学高
+    /// 变更走稀疏定向覆写 / `fold_plan` 稀疏 delta，见 `height_epoch` eval）。结构性变更
+    /// （换行/围栏/表格等改了块数或块序）才整篇重建。`set_theme`/`set_font_size` 把代置
+    /// 失效位强制重算。
     block_layout: RefCell<Option<(u64, Rc<std::cell::RefCell<element::BlockLayout>>)>>,
     /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
     /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
@@ -221,13 +223,25 @@ pub struct WyEditor {
     /// `None`(外层) = 尚未尝试加载；`Some(None)` = 加载失败（一直显示 alt 兜底）；
     /// `Some(Some(..))` = 已加载。供 shape（假布局尺寸）与 paint（占位）共用。
     image_sizes: RefCell<std::collections::HashMap<SharedString, Option<(f32, f32)>>>,
-    /// 图片加载完成代数：任何图片从「占位尺寸」变成「真实尺寸」自增——
-    /// 纳入帧缓存键，新图到达后必须重建整帧（否则缓存总高还是旧尺寸）。
+    /// 图片加载完成代数：任何图片从「占位尺寸」变成「真实尺寸」，或拖拽改宽，
+    /// 自增——纳入帧缓存键，新图/新宽到达后必须重建整帧（旧总高/几何失效）。
+    /// **不进基础布局代**（`height_epoch`）：图片行高的变更由 `pending_image_srcs` 收录、
+    /// `build_frame` 走稀疏定向覆写，见 [`Self::patch_pending_image_heights`]。
     images_gen: Cell<u64>,
     /// 用户拖拽调整的图片宽（px，按 src）：`None`（地图缺项）= 未调整 → 自然宽
     /// `min(avail, IMAGE_MAX_W)`。值已钳在 `[IMAGE_MIN_W, IMAGE_MAX_W]` 内。
     /// 改变 → `images_gen` 自增（帧/整形缓存失效 → 图片按新宽 + 原宽高比重排）。
     image_widths: RefCell<std::collections::HashMap<SharedString, f32>>,
+    /// 「图片 `src` → 引用它的块下标」**反向索引**（M3 A8）：`invalidate_image_row_cache`
+    /// 用它 O(1) 定位相关块，替代旧的「当前帧行 + 逐块 `parse_image_line` 全量兜底」。
+    /// 键 = `content_gen`，一处构建、全更新点自动同步（同 `toc_cache`）。见
+    /// [`ImageSrcBlocks`]。
+    image_src_blocks: RefCell<Option<ImageSrcBlocks>>,
+    /// 待「基础布局稀疏覆写」（M3 A4）的图片 `src`：`set_image_size`/`set_image_width`
+    /// 收录；`build_frame` 在**基表复用**路径按 `avail` 定向 patch 含图块高——图片高变更
+    /// 不进 `height_epoch`（免拖拽每 tick 近全量 Pass1），走与 mgen 同理的稀疏增量，每次
+    /// build_frame 消费清空。见 [`Self::patch_pending_image_heights`]。
+    pending_image_srcs: RefCell<std::collections::HashSet<SharedString>>,
     /// 进行中的图片调整条拖拽（右中边缘）。`Some` = 按住拖动中（随鼠标改宽，不改源码）。
     image_resize_drag: RefCell<Option<ImageResizeDrag>>,
     /// LaTeX → 排版结果缓存（参考 zorite `<MathStore>` 按公式源码做键）。

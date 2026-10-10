@@ -87,6 +87,49 @@ fn table_caret_aligns_with_clicked_cell(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn table_widths_derive_from_reused_cell_shapes(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 列宽必须**恰由数据行排版所用的同一 shape 产物 `line.width()`** 决定（单次 shape 复用
+    // 契约：测宽那次 shape 的行被数据行排版直接搬用，不二次 shape）。数据行比表头宽 →
+    // 列宽不受表头常规测宽主导，断言可精确到位。
+    let text = "| H | I |\n| --- | --- |\n| alpha | beta |\n| extremely-long-data | xyz |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格");
+        let t = row.table.as_ref().expect("表格渲染数据");
+        let te = row.table_edit.as_ref().expect("表格编辑排版");
+        for ci in 0..t.widths.len() {
+            // 数据行（跳过表头 row0）逐格：该列最宽数据格 `line.width()`+20；与列宽 48 下限取大。
+            let widest = te
+                .rows
+                .iter()
+                .skip(1)
+                .filter_map(|r| r.cells.get(ci))
+                .map(|c| f32::from(c.line.width()) + 20.)
+                .fold(0f32, f32::max)
+                .max(48.);
+            assert!(
+                (t.widths[ci] - widest).abs() < 0.01,
+                "列 {ci} 宽 {:.1} 应恰好 = 数据格 shape 产物宽最大值+20（与 48 下限取大）{:.1}",
+                t.widths[ci],
+                widest
+            );
+        }
+    });
+}
+
+#[gpui::test]
 fn all_text_rows_wrap_inside_content_box(cx: &mut TestAppContext) {
     use crate::markdown::ir::IrKind;
     cx.update(crate::actions::bind_local_keymaps);

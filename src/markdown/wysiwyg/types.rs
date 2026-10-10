@@ -99,6 +99,15 @@ pub(crate) struct BlockMathPin {
 pub(crate) fn inline_math_key(latex: &str) -> SharedString {
     format!("inline:{latex}").into()
 }
+/// M3 A8：「图片 `src` → 引用它的块下标」**反向索引**条目（`content_gen` + 表）——
+/// `invalidate_image_row_cache` 用它 O(1) 定位相关块，替代缺帧/图不在带内时的旧全量
+/// `parse_image_line` 兜底扫描（O(块数)）。键 = `content_gen`：内容任一变更即视为陈旧，
+/// 下次失效调用整表重建——一处构建、全更新点经 `content_gen` 增量自动同步（对齐
+/// [`TocCacheEntry`] 的派生缓存纪律，避免散落多点手动同步漂移）。
+pub(crate) type ImageSrcBlocks = (
+    u64,
+    std::collections::HashMap<SharedString, Vec<usize>>,
+);
 /// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `content_gen` 缓存，滚动 /
 /// 可视带移动（内容不变）直接复用 `Rc`，**不重扫全篇**——大文档每帧卡顿的主因之一
 /// （`math_regions` 7MB 全篇扫描 ~400ms、`alert_*` ~30ms，随每帧 paint / 每档 rebuild

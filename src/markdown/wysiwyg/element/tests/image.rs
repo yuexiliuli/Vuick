@@ -1082,3 +1082,361 @@ fn image_resize_window_mouse_up_clears_state(cx: &mut TestAppContext) {
     );
 }
 
+/// M3 A8 回归：`invalidate_image_row_cache` 经「图片 `src` → 块下标」**反向索引**
+/// （`image_src_blocks`）在**缺帧**（`frame = None`，旧实现此处退化为逐块
+/// `parse_image_line` 全量兜底 O(块数)）时仍**精确**作废「引用该 src 的块」：
+/// 同 src 多块全作废、**不误伤**其它 src 图片块与无关文本块；连续两次不同 src 失效
+/// 各自只命中自己的块（第二次命中索引 O(1) 路径，无需重建）。
+#[gpui::test]
+fn image_src_blocks_invalidate_only_referencing_rows(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text(
+                "para before\n\n![A](shared.png)\n\n![B](shared.png)\n\n![C](other.png)\n",
+            )
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 光标放文档末端 → 排除「光标行 reveal 强制重排」对缓存命中判定的干扰。
+    vcx.update(|_, cx| {
+        let n = ed.read(cx).len();
+        ed.update(cx, |e, _| e.set_caret(n));
+    });
+    // 同带两帧：整篇四块（段落 + 两幅 `shared.png` + 一幅 `other.png`）都排进整形缓存。
+    let width = vcx.update(|window, _| f32::from(window.viewport_size().width).max(1.));
+    vcx.update(|window, cx| {
+        let _g0 = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        ed.read(cx).take_reshapes();
+        let _g1 = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+    });
+    let para_b = ed.read_with(vcx, |e, _| e.doc().block_index_for_line(0));
+    let a_b = ed.read_with(vcx, |e, _| e.doc().block_index_for_line(2));
+    let b_b = ed.read_with(vcx, |e, _| e.doc().block_index_for_line(4));
+    let c_b = ed.read_with(vcx, |e, _| e.doc().block_index_for_line(6));
+    let real_rows = vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        f.rows
+            .iter()
+            .filter(|r| r.kind == IrKind::Image)
+            .count()
+    });
+    assert_eq!(real_rows, 3, "夹具应含 3 幅独立图片行");
+    for blk in [para_b, a_b, b_b, c_b] {
+        assert!(
+            ed.read_with(vcx, |e, _| e.shape_rows_has(blk)),
+            "前置：块 {blk} 应先入行整形缓存"
+        );
+    }
+    // 缺帧（旧实现此处必须走全量兜底；新实现走反向索引）→ 仍须精确定位。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| *e.frame.borrow_mut() = None);
+    });
+    // 失效 `shared.png` → 只命中引用它的两块。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_image_size("shared.png".into(), Some((200., 100.))));
+    });
+    assert!(
+        !ed.read_with(vcx, |e, _| e.shape_rows_has(a_b)),
+        "同 src 块 A 应作废"
+    );
+    assert!(
+        !ed.read_with(vcx, |e, _| e.shape_rows_has(b_b)),
+        "同 src 块 B 应作废"
+    );
+    assert!(
+        ed.read_with(vcx, |e, _| e.shape_rows_has(c_b)),
+        "其它 src 块应保留"
+    );
+    assert!(
+        ed.read_with(vcx, |e, _| e.shape_rows_has(para_b)),
+        "无关文本块应保留"
+    );
+    // 再失效 `other.png` → 只命中它（第二次失效走索引 O(1) 命中路径，无需重建）。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_image_size("other.png".into(), Some((200., 100.))));
+    });
+    assert!(
+        !ed.read_with(vcx, |e, _| e.shape_rows_has(a_b)),
+        "shared 块仍保持已作废（二次失效不应补回/误作废其它块）"
+    );
+    assert!(
+        !ed.read_with(vcx, |e, _| e.shape_rows_has(c_b)),
+        "other.png 块应作废"
+    );
+    assert!(
+        ed.read_with(vcx, |e, _| e.shape_rows_has(para_b)),
+        "无关文本块仍保留"
+    );
+}
+
+/// M3 A4 回归（稀疏增量核心）：**图片「占位→真实」与「拖拽改宽」都不再进基础布局代
+/// `height_epoch`**——`set_image_size`/`set_image_width` 收录 `pending_image_srcs`，
+/// `build_frame` 在**基表复用**路径 `patch_pending_image_heights` 只对**含图块**做稀疏
+/// Fenwick 点更新 → 免占位→真实 / 每 tick 拖拽的近全量 Pass1 估算重跑（mgen 与 epoch
+/// 分工对齐：一处构建 = `height_epoch` 的 pass1、一处失效 = 稀疏覆写，公式同源）。
+/// 高度一致性守恒：带内/带外图片块高与帧 `total` 都收敛到「真实尺寸 × 当前宽覆写」的
+/// 精确值（量程/首屏不缺内容），内容/换宽才换代（`ensure_block_layout` 重建）。
+#[gpui::test]
+fn image_height_change_sparse_no_epoch_bump(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("para before.\n\n![alt](img测试.png)\n\nafter para.\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let w = px(crate::config::markdown::reading_col_px(16.0));
+    // 占位帧：图片未加载 → 占位高（IMAGE_ROW_DEFAULT_H），并记录基础布局代。
+    let (epoch_p, b_img) = vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let img = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("含图")
+            .clone();
+        assert_eq!(
+            img.image.as_ref().unwrap().h,
+            crate::config::markdown::IMAGE_ROW_DEFAULT_H,
+            "未加载应占位高"
+        );
+        let b_img = ed.read(cx).doc().block_index_for_line(2);
+        (ed.read(cx).block_layout_epoch().expect("基表已建"), b_img)
+    });
+    // ① 占位→真实：注入真实尺寸（200×100）→ 只收录 src + 稀疏覆写，**不进代**。
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_image_size("img测试.png".into(), Some((200., 100.))));
+    });
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.block_layout_epoch()),
+        Some(epoch_p),
+        "占位→真实不得进基础布局代（旧实现：images_gen 进代 → 全量 Pass1）"
+    );
+    let (w0, h0, para, total1) = vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let img = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("含图")
+            .clone();
+        let w0 = img.image.as_ref().unwrap().w;
+        let h0 = img.image.as_ref().unwrap().h;
+        assert!(
+            (h0 - w0 / 2.).abs() < 0.51,
+            "200×100 → 图高 = 宽/2：w0={w0} h0={h0}"
+        );
+        (w0, h0, f32::from(img.lh), f32::from(f.total))
+    });
+    // 带外块高也打准（量程正确）：窄带帧读共享基表，图片块高 = 真实尺寸 + 题注。
+    vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, w, (0., 50.));
+        let bh = f.block_height(b_img);
+        let expect = h0 + crate::config::markdown::IMAGE_CAPTION_GAP_PX + para;
+        assert!(
+            (bh - expect).abs() < 0.51,
+            "带外图片块高应 = 真实尺寸+题注：{bh} vs {expect}"
+        );
+        assert!(
+            (f32::from(f.total) - total1).abs() < 0.51,
+            "窄带帧 total 与全带一致（共享同一基表）"
+        );
+    });
+    // ② 拖拽改宽：只覆写该图块高，**仍不进代**。
+    let shrink = 60.;
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_image_width("img测试.png".into(), w0 - shrink));
+    });
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.block_layout_epoch()),
+        Some(epoch_p),
+        "拖拽改宽不得进基础布局代（稀疏覆写）"
+    );
+    let (h2, total2) = vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let img = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("含图")
+            .clone();
+        let w2 = img.image.as_ref().unwrap().w;
+        let h2 = img.image.as_ref().unwrap().h;
+        assert!(
+            (w2 - (w0 - shrink)).abs() < 0.51,
+            "覆写宽生效：期望 {} 实际 {w2}",
+            w0 - shrink
+        );
+        assert!(
+            (h2 - (w2 / 2.)).abs() < 0.51,
+            "图高按真实比例：w2={w2} h2={h2}"
+        );
+        (h2, f32::from(f.total))
+    });
+    assert!(
+        (total2 - (total1 - (h0 - h2))).abs() < 0.51,
+        "量程 = 原量程 − 图高差({}−{})：期望 {} 实际 {total2}",
+        h0,
+        h2,
+        total1 - (h0 - h2)
+    );
+}
+
+/// M3 A4 回归（必读，真实渲染路径）：**拖拽多 tick 收敛到真实尺寸 + 高度/量程精确**。
+/// 事件层真实走 `on_mouse_down`（命中调整条）→ 多次 `on_mouse_move`
+/// （`apply_image_resize` → `set_image_width`）的**稀疏覆写**；图片用本仓真实 fixture
+/// `fixtures/img测试.png`（真实渲染路径读真实尺寸，占位→真实也走稀疏覆写，不进代）。
+/// 收尾重建帧断言行宽/行高/块基础高/帧 `total` 都按「当前宽 × 真实宽高比」首帧即收敛
+/// （无跳变/回弹），且**全程基础布局代不变**（免每 tick 近全量 Pass1）；无关前导段仍
+/// 留在整形缓存（非整带重排）。
+#[gpui::test]
+fn image_drag_multitick_sparse_converges(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/img测试.png").replace('\\', "/");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let text = format!("para before.\n\n![alt]({fixture})\n\nafter para.\n");
+        WyHost {
+            ed: cx.new(|cx| WyEditor::new(window, cx).with_text(&text)),
+        }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    // 光标放文末：排除「光标行 reveal 强制重排」对稀疏整形断言干扰（对齐 A8/A9 惯例）。
+    vcx.update(|_, cx| {
+        let n = ed.read(cx).len();
+        ed.update(cx, |e, _| e.set_caret(n));
+    });
+    let w = px(crate::config::markdown::reading_col_px(16.0));
+    let (epoch0, ratio, w0, h0, para, total0, hx, hy, b_img) = vcx.update(|window, cx| {
+        let _g0 = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        ed.read(cx).take_reshapes(); // 清首帧整形计数
+        let g1 = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let b_img = ed.read(cx).doc().block_index_for_line(2);
+        let img = g1
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("含图")
+            .clone();
+        let w0 = img.image.as_ref().unwrap().w;
+        let h0 = img.image.as_ref().unwrap().h;
+        assert!(
+            w0 > crate::config::markdown::IMAGE_MIN_W + 80.,
+            "自然宽应能左拖缩窄（w0={w0}）"
+        );
+        let ratio = h0 / w0.max(1.);
+        let para = f32::from(img.lh);
+        let rc = std::rc::Rc::new(g1);
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(rc.clone());
+            // 元素宽 = 帧宽（阅读栏宽）→ 阅读栏移位 = 0，窗口坐标与列内坐标一致。
+            e.set_last_bounds(Some(gpui::Bounds::new(
+                gpui::point(px(0.), px(0.)),
+                gpui::size(w, px(600.)),
+            )));
+        });
+        let bb = super::image_box_local(&rc, &img).expect("图片盒");
+        let hb = super::image_resize_handle_local(&bb);
+        let hx = f32::from(hb.left()) + super::IMAGE_RESIZE_HANDLE_W / 2.;
+        let hy = f32::from(hb.top()) + f32::from(hb.size.height) / 2.;
+        (
+            ed.read(cx).block_layout_epoch().expect("基表已建"),
+            ratio,
+            w0,
+            h0,
+            para,
+            f32::from(rc.total),
+            hx,
+            hy,
+            b_img,
+        )
+    });
+    // 按调整条一次 → 多 tick 左拖（每 tick 一次 apply_image_resize → set_image_width）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| e.on_mouse_down(&img_down(hx, hy), window, c));
+    });
+    assert!(
+        ed.read_with(vcx, |e, _| e.image_resize_drag_src().is_some()),
+        "按下调整条应开始拖拽"
+    );
+    // 真实 fixture 经 paint 异步加载完成 → 尺寸保持真实（load 路径 set_image_size 走
+    // 稀疏覆写，不进代）。
+    for dx in [20., 40., 60.] {
+        vcx.update(|_, cx| {
+            ed.update(cx, |e, c| e.on_mouse_move(&img_move_held(hx - dx, hy), c));
+        });
+        let ov = vcx
+            .update(|_, cx| ed.read(cx).image_width(fixture.as_str()))
+            .expect("拖拽中应有覆写宽");
+        assert!(
+            (ov - (w0 - dx)).abs() < 0.5,
+            "tick dx={dx}：覆写宽应 {}=实际 {ov}",
+            w0 - dx
+        );
+        // 每 tick 都不得进基础布局代（否则 = 近全量 Pass1 重建）。
+        assert_eq!(
+            ed.read_with(vcx, |e, _| e.block_layout_epoch()),
+            Some(epoch0),
+            "拖拽 tick dx={dx} 不得进基础布局代（稀疏覆写）"
+        );
+    }
+    // 收尾重建：行宽/行高/块基础高/帧 total 首帧即收敛；只重排受影响块（稀疏）。
+    let resh = vcx.update(|window, cx| {
+        ed.read(cx).take_reshapes();
+        let f = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        let r = ed.read(cx).take_reshapes();
+        let img = f
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Image)
+            .expect("含图")
+            .clone();
+        let w1 = img.image.as_ref().unwrap().w;
+        let h1 = img.image.as_ref().unwrap().h;
+        assert!(
+            (w1 - (w0 - 60.)).abs() < 0.51,
+            "行宽收敛到 {}=实际 {w1}",
+            w0 - 60.
+        );
+        assert!(
+            (h1 - (w0 - 60.) * ratio).abs() < 0.51,
+            "行高按真实比例收敛：期望 {} 实际 {h1}",
+            (w0 - 60.) * ratio
+        );
+        let bh = ed
+            .read(cx)
+            .block_base_height(b_img)
+            .expect("基表应存在");
+        let expect = h1 + crate::config::markdown::IMAGE_CAPTION_GAP_PX + para;
+        assert!(
+            (bh - expect).abs() < 0.51,
+            "块基础高 = 图高+题注：期望 {expect} 实际 {bh}"
+        );
+        assert!(
+            (f32::from(f.total) - (total0 - (h0 - h1))).abs() < 0.51,
+            "量程 = 原量程 − 图高差：期望 {} 实际 {}",
+            total0 - (h0 - h1),
+            f32::from(f.total)
+        );
+        r
+    });
+    assert!(
+        (1..=3).contains(&resh),
+        "收尾重建只重排受影响块（图片 + 光标尾行），非整带：resh={resh}"
+    );
+    // 无关前导段落仍留在整形缓存（未整带清空）。
+    let lead_b = ed.read_with(vcx, |e, _| e.doc().block_index_for_line(0));
+    assert!(
+        ed.read_with(vcx, |e, _| e.shape_rows_has(lead_b)),
+        "无关前导段应保留在整形缓存（非整带重排）"
+    );
+}
+

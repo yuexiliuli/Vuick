@@ -40,27 +40,6 @@ pub(crate) use geom::*;
 pub(crate) use paint::*;
 pub(crate) use hit::*;
 
-/// 单行文本的显示宽（px，f32）——表格列宽测量用。
-pub(crate) fn shaped_text_width(
-    window: &mut Window,
-    text: &str,
-    font_size: Pixels,
-    font: &gpui::Font,
-    color: gpui::Hsla,
-) -> f32 {
-    let run = gpui::TextRun {
-        len: text.len(),
-        font: font.clone(),
-        color,
-        ..Default::default()
-    };
-    window
-        .text_system()
-        .shape_line(gpui::SharedString::from(text), font_size, &[run], None)
-        .width()
-        .into()
-}
-
 /// 一段排好的行布局是否含 `.notdef`（glyph id=0，元字形＝豆腐块）。Windows 冷启动时
 /// 主字体缺、需走回退字体才有的字形（❗⚠✅ 等）首次解析可能直接给 `.notdef`（空心
 /// 矩形）；含它的行若被 `RowShapeCache` 钉住则会整次运行不消失——Pass2/热身的命中
@@ -635,14 +614,36 @@ pub(crate) struct FoldPlan {
     pub fold_lines: rustc_hash::FxHashSet<usize>,
     /// 各折叠体的 body 行区间（reveal 找「caret 所在折叠体」用）。
     pub fold_bodies: Vec<Range<usize>>,
+    /// `fold_bodies` 前缀中 alert 折叠体条数：`..fold_split` 为 alert 组、`fold_split..`
+    /// 为标题组（各自升序且互不重叠、跨组可重叠）——`fold_reveal` 据此分组二分。
+    pub fold_split: usize,
     /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高。
     pub deltas: std::rc::Rc<[(usize, f32)]>,
+    /// `deltas` 的前缀和表：`delta_pref[p]` = 前 p 项增量之和（p ∈ [0, len]）。
+    /// **跨带/跨帧缓存**（与 `deltas` 同生命周期，构建时一次算好）：`build_frame` 的
+    /// `find_band_range` 每帧用它做二分定位带区间——旧实现每帧新建 `Vec<f32>` 做 O(k)
+    /// 分配与填充（带内 3000 条增量时 ~2.8ms/帧），滚动帧现直接只读复用本表。
+    pub delta_pref: std::rc::Rc<[f32]>,
     /// `deltas` 求和（total = base.total + sum(deltas) - reveal；免每档 O(k) 重加）。
     pub delta_sum: f32,
 }
 
+/// 由**有序**增量表构建前缀和表：`[0, Δ0, Δ0+Δ1, …]`（长 = len+1）。`FoldPlan` 构建
+/// 时算好（`delta_pref` 字段）跨带缓存；`find_band_range` 每帧只读复用（免 O(k) 分配）。
+/// `frame` 里 reveal 覆盖产生的过滤增量表也用它就地重建前缀（reveal 帧罕见且表小）。
+pub(crate) fn build_delta_pref(deltas: &[(usize, f32)]) -> std::rc::Rc<[f32]> {
+    let mut v = Vec::with_capacity(deltas.len() + 1);
+    let mut s = 0f32;
+    v.push(0.);
+    for &(_, d) in deltas.iter() {
+        s += d;
+        v.push(s);
+    }
+    v.into_boxed_slice().into()
+}
+
 /// caret 所在区域被「展开显示源码」（reveal-on-caret）：由 `fold_plan` 的全折叠基准
-/// 上**按带现算**（最多一个数学块 + 一个折叠体，O(区域数) 线性扫 + 少量 block 查）。
+/// 上**按带现算**（最多一个数学块 + 一个折叠体，区域二分 O(log #区域) + 少量 block 查）。
 pub(crate) struct RevealPlan {
     /// 被 reveal 的源码行区间（≤2 个：数学块区间 + 折叠体区间）。
     pub(crate) ranges: Vec<Range<usize>>,

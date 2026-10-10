@@ -238,15 +238,14 @@ fn pass1_base_layout(
             }
             f32::from(mermaid_card_height(&src)) * editor.mermaid_zoom(srcline)
         } else if meta.kind == RowKind::Image {
-            // 图片行：用当前加载尺寸按 `shape_image_row` 同式算高（占位→真实由
-            // `igen` 触发整表重建，带内外必须同一公式防滚动跳）。块高 = 图片盒高 +
-            // 题注间隙 + 题注行高（alt 现为可编辑文本行，与 `shape_image_row` 同式）。
+            // 图片行：用当前加载尺寸/宽覆写按 `shape_image_row` 同式算高（占位→真实 /
+            // 拖拽改宽现在也能在「基表复用」路径由 `patch_pending_image_heights` **稀疏
+            // 定向覆写**，不再强制整表重建——此公式与稀疏覆写共用 `image_block_base_height`，
+            // 带内外必须同一公式防滚动跳）。块高 = 图片盒高 + 题注间隙 + 题注行高。
             let src = crate::markdown::parse::parse_image_line(doc.line_str(srcline).trim())
                 .map(|(_, s)| s)
                 .unwrap_or_default();
-            f32::from(image_row_height(editor, &src, avail))
-                + crate::config::markdown::IMAGE_CAPTION_GAP_PX
-                + f32::from(theme.para_line())
+            image_block_base_height(editor, &src, avail, line_h)
         } else {
             let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
             f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h))
@@ -291,28 +290,22 @@ fn pass1_base_layout(
 /// （返回下标区间 [i0, i1)）——后面只在屏内这几块上做昂贵的事，屏外全用粗算高度占位。
 ///
 /// `eff_top(i)` = 基础前缀 + 动态增量前缀；单调 → 二分 `count_true` 得区间。
+/// `delta_pref` 为**调用方提供的**增量前缀和表（`FoldPlan.delta_pref` 跨带缓存，随
+/// `deltas` 同源构建），滚动帧免每帧新建 `Vec<f32>` 做 O(k) 分配与填充。
 fn find_band_range(
     base: &Rc<RefCell<BlockLayout>>,
     deltas: &[(usize, f32)],
+    delta_pref: &[f32],
     band_lo: f32,
     band_hi: f32,
     n: usize,
 ) -> (usize, usize) {
     let _t_bis = crate::prof::begin();
-    // `deltas` 前缀和表：`delta_pref[p]` = 前 p 项增量之和（p ∈ [0, len]），一次
-    // O(len) 建成 → 任意 `eff_top(i)` 只需 O(log len) 定位（partition_point 找
-    // 首个 `ix >= i`），旧实现每个二分步都对前缀现算 O(len) 求和：带内 3000 条增量
-    // 时 bisect ~2.8ms/帧、Pass3 逐行 O(rows×len) ~27ms/帧。
-    let delta_pref: Vec<f32> = {
-        let mut v = Vec::with_capacity(deltas.len() + 1);
-        let mut s = 0f32;
-        v.push(0.);
-        for &(_, d) in deltas.iter() {
-            s += d;
-            v.push(s);
-        }
-        v
-    };
+    // `delta_pref[p]` = 前 p 项增量之和（p ∈ [0, len]），一次 O(k) 建成 → 任意
+    // `eff_top(i)` 只需 O(log len) 定位（partition_point 找首个 `ix >= i`），旧实现每个
+    // 二分步都对前缀现算 O(len) 求和：带内 3000 条增量时 bisect ~2.8ms/帧、Pass3 逐行
+    // O(rows×len) ~27ms/帧。前缀表现由调用方缓存复用（见 `build_frame`）。
+    debug_assert_eq!(delta_pref.len(), deltas.len() + 1, "前缀和表须与增量表对齐");
     let eff_top = |i: usize| -> f32 {
         let b = base.borrow();
         let k = deltas.partition_point(|&(ix, _)| ix < i);
@@ -710,24 +703,33 @@ pub(crate) fn build_frame(
     let igen = editor.images_gen();
     let mgen = editor.math_gen();
 
-    // 基础布局：代 = `(struct_ver, 图片/数学/宽度/mermaid缩放)`。滚动/带移动与**非结构性
-    // 编辑**都复用（编辑只对受影响块做 Fenwick 点更新），不再每档/每键对整个 O(n) 高度
-    // 数组重算前缀和（旧实现在内容代变化时对全篇重扫 ~400ms，是「一编辑就卡」之一）。
+    // 基础布局：代 = `(struct_ver, 宽度, mermaid缩放)`——**不含 `images_gen`/`mgen`**
+    // （图片/数学高变更走稀疏定向覆写 / fold_plan 稀疏 delta，见 `height_epoch` eval）。
+    // 滚动/带移动与**非结构性编辑**都复用（编辑只对受影响块做 Fenwick 点更新），不再
+    // 每档/每键对整个 O(n) 高度数组重算前缀和（旧实现在内容代变化时对全篇重扫 ~400ms，
+    // 是「一编辑就卡」之一）。
     let _t_setup = crate::prof::begin();
-    let epoch = super::height_epoch(editor.struct_ver(), igen, width_bits, editor.mermaid_zoom_gen());
+    let epoch = super::height_epoch(editor.struct_ver(), width_bits, editor.mermaid_zoom_gen());
     let (rebuilt, base, old_layout) = editor.ensure_block_layout(n, epoch);
     // 非结构性编辑：基础布局复用，只修补受影响块高（估计 → Fenwick 点更新，O(log n)）。
-    if !rebuilt
-        && let Some(ixs) = editor.take_pending_patch_blocks()
-    {
-        let mut b = base.borrow_mut();
-        for i in ixs.into_iter().filter(|&i| i < n) {
-            if let Some(meta) = doc.block_meta(i) {
-                let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
-                let h = f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h));
-                b.set(i, h);
+    if !rebuilt {
+        if let Some(ixs) = editor.take_pending_patch_blocks()
+        {
+            let mut b = base.borrow_mut();
+            for i in ixs.into_iter().filter(|&i| i < n) {
+                if let Some(meta) = doc.block_meta(i) {
+                    let (chars, ascii) = doc.line_chars_ascii(meta.src_line as usize);
+                    let h = f32::from(estimate_height(&meta, chars, ascii, theme, avail, line_h));
+                    b.set(i, h);
+                }
             }
         }
+        // 图片占位→真实 / 拖拽改宽：**不动 `height_epoch`**（免拖拽每 tick 近全量 Pass1），
+        // 只对受影响的含图块做**稀疏 Fenwick 点更新**（公式与 pass1 共用
+        // `image_block_base_height`）。必须在 `find_band_range`/Pass2 之前（二分与行高都读
+        // 新基础高）——位置见 `patch_pending_image_heights` 收录端（`set_image_size`/
+        // `set_image_width`）。
+        editor.patch_pending_image_heights(&base, avail, line_h);
     }
 
     // 结构扫描（derived 缓存 → O(1) Rc 复用）；`math_regions` 在 Pass3 卡片组装用。
@@ -767,10 +769,15 @@ pub(crate) fn build_frame(
     let _t_rv = crate::prof::begin();
     let reveal = editor.fold_reveal(caret_line, &plan, &base);
     crate::prof::end("wy.bf.plan.reveal", _t_rv);
-    // 有效增量：无 reveal（常见：光标在普通行）→ 直接复用计划 deltas（零拷贝）；
-    // 有 reveal → 过滤掉被归零的块（最多几个），每带一次 O(k) 拷贝。
-    let (deltas, delta_sum): (std::rc::Rc<[(usize, f32)]>, f32) = if reveal.is_empty() {
-        (plan.deltas.clone(), plan.delta_sum)
+    // 有效增量：无 reveal（常见：光标在普通行）→ 直接复用计划 deltas **及其跨带缓存
+    // 的前缀和表**（零拷贝、滚动帧免每帧 O(k) 重建）；有 reveal → 过滤掉被归零的块
+    // （最多几个），每带一次 O(k) 拷贝 + 就地重建前缀（reveal 帧罕见且表小）。
+    let (deltas, delta_sum, delta_pref) = if reveal.is_empty() {
+        (
+            plan.deltas.clone(),
+            plan.delta_sum,
+            plan.delta_pref.clone(),
+        )
     } else {
         let eff: Vec<(usize, f32)> = plan
             .deltas
@@ -779,12 +786,17 @@ pub(crate) fn build_frame(
             .filter(|(ix, _)| !reveal.zeroed.contains(ix))
             .collect();
         let s: f32 = eff.iter().map(|&(_, v)| v).sum();
-        (eff.into_boxed_slice().into(), s)
+        let pref = build_delta_pref(&eff);
+        (
+            std::rc::Rc::<[(usize, f32)]>::from(eff.into_boxed_slice()),
+            s,
+            pref,
+        )
     };
     crate::prof::end("wy.bf.plan", _t_plan);
 
     // 带内块区间 [i0, i1)：用「有效前缀」（基础 + 动态增量，单调）二分。
-    let (i0, mut i1) = find_band_range(&base, &deltas, band_lo, band_hi, n);
+    let (i0, mut i1) = find_band_range(&base, &deltas, &delta_pref, band_lo, band_hi, n);
 
     // Pass 2：带内非折叠/非数学块 shape，真实高 `set` 回基表（带外沿用收敛真值）。
     // reveal 覆盖：caret 所在区域的行不再 blocked（还原源码 shape）。
@@ -826,7 +838,7 @@ pub(crate) fn build_frame(
     while i1 < n && band_cover_steps < BAND_COVER_CAP {
         band_cover_steps += 1;
         // 用「Pass2 已写回真实高后的 base」重算 [band_lo, band_hi) 的带内上界。
-        let (_, i1_next) = find_band_range(&base, &deltas, band_lo, band_hi, n);
+        let (_, i1_next) = find_band_range(&base, &deltas, &delta_pref, band_lo, band_hi, n);
         if i1_next <= i1 {
             break;
         }
@@ -1100,41 +1112,49 @@ mod tests {
     fn band_mid_spans_visible_blocks() {
         // 4×100px 块，band 50..250 → 覆盖块 0/1/2（块 3 top=300 在带外）。
         let base = blk(vec![100., 100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[], 50., 250., 4), (0, 3));
+        assert_eq!(find_band_range(&base, &[], &[0.], 50., 250., 4), (0, 3));
     }
 
     #[test]
     fn band_start_at_boundary_includes_start_block() {
         // band 0..300：块 3 top=300 不含（< band_hi 严格），块 0 因 top<=0 计入。
         let base = blk(vec![100., 100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[], 0., 300., 4), (0, 3));
+        assert_eq!(find_band_range(&base, &[], &[0.], 0., 300., 4), (0, 3));
     }
 
     #[test]
     fn band_above_all_blocks_starts_at_first() {
         // band 顶部在首块内（负区），i0 饱和到 0；只含块 0。
         let base = blk(vec![100., 100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[], -100., 50., 4), (0, 1));
+        assert_eq!(find_band_range(&base, &[], &[0.], -100., 50., 4), (0, 1));
     }
 
     #[test]
     fn band_below_all_blocks_returns_empty_span() {
         // band 在整个文档之下（滚到底）→ 空区间 (4, 4)。
         let base = blk(vec![100., 100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[], 500., 600., 4), (4, 4));
+        assert_eq!(find_band_range(&base, &[], &[0.], 500., 600., 4), (4, 4));
     }
 
     #[test]
     fn delta_shifts_later_block_tops() {
         // 块 1 增量 +50 → 块 2 有效 top = 200+50 = 250 …band 250..260 恰好罩住块 2。
         let base = blk(vec![100., 100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[(1, 50.)], 250., 260., 4), (2, 3));
+        let deltas = [(1, 50.)];
+        assert_eq!(
+            find_band_range(&base, &deltas, &build_delta_pref(&deltas), 250., 260., 4),
+            (2, 3)
+        );
     }
 
     #[test]
     fn band_hi_beyond_total_clamps_to_n() {
         // deltas 使 total 增大到 400，band 超高 → i1 夹到 n 而不是多算。
         let base = blk(vec![100., 100., 100.]);
-        assert_eq!(find_band_range(&base, &[(2, 100.)], 0., 1e9, 3), (0, 3));
+        let deltas = [(2, 100.)];
+        assert_eq!(
+            find_band_range(&base, &deltas, &build_delta_pref(&deltas), 0., 1e9, 3),
+            (0, 3)
+        );
     }
 }

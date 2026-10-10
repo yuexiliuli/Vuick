@@ -244,6 +244,10 @@ fn fold_plan_incremental_shift_matches_full_rebuild(cx: &mut TestAppContext) {
             inc.fold_bodies, full.fold_bodies,
             "{needle}: fold_bodies 不一致"
         );
+        assert_eq!(
+            inc.fold_split, full.fold_split,
+            "{needle}: fold_split 不一致"
+        );
         assert_eq!(&*inc.deltas, &*full.deltas, "{needle}: deltas 不一致");
         assert!(
             (inc.delta_sum - full.delta_sum).abs() < 1e-3,

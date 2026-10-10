@@ -579,6 +579,18 @@ impl WyEditor {
         let cid = frame::block_content_id(&self.doc, block);
         self.shape_rows.borrow().entries.contains_key(&cid)
     }
+    /// （仅测试）当前缓存的基础布局代键（`height_epoch` 结果）——M3 A4 观测点：
+    /// 图片占位→真实 / 拖拽改宽走**稀疏覆写**（不进代），代不变；结构性编辑/换宽才换代。
+    #[cfg(test)]
+    pub(crate) fn block_layout_epoch(&self) -> Option<u64> {
+        self.block_layout.borrow().as_ref().map(|(e, _)| *e)
+    }
+    /// （仅测试）第 `i` 块的基础布局高（不含动态增量）——断言稀疏覆写后的带外/带内
+    /// 图片块高（Frame::block_height 只对完整帧，这里读编辑器基表本体）。
+    #[cfg(test)]
+    pub(crate) fn block_base_height(&self, i: usize) -> Option<f32> {
+        self.block_layout.borrow().as_ref().map(|(_, b)| b.borrow().height(i))
+    }
     /// （仅测试）Pass2 光栅计数（缓存未命中/光标行时自增）。
     #[cfg(test)]
     pub(crate) fn bump_reshapes(&self) {
@@ -654,7 +666,7 @@ impl WyEditor {
         // ———（一）marker 集合：从已增量平移的 `derived` 重建（O(#区域)；math/alert 区域
         // 在 `update_derived_after_edit` 已行号平移，marker 无需再平移）。标题折叠态仅在
         // 有折叠时才全文扫描。
-        let (math_start, math_body, fold_lines, fold_bodies) = {
+        let (math_start, math_body, fold_lines, fold_bodies, fold_split) = {
             let d = derived.borrow();
             let math_regions = &d.math_regions;
             // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
@@ -682,6 +694,8 @@ impl WyEditor {
                 fold_bodies.push(rnge.clone());
                 fold_lines.extend(rnge.start + 1..rnge.end);
             }
+            // alert 折叠体条数 = `fold_bodies` 前缀长度（两组二分分组边界：alert 组在前）。
+            let fold_split = fold_bodies.len();
             crate::prof::end("wy.fp.sets", _t_sets);
             let _t_head = crate::prof::begin();
             {
@@ -695,7 +709,7 @@ impl WyEditor {
                 }
             }
             crate::prof::end("wy.fp.head", _t_head);
-            (math_start, math_body, fold_lines, fold_bodies)
+            (math_start, math_body, fold_lines, fold_bodies, fold_split)
         };
         // ———（二）deltas：marker 身份未变 + 结构编辑待消费 → 增量平移（免 O(n) 双数组
         // 标记 + 0..n 扫描）；否则整建（见 [`Self::fold_plan_deltas_full`]）。
@@ -708,6 +722,7 @@ impl WyEditor {
             &math_body,
             &fold_lines,
             &fold_bodies,
+            fold_split,
         ) {
             return plan;
         }
@@ -720,6 +735,7 @@ impl WyEditor {
             math_body,
             fold_lines,
             fold_bodies,
+            fold_split,
         )
     }
     /// deltas **增量平移**（B5）：marker 集合已重建（O(#区域)，`fp.sets`），deltas 免
@@ -740,6 +756,7 @@ impl WyEditor {
         math_body: &rustc_hash::FxHashSet<usize>,
         fold_lines: &rustc_hash::FxHashSet<usize>,
         fold_bodies: &[Range<usize>],
+        fold_split: usize,
     ) -> Option<Rc<element::FoldPlan>> {
         if !self.struct_edit_pending.get() || !self.folded_headings.borrow().is_empty() {
             return None;
@@ -807,12 +824,15 @@ impl WyEditor {
         deltas.sort_unstable_by_key(|&(b, _)| b);
         deltas.dedup_by_key(|&mut (b, _)| b);
         let delta_sum: f32 = deltas.iter().map(|&(_, v)| v).sum();
+        let delta_pref = element::build_delta_pref(&deltas);
         let plan = Rc::new(element::FoldPlan {
             math_start: math_start.clone(),
             math_body: math_body.clone(),
             fold_lines: fold_lines.clone(),
             fold_bodies: fold_bodies.to_vec(),
+            fold_split,
             deltas: deltas.into_boxed_slice().into(),
+            delta_pref,
             delta_sum,
         });
         self.struct_edit_pending.set(false); // 消费本次平移
@@ -832,6 +852,7 @@ impl WyEditor {
         math_body: rustc_hash::FxHashSet<usize>,
         fold_lines: rustc_hash::FxHashSet<usize>,
         fold_bodies: Vec<Range<usize>>,
+        fold_split: usize,
     ) -> Rc<element::FoldPlan> {
         let math_regions = &derived.borrow().math_regions;
         let _t_dyn = crate::prof::begin();
@@ -867,21 +888,24 @@ impl WyEditor {
         }
         let delta_sum: f32 = deltas_vec.iter().map(|&(_, v)| v).sum();
         crate::prof::end("wy.fp.tail", _t_tail);
+        let delta_pref = element::build_delta_pref(&deltas_vec);
         let plan = Rc::new(element::FoldPlan {
             math_start,
             math_body,
             fold_lines,
             fold_bodies,
+            fold_split,
             deltas: deltas_vec.into_boxed_slice().into(),
+            delta_pref,
             delta_sum,
         });
         self.struct_edit_pending.set(false);
         *self.fold_plan.borrow_mut() = Some((key, marker_key, plan.clone()));
         plan
     }
-    /// caret 所在区域「展开显示源码」（reveal-on-caret）覆盖，按带现算（O(区域数) 线性扫
-    ///   加少量块定位）——最多一个数学块 + 一个折叠体。`build_frame` 用它把全折叠基准里
-    /// 该区域的行恢复成可编辑源码显示。
+    /// caret 所在区域「展开显示源码」（reveal-on-caret）覆盖，按带现算（O(log #区域)
+    ///   二分定位数学块 + 折叠体，少量块定位）——最多一个数学块 + 一个折叠体。
+    ///   `build_frame` 用它把全折叠基准里该区域的行恢复成可编辑源码显示。
     pub(crate) fn fold_reveal(
         &self,
         caret_line: usize,
@@ -898,14 +922,12 @@ impl WyEditor {
             }
         };
         // 数学块：caret 在 [start, end) → 整块还原源码（不卡片、body 不折叠 0 高）。
+        // `math_regions` 升序且互不重叠 → 二分（O(log n)，替代每帧线性扫）。
         {
             let d = self.derived();
             let d = d.borrow();
-            if let Some(reg) = d
-                .math_regions
-                .iter()
-                .find(|r| caret_line >= r.range.start && caret_line < r.range.end)
-            {
+            if let Some(ridx) = region_containing(&d.math_regions, |r| r.range.clone(), caret_line, true) {
+                let reg = &d.math_regions[ridx];
                 let rng = reg.range.clone();
                 reveal.ranges.push(rng.clone());
                 zero_ix(&mut reveal.zeroed, block_ix_of(rng.start));
@@ -915,11 +937,9 @@ impl WyEditor {
             }
         }
         // 折叠体：caret 在 body `[start+1, end)` → 该体行还原源码（不折叠成 0）。
-        if let Some(rnge) = plan
-            .fold_bodies
-            .iter()
-            .find(|r| caret_line > r.start && caret_line < r.end)
-        {
+        // `fold_bodies` 两组各自升序不重叠、跨组可重叠 → `folded_body_at` 分组二分
+        // （alert 优先），与旧线性 `find` 首中语义一致。
+        if let Some(rnge) = folded_body_at(&plan.fold_bodies, plan.fold_split, caret_line) {
             let rng = rnge.clone();
             reveal.ranges.push(rng.clone());
             for l in rng.start + 1..rng.end {
@@ -981,5 +1001,121 @@ impl WyEditor {
         }));
         *self.derived.borrow_mut() = Some((ver, d.clone()));
         d
+    }
+}
+
+/// 在**按 start 升序且互不重叠**的区域表上二分定位「包含 `line` 的区域」下标
+/// （O(log #区域)，替代逐区域线性扫）。`regions` 可为 `&[Range<usize>]`（如
+/// `fold_bodies` 两组）或 `&[MathRegion]`（`range_of` 抽出 `Range<usize>`）。
+/// `math_regions` 由前向扫描建、行号平移单调 → 保持升序与互不重叠 → 满足前提。
+/// `incl_start`：起始行算不算“包含”（数学 `>= start`；折叠体用 `> start`，标题行/
+/// 标记行本身不折叠）。原理只查「最后一个 start ≤/&lt; line 的区域」——表内重叠时该
+/// 结论不成立，**重叠或无序的表不要用它**（`fold_bodies` 跨 alert/标题组可重叠 →
+/// 走 [`fold_reveal`] 的分组二分）。
+pub(crate) fn region_containing<T>(
+    regions: &[T],
+    range_of: impl Fn(&T) -> Range<usize>,
+    line: usize,
+    incl_start: bool,
+) -> Option<usize> {
+    let p = if incl_start {
+        regions.partition_point(|r| range_of(r).start <= line)
+    } else {
+        regions.partition_point(|r| range_of(r).start < line)
+    };
+    let idx = p.checked_sub(1)?;
+    (line < range_of(&regions[idx]).end).then_some(idx)
+}
+
+/// `fold_bodies`（= [alert 折叠体组 ‖ 标题折叠体组]）里「包含 caret 的折叠体」。两组
+/// 各自升序且互不重叠 → 各二分（O(log #折叠体)）；跨组可重叠（折叠标题体可包住折叠
+/// callout），按旧线性 `find` 的「alert 组优先首中」语义返回。
+fn folded_body_at(
+    fold_bodies: &[Range<usize>],
+    fold_split: usize,
+    line: usize,
+) -> Option<&Range<usize>> {
+    fold_bodies
+        .get(..fold_split)
+        .and_then(|g| region_containing(g, |r| r.clone(), line, false).map(|i| &g[i]))
+        .or_else(|| {
+            fold_bodies
+                .get(fold_split..)
+                .and_then(|g| region_containing(g, |r| r.clone(), line, false).map(|i| &g[i]))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+
+    /// 线性参考：区域表逐条找首个命中（与生产二分前一致）。
+    fn linear_containing(regions: &[Range<usize>], line: usize, incl_start: bool) -> Option<usize> {
+        regions.iter().position(|r| {
+            if incl_start {
+                line >= r.start && line < r.end
+            } else {
+                line > r.start && line < r.end
+            }
+        })
+    }
+
+    /// M3-A3 对拍：`region_containing` 二分 == 线性参考，覆盖空表、空区间、紧邻、
+    /// 单行、区域前后/边界/间隙各形态。
+    #[test]
+    fn region_containing_matches_linear_reference() {
+        let regions: Vec<Range<usize>> = vec![
+            0..3,
+            3..3, // 空区间（不应命中任何行）
+            5..6, // 单行
+            8..8,
+            9..14,
+            14..17,
+            20..21,
+            24..30,
+        ];
+        assert_eq!(
+            super::region_containing(&[], |r: &Range<usize>| r.clone(), 3, true),
+            None,
+            "空表"
+        );
+        for incl in [true, false] {
+            for line in 0..35usize {
+                assert_eq!(
+                    super::region_containing(&regions, |r| r.clone(), line, incl),
+                    linear_containing(&regions, line, incl),
+                    "incl_start={incl} line={line}: 二分 != 线性参考"
+                );
+            }
+        }
+    }
+
+    /// M3-A3 对拍：`folded_body_at` 分组二分 == 旧线性 `find` 首中；含跨组重叠
+    /// （折叠标题体包住折叠 callout）与 alert 优先语义。
+    #[test]
+    fn folded_body_at_matches_linear_find_with_cross_group_overlap() {
+        // 构造序 = 建表序：alert 折叠体组（前）‖ 标题折叠体组（后）。
+        let bodies: Vec<Range<usize>> = vec![
+            10..16, // alert 组 0
+            30..60, // alert 组 1（包住标题 40..50）
+            70..71, // alert 组 2
+            2..20, // 标题组 0（包住 alert 10..16）
+            40..50, // 标题组 1
+        ];
+        let split = 3usize;
+        for line in 0..80usize {
+            let bin = super::folded_body_at(&bodies, split, line).cloned();
+            let lin = bodies
+                .iter()
+                .find(|r| line > r.start && line < r.end)
+                .cloned();
+            assert_eq!(bin, lin, "line={line}: 分组二分 {bin:?} != 线性首中 {lin:?}");
+        }
+        // 关键边界抽查：caret 在标题体内但 callout 外（旧行为=标题体，不能错收成 alert）。
+        let b = [10..16, 2..20usize];
+        assert_eq!(super::folded_body_at(&b, 1, 3).cloned(), Some(2..20));
+        assert_eq!(super::folded_body_at(&b, 1, 16).cloned(), Some(2..20));
+        assert_eq!(super::folded_body_at(&b, 1, 2).cloned(), None, "标题行本身不折叠");
+        assert_eq!(super::folded_body_at(&b, 1, 20).cloned(), None);
     }
 }

@@ -1,17 +1,18 @@
 use gpui::Pixels;
 use crate::markdown::wysiwyg::element;
 
-/// 基础布局代：`(struct_ver, igen, mermaid_zoom, shaping 宽)` 折成一个 u64——**结构性内容**/
-/// 图片/宽度 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，只做
+/// 基础布局代：`(struct_ver, mermaid_zoom, shaping 宽)` 折成一个 u64——**结构性内容**/宽度/
+/// mermaid 缩放 任一变 → 整篇重建；非结构性编辑不改 `struct_ver` → 布局跨键复用，只做
 /// Fenwick 点更新。mermaid 缩放（`zgen`）也进代：缩放只影响单张卡片高，但块高存在基础
-/// 布局数组里，必须整篇重建一次才一致（缩放是低频操作，可接受；不复用 `mgen` 的稀疏
-/// delta 路线）。
-/// **不含 `mgen`**：数学排版就绪只改**卡片高**（走 `fold_plan` 稀疏 delta），基础布局里
-/// 数学块的 base 是普通段估算高，与就绪无关——把 `mgen` 放这里会让每个公式光栅完成都
-/// 触发全 139k 块 Pass1 重建。纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉
-/// ~200ms）。
-pub(crate) fn height_epoch(struct_ver: u64, igen: u64, width_bits: u32, zgen: u64) -> u64 {
-    let a = struct_ver ^ igen.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+/// 布局数组里，必须整篇重建一次才一致（缩放是低频操作，可接受；不复用稀疏 delta 路线）。
+/// **不含 `mgen` 与图片代（`images_gen`）**：数学排版就绪只改**卡片高**（走 `fold_plan`
+/// 稀疏 delta）、图片占位→真实/拖拽改宽只改**含图块高**（走 `patch_pending_image_heights`
+/// 稀疏定向覆写）——基础布局里数学/图片块的 base 是普通段/占位估算高，与就绪/改宽无关
+/// ⟹ 把 `mgen`/`images_gen` 放这里会让每个公式光栅完成/每 tick 图片拖拽都触发全 139k 块
+/// Pass1 重建（M3 A4 前 `images_gen` 曾在代里：拖拽每 tick 2-5ms/10 万块近全量估算）。
+/// 纯算术混淆（不做 SipHash：15.9 万块逐块键构造会吃掉 ~200ms）。
+pub(crate) fn height_epoch(struct_ver: u64, width_bits: u32, zgen: u64) -> u64 {
+    let a = struct_ver ^ (width_bits as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     let b = (width_bits as u64).wrapping_mul(0x517C_C1B7_2722_0A95)
         ^ zgen.wrapping_mul(0x243F_6A88_85A3_08D3);
     let x = a ^ b.rotate_left(32);

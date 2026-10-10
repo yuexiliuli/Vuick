@@ -65,6 +65,8 @@ impl WyEditor {
             image_sizes: RefCell::new(std::collections::HashMap::new()),
             images_gen: Cell::new(0),
             image_widths: RefCell::new(std::collections::HashMap::new()),
+            image_src_blocks: RefCell::new(None),
+            pending_image_srcs: RefCell::new(std::collections::HashSet::new()),
             image_resize_drag: RefCell::new(None),
             math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
             math_color: RefCell::new(None),
@@ -317,6 +319,9 @@ impl WyEditor {
         self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
         *self.pending_patch_blocks.borrow_mut() = None;
+        // 图片行高收录随内容/拼图失效一并清空（重建路径 pass1 已按当前图片状态重估，
+        // 残留 src 反打旧文幂等但无谓；见 `patch_pending_image_heights`）。
+        self.pending_image_srcs.borrow_mut().clear();
         // 换源：搜索高亮行号/内容作废（同预览换源清高亮）。
         self.clear_highlight();
         self.loaded = true;
@@ -331,6 +336,11 @@ impl WyEditor {
         *self.frame.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();
         self.notdef_retry.borrow_mut().clear();
+        // 图片尺寸全量作废 → 基础布局里图片块高全部失效：强制整篇重建（pass1 按占位高
+        // 重估，图片高变更走 `pending_image_srcs` 稀疏覆写，这里必须整体作废进代重建）。
+        // 并清掉残留覆写收录，防旧 src 在本目录下误打。
+        *self.block_layout.borrow_mut() = None;
+        self.pending_image_srcs.borrow_mut().clear();
     }
     /// 解析图片源：URL / Windows 盘符绝对路径 / 已绝对路径原样返回，其余基于
     /// 基准目录拼成绝对路径（与预览 `view::MarkdownPreview::resolve_image_src` 一致）。

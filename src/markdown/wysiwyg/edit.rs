@@ -116,9 +116,8 @@ impl WyEditor {
         };
         let mut d = rc.borrow_mut();
         // 跨线区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
-        if d.math_regions
-            .iter()
-            .any(|r| r.range.start <= edit_line && edit_line < r.range.end)
+        if super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true)
+            .is_some()
             || d.alert_fold_regions
                 .iter()
                 .any(|(r, _)| r.start <= edit_line && edit_line < r.end)
@@ -566,11 +565,12 @@ impl WyEditor {
                 {
                     let derived = self.derived();
                     let d = derived.borrow();
-                    if let Some(idx) = d
-                        .math_regions
-                        .iter()
-                        .position(|reg| edit_line >= reg.range.start && edit_line < reg.range.end)
-                    {
+                    if let Some(idx) = super::view::region_containing(
+                        &d.math_regions,
+                        |r| r.range.clone(),
+                        edit_line,
+                        true,
+                    ) {
                         let rng = d.math_regions[idx].range.clone();
                         let old_src = d.math_regions[idx].source.clone();
                         drop(d);
