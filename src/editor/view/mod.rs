@@ -401,12 +401,9 @@ impl CodeEditor {
         // 防「新旧文档同 version=0」命中上一份文档的颜色）。
         self.hl_dirty = None;
         self.highlighter.invalidate();
-        // Markdown「所见即所得」滤镜缓存同因作废：`Buffer::new` 后 version 归零，
-        // 若不复位会让 `scan_window` 命中旧文档的版本键，把**旧文本**的样式区间
-        // 套到新文本上——行文本变短（如 WYSIWYG 删除标题 `#` 后写回）时区间端越过
-        // 新行长 / 切进 CJK 字符，`StyledText::with_highlights` 的
-        // `is_char_boundary(run.end)` 断言即崩。
-        self.md_decor.clear();
+        // Markdown「所见即所得」滤镜缓存无需作废：缓存键含文档身份指纹（+version），
+        // `Buffer::new` 后 version 归零也不会命中上一份文档的样式区间，`scan_window`
+        // 首扫即指纹 miss → 按新文档自愈（M0.3；勿再手加 `md_decor.clear()` 兜底）。
         // 整篇替换：点亮标尺清除（内容已变，旧“所属块”提示无意义）。
         self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
