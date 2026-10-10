@@ -1,0 +1,203 @@
+//! `EditorApp` 构造与窗口注册：实体创建/注册、初始主题与字号偏好落地、
+//! 焦点句柄，以及命令行首参打开与自动化测试钩子（非渲染/预览职责）。
+
+use super::*;
+
+impl EditorApp {
+    /// 组件编辑器内部统一使用 LF，避免 Windows 剪贴板 CRLF 进入文本布局。
+    pub(super) fn normalize_newlines(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
+    /// `crate::ui::root::Root` 宿主包裹）。
+    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+        Self::new_impl(window, cx, None, false)
+    }
+
+    /// 「拖出拆分」创建独立文件窗口：首个选项卡直接采用拖出的选项卡快照。
+    /// 返回的 `EditorApp` 标记为 `is_detached`，它的选项卡再被拖出 = 还原回主窗口。
+    pub(crate) fn new_detached(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        first_tab: DetachedTab,
+    ) -> EditorApp {
+        Self::new_impl(window, cx, Some(first_tab), true)
+    }
+
+    pub(super) fn new_impl(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        first_tab: Option<DetachedTab>,
+        is_detached: bool,
+    ) -> EditorApp {
+        let focus_handle = cx.focus_handle();
+        // 侧边栏搜索输入框：内容变化 → 重刷 app（从而重算并展示搜索结果）
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("搜索文件与内容…")
+                .default_value("")
+        });
+        let search_state = search.clone();
+        let search_sub = cx.subscribe(&search, |_this, _emitter, ev: &InputEvent, cx| {
+            match ev {
+                InputEvent::Change => cx.notify(),
+            }
+        });
+        // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
+        let prefs = UserPrefs::load();
+        // 初始主题：按偏好解析（Follow → 当前系统明暗；Light/Dark → 强制）。
+        let start_dark = prefs.theme.resolved_dark(cx.window_appearance());
+        let start_font = prefs
+            .font_size
+            .map(|v| v.clamp(FONT_MIN, FONT_MAX))
+            .unwrap_or(DEFAULT_FONT_SIZE);
+        let mut app = EditorApp {
+            tabs: Vec::new(),
+            active_tab: 0,
+            tab_bar_hscroll: TableScrollState::new(),
+            tab_hscroll_seq: 0,
+            status: SharedString::from("就绪"),
+            status_ok: true,
+            notifications: Vec::new(),
+            font_size: start_font,
+            preview_pending: false,
+            preview_syncing: false,
+            preview_seq: 0,
+            dark_mode: start_dark,
+            // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
+            theme_pref: prefs.theme,
+            split_ratio: 0.5,
+            // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
+            wrap_enabled: false,
+            split_drag: None,
+            splitter_hovered: false,
+            sidebar: sidebar::SidebarChromeState {
+                open: true,
+                view: sidebar::SidebarView::Toc,
+                // 目录面板默认收起（仅留 46px 活动栏，不挤占正文）；
+                // 点活动栏「目录」按钮再展开。
+                panel_open: false,
+                toc_collapsed: Default::default(),
+                toc_tab: None,
+                // 有持久化宽度 → 恢复并固定为手动宽度；否则保持随内容自适应。
+                width: prefs.sidebar_width.unwrap_or(SIDEBAR_WIDTH),
+                width_auto: prefs.sidebar_width.is_none(),
+                resize: None,
+                resize_hovered: false,
+            },
+            search_state,
+            _search_sub: search_sub,
+            _pdf_observe: None,
+            pdf_search: None,
+            search_scan: None,
+            search_scan_count: 0,
+            open_fast_count: 0,
+            open_finish_count: 0,
+            open_dialog_calls: 0,
+            last_title_ctrl_fg: None,
+            tab_dragging: None,
+            is_detached,
+            media_lock_menu_pos: None,
+            media_lock_menu_entity: None,
+            media_lock_menu_sub: None,
+            tab_bar_menu_pos: None,
+            tab_bar_menu_entity: None,
+            tab_bar_menu_sub: None,
+            focus_handle,
+            md_scroll_sync: MdScrollSync::default(),
+            _appearance_sub: None,
+            palette: None,
+            _palette_sub: None,
+        };
+        app.register_window(window, cx);
+        // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
+        // 首帧前完成，避免「先亮后暗」闪一下）。
+        crate::ui::theme::Theme::set(
+            if app.dark_mode {
+                crate::ui::theme::ThemeMode::Dark
+            } else {
+                crate::ui::theme::ThemeMode::Light
+            },
+            cx,
+        );
+        // 运行中跟随系统深浅色：事件订阅（Windows 经 WM_SETTINGCHANGE 驱动）。
+        // 仅在「跟随」模式生效；强制档下外观变化被忽略，切回跟随由
+        // `follow_system_theme` 立即按当前系统落地。
+        let weak = cx.weak_entity();
+        app._appearance_sub = Some(window.observe_window_appearance(
+            move |_window: &mut Window, cx: &mut App| {
+                if let Some(entity) = weak.upgrade() {
+                    entity.update(cx, |this, cx| {
+                        let dark = matches!(
+                            cx.window_appearance(),
+                            gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+                        );
+                        if this.theme_pref == ThemePref::Follow && this.dark_mode != dark {
+                            this.dark_mode = dark;
+                            this.refresh_theme_ui(cx);
+                        }
+                    });
+                }
+            },
+        ));
+        if let Some(first_tab) = first_tab {
+            // 拆出/拖拽产生的独立窗口：首个选项卡直接收纳（不额外建空选项卡）。
+            app.adopt_tab(first_tab, Some(window), cx);
+        }
+        // 不再给普通窗口预建初始空选项卡：新模型下启动即「零选项卡 → 欢迎页」，
+        // 只有用户点了「新建文件」、双击欢迎页或打开文件（内部 `open_file` → `make_tab`）
+        // 才出现第一个选项卡（见 `render_body`：`tabs.is_empty()` 整屏欢迎页）。
+
+        // 命令行参数：第一个参数作为初始打开文件（`open_file` 新建一个选项卡载入；
+        // 之前的「复用首个空选项卡」随零 tab 启动模型一并移除——效果等价，都是只留
+        // 打开的那个文件选项卡）。
+        if !is_detached {
+            let mut args = std::env::args_os();
+            args.next(); // 跳过程序名
+            if let Some(first) = args.next() {
+                let p = PathBuf::from(&first);
+                if p.is_file() {
+                    app.open_file(&p.to_string_lossy(), window, cx);
+                }
+            }
+            // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：打开文件后
+            // 立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
+            if std::env::var_os("WY_AUTOTEST").is_some() && app.is_markdown_tab(app.active_tab) {
+                app.toggle_live_test(window, cx);
+            }
+        }
+        app
+    }
+
+    /// 把本窗口登记进全局 `EditorAppRegistry`（惰性清理已关闭窗口的失效项）。
+    pub(super) fn register_window(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !cx.has_global::<EditorAppRegistry>() {
+            cx.set_global(EditorAppRegistry::default());
+        }
+        let weak = cx.weak_entity();
+        let handle = window.window_handle();
+        let registry = cx.global_mut::<EditorAppRegistry>();
+        registry.windows.retain(|(weak, _)| weak.upgrade().is_some());
+        registry.windows.push((weak, handle));
+    }
+
+    /// 选项卡的编辑焦点句柄：预览编辑模式返回 WYSIWYG 编辑器（否则键盘进
+    /// 不可见的源码编辑区）；否则返回源码编辑区。
+    pub(super) fn tab_focus_handle(&self, idx: usize, cx: &App) -> FocusHandle {
+        let Some(tab) = self.tabs.get(idx) else {
+            return self.focus_handle.clone();
+        };
+        if tab.live_edit
+            && let Some(l2) = &tab.live2 {
+                let h = gpui::Focusable::focus_handle(l2.read(cx), cx);
+                return h;
+            }
+        tab.editor.read(cx).focus_handle()
+    }
+
+    /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦）。
+    pub(crate) fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.tab_focus_handle(self.active_tab, cx)
+    }
+}
