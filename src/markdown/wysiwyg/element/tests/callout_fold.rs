@@ -523,6 +523,53 @@ fn heading_fold_enter_elsewhere_no_full_text_materialization(cx: &mut TestAppCon
     });
 }
 
+/// Cut-1b：纯文本（无 `$`、无 `[!`、无折叠标题）**跨行合并**（结构路径）与随后的
+/// 强制整建都不得触达全篇 `text_shared()` 物化——`derived()` 三路预筛全空时直接返回
+/// 空三表，不再把 6MB rope 物化成 String。配套 `bench_rw_delete_plain` 跨行合并
+/// 24.9ms/次里 `wy.bf.setup` 的 ~16ms 主项（`text_shared` 全拷）就从这条路径消失。
+#[gpui::test]
+fn merge_lines_plain_skips_full_text_materialization(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "alpha beta gamma\n\ndelta epsilon zeta\n\neta theta iota\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 首次建帧：derived 冷启动（物化计数进基线）。
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 编辑点须在计数基线前算好（`content()` 会物化全文，不能计入）。
+        let at = ed.read(cx).content().find("delta").unwrap();
+        let c0 = ed.read(cx).doc().text_shared_calls();
+        // 跨行合并：删掉 `delta` 前一行结尾的 `\n` → `cross_newline` → structural。
+        ed.update(cx, |e, ecx| e.replace_range(at - 1..at, "", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 强制整建（regions_ver++ 模拟结构性重建入口）：三路预筛全空 → 依然不得物化。
+        ed.update(cx, |e, _| e.regions_ver.set(e.regions_ver.get().wrapping_add(1)));
+        let _f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let c1 = ed.read(cx).doc().text_shared_calls();
+        assert_eq!(
+            c1, c0,
+            "纯文本跨行合并/整建不得再全篇 text_shared（c0={c0} c1={c1}）"
+        );
+        // derived 语义与整建一致（此处两者都应是全空三表）。
+        assert!(
+            ed.read(cx)
+                .derived()
+                .borrow()
+                .math_regions
+                .is_empty()
+                && ed.read(cx).derived().borrow().alert_fold_regions.is_empty()
+                && ed.read(cx).derived().borrow().heading_fold_bodies.is_empty(),
+            "纯文本跨行合并后 derived 应为全空三表"
+        );
+    });
+}
+
 /// M5-B3-1 子项 4 保真：折叠标题后**在别处 Enter**，增量路径（集合重建 + deltas 平移，
 /// 移除了旧的「有折叠态便禁用 deltas 平移」守卫）产出的折叠计划必须与强制整建逐字段
 /// 一致（`sets` + `deltas` + `delta_sum`）。

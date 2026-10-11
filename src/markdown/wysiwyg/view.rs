@@ -933,6 +933,24 @@ impl WyEditor {
         {
             return d.clone();
         }
+        // Cut-1b：三个全篇扫描的**计数器预筛全空**（无 `$`、无 `[!`、无折叠标题）时，
+        // derived 必为全空三表——直接返回，**不物化全文**。这是跨行删除/合并回退整建
+        // （`regions_ver++`）后 `derived()` 重建里最贵的一步（6.4MB rope → String 的
+        // `text_shared()` 全拷 ≈ 16ms/次），纯文本无区域时纯属浪费。语义与「物化后由
+        // 空扫描得空表」完全一致（三个分支各自在预筛为空时即返空，见下）。
+        if self.math_dollar_cnt.get() == 0
+            && self.alert_marker_cnt.get() == 0
+            && self.folded_headings.borrow().is_empty()
+        {
+            let d = Rc::new(RefCell::new(WyDerived {
+                math_regions: Vec::new(),
+                alert_fold_regions: Vec::new(),
+                alert_region_kinds: Default::default(),
+                heading_fold_bodies: Vec::new(),
+            }));
+            *self.derived.borrow_mut() = Some((ver, d.clone()));
+            return d;
+        }
         let content = self.doc.text_shared();
         // 警报区域单遍扫描，两个公开查询由它派生（旧实现 `alert_fold_regions` +
         // `alert_region_kinds` 各扫一遍全篇——重复 O(n)）。

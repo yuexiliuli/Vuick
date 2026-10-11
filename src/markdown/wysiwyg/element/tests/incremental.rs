@@ -387,6 +387,143 @@ fn fold_plan_sets_reused_across_epoch_only_rebuild(cx: &mut TestAppContext) {
     let _ = (&deltas0, &deltas1);
 }
 
+/// Cut-1a：跨行删除/合并不再一刀切 `regions_ver++`——`shift_derived_after_edit` 改为显式
+/// 判定「编辑线落在区域内 **或** 某区域**起始边界**落在被删除换行吸收的行区间」才回退
+/// 整建；否则纯行号平移。本测试遍历围绕数学块/警报/标题折叠体的各种跨行合并落点，
+/// 断言**每一次**合并后 `derived()`（无论走平移还是整建路径）与强制整建逐字段一致——
+/// 锁定增量平移的边界语义与整篇重建零偏差。
+#[gpui::test]
+fn derived_merge_shift_matches_full_rebuild(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style::MathAlign;
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    use std::ops::Range;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 行 0 `## App` 折叠体 [0,2)；行 3-5 `$$` 数学块 [3,6)；行 6-7 `> [!NOTE]` 警报
+    // 折叠体 [6,8)；行 8/9 为纯文本合并落点（不碰任何区域边界 → 走平移路径）；
+    // 行 11-15 尾部再放一个 `$$` 数学块 [11,14) + `> [!TIP]` 警报 [14,16)——平移类落点
+    // （8/9）必须真平移**编辑线之下**的区域，与强制整建比对（否则平移只覆盖「上方不变」
+    // 平凡情形，`start > edit_line → shift` 分支无人锁）。
+    let text = concat!(
+        "## App\n",
+        "app body\n",
+        "# Tail\n",
+        "$$\n",
+        "x^2\n",
+        "$$\n",
+        "> [!NOTE]-\n",
+        "> alert body\n",
+        "intro A\n",
+        "intro B\n",
+        "out\n",
+        "$$\n",
+        "z^2\n",
+        "$$\n",
+        "> [!TIP]-\n",
+        "> tip body\n",
+    );
+    // derived 快照（平移/整建后与强制整建比对）：MathRegion 未 derive PartialEq，
+    // 投影 `(range, source, align)` 再比。
+    let snap = |ed: &crate::markdown::wysiwyg::WyEditor| {
+        let d = ed.derived();
+        let d = d.borrow();
+        let math: Vec<(Range<usize>, String, MathAlign)> = d
+            .math_regions
+            .iter()
+            .map(|r| (r.range.clone(), r.source.clone(), r.align))
+            .collect();
+        (
+            math,
+            d.alert_fold_regions.clone(),
+            d.alert_region_kinds.clone(),
+            d.heading_fold_bodies.clone(),
+        )
+    };
+    // 每个落点独立起一个编辑器（防前次合并污染行号/区域）。
+    for line_end in [0usize, 1, 2, 4, 5, 7, 8, 9] {
+        let (host, vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+            WyHost { ed }
+        });
+        let vcx: &mut VisualTestContext = vcx;
+        vcx.update(|window, cx: &mut App| {
+            let ed = host.read(cx).ed.clone();
+            // 折叠 `## App` → heading_fold_bodies 非空（crut-1a 要覆盖三类区域）。
+            ed.update(cx, |e, ecx| e.toggle_heading_fold_at_line(0, ecx));
+            let _f0 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+            // 跨行合并：删掉行 `line_end` 结尾的 `\n`（其位置 = `line_end(line)`；删除
+            // 后下行并入本行，`edit_line` = line_end）。
+            ed.update(cx, |e, ecx| {
+                let at = e.line_end(line_end).min(e.len().saturating_sub(1));
+                e.replace_range(at..at + 1, "", ecx);
+            });
+            let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+            // 合并后（平移或整建路径产出的）derived。
+            let inc = { let ed = ed.read(cx); snap(ed) };
+            // 强制整建：regions_ver++ → 下帧 `derived()` 从全文重扫。
+            ed.update(cx, |e, _| e.regions_ver.set(e.regions_ver.get().wrapping_add(1)));
+            let full = { let ed = ed.read(cx); snap(ed) };
+            assert_eq!(
+                inc.0, full.0,
+                "line_end={line_end}: 合并后 math_regions 与强制整建不一致"
+            );
+            assert_eq!(
+                inc.1, full.1,
+                "line_end={line_end}: 合并后 alert_fold_regions 与强制整建不一致"
+            );
+            assert_eq!(
+                inc.2, full.2,
+                "line_end={line_end}: 合并后 alert_region_kinds 与强制整建不一致"
+            );
+            assert_eq!(
+                inc.3, full.3,
+                "line_end={line_end}: 合并后 heading_fold_bodies 与强制整建不一致"
+            );
+        });
+    }
+}
+
+/// Cut-1a 补口：纯文本 doc（Cut-1b 已把**空 derived** 缓存为主态）里粘贴新建 `$$` 围栏
+/// 块 / `> [!]` 警报——结构编辑走「平移判定成功」路径时若漏掉「编辑窗口新建了区域
+/// 起始行」，`derived()` 命中旧 `regions_ver` 的空 Rc → 数学块/警报隐形（平移只能搬旧
+/// 区域、无法新建）。断言一次建帧后 derived 已含该区域（由 `edit_window_creates_region_marker`
+/// 回退整篇重建保证）。
+#[gpui::test]
+fn pasting_new_region_marker_into_plain_doc_rebuilds_derived(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "plain head\n\nplain tail\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 首帧：计数器全空 → Cut-1b 缓存空 derived（模拟真实纯文本 doc 的主态）。
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let at = ed.read(cx).content().find("\n\n").unwrap() + 1;
+        // `\n` 跨行 → structural → 平移判定（此前 derived 全空，本方判定会误走平移）。
+        ed.update(cx, |e, ecx| {
+            e.replace_range(at..at, "$$\nx^2\n$$\n> [!NOTE]-\n> n body\n", ecx)
+        });
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let d = ed.read(cx).derived();
+        let d = d.borrow();
+        assert_eq!(
+            d.math_regions.len(),
+            1,
+            "粘贴 `$$` 围栏应重建出数学块（不得命中空 derived 滞空）"
+        );
+        assert_eq!(
+            d.alert_fold_regions.len(),
+            1,
+            "粘贴 `> [!NOTE]-` 应重建出警报折叠体（不得命中空 derived 滞空）"
+        );
+    });
+}
+
 /* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
 
 use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent};

@@ -111,13 +111,27 @@ impl WyEditor {
     /// `derived` 内维护（编辑线之上不变、之下平移；编辑线落在体**内** → 内容/边界变了，
     /// 无法纯平移）。若派生未缓存、或任一区域/折叠体**跨过**编辑线 → 返回 `false`，
     /// 调用方回退整篇重建（`regions_ver++`，`derived()` 懒重建并重扫标题折叠）。
-    fn shift_derived_after_edit(&mut self, edit_line: usize, line_delta: i64) -> bool {
+    /// Cut-1a：跨行删除/合并（`removed_nl > 0`）不再一刀切回退整建，而是显式判定
+    /// ——删除的每个 `\n` 都把一行（`[edit_line+1, edit_line+removed_nl]`）整体并进上一
+    /// 行；这些行的**起始标记**若是某区域的开界（`$$` 围栏 / 整行 `$$…$$` / `> [!]`
+    /// 警报 / 折叠标题），一旦被前文前缀破坏，区域即被吞并/改界，纯行号平移会留下
+    /// 陈旧区域 → 才回退整建。纯文本合并（无任何区域）与远离区域边界的合并直接平移，
+    /// 省掉整篇 `derived()` 重建 + `text_shared()` 物化 + `fold_plan` 整建（~16ms@6MB）。
+    /// `removed_nl` 为 0（纯插入）时区间为空 → 与旧行为一致。
+    fn shift_derived_after_edit(
+        &mut self,
+        edit_line: usize,
+        line_delta: i64,
+        removed_nl: usize,
+    ) -> bool {
         let cached = self.derived.borrow_mut();
         let Some((_, rc)) = cached.as_ref() else {
             return false;
         };
         let mut d = rc.borrow_mut();
-        // 跨线区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
+        // 被删除换行吸收的行区间（起始边界直接落在其中 → 区域有被吞并风险）。
+        let abs_starts = edit_line + 1..=edit_line + removed_nl;
+        // 跨线/跨吸收区间区域：编辑线落在区域内 → 内容/边界变了，无法纯平移。
         if super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true)
             .is_some()
             || d.alert_fold_regions
@@ -130,6 +144,16 @@ impl WyEditor {
                 true,
             )
             .is_some()
+            // Cut-1a：某区域**起始行**落在被吸收行区间 → 起始标记可能被合并吞掉。
+            || d.math_regions
+                .iter()
+                .any(|r| abs_starts.contains(&r.range.start))
+            || d.alert_fold_regions
+                .iter()
+                .any(|(r, _)| abs_starts.contains(&r.start))
+            || d.heading_fold_bodies
+                .iter()
+                .any(|r| abs_starts.contains(&r.start))
         {
             return false;
         }
@@ -146,11 +170,20 @@ impl WyEditor {
             }
         }
         if line_delta != 0 {
+            // 只平移**编辑线之下**的键（区域整体下方 → 其所有行都 > edit_line，见上方
+            // `region_containing(edit_line)` 已排除跨线区域）——编辑线上方的区域行号
+            // 不动，误平移会让 paint 的 `alert_region_kinds` 查新行号 miss（callout 左条
+            // 掉色）。旧实现无条件平移全部键（合并走整建掩盖了此 bug；Cut-1a 让合并可
+            // 平移后暴露，一并修正）。
             let old = std::mem::take(&mut d.alert_region_kinds);
             d.alert_region_kinds =
                 rustc_hash::FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
             for (l, k) in old {
-                d.alert_region_kinds.insert(shift(l), k);
+                if l > edit_line {
+                    d.alert_region_kinds.insert(shift(l), k);
+                } else {
+                    d.alert_region_kinds.insert(l, k);
+                }
             }
         }
         for hb in &mut d.heading_fold_bodies {
@@ -559,18 +592,23 @@ impl WyEditor {
             // 下标随之变化 → 一并重建（否则导航判定错位）。
             let line_delta =
                 (text.matches('\n').count() as i64) - (removed.matches('\n').count() as i64);
-            if !self.shift_derived_after_edit(edit_line, line_delta) {
+            let removed_nl = removed.matches('\n').count();
+            if !self.shift_derived_after_edit(edit_line, line_delta, removed_nl) {
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
-            } else if removed.matches('\n').count() > 0
-                || self.edit_window_creates_folded_heading(
-                    edit_line,
-                    text.matches('\n').count(),
-                )
-            {
-                // M5-B3-1 子项 4：行号平移成功，但**跨行删除/合并**（行内容合并、折叠
-                // 终结尾/列表缩进的边界语义无法增量保证）或**插入窗口新建了命中已折叠
-                // 键的标题行**（重复折叠同款）→ 回退整篇重建。两者都是相对少的路径，
-                // 与基线同成本（正确 > 快）。
+            } else if self.edit_window_creates_folded_heading(
+                edit_line,
+                text.matches('\n').count(),
+            ) || self.edit_window_creates_region_marker(
+                edit_line,
+                text.matches('\n').count(),
+            ) {
+                // M5-B3-1 子项 4：**插入窗口新建了命中已折叠键的标题行**（重复折叠
+                // 同款标题：行号平移只能搬旧折叠体、无法新建折叠体）→ 回退整篇重建。
+                // Cut-1a 补口：**新建区域起始行**（`$$` 围栏 / 整行 `$$…$$` / `> [!]`
+                // 警报）同理——平移搬不动「还没建出来」的区域（见
+                // `edit_window_creates_region_marker`）。
+                // （Cut-1a：跨行删除/合并的边界语义已由 `shift_derived_after_edit` 的
+                // 显式区域边界判定承担——纯文本合并不再无谓整建。）
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
             } else {
                 // 成功平移：region 结构不变、只是行号动 → 递增 `fp_sets` 缓存键的
@@ -720,6 +758,32 @@ impl WyEditor {
 
     /// 记录撤销快照并做一次文本替换（任务框 toggle / 警报折叠共用）。
     /// 快照与重做栈的维护在 [`Self::replace_range`] 内统一完成。
+    /// Cut-1a 补口：结构编辑**插入窗口**（`edit_line..=edit_line + 插入换行数`）内出现了
+    /// **新建的区域起始行**（`math_regions`/`alert_regions` 会认作开界的 `$$` 围栏 / 整行
+    /// `$$…$$` / `> [!]` 警报）——行号平移只能搬旧区域、无法**新建**区域，纯平移会在
+    /// 派生里留下陈旧空表（例：纯文本文档粘贴/合并出一个 `$$` 围栏行，`shift_derived_after_edit`
+    /// 对空缓存返回 true，`derived()` 命中旧 `regions_ver` 的空 Rc → 数学块隐形）。
+    /// 返回 `true` 让调用方回退整篇重建。先计数短路（无 `$`/`[!` 必无此类区域），
+    /// O(插入行数) 次 `line_str`——纯文本合并窗口内无任何区域开界 → 不影响 Cut-1a 快路径。
+    fn edit_window_creates_region_marker(&self, edit_line: usize, inserted_nl: usize) -> bool {
+        if self.math_dollar_cnt.get() == 0 && self.alert_marker_cnt.get() == 0 {
+            return false;
+        }
+        let max_line = self.doc.line_starts().len().saturating_sub(1);
+        for l in edit_line..=(edit_line + inserted_nl).min(max_line) {
+            let raw = self.doc.line_str(l);
+            if raw.trim() == "$$" || inline_style::one_line_math(&raw).is_some() {
+                return true;
+            }
+            if let Some(p) = inline_style::blockquote_prefix(&raw)
+                && inline_style::alert_prefix(&raw[p..]).is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn apply_edit(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
         self.replace_range(range, text, cx);
     }
