@@ -969,12 +969,21 @@ impl EditorApp {
                     this.activate_tab(ti, window, cx);
                     if let Some(tab) = this.tabs.get(ti) {
                         if tab.readonly_preview {
-                            // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本
-                            let md = tab.md_preview.clone();
-                            md.update(cx, |v, cx| {
-                                v.scroll_to_line(li);
-                                v.highlight_search(li, &q_owned, cx);
-                            });
+                            // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本。
+                            // P4-1：EPUB 走 WyEditor 只读宿主 → `set_scroll_target`（prepaint
+                            // 重钉，与 MD 统一组件同款）+ 搜索高亮；回退 MarkdownPreview 照旧。
+                            if let Some(wy) = tab.md_wy.clone() {
+                                wy.update(cx, |v, cx| {
+                                    v.set_scroll_target(li);
+                                    v.highlight_search(li, &q_owned.clone(), cx);
+                                });
+                            } else {
+                                let md = tab.md_preview.clone();
+                                md.update(cx, |v, cx| {
+                                    v.scroll_to_line(li);
+                                    v.highlight_search(li, &q_owned.clone(), cx);
+                                });
+                            }
                         } else {
                             // 预览可见（分屏/全屏）且仍是 MarkdownPreview（EPUB/手动预览，
                             // md_wy 缺席）时高亮预览中的命中文本——MD 已切统一组件由下面

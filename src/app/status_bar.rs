@@ -56,7 +56,7 @@ impl EditorApp {
         let left = self.status_bar_left(dirty, language, window, cx);
 
         // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
-        let epub_page = tab.and_then(|t| t.md_preview.read(cx).viewport_page_bounds());
+        let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
         let pdf_page = tab
             .and_then(|t| t.pdf_preview.as_ref().and_then(|pv| pv.read(cx).current_page()));
         let cursor_pos = tab.and_then(|t| {

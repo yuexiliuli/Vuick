@@ -554,12 +554,18 @@ impl EditorApp {
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
         let panel_bg = self.panel_bg();
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
         let text = doc.markdown;
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
+        // P4-1：EPUB 迁 WyEditor 只读宿主（回退开关默认开；关 → 仅 MarkdownPreview）。
+        // 只读（禁编辑）、标题居中（set_epub）、`epubimg://` 内存图（set_memory_images）。
+        // 在 `tab` 可变借用之前调用（需 `&mut self` 建实体）。
+        if self.epub_preview_backend_wy() {
+            self.ensure_epub_wy(idx, _window, cx, &text, &doc.images);
+        }
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
         // 编辑区置为提示文本（EPUB 只读，不参与文本编辑）
         tab.editor.update(cx, |ed, _cx| {
             ed.set_text("");
@@ -577,6 +583,8 @@ impl EditorApp {
             view.set_source(&text, cx);
         });
         tab.file_path = Some(p.to_path_buf());
+        // P4-1：EPUB 内存图随选项卡持有（供 WyEditor 只读宿主注入；随选项卡搬迁）。
+        tab.epub_images = doc.images.clone();
         tab.content = SharedString::from(text);
         tab.line_count = lines;
         tab.char_count = chars;

@@ -45,6 +45,7 @@ impl EditorApp {
             live_vscroll: gpui::ScrollHandle::new(),
             md_wy: None,
             md_wy_vscroll: gpui::ScrollHandle::new(),
+            epub_images: Default::default(),
             preview_prev: None,
             edit_version: 0,
             preview_dirty: None,

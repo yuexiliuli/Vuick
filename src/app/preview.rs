@@ -48,18 +48,46 @@ impl EditorApp {
     }
 
     /// A2：当前激活选项卡的右栏 WyEditor 预览实体（仅当该选项卡**真正以 WyEditor 作
-    /// 预览渲染**时才返回：Markdown 文件 → 已建 → 非 PDF → 非只读预览（EPUB 仍走
-    /// `MarkdownPreview`））。`render_preview_pane` / `render_fullscreen_preview` 据此
-    /// 决定走统一组件宿主。
+    /// 预览渲染**时才返回：Markdown 文件 → 已建 → 非 PDF；EPUB（P4-1 迁 WyEditor 只读
+    /// 宿主，且回退开关未关）→ 已建）。`render_preview_pane` / `render_fullscreen_preview`
+    /// 据此决定走统一组件宿主。
     pub(super) fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
-        if !self.is_markdown_tab(self.active_tab) {
-            return None;
-        }
         let tab = self.tabs.get(self.active_tab)?;
-        if tab.md_wy.is_none() || tab.pdf_preview.is_some() || tab.readonly_preview {
+        let wy = tab.md_wy.clone()?;
+        // PDF 用自带 PdfViewer，绝不以 WyEditor 渲染。
+        if tab.pdf_preview.is_some() {
             return None;
         }
-        tab.md_wy.clone()
+        if self.is_epub_tab(self.active_tab) {
+            // EPUB 只读宿主：回退开关关 → 仍走 MarkdownPreview。
+            if !self.epub_preview_backend_wy() {
+                return None;
+            }
+            return Some(wy);
+        }
+        // Markdown 统一预览：仅 Markdown（非只读）走 WyEditor。
+        if !self.is_markdown_tab(self.active_tab) || tab.readonly_preview {
+            return None;
+        }
+        Some(wy)
+    }
+
+    /// EPUB 轻量视口分页读数 `(当前页, 总页数)`（1 基；状态栏页码，P4-1）：
+    /// 新宿主（WyEditor 只读）读 WYSIWYG 确定性量程；回退后端读 `MarkdownPreview`
+    /// （原有实现）。非 EPUB / 就绪前 → `None`（状态栏不显示页码）。
+    pub(super) fn epub_page_bounds(&self, window: &mut Window, cx: &gpui::App) -> Option<(usize, usize)> {
+        let idx = self.active_tab;
+        if !self.is_epub_tab(idx) {
+            return None;
+        }
+        let tab = self.tabs.get(idx)?;
+        if self.epub_preview_backend_wy() && tab.md_wy.is_some() {
+            // 视口高：以窗口内容高估算（容器 ≈ 窗口正文区；误差 ≤ 顶部/底部工具条高，
+            // 对「第 x/N 页」展示无碍）。
+            let view_h = f32::from(window.viewport_size().height).max(1.);
+            return tab.md_wy.as_ref().and_then(|w| w.read(cx).viewport_page_bounds(view_h));
+        }
+        tab.md_preview.read(cx).viewport_page_bounds()
     }
 
     /// 编辑区⇄预览滚动同步（每帧渲染开头调用）。只在「活动选项卡以 WyEditor 作 MD
@@ -245,6 +273,92 @@ impl EditorApp {
         }
     }
 
+    /// EPUB：确保右栏 WyEditor **只读宿主**已创建（懒创建 + A1 只读门控 + 全局字号/
+    /// 基准目录/内存图片表），并用 EPUB 源**同步喂源**（P4-1：EPUB 迁 WyEditor）。
+    /// 只读（`set_editable(false)`）、标题居中（`set_epub(true)`）、`epubimg://…` 内存图
+    /// （`set_memory_images`）。注记/引文/页码等 A 侧能力仍由 `md_preview` 承载（P4-2）。
+    pub(super) fn ensure_epub_wy(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        text: &str,
+        images: &std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    ) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        let fs = self.font_size;
+        let base_dir = self.tabs[idx]
+            .file_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|d| d.to_path_buf());
+        if self.tabs[idx].md_wy.is_none() {
+            let ed = cx.new(|cx| WyEditor::new(window, cx));
+            ed.update(cx, |ed, _| {
+                ed.set_editable(false); // A1 只读门控：EPUB 阅读不可编辑
+                ed.set_font_size(gpui::px(fs));
+                ed.set_base_dir(base_dir.clone());
+            });
+            self.tabs[idx].md_wy = Some(ed.clone());
+        }
+        if let Some(ed) = self.tabs[idx].md_wy.clone() {
+            ed.update(cx, |ed, _| {
+                ed.set_font_size(gpui::px(fs));
+                ed.set_base_dir(base_dir);
+                ed.set_memory_images(images.clone());
+                ed.set_epub(true);
+                ed.set_source_text(text);
+            });
+        }
+    }
+
+    /// P4-1：EPUB 章节翻转「上一章/下一章」。章界 = 目录标题条目（每章以标题起始）。
+    /// 统一 WyEditor 宿主：当前章 = 顶行所在标题，滚动到相邻章标题（`set_scroll_target`，
+    /// prepaint 重钉，无需 window）；回退 MarkdownPreview：滚动到目录渲染行（`scroll_to_row`）。
+    /// 无 EPUB / 少于 2 章 / 已处边界章 → 不动，返回 `false`。
+    pub(super) fn epub_flip_chapter(&mut self, dir: i32, cx: &mut Context<Self>) -> bool {
+        let idx = self.active_tab;
+        if !self.is_epub_tab(idx) {
+            return false;
+        }
+        let Some((entries, scroll)) = self.md_toc_source(cx) else {
+            return false;
+        };
+        if entries.len() < 2 {
+            return false;
+        }
+        match scroll {
+            MdTocScroll::Unified(wy) => {
+                let current = wy.read(cx).top_source_line().unwrap_or(0);
+                let cur_ix = entries
+                    .iter()
+                    .rposition(|&(l, _, _)| l <= current)
+                    .unwrap_or(0);
+                let next = (cur_ix as i32 + dir).clamp(0, entries.len() as i32 - 1) as usize;
+                if next == cur_ix {
+                    return false;
+                }
+                wy.update(cx, |v, _| v.set_scroll_target(entries[next].0));
+                cx.notify();
+                true
+            }
+            MdTocScroll::Legacy(md) => {
+                let cur_ix = 0usize; // Legacy 无顶行读数：从首章起翻
+                let next = (cur_ix as i32 + dir).clamp(0, entries.len() as i32 - 1) as usize;
+                if next == cur_ix {
+                    return false;
+                }
+                md.update(cx, |v, cx| {
+                    v.scroll_to_row(entries[next].0);
+                    cx.notify();
+                });
+                true
+            }
+        }
+    }
+
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单 / 命令面板共用）。
     /// 会先激活该选项卡，再翻转其 `preview_on`。
     /// EPUB（`readonly_preview`）：正文只在预览区、编辑区为空，翻转预览无意义，
@@ -281,9 +395,15 @@ impl EditorApp {
         });
         if preview_on {
             // A4 脱离：MD（非只读）只走统一组件 WyEditor（ensure_md_wy 同步喂源）；
-            // 仅 EPUB / 手动预览（readonly 或非 md）仍用 MarkdownPreview（sync_md_preview）。
+            // EPUB（P4-1）走 WyEditor 只读宿主（回退开关开时），MarkdownPreview 仍喂
+            // （注记/引文/页码回退源，P4-2 收口）；手动预览仍用 MarkdownPreview。
             if is_md && !readonly {
                 self.ensure_md_wy(idx, window, cx, true);
+            } else if readonly && self.is_epub_tab(idx) && self.epub_preview_backend_wy() {
+                let images = self.tabs[idx].epub_images.clone();
+                self.sync_md_preview(idx, cx);
+                let content = self.tabs[idx].content.clone();
+                self.ensure_epub_wy(idx, window, cx, content.as_ref(), &images);
             } else {
                 self.sync_md_preview(idx, cx);
             }
@@ -357,6 +477,15 @@ impl EditorApp {
             .get(idx)
             .and_then(|t| t.file_path.as_ref())
             .map(|p| Self::is_markdown_path(p))
+            .unwrap_or(false)
+    }
+
+    /// 选项卡是否 EPUB 文件（按扩展名识别；EPUB 预览走 WyEditor 只读宿主的依据）。
+    pub(super) fn is_epub_tab(&self, idx: usize) -> bool {
+        self.tabs
+            .get(idx)
+            .and_then(|t| t.file_path.as_ref())
+            .map(|p| Self::is_epub_path(p))
             .unwrap_or(false)
     }
 

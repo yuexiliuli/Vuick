@@ -109,6 +109,8 @@ impl EditorApp {
             _appearance_sub: None,
             palette: None,
             _palette_sub: None,
+            #[cfg(test)]
+            epub_backend_force_legacy: false,
         };
         app.register_window(window, cx);
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，

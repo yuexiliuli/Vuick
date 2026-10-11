@@ -142,6 +142,26 @@ impl EditorApp {
         ))
         .item(Self::live_test_menu_item(weak.clone()))
         .separator()
+        // P4-1：EPUB 章节翻转（WyEditor 只读宿主 / MarkdownPreview 回退通用）。
+        .item(Self::menu_action_item(
+            "上一章",
+            "Ctrl+[",
+            weak.clone(),
+            |this, _window, cx| {
+                this.epub_flip_chapter(-1, cx);
+                cx.notify();
+            },
+        ))
+        .item(Self::menu_action_item(
+            "下一章",
+            "Ctrl+]",
+            weak.clone(),
+            |this, _window, cx| {
+                this.epub_flip_chapter(1, cx);
+                cx.notify();
+            },
+        ))
+        .separator()
         .item(Self::menu_action_item(
             "增大字号",
             "Ctrl+=",

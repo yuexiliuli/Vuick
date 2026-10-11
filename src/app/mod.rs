@@ -108,6 +108,23 @@ fn merge_preview_dirty(
     }
 }
 
+/// EPUB 预览后端开关（P4-1「EPUB 迁 WyEditor 只读宿主」的可回滚开关）：
+/// `true`（默认）= EPUB 预览走 **WyEditor 只读宿主**（`tab.md_wy`）；`false` = 回退
+/// 现有 **MarkdownPreview** 路径（注记/引文/页码等 A 侧能力，P4-2 再收口）。
+/// 运行时读环境变量 `EPUB_PREVIEW_BACKEND`（`"0"`/`"off"` → 回退；其余 → 新宿主），
+/// 便于线上/测试按进程回滚。（仅测试）实例字段 `epub_backend_force_legacy` 优先。
+impl EditorApp {
+    pub(crate) fn epub_preview_backend_wy(&self) -> bool {
+        #[cfg(test)]
+        if self.epub_backend_force_legacy {
+            return false;
+        }
+        std::env::var("EPUB_PREVIEW_BACKEND").map_or(true, |v| {
+            !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("off")
+        })
+    }
+}
+
 #[cfg(test)]
 mod merge_preview_dirty_tests {
     use super::merge_preview_dirty;
@@ -183,6 +200,9 @@ struct EditorTab {
     /// 从 `MarkdownPreview`（元素树）切到它（同一 `Doc` 管线的只读视图）；`None` =
     /// 未创建（文本 / PDF / EPUB 选项卡，或 MD 预览已关闭）。EPUB/PDF 仍走旧预览。
     md_wy: Option<gpui::Entity<WyEditor>>,
+    /// P4-1：EPUB 的**内存图片表**（虚拟 `epubimg://…` → 字节，不落盘）。打开时存
+    /// 一份供 WyEditor 宿主（`ensure_epub_wy`）注入；随选项卡搬迁（与 `md_wy` 同）。
+    epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// `md_wy` 右栏/全屏宿主的纵向滚动句柄：`#md-wy-scroll`（`overflow_y_scroll`）
     /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
     /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
@@ -224,6 +244,8 @@ pub(crate) struct DetachedTab {
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
     md_wy_vscroll: gpui::ScrollHandle,
+    /// P4-1：EPUB 内存图片表随选项卡搬迁（与 `md_wy` 宿主共用）。
+    epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     file_path: Option<PathBuf>,
     dirty: bool,
     content: SharedString,
@@ -351,6 +373,9 @@ pub struct EditorApp {
     /// 预览同步是否正在扫描/装配中：为 true 时不再起新一轮（防多轮 500ms 后台扫描
     /// 叠在一起；同步循环结束后复位，其间若有新编辑会自动续跑合并）。
     preview_syncing: bool,
+    /// （仅测试）强制本实例 EPUB 预览走 MarkdownPreview 回退后端（免 env 跨并行测试竞态）。
+    #[cfg(test)]
+    epub_backend_force_legacy: bool,
     /// 预览同步的代序号：每轮去抖发起时 +1；后台 `scan_blocks` 结果只允许最新代
     /// 落盘，旧代迟到结果直接丢弃（防旧内容覆盖新编辑）。
     preview_seq: u64,
