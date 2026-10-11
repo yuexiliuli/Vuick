@@ -964,7 +964,19 @@ fn empty_frame(
 /// - 方向只由带序号跨界（`band.top/512` 取整变化）判定；预算按速度自适应
 ///   （`Prewarm::effective_budget`：基础 `blocks_per_frame` + 速度×4，硬上限 24），
 ///   `bias` 滑动窗每帧推进、回绕兜底——区间扫满即全部命中/跳过，空转开销≈HashMap 查找。
-pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
+/// - **静置门控**（Sprint 4b）：滚动/内容/宽度全未变且连续 [`super::Prewarm::IDLE_SKIP_FRAMES`]
+///   帧无滚动意图 → 跳过整形循环（只保留上方登记簿）——预整形只在滚动活跃期工作，
+///   滚动停稳/纯编辑帧不再每帧白烧 8ms 预算；滚动/缩放/内容变化下一帧立即复原。
+///   跳过仅影响后续带穿越的冷启动（届时若正在滚动已恢复，Pass2 补一次整形突发）。
+///   `scroll_top` 必须是 prepaint 的**未量程化**滚动像素：`frame.band` 是 512px 量子栅格，
+///   带内几像素的微滚不动带，签名若不区分会把「慢速滚动中」误判为静置（见
+///   [`super::PrewarmSig`]）——跨带时落点带冷、Pass2 突发回归。
+pub(crate) fn prewarm_band(
+    e: &WyEditor,
+    frame: &Frame,
+    window: &mut Window,
+    scroll_top: f32,
+) {
     let q = 512.;
     let mut st = e.prewarm.borrow_mut();
     let (blo, bhi) = frame.band;
@@ -987,6 +999,11 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
     }
     st.last_band_idx = Some(bi);
     if st.dir == 0 {
+        return;
+    }
+    // 静置门控（Sprint 4b）：登记簿已新鲜（上方带序号/dir 更新），这里看本帧相对上一帧
+    // 有没有滚动/缩放/内容意图——全无且连续 N 帧 → 跳过预整形循环（O(1) 开销收工）。
+    if st.idle_skip(frame, scroll_top) {
         return;
     }
     // 目标量子带 = 当前带沿方向平移一个量子。

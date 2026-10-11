@@ -53,15 +53,26 @@ fn prewarm_band_makes_band_cross_near_cache_hit(cx: &mut TestAppContext) {
             if i == 0 {
                 // 首带冷建（不计入穿越整形）；随后对带 1 建立方向并预热。
                 ed.read(cx).take_reshapes();
-                prewarm_band(ed.read(cx), &f, window);
+                prewarm_band(ed.read(cx), &f, window, bw);
                 continue;
             }
-            // 本带穿越整形（上一帧已对带 i-1 执行过 10 次预热 → 命中应接近 0）。
+            // 本带穿越整形（上一帧已对带 i-1 预热 → 命中应接近 0）。
             warm.push(ed.read(cx).take_reshapes());
-            // 对本带 frame 预热下一带（i+1）：3 块/帧 × 10 帧覆盖整带。
-            for _ in 0..10 {
-                prewarm_band(ed.read(cx), &f, window);
+            // 对本带预热下一带（i+1）：3 块/帧 × 10 帧覆盖整带。静置门控（Sprint 4b）
+            // 下「同一 band 反复调用 = 静置、连续 2 帧后跳过」；真实滚动每帧带顶像素
+            // 都在变（含带内微滚），这里用逐帧带顶微移模拟滚动活跃期，让预热持续推进。
+            // 中间 build_frame 的 Pass2 只补带边 ≤1-2 块（进带 i+1 的入口在计数线外，
+            // 末尾一并丢弃），不影响穿越整形计数。
+            for j in 0..10 {
+                let fw = build_frame(
+                    ed.read(cx),
+                    window,
+                    width,
+                    (bw + j as f32 * 4., bw + j as f32 * 4. + 512.),
+                );
+                prewarm_band(ed.read(cx), &fw, window, bw + j as f32 * 4.);
             }
+            ed.read(cx).take_reshapes(); // 丢弃预热期中间 build_frame 的带边整形噪声
         }
         let warm_sum: u64 = warm.iter().sum();
         println!("[prewarm] cold={cold:?} (sum {cold_sum}) vs warm={warm:?} (sum {warm_sum})");
@@ -125,13 +136,13 @@ fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
 
         // 首帧登记带 0（无方向）；再对同一带预热 → dir 仍 0、直接返回（不整形）。
         let f0 = build_frame(ed.read(cx), window, width, (0., q));
-        prewarm_band(ed.read(cx), &f0, window);
-        prewarm_band(ed.read(cx), &f0, window);
+        prewarm_band(ed.read(cx), &f0, window, 0.);
+        prewarm_band(ed.read(cx), &f0, window, 0.);
 
         // 一次跳 3 个带（快滚）：方向置 +1、vel=3 → 预算 15。
         let f1 = build_frame(ed.read(cx), window, width, (3. * q, 4. * q));
         ed.read(cx).take_reshapes(); // 清 build_frame 自身的 Pass2 整形计数
-        prewarm_band(ed.read(cx), &f1, window);
+        prewarm_band(ed.read(cx), &f1, window, 3. * q);
         let d1 = ed.read(cx).take_prewarm_shapes();
         assert!(
             (12..=15).contains(&d1),
@@ -139,9 +150,80 @@ fn prewarm_budget_ramps_up_on_fast_band_jump(cx: &mut TestAppContext) {
         );
 
         // 同一带再预热（vel=0）：回落到基础预算 3。
-        prewarm_band(ed.read(cx), &f1, window);
+        prewarm_band(ed.read(cx), &f1, window, 3. * q);
         let d2 = ed.read(cx).take_prewarm_shapes();
         assert!((1..=3).contains(&d2), "静止时回落到基础预算 3，实际 {d2}");
+    });
+}
+
+/// Sprint 4b 静置门控：带宽/内容/宽度全未变时，连续 `IDLE_SKIP_FRAMES` 帧后
+/// `prewarm_band` 完全跳过预整形（prewarm_shapes == 0，只留登记簿）；滚动到新带或
+/// 内容变化立即复位并恢复。滚动活跃期的「穿越接近缓存命中」见
+/// `prewarm_band_makes_band_cross_near_cache_hit`（那里用带顶微移模拟活跃滚动）。
+#[gpui::test]
+fn prewarm_idle_gate_stops_after_idle_frames(cx: &mut TestAppContext) {
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!("paragraph number {i} with words here\n"));
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let q = 512.;
+        let width = px(900.);
+        ed.update(cx, |e, _| e.set_caret(text.len()));
+
+        // 建立方向并快滚 3 档（预算放大），登记门控签名。
+        let f0 = build_frame(ed.read(cx), window, width, (0., q));
+        prewarm_band(ed.read(cx), &f0, window, 0.); // 首帧仅登记带序号
+        let f1 = build_frame(ed.read(cx), window, width, (3. * q, 4. * q));
+        ed.read(cx).take_reshapes();
+        prewarm_band(ed.read(cx), &f1, window, 3. * q); // 变化帧：放行并复位门控
+        assert!(
+            ed.read(cx).take_prewarm_shapes() > 0,
+            "滚动变化帧应预整形"
+        );
+
+        // 同一 f1 继续：第 1 个无变化帧仍跑（沉降余量），第 2 个起跳过（idle 计满）。
+        prewarm_band(ed.read(cx), &f1, window, 3. * q);
+        assert!(
+            (1..=3).contains(&ed.read(cx).take_prewarm_shapes()),
+            "1 个无变化帧应仍按基础预算（3 块）预整形"
+        );
+        for _ in 0..3 {
+            prewarm_band(ed.read(cx), &f1, window, 3. * q);
+        }
+        assert_eq!(
+            ed.read(cx).take_prewarm_shapes(),
+            0,
+            "连续无变化帧达到阈值后应完全跳过预整形"
+        );
+
+        // 滚动恢复：换到新带 → 立即恢复预整形。
+        let f2 = build_frame(ed.read(cx), window, width, (4. * q, 5. * q));
+        ed.read(cx).take_reshapes();
+        prewarm_band(ed.read(cx), &f2, window, 4. * q);
+        assert!(
+            ed.read(cx).take_prewarm_shapes() > 0,
+            "带变（滚动意图）应立即恢复预整形"
+        );
+
+        // 内容变化（文内插字、非结构编辑）→ 内容代变，复位门控并恢复预整形。
+        let at = ed.read(cx).content().find("paragraph number 40").unwrap() + 5;
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "x", ecx));
+        let f3 = build_frame(ed.read(cx), window, width, (4. * q, 5. * q));
+        ed.read(cx).take_reshapes();
+        prewarm_band(ed.read(cx), &f3, window, 4. * q);
+        assert!(
+            ed.read(cx).take_prewarm_shapes() > 0,
+            "内容变化应复位门控并恢复预整形"
+        );
     });
 }
 

@@ -1070,8 +1070,10 @@ impl Element for WyEditorElement {
             link_grips = Self::link_hit_grips(f, col_origin, window);
         }
         // D1：滚动预热——带穿越前把下一量子带块提前 shape 进缓存（预算内摊平突发）。
+        // 传**未量程化**滚动 `top`（静置门签名追真实滚动；frame.band 是 512px 量子栅格，
+        // 带内微滚不动带，签名只看 band 会把慢速滚动误判为静置，见 `PrewarmSig`）。
         if let Some(f) = frame.as_ref() {
-            prewarm_band(self.editor.read(cx), f, window);
+            prewarm_band(self.editor.read(cx), f, window, top);
         }
         // 图片调整条（右中边缘）hitbox：可编辑模式对所有可见图片行登记。作用有二：
         // (a) 指针进/出该区时 `dispatch_mouse_event` 的 hit_test 变化 → 触发光标刷新；

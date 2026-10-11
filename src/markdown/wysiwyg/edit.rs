@@ -546,10 +546,13 @@ impl WyEditor {
             self.notdef_retry.borrow_mut().retain_prefix(prefix_keep);
             // 结构编辑清空整形缓存 → 预热进度全部作废：归零方向/偏差/带序号，
             // 下一帧由带序号跨界重新判定方向（否则拿旧 dir 在空区间空转）。
+            // 静置门控签名一并复位（内容已变，下一 prewarm 帧按「变化帧」放行）。
             let mut pw = self.prewarm.borrow_mut();
             pw.dir = 0;
             pw.bias = 0;
             pw.last_band_idx = None;
+            pw.idle = 0;
+            pw.sig = None;
         } else {
             // 非结构性：块下标稳定，记受影响的编辑行块。
             let blk = self.doc.block_index_for_line(edit_line);
