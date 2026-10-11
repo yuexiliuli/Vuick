@@ -175,9 +175,8 @@ fn small_doc_scrollbar_follows_list_summary_when_taller_than_estimate(
     ls.reset_with_uniform_height(n, px(hint * 1.5));
 
     // 与 `vertical_scrollbar` 完全同构地构造句柄（content_height 仍传估算以复刻旧缺陷）。
-    let handle = PreviewVerticalScrollHandle {
+    let handle = PreviewScrollHandle {
         list: ls.clone(),
-        content_width: 300.0,
         content_height: n as f32 * hint,
         est_hint: hint,
         n,
@@ -245,9 +244,8 @@ fn small_doc_scrollbar_thumb_tracks_drag_linearly(cx: &mut TestAppContext) {
         (m.item_count(), m.est_hint, m.test_list_state(), m.list_state.viewport_bounds())
     });
     assert!(n > 0 && hint > 0.0, "小文档应就绪（n={n} hint={hint:.1}）");
-    let handle = PreviewVerticalScrollHandle {
+    let handle = PreviewScrollHandle {
         list: ls.clone(),
-        content_width: 300.0,
         content_height: n as f32 * hint,
         est_hint: hint,
         n,
@@ -321,9 +319,8 @@ fn small_doc_total_h_follows_list_and_page_reaches_end(cx: &mut TestAppContext) 
     );
 
     // ② 拖到底（与滚动条同一[底]：start_drag 冻结 → thumb 到底）→ 页码 = 第 N/N 页。
-    let handle = PreviewVerticalScrollHandle {
+    let handle = PreviewScrollHandle {
         list: ls.clone(),
-        content_width: 300.0,
         content_height: estimate,
         est_hint: hint,
         n,
@@ -775,4 +772,5 @@ fn windowed_code_highlight_defers_big_jump_then_converges(cx: &mut TestAppContex
         "延后补色应收敛：仍缺 {missing} 个带语言块、队列挂起 {pending:?}"
     );
 }
+
 

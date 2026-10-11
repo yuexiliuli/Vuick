@@ -75,7 +75,7 @@ pub(crate) fn find_text_range(text: &str, needle: &str) -> Option<Range<usize>> 
 #[allow(unused_imports)]
 use gateway::{
     adaptive_overdraw, preview_backend, preview_text_avail, set_preview_backend, CodeHlCache,
-    HEIGHT_EXACT_SHAPE_MAX, PreviewBackend, PreviewVerticalScrollHandle,
+    HEIGHT_EXACT_SHAPE_MAX, PreviewBackend, PreviewScrollHandle,
 };
 #[cfg(test)]
 #[allow(unused_imports)]

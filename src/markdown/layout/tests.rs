@@ -8,7 +8,8 @@ use gpui::{App, AppContext, Pixels, SharedString, TestAppContext, Window, Window
 use crate::config::markdown::CONTENT_EDGE_PAD_X_PX;
 use crate::markdown::doc::{Doc, DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::layout::{Shard, shape_docrow_shard};
+use crate::markdown::layout::{Shard, shape_docrow_shard, shape_docrow_shard_with_image};
+use crate::markdown::parse::TableAlign;
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::wysiwyg::{Frame, WyEditor, WyTheme, build_frame};
 
@@ -153,6 +154,124 @@ fn heading_code_table_all_produce_sane_shards(cx: &mut TestAppContext) {
     let t = shape_docrow_shard(&ts, &table, &theme, 400., 400.);
     assert_shard_sane(&t, "表格");
     assert_eq!(t.len(), 1, "表格为单片");
+}
+
+/// P3-1c-2：表格 shard 必须携带**真实网格绘制几何**（[`crate::markdown::layout::ShardTable`]）
+/// ——列宽按字形实测 + 20 / 下限 48（与 WYSIWYG `shape_table_row` 同式）、单元格高 =
+/// `para_line + 12`、表头/数据/对齐；`shard.h` 仍 = 网格高 + 底部滚动条预留带
+/// （量程与渲染同源，R2；`parity_*` 的对拍保持）。
+#[gpui::test]
+fn table_shard_carries_grid_geometry(cx: &mut TestAppContext) {
+    let ts = WindowTextSystem::new(cx.text_system().clone());
+    let theme = cx.update(|cx| theme_from_font(cx, gpui::Font::default(), 14.));
+    let table = DocRow {
+        kind: IrKind::Table,
+        src_line: 0,
+        lines: 0..3,
+        text: SharedString::default(),
+        runs: vec![],
+        byte_map: vec![],
+        payload: DocPayload::Table(crate::markdown::parse::TableData {
+            header: vec!["a".into(), "很长的一列标题".into()],
+            rows: vec![vec!["b".into(), "x".into()], vec!["c".into(), "y".into()]],
+            aligns: vec![TableAlign::Left, TableAlign::Right],
+        }),
+        table_rows: None,
+    };
+    let shards = shape_docrow_shard(&ts, &table, &theme, 400., 400.);
+    assert_shard_sane(&shards, "表格网格");
+    let geo = shards[0]
+        .table
+        .as_ref()
+        .expect("表格 shard 应携带网格几何（P3-1c-2 切 shard 承载）");
+    assert_eq!(geo.header.len(), 2, "表头应随几何携带");
+    assert_eq!(geo.rows.len(), 2, "数据行应随几何携带");
+    assert!(
+        geo.widths.iter().all(|w| *w >= 48.0),
+        "列宽下限 48：{geo:?}"
+    );
+    assert!(
+        (geo.total_w - geo.widths.iter().sum::<f32>()).abs() < 0.01,
+        "total_w 应 = Σ widths"
+    );
+    assert!(
+        geo.widths[1] > geo.widths[0],
+        "长文本列应明显宽于短列（字形实测 + 20）：{:?}",
+        geo.widths
+    );
+    let expect_row_h = f32::from(theme.para_line()) + 12.;
+    assert!(
+        (geo.row_h - expect_row_h).abs() < 0.01,
+        "单元格高应 = para_line + 12：{} vs {}",
+        geo.row_h,
+        expect_row_h
+    );
+    assert_eq!(geo.aligns[0], TableAlign::Left, "对齐应补齐为 Left");
+    assert_eq!(geo.aligns[1], TableAlign::Right, "对齐应随原表保留");
+    // 高度公式保持：网格高 + 底部滚动条预留带（与 `parity_*` 对拍的 WYSIWYG 同式）。
+    let n = geo.rows.len() as f32;
+    let expect_h = (1. + n) * geo.row_h
+        + n
+        + 2.
+        + crate::config::markdown::TABLE_SCROLLBAR_RESERVE_PX;
+    assert!(
+        (shards[0].h - expect_h).abs() < 0.01,
+        "表格 shard 高应 = 网格高 + 预留带：{} vs {}",
+        shards[0].h,
+        expect_h
+    );
+}
+
+/// P3-1c-2：图片 shard 必须携带**真实盒几何**（[`crate::markdown::layout::ShardImage`]）；
+/// 给固尺寸后盒高按 `box_w * ih / iw` 等比换算、随可用宽缩放；不给尺寸用占位高
+/// （与现状一致；量程与渲染同源，R2）。
+#[gpui::test]
+fn image_shard_box_height_follows_aspect(cx: &mut TestAppContext) {
+    let ts = WindowTextSystem::new(cx.text_system().clone());
+    let theme = cx.update(|cx| theme_from_font(cx, gpui::Font::default(), 14.));
+    let img = DocRow {
+        kind: IrKind::Image,
+        src_line: 0,
+        lines: 0..1,
+        text: "题注文字".into(),
+        runs: vec![],
+        byte_map: vec![],
+        payload: DocPayload::Image {
+            src: "img/a.png".into(),
+        },
+        table_rows: None,
+    };
+    // 无固尺寸 → 占位盒高（`IMAGE_ROW_DEFAULT_H`）。
+    let ph = shape_docrow_shard(&ts, &img, &theme, 400., 400.);
+    assert_shard_sane(&ph, "图片占位");
+    let geo0 = ph[0].image.as_ref().expect("图片 shard 应携带盒几何");
+    assert_eq!(geo0.box_w, 400f32.min(crate::config::markdown::IMAGE_MAX_W), "盒宽 = min(avail, IMAGE_MAX_W)");
+    assert_eq!(geo0.box_h, crate::config::markdown::IMAGE_ROW_DEFAULT_H, "无尺寸用占位高");
+    assert_eq!(geo0.src.as_ref(), "img/a.png", "盒几何应携带源");
+
+    // 给固尺寸（宽 2 高 1）→ 盒高 = box_w × 0.5（等比换算）。
+    let sized = shape_docrow_shard_with_image(&ts, &img, &theme, 400., 400., Some((2, 1)));
+    let geo1 = sized[0].image.as_ref().expect("尺寸版应仍携带盒几何");
+    assert!(
+        (geo1.box_h - geo1.box_w * 0.5).abs() < 0.01,
+        "盒高按固尺寸比例换算：{:?}",
+        geo1
+    );
+    // 窄 avail → 盒宽/高随宽同比缩小（随宽缩放，量程跟随）。
+    let narrow = shape_docrow_shard_with_image(&ts, &img, &theme, 100., 100., Some((2, 1)));
+    let geo2 = narrow[0].image.as_ref().expect("窄宽应仍携带盒几何");
+    assert!((geo2.box_w - 100.).abs() < 0.01, "盒宽随 avail 缩小：{}", geo2.box_w);
+    assert!((geo2.box_h - 50.).abs() < 0.01, "盒高随宽同比：{}", geo2.box_h);
+    // 总高 = 盒高 + 题注间隙 + 题注折行高（与 `shape_image_row` 同式）。
+    let cap_lh = f32::from(theme.para_line());
+    let expect_total = geo2.box_h
+        + crate::config::markdown::IMAGE_CAPTION_GAP_PX
+        + cap_lh;
+    let total: f32 = narrow.iter().map(|s| s.h).sum();
+    assert!(
+        (total - expect_total).abs() < 1.0,
+        "图片块总高 = 盒高 + 题注间隙 + 题注高：{total:.1} vs {expect_total:.1}"
+    );
 }
 
 /// 真实窗口 + `WyEditor`：主题取自 `window.text_style()`（与 `WyEditor::new` 同一口径）。

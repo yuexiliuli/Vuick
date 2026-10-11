@@ -16,7 +16,7 @@
 //! .viewport_from_layout()`；容器内作为唯一子元素铺满视口（`request_layout` 填满父级）。
 //!
 //! # 自定义句柄
-//! 编辑器/预览的「确定性量程」句柄（`VerticalScrollHandle`/`PreviewVerticalScrollHandle`）
+//! 编辑器/预览的「确定性量程」句柄（`VerticalScrollHandle`/`PreviewScrollHandle`）
 //! 只需把 `impl gpui_component::scroll::ScrollbarHandle` 换成 `impl crate::ui::scrollbar::
 //! ScrollbarHandle`——契约方法完全相同。也内置了对 `gpui::ScrollHandle` / `ListState` 的实现。
 //!

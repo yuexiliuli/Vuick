@@ -9,7 +9,7 @@
 //!   （`render`/`build_list_content`/`render_core`）、搜索高亮、点选/复制交互、
 //!   目录与「双向滚动」接口（`scroll_to_row`/`scroll_to_line`/`row_for_line`/
 //!   `toc_entries`）、内存/诊断探针、`release`；
-//! - `PreviewVerticalScrollHandle`：纵向滚动条确定性量程句柄。
+//! - `PreviewScrollHandle`：纵向滚动条确定性量程句柄。
 //!
 //! EPUB 阅读增强（注记悬浮/引文导航/页码）在 `super::epub`，通过 `pub(super)`
 //! 访问宿主私有字段与方法（P3-1c-2 起可收窄）。
@@ -38,7 +38,7 @@ use crate::config::timing::HIGHLIGHT_MS;
 use crate::editor::rope_ext::RopeExt;
 use crate::markdown::doc::{assemble_docrow_window, DocLineView, DocPayload};
 use crate::markdown::ir::IrKind;
-use crate::markdown::layout::{docrow_for_height, shape_docrow_shard};
+use crate::markdown::layout::{docrow_for_height, shape_docrow_shard_with_image};
 use crate::markdown::parse::{
     build_line_starts_u32, parse_block_window, parse_block_window_rope, parse_to_rows, scan_blocks,
     BlockIndex, CitationIndex, Row, RowKind, RowPayload, RunKind, Toc,
@@ -47,7 +47,7 @@ use crate::markdown::wysiwyg::WyTheme;
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 use crate::ui::scrollbar::{Scrollbar, ScrollbarHandle, ScrollbarMode};
 use super::dimensions::{image_dimensions, image_dimensions_bytes};
-use super::row::{render_row_shard, PreviewRow, RowRenderCtx};
+use super::row::{preview_row_img_size, render_row_shard, PreviewRow, RowRenderCtx};
 use super::style::StyleParams;
 
 /// 最近一帧某个可见文本行的字形命中数据：供「鼠标点选字符」反查。
@@ -145,6 +145,15 @@ impl CodeHlCache {
 pub(crate) fn adaptive_overdraw(visible_blocks: usize) -> usize {
     let adaptive = (visible_blocks as f32 * WINDOWED_OVERDRAW_FACTOR) as usize;
     adaptive.clamp(WINDOWED_OVERDRAW_BLOCKS, WINDOWED_OVERDRAW_MAX)
+}
+
+/// 解析图片行携带的固尺寸 `(w, h)`（同时有效且 > 0 才返回）——喂
+/// `shape_docrow_shard_with_image` 让图片盒高按真实比例换算（量程与渲染同源，R2）。
+fn row_img_intrinsic(i: crate::markdown::parse::ImageInfo<'_>) -> Option<(u32, u32)> {
+    match (i.img_w, i.img_h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
 }
 
 /// 固定窗口虚拟化（预览窗口模式）：ListState 恒持这么多条目（O(1)，与块数无关）。
@@ -284,14 +293,16 @@ impl DocLineView for PreviewLineView<'_> {
 }
 
 // ===== M5-B5 P3-1b-2：预览后端开关（legacy|unified）=====
-// **P3-1b-2 起默认翻转 unified（量程/渲染单一 shard 真源）**：
+// **P3-1b-2 起默认翻转 unified（量程/渲染单一 shard 真源）；P3-1c-2 表格/图片内容
+// 切共享 shard（旧 `render_table_row`/`render_image_row` 已删）**：
 //   - 默认（生产线程未 set）= `Unified`：量程逐块喂真实 `DocRow` 给
 //     `shape_docrow_shard`（≤ `HEIGHT_EXACT_SHAPE_MAX` 块全量精确 == Σ 真实 DocRow
 //     shard 总高（R1），超出走抽样窗口、抽中块取真实 shard 高）；渲染几何同源
-//     `shape_docrow_shard`（文本/代码走 `render_row_shard`/`ShardStrip`，表格/图片沿
-//     旧 `render_table_row`/`render_image_row` 内容路径，P3-1c 再收）。
+//     `shape_docrow_shard`（文本/代码走 `render_row_shard`/`ShardStrip`；表格/图片
+//     P3-1c-2 起由 shard 的 `ShardTable`/`ShardImage` 几何直接绘制，图片高喂真实
+//     固尺寸 → 量程与渲染同源，R2）。
 //   - `PreviewBackend::Legacy`/`set_preview_backend(Legacy)` 保留为 **API 面**（供
-//     EPUB/表格图片旧路径与运行期诊断显式切换），但 P3-1b-2 已删 legacy 元素树/抽样
+//     EPUB/运行期诊断显式切换），但 P3-1b-2 已删 legacy 元素树/抽样
 //     估算轨 → 切 legacy 与 unified 收敛到同一 shard 实现（行为一致），EPUB 阅读
 //     能力（注记卡/引文/页码/内存图）在 unified 下原样保留。
 // 状态用 **线程本地**：生产线程默认 unified（未 set 即 1，零侵入）；`#[gpui::test]`
@@ -1222,8 +1233,8 @@ impl MarkdownPreview {
     /// 用预览同款 `parse_block_window(_rope)` 物化（与窗口渲染完全同源），再经
     /// [`docrow_for_height`] 适配成 `DocRow` 喂 `shape_docrow_shard`——高度与
     /// `Doc::rows_in_block_window` 的真实 DocRow 逐位一致（parity 测试钉死）。
-    /// `resolve_image_rows` 无需调用：`shape_image_shards` 只看 alt 文本与占位高，
-    /// 不依赖 img 固有尺寸。
+    /// P3-1c-2：图片行先 `resolve_image_rows` 解析固尺寸再喂（量程与渲染同源，R2——
+    /// 盒高按真实比例换算，不再恒用占位高）。
     fn exact_block_heights(
         &self,
         idx: &BlockIndex,
@@ -1239,14 +1250,17 @@ impl MarkdownPreview {
             return Vec::new();
         };
         debug_assert!(lo <= hi && hi < idx.blocks.len(), "exact 窗口越界 lo={lo} hi={hi}");
-        let rows = match src {
+        let mut rows = match src {
             PreviewSrc::Str(s) => parse_block_window(s, idx, lo, hi),
             PreviewSrc::Rope(r) => parse_block_window_rope(r, idx, lo, hi),
         };
+        // 图片量程与渲染同源：与 `window_preview_rows` 走同一固尺寸解析路径。
+        self.resolve_image_rows(&mut rows);
         rows.iter()
             .map(|r| {
                 let dr = docrow_for_height(r);
-                shape_docrow_shard(ts, &dr, theme, avail, width)
+                let img = r.image().and_then(row_img_intrinsic);
+                shape_docrow_shard_with_image(ts, &dr, theme, avail, width, img)
                     .iter()
                     .map(|s| s.h)
                     .sum::<f32>()
@@ -1753,10 +1767,17 @@ impl MarkdownPreview {
             .rows
             .iter()
             .map(|r| {
-                shape_docrow_shard(ts, &r.docrow, theme, avail, width)
-                    .iter()
-                    .map(|s| s.h)
-                    .sum::<f32>()
+                shape_docrow_shard_with_image(
+                    ts,
+                    &r.docrow,
+                    theme,
+                    avail,
+                    width,
+                    preview_row_img_size(r),
+                )
+                .iter()
+                .map(|s| s.h)
+                .sum::<f32>()
             })
             .sum();
         total / self.rows.len() as f32
@@ -2093,9 +2114,11 @@ impl MarkdownPreview {
         let n = self.item_count();
         let eh = self.est_hint.max(0.0);
         let windowed = self.index.is_some();
-        let v = PreviewVerticalScrollHandle {
+        let v = PreviewScrollHandle {
             list: list_state.clone(),
-            content_width: 0.0,
+            // 小文档的 `n×est_hint` 仅作「拖前坍缩检」的期望全篇高参照（量程本体在
+            // `content_size()` 里跟随 ListState 实测 + 视口，确定性真值）；窗口模式 =
+            // shard 块高模型总高（确定性真值）。
             content_height: if windowed { self.total_h() } else { n as f32 * eh },
             est_hint: eh,
             n,
@@ -2145,8 +2168,8 @@ impl Render for MarkdownPreview {
         self.height_exact_ctx = Some((window.text_system().clone(), theme));
         self.prepare_render(&p, pane_w, cx);
         // 渲染上下文：渲染闭包吃同一 `shape_docrow_shard`（与量程同 avail，R2）——
-        // `build_list_content` 据此输出 shard 几何（文本/代码 `render_row_shard`，
-        // 表格/图片沿旧内容路径 `render_table_row`/`render_image_row`）。
+        // `build_list_content` 据此输出 shard 几何（文本/代码 `render_row_shard`；
+        // 表格/图片 P3-1c-2 起也由 shard 几何绘制，旧内容路径已删）。
         let shard_ctx = self
             .height_exact_ctx
             .as_ref()
@@ -2216,7 +2239,7 @@ impl Render for MarkdownPreview {
 impl MarkdownPreview {
     /// 行数据源 List（窗口/全量两路）内容元素：按绝对块下标取行数据 → 搜索/选区/跳转
     /// 加亮定位 → 交 `render_row_shard`（统一 shard 几何；P3-1b-2 已删 legacy `render_row`/
-    /// `TextTrack` 元素树路径——表格/图片由 `render_row_shard` 内部沿旧内容路径）。
+    /// `TextTrack` 元素树路径，P3-1c-2 表格/图片也由 shard 几何绘制——旧内容路径已删）。
     /// 行源只读快照在构造闭包前取好（元素构造期不改 `self`）。
     fn build_list_content(
         &mut self,
@@ -2302,7 +2325,7 @@ impl MarkdownPreview {
                 row_ix: abs,
             };
             // P3-1b-2 起单一渲染入口：渲染几何切共享 `shape_docrow_shard`（与量程同真源，
-            // R2）；表格/图片由 `render_row_shard` 内部沿旧内容路径。
+            // R2）；P3-1c-2 表格/图片也由 shard 几何绘制（旧内容路径已删）。
             let (ts, theme, avail, max_w) = &shard_ctx;
             render_row_shard(row, &rctx, cx, ts.as_ref(), theme, *avail, *max_w)
         })
@@ -2390,18 +2413,27 @@ impl MarkdownPreview {
     }
 }
 
-/// 预览纵向滚动条的「确定性量程」句柄（与编辑器 `VerticalScrollHandle` 同法）。
-/// - **窗口模式**：量程 = 抽样块高模型总高（`content_height`，与窗口大小无关），
+/// 预览纵向滚动条的「确定性量程」句柄（P3-1c-2 收口形态，取代旧
+/// `PreviewVerticalScrollHandle`；轴/量程与编辑器 `VerticalScrollHandle` 同法）。
+/// - **窗口模式**：量程 = shard 块高模型总高（`content_height`，与窗口大小无关），
 ///   拖拽只写共享 `desired`（px，render 逐帧 `apply_desired` 落窗口重定位）——
 ///   确定性、无坍缩、拖到底必到全文末尾。
-/// - **小文档**：量程跟随 `list` 自身（实时/冻结 summary + 视口），与 gpui 内置
-///   ListState 滚动条同口径；拖拽前若检测到真坍缩，先 O(n) 统一重铺再冻结（原路径）。
+/// - **小文档**：量程跟随 `list` 自身（实时/冻结 summary + 视口，`content_size()`
+///   同 gpui 内置 ListState 滚动条口径）；拖拽前若检测到真坍缩，先 O(n) 统一重铺
+///   再冻结（`content_height = n×est_hint` 仅作坍缩检的期望全篇高参照）。
+/// - 两模式 `offset()` 都读共享 `desired`（px）：thumb 与拖拽目标 1:1 线性，绝不因
+///   标签逐帧重测量而滑开（drag 期列表重度量 → px 漂移的既有缺陷）。
+///
+/// 保留自定义句柄（而非改喂宿主 `ScrollHandle` / `ListState` 内置句柄）的**理由**：
+/// 预览的纵向滚动是**自持 px 模型驱动**（非真实 scroll 容器）——`ScrollHandle` 需要
+/// `track_scroll` 的真实可滚元素才会报告 max_offset/offset，预览没有；`ListState`
+/// 内置句柄的 `offset()` 读实测树，drag 期列表重度量会让 thumb 从抓点滑开。故量程
+/// 确定性 + thumb 线性都必须经本句柄把 `total_h()`（确定性）与 `desired` 接起来。
 ///
 /// 滚轮滚动由容器级处理器驱动（窗口模式），与本滚动条无关。
 #[derive(Clone)]
-pub(crate) struct PreviewVerticalScrollHandle {
+pub(crate) struct PreviewScrollHandle {
     pub(super) list: ListState,
-    pub(super) content_width: f32,
     pub(super) content_height: f32,
     pub(super) est_hint: f32,
     pub(super) n: usize,
@@ -2409,22 +2441,18 @@ pub(crate) struct PreviewVerticalScrollHandle {
     pub(super) desired: std::rc::Rc<Cell<f32>>,
 }
 
-impl ScrollbarHandle for PreviewVerticalScrollHandle {
+impl ScrollbarHandle for PreviewScrollHandle {
     fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
         self.list.viewport_bounds()
     }
 
     fn offset(&self) -> gpui::Point<gpui::Pixels> {
-        if self.windowed {
-            // 用「用户目标」而非固定窗口的实际位置：窗口只是渲染切片，量程是全文的。
-            point(px(0.), px(-self.desired.get()))
-        } else {
-            // 小文档同样经共享 `desired`（px）表达 thumb —— **不读 ListState 实测树**：
-            // 拖拽中标签会逐帧重测量（真实行高替换统一提示）→ 同一逻辑位置映射的 px
-            // 逐帧漂移 → thumb 从抓点滑开、显得「不跟鼠标」。用 desired 作轴则 thumb
-            // 恒 1:1，内容由 prepare 每帧按 desired 落位（见 prepare_render）。
-            point(px(0.), px(-self.desired.get()))
-        }
+        // 用「用户目标」而非固定窗口的实际位置：窗口只是渲染切片，量程是全文的。
+        // 小文档同样经共享 `desired`（px）表达 thumb —— **不读 ListState 实测树**：
+        // 拖拽中标签会逐帧重测量（真实行高替换统一提示）→ 同一逻辑位置映射的 px
+        // 逐帧漂移 → thumb 从抓点滑开、显得「不跟鼠标」。用 desired 作轴则 thumb
+        // 恒 1:1，内容由 prepare 每帧按 desired 落位（见 prepare_render）。
+        point(px(0.), px(-self.desired.get()))
     }
 
     fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
@@ -2445,8 +2473,8 @@ impl ScrollbarHandle for PreviewVerticalScrollHandle {
 
     fn content_size(&self) -> gpui::Size<gpui::Pixels> {
         if self.windowed {
-            // 窗口模式：量程 = 抽样块高模型总高（确定性，与列表测量无关）。
-            gpui::size(px(self.content_width), px(self.content_height))
+            // 窗口模式：量程 = shard 块高模型总高（确定性，与列表测量无关）。
+            gpui::size(px(0.), px(self.content_height))
         } else {
             // 小文档：量程**跟随 ListState 自身**（实时总高 / 拖拽时被冻结的
             // `scrollbar_drag_start_height` + 视口），与 gpui 内置

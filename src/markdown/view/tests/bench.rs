@@ -260,9 +260,8 @@ fn bench_preview_scrollbar_drag_step_cost(cx: &mut TestAppContext) {
             md.update(cx, |md, _cx| {
                 let list = md.list_state.clone();
                 let view = list.viewport_bounds();
-                let handle = PreviewVerticalScrollHandle {
+                let handle = PreviewScrollHandle {
                     list,
-                    content_width: 0.0,
                     content_height: md.total_h(),
                     est_hint: md.est_hint,
                     n: md.item_count(),
@@ -330,9 +329,8 @@ fn bench_preview_scrollbar_drag_step_cost(cx: &mut TestAppContext) {
                 md.update(cx, |md, _cx| {
                     let list = md.list_state.clone();
                     let view = list.viewport_bounds();
-                    let handle = PreviewVerticalScrollHandle {
+                    let handle = PreviewScrollHandle {
                         list,
-                        content_width: 0.0,
                         content_height: md.total_h(),
                         est_hint: md.est_hint,
                         n: md.item_count(),
@@ -499,4 +497,5 @@ fn bench_preview_scrollbar_drag_step_cost(cx: &mut TestAppContext) {
         eprintln!("[drag-bench] skip windowed: 缺 {path}");
     }
 }
+
 

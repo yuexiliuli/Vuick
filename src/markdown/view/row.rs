@@ -15,14 +15,14 @@ use gpui::{
 use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use crate::config::markdown::{
-    CONTENT_EDGE_PAD_X_PX, IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, TABLE_SCROLLBAR_RESERVE_PX,
+    CONTENT_EDGE_PAD_X_PX, IMAGE_MAX_W, TABLE_SCROLLBAR_RESERVE_PX,
 };
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::layout::{shape_docrow_shard, Shard};
+use crate::markdown::layout::{shape_docrow_shard, shape_docrow_shard_with_image, Shard};
 use crate::markdown::parse::{Row, RowAlign, RunKind};
 use crate::markdown::view::style::StyleParams;
-use crate::markdown::view::table::render_table;
+use crate::markdown::view::table::render_table_geometry;
 use crate::markdown::wysiwyg::WyTheme;
 use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
 
@@ -93,14 +93,6 @@ impl PreviewRow {
     pub(crate) fn code_language(&self) -> Option<&str> {
         match &self.docrow.payload {
             DocPayload::Code { language, .. } => language.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// 表格结构（仅 [`IrKind::Table`] 行）——从 [`DocPayload::Table`] 取。
-    pub(crate) fn table(&self) -> Option<&crate::markdown::parse::TableData> {
-        match &self.docrow.payload {
-            DocPayload::Table(t) => Some(t),
             _ => None,
         }
     }
@@ -307,8 +299,9 @@ pub(crate) use crate::util::char_align_range;
 //
 // **P3-1b-2 已删 legacy 元素树/`TextTrack`/`render_row` 旧路径**：文本/代码/空行/
 // 分隔线一律 `render_text_shard_rows`/`render_code_shard_rows`（`ShardStrip` 分片级
-// 命中/注记/行内代码底）；表格/图片仍沿旧内容路径（`render_table_row`/`render_image_row`，
-// P3-1c 再收）。
+// 命中/注记/行内代码底）；**P3-1c-2 表格/图片也切 shard 承载内容**——旧
+// `render_table_row`/`render_image_row` 已删，改由 shard 的 `ShardTable`/`ShardImage`
+// 几何直接绘制（列宽/单元格/盒高等与量程同源，R2）。
 // =============================================================================
 
 /// 把注记标记的窗口矩形写入共享命中表（[`ShardStrip`] 分片级登记）。
@@ -618,9 +611,11 @@ fn code_block_element(
 ///   `h/x_off/lh/runs/code_ranges` 落一个 strip（折行点、行高、代码圆角底、空白/分隔
 ///   行高全部与 shard 一致——渲染与量程同真源，R2 落地）。
 /// - 代码：每个源码行 = 一个 shard（nowrap），首/末空白带 + 块高 `Σ shard.h`。
-/// - **表格/图片保留元素树内容路径**：`layout` 的 `table_shard`/`image_shards` 只是**高度
-///   占位**（table 无单元格内容、image 只有占位盒 + 题注），无可渲染内容 → 沿旧
-///   `render_table_row`/`render_image_row`（P3-1c 再切 shard 承载表/图内容）。
+/// - **表格/图片（P3-1c-2 起切 shard 承载内容）**：`shape_table_shard` 的
+///   [`ShardTable`] / `shape_image_shards` 的 [`ShardImage`] 携带真实绘制几何
+///   （列宽/单元格高/表头数据 / 盒宽/盒高/源）——[`render_table_shard_row`] /
+///   [`render_image_shard_row`] 直接按 shard 几何画，旧 `render_table_row` /
+///   `render_image_row` 内容路径已删（量程与渲染同源，R2）。
 /// - `align`（EPUB `%%ALIGN:X%%` 排版）由 `render_text_shard_rows` 应用（P3-1b-2 起
 ///   unified 默认也保留对齐语义）。
 #[allow(clippy::too_many_arguments)] // 统一入口：行渲染上下文 + 共享整形上下文
@@ -634,11 +629,21 @@ pub(crate) fn render_row_shard(
     max_w: f32,
 ) -> gpui::AnyElement {
     let RowRenderCtx { p, table_handle, .. } = ctx;
+    // 表格/图片：内容在 shard 几何里（P3-1c-2 收口），图片高度喂真实固尺寸使量程同源。
     if let IrKind::Table = row.kind() {
-        return render_table_row(row, p, table_handle.clone());
+        let shards = shape_docrow_shard_with_image(ts, &row.docrow, theme, avail, max_w, None);
+        return render_table_shard_row(ctx, &shards, table_handle.clone());
     }
     if let IrKind::Image = row.kind() {
-        return render_image_row(row, p);
+        let shards = shape_docrow_shard_with_image(
+            ts,
+            &row.docrow,
+            theme,
+            avail,
+            max_w,
+            preview_row_img_size(row),
+        );
+        return render_image_shard_row(row, p, &shards);
     }
     let shards = shape_docrow_shard(ts, &row.docrow, theme, avail, max_w);
     if let IrKind::Code = row.kind() {
@@ -954,16 +959,18 @@ pub(crate) struct RowRenderCtx<'a> {
 
 /** 表格行（GFM pipe table 整体折叠成一渲染行）。
 /// 页面恒换行下表格**始终**自带横向滚动容器 + Always 滚动条：超宽表格在块内横向滚动，
-/// 不再被视口裁剪遮挡（对齐代码块方案）。 */
-fn render_table_row(
-    row: &PreviewRow,
-    p: &Rc<StyleParams>,
+/// 不再被视口裁剪遮挡（对齐代码块方案）。
+/// P3-1c-2：网格按 `shape_table_shard` 的 [`ShardTable`] 几何绘制（`md-table`），
+/// 列宽/单元格高/表头数据与量程同源（R2）。 */
+fn render_table_shard_row(
+    ctx: &RowRenderCtx,
+    shards: &[Shard],
     table_handle: Option<ScrollHandle>,
 ) -> gpui::AnyElement {
-    let t = row.table();
-    // Table 行恒有结构；防御：异常（结构缺失）时渲染空占位，渲染不 panic、不错位。
-    debug_assert!(t.is_some(), "Table 行必须携带表格结构");
-    let Some(table) = t else {
+    let p = ctx.p;
+    // Table shard 单片恒携带网格几何（`shape_table_shard` 保证）；防御：异常时空占位。
+    let Some(geo) = shards.first().and_then(|s| s.table.as_ref()) else {
+        debug_assert!(false, "Table shard 必须携带网格几何");
         return div()
             .w_full()
             .flex_shrink_0()
@@ -981,7 +988,7 @@ fn render_table_row(
         .child(
             div()
                 .debug_selector(|| "md-table-hscroll".into())
-                // 自然高度 = 表格自身高度 + 底部滚动条预留条；不强制高度，
+                // 自然高度 = 网格高 + 底部滚动条预留条（shard.h 同式）；不强制高度，
                 // 避免表格边框导致估算偏差、末行被 overflow_hidden 裁剪。
                 .w_full()
                 .relative()
@@ -998,7 +1005,7 @@ fn render_table_row(
                         .track_scroll(&h)
                         // 底部预留滚动条轨道高度，横向滚动条不遮挡表格内容
                         .pb(px(TABLE_SCROLLBAR_RESERVE_PX))
-                        .child(render_table(table, p)),
+                        .child(render_table_geometry(geo, p)),
                 )
                 .child(
                     div()
@@ -1015,12 +1022,31 @@ fn render_table_row(
         .into_any_element()
 }
 
-
-/** 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。 */
-fn render_image_row(row: &PreviewRow, p: &Rc<StyleParams>) -> gpui::AnyElement {
+/** 独立图片行：按 shard 的 [`ShardImage`] 盒几何显示（固尺寸等比 → 高度随可用宽
+/// 自适应，缩小窗口不出现大片留白）；未加载/无尺寸用占位高（与现状一致）。
+/// P3-1c-2：盒几何来自 `shape_image_shards`（量程同源），图片源/内存图仍走
+/// `PreviewRow` 展示附加。 */
+fn render_image_shard_row(
+    row: &PreviewRow,
+    p: &Rc<StyleParams>,
+    shards: &[Shard],
+) -> gpui::AnyElement {
     let src = row.image_src().to_string();
     let alt = row.docrow.text.clone();
     let fallback_color = p.muted_fg;
+    // Image shard 首片恒携带盒几何（`shape_image_shards` 保证）；防御：异常时空占位。
+    let Some(geo) = shards.first().and_then(|s| s.image.as_ref()) else {
+        debug_assert!(false, "Image shard 必须携带盒几何");
+        return div()
+            .w_full()
+            .flex_shrink_0()
+            .px(px(CONTENT_EDGE_PAD_X_PX))
+            .py_1()
+            .text_size(px(13.))
+            .text_color(fallback_color)
+            .child(alt)
+            .into_any_element();
+    };
 
     let img_el = match row.img_data.clone() {
         // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
@@ -1073,23 +1099,15 @@ fn render_image_row(row: &PreviewRow, p: &Rc<StyleParams>) -> gpui::AnyElement {
         }
     };
 
-    // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
-    //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
-    // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
-    let (img_w, img_h) = (row.img_w, row.img_h);
-    let box_ = match (img_w, img_h) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => div()
-            .w_full()
-            .max_w(px(IMAGE_MAX_W))
-            .aspect_ratio(w as f32 / h as f32)
-            .debug_selector(|| "md-img-box".into()),
-        _ => div()
-            .w(px(IMAGE_MAX_W))
-            .max_w_full()
-            .h(px(IMAGE_ROW_DEFAULT_H))
-            .min_h(px(IMAGE_ROW_DEFAULT_H))
-            .debug_selector(|| "md-img-box".into()),
-    };
+    // 图片盒宽/高直接取 shard 几何（`geo.box_w/box_h` = `min(avail, IMAGE_MAX_W)` × 固尺寸
+    // 比例）：用 aspect_ratio 表达（宽 `100%·max IMAGE_MAX_W`，高随实际布局宽等比）——
+    // 高度随视口宽自适应与旧 `aspect_ratio` 缩放语义逐位一致，且布局期重算（R2：量程
+    // `box_h` 与渲染同源）。未给固尺寸时盒高 = 占位高（ratio = box_w/占位高）。
+    let box_ = div()
+        .w_full()
+        .max_w(px(IMAGE_MAX_W))
+        .aspect_ratio(geo.box_w / geo.box_h.max(1.))
+        .debug_selector(|| "md-img-box".into());
     div()
         .w_full()
         .flex_shrink_0()
@@ -1100,6 +1118,15 @@ fn render_image_row(row: &PreviewRow, p: &Rc<StyleParams>) -> gpui::AnyElement {
         .items_center()
         .child(box_.child(img_el))
         .into_any_element()
+}
+
+/// `PreviewRow` 的固尺寸（`img_w/img_h` 同时有效）——喂 `shape_docrow_shard_with_image`
+/// 让图片盒高按真实比例换算（量程与渲染同源）。
+pub(crate) fn preview_row_img_size(row: &PreviewRow) -> Option<(u32, u32)> {
+    match (row.img_w, row.img_h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,7 @@ use crate::config::markdown::{
 };
 use crate::markdown::doc::{row_kind, DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::parse::{Row, RowKind, RunKind};
+use crate::markdown::parse::{Row, RowKind, RunKind, TableAlign};
 use crate::markdown::view::expand_bg_over_whitespace;
 use crate::markdown::wysiwyg::WyTheme;
 
@@ -48,6 +48,9 @@ const QUOTE_TEXT_INDENT_PX: f32 = 15.;
 const CODE_TEXT_PAD_X_PX: f32 = CONTENT_EDGE_PAD_X_PX;
 /// 标题块底部额外留白（`shape_text_row` 用 `text_style_for` 的 `pad`）。
 const HEADING_BLOCK_PAD_PX: f32 = 8.;
+/// 表格单元格左右内距合计（px，左右各 10）——列宽分配 = 字形宽 + 此值，下限 48。
+/// 与 `wysiwyg::shape::shape_table_row` / 预览 `table.rs` 同源。
+const CELL_PAD_X2_PX: f32 = 20.;
 
 /// 一个布局分片（横向条带）：一个视觉行的几何 + 渲染身份。
 ///
@@ -74,6 +77,12 @@ pub(crate) struct Shard {
     /// 该条带在**整块** `byte_map` 中的显示字节区间（`byte_map[b]` 为源字节）。
     /// 代码块为块级映射（`multi_offsets` 语义）；空条带为 `0..0`。
     pub byte_map: Range<usize>,
+    /// 表格网格几何（仅 [`IrKind::Table`] 块的首片；其余 None）。P3-1c-2：表格行
+    /// 内容切 shard——列宽/单元格高/表头数据都在这里，渲染与量程共用同一几何。
+    pub table: Option<ShardTable>,
+    /// 图片盒几何（仅 [`IrKind::Image`] 块的首片；其余 None）。P3-1c-2：图片行
+    /// 内容切 shard——盒宽/盒高（按固尺寸比例）+ 源，渲染据此画盒。
+    pub image: Option<ShardImage>,
 }
 
 impl Shard {
@@ -89,8 +98,63 @@ impl Shard {
         code_ranges: Vec<Range<usize>>,
         byte_map: Range<usize>,
     ) -> Self {
-        Shard { line_ix, h, w, x_off, lh, text, runs, code_ranges, byte_map }
+        Shard {
+            line_ix,
+            h,
+            w,
+            x_off,
+            lh,
+            text,
+            runs,
+            code_ranges,
+            byte_map,
+            table: None,
+            image: None,
+        }
     }
+
+    fn with_table(mut self, t: ShardTable) -> Self {
+        self.table = Some(t);
+        self
+    }
+
+    fn with_image(mut self, i: ShardImage) -> Self {
+        self.image = Some(i);
+        self
+    }
+}
+
+/// 表格网格的**单源几何**（`shape_table_shard` 产出；渲染/量程共用，R2）：列宽
+/// 分配 / 单元格高 / 表头数据文本 / 对齐。列宽与 `wysiwyg::shape::shape_table_row`
+/// **同式**：逐格字形实测宽 + 左右各 10px 内距（+20）、下限 48px——预览表格与
+/// WYSIWYG 表格列宽同一来源；单元格高 = `para_line + 12`（同 `table_row_h`）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShardTable {
+    /// 每列宽（px）。
+    pub widths: Vec<f32>,
+    /// 网格总宽（px，= `Σ widths`）。
+    pub total_w: f32,
+    /// 单元格高（px；表头/数据行同高）。
+    pub row_h: f32,
+    /// 表头单元格文本（列数 = `widths.len()`）。
+    pub header: Vec<SharedString>,
+    /// 数据行单元格文本（每行已补齐到列数）。
+    pub rows: Vec<Vec<SharedString>>,
+    /// 每列对齐（已补齐到列数）。
+    pub aligns: Vec<TableAlign>,
+}
+
+/// 独立图片行的**单源盒几何**（`shape_image_shards` 产出；渲染/量程共用）：图片盒
+/// 宽/高 + 源。盒高按固尺寸比例换算（`box_w * ih / iw`）→ 高度随可用宽缩放与现状
+/// （`aspect_ratio`）一致；未加载/无尺寸用占位高 [`IMAGE_ROW_DEFAULT_H`]。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ShardImage {
+    /// 图片盒宽（px，= `min(avail, IMAGE_MAX_W)`）。
+    pub box_w: f32,
+    /// 图片盒高（px，= `box_w * ih/iw` 或占位高）。
+    pub box_h: f32,
+    /// 图片源（渲染 `ImageSource` / 水平布局用）。
+    pub src: SharedString,
 }
 
 /// 把 [`DocRow`] 整形为横向分片序列：高度语义 = `wysiwyg::shape::shape_docrow`
@@ -105,9 +169,9 @@ impl Shard {
 /// 签名相对蓝图 `shape_docrow_shard(dr, theme, avail, max_w)` 多一个 `ts`：整形必须
 /// 访问字体整形上下文（px 宽/折行），显式传入可中性喂两引擎（不背 editor/window）。
 ///
-/// `#[allow(dead_code)]`：Phase 1 纯新增面，**尚无生产调用方**（设计如此，不改现有
-/// 调用方）；此即 Phase 2 让两引擎切换的唯一几何真值入口。
-#[allow(dead_code)]
+/// 高度占位（不给图固有尺寸）时图片行用 [`IMAGE_ROW_DEFAULT_H`] 占位高；需要「量程与
+/// 渲染同源」的调用方（预览量程/渲染）走 [`shape_docrow_shard_with_image`] 喂真实固
+/// 尺寸——图片盒高随之等比缩放（P3-1c-2）。
 pub(crate) fn shape_docrow_shard(
     ts: &WindowTextSystem,
     dr: &DocRow,
@@ -115,10 +179,23 @@ pub(crate) fn shape_docrow_shard(
     avail: f32,
     max_w: f32,
 ) -> Vec<Shard> {
+    shape_docrow_shard_with_image(ts, dr, theme, avail, max_w, None)
+}
+
+/// [`shape_docrow_shard`] 的图固有尺寸版本：`img_size = Some((w, h))` 只对
+/// [`IrKind::Image`] 行生效（图片盒高按比例换算）；其余行型与无 size 完全一致。
+pub(crate) fn shape_docrow_shard_with_image(
+    ts: &WindowTextSystem,
+    dr: &DocRow,
+    theme: &WyTheme,
+    avail: f32,
+    max_w: f32,
+    img_size: Option<(u32, u32)>,
+) -> Vec<Shard> {
     match dr.kind {
         IrKind::Code => shape_code_shards(ts, dr, theme, max_w),
-        IrKind::Table => shape_table_shard(dr, theme, avail),
-        IrKind::Image => shape_image_shards(ts, dr, theme, avail),
+        IrKind::Table => shape_table_shard(ts, dr, theme, avail),
+        IrKind::Image => shape_image_shards(ts, dr, theme, avail, img_size),
         _ => shape_text_shards(ts, dr, theme, avail),
     }
 }
@@ -327,22 +404,86 @@ fn shape_code_shards(
 }
 
 /// 表格块：单片，高 = 网格高 + 底部滚动条预留带——与 `shape_table_row` 同式。
-fn shape_table_shard(dr: &DocRow, theme: &WyTheme, avail: f32) -> Vec<Shard> {
-    let n_rows = match &dr.payload {
-        DocPayload::Table(t) => t.rows.len(),
-        _ => 0,
+/// P3-1c-2 起承载**真实单元格绘制几何**（[`ShardTable`]）：列宽按逐格字形实测宽 +
+/// 20 / 下限 48（与 `wysiwyg::shape::shape_table_row` 同式）、单元格高 = `para_line + 12`、
+/// 表头/数据文本与对齐——渲染直接按它画网格（删旧 `render_table_row` 的内容路径），
+/// 量程 `shard.h` 与其渲染（网格高 + 预留带）同源。
+fn shape_table_shard(ts: &WindowTextSystem, dr: &DocRow, theme: &WyTheme, _avail: f32) -> Vec<Shard> {
+    let (header, rows, aligns) = match &dr.payload {
+        DocPayload::Table(t) => (t.header.clone(), t.rows.clone(), t.aligns.clone()),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
     };
+    let ncols = header.len().max(1);
+    // 列宽 = 逐格字形实测宽 + 左右内距（+20）、下限 48 —— 与 `shape_table_row` 同式
+    // （同一 `shape_line` 整形上下文：`theme.font` / `theme.font_size`）。
+    let mut widths: Vec<f32> = (0..ncols).map(|_| 48.).collect();
+    let shape_len = |ts: &WindowTextSystem, c: &SharedString| -> f32 {
+        let run = [TextRun {
+            len: c.len(),
+            font: theme.font.clone(),
+            ..Default::default()
+        }];
+        ts.shape_line(c.clone(), theme.font_size, &run, None)
+            .width()
+            .as_f32()
+    };
+    for (ci, c) in header.iter().enumerate() {
+        widths[ci] = widths[ci].max(shape_len(ts, c) + CELL_PAD_X2_PX);
+    }
+    // 数据行同样测宽（含稀疏行补列后的空串——宽 0，`max` 不变）。
+    let rows2: Vec<Vec<SharedString>> = rows
+        .iter()
+        .map(|r| {
+            let mut v = r.clone();
+            v.resize(ncols, SharedString::default());
+            v
+        })
+        .collect();
+    for row in &rows2 {
+        for (ci, c) in row.iter().enumerate() {
+            widths[ci] = widths[ci].max(shape_len(ts, c) + CELL_PAD_X2_PX);
+        }
+    }
+    let total_w: f32 = widths.iter().sum();
+    let mut aligns2 = aligns.clone();
+    aligns2.resize(ncols, TableAlign::Left);
+    let n_rows = rows2.len();
     let row_h = f32::from(theme.para_line()) + 12.;
     let h = (1. + n_rows as f32) * row_h + n_rows as f32 + 2. + TABLE_SCROLLBAR_RESERVE_PX;
-    vec![Shard::new(0, h, avail, 0., row_h, SharedString::default(), Vec::new(), Vec::new(), 0..0)]
+    vec![
+        Shard::new(0, h, total_w, 0., row_h, SharedString::default(), Vec::new(), Vec::new(), 0..0)
+            .with_table(ShardTable {
+                widths,
+                total_w,
+                row_h,
+                header,
+                rows: rows2,
+                aligns: aligns2,
+            }),
+    ]
 }
 
-/// 独立图片行：图片盒片（未加载占位高 + 题注间隙）+ 题注折行片。
-/// 与 `shape_image_row` 同式（占位口径：未加载图用 `IMAGE_ROW_DEFAULT_H`）。
-fn shape_image_shards(ts: &WindowTextSystem, dr: &DocRow, theme: &WyTheme, avail: f32) -> Vec<Shard> {
+/// 独立图片行：图片盒片（按固尺寸等比换算的真实盒高 + 题注间隙）+ 题注折行片。
+/// 与 `shape_image_row` 同式（占位口径：未给固尺寸 / 未加载图用 `IMAGE_ROW_DEFAULT_H`）。
+/// P3-1c-2 起盒几何（[`ShardImage`]）随 shard 承载——渲染据此画盒（删 `render_image_row`），
+/// 给尺寸后盒高随可用宽等比缩放（量程与渲染同源，R2）。
+fn shape_image_shards(
+    ts: &WindowTextSystem,
+    dr: &DocRow,
+    theme: &WyTheme,
+    avail: f32,
+    img_size: Option<(u32, u32)>,
+) -> Vec<Shard> {
     let alt = dr.text.clone();
-    let w = avail.min(IMAGE_MAX_W);
-    let img_h = IMAGE_ROW_DEFAULT_H;
+    let src = match &dr.payload {
+        DocPayload::Image { src } => src.clone(),
+        _ => SharedString::default(),
+    };
+    let box_w = avail.min(IMAGE_MAX_W);
+    let img_h = match img_size {
+        Some((iw, ih)) if iw > 0 && ih > 0 => (box_w * ih as f32 / iw as f32).max(1.),
+        _ => IMAGE_ROW_DEFAULT_H,
+    };
     let gap = IMAGE_CAPTION_GAP_PX;
     // 题注（muted、正文行高）按内容宽折行——与 `shape_image_row` 同式。
     let cap_lh = f32::from(theme.para_line());
@@ -356,8 +497,11 @@ fn shape_image_shards(ts: &WindowTextSystem, dr: &DocRow, theme: &WyTheme, avail
         .map(|ls| ls.into_vec())
         .unwrap_or_default();
     let mut out = Vec::with_capacity(cap_wrapped.len().max(1) + 1);
-    // 图片盒片（占位高 + 题注间隙——`shape_image_row` 折进同一高度行）。
-    out.push(Shard::new(0, img_h + gap, w, 0., 0., SharedString::default(), Vec::new(), Vec::new(), 0..0));
+    // 图片盒片（真实/占位高 + 题注间隙——`shape_image_row` 折进同一高度行）。
+    out.push(
+        Shard::new(0, img_h + gap, box_w, 0., cap_lh, SharedString::default(), Vec::new(), Vec::new(), 0..0)
+            .with_image(ShardImage { box_w, box_h: img_h, src }),
+    );
     if cap_wrapped.is_empty() {
         out.push(Shard::new(1, cap_lh, 0., 0., cap_lh, SharedString::default(), Vec::new(), Vec::new(), 0..0));
     } else {

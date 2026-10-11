@@ -1,22 +1,26 @@
 //! 渲染一张 GFM 表格为带边框网格（借鉴旧 render.rs 的表格视觉）：
-//! 外边 1px 圆角边框 + 表头浅灰底/加粗 + 表头下分隔线 + 列左竖线 + 数据行上横线，
-//! 列宽按 [`crate::markdown::view::dimensions::table_column_widths`] 估算
-//! （内容自适应，超宽走外层横向滚动）。
+//! 外边 1px 圆角边框 + 表头浅灰底/加粗 + 表头下分隔线 + 列左竖线 + 数据行上横线。
+//!
+//! M5-B5 P3-1c-2：表格行内容切共享 shard——本模块不再自行估算列宽，而是直接消费
+//! [`layout::ShardTable`]（`shape_table_shard` 产出的**单源几何**：列宽分配/单元格
+//! 高/表头数据/对齐，与 WYSIWYG `shape_table_row` 同式）。渲染与量程共用同一几何
+//! （R2），`render_row_shard` 的 Table 分支据此画网格（旧 `render_table_row`/
+//! `table_column_widths` 估算路径已删）。
 
 use std::rc::Rc;
 
 use gpui::{div, px, Div, FontWeight, Hsla, InteractiveElement, ParentElement, Pixels, SharedString, Styled};
 
-use crate::markdown::parse::{TableAlign, TableData};
-use crate::markdown::view::dimensions::table_column_widths;
+use crate::markdown::layout::ShardTable;
+use crate::markdown::parse::TableAlign;
 use crate::markdown::view::style::StyleParams;
 
-/// 渲染一张 GFM 表格为带边框网格。
-pub(crate) fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::Div> {
+/// 按 [`ShardTable`] 几何渲染一张 GFM 表格为带边框网格。
+pub(crate) fn render_table_geometry(geo: &ShardTable, p: &Rc<StyleParams>) -> gpui::Stateful<gpui::Div> {
     let border = p.divider;
-    let widths = table_column_widths(table, p);
-    let total: f32 = widths.iter().sum();
-    let row_h = px(p.para_size.as_f32() * 1.45 + 12.0);
+    let widths = &geo.widths;
+    let total: f32 = geo.total_w;
+    let row_h = px(geo.row_h);
 
     let mut grid = div()
         .id("md-table")
@@ -30,10 +34,10 @@ pub(crate) fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stat
         .rounded(px(6.))
         .overflow_hidden();
 
-    grid = grid.child(render_table_row(
-        &table.header,
-        &widths,
-        &table.aligns,
+    grid = grid.child(render_row(
+        &geo.header,
+        widths,
+        &geo.aligns,
         true,
         border,
         row_h,
@@ -41,18 +45,8 @@ pub(crate) fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stat
     ));
     // 表头下分隔线
     grid = grid.child(div().h(px(1.)).w_full().flex_shrink_0().bg(border));
-    for (ri, row) in table.rows.iter().enumerate() {
-        let mut cells = row.clone();
-        cells.resize(table.header.len(), SharedString::from(""));
-        let mut row_el = render_table_row(
-            &cells,
-            &widths,
-            &table.aligns,
-            false,
-            border,
-            row_h,
-            p,
-        );
+    for (ri, cells) in geo.rows.iter().enumerate() {
+        let mut row_el = render_row(cells, widths, &geo.aligns, false, border, row_h, p);
         // 数据行之间加一条上横线（旧 render.rs 用 border_t_1）
         if ri > 0 {
             row_el = row_el.border_t_1().border_color(border);
@@ -63,7 +57,7 @@ pub(crate) fn render_table(table: &TableData, p: &Rc<StyleParams>) -> gpui::Stat
 }
 
 /// 表格的一行：定宽单元格 + 列左竖线；表头加粗/着色，按对齐方式排版。
-fn render_table_row(
+fn render_row(
     cells: &[SharedString],
     widths: &[f32],
     aligns: &[TableAlign],

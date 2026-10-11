@@ -1,12 +1,10 @@
 //! 内容/图片的尺寸估算与解析：
-//! - 表格列宽估算（超宽表格在块内横向滚动，列宽决定其内容宽）；
-//! - 解析常见图片格式的文件头得到固有尺寸（不整图解码，快）。
+//! - 图片头尺寸解析（不整图解码，快）；
 //!
 //! 注：页面已恒换行（无「非换行自然宽 + 页面级横向滚动」），单行文本宽估算
-//! （`est_row_width` / `est_row_width_meta`）已随该模式移除。
-
-use crate::markdown::parse::TableData;
-use crate::markdown::view::style::StyleParams;
+//! （`est_row_width` / `est_row_width_meta`）已随该模式移除；表格列宽估算
+//! （`table_column_widths`）已随 P3-1c-2「表格内容切共享 shard」删除——列宽现由
+//! `layout::shape_table_shard` 按字形实测宽产出（与 WYSIWYG `shape_table_row` 同源）。
 
 /// 读取 4 字节大端无符号整数（辅助解析 PNG/JPEG 头）。
 fn be_u32(d: &[u8], at: usize) -> Option<u32> {
@@ -78,46 +76,4 @@ pub(crate) fn image_dimensions_bytes(d: &[u8]) -> Option<(u32, u32)> {
         return None;
     }
     None
-}
-
-/// CJK 等全角字符：宽度按 1 个 em 估算，英文数字按 0.6 em。
-fn is_wide_char(c: char) -> bool {
-    let cp = c as u32;
-    (0x2E80..=0x9FFF).contains(&cp) // CJK 统一表意 + 部首 + 假名
-        || (0xAC00..=0xD7FF).contains(&cp) // 谚文
-        || (0xF900..=0xFAFF).contains(&cp) // CJK 兼容表意
-        || (0x3000..=0x303F).contains(&cp) // CJK 标点
-        || (0xFF00..=0xFF60).contains(&cp) // 全角符号
-}
-
-/// 估算一段文本的渲染宽度（px）。表格列宽估算用（`table_column_widths`）。
-fn est_text_width(text: &str, font_size: f32) -> f32 {
-    text.chars().fold(0.0, |acc, c| {
-        acc + if is_wide_char(c) {
-            font_size
-        } else {
-            font_size * 0.6
-        }
-    })
-}
-
-/// 表格每列估算宽度（px）：逐格 `est_text_width` + 左右各 10px 内距，
-/// 下限 48px，与 [`crate::markdown::view::table::render_table`] 的实际布局一致
-/// （超宽表格撑出横向滚动范围）。
-pub(crate) fn table_column_widths(table: &TableData, p: &StyleParams) -> Vec<f32> {
-    let ncols = table.header.len().max(1);
-    let mut widths = vec![0.0f32; ncols];
-    let font = p.para_size.as_f32();
-    for (ci, cell) in table.header.iter().enumerate() {
-        widths[ci] = widths[ci].max(est_text_width(cell.as_ref(), font) + 20.0);
-    }
-    for row in &table.rows {
-        for (ci, cell) in row.iter().enumerate().take(ncols) {
-            widths[ci] = widths[ci].max(est_text_width(cell.as_ref(), font) + 20.0);
-        }
-    }
-    for w in &mut widths {
-        *w = (*w).max(48.0);
-    }
-    widths
 }
