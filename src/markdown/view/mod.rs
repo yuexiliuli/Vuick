@@ -67,6 +67,9 @@ use crate::markdown::parse::{
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
+use crate::markdown::layout::docrow_for_height;
+use crate::markdown::layout::shape_docrow_shard;
+use crate::markdown::wysiwyg::WyTheme;
 use dimensions::{image_dimensions, image_dimensions_bytes};
 use row::{render_row, RowRenderCtx};
 use style::StyleParams;
@@ -202,6 +205,15 @@ const WINDOW_LEAD_BLOCKS: usize = 96;
 const HEIGHT_SAMPLE_TARGET: usize = 4096;
 /// 超过该块数才启用块高抽样（否则逐块精确：几十万块 ≈ 几 ms，仅换源/换宽发生）。
 const HEIGHT_FULL_BLOCKS_MAX: usize = 262_144;
+/// unified 后端「窗口模式**全量精确**量程」的块数上限：≤ 此值对**每个真实 DocRow**
+/// 逐块喂 `shape_docrow_shard`（`Σ shard.h` == 真实 DocRow shard 总高，R1，不再 estimate）；
+/// 超过此值退化为「抽样窗口」——只对抽中的块 shape 取精确高、组内其余块沿用（量程
+/// 误差 ≤ 组内异构，与 legacy 抽样同构）。依据 bench
+/// `bench_docrow_shard_full_range_cost`：全量 DocRow shape ≈0.05ms/块（debug）→ 8192 块
+/// ≈ 0.4s（debug）/ ≈50ms（release），再大超出交互预算（换宽/块数变化的 120ms 节流窗口）。
+const HEIGHT_EXACT_SHAPE_MAX: usize = 8192;
+/// 全量精确量程时物化/整形的一批块数（限制驻留内存：批内行释放后再取下一批）。
+const HEIGHT_EXACT_BATCH: usize = 512;
 
 /// 预览的原始文本源。窗口级懒解析在滚动/重解析时要反复对**原文**切片，
 /// 因此预览侧保存的源可以是：
@@ -248,14 +260,17 @@ impl From<SharedString> for PreviewSrc {
     }
 }
 
-// ===== M5-B5 Phase 2：预览后端开关（legacy|unified）=====
+// ===== M5-B5 Phase 2/3：预览后端开关（legacy|unified）=====
 // `legacy`（默认）= 现状逐位一致：List + 抽样量程 + gpui 自然行距（≈1.79×fs）。
 // `unified` = 预览行高/量程切共享 `markdown::layout::shape_docrow_shard` 口径：
 //   - 文本行显式 `line_height` = 共享行高系数（para_line/heading_line，单一源
 //     `StyleParams`，WYSIWYG/B 引擎同款），空行/分隔行盒高 = para_line；
 //     使预览每视觉行间距与 shard（BlockLayout）逐行一致；
-//   - 高度模型公式族换成 shard 公式族（layout/mod.rs 同常量：表格滚动条预留、
-//     空行=para_line、代码 (行数+2)×code_line、标题 +pad(8)）；
+//   - 高度模型：Phase 2 先切 shard **公式族**（layout/mod.rs 同常量：表格滚动条预留、
+//     空行=para_line、代码 (行数+2)×code_line、标题 +pad(8)，文本折行用 `est_wrap_*`
+//     估算）；**P3 前置（量程精确化，R1）再升级为「逐块喂真实 `DocRow` 给
+//     `shape_docrow_shard`」**——≤ `HEIGHT_EXACT_SHAPE_MAX` 块全量精确（量程 == Σ 真实
+//     DocRow shard 总高，不再 estimate），超出走抽样窗口（抽中块取真实 shard 高）；
 //   - 渲染 draw 仍走旧 List/TextTrack 路径（P3 再切 Frame/paint），几何来源
 //     统一在本步完成（渲染切换按蓝图范畴各留一档：切得了的已切、切不了留 P3）。
 // 一条变量（`set_preview_backend`）整体换轨；默认关 → 默认 legacy 逐位保真。
@@ -425,6 +440,12 @@ pub struct MarkdownPreview {
     /// 停稳后补齐」同手法。不能用 `is_scrollbar_dragging()`：窗口模式 `apply_desired`
     /// 重建 ListState 会清掉冻结值，且窗口模式本不冻结。
     last_sweep_lo: Option<usize>,
+    /// unified 精确量程的整形上下文（render 期从 `Window` 抓取；None = 后端 legacy 或
+    /// 尚未进入渲染）。`Arc<WindowTextSystem>` + [`WyTheme`] 与
+    /// `markdown::layout::shape_docrow_shard` 同口径——`rebuild_height_model` /
+    /// `estimated_avg_row_height` 的 unified 分支据此逐块喂真实 `DocRow` 得精确量程；
+    /// 缺失（bench/测试直接调 prepare_render、未走 render）时回退 unified 公式族。
+    height_exact_ctx: Option<(std::sync::Arc<gpui::WindowTextSystem>, WyTheme)>,
 }
 
 impl MarkdownPreview {
@@ -479,6 +500,7 @@ impl MarkdownPreview {
             zoom_anchor: None,
             pending_code_hl: None,
             last_sweep_lo: None,
+            height_exact_ctx: None,
         }
     }
 
@@ -1253,7 +1275,11 @@ impl MarkdownPreview {
         // 抽样步长：中等文档（≤ 该阈值）**逐块精确**算高（几十万块 ≈ 几 ms，换源/换宽
         // 才发生）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度
         // 周期复用块」有偏差，故只在 N 大到精确成本不可接受时启用。
-        let stride = if n > HEIGHT_FULL_BLOCKS_MAX {
+        // unified 后端阈值更小（`HEIGHT_EXACT_SHAPE_MAX`）：全量精确要逐块 shape（贵），
+        // 超出即抽样；且每块高度 = 抽中块的**真实 DocRow shard 高**（见 `exact_block_heights`）。
+        let unified = preview_backend() == PreviewBackend::Unified;
+        let fast_cap = if unified { HEIGHT_EXACT_SHAPE_MAX } else { HEIGHT_FULL_BLOCKS_MAX };
+        let stride = if n > fast_cap {
             (n / HEIGHT_SAMPLE_TARGET).max(1)
         } else {
             1
@@ -1263,13 +1289,40 @@ impl MarkdownPreview {
         let mut pref: Vec<f32> = Vec::with_capacity(groups + 1);
         pref.push(0.0);
         let mut si = 0usize;
-        while si < n {
-            let b = &idx.blocks.at(si.min(n - 1));
-            let h = index_block_height(b, p, self.wrap, avail).max(1.0);
-            block_h.push(h);
-            let group_len = stride.min(n - si);
-            pref.push(pref.last().copied().unwrap_or(0.0) + h * group_len as f32);
-            si += stride;
+        // unified 且整形上下文在场（render 期抓取）：逐块喂真实 `DocRow` → 精确 shard 高。
+        let exact = unified && self.height_exact_ctx.is_some();
+        if exact && stride == 1 {
+            // 全量精确（≤ `HEIGHT_EXACT_SHAPE_MAX` 块）：分批物化真实 DocRow 逐块 shape，
+            // 总量程 == Σ 真实 DocRow shard 总高（R1，不再 `est_wrap_len` 估算）。
+            while si < n {
+                let e = (si + HEIGHT_EXACT_BATCH - 1).min(n - 1);
+                let hs = self.exact_block_heights(&idx, avail, width, si, e);
+                for h in hs {
+                    let h = h.max(1.0);
+                    // stride=1：非抽样，`block_h[g]` / `pref` 逐块精确。
+                    block_h.push(h);
+                    pref.push(pref.last().copied().unwrap_or(0.0) + h);
+                }
+                si = e + 1;
+            }
+        } else {
+            while si < n {
+                let group_len = stride.min(n - si);
+                let h0 = if exact {
+                    // 抽样窗口：抽中块（组首）取真实 shard 高（`block_h[g]` 恒为单块高）。
+                    self.exact_block_heights(&idx, avail, width, si, si).pop().unwrap_or(1.0).max(1.0)
+                } else if unified {
+                    // 无整形上下文（render 前直接调 / 后端切换边缘）：回退 unified 公式族。
+                    let b = &idx.blocks.at(si.min(n - 1));
+                    unified_index_block_height(b, p, avail).max(1.0)
+                } else {
+                    let b = &idx.blocks.at(si.min(n - 1));
+                    index_block_height(b, p, self.wrap, avail).max(1.0)
+                };
+                block_h.push(h0);
+                pref.push(pref.last().copied().unwrap_or(0.0) + h0 * group_len as f32);
+                si += stride;
+            }
         }
         self.block_h = block_h;
         self.height_pref = pref;
@@ -1278,6 +1331,43 @@ impl MarkdownPreview {
         self.height_model_n = n;
         self.est_hint_width = width;
         crate::prof::end("md.hm.rebuild", _t_hm);
+    }
+
+    /// unified 后端：块窗口 `[lo, hi]` 内每个真实 `DocRow` 的精确 shard 高
+    /// （`Σ shape_docrow_shard(real DocRow)`；行数 == `hi-lo+1`，逐索引对齐块号）。
+    /// 用预览同款 `parse_block_window(_rope)` 物化（与窗口渲染完全同源），再经
+    /// [`docrow_for_height`] 适配成 `DocRow` 喂 `shape_docrow_shard`——高度与
+    /// `Doc::rows_in_block_window` 的真实 DocRow 逐位一致（parity 测试钉死）。
+    /// `resolve_image_rows` 无需调用：`shape_image_shards` 只看 alt 文本与占位高，
+    /// 不依赖 img 固有尺寸。
+    fn exact_block_heights(
+        &self,
+        idx: &BlockIndex,
+        avail: f32,
+        width: f32,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<f32> {
+        let Some((ts, theme)) = self.height_exact_ctx.as_ref() else {
+            return Vec::new();
+        };
+        let Some(src) = self.src_buf.as_ref() else {
+            return Vec::new();
+        };
+        debug_assert!(lo <= hi && hi < idx.blocks.len(), "exact 窗口越界 lo={lo} hi={hi}");
+        let rows = match src {
+            PreviewSrc::Str(s) => parse_block_window(s, idx, lo, hi),
+            PreviewSrc::Rope(r) => parse_block_window_rope(r, idx, lo, hi),
+        };
+        rows.iter()
+            .map(|r| {
+                let dr = docrow_for_height(r);
+                shape_docrow_shard(ts, &dr, theme, avail, width)
+                    .iter()
+                    .map(|s| s.h)
+                    .sum::<f32>()
+            })
+            .collect()
     }
 
     /// 块 → 像素（抽样模型近似；未建模型退化为 平均高×块号）。
@@ -1743,6 +1833,7 @@ impl MarkdownPreview {
         self.block_h = Vec::new();
         self.height_pref = Vec::new();
         self.height_stride = 1;
+        self.height_exact_ctx = None;
     }
 
     /// 标记「平均行高的宽度感知估算」已失效：换源 / 换行 / 字号变化后调用，
@@ -1787,16 +1878,29 @@ impl MarkdownPreview {
                     return p.body_row_hint().as_f32();
                 }
                 let mut total = 0.0f32;
+                // unified 后端且整形上下文在场：逐行喂真实 `DocRow` 给 `shape_docrow_shard`
+                // 得**精确**逐行高（小文档行数少，O(行数) shape 可承受）；否则回退统一 shard
+                // 公式族（`unified_row_height`）。legacy 走原公式（逐位不变）。
+                let exact = preview_backend() == PreviewBackend::Unified
+                    && self.height_exact_ctx.is_some();
+                let ctx = self.height_exact_ctx.as_ref().map(|(ts, th)| (ts.clone(), th.clone()));
                 for r in self.rows.iter() {
-                    // unified 后端：共享 shard 公式族（`unified_row_height`）。
-                    let h = if preview_backend() == PreviewBackend::Unified {
+                    let h = if exact {
+                        let (ts, theme) = ctx.as_ref().expect("exact 分支必有 ctx");
+                        let dr = docrow_for_height(r);
+                        shape_docrow_shard(ts, &dr, theme, avail, width)
+                            .iter()
+                            .map(|s| s.h)
+                            .sum::<f32>()
+                    } else if preview_backend() == PreviewBackend::Unified {
                         unified_row_height(r, p, avail)
                     } else {
                         match r.kind {
                             RowKind::Blank => p.blank_h.as_f32(),
                             RowKind::Rule => p.rule_h.as_f32(),
                             RowKind::Code => {
-                                (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
+                                (r.code_lines().len().max(1) as f32 + 2.0)
+                                    * p.code_line.as_f32()
                             }
                             RowKind::Table => {
                                 let row_h = p.para_size.as_f32() * 1.45 + 12.0;
@@ -2003,14 +2107,19 @@ fn index_block_height(b: &BlockMeta, p: &StyleParams, wrap: bool, avail: f32) ->
     }
 }
 
-/// `unified` 后端的块高（px）：**共享 shard 口径**（`markdown::layout` 公式族，
-/// 同常量同语义；页恒换行，`wrap` 恒为 true）。块高即 shard 高度累加：
+/// `unified` 后端的块高（px）：**共享 shard 公式族口径**（`markdown::layout` 同常量
+/// 同语义；页恒换行，`wrap` 恒为 true）。块高即 shard 高度累加：
 /// - 空行/分隔线：shard 走文本叶 1 行 → `para_line`；
 /// - 代码：`(行数+2) × code_line`（与 legacy 公式本来就一致）；
 /// - 表格：`(1+n)×row_h + n + 2 + TABLE_SCROLLBAR_RESERVE_PX`（`row_h = para_line+12`）；
 /// - 独立图片：`IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + 题注折行×para_line`；
 /// - 标题/文本：`lh × 折行段数(+标题 pad 8)`，折行用 `est_wrap_len` 估算（窗口模式
-///   只有元数据，无法精确 shape；小文档路径由 ListState 实测校正）。
+///   只有元数据，无法精确 shape）。
+///
+/// **P3 前置后本函数退居「无整形上下文时的回退档」**：render 期 `height_exact_ctx` 在场时，
+/// 高度模型（`rebuild_height_model` / `estimated_avg_row_height` 的 unified 分支）改为逐块
+/// 喂真实 `DocRow` 给 `shape_docrow_shard` 取精确高（≤ `HEIGHT_EXACT_SHAPE_MAX` 全量精确，
+/// 超出抽样取抽中块真实 shard 高）——`est_wrap_len` 的折行估算误差被消除（R1）。
 fn unified_index_block_height(b: &BlockMeta, p: &StyleParams, avail: f32) -> f32 {
     match b.kind {
         RowKind::Blank | RowKind::Rule => p.para_line.as_f32(),
@@ -2316,6 +2425,17 @@ impl Render for MarkdownPreview {
         };
         // 窗口模式：刷新统一行高/窗口模型量程 + 预物化可见窗口（构造 list 闭包前，
         // 闭包内只读窗口数据，避免在元素构造期改 `self`）。
+        // unified 后端：从本帧 `Window` 抓取整形上下文（字体系统 + 主题），供精确量程
+        // （`rebuild_height_model`/`estimated_avg_row_height` 逐块喂真实 `DocRow`）使用；
+        // legacy 清空——且每帧覆盖，渲染路径不缓存旧宽/旧字号的主题。
+        if preview_backend() == PreviewBackend::Unified {
+            let ts_style = window.text_style();
+            let fs = ts_style.font_size.to_pixels(window.rem_size());
+            let theme = WyTheme::from_style(&p, ts_style.font(), fs);
+            self.height_exact_ctx = Some((window.text_system().clone(), theme));
+        } else {
+            self.height_exact_ctx = None;
+        }
         self.prepare_render(&p, pane_w, cx);
         let list_state = self.list_state.clone();
         // 居中阅读栏（页面恒换行，单一来源 `config::markdown::reading_col_px`）：

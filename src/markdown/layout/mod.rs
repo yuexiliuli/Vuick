@@ -34,9 +34,9 @@ use crate::config::markdown::{
     CONTENT_EDGE_PAD_X_PX, IMAGE_CAPTION_GAP_PX, IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H,
     TABLE_SCROLLBAR_RESERVE_PX,
 };
-use crate::markdown::doc::{DocPayload, DocRow};
+use crate::markdown::doc::{row_kind, DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
-use crate::markdown::parse::RunKind;
+use crate::markdown::parse::{Row, RowKind, RunKind};
 use crate::markdown::view::expand_bg_over_whitespace;
 use crate::markdown::wysiwyg::WyTheme;
 
@@ -379,6 +379,41 @@ fn shape_image_shards(ts: &WindowTextSystem, dr: &DocRow, theme: &WyTheme, avail
         }
     }
     out
+}
+
+/// 预览 `parse::Row` → 高度可用的 [`DocRow`]（M5-B5 P3 前置「量程精确化」）。
+///
+/// `shape_docrow_shard` 对 `DocRow` 只读 `kind/text/runs/payload/byte_map.len()`——
+/// `byte_map` 只被 shard 当作「条带显示字节区间」的钳位上界，**不影响高度**，故置空。
+/// 其余字段与 [`crate::markdown::doc::Doc::assemble`] 同源：`text/runs` 直接来自
+/// 预览同款 `parse_block_window(_rope)` 产出、`kind` 用 `row_kind` 同式、payload 逐类
+/// 同式装配 → 高度与真实 `DocRow`（[`crate::markdown::doc::Doc::rows_in_block_window`]）
+/// **逐位一致**，由 `markdown::view::tests::docrow_for_height_matches_doc_docrow_shard`
+/// 对拍钉死。这让预览高度模型不必持有完整 `Doc`（省 `line_starts`/索引复制），
+/// 又能把真实 `DocRow` 喂给 `shape_docrow_shard` 得精确量程。
+pub(crate) fn docrow_for_height(r: &Row) -> DocRow {
+    let kind = row_kind(r.kind);
+    let payload = match r.kind {
+        RowKind::Code => DocPayload::Code {
+            code_lines: r.code_lines().to_vec(),
+            language: r.code_language().map(Into::into),
+        },
+        RowKind::Image => DocPayload::Image {
+            src: r.image().map(|i| i.src.clone()).unwrap_or_default(),
+        },
+        RowKind::Table => r.table().cloned().map(DocPayload::Table).unwrap_or_default(),
+        _ => DocPayload::Text,
+    };
+    DocRow {
+        kind,
+        src_line: r.src_line,
+        lines: r.src_line..r.src_line + 1,
+        text: r.text.clone(),
+        runs: r.runs.clone(),
+        byte_map: Vec::new(),
+        payload,
+        table_rows: None,
+    }
 }
 
 #[cfg(test)]
