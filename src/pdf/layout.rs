@@ -89,12 +89,19 @@ pub(crate) fn compute_layout(dims: &[(f32, f32)], page_width: f32) -> (Vec<f32>,
 /// 当前第一张**可见**页（0 基）：「页面底 > 视口顶」的首张页。
 /// 与 [`keep_window`] 的窗口起点不同——**不含 MARGIN 缓冲**，用于状态栏页码等
 /// 「如实反映视口」的读数；`scroll_y` 为内容已向下滚动的像素数（≥0）。
-pub(crate) fn first_visible_page(dims: &[(f32, f32)], page_width: f32, scroll_y: f32) -> usize {
-    if dims.is_empty() {
+///
+/// `tops` 为页列顶部偏移缓存（[`compute_layout`] 的第一个输出，调用方须与 `dims`
+/// 同步维护、长度一致）。二分**直读缓存**，每帧 O(log P)，不再每帧内建 O(P) 表。
+pub(crate) fn first_visible_page(
+    dims: &[(f32, f32)],
+    tops: &[f32],
+    page_width: f32,
+    scroll_y: f32,
+) -> usize {
+    if dims.is_empty() || tops.is_empty() {
         return 0;
     }
     let top = scroll_y.max(0.0);
-    let (tops, _) = compute_layout(dims, page_width);
 
     // 二分定位「页底 > 视口顶」的首张页（lower_bound）。
     // `tops` 严格递增（每页叠加正页高 + PAGE_GAP，见 `compute_layout_is_monotonic_and_bounded`），
@@ -117,19 +124,20 @@ pub(crate) fn first_visible_page(dims: &[(f32, f32)], page_width: f32, scroll_y:
 /// 可见页区间（含缓冲）：与页列布局镜像，纯函数便于测试。
 ///
 /// `scroll_y` 为内容已向下滚动的像素数（≥0）；`viewport_h` 为可见区高度。
+/// `tops` 为页列顶部偏移缓存（[`compute_layout`] 的第一个输出），直读不做 O(P) 重建。
 pub(crate) fn keep_window(
     dims: &[(f32, f32)],
+    tops: &[f32],
     page_width: f32,
     scroll_y: f32,
     viewport_h: f32,
 ) -> (usize, usize) {
-    if dims.is_empty() {
+    if dims.is_empty() || tops.is_empty() {
         return (0, 0);
     }
     let vh = if viewport_h > 1.0 { viewport_h } else { 720.0 };
     let top = scroll_y.max(0.0);
     let bottom = top + vh;
-    let (tops, _) = compute_layout(dims, page_width);
 
     // 二分首/尾两界（`tops` 严格递增 → 两个谓词都单调，见 `first_visible_page`）。与旧
     // 线性扫逐例等价：`first` 无命中（滚过末页）与 `last` 无命中（视口在首页顶之上）都回退 0。
@@ -631,8 +639,9 @@ mod tests {
     fn keep_window_covers_only_visible_plus_margin() {
         // 30 页 A4，页宽 840 → 每页高约 1189；视口 600px 高，滚到第 10 页附近
         let dims: Vec<(f32, f32)> = vec![a4(); 30];
+        let (tops, _) = compute_layout(&dims, 840.0);
         let scroll_y = 10.0 * page_step(840.0);
-        let (s, e) = keep_window(&dims, 840.0, scroll_y, 600.0);
+        let (s, e) = keep_window(&dims, &tops, 840.0, scroll_y, 600.0);
         // 第 10 页应可见，区间含 MARGIN 缓冲且不越界
         assert!(s <= 10 && 10 <= e, "第 10 页应在可见区间 [{s},{e}]");
         assert!(e - s + 1 > 2 * MARGIN, "区间宽度应至少为可见页 + 2*MARGIN");
@@ -641,7 +650,7 @@ mod tests {
 
     #[test]
     fn keep_window_empty_dims_returns_zero() {
-        assert_eq!(keep_window(&[], 840.0, 0.0, 600.0), (0, 0));
+        assert_eq!(keep_window(&[], &[], 840.0, 0.0, 600.0), (0, 0));
     }
 
     #[test]
@@ -650,17 +659,18 @@ mod tests {
         // 页正是页底越进视口顶的 0 基 9；keep_window 的窗口起点会再前移 MARGIN 张——
         // 页码读数必须用前者（否则状态栏显示「第 1 / N 页」时实际已看到更后面的页）。
         let dims: Vec<(f32, f32)> = vec![a4(); 30];
+        let (tops, _) = compute_layout(&dims, 840.0);
         let step = page_step(840.0);
         let scroll_y = 10.0 * step;
-        let visible = first_visible_page(&dims, 840.0, scroll_y);
+        let visible = first_visible_page(&dims, &tops, 840.0, scroll_y);
         assert_eq!(visible, 9, "第二十滚位=10 步：页底越过视口顶的首张页应 0 基 9");
-        let (s, _) = keep_window(&dims, 840.0, scroll_y, 600.0);
+        let (s, _) = keep_window(&dims, &tops, 840.0, scroll_y, 600.0);
         assert_eq!(s, visible - MARGIN, "keep_window 起点含 MARGIN 缓冲（≠ visible）");
 
         // 顶部：第 0 页；空 dims / 负滚动安全。
-        assert_eq!(first_visible_page(&dims, 840.0, 0.0), 0);
-        assert_eq!(first_visible_page(&[], 840.0, 0.0), 0);
-        assert_eq!(first_visible_page(&dims, 840.0, -5.0), 0);
+        assert_eq!(first_visible_page(&dims, &tops, 840.0, 0.0), 0);
+        assert_eq!(first_visible_page(&[], &[], 840.0, 0.0), 0);
+        assert_eq!(first_visible_page(&dims, &tops, 840.0, -5.0), 0);
     }
 
     /// 引用实现：旧线性扫 `first_visible_page`（用于与二分版逐例对拍）。
@@ -747,14 +757,14 @@ mod tests {
 
         for &scroll in &probes {
             let expect_first = ref_first_visible_page(&dims, pw, scroll);
-            let got_first = first_visible_page(&dims, pw, scroll);
+            let got_first = first_visible_page(&dims, &tops, pw, scroll);
             assert_eq!(
                 got_first, expect_first,
                 "first_visible_page 在 scroll={scroll} 处偏离线性版"
             );
             for &vh in &[600.0_f32, 720.0, 1.0, 0.5, 0.0, 2000.0] {
                 let expect_win = ref_keep_window(&dims, pw, scroll, vh);
-                let got_win = keep_window(&dims, pw, scroll, vh);
+                let got_win = keep_window(&dims, &tops, pw, scroll, vh);
                 assert_eq!(
                     got_win, expect_win,
                     "keep_window 在 scroll={scroll}, viewport={vh} 处偏离线性版"
@@ -763,9 +773,36 @@ mod tests {
         }
 
         // 显式断言二分关键的「滚过末页回退 0」与「视口底压过末页」边界不退化。
-        assert_eq!(first_visible_page(&dims, pw, total + 1.0), 0, "滚过末页应回退 0");
-        assert_eq!(keep_window(&dims, pw, total + 1.0, 600.0).1, dims.len() - 1);
-        assert_eq!(keep_window(&dims, pw, 0.0, 0.5).0, 0, "视口高 ≤1 回退默认 720 时窗口起点仍为首页");
+        assert_eq!(first_visible_page(&dims, &tops, pw, total + 1.0), 0, "滚过末页应回退 0");
+        assert_eq!(keep_window(&dims, &tops, pw, total + 1.0, 600.0).1, dims.len() - 1);
+        assert_eq!(keep_window(&dims, &tops, pw, 0.0, 0.5).0, 0, "视口高 ≤1 回退默认 720 时窗口起点仍为首页");
+    }
+
+    /// 超长 top 表直读二分：5000 页缓存 tops 构造一次后直接传入，抽查首/中/末/越界滚动位，
+    /// 与引用线性实现逐例对拍——锁「直读缓存 tops」路径（不再每帧内建 O(P) 表）行为不退化。
+    #[test]
+    fn binary_reads_long_cached_tops() {
+        let dims: Vec<(f32, f32)> = vec![a4(); 5000];
+        let pw = 840.0_f32;
+        let (tops, total) = compute_layout(&dims, pw);
+        assert_eq!(tops.len(), dims.len(), "tops 缓存与 dims 同长");
+        for &scroll in &[0.0_f32, total * 0.25, total * 0.5, total - 0.5, total, total + 1.0, 1e9] {
+            assert_eq!(
+                first_visible_page(&dims, &tops, pw, scroll),
+                ref_first_visible_page(&dims, pw, scroll),
+                "first_visible_page 长表 scroll={scroll} 偏离线性版"
+            );
+            for &vh in &[0.0_f32, 600.0, 2000.0] {
+                assert_eq!(
+                    keep_window(&dims, &tops, pw, scroll, vh),
+                    ref_keep_window(&dims, pw, scroll, vh),
+                    "keep_window 长表 scroll={scroll} vh={vh} 偏离线性版"
+                );
+            }
+        }
+        // 滚过末页回退 0 / 视口底压过末页夹到末页。
+        assert_eq!(first_visible_page(&dims, &tops, pw, total + 1.0), 0, "滚过末页应回退 0");
+        assert_eq!(keep_window(&dims, &tops, pw, total + 1.0, 600.0).1, dims.len() - 1);
     }
 
     #[test]
@@ -918,7 +955,8 @@ mod tests {
     fn keep_window_before_first_paint_assumes_viewport() {
         // viewport_h ≤ 1 时回退默认高度，首帧也应覆盖从首页开始的若干页
         let dims: Vec<(f32, f32)> = vec![a4(); 5];
-        let (s, e) = keep_window(&dims, 840.0, 0.0, 0.0);
+        let (tops, _) = compute_layout(&dims, 840.0);
+        let (s, e) = keep_window(&dims, &tops, 840.0, 0.0, 0.0);
         assert!(s == 0, "首帧应从首页开始，实际 s={s}");
         assert!(e <= 4, "不越界，实际 e={e}");
     }

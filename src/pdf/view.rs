@@ -265,8 +265,8 @@ impl PdfViewer {
         self.scroll.set_offset(gpui::point(px(0.), px(-top)));
     }
 
-    /// 页数（测试 / 状态栏使用；文档尚未加载完时为 0）。
-    #[allow(dead_code)]
+    /// 页数（仅测试消费；文档尚未加载完时为 0）。
+    #[cfg(test)]
     pub fn page_count(&self) -> usize {
         self.dims.len()
     }
@@ -281,12 +281,12 @@ impl PdfViewer {
         }
         // 首帧 `scroll` 偏移为 0 → `first_visible_page` 起始页即第 1 页，布局后精确。
         let scroll_y = f32::from(-self.scroll.offset().y);
-        let first = first_visible_page(&self.dims, self.page_width(), scroll_y);
+        let first = first_visible_page(&self.dims, &self.page_tops, self.page_width(), scroll_y);
         Some((first + 1, self.dims.len()))
     }
 
-    /// 是否已加载完成（测试用）。
-    #[allow(dead_code)]
+    /// 是否已加载完成（仅测试消费）。
+    #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
         !self.loading && self.worker.is_some() && !self.dims.is_empty()
     }
@@ -480,7 +480,7 @@ impl PdfViewer {
         self.last_scroll_y = scroll_y;
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
-        let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
+        let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
         let center = (start + end) / 2;
 
         // 4) L0 缩略图内存封顶：保留数超 THUMB_CACHE_PAGES 时丢离视口中心最远的，
@@ -1979,7 +1979,7 @@ impl PdfViewer {
     ) -> gpui::AnyElement {
         let scroll_y = f32::from(-self.scroll.offset().y);
         let viewport_h = f32::from(self.scroll.bounds().size.height);
-        let (start, end) = keep_window(&self.dims, page_width, scroll_y, viewport_h);
+        let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
         // 预取可见窗口文本层（低优先级懒加载）：交互时命中测试/复制/高亮已就绪。
         // 快速拖动时**跳过**——正在飞掠的页文本提取纯属浪费；停止后恢复预取。
         if !self.prev_fast {
