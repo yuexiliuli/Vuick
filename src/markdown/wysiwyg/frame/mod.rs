@@ -459,6 +459,12 @@ fn pass2_shape_band(
                         // id≠0 逃过上面的 notdef 检测、会被直接缓存钉住（caret 行正常 /
                         // 非 caret 行方框的翻转就是它）。不缓存首次结果：标记已校验 + 冷却
                         // 一帧强制第二次真实重排（实测第二次即正常），次排走正常缓存路径。
+                        // ── M5-B4 决策：**保留**（先发防御，非「把回退成功当完成」的短路）──
+                        // 它防的是「回退成功但一手字形是错误占位」被直接缓存钉住——删掉会把
+                        // caret/非 caret 翻转回归。本机无法稳定构造 COLR 失败真机场景 → 以
+                        // 静态结论保留、未真机实测；如需评估去留：WY_NOTDEF_DEBUG=1 观察
+                        // pass2 fallback-verify 是否仍触发 + 二次重排 run 字体/glyph 稳定，
+                        // 稳定即可考虑裁剪（见 cache.rs `NotdefRetry` 的 M4 归档注释）。
                         editor.mark_fallback_verified(k);
                         editor.verify_cool(k);
                         window.refresh();

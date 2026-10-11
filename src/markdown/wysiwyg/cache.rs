@@ -146,8 +146,19 @@ impl RowShapeCache {
 /// 重排后让该键一帧不被引用 → 两帧缓存自然淘汰 → 下一次重排才是新键、真打到平台。
 /// 连续 `NOTDEF_RETRY_ATTEMPTS` 次真实平台重排仍坏 → 判定字符确实无字形（正确显示
 /// tofu），落入 `settled` 从此不再重排空转。冷启动 DWrite 首次 shape 回退字形可能给
-/// .notdef、第二次同 (font,size) 即正常——3 帧内自愈；给 15 次余量（≈0.5s）。
-pub(crate) const NOTDEF_RETRY_ATTEMPTS: u32 = 15;
+/// .notdef、第二次同 (font,size) 即正常——**自愈约 3 帧就够**；8 次（≈0.27s@30fps）
+/// 比 3 帧仍富余、又比旧值 15 次（≈0.5s）减半冗余（M5-B4 瘦身）；重试仅在真 notdef
+/// 时才占预算，普通文本零成本。
+pub(crate) const NOTDEF_RETRY_ATTEMPTS: u32 = 8;
+
+// ═══ M4 跳过归档：本仓 P1 冷启动 emoji 缺陷的**永久驻留防御**（勿删）═══
+// P1 冷启动 emoji：Windows COLR 光栅失败被字模缓存钉住，上游 zed（含 93d7456）未修；
+// M4 vendor gpui_windows+[patch] 已决定跳过 → 本组件为本仓永久驻留防御，勿删；若升级
+// gpui 或引入 vendor 修复可整体移除并删除本注释。
+// 本类型（+ `NOTDEF_RETRY_ATTEMPTS`）与 `warm.rs`、Pass2 的 notdef/回退校验桥接同属
+// 这套防御体系：`verified`（非零占位字形校验）、`last`（冷却帧几何复用防闪跳）、
+// `cool_start`/`verify_cool`（冷却一帧破 LineLayoutCache 自愈）共为一块，改任何一处
+// 前先读 `WY_NOTDEF_DEBUG` 实测取证（`docs/debug-envs.md`），勿各自裁剪。
 
 /// `.notdef`（回退未命中）坏块的自愈状态机（被 [`element::build_frame`] Pass2 驱动）。
 /// 每次「真实平台重排」出 notdef 后登记一次并转冷却；冷却帧**不调用 gpui shape**——

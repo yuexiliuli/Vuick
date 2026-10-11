@@ -177,7 +177,8 @@ fn stale_verdicts_cleared_on_generation_change(cx: &mut TestAppContext) {
     let verified = |vcx: &mut VisualTestContext, b: usize| -> bool {
         vcx.update(|_, cx| host.read(cx).ed.read(cx).fallback_verified(b))
     };
-    // 构造"上一代判决"：块 5 被置 verified；块 7 被置 settled（15 次重排仍坏）。
+    // 构造"上一代判决"：块 5 被置 verified；块 7 被置 settled（NOTDEF_RETRY_ATTEMPTS
+    // 次重排仍坏，值为常数 8，勿在测试里硬编码具体次数）。
     vcx.update(|_, cx| host.read(cx).ed.read(cx).mark_fallback_verified(5));
     for _ in 0..NOTDEF_RETRY_ATTEMPTS {
         vcx.update(|_, cx| {

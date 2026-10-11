@@ -1,3 +1,10 @@
+// ═══ M4 跳过归档：本仓 P1 冷启动 emoji 缺陷的**永久驻留防御**（勿删）═══
+// P1 冷启动 emoji：Windows COLR 光栅失败被字模缓存钉住，上游 zed（含 93d7456）未修；
+// M4 vendor gpui_windows+[patch] 已决定跳过 → 本组件为本仓永久驻留防御，勿删；若升级
+// gpui 或引入 vendor 修复可整体移除并删除本注释。
+// 本文件 = 进程级 COLR 光栅预热（一次/进程），与 cache.rs 的 `NotdefRetry` 状态机、
+// frame/mod.rs Pass2 的 notdef/回退校验桥接同属一套防御体系（改前先读
+// `WY_NOTDEF_DEBUG` / `WY_WARM_DEBUG` 实测取证，`docs/debug-envs.md`）。
 use gpui::{point, px, Window};
 
 /// 进程级 warm 状态（一次/进程）：`WARM_DONE` 置位后，各窗格 paint 顶首先查

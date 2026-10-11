@@ -378,6 +378,9 @@ impl WyEditor {
     }
 
     /// notdef 后保存本帧几何（供随后的冷却帧 [`Self::cooling_row`] 显示复用）。
+    /// **勿删**：冷却帧不调用 gpui shape，若丢弃上一份几何会让该行在冷却帧「没有可画
+    /// 的行」或退化为空占位 → 几何与新鲜重排不一致 → 冷却帧闪跳（换代/滚动时尤其显眼）。
+    /// 保留它 = 以「可能仍坏的上一帧」换「不闪跳」，与 `NotdefRetry::last` 字段配套。
     pub(crate) fn cool_keep_last(&self, block: usize, row: std::rc::Rc<element::ShapedRow>) {
         self.notdef_retry.borrow_mut().last.insert(block, row);
     }
