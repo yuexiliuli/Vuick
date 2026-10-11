@@ -369,6 +369,9 @@ pub fn parse_block_window_rope(rope: &Rope, index: &BlockIndex, lo: usize, hi: u
 ///
 /// 不包含：`toc` / `code_scroll` / `table_scroll` 等辅助结构、文本整形/字体缓存。
 /// 用于定位“解析结果把文档放大多少倍”（15 万行 ≈ 30MB+ 的量级来自此处）。
+/// `#[allow(dead_code)]`：preview 迁移到 `PreviewRow`（M5-B5 P3-1a）后仅本模块测试消费
+/// （`view` 用其 `PreviewRow` 同口径变体 `preview_rows_memory_estimate`）。
+#[allow(dead_code)]
 pub(crate) fn rows_memory_estimate(rows: &[Row]) -> (usize, usize) {
     /// 每个独立堆分配的近似分配器开销（head + 对齐 + 页头分摊）。
     const ALLOC_OVERHEAD: usize = 32;

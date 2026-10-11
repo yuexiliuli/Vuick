@@ -119,7 +119,7 @@ fn shared_shard_height_matches_preview_row(cx: &mut TestAppContext) {
             let ix = md
                 .rows
                 .iter()
-                .position(|r| r.kind == RowKind::Paragraph)
+                .position(|r| r.docrow.kind == IrKind::Paragraph)
                 .expect("应有段落行");
             let h = md
                 .list_state
@@ -476,6 +476,110 @@ fn docrow_for_height_matches_doc_docrow_shard(cx: &mut TestAppContext) {
         failures
     });
     assert!(failures.is_empty(), "docrow_for_height 与真实 DocRow 高度不一致：\n{}", failures.join("\n"));
+}
+
+/// M5-B5 P3-1a：预览渲染行源切共享 `DocRow` 后，预览侧装配的 `DocRow` 与真实
+/// `Doc::rows_in_block_window` **逐字段一致**（kind/src_line/lines/text/runs/byte_map/
+/// payload/table_rows）——钉死「`DocRow.byte_map` 正常提供、字节反射语义保真」的前提，
+/// 且 Str 小文档全量路径与 Rope 大文档窗口路径**双源**都被锁住（渲染/命中/选择不变，
+/// 只是行数据源换成共享 Doc 行型）。
+#[gpui::test]
+fn preview_docrows_match_doc_rows_in_block_window(cx: &mut TestAppContext) {
+    use crate::config::limits::WINDOWED_MIN_BLOCKS;
+    use crate::markdown::doc::Doc;
+    use crate::markdown::parse::scan_blocks_rope;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    // —— ① 小文档全量路径（Str 源）：混合行型；预览 `rows` 的 DocRow == Doc 全量窗口。
+    let src = "# 标题 **加粗** 与 `代码`\n正文第二段，含 *斜体* 与 ~~删除~~。\n\n- 列表项\n  - 嵌套\n1. 有序\n> 引述\n\n```rust\nlet a = 1;\nlet b = 2;\n```\n\n| 列A | 列B |\n| :- | -: |\n| 1 | 2 |\n\n![图](a.png)\nשלום עולם";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    cx.simulate_resize(size(px(700.), px(500.)));
+    settle(cx);
+    let doc = Doc::open(src.into());
+    let n = doc.block_count();
+    let expect_ok = doc.rows_in_block_window(0, n - 1);
+    let got = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        assert!(md.index.is_none(), "小文档应走全量路径");
+        md.rows.iter().map(|r| r.docrow.clone()).collect::<Vec<_>>()
+    });
+    assert_eq!(got.len(), expect_ok.len(), "预览行数应与 Doc 块数对齐（全量路径）");
+    for (i, (g, e)) in got.iter().zip(expect_ok.iter()).enumerate() {
+        assert_eq!(g, e, "全量路径 row[{i}] DocRow 不一致（kind/text/byte_map/payload 应逐位相同）");
+    }
+
+    // —— ② 大文档窗口路径（Rope 源）：当前窗口 `win_rows` 的 DocRow == Doc 同窗口。
+    let mut big = String::new();
+    for i in 0..WINDOWED_MIN_BLOCKS + 600 {
+        big.push_str(&format!("# 标题 {i}\n\n正文段落 {i} **粗** `码`\n\n- 项 {i}\n\n```rust\nlet x = {i};\n```\n\n"));
+    }
+    let rope = ropey::Rope::from(big.as_str());
+    let index = std::rc::Rc::new(scan_blocks_rope(&rope));
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| {
+            md.set_source_with_index(PreviewSrc::Rope(rope.clone()), index, cx);
+        });
+    });
+    cx.simulate_resize(size(px(400.), px(600.)));
+    settle(cx);
+    let (win_lo, got) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        assert!(md.index.is_some(), "大文档应走窗口模式");
+        (
+            md.win_lo,
+            md.win_rows.iter().map(|r| r.docrow.clone()).collect::<Vec<_>>(),
+        )
+    });
+    let doc = Doc::open_rope(rope);
+    let hi = win_lo.saturating_add(got.len()).saturating_sub(1);
+    let expect_win = doc.rows_in_block_window(win_lo, hi);
+    assert_eq!(got.len(), expect_win.len(), "窗口行数应与 Doc 块数一致（窗口路径）");
+    for (i, (g, e)) in got.iter().zip(expect_win.iter()).enumerate() {
+        assert_eq!(
+            g,
+            e,
+            "窗口路径 row[{win_lo}+{i}] DocRow 不一致（byte_map 应逐位相同）"
+        );
+    }
+
+    // —— ③ Rope 窗口路径滚到底：末窗口含**末块**，验证 `line_count()`（ropey
+    // `len_lines(LF)` == `split('\n')`）与 Doc 末块 `lines` 上界逐位一致。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, _| md.scroll_to_px(1e9));
+    });
+    cx.update(|window, cx| {
+        for _ in 0..6 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
+    let (win_lo, got) = cx.update(|_, cx| {
+        let md = host.read(cx).md.read(cx);
+        (
+            md.win_lo,
+            md.win_rows.iter().map(|r| r.docrow.clone()).collect::<Vec<_>>(),
+        )
+    });
+    let hi = win_lo.saturating_add(got.len()).saturating_sub(1);
+    let expect_tail = doc.rows_in_block_window(win_lo, hi);
+    assert!(hi + 1 == doc.block_count(), "末窗口应收束到末块（hi={hi}）");
+    for (i, (g, e)) in got.iter().zip(expect_tail.iter()).enumerate() {
+        assert_eq!(
+            g,
+            e,
+            "末窗口 row[{win_lo}+{i}] DocRow 不一致（末块 lines 上界应一致）"
+        );
+    }
 }
 
 /// M5-B5 Phase 2/3 **unified 小文档量程精确化**：统一高度提示（`est_hint`，未偏置）seed

@@ -27,6 +27,7 @@ pub(crate) use rows::{
     ImgRef, inline_style_mapped, parse_image_line, parse_ref, split_table_cells,
     split_table_cells_mapped, text_segment,
 };
+#[allow(unused_imports)] // 兼容重导出：citation_index_from_rows 在 preview 迁移到 PreviewRow 后仅 parse 测试消费
 pub use citations::{CitationIndex, citation_index_from_rows, scan_citations};
 #[allow(unused_imports)] // 兼容重导出：BlocksIter 为公开类型但内部无人逐名引用；scan_blocks 供 markdown 级 #[cfg(test)] 重导出消费
 pub use blocks::{BlockIndex, BlockMeta, Blocks, BlocksIter, BlocksSeg, Toc, scan_blocks};
@@ -36,5 +37,6 @@ pub use blocks_scan::{
     parse_block_window, parse_block_window_rope, scan_blocks_incremental_rope, scan_blocks_rope,
 };
 pub(crate) use blocks_scan::scan_blocks_incremental_rope_blocks_only;
+#[allow(unused_imports)] // 兼容重导出：rows_memory_estimate 在 preview 迁移到 PreviewRow 后仅 parse 测试消费
 pub(crate) use blocks_scan::rows_memory_estimate;
 #[cfg(test)] pub(crate) use blocks_scan::next_line_byte;

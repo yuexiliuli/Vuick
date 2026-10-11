@@ -18,12 +18,100 @@ use crate::config::markdown::{
     CONTENT_EDGE_PAD_X_PX, IMAGE_MAX_W, IMAGE_ROW_DEFAULT_H, QUOTE_BAR_COLOR,
     QUOTE_BAR_WIDTH_PX, TABLE_SCROLLBAR_RESERVE_PX,
 };
-use crate::markdown::parse::{Row, RowAlign, RowKind, RunKind};
+use crate::markdown::doc::{DocPayload, DocRow};
+use crate::markdown::ir::IrKind;
+use crate::markdown::parse::{Row, RowAlign, RunKind};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
 use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
 
 use super::{NoteCtx, NoteHit, TextCtx, TextHit};
+
+/// 预览渲染行：统一行 [`DocRow`]（`kind/text/runs/payload/byte_map`，与
+/// `Doc::rows_in_block_window` 逐位一致，WYSIWYG 同源）+ 预览侧**展示附加**——
+/// [`DocRow`] 为 WYSIWYG 编辑侧语义，不携带纯展示字段：列表前缀 / 行对齐（EPUB
+/// `%%ALIGN:X%%`）/ 引注标记（`[^n]`/`[!n]`）/ 图片固有尺寸与内存图。行物化时由
+/// `parse::Row`（解析直出）装配（M5-B5 P3-1a：渲染行源切共享 `DocRow`）。
+///
+/// 行源不再直接是 `parse::Row`：渲染/命中只读它 + [`DocRow`]，为 P3-1b 删 `row.rs`
+/// /`TextTrack` 的平替清路（`PreviewRow` 即「共享 `DocRow` + 展示附加」的预览行型）。
+#[derive(Debug, Clone)]
+pub(crate) struct PreviewRow {
+    /// 统一行（共享装配核心产出；`byte_map`/`lines`/`table_rows` 语义与 `Doc` 一致）。
+    pub docrow: DocRow,
+    /// 列表项前缀（`•` / `-` / `1.`…；补在显示文本前；[`Row`] 同字段）。
+    pub prefix: Option<gpui::SharedString>,
+    /// 行对齐（EPUB 排版指令 `%%ALIGN:X%%`；None = 默认左对齐；[`Row`] 同字段）。
+    pub align: Option<RowAlign>,
+    /// 文内引注标记 `[^n]`：`(字节区间, 注记号)`，区间相对 `docrow.text`（[`Row`] 同字段）。
+    pub notes: Vec<(Range<usize>, usize)>,
+    /// 注释**定义**标记 `[!n]`：同上（[`Row`] 同字段）。
+    pub note_defs: Vec<(Range<usize>, usize)>,
+    /// 图片固有宽（px）；`docrow.payload` = 源（[`Row`] 载荷字段；DocRow 不携带）。
+    pub img_w: Option<u32>,
+    /// 图片固有高（px）。
+    pub img_h: Option<u32>,
+    /// 内存图数据（EPUB 不落盘场景；`ImageSource::Image` 解码用）。
+    pub img_data: Option<std::sync::Arc<gpui::Image>>,
+}
+
+impl PreviewRow {
+    /// 由共享装配出的 [`DocRow`] + 原始解析行 [`Row`] 的展示附加拼装（`Row` 仅此一处
+    /// 被消费；图片源/尺寸须在调用前经 `resolve_image_rows` 解析）。
+    pub(crate) fn from_parts(docrow: DocRow, r: &Row) -> Self {
+        let (img_w, img_h, img_data) = match r.image() {
+            Some(i) => (i.img_w, i.img_h, i.img_data.cloned()),
+            None => (None, None, None),
+        };
+        Self {
+            docrow,
+            prefix: r.prefix.clone(),
+            align: r.align,
+            notes: r.notes.clone(),
+            note_defs: r.note_defs.clone(),
+            img_w,
+            img_h,
+            img_data,
+        }
+    }
+
+    /// 行语义（IR 金标准）。
+    pub(crate) fn kind(&self) -> IrKind {
+        self.docrow.kind
+    }
+
+    /// 代码块的所有源码行（非代码行返回空切片）——从 [`DocPayload::Code`] 取。
+    pub(crate) fn code_lines(&self) -> &[gpui::SharedString] {
+        match &self.docrow.payload {
+            DocPayload::Code { code_lines, .. } => code_lines,
+            _ => &[],
+        }
+    }
+
+    /// 代码块的语言标记（围栏首行信息串；无标记/非代码行返回 `None`）。
+    pub(crate) fn code_language(&self) -> Option<&str> {
+        match &self.docrow.payload {
+            DocPayload::Code { language, .. } => language.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// 表格结构（仅 [`IrKind::Table`] 行）——从 [`DocPayload::Table`] 取。
+    pub(crate) fn table(&self) -> Option<&crate::markdown::parse::TableData> {
+        match &self.docrow.payload {
+            DocPayload::Table(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// 图片源（仅 [`IrKind::Image`] 行）——从 [`DocPayload::Image`] 取。
+    pub(crate) fn image_src(&self) -> &str {
+        match &self.docrow.payload {
+            DocPayload::Image { src } => src.as_ref(),
+            _ => "",
+        }
+    }
+}
 
 /// 预览后端是否为 `unified`（M5-B5 Phase 2 开关）：unified 下把文本行间距显式钉到
 /// **共享 shard 行高系数**（para_line/heading_line，单一源 `StyleParams`），
@@ -641,13 +729,13 @@ pub(crate) struct RowRenderCtx<'a> {
 }
 
 /// 行内文本子元素的浓缩调用：Paragraph / Heading / Quote 三种纯文本行类型共享的
-/// `text_child` 参数表几乎完全一致（`&row.text`/`&row.runs`/`&row.notes`/
-/// `&row.note_defs` 都来自 row），仅 `base` TextStyle 随行种不同。
+/// `text_child` 参数表几乎完全一致（`&row.docrow.text`/`&row.docrow.runs`/`&row.notes`/
+/// `&row.note_defs` 都来自行），仅 `base` TextStyle 随行种不同。
 /// 提取该助手以消除 `render_row` 双分支间的 13 参重复。
 #[inline]
 #[allow(clippy::too_many_arguments)] // 行内文本子元素：输入互为正交
 fn text_child_for_row(
-    row: &Row,
+    row: &PreviewRow,
     p: &Rc<StyleParams>,
     search: Option<(Range<usize>, Hsla)>,
     selection: Option<(Range<usize>, Hsla)>,
@@ -658,8 +746,8 @@ fn text_child_for_row(
     note_ctx: &Rc<NoteCtx>,
 ) -> gpui::AnyElement {
     text_child(
-        &row.text,
-        &row.runs,
+        &row.docrow.text,
+        &row.docrow.runs,
         p,
         search,
         selection,
@@ -678,7 +766,7 @@ fn text_child_for_row(
 /// 然后交给 `text_child` 渲染。用于消除 `render_row` 中 wrap 与非 wrap 双分支的重复。
 #[allow(clippy::too_many_arguments)] // 行内文本子元素：输入互为正交
 fn bullet_text_child(
-    row: &Row,
+    row: &PreviewRow,
     p: &Rc<StyleParams>,
     search: Option<(Range<usize>, Hsla)>,
     selection: Option<(Range<usize>, Hsla)>,
@@ -687,13 +775,13 @@ fn bullet_text_child(
     text_ctx: &Rc<TextCtx>,
     note_ctx: &Rc<NoteCtx>,
 ) -> gpui::AnyElement {
-    let mut text = row.text.to_string();
+    let mut text = row.docrow.text.to_string();
     if let Some(prefix) = &row.prefix {
         text = format!("{prefix} {text}");
     }
     let display = gpui::SharedString::from(text);
     let shift = row.prefix.as_ref().map_or(0, |s| s.len() + 1);
-    let runs = shift_runs(&row.runs, shift);
+    let runs = shift_runs(&row.docrow.runs, shift);
     let notes: Vec<(Range<usize>, usize)> = row
         .notes
         .iter()
@@ -728,7 +816,7 @@ fn bullet_text_child(
 }
 
 pub(crate) fn render_row(
-    row: &Row,
+    row: &PreviewRow,
     ctx: &RowRenderCtx,
     cx: &mut App,
 ) -> gpui::AnyElement {
@@ -738,28 +826,28 @@ pub(crate) fn render_row(
     let p: &Rc<StyleParams> = p;
     let table_handle: Option<ScrollHandle> = table_handle.clone();
     // 表格行（GFM pipe table 整体折叠成一渲染行；自带块内横向滚动容器）。
-    if let RowKind::Table = row.kind {
+    if let IrKind::Table = row.kind() {
         return render_table_row(row, p, table_handle);
     }
     // 独立图片行：按固有比例显示，高度随可用宽度自适应。
-    if let RowKind::Image = row.kind {
+    if let IrKind::Image = row.kind() {
         return render_image_row(row, p);
     }
 
-    match row.kind {
+    match row.kind() {
         // 代码保持不换行：整个围栏折叠成一个渲染行（多行紧贴相连成连续块），
         // 自带块内横向滚动容器（`md-code-scroll` + 句柄），不撑大页面列宽。
-        RowKind::Code => render_wrapped_code(row, ctx, cx),
-        RowKind::Paragraph => render_wrapped_paragraph(row, ctx, cx),
-        RowKind::Heading(_) => render_wrapped_heading(row, ctx, cx),
-        RowKind::Quote => render_wrapped_quote(row, ctx, cx),
-        RowKind::Bullet => render_wrapped_bullet(row, ctx, cx),
-        RowKind::Blank => {
+        IrKind::Code => render_wrapped_code(row, ctx, cx),
+        IrKind::Paragraph => render_wrapped_paragraph(row, ctx, cx),
+        IrKind::Heading(_) => render_wrapped_heading(row, ctx, cx),
+        IrKind::Quote => render_wrapped_quote(row, ctx, cx),
+        IrKind::Bullet => render_wrapped_bullet(row, ctx, cx),
+        IrKind::Blank => {
             // unified：空行也按共享 shard 口径（文本叶 1 行 = para_line）。
             let h = if unified_text() { p.para_line } else { p.blank_h };
             div().h(h).w_full().flex_shrink_0().into_any_element()
         }
-        RowKind::Rule => {
+        IrKind::Rule => {
             // unified：分隔线按共享 shard 口径（文本叶 1 行 = para_line）。
             let h = if unified_text() { p.para_line } else { p.rule_h };
             div()
@@ -772,14 +860,14 @@ pub(crate) fn render_row(
                 .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full())
                 .into_any_element()
         }
-        RowKind::Table => unreachable!("表格已在上方提前返回"),
-        RowKind::Image => unreachable!("图片行已在上方提前返回"),
+        IrKind::Table => unreachable!("表格已在上方提前返回"),
+        IrKind::Image => unreachable!("图片行已在上方提前返回"),
     }
 }
 
 /// 换行模式：围栏代码块折叠成连续块（逐行堆叠）+ 自带头部横向滚动容器（正文折行、
 /// 代码不折；底部单一横向滚动条方便长行）。
-fn render_wrapped_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+fn render_wrapped_code(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
     let RowRenderCtx {
         p,
         code_handle,
@@ -846,7 +934,7 @@ fn render_wrapped_code(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::Any
 }
 
 /// 换行模式：正文段（可含行内对齐）；行首缩进 2 字符由 EPUB 转换器前置「　　」。
-fn render_wrapped_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+fn render_wrapped_paragraph(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
     let RowRenderCtx {
         p,
         search,
@@ -903,7 +991,7 @@ fn render_wrapped_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui
 }
 
 /// 换行模式：标题（1-6 级）；EPUB 章/节标题默认居中（行内可显式指定对齐）。
-fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+fn render_wrapped_heading(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
     let RowRenderCtx {
         p,
         epub,
@@ -925,7 +1013,7 @@ fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::
     let row_ix: usize = *row_ix;
     let dark = crate::ui::theme::Theme::global(cx).is_dark();
     let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
-    let RowKind::Heading(n) = row.kind else {
+    let IrKind::Heading(n) = row.kind() else {
         unreachable!("只应在 Heading 行调用")
     };
     let (fs, lh) = p.heading_metrics(n);
@@ -970,7 +1058,7 @@ fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::
 }
 
 /// 换行模式：引述行（背景/左边框移到内层，灰带紧贴成整片；行内对齐作用于引述带内容）。
-fn render_wrapped_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+fn render_wrapped_quote(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
     let RowRenderCtx {
         p,
         search,
@@ -1038,7 +1126,7 @@ fn render_wrapped_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::An
 }
 
 /// 换行模式：列表项（项目符号接正文）。
-fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
+fn render_wrapped_bullet(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
     let RowRenderCtx {
         p,
         search,
@@ -1080,7 +1168,7 @@ fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::A
 /// 页面恒换行下表格**始终**自带横向滚动容器 + Always 滚动条：超宽表格在块内横向滚动，
 /// 不再被视口裁剪遮挡（对齐代码块方案）。 */
 fn render_table_row(
-    row: &Row,
+    row: &PreviewRow,
     p: &Rc<StyleParams>,
     table_handle: Option<ScrollHandle>,
 ) -> gpui::AnyElement {
@@ -1141,13 +1229,12 @@ fn render_table_row(
 
 
 /** 独立图片行：按图片固有比例显示，高度随可用宽度自适应（缩小窗口不出现大片留白）。 */
-fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
-    let info = row.image();
-    let src = info.map(|i| i.src.to_string()).unwrap_or_default();
-    let alt = row.text.clone();
+fn render_image_row(row: &PreviewRow, p: &Rc<StyleParams>) -> gpui::AnyElement {
+    let src = row.image_src().to_string();
+    let alt = row.docrow.text.clone();
     let fallback_color = p.muted_fg;
 
-    let img_el = match info.and_then(|i| i.img_data.cloned()) {
+    let img_el = match row.img_data.clone() {
         // 内存图片（EPUB 不落盘）：ImageSource::Image 走 ImageDecoder 由字节解码
         Some(image) => img(gpui::ImageSource::Image(image))
             .object_fit(ObjectFit::Contain)
@@ -1201,10 +1288,8 @@ fn render_image_row(row: &Row, p: &Rc<StyleParams>) -> gpui::AnyElement {
     // 已知固尺寸：图片盒宽 = min(视口宽, IMAGE_MAX_W)，高由宽 * h/w 得出
     //（aspect_ratio 使高度随可用宽度缩放 → 缩小窗口不会留白）；
     // 外层铺满宽度并 justify_center，使图片盒在窄于 600px 的视口里也水平居中。
-    let (img_w, img_h) = match row.image() {
-        Some(i) => (i.img_w, i.img_h),
-        None => (None, None),
-    };        let box_ = match (img_w, img_h) {
+    let (img_w, img_h) = (row.img_w, row.img_h);
+    let box_ = match (img_w, img_h) {
         (Some(w), Some(h)) if w > 0 && h > 0 => div()
             .w_full()
             .max_w(px(IMAGE_MAX_W))

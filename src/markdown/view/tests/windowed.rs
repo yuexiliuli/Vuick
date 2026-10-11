@@ -296,13 +296,16 @@ fn windowed_incremental_window_matches_full_reparse(cx: &mut TestAppContext) {
         let ref_rows = parse_block_window_rope(&rope0, &idx0, lo, hi);
         (lo, md.win_rows.clone(), ref_rows)
     });
-    let join = |rs: &[crate::markdown::parse::Row]| -> String {
+    let join = |rs: &[PreviewRow]| -> String {
+        rs.iter().map(|r| r.docrow.text.as_ref()).collect::<Vec<_>>().join("\n")
+    };
+    let join_row = |rs: &[crate::markdown::parse::Row]| -> String {
         rs.iter().map(|r| r.text.as_ref()).collect::<Vec<_>>().join("\n")
     };
     assert!(!win_rows.is_empty(), "应有窗口行");
     assert_eq!(
         join(&win_rows),
-        join(&ref_rows),
+        join_row(&ref_rows),
         "增量拼接窗口（win_lo={win_lo}）应与整窗重解析逐行一致"
     );
 }

@@ -60,18 +60,21 @@ use crate::config::markdown::{
     ROW_OVERDRAW_PX, TABLE_SCROLLBAR_RESERVE_PX,
 };
 use crate::config::timing::HIGHLIGHT_MS;
+use crate::markdown::doc::{assemble_docrow_window, DocLineView, DocPayload, DocRow};
+use crate::markdown::ir::IrKind;
 use crate::markdown::parse::{
-    citation_index_from_rows, parse_block_window, parse_block_window_rope, parse_to_rows,
-    rows_memory_estimate, scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row,
-    RowKind, RowPayload, Toc,
+    build_line_starts_u32, parse_block_window, parse_block_window_rope, parse_to_rows,
+    scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row, RowKind, RowPayload,
+    RunKind, Toc,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
 
+use crate::editor::rope_ext::RopeExt;
 use crate::markdown::layout::docrow_for_height;
 use crate::markdown::layout::shape_docrow_shard;
 use crate::markdown::wysiwyg::WyTheme;
 use dimensions::{image_dimensions, image_dimensions_bytes};
-use row::{render_row, RowRenderCtx};
+use row::{render_row, PreviewRow, RowRenderCtx};
 use style::StyleParams;
 
 /// EPUB 脚注悬浮命中：一行内某个 `[n]` 标记在**上一帧**的画面矩形 + 对应注释正文。
@@ -241,7 +244,7 @@ impl PreviewSrc {
         match self {
             PreviewSrc::Str(s) => s.lines().count(),
             PreviewSrc::Rope(r) => {
-                use crate::editor::rope_ext::RopeExt;
+use crate::editor::rope_ext::RopeExt;
                 r.lines_len()
             }
         }
@@ -257,6 +260,76 @@ impl From<Rope> for PreviewSrc {
 impl From<SharedString> for PreviewSrc {
     fn from(s: SharedString) -> Self {
         PreviewSrc::Str(s)
+    }
+}
+
+/// 预览侧 [`DocLineView`]：给共享 `DocRow` 装配（[`assemble_docrow_window`]）提供按行
+/// 索引/文本，口径与 [`crate::markdown::doc::DocLineView for Doc`] **完全一致**：
+/// - `Str`：预建行起始表（`self.line_starts`，在 `set_source_with_index` 一次性 O(n) 建表）
+///   + 全文切片；
+/// - `Rope`：走 ropey 内建行索引（`line_to_byte_idx`/`len_lines(LF)`）+ 源切片——不额外
+///   物化行表，保持「窗口级懒解析 / rope COW」的性能底座（O(log n) 每次访问）。
+pub(crate) enum PreviewLineView<'a> {
+    Str { table: &'a [usize], text: &'a str },
+    Rope(&'a Rope),
+}
+
+impl<'a> PreviewLineView<'a> {
+    pub(crate) fn new(src: &'a PreviewSrc, table: &'a [usize]) -> Self {
+        match src {
+            PreviewSrc::Str(s) => PreviewLineView::Str { table, text: s.as_ref() },
+            PreviewSrc::Rope(r) => PreviewLineView::Rope(r),
+        }
+    }
+}
+
+/// 剥 `Doc::line_str` 同式的行尾换行（`'\n'` 后可能还有 `'\r'`）。
+fn strip_line_ending(t: &mut String) {
+    if t.ends_with('\n') {
+        t.pop();
+    }
+    if t.ends_with('\r') {
+        t.pop();
+    }
+}
+
+impl DocLineView for PreviewLineView<'_> {
+    fn line_start(&self, ix: usize) -> usize {
+        match self {
+            PreviewLineView::Str { table, text } => {
+                table.get(ix).copied().unwrap_or(text.len())
+            }
+            PreviewLineView::Rope(r) => {
+                r.point_to_offset(crate::editor::rope_ext::Point::new(ix, 0))
+            }
+        }
+    }
+    fn line_count(&self) -> usize {
+        match self {
+            PreviewLineView::Str { table, .. } => table.len(),
+            PreviewLineView::Rope(r) => r.lines_len(),
+        }
+    }
+    fn line_str(&self, ix: usize) -> String {
+        let (s, e, n) = match self {
+            PreviewLineView::Str { table, text } => {
+                let s = table.get(ix).copied().unwrap_or(text.len());
+                let e = table.get(ix + 1).copied().unwrap_or(text.len());
+                (s, e, text.len())
+            }
+            PreviewLineView::Rope(r) => {
+                let s = r.line_start_offset(ix);
+                let e = r.line_start_offset(ix + 1);
+                (s, e.min(r.len()), r.len())
+            }
+        };
+        let (s, e) = (s.min(n), e.min(n).max(s));
+        let mut t = match self {
+            PreviewLineView::Str { text, .. } => text[s..e].to_string(),
+            PreviewLineView::Rope(r) => r.slice(s..e).to_string(),
+        };
+        strip_line_ending(&mut t);
+        t
     }
 }
 
@@ -310,7 +383,9 @@ pub(crate) fn set_preview_backend(b: PreviewBackend) {
 
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {
-    rows: Rc<Vec<Row>>,
+    /// 全量路径（小文档）的渲染行（每行 = 统一行 [`DocRow`] + 预览展示附加；图片源/
+    /// 尺寸已在装配时解析）。窗口模式保持空。
+    rows: Rc<Vec<PreviewRow>>,
     list_state: ListState,
     /// 背景色覆盖（由应用传入，与编辑区保持一致；None 用主题背景）。
     bg: Option<Hsla>,
@@ -408,7 +483,14 @@ pub struct MarkdownPreview {
     /// 已物化窗口的全局块下标（`win_rows[0]` 对应第 `win_lo` 块）。
     win_lo: usize,
     /// 已物化的当前窗口行（全局块下标 `win_lo..win_lo+len`；窗口模式才有内容）。
-    win_rows: Rc<Vec<Row>>,
+    /// 行型 = 统一行 [`DocRow`]（`byte_map`/`payload` 与 `Doc::rows_in_block_window`
+    /// 逐位一致）+ [`PreviewRow`] 展示附加（M5-B5 P3-1a：渲染行源切共享 DocRow）。
+    win_rows: Rc<Vec<PreviewRow>>,
+    /// 当前源的「行起始字节偏移表」（`split('\n')` 口径，与 `Doc::line_starts` 同语义）：
+    /// 装配共享 `DocRow`（`byte_map`/`lines`/`table_rows`）时喂 [`assemble_docrow_window`]。
+    /// `Str` 源在 [`Self::set_source_with_index`] 一次性建表；`Rope` 源走 ropey 内建行索引
+    /// （本表置空，见 [`PreviewLineView`]）。
+    line_starts: Rc<Vec<usize>>,
     /// 固定窗口虚拟化（窗口模式）：ListState 窗口首行的**绝对块下标**。
     /// ListState 只持 [`PREVIEW_LIST_WINDOW`] 条，渲染闭包把相对 item_ix 抬成
     /// 绝对块 `= win_base + ix` 取行；目标滚出窗口即重定位本字段并 `reset`。
@@ -492,6 +574,7 @@ impl MarkdownPreview {
             src_buf: None,
             win_lo: 0,
             win_rows: Rc::new(Vec::new()),
+            line_starts: Rc::new(Vec::new()),
             win_base: 0,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
             block_h: Vec::new(),
@@ -536,7 +619,7 @@ impl MarkdownPreview {
     pub fn search_highlight_range(&self) -> Option<(usize, std::ops::Range<usize>)> {
         let (line, query) = self.highlight_search.as_ref()?;
         let row_ix = self.row_for_line(*line)?;
-        let text = self.rows.get(row_ix)?.text.as_ref();
+        let text = self.rows.get(row_ix)?.docrow.text.as_ref();
         let range = find_text_range(text, query)?;
         Some((row_ix, range))
     }
@@ -784,8 +867,8 @@ impl MarkdownPreview {
                 };
                 scan_citations(&src)
             }
-            // 小文档：从已解析行集直接取（几乎零成本）。
-            None => citation_index_from_rows(&self.rows),
+            // 小文档：从已解析渲染行（`PreviewRow` 含引注标记）直接取（几乎零成本）。
+            None => citation_index_from_preview_rows(&self.rows),
         };
         self.cit_built_gen = self.cit_gen;
     }
@@ -936,9 +1019,9 @@ impl MarkdownPreview {
     /// 取第 `ix` 个渲染行的文本（窗口模式只能用已物化窗口行，尽力而为）。
     fn row_text_at(&self, ix: usize) -> Option<SharedString> {
         if self.index.is_some() {
-            self.win_rows.get(ix - self.win_lo).map(|r| r.text.clone())
+            self.win_rows.get(ix - self.win_lo).map(|r| r.docrow.text.clone())
         } else {
-            self.rows.get(ix).map(|r| r.text.clone())
+            self.rows.get(ix).map(|r| r.docrow.text.clone())
         }
     }
 
@@ -1005,7 +1088,7 @@ impl MarkdownPreview {
             let mid = (lo + hi) / 2;
             let src_line = match &self.index {
                 Some(idx) => idx.blocks.at(mid).src_line as usize,
-                None => self.rows[mid].src_line,
+                None => self.rows[mid].docrow.src_line,
             };
             if src_line <= line {
                 lo = mid + 1;
@@ -1052,6 +1135,19 @@ impl MarkdownPreview {
         // 记录当前滚动位置：源更新后恢复到同一逻辑位置（否则大文档每次编辑同步
         // 都会重建 ListState 跳回开头）。
         let prev_scroll = self.list_state.logical_scroll_top();
+        // 当前源的行起始表（`split('\n')` 口径，与 [`crate::markdown::doc::Doc`] 的
+        // `line_starts` 同语义）：装配共享 `DocRow`（`byte_map`/`lines`/`table_rows`）用。
+        // `Str` 一次性 O(n) 建表；`Rope` 走 ropey 内建行索引（表置空，见 [`PreviewLineView`]）。
+        let line_starts = match &src {
+            PreviewSrc::Str(s) => Rc::new(
+                build_line_starts_u32(s.as_ref())
+                    .into_iter()
+                    .map(|b| b as usize)
+                    .collect::<Vec<_>>(),
+            ),
+            PreviewSrc::Rope(_) => Rc::new(Vec::new()),
+        };
+        self.line_starts = line_starts;
         if index.blocks.len() > WINDOWED_MIN_BLOCKS {
             // ---- 大文档：窗口级懒解析 + 固定窗口虚拟化 ----
             // 整篇只保留轻量块索引（行号/类型/长度 ≈16B/行）+ 原始文本（rope COW
@@ -1112,27 +1208,32 @@ impl MarkdownPreview {
         }
 
         // ---- 小文档：全量路径（原有行为不变；rope 源在此物化，但仅小文档、低频） ----
+        // 逐块装配统一行 `DocRow`（含 byte_map，与 `Doc::rows_in_block_window` 逐位一致），
+        // 再补预览展示附加成 `PreviewRow`——渲染行型自本步起与 WYSIWYG 同一 `DocRow`。
         let mut parsed = match &src {
             PreviewSrc::Str(s) => parse_to_rows(s.as_ref()),
             PreviewSrc::Rope(r) => parse_to_rows(&r.to_string()),
         };
         self.resolve_image_rows(&mut parsed);
-        let rows = parsed;
+        let view = PreviewLineView::new(&src, &self.line_starts);
+        let docrows = assemble_docrow_window(&view, &index, &parsed, 0);
+        let rows: Vec<PreviewRow> = parsed
+            .into_iter()
+            .zip(docrows)
+            .map(|(r, dr)| PreviewRow::from_parts(dr, &r))
+            .collect();
         // 提取目录：标题行（行号, 级别, 清理后的文本）
         self.toc = Toc::from_vec(
             rows.iter()
                 .enumerate()
-                .filter_map(|(ix, r)| match r.kind {
-                    RowKind::Heading(level) => Some((ix, level, r.text.clone())),
-                    _ => None,
-                })
+                .filter_map(match_heading_toc)
                 .collect(),
         );
         // 代码行 → 稳定的横向滚动句柄（供块内滚动条拖动）
         self.code_scroll = Rc::new(
             rows.iter()
                 .enumerate()
-                .filter(|(_, r)| r.kind == RowKind::Code)
+                .filter(|(_, r)| r.docrow.kind == IrKind::Code)
                 .map(|(ix, _)| (ix, ScrollHandle::new()))
                 .collect(),
         );
@@ -1140,7 +1241,7 @@ impl MarkdownPreview {
         self.table_scroll = Rc::new(
             rows.iter()
                 .enumerate()
-                .filter(|(_, r)| r.kind == RowKind::Table)
+                .filter(|(_, r)| r.docrow.kind == IrKind::Table)
                 .map(|(ix, _)| (ix, ScrollHandle::new()))
                 .collect(),
         );
@@ -1148,7 +1249,7 @@ impl MarkdownPreview {
         // 代码块语法高亮：按围栏语言整块解析一次缓存（渲染只做颜色解析）。
         self.code_hl = Rc::new(build_code_highlights_for(&self.rows));
         if std::env::var_os("MD_MEM_DEBUG").is_some() {
-            let (n, bytes) = rows_memory_estimate(&self.rows);
+            let (n, bytes) = preview_rows_memory_estimate(&self.rows);
             eprintln!(
                 "[MD_MEM_DEBUG] preview set_source: 源 {} B / {} 行 → {} 渲染行, 估算驻留 {} KB",
                 src.len(),
@@ -1527,21 +1628,11 @@ impl MarkdownPreview {
             let head_band = (w_lo < overlap_lo).then(|| {
                 let lo = w_lo;
                 let hi = overlap_lo.saturating_sub(1);
-                let mut r = match &src {
-                    PreviewSrc::Str(s) => parse_block_window(s, &idx, lo, hi),
-                    PreviewSrc::Rope(rp) => parse_block_window_rope(rp, &idx, lo, hi),
-                };
-                self.resolve_image_rows(&mut r);
-                r
+                self.window_preview_rows(&src, &idx, lo, hi)
             });
             let tail_band = (overlap_hi < w_hi).then(|| {
                 let lo = overlap_hi.saturating_add(1);
-                let mut r = match &src {
-                    PreviewSrc::Str(s) => parse_block_window(s, &idx, lo, w_hi),
-                    PreviewSrc::Rope(rp) => parse_block_window_rope(rp, &idx, lo, w_hi),
-                };
-                self.resolve_image_rows(&mut r);
-                r
+                self.window_preview_rows(&src, &idx, lo, w_hi)
             });
             let span_lo = if head_band.is_some() {
                 w_lo
@@ -1571,16 +1662,35 @@ impl MarkdownPreview {
             self.win_lo = span_lo;
             self.win_rows = Rc::new(rows);
         } else {
-            let mut rows = match &src {
-                PreviewSrc::Str(s) => parse_block_window(s, &idx, w_lo, w_hi),
-                PreviewSrc::Rope(r) => parse_block_window_rope(r, &idx, w_lo, w_hi),
-            };
-            self.resolve_image_rows(&mut rows);
             self.win_lo = w_lo;
-            self.win_rows = Rc::new(rows);
+            self.win_rows = Rc::new(self.window_preview_rows(&src, &idx, w_lo, w_hi));
         }
         self.build_window_scroll_handles(first_build);
         crate::prof::end("md_ensure_window", _t);
+    }
+
+    /// 装配一块窗口的渲染行（[`PreviewRow`]）：`parse_block_window(_rope)` 原行 →
+    /// `resolve_image_rows`（图片源/尺寸，DocRow 自身不携带）→ 逐块装配共享 `DocRow`
+    /// （`byte_map`/`lines`/`table_rows` 与 [`crate::markdown::doc::Doc::rows_in_block_window`]
+    /// 逐位一致，M5-B5 P3-1a 渲染行源切共享 DocRow）→ 补预览展示附加。
+    fn window_preview_rows(
+        &self,
+        src: &PreviewSrc,
+        idx: &BlockIndex,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<PreviewRow> {
+        let mut raw = match src {
+            PreviewSrc::Str(s) => parse_block_window(s, idx, lo, hi),
+            PreviewSrc::Rope(r) => parse_block_window_rope(r, idx, lo, hi),
+        };
+        self.resolve_image_rows(&mut raw);
+        let view = PreviewLineView::new(src, &self.line_starts);
+        let docrows = assemble_docrow_window(&view, idx, &raw, lo);
+        raw.into_iter()
+            .zip(docrows)
+            .map(|(r, dr)| PreviewRow::from_parts(dr, &r))
+            .collect()
     }
 
     /// 为当前窗口建立代码/表格块的稳定横向滚动句柄与代码块语法高亮（键 = **全局块下标**，
@@ -1607,11 +1717,11 @@ impl MarkdownPreview {
             ts.retain(|ix, _| *ix >= win_lo && *ix < win_hi);
             for (j, r) in win_rows.iter().enumerate() {
                 let ix = win_lo + j;
-                match r.kind {
-                    RowKind::Code => {
+                match r.kind() {
+                    IrKind::Code => {
                         cs.entry(ix).or_default();
                     }
-                    RowKind::Table => {
+                    IrKind::Table => {
                         ts.entry(ix).or_default();
                     }
                     _ => {}
@@ -1634,7 +1744,7 @@ impl MarkdownPreview {
         let mut candid_bytes = 0usize;
         for (j, r) in win_rows.iter().enumerate() {
             let ix = win_lo + j;
-            if window_hl.contains_key(&ix) || r.kind != RowKind::Code {
+            if window_hl.contains_key(&ix) || r.kind() != IrKind::Code {
                 continue;
             }
             if let Some(hit) = self.code_hl_cache.get(ix) {
@@ -1713,12 +1823,12 @@ impl MarkdownPreview {
         cx.notify();
     }
 
-    /// 估算当前预览解析结果的驻留内存（近似，见 [`rows_memory_estimate`]）。
+    /// 估算当前预览解析结果的驻留内存（近似，见 [`preview_rows_memory_estimate`]）。
     /// 供运行时诊断（`MD_MEM_DEBUG=1`）输出，判断解析放大了多少倍。
     pub fn memory_estimate(&self) -> (usize, usize) {
         match &self.index {
             Some(idx) => {
-                let (_, win_b) = rows_memory_estimate(&self.win_rows);
+                let (_, win_b) = preview_rows_memory_estimate(&self.win_rows);
                 let n = idx.blocks.len();
                 let index_b = n * std::mem::size_of::<crate::markdown::parse::BlockMeta>();
                 // 源：`Str` 是预览自持副本（小文档 / EPUB 全量路径）如实计入；
@@ -1730,7 +1840,7 @@ impl MarkdownPreview {
                 }).unwrap_or(0);
                 (n, index_b + src_b + win_b)
             }
-            None => rows_memory_estimate(&self.rows),
+            None => preview_rows_memory_estimate(&self.rows),
         }
     }
 
@@ -1793,8 +1903,8 @@ impl MarkdownPreview {
     #[cfg(test)]
     pub(crate) fn rendered_text(&self) -> String {
         let rows: Vec<&str> = match &self.index {
-            Some(_) => self.win_rows.iter().map(|r| r.text.as_ref()).collect(),
-            None => self.rows.iter().map(|r| r.text.as_ref()).collect(),
+            Some(_) => self.win_rows.iter().map(|r| r.docrow.text.as_ref()).collect(),
+            None => self.rows.iter().map(|r| r.docrow.text.as_ref()).collect(),
         };
         rows.join("\n")
     }
@@ -1826,6 +1936,7 @@ impl MarkdownPreview {
         self.hint_recovered = false;
         self.index = None;
         self.src_buf = None;
+        self.line_starts = Rc::new(Vec::new());
         self.win_lo = 0;
         self.win_rows = Rc::new(Vec::new());
         self.win_base = 0;
@@ -1878,7 +1989,8 @@ impl MarkdownPreview {
                     return p.body_row_hint().as_f32();
                 }
                 let mut total = 0.0f32;
-                // unified 后端且整形上下文在场：逐行喂真实 `DocRow` 给 `shape_docrow_shard`
+                // unified 后端且整形上下文在场：逐行喂**真实 `DocRow`**（本行已装配，含
+                // byte_map；P3-1a 后不再经 `docrow_for_height` 薄适配）给 `shape_docrow_shard`
                 // 得**精确**逐行高（小文档行数少，O(行数) shape 可承受）；否则回退统一 shard
                 // 公式族（`unified_row_height`）。legacy 走原公式（逐位不变）。
                 let exact = preview_backend() == PreviewBackend::Unified
@@ -1887,42 +1999,42 @@ impl MarkdownPreview {
                 for r in self.rows.iter() {
                     let h = if exact {
                         let (ts, theme) = ctx.as_ref().expect("exact 分支必有 ctx");
-                        let dr = docrow_for_height(r);
-                        shape_docrow_shard(ts, &dr, theme, avail, width)
+                        shape_docrow_shard(ts, &r.docrow, theme, avail, width)
                             .iter()
                             .map(|s| s.h)
                             .sum::<f32>()
                     } else if preview_backend() == PreviewBackend::Unified {
-                        unified_row_height(r, p, avail)
+                        unified_row_height(&r.docrow, p, avail)
                     } else {
-                        match r.kind {
-                            RowKind::Blank => p.blank_h.as_f32(),
-                            RowKind::Rule => p.rule_h.as_f32(),
-                            RowKind::Code => {
+                        match r.kind() {
+                            IrKind::Blank => p.blank_h.as_f32(),
+                            IrKind::Rule => p.rule_h.as_f32(),
+                            IrKind::Code => {
                                 (r.code_lines().len().max(1) as f32 + 2.0)
                                     * p.code_line.as_f32()
                             }
-                            RowKind::Table => {
+                            IrKind::Table => {
                                 let row_h = p.para_size.as_f32() * 1.45 + 12.0;
                                 (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
                                     + 2.0
                                     + 8.0
                             }
-                            RowKind::Image => IMAGE_ROW_DEFAULT_H,
-                            RowKind::Heading(n) => {
+                            IrKind::Image => IMAGE_ROW_DEFAULT_H,
+                            IrKind::Heading(n) => {
                                 let (fs, lh) = p.heading_metrics(n);
                                 if wrap {
-                                    est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
+                                    est_wrap_lines(&r.docrow.text, avail, fs.as_f32()).max(1)
+                                        as f32
                                         * lh.as_f32()
                                         + 8.0
                                 } else {
                                     lh.as_f32()
                                 }
                             }
-                            RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+                            IrKind::Paragraph | IrKind::Quote | IrKind::Bullet => {
                                 if wrap {
                                     let lines = est_wrap_lines(
-                                        &r.text,
+                                        &r.docrow.text,
                                         avail,
                                         p.para_size.as_f32(),
                                     )
@@ -2043,10 +2155,13 @@ impl MarkdownPreview {
 /// 为给定行集重建代码块语法高亮缓存：按围栏语言**整块**解析一次，返回
 /// 「行号 → 每行语义名 run」的映射（键与 `code_scroll` 一致；无语言/未知语法
 /// 的代码行跳过）。结果与主题无关（明/暗色在渲染时解析），换主题无需重算。
-fn build_code_highlights_for(rows: &[Row]) -> std::collections::HashMap<usize, Rc<CodeLineRuns>> {
+/// 行源 = 共享 `DocRow`（`DocPayload::Code`）。
+fn build_code_highlights_for(
+    rows: &[PreviewRow],
+) -> std::collections::HashMap<usize, Rc<CodeLineRuns>> {
     let mut hl = std::collections::HashMap::new();
     for (ix, r) in rows.iter().enumerate() {
-        if r.kind != RowKind::Code {
+        if r.docrow.kind != IrKind::Code {
             continue;
         }
         let Some(lang) = r.code_language() else {
@@ -2067,6 +2182,71 @@ fn build_code_highlights_for(rows: &[Row]) -> std::collections::HashMap<usize, R
         }
     }
     hl
+}
+
+/// 标题行目录提取（`PreviewRow` 版）：`IrKind::Heading(n)` 才产出条目。
+fn match_heading_toc((ix, r): (usize, &PreviewRow)) -> Option<(usize, u8, SharedString)> {
+    match r.kind() {
+        IrKind::Heading(level) => Some((ix, level, r.docrow.text.clone())),
+        _ => None,
+    }
+}
+
+/// 从已解析渲染行（[`PreviewRow`]）构建引用跳转索引（小文档全量路径；多位置取第一个）。
+/// 语义与 `parse::citation_index_from_rows` 完全一致，只是行源换成 `PreviewRow`
+/// （`notes`/`note_defs`/`text` 由预览行携带；M5-B5 P3-1a 行型切统一 `DocRow` 后
+/// 不再喂 `&[Row]`）。
+fn citation_index_from_preview_rows(rows: &[PreviewRow]) -> CitationIndex {
+    let mut idx = CitationIndex::default();
+    for (ix, r) in rows.iter().enumerate() {
+        for (range, n) in &r.notes {
+            idx.refs.entry(*n).or_insert((ix, range.clone()));
+        }
+        for (range, n) in &r.note_defs {
+            idx.defs.entry(*n).or_insert((ix, range.clone()));
+            // 详情正文：定义标记 `[n]` 之后的文本（去首尾空白）。
+            idx.details.entry(*n).or_insert_with(|| {
+                let start = range.end.min(r.docrow.text.len());
+                r.docrow.text[start..].trim().into()
+            });
+        }
+    }
+    idx
+}
+
+/// 预览渲染行驻留内存估算（近似，口径同 `parse::rows_memory_estimate`：结构体 +
+/// SharedString 内容 + 分配器开销 + 内联 Vec）。`PreviewRow` 行型（DocRow + 展示附加）。
+fn preview_rows_memory_estimate(rows: &[PreviewRow]) -> (usize, usize) {
+    const ALLOC_OVERHEAD: usize = 32;
+    fn bytes(s: &SharedString) -> usize {
+        ALLOC_OVERHEAD + s.len()
+    }
+    fn sv(v: &[SharedString]) -> usize {
+        std::mem::size_of_val(v) + v.iter().map(bytes).sum::<usize>()
+    }
+    let mut b = 0usize;
+    for r in rows {
+        b += std::mem::size_of::<PreviewRow>();
+        b += bytes(&r.docrow.text);
+        if let Some(p) = &r.prefix {
+            b += bytes(p);
+        }
+        b += r.docrow.runs.capacity() * std::mem::size_of::<(std::ops::Range<usize>, RunKind)>();
+        if let DocPayload::Code { code_lines, language } = &r.docrow.payload {
+            b += sv(code_lines);
+            if let Some(l) = language {
+                b += ALLOC_OVERHEAD + l.len();
+            }
+        }
+        if let DocPayload::Table(t) = &r.docrow.payload {
+            b += std::mem::size_of::<crate::markdown::parse::TableData>();
+            b += sv(&t.header);
+            for row in &t.rows {
+                b += sv(row);
+            }
+        }
+    }
+    (rows.len(), b)
 }
 
 /// 单一「块元数据」的平均高度估算（窗口模式：只靠元数据，不物化 Row）。
@@ -2144,29 +2324,38 @@ fn unified_index_block_height(b: &BlockMeta, p: &StyleParams, avail: f32) -> f32
     }
 }
 
-/// `unified` 后端的小文档逐行高度估算（已物化 `Row`，折行用 `est_wrap_lines`）。
+/// `unified` 后端的小文档逐行高度估算（行源 = 共享 `DocRow`，折行用 `est_wrap_lines`）。
 /// 与 `unified_index_block_height` 同口径（shard 公式族），文本折行更精确。
-fn unified_row_height(r: &Row, p: &StyleParams, avail: f32) -> f32 {
-    match r.kind {
-        RowKind::Blank | RowKind::Rule => p.para_line.as_f32(),
-        RowKind::Code => (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32(),
-        RowKind::Table => {
+fn unified_row_height(dr: &DocRow, p: &StyleParams, avail: f32) -> f32 {
+    match dr.kind {
+        IrKind::Blank | IrKind::Rule => p.para_line.as_f32(),
+        IrKind::Code => {
+            let n = match &dr.payload {
+                DocPayload::Code { code_lines, .. } => code_lines.len(),
+                _ => 0,
+            };
+            (n.max(1) as f32 + 2.0) * p.code_line.as_f32()
+        }
+        IrKind::Table => {
             let row_h = p.para_line.as_f32() + 12.0;
-            let n = r.table().map_or(0, |t| t.rows.len()) as f32;
+            let n = match &dr.payload {
+                DocPayload::Table(t) => t.rows.len() as f32,
+                _ => 0.0,
+            };
             (1.0 + n) * row_h + n + 2.0 + TABLE_SCROLLBAR_RESERVE_PX
         }
-        RowKind::Image => {
+        IrKind::Image => {
             let cap_lines =
-                est_wrap_lines(r.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
+                est_wrap_lines(dr.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
             IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + cap_lines * p.para_line.as_f32()
         }
-        RowKind::Heading(hh) => {
+        IrKind::Heading(hh) => {
             let (fs, lh) = p.heading_metrics(hh);
-            est_wrap_lines(r.text.as_ref(), avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
+            est_wrap_lines(dr.text.as_ref(), avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
         }
-        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+        IrKind::Paragraph | IrKind::Quote | IrKind::Bullet => {
             let lines =
-                est_wrap_lines(r.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
+                est_wrap_lines(dr.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
             lines * p.para_line.as_f32()
         }
     }
@@ -2316,12 +2505,12 @@ impl MarkdownPreview {
             && let Some(row_ix) = self.row_for_line(line)
         {
             let text = match &self.index {
-                None => self.rows.get(row_ix).map(|r| r.text.clone()),
+                None => self.rows.get(row_ix).map(|r| r.docrow.text.clone()),
                 Some(_) => {
                     // 窗口模式：先把命中块纳入窗口，再取文本
                     self.ensure_window(row_ix, row_ix);
                     if row_ix >= self.win_lo && row_ix - self.win_lo < self.win_rows.len() {
-                        Some(self.win_rows[row_ix - self.win_lo].text.clone())
+                        Some(self.win_rows[row_ix - self.win_lo].docrow.text.clone())
                     } else {
                         None
                     }
@@ -2549,7 +2738,7 @@ impl MarkdownPreview {
                 if sr > abs || abs > er {
                     return None;
                 }
-                let rl = row.text.len();
+                let rl = row.docrow.text.len();
                 let a = if sr == abs { sb } else { 0 };
                 let b = if er == abs { eb } else { rl };
                 let a = a.min(rl);

@@ -34,6 +34,9 @@ pub struct CitationIndex {
 }
 
 /// 从**已解析行集**构建引用跳转索引（小文档全量路径；多位置取第一个）。
+/// `#[allow(dead_code)]`：preview 迁移到 `PreviewRow`（M5-B5 P3-1a）后仅本模块测试消费
+/// （`view` 用其 `PreviewRow` 同语义变体 `citation_index_from_preview_rows`）。
+#[allow(dead_code)]
 pub fn citation_index_from_rows(rows: &[Row]) -> CitationIndex {
     let mut idx = CitationIndex::default();
     for (ix, r) in rows.iter().enumerate() {

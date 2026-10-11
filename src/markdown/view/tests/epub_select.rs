@@ -24,20 +24,20 @@
         // 行数据语义：标题含注记 [1]；正文首行缩进「　　」且含 [2]；落款右对齐。
         let (heading_ok, body_ok, sig_align) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
-            let h = md.rows.iter().find(|r| matches!(r.kind, RowKind::Heading(_))).expect("有标题");
+            let h = md.rows.iter().find(|r| matches!(r.docrow.kind, IrKind::Heading(_))).expect("有标题");
             let body = md
                 .rows
                 .iter()
-                .find(|r| r.text.contains("共产主义者同盟"))
+                .find(|r| r.docrow.text.contains("共产主义者同盟"))
                 .expect("有正文段");
             let sig = md
                 .rows
                 .iter()
-                .find(|r| r.text.contains("卡尔·马克思"))
+                .find(|r| r.docrow.text.contains("卡尔·马克思"))
                 .expect("有落款行");
             (
-                h.text.contains("[1]") && h.notes.iter().any(|(_, n)| *n == 1),
-                body.text.starts_with("\u{3000}\u{3000}") && body.notes.iter().any(|(_, n)| *n == 2),
+                h.docrow.text.contains("[1]") && h.notes.iter().any(|(_, n)| *n == 1),
+                body.docrow.text.starts_with("\u{3000}\u{3000}") && body.notes.iter().any(|(_, n)| *n == 2),
                 sig.align,
             )
         });
@@ -238,7 +238,7 @@
 
         let (kinds, tops, heights) = cx.update(|_, cx| {
             let md = host.read(cx).md.read(cx);
-            let kinds: Vec<_> = md.rows.iter().map(|r| r.kind).collect();
+            let kinds: Vec<_> = md.rows.iter().map(|r| r.docrow.kind).collect();
             let mut tops = Vec::new();
             let mut heights = Vec::new();
             for i in 0..md.rows.len() {
@@ -249,7 +249,7 @@
             (kinds, tops, heights)
         });
         assert!(
-            kinds.iter().all(|k| *k == RowKind::Quote),
+            kinds.iter().all(|k| *k == IrKind::Quote),
             "三行都应是引述：{kinds:?}"
         );
         // 相邻引述行上下紧贴：row(i+1).top == row(i).top + row(i).height（±0.01 亚像素）。

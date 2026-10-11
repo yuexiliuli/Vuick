@@ -72,8 +72,8 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             .read(cx)
             .rows
             .iter()
-            .filter(|r| r.kind == RowKind::Image)
-            .map(|r| r.image().map(|i| i.src.to_string()))
+            .filter(|r| r.docrow.kind == IrKind::Image)
+            .map(|r| Some(r.image_src().to_string()))
             .collect::<Vec<_>>()
     });
     assert_eq!(srcs.len(), 3, "应解析出 3 张图片行，实际={srcs:?}");
@@ -103,11 +103,8 @@ fn base_dir_resolves_relative_image_srcs(cx: &mut TestAppContext) {
             .read(cx)
             .rows
             .iter()
-            .filter(|r| r.kind == RowKind::Image)
-            .map(|r| {
-                let i = r.image();
-                (i.and_then(|i| i.img_w), i.and_then(|i| i.img_h))
-            })
+            .filter(|r| r.docrow.kind == IrKind::Image)
+            .map(|r| (r.img_w, r.img_h))
             .collect::<Vec<_>>()
     });
     assert_eq!(dims[0], (Some(580), Some(773)), "img测试.png 尺寸应 580x773，实际={:?}", dims[0]);
@@ -144,12 +141,12 @@ fn image_rows_height_follows_width(cx: &mut TestAppContext) {
             let wi = md
                 .rows
                 .iter()
-                .position(|r| r.kind == RowKind::Image && r.text == "w")
+                .position(|r| r.docrow.kind == IrKind::Image && r.docrow.text == "w")
                 .expect("应有 wuling 图片行");
             let di = md
                 .rows
                 .iter()
-                .position(|r| r.kind == RowKind::Image && r.text == "s")
+                .position(|r| r.docrow.kind == IrKind::Image && r.docrow.text == "s")
                 .expect("应有 dify 图片行");
             let wb = md.list_state.bounds_for_item(wi).expect("wuling 行应有 bounds");
             let db = md.list_state.bounds_for_item(di).expect("dify 行应有 bounds");
@@ -257,13 +254,12 @@ fn epub_in_memory_images_render(cx: &mut TestAppContext) {
     // 图片行应挂上内存字节与尺寸
     let (has_data, dims_ok) = cx.update(|_, cx| {
         let md = host.read(cx).md.read(cx);
-        let img_rows: Vec<_> = md.rows.iter().filter(|r| r.kind == RowKind::Image).collect();
+        let img_rows: Vec<_> = md.rows.iter().filter(|r| r.docrow.kind == IrKind::Image).collect();
         assert_eq!(img_rows.len(), 1, "应有 1 个图片行");
         let r = img_rows[0];
-        let i = r.image();
         (
-            i.is_some_and(|i| i.img_data.is_some()),
-            i.is_some_and(|i| i.img_w.is_some() && i.img_h.is_some()),
+            r.img_data.is_some(),
+            r.img_w.is_some() && r.img_h.is_some(),
         )
     });
     assert!(has_data, "EPUB 内存图片应挂到图片行(img_data)");

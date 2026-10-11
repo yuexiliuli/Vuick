@@ -194,7 +194,7 @@
             m.rows
                 .iter()
                 .enumerate()
-                .map(|(ix, r)| (ix, matches!(r.kind, RowKind::Heading(_))))
+                .map(|(ix, r)| (ix, matches!(r.docrow.kind, IrKind::Heading(_))))
                 .collect()
         });
         // —— ① wrap 阅读栏（app / EPUB 路径）：宽开→窄收（列=可用宽退化档），
@@ -368,7 +368,7 @@
                         let is_head = h.row_ix >= m.win_lo
                             && m.win_rows
                                 .get(h.row_ix - m.win_lo)
-                                .map(|r| matches!(r.kind, RowKind::Heading(_)))
+                                .map(|r| matches!(r.docrow.kind, IrKind::Heading(_)))
                                 .unwrap_or(false);
                         if !is_head {
                             continue;
@@ -446,11 +446,11 @@
         // 行下标 → 行类：窗口模式经 `win_rows`（全局块下标映射），其余走全量 `rows`。
         let (head_min, para_min, head_n, para_n) = cx.update(|_, cx| {
             let m = host.read(cx).md.read(cx);
-            let kind_of = |ix: usize| -> Option<RowKind> {
+            let kind_of = |ix: usize| -> Option<IrKind> {
                 if ix >= m.win_lo {
-                    m.win_rows.get(ix - m.win_lo).map(|r| r.kind)
+                    m.win_rows.get(ix - m.win_lo).map(|r| r.docrow.kind)
                 } else {
-                    m.rows.get(ix).map(|r| r.kind)
+                    m.rows.get(ix).map(|r| r.docrow.kind)
                 }
             };
             let mut head_min = f32::INFINITY;
@@ -464,11 +464,11 @@
                 let right = h.origin.x.as_f32() + h.layout.bounds().size.width.as_f32();
                 let ws = pane_right - right;
                 match kind_of(h.row_ix) {
-                    Some(RowKind::Heading(_)) => {
+                    Some(IrKind::Heading(_)) => {
                         head_min = head_min.min(ws);
                         head_n += 1;
                     }
-                    Some(RowKind::Paragraph) => {
+                    Some(IrKind::Paragraph) => {
                         para_min = para_min.min(ws);
                         para_n += 1;
                     }
@@ -600,7 +600,7 @@ fn narrow_window_reflows_and_keeps_right_gap(cx: &mut TestAppContext) {
         let m = host.read(cx).md.read(cx);
         m.rows
             .iter()
-            .position(|r| r.text.starts_with("普通段落"))
+            .position(|r| r.docrow.text.starts_with("普通段落"))
             .expect("应有普通段落行")
     });
     let mut heights: Vec<(f32, f32)> = Vec::new();

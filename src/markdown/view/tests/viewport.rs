@@ -500,7 +500,7 @@ fn code_block_syntax_highlight_cache(cx: &mut TestAppContext) {
         let code_ix = md
             .rows
             .iter()
-            .position(|r| r.kind == RowKind::Code)
+            .position(|r| r.docrow.kind == IrKind::Code)
             .expect("应有代码渲染行");
         let runs = md
             .code_hl
@@ -641,7 +641,7 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
             let md = host.read(cx).md.clone();
             let md = md.read(cx);
             (0..md.win_rows.len()).all(|j| {
-                md.win_rows[j].kind != RowKind::Code
+                md.win_rows[j].docrow.kind != IrKind::Code
                     || md.win_rows[j].code_language().is_none()
                     || md.code_hl.get(&(md.win_lo + j)).is_some()
             })
@@ -662,7 +662,7 @@ fn windowed_code_highlight_uses_global_block_index(cx: &mut TestAppContext) {
         let hl = md.code_hl.clone();
         assert!(!hl.is_empty(), "窗口内应有代码高亮");
         let code_keys: Vec<usize> = (0..md.win_rows.len())
-            .filter(|&j| md.win_rows[j].kind == RowKind::Code)
+            .filter(|&j| md.win_rows[j].docrow.kind == IrKind::Code)
             .map(|j| md.win_lo + j)
             .collect();
         let found = code_keys.iter().filter(|k| hl.get(k).is_some()).count();
@@ -732,7 +732,7 @@ fn windowed_code_highlight_defers_big_jump_then_converges(cx: &mut TestAppContex
         let md = md.read(cx);
         let missing = (0..md.win_rows.len())
             .filter(|&j| {
-                md.win_rows[j].kind == RowKind::Code
+                md.win_rows[j].docrow.kind == IrKind::Code
                     && md.win_rows[j].code_language().is_some()
                     && md.code_hl.get(&(md.win_lo + j)).is_none()
             })
@@ -763,7 +763,7 @@ fn windowed_code_highlight_defers_big_jump_then_converges(cx: &mut TestAppContex
         let md = md.read(cx);
         let missing = (0..md.win_rows.len())
             .filter(|&j| {
-                md.win_rows[j].kind == RowKind::Code
+                md.win_rows[j].docrow.kind == IrKind::Code
                     && md.win_rows[j].code_language().is_some()
                     && md.code_hl.get(&(md.win_lo + j)).is_none()
             })
