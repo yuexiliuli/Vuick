@@ -1098,6 +1098,7 @@ impl EditorApp {
 
     /// PDF 搜索头部「上一处 / 下一处」导航按钮（↑/↓，点击在命中间移动）。
     /// 返回 owned `AnyElement`（避免 RPIT 捕获 `cx` 生命周期导致连续两按钮借用冲突）。
+    #[allow(clippy::too_many_arguments)] // 导航按钮：命中实体 + 几何 + 配色均为正交参数，拆结构体反添噪音
     fn sidebar_pdf_nav_btn(
         &self,
         window: &mut Window,

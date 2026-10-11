@@ -15,7 +15,7 @@ use super::*;
 fn status_section_divider(color: gpui::Hsla) -> gpui::Div {
     let owned = "status-bar-divider".to_string();
     div()
-        .debug_selector(move || owned.clone().into())
+        .debug_selector(move || owned.clone())
         .w(px(1.))
         .h(px(14.))
         .flex_shrink_0()
@@ -237,7 +237,7 @@ impl EditorApp {
         let dot = crate::ui::theme::language_badge_color(language, self.dark_mode);
         let owned = "status-language-badge".to_string();
         div()
-            .debug_selector(move || owned.clone().into())
+            .debug_selector(move || owned.clone())
             .flex()
             .flex_row()
             .items_center()
@@ -280,7 +280,7 @@ impl EditorApp {
     fn middle_text(&self, sel: &'static str, text: String) -> gpui::Div {
         let owned = sel.to_string();
         div()
-            .debug_selector(move || owned.clone().into())
+            .debug_selector(move || owned.clone())
             .flex_shrink_0()
             .text_size(px(12.))
             .text_color(self.chip_text())
@@ -366,7 +366,7 @@ impl EditorApp {
     fn status_item(&self, sel: &'static str, text: &str, color: gpui::Hsla) -> gpui::Div {
         let owned = sel.to_string();
         div()
-            .debug_selector(move || owned.clone().into())
+            .debug_selector(move || owned.clone())
             .flex_shrink_0()
             .text_size(px(12.))
             .text_color(color)

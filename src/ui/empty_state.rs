@@ -149,6 +149,7 @@ pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
 ///   （以 `MouseDownEvent.click_count >= 2` 判定，与编辑区双击同一套语义）。回调
 ///   由旁路 `Entity::update` 驱动宿主状态，不应 `stop_propagation`（欢迎页是整屏
 ///   覆盖元素，单击/按钮互不干扰）。
+#[allow(clippy::type_complexity)] // 双击回调签名较长（宿主无关回调），拆别名反添一层
 pub(crate) fn empty_state_hero(
     main: &str,
     sub: &str,

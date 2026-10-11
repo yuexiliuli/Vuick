@@ -74,15 +74,15 @@ pub struct UserPrefs {
 impl UserPrefs {
     /// 配置文件完整路径：环境变量覆盖 → APPDATA → 当前目录回退。
     pub fn config_path() -> PathBuf {
-        if let Ok(over) = std::env::var("GPUI_EDITOR_CONFIG") {
-            if !over.trim().is_empty() {
-                return PathBuf::from(over);
-            }
+        if let Ok(over) = std::env::var("GPUI_EDITOR_CONFIG")
+            && !over.trim().is_empty()
+        {
+            return PathBuf::from(over);
         }
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            if !appdata.trim().is_empty() {
-                return PathBuf::from(appdata).join("gpui-editor").join("config.json");
-            }
+        if let Ok(appdata) = std::env::var("APPDATA")
+            && !appdata.trim().is_empty()
+        {
+            return PathBuf::from(appdata).join("gpui-editor").join("config.json");
         }
         PathBuf::from("gpui-editor-config.json")
     }
@@ -102,15 +102,15 @@ impl UserPrefs {
         if let Some(Value::String(s)) = map.get("theme") {
             prefs.theme = ThemePref::from_str(s);
         }
-        if let Some(Value::Number(n)) = map.get("font_size") {
-            if let Some(v) = n.as_f64() {
-                prefs.font_size = Some(v as f32);
-            }
+        if let Some(Value::Number(n)) = map.get("font_size")
+            && let Some(v) = n.as_f64()
+        {
+            prefs.font_size = Some(v as f32);
         }
-        if let Some(Value::Number(n)) = map.get("sidebar_width") {
-            if let Some(v) = n.as_f64() {
-                prefs.sidebar_width = Some(v as f32);
-            }
+        if let Some(Value::Number(n)) = map.get("sidebar_width")
+            && let Some(v) = n.as_f64()
+        {
+            prefs.sidebar_width = Some(v as f32);
         }
         prefs
     }
@@ -121,10 +121,10 @@ impl UserPrefs {
             return;
         }
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = fs::create_dir_all(parent);
         }
         let body = json!({
             "theme": self.theme.as_str(),

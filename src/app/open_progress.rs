@@ -111,13 +111,13 @@ impl ChunkReader {
             // 而非「读缓冲截断的多字节尾部」）→ 立即报 InvalidData。
             self.utf8_carry.extend_from_slice(&self.buf[..n]);
             let parsed = std::str::from_utf8(&self.utf8_carry);
-            if let Err(e) = &parsed {
-                if e.error_len().is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "stream did not contain valid UTF-8",
-                    ));
-                }
+            if let Err(e) = &parsed
+                && e.error_len().is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
             }
             let valid_len = match parsed {
                 Ok(_) => self.utf8_carry.len(),

@@ -821,7 +821,7 @@ pub(crate) fn math_hscrollbar_hit(
     for r in &frame.rows {
         let top = f32::from(r.top);
         let bottom = top + f32::from(r.height);
-        if !(py >= top && py < bottom) || !matches!(&r.extra.card, Some(BlockCard::Math { .. })) {
+        if !(py >= top && py < bottom && matches!(&r.extra.card, Some(BlockCard::Math { .. }))) {
             continue;
         }
         let Some((bar_x, bar_w, thumb_x, thumb_w, _)) = math_hscroll_geo(editor, frame, r) else {
