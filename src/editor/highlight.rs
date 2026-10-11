@@ -389,7 +389,8 @@ impl Highlighter {
             && !self.lines.is_empty()
             && lo >= self.base
             && let Some((min_row, tail_new, delta)) = self.dirty
-            && min_row > self.base
+            && (min_row > self.base
+                || (min_row == self.base && self.base == 0)) // P4-3：文首编辑无上游作用域，增量安全
             && min_row.saturating_sub(lookback) < self.base + self.lines.len()
         {
             // 编辑增量：从 `min_row`（编辑行）直接用**编辑前一行保存点**

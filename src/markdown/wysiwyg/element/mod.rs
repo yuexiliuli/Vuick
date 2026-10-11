@@ -23,6 +23,12 @@ pub(crate) const ALERT_GUTTER_W: f32 = 84.;
 /// 标题折叠箭头 gutter 宽（= shape 期标题行 `x_off`）——箭头画在左缘、正文右移，
 /// gutter 点击区即 [padding, padding+此宽]；与 `heading_chevron_hit`/`paint_heading_chevron` 共用。
 pub(crate) const HEADING_GUTTER_W: f32 = 20.;
+/// 视为「真实预览面板」的最小 definite 宽度（px）：更窄的测量趟在**内容未变**时一律按
+/// gpui 过渡探针处理（见 `request_layout` 里 `probe` 的 P4-3 注）——不建帧、不覆写帧
+/// 缓存。实测探针宽：~滚动条宽 14.5px、flex 求解 68-75px；真实面板 ≥ 分割最小比例
+/// 0.2×窗宽（≥800px 窗 ≈ ≥112px），故 100px 不会误伤真实面板；内容代变化的窄宽仍建帧
+/// （极小面板不退化）。
+const WY_PROBE_MIN_WIDTH_PX: f32 = 100.0;
 
 pub(crate) use super::frame::{build_frame, prewarm_band, warm_emoji_rasterizer};
 pub(crate) use super::math::*;
@@ -829,13 +835,30 @@ impl Element for WyEditorElement {
             // （右栏 md_wy 宿主每键 ×N 次 build_frame，debug ~100-500ms/键，即 A2 引入
             // 的卡顿根因；实测根治后每键降到单次重建）。旧版仅在 `known` 为空时才跳过，
             // known 非空（如上一趟 800 兜底）时 0px 趟仍会建占位帧。
-            let probe = !width_definite;
-            // 帧缓存：内容/宽度/可视带/图片代数都没变 → 直接复用总高，不再整篇重建
-            // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
+            // P4-3：**过渡探针宽**也按探测对待——同一布局趟里 gpui 会以多个宽度反复测量
+            // 子元素（0px / ~滚动条宽的 14.5px / 68px… / 最终固定宽 376-486px），只要
+            // >1px 的 definite 探针就会被当成真宽建帧：`ensure_block_layout` 按
+            // `(struct_ver, 宽度)` 换代 → 对该 15 万块大文档整篇 Pass1 重建（~5-9ms），
+            // 并把结果存进唯一帧缓存槽，覆写掉真实宽度帧 → 下一趟真宽再整篇重建一次。
+            // 每键因此 ×3 次 build_frame（实测单键 ~21ms，正是「预览一开就卡」的主导）。
+            // 判据：非 definite 宽一律探测；definite 但**窄于真实面板最小宽**（分割最小
+            // 比例 0.2×窗宽 ≈ ≥100px）的宽度只在与缓存内容代一致时按探针（不建帧、不覆写
+            // 缓存、返回现成帧总高）——真实宽度的测量趟自然落到缓存命中或唯一一次建帧，
+            // 内容真实变化（rgen 等换代）的窄宽仍会正常建帧（极小面板不退化）。
             let rgen = e.content_gen();
             let igen = e.images_gen();
             let mgen = e.math_gen();
             let zgen = e.mermaid_zoom_gen();
+            let content_stale = {
+                let f = e.frame.borrow();
+                f.as_ref().is_none_or(|f| {
+                    f.rgen != rgen || f.igen != igen || f.mgen != mgen || f.zgen != zgen
+                })
+            };
+            let probe = !width_definite
+                || (f32::from(width) < WY_PROBE_MIN_WIDTH_PX && !content_stale);
+            // 帧缓存：内容/宽度/可视带/图片代数都没变 → 直接复用总高，不再整篇重建
+            // （大文档的每帧“卡死”就是这里：每次 notify 都重排全 16 万行）。
             let band = e.shape_band().unwrap_or((0., 2048.));
             let cached_total = e
                 .frame

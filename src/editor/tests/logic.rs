@@ -564,6 +564,30 @@ fn incremental_edit_inside_multiline_comment_matches_full() {
     });
 }
 
+/// P4-3 回归：**文首编辑（min_row == base == 0）**应走增量快速路径（新鲜 `ParseState`
+/// 从第 0 行起、收敛早退），且增量结果必须与整段重解析完全一致——含顶部多行作用域
+/// 未闭合时向下方传播的着色。修复前 `prepare_window` 对 `min_row == base` 一律回退整窗
+/// 重解析（.rs 大文档窗口 512 行 × 每键 ~90ms debug）；修复后文首编辑以 base==0 的新鲜
+/// 状态增量重解析（楼上作用域不存在，无丢失风险）。
+#[test]
+fn incremental_edit_at_row_zero_matches_full() {
+    // 顶部行内编辑（常见打字）：应快速收敛且与全量一致。
+    let src = "let top = 1; // x\nlet a = 2;\nlet b = 3;\nfn g() {}\n";
+    assert_incremental_matches_full(src, |b| {
+        let start = b.line_start(0);
+        b.apply_edit(start..start, "XYZ");
+        (0, 1, 0)
+    });
+    // 顶部插入未闭合块注释：从第 0 行起开启多行作用域，下方着色必须全部传播
+    // （新鲜状态路径不得丢失块注释作用域）。
+    let src2 = "fn f() {\n    let a = 1;\n    let b = 2;\n}\nfn g() {}\n";
+    assert_incremental_matches_full(src2, |b| {
+        let start = b.line_start(0);
+        b.apply_edit(start..start, "/*");
+        (0, 1, 0)
+    });
+}
+
 /// 撤回再重写同一行（编辑行视觉输出回到旧样子）：增量在编辑行本身即收敛，
 /// 下方复用旧缓存，仍与全量一致。
 #[test]
