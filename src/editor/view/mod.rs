@@ -30,7 +30,9 @@ pub(crate) use render::char_align_highlights;
 
 use std::{
     cell::Cell,
+    collections::{HashMap, VecDeque},
     ops::Range,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -80,28 +82,160 @@ pub enum EditorEvent {
     Blur,
 }
 
+/// 行静态内容层（跨帧缓存，不可变）：buffer 文本 + 整窗批量解析的原始 runs + 无选区
+/// 合并结果。滚动帧命中直接 `Rc` 浅复用，零分配零合并。
+#[derive(Clone)]
+struct RowContent {
+    /// 渲染窗口内的文本（`buffer.line_text(row)` 一次性物化，跨帧共享）。
+    text: SharedString,
+    /// 行内原始样式段（syntect / md_decor 整窗批量解析的**选区合并前**快照）。
+    /// 既是缓存有效性校验基准（与本帧新鲜解析逐位比对，见 [`RowCache::probe`]），
+    /// 也是选区活动时动态重合并的输入（见 [`RowData::highlight_override`]）。
+    hl_styles: Vec<(Range<usize>, HighlightStyle)>,
+    /// 无选区合并结果（= `merge_highlights(hl_styles, None, _)`，按当前代码合并语义
+    /// 定格）：选区坍缩时直接复用，跳过每行 O(段²) 的合并与分配。
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+impl RowContent {
+    /// 物化一行内容：文本 + 样式定格。选区坍缩帧可直接复用 `highlights`。
+    fn materialize(
+        buffer: &Buffer,
+        row: usize,
+        hl_styles: &[(Range<usize>, HighlightStyle)],
+    ) -> Self {
+        let text = buffer.line_text(row);
+        // 无选区合并不使用 sel_bg（见 merge_highlights：仅选区覆盖段才上底色）。
+        let highlights = merge_highlights(hl_styles, None, Hsla::default());
+        Self {
+            text,
+            hl_styles: hl_styles.to_vec(),
+            highlights,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            text: SharedString::new_static(""),
+            hl_styles: Vec::new(),
+            highlights: Vec::new(),
+        }
+    }
+}
+
 /// 行渲染数据（`list` 闭包只读）。
 #[derive(Clone)]
 struct RowData {
-    /// 渲染窗口内的文本（已按横向滚动裁切）。
-    text: SharedString,
-    /// 样式段（相对 `text` 字节；语法色 + 选区底）。
-    highlights: Vec<(Range<usize>, HighlightStyle)>,
-    /// 本行是否绘制光标 + 光标 x（相对文本起点，px）。
+    /// 静态内容层（`Rc` 浅复用：无编辑滚动帧直接引用缓存条目，不重新物化）。
+    content: Rc<RowContent>,
+    /// 选区活动帧的动态合并结果（= `merge_highlights(hl_styles, Some(sel), bg)`）。
+    /// `None` = 选区坍缩：直接读 `content.highlights`（滚动帧零分配零合并）。
+    highlight_override: Option<Vec<(Range<usize>, HighlightStyle)>>,
+    /// 本行是否绘制光标 + 光标 x（相对文本起点，px）。按帧状态现算，不入缓存。
     caret: Option<f32>,
-    /// 本行是折叠首行时：折叠指示「…」的 x（相对文本起点，px）。`None` 非折叠首行。
-    /// 独立元素渲染（不进 `StyledText`/shape_text），不污染行内测量。
+    /// 本行是折叠首行时折叠指示「…」的 x（相对文本起点，px）。折叠状态按帧现算，
+    /// 不入缓存。`None` 非折叠首行。独立元素渲染（不进 `StyledText`/shape_text），
+    /// 不污染行内测量。
     folded: Option<f32>,
 }
 
 impl RowData {
+    /// 渲染消费的样式段：选区坍缩用缓存的无选区合并结果；选区活动用逐帧动态合并。
+    fn highlights(&self) -> &[(Range<usize>, HighlightStyle)] {
+        match &self.highlight_override {
+            Some(v) => v,
+            None => &self.content.highlights,
+        }
+    }
+
     fn empty() -> Self {
+        // 空行兜底：共享同一份零分配的内容层（thread_local 单例），避免窗口外每个
+        // 空行都新建两个空 Vec。
+        thread_local! {
+            static EMPTY_CONTENT: Rc<RowContent> = Rc::new(RowContent::empty());
+        }
+        let content = EMPTY_CONTENT.with(|c| c.clone());
         Self {
-            text: SharedString::new_static(""),
-            highlights: Vec::new(),
+            content,
+            highlight_override: None,
             caret: None,
             folded: None,
         }
+    }
+}
+
+/// 行级静态内容缓存：键 = `(buffer.version(), 逻辑行)`。
+///
+/// 目标：滚动帧把「整窗重物化（每行一次 String 分配 + 一次 O(段²) 样式合并）」降为
+/// 「只物化新进窗口的行」——命中行 `Rc` 浅复用，零分配零合并。
+///
+/// 结构与选型理由：
+/// - 键用**逻辑行**而非视觉行：文本与高亮本就按逻辑行解析；视觉行随折叠状态可变，
+///   若按视觉行键会在折叠变化时让未改行整窗失效抖动。
+/// - `HashMap` + 有界 FIFO 淘汰（`CAP` ≈ 十余个窗口高，与滚动访问近似单调匹配）：
+///   滚动只换窗，增删查 O(1)；有界封顶防大文档一路滚动把缓存涨到 O(全文)。
+/// - 有效性 = 键命中 **且** 缓存 raw runs 与本帧新鲜解析逐位相等（[`Self::probe`]）：
+///   syntect/md 的重锚（滚动上移出缓存、大缺口下跳、回看上下文变化）会让同一
+///   `(version, row)` 产出不同 runs——逐位比对把这些行自动打回重物化并覆写，
+///   保证「任意编辑 + 滚动序列下渲染结果与每帧全建逐位一致」。
+///
+/// 失效语义：
+/// - 编辑 / 撤销 / 重做：`buffer.version()` +1 → 键失配，旧条目不可达（有界淘汰回收）。
+/// - 整篇替换（`reset_document`）：显式 `clear()`（`Buffer::new` 后 version 归零，
+///   防「新旧文档同 version=0」命中上一份文档的行）。
+/// - 折叠变化：不失效（内容与折叠无关；折叠指示是动态层，不在缓存里）。
+/// - 字号 / 主题变化：不失效（内容 = 字节区间 + 样式，与字形/底色无关）。
+#[derive(Default)]
+struct RowCache {
+    /// 键命中（probe 校验通过）→ 浅复用；无效/未命中 → 重物化并覆写。
+    entries: HashMap<(u64, usize), Rc<RowContent>>,
+    /// FIFO 淘汰序（仅最旧回收；滚动访问近似单调，无需 LRU 晋升）。
+    order: VecDeque<(u64, usize)>,
+    /// 命中计数（测试探针：滚动帧复用证明）。
+    hits: usize,
+}
+
+impl RowCache {
+    const CAP: usize = 1024;
+
+    /// 命中判定：键命中 **且** 缓存 raw runs 与本帧新鲜解析逐位相等才复用。
+    fn probe(
+        &mut self,
+        ver: u64,
+        row: usize,
+        fresh: &[(Range<usize>, HighlightStyle)],
+    ) -> Option<Rc<RowContent>> {
+        match self.entries.get(&(ver, row)) {
+            Some(c) if c.hl_styles == fresh => {
+                self.hits += 1;
+                Some(c.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, ver: u64, row: usize, content: Rc<RowContent>) {
+        let key = (ver, row);
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key);
+        }
+        self.entries.insert(key, content);
+        while self.entries.len() > Self::CAP
+            && let Some(old) = self.order.pop_front()
+        {
+            self.entries.remove(&old);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.hits = 0;
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, usize) {
+        (self.hits, self.entries.len())
     }
 }
 
@@ -147,6 +281,10 @@ pub struct CodeEditor {
     /// `Highlighter` 做「局部重解析 + 收敛早退」，避免逐键把整窗重跑 syntect。
     /// 整篇替换/打开/撤销重做置 `None`（走整段重解析）。
     hl_dirty: Option<(usize, usize, i64)>,
+    /// M5-B2-3 行级缓存：`build_rows` 按 `(buffer.version(), 逻辑行)` 复用行静态内容
+    /// （文本 + 合并后样式）。滚动帧只物化新进窗口的行；编辑/撤销/重做靠版本键失效，
+    /// 整篇替换由 [`Self::reset_document`] 显式清空。见 [`RowCache`]。
+    row_cache: RowCache,
     /// Markdown「所见即所得」滤镜：.md 时替代 syntect 行高亮，把记号画淡、正文
     /// 应用加粗/斜体/代码/链接/标题等富样式（只改样式，文本/光标/选区不变）。
     md_decor: MarkdownDecor,
@@ -201,10 +339,10 @@ pub struct CodeEditor {
     /// 绝对行 = `window_base + item_ix`（所有滚动/命中/行号/量程都以绝对行为准）。
     /// 目标滚出窗口即重定位本字段（`reset(LIST_WINDOW_ROWS)`，O(窗口)），不改文档。
     window_base: usize,
-    /// 恒为 true 的「像素级确定性量程」标志（固定窗口虚拟化下条目不预铺 uniform，
-    /// 纵向量程由滚动换算 + `ScrollbarHandle.content_height = 全文行数×行高` 承担，
-    /// 不存在换宽/陈旧 size_hint 的量程坍缩）。保留为布尔以让旧分支/测试沿用。
-    pixel_scroll: bool,
+    /// 恒 true 的「像素级确定性量程」（固定窗口虚拟化，已去布尔）：条目不预铺
+    /// uniform，纵向量程由滚动换算 + `ScrollbarHandle.content_height = 全文行数×
+    /// 行高` 承担，不存在换宽/陈旧 size_hint 的量程坍缩（若未来恢复
+    /// `pixel_scroll=false` 的小文档 List 委托，需重新加回该布尔与死分支）。
     /// 用户请求的纵向滚动位置（内容 px，全文绝对坐标），与纵向滚动条句柄共享
     /// （`Rc<Cell<f32>>`，见 [`VerticalScrollHandle`]）。滚动条拖动只写这里，render
     /// 每帧按它重定位窗口；键盘/滚轮/跳转经 [`Self::scroll_to_px`] 同步落窗口。
@@ -262,6 +400,7 @@ impl CodeEditor {
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
             hl_dirty: None,
+            row_cache: RowCache::default(),
             md_decor: MarkdownDecor::default(),
             md_mode: false,
             language: None,
@@ -294,8 +433,6 @@ impl CodeEditor {
             element_bounds: Bounds::default(),
             // 固定窗口虚拟化：窗口首行绝对行号（初始 0）。
             window_base: 0,
-            // 全文档统一像素级确定性量程（见 struct 的 pixel_scroll 注释）。
-            pixel_scroll: true,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
             tab_size: 4,
             folds: FoldMap::new(),
@@ -390,6 +527,9 @@ impl CodeEditor {
         // 防「新旧文档同 version=0」命中上一份文档的颜色）。
         self.hl_dirty = None;
         self.highlighter.invalidate();
+        // 整篇替换：行级缓存同样显式清空（`Buffer::new` 后 version 归零，同防
+        // 「新旧文档同 version=0」命中上一份文档的行静态内容）。
+        self.row_cache.clear();
         // Markdown「所见即所得」滤镜缓存无需作废：缓存键含文档身份指纹（+version），
         // `Buffer::new` 后 version 归零也不会命中上一份文档的样式区间，`scan_window`
         // 首扫即指纹 miss → 按新文档自愈（M0.3；勿再手加 `md_decor.clear()` 兜底）。
@@ -452,24 +592,15 @@ impl CodeEditor {
     /// 横向滚动条之上）。
     #[cfg(test)]
     pub(crate) fn list_max_offset(&self) -> f32 {
-        if self.pixel_scroll {
-            (self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
-                - self.list_state.viewport_bounds().size.height.as_f32())
-                .max(0.)
-        } else {
-            self.list_state.max_offset_for_scrollbar().y.as_f32()
-        }
+        (self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
+            - self.list_state.viewport_bounds().size.height.as_f32())
+            .max(0.)
     }
 
     /// 纵向量程总高（px）。像素路径 = 条目总数 × 行高（含底部预留空行；确定性），
     /// 诊断/测试用。
     pub(crate) fn vertical_total_px(&self) -> f32 {
-        if self.pixel_scroll {
-            self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
-        } else {
-            self.list_state.max_offset_for_scrollbar().y.as_f32()
-                + self.list_state.viewport_bounds().size.height.as_f32()
-        }
+        self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
     }
 
     /// 测试：暴露 ListState（共享 Rc）——测试拖拽路径 / 量程对账。
@@ -492,7 +623,7 @@ impl CodeEditor {
 
     /// 测试：对指定逻辑行走真实的 `build_rows` 取数路径，返回该行**最终样式段**
     /// （Markdown 滤镜或 syntect，选区合并前）。用于验证 Markdown WYSIWYG 接线
-    /// （`md_mode → scan_window → row_data → merge_highlights`）。
+    /// （`md_mode → scan_window → build_rows → merge_highlights`）。
     #[cfg(test)]
     pub(crate) fn test_line_styles(
         &mut self,
@@ -505,8 +636,30 @@ impl CodeEditor {
         self.build_rows(window, logical_row, logical_row, false)
             .into_iter()
             .next()
-            .map(|rd| rd.highlights)
+            .map(|rd| rd.content.highlights.clone())
             .unwrap_or_default()
+    }
+
+    /// 测试：走真实 `build_rows` 路径拍一行窗口快照（文本 + 渲染消费的合并后样式
+    /// 段），供「无编辑滚动多帧后渲染不变 / 编辑后缓存失效」回归断言（M5-B2-3）。
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)] // 测试专用（文本 + 样式段）复合快照类型。
+    pub(crate) fn test_build_rows_snapshot(
+        &mut self,
+        window: &mut Window,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
+        self.build_rows(window, lo, hi, false)
+            .into_iter()
+            .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
+            .collect()
+    }
+
+    /// 测试：行缓存命中计数 / 条目数（滚动窗口内断言缓存复用、编辑后失效）。
+    #[cfg(test)]
+    pub(crate) fn test_row_cache(&self) -> (usize, usize) {
+        self.row_cache.stats()
     }
 
     /// 测试：当前固定窗口首行绝对行号。
@@ -712,7 +865,6 @@ impl CodeEditor {
         self.row_count = new_n;
         let t = std::time::Instant::now();
         self.list_state.reset(LIST_WINDOW_ROWS);
-        self.pixel_scroll = true;
         self.window_base = 0;
         self.desired_scroll.set(0.);
         // 整段重挂：滞留的高亮增量登记作废（撤销/重做后走整段重解析）。
@@ -785,94 +937,69 @@ impl CodeEditor {
     // 行数据
     // -----------------------------------------------------------------
 
-    fn row_data(
-        &self,
-        window: &mut Window,
-        row: usize,
-        show_caret: bool,
-        hl_styles: &[(Range<usize>, HighlightStyle)],
-    ) -> RowData {
-        if self.row_count == 0 || self.buffer.line_count() == 0 || row >= self.row_count {
-            return RowData::empty();
+    /// 光标 x：按帧状态现算（真实字形宽度，CJK 双宽不再按等宽列近似）→ 光标停在
+    /// 真实字符边界上（横向滚动交给外层容器，行内文本从 x=0 全宽绘制，这里只算文本
+    /// 本地 x）。不入缓存——光标位置每帧都在变，且空行分支与普通分支值一致
+    /// （空行 head==line_start==line_end → byte_col=0 → x=0）。
+    fn row_caret(&self, window: &mut Window, row: usize, show_caret: bool) -> Option<f32> {
+        if !show_caret {
+            return None;
         }
-
         let line_start = self.buffer.line_start(row);
         let line_end = self.buffer.line_end(row);
-        let text = self.buffer.line_text(row);
-        // 折叠首行：记「…」指示器 x（文本尾随位置，独立元素渲染，不进 StyledText）。
-        let folded = if self.folds.fold_starting_at(row).is_some() {
+        let head = self.selection.head();
+        if head < line_start || head > line_end {
+            return None;
+        }
+        let byte_col = head - line_start;
+        Some(
+            self.row_layout(window, row)
+                .map(|layout| layout.x_for_index(byte_col).as_f32())
+                .unwrap_or_else(|| byte_col as f32 * self.char_width.as_f32().max(1.)),
+        )
+    }
+
+    /// 折叠首行指示：按帧状态现叠（折叠动作不失效内容缓存）。`Some(x)` = 折叠首行的
+    /// 「…」指示器 x（= 行文本整形宽；独立元素渲染，不进 StyledText，不污染行内测量）。
+    fn row_folded(&self, window: &mut Window, row: usize) -> Option<f32> {
+        if self.folds.fold_starting_at(row).is_some() {
             Some(
                 self.row_layout(window, row)
                     .map(|layout| layout.width().as_f32())
                     .unwrap_or_else(|| {
-                        text.chars().count() as f32 * self.char_width.as_f32().max(1.)
+                        self.buffer.line_text(row).chars().count() as f32
+                            * self.char_width.as_f32().max(1.)
                     }),
             )
         } else {
             None
-        };
-        if text.is_empty() {
-            // 空行：仅在光标停在本行（head==line_start==line_end）时画在 x=0。
-            return RowData {
-                text,
-                highlights: Vec::new(),
-                caret: if show_caret
-                    && self.selection.head() == line_start
-                {
-                    Some(0.)
-                } else {
-                    None
-                },
-                folded,
-            };
         }
+    }
 
-        // 语法/滤镜着色：`hl_styles` 已按整窗批量解析，且是**行内字节坐标
-        // （syntect`parse_line` 相对本行文本；Markdown 滤镜扫描同样相对本行）。
-        // 直接与选区合并成非重叠样式段（含加粗/斜体/淡化等富样式字段）。
-        // 注意：选区底色不能“附在语法段后面一并交出去”。gpui `StyledText`
-        // 的 `compute_runs` 假定各 highlight **互不重叠**；选区必然横跨多个语法段，
-        // 重叠会使 run 总量超出整行字节长（实测 42 > 18），`shape_text` 按行尾
-        // 截断 → 尾部选区整段被丢（选中不出高亮）。这解释了同一份内容
-        // `.txt/.md`（无语法段）可选、`.rs`（Rust 每行多段）“不可选择”。
-        // 这里把语法色与选区色**合并**成非重叠的连续段：每个单元被语法覆盖就上
-        // color、被选区覆盖就上 background_color。
-        let sel_range = if !self.selection.is_collapsed() {
-            let sel = self.selection.range();
-            let lo = sel.start.max(line_start);
-            let hi = sel.end.min(line_end);
-            if hi > lo {
-                Some((lo - line_start)..(hi - line_start))
-            } else {
-                None
-            }
+    /// 选区合并层（动态，不入缓存）：选区坍缩返回 `None`（直接用缓存的无选区合并
+    /// 结果，滚动帧零分配零合并）；选区活动返回本帧动态合并——`merge_highlights`
+    /// 输入用缓存的 raw runs，主题底色 `sel_bg` 用当前值。选区/IME 组合变化绝不被
+    /// 旧缓存吞掉：选中底色永远按 **当前** 选区现算（见 `merge_highlights` 的非重叠
+    /// 语义，选区与语法段被合并成连续段，run 总量不超订）。
+    fn row_highlight_override(
+        &self,
+        row: usize,
+        content: &RowContent,
+    ) -> Option<Vec<(Range<usize>, HighlightStyle)>> {
+        if self.selection.is_collapsed() {
+            return None;
+        }
+        let line_start = self.buffer.line_start(row);
+        let line_end = self.buffer.line_end(row);
+        let sel = self.selection.range();
+        let lo = sel.start.max(line_start);
+        let hi = sel.end.min(line_end);
+        let sel_range = if hi > lo {
+            Some((lo - line_start)..(hi - line_start))
         } else {
             None
         };
-        let highlights = merge_highlights(hl_styles, sel_range, self.sel_bg);
-
-        // 光标：真实字形宽度（CJK 双宽不再按等宽列近似）→ 光标停在真实字符边界上
-        // （横向滚动交给外层容器，行内文本从 x=0 全宽绘制，这里只算文本本地 x）。
-        let caret = if show_caret
-            && self.selection.head() >= line_start
-            && self.selection.head() <= line_end
-        {
-            let byte_col = self.selection.head() - line_start;
-            let x = self
-                .row_layout(window, row)
-                .map(|layout| layout.x_for_index(byte_col).as_f32())
-                .unwrap_or_else(|| byte_col as f32 * self.char_width.as_f32().max(1.));
-            Some(x)
-        } else {
-            None
-        };
-
-        RowData {
-            text,
-            highlights,
-            caret,
-            folded,
-        }
+        Some(merge_highlights(&content.hl_styles, sel_range, self.sel_bg))
     }
 
     /// 行数据：渲染窗口内（`[lo, hi]`，**视觉行**）每行。
@@ -904,10 +1031,13 @@ impl CodeEditor {
         // WY_TRACE breakdown：整窗行数据构建段（含语法/滤镜高亮解析 + 行内样式合并）。
         let _t_br = crate::prof::begin();
         // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
-        // 借用，否则后续 `self.row_data` 与高亮窗口的借用冲突）。
+        // 借用，否则后续行物化/缓存写与高亮窗口的借用冲突）。
         // 返回切片约定：第 0 项 = `lo_l` 行（两级缓存均统一对齐到请求窗口）。
         // Markdown 文档走「所见即所得」滤镜（记号淡化 + 正文富样式）；其余语言走
         // syntect 语法高亮（`(Range, Hsla)` → 仅色 `HighlightStyle`）。
+        // `deferred`：延后着色帧（大缺口/上移出缓存，本帧空样式渲染、下一帧 settle
+        // 补色）——此帧**跳过缓存读写**，避免把占位空色冻结进缓存（否则颜色永久缺失）。
+        let mut deferred = false;
         let hl_lines: Vec<Vec<(Range<usize>, HighlightStyle)>> = if self.md_mode {
             self.md_decor
                 .scan_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
@@ -948,16 +1078,39 @@ impl CodeEditor {
                 // 延后：本窗空样式（文本/光标/选区仍正确，仅颜色下一帧补齐）。
                 // 预约下一帧：滚动停住（窗口不再变）让 `settle` 补一次有界重锚上色；
                 // 覆盖后不再预约，自动静止（无空转帧）。
+                deferred = true;
                 window.request_animation_frame();
                 std::iter::repeat_n(Vec::new(), hi_l - lo_l + 1).collect()
             }
         };
         // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
+        let version = self.buffer.version();
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
         for v in lo..=hi {
             let logical = self.folds.logical_row(v);
             let styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
-            out.push(self.row_data(window, logical, show_caret, styles));
+            // 静态内容层（M5-B2-3 行级缓存）：命中缓存（键 + 本帧新鲜 runs 逐位比对）
+            // → `Rc` 浅复用；未命中 → 物化新进窗口的行并入缓存（`deferred` 帧除外：
+            // 占位空色不许入缓存）。内容只取决于 `(buffer.version(), 逻辑行)`，折叠/
+            // 选区/光标是下面动态层，不影响命中判定。
+            let content = if deferred {
+                Rc::new(RowContent::materialize(&self.buffer, logical, styles))
+            } else {
+                match self.row_cache.probe(version, logical, styles) {
+                    Some(c) => c,
+                    None => {
+                        let c = Rc::new(RowContent::materialize(&self.buffer, logical, styles));
+                        self.row_cache.put(version, logical, c.clone());
+                        c
+                    }
+                }
+            };
+            out.push(RowData {
+                highlight_override: self.row_highlight_override(logical, &content),
+                caret: self.row_caret(window, logical, show_caret),
+                folded: self.row_folded(window, logical),
+                content,
+            });
         }
         crate::prof::end("ed.build_rows", _t_br);
         out
@@ -978,7 +1131,7 @@ impl CodeEditor {
     }
 
     // -----------------------------------------------------------------
-    // 纵向滚动：像素级确定性换算（大文档 pixel_scroll 路径）
+    // 纵向滚动：像素级确定性换算（固定窗口虚拟化的像素路径，恒启用）
     // -----------------------------------------------------------------
     // 像素模式下条目高度**不预铺 uniform**（None 提示按需实测），ListState 的
     // summary 高度全是 0，所以一切滚动都不能再走 summary 换算（scroll_by /

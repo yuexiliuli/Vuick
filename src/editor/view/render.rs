@@ -420,15 +420,8 @@ impl CodeEditor {
                     content_width: content_w_px,
                     // 量程 = **全文**条目数 × 行高（含底部预留空行，见 pad_row_count）
                     // ——与窗口大小无关，thumb 始终反映全文可滚范围。
-                    content_height: if self.pixel_scroll {
-                        self.scroll_item_count() as f32
-                            * self.line_height.as_f32().max(1.)
-                    } else {
-                        self.row_count as f32 * self.line_height.as_f32()
-                    },
-                    line_height: self.line_height,
-                    pixel_scroll: self.pixel_scroll,
-                    bottom_pad: self.vscroll_bottom_pad_px(),
+                    content_height: self.scroll_item_count() as f32
+                        * self.line_height.as_f32().max(1.),
                     desired_scroll: self.desired_scroll.clone(),
                     // 单一来源：与编辑器 scroll_to_px 同一份「全文量程」。
                     reach_px: self.reach_px(),
@@ -651,13 +644,13 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
 }
 
 fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
-    // 咽喉点兜底：`rd.highlights` 是行内字节区间（md 滤镜 / syntect 缓存 / 选区合并后），
-    // 编辑→重析后行文本变短或区间按字节切进 CJK/emoji 多字节字符内部时，gpui
+    // 咽喉点兜底：`rd.highlights()` 是行内字节区间（md 滤镜 / syntect 缓存 / 选区合并
+    // 后），编辑→重析后行文本变短或区间按字节切进 CJK/emoji 多字节字符内部时，gpui
     // `StyledText::with_highlights` 的 `is_char_boundary(run.end)` debug_assert 会崩
-    // （`elements/text.rs`，dev 构建 panic）。这里把每个段吸收到 `rd.text` 的字符边界、
+    // （`elements/text.rs`，dev 构建 panic）。这里把每个段吸收到行文本的字符边界、
     // 钳入行尾、空段丢弃、段间不重叠——`StyledText` 永不看到坏区间。
-    let highlights = char_align_highlights(rd.text.as_ref(), &rd.highlights);
-    StyledText::new(rd.text.clone()).with_highlights(highlights)
+    let highlights = char_align_highlights(rd.content.text.as_ref(), rd.highlights());
+    StyledText::new(rd.content.text.clone()).with_highlights(highlights)
 }
 
 /// 把「着色/滤镜段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
@@ -797,22 +790,17 @@ fn number_element(ix: usize, folded: bool, gv: &GutterView) -> gpui::Div {
 /// 内容宽逐帧变化）时会清空全部 size_hint，使后者瞬时坍缩，滚动条 thumb 表现为
 /// “突然变长又变短”。
 ///
-/// 两条路径：
-/// - `pixel_scroll=true`（大文档）：条目不预铺高度、summary 恒为 0，**完全不能**走
-///   `scroll_px_offset_for_scrollbar`/`set_offset_from_scrollbar`（它们按 summary 换算）。
-///   偏移读取与设置全部用「行数×行高」的像素模型：读 `logical_scroll_top`，写
-///   `scroll_to(self::px_to_offset)`。量程永远正确，天然没有坍缩问题（F2/F3 的根治）。
-/// - `pixel_scroll=false`（小文档）：继续委托 ListState（保留既有拖拽冻结逻辑）。
+/// 恒走像素模型（固定窗口虚拟化下条目不预铺高度、summary 恒为 0，**完全不能**走
+/// `scroll_px_offset_for_scrollbar`/`set_offset_from_scrollbar`——它们按 summary
+/// 换算）。偏移读取与设置全部用「行数×行高」的像素模型：读/写 `desired_scroll`。
+/// 量程永远正确，天然没有坍缩问题（F2/F3 的根治）。若未来恢复
+/// `pixel_scroll=false`（小文档委托 ListState 的拖拽冻结逻辑），需重加
+/// `start_drag`/`end_drag` 的 `scrollbar_drag_started/ended` 与 offset 回退分支。
 #[derive(Clone)]
 struct VerticalScrollHandle {
     state: ListState,
     content_width: f32,
     content_height: f32,
-    line_height: Pixels,
-    pixel_scroll: bool,
-    /// 底部预留（px，覆盖层横向滚动条厚 + 额外行数）：量程/滚到底都包含它，保证
-    /// 最后一行能滚到横向滚动条之上，且 thumb 范围与「真实可滚距离」一致。
-    bottom_pad: f32,
     /// 用户请求的竖向滚动（px，内容坐标）——与编辑器共享（`Rc<Cell<f32>>`）。
     /// 深跳占位期 thumb 用它显示目标（可能超出 ListState 实际可滚范围，Scrollbar
     /// 会把它夹到量程尾 = 「已到当前可滚底部」）；常规期恒等于 ListState 位置。
@@ -829,55 +817,21 @@ impl ScrollbarHandle for VerticalScrollHandle {
     }
 
     fn offset(&self) -> Point<Pixels> {
-        if self.pixel_scroll {
-            // 用「用户请求位置」而非 ListState 实际滚动顶：深跳占位期 thumb 指示
-            // 目标（超量程时 Scrollbar 夹到量程尾端）；常规期二者一致。
-            point(px(0.), px(-self.desired_scroll.get()))
-        } else {
-            self.state.scroll_px_offset_for_scrollbar()
-        }
+        // 用「用户请求位置」而非 ListState 实际滚动顶：深跳占位期 thumb 指示
+        // 目标（超量程时 Scrollbar 夹到量程尾端）；常规期二者一致。
+        point(px(0.), px(-self.desired_scroll.get()))
     }
 
     fn set_offset(&self, offset: Point<Pixels>) {
-        if self.pixel_scroll {
-            let off = (-offset.y.as_f32()).max(0.).min(self.reach_px);
-            // 拖动滚动条 = 写用户目标（desired_scroll，全文绝对坐标）。这里的 ListState
-            // 是固定窗口内的相对坐标，不能直接 scroll_to 绝对 px——窗口重定位由 render
-            // 每帧的 `apply_desired_to_window` 承担（O(窗口)，即时生效）。
-            self.desired_scroll.set(off);
-        } else {
-            self.state.set_offset_from_scrollbar(offset);
-        }
+        let off = (-offset.y.as_f32()).max(0.).min(self.reach_px);
+        // 拖动滚动条 = 写用户目标（desired_scroll，全文绝对坐标）。这里的 ListState
+        // 是固定窗口内的相对坐标，不能直接 scroll_to 绝对 px——窗口重定位由 render
+        // 每帧的 `apply_desired_to_window` 承担（O(窗口)，即时生效）。
+        self.desired_scroll.set(off);
     }
 
     fn content_size(&self) -> gpui::Size<Pixels> {
         size(px(self.content_width), px(self.content_height))
-    }
-
-    fn start_drag(&self) {
-        if self.pixel_scroll {
-            // 量程确定性，无坍缩，无需重铺/冻结。
-            return;
-        }
-        // gpui 在布局宽度变化后清空全部 size_hint → `items.summary().height` 瞬时坍缩；
-        // 若此刻开始拖拽，`scrollbar_drag_start_height` 会把坍缩值**冻结一整次拖拽**
-        // （gpui list.rs，拖到底也到不了真正的底部）。拖拽开始前若检测到量程坍缩，用
-        // *确定性行高强制重铺*（`reset_with_uniform_height` 覆盖陈旧戳值；O(n) 一次），
-        // 保证冻结的量程是正确的；健康量程则直接冻结（省掉不必要的 O(n)）。
-        // （clone/self.state 与编辑器共享同一 `Rc<RefCell<Inner>>`，换掉 items 即全局生效。）
-        let total = self.state.max_offset_for_scrollbar().y.as_f32()
-            + self.state.viewport_bounds().size.height.as_f32();
-        if total < self.content_height * 0.97 {
-            let prev = self.state.logical_scroll_top();
-            self.state
-                .reset_with_uniform_height(self.state.item_count(), self.line_height);
-            self.state.scroll_to(prev);
-        }
-        self.state.scrollbar_drag_started();
-    }
-
-    fn end_drag(&self) {
-        self.state.scrollbar_drag_ended();
     }
 }
 

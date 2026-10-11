@@ -1378,3 +1378,66 @@ fn empty_new_tab_paste_not_collapsed_to_first_row(cx: &mut TestAppContext) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M5-B2-3 行级缓存：无编辑滚动多帧后渲染不变 / 编辑后缓存失效
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn row_cache_reuses_scrolled_rows_and_invalidates_on_edit(cx: &mut TestAppContext) {
+    // M5-B2-3：`build_rows` 行级缓存——滚动帧只物化新进窗口的行。重连线序断言：
+    // 1) 无编辑滚动多帧后，重叠行渲染（文本 + 样式段）逐位不变且命中缓存（浅复用）；
+    // 2) 编辑（buffer.version()+1）后缓存键失效，同一窗口下行取数路径如实反映新文本，
+    //    未编辑行不受影响。
+    let text = (0..200)
+        .map(|i| format!("line{i:03} fn f{i}() {{ let v = {i}; // {i} }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (host, cx) = open(cx, &text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+
+    // 帧 1：窗口 A = 逻辑行 0..50（真实 build_rows 路径，与 render 一帧同源）。
+    let a = cx.update(|window, cx| {
+        ed.update(cx, |ed, _| ed.test_build_rows_snapshot(window, 0, 50))
+    });
+    assert_eq!(a.len(), 51, "窗口 A 应含 51 行");
+
+    // 帧 2：无编辑滚动 +10 行 → 窗口 B = 10..60。
+    let hits0 = cx.update(|_, cx| ed.read(cx).test_row_cache().0);
+    let b = cx.update(|window, cx| {
+        ed.update(cx, |ed, _| ed.test_build_rows_snapshot(window, 10, 60))
+    });
+    let hits1 = cx.update(|_, cx| ed.read(cx).test_row_cache().0);
+
+    // 无编辑滚动多帧后渲染不变：B 与 A 重叠的行（10..49）逐位一致。
+    for i in 10..50 {
+        assert_eq!(b[i - 10].0, a[i].0, "滚动复用行文本应逐位一致（行 {i}）");
+        assert_eq!(b[i - 10].1, a[i].1, "滚动复用行样式应逐位一致（行 {i}）");
+    }
+    // 滚动帧只物化新进窗口的行：41 行重叠应基本全命中（而非整窗重物化）。
+    assert!(
+        hits1 - hits0 >= 40,
+        "无编辑滚动应大量复用缓存（hits {hits0} → {hits1}）"
+    );
+
+    // 帧 3：编辑窗口内的行 20 → version+1 → 缓存键整体失效 → 数据路径反映新文本。
+    let off = cx.update(|_, cx| ed.read(cx).offset_for_line_col(20, 4));
+    cx.update(|_, cx| {
+        ed.update(cx, |ed, cp| {
+            ed.set_caret_to(off);
+            ed.insert_text("X", cp);
+        })
+    });
+    let c = cx.update(|window, cx| {
+        ed.update(cx, |ed, _| ed.test_build_rows_snapshot(window, 10, 60))
+    });
+    assert!(
+        c[10].0.contains('X'),
+        "编辑后窗口行 20 应反映新文本（缓存未吞编辑）: {:?}",
+        c[10].0
+    );
+    // 未编辑行（行 11 / 22）文本不受编辑影响：缓存失效不引入失真。
+    assert_eq!(c[0].0, b[0].0, "未编辑行文本不应漂移（行 10）");
+    assert_eq!(c[12].0, b[12].0, "未编辑行文本不应漂移（行 22）");
+}
+
+
