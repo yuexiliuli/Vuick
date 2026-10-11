@@ -6,8 +6,9 @@ description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 edition = "2024"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+# gpui：钉死 zed 仓库提交（显式 rev，避免 cargo update 漂移；升级需同步改三处与 Cargo.lock）。
+gpui = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["font-kit"] }
 serde_json = "1"
 regex = "1"
 memchr = "2"
@@ -57,7 +58,7 @@ test-support = ["gpui/test-support"]
 video = []
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["test-support"] }
 
 [workspace]
 resolver = "2"
