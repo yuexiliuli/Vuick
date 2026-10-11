@@ -37,8 +37,34 @@ use crate::config::markdown::{
 use crate::markdown::doc::{row_kind, DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::{Row, RowKind, RunKind, TableAlign};
-use crate::markdown::view::expand_bg_over_whitespace;
 use crate::markdown::wysiwyg::WyTheme;
+
+/// 把背景区间向左右扩展吞掉紧邻空白：留给圆角背景的左右视觉间距。
+/// （高亮区间即"代码文本 + 两侧各一个空格"，等宽 overrides 只覆盖代码本体，
+/// 空格保持正文字宽 → 圆角灰底略宽于字形，左右有呼吸空间。）
+/// 预览与 WYSIWYG 的行内代码 pill 共用同一扩展规则（单一行为源；M5-B5 P4-2 由
+/// `markdown::view::row` 迁入本层——`view` 预览引擎已删）。
+pub(crate) fn expand_bg_over_whitespace(text: &str, range: &Range<usize>) -> Range<usize> {
+    let mut start = range.start;
+    let mut end = range.end;
+    if start > 0 {
+        let prev = text[..start].chars().next_back();
+        if let Some(c) = prev
+            && c.is_whitespace()
+        {
+            start -= c.len_utf8();
+        }
+    }
+    if end < text.len() {
+        let next = text[end..].chars().next();
+        if let Some(c) = next
+            && c.is_whitespace()
+        {
+            end += c.len_utf8();
+        }
+    }
+    start..end
+}
 
 /// 标题行左缘 gutter（折叠箭头预留）——与 `wysiwyg::element::HEADING_GUTTER_W` 同源常量。
 const HEADING_GUTTER_W: f32 = 20.;
@@ -558,6 +584,8 @@ pub(crate) fn docrow_for_height(r: &Row) -> DocRow {
         payload,
         table_rows: None,
         align: r.align,
+        notes: r.notes.clone(),
+        note_defs: r.note_defs.clone(),
     }
 }
 

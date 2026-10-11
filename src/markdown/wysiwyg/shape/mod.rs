@@ -231,7 +231,7 @@ pub(crate) fn shape_text_row(
         .runs
         .iter()
         .filter(|(_, k)| *k == RunKind::InlineCode)
-        .map(|(rg, _)| crate::markdown::view::expand_bg_over_whitespace(r.text.as_ref(), rg))
+        .map(|(rg, _)| crate::markdown::layout::expand_bg_over_whitespace(r.text.as_ref(), rg))
         .collect();
     let runs = runs_to_text_runs(
         r.text.as_ref(),
@@ -471,6 +471,12 @@ pub(crate) fn shape_text_row_decorated(
     if srow.editable {
         srow.extra.links = link_hits(&raw, srow.byte_map.as_slice());
     }
+    // P4-2: 脚注标记 `[n]` 命中几何（注记悬浮卡 / 双向跳转）。显示区间 =
+    // `r.notes`/`r.note_defs`（已是相对 `r.text` 的显示字节范围；范围越界即跳过，
+    // 数学 splice/警报剥标记等改写文本后行号漂移的安全网）。
+    if !r.notes.is_empty() || !r.note_defs.is_empty() {
+        srow.extra.note_markers = note_marker_hits(&r);
+    }
     // B1: 行内图片 `![alt](src)` → 在 alt 文本（显示区）上方画缩略图。
     srow.extra.inline_images = inline_image_hits(&r, &srow, &raw);
     srow
@@ -576,8 +582,7 @@ pub(crate) fn style_links_in_runs(r: &mut DocRow, raw: &str) {
 }
 
 /// 行内链接：源码区间（行坐标）→ 显示字节区间（经 byte_map 左界映射）。
-pub(crate) fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {
-    let mut out = Vec::new();
+pub(crate) fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {    let mut out = Vec::new();
     for (src, target) in recognition::links(raw) {
         let d0 = source_to_display(byte_map, src.start);
         let d1 = source_to_display(byte_map, src.end);
@@ -585,6 +590,34 @@ pub(crate) fn link_hits(raw: &str, byte_map: &[usize]) -> Vec<RowLink> {
             out.push(RowLink {
                 disp: d0..d1,
                 target,
+            });
+        }
+    }
+    out
+}
+
+/// 脚注标记 `[n]` 的显示几何（P4-2 注记迁入 WYSIWYG）：区间取 `r.notes`/`r.note_defs`
+/// ——`extract_notes` 已把 `[^n]`/`[!n]` 剥成 `[n]`，记录的是**相对 `r.text` 的显示
+/// 字节范围**（无需再经 byte_map 反查）。越界区间（剥记号/数学 splice 后行号漂移）
+/// 直接丢弃，`position_for_index` 也有界外 None 兜底，不会 panic。
+pub(crate) fn note_marker_hits(r: &DocRow) -> Vec<NoteMarker> {
+    let n = r.text.len();
+    let mut out = Vec::new();
+    for (range, nm) in &r.notes {
+        if range.start < range.end && range.end <= n {
+            out.push(NoteMarker {
+                disp: range.clone(),
+                n: *nm,
+                is_def: false,
+            });
+        }
+    }
+    for (range, nm) in &r.note_defs {
+        if range.start < range.end && range.end <= n {
+            out.push(NoteMarker {
+                disp: range.clone(),
+                n: *nm,
+                is_def: true,
             });
         }
     }

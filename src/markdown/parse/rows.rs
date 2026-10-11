@@ -114,6 +114,7 @@ pub enum RowPayload {
 
 /// 图片行载荷的只读视图（非图片行返回 None）。
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // 固有尺寸字段：预览引擎已删后仅 parse 测试消费
 pub struct ImageInfo<'a> {
     pub src: &'a SharedString,
     pub img_w: Option<u32>,

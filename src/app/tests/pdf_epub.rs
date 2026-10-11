@@ -1,113 +1,3 @@
-    /// 诊断（临时，手工跑）：真机大文档上对比编辑器/预览双层量程 + 模拟拖到底。
-    /// 依赖 `fixtures/大文档测试.md` 存在；正常跑套件时跳过。#[ignore] 手动：
-    /// `cargo test -- --ignored diag_drag_bottom_real_file --nocapture`
-    #[gpui::test]
-    #[ignore]
-    async fn diag_drag_bottom_real_file(cx: &mut TestAppContext) {
-        init_test(cx);
-        unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
-        let (app, cx) = add_app(cx);
-        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
-        for _ in 0..3 {
-            cx.run_until_parked();
-        }
-        cx.update(|window, cx| {
-            app.update(cx, |app, cx| {
-                app.open_file(r"fixtures/大文档测试.md", window, cx);
-            });
-        });
-        for _ in 0..20 {
-            cx.run_until_parked();
-            let _ = cx.cx.refresh();
-        }
-        cx.run_until_parked();
-        let (n_lines, ed_max, ed_vh, lh, pw_total, pv_blocks, pv_est) = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            let ed = a.tabs[i].editor.read(cx);
-            let pv = a.tabs[i].md_preview.read(cx);
-            (
-                ed.line_count(),
-                ed.list_max_offset(),
-                ed.list_viewport_height(),
-                ed.test_metrics().1,
-                pv.vertical_total_px(),
-                pv.memory_estimate().0,
-                pv.test_est_hint(),
-            )
-        });
-        println!(
-            "DIAG 编辑器: lines={n_lines} 摘要总高={:.1} 句柄高(lines×lh)={:.1} 行高={lh:.1}",
-            ed_max + ed_vh,
-            n_lines as f32 * lh
-        );
-        let (ed_vw, ed_cw) = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            let ed = a.tabs[i].editor.read(cx);
-            (
-                ed.test_list_state().viewport_bounds().size.width.as_f32(),
-                ed.test_content_w_px(),
-            )
-        });
-        println!("DIAG 编辑器宽: viewport_w={ed_vw:.1} content_w={ed_cw:.1}");
-        println!(
-            "DIAG 预览: blocks={pv_blocks} est={pv_est:.1} 摘要total={pw_total:.1} 句柄高(blocks×est)={:.1}",
-            pv_blocks as f32 * pv_est
-        );
-
-        // 编辑器模拟拖到底（重置→冻结→拖超远）
-        let ls = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].editor.read(cx).test_list_state()
-        });
-        ls.reset_with_uniform_height(n_lines, gpui::px(lh));
-        ls.scrollbar_drag_started();
-        ls.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
-        cx.run_until_parked();
-        let _ = cx.cx.refresh();
-        cx.run_until_parked();
-        let ed_ix = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i]
-                .editor
-                .read(cx)
-                .test_list_state()
-                .logical_scroll_top()
-                .item_ix
-        });
-        println!("DIAG 编辑器拖到底: 滚动顶行 item_ix={ed_ix} / {n_lines}（距末尾 {}）", n_lines.saturating_sub(ed_ix));
-
-        // 预览模拟拖到底
-        let pls = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].md_preview.read(cx).test_list_state()
-        });
-        pls.reset_with_uniform_height(pv_blocks, gpui::px(pv_est.max(0.0)));
-        pls.scrollbar_drag_started();
-        pls.set_offset_from_scrollbar(gpui::Point::new(gpui::px(0.), gpui::px(-10_000_000.)));
-        cx.run_until_parked();
-        let _ = cx.cx.refresh();
-        cx.run_until_parked();
-        let pv_ix = cx.update(|_, cx| {
-            let a = app.read(cx);
-            let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i]
-                .md_preview
-                .read(cx)
-                .test_list_state()
-                .logical_scroll_top()
-                .item_ix
-        });
-        println!(
-            "DIAG 预览拖到底: 滚动顶块 item_ix={pv_ix} / {pv_blocks}（距末尾 {}）",
-            pv_blocks.saturating_sub(pv_ix)
-        );
-    }
-
     /// 打开 .epub：应解析正文（含书名/章节），自动进入预览模式并填充内容。
     #[gpui::test]
     async fn opens_epub_and_shows_preview(cx: &mut TestAppContext) {
@@ -135,7 +25,7 @@
                 a.tabs.len(),
                 a.status_ok,
                 a.tabs[a.active_tab].preview_fullscreen,
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.tabs[a.active_tab].md_wy.is_some(),
             )
         });
         assert!(status_ok, "打开 EPUB 应成功");
@@ -439,24 +329,18 @@
             let last_toc_line = cx.update(|_w, cx| {
                 let a = app.read(cx);
                 let t = &a.tabs[a.active_tab];
-                if a.epub_preview_backend_wy() && t.md_wy.is_some() {
-                    t.md_wy.as_ref().map(|w| w.read(cx).toc_entries().last().map(|(l, _, _)| *l))
-                } else {
-                    Some(t.md_preview.read(cx).toc_entries().last().map(|(r, _, _)| *r))
-                }
+                // P4-2：统一 WyEditor 只读宿主（`MarkdownPreview` 已删）。
+                t.md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).toc_entries().last().map(|(l, _, _)| *l))
             });
             if let Some(Some(line)) = last_toc_line {
                 cx.update(|_w, cx| {
                     let a = app.read(cx);
                     let t = &a.tabs[a.active_tab];
-                    if a.epub_preview_backend_wy() && t.md_wy.is_some() {
-                        // 新宿主：set_scroll_target（prepaint 重钉到章标题所在块顶）。
-                        let wy = t.md_wy.clone().expect("后端 Wy 时宿主在场");
-                        wy.update(cx, |v, _| v.set_scroll_target(line));
-                    } else {
-                        let md = t.md_preview.clone();
-                        md.update(cx, |v, _| v.scroll_to_row(line));
-                    }
+                    // 统一宿主：set_scroll_target（prepaint 重钉到章标题所在块顶）。
+                    let wy = t.md_wy.clone().expect("统一宿主在场");
+                    wy.update(cx, |v, _| v.set_scroll_target(line));
                 });
                 for _ in 0..8 {
                     cx.run_until_parked();
@@ -499,7 +383,8 @@
         let (fs0, wrap0) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
-            (t.preview_fullscreen, t.md_preview.read(cx).is_wrap())
+            // P4-2：预览统一 WyEditor 恒换行（`MarkdownPreview::is_wrap` 已删）。
+            (t.preview_fullscreen, t.md_wy.is_some())
         });
         assert!(fs0, "初始应是全屏");
         assert!(wrap0, "初始应换行");
@@ -524,7 +409,7 @@
         let (fs1, wrap1) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
-            (t.preview_fullscreen, t.md_preview.read(cx).is_wrap())
+            (t.preview_fullscreen, t.md_wy.is_some())
         });
         assert!(!fs1, "切换后应退出全屏");
         assert!(wrap1, "退出全屏后预览应保持换行（预览始终自动换行）");
@@ -539,7 +424,7 @@
         let (wrap2, pref2) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.tabs[a.active_tab].md_wy.is_some(),
                 a.wrap_enabled,
             )
         });
@@ -556,7 +441,7 @@
         let (wrap3, pref3) = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.tabs[a.active_tab].md_preview.read(cx).is_wrap(),
+                a.tabs[a.active_tab].md_wy.is_some(),
                 a.wrap_enabled,
             )
         });

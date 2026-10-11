@@ -92,6 +92,13 @@ pub(crate) struct DocRow {
     /// 行对齐（EPUB 排版指令 `%%ALIGN:X%%`，来自 [`super::parse::Row::align`]；
     /// `None` = 跟随默认左对齐）。WYSIWYG 只读 EPUB 宿主用它做右/中对齐单源。
     pub(crate) align: Option<RowAlign>,
+    /// 文内脚注引用标记 `[^n]`（显示区间 = **相对本行渲染文本**的字节范围，见
+    /// [`super::parse::extract_notes`] 的 `[^n] → [n]` 剥记号语义；由 M5-B5 P4-2
+    /// 「注记迁入 WYSIWYG」透传，A 侧 `MarkdownPreview` 删除后由 WyEditor 承载
+    /// 悬浮卡/双向跳转）。
+    pub(crate) notes: Vec<(Range<usize>, usize)>,
+    /// 脚注**定义**标记 `[!n]`（同 `notes` 区间语义；`[!n] → [n]` 显示）。
+    pub(crate) note_defs: Vec<(Range<usize>, usize)>,
     /// 表格块的逐行/单元格编辑映射（仅 [`IrKind::Table`] 行非 `Some`；代码块用
     /// `byte_map`，表格因单元格多列需要更细粒度）。`Rc` 压低克隆成本。
     pub(crate) table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
@@ -958,22 +965,9 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
         payload,
         table_rows,
         align: r.align,
+        notes: r.notes.clone(),
+        note_defs: r.note_defs.clone(),
     }
-}
-
-/// 一块窗口的预览行 → 统一行序列（预览侧共享装配入口；`lo` = 窗口首块下标）。
-/// 与 [`Doc::rows_in_block_window`] 逐位一致（byte_map/lines/table_rows 语义单源），
-/// 由 `markdown::view` 消费；`Doc` 内部同样走 [`assemble_docrow`]。
-pub(crate) fn assemble_docrow_window<V: DocLineView>(
-    view: &V,
-    index: &BlockIndex,
-    rows: &[Row],
-    lo: usize,
-) -> Vec<DocRow> {
-    rows.iter()
-        .enumerate()
-        .map(|(j, r)| assemble_docrow(view, index, lo + j, r.clone()))
-        .collect()
 }
 
 /// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用

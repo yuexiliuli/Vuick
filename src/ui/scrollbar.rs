@@ -16,8 +16,10 @@
 //! .viewport_from_layout()`；容器内作为唯一子元素铺满视口（`request_layout` 填满父级）。
 //!
 //! # 自定义句柄
-//! 编辑器/预览的「确定性量程」句柄（`VerticalScrollHandle`/`PreviewScrollHandle`）
-//! 只需把 `impl gpui_component::scroll::ScrollbarHandle` 换成 `impl crate::ui::scrollbar::
+//! 编辑器/预览的「确定性量程」句柄（`VerticalScrollHandle`；M5-B5 P4-2 后
+//! `PreviewScrollHandle` 随 `MarkdownPreview` 删除，统一 WyEditor 用
+//! `gpui::ScrollHandle`（`md-wy-scroll`/`live-scroll`））只需把
+//! `impl gpui_component::scroll::ScrollbarHandle` 换成 `impl crate::ui::scrollbar::
 //! ScrollbarHandle`——契约方法完全相同。也内置了对 `gpui::ScrollHandle` / `ListState` 的实现。
 //!
 //! # 交互（对齐 gpui-component 的优化）

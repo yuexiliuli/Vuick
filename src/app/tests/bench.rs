@@ -34,11 +34,15 @@
         loop {
             frames += 1;
             cx.run_until_parked();
-            let (preview_blocks, editor_pending, editor_lines) = cx.update(|_, cx| {
+            let (wy_loaded, editor_pending, editor_lines) = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 (
-                    a.tabs[i].md_preview.read(cx).memory_estimate().0,
+                    a.tabs[i]
+                        .md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false),
                     a.tabs[i].editor_pending,
                     a.tabs[i].editor.read(cx).line_count(),
                 )
@@ -47,7 +51,7 @@
                 d_ready = true;
                 d_ready_ms = t0.elapsed().as_millis() as usize;
             }
-            if !a_ready && preview_blocks > 0 {
+            if !a_ready && wy_loaded {
                 a_ready = true;
                 a_ready_ms = t0.elapsed().as_millis() as usize;
             }
@@ -149,14 +153,17 @@
                 "未装配".to_string()
             }
         );
-        let md_prev_blocks = cx.update(|_, cx| {
+        // P4-2：MD 预览 = 唯一统一 WyEditor（`MarkdownPreview` 已删），无第二份扫描可量。
+        let wy_blocks = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
-            a.tabs[i].md_preview.read(cx).memory_estimate().0
+            a.tabs[i]
+                .md_wy
+                .as_ref()
+                .map(|w| w.read(cx).frame_total().map_or(0., |t| t) as usize)
+                .unwrap_or(0)
         });
-        println!(
-            "【md_preview（EPUB/TOC 侧）】 MD 分支脱离后不应再为大 md 建索引（blocks={md_prev_blocks}）"
-        );
+        println!("【WyEditor 预览帧总高】 {wy_blocks} px（可对照 □ 量程）");
         // 首帧真实布局
         let tb = std::time::Instant::now();
         for i in 0..3 {

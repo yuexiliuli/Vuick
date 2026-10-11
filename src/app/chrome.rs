@@ -160,21 +160,13 @@ impl EditorApp {
             },
             cx,
         );
-        // 刷新所有 Markdown 预览背景：背景是自绘色板（panel_bg）快照，
-        // 若不刷新，切换主题后预览文字色随组件主题变化而背景仍是旧色，导致内容看不清。
-        let panel_bg = self.panel_bg();
-        // PDF 阅读器画布用灰色系（window_bg），与页面“纸面”卡片形成分隔
+        // 刷新所有预览/WYSIWYG 的调色主题：`WyTheme` 在创建时从 `StyleParams` 一次性
+        // 派生并缓存，主题切换后必须重建（MD / EPUB 统一走 `WyEditor`；`MarkdownPreview`
+        // 后端已删，M5-B5 P4-2）。PDF 画布用灰色系（window_bg）与"纸面"卡片分隔。
         let canvas_bg = self.window_bg();
         for tab in &self.tabs {
-            let md = tab.md_preview.clone();
-            md.update(cx, |view, cx| {
-                view.set_background(panel_bg);
-                cx.notify();
-            });
             // A2/A4：右栏统一 WyEditor 预览（md_wy）与 WYSIWYG 活区（live2）的调色主题
-            // 在创建时一次性派生并缓存（`WyTheme`←`StyleParams`，见 `WyEditor::new`）——
-            // 主题切换后必须重建，否则预览/WYSIWYG 的文字/代码块/链接等颜色保持旧主题色
-            // （原先只刷背景，内容色滞后 →“切换黑白后预览不完全重染色/用旧色”）。
+            //（原先只刷背景，内容色滞后 →"切换黑白后预览不完全重染色/用旧色"）。
             if let Some(wy) = tab.md_wy.clone() {
                 wy.update(cx, |ed, cx| {
                     ed.rebuild_theme_from_global(cx);

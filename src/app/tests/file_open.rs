@@ -230,15 +230,6 @@
             "编辑后预览应跟随新内容（增量桥），实际 {t1:?}"
         );
         assert_eq!(t1, e1, "预览应与编辑区逐字节一致");
-        // MD 分支脱离：MarkdownPreview 不再承载 MD 预览（EPUB/TOC 专用）。
-        let md_prev = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.read(cx).rendered_text()
-        });
-        assert!(
-            !md_prev.contains("初始标题") && !md_prev.contains("新增段落"),
-            "MD 预览应已脱离 MarkdownPreview（不再喂源），实际 {md_prev:?}"
-        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -460,9 +451,10 @@
 
         let wrap = cx.update(|_w, cx| {
             let a = app.read(cx);
-            a.tabs[a.active_tab].md_preview.read(cx).is_wrap()
+            // P4-2：预览统一 WyEditor 恒换行（`MarkdownPreview::is_wrap` 已删）。
+            a.tabs[a.active_tab].md_wy.is_some()
         });
-        assert!(wrap, "编辑内容后首次打开预览应默认为换行模式");
+        assert!(wrap, "编辑内容后首次打开预览应默认唤出统一换行预览宿主");
     }
 
     /// 语法高亮回归：打开 rust 文件，解析在后台异步进行（不卡 UI / 不 panic），
@@ -830,8 +822,8 @@
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        // 块数 > WINDOWED_MIN_BLOCKS 且 > 128KB → 走异步流水线（finish 安装 md_wy）。
-        let n = crate::config::limits::WINDOWED_MIN_BLOCKS + 800;
+        // 块数足够多（转成 >128KB 文本）→ 走异步流水线（finish 安装 md_wy）。
+        let n = 4_800;
         let content = (0..n)
             .map(|i| {
                 format!("# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调*、`行内代码` 与 [链接](https://x.y)。\n\n")
@@ -868,20 +860,15 @@
             }
         }
         // 预览全文 = 编辑区正文（md_wy 从同一棵 Rope 装配，覆盖完整源；一份解析态）。
-        let (wy_text, ed_text, md_prev_blocks) = cx.update(|_, cx| {
+        let (wy_text, ed_text) = cx.update(|_, cx| {
             let a = app.read(cx);
             let i = a.tabs.len().saturating_sub(1);
             (
                 a.tabs[i].md_wy.as_ref().unwrap().read(cx).text().to_string(),
                 a.tabs[i].editor.read(cx).value().to_string(),
-                a.tabs[i].md_preview.read(cx).memory_estimate().0,
             )
         });
         assert_eq!(wy_text, ed_text, "大 md WyEditor 预览应覆盖完整源（与编辑区一致）");
-        assert!(
-            md_prev_blocks == 0,
-            "MD 分支脱离：MarkdownPreview 不再为大 md 建第二份索引（blocks={md_prev_blocks}）"
-        );
         let _ = std::fs::remove_file(&dir);
     }
 

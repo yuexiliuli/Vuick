@@ -406,7 +406,7 @@ impl EditorApp {
                 crate::toc::toc_node_has_child(&levels, idx)
             }
             Some(_t) => {
-                // A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview（同一数据源口径）。
+                // P4-2：MD / EPUB 目录都来自统一 WyEditor 只读宿主。
                 let levels: Vec<usize> = self
                     .md_toc_source(cx)
                     .map(|(entries, _)| entries.iter().map(|&(_, l, _)| l as usize).collect())
@@ -454,7 +454,7 @@ impl EditorApp {
                 .map(|e| Self::toc_row_width(e.level, &e.title, font_px) + page_col_w)
                 .fold(0.0f32, f32::max)
         } else {
-            // A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview（同一数据源口径）。
+            // P4-2：MD / EPUB 目录都来自统一 WyEditor 只读宿主。
             let entries = self
                 .md_toc_source(cx)
                 .map(|(e, _)| e)
@@ -536,7 +536,7 @@ impl EditorApp {
                         div().flex().flex_col().py_1().children(rows).into_any_element()
                     }
                 } else {
-                    // Markdown 标题（A4：MD 统一预览走 WyEditor、EPUB 走 MarkdownPreview）。
+                    // Markdown 标题（P4-2：MD / EPUB 目录都来自统一 WyEditor 宿主）。
                     match self.md_toc_source(cx) {
                         Some((entries, scroll)) if !entries.is_empty() => {
                             let rows = self.sidebar_toc_md_rows(
@@ -655,8 +655,8 @@ impl EditorApp {
     }
 
     /// Markdown 标题目录条目（可折叠树；可见性按当前折叠集合过滤）。
-    /// A4：`scroll` 区分跳转目标——`Legacy`（MarkdownPreview，渲染行列）用 `scroll_to_row`，
-    /// `Unified`（右栏 WyEditor 只读预览，源码行）用 `scroll_to_line` 滚动统一组件宿主。
+    /// P4-2：`scroll` 跳转目标 = 右栏 WyEditor 只读预览（源码行）`scroll_to_line`；
+    ///（`MarkdownPreview` 的 `Legacy` 渲染行目标已随引擎删除。）
     #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
     fn sidebar_toc_md_rows(
         &self,
@@ -702,12 +702,6 @@ impl EditorApp {
                 window,
                 cx,
                 move |_, window, cx| match &sc {
-                    MdTocScroll::Legacy(md) => {
-                        md.update(cx, |v, cx| {
-                            v.scroll_to_row(tgt);
-                            cx.notify();
-                        });
-                    }
                     MdTocScroll::Unified(wy) => {
                         wy.update(cx, |v, cx| {
                             v.scroll_to_line(tgt, window);
@@ -970,39 +964,22 @@ impl EditorApp {
                     if let Some(tab) = this.tabs.get(ti) {
                         if tab.readonly_preview {
                             // EPUB 等只读预览：编辑区为空，跳转 = 滚动预览到命中行并高亮命中文本。
-                            // P4-1：EPUB 走 WyEditor 只读宿主 → `set_scroll_target`（prepaint
-                            // 重钉，与 MD 统一组件同款）+ 搜索高亮；回退 MarkdownPreview 照旧。
+                            // P4-2：一律 WyEditor 只读宿主（`MarkdownPreview` 已删）——
+                            // `set_scroll_target`（prepaint 重钉）+ 搜索高亮。
                             if let Some(wy) = tab.md_wy.clone() {
                                 wy.update(cx, |v, cx| {
                                     v.set_scroll_target(li);
                                     v.highlight_search(li, &q_owned.clone(), cx);
                                 });
-                            } else {
-                                let md = tab.md_preview.clone();
-                                md.update(cx, |v, cx| {
-                                    v.scroll_to_line(li);
-                                    v.highlight_search(li, &q_owned.clone(), cx);
-                                });
                             }
                         } else {
-                            // 预览可见（分屏/全屏）且仍是 MarkdownPreview（EPUB/手动预览，
-                            // md_wy 缺席）时高亮预览中的命中文本——MD 已切统一组件由下面
-                            // `md_wy.highlight_search` 承担（A4）。
-                            if (tab.preview_on || tab.preview_fullscreen) && tab.md_wy.is_none() {
-                                let md = tab.md_preview.clone();
-                                md.update(cx, |v, cx| {
-                                    v.highlight_search(li, &q_owned, cx);
-                                });
-                            }
-                            // 统一组件（live2 WYSIWYG）也在场时：命中文本同步高亮
-                            // （预览独有能力搬入 `WyEditor::highlight_search`，同款语义）。
+                            // 统一组件（live2 WYSIWYG）与右栏 WyEditor 预览在场时：命中文本
+                            // 同步高亮（预览独有能力搬入 `WyEditor::highlight_search`，同款语义）。
                             if let Some(l2) = tab.live2.clone() {
                                 l2.update(cx, |v, cx| {
                                     v.highlight_search(li, &q_owned, cx);
                                 });
                             }
-                            // A2：右栏 WyEditor 预览（MD 统一组件，只读）在场时同样高亮
-                            // 命中文本（预览从 MarkdownPreview 切到它之后的跳转高亮同步）。
                             if let Some(wy) = tab.md_wy.clone() {
                                 wy.update(cx, |v, cx| {
                                     v.highlight_search(li, &q_owned, cx);

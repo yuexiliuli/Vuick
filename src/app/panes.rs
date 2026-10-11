@@ -10,7 +10,8 @@ pub(crate) const LIVE_BODY_PAD_Y: f32 = 8.0;
 impl EditorApp {
     /// 当前选项卡的预览视图：图片选项卡用 `ImageViewer`（自处理滚轮），
     /// 视频选项卡用 `VideoViewer`（M1 首帧静态阅读），PDF 选项卡用 `PdfViewer`
-    /// （整页原样），其余用 `MarkdownPreview`。
+    ///（整页原样），其余（MD / EPUB）用统一 WyEditor 只读宿主（M5-B5 P4-2：
+    /// `MarkdownPreview` 已删）。预览未创建 → 空元素兜底。
     fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
         if let Some(img) = &tab.image_viewer {
             return img.clone().into_any_element();
@@ -21,7 +22,11 @@ impl EditorApp {
         }
         match &tab.pdf_preview {
             Some(pdf) => pdf.clone().into_any_element(),
-            None => tab.md_preview.clone().into_any_element(),
+            None => tab
+                .md_wy
+                .clone()
+                .map(|w| w.into_any_element())
+                .unwrap_or_else(|| gpui::div().into_any_element()),
         }
     }
 
@@ -285,11 +290,7 @@ impl EditorApp {
         if self.md_wy_preview().is_some() {
             return self.md_wy_host_children(window, cx, false, grow);
         }
-        // EPUB / PDF / 旧预览（元素树 MarkdownPreview）。
-        let fs = self.font_size;
-        self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
-            view.set_font_size_anchored(fs, cx)
-        });
+        // PDF / 图片 / 视频（自包含阅读器）。
         div()
             .flex()
             .flex_row()
@@ -430,16 +431,12 @@ impl EditorApp {
         if self.sync_active_image_meta(cx) {
             cx.notify();
         }
-        // 视频查看器：同文件夹切换后标签标题/状态栏跟到当前视频。
+        // 图片 / 视频查看器：同文件夹切换后标签标题/状态栏跟到当前媒体。
         #[cfg(feature = "video")]
         if self.sync_active_video_meta(cx) {
             cx.notify();
         }
-        // 全屏阅读同样把全局字号推进到预览，并允许 Ctrl+滚轮缩放（EPUB 缩放入口统一）。
-        let fs = self.font_size;
-        self.tabs[self.active_tab].md_preview.update(cx, |view, cx| {
-            view.set_font_size_anchored(fs, cx)
-        });
+        // 全屏阅读（PDF / 图片 / 视频）：自包含阅读器自处理缩放，无需全局字号推进。
         let tab = &self.tabs[self.active_tab];
         let mut el = div()
             .id("fullscreen-preview")

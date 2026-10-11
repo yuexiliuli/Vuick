@@ -7,7 +7,8 @@
 //! - 每个章节是一个 XHTML 文件（spine 决定阅读顺序）
 //!
 //! 本模块把 EPUB 解析成**平铺的 XHTML 文本流**后转成 Markdown，交给
-//! [`crate::markdown::MarkdownPreview`] 渲染（复用行级虚拟化预览）。
+//! 统一 WyEditor 只读宿主渲染（`crate::markdown::wysiwyg::WyEditor`，M5-B5 P4-2
+//! 终态；`MarkdownPreview` 预览引擎已删）。
 //! 图片以**内存字节**形式保存在 [`EpubDocument::images`]（虚拟 src → 字节），
 //! 渲染时交给预览直接从内存解码显示，全程不写硬盘。
 

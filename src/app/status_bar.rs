@@ -45,9 +45,9 @@ impl EditorApp {
         let preview_on = tab.map(|t| t.preview_on).unwrap_or(false);
         let readonly_preview = tab.map(|t| t.readonly_preview).unwrap_or(false);
         let fullscreen = tab.map(|t| t.preview_fullscreen).unwrap_or(false);
-        let wrap_on = tab
-            .map(|t| t.md_preview.read(cx).is_wrap())
-            .unwrap_or(false);
+        // P4-2：预览统一 WyEditor（页面恒换行，`MarkdownPreview::is_wrap` 已删）；
+        // 「换行」按钮显示 = 有统一 WyEditor 预览在场。
+        let wrap_on = tab.map(|t| t.md_wy.is_some()).unwrap_or(false);
         let is_markdown = tab
             .and_then(|t| t.file_path.as_ref().map(|p| Self::is_markdown_path(p.as_path())))
             .unwrap_or(false);

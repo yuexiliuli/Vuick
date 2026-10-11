@@ -58,6 +58,7 @@ pub fn citation_index_from_rows(rows: &[Row]) -> CitationIndex {
 /// 提取一段**已剥行内样式**文本里的引用标记：返回 (清理后文本, 标记列表)。
 /// 每个标记是 (显示文本字节区间, 注记号, 是否定义)；区间与 [`parse_to_rows`] 内
 /// [`extract_notes`] 的产出一致。
+#[allow(dead_code)] // 整篇扫描面：预览引擎已删（WYSIWYG 用 Doc 块级 `citation_index`），仅本模块测试消费
 fn extract_citation_markers(text: &str) -> (SharedString, Vec<(Range<usize>, usize, bool)>) {
     let (out, _, notes, note_defs) = extract_notes(text.into(), Vec::new());
     let markers = notes
@@ -75,6 +76,7 @@ fn extract_citation_markers(text: &str) -> (SharedString, Vec<(Range<usize>, usi
 /// [`BlockIndex`] 完全一致，按需跳转不会错位。只对**文本块**（标题 / 引述 / 列表 /
 /// 段落）剥行内样式后提取 `[^n]` / `[!n]` 标记（与 [`parse_to_rows`] 定义一致）；
 /// 代码块 / 表格 / 图片不产生引用标记。
+#[allow(dead_code)] // 整篇扫描面：预览引擎已删（WYSIWYG 用 Doc 块级 `citation_index`），仅本模块测试消费
 pub fn scan_citations(src: &str) -> CitationIndex {
     let mut idx = CitationIndex::default();
     let lines: Vec<&str> = src.split('\n').collect();

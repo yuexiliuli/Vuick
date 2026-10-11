@@ -25,69 +25,40 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
-    /// 把指定选项卡的当前内容同步到 Markdown 预览（开启预览时刷新一次）。
-    /// 源用 `tab.content`（编辑区内容的镜像，EPUB 打开时正文只存在于 content/预览，
-    /// 编辑区为空，不能用 editor.value() 否则会拿空串覆盖预览导致内容消失）。
-    pub(super) fn sync_md_preview(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let panel_bg = self.panel_bg();
-        // 预览区始终自动换行（Markdown/EPUB，不随编辑区换行偏好）
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
-        let value = if !tab.content.is_empty() {
-            tab.content.clone().to_string()
-        } else {
-            tab.editor.read(cx).value().to_string()
-        };
-        tab.md_preview.update(cx, |view, cx| {
-            view.set_background(panel_bg);
-            view.set_base_dir(tab.file_path.as_ref().and_then(|p| p.parent()).map(|d| d.to_path_buf()));
-            view.set_wrap(true, cx);
-            view.set_source(&value, cx);
-        });
-    }
-
     /// A2：当前激活选项卡的右栏 WyEditor 预览实体（仅当该选项卡**真正以 WyEditor 作
-    /// 预览渲染**时才返回：Markdown 文件 → 已建 → 非 PDF；EPUB（P4-1 迁 WyEditor 只读
-    /// 宿主，且回退开关未关）→ 已建）。`render_preview_pane` / `render_fullscreen_preview`
-    /// 据此决定走统一组件宿主。
+    /// 预览渲染**时才返回）：Markdown / EPUB / 纯文本（都可能有 `md_wy`）返回宿主；
+    /// PDF / 图片 / 视频（自带阅读器）→ `None`。`render_preview_pane` /
+    /// `render_fullscreen_preview` 据此决定走统一组件宿主。
+    ///（M5-B5 P4-2：`MarkdownPreview` 已删，预览统一 WyEditor。）
     pub(super) fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
         let tab = self.tabs.get(self.active_tab)?;
-        let wy = tab.md_wy.clone()?;
-        // PDF 用自带 PdfViewer，绝不以 WyEditor 渲染。
+        // PDF/图片/视频用自带阅读器，绝不以 WyEditor 渲染。
         if tab.pdf_preview.is_some() {
             return None;
         }
-        if self.is_epub_tab(self.active_tab) {
-            // EPUB 只读宿主：回退开关关 → 仍走 MarkdownPreview。
-            if !self.epub_preview_backend_wy() {
-                return None;
-            }
-            return Some(wy);
-        }
-        // Markdown 统一预览：仅 Markdown（非只读）走 WyEditor。
-        if !self.is_markdown_tab(self.active_tab) || tab.readonly_preview {
+        if tab.image_viewer.is_some() {
             return None;
         }
-        Some(wy)
+        #[cfg(feature = "video")]
+        if tab.video_viewer.is_some() {
+            return None;
+        }
+        tab.md_wy.clone()
     }
 
-    /// EPUB 轻量视口分页读数 `(当前页, 总页数)`（1 基；状态栏页码，P4-1）：
-    /// 新宿主（WyEditor 只读）读 WYSIWYG 确定性量程；回退后端读 `MarkdownPreview`
-    /// （原有实现）。非 EPUB / 就绪前 → `None`（状态栏不显示页码）。
+    /// EPUB 轻量视口分页读数 `(当前页, 总页数)`（1 基；状态栏页码，P4-1/P4-2）：
+    /// 读 WyEditor 只读宿主 WYSIWYG 确定性量程（`MarkdownPreview` 回退后端已删）。
+    /// 非 EPUB / 就绪前 → `None`（状态栏不显示页码）。
     pub(super) fn epub_page_bounds(&self, window: &mut Window, cx: &gpui::App) -> Option<(usize, usize)> {
         let idx = self.active_tab;
         if !self.is_epub_tab(idx) {
             return None;
         }
         let tab = self.tabs.get(idx)?;
-        if self.epub_preview_backend_wy() && tab.md_wy.is_some() {
-            // 视口高：以窗口内容高估算（容器 ≈ 窗口正文区；误差 ≤ 顶部/底部工具条高，
-            // 对「第 x/N 页」展示无碍）。
-            let view_h = f32::from(window.viewport_size().height).max(1.);
-            return tab.md_wy.as_ref().and_then(|w| w.read(cx).viewport_page_bounds(view_h));
-        }
-        tab.md_preview.read(cx).viewport_page_bounds()
+        // 视口高：以窗口内容高估算（容器 ≈ 窗口正文区；误差 ≤ 顶部/底部工具条高，
+        // 对「第 x/N 页」展示无碍）。
+        let view_h = f32::from(window.viewport_size().height).max(1.);
+        tab.md_wy.as_ref().and_then(|w| w.read(cx).viewport_page_bounds(view_h))
     }
 
     /// 编辑区⇄预览滚动同步（每帧渲染开头调用）。只在「活动选项卡以 WyEditor 作 MD
@@ -212,20 +183,15 @@ impl EditorApp {
     }
 
     /// A4：当前激活选项卡的 Markdown TOC 数据源 + 跳转目标（侧边栏目录共用）：
-    /// MD 统一预览（`md_wy` 在场，非只读）→ WyEditor（条目 = 源码行，点击滚动统一组件
-    /// 宿主）；EPUB / 手动预览（`md_wy` 缺席）→ `MarkdownPreview`（渲染行列，`scroll_to_row`）。
+    /// MD / EPUB 统一预览都走 WyEditor 只读宿主（条目 = 源码行，点击滚动统一组件）；
+    /// 无 WyEditor（未开启预览 / 非预览文档）→ `None`。
     pub(super) fn md_toc_source(
         &self,
         cx: &gpui::App,
     ) -> Option<(crate::markdown::wysiwyg::TocEntries, MdTocScroll)> {
         let tab = self.tabs.get(self.active_tab)?;
-        if let Some(wy) = &tab.md_wy {
-            return Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())));
-        }
-        Some((
-            tab.md_preview.read(cx).toc_entries(),
-            MdTocScroll::Legacy(tab.md_preview.clone()),
-        ))
+        let wy = tab.md_wy.as_ref()?;
+        Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
     }
 
     /// A2：确保某选项卡的右栏 WyEditor 预览已创建（懒创建 + A1 只读门控 + 全局字号/
@@ -258,7 +224,7 @@ impl EditorApp {
             self.tabs[idx].md_wy = Some(ed.clone());
         }
         if feed {
-            // 同步喂源：源 = 编辑区规范文本（与 `sync_md_preview` 同口径）。
+            // 同步喂源：源 = 编辑区规范文本（与预览宿主同口径）。
             let text = {
                 let tab = &mut self.tabs[idx];
                 tab.editor.read(cx).value().to_string()
@@ -276,7 +242,7 @@ impl EditorApp {
     /// EPUB：确保右栏 WyEditor **只读宿主**已创建（懒创建 + A1 只读门控 + 全局字号/
     /// 基准目录/内存图片表），并用 EPUB 源**同步喂源**（P4-1：EPUB 迁 WyEditor）。
     /// 只读（`set_editable(false)`）、标题居中（`set_epub(true)`）、`epubimg://…` 内存图
-    /// （`set_memory_images`）。注记/引文/页码等 A 侧能力仍由 `md_preview` 承载（P4-2）。
+    /// （`set_memory_images`）、注记浮卡/引文跳转正文（`set_notes`，P4-2 迁入）。
     pub(super) fn ensure_epub_wy(
         &mut self,
         idx: usize,
@@ -284,6 +250,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
         text: &str,
         images: &std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+        notes: &std::collections::BTreeMap<usize, String>,
     ) {
         if idx >= self.tabs.len() {
             return;
@@ -309,6 +276,7 @@ impl EditorApp {
                 ed.set_base_dir(base_dir);
                 ed.set_memory_images(images.clone());
                 ed.set_epub(true);
+                ed.set_notes(notes.clone());
                 ed.set_source_text(text);
             });
         }
@@ -316,7 +284,8 @@ impl EditorApp {
 
     /// P4-1：EPUB 章节翻转「上一章/下一章」。章界 = 目录标题条目（每章以标题起始）。
     /// 统一 WyEditor 宿主：当前章 = 顶行所在标题，滚动到相邻章标题（`set_scroll_target`，
-    /// prepaint 重钉，无需 window）；回退 MarkdownPreview：滚动到目录渲染行（`scroll_to_row`）。
+    /// 统一 WyEditor 宿主：当前章 = 顶行所在标题，滚动到相邻章标题（`set_scroll_target`，
+    /// prepaint 重钉，无需 window；`MarkdownPreview` 回退后端已删）。
     /// 无 EPUB / 少于 2 章 / 已处边界章 → 不动，返回 `false`。
     pub(super) fn epub_flip_chapter(&mut self, dir: i32, cx: &mut Context<Self>) -> bool {
         let idx = self.active_tab;
@@ -329,34 +298,19 @@ impl EditorApp {
         if entries.len() < 2 {
             return false;
         }
-        match scroll {
-            MdTocScroll::Unified(wy) => {
-                let current = wy.read(cx).top_source_line().unwrap_or(0);
-                let cur_ix = entries
-                    .iter()
-                    .rposition(|&(l, _, _)| l <= current)
-                    .unwrap_or(0);
-                let next = (cur_ix as i32 + dir).clamp(0, entries.len() as i32 - 1) as usize;
-                if next == cur_ix {
-                    return false;
-                }
-                wy.update(cx, |v, _| v.set_scroll_target(entries[next].0));
-                cx.notify();
-                true
-            }
-            MdTocScroll::Legacy(md) => {
-                let cur_ix = 0usize; // Legacy 无顶行读数：从首章起翻
-                let next = (cur_ix as i32 + dir).clamp(0, entries.len() as i32 - 1) as usize;
-                if next == cur_ix {
-                    return false;
-                }
-                md.update(cx, |v, cx| {
-                    v.scroll_to_row(entries[next].0);
-                    cx.notify();
-                });
-                true
-            }
+        let MdTocScroll::Unified(wy) = scroll;
+        let current = wy.read(cx).top_source_line().unwrap_or(0);
+        let cur_ix = entries
+            .iter()
+            .rposition(|&(l, _, _)| l <= current)
+            .unwrap_or(0);
+        let next = (cur_ix as i32 + dir).clamp(0, entries.len() as i32 - 1) as usize;
+        if next == cur_ix {
+            return false;
         }
+        wy.update(cx, |v, _| v.set_scroll_target(entries[next].0));
+        cx.notify();
+        true
     }
 
     /// 切换指定选项卡的 Markdown 预览（眼睛图标 / 菜单 / 命令面板共用）。
@@ -380,8 +334,6 @@ impl EditorApp {
                 // 关闭预览时同步退出全屏
                 if !tab.preview_on {
                     tab.preview_fullscreen = false;
-                    // 增量基底随预览关闭即失效（下次开启重新全量建立）
-                    tab.preview_prev = None;
                 }
             }
             tab.preview_on
@@ -394,24 +346,20 @@ impl EditorApp {
             ed.set_soft_wrap(wrap);
         });
         if preview_on {
-            // A4 脱离：MD（非只读）只走统一组件 WyEditor（ensure_md_wy 同步喂源）；
-            // EPUB（P4-1）走 WyEditor 只读宿主（回退开关开时），MarkdownPreview 仍喂
-            // （注记/引文/页码回退源，P4-2 收口）；手动预览仍用 MarkdownPreview。
-            if is_md && !readonly {
+            // 统一预览（M5-B5 P4-2）：所有非只读文本选项卡（MD / 纯文本）→ `ensure_md_wy`
+            // 同步喂源；EPUB（只读）→ `ensure_epub_wy`（WyEditor 只读宿主 + 内存图/注记/
+            // 引文/页码）。`MarkdownPreview` 后端已删除，无回退分支。
+            if !readonly {
                 self.ensure_md_wy(idx, window, cx, true);
-            } else if readonly && self.is_epub_tab(idx) && self.epub_preview_backend_wy() {
+            } else if self.is_epub_tab(idx) {
                 let images = self.tabs[idx].epub_images.clone();
-                self.sync_md_preview(idx, cx);
+                let notes = self.tabs[idx].epub_notes.clone();
                 let content = self.tabs[idx].content.clone();
-                self.ensure_epub_wy(idx, window, cx, content.as_ref(), &images);
-            } else {
-                self.sync_md_preview(idx, cx);
+                self.ensure_epub_wy(idx, window, cx, content.as_ref(), &images, &notes);
             }
         } else {
-            // 关闭预览：释放整篇解析出的行数据与测量缓存，内存回到基线
-            // （否则隐藏的预览仍占着整篇文档，反复开关只涨不降）。
-            self.tabs[idx].md_preview.update(cx, |view, cx| view.release(cx));
-            // A2：右栏 WyEditor 预览随预览开关释放（同款内存回收）。
+            // 关闭预览：右栏 WyEditor 预览随预览开关释放（整篇解析/测量缓存随之释放，
+            // 内存回到基线）。
             self.tabs[idx].md_wy = None;
             self.tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
         }
@@ -419,19 +367,18 @@ impl EditorApp {
     }
 
     /// 切换当前选项卡预览是否全屏占满（EPUB 阅读模式）。
+    /// P4-2：预览统一 WyEditor（恒换行），全屏只影响编辑区/布局，无需再设预览换行。
     pub(super) fn toggle_preview_fullscreen(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
-        let (fullscreen, preview, editor) = {
+        let (fullscreen, editor) = {
             let Some(tab) = self.tabs.get_mut(idx) else {
                 return;
             };
             tab.preview_fullscreen = !tab.preview_fullscreen;
             let fs = tab.preview_fullscreen;
-            (fs, tab.md_preview.clone(), tab.editor.clone())
+            (fs, tab.editor.clone())
         };
-        // 进入全屏阅读模式 → 预览强制换行、编辑区强制换行；
-        // 退出全屏 → 预览始终换行（不随偏好）；编辑区恢复默认（md 换行 / 其余按偏好）。
-        preview.update(cx, |view, cx| view.set_wrap(true, cx));
+        // 编辑区软换行：进入全屏阅读 → 编辑区强制换行；退出全屏 → 恢复默认。
         let is_md = self.is_markdown_tab(idx);
         let editor_wrap = if fullscreen {
             true
@@ -662,9 +609,9 @@ impl EditorApp {
         tab.line_count = n_lines;
         tab.char_count = n_chars;
         tab.editor.update(cx, |ed, _| ed.set_text(&content));
-        tab.md_preview.update(cx, |v, cx| v.set_source(&content, cx));
         // A2/A3：右栏 WyEditor 预览（若存在）随 WYSIWYG 写回全量刷新——
         // 写回是整篇替换（非 Change 轨迹），增量桥不会替它补，这里一次性对正源。
+        // （`MarkdownPreview` 后端已删，M5-B5 P4-2，只有统一宿主需要对齐。）
         if let Some(wy) = tab.md_wy.clone() {
             wy.update(cx, |w, _cx| w.set_source_text(&content));
         }

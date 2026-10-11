@@ -378,6 +378,19 @@ pub struct WyEditor {
     /// 重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧（「突然往左闪烁」）。
     /// `None` = 无卡片 / 锚点未就绪。
     image_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
+    /// EPUB 注记正文表（`注记号 → 注释文本`，`set_notes` 注入；悬浮卡正文优先读它）。
+    note_ctx: std::collections::BTreeMap<usize, SharedString>,
+    /// 当前悬浮的注记标记（命中矩形 = 内容列局部，卡锚定用 `content_origin` 换算；
+    /// 由 `on_mouse_move`/窗口级 move 更新，注视离开/换源/点击跳转后清除）。
+    hover_note: Cell<Option<element::NoteMarkerHit>>,
+    /// 引文跳转后给目标行注记标记的**高亮**：`(源码行, 注记号, 是否定义)`，paint 用
+    /// accent 淡色画该标记（复用选区几何），[`HIGHLIGHT_MS`] 后自动消失。
+    marker_hl: Cell<Option<(usize, usize, bool)>>,
+    /// 高亮代序列号（同 `highlight_seq`：定时器只清同代，防旧定时器误清新高亮）。
+    marker_hl_seq: Cell<u64>,
+    /// 引文跳转索引缓存：`(content_gen, Rc<CitationIndex>)`——懒建（首次交互到注记才
+    /// O(块数) 建一次），内容变更后自动失效重建。「行」字段语义 = **源码行**。
+    cit: RefCell<Option<(u64, std::rc::Rc<crate::markdown::parse::CitationIndex>)>>,
 }
 /* ---------- 键盘 / IME 输入 ---------- */
 
@@ -466,6 +479,9 @@ impl gpui::Render for WyEditor {
         // `image_edit_anchor`（同代 origin+frame），不在此现算帧（避免读到 ensure
         // 兜底 800 宽重建的临时帧而横跳）。
         let image_edit_overlay = self.image_edit_card_element(window, cx);
+        // P4-2: 注记悬浮卡片浮层（只读宿主悬停注记标记时）：同样最后叠加、锚定在注记
+        // 矩形右下方（窗口坐标，paint 期 `hover_note` 的内容局部矩形 + `content_origin`）。
+        let note_overlay = self.note_card_element(window, cx);
         let mut root = gpui::div()
             .relative()
             .key_context(CONTEXT)
@@ -581,6 +597,9 @@ impl gpui::Render for WyEditor {
                 editor: cx.entity(),
             });
         if let Some(overlay) = image_edit_overlay {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = note_overlay {
             root = root.child(overlay);
         }
         root

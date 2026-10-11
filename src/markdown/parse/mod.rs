@@ -33,6 +33,7 @@ pub use citations::{CitationIndex, citation_index_from_rows, scan_citations};
 pub use blocks::{BlockIndex, BlockMeta, Blocks, BlocksIter, BlocksSeg, Toc, scan_blocks};
 pub(crate) use blocks::build_line_starts_u32;
 #[cfg(test)] pub(crate) use blocks::BLOCKS_MAX_SEGS;
+#[allow(unused_imports)] // 兼容重导出：窗口/增量扫描面（预览引擎已删，仅 parse 测试消费）
 pub use blocks_scan::{
     parse_block_window, parse_block_window_rope, scan_blocks_incremental_rope, scan_blocks_rope,
 };

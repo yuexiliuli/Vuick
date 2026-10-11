@@ -30,7 +30,6 @@ impl EditorApp {
             char_count: 0,
             cursor_row: 0,
             cursor_col: 0,
-            md_preview: cx.new(|cx| crate::markdown::MarkdownPreview::new(cx)),
             pdf_preview: None,
             image_viewer: None,
             #[cfg(feature = "video")]
@@ -46,9 +45,8 @@ impl EditorApp {
             md_wy: None,
             md_wy_vscroll: gpui::ScrollHandle::new(),
             epub_images: Default::default(),
-            preview_prev: None,
+            epub_notes: Default::default(),
             edit_version: 0,
-            preview_dirty: None,
             _edit_sub: edit_sub,
         });
         let idx = self.tabs.len() - 1;

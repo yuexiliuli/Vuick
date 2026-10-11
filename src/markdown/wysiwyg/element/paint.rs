@@ -1469,6 +1469,31 @@ fn paint_text_selection_hl(
     }
 }
 
+/// 注记跳转加亮（P4-2）：把 WyEditor 登记的「目标源码行的注记标记」解析成**绝对源
+/// 区间**，复用 [`paint_selection`] 的几何（与搜索高亮同机制）用 accent 淡色画该标记
+/// ——点击 `[n]` 跳转到对端后，落位标记短暂显色（[`HIGHLIGHT_MS`] 后由定时器清除）。
+/// 目标行不在带内 / 无此标记 → 不画（滚动落位后下一帧可见）。
+pub(crate) fn paint_note_marker_highlight(
+    editor: &gpui::Entity<WyEditor>,
+    origin: Point<Pixels>,
+    theme: &WyTheme,
+    f: &Frame,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let hl: Hsla = if crate::ui::theme::Theme::global(cx).is_dark() {
+        gpui::rgba(0x58a6ff59).into()
+    } else {
+        gpui::rgba(0x9ec9ff88).into()
+    };
+    let range = editor.read(cx).marker_hl.get().and_then(|(src_line, n, is_def)| {
+        let e = editor.read(cx);
+        note_marker_src_range(e, f, src_line, n, is_def)
+    });
+    let Some(range) = range else { return };
+    paint_selection(editor, origin, theme, f, &range, hl, window, cx);
+}
+
 /// 搜索跳转高亮（预览独有能力，搬入统一组件后由元素 paint 调用）：把 `WyEditor`
 /// 登记的搜索命中解析成**绝对源区间**，以「命中色」（暗琥珀 / 亮黄，与 preview
 /// `MarkdownPreview::compute_search_highlight` 同款）复用 [`paint_selection`] 的

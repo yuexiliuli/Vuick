@@ -61,9 +61,6 @@ impl EditorApp {
             status_ok: true,
             notifications: Vec::new(),
             font_size: start_font,
-            preview_pending: false,
-            preview_syncing: false,
-            preview_seq: 0,
             dark_mode: start_dark,
             // 手动切主题会退到强制档；此处仅为「跟随 / 强制」的偏好记录。
             theme_pref: prefs.theme,
@@ -109,8 +106,6 @@ impl EditorApp {
             _appearance_sub: None,
             palette: None,
             _palette_sub: None,
-            #[cfg(test)]
-            epub_backend_force_legacy: false,
         };
         app.register_window(window, cx);
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，

@@ -21,7 +21,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
     for _ in 0..8 {
         cx.run_until_parked();
     }
-    let (md_wy, editable, has_text, toc_len, routed, backend_on) = cx.update(|_w, cx| {
+    let (md_wy, editable, has_text, toc_len, routed) = cx.update(|_w, cx| {
         let a = app.read(cx);
         let t = &a.tabs[a.active_tab];
         (
@@ -39,10 +39,8 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
                 .map(|w| w.read(cx).toc_entries().len())
                 .unwrap_or(0),
             a.md_wy_preview().is_some(),
-            a.epub_preview_backend_wy(),
         )
     });
-    assert!(backend_on, "默认新宿主开关开启");
     assert!(md_wy.is_some(), "EPUB 应建 WyEditor 只读宿主");
     assert!(!editable, "EPUB 宿主应只读（禁编辑）");
     assert!(has_text, "宿主内容应含书名");
@@ -144,44 +142,62 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     assert!(moved_back, "上一章应可翻回");
 }
 
-/// P4-1：回退开关（测试专用实例字段强制 MarkdownPreview）下 EPUB **不建** WyEditor
-/// 宿主、预览路由回 MarkdownPreview；EPUB 仍自动开启预览（现有阅读体验不破坏）。
-/// 用实例字段而非全局/env：并行测试互不干扰。
+// P4-2：注记悬浮/引文跳转在 EPUB 全流程（app 层）回归见 `app/tests/pdf_epub.rs`
+// 与 `markdown/wysiwyg/element/tests/epub.rs`（`wy_note_*`）。回退开关测试已随
+// `MarkdownPreview` 后端删除（M5-B5 P4-2 终态）。
+
+/// P4-2：注记/引文在**统一正确宿主**（只读 WyEditor，MD 与 EPUB 同一管线）的 app 层
+/// 回归——打开含脚注 `[^1]`/`[!1]` 的 md，走真实 `open_file → ensure_md_wy` 喂源后：
+/// 引文索引 refs/defs/details 以**源码行**记（与 EPUB 宿主同机制）；`navigate_marker`
+/// 双向跳转设置对端滚动目标 + 加亮。换源后索引随 content_gen 失效。
 #[gpui::test]
-async fn epub_fallback_backend_keeps_markdown_preview(cx: &mut TestAppContext) {
+async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppContext) {
     init_test(cx);
     let (app, cx) = add_app(cx);
     cx.simulate_resize(gpui::size(px(980.), px(720.)));
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    cx.update(|_w, cx| {
-        app.update(cx, |a, _| a.epub_backend_force_legacy = true);
-    });
-    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+    let p = std::env::temp_dir().join("gpui-wy-notes-app.md");
+    std::fs::write(&p, "正文引用[^1]\n\n[!1] 注记正文\n").unwrap();
     cx.update(|window, cx| {
-        app.update(cx, |app, cx| {
-            app.open_file(epub.to_str().unwrap(), window, cx)
-        });
+        app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
     });
     for _ in 0..8 {
         cx.run_until_parked();
     }
-    let (md_wy_none, routed_none, preview_on, md_content_has) = cx.update(|_w, cx| {
+    let (cit_ref_line, cit_def_line, note_txt, routed) = cx.update(|_w, cx| {
         let a = app.read(cx);
         let t = &a.tabs[a.active_tab];
+        let wy = t.md_wy.clone().expect("MD 打开应建统一 WyEditor 预览");
+        let cit = wy.read(cx).citation_index();
         (
-            t.md_wy.is_none(),
-            a.md_wy_preview().is_none(),
-            t.preview_on,
-            t.content.contains("共产党宣言"),
+            cit.refs.get(&1).map(|(l, _)| *l),
+            cit.defs.get(&1).map(|(l, _)| *l),
+            wy.read(cx).note_text_for(1),
+            a.md_wy_preview().is_some(),
         )
     });
-    cx.update(|_w, cx| {
-        app.update(cx, |a, _| a.epub_backend_force_legacy = false);
+    assert!(routed, "MD 预览应路由到 WyEditor（统一宿主）");
+    assert_eq!(cit_ref_line, Some(0), "文内 `[^1]` 应收录（行 0）");
+    assert_eq!(cit_def_line, Some(2), "定义 `[!1]` 应收录（行 2）");
+    assert_eq!(note_txt.as_deref(), Some("注记正文"), "缺 EPUB 注记表时正文回退 details");
+    // 引用 → 定义 双向跳转（同一 update 内读，scroll_target 下一帧被 prepaint 消费）。
+    let (stl, mhl) = cx.update(|_w, cx| {
+        let a = app.read(cx);
+        let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
+        let hit = crate::markdown::wysiwyg::NoteMarkerHit {
+            src_line: 0,
+            n: 1,
+            is_def: false,
+            bounds: gpui::Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(10.), px(10.))),
+        };
+        wy.update(cx, |w, cx| {
+            w.navigate_marker(&hit, cx);
+            (w.scroll_target_line(), w.marker_hl_test())
+        })
     });
-    assert!(md_wy_none, "回退下不应建 WyEditor 宿主");
-    assert!(routed_none, "回退下预览路由应回 MarkdownPreview");
-    assert!(preview_on, "回退下 EPUB 仍自动开启预览");
-    assert!(md_content_has, "EPUB 正文仍由 content 持有（回退可读）");
+    assert_eq!(stl, Some(2), "引用 → 定义：滚动目标应为定义行");
+    assert_eq!(mhl, Some((2, 1, true)), "定义标记应加亮 (2, n=1, is_def)");
+    let _ = std::fs::remove_file(&p);
 }

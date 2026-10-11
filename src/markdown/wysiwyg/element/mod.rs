@@ -123,6 +123,18 @@ pub(crate) struct RowLink {
     pub target: LinkHit,
 }
 
+/// 脚注标记（`[n]`）：显示字节区间 + 注记号。P4-2 注记迁入 WYSIWYG——paint（悬浮
+/// 高亮/命中色）、命中、跳转共用同一几何（同 [`RowLink`] 模式）。
+#[derive(Clone, Debug)]
+pub(crate) struct NoteMarker {
+    /// 显示字节区间（`[n]` 显示文本，含括号）。
+    pub disp: Range<usize>,
+    /// 注记号（`[^n]` / `[!n]` 里的数字）。
+    pub n: usize,
+    /// 是否末尾定义标记（`[!n]`）；false = 文内引用 `[^n]`。
+    pub is_def: bool,
+}
+
 /// 块级卡片（数学块 / Mermaid 图）——把整块折叠成一张自绘卡片。
 #[derive(Clone, Debug)]
 pub(crate) enum BlockCard {
@@ -136,6 +148,7 @@ pub(crate) enum BlockCard {
 pub(crate) struct RowExtra {
     pub gutter: Option<RowGutter>,
     pub links: Vec<RowLink>,
+    pub note_markers: Vec<NoteMarker>,
     pub inline_maths: Vec<InlineMathText>,
     pub inline_images: Vec<InlineImageHit>,
     /// 非空 = 本块画成一张卡片（不再画文本），并跳过普通 paint。
@@ -699,7 +712,7 @@ pub(crate) struct ShapedRow {
     /// （代码行以 `\n` 连接）中的**起始渲染字节偏移**；长度 = 源码行数。
     /// 空 = 普通单源码行文本块（段落等折行仍只映射一行，用 `byte_map` 全宽映射）。
     pub multi_offsets: Vec<usize>,
-    /// （仅文本行；已按 [`crate::markdown::view::expand_bg_over_whitespace`] 扩展空白）行内代码
+    /// （仅文本行；已按 [`crate::markdown::layout::expand_bg_over_whitespace`] 扩展空白）行内代码
     /// （反引号）在渲染文本中的字节区间——paint 前自绘圆角 pill 底。空 = 无行内代码。
     pub code_ranges: Vec<Range<usize>>,
     /// 该行实际行高（正文=para_line、标题=heading_line、代码=code_line 等）。
@@ -1160,6 +1173,8 @@ impl Element for WyEditorElement {
             paint_selection(&self.editor, origin, &theme, f, &range, hl, window, cx);
         }
         paint_search_highlight(&self.editor, origin, &theme, f, window, cx);
+        // P4-2: 注记跳转加亮（点击 `[n]` 跳对端后给目标标记短暂显色，同搜索高亮机制）。
+        paint_note_marker_highlight(&self.editor, origin, &theme, f, window, cx);
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         // A1 只读门控：`editable=false` 不画光标（光标移动/选区仍工作，只是无竖条）。
         let (caret_on, caret_x, caret_top) = {

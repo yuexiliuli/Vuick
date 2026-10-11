@@ -431,7 +431,11 @@
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 !a.tabs[i].editor_pending
-                    && a.tabs[i].md_preview.read(cx).memory_estimate().0 > 0
+                    && a.tabs[i]
+                        .md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false)
             });
             if ready {
                 break;

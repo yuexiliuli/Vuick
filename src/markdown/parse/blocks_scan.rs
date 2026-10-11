@@ -67,6 +67,7 @@ fn common_suffix_bytes_rope(a: &Rope, b: &Rope) -> usize {
 /// `ob ≥ tail_start_new - delta` 处，对应新坐标行首 `ob + delta`——增量扫描从锚点
 /// 行扫到该行首即可安全复用旧尾部 [`prev.blocks[pi..]`]（行号/字节整体平移）。
 /// 对齐假设不命中（罕见，如变化区横跨围栏导致边界漂移）则整轮回退全量扫描兜底。
+#[allow(dead_code)] // 增量窗口扫描面：预览引擎已删，仅 parse 测试消费
 pub fn scan_blocks_incremental_rope(
     prev_src: &Rope,
     prev: &BlockIndex,

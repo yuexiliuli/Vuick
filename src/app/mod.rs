@@ -84,75 +84,6 @@ use crate::config::layout::{
 use crate::config::user::{ThemePref, UserPrefs};
 use crate::scrollbar::TableScrollState;
 
-/// 把上一帧的预览 dirty 区间平移到本帧（编辑点之前不变、之后随 δ 平移）再并入
-/// `[s, ne)`（新增变化区间），取 bounding box（当前文本字节坐标）；`None` = 首次编辑。
-fn merge_preview_dirty(
-    prev: Option<(usize, usize)>,
-    s: usize,
-    oe: usize,
-    ne: usize,
-) -> Option<(usize, usize)> {
-    match prev {
-        None => Some((s, ne)),
-        Some((lo, hi)) => {
-            let delta = ne as i64 - oe as i64;
-            let hi_shifted = if hi > oe {
-                hi as i64 + delta
-            } else if hi >= s {
-                ne as i64
-            } else {
-                hi as i64
-            };
-            Some((lo.min(s), hi_shifted.max(ne as i64).max(0) as usize))
-        }
-    }
-}
-
-/// EPUB 预览后端开关（P4-1「EPUB 迁 WyEditor 只读宿主」的可回滚开关）：
-/// `true`（默认）= EPUB 预览走 **WyEditor 只读宿主**（`tab.md_wy`）；`false` = 回退
-/// 现有 **MarkdownPreview** 路径（注记/引文/页码等 A 侧能力，P4-2 再收口）。
-/// 运行时读环境变量 `EPUB_PREVIEW_BACKEND`（`"0"`/`"off"` → 回退；其余 → 新宿主），
-/// 便于线上/测试按进程回滚。（仅测试）实例字段 `epub_backend_force_legacy` 优先。
-impl EditorApp {
-    pub(crate) fn epub_preview_backend_wy(&self) -> bool {
-        #[cfg(test)]
-        if self.epub_backend_force_legacy {
-            return false;
-        }
-        std::env::var("EPUB_PREVIEW_BACKEND").map_or(true, |v| {
-            !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("off")
-        })
-    }
-}
-
-#[cfg(test)]
-mod merge_preview_dirty_tests {
-    use super::merge_preview_dirty;
-
-    #[test]
-    fn first_edit_creates_interval() {
-        assert_eq!(merge_preview_dirty(None, 5, 2, 8), Some((5, 8)));
-    }
-
-    #[test]
-    fn edit_before_old_range_shifts_it() {
-        // prev=[20,30)，插入使 [5,8)→[5,13)（δ=+5）→ 旧区间平移成 [25,35)，并入 → [5,35)。
-        assert_eq!(merge_preview_dirty(Some((20, 30)), 5, 3, 8), Some((5, 35)));
-    }
-
-    #[test]
-    fn edit_inside_old_range_merges_upper_bound() {
-        // hi 落在 [s, oe]：上界直接折叠取新编辑终点的 ne。
-        assert_eq!(merge_preview_dirty(Some((0, 5)), 5, 7, 9), Some((0, 9)));
-    }
-
-    #[test]
-    fn edit_after_old_range_still_takes_bounding_box() {
-        // prev=[0,4)，后续编辑 [5,9) → 两区间取并的 bounding box。
-        assert_eq!(merge_preview_dirty(Some((0, 4)), 5, 7, 9), Some((0, 9)));
-    }
-}
-
 /// 一个文件选项卡：独立持有自研编辑器组件状态、文件路径与脏标记。
 struct EditorTab {
     /// 本选项卡的编辑区（[`crate::editor::CodeEditor`]）。
@@ -171,8 +102,6 @@ struct EditorTab {
     cursor_row: usize,
     /// 光标列（0 基）
     cursor_col: usize,
-    /// 自研 Markdown 渲染器状态（行级虚拟化）。
-    md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     /// PDF 阅读器（打开 .pdf 时创建）：整页原样显示；None = 非 PDF 选项卡。
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
     /// 图片查看器（打开图片时创建）：None = 非图片选项卡。
@@ -197,27 +126,22 @@ struct EditorTab {
     /// None = 未启用。启用即 `live_edit = true`。
     live2: Option<gpui::Entity<WyEditor>>,
     /// A2：右栏 Markdown 预览统一组件（`WyEditor`，A1 只读门控）。MD 右栏/全屏预览
-    /// 从 `MarkdownPreview`（元素树）切到它（同一 `Doc` 管线的只读视图）；`None` =
-    /// 未创建（文本 / PDF / EPUB 选项卡，或 MD 预览已关闭）。EPUB/PDF 仍走旧预览。
+    /// 与 EPUB 只读宿主都走它（同一 `Doc` 管线的只读视图）；`None` = 未创建（文本 /
+    /// PDF / 图片选项卡，或预览已关闭）。
     md_wy: Option<gpui::Entity<WyEditor>>,
     /// P4-1：EPUB 的**内存图片表**（虚拟 `epubimg://…` → 字节，不落盘）。打开时存
     /// 一份供 WyEditor 宿主（`ensure_epub_wy`）注入；随选项卡搬迁（与 `md_wy` 同）。
     epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    /// P4-2：EPUB 的**注记正文表**（`注记号 → 注释文本`）。打开时存一份供 WyEditor
+    /// 宿主（`ensure_epub_wy` → `set_notes`）注入——悬浮卡正文；随选项卡搬迁。
+    epub_notes: std::collections::BTreeMap<usize, String>,
     /// `md_wy` 右栏/全屏宿主的纵向滚动句柄：`#md-wy-scroll`（`overflow_y_scroll`）
     /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
     /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
     md_wy_vscroll: gpui::ScrollHandle,
-    /// 预览**增量解析**的基底：上次同步的整篇快照（编辑器正文 Rope 的 O(1) COW 克隆，
-    /// 不物化 6.4MB 全文）与其块索引。下一次去抖后用
-    /// [`crate::markdown::scan_blocks_incremental_rope`] 复用（只重扫变化区）。
-    preview_prev: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)>,
-    /// 编辑版本号：每次内容变更 +1。预览同步循环用它判断「扫描期间是否又有新编辑」，
-    /// 从而在扫描结束后自动续跑合并，而不是丢给下一次按键才触发。
+    /// 编辑版本号：每次内容变更 +1。编辑区⇄预览滚动同步用它判断「画面/内容是否有新
+    /// 编辑需重建同步基线」。
     edit_version: u64,
-    /// 去抖窗口内累积的「dirty 字节区间」（bounding box，当前文本字节坐标）：供
-    /// [`crate::markdown::scan_blocks_incremental_rope`] 跳过 O(n) 快照 diff；同步取走时清空。
-    /// 数据来自 [`crate::editor::CodeEditor::take_last_edit`]（每轮 Change 取走）。
-    preview_dirty: Option<(usize, usize)>,
     /// 监听编辑事件 → 置脏 + 刷新状态栏（保持有效）
     _edit_sub: Subscription,
     /// `live2`（WyEditor）的变更订阅。
@@ -233,7 +157,6 @@ struct EditorTab {
 /// 拔掉时随源 `EditorTab` 一并丢弃，目标窗口重新建立订阅。
 pub(crate) struct DetachedTab {
     editor: gpui::Entity<crate::editor::CodeEditor>,
-    md_preview: gpui::Entity<crate::markdown::MarkdownPreview>,
     pdf_preview: Option<gpui::Entity<crate::pdf::PdfViewer>>,
     /// 图片查看器实体（随选项卡跨窗口搬迁）。
     image_viewer: Option<gpui::Entity<crate::image::ImageViewer>>,
@@ -246,6 +169,8 @@ pub(crate) struct DetachedTab {
     md_wy_vscroll: gpui::ScrollHandle,
     /// P4-1：EPUB 内存图片表随选项卡搬迁（与 `md_wy` 宿主共用）。
     epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    /// P4-2：EPUB 注记正文表随选项卡搬迁（`ensure_epub_wy` → `set_notes` 用）。
+    epub_notes: std::collections::BTreeMap<usize, String>,
     file_path: Option<PathBuf>,
     dirty: bool,
     content: SharedString,
@@ -257,9 +182,7 @@ pub(crate) struct DetachedTab {
     preview_fullscreen: bool,
     readonly_preview: bool,
     editor_pending: bool,
-    preview_prev: Option<(Rope, std::rc::Rc<crate::markdown::BlockIndex>)>,
     edit_version: u64,
-    preview_dirty: Option<(usize, usize)>,
 }
 
 /// 编辑器被预览驱动后的落位收敛宽限（帧）：边界块（表格等）顶行读取可能滞后/抖动
@@ -267,11 +190,9 @@ pub(crate) struct DetachedTab {
 const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
 
 /// A4：Markdown 标题目录的跳转目标（侧边栏 `toc_item_frame` 主点击收起/滚动两用）：
-/// - `Legacy` = `MarkdownPreview`（EPUB / 手动预览，条目为渲染行列，`scroll_to_row`）；
-/// - `Unified` = 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
+/// 右栏统一组件 `WyEditor`（只读预览，条目为源码行，`scroll_to_line`）。
 #[derive(Clone)]
 pub(crate) enum MdTocScroll {
-    Legacy(gpui::Entity<crate::markdown::view::MarkdownPreview>),
     Unified(gpui::Entity<WyEditor>),
 }
 
@@ -368,17 +289,6 @@ pub struct EditorApp {
     notifications: Vec<crate::ui::notification::Notification>,
     /// 编辑器正文字号（px，用户可调）
     font_size: f32,
-    /// Markdown 预览重渲染去抖是否已挂起（避免打字时逐键整篇重解析）。
-    preview_pending: bool,
-    /// 预览同步是否正在扫描/装配中：为 true 时不再起新一轮（防多轮 500ms 后台扫描
-    /// 叠在一起；同步循环结束后复位，其间若有新编辑会自动续跑合并）。
-    preview_syncing: bool,
-    /// （仅测试）强制本实例 EPUB 预览走 MarkdownPreview 回退后端（免 env 跨并行测试竞态）。
-    #[cfg(test)]
-    epub_backend_force_legacy: bool,
-    /// 预览同步的代序号：每轮去抖发起时 +1；后台 `scan_blocks` 结果只允许最新代
-    /// 落盘，旧代迟到结果直接丢弃（防旧内容覆盖新编辑）。
-    preview_seq: u64,
     /// 是否深色（黑）模式：控制组件主题、自绘色板与原生标题栏深浅
     dark_mode: bool,
     /// 主题偏好三态：Follow=跟随系统 / Light / Dark（手动切亮/暗会覆盖「跟随」）。

@@ -149,7 +149,6 @@ impl EditorApp {
         defer_preview: bool,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        let panel_bg = self.panel_bg();
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -162,7 +161,6 @@ impl EditorApp {
         }
         // Markdown 文件编辑区默认软换行（其他文件默认不换行，见 make_tab 的 wrap_enabled）
         let is_md = Self::is_markdown_path(p);
-        let t_editor = std::time::Instant::now();
         tab.editor.update(cx, |ed, _cx| {
             // O(1) 装配：行宽统计在后台算好（快速挂载时为占位，finish 再补真值），
             // 不再 UI 线程 recompute_max_line（≈350ms）。
@@ -173,27 +171,10 @@ impl EditorApp {
             }
             ed.set_language(Some(lang));
         });
-        let elapsed_editor = t_editor.elapsed();
         // 编辑器即刻挂载（大文档不再是「预览优先」：内容瞬时可见优先于预览/滚动条精度）。
         tab.editor_pending = false;
-        let t_preview = std::time::Instant::now();
-        tab.md_preview.update(cx, |view, _cx| {
-            view.set_background(panel_bg);
-            view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
-            // A4 脱离：MD 预览已切统一组件 WyEditor（见下方 ensure_md_wy）——不再为
-            // MD 喂 MarkdownPreview（省第二次 scan_blocks / 一份源副本）；MarkdownPreview
-            // 仅留 EPUB 与手动预览（load_epub 另行喂源）。txt 无预览，两处 set 无害。
-        });
-        let elapsed_preview = t_preview.elapsed();
-        if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-            eprintln!(
-                "[MD_OPEN_DEBUG] load_file_text:{src_len} B/{} 行: 编辑器(from_parts+wrap+highlight)={} ms, 预览={} ms{}",
-                lines,
-                elapsed_editor.as_millis(),
-                elapsed_preview.as_millis(),
-                if defer_preview { " (预览延迟，finish 补齐)" } else { "" },
-            );
-        }
+        // P4-2：MD 预览统一走 WyEditor（`ensure_md_wy` 下方喂源）——不再为
+        // MarkdownPreview 喂源（该后端已删除，M5-B5 P4-2）。txt 无预览，不建。
         tab.file_path = Some(p.to_path_buf());
         // 普通文本/Markdown 选项卡：正文以编辑器 Rope 为准，不再整份镜像到
         // `content`（省一份全文副本，6MB 文件即省 6MB/卡）。EPUB/PDF 这类
@@ -204,21 +185,26 @@ impl EditorApp {
         tab.cursor_row = 0;
         tab.cursor_col = 0;
         tab.dirty = false;
-        // 运行时内存诊断：`MD_MEM_DEBUG=1 cargo run` 打开文件时输出各份文本副本与
-        // 预览解析驻留（定位“同样内容，.md 比 .txt 内存高”到底高在哪）。
+        // 运行时内存诊断：`MD_MEM_DEBUG=1 cargo run` 打开文件时输出各份文本副本
+        // （定位"同样内容，.md 比 .txt 内存高"到底高在哪；预览解析驻留收进统一组件，
+        // 用其内部 Doc 尺寸近似，不再单独读 MarkdownPreview——后端已删）。
         if std::env::var_os("MD_MEM_DEBUG").is_some() {
             let content_len = tab.content.len();
             let editor_len = tab.editor.read(cx).value().len();
-            let (rows, preview_bytes) = tab.md_preview.read(cx).memory_estimate();
+            let wy_len = tab
+                .md_wy
+                .as_ref()
+                .map(|w| w.read(cx).len())
+                .unwrap_or(0);
             eprintln!(
-                "[MD_MEM_DEBUG] 打开 {:?}: 源文件 {} B / {} 行 / {} 字符 → 副本 content={} B + editor={} B + 预览 {rows} 行≈{} KB",
+                "[MD_MEM_DEBUG] 打开 {:?}: 源文件 {} B / {} 行 / {} 字符 → 副本 content={} B + editor={} B + WyEditor Doc={} B",
                 p.file_name(),
                 src_len,
                 lines,
                 chars,
                 content_len,
                 editor_len,
-                preview_bytes / 1024,
+                wy_len,
             );
         }
         if is_md {
@@ -278,14 +264,22 @@ impl EditorApp {
                 ed.update(cx, |ed, _| ed.install_open(wy));
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
-            // 诊断“拖到底不到底”：量程就绪后两栏纵向量程总高。编辑器精确时应 ≈
-            // 行数×行高；预览(精确平均高) 应 ≈ 全篇块高之和。值远小于预期 → 该栏量程坍缩。
+            // 诊断“拖到底不到底”：量程就绪后的纵向总高。编辑器精确时应 ≈ 行数×行高；
+            // 统一 WyEditor 预览也用确定性量程（`MarkdownPreview` 抽样模型已删，M5-B5
+            // P4-2）。值远小于预期 → 对应栏量程坍缩。
             let editor_total = tab.editor.read(cx).vertical_total_px();
-            let preview_total = tab.md_preview.read(cx).vertical_total_px();
+            let wy_total = tab
+                .md_wy
+                .as_ref()
+                .map(|w| {
+                    w.read(cx)
+                        .frame_total()
+                        .unwrap_or(0.)
+                })
+                .unwrap_or(0.);
             eprintln!(
-                "[MD_SCROLL] finish 后纵向 total——编辑器={editor_total:.0}px ({} 行), 预览={preview_total:.0}px ({} 块)",
+                "[MD_SCROLL] finish 后纵向 total——编辑器={editor_total:.0}px ({} 行), WyEditor={wy_total:.0}px",
                 tab.line_count,
-                tab.md_preview.read(cx).memory_estimate().0,
             );
         }
         cx.notify();
@@ -553,16 +547,13 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        let panel_bg = self.panel_bg();
         let text = doc.markdown;
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
-        // P4-1：EPUB 迁 WyEditor 只读宿主（回退开关默认开；关 → 仅 MarkdownPreview）。
-        // 只读（禁编辑）、标题居中（set_epub）、`epubimg://` 内存图（set_memory_images）。
-        // 在 `tab` 可变借用之前调用（需 `&mut self` 建实体）。
-        if self.epub_preview_backend_wy() {
-            self.ensure_epub_wy(idx, _window, cx, &text, &doc.images);
-        }
+        // P4-1/P4-2：EPUB 迁 WyEditor 只读宿主（无回退后端，`MarkdownPreview` 已删）。
+        // 只读（禁编辑）、标题居中（set_epub）、`epubimg://` 内存图（set_memory_images）、
+        // 注记浮卡/引文跳转正文（set_notes）。在 `tab` 可变借用之前调用（需 `&mut self`）。
+        self.ensure_epub_wy(idx, _window, cx, &text, &doc.images, &doc.notes);
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
@@ -571,20 +562,11 @@ impl EditorApp {
             ed.set_text("");
             ed.set_language(Some("markdown"));
         });
-        tab.md_preview.update(cx, |view, cx| {
-            view.set_background(panel_bg);
-            view.set_base_dir(p.parent().map(|d| d.to_path_buf()));
-            // EPUB 图片保持内存，渲染时由预览查表直接解码（不写硬盘）
-            view.set_memory_images(doc.images.clone());
-            // EPUB 阅读默认开换行（正文自然折行），fullscreen 时占满为阅读模式
-            view.set_wrap(true, cx);
-            // EPUB 阅读排版：标题居中、正文首行缩进 2 字符、脚注 `[n]` 悬浮卡片
-            view.set_epub(true, doc.notes.clone(), cx);
-            view.set_source(&text, cx);
-        });
         tab.file_path = Some(p.to_path_buf());
         // P4-1：EPUB 内存图随选项卡持有（供 WyEditor 只读宿主注入；随选项卡搬迁）。
         tab.epub_images = doc.images.clone();
+        // P4-2：EPUB 注记正文表随选项卡持有（`ensure_epub_wy` → `WyEditor::set_notes`）。
+        tab.epub_notes = doc.notes.clone();
         tab.content = SharedString::from(text);
         tab.line_count = lines;
         tab.char_count = chars;
@@ -628,10 +610,6 @@ impl EditorApp {
         tab.editor.update(cx, |ed, _cx| {
             ed.set_text("");
             ed.set_language(Some("markdown"));
-        });
-        tab.md_preview.update(cx, |view, cx| {
-            view.set_background(canvas_bg);
-            view.set_source("", cx);
         });
         // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
         let viewer = cx.new(|cx| crate::pdf::PdfViewer::new(p.to_path_buf(), cx));
@@ -678,10 +656,6 @@ impl EditorApp {
             ed.set_text("");
             ed.set_language(Some("markdown"));
         });
-        tab.md_preview.update(cx, |view, cx| {
-            view.set_background(canvas_bg);
-            view.set_source("", cx);
-        });
         // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
         let viewer = cx.new(|cx| crate::image::ImageViewer::new(p.to_path_buf(), cx));
         viewer.update(cx, |view, _| view.set_background(canvas_bg));
@@ -722,10 +696,6 @@ impl EditorApp {
         tab.editor.update(cx, |ed, _cx| {
             ed.set_text("");
             ed.set_language(Some("markdown"));
-        });
-        tab.md_preview.update(cx, |view, cx| {
-            view.set_background(canvas_bg);
-            view.set_source("", cx);
         });
         // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
         let viewer = cx.new(|cx| crate::video::VideoViewer::new(p.to_path_buf(), cx));

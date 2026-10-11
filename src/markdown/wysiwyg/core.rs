@@ -113,6 +113,11 @@ impl WyEditor {
             selected_image: Cell::new(None),
             image_edit: None,
             image_edit_anchor: Cell::new(None),
+            note_ctx: std::collections::BTreeMap::new(),
+            hover_note: Cell::new(None),
+            marker_hl: Cell::new(None),
+            marker_hl_seq: Cell::new(0),
+            cit: RefCell::new(None),
         }
     }
 
@@ -190,6 +195,19 @@ impl WyEditor {
     /// 切 EPUB 阅读模式（EPUB 只读宿主）：标题默认居中（对齐 A 侧
     /// `MarkdownPreview::set_epub` 排版语义），带 `%%ALIGN:X%%` 指令的行以指令为准。
     /// 纯视图态，不进撤销栈；切换自增内容代使下帧全量重排。
+    ///
+    /// **M5-B5 P4-2 弃用决策（首行缩进 / float）**：A 侧 `MarkdownPreview` 的
+    /// `set_epub` 还启用了「正文首行缩进 2 字符」与 `%%FLOAT%%`（图/引文左右浮动）
+    /// 两项 EPUB 排版。统一组件（WYSIWYG）**未迁入**：
+    ///
+    /// - 首行缩进是**段落级排版指令**，WYSIWYG 的 DocRow 按行整形、无段落语义；为它加
+    ///   段落首行属性需动 `doc`/`shape` 两管线，成本高、收益低（绝大多数 EPUB 正文段落
+    ///   本身已是缩进/空格的源码表示）。
+    /// - `%%FLOAT%%` 依赖「块占位 → 环绕重排版」，WYSIWYG 块高确定性量程（Fenwick）
+    ///   不支持环绕；A 侧 float 也只对单图右留白生效，语义残缺。
+    ///
+    /// 接受范围：EPUB 首行缩进退化为自然换行、float 图片退化为独立图片行（仍在
+    /// `%%ALIGN%%` 左右对齐控制内）；回归矩阵（蓝图 §4）已按此放宽「EPUB 排版差异」项。
     pub fn set_epub(&mut self, on: bool) {
         if self.epub == on {
             return;
@@ -297,6 +315,12 @@ impl WyEditor {
         self.doc.char_count()
     }
 
+    /// （仅测试/诊断）当前帧确定性总高（px；Fenwick 量程真源，同 `viewport_page_bounds`
+    /// 口径）。帧未就绪 → `None`。
+    pub(crate) fn frame_total(&self) -> Option<f32> {
+        self.frame.borrow().as_ref().map(|f| f32::from(f.total))
+    }
+
     /// （仅测试）`doc.text_shared` 被调次数——B 步断言 handler 查询/编辑不再物化全文。
     #[cfg(test)]
     pub(crate) fn text_shared_calls(&self) -> u64 {
@@ -395,6 +419,9 @@ impl WyEditor {
         self.pending_image_srcs.borrow_mut().clear();
         // 换源：搜索高亮行号/内容作废（同预览换源清高亮）。
         self.clear_highlight();
+        // 换源：注记悬浮/加亮作废（行号随源失效；引文索引缓存键 = content_gen，自动失效）。
+        self.hover_note.set(None);
+        self.marker_hl.set(None);
         self.loaded = true;
     }
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
@@ -615,6 +642,181 @@ impl WyEditor {
         let text = self.line_text(*line);
         let range = crate::markdown::view::find_text_range(&text, query)?;
         Some(self.line_start(*line) + range.start..self.line_start(*line) + range.end)
+    }
+
+    /* ---------- 注记/引文（M5-B5 P4-2 迁自 MarkdownPreview，统一组件承载） ---------- */
+
+    /// 注入 EPUB 注记正文表（`注记号 → 注释文本`；`set_epub(true)` 打开阅读宿主时由
+    /// app 喂入）。替换旧表并清掉悬浮/加亮态（注记号可能已消失）。
+    pub fn set_notes(&mut self, notes: std::collections::BTreeMap<usize, String>) {
+        self.note_ctx = notes
+            .into_iter()
+            .map(|(k, v)| (k, SharedString::from(v)))
+            .collect();
+        self.hover_note.set(None);
+        self.marker_hl.set(None);
+    }
+
+    /// 注记正文：EPUB 注记表优先，其次引文索引 `details`（定义 `[!n]` 行剥标记后的文本）。
+    pub(crate) fn note_text_for(&self, n: usize) -> Option<SharedString> {
+        if let Some(t) = self.note_ctx.get(&n) {
+            return Some(t.clone());
+        }
+        self.citation_index().details.get(&n).cloned()
+    }
+
+    /// 引文跳转索引（懒建 + `content_gen` 缓存）：全篇每个含注记的块扫一遍（O(块数)），
+    /// 「行」字段语义 = **源码行**（统一组件用 `set_scroll_target` 按源码行跳转，区别于
+    /// A 侧预览的渲染行下标）。只交互到注记时才建，不打字/滚动热路径（同 A 侧
+    /// `MarkdownPreview::ensure_citations` 的懒重扫语义）。
+    pub(crate) fn citation_index(&self) -> std::rc::Rc<crate::markdown::parse::CitationIndex> {
+        let cg = self.content_gen.get();
+        if let Some((g, idx)) = &*self.cit.borrow()
+            && *g == cg
+        {
+            return idx.clone();
+        }
+        let mut idx = crate::markdown::parse::CitationIndex::default();
+        let n = self.doc.block_count();
+        for k in 0..n {
+            let Some(dr) = self.doc.rows_in_block_window(k, k + 1).into_iter().next() else {
+                continue;
+            };
+            for (range, m) in &dr.notes {
+                if range.start < range.end && range.end <= dr.text.len() {
+                    idx.refs.entry(*m).or_insert((dr.src_line, range.clone()));
+                }
+            }
+            for (range, m) in &dr.note_defs {
+                if range.start < range.end && range.end <= dr.text.len() {
+                    idx.defs.entry(*m).or_insert((dr.src_line, range.clone()));
+                    idx.details.entry(*m).or_insert_with(|| {
+                        let s = range.end.min(dr.text.len());
+                        dr.text[s..].trim().into()
+                    });
+                }
+            }
+        }
+        let idx = std::rc::Rc::new(idx);
+        *self.cit.borrow_mut() = Some((cg, idx.clone()));
+        idx
+    }
+
+    /// 点击注记标记后跳转对端（文内引用 ↔ 末尾定义双向，与 A 侧
+    /// `MarkdownPreview::navigate_marker` 同语义）：文内 `[^n]` → 定义 `[!n]`；
+    /// 定义 → 文内引用。对端经 `set_scroll_target` 滚动（元素 prepaint 逐帧重钉，
+    /// 无需 window），落位后加亮对端标记；无对端（孤立标记）仅清点选/悬浮、不跳转。
+    pub(crate) fn navigate_marker(&mut self, hit: &element::NoteMarkerHit, cx: &mut Context<Self>) {
+        let idx = self.citation_index();
+        let target = if hit.is_def {
+            idx.refs.get(&hit.n).cloned()
+        } else {
+            idx.defs.get(&hit.n).cloned()
+        };
+        match target {
+            Some((src_line, _)) => {
+                self.hover_note.set(None);
+                self.set_scroll_target(src_line);
+                self.set_marker_highlight(src_line, hit.n, !hit.is_def, cx);
+                cx.notify();
+            }
+            None => {
+                self.hover_note.set(None);
+                cx.notify();
+            }
+        }
+    }
+
+    /// 跳转后给目标行 `n` 注记标记加亮（`is_def` 指明定义/文内），[`HIGHLIGHT_MS`] 后
+    /// 自动消失（代序号防旧定时器误清，与 `highlight_search` 同款）。
+    pub(crate) fn set_marker_highlight(
+        &mut self,
+        src_line: usize,
+        n: usize,
+        is_def: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.marker_hl.set(Some((src_line, n, is_def)));
+        self.marker_hl_seq.set(self.marker_hl_seq.get().wrapping_add(1));
+        let seq = self.marker_hl_seq.get();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    crate::config::timing::HIGHLIGHT_MS,
+                ))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.marker_hl_seq.get() == seq {
+                    view.marker_hl.set(None);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 当前悬浮命中的注记（内容列局部矩形；无 → `None`）。
+    pub(crate) fn hover_note(&self) -> Option<element::NoteMarkerHit> {
+        self.hover_note.get()
+    }
+
+    /// （仅测试）当前注记跳转加亮 `(源码行, 注记号, 是否定义)`（`navigate_marker` 断言）。
+    #[cfg(test)]
+    pub(crate) fn marker_hl_test(&self) -> Option<(usize, usize, bool)> {
+        self.marker_hl.get()
+    }
+
+    /// 注记悬浮卡片浮层（有悬浮命中时返回）：`deferred(anchored(Window, TopLeft))` 锚定
+    /// 在注记矩形右下（边距 8/4，对齐 A 侧 `MarkdownPreview::note_card_point`），主题
+    /// popover 配色。参考 `image_edit_card_element` 的浮层约定（逃逸滚动容器裁剪/命中，
+    /// 随内容滚动跟手）。正文 = EPUB 注记表，缺则回退引文 `details`；无正文不浮卡。
+    pub(crate) fn note_card_element(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use gpui::{
+            Anchor, AnchoredPositionMode, Edges, InteractiveElement, IntoElement, ParentElement,
+            Styled,
+        };
+        let hit = self.hover_note()?;
+        let text = self.note_text_for(hit.n)?;
+        let origin = self.content_origin();
+        let at = gpui::point(
+            origin.x + hit.bounds.right() + px(8.),
+            origin.y + hit.bounds.top() + px(4.),
+        );
+        let colors = crate::ui::theme::Theme::global(cx).colors;
+        let card_bg: gpui::Hsla = colors.popover_bg.into();
+        let border: gpui::Hsla = colors.border.into();
+        let fg: gpui::Hsla = colors.fg.into();
+        let card = gpui::div()
+            .debug_selector(|| "wy-note-card".into())
+            .bg(card_bg)
+            .border_1()
+            .border_color(border)
+            .rounded_md()
+            .p_3()
+            .max_w(px(460.))
+            .child(
+                gpui::div()
+                    .whitespace_normal()
+                    .text_size(px(12.5))
+                    .text_color(fg)
+                    .child(text),
+            );
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position_mode(AnchoredPositionMode::Window)
+                    .anchor(Anchor::TopLeft)
+                    .position(at)
+                    .snap_to_window_with_margin(Edges::all(px(8.)))
+                    .child(card),
+            )
+            .with_priority(100)
+            .into_any_element(),
+        )
     }
 
     /// 复制：写入平台剪贴板（由 `on_action(Copy)` 装配）。

@@ -19,7 +19,6 @@ impl EditorApp {
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         Some(DetachedTab {
             editor: tab.editor,
-            md_preview: tab.md_preview,
             pdf_preview: tab.pdf_preview,
             image_viewer: tab.image_viewer,
             #[cfg(feature = "video")]
@@ -27,6 +26,7 @@ impl EditorApp {
             md_wy: tab.md_wy,
             md_wy_vscroll: tab.md_wy_vscroll,
             epub_images: tab.epub_images,
+            epub_notes: tab.epub_notes,
             file_path: tab.file_path,
             dirty: tab.dirty,
             content: tab.content,
@@ -38,9 +38,7 @@ impl EditorApp {
             preview_fullscreen: tab.preview_fullscreen,
             readonly_preview: tab.readonly_preview,
             editor_pending: tab.editor_pending,
-            preview_prev: tab.preview_prev,
             edit_version: tab.edit_version,
-            preview_dirty: tab.preview_dirty,
         })
     }
 
@@ -70,7 +68,6 @@ impl EditorApp {
             char_count: payload.char_count,
             cursor_row: payload.cursor_row,
             cursor_col: payload.cursor_col,
-            md_preview: payload.md_preview,
             pdf_preview: payload.pdf_preview,
             image_viewer: payload.image_viewer,
             #[cfg(feature = "video")]
@@ -78,18 +75,17 @@ impl EditorApp {
             md_wy: payload.md_wy,
             md_wy_vscroll: payload.md_wy_vscroll,
             epub_images: payload.epub_images,
+            epub_notes: payload.epub_notes,
             preview_on: payload.preview_on,
             preview_fullscreen: payload.preview_fullscreen,
             readonly_preview: payload.readonly_preview,
             editor_pending: payload.editor_pending,
-            // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交回写，见 take_tab_payload 调用点）
+            // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
             live_edit: false,
             live2: None,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
-            preview_prev: payload.preview_prev,
             edit_version: payload.edit_version,
-            preview_dirty: payload.preview_dirty,
             _edit_sub: edit_sub,
         });
         self.active_tab = idx;
@@ -101,13 +97,8 @@ impl EditorApp {
         });
         // 预览/PDF 主题背景刷新 + PDF 订阅重建
         let canvas_bg = self.window_bg();
-        if self.tabs[idx].preview_on {
-            // A4 脱离：MD（非只读）统一组件随选项卡搬家（已带内容），无需再喂预览；
-            // EPUB / 手动预览仍走 MarkdownPreview。
-            if !is_md || self.tabs[idx].readonly_preview {
-                self.sync_md_preview(idx, cx);
-            }
-        }
+        // P4-2：MD / EPUB 预览都走统一 WyEditor 只读宿主——实体随选项卡搬迁已带内容，
+        // 无需再喂 MarkdownPreview（该后端已删除）。
         if let Some(pdf) = self.tabs[idx].pdf_preview.clone() {
             let pv = pdf.clone();
             pv.update(cx, |view, _| view.set_background(canvas_bg));

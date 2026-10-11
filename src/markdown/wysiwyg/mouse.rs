@@ -174,6 +174,17 @@ impl WyEditor {
                 }
                 return;
             }
+            // P4-2: 点击注记标记 `[n]` → 文内引用 ↔ 末尾定义**双向跳转**（仅只读宿主，
+            // 对齐 A 侧预览语义；可编辑模式保留文本编辑、不劫持点击）。跳到对端源码行并
+            // 加亮对端标记，悬浮卡随之关闭（`navigate_marker` 内清 `hover_note`）。
+            if !self.editable
+                && let Some(hit) = element::note_marker_hit_at(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.navigate_marker(&hit, cx);
+                return;
+            }
             // A1/B2: 数学交互——
             // 数学块卡片：**单击不改光标**（否则 caret 进块被 reveal、整块回显源码字符串，
             // 即用户看到的「单击变回字符串」）；**双击**进块编辑（reveal 源码可改）。
@@ -240,6 +251,7 @@ impl WyEditor {
         // 拖选中不更新（指针离开图片也不应隐藏按钮，避免拖到别处时误闪烁）。
         if !self.dragging {
             self.update_hover(ev.position, cx);
+            self.update_note_hover(ev.position, cx);
             // 图片调整条 hover → 即时换 resize 光标（同 `on_window_mouse_move`）。
             if self.notify_when_hover_grip(ev.position) {
                 cx.notify();
@@ -266,6 +278,36 @@ impl WyEditor {
         drop(marker);
         if self.hover_image.get() != hovered {
             self.hover_image.set(hovered);
+            cx.notify();
+        }
+    }
+
+    /// 更新注记悬浮态（`hover_note`，P4-2）：命中注记标记（只读宿主）→ 记录命中
+    ///（含内容列局部矩形，悬浮卡锚定用）；移出标记 / 可编辑模式 → 清除。与
+    /// `hover_image` 同款「变才 notify」。
+    fn update_note_hover(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        if self.editable {
+            if self.hover_note.get().is_some() {
+                self.hover_note.set(None);
+                cx.notify();
+            }
+            return;
+        }
+        let marker = self.frame.borrow();
+        let hit = marker
+            .as_ref()
+            .and_then(|f| element::note_marker_hit_at(self, f, pos));
+        drop(marker);
+        let cur = self.hover_note.get();
+        let changed = match (&cur, &hit) {
+            (Some(a), Some(b)) => {
+                a.src_line != b.src_line || a.n != b.n || a.is_def != b.is_def
+            }
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.hover_note.set(hit);
             cx.notify();
         }
     }
@@ -301,6 +343,9 @@ impl WyEditor {
             self.hover_image.set(None);
             cx.notify();
         }
+        // 注记悬浮（只读宿主）：窗口级 move 兜底——元素在宿主顶层叠层之下时元素级
+        // `on_mouse_move` 会被遮罩吞掉（与滚轮同因），这里与 `hover_image` 同法更新。
+        self.update_note_hover(ev.position, cx);
         // 指针进入图片调整条（右中边缘）→ 立即重绘：paint 登记窗口级 resize 光标，
         // `finish_frame` 按新帧当场解析——否则要等下一次输入/点击光标才变
         //（「hover 不变 → 先点才显示」）。

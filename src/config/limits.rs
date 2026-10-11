@@ -28,32 +28,6 @@ pub const EDITOR_VSCROLL_BOTTOM_EXTRA_LINES: usize = 8;
 /// 时整篇扫一遍缩进折叠候选（O(行数)，几十万行毫秒级），gutter 默认显示可折叠指示器；
 /// 超过则由「手动 Ctrl+Shift+[/点击」按需折叠（候选为空，避免超大文档每键 O(N) 重扫）。
 pub const FOLD_CANDIDATE_FULL_MAX_LINES: usize = 200_000;
-/// 渲染行数超过该阈值启用「窗口级懒解析」（大字文档不整篇物化）。
-pub const WINDOWED_MIN_BLOCKS: usize = 4_000;
-/// 窗口懒解析时在可见范围上下各多物化的块数（过扫余量，减少反复重解析）。
-pub const WINDOWED_OVERDRAW_BLOCKS: usize = 24;
-/// **自适应过扫**：实际余量 = max(基准 [`WINDOWED_OVERDRAW_BLOCKS`], 可见块数 × 系数)。
-/// 高视口 / 快速滚动时缓冲随之变大，窗口重建次数变少（配合代码块高亮 LRU 缓存，
-/// 滚动手感更跟手）；系数取 0.5 → 余量约半屏。上限见 [`WINDOWED_OVERDRAW_MAX`]。
-pub const WINDOWED_OVERDRAW_FACTOR: f32 = 0.5;
-/// 自适应过扫的块数上限（防超高视口把窗口拉得过大、每次重建过慢）。
-pub const WINDOWED_OVERDRAW_MAX: usize = 120;
-/// 窗口模式代码块语法高亮的小型 LRU 容量（按块数）：滚动时复用相邻窗口已解析的
-/// 代码块（syntect 整块解析是滚动手感主成本），容量有限防滚遍整篇把结果全部驻留。
-pub const CODE_HL_LRU_CAP: usize = 96;
-/// 大跳转（一次新进窗口的代码块**块数**超过该值，或文本累计超过
-/// [`CODE_HL_DEFER_BYTES`]）触发**延后分片解析**：交 `pending_code_hl` 队列，由后续帧
-/// 按 [`CODE_HL_PARSE_BYTES_PER_FRAME`] × [`CODE_HL_PARSE_BLOCKS_PER_FRAME`] 预算逐步
-/// 补色（首帧这些块先纯文本/继承上色，帧不卡）；未超阈值的同步解析（现状）。
-/// 与编辑器「滚动延后上色 + 停稳补齐」同一廉价帧思路，换成**分片**而非跨线程。
-pub const CODE_HL_DEFER_BLOCKS: usize = 2;
-pub const CODE_HL_DEFER_BYTES: usize = 4 * 1024;
-/// 延后队列每帧最多解析的代码块文本字节预算：debug 下 syntect ~1ms/8KB，8KB/帧把
-/// 单帧摊薄在 ~1-2ms（release 进一步缩放）；剩余下帧续。
-pub const CODE_HL_PARSE_BYTES_PER_FRAME: usize = 8 * 1024;
-/// 延后队列每帧最多解析的代码块**块数**：大批小块（每块固定解析开销几十 µs~ms，
-/// 与字节无关）也按块数封顶，避免一眼几十个小块把单帧重新打满。
-pub const CODE_HL_PARSE_BLOCKS_PER_FRAME: usize = 8;
 /// 侧边栏搜索结果条数上限。
 pub const SEARCH_RESULT_CAP: usize = 200;
 /// WYSIWYG 行整形缓存容量（按**块下标**计）：滚动/带重建复用已整形的块（文本/代码/

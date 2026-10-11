@@ -26,6 +26,9 @@ pub(crate) fn char_align_byte(text: &str, mut p: usize) -> usize {
 
 /// 把字节区间两端分别吸收到最近的字符边界（向前进位、钳入 `text` 长度）。
 /// 空/越界/反向安全；区间可能缩小为 0 长（两端同边界）——由调用方自行丢弃空段。
+/// M5-B5 P4-2：预览 `row::char_align_range` 已删，本实现保留为共享工具（供测试与
+/// 后续消费；WYSIWYG 侧有同语义的 `src→显示` 防御）——`#[allow(dead_code)]` 挂起告警。
+#[allow(dead_code)]
 pub(crate) fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> {
     char_align_byte(text, range.start)..char_align_byte(text, range.end)
 }

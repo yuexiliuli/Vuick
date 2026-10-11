@@ -323,11 +323,6 @@ impl Toc {
         Self { segs: std::sync::Arc::new(vec![TocSeg::new(v.into())]), len }
     }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     /// 目录行号按源码行升序（标题各占一行）：统计 `row < line` 的条目数（二分，
     /// 只读 `data` 原始行号 + 段内平移，不物化）。增量扫描用它按**行坐标**切前缀/
     /// 后缀（与旧扁平 `filter(r < anchor)` / `filter(r >= prev_line)` 等价）。
@@ -350,11 +345,18 @@ impl Toc {
         total
     }
 
+    #[allow(dead_code)] // 目录长度/物化面：预览引擎已删，仅 parse 测试消费
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     pub fn iter(&self) -> TocIter<'_> {
         TocIter { toc: self, seg_i: 0, seg_off: 0 }
     }
 
-    /// 物化整表（消费方按需：预览目录/侧边栏渲染时用，非每键路径）。
+    /// 物化整表（消费方按需：侧边栏目录渲染时用，非每键路径）。
+    #[allow(dead_code)] // 预览引擎已删，仅 parse 测试消费
     pub fn to_vec(&self) -> Vec<(usize, u8, SharedString)> {
         let mut v = Vec::with_capacity(self.len());
         for s in self.segs.iter() {

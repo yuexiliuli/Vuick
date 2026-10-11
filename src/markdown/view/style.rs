@@ -25,15 +25,12 @@ pub(crate) struct StyleParams {
     /// 链接色（`[t](u)` / wiki / tag / 裸 URL；明 #0969da / 暗 #79c0ff，单一源
     /// `ColorScheme::link`——预览 / WYSIWYG / 源码编辑器一个蓝）。
     pub(crate) link: Hsla,
-    pub(crate) bg: Hsla,
     /// 引述块背景（浅灰卡片感）。
     pub(crate) quote_bg: Hsla,
     /// 表头底色（浅灰）。
     pub(crate) table_head_bg: Hsla,
     pub(crate) para_size: Pixels,
     pub(crate) para_line: Pixels,
-    /// 普通文本行额外垂直间距（行高之外，用于拉开行与行之间的距离）。
-    pub(crate) para_gap: Pixels,
     pub(crate) code_size: Pixels,
     pub(crate) code_line: Pixels,
     /// 当前主题是否为暗色（预览与 WYSIWYG 各自派生语法色/代码底色时共用）。
@@ -90,12 +87,10 @@ impl StyleParams {
             divider: colors.border.into(),
             accent: colors.accent.into(),
             link: colors.link.into(),
-            bg: crate::ui::shell::content_bg(is_dark, colors.bg.into()),
             quote_bg: colors.quote_bg.into(),
             table_head_bg: colors.table_head_bg.into(),
             para_size: para,
             para_line: line,
-            para_gap: px(6.),
             code_size: code,
             code_line,
             is_dark,
@@ -109,12 +104,5 @@ impl StyleParams {
     /// [`heading_metrics_for_size`] 同步重算，两处标题永远一致。
     pub(crate) fn heading_metrics(&self, level: u8) -> (Pixels, Pixels) {
         heading_metrics_for_size(self.para_size.as_f32(), level)
-    }
-
-    /// 普通正文行的估算高度（px）：段落/列表/引述等多数行的实际高度都接近这个值。
-    /// 作为行级虚拟化列表「未测量行统一高度提示」（`ListState::with_uniform_item_height`），
-    /// 让滚动条量程从一开始就大致正确，同时避免一次性测量整篇（大文档的内存炸弹）。
-    pub(crate) fn body_row_hint(&self) -> Pixels {
-        self.para_line + self.para_gap
     }
 }

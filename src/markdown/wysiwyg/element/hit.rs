@@ -578,6 +578,121 @@ pub(crate) fn link_hit_at(editor: &WyEditor, frame: &Frame, p: Point<Pixels>) ->
     None
 }
 
+/// 命中的脚注标记（P4-2 注记迁入 WYSIWYG）：来源行 + 注记号 + 是否定义 + 标记矩形。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NoteMarkerHit {
+    pub src_line: usize,
+    pub n: usize,
+    pub is_def: bool,
+    /// 标记矩形（**内容列局部**坐标：`padding + x_off + 对齐移量` 起；含居中阅读栏
+    /// 移位时用 `WyEditor::to_local` 换算命中、`content_origin` 换算窗口锚定）。
+    pub bounds: Bounds<Pixels>,
+}
+
+/// 某行脚注标记的**内容列局部**矩形（与 `link_hit_grips`/`paint` 同几何：padding +
+/// x_off + 对齐移量 + 字形 x；y = `row.top + text_row_shift + 带内 y`）。折行标记头尾
+/// 各自成片；`position_for_index` 界外（索引越界 / 行被数学 splice 改写）返回 None 时
+/// 安全滤除（不 panic）。
+fn note_marker_local_rects(f: &Frame, row: &ShapedRow) -> Vec<(NoteMarker, Bounds<Pixels>)> {
+    let mut out = Vec::new();
+    if row.extra.note_markers.is_empty() || row.wrapped.is_empty() {
+        return out;
+    }
+    let Some(w0) = row.wrapped.first() else {
+        return out;
+    };
+    let ox = f32::from(f.padding) + f32::from(row.x_off);
+    for mk in &row.extra.note_markers {
+        let end = mk.disp.end.min(w0.len());
+        let start = mk.disp.start.min(end);
+        let (Some(p0), Some(p1)) = (
+            w0.position_for_index(start, row.lh),
+            w0.position_for_index(end, row.lh),
+        ) else {
+            continue;
+        };
+        let b0 = (f32::from(p0.y) / f32::from(row.lh)).round() as usize;
+        let b1 = (f32::from(p1.y) / f32::from(row.lh)).round() as usize;
+        let a0 = row.align_offsets.get(b0).copied().unwrap_or(px(0.));
+        let a1 = row.align_offsets.get(b1).copied().unwrap_or(px(0.));
+        let oy = f32::from(row.top) + text_row_shift(row);
+        if b0 == b1 {
+            out.push((
+                mk.clone(),
+                Bounds::new(
+                    point(
+                        px(ox + f32::from(a0) + f32::from(p0.x)),
+                        px(oy + f32::from(p0.y)),
+                    ),
+                    size(px((f32::from(p1.x) - f32::from(p0.x)).max(2.)), row.lh),
+                ),
+            ));
+        } else {
+            let head = Bounds::new(
+                point(px(ox + f32::from(a0) + f32::from(p0.x)), px(oy + f32::from(p0.y))),
+                size(px((f32::from(w0.width()) - f32::from(p0.x)).max(2.)), row.lh),
+            );
+            let tail = Bounds::new(
+                point(px(ox + f32::from(a1)), px(oy + f32::from(p1.y))),
+                size(px(f32::from(p1.x).max(2.)), row.lh),
+            );
+            out.push((mk.clone(), head));
+            out.push((mk.clone(), tail));
+        }
+    }
+    out
+}
+
+/// 命中脚注标记（**窗口坐标**）：与 `link_hit_at` 同法转内容列局部后做包含判定，
+/// 返回 [`NoteMarkerHit`]（含内容列局部矩形，悬浮卡锚定与命中几何同源）。
+pub(crate) fn note_marker_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<NoteMarkerHit> {
+    let local = to_local(editor, p);
+    for row in &frame.rows {
+        for (mk, b) in note_marker_local_rects(frame, row) {
+            if b.contains(&local) {
+                return Some(NoteMarkerHit {
+                    src_line: row.src_line,
+                    n: mk.n,
+                    is_def: mk.is_def,
+                    bounds: b,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// 高亮目标行（`src_line`）内注记号 `n` 的**绝对源字节区间**（paint 画跳转加亮用；
+/// 复用选区几何）。目标行不在带内 / 无此标记 → `None`。
+pub(crate) fn note_marker_src_range(
+    editor: &WyEditor,
+    frame: &Frame,
+    src_line: usize,
+    n: usize,
+    is_def: bool,
+) -> Option<Range<usize>> {
+    let row = frame
+        .rows
+        .iter()
+        .find(|r| r.src_line == src_line && !r.extra.note_markers.is_empty())?;
+    let mk = row
+        .extra
+        .note_markers
+        .iter()
+        .find(|m| m.n == n && m.is_def == is_def)?;
+    let map = row.byte_map.as_slice();
+    let end = mk.disp.end.min(map.len().saturating_sub(1));
+    let start = mk.disp.start.min(end);
+    let ls = editor.line_start(src_line);
+    let s0 = ls + map.get(start).copied().unwrap_or(0);
+    let s1 = ls + map.get(end).copied().unwrap_or(s0);
+    (s1 > s0).then_some(s0..s1)
+}
+
 /// 代码块横向滚动条几何（内容超宽才返回）。
 /// 返回**元素局部** x（paint 加 `origin.x`，命中直接用）：
 /// `(bar_x, bar_w, thumb_x, thumb_w, max_scroll)`。`viewport_text` = 面板内文本可视宽
