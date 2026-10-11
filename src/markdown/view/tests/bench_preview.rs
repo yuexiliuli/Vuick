@@ -256,3 +256,52 @@
         );
     }
 
+    /// 基准（--ignored）：M5-B5 P3 前置「量程精确化」的决策依据——「全量 DocRow shape
+    /// 量程一次」在 1 万 / 10 万块量级的真实开销。合成文档（段落块：约 64B/块，视口宽下
+    /// 折成多视觉行），`Doc::open` + 全量物化 `rows_in_block_window` + Σ `shape_docrow_shard`
+    /// 分三段计时；支撑「全量可承受（用全量+缓存） vs 需分段/抽样（对拍误差）」取舍。
+    /// 打印、不断言；`--ignored` 运行。
+    #[gpui::test]
+    #[ignore]
+    fn bench_docrow_shard_full_range_cost(cx: &mut TestAppContext) {
+        use crate::markdown::layout::shape_docrow_shard;
+        use crate::markdown::wysiwyg::WyTheme;
+        use gpui::WindowTextSystem;
+        use std::time::Instant;
+        cx.update(crate::actions::bind_local_keymaps);
+        let p = cx.update(|cx| StyleParams::from_theme_with_font(cx, None));
+        let theme = WyTheme::from_style(&p, gpui::Font::default(), p.para_size);
+        let ts = WindowTextSystem::new(cx.text_system().clone());
+        let width = 980.0f32;
+        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        for &n_blocks in &[10_000usize, 100_000usize] {
+            let mut src = String::with_capacity(n_blocks * 88);
+            for i in 0..n_blocks {
+                src.push_str(&format!(
+                    "这是第 {i} 号段落：一段比较长的中文内容，用于让每块在视口宽度下折成多个视觉行以贴近真实场景。\n"
+                ));
+            }
+            let src_len = src.len() / 1024;
+            let t0 = Instant::now();
+            let doc = crate::markdown::doc::Doc::open(src.into());
+            let t_open = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = Instant::now();
+            let rows = doc.rows_in_block_window(0, n_blocks - 1);
+            let t_rows = t1.elapsed().as_secs_f64() * 1000.0;
+            let t2 = Instant::now();
+            let mut total_h = 0.0f32;
+            let mut shard_n = 0.5f32;
+            for dr in &rows {
+                let shards = shape_docrow_shard(&ts, dr, &theme, avail, width);
+                shard_n = shards.len() as f32;
+                total_h += shards.iter().map(|s| s.h).sum::<f32>();
+            }
+            let t_shape = t2.elapsed().as_secs_f64() * 1000.0;
+            let sum_ms = t_open + t_rows + t_shape;
+            let avg = sum_ms / n_blocks as f64;
+            eprintln!(
+                "[bench] 全量 DocRow shape 量程：{n_blocks} 块（≈{src_len}KB 源）→ open {t_open:.1}ms / 物化 {t_rows:.1}ms / shape {t_shape:.1}ms / 合计 {sum_ms:.1}ms；平均每块 {avg:.3}ms（含物化）；Σh={total_h:.0}px avg≈{shard_n:.0}片/块",
+            );
+        }
+    }
+

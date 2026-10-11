@@ -14,8 +14,13 @@
 //   显式 `line_height` = 共享 para_line/heading_line、空行/分隔 = para_line，故
 //   `unified_shard_height_matches_preview_row` 断言**同一 lyh 下逐行一致**：
 //   Code/标题/空行/分隔精确相等；内容主导的段落/引述 `盒高 − py == shard 总高`。
-//   另：`unified_window_range_equals_shard_formula_total` 钉窗口模式量程 ==
-//   Σ shard 公式块高，`unified_window_scroll_to_bottom_reaches_last_block` 钉滚到底。
+//   另：M5-B5 P3 前置「量程精确化」把量程从公式族升级为**真实 DocRow shard**：
+//   - `unified_window_range_equals_docrow_shard_total`：窗口模式（≤ `HEIGHT_EXACT_SHAPE_MAX`
+//     块）量程 == Σ `shape_docrow_shard(真实 DocRow)`（R1，不再 `est_wrap_len` 估算）；
+//   - `unified_sampled_model_matches_sampled_docrow_shard`：超大文档抽样档的量程 ==
+//     「抽中块真实 shard × 组内块数」的自洽值，并报告对全量精确的相对误差；
+//   - `unified_small_doc_range_equals_docrow_shard_total`：小文档统一提示 == 逐行精确；
+//   - `unified_window_scroll_to_bottom_reaches_last_block`：滚到底达末块且末块内容可达。
 // - 已知系统性差（只留档、不断言相等）：Bullet 的 min_h 兜底、列表/引述 gutter 宽、
 //   图片题注模型、行内公式 splice（B 独有）——P3 对齐盒模型后复校。
 
@@ -292,11 +297,13 @@ fn unified_shard_height_matches_preview_row(cx: &mut TestAppContext) {
     assert!(failures.is_empty(), "unified 对照失败：\n{}", failures.join("\n"));
 }
 
-/// M5-B5 Phase 2 **unified 量程**：窗口模式（> `WINDOWED_MIN_BLOCKS`）的滚动总量程 ==
-/// Σ 共享 shard 公式块高（`unified_index_block_height`；块数 < 抽样阈值 → stride=1
-/// 逐块精确，确定性）。legacy 下该口径就是旧抽样公式（默认行为不动）。
+/// M5-B5 P3 前置 **unified 量程精确化（R1）**：窗口模式（> `WINDOWED_MIN_BLOCKS`、且
+/// ≤ `HEIGHT_EXACT_SHAPE_MAX` 块 = 全量精确档）的滚动总量程 **== Σ shape_docrow_shard
+/// over 每个真实 DocRow**（不再 `unified_index_block_height` 的 `est_wrap_len` 估算）。
+/// 参考值用独立路径（`Doc::open` + `rows_in_block_window`）直接 shape 每块，与模型完全
+/// 解耦——模型增量内容为真（渲染上下文与参考同宽同主题）。
 #[gpui::test]
-fn unified_window_range_equals_shard_formula_total(cx: &mut TestAppContext) {
+fn unified_window_range_equals_docrow_shard_total(cx: &mut TestAppContext) {
     let _g = BackendGuard::with(PreviewBackend::Unified);
     cx.update(crate::actions::bind_local_keymaps);
     let (host, cx) = cx.add_window_view(|_window, cx| {
@@ -304,7 +311,7 @@ fn unified_window_range_equals_shard_formula_total(cx: &mut TestAppContext) {
         PreviewHost { md }
     });
     let cx: &mut VisualTestContext = cx;
-    // 2400 组「标题 + 空行」= 4800 块 > WINDOWED_MIN_BLOCKS(4000) → 窗口模式。
+    // 2400 组「标题 + 空行」= 4800 块 > WINDOWED_MIN_BLOCKS(4000) 且 < 8192 → 全量精确档。
     let mut src = String::with_capacity(512_000);
     for i in 0..2_400 {
         src.push_str(&format!("## 标题 {i}\n\n"));
@@ -317,27 +324,219 @@ fn unified_window_range_equals_shard_formula_total(cx: &mut TestAppContext) {
     cx.simulate_resize(size(px(width), px(600.)));
     settle(cx);
 
-    let (total, expect, n) = cx.update(|_window, cx| {
+    let (total, expect, n) = cx.update(|window, cx| {
         let p = StyleParams::from_theme_with_font(cx, None);
         let md = host.read(cx).md.read(cx);
-        let idx = md.index.as_ref().expect("大文档应走窗口模式");
-        let n = idx.blocks.len();
+        let n = md.index.as_ref().expect("大文档应走窗口模式").blocks.len();
         assert!(n > 4000, "应进入窗口模式（n={n}）");
+        assert!(
+            n <= HEIGHT_EXACT_SHAPE_MAX,
+            "该用例块数应落在全量精确档（n={n}）"
+        );
         let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
         let total = md.vertical_total_px();
-        let expect = (0..n)
-            .map(|i| unified_index_block_height(&idx.blocks.at(i), &p, avail))
-            .sum::<f32>();
+        // 独立参考：真实 DocRow → shape，与模型解耦。
+        let ts = window.text_system().clone();
+        let style = window.text_style();
+        let fs = style.font_size.to_pixels(window.rem_size());
+        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let doc = Doc::open(src.into());
+        let rows = doc.rows_in_block_window(0, n - 1);
+        let expect: f32 = rows
+            .iter()
+            .map(|dr| {
+                shape_docrow_shard(&ts, dr, &theme, avail, width)
+                    .iter()
+                    .map(|s| s.h)
+                    .sum::<f32>()
+            })
+            .sum();
         (total, expect, n)
     });
     assert!(
         (total - expect).abs() <= 1.0,
-        "unified 量程应 == Σ shard 公式块高：total={total:.1} expect={expect:.1} (n={n})"
+        "unified 量程应 == Σ 真实 DocRow shard 总高：total={total:.1} expect={expect:.1} (n={n})"
     );
 }
 
-/// M5-B5 Phase 2 **unified 滚到底护栏**（R1）：窗口模式 + unified（量程 = shard 口径）
-/// 下，`scroll_to_px` 滚到最大量程不被旧估算的短量程夹住，绝对块定位可达文档末块。
+/// M5-B5 P3 前置 **unified 抽样档自洽**：超大文档（> `HEIGHT_EXACT_SHAPE_MAX`）走
+/// 抽样窗口——`block_h[g]` 取**抽中块的真实 DocRow shard 高**、组内其余块沿用。
+/// 断言模型量程 == 「抽中块真实 shard × 组内块数」自洽值（抽样在采样点精确、无
+/// `est_wrap_len` 估算误差），并打印对「全量精确」的相对误差供取舍留档。
+#[gpui::test]
+fn unified_sampled_model_matches_sampled_docrow_shard(cx: &mut TestAppContext) {
+    let _g = BackendGuard::with(PreviewBackend::Unified);
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 9000 组「标题 + 空行」= 18000 块 > 8192 → 抽样档（stride = 18000/4096 ≈ 4）。
+    let mut src = String::with_capacity(1_000_000);
+    for i in 0..9_000 {
+        src.push_str(&format!("## 标题 {i}\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(&src, cx));
+    });
+    let width = 400f32;
+    cx.simulate_resize(size(px(width), px(600.)));
+    settle(cx);
+
+    let (total, sampled_total, exact_total, n, stride) = cx.update(|window, cx| {
+        let p = StyleParams::from_theme_with_font(cx, None);
+        let md = host.read(cx).md.read(cx);
+        let idx = md.index.as_ref().expect("大文档应走窗口模式");
+        let n = idx.blocks.len();
+        let stride = md.height_stride;
+        assert!(n > HEIGHT_EXACT_SHAPE_MAX && stride > 1, "应走抽样档（n={n}, stride={stride}）");
+        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        let ts = window.text_system().clone();
+        let style = window.text_style();
+        let fs = style.font_size.to_pixels(window.rem_size());
+        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let doc = Doc::open(src.into());
+        let rows = doc.rows_in_block_window(0, n - 1);
+        let block_h = |k: usize| {
+            shape_docrow_shard(&ts, &rows[k], &theme, avail, width)
+                .iter()
+                .map(|s| s.h)
+                .sum::<f32>()
+        };
+        // 与 `rebuild_height_model` 抽样同式（首块精确 × 组内块数）。
+        let mut si = 0usize;
+        let mut sampled_total = 0.0f32;
+        while si < n {
+            let group_len = stride.min(n - si);
+            sampled_total += block_h(si) * group_len as f32;
+            si += stride;
+        }
+        let exact_total: f32 = rows.iter().map(|dr| shape_docrow_shard(&ts, dr, &theme, avail, width).iter().map(|s| s.h).sum::<f32>()).sum();
+        (md.vertical_total_px(), sampled_total, exact_total, n, stride)
+    });
+    let rel = (exact_total - sampled_total).abs() / exact_total.max(1.0) * 100.0;
+    eprintln!(
+        "[guard] 抽样档（n={n}, stride={stride}）量程 {total:.0} == 抽样自洽 {sampled_total:.0}；对全量精确 {exact_total:.0} 的相对误差 {rel:.2}%（组首×组数、组内异构误差，与 legacy 抽样同构）"
+    );
+    assert!(
+        (total - sampled_total).abs() <= 1.0,
+        "unified 抽样档量程应 == 抽样点真实 shard 自洽值：total={total:.1} sampled={sampled_total:.1} (n={n})"
+    );
+    // 抽样采点精确 ⇒ 误差只来自「组首×组数」对周期复用块组的欠/过估（本用例为「标题+空行」
+    // 周期，stride=4 组首全为标题 → 系统性 +20% 量级）。这正是 `rebuild_height_model` 既有
+    // 注释的「确定性偏移抽样对高度周期复用块有偏差」；全量精确档（≤8192 块）不受影响。
+    assert!(rel < 50.0, "抽样档相对误差应 <50%（实测 {rel:.2}%）");
+}
+
+/// M5-B5 P3 前置：`docrow_for_height`（预览 Row→DocRow 适配）与真实
+/// `Doc::rows_in_block_window` DocRow 的 **shard 高度逐行一致**——钉死「适配器高度 ==
+/// 真实 DocRow」这一前提（视图高度模型不持完整 Doc 的合法性依据）。
+#[gpui::test]
+fn docrow_for_height_matches_doc_docrow_shard(cx: &mut TestAppContext) {
+    use crate::markdown::layout::docrow_for_height;
+    use crate::markdown::parse::parse_to_rows;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let src = sample_src();
+    let rows = parse_to_rows(src);
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    let width = 400f32;
+    cx.simulate_resize(size(px(width), px(600.)));
+    settle(cx);
+    let failures = cx.update(|window, cx| {
+        let p = StyleParams::from_theme_with_font(cx, None);
+        let ts = window.text_system().clone();
+        let style = window.text_style();
+        let fs = style.font_size.to_pixels(window.rem_size());
+        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let avail = width - 2.0 * PREVIEW_SIDE_GAP_PX - 2.0 * CONTENT_EDGE_PAD_X_PX;
+        let doc = Doc::open(src.into());
+        let n = doc.block_count();
+        let docrows = doc.rows_in_block_window(0, n - 1);
+        assert_eq!(docrows.len(), rows.len(), "DocRows 与预览行数应对齐");
+        let mut failures = Vec::new();
+        for (ix, (r, dr)) in rows.iter().zip(docrows.iter()).enumerate() {
+            let via_adapter: f32 = shape_docrow_shard(&ts, &docrow_for_height(r), &theme, avail, width)
+                .iter().map(|s| s.h).sum();
+            let via_doc: f32 = shape_docrow_shard(&ts, dr, &theme, avail, width)
+                .iter().map(|s| s.h).sum();
+            if (via_adapter - via_doc).abs() > 0.05 {
+                failures.push(format!("row[{ix}] kind={:?} adapter={via_adapter:.2} doc={via_doc:.2}", dr.kind));
+            }
+        }
+        failures
+    });
+    assert!(failures.is_empty(), "docrow_for_height 与真实 DocRow 高度不一致：\n{}", failures.join("\n"));
+}
+
+/// M5-B5 Phase 2/3 **unified 小文档量程精确化**：统一高度提示（`est_hint`，未偏置）seed
+/// 出的列表量程 `n × est_hint` == Σ 逐行真实 DocRow shard（不再 `est_wrap_lines` 估算）；
+/// 且小文档滚到底可达末行（ListState 实测路径，防夹量程）。
+#[gpui::test]
+fn unified_small_doc_range_equals_docrow_shard_total(cx: &mut TestAppContext) {
+    let _g = BackendGuard::with(PreviewBackend::Unified);
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let mut src = String::new();
+    for i in 0..80 {
+        src.push_str(&format!("这是一段足够长、能在 288px 内容宽下折成多行的中文段落文本，标号 {i}。\n\n"));
+    }
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(&src, cx));
+    });
+    let width = 400f32;
+    cx.simulate_resize(size(px(width), px(600.)));
+    settle(cx);
+
+    let (hint_total, expect, n) = cx.update(|window, cx| {
+        let p = StyleParams::from_theme_with_font(cx, None);
+        let md = host.read(cx).md.read(cx);
+        let n = md.rows.len();
+        assert!(md.index.is_none(), "小文档应走全量路径（n={n}）");
+        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        let ts = window.text_system().clone();
+        let style = window.text_style();
+        let fs = style.font_size.to_pixels(window.rem_size());
+        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let doc = Doc::open(src.into());
+        let rows = doc.rows_in_block_window(0, n - 1);
+        let expect: f32 = rows
+            .iter()
+            .map(|dr| shape_docrow_shard(&ts, dr, &theme, avail, width).iter().map(|s| s.h).sum::<f32>())
+            .sum();
+        (md.est_hint * n as f32, expect, n)
+    });
+    assert!(
+        (hint_total - expect).abs() <= 2.0,
+        "unified 小文档量程（n×est_hint）应 == Σ 逐行真实 shard：total={hint_total:.1} expect={expect:.1} (n={n})"
+    );
+    // 统一高度提示确已被逐行精确值 seed（`update_height_hint` 计量程的前提）。
+    let seeded = cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        let m = md.read(cx);
+        m.hint_applied.is_some_and(|(n2, h)| n2 == n && (h - m.est_hint).abs() < 0.01)
+    });
+    assert!(seeded, "小文档统一提示应按逐行精确平均高 seed（n={n}）");
+}
+
+/// M5-B5 Phase 2/3 **unified 滚到底护栏（R1）**：窗口模式 + unified（量程 = 真实 DocRow
+/// shard 总高）下，`scroll_to_px` 滚到最大量程不被旧估算的短量程夹住——绝对块定位可达
+/// 文档末块（尺寸对齐），且首屏/末屏**都被窗口物化、内容可达**（`rendered_text` 含首/末
+/// 标题文本，防「滚得到块号却渲染空白」的量程/渲染脱节）。
 #[gpui::test]
 fn unified_window_scroll_to_bottom_reaches_last_block(cx: &mut TestAppContext) {
     let _g = BackendGuard::with(PreviewBackend::Unified);
@@ -364,24 +563,39 @@ fn unified_window_scroll_to_bottom_reaches_last_block(cx: &mut TestAppContext) {
         md.read(cx).item_count()
     });
     assert!(n > 4000, "应进入窗口模式（n={n}）");
-    // 滚到最大量程（1e9 被 clamp 到总量−视口）→ 绝对块应落在末块附近。
+    // 首屏：未滚动时第一块内容已被窗口物化（首屏不缺内容）。
+    let first_text = cx.update(|_, cx| host.read(cx).md.read(cx).rendered_text());
+    assert!(
+        first_text.contains("标题 0"),
+        "首屏应含第一块内容（缺内容？rendered={first_text:?}）"
+    );
+    // 滚到最大量程（1e9 被 clamp 到总量−视口）→ 绝对块应落在末块附近，且末块内容可达。
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         md.update(cx, |md, _| md.scroll_to_px(1e9));
     });
-    for _ in 0..4 {
-        cx.run_until_parked();
-        let _ = cx.cx.refresh();
-    }
-    let (abs, total) = cx.update(|_, cx| {
+    // `scroll_to_px` 同步推进 win_base + ListState 滚动；窗口物化（ensure_window）在
+    // prepare_render 里做，需真实重绘帧才会跑——强制 `window.draw` 数次让窗口重建到末块。
+    cx.update(|window, cx| {
+        for _ in 0..6 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
+    let (abs, total, text) = cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
         let m = md.read(cx);
-        (m.test_abs_scroll_top(), m.vertical_total_px())
+        (m.test_abs_scroll_top(), m.vertical_total_px(), m.rendered_text())
     });
     assert!(
         abs.0 >= n.saturating_sub(48),
         "滚到底应达末块（abs_block={} n={n}，total={total:.0}）——量程被夹住？",
         abs.0
+    );
+    assert!(
+        text.contains("标题 2399"),
+        "滚到底后末块内容应被窗口物化可达（缺内容？rendered 尾部={:?}）",
+        &text[text.len().saturating_sub(80)..]
     );
 }
 
