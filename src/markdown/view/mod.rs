@@ -18,7 +18,7 @@
 //! 本目录按职责拆分（替代原先的单文件 `view.rs` 长文件）：
 //! - `style`：排版参数快照（[`style::StyleParams`]）
 //! - `dimensions`：行宽 / 表格列宽估算、图片头尺寸解析
-//! - `row`：单行渲染（[`row::render_row`]）
+//! - `row`：单行渲染（[`row::render_row_shard`] 统一 shard 几何；表格/图片旧内容路径）
 //! - `table`：GFM 表格渲染（[`table::render_table`] / `render_table_row`）
 //! - `tests`：视图层测试
 
@@ -56,15 +56,14 @@ use crate::config::limits::{
     WINDOWED_OVERDRAW_FACTOR, WINDOWED_OVERDRAW_MAX,
 };
 use crate::config::markdown::{
-    CONTENT_EDGE_PAD_X_PX, IMAGE_CAPTION_GAP_PX, IMAGE_ROW_DEFAULT_H, PREVIEW_SIDE_GAP_PX,
-    ROW_OVERDRAW_PX, TABLE_SCROLLBAR_RESERVE_PX,
+    CONTENT_EDGE_PAD_X_PX, PREVIEW_SIDE_GAP_PX, ROW_OVERDRAW_PX,
 };
 use crate::config::timing::HIGHLIGHT_MS;
-use crate::markdown::doc::{assemble_docrow_window, DocLineView, DocPayload, DocRow};
+use crate::markdown::doc::{assemble_docrow_window, DocLineView, DocPayload};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::{
     build_line_starts_u32, parse_block_window, parse_block_window_rope, parse_to_rows,
-    scan_blocks, scan_citations, BlockIndex, BlockMeta, CitationIndex, Row, RowKind, RowPayload,
+    scan_blocks, scan_citations, BlockIndex, CitationIndex, Row, RowKind, RowPayload,
     RunKind, Toc,
 };
 use crate::syntax::{parse_code_lines, CodeLineRuns};
@@ -74,7 +73,7 @@ use crate::markdown::layout::docrow_for_height;
 use crate::markdown::layout::shape_docrow_shard;
 use crate::markdown::wysiwyg::WyTheme;
 use dimensions::{image_dimensions, image_dimensions_bytes};
-use row::{render_row, render_row_shard, PreviewRow, RowRenderCtx};
+use row::{render_row_shard, PreviewRow, RowRenderCtx};
 use style::StyleParams;
 
 /// EPUB 脚注悬浮命中：一行内某个 `[n]` 标记在**上一帧**的画面矩形 + 对应注释正文。
@@ -209,15 +208,13 @@ const PREVIEW_LIST_WINDOW: usize = 2048;
 /// 窗口重定位时目标块之前保留的前置块数（滚动余量，减少频繁重定位/重解析窗口）。
 const WINDOW_LEAD_BLOCKS: usize = 96;
 /// 块高抽样目标（块）：`stride = max(1, 块数 / 目标)`。换宽/字号变化时重建
-/// 抽样块高模型 O(N/stride)（4k 次 `index_block_height` 纯算术 < 1ms），
-/// 替代原先全量 O(N) 的 20~40ms 平均行高估算。
+/// 抽样块高模型 O(N/stride)（抽中块喂真实 `shape_docrow_shard`，组内其余沿用），
+/// 替代原先全量 O(N) 的逐块精确/平均行高估算。
 const HEIGHT_SAMPLE_TARGET: usize = 4096;
-/// 超过该块数才启用块高抽样（否则逐块精确：几十万块 ≈ 几 ms，仅换源/换宽发生）。
-const HEIGHT_FULL_BLOCKS_MAX: usize = 262_144;
-/// unified 后端「窗口模式**全量精确**量程」的块数上限：≤ 此值对**每个真实 DocRow**
+/// 「窗口模式**全量精确**量程」的块数上限：≤ 此值对**每个真实 DocRow**
 /// 逐块喂 `shape_docrow_shard`（`Σ shard.h` == 真实 DocRow shard 总高，R1，不再 estimate）；
 /// 超过此值退化为「抽样窗口」——只对抽中的块 shape 取精确高、组内其余块沿用（量程
-/// 误差 ≤ 组内异构，与 legacy 抽样同构）。依据 bench
+/// 误差 ≤ 组内异构，与抽样同构）。依据 bench
 /// `bench_docrow_shard_full_range_cost`：全量 DocRow shape ≈0.05ms/块（debug）→ 8192 块
 /// ≈ 0.4s（debug）/ ≈50ms（release），再大超出交互预算（换宽/块数变化的 120ms 节流窗口）。
 const HEIGHT_EXACT_SHAPE_MAX: usize = 8192;
@@ -339,36 +336,36 @@ impl DocLineView for PreviewLineView<'_> {
     }
 }
 
-// ===== M5-B5 Phase 2/3：预览后端开关（legacy|unified）=====
-// `legacy`（默认）= 现状逐位一致：List + 抽样量程 + gpui 自然行距（≈1.79×fs）。
-// `unified` = 预览行高/量程切共享 `markdown::layout::shape_docrow_shard` 口径：
-//   - 文本行显式 `line_height` = 共享行高系数（para_line/heading_line，单一源
-//     `StyleParams`，WYSIWYG/B 引擎同款），空行/分隔行盒高 = para_line；
-//     使预览每视觉行间距与 shard（BlockLayout）逐行一致；
-//   - 高度模型：Phase 2 先切 shard **公式族**（layout/mod.rs 同常量：表格滚动条预留、
-//     空行=para_line、代码 (行数+2)×code_line、标题 +pad(8)，文本折行用 `est_wrap_*`
-//     估算）；**P3 前置（量程精确化，R1）再升级为「逐块喂真实 `DocRow` 给
-//     `shape_docrow_shard`」**——≤ `HEIGHT_EXACT_SHAPE_MAX` 块全量精确（量程 == Σ 真实
-//     DocRow shard 总高，不再 estimate），超出走抽样窗口（抽中块取真实 shard 高）；
-//   - 渲染 draw 仍走旧 List/TextTrack 路径（P3 再切 Frame/paint），几何来源
-//     统一在本步完成（渲染切换按蓝图范畴各留一档：切得了的已切、切不了留 P3）。
-// 一条变量（`set_preview_backend`）整体换轨；默认关 → 默认 legacy 逐位保真。
-// 状态用 **线程本地**：生产线程恒 legacy（未 set 即 0，零侵入）；`#[gpui::test]`
+// ===== M5-B5 P3-1b-2：预览后端开关（legacy|unified）=====
+// **P3-1b-2 起默认翻转 unified（量程/渲染单一 shard 真源）**：
+//   - 默认（生产线程未 set）= `Unified`：量程逐块喂真实 `DocRow` 给
+//     `shape_docrow_shard`（≤ `HEIGHT_EXACT_SHAPE_MAX` 块全量精确 == Σ 真实 DocRow
+//     shard 总高（R1），超出走抽样窗口、抽中块取真实 shard 高）；渲染几何同源
+//     `shape_docrow_shard`（文本/代码走 `render_row_shard`/`ShardStrip`，表格/图片沿
+//     旧 `render_table_row`/`render_image_row` 内容路径，P3-1c 再收）。
+//   - `PreviewBackend::Legacy`/`set_preview_backend(Legacy)` 保留为 **API 面**（供
+//     EPUB/表格图片旧路径与运行期诊断显式切换），但 P3-1b-2 已删 legacy 元素树/抽样
+//     估算轨 → 切 legacy 与 unified 收敛到同一 shard 实现（行为一致），EPUB 阅读
+//     能力（注记卡/引文/页码/内存图）在 unified 下原样保留。
+// 状态用 **线程本地**：生产线程默认 unified（未 set 即 1，零侵入）；`#[gpui::test]`
 // 每个用例跑在独立线程，各线程各自 set，**并行测试互不串扰**（进程全局 atomic
 // 在并行渲染下会跨用例竞态，弃用；与 wysiwyg/theme.rs 的 caret 线程本地同款）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreviewBackend {
-    /// 现状行为（默认）：抽样量程 + gpui 自然行距。
+    /// 历史抽样/元素树实现（P3-1b-2 已删除其独立实现；保留标签供诊断/EPUB 显式切换）。
     Legacy,
-    /// 共享 shard 口径：显式 line_height + shard 公式族量程。
+    /// 共享 shard 口径（默认）：显式 line_height + shard 量程 + render_row_shard。
     Unified,
 }
 
 thread_local! {
-    /// 0 = Legacy（默认），1 = Unified。仅当前线程可见。
-    static PREVIEW_BACKEND: Cell<u8> = const { Cell::new(0) };
+    /// 0 = Legacy（保留标签），1 = Unified（默认）。仅当前线程可见。
+    static PREVIEW_BACKEND: Cell<u8> = const { Cell::new(1) };
 }
 
+/// 读当前线程预览后端（默认 unified；保留供测试 BackendGuard 与诊断用）。
+/// `#[allow(dead_code)]`：P3-1b-2 后渲染/量程单一实现，生产路径不再读它。
+#[allow(dead_code)]
 pub(crate) fn preview_backend() -> PreviewBackend {
     match PREVIEW_BACKEND.get() {
         0 => PreviewBackend::Legacy,
@@ -376,9 +373,9 @@ pub(crate) fn preview_backend() -> PreviewBackend {
     }
 }
 
-/// 运行时切换预览后端（测试/诊断用；默认 legacy，行为与现状逐位一致；仅本线程生效）。
-/// `#[allow(dead_code)]`：生产路径只读 `preview_backend()`，setter 供测试与
-/// 运行期诊断换轨调用（一条变量整体换轨的入口）。
+/// 运行时切换预览后端（测试/诊断用；默认 unified；仅本线程生效）。
+/// `#[allow(dead_code)]`：生产路径不再读 `preview_backend()`（单一实现），setter 供
+/// 测试与运行期诊断换轨调用（保留 API 面；legacy 收敛到同一 shard 实现）。
 #[allow(dead_code)]
 pub(crate) fn set_preview_backend(b: PreviewBackend) {
     match b {
@@ -479,9 +476,6 @@ pub struct MarkdownPreview {
     /// `with_uniform_item_height` 会逐项物化整棵 SumTree（16 万块一次 30~90ms），
     /// 若每帧都补会直接卡死；记忆后只有块数变化/换宽/换源才重做。
     hint_applied: Option<(usize, f32)>,
-    /// 提示被 gpui 首布局按宽度变化清掉后，本轮是否已补过一份（补后不再反复补，
-    /// 防每帧 O(块数) 重建的无限循环）。
-    hint_recovered: bool,
     /// 大文档「窗口级懒解析」的整篇轻量块索引；`None` = 小文档走全量 `rows`。
     index: Option<Rc<BlockIndex>>,
     /// 窗口模式下保留的原始 markdown（窗口重解析需要）。rope COW 共享、不物化全文。
@@ -575,7 +569,6 @@ impl MarkdownPreview {
             last_render_width: -1.0,
             last_hint_estimate: std::time::Instant::now(),
             hint_applied: None,
-            hint_recovered: false,
             index: None,
             src_buf: None,
             win_lo: 0,
@@ -674,7 +667,7 @@ impl MarkdownPreview {
         }
         self.font_override = size;
         self.list_state.remeasure();
-        self.invalidate_height_hint();
+        self.est_hint_width = -1.0;
     }
 
     /// 带视口锚定的**绝对**字号设置（宿主 `app` 全局字号推进的统一落点）。
@@ -731,7 +724,7 @@ impl MarkdownPreview {
     pub fn set_wrap(&mut self, _wrap: bool, _cx: &mut App) {
         self.wrap = true;
         self.list_state.remeasure();
-        self.invalidate_height_hint();
+        self.est_hint_width = -1.0;
     }
 
     /// 当前是否文本自动换行（恒为 true；旧非换行模式已废弃）。
@@ -753,7 +746,7 @@ impl MarkdownPreview {
         });
         self.hover_hit = None;
         self.list_state.remeasure();
-        self.invalidate_height_hint();
+        self.est_hint_width = -1.0;
     }
 
     /// EPUB 轻量视口分页读数：`(当前页, 总页数)`（1 基）——按「内容总高 / 视口高」
@@ -1186,7 +1179,6 @@ impl MarkdownPreview {
                 ListState::new(PREVIEW_LIST_WINDOW, ListAlignment::Top, px(0.));
             self.win_base = 0;
             self.hint_applied = None;
-            self.hint_recovered = false;
             crate::prof::end("md.ss.drops", _t_drops);
             crate::prof::end("md.ss.reset", _t_reset);
             // 高度/块宽模型：不在此失效（否则每键打字的下一帧都 O(N) 重建）。小编辑只改
@@ -1282,7 +1274,6 @@ impl MarkdownPreview {
             // 行数变化只会重建列表：把滚动恢复到更新前的逻辑位置，避免跳回开头
             self.list_state.scroll_to(prev_scroll);
             self.hint_applied = None;
-            self.hint_recovered = false;
         } else {
             // 行数不变但内容变了 → 重新测量高度（保留滚动位置；未测行继续用统一提示）
             self.list_state.remeasure();
@@ -1363,8 +1354,9 @@ impl MarkdownPreview {
         }
     }
 
-    /// 重建全篇块高抽样模型（窗口模式专用）：O(N/stride) 纯算术，替代原先 O(N)
-    /// 的 `estimated_avg_row_height`（20~40ms），换宽/换源成本降到 <1ms。
+    /// 重建全篇块高模型（窗口模式专用）：≤ `HEIGHT_EXACT_SHAPE_MAX` 块逐块喂真实
+    /// `DocRow` 给 `shape_docrow_shard` 取精确高（量程 == Σ shard，R1）；超大文档走
+    /// 抽样窗口（O(N/stride)：只对抽中块 shape，组内其余沿用）。render 期调用。
     fn rebuild_height_model(&mut self, p: &StyleParams, width: f32) {
         let _t_hm = crate::prof::begin();
         let Some(idx) = self.index.clone() else {
@@ -1378,21 +1370,16 @@ impl MarkdownPreview {
             self.est_hint = 0.0;
             return;
         }
-        // 内容可用宽：unified 与渲染同源（`preview_text_avail`）；legacy 旧口径
-        // 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`，旧硬编码 24）。
-        let unified = preview_backend() == PreviewBackend::Unified;
-        let avail = if unified {
-            preview_text_avail(p, width)
-        } else {
-            (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0)
-        };
-        // 抽样步长：中等文档（≤ 该阈值）**逐块精确**算高（几十万块 ≈ 几 ms，换源/换宽
-        // 才发生）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度
-        // 周期复用块」有偏差，故只在 N 大到精确成本不可接受时启用。
-        // unified 后端阈值更小（`HEIGHT_EXACT_SHAPE_MAX`）：全量精确要逐块 shape（贵），
-        // 超出即抽样；且每块高度 = 抽中块的**真实 DocRow shard 高**（见 `exact_block_heights`）。
-        let fast_cap = if unified { HEIGHT_EXACT_SHAPE_MAX } else { HEIGHT_FULL_BLOCKS_MAX };
-        let stride = if n > fast_cap {
+        // 内容可用宽：与渲染同源（`preview_text_avail`，R2）——量程/渲染同真源。
+        let avail = preview_text_avail(p, width);
+        // 抽样步长：≤ `HEIGHT_EXACT_SHAPE_MAX` 块**逐块精确**算高（全量精确要逐块 shape，
+        // 贵）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度周期复用
+        // 块」有偏差，故只在 N 大到精确成本不可接受时启用；抽中块取**真实 DocRow shard 高**。
+        // 无整形上下文（render 前）不建模型——render 恒先置 `height_exact_ctx` 再建。
+        if self.height_exact_ctx.is_none() {
+            return;
+        }
+        let stride = if n > HEIGHT_EXACT_SHAPE_MAX {
             (n / HEIGHT_SAMPLE_TARGET).max(1)
         } else {
             1
@@ -1402,9 +1389,7 @@ impl MarkdownPreview {
         let mut pref: Vec<f32> = Vec::with_capacity(groups + 1);
         pref.push(0.0);
         let mut si = 0usize;
-        // unified 且整形上下文在场（render 期抓取）：逐块喂真实 `DocRow` → 精确 shard 高。
-        let exact = unified && self.height_exact_ctx.is_some();
-        if exact && stride == 1 {
+        if stride == 1 {
             // 全量精确（≤ `HEIGHT_EXACT_SHAPE_MAX` 块）：分批物化真实 DocRow 逐块 shape，
             // 总量程 == Σ 真实 DocRow shard 总高（R1，不再 `est_wrap_len` 估算）。
             while si < n {
@@ -1421,17 +1406,12 @@ impl MarkdownPreview {
         } else {
             while si < n {
                 let group_len = stride.min(n - si);
-                let h0 = if exact {
-                    // 抽样窗口：抽中块（组首）取真实 shard 高（`block_h[g]` 恒为单块高）。
-                    self.exact_block_heights(&idx, avail, width, si, si).pop().unwrap_or(1.0).max(1.0)
-                } else if unified {
-                    // 无整形上下文（render 前直接调 / 后端切换边缘）：回退 unified 公式族。
-                    let b = &idx.blocks.at(si.min(n - 1));
-                    unified_index_block_height(b, p, avail).max(1.0)
-                } else {
-                    let b = &idx.blocks.at(si.min(n - 1));
-                    index_block_height(b, p, self.wrap, avail).max(1.0)
-                };
+                // 抽样窗口：抽中块（组首）取真实 shard 高（`block_h[g]` 恒为单块高）。
+                let h0 = self
+                    .exact_block_heights(&idx, avail, width, si, si)
+                    .pop()
+                    .unwrap_or(1.0)
+                    .max(1.0);
                 block_h.push(h0);
                 pref.push(pref.last().copied().unwrap_or(0.0) + h0 * group_len as f32);
                 si += stride;
@@ -1945,7 +1925,6 @@ impl MarkdownPreview {
         self.est_hint = 0.0;
         self.est_hint_width = -1.0;
         self.hint_applied = None;
-        self.hint_recovered = false;
         self.index = None;
         self.src_buf = None;
         self.line_starts = Rc::new(Vec::new());
@@ -1959,12 +1938,6 @@ impl MarkdownPreview {
         self.height_exact_ctx = None;
     }
 
-    /// 标记「平均行高的宽度感知估算」已失效：换源 / 换行 / 字号变化后调用，
-    /// 下一次 render（视口宽度已知）会重算并刷新统一高度提示。
-    fn invalidate_height_hint(&mut self) {
-        self.est_hint_width = -1.0;
-    }
-
     /// 按当前视口宽度估算「平均渲染行高」作为列表的统一高度提示。
     /// 这样竖滚动条量程 = 行数 × 平均行高 ≈ 真实总高，从头一开始就可用滚动条
     /// 跳到任意位置（含文末），而无需像 `measure_all()` 那样一次性排版整篇。
@@ -1972,108 +1945,30 @@ impl MarkdownPreview {
     /// 折算行数（CJK ≈ 字号，其余 ≈ 0.55 × 字号），微差只会让滚动条映射略微
     /// 非线性，随行真正渲染后逐步收敛。
     fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
-        // 内容可用宽：unified 与渲染同源（`preview_text_avail`）；legacy 旧口径
-        // 视口宽 − 行内 px_3 左右内衬 ×2。
-        let avail = if preview_backend() == PreviewBackend::Unified {
-            preview_text_avail(p, width)
-        } else {
-            (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0)
-        };
-        let wrap = self.wrap;
-        // 小文档恒走 rows 逐行口径（行类型精确）；只有**大文档/窗口模式**（rows 懒物化
-        // 为空）才走块索引口径——避免「首帧 index 在场、随后丢弃」导致平均行高在两种
-        // 口径间跳变（EPUB 实测 77.6 ↔ 52，量程/总页数随之抖动）。
-        let (n, total) = match (&self.index, self.rows.is_empty()) {
-            (Some(idx), true) => {
-                if idx.blocks.is_empty() {
-                    return p.body_row_hint().as_f32();
-                }
-                // 大文档块索引十几万条：**精确求和全篇块高**（不抽样）。滚动条总长 =
-                // 块数 × 平均高，只要平均高精确，总长就精确（与分布无关），拖到底必然
-                // 到达真实末尾——抽样会把偏差写进量程，欠估 → 底部内容拖不到。
-                // 成本 O(n) 纯算术（16 万块 ≈ 20~40ms），仅在换源/视口宽变化（120ms
-                // 节流）时重算一次；`update_height_hint` 里已做节流。
-                let n = idx.blocks.len();
-                let total = idx
-                    .blocks
-                    .iter()
-                    .map(|b| index_block_height(&b, p, wrap, avail))
-                    .sum::<f32>();
-                (n, total)
-            }
-            _ => {
-                if self.rows.is_empty() {
-                    return p.body_row_hint().as_f32();
-                }
-                let mut total = 0.0f32;
-                // unified 后端且整形上下文在场：逐行喂**真实 `DocRow`**（本行已装配，含
-                // byte_map；P3-1a 后不再经 `docrow_for_height` 薄适配）给 `shape_docrow_shard`
-                // 得**精确**逐行高（小文档行数少，O(行数) shape 可承受）；否则回退统一 shard
-                // 公式族（`unified_row_height`）。legacy 走原公式（逐位不变）。
-                let exact = preview_backend() == PreviewBackend::Unified
-                    && self.height_exact_ctx.is_some();
-                let ctx = self.height_exact_ctx.as_ref().map(|(ts, th)| (ts.clone(), th.clone()));
-                for r in self.rows.iter() {
-                    let h = if exact {
-                        let (ts, theme) = ctx.as_ref().expect("exact 分支必有 ctx");
-                        shape_docrow_shard(ts, &r.docrow, theme, avail, width)
-                            .iter()
-                            .map(|s| s.h)
-                            .sum::<f32>()
-                    } else if preview_backend() == PreviewBackend::Unified {
-                        unified_row_height(&r.docrow, p, avail)
-                    } else {
-                        match r.kind() {
-                            IrKind::Blank => p.blank_h.as_f32(),
-                            IrKind::Rule => p.rule_h.as_f32(),
-                            IrKind::Code => {
-                                (r.code_lines().len().max(1) as f32 + 2.0)
-                                    * p.code_line.as_f32()
-                            }
-                            IrKind::Table => {
-                                let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-                                (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
-                                    + 2.0
-                                    + 8.0
-                            }
-                            IrKind::Image => IMAGE_ROW_DEFAULT_H,
-                            IrKind::Heading(n) => {
-                                let (fs, lh) = p.heading_metrics(n);
-                                if wrap {
-                                    est_wrap_lines(&r.docrow.text, avail, fs.as_f32()).max(1)
-                                        as f32
-                                        * lh.as_f32()
-                                        + 8.0
-                                } else {
-                                    lh.as_f32()
-                                }
-                            }
-                            IrKind::Paragraph | IrKind::Quote | IrKind::Bullet => {
-                                if wrap {
-                                    let lines = est_wrap_lines(
-                                        &r.docrow.text,
-                                        avail,
-                                        p.para_size.as_f32(),
-                                    )
-                                    .max(1) as f32;
-                                    (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
-                                        + p.para_gap.as_f32()
-                                        + 8.0
-                                } else {
-                                    p.para_line.as_f32() + p.para_gap.as_f32()
-                                }
-                            }
-                        }
-                    };
-                    total += h;
-                }
-                (self.rows.len(), total)
-            }
-        };
-        if n == 0 {
+        // 内容可用宽：与渲染同源（`preview_text_avail`，R2）——量程与渲染同真源。
+        // `update_height_hint`（本函数的唯一调用方）只在小文档（`index==None`）路径
+        // 被调：逐行喂**真实 `DocRow`**（本行已装配，含 byte_map）给 `shape_docrow_shard`
+        // 得**精确**逐行高（P3-1b-2 删 `unified_row_height`/`est_wrap_lines` 估算族）；
+        // 无整形上下文（直接调、未经 render）回退单一默认 `body_row_hint`（量程 seed，
+        // 非逐块公式估算；render 恒先置 `height_exact_ctx`，生产路径不经过该回退）。
+        let avail = preview_text_avail(p, width);
+        if self.rows.is_empty() {
             return p.body_row_hint().as_f32();
         }
-        total / n as f32
+        let Some((ts, theme)) = self.height_exact_ctx.as_ref() else {
+            return p.body_row_hint().as_f32();
+        };
+        let total: f32 = self
+            .rows
+            .iter()
+            .map(|r| {
+                shape_docrow_shard(ts, &r.docrow, theme, avail, width)
+                    .iter()
+                    .map(|s| s.h)
+                    .sum::<f32>()
+            })
+            .sum();
+        total / self.rows.len() as f32
     }
 
     /// 视口宽度已知（render 里）后刷新统一高度提示。
@@ -2086,7 +1981,8 @@ impl MarkdownPreview {
     /// 关键约束：`with_uniform_item_height` 会**逐项物化整棵 SumTree**（16 万块一次
     /// 30~90ms），绝对不能在每一帧或每次重同步都调用。这里用 `hint_applied` 记忆
     /// 「(行数, 提示值) 已应用」：只有块数/宽度变化或换源才重做一次；若提示被 gpui
-    /// 首布局按宽度变化清掉，则**每轮至多补一次**（`hint_recovered`），不再无限循环。
+    /// 首布局按宽度变化清掉，则按 `last_hint_apply` 的 120ms 时间节流补上一次
+    /// （P3-1b-2 删 `hint_recovered` 换宽坍缩自愈补丁，改为纯时间节流）。
     fn update_height_hint(&mut self, cx: &mut App, width: f32) -> bool {
         // gpui 的 `max_offset_for_scrollbar` = `max_scroll_offset()`，优先返回
         // **拖拽开始时冻结的** `scrollbar_drag_start_height`（见 list.rs）。若内置竖向
@@ -2128,9 +2024,6 @@ impl MarkdownPreview {
             + self.list_state.viewport_bounds().size.height.as_f32();
         let expected = n as f32 * hint;
         if summary_h >= expected * 0.9 {
-            // 量程健康：清除「重挂保护」痕迹——宽度安定后若提示再被清空，要立即可自愈，
-            // 不能残留 `hint_recovered=true` 永远卡死不重挂（“拖到底不到底”的持久根因）。
-            self.hint_recovered = false;
             if self.hint_applied == Some((n, hint)) {
                 return false;
             }
@@ -2144,17 +2037,18 @@ impl MarkdownPreview {
         // `reset`（splice 成全新 Unmeasured{None}）再统一填高，覆盖任何陈旧戳值——
         // `with_uniform_item_height` 用 `unwrap_or` 会保留陈旧戳值（实测窗口外条目被
         // 戳成 height≈0，量程永远恢复不了）。滚动位置先保存再恢复（reset 会清零）。
-        // 连续宽度变化（拖分屏，`last_render_width` 逐帧跳）中去抖：刚重挂过就被同帧
-        // prepaint 清掉属于常态，每帧 O(n) 是卡顿源；宽度安定后坍缩立即重铺一次。
+        // P3-1b-2 起以 `last_render_width` 宽度去抖（保留）取代 `hint_recovered`
+        // 自愈补丁：连续宽度变化（拖分屏）期重铺至多每 120ms 一次（避免每帧 O(n)
+        // 卡顿）；**宽度安定后坍缩立即重铺**（不因刚铺过而拒铺——否则打开 EPUB 量程
+        // 保持坍缩、必须拖一次才自愈）。`hint_recovered` 已删：稳定宽度下 gpui 不再
+        // 清 size_hint，一次重铺即收敛，无每帧循环风险。
+        let now = std::time::Instant::now();
         let width_active = (self.last_render_width - width).abs() >= 2.0;
         self.last_render_width = width;
-        // 宽度逐帧变化期间刚铺过又立刻被清 → 去抖那几帧（避免每帧 O(n)）。**仅在
-        // 「宽仍在动」且「刚铺过」时跳过一次**；稳定宽度（打开/静止）下绝不因去抖拒铺
-        // （否则打开 EPUB 量程保持坍缩、必须拖一次才自愈——“无法一次滚到底”根因）。
-        if self.hint_recovered
-            && width_active
+        if width_active
             && self.last_hint_apply.is_some_and(|t| {
-                (t.elapsed().as_millis() as u64) < crate::config::timing::HINT_REAPPLY_INTERVAL_MS
+                (now.duration_since(t).as_millis() as u64)
+                    < crate::config::timing::HINT_REAPPLY_INTERVAL_MS
             })
         {
             return false;
@@ -2162,9 +2056,8 @@ impl MarkdownPreview {
         let prev_scroll = self.list_state.logical_scroll_top();
         self.list_state.reset_with_uniform_height(n, px(hint));
         self.list_state.scroll_to(prev_scroll);
-        self.last_hint_apply = Some(std::time::Instant::now());
+        self.last_hint_apply = Some(now);
         self.hint_applied = Some((n, hint));
-        self.hint_recovered = true;
         true
     }
 }
@@ -2266,148 +2159,7 @@ fn preview_rows_memory_estimate(rows: &[PreviewRow]) -> (usize, usize) {
     (rows.len(), b)
 }
 
-/// 单一「块元数据」的平均高度估算（窗口模式：只靠元数据，不物化 Row）。
-/// 与 [`MarkdownPreview::estimated_avg_row_height`] 里 rows 全量路径的公式一一对应。
-/// `unified` 后端走共享 shard 公式族（见 [`unified_index_block_height`]）。
-fn index_block_height(b: &BlockMeta, p: &StyleParams, wrap: bool, avail: f32) -> f32 {
-    if preview_backend() == PreviewBackend::Unified {
-        return unified_index_block_height(b, p, avail);
-    }
-    match b.kind {
-        RowKind::Blank => p.blank_h.as_f32(),
-        RowKind::Rule => p.rule_h.as_f32(),
-        RowKind::Code => (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32(),
-        RowKind::Table => {
-            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-            (1.0 + b.aux as f32) * row_h + 2.0 + 8.0
-        }
-        RowKind::Image => IMAGE_ROW_DEFAULT_H,
-        RowKind::Heading(hh) => {
-            let (fs, lh) = p.heading_metrics(hh);
-            if wrap {
-                est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
-            } else {
-                lh.as_f32()
-            }
-        }
-        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
-            if wrap {
-                let lines =
-                    est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
-                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
-                    + p.para_gap.as_f32()
-                    + 8.0
-            } else {
-                p.para_line.as_f32() + p.para_gap.as_f32()
-            }
-        }
-    }
-}
-
-/// `unified` 后端的块高（px）：**共享 shard 公式族口径**（`markdown::layout` 同常量
-/// 同语义；页恒换行，`wrap` 恒为 true）。块高即 shard 高度累加：
-/// - 空行/分隔线：shard 走文本叶 1 行 → `para_line`；
-/// - 代码：`(行数+2) × code_line`（与 legacy 公式本来就一致）；
-/// - 表格：`(1+n)×row_h + n + 2 + TABLE_SCROLLBAR_RESERVE_PX`（`row_h = para_line+12`）；
-/// - 独立图片：`IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + 题注折行×para_line`；
-/// - 标题/文本：`lh × 折行段数(+标题 pad 8)`，折行用 `est_wrap_len` 估算（窗口模式
-///   只有元数据，无法精确 shape）。
-///
-/// **P3 前置后本函数退居「无整形上下文时的回退档」**：render 期 `height_exact_ctx` 在场时，
-/// 高度模型（`rebuild_height_model` / `estimated_avg_row_height` 的 unified 分支）改为逐块
-/// 喂真实 `DocRow` 给 `shape_docrow_shard` 取精确高（≤ `HEIGHT_EXACT_SHAPE_MAX` 全量精确，
-/// 超出抽样取抽中块真实 shard 高）——`est_wrap_len` 的折行估算误差被消除（R1）。
-fn unified_index_block_height(b: &BlockMeta, p: &StyleParams, avail: f32) -> f32 {
-    match b.kind {
-        RowKind::Blank | RowKind::Rule => p.para_line.as_f32(),
-        RowKind::Code => (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32(),
-        RowKind::Table => {
-            let row_h = p.para_line.as_f32() + 12.0;
-            (1.0 + b.aux as f32) * row_h + b.aux as f32 + 2.0 + TABLE_SCROLLBAR_RESERVE_PX
-        }
-        RowKind::Image => {
-            let cap_lines =
-                est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
-            IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + cap_lines * p.para_line.as_f32()
-        }
-        RowKind::Heading(hh) => {
-            let (fs, lh) = p.heading_metrics(hh);
-            est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
-        }
-        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
-            let lines = est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
-            lines * p.para_line.as_f32()
-        }
-    }
-}
-
-/// `unified` 后端的小文档逐行高度估算（行源 = 共享 `DocRow`，折行用 `est_wrap_lines`）。
-/// 与 `unified_index_block_height` 同口径（shard 公式族），文本折行更精确。
-fn unified_row_height(dr: &DocRow, p: &StyleParams, avail: f32) -> f32 {
-    match dr.kind {
-        IrKind::Blank | IrKind::Rule => p.para_line.as_f32(),
-        IrKind::Code => {
-            let n = match &dr.payload {
-                DocPayload::Code { code_lines, .. } => code_lines.len(),
-                _ => 0,
-            };
-            (n.max(1) as f32 + 2.0) * p.code_line.as_f32()
-        }
-        IrKind::Table => {
-            let row_h = p.para_line.as_f32() + 12.0;
-            let n = match &dr.payload {
-                DocPayload::Table(t) => t.rows.len() as f32,
-                _ => 0.0,
-            };
-            (1.0 + n) * row_h + n + 2.0 + TABLE_SCROLLBAR_RESERVE_PX
-        }
-        IrKind::Image => {
-            let cap_lines =
-                est_wrap_lines(dr.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
-            IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + cap_lines * p.para_line.as_f32()
-        }
-        IrKind::Heading(hh) => {
-            let (fs, lh) = p.heading_metrics(hh);
-            est_wrap_lines(dr.text.as_ref(), avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
-        }
-        IrKind::Paragraph | IrKind::Quote | IrKind::Bullet => {
-            let lines =
-                est_wrap_lines(dr.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
-            lines * p.para_line.as_f32()
-        }
-    }
-}
-
-/// 估算法：按字符宽（CJK/全角 ≈ font_size，其余 ≈ 0.55 × font_size）累计文本宽度，
-/// 折出在可用宽度 `avail` 下的行数。用于「平均行高」估算，非精确排版。
-fn est_wrap_lines(text: &str, avail: f32, font_size: f32) -> usize {
-    if text.is_empty() {
-        return 1;
-    }
-    let mut w = 0.0f32;
-    for ch in text.chars() {
-        let c = ch as u32;
-        let cw = if (0x2E80..=0x9FFF).contains(&c) || (0xFF00..=0xFFEF).contains(&c) {
-            font_size
-        } else {
-            font_size * 0.55
-        };
-        w += cw;
-    }
-    (w / avail).ceil() as usize
-}
-
-/// 按「字节长度」估算折行数（窗口模式用：块索引不含清理后文本）。
-/// 以 0.55em/字节 的保守平均宽折算（CJK 每字节的实际宽/3 更小），避免严重低估。
-fn est_wrap_len(bytes: usize, avail: f32, font_size: f32) -> usize {
-    if bytes == 0 {
-        return 1;
-    }
-    let w = bytes as f32 * font_size * 0.55;
-    ((w / avail).ceil() as usize).max(1)
-}
-
-/// **unified 后端内容可用宽（px）**：与渲染元素树完全同源——宿主阅读栏列宽
+/// **unified 内容可用宽（px）**：与渲染元素树完全同源——宿主阅读栏列宽
 /// `min(72ch, pane)` − 宿主侧边 gap×2 − 行内边距×2（`md-list-wrap` 的
 /// `PREVIEW_SIDE_GAP_PX` 内衬 + 行级 `CONTENT_EDGE_PAD_X_PX` 内衬）。
 ///
@@ -2646,29 +2398,28 @@ impl Render for MarkdownPreview {
                 window.bounds().size.width.as_f32() * 0.5
             }
         };
-        // 窗口模式：刷新统一行高/窗口模型量程 + 预物化可见窗口（构造 list 闭包前，
-        // 闭包内只读窗口数据，避免在元素构造期改 `self`）。
-        // unified 后端：从本帧 `Window` 抓取整形上下文（字体系统 + 主题），供精确量程
-        // （`rebuild_height_model`/`estimated_avg_row_height` 逐块喂真实 `DocRow`）使用；
-        // legacy 清空——且每帧覆盖，渲染路径不缓存旧宽/旧字号的主题。
-        if preview_backend() == PreviewBackend::Unified {
-            let ts_style = window.text_style();
-            // 注意：正文整形字号必须用 `p.para_size`（预览行 div `.text_size(para_size)`
-            // 的实际渲染字号），**不能用** `window.text_style().font_size`——后者是宿主/测试
-            // 默认字号（测试窗 =16），与渲染（14）不一致会让统一量程在错误的字原上整形、
-            // 量程 ≠ 实测（R2）。`WyTheme::from_style` 只取 `.font()`（字体族）与给定字号。
-            let theme = WyTheme::from_style(&p, ts_style.font(), p.para_size);
-            self.height_exact_ctx = Some((window.text_system().clone(), theme));
-        } else {
-            self.height_exact_ctx = None;
-        }
+        // P3-1b-2 起单一实现（unified）：恒从本帧 `Window` 抓取整形上下文（字体系统 +
+        // 主题），供精确量程（`rebuild_height_model`/`estimated_avg_row_height` 逐块喂
+        // 真实 `DocRow`）与渲染几何共用；每帧覆盖，渲染路径不缓存旧宽/旧字号的主题。
+        // 注意：正文整形字号必须用 `p.para_size`（预览行 div `.text_size(para_size)`
+        // 的实际渲染字号），**不能用** `window.text_style().font_size`——后者是宿主/测试
+        // 默认字号（测试窗 =16），与渲染（14）不一致会让统一量程在错误的字原上整形、
+        // 量程 ≠ 实测（R2）。`WyTheme::from_style` 只取 `.font()`（字体族）与给定字号。
+        let ts_style = window.text_style();
+        let theme = WyTheme::from_style(&p, ts_style.font(), p.para_size);
+        self.height_exact_ctx = Some((window.text_system().clone(), theme));
         self.prepare_render(&p, pane_w, cx);
-        // unified 渲染上下文：渲染闭包吃同一 `shape_docrow_shard`（与量程同 avail，
-        // R2）——`build_list_content` 据此切到 shard 几何输出（legacy 为 None 走元素树）。
-        let shard_ctx = self.height_exact_ctx.as_ref().map(|(ts, theme)| {
-            let avail = preview_text_avail(&p, pane_w);
-            (ts.clone(), theme.clone(), avail, pane_w)
-        });
+        // 渲染上下文：渲染闭包吃同一 `shape_docrow_shard`（与量程同 avail，R2）——
+        // `build_list_content` 据此输出 shard 几何（文本/代码 `render_row_shard`，
+        // 表格/图片沿旧内容路径 `render_table_row`/`render_image_row`）。
+        let shard_ctx = self
+            .height_exact_ctx
+            .as_ref()
+            .map(|(ts, theme)| {
+                let avail = preview_text_avail(&p, pane_w);
+                (ts.clone(), theme.clone(), avail, pane_w)
+            })
+            .expect("render 恒置 height_exact_ctx");
         let list_state = self.list_state.clone();
         // 居中阅读栏（页面恒换行，单一来源 `config::markdown::reading_col_px`）：
         // 列宽 = min(72ch, 视口宽)——窗口窄于 72ch 时退化为占满视口，不横向超界。
@@ -2729,23 +2480,23 @@ impl Render for MarkdownPreview {
 
 impl MarkdownPreview {
     /// 行数据源 List（窗口/全量两路）内容元素：按绝对块下标取行数据 → 搜索/选区/跳转
-    /// 加亮定位 → 交 `render_row`（legacy 元素树）或 `render_row_shard`（unified shard 几何，
-    /// 当 `shard_ctx` 在场时；`shard_ctx` 只会在 `preview_backend()==Unified` 时由 render 喂入）。
+    /// 加亮定位 → 交 `render_row_shard`（统一 shard 几何；P3-1b-2 已删 legacy `render_row`/
+    /// `TextTrack` 元素树路径——表格/图片由 `render_row_shard` 内部沿旧内容路径）。
     /// 行源只读快照在构造闭包前取好（元素构造期不改 `self`）。
     fn build_list_content(
         &mut self,
         p: Rc<StyleParams>,
         list_state: ListState,
-        shard_ctx: Option<(
+        shard_ctx: (
             std::sync::Arc<gpui::WindowTextSystem>,
             WyTheme,
             f32,
             f32,
-        )>,
+        ),
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
-        // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row。
+        // 在该行渲染文本里定位查询词的字节区间，连同主题感知背景色交给 render_row_shard。
         let search_highlight = self.compute_search_highlight(cx);
         let sel_color = selection_color(cx);
         let code_scroll = self.code_scroll.clone();
@@ -2815,14 +2566,10 @@ impl MarkdownPreview {
                 marker_hl,
                 row_ix: abs,
             };
-            // unified 后端：渲染几何切共享 `shape_docrow_shard`（与量程同真源，R2）；
-            // legacy 沿元素树（逐位一致）。
-            match &shard_ctx {
-                Some((ts, theme, avail, max_w)) => {
-                    render_row_shard(row, &rctx, cx, ts.as_ref(), theme, *avail, *max_w)
-                }
-                None => render_row(row, &rctx, cx),
-            }
+            // P3-1b-2 起单一渲染入口：渲染几何切共享 `shape_docrow_shard`（与量程同真源，
+            // R2）；表格/图片由 `render_row_shard` 内部沿旧内容路径。
+            let (ts, theme, avail, max_w) = &shard_ctx;
+            render_row_shard(row, &rctx, cx, ts.as_ref(), theme, *avail, *max_w)
         })
         .size_full()
         .into_any_element()

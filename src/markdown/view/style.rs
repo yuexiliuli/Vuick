@@ -36,8 +36,6 @@ pub(crate) struct StyleParams {
     pub(crate) para_gap: Pixels,
     pub(crate) code_size: Pixels,
     pub(crate) code_line: Pixels,
-    pub(crate) blank_h: Pixels,
-    pub(crate) rule_h: Pixels,
     /// 当前主题是否为暗色（预览与 WYSIWYG 各自派生语法色/代码底色时共用）。
     pub(crate) is_dark: bool,
 }
@@ -100,8 +98,6 @@ impl StyleParams {
             para_gap: px(6.),
             code_size: code,
             code_line,
-            blank_h: px(12.),
-            rule_h: px(18.),
             is_dark,
         }
     }

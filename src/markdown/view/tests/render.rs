@@ -57,10 +57,11 @@ fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
 
     let p = cx.update(|_w, cx| StyleParams::from_theme_with_font(cx, None));
     let rows = parse_to_rows(md_src);
-    let expected = p.para_line.as_f32() + p.para_gap.as_f32();
-    // 恒换行下文本行单行高 = 包裹盒的最小高度（`para_line + para_gap + 6` 兜底 + py_1
-    // 呼吸内衬），比旧非换行「单行裁剪」高约 6px；以首段为基准，逐行校验一致性——
-    // 既保留「第二个标题下的段落间距同样生效」的原回归语义，又不硬编码具体像素。
+    // P3-1b-2（默认翻转 unified）：文本行单行高 = 共享 shard 口径（每视觉行 = `para_line`，
+    // 无 legacy 的 `min_h(para_line+gap+6)` 兜底——legacy 该兜底已随 `render_wrapped_*`
+    // 删除）。以首段为基准，逐行校验一致性：既保留「第二个标题下的段落间距同样生效」
+    // 的原回归语义，又不硬编码具体像素。
+    let expected = p.para_line.as_f32();
     let ref_h: f32 = cx
         .update(|_, cx| {
             let m = host.read(cx).md.read(cx);
@@ -75,7 +76,10 @@ fn paragraph_gap_applies_after_every_heading(cx: &mut TestAppContext) {
                 .height
                 .as_f32()
         });
-    assert!(ref_h >= expected, "单行段落高不应低于单行基线（ref_h={ref_h:.1} >= {expected:.1}）");
+    assert!(
+        ref_h >= expected - 1.0,
+        "单行段落高不应低于单行基线（ref_h={ref_h:.1} >= {expected:.1}）"
+    );
 
     // 找出所有文本行（段落/列表/引述）在 rows 中的下标
     let mut checked = 0usize;

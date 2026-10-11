@@ -4,25 +4,22 @@
 // `use super::*` + `use gpui::{…, px, size, …}`，故 `MarkdownPreview`/`PreviewHost`/
 // `settle`/`parse_to_rows`/`RowKind`/`px`/`size` 直接可用，不重复 import 以免 E0252）。
 //
-// 断言口径（与 `layout` 模块文档一致；M5-B5 Phase 2 双模式）：
-// - **legacy（默认，现状逐位一致）**：`shared_shard_height_matches_preview_row` 走
-//   「高度带」断言——Code 行精确相等；文本行视觉行数一致、盒高落在
-//   `py + max(min_floor, n×[para_line, fs×1.9])` 带内。带能拦下折行数漂移并暴露真实
-//   行距系数差（**实测预览 gpui 自然行距 ≈1.79×fs**，shard 用 para_line = 1.45×fs；
-//   fs=14 时 25.10 vs 20.30）——这正是 Phase 2「单一 lyh」要消掉的口径差。
-// - **unified（开关 `set_preview_backend(PreviewBackend::Unified)`）**：预览文本行
-//   显式 `line_height` = 共享 para_line/heading_line、空行/分隔 = para_line，故
-//   `unified_shard_height_matches_preview_row` 断言**同一 lyh 下逐行一致**：
-//   Code/标题/空行/分隔精确相等；内容主导的段落/引述 `盒高 − py == shard 总高`。
-//   另：M5-B5 P3 前置「量程精确化」把量程从公式族升级为**真实 DocRow shard**：
+// 断言口径（与 `layout` 模块文档一致；**M5-B5 P3-1b-2 起默认翻转 unified、单一 shard
+// 真源，legacy 元素树/抽样量程已删除**）：
+// - `shared_shard_height_matches_preview_row`（默认 unified）：预览文本/代码/空行/
+//   分隔线实测行高 == Σ `shape_docrow_shard`（render_text_shard_rows 显式 `h = Σ shard.h`，
+//   逐行 tight 相等；R2 排布与量程同真源）。
+// - `unified_shard_height_matches_preview_row`：Code/标题/空行/分隔精确相等；
+//   内容主导的段落/引述 `盒高 − py == shard 总高`。
+//   另：量程精确化（R1，不再 `est_wrap_len` 估算）：
 //   - `unified_window_range_equals_docrow_shard_total`：窗口模式（≤ `HEIGHT_EXACT_SHAPE_MAX`
 //     块）量程 == Σ `shape_docrow_shard(真实 DocRow)`（R1，不再 `est_wrap_len` 估算）；
 //   - `unified_sampled_model_matches_sampled_docrow_shard`：超大文档抽样档的量程 ==
 //     「抽中块真实 shard × 组内块数」的自洽值，并报告对全量精确的相对误差；
 //   - `unified_small_doc_range_equals_docrow_shard_total`：小文档统一提示 == 逐行精确；
 //   - `unified_window_scroll_to_bottom_reaches_last_block`：滚到底达末块且末块内容可达。
-// - 已知系统性差（只留档、不断言相等）：Bullet 的 min_h 兜底、列表/引述 gutter 宽、
-//   图片题注模型、行内公式 splice（B 独有）——P3 对齐盒模型后复校。
+// - 已知系统性差（只留档、不断言相等）：列表/引述 gutter 宽、图片题注模型、行内公式
+//   splice（B 独有）——P3 对齐盒模型后复校。
 
 use crate::config::markdown::{CONTENT_EDGE_PAD_X_PX, PREVIEW_SIDE_GAP_PX};
 use crate::markdown::doc::Doc;
@@ -62,30 +59,10 @@ fn sample_src() -> &'static str {
 }
 
 /// 文本行对照（段落，无 gutter）：shard 折行行数 vs 预览盒高。
-/// - `h_preview`：预览 `bounds_for_item` 盒高（含垂直内衬 `py`、`min_h` 兜底）。
-/// - `n_visual`：`Σ shard.h/shard.lh` = shard 的视觉子行数（折行语义对拍）。
-/// - 预览每行实际行距 = gpui 自然行距 `natural`（实测 ≈1.8×fs），shard 用 `para_line`
-///   （1.45×fs）——两者行数一致，逐行行距系数不同（Phase 2 统一量程时以单一 lyh 消掉）。
-fn check_text_row(note: &str, h_preview: f32, n_visual: f32, p: &StyleParams, py: f32) {
-    let fs = p.para_size.as_f32();
-    let para = p.para_line.as_f32();
-    let min_floor = para + p.para_gap.as_f32() + 6.0;
-    // 预览每行 ∈ [para_line, fs×1.9]（gpui 自然行距实测 ≈1.8fs，留裕量）
-    // → 盒高 ∈ py + max(min_floor, n×[para_line, fs×1.9])。
-    let lo = py + min_floor.max(n_visual * para);
-    let hi = py + min_floor.max(n_visual * fs * 1.9);
-    assert!(
-        h_preview >= lo - 0.6,
-        "{note}: 预览盒高低于下界 h={h_preview:.2} lo={lo:.2}（shard 折行数过大？n={n_visual:.0}）"
-    );
-    assert!(
-        h_preview <= hi + 0.6,
-        "{note}: 预览盒高高于上界 h={h_preview:.2} hi={hi:.2}（shard 折行数过小？n={n_visual:.0}）"
-    );
-}
-
 /// 主对照测试：`shared_shard_height_matches_preview_row`。
-/// 断言 shard 高度累加与预览实测行高的关系（见模块注释口径）。
+/// P3-1b-2（默认翻转 unified）后断言 **逐行 `预览实测行高 == Σ shape_docrow_shard`**
+/// （文本/代码/空行/分隔线均由 `render_text_shard_rows`/`render_code_shard_rows` 以
+/// 显式 `h = Σ shard.h` 渲染 → tight 相等；legacy 自然行距带断言已删）。
 #[gpui::test]
 fn shared_shard_height_matches_preview_row(cx: &mut TestAppContext) {
     cx.update(crate::actions::bind_local_keymaps);
@@ -103,6 +80,14 @@ fn shared_shard_height_matches_preview_row(cx: &mut TestAppContext) {
     let width = 400f32;
     cx.simulate_resize(size(px(width), px(600.)));
     settle(cx);
+    // 追加收敛帧：unified 渲染的条目测量在换宽后多一帧落定（shard 固定高重测），
+    // 测试读取 `bounds_for_item` 前需等收敛（与其余 unified 对照测试同款）。
+    cx.update(|window, cx| {
+        for _ in 0..4 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
 
     let doc = Doc::open(src.into());
     let n = doc.block_count();
@@ -113,24 +98,9 @@ fn shared_shard_height_matches_preview_row(cx: &mut TestAppContext) {
         let p = StyleParams::from_theme_with_font(cx, None);
         let theme = WyTheme::from_style(&p, window.text_style().font(), p.para_size);
         let md = host.read(cx).md.read(cx);
-        // 垂直内衬 = 首个段落盒高 − min_h 兜底（空文本行仅为兜底+内衬）。
-        let min_floor = p.para_line.as_f32() + p.para_gap.as_f32() + 6.0;
-        let py = {
-            let ix = md
-                .rows
-                .iter()
-                .position(|r| r.docrow.kind == IrKind::Paragraph)
-                .expect("应有段落行");
-            let h = md
-                .list_state
-                .bounds_for_item(ix)
-                .map(|b| b.size.height.as_f32())
-                .unwrap_or(0.);
-            (h - min_floor).max(0.)
-        };
-    // 与预览同一内容宽度口径：宿主侧边 `PREVIEW_SIDE_GAP_PX`×2 + 行内左右边距×2。
-    let avail = width - 2.0 * PREVIEW_SIDE_GAP_PX - 2.0 * CONTENT_EDGE_PAD_X_PX;
-    let wts = window.text_system().clone();
+        // 与预览同一内容宽度口径：宿主侧边 `PREVIEW_SIDE_GAP_PX`×2 + 行内左右边距×2。
+        let avail = width - 2.0 * PREVIEW_SIDE_GAP_PX - 2.0 * CONTENT_EDGE_PAD_X_PX;
+        let wts = window.text_system().clone();
         let mut failures = Vec::new();
         let mut notes = Vec::new();
         for (ix, dr) in docrows.iter().enumerate() {
@@ -143,27 +113,12 @@ fn shared_shard_height_matches_preview_row(cx: &mut TestAppContext) {
             let sum: f32 = shards.iter().map(|s| s.h).sum();
             let n_visual: f32 = shards.iter().map(|s| s.h / s.lh).sum();
             let tag = format!("row[{ix}] kind={:?}", dr.kind);
-            if matches!(dr.kind, IrKind::Code) {
-                // 代码行：两引擎语义完全一致 → 精确相等。
-                if (sum - h_preview).abs() > 0.5 {
-                    failures.push(format!("{tag}: 代码行应精确相等 got={sum:.2} preview={h_preview:.2}"));
-                }
-            } else if matches!(dr.kind, IrKind::Paragraph) {
-                check_text_row(&tag, h_preview, n_visual, &p, py);
-                // 留档每行行距系数差：已能算出的预览自然行距 = (盒高−py)/n（仅 n≥2 时不受
-                // min_floor 遮蔽，准确），与 shard 的 para_line 对比。
-                if n_visual >= 2. {
-                    let natural = (h_preview - py) / n_visual;
-                    notes.push(format!(
-                        "{tag}: shard para_line={:.2} vs 预览 natural={natural:.2} (Δ/行 {:.2})",
-                        p.para_line.as_f32(),
-                        p.para_line.as_f32() - natural
-                    ));
-                }
-            } else {
-                // 其它行型（空行等）已知系统性差，仅记录不断言（见模块注释）。
-                notes.push(format!("{tag}: 留档 shard={sum:.2} preview={h_preview:.2}"));
+            if (sum - h_preview).abs() > 1.0 {
+                failures.push(format!(
+                    "{tag}: 预览实测行高应 == shard 总高 got={sum:.2} preview={h_preview:.2} (n_visual={n_visual:.0})"
+                ));
             }
+            notes.push(format!("{tag}: n_visual={n_visual:.0} shard={sum:.2} preview={h_preview:.2}"));
         }
         (failures, notes)
     });
@@ -614,9 +569,10 @@ fn unified_small_doc_range_equals_docrow_shard_total(cx: &mut TestAppContext) {
     // 换宽后平均行高重算有 120ms 节流（`HINT_REAPPLY_INTERVAL_MS`），测试瞬间跑完、
     // 第一次估算落在「换宽前」窄文档宽度上 → 强制一次确定性重算，让 `est_hint` 落在
     // 最终宽度（与下面的参考同口径），量程护栏与节流时序解耦。
+    // P3-1b-2 删 `invalidate_height_hint` 助手后直接失效标志位（同模块私有字段可达）。
     cx.update(|_, cx| {
         let md = host.read(cx).md.clone();
-        md.update(cx, |m, _| m.invalidate_height_hint());
+        md.update(cx, |m, _| m.est_hint_width = -1.0);
     });
     cx.update(|window, cx| {
         for _ in 0..3 {

@@ -245,8 +245,10 @@
             );
         }
 
-        // —— ② 对称性：标题与正文**左对齐基线一致**（同一起始 x），且正文右缘同样
-        //    满足右留白（标题不因字号而偏离正文的列内排版）。測量在 ① 末尾的窄窗态。 ——
+        // —— ② 对称性：标题与正文同列排版、正文右缘满足右留白。P3-1b-2（默认翻转
+        //    unified）起标题有共享 WYSIWYG 折叠箭头 gutter（`shard.x_off = HEADING_GUTTER_W`
+        //    =20），标题正文左缘 = 正文左缘 + gutter（不再二者同 x；右缘仍同列不越界）。
+        //    測量在 ① 末尾的窄窗态。 ——
         let pane_right = cx
             .debug_bounds("md-preview")
             .expect("md-preview 应渲染")
@@ -273,9 +275,11 @@
         });
         let (h_left, _h_right) = h_left.expect("应有标题行命中");
         let (p_left, p_right) = p_left.expect("应有正文行命中");
+        // 与 `markdown::layout::HEADING_GUTTER_W` 同源常量（=20，WYSIWYG 折叠箭头 gutter）。
+        let gutter: f32 = 20.0;
         assert!(
-            (h_left - p_left).abs() <= 1.0,
-            "标题与正文左对齐基线应一致：标题 left={h_left:.1} vs 正文 left={p_left:.1}"
+            (h_left - p_left - gutter).abs() <= 1.5,
+            "标题左缘应 = 正文左缘 + 标题 gutter({gutter:.0})：标题 left={h_left:.1} vs 正文 left={p_left:.1}"
         );
         assert!(
             p_right <= pane_right - side_gap + 1.5,
