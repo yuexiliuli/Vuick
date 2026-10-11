@@ -56,7 +56,8 @@ use crate::config::limits::{
     WINDOWED_OVERDRAW_FACTOR, WINDOWED_OVERDRAW_MAX,
 };
 use crate::config::markdown::{
-    CONTENT_EDGE_PAD_X_PX, IMAGE_ROW_DEFAULT_H, PREVIEW_SIDE_GAP_PX, ROW_OVERDRAW_PX,
+    CONTENT_EDGE_PAD_X_PX, IMAGE_CAPTION_GAP_PX, IMAGE_ROW_DEFAULT_H, PREVIEW_SIDE_GAP_PX,
+    ROW_OVERDRAW_PX, TABLE_SCROLLBAR_RESERVE_PX,
 };
 use crate::config::timing::HIGHLIGHT_MS;
 use crate::markdown::parse::{
@@ -1787,42 +1788,47 @@ impl MarkdownPreview {
                 }
                 let mut total = 0.0f32;
                 for r in self.rows.iter() {
-                    let h = match r.kind {
-                        RowKind::Blank => p.blank_h.as_f32(),
-                        RowKind::Rule => p.rule_h.as_f32(),
-                        RowKind::Code => {
-                            (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
-                        }
-                        RowKind::Table => {
-                            let row_h = p.para_size.as_f32() * 1.45 + 12.0;
-                            (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
-                                + 2.0
-                                + 8.0
-                        }
-                        RowKind::Image => IMAGE_ROW_DEFAULT_H,
-                        RowKind::Heading(n) => {
-                            let (fs, lh) = p.heading_metrics(n);
-                            if wrap {
-                                est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
-                                    * lh.as_f32()
-                                    + 8.0
-                            } else {
-                                lh.as_f32()
+                    // unified 后端：共享 shard 公式族（`unified_row_height`）。
+                    let h = if preview_backend() == PreviewBackend::Unified {
+                        unified_row_height(r, p, avail)
+                    } else {
+                        match r.kind {
+                            RowKind::Blank => p.blank_h.as_f32(),
+                            RowKind::Rule => p.rule_h.as_f32(),
+                            RowKind::Code => {
+                                (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32()
                             }
-                        }
-                        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
-                            if wrap {
-                                let lines = est_wrap_lines(
-                                    &r.text,
-                                    avail,
-                                    p.para_size.as_f32(),
-                                )
-                                .max(1) as f32;
-                                (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
-                                    + p.para_gap.as_f32()
+                            RowKind::Table => {
+                                let row_h = p.para_size.as_f32() * 1.45 + 12.0;
+                                (1.0 + r.table().map_or(0, |t| t.rows.len()) as f32) * row_h
+                                    + 2.0
                                     + 8.0
-                            } else {
-                                p.para_line.as_f32() + p.para_gap.as_f32()
+                            }
+                            RowKind::Image => IMAGE_ROW_DEFAULT_H,
+                            RowKind::Heading(n) => {
+                                let (fs, lh) = p.heading_metrics(n);
+                                if wrap {
+                                    est_wrap_lines(&r.text, avail, fs.as_f32()).max(1) as f32
+                                        * lh.as_f32()
+                                        + 8.0
+                                } else {
+                                    lh.as_f32()
+                                }
+                            }
+                            RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+                                if wrap {
+                                    let lines = est_wrap_lines(
+                                        &r.text,
+                                        avail,
+                                        p.para_size.as_f32(),
+                                    )
+                                    .max(1) as f32;
+                                    (lines * p.para_line.as_f32()).max(p.para_line.as_f32())
+                                        + p.para_gap.as_f32()
+                                        + 8.0
+                                } else {
+                                    p.para_line.as_f32() + p.para_gap.as_f32()
+                                }
                             }
                         }
                     };
@@ -1961,7 +1967,11 @@ fn build_code_highlights_for(rows: &[Row]) -> std::collections::HashMap<usize, R
 
 /// 单一「块元数据」的平均高度估算（窗口模式：只靠元数据，不物化 Row）。
 /// 与 [`MarkdownPreview::estimated_avg_row_height`] 里 rows 全量路径的公式一一对应。
+/// `unified` 后端走共享 shard 公式族（见 [`unified_index_block_height`]）。
 fn index_block_height(b: &BlockMeta, p: &StyleParams, wrap: bool, avail: f32) -> f32 {
+    if preview_backend() == PreviewBackend::Unified {
+        return unified_index_block_height(b, p, avail);
+    }
     match b.kind {
         RowKind::Blank => p.blank_h.as_f32(),
         RowKind::Rule => p.rule_h.as_f32(),
@@ -1989,6 +1999,66 @@ fn index_block_height(b: &BlockMeta, p: &StyleParams, wrap: bool, avail: f32) ->
             } else {
                 p.para_line.as_f32() + p.para_gap.as_f32()
             }
+        }
+    }
+}
+
+/// `unified` 后端的块高（px）：**共享 shard 口径**（`markdown::layout` 公式族，
+/// 同常量同语义；页恒换行，`wrap` 恒为 true）。块高即 shard 高度累加：
+/// - 空行/分隔线：shard 走文本叶 1 行 → `para_line`；
+/// - 代码：`(行数+2) × code_line`（与 legacy 公式本来就一致）；
+/// - 表格：`(1+n)×row_h + n + 2 + TABLE_SCROLLBAR_RESERVE_PX`（`row_h = para_line+12`）；
+/// - 独立图片：`IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + 题注折行×para_line`；
+/// - 标题/文本：`lh × 折行段数(+标题 pad 8)`，折行用 `est_wrap_len` 估算（窗口模式
+///   只有元数据，无法精确 shape；小文档路径由 ListState 实测校正）。
+fn unified_index_block_height(b: &BlockMeta, p: &StyleParams, avail: f32) -> f32 {
+    match b.kind {
+        RowKind::Blank | RowKind::Rule => p.para_line.as_f32(),
+        RowKind::Code => (b.aux.max(1) as f32 + 2.0) * p.code_line.as_f32(),
+        RowKind::Table => {
+            let row_h = p.para_line.as_f32() + 12.0;
+            (1.0 + b.aux as f32) * row_h + b.aux as f32 + 2.0 + TABLE_SCROLLBAR_RESERVE_PX
+        }
+        RowKind::Image => {
+            let cap_lines =
+                est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
+            IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + cap_lines * p.para_line.as_f32()
+        }
+        RowKind::Heading(hh) => {
+            let (fs, lh) = p.heading_metrics(hh);
+            est_wrap_len(b.raw_len as usize, avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
+        }
+        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+            let lines = est_wrap_len(b.raw_len as usize, avail, p.para_size.as_f32()).max(1) as f32;
+            lines * p.para_line.as_f32()
+        }
+    }
+}
+
+/// `unified` 后端的小文档逐行高度估算（已物化 `Row`，折行用 `est_wrap_lines`）。
+/// 与 `unified_index_block_height` 同口径（shard 公式族），文本折行更精确。
+fn unified_row_height(r: &Row, p: &StyleParams, avail: f32) -> f32 {
+    match r.kind {
+        RowKind::Blank | RowKind::Rule => p.para_line.as_f32(),
+        RowKind::Code => (r.code_lines().len().max(1) as f32 + 2.0) * p.code_line.as_f32(),
+        RowKind::Table => {
+            let row_h = p.para_line.as_f32() + 12.0;
+            let n = r.table().map_or(0, |t| t.rows.len()) as f32;
+            (1.0 + n) * row_h + n + 2.0 + TABLE_SCROLLBAR_RESERVE_PX
+        }
+        RowKind::Image => {
+            let cap_lines =
+                est_wrap_lines(r.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
+            IMAGE_ROW_DEFAULT_H + IMAGE_CAPTION_GAP_PX + cap_lines * p.para_line.as_f32()
+        }
+        RowKind::Heading(hh) => {
+            let (fs, lh) = p.heading_metrics(hh);
+            est_wrap_lines(r.text.as_ref(), avail, fs.as_f32()).max(1) as f32 * lh.as_f32() + 8.0
+        }
+        RowKind::Paragraph | RowKind::Quote | RowKind::Bullet => {
+            let lines =
+                est_wrap_lines(r.text.as_ref(), avail, p.para_size.as_f32()).max(1) as f32;
+            lines * p.para_line.as_f32()
         }
     }
 }
