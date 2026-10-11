@@ -20,9 +20,11 @@ use crate::config::markdown::{
 };
 use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
+use crate::markdown::layout::{shape_docrow_shard, Shard};
 use crate::markdown::parse::{Row, RowAlign, RunKind};
 use crate::markdown::view::style::StyleParams;
 use crate::markdown::view::table::render_table;
+use crate::markdown::wysiwyg::WyTheme;
 use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns};
 
 use super::{NoteCtx, NoteHit, TextCtx, TextHit};
@@ -456,6 +458,7 @@ fn text_child(
         code_bg_color: p.code_inline_bg,
         text: text.clone(),
         row_ix,
+        hit_sub: 0,
         notes: notes.to_vec(),
         note_defs: note_defs.to_vec(),
         note_ctx: (!notes.is_empty() || !note_defs.is_empty()).then(|| note_ctx.clone()),
@@ -483,6 +486,9 @@ struct TextTrack {
     text: gpui::SharedString,
     /// 全局块下标（共享命中表的行标识；同帧同行使旧条目失效）。
     row_ix: usize,
+    /// 行内子条带序号：legacy 恒 0（整行一个布局）；unified 分支用
+    /// [`ShardStrip`]（独立元素）不再走本结构。P3-1b-2 删除点：本字段随 TextTrack 删除。
+    hit_sub: usize,
     /// 文内引用标记 `[^n]` 的（字节区间, 注记号），区间相对 `text`。
     notes: Vec<(Range<usize>, usize)>,
     /// 末尾定义标记 `[!n]` 的（字节区间, 注记号），区间相对 `text`。
@@ -496,6 +502,7 @@ struct TextTrack {
 impl TextTrack {
     /// 把每个注记标记（`[^n]` / `[!n]`）的窗口坐标矩形写入共享命中表
     /// （同帧同行使旧条目失效）。命中框上下左右各放大 1px，方便鼠标悬停/点击。
+    /// 与 unified [`ShardStrip`] 共用 [`record_note_hit_rects`]（legacy 恒 `hit_sub=0`）。
     fn record_note_hits(
         &self,
         origin: gpui::Point<Pixels>,
@@ -505,39 +512,16 @@ impl TextTrack {
         let Some(ctx) = self.note_ctx.as_ref() else {
             return;
         };
-        let mut hits = ctx.hits.borrow_mut();
-        hits.retain(|h| h.row_ix != self.row_ix);
-        let mut push_hit = |range: &Range<usize>, n: usize, is_def: bool| {
-            let (Some(p0), Some(p1)) = (
-                layout.position_for_index(range.start, line_h),
-                layout.position_for_index(range.end, line_h),
-            ) else {
-                return;
-            };
-            // 标记通常单行；跨行取整段包围盒。
-            let x0 = p0.x.as_f32().min(p1.x.as_f32());
-            let y0 = p0.y.as_f32().min(p1.y.as_f32());
-            let x1 = p0.x.as_f32().max(p1.x.as_f32());
-            let y1 = (p1.y.as_f32() + line_h.as_f32()).max(p0.y.as_f32() + line_h.as_f32());
-            hits.push(NoteHit {
-                row_ix: self.row_ix,
-                n,
-                is_def,
-                bounds: Bounds {
-                    origin: point(
-                        px(origin.x.as_f32() + x0 - 1.0),
-                        px(origin.y.as_f32() + y0 - 1.0),
-                    ),
-                    size: gpui::size(px(x1 - x0 + 2.0), px(y1 - y0 + 2.0)),
-                },
-            });
-        };
-        for (range, n) in &self.notes {
-            push_hit(range, *n, false);
-        }
-        for (range, n) in &self.note_defs {
-            push_hit(range, *n, true);
-        }
+        record_note_hit_rects(
+            &mut ctx.hits.borrow_mut(),
+            self.row_ix,
+            self.hit_sub,
+            origin,
+            line_h,
+            layout,
+            &self.notes,
+            &self.note_defs,
+        );
     }
 
     /// 行内代码圆角灰底：把 `code_bg`（已扩展空白）区间按折行切成多段矩形并 paint，
@@ -677,6 +661,7 @@ impl Element for TextTrack {
                 text: self.text.clone(),
                 layout: layout.clone(),
                 origin: bounds.origin,
+                byte_offset: 0,
             });
         }
         // 2) 记录注记命中矩形（EPUB 悬浮卡片）。
@@ -698,6 +683,612 @@ impl Element for TextTrack {
             cx,
         );
     }
+}
+
+// =============================================================================
+// M5-B5 P3-1b-1：unified 后端——渲染几何切共享 `shape_docrow_shard` 输出。
+// 文本类行的排布不再由 gpui 元素树隐式排版，而是把 layout 的 `Shard` 序列逐一落元素：
+// 每个 strip 的 h/x_off 直接取 `shard.h/x_off`；折行点在 `render_text_shard_rows` 里以
+// 与 shard **同宽同 `ts.shape_text`** 的 StyledText 复现（`avail − gutter` 同一语义）。
+// `量程（P3-0 = Σ shard）` 与渲染同真源（R2）：两者吃同一 `avail`（`preview_text_avail`）。
+//
+// **legacy 保底**：默认后端走 row.rs 既有元素树（含 `TextTrack`），逐位一致、全绿名单
+// 不动；只有 `set_preview_backend(Unified)` 才进本路径。
+// **TextTrack 解耦（P3-1b-2 删除点）**：unified 分支用本节的 [`ShardStrip`]（分片级命中/
+// 注记/行内代码底），不再经过 `TextTrack`；`render_row`/`TextTrack` 只是 legacy 的剩余
+// 依赖，待 legacy 关闭后整体删除（见 `render_wrapped_*`/`text_child` 的 TODO 标注）。
+// =============================================================================
+
+/// 把注记标记的窗口矩形写入共享命中表（`legacy TextTrack` 与 `unified ShardStrip` 共用）。
+/// 分片键 = `(row_ix, hit_sub)`：legacy 恒 `hit_sub=0`（整行一个布局）；unified 按 shard
+/// 分片各自登记，同行多片互不清除（跨折行的标记每片记一段，悬浮/跳转都能命中）。
+#[allow(clippy::too_many_arguments)] // 纯函数矩形登记：输入互为正交
+fn record_note_hit_rects(
+    hits: &mut Vec<NoteHit>,
+    row_ix: usize,
+    hit_sub: usize,
+    origin: gpui::Point<Pixels>,
+    line_h: Pixels,
+    layout: &WrappedLineLayout,
+    notes: &[(Range<usize>, usize)],
+    note_defs: &[(Range<usize>, usize)],
+) {
+    hits.retain(|h| h.row_ix != row_ix || h.hit_sub != hit_sub);
+    let mut push_hit = |range: &Range<usize>, n: usize, is_def: bool| {
+        let (Some(p0), Some(p1)) = (
+            layout.position_for_index(range.start, line_h),
+            layout.position_for_index(range.end, line_h),
+        ) else {
+            return;
+        };
+        let x0 = p0.x.as_f32().min(p1.x.as_f32());
+        let y0 = p0.y.as_f32().min(p1.y.as_f32());
+        let x1 = p0.x.as_f32().max(p1.x.as_f32());
+        let y1 = (p1.y.as_f32() + line_h.as_f32()).max(p0.y.as_f32() + line_h.as_f32());
+        hits.push(NoteHit {
+            row_ix,
+            n,
+            is_def,
+            hit_sub,
+            bounds: Bounds {
+                origin: point(px(origin.x.as_f32() + x0 - 1.0), px(origin.y.as_f32() + y0 - 1.0)),
+                size: gpui::size(px(x1 - x0 + 2.0), px(y1 - y0 + 2.0)),
+            },
+        });
+    };
+    for (range, n) in notes {
+        push_hit(range, *n, false);
+    }
+    for (range, n) in note_defs {
+        push_hit(range, *n, true);
+    }
+}
+
+/// 行内代码圆角灰底（`TextTrack` 与 `ShardStrip` 共用）：把 `code_bg`（已扩展空白）
+/// 区间按折行切成多段矩形并 paint，与 `st` 的同一 layout 对齐。空区间不做事。
+fn paint_code_ranges_over(
+    st: &StyledText,
+    code_bg: &[Range<usize>],
+    bounds: Bounds<Pixels>,
+    color: Hsla,
+    radius: Pixels,
+    window: &mut Window,
+) {
+    if code_bg.is_empty() {
+        return;
+    }
+    let layout = st.layout();
+    let line_height = layout.line_height();
+    let layouts = layout.line_layouts();
+    let Some(single) = layouts.first() else {
+        return;
+    };
+    let line_h = line_height.as_f32();
+    let text_origin = bounds.origin;
+    for range in code_bg {
+        let Some(p0) = single.position_for_index(range.start, line_height) else {
+            continue;
+        };
+        let Some(p1) = single.position_for_index(range.end, line_height) else {
+            continue;
+        };
+        let y0 = (p0.y.as_f32() / line_h).floor() as usize;
+        let y1 = (p1.y.as_f32() / line_h).floor() as usize;
+        if y0 == y1 {
+            let b = Bounds {
+                origin: point(
+                    px(text_origin.x.as_f32() + p0.x.as_f32()),
+                    px(text_origin.y.as_f32() + p0.y.as_f32()),
+                ),
+                size: gpui::size(px((p1.x.as_f32() - p0.x.as_f32()).max(0.0)), px(line_h)),
+            };
+            window.paint_quad(fill(b, color).corner_radii(Corners::all(radius)));
+        } else {
+            let line_origin_x = text_origin.x.as_f32();
+            let origin_y = text_origin.y.as_f32();
+            for real_ri in y0..=y1 {
+                let (rx0, rx1) = if real_ri == y0 {
+                    (p0.x.as_f32(), single.width().as_f32())
+                } else if real_ri == y1 {
+                    (0.0, p1.x.as_f32())
+                } else {
+                    (0.0, single.width().as_f32())
+                };
+                let b = Bounds {
+                    origin: point(px(line_origin_x + rx0), px(origin_y + real_ri as f32 * line_h)),
+                    size: gpui::size(px((rx1 - rx0).max(0.0)), px(line_h)),
+                };
+                window.paint_quad(fill(b, color).corner_radii(Corners::all(radius)));
+            }
+        }
+    }
+}
+
+/// unified 单个 shard 条带的文本元素：一条**已按 shard 折行语义预整形的文本**（一行硬行、
+/// 内部可多可视行）。paint 期完成 legacy `TextTrack` 的三件副作用、但语义是**分片级**：
+/// - 文本命中（`TextCtx`）→ `TextHit.byte_offset`（= `shard.byte_map.start`，字节抬到整行）；
+/// - 注记命中（`NoteCtx`）→ 区间 clip 到本条带、`hit_sub` 区分同行多片；
+/// - 行内代码圆角底（`code_bg` = `shard.code_ranges`）。
+///
+/// **P3-1b-2 删除点**：unified 下 `TextTrack` 不再必要（选中/悬浮/行内代码底全由本元素
+/// + `render_text_shard_rows` 承接），届时删 `TextTrack` 并保留本元素。
+struct ShardStrip {
+    /// 文本载体（一条 shard 文本；命中用其 `layout().index_for_position`）。
+    st: StyledText,
+    /// 行内代码（反引号）区间（已扩展空白，相对本条带文本），画圆角底用。
+    code_bg: Vec<Range<usize>>,
+    /// 代码底颜色 / 圆角半径。
+    code_bg_color: Hsla,
+    code_radius: Pixels,
+    /// 显示文本（整行 docrow.text 的片段；命中后取文本长度钳制字节偏移）。
+    text: gpui::SharedString,
+    /// 本条带文本在整行 docrow.text 中的起始字节偏移（`shard.byte_map.start`）。
+    byte_offset: usize,
+    /// 全局块下标（共享命中表的行标识；同行多片以 `hit_sub` 区分）。
+    row_ix: usize,
+    /// 行内子条带序号（`shard.line_ix`）。
+    hit_sub: usize,
+    /// 注记区间（已 clip 到本条带、相对本条带文本）。
+    notes: Vec<(Range<usize>, usize)>,
+    note_defs: Vec<(Range<usize>, usize)>,
+    /// 注记共享表（存在标记时记录）。
+    note_ctx: Option<Rc<NoteCtx>>,
+    /// 文本命中共享表（恒有）。
+    text_ctx: Rc<TextCtx>,
+}
+
+impl IntoElement for ShardStrip {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for ShardStrip {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let (lid, ()) = self.st.request_layout(id, inspector_id, window, cx);
+        (lid, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        self.st
+            .prepaint(id, inspector_id, bounds, request_layout, window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint_state: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if !crate::markdown::wysiwyg::warm_emoji_is_done() {
+            crate::markdown::wysiwyg::warm_emoji_rasterizer(window, "preview-shard");
+        }
+        // 1) 记录文本命中（本片一条：只清本片旧条目，同行其它片保留）。
+        let layout = self.st.layout();
+        {
+            let mut hits = self.text_ctx.hits.borrow_mut();
+            hits.retain(|h| h.row_ix != self.row_ix || h.byte_offset != self.byte_offset);
+            hits.push(TextHit {
+                row_ix: self.row_ix,
+                text: self.text.clone(),
+                layout: layout.clone(),
+                origin: bounds.origin,
+                byte_offset: self.byte_offset,
+            });
+        }
+        // 2) 记录注记命中（分片级矩形；`hit_sub` 区分同行多片）。
+        let origin = bounds.origin;
+        let line_h = layout.line_height();
+        if let (Some(note_ctx), Some(single)) =
+            (self.note_ctx.as_ref(), layout.line_layouts().first())
+        {
+            record_note_hit_rects(
+                &mut note_ctx.hits.borrow_mut(),
+                self.row_ix,
+                self.hit_sub,
+                origin,
+                line_h,
+                single,
+                &self.notes,
+                &self.note_defs,
+            );
+        }
+        // 3) 行内代码圆角灰底（与 st 同一 layout，先画底）。
+        paint_code_ranges_over(&self.st, &self.code_bg, bounds, self.code_bg_color, self.code_radius, window);
+        // 4) 委托绘制文字。
+        self.st.paint(
+            id,
+            inspector_id,
+            bounds,
+            request_layout,
+            prepaint_state,
+            window,
+            cx,
+        );
+    }
+}
+
+/// 代码块外框（首/末空白带 + 代码行 + 块内横向滚动容器）。几何 = `block_h`（px）整块
+/// 固定高；`lines` 为代码源码行（首/末空白带由 [`code_block_bands`] 自行补齐）。
+/// legacy 与 unified 共用同一外壳——差异仅在行源/块高来源（legacy：`code_lines()` +
+/// 公式；unified：shard 行文本 + `Σ shard.h`），几何完全一致。
+fn code_block_element(
+    lines: &[gpui::SharedString],
+    block_h: f32,
+    code_handle: Option<ScrollHandle>,
+    code_runs: Option<&CodeLineRuns>,
+    p: &Rc<StyleParams>,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let p_ = p.clone();
+    let runs = code_runs;
+    let h = code_handle.unwrap_or_default();
+    let column = div()
+        .debug_selector(|| "md-code-row".into())
+        .flex()
+        .flex_col()
+        .flex_shrink_0()
+        .min_w_full()
+        .children(code_block_bands(lines, runs, dark, &p_));
+    div()
+        .debug_selector(|| "md-code-hscroll".into())
+        .h(px(block_h))
+        .w_full()
+        .flex_shrink_0()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
+        .child(
+            div()
+                .debug_selector(|| "md-code-hscroll-inner".into())
+                .w_full()
+                .h_full()
+                .relative()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("md-code-scroll")
+                        .w_full()
+                        .h_full()
+                        .flex()
+                        .flex_row()
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&h)
+                        .child(column),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "md-code-scrollbar".into())
+                        .absolute()
+                        .inset_0()
+                        .child(
+                            Scrollbar::horizontal(&h)
+                                .mode(ScrollbarMode::Always)
+                                .viewport_from_layout(),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
+/// **unified 后端入口**：渲染几何切共享 `shape_docrow_shard` 输出的 [`Shard`]。
+///
+/// - 文本类行（Paragraph/Heading/Quote/Bullet/Blank/Rule）：每个 shard 按其
+///   `h/x_off/lh/runs/code_ranges` 落一个 strip（折行点、行高、代码圆角底、空白/分隔
+///   行高全部与 shard 一致——渲染与量程同真源，R2 落地）。
+/// - 代码：每个源码行 = 一个 shard（nowrap），首/末空白带 + 块高 `Σ shard.h`。
+/// - **表格/图片保留元素树路径**：`layout` 的 `table_shard`/`image_shards` 只是**高度
+///   占位**（table 无单元格内容、image 只有占位盒 + 题注），无可渲染内容 → 沿旧
+///   `render_table_row`/`render_image_row`（P3-1b-2 再接 shard 承载表/图内容）。
+/// - `align`（EPUB `%%ALIGN:X%%` 排版）unified 不应用：EPUB 恒走 legacy（见调用方）。
+#[allow(clippy::too_many_arguments)] // 统一入口：行渲染上下文 + 共享整形上下文
+pub(crate) fn render_row_shard(
+    row: &PreviewRow,
+    ctx: &RowRenderCtx,
+    cx: &mut App,
+    ts: &gpui::WindowTextSystem,
+    theme: &WyTheme,
+    avail: f32,
+    max_w: f32,
+) -> gpui::AnyElement {
+    let RowRenderCtx { p, table_handle, .. } = ctx;
+    if let IrKind::Table = row.kind() {
+        return render_table_row(row, p, table_handle.clone());
+    }
+    if let IrKind::Image = row.kind() {
+        return render_image_row(row, p);
+    }
+    let shards = shape_docrow_shard(ts, &row.docrow, theme, avail, max_w);
+    if let IrKind::Code = row.kind() {
+        return render_code_shard_rows(ctx, cx, &shards);
+    }
+    render_text_shard_rows(row, ctx, cx, &shards)
+}
+
+/// unified 代码块：shard 行文本即源码行（首/末空白带文本为空，过滤掉）；块高 = Σ shard.h。
+fn render_code_shard_rows(ctx: &RowRenderCtx, cx: &mut App, shards: &[Shard]) -> gpui::AnyElement {
+    let lines: Vec<gpui::SharedString> = shards
+        .iter()
+        .filter(|s| !s.text.is_empty())
+        .map(|s| s.text.clone())
+        .collect();
+    let block_h: f32 = shards.iter().map(|s| s.h).sum();
+    code_block_element(&lines, block_h, ctx.code_handle.clone(), ctx.code_hl.as_deref(), ctx.p, cx)
+}
+
+/// unified 文本类行（除分隔线/空行外每条 = 一个 shard strip）。每个 strip 高 = `shard.h`、
+/// 文本左缘 = 行内边距 + `shard.x_off`、行高 = `shard.lh`，折行以与 shard **同宽**
+/// （`avail − 本行 gutter`）的 StyledText 复现 → 折行点/行高与 shard 逐位一致。
+///
+/// 展示附加照常叠加：行内样式/搜索/选区/注记色/跳转加亮按字节 clip 到本 shard；列表项
+/// 前缀以 `shard.x_off` 宽的固定槽画在首片左侧（`shard` 只载正文，前缀属展示层）。
+fn render_text_shard_rows(
+    row: &PreviewRow,
+    ctx: &RowRenderCtx,
+    cx: &mut App,
+    shards: &[Shard],
+) -> gpui::AnyElement {
+    let RowRenderCtx {
+        p,
+        search,
+        selection,
+        marker_hl,
+        row_ix,
+        text_ctx,
+        note_ctx,
+        ..
+    } = ctx;
+    let p: &Rc<StyleParams> = p;
+    let search: Option<(Range<usize>, Hsla)> = search.clone();
+    let selection: Option<(Range<usize>, Hsla)> = selection.clone();
+    let text_ctx: &Rc<TextCtx> = text_ctx;
+    let note_ctx: &Rc<NoteCtx> = note_ctx;
+    let row_ix: usize = *row_ix;
+    let kind = row.kind();
+    let dark = crate::ui::theme::Theme::global(cx).is_dark();
+    let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
+    // 行级基础样式（与 legacy 各 render_wrapped_* 同源）。
+    let (fs, color, weight) = match kind {
+        IrKind::Heading(n) => {
+            let (fs, _) = p.heading_metrics(n);
+            (fs, p.fg, gpui::FontWeight::BOLD)
+        }
+        IrKind::Quote => (p.para_size, p.muted_fg, gpui::FontWeight::default()),
+        _ => (p.para_size, p.fg, gpui::FontWeight::default()),
+    };
+    let bullet = kind == IrKind::Bullet;
+    let link_color: Hsla = p.accent;
+    // 显式整块高 = Σ shard.h：列表以 MinContent 高度测量条目，flex 列若只靠子条带
+    // 的 `.h()`（子项 min-content 会塌缩到首行文本高）会被量成首行高 → 显式钉死
+    // 条目高，保证 `bounds_for_item`（量程的构成）== shard 总高（R2）。
+    let sum: f32 = shards.iter().map(|s| s.h).sum();
+    let mut col = div()
+        .h(px(sum))
+        .w_full()
+        .flex_shrink_0()
+        .px(px(CONTENT_EDGE_PAD_X_PX))
+        .flex()
+        .flex_col();
+
+    for (k, sh) in shards.iter().enumerate() {
+        // 分隔线：shard 几何 = 1 条 para_line 高条带；画 1px 分隔线（display 层，非几何）。
+        if kind == IrKind::Rule {
+            let sel = format!("md-shard-{row_ix}-{k}");
+            col = col.child(
+                div()
+                    .debug_selector(move || sel)
+                    .h(px(sh.h))
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full()),
+            );
+            continue;
+        }
+        // 空条带（空行等）：仅高度 = shard.h。
+        if sh.text.is_empty() {
+            let sel = format!("md-shard-{row_ix}-{k}");
+            col = col.child(
+                div().debug_selector(move || sel).h(px(sh.h)).w_full().flex_shrink_0(),
+            );
+            continue;
+        }
+        // —— 有文本：按 shard 区间裁剪行级附加 → 构造本片 StyledText ——
+        let seg = &sh.byte_map;
+        let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+        let mut mono: Vec<(Range<usize>, gpui::SharedString)> = Vec::new();
+        for (range, rk) in &sh.runs {
+            match rk {
+                RunKind::InlineCode => {
+                    highlights.push((range.clone(), inline_code_highlight(p)));
+                    mono.push((range.clone(), p.mono.clone()));
+                }
+                RunKind::Bold => highlights.push((
+                    range.clone(),
+                    HighlightStyle {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..Default::default()
+                    },
+                )),
+                RunKind::Italic => highlights.push((
+                    range.clone(),
+                    HighlightStyle {
+                        font_style: Some(FontStyle::Italic),
+                        ..Default::default()
+                    },
+                )),
+                RunKind::Strikethrough => highlights.push((
+                    range.clone(),
+                    HighlightStyle {
+                        strikethrough: Some(StrikethroughStyle::default()),
+                        ..Default::default()
+                    },
+                )),
+                _ => {}
+            }
+        }
+        // 注记色 + 跳转加亮 + 搜索 + 选区：整行字节区间 clip 到本 shard 再映射到条带内。
+        let clip_marker = |hits: &mut Vec<(Range<usize>, HighlightStyle)>,
+                           range: &Range<usize>,
+                           style: HighlightStyle| {
+            let s = range.start.max(seg.start);
+            let e = range.end.min(seg.end);
+            if s >= e {
+                return;
+            }
+            let a = crate::util::char_align_byte(sh.text.as_ref(), s - seg.start);
+            let b = crate::util::char_align_byte(sh.text.as_ref(), e - seg.start);
+            if b > a {
+                hits.push((a..b, style));
+            }
+        };
+        for (range, _) in row.notes.iter().chain(row.note_defs.iter()) {
+            clip_marker(
+                &mut highlights,
+                range,
+                HighlightStyle {
+                    color: Some(link_color),
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some((hn, is_def, hcolor)) = marker_hl {
+            let src = if is_def { &row.note_defs } else { &row.notes };
+            for (range, _) in src.iter().filter(|(_, n)| *n == hn) {
+                clip_marker(
+                    &mut highlights,
+                    range,
+                    HighlightStyle {
+                        background_color: Some(hcolor),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        if let Some((range, c)) = &search {
+            clip_marker(
+                &mut highlights,
+                range,
+                HighlightStyle {
+                    background_color: Some(*c),
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some((range, c)) = &selection {
+            clip_marker(
+                &mut highlights,
+                range,
+                HighlightStyle {
+                    background_color: Some(*c),
+                    ..Default::default()
+                },
+            );
+        }
+        let merged = merge_highlights(highlights);
+        // 用 `with_highlights`（继承条带 div 的 text_size/color/line_height/字体）而非
+        // `with_default_highlights`：后者把「空 font_family 的 base」烙进 runs，measure
+        // 阶段字体宽度与 shard 的 `theme.font` 不一致 → 折行漂移（R2）。legacy 同款。
+        let mut st = if !sh.runs.is_empty() || search.is_some() {
+            StyledText::new(sh.text.clone()).with_highlights(merged)
+        } else {
+            let base = TextStyle {
+                font_size: fs.into(),
+                color,
+                font_weight: weight,
+                line_height: gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(sh.lh))),
+                ..TextStyle::default()
+            };
+            StyledText::new(sh.text.clone()).with_default_highlights(&base, merged)
+        };
+        if !mono.is_empty() {
+            st = st.with_font_family_overrides(mono);
+        }
+        // clip 到本条带的注记区间（相对本条带文本）。
+        let clip_notes = |ranges: &[(Range<usize>, usize)]| {
+            ranges
+                .iter()
+                .filter_map(|(rg, n)| {
+                    let s = rg.start.max(seg.start);
+                    let e = rg.end.min(seg.end);
+                    (s < e).then(|| (s - seg.start..e - seg.start, *n))
+                })
+                .collect::<Vec<_>>()
+        };
+        let notes = clip_notes(&row.notes);
+        let note_defs = clip_notes(&row.note_defs);
+        let has_notes = !notes.is_empty() || !note_defs.is_empty();
+        let strip: gpui::AnyElement = ShardStrip {
+            st,
+            code_bg: sh.code_ranges.clone(),
+            code_bg_color: p.code_inline_bg,
+            code_radius: px(5.),
+            text: sh.text.clone(),
+            byte_offset: seg.start,
+            row_ix,
+            hit_sub: k,
+            notes,
+            note_defs,
+            note_ctx: has_notes.then(|| note_ctx.clone()),
+            text_ctx: text_ctx.clone(),
+        }
+        .into_any_element();
+        // 条带外壳：显式 h = shard.h、pl = shard.x_off（列表首片 = 前缀槽 + 文本）。
+        let sel = format!("md-shard-{row_ix}-{k}");
+        let base_div = div()
+            .debug_selector(move || sel)
+            .h(px(sh.h))
+            .w_full()
+            .flex_shrink_0()
+            .whitespace_normal()
+            .text_size(fs)
+            .text_color(color)
+            .line_height(px(sh.lh));
+        let wrapper = if bullet && k == 0 {
+            base_div.flex().flex_row().child(
+                div()
+                    .w(px(sh.x_off))
+                    .flex_shrink_0()
+                    .text_size(fs)
+                    .text_color(color)
+                    .child(row.prefix.clone().unwrap_or_default()),
+            ).child(div().flex_1().child(strip))
+        } else {
+            base_div.pl(px(sh.x_off)).child(strip)
+        };
+        col = col.child(wrapper);
+    }
+    col.into_any_element()
 }
 
 /// 渲染单个行。`code_handle` / `table_handle` 为各自稳定的横向滚动句柄
@@ -866,71 +1457,12 @@ pub(crate) fn render_row(
 }
 
 /// 换行模式：围栏代码块折叠成连续块（逐行堆叠）+ 自带头部横向滚动容器（正文折行、
-/// 代码不折；底部单一横向滚动条方便长行）。
+/// 代码不折；底部单一横向滚动条方便长行）。**legacy 保底路径**（P3-1b-2 删除点：
+/// unified 走 [`render_code_shard_rows`]，几何已同源；本路径待 legacy 关闭后删除）。
 fn render_wrapped_code(row: &PreviewRow, ctx: &RowRenderCtx, cx: &mut App) -> gpui::AnyElement {
-    let RowRenderCtx {
-        p,
-        code_handle,
-        code_hl,
-        ..
-    } = ctx;
-    let p: &Rc<StyleParams> = p;
-    let code_handle: Option<ScrollHandle> = code_handle.clone();
-    let code_runs = code_hl.as_deref();
-    let dark = crate::ui::theme::Theme::global(cx).is_dark();
     let lines = row.code_lines().to_vec();
-    let p_ = p.clone();
-    let runs = code_runs;
-    let block_h = (lines.len() + 2) as f32 * p.code_line.as_f32();
-    let h = code_handle.unwrap_or_default();
-    let column = div()
-        .debug_selector(|| "md-code-row".into())
-        .flex()
-        .flex_col()
-        .flex_shrink_0()
-        .min_w_full()
-        .children(code_block_bands(&lines, runs, dark, &p_));
-    div()
-        .debug_selector(|| "md-code-hscroll".into())
-        .h(px(block_h))
-        .w_full()
-        .flex_shrink_0()
-        .px(px(CONTENT_EDGE_PAD_X_PX))
-        .child(
-            div()
-                .debug_selector(|| "md-code-hscroll-inner".into())
-                .w_full()
-                .h_full()
-                .relative()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .id("md-code-scroll")
-                        .w_full()
-                        .h_full()
-                        .flex()
-                        .flex_row()
-                        .overflow_x_scroll()
-                        // 只允许鼠标左键拖动滚动条，禁止滚轮滚动代码块：
-                        // restrict_scroll_to_axis 使纵向滚轮不被本容器横向消费（delta_x=0），
-                        // 事件继续冒泡给页面做纵向滚动。
-                        .restrict_scroll_to_axis()
-                        .track_scroll(&h)
-                        .child(column),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "md-code-scrollbar".into())
-                        .absolute()
-                        .inset_0()
-                        .child(
-                            Scrollbar::horizontal(&h)
-                                .mode(ScrollbarMode::Always)
-                                .viewport_from_layout(),
-                        ),
-                ),
-        )
-        .into_any_element()
+    let block_h = (lines.len() + 2) as f32 * ctx.p.code_line.as_f32();
+    code_block_element(&lines, block_h, ctx.code_handle.clone(), ctx.code_hl.as_deref(), ctx.p, cx)
 }
 
 /// 换行模式：正文段（可含行内对齐）；行首缩进 2 字符由 EPUB 转换器前置「　　」。

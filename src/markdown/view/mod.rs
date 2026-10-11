@@ -74,7 +74,7 @@ use crate::markdown::layout::docrow_for_height;
 use crate::markdown::layout::shape_docrow_shard;
 use crate::markdown::wysiwyg::WyTheme;
 use dimensions::{image_dimensions, image_dimensions_bytes};
-use row::{render_row, PreviewRow, RowRenderCtx};
+use row::{render_row, render_row_shard, PreviewRow, RowRenderCtx};
 use style::StyleParams;
 
 /// EPUB 脚注悬浮命中：一行内某个 `[n]` 标记在**上一帧**的画面矩形 + 对应注释正文。
@@ -88,6 +88,9 @@ pub(crate) struct NoteHit {
     pub(crate) n: usize,
     /// 是否末尾定义标记（`[!n]`）；false = 文内引用 `[^n]`。
     pub(crate) is_def: bool,
+    /// 行内**子条带**序号：legacy `TextTrack` 恒 0（整行一个布局）；unified `ShardStrip`
+    /// 按 shard 分片记录（同行的多片各自独立，互不清除；P3-1b-2 删 TextTrack 后保留）。
+    pub(crate) hit_sub: usize,
     /// 标记矩形（窗口坐标，上一帧）。
     pub(crate) bounds: Bounds<Pixels>,
 }
@@ -112,6 +115,9 @@ pub(crate) struct TextHit {
     pub(crate) layout: gpui::TextLayout,
     /// 该行在窗口坐标中的起点。
     pub(crate) origin: gpui::Point<gpui::Pixels>,
+    /// 该条带文本在**整行 docrow.text** 中的起始字节偏移：legacy 整行条目为 0；
+    /// unified `ShardStrip` 按 shard 分片 = `shard.byte_map.start`（字节命中需抬到行级）。
+    pub(crate) byte_offset: usize,
 }
 
 /// 文本命中共享表（row.rs paint 写、view 鼠标处理器读）。
@@ -1009,7 +1015,9 @@ impl MarkdownPreview {
                     .layout
                     .index_for_position(pos)
                     .unwrap_or(0)
-                    .min(hit.text.len());
+                    .min(hit.text.len())
+                    // unified 分片命中：条带内偏移抬到整行字节（`shard.byte_map.start`）。
+                    + hit.byte_offset;
                 return Some((hit.row_ix, byte));
             }
         }
@@ -1370,15 +1378,19 @@ impl MarkdownPreview {
             self.est_hint = 0.0;
             return;
         }
-        // 内容可用宽 = 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`，
-        // 与 row.rs 行渲染同源；旧硬编码 24）。
-        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        // 内容可用宽：unified 与渲染同源（`preview_text_avail`）；legacy 旧口径
+        // 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`，旧硬编码 24）。
+        let unified = preview_backend() == PreviewBackend::Unified;
+        let avail = if unified {
+            preview_text_avail(p, width)
+        } else {
+            (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0)
+        };
         // 抽样步长：中等文档（≤ 该阈值）**逐块精确**算高（几十万块 ≈ 几 ms，换源/换宽
         // 才发生）；超大文档才抽样（O(N/stride)，保住 <1ms）。确定性偏移抽样对「高度
         // 周期复用块」有偏差，故只在 N 大到精确成本不可接受时启用。
         // unified 后端阈值更小（`HEIGHT_EXACT_SHAPE_MAX`）：全量精确要逐块 shape（贵），
         // 超出即抽样；且每块高度 = 抽中块的**真实 DocRow shard 高**（见 `exact_block_heights`）。
-        let unified = preview_backend() == PreviewBackend::Unified;
         let fast_cap = if unified { HEIGHT_EXACT_SHAPE_MAX } else { HEIGHT_FULL_BLOCKS_MAX };
         let stride = if n > fast_cap {
             (n / HEIGHT_SAMPLE_TARGET).max(1)
@@ -1960,8 +1972,13 @@ impl MarkdownPreview {
     /// 折算行数（CJK ≈ 字号，其余 ≈ 0.55 × 字号），微差只会让滚动条映射略微
     /// 非线性，随行真正渲染后逐步收敛。
     fn estimated_avg_row_height(&self, p: &StyleParams, width: f32) -> f32 {
-        // 内容可用宽 = 视口宽 − 行内 px_3 左右内衬 ×2（单一来源 `CONTENT_EDGE_PAD_X_PX`）。
-        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        // 内容可用宽：unified 与渲染同源（`preview_text_avail`）；legacy 旧口径
+        // 视口宽 − 行内 px_3 左右内衬 ×2。
+        let avail = if preview_backend() == PreviewBackend::Unified {
+            preview_text_avail(p, width)
+        } else {
+            (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0)
+        };
         let wrap = self.wrap;
         // 小文档恒走 rows 逐行口径（行类型精确）；只有**大文档/窗口模式**（rows 懒物化
         // 为空）才走块索引口径——避免「首帧 index 在场、随后丢弃」导致平均行高在两种
@@ -2390,6 +2407,23 @@ fn est_wrap_len(bytes: usize, avail: f32, font_size: f32) -> usize {
     ((w / avail).ceil() as usize).max(1)
 }
 
+/// **unified 后端内容可用宽（px）**：与渲染元素树完全同源——宿主阅读栏列宽
+/// `min(72ch, pane)` − 宿主侧边 gap×2 − 行内边距×2（`md-list-wrap` 的
+/// `PREVIEW_SIDE_GAP_PX` 内衬 + 行级 `CONTENT_EDGE_PAD_X_PX` 内衬）。
+///
+/// M5-B5 P3-1b-1：量程（P3-0 的 `Σ shard`）与渲染**共用同一 avail** → 「排布与量程
+/// 真正同源」（R2）。此前 unified 高度模型用 `pane − 2×PAD`（不含侧边 gap），渲染却按
+/// `列宽 − 2×gap − 2×PAD` 折行，两者差 `2×SIDE_GAP=88px`，量程与实测渲染高度漂移。
+/// legacy 保留旧口径（`width − 2×PAD`，逐位不变）。
+fn preview_text_avail(p: &StyleParams, pane_w: f32) -> f32 {
+    let col_w = if crate::config::markdown::READING_COL_ENABLED {
+        crate::config::markdown::reading_col_px(p.para_size.as_f32()).min(pane_w)
+    } else {
+        pane_w
+    };
+    (col_w - 2.0 * PREVIEW_SIDE_GAP_PX - 2.0 * CONTENT_EDGE_PAD_X_PX).max(1.0)
+}
+
 impl MarkdownPreview {
     /// 渲染期预铺：刷新统一行高/窗口模型量程，并预物化可见窗口（构造 list 闭包前；
     /// 闭包内只读窗口数据，避免在元素构造期改 `self`）。
@@ -2619,13 +2653,22 @@ impl Render for MarkdownPreview {
         // legacy 清空——且每帧覆盖，渲染路径不缓存旧宽/旧字号的主题。
         if preview_backend() == PreviewBackend::Unified {
             let ts_style = window.text_style();
-            let fs = ts_style.font_size.to_pixels(window.rem_size());
-            let theme = WyTheme::from_style(&p, ts_style.font(), fs);
+            // 注意：正文整形字号必须用 `p.para_size`（预览行 div `.text_size(para_size)`
+            // 的实际渲染字号），**不能用** `window.text_style().font_size`——后者是宿主/测试
+            // 默认字号（测试窗 =16），与渲染（14）不一致会让统一量程在错误的字原上整形、
+            // 量程 ≠ 实测（R2）。`WyTheme::from_style` 只取 `.font()`（字体族）与给定字号。
+            let theme = WyTheme::from_style(&p, ts_style.font(), p.para_size);
             self.height_exact_ctx = Some((window.text_system().clone(), theme));
         } else {
             self.height_exact_ctx = None;
         }
         self.prepare_render(&p, pane_w, cx);
+        // unified 渲染上下文：渲染闭包吃同一 `shape_docrow_shard`（与量程同 avail，
+        // R2）——`build_list_content` 据此切到 shard 几何输出（legacy 为 None 走元素树）。
+        let shard_ctx = self.height_exact_ctx.as_ref().map(|(ts, theme)| {
+            let avail = preview_text_avail(&p, pane_w);
+            (ts.clone(), theme.clone(), avail, pane_w)
+        });
         let list_state = self.list_state.clone();
         // 居中阅读栏（页面恒换行，单一来源 `config::markdown::reading_col_px`）：
         // 列宽 = min(72ch, 视口宽)——窗口窄于 72ch 时退化为占满视口，不横向超界。
@@ -2643,7 +2686,8 @@ impl Render for MarkdownPreview {
         self.debug_dump_render_state();
 
         // 行数据源与滚动/滚动条层（各自 &self 方法，详见 `build_list_content`/`render_core`）。
-        let content = self.build_list_content(p.clone(), list_state.clone(), cx);
+        let content =
+            self.build_list_content(p.clone(), list_state.clone(), shard_ctx, cx);
 
         // 预览核心：内容上下滚动容器 + 双滚动条 + 点选/悬浮监听（见 `render_core`）。
         let core = self.render_core(content, bg, list_state, reading_col_w, cx);
@@ -2685,11 +2729,19 @@ impl Render for MarkdownPreview {
 
 impl MarkdownPreview {
     /// 行数据源 List（窗口/全量两路）内容元素：按绝对块下标取行数据 → 搜索/选区/跳转
-    /// 加亮定位 → 交 `render_row`。行源只读快照在构造闭包前取好（元素构造期不改 `self`）。
+    /// 加亮定位 → 交 `render_row`（legacy 元素树）或 `render_row_shard`（unified shard 几何，
+    /// 当 `shard_ctx` 在场时；`shard_ctx` 只会在 `preview_backend()==Unified` 时由 render 喂入）。
+    /// 行源只读快照在构造闭包前取好（元素构造期不改 `self`）。
     fn build_list_content(
         &mut self,
         p: Rc<StyleParams>,
         list_state: ListState,
+        shard_ctx: Option<(
+            std::sync::Arc<gpui::WindowTextSystem>,
+            WyTheme,
+            f32,
+            f32,
+        )>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // 搜索跳转高亮：只给命中**文本**着色（不吃整行）。把命中的源码行映射到渲染行，
@@ -2750,23 +2802,27 @@ impl MarkdownPreview {
             let marker_hl = marker_hl
                 .filter(|(row, _, _)| *row == abs)
                 .map(|(_, n, is_def)| (n, is_def));
-            render_row(
-                row,
-                &RowRenderCtx {
-                    p: &p,
-                    code_handle: ch,
-                    code_hl: chr,
-                    table_handle: th,
-                    search,
-                    epub,
-                    note_ctx: &note_ctx,
-                    text_ctx: &text_ctx,
-                    selection: sel,
-                    marker_hl,
-                    row_ix: abs,
-                },
-                cx,
-            )
+            let rctx = RowRenderCtx {
+                p: &p,
+                code_handle: ch,
+                code_hl: chr,
+                table_handle: th,
+                search,
+                epub,
+                note_ctx: &note_ctx,
+                text_ctx: &text_ctx,
+                selection: sel,
+                marker_hl,
+                row_ix: abs,
+            };
+            // unified 后端：渲染几何切共享 `shape_docrow_shard`（与量程同真源，R2）；
+            // legacy 沿元素树（逐位一致）。
+            match &shard_ctx {
+                Some((ts, theme, avail, max_w)) => {
+                    render_row_shard(row, &rctx, cx, ts.as_ref(), theme, *avail, *max_w)
+                }
+                None => render_row(row, &rctx, cx),
+            }
         })
         .size_full()
         .into_any_element()

@@ -213,6 +213,13 @@ fn unified_shard_height_matches_preview_row(cx: &mut TestAppContext) {
     let width = 400f32;
     cx.simulate_resize(size(px(width), px(600.)));
     settle(cx);
+    // 追加收敛帧：unified 渲染的条目测量在换宽后多一帧落定（shard 固定高重测）。
+    cx.update(|window, cx| {
+        for _ in 0..4 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
 
     let doc = Doc::open(src.into());
     let n = doc.block_count();
@@ -333,13 +340,14 @@ fn unified_window_range_equals_docrow_shard_total(cx: &mut TestAppContext) {
             n <= HEIGHT_EXACT_SHAPE_MAX,
             "该用例块数应落在全量精确档（n={n}）"
         );
-        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        // 与统一高度模型同一口径：内容可用宽 = `preview_text_avail`（渲染同源，R2）；
+        // 正文整形字号 = `p.para_size`（预览实际渲染字号，非窗口默认 16）。
+        let avail = super::preview_text_avail(&p, width);
         let total = md.vertical_total_px();
         // 独立参考：真实 DocRow → shape，与模型解耦。
         let ts = window.text_system().clone();
         let style = window.text_style();
-        let fs = style.font_size.to_pixels(window.rem_size());
-        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let theme = WyTheme::from_style(&p, style.font(), p.para_size);
         let doc = Doc::open(src.into());
         let rows = doc.rows_in_block_window(0, n - 1);
         let expect: f32 = rows
@@ -392,11 +400,10 @@ fn unified_sampled_model_matches_sampled_docrow_shard(cx: &mut TestAppContext) {
         let n = idx.blocks.len();
         let stride = md.height_stride;
         assert!(n > HEIGHT_EXACT_SHAPE_MAX && stride > 1, "应走抽样档（n={n}, stride={stride}）");
-        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        let avail = super::preview_text_avail(&p, width);
         let ts = window.text_system().clone();
         let style = window.text_style();
-        let fs = style.font_size.to_pixels(window.rem_size());
-        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let theme = WyTheme::from_style(&p, style.font(), p.para_size);
         let doc = Doc::open(src.into());
         let rows = doc.rows_in_block_window(0, n - 1);
         let block_h = |k: usize| {
@@ -456,8 +463,7 @@ fn docrow_for_height_matches_doc_docrow_shard(cx: &mut TestAppContext) {
         let p = StyleParams::from_theme_with_font(cx, None);
         let ts = window.text_system().clone();
         let style = window.text_style();
-        let fs = style.font_size.to_pixels(window.rem_size());
-        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let theme = WyTheme::from_style(&p, style.font(), p.para_size);
         let avail = width - 2.0 * PREVIEW_SIDE_GAP_PX - 2.0 * CONTENT_EDGE_PAD_X_PX;
         let doc = Doc::open(src.into());
         let n = doc.block_count();
@@ -605,17 +611,30 @@ fn unified_small_doc_range_equals_docrow_shard_total(cx: &mut TestAppContext) {
     let width = 400f32;
     cx.simulate_resize(size(px(width), px(600.)));
     settle(cx);
+    // 换宽后平均行高重算有 120ms 节流（`HINT_REAPPLY_INTERVAL_MS`），测试瞬间跑完、
+    // 第一次估算落在「换宽前」窄文档宽度上 → 强制一次确定性重算，让 `est_hint` 落在
+    // 最终宽度（与下面的参考同口径），量程护栏与节流时序解耦。
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |m, _| m.invalidate_height_hint());
+    });
+    cx.update(|window, cx| {
+        for _ in 0..3 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
 
     let (hint_total, expect, n) = cx.update(|window, cx| {
         let p = StyleParams::from_theme_with_font(cx, None);
         let md = host.read(cx).md.read(cx);
         let n = md.rows.len();
         assert!(md.index.is_none(), "小文档应走全量路径（n={n}）");
-        let avail = (width - 2.0 * CONTENT_EDGE_PAD_X_PX).max(40.0);
+        // 与统一高度模型同一口径（渲染同源，R2）：avail = `preview_text_avail`、字号 = para_size。
+        let avail = super::preview_text_avail(&p, width);
         let ts = window.text_system().clone();
         let style = window.text_style();
-        let fs = style.font_size.to_pixels(window.rem_size());
-        let theme = WyTheme::from_style(&p, style.font(), fs);
+        let theme = WyTheme::from_style(&p, style.font(), p.para_size);
         let doc = Doc::open(src.into());
         let rows = doc.rows_in_block_window(0, n - 1);
         let expect: f32 = rows
@@ -700,6 +719,201 @@ fn unified_window_scroll_to_bottom_reaches_last_block(cx: &mut TestAppContext) {
         text.contains("标题 2399"),
         "滚到底后末块内容应被窗口物化可达（缺内容？rendered 尾部={:?}）",
         &text[text.len().saturating_sub(80)..]
+    );
+}
+
+/// M5-B5 P3-1b-1：**unified 渲染几何 == shard 几何**（渲染与量程同真源，R2）。
+/// 逐行断言 `bounds_for_item` 高 == Σ `shape_docrow_shard`（同一 `preview_text_avail`）；
+/// 另用静态选择器断言代码块首/末空白带跨度 == 该行 shard 总高（`md-code-blank-top` →
+/// `md-code-blank-bottom`，唯一的代码块）。
+#[gpui::test]
+fn unified_render_bounds_equal_shard_geometry(cx: &mut TestAppContext) {
+    let _g = BackendGuard::with(PreviewBackend::Unified);
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    let src = concat!(
+        "### 标题\n",
+        "\n",
+        "主干长段落，这段中文内容必须足够长，在 288px 真实内容宽下强制折成多个视觉行，",
+        "用于对拍共享整形核心与预览渲染的逐行一致。再补若干字符稳稳超过一行的宽度。\n",
+        "\n",
+        "```rs\nlet a = 1;\nlet b = 2;\n```\n",
+        "\n",
+        "> 引述行\n",
+        "\n",
+        "---\n",
+    );
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    let width = 400f32;
+    cx.simulate_resize(size(px(width), px(600.)));
+    settle(cx);
+    // 追加收敛帧：unified 渲染的条目测量在换宽后多一帧才落定（shard 固定高重测），
+    // 测试读取 `bounds_for_item` 前需等收敛。
+    cx.update(|window, cx| {
+        for _ in 0..4 {
+            let _ = window.draw(cx);
+        }
+    });
+    cx.run_until_parked();
+
+    let (failures, code_sum) = cx.update(|window, cx| {
+        let p = StyleParams::from_theme_with_font(cx, None);
+        let theme = WyTheme::from_style(&p, window.text_style().font(), p.para_size);
+        let md = host.read(cx).md.read(cx);
+        let avail = super::preview_text_avail(&p, width);
+        let ts = window.text_system().clone();
+        let doc = Doc::open(src.into());
+        let n = doc.block_count();
+        let docrows = doc.rows_in_block_window(0, n - 1);
+        let mut failures = Vec::new();
+        let mut code_sum = 0.0f32;
+        for (ix, dr) in docrows.iter().enumerate() {
+            let b = md.list_state.bounds_for_item(ix);
+            let h_preview = b.map(|b| b.size.height.as_f32()).unwrap_or(0.);
+            let w_preview = b.map(|b| b.size.width.as_f32()).unwrap_or(0.);
+            let shards = shape_docrow_shard(&ts, dr, &theme, avail, width);
+            let sum: f32 = shards.iter().map(|s| s.h).sum();
+            let tag = format!("row[{ix}] kind={:?}", dr.kind);
+            if (h_preview - sum).abs() > 1.0 {
+                failures.push(format!("{tag}: 渲染高 ≠ shard 总高 got={h_preview:.2} shard={sum:.2}"));
+            }
+            if matches!(dr.kind, IrKind::Code) {
+                code_sum = sum;
+            }
+            eprintln!("{tag}: h_preview={h_preview:.2} w_preview={w_preview:.2} shard={sum:.2}");
+        }
+        (failures, code_sum)
+    });
+    // 代码块（唯一）：整块跨度（顶空白带顶 → 底空白带底）== shard 总高
+    //（= 首空白 + 2 代码行 + 末空白，共 4×code_line）。
+    if code_sum > 0.0 {
+        let top = cx
+            .debug_bounds("md-code-blank-top")
+            .expect("代码块顶部空白带应存在");
+        let bottom = cx
+            .debug_bounds("md-code-blank-bottom")
+            .expect("代码块底部空白带应存在");
+        let span =
+            (bottom.origin.y.as_f32() + bottom.size.height.as_f32()) - top.origin.y.as_f32();
+        assert!(
+            (span - code_sum).abs() < 1.5,
+            "代码块整块跨度应 == shard 总高 span={span:.1} shard={code_sum:.1}"
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "unified 渲染几何 ≠ shard 几何：\n{}",
+        failures.join("\n")
+    );
+}
+
+/// M5-B5 P3-1b-1：unified 文本命中分片与 shard 折行一致。多折行段落整段是一条
+/// `WrappedLine`（1 个 shard、1 条 `TextHit`）：其 layout 行高 == `shard.lh`、总高 ==
+/// `shard.h`、行数 == `shard.h / lh`；且分片命中文本拼回 == `docrow.text`（`byte_offset`
+/// 抬到整行不丢/不重字节——「命中区域」与 shard 几何一致）。
+#[gpui::test]
+fn unified_text_hits_match_shard_wrapping(cx: &mut TestAppContext) {
+    let _g = BackendGuard::with(PreviewBackend::Unified);
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, cx) = cx.add_window_view(|_window, cx| {
+        let md = cx.new(|cx| MarkdownPreview::new(cx));
+        PreviewHost { md }
+    });
+    let cx: &mut VisualTestContext = cx;
+    // 两段长中文强制多折行；同宽下 shard 与渲染应同折行点。
+    let src = "第一段足够长，在 288px 真实内容宽下折成三个视觉行的中文文本。再来一些内容稳稳超出宽度折到第二行第三行去。\n\n第二段同样长，确保多段逐段可达。这是一段中文测试文字，必须稳稳超过一行的可用宽度。\n";
+    cx.update(|_, cx| {
+        let md = host.read(cx).md.clone();
+        md.update(cx, |md, cx| md.set_source(src, cx));
+    });
+    let width = 400f32;
+    cx.simulate_resize(size(px(width), px(600.)));
+    settle(cx);
+
+    let failures = cx.update(|window, cx| {
+        let p = StyleParams::from_theme_with_font(cx, None);
+        let theme = WyTheme::from_style(&p, window.text_style().font(), p.para_size);
+        let md = host.read(cx).md.read(cx);
+        let avail = super::preview_text_avail(&p, width);
+        let ts = window.text_system().clone();
+        let doc = Doc::open(src.into());
+        let docrows = doc.rows_in_block_window(0, doc.block_count() - 1);
+        let mut failures = Vec::new();
+        let hits = md.text_ctx.hits.borrow();
+        for (ix, dr) in docrows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.kind, IrKind::Paragraph))
+        {
+            let shards = shape_docrow_shard(&ts, dr, &theme, avail, width);
+            let sum: f32 = shards.iter().map(|s| s.h).sum();
+            let n_visual: usize = shards.iter().map(|s| (s.h / s.lh).round() as usize).sum();
+            let row_hits: Vec<_> = hits.iter().filter(|h| h.row_ix == ix).collect();
+            let tag = format!("row[{ix}]");
+            if row_hits.is_empty() {
+                failures.push(format!("{tag}: 应有一条分片文本命中"));
+                continue;
+            }
+            // 分片命中拼回整行文本 == docrow.text（字节可达，不丢不重）。
+            let joined: String = {
+                let mut sorted = row_hits.to_vec();
+                sorted.sort_by_key(|h| h.byte_offset);
+                sorted.iter().map(|h| h.text.as_ref()).collect()
+            };
+            if joined != dr.text.as_ref() {
+                failures.push(format!("{tag}: 分片命中文本拼回 ≠ docrow.text"));
+            }
+            for h in &row_hits {
+                let line_h = h.layout.line_height().as_f32();
+                let n = h
+                    .layout
+                    .line_layouts()
+                    .first()
+                    .map(|l| l.wrap_boundaries().len() + 1)
+                    .unwrap_or(0);
+                let hit_w = h
+                    .layout
+                    .line_layouts()
+                    .first()
+                    .map(|l| l.width().as_f32())
+                    .unwrap_or(0.);
+                let hit_h = h
+                    .layout
+                    .line_layouts()
+                    .first()
+                    .map(|l| l.size(h.layout.line_height()).height.as_f32())
+                    .unwrap_or(0.);
+                eprintln!("{tag}: wrap = {hit_w:.1}px, n={n}, line_h={line_h:.2}, hit_h={hit_h:.2}");
+                // 行高按设备像素取整（scale 2.0 下 20.3→20.5）：命中 layout 行高可能被
+                // `pixel_snap` 抬半像素，与 shard 理想行高差 ≤ 0.5 为同一设备栅格。
+                if (line_h - shards[0].lh).abs() > 0.5 {
+                    failures.push(format!(
+                        "{tag}: 命中行高 {line_h:.2} ≠ shard.lh {:.2}",
+                        shards[0].lh
+                    ));
+                }
+                if (hit_h - sum).abs() > 1.0 {
+                    failures.push(format!("{tag}: 命中总高 {hit_h:.2} ≠ shard 总高 {sum:.2}"));
+                }
+                if n != n_visual {
+                    failures.push(format!("{tag}: 命中折行数 {n} ≠ shard 折行数 {n_visual}"));
+                }
+            }
+            eprintln!("{tag}: lh={:.2} n_visual={n_visual} hit_h={sum:.2}", shards[0].lh);
+        }
+        failures
+    });
+    assert!(
+        failures.is_empty(),
+        "unified 命中折行 ≠ shard：\n{}",
+        failures.join("\n")
     );
 }
 
