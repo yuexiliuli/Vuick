@@ -373,32 +373,26 @@ impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
         let _t = crate::prof::begin();
-        let index = parse::scan_blocks(src.as_ref());
-        crate::prof::end("doc.open.scan_blocks", _t);
+        // 融合一趟字节扫描：行起始（u32）+ 行粒度 UTF-16 前缀 + 字符数 + 全文 UTF-16
+        // 单元数，替代旧四趟独立 O(n)（`build_line_starts_u32` / `chars().count()` /
+        // 逐行 `encode_utf16().count()` / 全文 `encode_utf16().count()`）。
+        let (ls32, ls16, char_count, total_utf16) =
+            parse::build_line_stats_utf16(src.as_bytes());
+        crate::prof::end("doc.open.stats", _t);
         let _t = crate::prof::begin();
-        let line_starts: Vec<usize> = parse::build_line_starts_u32(src.as_ref())
-            .into_iter()
-            .map(|b| b as usize)
-            .collect();
-        crate::prof::end("doc.open.line_starts", _t);
+        // 块分类复用上述行起始表——不再整篇第二遍 `build_line_starts_u32`。
+        let index = parse::scan_blocks_with_line_starts(src.as_ref(), &ls32);
+        crate::prof::end("doc.open.scan_blocks", _t);
         let _t = crate::prof::begin();
         let rope = Rope::from(&*src);
         crate::prof::end("doc.open.rope", _t);
-        let _t = crate::prof::begin();
-        let char_count = src.chars().count();
-        let line_utf16_starts = build_line_utf16_starts(
-            |s, e| src.as_ref()[s..e].encode_utf16().count(),
-            &line_starts,
-            src.len(),
-        );
-        let total_utf16 = src.encode_utf16().count();
-        crate::prof::end("doc.open.counts_utf16", _t);
+        let line_starts: Vec<usize> = ls32.into_iter().map(|b| b as usize).collect();
         Self {
             src: DocSrc::Str(src),
             index,
             rope,
             line_starts: LineStarts::from_vec(line_starts),
-            line_utf16_starts: LineStarts::from_vec(line_utf16_starts),
+            line_utf16_starts: LineStarts::from_vec(ls16),
             char_count,
             total_utf16,
             edit_ver: 0,
@@ -875,8 +869,10 @@ fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
 }
 
 /// 行粒度 UTF-16 前缀索引构建：第 i 项 = `line_starts[i]`（含幻影尾行）前的累计
-/// UTF-16 单元数。`u16_of_range` 统计单行字节区间的 UTF-16 单元数（Str 走
-/// `encode_utf16().count()`，rope 走 `chars()` 累加）。O(n)。
+/// UTF-16 单元数。`u16_of_range` 统计单行字节区间的 UTF-16 单元数。O(n)。
+/// 仅 `open_rope`（测试路径）与对拍测试消费；`Doc::open` 走融合一趟
+/// [`parse::build_line_stats_utf16`]。
+#[cfg(test)]
 fn build_line_utf16_starts(
     u16_of_range: impl Fn(usize, usize) -> usize,
     line_starts: &[usize],
@@ -1052,6 +1048,76 @@ mod tests {
             "line_starts 与全量重建不一致（{ctx}）"
         );
         (d.line_starts().seg_count(), d.line_starts().len())
+    }
+
+    /// 四条行统计「新旧口径对拍」：融合一趟 `parse::build_line_stats_utf16` 与旧的
+    /// 四趟独立算法（`build_line_starts_u32` + 逐行 `encode_utf16().count()` +
+    /// `chars().count()` + `encode_utf16().count()`），在多样本（ASCII / 中文 / CRLF /
+    /// BOM / 空行 / 结尾换行 / 4 字节 emoji）与真实 6.4MB 文档上逐值相等。
+    #[test]
+    fn line_stats_fused_matches_old_multi_pass() {
+        let samples = [
+            "",
+            "\n",
+            "a",
+            "ab\ncd",
+            "ab\ncd\n",
+            "line one\nline two\r\nline three\r\n",
+            "中文文档第一行\n第二行 更多内容\n",
+            "\u{feff}BOM 开头\n正文",
+            "end with newline\n",
+            "emoji 😀🚀 后续\n中 end\r\n",
+            "a\r\n\r\nb\r\n",
+            "\r\n",
+            "x\nx\nx\ntail",
+        ];
+        for s in &samples {
+            let (ls32, ls16, cc, total) =
+                crate::markdown::parse::build_line_stats_utf16(s.as_bytes());
+            let want_ls: Vec<usize> = crate::markdown::parse::build_line_starts_u32(s)
+                .into_iter()
+                .map(|b| b as usize)
+                .collect();
+            let want_ls16 = build_line_utf16_starts(
+                |lo, hi| s[lo..hi].encode_utf16().count(),
+                &want_ls,
+                s.len(),
+            );
+            assert_eq!(
+                ls32.into_iter().map(|b| b as usize).collect::<Vec<_>>(),
+                want_ls,
+                "line_starts {s:?}"
+            );
+            assert_eq!(ls16, want_ls16, "line_utf16_starts {s:?}");
+            assert_eq!(cc, s.chars().count(), "char_count {s:?}");
+            assert_eq!(total, s.encode_utf16().count(), "total_utf16 {s:?}");
+        }
+        // 真实 6.4MB 文档（fixtures 缺失时跳过）：融合一趟 vs 旧四趟 vs rope 全量算法。
+        let p = r"fixtures/大文档测试2.md";
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let (ls32, ls16, cc, total) =
+                crate::markdown::parse::build_line_stats_utf16(s.as_bytes());
+            let ls: Vec<usize> = ls32.into_iter().map(|b| b as usize).collect();
+            let want_ls = crate::markdown::parse::build_line_starts_u32(&s)
+                .into_iter()
+                .map(|b| b as usize)
+                .collect::<Vec<_>>();
+            let want_ls16 = build_line_utf16_starts(
+                |lo, hi| s[lo..hi].encode_utf16().count(),
+                &want_ls,
+                s.len(),
+            );
+            assert_eq!(ls, want_ls, "realfile line_starts");
+            assert_eq!(ls16, want_ls16, "realfile line_utf16_starts");
+            assert_eq!(cc, s.chars().count(), "realfile char_count");
+            assert_eq!(total, s.encode_utf16().count(), "realfile total_utf16");
+            // rope 全量算法（`open_rope`）逐值对拍。
+            let rd = Doc::open_rope(ropey::Rope::from(s.as_str()));
+            assert_eq!(rd.line_starts().to_vec(), ls, "realfile rope line_starts");
+            assert_eq!(rd.line_utf16_starts().to_vec(), ls16, "realfile rope utf16");
+            assert_eq!(rd.char_count(), cc, "realfile rope char_count");
+            assert_eq!(rd.total_utf16(), total, "realfile rope total_utf16");
+        }
     }
 
     /// 分段行起始的摊销护栏 + 一致性：连续打字（no-'\n'）/ Enter（has-'\n'）/

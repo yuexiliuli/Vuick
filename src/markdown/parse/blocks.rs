@@ -479,6 +479,55 @@ pub(crate) fn build_line_starts_u32(src: &str) -> Vec<u32> {
     starts
 }
 
+/// 一趟字节扫描同时产出 `Doc::open` 所需的四条行统计（替代旧四趟独立 O(n)）：
+/// - `line_starts`（u32，`split('\n')` 语义，与 [`build_line_starts_u32`] 逐值相同）；
+/// - `line_utf16_starts`（第 i 项 = `line_starts[i]` 前累计 UTF-16 单元数，含该行尾 `\n`）；
+/// - `char_count`（`chars().count()` 口径）；
+/// - `total_utf16`（`encode_utf16().count()` 口径）。
+///
+/// UTF-16 单元按 UTF-8 引导字节折算：1–3 字节字符 = 1 单元、4 字节字符 = 2 单元
+/// （= `char::len_utf16`），ASCII 逐字节同长。BOM（3 字节）、`\r\n` 都按普通字符
+/// 计入，与旧口径逐值一致（对拍测试 [`Doc`] 侧 `line_stats_fused_matches_old_multi_pass`）。
+pub(crate) fn build_line_stats_utf16(bytes: &[u8]) -> (Vec<u32>, Vec<usize>, usize, usize) {
+    let cap = bytes.len() / 8 + 2;
+    let mut line_starts = Vec::with_capacity(cap);
+    let mut line_utf16_starts = Vec::with_capacity(cap);
+    line_starts.push(0u32);
+    line_utf16_starts.push(0usize);
+    let mut run_u16 = 0usize;
+    let mut char_count = 0usize;
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        let b = bytes[i];
+        if b < 0x80 {
+            char_count += 1;
+            run_u16 += 1;
+            if b == b'\n' {
+                line_starts.push((i + 1) as u32);
+                line_utf16_starts.push(run_u16);
+            }
+            i += 1;
+        } else {
+            // 非 ASCII：按 UTF-8 引导字节推进（`&str` 保证合法 UTF-8；连续字节
+            // 0x80..0xC0 不出现于字符首，按 1 推进防死循环）。
+            let len = if b < 0xC0 {
+                1
+            } else if b < 0xE0 {
+                2
+            } else if b < 0xF0 {
+                3
+            } else {
+                4
+            };
+            char_count += 1;
+            run_u16 += if len == 4 { 2 } else { 1 };
+            i += len;
+        }
+    }
+    (line_starts, line_utf16_starts, char_count, run_u16)
+}
+
 /// 一个源码块的**切块判定**结果：类型 + 消费行数 + 辅助计数。
 ///
 /// “切块判定”指「当前行属于哪种块、吃几行源码」：围栏 / 空行 / 标题 / 引述 /
@@ -568,6 +617,14 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     let _t = crate::prof::begin();
     let line_starts = build_line_starts_u32(src);
     crate::prof::end("scan.blocks.line_starts", _t);
+    scan_blocks_with_line_starts(src, &line_starts)
+}
+
+/// [`scan_blocks`] 的复用行起始版：块判定逻辑完全一致，仅不重复计算行起始表。
+/// `line_starts` 必须是 `split('\n')` 语义（[`build_line_starts_u32`] /
+/// [`build_line_stats_utf16`] 产出）——`Doc::open` 从融合扫描复用，省掉整篇第二遍
+/// `build_line_starts_u32`。
+pub(crate) fn scan_blocks_with_line_starts(src: &str, line_starts: &[u32]) -> BlockIndex {
     let _t = crate::prof::begin();
     let lines: Vec<&str> = src.split('\n').collect();
     crate::prof::end("scan.blocks.split", _t);
