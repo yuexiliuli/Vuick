@@ -80,6 +80,7 @@ use crate::config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
     MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
+use crate::viewer::folder::FolderNav;
 use crate::viewer::pan_zoom;
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
@@ -109,10 +110,9 @@ pub struct ImageViewer {
     image: Option<Arc<RenderImage>>,
     /// 图片固有像素尺寸（显示比例依据）。
     intrinsic: Option<(f32, f32)>,
-    /// 同文件夹图片清单（文件名升序，始终含当前图，恒非空）。
-    folder: Vec<PathBuf>,
-    /// 当前图片在 `folder` 中的下标（0 基，取模循环）。
-    current: usize,
+    /// 同文件夹兄弟文件导航（清单文件名升序、恒含当前图、恒非空；循环翻页语义收敛在
+    /// [`FolderNav`]）。
+    nav: FolderNav,
     /// 缩放倍数（1.0 = 适应视口；Ctrl+滚轮调）。
     zoom: f32,
     /// 是否仍在后台解码（首张或切换中）。
@@ -191,8 +191,7 @@ impl ImageViewer {
             path: path.clone(),
             image: None,
             intrinsic: None,
-            folder: vec![path.clone()],
-            current: 0,
+            nav: FolderNav::new(vec![path.clone()], 0),
             zoom: 1.0,
             loading: true,
             load_error: None,
@@ -227,13 +226,12 @@ impl ImageViewer {
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
-            let (folder, current) = cx
+            let nav = cx
                 .background_executor()
-                .spawn(async move { scan_folder(&scan_at) })
+                .spawn(async move { FolderNav::scan(&scan_at, crate::image::is_image_extension) })
                 .await;
             let _ = weak.update(cx, |this, cx| {
-                this.folder = folder;
-                this.current = current;
+                this.nav = nav;
                 // 统一入口：缓存命中瞬时落盘 / 未中由 worker 解码并预取 ±1。
                 // 注意：**不在打开时抢跑预取**——首图先独占解码槽、尽快出现；首图安装
                 // （install_current）后才启动级联预取。否则大图（如 20MP 照片）首图解码会
@@ -248,21 +246,21 @@ impl ImageViewer {
 
     /// 当前图片路径（宿主 `EditorApp` 同步标签标题 / 状态栏用）。
     pub fn current_path(&self) -> Option<PathBuf> {
-        Some(self.path.clone())
+        Some(self.nav.current_path().to_path_buf())
     }
 
     /// 当前图片在同文件夹清单中的下标（0 基）。
     pub fn current_index(&self) -> usize {
-        self.current
+        self.nav.current()
     }
 
     /// 同文件夹图片总数。
     pub fn folder_len(&self) -> usize {
-        self.folder.len()
+        self.nav.len()
     }
 
-    /// 是否已加载完成（首张解码成功）。
-    #[allow(dead_code)]
+    /// 是否已加载完成（首张解码成功；仅测试消费）。
+    #[cfg(test)]
     pub fn is_loaded(&self) -> bool {
         !self.loading && self.image.is_some()
     }
@@ -499,17 +497,15 @@ impl ImageViewer {
         self.escalate_display_denom(cx);
     }
 
-    /// 在同文件夹清单内切换（`dir` = ±1，取模循环）。切换本身 O(1)：目标立即写入
-    /// `path`（标题/状态栏跟着走），显示由 `request_display` 决定「缓存命中秒切 / 未中
-    /// 池解码追最新」。方向变化时重置级联预取锚点；同时做 B4「快速连续滚动」判定（连续
-    /// 同向且步间隔 ≤ [`FAST_SCROLL_STEP_MS`] 累计到阈值 → 临时放宽前向窗口）。
+    /// 在同文件夹清单内切换（`dir` = ±1，环绕语义收敛于 [`FolderNav::step`]）。切换本身
+    /// O(1)：目标立即写入 `path`（标题/状态栏跟着走），显示由 `request_display` 决定「缓存
+    /// 命中秒切 / 未中池解码追最新」。方向变化时重置级联预取锚点；同时做 B4「快速连续
+    /// 滚动」判定（连续同向且步间隔 ≤ [`FAST_SCROLL_STEP_MS`] 累计到阈值 → 临时放宽前向窗口）。
     fn switch(&mut self, dir: i32, cx: &mut Context<Self>) {
-        let n = self.folder.len();
-        if n <= 1 || dir == 0 {
+        let Some(next) = self.nav.step(i64::from(dir)) else {
             return;
-        }
-        let next = ((self.current as i64 + dir as i64).rem_euclid(n as i64)) as usize;
-        if next == self.current {
+        };
+        if next == self.nav.current() {
             return;
         }
         if dir != self.prefetch_dir {
@@ -532,8 +528,8 @@ impl ImageViewer {
         // 进入阈值 FAST_SCROLL_THRESHOLD；进入后只要计数 > 0 保持（迟滞，避免抖进抖出）
         self.scroll_fast =
             self.fast_count >= FAST_SCROLL_THRESHOLD || (self.scroll_fast && self.fast_count > 0);
-        self.current = next;
-        self.path = self.folder[next].clone();
+        let _ = self.nav.set_current(next);
+        self.path = self.nav.item(next).expect("switch 目标恒在清单内");
         // 切图：缩放复位为适应视口 + 平移/拖拽归零（每张都从初始大小开始）
         self.zoom = 1.0;
         self.pan = (0.0, 0.0);
@@ -834,7 +830,7 @@ impl ImageViewer {
         if self.pending_target.is_some() {
             return;
         }
-        let n = self.folder.len() as i64;
+        let n = self.nav.len() as i64;
         if n <= 1 {
             return;
         }
@@ -854,7 +850,9 @@ impl ImageViewer {
                 break;
             }
             let ni = self.prefetch_pos.rem_euclid(n) as usize;
-            let path = self.folder[ni].clone();
+            let Some(path) = self.nav.item(ni) else {
+                break;
+            };
             self.prefetch_pos += self.prefetch_dir as i64;
             if self.cache_contains(&path) || self.in_flight.contains(&path) {
                 continue;
@@ -866,7 +864,7 @@ impl ImageViewer {
         }
         // 2) 反向窗口：非快速滚动时，当前图往回 PREFETCH_BACKWARD 张（低优先，仅余量时补）
         if !self.scroll_fast {
-            let base = self.current as i64;
+            let base = self.nav.current() as i64;
             for k in 1..=PREFETCH_BACKWARD as i64 {
                 if self.prefetch_inflight + 1 >= MAX_DECODE
                     || self.cache.len() >= CACHE_MAX_ITEMS
@@ -875,7 +873,9 @@ impl ImageViewer {
                     break;
                 }
                 let ni = (base - k).rem_euclid(n) as usize;
-                let path = self.folder[ni].clone();
+                let Some(path) = self.nav.item(ni) else {
+                    break;
+                };
                 if self.cache_contains(&path) || self.in_flight.contains(&path) {
                     continue;
                 }
@@ -892,7 +892,9 @@ impl ImageViewer {
                     break;
                 }
                 let ni = self.prefetch_pos.rem_euclid(n) as usize;
-                let path = self.folder[ni].clone();
+                let Some(path) = self.nav.item(ni) else {
+                    break;
+                };
                 self.prefetch_pos += self.prefetch_dir as i64;
                 self.preload_bytes(path, cx);
             }
@@ -946,8 +948,8 @@ impl ImageViewer {
         cx.notify();
         cx.refresh_windows();
         // 锚点移到当前位置：前向/反向窗口随位置滑动，继续沿方向补满
-        self.prefetch_origin = self.current as i64;
-        self.prefetch_pos = self.current as i64 + self.prefetch_dir as i64;
+        self.prefetch_origin = self.nav.current() as i64;
+        self.prefetch_pos = self.nav.current() as i64 + self.prefetch_dir as i64;
         self.pump_prefetch(cx);
     }
 
@@ -1019,13 +1021,13 @@ impl ImageViewer {
     /// （同尺寸、opacity 0、不拦截输入）。让 gpui 在上屏前就完成该纹理的 GPU 上传，切到
     /// 的那一帧不再肩负首次上传（真实 GPU 生效；headless 测试无真实纹理，仅保证构造正确）。
     fn peek_upgrade_element(&self) -> Option<gpui::AnyElement> {
-        let n = self.folder.len() as i64;
+        let n = self.nav.len() as i64;
         if n <= 1 {
             return None;
         }
-        let ni = (self.current as i64 + self.prefetch_dir as i64).rem_euclid(n) as usize;
-        let target = self.folder.get(ni)?;
-        if target == &self.path {
+        let ni = (self.nav.current() as i64 + self.prefetch_dir as i64).rem_euclid(n) as usize;
+        let target = self.nav.get(ni)?;
+        if *target == self.path {
             return None;
         }
         let entry = self.cache.iter().find(|e| e.path == *target)?;
@@ -1095,8 +1097,8 @@ impl Render for ImageViewer {
         // 底部信息条：第几张/共几张 · 缩放百分比（含锁定模式；名称不显示）。
         let info = SharedString::from(format!(
             "{}/{} · {:.0}%",
-            self.current + 1,
-            self.folder.len(),
+            self.nav.current() + 1,
+            self.nav.len(),
             self.zoom * 100.0
         ));
 
@@ -1385,29 +1387,6 @@ fn decode_display_at(
     decode_background(&bytes, need)
 }
 
-/// 扫描当前图片所在文件夹的全部图片（扩展名过滤、文件名升序），返回
-/// (清单, 当前图下标)。失败/空目录时退化为「仅当前图」单元素清单。
-fn scan_folder(at: &Path) -> (Vec<PathBuf>, usize) {
-    let Some(dir) = at.parent() else {
-        return (vec![at.to_path_buf()], 0);
-    };
-    let mut list: Vec<PathBuf> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.is_file() && crate::image::is_image_extension(&p) {
-                list.push(p);
-            }
-        }
-    }
-    if list.is_empty() {
-        return (vec![at.to_path_buf()], 0);
-    }
-    list.sort();
-    let idx = list.iter().position(|p| p == at).unwrap_or(0);
-    (list, idx)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,8 +1589,10 @@ mod tests {
         let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
             app.new(|cx| {
                 let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
-                v.folder = vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")];
-                v.current = 0;
+                v.nav = FolderNav::new(
+                    vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")],
+                    0,
+                );
                 v.last_viewport = (800.0, 600.0);
                 v.intrinsic = Some((200.0, 100.0));
                 v.zoom = 4.0; // 放大后 3008×1504 远超视口
@@ -1623,7 +1604,7 @@ mod tests {
             viewer.update(app, |v, cx| {
                 v.wheel_pan_or_switch(1, 100.0, cx);
                 assert_eq!(v.pan, (0.0, -100.0), "放大态应先纵向平移而非切图");
-                assert_eq!(v.current, 0);
+                assert_eq!(v.nav.current(), 0);
             })
         });
         // 一路滚到纵向边缘（贴边 contain：缩放 4× → 3200×1600，ay=(1600-600)/2=500）再继续
@@ -1632,7 +1613,7 @@ mod tests {
             viewer.update(app, |v, cx| {
                 v.pan.1 = -500.0; // 已到边缘
                 v.wheel_pan_or_switch(1, 100.0, cx);
-                assert_eq!(v.current, 1, "滚到边缘继续同向外滚才切下一张");
+                assert_eq!(v.nav.current(), 1, "滚到边缘继续同向外滚才切下一张");
                 assert_eq!(v.zoom, 1.0, "切图后缩放复位为适应视口");
                 assert_eq!(v.pan, (0.0, 0.0), "切图后平移归零");
             })
@@ -1647,8 +1628,10 @@ mod tests {
         let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
             app.new(|cx| {
                 let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
-                v.folder = vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")];
-                v.current = 0;
+                v.nav = FolderNav::new(
+                    vec![dir.join("a.jpg"), dir.join("b.jpg"), dir.join("c.jpg")],
+                    0,
+                );
                 v.last_viewport = (800.0, 600.0);
                 v.intrinsic = Some((100.0, 50.0)); // 1× 适配视口（752×376 < 800×600）
                 v.zoom = 1.0;
@@ -1658,7 +1641,7 @@ mod tests {
         cx.update(|app| {
             viewer.update(app, |v, cx| {
                 v.wheel_pan_or_switch(1, 50.0, cx);
-                assert_eq!(v.current, 1, "未放大：滚轮仍直接切下一张");
+                assert_eq!(v.nav.current(), 1, "未放大：滚轮仍直接切下一张");
                 assert_eq!(v.zoom, 1.0);
             })
         });
@@ -1693,8 +1676,7 @@ mod tests {
         let viewer: gpui::Entity<ImageViewer> = cx.update(|app| {
             app.new(|cx| {
                 let mut v = ImageViewer::new(dir.join("a.jpg"), cx);
-                v.folder = vec![dir.join("a.jpg"), dir.join("b.jpg")];
-                v.current = 0;
+                v.nav = FolderNav::new(vec![dir.join("a.jpg"), dir.join("b.jpg")], 0);
                 v.locked = true;
                 v
             })
@@ -1890,25 +1872,26 @@ mod tests {
         std::fs::write(dir.join("note.md"), "not an image").unwrap();
         std::fs::write(dir.join("logo.WEBP"), "fake webp bytes").unwrap();
         let current = dir.join("b.png");
-        let (list, idx) = scan_folder(&current);
-        let names: Vec<String> = list
+        let nav = FolderNav::scan(&current, crate::image::is_image_extension);
+        let names: Vec<String> = nav
+            .items()
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         // md 排除；WEbP 大小写不敏感识别；清单按文件名升序。
         assert_eq!(names, vec!["a.png", "b.png", "c.jpeg", "logo.WEBP"]);
-        assert_eq!(idx, 1);
-        assert_eq!(list[idx], current);
+        assert_eq!(nav.current(), 1);
+        assert_eq!(nav.current_path(), current);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn scan_folder_empty_dir_falls_back_to_single_item() {
         let p = tmp_dir("orf").join("orphan.png");
-        let (list, idx) = scan_folder(&p);
-        assert_eq!(list.len(), 1);
-        assert_eq!(idx, 0);
-        assert_eq!(list[0], p);
+        let nav = FolderNav::scan(&p, crate::image::is_image_extension);
+        assert_eq!(nav.len(), 1);
+        assert_eq!(nav.current(), 0);
+        assert_eq!(nav.current_path(), p);
     }
 
     /// 实测大图冷解码耗时：**全分辨率（旧链路 `image` 全解）vs 展示尺寸档（新链路
@@ -2071,7 +2054,7 @@ mod tests {
         flush(cx);
         let (cache_len, folder_len) = cx.update(|app| {
             let v = viewer.read(app);
-            (v.cache.len(), v.folder.len())
+            (v.cache.len(), v.nav.len())
         });
         assert!(
             cache_len >= 3,
