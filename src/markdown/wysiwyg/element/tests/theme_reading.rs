@@ -88,8 +88,8 @@ fn reading_column_clamps_frame_and_centers_hits(cx: &mut TestAppContext) {
             let frame = e.frame.borrow().clone().expect("真实渲染应已建帧");
             let local = point(px(f32::from(frame.padding) + 10.), px(2.));
             let win = point(local.x + px(shift), local.y);
-            let off_win = super::source_offset_at(&e, &frame, win);
-            let off_local = super::source_offset_at_local(&e, &frame, local);
+            let off_win = super::source_offset_at(e, &frame, win);
+            let off_local = super::source_offset_at_local(e, &frame, local);
             assert_eq!(
                 off_win, off_local,
                 "窗口坐标叠加居中移位后应命中与局部坐标同一源偏移（off={off_local}）"
@@ -103,7 +103,7 @@ fn reading_column_clamps_frame_and_centers_hits(cx: &mut TestAppContext) {
 #[gpui::test]
 fn reading_column_narrows_with_window(cx: &mut TestAppContext) {
     cx.update(crate::actions::bind_local_keymaps);
-    let text = "# 标题\n\n一段很长的正文内容用于验证窗口缩窄后随窗口宽度重排。".repeat(1);
+    let text = "# 标题\n\n一段很长的正文内容用于验证窗口缩窄后随窗口宽度重排。".to_string();
     let (host, vcx) = cx.add_window_view(|window, cx| {
         let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
         WyHost { ed }

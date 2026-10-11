@@ -48,7 +48,7 @@ fn wrapped_row_click_on_second_visual_line_lands_in_second_half(cx: &mut TestApp
     // 长文本，在 300px 宽度窗口内必然折成 ≥2 个可视行。
     let words = "1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678 1234 5678";
     let (host, vcx) = cx.add_window_view(|window, cx| {
-        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&words));
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(words));
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;

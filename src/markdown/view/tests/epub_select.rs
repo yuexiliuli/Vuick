@@ -134,7 +134,7 @@
             (md.marker_hl, md.selection, def_hit)
         });
         assert_eq!(hl, Some((def1_row, 1, true)), "点文内引用应定位到定义并加亮定义标记");
-        assert!(!sel.is_some(), "点标记不应进入文本点选");
+        assert!(sel.is_none(), "点标记不应进入文本点选");
         assert!(def_hit, "定义行仍在视口内、定义命中仍可查");
 
         // 反向：点击定义 [1] → 跳回文内引用行并加亮引用标记（is_def=false）。

@@ -189,13 +189,14 @@ fn runs_to_text_runs_clamps_mid_char_ranges_to_char_boundaries() {
     );
 
     // —— 3) 越界区间 + 反向区间 + 重叠区间：一律不 panic、输出仍然铺满 ——
+    #[allow(clippy::reversed_empty_ranges)] // 故意喂「反向 → 空」区间，检验 tiling 兜底不 panic
     let tricky = vec![
         (20..30, RunKind::Bold), // 整体越界 → 吸收到行尾/空
         (9..2, RunKind::Italic), // 反向 → 空
         (1..13, RunKind::Link),  // 切进首字符 → 吸收成 [0..13) 整行链接
     ];
     let out = runs_to_text_runs(
-        &text,
+        text,
         &tricky,
         &base,
         plain,

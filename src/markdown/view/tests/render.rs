@@ -299,10 +299,7 @@ fn reading_col_and_heading_line_ratio_constants(cx: &mut TestAppContext) {
     );
     // 正文 14px 参考：72ch ≈ 806px（典型阅读栏宽，符合「~800px 级」预期）。
     assert!((crate::config::markdown::reading_col_px(14.0) - 806.4).abs() < 0.01);
-    assert!(
-        crate::config::markdown::READING_COL_ENABLED,
-        "阅读栏默认应开启"
-    );
+    const { assert!(crate::config::markdown::READING_COL_ENABLED, "阅读栏默认应开启") };
     // 行高系数分级：h1 < h2 < h3 < h4 < h5，且都 > 1、< 2（h1 收紧、小级透气）。
     let ratios = crate::config::markdown::HEADING_LINE_RATIOS;
     assert!(

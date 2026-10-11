@@ -1029,6 +1029,10 @@ mod tests {
     /// 文本提取冒烟：真实 PDF 首页能取出非空文本层，且每个字符盒有限、落在页内。
     #[test]
     fn extracts_page_text_from_real_pdf() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         let p = target_pdf_paths()[0].clone();
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
@@ -1080,6 +1084,10 @@ mod tests {
     /// 未打开的文档请求文本 → None（区别于“页面无文本”的 Some(空)）。
     #[test]
     fn text_request_for_unknown_doc_returns_none() {
+        if crate::pdf::test_util::missing_pdf_fixture() {
+            eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+            return;
+        }
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
         let p = target_pdf_paths()[0].clone();
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());

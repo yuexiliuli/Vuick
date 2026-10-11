@@ -815,6 +815,7 @@ fn char_align_highlights_survives_stale_ranges() {
     };
 
     // 一把“脏”区间：越界 end / start-end 都切在多字节字符内 / 反向区间。
+    #[allow(clippy::reversed_empty_ranges)] // 故意喂「反向（空）」区间，检验钳位兜底不 panic
     let stale = vec![
         (1..20, bold),   // start 切进『测』(0..3) 内部，end 越界
         (8..8, italic),  // 空区间

@@ -373,8 +373,8 @@ impl Doc {
 
     /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
     /// 切片，不整份持有字符串——与预览一致。`line_starts` 用 chunks 单遍扫（O(n)，
-    /// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降）。
-    #[allow(dead_code)]
+    /// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降）。仅测试消费（parity 对比）。
+    #[cfg(test)]
     pub(crate) fn open_rope(rope: Rope) -> Self {
         let index = parse::scan_blocks_rope(&rope);
         let line_starts = build_line_starts_rope(&rope);
@@ -606,8 +606,8 @@ impl Doc {
     }
 
     /// 行粒度 UTF-16 前缀索引（与 `line_starts` 平行）：第 i 项 = `line_starts[i]` 前累计
-    /// UTF-16 单元数。
-    #[allow(dead_code)]
+    /// UTF-16 单元数。仅测试消费（parity 对比）。
+    #[cfg(test)]
     pub(crate) fn line_utf16_starts(&self) -> &LineStarts {
         &self.line_utf16_starts
     }
@@ -729,8 +729,8 @@ impl Doc {
         rows.into_iter().enumerate().map(|(j, r)| self.assemble(lo + j, r)).collect()
     }
 
-    /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。
-    #[allow(dead_code)]
+    /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。仅测试消费（parity 对比）。
+    #[cfg(test)]
     pub(crate) fn rows_in_line_window(&self, lo_line: usize, hi_line: usize) -> Vec<DocRow> {
         let b = &self.index.blocks;
         if b.is_empty() {
@@ -938,7 +938,8 @@ impl Doc {
 }
 
 /// rope 的行起始字节偏移表（`split('\n')` 语义）：chunks 单遍扫（每字节一次，O(n)），
-/// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降。
+/// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降。仅测试消费（`open_rope` 用）。
+#[cfg(test)]
 fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
     let mut v = vec![0usize];
     let mut pos = 0usize;

@@ -24,15 +24,14 @@ fn long_inline_math_typed_after_single_value_within_box(cx: &mut TestAppContext)
             super::super::inline_math_key(&latex),
             super::super::MathSlot::Ready(img, 4000., 40.),
         );
-        let mut caret = ed.read(cx).content().find("后尾").unwrap();
+        let caret_start = ed.read(cx).content().find("后尾").unwrap();
         let mut frames: Vec<(f32, usize, f32, f32)> = Vec::new();
         let mut last_following_top = 0.0;
-        for _ in 0..6 {
+        for caret in caret_start..(caret_start + 6) {
             ed.update(cx, |e, ecx| {
                 e.set_caret(caret);
                 e.replace_range(caret..caret, "X", ecx);
             });
-            caret += 1;
             let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
             let r = &f.rows[0];
             let w0 = r.wrapped.first().unwrap();
@@ -174,9 +173,9 @@ fn block_math_typing_geometry_stable_across_slot_flip(cx: &mut TestAppContext) {
     vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         // 光标在后续段（块折叠成卡）：模拟「每键一次换代」——帧内交替 Loading/Ready。
-        let mut caret = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
+        let caret_start = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
         let mut prev: Option<(f32, f32)> = None;
-        for k in 0..6 {
+        for (caret, k) in (caret_start..).take(6).zip(0..6) {
             let slots = ed.read(cx).math_slots();
             slots.borrow_mut().remove(latex.as_str());
             if k % 2 == 0 {
@@ -190,7 +189,6 @@ fn block_math_typing_geometry_stable_across_slot_flip(cx: &mut TestAppContext) {
                 e.set_caret(caret);
                 e.replace_range(caret..caret, "X", ecx);
             });
-            caret += 1;
             let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
             let card_h = f
                 .rows
@@ -240,14 +238,13 @@ fn wide_block_math_followed_by_typing_stays_single_value(cx: &mut TestAppContext
             latex.clone().into(),
             super::super::MathSlot::Ready(img, 5000., 60.),
         );
-        let mut caret = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
+        let caret_start = ed.read(cx).content().find("后文 xxxx").unwrap() + "后文 xxxx".len();
         let mut prev: Option<(f32, f32)> = None;
-        for k in 0..5 {
+        for (caret, k) in (caret_start..).take(5).zip(0..5) {
             ed.update(cx, |e, ecx| {
                 e.set_caret(caret);
                 e.replace_range(caret..caret, "X", ecx);
             });
-            caret += 1;
             let f = build_frame(ed.read(cx), window, px(400.), (0., 999_999.));
             // 卡片行 = 唯一带 `extra.card` 的行；其高度 + 卡片下方后续段落 top 必须稳定。
             let card_h = f

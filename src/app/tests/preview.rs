@@ -764,9 +764,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let md = std::env::current_dir()
-            .unwrap()
-            .join("target/测试.md");
+        let md = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/测试.md");
         let src_expected = std::fs::read_to_string(&md).expect("read 测试.md");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));

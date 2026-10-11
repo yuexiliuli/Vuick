@@ -1,0 +1,8 @@
+# 工具链 pin：CI（dtolnay/rust-toolchain@master + toolchain 显式传参）与本机
+# rustup（cargo 调用时自动读取本文件）双读此版本。
+# 依据：crate 用 edition 2024（需 stable ≥ 1.85）；本机 rustc 1.96.0
+# （2026-05-25）已实测 cargo check / test / clippy 全绿（含全部视觉回归），
+# pin 到「已知可构建」的稳定版，避免未来 stable 升级漂移破坏构建或 clippy 基线。
+# 升级工具链需同时改这里与 .github/workflows/ci.yml 两处显式 "1.96.0"。
+[toolchain]
+channel = "1.96.0"

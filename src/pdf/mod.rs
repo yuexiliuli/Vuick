@@ -74,6 +74,25 @@ pub(crate) mod test_util {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    /// 测试 PDF 夹具路径（仓库根 `target/`，**不入库**）：
+    /// 本机 Rust 进程内 pdfium 对 `fixtures/` 下的 PDF 报 FormatError（PDF Complete 之外
+    /// 风格无法解析），fixtures/ 下文件一律不用；`target/` 下三个文件生产路径可解析。
+    /// 保留两元素索引形状：0=基础文本型、1=长文（≥50 页）。
+    pub(crate) fn test_pdf_paths() -> Vec<std::path::PathBuf> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        vec![
+            manifest.join("pdf测试.pdf"),
+            manifest.join("pdf测试2.pdf"),
+        ]
+    }
+
+    /// 缺夹具判定：`target/pdf测试*.pdf` 任一缺失即 true。CI/装好夹具的机器返回 false，
+    /// 测试真跑；本机无夹具时所有依赖真 PDF 的测试用它做「缺夹具即 SKIP」守卫（夹具
+    /// 超 1MB 不入库，只能本地手动装配，故 SKIP 是常态而非异常）。
+    pub(crate) fn missing_pdf_fixture() -> bool {
+        !test_pdf_paths().iter().all(|p| p.exists())
+    }
 }
 
 #[cfg(test)]
@@ -86,18 +105,22 @@ mod tests {
     }
 
     fn test_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-        // 本机 Rust 进程内 pdfium 对 fixtures/pdf测试.pdf 报 FormatError（PDF Complete 之外
-        // 风格无法解析），fixtures/ 下文件一律不用；target/ 下三个文件生产路径可解析。
-        // 保留两元素索引形状：0=基础文本型、1=长文（≥50 页）。
-        vec![
-            manifest.join("pdf测试.pdf"),
-            manifest.join("pdf测试2.pdf"),
-        ]
+        test_util::test_pdf_paths()
+    }
+
+    /// 缺夹具即 SKIP 守卫：无 `target/pdf测试*.pdf` 时打印并 `return`（CI 有夹具则真跑）。
+    macro_rules! skip_if_missing_pdf_fixture {
+        () => {
+            if test_util::missing_pdf_fixture() {
+                eprintln!("SKIP: missing target/pdf测试*.pdf（夹具不入库，本机无真 PDF）");
+                return;
+            }
+        };
     }
 
     #[test]
     fn parses_all_test_pdfs_and_reads_dims() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         for p in test_pdf_paths() {
             assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
@@ -120,6 +143,7 @@ mod tests {
 
     #[test]
     fn extracts_outline_from_pdf_bookmarks() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         // 目录提取冒烟测试：真实 PDF 能安全打开，outline 返回合法结构（可空）。
         // 注：本 dll 无法解析含 ObjStm（压缩对象流）的 PDF（如 pdfium-render 官方
@@ -156,6 +180,7 @@ mod tests {
 
     #[test]
     fn worker_renders_single_page_to_bgra() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -179,6 +204,7 @@ mod tests {
     /// 判据）。同时验证单瓦片尺寸恒 ~TILE_SIZE、内存不随页面积爆炸（单瓦片 ≪ 整页）。
     #[test]
     fn tiles_stitch_back_to_full_page_render() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -273,6 +299,7 @@ mod tests {
 
     #[test]
     fn worker_renders_thumbnail_at_low_resolution() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         // L0 缩略图：应远小于全尺寸位图，且宽度与 THUMB_WIDTH 推导一致（低成本占位层）
         let p = test_pdf_paths()[0].clone();
@@ -309,6 +336,7 @@ mod tests {
 
     #[test]
     fn worker_renders_mid_at_mid_resolution() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         // L0.5 中清页：宽度应按 MID_WIDTH 推导，体积介于缩略图与全清之间（拖动清晰度主力）
         let p = test_pdf_paths()[0].clone();
@@ -351,6 +379,7 @@ mod tests {
 
     #[test]
     fn worker_renders_many_pages_individually() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         // 长 PDF（target/pdf测试2.pdf，259 页文本型）：抽查首/中/末各一页
         // （模拟「滚动到哪渲染哪」）
@@ -385,6 +414,7 @@ mod tests {
 
     #[test]
     fn bgra_roundtrips_to_render_image() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -404,6 +434,7 @@ mod tests {
     /// 且 Y 朝向正确。若翻转方向写反 / 映射比例错，盒会落到空白处（无墨）或上下颠倒。
     #[test]
     fn text_boxes_align_with_rendered_glyphs() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -509,6 +540,7 @@ mod tests {
     /// 防止每字符盒高沿抖动导致选区高亮锯齿。
     #[test]
     fn mapped_line_baselines_stay_within_pixel_variance() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         // 注：长 PDF fixture 已变更为 242 页**扫描件**（无文本层），故改在文本型
         // pdf测试.pdf 上选内容稠密页验证（动态挑页，防 fixture 换页号被戳穿）。
@@ -592,6 +624,7 @@ mod tests {
     /// 该行复制文本应无内部换行、且首尾字符保留（启发式空格除外）。
     #[test]
     fn real_page_lines_merge_to_single_span_and_copy_keeps_chars() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
@@ -650,6 +683,7 @@ mod tests {
     /// 并打印最稠密页的首行文本样本便于人工核对抽取质量。
     #[test]
     fn configure_sheet_selection_pipeline() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
         assert!(p.exists(), "测试文件应存在: {}", p.display());
@@ -744,6 +778,7 @@ mod tests {
     /// 无命中返回空；空串返回空且不截断。
     #[test]
     fn doc_search_finds_and_verifies_hits() {
+        skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
         let p = test_pdf_paths()[0].clone();
         assert!(p.exists(), "测试 PDF 应存在: {}", p.display());
@@ -808,6 +843,8 @@ mod tests {
     /// 修复后：检索按片执行（数页/数 ms 一片），检索期间到达的渲染只等一片就轮到。
     #[test]
     fn whole_doc_search_freeze_blocks_renders_probe() {
+        // 时序探针（`render_wait_ms < search_ms * 0.4`）：有夹具时随套件跑，验证检索分片不冻结渲染。
+        skip_if_missing_pdf_fixture!();
         use std::time::{Duration, Instant};
         let _guard = pdf_lock().lock().unwrap();
         // 必须用长文本型 PDF（target/pdf测试2.pdf，259 页）复现：18 页文本 PDF 整篇检索
@@ -859,6 +896,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // 性能基准：依赖真 PDF 夹具且耗时，手动 `--ignored` 跑
     fn bench_first_pages_render_time() {
         let _guard = pdf_lock().lock().unwrap();
         // 首次浏览性能摸底：加载 + 顺序渲染前 8 页，统计平均单页端到端耗时
@@ -894,6 +932,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // 性能基准：依赖真 PDF 夹具且耗时，手动 `--ignored` 跑
     fn bench_single_page_latency_histogram() {
         let _guard = pdf_lock().lock().unwrap();
         // 单页端到端延迟直方图：连发 5 次第 2 页，看 worker 是否排队/稳定性
@@ -917,6 +956,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // 性能基准：依赖真 PDF 夹具且耗时，手动 `--ignored` 跑
     fn bench_worker_cost_split() {
         let _guard = pdf_lock().lock().unwrap();
         // 细拆分：pdfium 栅格化 vs RGBA→BGRA 重排 vs PNG 编码，各占多少毫秒
@@ -947,6 +987,7 @@ mod tests {
     /// 同时可视区窄于「页宽+边距」时必须产生横向溢出（可滚到全部页面）。
     #[gpui::test]
     async fn pdf_column_centers_within_pane_width(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{
             AppContext, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
         };
@@ -1033,6 +1074,7 @@ mod tests {
     /// 回归：Ctrl+滚轮应放大/缩小页面（页列宽、整列高随之变化），普通滚轮不改变缩放。
     #[gpui::test]
     async fn pdf_ctrl_wheel_zooms_in_out(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{
             AppContext, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
         };
@@ -1187,6 +1229,7 @@ mod tests {
     /// `tile_scale` 与当前显示密度一致；且可视区只驻留少量瓦片（内存按视口封顶）。
     #[gpui::test]
     async fn tiles_fill_viewport_on_visible_pages(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1401,6 +1444,7 @@ mod tests {
     /// 带时间戳（`timing_ms`）的巡检行，与 `GPUI_EDITOR_PDF_TIMING=1` 的控制台日志对位。
     #[gpui::test]
     async fn auto_flip_renders_every_stop_page(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1565,6 +1609,7 @@ mod tests {
     /// “随机页先模糊、数秒后清晰”的根因。
     #[gpui::test]
     async fn abrupt_fast_stop_sharpens_without_input(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1777,6 +1822,7 @@ mod tests {
     /// 回收该页瓦片与中清、瓦片预算降到 40MB，完整滚动后应显著回落。
     #[gpui::test]
     async fn memory_stays_bounded_after_full_scroll(cx: &mut gpui::TestAppContext) {
+        skip_if_missing_pdf_fixture!();
         use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -1943,6 +1989,7 @@ mod tests {
     /// 用法：当前工作树跑一遍记录 after；再 `git worktree add <tmp> e031f0c` 并在其中
     /// 打上 `git diff HEAD -- src/pdf/mod.rs`（本文件即基准源码）后各跑一次，对比 [BENCH]。
     #[gpui::test]
+    #[ignore] // 性能/内存基准：依赖真 PDF 夹具且耗时，手动 `--ignored` 跑
     async fn bench_full_scroll_time_memory(cx: &mut gpui::TestAppContext) {
         use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
         use std::cell::RefCell;
