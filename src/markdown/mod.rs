@@ -14,6 +14,9 @@ pub(crate) mod view;
 mod parse;
 mod doc;
 mod ir;
+/// 共享行整形核心（B5 蓝图 Phase 1）：`DocRow → 横向分片几何`。
+/// 纯新增面，未接任何现有调用方——WYSIWYG `shape` 与预览 `row` 仍走各自路径。
+mod layout;
 pub(crate) mod wysiwyg;
 
 pub use parse::{scan_blocks_incremental_rope, scan_blocks_rope, BlockIndex, RowAlign};

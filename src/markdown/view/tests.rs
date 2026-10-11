@@ -10,3 +10,5 @@ include!("tests/windowed.rs");
 include!("tests/epub_select.rs");
 include!("tests/bench_preview.rs");
 include!("tests/gap.rs");
+// B5 Phase 1 对照测试：shared shard 高度累加 == 现行预览实测行高（见 layout/mod.rs）。
+include!("tests/layout_shared.rs");
