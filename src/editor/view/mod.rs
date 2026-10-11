@@ -1899,20 +1899,27 @@ impl CodeEditor {
     }
 
     /// 重扫折叠候选：≤ 阈值的整篇扫，超大文档清空（改为按需折叠）。
+    ///
+    /// 落地后按 `start` 升序排序——gutter 逐行查询 `candidate_starting_at` 靠它做
+    /// O(log n) 二分（原始 `scan_fold_candidates` 是 LIFO 收栈序，非单调，不能直接查）。
+    /// 排序只改内部存储次序，候选集合与折叠/点击语义不变。
     fn recompute_fold_candidates(&mut self) {
         if self.row_count > FOLD_CANDIDATE_FULL_MAX_LINES {
             self.fold_candidates.clear();
         } else {
             self.fold_candidates = self.scan_fold_candidates();
+            self.fold_candidates.sort_by_key(|f| f.start);
         }
     }
 
     /// 以 `line` 为起点的折叠候选（gutter 指示器/点击折叠的区间来源）。
+    ///
+    /// `fold_candidates` 已按 `start` 升序（见 `recompute_fold_candidates` / 后台
+    /// `refresh_fold_brackets` 落地处）→ 二分 O(log n)，避免 gutter 每帧对每行做
+    /// O(候选数) 线性扫描（大文档数列 ~1k+ 候选 × 每帧 40 行 = 每键几 ms 白烧）。
     fn candidate_starting_at(&self, line: usize) -> Option<Fold> {
-        self.fold_candidates
-            .iter()
-            .find(|f| f.start == line)
-            .copied()
+        let i = self.fold_candidates.partition_point(|f| f.start < line);
+        self.fold_candidates.get(i).filter(|f| f.start == line).copied()
     }
 
     /// `line` 是否有「可折叠」标记：已激活折叠首行，或折叠候选起点。
@@ -1922,6 +1929,8 @@ impl CodeEditor {
     }
 
     /// 重扫括号标尺配对：≤ 阈值整篇扫（跨字符串/注释词法），超大文档清空。
+    /// 落地后按 `open_line` 升序排序（标尺按视口窗口化二分，见
+    /// `bracket_guide_segments_flagged`）；排序不影响配对集合/配对语义。
     fn recompute_bracket_pairs(&mut self) {
         if self.row_count > FOLD_CANDIDATE_FULL_MAX_LINES {
             self.bracket_pairs.clear();
@@ -1931,6 +1940,7 @@ impl CodeEditor {
                 |r| buffer.line_text(r),
                 self.row_count,
             );
+            self.bracket_pairs.sort_by_key(|p| p.open_line);
         }
     }
 
@@ -1971,8 +1981,13 @@ impl CodeEditor {
                 let done = this
                     .update(cx, |this, cx| {
                         if epoch == this.scan_epoch {
+                            // 落地即排序：折叠候选按 `start`、括号配对按 `open_line`
+                            // 升序（gutter/标尺查询走二分，见 `candidate_starting_at` 与
+                            // `bracket_guide_segments_flagged`）。仅内部次序，语义不变。
                             this.fold_candidates = folds;
+                            this.fold_candidates.sort_by_key(|f| f.start);
                             this.bracket_pairs = brackets;
+                            this.bracket_pairs.sort_by_key(|p| p.open_line);
                             this.scan_inflight = false;
                             cx.notify();
                             true
@@ -2029,9 +2044,21 @@ impl CodeEditor {
         let cw = self.char_width.as_f32().max(1.);
         let hscroll = self.hscroll_px();
         let bottom_vis = top_vis.saturating_add(((view_h / lh).ceil() as usize) + 1);
+        // 窗口化：配对已按 `open_line` 升序（两个落地处排序，见 `recompute_bracket_pairs` /
+        // `refresh_fold_brackets`）。竖线只可能来自 `open_line ∈ [top_vis − 回看, bottom_vis]`
+        // 的配对——开括号在视口之下（`> bottom_vis`）的配对必不相交；开在「回看」行以上的
+        // 大跨度配对（竖线远超一屏）视为无意义跳过。原实现对**全部**配对逐条算 `visual_row`
+        // /相交判定（大文档 1k+ 对 × 每帧 = 每键几 ms 白烧），实际视口内只有个位数可见段。
+        // 回看再放宽也不影响正确性（仍逐条跑原过滤），只决定「多长跨度的竖线还画」。
+        let lb = self
+            .bracket_pairs
+            .partition_point(|p| p.open_line < top_vis.saturating_sub(
+                crate::config::limits::BRACKET_GUIDE_WINDOW_LOOKBACK_LINES,
+            ));
+        let ub = self.bracket_pairs.partition_point(|p| p.open_line <= bottom_vis);
         // (x, 视觉顶行, 视觉底行**开区间**, 是否点亮) —— 先整列收集，再合并同列重叠/相邻段。
         let mut intervals: Vec<(f32, usize, usize, bool)> = Vec::new();
-        for p in &self.bracket_pairs {
+        for p in &self.bracket_pairs[lb..ub] {
             if p.open_line >= p.close_line {
                 continue; // 过期（编辑后未及时重扫）的配对；重扫会清理。
             }

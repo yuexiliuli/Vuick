@@ -457,7 +457,8 @@ fn fold_candidates_detected_for_indented_blocks(cx: &mut TestAppContext) {
     let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
     let (host, cx) = open(cx, text);
     let cands = cx.update(|_, cx| host.read(cx).ed.read(cx).test_fold_candidates().to_vec());
-    assert_eq!(cands, vec![Fold { start: 1, end: 3 }, Fold { start: 0, end: 5 }]);
+    // 落地点按 `start` 升序（`candidate_starting_at` 二分查询依赖排序）；集合不变。
+    assert_eq!(cands, vec![Fold { start: 0, end: 5 }, Fold { start: 1, end: 3 }]);
     // gutter 指示器口径：候选起点行有标记。
     let marks = cx.update(|_, cx| {
         let ed = host.read(cx).ed.clone();
@@ -523,18 +524,70 @@ fn bracket_guides_detected_and_rendered(cx: &mut TestAppContext) {
     let text = "impl RowData {\n    fn empty() -> Self {\n        Self {\n            a: 1,\n        }\n    }\n}";
     let (host, cx) = open(cx, text);
     let pairs = cx.update(|_, cx| host.read(cx).ed.read(cx).test_bracket_pairs().to_vec());
+    // 落地点按 `open_line` 升序（标尺视口二分依赖排序）；配对集合不变。
     assert_eq!(
         pairs,
         vec![
-            crate::editor::fold::BracketPair { open_line: 2, open_col: 13, close_line: 4, guide_units: 8 },
-            crate::editor::fold::BracketPair { open_line: 1, open_col: 23, close_line: 5, guide_units: 4 },
             crate::editor::fold::BracketPair { open_line: 0, open_col: 13, close_line: 6, guide_units: 0 },
+            crate::editor::fold::BracketPair { open_line: 1, open_col: 23, close_line: 5, guide_units: 4 },
+            crate::editor::fold::BracketPair { open_line: 2, open_col: 13, close_line: 4, guide_units: 8 },
         ]
     );
     // 竖线叠层确实渲染进树。
     assert!(
         cx.debug_bounds("ce-bracket-guides").is_some(),
         "括号标尺叠层应渲染"
+    );
+}
+
+#[gpui::test]
+fn bracket_guide_window_keeps_enclosing_pair_when_viewport_deep(cx: &mut TestAppContext) {
+    // 标尺窗口化（Sprint 4a，`BRACKET_GUIDE_WINDOW_LOOKBACK_LINES`）回归：
+    // 视口已滚到某外层块的**深处**（open_line 在视口顶上方、但仍在回看窗口内）时，
+    // 该块的竖线仍须画出——竖线贯穿视口（高层包装块/长函数体）。若窗口下界误用
+    // 视口顶（而非 视口顶−回看），深滚时外层竖线会整段漏画。
+    use crate::config::limits::BRACKET_GUIDE_WINDOW_LOOKBACK_LINES as LOOKBACK;
+    let mut text = String::new();
+    text.push_str("fn outer() {\n"); // line 0
+    text.push_str("    println!(\"head\");\n"); // line 1..9
+    for _ in 2..10 {
+        text.push_str("    \n");
+    }
+    text.push_str("    {\n"); // line 10
+    for _ in 11..40 {
+        text.push_str("    \n");
+    }
+    text.push_str("    }\n"); // line 40
+    text.push_str("}\n"); // line 41
+    let (host, cx) = open(cx, &text);
+    let (cw, lh, _g) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metrics());
+    let lh = lh.max(1.);
+    let top_vis = 20; // 视口在两层块中间（外层 open=0 上方远处、仍回看窗口内）。
+    assert!(
+        top_vis < LOOKBACK,
+        "本用例的前置：20 < 回看 {LOOKBACK}"
+    );
+    // 视口内可见竖线段：外层 fn（x≈0）从 21 到底、内层 {（x≈4）从 21 到 39。
+    let segs = cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.read(cx).test_bracket_guide_segments(top_vis, 0.0, lh, 1200.0, 1000.0)
+    });
+    let outer = segs
+        .iter()
+        .find(|(x, _, h)| (*x - 0.0 * cw).abs() < 1.0 && *h > (40 - top_vis - 1) as f32 * lh)
+        .expect("视口深处仍应有外层 fn 竖线（贯穿视口）");
+    assert!(
+        outer.1 < lh * 2.,
+        "外层竖线应贴视口顶（从 open 之后的深处横贯）：y={}",
+        outer.1
+    );
+    let inner = segs
+        .iter()
+        .find(|(x, _, h)| (*x - 4.0 * cw).abs() < 1.0 && *h > 15.)
+        .expect("应有内层 { 竖线");
+    assert!(
+        inner.1 >= 0. && inner.2 > 0.,
+        "内层竖线应在视口内可见：{inner:?}"
     );
 }
 
