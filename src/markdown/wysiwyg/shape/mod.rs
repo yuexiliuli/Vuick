@@ -37,7 +37,7 @@ pub(crate) fn runs_to_text_runs(
     base: &gpui::Font,
     color: gpui::Hsla,
     mono: &gpui::Font,
-    _accent: gpui::Hsla,
+    accent: gpui::Hsla,
     link: gpui::Hsla,
     code_inline_fg: gpui::Hsla,
 ) -> Vec<gpui::TextRun> {
@@ -96,6 +96,12 @@ pub(crate) fn runs_to_text_runs(
             }
             // 行内图片：alt 只是加载完成前的占位文字——正文色、无下划线（不冒充链接）。
             RunKind::Image => {}
+            // 脚注标记 `[n]`：静态 accent 高亮（回归修复——P4-2 后标号回落到正文色）。
+            // 对齐 A 侧预览 `link_color = p.accent` 同色；**不下划线**（不冒充链接，
+            // 与老预览的 HighlightStyle 只着色一致）。
+            RunKind::NoteMarker => {
+                tr.color = accent;
+            }
         }
         out.push(tr);
         i = e;

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{note_marker_hit_at, NoteMarkerHit};
+use gpui::MouseUpEvent;
 
 /// 构造仅含「PNG 签名 + IHDR 头」的伪 PNG 字节（`image_dimensions_bytes` 只嗅头部，
 /// 故只需头 24 字节即可读出固有尺寸；不参与整图解码）。
@@ -199,6 +200,178 @@ fn epub_image_row_and_align_render_together(cx: &mut TestAppContext) {
         Some("epubimg://2.jpeg"),
         "图片行 src 应为 EPUB 内存虚拟 src"
     );
+}
+
+/// P4-2 回归修复：静态 `[n]` 标号要有 accent 高亮（用户报告「标号如[1][2]的高亮没了」）。
+/// 根因：注记迁入 WYSIWYG 后 marker 显示区间只是普通正文 run，paint 只画跳转后的瞬态
+/// 加亮。修复：`extract_notes` 在剥记号的同时把 `[n]` 显示区间登记成 `RunKind::NoteMarker`
+///（与既有 runs 无重叠 break-merge），`runs_to_text_runs` 染成 accent 色（对齐 A 侧预览
+/// `link_color = p.accent`）、不下划线。锁两条：① parse 后 marker 区间带
+/// `RunKind::NoteMarker`（真实渲染路径上游）；② 该 run 经 `runs_to_text_runs` 产出
+/// accent 色 TextRun（真实渲染路径具体化）。
+#[test]
+fn note_marker_static_highlight_restored() {
+    use crate::markdown::parse::{RunKind, parse_to_rows};
+    use super::runs_to_text_runs;
+    // ① 「正文[^1]带注段。」 → 显示「正文[1]带注段。」，`[1]` 显示区间 = 6..9 字节。
+    let rows = parse_to_rows("正文[^1]带注段。");
+    assert_eq!(rows[0].text.as_ref(), "正文[1]带注段。");
+    let mk_run = rows[0]
+        .runs
+        .iter()
+        .find(|(rg, k)| *k == RunKind::NoteMarker && rg.start == 6 && rg.end == 9)
+        .expect("注记标记显示区间应带 RunKind::NoteMarker（静态高亮来源）");
+    assert_eq!(mk_run.0.len(), 3, "标记区间 = `[1]` 3 字节");
+    // ② runs_to_text_runs 把 NoteMarker 染成 accent 色、无下划线（A 侧 p.accent 同色）。
+    let base = gpui::font("Arial");
+    let mono = gpui::font("Consolas");
+    let accent: gpui::Hsla = gpui::rgb(0x3b82f6).into();
+    let text = rows[0].text.as_ref();
+    let out = runs_to_text_runs(
+        text,
+        &rows[0].runs,
+        &base,
+        gpui::Hsla::default(),
+        &mono,
+        accent,
+        gpui::Hsla::default(),
+        gpui::Hsla::default(),
+    );
+    let marker_run = out
+        .iter()
+        .find(|r| r.color == accent && r.len == 3)
+        .expect("`[1]` 标记应渲染成 accent 色 TextRun");
+    assert!(marker_run.underline.is_none(), "标记不下划线（不冒充链接）");
+}
+
+/// P4-2 回归修复：双击注记标记 `[n]` **不**双向跳转（用户报告「某些段落双击 → 闪烁
+/// 变动/文字掉到其他行」，EPUB 尾部 90 条注记尤其严重）。根因：P4-2 在 `on_mouse_down`
+/// 无条件 `navigate_marker`，双击首击即 `set_scroll_target` 跳对端 + 瞬态加亮。修复：
+/// 按下只登记「单击确认」待跳转（[`NOTE_NAV_CONFIRM_MS`] 窗口），第二击作废 → 双击
+/// 全程不跳转、不闪；单击（确认窗口到点）仍正常跳转对端。
+#[gpui::test]
+fn wy_note_double_click_does_not_navigate(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text(
+                "正文引用[^1]继续\n\n[!1] 这是尾部注释正文的第一行文字，长到足以验证双击行为不跳转\n",
+            )
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    ed.update(vcx, |e, _| e.set_editable(false));
+    ed.update(vcx, |e, _| e.set_epub(true));
+    let width = vcx.update(|window, _| f32::from(window.viewport_size().width).max(1.));
+    let frame = vcx.update(|window, cx| {
+        let f = build_frame(ed.read(cx), window, px(width), (0., 999_999.));
+        std::rc::Rc::new(f)
+    });
+    // 定义行 `[!1]`（src_line 2）的 `[1]` 标记字形几何中心 = 单击/双击命中点。
+    let def_row = frame
+        .rows
+        .iter()
+        .find(|r| r.src_line == 2)
+        .expect("定义行");
+    let dmk = def_row
+        .extra
+        .note_markers
+        .iter()
+        .find(|m| m.n == 1 && m.is_def)
+        .expect("定义标记 `[1]`");
+    let w0 = &def_row.wrapped[0];
+    let p0 = w0.position_for_index(dmk.disp.start, def_row.lh).unwrap();
+    let p1 = w0.position_for_index(dmk.disp.end, def_row.lh).unwrap();
+    assert_eq!(f32::from(p0.y), f32::from(p1.y), "行首 `[1]` 不应折行");
+    let ox = f32::from(frame.padding) + f32::from(def_row.x_off);
+    let center = point(
+        px(ox + (f32::from(p0.x) + f32::from(p1.x)) / 2.0),
+        px(f32::from(def_row.top) + f32::from(p0.y) + f32::from(def_row.lh) / 2.0),
+    );
+    let down = |click_count: usize| MouseDownEvent {
+        button: MouseButton::Left,
+        position: center,
+        modifiers: Modifiers::default(),
+        click_count,
+        first_mouse: false,
+    };
+    let up = MouseUpEvent {
+        button: MouseButton::Left,
+        position: center,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    };
+    // 双击序列 down(1) up(1) down(2) up(2)：全程不得设置跳转目标/加亮。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            *e.frame.borrow_mut() = Some(frame.clone());
+            e.on_mouse_down(&down(1), window, cx);
+            e.on_mouse_up(&up, cx);
+            e.on_mouse_down(&down(2), window, cx);
+            e.on_mouse_up(&up, cx);
+        });
+    });
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.scroll_target_line()),
+        None,
+        "双击不得设置滚动目标（否则整页位移）"
+    );
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.marker_hl_test()),
+        None,
+        "双击不得设置跳转加亮（否则闪烁）"
+    );
+    // 推进确认窗口 + 排空后台：双击首击登记的那枚「单击确认」定时器必须已被第二击作废，
+    // 不得在窗口到点后补发跳转（否则仍会整页位移）。
+    let drain = |cx: &TestAppContext| {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(
+                crate::config::timing::NOTE_NAV_CONFIRM_MS + 50,
+            ));
+        cx.run_until_parked();
+    };
+    let _ = vcx;
+    drain(cx);
+    {
+        let win = cx.windows()[0];
+        let mut vcx2 = VisualTestContext::from_window(win, cx);
+        assert_eq!(
+            ed.update(&mut vcx2, |e, _| e.marker_hl_test()),
+            None,
+            "双击全程不得触发跳转加亮（定时器须被第二击作废）"
+        );
+        assert_eq!(
+            ed.update(&mut vcx2, |e, _| e.scroll_target_line()),
+            None,
+            "双击全程不得设置滚动目标"
+        );
+    }
+    // 单击（唯一一次按下、确认窗口到点后）仍应正常跳转到文内引用行 0，并加亮文内标记。
+    let mut vcx3 = VisualTestContext::from_window(cx.windows()[0], cx);
+    vcx3.update(|window, cx| {
+        ed.update(cx, |e, cx| {
+            *e.frame.borrow_mut() = Some(frame.clone());
+            e.on_mouse_down(&down(1), window, cx);
+            e.on_mouse_up(&up, cx);
+        });
+    });
+    assert_eq!(
+        ed.read_with(&vcx3, |e, _| e.marker_hl_test()),
+        None,
+        "单击按下瞬间不得跳转（确认窗口内等待第二击判定）"
+    );
+    let _ = vcx3;
+    drain(cx);
+    let mhl = {
+        let win = cx.windows()[0];
+        let mut vcx4 = VisualTestContext::from_window(win, cx);
+        ed.update(&mut vcx4, |e, _| e.marker_hl_test())
+    };
+    assert_eq!(mhl, Some((0, 1, false)), "单击确认窗口到点后应跳转并加亮文内引用标记");
+    // （scroll_target 由宿主 prepaint 消费：本测试未注入 host_scroll，`advance_pending_scroll`
+    //  会因无宿主把目标清掉——跳转是否发生以持续到 2.2s 的 `marker_hl` 为准。）
 }
 
 /// P4-2：注记标记 `[^n]`/`[!n]` 迁入 WYSIWYG——shape 后 `extra.note_markers` 携带

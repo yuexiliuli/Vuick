@@ -56,6 +56,10 @@ pub enum RunKind {
     Link,
     /// 行内图片 `![alt](url)`：渲染为 alt 文字。
     Image,
+    /// 脚注标记 `[n]`（由 [`extract_notes`] 从 `[^n]`/`[!n]` 剥记号时登记）：
+    /// 静态渲染成 accent 高亮色（对齐 A 侧预览 `link_color = p.accent`）。与
+    /// `Row.notes`/`Row.note_defs` 同区间同位置——两处共用同一「显示区间」语义。
+    NoteMarker,
 }
 
 /// 表格列对齐（从分隔行 `:---:` / `---:` 解析）。
@@ -414,6 +418,12 @@ pub(crate) fn extract_notes(
     let mut out = String::with_capacity(src.len());
     let mut notes: Vec<(Range<usize>, usize)> = Vec::new();
     let mut note_defs: Vec<(Range<usize>, usize)> = Vec::new();
+    // 注记标记 `[n]` 静态 accent 高亮（回归：P4-2 注记迁入 WYSIWYG 后标号变回正文色）。
+    // 标记的显示区间（`out` 的当前字节位）就地收集成 `RunKind::NoteMarker`，循环后与
+    // 既有 runs 做无重叠 break-merge（同 WYSIWYG `shape::style_links_in_runs` 的切分），
+    // 防止「标记嵌在加粗/链接里」时 `runs_to_text_runs` 的顺延 `i` 把后加的标记 run
+    // 吞掉 → 高亮丢失。
+    let mut marker_runs: Vec<(Range<usize>, RunKind)> = Vec::new();
     let chars: Vec<(usize, char)> = src.char_indices().collect();
     let mut ci = 0usize;
     while ci < chars.len() {
@@ -442,6 +452,7 @@ pub(crate) fn extract_notes(
                     out.push(']');
                     let mark_end = out.len();
                     let entry = (mark_start..mark_end, n);
+                    marker_runs.push((mark_start..mark_end, RunKind::NoteMarker));
                     if is_def {
                         note_defs.push(entry);
                     } else {
@@ -463,7 +474,50 @@ pub(crate) fn extract_notes(
         out.push(ch);
         ci += 1;
     }
+    let runs = merge_marker_runs(out.len(), runs, &marker_runs);
     (out.into(), runs, notes, note_defs)
+}
+
+/// 把注记标记区间以 [`RunKind::NoteMarker`] 并入既有 runs，产出**互不重叠**、完全
+/// 铺满 `[0, text_len)` 的样式段：段内被标记区间**整段**覆盖 → NoteMarker（标记优先），
+/// 否则取覆盖它的既有 run（加粗/链接等）；两不沾 → 普通文本。边界取「既有 run 边界 ∪
+/// 标记区间边界」，旧 run 越界（剥记号后区间未收敛）段直接丢弃。
+fn merge_marker_runs(
+    text_len: usize,
+    old: Vec<(Range<usize>, RunKind)>,
+    extra: &[(Range<usize>, RunKind)],
+) -> Vec<(Range<usize>, RunKind)> {
+    if extra.is_empty() {
+        return old;
+    }
+    let mut breaks: Vec<usize> = vec![0, text_len];
+    for (rg, _) in &old {
+        breaks.push(rg.start);
+        breaks.push(rg.end);
+    }
+    for (rg, _) in extra {
+        breaks.push(rg.start);
+        breaks.push(rg.end);
+    }
+    breaks.sort_unstable();
+    breaks.dedup();
+    let mut out: Vec<(Range<usize>, RunKind)> = Vec::new();
+    for w in breaks.windows(2) {
+        let a = w[0].min(text_len);
+        let b = w[1].min(text_len);
+        if a >= b {
+            continue;
+        }
+        let kind = extra
+            .iter()
+            .find(|(rg, _)| rg.start <= a && b <= rg.end)
+            .map(|(_, k)| *k)
+            .or_else(|| old.iter().find(|(rg, _)| rg.start <= a && b <= rg.end).map(|(_, k)| *k));
+        if let Some(k) = kind {
+            out.push((a..b, k));
+        }
+    }
+    out
 }
 
 /// 段落文本的行首/行尾修整：剥掉 ASCII 空格/Tab 与尾部空白，但**保留行首全角空格**

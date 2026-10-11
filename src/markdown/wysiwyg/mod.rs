@@ -388,6 +388,14 @@ pub struct WyEditor {
     marker_hl: Cell<Option<(usize, usize, bool)>>,
     /// 高亮代序列号（同 `highlight_seq`：定时器只清同代，防旧定时器误清新高亮）。
     marker_hl_seq: Cell<u64>,
+    /// 注记标记 `[n]` 按下但**尚未确认是单击**的命中（P4-2 回归修复）：按下不立即跳转，
+    /// 等 [`NOTE_NAV_CONFIRM_MS`] 的单击确认窗口；期间出现第二击（双击）即取消——
+    /// 否则双击注记段落首击就整页位移 + 加亮闪烁（用户报告「某些段落双击 → 闪烁变动/
+    /// 文字掉到其他行」，EPUB 尾部 90 条注记尤其严重）。`Some` 且窗口无双击 → `navigate_marker`。
+    note_down: Cell<Option<element::NoteMarkerHit>>,
+    /// 单击确认代的序列号：每次按下/取消 +1，旧窗口的定时器对不上代即静默（防多次
+    /// 双击后残留的定时器误触发跳转）。
+    note_down_seq: Cell<u64>,
     /// 引文跳转索引缓存：`(content_gen, Rc<CitationIndex>)`——懒建（首次交互到注记才
     /// O(块数) 建一次），内容变更后自动失效重建。「行」字段语义 = **源码行**。
     cit: RefCell<Option<(u64, std::rc::Rc<crate::markdown::parse::CitationIndex>)>>,

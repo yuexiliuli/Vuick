@@ -117,6 +117,8 @@ impl WyEditor {
             hover_note: Cell::new(None),
             marker_hl: Cell::new(None),
             marker_hl_seq: Cell::new(0),
+            note_down: Cell::new(None),
+            note_down_seq: Cell::new(0),
             cit: RefCell::new(None),
         }
     }
@@ -422,6 +424,12 @@ impl WyEditor {
         // 换源：注记悬浮/加亮作废（行号随源失效；引文索引缓存键 = content_gen，自动失效）。
         self.hover_note.set(None);
         self.marker_hl.set(None);
+        // 换源：注记「单击确认」待跳转作废——换源后旧 hit 的 src_line/注记号随源失效，
+        // 残留注记的确认定时器若到点会拿旧 hit 对新文档做 `navigate_marker`（引用/定义
+        // 同号时误跳对端）。清 `note_down` + 推高 `note_down_seq`（旧定时器对不上代即静默），
+        // 与上两行悬浮/加亮同类：打开新文档/切换标签/EPUB 重喂源后不残留跳转。
+        self.note_down.set(None);
+        self.note_down_seq.set(self.note_down_seq.get().wrapping_add(1));
         self.loaded = true;
     }
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。

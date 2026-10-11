@@ -17,6 +17,12 @@ impl WyEditor {
         if ev.button != gpui::MouseButton::Left {
             return;
         }
+        // 任何新左键按下先作废「注记单击确认」待跳转（此前按下过注记标记、确认窗口
+        // 未到点）：本次按下要么落在注记上（上面的注记分支重新登记），要么是别处动作
+        //（候选跳转作废）。双击第二击天然命中此消——已按下的标记不再整页位移。
+        self.note_down.set(None);
+        self.note_down_seq
+            .set(self.note_down_seq.get().wrapping_add(1));
         // 任何新左键按下都先清残留的图片调整条拖拽：上次松开若落在元素/顶层叠层外，
         // 元素级 `on_mouse_up`（受 `hitbox.is_hovered` 门控）未被派发 → 状态残留，
         // 之后「仅移动鼠标 / 点图片外」就会误触发 `apply_image_resize` 突然改宽。
@@ -177,12 +183,42 @@ impl WyEditor {
             // P4-2: 点击注记标记 `[n]` → 文内引用 ↔ 末尾定义**双向跳转**（仅只读宿主，
             // 对齐 A 侧预览语义；可编辑模式保留文本编辑、不劫持点击）。跳到对端源码行并
             // 加亮对端标记，悬浮卡随之关闭（`navigate_marker` 内清 `hover_note`）。
+            // ⚠️ 双击回归修复：**不在按下时立即跳转**——按下只登记「单击确认」待跳转
+            //（[`NOTE_NAV_CONFIRM_MS`] 窗口），第二击（`click_count >= 2`）会取消它并走
+            // 普通文字命中。否则双击注记段落（尤其 EPUB 尾部 90 条注记）首击即整页位移 +
+            // 加亮闪烁（用户报告「某些段落双击 → 闪烁变动/文字掉到其他行」）。
             if !self.editable
                 && let Some(hit) = element::note_marker_hit_at(self, f, ev.position)
             {
                 drop(marker);
                 self.focus.focus(window, cx);
-                self.navigate_marker(&hit, cx);
+                if ev.click_count >= 2 {
+                    // 双击（第二击）：作废首击的待跳转（seq 推高，旧定时器对不上代即静默），
+                    // 本次也不登记新跳转——双击注记标记全程不跳转、不整页位移。
+                    self.note_down.set(Some(hit));
+                    self.note_down_seq
+                        .set(self.note_down_seq.get().wrapping_add(1));
+                    return;
+                }
+                self.note_down.set(Some(hit));
+                self.note_down_seq
+                    .set(self.note_down_seq.get().wrapping_add(1));
+                let seq = self.note_down_seq.get();
+                let delay = crate::config::timing::NOTE_NAV_CONFIRM_MS;
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(delay))
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        if view.note_down_seq.get() == seq
+                            && let Some(h) = view.note_down.get()
+                        {
+                            view.note_down.set(None);
+                            view.navigate_marker(&h, cx);
+                        }
+                    });
+                })
+                .detach();
                 return;
             }
             // A1/B2: 数学交互——
