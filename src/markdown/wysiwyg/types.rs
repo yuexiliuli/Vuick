@@ -108,7 +108,7 @@ pub(crate) type ImageSrcBlocks = (
     u64,
     std::collections::HashMap<SharedString, Vec<usize>>,
 );
-/// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `content_gen` 缓存，滚动 /
+/// 一次「内容派生」的全篇扫描结果。纯 `content` 函数 → 按 `regions_ver` 缓存，滚动 /
 /// 可视带移动（内容不变）直接复用 `Rc`，**不重扫全篇**——大文档每帧卡顿的主因之一
 /// （`math_regions` 7MB 全篇扫描 ~400ms、`alert_*` ~30ms，随每帧 paint / 每档 rebuild
 /// 重复执行）。
@@ -122,6 +122,14 @@ pub(crate) struct WyDerived {
     /// 数千条 ≈ Enter 路径 1-2ms）。
     pub alert_region_kinds:
         rustc_hash::FxHashMap<usize, crate::markdown::parse::recognition::AlertKind>,
+    /// **折叠标题体**（M5-B3-1 子项 4 移入 derived，不再每键 `text_shared()` 全篇物化 +
+    /// `heading_fold_regions` 全扫）：`fold_plan` 的 `FoldPlanSets` 直接读它。不过它是
+    /// **视图折叠态相关**（不属纯 content 函数）——三处同步保一致：
+    /// ① `derived()` 重建（`regions_ver` 变）时按当前 `folded_headings` 重扫；
+    /// ② `toggle_heading_fold_at_line` 翻转折叠态后就地重扫（稀有用户动作，允许一次 O(n)）；
+    /// ③ `shift_derived_after_edit` 结构编辑行号平移时与数学/警报区域同规则平移（编辑线
+    /// 落在体**内** → 回退整篇重建，见该函数）。
+    pub heading_fold_bodies: Vec<Range<usize>>,
 }
 /// 一次全篇的行内公式清单扫描 `(源码行, 槽键)`——已被「可见带懒光栅」取代（`sync_math`
 /// 改从窗口化 `frame.rows` 拿带内公式，见约定）。此函数保留一则可应急回退。
@@ -175,6 +183,20 @@ pub(crate) fn region_line_sig(line: &str) -> u64 {
         }
     }
     h.finish()
+}
+/// 是否「**普通行**」（`region_line_sig` 的 class 7 分支）：非 ` ``` ` 围栏、非 `$$`
+/// 围栏、非整行 `$$…$$`、非引述/警报、非对齐标记 → 该行只可能是纯文本/行内样式行。
+/// M5-B3-1 子项 3 用它做增量判定：普通行 ↔ 普通行的非结构编辑（行内 `$` 有无翻转）
+/// **不改变任何 region 结构**（`math_regions` 只认围栏/整行 `$$…$$`，行内 `$` 由可见带
+/// 懒光栅 claim）→ 免 `regions_ver++` 整篇重扫。**必须与 `region_line_sig` 的 class-7
+/// 分支同判据**（同一目录下同步维护）。
+pub(crate) fn is_plain_region_line(line: &str) -> bool {
+    let t = line.trim();
+    !line.trim_start().starts_with("```")
+        && t != "$$"
+        && crate::markdown::parse::inline_style::one_line_math(line).is_none()
+        && crate::markdown::parse::inline_style::blockquote_prefix(line).is_none()
+        && crate::markdown::parse::inline_style::math_align_marker(line).is_none()
 }
 /// 撤销/重做栈深度上限（超出丢最旧）。
 pub(crate) const UNDO_LIMIT: usize = 200;

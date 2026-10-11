@@ -600,12 +600,13 @@ impl BlockLayout {
 }
 
 
-/// 折叠/重排计划：与**可视带无关且不含 caret**（内容、数学就绪、宽度、结构版本决定，
-/// 键 = `(epoch, regions_ver, mgen, fold_ver)`），滚动/带移动/**光标移动/纯文本键入**都
-/// 复用——旧实现把 caret 纳入键，每次光标动/每键都整算折叠增量（结构密集大文档
-/// ~40-100ms/次 → 输入/方向键「巨大延迟」）。caret 的 reveal 由 `fold_reveal` 按带价
-/// 优惠叠加（最多一个数学块 + 一个折叠体）。
-pub(crate) struct FoldPlan {
+/// 折叠计划的 **marker 集合**（行索引结构）：`math_start` / `math_body` / `fold_lines` /
+/// `fold_bodies` / `fold_split`。只依赖 region/折叠**结构**（`regions_ver` / 行号平移 /
+/// `fold_ver`），**与布局 epoch / mgen 无关**——同 `Rc` 被多个 `FoldPlan` 共享（M5-B3-1
+/// 子项 2：布局换代/公式光栅就绪只重建 deltas，marker 集合跨计划复用，免每次 O(#区域)
+/// 哈希重建）。不可变：构建后任何一行号/折叠态变化都会因缓存键（含行号平移版本）miss
+/// 而重建整份。
+pub(crate) struct FoldPlanSets {
     /// 数学块首源码行 → `math_regions` 下标（全部块；reveal 由 `RevealPlan` 覆盖）。
     pub math_start: rustc_hash::FxHashMap<usize, usize>,
     /// 数学块 body 行（折叠成 0 高）。
@@ -617,6 +618,17 @@ pub(crate) struct FoldPlan {
     /// `fold_bodies` 前缀中 alert 折叠体条数：`..fold_split` 为 alert 组、`fold_split..`
     /// 为标题组（各自升序且互不重叠、跨组可重叠）——`fold_reveal` 据此分组二分。
     pub fold_split: usize,
+}
+
+/// 折叠/重排计划：与**可视带无关且不含 caret**（内容、数学就绪、宽度、结构版本决定，
+/// 键 = `(epoch, regions_ver, mgen, fold_ver)`），滚动/带移动/**光标移动/纯文本键入**都
+/// 复用——旧实现把 caret 纳入键，每次光标动/每键都整算折叠增量（结构密集大文档
+/// ~40-100ms/次 → 输入/方向键「巨大延迟」）。caret 的 reveal 由 `fold_reveal` 按带价
+/// 优惠叠加（最多一个数学块 + 一个折叠体）。`sets` 为可共享的 marker 集合（见
+/// [`FoldPlanSets`]）：布局/公式就绪重建只换 `deltas`，`sets` 跨计划复用。
+pub(crate) struct FoldPlan {
+    /// marker 集合（与可视带、caret、布局、公式就绪均无关，跨计划共享）。
+    pub sets: std::rc::Rc<FoldPlanSets>,
     /// 排序的 `(块下标, Δ)`：折叠→−基础高、数学卡片→卡高−基础高。
     pub deltas: std::rc::Rc<[(usize, f32)]>,
     /// `deltas` 的前缀和表：`delta_pref[p]` = 前 p 项增量之和（p ∈ [0, len]）。

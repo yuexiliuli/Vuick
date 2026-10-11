@@ -105,10 +105,12 @@ impl WyEditor {
 
     /// 从块索引重建每个可编辑块区域（代码内容行 / 表格表头+数据行）。文本变更后调用。
     /// 结构编辑后**派生区域行号平移**（B3 增量，替代整篇 `inline_style::math_regions`/
-    /// `alert_regions` 重扫）：编辑线**之上**（`end <= edit_line`）区域完全不变；**之下**
-    /// （`start > edit_line`）整体平移 `Δ`（source 内容未变，保留）。若派生未缓存或
-    /// 有区域**跨过**编辑线（内容变了，无法仅平移）→ 返回 `false`，调用方回退整篇
-    /// 重建（`regions_ver++`，`derived()` 懒重建）。
+    /// `alert_regions`/`heading_fold_regions` 重扫）：编辑线**之上**（`end <= edit_line`）
+    /// 区域完全不变；**之下**（`start > edit_line`）整体平移 `Δ`（source 内容未变，保留）。
+    /// （M5-B3-1 子项 4）标题折叠体与数学/警报区域同规则平移——`heading_fold_bodies` 已在
+    /// `derived` 内维护（编辑线之上不变、之下平移；编辑线落在体**内** → 内容/边界变了，
+    /// 无法纯平移）。若派生未缓存、或任一区域/折叠体**跨过**编辑线 → 返回 `false`，
+    /// 调用方回退整篇重建（`regions_ver++`，`derived()` 懒重建并重扫标题折叠）。
     fn shift_derived_after_edit(&mut self, edit_line: usize, line_delta: i64) -> bool {
         let cached = self.derived.borrow_mut();
         let Some((_, rc)) = cached.as_ref() else {
@@ -121,6 +123,13 @@ impl WyEditor {
             || d.alert_fold_regions
                 .iter()
                 .any(|(r, _)| r.start <= edit_line && edit_line < r.end)
+            || super::view::region_containing(
+                &d.heading_fold_bodies,
+                |r| r.clone(),
+                edit_line,
+                true,
+            )
+            .is_some()
         {
             return false;
         }
@@ -142,6 +151,11 @@ impl WyEditor {
                 rustc_hash::FxHashMap::with_capacity_and_hasher(old.len(), Default::default());
             for (l, k) in old {
                 d.alert_region_kinds.insert(shift(l), k);
+            }
+        }
+        for hb in &mut d.heading_fold_bodies {
+            if hb.start > edit_line {
+                *hb = shift(hb.start)..shift(hb.end);
             }
         }
         true
@@ -519,6 +533,10 @@ impl WyEditor {
     /// → `derived` Rc 跨键复用——大文档（尤其结构密集）「输入卡死」的根因是旧实现
     /// 每键对全篇 `math_regions`×2 + `alert_*`×2 + 行内逐行扫 ≈1s。
     /// （公式光栅已走「可见带懒加载」，不再需要另一路全篇数学重扫信号。）
+    /// M5-B3-1 子项 3：**签名变化但可精确证明区域结构未变**的行（普通行↔普通行，行内
+    /// `$` 有无翻转）不再整篇重建（见 [`Self::maybe_patch_sig_changed_plain`]）。
+    /// 子项 4：结构编辑纯插入且未新建命中折叠键标题 → 行号平移（含标题折叠体），
+    /// **跨行删除/合并** 回退整篇重建。
     fn update_derived_after_edit(
         &mut self,
         edit_line: usize,
@@ -543,6 +561,22 @@ impl WyEditor {
                 (text.matches('\n').count() as i64) - (removed.matches('\n').count() as i64);
             if !self.shift_derived_after_edit(edit_line, line_delta) {
                 self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            } else if removed.matches('\n').count() > 0
+                || self.edit_window_creates_folded_heading(
+                    edit_line,
+                    text.matches('\n').count(),
+                )
+            {
+                // M5-B3-1 子项 4：行号平移成功，但**跨行删除/合并**（行内容合并、折叠
+                // 终结尾/列表缩进的边界语义无法增量保证）或**插入窗口新建了命中已折叠
+                // 键的标题行**（重复折叠同款）→ 回退整篇重建。两者都是相对少的路径，
+                // 与基线同成本（正确 > 快）。
+                self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+            } else {
+                // 成功平移：region 结构不变、只是行号动 → 递增 `fp_sets` 缓存键的
+                // 行号平移分量（集合命中旧行号即错）。
+                self.regions_shift_ver
+                    .set(self.regions_shift_ver.get().wrapping_add(1));
             }
             // B4：`block_regions` 增量更新（编辑线附近重算 + 其余平移），不再每键
             // O(块数) 整表扫描（6MB/10 万块 debug ~5.9ms/键）。
@@ -554,49 +588,134 @@ impl WyEditor {
             // 非结构性编辑既不跨行、也不在代码/表格块内 → 区域必然不变）。
             let new_line = self.doc.line_str(edit_line);
             if region_line_sig(old_line) != region_line_sig(&new_line) {
-                // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）
-                // → 区域结构可能变化 → 整篇重建派生。
-                self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+                // 该行 region 签名变了（出现/消失 `$`、``` 、`[!` 或 `$$` 边界等）。
+                // M5-B3-1 子项 3：普通行 ↔ 普通行（行内 `$` 有无翻转）可精确判定区域
+                // 结构未变 → 只补受影响块 source；其余签名变化仍整篇重建。
+                if self.maybe_patch_sig_changed_plain(edit_line, old_line, &new_line) {
+                    // 本地已修补，`regions_ver` 不递增（derived Rc 跨键复用）。
+                } else {
+                    self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+                }
             } else {
                 let _t_m = crate::prof::begin();
                 // 快路径：区域结构不变，只做受影响点的小修补（都不全篇重建）——
                 // 编辑行在 `$$…$$` 数学块内 → 重算该块 `source`（卡片 / 排版键正确，
                 // 否则离开块后卡片显示旧公式）。
-                {
-                    let derived = self.derived();
-                    let d = derived.borrow();
-                    if let Some(idx) = super::view::region_containing(
-                        &d.math_regions,
-                        |r| r.range.clone(),
-                        edit_line,
-                        true,
-                    ) {
-                        let rng = d.math_regions[idx].range.clone();
-                        let old_src = d.math_regions[idx].source.clone();
-                        drop(d);
-                        let mut d2 = derived.borrow_mut();
-                        let new_source = if rng.end == rng.start + 1 {
-                            // 单行 `$$x^2$$`：source = 行内内层。
-                            inline_style::one_line_math(&new_line)
-                                .map(str::to_string)
-                                .unwrap_or(old_src)
-                        } else if rng.start + 1 < rng.end.saturating_sub(1) {
-                            let hi = rng.end.saturating_sub(1);
-                            (rng.start + 1..hi)
-                                .map(|l| self.doc.line_str(l))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        } else {
-                            String::new()
-                        };
-                        if d2.math_regions[idx].source != new_source {
-                            d2.math_regions[idx].source = new_source;
-                        }
-                    }
-                }
+                self.patch_math_block_source(edit_line, &new_line);
                 crate::prof::end("wy.rr.math", _t_m);
             }
         }
+    }
+
+    /// M5-B3-1 子项 3：非结构编辑、行签名变化，但可**精确判定**区域结构未变——
+    /// 仅当编辑行「普通行 ↔ 普通行」（`is_plain_region_line`，class 7，任意行内 `$`
+    /// 有无翻转）：`math_regions` 只认 `$$` 围栏行与整行 `$$…$$`，行内 `$` 由可见带
+    /// 懒光栅 claim、不构成区域；`alert_*` 只认 `>`/`[!]` 前缀。该类编辑唯一可能影响
+    /// 的区域是「恰为该 `$$…$$` 块 body 行」时的 source 内容 → 就地补块即可。
+    /// 其余签名变化（围栏/`$$` 边界/警报/对齐标记出入）→ `false` 回退整篇重建。
+    ///
+    /// 权衡：本分支是「只加速常见路径、稀有路径保全量」——`$` 在普通文本行打出行内
+    /// 公式是最常见触发面；`$$` 围栏出入/警报/代码围栏边界仍整篇重建（正确 > 速度；
+    /// 增量开块本可前向扫到闭合围栏但风险高于收益，暂不）。
+    fn maybe_patch_sig_changed_plain(
+        &mut self,
+        edit_line: usize,
+        old_line: &str,
+        new_line: &str,
+    ) -> bool {
+        // 只对「普通行 ↔ 普通行」做增量：任一侧是围栏/`$$` 边界/警报/对齐标记 →
+        // 区域结构可能真的变 → 全篇重建。
+        if !(is_plain_region_line(old_line) && is_plain_region_line(new_line)) {
+            return false;
+        }
+        let derived = self.derived();
+        let d = derived.borrow();
+        let Some(idx) =
+            super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true)
+        else {
+            // 不在任何数学块内：行内 `$` 翻转不构成/不改变任何区域。
+            return true;
+        };
+        let rng = d.math_regions[idx].range.clone();
+        drop(d);
+        // 单行 `$$x^2$$` / 开界或闭界围栏行本身 → 该块结构受直接影响 → 不能增量。
+        if rng.end == rng.start + 1 || edit_line == rng.start || edit_line == rng.end - 1 {
+            return false;
+        }
+        // 普通 body 行内的 `$` 翻转：块区间不变，只重拼该块 source。
+        self.patch_math_block_source_at(edit_line, idx, new_line);
+        true
+    }
+
+    /// 编辑行在 `$$…$$` 数学块内 → 就地重算该块 `source`（卡片 / 排版键正确，否则离开
+    /// 块后卡片显示旧公式）。非结构编辑的两个走快路径的分支（签名不变、签名变但仅普通
+    /// 行美元翻转）共用；都**不**整篇重建 derived。
+    fn patch_math_block_source(&mut self, edit_line: usize, new_line: &str) {
+        let derived = self.derived();
+        let d = derived.borrow();
+        if let Some(idx) =
+            super::view::region_containing(&d.math_regions, |r| r.range.clone(), edit_line, true)
+        {
+            let rng = d.math_regions[idx].range.clone();
+            drop(d);
+            self.patch_math_block_source_impl(edit_line, idx, new_line, &rng);
+        }
+    }
+    /// 已知块下标版的 source 修补（`maybe_patch_sig_changed_plain` 已定位 idx，省一次二分）。
+    fn patch_math_block_source_at(&mut self, edit_line: usize, idx: usize, new_line: &str) {
+        let derived = self.derived();
+        let d = derived.borrow();
+        let rng = d.math_regions[idx].range.clone();
+        drop(d);
+        self.patch_math_block_source_impl(edit_line, idx, new_line, &rng);
+    }
+    fn patch_math_block_source_impl(
+        &self,
+        _edit_line: usize,
+        idx: usize,
+        new_line: &str,
+        rng: &std::ops::Range<usize>,
+    ) {
+        let derived = self.derived();
+        let mut d2 = derived.borrow_mut();
+        let old_src = d2.math_regions[idx].source.clone();
+        let new_source = if rng.end == rng.start + 1 {
+            // 单行 `$$x^2$$`：source = 行内内层。
+            inline_style::one_line_math(new_line)
+                .map(str::to_string)
+                .unwrap_or(old_src)
+        } else if rng.start + 1 < rng.end.saturating_sub(1) {
+            let hi = rng.end.saturating_sub(1);
+            (rng.start + 1..hi)
+                .map(|l| self.doc.line_str(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        if d2.math_regions[idx].source != new_source {
+            d2.math_regions[idx].source = new_source;
+        }
+    }
+
+    /// M5-B3-1 子项 4 守卫：结构编辑**插入窗口**（`edit_line..=edit_line + 插入换行数`）
+    /// 内出现了「`heading_fold_regions` 会认作标题且命中已折叠键」的新行——行号平移只能
+    /// 搬旧折叠体、无法新建折叠体（同键标题多处重复折叠）→ 返回 `true` 让调用方回退
+    /// 整篇重建。只在有折叠态时干活（O(插入行数) 次 line_str + HashSet 查，单键 Enter ≈
+    /// 常数）；行号平移本身已在 `shift_derived_after_edit` 处理「编辑线落在体**内**」。
+    fn edit_window_creates_folded_heading(&self, edit_line: usize, inserted_nl: usize) -> bool {
+        let folded = self.folded_headings.borrow();
+        if folded.is_empty() {
+            return false;
+        }
+        let max_line = self.doc.line_starts().len().saturating_sub(1);
+        for l in edit_line..=(edit_line + inserted_nl).min(max_line) {
+            let raw = self.doc.line_str(l);
+            if inline_style::line_heading_level(&raw).is_some() && folded.contains(raw.trim()) {
+                return true;
+            }
+        }
+        false
     }
 
     /// 记录撤销快照并做一次文本替换（任务框 toggle / 警报折叠共用）。
@@ -651,6 +770,18 @@ impl WyEditor {
         }
         // 折叠态变化 → `fold_plan` 缓存失效（滚动/带移动间不重算，但折叠变必须重建）。
         self.fold_ver.set(self.fold_ver.get().wrapping_add(1));
+        // M5-B3-1 子项 4：标题折叠体列表是 `fold_plan` sets 输入之一、按 `fold_ver`
+        // 进缓存键——这里**就地**重扫进 `derived`（`regions_ver` 键不变 → 不整篇重建；
+        // 折叠翻转本身稀有，允许一次 O(n) 全扫 + `text_shared`；逐键输入/Enter 不再触达）。
+        if let Some((_, rc)) = &*self.derived.borrow() {
+            let mut d = rc.borrow_mut();
+            let folded = self.folded_headings.borrow();
+            d.heading_fold_bodies = if folded.is_empty() {
+                Vec::new()
+            } else {
+                inline_style::heading_fold_regions(&self.doc.text_shared(), &folded)
+            };
+        }
         *self.frame.borrow_mut() = None;
         cx.notify();
     }

@@ -62,6 +62,34 @@ pub trait ImeTextHost: Sized {
         true
     }
 
+    /// 组合更新（`mark=true` 且新文本非空）后落定**组合内光标/选区**。
+    ///
+    /// `base_byte` = 组合起点字节；`new_text` = 组合当前文本；
+    /// `new_selected_range` = 平台给的组合内区间（**相对组合文本起点**的 UTF-16
+    /// 偏移；`None` = 光标落文本末尾）。
+    ///
+    /// 共享默认（编辑器/ui 语义）：把 `new_selected_range` 当 marked 文本内的
+    /// 选区、光标落 head（区间末尾）。WYSIWYG 覆盖为「只取 `sel.start` 摆光标、
+    /// 不回写 sel_anchor」——与其现状（`replace_and_mark` 仅按
+    /// `offset_from_utf16(new_text, sel.start)` 摆 caret、不建选区）一致，避免把
+    /// WYSIWYG 行为改成 editor 的。
+    fn set_composition_caret(
+        &mut self,
+        base_byte: usize,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+    ) {
+        let end = base_byte + new_text.len();
+        let (s, e) = match new_selected_range {
+            Some(sel) => (
+                base_byte + utf16_to_byte(new_text, sel.start),
+                base_byte + utf16_to_byte(new_text, sel.end),
+            ),
+            None => (end, end),
+        };
+        self.set_selection_bytes(s..e);
+    }
+
     /// 落地一次替换（byte 区间 → 新文本）。约定：落地后光标停在新文本末尾；
     /// `intent` 描述 undo 事务粒度（无 undo 的宿主忽略）。
     fn apply_edit(
@@ -149,17 +177,9 @@ pub fn replace<H: ImeTextHost>(
             // `new_selected_range` 是**相对被标记文本（new_text）起点**的 UTF-16
             // 偏移（AppKit setMarkedText 的 selectedRange 语义），不是文档绝对
             // 偏移——当绝对偏移用会导致光标跳文档开头附近的旧崩溃（P2 回归）。
-            let (s, e) = match new_selected_range {
-                Some(sel) => (
-                    byte_range.start + utf16_to_byte(new_text, sel.start),
-                    byte_range.start + utf16_to_byte(new_text, sel.end),
-                ),
-                None => (
-                    byte_range.start + new_text.len(),
-                    byte_range.start + new_text.len(),
-                ),
-            };
-            host.set_selection_bytes(s..e);
+            // 落定组合内光标/选区的具体姿势由宿主定（编辑器=选区+head，
+            // WYSIWYG=只用 sel.start 摆光标），见 [`ImeTextHost::set_composition_caret`]。
+            host.set_composition_caret(byte_range.start, new_text, new_selected_range);
         }
     }
 }

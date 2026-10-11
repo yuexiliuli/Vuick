@@ -442,3 +442,95 @@ fn ime_new_selected_range_is_relative_to_marked(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn ime_composition_real_path_updates_commits_cjk_and_punctuation(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    // 回归（并入 ime:: 后）：`EntityInputHandler` 直通共享状态机的真实回路——
+    // 组合开始→更新（替换旧 marked）→提交，覆盖 CJK（你）与中文标点（，），
+    // 提交后的新组合不得把已提交文本当旧 marked 覆盖。
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret("你好".len());
+            // 组合第 1 字：n → ni → 你（每次更新替换旧的 marked）
+            e.replace_and_mark_text_in_range(None, "n", None, window, cx);
+            e.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+            e.replace_and_mark_text_in_range(None, "你", None, window, cx);
+            assert_eq!(e.text().as_ref(), "你好你", "组合首字插在光标后");
+            // 提交第 1 字（结束组合，marked 清空）
+            e.replace_text_in_range(None, "你", window, cx);
+            assert_eq!(e.text().as_ref(), "你好你");
+            // 中文标点组合并提交
+            e.replace_and_mark_text_in_range(None, "，", None, window, cx);
+            assert_eq!(e.text().as_ref(), "你好你，", "标点组合插在提交文本后");
+            e.replace_text_in_range(None, "，", window, cx);
+            assert_eq!(e.text().as_ref(), "你好你，", "提交后文本不变");
+            assert_eq!(e.caret(), "你好你，".len(), "光标在提交文本末尾");
+            // 新组合（含第二轮更新）不得复用旧 marked
+            e.replace_and_mark_text_in_range(None, "a", None, window, cx);
+            e.replace_and_mark_text_in_range(None, "ab", None, window, cx);
+            assert_eq!(e.text().as_ref(), "你好你，ab", "新组合不重复旧提交");
+            e.replace_text_in_range(None, "!", window, cx);
+            assert_eq!(e.text().as_ref(), "你好你，!", "最终文本");
+        });
+    });
+}
+
+#[gpui::test]
+fn ime_composition_cancel_removes_marked_and_stays_clean(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    // 回归（并入 ime:: 后）：组合取消（空替换）删除组合占位、光标回组合起点、
+    // marked 清空——取消后开新组合不得把已清除的组合当旧 marked 复用。
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            e.set_caret("你好".len());
+            e.replace_and_mark_text_in_range(None, "nih", None, window, cx);
+            assert_eq!(e.text().as_ref(), "你好nih");
+            // 取消：空替换把组合占位移除，光标回组合起点
+            e.replace_and_mark_text_in_range(None, "", None, window, cx);
+            assert_eq!(e.text().as_ref(), "你好", "取消后组合文本被移除");
+            assert_eq!(e.caret(), "你好".len(), "光标回到组合起点");
+            // 取消后新组合 + 提交：只追加一次（旧 marked 已清除）
+            e.replace_and_mark_text_in_range(None, "你", None, window, cx);
+            e.replace_text_in_range(None, "你", window, cx);
+            assert_eq!(e.text().as_ref(), "你好你", "取消后新组合不残留");
+        });
+    });
+}
+
+#[gpui::test]
+fn ime_replace_with_explicit_utf16_range_lands_on_doc_bytes(cx: &mut TestAppContext) {
+    use gpui::EntityInputHandler;
+    // 回归（并入 ime:: 后）：显式 UTF-16 区间（macOS/部分平台）走行粒度索引换算，
+    // 落到正确的源字节并清 marked。
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("你好世界"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| {
+            // [1,2) UTF-16 = "好"整字（字节 3..6），替换后文本与光标都应落对。
+            e.replace_text_in_range(Some(1..2), "更", window, cx);
+            assert_eq!(e.text().as_ref(), "你更世界", "显式 UTF-16 区间替换整字");
+            assert_eq!(e.caret(), "你更".len(), "光标落新文本末尾");
+        });
+    });
+}
+
+

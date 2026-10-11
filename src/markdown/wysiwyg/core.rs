@@ -40,8 +40,10 @@ impl WyEditor {
             struct_blk_span_delta: Cell::new(0),
             struct_edit_pending: Cell::new(false),
             regions_ver: Cell::new(0),
+            regions_shift_ver: Cell::new(0),
             fold_ver: Cell::new(0),
             fold_plan: RefCell::new(None),
+            fp_sets: RefCell::new(None),
             pending_patch_blocks: RefCell::new(None),
             math_dollar_cnt: Cell::new(0),
             alert_marker_cnt: Cell::new(0),
@@ -317,6 +319,8 @@ impl WyEditor {
         self.shape_rows.borrow_mut().clear();
         self.notdef_retry.borrow_mut().clear();
         self.regions_ver.set(self.regions_ver.get().wrapping_add(1));
+        self.regions_shift_ver.set(0);
+        *self.fp_sets.borrow_mut() = None;
         *self.pending_patch_blocks.borrow_mut() = None;
         // 图片行高收录随内容/拼图失效一并清空（重建路径 pass1 已按当前图片状态重估，
         // 残留 src 反打旧文幂等但无谓；见 `patch_pending_image_heights`）。
@@ -568,8 +572,10 @@ impl WyEditor {
         self.replace_range(range, &text, cx);
     }
 
-    /// 直输/提交（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked，
+    /// 直输/提交（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked、
     /// 再清掉 marked——否则下一次组合会把已提交文本当旧 marked 再次替换。
+    /// 状态机已收敛到共享 `crate::ime::replace`（mark=false：提交/直输落编辑后
+    /// 因 `supports_marked` 清 marked；undo 意图由 `replace_range` 自推导）。
     pub(crate) fn replace_text_utf16(
         &mut self,
         range: Option<Range<usize>>,
@@ -581,21 +587,16 @@ impl WyEditor {
             return;
         }
         crate::prof::op_start("type");
-        let r = match range {
-            // 显式 UTF-16 区间（macOS/部分平台）走行粒度索引换算，O(log n + 行长)。
-            Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
-            None => self
-                .marked
-                .clone()
-                .unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret)),
-        };
-        self.replace_range(r, text, cx);
-        self.marked = None;
+        crate::ime::replace(self, range, text, None, false, cx);
     }
 
     /// IME 组合更新（可测）：`range`（UTF-16 文档区间）为 `None` 时替换当前 marked
     /// （没有 marked 时才落普通选区/光标）——否则 Windows 每次组合更新都不带区间，
     /// 新旧组合文本会一前一后堆叠出「nnini'hni'hao你好」式垃圾串。
+    /// 状态机已收敛到共享 `crate::ime::replace`（mark=true：Atomic 意图落编辑 +
+    /// 维护 marked + 组合内光标）；WYSIWYG 专有的「只取 `sel.start` 摆光标」姿势由
+    /// `ImeTextHost::set_composition_caret` 覆写承载。末尾 `cx.notify()` 保持现状
+    /// （空区间取消时 `replace_range` 短路不 notify，这里兜一帧）。
     pub(crate) fn replace_and_mark_utf16(
         &mut self,
         range: Option<Range<usize>>,
@@ -608,34 +609,7 @@ impl WyEditor {
             return;
         }
         crate::prof::op_start("ime");
-        let byte_range = match range {
-            Some(r) => self.doc.utf16_to_byte(r.start)..self.doc.utf16_to_byte(r.end),
-            None => self
-                .marked
-                .clone()
-                .unwrap_or_else(|| self.selection().unwrap_or(self.caret..self.caret)),
-        };
-        self.replace_range(byte_range.clone(), new_text, cx);
-        if new_text.is_empty() {
-            // 组合被取消：清掉 marked，光标回组合起点。
-            self.marked = None;
-            self.caret = byte_range.start.min(self.len());
-        } else {
-            self.marked = Some(
-                byte_range.start
-                    ..byte_range.start + new_text.len().min(self.len() - byte_range.start),
-            );
-            // `new_selected_range` 是**相对 new_text 起点**的 UTF-16 偏移，不是文档
-            // 绝对偏移（AppKit setMarkedText 的 selectedRange 语义）。
-            let caret = match new_selected_range {
-                Some(sel) => {
-                    byte_range.start
-                        + input::offset_from_utf16(new_text, sel.start).min(new_text.len())
-                }
-                None => byte_range.start + new_text.len(),
-            };
-            self.caret = caret.min(self.len());
-        }
+        crate::ime::replace(self, range, new_text, new_selected_range, true, cx);
         cx.notify();
     }
 }

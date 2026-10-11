@@ -441,3 +441,144 @@ A-->B
     });
 }
 
+/// M5-B3-1 回归（1c）：**折叠了一个标题后，在别处（折叠体之外）按 Enter**——
+/// 折叠 section 必须保持折叠（body 仍 0 高）、`fold_plan` 的折叠体行区间仍正确、
+/// 新文本正确。钉住「folded_headings 非空 → 全篇 text_shared 物化/重扫」航线的落点。
+#[gpui::test]
+fn heading_fold_survives_structural_enter_elsewhere(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // `# Tail`（level 1 ≤ `## App` 的 level 2）截断 section → 折叠体 = 行 0..2。
+    let text = "## App\napp body\n# Tail\noutside line\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标默认在行首（标题行）→ 折叠保持。
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+        assert!(ed.read(cx).folded_headings.borrow().contains("## App"));
+        let frame0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body0 = frame0.block_index_for_src_line(1).expect("body 块");
+        assert_eq!(frame0.block_height(body0), 0., "折叠后 body 应 0 高");
+        // 在折叠体之外（`# Tail` 之下的段落）按 Enter。
+        let at = ed.read(cx).content().find("outside").unwrap() + 4;
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        assert!(
+            ed.read(cx).text().as_ref().contains("outs\nide"),
+            "Enter 文本应正确"
+        );
+        let frame1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let body1 = frame1.block_index_for_src_line(1).expect("body 块");
+        assert_eq!(
+            frame1.block_height(body1),
+            0.,
+            "别处 Enter 后 body 应仍 0 高"
+        );
+        // fold_plan 仍含该折叠体、行区间未漂移。
+        let plan = ed.read(cx).fold_plan_rc().expect("折叠计划");
+        assert_eq!(plan.sets.fold_bodies.len(), 1, "应只有 1 个折叠体");
+        assert_eq!(
+            plan.sets.fold_bodies[0], 0usize..2,
+            "折叠体行区间仍为 0..2"
+        );
+        assert_eq!(plan.sets.fold_split, 0, "无 alert 折叠体 → split 应为 0");
+    });
+}
+
+/// M5-B3-1 子项 4：折叠标题后**在别处（折叠体之外）按 Enter**，全篇 `text_shared()`
+/// 不应再被触达——标题折叠体已移入 `derived` 行号平移，`fold_plan` 的 sets 重建不再
+/// 物化全文 + `heading_fold_regions` 全扫（旧实现每键 text_shared 一次 O(n) 副本）。
+#[gpui::test]
+fn heading_fold_enter_elsewhere_no_full_text_materialization(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "## App\napp body\n# Tail\noutside line\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 折叠 `## App`（body 0..2）→ 首次建帧（真正物化折叠计划的时刻）。
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 先算好编辑点（`content()` 会物化全文 → 必须先于计数基线），再记录此刻
+        // `text_shared` 调用计数（含此前折叠动作本身的物化）。
+        let at = ed.read(cx).content().find("outside").unwrap() + 4;
+        let c0 = ed.read(cx).doc().text_shared_calls();
+        // 折叠体之外 Enter + 重建帧：此步任何一处都不得再全篇物化/全扫标题。
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let c1 = ed.read(cx).doc().text_shared_calls();
+        assert_eq!(
+            c1, c0,
+            "折叠标题后别处 Enter 不应再全篇 text_shared（c0={c0} c1={c1}）"
+        );
+    });
+}
+
+/// M5-B3-1 子项 4 保真：折叠标题后**在别处 Enter**，增量路径（集合重建 + deltas 平移，
+/// 移除了旧的「有折叠态便禁用 deltas 平移」守卫）产出的折叠计划必须与强制整建逐字段
+/// 一致（`sets` + `deltas` + `delta_sum`）。
+#[gpui::test]
+fn heading_fold_enter_elsewhere_deltas_match_full_rebuild(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // `## App`(行 1) 折叠体 [1,4)（被 `# Tail` 截断）；math 块 [6,9)；编辑点在 `outside`。
+    let text = "intro\n## App\napp body\napp body 2\n# Tail\noutside\n$$\nx^2\n$$\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(1, cx));
+        // 先整建一次（热缓存/基线）。
+        let _f0 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+        // 折叠体之外 Enter（`outside` 中段）。
+        let at = ed.read(cx).content().find("outside").unwrap() + 4;
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        let _f1 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+        let inc = ed.read(cx).fold_plan_rc().expect("增量路径折叠计划");
+        // 强制整建：清缓存 + 清待消费标志（增量条件不满足 → 走整建）。
+        ed.update(cx, |e, _| {
+            *e.fold_plan.borrow_mut() = None;
+            e.struct_edit_pending.set(false);
+        });
+        let _f2 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+        let full = ed.read(cx).fold_plan_rc().expect("整建折叠计划");
+        assert_eq!(
+            inc.sets.math_start, full.sets.math_start,
+            "math_start 不一致"
+        );
+        assert_eq!(inc.sets.math_body, full.sets.math_body, "math_body 不一致");
+        assert_eq!(
+            inc.sets.fold_lines, full.sets.fold_lines,
+            "fold_lines 不一致"
+        );
+        assert_eq!(
+            inc.sets.fold_bodies, full.sets.fold_bodies,
+            "fold_bodies 不一致"
+        );
+        assert_eq!(
+            inc.sets.fold_split, full.sets.fold_split,
+            "fold_split 不一致"
+        );
+        assert_eq!(&*inc.deltas, &*full.deltas, "deltas 不一致");
+        assert!(
+            (inc.delta_sum - full.delta_sum).abs() < 1e-3,
+            "delta_sum 不一致 {} vs {}",
+            inc.delta_sum,
+            full.delta_sum
+        );
+    });
+}
+

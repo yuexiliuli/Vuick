@@ -133,10 +133,99 @@ fn math_interior_edit_patches_block_source(cx: &mut TestAppContext) {
     });
 }
 
+/// M5-B3-1 回归（1a）：在数学区**上界**（开界 `$$` 行）处键入 `$` 结构性字符——
+/// 开界行 `$$` → `$$$`（`region_line_sig` 变化）→ 派生整篇重建。断言重建后的
+/// `math_regions` 与对新文本从零重扫完全一致（区域/边界错位即此处漏网）。
 #[gpui::test]
-fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
-    // 键入 `$`（行签名变化）→ 派生整篇重建 + regions 版本递增（新 `$…$` 公式
-    // 由「可见带懒光栅」在下一帧 shape 后经 frame.rows claim，见 sync_math 集成）。
+fn typing_dollar_at_math_upper_bound_keeps_regions_consistent(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "intro\n$$\n\\int_a b dx\n$$\ntail\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 在开界 `$$` 行首插入 `$` → 该行变 `$$$`（不再等于 `$$`，围栏消失）。
+        let at = ed.read(cx).content().find("$$\n\\int").unwrap();
+        let v0 = ed.read(cx).regions_ver();
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "$", ecx));
+        assert_ne!(
+            ed.read(cx).regions_ver(),
+            v0,
+            "开界行签名变化应整篇重建"
+        );
+        // 与新文本从零重扫对拍（range + source + align 全比）。
+        let new_text = ed.read(cx).content();
+        let expect = inline_style::math_regions(&new_text);
+        let derived = ed.read(cx).derived();
+        let d = derived.borrow();
+        let got = &d.math_regions;
+        assert_eq!(got.len(), expect.len(), "区域数应一致");
+        for (g, e) in got.iter().zip(expect.iter()) {
+            assert_eq!(g.range, e.range, "区域行区间应一致");
+            assert_eq!(g.source, e.source, "区域 source 应一致");
+            assert_eq!(g.align, e.align, "区域 align 应一致");
+        }
+        drop(d);
+        let _f1 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+    });
+}
+
+/// M5-B3-1 回归（1b）：Enter 落在 `$$ … $$` 块**内部**（跨线区域，内容/边界变）→
+/// 增量平移失败 → 整篇重建（`regions_ver++`）。断言重建后 derived 与从零重扫一致
+/// （块被拆成两行 body、`source` 用 `\n` 重拼）。
+#[gpui::test]
+fn enter_inside_math_block_rebuilds_and_stays_consistent(cx: &mut TestAppContext) {
+    use crate::markdown::parse::inline_style;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_a b dx\n$$\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert_eq!(ed.read(cx).derived().borrow().math_regions.len(), 1);
+        // 在 body 行中段按 Enter（结构编辑跨区域）。
+        let at = ed.read(cx).content().find("\\int_a").unwrap() + 4;
+        let v0 = ed.read(cx).regions_ver();
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+        assert_eq!(
+            ed.read(cx).regions_ver(),
+            v0.wrapping_add(1),
+            "块内 Enter 应整篇重建"
+        );
+        let new_text = ed.read(cx).content();
+        let expect = inline_style::math_regions(&new_text);
+        let derived = ed.read(cx).derived();
+        let d = derived.borrow();
+        let got = &d.math_regions;
+        assert_eq!(got.len(), expect.len(), "区域数应一致");
+        for (g, e) in got.iter().zip(expect.iter()) {
+            assert_eq!(g.range, e.range, "区域行区间应一致");
+            assert_eq!(g.source, e.source, "source 应含拆行后的 `\\n`");
+            assert_eq!(g.align, e.align, "区域 align 应一致");
+        }
+        assert_eq!(got[0].range, 0usize..4, "块仍应在 0..4 行");
+    });
+}
+
+#[gpui::test]
+fn inline_dollar_on_plain_line_outside_regions_reuses_derived(cx: &mut TestAppContext) {
+    // M5-B3-1 子项 3（替换旧 `dollar_edit_rebuilds_derived`）：在**普通行**（class 7，
+    // 无区域边界）打 `$`（行内公式如 `$x$abc`）——`math_regions` 只认 `$$` 围栏与整行
+    // `$$…$$`，行内 `$` 由「可见带懒光栅」claim（`sync_math`），不构成区域 → 派生
+    // **不再整篇重建**，`regions_ver` 不变、`derived` Rc 跨键复用。行签名虽变化（普通行
+    // 美元有无翻转）但可精确判定区域结构未变（旧实现每 `$` 键整篇重扫，数学密集文档
+    // 就是逐键 O(n) spike 的来源）。
     use crate::markdown::wysiwyg::WyEditor;
     use gpui::App;
     cx.update(crate::actions::bind_local_keymaps);
@@ -150,7 +239,7 @@ fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
         let d = ed.read(cx).derived();
         (d, ed.read(cx).regions_ver())
     });
-    // 行首写入一个完整的行内公式 `$x$`。
+    // 行首写入一个行内公式 `$x$`（不构成任何区域）。
     vcx.update(|_w, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         ed.update(cx, |e, ecx| e.replace_range(0..0, "$x$", ecx));
@@ -159,8 +248,175 @@ fn dollar_edit_rebuilds_derived(cx: &mut TestAppContext) {
         let ed = host.read(cx).ed.clone();
         let d1 = ed.read(cx).derived();
         assert!(
+            std::rc::Rc::ptr_eq(&rc0, &d1),
+            "普通行美元翻转不构成区域 → 派生应复用 Rc（不整篇重建）"
+        );
+        assert_eq!(ed.read(cx).regions_ver(), rv0, "regions 版本应不变");
+        assert_eq!(d1.borrow().math_regions.len(), 0, "仍无数学区域");
+    });
+}
+
+#[gpui::test]
+fn one_line_math_creation_rebuilds_derived(cx: &mut TestAppContext) {
+    // M5-B3-1 子项 3 的「边界」：把普通行改成**整行 `$$…$$`**（class 7 → 3）→ 真的
+    // 新建了一个区域 → 必须整篇重建（`regions_ver++`）。保住「只加速普通情形、区域
+    // 创建/销毁保全量」的收口。
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x^2\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        assert_eq!(d.borrow().math_regions.len(), 0, "初始无数学区域");
+        (d, ed.read(cx).regions_ver())
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.replace_range(0..3, "$$x^2$$", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
             !std::rc::Rc::ptr_eq(&rc0, &d1),
-            "出现 `$` 使行签名变化 → 派生应整篇重建"
+            "整行变成 `$$…$$` → 新建区域 → 派生应整篇重建"
+        );
+        assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
+        assert_eq!(
+            d1.borrow().math_regions.len(),
+            1,
+            "应扫到新单行数学区域"
+        );
+        assert_eq!(d1.borrow().math_regions[0].range, 0usize..1);
+        assert_eq!(d1.borrow().math_regions[0].source, "x^2");
+    });
+}
+
+#[gpui::test]
+fn inline_dollar_inside_math_block_body_patches_source(cx: &mut TestAppContext) {
+    // M5-B3-1 子项 3：`$$…$$` 块 **body 行**内打 `$`（普通行美元翻转 + 恰在该块内）
+    // → 不整篇重建，只就地重拼该块 `source`（离开块卡片显示新公式）；`regions_ver`
+    // 不变、区域区间不变。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("$$\nE = mc\n$$\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+    });
+    let (rc0, rv0, src0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        let src = d.borrow().math_regions[0].source.clone();
+        (d, ed.read(cx).regions_ver(), src)
+    });
+    assert_eq!(src0, "E = mc");
+    // 在 body 行 `E = mc` 的 `m` 前打 `$` → 行变 `E = $mc`（普通行美元翻转，块内 body）。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("E = mc").unwrap() + 4; // 落在 `m` 前
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "$", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
+            std::rc::Rc::ptr_eq(&rc0, &d1),
+            "块 body 内美元翻转 → 派生应复用 Rc（不整篇重建）"
+        );
+        assert_eq!(ed.read(cx).regions_ver(), rv0);
+        assert_eq!(d1.borrow().math_regions[0].range, 0usize..3, "块区间不变");
+        assert_eq!(
+            d1.borrow().math_regions[0].source,
+            "E = $mc",
+            "块 source 应被就地修补为含 $"
+        );
+    });
+}
+
+#[gpui::test]
+fn inline_dollar_near_block_fence_keeps_regions_stable(cx: &mut TestAppContext) {
+    // M5-B3-1 子项 3 极值：`$$` 块 **body 行同时携带行内 `$`**（普通行，class 7），
+    // 且恰在闭界围栏行之上——行内 `$` 增补（`$cost` → `$$cost`，trim 仍是普通行、
+    // 非整行 `$$…$$`）不得改变任何区域边界：`derived` Rc 复用、块区间不变、`source`
+    // 就地修补（若误判重建/误动边界即此漏网）。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("$$\nE = mc^2 $cost\n$$\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0, src0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        assert_eq!(d.borrow().math_regions.len(), 1, "1 个 $$ 块");
+        assert_eq!(d.borrow().math_regions[0].range, 0usize..3);
+        let src = d.borrow().math_regions[0].source.clone();
+        (d, ed.read(cx).regions_ver(), src)
+    });
+    assert_eq!(src0, "E = mc^2 $cost");
+    // 闭界围栏行（行 2）之上的 body 行（行 1）：`$cost` 前补 `$` → `$` 现值 $。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = ed.read(cx).content().find("$cost").unwrap();
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "$", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
+            std::rc::Rc::ptr_eq(&rc0, &d1),
+            "块内 body 行行内 `$` 增补 → 派生应复用 Rc（不整篇重建）"
+        );
+        assert_eq!(ed.read(cx).regions_ver(), rv0);
+        assert_eq!(d1.borrow().math_regions.len(), 1);
+        assert_eq!(d1.borrow().math_regions[0].range, 0usize..3, "区域区间不变");
+        assert_eq!(
+            d1.borrow().math_regions[0].source,
+            "E = mc^2 $$cost",
+            "块 source 应被就地修补"
+        );
+    });
+}
+
+#[gpui::test]
+fn dollar_fence_removal_rebuilds_derived(cx: &mut TestAppContext) {
+    // M5-B3-1 子项 3 的「边界」：把 `$$` 围栏行改成 `$$$`（class 2 → 7）→ 围栏消失、
+    // 区域结构真变 → 仍整篇重建。保「$$ 围栏出入保全量」，不被普通行快捷分支误伤。
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("$$\nx\n$$\n"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (rc0, rv0) = vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d = ed.read(cx).derived();
+        assert_eq!(d.borrow().math_regions.len(), 1, "初始 1 个 $$ 块");
+        (d, ed.read(cx).regions_ver())
+    });
+    // 开界行 `$$` 首插 `$` → `$$$`（围栏消失）。
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, ecx| e.replace_range(0..0, "$", ecx));
+    });
+    vcx.update(|_w, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let d1 = ed.read(cx).derived();
+        assert!(
+            !std::rc::Rc::ptr_eq(&rc0, &d1),
+            "围栏行变 `$$$` → 区域结构变 → 派生应整篇重建"
         );
         assert_ne!(ed.read(cx).regions_ver(), rv0, "regions 版本应递增");
     });

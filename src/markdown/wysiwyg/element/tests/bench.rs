@@ -200,6 +200,77 @@ fn bench_cached_band_rebuild_vs_materialize(cx: &mut TestAppContext) {
         });
 }
 
+/// M5-B3-1 手动基准（`--ignored` + `--nocapture` 才跑）：量化两个逐键 O(n) 残余的收口
+/// ① 折叠了一个标题后、在别处（折叠体之外）按 Enter——旧实现每键 `text_shared()` 全篇
+/// 物化 + `heading_fold_regions` 全扫 + 禁用 deltas 平移；新实现标题折叠体移入 derived
+/// 行号平移、sets 重建不再物化全文、deltas 平移。
+/// ② 在普通行打 `$`（行内公式不构成区域）——旧实现每键 `regions_ver++` → derived 全篇
+/// 数学/警报重扫；新实现精确判定后跳过。
+/// 输出 ms/key 与 text_shared 计数差（后者是收口对象）供 before/after 对比。
+/// 注意：Pass1（结构编辑后缀估计）与带内 Pass2 整形是此规模文档的固有成本，两种模式
+/// 都在；对比看的是**差量**（旧实现的 text_shared + 标题全扫 + deltas 整建被消掉）。
+#[gpui::test]
+#[ignore]
+fn bench_m5b31_per_key_enter_and_dollar(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 大文档：头部一个折叠标题（body 被 `# Tail` 截断）+ 顶部一簇数学块 + 普通段落；
+    // 编辑点放在顶部的 `# Tail` 之后（折叠体之外、又不至于让 Pass1 后缀太长）。
+    let mut text = String::from("## App\napp body\n");
+    for i in 0..12 {
+        text.push_str(&format!(
+            "zone paragraph {i} with $e^{{i\\pi}}$ inline math here\n$$\n\\int_{i} x dx\n$$\n"
+        ));
+    }
+    text.push_str("# Tail\n");
+    let mut k = 0;
+    while text.len() < 1_000_000 {
+        text.push_str(&format!(
+            "ordinary para line {k} some more words to fill the doc here\n"
+        ));
+        k += 1;
+    }
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, cx| e.toggle_heading_fold_at_line(0, cx));
+        let _f0 = build_frame(ed.read(cx), window, px(900.), (0., 999_999.));
+        let n = ed.read(cx).content().len();
+        let tail_at = ed.read(cx).content().find("ordinary para line 3").unwrap();
+        // 40 个编辑点（都在 `# Tail` 之下、折叠体之外）；每点隔 80 字节（落不同行）。
+        let ats: Vec<usize> = (0..40).map(|j| tail_at + j * 80).collect();
+        // ① Enter。
+        let t0 = std::time::Instant::now();
+        for (i, &at) in ats.iter().enumerate() {
+            let c_a = ed.read(cx).doc().text_shared_calls();
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "\n", ecx));
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 1400.));
+            let delta_c = ed.read(cx).doc().text_shared_calls() - c_a;
+            eprintln!("[bench] Enter iter={i} text_shared_delta={delta_c}");
+        }
+        let dt1 = t0.elapsed().as_millis() as f64 / ats.len() as f64;
+        // ② 打 `$`：同样 40 个编辑点各打一个 `$`（仍在普通行/折叠体之外；① 的换行
+        // 使偏移略漂移，但仍在普通段落区，计时对比成立）。
+        let t2 = std::time::Instant::now();
+        for (i, &at) in ats.iter().enumerate() {
+            let c_a = ed.read(cx).doc().text_shared_calls();
+            ed.update(cx, |e, ecx| e.replace_range(at..at, "$", ecx));
+            let _f = build_frame(ed.read(cx), window, px(900.), (0., 1400.));
+            let delta_c = ed.read(cx).doc().text_shared_calls() - c_a;
+            eprintln!("[bench] dollar iter={i} text_shared_delta={delta_c}");
+        }
+        let dt2 = t2.elapsed().as_millis() as f64 / ats.len() as f64;
+        eprintln!(
+            "[bench] M5-B3-1 doc={n}B 折叠标题後别处 40×Enter: {dt1:.3}ms/key; 普通行 40×打`$`: {dt2:.3}ms/key"
+        );
+    });
+}
+
 /// 手动性能基准（`--ignored` + `--nocapture` 才跑）：在「结构密集」大文档上量化
 /// 编辑/滚动的单次成本，供人工复测比对（debug 模式即与 `cargo run` 同构）。
 #[gpui::test]

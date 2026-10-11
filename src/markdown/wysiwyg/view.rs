@@ -545,6 +545,11 @@ impl WyEditor {
     pub(crate) fn regions_ver(&self) -> u64 {
         self.regions_ver.get()
     }
+    /// 结构编辑「行号平移」版本（`fp_sets` 缓存键组成部分；`shift_derived_after_edit`
+    /// 成功就地平移区域行号时递增——region 结构未重建、只是行号动了）。
+    pub(crate) fn regions_shift_ver(&self) -> u64 {
+        self.regions_shift_ver.get()
+    }
     /// 标题折叠视图态版本（`fold_plan` 缓存键组成部分）。
     pub(crate) fn fold_ver(&self) -> u64 {
         self.fold_ver.get()
@@ -635,12 +640,13 @@ impl WyEditor {
         *self.block_layout.borrow_mut() = Some((epoch, l.clone()));
         (true, l, old)
     }
-    /// 折叠/重排计划（缓存）：`math_start` / `math_body` / `fold_lines` / `deltas`——
-    /// 全部**与可视带无关且不含 caret**（键 = `epoch ^ regions_ver ^ mgen ^ fold_ver`），
-    /// 滚动/带移动/**光标移动/纯文本键入**都复用同一 `Rc`。caret 的 reveal-on-caret 由
-    /// [`Self::fold_reveal`] 按带现算叠加（最多一个数学块 + 一个折叠体）。
-    /// 旧实现把 caret 放进键——每次光标动/每键都整算（结构密集大文档 ~40-100ms → 输入/
-    /// 方向键「巨大延迟」）；更早是每档在 `build_frame` 里重算（滚动卡）。
+    /// 折叠/重排计划（缓存）：marker 集合（`FoldPlanSets`）与 `deltas` 分层缓存——
+    /// 全部**与可视带无关且不含 caret**。`deltas` 键 = `epoch ^ regions_ver ^ mgen ^
+    /// fold_ver`；`sets` 键 + 布局 epoch / mgen（只影响高度）→ `sets` 跨布局复用
+    /// （M5-B3-1 子项 2）。滚动/带移动/**光标移动/纯文本键入**都复用同一 `Rc`。
+    /// caret 的 reveal-on-caret 由 [`Self::fold_reveal`] 按带现算叠加（最多一个数学块 +
+    /// 一个折叠体）。旧实现把 caret 放进键——每次光标动/每键都整算（结构密集大文档
+    /// ~40-100ms → 输入/方向键「巨大延迟」）；更早是每档在 `build_frame` 里重算（滚动卡）。
     pub(crate) fn fold_plan(
         &self,
         base: Rc<std::cell::RefCell<element::BlockLayout>>,
@@ -663,102 +669,61 @@ impl WyEditor {
             return p.clone();
         }
         let derived = self.derived();
-        // ———（一）marker 集合：从已增量平移的 `derived` 重建（O(#区域)；math/alert 区域
-        // 在 `update_derived_after_edit` 已行号平移，marker 无需再平移）。标题折叠态仅在
-        // 有折叠时才全文扫描。
-        let (math_start, math_body, fold_lines, fold_bodies, fold_split) = {
-            let d = derived.borrow();
-            let math_regions = &d.math_regions;
-            // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
-            let _t_sets = crate::prof::begin();
-            let mut math_start: rustc_hash::FxHashMap<usize, usize> =
-                rustc_hash::FxHashMap::with_capacity_and_hasher(
-                    math_regions.len(),
-                    std::default::Default::default(),
-                );
-            let mut math_body: rustc_hash::FxHashSet<usize> =
-                rustc_hash::FxHashSet::with_capacity_and_hasher(
-                    math_regions.len() * 2,
-                    std::default::Default::default(),
-                );
-            for (idx, reg) in math_regions.iter().enumerate() {
-                math_start.insert(reg.range.start, idx);
-                math_body.extend(reg.range.start + 1..reg.range.end);
-            }
-            let mut fold_lines: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
-            let mut fold_bodies: Vec<Range<usize>> = Vec::new();
-            for (rnge, folded) in &d.alert_fold_regions {
-                if !*folded {
-                    continue;
-                }
-                fold_bodies.push(rnge.clone());
-                fold_lines.extend(rnge.start + 1..rnge.end);
-            }
-            // alert 折叠体条数 = `fold_bodies` 前缀长度（两组二分分组边界：alert 组在前）。
-            let fold_split = fold_bodies.len();
-            crate::prof::end("wy.fp.sets", _t_sets);
-            let _t_head = crate::prof::begin();
-            {
-                let folded = self.folded_headings.borrow();
-                if !folded.is_empty() {
-                    let content = self.doc.text_shared();
-                    for rnge in inline_style::heading_fold_regions(&content, &folded) {
-                        fold_bodies.push(rnge.clone());
-                        fold_lines.extend(rnge.start + 1..rnge.end);
-                    }
-                }
-            }
-            crate::prof::end("wy.fp.head", _t_head);
-            (math_start, math_body, fold_lines, fold_bodies, fold_split)
-        };
+        // ———（一）marker 集合（`FoldPlanSets`）：从**缓存**取（O(1) `Rc` 复用）——
+        // 键 = `regions_ver ^ 行号平移版本 ^ fold_ver`（**不含布局 epoch / mgen**）：
+        // 布局换代 / 公式光栅就绪（mgen 变）不改变任何行号/区域结构 → 集合跨计划复用，
+        // 不再每键重建 O(#区域) 哈希（M5-B3-1 子项 2）。标题折叠体已在 `derived`
+        // 内维护（行号平移 / 折叠态翻转时重扫），不再每键 `text_shared()` 全篇物化
+        // + `heading_fold_regions` 全扫（M5-B3-1 子项 4）。
+        let sets = self.fold_plan_sets(&derived);
         // ———（二）deltas：marker 身份未变 + 结构编辑待消费 → 增量平移（免 O(n) 双数组
         // 标记 + 0..n 扫描）；否则整建（见 [`Self::fold_plan_deltas_full`]）。
-        if let Some(plan) = self.fold_plan_deltas_shifted(
-            &derived,
-            base.clone(),
-            key,
-            marker_key,
-            &math_start,
-            &math_body,
-            &fold_lines,
-            &fold_bodies,
-            fold_split,
-        ) {
+        if let Some(plan) =
+            self.fold_plan_deltas_shifted(&derived, base.clone(), key, marker_key, sets.clone())
+        {
             return plan;
         }
-        self.fold_plan_deltas_full(
-            &derived,
-            base,
-            key,
-            marker_key,
-            math_start,
-            math_body,
-            fold_lines,
-            fold_bodies,
-            fold_split,
-        )
+        self.fold_plan_deltas_full(&derived, base, key, marker_key, sets)
     }
-    /// deltas **增量平移**（B5）：marker 集合已重建（O(#区域)，`fp.sets`），deltas 免
-    /// O(n) 双数组标记 + 0..n 扫描（`fp.dyn/fp.tail` ~3ms debug），改为平移旧计划：
-    /// 块下标 < 旧编辑块的不变、> 旧编辑块的整体 + 块数净增；被编辑块旧条目丢弃，按新
-    /// markers + 新 base 就地重算编辑邻域（折叠/数学 body → -height、数学 start →
-    /// 卡高-height；body 优先）。
-    /// 仅在：marker 身份与缓存一致、确有结构编辑待消费、无标题折叠态时走此路径；任何
-    /// 偏离回退 `None` 走整建（正确 > 快）。
-    #[allow(clippy::too_many_arguments)] // 折叠计划产出的正交输入
+    /// `FoldPlanSets`（marker 集合）构建 + 缓存。键 = `regions_ver ^ regions_shift_ver ^
+    /// fold_ver`（**不含布局 epoch / mgen**）：任一键分量表示 region/折叠**结构**变化 →
+    /// 重建；epoch/mgen 只改 `deltas`（高度），不碰键 → 布局/公式就绪重建直接复用同一
+    /// `Rc`。安全性：集合只含行号与区域下标、不含任何高度值；`math_start` 的 region 下标
+    /// 指向 `derived` 内 `math_regions`——键含 `regions_ver` 保证同一 `derived` 实例
+    /// （行号平移版本分量保证行号已平移的集合不命中旧键，见 `shift_derived_after_edit`）。
+    fn fold_plan_sets(&self, derived: &Rc<RefCell<WyDerived>>) -> Rc<element::FoldPlanSets> {
+        let regions_ver = self.regions_ver();
+        let shift_ver = self.regions_shift_ver();
+        let fold_ver = self.fold_ver();
+        let skey = regions_ver.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ shift_ver.wrapping_mul(0x296C_4EA9_6BE3_A5F1)
+            ^ fold_ver.wrapping_mul(0x517C_C1B7_2722_0A95);
+        if let Some((k, s)) = &*self.fp_sets.borrow()
+            && *k == skey
+        {
+            return s.clone();
+        }
+        let sets = build_fp_sets(derived);
+        *self.fp_sets.borrow_mut() = Some((skey, sets.clone()));
+        sets
+    }
+    /// deltas **增量平移**（B5 + M5-B3-1）：marker 集合来自缓存（O(1) `Rc` 复用 / 行号
+    /// 平移，见 [`Self::fold_plan_sets`]），deltas 免 O(n) 双数组标记 + 0..n 扫描
+    /// （`fp.dyn/fp.tail` ~3ms debug），改为平移旧计划：块下标小于旧编辑块的不变、
+    /// 在旧编辑块之后整体 + 块数净增；被编辑块旧条目丢弃，按新 markers + 新 base 就地
+    /// 重算编辑邻域（折叠/数学 body → -height、数学 start → 卡高-height；body 优先）。
+    /// 仅在：marker 身份与缓存一致、确有结构编辑待消费时走此路径（**含标题折叠**：
+    /// M5-B3-1 把标题折叠体移入 `derived` 行号平移后，平移一致性对折叠态同样成立——
+    /// 旧实现因此禁用折叠态时的增量路径）；任何偏离回退 `None` 走整建（正确 > 快）。
     fn fold_plan_deltas_shifted(
         &self,
         derived: &Rc<std::cell::RefCell<WyDerived>>,
         base: Rc<std::cell::RefCell<element::BlockLayout>>,
         key: u64,
         marker_key: u64,
-        math_start: &rustc_hash::FxHashMap<usize, usize>,
-        math_body: &rustc_hash::FxHashSet<usize>,
-        fold_lines: &rustc_hash::FxHashSet<usize>,
-        fold_bodies: &[Range<usize>],
-        fold_split: usize,
+        sets: Rc<element::FoldPlanSets>,
     ) -> Option<Rc<element::FoldPlan>> {
-        if !self.struct_edit_pending.get() || !self.folded_headings.borrow().is_empty() {
+        if !self.struct_edit_pending.get() {
             return None;
         }
         let old_plan = {
@@ -787,6 +752,9 @@ impl WyEditor {
             .doc
             .block_index_for_line(self.struct_dirty_line())
             .min(n.saturating_sub(1));
+        let fold_lines = &sets.fold_lines;
+        let math_body = &sets.math_body;
+        let math_start = &sets.math_start;
         let member_delta = |ix: usize| -> Option<f32> {
             let m = self.doc.block_meta(ix)?;
             let s0 = m.src_line as usize;
@@ -826,11 +794,7 @@ impl WyEditor {
         let delta_sum: f32 = deltas.iter().map(|&(_, v)| v).sum();
         let delta_pref = element::build_delta_pref(&deltas);
         let plan = Rc::new(element::FoldPlan {
-            math_start: math_start.clone(),
-            math_body: math_body.clone(),
-            fold_lines: fold_lines.clone(),
-            fold_bodies: fold_bodies.to_vec(),
-            fold_split,
+            sets,
             deltas: deltas.into_boxed_slice().into(),
             delta_pref,
             delta_sum,
@@ -839,20 +803,15 @@ impl WyEditor {
         *self.fold_plan.borrow_mut() = Some((key, marker_key, plan.clone()));
         Some(plan)
     }
-    /// deltas **整建**：marker 集合（已重建）→「命中标记 + 块值」双数组（块下标 ∈
+    /// deltas **整建**：marker 集合（取自缓存）→「命中标记 + 块值」双数组（块下标 ∈
     /// [0,n)，填表 O(1)、尾随按 0..n 升序扫出——免 30k 项全排序；见 `fp.dyn/fp.tail`）。
-    #[allow(clippy::too_many_arguments)] // 与 fold_plan_deltas_shifted 同源的正交输入
     fn fold_plan_deltas_full(
         &self,
         derived: &Rc<std::cell::RefCell<WyDerived>>,
         base: Rc<std::cell::RefCell<element::BlockLayout>>,
         key: u64,
         marker_key: u64,
-        math_start: rustc_hash::FxHashMap<usize, usize>,
-        math_body: rustc_hash::FxHashSet<usize>,
-        fold_lines: rustc_hash::FxHashSet<usize>,
-        fold_bodies: Vec<Range<usize>>,
-        fold_split: usize,
+        sets: Rc<element::FoldPlanSets>,
     ) -> Rc<element::FoldPlan> {
         let math_regions = &derived.borrow().math_regions;
         let _t_dyn = crate::prof::begin();
@@ -860,17 +819,17 @@ impl WyEditor {
         let nb = base_br.n();
         let mut marked: Vec<bool> = vec![false; nb];
         let mut vals: Vec<f32> = vec![0.0; nb];
-        for &srcline in fold_lines.iter() {
+        for &srcline in sets.fold_lines.iter() {
             let ix = base_br.block_for_line(srcline);
             marked[ix] = true;
             vals[ix] = -base_br.height(ix);
         }
-        for &srcline in math_body.iter() {
+        for &srcline in sets.math_body.iter() {
             let ix = base_br.block_for_line(srcline);
             marked[ix] = true;
             vals[ix] = -base_br.height(ix);
         }
-        for (&srcline, &ridx) in math_start.iter() {
+        for (&srcline, &ridx) in sets.math_start.iter() {
             let ix = base_br.block_for_line(srcline);
             if !marked[ix] {
                 let card_h = f32::from(element::math_card_height(self, &math_regions[ridx]));
@@ -890,11 +849,7 @@ impl WyEditor {
         crate::prof::end("wy.fp.tail", _t_tail);
         let delta_pref = element::build_delta_pref(&deltas_vec);
         let plan = Rc::new(element::FoldPlan {
-            math_start,
-            math_body,
-            fold_lines,
-            fold_bodies,
-            fold_split,
+            sets,
             deltas: deltas_vec.into_boxed_slice().into(),
             delta_pref,
             delta_sum,
@@ -939,7 +894,7 @@ impl WyEditor {
         // 折叠体：caret 在 body `[start+1, end)` → 该体行还原源码（不折叠成 0）。
         // `fold_bodies` 两组各自升序不重叠、跨组可重叠 → `folded_body_at` 分组二分
         // （alert 优先），与旧线性 `find` 首中语义一致。
-        if let Some(rnge) = folded_body_at(&plan.fold_bodies, plan.fold_split, caret_line) {
+        if let Some(rnge) = folded_body_at(&plan.sets.fold_bodies, plan.sets.fold_split, caret_line) {
             let rng = rnge.clone();
             reveal.ranges.push(rng.clone());
             for l in rng.start + 1..rng.end {
@@ -998,6 +953,14 @@ impl WyEditor {
             },
             alert_fold_regions,
             alert_region_kinds,
+            heading_fold_bodies: {
+                let folded = self.folded_headings.borrow();
+                if folded.is_empty() {
+                    Vec::new()
+                } else {
+                    inline_style::heading_fold_regions(&content, &folded)
+                }
+            },
         }));
         *self.derived.borrow_mut() = Some((ver, d.clone()));
         d
@@ -1043,6 +1006,53 @@ fn folded_body_at(
                 .get(fold_split..)
                 .and_then(|g| region_containing(g, |r| r.clone(), line, false).map(|i| &g[i]))
         })
+}
+
+/// 由已增量维护的 `WyDerived` 构建 marker 集合（O(#数学块 + #折叠体) 预分配哈希构建）。
+/// 标题折叠体不再每键扫全篇文本：`heading_fold_bodies` 已由 `shift_derived_after_edit`
+/// 行号平移 / `toggle_heading_fold_at_line` / `derived`（`regions_ver` 重建）维护在
+/// `WyDerived` 内（M5-B3-1 子项 4，见 [`WyDerived::heading_fold_bodies`] 注释）。
+fn build_fp_sets(derived: &Rc<RefCell<WyDerived>>) -> Rc<element::FoldPlanSets> {
+    let d = derived.borrow();
+    let math_regions = &d.math_regions;
+    // 预分配容量（大文档 3000 数学块：未预分配每次重建多次 rehash ≈20ms）。
+    let _t_sets = crate::prof::begin();
+    let mut math_start: rustc_hash::FxHashMap<usize, usize> =
+        rustc_hash::FxHashMap::with_capacity_and_hasher(
+            math_regions.len(),
+            std::default::Default::default(),
+        );
+    let mut math_body: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+        math_regions.len() * 2,
+        std::default::Default::default(),
+    );
+    for (idx, reg) in math_regions.iter().enumerate() {
+        math_start.insert(reg.range.start, idx);
+        math_body.extend(reg.range.start + 1..reg.range.end);
+    }
+    let mut fold_lines: rustc_hash::FxHashSet<usize> = rustc_hash::FxHashSet::default();
+    let mut fold_bodies: Vec<Range<usize>> = Vec::new();
+    for (rnge, folded) in &d.alert_fold_regions {
+        if !*folded {
+            continue;
+        }
+        fold_bodies.push(rnge.clone());
+        fold_lines.extend(rnge.start + 1..rnge.end);
+    }
+    // alert 折叠体条数 = `fold_bodies` 前缀长度（两组二分分组边界：alert 组在前）。
+    let fold_split = fold_bodies.len();
+    for rnge in &d.heading_fold_bodies {
+        fold_bodies.push(rnge.clone());
+        fold_lines.extend(rnge.start + 1..rnge.end);
+    }
+    crate::prof::end("wy.fp.sets", _t_sets);
+    Rc::new(element::FoldPlanSets {
+        math_start,
+        math_body,
+        fold_lines,
+        fold_bodies,
+        fold_split,
+    })
 }
 
 #[cfg(test)]

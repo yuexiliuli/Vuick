@@ -358,9 +358,9 @@ fn pass2_shape_band(
     reveal: &RevealPlan,
 ) -> Vec<(usize, ShapedRow)> {
     let _t_p2 = crate::prof::begin();
-    let fold_lines = &plan.fold_lines;
-    let math_body = &plan.math_body;
-    let math_start = &plan.math_start;
+    let fold_lines = &plan.sets.fold_lines;
+    let math_body = &plan.sets.math_body;
+    let math_start = &plan.sets.math_start;
     let mut shaped: Vec<(usize, ShapedRow)> = Vec::new();
     let mut i = i0;
         while i < i1 {
@@ -583,9 +583,9 @@ fn pass3_assemble_rows(
     reveal: &RevealPlan,
 ) -> (Vec<ShapedRow>, f32) {
     let _t_pass3 = crate::prof::begin();
-    let math_start = &plan.math_start;
-    let math_body = &plan.math_body;
-    let fold_lines = &plan.fold_lines;
+    let math_start = &plan.sets.math_start;
+    let math_body = &plan.sets.math_body;
+    let fold_lines = &plan.sets.fold_lines;
     let mut rows: Vec<ShapedRow> = Vec::new();
     let mut shaped_iter = shaped.into_iter().peekable();
     let total = {
@@ -1052,9 +1052,9 @@ pub(crate) fn prewarm_band(e: &WyEditor, frame: &Frame, window: &mut Window) {
         // 与 Pass2 `blocked` 同判据：折叠/math 块不物化整形行。
         let blocked = match &plan {
             Some(p) => {
-                p.fold_lines.contains(&srcline)
-                    || p.math_body.contains(&srcline)
-                    || p.math_start.contains_key(&srcline)
+                p.sets.fold_lines.contains(&srcline)
+                    || p.sets.math_body.contains(&srcline)
+                    || p.sets.math_start.contains_key(&srcline)
             }
             None => false,
         };

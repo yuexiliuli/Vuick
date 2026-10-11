@@ -71,7 +71,7 @@ pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 pub(crate) use self::types::{
     BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
     ImageSrcBlocks, MathSlot, TocCacheEntry, TocEntries, UNDO_LIMIT, UndoUnit, WyDerived,
-    WyOpenResult, inline_math_key, region_line_sig,
+    WyOpenResult, inline_math_key, is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -158,6 +158,11 @@ pub struct WyEditor {
     /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
     /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
     struct_ver: Cell<u64>,
+    /// 结构编辑「行号平移」版本（M5-B3-1 子项 2/4）：`shift_derived_after_edit` 成功
+    /// 就地平移区域行号（结构不变、只是行号动）时递增——纳入 [`Self::fp_sets`] 缓存键，
+    /// 防集合命中旧行号；`regions_ver++` 整篇重建走另一条键分量（`regions_ver`）天然
+    /// 失效。
+    regions_shift_ver: Cell<u64>,
     /// 结构性编辑影响的**首个源行**（Pass1 增量高度重估的起点）：编辑线之前的块
     /// 内容未变 → 复用旧布局高度；只有「编辑线起 → 文尾」重新估算（Enter 贴近文尾时
     /// O(变化后缀) 而非全篇）。非结构编辑不参与（无重建）。
@@ -186,6 +191,11 @@ pub struct WyEditor {
     /// `marker_key` = regions_ver^mgen^fold_ver：marker 身份在结构编辑间未变 → deltas
     /// 可增量平移复用（`fold_plan_incremental`）。
     fold_plan: RefCell<Option<(u64, u64, Rc<element::FoldPlan>)>>,
+    /// 折叠计划 **marker 集合**缓存：`(sets_key, Rc<FoldPlanSets>)`。`sets_key` =
+    /// `regions_ver ^ regions_shift_ver ^ fold_ver`（只 region/折叠结构，**不含布局
+    /// epoch / mgen**）——布局换代、宽度/字号、公式光栅就绪（mgen）只改 `deltas`（高度），
+    /// marker 集合跨计划复用（M5-B3-1 子项 2，免每次 O(#区域) 哈希重建）。
+    fp_sets: RefCell<Option<(u64, Rc<element::FoldPlanSets>)>>,
     /// 标题折叠视图态版本：`toggle_heading_fold_at_line` 翻转 `folded_headings` 时递增
     /// （纳入 `fold_plan` 缓存键，滚动不带折叠态重算）。
     fold_ver: Cell<u64>,

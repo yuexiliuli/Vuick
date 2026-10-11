@@ -232,20 +232,23 @@ fn fold_plan_incremental_shift_matches_full_rebuild(cx: &mut TestAppContext) {
             (inc, full)
         });
         assert_eq!(
-            inc.math_start, full.math_start,
+            inc.sets.math_start, full.sets.math_start,
             "{needle}: math_start 不一致"
         );
-        assert_eq!(inc.math_body, full.math_body, "{needle}: math_body 不一致");
         assert_eq!(
-            inc.fold_lines, full.fold_lines,
+            inc.sets.math_body, full.sets.math_body,
+            "{needle}: math_body 不一致"
+        );
+        assert_eq!(
+            inc.sets.fold_lines, full.sets.fold_lines,
             "{needle}: fold_lines 不一致"
         );
         assert_eq!(
-            inc.fold_bodies, full.fold_bodies,
+            inc.sets.fold_bodies, full.sets.fold_bodies,
             "{needle}: fold_bodies 不一致"
         );
         assert_eq!(
-            inc.fold_split, full.fold_split,
+            inc.sets.fold_split, full.sets.fold_split,
             "{needle}: fold_split 不一致"
         );
         assert_eq!(&*inc.deltas, &*full.deltas, "{needle}: deltas 不一致");
@@ -339,7 +342,51 @@ fn chunked_layout_structural_edit_matches_flat_rebuild(_cx: &mut TestAppContext)
     assert_eq!(ss.as_slice(), &[0, 1]);
 }
 
+/// M5-B3-1 子项 2：`fp_sets` 与布局 epoch 解耦——宽度换代（epoch 变、region/折叠结构
+/// 不变）只重算 deltas，marker 集合 `Rc` **跨计划复用**（不再每键 O(#区域) 哈希重建；
+/// 同理由结构与折叠态决定，与布局无关）。
+#[gpui::test]
+fn fold_plan_sets_reused_across_epoch_only_rebuild(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = concat!(
+        "para\n",
+        "$$\n",
+        "\\int dx\n",
+        "$$\n",
+        "> [!NOTE]-\n",
+        "alert body\n",
+        "para tail\n",
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let (sets0, deltas0) = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f0 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let plan = ed.read(cx).fold_plan_rc().expect("折叠计划");
+        assert_eq!(plan.sets.math_start.len(), 1, "1 个数学块");
+        assert_eq!(plan.sets.fold_bodies.len(), 1, "1 个 alert 折叠体");
+        (plan.sets.clone(), plan.deltas.clone())
+    });
+    // 宽度 600 → 700：epoch（布局代）变化，region/折叠结构不变 → sets 复用同一 Rc，
+    // deltas 是布局相关量（卡高/行高随宽度），允许重算为新的。
+    let (sets1, deltas1) = vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let _f1 = build_frame(ed.read(cx), window, px(700.), (0., 999_999.));
+        let plan = ed.read(cx).fold_plan_rc().expect("折叠计划");
+        (plan.sets.clone(), plan.deltas.clone())
+    });
+    assert!(
+        std::rc::Rc::ptr_eq(&sets0, &sets1),
+        "仅宽度换代不应重建 marker 集合（fp_sets 与 epoch 解耦）"
+    );
+    let _ = (&deltas0, &deltas1);
+}
+
 /* ==================== 图片编辑：悬浮铅笔按钮 + 卡片表单 ==================== */
 
 use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent};
-

@@ -1,22 +1,83 @@
-/* ---------- UTF16 ↔ 字节（IME/选择器用） ---------- */
+/* ---------- IME：`ImeTextHost` 适配层 + `EntityInputHandler` 委托 ---------- */
 
 use std::ops::Range;
 
 use gpui::{px, Context, EntityInputHandler, Pixels, UTF16Selection, Window};
 
 use super::WyEditor;
+use crate::editor::EditIntent;
+use crate::ime::{self, ImeTextHost};
 
-/// 小串内（组合文本 `new_text`，`new_selected_range` 是相对它起点的 UTF-16 偏移）的
-/// UTF-16 → 字节扫描，O(串长)（组合文本只有几个字符，不需要行索引）。
-pub(crate) fn offset_from_utf16(s: &str, utf16: usize) -> usize {
-    let mut count = 0usize;
-    for (i, c) in s.char_indices() {
-        if count >= utf16 {
-            return i;
-        }
-        count += c.len_utf16();
+impl ImeTextHost for WyEditor {
+    fn len_utf16(&self) -> usize {
+        self.doc.total_utf16()
     }
-    s.len()
+
+    fn byte_to_utf16(&self, byte: usize) -> usize {
+        self.doc.byte_to_utf16(byte)
+    }
+
+    fn utf16_to_byte(&self, offset_utf16: usize) -> usize {
+        self.doc.utf16_to_byte(offset_utf16)
+    }
+
+    fn text_in_bytes(&self, range: Range<usize>) -> Option<String> {
+        Some(self.doc.slice_str(range))
+    }
+
+    fn selection_bytes(&self) -> Range<usize> {
+        self.selection().unwrap_or(self.caret..self.caret)
+    }
+
+    fn selection_reversed(&self) -> bool {
+        self.caret < self.sel_anchor.unwrap_or(self.caret)
+    }
+
+    fn set_selection_bytes(&mut self, range: Range<usize>) {
+        self.caret = range.end.min(self.len());
+        self.sel_anchor = Some(range.start.min(self.len()));
+        *self.frame.borrow_mut() = None;
+    }
+
+    fn marked_bytes(&self) -> Option<Range<usize>> {
+        self.marked.clone()
+    }
+
+    fn set_marked_bytes(&mut self, range: Option<Range<usize>>) {
+        self.marked = range;
+    }
+
+    /// 只取 `new_selected_range.start` 作组合内光标、不建立选区。
+    ///
+    /// 现状（未并前 `replace_and_mark`）即「`offset_from_utf16(new_text, sel.start)`
+    /// 摆 caret、不回写 sel_anchor」（`apply_edit` 已由 `replace_range` 清掉旧选区）。
+    /// 用共享 `ime::utf16_to_byte` 替代自研开销的 O(len) 扫描——两者除「偏移落
+    /// 在代理对内」的边角：自研版返回下一字符起点，共享版取该字符起点（更正确），
+    /// 其余字节逐位一致。不改动 editor/ui 的默认实现（选区 + head）。
+    fn set_composition_caret(
+        &mut self,
+        base_byte: usize,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+    ) {
+        let caret = match new_selected_range {
+            Some(sel) => base_byte + ime::utf16_to_byte(new_text, sel.start),
+            None => base_byte + new_text.len(),
+        };
+        self.caret = caret.min(self.len());
+    }
+
+    /// 落地编辑：`replace_range` 承载全部意图（undo 事务粒度按 `removed/text`
+    /// 自推导 `EditKind`，与 editor 的 `EditIntent` 无关——`intent` 无需透传）。
+    fn apply_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        _intent: EditIntent,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_range(range, text, cx);
+    }
 }
 
 impl EntityInputHandler for WyEditor {
@@ -28,6 +89,8 @@ impl EntityInputHandler for WyEditor {
         _: &mut Context<Self>,
     ) -> Option<String> {
         // 行粒度 UTF-16 前缀索引换算（O(log n + 行长)）+ 区间切片——不再物化全文。
+        // 保留上报 `actual_range`（平台读它校正 UTF-16 换算后的真实区间；共享
+        // `ime::text_for_range` 未暴露该出参，故此处走宿主自译而非共享面）。
         let range =
             self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
         *actual_range = Some(self.doc.byte_to_utf16(range.start)..self.doc.byte_to_utf16(range.end));
@@ -40,29 +103,16 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        match self.selection() {
-            Some(r) => Some(UTF16Selection {
-                range: self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end),
-                reversed: self.caret < self.sel_anchor.unwrap_or(self.caret),
-            }),
-            None => Some(UTF16Selection {
-                range: {
-                    let b = self.doc.byte_to_utf16(self.caret.min(self.len()));
-                    b..b
-                },
-                reversed: false,
-            }),
-        }
+        // 共享：byte 选区 → UTF-16；`reversed` 由 `selection_reversed` 提供。
+        Some(ime::selected_text_range(self))
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked
-            .as_ref()
-            .map(|r| self.doc.byte_to_utf16(r.start)..self.doc.byte_to_utf16(r.end))
+        ime::marked_text_range(self)
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked = None;
+        ime::unmark(self);
     }
 
     fn replace_text_in_range(
@@ -99,11 +149,9 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
-        let r =
-            self.doc.utf16_to_byte(range_utf16.start)..self.doc.utf16_to_byte(range_utf16.end);
-        self.caret = r.end.min(self.len());
-        self.sel_anchor = Some(r.start.min(self.len()));
-        *self.frame.borrow_mut() = None;
+        // 共享：UTF-16 → byte 后经 `set_selection_bytes` 落定（不在此 notify，
+        // 与现状一致）。
+        ime::set_selected_text_range(self, range_utf16);
     }
 
     fn bounds_for_range(
@@ -160,7 +208,7 @@ impl EntityInputHandler for WyEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.doc.total_utf16())
+        Some(self.len_utf16())
     }
 
     fn accepts_text_input(&self, _: &mut Window, _: &mut Context<Self>) -> bool {
