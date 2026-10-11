@@ -21,7 +21,8 @@ use ropey::Rope;
 
 use super::ir::IrKind;
 use super::parse::{
-    parse_block_window, parse_block_window_rope, BlockMeta, Row, RowKind, RunKind, TableData,
+    parse_block_window, parse_block_window_rope, BlockIndex, BlockMeta, Row, RowKind, RunKind,
+    TableData,
 };
 use super::parse;
 
@@ -97,6 +98,32 @@ pub(crate) struct DocRow {
 enum DocSrc {
     Str(SharedString),
     Rope(Rope),
+}
+
+/// 按行装配 [`DocRow`]（`assemble_docrow`）所需的**行索引 / 行文本访问接口**。
+///
+/// [`Doc`] 与预览快照（`MarkdownPreview` 的 `PreviewSrc` + 行起始表 / ropey 内建
+/// 行索引）都实现它：让「`Doc::rows_in_block_window` 的真实 `DocRow`」与「预览窗口 /
+/// 全量物化的 `DocRow`」共用同一份装配逻辑（M5-B5 P3-1a 预览渲染行源切共享 `DocRow`、
+/// `byte_map` 保真）。语义口径与 [`Doc::line_starts`] / [`Doc::line_str`] 一致：
+/// `line_start(ix)` = 第 ix 行起始字节偏移（越界 = `src_len`）、`line_count()` = 总行数
+/// （含末尾换行的幻影空行）、`line_str(ix)` = 第 ix 行源码文本（剥 `\r\n`/`\n` 行尾）。
+pub(crate) trait DocLineView {
+    fn line_start(&self, ix: usize) -> usize;
+    fn line_count(&self) -> usize;
+    fn line_str(&self, ix: usize) -> String;
+}
+
+impl DocLineView for Doc {
+    fn line_start(&self, ix: usize) -> usize {
+        self.line_starts.get(ix).unwrap_or_else(|| self.src_len())
+    }
+    fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+    fn line_str(&self, ix: usize) -> String {
+        self.line_str(ix)
+    }
 }
 
 /// 行起始表（`line_starts` / `line_utf16_starts` 共用）的**分段持久化**。
@@ -726,7 +753,10 @@ impl Doc {
             DocSrc::Str(s) => parse_block_window(s.as_ref(), &self.index, lo, hi),
             DocSrc::Rope(r) => parse_block_window_rope(r, &self.index, lo, hi),
         };
-        rows.into_iter().enumerate().map(|(j, r)| self.assemble(lo + j, r)).collect()
+        rows.into_iter()
+            .enumerate()
+            .map(|(j, r)| assemble_docrow(self, &self.index, lo + j, r))
+            .collect()
     }
 
     /// 按源码行区间找覆盖的块窗口并物化（虚拟化视口色调）。仅测试消费（parity 对比）。
@@ -743,126 +773,6 @@ impl Doc {
         let hi = b.partition_point(|m| m.src_line < hi_line as u32).max(lo);
         let hi = hi.saturating_sub(1).min(b.len() - 1).max(lo);
         self.rows_in_block_window(lo, hi)
-    }
-
-    /// 把预览侧一个块行装成统一行：kind 用 `row_kind`（与 `ir` 金标准同式，parity 钉死），
-    /// 行区间用**索引自身**（块 k 覆盖 `[src_line, 下一块 src_line)`，与窗口切片同源——
-    /// 不再为 kind/行区间在整篇 IR 上二分/全扫）。
-    fn assemble(&self, k: usize, r: Row) -> DocRow {
-        let kind = row_kind(r.kind);
-        let n = self.index.blocks.len();
-        let lines = if k + 1 < n {
-            let next = self.index.blocks.get(k + 1).map(|b| b.src_line as usize).unwrap_or(r.src_line + 1);
-            r.src_line..next.max(r.src_line + 1)
-        } else {
-            r.src_line..self.line_starts.len().max(r.src_line + 1)
-        };
-        let code_lines = r.code_lines().to_vec();
-        let byte_map = match r.kind {
-            RowKind::Paragraph
-            | RowKind::Heading(_)
-            | RowKind::Bullet
-            | RowKind::Quote => {
-                let line = self.line_str(r.src_line);
-                parse::text_segment(&line, r.kind)
-                    .map(|(off, seg)| {
-                        parse::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
-                    })
-                    .unwrap_or_default()
-            }
-            RowKind::Code => self.code_byte_map(r.src_line, &code_lines),
-            RowKind::Image => {
-                // 独立图片行 `![alt](src)`：alt 文本与源字节 1:1 连续（`!`/`[`
-                // 各占 1 字节，alt 自字节 2 起；末项哨兵 = 闭合 `]` 前 = 2+alt.len()）。
-                // 让图片题注成为与普通文本行同构的可编辑段（编辑正确映射回源）。
-                (0..=r.text.len()).map(|i| 2 + i).collect()
-            }
-            _ => Vec::new(),
-        };
-        let payload = match r.kind {
-            RowKind::Code => DocPayload::Code {
-                code_lines,
-                language: r.code_language().map(Into::into),
-            },
-            RowKind::Image => DocPayload::Image {
-                src: r.image().map(|i| i.src.clone()).unwrap_or_default(),
-            },
-            RowKind::Table => r.table().cloned().map(DocPayload::Table).unwrap_or_default(),
-            _ => DocPayload::Text,
-        };
-        let table_rows = match r.kind {
-            RowKind::Table => {
-                let n_data = r.table().map_or(0, |t| t.rows.len());
-                self.table_row_maps(r.src_line, n_data)
-            }
-            _ => None,
-        };
-        DocRow {
-            kind,
-            src_line: r.src_line,
-            lines,
-            text: r.text,
-            runs: r.runs,
-            byte_map,
-            payload,
-            table_rows,
-        }
-    }
-
-    /// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用
-    /// [`parse::split_table_cells_mapped`] 装配单元格编辑映射。
-    fn table_row_maps(
-        &self,
-        src_line: usize,
-        n_data: usize,
-    ) -> Option<std::rc::Rc<Vec<TableRowMap>>> {
-        let mut out = Vec::with_capacity(1 + n_data);
-        for k in 0..=n_data {
-            // k=0 表头（src_line）；数据行 i（0 基，k=i+1）源行 = src_line + 1 + k。
-            let line_ix = if k == 0 { src_line } else { src_line + 1 + k };
-            let line = self.line_str(line_ix);
-            let cells = parse::split_table_cells_mapped(&line)
-                .into_iter()
-                .map(|(src, text, map)| TableCellMap { src, text, map })
-                .collect();
-            out.push(TableRowMap { src_line: line_ix, cells });
-        }
-        Some(std::rc::Rc::new(out))
-    }
-
-    /// 代码块（围栏内内容行可编辑）的块级编辑映射：
-    /// `byte_map[i]` = 整块渲染文本（代码行以 `\n` 连接，围栏标记本身只读不渲染）
-    /// 第 `i` 个渲染字节对应的**块首源偏移**（相对 `src_line` 围栏行起始），使元素层
-    /// 可对围栏内任意内容行做「渲染位置 ↔ 源字节」换算。末项哨兵 = 末内容行行尾
-    /// （= 闭合围栏行起始）。`CRLF` 下分隔符映射到上一行的 `\n`（`line_starts` 已跳过 `\r\n`）。
-    fn code_byte_map(&self, src_line: usize, code_lines: &[SharedString]) -> Vec<usize> {
-        let block_start = self.line_starts.get(src_line).unwrap_or(0);
-        let mut map = Vec::new();
-        for (k, line) in code_lines.iter().enumerate() {
-            // 行与行之间的渲染 `\n`（首行前无分隔符）。
-            if k > 0 {
-                let prev_nl = self
-                    .line_starts
-                    .get(src_line + 1 + k)
-                    .unwrap_or(block_start)
-                    .saturating_sub(1);
-                map.push(prev_nl.saturating_sub(block_start));
-            }
-            let line_start = self
-                .line_starts
-                .get(src_line + 1 + k)
-                .unwrap_or(block_start);
-            for (i, _) in line.as_bytes().iter().enumerate() {
-                map.push(line_start.saturating_sub(block_start) + i);
-            }
-        }
-        let sentinel = self
-            .line_starts
-            .get(src_line + 1 + code_lines.len())
-            .unwrap_or_else(|| self.src_len())
-            .saturating_sub(block_start);
-        map.push(sentinel);
-        map
     }
 
     /// 第 `ix` 行的源码文本（仅该行切片，O(行长)）。
@@ -971,6 +881,146 @@ fn build_line_utf16_starts(
         run += u16_of_range(s, e);
     }
     v
+}
+
+/// 逐块装配统一行 [`DocRow`]（`Doc::rows_in_block_window` 与预览窗口/全量 DocRow
+/// 物化共用；M5-B5 P3-1a 渲染行源切到共享 DocRow 的装配核心）。
+///
+/// - kind 用 `row_kind`（与 `ir` 金标准同式，parity 钉死）；
+/// - 行区间用**索引自身**（块 k 覆盖 `[src_line, 下一块 src_line)`；末块到
+///   `line_count()` = `Doc::line_starts.len()` 口径）；
+/// - `byte_map`/`table_rows` 语义 = [`Doc`] 编辑映射（与 WYSIWYG 同一份）。
+pub(crate) fn assemble_docrow<V: DocLineView>(
+    view: &V,
+    index: &BlockIndex,
+    k: usize,
+    r: Row,
+) -> DocRow {
+    let kind = row_kind(r.kind);
+    let n = index.blocks.len();
+    let lines = if k + 1 < n {
+        let next = index
+            .blocks
+            .get(k + 1)
+            .map(|b| b.src_line as usize)
+            .unwrap_or(r.src_line + 1);
+        r.src_line..next.max(r.src_line + 1)
+    } else {
+        r.src_line..view.line_count().max(r.src_line + 1)
+    };
+    let code_lines = r.code_lines().to_vec();
+    let byte_map = match r.kind {
+        RowKind::Paragraph | RowKind::Heading(_) | RowKind::Bullet | RowKind::Quote => {
+            let line = view.line_str(r.src_line);
+            parse::text_segment(&line, r.kind)
+                .map(|(off, seg)| {
+                    parse::inline_style_mapped(seg).2.into_iter().map(|b| off + b).collect()
+                })
+                .unwrap_or_default()
+        }
+        RowKind::Code => code_byte_map(view, r.src_line, &code_lines),
+        RowKind::Image => {
+            // 独立图片行 `![alt](src)`：alt 文本与源字节 1:1 连续（`!`/`[`
+            // 各占 1 字节，alt 自字节 2 起；末项哨兵 = 闭合 `]` 前 = 2+alt.len()）。
+            // 让图片题注成为与普通文本行同构的可编辑段（编辑正确映射回源）。
+            (0..=r.text.len()).map(|i| 2 + i).collect()
+        }
+        _ => Vec::new(),
+    };
+    let payload = match r.kind {
+        RowKind::Code => DocPayload::Code {
+            code_lines,
+            language: r.code_language().map(Into::into),
+        },
+        RowKind::Image => DocPayload::Image {
+            src: r.image().map(|i| i.src.clone()).unwrap_or_default(),
+        },
+        RowKind::Table => r.table().cloned().map(DocPayload::Table).unwrap_or_default(),
+        _ => DocPayload::Text,
+    };
+    let table_rows = match r.kind {
+        RowKind::Table => {
+            let n_data = r.table().map_or(0, |t| t.rows.len());
+            table_row_maps(view, r.src_line, n_data)
+        }
+        _ => None,
+    };
+    DocRow {
+        kind,
+        src_line: r.src_line,
+        lines,
+        text: r.text,
+        runs: r.runs,
+        byte_map,
+        payload,
+        table_rows,
+    }
+}
+
+/// 一块窗口的预览行 → 统一行序列（预览侧共享装配入口；`lo` = 窗口首块下标）。
+/// 与 [`Doc::rows_in_block_window`] 逐位一致（byte_map/lines/table_rows 语义单源），
+/// 由 `markdown::view` 消费；`Doc` 内部同样走 [`assemble_docrow`]。
+pub(crate) fn assemble_docrow_window<V: DocLineView>(
+    view: &V,
+    index: &BlockIndex,
+    rows: &[Row],
+    lo: usize,
+) -> Vec<DocRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(j, r)| assemble_docrow(view, index, lo + j, r.clone()))
+        .collect()
+}
+
+/// 表格块：逐可见行（表头 + 各数据行，跳过分隔行）用
+/// [`parse::split_table_cells_mapped`] 装配单元格编辑映射。
+fn table_row_maps<V: DocLineView>(
+    view: &V,
+    src_line: usize,
+    n_data: usize,
+) -> Option<std::rc::Rc<Vec<TableRowMap>>> {
+    let mut out = Vec::with_capacity(1 + n_data);
+    for k in 0..=n_data {
+        // k=0 表头（src_line）；数据行 i（0 基，k=i+1）源行 = src_line + 1 + k。
+        let line_ix = if k == 0 { src_line } else { src_line + 1 + k };
+        let line = view.line_str(line_ix);
+        let cells = parse::split_table_cells_mapped(&line)
+            .into_iter()
+            .map(|(src, text, map)| TableCellMap { src, text, map })
+            .collect();
+        out.push(TableRowMap { src_line: line_ix, cells });
+    }
+    Some(std::rc::Rc::new(out))
+}
+
+/// 代码块（围栏内内容行可编辑）的块级编辑映射：
+/// `byte_map[i]` = 整块渲染文本（代码行以 `\n` 连接，围栏标记本身只读不渲染）
+/// 第 `i` 个渲染字节对应的**块首源偏移**（相对 `src_line` 围栏行起始），使元素层
+/// 可对围栏内任意内容行做「渲染位置 ↔ 源字节」换算。末项哨兵 = 末内容行行尾
+/// （= 闭合围栏行起始）。`CRLF` 下分隔符映射到上一行的 `\n`（`line_starts` 已跳过 `\r\n`）。
+fn code_byte_map<V: DocLineView>(
+    view: &V,
+    src_line: usize,
+    code_lines: &[SharedString],
+) -> Vec<usize> {
+    let block_start = view.line_start(src_line);
+    let mut map = Vec::new();
+    for (k, line) in code_lines.iter().enumerate() {
+        // 行与行之间的渲染 `\n`（首行前无分隔符）。
+        if k > 0 {
+            let prev_nl = view.line_start(src_line + 1 + k).saturating_sub(1);
+            map.push(prev_nl.saturating_sub(block_start));
+        }
+        let line_start = view.line_start(src_line + 1 + k);
+        for (i, _) in line.as_bytes().iter().enumerate() {
+            map.push(line_start.saturating_sub(block_start) + i);
+        }
+    }
+    let sentinel = view
+        .line_start(src_line + 1 + code_lines.len())
+        .saturating_sub(block_start);
+    map.push(sentinel);
+    map
 }
 
 /// 预览 `RowKind` → IR 语义（对齐子集上恒等；parity 保证二者一致）。
