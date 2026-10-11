@@ -20,3 +20,4 @@ include!("tests/notdef.rs");
 include!("tests/incremental.rs");
 include!("tests/image.rs");
 include!("tests/block_math.rs");
+include!("tests/epub.rs");

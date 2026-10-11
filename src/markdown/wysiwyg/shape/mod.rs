@@ -15,7 +15,7 @@ use crate::markdown::doc::{DocPayload, DocRow};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::inline_style::{self, MathRegion};
 use crate::markdown::parse::recognition;
-use crate::markdown::parse::{BlockMeta, RowKind, RunKind, TableAlign};
+use crate::markdown::parse::{BlockMeta, RowAlign, RowKind, RunKind, TableAlign};
 use crate::syntax::{
     CodeLineRuns, github_theme_cached, parse_code_lines, resolve_line_styles_with,
 };
@@ -329,6 +329,9 @@ pub(crate) fn shape_text_row(
         code_ranges,
         lh: st.lh,
         x_off,
+        // 行对齐（EPUB `%%ALIGN%%` / 标题居中）在 `shape_text_row_decorated` 里按
+        // **最终 x_off**（含标题 gutter 等）与内容盒宽一起算；这里恒空（左对齐）。
+        align_offsets: Vec::new(),
         height,
         top: px(0.),
         kind,
@@ -341,6 +344,43 @@ pub(crate) fn shape_text_row(
             ..Default::default()
         },
     }
+}
+
+/// EPUB 行对齐的逐可视行水平移量（px）：相对**内容盒**（`avail`，= 帧宽 − 两内衬）
+/// 按行宽右/中推，`row.x_off`（额外左缩进，标题 gutter 等）已计入，使齐平的几何以
+/// 「内容盒中心/右缘」为基准：`Right` = (avail − 行宽) − x_off、`Center` =
+/// (avail − 行宽)/2 − x_off；不足（行过期宽/行外缩进吞噬）时钳到 0（保持左对齐）。
+/// 对齐来源 = `row.align`（`%%ALIGN:X%%` 指令）优先；EPUB 阅读模式下**标题**默认居中
+/// （对齐 A 侧 `row.rs` 的 `align.or(if epub { 标题居中 })`）。普通行（无对齐）恒空，
+/// 行为与改造前逐位一致。
+pub(crate) fn align_offsets_for(
+    kind: IrKind,
+    row_align: Option<RowAlign>,
+    epub: bool,
+    wrapped: &std::rc::Rc<Vec<gpui::WrappedLine>>,
+    avail: f32,
+    x_off: f32,
+) -> Vec<Pixels> {
+    let align = match row_align {
+        Some(a) => Some(a),
+        None if epub && matches!(kind, IrKind::Heading(_)) => Some(RowAlign::Center),
+        None => None,
+    };
+    let factor = match align {
+        Some(RowAlign::Right) => 1.0f32,
+        Some(RowAlign::Center) => 0.5f32,
+        _ => return Vec::new(),
+    };
+    if avail <= 0. {
+        return Vec::new();
+    }
+    wrapped
+        .iter()
+        .map(|wl| {
+            let slack = ((avail - f32::from(wl.width())) * factor - x_off).max(0.);
+            px(slack)
+        })
+        .collect()
 }
 
 /// 文本行的装饰化入口（在 [`shape_text_row`] 之上叠加：警报标记剥除、列表/任务
@@ -418,6 +458,14 @@ pub(crate) fn shape_text_row_decorated(
     // 也统一留位，避免命中/光标在「有无箭头」间抖动）。
     if matches!(r.kind, IrKind::Heading(_)) {
         srow.x_off = px(HEADING_GUTTER_W);
+    }
+    // P4-1：EPUB 行对齐（`%%ALIGN%%` 指令 / EPUB 标题居中）——在 `x_off` 定型后按
+    // 内容盒宽（`avail = wrap_w + gutter == 帧宽 − 两内衬`）算逐带移量（paint/命中/
+    // 光标同带同 x）。无对齐（左）恒空，行为与改造前逐位一致。
+    if !srow.align_offsets.is_empty() || r.align.is_some() || editor.is_epub() {
+        let avail = wrap_w + gutter_x;
+        srow.align_offsets =
+            align_offsets_for(r.kind, r.align, editor.is_epub(), &srow.wrapped, avail, f32::from(srow.x_off));
     }
     // C5: 行内链接命中（hand 光标 + 单键点击导航）。
     if srow.editable {
@@ -646,6 +694,7 @@ pub(crate) fn shape_code_row(
             code_ranges: Vec::new(),
             lh: px(0.),
             x_off: px(0.),
+            align_offsets: Vec::new(),
             height,
             top: px(0.),
             kind,
@@ -772,6 +821,7 @@ pub(crate) fn shape_code_row(
         // 代码块行再内缩 `CONTENT_EDGE_PAD_X_PX`（= 预览 px_3 内衬；= paint/命中/光标的
         // `r.x_off` 同源常量）。
         x_off: px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX),
+        align_offsets: Vec::new(),
         height,
         top: px(0.),
         kind,
@@ -953,6 +1003,7 @@ pub(crate) fn shape_table_row(
         code_ranges: Vec::new(),
         lh: row_h,
         x_off: px(0.),
+        align_offsets: Vec::new(),
         height,
         top: px(0.),
         kind,
@@ -1113,6 +1164,7 @@ pub(crate) fn shape_image_row(
         code_ranges: Vec::new(),
         lh: cap_lh,
         x_off: px(x_off),
+        align_offsets: Vec::new(),
         height,
         top: px(0.),
         kind,
@@ -1237,6 +1289,7 @@ pub(crate) fn build_math_card_row(
         code_ranges: Vec::new(),
         lh: px(0.),
         x_off: px(0.),
+        align_offsets: Vec::new(),
         height,
         top,
         kind: IrKind::Paragraph,

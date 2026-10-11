@@ -21,8 +21,8 @@ use ropey::Rope;
 
 use super::ir::IrKind;
 use super::parse::{
-    parse_block_window, parse_block_window_rope, BlockIndex, BlockMeta, Row, RowKind, RunKind,
-    TableData,
+    parse_block_window, parse_block_window_rope, BlockIndex, BlockMeta, Row, RowAlign, RowKind,
+    RunKind, TableData,
 };
 use super::parse;
 
@@ -89,6 +89,9 @@ pub(crate) struct DocRow {
     pub(crate) byte_map: Vec<usize>,
     /// 块级渲染负载（非文本块的渲染数据）。
     pub(crate) payload: DocPayload,
+    /// 行对齐（EPUB 排版指令 `%%ALIGN:X%%`，来自 [`super::parse::Row::align`]；
+    /// `None` = 跟随默认左对齐）。WYSIWYG 只读 EPUB 宿主用它做右/中对齐单源。
+    pub(crate) align: Option<RowAlign>,
     /// 表格块的逐行/单元格编辑映射（仅 [`IrKind::Table`] 行非 `Some`；代码块用
     /// `byte_map`，表格因单元格多列需要更细粒度）。`Rc` 压低克隆成本。
     pub(crate) table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
@@ -954,6 +957,7 @@ pub(crate) fn assemble_docrow<V: DocLineView>(
         byte_map,
         payload,
         table_rows,
+        align: r.align,
     }
 }
 

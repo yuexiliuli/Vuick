@@ -557,6 +557,7 @@ pub(crate) fn docrow_for_height(r: &Row) -> DocRow {
         byte_map: Vec::new(),
         payload,
         table_rows: None,
+        align: r.align,
     }
 }
 

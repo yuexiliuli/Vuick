@@ -78,9 +78,16 @@ pub(crate) fn caret_geometry(editor: &WyEditor, f: &Frame) -> (bool, Pixels, Pix
         let p = render_point_of(&r.wrapped, r.lh, dcol);
         // `f.padding` = 帧内衬（单一来源 `CONTENT_EDGE_PAD_X_PX`，与 paint 的
         // `origin.x + f.padding` 同 x）；引述/代码等额外缩进走 `r.x_off`（与 paint 同 x）。
+        // EPUB 行对齐（`align_offsets[带]`）与 `paint_text_row` 同带同 x：光标落到
+        // 右/中对齐行时也画在文字实际位置。
+        let aln = r
+            .align_offsets
+            .get(text_band_at(r, f32::from(p.y)))
+            .copied()
+            .unwrap_or(px(0.));
         return (
             true,
-            f.padding + r.x_off + p.x,
+            f.padding + r.x_off + aln + p.x,
             r.top + px(text_y_off(r) + text_row_shift(r)) + p.y,
         );
     }
@@ -161,9 +168,18 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 // x 先扣内容边距与行级缩进（引述等），y 用点击在块内的**子行偏移**
                 // （`rel_y - top - 撑高下移`）：`closest_index_for_position` 据此选折行的
                 // 第几可视行——写成 0 或漏掉下移量会把撑高行上的点击映射错行/错列。
-                let rel_x =
-                    (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off)).max(0.);
                 let sub_y = (rel_y - top - text_y_off(r) - text_row_shift(r)).max(0.);
+                // EPUB 行对齐：命中处先**还原**该带的水平移量（paint 把文字右/中推
+                // 到 `x_off + align_offsets[带]`），再按原 x 映射字形——点击对齐行的
+                // 文字才落在正确源字节（与 `caret_geometry` 同带同 x）。
+                let aln = r
+                    .align_offsets
+                    .get(text_band_at(r, sub_y))
+                    .copied()
+                    .unwrap_or(px(0.));
+                let rel_x = (f32::from(p.x) - f32::from(frame.padding) - f32::from(r.x_off)
+                    - f32::from(aln))
+                    .max(0.);
                 let rel = point(px(rel_x), px(sub_y));
                 // `closest_index_for_position` 的 `Err` 是越界钳制后的有效索引
                 // （点过行尾/行首）；把它当 0 会让点行尾时光标跳回行首。

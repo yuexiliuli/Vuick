@@ -77,6 +77,12 @@ impl WyEditor {
         self.scroll_target.get().is_some()
     }
 
+    /// （仅测试）当前待落地的滚动目标源码行（P4-1 EPUB 翻章/目录跳转断言用）。
+    #[cfg(test)]
+    pub(crate) fn scroll_target_line(&self) -> Option<usize> {
+        self.scroll_target.get()
+    }
+
     /// 编辑区⇄预览滚动同步的**重钉兜底**：最多逐帧施加这么多次后强制清除（防宿主
     /// 偏移被滚动条/布局持续复位的病态下永不收敛 → 每帧 `window.refresh()` + 重排
     /// 满载忙循环；对齐缩放恢复 [`Self::ZOOM_ANCHOR_MAX_APPLIES`]）。

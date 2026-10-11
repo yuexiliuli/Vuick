@@ -35,6 +35,7 @@ fn text_row(kind: IrKind, text: &str) -> DocRow {
         byte_map: (0..=n).collect(),
         payload: DocPayload::Text,
         table_rows: None,
+        align: None,
     }
 }
 
@@ -133,6 +134,7 @@ fn heading_code_table_all_produce_sane_shards(cx: &mut TestAppContext) {
             language: None,
         },
         table_rows: None,
+        align: None,
     };
     let c = shape_docrow_shard(&ts, &code, &theme, 400., 400.);
     assert_shard_sane(&c, "代码");
@@ -150,6 +152,7 @@ fn heading_code_table_all_produce_sane_shards(cx: &mut TestAppContext) {
             aligns: vec![],
         }),
         table_rows: None,
+        align: None,
     };
     let t = shape_docrow_shard(&ts, &table, &theme, 400., 400.);
     assert_shard_sane(&t, "表格");
@@ -177,6 +180,7 @@ fn table_shard_carries_grid_geometry(cx: &mut TestAppContext) {
             aligns: vec![TableAlign::Left, TableAlign::Right],
         }),
         table_rows: None,
+        align: None,
     };
     let shards = shape_docrow_shard(&ts, &table, &theme, 400., 400.);
     assert_shard_sane(&shards, "表格网格");
@@ -240,6 +244,7 @@ fn image_shard_box_height_follows_aspect(cx: &mut TestAppContext) {
             src: "img/a.png".into(),
         },
         table_rows: None,
+        align: None,
     };
     // 无固尺寸 → 占位盒高（`IMAGE_ROW_DEFAULT_H`）。
     let ph = shape_docrow_shard(&ts, &img, &theme, 400., 400.);

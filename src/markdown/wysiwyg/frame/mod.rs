@@ -923,6 +923,7 @@ fn empty_frame(
             code_ranges: Vec::new(),
             lh: line_h,
             x_off: px(0.),
+            align_offsets: Vec::new(),
             height: line_h,
             top: px(0.),
             kind: IrKind::Blank,

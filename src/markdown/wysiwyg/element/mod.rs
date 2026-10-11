@@ -707,6 +707,10 @@ pub(crate) struct ShapedRow {
     /// 文本在内容区内的**额外左缩进**（padding 之外；引述=边条+内衬）。编辑可点行
     /// 的 caret/hit-test/paint 都要用它对齐，否则文本缩进但光标/点击仍在原处。
     pub x_off: Pixels,
+    /// 行对齐（EPUB `%%ALIGN:X%%` / Heading 居中）的**逐可视行**水平移量（px；
+    /// 与 `wrapped[i]` 对齐，`i` 超出取 0）：平日在内容盒内按此行宽右/中推。空 =
+    /// 无对齐（普通行，恒左对齐，行为与改造前逐位一致）。
+    pub align_offsets: Vec<Pixels>,
     pub height: Pixels,
     pub top: Pixels,
     /// 块语义（paint 按类型分派：代码面板/表格网格/图片）。
@@ -1277,7 +1281,8 @@ impl WyEditorElement {
             let Some(w0) = row.wrapped.first() else {
                 continue;
             };
-            let ox = origin.x + f.padding + row.x_off;
+            let ox = origin.x + f.padding + row.x_off
+                + row.align_offsets.first().copied().unwrap_or(px(0.));
             let oy = origin.y + row.top + px(text_row_shift(row));
             for lk in &row.extra.links {
                 let (Some(p0), Some(p1)) = (

@@ -101,6 +101,24 @@ pub(crate) fn code_group_at(row: &ShapedRow, dy: f32) -> usize {
     row.sub_heights.len() - 1
 }
 
+/// 文本块内 dy（相对块首，**未叠** `text_y_off`/撑高下移）→ 可视行带序号：
+/// 逐 `sub_heights` 累积（每带 = 一个 `WrappedLine`）。`paint_text_row` 的逐带水平
+/// 对齐移量（`align_offsets[k]`）与命中/光标映射共用同一带索引，点击/光标才与绘制
+/// 同 x。空 `sub_heights`（带外块）返回 0。
+pub(crate) fn text_band_at(row: &ShapedRow, dy: f32) -> usize {
+    if row.sub_heights.is_empty() {
+        return 0;
+    }
+    let mut acc = 0f32;
+    for (k, sh) in row.sub_heights.iter().enumerate() {
+        acc += f32::from(*sh);
+        if dy < acc {
+            return k;
+        }
+    }
+    row.sub_heights.len() - 1
+}
+
 /// 块级渲染字节 → 所在源码行组序号（`multi_offsets` 起始偏移左界折半）。
 pub(crate) fn group_from_rend(row: &ShapedRow, rend: usize) -> usize {
     if row.multi_offsets.is_empty() {

@@ -17,6 +17,7 @@ impl WyEditor {
             caret: 0,
             loaded: false,
             editable: true,
+            epub: false,
             theme: WyTheme::from_style(&p, ts.font(), fs),
             frame: RefCell::new(None),
             last_bounds: Cell::new(None),
@@ -88,6 +89,7 @@ impl WyEditor {
             inline_math_rows: RefCell::new(std::collections::HashMap::new()),
             math_pins: RefCell::new(std::collections::HashMap::new()),
             base_dir: None,
+            memory_images: std::collections::HashMap::new(),
             marked: None,
             sel_anchor: None,
             dragging: false,
@@ -183,6 +185,72 @@ impl WyEditor {
     /// 当前是否可编辑（只读预览 = `false`）。
     pub fn is_editable(&self) -> bool {
         self.editable
+    }
+
+    /// 切 EPUB 阅读模式（EPUB 只读宿主）：标题默认居中（对齐 A 侧
+    /// `MarkdownPreview::set_epub` 排版语义），带 `%%ALIGN:X%%` 指令的行以指令为准。
+    /// 纯视图态，不进撤销栈；切换自增内容代使下帧全量重排。
+    pub fn set_epub(&mut self, on: bool) {
+        if self.epub == on {
+            return;
+        }
+        self.epub = on;
+        *self.frame.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
+    }
+
+    /// 当前是否 EPUB 阅读模式（只读 EPUB 宿主）。
+    pub(crate) fn is_epub(&self) -> bool {
+        self.epub
+    }
+
+    /// EPUB 只读宿主的轻量视口分页读数 `(当前页, 总页数)`（1 基，P4-1 迁入
+    /// `MarkdownPreview::viewport_page_bounds` 语义，状态栏页码同口径）：
+    /// 量程源 = WYSIWYG `Frame` 的 Fenwick **确定性总高**（比预览抽样模型更准），
+    /// 滚动顶部 = 宿主每帧推入的 `viewport_top_px` + 顶部内衬换算。非 EPUB /
+    /// 帧未就绪 → `None`。`view_h` = 宿主视口高（px，调用方按实际容器传）。
+    /// 与 `MarkdownPreview` 同语义：当前页以视口**底部到达**的页计（拖到底 = N/N）。
+    pub(crate) fn viewport_page_bounds(&self, view_h: f32) -> Option<(usize, usize)> {
+        if !self.epub {
+            return None;
+        }
+        // 顶部内衬：`app::panes::LIVE_BODY_PAD_Y` 同值（宿主 `#live-body` py；内容高含
+        // 上下内衬）。若改宿主内衬必须同步这里（分页边界一致性）。
+        const HOST_PAD_Y: f32 = 8.0;
+        let total = self.frame.borrow().as_ref().map(|f| f32::from(f.total))?;
+        let content_h = (total + 2. * HOST_PAD_Y).max(1.);
+        let view_h = view_h.max(16.);
+        // 视口顶：宿主每帧推入的 `viewport_top_px`（已 `max(0.)`，内容顶起点 = 0）。
+        let top_px = self.viewport_top_px.get().max(0.);
+        let total_pages = (content_h / view_h).ceil().max(1.) as usize;
+        let bottom = top_px + view_h;
+        let page = ((bottom - 0.5) / view_h).floor().max(0.) as usize;
+        Some((page.min(total_pages - 1) + 1, total_pages))
+    }
+
+    /// 注册内存图片表（虚拟 src → 图片字节，不落盘；EPUB 用 `epubimg://…`）。
+    /// 覆盖旧表；图片尺寸/整形/基础布局随之失效（下帧按新图重排）。
+    pub fn set_memory_images(
+        &mut self,
+        images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
+    ) {
+        self.memory_images = images;
+        self.image_sizes.borrow_mut().clear();
+        self.images_gen.set(self.images_gen.get().wrapping_add(1));
+        // 内存图尺寸全量作废 → 基础布局里图片块高全部失效：强制整篇重建。
+        *self.block_layout.borrow_mut() = None;
+        *self.frame.borrow_mut() = None;
+        self.shape_rows.borrow_mut().clear();
+        self.notdef_retry.borrow_mut().clear();
+        self.pending_image_srcs.borrow_mut().clear();
+    }
+
+    /// 查内存图片表（EPUB 虚拟 src → 字节）；未登记返回 `None`（走普通路径加载）。
+    pub(crate) fn memory_image(
+        &self,
+        src: &str,
+    ) -> Option<std::sync::Arc<gpui::Image>> {
+        self.memory_images.get(src).cloned()
     }
     /// A4：目录条目 `(源码行, 标题级别, 标题文本)`——与 `MarkdownPreview::toc_entries`
     /// 同构，首字段语义 = **源码行**（统一组件宿主用 `scroll_to_line` 跳转）。遍历 Doc
@@ -395,6 +463,16 @@ impl WyEditor {
     /// paint 的异步 asset 加载照常（带内图尺寸已知后只画、不重复校正）。
     pub(crate) fn lazy_ensure_image_size(&self, src: &str) {
         if self.image_sizes.borrow().get(src).is_some() {
+            return;
+        }
+        // EPUB 内存图（`epubimg://…` 虚拟 src）：直接读字节固有尺寸，不读文件不落盘。
+        if let Some(img) = self.memory_images.get(src)
+            && let Some((w, h)) =
+                crate::markdown::view::dimensions::image_dimensions_bytes(&img.bytes)
+        {
+            self.image_sizes
+                .borrow_mut()
+                .insert(src.into(), Some((w as f32, h as f32)));
             return;
         }
         let resolved = self.resolve_image_src(src);

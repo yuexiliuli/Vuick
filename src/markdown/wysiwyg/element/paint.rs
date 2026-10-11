@@ -315,17 +315,31 @@ pub(crate) fn paint_image_row(
     if matches!(state, Some(None)) {
         paint_image_fallback(theme, bounds, window);
     } else {
-        let resource = {
-            let e = editor.read(cx);
-            e.image_load_resource(img.src.as_ref())
+        // 取已就绪的 `RenderImage`：EPUB 内存图（`epubimg://…`，不落盘）直接查表把
+        // `Arc<Image>` 字节解码成 RenderImage（不走异步加载器）；普通路径照旧经
+        // `AnyImageCache`（本地文件/URL）异步加载。
+        let loaded: Option<std::sync::Arc<gpui::RenderImage>> = {
+            let mem = editor.read(cx).memory_image(img.src.as_ref());
+            match &mem {
+                Some(image) => image.clone().get_render_image(window, cx),
+                None => {
+                    let resource = editor.read(cx).image_load_resource(img.src.as_ref());
+                    let cache = editor.read(cx).image_cache();
+                    let anycache: gpui::AnyImageCache = cache.clone().into();
+                    match anycache.load(&resource, window, cx) {
+                        Some(Ok(data)) => Some(data),
+                        // 普通路径加载失败：登记失败态，后续不再反复发起加载。
+                        Some(Err(_)) => {
+                            editor.update(cx, |e, _| e.set_image_size(img.src.clone(), None));
+                            None
+                        }
+                        None => None,
+                    }
+                }
+            }
         };
-        let cache = {
-            let e = editor.read(cx);
-            e.image_cache()
-        };
-        let anycache: gpui::AnyImageCache = cache.clone().into();
-        match anycache.load(&resource, window, cx) {
-            Some(Ok(data)) => {
+        match loaded {
+            Some(data) => {
                 let img_size = data.size(0);
                 let iw = img_size.width.0 as f32;
                 let ih = img_size.height.0 as f32;
@@ -340,10 +354,6 @@ pub(crate) fn paint_image_row(
                 } else {
                     paint_image_fallback(theme, bounds, window);
                 }
-            }
-            Some(Err(_)) => {
-                editor.update(cx, |e, _| e.set_image_size(img.src.clone(), None));
-                paint_image_fallback(theme, bounds, window);
             }
             None => paint_image_fallback(theme, bounds, window),
         }
@@ -525,8 +535,11 @@ pub(crate) fn paint_text_row(
         let orig = row.lh * (wl.wrap_boundaries().len() + 1) as f32;
         // 撑高后的下移：文本组在 [band_top, band_top+band_h] 里垂直居中。
         let shift = ((f32::from(band_h) - f32::from(orig)) / 2.).max(0.);
+        // EPUB 行对齐（`%%ALIGN:X%%` / 标题居中）的逐带水平移量（`align_offsets[k]`，
+        // 带外/无对齐 = 0 恒左，与命中/光标 `text_band_at` 同带同 x）。
+        let aln = row.align_offsets.get(k).copied().unwrap_or(px(0.));
         let o = point(
-            origin.x + f.padding + row.x_off,
+            origin.x + f.padding + row.x_off + aln,
             origin.y + band_top + px(shift),
         );
         let _ = wl.paint(o, row.lh, gpui::TextAlign::Left, None, window, cx);
@@ -799,7 +812,8 @@ pub(crate) fn paint_inline_maths(
         return;
     }
     let w0 = &row.wrapped[0];
-    let tx = origin.x + f.padding + row.x_off;
+    let tx = origin.x + f.padding + row.x_off
+        + row.align_offsets.first().copied().unwrap_or(px(0.));
     let ty = origin.y + row.top;
     let fs = w0.unwrapped_layout.font_size;
     let lh = row.lh;
@@ -891,16 +905,20 @@ pub(crate) fn paint_inline_images(
         let x = tx + p0.x;
         let y = ty + p0.y;
         let show_w = (p1.x - p0.x).max(px(6.));
-        let resource = {
-            let e = editor.read(cx);
-            e.image_load_resource(ii.src.as_ref())
+        // EPUB 内存图（`epubimg://…`）直接解码字节；普通路径照旧异步加载。
+        let loaded: Option<std::sync::Arc<gpui::RenderImage>> = {
+            let mem = editor.read(cx).memory_image(ii.src.as_ref());
+            match &mem {
+                Some(image) => image.clone().get_render_image(window, cx),
+                None => {
+                    let resource = editor.read(cx).image_load_resource(ii.src.as_ref());
+                    let cache = editor.read(cx).image_cache();
+                    let anycache: gpui::AnyImageCache = cache.into();
+                    anycache.load(&resource, window, cx).and_then(|r| r.ok())
+                }
+            }
         };
-        let cache = {
-            let e = editor.read(cx);
-            e.image_cache()
-        };
-        let anycache: gpui::AnyImageCache = cache.into();
-        if let Some(Ok(data)) = anycache.load(&resource, window, cx) {
+        if let Some(data) = loaded {
             let sz = data.size(0);
             let (iw, ih) = (sz.width.0 as f32, sz.height.0 as f32);
             if iw > 0. && ih > 0. {
@@ -1399,6 +1417,8 @@ fn paint_text_selection_hl(
     }
     // 逐换行边界组成的可视行字节区间：换行点字节 = 边界前最后 glyph 的起点。
     let runs = &w0.unwrapped_layout.runs;
+    // EPUB 行对齐（逐带移量，选区同 paint_text_row 的同一带同一 x；普通行 = 0）。
+    let aln0 = r.align_offsets.first().copied().unwrap_or(px(0.));
     let mut rows: Vec<(usize, usize)> = Vec::new();
     let mut prev = 0usize;
     for b in w0.wrap_boundaries() {
@@ -1437,7 +1457,7 @@ fn paint_text_selection_hl(
         let w = f32::from(p1.x - p0.x).max(2.);
         window.paint_quad(gpui::PaintQuad {
             bounds: Bounds::new(
-                point(origin.x + f.padding + r.x_off + p0.x, origin.y + y),
+                point(origin.x + f.padding + r.x_off + aln0 + p0.x, origin.y + y),
                 size(px(w), r.lh),
             ),
             corner_radii: gpui::Corners::default(),

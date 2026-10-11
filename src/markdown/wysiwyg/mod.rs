@@ -103,6 +103,9 @@ pub struct WyEditor {
     /// 输入/IME/删除/撤销/粘贴短路（`replace_range` 硬门控）、不画光标；保留光标移动、
     /// 点选/复制、链接点击、折叠、搜索高亮、表格/代码纵向滚动条拖动。
     editable: bool,
+    /// EPUB 阅读模式（`set_epub` 打开，EPUB 只读宿主）：标题默认居中（对齐 A 侧预览
+    /// `MarkdownPreview::set_epub` 的排版语义）；带 `%%ALIGN:X%%` 指令的行仍以指令为准。
+    epub: bool,
     theme: WyTheme,
     /// 本帧行网格（measure→prepaint→paint 复用；**窗口化**：仅带内块被真正 shape，
     /// 带外块用 `BlockMeta` 估算高度占位，避免大文档整篇每帧 shape 卡死）。
@@ -293,6 +296,9 @@ pub struct WyEditor {
     math_pins: RefCell<std::collections::HashMap<usize, BlockMathPin>>,
     /// 图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。
     base_dir: Option<std::path::PathBuf>,
+    /// 内存图片注册表：虚拟 src（`epubimg://…`）→ 图片字节（EPUB 不落盘）。
+    /// 渲染时 paint 直接查表解码（`set_memory_images` 注入，`memory_image` 读取）。
+    memory_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// IME 组合（marked text）的源字节区间。空 = 无组合进行中。
     /// 关键：组合的每次更新都**替换**这段（而非追加到后面）——不追踪它就会把
     /// 上一次组合的字符重复插入（输入“你好”→ “nnini'hni'hao你好”的坏字符）。
