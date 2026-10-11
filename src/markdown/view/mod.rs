@@ -247,6 +247,51 @@ impl From<SharedString> for PreviewSrc {
     }
 }
 
+// ===== M5-B5 Phase 2：预览后端开关（legacy|unified）=====
+// `legacy`（默认）= 现状逐位一致：List + 抽样量程 + gpui 自然行距（≈1.79×fs）。
+// `unified` = 预览行高/量程切共享 `markdown::layout::shape_docrow_shard` 口径：
+//   - 文本行显式 `line_height` = 共享行高系数（para_line/heading_line，单一源
+//     `StyleParams`，WYSIWYG/B 引擎同款），空行/分隔行盒高 = para_line；
+//     使预览每视觉行间距与 shard（BlockLayout）逐行一致；
+//   - 高度模型公式族换成 shard 公式族（layout/mod.rs 同常量：表格滚动条预留、
+//     空行=para_line、代码 (行数+2)×code_line、标题 +pad(8)）；
+//   - 渲染 draw 仍走旧 List/TextTrack 路径（P3 再切 Frame/paint），几何来源
+//     统一在本步完成（渲染切换按蓝图范畴各留一档：切得了的已切、切不了留 P3）。
+// 一条变量（`set_preview_backend`）整体换轨；默认关 → 默认 legacy 逐位保真。
+// 状态用 **线程本地**：生产线程恒 legacy（未 set 即 0，零侵入）；`#[gpui::test]`
+// 每个用例跑在独立线程，各线程各自 set，**并行测试互不串扰**（进程全局 atomic
+// 在并行渲染下会跨用例竞态，弃用；与 wysiwyg/theme.rs 的 caret 线程本地同款）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewBackend {
+    /// 现状行为（默认）：抽样量程 + gpui 自然行距。
+    Legacy,
+    /// 共享 shard 口径：显式 line_height + shard 公式族量程。
+    Unified,
+}
+
+thread_local! {
+    /// 0 = Legacy（默认），1 = Unified。仅当前线程可见。
+    static PREVIEW_BACKEND: Cell<u8> = const { Cell::new(0) };
+}
+
+pub(crate) fn preview_backend() -> PreviewBackend {
+    match PREVIEW_BACKEND.get() {
+        0 => PreviewBackend::Legacy,
+        _ => PreviewBackend::Unified,
+    }
+}
+
+/// 运行时切换预览后端（测试/诊断用；默认 legacy，行为与现状逐位一致；仅本线程生效）。
+/// `#[allow(dead_code)]`：生产路径只读 `preview_backend()`，setter 供测试与
+/// 运行期诊断换轨调用（一条变量整体换轨的入口）。
+#[allow(dead_code)]
+pub(crate) fn set_preview_backend(b: PreviewBackend) {
+    match b {
+        PreviewBackend::Legacy => PREVIEW_BACKEND.set(0),
+        PreviewBackend::Unified => PREVIEW_BACKEND.set(1),
+    }
+}
+
 /// 自研 Markdown 预览器（行级虚拟化 + 双向滚动条）。
 pub struct MarkdownPreview {
     rows: Rc<Vec<Row>>,

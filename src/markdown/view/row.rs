@@ -25,6 +25,14 @@ use crate::syntax::{github_theme_cached, resolve_line_styles_with, CodeLineRuns}
 
 use super::{NoteCtx, NoteHit, TextCtx, TextHit};
 
+/// 预览后端是否为 `unified`（M5-B5 Phase 2 开关）：unified 下把文本行间距显式钉到
+/// **共享 shard 行高系数**（para_line/heading_line，单一源 `StyleParams`），
+/// 使预览每视觉行高 == `shape_docrow_shard` 口径；legacy（默认）保持 gpui 自然行距
+/// （≈1.79×fs），行为与现状逐位一致。
+fn unified_text() -> bool {
+    super::preview_backend() == super::PreviewBackend::Unified
+}
+
 /// 行内代码（反引号 `` ` `` 包裹）：等宽字体 + 主题配色文字；圆角底色由
 /// [`TextTrack::paint_code_ranges`] 在 paint 阶段按代码段的像素几何自绘（方角
 /// highlight 背景无法圆角，且 gpui 文本 run 背景只有平面矩形）。
@@ -746,16 +754,24 @@ pub(crate) fn render_row(
         RowKind::Heading(_) => render_wrapped_heading(row, ctx, cx),
         RowKind::Quote => render_wrapped_quote(row, ctx, cx),
         RowKind::Bullet => render_wrapped_bullet(row, ctx, cx),
-        RowKind::Blank => div().h(p.blank_h).w_full().flex_shrink_0().into_any_element(),
-        RowKind::Rule => div()
-            .h(p.rule_h)
-            .w_full()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .px(px(CONTENT_EDGE_PAD_X_PX))
-            .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full())
-            .into_any_element(),
+        RowKind::Blank => {
+            // unified：空行也按共享 shard 口径（文本叶 1 行 = para_line）。
+            let h = if unified_text() { p.para_line } else { p.blank_h };
+            div().h(h).w_full().flex_shrink_0().into_any_element()
+        }
+        RowKind::Rule => {
+            // unified：分隔线按共享 shard 口径（文本叶 1 行 = para_line）。
+            let h = if unified_text() { p.para_line } else { p.rule_h };
+            div()
+                .h(h)
+                .w_full()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .px(px(CONTENT_EDGE_PAD_X_PX))
+                .child(div().h(px(1.)).w_full().bg(p.divider).rounded_full())
+                .into_any_element()
+        }
         RowKind::Table => unreachable!("表格已在上方提前返回"),
         RowKind::Image => unreachable!("图片行已在上方提前返回"),
     }
@@ -874,6 +890,10 @@ fn render_wrapped_paragraph(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui
         .whitespace_normal()
         .text_size(p.para_size)
         .text_color(p.fg);
+    // unified：行间距钉到共享 para_line（== shard 每视觉行高），legacy 不变。
+    if unified_text() {
+        el = el.line_height(p.para_line);
+    }
     match row.align {
         Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
         Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
@@ -937,6 +957,10 @@ fn render_wrapped_heading(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::
         .text_size(fs)
         .text_color(p.fg)
         .font_weight(FontWeight::BOLD);
+    // unified：标题行间距钉到共享 heading_line（== shard 标题行高），legacy 不变。
+    if unified_text() {
+        el = el.line_height(lh);
+    }
     match h_align {
         Some(RowAlign::Center) => el = el.flex().flex_row().justify_center(),
         Some(RowAlign::Right) => el = el.flex().flex_row().justify_end(),
@@ -995,6 +1019,10 @@ fn render_wrapped_quote(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::An
         .whitespace_normal()
         .text_size(p.para_size)
         .text_color(p.muted_fg);
+    // unified：引述行间距钉到共享 para_line（== shard 引述行高），legacy 不变。
+    if unified_text() {
+        band = band.line_height(p.para_line);
+    }
     match row.align {
         Some(RowAlign::Center) => band = band.flex().flex_row().justify_center(),
         Some(RowAlign::Right) => band = band.flex().flex_row().justify_end(),
@@ -1031,7 +1059,7 @@ fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::A
     let dark = crate::ui::theme::Theme::global(cx).is_dark();
     let marker_hl = marker_hl.map(|(n, is_def)| (n, is_def, marker_flash_color(dark)));
     let t = bullet_text_child(row, p, search, selection, marker_hl, row_ix, text_ctx, note_ctx);
-    div()
+    let mut el = div()
         .w_full()
         .min_h(px(p.para_line.as_f32() + p.para_gap.as_f32() + 6.0))
         .flex_shrink_0()
@@ -1040,9 +1068,12 @@ fn render_wrapped_bullet(row: &Row, ctx: &RowRenderCtx, cx: &mut App) -> gpui::A
         .py_1()
         .whitespace_normal()
         .text_size(p.para_size)
-        .text_color(p.fg)
-        .child(t)
-        .into_any_element()
+        .text_color(p.fg);
+    // unified：列表项行间距钉到共享 para_line（== shard 列表行高），legacy 不变。
+    if unified_text() {
+        el = el.line_height(p.para_line);
+    }
+    el.child(t).into_any_element()
 }
 
 /** 表格行（GFM pipe table 整体折叠成一渲染行）。
