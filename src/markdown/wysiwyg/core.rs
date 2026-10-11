@@ -113,7 +113,6 @@ impl WyEditor {
     }
 
     /// 覆盖主题。
-    #[allow(dead_code)]
     pub fn set_theme(&mut self, theme: WyTheme) {
         self.theme = theme;
         *self.frame.borrow_mut() = None;

@@ -3,7 +3,7 @@
 //! 只保留**被预览与 WYSIWYG 真实使用**的子集：
 //! - [`parse_code_lines`]：整块解析出每行的语义名 run（`CodeLineRuns`）；
 //! - [`github_theme`] / [`github_theme_cached`]：明/暗 GitHub 配色 → [`HighlightStyle`]；
-//! - [`resolve_styles`] / [`resolve_line_styles_with`] / [`block_highlights`]：语义名 → 样式 run；
+//! - [`resolve_styles`] / [`resolve_line_styles_with`]：语义名 → 样式 run；
 //! - [`prewarm`]：启动预热（语法集 + 常用语言 + 明暗色板）。
 //!
 //! **不依赖 gpui_component**：配色是用 [`GitHubTheme`]（自研，实现本地
@@ -660,34 +660,6 @@ pub(crate) fn prewarm() {
     // 明暗 GitHub 色板。
     let _ = github_theme_cached(false);
     let _ = github_theme_cached(true);
-}
-
-/// 项目代码块实现的**对外形状**：给围栏语言与块内文本（`\n` 连接、无尾换行），
-/// 返回**块级字节偏移**、无缝隙的 [`HighlightStyle`] run —— 供 WYSIWYG live 的
-/// `set_code_highlighter` 钩子使用，语义/配色与预览代码块完全一致
-/// （同 `parse_code_lines` + `github_theme_cached`/`resolve_line_styles_with`）。
-/// 未知语言/无标记 → 返回空（按纯文本渲染，与预览一致）。
-///
-/// 预留的 WYSIWYG 代码块 live 高亮对外形状（当前未接线，保留供钩子接入）。
-#[allow(dead_code)]
-pub(crate) fn block_highlights(
-    language: &str,
-    block: &str,
-    dark: bool,
-) -> Vec<(Range<usize>, HighlightStyle)> {
-    let Some(line_runs) = parse_code_lines(language, block) else {
-        return Vec::new();
-    };
-    let resolver = github_theme_cached(dark);
-    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
-    let mut offset = 0usize;
-    for (runs, line) in line_runs.iter().zip(block.split('\n')) {
-        for (r, style) in resolve_line_styles_with(runs, line.len(), resolver) {
-            out.push((r.start + offset..r.end + offset, style));
-        }
-        offset += line.len() + 1; // '\n'
-    }
-    out
 }
 
 #[cfg(test)]

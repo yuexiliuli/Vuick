@@ -31,9 +31,6 @@ pub struct EpubDocument {
     pub author: String,
     /// 按阅读顺序拼接的整书 Markdown 文本（每章以章标题开始）
     pub markdown: String,
-    /// 章节标题列表（预留：供目录跳转使用）
-    #[allow(dead_code)]
-    pub chapters: Vec<String>,
     /// 章节数
     pub chapter_count: usize,
     /// 内存图片表：markdown 里的虚拟 src（`epubimg://xxx`）→ 图片字节。
@@ -66,7 +63,6 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
 
     // 3) 按 spine 顺序逐章读取 XHTML → 转 Markdown；图片保留在内存（不落盘）
     let mut markdown = String::new();
-    let mut chapters: Vec<String> = Vec::new();
     let mut images: HashMap<String, Arc<Image>> = HashMap::new();
     let mut notes: std::collections::BTreeMap<usize, String> = std::collections::BTreeMap::new();
     let base_dir = parent_zip_dir(&opf_path);
@@ -113,11 +109,6 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         if chapter_md.trim().is_empty() {
             continue;
         }
-        // 提取首个标题作为章节名（供目录）
-        let heading = first_heading(&chapter_md);
-        if !heading.is_empty() {
-            chapters.push(heading.to_string());
-        }
         markdown.push_str(&chapter_md);
         markdown.push('\n');
     }
@@ -126,7 +117,6 @@ pub fn parse_epub_reader<R: Read + std::io::Seek>(reader: R) -> Result<EpubDocum
         title,
         author,
         markdown,
-        chapters,
         chapter_count: spine_hrefs.len(),
         images,
         notes,
@@ -640,14 +630,6 @@ fn parent_is_ordered(node: &roxmltree::Node) -> bool {
     node.parent()
         .map(|p| p.has_tag_name("ol"))
         .unwrap_or(false)
-}
-
-/// 从章节 Markdown 里提取第一个标题（`# xxx`）。
-fn first_heading(md: &str) -> &str {
-    md.lines()
-        .find(|l| l.starts_with('#'))
-        .map(|l| l.trim_start_matches('#').trim())
-        .unwrap_or("")
 }
 
 /// OPF 所在目录（zip 内路径，用于拼接章节相对路径）。
