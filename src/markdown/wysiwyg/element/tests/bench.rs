@@ -1306,3 +1306,358 @@ fn bench_scroll_bands(cx: &mut TestAppContext) {
     crate::prof::dump("wy.scroll.warm");
 }
 
+/// 手动性能基准（`--ignored` + `--nocapture` 才跑）：**删除/Backspace** 逐键稳态成本。
+/// 全走 `edit.rs::replace_range`（src/markdown/wysiwyg/edit.rs:342）唯一漏斗，拆两段：
+/// ① 普通逐键 Backspace（非结构：单字符、行内、块几何不变）——6MB 纯文本、光标放正文
+///    中部，预热 2 键后连续回退 N 键；输出 `ms/key`（含每键一帧 `refresh`），
+///    `KILO_PROF=1` 时 prof::dump 拆 `wy.replace_range`/Pass1/Pass2 账。
+/// ② 跨行删除（结构路径）：光标在行首 Backspace 删除前一个 `\n` → `cross_newline` →
+///    structural（Pass1 三段式 + derived 整篇回退/增量判定），重复 M 次段落合并；
+///    单独标注输出 `ms/次`，与 perf 对比的基线相同。单位：ms/key、ms/次。
+#[gpui::test]
+#[ignore]
+fn bench_rw_delete_plain(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    crate::prof::enable();
+    cx.update(crate::actions::bind_local_keymaps);
+    fn doc_plain() -> (String, usize) {
+        let para = "alpha beta gamma delta epsilon zeta eta theta one two three four five six seven eight nine ten\n";
+        let mut t = String::new();
+        while t.len() < 6_000_000 {
+            t.push_str(para);
+        }
+        (t, para.len())
+    }
+    let (text, line_len) = doc_plain();
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let _ = cx.refresh();
+    // ① 逐键 Backspace（正文中部；ASCII 恒在字符边界）。每键 = replace_range(at-1..at,"")
+    // + 一帧 refresh；替换后 caret 自动回退 1 → at 跟着递减。
+    let mut at = 3_000_000usize;
+    let warm = |cx: &mut TestAppContext, at: &mut usize| {
+        cx.update(|cx| {
+            host.update(cx, |w, cx| {
+                w.ed.update(cx, |e, ecx| {
+                    e.set_caret(*at);
+                    e.replace_range(*at - 1..*at, "", ecx);
+                })
+            })
+        });
+        let _ = cx.refresh();
+        *at -= 1;
+    };
+    warm(cx, &mut at);
+    warm(cx, &mut at);
+    crate::prof::dump("wy.delete.plain.warmup");
+    let mut t = 0u128;
+    let n = 48usize;
+    for _ in 0..n {
+        let t0 = std::time::Instant::now();
+        warm(cx, &mut at);
+        t += t0.elapsed().as_millis();
+    }
+    eprintln!(
+        "[bench] rw-delete plain 逐键Backspace: {t}ms ({:.1}ms/key 稳态, {n} 键)",
+        t as f64 / n as f64
+    );
+    crate::prof::dump("wy.delete.plain.key");
+    // ② 跨行删除（结构路径）：从 `at` 所在行起，逐次把光标放行首、Backspace 掉前一个
+    // `\n` 合并段落（`cross_newline` → structural）。合并后行号 -1，用 line_start(line)
+    // 定位下次行首（line>=1 保证前面必有 `\n`）。
+    let mut line = (at / line_len).max(1);
+    let mut t2 = 0u128;
+    let m = 32usize;
+    for _ in 0..m {
+        let ls = cx.update(|cx| host.read(cx).ed.read(cx).line_start(line));
+        let t0 = std::time::Instant::now();
+        cx.update(|cx| {
+            host.update(cx, |w, cx| {
+                w.ed.update(cx, |e, ecx| {
+                    e.set_caret(ls);
+                    e.replace_range(ls - 1..ls, "", ecx);
+                })
+            })
+        });
+        let _ = cx.refresh();
+        t2 += t0.elapsed().as_millis();
+        line = line.saturating_sub(1);
+    }
+    eprintln!(
+        "[bench] rw-delete plain 跨行合并(结构路径): {t2}ms ({:.1}ms/次 稳态, {m} 次)",
+        t2 as f64 / m as f64
+    );
+    crate::prof::dump("wy.delete.plain.structural");
+}
+
+/// 手动性能基准（`--ignored` + `--nocapture` 才跑）：**删除/Backspace** 在代码块
+/// （围栏内）的逐键稳态成本，与 `bench_rw_code` 对称；围栏内删字符是非结构路径
+/// （块几何不变），输出 `ms/key` + `KILO_PROF=1` 时 prof::dump 拆账。单位：ms/key。
+#[gpui::test]
+#[ignore]
+fn bench_rw_delete_code(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    crate::prof::enable();
+    cx.update(crate::actions::bind_local_keymaps);
+    fn doc_code() -> String {
+        let mut t = String::from("```\n");
+        let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
+        while t.len() < 6_000_000 {
+            t.push_str(line);
+        }
+        t.push_str("```\n");
+        t
+    }
+    let (host, _vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&doc_code()));
+        WyHost { ed }
+    });
+    let _ = cx.refresh();
+    let mut at = 3_000_000usize;
+    let warm = |cx: &mut TestAppContext, at: &mut usize| {
+        cx.update(|cx| {
+            host.update(cx, |w, cx| {
+                w.ed.update(cx, |e, ecx| {
+                    e.set_caret(*at);
+                    e.replace_range(*at - 1..*at, "", ecx);
+                })
+            })
+        });
+        let _ = cx.refresh();
+        *at -= 1;
+    };
+    warm(cx, &mut at);
+    warm(cx, &mut at);
+    crate::prof::dump("wy.delete.code.warmup");
+    let mut t = 0u128;
+    let n = 48usize;
+    for _ in 0..n {
+        let t0 = std::time::Instant::now();
+        warm(cx, &mut at);
+        t += t0.elapsed().as_millis();
+    }
+    eprintln!(
+        "[bench] rw-delete code 逐键Backspace: {t}ms ({:.1}ms/键 稳态, {n} 键)",
+        t as f64 / n as f64
+    );
+    crate::prof::dump("wy.delete.code.key");
+}
+
+/// 手动性能基准（`--ignored` + `--nocapture` 才跑）：**删除/Backspace** 在真实文档
+/// `fixtures/大文档测试2.md` 上挑 5 个代表点、各删若干键的稳态成本，与
+/// `bench_rw_realfile` 同一文档/同一命中点选择逻辑（输出格式一致，脚本可抓取）：
+/// - plain-del / fence-del / table-del / math-$$-del：非结构逐键删除（固定 `at2`
+///   向前删，留在同一 markup 构造内），预热 2 键后稳态 `ms/键` + prof::dump；
+/// - merge-lines：结构路径（光标在行首 Backspace 合并上一行段落，重复 M 次），
+///   单独标注输出 `ms/次`。
+/// 单位：ms/键、ms/次。
+#[gpui::test]
+#[ignore]
+fn bench_rw_delete_realfile(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    crate::prof::enable();
+    cx.update(crate::actions::bind_local_keymaps);
+    let path = "fixtures/大文档测试2.md";
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[bench] skip realfile: {e}");
+            return;
+        }
+    };
+    // 定位各类位置：围栏内部、表格行、数学行、普通文本行（与 bench_rw_realfile 相同）。
+    let find_after = |needle: &str, from: usize| -> Option<usize> {
+        let rel = text[from..].find(needle)?;
+        Some(from + rel)
+    };
+    let fence_open = find_after("```\n", 0)
+        .map(|i| i + 4)
+        .unwrap_or(text.len() / 2);
+    let fence_mid = {
+        let next = find_after("```\n", fence_open + 1).unwrap_or(text.len());
+        let mid = fence_open + 10 * ((next - fence_open) / 21).max(1);
+        if mid < next { mid } else { fence_open }
+    };
+    let table_row = find_after("\n|", 0)
+        .map(|i| i + 2)
+        .unwrap_or(text.len() / 2);
+    let math_line = find_after("\n$$", 0)
+        .map(|i| i + 3)
+        .unwrap_or(text.len() / 2);
+    let cb = |s: &str, i: usize| -> usize {
+        let i = i.min(s.len());
+        if i == 0 || s.is_char_boundary(i) {
+            return i;
+        }
+        let mut j = i;
+        let b = s.as_bytes();
+        while j > 0 && (b[j] & 0b1100_0000) == 0b1000_0000 {
+            j -= 1;
+        }
+        j
+    };
+    // 一个普通文本行行首（避开 $ | # > - ` 前缀），也用作 merge-lines 的起始行。
+    let plain_at = (0..100)
+        .find_map(|k| {
+            let raw = text.len() / 2 + k * 97;
+            let i = cb(&text, raw.min(text.len()));
+            let line = text[i..].lines().next().unwrap_or("");
+            let at_line_start = i == 0 || text[..i].ends_with('\n');
+            if at_line_start
+                && !line.starts_with('#')
+                && !line.starts_with('|')
+                && !line.starts_with("```")
+                && !line.starts_with(">")
+                && !line.starts_with("- ")
+                && !line.starts_with('$')
+                && !line.contains('$')
+                && !line.is_empty()
+            {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(cb(&text, text.len() / 2));
+
+    eprintln!(
+        "[bench] rw-delete realfile len={} fence_mid={fence_mid} table_row={table_row} math_line={math_line} plain_at={plain_at}",
+        text.len()
+    );
+    // 非结构逐键删除 case：Backspace 语义（删光标前一字符）——含中文/多字节的真实文档
+    // 上最稳妥：每键在**实时 doc** 的当前行串上定位前一字符起点（行串短，O(行宽)），恒在
+    // 字符边界；到行首即停（再删就是跨行结构路径，交给下方 merge-lines 单独测）。起点 =
+    // 模板 at2 往行内推 push 个字符（给足可回字符数）。预热 2 键后测稳态，prof dump 只
+    // 覆盖稳态段。单位：ms/键。
+    let advance = |s: &str, at: usize, k: usize| -> usize {
+        let mut j = at.min(s.len());
+        for _ in 0..k {
+            match s[j..].chars().next() {
+                Some(c) => j += c.len_utf8(),
+                None => break,
+            }
+        }
+        j
+    };
+    let case = |cx: &mut TestAppContext, name: &str, at: usize, n: usize, push: usize| {
+        let (host, _vcx) = cx.add_window_view(|window, cx| {
+            let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+            WyHost { ed }
+        });
+        let _ = cx.refresh();
+        let at2 = cb(&text, at.min(text.len().saturating_sub(1)));
+        let start0 = advance(&text, at2, push).min(text.len());
+        if start0 == text.len() {
+            eprintln!("[bench] rw-delete realfile {name}: 跳过（起点在文件尾）");
+            return;
+        }
+        eprintln!("[bench] rw-delete realfile {name}: start0={start0}");
+        // Backspace：删光标前一字符；到行首/文档头返回 false（本 case 结束）。
+        let del = |cx: &mut TestAppContext, at: &mut usize| -> bool {
+            let (line, col) = cx.update(|cx| host.read(cx).ed.read(cx).row_col(*at));
+            if *at == 0 || col == 0 {
+                return false;
+            }
+            let (ls, le) = cx.update(|cx| {
+                let ed = host.read(cx).ed.read(cx);
+                (ed.line_start(line), ed.line_end(line))
+            });
+            if le <= ls {
+                return false;
+            }
+            let line_s =
+                cx.update(|cx| host.read(cx).ed.read(cx).doc().slice_str(ls..le.max(ls)));
+            let col = col.min(line_s.len());
+            if col == 0 {
+                return false;
+            }
+            let prev_col = line_s[..col]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let prev = ls + prev_col;
+            if prev >= *at {
+                return false;
+            }
+            cx.update(|cx| {
+                host.update(cx, |w, cx| {
+                    w.ed.update(cx, |ed2, ecx| {
+                        ed2.set_caret(*at);
+                        ed2.replace_range(prev..*at, "", ecx);
+                    })
+                });
+            });
+            let _ = cx.refresh();
+            *at = prev;
+            true
+        };
+        // 预热 2 键进稳态（首次 bf 冷缓存/Pass1 不代表逐键成本），dump 清掉暖机开销。
+        let mut a = start0;
+        for _ in 0..2 {
+            if !del(cx, &mut a) {
+                break;
+            }
+        }
+        crate::prof::dump(&format!("wy.delete.realfile.{name}.warmup"));
+        let mut t = 0u128;
+        let mut k = 0usize;
+        for _ in 0..n {
+            let t0 = std::time::Instant::now();
+            if !del(cx, &mut a) {
+                break;
+            }
+            t += t0.elapsed().as_millis();
+            k += 1;
+        }
+        eprintln!(
+            "[bench] rw-delete realfile {name}: {t}ms ({:.1}ms/键 稳态, {k} 键) start0={start0}",
+            t as f64 / (k.max(1)) as f64
+        );
+        crate::prof::dump(&format!("wy.delete.realfile.{name}"));
+    };
+    let n = 4usize; // 每点删 4 键，留在同一构造内（非结构）。
+    let push = 6usize; // 起点往行内推 6 字符，给足 Backspace 可回字符数。
+    case(cx, "plain-del", plain_at, n, push);
+    case(cx, "fence-del", fence_mid, n, push);
+    case(cx, "table-del", table_row, n, push);
+    case(cx, "math-$$-del", math_line, n, push);
+    // 结构删除（跨行合并）：在普通文本行首 Backspace 合并上一行（cross_newline →
+    // structural 路径），重复 M 次段落合并；每次用 line_start(line) 定位当前行首。
+    let (host_m, _vcx_m) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let _ = cx.refresh();
+    let mut line = cx.update(|cx| host_m.read(cx).ed.read(cx).row_col(plain_at).0);
+    let merge_once = |cx: &mut TestAppContext, line: &mut usize| {
+        let ls = cx.update(|cx| host_m.read(cx).ed.read(cx).line_start(*line));
+        cx.update(|cx| {
+            host_m.update(cx, |w, cx| {
+                w.ed.update(cx, |ed2, ecx| {
+                    ed2.set_caret(ls);
+                    ed2.replace_range(ls - 1..ls, "", ecx);
+                })
+            });
+        });
+        let _ = cx.refresh();
+        *line = line.saturating_sub(1);
+    };
+    merge_once(cx, &mut line);
+    crate::prof::dump("wy.delete.realfile.merge.warmup");
+    let mut t2 = 0u128;
+    let m = 6usize;
+    for _ in 0..m {
+        let t0 = std::time::Instant::now();
+        merge_once(cx, &mut line);
+        t2 += t0.elapsed().as_millis();
+    }
+    eprintln!(
+        "[bench] rw-delete realfile merge-lines(结构路径): {t2}ms ({:.1}ms/次 稳态, {m} 次)",
+        t2 as f64 / m as f64
+    );
+    crate::prof::dump("wy.delete.realfile.merge");
+}
+

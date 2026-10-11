@@ -869,4 +869,135 @@
         }
     }
 
+    /// 基准：编辑器本体（左侧纯文本 CodeEditor）连续删除 1000 次字符的耗时，与
+    /// `bench_insert_1000_times` 对称。删除漏斗说明：`CodeEditor::backspace` /
+    /// `delete_forward` 是私有方法（src/editor/view/mod.rs:2236，内部都走
+    /// `insert_edit(…, EditIntent::Backspace/Delete)`），测试拿不到；这里用等价公开
+    /// 漏斗复现同一 delete 成本——`set_selection_range(at..at+1)` + `insert_text("")`
+    /// （insert_text 内部即 `insert_edit(self.selection.range(), text, …)`：逐键单字符
+    /// 删除、撤销合并走同一主链）。打开真实文件后从正文中部向前逐字符删 N 次，输出
+    /// 总耗时 + ms/次（单位：ms/次），`KILO_PROF=1` 时 `crate::prof::dump` 拆账。
+    /// 运行：`cargo test --release -- --ignored --nocapture bench_editor_delete_1000_times`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_editor_delete_1000_times(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 目标文件继承 bench_insert_1000_times 的环境变量覆盖约定；默认三份样本。
+        let files: Vec<String> = std::env::var("BENCH_INSERT_FILES")
+            .map(|v| {
+                v.split(';')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                vec![
+                    r"fixtures/大文档测试.md".to_string(),
+                    r"fixtures/SKILL.md".to_string(),
+                    r"fixtures/SKILL.txt".to_string(),
+                ]
+            });
+        const N: usize = 1000;
+        for path in &files {
+            let file_name = std::path::Path::new(path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string());
+            if !std::path::Path::new(path).is_file() {
+                println!("跳过（文件不存在）：{file_name}");
+                continue;
+            }
+            // 1) 打开文件（md 大文档走异步打开，小文档同步打开）
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| app.open_file(path, window, cx));
+            });
+            // 2) 等待编辑器挂载完成（editor_pending 复位 = 编辑区已升起）
+            let t_open = std::time::Instant::now();
+            let mut frames = 0;
+            loop {
+                cx.run_until_parked();
+                let pending = cx.update(|_, cx| {
+                    let a = app.read(cx);
+                    a.tabs.last().map(|t| t.editor_pending).unwrap_or(true)
+                });
+                if !pending {
+                    break;
+                }
+                frames += 1;
+                if frames > 400 {
+                    panic!("打开超时：{file_name}");
+                }
+            }
+            let open_ms = t_open.elapsed();
+            // 3) 取编辑器实体；光标放正文中部，向前逐字符删 N 次（每次删 1 字符）。
+            let editor = cx.update(|_, cx| {
+                let a = app.read(cx);
+                a.tabs[a.active_tab].editor.clone()
+            });
+            let before = cx.update(|_, cx| editor.read(cx).value().len());
+            if before < 2 {
+                println!("【{file_name}】过短跳过（len={before}）");
+                continue;
+            }
+            let n = N.min(before - 1).max(1);
+            let before_chars = cx.update(|_, cx| editor.read(cx).char_count());
+            crate::prof::enable();
+            crate::prof::dump("editor-delete.warmup");
+            // 逐字符前删 = 编辑器 `delete_forward` 同款语义：光标 `at` 固定（边界，先经
+            // char_left 钳正，避免 before/2 劈开多字节字符），每键删 `[at, char_right(at))`
+            // 一个字符并重新取边界；删除后文档左移，固定 `at` 即连续删后继字符——
+            // 等价真 Delete 键的 `insert_edit(head..char_right, "", Delete)`。
+            let at = cx.update(|_, cx| {
+                let e = editor.read(cx);
+                crate::editor::movement::char_left(e.text(), (before / 2).min(e.text().len()))
+            });
+            let mut deleted = 0usize;
+            let t_del = std::time::Instant::now();
+            for _ in 0..n {
+                let done = cx.update(|_w, cx| {
+                    let e = editor.read(cx);
+                    if at >= e.text().len() {
+                        return true;
+                    }
+                    let r = crate::editor::movement::char_right(e.text(), at);
+                    editor.update(cx, |e, cx| {
+                        e.set_selection_range(at..r, cx);
+                        e.insert_text("", cx);
+                    });
+                    false
+                });
+                if done {
+                    break;
+                }
+                deleted += 1;
+            }
+            let dt = t_del.elapsed();
+            crate::prof::dump("editor-delete.measured");
+            let after = cx.update(|_, cx| editor.read(cx).value().len());
+            let after_chars = cx.update(|_, cx| editor.read(cx).char_count());
+            let shrank = before.saturating_sub(after);
+            assert_eq!(
+                before_chars - after_chars,
+                deleted,
+                "删除 {deleted} 次后应恰好少 {deleted} 个字符，实际少 {} 个字符（字节 {} B）",
+                before_chars - after_chars,
+                shrank,
+            );
+            println!(
+                "【{file_name}】打开(异步装配) {} ms | {deleted} 次删除(逐字符) 耗时 {:.1} ms（单次平均 {:.3} ms），长度 {} -> {}（-{} B）",
+                open_ms.as_millis(),
+                dt.as_secs_f64() * 1000.0,
+                dt.as_secs_f64() * 1000.0 / deleted.max(1) as f64,
+                before,
+                after,
+                shrank,
+            );
+        }
+    }
+
 
