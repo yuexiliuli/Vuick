@@ -46,6 +46,49 @@ use crate::ui::scrollbar::{Scrollbar, ScrollbarMode};
 /// 在途瓦片请求记录：`(派发时密度 scale, 结果通道)`。
 pub(crate) type PendingTileEntry = (f32, mpsc::Receiver<Option<TileResult>>);
 
+/// 静态帧门控签名（Sprint 5）：本帧到上帧「滚动 / 缩放 / DPI / 视口尺寸 / 页数」的
+/// 变化判定信号。任一维不同 → 帧状态已变，必须恢复 keep_window/schedule/evict 全量
+/// 调度；完全一致 → 才可进入「静置候选」（还需在途清空 + [`PdfViewer::window_settled`]
+/// 确认才真正跳过——见 `ensure_window` 的门控分支）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct WindowSig {
+    /// 未量程化纵向滚动像素（f32 位型）：任意微滚即变，杜绝量子化掩盖滚动（同 wy prewarm）。
+    scroll_top: u32,
+    /// 未量程化横向滚动像素（f32 位型）：窄窗下内容宽于视口可横向平移
+    /// （见 render 的横向滚动条），`page_visible_rect` 用 `-offset().x` 推可见瓦片列——
+    /// 漏掉该维会在横向平移停稳后假静止 → 新暴露列的瓦片永不调度（贴图迟滞）。
+    scroll_x: u32,
+    /// 页列显示宽 = `PAGE_WIDTH × zoom`（f32 位型）：Ctrl+滚轮缩放变化即变。
+    page_width: u32,
+    /// 窗口缩放密度（f32 位型）：换 DPI / 跨屏拖拽变化即变。
+    scale_factor: u32,
+    /// 滚动容器可视尺寸（px）：窗口/分屏/侧边栏宽度变化即变。
+    viewport_w: u32,
+    viewport_h: u32,
+    /// 页数兜底：加载完成建槽 / 任何布局重算潜在的侧通道变化。
+    pages: usize,
+}
+
+impl WindowSig {
+    pub(crate) fn of(
+        v: &PdfViewer,
+        scroll_y: f32,
+        page_width: f32,
+        scale_factor: f32,
+        viewport_h: f32,
+    ) -> Self {
+        Self {
+            scroll_top: scroll_y.to_bits(),
+            scroll_x: f32::from(-v.scroll.offset().x).to_bits(),
+            page_width: page_width.to_bits(),
+            scale_factor: scale_factor.to_bits(),
+            viewport_w: f32::from(v.scroll.bounds().size.width).to_bits(),
+            viewport_h: viewport_h.to_bits(),
+            pages: v.dims.len(),
+        }
+    }
+}
+
 use crate::config::pdf::{
     COVER_INFLIGHT, MAX_MID_INFLIGHT, MAX_THUMB_INFLIGHT, MID_CACHE_PAGES, MOVE_THRESHOLD_LOWER_RATIO, MOVE_THRESHOLD_PX, PAGE_PAD_X, PAGE_WIDTH, TEXT_CACHE_PAGES,
     TEXT_INFLIGHT, THUMB_CACHE_PAGES, TILE_CACHE_BYTES, TILE_INFLIGHT, TILE_MARGIN, TILE_SIZE,
@@ -152,6 +195,17 @@ pub struct PdfViewer {
     pub(crate) search_seq: u64,
     /// 页面缩放倍数（Ctrl+滚轮可调；页面显示宽度 = `PAGE_WIDTH * zoom`）。
     pub(crate) zoom: f32,
+    /// 静态帧门控签名（Sprint 5）：上一非门帧的变化签名（[`WindowSig`]）；与当前帧
+    /// 一致是「静置候选」的前提，不一致/首帧（`None`）绝不门。供 `ensure_window`
+    /// 门控判定，另供 pdf::tests 回归测试断言「静置 → 滚动恢复」转换。
+    pub(crate) window_sig: Option<WindowSig>,
+    /// 上一帧是否已「静置确认」：非快速态做过一次常态调度、且调度后无在途瓦片/封面
+    /// （即确认过「没有待派的新 tile 请求」）。门控必要条件——只有确认过无待派才允许
+    /// 静态帧跳过调度（防「快速拖动刚停 / 首帧」等尚未补调的场景出现贴图迟滞）。
+    pub(crate) window_settled: bool,
+    /// 已被静态帧门控跳过的帧计数（Sprint 5）：门控分支每命中一次 +1。纯观测计数
+    /// （静态跳过分支每次 ~1ns），供回归测试断言「静置帧确实跳过调度、变化帧不门」。
+    pub(crate) idle_gate_skips: u64,
 }
 
 impl PdfViewer {
@@ -197,6 +251,9 @@ impl PdfViewer {
             search_pending_seq: 0,
             search_seq: 0,
             zoom: 1.0,
+            window_sig: None,
+            window_settled: false,
+            idle_gate_skips: 0,
         };
         this.start_load(cx);
         this
@@ -480,6 +537,35 @@ impl PdfViewer {
         self.last_scroll_y = scroll_y;
 
         let viewport_h = f32::from(self.scroll.bounds().size.height);
+
+        // 2.5) **静态帧门控（Sprint 5）**：滚动/缩放/DPI/视口/页数全未变 + 在途清空 +
+        //      上帧已常态调度确认无待派（`window_settled`）→ 本帧 keep_window/内存封顶/
+        //      schedule/evict 全部跳过。调度是异步投机——跳过只影响后续滚动时冷片延迟，
+        //      恢复帧立即补调；首帧（sig=None）、加载/缩放/尺寸变化帧、任何「在途未决」
+        //      帧、快速拖动帧都绝不门（防贴图迟滞）。跳过帧不采样泵（无在途 + 视口非空
+        //      + 非快速 → `pump_still_needed` 本就为 false，早退不改变任何泵语义）。
+        let sig = WindowSig::of(self, scroll_y, page_width, scale_factor, viewport_h);
+        let idle_sig = self.window_sig.is_some_and(|s| s == sig);
+        if idle_sig
+            && self.window_settled
+            && !self.prev_fast
+            && viewport_h > 0.0
+            && self.pending_tiles.is_empty()
+            && self.pending_cover.is_empty()
+            && self.pending_mid.is_empty()
+            && self.pending_thumb.is_empty()
+        {
+            if timing_view() {
+                eprintln!(
+                    "[{:.1}ms] [VIEW-IDLE] 静置帧：跳过 keep_window/schedule/evict",
+                    crate::pdf::timing_ms()
+                );
+            }
+            self.idle_gate_skips += 1;
+            // 不更新 `window_sig`/`window_settled`：保持同一静置签名与确认状态。
+            return;
+        }
+
         let (start, end) = keep_window(&self.dims, &self.page_tops, page_width, scroll_y, viewport_h);
         let center = (start + end) / 2;
 
@@ -554,6 +640,14 @@ impl PdfViewer {
             self.schedule_tiles(window, start, end, page_width, scale_factor, scroll_y);
         }
         self.evict_tiles(start, end, scale_factor);
+
+        // 更新门控状态（本轮已真实跑过调度）：签名对齐当前帧；settled = 非快速态
+        // 且调度后无在途瓦片/封面（即确认「已无待派的新 tile 请求」→ 下帧可门）。
+        // 快速态（占位调度）或仍有在途 → settled=false，绝不允许静态帧跳过调度。
+        self.window_sig = Some(sig);
+        self.window_settled = !self.prev_fast
+            && self.pending_tiles.is_empty()
+            && self.pending_cover.is_empty();
 
         // 7) 瓦片在途自刷新：若无用户输入就没有下一次重绘，而瓦片结果要等下一次
         //    `ensure_window` 才收集——启动 ~16ms 泵直到在途瓦片清空（静置也能出图）。
@@ -2109,6 +2203,9 @@ mod tests {
                     search_pending_seq: 0,
                     search_seq: 0,
                     zoom: 1.0,
+                    window_sig: None,
+                    window_settled: false,
+                    idle_gate_skips: 0,
                 };
                 // 先滚到文档中段（纵向负偏移），作为缩放重锚的基准
                 v.scroll.set_offset(gpui::point(px(-40.0), px(-1200.0)));

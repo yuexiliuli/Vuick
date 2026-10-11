@@ -1983,6 +1983,161 @@ mod tests {
         );
     }
 
+    /// 回归（Sprint 5 静态帧门控，真实渲染路径）：加载 + 首屏调度/泵结束进入「静态
+    /// 停靠」后应进入静置确认（`window_settled`）；连发无变化帧被门控跳过（`idle_gate_skips`
+    /// 单调增）且不产生待派、不饿死渲染；跳页（变化帧）立即复位门控并恢复调度（在途
+    /// 瓦片/封面出现 = 贴图不迟滞）；重新停稳后再次静置确认。
+    #[gpui::test]
+    async fn static_gate_enters_idle_and_resumes_scheduling_on_scroll(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        skip_if_missing_pdf_fixture!();
+        use gpui::{AppContext, Entity, IntoElement, ParentElement, Render, Styled};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+
+        let _guard = crate::pdf::test_util::lock().lock().unwrap();
+        cx.update(crate::actions::bind_local_keymaps);
+        let pdf_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试2.pdf");
+
+        struct PageProbe {
+            pdf: Entity<crate::pdf::PdfViewer>,
+        }
+        impl Render for PageProbe {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl IntoElement {
+                gpui::div().size_full().child(self.pdf.clone())
+            }
+        }
+
+        let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
+        let (_root, cx) = cx.add_window_view(|_window, cx| {
+            let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
+            *holder.borrow_mut() = Some(pdf.clone());
+            PageProbe { pdf }
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1500.), gpui::px(900.)));
+
+        // 1) 等加载 + 首屏调度/泵结束 → 静态停靠
+        let n = {
+            let mut loaded = false;
+            for _ in 0..400 {
+                cx.run_until_parked();
+                loaded =
+                    cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).is_loaded());
+                if loaded {
+                    break;
+                }
+            }
+            assert!(loaded, "应加载完成");
+            cx.update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).page_count())
+        };
+        assert!(n >= 50, "长文夹具应 ≥50 页: {n}");
+        for _ in 0..300 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+
+        // 2) 静置确认成立：settled + 签名在位 + 无在途 + 非快速
+        let quiescent = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.window_settled,
+                v.window_sig.is_some(),
+                v.pending_tiles.is_empty(),
+                v.pending_cover.is_empty(),
+                !v.prev_fast,
+            )
+        });
+        assert_eq!(
+            quiescent,
+            (true, true, true, true, true),
+            "静态停靠应进入静置确认: {quiescent:?}"
+        );
+
+        // 3) 连发无变化帧：被门控跳过（计数递增）、不产生待派、状态不掉
+        let skips_before = cx
+            .update(|_w, cx| holder.borrow().as_ref().unwrap().read(cx).idle_gate_skips);
+        for _ in 0..20 {
+            cx.update(|_w, cx| {
+                holder
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .update(cx, |_v, cx| cx.notify());
+            });
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+        }
+        let (skips_after, still) = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (
+                v.idle_gate_skips,
+                (v.window_settled, v.pending_tiles.is_empty(), v.pending_cover.is_empty()),
+            )
+        });
+        assert!(
+            skips_after >= skips_before + 20,
+            "20 个无变化帧应全部被门控：{skips_before} -> {skips_after}"
+        );
+        assert_eq!(still, (true, true, true), "静置帧不得产生待派/掉状态: {still:?}");
+
+        // 4) 跳页（变化帧）→ 立即恢复调度：帧内出现在途瓦片或封面（贴图不迟滞）
+        cx.update(|_w, cx| {
+            holder
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .update(cx, |v, cx| {
+                    v.scroll_to_page(n - 5);
+                    cx.notify();
+                });
+        });
+        let mut resumed = false;
+        for _ in 0..10 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            let in_flight = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                // 大跨度跳页会进快速态 → 占位（中清/缩略）先调度，之后才补瓦片/封面；
+                // 四类在途任一非空都证明「变化帧立即恢复调度」。
+                !v.pending_tiles.is_empty()
+                    || !v.pending_cover.is_empty()
+                    || !v.pending_mid.is_empty()
+                    || !v.pending_thumb.is_empty()
+            });
+            if in_flight {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(resumed, "跳页变化帧应立即恢复调度（贴图不得迟滞）");
+
+        // 5) 重新停稳后再次静置确认（滚动恢复后门控仍可复用）
+        for _ in 0..400 {
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.run_until_parked();
+            let settled_again = cx.update(|_w, cx| {
+                let v = holder.borrow().as_ref().unwrap().read(cx);
+                (v.pending_tiles.is_empty() && v.pending_cover.is_empty() && !v.tile_pump_running)
+                    && v.window_settled
+            });
+            if settled_again {
+                break;
+            }
+        }
+        let resettle = cx.update(|_w, cx| {
+            let v = holder.borrow().as_ref().unwrap().read(cx);
+            (v.pending_tiles.is_empty(), v.pending_cover.is_empty(), v.window_settled)
+        });
+        assert_eq!(resettle, (true, true, true), "滚动重定居应再次静置确认: {resettle:?}");
+    }
+
     /// 时空基准（自动对比前后两版）：只依赖两版公共 API，用**完全相同的固定工作负载**
     /// 打印一条 `[BENCH]`：总耗时（加载 + Ctrl+滚轮放大到 ~2.48 密度 + 整份文档前后翻页
     /// 停稳）、停靠总帧数、最终渲染驻留内存估算（瓦片字节 + 封面 + 中清 + 缩略）。
