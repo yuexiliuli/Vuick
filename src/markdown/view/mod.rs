@@ -2109,16 +2109,15 @@ impl MarkdownPreview {
                 hit = Some((row_ix, range));
             }
         }
-        let color = if hit.is_some() {
-            Some(if crate::ui::theme::Theme::global(cx).is_dark() {
+        hit.map(|(row_ix, range)| {
+            // 背景色与 `hit` 同源（命中才有色）——直接在闭包内求值，去掉不变量 expect。
+            let color = if crate::ui::theme::Theme::global(cx).is_dark() {
                 rgba(0xf59e0b47).into()
             } else {
                 rgba(0xfef08a8c).into()
-            })
-        } else {
-            None
-        };
-        hit.map(|(row_ix, range)| (row_ix, range, color.expect("命中则有背景色")))
+            };
+            (row_ix, range, color)
+        })
     }
 
     /// 悬浮详情卡片：鼠标停在 `[n]` 标记（文内引用 / 末尾定义皆可）上时，浮出该引用

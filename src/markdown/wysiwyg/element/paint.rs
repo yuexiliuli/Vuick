@@ -117,9 +117,13 @@ pub(crate) fn paint_table_row(
                 border_style: gpui::BorderStyle::Solid,
             });
             let mut cy = inner_lo;
-            // 单元格文本画 shape 期排好的 `table_edit` 单行（免每帧重 shape）。`shape_table_row`
-            // 恒推表头行 → `table_edit` 恒 Some（不变量，无兜底重推对齐公式的漂移路径）。
-            let te = row.table_edit.as_ref().expect("表格行恒有逐单元格编辑排版");
+            // 单元格文本画 shape 期排好的 `table_edit` 单行（免每帧重 shape）。表头行由
+            // `shape_table_row` 恒定推入 → `table_edit` 恒 Some；防御：异常（无任何排版行）
+            // 时跳过本表格内容绘制（外框仍在），渲染不 panic、不落兜底错位。
+            debug_assert!(row.table_edit.is_some(), "表格行恒有逐单元格编辑排版");
+            let Some(te) = row.table_edit.as_ref() else {
+                return;
+            };
             if let Some(hrow) = te.rows.first() {
                 draw_table_row_cached(window, cx, &hrow.cells, &t.widths, x0, cy, row_h_f, theme);
             }
@@ -1177,7 +1181,11 @@ pub(crate) fn paint_card(
             );
             // 布局已在 shape 期算好缓存进 `row.mm`（flowchart / sequence / 空），
             // paint 不再每帧重排，只加卡片原点绘制（统一入口 `paint_mermaid_layout`）。
-            let mm = row.mm.as_ref().expect("mermaid 卡片恒有缓存的已排布局");
+            // 防御：异常（`mm` 缺失）时跳过卡片内容绘制（背景与左上角标签已画），不 panic。
+            debug_assert!(row.mm.is_some(), "mermaid 卡片恒有缓存的已排布局");
+            let Some(mm) = row.mm.as_ref() else {
+                return;
+            };
             paint_mermaid_layout(window, theme, mm, x0, top0, content_w, cx);
         }
     }

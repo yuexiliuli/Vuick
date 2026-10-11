@@ -1053,7 +1053,17 @@ fn render_table_row(
     p: &Rc<StyleParams>,
     table_handle: Option<ScrollHandle>,
 ) -> gpui::AnyElement {
-    let table = row.table().expect("Table 行必须携带表格结构");
+    let t = row.table();
+    // Table 行恒有结构；防御：异常（结构缺失）时渲染空占位，渲染不 panic、不错位。
+    debug_assert!(t.is_some(), "Table 行必须携带表格结构");
+    let Some(table) = t else {
+        return div()
+            .w_full()
+            .flex_shrink_0()
+            .px(px(CONTENT_EDGE_PAD_X_PX))
+            .py_1()
+            .into_any_element();
+    };
     // 块内横向滚动容器 + Always 滚动条：超宽表格在块内滚动，不撑大页面列宽。
     let h = table_handle.unwrap_or_default();
     div()

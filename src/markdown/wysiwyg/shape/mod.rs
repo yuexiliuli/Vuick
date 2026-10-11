@@ -20,9 +20,10 @@ use crate::syntax::{
     CodeLineRuns, github_theme_cached, parse_code_lines, resolve_line_styles_with,
 };
 
-/// 引述（非警报）正文的**左缘缩进**（px，`x_off`）：= 内容边距(12) + 左侧指示条(3)
-/// + 带内左内衬(12) − 内容边距(12) = 15。正文起点在内容盒内再缩进，文字折行宽必须
-/// 一并扣除（`gutter_x` 与 `shape_text_row` 的行 `x_off` 同源），否则右缘越出内容盒。
+/// 引述（非警报）正文的**左缘缩进**（px，`x_off`）：
+/// 内容边距(12) + 左侧指示条(3) + 带内左内衬(12) − 内容边距(12) = 15。
+/// 正文起点在内容盒内再缩进，文字折行宽必须一并扣除（`gutter_x` 与
+/// `shape_text_row` 的行 `x_off` 同源），否则右缘越出内容盒。
 const QUOTE_TEXT_INDENT_PX: f32 = 15.0;
 
 /// `DocRow.runs` → gpui `TextRun`（`RunKind` → 视觉样式）。
@@ -885,9 +886,7 @@ pub(crate) fn shape_table_row(
                     .text_system()
                     .shape_line(c.clone(), font_size, &run, None)
             } else {
-                lines
-                    .next()
-                    .expect("数据行 shape 产物须与列数等长（`rows_shapes` 与 `rows2` 同构）")
+                take_data_line_or_placeholder(window, &mut lines, font_size)
             };
             let w = f32::from(line.width());
             let text_x = match aligns2.get(ci).copied().unwrap_or(TableAlign::Left) {
@@ -972,6 +971,23 @@ pub(crate) fn shape_table_row(
         image: None,
         mm: None,
         extra: RowExtra::default(),
+    }
+}
+
+/// 数据行逐格搬用 shape 期唯一一次产物（`rows_shapes` 与 `rows2` 同构）。
+/// 防御：异常/错误输入下产物可能与列数不一致或为空（此时 `lines.next()` 为 `None`），
+/// 给**空占位行**（宽 0、无字形）并继续——绝不 `next()` 撞 `None` 让整帧渲染 panic，
+/// 也不让该列后续几何错位。正常（产物齐全）路径行为与顺取产物完全一致。
+pub(crate) fn take_data_line_or_placeholder(
+    window: &mut Window,
+    lines: &mut dyn Iterator<Item = gpui::ShapedLine>,
+    font_size: Pixels,
+) -> gpui::ShapedLine {
+    match lines.next() {
+        Some(line) => line,
+        None => window
+            .text_system()
+            .shape_line(gpui::SharedString::default(), font_size, &[], None),
     }
 }
 

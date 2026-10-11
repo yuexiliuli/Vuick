@@ -282,3 +282,56 @@ fn table_selection_highlight_paints_and_intersects_cells(cx: &mut TestAppContext
     });
 }
 
+#[gpui::test]
+fn table_data_row_shape_gap_falls_back_to_empty_placeholder(cx: &mut TestAppContext) {
+    use crate::markdown::ir::IrKind;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 2 列表格：数据行应有 2 个 shape 产物；正常真实渲染不 panic。
+    let text = "| A | B |\n| --- | --- |\n| 1 | 2 |\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let row = frame
+            .rows
+            .iter()
+            .find(|r| r.kind == IrKind::Table)
+            .expect("应有表格");
+        let te = row.table_edit.as_ref().expect("表格编辑排版");
+        assert_eq!(te.rows.len(), 2, "表头 + 1 数据行应逐可见行排版");
+        let fs = px(14.);
+        // 异常输入（模拟 `rows_shapes` 与列数不一致/为空，即 shape:890 数据行产物耗尽）：
+        // 兜底函数 `take_data_line_or_placeholder` 真实调用——产物不足时给**空占位行**
+        // （宽 0、无字形）并继续，绝不 panic、不偏移该格后续几何。
+        // ① 空迭代器（整行无产物）→ 全格落空占位。
+        let empty: Vec<gpui::ShapedLine> = Vec::new();
+        let ph = crate::markdown::wysiwyg::shape::take_data_line_or_placeholder(
+            window,
+            &mut empty.into_iter(),
+            fs,
+        );
+        assert_eq!(ph.len(), 0, "空产物兜底应产出空行（len 0）");
+        assert_eq!(f32::from(ph.width()), 0., "空占位行宽应为 0，不错位/不占宽");
+        // ② 短一列（真实产物 1 项对 2 列）：第 1 格搬用真实产物（与正常路径一致），
+        // 第 2 格（耗尽）落空占位——正常像素不动、仅缺失格空渲染。
+        let real = te.rows[1].cells[0].line.clone();
+        let mut short = vec![real].into_iter();
+        let c1 = crate::markdown::wysiwyg::shape::take_data_line_or_placeholder(
+            window,
+            &mut short,
+            fs,
+        );
+        assert_eq!(c1.len(), 1, "第 1 格应搬用真实产物，不含兜底");
+        let c2 = crate::markdown::wysiwyg::shape::take_data_line_or_placeholder(
+            window,
+            &mut short,
+            fs,
+        );
+        assert_eq!(c2.len(), 0, "第 2 格（产物耗尽）应落空占位");
+    });
+}
+
