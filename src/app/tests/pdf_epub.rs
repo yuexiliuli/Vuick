@@ -425,44 +425,47 @@
         }
         let page_el = page_el.expect("EPUB 状态栏应显示页码（status-epub-page）");
         assert!(page_el.size.width > px(0.), "页码元素应有宽度");
-        let (p1, n) = cx.update(|_, cx| {
+        // P4-1：页码读数路由到当前后端（WyEditor 只读宿主确定性量程 / MarkdownPreview 回退）。
+        let (p1, n) = cx.update(|window, cx| {
             let a = app.read(cx);
-            let md = &a.tabs[a.active_tab].md_preview;
-            md.read(cx)
-                .viewport_page_bounds()
+            a.epub_page_bounds(window, cx)
                 .expect("EPUB 应有页码读数")
         });
         assert_eq!(p1, 1, "初始应为第 1 页");
         assert!(n >= 1, "总页数至少 1 页（实际 {n}）");
 
-        // 滚动预览到最后一个目录标题 → 页码前进（内容不足一页则不强制）。
+        // 滚动预览到最后一个章标题 → 页码前进（内容不足一页则不强制）。
         if n > 1 {
-            let last_toc_row = cx.update(|_, cx| {
+            let last_toc_line = cx.update(|_w, cx| {
                 let a = app.read(cx);
-                let md = &a.tabs[a.active_tab].md_preview;
-                md.read(cx)
-                    .toc_entries()
-                    .last()
-                    .map(|(r, _, _)| *r)
+                let t = &a.tabs[a.active_tab];
+                if a.epub_preview_backend_wy() && t.md_wy.is_some() {
+                    t.md_wy.as_ref().map(|w| w.read(cx).toc_entries().last().map(|(l, _, _)| *l))
+                } else {
+                    Some(t.md_preview.read(cx).toc_entries().last().map(|(r, _, _)| *r))
+                }
             });
-            if let Some(row) = last_toc_row {
-                cx.update(|_, cx| {
+            if let Some(Some(line)) = last_toc_line {
+                cx.update(|_w, cx| {
                     let a = app.read(cx);
-                    let i = a.active_tab;
-                    let md = a.tabs[i].md_preview.clone();
-                    md.update(cx, |v, _| v.scroll_to_row(row));
+                    let t = &a.tabs[a.active_tab];
+                    if a.epub_preview_backend_wy() && t.md_wy.is_some() {
+                        // 新宿主：set_scroll_target（prepaint 重钉到章标题所在块顶）。
+                        let wy = t.md_wy.clone().expect("后端 Wy 时宿主在场");
+                        wy.update(cx, |v, _| v.set_scroll_target(line));
+                    } else {
+                        let md = t.md_preview.clone();
+                        md.update(cx, |v, _| v.scroll_to_row(line));
+                    }
                 });
                 for _ in 0..8 {
                     cx.run_until_parked();
                     let _ = cx.cx.refresh();
                     cx.run_until_parked();
                 }
-                let p2 = cx.update(|_, cx| {
-                    let a = app.read(cx);
-                    a.tabs[a.active_tab]
-                        .md_preview
-                        .read(cx)
-                        .viewport_page_bounds()
+                let p2 = cx.update(|window, cx| {
+                    app.read(cx)
+                        .epub_page_bounds(window, cx)
                         .expect("EPUB 应有页码读数")
                 });
                 assert!(
