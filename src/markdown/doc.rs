@@ -381,7 +381,10 @@ impl Doc {
         crate::prof::end("doc.open.stats", _t);
         let _t = crate::prof::begin();
         // 块分类复用上述行起始表——不再整篇第二遍 `build_line_starts_u32`。
-        let index = parse::scan_blocks_with_line_starts(src.as_ref(), &ls32);
+        // blocks-only（toc 跳过：WYSIWYG Doc 层从不消费 index.toc，侧边栏目录由
+        // `WyEditor::toc_entries()` 独立构建；见 `scan_blocks_with_line_starts` 注释）。
+        let lines: Vec<&str> = src.split('\n').collect();
+        let index = parse::scan_blocks_with_line_starts(&lines, &ls32, false);
         crate::prof::end("doc.open.scan_blocks", _t);
         let _t = crate::prof::begin();
         let rope = Rope::from(&*src);
@@ -402,30 +405,64 @@ impl Doc {
         }
     }
 
-    /// 打开大文档（`Rope` 源，COW）：块索引全量一次（O(n)），**窗口化物化行**走 rope
-    /// 切片，不整份持有字符串——与预览一致。`line_starts` 用 chunks 单遍扫（O(n)，
-    /// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降）。仅测试消费（parity 对比）。
-    #[cfg(test)]
+    /// 打开大文档（`Rope` 源，COW）：块索引走 rope 原生全量 **blocks-only** 扫描
+    /// （跳过 toc——WYSIWYG 从不消费 `index.toc`）；行切片按 chunk 装配（跨 chunk
+    /// 分裂的行物化为局部 `String`，余下零拷贝借 chunk `&str`，**不整份物化 rope**）；
+    /// 四行统计一趟 chunk 融合扫描（[`build_line_stats_utf16_rope`]，与 Str 分支
+    /// [`parse::build_line_stats_utf16`] 口径一致）。`DocSrc::Rope` 持 COW 快照，
+    /// [`Self::edit`] 不污染宿主编辑区共享的 rope 原树（有回归测试锁）。
     pub(crate) fn open_rope(rope: Rope) -> Self {
-        let index = parse::scan_blocks_rope(&rope);
-        let line_starts = build_line_starts_rope(&rope);
-        let char_count = rope.chars().count();
-        let line_utf16_starts = build_line_utf16_starts(
-            |s, e| rope.slice(s..e).chars().map(|c| c.len_utf16()).sum(),
-            &line_starts,
-            rope.len(),
-        );
-        let total_utf16: usize = rope
-            .chars()
-            .map(|c| c.len_utf16())
-            .sum::<usize>();
+        let (ls32, ls16, char_count, total_utf16) = build_line_stats_utf16_rope(&rope);
+        let n = ls32.len();
+        let rope_len = rope.len();
+        // 行 k 的源码字节区间（含尾 `\n` 剔除；末行/幻影尾行到文末）。
+        let line_content = |k: usize| -> (usize, usize) {
+            let s = ls32[k] as usize;
+            let e = if k + 1 < n {
+                (ls32[k + 1] as usize).saturating_sub(1)
+            } else {
+                rope_len
+            };
+            (s, e)
+        };
+        // 两阶段：先物化跨 chunk 分裂的行（`owned` 冻结），再装配行引用——规避
+        // `Vec<&str>` 同时借 rope chunk 与本地 `owned` 的借用冲突。
+        let mut owned: Vec<String> = Vec::new();
+        for k in 0..n {
+            let (s, e) = line_content(k);
+            if s < e {
+                let (chunk, off) = rope.chunk(s);
+                if e > off + chunk.len() {
+                    owned.push(rope.slice(s..e).to_string());
+                }
+            }
+        }
+        let mut lines: Vec<&str> = Vec::with_capacity(n);
+        let mut oi = 0usize;
+        for k in 0..n {
+            let (s, e) = line_content(k);
+            if s == e {
+                lines.push("");
+            } else {
+                let (chunk, off) = rope.chunk(s);
+                let rel = s - off;
+                if e <= off + chunk.len() {
+                    lines.push(&chunk[rel..rel + (e - s)]);
+                } else {
+                    lines.push(owned[oi].as_str());
+                    oi += 1;
+                }
+            }
+        }
+        debug_assert_eq!(oi, owned.len(), "跨 chunk 行物化数与装配数应一致");
+        let index = parse::scan_blocks_with_line_starts(&lines, &ls32, false);
         let src = DocSrc::Rope(rope.clone());
         Self {
             src,
             index,
             rope,
-            line_starts: LineStarts::from_vec(line_starts),
-            line_utf16_starts: LineStarts::from_vec(line_utf16_starts),
+            line_starts: LineStarts::from_vec(ls32.into_iter().map(|b| b as usize).collect()),
+            line_utf16_starts: LineStarts::from_vec(ls16),
             char_count,
             total_utf16,
             edit_ver: 0,
@@ -851,27 +888,61 @@ impl Doc {
     }
 }
 
-/// rope 的行起始字节偏移表（`split('\n')` 语义）：chunks 单遍扫（每字节一次，O(n)），
-/// 替代旧实现逐字节 `get_byte` 的 O(n log n) 树下降。仅测试消费（`open_rope` 用）。
-#[cfg(test)]
-fn build_line_starts_rope(rope: &Rope) -> Vec<usize> {
-    let mut v = vec![0usize];
-    let mut pos = 0usize;
+/// rope 的行统计融合一趟 chunk 扫描：与 `parse::build_line_stats_utf16`（Str 分支）
+/// 同口径产出四值（`line_starts` u32 / 行粒度 UTF-16 前缀 / 标量字符数 / 全文
+/// UTF-16 单元数），逐 chunk 推进绝对字节游标 `base`、跨 chunk 进位 `run_u16` /
+/// `char_count`——rope 的 chunk 边界落在字符边界上（chunk 是合法 `&str`），逐引导
+/// 字节折算与单缓冲逐值一致（有对拍测试背书）。`Doc::open_rope` 生产路径用。
+fn build_line_stats_utf16_rope(rope: &Rope) -> (Vec<u32>, Vec<usize>, usize, usize) {
+    let cap = rope.len() / 8 + 2;
+    let mut line_starts = Vec::with_capacity(cap);
+    let mut line_utf16_starts = Vec::with_capacity(cap);
+    line_starts.push(0u32);
+    line_utf16_starts.push(0usize);
+    let mut run_u16 = 0usize;
+    let mut char_count = 0usize;
+    let mut base = 0usize; // 当前 chunk 的文档绝对字节起始
     for chunk in rope.chunks() {
-        for (i, b) in chunk.bytes().enumerate() {
-            if b == b'\n' {
-                v.push(pos + i + 1);
+        let bytes = chunk.as_bytes();
+        let m = bytes.len();
+        let mut j = 0usize;
+        while j < m {
+            let b = bytes[j];
+            if b < 0x80 {
+                char_count += 1;
+                run_u16 += 1;
+                if b == b'\n' {
+                    line_starts.push((base + j + 1) as u32);
+                    line_utf16_starts.push(run_u16);
+                }
+                j += 1;
+            } else {
+                // 非 ASCII：按 UTF-8 引导字节折算（同 Str 分支口径；chunk 边界在
+                // 字符边界上，无跨 chunk 的半字符）。
+                let l = if b < 0xC0 {
+                    1
+                } else if b < 0xE0 {
+                    2
+                } else if b < 0xF0 {
+                    3
+                } else {
+                    4
+                };
+                char_count += 1;
+                run_u16 += if l == 4 { 2 } else { 1 };
+                j += l;
             }
         }
-        pos += chunk.len();
+        base += m;
     }
-    v
+    (line_starts, line_utf16_starts, char_count, run_u16)
 }
 
 /// 行粒度 UTF-16 前缀索引构建：第 i 项 = `line_starts[i]`（含幻影尾行）前的累计
 /// UTF-16 单元数。`u16_of_range` 统计单行字节区间的 UTF-16 单元数。O(n)。
-/// 仅 `open_rope`（测试路径）与对拍测试消费；`Doc::open` 走融合一趟
-/// [`parse::build_line_stats_utf16`]。
+/// 仅**对拍测试**（`line_stats_fused_matches_old_multi_pass` 的旧四趟参考）消费；
+/// `Doc::open` 走融合一趟 [`parse::build_line_stats_utf16`]、`open_rope` 走
+/// [`build_line_stats_utf16_rope`]。
 #[cfg(test)]
 fn build_line_utf16_starts(
     u16_of_range: impl Fn(usize, usize) -> usize,
@@ -1164,6 +1235,104 @@ mod tests {
             doc.edit(len..len, "\n# 尾部\n正文");
             let (segs, _) = assert_matches_full_rebuild(&doc, "文末追加");
             assert!(segs <= LINE_STARTS_MAX_SEGS, "文末追加段数超限：{segs}");
+        }
+    }
+
+    /// COW 语义回归：`Doc::open_rope` 持宿主 rope 的 COW 快照——`Doc::edit` 只改动
+    /// 自己的趟副本（`new_rope = self.rope.clone()`，ropey 拓扑 COW），宿主共享的
+    /// rope 原树逐字节不变；再对同一宿主 rope `open_rope` 得到独立新 Doc，互不串扰。
+    /// （锁「open_rope 后编辑不污染共享 rope 源」的 doc.rs:467 同款语义。）
+    #[test]
+    fn open_rope_edit_does_not_pollute_host_rope() {
+        let src = "# 标题\n段落 **加粗** `代码`\n\n```rust\nlet a = 1;\n```\n\ntail\n";
+        let host = ropey::Rope::from(src);
+        let mut doc = Doc::open_rope(host.clone());
+        // 行内编辑（no-'\n'，尾部平移路径）+ 结构编辑（含 '\n'，区域重建路径）。
+        let at = src.find("let a = 1;").unwrap();
+        doc.edit(at..at + "let a = 1;".len(), "let b = 2;");
+        let nl = src.find("\n\n```rust").unwrap() + 1;
+        doc.edit(nl..nl, "插入行\n");
+        // 宿主 rope 快照未被污染（COW）：内容与起始完全一致。
+        assert_eq!(host.to_string(), src, "宿主 rope 必须保持原状（COW）");
+        // 唯一真源读回：Doc 反映两次编辑。
+        let want = src
+            .replacen("let a = 1;", "let b = 2;", 1)
+            .replace("\n\n```rust", "\n插入行\n\n```rust");
+        assert_eq!(doc.text_shared(), SharedString::from(want.as_str()));
+        // 再开同一宿主 rope → 独立新 Doc，不受上一 Doc 编辑影响。
+        let doc2 = Doc::open_rope(host.clone());
+        assert_eq!(doc2.text_shared(), SharedString::from(src));
+        assert_eq!(doc2.len(), src.len());
+    }
+
+    /// Rope/Str 两构造路径逐项对拍（冷开 blocks-only 与 Str 口一致的抽取面）：
+    /// 行统计 / 块序列 / `line_str` / `line_chars_ascii` 两分支逐值相等；
+    /// 并含**跨 chunk 分裂行**（`RopeBuilder` 构造多叶 rope，长行跨叶边界）——
+    /// `open_rope` 的行装配走物化跨叶行路径，须与 Str 分支逐字一致。
+    #[test]
+    fn open_rope_matches_str_doc_incl_cross_chunk_lines() {
+        // 单叶样本：基础结构（标题/围栏/表格/引用/图片/CRLF/中文/emoji）。
+        let samples = [
+            "",
+            "# 标题\r\n正文 **粗**\r\n\r\n```rust\r\nlet a = 1;\r\n```\r\n\r\n| A | B |\r\n|---|---|\r\n| 1 | 2 |\r\n\r\n> 引用\r\n\r\n![图](x.png)\r\n",
+            "行零\n行一\n普通段落\nAB\nCD\n末尾行\n",
+            "emoji 😀🚀 后\n中\r\n",
+        ];
+        // 多叶 rope：>1024B 无换行长行直接成叶在 1024 处截断 → 首行跨叶边界
+        // （其余行在第二叶内）；再补一段普通文本（未跟踪的换行归属也在叶边界附近）。
+        let mut builder = ropey::RopeBuilder::new();
+        builder.append(&"x".repeat(2000));
+        builder.append("\n第二行\n");
+        let multi_leaf_rope = builder.finish();
+        let multi_leaf_src = format!("{}\n第二行\n", "x".repeat(2000));
+        assert_eq!(multi_leaf_rope.to_string(), multi_leaf_src);
+        // 断言确实构造出跨叶行：首叶只含第一行前缀（无 '\n'）。
+        assert!(!multi_leaf_rope.chunk(0).0.contains('\n'));
+        let check = |str_doc: &Doc, rope_doc: &Doc, tag: &str| {
+            assert_eq!(
+                rope_doc.line_starts().to_vec(),
+                str_doc.line_starts().to_vec(),
+                "{tag}: line_starts"
+            );
+            assert_eq!(
+                rope_doc.line_utf16_starts().to_vec(),
+                str_doc.line_utf16_starts().to_vec(),
+                "{tag}: line_utf16_starts"
+            );
+            assert_eq!(rope_doc.char_count(), str_doc.char_count(), "{tag}: char_count");
+            assert_eq!(rope_doc.total_utf16(), str_doc.total_utf16(), "{tag}: total_utf16");
+            assert_eq!(rope_doc.block_count(), str_doc.block_count(), "{tag}: block_count");
+            let n = rope_doc.block_count();
+            for i in 0..n {
+                assert_eq!(
+                    rope_doc.block_meta(i),
+                    str_doc.block_meta(i),
+                    "{tag}: block_meta[{i}]"
+                );
+            }
+            let n_lines = rope_doc.line_count();
+            for i in 0..n_lines {
+                assert_eq!(
+                    rope_doc.line_str(i),
+                    str_doc.line_str(i),
+                    "{tag}: line_str[{i}]"
+                );
+                assert_eq!(
+                    rope_doc.line_chars_ascii(i),
+                    str_doc.line_chars_ascii(i),
+                    "{tag}: line_chars_ascii[{i}]"
+                );
+            }
+        };
+        for s in &samples {
+            let str_doc = Doc::open(SharedString::from(s.to_string()));
+            let rope_doc = Doc::open_rope(ropey::Rope::from(*s));
+            check(&str_doc, &rope_doc, &format!("sample {s:?}"));
+        }
+        {
+            let str_doc = Doc::open(SharedString::from(multi_leaf_src.as_str()));
+            let rope_doc = Doc::open_rope(multi_leaf_rope);
+            check(&str_doc, &rope_doc, "cross-chunk multi-leaf");
         }
     }
 }

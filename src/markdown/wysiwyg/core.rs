@@ -367,12 +367,40 @@ impl WyEditor {
     }
 
     /// 从编辑器 `Rope`（O(1) COW 快照）完整构建——App 大文档 load 的后台段：
-    /// `Doc::open` 6.4MB 解析（~200ms）与标记计数全在这里，UI 线程只做快照 + 装配。
+    /// `Doc::open_rope` 零整份拷贝（blocks-only 跳过 toc）与标记计数全在这里，
+    /// UI 线程只做快照 + 装配。不再 `rope.to_string()` 物化全文（曾 6.4MB 整份拷）。
     pub(crate) fn open_from_rope(rope: Rope) -> WyOpenResult {
         let _t = crate::prof::begin();
-        let ss = SharedString::from(rope.to_string());
-        crate::prof::end("wy.open.to_string", _t);
-        Self::open_from_str(ss)
+        let (math_dollar_cnt, alert_marker_cnt) = Self::count_marks(&rope);
+        crate::prof::end("wy.open.marks", _t);
+        let _t = crate::prof::begin();
+        let doc = Doc::open_rope(rope);
+        crate::prof::end("wy.open.doc", _t);
+        WyOpenResult {
+            doc,
+            math_dollar_cnt,
+            alert_marker_cnt,
+        }
+    }
+
+    /// 全文标记计数（`$` / `[!`）——`derived()` 的数学/警报预筛用增量计数（内容级
+    /// O(n) 一次，之后编辑逐键增量维护，避免每次变更对 6.4MB 全篇重扫）。直接在
+    /// rope 字节流上单遍滑窗（跨 chunk 连续，与 `str::bytes`/`matches("[!")` 同值）
+    /// ——不物化全文。
+    pub(crate) fn count_marks(rope: &Rope) -> (usize, usize) {
+        let mut dollar = 0usize;
+        let mut alert = 0usize;
+        let mut prev = 0u8;
+        for b in rope.bytes() {
+            if b == b'$' {
+                dollar += 1;
+            }
+            if b == b'!' && prev == b'[' {
+                alert += 1;
+            }
+            prev = b;
+        }
+        (dollar, alert)
     }
 
     /// 装配后台结果（UI 线程）：整篇重活已发生（`WyOpenResult`），这里只剩换源后的
@@ -905,5 +933,42 @@ impl WyEditor {
         crate::prof::op_start("ime");
         crate::ime::replace(self, range, new_text, new_selected_range, true, cx);
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `count_marks`（rope 字节流滑窗）与字符串口径（`bytes().filter('$')` /
+    /// `matches("[!")`）逐值对拍——冷开替换旧 `open_from_str` 的全篇串扫描后，
+    /// `derived()` 的数学/警报预筛计数必须不漂移。
+    #[test]
+    fn count_marks_matches_string_reference() {
+        let samples = [
+            "",
+            "纯文本无标记",
+            "$x + y$ 与 $z$",
+            "[!NOTE] 开头 + [!WARNING]",
+            "数学 $a$[!TIP] 混排 $[! $b$",
+            "$$ 块级 + [!CAUTION]\n第二行 [!!] 双感叹",
+            "转义 \\$cash$ 不规则",
+            "emoji 😀 $🚀$ [!️!]",
+        ];
+        for s in &samples {
+            let (d, a) = WyEditor::count_marks(&ropey::Rope::from(*s));
+            let want_d = s.bytes().filter(|&b| b == b'$').count();
+            let want_a = s.matches("[!").count();
+            assert_eq!(d, want_d, "dollar {s:?}");
+            assert_eq!(a, want_a, "alert {s:?}");
+        }
+        // 多叶 rope：构造 `[!` 恰好跨叶边界（首叶 1024B 以 `[` 收尾，`!` 在次叶首），
+        // 验证字节流滑窗跨 chunk 不漏计（也覆盖 `$` 跨叶）。
+        let long = format!("{}[!WARN]$", "a".repeat(1023));
+        let rope = ropey::Rope::from(long.as_str());
+        assert_eq!(rope.chunks().count() > 1, true);
+        let (d, a) = WyEditor::count_marks(&rope);
+        assert_eq!(d, long.bytes().filter(|&b| b == b'$').count());
+        assert_eq!(a, long.matches("[!").count());
     }
 }

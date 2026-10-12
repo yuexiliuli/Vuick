@@ -617,17 +617,25 @@ pub fn scan_blocks(src: &str) -> BlockIndex {
     let _t = crate::prof::begin();
     let line_starts = build_line_starts_u32(src);
     crate::prof::end("scan.blocks.line_starts", _t);
-    scan_blocks_with_line_starts(src, &line_starts)
-}
-
-/// [`scan_blocks`] 的复用行起始版：块判定逻辑完全一致，仅不重复计算行起始表。
-/// `line_starts` 必须是 `split('\n')` 语义（[`build_line_starts_u32`] /
-/// [`build_line_stats_utf16`] 产出）——`Doc::open` 从融合扫描复用，省掉整篇第二遍
-/// `build_line_starts_u32`。
-pub(crate) fn scan_blocks_with_line_starts(src: &str, line_starts: &[u32]) -> BlockIndex {
     let _t = crate::prof::begin();
     let lines: Vec<&str> = src.split('\n').collect();
     crate::prof::end("scan.blocks.split", _t);
+    scan_blocks_with_line_starts(&lines, &line_starts, true)
+}
+
+/// [`scan_blocks`] 的复用行起始版：块判定逻辑完全一致，仅不重复计算行起始表与
+/// `split`——输入是已按 `split('\n')` 切好的行切片（`lines[i]` 不含尾 `\n`，
+/// `line_starts[i]` 为该行字节起始）。字符串源由 [`scan_blocks`] 切好传入；rope 源
+///（WYSIWYG `Doc::open_rope` 冷开，零整份拷贝）由调用方按 chunk 装配行切片后传入。
+///
+/// `build_toc=false` 时目录恒空：WYSIWYG `Doc` 层从不消费 `index.toc`（侧边栏目录
+/// 由预览侧 `WyEditor::toc_entries()` 独立构建），整表目录重建是大文档打开的真热点，
+/// 跳过归零；需要正确目录的调用方（parse 测试 / 未来目录消费）传 `true`。
+pub(crate) fn scan_blocks_with_line_starts(
+    lines: &[&str],
+    line_starts: &[u32],
+    build_toc: bool,
+) -> BlockIndex {
     let _t = crate::prof::begin();
     let mut blocks: Vec<BlockMeta> = Vec::with_capacity(lines.len());
     let mut toc: Vec<(usize, u8, SharedString)> = Vec::new();
@@ -640,8 +648,10 @@ pub(crate) fn scan_blocks_with_line_starts(src: &str, line_starts: &[u32]) -> Bl
         // 与 parse_to_rows 一致的 EPUB 对齐指令剥离（kind 判定对同一份内容做）。
         let (_, line) = strip_align_directive(raw_line);
         let t = line.trim_start();
-        let c = classify_block(&lines, idx, t);
-        if let RowKind::Heading(h) = c.kind {
+        let c = classify_block(lines, idx, t);
+        if build_toc
+            && let RowKind::Heading(h) = c.kind
+        {
             let _t = crate::prof::begin();
             let text = inline_strip(t[h as usize..].trim_start());
             toc.push((row_start, h, text));
