@@ -200,6 +200,24 @@ pwsh scripts/package.ps1
 - DLL 须与编译期是**同一个** FFmpeg 构建（脚本直接从 `FFMPEG_DIR\bin` 取，版本号一致，不会 ABI 错位）；
 - **PDF 无需额外分发**：pdfium dll 构建时已内嵌进 exe（`embed_pdfium`），运行时自动解出。
 
+## 用户偏好（配置文件）
+
+应用的**用户偏好**（主题 / 字号 / 侧栏宽度）会在运行时持久化成一份 JSON 配置文件（代码：`src/config/user.rs`）：
+
+- **位置**（Windows）：`%APPDATA%\gpui-editor\config.json`
+  - 可用环境变量 `GPUI_EDITOR_CONFIG` 指定其它路径（绝对值）；无 `APPDATA` 时回退到当前目录 `gpui-editor-config.json`。
+  - 它在用户目录、**不在仓库里**，不会随 git 提交。
+- **作用**：退出 / 下次重启时保持这些个性化设置：
+  | 字段 | 取值 | 说明 |
+  | --- | --- | --- |
+  | `theme` | `"follow"` / `"light"` / `"dark"` | 跟随系统 / 强制浅色 / 强制深色（`ui/theme.rs`） |
+  | `font_size` | 数字 px | 正文字号；缺失 → 默认 `14.0`（`layout::DEFAULT_FONT_SIZE`） |
+  | `sidebar_width` | 数字 px / `null` | 侧栏手动宽度；`null` = 随目录内容自适应 |
+- **何时写盘**：切换主题、`Ctrl+=` / `Ctrl+-` / `Ctrl+0`（或菜单 / 状态栏）调节字号、侧栏右缘拖拽结束时（`chrome.rs` / `preview.rs` / `sidebar.rs` 的 `persist_prefs`）。
+- **排障提示**：觉得界面（含 EPUB / Markdown 正文）文字整体偏小，先看该文件里的 `font_size` 是否被之前 `Ctrl+滚轮` 缩放写小了——应用内按 `Ctrl+0` 即可恢复默认 14 并持久化，或直接改这个 JSON。
+
+示例：`{"theme":"dark","font_size":14.0,"sidebar_width":null}`
+
 ## 已知限制与后续方向
 
 - 内容区拖选是整条文本维度的选择；图表 / 图片等富媒体尚未支持选择。
