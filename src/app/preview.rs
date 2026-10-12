@@ -22,13 +22,26 @@ pub(crate) static LIVE_COMMIT_WRITEBACK: std::sync::atomic::AtomicUsize =
 pub(crate) static LIVE_COMMIT_SKIP_UNCHANGED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// 测试探针（`cfg(test)`）：走**增量 diff 写回**（replaces 非空 → `apply_replaces` /
-/// `preview_apply_edit` 被调用）的 `commit_live` 次数。
+/// `preview_apply_edit` 被调用）的 `commit_live` 次数。方案2 后仅「编辑日志重放护栏
+/// 失败 / 有脏标记但无日志」的兜底路径累加。
 #[cfg(test)]
 pub(crate) static LIVE_COMMIT_DIFF_APPLIED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// 测试探针（`cfg(test)`）：增量写回实际应用的替换 hunk 累计数（>0 即非整篇替换）。
+/// 仅「护栏/无日志」兜底走 diff 时累加——主路径已被编辑日志重放（[`LIVE_COMMIT_OPS_*`]）
+/// 取代。
 #[cfg(test)]
 pub(crate) static LIVE_COMMIT_DIFF_HUNKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针（`cfg(test)`）：走**编辑日志重放**（方案2，`apply_live_replay` 主路径）写回
+/// 的 `commit_live` 次数（op 非空且护栏自检通过）。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_OPS_REPLAYED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针（`cfg(test)`）：编辑日志重放实际应用的 op 累计数（= 该 live 会话缴存的
+/// 内容变更条数；引用计数断言「单字符恰 1 条」「大粘贴单大 op」）。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_OPS_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 impl EditorApp {
@@ -642,7 +655,67 @@ impl EditorApp {
         }
         #[cfg(test)]
         LIVE_COMMIT_WRITEBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // —— 增量写回（M：WYSIWYG 编辑过 → 切回也快速）——
+        // —— 编辑日志重放（M：方案2，取代行级 diff 的主路径）——
+        // live2 在 live 会话期把每笔内容变更（`replace_range` / 撤销 / 重做统一缴存）记成
+        // `(字节区间, 新文本)` op 日志：两步起点同源（toggle ON 的源码 COW Rope 快照、
+        // live 期间源码编辑区不被改写）→ op 字节偏移在源码编辑区与 live2 恒等，**按序
+        // 重放即得最终态**，无需行级 LCS / 整篇物化比对。单 op = O(log n) Rope 编辑 +
+        // 窗口化高亮增量。实测（debug，6.4MB）：写回本体 1 字符 ~1ms、3 行 ~3ms（旧 diff
+        // 光行级扫描就 ~45ms）；余下 ~20ms 是 tab.content 全网 O(n) 物化（旧路径同有）、
+        // ~36ms 是 live2 实体销毁（未改动 O(1) 跳过路径同款，既有接受的非写回开销）。
+        let ops = l2.update(cx, |ed, _| ed.take_live_ops());
+        if !ops.is_empty() {
+            // 最终态 = live2 文本（O(1) SharedString COW；live2 是 op 序号回放的权威终点）。
+            let content = l2.read(cx).text();
+            tab.content = content.clone();
+            // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；不再
+            // 对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
+            tab.line_count = l2.read(cx).line_count();
+            tab.char_count = l2.read(cx).char_count();
+            // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
+            // 长度不等即空壳/失步 → 整篇喂源兜底，见下）。
+            let src_len = tab.editor.read(cx).text().len();
+            // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
+            // 自检失败 → 缓冲区未被改动，落下方既有 diff 兜底（content 仍是最终态）。
+            let ok = tab.editor.update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()));
+            if ok {
+                #[cfg(test)]
+                {
+                    LIVE_COMMIT_OPS_REPLAYED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    LIVE_COMMIT_OPS_COUNT
+                        .fetch_add(ops.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                // A2/A3：右栏只读预览 `md_wy`（若存在）随写回对齐——逐 op 增量重放（与旧
+                // diff hunk 同款 `preview_apply_edit` 免门控增量管线）。**前提 O(1) 校验**：
+                // md_wy 当前长度 == 重放前的源长度（同源、live 期间未被改写 → 起点一致），
+                // 否则（空壳未就绪/外部失步）直接整篇喂源兜底——**不做全篇文本比对**（那会
+                // 冷物化 md_wy 全文，6.4MB 又 +20ms）。编辑量超阈值（大段粘贴）同旧 diff 的
+                // 做法改整篇喂源，首帧零卡不劣于现状。
+                if let Some(wy) = tab.md_wy.clone() {
+                    let span: usize = ops
+                        .iter()
+                        .map(|(r, t)| (r.end - r.start).max(t.len()))
+                        .sum();
+                    if span <= MD_WY_DIFF_MAX_SPAN_BYTES && wy.read(cx).len() == src_len {
+                        for (r, t) in &ops {
+                            wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t.as_ref(), cx));
+                        }
+                        // 重放后 md_wy 长度必然 == content（同起点 + 确定性 op）；若因
+                        // 未知原因不等 → 整篇喂源兜底（仅长度 O(1) 比对）。
+                        if wy.read(cx).len() != content.len() {
+                            wy.update(cx, |w, _cx| w.set_source_text(&content));
+                        }
+                    } else {
+                        wy.update(cx, |w, _cx| w.set_source_text(&content));
+                    }
+                }
+                self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
+                self.status_ok = true;
+                return;
+            }
+            // 护栏失败 → 落到既有行级 diff 兜底（源码编辑区未被重放污染，`base` 仍有效）。
+        }
+        // —— 既有行级 diff 写回（护栏失败 / 有脏标记但无日志时的兜底，见 src/app/diff.rs）——
         // 与「toggle ON 的源快照」（= 当前源码编辑区缓冲区，live 期间无其它写入路径）
         // 做**行级 diff**，产出少量（字节区间, 文本）替换 → 应用到：
         //   1) 源码编辑区缓冲区：`CodeEditor::apply_replaces`（每处 O(log n) Rope 编辑 +
@@ -730,6 +803,9 @@ impl EditorApp {
                 .and_then(|p| p.parent())
                 .map(|d| d.to_path_buf());
             ed.update(cx, |ed, _| ed.set_base_dir(base_dir));
+            // 开启编辑日志收集（方案2）：仅本 live2 实例缴存 op（右栏 `md_wy` 等不开启）。
+            // 大文档后台加载的 `install_open` 会清空加载窗口内的陈旧 op（收集开关保留）。
+            ed.update(cx, |ed, _| ed.capture_live_ops());
             let ed_sub = cx.subscribe(&ed, |this, emitter, ev: &WyEvent, cx| {
                 let _t = crate::prof::begin();
                 match ev {

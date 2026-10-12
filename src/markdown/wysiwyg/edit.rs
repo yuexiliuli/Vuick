@@ -367,6 +367,19 @@ impl WyEditor {
     }
     /* ---------- 编辑操作（源字节域） ---------- */
 
+    /// 开启「编辑日志」收集（方案2：切回源码编辑区按序重放）。仅 App 对 live2 实例调；
+    /// 其余实例（`md_wy` 右栏预览等）一律不开启，避免把旁路/预览增删误收进日志。
+    pub(crate) fn capture_live_ops(&mut self) {
+        self.live_ops.get_or_insert_with(Vec::new);
+    }
+
+    /// 取走并清空「编辑日志」（App `commit_live` 消费；此后实体随即销毁）。返回空 =
+    /// 本次 live 会话无任何内容变更（等价旧的 `live2_dirty == false` 判定；二者都只由
+    /// 内容变更置位，`WyEvent::Changed` 与 op 缴存同源）。
+    pub(crate) fn take_live_ops(&mut self) -> Vec<(Range<usize>, SharedString)> {
+        self.live_ops.take().unwrap_or_default()
+    }
+
     /// 核心编辑：替换 `[start, end)` → `text`，重建模型、移光标、通知。
     /// 任意替换都会收敛选区（无选区）与 IME 组合区间（替换后由输入处理器重设）。
     /// **所有编辑**（输入/剪贴板/退格/任务框翻转/警报折叠）都从这里过——每笔真实
@@ -387,6 +400,12 @@ impl WyEditor {
         // 编辑前被替换区间（cross_newline / 标记计数 / 撤销意图用；O(被删长)）。
         let removed = self.doc.slice_str(r.clone());
         let inserted_len = text.len();
+        // —— 编辑日志（方案2）：每笔真实内容变更缴存 `(字节区间, 新文本)` op，供切回
+        // 源码编辑区按序重放（撤销/重做的净逆操作同样经 `apply_raw_edit` 缴存，按序重放
+        // 即得最终态，见 `apply_raw_edit` 尾部同款缴存）。仅 live2 收集（`md_wy` 不开）。
+        if let Some(log) = &mut self.live_ops {
+            log.push((r.clone(), SharedString::from(text)));
+        }
         // —— B2 撤销单元 + 事务合并（无定时器确定性判定，同 editor/undo.rs）——
         self.record_undo_unit(&r, &removed, text);
         // 原地 rope 编辑（`Doc::edit`：COW remove+insert + 增量块扫描 + 增量行起始）——
@@ -936,6 +955,12 @@ impl WyEditor {
             return;
         }
         let _t_rr = crate::prof::begin();
+        // —— 编辑日志（方案2）：撤销/重做（与 `preview_apply_edit` 的右栏桥）共用本
+        // 增量管道。撤销/重做也经此缴存 op → live 会话编辑日志按序重放即得最终文本。
+        // 右栏 `md_wy` 未开启收集，其逐 op 桥重放（`preview_apply_edit`）不会误入日志。
+        if let Some(log) = &mut self.live_ops {
+            log.push((r.clone(), SharedString::from(text)));
+        }
         let removed = self.doc.slice_str(r.clone());
         let edit_line = self.row_col(r.start).0;
         let old_line = self.doc.line_str(edit_line);

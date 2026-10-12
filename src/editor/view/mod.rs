@@ -50,6 +50,7 @@ use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES;
 use crate::editor::fold::{scan_bracket_pairs, BracketPair, Fold, FoldMap};
 use crate::editor::highlight::Highlighter;
 use crate::editor::movement;
+use crate::editor::rope_ext::RopeExt;
 use crate::editor::undo::{EditIntent, UndoManager};
 use crate::editor::{Buffer, Selection};
 
@@ -383,6 +384,13 @@ pub struct CodeEditor {
     /// 点亮竖线颜色：主题强调蓝 `colors.accent.opacity(0.9)`（`refresh_metrics` 设置；
     /// **勿抽进 config**——用户已明确回滚过颜色抽取）。
     active_guide_color: Hsla,
+    /// （仅测试）`apply_live_replay`（方案2 op 重放主路径）成功调用次数——每个测试的
+    /// `CodeEditor` 都是新实例、字段从 0 起，比进程级静态计数在串行/并行测试下都确定。
+    #[cfg(test)]
+    live_replay_calls: Cell<usize>,
+    /// （仅测试）`apply_replaces`（行级 diff 兜底）非空调用次数——同上，实例级确定性。
+    #[cfg(test)]
+    apply_replaces_calls: Cell<usize>,
 }
 
 impl CodeEditor {
@@ -451,6 +459,10 @@ impl CodeEditor {
             guide_color: rgb(0x000000).into(),
             active_guide_open: None,
             active_guide_color: rgb(0x000000).into(),
+            #[cfg(test)]
+            live_replay_calls: Cell::new(0),
+            #[cfg(test)]
+            apply_replaces_calls: Cell::new(0),
         }
     }
 
@@ -571,6 +583,9 @@ impl CodeEditor {
         if replaces.is_empty() {
             return;
         }
+        #[cfg(test)]
+        self.apply_replaces_calls
+            .set(self.apply_replaces_calls.get() + 1);
         // 与 `set_text` 同语义：整篇写回 = 原子替换，撤销栈清空（旧内容快照作废）。
         self.undo.clear();
         let mut min_line_a = usize::MAX;
@@ -595,6 +610,66 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         self.last_edit = None;
         self.marked_range = None;
+    }
+
+    /// WYSIWYG 编辑日志**按序重放**（切回「预览编辑测试」有改动路径，方案2）：把 live2
+    /// 缴存的 `(字节区间, 新文本)` op（含撤/重做的净逆操作）按发生顺序逐条应用到当前
+    /// 缓冲区。两者从同一「toggle ON 的源码 COW Rope 快照」起步、live 会话期间本缓冲区
+    /// 不被改写 → op 字节坐标恒等，按序重放即得最终态。语义对齐 [`Self::set_text`] /
+    /// [`Self::apply_replaces`]：清空撤销栈（整篇写回 = 原子替换）、光标收行首、无编辑事件；
+    /// 每处走 [`Self::apply_edit_synced`] 的 O(log n) Rope 编辑 + 窗口化高亮增量登记，
+    /// **不整篇重建**（区别于 `set_text` 的 reset_document 级联）。
+    ///
+    /// **护栏**（护栏成本必须 O(编辑量)+O(1)，绝不做全篇 O(n) 比对——那会把 6.4MB 大文档
+    /// 的「1 字符切回」顶到几十 ms）：先在临时 COW Rope 上按序干跑一次，逐 op 校验越界 /
+    /// 切中多字节字符（这些会污染缓冲区，必须先拦下），最后做 **O(1) 总长度比对**——方案2
+    /// 的现实漂移模式（CRLF / BOM / 漏 op）**全部改变总字节长**，长度不等即拦截返回
+    /// `false`；同长异字在「同源 Rope + 确定性 op」下不可能发生（且由 app 层全文等价测试
+    /// 兜底）。干跑 + 长度栏都不通过 → **不改动缓冲区**，由调用方回退既有行级 diff 管线
+    /// （`app::diff`）。
+    pub fn apply_live_replay(&mut self, ops: &[(Range<usize>, gpui::SharedString)], expected: &str) -> bool {
+        if ops.is_empty() {
+            return expected == self.text_string();
+        }
+        let exp_len = expected.len();
+        // —— 干跑自检（护栏）：逐 op 边界/字符边界校验 + 终态 O(1) 长度栏 ——
+        let mut probe = self.buffer_text().clone();
+        for (r, t) in ops {
+            if r.start > r.end || r.end > probe.len() {
+                return false;
+            }
+            if !probe.is_char_boundary(r.start) || !probe.is_char_boundary(r.end) {
+                return false;
+            }
+            probe.replace(r.clone(), t.as_ref());
+        }
+        if probe.len() != exp_len {
+            return false;
+        }
+        // —— 自检通过：落盘（与 apply_replaces 同语义的原子整篇写回）——
+        self.undo.clear();
+        for (range, text) in ops {
+            self.apply_edit_synced(range.clone(), text.as_ref());
+        }
+        self.selection = Selection::collapsed(0);
+        self.last_edit = None;
+        self.marked_range = None;
+        #[cfg(test)]
+        self.live_replay_calls
+            .set(self.live_replay_calls.get() + 1);
+        true
+    }
+
+    /// （仅测试）本实例成功走 `apply_live_replay`（方案2 op 重放）的次数。
+    #[cfg(test)]
+    pub(crate) fn live_replay_calls(&self) -> usize {
+        self.live_replay_calls.get()
+    }
+
+    /// （仅测试）本实例成功走 `apply_replaces`（行级 diff 兜底）的次数（非空替换）。
+    #[cfg(test)]
+    pub(crate) fn apply_replaces_calls(&self) -> usize {
+        self.apply_replaces_calls.get()
     }
 
     /// 底层 Rope（只读；O(1) COW 快照给后台线程）。

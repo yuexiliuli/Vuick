@@ -1493,4 +1493,55 @@ fn row_cache_reuses_scrolled_rows_and_invalidates_on_edit(cx: &mut TestAppContex
     assert_eq!(c[12].0, b[12].0, "未编辑行文本不应漂移（行 22）");
 }
 
+/// 方案2 护栏：`apply_live_replay` 的「先干跑自检后落盘」契约——基线一致时按序重放成功、
+/// 产物 == 期望全文；基线错位（越界 / 切中多字节字符 / 终态不符，如 CRLF/BOM/漏 op 的
+/// 偏移漂移）时**不改动缓冲区**、返回 `false`，由调用方（`app::commit_live`）回退行级
+/// diff。若护栏失败也把缓冲区改掉，fallback 的 diff 基线就会取到污损文本，内容必错。
+#[gpui::test]
+fn live_replay_guard_never_mutates_on_drift(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let ed = cx.new(|cx| CodeEditor::new(cx));
+        // 基线一致（happy path）：1 条 op 按序重放 → true 且内容 == 期望。
+        ed.update(cx, |ed, _| {
+            ed.set_text("a\nb\n");
+            let ops = vec![(0..0, gpui::SharedString::from("+"))];
+            assert!(ed.apply_live_replay(&ops, "+a\nb\n"), "基线一致时应重放成功");
+            assert_eq!(ed.text_string(), "+a\nb\n", "重放后内容应等于期望全文");
+        });
+        // 终态错位：op 重放到本缓冲区的产物 != 期望（模拟外部漂移基线）→ 不改动、false。
+        ed.update(cx, |ed, _| {
+            ed.set_text("a\nb\n");
+            let before = ed.text_string();
+            let ops = vec![(0..0, gpui::SharedString::from("+"))];
+            assert!(
+                !ed.apply_live_replay(&ops, "+X\na\nb\n"),
+                "终态不符时应判定漂移并拒绝"
+            );
+            assert_eq!(ed.text_string(), before, "护栏失败不得改动缓冲区");
+        });
+        // 越界错位：op 区间超出当前文档尾 → 不改动、false。
+        ed.update(cx, |ed, _| {
+            ed.set_text("a\nb\n");
+            let before = ed.text_string();
+            let ops = vec![(99..120, gpui::SharedString::from("x"))];
+            assert!(
+                !ed.apply_live_replay(&ops, "x"),
+                "越界 op 应被护栏拒绝"
+            );
+            assert_eq!(ed.text_string(), before, "越界时不得改动缓冲区");
+        });
+        // 切中多字节字符：op 区间切破 UTF-8 字符边界 → 不改动、false。
+        ed.update(cx, |ed, _| {
+            ed.set_text("中文内容");
+            let before = ed.text_string();
+            let ops = vec![(1..2, gpui::SharedString::from("X"))];
+            assert!(
+                !ed.apply_live_replay(&ops, "X中文内容"),
+                "切中字符边界的 op 应被护栏拒绝"
+            );
+            assert_eq!(ed.text_string(), before, "切中字符时不得改动缓冲区");
+        });
+    });
+}
+
 

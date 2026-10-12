@@ -360,6 +360,14 @@ pub struct WyEditor {
     /// 同一撤销事务（连续打字 / 相邻退格 / 同点删除）；光标移动（`set_caret`/方向键
     /// `moved`）与整篇内容替换打断。
     last_edit: Option<(EditKind, usize, usize)>,
+    /// WYSIWYG「编辑日志」（方案2：切回编辑区按序重放，取代行级 diff 的主路径）。
+    /// `Some` = 正在收集（仅 live2 实例被 App 开启，`md_wy` 右栏预览等非 live 编辑不
+    /// 收集）；`None` = 关闭。收集内容 = `replace_range` / undo / redo 统一缴存的
+    /// `(字节区间, 新文本)` op——两者从同一「toggle ON 的源码 Rope 快照」起步、live 会话
+    /// 期间源码编辑区不被改写 → op 字节偏移在源码编辑区与 live2 坐标系恒等，按序重放
+    /// 即得最终态（整篇换源 `install_open` 时清空，防后台加载窗口内的陈旧 op 错位）。
+    /// 提交（App `commit_live`）取空后实体即销毁。
+    live_ops: Option<Vec<(Range<usize>, SharedString)>>,
     /// 当前悬浮的图片行 `src_line`（`on_mouse_move` 更新）。非 `None` 时该图片右上角
     /// 浮现「编辑」铅笔按钮（仅可编辑模式绘制/响应）。纯视图态，不进撤销栈。
     hover_image: Cell<Option<usize>>,
@@ -626,5 +634,10 @@ impl WyEditor {
     }
     pub(crate) fn test_theme_is_dark(&self) -> bool {
         self.theme.is_dark
+    }
+    /// （仅测试）当前缴存中的编辑日志 op 条数（未开启收集 = 0）。app 回归用实例级
+    /// 确定性断言「单字符恰 1 条 / 撤重混用恰 N 条 / 大粘贴单大 op」，不依赖进程级静态。
+    pub(crate) fn live_ops_len(&self) -> usize {
+        self.live_ops.as_ref().map_or(0, |v| v.len())
     }
 }

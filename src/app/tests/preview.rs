@@ -1244,12 +1244,14 @@
         let _ = std::fs::remove_file(&md);
     }
 
-    /// M：WYSIWYG 编辑过 → 切回不再整篇 `set_text`,而是按**行级 diff 增量写回**。
+    /// M：WYSIWYG 编辑过 → 切回不再整篇 `set_text`，而是按**编辑日志按序重放**
+    /// （方案2 op 主路径；护栏/无日志时才回退行级 diff `src/app/diff.rs`）。
     /// 在 WYSIWYG 里做多行编辑（开头插入一行 + 中部改一行）→ OFF → 断言：
     /// 1) 源码编辑区内容 == live2 最终文本（全量等价）；
-    /// 2) 走增量路径：`LIVE_COMMIT_DIFF_APPLIED` 前进、`LIVE_COMMIT_DIFF_HUNKS` 累计，
-    ///    **且整个切回期间 `CodeEditor::set_text`（reset_document 全量级联）未被调用**；
-    /// 3) 右栏只读预览 `md_wy` 也随 diff 对齐到最终文本；
+    /// 2) 走 op 重放路径：`LIVE_COMMIT_OPS_REPLAYED` 前进、`LIVE_COMMIT_OPS_COUNT` 累计
+    ///    ≥ 编辑条数，**且整个切回期间 `CodeEditor::set_text`（reset_document 全量级联）
+    ///    未被调用**；
+    /// 3) 右栏只读预览 `md_wy` 也随重放对齐到最终文本；
     /// 4) 切回后继续编辑/保存语义正常。
     #[gpui::test]
     async fn wysiwyg_toggle_off_edited_uses_incremental_diff(cx: &mut TestAppContext) {
@@ -1309,7 +1311,7 @@
             cx.run_until_parked();
         }
         // 采样切回前的探针与本 live2 最终文本。
-        let (expected, diff_applied_pre, diff_hunks_pre, wy_text_pre) = cx.update(|_w, cx| {
+        let (expected, ops_replayed_pre, ops_count_pre, wy_text_pre) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
             let l2 = t.live2.clone().expect("live2 应存在");
@@ -1317,9 +1319,9 @@
             let wy_text_pre = t.md_wy.clone().map(|w| w.read(cx).text().to_string());
             (
                 expected,
-                crate::app::preview::LIVE_COMMIT_DIFF_APPLIED
+                crate::app::preview::LIVE_COMMIT_OPS_REPLAYED
                     .load(std::sync::atomic::Ordering::Relaxed),
-                crate::app::preview::LIVE_COMMIT_DIFF_HUNKS
+                crate::app::preview::LIVE_COMMIT_OPS_COUNT
                     .load(std::sync::atomic::Ordering::Relaxed),
                 wy_text_pre,
             )
@@ -1328,7 +1330,7 @@
             expected.len() > src.len(),
             "多行编辑后 live2 文本应比源长（插入了一行）"
         );
-        // OFF：有改动 → 应走增量 diff 写回。
+        // OFF：有改动 → 应走编辑日志按序重放写回（op 主路径）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -1337,39 +1339,41 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let (committed, diff_applied_after, diff_hunks_after, wy_text_after) = cx.update(|_w, cx| {
-            let a = app.read(cx);
-            let t = &a.tabs[a.active_tab];
-            assert!(t.live2.is_none(), "切回后 live2 实体应已销毁");
-            assert!(
-                a.status.to_string().contains("内容已写回编辑区"),
-                "有改动切回应提示「已写回」，实际状态：{}",
-                a.status
-            );
-            let ed = editor.read(cx);
-            (
-                ed.value(),
-                crate::app::preview::LIVE_COMMIT_DIFF_APPLIED
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                crate::app::preview::LIVE_COMMIT_DIFF_HUNKS
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
-            )
-        });
-        assert_eq!(committed, expected, "增量写回后源码编辑区应与 live2 全文等价");
-        // 走增量 diff 路径（`apply_replaces` / `preview_apply_edit`，二者都不调用整篇
-        // `set_text` 的 reset_document 级联）——此探针只在 `commit_live` 有改动分支的
-        // 增量路径前进，故其推进即证明本次切回未走整篇 set_text 写回。
+        let (committed, ops_replayed_after, ops_count_after, wy_text_after) =
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                assert!(t.live2.is_none(), "切回后 live2 实体应已销毁");
+                assert!(
+                    a.status.to_string().contains("内容已写回编辑区"),
+                    "有改动切回应提示「已写回」，实际状态：{}",
+                    a.status
+                );
+                let ed = editor.read(cx);
+                (
+                    ed.value(),
+                    crate::app::preview::LIVE_COMMIT_OPS_REPLAYED
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    crate::app::preview::LIVE_COMMIT_OPS_COUNT
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
+                )
+            });
+        assert_eq!(committed, expected, "重放写回后源码编辑区应与 live2 全文等价");
+        // 走 op 重放路径（`apply_live_replay` → `apply_edit_synced`，不调用整篇 `set_text`
+        // 的 reset_document 级联）——此探针只在 `commit_live` 的 op 重放分支前进，故其
+        // 推进即证明本次切回未走整篇 set_text 写回。
         assert!(
-            diff_applied_after >= diff_applied_pre + 1,
-            "有改动切回应走增量 diff 写回路径（至少本用例一次）"
+            ops_replayed_after >= ops_replayed_pre + 1,
+            "有改动切回应走 op 重放写回路径（至少本用例一次）"
         );
         assert!(
-            diff_hunks_after > diff_hunks_pre,
-            "增量写回应实际产生 hunk（>0）"
+            ops_count_after >= ops_count_pre + 2,
+            "两次编辑应至少缴存 2 条 op（实际增量 {}）",
+            ops_count_after.saturating_sub(ops_count_pre)
         );
-        // 右栏只读预览随 diff 对齐到最终文本。live 期间右栏不镜像（保持源内容）——
-        // 切回后应被 diff 增量追平到最终文本。
+        // 右栏只读预览随重放对齐到最终文本。live 期间右栏不镜像（保持源内容）——
+        // 切回后应被逐 op 增量追平到最终文本。
         if let (Some(pre), Some(after)) = (wy_text_pre, wy_text_after) {
             assert_eq!(pre, src, "切回前右栏预览应仍是源内容（live 期间不镜像）");
             assert_eq!(after, expected, "切回后右栏预览应与最终文本一致");
@@ -1388,8 +1392,9 @@
         let _ = std::fs::remove_file(&md);
     }
 
-    /// M：单字符这类**行内小改动**切回也走增量 diff，且产出**少量** hunk
-    /// （行级前缀/后缀 + 有界 LCS，不整段替换）。源码编辑区内容与 live2 全文等价。
+    /// M：单字符这类**行内小改动**切回走**编辑日志重放**（方案2）且**恰缴存 1 条 op**
+    /// （`LIVE_COMMIT_OPS_COUNT` 增量 == 1），不再做行级 LCS / 整篇物化。源码编辑区
+    /// 内容与 live2 全文等价。
     #[gpui::test]
     async fn wysiwyg_toggle_off_one_char_edit_incremental(cx: &mut TestAppContext) {
         init_test(cx);
@@ -1447,8 +1452,16 @@
                 .text()
                 .to_string()
         });
-        let hunks_pre = crate::app::preview::LIVE_COMMIT_DIFF_HUNKS
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // 采样切回前（实例级，确定性）：编辑日志应恰 1 条 op。
+        let ops_len = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .live_ops_len()
+        });
+        assert_eq!(ops_len, 1, "单字符编辑应恰缴存 1 条 op，实际 {ops_len}");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.toggle_live_test(window, cx));
         });
@@ -1457,24 +1470,311 @@
             let _ = cx.cx.refresh();
             cx.run_until_parked();
         }
-        let (committed, hunks_after) = cx.update(|_w, cx| {
+        let (committed, replays, diffs) = cx.update(|_w, cx| {
             let ed = editor.read(cx);
             (
                 ed.value(),
-                crate::app::preview::LIVE_COMMIT_DIFF_HUNKS
-                    .load(std::sync::atomic::Ordering::Relaxed),
+                ed.live_replay_calls(),
+                ed.apply_replaces_calls(),
             )
         });
         assert_eq!(committed, expected, "单字符编辑切回应与 live2 全文等价");
-        // 单字符改动应只补几个 hunk（行级 diff 不该把整篇当一段替换）。
-        assert!(
-            hunks_after.saturating_sub(hunks_pre) <= 4,
-            "单字符切回应 ≤4 hunk，实际 {}",
-            hunks_after.saturating_sub(hunks_pre)
-        );
+        // 走 op 重放主路径（`apply_live_replay`），不经行级 diff 兜底（实例级探针）。
+        assert_eq!(replays, 1, "单字符改动切回应走 op 重放路径");
+        assert_eq!(diffs, 0, "单字符改动不应走 diff 兜底");
         let _ = std::fs::remove_file(&md);
     }
 
+    /// 方案2：**多次编辑 + 撤销/重做混用** → 编辑日志（含撤/重做的净逆操作缴存）按序
+    /// 重放后源码编辑区内容与 live2 全文等价（宏语义：撤/重做也是 op，按序重放即得最终态）。
+    /// 右栏只读预览也逐 op 对齐；`live_ops_len`（实例级）精确断言本次缴存 5 条。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_edits_undo_redo_replay_equivalent(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-undo-{}.md",
+            std::process::id()
+        ));
+        let src = "甲\n乙\n丙\n丁\n戊\n".repeat(8);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        // ON：进入 WYSIWYG（live2）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let live = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+        });
+        // 1) 开头插入一行；2) 中部改一处；3) 撤销第 2 笔；4) 重做第 2 笔；5) 再开头插入。
+        cx.update(|_w, cx| {
+            live.update(cx, |e, cx| e.replace_range(0..0, "前言\n", cx));
+        });
+        cx.update(|_w, cx| {
+            let t = live.read(cx).text().to_string();
+            let at = t.find('丙').expect("应有丙行");
+            live.update(cx, |e, cx| e.replace_range(at..at + 3, "丙X", cx));
+        });
+        cx.update(|_w, cx| live.update(cx, |e, cx| e.undo(cx)));
+        cx.update(|_w, cx| live.update(cx, |e, cx| e.redo(cx)));
+        cx.update(|_w, cx| {
+            live.update(cx, |e, cx| e.replace_range(0..0, "另一行\n", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (expected, wy_text_pre, ops_len) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let l2 = a.tabs[a.active_tab].live2.clone().expect("live2 应存在");
+            (
+                l2.read(cx).text().to_string(),
+                a.tabs[a.active_tab]
+                    .md_wy
+                    .clone()
+                    .map(|w| w.read(cx).text().to_string()),
+                l2.read(cx).live_ops_len(),
+            )
+        });
+        assert!(
+            expected.starts_with("另一行\n前言\n"),
+            "撤销/重做混用后的 live2 最终文本应如预期：{expected:?}"
+        );
+        // 本次缴存 5 条 op：2 次 insert + 1 次 replace + 1 次 undo + 1 次 redo（实例级）。
+        assert_eq!(
+            ops_len, 5,
+            "插入×2 + 改×1 + 撤×1 + 重×1 应恰缴存 5 条 op，实际 {ops_len}"
+        );
+        // OFF：有改动 → 编辑日志（含撤/重做 op）按序重放写回。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (committed, replays, wy_text_after) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            let ed = editor.read(cx);
+            (ed.value(), ed.live_replay_calls(), t.md_wy.clone().map(|w| w.read(cx).text().to_string()))
+        });
+        assert_eq!(committed, expected, "编辑日志（含撤/重做）重放后须与 live2 全文等价");
+        assert_eq!(replays, 1, "含撤/重做混用的切回应走 op 重放路径（实例级探针）");
+        if let (Some(pre), Some(after)) = (wy_text_pre, wy_text_after) {
+            assert_eq!(pre, src, "切回前右栏预览应仍是源内容（live 期间不镜像）");
+            assert_eq!(after, expected, "切回后右栏预览应逐 op 对齐到最终文本");
+        }
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 方案2：**大段粘贴单大 op** → 编辑日志恰 1 条且内容等价；(探针)走 op 重放而非
+    /// 行级 diff 兜底（实例级 `live_replay_calls == 1` / `apply_replaces_calls == 0`）。
+    /// 右栏预览随后逐 op 增量对齐（< 64KB 阈值）。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_large_paste_single_op_replay(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-big-{}.md",
+            std::process::id()
+        ));
+        let src = "# 原文\n首段。\n\n第二段。\n".repeat(5);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 大段粘贴：单条 replace_range 插入约 30KB（远大于单键 op，仍远低于 md_wy 整篇
+        // 兜底阈值 64KB → 右栏应走逐 op 增量对齐路径）。
+        let big = format!("## 大段\n{}\n", "粘贴内容行示例，中文与 ASCII 混排。\n".repeat(1000));
+        assert!(big.len() > 30_000, "粘贴内容应足够大：{}", big.len());
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            live.update(cx, |e, cx| e.replace_range(0..0, &big, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let expected = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        // 采样切回前（实例级）：大段粘贴应恰缴存 1 条 op（单大 op）。
+        let ops_len = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .live_ops_len()
+        });
+        assert!(expected.starts_with(&big), "大段粘贴应落到文档开头");
+        assert_eq!(ops_len, 1, "大段粘贴应恰缴存 1 条 op（单大 op），实际 {ops_len}");
+        // OFF：有改动 → 应走 op 重放（单大 op），而非行级 diff 兜底。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (committed, replays, diffs) = cx.update(|_w, cx| {
+            let ed = editor.read(cx);
+            (ed.value(), ed.live_replay_calls(), ed.apply_replaces_calls())
+        });
+        assert_eq!(committed, expected, "大段粘贴切回应与 live2 全文等价");
+        // （探针）走 op 重放主路径：`apply_live_replay` 成功 1 次、`apply_replaces` 兜底 0 次
+        // （实例级确定性计数，契合「护栏成功 → op 重放而非 diff」验收点）。
+        assert_eq!(replays, 1, "大段粘贴切回应走 op 重放路径（实例级探针）");
+        assert_eq!(diffs, 0, "大段粘贴切回不得走行级 diff 兜底");
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 方案2 护栏：**构造坐标系错位**（live 期间外部改写源码编辑区，模拟 CRLF/BOM/
+    /// 漏 op 等偏移漂移）→ `apply_live_replay` 干跑/长度栏失败、**不改动源码编辑区**，回退
+    /// 既有行级 diff 管道（实例级探针：`live_replay_calls == 0` / `apply_replaces_calls == 1`）；
+    /// 最终源码编辑区内容仍与 live2 全文等价。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_guard_falls_back_to_diff_on_drift(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-guard-{}.md",
+            std::process::id()
+        ));
+        let src = "line0\nline1\nline2\nline3\nline4\n".repeat(20);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 在 WYSIWYG 里做一笔开头插入（缴存 1 条 op）。
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            live.update(cx, |e, cx| e.replace_range(0..0, "插入行\n", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 构造错位：外部直接把源码编辑区整体换成「漂移」基线（≠ live2 的 toggle ON 快照）。
+        cx.update(|_w, cx| {
+            editor.update(cx, |ed, _| ed.set_text(&format!("漂移基线\n{src}")));
+        });
+        let expected = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        // 采样切回前（实例级）：up 日志确有 1 条 op（护栏将被触发，重放不应成功）。
+        let ops_len = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .live_ops_len()
+        });
+        assert_eq!(ops_len, 1, "错位用例也应先缴存编辑 op（实际 {ops_len}）");
+        // OFF：op 干跑自检失败 → 回退行级 diff（实例级探针：`apply_live_replay` 0 次 /
+        // `apply_replaces` 兜底 1 次），仍须追平到 live2 最终文本。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (committed, replays, diffs) = cx.update(|_w, cx| {
+            let ed = editor.read(cx);
+            (ed.value(), ed.live_replay_calls(), ed.apply_replaces_calls())
+        });
+        assert_eq!(committed, expected, "护栏回退 diff 后仍须与 live2 全文等价");
+        assert_eq!(replays, 0, "错位时不得走 op 重放路径（护栏应拦截）");
+        assert_eq!(diffs, 1, "错位时应回退走既有行级 diff 兜底（本用例一次）");
+        let _ = std::fs::remove_file(&md);
+    }
 
     /// Markdown 预览（分屏，统一组件 WyEditor 宿主）纵向滚动条拖拽：向下拖 -> 内容实时
     /// 向下滚，向上拖 -> 实时反向。回归：预览窗口模式拖拽只写共享 `desired`，render 逐帧
