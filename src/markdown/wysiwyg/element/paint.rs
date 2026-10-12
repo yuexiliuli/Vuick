@@ -643,7 +643,10 @@ pub(crate) fn paint_row_gutter(
         return;
     };
     let x0 = f32::from(origin.x + f.padding);
-    let center_y = f32::from(origin.y) + f32::from(row.top) + f32::from(row.height) / 2.;
+    // 垂直对齐**首可视行**（与 `paint_text_row` 画第一折行的几何同一推导；见
+    // `first_band_center_y`）。旧 `row.height/2` 是整块（折行各带之和）中点——折成
+    // N 行时标记会掉到第 N/2 折行行（有序长项 `1.` 跑到中间折行行的 bug 根源）。
+    let center_y = f32::from(origin.y) + first_band_center_y(row);
     // 与预览（view/row.rs）一致：项目符号 / 有序号 / 任务框都是正文色字形（☐/☑/•/N.）。
     // 警报（Alert）不画任何字形——它的 chrome（彩条 + 粗体标签 + 折叠箭头）由
     // `paint_alert_chrome` 单独画；这里若给 `•` 会在彩条与文字之间漏个黑点。

@@ -267,3 +267,71 @@ fn quote_band_covers_all_wrapped_text_right_edges(cx: &mut TestAppContext) {
         });
 }
 
+/// 防回归：行首装饰（有序号 `N.` / 项目符号 / 任务框）必须垂直对齐**首可视行文字中心**。
+/// 旧 `paint_row_gutter` 用 `row.height / 2`（整块各折行带之和的中点）当标记中心——折成
+/// N 行时标记掉到第 N/2 折行行（有序长项 `1.` 跑到中间折行行的 bug 根源；单行项因
+/// `height≈lh` 恰好看着对）。修复后标记中心 = `first_band_center_y`，恰为 `paint_text_row`
+/// 画第一折行的几何推导（`top + text_y_off + text_row_shift + lh/2`）。
+/// 同一「真实折行渲染路径」（`build_frame`）内锁定：长有序/无序/任务项各 ▶ 折成 ≥3 子行
+/// （测试前提）+ 首行中心断言（与 paint_text_row 同式）+ 旧公式偏离 ≥1 行高（证明断言
+/// 真能锁住「标记掉到中间折行行」的回归）；短项 ▶ 单行中心 = `top + lh/2`（修复前后一致）。
+#[gpui::test]
+fn list_marker_vertical_center_tracks_first_wrapped_line(cx: &mut TestAppContext) {
+    use super::{first_band_center_y, text_row_shift, text_y_off};
+    cx.update(crate::actions::bind_local_keymaps);
+    // 测试环境 CJK 字宽≈0，ASCII 才撑起折行：长项用 ASCII token 重复到必然折成多行，
+    // 短项保持单行（锁「单行行为不变」）。
+    let long = "word-1234567890 ".repeat(60);
+    let text = format!(
+        "1. 有序列表项 A {long}END\n- 无序列表项 B {long}END\n- [ ] 任务列表项 C {long}END\n2. 短项 END\n"
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text.as_str()));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(300.), (0., 999_999.));
+        let gutters: Vec<_> = frame
+            .rows
+            .iter()
+            .filter(|r| r.extra.gutter.is_some())
+            .collect();
+        assert!(
+            gutters.len() >= 4,
+            "应有 ≥4 个 gutter 行（有序长/无序长/任务长/短项），实际 {}",
+            gutters.len()
+        );
+        for (ix, row) in gutters.iter().enumerate() {
+            let w0 = row.wrapped.first().expect("gutter 行应有整形结果");
+            let top = f32::from(row.top);
+            let lh = f32::from(row.lh);
+            // paint_text_row 画第一折行的中心 = 首带起点 + 撑高下移 + 半行高。
+            let expect = top + text_y_off(row) + text_row_shift(row) + lh * 0.5;
+            let center = first_band_center_y(row);
+            assert!(
+                (center - expect).abs() < 0.5,
+                "[{ix}] 标记中心应=首行文字中心 {expect:.2}，实际 {center:.2}（top={top:.2} lh={lh:.2}）"
+            );
+            let sub_lines = w0.wrap_boundaries().len() + 1;
+            let old = top + f32::from(row.height) * 0.5;
+            if sub_lines >= 3 {
+                // 旧公式（height/2）落在 ≥2 子带 → 与首行中心差 ≥1 lh：此断言真能锁回归。
+                assert!(
+                    (old - expect).abs() >= lh - 0.5,
+                    "[{ix}] 折成 {sub_lines} 行时旧 height/2 应偏离首行中心 ≥1lh（差分 {:.2}）",
+                    (old - expect).abs()
+                );
+            } else {
+                // 短项（单行）：`height == lh` → 旧/新一致，修复后单行行为不变。
+                assert_eq!(sub_lines, 1, "[{ix}] 短项不应折行");
+                assert!(
+                    (old - expect).abs() < 0.5,
+                    "[{ix}] 单行项标记中心仍应=top+lh/2（修复前后一致），实际 {center:.2}"
+                );
+            }
+        }
+    });
+}
+

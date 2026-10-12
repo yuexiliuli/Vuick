@@ -61,6 +61,16 @@ pub(crate) fn text_y_off(row: &ShapedRow) -> f32 {
     }
 }
 
+/// 行首装饰（列表符号 / 有序号 / 任务框）应垂直对齐的「首可视行文字中心 y」
+/// （相对块 `top` 的偏移，px；绝对 y = 本值 + 帧 origin.y）：= 首带起点
+/// （[`text_y_off`]）+ 行内公式撑高下移（[`text_row_shift`]）+ 半行高。与
+/// `paint_text_row` 画第一折行的几何**同一推导**（首带内 `wrapped[0]` 的文本中心）。
+/// 整块 `height`（= 各折行带高之和）用于取块中点会把标记拉到第 N/2 折行行
+/// （多行列表项 `1.` 跑到中间折行行的 bug 根源）——标记垂直定位**禁用** `height`。
+pub(crate) fn first_band_center_y(row: &ShapedRow) -> f32 {
+    f32::from(row.top) + text_y_off(row) + text_row_shift(row) + f32::from(row.lh) / 2.
+}
+
 /// 表格单元格源区间与选区的交集 → `(渲染内起始字节, 渲染内结束字节)`。
 /// `map` = 单元格 `TableCellLayout.map`（渲染字节→源字节，相对该行行首，末项哨兵）；
 /// `cell_src` 相对行首；`row_line_start` = 该源行的**绝对**行首；`sel` = 全局源选区
