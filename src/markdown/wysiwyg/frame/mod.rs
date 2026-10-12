@@ -515,6 +515,22 @@ fn band_hit_test(
     shape_key: u64,
 ) -> (Vec<usize>, std::collections::HashMap<usize, std::rc::Rc<ShapedRow>>) {
     let mut row_cache = editor.shape_rows.borrow_mut();
+    // notdef/回退自愈判决（settled/verified/attempts）只应随**真实代**（内容/图片/数学/
+    // mermaid 缩放）变化而作废。`shape_key` 只含「宽度 ^ mermaid 缩放」——纯宽度换代
+    // （如点击清帧后 measure 以 800/806 两宽反复建帧）不代表字形解析换代：回退/notdef
+    // 判决与折行宽无关。旧实现 `key_mismatch` 直接作废判决，导致点击书尾注释章时 800 宽
+    // 建帧把整章已校验的回退判决清掉 → 下一 806 建帧重新走 `fallback-verify`「首排不缓存
+    // →冷却→次排」，而首排回退字形宽不稳定（实测 [!90] 行 776 vs 782，一个字形 advance
+    // 差 6px）→ 同一文本在相邻帧按两种 wrap 显示（句号跨行翻转＝用户所见抖动）。
+    let gen_changed = editor.frame.borrow().as_ref().is_some_and(|f| {
+        (f.rgen, f.igen, f.mgen, f.zgen)
+            != (
+                editor.content_gen(),
+                editor.images_gen(),
+                editor.math_gen(),
+                editor.mermaid_zoom_gen(),
+            )
+    });
     let mut need_row: Vec<usize> = Vec::new();
     let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
         std::collections::HashMap::new();
@@ -533,11 +549,12 @@ fn band_hit_test(
                 hit_map.insert(k, rc);
             }
         } else {
-            // 缓存 miss。若存在**旧键**条目（内容/图片/数学/宽度换代把旧行逐出），旧
-            // `settled/verified/attempts` 判决对应的是上一代结果——可能在图片解码卡顿窗口
-            // 里留下（.notdef 预算烧光→settled / 非零占位字形→verified），换代重排前作废，
-            // 让本块按新代重新校验/重试。图片加载完成的 `igen` 换代重建会走到这里 → 自愈。
-            if row_cache.key_mismatch(cid, shape_key) {
+            // 缓存 miss。**真实代**变化（图片解码完成 igen / 内容编辑 rgen / 数学就绪
+            // mgen 等，见上方 `gen_changed`）时，旧条目的 `settled/verified/attempts` 判决
+            // 可能对应退化窗口 → 作废让本块按新代重新校验/重试（换代自愈）；纯宽度换代
+            // 不作废（字形解析与折行宽无关，见 `gen_changed` 注释——否则点击重建触发
+            // fallback-verify 冷却重装 → 首排不稳定宽度两态翻转）。
+            if gen_changed && row_cache.key_mismatch(cid, shape_key) {
                 editor.clear_stale_verdicts(k);
             }
             need_row.push(k);

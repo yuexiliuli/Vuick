@@ -191,6 +191,21 @@ impl NotdefRetry {
         self.last.remove(&block);
     }
 
+    /// 干净排成功后的收尾：清 notdef 重试循环（attempts/cooling/settled/last），
+    /// **保留**回退校验标记 `verified`。同一（text,font,runs）的回退字形解析与折行宽无关，
+    /// 一次校验即长期有效（`verified` 的原始语义就是「已做第二次真实重排、此后直接走正常
+    /// 缓存」）。若连 verified 一起清掉，任何一次缓存 miss 重建（滚动/点击清帧/宽度换代）
+    /// 都会重新走 `fallback-verify`「首排不缓存→冷却→次排」——而首排回退字形 advance 不稳定
+    /// （真机实测书尾注释章 [!90] 行 776 vs 782，差 6px）→ 同一行相邻帧按两种 wrap 显示
+    /// （句号跨行翻转）。`clear_stale`（换代）/`retain_prefix`（编辑）才是 verified 的正确
+    /// 回收点。
+    pub(crate) fn clear_notdef_keep_verified(&mut self, block: usize) {
+        self.attempts.remove(&block);
+        self.cooling.remove(&block);
+        self.settled.remove(&block);
+        self.last.remove(&block);
+    }
+
     /// 「换代」作废：块被**新代**键重新整形前，清掉上一代的判决（attempts/settled/
     /// verified/last），**保留**冷却位——冷却帧仍复用上一份几何，换代重排不闪跳。
     /// 作用：图片解码完成触发 `igen` 换代重建时，若某块曾在 DWrite 退化期（解码卡顿

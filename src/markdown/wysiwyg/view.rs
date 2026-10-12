@@ -412,8 +412,13 @@ impl WyEditor {
         self.notdef_retry.borrow().settled.contains(&block)
     }
 
+    /// 干净排成功后清 notdef 重试态（attempts/cooling/settled/last），**保留**回退校验标记
+    /// `verified`——同一（text,font,runs）的回退字形解析与折行宽无关，一次校验后续所有
+    /// 重建直接复用稳定形状；若清掉 verified，任何缓存 miss（点击清帧/宽度换代/滚动）都会
+    /// 重新走 `fallback-verify` 首排（不缓存、advance 不稳定）→ 书尾注释章点击时相邻帧
+    /// wrap 两态翻转（见 `NotdefRetry::clear_notdef_keep_verified` 文档与 `band_hit_test`）。
     pub(crate) fn clear_notdef(&self, block: usize) {
-        self.notdef_retry.borrow_mut().clear_block(block);
+        self.notdef_retry.borrow_mut().clear_notdef_keep_verified(block);
     }
 
     /// 换代自愈：块被新代键重排前清掉上一代判决（attempts/settled/verified/last），
