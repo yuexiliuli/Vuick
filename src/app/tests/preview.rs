@@ -49,6 +49,84 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// Step2：大文档 md 冷开「打开即骨架占位」——右栏 `md_wy` 未就绪（后台整篇解析在途）
+    /// 时渲染「正在排版 Markdown 预览…」占位（打开一瞬间即有视觉内容，不再右栏全白等
+    /// 几秒）；`install_open`（`is_loaded()==true`）后同一帧起切回正式宿主——占位外框与
+    /// 正式宿主同名（`#preview-md-wy`），切替不改变窗口列宽布局。
+    ///
+    /// 测试说明：本测试钩子的 `run_until_parked` 会一次排空全部后台任务，真实 open_file
+    /// 的「首块已挂、解析在途」窗口无法在帧间观察到 → 用**等价状态布置**（`ensure_md_wy
+    /// (feed=false)` 建空壳 = 大文档首块挂载后的待装配态）走真实渲染路径断言占位 →
+    /// 就绪切换；真实 open 的「提前解析装好 + EOF 不重复 install」另由
+    /// `large_md_open_early_install_skips_eof_double` 覆盖。
+    #[gpui::test]
+    async fn md_wy_pending_placeholder_renders_until_loaded(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 建「空壳未装」的右栏 WyEditor：等价大文档打开首块挂载后、整篇解析完成前。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                app.ensure_md_wy(idx, window, cx, false);
+                // 等价大文档 md 打开：预览打开（空壳已建、正文待后台装）。
+                app.tabs[idx].preview_on = true;
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (loaded,) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let wy = a.tabs[a.active_tab].md_wy.clone().expect("空壳应已创建");
+            (wy.read(cx).is_loaded(),)
+        });
+        let (label_shown, scroll_shown) = (
+            cx.debug_bounds("md-wy-pending-label").is_some(),
+            cx.debug_bounds("md-wy-scroll").is_some(),
+        );
+        assert!(!loaded, "空壳应处于未就绪");
+        assert!(
+            label_shown && !scroll_shown,
+            "md_wy 未就绪时应渲染「正在排版」占位（#md-wy-pending-label），且不得出现正式宿主 #md-wy-scroll"
+        );
+        // 就绪：install 全量 → 下一帧起正式宿主出现、占位消失。
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                let wy = app.tabs[app.active_tab].md_wy.clone().unwrap();
+                wy.update(cx, |ed, _cx| {
+                    ed.install_open(crate::markdown::wysiwyg::WyEditor::open_from_str(
+                        "# 就绪正文\n\n解析完成后的预览内容。\n".into(),
+                    ));
+                });
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (loaded,) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let wy = a.tabs[a.active_tab].md_wy.clone().expect("md_wy 应仍在");
+            (wy.read(cx).is_loaded(),)
+        });
+        let (label_shown, scroll_shown) = (
+            cx.debug_bounds("md-wy-pending-label").is_some(),
+            cx.debug_bounds("md-wy-scroll").is_some(),
+        );
+        assert!(loaded, "install_open 后应就绪");
+        assert!(
+            scroll_shown && !label_shown,
+            "就绪后应渲染正式宿主（#md-wy-scroll），占位消失"
+        );
+    }
+
     /// 回归（用户拍板方案「右侧明显留白」）：右栏 WyEditor 预览宿主（`#md-wy-body`）
     /// 给内容**右侧**留出明显可感的间距——`.md` 预览标题/正文最右字不贴右缘、不被自绘
     /// 滚动条带盖住。宿主水平内衬走**单一来源** `PREVIEW_SIDE_GAP_PX`（与 `markdown::view`
@@ -2768,5 +2846,281 @@
         println!("【A·after】切回同步路径（写回+物化，不含 Drop）≈ {off_ms} ms");
         println!("【A·before 参考】旧 GUI 实测 ≈63ms（1 字符，HEAD~0 提交文档）＝本 after + 被移出的实体 Drop ~36ms");
         let _ = std::fs::remove_file(&md);
+    }
+
+    /// Step3：大文档 md 冷开「首块 prefix 首装」——`md_wy_spawn_prefix_install`
+    /// 后台 `open_from_rope(首块 rope 快照)` + `install_open` → **首屏即真内容**
+    ///（`is_loaded()==true`、内容 == 首块 prefix），并置「整篇在途」标记
+    /// `md_wy_pending_full=(代号, prefix_len)`。测试钩子的 `run_until_parked` 一次排空
+    /// 全部后台任务、看不到真实 open 的「prefix 已装、整篇未到」中间窗口（Step2 已遇），
+    /// 用**等价状态布置**（编辑器 rope = 首块内容 + 空壳 md_wy + `md_wy_early=Pending`）
+    /// 走真实渲染路径（`open_from_rope` → `install_open`）断言 prefix 首装。
+    #[gpui::test]
+    async fn md_wy_prefix_first_install_shows_content(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 首块内容（≈几十 KB）：线 4i 为 `## 标题`（块起点），与真实 ChunkReader 首块同为
+        // 「行完整、LF 归一」文本。
+        let prefix = (0..1600)
+            .map(|i| format!("## 标题 {i}\n\n正文段 {i}。\n\n"))
+            .collect::<String>();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                let rope = ropey::Rope::from(prefix.as_str());
+                app.tabs[idx].editor.update(cx, |ed, cx| {
+                    ed.set_rope_with_stats(rope.clone(), 0, Default::default());
+                    cx.notify();
+                });
+                app.ensure_md_wy(idx, window, cx, false);
+                app.tabs[idx].preview_on = true;
+                // 等价 `md_wy_spawn_early_install` 启动后（代号 = ensure_md_wy 已 invalidate →
+                // seq=1；整篇在途、未编辑）。
+                app.tabs[idx].md_wy_early = Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
+                app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
+            });
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (loaded, text, pending, early) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            let wy = a.tabs[i].md_wy.clone().expect("prefix 首装前应已建空壳");
+            (
+                wy.read(cx).is_loaded(),
+                wy.read(cx).text().to_string(),
+                a.tabs[i].md_wy_pending_full,
+                a.tabs[i].md_wy_early,
+            )
+        });
+        assert!(loaded, "prefix 首装应 `install_open`（loaded=true），首屏立刻真内容");
+        assert_eq!(text, prefix, "首屏预览内容应 = 首块 prefix（编辑器 rope 快照）");
+        assert_eq!(
+            pending,
+            Some((1, prefix.len())),
+            "prefix 首装后应置「整篇在途」标记 (代号, prefix_len)"
+        );
+        assert_eq!(
+            early,
+            Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 }),
+            "整篇仍应在途（prefix 首装不消费 early 状态）"
+        );
+    }
+
+    /// Step3：整篇就绪后 `md_wy_install_full_swap` **带守卫换入全文 + 滚动锚**——换入前
+    /// 顶行 `src_line` 在换入后保持不变（视觉不跳），内容 == 全文，`md_wy_early=Done`、
+    /// `md_wy_pending_full=None`（整篇已装，增量桥恢复）。真实渲染路径：prefix 首装 →
+    /// 编辑器与预览同滚到标题线 300（块起点）→ 换入全文 → 逐帧刷新断言锚定。
+    #[gpui::test]
+    async fn md_wy_full_swap_anchors_top_src_line(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let full = (0..2200)
+            .map(|i| format!("## 标题 {i}\n\n正文段 {i}。\n\n"))
+            .collect::<String>();
+        let prefix = (0..1600)
+            .map(|i| format!("## 标题 {i}\n\n正文段 {i}。\n\n"))
+            .collect::<String>();
+        assert!(prefix.len() < full.len(), "prefix 应为全文真前缀");
+        let target_line = 300usize; // 4*75 → `## 标题 75`（块起点，prefix / full 同名同列）
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                let rope = ropey::Rope::from(prefix.as_str());
+                app.tabs[idx].editor.update(cx, |ed, cx| {
+                    ed.set_rope_with_stats(rope.clone(), 0, Default::default());
+                    cx.notify();
+                });
+                app.ensure_md_wy(idx, window, cx, false);
+                app.tabs[idx].preview_on = true;
+                app.tabs[idx].md_wy_early =
+                    Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
+                app.md_wy_spawn_prefix_install(idx, rope.clone(), 1, cx);
+            });
+        });
+        // prefix 就绪并渲染（宿主帧建立 → viewport_top 推入）。
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 预览与编辑器同滚到目标标题线（对齐 app 双向滚动同步，避免它在测试内互拉）。
+        cx.update(|_, cx| {
+            let (mdw, ed) = {
+                let a = app.read(cx);
+                let idx = a.active_tab;
+                (
+                    a.tabs[idx].md_wy.clone().unwrap(),
+                    a.tabs[idx].editor.clone(),
+                )
+            };
+            mdw.update(cx, |w, _| w.set_scroll_target(target_line));
+            ed.update(cx, |ed, _| ed.scroll_to_line(target_line));
+        });
+        let mut before: Option<usize> = None;
+        for _ in 0..30 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            before = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.active_tab;
+                a.tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
+            });
+            // 首帧 viewport_top 还是旧值（0），advance_pending_scroll 逐帧重钉后收敛。
+            if before.is_some_and(|b| b != 0) {
+                break;
+            }
+        }
+        let before = before.expect("预览滚动后应有顶行 src_line");
+        assert!(
+            before != 0,
+            "滚动到标题 300 后顶行不应为 0（实际 {before}）"
+        );
+        // 整篇就绪 → 带守卫换入全文（同 `md_wy_spawn_early_install` 完成回调的落地）。
+        let wy_open = crate::markdown::wysiwyg::WyEditor::open_from_str(full.clone().into());
+        cx.update(|_, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                let wy = app.tabs[idx].md_wy.clone().unwrap();
+                app.md_wy_install_full_swap(idx, &wy, wy_open, cx);
+            });
+        });
+        let mut after: Option<usize> = None;
+        for _ in 0..30 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            after = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.active_tab;
+                a.tabs[i].md_wy.as_ref().unwrap().read(cx).top_source_line()
+            });
+            // 换入后由 advance_pending_scroll 重钉回锚点；收敛到 before 即稳定。
+            if after == Some(before) {
+                break;
+            }
+        }
+        let (after, text, early, pending) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            let wy = a.tabs[i].md_wy.as_ref().unwrap();
+            (
+                after,
+                wy.read(cx).text().to_string(),
+                a.tabs[i].md_wy_early,
+                a.tabs[i].md_wy_pending_full,
+            )
+        });
+        assert_eq!(after, Some(before), "整篇换入后顶行 src_line 应锚定不变（视觉不跳）");
+        assert_eq!(text, full, "整篇换入后预览内容应 == 全文");
+        assert_eq!(
+            early,
+            Some(crate::app::MdWyEarly::Done),
+            "整篇换入应置 md_wy_early = Done（EOF 收尾据此跳过重复 install）"
+        );
+        assert_eq!(pending, None, "整篇已装 → 解除「整篇在途」标记（增量桥恢复逐键）");
+    }
+
+    /// Step3：prefix 首装后用户**编辑** → `sync::on_editor_edited` 不得把编辑区坐标增量
+    /// 打到 prefix（预览 ≠ 编辑区，会错位）；应作废在途整篇 + 以当前编辑区 Rope 异步整篇
+    /// 重喂（`md_wy_feed_full_rope`），装好后预览 == 编辑区，此后退化逐键增量——**不装旧**。
+    /// 等价状态布置：编辑器 rope = 全文、预览 = 仅 prefix（`md_wy_pending_full` 在途），
+    /// 真实 `Paste` 落进编辑区触发增量桥，断言最终预览恒 == 编辑区。
+    #[gpui::test]
+    async fn md_wy_prefix_edit_revokes_full_and_sync_refeeds(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let full = (0..2200)
+            .map(|i| format!("## 标题 {i}\n\n正文段 {i}。\n\n"))
+            .collect::<String>();
+        let prefix = (0..1600)
+            .map(|i| format!("## 标题 {i}\n\n正文段 {i}。\n\n"))
+            .collect::<String>();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                // 编辑器 rope = 全文（等价「编辑区已追加超出 prefix」）；预览只装 prefix。
+                let rope_full = ropey::Rope::from(full.as_str());
+                app.tabs[idx].editor.update(cx, |ed, cx| {
+                    ed.set_rope_with_stats(rope_full.clone(), 0, Default::default());
+                    cx.notify();
+                });
+                app.ensure_md_wy(idx, window, cx, false);
+                app.tabs[idx].preview_on = true;
+                app.tabs[idx].md_wy_early =
+                    Some(crate::app::MdWyEarly::Pending { seq: 1, edit_version: 0 });
+                let rope_prefix = ropey::Rope::from(prefix.as_str());
+                app.md_wy_spawn_prefix_install(idx, rope_prefix.clone(), 1, cx);
+            });
+        });
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 前置断言：预览 = prefix（已装、整篇在途），与编辑区长度不等。
+        let (pre_loaded, pre_pending, pre_len) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            let wy = a.tabs[i].md_wy.as_ref().unwrap();
+            (wy.read(cx).is_loaded(), a.tabs[i].md_wy_pending_full, wy.read(cx).len())
+        });
+        assert!(pre_loaded, "prefix 应已 install（loaded）");
+        assert_eq!(pre_pending, Some((1, prefix.len())));
+        assert!(pre_len < full.len(), "预览=prefix 应短于编辑区全文");
+        // 真实编辑：聚焦编辑区 + 粘贴（走 EditorEvent::Edited → 增量桥）。
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("早编插入".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (wy_text, ed_text, pending, loaded) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.active_tab;
+            let wy = a.tabs[i].md_wy.as_ref().unwrap();
+            (
+                wy.read(cx).text().to_string(),
+                a.tabs[i].editor.read(cx).value(),
+                a.tabs[i].md_wy_pending_full,
+                wy.read(cx).is_loaded(),
+            )
+        });
+        assert!(loaded);
+        assert!(
+            ed_text.starts_with("早编插入") || ed_text.contains("早编插入"),
+            "编辑区应含粘贴内容（实际前 20 字符 {:?}）",
+            &ed_text[..ed_text.len().min(20)]
+        );
+        assert_eq!(
+            wy_text, ed_text,
+            "pending_full 期间编辑 → 应作废在途整篇 + 以当前编辑区全文重喂（预览恒 == 编辑区，\
+             不装旧、不把增量错位打到 prefix）"
+        );
+        assert_eq!(
+            pending, None,
+            "编辑触发的整篇重喂落地后（小 rope 同步装）应解除在途标记"
+        );
     }
 

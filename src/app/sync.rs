@@ -58,15 +58,26 @@ impl EditorApp {
             tab.editor.update(cx, |ed, _| ed.take_last_edit())
         };
         if let Some((s, oe, ne)) = dirty_range {
-            let tab = &mut self.tabs[tab_ix];
             // A3 逐键增量桥：右栏 WyEditor 预览（若该选项卡有）重放**同一次**编辑
             // （src 字节区间 `[s, oe)` → 编辑后新文本 `[s, ne)`），走 WyEditor 增量管线
             //（Doc::edit + Pass1 + derived），大文档每键 ≈0.4ms——预览恒等于编辑区。
-            if let Some(wy) = tab.md_wy.clone() {
-                let ed = tab.editor.clone();
+            if let Some(wy) = self.tabs[tab_ix].md_wy.clone() {
+                let ed = self.tabs[tab_ix].editor.clone();
                 let new_text = ed.read(cx).rope().slice(s..ne).to_string();
                 if wy.read(cx).is_loaded() {
-                    wy.update(cx, |w, cx| w.preview_apply_edit(s..oe, &new_text, cx));
+                    // Step3：整篇在途（`md_wy_pending_full`：预览=prefix、编辑区逐块追加中）
+                    // 或预览长度 ≠ 编辑区 → 增量桥坐标会错位，**禁止**把编辑区坐标增量打到
+                    // 当前预览；改以当前编辑区 Rope（O(1) COW 快照）**异步整篇重喂**（带装配
+                    // 代号守卫，作废在途整篇/prefix），装好后预览 == 编辑区，此后的编辑退化
+                    // 逐键增量——编辑过的整篇离散弃，不装旧。
+                    let stale = self.tabs[tab_ix].md_wy_pending_full.is_some()
+                        || wy.read(cx).len() != ed.read(cx).rope().len();
+                    if stale {
+                        let rope = ed.read(cx).rope().clone();
+                        self.md_wy_feed_full_rope(tab_ix, rope, cx);
+                    } else {
+                        wy.update(cx, |w, cx| w.preview_apply_edit(s..oe, &new_text, cx));
+                    }
                 } else {
                     // 自愈：异步装配尚未完成用户已编辑 → 一次性从当前编辑区全文补齐
                     //（O(n) 仅此一次），此后退化到逐键增量（防空壳上重放错位）。

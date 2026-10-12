@@ -204,11 +204,14 @@
             wy_ready = cx.update(|_, cx| {
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
-                a.tabs[i]
-                    .md_wy
-                    .as_ref()
-                    .map(|w| w.read(cx).is_loaded())
-                    .unwrap_or(false)
+                // Step2：提前整篇解析可先于编辑区收尾装好预览 → 逐键一致性（m==e）必须
+                // 等**打开流水线整体完成**（open_finish_count>=1 ⇒ 编辑区已全文落定）。
+                a.open_finish_count >= 1
+                    && a.tabs[i]
+                        .md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false)
             });
             if wy_ready {
                 break;

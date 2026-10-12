@@ -155,6 +155,14 @@ struct EditorTab {
     /// （增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配（代号
     /// 不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。随选项卡搬迁。
     md_wy_install_seq: usize,
+    /// Step2：大文档 md「打开即提前整篇解析」在途状态（见 [`MdWyEarly`]）。随选项卡搬迁。
+    md_wy_early: Option<MdWyEarly>,
+    /// Step3：右栏 `md_wy`「整篇在途」标记：`Some((装配代号, prefix 字节长))` = 预览
+    /// 当前只装了**首块 prefix**（已 `is_loaded`，首屏即真内容），整篇后台解析在途——
+    /// 此期间预览 ≠ 编辑区全文，`sync` 增量桥**禁止**把编辑区坐标增量打到 prefix（会
+    /// 错位），改走「作废在途整篇 + 异步整篇重喂」；整篇就绪带守卫换入全文后置 `None`
+    /// （恢复逐键增量）。随选项卡搬迁。
+    md_wy_pending_full: Option<(usize, usize)>,
     /// 编辑版本号：每次内容变更 +1。编辑区⇄预览滚动同步用它判断「画面/内容是否有新
     /// 编辑需重建同步基线」。
     edit_version: u64,
@@ -186,6 +194,11 @@ pub(crate) struct DetachedTab {
     /// B3：随选项卡搬迁（承接在途后台装配的标记与代号，防搬迁后旧完成回调被误丢）。
     md_wy_pending: Option<(usize, SharedString)>,
     md_wy_install_seq: usize,
+    /// Step2：随选项卡搬迁（承接提前整篇解析在途状态，防搬迁后 EOF 让位/回退判断错位）。
+    md_wy_early: Option<MdWyEarly>,
+    /// Step3：随选项卡搬迁（承接「整篇在途、prefix 已装」标记，防搬迁后 sync 把增量
+    /// 错位打到 prefix）。
+    md_wy_pending_full: Option<(usize, usize)>,
     /// P4-1：EPUB 内存图片表随选项卡搬迁（与 `md_wy` 宿主共用）。
     epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// P4-2：EPUB 注记正文表随选项卡搬迁（`ensure_epub_wy` → `set_notes` 用）。
@@ -213,6 +226,24 @@ const DRIVEN_EDITOR_MAX_AWAIT: u32 = 8;
 #[derive(Clone)]
 pub(crate) enum MdTocScroll {
     Unified(gpui::Entity<WyEditor>),
+}
+
+/// Step2/3：大文档 md「打开即提前后台整篇解析」（与分块读盘并行、不等 EOF）在途状态。
+/// 首块挂载后立即启动（`file_ops::apply_open_chunk` → `md_wy_spawn_early_install`）；
+/// **Step3 两阶段**：先由 `md_wy_spawn_prefix_install` 装首块 prefix（首屏真内容、置
+/// `md_wy_pending_full`），整篇就绪后本路径**带守卫换入全文**（滚动锚按 src_line 钉顶行），
+/// 置 [`Self::Done`]。EOF 收尾（`finish_file_text`）据此**跳过重复 install**
+/// （[`Self::Pending`]/[`Self::Done`] 时让位早期装配，不再重复
+/// 整篇 `Doc::open`），[`Self::Failed`]/`None` 才回退走既有 EOF 整篇装配（兜底）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MdWyEarly {
+    /// 在途：`seq` = 启动时装配代号、`edit_version` = 启动时编辑版本（此后用户编辑 →
+    /// 完成回调按代号/版本双守卫丢弃在途整篇，避免把「装旧」覆盖用户改动）。
+    Pending { seq: usize, edit_version: u64 },
+    /// 已由提前解析装配完成（全文就绪）。
+    Done,
+    /// 提前读盘/解析失败（EOF 回退走既有整篇装配兜底）。
+    Failed,
 }
 
 /// 选项卡拖拽携带的数据：目标选项卡下标 + 当前显示名（拖拽幽灵视图用它画“小胶囊”）。

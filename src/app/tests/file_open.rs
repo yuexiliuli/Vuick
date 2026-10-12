@@ -845,7 +845,10 @@
                 let a = app.read(cx);
                 let i = a.tabs.len().saturating_sub(1);
                 let t = &a.tabs[i];
+                // Step2：提前整篇解析可能先于编辑区收尾装好预览 → 就绪必须等**编辑区也
+                // 全文落定**（预览全文 = 编辑区全文的唯一判据在两者都完成之后成立）。
                 !t.editor_pending
+                    && t.editor.read(cx).value() == content
                     && t.md_wy
                         .as_ref()
                         .map(|w| w.read(cx).is_loaded())
@@ -869,6 +872,206 @@
             )
         });
         assert_eq!(wy_text, ed_text, "大 md WyEditor 预览应覆盖完整源（与编辑区一致）");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Step2：大文档 md 冷开「提前开跑 + EOF 收尾**不双 install、不竞态**」。真实异步
+    /// 流水线全流程断言：右栏预览由「打开即提前整篇解析」装好（`md_wy_early == Done`——
+    /// EOF 收尾让位不重复 install），`open_finish_count == 1`，且预览全文 == 编辑区全文
+    /// == 源文件。
+    #[gpui::test]
+    async fn large_md_open_early_install_skips_eof_double(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-large-md-early-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let content = (0..4800)
+            .map(|i| {
+                format!(
+                    "# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调*、`行内代码` 与 [链接](https://x.y)。\n\n"
+                )
+            })
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试 md 应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let t = &a.tabs[i];
+                !t.editor_pending
+                    && t.editor.read(cx).value() == content
+                    && a.open_finish_count >= 1
+                    && t.md_wy
+                        .as_ref()
+                        .map(|w| w.read(cx).is_loaded())
+                        .unwrap_or(false)
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 300 {
+                panic!("大 md 打开/预览装配超时：{frames} 帧");
+            }
+        }
+        let (early, finish, wy_text, ed_text) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            (
+                a.tabs[i].md_wy_early,
+                a.open_finish_count,
+                a.tabs[i]
+                    .md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                a.tabs[i].editor.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(
+            early,
+            Some(crate::app::MdWyEarly::Done),
+            "整篇解析应由「提前开跑」路径装好（EOF 收尾让位不重复 install）"
+        );
+        assert_eq!(finish, 1, "EOF 收尾应仍执行 1 次（统计/状态用，预览让位）");
+        assert_eq!(ed_text, content, "编辑区应全文落定");
+        assert_eq!(wy_text, ed_text, "预览全文应 == 编辑区全文");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    /// Step2：大文档冷开中用户**提前编辑** → 在途的「提前整篇解析」不得装旧（装配代号/
+    /// edit_version 双守卫丢弃）。真实路径：首块挂载后编辑编辑区（真实 `Paste` →
+    /// `EditorEvent::Edited` → `edit_version`+1；若尚未装好则 `sync` 自愈喂源一次）→
+    /// 泵到打开收尾。断言（时序无关，按最终状态分叉）：
+    /// - 提前整篇已装（`Done`）→ 其后编辑全走增量，预览恒 == 编辑区；
+    /// - 提前整篇被编辑拦截 → 丢弃（`md_wy_early == None`、不得拖延为 Done/Failed），
+    ///   **绝不**装旧覆盖用户改动；两种时序下 `open_finish_count` 都是 1、无崩溃。
+    #[gpui::test]
+    async fn large_md_open_edit_during_parse_no_stale_install(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-large-md-edit-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let content = (0..4800)
+            .map(|i| {
+                format!(
+                    "# 大标题 {i}\n\n这是第 {i} 段正文，包含 *强调*、`行内代码` 与 [链接](https://x.y)。\n\n"
+                )
+            })
+            .collect::<String>();
+        assert!(
+            content.len() > crate::config::limits::OPEN_ASYNC_MIN_BYTES as usize,
+            "测试 md 应超过后台打开阈值，实际 {} B",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        // 泵到首块挂载（编辑器有内容、md_wy 已建）即编辑——不必等整篇解析。
+        let mut first = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            first = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let t = &a.tabs[i];
+                !t.editor_pending && t.editor.read(cx).value().len() > 0
+            });
+            if first {
+                break;
+            }
+        }
+        assert!(first, "首块应在 200 帧内挂载");
+        // 真实编辑路径：聚焦编辑区 + 粘贴（走 `EditorEvent::Edited` → edit_version +1）。
+        cx.update(|window, cx| {
+            let focus = app.read(cx).editor_focus_handle(cx);
+            window.focus(&focus, cx);
+        });
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("早编插入".to_string()));
+        cx.dispatch_action(Paste);
+        for _ in 0..10 {
+            cx.run_until_parked();
+        }
+        // 泵到收尾（编辑区落定全文 + 编辑增量）。
+        let extra = "早编插入".len();
+        let mut done = false;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            done = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                let t = &a.tabs[i];
+                a.open_finish_count >= 1 && t.editor.read(cx).value().len() >= content.len() + extra
+            });
+            if done {
+                break;
+            }
+        }
+        assert!(done, "打开收尾应在 300 帧内完成");
+        let (early, finish, wy_text, ed_text) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let i = a.tabs.len().saturating_sub(1);
+            (
+                a.tabs[i].md_wy_early,
+                a.open_finish_count,
+                a.tabs[i]
+                    .md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                a.tabs[i].editor.read(cx).value().to_string(),
+            )
+        });
+        assert_eq!(finish, 1, "EOF 收尾应仍执行 1 次");
+        assert!(ed_text.contains("早编插入"), "编辑区应含提前编辑内容");
+        if matches!(early, Some(crate::app::MdWyEarly::Done)) {
+            // 提前整篇已装 → 后续编辑全走增量，预览应恒等于编辑区（含全文 + 编辑）。
+            assert_eq!(
+                wy_text, ed_text,
+                "提前已装 + 编辑走增量：预览应恒等于编辑区（装旧/回滚即失败）"
+            );
+        } else {
+            // 提前整篇被编辑拦截丢弃：不得拖延为 Done/Failed、不得装旧覆盖。
+            assert!(
+                matches!(early, None),
+                "编辑应拦截在途提前整篇（md_wy_early 应复位为 None，实际 {early:?}）"
+            );
+        }
         let _ = std::fs::remove_file(&dir);
     }
 

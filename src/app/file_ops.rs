@@ -244,7 +244,20 @@ impl EditorApp {
         // B3：文件换源会同步改写右栏 md_wy（install_open）→ 先作废任何在途后台装配
         //（否则旧切回装配在文件打开完成后把新打开的整篇覆盖回去）。仅 markdown 才喂
         // md_wy；此处提前作废不影响「本次 install_open」——它走同步、代号已换代。
-        if Self::is_markdown_path(p) {
+        // Step2：**打开即提前整篇解析**（`md_wy_early` Pending/Done）在途 → EOF 收尾让位：
+        // 首块挂载时 `ensure_md_wy` 已作废过陈旧在途，此处**不再 invalidate**（否则会把
+        // 在途的早期解析丢弃，白做一次整篇 Doc::open），本次 EOF 也不重复 install（见下）。
+        let early_live = Self::is_markdown_path(p)
+            && self
+                .tabs
+                .get(idx)
+                .is_some_and(|t| {
+                    matches!(
+                        t.md_wy_early,
+                        Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
+                    )
+                });
+        if Self::is_markdown_path(p) && !early_live {
             self.md_wy_invalidate_async(idx);
         }
         let Some(tab) = self.tabs.get_mut(idx) else {
@@ -263,11 +276,16 @@ impl EditorApp {
         // A4 脱离：MD 不再喂 MarkdownPreview / 登记增量基底（预览统一走 md_wy）——
         // 后台预建的 `WyOpenResult` 一次性 `install_open` 装配右栏 WyEditor 预览
         // （UI 线程只做 O(块) 换源重置，不背 Doc::open）。
+        // Step2：早期解析在途/已装（early_live）→ 本次 EOF **跳过重复 install**
+        //（`md_wy_open` 已按早装让位传 None；早期完成后自会 install）。
         if Self::is_markdown_path(p)
             && tab.preview_on
+            && !early_live
             && let Some(ed) = tab.md_wy.clone()
             && let Some(wy) = md_wy_open {
                 ed.update(cx, |ed, _| ed.install_open(wy));
+                // Step3：EOF 兜底整篇装配落地 → 整篇已装，解除「整篇在途」标记。
+                tab.md_wy_pending_full = None;
             }
         if std::env::var_os("MD_OPEN_DEBUG").is_some() {
             // 诊断“拖到底不到底”：量程就绪后的纵向总高。编辑器精确时应 ≈ 行数×行高；
@@ -400,7 +418,23 @@ impl EditorApp {
                 // A4：MD 后台预建右栏 WyEditor 预览的整篇 `Doc::open`（快照 rope O(1)
                 // 克隆）——**不再 scan_blocks 喂 MarkdownPreview**（MD 已走统一组件，
                 // 省第二次扫块 + 一份 BlockIndex/源副本；本份 Doc 即预览唯一解析态）。
-                let md_wy_open = if is_md {
+                // Step2：若「打开即提前整篇解析」已在途/已装（Pending/Done）→ 收尾让位
+                // 它 install（本处不再快照编辑区 rope、不再重复整篇 Doc::open，避免双装）。
+                // Failed / 未启动（空文件等）→ 走既有 EOF 整篇装配兜底。
+                let early_live = is_md
+                    && cx
+                        .update_window_entity(&entity, |this, _w, _cx| {
+                            this.tabs.get(idx).is_some_and(|t| {
+                                matches!(
+                                    t.md_wy_early,
+                                    Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Done)
+                                )
+                            })
+                        })
+                        .unwrap_or(false);
+                let md_wy_open = if early_live {
+                    None
+                } else if is_md {
                     let p_snap = p.clone();
                     let snap = cx
                         .update_window_entity(&entity, move |this, _w, cx| {
@@ -514,6 +548,15 @@ impl EditorApp {
                 line_width_histogram: hist,
             };
             self.load_file_text(idx, p, prep, window, cx, true);
+            // Step2/3：md 大文档「打开即」后台整篇解析（与后续分块追加并行，不再等 EOF
+            // 才开跑 Doc::open）——先**首块 prefix 首装**（编辑区 rope O(1) COW 快照 →
+            // 后台 `open_from_rope` + install，首屏立刻真内容），再整篇续读/续解析；整篇
+            // 就绪后带守卫换入全文。EOF 收尾（`finish_file_text`）据此跳过重复 install。
+            if Self::is_markdown_path(p) {
+                let prefix = self.tabs[idx].editor.read(cx).rope().clone();
+                let full_seq = self.md_wy_spawn_early_install(idx, p.to_path_buf(), cx);
+                self.md_wy_spawn_prefix_install(idx, prefix, full_seq, cx);
+            }
             // 首块后内容已可见，但整篇仍在读盘 → 保持「正在打开」，读完置最终态。
             if let Some(tab) = self.tabs.get(idx) {
                 self.status = SharedString::from(format!("正在打开大文档：{}…", p.display()));

@@ -336,6 +336,12 @@ impl EditorApp {
         grow: f32,
     ) -> gpui::AnyElement {
         let ed = self.md_wy_preview().expect("调用方已判定走 WyEditor 预览");
+        // Step2：大文档异步整篇解析在途（`md_wy` 空壳尚未 `install_open`）→ 渲染
+        // 「正在排版 Markdown 预览…」占位——打开一瞬间右栏即有视觉内容，不再全白
+        // 等整篇 Doc::open。解析一完成（`is_loaded()==true`）下一帧自动切回正式宿主。
+        if !ed.read(cx).is_loaded() {
+            return self.md_wy_pending_placeholder(fullscreen, grow);
+        }
         let fs = self.font_size;
         let vhand = self.tabs[self.active_tab].md_wy_vscroll.clone();
         let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
@@ -412,6 +418,51 @@ impl EditorApp {
             .child(scroll)
             .child(vscrollbar_overlay)
             .child(zoom_overlay)
+            .into_any_element()
+    }
+
+    /// Step2：右栏 `md_wy` 未就绪（大文档后台整篇解析在途）时的「正在排版」占位。
+    /// 布局对齐 [`Self::render_editor_pending`]（flex 居中 + 主题 muted 文字）；**容器**形态
+    /// 对齐 `md_wy_host_children` 外层（同一 `preview-md-wy` / `fullscreen-preview` 容器 id
+    /// 与 `flex_grow/shrink/basis/min_w` 参数），占位→内容切换不改变窗口列宽布局。样式全走
+    /// `ui::theme` token（`panel_bg` / `text_minor`），禁止散落 rgba。
+    fn md_wy_pending_placeholder(&self, fullscreen: bool, grow: f32) -> gpui::AnyElement {
+        let panel_bg = self.panel_bg();
+        let muted = self.text_minor();
+        let label = div()
+            .id("md-wy-pending-label")
+            .debug_selector(|| "md-wy-pending-label".into())
+            .text_color(muted)
+            .text_size(px(13.))
+            .child("正在排版 Markdown 预览…");
+        if fullscreen {
+            return div()
+                .id("fullscreen-preview")
+                .debug_selector(|| "fullscreen-preview".into())
+                .size_full()
+                .relative()
+                .bg(panel_bg)
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(label)
+                .into_any_element();
+        }
+        div()
+            .id("preview-md-wy")
+            .debug_selector(|| "preview-md-wy".into())
+            .relative()
+            .flex_grow(grow)
+            .flex_shrink_1()
+            .flex_basis(px(0.))
+            .min_w(px(0.))
+            .bg(panel_bg)
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(label)
             .into_any_element()
     }
 
