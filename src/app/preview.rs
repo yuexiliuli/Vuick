@@ -20,6 +20,19 @@ const MD_WY_DIFF_MAX_SPAN_BYTES: usize = 64 * 1024;
 /// 无「旧→新」等待窗口）。
 const MD_WY_ASYNC_INSTALL_MIN_BYTES: usize = 512 * 1024;
 
+/// I2：右栏预览「Scrub 延后」进入判定的连续跨块帧下限。预览连续 ≥ 此帧数快速跨块
+/// （右栏拖滚动条 / 高频滚屏）即判定为 Scrub 期——期内的编辑区 `scroll_to_line` 跟随
+/// **延后**到静止后一次收敛，消除「拖动每帧嵌编辑器全窗重建」的 28ms/帧卡顿
+/// （D1：ed.build_rows+prepaint+paint ≈11ms 叠加 WYSIWYG ~17ms）。低频单步滚屏
+/// 跨块数不足、不触发，保持慢滚逐帧对齐。
+const SCRUB_ENTER_STREAK: u32 = 2;
+/// Scrub 延后期内「预览静止」的收敛帧数：预览连续 ≥ 此帧数不再跨块（拖条松手 /
+/// 快速连滚停下）即**一次收敛**到延后期内最新预览顶块。帧数与墙钟兜底二者取先到。
+const SCRUB_IDLE_FRAMES: u32 = 2;
+/// Scrub 延后期内「预览静止」的收敛墙钟兜底：即使渲染帧稀疏（静止后无持续重绘），
+/// 距上次跨块 ≥ 此时长后任一后续同步帧都会一次收敛，避免两栏长期错位。
+const SCRUB_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// 测试探针（`cfg(test)`）：B3 **后台异步整篇装配**发起次数——大跨度切回登记
 /// `open_from_str` 后台解析（而非同步整篇 `set_source_text`）的路径计数。回归测试
 /// 据此断言「大段切回同步路径不再 O(n) 解析」。
@@ -161,18 +174,42 @@ impl EditorApp {
             driven_preview_target: None,
             driven_editor_target: None,
             driven_editor_await: 0,
+            scrub: false,
+            scrub_streak: 0,
+            scrub_idle_frames: 0,
+            scrub_target: None,
+            scrub_last_cross: std::time::Instant::now(),
         };
         return;
     }
     let prev = self.md_scroll_sync;
     self.md_scroll_sync.editor_block = editor_block;
     self.md_scroll_sync.preview_block = preview_block;
+
+    // I2 Scrub 检测前置量：预览本帧是否「自主跨块」（顶块较上帧变化，且**不是**编辑器
+    // 主导下的预览到达——编辑器驱动预览期 `driven_preview_target=Some`，到达帧绝不计入
+    // Scrub，防编辑器→预览对齐被误判成拖动）。逐帧维护连续跨块计数（非连续即清零），
+    // 供进入延后判定用；同时刷新墙钟兜底时间戳。
+    let preview_moved = self.md_scroll_sync.driven_preview_target.is_none()
+        && prev.preview_block != preview_block
+        && preview_block != self.md_scroll_sync.driven_preview_target;
+    if preview_moved {
+        self.md_scroll_sync.scrub_streak = self.md_scroll_sync.scrub_streak.saturating_add(1);
+        self.md_scroll_sync.scrub_last_cross = std::time::Instant::now();
+    } else {
+        self.md_scroll_sync.scrub_streak = 0;
+    }
+
     let Some(eb) = editor_block else { return };
     if preview_block == Some(eb) {
         // 两侧同一块，已同步：作废「等待预览到达」与「等待编辑器到达」的驱动目标（已对齐）。
+        // Scrub 延后态一并退出（preview_moved=false 帧已把 streak 清零）。
         self.md_scroll_sync.driven_preview_target = None;
         self.md_scroll_sync.driven_editor_target = None;
         self.md_scroll_sync.driven_editor_await = 0;
+        self.md_scroll_sync.scrub = false;
+        self.md_scroll_sync.scrub_idle_frames = 0;
+        self.md_scroll_sync.scrub_target = None;
         return;
     }
     // 我方正在驱动编辑器到达 `driven_editor_target`：期间 editor_block 的连续变化是
@@ -181,7 +218,9 @@ impl EditorApp {
     // 宽限期内只计数，超限才放手交给正常双向同步（防永远到不了目标时停摆）。
     if prev.editor_block != editor_block {
         if self.md_scroll_sync.driven_editor_target.is_some() {
-            // 我方驱动编辑器落位中：抑制回声，只给宽限计数；超限才放手交给正常双向同步。
+            // 我方驱动编辑器落位中（含 Scrub 收敛 / 进入延后前的最后一次跟随落位）：
+            // 抑制回声，只给宽限计数；超限才放手交给正常双向同步。**不**清 Scrub——
+            // 延后期内编辑器落位余波不得把延后态打断（防拖动中延后被落位逐帧打断）。
             // 注意：放手时**不得**顺便重钉预览（会把预览拉回，重蹈回声之弊）——清标后由
             // 后续帧的正常判定接管（真用户滚编辑器 → 下一帧 editor_block 再变 → 正常驱动
             // 预览；边界块卡住 → 编辑器不再变 → 安静保持，不再互拉）。
@@ -193,27 +232,68 @@ impl EditorApp {
             }
             return;
         }
-        // 编辑器先动（无我方驱动在途 = 用户滚动）→ 预览跟到编辑器顶行所在块。
+        // 编辑器真正用户滚动（无我方驱动在途且不在 Scrub 延后期）→ 预览跟到编辑器
+        // 顶行所在块；Scrub 延后不适用，退出。
+        self.md_scroll_sync.scrub = false;
+        self.md_scroll_sync.scrub_idle_frames = 0;
+        self.md_scroll_sync.scrub_target = None;
         // **不能在本帧 render 直接调** `scroll_to_line`（宿主 `ScrollHandle::set_offset`
         // 在渲染期会被本帧布局复位）：只把目标行写进 WY 的 `scroll_target`，由其元素
         // prepaint 逐帧重钉宿主偏移直到稳住（有 [`WyEditor::SCROLL_TARGET_MAX_APPLIES`]
         // 兜底）。记录「等待预览到达」目标：预览重钉落位到它时不被误判为预览用户滚动。
         md.update(cx, |v, _| v.set_scroll_target(eb));
         self.md_scroll_sync.driven_preview_target = Some(eb);
-    } else if let Some(pb) = preview_block
-        && prev.preview_block != preview_block
-        // 预览落位到「我方正在驱动的预览目标」= 编辑器主导下的跟随，不反向拉动。
-        && preview_block != self.md_scroll_sync.driven_preview_target
-    {
-        // 预览先动 → 编辑器跟到预览顶块起点。
-        editor.update(cx, |ed, _| ed.scroll_to_line(pb));
-        // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
-        // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
-        // 目标作废。
-        self.md_scroll_sync.driven_editor_target = Some(pb);
-        self.md_scroll_sync.driven_editor_await = 0;
-        self.md_scroll_sync.editor_block = Some(pb);
+    } else if self.md_scroll_sync.scrub && !preview_moved {
+        // Scrub 延后期内预览已静止（拖条松手 / 连滚停下）：静止帧计数推进，达到帧数
+        // 或墙钟阈值（二者取先到）即**一次收敛**到延后期内最新预览顶块，恢复双侧对齐
+        // （收敛后由正常双向同步照常跟进——幂等，目标已到即静止）。
+        self.md_scroll_sync.scrub_idle_frames += 1;
+        if self.md_scroll_sync.scrub_idle_frames >= SCRUB_IDLE_FRAMES
+            || self.md_scroll_sync.scrub_last_cross.elapsed() >= SCRUB_IDLE
+        {
+            if let Some(t) = self.md_scroll_sync.scrub_target {
+                editor.update(cx, |ed, _| ed.scroll_to_line(t));
+                self.md_scroll_sync.driven_editor_target = Some(t);
+                self.md_scroll_sync.driven_editor_await = 0;
+                self.md_scroll_sync.editor_block = Some(t);
+                self.md_scroll_sync.driven_preview_target = None;
+            }
+            self.md_scroll_sync.scrub = false;
+            self.md_scroll_sync.scrub_idle_frames = 0;
+            self.md_scroll_sync.scrub_target = None;
+        }
+    } else if preview_moved {
+        // 预览自主跨块 → 预览主导。统一收尾：旧等待预览目标作废。
         self.md_scroll_sync.driven_preview_target = None;
+        if self.md_scroll_sync.scrub {
+            // 延后期内继续跨块：只推进收敛目标（最新预览顶块），**不逐帧**驱动编辑器
+            // （延后的全部意义所在：拖动中不再每帧嵌编辑器全窗重建）。`driven_editor_target`
+            // 保持不动——延后期前的最后一次跟随落位（若有）仍由 `driven_editor_await` 收敛。
+            // **不预填 editor_block**：延后期内编辑器未被驱动，顶块就按实读数，避免伪造
+            // 「编辑器在动」触发上方分支二、把延后态打断。
+            self.md_scroll_sync.scrub_target = preview_block;
+            self.md_scroll_sync.scrub_idle_frames = 0;
+            return;
+        }
+        if self.md_scroll_sync.scrub_streak >= SCRUB_ENTER_STREAK {
+            // 连续跨块（拖动 / 高频滚屏）→ 进入 Scrub 延后：本次起编辑器跟随延后到
+            // 静止后一次收敛。首/低频单次跨块不满足连跨阈值，仍走下方立即跟随。
+            // 同理不预填 editor_block（编辑器未被驱动，看实读数）。
+            self.md_scroll_sync.scrub = true;
+            self.md_scroll_sync.scrub_idle_frames = 0;
+            self.md_scroll_sync.scrub_target = preview_block;
+            return;
+        }
+        // 首次/低频跨块：照常立即跟随（同块内微滚 / 慢速单步滚仍逐帧对齐，行为不变）。
+        if let Some(pb) = preview_block {
+            editor.update(cx, |ed, _| ed.scroll_to_line(pb));
+            // 预置编辑器基线为驱动目标：编辑器下一帧实际到位即与基线一致，不再被误判
+            // 成「编辑器用户主动滚动」而把预览拽回（来回跳动）；预览现为主导，旧等待
+            // 目标作废。
+            self.md_scroll_sync.driven_editor_target = Some(pb);
+            self.md_scroll_sync.driven_editor_await = 0;
+            self.md_scroll_sync.editor_block = Some(pb);
+        }
     } else if self.md_scroll_sync.driven_preview_target.is_none()
         // 预览已稳定（上帧到本帧未变）：
         && prev.preview_block == preview_block

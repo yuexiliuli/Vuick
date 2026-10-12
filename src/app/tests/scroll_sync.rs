@@ -230,6 +230,289 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// I2：右栏预览**拖动中**编辑区跟随被延后——高跨块系列 tick（真实 MouseDown +
+    /// 连续 Move，每帧跨大量块 = 拖动每步连跨）下编辑器 scroll 只更新首次、随后进入
+    /// 延后**不逐帧**跟随（消除「每帧嵌编辑器全窗重建」的 28ms/帧卡顿）；停止滚动
+    /// 但**不松手** → 按静止帧阈值（/墙钟兜底，取先到）**一次收敛**到最终预览顶块
+    /// （覆盖「静止 150-250ms 取先到」的静止路径，不依赖 mouse-up）。
+    #[gpui::test]
+    async fn preview_fast_scrub_defers_editor_follow_then_converges(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-sync-scrub-{}.md",
+            std::process::id()
+        ));
+        let mut doc = String::new();
+        for i in 0..60 {
+            doc.push_str(&format!("# 大标题 {i}\n\n正文章节 {i}。\n\n"));
+        }
+        std::fs::write(&md, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (editor, mdw) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].editor.clone(),
+                a.tabs[a.active_tab].md_wy.clone().expect("预览应在场"),
+            )
+        });
+        let overlay = cx
+            .debug_bounds("md-wy-vscrollbar-overlay")
+            .expect("预览滚动条叠层应渲染");
+        let x = overlay.right() - px(8.);
+        let grab_y = overlay.top() + px(14.);
+        cx.simulate_mouse_down(gpui::point(x, grab_y), MouseButton::Left, Default::default());
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 连续快速下拖：逐帧一笔（只 refresh 单帧推进——完整 park 会排空落位/跟随、
+        // 退化成慢速步进而测不出延后；自绘滚动条 prepaint 帧级落地 pending_target，
+        // 与 `scrollbar_drag_defers_then_converges_on_release` 同路径）。
+        for step in 1..=8 {
+            let y = overlay.top() + px(70.0 * step as f32);
+            cx.simulate_mouse_move(gpui::point(x, y), MouseButton::Left, Default::default());
+            let _ = cx.cx.refresh();
+        }
+
+        // 拖动中（尚无静止帧）：编辑器顶块应明显落后于预览最终顶块（延后生效）。
+        let (editor_top_drag, preview_pb_drag) = cx.update(|_, cx| {
+            let et = editor.read(cx).viewport_top_line();
+            let pb = mdw.read(cx).top_source_line();
+            (et, pb)
+        });
+        let final_pb = preview_pb_drag.expect("预览帧应就绪");
+        let editor_block_drag = cx.update(|_, cx| mdw.read(cx).block_start_of_line(editor_top_drag));
+        assert!(
+            final_pb >= 20,
+            "预览应已被拖到深处（final_pb={final_pb}）——夹具无效则断言无从谈起"
+        );
+        assert!(
+            final_pb.saturating_sub(editor_block_drag) >= 12,
+            "拖动中编辑器不应逐帧跟随（preview 顶块 {final_pb} vs editor 顶块 {editor_block_drag}）：延后失效时二者接近",
+        );
+
+        // 停止移动但**不松手** → 静止帧阈值内一次收敛到最终预览顶块（±1 块对齐）。
+        let mut converged: Option<(usize, usize)> = None;
+        for _frame in 0..40 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let (et, ps) = cx.update(|_, cx| {
+                let et = editor.read(cx).viewport_top_line();
+                (et, mdw.read(cx).top_source_line())
+            });
+            if let Some(ps) = ps {
+                let eb = cx.update(|_, cx| mdw.read(cx).block_start_of_line(et));
+                if eb.abs_diff(ps) <= 1 {
+                    converged = Some((eb, ps));
+                    break;
+                }
+            }
+        }
+        let (eb_done, ps_done) =
+            converged.expect("静止后编辑器应一次收敛到预览最终顶块（有界 40 帧）");
+        assert!(
+            ps_done >= final_pb.saturating_sub(2),
+            "收敛目标应为延后期最终预览块（final={final_pb}, got={ps_done}）"
+        );
+        assert!(
+            eb_done.abs_diff(ps_done) <= 1,
+            "收敛后两侧同块（editor={eb_done} vs preview={ps_done}）"
+        );
+        // 清理：补发 mouse_up 结束拖拽态（避免拖条状态残留影响后续测试）。
+        cx.simulate_mouse_up(
+            gpui::point(x, overlay.top() + px(560.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// I2：右栏**拖滚动条**真实事件路径（MouseDown / 连续 Move / Up）：拖动中编辑区
+    /// 跟随延后（连续多笔快速跨块），松手（mouse-up）预览静止后一次收敛到最终预览
+    /// 顶块。复用自绘滚动条（`#md-wy-vscrollbar-overlay`）与真实事件分发，与
+    /// `preview_scroll_drives_editor` 同路径但模拟**连续快速**拖动。
+    #[gpui::test]
+    async fn preview_scrollbar_drag_defers_then_converges_on_release(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-sync-scrub-release-{}.md",
+            std::process::id()
+        ));
+        let mut doc = String::new();
+        for i in 0..60 {
+            doc.push_str(&format!("# 大标题 {i}\n\n正文章节 {i}。\n\n"));
+        }
+        std::fs::write(&md, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (editor, mdw) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].editor.clone(),
+                a.tabs[a.active_tab].md_wy.clone().expect("预览应在场"),
+            )
+        });
+        let overlay = cx
+            .debug_bounds("md-wy-vscrollbar-overlay")
+            .expect("预览滚动条叠层应渲染");
+        let x = overlay.right() - px(8.);
+        let grab_y = overlay.top() + px(14.);
+        cx.simulate_mouse_down(gpui::point(x, grab_y), MouseButton::Left, Default::default());
+        for _ in 0..2 {
+            cx.run_until_parked();
+        }
+        // 连续快速下拖：逐帧一笔（只 refresh 单帧推进；完整 park 会排空落位/跟随、
+        // 退化成慢速步进而测不出延后）。
+        for step in 1..=8 {
+            let y = overlay.top() + px(70.0 * step as f32);
+            cx.simulate_mouse_move(gpui::point(x, y), MouseButton::Left, Default::default());
+            let _ = cx.cx.refresh();
+        }
+        // 拖动中（未松手）：编辑器不得逐帧跟到预览深处。
+        let (editor_top_drag, preview_pb_drag) = cx.update(|_, cx| {
+            let et = editor.read(cx).viewport_top_line();
+            let pb = mdw.read(cx).top_source_line();
+            (et, pb)
+        });
+        let final_pb = preview_pb_drag.expect("预览帧应就绪");
+        let editor_block_drag = cx.update(|_, cx| mdw.read(cx).block_start_of_line(editor_top_drag));
+        assert!(
+            final_pb >= 20,
+            "预览应已被拖到深处（final_pb={final_pb}）——夹具无效则断言无从谈起"
+        );
+        assert!(
+            final_pb.saturating_sub(editor_block_drag) >= 12,
+            "拖动中（未松手）编辑器不应逐帧跟随（preview 顶块 {final_pb} vs editor 顶块 {editor_block_drag}）",
+        );
+
+        // 松手 + 静止：一次收敛到最终预览顶块（±1 块对齐）。
+        cx.simulate_mouse_up(
+            gpui::point(x, overlay.top() + px(560.)),
+            MouseButton::Left,
+            Default::default(),
+        );
+        let mut converged: Option<(usize, usize)> = None;
+        for _frame in 0..40 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let (et, ps) = cx.update(|_, cx| {
+                let et = editor.read(cx).viewport_top_line();
+                (et, mdw.read(cx).top_source_line())
+            });
+            if let Some(ps) = ps {
+                let eb = cx.update(|_, cx| mdw.read(cx).block_start_of_line(et));
+                if eb.abs_diff(ps) <= 1 {
+                    converged = Some((eb, ps));
+                    break;
+                }
+            }
+        }
+        let (eb_done, ps_done) =
+            converged.expect("松手后编辑器应一次收敛到预览最终顶块（有界 40 帧）");
+        assert!(
+            ps_done >= final_pb.saturating_sub(2),
+            "收敛目标应为延后期最终预览块（final={final_pb}, got={ps_done}）"
+        );
+        assert!(
+            eb_done.abs_diff(ps_done) <= 1,
+            "松开后两侧同块（editor={eb_done} vs preview={ps_done}）"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// I2：速度边界——低频**单次**跨块（慢速单步滚 / 同块内微滚）**不**被误判为拖动：
+    /// 单笔跨块照常立即跟随（与旧行为一致，编辑区逐帧对齐），不进入延后。
+    #[gpui::test]
+    async fn slow_single_preview_cross_follows_immediately(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-sync-scrub-slow-{}.md",
+            std::process::id()
+        ));
+        let mut doc = String::new();
+        for i in 0..60 {
+            doc.push_str(&format!("# 大标题 {i}\n\n正文章节 {i}。\n\n"));
+        }
+        std::fs::write(&md, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (editor, mdw) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            (
+                a.tabs[a.active_tab].editor.clone(),
+                a.tabs[a.active_tab].md_wy.clone().expect("预览应在场"),
+            )
+        });
+        let vhand = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_wy_vscroll.clone()
+        });
+        let max = cx.update(|_w, _cx| vhand.max_offset().y.as_f32().max(100.0));
+
+        // 单笔跨块 + 完整排空（慢速单步滚语义）：不进入延后，编辑器逐帧对齐。
+        vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(-max * 0.3)));
+        let mut converged: Option<(usize, usize)> = None;
+        for _frame in 0..30 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            let (et, ps) = cx.update(|_, cx| {
+                let et = editor.read(cx).viewport_top_line();
+                (et, mdw.read(cx).top_source_line())
+            });
+            if let Some(ps) = ps {
+                let eb = cx.update(|_, cx| mdw.read(cx).block_start_of_line(et));
+                if eb.abs_diff(ps) <= 1 {
+                    converged = Some((eb, ps));
+                    break;
+                }
+            }
+        }
+        assert!(
+            converged.is_some(),
+            "单次跨块应照常立即跟随并对齐（不进入延后；速度相关边界）"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// WYSIWYG（原生 `ScrollHandle` 宿主）滚动条拖拽：向下拖 -> 内容应**实时**向下滚，
     /// 向上拖 -> 实时反向滚。回归：自绘滚动条拖动只写 `live_vscroll` + notify，若宿主
     /// 原生滚动容器没有重渲染，内容会只在松开后才跳（用户报告「从上到下要松开才动」）。

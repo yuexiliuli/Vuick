@@ -307,6 +307,23 @@ struct MdScrollSync {
     /// 顶行读取可能滞后/抖动一帧到数帧，期间回显必须被抑制；超过宽限才放手让正常
     /// 双向同步接管（防编辑器永远到不了目标时同步停摆）。
     driven_editor_await: u32,
+    /// 右栏预览「Scrub 延后」在途（I2）：预览被快速拖动 / 高频滚屏**连续跨块**时置
+    /// 真，期内的编辑区 `scroll_to_line` 跟随**延后**（不逐帧嵌编辑器全窗重建）；
+    /// 预览静止（松手 / 停滚）后一次收敛到最终目标，恢复双侧对齐。
+    scrub: bool,
+    /// 进入 Scrub 的连续「预览跨块」帧计数：由同步函数逐帧维护（`preview_moved`
+    /// 连续即累加、中断即清零），达到 [`crate::app::preview::SCRUB_ENTER_STREAK`]
+    /// 才进入延后——低频单步滚屏不触发，保持慢滚逐帧对齐。
+    scrub_streak: u32,
+    /// Scrub 延后期内「预览静止」的连续帧计数：达到
+    /// [`crate::app::preview::SCRUB_IDLE_FRAMES`]（或墙钟兜底）即一次收敛。
+    scrub_idle_frames: u32,
+    /// Scrub 延后的收敛目标 = 延后期内最新一次预览顶块（松手/静止后编辑器一次
+    /// 收敛到它）。
+    scrub_target: Option<usize>,
+    /// 距上次预览跨块的墙钟（静止收敛的墙钟兜底，见
+    /// [`crate::app::preview::SCRUB_IDLE`]；帧稀疏时保证仍会收敛）。
+    scrub_last_cross: std::time::Instant,
 }
 
 impl Default for MdScrollSync {
@@ -319,6 +336,11 @@ impl Default for MdScrollSync {
             driven_preview_target: None,
             driven_editor_target: None,
             driven_editor_await: 0,
+            scrub: false,
+            scrub_streak: 0,
+            scrub_idle_frames: 0,
+            scrub_target: None,
+            scrub_last_cross: std::time::Instant::now(),
         }
     }
 }
