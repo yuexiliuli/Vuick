@@ -1400,28 +1400,60 @@ fn paint_text_selection_hl(
     hl: Hsla,
     window: &mut Window,
 ) {
+    // EPUB 行对齐（逐带移量，选区同 paint_text_row 的同一带同一 x；普通行 = 0）。
+    let aln0 = f32::from(r.align_offsets.first().copied().unwrap_or(px(0.)));
+    let rects = text_selection_hl_rects(e, r, range, f32::from(f.padding), aln0);
+    for (x, y, w) in rects {
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(
+                point(origin.x + px(x), origin.y + px(y)),
+                size(px(w), r.lh),
+            ),
+            corner_radii: gpui::Corners::default(),
+            background: hl.into(),
+            border_widths: gpui::Edges::default(),
+            border_color: gpui::Hsla::default(),
+            border_style: gpui::BorderStyle::Solid,
+        });
+    }
+}
+
+/// 普通文本行选区高亮的逐可视行背景矩形（几何纯函数，paint 与回归测试共用）。
+/// 返回 `(x, y, w)`：x/y 相对帧原点（x 已含帧内衬 `pad` + 行级缩进 `r.x_off` +
+/// 该行对齐移量 `aln0`；y 已含 `r.top` + 图片题注下移 + 行内公式撑高的垂直居中下移），
+/// w 为矩形宽，高恒为 `r.lh`（由调用方按整行高画）。
+///
+/// 折行续行的几何坑（本函数修复的 bug）：`position_for_index` 对「恰为换行边界字节」
+/// 的索引会把它归到**上一可视行右缘**（行末判定用排除式 `>`）——若直接拿它当行首
+/// 起点，整行选中时续行的高亮会缩成右端竖条。因此每个可视行 `[a, b2)` 的左缘在
+/// `c0 == a`（选区从此行行首开始）时取 x=0，行内其余字节才用 `position_for_index`。
+pub(crate) fn text_selection_hl_rects(
+    e: &WyEditor,
+    r: &ShapedRow,
+    range: &Range<usize>,
+    pad: f32,
+    aln0: f32,
+) -> Vec<(f32, f32, f32)> {
     let ls = e.line_start(r.src_line);
     let le = e.line_end(r.src_line).max(ls);
     let from = range.start.max(ls).min(le);
     let to = range.end.max(ls).min(le);
     if to <= from {
-        return;
+        return Vec::new();
     }
     let d0 = source_to_display(&r.byte_map, from - ls);
     let d1 = source_to_display(&r.byte_map, to - ls);
     let Some(w0) = r.wrapped.first() else {
-        return;
+        return Vec::new();
     };
     let len = w0.len().max(1);
     let d0 = d0.min(len);
     let d1 = d0.max(d1.min(len));
     if d1 <= d0 {
-        return;
+        return Vec::new();
     }
     // 逐换行边界组成的可视行字节区间：换行点字节 = 边界前最后 glyph 的起点。
     let runs = &w0.unwrapped_layout.runs;
-    // EPUB 行对齐（逐带移量，选区同 paint_text_row 的同一带同一 x；普通行 = 0）。
-    let aln0 = r.align_offsets.first().copied().unwrap_or(px(0.));
     let mut rows: Vec<(usize, usize)> = Vec::new();
     let mut prev = 0usize;
     for b in w0.wrap_boundaries() {
@@ -1445,31 +1477,31 @@ fn paint_text_selection_hl(
         }
     }
     rows.push((prev, len));
+    let y_base = f32::from(r.top) + text_y_off(r) + text_row_shift(r);
+    let mut out = Vec::with_capacity(rows.len());
     for (a, b2) in rows {
         let c0 = d0.max(a);
         let c1 = d1.min(b2);
         if c1 <= c0 {
             continue;
         }
-        let p0 = match w0.position_for_index(c0, r.lh) {
-            Some(p) => p,
-            None => continue,
+        // 右端：`position_for_index(c1)` 对「恰为行末字节」也落回本行右缘（行末判定
+        // 排除式 `>`），y 即本可视行序号×lh——可靠。
+        let p1 = w0.position_for_index(c1, r.lh).unwrap_or(point(px(0.), px(0.)));
+        // 左缘：c0 恰为本行首字节（整行/左截选中）→ x=0；行内字节 → 行内 x。
+        let x_left = if c0 == a {
+            0.
+        } else {
+            w0.position_for_index(c0, r.lh).map_or(0., |p| f32::from(p.x))
         };
-        let p1 = w0.position_for_index(c1, r.lh).unwrap_or(p0);
-        let y = r.top + px(text_y_off(r) + text_row_shift(r)) + p1.y.min(p0.y);
-        let w = f32::from(p1.x - p0.x).max(2.);
-        window.paint_quad(gpui::PaintQuad {
-            bounds: Bounds::new(
-                point(origin.x + f.padding + r.x_off + aln0 + p0.x, origin.y + y),
-                size(px(w), r.lh),
-            ),
-            corner_radii: gpui::Corners::default(),
-            background: hl.into(),
-            border_widths: gpui::Edges::default(),
-            border_color: gpui::Hsla::default(),
-            border_style: gpui::BorderStyle::Solid,
-        });
+        let w = f32::from(p1.x - px(x_left)).max(2.);
+        out.push((
+            pad + f32::from(r.x_off) + aln0 + x_left,
+            y_base + f32::from(p1.y),
+            w,
+        ));
     }
+    out
 }
 
 /// 注记跳转加亮（P4-2）：把 WyEditor 登记的「目标源码行的注记标记」解析成**绝对源

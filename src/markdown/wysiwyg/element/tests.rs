@@ -22,3 +22,4 @@ include!("tests/image.rs");
 include!("tests/block_math.rs");
 include!("tests/epub.rs");
 include!("tests/note_def_flip.rs");
+include!("tests/selection_highlight.rs");
