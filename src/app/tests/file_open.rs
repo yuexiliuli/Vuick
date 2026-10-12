@@ -802,6 +802,85 @@
         let _ = std::fs::remove_file(&dir);
     }
 
+    /// P1b：大文档渐进打开的消费者改为**批级装配**——一次 UI 更新内尽量多收已缓冲块、
+    /// 逐块追加、批末统一一次 notify（每块不再整窗重绘）。本测试锁定语义不回归：
+    /// 多块消息一个不丢（内容字节级一致）、`open_fast_count`/`open_finish_count` 各 1 次、
+    /// notify 数与块数的量级关系合理（批均 ≥1 块/批），并让既有逐块时序/计数断言全绿。
+    #[gpui::test]
+    async fn progressive_open_batches_and_preserves_semantics(cx: &mut TestAppContext) {
+        use crate::app::file_ops::{PROGRESSIVE_OPEN_CHUNKS, PROGRESSIVE_OPEN_NOTIFIES};
+        use std::sync::atomic::Ordering;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // ~12MB / 6 万行：首块 256KB + 后 ~1MB/块 → 12+ 块，给批级装配留足合并窗口。
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-p1b-batch-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let content = (0..60_000)
+            .map(|i| format!("{} {i:09}\n", "y".repeat(200)))
+            .collect::<String>();
+        assert!(
+            content.len() > 256 * 1024,
+            "测试文件应远超首块下限（实际 {} B）",
+            content.len()
+        );
+        std::fs::write(&dir, &content).unwrap();
+
+        PROGRESSIVE_OPEN_NOTIFIES.store(0, Ordering::Relaxed);
+        PROGRESSIVE_OPEN_CHUNKS.store(0, Ordering::Relaxed);
+        let chunks_before = PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed);
+
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        let mut frames = 0;
+        loop {
+            cx.run_until_parked();
+            let ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                !a.tabs[i].editor_pending
+                    && a.tabs[i].editor.read(cx).value() == content
+                    && a.open_finish_count >= 1
+            });
+            if ready {
+                break;
+            }
+            frames += 1;
+            if frames > 1000 {
+                panic!("P1b 大文件批级装配超时：{} 帧", frames);
+            }
+        }
+        let (chunks, notifies, fast, finish) = (
+            PROGRESSIVE_OPEN_CHUNKS.load(Ordering::Relaxed) - chunks_before,
+            PROGRESSIVE_OPEN_NOTIFIES.load(Ordering::Relaxed),
+            cx.update(|_, cx| app.read(cx).open_fast_count),
+            cx.update(|_, cx| app.read(cx).open_finish_count),
+        );
+        assert!(chunks >= 7, "应有多块渐进（实际 {chunks} 块）——测试前提不成立");
+        assert_eq!(fast, 1, "两段式快段应执行 1 次");
+        assert_eq!(finish, 1, "两段式慢段应执行 1 次");
+        assert!(
+            notifies >= 1 && notifies <= chunks,
+            "批级 notify 数应在 [1, 块数] 内（notifies={notifies} / chunks={chunks}）"
+        );
+        // 语义保真：批内绝不丢块（内容字节级一致已断言）。批均 ≥1 块/批 = 无损失上界。
+        eprintln!(
+            "[P1b] chunks={chunks} notifies={notifies} 批均 {:.2} 块/批",
+            chunks as f64 / notifies.max(1) as f64
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
     /// A4（承接原“预览与编辑器共享源 Rope”回归）：大 md 打开（完整异步流水线 +
     /// `finish_file_text` 装预览）后，右栏统一组件 WyEditor 由**同一棵编辑器 Rope**（ropey
     /// 2.0 Arc 树，`Clone` O(1)）后台 `open_from_rope` 装配——不物化第二份源文本，

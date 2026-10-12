@@ -17,6 +17,16 @@ enum ChunkApply {
     Stale,
 }
 
+/// 测试探针（`cfg(test)`）：大文档渐进打开消费者的「统一 notify」次数（= 批数）与
+/// 收到/应用的块消息数。P1b 回归断言「批级装配确实把 per-chunk 重绘降为 per-batch」，
+/// 且块消息无一丢失（两者相等则每批只收到 1 块的极端时序下也不少于块数）。
+#[cfg(test)]
+pub(crate) static PROGRESSIVE_OPEN_NOTIFIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static PROGRESSIVE_OPEN_CHUNKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 生产者 → 消费者的消息（大文档分块打开的异步通道）。
 enum OpenMsg {
     Chunk(TextChunk),
@@ -347,7 +357,8 @@ impl EditorApp {
                     .spawn(read_chunks_async(prod_tx, prod_p))
                     .detach();
 
-                // ---- 消费者：逐块取（空时让出调度），再到主线程追加装配 ----
+                // ---- 消费者：批级装配（一次 UI 更新尽量多收已缓冲块、逐块追加、批末统一
+                // notify；空时让出调度），再到主线程追加装配 ----
                 let mut cum_mx = 0usize;
                 let mut cum_hist = crate::editor::buffer::LineWidthHistogram::new();
                 let mut src_len = 0u64;
@@ -356,41 +367,103 @@ impl EditorApp {
                 let mut io_err: Option<std::io::Error> = None;
                 let mut aborted = false;
                 let mut rx = rx;
-                while let Some(msg) = rx.next().await {
-                    match msg {
-                        OpenMsg::Chunk(chunk) => {
-                            // 累计精确统计（与 编辑器每个块合并 的是同一份；finish 用它复位）。
-                            cum_mx = cum_mx.max(chunk.max_line_chars);
-                            for (w, c) in chunk.hist.iter() {
-                                *cum_hist.entry(*w).or_insert(0) += c;
+                // 组批时把通道里非 Chunk 的尾巴（Eof/Err）暂存到下一篇处理（`try_next`
+                // 会把它取出，不能放回通道）。
+                let mut pending_msg: Option<OpenMsg> = None;
+                'consume: loop {
+                    let msg = match pending_msg.take() {
+                        Some(m) => m,
+                        None => match rx.next().await {
+                            Some(m) => m,
+                            None => break 'consume,
+                        },
+                    };
+                    let OpenMsg::Chunk(first_chunk) = msg else {
+                        match msg {
+                            OpenMsg::Eof { src_len: s } => {
+                                src_len = s;
+                                break 'consume;
                             }
-                            let is_first = first;
-                            let p_ch = p.clone();
-                            let r = cx
-                                .update_window_entity(&entity, move |this, window, cx| {
-                                    this.apply_open_chunk(idx, &p_ch, chunk, is_first, window, cx)
-                                });
-                            match r {
-                                Ok(ChunkApply::Mounted(v)) => {
-                                    if resume_version.is_none() {
-                                        resume_version = Some(v);
+                            OpenMsg::Err(e) => {
+                                io_err = Some(e);
+                                break 'consume;
+                            }
+                            OpenMsg::Chunk(_) => unreachable!(), // 上面 let-else 已排除
+                        }
+                    };
+                    // —— 收齐通道已缓冲的块入批（通道容量 4；Eof/Err 暂存下一篇按序处理）——
+                    let mut batch: Vec<TextChunk> = vec![first_chunk];
+                    while let Ok(m) = rx.try_recv() {
+                        match m {
+                            OpenMsg::Chunk(c) => batch.push(c),
+                            other => {
+                                pending_msg = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                    // —— 批内累计精确统计（每块自身携带精确 hist/max_line_chars；finish 复位用）——
+                    #[cfg(test)]
+                    PROGRESSIVE_OPEN_CHUNKS
+                        .fetch_add(batch.len(), std::sync::atomic::Ordering::Relaxed);
+                    for chunk in &batch {
+                        cum_mx = cum_mx.max(chunk.max_line_chars);
+                        for (w, c) in chunk.hist.iter() {
+                            *cum_hist.entry(*w).or_insert(0) += c;
+                        }
+                    }
+                    // —— 一次 UI 更新内依次挂载/追加（各自不 notify），批末统一一次 notify：
+                    // 每块不再触发整窗重绘（P1b；配合 P1a 高亮门控，打开期整窗重绘/重解析
+                    // 从 ~块数 降到 ~批数）——保留首块挂载、Stale 中止、resume_version 语义。
+                    let is_first = first;
+                    let p_ch = p.clone();
+                    let res = cx
+                        .update_window_entity(&entity, move |this, window, cx| {
+                            let mut out = (None, false, false); // (Mounted版本, 是否挂过载, 是否中止)
+                            for (i, chunk) in batch.into_iter().enumerate() {
+                                let r = this.apply_open_chunk(
+                                    idx,
+                                    &p_ch,
+                                    chunk,
+                                    is_first && i == 0,
+                                    window,
+                                    cx,
+                                );
+                                match r {
+                                    ChunkApply::Mounted(v) => {
+                                        if out.0.is_none() {
+                                            out.0 = Some(v);
+                                        }
+                                        out.1 = true;
                                     }
-                                    first = false;
-                                }
-                                Ok(ChunkApply::Appended) => {}
-                                _ => {
-                                    aborted = true; // 选项卡已关 / 下标被换成其它文件
-                                    break;
+                                    ChunkApply::Appended => {}
+                                    ChunkApply::Stale => {
+                                        out.2 = true;
+                                        break;
+                                    }
                                 }
                             }
+                            #[cfg(test)]
+                            PROGRESSIVE_OPEN_NOTIFIES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            cx.notify(); // 批末统一一次通知（本批块不逐块重绘）
+                            out
+                        });
+                    match res {
+                        Ok((Some(v), _, false)) => {
+                            if resume_version.is_none() {
+                                resume_version = Some(v);
+                            }
+                            first = false;
                         }
-                        OpenMsg::Eof { src_len: s } => {
-                            src_len = s;
-                            break;
+                        Ok((_, mounted, false)) => {
+                            if mounted {
+                                first = false;
+                            }
                         }
-                        OpenMsg::Err(e) => {
-                            io_err = Some(e);
-                            break;
+                        Ok((_, _, true)) | Err(_) => {
+                            aborted = true; // 选项卡已关 / 下标被换成其它文件
+                            break 'consume;
                         }
                     }
                 }
@@ -582,7 +655,8 @@ impl EditorApp {
         };
         tab.line_count = lc;
         tab.char_count = cc;
-        cx.notify();
+        // 不在此 notify：P1b 批级装配在 `spawn_progressive_open` 批末统一 notify 一次
+        // （每块整窗重绘 → 每批一次），首块挂载自有 `load_file_text` 的 notify。
         ChunkApply::Appended
     }
 

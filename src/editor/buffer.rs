@@ -172,6 +172,12 @@ pub struct Buffer {
     /// （O(受影响行 × log L)，L=不同宽度数）——删除长内容后横向滚动条量程立即精确
     /// 收敛，不欠 O(1) 旧上界、也不做同步 O(n) 全量重扫。
     line_width_histogram: LineWidthHistogram,
+    /// 渐进打开「纯尾追加运行」标记：`Some((start_version, start_row))` 表示自版本
+    /// `start_version` 起，本缓冲只发生过**尾部追加**（无编辑/撤销/重做/整篇替换），
+    /// 且首个追加内容的起始逻辑行为 `start_row`（= 首块追加前的行数）。任何非追加变更
+    /// 都会把它抹成 `None`。高亮器据此判定「版本虽推进、但当前已解析窗口的内容未变」，
+    /// 从而跨块复用高亮缓存、避免渐进打开时每块对可视窗口整段重解析（大 .rs 各 ~91ms）。
+    tail_append: Option<(u64, usize)>,
 }
 
 impl Default for Buffer {
@@ -181,6 +187,7 @@ impl Default for Buffer {
             version: 0,
             max_line_chars: 0,
             line_width_histogram: BTreeMap::new(),
+            tail_append: None,
         }
     }
 }
@@ -193,6 +200,7 @@ impl Buffer {
             version: 0,
             max_line_chars: 0,
             line_width_histogram: BTreeMap::new(),
+            tail_append: None,
         };
         b.recompute_max_line();
         b
@@ -205,6 +213,7 @@ impl Buffer {
             version: 0,
             max_line_chars: 0,
             line_width_histogram: LineWidthHistogram::new(),
+            tail_append: None,
         };
         b.recompute_max_line();
         b
@@ -222,6 +231,7 @@ impl Buffer {
             version: 0,
             max_line_chars,
             line_width_histogram,
+            tail_append: None,
         }
     }
 
@@ -249,13 +259,29 @@ impl Buffer {
     /// （撤销栈/脏标记/编辑事件都不涉及），只推进 `version` 让缓存失效。
     pub fn append_chunk(&mut self, text: &str, chunk_max_chars: usize, chunk_hist: LineWidthHistogram) {
         if !text.is_empty() {
+            // 追加前的行数 = 新内容的起始逻辑行。记录「纯尾追加运行」：多块连续追加时
+            // 起始行取最早一块（追加永远在尾部，后块起始行只会更靠后），起始版本保留
+            // 首次的——高亮器用 `start_version ≤ gated_version+1` 判定本次版本推进是否
+            // 完全由尾追加造成（中间夹编辑会让起点版本前移被重置逻辑排除）。
+            let start_row = self.line_count();
             self.text.insert(self.text.len(), text);
             self.version += 1;
+            self.tail_append = Some(match self.tail_append {
+                Some((sv, sr)) => (sv, sr.min(start_row)),
+                None => (self.version, start_row),
+            });
         }
         self.max_line_chars = self.max_line_chars.max(chunk_max_chars);
         for (w, c) in chunk_hist {
             *self.line_width_histogram.entry(w).or_insert(0) += c;
         }
+    }
+
+    /// 当前「纯尾追加运行」的起始 `(版本, 首个追加行)`；无在途尾追加 = `None`。
+    /// 供高亮器在版本变更时判定「追加区是否完全落在当前已解析窗口之下」（见
+    /// [`Self::append_chunk`] 与 `crate::editor::highlight` 的门控）。
+    pub(crate) fn tail_append(&self) -> Option<(u64, usize)> {
+        self.tail_append
     }
 
     /// 全文最长行（字符数）——O(1) 读，供等宽列近似/测试。
@@ -514,6 +540,7 @@ impl Buffer {
         let old = SharedString::from(self.text.slice(range.clone()).to_string());
         self.text.replace(range.clone(), new_text);
         self.version += 1;
+        self.tail_append = None; // 编辑 = 非尾部追加变更，清掉「纯尾追加」标记
         let new_line_b = self.line_of_offset((range.start + new_text.len()).min(self.text.len()));
         self.refresh_lines(old_widths, old_line_a, new_line_b);
         Edit {
@@ -531,6 +558,7 @@ impl Buffer {
         let old_widths = self.line_widths_in(old_line_a, old_line_b);
         self.text.replace(ir, edit.old_text.as_ref());
         self.version += 1;
+        self.tail_append = None; // 撤销 = 非尾部追加变更
         let new_line_b = self
             .line_of_offset((edit.start + edit.old_text.len()).min(self.text.len()));
         self.refresh_lines(old_widths, old_line_a, new_line_b);
@@ -544,6 +572,7 @@ impl Buffer {
         let old_widths = self.line_widths_in(old_line_a, old_line_b);
         self.text.replace(rr, edit.new_text.as_ref());
         self.version += 1;
+        self.tail_append = None; // 重做 = 非尾部追加变更
         let new_line_b = self
             .line_of_offset((edit.start + edit.new_text.len()).min(self.text.len()));
         self.refresh_lines(old_widths, old_line_a, new_line_b);

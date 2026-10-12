@@ -174,6 +174,15 @@ pub struct Highlighter {
     /// 会把帧率压到个位数，滑块/内容跟不紧鼠标。先登记 pending、本帧用空样式渲染
     /// （帧廉价），滚动停住（相邻帧窗口一致）再由 `settle_pending` 补一次有界重锚。
     pending: Option<(usize, usize, usize)>,
+    /// 测试探针（`cfg(test)`）：本实例 `full_reparse`（整段重解析建缓存）被调次数。
+    /// P1a 渐进打开回归用它断言「追加块完全落在解析窗口之下时不再每块整段重解析」。
+    /// 放实例上（而非全局静态）：cargo 并行跑测试时全局计数会被其它测试污染。
+    #[cfg(test)]
+    test_reparse_count: usize,
+    /// 测试探针（`cfg(test)`）：置 `true` 强行关闭「纯尾追加门控」得到旧行为基线
+    /// （before/after 对比用；生产恒 `false`）。
+    #[cfg(test)]
+    test_append_gate_disabled: bool,
 }
 
 impl Highlighter {
@@ -188,6 +197,40 @@ impl Highlighter {
             dirty: None,
             force_full: true,
             pending: None,
+            #[cfg(test)]
+            test_reparse_count: 0,
+            #[cfg(test)]
+            test_append_gate_disabled: false,
+        }
+    }
+
+    /// 测试探针：关闭/恢复「纯尾追加门控」（before/after 对比；生产恒关闭生效）。
+    #[cfg(test)]
+    pub(crate) fn set_test_append_gate_disabled(&mut self, v: bool) {
+        self.test_append_gate_disabled = v;
+    }
+
+    /// 测试探针：本实例 `full_reparse` 累计次数。
+    #[cfg(test)]
+    pub(crate) fn test_reparse_count(&self) -> usize {
+        self.test_reparse_count
+    }
+
+    /// 测试探针：累计一次 `full_reparse`（仅测试构建存在）。
+    #[cfg(test)]
+    fn bump_reparse_count(&mut self) {
+        self.test_reparse_count += 1;
+    }
+
+    /// 「纯尾追加门控」是否被测试临时关闭（生产恒不关闭）。
+    fn append_gate_temporarily_disabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.test_append_gate_disabled
+        }
+        #[cfg(not(test))]
+        {
+            false
         }
     }
 
@@ -253,6 +296,15 @@ impl Highlighter {
         if self.covered(lo, hi) {
             self.pending = None;
             return true;
+        }
+        // 首帧（缓存为空）且配置了语法 → 一律延后：首次整窗 syntect 解析（DEBUG 下
+        // .rs ~10-30ms）改到「下一帧 settle_pending」补色，首帧先出纯文本/光标。与滚动期
+        // 大缺口共用同一 pending / request_animation_frame / settle 机制，不新造状态机；
+        // `.txt`（无 syntax）不受影响（下方 needs_reanchor 判定照旧，空缓存小窗口仍走
+        // 快路径——放空样式行的建缓存成本可忽略）。
+        if self.lines.is_empty() && self.syntax.is_some() {
+            self.pending = Some((lo, hi, lookback));
+            return false;
         }
         let needs_reanchor = if lo >= self.base {
             let cached_end = self.base + self.lines.len();
@@ -355,6 +407,30 @@ impl Highlighter {
             }
         }
 
+        // A0) 渐进打开「纯尾追加」门控（P1）：版本虽推进，但变更完全落在当前已解析窗口
+        // `[base, base+lines.len())` 之下——`append_chunk` 只在全文尾部追加新行、窗口内
+        // 既有行内容未动 → 缓存仍准确，无需对可视窗口整段重解析（大 .rs 每块 ~91ms）。
+        // 把 `gated_version` 对齐到当前版本，接着走「内容未变」路径（命中 / `extend_down`
+        // 续解析，滚进新块区域时颜色正确落位）。条件：
+        // - 无在途编辑登记（编辑即使被 `apply_edit` 清零标记，本帧 `set_dirty` 也已喂入，
+        //   双保险）且未强刷；
+        // - 追加运行自上次缓存版本之后开始（`start_version ≤ gated_version+1`；若不成立，
+        //   说明中间隔着一次非追加变更，缓存可能过期）；
+        // - 追加起点行 ≥ 当前缓存上界（`base + lines.len()`，追加区**完全**落在已解析窗口
+        //   之下）。非恒成立：缓存若在追加运行**期间**重建过（缓存尾已含部分追加行），
+        //   此护栏拒绝命中、保守落整段重解析（代价=旧行为一次重解析，保住正确性）。
+        if !self.force_full
+            && !self.lines.is_empty()
+            && version != self.gated_version
+            && self.dirty.is_none()
+            && !self.append_gate_temporarily_disabled()
+            && let Some((start_version, start_row)) = buffer.tail_append()
+            && start_version <= self.gated_version.wrapping_add(1)
+            && start_row >= self.base + self.lines.len()
+        {
+            self.gated_version = version;
+        }
+
         // A) 内容未变：命中缓存；窗口下移出缓存则向下扩展（只解析新行）。
         if !self.force_full && version == self.gated_version && !self.lines.is_empty() {
             if self.covered(lo, hi) {
@@ -431,6 +507,8 @@ impl Highlighter {
         version: u64,
         line_count: usize,
     ) {
+        #[cfg(test)]
+        self.bump_reparse_count();
         let start = lo.saturating_sub(lookback).min(line_count.saturating_sub(1));
         let mut lines: Vec<Vec<(Range<usize>, Hsla)>> = Vec::with_capacity(hi - start + 1);
         let mut saves: Vec<ParseState> = Vec::with_capacity(hi - start + 1);

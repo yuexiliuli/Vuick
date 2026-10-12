@@ -758,6 +758,7 @@ impl CodeEditor {
         if logical_row >= self.row_count || logical_row >= self.buffer.line_count() {
             return Vec::new();
         }
+        self.test_warm_highlight(logical_row, logical_row);
         self.build_rows(window, logical_row, logical_row, false)
             .into_iter()
             .next()
@@ -775,10 +776,32 @@ impl CodeEditor {
         lo: usize,
         hi: usize,
     ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
+        self.test_warm_highlight(lo, hi);
         self.build_rows(window, lo, hi, false)
             .into_iter()
             .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
             .collect()
+    }
+
+    /// 测试：直接调 `build_rows` 前先预热高亮缓存（仅非 Markdown 的 syntect 路径需要）。
+    /// P1c 起 `.rs` 首帧（空缓存 + 语法）会走「延后上色」且在 `build_rows` 里
+    /// `request_animation_frame`（只能在真实帧内调用）——测试在帧外直调 build_rows 会
+    /// debug_assert 炸。这里绕过高亮器把 pending/settle 契约**帧外安全**执行完（与
+    /// `build_rows` 的快路径/延后路径同一组 API），之后 `build_rows` 自然命中缓存，不再
+    /// 走延后分支。缓存已覆盖则幂等（命中/小扩展）。Markdown（`md_mode`）走
+    /// `scan_window`，不经过该延后分支，无需预热。
+    #[cfg(test)]
+    fn test_warm_highlight(&mut self, lo: usize, hi: usize) {
+        if self.md_mode {
+            return;
+        }
+        self.highlighter.set_dirty(self.hl_dirty.take());
+        let _ = self.highlighter.accept_deferred(lo, hi, HL_LOOKBACK_LINES);
+        let _ = self.highlighter.settle_pending(&self.buffer);
+        let _ = self
+            .highlighter
+            .highlight_window(&self.buffer, lo, hi, HL_LOOKBACK_LINES)
+            .len();
     }
 
     /// 测试：行缓存命中计数 / 条目数（滚动窗口内断言缓存复用、编辑后失效）。

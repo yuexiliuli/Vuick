@@ -385,11 +385,17 @@ fn deferred_scroll_skips_syntect_until_settled() {
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
 
-    // 首帧：顶部窗口（快路径，覆盖/小扩展）。
-    assert!(hl.accept_deferred(0, 108, 16), "顶部窗口应走快速路径");
-    assert_eq!(hl.pending(), None, "快路径不登记 pending");
+    // 首帧（P1c：空缓存 + 语法）延后上色——登记 pending、本帧不整窗重解析；次帧同一
+    // 窗口 settle 补齐顶部缓存后即命中快速路径。
+    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
+    assert_eq!(hl.pending(), Some((0, 108, 16)), "延后登记 pending 供次帧 settle");
+    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
+    assert_eq!(hl.pending(), None);
     let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
-    assert!(!top[0].is_empty(), "快速路径应有颜色");
+    assert!(!top[0].is_empty(), "settle 后顶部窗口应有颜色");
+    // 缓存就绪后，同窗口再次请求命中快速路径（覆盖 → 不登记 pending）。
+    assert!(hl.accept_deferred(0, 108, 16), "缓存命中应走快速路径");
+    assert_eq!(hl.pending(), None, "快路径不登记 pending");
 
     // 大缺口：注册 pending，且**不**立刻重锚（本帧空样式渲染的前提）。
     let quick = hl.accept_deferred(72_000, 72_108, 16);
@@ -905,5 +911,194 @@ fn char_align_highlights_survives_stale_ranges() {
         crate::editor::view::char_align_highlights(text, &clean),
         clean,
         "已对齐输入应原样保留"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1a：渐进打开「纯尾追加」跨块高亮复用
+// ---------------------------------------------------------------------------
+// P1a / P1c：渐进打开「纯尾追加」跨块高亮复用 + 首帧延后上色
+// ---------------------------------------------------------------------------
+// 探针（`full_reparse` 计数 / 门控开关）都打在 `Highlighter` **实例**上（`#![cfg(test)]`
+// 字段 + 访问器），cargo 并行跑其它触发重解析的测试时不会互相污染。
+
+/// P1c 回归：`.rs` 首帧（高亮缓存为空 + 语法已配置）一律**延后上色**——`accept_deferred`
+/// 登记 pending 并返回 `false`（本帧空样式渲染、不同步整段重解析），次帧 settle 补色。
+/// 复用滚动期既有 pending/request_animation_frame/settle 机制，不新造状态机；
+/// `.txt`（无语法）不受影响（空缓存小窗口仍走快路径：其建缓存只是填空样式，代价≈0）。
+#[test]
+fn empty_cache_with_syntax_defers_first_frame() {
+    use crate::editor::highlight::Highlighter;
+    let text = (0..20)
+        .map(|i| format!("fn f{i}() {{ let v = {i}; // c{i} }}\n"))
+        .collect::<String>();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    // 空缓存 + 语法 → 延后（本帧不整窗重解析，首帧先出纯文本/光标）。
+    assert!(
+        !hl.accept_deferred(0, 10, 16),
+        ".rs 首帧（空缓存）应延后上色，不在首帧同步整段重解析"
+    );
+    assert_eq!(
+        hl.pending(),
+        Some((0, 10, 16)),
+        "延后应登记 pending，供下一帧 settle 补色"
+    );
+    // 次帧同一窗口 → settle_pending 有界重锚 → 有颜色且与窗口对齐。
+    assert!(hl.settle_pending(&b), "settle 应补齐缓存");
+    assert_eq!(hl.pending(), None, "settle 消耗 pending");
+    let rows = hl.highlight_window(&b, 0, 10, 16).to_vec();
+    assert_eq!(rows.len(), 11);
+    assert!(!rows[0].is_empty(), "settle 后首行应有颜色");
+
+    // 对照：`.txt`（无语法）首帧空缓存仍走快路径（不延后），且首帧填空样式代价≈0。
+    let mut hl_txt = Highlighter::new();
+    assert!(
+        hl_txt.accept_deferred(0, 10, 16),
+        "无语法（.txt）首帧不应被 P1c 延后（快路径保持）"
+    );
+    let txt_rows = hl_txt.highlight_window(&b, 0, 10, 16).to_vec();
+    assert_eq!(txt_rows.len(), 11);
+    assert!(txt_rows.iter().all(|r| r.is_empty()), ".txt 无语法段（空样式）");
+}
+
+// ---------------------------------------------------------------------------
+// P1a：渐进打开「纯尾追加」跨块高亮复用
+// ---------------------------------------------------------------------------
+
+#[test]
+fn highlight_cache_reuses_window_across_append_chunks() {
+    // P1a 回归：渐进打开期间追加块纯粹落在当前高亮窗口之下时，不得对可视窗口整段
+    // 重解析——旧实现每块 `version+1` 使 `gated_version` 失效 → 每块对窗口 `full_reparse`
+    // （大 `.rs` ≈91ms/块 × ~9 块 ≈ 1s 打开卡顿）。缓存（含每行解析状态保存点）只依赖
+    // 「窗口内既有行」，尾部追加不改变它们 → 应跨块命中、窗口颜色不变；滚进新块区域时
+    // 由 `extend_down` 从保存点续解析补色（正确性用「有颜色」锁住）。
+    let chunk1: String = (0..100)
+        .map(|i| format!("fn f{i}() {{ let v: u32 = {i}; // c{i} }}\n"))
+        .collect();
+    let mut b = Buffer::new(&chunk1);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let warm = hl.highlight_window(&b, 0, 40, 16).to_vec();
+    assert!(!warm[0].is_empty(), "首窗应有颜色");
+    assert_eq!(
+        hl.test_reparse_count(),
+        1,
+        "首窗建缓存恰一次整段重解析"
+    );
+    let warm_rows = warm.len();
+
+    // 追加 3 块（各 ~50 行，渐进打开路径：Buffer 版本每块 +1）。
+    for k in 0..3 {
+        let chunk: String = (0..50)
+            .map(|i| format!("fn g{k}{i}() {{ let s = \"str{k}{i}\"; /* k{k} */ }}\n"))
+            .collect();
+        b.append_chunk(&chunk, 30, crate::editor::buffer::LineWidthHistogram::new());
+    }
+    assert_eq!(b.version(), 3, "3 次追加应推进 3 个版本");
+
+    // 可视窗口仍在顶部（追加区在窗口之下）→ 跨块命中缓存，不再整段重解析。
+    let rows = hl.highlight_window(&b, 0, 40, 16).to_vec();
+    assert_eq!(rows.len(), warm_rows, "切片仍与请求窗口对齐");
+    assert_eq!(
+        hl.test_reparse_count(),
+        1,
+        "追加块落在窗口之下 → 不得触发可视窗口整段重解析"
+    );
+    assert_eq!(rows, warm, "窗口颜色跨块保持一致（缓存复用）");
+
+    // 滚进新块区域（窗口 [55,105]，缺口远小于 REANCHOR_GAP）→ `extend_down` 从保存点
+    // 续解析补色：仍不整段重解析，且新行有正确颜色。
+    let deep = hl.highlight_window(&b, 55, 105, 16).to_vec();
+    assert_eq!(deep.len(), 51, "深窗切片应与请求窗口对齐");
+    assert_eq!(
+        hl.test_reparse_count(),
+        1,
+        "小缺口滚动应走 extend_down，不得整段重解析"
+    );
+    assert!(
+        deep.iter().all(|r| !r.is_empty()),
+        "滚进追加块区域后每行都应有颜色（extend_down 补色）"
+    );
+
+    // 对照：编辑窗口内的行（非尾追加变更）不得被追加门控吞掉——编辑清掉 `tail_append`
+    // 标记 → 门控条件不成立 → 落整段重解析 → 输出与全新解析器对拍一致。
+    let mut b2 = b.clone();
+    b2.apply_edit(10..14, "X\nY\nZ\n");
+    assert_eq!(b2.tail_append(), None, "编辑应清掉『纯尾追加』标记");
+    hl.set_dirty(None); // 模拟编辑后的清理：dirty 为 None 时门控也因 tail_append=None 失效
+    let edited = hl.highlight_window(&b2, 0, 40, 16).to_vec();
+    assert_eq!(hl.test_reparse_count(), 2, "编辑应触发一次整段重解析（门控不吞）");
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth
+        .highlight_window(&Buffer::new(b2.to_string()), 0, 40, 16)
+        .to_vec();
+    assert_ne!(
+        edited, warm,
+        "编辑必须在窗口输出中反映（追加门控不得把编辑当纯尾追加命中）"
+    );
+    assert_eq!(
+        edited, truth_rows,
+        "编辑后输出应与全新解析器一致"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1a before/after 基准（有门控 vs 无门控）
+// ---------------------------------------------------------------------------
+
+/// 运行：`cargo test --release --bin gpui-editor bench_progressive_append_highlight_reuse -- \
+///        --ignored --nocapture`（debug 亦可，比值不变、绝对值放大）。
+#[test]
+#[ignore]
+fn bench_progressive_append_highlight_reuse() {
+    use std::time::Instant;
+
+    let chunk1: String = (0..2_000)
+        .map(|i| format!("fn foo{i}() {{ let x: u32 = {i}; // 注释 {i}\n"))
+        .collect();
+    // 9 块追加（与真实大 .rs 打开块数同量级：首块 256KB + 后 ~1MB×8）。
+    let extra: Vec<String> = (0..9)
+        .map(|k| {
+            (0..400)
+                .map(|i| format!("fn g{k}_{i}() {{ let s = \"str{k}{i}\"; /* b {k}{i} */ }}\n"))
+                .collect()
+        })
+        .collect();
+
+    // —— 无门控（= 旧行为）基线 ——
+    let (mut b_old, mut hl_old) = (Buffer::new(&chunk1), Highlighter::new());
+    hl_old.set_language(Some("rust"));
+    hl_old.set_test_append_gate_disabled(true);
+    let _ = hl_old.highlight_window(&b_old, 0, 108, 16).to_vec(); // 预热窗口
+    let t = Instant::now();
+    for chunk in &extra {
+        b_old.append_chunk(chunk, 30, crate::editor::buffer::LineWidthHistogram::new());
+        let _ = hl_old.highlight_window(&b_old, 0, 108, 16).to_vec();
+    }
+    let ungated_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let ungated_reparse = hl_old.test_reparse_count() - 1; // 减掉预热那一次
+
+    // —— 有门控（本改动） ——
+    let (mut b_new, mut hl_new) = (Buffer::new(&chunk1), Highlighter::new());
+    hl_new.set_language(Some("rust"));
+    hl_new.set_test_append_gate_disabled(false);
+    let _ = hl_new.highlight_window(&b_new, 0, 108, 16).to_vec();
+    let t = Instant::now();
+    for chunk in &extra {
+        b_new.append_chunk(chunk, 30, crate::editor::buffer::LineWidthHistogram::new());
+        let _ = hl_new.highlight_window(&b_new, 0, 108, 16).to_vec();
+    }
+    let gated_ms = t.elapsed().as_secs_f64() * 1000.0;
+    let gated_reparse = hl_new.test_reparse_count() - 1;
+
+    println!("==== P1a 尾追加高亮复用基准（9 块） ====");
+    println!("  无门控(旧): {ungated_ms:.2} ms  整段重解析 ×{ungated_reparse}");
+    println!("  有门控(新): {gated_ms:.2} ms  整段重解析 ×{gated_reparse}");
+    println!(
+        "  提速: {:.1}×",
+        ungated_ms / gated_ms.max(f64::MIN_POSITIVE)
     );
 }
