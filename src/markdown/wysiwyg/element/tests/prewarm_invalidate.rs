@@ -396,3 +396,111 @@ fn caret_move_keeps_shape_cache(cx: &mut TestAppContext) {
     });
 }
 
+/// Step4-① 接线：后台 rope 冷开（`open_from_rope` → `install_open`）后预建槽在场、
+/// 且因冷开路径已 arm `cold_topup`；首个 `build_frame` **一次性消费**预建槽并物化出
+/// 基础布局（槽清空）。同步 Str 路径（`with_text`）无预建、不 arm（不影响既有单测）。
+#[gpui::test]
+fn install_rope_prebuild_consumed_on_first_frame(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::{Prewarm, WyEditor};
+    use ropey::Rope;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..2000 {
+        text.push_str(&format!("paragraph number {i} here\n"));
+    }
+    let rope = Rope::from(text.as_str());
+    let r = WyEditor::open_from_rope(rope);
+    assert!(
+        r.prebuild
+            .as_ref()
+            .is_some_and(|p| p.len() == r.doc.block_count()),
+        "rope 路径应带预建且块数对齐"
+    );
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.install_open(r);
+            assert!(e.prebuild_slot.borrow().is_some(), "install 后应存预建槽");
+            assert_eq!(
+                e.prewarm.borrow().cold_topup,
+                Prewarm::COLD_TOPUP_FRAMES,
+                "后台 rope 冷开应 arm 冷开反门控"
+            );
+        });
+        // 首个 build_frame：预建 fast path 消费槽 → 基础布局建出、槽清空。
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 2000.));
+        assert!(
+            ed.read(cx).prebuild_slot.borrow().is_none(),
+            "首帧应一次性消费预建槽"
+        );
+        assert!(
+            ed.read(cx).block_layout.borrow().is_some(),
+            "首帧后基础布局应已物化"
+        );
+    });
+}
+
+/// Step4-③ 冷开反门控：`install_open`（rope 冷开）arm 后，**静置签名**（滚动/内容/宽度
+/// 全不变）下 `prewarm_band` 仍强制预整形 `cold_topup` 帧；耗尽后恢复静置门控（0 整形）
+/// ——与 `prewarm_idle_gate_stops_after_idle_frames`（Str 路径不 arm）互补锁行为。
+#[gpui::test]
+fn cold_open_topup_forces_prewarm_despite_idle(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    use ropey::Rope;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!("paragraph number {i} here\n"));
+    }
+    let rope = Rope::from(text.as_str());
+    let r = WyEditor::open_from_rope(rope);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let q = 512.;
+        let width = px(900.);
+        ed.update(cx, |e, _| {
+            e.install_open(r);
+            e.set_caret(text.len());
+        });
+        // 首帧登记带序号（无整形）；随后**同一 top 连续帧**：冷开期强制预整形。
+        let f0 = build_frame(ed.read(cx), window, width, (0., q));
+        prewarm_band(ed.read(cx), &f0, window, 0.);
+        let mut shaped = 0u64;
+        for _ in 0..8 {
+            let f = build_frame(ed.read(cx), window, width, (0., q));
+            prewarm_band(ed.read(cx), &f, window, 0.);
+            shaped += ed.read(cx).take_prewarm_shapes();
+        }
+        assert!(shaped > 0, "冷开 topup 期静置也应预整形（实际 {shaped}）");
+        // topup 耗尽 → 同一签名连续帧落到静置门控：0 整形。
+        let f2 = build_frame(ed.read(cx), window, width, (0., q));
+        for _ in 0..4 {
+            prewarm_band(ed.read(cx), &f2, window, 0.);
+        }
+        assert_eq!(
+            ed.read(cx).take_prewarm_shapes(),
+            0,
+            "topup 耗尽后应恢复静置门控"
+        );
+        // 滚动恢复（带变）→ 正常门控立即放行（冷开期已回归、不断电）。
+        let f3 = build_frame(ed.read(cx), window, width, (q, 2. * q));
+        ed.read(cx).take_reshapes();
+        prewarm_band(ed.read(cx), &f3, window, q);
+        assert!(
+            ed.read(cx).take_prewarm_shapes() > 0,
+            "带变（滚动意图）应放行预整形"
+        );
+    });
+}
+

@@ -33,6 +33,7 @@ impl WyEditor {
             shape_band: Cell::new(None),
             prewarm: RefCell::new(Prewarm::default()),
             block_layout: RefCell::new(None),
+            prebuild_slot: RefCell::new(None),
             struct_ver: Cell::new(0),
             struct_dirty_line: Cell::new(0),
             struct_old_end_line: Cell::new(0),
@@ -363,6 +364,7 @@ impl WyEditor {
             doc,
             math_dollar_cnt: text.as_ref().bytes().filter(|&b| b == b'$').count(),
             alert_marker_cnt: text.as_ref().matches("[!").count(),
+            prebuild: None,
         }
     }
 
@@ -376,10 +378,14 @@ impl WyEditor {
         let _t = crate::prof::begin();
         let doc = Doc::open_rope(rope);
         crate::prof::end("wy.open.doc", _t);
+        // Step4-①：解析重叠期预建首帧 Pass1 输入（后台线程，无窗口/主题——只算
+        // doc 依赖量；首帧以真实主题/宽度纯算术物化，见 `frame::pass1_from_prebuild`）。
+        let prebuild = crate::markdown::wysiwyg::frame::build_prebuild_pass1(&doc);
         WyOpenResult {
             doc,
             math_dollar_cnt,
             alert_marker_cnt,
+            prebuild: Some(prebuild),
         }
     }
 
@@ -464,6 +470,20 @@ impl WyEditor {
         // 与上两行悬浮/加亮同类：打开新文档/切换标签/EPUB 重喂源后不残留跳转。
         self.note_down.set(None);
         self.note_down_seq.set(self.note_down_seq.get().wrapping_add(1));
+        // Step4-①：存首帧基础布局**预建输入**槽（`build_frame` 首帧经
+        // `pass1_from_prebuild` 一次性物化后清空）；同步/Str 路径为 None → 走既有 path。
+        let cold_backload = r.prebuild.is_some();
+        self.prebuild_slot.replace(r.prebuild);
+        // Step4-③：冷开反门控——仅**后台 rope 冷开路径**（有预建 = 大文档换源）装完后
+        // 强制预整形 `cold_topup` 帧。静置门控（0746946）在滚动前会把预热门关掉 →
+        // 用户一滚落点带冷、Pass2 突发；冷开期每帧预算内推进直到首几带 warm，任何
+        // 滚动/编辑/宽度变化由 `idle_skip` 打断回归正常门控。同步 Str 路径（测试 /
+        // 小文档 `with_text`）不 arm → 既有 prewarm 单测不受影响。
+        if cold_backload {
+            self.prewarm.borrow_mut().arm_cold_topup(
+                crate::markdown::wysiwyg::Prewarm::COLD_TOPUP_FRAMES,
+            );
+        }
         self.loaded = true;
     }
     /// 设置图片相对路径解析的基准目录（打开文件时由应用传入其父目录，与预览一致）。

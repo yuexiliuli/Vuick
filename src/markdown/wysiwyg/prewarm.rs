@@ -19,6 +19,12 @@ pub(crate) struct Prewarm {
     pub idle: u8,
     /// 上一 prewarm 帧的变化签名；任一维与当前帧不同都视为「有滚动/缩放/内容意图」。
     pub sig: Option<PrewarmSig>,
+    /// 冷开强制预整形的**剩余帧数**（Step4-③）：`install_open` 换源后置
+    /// [`Self::COLD_TOPUP_FRAMES`]，这些帧内 `idle_skip` **无视静置门控** 放行
+    /// `prewarm_band`（每帧 8ms 预算内），把首视口周边带提前 shape 进缓存（否则静置
+    /// 门控会在滚动前就把预热门关掉 → 用户首次滚动落点带冷、Pass2 突发回归）。
+    /// 任何滚动/内容/宽度变化（签名变）立即清零 → 回归正常门控（0746946 不破坏）。
+    pub cold_topup: u8,
 }
 
 /// 帧变化签名（见 [`Prewarm::sig`]）——「内容/宽度维」与 `build_frame` 帧缓存键**同源**
@@ -61,11 +67,31 @@ impl Default for Prewarm {
             last_band_idx: None,
             idle: 0,
             sig: None,
+            cold_topup: 0,
         }
     }
 }
 
 impl Prewarm {
+    /// 冷开强制预整形帧数（Step4-③）：首帧 `prewarm_band` 只登记带序号（无整形）——
+    /// 帧 1 消耗 1 帧、帧 2.. 每帧 8ms 预算预整形下一带；≈6 帧（0.2s@30fps）足够首
+    /// 视口下几带温好。比时长更关键的是预算：预整形单帧仍有 **8ms 硬时间上限**
+    /// （`prewarm_band` 内 `time_budget`），冷开帧不会叠加成长帧。
+    pub(crate) const COLD_TOPUP_FRAMES: u8 = 6;
+
+    /// 装源后冷开反门控：置 `cold_topup` 并让方向/登记簿全新（首帧重登记当前带），
+    /// 之后每帧在预算内强制预整形，直到帧数耗尽或用户任何举动（签名变）打断（打断在
+    /// [`Self::idle_skip`] 内联——见其文档）。
+    pub(crate) fn arm_cold_topup(&mut self, frames: u8) {
+        self.cold_topup = frames.max(1);
+        // 全新方向：始终向「下一个带」预整形（首视口下方——用户首次滚动最可能的方向；
+        // 上方由滚动恢复时 `dir` 反转补，兜底正确性不受影响）。
+        self.dir = 1;
+        self.last_band_idx = None;
+        self.bias = 0;
+        self.idle = 0;
+        self.sig = None;
+    }
     /// **速度自适应预算**：`vel` = 本帧带序号的跳跃量（= 滚动速度，带/帧）。
     ///
     /// 快滚时视口每帧跨多个 512px 量子带，固定 3 块/帧的预热追不上 → 落点带仍冷、Pass2
@@ -92,13 +118,25 @@ impl Prewarm {
     /// 512px 量子栅格，带内微滚看不出差异 → 必须用原始值，见 [`PrewarmSig`]）。
     /// 调用方（`prewarm_band`）务必**先**更新登记簿（`last_band_idx`/`dir`/`bias`）
     /// 再调本方法，保证跳过帧的滚动状态仍新鲜。
+    /// 冷开反门控（Step4-③）：`cold_topup > 0` 时**无视静置门控**持续放行（预算内
+    /// 预整形首视口周边带）；签名任何变化（滚动/编辑/宽度）→ 立即清零冷开期回归
+    /// 正常门控。
     pub(crate) fn idle_skip(&mut self, frame: &Frame, scroll_top: f32) -> bool {
         let sig = PrewarmSig::of(frame, scroll_top);
         if self.sig == Some(sig) {
             self.idle = self.idle.saturating_add(1);
         } else {
+            // 装源后首帧登记（None→Some）不算用户变化（那是冷开期本身）；之后任何
+            // 滚动/缩放/内容/宽度变化 → 冷开期结束、回归正常门控。
+            if self.sig.is_some() {
+                self.cold_topup = 0;
+            }
             self.idle = 0;
             self.sig = Some(sig);
+        }
+        if self.cold_topup > 0 {
+            self.cold_topup -= 1;
+            return false;
         }
         self.idle >= Self::IDLE_SKIP_FRAMES
     }

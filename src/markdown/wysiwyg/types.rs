@@ -200,10 +200,53 @@ pub(crate) fn is_plain_region_line(line: &str) -> bool {
 }
 /// 撤销/重做栈深度上限（超出丢最旧）。
 pub(crate) const UNDO_LIMIT: usize = 200;
-/// 后台装载结果：整篇 O(n) 解析（Doc::open + 派生标记计数）的**纯输出**。`Send`，
-/// 可在 `background_executor` 任意线程构建、再回 UI 线程 [`WyEditor::install_open`]。
+/// 后台装载结果：整篇 O(n) 解析（Doc::open + 派生标记计数 + 首帧基础布局预建输入）
+/// 的**纯输出**。`Send`，可在 `background_executor` 任意线程构建、再回 UI 线程
+/// [`WyEditor::install_open`]。
 pub(crate) struct WyOpenResult {
     pub(crate) doc: Doc,
     pub(crate) math_dollar_cnt: usize,
     pub(crate) alert_marker_cnt: usize,
+    /// 首帧基础布局（Pass1）的**预建输入**（Step4-①）：后台在 `Doc::open_rope` 的
+    /// 解析重叠期逐块只读自身 `BlockMeta`/行长/围栏类形态，把「每块估算高所需的全部
+    /// doc 依赖量」算好并随结果带回——`install_open` 只存槽，首帧 `build_frame` 用
+    /// 真实主题/宽度以 O(n) 纯算术物化成 `BlockLayout`（若干 ms），不再首帧全量
+    /// doc 估高（Step1 基线 debug ~103ms / release ~29ms）。None = 同步/Str 路径
+    /// （无预建，走既有 `pass1_base_layout`）。
+    pub(crate) prebuild: Option<PrebuildPass1>,
+}
+
+/// 首帧基础布局预建输入：每个块只留 `pass1_base_layout::est_block` **除主题/宽度
+/// 之外的全部输入**（Meta 形态 + 行长/ASCII + 围栏类特殊源文本）。全部与 doc 同源
+/// 计算、`Send`，可在后台线程构建。
+/// 主题/宽度相关（`estimate_height` 的行高乘子、折行宽 cpl、图片占位高、mermaid 卡高
+/// 常数）留到首帧 `pass1_from_prebuild` 以真实 `WyTheme`/`avail` 现场折算——因为
+/// 后台 `open_from_rope` 无窗口/主题（不引入 app 侧改动的前提下此边界不可逾越）。
+#[derive(Default)]
+pub(crate) struct PrebuildPass1 {
+    pub(crate) blocks: Vec<PrebuildBlock>,
+}
+
+impl PrebuildPass1 {
+    pub(crate) fn len(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+/// 单个块的预建估算输入（≈32B/块；160k 块 ≈ 5MB，仅跨一次后台 spawn 后即转
+/// `BlockLayout` 释放）。
+#[derive(Debug, Clone)]
+pub(crate) struct PrebuildBlock {
+    pub(crate) src_line: u32,
+    pub(crate) kind: crate::markdown::parse::RowKind,
+    /// Code：代码行数；Table：数据行数；Image：1；其余 0。
+    pub(crate) aux: u32,
+    pub(crate) chars: u32,
+    pub(crate) ascii: bool,
+    /// 该围栏块的 mermaid 源码（` ```mermaid` 开头的 Code 块才 Some；卡高与
+    /// mermaid 缩放无关部分在后台先算好，首帧再乘 zoom——冷开守卫 zgen==0 → zoom=1）。
+    pub(crate) mermaid: Option<gpui::SharedString>,
+    /// 该图片块的解析 src（`parse_image_line` 结果）；首帧按当前 `image_sizes` 现场
+    /// 走 `image_block_base_height`（与 `pass1_base_layout`/稀疏覆写同一公式）。
+    pub(crate) image_src: Option<gpui::SharedString>,
 }

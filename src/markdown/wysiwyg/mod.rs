@@ -70,8 +70,8 @@ pub(crate) use self::prewarm::Prewarm;
 pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 pub(crate) use self::types::{
     BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
-    ImageSrcBlocks, MathSlot, TocCacheEntry, TocEntries, UNDO_LIMIT, UndoUnit, WyDerived,
-    WyOpenResult, inline_math_key, is_plain_region_line, region_line_sig,
+    ImageSrcBlocks, MathSlot, PrebuildBlock, PrebuildPass1, TocCacheEntry, TocEntries, UNDO_LIMIT,
+    UndoUnit, WyDerived, WyOpenResult, inline_math_key, is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -158,6 +158,12 @@ pub struct WyEditor {
     /// （换行/围栏/表格等改了块数或块序）才整篇重建。`set_theme`/`set_font_size` 把代置
     /// 失效位强制重算。
     block_layout: RefCell<Option<(u64, Rc<std::cell::RefCell<element::BlockLayout>>)>>,
+    /// 首帧基础布局**预建输入槽**（Step4-①）：`install_open` 存 `WyOpenResult.prebuild`，
+    /// 首个 `build_frame`（`rebuilt` 分支）经 [`frame::pass1_from_prebuild`] **一次性**
+    /// 用真实主题/宽度物化成 `BlockLayout` 后清空——首帧不再全量 doc 估高。任何编辑
+    /// （`struct_ver > 0`）/mermaid 缩放（`zgen != 0`）/块数不齐 → 守卫放行走既有
+    /// `pass1_base_layout` 兜底（正确优先）。
+    prebuild_slot: RefCell<Option<PrebuildPass1>>,
     /// 内容**结构版本**：`replace_range` 里结构性变更（跨行、代码/表格边界）才递增——
     /// 参与基础布局代；非结构性编辑不递增（基础布局跨键复用，只 patch 受影响块高）。
     struct_ver: Cell<u64>,

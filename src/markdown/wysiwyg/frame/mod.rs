@@ -16,7 +16,7 @@ use gpui::{Pixels, Window};
 
 use crate::markdown::doc::DocRow;
 use crate::markdown::ir::IrKind;
-use crate::markdown::parse::RowKind;
+use crate::markdown::parse::{BlockMeta, RowKind};
 use crate::markdown::parse::inline_style::MathRegion;
 
 /// 冷启动首次 shape 回退字形（❗⚠✅ 等）时 DWrite 可能给「错误回退字体的非零占位字形」
@@ -126,7 +126,7 @@ fn debug_special_row(
 /// 布局（只平移 src_line）。结构编辑从「dirty_line → 文尾」全后缀重估（大文档
 /// Enter/代码/表格 183-375ms）降到「仅中段估算 + Vec 复制」。
 #[allow(clippy::too_many_arguments)] // 行布局输入互为正交
-fn pass1_base_layout(
+pub(crate) fn pass1_base_layout(
     doc: &Doc,
     editor: &WyEditor,
     n: usize,
@@ -282,6 +282,212 @@ fn pass1_base_layout(
     debug_assert_eq!(heights.len(), n, "Pass1 三段式产出的块数与新索引一致");
     base.borrow_mut().rebuild_from_flat(heights, src_lines);
     crate::prof::end("wy.pass1", _t_p1);
+}
+
+/// —— Step4-①：首帧 Pass1 预建（后台算输入 + 首帧纯算术物化）——
+///
+/// `pass1_base_layout` 首建路径的昂贵处是**逐块 doc 访问**（`block_meta` +
+/// `line_chars_ascii` + mermaid 源组装 + 图片源解析），而这些输入全部与主题/宽度无关。
+/// 后台 `open_from_rope`（无窗口/主题）在解析重叠期先把每块这类输入算成
+/// [`PrebuildPass1`]（`Send`）随结果带回；首帧 `build_frame` 看到预建槽非空且守卫通过
+/// （未编辑 `struct_ver==0`、无 mermaid 缩放 `zgen==0`、块数齐）→ [`pass1_from_prebuild`]
+/// 用**真实** `WyTheme`/`avail` 以 O(n) 纯算术物化 `BlockLayout`（160k 块 ~ms 级），
+/// 替代首帧对全篇 doc 估高（Step1 基线 debug ~103ms / release ~29ms）。守卫不通过（已
+/// 编辑/已缩放/宽度换代等）→ 走既有 `pass1_base_layout` 兜底（正确优先）。与 Step1 的
+/// rope/chunk 路径共存：预建只读 `Doc` 公开查询（`block_meta`/`line_chars_ascii`/
+/// `line_str`），不触碰 `Doc::open_rope` 的行装配/零拷贝实现，也不改 `scan_blocks`。
+pub(crate) fn build_prebuild_pass1(doc: &Doc) -> PrebuildPass1 {
+    let _t = crate::prof::begin();
+    let n = doc.block_count();
+    let mut blocks = Vec::with_capacity(n);
+    // 需要行长统计（chars/ascii）的块：Code/Table/Image 的 `estimate_height` 只用 `aux`
+    // /源文本，不需要首行行长（与 `est_block` 的 else 分支一致，对拍口径同源）。
+    let mut need_chars: Vec<(usize, usize)> = Vec::new(); // (块下标, 首行源行)
+    for i in 0..n {
+        let Some(meta) = doc.block_meta(i) else { break };
+        let srcline = meta.src_line as usize;
+        let mut pb = PrebuildBlock {
+            src_line: meta.src_line,
+            kind: meta.kind,
+            aux: meta.aux,
+            chars: 0,
+            ascii: true,
+            mermaid: None,
+            image_src: None,
+        };
+        match meta.kind {
+            RowKind::Code => {
+                // mermaid 围栏判定：与 est_block 同式（读首行 `line_str`，副本次数 =
+                // 代码块数，占比低）。
+                if doc.line_str(srcline).trim_start().starts_with("```mermaid") {
+                    let mut src = String::new();
+                    for k in 0..meta.aux {
+                        if k > 0 {
+                            src.push('\n');
+                        }
+                        src.push_str(&doc.line_str(srcline + 1 + k as usize));
+                    }
+                    pb.mermaid = Some(gpui::SharedString::from(src));
+                }
+            }
+            RowKind::Image => {
+                pb.image_src = Some(
+                    crate::markdown::parse::parse_image_line(doc.line_str(srcline).trim())
+                        .map(|(_, s)| gpui::SharedString::from(s.to_string()))
+                        .unwrap_or_default(),
+                );
+            }
+            // Code/Table/Image 的 `estimate_height` 只用 aux/源文本，不需要首行行长。
+            RowKind::Table => {}
+            _ => need_chars.push((i, srcline)),
+        }
+        blocks.push(pb);
+    }
+    // 行长统计用**对 rope 的单趟 chunk 顺序扫描**融合计算（零每块 RopeSlice 定位，与
+    // `build_line_stats_utf16_rope` 同构）——对 6.4MB/139k 块省 ~每块一次 chunk 二分
+    // （实测单块 line_chars_ascii 的 rope 切片开销 ~2.4× Str 版）。
+    fill_prebuild_chars(doc, &mut blocks, &need_chars);
+    crate::prof::end("wy.prebuild", _t);
+    PrebuildPass1 { blocks }
+}
+
+/// 单趟 chunk 顺序扫描填 `need_chars` 各块首行的 `(chars, ascii)`（零 `RopeSlice`
+/// 二分；`need_chars` 按 `src_line` 升序 = 块序天然升序 → 一趟推进、命中即写）。
+/// 行语义与 `Doc::line_chars_ascii` 的 rope 分支逐值一致（行尾 `\n` 停、`\r` 跳过、
+/// 非 ASCII 按引导字节折算），对拍测试锁死。
+fn fill_prebuild_chars(doc: &Doc, blocks: &mut [PrebuildBlock], need: &[(usize, usize)]) {
+    if need.is_empty() {
+        return;
+    }
+    let rope = doc.rope();
+    let mut ni = 0usize;
+    let (mut bi, mut tgt) = need[ni];
+    // 当前字节所在源行：逐 `\n` 推进；`started` = 正在计 tgt 行内容。
+    let mut cur_line = 0usize;
+    let mut started = false;
+    let mut line_chars = 0u32;
+    let mut line_ascii = true;
+    for chunk in rope.chunks() {
+        let bytes = chunk.as_bytes();
+        let mut j = 0usize;
+        let m = bytes.len();
+        while j < m {
+            // 每次进线先判：当前行（`cur_line`）是否已到下一目标行首。
+            if !started && cur_line == tgt {
+                started = true;
+                line_chars = 0;
+                line_ascii = true;
+            }
+            let b = bytes[j];
+            if started {
+                if b == b'\n' {
+                    // 行尾：落盘并切到下一个待填块（同一行相邻块由顶部判进入）。
+                    blocks[bi].chars = line_chars;
+                    blocks[bi].ascii = line_ascii;
+                    ni += 1;
+                    if ni >= need.len() {
+                        return;
+                    }
+                    (bi, tgt) = need[ni];
+                    started = false;
+                    cur_line += 1;
+                    j += 1;
+                    continue;
+                }
+                if b == b'\r' {
+                    j += 1;
+                    continue; // 与 line_chars_ascii 一致（\r 不计入）
+                }
+                line_chars += 1;
+                if b >= 0x80 {
+                    line_ascii = false;
+                    // 按 UTF-8 引导字节推进（同 `build_line_stats_utf16_rope` 口径；
+                    // 连续字节 0x80..C0 按 1 推进防死循环）。
+                    let l = if b < 0xC0 {
+                        1
+                    } else if b < 0xE0 {
+                        2
+                    } else if b < 0xF0 {
+                        3
+                    } else {
+                        4
+                    };
+                    j += l;
+                } else {
+                    j += 1;
+                }
+            } else {
+                if b == b'\n' {
+                    cur_line += 1;
+                }
+                j += 1;
+            }
+        }
+    }
+    // 末尾：目标为最后一行且文末无尾 `\n` → 补记。
+    if started && ni < need.len() {
+        blocks[bi].chars = line_chars;
+        blocks[bi].ascii = line_ascii;
+    }
+}
+
+/// 单个预建块的估算高——与 [`pass1_base_layout`] 的 `est_block` **同一公式**（mermaid
+/// 卡高 / 图片 `image_block_base_height` / 其余 `estimate_height`），保证首帧物化结果与
+/// 既有首建 path 逐值一致（对拍测试锁）。mermaid 卡高按 zoom=1 预建（冷开守卫
+/// `zgen==0`；缩放后再重建即按真 zoom 走既有 path）；图片现场读 `image_sizes`（空 =
+/// 占位高，与 `patch_pending_image_heights` 稀疏覆写同公式）。
+pub(crate) fn prebuild_block_height(
+    editor: &WyEditor,
+    pb: &PrebuildBlock,
+    theme: &WyTheme,
+    avail: f32,
+    line_h: Pixels,
+) -> f32 {
+    if let Some(src) = &pb.mermaid {
+        f32::from(mermaid_card_height(src))
+    } else if pb.kind == RowKind::Image {
+        let src: &str = pb.image_src.as_deref().unwrap_or_default();
+        image_block_base_height(editor, src, avail, line_h)
+    } else {
+        let meta = BlockMeta {
+            src_line: pb.src_line,
+            byte: 0,
+            kind: pb.kind,
+            raw_len: 0,
+            aux: pb.aux,
+        };
+        f32::from(estimate_height(&meta, pb.chars as usize, pb.ascii, theme, avail, line_h))
+    }
+}
+
+/// 用预建输入在**首帧**把整篇基础布局物化（O(n) 纯算术，无 doc 行访问）。成功物化后
+/// **清空预建槽**（一次性：之后任何重建走既有 `pass1_base_layout` / 稀疏增量）。
+/// 调用方（[`build_frame`]）须先判守卫（`struct_ver==0 && zgen==0 && 块数齐`）。
+pub(crate) fn pass1_from_prebuild(
+    editor: &WyEditor,
+    base: &Rc<RefCell<element::BlockLayout>>,
+    theme: &WyTheme,
+    avail: f32,
+    line_h: Pixels,
+) -> bool {
+    let _t = crate::prof::begin();
+    {
+        let b = editor.prebuild_slot.borrow();
+        let Some(p) = b.as_ref() else { return false };
+        if p.len() != editor.doc().block_count() {
+            return false;
+        }
+        let mut heights = Vec::with_capacity(p.len());
+        let mut src_lines = Vec::with_capacity(p.len());
+        for pb in &p.blocks {
+            heights.push(prebuild_block_height(editor, pb, theme, avail, line_h));
+            src_lines.push(pb.src_line);
+        }
+        base.borrow_mut().rebuild_from_flat(heights, src_lines);
+    }
+    *editor.prebuild_slot.borrow_mut() = None;
+    crate::prof::end("wy.pass1_prebuilt", _t);
+    true
 }
 
 /// 在可视带内二分定位 [i0, i1) 块区间。
@@ -769,16 +975,30 @@ pub(crate) fn build_frame(
     // 滚动 / 普通打字只重做 ③④⑤，①②的结果跨带复用（廉价帧）。
 
     if rebuilt {
-        pass1_base_layout(
-            doc,
-            editor,
-            n,
-            &base,
-            old_layout.as_ref(),
-            theme,
-            avail,
-            line_h,
-        );
+        // Step4-①：首帧有后台预建输入（`install_open` 存槽）且守卫通过（未编辑 /
+        // 未 mermaid 缩放 / 块数齐）→ O(n) 纯算术物化（~ms），首帧不再全量 doc 估高。
+        // 守卫不通过（已编辑/已缩放/块数不齐等，含宽度换代重建）→ 既有 path 兜底。
+        let prebuilt = editor.struct_ver() == 0
+            && editor.mermaid_zoom_gen() == 0
+            && editor
+                .prebuild_slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.len() == n);
+        if !(prebuilt && pass1_from_prebuild(editor, &base, theme, avail, line_h)) {
+            // 预建不可用（守卫不通过/块数不齐）→ 弃槽（避免悬置 ~5MB）走既有 path。
+            *editor.prebuild_slot.borrow_mut() = None;
+            pass1_base_layout(
+                doc,
+                editor,
+                n,
+                &base,
+                old_layout.as_ref(),
+                theme,
+                avail,
+                line_h,
+            );
+        }
     }
     // 折叠/重排计划（与可视带无关、不含 caret，跨带/跨光标复用——滚动与输入不再重算
     // `math_start`/`fold_lines`/`deltas`）。caret 所在区域的 reveal 由 `fold_reveal`

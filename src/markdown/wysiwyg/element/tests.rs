@@ -17,6 +17,7 @@ include!("tests/prewarm_invalidate.rs");
 include!("tests/undo.rs");
 include!("tests/bench.rs");
 include!("tests/notdef.rs");
+include!("tests/prebuild_pass1.rs");
 include!("tests/incremental.rs");
 include!("tests/image.rs");
 include!("tests/block_math.rs");
