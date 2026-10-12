@@ -27,6 +27,13 @@ const MD_WY_ASYNC_INSTALL_MIN_BYTES: usize = 512 * 1024;
 pub(crate) static LIVE_COMMIT_MD_WY_ASYNC: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// 测试探针（`cfg(test)`）：toggle ON 命中**共享复用右栏已解析 Doc** 的次数——大文档
+/// 切 live2 走 `md_wy.doc().clone()` O(1) 复用（消双解析）而非 `open_from_rope` 整篇
+/// 重解析。回归测试据此断言「复用路径真的被走上」。
+#[cfg(test)]
+pub(crate) static LIVE_ON_MD_WY_REUSE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// 测试探针（`cfg(test)`）：`commit_live` 退出路径计数——整篇写回（有改动）vs
 /// 未改动直接销毁实体（O(1) 跳过写回）。app 层回归测试据此断言「未编辑不写回」。
 #[cfg(test)]
@@ -1226,7 +1233,43 @@ impl EditorApp {
             const ASYNC_LOAD_MIN_BYTES: usize = 512 * 1024;
             let rope = self.tabs[idx].editor.read(cx).text().clone();
             let async_load = rope.len() >= ASYNC_LOAD_MIN_BYTES;
-            let ed = if async_load {
+            // —— 共享复用右栏已解析 Doc（消双解析、O(1) 即见）——
+            // 守卫沿增量桥不变式：`md_wy` 已 loaded（且与编辑区字节等长 → 内容一致）、无
+            // 整篇在途（`md_wy_pending`/`md_wy_pending_full` 为 None、`md_wy_early` 非
+            // Pending|Failed）。命中 → O(1) 克隆共享右栏已解析结构（`Doc::clone`），后台只
+            // 补算首帧预建（~36ms release 的 Pass1 输入）即装配——不再 `open_from_rope`
+            // 整篇重解析（原大文档切 live 白屏比解析还久的根因之一）。未命中 → 保留既有
+            // 异步 `open_from_rope` 兜底。小文档（`!async_load`）不蹭复用：同步 `with_text`
+            // 本就无空白帧、零风险不变行为。
+            let reuse = self
+                .tabs[idx]
+                .md_wy
+                .as_ref()
+                .filter(|w| {
+                    async_load
+                        && w.read(cx).is_loaded()
+                        && self.tabs[idx].md_wy_pending.is_none()
+                        && self.tabs[idx].md_wy_pending_full.is_none()
+                        && !matches!(
+                            self.tabs[idx].md_wy_early,
+                            Some(MdWyEarly::Pending { .. }) | Some(MdWyEarly::Failed)
+                        )
+                        && w.read(cx).len() == rope.len()
+                })
+                .map(|w| {
+                    // O(1) Doc 克隆（Arc/rope COW 段共享，不复制数据）；$ / [! 标记计数
+                    // 克隆自只读 md_wy（与克隆 Doc 同源，编辑前不变式成立）。
+                    (
+                        w.read(cx).doc().clone(),
+                        w.read(cx).math_dollar_cnt(),
+                        w.read(cx).alert_marker_cnt(),
+                    )
+                });
+            #[cfg(test)]
+            if reuse.is_some() {
+                LIVE_ON_MD_WY_REUSE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let ed = if reuse.is_some() || async_load {
                 cx.new(|cx| WyEditor::new(window, cx))
             } else {
                 let text = SharedString::from(rope.to_string());
@@ -1287,7 +1330,45 @@ impl EditorApp {
             // 点击漏进的 MouseDown 恰在切离前把 `dragging` 置位过（见 `commit_live` 注释），
             // 若不在此刻清掉，隐藏期的残留会在切回后仅移动鼠标时把选区从 anchor 拉长。
             tab.editor.update(cx, |ed, _| ed.cancel_mouse_drag());
-            if async_load {
+            if let Some((doc_clone, math_dollar, alert_marker)) = reuse {
+                let tab_idx = idx;
+                let ed_install = ed.clone();
+                cx.spawn(async move |this, cx| {
+                    let t0 = std::time::Instant::now();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            // 复用路径：零拷贝复用右栏已解析 Doc，只补算首帧 Pass1 预建
+                            // （纯 doc 依赖量、无窗口/主题）——首帧经 `pass1_from_prebuild`
+                            // 轻量物化 + arm 冷开保温（prebuild=Some），不丢冷开路径设施。
+                            let prebuild =
+                                crate::markdown::wysiwyg::frame::build_prebuild_pass1(&doc_clone);
+                            crate::markdown::wysiwyg::WyEditor::open_result_from_doc(
+                                doc_clone,
+                                math_dollar,
+                                alert_marker,
+                                Some(prebuild),
+                            )
+                        })
+                        .await;
+                    crate::prof::add_absolute("wy.app.reuse_prebuild", t0.elapsed());
+                    let _ = this.update(cx, |this, cx| {
+                        // 只装配仍挂在原 tab 的 live2（用户在装配期间切换/退出则丢弃）。
+                        if this
+                            .tabs
+                            .get(tab_idx)
+                            .is_some_and(|t| t.live2.as_ref() == Some(&ed_install))
+                        {
+                            ed_install.update(cx, |ed, _| ed.install_open(result));
+                            let tab = &mut this.tabs[tab_idx];
+                            tab.line_count = ed_install.read(cx).line_count();
+                            tab.char_count = ed_install.read(cx).char_count();
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            } else if async_load {
                 let tab_idx = idx;
                 let ed_install = ed.clone();
                 cx.spawn(async move |this, cx| {

@@ -369,6 +369,42 @@ pub(crate) struct Doc {
     text_shared_calls: std::cell::Cell<u64>,
 }
 
+/// `Doc` 的 **O(1) 共享克隆**：克隆即共享、编辑即 COW 分离。
+///
+/// 全部重字段都是一次性只读构建的「持久分段 + Arc / ropey COW」：`index`
+/// （`Blocks/Toc` 的 `Arc<[..]>` 段）、`line_starts`/`line_utf16_starts`（`LineSeg`
+/// 的 `Arc<[..]>` 段）、`rope`（ropey 拓扑 COW，与宿主编辑器共享底层树）——这里逐项
+/// `Arc` 克隆，不复制任何数据。唯一跳过分叉的是 `text_cache`：fork 缓存本就该空
+/// （`edit` 会失效它；同源共享下 fork 各自首读全文时各自物化一次并缓存，无正确性
+/// 影响）、`text_shared_calls` 归零（每份独立观测）。
+///
+/// 编辑分离语义：`Doc::edit` 只替换**自己**这份克隆的字段——rope remove/insert 出新树、
+/// 分段重建叠出「旧前缀 Arc + 新中段 + 旧后缀 Arc」——原 Doc 的字段逐字节不动（与
+/// `open_rope_edit_does_not_pollute_host_rope` 同款不污染语义，该测试已锁 ropey chunk
+/// 边界的 COW 前提）。宿主用途：右栏只读预览 `md_wy` 与左面板 live2 各自持 `Doc`——
+/// toggle 切 live2 时 `md_wy.doc().clone()` O(1) 复用同一份已解析结构（消双解析），
+/// live2 首编辑即与该份不可变共享分离。
+impl Clone for Doc {
+    fn clone(&self) -> Self {
+        Self {
+            src: match &self.src {
+                DocSrc::Str(s) => DocSrc::Str(s.clone()),
+                DocSrc::Rope(r) => DocSrc::Rope(r.clone()),
+            },
+            index: self.index.clone(),
+            rope: self.rope.clone(),
+            line_starts: self.line_starts.clone(),
+            line_utf16_starts: self.line_utf16_starts.clone(),
+            char_count: self.char_count,
+            total_utf16: self.total_utf16,
+            edit_ver: self.edit_ver,
+            text_cache: RefCell::new(None),
+            #[cfg(test)]
+            text_shared_calls: std::cell::Cell::new(0),
+        }
+    }
+}
+
 impl Doc {
     /// 打开小/中文档（`Str` 源）。
     pub(crate) fn open(src: SharedString) -> Self {
@@ -1263,6 +1299,60 @@ mod tests {
         let doc2 = Doc::open_rope(host.clone());
         assert_eq!(doc2.text_shared(), SharedString::from(src));
         assert_eq!(doc2.len(), src.len());
+    }
+
+    /// `Doc::clone` 的「克隆即共享、编辑即 COW 分离」回归（共享复用右栏已解析 Doc 的
+    /// 语义地基）：克隆一份 Doc，编辑克隆（行内 + 结构各一，覆盖无换行/含换行两路径），
+    /// 原 Doc 逐字节不变；再对已编辑克隆二次克隆并编辑，三者互不串扰。Rope 源与 Str 源
+    /// 各验一遍（Rope 源 = 大文档复用路径）。
+    #[test]
+    fn clone_edit_does_not_pollute_original() {
+        let src = "# 标题\n段落 **加粗** `代码`\n\n```rust\nlet a = 1;\n```\n\ntail\n";
+        let check = |doc: Doc, tag: &str| {
+            let mut fork = doc.clone();
+            // 行内编辑（no-'\n'）+ 结构编辑（含 '\n'），同 COW 测试的双路径。
+            let at = src.find("let a = 1;").unwrap();
+            fork.edit(at..at + "let a = 1;".len(), "let b = 2;");
+            let nl = src.find("\n\n```rust").unwrap() + 1;
+            fork.edit(nl..nl, "插入行\n");
+            let want = src
+                .replacen("let a = 1;", "let b = 2;", 1)
+                .replace("\n\n```rust", "\n插入行\n\n```rust");
+            // 原 Doc（克隆源）未受编辑影响；fork 反映两次编辑。
+            assert_eq!(
+                doc.text_shared(),
+                SharedString::from(src),
+                "{tag}: 原 Doc 必须保持原状（克隆共享、编辑分离）"
+            );
+            assert_eq!(
+                fork.text_shared(),
+                SharedString::from(want.as_str()),
+                "{tag}: fork 应反映编辑"
+            );
+            assert_eq!(doc.len(), src.len(), "{tag}: 原 Doc len 不变");
+            // 多代共享：对已编辑 fork 再克隆并编辑，前两代都不串扰。
+            let mut fork2 = fork.clone();
+            fork2.edit(0..0, "# 前缀\n");
+            assert_eq!(
+                fork.text_shared(),
+                SharedString::from(want.as_str()),
+                "{tag}: fork 不受 fork2 编辑影响"
+            );
+            assert_eq!(
+                fork2.text_shared(),
+                SharedString::from(format!("# 前缀\n{want}")),
+                "{tag}: fork2 反映其编辑"
+            );
+            assert_eq!(
+                doc.text_shared(),
+                SharedString::from(src),
+                "{tag}: 原 Doc 仍不受任何代影响"
+            );
+        };
+        check(Doc::open(SharedString::from(src)), "Str 源");
+        let host = ropey::Rope::from(src);
+        check(Doc::open_rope(host.clone()), "Rope 源");
+        assert_eq!(host.to_string(), src, "宿主 rope 未被克隆编辑污染（COW）");
     }
 
     /// Rope/Str 两构造路径逐项对拍（冷开 blocks-only 与 Str 口一致的抽取面）：

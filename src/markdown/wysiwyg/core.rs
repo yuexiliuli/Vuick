@@ -389,6 +389,21 @@ impl WyEditor {
         }
     }
 
+    /// 从既有 `Doc` **克隆共享**装配（App toggle 复用路径）：右栏 `md_wy` 已解析的
+    /// `Doc` O(1) 克隆复用（`Doc::clone` 共享不复制），不再 `open_from_rope` 整篇重解析。
+    /// 宿主（后台）对克隆只补算一次首帧预建（[`crate::markdown::wysiwyg::frame::build_prebuild_pass1`]）后调
+    /// 本函数——`install_open` 语义与 `open_from_rope` 完全一致（存预建槽 + arm 冷开保温，
+    /// 首帧即轻）。`math/alert` 计数克隆自只读 `md_wy`（与克隆 Doc 同源、编辑前不变式）。
+    /// 留在本级（而非 App 侧直接拼 `WyOpenResult`）：字段契约/预建语义归 wysiwyg 管。
+    pub(crate) fn open_result_from_doc(
+        doc: Doc,
+        math_dollar_cnt: usize,
+        alert_marker_cnt: usize,
+        prebuild: Option<PrebuildPass1>,
+    ) -> WyOpenResult {
+        WyOpenResult { doc, math_dollar_cnt, alert_marker_cnt, prebuild }
+    }
+
     /// 全文标记计数（`$` / `[!`）——`derived()` 的数学/警报预筛用增量计数（内容级
     /// O(n) 一次，之后编辑逐键增量维护，避免每次变更对 6.4MB 全篇重扫）。直接在
     /// rope 字节流上单遍滑窗（跨 chunk 连续，与 `str::bytes`/`matches("[!")` 同值）
@@ -588,6 +603,14 @@ impl WyEditor {
     }
     pub(crate) fn doc(&self) -> &Doc {
         &self.doc
+    }
+    /// `$` 标记计数（只读；共享复用路径 App 把它原样带进装配结果）。
+    pub(crate) fn math_dollar_cnt(&self) -> usize {
+        self.math_dollar_cnt.get()
+    }
+    /// `[!` 标记计数（只读；共享复用路径 App 把它原样带进装配结果）。
+    pub(crate) fn alert_marker_cnt(&self) -> usize {
+        self.alert_marker_cnt.get()
     }
     pub(crate) fn caret(&self) -> usize {
         self.caret

@@ -57,9 +57,15 @@ impl EditorApp {
         // 所见即所得预览编辑（WYSIWYG）模式：左面板 = 本项目 `WyEditor`
         // （AUTO-GROW，内部无滚动条，宿主负责滚动 + 自绘纵向滚动条）。
         if let Some(ed) = self.tabs[self.active_tab].live2.clone() {
+            // live2 未就绪（大文档后台装配在途）：**冻结源码编辑区** + 全区域透明输入
+            // 拦截层——窗口期内不整白屏等后台（原白屏根因），也不在空壳上画空白帧。
+            // 就绪后下一帧自动切入 `render_live_area`（首帧即真内容，靠既有预建槽）。
+            if !ed.read(cx).is_loaded() {
+                return self.render_plain_editor(grow, true, cx);
+            }
             return self.render_live_area(&ed, window, grow, cx);
         }
-        self.render_plain_editor(grow, cx)
+        self.render_plain_editor(grow, false, cx)
     }
 
     /// 大文档异步打开中的编辑区轻量占位（与正式编辑区**同一套 flex 布局参数**——
@@ -163,12 +169,18 @@ impl EditorApp {
     }
 
     /// 普通源码编辑区（非只读 / 非挂载占位 / 非 WYSIWYG）。
-    fn render_plain_editor(&mut self, grow: f32, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// `freeze_input=true`：live2 未就绪冻结展示——追加全区域透明输入拦截层。
+    fn render_plain_editor(
+        &mut self,
+        grow: f32,
+        freeze_input: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let editor = self.tabs[self.active_tab].editor.clone();
         // 字号覆盖（用户 Ctrl+=/- 调节；None=主题默认）。渲染时由 CodeEditor 自身读取。
         let font_size = self.font_size;
         editor.update(cx, |ed, _| ed.set_font_override(Some(font_size)));
-        div()
+        let mut el = div()
             .id("editor-area")
             .debug_selector(|| "editor-area".into())
             .relative()
@@ -189,7 +201,27 @@ impl EditorApp {
             ))
             .child(editor)
             // 透明覆盖层（画在编辑器之上，命中测试最靠前)：拦截 Ctrl+滚轮缩放。
-            .child(Self::zoom_overlay(cx))
+            .child(Self::zoom_overlay(cx));
+        // live2 未就绪冻结期追加**全区域输入拦截层**（画在最上、吞鼠标/滚轮）：防
+        // 「窗口期内输入进源码」与后台解析快照分歧——源码此刻是权威源（live2 尚无内容），
+        // 只读展示；就绪后本分支不再渲染，自然消失。
+        if freeze_input {
+            el = el.child(Self::live_pending_input_overlay());
+        }
+        el.into_any_element()
+    }
+
+    /// live2 未就绪期间的全区域**透明输入拦截层**（形态对齐 `zoom_overlay`）：absolute
+    /// inset_0 透明层 + `.occlude()`（GPUI 原生遮挡：阻断其下所有鼠标交互，含滚轮）
+    /// ——不画任何视觉（样式零散落，全走 `ui::theme` 的父容器底色）。鼠标被整块吞掉，
+    /// 键盘焦点在 toggle ON 时已移给 live2 空壳（不达源码编辑区）。
+    fn live_pending_input_overlay() -> gpui::AnyElement {
+        div()
+            .id("live-pending-input-overlay")
+            .debug_selector(|| "live-pending-input-overlay".into())
+            .absolute()
+            .inset_0()
+            .occlude()
             .into_any_element()
     }
 

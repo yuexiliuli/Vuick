@@ -3124,3 +3124,229 @@
         );
     }
 
+    /// 左面板 live2 **未就绪冻结源码**回归（修复「预览编辑测试切左面板 WYSIWYG 白屏」①）：
+    /// 空壳 live2 未 `is_loaded()`（大文档后台装配在途）时，左面板不渲染空白 WYSIWYG 帧
+    /// （原白屏根因），而是**冻结渲染切换前的源码编辑区** + 全区域透明输入拦截层
+    /// （`#live-pending-input-overlay`，`occlude()` 吞鼠标/滚轮，防窗口期内输入进源码与
+    /// 后台解析快照分歧）；`install_open`（`is_loaded()==true`）后同一帧起切正式 live 宿主
+    /// （`#live-scroll`）、拦截层消失。
+    ///
+    /// 测试说明：本测试钩子 `run_until_parked` 会一次排空后台任务，真实 toggle ON 的
+    /// 「空壳已建、装配在途」窗口无法在帧间观察到 → 用**等价状态布置**（建空壳 live2 =
+    /// 大文档装配完成前态，同 `md_wy_pending_placeholder_renders_until_loaded` 手法）走
+    /// 真实渲染路径断言冻结 → 就绪切换。
+    #[gpui::test]
+    async fn wysiwyg_live2_pending_freeze_renders_source_then_live_area(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 打开一个小 md（让冻结展示的源码编辑区有内容可看）。
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-live-pending-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, "# 标题\n正文。\n\n```rust\nlet a = 1;\n```\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 等价大文档装配在途：建「空壳未装」的左面板 live2（不 install_open → is_loaded()==false）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.active_tab;
+                let ed = cx.new(|cx| crate::markdown::wysiwyg::WyEditor::new(window, cx));
+                ed.update(cx, |ed, _| ed.capture_live_ops());
+                app.tabs[idx].live2 = Some(ed.clone());
+                app.tabs[idx]._live2_sub = None;
+                app.tabs[idx].live_edit = true;
+                app.tabs[idx].live2_dirty = false;
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (loaded,) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let live = a.tabs[a.active_tab].live2.clone().expect("live2 应已创建");
+            (live.read(cx).is_loaded(),)
+        });
+        let (freeze_shown, live_shown) = (
+            cx.debug_bounds("live-pending-input-overlay").is_some(),
+            cx.debug_bounds("live-scroll").is_some(),
+        );
+        assert!(!loaded, "空壳应处于未就绪");
+        assert!(
+            freeze_shown && !live_shown,
+            "未就绪应渲染冻结源码 + 输入拦截层（#live-pending-input-overlay），且不得出现正式宿主 #live-scroll"
+        );
+        // 就绪：install 全量 → 下一帧起正式 live 宿主出现、拦截层消失。
+        cx.update(|_window, cx| {
+            app.update(cx, |app, cx| {
+                let live = app.tabs[app.active_tab].live2.clone().unwrap();
+                live.update(cx, |ed, _cx| {
+                    ed.install_open(crate::markdown::wysiwyg::WyEditor::open_from_str(
+                        "# 就绪正文\n\n装配完成后的 WYSIWYG 内容。\n".into(),
+                    ));
+                });
+            });
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (loaded,) = cx.update(|_, cx| {
+            let a = app.read(cx);
+            let live = a.tabs[a.active_tab].live2.clone().expect("live2 应仍在");
+            (live.read(cx).is_loaded(),)
+        });
+        let (freeze_shown, live_shown) = (
+            cx.debug_bounds("live-pending-input-overlay").is_some(),
+            cx.debug_bounds("live-scroll").is_some(),
+        );
+        assert!(loaded, "install_open 后应就绪");
+        assert!(
+            live_shown && !freeze_shown,
+            "就绪后应渲染正式 live 宿主（#live-scroll），拦截层消失"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// 共享复用右栏已解析 Doc（修复「预览编辑测试」白屏 ②）回归：大文档 md 右栏 `md_wy`
+    /// 已 loaded（== 编辑区）时 toggle ON → 守卫命中**复用路径**（探针 +1）——live2 装配
+    /// 自 `md_wy.doc().clone()`（O(1) 共享、消双解析），`is_loaded()` 后 len == 编辑区（
+    /// 全文即见）；md_wy 不受影响（仍为源全文）；live2 首次编辑后 md_wy Doc 逐字节不变
+    /// （`Doc::clone` 的「克隆共享、编辑即 COW 分离」，右栏只读预览不被左面板编辑污染）。
+    #[gpui::test]
+    async fn wysiwyg_toggle_on_reuses_md_wy_doc_cow(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-reuse-{}.md",
+            std::process::id()
+        ));
+        // 大文档（≥512KB）走既有大文档打开流：右栏 md_wy 由「打开即提前整篇解析」装好。
+        let block = "# 大标题\n这是正文段落，用于 WYSIWYG 共享复用右栏已解析 Doc 的回归。\n\n- [ ] 待办\n";
+        let src = block.repeat((600 * 1024) / block.len());
+        assert!(src.len() >= 512 * 1024, "大文档应 ≥512KB，实际 {}", src.len());
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                t.editor.read(cx).value().len() >= src.len()
+                    && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
+        let md_old = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .md_wy
+                .clone()
+                .expect("md_wy 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert_eq!(md_old, src, "toggle 前右栏应为原文档全文");
+        // ON：守卫该命中共享复用路径（探针 +1）。
+        let reuse_before = crate::app::preview::LIVE_ON_MD_WY_REUSE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let reuse_after = crate::app::preview::LIVE_ON_MD_WY_REUSE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // 全局复用探针：并行的其它大文档 toggle ON 用例（同一 ≥512KB + md_wy 已 loaded
+        // 同源布置）也走同一复用路径、可能并发推进计数 → 用 ≥（本用例至少一次），与
+        // 既有 `LIVE_COMMIT_*` 全局探针判据同款（见 1207/1314 注释）。「本次 toggle 真的
+        // 复用」的确定性判据是下方 live2 len/text == 编辑区全文、右栏 md_wy 不被改动。
+        assert!(
+            reuse_after > reuse_before,
+            "大文档 toggle ON 且右栏 md_wy 已 loaded 应命中共享复用路径"
+        );
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内装配完（复用路径 = 克隆 + 预建）");
+        let (l2_len, l2_text, md_now) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            let l2 = t.live2.clone().expect("live2 应存在");
+            (
+                l2.read(cx).len(),
+                l2.read(cx).text().to_string(),
+                t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
+            )
+        });
+        assert_eq!(l2_len, src.len(), "live2 应全文即见（复用已解析 Doc，len == 编辑区）");
+        assert_eq!(l2_text, src, "live2 内容应 == 编辑区全文（复用同源）");
+        assert_eq!(md_now.as_deref(), Some(src.as_str()), "live2 装配不得改动右栏 md_wy");
+        // live2 首次编辑 → 自身 Doc::edit COW 分离，右栏 md_wy Doc 逐字节不变。
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            live.update(cx, |e, cx| e.replace_range(0..0, "X", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (l2_after, md_after) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.live2.clone().expect("live2 应存在").read(cx).text().to_string(),
+                t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
+            )
+        });
+        assert!(l2_after.starts_with('X'), "live2 编辑应生效：{l2_after:?}");
+        assert_eq!(
+            md_after.as_deref(),
+            Some(src.as_str()),
+            "live2 编辑一次后右栏 md_wy Doc 必须保持原状（克隆共享、编辑即 COW 分离）"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
