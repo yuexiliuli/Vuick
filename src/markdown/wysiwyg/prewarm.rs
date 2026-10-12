@@ -8,7 +8,10 @@ use super::Frame;
 /// （滚动像素/宽度/内容代）签名，连续无变化帧累计到 [`Self::IDLE_SKIP_FRAMES`] 后停止，
 /// 滚动/缩放/编辑等任何变化立即复位。登记簿（`last_band_idx`/`dir`/`bias`）在跳过帧
 /// 仍由 [`element::prewarm_band`] 更新，滚动恢复后速度预算/方向判定保持新鲜。
-#[derive(Debug, Clone, Copy)]
+///
+/// I4（巨型代码块整形跳过）：`giant_pin`/`pending_giant`/`giant_idle`/`giant_sig` 是
+/// 「巨块快速路径 → 静止权威整形」的跨帧状态，见 [`super::frame::settle_giant_blocks`]。
+#[derive(Clone)]
 pub(crate) struct Prewarm {
     pub dir: i8,
     /// 基础预算（每帧预热块数的下限；慢滚/静止时用它维持对下一带的渐进填充）。
@@ -25,6 +28,18 @@ pub(crate) struct Prewarm {
     /// 门控会在滚动前就把预热门关掉 → 用户首次滚动落点带冷、Pass2 突发回归）。
     /// 任何滚动/内容/宽度变化（签名变）立即清零 → 回归正常门控（0746946 不破坏）。
     pub cold_topup: u8,
+    /// I4 巨块**钉住行**（键 = 块内容指纹 [`super::frame::block_content_id`]）：最后一次
+    /// 权威整形的巨型代码块行。编辑作废 `shape_rows` 后仍钉住复用——巨块内键入期间
+    /// 文本/光标/点击继续可用（内容滞后至上次 settle，静止后由 `settle_giant_blocks`
+    /// 更新为新内容）。按内容指纹键 → 结构编辑/换源后旧条目自然失效（不触碰 edit.rs）。
+    pub(crate) giant_pin: std::collections::HashMap<u64, std::rc::Rc<super::ShapedRow>>,
+    /// I4 待「静止权威整形」的巨型代码块下标（去重；`settle_giant_blocks` 消费）。
+    pub(crate) pending_giant: Vec<usize>,
+    /// I4 静止权威整形驱动：连续「签名无变化」帧计数（语义同 [`Self::idle`]，独立于
+    /// 预热门控，编辑/滚动/宽度任一变复位——保证每键不整块、静止后才补）。
+    pub(crate) giant_idle: u8,
+    /// I4 静止整形**上一帧**签名（同 [`PrewarmSig`] 语义；与预热门控签名各记各的）。
+    pub(crate) giant_sig: Option<PrewarmSig>,
 }
 
 /// 帧变化签名（见 [`Prewarm::sig`]）——「内容/宽度维」与 `build_frame` 帧缓存键**同源**
@@ -68,6 +83,10 @@ impl Default for Prewarm {
             idle: 0,
             sig: None,
             cold_topup: 0,
+            giant_pin: std::collections::HashMap::new(),
+            pending_giant: Vec::new(),
+            giant_idle: 0,
+            giant_sig: None,
         }
     }
 }
@@ -78,6 +97,26 @@ impl Prewarm {
     /// 视口下几带温好。比时长更关键的是预算：预整形单帧仍有 **8ms 硬时间上限**
     /// （`prewarm_band` 内 `time_budget`），冷开帧不会叠加成长帧。
     pub(crate) const COLD_TOPUP_FRAMES: u8 = 6;
+
+    /// I4 静止权威整形等待帧数：巨块快速路径登记后，连续 `GIANT_SETTLE_IDLE_FRAMES`
+    /// 帧签名无变化（静止/停编辑）才补一次权威整形——太短会插进打字连击中间造成
+    /// 单帧秒级冻结；8 帧 ≈ 0.27s@30fps，足够识别真正的停顿。
+    pub(crate) const GIANT_SETTLE_IDLE_FRAMES: u8 = 8;
+
+    /// I4 登记「待静止权威整形」的巨块（去重；`settle_giant_blocks` 消费）。
+    pub(crate) fn register_giant(&mut self, block: usize) {
+        if !self.pending_giant.contains(&block) {
+            self.pending_giant.push(block);
+        }
+    }
+    /// I4 取指定内容指纹的钉住行（快速路径复用；None = 无钉/已换代）。
+    pub(crate) fn giant_stale(&self, cid: u64) -> Option<std::rc::Rc<super::ShapedRow>> {
+        self.giant_pin.get(&cid).cloned()
+    }
+    /// I4 更新钉住行（`settle_giant_blocks` 权威整形落盘）。
+    pub(crate) fn pin_giant(&mut self, cid: u64, row: std::rc::Rc<super::ShapedRow>) {
+        self.giant_pin.insert(cid, row);
+    }
 
     /// 装源后冷开反门控：置 `cold_topup` 并让方向/登记簿全新（首帧重登记当前带），
     /// 之后每帧在预算内强制预整形，直到帧数耗尽或用户任何举动（签名变）打断（打断在

@@ -18,6 +18,7 @@ use crate::markdown::doc::DocRow;
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::{BlockMeta, RowKind};
 use crate::markdown::parse::inline_style::MathRegion;
+use crate::markdown::wysiwyg::prewarm::PrewarmSig;
 
 /// 冷启动首次 shape 回退字形（❗⚠✅ 等）时 DWrite 可能给「错误回退字体的非零占位字形」
 /// （glyph id≠0，逃过 `.notdef` 检测）→ 渲染方框且会被直接缓存（caret 行正常 / 非
@@ -603,6 +604,11 @@ fn pass2_shape_band(
                 let cid = block_content_id(doc, k);
                 let srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
+                } else if is_giant_code_block(doc, base, k) {
+                    // I4 巨型代码块快速路径：不物化、不整块重 shape 出权威行——复用
+                    // 钉住的陈旧行（内容滞后至上次 settle，几何/字节图仍可用）或估计高
+                    // 占位；登记待静止 settle（`giant_fast_row` 内部完成）。
+                    giant_fast_row(editor, doc, base, k, shape_key)
                 } else if let Some(last) = editor.cooling_row(k) {
                     // 冷却帧：不调用 gpui shape（被钉的 `LineLayoutCache` 键本帧不被
                     // 引用 → 帧末自然淘汰），复用上一份 notdef 行几何继续显示。次帧
@@ -741,6 +747,12 @@ fn band_hit_test(
     let mut hit_map: std::collections::HashMap<usize, std::rc::Rc<ShapedRow>> =
         std::collections::HashMap::new();
     for k in lo..hi {
+        // I4 巨型代码块：**不进 need_row / hit_map**——物化 + 逐行 shape 整块代价可达
+        // 秒级（debug 6MB 单围栏 1.4s），由 Pass2 组装循环走快速路径（钉住陈旧行 /
+        // 估计高占位），静止后 `settle_giant_blocks` 权威补真。
+        if is_giant_code_block(doc, base, k) {
+            continue;
+        }
         let srcline = base.borrow().src_line(k) as usize;
         let cid = block_content_id(doc, k);
         if caret_line == srcline {
@@ -789,6 +801,85 @@ fn band_parse_rows(doc: &Doc, need_row: &[usize]) -> std::collections::HashMap<u
     }
     crate::prof::end("wy.bf.blockparse", _t_parse);
     rows_map
+}
+
+/// I4 巨型代码块**快速路径行**：不物化、不整块重 shape 出权威行，只给「可显示」近似。
+///
+/// 优先级：① `shape_rows` 缓存命中（早前 settle 的权威行）→ 直接复用不登记；
+/// ② 钉住的陈旧权威行（编辑作废 `shape_rows` 后仍可用，几何/字节图完好 → 巨块内键入
+/// 期间文本/光标/点击继续工作，内容滞后至上次 settle）→ 复用 + 登记待 settle；
+/// ③ 首现/未知 → 估计高占位（空面板，内容静止 settle 后权威出现）+ 登记待 settle。
+/// ②③ 登记进 [`Prewarm::pending_giant`] 后由 [`self::settle_giant_blocks`] 静止期补算
+/// 真整形并 notify——每键不再整块重 shape。
+fn giant_fast_row(
+    editor: &WyEditor,
+    doc: &Doc,
+    base: &Rc<RefCell<BlockLayout>>,
+    k: usize,
+    shape_key: u64,
+) -> ShapedRow {
+    let cid = block_content_id(doc, k);
+    // ① 权威行已在缓存（settle 已落盘，本帧复用）→ 既快又新，不需重新登记。
+    if let Some(rc) = editor.shape_rows.borrow_mut().get(cid, shape_key) {
+        return (*rc).clone();
+    }
+    // ② 钉住的上一次权威行（几何/字节图仍可用）→ 复用 + 登记待 settle。
+    let stale = {
+        let pw = editor.prewarm.borrow();
+        pw.giant_stale(cid)
+    };
+    if let Some(rc) = stale {
+        editor.prewarm.borrow_mut().register_giant(k);
+        return (*rc).clone();
+    }
+    // ③ 首现/未知：估计高占位 + 登记待 settle。
+    editor.prewarm.borrow_mut().register_giant(k);
+    giant_placeholder_row(editor, doc, base, k)
+}
+
+/// I4 巨块估计高占位：仅面板背景 + 基础布局当前估计高（不物化、不逐行 shape）。
+/// 代码块 `estimate_height = code_line()*(aux+2)` 与真实（nowrap 逐行等高）一致数量级，
+/// 滚动条量程/带边基本不抖；`editable=false` → caret/命中未知几何时不画光标不引导错位。
+fn giant_placeholder_row(
+    editor: &WyEditor,
+    doc: &Doc,
+    base: &Rc<RefCell<BlockLayout>>,
+    k: usize,
+) -> ShapedRow {
+    let (src_line, height) = {
+        let b = base.borrow();
+        (b.src_line(k) as usize, b.height(k))
+    };
+    let next = {
+        let b = base.borrow();
+        if k + 1 < b.n() {
+            b.src_line(k + 1) as usize
+        } else {
+            doc.line_count().max(src_line + 1)
+        }
+    };
+    ShapedRow {
+        src_line,
+        src_lines: src_line..next.max(src_line + 1),
+        wrapped: std::rc::Rc::new(Vec::new()),
+        has_non_ascii: false,
+        sub_heights: Vec::new(),
+        byte_map: std::rc::Rc::new(Vec::new()),
+        editable: false,
+        multi_offsets: Vec::new(),
+        code_ranges: Vec::new(),
+        lh: editor.theme.code_line(),
+        x_off: px(crate::config::markdown::CONTENT_EDGE_PAD_X_PX),
+        align_offsets: Vec::new(),
+        height: px(height),
+        top: px(0.),
+        kind: IrKind::Code,
+        table: None,
+        table_edit: None,
+        image: None,
+        mm: None,
+        extra: RowExtra::default(),
+    }
 }
 
 /// **Pass 3**：组装带内行（有效 top = 基础前缀 + 动态增量前缀，`set` 后已是最终高度）。
@@ -900,6 +991,52 @@ pub(crate) fn block_content_id(doc: &Doc, block: usize) -> u64 {
         h.write(doc.line_str(srcn).as_bytes());
     }
     h.finish()
+}
+
+// ═══ I4 巨型代码块「整形跳过 → 静止权威整形」闸门 ═══
+// 超大块（单围栏 6MB：debug 单次权威整形 ~1.4s）进带/编辑时绝不能在 Pass2 同步整块重
+// shape——首现/滚动进带先走「快速路径」（钉住陈旧行 / 估计高占位），登记进
+// [`Prewarm::pending_giant`]，静止后由 [`self::settle_giant_blocks`] 补算真整形并 notify。
+// 阈值与 `prewarm_band` 的「大块跳过预热」同源（`block_span` 双阈值），见其下方调用点。
+pub(crate) const GIANT_SPAN_LINES: usize = 64;
+pub(crate) const GIANT_SPAN_BYTES: usize = 4096;
+
+/// 块跨度 `(覆盖源码行数, 字节跨度)`——I4 巨块判定与 `prewarm_band` 大块跳过**共用**
+/// 同一计算源（对齐阈值：改一个常量两处同时生效）。行数不反映行的宽度（胖表格多列），
+/// 字节更准，双阈值取或。
+pub(crate) fn block_span(
+    doc: &Doc,
+    base: &Rc<RefCell<BlockLayout>>,
+    k: usize,
+) -> (usize, i64) {
+    let base_ref = base.borrow();
+    let s0 = if k < base_ref.n() {
+        base_ref.src_line(k) as usize
+    } else {
+        0
+    };
+    let s1 = if k + 1 < base_ref.n() {
+        base_ref.src_line(k + 1) as usize
+    } else {
+        s0 + 1
+    };
+    let span_bytes = doc
+        .block_meta(k)
+        .and_then(|m| doc.block_meta(k + 1).map(|n| n.byte as i64 - m.byte as i64))
+        .unwrap_or(0);
+    (s1.saturating_sub(s0), span_bytes)
+}
+
+/// **巨型代码块**判定：`kind == Code` 且跨度超阈值（与 `prewarm_band` 大块跳过同源）。
+/// 命中 → `band_hit_test` 不物化、Pass2 走 [`self::giant_fast_row`]，静止后权威整形。
+pub(crate) fn is_giant_code_block(
+    doc: &Doc,
+    base: &Rc<RefCell<BlockLayout>>,
+    k: usize,
+) -> bool {
+    let (span_lines, span_bytes) = block_span(doc, base, k);
+    doc.block_meta(k).is_some_and(|m| m.kind == RowKind::Code)
+        && (span_lines > GIANT_SPAN_LINES || span_bytes > GIANT_SPAN_BYTES as i64)
 }
 
 pub(crate) fn build_frame(
@@ -1214,6 +1351,8 @@ pub(crate) fn prewarm_band(
     window: &mut Window,
     scroll_top: f32,
 ) {
+    // I4：巨型代码块静止权威整形（先于预热登记簿；独立静止门控，静止期才干活）。
+    settle_giant_blocks(e, window, frame, scroll_top);
     let q = 512.;
     let mut st = e.prewarm.borrow_mut();
     let (blo, bhi) = frame.band;
@@ -1282,34 +1421,21 @@ pub(crate) fn prewarm_band(
         let srcline = frame.base.borrow().src_line(k) as usize;
         // 大块跳过预热：单块 DocRow 覆盖整块源区间，`rows_in_block_window(k,k)` 会
         // 一次性物化并整形整个块（debug 胖表格/长代码段可达 1.6s/块，实测快滚跨界时
-        // 单帧窒息）。预热只挑小/中块；大块进带时由 Pass2 权威整形（那时本来就要渲染）。
-        // 判定用「字节跨度 + 行跨度」双阈值——行数不反映行的宽度（胖表格多列），字节更准。
-        let big = {
-            let base_ref = frame.base.borrow();
-            let s0 = if k < base_ref.n() {
-                base_ref.src_line(k) as usize
-            } else {
-                0
-            };
-            let s1 = if k + 1 < base_ref.n() {
-                base_ref.src_line(k + 1) as usize
-            } else {
-                s0 + 1
-            };
-            let span_lines = s1.saturating_sub(s0);
-            let span_bytes = doc
-                .block_meta(k)
-                .and_then(|m| doc.block_meta(k + 1).map(|n| n.byte as i64 - m.byte as i64))
-                .unwrap_or(0);
-            // 中大型代码块（≥8 行）也按「大块」跳过预热：syntect 整块解析是 debug 下
-            // 的主要单块成本（实测 14 行 rust 块 ~300ms），预热 8ms 预算拦不住它——
-            // 交进带时 Pass2 权威整形（那时本来要渲染），滚动帧不被投机整形拖垮。
-            let is_medium_code = doc
-                .block_meta(k)
-                .map(|m| m.kind == RowKind::Code && s1.saturating_sub(s0) > 8)
-                .unwrap_or(false);
-            span_lines > 64 || span_bytes > 4096 || is_medium_code
-        };
+        // 单帧窒息）。预热只挑小/中块；大块进带时由 Pass2 权威整形（那时本来就要渲染，
+        // 且 I4 后巨型代码块改走快速路径 + 静止 settle）。判定用「字节跨度 + 行跨度」
+        // 双阈值——行数不反映行的宽度（胖表格多列），字节更准；与 I4 巨块闸共用
+        // [`self::block_span`]（阈值常量同源）。
+        let (span_lines, span_bytes) = block_span(doc, &frame.base, k);
+        // 中大型代码块（≥8 行）也按「大块」跳过预热：syntect 整块解析是 debug 下
+        // 的主要单块成本（实测 14 行 rust 块 ~300ms），预热 8ms 预算拦不住它——
+        // 交进带时 Pass2 权威整形（那时本来要渲染），滚动帧不被投机整形拖垮。
+        let is_medium_code = doc
+            .block_meta(k)
+            .map(|m| m.kind == RowKind::Code && span_lines > 8)
+            .unwrap_or(false);
+        let big = span_lines > GIANT_SPAN_LINES
+            || span_bytes > GIANT_SPAN_BYTES as i64
+            || is_medium_code;
         // 与 Pass2 `blocked` 同判据：折叠/math 块不物化整形行。
         let blocked = match &plan {
             Some(p) => {
@@ -1344,6 +1470,79 @@ pub(crate) fn prewarm_band(
     }
     crate::prof::end("wy.prewarm", _t);
     st.bias = (st.bias + bpf) % n;
+}
+
+/// I4 巨型代码块「静止权威整形」：Pass2 快速路径把巨块登记进 [`Prewarm::pending_giant`]
+/// 后，这里在**帧签名静止**（复用 [`PrewarmSig`] 门控语义：滚动像素/宽度/内容/图片/数学
+/// /mermaid 缩放任一变都复位）且连续 [`Prewarm::GIANT_SETTLE_IDLE_FRAMES`] 帧后，对本帧
+/// 带内可见的一个 pending 巨块做一次**权威整形**（物化 + `shape_docrow` + 入 `shape_rows`
+/// 缓存 + 更新钉 + 真高写回基础布局），并把缓存帧置 None + 请求下一帧——权威内容/高度
+/// 在下帧出现。编辑/滚动活跃期不触发（每键不整块重 shape）。
+///
+/// 单块权威整形可达秒级（debug 6MB 单围栏 ~1.4s），**一次一块**摊到静止后的逐帧；
+/// 带外（滚走）的 pending 块不强制整形，等它回带 + 静止再补。正确性闭环：首现/滚动
+/// 进带 → 占位（`giant_fast_row`）→ 静止 → 这里真整形 → 下帧内容正确出现。
+pub(crate) fn settle_giant_blocks(
+    e: &WyEditor,
+    window: &mut Window,
+    frame: &Frame,
+    scroll_top: f32,
+) {
+    let mut st = e.prewarm.borrow_mut();
+    if st.pending_giant.is_empty() {
+        // 无 pending → 静止整形状态归零（换源/清空后不残留旧签名）。
+        st.giant_idle = 0;
+        st.giant_sig = None;
+        return;
+    }
+    let sig = PrewarmSig::of(frame, scroll_top);
+    if st.giant_sig != Some(sig) {
+        // 签名变化（滚动/缩放/内容/宽度动过）→ 复位静止计数，等它真正停稳。
+        st.giant_idle = 0;
+        st.giant_sig = Some(sig);
+    } else {
+        st.giant_idle = st.giant_idle.saturating_add(1);
+    }
+    if st.giant_idle < Prewarm::GIANT_SETTLE_IDLE_FRAMES {
+        return;
+    }
+    // 越界（换源/结构编辑后旧下标失效）的登记直接清掉。
+    let n = e.doc().block_count();
+    st.pending_giant.retain(|&k| k < n);
+    // 只 settle 本帧带内可见的 pending 巨块（一次一块：单块即可达秒级）。
+    let (bi0, bi1) = frame.band_block_range(frame.band.0, frame.band.1);
+    let Some(pos) = st.pending_giant.iter().position(|&k| k >= bi0 && k < bi1) else {
+        // 在带外（滚走了）：本轮不强制整形，等回带 + 静止再补。
+        st.giant_idle = 0;
+        return;
+    };
+    let k = st.pending_giant.remove(pos);
+    drop(st);
+    let doc = e.doc();
+    let sk = (f32::from(frame.width).to_bits() as u64) ^ e.mermaid_zoom_gen();
+    let avail = (f32::from(frame.width) - f32::from(frame.padding) * 2.).max(1.);
+    if let Some(r) = doc.rows_in_block_window(k, k).into_iter().next() {
+        // 权威整形（与 Pass2 同路径）：>8 行代码首帧纯文本 + 请求后台 syntect，就绪后
+        // `on_code_parse_ready` 定向重排上色——静止期多在首帧后一两帧补上。
+        let row = shape_docrow(r, e, window, frame.width, avail, &e.theme, &e.theme.font);
+        let cid = block_content_id(doc, k);
+        // 真高写回基础布局（下次 `build_frame` 的带/量程用收敛真值；这里用 try 借用，
+        // paint/prepaint 若正持 base 借用则跳过写回，缓存仍在下帧生效）。
+        if let Ok(mut b) = frame.base.try_borrow_mut() {
+            b.set(k, f32::from(row.height));
+        }
+        let rc = e.shape_rows.borrow_mut().put(cid, sk, row);
+        // 更新钉：随后编辑作废 `shape_rows` 时快速路径可复用这份权威行。
+        e.prewarm.borrow_mut().pin_giant(cid, rc);
+        // 强制下帧重建 Frame（base 真高 / 缓存命中才生效）并请求重绘。
+        *e.frame.borrow_mut() = None;
+        // 请求动画帧（prepaint 内合法）：settle 后若再无事件，不请求就没有下一帧、
+        // 新内容永远不显示。测试二进制无平台帧循环，`request_animation_frame` 的
+        // `current_view()` 断言只在渲染相位合法——测试里由显式 build_frame/refresh 驱动，
+        // 这里跳过（不影响行为断言）。
+        #[cfg(not(test))]
+        window.request_animation_frame();
+    }
 }
 
 /// Windows 冷启动 color-emoji 光栅预热（一次/进程）。实测：DWrite 在冷进程里**首次**

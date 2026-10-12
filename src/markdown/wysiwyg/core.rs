@@ -110,6 +110,7 @@ impl WyEditor {
             redo_stack: Vec::new(),
             open_unit: None,
             last_edit: None,
+            last_edit_at: None,
             live_ops: None,
             hover_image: Cell::new(None),
             selected_image: Cell::new(None),
@@ -436,6 +437,7 @@ impl WyEditor {
         self.redo_stack.clear();
         self.open_unit = None;
         self.last_edit = None;
+        self.last_edit_at = None;
         // 整篇换源：后台加载窗口内（旧空壳上）缴存的陈旧 op 与新的源坐标不再对应，
         // 必须清空（否则切回时把它们错位重放到源码编辑区）。收集开关本身保留。
         if let Some(log) = &mut self.live_ops {
@@ -626,6 +628,7 @@ impl WyEditor {
         self.sel_anchor = None;
         // 光标移动 → 打断撤销合并组（同 editor/undo.rs 的 cooperative=false）。
         self.last_edit = None;
+        self.last_edit_at = None;
         *self.frame.borrow_mut() = None;
     }
     /* ---------- 选区 ---------- */

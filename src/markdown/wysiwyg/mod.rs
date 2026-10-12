@@ -70,8 +70,9 @@ pub(crate) use self::prewarm::Prewarm;
 pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 pub(crate) use self::types::{
     BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
-    ImageSrcBlocks, MathSlot, PrebuildBlock, PrebuildPass1, TocCacheEntry, TocEntries, UNDO_LIMIT,
-    UndoUnit, WyDerived, WyOpenResult, inline_math_key, is_plain_region_line, region_line_sig,
+    ImageSrcBlocks, MathSlot, PrebuildBlock, PrebuildPass1, TocCacheEntry, TocEntries,
+    UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived, WyOpenResult, inline_math_key,
+    is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -366,6 +367,9 @@ pub struct WyEditor {
     /// 同一撤销事务（连续打字 / 相邻退格 / 同点删除）；光标移动（`set_caret`/方向键
     /// `moved`）与整篇内容替换打断。
     last_edit: Option<(EditKind, usize, usize)>,
+    /// 上一个编辑发生的时刻（I1 时间窗）：与它停顿 ≥[`UNDO_GROUP_MS`]（300ms）即新起
+    /// 撤销单元（持续打字合并、停顿打断，对齐 `editor/undo.rs`）。与 `last_edit` 同生共灭。
+    last_edit_at: Option<std::time::Instant>,
     /// WYSIWYG「编辑日志」（方案2：切回编辑区按序重放，取代行级 diff 的主路径）。
     /// `Some` = 正在收集（仅 live2 实例被 App 开启，`md_wy` 右栏预览等非 live 编辑不
     /// 收集）；`None` = 关闭。收集内容 = `replace_range` / undo / redo 统一缴存的

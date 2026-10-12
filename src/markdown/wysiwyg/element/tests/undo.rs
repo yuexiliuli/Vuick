@@ -232,3 +232,42 @@ fn undo_redo_large_paste_circle(cx: &mut TestAppContext) {
     });
 }
 
+/// I1 时间窗合并：连续快速键入 → 一个撤销单元；停顿 >300ms 后继续键入 → 新起单元。
+#[gpui::test]
+fn undo_i1_breaks_group_after_300ms_pause(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(""));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|_window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 连续快速键入 abc → 一个撤销单元。
+        for ch in ["a", "b", "c"] {
+            ed.update(cx, |e, ecx| {
+                let at = e.caret();
+                e.replace_range(at..at, ch, ecx);
+            });
+        }
+        assert_eq!(ed.read(cx).text().as_ref(), "abc");
+        // 停顿 >300ms 再键入 def（真实单调钟，远超 UNDO_GROUP_MS）。
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        for ch in ["d", "e", "f"] {
+            ed.update(cx, |e, ecx| {
+                let at = e.caret();
+                e.replace_range(at..at, ch, ecx);
+            });
+        }
+        assert_eq!(ed.read(cx).text().as_ref(), "abcdef");
+        // 第一次撤销只回退 def（停顿后新起单元）。
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "abc", "停顿后新起撤销单元");
+        // 第二次撤销回退 abc（仍是一整个单元）。
+        ed.update(cx, |e, ecx| e.undo(ecx));
+        assert_eq!(ed.read(cx).text().as_ref(), "", "abc 应整体回退");
+    });
+}
+

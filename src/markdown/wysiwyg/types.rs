@@ -200,6 +200,9 @@ pub(crate) fn is_plain_region_line(line: &str) -> bool {
 }
 /// 撤销/重做栈深度上限（超出丢最旧）。
 pub(crate) const UNDO_LIMIT: usize = 200;
+/// 撤销合并时间窗：两次编辑间隔 < 300ms 才并入同一撤销单元；停顿 ≥ 该值即新起单元
+/// （I1 对齐 zed `History.group_interval`，与 `editor/undo.rs::UNDO_GROUP_MS` 同位）。
+pub(crate) const UNDO_GROUP_MS: std::time::Duration = std::time::Duration::from_millis(300);
 /// 后台装载结果：整篇 O(n) 解析（Doc::open + 派生标记计数 + 首帧基础布局预建输入）
 /// 的**纯输出**。`Send`，可在 `background_executor` 任意线程构建、再回 UI 线程
 /// [`WyEditor::install_open`]。

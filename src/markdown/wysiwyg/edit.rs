@@ -472,16 +472,20 @@ impl WyEditor {
         } else {
             EditKind::Atomic
         };
-        let merges = match self.last_edit {
-            Some((k, s, _e)) if k == intent => match intent {
-                // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
-                EditKind::Typing => r.start == s + inserted_len,
-                EditKind::Backspace => r.end == s, // 向后退格首尾相接
-                EditKind::Delete => r.start == s,  // 同起点延伸
-                EditKind::Atomic => false,
-            },
-            _ => false,
-        };
+        // I1 时间窗合并：与上一编辑停顿 ≥ UNDO_GROUP_MS（300ms）→ 视为新事务（持续打字
+        // 合并、停顿打断，同 editor/undo.rs）。std 单调钟纯时间判定，无定时器副作用。
+        let within_window = self.last_edit_at.is_none_or(|t| t.elapsed() < UNDO_GROUP_MS);
+        let merges = within_window
+            && match self.last_edit {
+                Some((k, s, _e)) if k == intent => match intent {
+                    // 纯插入区间零宽：上一编辑的**插入终点** = 其起点 + 插入长。
+                    EditKind::Typing => r.start == s + inserted_len,
+                    EditKind::Backspace => r.end == s, // 向后退格首尾相接
+                    EditKind::Delete => r.start == s,  // 同起点延伸
+                    EditKind::Atomic => false,
+                },
+                _ => false,
+            };
         if merges {
             // 并入打开单元：净区间/文本按意图累积（逆操作坐标不变形，见 UndoUnit）。
             let u = self.open_unit.as_mut().expect("能合并必已有打开的单元");
@@ -512,6 +516,7 @@ impl WyEditor {
         }
         self.redo_stack.clear();
         self.last_edit = Some((intent, r.start, r.start + inserted_len));
+        self.last_edit_at = Some(std::time::Instant::now());
         merges
     }
 
@@ -899,6 +904,7 @@ impl WyEditor {
             self.apply_raw_edit(u.range.clone(), &u.delete, target, cx);
         }
         self.last_edit = None;
+        self.last_edit_at = None;
     }
 
     /// 重做（D1）。
@@ -919,6 +925,7 @@ impl WyEditor {
             self.apply_raw_edit(r, &u.insert, target, cx);
         }
         self.last_edit = None;
+        self.last_edit_at = None;
     }
 
     /// A3：只读右栏预览的**增量桥**——把左栏源码编辑区同一次增删（`CodeEditor::take_last_edit`
@@ -1255,6 +1262,7 @@ impl WyEditor {
     fn moved(&mut self) {
         // 方向键移动 → 打断撤销合并组。
         self.last_edit = None;
+        self.last_edit_at = None;
         // 表格内容行内：光标钳到最近单元格内容区间（不落在管道/空白上，避免输入破坏表）。
         let (line, col) = self.row_col(self.caret);
         if let Some(c) = self.clamp_caret_table(line, col) {

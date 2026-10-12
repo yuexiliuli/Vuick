@@ -832,6 +832,72 @@ fn bench_rw_code(cx: &mut TestAppContext) {
 }
 #[gpui::test]
 #[ignore]
+fn bench_giant_code_scroll(cx: &mut TestAppContext) {
+    // 巨型单围栏（6MB，单块覆盖全档）的「滚动大块跨带」基准：① 首档冷建（巨块首现/
+    // 滚动进带，I4 前整块 Pass2 重 shape ~1.4s）② 随后多档带重建（跨带）。I4 后首档
+    // 走快速路径占位（~ms）、静止 settle 才补权威整形；跨带档全为占位/缓存命中。
+    use crate::markdown::wysiwyg::WyEditor;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::from("```\n");
+    let line = "let alpha beta gamma delta epsilon zeta = compute_one_two_three_four_five_six_seven_eight_nine_ten();\n";
+    while text.len() < 6_000_000 {
+        text.push_str(line);
+    }
+    text.push_str("```\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let width = px(980.);
+    let vh = 800.0f32;
+    let q = 512.0f32;
+    // ① 首档冷建（巨块滚动进带）。
+    let t0 = std::time::Instant::now();
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let _ = build_frame(ed.read(cx), window, width, (0., vh));
+    });
+    let first = t0.elapsed().as_secs_f64() * 1000.0;
+    let r0 = vcx.update(|_w, cx| host.read(cx).ed.read(cx).take_reshapes());
+    eprintln!("[bench] giant-scroll 首档冷建: {first:.3}ms（{r0} 次权威整形）");
+    // ② 多档带重建跨带（模拟 prepaint 512px 量子带，顶部 → 中下部，每档都是单块全档）。
+    let mut bands: Vec<(f32, f32)> = Vec::new();
+    for k in 0..20 {
+        let top = 400.0 * (k + 1) as f32;
+        bands.push((
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        ));
+    }
+    for (i, top) in [200_000.0f32, 400_000.0, 600_000.0].into_iter().enumerate() {
+        let _ = i;
+        bands.push((
+            (((top - vh) / q).floor() * q).max(0.),
+            ((top + 2. * vh) / q).ceil() * q,
+        ));
+    }
+    let mut t = 0.0f64;
+    let mut resh = 0u64;
+    for &band in &bands {
+        let t1 = std::time::Instant::now();
+        vcx.update(|window, cx| {
+            let ed = host.read(cx).ed.clone();
+            let _ = build_frame(ed.read(cx), window, width, band);
+        });
+        t += t1.elapsed().as_secs_f64() * 1000.0;
+        vcx.update(|_w, cx| {
+            resh += host.read(cx).ed.read(cx).take_reshapes();
+        });
+    }
+    eprintln!(
+        "[bench] giant-scroll 跨带 {} 档: {:.3}ms/档 (共 {resh} 次权威整形)",
+        bands.len(),
+        t / bands.len() as f64
+    );
+}
+#[gpui::test]
+#[ignore]
 fn bench_per_key_code_highlight_completion(cx: &mut TestAppContext) {
     // 量化「代码块内每键打字」的稳态成本（真实窗口顶部密集带 24-34ms/键的表现路径）：
     // 每键 = replace_range（非结构，块内单字符）→ build_frame（新内容纯文本行）→

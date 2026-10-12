@@ -504,3 +504,199 @@ fn cold_open_topup_forces_prewarm_despite_idle(cx: &mut TestAppContext) {
     });
 }
 
+/// I4 S1：巨型代码块（>64 行 / >4096B）**首现/滚动进带不再整块重 shape**——Pass2 走
+/// 快速路径（估计高占位）、零整形计数、登记进 `pending_giant`；静止
+/// [`Prewarm::GIANT_SETTLE_IDLE_FRAMES`] 帧后 `settle_giant_blocks` 补算权威整形（真行
+/// 入缓存 + 真高写回），重建后内容正确出现。
+#[gpui::test]
+fn giant_code_first_frame_placeholder_then_settle(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::{Prewarm, WyEditor};
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 巨型围栏（400 行代码 ≫ 64 行闸，估计高必超 1600px 带）→ 首帧带内只有它。
+    let mut text = String::from("```\n");
+    for i in 0..400 {
+        text.push_str(&format!("let value_{i} = alpha beta gamma delta epsilon;\n"));
+    }
+    text.push_str("```\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 首帧：巨块进带 → 只占位、零权威整形。
+        let f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        assert_eq!(
+            ed.read(cx).take_reshapes(),
+            0,
+            "巨块首现不得整块重 shape"
+        );
+        assert_eq!(
+            ed.read(cx).shape_rows_len(),
+            0,
+            "巨块不应以权威行入整形缓存（占位期）"
+        );
+        assert_eq!(
+            ed.read(cx).prewarm.borrow().pending_giant,
+            vec![0],
+            "巨块应登记进待 settle 集"
+        );
+        // 首帧输出 = 估计高占位空面板（无文本行）。
+        assert_eq!(f.rows.len(), 1, "带内只应有巨块");
+        assert!(f.rows[0].wrapped.is_empty(), "占位期不应有权威文本行");
+        assert_eq!(
+            f.rows[0].kind,
+            crate::markdown::ir::IrKind::Code,
+            "占位行仍是代码块语义（画面板背景）"
+        );
+        // 静止：连续同签名帧达到阈值 → settle 权威整形（一次真整形 + 入缓存 + 真高写回）。
+        for _ in 0..(Prewarm::GIANT_SETTLE_IDLE_FRAMES as usize + 2) {
+            prewarm_band(ed.read(cx), &f, window, 0.);
+        }
+        assert!(
+            ed.read(cx).prewarm.borrow().pending_giant.is_empty(),
+            "settle 后待处理集应清空"
+        );
+        assert!(
+            ed.read(cx).shape_rows_has(0),
+            "settle 后巨块权威行应入整形缓存"
+        );
+        // settle 强制下帧重建（frame 缓存置 None），重建后权威内容出现。
+        assert!(
+            ed.read(cx).frame.borrow().is_none(),
+            "settle 应清帧缓存触发重建"
+        );
+        let f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        assert_eq!(
+            f2.rows[0].wrapped.len(),
+            400,
+            "重建后巨块应显示 400 行权威内容"
+        );
+    });
+}
+
+/// I4 S2：巨块内**逐键键入不整块重 shape**（每键整形计数 0）、权威内容滞后、静止 settle
+/// 后内容正确补上；随后再次键入仍不整块（复用钉住陈旧行），再次静止再补——闭环成立。
+#[gpui::test]
+fn giant_code_typing_skips_whole_block_until_settle(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::{Prewarm, WyEditor};
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    let mut text = String::from("```\n");
+    for i in 0..400 {
+        text.push_str(&format!("let value_{i} = alpha beta gamma delta epsilon;\n"));
+    }
+    text.push_str("```\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        // 光标放到巨块内容中部（编辑行附近）。
+        let at = text.find("let value_40").unwrap() + 5;
+        ed.update(cx, |e, _| e.set_caret(at));
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        ed.read(cx).take_reshapes();
+        // 连续多键键入：每键都不整块（巨块在带内、光标在其内）；每键用**新鲜帧**喂
+        // prewarm_band（真实 prepaint 节奏：签名变 → settle 复位，不擅自整块）。
+        for k in 0..3u32 {
+            let ins = if k % 2 == 0 { "x" } else { "y" };
+            ed.update(cx, |e, ecx| e.replace_range(at..at, ins, ecx));
+            let fk = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            assert_eq!(
+                ed.read(cx).take_reshapes(),
+                0,
+                "巨块内键入不得触发整块权威重 shape（键 {k}）"
+            );
+            prewarm_band(ed.read(cx), &fk, window, 0.);
+        }
+        assert!(
+            !ed.read(cx).shape_rows_has(0),
+            "键入期不应有权威行入缓存（内容滞后）"
+        );
+        assert_eq!(
+            ed.read(cx).prewarm.borrow().pending_giant,
+            vec![0],
+            "键入期巨块仍登记待 settle"
+        );
+        // 静止补算：权威整形落后键一次性补齐 → 内容正确出现。
+        for _ in 0..(Prewarm::GIANT_SETTLE_IDLE_FRAMES as usize + 2) {
+            let f2 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            prewarm_band(ed.read(cx), &f2, window, 0.);
+        }
+        assert!(
+            ed.read(cx).shape_rows_has(0),
+            "静止 settle 后权威内容应入缓存"
+        );
+        let f3 = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        assert_eq!(
+            f3.rows[0].wrapped.len(),
+            400,
+            "settle 后巨块显示的是整块权威内容"
+        );
+        // 再次键入（编辑作废缓存 → 复用钉 + 重新登记），仍不整块。
+        ed.update(cx, |e, ecx| e.replace_range(at..at, "z", ecx));
+        build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        assert_eq!(
+            ed.read(cx).take_reshapes(),
+            0,
+            "settle 后再次键入仍不整块重 shape"
+        );
+        assert!(
+            !ed.read(cx).shape_rows_has(0),
+            "编辑作废后缓存条目应被剔除（钉住行仍供显示）"
+        );
+    });
+}
+
+/// I4 回归护栏：**非巨块（小围栏）行为与现状完全一致**——<64 行代码块照常逐键整块
+/// 重 shape（整形计数 1/键、不登记待 settle），不受巨块闸影响。
+#[gpui::test]
+fn small_fence_unchanged_per_key_reshape(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::WyEditor;
+    use gpui::App;
+    cx.update(crate::actions::bind_local_keymaps);
+    // 10 行为小围栏（远低于 64 行闸）。
+    let mut text = String::from("```\n");
+    for i in 0..10 {
+        text.push_str(&format!("let v_{i} = alpha beta;\n"));
+    }
+    text.push_str("```\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx: &mut App| {
+        let ed = host.read(cx).ed.clone();
+        let at = text.find("let v_5").unwrap() + 5;
+        ed.update(cx, |e, _| e.set_caret(at));
+        let _f = build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+        ed.read(cx).take_reshapes();
+        // 小围栏逐键 → 仍按现状整块重排（恰 1 次整形/键），且不登记待 settle。
+        for k in 0..3u32 {
+            let ins = if k % 2 == 0 { "x" } else { "y" };
+            ed.update(cx, |e, ecx| e.replace_range(at..at, ins, ecx));
+            build_frame(ed.read(cx), window, px(900.), (0., 1600.));
+            assert_eq!(
+                ed.read(cx).take_reshapes(),
+                1,
+                "小围栏每键应整块重 shape 1 次（键 {k}）"
+            );
+        }
+        assert_eq!(
+            ed.read(cx).prewarm.borrow().pending_giant,
+            Vec::<usize>::new(),
+            "小围栏不应走巨块快速路径"
+        );
+        assert!(
+            ed.read(cx).shape_rows_has(0),
+            "小围栏权威行照常入缓存"
+        );
+    });
+}
+
