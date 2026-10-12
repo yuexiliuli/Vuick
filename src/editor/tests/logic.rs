@@ -287,6 +287,44 @@ fn undo_backspace_chains_merge_and_selection_restore() {
     assert_eq!(tx.edits.len(), 1);
 }
 
+/// I1 时间窗合并：连续快速键入 → 一个撤销单元；停顿 >300ms 后继续键入 → 新起单元。
+#[test]
+fn undo_i1_breaks_group_after_300ms_pause() {
+    let mut buf = Buffer::default();
+    let mut mgr = UndoManager::new();
+    // 连续快速键入 abc → 一个撤销单元。
+    for (i, ch) in "abc".chars().enumerate() {
+        mgr.start_tx(EditIntent::Typing, (i, i));
+        mgr.push_edit(buf.apply_edit(i..i, &ch.to_string()));
+        mgr.set_cooperative(true);
+    }
+    assert_eq!(buf.to_string(), "abc");
+    // 停顿 >300ms 再键入 def（真实单调钟，远超 UNDO_GROUP_MS）。
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    for (i, ch) in "def".chars().enumerate() {
+        let at = 3 + i;
+        mgr.start_tx(EditIntent::Typing, (at, at));
+        mgr.push_edit(buf.apply_edit(at..at, &ch.to_string()));
+        mgr.set_cooperative(true);
+    }
+    assert_eq!(buf.to_string(), "abcdef");
+    // 第一次撤销只回退 def（停顿后新起单元），before 从停顿后的光标起。
+    let tx = mgr.undo().expect("事务");
+    assert_eq!(tx.edits.len(), 1);
+    assert_eq!(tx.before, (3, 3));
+    for e in tx.edits.iter().rev() {
+        buf.undo_edit(e);
+    }
+    assert_eq!(buf.to_string(), "abc");
+    // 第二次撤销回退 abc（仍是一整个单元）。
+    let tx = mgr.undo().expect("事务");
+    assert_eq!(tx.edits.len(), 1);
+    for e in tx.edits.iter().rev() {
+        buf.undo_edit(e);
+    }
+    assert_eq!(buf.to_string(), "");
+}
+
 // ---------------------------------------------------------------------------
 // Highlight
 // ---------------------------------------------------------------------------
@@ -311,8 +349,9 @@ fn highlight_rust_keyword_comment_string() {
 fn far_down_jump_reanchors_bounded_not_full_prefix() {
     // 回归：大文档 `.rs` 拖滚动条时滑块极短，1 鼠标像素 ≈ 数千行，缺口（目标窗口底 −
     // 缓存上界）巨大。修复前 `extend_down` 会把整个缺口逐行重跑 syntect（16 万行级 →
-    // 数百毫秒），UI 线程卡死 → 内容只有松开才动。修复后缺口 >`REANCHOR_GAP` 改走
-    // **有界重锚**（O(窗口+回看) ≈ 百行级）。测试用 wall-clock 兜底 + 切片/锚点断言：
+    // 数百毫秒），UI 线程卡死 → 内容只有松开才动。修复后缺口超过单帧同步预算
+    // （`EXTEND_SYNC_BUDGET_ROWS`，见 highlight.rs）改走**有界重锚**（O(窗口+回看)
+    // ≈ 百行级）。测试用 wall-clock 兜底 + 切片/锚点断言：
     // 重锚后 base = lo − lookback、返回切片仍与请求窗口对齐。
     let text: String = (0..120_000)
         .map(|i| match i % 6 {
@@ -422,6 +461,77 @@ fn deferred_scroll_skips_syntect_until_settled() {
     assert_eq!(prev2, Some((0, 60, 16)));
     assert!(hl.settle_pending(&b), "上移的 settle 也应补齐缓存");
     assert_eq!(hl.highlight_window(&b, 0, 60, 16).len(), 61);
+}
+
+#[test]
+fn medium_gap_scroll_defers_until_settled() {
+    // I3 回归：中速拖动/惯性滚「缺口 ~500 行」——修复前缺口 < 旧 `REANCHOR_GAP`(1024)
+    // 走 `extend_down` 每帧同步逐行重跑整个缺口（~63µs/行，~500 行 ≈ 40-100ms/跳
+    // release / 百 ms 级 debug → 滑块跟不上鼠标）；修复后缺口超过 `EXTEND_SYNC_BUDGET_ROWS`
+    // 一律延后（登记 pending、本帧跳过 syntect、空样式渲染），静止 settle 一次**有界
+    // 重锚**（O(窗口+回看)≈一屏）上色——与既有大缺口路径共用同一 pending/settle 机制。
+    // 此测试锁定「~500 行缺口（100-900 行中速带）」也走延后，不再吃旧的同步扩展行为。
+    let text: String = (0..2_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    // 首帧（P1c 空缓存）延后 + settle 建顶窗缓存。
+    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
+    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
+    let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert!(!top[0].is_empty(), "预热后顶部应有颜色");
+
+    // 中速大缺口（~500 行，落在 100-900 中速带、且 < 旧 1024 阈值）：应延后而非同步扩展。
+    let (lo, hi) = (500usize, 608usize);
+    assert!(
+        !hl.accept_deferred(lo, hi, 16),
+        "缺口 500 行（> 单帧预算）应走延后，不再每帧同步逐行扩展"
+    );
+    assert_eq!(hl.pending(), Some((lo, hi, 16)), "延后应登记 pending 供 settle");
+    // 延后帧用空样式渲染：settle 前窗口尚未重锚（base 还停在顶部锚点）。
+    assert_eq!(hl.base(), 0, "settle 前不得提前重锚（本帧空样式渲染的前提）");
+
+    // 相邻帧窗口一致（滚动已停）→ settle 一次有界重锚即补齐，且只付一屏解析。
+    assert!(!hl.accept_deferred(lo, hi, 16), "次帧同一窗口仍延后（满足 settle 前提）");
+    assert_eq!(hl.pending(), Some((lo, hi, 16)), "相邻帧窗口一致 → 满足 settle 前提");
+    assert!(hl.settle_pending(&b), "settle 应补齐缓存");
+    assert_eq!(hl.base(), lo - 16, "settle 有界重锚到 lo − lookback，而非逐行扫缺口");
+    let rows = hl.highlight_window(&b, lo, hi, 16).to_vec();
+    assert_eq!(rows.len(), hi - lo + 1, "settle 后切片与请求窗口对齐");
+    assert!(!rows[0].is_empty(), "settle 后窗口应有颜色");
+    assert_eq!(hl.pending(), None, "settle 消耗 pending");
+}
+
+#[test]
+fn small_gap_scroll_stays_sync_path() {
+    // I3 护栏：缺口 ≤ `EXTEND_SYNC_BUDGET_ROWS`（滚轮/惯性微跳，每帧几~几十行）维持
+    // 现状**同步扩展**——`accept_deferred` 返回快路径、不登记 pending、颜色即时，
+    // 避免每帧都延后一帧的延迟；且扩展保持 `base` 不动（作用域栈连续，非重锚）。
+    let text: String = (0..2_000)
+        .map(|i| format!("let x: u32 = {i}; // c{i}\n"))
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
+    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
+    let _ = hl.highlight_window(&b, 0, 108, 16).to_vec();
+
+    // 小缺口下滚：窗口 [60,180] 越出缓存 72 行（≤ 预算）→ 同步扩展、颜色即时。
+    let (lo, hi) = (60usize, 180usize);
+    assert!(hl.accept_deferred(lo, hi, 16), "小缺口应走同步快路径（不延后）");
+    assert_eq!(hl.pending(), None, "同步路径不登记 pending");
+    assert_eq!(hl.base(), 0, "同步扩展保持 base 不动（作用域栈连续）");
+    let rows = hl.highlight_window(&b, lo, hi, 16).to_vec();
+    assert_eq!(rows.len(), hi - lo + 1, "切片与请求窗口对齐");
+    assert!(!rows[0].is_empty(), "同步扩展立即有颜色");
 }
 
 #[test]
@@ -1008,7 +1118,7 @@ fn highlight_cache_reuses_window_across_append_chunks() {
     );
     assert_eq!(rows, warm, "窗口颜色跨块保持一致（缓存复用）");
 
-    // 滚进新块区域（窗口 [55,105]，缺口远小于 REANCHOR_GAP）→ `extend_down` 从保存点
+    // 滚进新块区域（窗口 [55,105]，缺口 65 行 ≤ 单帧同步预算）→ `extend_down` 从保存点
     // 续解析补色：仍不整段重解析，且新行有正确颜色。
     let deep = hl.highlight_window(&b, 55, 105, 16).to_vec();
     assert_eq!(deep.len(), 51, "深窗切片应与请求窗口对齐");
@@ -1101,4 +1211,67 @@ fn bench_progressive_append_highlight_reuse() {
         "  提速: {:.1}×",
         ungated_ms / gated_ms.max(f64::MIN_POSITIVE)
     );
+}
+
+// ---------------------------------------------------------------------------
+// I3：中速大缺口滚动「限预算分段」帧成本基准
+// ---------------------------------------------------------------------------
+
+/// I3 基准：中速拖动/惯性滚「每帧缺口 ~500 行」的高亮帧成本（debug = 开发体感）。
+/// 模拟 `build_rows` 的帧循环：预热顶窗缓存后连续 8 帧下滚（每帧窗口底越出缓存
+/// ~500 行），每帧 `accept_deferred`；同步路径（返回 `quick`）再补 `highlight_window`
+/// ——即「UI 线程每帧要付的 syntect 成本」；最后静止一帧 settle。
+/// 旧行为（缺口 < 1024 走 `extend_down`）：每帧同步逐行扫整个缺口（~63µs/行，
+/// ~500 行 ≈ 40ms+ release / 百 ms 级 debug）→ 滑块跟不上鼠标；
+/// 本改动（> `EXTEND_SYNC_BUDGET_ROWS` 一律延后 + settle 有界重锚一屏）：拖动帧≈0
+/// syntect（延后帧空样式渲染）、settle 帧≈一屏（O(窗口+回看)）。
+/// 运行：`cargo test --bin gpui-editor bench_medium_gap_scroll_frames -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_medium_gap_scroll_frames() {
+    use std::time::Instant;
+    let text: String = (0..120_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+    let _ = hl.highlight_window(&b, 0, 108, 16).to_vec(); // 预热（不计时）
+
+    // 拖动：每帧窗口下移 ~500（中速拖动/惯性滚真实缺口带），共 8 帧。
+    const GAP: usize = 500;
+    const FRAMES: usize = 8;
+    let mut lo = 0usize;
+    let mut frame_us: Vec<u128> = Vec::with_capacity(FRAMES);
+    let mut sync_n = 0usize;
+    for _ in 0..FRAMES {
+        lo += GAP;
+        let hi = lo + 108;
+        let t = Instant::now();
+        if hl.accept_deferred(lo, hi, 16) {
+            sync_n += 1; // 同步路径（旧行为）：本帧整段扩展缺口。
+            let _ = hl.highlight_window(&b, lo, hi, 16).to_vec();
+        } // 延后路径（本改动）：本帧 0 syntect，颜色缺席由 settle 补。
+        frame_us.push(t.elapsed().as_micros());
+    }
+    let mean_us = frame_us.iter().sum::<u128>() as f64 / FRAMES as f64;
+    let min_us = *frame_us.iter().min().unwrap();
+    // 静止：pending 存在则一次有界重锚（O(窗口+回看)≈一屏）上色。
+    let settle_us = if hl.pending().is_some() {
+        let t = Instant::now();
+        assert!(hl.settle_pending(&b), "settle 应补齐缓存");
+        t.elapsed().as_micros()
+    } else {
+        0
+    };
+    println!("==== I3 中速大缺口滚动帧基准（缺口 {GAP} 行 ×{FRAMES} 帧） ====");
+    println!(
+        "  拖动帧: 均值 {mean_us:.0}µs  最小 {min_us}µs  明细 {frame_us:?}（同步补缺口 {sync_n} 帧）"
+    );
+    println!("  静止 settle（一屏有界重锚）: {settle_us}µs");
 }

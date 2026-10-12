@@ -1,16 +1,23 @@
-//! 撤销/重做：无定时器的确定性事务合并。
+//! 撤销/重做：确定性事务合并 + 300ms 时间窗。
 //!
 //! 设计吸收 **gpui-component `UndoManager`**：
 //! - 事务 = 「一组编辑 + 编辑前后选区」，编辑与光标绑定恢复（zed 也是「事务即编辑单元」）。
-//! - **无定时器合并**：按 `EditIntent` + 邻接性确定性判定（连续打字合并；Backspace 首尾
-//!   相接合并；Delete 同点延伸合并；Atomic/换行永远独立），光标移动即 `set_cooperative(false)` 断层。
+//! - **确定性合并 + 时间窗**：按 `EditIntent` + 邻接性确定性判定（连续打字合并；Backspace
+//!   首尾相接合并；Delete 同点延伸合并；Atomic/换行永远独立）；**I1 时间窗**：与上一编辑
+//!   停顿 ≥[`UNDO_GROUP_MS`]（300ms）即新起撤销单元（对齐 zed `History.group_interval`，
+//!   std 单调钟纯时间判定、无定时器副作用）。光标移动即 `set_cooperative(false)` 断层。
 //! - 上限 [`MAX_UNDO_TXS`] 个事务，超出丢最早。
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::editor::buffer::Edit;
 
 pub const MAX_UNDO_TXS: usize = 1000;
+
+/// 撤销合并时间窗：两次编辑间隔 < 300ms 才并入同一事务；停顿 ≥ 该值即新起撤销单元
+/// （zed/VS Code 式分组直觉：持续打字合并、停顿后打断）。
+pub const UNDO_GROUP_MS: Duration = Duration::from_millis(300);
 
 /// 编辑意图（决定合并规则）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +62,9 @@ pub struct UndoManager {
     redo_stack: Vec<Transaction>,
     pending: Option<PendingTx>,
     cooperative: bool,
+    /// 上一次编辑/合并发生的时刻（I1 时间窗）：自它停顿 ≥[`UNDO_GROUP_MS`] 未编辑 →
+    /// 下一条不再并入当前事务（新起撤销单元）。`None` = 尚无编辑。
+    last_edit_at: Option<Instant>,
 }
 
 impl UndoManager {
@@ -62,13 +72,18 @@ impl UndoManager {
         Self::default()
     }
 
-    /// 开始/续接一个事务。若已存在同意图的**可合作**事务则续接并返回 `true`；
-    /// 否则先提交旧事务、开启新事务。`before`：本事务开始前的选区。
+    /// 开始/续接一个事务。若已存在同意图的**可合作**事务且距上一编辑 <[`UNDO_GROUP_MS`]
+    /// 则续接并返回 `true`；否则先提交旧事务、开启新事务。`before`：本事务开始前的选区。
     pub fn start_tx(&mut self, intent: EditIntent, before: (usize, usize)) -> bool {
         let can_continue = self
             .pending
             .as_ref()
-            .map(|p| p.intent == intent && self.cooperative)
+            .map(|p| {
+                p.intent == intent
+                    && self.cooperative
+                    // I1 时间窗：停顿 ≥ UNDO_GROUP_MS → 视为新事务起点（刷新 before）。
+                    && self.last_edit_at.is_none_or(|t| t.elapsed() < UNDO_GROUP_MS)
+            })
             .unwrap_or(false);
         if can_continue {
             return true;
@@ -93,7 +108,8 @@ impl UndoManager {
             });
         }
 
-        // 尝试合并（克隆末条以避免与可变借用冲突；合并频率低、Edit 很小）
+        // 尝试合并（同意图 + 时间窗 + 邻接性，见 `try_merge`；克隆末条以避免与可变借用
+        // 冲突；合并频率低、Edit 很小）
         if self.cooperative {
             let intent = self.pending.as_ref().unwrap().intent;
             let last_clone = self.pending.as_ref().and_then(|p| p.edits.last().cloned());
@@ -102,6 +118,7 @@ impl UndoManager {
                     && let Some(p) = self.pending.as_mut()
                         && let Some(slot) = p.edits.last_mut() {
                             *slot = merged;
+                            self.last_edit_at = Some(Instant::now());
                             return;
                         }
         }
@@ -115,10 +132,15 @@ impl UndoManager {
             edits: vec![edit],
             before,
         });
+        self.last_edit_at = Some(Instant::now());
     }
 
     /// 尝试把 `next` 并入 `last`；可并入返回合并后的 `last`。
     fn try_merge(&self, intent: EditIntent, last: &Edit, next: &Edit) -> Option<Edit> {
+        // I1 时间窗：与上一编辑停顿 ≥ UNDO_GROUP_MS → 不并入（超窗断事务）。
+        if self.last_edit_at.is_none_or(|t| t.elapsed() >= UNDO_GROUP_MS) {
+            return None;
+        }
         match intent {
             EditIntent::Typing => {
                 // 连续打字：两侧纯插入、无换行、且紧邻（next 起点 = last 插入后终点）。
@@ -237,5 +259,6 @@ impl UndoManager {
         self.redo_stack.clear();
         self.pending = None;
         self.cooperative = false;
+        self.last_edit_at = None;
     }
 }

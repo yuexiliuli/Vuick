@@ -35,12 +35,14 @@ use syntect::parsing::{ParseState, Scope, ScopeStackOp, SyntaxReference, SyntaxS
 
 use crate::editor::buffer::Buffer;
 
-/// 向下滚动「缺口」超过此值（目标窗口底 − 缓存上界 + 1）时，放弃逐行 `extend_down`
-/// 改走**有界重锚**（`full_reparse`，O(窗口+回看)）：大文档 `.rs` 拖滚动条时滑块极短，
-/// 1 鼠标像素 ≈ 数千行，若逐行把整个缺口重跑 syntect 会把 UI 线程卡死数百毫秒
-/// （表现成「内容只有松开才动」）。缺口小（滚轮/小幅拖拽）仍走 extend_down，作用域栈
-/// 完整、颜色正确。
-const REANCHOR_GAP: usize = 1_024;
+/// 单帧**同步**逐行扩展（`extend_down`）的行数预算（≈ 1.5× 典型视口行数）：滚动缺口
+/// （目标窗口底 − 缓存上界 + 1）不超过此值时允许 UI 线程同步逐行续解析——滚轮/惯性微跳
+/// （每帧几~几十行）保持即时上色、作用域栈完整；超过预算（中速拖动/惯性滚，缺口
+/// 100-900 行）改走 [`Self::pending`] 延后 + settle **有界重锚**（`full_reparse`，
+/// O(窗口+回看)≈一屏）：首帧/拖动帧只付一屏解析（延后帧 0 syntect、空样式渲染），余量
+/// 交 settle 补齐，不再每帧把整个缺口逐行重跑——大 `.rs` ~63µs/行，600 行缺口 ≈
+/// 40-100ms/跳（release）/ 百 ms 级（debug），是「中速拖动不跟手」的根因。
+const EXTEND_SYNC_BUDGET_ROWS: usize = 160;
 
 /// 共享语法集（默认语法集几 MB，进程级共享一次）。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -169,10 +171,11 @@ pub struct Highlighter {
     dirty: Option<(usize, usize, i64)>,
     /// 语言/色板切换强制整窗重解析（跳过增量路径）。
     force_full: bool,
-    /// 滚动（拖拽/快滚）期间被延后的高亮窗口 `(lo, hi, lookback)`：大文档上拖滚动条
-    /// 每提交一跳都远超缓存，若每帧同步 `full_reparse`（DEBUG 下 syntect ~百 ms/次）
-    /// 会把帧率压到个位数，滑块/内容跟不紧鼠标。先登记 pending、本帧用空样式渲染
-    /// （帧廉价），滚动停住（相邻帧窗口一致）再由 `settle_pending` 补一次有界重锚。
+    /// 滚动（拖拽/快滚）期间被延后的高亮窗口 `(lo, hi, lookback)`：缺口超过单帧同步预算
+    /// （中速拖动/惯性滚 100-900 行到暴跳）时，若每帧同步 `extend_down` 逐行扫整个缺口
+    /// （DEBUG 下 syntect ~百 ms/帧）或 `full_reparse`，会把帧率压到个位数，滑块/内容
+    /// 跟不紧鼠标。先登记 pending、本帧用空样式渲染（帧廉价），滚动停住（相邻帧窗口
+    /// 一致）再由 `settle_pending` 补一次有界重锚（O(窗口+回看)≈一屏）。
     pending: Option<(usize, usize, usize)>,
     /// 测试探针（`cfg(test)`）：本实例 `full_reparse`（整段重解析建缓存）被调次数。
     /// P1a 渐进打开回归用它断言「追加块完全落在解析窗口之下时不再每块整段重解析」。
@@ -289,8 +292,8 @@ impl Highlighter {
     /// `extend_down` 即可（廉价且作用域栈完整）→ 返回 `true`，调用方继续走
     /// `highlight_window`（命中/小扩展两路径）。
     ///
-    /// 否则（大缺口下跳 / 上移越过 base，需要有界重锚 `full_reparse`）→ 返回 `false`，
-    /// 并把窗口登记为 `pending`（本帧不重锚，帧廉价）；滚动停住后由
+    /// 否则（缺口超单帧预算下跳 / 上移越过 base，需要有界重锚 `full_reparse`）→ 返回
+    /// `false`，并把窗口登记为 `pending`（本帧不重锚，帧廉价）；滚动停住后由
     /// [`Self::settle_pending`] 补一次重锚。见 [`Self::pending`] 字段说明。
     pub fn accept_deferred(&mut self, lo: usize, hi: usize, lookback: usize) -> bool {
         if self.covered(lo, hi) {
@@ -309,7 +312,7 @@ impl Highlighter {
         let needs_reanchor = if lo >= self.base {
             let cached_end = self.base + self.lines.len();
             hi.saturating_add(1) > cached_end
-                && hi.saturating_sub(cached_end).saturating_add(1) > REANCHOR_GAP
+                && hi.saturating_sub(cached_end).saturating_add(1) > EXTEND_SYNC_BUDGET_ROWS
         } else {
             // 上移出缓存：`highlight_window` 也会走整段重解析，同样贵 → 同样延后。
             true
@@ -440,10 +443,11 @@ impl Highlighter {
             if lo >= self.base {
                 let cached_end = self.base + self.lines.len();
                 if hi + 1 > cached_end {
-                    // 缺口巨大（拖滚动条在大文档上暴跳）→ 有界重锚，避免逐行解析整个
-                    // 前缀卡死 UI 线程；缺口小则正常向下扩展（作用域栈完整）。
+                    // 缺口超过单帧同步预算（拖滚动条/中速大跳）→ 有界重锚（O(窗口+回看)），
+                    // 避免逐行解析整个缺口卡死 UI 线程；缺口 ≤ 预算则正常向下扩展
+                    //（滚轮/惯性微跳，作用域栈完整）。
                     let gap = hi.saturating_sub(cached_end).saturating_add(1);
-                    if gap > REANCHOR_GAP {
+                    if gap > EXTEND_SYNC_BUDGET_ROWS {
                         self.full_reparse(buffer, lo, hi, lookback, version, line_count);
                         return;
                     }
