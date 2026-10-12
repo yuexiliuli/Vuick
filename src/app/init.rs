@@ -106,6 +106,8 @@ impl EditorApp {
             _appearance_sub: None,
             palette: None,
             _palette_sub: None,
+            // A：旧 live2 实体延迟回收队列（`commit_live` 暂存、下一帧 on_next_frame 清空）。
+            retired_live2: Vec::new(),
         };
         app.register_window(window, cx);
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，

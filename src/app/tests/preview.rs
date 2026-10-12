@@ -1882,3 +1882,302 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// A1：`commit_live` 把 `tab.content` 设为 live2 文本的**零拷贝共享**（`SharedString`
+    /// 句柄 clone，同一分配），不整篇 `.to_string()` 物化。探针：切回前先取 live2
+    /// `text()` 快照（先物化一次热身、令 `Doc::text_shared` 缓存就绪），切回后断言
+    /// `tab.content` 与快照**同一分配**（`as_ptr()` 相等）+ 内容等价——若 `commit_live`
+    /// 退化成 `.to_string()` + `SharedString::from`，必然新分配，指针即不等。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_content_shares_live2_text_zero_copy(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-zerocopy-{}.md",
+            std::process::id()
+        ));
+        let src = "# 标题\n正文段落。\n\n- [ ] 待办\n".repeat(40);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 编辑一字（切回走 op 重放主路径）。
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            let e = live.read(cx).text().to_string();
+            let at = e.find('段').expect("应有中文");
+            live.update(cx, |ed, cx| ed.replace_range(at..at + 3, "更", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 切回前快照：`text()` 返回与 `commit_live` 内部**同源同分配**的 SharedString。
+        let snap = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+        });
+        let snap_ptr = snap.as_ptr() as usize;
+        let snap_len = snap.len();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        // 探针：`tab.content` 与快照同一分配（零拷贝共享，非 to_string 物化）＋内容等价。
+        let (mirror_ptr, mirror) = cx.update(|_w, cx| {
+            let c = app.read(cx).tabs[app.read(cx).active_tab].content.clone();
+            (c.as_ptr() as usize, c)
+        });
+        assert_eq!(mirror.len(), snap_len, "tab.content 应等于 live2 最终文本长度");
+        assert_eq!(
+            mirror, snap,
+            "tab.content 应与 live2 最终文本内容等价"
+        );
+        assert_eq!(
+            mirror_ptr, snap_ptr,
+            "commit_live 的 tab.content 必须零拷贝共享 live2 text（同分配）；\
+            若退化成 .to_string()/SharedString::from 会另开新分配"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// A2：切回（`commit_live`）时 live2 实体**不立即销毁**，而是暂存进 app 侧
+    /// `retired_live2`，由 `cx.on_next_frame` 在「下一帧渲染完之后」清空队列、放实体
+    /// 出作用域 Drop（WyEditor 级联 Drop 因此移出点击同步路径）。
+    /// 断言：切回瞬间队列长度 == 1（app 侧不立即放行实体）；渲染一帧 + 投递
+    /// on_next_frame 后队列 == 0（app 侧不再持有、无累积）；再开再切一轮仍回到 0，
+    /// 不跨会话泄漏到下一次 open。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_retired_live2_drained_next_frame(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-retire-{}.md",
+            std::process::id()
+        ));
+        let src = "# 标题\n正文段落。\n\n- [ ] 待办\n".repeat(30);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ON → OFF：实体进 `retired_live2`，此时尚未到下一帧 on_next_frame，队列应暂存 1
+        //（app 侧不立即放行、不同步 Drop——销毁被延迟出点击路径）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let n0 = cx.update(|_w, cx| app.read(cx).retired_live2_len());
+        assert_eq!(n0, 1, "切回瞬间旧 live2 应暂存进 retired_live2，实际 {n0}");
+        // 渲染一帧（不带 live2 的源码编辑区 UI），再投递 `cx.on_next_frame` 登记的下一帧
+        // 回调 → 队列清空（app 侧放行实体，不再持有/累积）。
+        let mut drained = 0;
+        for _ in 0..6 {
+            cx.run_until_parked();
+            drained = cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+            if drained > 0 {
+                break;
+            }
+        }
+        assert!(drained > 0, "on_next_frame 应有已登记的下一帧回调");
+        let n1 = cx.update(|_w, cx| app.read(cx).retired_live2_len());
+        assert_eq!(n1, 0, "下一帧后 retired_live2 应被清空（app 侧无累积），实际 {n1}");
+        // 再来一轮 ON→OFF：队列重回 1 再清 0，无跨会话累积（无泄漏到下一次 open）。
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).retired_live2_len()),
+            0,
+            "重新开 live 前回收队列应为空"
+        );
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert_eq!(cx.update(|_w, cx| app.read(cx).retired_live2_len()), 0);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).retired_live2_len()),
+            1,
+            "再次切回仍应暂存 1 个旧实体"
+        );
+        let mut drained2 = 0;
+        for _ in 0..6 {
+            cx.run_until_parked();
+            drained2 = cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+            if drained2 > 0 {
+                break;
+            }
+        }
+        assert!(drained2 > 0, "第二轮 on_next_frame 回调应被投递");
+        assert_eq!(cx.update(|_w, cx| app.read(cx).retired_live2_len()), 0);
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// A 基准（`--ignored`，诊断不断言）：6.4MB 大文档「单字符」切回**同步点击路径**
+    /// 的分项实测——① `commit_live` 最终态物化（`text_shared` 冷一次，= A1 剩余下限
+    ///  ~20ms）；② WyEditor 实体**级联 Drop**（= A2 已移出点击路径的 ~36ms），用它
+    /// 还原「改动前」预估值 = 本测试的 OFF 耗时 + ②。运行：
+    /// `cargo test --bin gpui-editor app::tests::bench_wysiwyg_switch_fixed_overhead -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_wysiwyg_switch_fixed_overhead(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        // 6.4MB 文档：优先取仓内真实富结构 `fixtures/大文档测试2.md`（≈6.27MB，含标题/
+        // 表格/代码/待办等，与 63ms 基线的同一批素材），缺失则回退合成重复块。
+        let src = match std::fs::read(r"fixtures/大文档测试2.md") {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(_) => {
+                let block = "# 标题\n这是正文段落，凑 6.4MB 大文档的切回基准文本。\n\n- [ ] 待办\n";
+                block.repeat((64 * 1024 * 100) / block.len())
+            }
+        };
+        assert!(src.len() > 5 * 1024 * 1024, "基准文档应 ≥5MB，实际 {}", src.len());
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-bench-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        // 等到编辑区挂载完成（大文档两段式打开）。
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                !t.editor_pending && t.editor.read(cx).line_count() > 1000
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档编辑区应在 200 帧内就绪");
+        // ON，等 live2 后台解析就绪。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内加载完 6.4MB");
+        // 单字符编辑。
+        cx.update(|_w, cx| {
+            let live = app.read(cx).tabs[app.read(cx).active_tab]
+                .live2.clone().expect("live2");
+            let e = live.read(cx).text().to_string();
+            let at = e.find('段').expect("应有中文");
+            live.update(cx, |ed, cx| ed.replace_range(at..at + 3, "更", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ② 实体级联 Drop 成本（A2 已移出点击路径的分项）：OFF 前 clone 现实中的
+        // live2 句柄（live 会话已被 app 真实渲染过多帧、布局/整形缓存全就位）。OFF 后
+        // 让延迟回收队列清空、再把最后的句柄 drop 掉——complete 级联释放就是旧代码在
+        // 点击路径内同步做掉的成本。
+        let live_handle = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2.clone().expect("live2")
+        });
+        // ① OFF 切回（改动后）同步路径耗时 = 写回 + A1 物化下限；不含 Drop（已延迟到
+        // 下一帧，`ref retired_live2` 探针见 `wysiwyg_toggle_off_retired_live2_drained_next_frame`）。
+        let off_ms = cx.update(|window, cx| {
+            let t = std::time::Instant::now();
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+            t.elapsed().as_millis()
+        });
+        // ② OFF 后 app 侧不再持有旧实体（render + on_next_frame 清空退休队列）；实体的
+        // Rc 级联释放此前在点击路径内同步做（旧实现），现移到这之后。留一个句柄测其
+        // 释放被移出后点击路径的后果：此处 drop 已与点击路径无涉（仅供参考量级）。
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        for _ in 0..6 {
+            cx.run_until_parked();
+            let _ = cx.update(|window, cx| window.simulate_next_frame(cx));
+            cx.run_until_parked();
+        }
+        let drop_ms = cx.update(|_w, _cx| {
+            let t = std::time::Instant::now();
+            drop(live_handle);
+            t.elapsed().as_millis()
+        });
+        println!("【A2 分项】页点击路径内已不再持有/释放 live2；残留句柄 Drop ≈ {drop_ms} ms（量级参考）");
+        println!("【A·after】切回同步路径（写回+物化，不含 Drop）≈ {off_ms} ms");
+        println!("【A·before 参考】旧 GUI 实测 ≈63ms（1 字符，HEAD~0 提交文档）＝本 after + 被移出的实体 Drop ~36ms");
+        let _ = std::fs::remove_file(&md);
+    }
+

@@ -615,8 +615,16 @@ impl EditorApp {
         }
     }
 
-    /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
-    pub(super) fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
+    /// （仅测试）当前 `retired_live2` 延迟回收队列长度——A2 探针：切回瞬间应暂存 1 个
+    /// 旧 live2 实体，下一帧 `on_next_frame` 清空后回 0（无泄漏到下一次 open）。
+    #[cfg(test)]
+    pub(crate) fn retired_live2_len(&self) -> usize {
+        self.retired_live2.len()
+    }
+
+    /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览；live2 实体**延迟**
+    /// 到下一帧渲染后销毁（A：实体级联 Drop ~36ms 移出点击同步路径）。
+    pub(super) fn commit_live(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
         // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
         let l2_dirty = tab.live2_dirty;
@@ -624,6 +632,18 @@ impl EditorApp {
         tab.live_edit = false;
         tab._live2_sub = None;
         let Some(l2) = tab.live2.take() else { return };
+        // A2：**延迟回收**。live2 实体（WyEditor 大对象：Doc 的 rope/行索引/派生缓存 +
+        // 整`Rc` 级联）的销毁占切回 ~36ms，不能丢在点击事件路径里同步 Drop。先把实体
+        // 暂存到 app 侧 `retired_live2`（clone 是 O(1) 句柄；本函数内 `l2` 继续照常读写），
+        // 再用 `cx.on_next_frame`（gpui 保证「下一帧渲染完之后」触发）清空队列放实体
+        // 出作用域 Drop。**渲染引用安全性**：此处已 `tab.live2 = None`，切回后的任何
+        // render 都不再引用旧实体；`on_next_frame` 又晚于「下一帧已渲染/呈现」，故延迟
+        // Drop 时既无渲染在读它、也不占用展示切回结果的那一帧的 CPU。本函数所有提前
+        // return 路径共用此延迟（未改动 O(1) 跳过 / 加载中退出同样受益）。
+        self.retired_live2.push(l2.clone());
+        cx.on_next_frame(window, |this, _window, _cx| {
+            this.retired_live2.clear();
+        });
         // 视图从 WYSIWYG 换回源码编辑区：先清空两端编辑器可能残留的鼠标拖选状态
         // （须在任何提前 return 之前）。点击「预览编辑测试」菜单项时 GPUI 把 MouseDown
         // 按 `hitbox.is_hovered` 漏进编辑区置 `dragging=true`（不按 z-order 裁掉被菜单
@@ -661,11 +681,14 @@ impl EditorApp {
         // live 期间源码编辑区不被改写）→ op 字节偏移在源码编辑区与 live2 恒等，**按序
         // 重放即得最终态**，无需行级 LCS / 整篇物化比对。单 op = O(log n) Rope 编辑 +
         // 窗口化高亮增量。实测（debug，6.4MB）：写回本体 1 字符 ~1ms、3 行 ~3ms（旧 diff
-        // 光行级扫描就 ~45ms）；余下 ~20ms 是 tab.content 全网 O(n) 物化（旧路径同有）、
-        // ~36ms 是 live2 实体销毁（未改动 O(1) 跳过路径同款，既有接受的非写回开销）。
+        // 光行级扫描就 ~45ms）；`tab.content` 经 A1 走 SharedString 零拷贝分配（大文档 rope
+        // 源首次 `text_shared` 恰一次 O(n) 物化 ~20ms 属固有下限）；live2 实体销毁（~36ms）
+        // 已由 A2 延迟到下一帧（见上 `retired_live2`），不再计进本点击路径。
         let ops = l2.update(cx, |ed, _| ed.take_live_ops());
         if !ops.is_empty() {
-            // 最终态 = live2 文本（O(1) SharedString COW；live2 是 op 序号回放的权威终点）。
+            // 最终态 = live2 文本（A1：`SharedString` 句柄的 O(1) clone 赋给 `tab.content`，
+            // 零拷贝共享同一缓冲；大文档 rope 源首次 `text_shared` 恰一次 O(n) 物化是
+            // `tab.content` 必须为整段字符串的固有下限，已是最小化作一次）。
             let content = l2.read(cx).text();
             tab.content = content.clone();
             // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；不再
@@ -726,9 +749,13 @@ impl EditorApp {
         // 典型小改动（几字符/几行）切回落到数百 ms；大范围改动也只重排受影响块，不退化
         // 成整篇 set_text 级联。基线文本与 live2 同源（全 LF 规范化），无需再处理 CRLF。
         let base = tab.editor.read(cx).text().to_string();
-        let text = l2.read(cx).text().to_string();
-        tab.content = SharedString::from(text);
-        let content = tab.content.clone();
+        // A1：`l2.text()` 直接返回 `SharedString`（`Doc::text_shared` 的 O(1) 句柄），
+        // 零拷贝赋给 `tab.content` —— 不再 `.to_string()` 又 `SharedString::from` 绕一圈
+        // （省掉那份 6.4MB 副本与分配）。`content` 与 live2 的 rope 同源同值；SharedString
+        // 不可变（仅 `Deref<Target=str>`），源码编辑区后续任何写入都会新建缓冲，不会
+        // 改到被 `tab.content` 持有的这份 → 保存/脏标整篇读取安全。
+        let content = l2.read(cx).text();
+        tab.content = content.clone();
         let n_lines = content.as_ref().lines().count().max(1);
         let n_chars = content.as_ref().chars().count();
         tab.line_count = n_lines;
@@ -777,7 +804,7 @@ impl EditorApp {
             return;
         }
         if self.tabs[idx].live2.is_some() {
-            self.commit_live(idx, cx);
+            self.commit_live(idx, window, cx);
         } else {
             // 源快照：O(1) COW Rope。大文档走**后台解析**（与预览的后台 scan_blocks 同构）：
             // UI 线程只做 O(1) 快照 + 空壳编辑器创建 + 完成装配；整篇 O(n) 解析

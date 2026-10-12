@@ -147,7 +147,7 @@ impl EditorApp {
         }
         // 实时预览编辑模式下鼠标按住拖出：先把内容写回编辑区（实时实体不随选项卡搬）。
         if self.tabs[idx].live_edit {
-            self.commit_live(idx, cx);
+            self.commit_live(idx, window, cx);
         }
         let Some(payload) = self.take_tab_payload(idx) else {
             return;
@@ -180,7 +180,7 @@ impl EditorApp {
         }
         // 实时预览编辑模式下 tear-off：先写回（实时实体不随选项卡搬）。
         if self.tabs[idx].live_edit {
-            self.commit_live(idx, cx);
+            self.commit_live(idx, window, cx);
         }
         let Some(payload) = self.take_tab_payload(idx) else {
             return;

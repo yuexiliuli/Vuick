@@ -370,6 +370,13 @@ pub struct EditorApp {
     palette: Option<gpui::Entity<crate::ui::palette::CommandPalette>>,
     /// 面板关闭订阅（选择/Esc/点击外 → 清空 `palette` 并释放实体）。
     _palette_sub: Option<Subscription>,
+    /// A：退出预览编辑（`commit_live`）时被 `take(2)` 的旧 live2 实体**延迟回收队列**：
+    /// WyEditor 是大对象（`Doc` rope/行索引 + `Rc` 级联），Drop 的级联释放实测 ~36ms——
+    /// 若在点击切回的事件路径内同步 Drop，会卡进「切回」延迟里。切回时把实体暂存此处、
+    /// 并由 `cx.on_next_frame` 在**下一帧渲染后**清空（放实体出作用域 Drop），把级联释放
+    /// 移出点击同步路径。渲染路径在 `commit_live` 之后已不再引用旧实体（`tab.live2` 置
+    /// None），延迟 Drop 不影响任何渲染。
+    retired_live2: Vec<gpui::Entity<WyEditor>>,
 }
 
 /// 窗口控制钮（最小化/最大化/关闭）上一帧解析出的图标前景色。
