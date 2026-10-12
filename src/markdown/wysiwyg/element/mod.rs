@@ -1045,7 +1045,19 @@ impl Element for WyEditorElement {
         // 规避「单次写宿主偏移被后续布局复位」）。目标在或刚清除都要刷下一帧。
         if self.editor.read(cx).scroll_target_active() {
             self.editor.update(cx, |e, _| e.advance_pending_scroll(window));
-            window.refresh();
+            if self.editor.read(cx).scroll_target_active() {
+                // ⚠️ 不能在这里用 `window.refresh()`：gpui 的 `Window::refresh` 只在
+                // `draw_phase == None`（即 draw 之外）才 set_dirty 调度下一帧；prepaint
+                // 处于 Prepaint 相位调用是 **no-op**（只置一个从未被读取的 `refreshing`
+                // 标志，见 deps gpui src/window.rs）。后果：注记跳转首帧写完宿主偏移后，
+                // 若再没有输入事件，就再也没有下一帧——滚动容器不按新偏移重排 → 远带帧
+                // 永远补不成显示帧 → 「thumb 已到目标、内容冻结，鼠标一动突然跳」（P4-2
+                // 实测）。改走 gpui 动画同款 `request_animation_frame`：它登记「下一帧
+                // notify 当前 view」进 on_next_frame 并请求平台一帧，下一平台帧投递时（已
+                // 出 draw）notify 有效 → 强制重绘 → advance 继续推进；目标消费后此分支
+                // 不再进入 → 收敛即静止，不持续逐帧重绘。
+                window.request_animation_frame();
+            }
         }
 
         // 光标可视位置（元素局部）→ IME bounds。

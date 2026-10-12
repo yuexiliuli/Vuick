@@ -129,7 +129,17 @@ impl WyEditor {
         };
         let target = match reused {
             Some(pt) => pt,
-            None => self.scroll_to_line_impl(sl, window),
+            None => {
+                // 首帧：精确重建远带帧 + 把目标写进宿主偏移。**重建出的远带帧先不装回显示帧**
+                // ——容器 prepaint 已在本帧开头把「旧偏移」快照给本帧 paint，若本帧就画远帧，
+                // 旧视口区域我会无行可画 → 一跳一白闪（EPUB 注记跳尾部注释实测 `visible=0`）。
+                // 先把显示帧回退为跳转前的旧帧（本帧继续画旧页，无白闪），宿主偏移下帧生效后
+                // 由 prepaint 按远带重建显示；上式复用帧的收敛判据仍会精确重钉到同一目标。
+                let old = self.frame.borrow().clone();
+                let t = self.scroll_to_line_impl(sl, window);
+                *self.frame.borrow_mut() = old;
+                t
+            }
         };
         if !target.is_finite() {
             self.scroll_target.set(None);
@@ -139,7 +149,13 @@ impl WyEditor {
         }
         if reused.is_some() {
             // 复用态的收敛判定（不重建，避免大文档每帧 band 重建放大 CPU）：
-            let diff = cur - target;
+            // `cur` = 宿主**内容偏移**（向下滚为正，`-vh.offset().y`）；`target` = 写入句柄的
+            // **负**偏移（`scroll_to_line_impl` 返回 `-(exact_top + pad_y)` 并直接
+            // `set_offset(target)`）。写入成功后二者互为相反数：cur == -target —— 收敛/接管
+            // 判据因此按**同号**比较：`diff = cur + target` ≈ 0 = 已稳住；|diff| 超接管阈值 =
+            // 用户滚走 / 偏移被布局复位（修：旧实现 `cur - target` 对远距跳转是「同向加倍」，
+            // 永不 <1.5 → 每次都被误判成用户接管而提前放弃重钉）。
+            let diff = cur + target;
             if diff.abs() < 1.5 {
                 // 上一帧写入的目标在再次写入前仍被宿主持有 → 布局未复位，稳定落地。
                 self.scroll_target.set(None);

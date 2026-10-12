@@ -490,3 +490,85 @@ fn wy_notes_citation_index_and_navigation(cx: &mut TestAppContext) {
     assert_eq!(stl2, Some(0), "定义 → 引用：滚动目标应为文内引用行");
     assert_eq!(mhl2, Some((0, 1, false)), "定义 → 引用：应加亮引用标记 (行0, n=1, is_def=false)");
 }
+
+/// 注记跳转（远距）的重钉收敛回归：注入宿主滚动句柄后，`set_scroll_target` → 首帧
+/// `scroll_to_line_impl` 写远端偏移；**复用帧**应走「收敛/修正」路径而非被误判成
+/// 「用户接管」提前放弃——直接锁死 P4-2 注记跳转「复用态收敛判据」的同号比较
+/// （`cur` 是正的宿主内容偏移，`target` 是负的句柄偏移；旧实现 `cur - target` 对远距
+/// 跳转是「同向加倍」、|diff| 恒超接管阈值 → 每帧都当用户滚走而弃钉）。
+#[gpui::test]
+fn wy_far_note_jump_repin_converges_not_takeover(cx: &mut TestAppContext) {
+    cx.update(crate::actions::bind_local_keymaps);
+    // 大文档：顶部正文多条 + 尾部一条注记定义（目标块在远端，模拟 EPUB 尾部注释章）。
+    let mut text = String::new();
+    for i in 0..800 {
+        text.push_str(&format!(
+            "正文第 {i} 段 alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n\n"
+        ));
+    }
+    text.push_str("[!1] 尾部注记定义正文。\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    ed.update(vcx, |e, _| {
+        e.set_editable(false);
+        e.set_epub(true);
+    });
+    let vhand = gpui::ScrollHandle::new();
+    ed.update(vcx, |e, _| e.set_host_scroll(Some(vhand.clone()), 0.0));
+    // 目标源码行 = `[!1]` 定义所在行（尾部）。
+    let def_src_line = {
+        let t = ed.read_with(vcx, |e, _| e.text());
+        let at = t.as_ref().find("[!1]").expect("尾部应有定义标记");
+        t.as_ref()[..at].bytes().filter(|&b| b == b'\n').count()
+    };
+    assert!(def_src_line >= 700, "定义应在远端：{def_src_line}");
+    // —— 首帧（远端重建 + 写宿主偏移）——
+    ed.update(vcx, |e, _| e.set_scroll_target(def_src_line));
+    vcx.update(|window, cx: &mut gpui::App| {
+        ed.update(cx, |e, _| {
+            e.advance_pending_scroll(window);
+        });
+    });
+    let off_write = vhand.offset().y.as_f32();
+    assert!(off_write < -8_000., "远距跳转首帧应把宿主偏移写到远端：{off_write:.0}");
+    let target_line = ed.read_with(vcx, |e, _| e.scroll_target_line());
+    assert_eq!(target_line, Some(def_src_line), "首帧仍在重钉（目标未清）");
+    // —— 复用帧 1：宿主持有目标但又漂移 3px（< 接管阈值 8px）——
+    // 真实容器 set_offset 后 offset() 即返回所写值；这里模拟「已持有 + 3px 微小漂移」。
+    vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(off_write + 3.0)));
+    vcx.update(|window, cx: &mut gpui::App| {
+        ed.update(cx, |e, _| {
+            e.advance_pending_scroll(window);
+        });
+    });
+    let off_fix = vhand.offset().y.as_f32();
+    let still_active = ed.read_with(vcx, |e, _| e.scroll_target_line()).is_some();
+    assert!(
+        still_active,
+        "复用帧 3px 漂移（在接管阈值内）应保持重钉目标而非误判用户接管——旧实现 `cur - target` \
+         同向加倍把远端跳转一律判成接管、提前放弃"
+    );
+    assert!(
+        (off_fix - off_write).abs() < 0.75,
+        "3px 漂移应被重写回目标：写 {off_write:.2}，实测 {off_fix:.2}"
+    );
+    // —— 复用帧 2：无漂移 → 按 `<1.5` 收敛清除目标（真正走收敛分支）——
+    vcx.update(|window, cx: &mut gpui::App| {
+        ed.update(cx, |e, _| {
+            e.advance_pending_scroll(window);
+        });
+    });
+    let final_off = vhand.offset().y.as_f32();
+    assert!(
+        ed.read_with(vcx, |e, _| e.scroll_target_line()).is_none(),
+        "无漂移复用帧应按收敛清目标"
+    );
+    assert!(
+        (final_off - off_write).abs() < 0.75,
+        "收敛后宿主偏移应仍停在目标：{final_off:.2} vs {off_write:.2}"
+    );
+}
