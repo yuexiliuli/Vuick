@@ -241,6 +241,12 @@ impl EditorApp {
         resume_version: Option<u64>,
         cx: &mut Context<Self>,
     ) {
+        // B3：文件换源会同步改写右栏 md_wy（install_open）→ 先作废任何在途后台装配
+        //（否则旧切回装配在文件打开完成后把新打开的整篇覆盖回去）。仅 markdown 才喂
+        // md_wy；此处提前作废不影响「本次 install_open」——它走同步、代号已换代。
+        if Self::is_markdown_path(p) {
+            self.md_wy_invalidate_async(idx);
+        }
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };

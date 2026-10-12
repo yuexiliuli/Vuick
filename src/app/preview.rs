@@ -2,6 +2,7 @@
 //! 统一 WyEditor 预览组件（`md_wy`）的创建/喂源/滚动同步、WYSIWYG 活区
 //! （`live2`）的进入/写回，以及路径 → 类型/语言推断等路由辅助。
 
+use std::ops::Range;
 use std::path::Path;
 
 use super::*;
@@ -12,6 +13,19 @@ use super::*;
 /// Doc 打开（实测 ~1s）成本落在同步写回里、首帧零卡——总墙钟更短。典型小改动（几字符/
 /// 几行）跨度远低于此，走增量（几十 ms）。
 const MD_WY_DIFF_MAX_SPAN_BYTES: usize = 64 * 1024;
+
+/// B3：右栏 `md_wy` 整篇喂源时「后台异步装配」的内容大小门槛（对齐 toggle ON 的
+/// `ASYNC_LOAD_MIN_BYTES`）。大内容（如 6.4MB 大段切回）走后台 `open_from_str` 解析、
+/// 点击路径零 O(n)，右栏内容「后到」；小内容保持同步（几十 KB 级 Doc::open 极快，
+/// 无「旧→新」等待窗口）。
+const MD_WY_ASYNC_INSTALL_MIN_BYTES: usize = 512 * 1024;
+
+/// 测试探针（`cfg(test)`）：B3 **后台异步整篇装配**发起次数——大跨度切回登记
+/// `open_from_str` 后台解析（而非同步整篇 `set_source_text`）的路径计数。回归测试
+/// 据此断言「大段切回同步路径不再 O(n) 解析」。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_MD_WY_ASYNC: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 测试探针（`cfg(test)`）：`commit_live` 退出路径计数——整篇写回（有改动）vs
 /// 未改动直接销毁实体（O(1) 跳过写回）。app 层回归测试据此断言「未编辑不写回」。
@@ -246,6 +260,8 @@ impl EditorApp {
         if idx >= self.tabs.len() {
             return;
         }
+        // B3：喂源/就地换源前作废在途后台装配（防旧切回的装配把新喂内容覆盖回去）。
+        self.md_wy_invalidate_async(idx);
         let fs = self.font_size;
         let base_dir = self.tabs[idx]
             .file_path
@@ -293,6 +309,8 @@ impl EditorApp {
         if idx >= self.tabs.len() {
             return;
         }
+        // B3：喂源/就地换源前作废在途后台装配（防旧切回装配覆盖新喂内容）。
+        self.md_wy_invalidate_async(idx);
         let fs = self.font_size;
         let base_dir = self.tabs[idx]
             .file_path
@@ -397,7 +415,9 @@ impl EditorApp {
             }
         } else {
             // 关闭预览：右栏 WyEditor 预览随预览开关释放（整篇解析/测量缓存随之释放，
-            // 内存回到基线）。
+            // 内存回到基线）。B3：在途后台整篇装配一并作废（实体被丢弃，完成回调按
+            // tab 归属/代号不再安装）。
+            self.md_wy_invalidate_async(idx);
             self.tabs[idx].md_wy = None;
             self.tabs[idx].md_wy_vscroll = gpui::ScrollHandle::new();
         }
@@ -690,17 +710,21 @@ impl EditorApp {
             // 零拷贝共享同一缓冲；大文档 rope 源首次 `text_shared` 恰一次 O(n) 物化是
             // `tab.content` 必须为整段字符串的固有下限，已是最小化作一次）。
             let content = l2.read(cx).text();
-            tab.content = content.clone();
-            // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；不再
-            // 对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
-            tab.line_count = l2.read(cx).line_count();
-            tab.char_count = l2.read(cx).char_count();
-            // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
-            // 长度不等即空壳/失步 → 整篇喂源兜底，见下）。
-            let src_len = tab.editor.read(cx).text().len();
-            // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
-            // 自检失败 → 缓冲区未被改动，落下方既有 diff 兜底（content 仍是最终态）。
-            let ok = tab.editor.update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()));
+            let src_len;
+            let ok = {
+                let tab = &mut self.tabs[idx];
+                tab.content = content.clone();
+                // 行/字符计数直接取 WyEditor 增量维护的 O(1) 值（订阅已随每次编辑更新；
+                // 不再对 6.4MB 全文做 lines()/chars() 线性扫——那是旧路径 ~90ms 的主来源）。
+                tab.line_count = l2.read(cx).line_count();
+                tab.char_count = l2.read(cx).char_count();
+                // 重放前的源缓冲区长度（O(1)；右栏 md_wy 逐 op 重放的前提 = 起点与源同长，
+                // 长度不等即空壳/失步 → 整篇喂源兜底，见 `md_wy_align_after_ops`）。
+                src_len = tab.editor.read(cx).text().len();
+                // 重放到源码编辑区（`apply_live_replay` 内置「干跑 + O(1) 长度栏」护栏）：
+                // 自检失败 → 缓冲区未被改动，落下方既有 diff 兜底（content 仍是最终态）。
+                tab.editor.update(cx, |ed, _| ed.apply_live_replay(&ops, content.as_ref()))
+            };
             if ok {
                 #[cfg(test)]
                 {
@@ -708,30 +732,10 @@ impl EditorApp {
                     LIVE_COMMIT_OPS_COUNT
                         .fetch_add(ops.len(), std::sync::atomic::Ordering::Relaxed);
                 }
-                // A2/A3：右栏只读预览 `md_wy`（若存在）随写回对齐——逐 op 增量重放（与旧
-                // diff hunk 同款 `preview_apply_edit` 免门控增量管线）。**前提 O(1) 校验**：
-                // md_wy 当前长度 == 重放前的源长度（同源、live 期间未被改写 → 起点一致），
-                // 否则（空壳未就绪/外部失步）直接整篇喂源兜底——**不做全篇文本比对**（那会
-                // 冷物化 md_wy 全文，6.4MB 又 +20ms）。编辑量超阈值（大段粘贴）同旧 diff 的
-                // 做法改整篇喂源，首帧零卡不劣于现状。
-                if let Some(wy) = tab.md_wy.clone() {
-                    let span: usize = ops
-                        .iter()
-                        .map(|(r, t)| (r.end - r.start).max(t.len()))
-                        .sum();
-                    if span <= MD_WY_DIFF_MAX_SPAN_BYTES && wy.read(cx).len() == src_len {
-                        for (r, t) in &ops {
-                            wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t.as_ref(), cx));
-                        }
-                        // 重放后 md_wy 长度必然 == content（同起点 + 确定性 op）；若因
-                        // 未知原因不等 → 整篇喂源兜底（仅长度 O(1) 比对）。
-                        if wy.read(cx).len() != content.len() {
-                            wy.update(cx, |w, _cx| w.set_source_text(&content));
-                        }
-                    } else {
-                        wy.update(cx, |w, _cx| w.set_source_text(&content));
-                    }
-                }
+                // A2/A3 + B3：右栏只读预览 `md_wy`（若存在）随写回对齐。小跨度维持增量
+                // `preview_apply_edit`（1-3ms，不回归）；大跨度/失步改整篇喂源——大内容
+                // **后台异步装配**（`md_wy_feed_full`），同步路径不再 O(n) `Doc::open`。
+                self.md_wy_align_after_ops(idx, &ops, src_len, content, cx);
                 self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
                 self.status_ok = true;
                 return;
@@ -745,53 +749,203 @@ impl EditorApp {
         //      窗口化高亮局部重解析，**不整篇重建**——区别于旧 `set_text` 的 reset_document
         //      级联，大文档 debug ~11s）；
         //   2) 右栏只读预览 `md_wy`：同 diff 逐 hunk 用 `preview_apply_edit` 增量重放
-        //      （与 A3 逐键桥同一无门控增量管线；大跨度改动按下方阈值改整篇喂源）。
+        //      （与 A3 逐键桥同一无门控增量管线；大跨度改动按 `md_wy_align_after_diff`
+        //      改整篇喂源——大内容后台异步装配）。
         // 典型小改动（几字符/几行）切回落到数百 ms；大范围改动也只重排受影响块，不退化
         // 成整篇 set_text 级联。基线文本与 live2 同源（全 LF 规范化），无需再处理 CRLF。
-        let base = tab.editor.read(cx).text().to_string();
-        // A1：`l2.text()` 直接返回 `SharedString`（`Doc::text_shared` 的 O(1) 句柄），
-        // 零拷贝赋给 `tab.content` —— 不再 `.to_string()` 又 `SharedString::from` 绕一圈
-        // （省掉那份 6.4MB 副本与分配）。`content` 与 live2 的 rope 同源同值；SharedString
-        // 不可变（仅 `Deref<Target=str>`），源码编辑区后续任何写入都会新建缓冲，不会
-        // 改到被 `tab.content` 持有的这份 → 保存/脏标整篇读取安全。
-        let content = l2.read(cx).text();
-        tab.content = content.clone();
-        let n_lines = content.as_ref().lines().count().max(1);
-        let n_chars = content.as_ref().chars().count();
-        tab.line_count = n_lines;
-        tab.char_count = n_chars;
-        let replaces = super::diff::line_diff(base.as_str(), content.as_ref());
+        let base;
+        let content;
+        let replaces;
+        {
+            let tab = &mut self.tabs[idx];
+            base = tab.editor.read(cx).text().to_string();
+            // A1：`l2.text()` 直接返回 `SharedString`（`Doc::text_shared` 的 O(1) 句柄），
+            // 零拷贝赋给 `tab.content` —— 不再 `.to_string()` 又 `SharedString::from` 绕一圈
+            // （省掉那份 6.4MB 副本与分配）。`content` 与 live2 的 rope 同源同值；SharedString
+            // 不可变（仅 `Deref<Target=str>`），源码编辑区后续任何写入都会新建缓冲，不会
+            // 改到被 `tab.content` 持有的这份 → 保存/脏标整篇读取安全。
+            content = l2.read(cx).text();
+            tab.content = content.clone();
+            let n_lines = content.as_ref().lines().count().max(1);
+            let n_chars = content.as_ref().chars().count();
+            tab.line_count = n_lines;
+            tab.char_count = n_chars;
+            replaces = super::diff::line_diff(base.as_str(), content.as_ref());
+            if !replaces.is_empty() {
+                tab.editor.update(cx, |ed, _| ed.apply_replaces(&replaces));
+            }
+        }
         #[cfg(test)]
         LIVE_COMMIT_DIFF_HUNKS.fetch_add(replaces.len(), std::sync::atomic::Ordering::Relaxed);
         #[cfg(test)]
         if !replaces.is_empty() {
             LIVE_COMMIT_DIFF_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if !replaces.is_empty() {
-            tab.editor.update(cx, |ed, _| ed.apply_replaces(&replaces));
-        }
-        // A2/A3：右栏 WyEditor 预览（若存在）随写回对齐。优先与源码编辑区同 diff 逐 hunk
-        // 增量重放（后→前；`preview_apply_edit` 绕过只读门控、不写撤销栈、增量块重排，
-        // 典型小改动几十 ms）。**大跨度 diff（被替换基线字节总量超阈值）改用整篇喂源**：
-        // WYSIWYG 对深部大结构改动的「增量」会把最贵的整篇重排推迟到切回后第一帧，实测
-        // 6.4MB 大段替换更慢；一次性 `set_source_text`（O(n) Doc 打开，实测 ~1s）把成本
-        // 收进同步写回、首帧零卡。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
-        if let Some(wy) = tab.md_wy.clone() {
-            let span: usize = replaces.iter().map(|(r, _)| r.end - r.start).sum();
-            let base_str = base.as_str();
-            let use_diff = !replaces.is_empty()
-                && span <= MD_WY_DIFF_MAX_SPAN_BYTES
-                && wy.read(cx).text().as_ref() == base_str;
-            if use_diff {
-                for (r, t) in replaces.iter().rev() {
-                    wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t, cx));
-                }
-            } else if !replaces.is_empty() || wy.read(cx).text().as_ref() != base_str {
-                wy.update(cx, |w, _cx| w.set_source_text(&content));
-            }
-        }
+        // A2/A3 + B3：右栏 WyEditor 预览（若存在）随写回对齐。优先与源码编辑区同 diff
+        // 逐 hunk 增量重放（后→前；`preview_apply_edit` 绕过只读门控、不写撤销栈、增量
+        // 块重排，典型小改动几十 ms）。**大跨度 diff（被替换基线字节总量超阈值）改整篇
+        // 喂源**：WYSIWYG 对深部大结构改动的「增量」会把最贵的整篇重排推迟到切回后第一
+        // 帧，实测 6.4MB 大段替换更慢；B3 起大内容整篇喂源改后台异步装配（`md_wy_feed_full`）
+        // ——同步路径不再 O(n)。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
+        self.md_wy_align_after_diff(idx, &replaces, base.as_str(), content, cx);
         self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
         self.status_ok = true;
+    }
+
+    // —— B3：右栏 `md_wy` 整篇喂源 / 后台异步装配 ——
+
+    /// B3：作废右栏 `md_wy` 的在途后台整篇装配（装配代号 +1、清 pending）。任何**同步**
+    /// 改写 `md_wy` 内容的路径（增量重放 / 同步整篇喂源 / 换源 install_open / 预览关闭）
+    /// 都必须在改动前调用——否则旧装配完成后会按旧代号命中、把刚改好的内容覆盖回去
+    /// （装错）。`file_ops`（打开换源）也调用，故 `pub(super)`。
+    pub(super) fn md_wy_invalidate_async(&mut self, idx: usize) {
+        if let Some(t) = self.tabs.get_mut(idx) {
+            t.md_wy_install_seq += 1;
+            t.md_wy_pending = None;
+        }
+    }
+
+    /// B3：整篇喂右栏 `md_wy` 的统一入口（替代同步 `set_source_text`）。`content` 大
+    /// （≥ [`MD_WY_ASYNC_INSTALL_MIN_BYTES`]）→ **后台** `open_from_str` 解析、就绪后带
+    /// tab 归属 + 装配代号守卫 `install_open`（点击路径零 O(n)，右栏内容「后到」可接受）；
+    /// 小内容 → 同步（几十 KB 级解析极快，无「旧→新」等待）。每次调用递增装配代号——
+    /// 本次装配胜出，覆盖在途旧装配。`open_from_str` 在本管线内无失败路径；若守卫不通过
+    /// （切走/关闭/更新换代）则完成回调直接丢弃结果，md_wy 保持当前（旧）内容，由后续
+    /// 喂源/装配追平，不装错、不泄漏。
+    fn md_wy_feed_full(&mut self, idx: usize, content: SharedString, cx: &mut Context<Self>) {
+        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+            return;
+        };
+        let seq = {
+            let t = &mut self.tabs[idx];
+            t.md_wy_install_seq += 1;
+            t.md_wy_install_seq
+        };
+        if content.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
+            // 同步小整篇（无「旧→新」等待；`open_from_str` 免 `set_source_text` 的一次
+            // 字符串复制，直接共享这份 `content`）。
+            wy.update(cx, |w, _| {
+                w.install_open(crate::markdown::wysiwyg::WyEditor::open_from_str(content))
+            });
+            if let Some(t) = self.tabs.get_mut(idx) {
+                t.md_wy_pending = None;
+            }
+            return;
+        }
+        self.tabs[idx].md_wy_pending = Some((seq, content.clone()));
+        #[cfg(test)]
+        LIVE_COMMIT_MD_WY_ASYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self::md_wy_spawn_async_install(idx, wy, content, seq, cx);
+    }
+
+    /// B3：切回后右栏 `md_wy` 对齐——**op 重放主路径**版（A2/A3 语义保留）。
+    /// 小跨度（≤ 阈值）且 md_wy 与源同长 → 逐 op 增量 `preview_apply_edit`（1-3ms）；
+    /// 大跨度 / 长度失步 → 整篇喂源 [`Self::md_wy_feed_full`]（大内容后台装配）。前提
+    /// 只做 O(1) 的 md_wy 长度比对（同源、live 期间未被改写 → 起点一致）——**不做全篇
+    /// 文本比对**（那会冷物化 md_wy 全文，6.4MB 又 +20ms）。
+    fn md_wy_align_after_ops(
+        &mut self,
+        idx: usize,
+        ops: &[(Range<usize>, SharedString)],
+        src_len: usize,
+        content: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+            return;
+        };
+        let span: usize = ops
+            .iter()
+            .map(|(r, t)| (r.end - r.start).max(t.len()))
+            .sum();
+        if span <= MD_WY_DIFF_MAX_SPAN_BYTES && wy.read(cx).len() == src_len {
+            // 增量重放会逐 op 把 md_wy 改成最终态 → 先作废在途后台装配（不装陈旧整篇）。
+            self.md_wy_invalidate_async(idx);
+            for (r, t) in ops {
+                wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t.as_ref(), cx));
+            }
+            // 重放后 md_wy 长度必然 == content（同起点 + 确定性 op）；若因未知原因不等 →
+            // 整篇喂源兜底（仅长度 O(1) 比对）。
+            if wy.read(cx).len() != content.len() {
+                self.md_wy_feed_full(idx, content, cx);
+            }
+        } else {
+            self.md_wy_feed_full(idx, content, cx);
+        }
+    }
+
+    /// B3：切回后右栏 `md_wy` 对齐——**行级 diff 兜底**版（A2/A3 语义保留）。
+    /// 增量 hunk（后→前 `preview_apply_edit`）；大跨度 diff 或 md_wy 内容 ≠ 基线 →
+    /// [`Self::md_wy_feed_full`] 整篇喂源（大内容后台装配）。
+    fn md_wy_align_after_diff(
+        &mut self,
+        idx: usize,
+        replaces: &[(Range<usize>, String)],
+        base: &str,
+        content: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(wy) = self.tabs.get(idx).and_then(|t| t.md_wy.clone()) else {
+            return;
+        };
+        let span: usize = replaces.iter().map(|(r, _)| r.end - r.start).sum();
+        let use_diff = !replaces.is_empty()
+            && span <= MD_WY_DIFF_MAX_SPAN_BYTES
+            && wy.read(cx).text().as_ref() == base;
+        if use_diff {
+            self.md_wy_invalidate_async(idx);
+            for (r, t) in replaces.iter().rev() {
+                wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t, cx));
+            }
+        } else if !replaces.is_empty() || wy.read(cx).text().as_ref() != base {
+            self.md_wy_feed_full(idx, content, cx);
+        }
+    }
+
+    /// B3：启动「右栏 `md_wy` 后台整篇装配」并登记完成回调。**不走 `&mut self`**（仅借用
+    /// `cx`），便于 `commit_live` 内仍持 `&mut self.tabs[i]` 借用时调用。整篇 O(n) 解析
+    /// （`Doc::open` + 派生标记计数）在 `background_executor`，UI 只做 O(1) 快照 + 完成
+    /// 回调里的 `install_open`（对齐 toggle ON 的既有异步通道）。
+    ///
+    /// 完成回调两层守卫，任一不满足即丢弃结果（不装错、不泄漏）：
+    ///   1) **tab 归属**：该 tab 的 `md_wy` 仍指向 `wy`（未关闭 / 未重建实体 / 未切走）；
+    ///   2) **装配代号**：`md_wy_install_seq == seq`（期间又有新装配 / 同步喂源 / 换源 →
+    ///      旧装配作废，不装陈旧整篇）。
+    /// 满足才 `install_open` 并清 pending。
+    fn md_wy_spawn_async_install(
+        tab_idx: usize,
+        wy: gpui::Entity<WyEditor>,
+        content: SharedString,
+        seq: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let wy_install = wy;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::markdown::wysiwyg::WyEditor::open_from_str(content)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.tabs.get(tab_idx).is_some_and(|t| {
+                    t.md_wy.as_ref() == Some(&wy_install) && t.md_wy_install_seq == seq
+                }) {
+                    wy_install.update(cx, |ed, _| ed.install_open(result));
+                    if let Some(tab) = this.tabs.get_mut(tab_idx) {
+                        tab.md_wy_pending = None;
+                    }
+                    cx.notify();
+                } else if let Some(tab) = this.tabs.get_mut(tab_idx)
+                    && tab.md_wy_pending.as_ref().is_some_and(|(s, _)| *s == seq)
+                {
+                    // 守卫不通过（切走/关闭/更新换代后结果被丢弃）：若 pending 仍挂本代号
+                    // （期间无更新装配）则清掉悬空标记；已换新代号则保留新 pending。
+                    tab.md_wy_pending = None;
+                }
+            });
+        })
+        .detach();
     }
 
     /// 「预览编辑测试」开关：用本项目 `markdown::wysiwyg::WyEditor` 渲染左面板。

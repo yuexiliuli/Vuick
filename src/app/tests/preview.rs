@@ -2060,6 +2060,595 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// B3：**大跨度切回 → 右栏 md_wy 后台异步整篇装配**。大内容（≥512KB）整篇喂源不再
+    /// 在点击路径同步 `Doc::open`：OFF 瞬间断言「异步已登记（探针 +1）、右栏仍显示旧内容、
+    /// 未同步解析」；泵后台到完成后断言「右栏最终内容 == live2 全文 == 源码编辑区」，且
+    /// pending 清空、异步计数不重复。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_big_span_async_installs_right_pane(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-async-{}.md",
+            std::process::id()
+        ));
+        // 大文档：内容 ≥ 512KB（B3 后台装配门槛）。
+        let block = "# 大标题\n这是正文段落，用于 WYSIWYG 大段切回的后台装配回归。\n\n- [ ] 待办\n";
+        let src = block.repeat((600 * 1024) / block.len());
+        assert!(src.len() >= 512 * 1024, "大文档应 ≥512KB，实际 {}", src.len());
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        // 等到右栏 md_wy 与编辑区都就绪（大文档走两段式打开，md_wy 后台 install_open）。
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                t.editor.read(cx).value().len() >= src.len()
+                    && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
+        let wy_old = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .md_wy
+                .clone()
+                .expect("md_wy 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert_eq!(wy_old, src, "切回前右栏应显示原文档全文");
+        // ON：进入 WYSIWYG（live2），等加载完成。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内加载完大文档");
+        // 大段插入：单 op，跨度 > 64KB 阈值 → commit 走整篇喂源。
+        let big = format!("## 大段\n{}\n", "插入的正文内容，确保大跨度走整篇喂源。\n".repeat(3000));
+        assert!(big.len() > 64 * 1024, "大段应 >64KB 跨度，实际 {}", big.len());
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            live.update(cx, |e, cx| e.replace_range(0..0, &big, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let expected = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        let async_before = crate::app::preview::LIVE_COMMIT_MD_WY_ASYNC
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // OFF：大内容整篇喂源 → 后台异步装配（同步路径零 O(n) 解析）。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        // 不泵后台，立即断言：异步已登记、右栏仍是旧内容（未同步解析）、探针 +1。
+        let (pending, wy_now) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy_pending.clone(),
+                t.md_wy.clone().map(|w| w.read(cx).text().to_string()),
+            )
+        });
+        let async_after = crate::app::preview::LIVE_COMMIT_MD_WY_ASYNC
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            async_after,
+            async_before + 1,
+            "大段切回应恰发起 1 次后台异步装配（探针）"
+        );
+        assert!(
+            pending.as_ref().is_some_and(|(_, c)| c.as_ref() == expected),
+            "OFF 后右栏应登记待装配目标 = live2 全文"
+        );
+        assert_eq!(wy_now.as_deref(), Some(src.as_str()), "OFF 瞬间右栏仍是旧内容（未同步解析）");
+        // 泵后台到完成：右栏最终内容 == live2 全文，pending 清空。
+        let mut done = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            done = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .md_wy_pending
+                    .is_none()
+            });
+            if done {
+                break;
+            }
+        }
+        assert!(done, "后台装配应在 200 帧内完成（pending 清空）");
+        let (wy_final, committed) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let w = a.tabs[a.active_tab]
+                .md_wy
+                .clone()
+                .expect("md_wy 应在")
+                .read(cx)
+                .text()
+                .to_string();
+            (w, a.tabs[a.active_tab].editor.read(cx).value().to_string())
+        });
+        assert_eq!(wy_final, expected, "右栏 md_wy 最终应等价于 live2 全文（后到一致）");
+        assert_eq!(committed, expected, "源码编辑区切回内容应等价（未回归写回）");
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// B3：**小跨度维持增量、不发起后台装配**。小文档小改动切回：`LIVE_COMMIT_MD_WY_ASYNC`
+    /// 不动（探针 0），右栏 md_wy 在 OFF 点击路径内**同步**逐 op 增量对齐（无「后到」），
+    /// 最终内容等价——既保全量路径不回归，也不自找异步（右栏无旧内容滞留）。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_small_span_stays_incremental_no_async(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-small-{}.md",
+            std::process::id()
+        ));
+        let src = "# 小标题\n甲行。\n\n乙行。\n".repeat(30);
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // 单字符编辑（小跨度 → 右栏逐 op 增量对齐）。
+        cx.update(|_w, cx| {
+            let live = app
+                .read(cx)
+                .tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在");
+            let e = live.read(cx).text().to_string();
+            let at = e.find('甲').expect("应有中文");
+            live.update(cx, |ed, cx| ed.replace_range(at..at + 3, "更", cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let expected = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        let async_before = crate::app::preview::LIVE_COMMIT_MD_WY_ASYNC
+            .load(std::sync::atomic::Ordering::Relaxed);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        // OFF 同步完成（无后台等待）：右栏应立即等于最终文本。
+        let (committed, wy_now) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let ed = editor.read(cx);
+            (
+                ed.value().to_string(),
+                a.tabs[a.active_tab]
+                    .md_wy
+                    .clone()
+                    .map(|w| w.read(cx).text().to_string()),
+            )
+        });
+        assert_eq!(committed, expected, "小跨度切回源码编辑区应等价");
+        assert_eq!(wy_now.as_deref(), Some(expected.as_str()), "小跨度右栏应在 OFF 内同步增量对齐");
+        assert_eq!(
+            crate::app::preview::LIVE_COMMIT_MD_WY_ASYNC
+                .load(std::sync::atomic::Ordering::Relaxed),
+            async_before,
+            "小跨度不得发起后台整篇装配（探针不动）"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// B3：**异步在途被同一实体上的更新同步喂源作废（装配代号守卫）**。大段切回登记后台
+    /// 装配（目标 CX）后，尚未落地前：源码编辑区改写成 CY 并 `ensure_md_wy(feed)` 同步喂源
+    /// → 装配代号换代；泵后台完成 → 旧装配必须丢弃，右栏保持 CY（不被陈旧的 CX 覆盖）。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_async_inflight_invalidated_by_sync_feed(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-seq-{}.md",
+            std::process::id()
+        ));
+        let block = "# 大标题\n正文段落，用于装配代号守卫回归。\n\n- [ ] 待办\n";
+        let src = block.repeat((600 * 1024) / block.len());
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                t.editor.read(cx).value().len() >= src.len()
+                    && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内加载完大文档");
+        // 大段插入 X（切回登记后台装配 CX）。
+        let big_x = format!("## 大段 X\n{}\n", "X 内容，构成大跨度。\n".repeat(3000));
+        cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2")
+                .update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        // 尚未泵后台：异步装配在途（pending 挂着 CX）。
+        let (pending, wy) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy_pending.clone(),
+                t.md_wy.clone().expect("md_wy 应在"),
+            )
+        });
+        let cx_snapshot = pending.clone().expect("在途装配应有 pending").1;
+        // 在途窗口内：源码编辑区改成 CY（≠ CX），再同步喂源右栏 → 装配代号换代。
+        let cy = format!("CY 全文基线\n{src}");
+        cx.update(|_w, cx| {
+            editor.update(cx, |ed, _| ed.set_text(&cy));
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.ensure_md_wy(app.active_tab, window, cx, true));
+        });
+        let wy_now = cx.update(|_w, cx| wy.read(cx).text().to_string());
+        assert_eq!(wy_now, cy, "同步喂源后右栏应立即显示 CY");
+        assert!(cx_snapshot != cy, "测试前提：CX ≠ CY（否则无法检测陈旧覆盖）");
+        // 泵后台完成：旧装配（CX）必须被代号守卫丢弃，右栏保持 CY。
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let wy_final = cx.update(|_w, cx| wy.read(cx).text().to_string());
+        assert_eq!(wy_final, cy, "异步在途被同步喂源作废后，右栏必须保持 CY（不得回滚到 CX）");
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// B3：**异步在途关闭预览（重建实体）不装错 tab（tab 归属守卫）**。大段切回登记后台
+    /// 装配后，尚未落地前关闭预览（md_wy 实体被丢弃）再重开（新实体，同步喂 CY）→ 泵后台
+    /// 完成：旧装配目标已不在原 tab，不得装进新实体，右栏保持 CY。
+    #[gpui::test]
+    async fn wysiwyg_toggle_off_async_inflight_dropped_when_preview_recreated(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-entity-{}.md",
+            std::process::id()
+        ));
+        let block = "# 大标题\n正文段落，用于 tab 归属守卫回归。\n\n- [ ] 待办\n";
+        let src = block.repeat((600 * 1024) / block.len());
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                t.editor.read(cx).value().len() >= src.len()
+                    && t.md_wy.as_ref().map(|w| w.read(cx).is_loaded()).unwrap_or(false)
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档右栏 md_wy 应在 200 帧内装好");
+        let editor = cx.update(|_w, cx| app.read(cx).tabs[app.read(cx).active_tab].editor.clone());
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内加载完大文档");
+        let big_x = format!("## 大段 X\n{}\n", "X 内容，构成大跨度。\n".repeat(3000));
+        cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2")
+                .update(cx, |e, cx| e.replace_range(0..0, &big_x, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        // 尚未泵后台：异步装配在途；关闭预览（实体丢弃）再重开（新实体，同步喂编辑器文本）。
+        let cy = format!("CY 全文基线\n{src}");
+        cx.update(|_w, cx| {
+            editor.update(cx, |ed, _| ed.set_text(&cy));
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_preview_for_tab(app.active_tab, window, cx));
+        });
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_preview_for_tab(app.active_tab, window, cx));
+        });
+        let new_wy_text = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .md_wy
+                .clone()
+                .expect("重开后 md_wy 应在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert_eq!(new_wy_text, cy, "重开预览应立即显示 CY");
+        // 泵后台完成：旧装配不得装进新实体，右栏保持 CY。
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let wy_final = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .md_wy
+                .clone()
+                .expect("md_wy 应在")
+                .read(cx)
+                .text()
+                .to_string()
+        });
+        assert_eq!(wy_final, cy, "异步在途预览重开后，右栏必须保持 CY（旧装配不得装新实体）");
+        let _ = std::fs::remove_file(&md);
+    }
+
+    /// B3 基准（`--ignored`，诊断不断言）：**大跨度切回同步点击路径耗时**（debug）。
+    /// 大段插入 + OFF，逐段打点：① OFF 同步路径（op 重放 + 最终态物化 + 登记后台装配，
+    /// 不再含整篇同步 `Doc::open`）；② 后台 `open_from_str` 完成（右栏 md_wy 追平）墙钟。
+    /// 旧实现该大段切回同步 ≈2.3s（其中整篇 `set_source_text` 同步 Doc::open ~1.5s）。
+    /// 运行：`cargo test --bin gpui-editor app::tests::bench_b3_big_span_switch_async -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_b3_big_span_switch_async(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-b3-bench-{}.md",
+            std::process::id()
+        ));
+        // ≈6.4MB 大文档（与 `bench_wysiwyg_switch_fixed_overhead` 同口径，优先仓内真实
+        // 富结构素材，缺失回退合成块）——「before」记录即此文档大段的 ~2.3s。
+        let src = match std::fs::read(r"fixtures/大文档测试2.md") {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(_) => {
+                let block = "# 标题\n正文段落，凑大文档基准文本。\n\n- [ ] 待办\n";
+                block.repeat((64 * 1024 * 100) / block.len())
+            }
+        };
+        assert!(src.len() > 5 * 1024 * 1024, "基准文档应 ≥5MB，实际 {}", src.len());
+        std::fs::write(&md, &src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        let mut ready = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            // 与 `bench_wysiwyg_switch_fixed_overhead` 同口径（真实素材可能是 CRLF，不能
+            // 按字节长比对；行数 >1000 即视为内容已就位）。
+            ready = cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[a.active_tab];
+                !t.editor_pending && t.editor.read(cx).line_count() > 1000
+            });
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "大文档编辑区应在 200 帧内就绪");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        let mut l2_loaded = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            l2_loaded = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .live2
+                    .as_ref()
+                    .map(|l| l.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if l2_loaded {
+                break;
+            }
+        }
+        assert!(l2_loaded, "live2 应在 200 帧内加载完 6.4MB");
+        // 大段插入（单 op，跨度 >64KB → 整篇喂源）。
+        let big = format!("## 大段\n{}\n", "插入正文，构成大跨度。\n".repeat(5000));
+        cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2")
+                .update(cx, |e, cx| e.replace_range(0..0, &big, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ① OFF 同步路径耗时（写回 + 物化 + 登记异步；不含实体 Drop=已延迟、不含 Doc::open）。
+        let off_ms = cx.update(|window, cx| {
+            let t = std::time::Instant::now();
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+            t.elapsed().as_millis()
+        });
+        // ② 泵后台到右栏 md_wy 追平（异步装配完成）。
+        let bg_t0 = std::time::Instant::now();
+        let mut done = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            done = cx.update(|_w, cx| {
+                app.read(cx).tabs[app.read(cx).active_tab]
+                    .md_wy_pending
+                    .is_none()
+            });
+            if done {
+                break;
+            }
+        }
+        assert!(done, "后台装配应在 400 帧内完成");
+        let bg_ms = bg_t0.elapsed().as_millis();
+        let (wy_len, committed_len) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                t.md_wy.clone().map(|w| w.read(cx).len()).unwrap_or(0),
+                t.editor.read(cx).value().len(),
+            )
+        });
+        println!("【B3·after】大段切回 OFF 同步路径 ≈ {off_ms} ms（旧实现 ≈2300 ms，含同步 Doc::open ~1500 ms）");
+        println!("【B3·after】右栏后台追平（异步装配完成）墙钟 ≈ {bg_ms} ms");
+        println!("【B3·after】右栏 md_wy {wy_len} B == 源码编辑区 {committed_len} B（最终一致）");
+        let _ = std::fs::remove_file(&md);
+    }
+
     /// A 基准（`--ignored`，诊断不断言）：6.4MB 大文档「单字符」切回**同步点击路径**
     /// 的分项实测——① `commit_live` 最终态物化（`text_shared` 冷一次，= A1 剩余下限
     ///  ~20ms）；② WyEditor 实体**级联 Drop**（= A2 已移出点击路径的 ~36ms），用它

@@ -146,6 +146,15 @@ struct EditorTab {
     /// 经 `track_scroll` 跟踪它，右侧自绘 `Scrollbar::vertical` 跟随（与 `live_vscroll`
     /// 同型：每次渲染重建容器、句柄跨帧稳定）。随选项卡搬迁（与 `md_preview` 同）。
     md_wy_vscroll: gpui::ScrollHandle,
+    /// B3：右栏 `md_wy` 「后台整篇装配在途」标记：`Some((装配代号, 目标内容))` = 已登记
+    /// 后台 `open_from_str` 解析、尚未 `install_open`；`None` = 无在途（已装好 / 被同步
+    /// 改动取代）。异步完成回调按代号与 [Self::md_wy_install_seq] 匹配才装配（不装错、不
+    /// 泄漏）；切回右栏内容「后到」期间保持旧内容。
+    md_wy_pending: Option<(usize, SharedString)>,
+    /// B3：右栏 `md_wy` 内容装配代号单调计数器——每次发起后台整篇装配 / 任何同步改源
+    /// （增量重放、同步喂源、换源 install_open、预览关闭）递增，结束在途旧装配（代号
+    /// 不匹配即丢弃其完成回调，防陈旧整篇覆盖刚改好的内容）。随选项卡搬迁。
+    md_wy_install_seq: usize,
     /// 编辑版本号：每次内容变更 +1。编辑区⇄预览滚动同步用它判断「画面/内容是否有新
     /// 编辑需重建同步基线」。
     edit_version: u64,
@@ -174,6 +183,9 @@ pub(crate) struct DetachedTab {
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
     md_wy_vscroll: gpui::ScrollHandle,
+    /// B3：随选项卡搬迁（承接在途后台装配的标记与代号，防搬迁后旧完成回调被误丢）。
+    md_wy_pending: Option<(usize, SharedString)>,
+    md_wy_install_seq: usize,
     /// P4-1：EPUB 内存图片表随选项卡搬迁（与 `md_wy` 宿主共用）。
     epub_images: std::collections::HashMap<String, std::sync::Arc<gpui::Image>>,
     /// P4-2：EPUB 注记正文表随选项卡搬迁（`ensure_epub_wy` → `set_notes` 用）。
