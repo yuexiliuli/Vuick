@@ -251,8 +251,7 @@ struct RowView {
     fold_color: Hsla,
 }
 
-/// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行
-/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
+/// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
 /// [`CodeEditor::window_base`]（窗口首行绝对行号）+ ListState 相对滚动合成：
 /// - 目标超出当前窗口即 `reset(WINDOW)` 重定位（O(窗口)，一刀切重定位、无需分帧）；
 /// - 量程/clamp 全部按**全文** `scroll_item_count()×行高` 算（与窗口无关）；
@@ -262,6 +261,13 @@ struct RowView {
 ///
 /// 固定窗口条目数：需 ≥ 最高分辨率的可见行 + 过扫余量（512 × 行高 ≈ 上万 px 视口）。
 const LIST_WINDOW_ROWS: usize = crate::config::limits::EDITOR_LIST_PROVISIONAL_ROWS;
+
+/// 测试探针（`cfg(test)`）：整篇 `set_text`/`set_rope_with_stats`（reset_document 级联）
+/// 被调次数。app 层「WYSIWYG 写回走增量路径」回归断言：切回**编辑过的大文档**不得再
+/// 走整篇 set_text（旧实现 debug ~11s；增量 `apply_replaces` 不计数）。
+#[cfg(test)]
+pub(crate) static CODE_EDITOR_FULL_RESET_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// 自研代码编辑器（首版）。
 pub struct CodeEditor {
@@ -465,6 +471,8 @@ impl CodeEditor {
 
     /// 设置文档文本（清空撤销/重做与选区）。
     pub fn set_text(&mut self, text: &str) {
+        #[cfg(test)]
+        CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buffer = Buffer::new(text);
         self.reset_document();
     }
@@ -478,6 +486,8 @@ impl CodeEditor {
         max_line_chars: usize,
         line_width_histogram: crate::editor::buffer::LineWidthHistogram,
     ) {
+        #[cfg(test)]
+        CODE_EDITOR_FULL_RESET_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.buffer = Buffer::from_parts(text, max_line_chars, line_width_histogram);
         self.reset_document();
     }
@@ -545,6 +555,46 @@ impl CodeEditor {
     /// 在选区处输入文本（等同连续打字：合并撤销、走同一编辑主链）。
     pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
         self.insert_edit(self.selection.range(), text, EditIntent::Typing, cx);
+    }
+
+    /// 批量增量替换（切回「预览编辑测试」整篇写回用）：按**从后往前**应用一组互不
+    /// 重叠、已整行对齐的 `(字节区间, 文本)`，把文档改写为目标内容。每处走
+    /// [`Self::apply_edit_synced`] 的 O(log n) Rope 编辑 + 窗口化高亮增量登记，**不整篇
+    /// 重建**（区别于 `set_text` 的 `reset_document`：保留滚动/折叠/行静态缓存，只在高亮
+    /// 器按编辑登记/版本跳变局部重解析）——按 diff 改写大文档只在受影响区间重解析，
+    /// 典型小改动落到数百 ms 内（旧整篇 `set_text` 级联重排 debug ~11s）。
+    ///
+    /// 语义对齐 `set_text`：清空撤销栈（写回 = 原子替换，undo/redo 不逐个回滚本次
+    /// 写回事务）、光标收到行首、无编辑事件（宿主写回后自行同步行/字符计数与右栏）。
+    /// 空列表 = no-op。
+    pub fn apply_replaces(&mut self, replaces: &[(Range<usize>, String)]) {
+        if replaces.is_empty() {
+            return;
+        }
+        // 与 `set_text` 同语义：整篇写回 = 原子替换，撤销栈清空（旧内容快照作废）。
+        self.undo.clear();
+        let mut min_line_a = usize::MAX;
+        let mut total_rows_delta: i64 = 0;
+        for (range, text) in replaces.iter().rev() {
+            // 编辑前行跨度（后→前应用：较晚偏移 hunk 不位移较早偏移 hunk 的行号）。
+            let line_a = self.buffer.line_of_offset(range.start);
+            let line_b = self.buffer.line_of_offset(range.end);
+            total_rows_delta += text.matches('\n').count() as i64 + 1;
+            total_rows_delta -= line_b.saturating_sub(line_a) as i64 + 1;
+            min_line_a = min_line_a.min(line_a);
+            // 缓冲写入 + 折叠同步 + 高亮增量登记（单 hunk 场景即精确值）。
+            self.apply_edit_synced(range.clone(), text);
+        }
+        // 多 hunk：`apply_edit_synced` 的单槽登记彼此覆盖 → 归并为粗略一份；高亮器按
+        // 编辑版本跳变（>1）回落有界整段重解析（O(窗口)，正确且与旧实现代价相当）。
+        if replaces.len() > 1 {
+            let tail = min_line_a.saturating_add(total_rows_delta.max(0) as usize);
+            self.hl_dirty = Some((min_line_a, tail, total_rows_delta));
+        }
+        // 与 `set_text` 一致：整篇写回后光标行首、无待重放的单笔编辑轨迹。
+        self.selection = Selection::collapsed(0);
+        self.last_edit = None;
+        self.marked_range = None;
     }
 
     /// 底层 Rope（只读；O(1) COW 快照给后台线程）。

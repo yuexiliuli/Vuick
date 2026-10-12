@@ -40,6 +40,7 @@ impl EditorApp {
             editor_pending: false,
             live_edit: false,
             live2: None,
+            live2_dirty: false,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
             md_wy: None,

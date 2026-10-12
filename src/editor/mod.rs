@@ -55,5 +55,9 @@ pub use selection::Selection;
 pub use undo::{EditIntent, Transaction, UndoManager};
 #[allow(unused_imports)]
 pub use view::{CodeEditor, EditorEvent};
+
+/// 测试探针再导出（`view` 为私有模块，app 层回归需读该静态计数）。
+#[cfg(test)]
+pub(crate) use view::CODE_EDITOR_FULL_RESET_CALLS;
 #[allow(unused_imports)]
 pub(crate) use view::merge_highlights;

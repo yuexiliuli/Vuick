@@ -83,6 +83,7 @@ impl EditorApp {
             // 预览编辑（WYSIWYG）不随选项卡搬迁（搬迁前已提交写回，见 take_tab_payload 调用点）
             live_edit: false,
             live2: None,
+            live2_dirty: false,
             _live2_sub: None,
             live_vscroll: gpui::ScrollHandle::new(),
             edit_version: payload.edit_version,

@@ -6,6 +6,31 @@ use std::path::Path;
 
 use super::*;
 
+/// 右栏只读预览 `md_wy` 走「逐 hunk 增量重放」的最大基线跨度（被替换的 base 字节总量）。
+/// 超过即改用整篇 `set_source_text`：WYSIWYG 对深部大结构改动的增量会退化成本应整篇做
+/// 的重排、并把它推迟到切回后第一渲染帧（实测 6.4MB 大段替换首帧卡 5.5s）；一次性 O(n)
+/// Doc 打开（实测 ~1s）成本落在同步写回里、首帧零卡——总墙钟更短。典型小改动（几字符/
+/// 几行）跨度远低于此，走增量（几十 ms）。
+const MD_WY_DIFF_MAX_SPAN_BYTES: usize = 64 * 1024;
+
+/// 测试探针（`cfg(test)`）：`commit_live` 退出路径计数——整篇写回（有改动）vs
+/// 未改动直接销毁实体（O(1) 跳过写回）。app 层回归测试据此断言「未编辑不写回」。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_WRITEBACK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_SKIP_UNCHANGED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针（`cfg(test)`）：走**增量 diff 写回**（replaces 非空 → `apply_replaces` /
+/// `preview_apply_edit` 被调用）的 `commit_live` 次数。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_DIFF_APPLIED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// 测试探针（`cfg(test)`）：增量写回实际应用的替换 hunk 累计数（>0 即非整篇替换）。
+#[cfg(test)]
+pub(crate) static LIVE_COMMIT_DIFF_HUNKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl EditorApp {
     /// 选项卡默认文件名（用于保存对话框）。
     pub(super) fn tab_file_name(&self, idx: usize) -> String {
@@ -580,6 +605,9 @@ impl EditorApp {
     /// 退出预览编辑：把 WYSIWYG 内容写回源码编辑区 + 内容镜像 + 预览，销毁实体。
     pub(super) fn commit_live(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(idx) else { return };
+        // 本 live 会话是否有内容编辑（读后再清，供下方「未改动跳过写回」判定）。
+        let l2_dirty = tab.live2_dirty;
+        tab.live2_dirty = false;
         tab.live_edit = false;
         tab._live2_sub = None;
         let Some(l2) = tab.live2.take() else { return };
@@ -601,6 +629,30 @@ impl EditorApp {
             self.status_ok = false;
             return;
         }
+        // 未改动（live 期间无任何内容编辑，`live2_dirty == false`）：live2 文本恒等于
+        // 打开瞬间的源码 COW 快照（toggle ON 只从该快照建实体，无其它写入路径），
+        // 整篇物化 + `set_text` 写回 + 喂右栏纯属 O(n) 浪费（大文档级联重排卡 7-8s）——
+        // 直接销毁实体切回（O(1)），源码编辑区仍是原内容、可继续编辑。
+        if !l2_dirty {
+            #[cfg(test)]
+            LIVE_COMMIT_SKIP_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.status = SharedString::from("预览编辑测试：关（未改动，无需写回）");
+            self.status_ok = true;
+            return;
+        }
+        #[cfg(test)]
+        LIVE_COMMIT_WRITEBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // —— 增量写回（M：WYSIWYG 编辑过 → 切回也快速）——
+        // 与「toggle ON 的源快照」（= 当前源码编辑区缓冲区，live 期间无其它写入路径）
+        // 做**行级 diff**，产出少量（字节区间, 文本）替换 → 应用到：
+        //   1) 源码编辑区缓冲区：`CodeEditor::apply_replaces`（每处 O(log n) Rope 编辑 +
+        //      窗口化高亮局部重解析，**不整篇重建**——区别于旧 `set_text` 的 reset_document
+        //      级联，大文档 debug ~11s）；
+        //   2) 右栏只读预览 `md_wy`：同 diff 逐 hunk 用 `preview_apply_edit` 增量重放
+        //      （与 A3 逐键桥同一无门控增量管线；大跨度改动按下方阈值改整篇喂源）。
+        // 典型小改动（几字符/几行）切回落到数百 ms；大范围改动也只重排受影响块，不退化
+        // 成整篇 set_text 级联。基线文本与 live2 同源（全 LF 规范化），无需再处理 CRLF。
+        let base = tab.editor.read(cx).text().to_string();
         let text = l2.read(cx).text().to_string();
         tab.content = SharedString::from(text);
         let content = tab.content.clone();
@@ -608,12 +660,35 @@ impl EditorApp {
         let n_chars = content.as_ref().chars().count();
         tab.line_count = n_lines;
         tab.char_count = n_chars;
-        tab.editor.update(cx, |ed, _| ed.set_text(&content));
-        // A2/A3：右栏 WyEditor 预览（若存在）随 WYSIWYG 写回全量刷新——
-        // 写回是整篇替换（非 Change 轨迹），增量桥不会替它补，这里一次性对正源。
-        // （`MarkdownPreview` 后端已删，M5-B5 P4-2，只有统一宿主需要对齐。）
+        let replaces = super::diff::line_diff(base.as_str(), content.as_ref());
+        #[cfg(test)]
+        LIVE_COMMIT_DIFF_HUNKS.fetch_add(replaces.len(), std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        if !replaces.is_empty() {
+            LIVE_COMMIT_DIFF_APPLIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !replaces.is_empty() {
+            tab.editor.update(cx, |ed, _| ed.apply_replaces(&replaces));
+        }
+        // A2/A3：右栏 WyEditor 预览（若存在）随写回对齐。优先与源码编辑区同 diff 逐 hunk
+        // 增量重放（后→前；`preview_apply_edit` 绕过只读门控、不写撤销栈、增量块重排，
+        // 典型小改动几十 ms）。**大跨度 diff（被替换基线字节总量超阈值）改用整篇喂源**：
+        // WYSIWYG 对深部大结构改动的「增量」会把最贵的整篇重排推迟到切回后第一帧，实测
+        // 6.4MB 大段替换更慢；一次性 `set_source_text`（O(n) Doc 打开，实测 ~1s）把成本
+        // 收进同步写回、首帧零卡。md_wy 内容 ≠ 源快照（含空壳未就绪）也整篇兜底。
         if let Some(wy) = tab.md_wy.clone() {
-            wy.update(cx, |w, _cx| w.set_source_text(&content));
+            let span: usize = replaces.iter().map(|(r, _)| r.end - r.start).sum();
+            let base_str = base.as_str();
+            let use_diff = !replaces.is_empty()
+                && span <= MD_WY_DIFF_MAX_SPAN_BYTES
+                && wy.read(cx).text().as_ref() == base_str;
+            if use_diff {
+                for (r, t) in replaces.iter().rev() {
+                    wy.update(cx, |w, cx| w.preview_apply_edit(r.clone(), t, cx));
+                }
+            } else if !replaces.is_empty() || wy.read(cx).text().as_ref() != base_str {
+                wy.update(cx, |w, _cx| w.set_source_text(&content));
+            }
         }
         self.status = SharedString::from("预览编辑（WYSIWYG）：关（内容已写回编辑区）");
         self.status_ok = true;
@@ -669,6 +744,10 @@ impl EditorApp {
                             // `commit_live` 时统一写回。
                             tab.line_count = emitter.read(cx).line_count();
                             tab.char_count = emitter.read(cx).char_count();
+                            // 本 live 会话有内容编辑（仅当事件来自 live2 实体——订阅
+                            // 只挂在 live2、且上方已按 `live2 == emitter` 过滤，md_wy 右栏
+                            // 的 Changed 到不了这里）：切回时据此决定是否整篇写回。
+                            tab.live2_dirty = true;
                             if !tab.dirty {
                                 tab.dirty = true;
                             }
@@ -686,6 +765,8 @@ impl EditorApp {
             tab.live2 = Some(ed.clone());
             tab._live2_sub = Some(ed_sub);
             tab.live_edit = true;
+            // 新 live 会话从「源快照」起，本会话编辑标记清 false（仅编辑才置位）。
+            tab.live2_dirty = false;
             // 源编辑区即将被 WYSIWYG 取代（隐藏/切离）：在此「被隐藏」生命周期点复位
             // 其鼠标拖选态（与 `commit_live` 同用 `cancel_mouse_drag` 统一钩子）。菜单
             // 点击漏进的 MouseDown 恰在切离前把 `dragging` 置位过（见 `commit_live` 注释），

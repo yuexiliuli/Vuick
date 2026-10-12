@@ -45,6 +45,7 @@ mod tabs;
 // 原私有条目在 `app` 内对整棵子树（含 app::tests）可见 → 搬入子模块后统一 `pub(super)`
 // （可见于 `app`）；原 `pub` / `pub(super)`（= crate 可见）搬入私有子模块后升为 `pub(crate)`）。
 mod chrome;
+mod diff;
 mod init;
 mod layout;
 mod media;
@@ -125,6 +126,12 @@ struct EditorTab {
     /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源）。
     /// None = 未启用。启用即 `live_edit = true`。
     live2: Option<gpui::Entity<WyEditor>>,
+    /// 「预览编辑测试」本 live 会话里 WYSIWYG 内容是否被**编辑过**（`WyEvent::Changed`
+    /// 订阅中对 live2 实体置位；进入 ON 与新建选项卡时清 false）。退出 `commit_live`
+    /// 用它判断是否需要整篇写回源码编辑区：未编辑时 live2 文本恒等于打开瞬间的源码
+    /// COW 快照（O(1) 同源），写回纯属 O(n) 浪费（大文档级联 `set_text` 重排卡 7-8s）
+    /// → 直接销毁实体切回，不物化全文。
+    live2_dirty: bool,
     /// A2：右栏 Markdown 预览统一组件（`WyEditor`，A1 只读门控）。MD 右栏/全屏预览
     /// 与 EPUB 只读宿主都走它（同一 `Doc` 管线的只读视图）；`None` = 未创建（文本 /
     /// PDF / 图片选项卡，或预览已关闭）。
