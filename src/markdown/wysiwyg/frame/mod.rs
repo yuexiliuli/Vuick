@@ -602,7 +602,7 @@ fn pass2_shape_band(
             let _t_shape = crate::prof::begin();
             for k in lo..hi {
                 let cid = block_content_id(doc, k);
-                let srow = if let Some(rc) = hit_map.remove(&k) {
+                let mut srow = if let Some(rc) = hit_map.remove(&k) {
                     (*rc).clone()
                 } else if is_giant_code_block(doc, base, k) {
                     // I4 巨型代码块快速路径：不物化、不整块重 shape 出权威行——复用
@@ -700,7 +700,23 @@ fn pass2_shape_band(
                         }
                     }
                 };
+                // 命中缓存 / 巨块 / 冷却复用的行，其 `src_line`/`src_lines` 是**首次命中块**
+                // 钉死的身份（`shape_docrow` 取该块 `r.src_line`/`r.lines`；缓存指纹键
+                // `block_content_id` 不含 `src_line`）——文本完全相同的不同块共享指纹，
+                // 复用行身份串到首块 → 源偏移反查（hit）与选区求交（paint）都算错行。
+                // 在复用点按当前块 k 重贴权威身份（覆盖区间与 `assemble_docrow`/巨块占位
+                // 同一口径：`src_line(k) .. src_line(k+1)`，末块 `line_count()` 兜底）。
                 let srcl = base.borrow().src_line(k) as usize;
+                let srcl_next = {
+                    let b = base.borrow();
+                    if k + 1 < b.n() {
+                        b.src_line(k + 1) as usize
+                    } else {
+                        doc.line_count().max(srcl + 1)
+                    }
+                };
+                srow.src_line = srcl;
+                srow.src_lines = srcl..srcl_next.max(srcl + 1);
                 debug_special_row(editor, window, srcl, &srow, base_font);
                 base.borrow_mut().set(k, f32::from(srow.height));
                 shaped.push((k, srow));

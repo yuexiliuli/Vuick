@@ -24,3 +24,4 @@ include!("tests/block_math.rs");
 include!("tests/epub.rs");
 include!("tests/note_def_flip.rs");
 include!("tests/selection_highlight.rs");
+include!("tests/same_text_rows.rs");
