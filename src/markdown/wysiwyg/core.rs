@@ -941,7 +941,9 @@ impl WyEditor {
     }
 
     /// 粘贴：用剪贴板文本替换选区（若为空则插入光标处）。
-    pub(crate) fn paste(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    /// 数学编辑卡内嵌编辑器聚焦时（`paste_into_focused_math_edit`）先把剪贴板路由给它
+    /// ——否则焦点在卡片上按 Ctrl+V 会把内容误粘到文档正文（P10 实测）。
+    pub(crate) fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.editable {
             return;
         }
@@ -950,6 +952,9 @@ impl WyEditor {
             .read_from_clipboard()
             .map(|i| i.text().unwrap_or_default())
             .unwrap_or_default();
+        if self.paste_into_focused_math_edit(window, &text, cx) {
+            return;
+        }
         let range = self.selection().unwrap_or(self.caret..self.caret);
         if text.is_empty() && range.start == range.end {
             return;

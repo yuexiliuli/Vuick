@@ -318,6 +318,34 @@ impl WyEditor {
         self.math_edit_anchor.set(anchor);
     }
 
+    /// 数学编辑卡内嵌编辑器**当前是否持有焦点**（app 层 `PasteNormalized` 路由判定：
+    /// Ctrl+V 落到 app 根时据此决定把剪贴板喂给卡片输入区而非源码编辑区）。
+    pub(crate) fn math_edit_focused(&self, window: &mut Window, cx: &gpui::App) -> bool {
+        self.math_edit
+            .as_ref()
+            .map(|p| p.text.read(cx).focus_handle().is_focused(window))
+            .unwrap_or(false)
+    }
+
+    /// 数学编辑卡内嵌编辑器聚焦时把 `text` 粘贴进卡片输入区（换行归一化由 CodeEditor
+    /// `paste_text` 承担）。返回 `true` = 本次粘贴已路由到卡片，调用方（WYSIWYG 的
+    /// `paste` / app 的 `paste_normalized`）应直接返回，不再落到文档/主编辑区。
+    pub(crate) fn paste_into_focused_math_edit(
+        &self,
+        window: &mut Window,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.math_edit_focused(window, cx) {
+            return false;
+        }
+        let Some(p) = &self.math_edit else {
+            return false;
+        };
+        p.text.update(cx, |ed, cx| ed.paste_text(text, cx));
+        true
+    }
+
     /// 数学编辑卡在**窗口坐标**中的包围盒（锚点缓存 + 固定尺寸估计）。用于 `on_mouse_down`
     /// 的「点卡内不关/不动文档光标」判定——对点击**落在卡浮层内但非数学卡命中区**
     /// （标题/输入框下缘等）也放行，防止点到输入框时误关卡片或误移文档光标。

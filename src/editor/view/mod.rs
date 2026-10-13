@@ -1558,13 +1558,21 @@ impl CodeEditor {
     }
 
     /// 把目标**逻辑行**滚进可视区（统一行高模型；先经折叠映射成视觉行，再算像素：
-    /// 折叠隐藏行的逻辑行会塌缩到折叠首行的视觉位置）。可视高度扣除底部预留，
-    /// 保证被 reveal 的行不会贴到横向滚动条之下。
+    /// 折叠隐藏行的逻辑行会塌缩到折叠首行的视觉位置）。可视高度只扣除底部**横向
+    /// 滚动条**（真正的非文本区），保证被 reveal 的行不会贴到横向滚动条之下。
+    ///
+    /// ⚠️ 这里**不能**把整段底部预留（`vscroll_bottom_pad_px` = 滚动条 16px + 8 行
+    /// 呼吸区）当「无需滚动区」从可视高里扣——那是**量程**语义（滚到底让末行停在
+    /// 滚动条之上，由 `reach_px`/`pad_row_count` 承担）。矮视口（数学编辑卡内嵌
+    /// 编辑器高 200px、预留 ≈180px，见 P10 实测）全量扣预留 → `rows_visible`=1 →
+    /// 点击任意非首行都触发 `scroll_to_px` 把该行顶到顶部（用户实测「点击某行直接
+    /// 跳成第一行、内容滚下去」）。按真实可见行数算，点击任何可视行都不滚动。
     fn reveal_row(&mut self, row: usize) {
         let lh = self.line_height.as_f32().max(1.);
         let vis = self.folds.visual_row(row);
         let view = self.list_state.viewport_bounds().size.height.as_f32();
-        let rows_visible = ((view - self.vscroll_bottom_pad_px()) / lh).floor().max(1.) as usize;
+        let scrollbar = crate::ui::scrollbar::scrollbar_width().as_f32();
+        let rows_visible = ((view - scrollbar) / lh).floor().max(1.) as usize;
         let cur_top = (self.scroll_top_px() / lh).floor() as usize;
         if vis < cur_top {
             self.scroll_to_px(vis as f32 * lh);

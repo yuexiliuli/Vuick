@@ -3350,3 +3350,108 @@
         let _ = std::fs::remove_file(&md);
     }
 
+    /// P10：数学编辑卡在 live2（WYSIWYG 实时编辑）内聚焦时，Ctrl+V（真实 app 走
+    /// `PasteNormalized` 覆盖绑定 → app 根 `paste_normalized`）必须把剪贴板**路由进
+    /// 卡片输入区**，而不是误粘进源码编辑区；写回经卡片 `Edited` 订阅落到 live2 文档。
+    /// 键盘解析/派发走真实链路（聚焦卡片 + ctrl-v 键 + 与 main.rs 同序的
+    /// PasteNormalized 覆盖绑定）。
+    #[gpui::test]
+    async fn wysiwyg_live_math_edit_ctrl_v_pastes_into_card_not_source_editor(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::actions::PasteNormalized;
+        use gpui::{App, KeyBinding, Keystroke};
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(800.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let md = std::env::temp_dir().join(format!(
+            "gpui-wy-math-paste-{}.md",
+            std::process::id()
+        ));
+        let src = "$$\na + b\n$$\n尾行\n";
+        std::fs::write(&md, src).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        // ON：进入 WYSIWYG（live2）实时编辑模式。
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.toggle_live_test(window, cx));
+        });
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let live = cx.update(|_w, cx| {
+            app.read(cx).tabs[app.read(cx).active_tab]
+                .live2
+                .clone()
+                .expect("live2 应存在")
+        });
+        // 程序化打开数学编辑卡（卡片锚定第 0 块）+ 聚焦卡片输入区。
+        cx.update(|window, cx| {
+            live.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        });
+        cx.update(|window, cx| {
+            live.update(cx, |e, cx| {
+                let fh = e
+                    .math_edit_input()
+                    .expect("应有卡片输入区")
+                    .read(cx)
+                    .focus_handle();
+                window.focus(&fh, cx);
+            });
+            let _ = window.draw(cx);
+        });
+        let card = cx.update(|_w, cx| {
+            live.read(cx).math_edit_input().expect("应有卡片输入区")
+        });
+        // 与 main.rs 同序：在 `bind_local_keymaps` **之后**补 `PasteNormalized` 覆盖
+        // 绑定（更高优先级 → 真实 app 链路：Ctrl+V → PasteNormalized → app 根路由）。
+        cx.update(|_w, cx: &mut App| {
+            cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);
+        });
+        // Ctrl+V 粘贴 → 应进卡片输入区（而非源码编辑区）。
+        let wh = cx.windows().first().copied().expect("窗口句柄");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+        cx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let (card_text, src_value, live_text) = cx.update(|_w, cx: &mut App| {
+            let a = app.read(cx);
+            let t = &a.tabs[a.active_tab];
+            (
+                card.read(cx).text_string(),
+                t.editor.read(cx).value().to_string(),
+                t.live2.clone().expect("live2 应存在").read(cx).text().to_string(),
+            )
+        });
+        assert_eq!(
+            card_text.as_str(),
+            "XYa + b",
+            "Ctrl+V 应把剪贴板粘贴进数学编辑卡输入区：card={card_text:?}"
+        );
+        assert_eq!(
+            src_value.as_str(),
+            src,
+            "源码编辑区不得被误粘（P10：修复前 Ctrl+V 落在源码编辑区）：src={src_value:?}"
+        );
+        assert_eq!(
+            live_text.as_str(),
+            "$$\nXYa + b\n$$\n尾行\n",
+            "卡片粘贴写回 live2 文档（Edited 订阅，围栏形态保留）：live={live_text:?}"
+        );
+        let _ = std::fs::remove_file(&md);
+    }
+

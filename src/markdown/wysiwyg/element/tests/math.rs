@@ -1779,3 +1779,136 @@ fn math_edit_empty_block_writeback_keeps_fences(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn math_edit_click_visible_row_does_not_jump_to_top(cx: &mut TestAppContext) {
+    // 复现（用户实测）：编辑卡内换行/多行后，点击**第二个可视行** → 该行直接跳成第一行
+    // （内容整体滚下一行）。根因疑点：`reveal_row` 的 `rows_visible` =
+    // `floor((视口高 − 底部预留 pad)/行高)`，而数学编辑卡视口仅 `MATH_EDIT_EDITOR_H`(200)px、
+    // 底部预留 pad ≈ 180px（16px 横向滚动条 + 8 行呼吸区量化）→ `rows_visible`=1，
+    // 点击任意非首行都触发 `scroll_to_px` 把该行顶到顶部 = 「点哪行跳哪行到第一行」。
+    use gpui::{Bounds, Modifiers, MouseButton, point, px, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\na + b\nc + d\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应打开编辑卡");
+        // 真实绘制一帧（deferred 浮层布局落定 → ListState 视口高回写）。
+        let _ = window.draw(cx);
+    });
+    let input = ed.read_with(vcx, |e, _| e.math_edit_input()).expect("应有输入区");
+    let (view_h, lh, pad) = input.read_with(vcx, |ed, _| {
+        (
+            ed.list_viewport_height(),
+            ed.test_metrics().1,
+            ed.test_bottom_pad_px(),
+        )
+    });
+    assert!(view_h > 100., "卡片编辑器视口高应落定（≈200）：view_h={view_h}");
+    let editor_b = vcx
+        .debug_bounds("wy-math-edit-editor")
+        .expect("编辑器区已绘制");
+    let scroll0 = input.read_with(vcx, |ed, _| ed.test_text_scroll_top());
+    // 点**第二个可视行**中部（y = 1.5×行高）→ 点击后滚动位置必须保持不变。
+    let click = point(
+        editor_b.origin.x + px(40.),
+        editor_b.origin.y + px(lh * 1.5),
+    );
+    vcx.simulate_mouse_down(click, MouseButton::Left, Modifiers::default());
+    let scroll1 = input.read_with(vcx, |ed, _| ed.test_text_scroll_top());
+    assert_eq!(
+        scroll1, scroll0,
+        "点击第二可视行不得把该行滚到顶：前={scroll0:?} 后={scroll1:?} \
+         （view_h={view_h:.1} lh={lh:.1} pad={pad:.1}，修复目标 rows_visible>1）"
+    );
+}
+
+#[gpui::test]
+fn math_edit_copy_paste_inside_card(cx: &mut TestAppContext) {
+    // 复现（用户实测）：卡片内嵌编辑器的复制/粘贴无效。逐环节验证：程序化选中 →
+    // Ctrl+C（剪贴板应有选中文本）→ 光标置首 + 写剪贴板 → Ctrl+V（内容插入光标处）。
+    // 键位：`bind_input_keys` 在 "Input" 上下文绑 ctrl-c（CodeEditor 核心元素），
+    // ctrl-v 由 `wysiwyg::bind_keys` 的 wy-editor 上下文兜底 → action 派发到聚焦的
+    // 内嵌 CodeEditor（最深 handler + stop_propagation）。
+    use gpui::{App, Bounds, Keystroke, point, px, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\na + b\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应打开编辑卡");
+        // 显式聚焦内嵌编辑器（真实用户点击输入区后的焦点态）。
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        let fh = input.read(cx).focus_handle();
+        window.focus(&fh, cx);
+        let _ = window.draw(cx);
+    });
+    let input = ed.read_with(vcx, |e, _| e.math_edit_input()).expect("应有输入区");
+    let wh = vcx.windows().first().copied().expect("窗口句柄");
+    // ① 选中正文 → Ctrl+C → 剪贴板应有选中文本。
+    vcx.update(|_w, cx| {
+        input.update(cx, |e, cx| {
+            let len = e.text_string().len();
+            e.set_selection_range(0..len, cx);
+        });
+    });
+    vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-c").unwrap());
+    let clip: Option<String> = vcx.update(|_w, cx: &mut App| {
+        cx.read_from_clipboard()
+            .map(|i| i.text().unwrap_or_default())
+    });
+    assert_eq!(
+        clip.as_deref(),
+        Some("a + b"),
+        "Ctrl+C 应把选中文本写入剪贴板（卡片内嵌编辑器）"
+    );
+    // ② 光标放开头 → 写剪贴板 → Ctrl+V → 内容插入光标处。
+    vcx.update(|_w, cx| {
+        input.update(cx, |e, _| e.set_caret_to(0));
+    });
+    vcx.write_to_clipboard(gpui::ClipboardItem::new_string("XY".to_string()));
+    vcx.dispatch_keystroke(wh, Keystroke::parse("ctrl-v").unwrap());
+    let (after, doc) = vcx.update(|_w, cx: &mut App| {
+        (input.read(cx).text_string(), ed.read(cx).content())
+    });
+    assert_eq!(
+        after.as_str(),
+        "XYa + b",
+        "Ctrl+V 应把剪贴板内容粘贴进卡片内嵌编辑器（不能粘进文档正文）：after={after:?} doc={doc:?}"
+    );
+}
+

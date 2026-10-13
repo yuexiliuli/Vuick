@@ -1103,6 +1103,14 @@ impl EditorApp {
         let Some(tab) = self.tabs.get(self.active_tab) else {
             return;
         };
+        // 数学编辑卡内嵌编辑器聚焦（live2 WYSIWYG 的卡片输入区）：Ctrl+V（app 根
+        // `PasteNormalized`）必须粘贴进卡片，而不是误粘进源码编辑区（P10 实测）。
+        if let Some(live) = tab.live2.as_ref() {
+            let routed = live.update(cx, |w, cx| w.paste_into_focused_math_edit(window, &text, cx));
+            if routed {
+                return;
+            }
+        }
         tab.editor.update(cx, |editor, cx| {
             editor.paste_text(&text, cx);
         });
