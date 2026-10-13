@@ -1538,6 +1538,325 @@ mod dt {
         assert_eq!(rows[2].note_defs[0].1, 33);
     }
 
+    /// 回归（S2）：**巨代码块内编辑**走 in-place 捷径时必须与全量扫描逐块一致，且
+    /// 真实路径（含 `rebuild_toc` 的完整增量）的 blocks 与 toc 都不漂移；同时断言
+    /// 逐字编辑**命中** in-place 计数（不再「块首→文末」整段重扫）。内容用纯 ASCII
+    /// （字节位置即字符边界，模拟真实字符边界 dirty 通道）。
+    #[test]
+    fn giant_fence_interior_edit_parity_and_inplace() {
+        use super::blocks_scan::INPLACE_CODE_SCAN_HITS;
+        let mut text = String::from("# HEAD BEFORE\n\n```rust\n");
+        for i in 0..5000 {
+            text.push_str(&format!("// content line {i} with padding xxxxxxxxxxxxxxxxxx\n"));
+        }
+        text.push_str("```\n# HEAD AFTER\n\nTRAIL paragraph with [link](https://x.y).\n");
+
+        let run = |name: &str, f: &dyn Fn(&mut String)| {
+            let mut newt = text.clone();
+            f(&mut newt);
+            let cur = Rope::from(text.as_str());
+            let prev = scan_blocks_rope(&cur);
+            let new = Rope::from(newt.as_str());
+            let dirty = {
+                let cp = common_prefix_bytes(&text, &newt);
+                let cs = common_suffix_bytes(&text, &newt);
+                cp..(newt.len() - cs)
+            };
+            // 完整版（rebuild_toc）与 WYSIWYG blocks-only 版都要与各自全量逐值一致。
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &new, Some(dirty.clone()));
+            let full = scan_blocks_rope(&new);
+            assert!(
+                inc.blocks == full.blocks && inc.toc == full.toc,
+                "{name}（完整版）增量与全量不一致\ndirty={dirty:?}\ninc_blocks={:?}\nfull_blocks={:?}\ninc_toc={:?}\nfull_toc={:?}",
+                inc.blocks,
+                full.blocks,
+                inc.toc,
+                full.toc,
+            );
+            let inc = scan_blocks_incremental_rope_blocks_only(&cur, &prev, &new, Some(dirty));
+            assert!(
+                inc.blocks == full.blocks,
+                "{name}（blocks-only）增量与全量不一致"
+            );
+        };
+
+        // 字符插入 / 删除 / 行内替换：必须命中 in-place（计数 +1）且对拍一致。
+        let before = INPLACE_CODE_SCAN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        run("巨围栏内插字", &|v| {
+            let at = v.find("content line 2500").unwrap() + 4;
+            v.insert_str(at, "XYZ");
+        });
+        let after = INPLACE_CODE_SCAN_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after >= before + 1,
+            concat!(
+                "巨围栏内逐字编辑应命中 in-place 路径（before={} after={}），",
+                "否则仍在对整段做块首→文末重扫"
+            ),
+            before,
+            after
+        );
+        run("巨围栏内删字", &|v| {
+            let at = v.find("content line 2500").unwrap() + 4;
+            v.remove(at);
+        });
+        run("巨围栏内行内替换", &|v| {
+            let at = v.find("content line 2500").unwrap();
+            v.replace_range(at + 4..at + 10, "REPLXX");
+        });
+        run("巨围栏内插入 Enter", &|v| {
+            let at = v.find("content line 2500").unwrap() + 4;
+            v.insert(at, '\n');
+        });
+        run("巨围栏内删除换行", &|v| {
+            let at = v.find("content line 2501").unwrap() - 1; // 2500 行尾的 '\n'
+            v.remove(at);
+        });
+        // toc 平移正确性：后置标题应保留且行号 +（新增换行数）。
+        let mut newt = text.clone();
+        newt.insert_str(newt.find("content line 2500").unwrap() + 4, "XYZ\nW");
+        let new = Rope::from(newt.as_str());
+        let full = scan_blocks_rope(&new);
+        let inc = scan_blocks_incremental_rope(
+            &Rope::from(text.as_str()),
+            &scan_blocks_rope(&Rope::from(text.as_str())),
+            &new,
+            Some(newt.len().saturating_sub(text.len())..newt.len()),
+        );
+        assert!(
+            inc.blocks == full.blocks && inc.toc == full.toc,
+            "巨围栏内多行编辑后 toc 平移不一致"
+        );
+        let tt: Vec<_> = full.toc.iter().map(|(r, lv, t)| (r, lv, t.to_string())).collect();
+        assert!(tt.iter().any(|(_, _, t)| t == "HEAD AFTER"), "HEAD AFTER 标题应仍在 toc");
+    }
+
+    /// 回归（S2）：**扰动围栏结构**的巨围栏编辑必须掉回通用路径并保持与全量一致
+    /// （in-place 判定拒绝：开门/关门行被改、围栏内新成/毁等长围栏行、删换行把合并
+    /// 行变成围栏行）。内容纯 ASCII。
+    #[test]
+    fn giant_fence_structure_edits_fallback_to_full_parity() {
+        let mut text = String::from("```rust\n");
+        for i in 0..1000 {
+            text.push_str(&format!("// giant fence content line {i}\n"));
+        }
+        text.push_str("``\n");
+        text.push_str("`x\n");
+        for i in 1000..3000 {
+            text.push_str(&format!("// giant fence content line {i}\n"));
+        }
+        text.push_str("```\n# HEAD AFTER\n\nTRAIL paragraph.\n");
+
+        let run = |name: &str, f: &dyn Fn(&mut String)| {
+            let mut newt = text.clone();
+            f(&mut newt);
+            let cur = Rope::from(text.as_str());
+            let prev = scan_blocks_rope(&cur);
+            let new = Rope::from(newt.as_str());
+            let cp = common_prefix_bytes(&text, &newt);
+            let cs = common_suffix_bytes(&text, &newt);
+            let dirty = cp..(newt.len() - cs);
+            for (tag, d) in [("精确", dirty.clone()), ("膨胀", {
+                let lo = dirty.start.saturating_sub(4);
+                let hi = (dirty.end + 4).min(newt.len());
+                lo..hi
+            })] {
+                let inc = scan_blocks_incremental_rope(&cur, &prev, &new, Some(d.clone()));
+                let full = scan_blocks_rope(&new);
+                assert!(
+                    inc.blocks == full.blocks && inc.toc == full.toc,
+                    "{name}/{tag} 绕回通用路径后仍须与全量一致\ndirty={d:?}\ninc_blocks={:?}\nfull_blocks={:?}",
+                    inc.blocks,
+                    full.blocks,
+                );
+            }
+        };
+
+        // 围栏内新造等长围栏行（提前关门 → 结构剧变）
+        run("围栏内插入关门围栏", &|v| {
+            let at = v.find("content line 1500").unwrap();
+            v.insert_str(at, "```\n");
+        });
+        // 围栏内删换行把两内容行合并成等长围栏行（`` + `x → ```x）
+        run("删换行合并成围栏行", &|v| {
+            let at = v.find("`x").unwrap() - 1; // "``\n" 的换行符
+            v.remove(at);
+        });
+        // 改开门行（```rust → xxrust）
+        run("改开门行", &|v| {
+            let at = v.find("rust").unwrap();
+            v.replace_range(at..at + 4, "xxxx");
+        });
+        // 改关门行（``` → xxx）
+        run("改关门行", &|v| {
+            let at = v.rfind("```").unwrap();
+            v.replace_range(at..at + 3, "xxx");
+        });
+        // 删除关门围栏行（关门行消失 → 围栏延伸到文末）
+        run("删除关门围栏行", &|v| {
+            let at = v.rfind("```\n").unwrap();
+            v.replace_range(at..at + 4, "");
+        });
+    }
+
+    /// 回归（S2）：`classify_block` 的关门判定**只比围栏字符、不比长度**（开门 3 反引号
+    /// 的围栏会被 4 反引号行提前关闭）。in-place 守卫若只按「等长」判定，会漏掉「同字符
+    /// 异长」的关门行（如 4 反引号）→ 误命中 → 与全量不一致；必须按围栏字符判定（变化
+    /// 区整行内出现任何 ≥3 同字符围栏行都拒绝）→ 掉回通用路径。内容纯 ASCII。
+    #[test]
+    fn giant_fence_same_char_longer_fence_line_fallback_to_full_parity() {
+        let mut text = String::from("```rust\n");
+        for i in 0..1000 {
+            text.push_str(&format!("// giant content line {i}\n"));
+        }
+        // 两行"``" 内容行（n=2<3，非围栏）：删其中换行 → 4 反引号「提前关门」行。
+        text.push_str("``\n``\n");
+        for i in 1000..2000 {
+            text.push_str(&format!("// giant content line {i}\n"));
+        }
+        text.push_str("```\n# HEAD AFTER\n\nTRAIL.\n");
+
+        let run = |name: &str, f: &dyn Fn(&mut String)| {
+            let mut newt = text.clone();
+            f(&mut newt);
+            let cur = Rope::from(text.as_str());
+            let prev = scan_blocks_rope(&cur);
+            let new = Rope::from(newt.as_str());
+            let cp = common_prefix_bytes(&text, &newt);
+            let cs = common_suffix_bytes(&text, &newt);
+            for (tag, d) in [("精确", cp..(newt.len() - cs)), ("膨胀", {
+                let lo = cp.saturating_sub(4);
+                let hi = (newt.len() - cs + 4).min(newt.len());
+                lo..hi
+            })] {
+                let inc = scan_blocks_incremental_rope(&cur, &prev, &new, Some(d.clone()));
+                let full = scan_blocks_rope(&new);
+                assert!(
+                    inc.blocks == full.blocks && inc.toc == full.toc,
+                    "{name}/{tag} 同字符异长围栏行须绕回通用路径且与全量一致\n\
+                     dirty={d:?}\ninc_blocks_first={:?}\nfull_blocks_first={:?}",
+                    inc.blocks.iter().take(4).collect::<Vec<_>>(),
+                    full.blocks.iter().take(4).collect::<Vec<_>>(),
+                );
+            }
+        };
+
+        // 2 反引号内容行前插 2 反引号 → 4 反引号行（同字符、长度≠开门长）提前关门
+        run("造出 4 反引号关门行", &|v| {
+            let at = v.find("\n``\n").unwrap() + 1;
+            v.insert_str(at, "``");
+        });
+        // 两条 2 反引号内容行删换行合并 → 4 反引号关门行
+        run("删换行合并成 4 反引号关门行", &|v| {
+            let at = v.find("\n``\n").unwrap() + 3; // "``\n``\n" 中第一条 ```` 行后换行
+            v.remove(at);
+        });
+    }
+
+    /// 回归（S2）：**未关门**巨围栏（延伸到文末，无后缀块/无关门行）内部编辑与
+    /// 文末追加仍走 in-place 并保持与全量一致（后缀/目录后缀为空的角落路径）。
+    #[test]
+    fn unclosed_giant_fence_edit_parity() {
+        let mut text = String::from("```rust\n");
+        for i in 0..3000 {
+            text.push_str(&format!("// unclosed content line {i}\n"));
+        }
+        text.push_str("# HEAD AFTER\n\nTRAIL paragraph.\n");
+        text.truncate(text.find("# HEAD AFTER").unwrap()); // 无关门行，围栏到文末
+        assert!(!text.contains("```\n```"), "不应有关门行");
+
+        let run = |name: &str, f: &dyn Fn(&mut String)| {
+            let mut newt = text.clone();
+            f(&mut newt);
+            let cur = Rope::from(text.as_str());
+            let prev = scan_blocks_rope(&cur);
+            let new = Rope::from(newt.as_str());
+            let cp = common_prefix_bytes(&text, &newt);
+            let cs = common_suffix_bytes(&text, &newt);
+            let inc = scan_blocks_incremental_rope(&cur, &prev, &new, Some(cp..(newt.len() - cs)));
+            let full = scan_blocks_rope(&new);
+            assert!(
+                inc.blocks == full.blocks && inc.toc == full.toc,
+                "{name} 未关门围栏内编辑须与全量一致\ninc_blocks={:?}\nfull_blocks={:?}",
+                inc.blocks,
+                full.blocks,
+            );
+        };
+
+        run("未关门围栏内插字", &|v| {
+            let at = v.find("content line 2000").unwrap() + 4;
+            v.insert_str(at, "XYZ");
+        });
+        run("未关门围栏内插 Enter", &|v| {
+            let at = v.find("content line 2000").unwrap() + 4;
+            v.insert(at, '\n');
+        });
+        // 文末追加（仍在围栏内部）：纯追加、delta>0、new_lo 处非 EOF。
+        run("未关门围栏文末追加", &|v| {
+            v.push_str("// appended tail line\n");
+        });
+    }
+
+    /// 基准（--ignored）：**巨代码块内逐键**成本——单围栏文档（开门行 + 约 8 万行
+    /// 内容），在围栏内部固定点位逐字插入（模拟一处连续打字），走 WYSIWYG 每键路径
+    /// `scan_blocks_incremental_rope_blocks_only` 与完整版 `scan_blocks_incremental_rope`，
+    /// 每 20 轮与全量扫描逐块对拍（断言）。S2 前基线 ≈19.7ms/键（region 从块首切片到
+    /// 文末整段重切重 classify）；S2 后目标 <5ms/键。打印、不断言数值。
+    #[test]
+    #[ignore]
+    fn bench_giant_fence_per_key_before_after() {
+        use std::time::Instant;
+        // 单围栏：开门行 + 6MB 级代码内容（>64 行、>4096B，属 is_giant_code_block 阈值级）。
+        let line = "// 这是一行足够长的代码注释内容，模拟真实大代码块里的普通行，xxxxxxxxxxxxxxxx\n";
+        let mut inner = String::new();
+        while inner.len() < 6_000_000 {
+            inner.push_str(line);
+        }
+        let mut text = String::from("```rust\n");
+        text.push_str(&inner);
+        text.push_str("```\n");
+        let n_lines = text.lines().count();
+
+        // 固定锚点（围栏内部、ASCII → 字节位置必为字符边界）：约 1/3 处某行中部。
+        let anchor = (text.len() / 3 .. text.len() / 3 + 4096)
+            .find(|&i| text.as_bytes()[i] == b'/' && text.as_bytes()[i - 1] == b'/')
+            .unwrap_or(text.len() / 3 + 100);
+
+        let run = |label: &str, n: usize| {
+            let mut cur = Rope::from(text.as_str());
+            let mut prev = scan_blocks_rope(&cur);
+            let (mut sum, mut max, mut min) = (0.0f64, f64::MIN, f64::MAX);
+            for i in 0..n {
+                let mut next = cur.clone();
+                next.insert(anchor, "x");
+                let dirty = anchor..anchor + 1;
+                let t = Instant::now();
+                let inc = scan_blocks_incremental_rope_blocks_only(&cur, &prev, &next, Some(dirty));
+                let d = t.elapsed().as_secs_f64() * 1000.0;
+                sum += d;
+                max = max.max(d);
+                min = min.min(d);
+                if i % 20 == 19 {
+                    let full = scan_blocks_rope(&next);
+                    assert!(
+                        inc.blocks == full.blocks,
+                        "{label} 第 {i} 轮 blocks 与全量不一致（对拍失败）"
+                    );
+                }
+                cur = next;
+                prev = inc;
+            }
+            eprintln!(
+                "[bench][{label}] 巨围栏 {n_lines} 行 / {:.1} MB 逐键（n={n} @{anchor}）：avg {:.3}ms min {:.3}ms max {:.3}ms",
+                text.len() as f64 / 1e6,
+                sum / n as f64,
+                min,
+                max,
+            );
+        };
+        run("blocks_only(before/after)", 120);
+    }
+
     #[test]
     fn citation_index_from_rows_maps_refs_and_defs() {
         // 全量路径：注记号 → (渲染行, 显示文本字节区间) + 详情正文。

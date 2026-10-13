@@ -8,12 +8,14 @@
 use std::ops::Range;
 
 use gpui::{Image, SharedString};
-use ropey::Rope;
+use ropey::{LineType, Rope};
 
 use super::blocks::{
     classify_block, scan_blocks, BlockIndex, BlockMeta, Blocks, BlocksSeg, Toc, TocSeg,
 };
-use super::rows::{inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData};
+use super::rows::{
+    fence_len, inline_strip, parse_to_rows, Row, RowKind, RunKind, TableAlign, TableData,
+};
 
 /// 全量扫描一个 **ropey Rope** 文本（打开/首同步/大变化兜底用）。
 ///
@@ -55,6 +57,154 @@ fn common_suffix_bytes_rope(a: &Rope, b: &Rope) -> usize {
         }
     }
     i
+}
+
+/// —— S2 巨代码块 in-place 增量 ——
+///
+/// 通用增量路径锚点在「块首」：围栏是单个 `Code` 块，编辑点落在围栏内部时，锚点仍
+/// 是开门行 → region 从块首切片到尾部对齐点（整段≤文末）→ 物化 + split + 重 classify
+/// 一遍 6MB 围栏（debug 实测 ~37ms/键）。这里给出**围栏内编辑的专用捷径**：锚点块
+/// 是 Code 围栏且编辑点所在变化区不扰动围栏结构时，只按「编辑点净行差」平移
+/// 围栏块的 `aux`，前缀/后缀块与目录 O(段数) 共享平移——整段不再物化、不再重 classify。
+///
+/// 判定（任一不满足 → `None` 走通用慢速路径，正确性由全量对拍兜底）：
+/// 1. 锚点块 [RowKind::Code] 且其开门行确为围栏（取开门围栏字符 `open_char`）；
+/// 2. 变化字节区间（新旧两侧，各自扩到覆盖完整行）内**不存在**与开门**同字符**的
+///    ≥3 围栏行——`classify_block` 的关门判定只比围栏字符、不比长度（开门 3 反引号
+///    会被 4 反引号行提前关闭），故开门/关门行被编辑、内部新成/毁围栏、删除换行导致
+///    合并行成围栏，都会被这里的整行检查拒掉（保守回退）。此条件等价于「开门到关门
+///    之间第一个同字符围栏行（即关门行）的相对位置不变」：变化区外所有行字节相同 ⇒
+///    围栏结构逐块不变。
+///
+/// 命中时产物与全量扫描逐块一致（有对拍回归测试）：围栏块仅 `aux` 平移净行差，
+/// 后缀块/目录整体平移 `(delta, delta_lines)`（与通用路径尾部复用同式）。
+/// `#[cfg(test)]` 计数供回归观察：巨块内编辑应命中本路径而非整段重扫（不断言时间）。
+#[cfg(test)]
+pub(crate) static INPLACE_CODE_SCAN_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// 字节区间 `[lo, hi)` 覆盖的「整行」字节跨度（`[s, e)`，s/e 都是行首字节）。
+/// 空区间（lo == hi，如纯删除/纯插入的另一侧）也覆盖 lo 所在的一行——检查合并/分裂
+/// 点本身；lo 已到 EOF（无内容）时返回空（`[n, n)`）。
+fn whole_line_byte_span(rope: &Rope, lo: usize, hi: usize) -> (usize, usize) {
+    let n = rope.len();
+    let lo = lo.min(n);
+    let hi = hi.min(n).max(lo);
+    if lo >= n {
+        return (n, n);
+    }
+    let line_lo = rope.byte_to_line_idx(lo, LineType::LF);
+    let last = if hi > lo { hi - 1 } else { lo };
+    let line_last = rope.byte_to_line_idx(last, LineType::LF);
+    let s = rope.line_to_byte_idx(line_lo, LineType::LF);
+    let e = rope.line_to_byte_idx(line_last + 1, LineType::LF);
+    (s, e)
+}
+
+/// `[s, e)`（已对齐整行）：任一行 `fence_len(trim_start)` 的围栏字符与开门 `open_char`
+/// 相同即「可能改变围栏结构」——判定口径与 `classify_block` 的关门判定逐字一致：
+/// 关门**只比围栏字符** `~`/`` ` ``、**不比长度**（开门 3 反引号的围栏会被 4 反引号行
+/// 提前关闭），因此任何 ≥3 同字符围栏行都必须拒掉，保守回退通用路径。
+fn span_has_fc_fence_line(rope: &Rope, s: usize, e: usize, open_char: char) -> bool {
+    if s >= e || s >= rope.len() {
+        return false;
+    }
+    let text = rope.slice(s..e).to_string();
+    for raw in text.split('\n') {
+        let t = raw.trim_end_matches('\r').trim_start();
+        if let Some((c, _)) = fence_len(t)
+            && c == open_char
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// S2 巨代码块 in-place 扫描：见模块头注释。返回 `None` 表示判定不命中（走通用路径）。
+fn try_code_block_inplace_scan(
+    prev_src: &Rope,
+    prev: &BlockIndex,
+    new_src: &Rope,
+    b_first: usize,
+    tail_start_new: usize,
+    delta: i64,
+    bi: usize,
+    rebuild_toc: bool,
+) -> Option<BlockIndex> {
+    let block = prev.blocks.at(bi);
+    if block.kind != RowKind::Code {
+        return None;
+    }
+    let open_byte = block.byte as usize;
+    let open_line = block.src_line as usize;
+    // 开门行文本（读旧 rope；变化前字节逐位相同，与新版一致）。
+    let open_line_no = prev_src.byte_to_line_idx(open_byte, LineType::LF);
+    let open_end = prev_src.line_to_byte_idx(open_line_no + 1, LineType::LF);
+    let open_text = prev_src.slice(open_byte..open_end).to_string();
+    let (open_char, _) = match fence_len(open_text.trim_end_matches('\r').trim_start()) {
+        Some(x) => x,
+        None => return None, // 锚点块名不符实（非围栏）→ 通用路径
+    };
+
+    // 变化字节区间（旧/新坐标系）：前缀/后缀字节相同 ⇒ 区间 [b_first, tail) 精确覆盖
+    // 被改内容（删/插/替换统一；`tail_start_new - delta` 把尾部映射回旧坐标）。
+    // 端点一律裁到字符边界（真实 dirty 通道恒为字符边界；膨胀 dirty 兜底防 slice 越界）
+    // ——裁入的整字符来自未变内容，不改变围栏行判定结果。
+    let old_lo = prev_src.floor_char_boundary(b_first.min(prev_src.len()));
+    let new_lo = new_src.floor_char_boundary(b_first.min(new_src.len()));
+    let old_hi = prev_src
+        .ceil_char_boundary(((tail_start_new as i64 - delta).max(0) as usize).min(prev_src.len()))
+        .max(old_lo);
+    let new_hi = new_src
+        .ceil_char_boundary(tail_start_new.min(new_src.len()))
+        .max(new_lo);
+
+    // 围栏结构不变量：两侧「变化区覆盖整行」都不得出现开门同字符围栏行（见模块头）。
+    let (os, oe) = whole_line_byte_span(prev_src, old_lo, old_hi);
+    let (ns, ne) = whole_line_byte_span(new_src, new_lo, new_hi);
+    if span_has_fc_fence_line(prev_src, os, oe, open_char)
+        || span_has_fc_fence_line(new_src, ns, ne, open_char)
+    {
+        return None;
+    }
+
+    // 行数平移量（围栏块 aux 与后缀/目录行号都按它平）：「未变后缀起点」的新旧行号差
+    // ——即使 dirty 尾部被「尾随相同字节」（如共用尾 `\n`）裁掉，行号差仍精确等于编辑
+    // 引入/移除的净行数（区域换行差会被共用尾 `\n` 漏算，已实测 + 对拍修正）。
+    let old_tail = ((tail_start_new as i64 - delta).max(0) as usize).min(prev_src.len());
+    let new_tail = tail_start_new.min(new_src.len());
+    let delta_lines = new_src.byte_to_line_idx(new_tail, LineType::LF) as i64
+        - prev_src.byte_to_line_idx(old_tail, LineType::LF) as i64;
+
+    // 锚点块：仅 aux 平移；byte/src_line/kind/raw_len 皆不变（开门行在变化前、未动）。
+    let mut mid = prev.blocks.at(bi);
+    mid.aux = (mid.aux as i64 + delta_lines).max(0) as u32;
+
+    // 前缀块共享段不变；后缀块（围栏之后）整体平移 (delta, delta_lines)。
+    let prefix = prev.blocks.shares_prefix(bi);
+    let suffix = prev.blocks.shares_suffix(bi + 1, delta, delta_lines);
+
+    // 目录：标题不可能出现在围栏内部——前缀取开门行之前；后缀经「关门行后第一行」
+    // 切出（未闭围栏无后缀块 ⇒ 目录后缀也空）。
+    let toc = if rebuild_toc {
+        let prefix_n = prev.toc.count_before_line(open_line);
+        let suffix_n = if bi + 1 < prev.blocks.len() {
+            prev.toc.count_before_line(open_line + block.aux as usize + 2)
+        } else {
+            prev.toc.len()
+        };
+        let tp = prev.toc.shares_prefix(prefix_n);
+        let ts = prev.toc.shares_suffix(suffix_n, delta_lines);
+        Toc::assemble(tp, Vec::new(), ts)
+    } else {
+        Toc::default()
+    };
+
+    Some(BlockIndex {
+        blocks: Blocks::assemble(prefix, vec![mid], suffix),
+        toc,
+    })
 }
 
 /// **预览增量解析（rope 版）**：语义与 `scan_blocks_incremental`（str 版，测试参照）
@@ -137,6 +287,24 @@ fn scan_blocks_incremental_rope_impl(
         .saturating_sub(1);
     let anchor = prev.blocks.get(bi).map(|b| b.src_line as usize).unwrap_or(0);
     let anchor_byte = prev.blocks.get(bi).map(|b| b.byte as usize).unwrap_or(0);
+
+    // —— S2 巨代码块 in-place：锚点块是 Code 围栏且编辑点不扰动围栏结构时，只按
+    // 编辑点净行差平移 `aux`，前缀/后缀共享段零拷贝，不再「块首→文末」整段
+    // 物化 + 重 classify（6MB 单围栏实测 ~37ms/键 → 亚毫秒）。不命中则继续通用路径。
+    if let Some(idx) = try_code_block_inplace_scan(
+        prev_src,
+        prev,
+        new_src,
+        b_first,
+        tail_start_new,
+        delta,
+        bi,
+        rebuild_toc,
+    ) {
+        #[cfg(test)]
+        INPLACE_CODE_SCAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return idx;
+    }
 
     // 未变前缀直接沿用；toc 同样取前缀（与 str 版相同的「源码行 vs 块下标」坐标
     // 修正：按重扫起点 `anchor` 行号过滤，而非块下标 `bi`）。
