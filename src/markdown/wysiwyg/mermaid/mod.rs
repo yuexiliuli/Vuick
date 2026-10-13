@@ -28,6 +28,7 @@ mod parse;
 pub(crate) use layout::{mm_layout, mermaid_card_height, scale_mm_layout, MmSeqLayout, MmSeqColumn, SEQ_NOTE_H};
 #[cfg(test)]
 pub(crate) use layout::accent_idx_for;
+pub(crate) use layout::arrow_base;
 pub(crate) use paint::paint_mermaid_layout;
 pub(crate) use parse::{diagram_kind, mermaid_graph, mermaid_seq, MmDiagramKind};
 
@@ -302,6 +303,12 @@ pub(crate) struct MmPolylineEdge {
     /// 曲线化后的密点（layout 期一次算好缓存；`Some` = 圆角/贝塞尔后的采样，
     /// paint 优先消费，`None` = 骨架即直边直接用 `points`）。
     pub smoothed: Option<Vec<(f32, f32)>>,
+    /// 目标端箭头方向 = 目标节点接触边的**垂直内法向**（与弧线切线无关，「垂直指向节点」）：
+    /// TB 顶边进 → (0,1) 垂直向下、BT 底边进 → (0,-1) 垂直向上、LR 左进 → (1,0)、RL 右进
+    /// → (-1,0)。`route_edges` 按本边实际钉在目标的哪条边定死，paint 直接消费；不再取弧线
+    /// 入射切线（旧 `end_tangent` 在 12 采样/大弓高下与垂直方向偏差 5~11.5°，即「箭头随弧线
+    /// 角度歪斜」投诉根因）。单位向量，等比缩放下不变（保角，无需随缩放变换）。
+    pub arrow_dir: (f32, f32),
     /// 标签锚点（卡片相对坐标，居中在路径中点）。
     pub label: Option<(f32, f32)>,
     /// 边标签文本。
@@ -352,6 +359,10 @@ pub(crate) const MM_SEP: f32 = 24.;
 pub(crate) const MM_EDGE_X: f32 = 14.;
 /// 每个 subgraph 嵌套层加的标题带高。
 pub(crate) const MM_SUB_TITLE_H: f32 = 26.;
+/// 端箭头长度（px，缩放前规范空间；= `paint::arrow_head` 的 len 9·s 在 s=1 的取值）。
+/// 布局据此把弧线目标端收短一个箭头长、paint 据此把线末点回缩到箭头基部——「线到基部、
+/// 箭头到节点」双连接修复的**单一几何来源**，layout 与 paint 同源，不得分开改。
+pub(crate) const ARROW_LEN_PX: f32 = 9.;
 
 /// 空图的固定卡片高。
 pub(crate) fn mermaid_empty_height() -> Pixels {

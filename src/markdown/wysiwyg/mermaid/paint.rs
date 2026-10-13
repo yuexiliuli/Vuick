@@ -5,7 +5,7 @@
 //! 绘制原语：`paint_quad`（圆角矩形/卡片）、`PathBuilder::fill/stroke`（多边形节点、
 //! 椭圆近似）、虚线用短线段仿制（GPUI 无 native dashed path）。
 
-use super::{MmEdgeKind, MmFlowLayout, MmLayout, MmPlaced, MmSeqArrow, MmSeqColumn, MmSeqFragmentKind, MmSeqLayout, MmSeqNotePos, MmSeqRow, MmShape, SEQ_NOTE_H};
+use super::{MmEdgeKind, MmFlowLayout, MmLayout, MmPlaced, MmSeqArrow, MmSeqColumn, MmSeqFragmentKind, MmSeqLayout, MmSeqNotePos, MmSeqRow, MmShape, SEQ_NOTE_H, ARROW_LEN_PX, arrow_base};
 use crate::markdown::wysiwyg::WyTheme;
 use gpui::{App, Bounds, Corners, Edges, Hsla, PathBuilder, Pixels, Point, SharedString, TextRun, Window, point, px};
 
@@ -224,7 +224,14 @@ fn stroke_poly(window: &mut Window, pts: &[(f32, f32)], color: Hsla, width: f32)
     }
 }
 
-/// 画一条边（虚线/实线/粗线 + 首尾标记 + 标签）。
+/// 画一条边（虚线/实线/粗线 + 首尾箭头 + 标签）。统一规则「线到基部、箭头到节点」：
+/// - **箭头 tip 恒为逻辑锚点 `e.points.last()` = 骨架末端 = 节点边缘接触点**（与 smoothed
+///   是否已收短无关，缩放/平移不变）——paint 用 `<tip>` 落实心箭头尖；
+/// - **线末点回缩到箭头基部** `base = tip − ARROW_LEN_PX·z·arrow_dir`（与 layout 的弧线
+///   [`arrow_base`] 同函数同常量）：弧线已在 layout 收短到基部（末点 == base，此处 no-op）；
+///   直边/圆角肘末段沿 `arrow_dir` 轴对齐，此处精确回缩 9·z——不再「线穿到节点边 + 箭头
+///   同点」双连接；
+/// - **双端**（Both）源端对称：线首点沿首段方向回缩一个箭头长。
 fn paint_edge(
     window: &mut Window,
     e: &super::MmPolylineEdge,
@@ -233,7 +240,7 @@ fn paint_edge(
     color: Hsla,
     z: f32,
 ) {
-    // 曲线化密点优先（layout 期缓存）；无则用直角骨架。首尾锚定不变。
+    // 曲线化密点优先（layout 期缓存）；无则用直角骨架。首锚定不变。
     let src: &Vec<(f32, f32)> = e.smoothed.as_ref().unwrap_or(&e.points);
     let pts: Vec<(f32, f32)> = src.iter().map(|&(x, y)| (x + ox, y + oy)).collect();
     if pts.len() < 2 {
@@ -243,27 +250,56 @@ fn paint_edge(
         MmEdgeKind::ThickArrow | MmEdgeKind::ThickLine | MmEdgeKind::BothThick => 2.8,
         _ => 1.5,
     };
+    // 目标端箭头方向 = 目标接触边垂直内法向（`e.arrow_dir`，layout 期按边实际钉在目标的
+    // 哪条边定死）——垂直指向节点、直插所入边，不随弧线切线歪斜（旧 `end_tangent` 偏差
+    // 5~11.5° 是投诉 .2 根因）。
+    let tip = (e.points.last().unwrap().0 + ox, e.points.last().unwrap().1 + oy);
+    let dir = e.arrow_dir;
+    let has_arrow = matches!(
+        e.kind,
+        MmEdgeKind::Arrow
+            | MmEdgeKind::DottedArrow
+            | MmEdgeKind::ThickArrow
+            | MmEdgeKind::BothArrow
+            | MmEdgeKind::BothThick
+    );
+    // 绘制用点：有箭头 → 末点回缩到基部（任意缩放下 `base = tip − 9·z·dir` 与 layout 收短
+    // 的弧线尾点严格重合）；无箭头（Line/圆端/叉端）→ 原样连到节点边缘。
+    let draw: Vec<(f32, f32)> = if has_arrow {
+        let base = arrow_base(tip, dir, ARROW_LEN_PX * z);
+        let mut v = pts.clone();
+        *v.last_mut().unwrap() = base;
+        if matches!(e.kind, MmEdgeKind::BothArrow | MmEdgeKind::BothThick) {
+            // 双端：源端同样把线首点回缩一个箭头长（沿首段方向进入线内），与目标端对称，
+            // 两条半箭头各占两端一个箭头长、「线到两端基部」。
+            let (a, b) = (v[0], v[1]);
+            let l = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-3);
+            let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+            v[0] = (a.0 + ARROW_LEN_PX * z * ux, a.1 + ARROW_LEN_PX * z * uy);
+        }
+        v
+    } else {
+        pts.clone()
+    };
     match e.kind {
         MmEdgeKind::DottedArrow | MmEdgeKind::DottedLine => {
-            dashed_path(window, &pts, color, width, 4., 4.);
+            dashed_path(window, &draw, color, width, 4., 4.);
         }
-        _ => stroke_poly(window, &pts, color, width),
+        _ => stroke_poly(window, &draw, color, width),
     }
-    // 端点标记（箭头方向取末两密点切线，与曲线末端一致）。
-    let last = *pts.last().unwrap();
-    let dir = dir_of(&pts);
+    // 端点标记：tip = 节点边缘接触点；箭头实心填充从基部到 tip。
     match e.kind {
         MmEdgeKind::Arrow | MmEdgeKind::DottedArrow | MmEdgeKind::ThickArrow | MmEdgeKind::BothArrow | MmEdgeKind::BothThick => {
-            arrow_head(window, last, dir, color, z);
+            arrow_head(window, tip, dir, color, z);
         }
         MmEdgeKind::CircleEnd => {
-            circle(window, last.0, last.1, 3.5 * z, 3.5 * z, color, color, width);
+            circle(window, tip.0, tip.1, 3.5 * z, 3.5 * z, color, color, width);
         }
         MmEdgeKind::CrossEnd => {
             let (dx, dy) = (dir.0 * 4. * z, dir.1 * 4. * z);
             let (pxx, py) = (dir.1 * 4. * z, -dir.0 * 4. * z);
-            stroke_seg(window, (last.0 - dx + pxx, last.1 - dy + py), (last.0 + dx - pxx, last.1 + dy - py), color, width);
-            stroke_seg(window, (last.0 - dx - pxx, last.1 - dy - py), (last.0 + dx + pxx, last.1 + dy + py), color, width);
+            stroke_seg(window, (tip.0 - dx + pxx, tip.1 - dy + py), (tip.0 + dx - pxx, tip.1 + dy - py), color, width);
+            stroke_seg(window, (tip.0 - dx - pxx, tip.1 - dy - py), (tip.0 + dx + pxx, tip.1 + dy + py), color, width);
         }
         _ => {}
     }
@@ -322,10 +358,11 @@ fn measure_edge_label(window: &mut Window, theme: &WyTheme, text: &str, z: f32) 
     f32::from(window.text_system().shape_line(SharedString::from(text), px(12. * z), &run, None).width())
 }
 
-/// 实心三角形箭头：len 9·s、半宽 5·s，尖端落在线终点，颜色=边色（`Some(色)` 填充、
-/// 无描边）。流程/序列共用——`->>`/`-->`/`==>` 等实心箭头同款。
+/// 实心三角形箭头：len=ARROW_LEN_PX·s、半宽 5·s，尖端落在线终点（=节点边缘/消息线端），
+/// 颜色=边色（`Some(色)` 填充、无描边）。流程/序列共用——`->>`/`-->`/`==>` 等实心箭头
+/// 同款；len 与 layout 收短弧线/ line 回缩用同一 [`ARROW_LEN_PX`] 常量，保证「线末=基部」。
 fn arrow_head(window: &mut Window, tip: (f32, f32), dir: (f32, f32), color: Hsla, s: f32) {
-    let base = (tip.0 - dir.0 * 9. * s, tip.1 - dir.1 * 9. * s);
+    let base = (tip.0 - dir.0 * ARROW_LEN_PX * s, tip.1 - dir.1 * ARROW_LEN_PX * s);
     let (px_, py_) = (dir.1 * 5. * s, -dir.0 * 5. * s);
     let p1 = (base.0 + px_, base.1 + py_);
     let p2 = (base.0 - px_, base.1 - py_);
@@ -625,17 +662,18 @@ fn paint_message(
         let lo = ax.min(bx);
         let hi = ax.max(bx);
         let (x0, x1) = if ax < bx { (lo + 4. * z, hi - 4. * z) } else { (hi + 4. * z, lo - 4. * z) };
-        let pts = [(x0, y), (x1, y)];
+        let dir: (f32, f32) = if ax < bx { (1., 0.) } else { (-1., 0.) };
+        // 线到箭头基部、箭头到线端（tip=x1，4·z 处生命线停靠）：与流程图端箭头同一规则
+        // （`ARROW_LEN_PX` 同源）——不再「线穿到线端 + 箭头同点」双连接。
+        let base = arrow_base((x1, y), dir, ARROW_LEN_PX * z);
         if dotted {
-            dashed_path(window, &pts, color, width, 4. * z, 4. * z);
+            dashed_path(window, &[(x0, y), (base.0, base.1)], color, width, 4. * z, 4. * z);
         } else {
-            stroke_seg(window, (x0, y), (x1, y), color, width);
+            stroke_seg(window, (x0, y), base, color, width);
         }
-        // 箭头在目标端（实心填充三角形，尖端落线端）。
-        if head && ax < bx {
-            arrow_head(window, pts[1], (1., 0.), color, z);
-        } else if head && ax > bx {
-            arrow_head(window, pts[1], (-1., 0.), color, z);
+        // 箭头在目标端（实心填充三角形，尖端落线端 tip=x1）。
+        if head {
+            arrow_head(window, (x1, y), dir, color, z);
         }
         stride_label(window, theme, (x0 + x1) / 2., y, text, z, cx);
     }

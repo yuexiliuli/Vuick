@@ -454,10 +454,12 @@ fn mermaid_lr_edges_attach_to_node_edges(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn mermaid_td_branch_user_example_s_curves(cx: &mut TestAppContext) {
-    // 投诉 .1：`B-->|是|C` / `B-->|否|D` 同源分支边须出 S 曲线——smoothed 密点首尾锚定
-    // 骨架端点、12 点贝塞尔、中点横扫（非直角折线）。走完整 mm_layout（真实 shaping）。
-    use super::{MmLayout, mm_layout};
+fn mermaid_td_branch_user_example_arcs(cx: &mut TestAppContext) {
+    // 投诉 .1：`B-->|是|C` / `B-->|否|D` 同源分支边须出**单弓弧线**——smoothed 密点首锚定、
+    // 12 点二次贝塞尔、中点横扫（非直角折线）、**无 S 拐点**（横向偏距同号）、弓向各自
+    // 目标外侧、彼此不交叉；目标端收短到**箭头基部**（「线到基部、箭头到节点」双连接修复）。
+    // 走完整 mm_layout（真实 shaping）。
+    use super::{MmLayout, ARROW_LEN_PX, arrow_base, mm_layout};
     cx.update(crate::actions::bind_local_keymaps);
     const SRC: &str = "graph TD\nA[开始]-->B{判断}\nB-->|是|C[完成]\nB-->|否|D[返回 A]";
     let (host, vcx) = cx.add_window_view(|window, cx| {
@@ -478,21 +480,74 @@ fn mermaid_td_branch_user_example_s_curves(cx: &mut TestAppContext) {
                 };
                 for (f, t) in [("B", "C"), ("B", "D")] {
                     let e = edge(f, t);
-                    let sm = e.smoothed.as_ref().unwrap_or_else(|| panic!("{f}→{t} 同源分支应出 S 曲线"));
-                    assert_eq!(sm.len(), 12, "{f}→{t} S 曲线 12 点 ≤24");
+                    let sm = e.smoothed.as_ref().unwrap_or_else(|| panic!("{f}→{t} 同源分支应出弧线"));
+                    assert_eq!(sm.len(), 12, "{f}→{t} 弧线 12 点 ≤24");
                     assert_eq!(sm.first(), e.points.first(), "{f}→{t} 首锚定 = 骨架首点");
-                    assert_eq!(sm.last(), e.points.last(), "{f}→{t} 尾锚定 = 骨架尾点");
+                    // **箭头基部（双连接修复核心断言）**：smoothed 尾点 = 节点边缘 −
+                    // ARROW_LEN_PX·arrow_dir（弧线收短到基部，paint 线到基部、箭头到节点，
+                    // 不再「线穿到节点边 + 箭头同点」双连接）。
+                    let tip = *e.points.last().unwrap();
+                    let base = arrow_base(tip, e.arrow_dir, ARROW_LEN_PX);
+                    assert_eq!(*sm.last().unwrap(), base, "{f}→{t} 弧线尾点 = 箭头基部（非节点边缘）");
+                    assert_ne!(*sm.last().unwrap(), tip, "{f}→{t} 线末 ≠ 节点边缘（不再双连接）");
+                    let (dx, dy) = (sm.last().unwrap().0 - tip.0, sm.last().unwrap().1 - tip.1);
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    assert!((dist - ARROW_LEN_PX).abs() < 1e-3, "{f}→{t} 基部-尖端距离 = 箭头长：{dist:.2}");
+                    assert!(
+                        (dx + e.arrow_dir.0 * ARROW_LEN_PX).abs() < 1e-3 && (dy + e.arrow_dir.1 * ARROW_LEN_PX).abs() < 1e-3,
+                        "{f}→{t} 基部在 tip 的 arrow_dir 反方向一个箭头长：dir={:?}",
+                        e.arrow_dir,
+                    );
                     let (x0, x1) = (e.points[0].0, e.points.last().unwrap().0);
                     let (y0, y1) = (e.points[0].1, e.points.last().unwrap().1);
                     assert!(
                         sm.iter().any(|&(x, y)| x > x0.min(x1) && x < x0.max(x1) && y > y0.min(y1) && y < y0.max(y1)),
-                        "{f}→{t} S 曲线中点横扫（非直角折线）",
+                        "{f}→{t} 弧线中点横扫（非直角折线）",
+                    );
+                    // 无 S 拐点硬判据：对直线弦的横向（外侧）偏距全部同号——单弓、不弯
+                    // 来弯去。弦 x(y)=x0+(x1-x0)·(y-y0)/(y1-y0)，偏距=x−弦x，逐点断言同号。
+                    let chord = |p: (f32, f32)| x0 + (x1 - x0) * (p.1 - y0) / (y1 - y0);
+                    let interior: Vec<f32> = sm.iter().skip(1).take(sm.len() - 2).map(|&(x, y)| x - chord((x, y))).collect();
+                    assert!(interior.len() >= 2);
+                    let s0 = interior[0].signum();
+                    assert!(s0 != 0., "{f}→{t} 弧线中段偏距不可为零");
+                    for (i, &d) in interior.iter().enumerate() {
+                        assert!(
+                            d.signum() == s0,
+                            "{f}→{t} 第 {} 点偏距 {d:.2} 与首点异号 ⇒ 有 S 拐点（弯来弯去）",
+                            i + 1
+                        );
+                    }
+                    // 弓起**带符号方向（向外分叉）**：曲线中点对骨架直线中点的横向偏距——
+                    // 左目标(C)必须 <0（弓 −x）、右目标(D)必须 >0（弓 +x），即每分支弓向
+                    // 远离源列中心线的外侧。窗口化（真实 shaping）debug 实测：单弓弧线
+                    // B→C=−28.1、B→D=+29.2（=弦中点横向偏距，肚皮约过目标入射点 ~3px）。
+                    // 阈值 ±10 是「肉眼可辨向外弯」下限，方向断言拒绝把弓弯回内侧/彼此。
+                    let signed = sm[sm.len() / 2].0 - (x0 + x1) / 2.;
+                    if x1 < x0 {
+                        assert!(signed <= -10., "{f}→{t} 应弓向外侧(左)：signed={signed:.1} ≤ −10");
+                    } else {
+                        assert!(signed >= 10., "{f}→{t} 应弓向外侧(右)：signed={signed:.1} ≥ +10");
+                    }
+                }
+                // 双分支不交叉：同一出射点、同一目标行 ⇒ 采样 y 逐点相同，断言 C 的 x < D 的 x。
+                let (sc, sd) = (edge("B", "C"), edge("B", "D"));
+                let (smc, smd) = (
+                    sc.smoothed.as_ref().expect("B→C 弧线"),
+                    sd.smoothed.as_ref().expect("B→D 弧线"),
+                );
+                assert_eq!(smc.len(), smd.len());
+                for i in 0..smc.len() {
+                    assert!(
+                        smc[i].0 <= smd[i].0,
+                        "B→C 与 B→D 弧线第 {i} 点交叉：{:.1} > {:.1}",
+                        smc[i].0, smd[i].0
                     );
                 }
-                // A→B 直干：A 非分支源——即便对齐/偏移都不得误接 S 曲线（对齐直边→None；
-                // 若宽度差≥4 也只能是圆角肘，绝无 12 点 S）。
+                // A→B 直干：A 非分支源——即便对齐/偏移都不得误接弧线（对齐直边→None；
+                // 若宽度差≥4 也只能是圆角肘，绝无 12 点弧线）。
                 let ab = edge("A", "B");
-                assert_ne!(ab.smoothed.as_ref().map(|s| s.len()), Some(12), "A→B 非分支不得误接 S 曲线");
+                assert_ne!(ab.smoothed.as_ref().map(|s| s.len()), Some(12), "A→B 非分支不得误接弧线");
             }
             other => panic!("应为 flowchart 布局，实际 {other:?}"),
         }

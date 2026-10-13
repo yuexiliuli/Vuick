@@ -282,7 +282,7 @@ fn scale_layout_zooms_flow_geometries() {
         }],
         edges: vec![MmPolylineEdge {
             a: 0, b: 0, kind: MmEdgeKind::Arrow,
-            points: vec![(0., 0.), (10., 10.)], smoothed: None, label: Some((5., 2.)), label_text: Some("x".into()),
+            points: vec![(0., 0.), (10., 10.)], smoothed: None, arrow_dir: (0., 1.), label: Some((5., 2.)), label_text: Some("x".into()),
         }],
         subgraphs: vec![MmSubgraphBox { title: "g".into(), x: 80., y: 10., w: 80., h: 60. }],
         content_w: 0., content_h: 0., zoom: 1.,
@@ -302,6 +302,20 @@ fn scale_layout_zooms_flow_geometries() {
             assert_eq!(f.edges[0].points[0].1, 0.);
             // 标签锚点 (5,2)→x=100+(5-100)*2=-90，y=4。
             assert_eq!(f.edges[0].label, Some((-90., 4.)));
+            // 目标端箭头方向是**单位方向**（目标接触边垂直内法向），均匀缩放（x/y 同倍）+
+            // 平移保角 ⇒ 原样保留；tip 落点 = 变换后的骨架末端（节点边缘接触点）。箭头
+            // 方向不随缩放歪。
+            assert_eq!(f.edges[0].arrow_dir, (0., 1.), "arrow_dir 不随缩放变换（保角）");
+            assert_eq!(f.edges[0].points.last(), Some(&(-80., 20.)), "tip 落点=缩放后的骨架末端");
+            // 箭头基部随缩放正确：paint 在 zoom z 下 `base = tip − ARROW_LEN_PX·z·arrow_dir`
+            // （直边/肘边回缩）；弧线收短的基点在 scale_mm_layout 中随 smoothed 密点同式
+            // 缩放，两处共用 `arrow_base` + `ARROW_LEN_PX` 严格重合。此处 z=2 → (−80,20)−18·(0,1)。
+            let zoom_tip = *f.edges[0].points.last().unwrap();
+            assert_eq!(
+                arrow_base(zoom_tip, f.edges[0].arrow_dir, ARROW_LEN_PX * f.zoom),
+                (-80., 2.),
+                "缩放后箭头基部 = tip − ARROW_LEN_PX·zoom·arrow_dir"
+            );
             assert_eq!(f.subgraphs[0].w, 160.);
         }
         _ => panic!("应为 Flow"),
