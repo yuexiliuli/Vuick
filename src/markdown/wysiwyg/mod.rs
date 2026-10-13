@@ -38,6 +38,7 @@ mod content_sync;
 mod core;
 mod edit;
 mod image;
+mod math_edit;
 mod mouse;
 mod prewarm;
 mod theme;
@@ -70,9 +71,9 @@ pub(crate) use self::prewarm::Prewarm;
 pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 pub(crate) use self::types::{
     BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
-    ImageSrcBlocks, MathSlot, PrebuildBlock, PrebuildPass1, TocCacheEntry, TocEntries,
-    UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived, WyOpenResult, inline_math_key,
-    is_plain_region_line, region_line_sig,
+    ImageSrcBlocks, MathEditDrag, MathEditPopup, MathSlot, PrebuildBlock, PrebuildPass1,
+    TocCacheEntry, TocEntries, UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived, WyOpenResult,
+    inline_math_key, is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -396,6 +397,24 @@ pub struct WyEditor {
     /// 重建，render 期每次读到的帧宽不同 → 卡片横向左右跳一帧（「突然往左闪烁」）。
     /// `None` = 无卡片 / 锚点未就绪。
     image_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
+    /// 块级数学公式（`$$…$$`）的编辑卡片（双击卡弹出，预填正文多行输入区域）。
+    /// `None` = 未打开。打开期间输入区域获得焦点（内嵌 CodeEditor，与文档输入互不
+    /// 干扰）；每键经订阅即时写回文档（`apply_edit` 撤销栈、实时重渲染），点卡片外
+    /// 任意处关闭（无取消语义）。仅可编辑模式打开；只读模式双击维持旧 reveal 预览。
+    math_edit: Option<MathEditPopup>,
+    /// 数学编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：paint 期同代配对算出并
+    /// 缓存，render 只读它摆卡片（同 `image_edit_anchor` 的纪律：render 绝不现算 frame）。
+    math_edit_anchor: Cell<Option<gpui::Point<Pixels>>>,
+    /// 数学编辑卡片输入区域（CodeEditor）的 `Edited` 订阅（每键写回文档的唯一入口）。
+    /// 随打开重建、随关闭 / 换源 / 切只读 drop（旧输入实体随之失效）。
+    math_edit_sub: Option<gpui::Subscription>,
+    /// 数学编辑卡片**拖拽把手**进行中（标题栏按下置位；`on_mouse_up` / 窗口级 mouse up
+    /// / 新按下 / 换源 / 切只读清除）。有它 = 本帧正在拖动卡片。
+    math_edit_drag: Cell<Option<MathEditDrag>>,
+    /// 数学编辑卡片相对文档锚点的**累计偏移**（px，默认 0）：标题栏拖拽累计
+    /// `pre_delta + (pos − grab)`；paint 期刷新锚点 = `anchor_at(origin,f) + delta`
+    /// （否则每帧 paint 把拖拽偏移冲掉）；open/close 重置 0。
+    math_edit_delta: Cell<gpui::Point<Pixels>>,
     /// EPUB 注记正文表（`注记号 → 注释文本`，`set_notes` 注入；悬浮卡正文优先读它）。
     note_ctx: std::collections::BTreeMap<usize, SharedString>,
     /// 当前悬浮的注记标记（命中矩形 = 内容列局部，卡锚定用 `content_origin` 换算；
@@ -505,6 +524,8 @@ impl gpui::Render for WyEditor {
         // `image_edit_anchor`（同代 origin+frame），不在此现算帧（避免读到 ensure
         // 兜底 800 宽重建的临时帧而横跳）。
         let image_edit_overlay = self.image_edit_card_element(window, cx);
+        // 数学编辑卡片浮层：同样最后叠加、锚定在目标公式卡顶部（打开时才有）。
+        let math_edit_overlay = self.math_edit_card_element(window, cx);
         // P4-2: 注记悬浮卡片浮层（只读宿主悬停注记标记时）：同样最后叠加、锚定在注记
         // 矩形右下方（窗口坐标，paint 期 `hover_note` 的内容局部矩形 + `content_origin`）。
         let note_overlay = self.note_card_element(window, cx);
@@ -623,6 +644,9 @@ impl gpui::Render for WyEditor {
                 editor: cx.entity(),
             });
         if let Some(overlay) = image_edit_overlay {
+            root = root.child(overlay);
+        }
+        if let Some(overlay) = math_edit_overlay {
             root = root.child(overlay);
         }
         if let Some(overlay) = note_overlay {

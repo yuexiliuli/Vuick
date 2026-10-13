@@ -10,6 +10,25 @@ pub(crate) const IMAGE_EDIT_BTN_SIZE: f32 = 24.;
 pub(crate) const IMAGE_EDIT_BTN_MARGIN: f32 = 6.;
 /// 图片编辑卡片的宽（px；卡片水平居中于内容区）。
 pub(crate) const IMAGE_EDIT_CARD_W: f32 = 320.;
+/// 数学编辑卡片的宽（px；卡片水平居中于内容区，锚定覆盖在目标公式卡顶部）。
+pub(crate) const MATH_EDIT_CARD_W: f32 = 520.;
+/// 数学编辑卡片的估计高（px；标题栏 + 多行编辑器区 + 内边距，点外关闭的**保守**
+/// 包围盒判定用——宁可略大，防止点到卡内输入区误关卡）。
+pub(crate) const MATH_EDIT_CARD_H: f32 = 280.;
+/// 数学编辑卡片内**多行编辑器区**的固定高（px；CodeEditor 内嵌区域，≥160）。
+pub(crate) const MATH_EDIT_EDITOR_H: f32 = 200.;
+/// 数学编辑卡内嵌 CodeEditor 区的**内容宽**（px）＝ 卡片宽 − 卡片内衬 2×12 − 卡片描边
+/// 2×1 − 编辑器区描边 2×1。`open_math_edit` 首帧前以此给内嵌编辑器一个确定的可视宽
+/// （`CodeEditor::set_element_bounds`）——否则 `sync_render_state` 首帧读不到
+/// `element_bounds` 会回退到**窗口宽**，长公式的横向内容宽/可视字符数/量程全错，尾部
+/// 字符被裁且无法滚动/点中。
+pub(crate) const MATH_EDIT_EDITOR_W: f32 = MATH_EDIT_CARD_W - 24. - 2. - 2.;
+/// 数学编辑卡内嵌编辑器的**横向尾部 gap**（px）：打开编辑卡时给内嵌 CodeEditor 设
+/// `hscroll_tail_gap` ——长公式横向滚到底后，最后一个真实字符与编辑器右裁切缘之间留出
+/// 这段可见空隙，末尾字符不再贴缘（否则尾部字符半截被 `overflow_hidden` 裁掉、看不清也
+/// 难点中/选中）；≈ 编辑器等宽 8 字符宽（editor 默认字号 ~13px × 0.6 ≈ 62px）。只加成
+/// `content_w`，缓冲文本不受影响 → 写回文档零歧义（gap 永不进 `$$` 块源码）。
+pub(crate) const MATH_EDIT_TAIL_GAP_PX: f32 = 64.;
 
 /// 源 caret → 光标条几何。非文本行停在块首（只读）；代码块内停在对应内容行。
 /// 行高用 `r.lh`（标题/代码等类型各自行高），否则光标会错位。

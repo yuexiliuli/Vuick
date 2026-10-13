@@ -341,6 +341,10 @@ pub struct CodeEditor {
     blink_running: bool,
     focus_registered: bool,
     element_bounds: Bounds<Pixels>,
+    /// 横向内容的**尾部留白**（px；默认 0）：仅当最宽行**溢出**可视区时才追加到
+    /// `content_w_px` 之后——滚到底后最后一个字符与右裁切缘之间留出该空隙，不再贴缘
+    /// 被裁/难以点中（数学编辑卡长公式专用；主编辑器保持 0 = 行为不变）。
+    hscroll_tail_gap: f32,
 
     /// ListState 固定窗口的**首行绝对行号**：ListState 的 item_ix 是窗口内的相对下标，
     /// 绝对行 = `window_base + item_ix`（所有滚动/命中/行号/量程都以绝对行为准）。
@@ -464,6 +468,7 @@ impl CodeEditor {
             blink_running: false,
             focus_registered: false,
             element_bounds: Bounds::default(),
+            hscroll_tail_gap: 0.0,
             // 固定窗口虚拟化：窗口首行绝对行号（初始 0）。
             window_base: 0,
             desired_scroll: std::rc::Rc::new(Cell::new(0.)),
@@ -1012,6 +1017,22 @@ impl CodeEditor {
         self.undo.set_cooperative(false);
     }
 
+    /// 设置元素包围盒（备用宽度来源）。内嵌宿主（数学编辑卡等浮层）在**首次渲染前**
+    /// 用它给编辑器一个确定的可视宽——`sync_render_state` 的 `avail_w` 在
+    /// `element_bounds` 未就绪（元素尚未 prepaint）时回退窗口宽，浮层内嵌编辑器首帧
+    /// 会按窗口宽算 `content_w_px`/`visible_chars`/横向量程（长内容尾部不可达）。
+    /// prepaint 每帧会用真实布局包围盒覆写本字段，故该值只影响首帧、随后自然收敛。
+    pub fn set_element_bounds(&mut self, bounds: Bounds<Pixels>) {
+        self.element_bounds = bounds;
+    }
+
+    /// 设置横向内容的**尾部留白**（px；`0.` 关闭 = 默认）。仅当最宽行溢出可视区时，
+    /// `compute_content_width` 会在内容宽上追加该值——滚到底后末尾字符与右裁切缘之间
+    /// 留出空隙（避免尾部字符贴缘被裁/难以点中）。数学编辑卡长公式用；主编辑器不动。
+    pub fn set_hscroll_tail_gap(&mut self, px: f32) {
+        self.hscroll_tail_gap = px.max(0.);
+    }
+
     pub fn can_undo(&self) -> bool {
         self.undo.can_undo()
     }
@@ -1194,11 +1215,16 @@ impl CodeEditor {
         }
     }
 
+    /// 由可视宽推导「可见宽度单位格数」：真实可视格 + 8 的估算余量（多余量供折行/
+    /// 绘制安全，`reveal_caret` 已先减掉再算右缘）。**不再设 80 格下限**——该下限是
+    /// 「按窗口切片渲染文本」时代的遗留：窄视口（数学编辑卡 ~57 格）会被虚高到 80，
+    /// `reveal_caret` 的右缘按 80 算 → 光标/新输入停在真实右缘之外、被 `overflow_hidden`
+    /// 裁掉看不见。主编辑器视口 ≫80 格，该下限从不生效、行为不变。
     fn visible_chars_from_width(&self, width_px: f32) -> usize {
         let cw = self.char_width.as_f32().max(1.);
         (((width_px - self.gutter_width_px.as_f32()).max(0.) / cw).ceil() as usize)
             .saturating_add(8)
-            .max(80)
+            .max(1)
     }
 
     // -----------------------------------------------------------------
@@ -1816,6 +1842,11 @@ impl CodeEditor {
     /// 测试用：当前横向内容宽度（px）。断言行宽估算不低估真实字形宽 → 不折行。
     pub(crate) fn test_content_w_px(&self) -> f32 {
         self.content_w_px
+    }
+
+    /// 测试用：元素布局包围盒（`EditorElement::prepaint` 回写；未就绪 = 默认 0 大小）。
+    pub(crate) fn test_element_bounds(&self) -> Bounds<Pixels> {
+        self.element_bounds
     }
 
     /// 测试用：横向滚动容器最大可滚量（px）——底部横向滚动条量程的依据。

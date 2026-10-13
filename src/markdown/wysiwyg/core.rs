@@ -116,6 +116,11 @@ impl WyEditor {
             selected_image: Cell::new(None),
             image_edit: None,
             image_edit_anchor: Cell::new(None),
+            math_edit: None,
+            math_edit_anchor: Cell::new(None),
+            math_edit_sub: None,
+            math_edit_drag: Cell::new(None),
+            math_edit_delta: Cell::new(point(px(0.), px(0.))),
             note_ctx: std::collections::BTreeMap::new(),
             hover_note: Cell::new(None),
             marker_hl: Cell::new(None),
@@ -188,6 +193,12 @@ impl WyEditor {
             self.image_edit_anchor.set(None);
             self.hover_image.set(None);
             self.selected_image.set(None);
+            // 只读：数学编辑卡（写回依赖可编辑）一并收起 + 订阅 drop + 拖拽态清空。
+            self.math_edit = None;
+            self.math_edit_anchor.set(None);
+            self.math_edit_sub = None;
+            self.math_edit_drag.set(None);
+            self.math_edit_delta.set(point(px(0.), px(0.)));
         }
         *self.frame.borrow_mut() = None;
     }
@@ -449,6 +460,12 @@ impl WyEditor {
         self.image_edit_anchor.set(None);
         self.hover_image.set(None);
         self.selected_image.set(None);
+        // 换源：数学编辑卡（锚定行号/正文随源失效）关闭 + 订阅 drop + 拖拽态清空。
+        self.math_edit = None;
+        self.math_edit_anchor.set(None);
+        self.math_edit_sub = None;
+        self.math_edit_drag.set(None);
+        self.math_edit_delta.set(point(px(0.), px(0.)));
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         self.math_dollar_cnt.set(r.math_dollar_cnt);

@@ -63,6 +63,30 @@ pub(crate) struct ImageEditPopup {
     /// 图片文本（alt / 题注）输入框。
     pub(crate) text: gpui::Entity<crate::ui::input::InputState>,
 }
+/// 块级数学公式（`$$…$$`）的编辑卡片：**多行输入区域**（内嵌 `CodeEditor`，预填
+/// 公式**正文**、不含 `$$` 定界符）锚定在目标公式卡顶部。每键即时 `apply_edit` 写回
+/// 文档（撤销栈）、公式实时重渲染；长公式/多行靠 CodeEditor 自带纵横滚动不溢出；
+/// 点卡片外任意处关闭（无取消语义）。标题栏兼作拖拽把手（见 [`MathEditDrag`]）。
+/// 仅可编辑模式打开；只读模式双击维持旧「reveal 源码」预览。
+pub(crate) struct MathEditPopup {
+    /// 目标数学块的首源码行号。
+    pub(crate) src_line: usize,
+    /// 公式正文（不含 `$$` 定界符）的多行输入区域（内嵌 CodeEditor）。
+    pub(crate) text: gpui::Entity<crate::editor::CodeEditor>,
+}
+/// 数学编辑卡片**拖拽把手**进行中状态：按住标题栏（兼作把手）开始拖动。
+/// `on_mouse_down` 记录抓取光标 + 抓取时缓存锚点 + 抓取前的累计偏移；窗口级
+/// `on_window_mouse_move` 按 `pre_delta + (pos − grab)` 更新累计偏移并重设缓存锚点
+/// （卡片跟随鼠标 1:1；paint 期刷新锚点 = `anchor_at(origin,f) + delta` 保持拖拽位移）。
+#[derive(Clone, Copy)]
+pub(crate) struct MathEditDrag {
+    /// 抓取时指针的窗口坐标（位移起点）。
+    pub(crate) grab: gpui::Point<gpui::Pixels>,
+    /// 抓取时缓存的卡片锚点（本次拖拽基准；含此前累计偏移）。
+    pub(crate) base_anchor: gpui::Point<gpui::Pixels>,
+    /// 抓取前的累计偏移（本次位移叠加其上，使 paint 刷新与文档几何重新对齐后不丢旧位移）。
+    pub(crate) pre_delta: gpui::Point<gpui::Pixels>,
+}
 /// 图片调整条拖拽：按住右中边缘的条，随鼠标横向移动改图片宽（保持宽高比）。
 /// `grab_x` = 按下时指针的窗口 x；拖动中新宽 = `start_w + (mouse_x − grab_x)`。
 #[derive(Clone)]

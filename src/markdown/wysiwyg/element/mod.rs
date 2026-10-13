@@ -1157,6 +1157,14 @@ impl Element for WyEditorElement {
                     frame.as_ref().and_then(|f| e.image_edit_anchor_at(origin, f)),
                 );
             });
+        // 数学编辑卡片锚点：同图片编辑卡——以**本帧** `bounds.origin` + 当前帧几何**同代
+        // 配对**算出并缓存（render 只读缓存摆卡片，绝不现算 frame）。
+        self.editor
+            .update(cx, |e, _| {
+                e.set_math_edit_anchor(
+                    frame.as_ref().and_then(|f| e.math_edit_anchor_at(origin, f)),
+                );
+            });
         // 数学排版同步（可见带懒光栅）：只对**当前带内**公式发起排版（对齐
         // view/editor 只渲染可见区；不再开篇全量光栅 1.3 万公式占满后台 CPU）。
         let _t_sm = crate::prof::begin();

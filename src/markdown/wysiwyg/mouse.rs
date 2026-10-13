@@ -37,6 +37,23 @@ impl WyEditor {
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
+        // 数学编辑卡打开时：点击落在**卡浮层包围盒内**（但非本卡命中区，如卡片空白/
+        // 编辑器下缘 / 标题栏下缘）→ 卡片子树自行消费（编辑器聚焦等），**不关卡也不动
+        // 文档光标**——否则点到输入区会被下面的普通选区路径拖走文档光标/误关卡（与图片
+        // 编辑卡的浮层语义对齐）。**任何文档数学卡命中**（含另一块）不吞：落回正常
+        // 数学卡分支（单/双击切换/换块），否则大卡包围盒会吞掉对相邻公式块的点击
+        // （`MATH_EDIT_CARD_H` 是保守包围盒、比卡片可视区大）。拖拽把手按下点在卡内
+        // → 同样早退（标题栏 handler 已 stop_propagation，这里再兜底一次）。
+        if self.math_edit.is_some()
+            && (self.math_edit_drag.get().is_some()
+                || (self
+                    .math_edit_card_bounds()
+                    .is_some_and(|b| b.contains(&ev.position))
+                    && element::math_card_hit(self, f, ev.position).is_none()))
+        {
+            drop(marker);
+            return;
+        }
         // 任何点击都先清除旧图片选中（图片本体/编辑按钮分支随后重新置位）：
         // 点文本/任务框/链接等 → 图片不再保持选中态。
         self.selected_image.set(None);
@@ -223,20 +240,28 @@ impl WyEditor {
             }
             // A1/B2: 数学交互——
             // 数学块卡片：**单击不改光标**（否则 caret 进块被 reveal、整块回显源码字符串，
-            // 即用户看到的「单击变回字符串」）；**双击**进块编辑（reveal 源码可改）。
-            // 行内公式：**双击** spacer → 光标放进 `$…$` 内（shape 期 reveal 可编辑）。
+            // 即用户看到的「单击变回字符串」）；**双击**弹出**数学编辑卡**（预填公式正文，
+            // 每键即时写回文档，点卡片外关闭；不再原地 reveal 进块）。只读模式在
+            // `open_math_edit` 内降级为旧「双击 reveal 源码」预览。
+            // 行内公式：**双击** spacer → 光标放进 `$…$` 内（shape 期 reveal 可编辑，保持）。
             let dbl = ev.click_count >= 2;
             if let Some(block_start) = element::math_card_hit(self, f, ev.position) {
+                let block_line = self.row_col(block_start).0;
+                // 编辑卡开着且点是**另一块**数学卡 → 先关旧卡（点本卡不关：单击早退、
+                // 双击同卡在 `open_math_edit` 内切换/关闭）。
+                let close_old = self
+                    .math_edit
+                    .as_ref()
+                    .is_some_and(|cur| cur.src_line != block_line);
                 drop(marker);
+                if close_old {
+                    self.close_math_edit(cx);
+                }
                 self.focus.focus(window, cx);
                 if dbl {
-                    // 光标放进 `$$` 行**内容内 1 字节**（不是行首 0 列）：
-                    // ①块 reveal ②单行 `$$…$$` 的行内 splice reveal 同时满足
-                    // → 两种情况（多行块 / 单行块）双击都直接还原成源码字符串
-                    // （放行首 0 列时 `splice_math_text` 的 `c > span.start` 不成立，
-                    // 单行块会被 splice 成小号行内公式，需再双击一次才还原）。
-                    self.set_caret(block_start + 1);
-                    cx.notify();
+                    // 双击块级数学卡 → 弹出可编辑公式卡（光标不进块、不 reveal）；
+                    // 只读模式在 `open_math_edit` 内降级为 reveal 预览。
+                    self.open_math_edit(block_line, window, cx);
                 }
                 return;
             }
@@ -251,6 +276,16 @@ impl WyEditor {
         let off = element::source_offset_at(self, f, ev.position);
         drop(marker);
         self.focus.focus(window, cx);
+        // 点卡片外任意处 → 关闭数学编辑卡（写回已实时生效，无取消语义）。本路径 = 点击
+        // 未命中任何数学卡（卡内命中在上面早退）→ 直接关；生产里卡片浮层的
+        // `on_mouse_down_out` 也会兜底一次（幂等，双保险）。
+        if self.math_edit.is_some()
+            && !self
+                .math_edit_card_bounds()
+                .is_some_and(|b| b.contains(&ev.position))
+        {
+            self.close_math_edit(cx);
+        }
         self.begin_selection_at(off);
         cx.notify();
     }
@@ -364,6 +399,14 @@ impl WyEditor {
         // 由 `end_image_resize` 四条边界闭环保证。
         if self.image_resize_drag.borrow().is_some() {
             self.apply_image_resize(ev.position.x, cx);
+            return;
+        }
+        // 数学编辑卡片拖拽把手：拖动期间跟随鼠标（累计偏移 + 刷新缓存锚点，卡片跟手
+        // 1:1）。走窗口级（顶层叠层会吞元素级 move / Windows 元素级 mouse_move 首帧
+        // 不可靠，与图片调整条同因）；只更新锚点状态，不参与拖选/点外关闭。
+        if self.math_edit_drag.get().is_some() {
+            self.math_edit_drag_move(ev.position);
+            cx.notify();
             return;
         }
         if self.dragging {
@@ -605,13 +648,15 @@ impl WyEditor {
         self.set_math_h_scroll(blk, rel * max_scroll);
         cx.notify();
     }
-    /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格 & 数学卡横向滚动条拖动。
+    /// 鼠标松开：结束拖选 / 图片调整条 / 代码块 & 表格 & 数学卡横向滚动条拖动 /
+    /// 数学编辑卡片拖拽把手。
     pub(crate) fn on_mouse_up(&mut self, _: &gpui::MouseUpEvent, cx: &mut Context<Self>) {
         self.end_selection();
         self.end_image_resize();
         *self.code_h_drag.borrow_mut() = None;
         *self.table_h_drag.borrow_mut() = None;
         *self.math_h_drag.borrow_mut() = None;
+        self.end_math_edit_drag();
         cx.notify();
     }
 
@@ -627,6 +672,11 @@ impl WyEditor {
     pub(crate) fn on_window_mouse_up(&mut self, cx: &mut Context<Self>) {
         if self.image_resize_drag.borrow().is_some() {
             self.end_image_resize();
+            cx.notify();
+        }
+        // 数学编辑卡拖拽把手：松开即结束（保留累计偏移 → 卡片停在拖拽终点）。
+        if self.math_edit_drag.get().is_some() {
+            self.end_math_edit_drag();
             cx.notify();
         }
     }

@@ -364,7 +364,15 @@ impl CodeEditor {
         // 导致量程坍缩；横向量程 = `h_handle.max_offset().x`——本容器按真实
         // `content_w_px` 布局后的**实测**值，滚动条/滚轮夹紧同读它，随内容实时精确。
         let raw_max_w = self.buffer.max_line_units() as f32 * cw_max;
-        let content_w_px = raw_max_w.max(harea_w);
+        // 尾部留白（`hscroll_tail_gap`，默认 0 = 无）：仅当最宽行**溢出**可视区时追加
+        // ——滚到底后末尾字符与右裁切缘之间留该空隙（数学编辑卡长公式用），内容变短
+        // 不产生幻影量程（不溢出时 <0 语义不与 P7 的「无浮余」冲突：显式 if 而非
+        // `.max()`，空档行不出现多余滚动条）。
+        let content_w_px = if raw_max_w > harea_w {
+            raw_max_w + self.hscroll_tail_gap
+        } else {
+            harea_w
+        };
         self.content_w_px = content_w_px;
         // 内容变短（量程缩小时）把 `h_handle` 夹回新量程（O(1)）——删除长内容后
         // 横向滚动位置不再停在旧更远处的空白处。ScrollableElement 布局也会夹，

@@ -177,9 +177,10 @@ fn inline_math_double_click_enters_edit(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext) {
-    // A1 交互语义修复：单击数学块卡片**不改光标**（不会因 caret 进块被 reveal 回
-    // 源码字符串）；**双击**把光标放进块首 → 整块 reveal 源码进入编辑。
+fn math_block_single_click_keeps_card_double_click_opens_edit(cx: &mut TestAppContext) {
+    // A1/B2 交互语义（2026-10 改造）：单击数学块卡片**不改光标**（不 reveal 回源码
+    // 字符串）；**双击**弹出**数学编辑卡**——预填公式正文（无 `$$` 定界符）、光标
+    // **不进**块（不 reveal）、块保持卡片折叠；不再像旧实现那样原地 set_caret reveal。
     use super::BlockCard;
     use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
     cx.update(crate::actions::bind_local_keymaps);
@@ -233,7 +234,7 @@ fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
             "单击后卡片仍在（未 reveal）"
         );
-        // 双击：光标进块首（源码行 0）→ reveal 源码（不再有卡片）。
+        // 双击：弹出数学编辑卡（预填正文、无定界符）；光标不进块；块仍卡片（未 reveal）。
         let ev2 = MouseDownEvent {
             button: MouseButton::Left,
             position: point(px(x), px(y)),
@@ -242,24 +243,38 @@ fn math_block_single_click_keeps_card_double_click_edits(cx: &mut TestAppContext
             first_mouse: false,
         };
         ed.update(cx, |e, cx| e.on_mouse_down(&ev2, window, cx));
-        let caret = ed.read(cx).caret();
-        assert!(ed.read(cx).row_col(caret).0 == 0, "双击应把光标放进块首");
+        assert!(ed.read(cx).math_edit_open(), "双击应打开数学编辑卡");
+        assert_eq!(ed.read(cx).math_edit_src_line(), Some(0), "卡锚定到块首源码行");
+        let prefill = ed
+            .read(cx)
+            .math_edit_input()
+            .map(|i| i.read(cx).text_string());
+        assert_eq!(
+            prefill.as_deref(),
+            Some(r"\int_0^1 x^2 dx"),
+            "输入框预填公式正文（不含 $$ 定界符）"
+        );
+        assert_eq!(
+            ed.read(cx).caret(),
+            text.find("尾").unwrap(),
+            "双击打开编辑卡不得把光标移进块（否则 reveal）"
+        );
         let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            !f2.rows
+            f2.rows
                 .iter()
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-            "双击后 reveal 源码（无卡片）"
+            "打开编辑卡后块仍卡片折叠（未 reveal 成源码）"
         );
     });
 }
 
 #[gpui::test]
-fn math_block_single_line_double_click_reveals_immediately(cx: &mut TestAppContext) {
-    // 单行 `$$…$$` 数学块（`$$\sum…$$` 独占一行）：双击必须**直接**还原成源码
-    // 字符串，不得先变成行内小公式再双击一次。根因：光标放在行首 0 列时
-    // `splice_math_text` 的 `c > span.start` 不成立 → 仍被 splice 成小号行内公式；
-    // 现在放 `$$` 行内容内 1 字节 → 块 reveal 与行内 splice reveal 同时满足。
+fn math_block_single_line_double_click_opens_edit(cx: &mut TestAppContext) {
+    // 单行 `$$…$$` 数学块（`$$\sum…$$` 独占一行）：双击必须**直接**弹出数学编辑卡、
+    // 预填两个 `$` 之间的内层 LaTeX（无定界符）；光标不进块、块仍卡片折叠（不再像旧的
+    // 原地 reveal——旧语义是「直接还原成源码字符串，不得先变成行内小公式再双击一次」，
+    // 新交互下由编辑卡承担编辑入口）。
     use super::BlockCard;
     use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
     cx.update(crate::actions::bind_local_keymaps);
@@ -299,30 +314,225 @@ fn math_block_single_line_double_click_reveals_immediately(cx: &mut TestAppConte
             first_mouse: false,
         };
         ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
-        // 双击一次：光标在行内（>0 列），卡片消失、不再 splice（直接是字符串）。
-        let caret = ed.read(cx).caret();
-        let (_, col) = ed.read(cx).row_col(caret);
-        assert!(col > 0, "双击后光标应进入块行内部，col={col}");
+        // 双击一次：弹出编辑卡、输入框预填内层 LaTeX、光标不进块、卡片仍在。
+        assert!(ed.read(cx).math_edit_open(), "单行块双击应打开编辑卡");
+        let prefill = ed
+            .read(cx)
+            .math_edit_input()
+            .map(|i| i.read(cx).text_string());
+        assert_eq!(
+            prefill.as_deref(),
+            Some(r"\sum_{i=1}^{n} i = \frac{n(n+1)}{2}"),
+            "单行块预填两个 `$` 之间的内层（无定界符）"
+        );
+        assert_eq!(
+            ed.read(cx).caret(),
+            text.find("尾").unwrap(),
+            "双击不得把光标移进块"
+        );
+        assert!(
+            ed.read(cx)
+                .row_col(ed.read(cx).caret())
+                .0
+                > 0,
+            "光标不在首行（块内）"
+        );
         let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            !f2.rows
+            f2.rows
                 .iter()
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-            "双击后应无卡片（reveal 源码）"
+            "单行块双击后仍卡片（未 reveal 成字符串）"
         );
-        let row0 = f2.rows.iter().find(|r| r.src_lines.contains(&0)).unwrap();
+    });
+}
+
+#[gpui::test]
+fn math_edit_card_live_write_back_updates_doc_and_rerenders(cx: &mut TestAppContext) {
+    // 编辑卡每键 `Edited` 即时写回（撤销栈入口 `apply_edit`）：对多行输入区域做**真实
+    // CodeEditor 编辑**（全选替换 = `set_selection_range` + `insert_text`，走同一编辑主链
+    // 并发出 `EditorEvent::Edited`）→ 文档正文被替换（保留 `$$` 定界符与行数）、区域
+    // `source` 更新、重建帧仍以卡片渲染新公式，且**光标不进块**。多行 `$$\n…\n$$`
+    // 与单行 `$$…$$` 两种形态都验；连续两次写入各自成独立撤销单元（整段替换意图 =
+    // Atomic、永不合并）。
+    // ⚠️ GPUI 的 `emit` 是**延迟副作用**（`App::update` 结束时才冲刷）→ 编辑与断言必须
+    // 分属两个 `vcx.update` 块，否则订阅写回尚未发生。
+    use super::BlockCard;
+    use gpui::{App, Bounds, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    // 全选替换输入区域内容（CodeEditor 真实编辑入口）：清空选区起点 + 全选 + 键入替换，
+    // 触发 `EditorEvent::Edited` → 订阅写回（与旧 `InputState::set_value` 等价语义）。
+    let replace_all = |input: &gpui::Entity<crate::editor::CodeEditor>,
+                       cx: &mut App,
+                       text: &str| {
+        input.update(cx, |ed, cx| {
+            let len = ed.text_string().len();
+            ed.set_caret_to(0);
+            ed.set_selection_range(0..len, cx);
+            ed.insert_text(text, cx);
+        });
+    };
+    // —— 多行 `$$\n…\n$$` ——
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let tail = text.find("尾").unwrap();
+    let ed = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail); // 光标在块外（末行）
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应打开编辑卡");
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        // 第 1 次写回：输入区改为新正文 → 订阅在 update 结束冲刷时生效。
+        replace_all(&input, cx, "x + y");
+        ed
+    });
+    vcx.update(|window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$\nx + y\n$$\n尾行\n",
+            "应保留 `$$` 定界符与三行块结构"
+        );
+        assert_eq!(
+            ed.read(cx).derived().borrow().math_regions[0].source,
+            "x + y",
+            "区域 source 应即时更新"
+        );
+        assert_eq!(ed.read(cx).caret(), tail, "写回不得把光标拖进块内");
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            row0.extra.inline_maths.is_empty(),
-            "单行块双击应直接还原字符串（不得再 splice 成行内公式）"
+            f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "写回后重建帧仍以卡片渲染新公式（未 reveal）"
         );
-        // 光标移出块（到尾行）后恢复卡片渲染。
-        ed.update(cx, |e, _| e.set_caret(text.find("尾").unwrap()));
-        let f3 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        // 第 2 次写回：上一单元已固化入栈（Atomic 不合并 → 每键一条 undo）。
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        replace_all(&input, cx, "x + y + z");
+    });
+    vcx.update(|_window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$\nx + y + z\n$$\n尾行\n",
+            "第 2 次写回继续保留定界符与行数"
+        );
+        assert_eq!(
+            ed.read(cx).undo_stack.len() + (ed.read(cx).open_unit.is_some() as usize),
+            2,
+            "两次写回应各自构成独立撤销单元"
+        );
+        assert_eq!(ed.read(cx).caret(), tail, "第 2 次写回仍不拖光标");
+    });
+    // —— 单行 `$$a+b$$` ——
+    let text1 = "$$a+b$$\n尾行\n";
+    let (host1, vcx1) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text1));
+        WyHost { ed }
+    });
+    let vcx1: &mut VisualTestContext = vcx1;
+    let tail1 = text1.find("尾").unwrap();
+    let ed1 = vcx1.update(|window, cx| {
+        let ed = host1.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail1);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        replace_all(&input, cx, "c^2");
+        ed
+    });
+    vcx1.update(|window, cx| {
+        assert_eq!(
+            ed1.read(cx).content(),
+            "$$c^2$$\n尾行\n",
+            "单行块只替换 `$` 之间的内层，定界符保留"
+        );
+        assert_eq!(
+            ed1.read(cx).derived().borrow().math_regions[0].source,
+            "c^2"
+        );
+        assert_eq!(ed1.read(cx).caret(), tail1, "单行块写回也不拖光标");
+        let f3 = build_frame(ed1.read(cx), window, px(600.), (0., 999_999.));
         assert!(
             f3.rows
                 .iter()
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-            "光标移出后应恢复数学卡片（公式感）"
+            "单行块写回后仍卡片渲染"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_edit_card_click_outside_closes(cx: &mut TestAppContext) {
+    // 点**卡片外**任意处 → 关闭数学编辑卡（写回已实时生效，无取消语义）。
+    // 本测试沿直接 `on_mouse_down` 路径（点卡外空白 → 普通选区路径内关闭）；
+    // 卡片浮层 `on_mouse_down_out` 在生产树里兜底同一语义。
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(text.find("尾").unwrap());
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应先打开编辑卡");
+        assert!(
+            ed.read(cx).math_edit_anchor().is_some(),
+            "打开时应按当前帧算出窗口锚点"
+        );
+        // 卡片外的坐标：卡片**保守包围盒**右下之外（卡片加大后尾行可能被浮层覆盖，
+        // 故取包围盒外侧一点）——数学卡在顶部，其下与右侧皆空。
+        let box_b = ed.read(cx).math_edit_card_bounds().expect("卡包围盒");
+        let (x, y) = (
+            f32::from(box_b.left()) + 40.,
+            f32::from(box_b.bottom()) + 40.,
+        );
+        let down = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&down, window, cx));
+        assert!(
+            !ed.read(cx).math_edit_open(),
+            "点卡片外应关闭编辑卡"
         );
     });
 }
@@ -660,6 +870,911 @@ fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
             "光标 y {} 应在撑高后的文本带 [{shift}, {}] 内，不能回到块顶空白",
             f32::from(carety),
             shift + lh
+        );
+    });
+}
+
+#[gpui::test]
+fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
+    // 只读模式（预览/EPUB）：双击块级数学卡**不弹编辑卡**（写回依赖可编辑），
+    // 维持旧「reveal 源码」预览——光标放进块首（`$$` 行内 1 字节）→ 重建帧该块
+    // 还原成可读源码字符串（可读不可改）。多行 `$$\n…\n$$` 与单行 `$$…$$` 都验。
+    // 对应的可编辑口径见 `math_block_single_click_keeps_card_double_click_opens_edit`
+    // 与 `math_block_single_line_double_click_opens_edit`（弹卡、预填、光标不进块）。
+    use super::BlockCard;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    // —— 多行 `$$\n…\n$$` ——
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        ed.update(cx, |e, _| e.set_editable(false));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(text.find("尾").unwrap());
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let x = f32::from(frame.padding) + 40.;
+        let y = {
+            let card = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .expect("只读帧应有数学卡片");
+            f32::from(card.top) + f32::from(card.height) / 2.
+        };
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let dbl = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&dbl, window, cx));
+        assert!(
+            !ed.read(cx).math_edit_open(),
+            "只读模式双击不得弹编辑卡（写回依赖可编辑）"
+        );
+        assert_eq!(
+            ed.read(cx).row_col(ed.read(cx).caret()).0,
+            0,
+            "只读双击应把光标放进块首（reveal 源码预览）"
+        );
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            !f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "只读双击后块应 reveal 成源码（无卡片）"
+        );
+    });
+    // —— 单行 `$$…$$` ——
+    let text1 = "$$\\sum_{i=1}^{n} i$$\n尾行\n";
+    let (host1, vcx1) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text1));
+        ed.update(cx, |e, _| e.set_editable(false));
+        WyHost { ed }
+    });
+    let vcx1: &mut VisualTestContext = vcx1;
+    vcx1.update(|window, cx| {
+        let ed1 = host1.read(cx).ed.clone();
+        ed1.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(text1.find("尾").unwrap());
+        });
+        let frame = build_frame(ed1.read(cx), window, px(600.), (0., 999_999.));
+        let x = f32::from(frame.padding) + 40.;
+        let y = {
+            let card = frame
+                .rows
+                .iter()
+                .find(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+                .expect("单行只读帧应有数学卡片");
+            f32::from(card.top) + f32::from(card.height) / 2.
+        };
+        ed1.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let dbl = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed1.update(cx, |e, cx| e.on_mouse_down(&dbl, window, cx));
+        assert!(
+            !ed1.read(cx).math_edit_open(),
+            "只读单行双击不得弹编辑卡"
+        );
+        let f2 = build_frame(ed1.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            !f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "只读单行双击后块应 reveal 成源码（无卡片）"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_edit_card_switch_block_closes_old_and_opens_new(cx: &mut TestAppContext) {
+    // 双击**另一块**数学卡 → 先关旧卡（旧输入框/订阅 drop）再开新卡（新预填、锚行
+    // 换成新块）；两个块各自独立。开卡期间单击另一块不管卡（走数学卡早退）。
+    use super::BlockCard;
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\na + b\n$$\n\n$$\nx^2\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(text.find("尾").unwrap());
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let cards: Vec<(usize, f32)> = frame
+            .rows
+            .iter()
+            .filter(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. })))
+            .map(|r| (r.src_line, f32::from(r.top) + f32::from(r.height) / 2.))
+            .collect();
+        assert_eq!(cards.len(), 2, "应有 2 块数学卡");
+        let pad = f32::from(frame.padding);
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let x = pad + 40.;
+        let down = |line: usize, clicks: usize| MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(cards.iter().find(|c| c.0 == line).unwrap().1)),
+            modifiers: Modifiers::default(),
+            click_count: clicks,
+            first_mouse: false,
+        };
+        // 双击第 1 块 → 开卡。
+        ed.update(cx, |e, cx| e.on_mouse_down(&down(cards[0].0, 2), window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应先开第 1 块卡");
+        assert_eq!(ed.read(cx).math_edit_src_line(), Some(cards[0].0));
+        assert_eq!(
+            ed.read(cx)
+                .math_edit_input()
+                .map(|i| i.read(cx).text_string())
+                .as_deref(),
+            Some("a + b"),
+            "第 1 块预填 a + b"
+        );
+        // 双击第 2 块 → 先关旧卡、再开新卡（锚行换成第 2 块、预填换源）。
+        ed.update(cx, |e, cx| e.on_mouse_down(&down(cards[1].0, 2), window, cx));
+        assert!(ed.read(cx).math_edit_open(), "切换后仍应开着卡");
+        assert_eq!(
+            ed.read(cx).math_edit_src_line(),
+            Some(cards[1].0),
+            "卡应切换到位移后的第 2 块"
+        );
+        assert_eq!(
+            ed.read(cx)
+                .math_edit_input()
+                .map(|i| i.read(cx).text_string())
+                .as_deref(),
+            Some("x^2"),
+            "第 2 块预填 x^2"
+        );
+        // 重新双击第 1 块 → 再切回来。
+        ed.update(cx, |e, cx| e.on_mouse_down(&down(cards[0].0, 2), window, cx));
+        assert_eq!(ed.read(cx).math_edit_src_line(), Some(cards[0].0), "可再切回第 1 块");
+        // 双击当前块（同一块）→ 关闭（切换语义）。
+        ed.update(cx, |e, cx| e.on_mouse_down(&down(cards[0].0, 2), window, cx));
+        assert!(!ed.read(cx).math_edit_open(), "双击同块应关闭卡");
+    });
+}
+
+#[gpui::test]
+fn math_edit_card_title_drag_moves_anchor_and_keeps_after_paint(cx: &mut TestAppContext) {
+    // 标题栏（**拖拽把手**）真实渲染路径：绘制出卡片 → 标题栏按下（抓取点=标题栏内、
+    // 基准锚点=当前缓存锚点）→ 窗口级 `on_window_mouse_move`(+Δx,+Δy) → 缓存锚点 =
+    // 原锚点 + Δ → paint 期 `math_edit_anchor_at` 刷新后偏移仍保持（不被每帧 paint 冲掉）
+    // → 松开结束，随后纯移动不再改锚点；期间卡片未关、文档光标未动。
+    use gpui::{Bounds, Modifiers, MouseButton, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n\\int_0^1 x^2 dx\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应打开编辑卡");
+        // 绘制一帧：元素树 + deferred 卡片 + 窗口级 mouse 监听（paint 期注册）就位。
+        let _ = window.draw(cx);
+    });
+    let anchor0 = ed
+        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .expect("打开即缓存锚点");
+    // 标题栏中心（真实拖拽把手）按下。
+    let title_b = vcx
+        .debug_bounds("wy-math-edit-title")
+        .expect("标题栏已绘制");
+    let title = point(
+        title_b.origin.x + title_b.size.width / 2.,
+        title_b.origin.y + title_b.size.height / 2.,
+    );
+    vcx.simulate_mouse_down(title, MouseButton::Left, Modifiers::default());
+    assert!(
+        ed.read_with(vcx, |e, _| e.math_edit_dragging()),
+        "按下标题栏应进入拖拽"
+    );
+    // 窗口级 mouse_move(+Δx,+Δy) → 锚点 = 原锚点 + Δ。
+    let (dx, dy) = (40.0f32, 30.0f32);
+    vcx.simulate_mouse_move(
+        point(px(f32::from(title.x) + dx), px(f32::from(title.y) + dy)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    let anchor1 = ed
+        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .expect("拖拽后锚点");
+    assert!(
+        (f32::from(anchor1.x) - (f32::from(anchor0.x) + dx)).abs() < 1.
+            && (f32::from(anchor1.y) - (f32::from(anchor0.y) + dy)).abs() < 1.,
+        "拖拽后锚点 = 原锚点 + Δ：({:.1},{:.1})→({:.1},{:.1})，期望 (+{dx},+{dy})",
+        f32::from(anchor0.x),
+        f32::from(anchor0.y),
+        f32::from(anchor1.x),
+        f32::from(anchor1.y)
+    );
+    assert!((f32::from(ed.read_with(vcx, |e, _| e.math_edit_delta().x)) - dx).abs() < 1.,
+        "累计偏移随锚点同步更新");
+    assert!(ed.read_with(vcx, |e, _| e.math_edit_open()), "拖拽期间卡片不关");
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.caret()),
+        tail,
+        "拖拽不得移动文档光标"
+    );
+    // paint 期刷新锚点：以**当前帧 + 元素原点**（与 paint 同代配对）重算 `anchor_at`（含
+    // delta 叠加）→ 拖拽偏移仍保持，不被每帧 paint 冲掉。
+    vcx.update(|_window, cx| {
+        let origin = ed.read(cx).content_origin();
+        let f = ed.read(cx).frame.borrow().clone();
+        ed.update(cx, |e, _| {
+            let base = f
+                .as_ref()
+                .and_then(|f| e.math_edit_anchor_at(origin, f))
+                .expect("锚点");
+            e.set_math_edit_anchor(Some(base));
+        });
+    });
+    let anchor2 = ed
+        .read_with(vcx, |e, _| e.math_edit_anchor())
+        .expect("paint 后锚点");
+    assert!(
+        (f32::from(anchor2.x) - f32::from(anchor1.x)).abs() < 1.
+            && (f32::from(anchor2.y) - f32::from(anchor1.y)).abs() < 1.,
+        "paint 刷新后拖拽偏移仍保持：({:.1},{:.1})（应与拖拽终点 ({:.1},{:.1}) 一致）",
+        f32::from(anchor2.x),
+        f32::from(anchor2.y),
+        f32::from(anchor1.x),
+        f32::from(anchor1.y)
+    );
+    // 松开结束；随后纯移动不再改锚点；卡片仍开。
+    vcx.simulate_mouse_up(
+        point(px(f32::from(title.x) + dx), px(f32::from(title.y) + dy)),
+        MouseButton::Left,
+        Modifiers::default(),
+    );
+    assert!(
+        !ed.read_with(vcx, |e, _| e.math_edit_dragging()),
+        "松开结束拖拽"
+    );
+    let before_more = ed.read_with(vcx, |e, _| e.math_edit_anchor());
+    vcx.simulate_mouse_move(
+        point(px(f32::from(title.x) + dx + 20.), px(f32::from(title.y) + dy + 20.)),
+        Some(MouseButton::Left),
+        Modifiers::default(),
+    );
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.math_edit_anchor()),
+        before_more,
+        "松开后移动不再改锚点"
+    );
+    assert!(
+        ed.read_with(vcx, |e, _| e.math_edit_open()),
+        "拖拽结束卡片仍开"
+    );
+    // 关闭后重新打开：拖拽偏移重置（delta=0，卡片回到文档几何位）。
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, cx| e.close_math_edit(cx));
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+    });
+    assert!(
+        f32::from(ed.read_with(vcx, |e, _| e.math_edit_delta().x)).abs() < 0.5,
+        "重开后拖拽偏移重置"
+    );
+    // 需求 ①：卡片加大（宽 ≥520、保守包围盒高 ≥200、编辑器区高 ≥160）。
+    assert!(super::MATH_EDIT_CARD_W >= 520., "卡片加宽 ≥520");
+    assert!(super::MATH_EDIT_CARD_H >= 200., "卡片保守包围盒高 ≥200");
+    assert!(super::MATH_EDIT_EDITOR_H >= 160., "编辑器区固定高 ≥160");
+}
+
+#[gpui::test]
+fn math_edit_multiline_writeback_grows_body_lines(cx: &mut TestAppContext) {
+    // 多行块：编辑器内**真实插入 `\n`**（CodeEditor 编辑主链 → `Edited` → 订阅写回）
+    // → 文档正文行数 +1、`$$` 围栏形态保留、derived region 平移后仍命中、块仍卡片折叠；
+    // 每键写回 = 独立撤销单元（含 `\n` → Atomic 不合并）。
+    use super::BlockCard;
+    use gpui::{Bounds, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\na + b\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let tail = text.find("尾").unwrap();
+    let ed = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        // 光标移到输入区末尾 → 真实插入 `\n`（编辑主链发 `Edited`）。
+        input.update(cx, |ed, cx| {
+            let at = ed.text_string().len();
+            ed.set_caret_to(at);
+            ed.insert_text("\n", cx);
+        });
+        ed
+    });
+    vcx.update(|_window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$\na + b\n\n$$\n尾行\n",
+            "插入换行后正文行数 +1、围栏形态保留"
+        );
+        assert_eq!(
+            ed.read(cx).derived().borrow().math_regions[0].source,
+            "a + b\n",
+            "derived region source 随插入更新（仍含换行）"
+        );
+        {
+            let drc = ed.read(cx).derived();
+            let dr = drc.borrow();
+            assert_eq!(dr.math_regions.len(), 1, "region 平移后仍在");
+            assert_eq!(dr.math_regions[0].range.start, 0, "块首行仍命中");
+        }
+        {
+            let drc = ed.read(cx).derived();
+            let dr = drc.borrow();
+            let blk_range = dr.math_regions[0].range.clone();
+            let caret_line = ed.read(cx).row_col(ed.read(cx).caret()).0;
+            assert!(
+                !(blk_range.start <= caret_line && caret_line < blk_range.end),
+                "多行写回不得把光标拖进块（光标行 {caret_line} 在块 {blk_range:?} 内）"
+            );
+        }
+        // 第 2 键：再插入一行字符 → 写回仍在同一块内、独立撤销单元。
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        input.update(cx, |ed, cx| {
+            let at = ed.text_string().len();
+            ed.set_caret_to(at);
+            ed.insert_text("c", cx);
+        });
+    });
+    vcx.update(|window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$\na + b\nc\n$$\n尾行\n",
+            "第二键写回继续保留围栏与两行正文"
+        );
+        assert_eq!(
+            ed.read(cx).derived().borrow().math_regions[0].source,
+            "a + b\nc",
+            "region source 再次更新"
+        );
+        assert_eq!(
+            ed.read(cx).undo_stack.len() + (ed.read(cx).open_unit.is_some() as usize),
+            2,
+            "每次换行写回各自构成独立撤销单元"
+        );
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "写回后重建帧仍以卡片渲染新公式（未 reveal）"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_edit_single_line_folds_newlines_to_one_line(cx: &mut TestAppContext) {
+    // 单行 `$$body$$`：编辑器内贴含 `\n` 文本（全选替换 = 真实 CodeEditor 编辑）→ 写回后
+    // 正文被折为一行（`\n`→空格），块仍是单行 `$$…$$` 形态（保持单行合法、不破坏围栏）。
+    use super::BlockCard;
+    use gpui::{Bounds, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$a+b$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let tail = text.find("尾").unwrap();
+    let ed = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        // 全选替换为含 `\n` 的文本（模拟粘贴多行后落笔）。
+        input.update(cx, |ed, cx| {
+            let len = ed.text_string().len();
+            ed.set_caret_to(0);
+            ed.set_selection_range(0..len, cx);
+            ed.insert_text("x\ny", cx);
+        });
+        ed
+    });
+    vcx.update(|window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$x y$$\n尾行\n",
+            "含换行写回折为一行（`\\n`→空格），定界符保留"
+        );
+        assert_eq!(
+            ed.read(cx).derived().borrow().math_regions[0].source,
+            "x y",
+            "单行块 source 为折行后文本"
+        );
+        assert_eq!(ed.read(cx).caret(), tail, "单行折行写回不拖光标");
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "折行后仍单行卡片（行数不变）"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_edit_long_formula_editor_bounded_and_roundtrips(cx: &mut TestAppContext) {
+    // 长公式：超长单行正文 → 打开编辑卡并**真实绘制一帧**（内嵌 CodeEditor 渲染）不
+    // panic；编辑器区有界（不溢出卡片外，固定编辑器高）；预填/写回转读一致。
+    use super::{BlockCard, MATH_EDIT_CARD_W, MATH_EDIT_EDITOR_H};
+    use gpui::{Bounds, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    // 单行超长 LaTeX（长行触发 CodeEditor 横向滚动，不参与布局溢出）。
+    let long = r"\frac{\partial f}{\partial x} + \int_{0}^{\infty} e^{-x^2} dx ".repeat(24);
+    let text = format!("$$\n{long}\n$$\n尾行\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "长公式应打开编辑卡");
+        // 真实绘制一帧（内嵌 CodeEditor 渲染），不得 panic。
+        let _ = window.draw(cx);
+    });
+    // 编辑器区有界（宽 ≤ 卡片宽；高 = 固定编辑器高）。
+    let editor_b = vcx
+        .debug_bounds("wy-math-edit-editor")
+        .expect("编辑器区已绘制");
+    let card_b = vcx
+        .debug_bounds("wy-math-edit-card")
+        .expect("卡片已绘制");
+    assert!(
+        f32::from(editor_b.size.width) <= f32::from(card_b.size.width) + 1.,
+        "编辑器宽 {:.1} 不得溢出卡片宽 {:.1}",
+        f32::from(editor_b.size.width),
+        f32::from(card_b.size.width)
+    );
+    assert!(
+        (f32::from(editor_b.size.height) - MATH_EDIT_EDITOR_H).abs() < 2.,
+        "编辑器区固定高 {MATH_EDIT_EDITOR_H}：实际 {:.1}",
+        f32::from(editor_b.size.height)
+    );
+    assert!(
+        f32::from(editor_b.size.width) <= f32::from(MATH_EDIT_CARD_W) - 8.,
+        "编辑器不溢出卡片内容宽"
+    );
+    // 预填回读一致。
+    assert_eq!(
+        ed.read_with(vcx, |e, _| e.math_edit_input())
+            .expect("输入区")
+            .read_with(vcx, |ed, _| ed.text_string()),
+        long,
+        "超长公式预填回读一致"
+    );
+    // 写回转读一致：追加一个真实编辑 → 文档正文随之更新、重建帧仍卡片。
+    vcx.update(|_window, cx| {
+        let input = ed.read(cx).math_edit_input().expect("输入区");
+        input.update(cx, |ed, cx| {
+            let at = ed.text_string().len();
+            ed.set_caret_to(at);
+            ed.insert_text(" + 1", cx);
+        });
+    });
+    vcx.update(|window, cx| {
+        assert_eq!(
+            ed.read(cx).derived().borrow().math_regions[0].source,
+            format!("{long} + 1"),
+            "写回后 region source 更新（超长正文回读一致）"
+        );
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "超长写回后重建帧仍卡片渲染"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_edit_long_formula_tail_reachable_by_hscroll(cx: &mut TestAppContext) {
+    // 复现：超长单行公式正文在编辑卡内被裁掉尾部，看不到、也无法选中/点中末尾字符。
+    // 根因（几何证据）：内嵌 CodeEditor 首帧 `avail_w` 读不到 `element_bounds`（浮层
+    // `deferred` prepaint 在 render **之后**才回写）→ 回退到**窗口宽** → `content_w_px`、
+    // `visible_chars` 全按窗口宽算（修复前实测 content_w=窗口宽、visible≈249），横向量程
+    // 虚高、reveal/点按映射错乱，滚到底尾部被甩出可视区左侧，肉眼看不到也无法点中。
+    // 修复：`open_math_edit` 首帧前 `set_element_bounds` 给出卡片内编辑器区的确定可视宽
+    // （`MATH_EDIT_EDITOR_W`）→ 首帧 content_w=真实行宽、visible≈卡片宽，横向量程正确，
+    // 滚到底尾部落在可视区内；再叠加**尾部 gap**（`MATH_EDIT_TAIL_GAP_PX`，只加成
+    // content_w）→ 末尾字符右侧留出可见空隙、不再贴裁切缘（可看清/可点中）。
+    use gpui::{
+        Bounds, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase, point, px, size,
+    };
+    cx.update(crate::actions::bind_local_keymaps);
+    // 单行超长正文：160 个 ASCII 宽单位 ≈ 1248px —— 落在「卡片内编辑器可视宽(~447)」与
+    // 「窗口宽(≈1930)」之间：修复前 max() 取到窗口宽（量程/可见字符错乱），修复后取到
+    // 真实行宽（尾部可达）。
+    let long = "x+".repeat(80);
+    let units = long.len() as f32; // 全 ASCII → 每字符 1 宽度单位
+    let text = format!("$$\n{long}\n$$\n尾行\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "长公式应打开编辑卡");
+        assert!(
+            ed.read(cx).math_edit_anchor().is_some(),
+            "打开即缓存锚点（浮层就位）"
+        );
+        // 真实绘制一帧（内嵌 CodeEditor 渲染 + deferred 卡片浮层布局）。
+        let _ = window.draw(cx);
+    });
+    let editor_b = vcx
+        .debug_bounds("wy-math-edit-editor")
+        .expect("编辑器区已绘制");
+    let input = ed.read_with(vcx, |e, _| e.math_edit_input()).expect("输入区");
+    let (max_scroll, content_w, visible, (cw, _lh, gutter), eb) =
+        input.read_with(vcx, |ed, _| {
+            (
+                ed.test_hscroll_max_px(),
+                ed.test_content_w_px(),
+                ed.test_visible_chars(),
+                ed.test_metrics(),
+                ed.test_element_bounds(),
+            )
+        });
+    let editor_w = f32::from(eb.size.width);
+    let harea = (editor_w - gutter).max(0.);
+    let raw_w = units * cw;
+    assert!(
+        max_scroll > 8.,
+        "长公式编辑卡应存在横向量程：content_w={content_w:.1} harea={harea:.1} max_scroll={max_scroll:.1}"
+    );
+    // 内容宽 = 真实文本行宽 + 尾部显示 gap（`MATH_EDIT_TAIL_GAP_PX`；修复前 max(行宽,
+    // 窗口宽) → 虚高到窗口宽 FAIL；修复后不再回退窗口宽，只在真实行宽上追加尾部留白）。
+    assert!(
+        (content_w - (raw_w + super::MATH_EDIT_TAIL_GAP_PX)).abs() < 3.,
+        "内容宽应 = 真实行宽 + 尾部 gap（不是窗口宽）：content_w={content_w:.1} raw+gap={:.1}",
+        raw_w + super::MATH_EDIT_TAIL_GAP_PX
+    );
+    // 可视字符数 = 卡片内编辑器宽（修复前 = 窗口宽 → 虚高到 ~249，FAIL；修复后 = 卡片
+    // 宽推导值，`visible_chars_from_width` 有 `.max(80)` 下限 → ≤ 80）。
+    assert!(
+        visible < 120,
+        "可视字符数应按卡片内编辑器宽算（不是窗口宽）：visible={visible} editor_w={editor_w:.1} gutter={gutter:.1}"
+    );
+    // 内嵌编辑器**可点中**：首次鼠标按下（绘制后第一个鼠标事件，deferred 浮层命中路径
+    // 已就绪）在文本区点一下 → 光标落在真实文本列内（>0 且 < 行宽；修复前若首帧几何按
+    // 窗口宽，仍能点但坐标系/可视范围错乱，这里是可点性兜底）。
+    let first_click = point(
+        editor_b.origin.x + px(160.),
+        editor_b.origin.y + editor_b.size.height / 2.,
+    );
+    vcx.simulate_mouse_down(first_click, MouseButton::Left, Modifiers::default());
+    let caret0 = input.read_with(vcx, |ed, _| ed.selection().head());
+    assert!(
+        caret0 > 0 && caret0 < units as usize,
+        "点文本区应把光标放进真实文本列：caret0={caret0}（行宽 {units:.0}）"
+    );
+    // 横向滚轮滚到最右（量程上限）→ 末尾字符应落在可视区右缘内（修复前量程按窗口宽
+    // 虚高 → 滚过头、末尾字符被甩出可视区左侧，看不到也无法点中，FAIL）。
+    // ⚠️ 用**点击后最新一帧**的编辑器几何（卡片/卡行在重绘间会移动，防止滚到旧位置）。
+    let editor_b = vcx
+        .debug_bounds("wy-math-edit-editor")
+        .expect("点击后编辑器区仍在");
+    let wheel_center = point(
+        editor_b.origin.x + editor_b.size.width / 2.,
+        editor_b.origin.y + editor_b.size.height / 2.,
+    );
+    vcx.simulate_event(ScrollWheelEvent {
+        position: wheel_center,
+        delta: ScrollDelta::Pixels(point(px(50_000.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: TouchPhase::Moved,
+    });
+    let (hscroll, max2) = input.read_with(vcx, |ed, _| {
+        (ed.test_hscroll_px(), ed.test_hscroll_max_px())
+    });
+    assert!(
+        hscroll >= 8.,
+        "横向滚轮应让内嵌编辑器真正横滚（尾部可达）：hscroll={hscroll:.1} max={max2:.1}"
+    );
+    let tail_on_screen = raw_w - hscroll;
+    assert!(
+        tail_on_screen >= -2. && tail_on_screen <= harea + 2.,
+        "滚到底末尾字符应在可视区内（否则被 overflow_hidden 裁掉、看不到也点不中）：\
+         tail_on_screen={tail_on_screen:.1}（可视 [0, {harea:.1}]）hscroll={hscroll:.1}",
+    );
+    // 尾部 gap（本次 workaround 的验收点）：滚到底后末尾字符应停在可视右缘**左侧**
+    // ≈`MATH_EDIT_TAIL_GAP_PX` 处——末尾字符右侧留出可辨空隙，不再贴裁切缘（可看清、
+    // 可点中；若 gap 未加成，tail_to_edge≈0 → FAIL）。
+    let tail_to_edge = harea - tail_on_screen;
+    assert!(
+        tail_to_edge > 20. && tail_to_edge <= super::MATH_EDIT_TAIL_GAP_PX + 12.,
+        "滚到底末尾字符右侧应留出尾部 gap（不贴缘）：tail_to_edge={tail_to_edge:.1}，目标 {}",
+        super::MATH_EDIT_TAIL_GAP_PX
+    );
+}
+
+#[gpui::test]
+fn math_edit_long_formula_typing_follows_hscroll(cx: &mut TestAppContext) {
+    // 复现（用户实测）：长公式末尾继续输入时，横向滚动条不跟随（停在原位），内容变长后
+    // 刚输入的新内容在可视区外看不到。与主编辑器
+    // `reveal_keeps_caret_visible_while_typing_in_long_line` 同语义：末尾敲字应让 hscroll
+    // 持续推进、末字符落进可视区（真实渲染路径 + 连续键入）。
+    use gpui::{Bounds, point, px, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let long = "x+".repeat(80);
+    let text = format!("$$\n{long}\n$$\n尾行\n");
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(&text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let tail = text.find("尾").unwrap();
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "应打开编辑卡");
+        let _ = window.draw(cx);
+    });
+    let input = ed.read_with(vcx, |e, _| e.math_edit_input()).expect("输入区");
+    // 首帧基线。
+    let (cw0, visible0, h0, gutter0, eb_w0) = input.read_with(vcx, |ed, _| {
+        let m = ed.test_metrics();
+        (
+            m.0,
+            ed.test_visible_chars(),
+            ed.test_hscroll_px(),
+            m.2,
+            ed.test_element_bounds().size.width.as_f32(),
+        )
+    });
+    assert!(cw0 > 0., "首帧后 char_width 应已就绪：cw0={cw0}");
+    assert!(
+        visible0 < 120,
+        "首帧 visible 应按卡片宽算（不是窗口宽）：visible0={visible0} eb_w0={eb_w0:.1}"
+    );
+    // 光标放正文末尾 → 连续键入 → 每轮统计 hscroll 推进与末字符屏幕位置。
+    let harea = (eb_w0 - gutter0).max(0.);
+    assert!(
+        visible0 < 120 && harea > 0.,
+        "首帧几何应就绪（visible0={visible0} harea={harea:.1}）"
+    );
+    // 光标放正文末尾 → 连续键入 → 每轮统计 hscroll 推进与末字符屏幕位置。
+    let mut last_h = h0;
+    let mut mono_ok = true;
+    let mut worst_screen_right = f32::MIN;
+    let mut log = String::new();
+    let mut step = 0usize;
+    for _ in 0..40 {
+        step += 1;
+        input.update(vcx, |ed, cx| {
+            ed.set_caret_to(ed.text_string().len());
+            ed.insert_text("y", cx);
+        });
+        // 键入即 reveal（同调用栈）；再真实绘制一帧（sync_render_state 回读 h_handle、
+        // 更新 visible_chars、ScrollableElement 落 max_offset）。
+        let h_after_edit = vcx.update(|_, cx| input.read(cx).test_hscroll_px());
+        vcx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (hscroll, max, cw, vis, cols) = vcx.update(|_, cx| {
+            let ed = input.read(cx);
+            (
+                ed.test_hscroll_px(),
+                ed.test_hscroll_max_px(),
+                ed.test_metrics().0,
+                ed.test_visible_chars(),
+                ed.test_caret_units(),
+            )
+        });
+        // 末字符（=光标前一格）左缘 = 列×字宽 − hscroll。
+        let screen = (cols as f32 - 1.) * cw - hscroll;
+        worst_screen_right = worst_screen_right.max(screen + cw);
+        if hscroll <= last_h {
+            mono_ok = false;
+            log.push_str(&format!(
+                "  [{step}] hscroll={hscroll:.1} <= last={last_h:.1}（max={max:.1} cw={cw:.2} \
+                 vis={vis} cols={cols} h_after_edit={h_after_edit:.1}）\n",
+            ));
+        }
+        last_h = hscroll;
+    }
+    assert!(
+        mono_ok,
+        "末尾连续键入时横向滚动应持续推进（停在原位则新内容溢出可视区）：h0={h0:.1}，\n{}",
+        log
+    );
+    // 末字符右缘落进可视文本区（修复前 visible 被 80 格下限虚高 → reveal 右缘偏大 → 末字符
+    // 在真实右缘之外、被 overflow_hidden 裁掉看不到，worst 可达 530px > harea 447）。
+    assert!(
+        worst_screen_right <= harea + 2.,
+        "末尾键后的末字符右缘应落进可视文本区：worst_screen_right={worst_screen_right:.1} \
+         harea={harea:.1}（h0={h0:.1}，最后一轮 hscroll={last_h:.1}）"
+    );
+}
+
+#[gpui::test]
+fn math_edit_empty_block_writeback_keeps_fences(cx: &mut TestAppContext) {
+    // 空块 `$$\n$$`（无正文行）：双击弹卡预填空正文 → 键入正文 → 写回必须让正文独占
+    // 一行、闭围栏独立成行（`$$\n<body>\n$$`）——若只插正文不换行会生成 `<body>$$`，
+    // `$$` 不再是整行围栏，派生重扫会把闭围栏及以下整篇吞进块内（block 区间 0..4、
+    // source 含尾行）。断言围栏形态保留、region 只含正文、光标仍在块外。
+    use super::BlockCard;
+    use gpui::{Bounds, size};
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "$$\n$$\n尾行\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let tail = text.find("尾").unwrap();
+    let ed = vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+            e.set_caret(tail);
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        ed.update(cx, |e, cx| e.open_math_edit(0, window, cx));
+        assert!(ed.read(cx).math_edit_open(), "空块应打开编辑卡");
+        let input = ed.read(cx).math_edit_input().expect("应有输入区");
+        assert_eq!(input.read(cx).text_string(), "", "空块预填空正文");
+        input.update(cx, |ed, cx| {
+            ed.set_caret_to(0);
+            ed.insert_text("a+b", cx);
+        });
+        ed
+    });
+    vcx.update(|window, cx| {
+        assert_eq!(
+            ed.read(cx).content(),
+            "$$\na+b\n$$\n尾行\n",
+            "空块写回：正文独占一行、闭围栏独立成行"
+        );
+        {
+            let drc = ed.read(cx).derived();
+            let d = drc.borrow();
+            assert_eq!(d.math_regions.len(), 1, "仍只有 1 个数学块");
+            assert_eq!(d.math_regions[0].range, 0usize..3, "区间只含开/闭围栏+正文");
+            assert_eq!(d.math_regions[0].source, "a+b", "region 只含正文，不吞尾行");
+        }
+        {
+            let blk = 0usize..3;
+            let caret_line = ed.read(cx).row_col(ed.read(cx).caret()).0;
+            assert!(
+                !(blk.start <= caret_line && caret_line < blk.end),
+                "空块写回不得把光标拖进块内（光标行 {caret_line} 在块 {blk:?} 内）"
+            );
+            assert_eq!(
+                caret_line, 3,
+                "光标应停在闭围栏后一行（尾行行首，随插入平移）"
+            );
+        }
+        let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        assert!(
+            f2.rows
+                .iter()
+                .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
+            "空块写回后重建帧仍卡片渲染"
         );
     });
 }
