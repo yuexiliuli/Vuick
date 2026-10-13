@@ -29,6 +29,11 @@ pub(crate) struct StyleParams {
     pub(crate) quote_bg: Hsla,
     /// 表头底色（浅灰）。
     pub(crate) table_head_bg: Hsla,
+    /// Mermaid 图节点分类 accent 色板（6 色，亮/暗由 `ColorScheme` 分流；节点按出现
+    /// 顺序循环取色，作者 classDef/style 显式色不参与）。
+    pub(crate) mermaid_accents: [Hsla; 6],
+    /// Mermaid 边线/边框主色（≈ divider 同 hue 提一档：中性灰，随明暗 token 自动）。
+    pub(crate) mermaid_border: Hsla,
     pub(crate) para_size: Pixels,
     pub(crate) para_line: Pixels,
     pub(crate) code_size: Pixels,
@@ -89,6 +94,8 @@ impl StyleParams {
             link: colors.link.into(),
             quote_bg: colors.quote_bg.into(),
             table_head_bg: colors.table_head_bg.into(),
+            mermaid_accents: colors.mermaid_accent_palette.map(Into::into),
+            mermaid_border: colors.mermaid_border.into(),
             para_size: para,
             para_line: line,
             code_size: code,

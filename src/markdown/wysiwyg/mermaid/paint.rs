@@ -64,11 +64,11 @@ pub(crate) fn paint_mermaid_placed(
     for sg in &flow.subgraphs {
         paint_quad(window, sg.x + ox, sg.y + oy, sg.w, sg.h, 8., soft_bg(theme), border_soft(theme), 1.);
         if !sg.title.is_empty() {
-            text(window, theme, sg.x + ox + 8., sg.y + oy + (18. - 12.) / 2. * z, &sg.title, theme.mono.clone(), 11. * z, muted_faded(theme), 17. * z, cx);
+            text(window, theme, sg.x + ox + 8., sg.y + oy + (18. - 12.) / 2. * z, &sg.title, theme.font.clone(), 11. * z, theme.muted, 17. * z, cx);
         }
     }
     // 2) 边（折线 + 端点标记 + 箭头，**不含标签**——标签在节点之后单独顶层画）。
-    let edge_color = { let mut c = theme.muted; c.a = 0.85; c };
+    let edge_color = { let mut c = theme.mermaid_border; c.a = 0.85; c };
     for e in &flow.edges {
         paint_edge(window, e, ox, oy, edge_color, z);
     }
@@ -109,23 +109,17 @@ fn to_hsla(hex: u32) -> Hsla {
     gpui::rgb(hex).into()
 }
 
-/// 分组底色（比卡片底再浅一档）。
+/// 分组底色：`mermaid_border` 极浅 tint（panel 语义，比卡底 show 一层浅灰分组）。
 fn soft_bg(theme: &WyTheme) -> Hsla {
-    let mut c = theme.code_bg;
-    c.a = 0.45;
+    let mut c = theme.mermaid_border;
+    c.a = 0.12;
     c
 }
 
 /// 分组边框。
 fn border_soft(theme: &WyTheme) -> Hsla {
-    let mut c = theme.muted;
-    c.a = 0.35;
-    c
-}
-
-fn muted_faded(theme: &WyTheme) -> Hsla {
-    let mut c = theme.muted;
-    c.a = 0.8;
+    let mut c = theme.mermaid_border;
+    c.a = 0.40;
     c
 }
 
@@ -244,8 +238,8 @@ fn paint_edge(
         return;
     }
     let width = match e.kind {
-        MmEdgeKind::ThickArrow | MmEdgeKind::ThickLine | MmEdgeKind::BothThick => 2.4,
-        _ => 1.6,
+        MmEdgeKind::ThickArrow | MmEdgeKind::ThickLine | MmEdgeKind::BothThick => 2.0,
+        _ => 1.2,
     };
     match e.kind {
         MmEdgeKind::DottedArrow | MmEdgeKind::DottedLine => {
@@ -299,7 +293,7 @@ fn paint_edge_label(
 ) {
     if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text)
         && !lt.is_empty() {
-            text_centered(window, lx + ox, ly + oy, lt, theme.mono.clone(), 12. * z, theme.muted, 14. * z, cx);
+            text_centered(window, lx + ox, ly + oy, lt, theme.font.clone(), 12. * z, theme.text, 14. * z, cx);
         }
 }
 
@@ -468,20 +462,21 @@ pub(crate) fn paint_mermaid_seq(
     let header_h = 30. * z;
     let body_top = oy + seq.body_top;
     // 参与者头部盒 + 生命线（虚线）。
-    let line_color = { let mut c = theme.muted; c.a = 0.4; c };
+    let line_color = { let mut c = theme.mermaid_border; c.a = 0.5; c };
     for c in cols {
         let x = c.x + ox;
         // 生命线。
         dashed_path(window, &[(x + c.w / 2., oy + header_h + 6. * z), (x + c.w / 2., body_top + (seq.height - header_h))], line_color, 1. * z, 3. * z, 3. * z);
         // 头部盒。
-        paint_quad(window, x + 4. * z, oy + 4. * z, c.w - 8. * z, header_h - 8. * z, 6. * z, theme.code_bg, { let mut m = theme.muted; m.a = 0.5; m }, 1. * z);
+        let head_border = { let mut c = theme.mermaid_border; c.a = 0.7; c };
+        paint_quad(window, x + 4. * z, oy + 4. * z, c.w - 8. * z, header_h - 8. * z, 6. * z, theme.table_head_bg, head_border, 1. * z);
         text(window, theme, x + 6. * z, oy + 6. * z + 2. * z, &c.label, theme.font.clone(), 13. * z, theme.text, 18. * z, cx);
     }
 
     // 片段盒（先扫出区间再画底层）。
     let frag_boxes: Vec<(usize, f32, f32)> = scan_fragments(&seq.rows);
-    let band_color = { let mut c = theme.muted; c.a = 0.14; c };
-    let band_border = { let mut c = theme.muted; c.a = 0.5; c };
+    let band_color = { let mut c = theme.mermaid_border; c.a = 0.10; c };
+    let band_border = { let mut c = theme.mermaid_border; c.a = 0.55; c };
     for (fi, y0, y1) in &frag_boxes {
         let bx = ox + 6.;
         let by = oy + y0;
@@ -491,7 +486,7 @@ pub(crate) fn paint_mermaid_seq(
         if let Some(frg) = seq.seq.fragments.get(*fi) {
             let label = frag_title(&frg.kind, &frg.title);
             if !label.is_empty() {
-                text(window, theme, bx + 10., by + (14. - 10.) / 2. * z, &label, theme.mono.clone(), 11. * z, muted_faded(theme), 15. * z, cx);
+                text(window, theme, bx + 10., by + (14. - 10.) / 2. * z, &label, theme.font.clone(), 11. * z, theme.muted, 15. * z, cx);
             }
         }
     }
@@ -525,7 +520,7 @@ pub(crate) fn paint_mermaid_seq(
                 stroke_seg(window, (bx, by), (bx + seq.content_w - 12., by), { let mut c = band_border; c.a = 0.8; c }, 1.);
                 if let Some(t) = title
                     && !t.is_empty() {
-                        text(window, theme, bx + 10., by + 4. * z, t, theme.mono.clone(), 11. * z, muted_faded(theme), 15. * z, cx);
+                        text(window, theme, bx + 10., by + 4. * z, t, theme.font.clone(), 11. * z, theme.muted, 15. * z, cx);
                     }
             }
             _ => {}
@@ -585,8 +580,8 @@ fn paint_message(
     let bx = col(tc);
     let dotted = matches!(arrow, MmSeqArrow::Dotted | MmSeqArrow::DottedOpen | MmSeqArrow::DottedCross);
     let head = matches!(arrow, MmSeqArrow::Solid | MmSeqArrow::Dotted | MmSeqArrow::SolidCross | MmSeqArrow::DottedCross);
-    let color = { let mut c = theme.muted; c.a = 0.9; c };
-    let width = 1.4 * z;
+    let color = { let mut c = theme.mermaid_border; c.a = 0.9; c };
+    let width = 1.2 * z;
     if (ax - bx).abs() < 1. {
         // 自环：向右画一个小折环。
         let r = 14. * z;
@@ -667,8 +662,8 @@ fn paint_note(
     let w = (x1 - x0).max(40. * z);
     let h = 26. * z;
     let y0 = y + (SEQ_NOTE_H * z - h) / 2.;
-    let note_bg = { let mut c = theme.code_inline_bg; c.a = 0.6; c };
-    let border = { let mut c = theme.muted; c.a = 0.45; c };
+    let note_bg = { let mut c = theme.code_inline_bg; c.a = 0.8; c };
+    let border = { let mut c = theme.mermaid_border; c.a = 0.7; c };
     paint_quad(window, x0, y0, w, h, 5. * z, note_bg, border, 1. * z);
     text(window, theme, x0 + 6. * z, y0 + 4. * z, note_text, theme.font.clone(), 12. * z, theme.text, 16. * z, cx);
 }

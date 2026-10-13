@@ -121,6 +121,13 @@ pub struct ColorScheme {
     pub heading: Rgba,
     /// 悬浮小卡片/弹层背景（EPUB 脚注卡片等，明 #ffffff / 暗 #333333）
     pub popover_bg: Rgba,
+    /// Mermaid 图节点分类 accent 色板（6 色 Fluent 语义色，亮/暗各一套：亮底取深一档、
+    /// 暗底取亮一档，保证两种卡底色下描边对比达标）。节点按出现顺序循环取色，
+    /// 作者 classDef/style 显式 hex 色不参与循环。色相参考 zed 玩家板（蓝/绿/橙/紫/红/青）。
+    pub mermaid_accent_palette: [Rgba; 6],
+    /// Mermaid 边线/边框主色（≈ divider 同 hue 提一档：中性灰、比 divider 更可辨；
+    /// 亮/暗随本 token 自动分流，paint 侧再按 a≈0.85 弱化）。
+    pub mermaid_border: Rgba,
 }
 
 impl ColorScheme {
@@ -153,6 +160,16 @@ impl ColorScheme {
             table_head_bg: rgb(0xf2f2f2),
             heading: rgb(0x0b57d0),
             popover_bg: rgb(0xffffff),
+            // Mermaid 分类色板（亮底）：6 色相分散、亮度取深一档（白/浅灰卡上描边对比达标）。
+            mermaid_accent_palette: [
+                hsla(207.8 / 360., 0.78, 0.40, 1.0).into(),
+                hsla(95.0 / 360., 0.45, 0.36, 1.0).into(),
+                hsla(29.0 / 360., 0.68, 0.42, 1.0).into(),
+                hsla(286.0 / 360., 0.50, 0.40, 1.0).into(),
+                hsla(355.0 / 360., 0.62, 0.42, 1.0).into(),
+                hsla(187.0 / 360., 0.55, 0.36, 1.0).into(),
+            ],
+            mermaid_border: rgb(0x909090),
         }
     }
 
@@ -186,6 +203,17 @@ impl ColorScheme {
             table_head_bg: rgb(0x323232),
             heading: rgb(0x6fb1ff),
             popover_bg: rgb(0x333333),
+            // Mermaid 分类色板（暗底）：色相同亮档、亮度取亮一档（zed 暗色玩家板同款，
+            // 深色卡上描边对比达标）。
+            mermaid_accent_palette: [
+                hsla(207.8 / 360., 0.81, 0.66, 1.0).into(),
+                hsla(95.0 / 360., 0.38, 0.62, 1.0).into(),
+                hsla(29.0 / 360., 0.54, 0.61, 1.0).into(),
+                hsla(286.0 / 360., 0.51, 0.64, 1.0).into(),
+                hsla(355.0 / 360., 0.65, 0.65, 1.0).into(),
+                hsla(187.0 / 360., 0.47, 0.55, 1.0).into(),
+            ],
+            mermaid_border: rgb(0xa8a8a8),
         }
     }
 }
@@ -489,6 +517,40 @@ mod tests {
         assert_ne!(light.colors.heading, dark.colors.heading, "标题色随明暗");
         // 悬浮卡片底随明暗（亮 #FFFFFF / 暗 #333333）
         assert_ne!(light.colors.popover_bg, dark.colors.popover_bg, "弹层底色随明暗");
+    }
+
+    #[gpui::test]
+    fn mermaid_accent_palette_is_distinct_and_mode_split(_cx: &mut TestAppContext) {
+        // Mermaid 分类 accent 板：亮/暗各 6 色、同下标色相一致、暗档比亮档亮（对比达标）、
+        // 六色色相彼此分散；mermaid_border 随明暗分流。
+        let light = Theme::light().colors;
+        let dark = Theme::dark().colors;
+        assert_eq!(light.mermaid_accent_palette.len(), 6, "亮板 6 色");
+        assert_eq!(dark.mermaid_accent_palette.len(), 6, "暗板 6 色");
+        for i in 0..6 {
+            let l: Hsla = light.mermaid_accent_palette[i].into();
+            let d: Hsla = dark.mermaid_accent_palette[i].into();
+            assert!(
+                (l.h - d.h).abs() < 1e-3,
+                "色相应跨明暗一致（同 hue 板）：[{i}]"
+            );
+            assert!(d.l > l.l, "暗档应比亮档亮（深底需亮描边）：[{i}]");
+        }
+        let hsl: Vec<Hsla> = light
+            .mermaid_accent_palette
+            .iter()
+            .map(|&c| c.into())
+            .collect();
+        for i in 0..6 {
+            for j in (i + 1)..6 {
+                let dh = (hsl[i].h - hsl[j].h).abs();
+                assert!(
+                    dh > 0.02 && dh < 0.98,
+                    "六色色相应分散可辨：[{i}] vs [{j}] Δh={dh}"
+                );
+            }
+        }
+        assert_ne!(light.mermaid_border, dark.mermaid_border, "边线色随明暗分流");
     }
 
     #[gpui::test]

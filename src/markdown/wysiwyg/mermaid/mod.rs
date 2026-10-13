@@ -26,6 +26,8 @@ mod paint;
 mod parse;
 
 pub(crate) use layout::{mm_layout, mermaid_card_height, scale_mm_layout, MmSeqLayout, MmSeqColumn, SEQ_NOTE_H};
+#[cfg(test)]
+pub(crate) use layout::accent_idx_for;
 pub(crate) use paint::paint_mermaid_layout;
 pub(crate) use parse::{diagram_kind, mermaid_graph, mermaid_seq, MmDiagramKind};
 
@@ -281,6 +283,10 @@ pub(crate) struct MmPlaced {
     pub fill: Option<u32>,
     pub stroke: Option<u32>,
     pub stroke_width: Option<f32>,
+    /// 分类 accent 色板下标（`Some(i)` = 按出现顺序循环 `WyTheme.mermaid_accents`；
+    /// `None` = 作者 classDef/style 显式 hex 着色，按作者色绘制，不参与循环。
+    /// 长边插桩虚节点亦为 `None`）。shape 期定死，paint 只查表调色。
+    pub accent_idx: Option<usize>,
     /// 长边插桩的虚节点（画点不画框，不计入测试节点数语义验证）。
     pub virtual_node: bool,
 }

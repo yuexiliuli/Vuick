@@ -36,6 +36,11 @@ pub struct WyTheme {
     pub divider: Hsla,
     /// 表头底色（预览 `table_head_bg`）。
     pub table_head_bg: Hsla,
+    /// Mermaid 图节点分类 accent 色板（6 色，亮/暗随 token 自动；shape 期按节点序
+    /// 循环取 `accent_idx`，paint 查表调色）。
+    pub mermaid_accents: [Hsla; 6],
+    /// Mermaid 边线/边框主色（≈ divider 提一档，亮/暗随 token 自动）。
+    pub mermaid_border: Hsla,
     /// 引述块背景（预览 `quote_bg`，浅灰卡片感）。
     pub quote_bg: Hsla,
     pub is_dark: bool,
@@ -71,6 +76,8 @@ impl WyTheme {
             code_inline_bg: p.code_inline_bg,
             divider: p.divider,
             table_head_bg: p.table_head_bg,
+            mermaid_accents: p.mermaid_accents,
+            mermaid_border: p.mermaid_border,
             quote_bg: p.quote_bg,
             is_dark: p.is_dark,
             para_line: p.para_line,

@@ -659,3 +659,85 @@ fn mm_blit(
     }
 }
 
+#[gpui::test]
+fn mermaid_paint_smoke_accents_and_sequence(cx: &mut TestAppContext) {
+    // 换色后的 paint 冒烟：流程图（多形状 + 粗/点边缘 + classDef 作者色节点）+
+    // 序列图（loop/else、激活、实/虚/叉箭头）一起真实绘制一遍，断言不 panic；
+    // 同时核对分类 accent：普通节点拿到 accent_idx（循环 0..），作者色节点为 None 且保留 hex。
+    use super::BlockCard;
+    cx.update(crate::actions::bind_local_keymaps);
+    let text = "\
+# 标题
+
+```mermaid
+flowchart TD
+    A[开始] ==> B{判断}
+    B -.-> C[完成]
+    B --> D[返回]
+    D ==> E[退出]
+    classDef red fill:#ff8888
+    class B red
+```
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant S as 服务
+    U->>+S: 登录
+    loop 重试
+        S->>U: 提示
+    else 超时
+        S--xU: 错误
+    end
+    S-->>-U: 成功
+```
+
+尾段
+";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let cards: Vec<_> = frame
+            .rows
+            .iter()
+            .filter(|r| matches!(&r.extra.card, Some(BlockCard::Mermaid)))
+            .collect();
+        assert_eq!(cards.len(), 2, "两张 mermaid 卡（流程图 + 序列图）");
+        // 流程图：普通节点按声明序循环 accent 0..、作者 classDef 着色节点 None。
+        let flow = cards
+            .iter()
+            .find_map(|r| {
+                r.mm.as_deref().and_then(|l| match l {
+                    super::MmLayout::Flow(f) => Some(f),
+                    _ => None,
+                })
+            })
+            .expect("应有流程图布局");
+        let accent = |id: &str| {
+            flow.placed
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.accent_idx)
+        };
+        // 声明序 A,B,C,D,E；B 作者着色跳过 → A=0、C=1、D=2、E=3。
+        assert_eq!(accent("A"), Some(Some(0)), "A accent 0");
+        assert_eq!(accent("B"), Some(None), "classDef 作者色节点不参与循环");
+        assert_eq!(accent("C"), Some(Some(1)), "C accent 1");
+        assert_eq!(accent("D"), Some(Some(2)), "D accent 2");
+        assert_eq!(accent("E"), Some(Some(3)), "E accent 3");
+        // 作者色节点保留作者 fill hex；普通节点 fill 在 shape 期预混好（Some tint）。
+        let b = flow.placed.iter().find(|p| p.id == "B").unwrap();
+        assert_eq!(b.fill, Some(0xff8888), "作者 fill 原样保留");
+        // 完整画一遍（measure→prepaint→paint），catch 任何渲染 panic。
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let _ = window.draw(cx);
+    });
+}
+

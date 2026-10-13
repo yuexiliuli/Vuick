@@ -5,8 +5,60 @@
 
 use super::{MmDirection, MmEdgeKind, MmFlowLayout, MmGraph, MmLayout, MmPlaced, MmPolylineEdge, MmSeq, MmSeqRow, MmShape, MmStyle, MmSubgraphBox, MM_EDGE_X, MM_H_GAP, MM_LANE, MM_NODE_H, MM_NODE_XPAD, MM_RANK_TB, MM_SEP, MM_SUB_TITLE_H, MM_TOP_PAD, mermaid_empty_height};
 use crate::markdown::wysiwyg::WyTheme;
-use gpui::{Pixels, SharedString, TextRun, Window, px};
+use gpui::{Hsla, Pixels, SharedString, TextRun, Window, px};
 use std::collections::HashMap;
+
+/// Mermaid 节点分类色板长度（=`ColorScheme.mermaid_accent_palette` 的 6 色；zed 用
+/// 8 色玩家板，本仓库给 6 即可——循环取色下标只在此推导，paint 只查表）。
+pub(crate) const MM_ACCENT_COUNT: usize = 6;
+
+/// accent 填充不透明度：把 accent 以 15% 混到卡底（仿 zed `blend_over_background`）。
+const ACCENT_FILL_OPACITY: f32 = 0.15;
+
+/// 分类 accent 下标分配（**纯函数**，供 `assemble_placed` 与单测共用）：按 `g.nodes`
+/// 声明序循环 `0..MM_ACCENT_COUNT`；作者 classDef/style 显式 hex（fill/stroke 任一）
+/// 着色节点不参与循环、映射 `None`（按作者色绘制）。`assemble_placed` 据此再补
+/// 虚节点（id 不在表内）的 `None`。
+pub(crate) fn accent_idx_for(g: &MmGraph) -> HashMap<String, Option<usize>> {
+    let mut out = HashMap::new();
+    let mut acc = 0usize;
+    for n in &g.nodes {
+        let st = g.styles.get(&n.id);
+        let author_colored = st.map_or(false, |s| s.fill.is_some() || s.stroke.is_some());
+        out.insert(
+            n.id.clone(),
+            if author_colored {
+                None
+            } else {
+                let i = acc % MM_ACCENT_COUNT;
+                acc += 1;
+                Some(i)
+            },
+        );
+    }
+    out
+}
+
+/// accent 填充 hex：把 accent 以 `ACCENT_FILL_OPACITY` 不透明度在 RGB 通道线性混到
+/// 卡底 `card_bg`（zed `blend_over_background` 同款）。**shape 期算好锁进
+/// `MmPlaced.fill`** → paint 零计算（不逐帧 blend/重算）。
+fn accent_fill_hex(accent: Hsla, card_bg: Hsla) -> u32 {
+    let fg = gpui::Rgba::from(accent);
+    let bg = gpui::Rgba::from(card_bg);
+    let t = ACCENT_FILL_OPACITY;
+    let blended = gpui::Rgba {
+        r: fg.r * t + bg.r * (1.0 - t),
+        g: fg.g * t + bg.g * (1.0 - t),
+        b: fg.b * t + bg.b * (1.0 - t),
+        a: 1.0,
+    };
+    hsla_to_hex(blended.into())
+}
+
+/// Hsla → 0xRRGGBB（与 `parse.rs` 的 hex / `paint::to_hsla` 同式，丢 alpha 字节）。
+fn hsla_to_hex(c: Hsla) -> u32 {
+    (u32::from(gpui::Rgba::from(c)) >> 8) & 0xFF_FF_FF
+}
 
 /// 序列图列（卡片相对坐标）。
 #[derive(Clone, Debug)]
@@ -237,7 +289,7 @@ fn layout_flow(
     let order = barycenter_order(&fe.elements, &fe.virtual_layers, &fe.layer_of, &fe.chain, fe.n_layers);
     let sizes = flow_sizes(window, theme, &fe.elements, &fe.virtual_layers);
     let geom = flow_positions(g, &fe.elements, &order, sizes, area_x, area_w);
-    let placed = assemble_placed(g, &fe.elements, area_x, area_y, geom);
+    let placed = assemble_placed(g, theme, &fe.elements, area_x, area_y, geom);
     let edges = route_edges(g, &fe.chain, &placed);
     let subgraphs = flow_subgraph_boxes(g, &fe.real_index, &placed, area_x, area_y);
 
@@ -474,18 +526,32 @@ fn flow_positions(
     FlowGeometry { cx, cy, cw: sizes.cw, ch: sizes.ch, virtual_flag: sizes.virtual_flag, axis_ref }
 }
 
-/// 方向变换并装配 placed（整体坐标系）。
+/// 方向变换并装配 placed（整体坐标系）。`accent_idx` 在此按节点序循环调色板
+/// （作者 classDef/style 显式 hex 节点为 None）；accent 的填充/描边也在 **shape 期**
+/// 预混好锁进 `fill`/`stroke`，paint 只查表零计算。
 fn assemble_placed(
     g: &MmGraph,
+    theme: &WyTheme,
     elements: &[(String, String, MmShape)],
     area_x: f32,
     area_y: f32,
     geom: FlowGeometry,
 ) -> Vec<MmPlaced> {
+    let accents = accent_idx_for(g);
     let mut placed: Vec<MmPlaced> = Vec::with_capacity(elements.len());
     for (ei, (id, lab, shp)) in elements.iter().enumerate() {
         let (fx, fy) = orient(g.direction, geom.cx[ei], geom.cy[ei], geom.axis_ref);
         let st = g.styles.get(id).copied().unwrap_or(MmStyle::default());
+        let accent_idx = accents.get(id.as_str()).copied().flatten();
+        // accent 节点的填充 = 混色 tint、描边 = accent 实色（shape 期定死，paint 零计算）；
+        // author 节点原样保留作者 hex；虚节点（不在映射表）走 None → paint 兜底。
+        let (fill, stroke) = match accent_idx {
+            Some(i) => {
+                let a = theme.mermaid_accents[i];
+                (Some(accent_fill_hex(a, theme.code_bg)), Some(hsla_to_hex(a)))
+            }
+            None => (st.fill, st.stroke),
+        };
         placed.push(MmPlaced {
             id: id.clone(),
             label: lab.clone(),
@@ -494,9 +560,10 @@ fn assemble_placed(
             y: area_y + fy,
             w: geom.cw[ei],
             h: geom.ch[ei],
-            fill: st.fill,
-            stroke: st.stroke,
+            fill,
+            stroke,
             stroke_width: st.stroke_width,
+            accent_idx,
             virtual_node: geom.virtual_flag[ei],
         });
     }
@@ -758,6 +825,7 @@ mod tests {
             fill: None,
             stroke: None,
             stroke_width: None,
+            accent_idx: None,
             virtual_node: false,
         }
     }

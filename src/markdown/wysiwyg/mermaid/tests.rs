@@ -240,6 +240,37 @@ fn flow_layout_extents_match_card_height() {
     assert_eq!(mermaid_card_height(lr), px(142.));
 }
 
+/// 分类 accent 循环（纯函数）：普通节点按声明序循环 0..5；作者 classDef/style 显式
+/// hex 着色节点不参与循环、映射 None；第 7 个普通节点回绕到 0。
+#[test]
+fn accent_idx_cycles_and_skips_author_colors() {
+    let g = mermaid_graph("flowchart TD\nA-->B\nB-->C\nC-->D\nD-->E\nE-->F");
+    let m = accent_idx_for(&g);
+    for (id, want) in [("A", 0), ("B", 1), ("C", 2), ("D", 3), ("E", 4), ("F", 5)] {
+        assert_eq!(m[id], Some(want), "节点 {id} 应循环到 accent {want}");
+    }
+
+    // 作者 classDef/style hex 节点不占循环位（None）；其后普通节点从 0 续起。
+    let g2 = mermaid_graph(
+        "flowchart TD\n\
+         X[甲] --> Y[乙]\n\
+         Z[丙] --> Y\n\
+         classDef red fill:#f66\n\
+         class X red\n\
+         style Z stroke:#4488ff",
+    );
+    let m2 = accent_idx_for(&g2);
+    assert_eq!(m2["X"], None, "classDef 填色 → 作者色不参与循环");
+    assert_eq!(m2["Z"], None, "style 描边色 → 同样视为作者着色");
+    assert_eq!(m2["Y"], Some(0), "作者色节点不占位，Y 从 0 起");
+
+    // 第 7 个普通节点回绕到 0（0..5 后循环）。
+    let g3 = mermaid_graph("flowchart TD\nA1-->A2\nA2-->A3\nA3-->A4\nA4-->A5\nA5-->A6\nA6-->A7");
+    let m3 = accent_idx_for(&g3);
+    assert_eq!(m3["A1"], Some(0));
+    assert_eq!(m3["A7"], Some(0), "7 个普通节点回绕到 0");
+}
+
 /// `scale_mm_layout`：flowchart 整体等比缩放（x 绕中线、y 贴顶），paint 按 zoom 缩放字号。
 #[test]
 fn scale_layout_zooms_flow_geometries() {
@@ -247,7 +278,7 @@ fn scale_layout_zooms_flow_geometries() {
     let flow = MmFlowLayout {
         placed: vec![MmPlaced {
             id: "A".into(), label: "A".into(), shape: MmShape::Rect,
-            x: 100., y: 20., w: 40., h: 30., fill: None, stroke: None, stroke_width: None, virtual_node: false,
+            x: 100., y: 20., w: 40., h: 30., fill: None, stroke: None, stroke_width: None, accent_idx: None, virtual_node: false,
         }],
         edges: vec![MmPolylineEdge {
             a: 0, b: 0, kind: MmEdgeKind::Arrow,
