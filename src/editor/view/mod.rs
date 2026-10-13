@@ -70,6 +70,9 @@ const HSCROLL_MARGIN_COLS: usize = 4;
 const GUTTER_LEFT_PAD_PX: f32 = 12.;
 /// 行号与文本之间的留白（px）。
 const GUTTER_RIGHT_PAD_PX: f32 = 6.;
+/// 折叠指示箭头的**固定槽宽**（px）。槽恒存在（无箭头时为空但照占位）→ 行号右缘
+/// 锚点不随有无箭头而位移，有箭头行不与无箭头行错位；槽内右对齐放「▸/▾」字形。
+const FOLD_ARROW_SLOT_PX: f32 = 14.;
 
 /// 编辑器对外事件。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1109,11 +1112,13 @@ impl CodeEditor {
 
         let digits = self.buffer.line_count().max(1).to_string().len();
         self.gutter_chars = digits.max(3);
+        // 总宽 = 数字格 + 左右内边距 + 固定箭头槽（槽替代旧 +4 缓冲：数字格因此
+        // 恒 = gutter_chars×字宽，行号右缘锚点固定，不会被 overflow_hidden 裁槽）。
         self.gutter_width_px = px(
             self.gutter_chars as f32 * char_width.as_f32()
                 + GUTTER_LEFT_PAD_PX
                 + GUTTER_RIGHT_PAD_PX
-                + 4.,
+                + FOLD_ARROW_SLOT_PX,
         );
     }
 
@@ -1813,6 +1818,11 @@ impl CodeEditor {
         self.has_fold_or_candidate(line)
     }
 
+    /// 测试用：`line` 行的折叠箭头状态（与渲染同口径的单一权威，见 [`Self::fold_arrow_state`]）。
+    pub(crate) fn test_fold_arrow_state(&self, line: usize) -> Option<bool> {
+        self.fold_arrow_state(line)
+    }
+
     /// 测试用：光标行折叠切换（gutter 点击同路径）。
     pub(crate) fn test_toggle_fold_at(&mut self, line: usize) {
         self.toggle_fold_at(line);
@@ -2206,10 +2216,23 @@ impl CodeEditor {
         self.fold_candidates.get(i).filter(|f| f.start == line).copied()
     }
 
+    /// `line` 行的折叠指示箭头状态（渲染与测试共用的**单一权威**）：
+    /// - `None` = 不画箭头；
+    /// - `Some(true)` = 已激活折叠首行（隐藏体收起）→ 右向「▸」；
+    /// - `Some(false)` = 仅折叠候选起点 → 下向「▾」。
+    fn fold_arrow_state(&self, line: usize) -> Option<bool> {
+        if self.folds.fold_starting_at(line).is_some() {
+            Some(true)
+        } else if self.candidate_starting_at(line).is_some() {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     /// `line` 是否有「可折叠」标记：已激活折叠首行，或折叠候选起点。
     fn has_fold_or_candidate(&self, line: usize) -> bool {
-        self.folds.fold_starting_at(line).is_some()
-            || self.candidate_starting_at(line).is_some()
+        self.fold_arrow_state(line).is_some()
     }
 
     /// 打开/整篇替换路径的**同步**整篇重扫（内容全新，首屏即就绪，测试依赖）：

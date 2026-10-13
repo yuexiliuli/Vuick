@@ -24,8 +24,8 @@ use crate::config::layout::{
     BRACKET_GUIDE_ACTIVE_WIDTH, BRACKET_GUIDE_WIDTH, EDITOR_RULER_COLUMNS,
 };
 use super::{
-    CARET_WIDTH_PX, CodeEditor, EditorEvent, GUTTER_LEFT_PAD_PX, GUTTER_RIGHT_PAD_PX,
-    MIN_VISIBLE_ROWS, RowData, RowView,
+    CARET_WIDTH_PX, CodeEditor, EditorEvent, FOLD_ARROW_SLOT_PX, GUTTER_LEFT_PAD_PX,
+    GUTTER_RIGHT_PAD_PX, MIN_VISIBLE_ROWS, RowData, RowView,
 };
 
 // -------------------------------------------------------------------------
@@ -187,7 +187,8 @@ impl CodeEditor {
         // 可见行号 = 绝对顶行起、覆盖一屏（+1 行抗舍入）。叠层列 top = −已滚进顶行的
         // offset：与 List 把首个可见 item 画在 `origin − offset_in_item` 完全一致。
         // 折叠后 gutter 按**视觉行**取逻辑行号（隐藏行不占视觉行 → 行号呈缺口，
-        // 折叠首行渲染「▾」指示器）。先快照（closure 不捕获 self）。
+        // 折叠首行按 `fold_arrow_state` 渲染方向箭头：已折叠「▸」/仅候选「▾」）。
+        // 先快照（closure 不捕获 self）。
         let gutter_items = self.gutter_items_for(g_top_abs, gutter_rows, view_h, lh);
         let gutter_col = div()
             .id("ce-gutter-col")
@@ -197,8 +198,8 @@ impl CodeEditor {
             .top(px(-gutter_offset))
             .w_full()
             .children(gutter_items.into_iter().map(move |item| match item {
-                Some((logical, folded)) => {
-                    number_element(logical, folded, &gv).into_any_element()
+                Some((logical, arrow)) => {
+                    number_element(logical, arrow, &gv).into_any_element()
                 }
                 None => div().h(gv.line_height).into_any_element(),
             }));
@@ -387,22 +388,23 @@ impl CodeEditor {
         (content_w_px, harea_w)
     }
 
-    /// 可见行号叠层条目：`Some((逻辑行号, 是否折叠指示器))` 或 `None`（底部预留区/文档末尾）。
+    /// 可见行号叠层条目：`Some((逻辑行号, 箭头状态))` 或 `None`（底部预留区/文档末尾）。
+    /// 第二项 = [`CodeEditor::fold_arrow_state`] 直接透传：`Some(true)`=已折叠首行、
+    /// `Some(false)`=仅候选起点、`None`=不画箭头（渲染口径与测试同源，不在此重判）。
     fn gutter_items_for(
         &self,
         gutter_start: usize,
         gutter_rows: usize,
         view_h: f32,
         lh: f32,
-    ) -> Vec<Option<(usize, bool)>> {
+    ) -> Vec<Option<(usize, Option<bool>)>> {
         let gutter_count = ((view_h / lh).ceil() as usize).clamp(1, 4096) + 1;
         (gutter_start..gutter_start + gutter_count)
             .map(|vix| {
                 if vix < gutter_rows {
                     let l = self.folds.logical_row(vix);
-                    // 指示器：激活折叠首行，或自动探测的折叠候选起点（默认可见）。
-                    let folded = self.has_fold_or_candidate(l);
-                    Some((l, folded))
+                    let arrow = self.fold_arrow_state(l);
+                    Some((l, arrow))
                 } else {
                     None
                 }
@@ -767,30 +769,50 @@ struct GutterView {
     fg: Hsla,
 }
 
-/// 行号单元格：右对齐、行高与文本行一致。由共享 ListState 的第二个 `list()`
-/// 驱动 → 行号与文本行对齐、随滚动同步移动且不闪烁。`folded=true` 时在行号左侧
-/// 渲染「▾」（指示该行为折叠首行、有隐藏内容，点击可展开——见 `on_mouse_down`）。
-fn number_element(ix: usize, folded: bool, gv: &GutterView) -> gpui::Div {
+/// 行号单元格：行高与文本行一致，由共享 ListState 的第二个 `list()` 驱动 → 行号与
+/// 文本行对齐、随滚动同步移动且不闪烁。`arrow` = 折叠指示箭头状态
+/// （[`CodeEditor::fold_arrow_state`] 透传）：`Some(true)`=已折叠首行 → 右向「▸」；
+/// `Some(false)`=候选起点 → 下向「▾」；`None`=不画。
+///
+/// 布局：flex-grow 的**数字格**（内部 `justify_end` 右对齐）+ 固定宽**箭头槽**（恒占位）
+/// → 无论有无箭头，数字右缘都钉在「gutter 右缘 − 右内边距 − 槽宽」，有箭头行不把
+/// 行号左推、与无箭头行数字列对齐（避免真机「行号被挤/错位」回归）。
+fn number_element(ix: usize, arrow: Option<bool>, gv: &GutterView) -> gpui::Div {
     let number = SharedString::from((ix + 1).to_string());
     div()
         .h(gv.line_height)
         .flex()
         .items_center()
-        .justify_end()
         .pl(px(GUTTER_LEFT_PAD_PX))
         .pr(px(GUTTER_RIGHT_PAD_PX))
         .text_color(gv.fg)
         .text_size(gv.font_size)
         .font_family(gv.mono.clone())
-        .when(folded, |this| {
-            this.child(
-                div()
-                    .debug_selector(|| "ce-fold-arrow".into())
-                    .pr(px(2.))
-                    .child("▾"),
-            )
-        })
-        .child(number)
+        .child(
+            div()
+                .debug_selector(|| "ce-gutter-number".into())
+                .flex()
+                .flex_grow(1.0)
+                .justify_end()
+                .items_center()
+                .child(number),
+        )
+        .child(
+            div()
+                .debug_selector(|| "ce-gutter-arrow-slot".into())
+                .w(px(FOLD_ARROW_SLOT_PX))
+                .flex()
+                .items_center()
+                .justify_end()
+                .when(arrow.is_some(), |this| {
+                    let glyph = if arrow == Some(true) { "▸" } else { "▾" };
+                    this.child(
+                        div()
+                            .debug_selector(|| "ce-fold-arrow".into())
+                            .child(glyph),
+                    )
+                }),
+        )
 }
 
 /// 纵向滚动条的「确定性量程」句柄：内容高 = 行数 × 行高（固定），而不用

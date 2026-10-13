@@ -593,6 +593,146 @@ fn gutter_click_on_candidate_creates_fold(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn fold_arrow_state_tracks_candidate_vs_folded(cx: &mut TestAppContext) {
+    // 折叠箭头状态 = 渲染/测试共用的单一权威（`fold_arrow_state`）：
+    // 候选起点 → Some(false)「▾」；点击折叠（test_toggle_fold_at 与 gutter 点击同一
+    // 路径 `toggle_fold_at`）成激活折叠 → Some(true)「▸」；普通行 → None 不画箭头。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(0)),
+        Some(false),
+        "候选起点：下向「▾」"
+    );
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(1)),
+        Some(false),
+        "候选起点：下向「▾」"
+    );
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(2)),
+        None,
+        "普通行：不画箭头"
+    );
+    // 折叠 if 块候选 → 激活折叠 → Some(true)「▸」；外层 fn 仍是候选「▾」。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(1)));
+    settle(cx);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(1)),
+        Some(true),
+        "已折叠首行：右向「▸」"
+    );
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(0)),
+        Some(false),
+        "外层候选不受激活折叠影响：仍「▾」"
+    );
+    // 再次 toggle（同为 start）→ 展开 → 回落为候选「▾」。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(1)));
+    settle(cx);
+    assert_eq!(
+        cx.update(|_, cx| ed.read(cx).test_fold_arrow_state(1)),
+        Some(false),
+        "展开后回落为候选「▾」"
+    );
+}
+
+#[gpui::test]
+fn gutter_fold_arrow_renders_right_of_line_number(cx: &mut TestAppContext) {
+    // 折叠/候选行渲染 `ce-fold-arrow`，且箭头**字形**在固定槽内（槽恒存在、位于
+    // 行号右侧：槽左缘 = 数字格右缘 = 行号锚点）。行号锚点可测信号 = 槽左缘：
+    //   = gutter 右缘 − 右内边距(6) − 槽宽(14)（FOLD_ARROW_SLOT_PX，见 view/mod.rs）。
+    let text = "fn a() {\n    x();\n}";
+    let (host, cx) = open(cx, text);
+    // 打开即有候选起点（未折叠）→ 箭头在槽内右侧。
+    let gutter = cx.debug_bounds("ce-gutter").expect("行号列应渲染");
+    let slot = cx.debug_bounds("ce-gutter-arrow-slot").expect("箭头槽应恒存在");
+    let arrow = cx.debug_bounds("ce-fold-arrow").expect("候选行应渲染折叠箭头");
+    let gutter_right = gutter.origin.x.as_f32() + gutter.size.width.as_f32();
+    let slot_left = slot.origin.x.as_f32();
+    let slot_right = slot_left + slot.size.width.as_f32();
+    assert!(
+        (slot_left - (gutter_right - 6.0 - 14.0)).abs() <= 1.0,
+        "槽左缘（行号锚点）应 = gutter 右缘 − 右内边距 − 槽宽（{slot_left} vs {}）",
+        gutter_right - 6.0 - 14.0
+    );
+    // 箭头字形右对齐在槽内：左缘 ≥ 槽左缘、右缘 ≤ 槽右缘。
+    assert!(
+        arrow.origin.x.as_f32() + 0.5 >= slot_left,
+        "箭头应位于行号右侧的槽内（箭头左缘 {} ≥ 槽左缘 {slot_left}）",
+        arrow.origin.x.as_f32()
+    );
+    assert!(
+        arrow.origin.x.as_f32() + arrow.size.width.as_f32() <= slot_right + 0.5,
+        "箭头不应越出槽右缘"
+    );
+    assert!(
+        slot_right <= gutter_right + 0.5,
+        "箭头槽不应越出 gutter（宽度口径未含槽会被 overflow_hidden 裁掉）"
+    );
+    // 折叠候选 → 激活折叠：箭头仍在（方向「▸/▾」由 fold_arrow_state 保证）。
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(0)));
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-fold-arrow").is_some(),
+        "已折叠行应仍渲染折叠箭头"
+    );
+}
+
+#[gpui::test]
+fn gutter_fold_arrow_keeps_number_anchor(cx: &mut TestAppContext) {
+    // 回归锁（用户真机：行号被箭头左推、带/不带箭头行错位）：折叠切换前后
+    // 数字右缘锚点（= 箭头槽左缘）必须纹丝不动（±1px）。修复前 `justify_end`
+    // 把「行号+箭头」整组右对齐 → 有箭头行数字被左推（实测 diff 10px）。
+    let text = "fn a() {\n    x();\n}";
+    let (host, cx) = open(cx, text);
+    let anchor0 = cx
+        .debug_bounds("ce-gutter-arrow-slot")
+        .expect("箭头槽应恒存在")
+        .origin
+        .x
+        .as_f32();
+    let num0 = cx.debug_bounds("ce-gutter-number").expect("数字格应渲染");
+    let num_right0 = num0.origin.x.as_f32() + num0.size.width.as_f32();
+    assert!(
+        (num_right0 - anchor0).abs() <= 1.0,
+        "数字右缘应钉在槽左缘（{num_right0} vs {anchor0}）"
+    );
+    // 折叠候选 → 激活折叠（箭头仍在，方向从「▾」→「▸」）。
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(0)));
+    settle(cx);
+    let anchor1 = cx
+        .debug_bounds("ce-gutter-arrow-slot")
+        .expect("箭头槽仍恒存在")
+        .origin
+        .x
+        .as_f32();
+    let num1 = cx.debug_bounds("ce-gutter-number").expect("数字格仍渲染");
+    let num_right1 = num1.origin.x.as_f32() + num1.size.width.as_f32();
+    assert!(
+        (anchor1 - anchor0).abs() <= 1.0,
+        "折叠切换前后行号锚点应不变（{anchor0} → {anchor1}）"
+    );
+    assert!(
+        (num_right1 - num_right0).abs() <= 1.0,
+        "折叠切换前后数字右缘应不变（{num_right0} → {num_right1}）"
+    );
+}
+
+#[gpui::test]
+fn gutter_fold_arrow_absent_on_plain_rows(cx: &mut TestAppContext) {
+    // 无折叠候选、无激活折叠的普通文档：不渲染任何折叠箭头（槽仍占位但空着）。
+    let (_host, cx) = open(cx, "aaa\nbbb\nccc");
+    assert!(
+        cx.debug_bounds("ce-fold-arrow").is_none(),
+        "无可折叠行时不应渲染折叠箭头"
+    );
+}
+
+#[gpui::test]
 fn ruler_infra_renders_but_defaults_off(cx: &mut TestAppContext) {
     // margin guide 默认关闭（EDITOR_RULER_COLUMNS 为空）：叠层容器仍渲染、无竖线子元素；
     // 坐标换算（第 80 列在可视区内应给 Some(x)）保持精确，供用户配置恢复使用。
