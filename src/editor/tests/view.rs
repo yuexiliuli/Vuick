@@ -1544,4 +1544,182 @@ fn live_replay_guard_never_mutates_on_drift(cx: &mut TestAppContext) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Wave2-S1：折叠候选 / 括号配对后台**增量**刷新（受影响段局部重扫 + 尾部平移）
+// ---------------------------------------------------------------------------
+
+/// 对拍 oracle：对当前文本跑整篇扫描，返回按 `start` / `open_line` 排序的
+/// fold 候选 / 括号配对（与视图落地口径一致）。
+fn full_scan_oracle(text: &str) -> (Vec<Fold>, Vec<crate::editor::fold::BracketPair>) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let n = lines.len();
+    let mut folds = crate::editor::fold::scan_fold_candidates(
+        |i: usize| {
+            lines
+                .get(i)
+                .map(|s| gpui::SharedString::from(*s))
+                .unwrap_or_else(|| gpui::SharedString::new_static(""))
+        },
+        n,
+    );
+    folds.sort_by_key(|f| f.start);
+    let mut pairs = crate::editor::fold::scan_bracket_pairs(
+        |i: usize| {
+            lines
+                .get(i)
+                .map(|s| gpui::SharedString::from(*s))
+                .unwrap_or_else(|| gpui::SharedString::new_static(""))
+        },
+        n,
+    );
+    pairs.sort_by_key(|p| p.open_line);
+    (folds, pairs)
+}
+
+/// 断言当前编辑器的 fold 候选 / 括号配对与整篇扫描逐位一致（对拍）。
+fn assert_scan_parity(host: &Entity<Host>, cx: &mut VisualTestContext) {
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        let cands = ed.test_fold_candidates().to_vec();
+        let pairs = ed.test_bracket_pairs().to_vec();
+        let text = ed.text_string();
+        let (ef, ep) = full_scan_oracle(&text);
+        assert_eq!(cands, ef, "折叠候选与整篇扫描不一致（text={text:?}）");
+        assert_eq!(pairs, ep, "括号配对与整篇扫描不一致（text={text:?}）");
+    });
+}
+
+/// 等待后台折叠候选/括号配对扫描落地：先强制渲染一帧让 render 把 `scan_dirty_edit`
+/// 挂起的扫描真正 spawn，再用时钟推进 + 毫秒级 sleep 多泵几轮（测试执行器的后台
+/// 线程需真实时间，`run_until_parked` 恒零时间不够），在途任务（`scan_inflight`）
+/// 结束即返回；无在途任务直接返回。
+#[gpui::test]
+fn structural_edits_update_fold_brackets_incrementally(cx: &mut TestAppContext) {
+    // 结构编辑/删除后：折叠候选与括号配对经**增量**刷新（受影响段局部重扫 + 尾部
+    // 平移）落地，结果与整篇扫描逐位一致；且确实走增量路径（非 O(全文) 整篇兜底）。
+    // 刷新用测试**同步**落地入口 `test_scan_sync_land`（与后台刷新共用同一计算函数
+    // `compute_fold_brackets`；后台调度的异步链路另由 `async_refresh_lands_incrementally`
+    // 冒烟覆盖）。注意：`test_scan_sync_land` 必须与编辑同一 `ed.update` 闭包内调用，
+    // 否则测试执行器会在语句间自动渲染、先行消费 `scan_dirty_edit`。
+    let text = "fn a() {\n    let x = {\n        y,\n    };\n    z();\n}\nfn b() {\n    w();\n}";
+    let (host, cx) = open(cx, text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 打开时同步整篇扫描即对拍基准。
+    assert_scan_parity(&host, cx);
+
+    // 编辑 1：`z();` 行首插入换行 + 更深缩进的新 if 块（净 +2 行、新 brace）。
+    cx.update(|_, cx| {
+        ed.update(cx, |ed, cx| {
+            let off = ed.offset_for_line_col(4, 0);
+            ed.set_caret_to(off);
+            ed.insert_text("\n    if ok {\n        q();\n    }", cx);
+            assert!(ed.test_scan_sync_land(), "结构插入应走增量路径");
+        })
+    });
+    assert_scan_parity(&host, cx);
+
+    // 编辑 2：删掉整个 if 块（多行删除，净 −3）——走真实编辑主链（apply_edit_synced）。
+    cx.update(|_, cx| {
+        ed.update(cx, |ed, _| {
+            let (a, b) = (ed.offset_for_line_col(5, 0), ed.offset_for_line_col(8, 0));
+            ed.apply_replaces(&[(a..b, String::new())]);
+            assert!(ed.test_scan_sync_land(), "多行删除应走增量路径");
+        })
+    });
+    assert_scan_parity(&host, cx);
+
+    let (inc, full) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_scan_landings());
+    assert!(
+        inc >= 2 && full <= 1,
+        "结构编辑应走增量路径而非整篇兜底（inc={inc} full={full}）"
+    );
+}
+
+/// 泵空测试执行器里的后台异步任务（真实应用由 RAF/notify + OS 事件循环持续驱动；
+/// 测试执行器对 render 内 `cx.spawn` 轮询不足 → 用时钟推进 + 毫秒级 sleep 兜底，
+/// 与仓库其它异步模块（pdf/video/image）同款挠法）。
+fn pump_async(cx: &mut VisualTestContext) {
+    for _ in 0..40 {
+        cx.executor().advance_clock(std::time::Duration::from_millis(16));
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn undo_redo_keep_fold_brackets_parity_and_incremental(cx: &mut TestAppContext) {
+    // undo/redo（文档行数变化路径）同样登记受影响行段：增量刷新落地后与整篇扫描
+    // 一致；激活折叠在编辑后保持合理（FoldMap 平移/展开不越界）。
+    let text = "fn a() {\n    let x = {\n        y,\n    };\n    z();\n}\nfn b() {\n    w();\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let w = window_handle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 预置一个激活折叠 [1,5)（fn a 体）→ 编辑后折叠状态仍合理。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_set_fold(1, 5)));
+    settle(cx);
+
+    // 结构编辑：`z();` 行首插入换行 + 一行（同一闭包内同步增量落地）。
+    cx.update(|_, cx| {
+        ed.update(cx, |ed, cx| {
+            let off = ed.offset_for_line_col(4, 0);
+            ed.set_caret_to(off);
+            ed.insert_text("\n    q();", cx);
+            assert!(ed.test_scan_sync_land(), "结构编辑应走增量路径");
+        })
+    });
+    assert_scan_parity(&host, cx);
+    // 编辑进折叠体 → 该折叠被展开（FoldMap.sync_edit），不得残留越界区间。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.read(cx);
+        for f in ed.test_folds().folds() {
+            assert!(
+                f.start < f.end && f.end <= ed.text_string().split('\n').count(),
+                "折叠区间越界：{f:?}"
+            );
+        }
+    });
+
+    // 撤销（键盘路径 → render 起后台异步增量刷新）→ 对拍仍一致。
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-z").unwrap());
+    pump_async(cx);
+    assert_scan_parity(&host, cx);
+
+    // 重做 → 对拍仍一致。
+    cx.dispatch_keystroke(w, Keystroke::parse("ctrl-y").unwrap());
+    pump_async(cx);
+    assert_scan_parity(&host, cx);
+
+    let (inc, full) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_scan_landings());
+    assert!(
+        inc >= 3 && full <= 1,
+        "编辑 + 撤销 + 重做都应走增量路径（inc={inc} full={full}）"
+    );
+}
+
+/// 后台异步刷新链路冒烟：一次结构编辑后，`cx.spawn` + `background_executor` + 落地
+/// 通知的全链路在真实渲染帧驱动下能增量落地（首帧即与整篇扫描一致）。测试执行器
+/// 只可靠轮询**首个** render 内 spawn 的任务（后续轮的轮询属观测器材性，已由同步
+/// 落地入口覆盖），真实应用由 OS 事件循环持续驱动、无此问题。
+#[gpui::test]
+fn async_refresh_lands_incrementally(cx: &mut TestAppContext) {
+    let text = "fn a() {\n    let x = {\n        y,\n    };\n}\nfn b() {\n    w();\n}";
+    let (host, cx) = open(cx, text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 结构编辑：`x();` 后插入换成 + 更深块。
+    cx.update(|_, cx| {
+        ed.update(cx, |ed, cx| {
+            let off = ed.offset_for_line_col(2, 0);
+            ed.set_caret_to(off);
+            ed.insert_text("\n        q();\n    }\n    r();\n}\nfn c() {", cx);
+        })
+    });
+    settle(cx);
+    // 渲染驱动下增量落地已就绪（对拍整篇扫描）且确实走了增量路径。
+    assert_scan_parity(&host, cx);
+    let (inc, full) = cx.update(|_, cx| host.read(cx).ed.read(cx).test_scan_landings());
+    assert!(inc >= 1, "异步后台刷新应走增量路径（inc={inc} full={full}）");
+}
+
 
