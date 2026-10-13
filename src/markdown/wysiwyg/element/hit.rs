@@ -85,10 +85,15 @@ pub(crate) fn caret_geometry(editor: &WyEditor, f: &Frame) -> (bool, Pixels, Pix
             .get(text_band_at(r, f32::from(p.y)))
             .copied()
             .unwrap_or(px(0.));
+        // 标题行（`r.lh` = heading_line > 正文行高 `f.line_h`）文本在行盒内垂直居中
+        // （`paint_text_row` 以 `row.lh` 排版），光标条高固定 `f.line_h` → 锚顶会偏上：
+        // 把光标 top 下移 `(r.lh − f.line_h)/2`（钳 ≥0）使竖条在行盒内垂直居中。
+        // 正文/引述/code 等 `lh ≤ f.line_h` 的行偏移 =0，行为完全不变。
+        let caret_shift = ((f32::from(r.lh) - f32::from(f.line_h)) / 2.).max(0.);
         return (
             true,
             f.padding + r.x_off + aln + p.x,
-            r.top + px(text_y_off(r) + text_row_shift(r)) + p.y,
+            r.top + px(text_y_off(r) + text_row_shift(r)) + p.y + px(caret_shift),
         );
     }
     // 带外（caret 所在块未物化 = 屏外）：用紧凑布局 `tops` 兜底定位，不画光标
