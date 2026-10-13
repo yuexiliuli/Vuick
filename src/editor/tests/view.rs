@@ -733,6 +733,87 @@ fn gutter_fold_arrow_absent_on_plain_rows(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn folded_row_highlight_bg_tracks_fold_state(cx: &mut TestAppContext) {
+    // 已折叠行的整行背景 `ce-fold-row-bg`：折叠激活后出现在折叠首行；候选（未
+    // 折叠）行与普通行都没有。用 test_toggle_fold_at 走「候选未折叠 → 折叠 →
+    // 展开」三态，断言背景随折叠出现/消失。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 候选未折叠：候选行（line 0/1）与普通行都不渲染折叠背景。
+    assert!(
+        cx.debug_bounds("ce-fold-row-bg").is_none(),
+        "候选未折叠时不渲染折叠行背景"
+    );
+    // 折叠 if 块候选（line 1）→ 激活折叠 → 折叠首行出现背景，且铺满整行（高 = 行高）。
+    // `test_toggle_fold_at` 不比真机 gutter 点击（聚焦自带 notify）——显式 notify 让
+    // 下一帧按折叠态重建行元素（与 `fold_arrow_state` 渲染/测试同口径）。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(1)));
+    cx.update(|_, cx| ed.update(cx, |_, cx| cx.notify()));
+    settle(cx);
+    let bg = cx
+        .debug_bounds("ce-fold-row-bg")
+        .expect("已折叠首行应渲染整行背景");
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    assert!(
+        (bg.size.height.as_f32() - lh).abs() < 1.0,
+        "背景应铺满整行（高 {} vs 行高 {lh}）",
+        bg.size.height.as_f32()
+    );
+    // 再次 toggle（同 start）→ 展开 → 背景消失。
+    cx.update(|_, cx| ed.update(cx, |ed, _| ed.test_toggle_fold_at(1)));
+    cx.update(|_, cx| ed.update(cx, |_, cx| cx.notify()));
+    settle(cx);
+    assert!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_folds().folds().is_empty()),
+        "再次 toggle 后折叠应已展开"
+    );
+    assert!(
+        cx.debug_bounds("ce-fold-row-bg").is_none(),
+        "展开后折叠背景应消失"
+    );
+}
+
+#[gpui::test]
+fn fold_row_bg_fainter_than_selection_bg_both_themes(cx: &mut TestAppContext) {
+    // 折叠底色与选区底色同源 `colors.accent` 导出；锁「折叠比选区淡」且两主题
+    // 各自落到约定档位（dark 0.16<0.40 / light 0.10<0.28，约选区一半不到）。
+    let (host, cx) = open(cx, "a\nb");
+    let read_alpha = |host: &Entity<Host>, cx: &mut VisualTestContext| -> (f32, f32) {
+        cx.update(|_, cx| {
+            let (sel, fold) = host.read(cx).ed.read(cx).test_sel_and_fold_bg();
+            (sel.a, fold.a)
+        })
+    };
+    // 未初始化主题默认 Light。
+    let (l_sel, l_fold) = read_alpha(&host, cx);
+    assert!(
+        l_fold < l_sel,
+        "亮底：折叠应比选区淡（{l_fold} < {l_sel}）"
+    );
+    assert!(
+        (l_sel - 0.28).abs() < 1e-4 && (l_fold - 0.10).abs() < 1e-4,
+        "亮底档位：选区 0.28 / 折叠 0.10（实测 {l_sel}/{l_fold}）"
+    );
+    // 切暗 → 重渲染后读回。
+    cx.update(|_, cx| {
+        crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx)
+    });
+    settle(cx);
+    let (d_sel, d_fold) = read_alpha(&host, cx);
+    assert!(
+        d_fold < d_sel,
+        "暗底：折叠应比选区淡（{d_fold} < {d_sel}）"
+    );
+    assert!(
+        (d_sel - 0.40).abs() < 1e-4 && (d_fold - 0.16).abs() < 1e-4,
+        "暗底档位：选区 0.40 / 折叠 0.16（实测 {d_sel}/{d_fold}）"
+    );
+}
+
+#[gpui::test]
 fn ruler_infra_renders_but_defaults_off(cx: &mut TestAppContext) {
     // margin guide 默认关闭（EDITOR_RULER_COLUMNS 为空）：叠层容器仍渲染、无竖线子元素；
     // 坐标换算（第 80 列在可视区内应给 Some(x)）保持精确，供用户配置恢复使用。

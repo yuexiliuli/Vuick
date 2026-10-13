@@ -67,6 +67,7 @@ impl Render for CodeEditor {
             font_size: self.font_size,
             caret_color: self.caret_color,
             fold_color: self.gutter_fg,
+            fold_bg: self.fold_bg,
         };
         let rv = std::rc::Rc::new(rv);
         let list_state = self.list_state.clone();
@@ -612,6 +613,13 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
         // 永远只增不减、正常情况下不会），也绝不把溢出文本画到下一行去（否则行号
         // 错位、点击/光标重叠）。
         .overflow_hidden()
+        // 已折叠行的整行底色：直接上到行盒（文本/光标/「…」是子元素、画在其上），
+        // `w_full` 铺满该行内容宽；横向滚动溢出的部分由 harea/本行 overflow_hidden
+        // 裁掉，符合「一眼认出折叠位置」的直觉。
+        .when(rd.folded.is_some(), |this| {
+            this.debug_selector(|| "ce-fold-row-bg".into())
+                .bg(rv.fold_bg)
+        })
         .child(
             div()
                 .absolute()

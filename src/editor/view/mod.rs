@@ -253,6 +253,8 @@ struct RowView {
     caret_color: Hsla,
     /// 折叠指示器/「…」等次要文字色。
     fold_color: Hsla,
+    /// 已折叠行整行底色（比选区淡，见 `refresh_metrics`）。
+    fold_bg: Hsla,
 }
 
 /// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
@@ -325,6 +327,8 @@ pub struct CodeEditor {
     fg: Hsla,
     gutter_fg: Hsla,
     sel_bg: Hsla,
+    /// 已折叠行的整行底色（`colors.accent` 派生、比选区淡，见 `refresh_metrics`）。
+    fold_bg: Hsla,
     caret_color: Hsla,
 
     // —— IME ——
@@ -459,6 +463,7 @@ impl CodeEditor {
             fg: rgb(0x000000).into(),
             gutter_fg: rgb(0x9aa0a6).into(),
             sel_bg: rgb(0xd0d7de).into(),
+            fold_bg: rgb(0xd0d7de).into(),
             caret_color: rgb(0x000000).into(),
             marked_range: None,
             last_edit: None,
@@ -1108,6 +1113,10 @@ impl CodeEditor {
         self.caret_color = colors.fg.into();
         // 选区底色用主题强调蓝（与括号点亮、标题/菜单高亮同源单点出口，改调色板只动 theme）。
         self.sel_bg = colors.accent.opacity(if dark { 0.4 } else { 0.28 }).into();
+        // 已折叠行的整行底色：与选区同源 accent，但 alpha 明显更淡（dark≈0.16 /
+        // light≈0.10，约为选区 0.4/0.28 的一半不到）——一眼认出折叠位置、又绝不
+        // 喧宾夺主，明/暗两主题下都肉眼可辨（锁「比选区淡」的回归见 tests/view.rs）。
+        self.fold_bg = colors.accent.opacity(if dark { 0.16 } else { 0.10 }).into();
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
@@ -1821,6 +1830,12 @@ impl CodeEditor {
     /// 测试用：`line` 行的折叠箭头状态（与渲染同口径的单一权威，见 [`Self::fold_arrow_state`]）。
     pub(crate) fn test_fold_arrow_state(&self, line: usize) -> Option<bool> {
         self.fold_arrow_state(line)
+    }
+
+    /// 测试用：选区底色与折叠行底色快照 `(sel_bg, fold_bg)`（`refresh_metrics` 里
+    /// 同一 `colors.accent` 导出的两档 alpha，锁「折叠比选区淡」的回归）。
+    pub(crate) fn test_sel_and_fold_bg(&self) -> (Hsla, Hsla) {
+        (self.sel_bg, self.fold_bg)
     }
 
     /// 测试用：光标行折叠切换（gutter 点击同路径）。
