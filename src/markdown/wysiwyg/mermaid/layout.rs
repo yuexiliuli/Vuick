@@ -625,7 +625,7 @@ fn route_edges(
     for (a, b, kind, label) in chain {
         let pa = &placed[*a];
         let pb = &placed[*b];
-        let (pts, label_anchor) = if vertical_flow {
+        let pts = if vertical_flow {
             let (ay0, by0) = if pb.y + pb.h <= pa.y {
                 (pa.y, pb.y + pb.h) // BT：B 在 A 之上，A 顶出、B 底进
             } else {
@@ -635,12 +635,9 @@ fn route_edges(
             let bx = pb.x + pb.w / 2.;
             let mid_y = (ay0 + by0) / 2.;
             if (bx - ax).abs() < 4. {
-                (vec![(ax, ay0), (bx, by0)], Some(((ax + bx) / 2., mid_y)))
+                vec![(ax, ay0), (bx, by0)]
             } else {
-                (
-                    vec![(ax, ay0), (ax, mid_y), (bx, mid_y), (bx, by0)],
-                    Some(((ax + bx) / 2., mid_y)),
-                )
+                vec![(ax, ay0), (ax, mid_y), (bx, mid_y), (bx, by0)]
             }
         } else {
             let (ax0, bx0) = if pb.x + pb.w <= pa.x {
@@ -652,12 +649,9 @@ fn route_edges(
             let by = pb.y + pb.h / 2.;
             let mid_x = (ax0 + bx0) / 2.;
             if (by - ay).abs() < 4. {
-                (vec![(ax0, ay), (bx0, by)], Some((mid_x, (ay + by) / 2.)))
+                vec![(ax0, ay), (bx0, by)]
             } else {
-                (
-                    vec![(ax0, ay), (mid_x, ay), (mid_x, by), (bx0, by)],
-                    Some((mid_x, (ay + by) / 2.)),
-                )
+                vec![(ax0, ay), (mid_x, ay), (mid_x, by), (bx0, by)]
             }
         };
         let branch = out_t.get(a).map_or(0, Vec::len) >= 2;
@@ -712,11 +706,34 @@ fn route_edges(
         // 尾部收短而变）——「线到基部、箭头到节点」双连接修复的 layout 侧落点。
         let base = arrow_base(*pts.last().unwrap(), arrow_dir, ARROW_LEN_PX);
         let smoothed = smoothed_edge(g.direction, *kind, &pts, branch, Some(tgt_w), q_max, Some(base));
-        // 弧线（smoothed=12 点）弓起后中点偏离骨架中线 → 标签锚点改取曲线中点，
-        // 断线盒仍盖住连线；圆角肘/直线仍用原路径中点（骨架中线）。
-        let label_anchor = match &smoothed {
-            Some(sm) if sm.len() == 12 => Some(sm[sm.len() / 2]),
-            _ => label_anchor,
+        // 标签锚点 = **可见线（绘制折线）按弧长的真实中点**：绘制折线 = smoothed（无则
+        // 骨架），有箭头时末点回缩到箭头基部、双向源端再回缩一个箭头长（与 paint
+        // `edge_draw_points` 同式同常量，「线到基部、箭头到节点」的可见线）。旧取弧线
+        // t=0.5 参数中点 `sm[len/2]`——二次贝塞尔 t 均匀采样弧速不等，用户例图实测该点落
+        // 在弧的 69~74%（B→C 距基部仅 ~19px），开口偏向目标端、箭头基部被文字开口吞掉
+        // → 尾段（tail）缺失；改为按折线累计弧长一半处线性插值定位**真中点**，head/tail
+        // 两分支对称、文字居中。直边同理从「骨架中点」改为「P0→基部中点」（直边末段回缩
+        // 一个箭头长，骨架中点偏源端约半箭头长）。
+        let label_anchor = {
+            let src: &Vec<(f32, f32)> = smoothed.as_ref().unwrap_or(&pts);
+            let mut draw = src.clone();
+            if matches!(
+                *kind,
+                MmEdgeKind::Arrow
+                    | MmEdgeKind::DottedArrow
+                    | MmEdgeKind::ThickArrow
+                    | MmEdgeKind::BothArrow
+                    | MmEdgeKind::BothThick
+            ) {
+                *draw.last_mut().unwrap() = base;
+                if matches!(*kind, MmEdgeKind::BothArrow | MmEdgeKind::BothThick) {
+                    let (a, b) = (draw[0], draw[1]);
+                    let l = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-3);
+                    let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+                    draw[0] = (a.0 + ARROW_LEN_PX * ux, a.1 + ARROW_LEN_PX * uy);
+                }
+            }
+            Some(polyline_midpoint(&draw))
         };
         edges_out.push(MmPolylineEdge { a: *a, b: *b, kind: *kind, points: pts, smoothed, label: label_anchor, label_text: label.clone(), arrow_dir });
     }
@@ -853,6 +870,33 @@ fn pt_len(a: (f32, f32), b: (f32, f32)) -> f32 {
     let dx = b.0 - a.0;
     let dy = b.1 - a.1;
     (dx * dx + dy * dy).sqrt()
+}
+
+/// 折线按**弧长**的中点（累计段长到一半处，在所在段内线性插值）——「连线中段」标签锚点。
+/// 二次贝塞尔 t=0.5 参数中点 ≠ 弧长中点（t 均匀采样下弧速不等，用户例图 `sm[6]` 落在弧的
+/// ~70% 处、偏目标端）；折线弧长插值才得到真实连线中点。`pts` 即可见绘制折线（末点已回缩
+/// 到箭头基部）。
+fn polyline_midpoint(pts: &[(f32, f32)]) -> (f32, f32) {
+    if pts.is_empty() {
+        return (0., 0.);
+    }
+    if pts.len() == 1 {
+        return pts[0];
+    }
+    let total: f32 = pts.windows(2).map(|w| pt_len(w[0], w[1])).sum();
+    let mut target = total / 2.;
+    for w in pts.windows(2) {
+        let d = pt_len(w[0], w[1]);
+        if d < 1e-9 {
+            continue;
+        }
+        if target <= d {
+            let t = target / d;
+            return (w[0].0 + (w[1].0 - w[0].0) * t, w[0].1 + (w[1].1 - w[0].1) * t);
+        }
+        target -= d;
+    }
+    *pts.last().unwrap()
 }
 
 /// 正交肘圆角：对骨架每个内角切掉 rk，用切点 A/B + 控制点=Pk 的二次贝塞尔 8 点采样
@@ -1222,8 +1266,10 @@ mod tests {
         assert_eq!((e.a, e.b), (0, 1));
         // B 在 A 之下：A 底(50)出、B 顶(80)进，中转折 65 → 4 点直角折线。
         assert_eq!(e.points, vec![(30., 50.), (30., 65.), (90., 65.), (90., 80.)]);
-        // 标签锚点居中路径中点（肘边水平段中点）。
-        assert_eq!(e.label, Some((60., 65.)));
+        // 标签锚点 = 可见线（末点已回缩到箭头基部 (90,71)）按弧长的中点——肘边水平段
+        // 中点 (60,65) 偏源端半箭头长，真中点在 (55.5,65)。
+        let lab = e.label.expect("应带标签锚点");
+        assert!((lab.0 - 55.5).abs() < 1e-3 && (lab.1 - 65.).abs() < 1e-3, "TB 肘边标签应在可见线中点：{lab:?}");
         assert_eq!(e.kind, MmEdgeKind::Arrow);
         // 4 点肘 → 圆角密点已缓存在 smoothed，首尾锚定与骨架一致。
         let sm = e.smoothed.as_ref().expect("4 点肘应产出 smoothed");
@@ -1244,8 +1290,10 @@ mod tests {
         let e = &edges[0];
         // 水平流：A 右(50)出、B 左(70)进；A/B 纵中线 35/95 差大 → 中转折 60。
         assert_eq!(e.points, vec![(50., 35.), (60., 35.), (60., 95.), (70., 95.)]);
-        // 标签锚点居中路径中点（肘边竖段中点）。
-        assert_eq!(e.label, Some((60., 65.)));
+        // 标签锚点 = 可见线（末点已回缩到箭头基部 (61,95)）按弧长的中点——竖直段中点
+        // (60,65) 偏源端半箭头长，真中点在 (60,62.5)。
+        let lab = e.label.expect("应带标签锚点");
+        assert!((lab.0 - 60.).abs() < 1e-3 && (lab.1 - 62.5).abs() < 1e-3, "LR 肘边标签应在可见线中点：{lab:?}");
     }
 
     /// 弧线「无拐点」判据：对弧线采样点按「行进方向」对直线弦取横向（外侧）偏距，
@@ -1520,6 +1568,152 @@ mod tests {
         }
     }
 
+    /// 边标签「无盒纯文字 + 连线文字处开口 + **连线中段居中**」端到端回归（用户例图）：真实
+    /// `route_edges` 的分支弧线（B→C「是」、B→D「否」）用 [paint 同式 `split_poly_at_rect`] 对
+    /// **绘制折线**（已回缩到箭头基部，与 `paint_edge` 同几何）开口——标签锚点 = 绘制折线按
+    /// **弧长的真实中点**（旧 `sm[6]` 为 t=0.5 参数中点、实测落在弧的 ~70% 处偏目标端、开口
+    /// 吞掉箭头基部 → tail=None；改弧长中点后严格居中）：标签到源端弧长 ≈ 到基部弧长、
+    /// **head 与 tail 两分支都非空**（线从两侧进出开口、标记中间）、文字矩形内无线段采样点
+    /// （margin 达标）、矩形到箭头基部间距 ≥ 箭头长（文字不贴箭头/节点）；断点精确落矩形
+    /// 边界；同时锁「破盒」：缺口宽（tw+2·margin）< 旧断线盒宽（tw+12），纯文字无盒背景。
+    #[test]
+    fn edge_label_gap_clears_text_on_user_arc_branches() {
+        let g = crate::markdown::wysiwyg::mermaid_graph("graph TD\nA[开始]-->B{判断}\nB-->|是|C[完成]\nB-->|否|D[返回 A]");
+        let fe = flow_elements(&g);
+        let order = barycenter_order(&fe.elements, &fe.virtual_layers, &fe.layer_of, &fe.chain, fe.n_layers);
+        let w = |lab: &str| lab.chars().count() as f32 * 8. + 2. * MM_NODE_XPAD;
+        let sizes = FlowSizes {
+            cw: fe.elements.iter().map(|(_, l, _)| w(l)).collect(),
+            ch: vec![MM_NODE_H; fe.elements.len()],
+            widths: fe.elements.iter().map(|(_, l, _)| w(l)).collect(),
+            virtual_flag: vec![false; fe.elements.len()],
+        };
+        let geom = flow_positions(&g, &fe.elements, &order, sizes, 0., 800.);
+        let placed: Vec<MmPlaced> = fe
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(i, (id, lab, shp))| MmPlaced {
+                id: id.clone(),
+                label: lab.clone(),
+                shape: *shp,
+                x: geom.cx[i] - geom.cw[i] / 2.,
+                y: geom.cy[i],
+                w: geom.cw[i],
+                h: geom.ch[i],
+                fill: None,
+                stroke: None,
+                stroke_width: None,
+                accent_idx: None,
+                virtual_node: false,
+            })
+            .collect();
+        let edges = route_edges(&g, &fe.chain, &placed);
+        let edge = |from: &str, to: &str| {
+            let f = fe.elements.iter().position(|(id, _, _)| id == from).unwrap();
+            let t = fe.elements.iter().position(|(id, _, _)| id == to).unwrap();
+            edges.iter().find(|e| e.a == f && e.b == t).unwrap()
+        };
+        let dist_pt_rect = |p: (f32, f32), x0: f32, y0: f32, x1: f32, y1: f32| -> f32 {
+            let dx = if p.0 < x0 { x0 - p.0 } else if p.0 > x1 { p.0 - x1 } else { 0. };
+            let dy = if p.1 < y0 { y0 - p.1 } else if p.1 > y1 { p.1 - y1 } else { 0. };
+            (dx * dx + dy * dy).sqrt()
+        };
+        let z = 1.;
+        let margin = 2.5 * z;
+        for (f, t, lab) in [("B", "C", "是"), ("B", "D", "否")] {
+            let e = edge(f, t);
+            assert_eq!(e.label_text.as_deref(), Some(lab), "{f}→{t} 应带标签 {lab}");
+            // 无窗口：文字盒宽按 CJK 近似（1 字 ≈ 1em = 12·z，与 measure 的 12·z 同档）——
+            // 真实 measuring 只影响开口尺寸的绝对值，不改变「分叉不穿字」的几何断言。
+            let tw = lab.chars().count() as f32 * 12. * z;
+            let th = 14. * z;
+            let (lx, ly) = e.label.expect("分支边应带标签锚点");
+            // 复刻 paint：smoothed 弧线密点 + 末点回缩到箭头基部（tip=逻辑锚点）→ 绘制折线。
+            let sm = e.smoothed.as_ref().expect("分支弧线");
+            let host: Vec<(f32, f32)> = sm.iter().copied().collect();
+            let tip = *e.points.last().unwrap();
+            let draw = super::super::paint::edge_draw_points(e, &host, tip, z);
+            let base = arrow_base(tip, e.arrow_dir, ARROW_LEN_PX * z);
+            assert!(
+                dist_pt_rect(*draw.last().unwrap(), base.0 - 1e-3, base.1 - 1e-3, base.0 + 1e-3, base.1 + 1e-3) < 1e-3,
+                "{f}→{t} 绘制线末点应回缩到箭头基部（与 paint 同几何）",
+            );
+            // 文字矩形（无 margin）+ 开口矩形（文字外扩 margin），与 paint_edge 同式。
+            let cx = lx;
+            let cy = ly + th / 2.;
+            let (tx0, ty0, tx1, ty1) = (cx - tw / 2., cy - th / 2., cx + tw / 2., cy + th / 2.);
+            let (head, tail) = super::super::paint::split_poly_at_rect(&draw, tx0 - margin, ty0 - margin, tx1 + margin, ty1 + margin);
+            let (gx0, gy0, gx1, gy1) = (tx0 - margin, ty0 - margin, tx1 + margin, ty1 + margin);
+            assert!(!head.is_empty(), "{f}→{t} head 不应空");
+            // 断点精确落开口矩形边界（不是采样毛糙）：head 末点 / tail 首点到开口矩形距离 ≈ 0。
+            let d_gap_h = dist_pt_rect(*head.last().unwrap(), gx0, gy0, gx1, gy1);
+            assert!(d_gap_h < 0.1, "{f}→{t} head 末点应在开口矩形边界，实测距边界 {d_gap_h:.3}");
+            // **中段回归**：标签中心 = 可见线按弧长的真实中点 ⇒ head 与 tail 两分支必须都
+            // 非空（线从两侧进出开口、标记中间；旧 t=0.5 参数中点偏目标端曾把尾段吞掉）。
+            let tt = tail.expect("{f}→{t} 标签居中后尾段必须存在（线从两侧进出开口）");
+            assert!(tt.len() >= 2, "{f}→{t} tail 不应坍缩成单点：{tt:?}");
+            let d_gap_t = dist_pt_rect(tt[0], gx0, gy0, gx1, gy1);
+            assert!(d_gap_t < 0.1, "{f}→{t} tail 首点应在开口矩形边界，实测距边界 {d_gap_t:.3}");
+            // 尾段续到绘制折线终点（= 箭头基部，与 paint 同几何）。
+            assert_eq!(tt.last(), draw.last(), "{f}→{t} tail 应续到绘制折线终点（箭头基部）");
+            // **弧长中点断言**：把标签锚点投影到绘制折线，得到其弧长位置 s；标签到源端距离
+            // ≈ 到基部距离，容差 ≤ max(6·z, 全长·10%)。
+            let mut acc = 0.;
+            for w in draw.windows(2) {
+                acc += pt_len(w[0], w[1]);
+            }
+            let mut s = acc;
+            {
+                let mut cum = 0.;
+                for w in draw.windows(2) {
+                    let d = pt_len(w[0], w[1]);
+                    let denom = (d * d).max(1e-9);
+                    let tt0 = (((lx - w[0].0) * (w[1].0 - w[0].0) + (ly - w[0].1) * (w[1].1 - w[0].1)) / denom).clamp(0., 1.);
+                    let px = w[0].0 + (w[1].0 - w[0].0) * tt0;
+                    let py = w[0].1 + (w[1].1 - w[0].1) * tt0;
+                    let dd = ((lx - px).powi(2) + (ly - py).powi(2)).sqrt();
+                    if dd < 1e-3 {
+                        s = cum + d * tt0;
+                        break;
+                    }
+                    cum += d;
+                }
+            }
+            let to_src = s;
+            let to_base = acc - s;
+            let tol = (6. * z).max(acc * 0.10);
+            assert!(
+                (to_src - to_base).abs() <= tol,
+                "{f}→{t} 标签应居中于连线弧长中点：to_src={to_src:.2} to_base={to_base:.2} |差|={:.2} > 容差 {tol:.2}（旧 sm[6]≈70% 偏向目标端）",
+                (to_src - to_base).abs(),
+            );
+            // 验收口径「文字矩形四边到最近线段/采样点距离 ≥ margin」：head/tail 全部点
+            // 到文字矩形最近距离不小于 margin（线在文字两侧断开、不穿字）。
+            let mut min_d = f32::INFINITY;
+            for p in head.iter().chain(tt.iter()) {
+                min_d = min_d.min(dist_pt_rect(*p, tx0, ty0, tx1, ty1));
+            }
+            assert!(min_d >= margin - 1e-3, "{f}→{t} 文字矩形到最近采样点 {min_d:.3} < margin {margin}");
+            // **箭头基部间距**：文字矩形到箭头基部（绘制折线终点）≥ 一个箭头长——文字不贴
+            // 箭头/节点边。
+            let base_d_text = dist_pt_rect(*draw.last().unwrap(), tx0, ty0, tx1, ty1);
+            assert!(
+                base_d_text >= ARROW_LEN_PX * z,
+                "{f}→{t} 文字矩形到箭头基部 {base_d_text:.2} < 箭头长 {ARROW_LEN_PX}",
+            );
+            // 纯文字无盒：缺口横向宽 = tw + 2·margin（文字外扩）< 旧断线盒宽 tw + 12。
+            let new_gap_w = tw + 2. * margin;
+            let old_box_w = tw + 12. * z;
+            assert!(new_gap_w < old_box_w, "{f}→{t} 破盒后缺口宽 {new_gap_w:.1} < 旧盒宽 {old_box_w:.1}");
+            println!(
+                "{f}→{t} label={lab} tw={tw:.1} anchor=({lx:.1},{ly:.1}) head.pts={} tail.pts={} to_src={to_src:.2} to_base={to_base:.2} min_d={min_d:.3} base距文字={base_d_text:.2} margin={margin:.1} new_gap={new_gap_w:.1} old_box={old_box_w:.1}",
+                head.len(),
+                tt.len(),
+            );
+        }
+    }
+
     /// 分支**单弓弧线**带符号弓向回归：弓向 = 远离源列中心线的外侧（= 目标所在侧）。
     /// 对每个流向断言曲线中点相对骨架直线中点的**带符号**横向（外侧）偏距方向正确：
     /// TB/BT 右目标 → 弓 +x（ldev 显著>+阈值）、左目标 → −x（显著<−阈值）；
@@ -1649,4 +1843,5 @@ mod tests {
         // A(100,100)、B 右缘 220、下缘 130。内边距 8，夹内容区（MM_EDGE_X=14 / MM_TOP_PAD=30）。
         assert_eq!((b.x, b.y, b.w, b.h), (92., 92., 136., 46.));
     }
+
 }

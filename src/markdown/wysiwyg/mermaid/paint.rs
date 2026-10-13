@@ -70,7 +70,7 @@ pub(crate) fn paint_mermaid_placed(
     // 2) 边（折线 + 端点标记 + 箭头，**不含标签**——标签在节点之后单独顶层画）。
     let edge_color = { let mut c = theme.mermaid_border; c.a = 0.85; c };
     for e in &flow.edges {
-        paint_edge(window, e, ox, oy, edge_color, z);
+        paint_edge(window, theme, e, ox, oy, edge_color, z);
     }
     // 3) 节点。
     let box_bg = theme.code_bg;
@@ -234,6 +234,7 @@ fn stroke_poly(window: &mut Window, pts: &[(f32, f32)], color: Hsla, width: f32)
 /// - **双端**（Both）源端对称：线首点沿首段方向回缩一个箭头长。
 fn paint_edge(
     window: &mut Window,
+    theme: &WyTheme,
     e: &super::MmPolylineEdge,
     ox: f32,
     oy: f32,
@@ -255,37 +256,53 @@ fn paint_edge(
     // 5~11.5° 是投诉 .2 根因）。
     let tip = (e.points.last().unwrap().0 + ox, e.points.last().unwrap().1 + oy);
     let dir = e.arrow_dir;
-    let has_arrow = matches!(
-        e.kind,
-        MmEdgeKind::Arrow
-            | MmEdgeKind::DottedArrow
-            | MmEdgeKind::ThickArrow
-            | MmEdgeKind::BothArrow
-            | MmEdgeKind::BothThick
-    );
-    // 绘制用点：有箭头 → 末点回缩到基部（任意缩放下 `base = tip − 9·z·dir` 与 layout 收短
-    // 的弧线尾点严格重合）；无箭头（Line/圆端/叉端）→ 原样连到节点边缘。
-    let draw: Vec<(f32, f32)> = if has_arrow {
-        let base = arrow_base(tip, dir, ARROW_LEN_PX * z);
-        let mut v = pts.clone();
-        *v.last_mut().unwrap() = base;
-        if matches!(e.kind, MmEdgeKind::BothArrow | MmEdgeKind::BothThick) {
-            // 双端：源端同样把线首点回缩一个箭头长（沿首段方向进入线内），与目标端对称，
-            // 两条半箭头各占两端一个箭头长、「线到两端基部」。
-            let (a, b) = (v[0], v[1]);
-            let l = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-3);
-            let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
-            v[0] = (a.0 + ARROW_LEN_PX * z * ux, a.1 + ARROW_LEN_PX * z * uy);
+    let draw = edge_draw_points(e, &pts, tip, z);
+    // 边标签文字开口：把绘制折线按「文字矩形 + 2.5·z margin」拆成两段——head 收到入矩形
+    // 边界、tail 从出矩形边界续到箭头基部，中间跳过文字区（线在文字两侧断开、不穿字），
+    // 替代旧「断线盒盖上电线」（盒已删、纯文字）。`split_poly_at_rect` 精确线性插值到矩形
+    // 边界作断点，不靠采样粗切。
+    let (head, tail) = if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text)
+        && !lt.is_empty()
+    {
+        let (tw, th) = measure_edge_label(window, theme, lt, z);
+        if tw > 0. {
+            let margin = 2.5 * z;
+            let cx = lx + ox;
+            let cy = ly + oy + th / 2.;
+            split_poly_at_rect(
+                &draw,
+                cx - tw / 2. - margin,
+                cy - th / 2. - margin,
+                cx + tw / 2. + margin,
+                cy + th / 2. + margin,
+            )
+        } else {
+            (draw.clone(), None)
         }
-        v
     } else {
-        pts.clone()
+        (draw.clone(), None)
     };
     match e.kind {
         MmEdgeKind::DottedArrow | MmEdgeKind::DottedLine => {
-            dashed_path(window, &draw, color, width, 4., 4.);
+            if head.len() >= 2 {
+                dashed_path(window, &head, color, width, 4., 4.);
+            }
+            if let Some(t) = &tail
+                && t.len() >= 2
+            {
+                dashed_path(window, t, color, width, 4., 4.);
+            }
         }
-        _ => stroke_poly(window, &draw, color, width),
+        _ => {
+            if head.len() >= 2 {
+                stroke_poly(window, &head, color, width);
+            }
+            if let Some(t) = &tail
+                && t.len() >= 2
+            {
+                stroke_poly(window, t, color, width);
+            }
+        }
     }
     // 端点标记：tip = 节点边缘接触点；箭头实心填充从基部到 tip。
     match e.kind {
@@ -319,8 +336,143 @@ fn dir_of(pts: &[(f32, f32)]) -> (f32, f32) {
     (dx / l, dy / l)
 }
 
-/// 边标签：**单独一层最后画**（在节点框/连线之上）——先画与卡底同色不透明的圆角断线盒
-/// 盖住下方连线（标签不再被折线从中间穿过，观感“断线盒”），盒内居中画原文字。
+/// 绘制用折线（宿主坐标）：复刻「线到基部、箭头到节点」的端点回缩，`paint_edge` 与单测
+/// 共用同一几何——有箭头（含双向）末点回缩到箭头基部 `tip − ARROW_LEN_PX·z·arrow_dir`
+/// （与 layout 收短弧线尾点同函数同常量严格重合；`tip` 恒为逻辑锚点 `e.points.last()` 的
+/// 宿主坐标，弧线 `pts.last()` 已收短到基部、不能当 tip 用）、双向源端对称回缩；无箭头
+/// （Line/圆端/叉端）原样连到节点边缘。`pts[..]` 为已加卡原点的绘制点。
+pub(crate) fn edge_draw_points(
+    e: &super::MmPolylineEdge,
+    pts: &[(f32, f32)],
+    tip: (f32, f32),
+    z: f32,
+) -> Vec<(f32, f32)> {
+    if pts.len() < 2 {
+        return pts.to_vec();
+    }
+    let has_arrow = matches!(
+        e.kind,
+        MmEdgeKind::Arrow
+            | MmEdgeKind::DottedArrow
+            | MmEdgeKind::ThickArrow
+            | MmEdgeKind::BothArrow
+            | MmEdgeKind::BothThick
+    );
+    if !has_arrow {
+        return pts.to_vec();
+    }
+    let base = arrow_base(tip, e.arrow_dir, ARROW_LEN_PX * z);
+    let mut v = pts.to_vec();
+    *v.last_mut().unwrap() = base;
+    if matches!(e.kind, MmEdgeKind::BothArrow | MmEdgeKind::BothThick) {
+        // 双端：源端同样把线首点回缩一个箭头长（沿首段方向进入线内），与目标端对称，
+        // 两条半箭头各占两端一个箭头长、「线到两端基部」。
+        let (a, b) = (v[0], v[1]);
+        let l = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt().max(1e-3);
+        let (ux, uy) = ((b.0 - a.0) / l, (b.1 - a.1) / l);
+        v[0] = (a.0 + ARROW_LEN_PX * z * ux, a.1 + ARROW_LEN_PX * z * uy);
+    }
+    v
+}
+
+/// 线段 (a,b) 与轴对齐矩形（x0,y0,x1,y1）求交：返回落在矩形内的参数区间 `[t0,t1]`
+/// （a↔t=0、b↔t=1）；`None` = 完全不相交（相切单点由调用方以 `t1-t0` 阈值过滤）。
+fn seg_rect_t(a: (f32, f32), b: (f32, f32), x0: f32, y0: f32, x1: f32, y1: f32) -> Option<(f32, f32)> {
+    let mut t0 = 0.;
+    let mut t1 = 1.;
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    for (p, q) in [(-dx, a.0 - x0), (dx, x1 - a.0), (-dy, a.1 - y0), (dy, y1 - a.1)] {
+        if p.abs() < 1e-9 {
+            if q < 0. {
+                return None;
+            }
+        } else {
+            let r = q / p;
+            if p < 0. {
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
+            }
+        }
+    }
+    (t1 >= t0).then_some((t0, t1))
+}
+
+/// 按文字矩形把折线「开口」拆两段：`head` = 起点→入矩形边界、`tail` = 出矩形边界→终点
+/// （`None` = 折线未穿矩形），矩形内一段跳过——线在文字两侧断开、不穿字。进出点用
+/// 线性插值精确落在矩形边界（`seg_rect_t`，避免采样粗导致断口毛糙）。单文字区（标签
+/// 锚点在路径中点，折线至多穿入/穿出各一次）为设计前提。
+pub(crate) fn split_poly_at_rect(
+    pts: &[(f32, f32)],
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> (Vec<(f32, f32)>, Option<Vec<(f32, f32)>>) {
+    let inside = |p: (f32, f32)| x0 <= p.0 && p.0 <= x1 && y0 <= p.1 && p.1 <= y1;
+    let lerp = |a: (f32, f32), b: (f32, f32), t: f32| (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+    let mut head = vec![pts[0]];
+    let mut tail: Option<Vec<(f32, f32)>> = None;
+    for w in pts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        match seg_rect_t(a, b, x0, y0, x1, y1) {
+            Some((t0, t1)) if t1 - t0 > 1e-5 => match (inside(a), inside(b)) {
+                // 出矩形：出点是尾段首点（精确落矩形边界），随后续到 b（在外）。
+                (true, false) => {
+                    let exit = lerp(a, b, t1.min(1.));
+                    match &mut tail {
+                        Some(t) => t.push(exit),
+                        None => tail = Some(vec![exit]),
+                    }
+                    tail.as_mut().unwrap().push(b);
+                }
+                // 入矩形：head 收在入点（精确落矩形边界）；b 在矩形内跳过。
+                (false, true) => {
+                    let enter = lerp(a, b, t0);
+                    match &mut tail {
+                        Some(t) => t.push(enter),
+                        None => head.push(enter),
+                    }
+                }
+                // 段直穿（双端在外切角）：入口接 head、出口接 tail 并续 b。
+                (false, false) => {
+                    let enter = lerp(a, b, t0);
+                    let exit = lerp(a, b, t1);
+                    match &mut tail {
+                        Some(t) => t.push(enter),
+                        None => head.push(enter),
+                    }
+                    match &mut tail {
+                        Some(t) => t.push(exit),
+                        None => tail = Some(vec![exit]),
+                    }
+                    tail.as_mut().unwrap().push(b);
+                }
+                // 段全在矩形内：整段跳过。
+                (true, true) => {}
+            },
+            // 段与矩形不相交：全部在外，续到当前活动段（tail 已开 → tail，否则 head）。
+            _ => match &mut tail {
+                Some(t) => t.push(b),
+                None => head.push(b),
+            },
+        }
+    }
+    (head, tail)
+}
+
+/// 边标签：**单独一层最后画**（在节点框/连线之上）——无盒纯文字居中（连线已在
+/// [`paint_edge`] 按文字矩形开口断开，不再有背景盒盖线）。
 fn paint_edge_label(
     window: &mut Window,
     theme: &WyTheme,
@@ -331,31 +483,21 @@ fn paint_edge_label(
     cx: &mut App,
 ) {
     if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text)
-        && !lt.is_empty() {
-            // 断线盒：w=tw+12、h=18·z，锚点居中在标签锚点（路径中点）；fill=code_bg 不透明
-            // α=1（与卡底无缝合线），可选 1px mermaid_border α0.25 细边。
-            let tw = measure_edge_label(window, theme, lt, z);
-            let bw = tw + 12.;
-            let bh = 18. * z;
-            let bx = lx + ox - bw / 2.;
-            // 文本行盒 [ly, ly+14z] 在盒内垂直居中 → 盒顶 = ly - 2z。
-            let by = ly + oy + (14. * z - bh) / 2.;
-            let mut box_fill = theme.code_bg;
-            box_fill.a = 1.;
-            let mut box_border = theme.mermaid_border;
-            box_border.a = 0.25;
-            paint_quad(window, bx, by, bw, bh, 3. * z, box_fill, box_border, 1.);
-            text_centered(window, lx + ox, ly + oy, lt, theme.font.clone(), 12. * z, theme.text, 14. * z, cx);
-        }
+        && !lt.is_empty()
+    {
+        text_centered(window, lx + ox, ly + oy, lt, theme.font.clone(), 12. * z, theme.text, 14. * z, cx);
+    }
 }
 
-/// 测量边标签盒宽（`shape_line` 于 `theme.font`、12·z px，沿用边标签字号）。
-fn measure_edge_label(window: &mut Window, theme: &WyTheme, text: &str, z: f32) -> f32 {
+/// 测量边标签文字盒：返回 `(tw, th)`——`tw` = 文字宽（`shape_line` 于 `theme.font`、12·z），
+/// `th` = 文本行盒高（= [`text_centered`] 的行高 14·z）。供 [`paint_edge`] 文字开口几何用。
+fn measure_edge_label(window: &mut Window, theme: &WyTheme, text: &str, z: f32) -> (f32, f32) {
     if text.is_empty() {
-        return 0.;
+        return (0., 0.);
     }
     let run = [TextRun { len: text.len(), font: theme.font.clone(), color: theme.text, ..Default::default() }];
-    f32::from(window.text_system().shape_line(SharedString::from(text), px(12. * z), &run, None).width())
+    let l = window.text_system().shape_line(SharedString::from(text), px(12. * z), &run, None);
+    (f32::from(l.width()), 14. * z)
 }
 
 /// 实心三角形箭头：len=ARROW_LEN_PX·s、半宽 5·s，尖端落在线终点（=节点边缘/消息线端），
@@ -742,4 +884,57 @@ fn text_w(window: &mut Window, theme: &WyTheme, s: &str, z: f32) -> f32 {
     }
     let run = [TextRun { len: s.len(), font: theme.font.clone(), color: theme.text, ..Default::default() }];
     f32::from(window.text_system().shape_line(SharedString::from(s), px(12. * z), &run, None).width())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 点 p 到文字矩形（无 margin）的最近距离。
+    fn dist_pt_rect(p: (f32, f32), x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
+        let dx = if p.0 < x0 { x0 - p.0 } else if p.0 > x1 { p.0 - x1 } else { 0. };
+        let dy = if p.1 < y0 { y0 - p.1 } else if p.1 > y1 { p.1 - y1 } else { 0. };
+        (dx * dx + dy * dy).sqrt()
+    }
+
+    /// 直边（LR 横向）穿文字矩形：整段被开口切成 head/tail，断点精确落在矩形边界、
+    /// 无任何点落在文字矩形内。
+    #[test]
+    fn split_poly_gaps_straight_edge_at_label() {
+        let pts = [(0., 100.), (40., 100.), (200., 100.)];
+        let (head, tail) = split_poly_at_rect(&pts, 80., 90., 160., 110.);
+        assert_eq!(head, vec![(0., 100.), (40., 100.), (80., 100.)], "head 收在入矩形点（精确到边）");
+        let tail = tail.expect("直边穿文字矩形应拆出尾段");
+        assert_eq!(tail, vec![(160., 100.), (200., 100.)], "tail 从出矩形点续到终点");
+        for p in head.iter().chain(tail.iter()) {
+            assert!(!(80. < p.0 && p.0 < 160.), "点 {p:?} 不应落在文字矩形内");
+        }
+    }
+
+    /// 弧线采样（模拟用户例图 arc 12 点）穿文字矩形：入/出点精确落边界，矩形内段被完全
+    /// 移除（线不穿字），两侧段各自连续。
+    #[test]
+    fn split_poly_gaps_arc_like_polyline() {
+        let pts = [(60., 90.), (90., 100.), (120., 110.), (150., 100.), (180., 90.)];
+        let (head, tail) = split_poly_at_rect(&pts, 80., 90., 160., 110.);
+        assert_eq!(head.len(), 2, "head 应止于入矩形点");
+        let te = 1e-2;
+        assert!((head[1].0 - 80.).abs() < te && (head[1].1 - 96.6667).abs() < te, "head 末点应在左边界：{head:?}");
+        let tail = tail.expect("弧线穿文字矩形应拆出尾段");
+        assert_eq!(tail.len(), 2, "tail 应从出矩形点续到终点：{tail:?}");
+        assert!((tail[0].0 - 160.).abs() < te && (tail[0].1 - 96.6667).abs() < te, "tail 首点应在右边界：{tail:?}");
+        assert_eq!(tail[1], (180., 90.));
+        for p in head.iter().chain(tail.iter()) {
+            assert!(!(80. < p.0 && p.0 < 160. && 90. < p.1 && p.1 < 110.), "点 {p:?} 不应落在文字矩形内");
+        }
+    }
+
+    /// 折线不穿矩形：原样单段返回（无标签时行为不变）。
+    #[test]
+    fn split_poly_keeps_polyline_when_missing_rect() {
+        let pts = [(0., 0.), (10., 0.), (20., 0.)];
+        let (head, tail) = split_poly_at_rect(&pts, 30., -5., 60., 5.);
+        assert_eq!(head, pts.to_vec());
+        assert!(tail.is_none(), "未穿矩形不应拆尾段");
+    }
 }
