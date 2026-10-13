@@ -92,7 +92,7 @@ pub(crate) fn paint_mermaid_placed(
         }
         let fill = p.fill.map(to_hsla).unwrap_or(box_bg);
         let border = p.stroke.map(to_hsla).unwrap_or(box_border);
-        let bw = p.stroke_width.unwrap_or(1.2);
+        let bw = p.stroke_width.unwrap_or(1.5);
         paint_node_shape(window, theme, p, ox, oy, fill, border, bw, z, cx);
     }
     // 4) 边标签顶层（任何节点/折线都盖不住文字）。
@@ -233,13 +233,15 @@ fn paint_edge(
     color: Hsla,
     z: f32,
 ) {
-    let pts: Vec<(f32, f32)> = e.points.iter().map(|&(x, y)| (x + ox, y + oy)).collect();
+    // 曲线化密点优先（layout 期缓存）；无则用直角骨架。首尾锚定不变。
+    let src: &Vec<(f32, f32)> = e.smoothed.as_ref().unwrap_or(&e.points);
+    let pts: Vec<(f32, f32)> = src.iter().map(|&(x, y)| (x + ox, y + oy)).collect();
     if pts.len() < 2 {
         return;
     }
     let width = match e.kind {
-        MmEdgeKind::ThickArrow | MmEdgeKind::ThickLine | MmEdgeKind::BothThick => 2.0,
-        _ => 1.2,
+        MmEdgeKind::ThickArrow | MmEdgeKind::ThickLine | MmEdgeKind::BothThick => 2.8,
+        _ => 1.5,
     };
     match e.kind {
         MmEdgeKind::DottedArrow | MmEdgeKind::DottedLine => {
@@ -247,12 +249,12 @@ fn paint_edge(
         }
         _ => stroke_poly(window, &pts, color, width),
     }
-    // 端点标记。
+    // 端点标记（箭头方向取末两密点切线，与曲线末端一致）。
     let last = *pts.last().unwrap();
     let dir = dir_of(&pts);
     match e.kind {
         MmEdgeKind::Arrow | MmEdgeKind::DottedArrow | MmEdgeKind::ThickArrow | MmEdgeKind::BothArrow | MmEdgeKind::BothThick => {
-            arrow_head(window, last, dir, color, width, z);
+            arrow_head(window, last, dir, color, z);
         }
         MmEdgeKind::CircleEnd => {
             circle(window, last.0, last.1, 3.5 * z, 3.5 * z, color, color, width);
@@ -268,7 +270,7 @@ fn paint_edge(
     if matches!(e.kind, MmEdgeKind::BothArrow | MmEdgeKind::BothThick) {
         let first = *pts.first().unwrap();
         let d = dir_of(&pts);
-        arrow_head(window, first, (-d.0, -d.1), color, width, z);
+        arrow_head(window, first, (-d.0, -d.1), color, z);
     }
 }
 
@@ -281,7 +283,8 @@ fn dir_of(pts: &[(f32, f32)]) -> (f32, f32) {
     (dx / l, dy / l)
 }
 
-/// 边标签：**单独一层最后画**（在节点框/连线之上），避免被节点盒或折线盖住文字。
+/// 边标签：**单独一层最后画**（在节点框/连线之上）——先画与卡底同色不透明的圆角断线盒
+/// 盖住下方连线（标签不再被折线从中间穿过，观感“断线盒”），盒内居中画原文字。
 fn paint_edge_label(
     window: &mut Window,
     theme: &WyTheme,
@@ -293,17 +296,44 @@ fn paint_edge_label(
 ) {
     if let (Some((lx, ly)), Some(lt)) = (e.label, &e.label_text)
         && !lt.is_empty() {
+            // 断线盒：w=tw+12、h=18·z，锚点居中在标签锚点（路径中点）；fill=code_bg 不透明
+            // α=1（与卡底无缝合线），可选 1px mermaid_border α0.25 细边。
+            let tw = measure_edge_label(window, theme, lt, z);
+            let bw = tw + 12.;
+            let bh = 18. * z;
+            let bx = lx + ox - bw / 2.;
+            // 文本行盒 [ly, ly+14z] 在盒内垂直居中 → 盒顶 = ly - 2z。
+            let by = ly + oy + (14. * z - bh) / 2.;
+            let mut box_fill = theme.code_bg;
+            box_fill.a = 1.;
+            let mut box_border = theme.mermaid_border;
+            box_border.a = 0.25;
+            paint_quad(window, bx, by, bw, bh, 3. * z, box_fill, box_border, 1.);
             text_centered(window, lx + ox, ly + oy, lt, theme.font.clone(), 12. * z, theme.text, 14. * z, cx);
         }
 }
 
-fn arrow_head(window: &mut Window, tip: (f32, f32), dir: (f32, f32), color: Hsla, width: f32, s: f32) {
-    let base = (tip.0 - dir.0 * 8. * s, tip.1 - dir.1 * 8. * s);
-    let (px_, py_) = (dir.1 * 4.5 * s, -dir.0 * 4.5 * s);
+/// 测量边标签盒宽（`shape_line` 于 `theme.font`、12·z px，沿用边标签字号）。
+fn measure_edge_label(window: &mut Window, theme: &WyTheme, text: &str, z: f32) -> f32 {
+    if text.is_empty() {
+        return 0.;
+    }
+    let run = [TextRun { len: text.len(), font: theme.font.clone(), color: theme.text, ..Default::default() }];
+    f32::from(window.text_system().shape_line(SharedString::from(text), px(12. * z), &run, None).width())
+}
+
+/// 实心三角形箭头：len 9·s、半宽 5·s，尖端落在线终点，颜色=边色（`Some(色)` 填充、
+/// 无描边）。流程/序列共用——`->>`/`-->`/`==>` 等实心箭头同款。
+fn arrow_head(window: &mut Window, tip: (f32, f32), dir: (f32, f32), color: Hsla, s: f32) {
+    let base = (tip.0 - dir.0 * 9. * s, tip.1 - dir.1 * 9. * s);
+    let (px_, py_) = (dir.1 * 5. * s, -dir.0 * 5. * s);
     let p1 = (base.0 + px_, base.1 + py_);
     let p2 = (base.0 - px_, base.1 - py_);
-    let pts = [p1, tip, p2];
-    stroke_poly(window, &pts, color, width);
+    let pts: Vec<Point<Pixels>> = [(p1.0, p1.1), (tip.0, tip.1), (p2.0, p2.1)]
+        .into_iter()
+        .map(|(x, y)| point(px(x), px(y)))
+        .collect();
+    path_pts(window, &pts, Some(color), None, 0.);
 }
 
 #[allow(clippy::too_many_arguments)] // paint 文本图元：画布 + 字体/坐标互为正交
@@ -601,11 +631,11 @@ fn paint_message(
         } else {
             stroke_seg(window, (x0, y), (x1, y), color, width);
         }
-        // 箭头在目标端。
+        // 箭头在目标端（实心填充三角形，尖端落线端）。
         if head && ax < bx {
-            arrow_head(window, pts[1], (1., 0.), color, width, z);
+            arrow_head(window, pts[1], (1., 0.), color, z);
         } else if head && ax > bx {
-            arrow_head(window, pts[1], (-1., 0.), color, width, z);
+            arrow_head(window, pts[1], (-1., 0.), color, z);
         }
         stride_label(window, theme, (x0 + x1) / 2., y, text, z, cx);
     }

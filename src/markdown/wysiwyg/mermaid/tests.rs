@@ -220,8 +220,8 @@ fn parses_sequence_basics() {
 /// 无窗口卡高：flowchart 按层数 / 方向不同；sequence 按行数；空图固定。
 #[test]
 fn card_height_window_free() {
-    // TB：3 层 → 30 + 3*76（秩距） + 8 = 266（留足容纳边线+标签）。
-    assert_eq!(mermaid_card_height("graph TD\nA-->B-->C"), px(266.));
+    // TB：3 层 → 30 + 3*84（秩距） + 8 = 290（留足容纳边线+标签）。
+    assert_eq!(mermaid_card_height("graph TD\nA-->B-->C"), px(290.));
     // LR：按单层最多节点数（max_row=1）→ 30 + 1*52 + 8 = 90。
     assert_eq!(mermaid_card_height("flowchart LR\nA-->B-->C"), px(90.));
     // 空图。
@@ -233,10 +233,10 @@ fn card_height_window_free() {
 /// 卡高不含窗口：与 `layout_flow` 几何一致（LR 固定纵向步距）。
 #[test]
 fn flow_layout_extents_match_card_height() {
-    // 两层、每层 2 节点：TB 高 30+2*76+8=190；LR 高 30+2*52+8=142（max_row=2）。
+    // 两层、每层 2 节点：TB 高 30+2*84+8=206；LR 高 30+2*52+8=142（max_row=2）。
     let tb = "flowchart TD\nA-->C\nB-->C";
     let lr = "flowchart LR\nA-->C\nB-->C";
-    assert_eq!(mermaid_card_height(tb), px(190.));
+    assert_eq!(mermaid_card_height(tb), px(206.));
     assert_eq!(mermaid_card_height(lr), px(142.));
 }
 
@@ -282,7 +282,7 @@ fn scale_layout_zooms_flow_geometries() {
         }],
         edges: vec![MmPolylineEdge {
             a: 0, b: 0, kind: MmEdgeKind::Arrow,
-            points: vec![(0., 0.), (10., 10.)], label: Some((5., 2.)), label_text: Some("x".into()),
+            points: vec![(0., 0.), (10., 10.)], smoothed: None, label: Some((5., 2.)), label_text: Some("x".into()),
         }],
         subgraphs: vec![MmSubgraphBox { title: "g".into(), x: 80., y: 10., w: 80., h: 60. }],
         content_w: 0., content_h: 0., zoom: 1.,

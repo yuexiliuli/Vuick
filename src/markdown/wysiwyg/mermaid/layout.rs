@@ -126,6 +126,12 @@ pub(crate) fn scale_mm_layout(mm: &mut MmLayout, zoom: f32, area_w: f32) {
                     pt.0 = tx(pt.0);
                     pt.1 *= zoom;
                 }
+                if let Some(sm) = &mut e.smoothed {
+                    for pt in sm.iter_mut() {
+                        pt.0 = tx(pt.0);
+                        pt.1 *= zoom;
+                    }
+                }
                 if let Some((lx, ly)) = &mut e.label {
                     *lx = tx(*lx);
                     *ly *= zoom;
@@ -572,13 +578,21 @@ fn assemble_placed(
 
 /// 边折线：**在最终坐标**里按方向装配——起终点钉在**节点边缘中心**（TB/BT 顶/底、
 /// LR/RL 右/左），生成横/纵直角折线。旧的「规范空间纵向路由 + 方向变换」在 LR/RL 下
-/// 起终点钉在节点中心，节点宽度不同就歪斜。
+/// 起终点钉在节点中心，节点宽度不同就歪斜。标签锚点一律居中**路径中点**（直边/肘边
+/// 同式），交给断线盒盖住连线；`smoothed` 在此一次算好缓存（同源分支单弯肘直接 S
+/// 曲线 / 其余 4 点肘圆角 / 2 点直边箭头 S 曲线，见 [`smoothed_edge`]）。
 fn route_edges(
     g: &MmGraph,
     chain: &[(usize, usize, MmEdgeKind, Option<String>)],
     placed: &[MmPlaced],
 ) -> Vec<MmPolylineEdge> {
     let vertical_flow = matches!(g.direction, MmDirection::TB | MmDirection::BT);
+    // 每个源的出边数：出度 ≥2 且横向偏移 → 同源分支边直接 S 曲线（用户 .1 分支曲线），
+    // 否则 4 点肘保留圆角正交折线。
+    let mut out_deg: HashMap<usize, usize> = HashMap::new();
+    for (a, _, _, _) in chain {
+        *out_deg.entry(*a).or_insert(0) += 1;
+    }
     let mut edges_out: Vec<MmPolylineEdge> = Vec::with_capacity(chain.len());
     for (a, b, kind, label) in chain {
         let pa = &placed[*a];
@@ -593,11 +607,11 @@ fn route_edges(
             let bx = pb.x + pb.w / 2.;
             let mid_y = (ay0 + by0) / 2.;
             if (bx - ax).abs() < 4. {
-                (vec![(ax, ay0), (bx, by0)], Some((ax + 8., mid_y - 4.)))
+                (vec![(ax, ay0), (bx, by0)], Some(((ax + bx) / 2., mid_y)))
             } else {
                 (
                     vec![(ax, ay0), (ax, mid_y), (bx, mid_y), (bx, by0)],
-                    Some(((ax + bx) / 2., mid_y - 8.)),
+                    Some(((ax + bx) / 2., mid_y)),
                 )
             }
         } else {
@@ -610,14 +624,136 @@ fn route_edges(
             let by = pb.y + pb.h / 2.;
             let mid_x = (ax0 + bx0) / 2.;
             if (by - ay).abs() < 4. {
-                (vec![(ax0, ay), (bx0, by)], Some((mid_x + 6., ay - 8.)))
+                (vec![(ax0, ay), (bx0, by)], Some((mid_x, (ay + by) / 2.)))
             } else {
-                (vec![(ax0, ay), (mid_x, ay), (mid_x, by), (bx0, by)], Some((mid_x + 8., (ay + by) / 2.)))
+                (
+                    vec![(ax0, ay), (mid_x, ay), (mid_x, by), (bx0, by)],
+                    Some((mid_x, (ay + by) / 2.)),
+                )
             }
         };
-        edges_out.push(MmPolylineEdge { a: *a, b: *b, kind: *kind, points: pts, label: label_anchor, label_text: label.clone() });
+        let branch = out_deg.get(a).copied().unwrap_or(0) >= 2;
+        let smoothed = smoothed_edge(g.direction, *kind, &pts, branch);
+        edges_out.push(MmPolylineEdge { a: *a, b: *b, kind: *kind, points: pts, smoothed, label: label_anchor, label_text: label.clone() });
     }
     edges_out
+}
+
+/// 曲线化纯函数（layout 期一次算好缓存进 `MmPolylineEdge.smoothed`，paint 只消费）：
+/// - **2 点直边**（骨架无中间点）：`Arrow` 且端点有横向（轴）偏移 → 三次贝塞尔 S 曲线
+///   （见 [`s_curve`]）；端点横/纵对齐或非 Arrow（虚节点直腿）→ 退化为直线（返回
+///   `None`，paint 直接用骨架）。
+/// - **4 点正交肘**：*同源分支*（`branch`，源出度 ≥2）且 `Arrow` → 直接按端点出
+///   [S 曲线](`s_curve`)（用户 .1「分支边曲线」；单弯肘横/纵偏移必 ≥4 由路由保证）；
+///   其余每个内角二次贝塞尔圆角（切点 A=Pk−in_u·rk、B=Pk+out_u·rk、控制点=Pk，
+///   rk=clamp(min(前段,后段)·0.3, 3, 10)，采样 8 点），中间水平段保留。
+/// 每边采样 ≤24 点（骨架恒 ≤4 点 ⇒ 至多 2 个内角）。
+fn smoothed_edge(dir: MmDirection, kind: MmEdgeKind, pts: &[(f32, f32)], branch: bool) -> Option<Vec<(f32, f32)>> {
+    match pts.len() {
+        2 => {
+            let (p0, p3) = (pts[0], pts[1]);
+            // 横向（垂直于行进方向）偏移量；对齐则不曲。
+            let lateral = match dir {
+                MmDirection::TB | MmDirection::BT => (p3.0 - p0.0).abs(),
+                MmDirection::LR | MmDirection::RL => (p3.1 - p0.1).abs(),
+            };
+            if kind != MmEdgeKind::Arrow || lateral < 4. {
+                return None;
+            }
+            Some(s_curve(p0, p3, dir))
+        }
+        // 同源分支边单弯肘（4 点：源直出 → 一段横/竖 → 目标直入）：端点横向偏移已由
+        // 路由保证 ≥4，直接按端点出 S 曲线（出射端沿行进方向 offset）。
+        4 if branch && kind == MmEdgeKind::Arrow => {
+            let p0 = pts[0];
+            let p3 = *pts.last().unwrap();
+            Some(s_curve(p0, p3, dir))
+        }
+        n if n >= 3 => Some(round_polyline(pts)),
+        _ => None,
+    }
+}
+
+/// 对称三次贝塞尔 S 曲线（出射/入射都沿行进方向，BT/RL 反向推进仍正确）：
+/// P0=出射点、P3=入射点，C1=P0+u·k、C2=P3−u·k，u=行进方向单位向量，
+/// k=clamp(0.35·adv, 8, 40)、adv=(P3−P0)·u；12 采样含两端点。曲线扫码严格落在
+/// [P0,P3] 矩形内（控制点都在对边投影上），中点恰在骨架直线中点——标签断线盒
+/// 锚点（路径中点）仍在曲线正上方。
+fn s_curve(p0: (f32, f32), p3: (f32, f32), dir: MmDirection) -> Vec<(f32, f32)> {
+    let (ux, uy) = match dir {
+        MmDirection::TB | MmDirection::BT => (0., if p3.1 >= p0.1 { 1. } else { -1. }),
+        MmDirection::LR | MmDirection::RL => (if p3.0 >= p0.0 { 1. } else { -1. }, 0.),
+    };
+    let adv = (p3.0 - p0.0) * ux + (p3.1 - p0.1) * uy;
+    let k = (0.35 * adv).clamp(8., 40.);
+    let c1 = (p0.0 + ux * k, p0.1 + uy * k);
+    let c2 = (p3.0 - ux * k, p3.1 - uy * k);
+    sample_cubic(p0, c1, c2, p3, 12)
+}
+
+/// 三次贝塞尔采样（含两端点；n 点）。
+fn sample_cubic(p0: (f32, f32), c1: (f32, f32), c2: (f32, f32), p3: (f32, f32), n: usize) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = i as f32 / (n - 1).max(1) as f32;
+        let mt = 1. - t;
+        let x = mt * mt * mt * p0.0 + 3. * mt * mt * t * c1.0 + 3. * mt * t * t * c2.0 + t * t * t * p3.0;
+        let y = mt * mt * mt * p0.1 + 3. * mt * mt * t * c1.1 + 3. * mt * t * t * c2.1 + t * t * t * p3.1;
+        out.push((x, y));
+    }
+    out
+}
+
+/// 二次贝塞尔采样（`a`→`b`，控制点 `ctrl`；n 点，含 `b` 不含 `a`）。
+fn sample_quad(a: (f32, f32), ctrl: (f32, f32), b: (f32, f32), n: usize) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(n);
+    for i in 1..=n {
+        let t = i as f32 / n as f32;
+        let mt = 1. - t;
+        let x = mt * mt * a.0 + 2. * mt * t * ctrl.0 + t * t * b.0;
+        let y = mt * mt * a.1 + 2. * mt * t * ctrl.1 + t * t * b.1;
+        out.push((x, y));
+    }
+    out
+}
+
+fn pt_len(a: (f32, f32), b: (f32, f32)) -> f32 {
+    let dx = b.0 - a.0;
+    let dy = b.1 - a.1;
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// 正交肘圆角：对骨架每个内角切掉 rk，用切点 A/B + 控制点=Pk 的二次贝塞尔 8 点采样
+/// 替代直角拐点；中间（水平）直段由相邻切点间的连线段保留。首尾锚定与骨架一致。
+fn round_polyline(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut out: Vec<(f32, f32)> = vec![pts[0]];
+    for k in 1..pts.len() - 1 {
+        let prev = pts[k - 1];
+        let cur = pts[k];
+        let next = pts[k + 1];
+        let l1 = pt_len(prev, cur);
+        let l2 = pt_len(cur, next);
+        let rk = (l1.min(l2) * 0.3).clamp(3., 10.).min(l1).min(l2);
+        let in_len = l1.max(1e-6);
+        let out_len = l2.max(1e-6);
+        let in_u = ((prev.0 - cur.0) / in_len, (prev.1 - cur.1) / in_len);
+        let out_u = ((next.0 - cur.0) / out_len, (next.1 - cur.1) / out_len);
+        let a = (cur.0 + in_u.0 * rk, cur.1 + in_u.1 * rk);
+        let b = (cur.0 + out_u.0 * rk, cur.1 + out_u.1 * rk);
+        let last = *out.last().unwrap();
+        if pt_len(last, a) > 1e-3 {
+            out.push(a);
+        }
+        out.extend(sample_quad(a, cur, b, 8));
+    }
+    let end = *pts.last().unwrap();
+    if pt_len(*out.last().unwrap(), end) > 1e-3 {
+        out.push(end);
+    }
+    out
 }
 
 /// subgraph 盒（最终坐标，取成员包围盒加内边距）。
@@ -936,9 +1072,9 @@ mod tests {
             0.,
             200.,
         );
-        // TB：层0 轴位 30、层1 轴位 106（MM_TOP_PAD + li*MM_RANK_TB，均无 sub 偏移）。
+        // TB：层0 轴位 30、层1 轴位 114（MM_TOP_PAD + li*MM_RANK_TB 84，均无 sub 偏移）。
         assert_eq!(geom.cx, vec![80., 80.]);
-        assert_eq!(geom.cy, vec![30., 106.]);
+        assert_eq!(geom.cy, vec![30., 114.]);
         assert_eq!(geom.axis_ref, 0.);
     }
 
@@ -954,8 +1090,14 @@ mod tests {
         assert_eq!((e.a, e.b), (0, 1));
         // B 在 A 之下：A 底(50)出、B 顶(80)进，中转折 65 → 4 点直角折线。
         assert_eq!(e.points, vec![(30., 50.), (30., 65.), (90., 65.), (90., 80.)]);
-        assert_eq!(e.label, Some((60., 57.)));
+        // 标签锚点居中路径中点（肘边水平段中点）。
+        assert_eq!(e.label, Some((60., 65.)));
         assert_eq!(e.kind, MmEdgeKind::Arrow);
+        // 4 点肘 → 圆角密点已缓存在 smoothed，首尾锚定与骨架一致。
+        let sm = e.smoothed.as_ref().expect("4 点肘应产出 smoothed");
+        assert_eq!(sm.first(), e.points.first());
+        assert_eq!(sm.last(), e.points.last());
+        assert!((sm.len() as isize) <= 24, "采样点 {} ≤24", sm.len());
     }
 
     /// `route_edges`：LR 水平流——A 右出 B 左进，先水平再竖直。
@@ -970,7 +1112,132 @@ mod tests {
         let e = &edges[0];
         // 水平流：A 右(50)出、B 左(70)进；A/B 纵中线 35/95 差大 → 中转折 60。
         assert_eq!(e.points, vec![(50., 35.), (60., 35.), (60., 95.), (70., 95.)]);
-        assert_eq!(e.label, Some((68., 65.)));
+        // 标签锚点居中路径中点（肘边竖段中点）。
+        assert_eq!(e.label, Some((60., 65.)));
+    }
+
+    /// `smoothed_edge`：4 点肘**非分支**每内角二次贝塞尔圆角（smoothed 非空、首尾锚定
+    /// 不变、中间水平段保留）；**同源分支**单弯肘直接出 S 曲线（端点锚定、12 点密点、
+    /// 中点横扫而非直角）；2 点 Arrow 直边有横向偏移出 S 曲线；对齐/非 Arrow 直边退化
+    /// 为 `None`（paint 直接吃骨架）；Line（虚节点直腿）即使分支也保持圆角肘。
+    #[test]
+    fn smoothed_edge_rounds_elbows_and_curves_offset_arrows() {
+        use MmEdgeKind::{Arrow, Line};
+        // 4 点肘（非分支）：骨架竖-横-竖，圆角后中点水平段仍在 y=10 上。
+        let elbow = smoothed_edge(MmDirection::TB, Arrow, &[(0., 0.), (0., 10.), (50., 10.), (50., 20.)], false)
+            .expect("非分支 4 点肘应圆角");
+        assert_eq!(elbow.first(), Some(&(0., 0.)), "首锚定不变");
+        assert_eq!(elbow.last(), Some(&(50., 20.)), "尾锚定不变");
+        assert!(elbow.len() > 4 && elbow.len() <= 24, "圆角采样点 {} ∈ (4,24]", elbow.len());
+        assert!(elbow.iter().any(|&(_, y)| y == 10.), "中间水平段保留");
+        // 4 点肘（同源分支）：直接出 S 曲线（12 点、首尾锚定、无直角横段、中点横扫）。
+        let sbr = smoothed_edge(MmDirection::TB, Arrow, &[(0., 0.), (0., 10.), (50., 10.), (50., 20.)], true)
+            .expect("同源分支 4 点肘应出 S 曲线");
+        assert_eq!(sbr.len(), 12, "S 曲线采样 12 点 ≤24");
+        assert_eq!(sbr.first(), Some(&(0., 0.)));
+        assert_eq!(sbr.last(), Some(&(50., 20.)));
+        assert!(sbr.iter().any(|&(x, y)| x > 5. && x < 45. && y > 2. && y < 18.), "S 曲线中点横扫中带（非直角肘）");
+        // 2 点 Arrow + 横向偏移 → S 曲线（端点钉在骨架首尾，密点在中间）。
+        let s = smoothed_edge(MmDirection::TB, Arrow, &[(0., 0.), (30., 40.)], false)
+            .expect("2 点 Arrow 横向偏移应出 S 曲线");
+        assert_eq!(s.first(), Some(&(0., 0.)));
+        assert_eq!(s.last(), Some(&(30., 40.)));
+        assert_eq!(s.len(), 12, "S 曲线采样 12 点 ≤24");
+        assert!(s.iter().any(|&(x, y)| (x - 15.).abs() < 20. && y > 10. && y < 30.), "S 曲线中点扫过中带");
+        // 对齐直边 → None（退化为直线）。
+        assert!(smoothed_edge(MmDirection::TB, Arrow, &[(0., 0.), (0., 40.)], false).is_none());
+        // 非 Arrow（虚节点直腿）偏移直边 → 不加 S。
+        assert!(smoothed_edge(MmDirection::TB, Line, &[(0., 0.), (30., 40.)], false).is_none());
+        // Line 分支直腿（4 点肘）：仍圆角，不接 S 曲线。
+        let lline = smoothed_edge(MmDirection::TB, Line, &[(0., 0.), (0., 10.), (50., 10.), (50., 20.)], true)
+            .expect("Line 分支直腿应保持圆角肘");
+        assert!(lline.len() > 4 && lline.len() <= 24, "Line 直腿不接 S 曲线");
+        // LR 肘同样圆角。
+        let lr = smoothed_edge(MmDirection::LR, Arrow, &[(0., 0.), (10., 0.), (10., 60.), (20., 60.)], false)
+            .expect("LR 4 点肘应圆角");
+        assert_eq!(lr.first(), Some(&(0., 0.)));
+        assert_eq!(lr.last(), Some(&(20., 60.)));
+    }
+
+    /// `route_edges` 真实接线：横向偏移的相邻层边（**单出边非分支**）→ 4 点肘圆角
+    /// + smoothed 密点已缓存，首尾锚定与骨架一致。
+    #[test]
+    fn route_edges_smoothed_cached_for_offset_edges() {
+        let g = mini_flow(&["A", "B"], &[("A", "B")]);
+        let fe = flow_elements(&g);
+        let placed = vec![placed_node("A", 10., 20.), placed_node("B", 70., 80.)];
+        let edges = route_edges(&g, &fe.chain, &placed);
+        let e = &edges[0];
+        assert_eq!(e.points.len(), 4);
+        let sm = e.smoothed.as_ref().expect("偏移边应有 smoothed（圆角肘）");
+        assert!(sm.len() > 4, "非分支偏移边为圆角肘（>4 点）");
+        assert_eq!(sm.first(), e.points.first(), "smoothed 首锚定 = 骨架首点");
+        assert_eq!(sm.last(), e.points.last(), "smoothed 尾锚定 = 骨架尾点");
+    }
+
+    /// **用户例图真实装配链**（parse → flow_elements → barycenter_order → flow_positions
+    /// → route_edges）：`graph TD A[开始]-->B{判断} B-->|是|C[完成] B-->|否|D[返回 A]`
+    /// 中 A→B 对齐直边退化为直线；B→C/B→D 为**同源分支**且横向偏移 → smoothed 落 S
+    /// 曲线（12 点、首尾锚定、中点横扫非直角）——即投诉 .1「分支边曲线」真实命中。
+    #[test]
+    fn route_edges_td_branch_user_example_s_curve() {
+        let g = crate::markdown::wysiwyg::mermaid_graph("graph TD\nA[开始]-->B{判断}\nB-->|是|C[完成]\nB-->|否|D[返回 A]");
+        assert_eq!(g.direction, MmDirection::TB);
+        assert_eq!(g.nodes.len(), 4);
+        let fe = flow_elements(&g);
+        let order = barycenter_order(&fe.elements, &fe.virtual_layers, &fe.layer_of, &fe.chain, fe.n_layers);
+        // 无窗口测试不可真实 shaping：宽度按「字符数×8 + 2·XPAD」近似——A/B/C 两字同宽、
+        // D 四字更宽 → B→C/B→D 横向偏移、A/B 对齐（几何只随 cw 推，不影响判定）。
+        let w = |lab: &str| lab.chars().count() as f32 * 8. + 2. * MM_NODE_XPAD;
+        let sizes = FlowSizes {
+            cw: fe.elements.iter().map(|(_, l, _)| w(l)).collect(),
+            ch: vec![MM_NODE_H; fe.elements.len()],
+            widths: fe.elements.iter().map(|(_, l, _)| w(l)).collect(),
+            virtual_flag: vec![false; fe.elements.len()],
+        };
+        let geom = flow_positions(&g, &fe.elements, &order, sizes, 0., 800.);
+        let placed: Vec<MmPlaced> = fe
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(i, (id, lab, shp))| MmPlaced {
+                id: id.clone(),
+                label: lab.clone(),
+                shape: *shp,
+                x: geom.cx[i] - geom.cw[i] / 2.,
+                y: geom.cy[i],
+                w: geom.cw[i],
+                h: geom.ch[i],
+                fill: None,
+                stroke: None,
+                stroke_width: None,
+                accent_idx: None,
+                virtual_node: false,
+            })
+            .collect();
+        let edges = route_edges(&g, &fe.chain, &placed);
+        let edge_pts = |from: &str, to: &str| {
+            let f = fe.elements.iter().position(|(id, _, _)| id == from).unwrap();
+            let t = fe.elements.iter().position(|(id, _, _)| id == to).unwrap();
+            edges.iter().find(|e| e.a == f && e.b == t).unwrap()
+        };
+        let ab = edge_pts("A", "B");
+        assert_eq!(ab.points.len(), 2, "A/B 同宽对齐 → 直边骨架");
+        assert!(ab.smoothed.is_none(), "对齐直边退化为直线（不接 S）");
+        for (f, t) in [("B", "C"), ("B", "D")] {
+            let e = edge_pts(f, t);
+            assert_eq!(e.points.len(), 4, "{f}→{t} 横向偏移 → 4 点肘骨架");
+            let sm = e.smoothed.as_ref().unwrap_or_else(|| panic!("{f}→{t} 同源分支应接 S 曲线"));
+            assert_eq!(sm.len(), 12, "{f}→{t} S 曲线 12 点 ≤24");
+            assert_eq!(sm.first(), e.points.first(), "{f}→{t} smoothed 首锚定 = 骨架首点");
+            assert_eq!(sm.last(), e.points.last(), "{f}→{t} smoothed 尾锚定 = 骨架尾点");
+            let (x0, x1) = (e.points[0].0, e.points[3].0);
+            let (y0, y1) = (e.points[0].1, e.points[3].1);
+            assert!(
+                sm.iter().any(|&(x, y)| x > x0.min(x1) && x < x0.max(x1) && y > y0.min(y1) && y < y0.max(y1)),
+                "{f}→{t} S 曲线有中间横扫点（非直角折线）",
+            );
+        }
     }
 
     /// `flow_subgraph_boxes`：成员包围盒加 8px 内边距，并夹到内容区。

@@ -454,6 +454,52 @@ fn mermaid_lr_edges_attach_to_node_edges(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn mermaid_td_branch_user_example_s_curves(cx: &mut TestAppContext) {
+    // 投诉 .1：`B-->|是|C` / `B-->|否|D` 同源分支边须出 S 曲线——smoothed 密点首尾锚定
+    // 骨架端点、12 点贝塞尔、中点横扫（非直角折线）。走完整 mm_layout（真实 shaping）。
+    use super::{MmLayout, mm_layout};
+    cx.update(crate::actions::bind_local_keymaps);
+    const SRC: &str = "graph TD\nA[开始]-->B{判断}\nB-->|是|C[完成]\nB-->|否|D[返回 A]";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text("x"));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        let theme = ed.read(cx).theme.clone();
+        match mm_layout(window, &theme, SRC, 0., 0., 800.) {
+            MmLayout::Flow(f) => {
+                let edge = |from: &str, to: &str| {
+                    f.edges
+                        .iter()
+                        .find(|e| f.placed[e.a].id == from && f.placed[e.b].id == to)
+                        .expect("边")
+                };
+                for (f, t) in [("B", "C"), ("B", "D")] {
+                    let e = edge(f, t);
+                    let sm = e.smoothed.as_ref().unwrap_or_else(|| panic!("{f}→{t} 同源分支应出 S 曲线"));
+                    assert_eq!(sm.len(), 12, "{f}→{t} S 曲线 12 点 ≤24");
+                    assert_eq!(sm.first(), e.points.first(), "{f}→{t} 首锚定 = 骨架首点");
+                    assert_eq!(sm.last(), e.points.last(), "{f}→{t} 尾锚定 = 骨架尾点");
+                    let (x0, x1) = (e.points[0].0, e.points.last().unwrap().0);
+                    let (y0, y1) = (e.points[0].1, e.points.last().unwrap().1);
+                    assert!(
+                        sm.iter().any(|&(x, y)| x > x0.min(x1) && x < x0.max(x1) && y > y0.min(y1) && y < y0.max(y1)),
+                        "{f}→{t} S 曲线中点横扫（非直角折线）",
+                    );
+                }
+                // A→B 直干：A 非分支源——即便对齐/偏移都不得误接 S 曲线（对齐直边→None；
+                // 若宽度差≥4 也只能是圆角肘，绝无 12 点 S）。
+                let ab = edge("A", "B");
+                assert_ne!(ab.smoothed.as_ref().map(|s| s.len()), Some(12), "A→B 非分支不得误接 S 曲线");
+            }
+            other => panic!("应为 flowchart 布局，实际 {other:?}"),
+        }
+    });
+}
+
+#[gpui::test]
 fn mermaid_wheel_zooms_block(cx: &mut TestAppContext) {
     // 滚轮缩放须**先点击聚焦该 mermaid 卡**：未聚焦时滚轮放行（给宿主正常滚动，
     // 不再「往下滚遇到 mermaid 就缩图」）；点击卡置聚焦后才缩放；点击它处解除聚焦。

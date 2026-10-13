@@ -299,7 +299,10 @@ pub(crate) struct MmPolylineEdge {
     pub b: usize,
     pub kind: MmEdgeKind,
     pub points: Vec<(f32, f32)>,
-    /// 标签锚点（卡片相对坐标）。
+    /// 曲线化后的密点（layout 期一次算好缓存；`Some` = 圆角/贝塞尔后的采样，
+    /// paint 优先消费，`None` = 骨架即直边直接用 `points`）。
+    pub smoothed: Option<Vec<(f32, f32)>>,
+    /// 标签锚点（卡片相对坐标，居中在路径中点）。
     pub label: Option<(f32, f32)>,
     /// 边标签文本。
     pub label_text: Option<String>,
@@ -340,12 +343,12 @@ pub(crate) const MM_TOP_PAD: f32 = 30.;
 /// LR/RL 纵向层内堆叠间距（cross 固定步距，宽度无关 → 卡高无窗口可算）。
 pub(crate) const MM_LANE: f32 = 52.;
 /// TB/BT 轴向秩距 = 节点高 + 轴间隙（轴间隙容纳边折线与标签，防文字挤成堆）。
-pub(crate) const MM_RANK_TB: f32 = 76.;
+pub(crate) const MM_RANK_TB: f32 = 84.;
 /// LR/RL 列与列之间的水平间距（容纳箭头/横线段）。
-pub(crate) const MM_H_GAP: f32 = 30.;
-pub(crate) const MM_NODE_H: f32 = 30.;
-pub(crate) const MM_NODE_XPAD: f32 = 14.;
-pub(crate) const MM_SEP: f32 = 20.;
+pub(crate) const MM_H_GAP: f32 = 40.;
+pub(crate) const MM_NODE_H: f32 = 36.;
+pub(crate) const MM_NODE_XPAD: f32 = 18.;
+pub(crate) const MM_SEP: f32 = 24.;
 pub(crate) const MM_EDGE_X: f32 = 14.;
 /// 每个 subgraph 嵌套层加的标题带高。
 pub(crate) const MM_SUB_TITLE_H: f32 = 26.;
