@@ -655,45 +655,9 @@ fn route_edges(
             }
         };
         let branch = out_t.get(a).map_or(0, Vec::len) >= 2;
-        // 弓向限制（分支边才受限）：以「源盒 + 本源全部子节点盒」的联合骨架 bbox 为界，
-        // 每分支只许朝目标那一侧的外侧空间弓——二次贝塞尔整体落在控制点凸包内 ⇒ 只要
-        // 控制点 Q 不越 bbox，整条弧线就不越界（「肚皮」至多与目标列外侧齐平，绝不压
-        // 同侧相邻子盒/源盒）。目标即最外侧兄弟时上限 ≈ 外侧整段空距（放手外弓分叉）；
-        // 内侧兄弟因幅度随横向距离单调（见 q_pref）天然在外侧兄弟之内，不会被压。
-        // 单出边（无兄弟）无此约束（None）。
-        let bounds = out_t.get(a).filter(|t| t.len() >= 2).map(|t| {
-            let (pk0, pk1) = if vertical_flow { (pa.x, pa.x + pa.w) } else { (pa.y, pa.y + pa.h) };
-            let (mut lo, mut hi) = (pk0, pk1);
-            for &k in t {
-                let (k0, k1) = if vertical_flow {
-                    (placed[k].x, placed[k].x + placed[k].w)
-                } else {
-                    (placed[k].y, placed[k].y + placed[k].h)
-                };
-                lo = lo.min(k0);
-                hi = hi.max(k1);
-            }
-            (lo, hi)
-        });
-        // 单弓弧线的弓高上限：控制点 Q=弦中点+外侧·q，Q 不越联合 bbox ⇒ q ≤ 弦中点到
-        // 目标侧 bbox 外沿的距离。内侧兄弟（更外侧还有同向兄弟）此限更宽，但 q_pref
-        // 的「幅度随 lat 单调」保证它仍小于外兄弟的幅度，分支彼此永不交叉。
-        // 横向轴：TB/BT 用 x（节点宽）、LR/RL 用 y（节点高）。
-        let (src_c, tgt_c) = if vertical_flow {
-            (pa.x + pa.w / 2., pb.x + pb.w / 2.)
-        } else {
-            (pa.y + pa.h / 2., pb.y + pb.h / 2.)
-        };
-        let ch_mid = (src_c + tgt_c) / 2.;
-        let q_max = bounds.map(|(lo, hi)| {
-            if tgt_c >= src_c {
-                hi - ch_mid
-            } else {
-                ch_mid - lo
-            }
-        });
-        // 目标横向半尺寸（弧线「肚皮」落到目标列外侧一点的依据；LR/RL 用节点高）。
-        let tgt_w = if vertical_flow { pb.w } else { pb.h };
+        // 旧「弓高 q_max / 目标半宽 tgt_w」限额已随弧线重构移除（见 [`arc_curve`]）：新弧线
+        // 前段单弓横向极值恒 ≤ 目标列、末端竖直尾段沿箭头方向，天然不越「源盒+子盒」联合
+        // 列带，无需再按 bbox 钳制（`smoothed_edge` 两参数据此传 `None`）。
         // 目标端箭头方向 = 目标接触边垂直内法向（[`edge_arrow_dir`]）：按本边实际钉在目标
         // 的哪条边定死（TB 顶边→(0,1)、BT 底边→(0,-1)、LR 左→(1,0)、RL 右→(-1,0)），与
         // 弧线切线无关——箭头「垂直指向节点」而非跟随弧线入射角度（旧 `end_tangent` 解析
@@ -705,7 +669,7 @@ fn route_edges(
         // 逻辑锚点仍保留节点边缘（标签锚点 / 缩放 / paint 箭头 tip 的单一来源，不随弧线
         // 尾部收短而变）——「线到基部、箭头到节点」双连接修复的 layout 侧落点。
         let base = arrow_base(*pts.last().unwrap(), arrow_dir, ARROW_LEN_PX);
-        let smoothed = smoothed_edge(g.direction, *kind, &pts, branch, Some(tgt_w), q_max, Some(base));
+        let smoothed = smoothed_edge(g.direction, *kind, &pts, branch, None, None, Some(base));
         // 标签锚点 = **可见线（绘制折线）按弧长的真实中点**：绘制折线 = smoothed（无则
         // 骨架），有箭头时末点回缩到箭头基部、双向源端再回缩一个箭头长（与 paint
         // `edge_draw_points` 同式同常量，「线到基部、箭头到节点」的可见线）。旧取弧线
@@ -788,56 +752,55 @@ fn smoothed_edge(
     }
 }
 
-/// 二次贝塞尔**单弓弧线**（弓向目标外侧 = 远离源列中心线的外侧分叉，TB/BT/RL/LR
-/// 任意方向自洽，BT/RL 反向推进仍正确）：
-/// P0=出射点、P3=入射点，Q=骨架直线中点 + n·q（n=弓起方向单位向量，指向目标所在侧）。
+/// 弧线 = **前段二次贝塞尔单弓 + 末端竖直尾段**：以与箭头**同方向的切线**自然落入基部，
+/// 消灭「先弓向外、入端切线斜 40~60°、接垂直箭头前先弯出去再折回来」的拐角/回弯。
 ///
-/// 解析性质（二次贝塞尔 + 控制点取弦中点的结构）：
-/// - **行进坐标线性**：Q 的行进坐标（TB/BT 的 y、LR/RL 的 x）恰为 P0/P3 均值 ⇒
-///   行进坐标随 t **线性**推进，曲线只占据「源出射边 → 目标入射边」之间的带，绝无
-///   回折/穿回源或目标盒；
-/// - **对直线弦的横向（外侧）偏距 = 2·q·t(1−t)**（代入 x(t)=(1−t)²x0+2t(1−t)(弦中+q)+t²x3
-///   展开即得）：符号恒为「目标侧」、中点（t=½）**最大 = q/2**（肚皮）⇒ **无 S 拐点、
-///   无回折、不越弦**（这正是用户「别弯来弯去」的几何落点）；端点精确穿过 P0/P3；
-/// - **凸包界**：整条曲线落在 {P0,Q,P3} 凸包内 ⇒ 凡 Q 不越的 bbox，弧线也不越。
-///
-/// q 的取值（`q_pref` 为主，双保险钳制）：
-/// - 目标节点宽度已知（`tgt_w`，路由期传入）→ `q_pref=clamp(0.5·lat+0.5·tgt_w+3,14,84)`，
-///   肚皮（q/2）落在目标列中区偏外侧、约过目标入射点 ~3px（窗口化实测），同源分支幅度
-///   随 lat 单调 ⇒ 分支彼此不交叉（同侧两支 D−C=(Δlat)·t+2(q_D−q_C)t(1−t) ≥ 0）；
-/// - 无宽度信息（单元直调）→ 退化为 `q_pref=clamp(1.35·lat,16,84)`；
-/// - 再取 `min(1.15·adv)`（弓高不超过行进步，避免横摆过度）与 `min(q_max)`（见
-///   [`route_edges`]，控制点 Q 不越联合 bbox ⇒ 整条弧线亦然）。
-/// 12 采样含两端点，paint 逐段画弧。箭头方向**不再取弧线切线**——改由目标接触边的垂直
-/// 内法向决定（见 [`edge_arrow_dir`]），弧线本体只负责路径形状（用户「垂直指向节点」）。
-/// `end` = 弧线实际终点 = 箭头基部（节点边缘 `p3` 向连接外侧回缩一个箭头长，见
-/// [`arrow_base`]）；控制点仍由真实 `p3`（节点边缘）推导，故弧线的弓幅/入射切线几何不变，
-/// 只是尾部 9px 收短到基部——入射段仍沿原切线方向进入基部（用户「线到基部、箭头到节点」）。
-fn arc_curve(p0: (f32, f32), p3: (f32, f32), dir: MmDirection, tgt_w: Option<f32>, q_max: Option<f32>, end: (f32, f32)) -> Vec<(f32, f32)> {
-    let ctrl = arc_ctrl(p0, p3, dir, tgt_w, q_max);
-    sample_quad_full(p0, ctrl, end, 12)
-}
-
-/// 弧线控制点 Q = 弦中点 + 外侧 · q。`arc_curve` 采样整条弧线；箭头方向不随弧线切线走，
-/// 由目标接触边垂直内法向决定（见 [`edge_arrow_dir`]）。
-fn arc_ctrl(p0: (f32, f32), p3: (f32, f32), dir: MmDirection, tgt_w: Option<f32>, q_max: Option<f32>) -> (f32, f32) {
-    let (nx, ny) = match dir {
-        MmDirection::TB | MmDirection::BT => (if p3.0 >= p0.0 { 1. } else { -1. }, 0.),
-        MmDirection::LR | MmDirection::RL => (0., if p3.1 >= p0.1 { 1. } else { -1. }),
-    };
-    let (lat, adv) = match dir {
-        MmDirection::TB | MmDirection::BT => ((p3.0 - p0.0).abs(), (p3.1 - p0.1).abs()),
-        MmDirection::LR | MmDirection::RL => ((p3.1 - p0.1).abs(), (p3.0 - p0.0).abs()),
-    };
-    let w = tgt_w.unwrap_or(0.);
-    let q_pref = if w > 0. {
-        (0.5 * lat + 0.5 * w + 3.).clamp(14., 84.)
+/// 结构（TB/BT/RL/LR 任意方向自洽，BT/RL 反向推进仍正确）：
+/// - **竖直尾段**：终点 `end`（= 箭头基部，节点边缘沿连接外侧回缩一个箭头长，见
+///   [`arrow_base`]）沿行进方向回退 `k2` 得拐点 `J`；`J→end` 是**严格沿箭头方向（该边
+///   垂直/水平内法向，见 [`edge_arrow_dir`]）的直线尾段**——其上任意采样点都落在箭头方向
+///   上，**末段与 arrow_dir 夹角恒 0°**（构造性保证「线以同向切线落入基部、无回弯」；
+///   旧二次贝塞尔仅有 t=1 端点切线竖直，末段多边形采样仍斜至高 ~22°，肉眼有翼）。
+/// - **前段**：P0→J 的二次贝塞尔单弓，控制点 C1 **横向钉在 J 列**（= 箭头内法向列）、行进
+///   取前段中点 ⇒ 前段**端切线自已是竖直的**（端切线 = J−C1 = (0,·)），与竖直尾段
+///   **C1 连续、无折角**；横向偏距对直线弦同号（单弓）、且极值 ≤ 目标列——**无 S、不越
+///   目标列**（绝不跨界压同侧兄弟/目标盒，比旧 q 弓超目标列更收敛）；行进取 P0→J→end
+///   单调无回折（凸包界：整条曲线落在 {P0,C1,J,end} 凸包内）。
+/// - **k2**（竖直尾段长）= `clamp(0.35·行进步, 8, 16)` 再按可用行进步收窄（J 不越过 P0、
+///   前段留保形跨度），尾段覆盖基部前最后一小段、随缩放任其实质竖直。
+/// - 12 采样（前段 9 点含两端 + 尾段 4 点去重后共 12），paint 逐段画弧。`p3`（节点边缘）/
+///   `tgt_w`/`q_max`（旧 q 弓高与 bbox 限额）在新结构下不再参与（横向恒 ≤ 目标列），保留
+///   签名以不变更调用方；弧线目标端收短到 `end`、箭头 tip 仍 = 节点边缘（「线到基部、
+///   箭头到节点」）。
+fn arc_curve(p0: (f32, f32), _p3: (f32, f32), dir: MmDirection, _tgt_w: Option<f32>, _q_max: Option<f32>, end: (f32, f32)) -> Vec<(f32, f32)> {
+    let vertical = matches!(dir, MmDirection::TB | MmDirection::BT);
+    let (adv, ts) = if vertical {
+        ((end.1 - p0.1).abs(), if end.1 >= p0.1 { 1. } else { -1. })
     } else {
-        (1.35 * lat).clamp(16., 84.)
+        ((end.0 - p0.0).abs(), if end.0 >= p0.0 { 1. } else { -1. })
     };
-    let q = q_pref.min(1.15 * adv).min(q_max.unwrap_or(f32::INFINITY));
-    let mid = ((p0.0 + p3.0) / 2., (p0.1 + p3.1) / 2.);
-    (mid.0 + nx * q, mid.1 + ny * q)
+    // 竖直尾段长：默认约 1/3 行进步，保底 8、封顶 16；再用可用行进步收窄（J 不越过 P0、
+    // 前段至少留 30% / 4px 的保形跨度）。
+    let k2 = (0.35 * adv).clamp(8., 16.).min(adv * 0.7).min((adv - 4.).max(2.));
+    let jt = adv - k2;
+    let j = if vertical {
+        (end.0, p0.1 + ts * jt)
+    } else {
+        (p0.0 + ts * jt, end.1)
+    };
+    // 前段控制点 C1：横向钉在 J 列 ⇒ 前段端切线竖直、与尾段 C1 连续；行进取前段中点。
+    let c1 = if vertical {
+        (j.0, (p0.1 + j.1) / 2.)
+    } else {
+        ((p0.0 + j.0) / 2., j.1)
+    };
+    let mut pts = sample_quad_full(p0, c1, j, 9);
+    pts.pop(); // 去掉 J，由竖直尾段从 J 续（去重后共 12 点）
+    for k in 0..4 {
+        let t = k as f32 / 3.;
+        pts.push((j.0 + (end.0 - j.0) * t, j.1 + (end.1 - j.1) * t));
+    }
+    pts
 }
 
 /// 二次贝塞尔采样（含两端点；n 点，中点当 n 奇为 t=0.5）。
@@ -1340,21 +1303,6 @@ mod tests {
         dot.acos().to_degrees()
     }
 
-    /// 二次贝塞尔采样点重建控制点 Q（独立于 `arc_ctrl` 的数值反演）：取 t=1/(n-1) 的
-    /// 首内样点，`B(t)=(1-t)²P0+2(1-t)t·Q+t²P3` → 解出 Q。用于独立反演弧线真实入射
-    /// 切线（∝ P3−Q），证明「垂直内法向」箭头与弧线入射方向确实不同，避免「用同一实现
-    /// 验证同一实现」。
-    fn reconstruct_quad_ctrl(sm: &[(f32, f32)], p0: (f32, f32), p3: (f32, f32)) -> (f32, f32) {
-        let n = sm.len();
-        assert!(n >= 3);
-        let t = 1. / (n - 1) as f32;
-        let mt = 1. - t;
-        let s = sm[1];
-        let qx = (s.0 - mt * mt * p0.0 - t * t * p3.0) / (2. * mt * t);
-        let qy = (s.1 - mt * mt * p0.1 - t * t * p3.1) / (2. * mt * t);
-        (qx, qy)
-    }
-
     fn unit(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
         let dx = b.0 - a.0;
         let dy = b.1 - a.1;
@@ -1522,19 +1470,22 @@ mod tests {
             } else {
                 assert!(signed >= 8., "{f}→{t} 应弓向外侧(右{expect})：signed={signed:.1} ≥ +8");
             }
-            // 箭头方向（新语义，paint 取 `arrow_dir` ——目标接触边垂直内法向）：
-            // 1. = (0,1)：TD 正向目标顶边 → 垂直向下直插节点，不与边界法向夹角（=0°）；
-            // 2. 且该弧线**真实入射切线**（独立重建控制点反演）偏离垂直方向显著 —— 弧线
-            //    并非竖直入射，证明「垂直指向」是真实改动（旧实现取真切线/割线即那个歪角，
-            //    正是投诉 .2 根因；若未来把箭头接回切线须重写本断言）；
+            // 箭头方向（paint 取 `arrow_dir` ——目标接触边垂直内法向）：
+            // 1. = (0,1)：TD 正向目标顶边 → 垂直向下直插节点，与边界法向夹角 0°；
+            // 2. 且弧线**末段方向与 arrow_dir 夹角 < 5°**（=0°，构造性保证，见 [`arc_curve`]
+            //    竖直尾段）——线以**同向切线**落入箭头基部，无「先出后回」回弯。本断言是
+            //    用户「弧线自然落入垂直箭头」的落点（原「真实切线偏离垂直 5~11.5°」的旧
+            //    语义已随本次重构反转，重写为要求的反方向断言）；
             // 3. tip 落点 = 骨架末端 = 目标顶边接触点（`points.last()` 逻辑锚点不因弧线收短
             //    到基部而变；上方已锁 sm.last()=基部、且基部≠节点边缘）。
             assert_eq!(e.arrow_dir, (0., 1.), "{f}→{t} TD 顶边进应垂直向下 (0,1)");
             assert_eq!(ang_between(e.arrow_dir, (0., 1.)), 0., "{f}→{t} 与边界法向夹角应 0°");
-            let q = reconstruct_quad_ctrl(sm, e.points[0], e.points[3]);
-            let real = unit(q, e.points[3]);
-            let dev = ang_between(real, e.arrow_dir);
-            assert!(dev > 2., "{f}→{t} 弧线真实切线偏离垂直法向 {dev:.2}° 应显著（垂直指向是真实修复）");
+            let dev = ang_between(unit(sm[sm.len() - 2], sm[sm.len() - 1]), e.arrow_dir);
+            assert!(dev < 5., "{f}→{t} 弧线末段方向与箭头方向夹角 {dev:.2}° 应 < 5°（以同向切线落入基部、无回弯）");
+            // 竖直尾段真正进入基部：末段端点（倒数第二→末）应基本沿箭头方向推进（无回折）。
+            let (t0, t1) = (sm[sm.len() - 2], sm[sm.len() - 1]);
+            let travel_adv = (t1.1 - t0.1) * e.arrow_dir.1 + (t1.0 - t0.0) * e.arrow_dir.0;
+            assert!(travel_adv > 0., "{f}→{t} 竖直尾段应继续沿 arrow_dir 推进");
             // 基部-尖端闭合几何：sm.last()(基部) 到 points.last()(节点边缘) 恰沿 arrow_dir
             // 一个 ARROW_LEN_PX——paint 最后一段线到基部、实心箭头从基部填充到节点边缘。
             let (dx, dy) = (sm.last().unwrap().0 - tip.0, sm.last().unwrap().1 - tip.1);
@@ -1766,6 +1717,45 @@ mod tests {
         // RL：左行源（镜像），下方目标 → 弓 +y；上方目标 → 弓 −y。
         assert!(signed(RL, (60., 0.), (20., 50.)) >= 8., "RL 下方目标弓 +y");
         assert!(signed(RL, (60., 60.), (20., 10.)) <= -8., "RL 上方目标弓 −y");
+    }
+
+    /// 用户「弧线以与箭头**同方向**的切线自然落入基部、无回弯」核心回归：分支弧线（同源
+    /// 分支 4 点肘 → [`smoothed_edge`] → [`arc_curve`]）的**末段方向恒 ≈ 该边箭头方向**
+    /// （竖直尾段构造保证夹角 =0°，见 [`arc_curve`]；旧二次贝塞尔仅 t=1 端点切线竖直、末段
+    /// 多边形采样仍斜至高 ~22°，接垂直箭头前「先弯出去再折回来」即本修复对象）。四流向
+    /// TB/BT/LR/RL 各自锁：末段与 `arrow_dir`（= 行进方向 = 目标接触边垂直内法向）夹角
+    /// **< 5°**、末段**沿箭头方向推进**（在 arrow_dir 上投影 >0，证无回折）、**无 S**（横向
+    /// 对直线弦同号偏距）、首尾锚定不变。
+    #[test]
+    fn arc_ends_vertical_with_arrow_dir_all_directions() {
+        use MmDirection::{BT, LR, RL, TB};
+        use MmEdgeKind::Arrow;
+        // (流向, 源点, 入点=节点边缘, 期望箭头方向=行进方向, 横向轴 axis: TB/BT→x、LR/RL→y)。
+        let cases: [(MmDirection, (f32, f32), (f32, f32), (f32, f32), usize); 6] = [
+            (TB, (0., 0.), (50., 20.), (0., 1.), 0),
+            (TB, (60., 0.), (10., 20.), (0., 1.), 0),
+            (BT, (0., 30.), (50., 2.), (0., -1.), 0),
+            (LR, (0., 0.), (20., 50.), (1., 0.), 1),
+            (LR, (0., 60.), (20., 10.), (1., 0.), 1),
+            (RL, (60., 60.), (20., 10.), (-1., 0.), 1),
+        ];
+        for (dir, p0, p3, arrow_dir, axis) in cases {
+            let mid_y = (p0.1 + p3.1) / 2.;
+            let sm = smoothed_edge(dir, Arrow, &[p0, (p0.0, mid_y), (p3.0, mid_y), p3], true, None, None, None)
+                .expect(&format!("{dir:?} 分支应出弧线"));
+            assert_eq!(sm.len(), 12, "{dir:?} 弧线应 12 点");
+            assert_eq!(sm.first(), Some(&p0), "{dir:?} 首锚定不变");
+            assert_eq!(sm.last(), Some(&p3), "{dir:?} 尾锚定不变");
+            // 核心：末段方向与箭头方向夹角 < 5°（无回弯、自然接箭）。
+            let dev = ang_between(unit(sm[sm.len() - 2], sm[sm.len() - 1]), arrow_dir);
+            assert!(dev < 5., "{dir:?} 末段与箭头方向夹角 {dev:.2}° 应 < 5°（以同向切线落入基部、无回弯）");
+            // 末段沿箭头方向推进（无「出后再回」：在 arrow_dir 上的投影为正）。
+            let (a, b) = (sm[sm.len() - 2], sm[sm.len() - 1]);
+            let adv = (b.0 - a.0) * arrow_dir.0 + (b.1 - a.1) * arrow_dir.1;
+            assert!(adv > 0., "{dir:?} 末段应沿箭头方向 {arrow_dir:?} 推进（无回折）");
+            // 无 S：横向对直线弦偏距同号（单弓）。
+            assert_arc_no_s(&sm, axis, p0, p3);
+        }
     }
 
     /// 箭头方向 = 目标接触边**垂直内法向**（与弧线切线无关，用户「垂直指向节点」语义落点）。
