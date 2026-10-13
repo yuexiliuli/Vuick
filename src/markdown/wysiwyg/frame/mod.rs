@@ -1504,6 +1504,14 @@ pub(crate) fn settle_giant_blocks(
         st.giant_idle = st.giant_idle.saturating_add(1);
     }
     if st.giant_idle < Prewarm::GIANT_SETTLE_IDLE_FRAMES {
+        // I4 补帧：登记待 settle 后**滚动/编辑停止即不再有事件帧**——「静止连续帧」计数
+        // 会卡在低值，「占位 → 静止 → 权威整形」闭环永远走不到，巨块停在空占位/钉住旧
+        // 行直到用户再互动。这里每帧请求下一帧，让计数推进到阈值；settle 消费完
+        // `pending_giant`（`is_empty` 分支）或带判定放弃（`giant_idle=0` 分支）后不再
+        // 请求 → 收敛即静止，不引入持续逐帧重绘（与 `advance_pending_scroll` 同款 RAF，
+        // prepaint 内合法）。
+        #[cfg(not(test))]
+        window.request_animation_frame();
         return;
     }
     // 越界（换源/结构编辑后旧下标失效）的登记直接清掉。
