@@ -119,6 +119,103 @@ fn markdown_editor_renders_wysiwyg_styles(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn large_rs_first_frame_colors_visible_area_sync(cx: &mut TestAppContext) {
+    use std::ops::Range;
+    use gpui::HighlightStyle;
+
+    // 首屏同步上色回归（方案 A+B）：大 `.rs`（≥数百行、顶部含多行块注释 / 原始字符串
+    // 跨行构造）打开**首帧**（空缓存、未预热、不 settle）走真实 `build_rows` 路径，可见区
+    // **立即**有着色（不再先纯文本、后补色）。多行构造的作用域从文件头整段解析：闭界
+    // 后的行不再被误染注释/字符串色（作用域跨行正确闭合，非逐行孤立上色）。第二段：
+    // 首帧后下滚（真路径）仍连续上色。
+    // 注：本引擎 `parse_line` 按行消费 syntect 的 scope ops，多行作用域的**内部行**（块
+    // 注释中间行 / 原始字符串中间行）历来接不到 ops → 为空的既有行为，此处不作断言；
+    // 断言的是「闭界后的解析正确」与「首帧可见区整体有色」。
+    let mut lines: Vec<String> = vec![
+        "// 顶部行注释".into(),
+        "/* 块注释开始".into(),
+        "   块注释中间行".into(),
+        "   块注释结束 */".into(),
+        "fn main() {".into(),
+        "    // 函数内行注释".into(),
+        "    let s = \"普通字符串\";".into(),
+        "    let rs = r#\"原始字符串".into(),
+        "        第一行".into(),
+        "        第三行也是\"#;".into(),
+        "    /* 第二个块".into(),
+        "        继续 */".into(),
+        "    let n: u64 = 1234;".into(),
+        "    call();".into(),
+        "}".into(),
+    ];
+    for i in 0..420 {
+        lines.push(format!("fn pad{i}() {{ let v: u32 = {i}; // c{i} }}"));
+    }
+    let text = lines.join("\n");
+    let (host, cx) = open(cx, &text);
+
+    // 切到 Rust 语法后**立刻**（无中间渲染/预热/settle）走首帧 `build_rows`。
+    let first = cx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.set_language(Some("rust")));
+        ed.update(cx, |ed, _| ed.test_build_rows_first_frame(window, 0, 20))
+    });
+    assert!(first.len() >= 21, "首帧应返回可见行（实际 {} 行）", first.len());
+    let color_of = |row: &[(Range<usize>, HighlightStyle)]| -> Option<gpui::Hsla> {
+        row.iter().find(|(_, s)| s.color.is_some()).and_then(|(_, s)| s.color)
+    };
+    // 首帧可见区**整体有色**：绝大多数行有着色段（多行作用域内部行除外），不再整帧空白。
+    let colored_rows = first.iter().filter(|(_, st)| !st.is_empty()).count();
+    assert!(
+        colored_rows >= 10,
+        "首帧可见区应整体有色（≥10 行，实际 {colored_rows}/{} 行）——首帧不再被延后成空样式",
+        first.len()
+    );
+    // 具体 token 即有着色（真语法解析，非占位）：注释 / 字符串 / 数字各归其色。
+    let c_comment = color_of(&first[0].1).expect("顶部 // 行应有注释色");
+    let c_string = color_of(&first[6].1).expect("字符串行应有字符串色");
+    let c_number = color_of(&first[12].1).expect("数字行应有数字色");
+    assert_ne!(c_string, c_comment, "字符串色 ≠ 注释色");
+    assert_ne!(c_number, c_comment, "数字色 ≠ 注释色");
+    // 多行块注释/原始字符串**闭界后的解析正确**（作用域跨行连续）：闭界后行不得被
+    // 误染注释/字符串色——块注释闭界后的 `fn main`、原始字符串闭界后的行均为各自色。
+    assert_ne!(
+        color_of(&first[4].1),
+        Some(c_comment),
+        "块注释闭界后（fn main）不得误染注释色"
+    );
+    assert_ne!(
+        color_of(&first[12].1),
+        Some(c_comment),
+        "第二个块注释闭界后（数字行）不得误染注释色"
+    );
+    assert_ne!(
+        color_of(&first[13].1),
+        Some(c_string),
+        "原始字符串闭界后（call();）不得误染字符串色"
+    );
+    // 多行构造起点即入作用域：原始字符串开始行与普通字符串同色。
+    assert_eq!(
+        color_of(&first[7].1),
+        Some(c_string),
+        "原始字符串开始行应为字符串色（作用域从开始行接入）"
+    );
+
+    // 首帧后下滚（真路径，预热保存点 → `extend_down` 连续续栈）仍每行有色。
+    let deep = cx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_build_rows_snapshot(window, 60, 100))
+    });
+    assert!(deep.len() >= 41, "下滚窗口应返回行（实际 {} 行）", deep.len());
+    for (i, (text, st)) in deep.iter().enumerate() {
+        assert!(
+            !st.is_empty(),
+            "下滚第 {i} 行（60+{i}，{text:?}）应有颜色（extend_down 续栈）"
+        );
+    }
+}
+
+#[gpui::test]
 fn font_size_change_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
     // 回归（2026-09-19 用户反馈）：编辑区 Ctrl+滚轮放大/缩小字号时窗口也跟着滚动。
     // 修复 = 行高变化时把滚动目标同比换算（同 PDF 的视口锚定）——视口顶部的内容点

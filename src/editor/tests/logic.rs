@@ -424,14 +424,13 @@ fn deferred_scroll_skips_syntect_until_settled() {
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
 
-    // 首帧（P1c：空缓存 + 语法）延后上色——登记 pending、本帧不整窗重解析；次帧同一
-    // 窗口 settle 补齐顶部缓存后即命中快速路径。
-    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
-    assert_eq!(hl.pending(), Some((0, 108, 16)), "延后登记 pending 供次帧 settle");
-    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
-    assert_eq!(hl.pending(), None);
+    // 首屏（P1c：空缓存 + 语法）→ 方案 A **同步立即上色**——不再延后 settle，首帧即
+    // 整窗解析建缓存（O(窗口+回看)）；只有滚动大缺口才走延后。缓存就绪后同窗口命中
+    // 快速路径。
+    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
+    assert_eq!(hl.pending(), None, "首屏同步上色不登记 pending");
     let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
-    assert!(!top[0].is_empty(), "settle 后顶部窗口应有颜色");
+    assert!(!top[0].is_empty(), "首屏首行立即有颜色（不再先纯文本后补色）");
     // 缓存就绪后，同窗口再次请求命中快速路径（覆盖 → 不登记 pending）。
     assert!(hl.accept_deferred(0, 108, 16), "缓存命中应走快速路径");
     assert_eq!(hl.pending(), None, "快路径不登记 pending");
@@ -482,11 +481,10 @@ fn medium_gap_scroll_defers_until_settled() {
     let b = Buffer::new(&text);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    // 首帧（P1c 空缓存）延后 + settle 建顶窗缓存。
-    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
-    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
+    // 首屏（P1c 空缓存）→ 方案 A 同步上色建顶窗缓存（不再延后 settle）。
+    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
     let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
-    assert!(!top[0].is_empty(), "预热后顶部应有颜色");
+    assert!(!top[0].is_empty(), "首屏顶部应有颜色");
 
     // 中速大缺口（~500 行，落在 100-900 中速带、且 < 旧 1024 阈值）：应延后而非同步扩展。
     let (lo, hi) = (500usize, 608usize);
@@ -520,12 +518,12 @@ fn small_gap_scroll_stays_sync_path() {
     let b = Buffer::new(&text);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    assert!(!hl.accept_deferred(0, 108, 16), "首帧（空缓存）应延后上色（P1c）");
-    assert!(hl.settle_pending(&b), "首帧 settle 应补齐顶部缓存");
+    // 首屏（P1c 空缓存）→ 方案 A 同步上色建顶窗缓存（+ ≤2×视口预热）。
+    assert!(hl.accept_deferred(0, 108, 16), "首屏（空缓存）应同步立即上色（方案 A）");
     let _ = hl.highlight_window(&b, 0, 108, 16).to_vec();
 
-    // 小缺口下滚：窗口 [60,180] 越出缓存 72 行（≤ 预算）→ 同步扩展、颜色即时。
-    let (lo, hi) = (60usize, 180usize);
+    // 小缺口下滚：窗口 [260,380] 越出预热缓存上界 112 行（≤ 预算）→ 同步扩展、颜色即时。
+    let (lo, hi) = (260usize, 380usize);
     assert!(hl.accept_deferred(lo, hi, 16), "小缺口应走同步快路径（不延后）");
     assert_eq!(hl.pending(), None, "同步路径不登记 pending");
     assert_eq!(hl.base(), 0, "同步扩展保持 base 不动（作用域栈连续）");
@@ -728,17 +726,18 @@ fn incremental_edit_grows_window_beyond_cache_matches_full() {
     let mut b = Buffer::new(&src);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    // 暖缓存：小窗口 [0,20]（缓存只覆盖 0..≈36）
+    // 暖缓存：小窗口 [0,20]（首屏预热后缓存覆盖 0..=62）。
     let _ = hl.highlight_window(&b, 0, 20, 16).to_vec();
     // 编辑第 0 行行首插入换行（净行 +1）
     let pos = b.line_start(0);
     b.apply_edit(pos..pos, "\n");
     hl.set_dirty(Some((0, 2, 1)));
-    // 请求窗口大幅下移 [0,60]：底超出旧缓存上界 + delta → 尾部位移行越出旧缓存。
-    let after: Vec<_> = hl.highlight_window(&b, 0, 60, 16).to_vec();
+    // 请求窗口大幅下移 [0,80]：底（80）超出旧缓存上界（62）+ delta → 尾部位移行越出
+    // 旧缓存，必须界校验后回落整段重解析（否则 `old_lines[or - old_base]` 越界 panic）。
+    let after: Vec<_> = hl.highlight_window(&b, 0, 80, 16).to_vec();
     let mut truth = Highlighter::new();
     truth.set_language(Some("rust"));
-    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 60, 16).to_vec();
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 80, 16).to_vec();
     assert_eq!(
         after, truth_rows,
         "编辑+窗口下移超出旧缓存后应回落整段重解析，不得越界 panic"
@@ -1027,17 +1026,20 @@ fn char_align_highlights_survives_stale_ranges() {
 // ---------------------------------------------------------------------------
 // P1a：渐进打开「纯尾追加」跨块高亮复用
 // ---------------------------------------------------------------------------
-// P1a / P1c：渐进打开「纯尾追加」跨块高亮复用 + 首帧延后上色
+// P1a / P1c：渐进打开「纯尾追加」跨块高亮复用 + 首屏同步上色（方案 A 改 P1c 旧「首帧
+// 延后」行为）
 // ---------------------------------------------------------------------------
 // 探针（`full_reparse` 计数 / 门控开关）都打在 `Highlighter` **实例**上（`#![cfg(test)]`
 // 字段 + 访问器），cargo 并行跑其它触发重解析的测试时不会互相污染。
 
-/// P1c 回归：`.rs` 首帧（高亮缓存为空 + 语法已配置）一律**延后上色**——`accept_deferred`
-/// 登记 pending 并返回 `false`（本帧空样式渲染、不同步整段重解析），次帧 settle 补色。
-/// 复用滚动期既有 pending/request_animation_frame/settle 机制，不新造状态机；
-/// `.txt`（无语法）不受影响（空缓存小窗口仍走快路径：其建缓存只是填空样式，代价≈0）。
+/// 首屏回归（方案 A，改 P1c 旧行为）：`.rs` 首屏（高亮缓存为空 + 语法已配置）
+/// **同步立即上色**——`accept_deferred` 走快路径、不登记 pending、不在「下一帧」才补色
+/// （避免「先纯文本、滚动停住才上色」的观感死区）；首帧 `highlight_window` 即整段
+/// 建缓存 O(窗口+回看)。滚动大缺口（>单帧预算）仍走既有延后 + settle（见
+/// `deferred_scroll_skips_syntect_until_settled`）。
+/// `.txt`（无语法）不受影响（空缓存小窗口快路径：建缓存只是填空样式，代价≈0）。
 #[test]
-fn empty_cache_with_syntax_defers_first_frame() {
+fn empty_cache_with_syntax_colors_first_frame_sync() {
     use crate::editor::highlight::Highlighter;
     let text = (0..20)
         .map(|i| format!("fn f{i}() {{ let v = {i}; // c{i} }}\n"))
@@ -1045,28 +1047,22 @@ fn empty_cache_with_syntax_defers_first_frame() {
     let b = Buffer::new(&text);
     let mut hl = Highlighter::new();
     hl.set_language(Some("rust"));
-    // 空缓存 + 语法 → 延后（本帧不整窗重解析，首帧先出纯文本/光标）。
+    // 空缓存 + 语法 → 首屏同步（本帧不延后、不登记 pending）。
     assert!(
-        !hl.accept_deferred(0, 10, 16),
-        ".rs 首帧（空缓存）应延后上色，不在首帧同步整段重解析"
+        hl.accept_deferred(0, 10, 16),
+        ".rs 首屏（空缓存）应同步立即上色，不在首帧延后"
     );
-    assert_eq!(
-        hl.pending(),
-        Some((0, 10, 16)),
-        "延后应登记 pending，供下一帧 settle 补色"
-    );
-    // 次帧同一窗口 → settle_pending 有界重锚 → 有颜色且与窗口对齐。
-    assert!(hl.settle_pending(&b), "settle 应补齐缓存");
-    assert_eq!(hl.pending(), None, "settle 消耗 pending");
+    assert_eq!(hl.pending(), None, "首屏同步上色不登记 pending");
+    // 首帧即全量解析 → 有颜色且与窗口对齐（不必等 settle）。
     let rows = hl.highlight_window(&b, 0, 10, 16).to_vec();
     assert_eq!(rows.len(), 11);
-    assert!(!rows[0].is_empty(), "settle 后首行应有颜色");
+    assert!(!rows[0].is_empty(), "首屏首行应有颜色（无需 settle）");
 
-    // 对照：`.txt`（无语法）首帧空缓存仍走快路径（不延后），且首帧填空样式代价≈0。
+    // 对照：`.txt`（无语法）首屏空缓存仍走快路径，且首帧填空样式代价≈0。
     let mut hl_txt = Highlighter::new();
     assert!(
         hl_txt.accept_deferred(0, 10, 16),
-        "无语法（.txt）首帧不应被 P1c 延后（快路径保持）"
+        "无语法（.txt）首屏走快路径（与方案 A 一致）"
     );
     let txt_rows = hl_txt.highlight_window(&b, 0, 10, 16).to_vec();
     assert_eq!(txt_rows.len(), 11);
@@ -1274,4 +1270,93 @@ fn bench_medium_gap_scroll_frames() {
         "  拖动帧: 均值 {mean_us:.0}µs  最小 {min_us}µs  明细 {frame_us:?}（同步补缺口 {sync_n} 帧）"
     );
     println!("  静止 settle（一屏有界重锚）: {settle_us}µs");
+}
+
+// ---------------------------------------------------------------------------
+// 首屏上色时延基准（方案 A+B）
+// ---------------------------------------------------------------------------
+
+/// 首屏「首帧 → 可见区着色可感知」基准：模拟 `build_rows` 的首屏帧循环（`accept_deferred`
+/// 快/延后分叉 + settle），输出到「可见区全有色」所需**帧数与 syntect 成本**（debug）。
+/// - 方案 A：首帧 `accept_deferred` 走快速（空缓存 → 同步）→ 首帧 `highlight_window`
+///   即着色（**1 帧到位**）；首屏预热（≤2×视口，封顶 160）使缓存行数有界（打印
+///   `test_cache_len`，
+///   绝不当全档 parse）。
+/// - 旧行为（P1c）：首帧延后（本帧 0 syntect、空样式 + RAF），次帧 settle 才着色
+///   （**2 帧到位**）——即「先纯文本、随后才补色」的观感死区。
+/// 基准实测当前代码实际路径；before/after 各跑 ≥3 次取中位数对比（`first_quick` + 帧数
+/// + µs 中位数），bench 代码两份 HEAD 相同。
+/// 运行：`cargo test --bin gpui-editor bench_first_frame_coloring -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_first_frame_coloring() {
+    use std::time::Instant;
+    const W: usize = 108;
+    const RUNS: usize = 5;
+    let text: String = (0..120_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let fresh = || {
+        let mut hl = Highlighter::new();
+        hl.set_language(Some("rust"));
+        hl
+    };
+
+    let mut first_quick = None;
+    let mut frames_first = None;
+    let mut colors_us: Vec<u128> = Vec::new(); // 当前代码实际路径（到首色 syntect 成本）。
+    let mut cache_len = 0usize;
+    for _ in 0..RUNS {
+        let mut hl = fresh();
+        let quick = hl.accept_deferred(0, W, 16);
+        if first_quick.is_none() {
+            first_quick = Some(quick);
+        }
+        let t = Instant::now();
+        if quick {
+            // 方案 A：首帧同步上色（含 ≤2×视口预热）。
+            if frames_first.is_none() {
+                frames_first = Some(1usize);
+            }
+            let rows = hl.highlight_window(&b, 0, W, 16).to_vec();
+            assert!(rows.iter().all(|r| !r.is_empty()), "首屏即可见区全有色");
+        } else {
+            // 旧行为：首帧延后（本帧 0 syntect、空样式 + RAF）；次帧窗口一致 → settle 补色。
+            if frames_first.is_none() {
+                frames_first = Some(2usize);
+            }
+            let prev = hl.pending();
+            let quick2 = hl.accept_deferred(0, W, 16);
+            assert!(!quick2 && prev == Some((0, W, 16)), "次帧仍延后 → 满足 settle 前提");
+            assert!(hl.settle_pending(&b), "settle 应补齐缓存");
+            let rows = hl.highlight_window(&b, 0, W, 16).to_vec();
+            assert!(rows.iter().all(|r| !r.is_empty()), "settle 后可见区应全有色");
+        }
+        colors_us.push(t.elapsed().as_micros());
+        cache_len = cache_len.max(hl.test_cache_len());
+    }
+    let mut us = colors_us.clone();
+    us.sort_unstable();
+    let med = us[us.len() / 2];
+    // 校准：同行文本绕过 Buffer 直接纯 syntect parse，看每行成本大头在哪。
+    let st_ref = crate::editor::highlight::syntax_set_ref();
+    let syn = st_ref.find_syntax_by_token("rust").unwrap();
+    let mut pp = syntect::parsing::ParseState::new(syn);
+    let t_c = std::time::Instant::now();
+    for r in 0..269 {
+        let _ = pp.parse_line(b.line_text(r).as_ref(), st_ref);
+    }
+    let cal_us = t_c.elapsed().as_micros();
+    println!("==== 首屏上色时延基准（大 .rs 12 万行，debug，视口 {W} 行 ×{RUNS} 次）====");
+    println!("  校准：纯 syntect parse 269 行 = {cal_us}µs（{:.0}µs/行）", cal_us as f64 / 269.0);
+    println!("  首帧 accept_deferred 返回快速（方案 A 同步上色）: {first_quick:?}");
+    println!("  到「可见区全有色」: {frames_first:?} 帧（1=首帧即有色；2=先纯文本+RAF，次帧 settle 才着色）");
+    println!("  着色 syntect 成本: 中位 {med}µs  min {}µs  {us:?}", us[0]);
+    println!("  首屏预热缓存行数（封顶=非全档 parse）: {cache_len}（基线窗 {W} 行）");
 }

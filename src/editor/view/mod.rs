@@ -859,9 +859,28 @@ impl CodeEditor {
             .collect()
     }
 
+    /// 测试：**不预热**直接走 `build_rows` 的取数路径（每行最终样式段）。
+    /// 方案 A 后首屏（空缓存）同步上色、不再延后 + `request_animation_frame`，故在
+    /// 帧外直调 `build_rows` 安全——用「新开文档首屏」验证**首帧即有着色**（大 .rs
+    /// 打开不再先纯文本、后补色）。仅适用于「新开文档首屏」窗口（小缺口），勿用于
+    /// 滚动大缺口窗口（那帧仍会延后 + RAF，帧外直调会 debug_assert 炸）。
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)] // 测试专用（文本 + 样式段）复合快照类型。
+    pub(crate) fn test_build_rows_first_frame(
+        &mut self,
+        window: &mut Window,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
+        self.build_rows(window, lo, hi, false)
+            .into_iter()
+            .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
+            .collect()
+    }
+
     /// 测试：直接调 `build_rows` 前先预热高亮缓存（仅非 Markdown 的 syntect 路径需要）。
-    /// P1c 起 `.rs` 首帧（空缓存 + 语法）会走「延后上色」且在 `build_rows` 里
-    /// `request_animation_frame`（只能在真实帧内调用）——测试在帧外直调 build_rows 会
+    /// 首屏（方案 A）虽已同步上色，但**滚动大缺口**帧仍走「延后上色」且在 `build_rows`
+    /// 里 `request_animation_frame`（只能在真实帧内调用）——测试在帧外直调 build_rows 会
     /// debug_assert 炸。这里绕过高亮器把 pending/settle 契约**帧外安全**执行完（与
     /// `build_rows` 的快路径/延后路径同一组 API），之后 `build_rows` 自然命中缓存，不再
     /// 走延后分支。缓存已覆盖则幂等（命中/小扩展）。Markdown（`md_mode`）走

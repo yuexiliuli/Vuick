@@ -39,9 +39,10 @@ use crate::editor::buffer::Buffer;
 /// （目标窗口底 − 缓存上界 + 1）不超过此值时允许 UI 线程同步逐行续解析——滚轮/惯性微跳
 /// （每帧几~几十行）保持即时上色、作用域栈完整；超过预算（中速拖动/惯性滚，缺口
 /// 100-900 行）改走 [`Self::pending`] 延后 + settle **有界重锚**（`full_reparse`，
-/// O(窗口+回看)≈一屏）：首帧/拖动帧只付一屏解析（延后帧 0 syntect、空样式渲染），余量
-/// 交 settle 补齐，不再每帧把整个缺口逐行重跑——大 `.rs` ~63µs/行，600 行缺口 ≈
-/// 40-100ms/跳（release）/ 百 ms 级（debug），是「中速拖动不跟手」的根因。
+/// O(窗口+回看)≈一屏）：拖动帧只付空样式渲染（帧廉价、0 syntect），余量交 settle 补齐，
+/// 不再每帧把整个缺口逐行重跑——大 `.rs` ~63µs/行，600 行缺口 ≈ 40-100ms/跳（release）/
+/// 百 ms 级（debug），是「中速拖动不跟手」的根因。**注意**：首屏（缓存为空）不走此延后
+/// 路径——打开/首帧同步上色（见 [`Self::accept_deferred`]），否则大文档先出纯文本再补色。
 const EXTEND_SYNC_BUDGET_ROWS: usize = 160;
 
 /// 共享语法集（默认语法集几 MB，进程级共享一次）。
@@ -64,6 +65,12 @@ fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
         cache.insert(lang, r);
     }
     r
+}
+
+/// 测试探针：进程级共享语法集引用（供基准校准直接测纯 syntect parse 成本）。
+#[cfg(test)]
+pub(crate) fn syntax_set_ref() -> &'static SyntaxSet {
+    &SYNTAX_SET
 }
 
 /// syntect scope → 语义名（与 `src/syntax` 的 GitHub 配色语义一致）。
@@ -219,6 +226,12 @@ impl Highlighter {
         self.test_reparse_count
     }
 
+    /// 测试探针：当前缓存行数（自 `base` 起）；用于断言首屏预热**有界**（非全档 parse）。
+    #[cfg(test)]
+    pub(crate) fn test_cache_len(&self) -> usize {
+        self.lines.len()
+    }
+
     /// 测试探针：累计一次 `full_reparse`（仅测试构建存在）。
     #[cfg(test)]
     fn bump_reparse_count(&mut self) {
@@ -300,14 +313,14 @@ impl Highlighter {
             self.pending = None;
             return true;
         }
-        // 首帧（缓存为空）且配置了语法 → 一律延后：首次整窗 syntect 解析（DEBUG 下
-        // .rs ~10-30ms）改到「下一帧 settle_pending」补色，首帧先出纯文本/光标。与滚动期
-        // 大缺口共用同一 pending / request_animation_frame / settle 机制，不新造状态机；
-        // `.txt`（无 syntax）不受影响（下方 needs_reanchor 判定照旧，空缓存小窗口仍走
-        // 快路径——放空样式行的建缓存成本可忽略）。
-        if self.lines.is_empty() && self.syntax.is_some() {
-            self.pending = Some((lo, hi, lookback));
-            return false;
+        // 首屏（缓存为空）→ 同步立即上色：打开/首帧一次整窗解析（O(窗口+回看)≈一屏）直接
+        // 放本帧做。P1c 曾把「首帧一律延后 + settle」与「滚动大缺口延后」共用同一
+        // pending/settle 状态机，导致首次打开大文档也是先出纯文本、滚动停住才上色
+        // （观感死区）；改后只有**滚动大缺口**（>单帧预算下跳 / 上移越过 base）才走
+        // 延后 + settle（滚动期帧必须廉价、滑块/内容跟手）。
+        // `.txt`（无 syntax）首屏本就走快路径（建缓存只是填空样式，代价≈0），不受影响。
+        if self.lines.is_empty() {
+            return true;
         }
         let needs_reanchor = if lo >= self.base {
             let cached_end = self.base + self.lines.len();
@@ -514,6 +527,29 @@ impl Highlighter {
         #[cfg(test)]
         self.bump_reparse_count();
         let start = lo.saturating_sub(lookback).min(line_count.saturating_sub(1));
+        // 方案 B：首屏从文件头锚定（空缓存 + lo==0）时预热 ≤2×视口 行（视口 =
+        // hi−lo+1，封顶 `EXTEND_SYNC_BUDGET_ROWS`）并保存每行作用域保存点——打开后首次
+        // 下滚在预热范围内由 `extend_down`
+        // 从保存点连续续栈、不整段重锚（滚动小缺口即时上色而不是重锚整窗）。预热必须
+        // 封顶（`min` 单帧预算），且**绝不越过「末真实行」**：`line_count` 含 ropey
+        // 尾换行幻影空行，若把幻影行缓存下来，追加开始时该槽被新内容占用而缓存未失效
+        // → 复用旧空槽（色缺失）。预热下端最多到请求窗口底（请求窗本身含幻影行是既有
+        // 语义，不得缩到请求窗口之下）。代价 O(视口)+常数，绝不演变成全档 parse。
+        let requested_hi = hi;
+        let warm_rows = if self.lines.is_empty() && lo == 0 {
+            (hi.saturating_sub(lo).saturating_add(1).saturating_mul(2))
+                .min(EXTEND_SYNC_BUDGET_ROWS)
+        } else {
+            0
+        };
+        // 末真实行：`line_count - 1` 为幻影空行（尾换行 → 该行长 0）则减一，否则即末行。
+        let last_real = if line_count > 1 && buffer.line_len(line_count - 1) == 0 {
+            line_count.saturating_sub(2)
+        } else {
+            line_count.saturating_sub(1)
+        };
+        let warm_ceiling = last_real.max(requested_hi);
+        let hi = requested_hi.saturating_add(warm_rows).min(warm_ceiling);
         let mut lines: Vec<Vec<(Range<usize>, Hsla)>> = Vec::with_capacity(hi - start + 1);
         let mut saves: Vec<ParseState> = Vec::with_capacity(hi - start + 1);
         let Some(syntax) = self.syntax else {
