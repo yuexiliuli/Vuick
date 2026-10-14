@@ -15,17 +15,21 @@
 //! 自带组合窗口），组合内偏移只摆光标、不建选区。
 
 use std::ops::Range;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, point, size, AnyElement, App, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
     EntityInputHandler, EventEmitter, Focusable, FocusHandle, GlobalElementId, Hsla,
-    InteractiveElement as _, IntoElement, LayoutId, MouseButton, MouseDownEvent, Pixels, Point,
-    Render, SharedString, Styled as _, TextInputConfiguration, TextRun, UTF16Selection, Window, px,
+    InteractiveElement as _, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Styled as _,
+    TextInputConfiguration, TextRun, UTF16Selection, Window, px,
 };
 
 use crate::actions::{
     Backspace, Copy, Delete, DeleteToNextWordEnd, DeleteToPreviousWordStart, MoveEnd, MoveHome,
     MoveLeft, MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, SelectAll,
+    SelectToEnd, SelectToEndOfLine, SelectToNextWordEnd, SelectToPreviousWordStart, SelectToStart,
+    SelectToStartOfLine,
 };
 use config::layout::DEFAULT_FONT_SIZE;
 // P3a 断环关键点：EditIntent 已下沉 base，本 crate 不再经 editor 引用（editor↔ui 环断开）。
@@ -44,6 +48,10 @@ pub enum InputEvent {
 const PAD_PX: f32 = 2.0;
 /// 光标宽。
 const CARET_PX: f32 = 1.0;
+/// 光标闪烁周期（ms，对齐编辑器 `BLINK_MS`）。
+const CARET_BLINK_MS: u64 = 500;
+/// 光标交互后的静止期（ms，期间光标常亮不闪，对齐编辑器 `BLINK_PAUSE_MS`）。
+const CARET_BLINK_PAUSE_MS: u64 = 300;
 
 /// 单行输入框状态（实体）：文本 + 占位符 + 焦点 + 光标（字节区间）+ 元素边界。
 pub struct InputState {
@@ -51,6 +59,22 @@ pub struct InputState {
     placeholder: SharedString,
     focus_handle: FocusHandle,
     selection: Range<usize>,
+    /// 选区活动端点（head）：光标所在端（`selection` 恒为 min..max）。
+    /// 拖选/Shift 移动时 head 随鼠标/按键走、锚点（另一端）不动；光标绘制看 head。
+    selection_head: usize,
+    /// 鼠标拖选中（元素内已按下、尚未松开）。`on_mouse_up`/`on_mouse_up_out`/失焦复位。
+    dragging: bool,
+    /// 光标可见性（闪烁驱动）。
+    caret_visible: bool,
+    /// 光标交互后静止期起点（期间光标常亮不闪）。
+    caret_pause_until: Option<Instant>,
+    /// 闪烁代际：失焦/重新聚焦后旧循环自然退出。
+    blink_epoch: u64,
+    blink_running: bool,
+    /// 本实体是否持焦（on_focus/on_blur + render 对齐维护，供闪烁循环判退）。
+    focused: bool,
+    /// 焦点事件是否已注册（仅一次）。
+    focus_registered: bool,
     /// 组合中（marked）区间（字节）。Windows 组合更新 `range=None` = 替换它；
     /// 提交/取消后由共享核心清空。单行框不画组合下划线，但必须跟踪以保证「替换不追加」。
     marked: Option<Range<usize>>,
@@ -65,6 +89,14 @@ impl InputState {
             placeholder: SharedString::default(),
             focus_handle: cx.focus_handle(),
             selection: 0..0,
+            selection_head: 0,
+            dragging: false,
+            caret_visible: false,
+            caret_pause_until: None,
+            blink_epoch: 0,
+            blink_running: false,
+            focused: false,
+            focus_registered: false,
             marked: None,
             element_bounds: Bounds::default(),
         }
@@ -81,6 +113,7 @@ impl InputState {
         self.text = value.into();
         let len = self.text.len();
         self.selection = len..len;
+        self.selection_head = len;
         self
     }
 
@@ -101,6 +134,7 @@ impl InputState {
         self.text = value.into();
         let len = self.text.len();
         self.selection = len..len;
+        self.selection_head = len;
         self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -111,6 +145,7 @@ impl InputState {
         self.text = text.into();
         let len = self.text.len();
         self.selection = len..len;
+        self.selection_head = len;
         self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -133,6 +168,7 @@ impl InputState {
         self.text.replace_range(start..end, new_text);
         let caret = start + new_text.len();
         self.selection = caret..caret;
+        self.selection_head = caret;
         self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
@@ -163,11 +199,33 @@ impl InputState {
     fn move_to(&mut self, index: usize, cx: &mut Context<Self>) {
         let index = index.min(self.text.len());
         self.selection = index..index;
+        self.selection_head = index;
+        self.kick_caret();
+        cx.notify();
+    }
+
+    /// 扩展选区：把 head（活动端点，光标所在端）移到 `index`，锚点（另一端）不动——
+    /// 拖选 / Shift（含 Shift+Ctrl）方向扩选共用。选区恒归一化为 `min..max`。
+    fn extend_to(&mut self, index: usize, cx: &mut Context<Self>) {
+        let index = index.min(self.text.len());
+        // 锚点 = 当前非 head 端点（反选中 head==start 时锚点在 end，否则在 start）。
+        let anchor = if self.selection_head == self.selection.start {
+            self.selection.end
+        } else {
+            self.selection.start
+        };
+        if index >= anchor {
+            self.selection = anchor..index;
+        } else {
+            self.selection = index..anchor;
+        }
+        self.selection_head = index;
+        self.kick_caret();
         cx.notify();
     }
 
     fn move_delta(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let cur = self.selection.end;
+        let cur = self.selection_head;
         let next = if delta < 0 {
             self.prev_char(cur)
         } else {
@@ -176,29 +234,45 @@ impl InputState {
         self.move_to(next, cx);
     }
 
-    fn move_word(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let mut cur = self.selection.end;
-        if forward {
-            while cur < self.text.len() && self.text[cur..].starts_with(char::is_whitespace) {
-                cur = self.next_char(cur);
-            }
-            while cur < self.text.len() && !self.text[cur..].starts_with(char::is_whitespace) {
-                cur = self.next_char(cur);
-            }
-        } else {
-            while cur > 0 && self.text[..cur].ends_with(char::is_whitespace) {
-                cur = self.prev_char(cur);
-            }
-            while cur > 0 && !self.text[..cur].ends_with(char::is_whitespace) {
-                cur = self.prev_char(cur);
-            }
+    /// 往回一个词边界（字节，纯计算，不改状态）。
+    fn prev_word(&self, cur: usize) -> usize {
+        let mut cur = cur.min(self.text.len());
+        while cur > 0 && self.text[..cur].ends_with(char::is_whitespace) {
+            cur = self.prev_char(cur);
         }
-        self.move_to(cur, cx);
+        while cur > 0 && !self.text[..cur].ends_with(char::is_whitespace) {
+            cur = self.prev_char(cur);
+        }
+        cur
+    }
+
+    /// 往前一个词边界（字节，纯计算，不改状态）。
+    fn next_word(&self, cur: usize) -> usize {
+        let mut cur = cur.min(self.text.len());
+        while cur < self.text.len() && self.text[cur..].starts_with(char::is_whitespace) {
+            cur = self.next_char(cur);
+        }
+        while cur < self.text.len() && !self.text[cur..].starts_with(char::is_whitespace) {
+            cur = self.next_char(cur);
+        }
+        cur
+    }
+
+    fn move_word(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let head = self.selection_head;
+        let next = if forward {
+            self.next_word(head)
+        } else {
+            self.prev_word(head)
+        };
+        self.move_to(next, cx);
     }
 
     fn select_all(&mut self, cx: &mut Context<Self>) {
         let len = self.text.len();
         self.selection = 0..len;
+        self.selection_head = len;
+        self.kick_caret();
         cx.notify();
     }
 
@@ -229,23 +303,11 @@ impl InputState {
         if sel.start < sel.end {
             self.edit_range(sel, "", cx);
         } else if backward {
-            let mut cur = sel.start;
-            while cur > 0 && self.text[..cur].ends_with(char::is_whitespace) {
-                cur = self.prev_char(cur);
-            }
-            while cur > 0 && !self.text[..cur].ends_with(char::is_whitespace) {
-                cur = self.prev_char(cur);
-            }
-            self.edit_range(cur..sel.start, "", cx);
+            let start = self.prev_word(sel.start);
+            self.edit_range(start..sel.start, "", cx);
         } else {
-            let mut cur = sel.end;
-            while cur < self.text.len() && self.text[cur..].starts_with(char::is_whitespace) {
-                cur = self.next_char(cur);
-            }
-            while cur < self.text.len() && !self.text[cur..].starts_with(char::is_whitespace) {
-                cur = self.next_char(cur);
-            }
-            self.edit_range(sel.end..cur, "", cx);
+            let end = self.next_word(sel.end);
+            self.edit_range(sel.end..end, "", cx);
         }
     }
 
@@ -279,31 +341,29 @@ impl InputState {
         cursor
     }
 
-    /// 光标矩形 x（元素原点 + pad + 前缀宽），供 IME `bounds_for_range`。
-    fn caret_px(&self, byte: usize, element_bounds: Bounds<Pixels>, window: &mut Window) -> Pixels {
-        let prefix = &self.text[..byte.min(self.text.len())];
-        let pad = element_bounds.origin.x + px(PAD_PX);
-        if prefix.is_empty() {
-            return pad;
+    /// 前缀文本整形宽度（px，空串 → 0）。供光标 x、拖选两端 x 共用。
+    fn text_width(&self, s: &str, window: &mut Window) -> Pixels {
+        if s.is_empty() {
+            return px(0.);
         }
         let run = TextRun {
-            len: prefix.len(),
+            len: s.len(),
             font: gpui::font(SharedString::from(".SystemUIFont")),
             color: Hsla::default(),
             background_color: None,
             underline: None,
             strikethrough: None,
         };
-        let w = window
+        window
             .text_system()
-            .shape_line(
-                SharedString::from(prefix.to_string()),
-                px(DEFAULT_FONT_SIZE),
-                &[run],
-                None,
-            )
-            .width();
-        pad + w
+            .shape_line(SharedString::from(s.to_string()), px(DEFAULT_FONT_SIZE), &[run], None)
+            .width()
+    }
+
+    /// 光标矩形 x（元素原点 + pad + 前缀宽），供 IME `bounds_for_range`。
+    fn caret_px(&self, byte: usize, element_bounds: Bounds<Pixels>, window: &mut Window) -> Pixels {
+        let prefix = &self.text[..byte.min(self.text.len())];
+        element_bounds.origin.x + px(PAD_PX) + self.text_width(prefix, window)
     }
 
     // -- 事件回调 --
@@ -384,11 +444,184 @@ impl InputState {
         self.copy(cx);
     }
 
+    fn on_select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_to(0, cx);
+    }
+
+    fn on_select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.extend_to(self.text.len(), cx);
+    }
+
+    fn on_select_to_start_of_line(
+        &mut self,
+        _: &SelectToStartOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_to(0, cx);
+    }
+
+    fn on_select_to_end_of_line(
+        &mut self,
+        _: &SelectToEndOfLine,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.extend_to(self.text.len(), cx);
+    }
+
+    fn on_select_prev_word(
+        &mut self,
+        _: &SelectToPreviousWordStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let head = self.selection_head;
+        self.extend_to(self.prev_word(head), cx);
+    }
+
+    fn on_select_next_word(
+        &mut self,
+        _: &SelectToNextWordEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let head = self.selection_head;
+        self.extend_to(self.next_word(head), cx);
+    }
+
+    /// 统一按键：只处理 keymap 未覆盖的 **Shift+← / Shift+→** 逐字符扩选（与主编辑器
+    /// `CodeEditor::on_key_down` 同套路——`Select{Left,Right}` 是组件/编辑器内部 action、
+    /// 公共 keymap 未绑我们无法注册 handler，故在原样 key_down 层处理）；其余全走
+    /// `on_action`。可打印字符（无修饰）放行给 IME/输入处理。
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let k = &event.keystroke;
+        let m = k.modifiers;
+        if !m.control && !m.alt && !m.platform && k.key_char.is_some() {
+            return;
+        }
+        if m.shift && !m.control && !m.alt && !m.platform {
+            match k.key.to_ascii_lowercase().as_str() {
+                "left" => self.extend_to(self.prev_char(self.selection_head), cx),
+                "right" => self.extend_to(self.next_char(self.selection_head), cx),
+                _ => {}
+            }
+        }
+    }
+
     fn on_mouse_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if ev.button != MouseButton::Left {
+            return;
+        }
         self.focus_handle.focus(window, cx);
         let x = (ev.position.x - self.element_bounds.origin.x - px(PAD_PX)).max(px(0.));
         let index = self.index_at_x_impl(x, window);
-        self.move_to(index, cx);
+        // Shift+点按 = 从当前光标扩选到点击处（编辑器同语义）；否则落点摆光标。
+        if ev.modifiers.shift {
+            self.extend_to(index, cx);
+        } else {
+            self.move_to(index, cx);
+        }
+        self.dragging = true;
+        cx.notify();
+    }
+
+    /// 拖选：按住左键移动 → 扩展选区 head 到鼠标落点（锚点固定在按下处）。
+    fn on_mouse_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        let x = (ev.position.x - self.element_bounds.origin.x - px(PAD_PX)).max(px(0.));
+        let index = self.index_at_x_impl(x, window);
+        self.extend_to(index, cx);
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.cancel_mouse_drag();
+    }
+
+    /// 松开点落在元素 hitbox 外 / 顶层叠层 / 窗口外：元素级 `on_mouse_up`（受
+    /// `hitbox.is_hovered` 门控）不派发，本钩子（Capture 阶段）无条件收口拖选态
+    /// （对齐本仓 scrollbar / editor / wysiwyg 的 `on_mouse_up_out` 拖拽清态惯例）。
+    fn on_mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.cancel_mouse_drag();
+    }
+
+    /// 拖选态生命周期终点之一：松开/失焦复位 `dragging`（对齐编辑器
+    /// `CodeEditor::cancel_mouse_drag`；只清拖拽态，不动光标/选区）。
+    fn cancel_mouse_drag(&mut self) {
+        self.dragging = false;
+    }
+
+    // ---------------------------------------------------------------------
+    // 光标闪烁（对齐编辑器 `CodeEditor` 的 blink 实现）
+    // ---------------------------------------------------------------------
+
+    fn on_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = true;
+        self.kick_caret();
+        if !self.blink_running {
+            self.start_blink(cx);
+        }
+        cx.notify();
+    }
+
+    fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = false;
+        self.caret_visible = true;
+        self.cancel_mouse_drag();
+        cx.notify();
+    }
+
+    fn start_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_running {
+            return;
+        }
+        self.blink_running = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| loop {
+            let elapsed = this
+                .update(cx, |this, _| {
+                    this.caret_pause_until
+                        .map_or(u128::MAX, |p| p.elapsed().as_millis())
+                })
+                .unwrap_or(u128::MAX);
+            if elapsed >= CARET_BLINK_PAUSE_MS as u128 {
+                let _ = this.update(cx, |this, cx| {
+                    this.caret_visible = !this.caret_visible;
+                    cx.notify();
+                });
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(CARET_BLINK_MS))
+                .await;
+            let keep = this
+                .update(cx, |this, _| this.focused && epoch == this.blink_epoch)
+                .unwrap_or(false);
+            if !keep {
+                this.update(cx, |this, _| this.blink_running = false).ok();
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 光标交互后常亮静止期（拖选/键移后先亮住再继续闪）。
+    fn kick_caret(&mut self) {
+        self.caret_visible = true;
+        self.caret_pause_until = Some(Instant::now());
+    }
+
+    /// 当前帧光标是否应绘制：失焦不画；交互静止期内常亮；否则跟随闪烁翻转。
+    fn caret_shown_now(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let paused = self
+            .caret_pause_until
+            .is_some_and(|p| p.elapsed() < Duration::from_millis(CARET_BLINK_PAUSE_MS));
+        paused || self.caret_visible
     }
 }
 
@@ -431,8 +664,14 @@ impl ImeTextHost for InputState {
         self.selection.clone()
     }
 
+    /// 是否反选（`head < anchor`），驱动 `selected_text_range.reversed`。
+    fn selection_reversed(&self) -> bool {
+        self.selection.start < self.selection.end && self.selection_head == self.selection.start
+    }
+
     fn set_selection_bytes(&mut self, range: Range<usize>) {
-        self.selection = range;
+        self.selection = range.clone();
+        self.selection_head = range.end;
     }
 
     fn marked_bytes(&self) -> Option<Range<usize>> {
@@ -460,6 +699,7 @@ impl ImeTextHost for InputState {
             None => base_byte + new_text.len(),
         };
         self.selection = caret.min(self.text.len())..caret.min(self.text.len());
+        self.selection_head = caret.min(self.text.len());
     }
 
     fn apply_edit(
@@ -614,7 +854,26 @@ impl Input {
 }
 
 impl Render for InputState {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 首次渲染注册焦点事件（blink 启动/失焦复位），并做启动期焦点态对齐
+        // （对齐编辑器 sync_render_state：window.focus() 若发生在注册前，事件会丢）。
+        if !self.focus_registered {
+            let _ = cx.on_focus(&self.focus_handle, window, Self::on_focus);
+            let _ = cx.on_blur(&self.focus_handle, window, Self::on_blur);
+            self.focus_registered = true;
+        }
+        if self.focus_handle.is_focused(window) && !self.focused {
+            self.focused = true;
+            self.kick_caret();
+            if !self.blink_running {
+                self.start_blink(cx);
+            }
+            cx.notify();
+        } else if !self.focus_handle.is_focused(window) && self.focused {
+            self.focused = false;
+            self.cancel_mouse_drag();
+            cx.notify();
+        }
         let inner = div()
             .id("ui-input-box")
             .key_context("Input")
@@ -632,8 +891,18 @@ impl Render for InputState {
             .on_action(cx.listener(Self::on_move_prev_word))
             .on_action(cx.listener(Self::on_move_next_word))
             .on_action(cx.listener(Self::on_select_all))
+            .on_action(cx.listener(Self::on_select_prev_word))
+            .on_action(cx.listener(Self::on_select_next_word))
+            .on_action(cx.listener(Self::on_select_to_start))
+            .on_action(cx.listener(Self::on_select_to_end))
+            .on_action(cx.listener(Self::on_select_to_start_of_line))
+            .on_action(cx.listener(Self::on_select_to_end_of_line))
             .on_action(cx.listener(Self::on_copy))
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out))
             .w_full()
             .h(px(24.))
             .overflow_hidden();
@@ -712,13 +981,15 @@ impl Element for InputElement {
         );
         self.inner.paint(window, cx);
 
-        let (focused, text, placeholder, selection) = {
+        let (focused, text, placeholder, selection, selection_head, caret_shown) = {
             let state = self.entity.read(cx);
             (
                 state.focused(window, cx),
                 state.text.clone(),
                 state.placeholder.clone(),
                 state.selection.clone(),
+                state.selection_head,
+                state.caret_shown_now(),
             )
         };
         let theme = Theme::global(cx).clone();
@@ -750,35 +1021,44 @@ impl Element for InputElement {
                 .shape_line(SharedString::from(display.to_string()), fs, &[run], None);
             let _ = line.paint(text_origin, line_h, gpui::TextAlign::Left, None, window, cx);
         }
-        // 光标：仅聚焦且显示真实文本（非占位符）时。
+        // 选区背景（拖选/键选时高亮，对齐编辑器选区底色）+ 光标：仅聚焦且显示真实
+        // 文本（非占位符）时。光标画在选区 head 端、由闪烁驱动显示。
         if focused && !show_placeholder {
-            let caret_byte = selection.start.min(text.len());
-            let prefix = &text[..caret_byte];
-            let caret_x = if prefix.is_empty() {
-                text_origin.x
-            } else {
-                let p_run = TextRun {
-                    len: prefix.len(),
-                    font: gpui::font(SharedString::from(".SystemUIFont")),
-                    color: Hsla::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
+            if selection.start < selection.end {
+                let s_x = text_origin.x
+                    + self.entity.read(cx).text_width(&text[..selection.start], window);
+                let e_x = text_origin.x
+                    + self.entity.read(cx).text_width(&text[..selection.end], window);
+                let sel_bg = theme.colors.editor_selection_bg;
+                window.paint_quad(gpui::PaintQuad {
+                    bounds: Bounds::new(point(s_x, text_origin.y), size(e_x - s_x, line_h)),
+                    corner_radii: gpui::Corners::default(),
+                    background: sel_bg.into(),
+                    border_widths: gpui::Edges::default(),
+                    border_color: sel_bg.into(),
+                    border_style: gpui::BorderStyle::Solid,
+                });
+            }
+            if caret_shown {
+                let caret_byte = selection_head.min(text.len());
+                let prefix = &text[..caret_byte];
+                let caret_x = if prefix.is_empty() {
+                    text_origin.x
+                } else {
+                    text_origin.x + self.entity.read(cx).text_width(prefix, window)
                 };
-                let w = window
-                    .text_system()
-                    .shape_line(SharedString::from(prefix.to_string()), fs, &[p_run], None)
-                    .width();
-                text_origin.x + w
-            };
-            window.paint_quad(gpui::PaintQuad {
-                bounds: Bounds::new(point(caret_x, text_origin.y), size(px(CARET_PX), line_h)),
-                corner_radii: gpui::Corners::default(),
-                background: theme.colors.fg.into(),
-                border_widths: gpui::Edges::default(),
-                border_color: theme.colors.fg.into(),
-                border_style: gpui::BorderStyle::Solid,
-            });
+                window.paint_quad(gpui::PaintQuad {
+                    bounds: Bounds::new(
+                        point(caret_x, text_origin.y),
+                        size(px(CARET_PX), line_h),
+                    ),
+                    corner_radii: gpui::Corners::default(),
+                    background: theme.colors.fg.into(),
+                    border_widths: gpui::Edges::default(),
+                    border_color: theme.colors.fg.into(),
+                    border_style: gpui::BorderStyle::Solid,
+                });
+            }
         }
     }
 }
@@ -943,5 +1223,242 @@ mod tests {
         );
         assert_eq!(caret, "编辑".len().."编辑".len(), "光标停在提交文本末尾");
         assert_eq!(*changes.borrow(), 7, "组合每步与提交各发一次 Change");
+    }
+
+    /// 跑几帧，等渲染/layout/prepaint 就绪（element_bounds 供鼠标命中换算）。
+    fn settle_window(wcx: &mut VisualTestContext) {
+        for _ in 0..3 {
+            let _ = wcx.refresh();
+            wcx.run_until_parked();
+        }
+    }
+
+    /// 复现 1：侧边栏搜索框「无法按住鼠标拖动选中文字」——`on_mouse_down` 只摆光标、
+    /// 没有线内 mouse-move 拖动扩展选区。断言：按下左键后拖动（移动鼠标）应形成选区。
+    #[gpui::test]
+    async fn mouse_drag_selects_range(cx: &mut TestAppContext) {
+        let (input, wcx, _) = add_input(cx, "hello world");
+        settle_window(wcx);
+        let bounds = wcx.update(|window, cx| {
+            let b = input.read(cx).element_bounds.clone();
+            let _ = window;
+            b
+        });
+        let y = bounds.origin.y + px(4.);
+        // 按下：文本起始处（元素左缘 + 左内边距）→ 光标落 0
+        let down = point(bounds.origin.x + px(PAD_PX), y);
+        wcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: down,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..0,
+            "按下落点应先把光标坍缩到 0"
+        );
+        // 按住左键拖到元素右缘 → 选区应扩展（而非仍坍缩）
+        let drag_to = point(bounds.origin.x + bounds.size.width - px(1.), y);
+        wcx.simulate_event(gpui::MouseMoveEvent {
+            position: drag_to,
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::default(),
+        });
+        let sel = wcx.update(|_, cx| input.read(cx).selection.clone());
+        assert_eq!(
+            sel,
+            0.."hello world".len(),
+            "按住左键拖到右缘应形成 0..len 选区（拖选）"
+        );
+        // 反向拖回落点 → 选区收缩坍缩（锚点固定）
+        wcx.simulate_event(gpui::MouseMoveEvent {
+            position: down,
+            pressed_button: Some(gpui::MouseButton::Left),
+            modifiers: gpui::Modifiers::default(),
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..0,
+            "拖回落点应收缩到坍缩"
+        );
+        // 松开左键 → 拖拽闭环
+        wcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: down,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        });
+        assert!(
+            !wcx.update(|_, cx| input.read(cx).dragging),
+            "松开后拖拽态应复位"
+        );
+    }
+
+    /// 复现 2：搜索框「Ctrl+← / Ctrl+→ 无法扩选词」。keymap 已绑
+    /// `ctrl-shift-left/right` → `SelectToPreviousWordStart/SelectToNextWordEnd`（见
+    /// `base::actions::bind_input_keys`），但 input.rs 没有对应 `on_action` handler。
+    /// 断言：Ctrl+Shift+方向应扩选词；普通 Ctrl+方向仍只移动光标（回归护栏）。
+    #[gpui::test]
+    async fn ctrl_shift_arrow_selects_word(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "foo bar baz");
+        settle_window(wcx);
+        // 点按聚焦并落光标到文本首
+        let bounds = wcx.update(|window, cx| {
+            let b = input.read(cx).element_bounds.clone();
+            let _ = window;
+            b
+        });
+        let y = bounds.origin.y + px(4.);
+        wcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: point(bounds.origin.x + px(PAD_PX), y),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        wcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: point(bounds.origin.x + px(PAD_PX), y),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        });
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..0,
+            "点按文本首应坍缩光标到 0"
+        );
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        // Ctrl+Shift+→：扩选第一个词 foo（0..3）
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-shift-right").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..3,
+            "Ctrl+Shift+→ 应扩选到词尾（foo）"
+        );
+        // 再按：扩到 "foo bar"（0..7）
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-shift-right").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..7,
+            "连续 Ctrl+Shift+→ 应扩展到第二个词尾"
+        );
+        // Ctrl+Shift+←：收缩一个词（head 7 → 4）
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-shift-left").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            0..4,
+            "Ctrl+Shift+← 应收缩到词头"
+        );
+        // 普通 Ctrl+→：仅移动光标（不扩选）
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("ctrl-right").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            7..7,
+            "普通 Ctrl+→ 应只移动光标"
+        );
+    }
+
+    /// 复现 2b：Shift+← / Shift+→ 逐字符扩选（与主编辑器 on_key_down 同套路——
+    /// `Select{Left,Right}` 无本地 action，走原样 key_down 层）。
+    #[gpui::test]
+    async fn shift_arrow_selects_by_char(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (input, wcx, _) = add_input(cx, "abcd");
+        settle_window(wcx);
+        let bounds = wcx.update(|window, cx| {
+            let b = input.read(cx).element_bounds.clone();
+            let _ = window;
+            b
+        });
+        let y = bounds.origin.y + px(4.);
+        wcx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: point(bounds.origin.x + px(PAD_PX), y),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        wcx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: point(bounds.origin.x + px(PAD_PX), y),
+            modifiers: gpui::Modifiers::default(),
+            click_count: 1,
+        });
+        let w = wcx.windows().first().copied().expect("有测试窗口");
+        // 先三个右移 → 光标 3
+        for _ in 0..3 {
+            wcx.dispatch_keystroke(w, gpui::Keystroke::parse("right").unwrap());
+        }
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            3..3,
+            "右移三次光标应在 3"
+        );
+        // Shift+Right：扩到 3..4
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("shift-right").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            3..4,
+            "Shift+Right 应扩选一个字符"
+        );
+        // Shift+Left：收缩回 3..3
+        wcx.dispatch_keystroke(w, gpui::Keystroke::parse("shift-left").unwrap());
+        assert_eq!(
+            wcx.update(|_, cx| input.read(cx).selection.clone()),
+            3..3,
+            "Shift+Left 应收缩一个字符"
+        );
+    }
+
+    /// 复现 3：搜索框「光标不闪烁」——聚焦后应启动 blink 循环、光标先可见；暂停期
+    /// 结束后可见性随计时翻转（闪烁）；失焦后循环退出不再翻转。
+    #[gpui::test]
+    async fn caret_blinks_with_timer(cx: &mut TestAppContext) {
+        let (input, wcx, _) = add_input(cx, "ab");
+        // 未聚焦：光标不画
+        assert!(
+            !wcx.update(|_, cx| input.read(cx).caret_shown_now()),
+            "未聚焦光标应不可见"
+        );
+        // 聚焦 → 光标可见（静止期开始）、blink 循环启动
+        wcx.update(|window, cx| window.focus(&input.read(cx).focus_handle(cx), cx));
+        settle_window(wcx);
+        let (shown, running, visible) = wcx.update(|_, cx| {
+            let s = input.read(cx);
+            (s.caret_shown_now(), s.blink_running, s.caret_visible)
+        });
+        assert!(shown, "聚焦后光标应可见");
+        assert!(running, "聚焦后应启动 blink 循环");
+        assert!(visible, "聚焦后 caret_visible 应为 true");
+        // 模拟静止期结束（无暂停标记 → 循环下一次 tick 翻转），推进虚拟时钟驱动计时器
+        wcx.update(|_, cx| input.update(cx, |s, _| s.caret_pause_until = None));
+        wcx.executor()
+            .advance_clock(Duration::from_millis(CARET_BLINK_MS + 10));
+        wcx.run_until_parked();
+        let after = wcx.update(|_, cx| input.read(cx).caret_visible);
+        assert!(!after, "光标可见性应随 blink 计时翻转（闪烁）");
+        // 失焦：真正 blur 窗口焦点态 + 直调 on_blur（gpui 测试环境不派发真实 focus/blur
+        // 事件，与编辑器 active_line_bg_requires_focus 的「focused=false 分支直测」同套路）。
+        // 不真正清焦点的话，render 焦点对齐会把 `focused` 拉回 true。
+        wcx.update(|window, cx| {
+            window.blur(cx);
+            input.update(cx, |s, cx| s.on_blur(window, cx));
+        });
+        // 失焦后循环还要再睡满周期才到退出判定（toggle → sleep → keep-check），分拍
+        // 推进 + 每拍 park（对齐本仓 pdf/editor 的 advance_clock 驱动惯用法）。
+        for _ in 0..8 {
+            wcx.executor()
+                .advance_clock(Duration::from_millis(CARET_BLINK_MS));
+            wcx.run_until_parked();
+        }
+        let (running2, shown2) = wcx.update(|_, cx| {
+            let s = input.read(cx);
+            (s.blink_running, s.caret_shown_now())
+        });
+        assert!(!running2, "失焦后 blink 循环应退出");
+        assert!(!shown2, "失焦后光标应不可见");
     }
 }
