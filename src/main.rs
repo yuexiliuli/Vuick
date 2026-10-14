@@ -3,17 +3,17 @@
 //!
 //! P5 拆分终态：全部功能逻辑已迁出到 workspace 各 crate（config/base/ime/viewer/
 //! syntax/ui/editor/markdown/toc/pdf/image/video/epub/shell），本包只剩初始化胶水。
-//! 各模块职责见各 crate（如 `gpui-editor-shell` 的 `EditorApp` / `bind_local_keymaps`）。
+//! 各模块职责见各 crate（如 `shell` 的 `EditorApp` / `bind_local_keymaps`）。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-use gpui_editor_base::actions::*;
-use gpui_editor_shell::{bind_local_keymaps, EditorApp};
-use gpui_editor_syntax::prewarm;
-use gpui_editor_ui::root;
-use gpui_editor_ui::theme::{Theme, ThemeMode};
-use gpui_editor_config::user::UserPrefs;
+use base::actions::*;
+use shell::{bind_local_keymaps, EditorApp};
+use syntax::prewarm;
+use ui::root;
+use ui::theme::{Theme, ThemeMode};
+use config::user::UserPrefs;
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {

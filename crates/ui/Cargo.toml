@@ -1,0 +1,21 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition = "2024"
+description = "gpui-editor 自研 UI 组件库 crate（button/theme/input/root/scrollbar 等，替代 gpui-component）"
+
+[dependencies]
+gpui = { workspace = true }
+regex = { workspace = true }
+config = { path = "../config" }
+base = { path = "../base" }
+ime = { path = "../ime" }
+
+[features]
+# video 相关图标变体（IconName::Play/Pause/Volume/…）随根包 video feature 转发而开关；
+# 根 `gpui-editor` 的 `video = ["ui/video"]` 保持行为与拆 crate 前一致。
+video = []
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+gpui = { workspace = true, features = ["test-support"] }
