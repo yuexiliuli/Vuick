@@ -68,8 +68,7 @@ impl FolderNav {
         self.items.get(idx).cloned()
     }
 
-    /// 清单切片（仅测试/只读辅助用；生产代码用 [`Self::get`]/[`Self::item`] 取单条）。
-    #[cfg(test)]
+    /// 清单切片（只读辅助；生产代码用 [`Self::get`]/[`Self::item`] 取单条）。
     pub fn items(&self) -> &[PathBuf] {
         &self.items
     }
