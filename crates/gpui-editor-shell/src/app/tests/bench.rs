@@ -16,7 +16,7 @@
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_file(r"fixtures/大文档测试.md", window, cx);
+                app.open_file(r"../../fixtures/大文档测试.md", window, cx);
             });
         });
         let sync_ms = t0.elapsed().as_millis();
@@ -80,7 +80,7 @@
         let t_txt = std::time::Instant::now();
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
-                app.open_file(r"fixtures/大文档测试.txt", window, cx);
+                app.open_file(r"../../fixtures/大文档测试.txt", window, cx);
             });
         });
         println!("【txt 打开：open_file 返回】(对照) {} ms", t_txt.elapsed().as_millis());
@@ -101,7 +101,7 @@
             cx.run_until_parked();
         }
         unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
-        let p = r"fixtures/大文档测试2.md";
+        let p = r"../../fixtures/大文档测试2.md";
         assert!(std::path::Path::new(p).is_file(), "{p} 缺失");
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
@@ -194,7 +194,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let p = r"fixtures/大文档测试2.md";
+        let p = r"../../fixtures/大文档测试2.md";
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(p, window, cx));
         });
@@ -314,9 +314,9 @@
             })
             .unwrap_or_else(|_| {
                 vec![
-                    r"fixtures/大文档测试.md".to_string(),
-                    r"fixtures/SKILL.md".to_string(),
-                    r"fixtures/SKILL.txt".to_string(),
+                    r"../../fixtures/大文档测试.md".to_string(),
+                    r"../../fixtures/SKILL.md".to_string(),
+                    r"../../fixtures/SKILL.txt".to_string(),
                 ]
             });
 
@@ -472,7 +472,7 @@
             cx.run_until_parked();
         }
         let path = std::env::var("BENCH_OPEN_FILE").unwrap_or_else(|_| {
-            r"fixtures/大文档测试126MB.txt".to_string()
+            r"../../fixtures/大文档测试126MB.txt".to_string()
         });
         if !std::path::Path::new(&path).is_file() {
             // 资产缺失：现场生成一份 ~120MB LF 文本（保证可复现基准）。
@@ -670,7 +670,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(r"fixtures/大文档测试.md", window, cx));
+            app.update(cx, |app, cx| app.open_file(r"../../fixtures/大文档测试.md", window, cx));
         });
         let mut frames = 0;
         loop {
@@ -767,7 +767,7 @@
             cx.run_until_parked();
         }
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.open_file(r"fixtures/大文档测试.md", window, cx));
+            app.update(cx, |app, cx| app.open_file(r"../../fixtures/大文档测试.md", window, cx));
         });
         let mut frames = 0;
         loop {
@@ -900,9 +900,9 @@
             })
             .unwrap_or_else(|_| {
                 vec![
-                    r"fixtures/大文档测试.md".to_string(),
-                    r"fixtures/SKILL.md".to_string(),
-                    r"fixtures/SKILL.txt".to_string(),
+                    r"../../fixtures/大文档测试.md".to_string(),
+                    r"../../fixtures/SKILL.md".to_string(),
+                    r"../../fixtures/SKILL.txt".to_string(),
                 ]
             });
         const N: usize = 1000;

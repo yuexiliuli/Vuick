@@ -9,69 +9,31 @@ edition = "2024"
 # gpui：钉死 zed 仓库提交（显式 rev，避免 cargo update 漂移；升级需同步改 workspace.dependencies 与 Cargo.lock）。
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
-serde_json = { workspace = true }
-regex = { workspace = true }
-memchr = { workspace = true }
-# 快速非加密哈希（默认 SipHash 在 debug 下对 3000-9000 条容器重建慢 5-10×）：
-# fold_plan 重建的 math_start/math_body/fold_lines/dyn_map 全部换 Fx（无迭代序依赖）。
-rustc-hash = { workspace = true }
-# 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
-# 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
-futures = { workspace = true }
-rfd = { workspace = true }
-anyhow = { workspace = true }
-zip = { workspace = true }
-roxmltree = { workspace = true }
-# ropey：自研编辑器直接持有的文本存储类型（CodeEditor 缓冲区/语法缓存）。
-ropey = { workspace = true }
-# PDF 栅格化用 native pdfium
-# 容器无损往返，字节逐像素保真（文本层对齐精度不受影响）。
-pdfium-render = { workspace = true }
-image = { workspace = true }
-# LaTeX 数学排版（参考 zorite-main 的 ratex-gpui 方案）：parse → layout → render，
-# 用 KaTeX 字体（embed-fonts 内嵌、纯 CPU 光栅），把 `$$…$$` / `$…$` 排版成 RenderImage，
-# 取代原来的 Unicode 近似（`∫₋∞∞` 等上下标/分式/根号终于按真实排版显示）。
-ratex-parser = { workspace = true }
-ratex-layout = { workspace = true }
-ratex-render = { workspace = true }
-# 编辑器代码高亮：syntect 解析默认语法集（features 对齐：parsing + default-syntaxes + regex-fancy）。
-syntect = { workspace = true }
-libjpeg-turbo-rs = { workspace = true }
-# FFmpeg 解码内核搬进独立 cdylib 工作区成员 `video-ffmpeg`（见下注释与 [workspace]）：
-# 主 exe 不再静态链接 FFmpeg → 缺 FFmpeg 运行库也能启动，只在用到视频时经 libloading
-# 运行时加载；加载失败（缺 video_ffmpeg.dll 或 FFmpeg dll）就在窗口内报错。
-# 无 FFmpeg 环境的源码构建：`cargo build --workspace --no-default-features --exclude video-ffmpeg`。
-libloading = { workspace = true }
-cpal = { workspace = true }
-# 拆分 workspace 后迁出的叶子 crate（P1）：config 常数 / base 基础件。
-gpui-editor-config = { path = "crates/gpui-editor-config" }
-gpui-editor-base = { path = "crates/gpui-editor-base" }
-# 拆分 workspace 后迁出的共享设施叶子 crate（P2）：ime / viewer / syntax。
-gpui-editor-ime = { path = "crates/gpui-editor-ime" }
-gpui-editor-viewer = { path = "crates/gpui-editor-viewer" }
-gpui-editor-syntax = { path = "crates/gpui-editor-syntax" }
-# 拆分 workspace 后迁出的自研 UI 组件库 crate（P3a）：ui，依赖 {config, base, ime} 不再依赖 editor。
+# P5 拆分终态：本二进制薄壳只需挂 shell（EditorApp + bind_local_keymaps）与
+# main.rs 直接引用的共享 crate（ui::root / ui::theme、config::user、syntax::prewarm、
+# base::actions 动作类型）；其余全部外部依赖已随各自功能 crate 迁出。
+# default-features = false：shell 的 `video` feature 由根 `video` feature 显式转发，
+# 否则 `--no-default-features` 仍会经 shell 自带的默认 video feature 拉进 FFmpeg 依赖。
+gpui-editor-shell = { path = "crates/gpui-editor-shell", default-features = false }
 gpui-editor-ui = { path = "crates/gpui-editor-ui" }
-# 拆分 workspace 后迁出的自研文本/代码编辑器 crate（P3b）：editor，依赖 {config, base, ime, ui} 不再依赖 markdown。
-gpui-editor-editor = { path = "crates/gpui-editor-editor" }
-# 拆分 workspace 后迁出的自研 Markdown 渲染 + WYSIWYG 编辑 crate（P3c）：markdown，
-# 依赖 {config, base, ime, ui, editor, syntax}；markdown → editor 合法单向（WYSIWYG 内嵌 CodeEditor）。
-gpui-editor-markdown = { path = "crates/gpui-editor-markdown" }
-# 拆分 workspace 后迁出的子阅读器 crate（P4）：toc / pdf / image / video / epub。
-gpui-editor-toc = { path = "crates/gpui-editor-toc" }
-gpui-editor-pdf = { path = "crates/gpui-editor-pdf" }
-gpui-editor-image = { path = "crates/gpui-editor-image" }
-# P4：视频解码内核已随 video crate 独立；作为可选依赖，由根 `video` feature 开关。
+gpui-editor-config = { path = "crates/gpui-editor-config" }
+gpui-editor-syntax = { path = "crates/gpui-editor-syntax" }
+gpui-editor-base = { path = "crates/gpui-editor-base" }
+# P4：视频解码内核已随 video crate 独立；作为可选依赖，由根 `video` feature 开关
+# （实际视频功能在 shell crate，本依赖仅保留以维持 feature 语义与转发）。
 gpui-editor-video = { path = "crates/gpui-editor-video", optional = true }
-gpui-editor-epub = { path = "crates/gpui-editor-epub" }
 
 [features]
 default = ["video"]
 test-support = ["gpui/test-support"]
 # video：P4 已把视频模块拆为独立 `gpui-editor-video` crate。
-# 本 feature = 开启该可选依赖，并保留转发给 ui crate 以同步开关其视频图标变体
-# （IconName::Play/Pause/…，见 gpui-editor-ui/icon.rs；video crate 依赖 ui 亦开启之）。
-video = ["dep:gpui-editor-video", "gpui-editor-ui/video"]
+# 本 feature = 开启该可选依赖、转发给 ui crate（IconName::Play/Pause/… 视频图标变体，
+# 见 gpui-editor-ui/icon.rs），并转发给 shell crate（实际消费 VideoViewer 的层）。
+video = [
+    "dep:gpui-editor-video",
+    "gpui-editor-ui/video",
+    "gpui-editor-shell/video",
+]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 依赖叠加 test-support feature（features 与 workspace 定义相加；
@@ -80,7 +42,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor", "crates/gpui-editor-markdown", "crates/gpui-editor-toc", "crates/gpui-editor-pdf", "crates/gpui-editor-image", "crates/gpui-editor-video", "crates/gpui-editor-epub"]
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor", "crates/gpui-editor-markdown", "crates/gpui-editor-toc", "crates/gpui-editor-pdf", "crates/gpui-editor-image", "crates/gpui-editor-video", "crates/gpui-editor-epub", "crates/gpui-editor-shell"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

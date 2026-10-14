@@ -842,7 +842,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let md = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/测试.md");
+        let md = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/测试.md");
         let src_expected = std::fs::read_to_string(&md).expect("read 测试.md");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(md.to_str().unwrap(), window, cx));
@@ -1024,7 +1024,7 @@
             cx.run_until_parked();
         }
         // 候选源：真实 `target/测试.md`（不清写）；缺或无标题则造等价 CJK 临时文件。
-        let md = std::env::current_dir().unwrap().join("target/测试.md");
+        let md = std::env::current_dir().unwrap().join("../../target/测试.md");
         let (md, src_text) = match std::fs::read_to_string(&md) {
             Ok(s) if s.contains("# ") => (md, s),
             _ => {
@@ -2626,7 +2626,7 @@
         ));
         // ≈6.4MB 大文档（与 `bench_wysiwyg_switch_fixed_overhead` 同口径，优先仓内真实
         // 富结构素材，缺失回退合成块）——「before」记录即此文档大段的 ~2.3s。
-        let src = match std::fs::read(r"fixtures/大文档测试2.md") {
+        let src = match std::fs::read(r"../../fixtures/大文档测试2.md") {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(_) => {
                 let block = "# 标题\n正文段落，凑大文档基准文本。\n\n- [ ] 待办\n";
@@ -2743,7 +2743,7 @@
         }
         // 6.4MB 文档：优先取仓内真实富结构 `fixtures/大文档测试2.md`（≈6.27MB，含标题/
         // 表格/代码/待办等，与 63ms 基线的同一批素材），缺失则回退合成重复块。
-        let src = match std::fs::read(r"fixtures/大文档测试2.md") {
+        let src = match std::fs::read(r"../../fixtures/大文档测试2.md") {
             Ok(b) => String::from_utf8_lossy(&b).into_owned(),
             Err(_) => {
                 let block = "# 标题\n这是正文段落，凑 6.4MB 大文档的切回基准文本。\n\n- [ ] 待办\n";

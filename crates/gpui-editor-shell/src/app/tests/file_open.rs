@@ -1350,10 +1350,10 @@
         }
         unsafe { std::env::set_var("MD_OPEN_DEBUG", "1") };
         for path in [
-            r"fixtures/大文档测试.md",
-            r"fixtures/大文档测试23MB.md",
-            r"fixtures/大文档测试23MB.txt",
-            r"fixtures/大文档测试116MB.txt",
+            r"../../fixtures/大文档测试.md",
+            r"../../fixtures/大文档测试23MB.md",
+            r"../../fixtures/大文档测试23MB.txt",
+            r"../../fixtures/大文档测试116MB.txt",
         ] {
             println!("========== {path} ==========");
             let t0 = std::time::Instant::now();

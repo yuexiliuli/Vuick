@@ -1,50 +1,19 @@
-﻿//! 程序入口：初始化 GPUI + GPUI-Component、注册应用级快捷键、
-//! 创建主窗口并把窗口根视图包上自研 `ui::root` 视图。
+﻿//! 程序入口（薄二进制壳）：初始化 GPUI、注册应用级快捷键、创建主窗口，
+//! 把窗口根视图包上自研 `ui::root` 视图，主视图实体由 `shell`（app）crate 提供。
 //!
-//! 模块结构：
-//! - [`app`]：主视图 `EditorApp`（自绘标题栏 + 菜单栏 + 选项卡栏 + 编辑区 + 可选 Markdown 预览 + 状态栏）
-//! - `gpui_component::text::TextView`：Markdown 预览（text 管线，未迁移部分）
-//! - [`scrollbar`]：自绘横向滚动条（选项卡栏用）
-//! - [`actions`]：应用级动作类型与编辑区输入动作/键位
-//!
-//! 文本（代码）编辑区使用 **gpui-component 的 `Input`（CodeEditor 模式）**：
-//! 底层的 `EditorState` 用 ropey 存储文本、内置语法高亮（tree-sitter）、行号、
-//! 缩进参考线、搜索面板与撤销/重做，替换掉原先自研的 `TextArea`（其换行排版
-//! 在大量粘贴时曾出现“整行消失”的问题）。
+//! P5 拆分终态：全部功能逻辑已迁出到 workspace 各 crate（config/base/ime/viewer/
+//! syntax/ui/editor/markdown/toc/pdf/image/video/epub/shell），本包只剩初始化胶水。
+//! 各模块职责见各 crate（如 `gpui-editor-shell` 的 `EditorApp` / `bind_local_keymaps`）。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod actions;
-mod app;
-mod scrollbar;
-
-// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::syntax::` /
-// `crate::config::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
-use gpui_editor_syntax as syntax;
-use gpui_editor_base::prof;
-use gpui_editor_config as config;
-// P3a：自研 UI 组件库迁出为 `gpui-editor-ui` crate，以 crate 根别名保持
-// `crate::ui::` 短路径（editor/markdown/pdf/image/video/toc/app 现有引用零改动）。
-use gpui_editor_ui as ui;
-// P3b：自研文本/代码编辑器迁出为 `gpui-editor-editor` crate，以 crate 根别名保持
-// `crate::editor::` 短路径（app/markdown/main 现有引用零改动）。
-use gpui_editor_editor as editor;
-// P3c：自研 Markdown 渲染 + WYSIWYG 编辑迁出为 `gpui-editor-markdown` crate，
-// 以 crate 根别名保持 `crate::markdown::` 短路径（app/epub/main 现有引用零改动）。
-use gpui_editor_markdown as markdown;
-// P4：子阅读器 toc/pdf/image/video/epub 迁出为独立 crate，以 crate 根别名保持
-// `crate::toc::` / `crate::pdf::` / `crate::image::` / `crate::video::` / `crate::epub::`
-// 短路径（app 现有引用零改动；video 随根 feature 开关）。
-use gpui_editor_epub as epub;
-use gpui_editor_image as image;
-use gpui_editor_pdf as pdf;
-use gpui_editor_toc as toc;
-#[cfg(feature = "video")]
-use gpui_editor_video as video;
-
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
-
-use crate::actions::*;
+use gpui_editor_base::actions::*;
+use gpui_editor_shell::{bind_local_keymaps, EditorApp};
+use gpui_editor_syntax::prewarm;
+use gpui_editor_ui::root;
+use gpui_editor_ui::theme::{Theme, ThemeMode};
+use gpui_editor_config::user::UserPrefs;
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
@@ -73,29 +42,29 @@ fn main() {
             // 启动跟随：按持久化偏好解析；从未手动选过（默认 follow）→ 由系统深浅色决定。
             // EditorApp::new_impl 会用同一逻辑再落地一次（双保险 + 多窗口一致），
             // 此处在首帧前先落定，避免窗口以错误主题闪现。
-            let prefs = crate::config::user::UserPrefs::load();
-            crate::ui::theme::Theme::set(
+            let prefs = UserPrefs::load();
+            Theme::set(
                 if prefs.theme.resolved_dark(cx.window_appearance()) {
-                    crate::ui::theme::ThemeMode::Dark
+                    ThemeMode::Dark
                 } else {
-                    crate::ui::theme::ThemeMode::Light
+                    ThemeMode::Light
                 },
                 cx,
             );
             // 本地快捷键全集：编辑区 Input + 窗口根 Root + WYSIWYG wy-editor。
-            crate::actions::bind_local_keymaps(cx);
+            bind_local_keymaps(cx);
             // 后台预热 syntect 全局语法集与明暗色板（A2）：把「首次代码块同步
             // 反序列化几 MB」的一次性成本移出滚动路径 → 首张图片附近不再卡那一下。
             // LazyLock 并发安全，主线程先命中只会短暂阻塞。
             cx.background_executor()
-                .spawn(async move { crate::syntax::prewarm() })
+                .spawn(async move { prewarm() })
                 .detach();
             // 覆盖默认粘贴：Windows 剪贴板的 CRLF 必须先转为 LF，
             // 否则回车符会作为普通字符参与代码编辑器的布局。
             // （须在 bind_local_keymaps 之后注册：优先级更高，Ctrl+V 只走归一化粘贴。）
             cx.bind_keys([KeyBinding::new("ctrl-v", PasteNormalized, Some("Input"))]);
 
-            let mut created: Option<gpui::Entity<app::EditorApp>> = None;
+            let mut created: Option<gpui::Entity<EditorApp>> = None;
             let window = cx
                 .open_window(
                     WindowOptions {
@@ -111,10 +80,10 @@ fn main() {
                     },
                     |window, cx| {
                         window.set_window_title("GPUI 编辑器");
-                        let view = cx.new(|cx| app::EditorApp::new(window, cx));
+                        let view = cx.new(|cx| EditorApp::new(window, cx));
                         created = Some(view.clone());
                         // 窗口第一层是自研根视图（ui::root，替代 gpui_component::Root）
-                        cx.new(|cx| crate::ui::root::Root::new(view, window, cx))
+                        cx.new(|cx| root::Root::new(view, window, cx))
                     },
                 )
                 .unwrap();

@@ -11,7 +11,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
     assert!(epub.exists(), "测试 EPUB 应存在");
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
@@ -83,7 +83,7 @@ async fn epub_flip_chapter_moves_between_headings(cx: &mut TestAppContext) {
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.open_file(epub.to_str().unwrap(), window, cx)
@@ -220,7 +220,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/epub测试.epub");
+    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/epub测试.epub");
     assert!(epub.exists(), "target/epub测试.epub 应存在");
     cx.update(|window, cx| {
         app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));
@@ -340,7 +340,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
     for _ in 0..3 {
         cx.run_until_parked();
     }
-    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/epub测试.epub");
+    let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/epub测试.epub");
     assert!(epub.exists(), "target/epub测试.epub 应存在");
     cx.update(|window, cx| {
         app.update(cx, |app, cx| app.open_file(epub.to_str().unwrap(), window, cx));

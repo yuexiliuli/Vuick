@@ -7,7 +7,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
         assert!(epub.exists(), "测试 EPUB 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -88,7 +88,7 @@
             cx.run_until_parked();
         }
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("../../target/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
@@ -166,7 +166,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.open_file(pdf.to_str().unwrap(), window, cx));
@@ -233,7 +233,7 @@
         // 长 PDF 输入改用 target/pdf测试2.pdf（259 页文本型）：fixtures/ 下 PDF 在本机 Rust 进程
         // 内无法解析（FormatError），且长度要 ≥50 页（opens_long_pdf_virtualized 断言）。
         let pdf = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试2.pdf");
+            .join("../../target/pdf测试2.pdf");
         assert!(pdf.exists(), "测试 PDF 应存在");
         let t0 = std::time::Instant::now();
         cx.update(|window, cx| {
@@ -282,7 +282,7 @@
     /// 分页；滚动预览到末标题后页码前进（滚动明细由 view 层单元测试覆盖）。
     #[gpui::test]
     async fn epub_status_bar_shows_pages_and_follows_scroll(cx: &mut TestAppContext) {
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
         if !epub.exists() {
             eprintln!("SKIP epub_status_bar_shows_pages_and_follows_scroll: 缺 fixtures/xy.epub");
             return;
@@ -366,7 +366,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub");
+        let epub = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub");
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 app.open_file(epub.to_str().unwrap(), window, cx)

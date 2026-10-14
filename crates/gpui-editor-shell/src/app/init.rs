@@ -11,7 +11,8 @@ impl EditorApp {
 
     /// 创建并注册 `EditorApp` 实体（作为窗口的第一层视图，外层再由
     /// `crate::ui::root::Root` 宿主包裹）。
-    pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
+    /// P5：shell 独立 crate 后由二进制壳 `main.rs` 消费，`pub(crate)` → `pub`。
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> EditorApp {
         Self::new_impl(window, cx, None, false)
     }
 
@@ -195,8 +196,8 @@ impl EditorApp {
         tab.editor.read(cx).focus_handle()
     }
 
-    /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦）。
-    pub(crate) fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
+    /// 当前激活选项卡的编辑区焦点句柄（供入口聚焦，二进制壳 `main.rs` 消费）。
+    pub fn editor_focus_handle(&self, cx: &App) -> FocusHandle {
         self.tab_focus_handle(self.active_tab, cx)
     }
 }

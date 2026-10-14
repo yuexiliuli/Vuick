@@ -2112,40 +2112,14 @@ dependencies = [
 name = "gpui-editor"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "cpal",
- "futures",
  "gpui",
  "gpui-editor-base",
  "gpui-editor-config",
- "gpui-editor-editor",
- "gpui-editor-epub",
- "gpui-editor-image",
- "gpui-editor-ime",
- "gpui-editor-markdown",
- "gpui-editor-pdf",
+ "gpui-editor-shell",
  "gpui-editor-syntax",
- "gpui-editor-toc",
  "gpui-editor-ui",
  "gpui-editor-video",
- "gpui-editor-viewer",
  "gpui_platform",
- "image",
- "libjpeg-turbo-rs",
- "libloading",
- "memchr",
- "pdfium-render",
- "ratex-layout",
- "ratex-parser",
- "ratex-render",
- "regex",
- "rfd",
- "ropey",
- "roxmltree 0.21.1",
- "rustc-hash 1.1.0",
- "serde_json",
- "syntect",
- "zip",
 ]
 
 [[package]]
@@ -2242,6 +2216,28 @@ dependencies = [
  "gpui-editor-viewer",
  "image",
  "pdfium-render",
+]
+
+[[package]]
+name = "gpui-editor-shell"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "gpui",
+ "gpui-editor-base",
+ "gpui-editor-config",
+ "gpui-editor-editor",
+ "gpui-editor-epub",
+ "gpui-editor-image",
+ "gpui-editor-markdown",
+ "gpui-editor-pdf",
+ "gpui-editor-syntax",
+ "gpui-editor-toc",
+ "gpui-editor-ui",
+ "gpui-editor-video",
+ "memchr",
+ "rfd",
+ "ropey",
 ]
 
 [[package]]

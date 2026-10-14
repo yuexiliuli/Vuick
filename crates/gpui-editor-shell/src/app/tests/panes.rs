@@ -327,9 +327,9 @@
             eprintln!("[BENCH] {kind} = {ms:.1} ms");
         };
         let md_path =
-            std::env::var("BIGDOC_MD").unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
+            std::env::var("BIGDOC_MD").unwrap_or_else(|_| "../../fixtures/大文档测试2.md".to_string());
         let rs_path =
-            std::env::var("BIGDOC_RS").unwrap_or_else(|_| "fixtures/大文档测试.rs".to_string());
+            std::env::var("BIGDOC_RS").unwrap_or_else(|_| "../../fixtures/大文档测试.rs".to_string());
 
         // ---------- 打开 .rs（代码编辑器）并等就绪 ----------
         let t0 = std::time::Instant::now();
@@ -526,7 +526,7 @@
         // 严格单调）对合成档的块粒度/行高几何高度敏感——「编辑器微滚进一个块内 → sync 把
         // 编辑器拉回块起点」会让顶行读数回跳，只有真实档的块布局才稳定通过 H2；故回退守卫。
         let md_path = std::env::var("BIGDOC_MD")
-            .unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
+            .unwrap_or_else(|_| "../../fixtures/大文档测试2.md".to_string());
         if !std::path::Path::new(&md_path).exists() {
             eprintln!("SKIP: missing {md_path}（6.4MB 大文档不入库）；置 BIGDOC_MD 指真实档可跑本回归");
             return;
@@ -692,7 +692,7 @@
             cx.run_until_parked();
         }
         let md_path = std::env::var("BIGDOC_MD")
-            .unwrap_or_else(|_| "fixtures/大文档测试2.md".to_string());
+            .unwrap_or_else(|_| "../../fixtures/大文档测试2.md".to_string());
         let md_path = md_path.clone();
         cx.update(|window, cx| {
             app.update(cx, |a, cx| a.open_file(&md_path, window, cx));
