@@ -46,6 +46,14 @@ pub(crate) fn caret_geometry(editor: &WyEditor, f: &Frame) -> (bool, Pixels, Pix
             continue;
         }
         if !r.editable {
+            // 空行（字面空白的源行，`IrKind::Blank`）：byte_map 空 → `editable=false`，
+            // 但语义上是可输入的空白行——给一个位在行首的可见光标（x = padding + x_off、
+            // y = 行顶，与空文本行的 paint 起点同 x），否则点空行光标移到该行却画不出
+            // 竖条（用户报告「点空行不显示光标」）。其余只读行（代码/表格/卡片/分隔线）
+            // 维持原样：不画光标（光标移动/选区仍可用，只是无竖条）。
+            if r.kind == IrKind::Blank {
+                return (true, f.padding + r.x_off, r.top);
+            }
             return (false, f.padding, r.top);
         }
         if let (Some(te), Some(t)) = (&r.table_edit, &r.table) {
@@ -220,6 +228,13 @@ pub(crate) fn source_offset_at_local(editor: &WyEditor, frame: &Frame, p: Point<
                 let le = editor.line_end(r.src_line);
                 return (ls + local).min(le);
             }
+            // 空行/空白文本行兜底（`editable=true` 但 `wrapped` 无折行——`shape_text`
+            // 对空串不产折行 → `wrapped.first()` 为 None，老代码整行跳过 → 落到
+            // `editor.caret()` 返回原值，点空行光标不动）。命中该行返回**行首字节**，
+            // 光标可见于行首；不破坏表格/代码/普通文本已有命中。
+            let ls = editor.line_start(r.src_line);
+            let le = editor.line_end(r.src_line).max(ls);
+            return ls.min(le);
         }
     }
     editor.caret()

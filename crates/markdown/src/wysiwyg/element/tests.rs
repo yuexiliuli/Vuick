@@ -25,3 +25,4 @@ include!("tests/epub.rs");
 include!("tests/note_def_flip.rs");
 include!("tests/selection_highlight.rs");
 include!("tests/same_text_rows.rs");
+include!("tests/blank_line_hit.rs");
