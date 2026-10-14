@@ -31,13 +31,13 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 ### 三、编译与验证纪律（编译是耗时头号）
 
 - **只跑 debug、禁止 release**；workspace 测试必须带 `-p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；pdf 加 `--test-threads=1`
-- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量；filter 用**模块路径前缀**（如 `cargo test -p shell app::tests::sidebar`）一次盖全模块，避免函数名不带前缀被漏跑→评审重复补跑
+- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量；filter 用**模块路径前缀**（如 `cargo test -p shell app::tests::sidebar`）一次盖全模块，避免函数名不带前缀被漏跑→评审重复补跑；**核心渲染改动也默认按模块前缀收最小集**，仅共享核心/用户要求才放宽全模块
 - **验证只做改动部分、禁止全量**（全量仅当用户明确要求/特性定型）；行为功能**不跑 stash 基线**（回归由评审兜底）——仅性能对比子 agent 才 stash before/after，pop 后逐文件核对还原
 - 边界测试先行 → 字节/几何盲区消灭在实现侧，评审不再补 FAIL→PASS
 
 ### 四、主 agent 三收敛（主上下文涨速主因）
 
-- **侦察下放**：派活前只做 **1-2 条 CRG 查询**（`get_minimal_context_tool` / `query_graph` / `traverse_graph`）或 grep 定入口；**不 read 实现细节、不跑多路 grep/采样替子 agent 摸底**——子 agent 本就要读，主 agent 抢读既烧上下文又常常猜错根因
+- **侦察下放**：派活前只做 **1-2 条 CRG 查询**（`get_minimal_context_tool` / `query_graph` / `traverse_graph`）或 grep 定入口；**不 read 实现细节、不跑多路 grep/采样替子 agent 摸底**——子 agent 本就要读，主 agent 抢读既烧上下文又常常猜错根因；派活只需「结构入口 + 参考实现」两样，**不追 paint/hit 具体行号**（子 agent 会架且猜得更准）
 - **核对极简**：收报告后只跑一条 `git status --short && git diff --stat`；不再逐路复核（确需抽查至多 1 个 grep）
 - **brief 收敛**：只写「需求 + 约束 + 已知落点」，不写实现规格；**根因只写已核实的、不写猜测**（见流水线条）——未核实的 prime suspect 只作线索并标注「需子 agent 核实」，不得当结论引偏；续跑轮只写 delta；歧义合并进一次 `question`；bench/大表输出一律 `-Last N`/limit 截断
 
