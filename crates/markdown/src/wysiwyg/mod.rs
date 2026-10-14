@@ -432,7 +432,7 @@ pub struct WyEditor {
     /// 块级数学公式（`$$…$$`）的编辑卡片（双击卡弹出，预填正文多行输入区域）。
     /// `None` = 未打开。打开期间输入区域获得焦点（内嵌 CodeEditor，与文档输入互不
     /// 干扰）；每键经订阅即时写回文档（`apply_edit` 撤销栈、实时重渲染），点卡片外
-    /// 任意处关闭（无取消语义）。仅可编辑模式打开；只读模式双击维持旧 reveal 预览。
+    /// 任意处关闭（无取消语义）。仅可编辑模式打开；只读模式双击 = no-op（保持渲染卡）。
     math_edit: Option<MathEditPopup>,
     /// 数学编辑卡片的**窗口锚点**（卡片 TopLeft，window 坐标）：paint 期同代配对算出并
     /// 缓存，render 只读它摆卡片（同 `image_edit_anchor` 的纪律：render 绝不现算 frame）。

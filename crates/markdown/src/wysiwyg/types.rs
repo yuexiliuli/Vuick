@@ -99,7 +99,7 @@ pub(crate) struct ImageEditPopup {
 /// 公式**正文**、不含 `$$` 定界符）锚定在目标公式卡顶部。每键即时 `apply_edit` 写回
 /// 文档（撤销栈）、公式实时重渲染；长公式/多行靠 CodeEditor 自带纵横滚动不溢出；
 /// 点卡片外任意处关闭（无取消语义）。标题栏兼作拖拽把手（见 [`MathEditDrag`]）。
-/// 仅可编辑模式打开；只读模式双击维持旧「reveal 源码」预览。
+/// 仅可编辑模式打开；只读模式双击 = no-op（保持渲染卡，不 reveal、不弹卡）。
 pub(crate) struct MathEditPopup {
     /// 目标数学块的首源码行号。
     pub(crate) src_line: usize,

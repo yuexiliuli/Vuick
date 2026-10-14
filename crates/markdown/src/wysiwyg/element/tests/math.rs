@@ -875,12 +875,12 @@ fn inline_math_grown_row_caret_and_click_stay_aligned(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
-    // 只读模式（预览/EPUB）：双击块级数学卡**不弹编辑卡**（写回依赖可编辑），
-    // 维持旧「reveal 源码」预览——光标放进块首（`$$` 行内 1 字节）→ 重建帧该块
-    // 还原成可读源码字符串（可读不可改）。多行 `$$\n…\n$$` 与单行 `$$…$$` 都验。
-    // 对应的可编辑口径见 `math_block_single_click_keeps_card_double_click_opens_edit`
-    // 与 `math_block_single_line_double_click_opens_edit`（弹卡、预填、光标不进块）。
+fn math_block_ro_double_click_keeps_card(cx: &mut TestAppContext) {
+    // 只读模式（预览/EPUB）是 **WYSIWYG 只读形态**：双击块级数学卡 = **不做任何事**——
+    // 不弹编辑卡（写回依赖可编辑）、光标不进块、块不 reveal 回原始 LaTeX，公式始终
+    // 保持渲染后的卡片；单击同样不动。多行 `$$\n…\n$$` 与单行 `$$…$$` 都验。
+    // 可编辑口径见 `math_block_single_click_keeps_card_double_click_opens_edit`（弹卡、
+    // 预填、光标不进块）。
     use super::BlockCard;
     use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
     cx.update(crate::test_support::bind_local_keymaps);
@@ -914,6 +914,20 @@ fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
         ed.update(cx, |e, _| {
             *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
+        let caret_before = ed.read(cx).caret();
+        let one = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&one, window, cx));
+        assert_eq!(
+            ed.read(cx).caret(),
+            caret_before,
+            "只读单击块卡不得移动光标"
+        );
         let dbl = MouseDownEvent {
             button: MouseButton::Left,
             position: point(px(x), px(y)),
@@ -927,16 +941,21 @@ fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
             "只读模式双击不得弹编辑卡（写回依赖可编辑）"
         );
         assert_eq!(
+            ed.read(cx).caret(),
+            caret_before,
+            "只读双击光标不动（不进块）"
+        );
+        assert_ne!(
             ed.read(cx).row_col(ed.read(cx).caret()).0,
             0,
-            "只读双击应把光标放进块首（reveal 源码预览）"
+            "光标不在块首行（未 reveal 进块）"
         );
         let f2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            !f2.rows
+            f2.rows
                 .iter()
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-            "只读双击后块应 reveal 成源码（无卡片）"
+            "只读双击后块仍保持渲染卡（未 reveal 成源码）"
         );
     });
     // —— 单行 `$$…$$` ——
@@ -969,6 +988,7 @@ fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
         ed1.update(cx, |e, _| {
             *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
         });
+        let caret_before = ed1.read(cx).caret();
         let dbl = MouseDownEvent {
             button: MouseButton::Left,
             position: point(px(x), px(y)),
@@ -981,12 +1001,88 @@ fn math_block_ro_double_click_keeps_reveal_preview(cx: &mut TestAppContext) {
             !ed1.read(cx).math_edit_open(),
             "只读单行双击不得弹编辑卡"
         );
+        assert_eq!(
+            ed1.read(cx).caret(),
+            caret_before,
+            "只读单行双击光标不动（不进块）"
+        );
         let f2 = build_frame(ed1.read(cx), window, px(600.), (0., 999_999.));
         assert!(
-            !f2.rows
+            f2.rows
                 .iter()
                 .any(|r| matches!(&r.extra.card, Some(BlockCard::Math { .. }))),
-            "只读单行双击后块应 reveal 成源码（无卡片）"
+            "只读单行双击后块仍保持渲染卡（未 reveal 成源码）"
+        );
+    });
+}
+
+#[gpui::test]
+fn math_inline_ro_double_click_no_reveal(cx: &mut TestAppContext) {
+    // 只读模式（预览/EPUB）是 **WYSIWYG 只读形态**：双击行内 `$…$` 公式 spacer **不
+    // reveal**——光标不进公式源区间（shape 按「caret 严格落在 `$…$` 内」reveal 回
+    // 原始 LaTeX），重建帧该行公式仍以 spliced 渲染呈现。可编辑口径见
+    // `inline_math_double_click_enters_edit`（双击光标进公式内、reveal 可编辑）。
+    use gpui::{Bounds, Modifiers, MouseButton, MouseDownEvent, size};
+    cx.update(crate::test_support::bind_local_keymaps);
+    let text = "前置文字 $x^2+\\alpha$ 后置文字\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        ed.update(cx, |e, _| e.set_editable(false));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    vcx.update(|window, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(600.), px(600.)),
+            )));
+        });
+        let frame = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para = frame
+            .rows
+            .iter()
+            .find(|r| !r.extra.inline_maths.is_empty())
+            .expect("只读帧应有行内公式 splice");
+        let im = para.extra.inline_maths[0].clone();
+        let w0 = para.wrapped.first().unwrap();
+        let p0 = w0.position_for_index(im.display_off, para.lh).unwrap();
+        let (src_line, x_off, top, lh) = (
+            para.src_line,
+            f32::from(para.x_off),
+            f32::from(para.top),
+            para.lh,
+        );
+        let x = f32::from(frame.padding) + x_off + f32::from(p0.x) + 2.0;
+        let y = top + f32::from(lh) / 2.;
+        ed.update(cx, |e, _| {
+            *e.frame.borrow_mut() = Some(std::rc::Rc::new(frame))
+        });
+        let ev = MouseDownEvent {
+            button: MouseButton::Left,
+            position: point(px(x), px(y)),
+            modifiers: Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        };
+        ed.update(cx, |e, cx| e.on_mouse_down(&ev, window, cx));
+        let caret = ed.read(cx).caret();
+        assert!(
+            !(caret > im.source.start && caret < im.source.end),
+            "只读双击不得把光标放进公式源区间内（否则 reveal）：caret={caret}，公式={:?}",
+            im.source
+        );
+        // reveal 判定与 shape 一致：重建帧该行公式仍 splice（未 reveal 成源码）。
+        let frame2 = build_frame(ed.read(cx), window, px(600.), (0., 999_999.));
+        let para2 = frame2
+            .rows
+            .iter()
+            .find(|r| r.src_lines.contains(&src_line))
+            .unwrap();
+        assert!(
+            !para2.extra.inline_maths.is_empty(),
+            "只读双击后行内公式应仍 splice（不 reveal 回原始 LaTeX）"
         );
     });
 }

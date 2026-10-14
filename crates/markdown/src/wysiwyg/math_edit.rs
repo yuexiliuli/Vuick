@@ -40,10 +40,10 @@ impl WyEditor {
 
     /// 双击块级数学卡 → 打开数学编辑卡（预填公式正文、无定界符；光标不进块、不 reveal）。
     /// 已在该块 → 关闭（与图片编辑卡同款切换语义）。
-    /// **只读模式**（预览/EPUB）维持旧「双击 reveal 源码」的预览行为——写回依赖
-    /// `replace_range` 的 editable 门控，只读无写回权限、弹编辑卡也无意义；故降级为把
-    /// 光标放进块内 1 字节 → 重建帧后该块还原成可读源码字符串（不与既有只读预览语义
-    /// 冲突，可读不可改）。
+    /// **只读模式**（预览/EPUB）：双击 = **不做任何事**——预览是 WYSIWYG 只读形态，
+    /// 公式始终保持渲染后的卡片；写回依赖 `replace_range` 的 editable 门控、只读无写回
+    /// 权限（弹编辑卡也无意义），也不再降级为旧「双击 reveal 源码」预览（那会把渲染
+    /// 卡回退成原始 LaTeX，与只读预览恒为渲染形态冲突）。
     pub fn open_math_edit(
         &mut self,
         src_line: usize,
@@ -51,10 +51,8 @@ impl WyEditor {
         cx: &mut Context<Self>,
     ) {
         if !self.editable {
-            // 只读：与旧 `set_caret(block_start + 1)` 完全同点（块首字节 + 1）。
-            let reveal_at = self.line_start(src_line) + 1;
-            self.set_caret(reveal_at);
-            cx.notify();
+            // 只读（预览/EPUB）：双击块级公式卡 = **不做任何事**——不弹编辑卡、不落
+            // 光标、不回退字符，公式保持渲染后的卡片形态（预览 = WYSIWYG 只读）。
             return;
         }
         if self

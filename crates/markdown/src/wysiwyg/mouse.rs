@@ -263,8 +263,9 @@ impl WyEditor {
             // 数学块卡片：**单击不改光标**（否则 caret 进块被 reveal、整块回显源码字符串，
             // 即用户看到的「单击变回字符串」）；**双击**弹出**数学编辑卡**（预填公式正文，
             // 每键即时写回文档，点卡片外关闭；不再原地 reveal 进块）。只读模式在
-            // `open_math_edit` 内降级为旧「双击 reveal 源码」预览。
-            // 行内公式：**双击** spacer → 光标放进 `$…$` 内（shape 期 reveal 可编辑，保持）。
+            // `open_math_edit` 内直接 no-op（保持渲染卡：不落光标、不弹卡、不回退字符）。
+            // 行内公式：**双击** spacer → 光标放进 `$…$` 内（shape 期 reveal 可编辑）；
+            // 仅可编辑模式——只读不做 reveal，保持渲染公式。
             let dbl = ev.click_count >= 2;
             if let Some(block_start) = element::math_card_hit(self, f, ev.position) {
                 let block_line = self.row_col(block_start).0;
@@ -281,12 +282,15 @@ impl WyEditor {
                 self.focus.focus(window, cx);
                 if dbl {
                     // 双击块级数学卡 → 弹出可编辑公式卡（光标不进块、不 reveal）；
-                    // 只读模式在 `open_math_edit` 内降级为 reveal 预览。
+                    // 只读模式在 `open_math_edit` 内直接 no-op（保持渲染卡）。
                     self.open_math_edit(block_line, window, cx);
                 }
                 return;
             }
-            if dbl && let Some(src) = element::inline_math_hit_at(self, f, ev.position) {
+            if self.editable
+                && dbl
+                && let Some(src) = element::inline_math_hit_at(self, f, ev.position)
+            {
                 drop(marker);
                 self.focus.focus(window, cx);
                 self.set_caret(src.start + 1);
