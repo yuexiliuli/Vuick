@@ -54,6 +54,9 @@ gpui-editor-syntax = { path = "crates/gpui-editor-syntax" }
 gpui-editor-ui = { path = "crates/gpui-editor-ui" }
 # 拆分 workspace 后迁出的自研文本/代码编辑器 crate（P3b）：editor，依赖 {config, base, ime, ui} 不再依赖 markdown。
 gpui-editor-editor = { path = "crates/gpui-editor-editor" }
+# 拆分 workspace 后迁出的自研 Markdown 渲染 + WYSIWYG 编辑 crate（P3c）：markdown，
+# 依赖 {config, base, ime, ui, editor, syntax}；markdown → editor 合法单向（WYSIWYG 内嵌 CodeEditor）。
+gpui-editor-markdown = { path = "crates/gpui-editor-markdown" }
 
 [features]
 default = ["video"]
@@ -70,7 +73,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor"]
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor", "crates/gpui-editor-markdown"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

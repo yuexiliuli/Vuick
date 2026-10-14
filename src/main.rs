@@ -18,7 +18,6 @@ mod actions;
 mod app;
 mod epub;
 mod image;
-mod markdown;
 mod pdf;
 mod scrollbar;
 mod toc;
@@ -28,13 +27,11 @@ mod video;
 
 // 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::ime::` /
 // `crate::viewer::` / `crate::syntax::` 短路径（后续各模块迁出时再逐段清理）。
-use gpui_editor_ime as ime;
 use gpui_editor_syntax as syntax;
 use gpui_editor_viewer as viewer;
 // 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::config::` /
 // `crate::util::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
 use gpui_editor_base::prof;
-use gpui_editor_base::util;
 use gpui_editor_config as config;
 // P3a：自研 UI 组件库迁出为 `gpui-editor-ui` crate，以 crate 根别名保持
 // `crate::ui::` 短路径（editor/markdown/pdf/image/video/toc/app 现有引用零改动）。
@@ -42,6 +39,9 @@ use gpui_editor_ui as ui;
 // P3b：自研文本/代码编辑器迁出为 `gpui-editor-editor` crate，以 crate 根别名保持
 // `crate::editor::` 短路径（app/markdown/main 现有引用零改动）。
 use gpui_editor_editor as editor;
+// P3c：自研 Markdown 渲染 + WYSIWYG 编辑迁出为 `gpui-editor-markdown` crate，
+// 以 crate 根别名保持 `crate::markdown::` 短路径（app/epub/main 现有引用零改动）。
+use gpui_editor_markdown as markdown;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 
