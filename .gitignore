@@ -10,8 +10,6 @@ docs/
 # exe 打包 dll目录
 /dist
 
-AGENTS.md
-
 # 测试夹具二进制/大文件——仅本地保留，不入库（曾误提交经历史重写移除，见 backup-pre-rewrite）
 # 例外：小体积关键夹具（<1MB）显式入库。注意空目录不被 git 追踪，父目录不可整体忽略，
 # 否则子文件无法反选；故用 fixtures/* 而非 fixtures/。
