@@ -19,23 +19,25 @@ mod app;
 mod editor;
 mod epub;
 mod image;
-mod ime;
 mod markdown;
 mod pdf;
 mod scrollbar;
-mod syntax;
 mod toc;
 mod ui;
-mod viewer;
 
+#[cfg(feature = "video")]
+mod video;
+
+// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::ime::` /
+// `crate::viewer::` / `crate::syntax::` 短路径（后续各模块迁出时再逐段清理）。
+use gpui_editor_ime as ime;
+use gpui_editor_syntax as syntax;
+use gpui_editor_viewer as viewer;
 // 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::config::` /
 // `crate::util::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
 use gpui_editor_base::prof;
 use gpui_editor_base::util;
 use gpui_editor_config as config;
-
-#[cfg(feature = "video")]
-mod video;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 

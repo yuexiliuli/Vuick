@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 /// **不**吸附调用方的加载/渲染状态机：图片的「级联预取 / B4 快滚 / 锁定信息条」、
 /// 视频的「换代重开 / 播放器状态」都留在各自查看器，本类型只负责「当前在哪、下一步去哪」。
 #[derive(Debug, Clone)]
-pub(crate) struct FolderNav {
+pub struct FolderNav {
     /// 同目录兄弟文件清单（文件名升序，恒含当前项，恒非空——扫描失败退化为单元素）。
     items: Vec<PathBuf>,
     /// 当前项在 `items` 中的下标（0 基；`set_current`/`step` 维护）。
@@ -25,7 +25,7 @@ pub(crate) struct FolderNav {
 
 impl FolderNav {
     /// 直接构造（扫描请用 [`Self::scan`]）。`current` 越界时钳到末尾；默认环绕开。
-    pub(crate) fn new(items: Vec<PathBuf>, current: usize) -> Self {
+    pub fn new(items: Vec<PathBuf>, current: usize) -> Self {
         let current = current.min(items.len().saturating_sub(1));
         Self {
             items,
@@ -38,52 +38,52 @@ impl FolderNav {
     /// 环绕开，本方法暂无生产调用方——作为「边界禁用」扩展 API 存在，由下方纯函数单测
     /// 覆盖 wrap 开关语义（后续需要边界禁用的调用方可直接使用）。
     #[allow(dead_code)]
-    pub(crate) fn with_wrap(mut self, wrap: bool) -> Self {
+    pub fn with_wrap(mut self, wrap: bool) -> Self {
         self.wrap = wrap;
         self
     }
 
     /// 清单长度。
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.items.len()
     }
 
     /// 当前项下标（0 基）。
-    pub(crate) fn current(&self) -> usize {
+    pub fn current(&self) -> usize {
         self.current
     }
 
     /// 当前项路径。
-    pub(crate) fn current_path(&self) -> &Path {
+    pub fn current_path(&self) -> &Path {
         &self.items[self.current]
     }
 
     /// 下标取路径引用（越界 `None`）。
-    pub(crate) fn get(&self, idx: usize) -> Option<&Path> {
+    pub fn get(&self, idx: usize) -> Option<&Path> {
         self.items.get(idx).map(PathBuf::as_path)
     }
 
     /// 下标取路径克隆（越界 `None`）。
-    pub(crate) fn item(&self, idx: usize) -> Option<PathBuf> {
+    pub fn item(&self, idx: usize) -> Option<PathBuf> {
         self.items.get(idx).cloned()
     }
 
     /// 清单切片（仅测试/只读辅助用；生产代码用 [`Self::get`]/[`Self::item`] 取单条）。
     #[cfg(test)]
-    pub(crate) fn items(&self) -> &[PathBuf] {
+    pub fn items(&self) -> &[PathBuf] {
         &self.items
     }
 
     /// 是否停在首个（环绕关闭时的滞后边界）。当前调用方均环绕开启，本方法暂无生产
     /// 调用方——作为「边界禁用」扩展 API 存在，由纯函数单测覆盖。
     #[allow(dead_code)]
-    pub(crate) fn at_start(&self) -> bool {
+    pub fn at_start(&self) -> bool {
         self.current == 0
     }
 
     /// 是否停在最后一个（环绕关闭时的前置边界）。同上，为「边界禁用」扩展 API。
     #[allow(dead_code)]
-    pub(crate) fn at_end(&self) -> bool {
+    pub fn at_end(&self) -> bool {
         self.current + 1 >= self.items.len()
     }
 
@@ -91,7 +91,7 @@ impl FolderNav {
     ///
     /// - `None`：无移动（单元素清单或 `dir == 0`），或环绕关闭且越过边界。
     /// - `Some(idx)`：目标下标；环绕开启时恒在 `[0, len)`（含首↔尾循环）。
-    pub(crate) fn step(&self, dir: i64) -> Option<usize> {
+    pub fn step(&self, dir: i64) -> Option<usize> {
         let n = self.items.len();
         if n <= 1 || dir == 0 {
             return None;
@@ -104,17 +104,17 @@ impl FolderNav {
     }
 
     /// 前进一（环绕开时尾→首）。无移动返回 `None`。
-    pub(crate) fn next(&self) -> Option<usize> {
+    pub fn next(&self) -> Option<usize> {
         self.step(1)
     }
 
     /// 后退一（环绕开时首→尾）。无移动返回 `None`。
-    pub(crate) fn prev(&self) -> Option<usize> {
+    pub fn prev(&self) -> Option<usize> {
         self.step(-1)
     }
 
     /// 越界校验设置当前下标：越界返回 `None`（不改状态）；成功返回 `Some(idx)`。
-    pub(crate) fn set_current(&mut self, idx: usize) -> Option<usize> {
+    pub fn set_current(&mut self, idx: usize) -> Option<usize> {
         if idx >= self.items.len() {
             return None;
         }
@@ -124,7 +124,7 @@ impl FolderNav {
 
     /// 扫描 `at` 所在目录的全部兄弟文件：`include` 做扩展名白名单过滤，文件名升序，
     /// 并定位 `at` 为当前项。读取失败或目录内无匹配 → 退化为「仅当前项」单元素清单。
-    pub(crate) fn scan(at: &Path, include: impl Fn(&Path) -> bool) -> Self {
+    pub fn scan(at: &Path, include: impl Fn(&Path) -> bool) -> Self {
         let mut items = Vec::new();
         if let Some(dir) = at.parent()
             && let Ok(rd) = std::fs::read_dir(dir)

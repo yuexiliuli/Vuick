@@ -142,13 +142,13 @@ fn semantic_name(scope: Scope) -> Option<&'static str> {
 // -------------------------------------------------------------------------
 
 /// 语义名 → 样式解析器（本地 trait，替代组件库 `HighlightStyleResolver`）。
-pub(crate) trait SemanticStyleResolver {
+pub trait SemanticStyleResolver {
     fn style(&self, name: &str) -> Option<HighlightStyle>;
 }
 
 /// 明/暗 GitHub 语法配色（编译期常量；`style` 按语义名查色）。
 /// 未设色（`variable`/`punctuation` 等）→ None → 沿用外层文字色。
-pub(crate) struct GitHubTheme {
+pub struct GitHubTheme {
     dark: bool,
 }
 
@@ -213,13 +213,13 @@ impl SemanticStyleResolver for GitHubTheme {
 }
 
 /// GitHub 风格语法配色（明/暗两套），取自 GitHub 官方（Primer）语法色板。
-pub(crate) fn github_theme(dark: bool) -> GitHubTheme {
+pub fn github_theme(dark: bool) -> GitHubTheme {
     GitHubTheme { dark }
 }
 
 /// 明/暗 GitHub 语法色板（各静态缓存一份）。代码块渲染**每帧**都要把逐行语义名
 /// 解析成颜色（[`resolve_line_styles_with`]），静态缓存避免每帧重建配色。
-pub(crate) fn github_theme_cached(dark: bool) -> &'static GitHubTheme {
+pub fn github_theme_cached(dark: bool) -> &'static GitHubTheme {
     static LIGHT: LazyLock<GitHubTheme> = LazyLock::new(|| github_theme(false));
     static DARK: LazyLock<GitHubTheme> = LazyLock::new(|| github_theme(true));
     if dark { &DARK } else { &LIGHT }
@@ -231,7 +231,7 @@ pub(crate) fn github_theme_cached(dark: bool) -> &'static GitHubTheme {
 
 /// 把区间内的高亮段切成无缝隙的样式 run。`highlights` 有序且互不重叠，
 /// 用二分定位首个候选段，避免每帧全量扫描。
-pub(crate) fn resolve_styles(
+pub fn resolve_styles(
     highlights: &[(Range<usize>, &'static str)],
     range: &Range<usize>,
     resolver: &dyn SemanticStyleResolver,
@@ -266,7 +266,7 @@ pub(crate) fn resolve_styles(
 /// 把某一行的语义名 run 解析成**覆盖整行、无缝隙**的 `HighlightStyle` run。
 /// 颜色由 `resolver`（GitHub 明/暗色板）决定；无命中段时返回单个默认 run（沿用外层文字色）。
 /// 调用方应复用同一个 resolver 逐行解析，避免每行重建主题。
-pub(crate) fn resolve_line_styles_with(
+pub fn resolve_line_styles_with(
     runs: &[(Range<usize>, &'static str)],
     line_len: usize,
     resolver: &dyn SemanticStyleResolver,
@@ -280,7 +280,7 @@ pub(crate) fn resolve_line_styles_with(
 
 /// Markdown 预览代码块的高亮结果：**每行一个**未解析的语义名 run
 /// （行内字节区间 → 语义名）。与主题无关，可跨明/暗主题复用缓存。
-pub(crate) type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
+pub type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
 
 /// 解析整个代码块文本，返回每行的语义名 run（整块一次解析，
 /// 多行注释 / 字符串 / 跨行语法上下文能正确配色，预览不会“逐行独立”地错色）。
@@ -288,7 +288,7 @@ pub(crate) type CodeLineRuns = Vec<Vec<(Range<usize>, &'static str)>>;
 ///
 /// TOML 不在 syntect 内置语法集里（syntect 5.3 的 default_newlines 无 TOML），
 /// 走内置的轻量扫描器 [`toml_code_runs`]（与 GitHub 配色同一套语义名）。
-pub(crate) fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRuns> {
+pub fn parse_code_lines(language: &str, code: &str) -> Option<CodeLineRuns> {
     if normalize_language(language).eq_ignore_ascii_case("toml") {
         return Some(toml_code_runs(code));
     }
@@ -645,7 +645,7 @@ fn lookahead_is_key(line: &str, mut k: usize, vis: usize) -> bool {
 /// - `SYNTAX_CACHE`：预填常用语言 → 首个代码块不再对全集做首次 `find_syntax` 扫描；
 /// - `github_theme_cached`：明/暗两张色板各一份，首次上色不再现场构建主题。
 ///   `LazyLock`/`Mutex` 并发安全：可在后台线程调用，主线程若抢先命中只会短暂阻塞。
-pub(crate) fn prewarm() {
+pub fn prewarm() {
     // 触发全局语法集加载（进程内仅一次）。
     let _ = &*SYNTAX_SET;
     // 预填常用语言映射；未知/无命中（如 js 走扩展名）返回 None，无害。

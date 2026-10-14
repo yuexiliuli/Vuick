@@ -2118,6 +2118,9 @@ dependencies = [
  "gpui",
  "gpui-editor-base",
  "gpui-editor-config",
+ "gpui-editor-ime",
+ "gpui-editor-syntax",
+ "gpui-editor-viewer",
  "gpui_platform",
  "image",
  "libjpeg-turbo-rs",
@@ -2150,6 +2153,29 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "serde_json",
+]
+
+[[package]]
+name = "gpui-editor-ime"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-editor-base",
+]
+
+[[package]]
+name = "gpui-editor-syntax"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "syntect",
+]
+
+[[package]]
+name = "gpui-editor-viewer"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]

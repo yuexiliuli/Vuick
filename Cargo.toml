@@ -46,6 +46,10 @@ cpal = { workspace = true }
 # 拆分 workspace 后迁出的叶子 crate（P1）：config 常数 / base 基础件。
 gpui-editor-config = { path = "crates/gpui-editor-config" }
 gpui-editor-base = { path = "crates/gpui-editor-base" }
+# 拆分 workspace 后迁出的共享设施叶子 crate（P2）：ime / viewer / syntax。
+gpui-editor-ime = { path = "crates/gpui-editor-ime" }
+gpui-editor-viewer = { path = "crates/gpui-editor-viewer" }
+gpui-editor-syntax = { path = "crates/gpui-editor-syntax" }
 
 [features]
 default = ["video"]
@@ -59,7 +63,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base"]
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

@@ -21,7 +21,7 @@ use std::ops::Range;
 
 use gpui::{Context, UTF16Selection};
 
-use crate::editor::EditIntent;
+use gpui_editor_base::EditIntent;
 
 /// 文本宿主（**byte 语义**）：IME 状态机通过它读写文档。偏移一律为 UTF-8 字节，
 /// UTF-16 ↔ byte 换算与落地编辑由宿主按其存储结构提供。

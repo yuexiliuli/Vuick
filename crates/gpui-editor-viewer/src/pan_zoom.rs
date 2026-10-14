@@ -17,7 +17,7 @@
 use gpui::{ScrollDelta, ScrollWheelEvent};
 
 /// 滚轮纵轴增量：`Lines` → 格数 / `Pixels` → 像素（三查看器原实现逐字节一致的 match）。
-pub(crate) fn wheel_delta_y(event: &ScrollWheelEvent) -> f32 {
+pub fn wheel_delta_y(event: &ScrollWheelEvent) -> f32 {
     match event.delta {
         ScrollDelta::Lines(v) => v.y,
         ScrollDelta::Pixels(v) => f32::from(v.y),
@@ -26,13 +26,13 @@ pub(crate) fn wheel_delta_y(event: &ScrollWheelEvent) -> f32 {
 
 /// Ctrl+滚轮缩放因子：`1 + clamp(delta_y, -1, 1) * step`（实测本平台向上滚 `delta.y>0`
 /// → 放大；与编辑器字号缩放一致）。一档 = `1 ± step`。
-pub(crate) fn zoom_factor(delta_y: f32, step: f32) -> f32 {
+pub fn zoom_factor(delta_y: f32, step: f32) -> f32 {
     1.0 + delta_y.clamp(-1.0, 1.0) * step
 }
 
 /// 应用缩放并钳位到 `[min, max]`；变化量 < 1e-4 视为无变化（返回 `false`，调用方便可
 /// 跳过副作用 / `notify`）。`zoom` 就地更新，返回是否实际变化。
-pub(crate) fn apply_zoom(zoom: &mut f32, factor: f32, min: f32, max: f32) -> bool {
+pub fn apply_zoom(zoom: &mut f32, factor: f32, min: f32, max: f32) -> bool {
     let new_zoom = (*zoom * factor).clamp(min, max);
     if (new_zoom - *zoom).abs() < 1e-4 {
         return false;
@@ -43,7 +43,7 @@ pub(crate) fn apply_zoom(zoom: &mut f32, factor: f32, min: f32, max: f32) -> boo
 
 /// 适应视口（Contain，**贴边无留白**）：取较小缩放比 `min(vw/iw, vh/ih)`（下限 0.001
 /// 防除零），一轴正好贴边、另一轴居中留白，保持原始比例。
-pub(crate) fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
+pub fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
     let fit = (vw / iw).min(vh / ih).max(0.001);
     (iw * fit, ih * fit)
 }
@@ -51,22 +51,22 @@ pub(crate) fn contain_fit(iw: f32, ih: f32, vw: f32, vh: f32) -> (f32, f32) {
 /// 平移 clamp：放大后（`dw > vw` 或 `dh > vh`）允许在图内滑动，范围 = ±(图 − 视口)/2；
 /// 未放大时范围 0（恒居中，拖拽无效果）。以「视口中心 = 图中心」为 0 基准，
 /// 缩放/切图后范围变化由 render 逐帧重新 clamp 收敛。
-pub(crate) fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
+pub fn clamp_pan(pan: (f32, f32), vw: f32, vh: f32, dw: f32, dh: f32) -> (f32, f32) {
     let ax = (dw - vw).max(0.0) * 0.5;
     let ay = (dh - vh).max(0.0) * 0.5;
     (pan.0.clamp(-ax, ax), pan.1.clamp(-ay, ay))
 }
 
 /// 拖拽平移会话状态：`(左键按下位置, 按下时 pan 起点)`。image / video 两家同款布局。
-pub(crate) type PanDrag = ((f32, f32), (f32, f32));
+pub type PanDrag = ((f32, f32), (f32, f32));
 
 /// 开始拖拽：记录按下位置与按下时 pan 起点（未放大时 clamp 恒 0，拖动无效果）。
-pub(crate) fn pan_drag_begin(pos: (f32, f32), pan: (f32, f32)) -> PanDrag {
+pub fn pan_drag_begin(pos: (f32, f32), pan: (f32, f32)) -> PanDrag {
     (pos, pan)
 }
 
 /// 拖拽增量 = 当前鼠标位置 − 按下位置。
-pub(crate) fn pan_drag_delta(drag: &PanDrag, pos: (f32, f32)) -> (f32, f32) {
+pub fn pan_drag_delta(drag: &PanDrag, pos: (f32, f32)) -> (f32, f32) {
     (pos.0 - drag.0.0, pos.1 - drag.0.1)
 }
 
