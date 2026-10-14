@@ -104,10 +104,16 @@ pub use crate::markdown::parse::recognition::LinkHit;
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gpui::{Context, FocusHandle, Focusable, Hsla, Pixels, SharedString, Window, point, px};
 
 use super::doc::Doc;
+
+/// 光标闪烁周期（ms；对齐编辑器 `CodeEditor` / ui 输入框同款常量）。
+const BLINK_MS: u64 = 500;
+/// 光标交互后的常亮静止期（ms）：点击/键移/输入后先亮住再继续闪。
+const BLINK_PAUSE_MS: u64 = 300;
 
 /// 编辑器变更事件（宿主订阅，内容镜像回源码编辑区/保存流程）。
 #[derive(Clone, PartialEq, Debug)]
@@ -120,6 +126,14 @@ pub enum WyEvent {
 pub struct WyEditor {
     doc: Doc,
     focus: FocusHandle,
+    /// —— 光标闪烁（对齐编辑器 `CodeEditor` / ui 输入框同一模式：聚焦启动、失焦
+    /// 退出、epoch 防重、交互静止期常亮；定时器驱动翻转，非每帧重绘）——
+    focused: bool,
+    caret_visible: bool,
+    caret_pause_until: Option<Instant>,
+    blink_epoch: u64,
+    blink_running: bool,
+    focus_registered: bool,
     caret: usize,
     /// 是否已装入过完整源（`set_source_text`/`install_open` 置真）。App 大文档 load 走
     /// 后台解析时，`new()` 产生**空**编辑器——在 `install_open` 完成前该编辑器没有内容，

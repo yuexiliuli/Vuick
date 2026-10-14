@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::Duration;
+
 use gpui::Pixels;
 use ropey::Rope;
 
@@ -14,6 +16,12 @@ impl WyEditor {
         Self {
             doc: Doc::open(SharedString::default()),
             focus: cx.focus_handle(),
+            focused: false,
+            caret_visible: false,
+            caret_pause_until: None,
+            blink_epoch: 0,
+            blink_running: false,
+            focus_registered: false,
             caret: 0,
             loaded: false,
             editable: true,
@@ -652,6 +660,8 @@ impl WyEditor {
         // 光标移动 → 打断撤销合并组（同 editor/undo.rs 的 cooperative=false）。
         self.last_edit = None;
         self.last_edit_at = None;
+        // 光标移动 → 静止期常亮（blink 暂停，先亮住再继续闪）。
+        self.kick_caret();
         *self.frame.borrow_mut() = None;
     }
     /* ---------- 选区 ---------- */
@@ -680,6 +690,8 @@ impl WyEditor {
         let off = off.min(self.len());
         self.caret = off;
         self.sel_anchor = Some(off);
+        // 点击落光标 → 静止期常亮（对齐 editor `on_mouse_down` 的 kick）。
+        self.kick_caret();
         self.dragging = true;
         *self.frame.borrow_mut() = None;
     }
@@ -691,6 +703,8 @@ impl WyEditor {
         }
         let off = off.min(self.len());
         self.caret = off;
+        // 拖选移动光标 → 静止期常亮（对齐 editor `on_mouse_move` 拖选期实时 kick）。
+        self.kick_caret();
         if self.sel_anchor.is_none() {
             self.sel_anchor = Some(off);
         }
@@ -704,6 +718,8 @@ impl WyEditor {
         if self.sel_anchor == Some(self.caret) {
             self.sel_anchor = None;
         }
+        // 拖选结束 → 静止期常亮。
+        self.kick_caret();
         *self.frame.borrow_mut() = None;
     }
 
@@ -711,7 +727,96 @@ impl WyEditor {
     pub(crate) fn select_all(&mut self) {
         self.sel_anchor = Some(0);
         self.caret = self.len();
+        self.kick_caret();
         *self.frame.borrow_mut() = None;
+    }
+
+    /* ---------- 光标闪烁（对齐编辑器 `CodeEditor` / ui 输入框同一模式） ---------- */
+
+    /// 当前帧光标是否应绘制：失焦不画；交互静止期内常亮；否则跟随闪烁翻转。
+    /// paint 的唯一光标相位（`caret_visible` 翻转由 blink 定时器驱动，非每帧计算）。
+    pub(crate) fn caret_shown_now(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
+        let paused = self
+            .caret_pause_until
+            .is_some_and(|p| p.elapsed() < Duration::from_millis(BLINK_PAUSE_MS));
+        paused || self.caret_visible
+    }
+
+    /// 光标交互后常亮静止期（点击/键移/输入后先亮住再继续闪）。
+    pub(crate) fn kick_caret(&mut self) {
+        self.caret_visible = true;
+        self.caret_pause_until = Some(Instant::now());
+    }
+
+    fn on_focus(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = true;
+        self.kick_caret();
+        if !self.blink_running {
+            self.start_blink(cx);
+        }
+        cx.notify();
+    }
+
+    fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focused = false;
+        self.caret_visible = true;
+        cx.notify();
+    }
+
+    fn start_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_running {
+            return;
+        }
+        self.blink_running = true;
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        cx.spawn(async move |this, cx| loop {
+            let elapsed = this
+                .update(cx, |this, _| {
+                    this.caret_pause_until
+                        .map_or(u128::MAX, |p| p.elapsed().as_millis())
+                })
+                .unwrap_or(u128::MAX);
+            if elapsed >= BLINK_PAUSE_MS as u128 {
+                // 定时器驱动翻转（500ms 一拍，非每帧重绘）；实体 notify → gpui 按
+                // 访问追踪作废宿主窗口（WyEditorElement 每帧 read 本实体已注册追踪）。
+                let _ = this.update(cx, |this, cx| {
+                    this.caret_visible = !this.caret_visible;
+                    cx.notify();
+                });
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(BLINK_MS))
+                .await;
+            let keep = this
+                .update(cx, |this, _| this.focused && epoch == this.blink_epoch)
+                .unwrap_or(false);
+            if !keep {
+                this.update(cx, |this, _| this.blink_running = false).ok();
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 首次渲染注册焦点事件 + 每帧按窗口焦点态对齐（补应用启动时焦点先于注册的
+    /// 丢失事件；聚焦/失焦都经 on_focus/on_blur 收敛到 blink 循环）。由元素
+    /// `request_layout`/`prepaint` 每帧调用。
+    pub(crate) fn sync_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus_registered {
+            let _ = cx.on_focus(&self.focus, window, Self::on_focus);
+            let _ = cx.on_blur(&self.focus, window, Self::on_blur);
+            self.focus_registered = true;
+        }
+        let focused = self.focus.is_focused(window);
+        if focused && !self.focused {
+            self.on_focus(window, cx);
+        } else if !focused && self.focused {
+            self.on_blur(window, cx);
+        }
     }
 
     /* ---------- 搜索跳转高亮（预览独有能力，搬入统一组件） ---------- */

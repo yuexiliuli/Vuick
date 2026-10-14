@@ -447,6 +447,8 @@ impl WyEditor {
 
         self.caret = (r.start + inserted_len).min(self.len());
         self.sel_anchor = None;
+        // 输入/删除/粘贴 → 静止期常亮（blink 暂停，先亮住再继续闪）。
+        self.kick_caret();
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         crate::prof::end("wy.replace_range", _t_rr);
@@ -995,6 +997,8 @@ impl WyEditor {
         self.caret = target_caret.min(self.len());
         self.sel_anchor = None;
         self.marked = None;
+        // 撤销/重做等净逆操作落地 → 静止期常亮。
+        self.kick_caret();
         *self.frame.borrow_mut() = None;
         self.content_gen.set(self.content_gen.get().wrapping_add(1));
         crate::prof::end("wy.replace_range", _t_rr);
@@ -1273,6 +1277,8 @@ impl WyEditor {
         // 方向键移动 → 打断撤销合并组。
         self.last_edit = None;
         self.last_edit_at = None;
+        // 方向键移动 → 静止期常亮（blink 暂停，先亮住再继续闪）。
+        self.kick_caret();
         // 表格内容行内：光标钳到最近单元格内容区间（不落在管道/空白上，避免输入破坏表）。
         let (line, col) = self.row_col(self.caret);
         if let Some(c) = self.clamp_caret_table(line, col) {

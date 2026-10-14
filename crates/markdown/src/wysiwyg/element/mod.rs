@@ -799,8 +799,11 @@ impl Element for WyEditorElement {
         _: Option<&GlobalElementId>,
         _: Option<&InspectorElementId>,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, ()) {
+        // 光标闪烁：首次渲染注册焦点事件 + 每帧按窗口焦点态对齐（聚焦启动/
+        // 失焦退出 blink 循环；见 `WyEditor::sync_focus`）。
+        self.editor.update(cx, |e, ecx| e.sync_focus(window, ecx));
         let editor = self.editor.clone();
         let mut style = gpui::Style::default();
         style.size.width = relative(1.).into();
@@ -1224,11 +1227,14 @@ impl Element for WyEditorElement {
         paint_note_marker_highlight(&self.editor, origin, &theme, f, window, cx);
         // 光标几何每帧按 caret 现算（帧缓存不含 caret，改 caret 无需整帧重建）。
         // A1 只读门控：`editable=false` 不画光标（光标移动/选区仍工作，只是无竖条）。
+        // 闪烁相位：`caret_shown_now()`（聚焦 + 静止期常亮/定时器翻转），替代旧的
+        // 恒 `focus.is_focused(window)` —— 修「光标位置对但静止不闪」。
         let (caret_on, caret_x, caret_top) = {
             let e = self.editor.read(cx);
             caret_geometry(e, f)
         };
-        if self.editor.read(cx).is_editable() && caret_on && focus.is_focused(window) {
+        let caret_shown = self.editor.read(cx).caret_shown_now();
+        if self.editor.read(cx).is_editable() && caret_on && caret_shown {
             window.paint_quad(gpui::PaintQuad {
                 bounds: Bounds::new(
                     point(origin.x + caret_x, origin.y + caret_top),
