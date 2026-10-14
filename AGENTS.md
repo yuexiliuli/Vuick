@@ -23,7 +23,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 → 主 agent 轻核对(git status --short && git diff --stat) → 用户说"提交git"才提交
 ```
 
-- 修 bug 也走同线：**复现测试先行**（真实渲染断言，先 FAIL 修到 PASS）；根因由实现子 agent 自证（引用代码证据）。brief 根因规则：**只写已核实的根因**（主 agent read 确证过才给，直接省实现时间）；**未核实的猜想必不写**，只给症状+入口点，避免引偏
+- 修 bug 也走同线：**复现测试先行**（真实渲染断言，先 FAIL 修到 PASS）；根因由实现子 agent 自证（引用代码证据）。brief 根因规则：**只写已核实的根因**（主 agent read 确证过才给，直接省实现时间）；**未核实的猜想必不写**，只给症状+入口点，避免引偏。**bug 紧跟近期改动后报告 → 首步 `git stash` 剥离该改动定性「回归 or 既有」（先存 diff 指纹精确还原）再修**
 - **实现→评审双 agent 只用于逻辑/几何/命中/并发类**；纯视觉/数值微调（k/曲率/间距等）自验即可；同文件连续微调用 `task_id` 续跑同一会话
 - 评审分级：高风险共享模块（editor/view/core/shell/公共组件）亲自重跑；低风险单模块只读 diff + 抽查关键断言 + 定向跑，**与实现方共用同一份测试输出**
 - 互不冲突的独立任务并行派（跨文件/跨模块）；同文件改动强制串行
@@ -31,7 +31,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 ### 三、编译与验证纪律（编译是耗时头号）
 
 - **只跑 debug、禁止 release**；workspace 测试必须带 `-p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；pdf 加 `--test-threads=1`
-- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量
+- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量；filter 用**模块路径前缀**（如 `cargo test -p shell app::tests::sidebar`）一次盖全模块，避免函数名不带前缀被漏跑→评审重复补跑
 - **验证只做改动部分、禁止全量**（全量仅当用户明确要求/特性定型）；行为功能**不跑 stash 基线**（回归由评审兜底）——仅性能对比子 agent 才 stash before/after，pop 后逐文件核对还原
 - 边界测试先行 → 字节/几何盲区消灭在实现侧，评审不再补 FAIL→PASS
 
@@ -39,7 +39,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 
 - **侦察下放**：派活前只做 **1-2 条 CRG 查询**（`get_minimal_context_tool` / `query_graph` / `traverse_graph`）或 grep 定入口；**不 read 实现细节、不跑多路 grep/采样替子 agent 摸底**——子 agent 本就要读，主 agent 抢读既烧上下文又常常猜错根因
 - **核对极简**：收报告后只跑一条 `git status --short && git diff --stat`；不再逐路复核（确需抽查至多 1 个 grep）
-- **brief 收敛**：只写「需求 + 约束 + 已知落点」，不写实现规格；**根因只写已核实的、不写猜测**（见流水线条）；续跑轮只写 delta；歧义合并进一次 `question`；bench/大表输出一律 `-Last N`/limit 截断
+- **brief 收敛**：只写「需求 + 约束 + 已知落点」，不写实现规格；**根因只写已核实的、不写猜测**（见流水线条）——未核实的 prime suspect 只作线索并标注「需子 agent 核实」，不得当结论引偏；续跑轮只写 delta；歧义合并进一次 `question`；bench/大表输出一律 `-Last N`/limit 截断
 
 ## 既有验收口径（子 agent 验证口径，别当"回归"）
 
