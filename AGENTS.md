@@ -11,7 +11,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 ### 一、任务包工（每次派活必写全）
 
 1. **目标 + 已知落点**：`path:行号`（附"行号可漂移、先 grep/read 精读再动"，让子 agent 不从头摸）
-2. **需求清单**：可勾选、逐条、可验收
+2. **需求清单**：可勾选、逐条、可验收；凡**缓存/派生状态改动**，必须列全失效源（换文档/切预览/内容编辑/整篇换源/折叠/只读切换等）
 3. **纪律**：不改 gpui checkout、不加依赖；不提交 git（提交权在主 agent，须用户明确说"提交git"）；颜色走 `ui::theme`、注释中文；先 `get_minimal_context_tool(task=...)`
 4. **验证**：`cargo check --bin gpui-editor`（0 error/0 warning）+ `cargo test -p <crate>` 最小精确测试集 + 真实渲染路径回归——**边界清单逐项打勾**（非行 0、同行多元素、折行续行、文档结尾、空文档等；实现侧每项勾完才算完成，漏项留到评审=返工多耗一轮 FAIL→PASS 编译）
 5. **报告**：改动 `path:line` → 机制 → 验证输出摘要 → 遗留风险 → 建议 commit message（几 KB 内，禁止转贴源码）
@@ -31,7 +31,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 ### 三、编译与验证纪律（编译是耗时头号）
 
 - **只跑 debug、禁止 release**；workspace 测试必须带 `-p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；pdf 加 `--test-threads=1`
-- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮
+- **每组改动改完再编译**：`cargo test -p <crate> <filter>` 一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量
 - **验证只做改动部分、禁止全量**（全量仅当用户明确要求/特性定型）；行为功能**不跑 stash 基线**（回归由评审兜底）——仅性能对比子 agent 才 stash before/after，pop 后逐文件核对还原
 - 边界测试先行 → 字节/几何盲区消灭在实现侧，评审不再补 FAIL→PASS
 
@@ -58,7 +58,7 @@ Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo wo
 ## 代码探索与评审：优先用本机 CRG 工具链
 
 - MCP `code-review-graph` 已启用（`.kilo/kilo.jsonc`，本地 venv，仓库根 `.code-review-graph/graph.db`）；**不要为查"谁调用谁/影响面"手工通读 2000 行整文件**
-- **新鲜度靠 CLI 保鲜**：本机 `code-review-graph watch` 常驻自动增更（仓库根 `.code-review-graph/` 不入库）；图暂停过/换 checkout 后先 CLI `build` 拉新再查
+- **新鲜度靠 CLI 保鲜**：本机 `code-review-graph watch` 常驻自动增更（仓库根 `.code-review-graph/` 不入库）；图暂停过/换 checkout 后先 CLI `build` 拉新再查。**`get_minimal_context`/搜索报 stale 且排查对象不在近期改动里 → 直接用单 token 搜索 + grep 寻路，不追更**（`update` 报 0 常因增量基准未随 HEAD 推进；确需拉新用 `build`）
 - **技能**：复杂任务/评审/重命名/架构体检前先 `skill` 加载 `code-review-graph`（`.kilo/skills/`，自动发现），按其已验证调用姿势执行（评审 §4、搜索 §5、坑 §7、节奏 §8）
 - 每个任务开头先 `get_minimal_context_tool(task=...)`，拿风险分、相关 communities/flows、`head_matches_build`
 
