@@ -2404,3 +2404,133 @@ fn async_refresh_lands_incrementally(cx: &mut TestAppContext) {
 }
 
 
+
+
+#[gpui::test]
+fn quick_scroll_progressive_fill_reaches_full_color(cx: &mut TestAppContext) {
+    // 分片补色回归：大 `.rs` 远跳（>160 行缺口）后，延后帧不再整窗空样式，而是从
+    // **可见区顶部**起每帧补 `HL_FILL_BUDGET_ROWS` 行真颜色。两段验证：
+    // A) 确定性补色状态机（`test_fill_step` 直接驱动步进，不经渲染帧）：①首步后
+    //    可见区顶部若干行已入缓存（非空颜色）、窗口底未补（不是全窗重锚，告别全空）；
+    //    ②同窗口下一步有色前缀变长；③多步补满 → 整窗有色（done）→ 下帧命中缓存；
+    //    ④窗口变（仍在拖）→ 重锚回新可见顶、顶部带重新有色。
+    // B) 真实渲染集成（`build_rows` 经 draw 跑；延后帧 `request_animation_frame` 预约
+    //    下一帧、flush 驱动到静止）：远跳后最终满窗有色（告别 1s 死白），fill 会话
+    //    复位（自动静止、无空转帧）。
+    let text: String = (0..120_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let (host, cx) = open(cx, &text);
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.set_language(Some("rust")));
+    });
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let row_runs = |ed: &Entity<CodeEditor>, cx: &mut VisualTestContext, logical: usize| {
+        cx.update(|_, cx| ed.read(cx).test_hl_row_runs(logical))
+    };
+    let fill_step = |ed: &Entity<CodeEditor>, cx: &mut VisualTestContext,
+                     lo_l: usize,
+                     hi_l: usize,
+                     vis_top_l: usize| {
+        cx.update(|_, cx| {
+            ed.update(cx, |ed, _| ed.test_fill_step(lo_l, hi_l, vis_top_l))
+        })
+    };
+
+    // A1) 首步（远窗口 [71900, 72060]，可见顶 71960）：只补可见区顶部一截（BUDGET 行），
+    //     顶部已有非空颜色、窗口底未补（不是全窗重锚）。
+    let (range1, done1) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    assert_eq!(range1.0, 71_960, "补色起点=可见区顶部 vis_top（非窗口 lo）");
+    assert_eq!(range1.1, 71_960 + 31, "首步恰好补 BUDGET 行前缀");
+    assert!(!done1, "首步未整窗覆盖（分片推进中）");
+    assert!(
+        (0..8).all(|k| row_runs(&ed, cx, 71_960 + k) > 0),
+        "首步后可见区顶部前几行应已有非空颜色（不是全空）"
+    );
+    assert!(
+        row_runs(&ed, cx, 72_052) == 0,
+        "同帧窗口底仍未补（分片：本帧只补可见区顶部前缀）"
+    );
+
+    // A2) 同窗口下一步：有色前缀变长（游标继续下推）。
+    let (range2, done2) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    assert!(range2.1 > range1.1, "同窗口下一帧有色前缀应变长（{}→{}）", range1.1, range2.1);
+    assert!(
+        (0..33).all(|k| row_runs(&ed, cx, 71_960 + k) > 0),
+        "第二次步进后此前缀内全部有色（含上一帧的部分）"
+    );
+    assert!(!done2, "两步后仍未整窗覆盖");
+
+    // A3) 继续步进到补满：整窗有色（done=true，缓存覆盖整个请求窗 → 下帧命中快路径）。
+    let (_range3, done3) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    let (_range4, done4) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    assert!(done3 || done4, "多步后应整窗覆盖（done）");
+    assert!(
+        (72_000..72_060).all(|k| row_runs(&ed, cx, k) > 0),
+        "多步补满后窗口深部也应有色（非只顶部前缀）"
+    );
+    let (_r5, done5) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    assert!(done5, "补满后保持 done（无空转）");
+    let (_r6, done6) = fill_step(&ed, cx, 71_900, 72_060, 71_960);
+    assert!(done6, "补满后反复步进保持 done（不重锚、不空转）");
+    assert!(
+        (72_000..72_060).all(|k| row_runs(&ed, cx, k) > 0),
+        "补满后整窗保持有色（后续帧缓存命中）"
+    );
+
+    // A4) 窗口变了（仍在拖）：重锚回新可见顶，顶部带重新有色、新窗口深部未补。
+    let (range7, done7) = fill_step(&ed, cx, 72_040, 73_200, 72_100);
+    assert_eq!(range7.0, 72_100, "拖走后重锚回新可见顶");
+    assert!(!done7, "新窗口步进中仍未覆盖全窗");
+    assert!(
+        (0..8).all(|k| row_runs(&ed, cx, 72_100 + k) > 0),
+        "拖走后新窗口顶部也应立即有色带"
+    );
+    assert!(
+        row_runs(&ed, cx, 73_192) == 0,
+        "新窗口底部未补（拖动中仍在推进）"
+    );
+
+    // B) 真实渲染集成：远跳新窗口并 flush 到静止 → 语义同 A，走真实 draw 路径
+    //    （含延后帧里 `request_animation_frame` 的下一帧回调），最终满窗有色且会话复位。
+    cx.update(|_, cx| {
+        let ed2 = host.read(cx).ed.clone();
+        ed2.update(cx, |ed, _| ed.test_scroll_to_px(73_960.0 * lh));
+    });
+    for _ in 0..6 {
+        let _ = cx.refresh();
+        cx.update(|_, _| {});
+    }
+    assert!(
+        row_runs(&ed, cx, 73_960) > 0 && row_runs(&ed, cx, 74_040) > 0,
+        "真实渲染远跳后可见顶与更深行都应有色（告别死白）"
+    );
+    cx.update(|_, cx| {
+        let ed2 = host.read(cx).ed.clone();
+        ed2.update(cx, |ed, _| ed.test_scroll_to_px(74_000.0 * lh));
+    });
+    for _ in 0..6 {
+        let _ = cx.refresh();
+        cx.update(|_, _| {});
+    }
+    assert_eq!(
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_hl_fill()),
+        Some(((0, 0), 0, 0)),
+        "渲染静止后分片会话应复位（自动静止、无空转帧）"
+    );
+    assert!(
+        row_runs(&ed, cx, 74_000) > 0 && row_runs(&ed, cx, 74_080) > 0,
+        "再次远跳静止后新窗口整窗有色（告别死白）"
+    );
+}
+

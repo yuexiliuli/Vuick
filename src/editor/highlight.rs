@@ -232,6 +232,20 @@ impl Highlighter {
         self.lines.len()
     }
 
+    /// 测试探针：逻辑行 `logical` 当前是否已在缓存里且带真颜色段（返回样式段数）。
+    /// 分片补色回归用它断言「可见区顶部若干行已有非空颜色」——缓存里有段 = 该行
+    /// 本帧被真正解析过（`0` = 未入缓存 / 空样式占位）。
+    #[cfg(test)]
+    pub(crate) fn test_row_runs(&self, logical: usize) -> usize {
+        if self.lines.is_empty() || logical < self.base {
+            return 0;
+        }
+        self.lines
+            .get(logical - self.base)
+            .map(|runs| runs.len())
+            .unwrap_or(0)
+    }
+
     /// 测试探针：累计一次 `full_reparse`（仅测试构建存在）。
     #[cfg(test)]
     fn bump_reparse_count(&mut self) {

@@ -56,6 +56,16 @@ use crate::editor::{Buffer, Selection};
 
 /// 代码行高亮回看行数（多行注释/字符串上下文不错位）。
 const HL_LOOKBACK_LINES: usize = 16;
+/// 语法高亮「分片补色」每帧行数预算（`build_rows` 延后帧：从可见区顶部起本帧只解析
+/// 这么些行的真颜色，窗口其余行仍空样式）。
+///
+/// 基准实测（debug，本仓库大 .rs 样本 12 万行，见 `bench_first_frame_coloring` 校准）：
+/// syntect 逐行 parse ≈ **1.3-1.7ms/行**。若把「每补色帧 ≤5ms」的目标硬换算成行数只有
+/// ~3 行/帧——那种摊法首批颜色要跨几十帧、满窗总成本反而更高（每帧固定开销 + 帧调度
+/// 损耗）。按实测取 **32 行/帧 ≈45-55ms**：首批颜色 <60ms（观感目标）、整窗 ~5 帧；
+/// 滚动停住后由 `settle_pending` 一次有界重锚补齐整窗（含上方过扫）、清 pending，
+/// 全窗总耗落回 ~200-300ms 级（不再 1s 级死白）。
+const HL_FILL_BUDGET_ROWS: usize = 32;
 /// 光标闪烁半周期（ms）。
 const BLINK_MS: u64 = 500;
 /// 输入后光标暂停闪烁（实心显示，ms）。
@@ -283,6 +293,28 @@ const LIST_WINDOW_ROWS: usize = crate::config::limits::EDITOR_LIST_PROVISIONAL_R
 pub(crate) static CODE_EDITOR_FULL_RESET_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// 语法高亮「分片补色」进度（`build_rows` 的延后帧用它逐帧从可见区顶部往下补色）。
+///
+/// 背景：大 `.rs` 拖滚动条/远跳时，`Highlighter::accept_deferred` 把窗口登记为
+/// `pending`（本帧延后满窗空样式）。改进 = 延后帧不再全空：本帧只从**可见区顶部**
+/// 逻辑行起解析 `HL_FILL_BUDGET_ROWS` 行真颜色（其余行空样式），相邻帧窗口一致 →
+/// 游标继续下推，直到 `settle`（滚动停稳）一次有界重锚补齐整窗、清 pending。这样
+/// 「滚动中可见区顶部一段始终有色、停稳后首批颜色几十 ms 出现」，告别全程死白。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HlFill {
+    /// 本补色会话所属请求窗口 `(lo_l, hi_l)`（**逻辑行**）；与前帧窗口不一致（仍在
+    /// 拖）/编辑器版本变了（编辑）→ 重锚回新窗口可见顶。
+    window: (usize, usize),
+    /// 会话建立时的 `buffer.version`；编辑后重锚从头补（下方缓存已随编辑失效）。
+    version: u64,
+    /// 会话可见区顶部逻辑行（= 补色起点，`vis_top` 非窗口 `lo`——窗口 `lo` 含上方过扫，
+    /// 先给不可见行上色没用）。
+    vis_top_l: usize,
+    /// 下一个待补逻辑行（向下阶段：`vis_top_l → hi_l`）。`> hi_l` 表示可见区顶到窗口底
+    /// 已补完，剩余「上方过扫 `[lo_l, vis_top_l)`」由 settle 一次补齐。
+    cursor: usize,
+}
+
 /// 自研代码编辑器（首版）。
 pub struct CodeEditor {
     buffer: Buffer,
@@ -301,6 +333,9 @@ pub struct CodeEditor {
     /// `Highlighter` 做「局部重解析 + 收敛早退」，避免逐键把整窗重跑 syntect。
     /// 整篇替换/打开/撤销重做置 `None`（走整段重解析）。
     hl_dirty: Option<(usize, usize, i64)>,
+    /// 语法高亮「分片补色」进度（延后帧逐帧下刷，见 [`HlFill`]；滚动停稳 settle 后
+    /// 复位为默认）。
+    hl_fill: HlFill,
     /// M5-B2-3 行级缓存：`build_rows` 按 `(buffer.version(), 逻辑行)` 复用行静态内容
     /// （文本 + 合并后样式）。滚动帧只物化新进窗口的行；编辑/撤销/重做靠版本键失效，
     /// 整篇替换由 [`Self::reset_document`] 显式清空。见 [`RowCache`]。
@@ -455,6 +490,7 @@ impl CodeEditor {
             h_handle: ScrollHandle::new(),
             highlighter: Highlighter::new(),
             hl_dirty: None,
+            hl_fill: HlFill::default(),
             row_cache: RowCache::default(),
             md_decor: MarkdownDecor::default(),
             md_mode: false,
@@ -860,7 +896,7 @@ impl CodeEditor {
             return Vec::new();
         }
         self.test_warm_highlight(logical_row, logical_row);
-        self.build_rows(window, logical_row, logical_row, false, false)
+        self.build_rows(window, logical_row, logical_row, logical_row, false, false)
             .into_iter()
             .next()
             .map(|rd| rd.content.highlights.clone())
@@ -878,7 +914,7 @@ impl CodeEditor {
         hi: usize,
     ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
         self.test_warm_highlight(lo, hi);
-        self.build_rows(window, lo, hi, false, false)
+        self.build_rows(window, lo, hi, lo, false, false)
             .into_iter()
             .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
             .collect()
@@ -897,7 +933,7 @@ impl CodeEditor {
         lo: usize,
         hi: usize,
     ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
-        self.build_rows(window, lo, hi, false, false)
+        self.build_rows(window, lo, hi, lo, false, false)
             .into_iter()
             .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
             .collect()
@@ -928,6 +964,19 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_row_cache(&self) -> (usize, usize) {
         self.row_cache.stats()
+    }
+
+    /// 测试：当前语法高亮「分片补色」进度快照 `(窗口(lo_l,hi_l), 可见顶, 游标)`。
+    #[cfg(test)]
+    pub(crate) fn test_hl_fill(&self) -> Option<((usize, usize), usize, usize)> {
+        let f = self.hl_fill;
+        Some((f.window, f.vis_top_l, f.cursor))
+    }
+
+    /// 测试：逻辑行 `logical` 当前在语法缓存里的真颜色段数（`0` = 未补色/不在缓存）。
+    #[cfg(test)]
+    pub(crate) fn test_hl_row_runs(&self, logical: usize) -> usize {
+        self.highlighter.test_row_runs(logical)
     }
 
     /// 测试：当前固定窗口首行绝对行号。
@@ -972,6 +1021,12 @@ impl CodeEditor {
     #[cfg(test)]
     pub(crate) fn test_scroll_to_bottom(&mut self) {
         self.scroll_to_px(self.list_max_offset());
+    }
+
+    /// 测试：滚到目标内容 px（夹到量程内）——远跳窗口（大缺口滚动）用。
+    #[cfg(test)]
+    pub(crate) fn test_scroll_to_px(&mut self, target_px: f32) {
+        self.scroll_to_px(target_px);
     }
 
     /// 字符总数。
@@ -1335,6 +1390,7 @@ impl CodeEditor {
         window: &mut Window,
         lo: usize,
         hi: usize,
+        vis_top: usize,
         show_caret: bool,
         focused: bool,
     ) -> Vec<RowData> {
@@ -1349,9 +1405,12 @@ impl CodeEditor {
         if hi < lo {
             return Vec::new();
         }
-        // 把窗口两端映射成逻辑行，供高亮整窗批量解析与行文本提取。
+        // 把窗口两端映射成逻辑行，供高亮整窗批量解析与行文本提取；`vis_top` 也映射成
+        // 逻辑行——延后「分片补色」从**可见区顶部**起（`lo_l` 含上方过扫，先给不可见
+        // 行上色没用）。
         let lo_l = self.folds.logical_row(lo);
         let hi_l = self.folds.logical_row(hi);
+        let vis_top_l = self.folds.logical_row(vis_top.min(last_v));
         // WY_TRACE breakdown：整窗行数据构建段（含语法/滤镜高亮解析 + 行内样式合并）。
         let _t_br = crate::prof::begin();
         // 整窗一次批量解析，快照成 owned（`.to_vec()` 结束内部的 `&mut self`
@@ -1359,19 +1418,22 @@ impl CodeEditor {
         // 返回切片约定：第 0 项 = `lo_l` 行（两级缓存均统一对齐到请求窗口）。
         // Markdown 文档走「所见即所得」滤镜（记号淡化 + 正文富样式）；其余语言走
         // syntect 语法高亮（`(Range, Hsla)` → 仅色 `HighlightStyle`）。
-        // `deferred`：延后着色帧（大缺口/上移出缓存，本帧空样式渲染、下一帧 settle
-        // 补色）——此帧**跳过缓存读写**，避免把占位空色冻结进缓存（否则颜色永久缺失）。
-        let mut deferred = false;
+        // `colored_range`：本帧**有真颜色**的逻辑行区间（`None` = 占位空样式帧）。
+        // 行缓存写入口径按它逐行判定：真色行走缓存 probe/write；占位空色行
+        // **不入缓存**（否则把空色冻结进缓存 → 颜色永久缺失）。
+        let colored_range: Option<(usize, usize)>;
         let hl_lines: Vec<Vec<(Range<usize>, HighlightStyle)>> = if self.md_mode {
+            colored_range = Some((lo_l, hi_l));
             self.md_decor
                 .scan_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
                 .to_vec()
         } else {
             // 把最近编辑的增量登记喂给高亮器（局部重解析 + 收敛早退），只取走一次。
             self.highlighter.set_dirty(self.hl_dirty.take());
-            // 大文档拖滚动条：窗口未覆盖且需有界重锚时，**本帧先用空样式渲染**
-            // （syntect 解析延后：帧廉价 → 滑块/内容紧跟鼠标）；滚动停住（相邻帧
-            // 窗口一致）由 `settle_pending` 补一次有界重锚，颜色随后落位。
+            // 大文档拖滚动条：窗口未覆盖且需有界重锚时，本帧走「分片补色」——从可见区
+            // 顶部起只解析 `HL_FILL_BUDGET_ROWS` 行真颜色（窗口其余行空样式），颜色
+            // 逐帧往下长；滚动停住（相邻帧窗口一致）由 `settle_pending` 补一次有界
+            // 重锚补齐整窗（含上方过扫）、清 pending。
             let prev_pending = self.highlighter.pending();
             let quick = self.highlighter.accept_deferred(lo_l, hi_l, HL_LOOKBACK_LINES);
             let settle = !quick
@@ -1380,6 +1442,9 @@ impl CodeEditor {
                 if settle {
                     self.highlighter.settle_pending(&self.buffer);
                 }
+                // 整窗已覆盖：清分片进度（本帧真颜色全窗，之后走缓存命中快路径）。
+                self.hl_fill = HlFill::default();
+                colored_range = Some((lo_l, hi_l));
                 self.highlighter
                     .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES)
                     .to_vec()
@@ -1399,12 +1464,16 @@ impl CodeEditor {
                     })
                     .collect::<Vec<_>>()
             } else {
-                // 延后：本窗空样式（文本/光标/选区仍正确，仅颜色下一帧补齐）。
-                // 预约下一帧：滚动停住（窗口不再变）让 `settle` 补一次有界重锚上色；
-                // 覆盖后不再预约，自动静止（无空转帧）。
-                deferred = true;
-                window.request_animation_frame();
-                std::iter::repeat_n(Vec::new(), hi_l - lo_l + 1).collect()
+                // 延后帧：从可见区顶部起逐帧往下补真颜色（其余行空样式占位），并预约
+                // 下一帧继续推进；补齐（缓存覆盖整个请求窗）后不再预约，自动静止
+                // （无空转帧）。
+                let (lines, range, done) =
+                    self.syntect_fill_deferred(lo_l, hi_l, vis_top_l);
+                colored_range = range;
+                if !done {
+                    window.request_animation_frame();
+                }
+                lines
             }
         };
         // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
@@ -1426,12 +1495,12 @@ impl CodeEditor {
                 && head >= self.buffer.line_start(logical)
                 && head <= self.buffer.line_end(logical);
             // 静态内容层（M5-B2-3 行级缓存）：命中缓存（键 + 本帧新鲜 runs 逐位比对）
-            // → `Rc` 浅复用；未命中 → 物化新进窗口的行并入缓存（`deferred` 帧除外：
-            // 占位空色不许入缓存）。内容只取决于 `(buffer.version(), 逻辑行)`，折叠/
-            // 选区/光标是下面动态层，不影响命中判定。
-            let content = if deferred {
-                Rc::new(RowContent::materialize(&self.buffer, logical, styles))
-            } else {
+            // → `Rc` 浅复用；未命中 → 物化新进窗口的行并入缓存。分片补色帧里只有
+            // 「本帧真颜色区间」内的行走缓存 probe/write；占位空色行**不入缓存**，
+            // 直接物化（否则把空色冻结进缓存 → 颜色永久缺失）。内容只取决于
+            // `(buffer.version(), 逻辑行)`，折叠/选区/光标是下面动态层，不影响命中。
+            let cacheable = colored_range.is_some_and(|(cf, ch)| logical >= cf && logical <= ch);
+            let content = if cacheable {
                 match self.row_cache.probe(version, logical, styles) {
                     Some(c) => c,
                     None => {
@@ -1440,6 +1509,8 @@ impl CodeEditor {
                         c
                     }
                 }
+            } else {
+                Rc::new(RowContent::materialize(&self.buffer, logical, styles))
             };
             out.push(RowData {
                 highlight_override: self.row_highlight_override(logical, &content),
@@ -1451,6 +1522,134 @@ impl CodeEditor {
         }
         crate::prof::end("ed.build_rows", _t_br);
         out
+    }
+
+    /// 延后帧「分片补色」：本帧只从可见区顶部 `vis_top_l` 起解析一截真颜色
+    /// （`highlight_window` 命中/`extend_down` 增量续解析，不整窗重锚），窗口其余行
+    /// 空样式。返回 `hl_lines`（对齐 `[lo_l, hi_l]`）+ 本帧真颜色的逻辑行区间
+    /// （供 `build_rows` 行缓存写入口径：真色行走缓存、占位空色不入缓存）+ 是否已
+    /// 整窗覆盖（`done=true` → 调用方不再预约下一帧，静止）。
+    ///
+    /// 相邻帧窗口一致且未编辑 → 游标继续下推（每次前缀变长 `HL_FILL_BUDGET_ROWS`）；
+    /// 窗口变了（仍在拖）/编辑器版本变了（编辑）→ 游标重锚回新窗口可见顶。下方
+    /// （`vis_top_l → hi_l`）补完后，剩余「上方过扫 `[lo_l, vis_top_l)`」由滚动停稳的
+    /// `settle_pending` 一次有界重锚补齐（本分支兜底：若 settle 未触发，也在下方补完后
+    /// 自己补一次整窗，保证缓存覆盖整个请求窗 → 下帧 `accept_deferred` 命中自动清
+    /// pending）。整窗覆盖后返回 `done=true`（无空转重绘，项目红线）。
+    fn syntect_fill_deferred(
+        &mut self,
+        lo_l: usize,
+        hi_l: usize,
+        vis_top_l: usize,
+    ) -> (
+        Vec<Vec<(Range<usize>, HighlightStyle)>>,
+        Option<(usize, usize)>,
+        bool,
+    ) {
+        let version = self.buffer.version();
+        // 窗口变了（仍在拖）/ 编辑器版本变了（编辑）→ 重锚回新窗口可见顶。
+        // （`cursor > hi_l` 不是重锚触发：那是「下方已补完」，下面沿用会话继续收尾。）
+        if self.hl_fill.window != (lo_l, hi_l) || self.hl_fill.version != version {
+            self.hl_fill = HlFill {
+                window: (lo_l, hi_l),
+                version,
+                vis_top_l,
+                cursor: vis_top_l,
+            };
+        }
+        let start = self.hl_fill.vis_top_l;
+        let mut hl_lines: Vec<Vec<(Range<usize>, HighlightStyle)>> =
+            Vec::with_capacity(hi_l - lo_l + 1);
+        hl_lines.resize(hi_l - lo_l + 1, Vec::new());
+        let mut colored: Option<(usize, usize)> = None;
+        if self.hl_fill.cursor <= hi_l {
+            // 本帧可达上限：游标向下推 `BUDGET` 行。
+            let fetch_hi = self
+                .hl_fill
+                .cursor
+                .saturating_add(HL_FILL_BUDGET_ROWS)
+                .saturating_sub(1)
+                .min(hi_l);
+            // 请求整段前缀 `[start, fetch_hi]`：前半段在上帧已入缓存（命中、零解析），
+            // 只新解析本帧多出的 `BUDGET` 行（`extend_down`，单帧成本可控）。
+            let slice = self
+                .highlighter
+                .highlight_window(&self.buffer, start, fetch_hi, HL_LOOKBACK_LINES)
+                .to_vec();
+            for (i, runs) in slice.into_iter().enumerate() {
+                let logical = start + i;
+                let len = hl_lines.len();
+                self.fill_place(&mut hl_lines, lo_l, len, logical, runs);
+            }
+            colored = Some((start, fetch_hi));
+            self.hl_fill.cursor = fetch_hi + 1;
+        }
+        // 下方（可见区顶 → 窗口底）已补完：把整段 `[start, hi_l]` 取回渲染（命中缓存）。
+        // 若缓存仍未盖到窗口顶（上方过扫 `[lo_l, start)` 未入缓存 / `base > lo_l`），先补
+        // 一次整窗有界重锚（O(窗口+回看)≈一屏，`settle_pending` 同款）。正常路径滚动停稳
+        // 时 settle 分支会先做这件事，此处是绕过 settle 的兜底。
+        if self.hl_fill.cursor > hi_l {
+            if self.highlighter.base() > lo_l {
+                self.highlighter
+                    .highlight_window(&self.buffer, lo_l, hi_l, HL_LOOKBACK_LINES);
+            }
+            self.hl_fill.cursor = hi_l + 1;
+            let slice = self
+                .highlighter
+                .highlight_window(&self.buffer, start, hi_l, HL_LOOKBACK_LINES)
+                .to_vec();
+            for (i, runs) in slice.into_iter().enumerate() {
+                let logical = start + i;
+                let len = hl_lines.len();
+                self.fill_place(&mut hl_lines, lo_l, len, logical, runs);
+            }
+            colored = Some((start, hi_l));
+        }
+        // 整窗覆盖 → `done`（调用方不再预约下一帧，静止）。
+        let done = self.hl_fill.cursor > hi_l && self.highlighter.base() <= lo_l;
+        (hl_lines, colored, done)
+    }
+
+    /// `syntect_fill_deferred` 的公共小段：把逻辑行 `logical` 的 runs 放进对齐 `[lo_l, ...)`
+    /// 的 `hl_lines` 槽位（越界忽略）。
+    fn fill_place(
+        &self,
+        hl_lines: &mut [Vec<(Range<usize>, HighlightStyle)>],
+        lo_l: usize,
+        len: usize,
+        logical: usize,
+        runs: Vec<(Range<usize>, Hsla)>,
+    ) {
+        if let Some(idx) = logical.checked_sub(lo_l)
+            && idx < len
+        {
+            hl_lines[idx] = runs
+                .into_iter()
+                .map(|(r, c)| {
+                    (
+                        r,
+                        HighlightStyle {
+                            color: Some(c),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+        }
+    }
+
+    /// 测试：直接走一帧「分片补色」（不经过渲染帧，无 RAF），返回
+    /// `(本帧真色起点, 本帧真色终点, 是否已整窗覆盖)`——供确定性回归锁定
+    /// 「首帧补顶部、同窗口前缀变长、窗口变重锚、补满即停」的分片状态机。
+    #[cfg(test)]
+    pub(crate) fn test_fill_step(
+        &mut self,
+        lo_l: usize,
+        hi_l: usize,
+        vis_top_l: usize,
+    ) -> ((usize, usize), bool) {
+        let (_, range, done) = self.syntect_fill_deferred(lo_l, hi_l, vis_top_l);
+        (range.unwrap_or((0, 0)), done)
     }
 
     // -----------------------------------------------------------------

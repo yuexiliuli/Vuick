@@ -55,7 +55,7 @@ impl Render for CodeEditor {
         let last_v = self.folds.visual_line_count().saturating_sub(1);
         let hi = vis_top.saturating_add(nrows * 2).min(last_v);
         let show_caret = self.caret_shown_now();
-        let rows = self.build_rows(window, lo, hi, show_caret, self.focused);
+        let rows = self.build_rows(window, lo, hi, vis_top, show_caret, self.focused);
 
         let (content_w_px, harea_w) = self.compute_content_width(avail_w);
 
