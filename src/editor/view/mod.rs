@@ -141,6 +141,10 @@ struct RowData {
     /// 不入缓存。`None` 非折叠首行。独立元素渲染（不进 `StyledText`/shape_text），
     /// 不污染行内测量。
     folded: Option<f32>,
+    /// 本行是否为「光标所在行」（持焦且 selection head 落本行范围内）。按帧现算、
+    /// 不入缓存，与 `caret`/`folded` 同级——但不受光标闪烁影响（head 位置稳定即
+    /// 恒高亮）。折叠优先于本高亮（见 `row_element` 的互斥 `when`）。
+    active: bool,
 }
 
 impl RowData {
@@ -164,6 +168,7 @@ impl RowData {
             highlight_override: None,
             caret: None,
             folded: None,
+            active: false,
         }
     }
 }
@@ -255,6 +260,9 @@ struct RowView {
     fold_color: Hsla,
     /// 已折叠行整行底色（比选区淡，见 `refresh_metrics`）。
     fold_bg: Hsla,
+    /// 光标所在行（持焦且 head 落行内）整行高亮底（=`colors.editor_active_line_bg`，
+    /// 与折叠行同色，见 `refresh_metrics`）。
+    active_line_bg: Hsla,
 }
 
 /// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
@@ -327,8 +335,11 @@ pub struct CodeEditor {
     fg: Hsla,
     gutter_fg: Hsla,
     sel_bg: Hsla,
-    /// 已折叠行的整行底色（`colors.accent` 派生、比选区淡，见 `refresh_metrics`）。
+    /// 已折叠行的整行底色（`colors.editor_fold_bg`、比选区淡，见 `refresh_metrics`）。
     fold_bg: Hsla,
+    /// 光标所在行（持焦且 selection head 落行内）的整行高亮底色
+    /// （`colors.editor_active_line_bg`，与折叠行同色，见 `refresh_metrics`）。
+    active_line_bg: Hsla,
     caret_color: Hsla,
 
     // —— IME ——
@@ -464,6 +475,7 @@ impl CodeEditor {
             gutter_fg: rgb(0x9aa0a6).into(),
             sel_bg: rgb(0xd0d7de).into(),
             fold_bg: rgb(0xd0d7de).into(),
+            active_line_bg: rgb(0xd0d7de).into(),
             caret_color: rgb(0x000000).into(),
             marked_range: None,
             last_edit: None,
@@ -848,7 +860,7 @@ impl CodeEditor {
             return Vec::new();
         }
         self.test_warm_highlight(logical_row, logical_row);
-        self.build_rows(window, logical_row, logical_row, false)
+        self.build_rows(window, logical_row, logical_row, false, false)
             .into_iter()
             .next()
             .map(|rd| rd.content.highlights.clone())
@@ -866,7 +878,7 @@ impl CodeEditor {
         hi: usize,
     ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
         self.test_warm_highlight(lo, hi);
-        self.build_rows(window, lo, hi, false)
+        self.build_rows(window, lo, hi, false, false)
             .into_iter()
             .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
             .collect()
@@ -885,7 +897,7 @@ impl CodeEditor {
         lo: usize,
         hi: usize,
     ) -> Vec<(String, Vec<(Range<usize>, HighlightStyle)>)> {
-        self.build_rows(window, lo, hi, false)
+        self.build_rows(window, lo, hi, false, false)
             .into_iter()
             .map(|rd| (rd.content.text.to_string(), rd.highlights().to_vec()))
             .collect()
@@ -1111,12 +1123,15 @@ impl CodeEditor {
         // 光标不能用 colors.accent：Light 主题 accent = #005fb8 蓝，白底上对比足够，
         // 但沿用既有口径用前景墨色，明/暗主题下都一定可见。
         self.caret_color = colors.fg.into();
-        // 选区底色用主题强调蓝（与括号点亮、标题/菜单高亮同源单点出口，改调色板只动 theme）。
-        self.sel_bg = colors.accent.opacity(if dark { 0.4 } else { 0.28 }).into();
-        // 已折叠行的整行底色：与选区同源 accent，但 alpha 明显更淡（dark≈0.16 /
-        // light≈0.10，约为选区 0.4/0.28 的一半不到）——一眼认出折叠位置、又绝不
-        // 喧宾夺主，明/暗两主题下都肉眼可辨（锁「比选区淡」的回归见 tests/view.rs）。
-        self.fold_bg = colors.accent.opacity(if dark { 0.16 } else { 0.10 }).into();
+        // 选区底色 = 主题 `editor_selection_bg`（精确不透明值，不再 accent×alpha 叠
+        // 内容底派生——改调色板只动 theme，明/暗两主题各自可预测）。
+        self.sel_bg = colors.editor_selection_bg.into();
+        // 已折叠行的整行底色 = 主题 `editor_fold_bg`（比选区更淡、更贴内容底。
+        // 锁「比选区弱」的回归见 tests/view.rs）。
+        self.fold_bg = colors.editor_fold_bg.into();
+        // 光标所在行（持焦且 head 落行内）的整行高亮底色 = 主题 `editor_active_line_bg`
+        // （与折叠行同色；稳定持焦高亮，不受光标闪烁影响）。
+        self.active_line_bg = colors.editor_active_line_bg.into();
         self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
@@ -1321,6 +1336,7 @@ impl CodeEditor {
         lo: usize,
         hi: usize,
         show_caret: bool,
+        focused: bool,
     ) -> Vec<RowData> {
         if self.row_count == 0 {
             return Vec::new();
@@ -1393,10 +1409,22 @@ impl CodeEditor {
         };
         // 输出按**视觉行**对齐（第 0 项 = 视觉 `lo` 行）：每个视觉行映射一个逻辑行。
         let version = self.buffer.version();
+        // 光标所在行判定（selection head 落行内即高亮）：与 `row_caret` 的头部窗口
+        // 判定同源口径，但取 head 一次性快照、不受光标闪烁影响（稳定持焦高亮）。
+        // **选区坍缩守卫**：存在非坍缩选区（文字被选中）时不高亮整行——只高亮选中
+        // 的字符本身（`is_collapsed` 与 `row_highlight_override` 同款判法），避免
+        // 鼠标选中某行字符时整行再叠一层底色喧宾夺主。纯点击/光标（选区坍缩）时才
+        // 显示光标行整行高亮。
+        let head = self.selection.head();
+        let head_selection_collapsed = self.selection.is_collapsed();
         let mut out: Vec<RowData> = Vec::with_capacity(hi - lo + 1);
         for v in lo..=hi {
             let logical = self.folds.logical_row(v);
             let styles: &[(Range<usize>, HighlightStyle)] = &hl_lines[logical - lo_l];
+            let active = focused
+                && head_selection_collapsed
+                && head >= self.buffer.line_start(logical)
+                && head <= self.buffer.line_end(logical);
             // 静态内容层（M5-B2-3 行级缓存）：命中缓存（键 + 本帧新鲜 runs 逐位比对）
             // → `Rc` 浅复用；未命中 → 物化新进窗口的行并入缓存（`deferred` 帧除外：
             // 占位空色不许入缓存）。内容只取决于 `(buffer.version(), 逻辑行)`，折叠/
@@ -1417,6 +1445,7 @@ impl CodeEditor {
                 highlight_override: self.row_highlight_override(logical, &content),
                 caret: self.row_caret(window, logical, show_caret),
                 folded: self.row_folded(window, logical),
+                active,
                 content,
             });
         }
@@ -1832,10 +1861,10 @@ impl CodeEditor {
         self.fold_arrow_state(line)
     }
 
-    /// 测试用：选区底色与折叠行底色快照 `(sel_bg, fold_bg)`（`refresh_metrics` 里
-    /// 同一 `colors.accent` 导出的两档 alpha，锁「折叠比选区淡」的回归）。
-    pub(crate) fn test_sel_and_fold_bg(&self) -> (Hsla, Hsla) {
-        (self.sel_bg, self.fold_bg)
+    /// 测试用：编辑器行底色快照 `(sel_bg, fold_bg, active_line_bg)`（`refresh_metrics`
+    /// 里直读的三个 `colors.editor_*` token，锁「折叠/光标行比选区更贴背景」的回归）。
+    pub(crate) fn test_sel_and_fold_bg(&self) -> (Hsla, Hsla, Hsla) {
+        (self.sel_bg, self.fold_bg, self.active_line_bg)
     }
 
     /// 测试用：光标行折叠切换（gutter 点击同路径）。

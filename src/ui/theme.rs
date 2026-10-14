@@ -128,6 +128,19 @@ pub struct ColorScheme {
     /// Mermaid 边线/边框主色（≈ divider 同 hue 提一档：中性灰、比 divider 更可辨；
     /// 亮/暗随本 token 自动分流，paint 侧再按 a≈0.85 弱化）。
     pub mermaid_border: Rgba,
+    /// 编辑器选区底色 = **半透明补偿色**：叠到编辑区底上复合成目标取色值（暗
+    /// `rgba(0x3ab5e973)`≈#245C74 / 亮 `rgba(0x619bd373)`≈#B8D2EB）。用半透明而非
+    /// 不透明，保证**括号竖线穿过选区仍能透出**（竖线叠层在文字/选区层之下）；非竖线
+    /// 像素复合后与不透明目标色一致。消费方（`CodeEditor::refresh_metrics`）直读本
+    /// token，零裸色四处散落。
+    pub editor_selection_bg: Rgba,
+    /// 编辑器已折叠行的整行底色（暗 #172931 冷灰蓝 / 亮 #E6EFF8），比选区更淡、
+    /// 更贴内容底，一眼认出折叠位置、又不喧宾夺主。
+    pub editor_fold_bg: Rgba,
+    /// 编辑器光标所在行（selection head 所在行、且持焦且选区坍缩）的整行高亮底
+    /// （暗 #242525 中性灰 / 亮 #E6EFF8）；暗色与折叠行（#172931）区分开。稳定持焦
+    /// 高亮，不受光标闪烁影响；存在非坍缩选区时不高亮整行（只高亮选中字符本身）。
+    pub editor_active_line_bg: Rgba,
 }
 
 impl ColorScheme {
@@ -170,6 +183,9 @@ impl ColorScheme {
                 hsla(187.0 / 360., 0.55, 0.36, 1.0).into(),
             ],
             mermaid_border: rgb(0x909090),
+            editor_selection_bg: rgba(0x619bd373),
+            editor_fold_bg: rgb(0xe6eff8),
+            editor_active_line_bg: rgb(0xe6eff8),
         }
     }
 
@@ -214,6 +230,9 @@ impl ColorScheme {
                 hsla(187.0 / 360., 0.47, 0.55, 1.0).into(),
             ],
             mermaid_border: rgb(0xa8a8a8),
+            editor_selection_bg: rgba(0x3ab5e973),
+            editor_fold_bg: rgb(0x172931),
+            editor_active_line_bg: rgb(0x242525),
         }
     }
 }
@@ -551,6 +570,37 @@ mod tests {
             }
         }
         assert_ne!(light.mermaid_border, dark.mermaid_border, "边线色随明暗分流");
+    }
+
+    #[gpui::test]
+    fn editor_row_bg_tokens_pinned_both_themes(_cx: &mut TestAppContext) {
+        // 编辑器行底色三 token 逐字节钉死：选区为**半透明补偿色**（叠编辑区底合成目标
+        // 取色值：暗 rgba(0x3ab5e973)≈#245C74 / 亮 rgba(0x619bd373)≈#B8D2EB，保证括号
+        // 竖线穿选区透出），折叠/光标行保持不透明（暗 #172931/#242525、亮 #E6EFF8×2）。
+        let light = Theme::light().colors;
+        let dark = Theme::dark().colors;
+        assert_eq!(dark.editor_selection_bg, rgba(0x3ab5e973), "暗选区底（半透明补偿色）");
+        assert_eq!(dark.editor_fold_bg, rgb(0x172931), "暗折叠行底色");
+        assert_eq!(dark.editor_active_line_bg, rgb(0x242525), "暗光标行底色（已与折叠行区分）");
+        assert_eq!(light.editor_selection_bg, rgba(0x619bd373), "亮选区底（半透明补偿色）");
+        assert_eq!(light.editor_fold_bg, rgb(0xe6eff8), "亮折叠行底色");
+        assert_eq!(light.editor_active_line_bg, rgb(0xe6eff8), "亮光标行底色 = 折叠行同色");
+        // 选区半透明（竖线透出契约）；折叠/光标行不透明不动。
+        assert!(dark.editor_selection_bg.a < 1.0, "暗选区底应半透明（a<1）");
+        assert!(light.editor_selection_bg.a < 1.0, "亮选区底应半透明（a<1）");
+        assert_eq!(dark.editor_fold_bg.a, 1.0, "暗折叠底应不透明");
+        assert_eq!(dark.editor_active_line_bg.a, 1.0, "暗光标行底应不透明");
+        // 语义不变式：亮色光标行底色恒等于折叠行底色；暗色三档两两互不相同（折叠冷灰蓝
+        // #172931 / 光标行中性灰 #242525 / 选区半透明蓝系另档）。两主题都「折叠/光标
+        // 行比选区更贴背景」。
+        assert_ne!(dark.editor_selection_bg, dark.editor_fold_bg, "暗：选区 ≠ 折叠");
+        assert_ne!(dark.editor_selection_bg, dark.editor_active_line_bg, "暗：选区 ≠ 光标行");
+        assert_ne!(dark.editor_fold_bg, dark.editor_active_line_bg, "暗：折叠 ≠ 光标行（两色已区分）");
+        assert_eq!(light.editor_active_line_bg, light.editor_fold_bg, "亮：光标行=折叠行");
+        // 同同档值随明暗分离（暗深 / 亮浅）。
+        assert_ne!(dark.editor_selection_bg, light.editor_selection_bg, "选区底色随明暗");
+        assert_ne!(dark.editor_fold_bg, light.editor_fold_bg, "折叠底色随明暗");
+        assert_ne!(dark.editor_active_line_bg, light.editor_active_line_bg, "光标行底色随明暗");
     }
 
     #[gpui::test]

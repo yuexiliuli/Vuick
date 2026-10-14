@@ -55,7 +55,7 @@ impl Render for CodeEditor {
         let last_v = self.folds.visual_line_count().saturating_sub(1);
         let hi = vis_top.saturating_add(nrows * 2).min(last_v);
         let show_caret = self.caret_shown_now();
-        let rows = self.build_rows(window, lo, hi, show_caret);
+        let rows = self.build_rows(window, lo, hi, show_caret, self.focused);
 
         let (content_w_px, harea_w) = self.compute_content_width(avail_w);
 
@@ -68,11 +68,15 @@ impl Render for CodeEditor {
             caret_color: self.caret_color,
             fold_color: self.gutter_fg,
             fold_bg: self.fold_bg,
+            active_line_bg: self.active_line_bg,
         };
         let rv = std::rc::Rc::new(rv);
         let list_state = self.list_state.clone();
         let bg = self.bg;
         let fg = self.fg;
+
+        // 折叠/光标行整行底色叠层：标尺之上、括号竖线之下（层级见 `row_bg_overlay`）。
+        let row_bg = self.row_bg_overlay(&rv, vis_top, vis_off, lh, view_h);
 
         // 文本区（List 文本 + 横向滚动容器）、行号列、标尺/括号竖线叠层 → 各自 &self 助手
         // （`vscrollbar_overlay` 之后仍需 `list_state`，故此处给 text_area_layer 传克隆）。
@@ -107,7 +111,10 @@ impl Render for CodeEditor {
         let core = core
             // 垂直标尺叠层：第一个子元素 → 位于文本/选区/滚动条之下（经典后台参考线）。
             .child(ruler)
-            // 括号标尺竖线叠层：也在文本之下（与标尺同级序），盖在背景上、不挡文本。
+            // 折叠/光标行整行底色叠层：标尺之上、括号竖线之下（拆出行元素，见
+            // `row_bg_overlay`；竖线在折叠/光标行上清晰可见且保持原色）。
+            .child(row_bg)
+            // 括号标尺竖线叠层：盖在行底色叠层之上、文字/选区之下（不挡文本）。
             .child(guides)
             .child(harea)
             // 行号列叠层（同一绝对滚动顶）：盖在横向滚动文本区左缘，不随内容横移，
@@ -413,6 +420,71 @@ impl CodeEditor {
             .collect()
     }
 
+    /// 折叠行/光标行整行底色**独立背景叠层**：从行元素拆出（`row_element` 不再上
+    /// 不透明底色），按可见行绝对定位铺底色（复刻 `gutter_overlay`/`gutter_items_for`
+    /// 的列式叠层，不建第二棵 ListState）。层级 = 标尺 < 本叠层 < 括号竖线 < 文字/
+    /// 选区 < 行号 → 跨行括号竖线在任何折叠行/光标行上都清晰可见且保持原色，文字仍
+    /// 画在竖线之上（不挡文本）。
+    ///
+    /// 行单位与 gutter 同口径（第 idx 个孩子高 = idx×lh、列顶 −vis_off、越窗/文档
+    /// 末尾取透明占位），与 List 把首个可见 item 画在 `origin − offset_in_item` 完全
+    /// 一致。底色随「可视带」锚定（`left=gutter_width`/`right=0`，横向滚动不移），
+    /// 与括号竖线同口径——横向滚动时底色保持视口锚定，是刻意行为而非 bug。
+    fn row_bg_overlay(
+        &self,
+        rv: &std::rc::Rc<RowView>,
+        vis_top: usize,
+        vis_off: f32,
+        lh: f32,
+        view_h: f32,
+    ) -> gpui::Stateful<gpui::Div> {
+        let last_v = self.folds.visual_line_count().saturating_sub(1);
+        let count = ((view_h / lh).ceil() as usize).clamp(1, 4096) + 1;
+        let fold_bg = rv.fold_bg;
+        let active_line_bg = rv.active_line_bg;
+        let rv = rv.clone();
+        let row_bg_col = div()
+            .absolute()
+            .left(px(0.))
+            .top(px(-vis_off))
+            .w_full()
+            .children((vis_top..vis_top + count).map(move |vix| {
+                // 越窗/越过文档末尾（底部预留区）取空行兜底（透明占位，保列内行序对齐）。
+                let rd = if vix <= last_v && vix >= rv.lo && vix - rv.lo < rv.rows.len() {
+                    &rv.rows[vix - rv.lo]
+                } else {
+                    &RowData::empty()
+                };
+                if rd.folded.is_some() {
+                    div()
+                        .debug_selector(|| "ce-fold-row-bg".into())
+                        .h(px(lh))
+                        .w_full()
+                        .bg(fold_bg)
+                        .into_any_element()
+                } else if rd.active {
+                    div()
+                        .debug_selector(|| "ce-active-line-bg".into())
+                        .h(px(lh))
+                        .w_full()
+                        .bg(active_line_bg)
+                        .into_any_element()
+                } else {
+                    div().h(px(lh)).into_any_element()
+                }
+            }));
+        div()
+            .id("ce-row-bg-layer")
+            .debug_selector(|| "ce-row-bg-layer".into())
+            .absolute()
+            .top(px(0.))
+            .bottom(px(0.))
+            .left(self.gutter_width_px)
+            .right(px(0.))
+            .overflow_hidden()
+            .child(row_bg_col)
+    }
+
     /// 竖直滚动条叠层（Always 常显）：量程 = 全文条目数 × 行高（含底部预留），
     /// 与编辑器 `scroll_to_px` 共享同一份「全文量程」。
     fn vscrollbar_overlay(
@@ -604,6 +676,9 @@ fn attach_input_actions(
 
 /// 行元素：文本 + 光标。行号 gutter 已是编辑区左侧固定叠层（见 render `gutter`），
 /// 不放进本行，否则会跟随横向滚动容器一起被推走；文本从行左缘（叠层右缘）开始。
+/// 折叠行/光标行的整行底色**不在本行**——已拆到独立背景叠层
+/// `CodeEditor::row_bg_overlay`（层级 = 标尺 < 行底色 < 括号竖线 < 文字/选区 < 行号，
+/// 否则不透明整行底色会把跨行括号竖线盖住，见 `bracket_guides_stay_visible_...`）。
 fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
     div()
         .h(rv.line_height)
@@ -613,13 +688,6 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
         // 永远只增不减、正常情况下不会），也绝不把溢出文本画到下一行去（否则行号
         // 错位、点击/光标重叠）。
         .overflow_hidden()
-        // 已折叠行的整行底色：直接上到行盒（文本/光标/「…」是子元素、画在其上），
-        // `w_full` 铺满该行内容宽；横向滚动溢出的部分由 harea/本行 overflow_hidden
-        // 裁掉，符合「一眼认出折叠位置」的直觉。
-        .when(rd.folded.is_some(), |this| {
-            this.debug_selector(|| "ce-fold-row-bg".into())
-                .bg(rv.fold_bg)
-        })
         .child(
             div()
                 .absolute()

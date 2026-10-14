@@ -778,38 +778,401 @@ fn folded_row_highlight_bg_tracks_fold_state(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn fold_row_bg_fainter_than_selection_bg_both_themes(cx: &mut TestAppContext) {
-    // 折叠底色与选区底色同源 `colors.accent` 导出；锁「折叠比选区淡」且两主题
-    // 各自落到约定档位（dark 0.16<0.40 / light 0.10<0.28，约选区一半不到）。
+    // 选区底 = **半透明补偿色**（rgba 钉死 + 叠编辑区底复合验证 = 目标取色值）；
+    // 折叠/光标行底 = 不透明 token（暗 #172931/#242525、亮 #E6EFF8×2）。
+    // 「折叠/光标行比选区更贴背景」的亮度/luminance 语义按**选区复合目标色**比较
+    // （半透明 fill 自身的 luminance 不代表实际观感——像素观感是 alpha×fill 叠底）。
     let (host, cx) = open(cx, "a\nb");
-    let read_alpha = |host: &Entity<Host>, cx: &mut VisualTestContext| -> (f32, f32) {
-        cx.update(|_, cx| {
-            let (sel, fold) = host.read(cx).ed.read(cx).test_sel_and_fold_bg();
-            (sel.a, fold.a)
-        })
+    let read_bg = |host: &Entity<Host>, cx: &mut VisualTestContext| -> (gpui::Hsla, gpui::Hsla, gpui::Hsla) {
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_sel_and_fold_bg())
     };
-    // 未初始化主题默认 Light。
-    let (l_sel, l_fold) = read_alpha(&host, cx);
-    assert!(
-        l_fold < l_sel,
-        "亮底：折叠应比选区淡（{l_fold} < {l_sel}）"
+    // WCAG 相对 luminance（线性化 sRGB 三通道加权）。
+    let luminance = |c: &gpui::Hsla| -> f32 {
+        let c: gpui::Rgba = (*c).into();
+        let lin = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+    };
+    // 同一 WCAG 公式，输入为 (r,g,b) 三元组（合成后颜色用）。
+    let luminance_rgb = |(r, g, b): (f32, f32, f32)| -> f32 {
+        let lin = |v: f32| {
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    };
+    // alpha×fill + (1-alpha)×bg 的 RGB 合成（0..1 线性）。
+    let composite_rgb = |c: &gpui::Hsla, bg: &gpui::Hsla| -> (f32, f32, f32) {
+        let c: gpui::Rgba = (*c).into();
+        let bg: gpui::Rgba = (*bg).into();
+        let a = c.a;
+        (
+            a * c.r + (1.0 - a) * bg.r,
+            a * c.g + (1.0 - a) * bg.g,
+            a * c.b + (1.0 - a) * bg.b,
+        )
+    };
+    let near = |v: f32, t: f32| (v - t).abs() < 0.01;
+    // 折叠/光标行 vs 选区**复合目标**：dev(行底) < dev(选区目标，相对内容底)。
+    let assert_fainter_than_sel =
+        |sel: &gpui::Hsla, c: &gpui::Hsla, bg: &gpui::Hsla, mode: &str| {
+            let sel_dev = (luminance_rgb(composite_rgb(sel, bg)) - luminance(bg)).abs();
+            let c_dev = (luminance(c) - luminance(bg)).abs();
+            assert!(
+                c_dev < sel_dev,
+                "{mode}：该底应比选区复合目标更贴背景（dev {c_dev} < {sel_dev}）"
+            );
+        };
+    // 未初始化主题默认 Light：精确色值 + 半透明 + 复合目标验证。
+    let (l_sel, l_fold, l_active) = read_bg(&host, cx);
+    assert_eq!(l_sel, gpui::rgba(0x619bd373).into(), "亮：选区底 = rgba(0x619BD373)");
+    assert!(l_sel.a < 1.0, "亮：选区底应半透明（竖线穿选区透出）");
+    assert_eq!(l_fold, gpui::rgb(0xe6eff8).into(), "亮：折叠底 = #E6EFF8");
+    assert_eq!(
+        l_active, l_fold,
+        "亮：光标行底 = 折叠行底（#E6EFF8 同色）"
     );
+    // 亮：rgba(0x619BD373) 叠 #FFFFFF 应复合出目标 #B8D2EB=(184,210,235)。
+    let (lr, lg, lb) = composite_rgb(&l_sel, &gpui::rgb(0xffffff).into());
     assert!(
-        (l_sel - 0.28).abs() < 1e-4 && (l_fold - 0.10).abs() < 1e-4,
-        "亮底档位：选区 0.28 / 折叠 0.10（实测 {l_sel}/{l_fold}）"
+        near(lr, 184.0 / 255.0) && near(lg, 210.0 / 255.0) && near(lb, 235.0 / 255.0),
+        "亮：半透明选区复合应=#B8D2EB（{lr}/{lg}/{lb}）"
     );
-    // 切暗 → 重渲染后读回。
+    assert_fainter_than_sel(&l_sel, &l_fold, &gpui::rgb(0xffffff).into(), "亮底折叠");
+    // 切暗 → 重渲染后读回：精确色值 + 半透明 + 复合目标验证（暗色光标行 ≠ 折叠行）。
     cx.update(|_, cx| {
         crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx)
     });
     settle(cx);
-    let (d_sel, d_fold) = read_alpha(&host, cx);
+    let (d_sel, d_fold, d_active) = read_bg(&host, cx);
+    assert_eq!(d_sel, gpui::rgba(0x3ab5e973).into(), "暗：选区底 = rgba(0x3AB5E973)");
+    assert!(d_sel.a < 1.0, "暗：选区底应半透明（竖线穿选区透出）");
+    assert_eq!(d_fold, gpui::rgb(0x172931).into(), "暗：折叠底 = #172931");
+    assert_eq!(d_active, gpui::rgb(0x242525).into(), "暗：光标行底 = #242525");
+    assert_ne!(d_active, d_fold, "暗：光标行 ≠ 折叠行（两色已区分）");
+    // 暗：rgba(0x3AB5E973) 叠 #121314 应复合出目标 #245C74=(36,92,116)。
+    let (dr, dg, db) = composite_rgb(&d_sel, &gpui::rgb(0x121314).into());
     assert!(
-        d_fold < d_sel,
-        "暗底：折叠应比选区淡（{d_fold} < {d_sel}）"
+        near(dr, 36.0 / 255.0) && near(dg, 92.0 / 255.0) && near(db, 116.0 / 255.0),
+        "暗：半透明选区复合应=#245C74（{dr}/{dg}/{db}）"
+    );
+    assert_fainter_than_sel(&d_sel, &d_fold, &gpui::rgb(0x121314).into(), "暗底折叠");
+    assert_fainter_than_sel(&d_sel, &d_active, &gpui::rgb(0x121314).into(), "暗底光标行");
+}
+
+#[gpui::test]
+fn active_line_bg_highlights_cursor_row_when_focused(cx: &mut TestAppContext) {
+    // 新增「光标所在行整行高亮」：编辑器持焦且 head 落行内 → 该行铺 `ce-active-line-bg`。
+    // 未聚焦不渲染；聚焦后默认光标（head=0）在首行 → 首行渲染且高=行高；光标移到另一行
+    // → 高亮转移到新行（y 随行移动）。active 按帧现算、不受光标闪烁影响。
+    let (host, cx) = open(cx, "aaa\nbbb\nccc\nddd\neee");
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_none(),
+        "未聚焦时不应渲染光标行高亮"
+    );
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    // 聚焦 → 默认光标在首行 → 首行出现高亮，铺满整行（高=行高）。
+    focus(&host, cx);
+    let bg = cx
+        .debug_bounds("ce-active-line-bg")
+        .expect("持焦时光标行应渲染整行高亮");
+    assert!(
+        (bg.size.height.as_f32() - lh).abs() < 1.0,
+        "高亮应铺满整行（高 {} vs 行高 {lh}）",
+        bg.size.height.as_f32()
     );
     assert!(
-        (d_sel - 0.40).abs() < 1e-4 && (d_fold - 0.16).abs() < 1e-4,
-        "暗底档位：选区 0.40 / 折叠 0.16（实测 {d_sel}/{d_fold}）"
+        (bg.origin.y.as_f32() - 0.0).abs() < 1.0,
+        "默认光标在首行：高亮 y 应=首行顶（{}）",
+        bg.origin.y.as_f32()
+    );
+    // 光标移到第 3 行（行索引 2，0 基）→ 高亮转移到该行（y ≈ 2×行高），首行不再高亮。
+    let off2 = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(2, 0));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off2..off2, cx));
+    });
+    settle(cx);
+    let bg2 = cx
+        .debug_bounds("ce-active-line-bg")
+        .expect("光标移到第 3 行后该行应高亮");
+    assert!(
+        (bg2.origin.y.as_f32() - 2.0 * lh).abs() < 1.0,
+        "高亮应转移到新光标行（y {} vs 期望 {}）",
+        bg2.origin.y.as_f32(),
+        2.0 * lh
+    );
+}
+
+#[gpui::test]
+fn active_line_bg_requires_focus(cx: &mut TestAppContext) {
+    // 光标行整行高亮**强依赖持焦**：未持焦时移动光标（notify + settle 重建行元素）
+    // 不产生任何高亮；持焦瞬间该高亮才出现在光标所在行。这从状态层锁死「失焦 →
+    // 背景不出现/消失」语义（`active = focused && head 落行内`，见 `build_rows`；
+    // 真正的 `on_blur` 事件派发在 gpui 测试环境不触发，故用「未持焦 + 移动光标」
+    // 直接断言 `focused=false` 分支——光标行判定与焦点态解耦，二者都各自可测）。
+    let text = "aaa\nbbb\nccc";
+    let (host, cx) = open(cx, text);
+    // 未持焦：把光标移到第 2 行并重建 → 仍无高亮（focused=false 直接短路）。
+    let off1 = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(1, 0));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off1..off1, cx));
+    });
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_none(),
+        "未持焦时光标所在行不得渲染高亮"
+    );
+    // 聚焦 → 光标（head）所在第 2 行立即出现高亮，且高度=行高、y 落在该行。
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    focus(&host, cx);
+    let bg = cx
+        .debug_bounds("ce-active-line-bg")
+        .expect("持焦后光标所在行应渲染整行高亮");
+    assert!(
+        (bg.size.height.as_f32() - lh).abs() < 1.0,
+        "高亮应铺满整行（高 {} vs 行高 {lh}）",
+        bg.size.height.as_f32()
+    );
+    assert!(
+        (bg.origin.y.as_f32() - lh).abs() < 1.0,
+        "高亮应在光标所在第 2 行（y {} vs 期望 {lh}）",
+        bg.origin.y.as_f32()
+    );
+}
+
+#[gpui::test]
+fn active_line_bg_yields_to_folded_row_bg(cx: &mut TestAppContext) {
+    // 光标所在行恰为已折叠首行：`ce-fold-row-bg` 优先、`ce-active-line-bg` 不渲染
+    // （折叠优先、互斥，见 `row_element` 的 `rd.folded.is_none()` 门槛）。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    // 默认光标在首行（未折叠行）→ active 高亮正常出现（基线正常态）。
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_some(),
+        "聚焦后未折叠行应先渲染光标行高亮"
+    );
+    // 光标移到 if 块首行（逻辑行 1）并折叠它 → 该行显示折叠底、不显示 active 底（互斥）。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(ed.offset_for_line_col(1, 0)..ed.offset_for_line_col(1, 0), cx));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-fold-row-bg").is_some(),
+        "已折叠首行应渲染折叠整行底"
+    );
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_none(),
+        "光标落在已折叠首行时不应渲染 active 高亮（折叠底优先）"
+    );
+}
+
+#[gpui::test]
+fn active_line_bg_suppressed_while_text_selection(cx: &mut TestAppContext) {
+    // 核心修复：存在**非坍缩选区**（文字被选中）时光标行整行高亮必须消失，只高亮
+    // 选中的字符本身（`build_rows` 的 `active` 加 `selection.is_collapsed()` 守卫）；
+    // 选区坍缩回单点光标 → 光标行整行高亮出现。用 `set_selection_range`（同文件
+    // 既有手法）先后设非坍缩选区（跨 3 字符）与坍缩光标。
+    let text = "aaaa\nbbbb\ncccc";
+    let (host, cx) = open(cx, text);
+    focus(&host, cx);
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    // 基线：坍缩光标（head=0 首行）→ 光标行整行高亮出现。
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_some(),
+        "基线：坍缩光标时光标行应整行高亮"
+    );
+    // 非坍缩选区：选中首行 0..3 字符（anchor=0 / head=3）→ 整行高亮消失。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(0..3, cx));
+    });
+    settle(cx);
+    assert!(
+        cx.debug_bounds("ce-active-line-bg").is_none(),
+        "选中文字（非坍缩选区）时不应再渲染光标行整行高亮"
+    );
+    // 选区坍缩回单点光标（head=2，仍在首行）→ 光标行整行高亮重新出现。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(2..2, cx));
+    });
+    settle(cx);
+    let bg = cx
+        .debug_bounds("ce-active-line-bg")
+        .expect("选区坍缩回光标后该行应重新整行高亮");
+    assert!(
+        (bg.size.height.as_f32() - lh).abs() < 1.0,
+        "高亮应铺满整行（高 {} vs 行高 {lh}）",
+        bg.size.height.as_f32()
+    );
+}
+
+#[gpui::test]
+fn selection_bg_semi_transparent_keeps_bracket_guides_visible(cx: &mut TestAppContext) {
+    // 选区底 = **半透明补偿色**：存在非坍缩选区（文字被选中）时，选区像素叠编辑区
+    // 底仍复合出目标取色值，但 alpha<1 → 括号竖线（叠层在文字/选区层之下）能透出，
+    // 不再被不透明纯色盖死。z 序无法在 harness 断言，以 `sel_bg.a < 1.0` 为契约 +
+    // 同帧 `ce-bracket-guide` 存在性佐证。两主题各验一遍。
+    let text = "fn a() {\n    x();\n}";
+    let (host, cx) = open(cx, text);
+    assert!(
+        cx.debug_bounds("ce-bracket-guides").is_some(),
+        "前置：括号竖线叠层应渲染"
+    );
+    let read_sel_alpha = |host: &Entity<Host>, cx: &mut VisualTestContext| -> f32 {
+        cx.update(|_, cx| host.read(cx).ed.read(cx).test_sel_and_fold_bg().0.a)
+    };
+    let set_noncollapsed = |host: &Entity<Host>, cx: &mut VisualTestContext| {
+        // 非坍缩选区：选中首行 0..3 字符（选中文字，不等于光标单点）。
+        cx.update(|_, cx| {
+            let ed = host.read(cx).ed.clone();
+            ed.update(cx, |ed, cx| ed.set_selection_range(0..3, cx));
+        });
+        settle(cx);
+    };
+    // 亮：半透明 + 竖线同帧仍在。
+    set_noncollapsed(&host, cx);
+    let l_a = read_sel_alpha(&host, cx);
+    assert!(
+        (0.0..1.0).contains(&l_a),
+        "亮：选区底应半透明（a={l_a} ∈ (0,1)）"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-guide").is_some(),
+        "亮：选中文字帧括号竖线仍存在（半透明透出契约）"
+    );
+    // 暗：同样。
+    cx.update(|_, cx| crate::ui::theme::Theme::set(crate::ui::theme::ThemeMode::Dark, cx));
+    settle(cx);
+    set_noncollapsed(&host, cx);
+    let d_a = read_sel_alpha(&host, cx);
+    assert!(
+        (0.0..1.0).contains(&d_a),
+        "暗：选区底应半透明（a={d_a} ∈ (0,1)）"
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-guide").is_some(),
+        "暗：选中文字帧括号竖线仍存在（半透明透出契约）"
+    );
+}
+
+#[gpui::test]
+fn bracket_guides_stay_visible_over_fold_and_active_rows(cx: &mut TestAppContext) {
+    // 行底色拆成独立叠层（ruler < row_bg < guides < harea）后：跨行括号竖线在折叠行
+    // /光标行的整行底色上仍清晰可见——同帧两者共存、且几何上有 y 重叠（竖线不再被
+    // 不透明整行底色吞掉）。`debug_bounds` 不编码 z 序，故用「两选择器同帧都在 +
+    // 竖线段与底色带 y 区间重叠」锁定该回归（`test_bracket_guide_segments` 与渲染
+    // 同源，返回视口内全部竖线段，见 `bracket_guide_segments_flagged`）。
+    let text = "fn a() {\n    if x {\n        y();\n    }\n    z();\n}";
+    let (host, cx) = open(cx, text);
+    let lh = cx
+        .update(|_, cx| host.read(cx).ed.read(cx).test_metrics().1)
+        .max(1.);
+    // 任一竖线段的 y 区间与该行底色带 [band.0, band.1) 有交集。
+    let guides_overlap =
+        |host: &Entity<Host>, cx: &mut VisualTestContext, band: (f32, f32)| -> bool {
+            cx.update(|_, cx| {
+                let ed = host.read(cx).ed.clone();
+                ed.read(cx)
+                    .test_bracket_guide_segments(0, 0.0, lh, 1200.0, 1000.0)
+                    .into_iter()
+                    .any(|(_, y, h)| y < band.1 && y + h > band.0)
+            })
+        };
+    // Phase A：折叠 if 块首行（line 1，未聚焦）→ 折叠首行铺整行底色；`fn a() {`
+    // 配对的竖线跨过该折叠行 → 底色与竖线同帧共存且 y 重叠。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    let fold_bg = cx
+        .debug_bounds("ce-fold-row-bg")
+        .expect("已折叠首行应渲染整行底色");
+    assert!(
+        (fold_bg.size.height.as_f32() - lh).abs() < 1.0,
+        "折叠底色高应=行高（{} vs {lh}）",
+        fold_bg.size.height.as_f32()
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-guide").is_some(),
+        "折叠帧同帧仍应渲染括号竖线"
+    );
+    let fold_band = (
+        fold_bg.origin.y.as_f32(),
+        fold_bg.origin.y.as_f32() + fold_bg.size.height.as_f32(),
+    );
+    assert!(
+        guides_overlap(&host, cx, fold_band),
+        "竖线段应跨过折叠行底色带 {fold_band:?}"
+    );
+    // Phase B：展开折叠、聚焦并放光标到 line 1（非折叠行）→ 光标行整行高亮与竖线
+    // 共存（同样不被吞）。
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, _| ed.test_toggle_fold_at(1));
+    });
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |_, cx| cx.notify());
+    });
+    settle(cx);
+    focus(&host, cx);
+    let off1 = cx.update(|_, cx| host.read(cx).ed.read(cx).offset_for_line_col(1, 0));
+    cx.update(|_, cx| {
+        let ed = host.read(cx).ed.clone();
+        ed.update(cx, |ed, cx| ed.set_selection_range(off1..off1, cx));
+    });
+    settle(cx);
+    let active = cx
+        .debug_bounds("ce-active-line-bg")
+        .expect("持焦光标行应渲染整行高亮");
+    assert!(
+        (active.size.height.as_f32() - lh).abs() < 1.0,
+        "光标行高亮高应=行高（{} vs {lh}）",
+        active.size.height.as_f32()
+    );
+    assert!(
+        cx.debug_bounds("ce-bracket-guide").is_some(),
+        "光标行帧同帧仍应渲染括号竖线"
+    );
+    let active_band = (
+        active.origin.y.as_f32(),
+        active.origin.y.as_f32() + active.size.height.as_f32(),
+    );
+    assert!(
+        guides_overlap(&host, cx, active_band),
+        "竖线段应跨过光标行高亮带 {active_band:?}"
     );
 }
 
