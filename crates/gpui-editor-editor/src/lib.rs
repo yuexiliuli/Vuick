@@ -1,4 +1,4 @@
-//! 自研的文本/代码编辑器组件（首版，`src/editor/`）。
+//! 自研的文本/代码编辑器组件（首版，原 `src/editor/`）。
 //!
 //! 这是**独立于 gpui-component `Editor`** 的自有实现：从缓冲、选区、光标移动、
 //! 撤销/重做、语法高亮到视图渲染全部自持，可作为预览/编辑区的可替换组件。
@@ -32,7 +32,7 @@
 //! - 行数变更用 `ListState::splice` 增量对齐（大文档避免整树重建）；
 //!   打开/整篇替换/撤销重做仍是单次 O(n)（API 所限）。
 
-#![allow(dead_code)] // 组件库公共 API：接入 app 主视图前，bin crate 会对未使用项误报 dead_code
+#![allow(dead_code)] // 组件库公共 API：作为 lib crate 前 bin crate 会对未使用项误报 dead_code
 
 pub mod buffer;
 pub mod fold;
@@ -56,8 +56,35 @@ pub use undo::{EditIntent, Transaction, UndoManager};
 #[allow(unused_imports)]
 pub use view::{CodeEditor, EditorEvent};
 
-/// 测试探针再导出（`view` 为私有模块，app 层回归需读该静态计数）。
-#[cfg(test)]
-pub(crate) use view::CODE_EDITOR_FULL_RESET_CALLS;
 #[allow(unused_imports)]
 pub(crate) use view::merge_highlights;
+
+// ---------------------------------------------------------------------------
+// 迁移期 crate-root 短别名（与根包 P1/P2/P3a 同一策略）：
+// 让本 crate 内部既有的 `crate::editor::`（自引用）/ `crate::config::` /
+// `crate::actions::` / `crate::prof::` / `crate::util::` / `crate::ime::` /
+// `crate::ui::` 旧路径在拆 crate 后零改动即可解析。
+// ---------------------------------------------------------------------------
+/// 迁移期别名：自引用。本 crate 根 = 原 bin 里 `editor` 模块，`crate::editor::X` → `crate::X`。
+use crate as editor;
+/// 迁移期别名：`crate::config::` → `gpui_editor_config`。
+use gpui_editor_config as config;
+/// 迁移期别名：`crate::actions::` → `gpui_editor_base::actions`（动作类型已下沉 base）。
+use gpui_editor_base::actions;
+/// 迁移期别名：`crate::prof::` → `gpui_editor_base::prof`。
+use gpui_editor_base::prof;
+/// 迁移期别名：`crate::util::` → `gpui_editor_base::util`。
+use gpui_editor_base::util;
+/// `crate::base`：`warm`（COLR 彩字预热，自 P1 从 markdown 下沉，editor 不再依赖 markdown）。
+use gpui_editor_base as base;
+/// 迁移期别名：`crate::ime::` → `gpui_editor_ime`。
+use gpui_editor_ime as ime;
+/// 迁移期别名：`crate::ui::` → `gpui_editor_ui`。
+use gpui_editor_ui as ui;
+
+/// 测试键位助手：`editor` 独立 crate 后其测试不能再调根包
+/// `crate::actions::bind_local_keymaps`（该组合含 markdown 部分且定义在根包），
+/// 本转向 `base::bind_input_keys`（Input 键上下文）+ `ui::root::bind_keys`
+/// （Root 键上下文），即原组合去掉 markdown 后的片段，等价原 Input+Root 两套键上下文。
+#[cfg(test)]
+pub mod test_support;

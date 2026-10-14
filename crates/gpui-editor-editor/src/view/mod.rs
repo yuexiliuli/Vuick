@@ -456,10 +456,8 @@ pub struct CodeEditor {
     active_guide_color: Hsla,
     /// （仅测试）`apply_live_replay`（方案2 op 重放主路径）成功调用次数——每个测试的
     /// `CodeEditor` 都是新实例、字段从 0 起，比进程级静态计数在串行/并行测试下都确定。
-    #[cfg(test)]
     live_replay_calls: Cell<usize>,
     /// （仅测试）`apply_replaces`（行级 diff 兜底）非空调用次数——同上，实例级确定性。
-    #[cfg(test)]
     apply_replaces_calls: Cell<usize>,
     /// （仅测试）后台折叠候选/括号配对落地的**增量**次数（增量前提成立的刷新轮次）。
     #[cfg(test)]
@@ -543,9 +541,7 @@ impl CodeEditor {
             guide_color: rgb(0x000000).into(),
             active_guide_open: None,
             active_guide_color: rgb(0x000000).into(),
-            #[cfg(test)]
             live_replay_calls: Cell::new(0),
-            #[cfg(test)]
             apply_replaces_calls: Cell::new(0),
             #[cfg(test)]
             scan_inc_landings: Cell::new(0),
@@ -671,7 +667,6 @@ impl CodeEditor {
         if replaces.is_empty() {
             return;
         }
-        #[cfg(test)]
         self.apply_replaces_calls
             .set(self.apply_replaces_calls.get() + 1);
         // 与 `set_text` 同语义：整篇写回 = 原子替换，撤销栈清空（旧内容快照作废）。
@@ -742,21 +737,20 @@ impl CodeEditor {
         self.selection = Selection::collapsed(0);
         self.last_edit = None;
         self.marked_range = None;
-        #[cfg(test)]
         self.live_replay_calls
             .set(self.live_replay_calls.get() + 1);
         true
     }
 
     /// （仅测试）本实例成功走 `apply_live_replay`（方案2 op 重放）的次数。
-    #[cfg(test)]
-    pub(crate) fn live_replay_calls(&self) -> usize {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn live_replay_calls(&self) -> usize {
         self.live_replay_calls.get()
     }
 
     /// （仅测试）本实例成功走 `apply_replaces`（行级 diff 兜底）的次数（非空替换）。
-    #[cfg(test)]
-    pub(crate) fn apply_replaces_calls(&self) -> usize {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn apply_replaces_calls(&self) -> usize {
         self.apply_replaces_calls.get()
     }
 
@@ -845,15 +839,15 @@ impl CodeEditor {
     }
 
     /// 列表视口高（px，测试断言用：List 必须撑满容器，否则可见行数为 0）。
-    #[cfg(test)]
-    pub(crate) fn list_viewport_height(&self) -> f32 {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn list_viewport_height(&self) -> f32 {
         self.list_state.viewport_bounds().size.height.as_f32()
     }
 
     /// 竖向最大滚动量（px，测试断言用；像素路径含底部预留，滚到底时最后一行在
     /// 横向滚动条之上）。
-    #[cfg(test)]
-    pub(crate) fn list_max_offset(&self) -> f32 {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn list_max_offset(&self) -> f32 {
         (self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
             - self.list_state.viewport_bounds().size.height.as_f32())
             .max(0.)
@@ -861,25 +855,25 @@ impl CodeEditor {
 
     /// 纵向量程总高（px）。像素路径 = 条目总数 × 行高（含底部预留空行；确定性），
     /// 诊断/测试用。
-    pub(crate) fn vertical_total_px(&self) -> f32 {
+    pub fn vertical_total_px(&self) -> f32 {
         self.scroll_item_count() as f32 * self.line_height.as_f32().max(1.)
     }
 
     /// 测试：暴露 ListState（共享 Rc）——测试拖拽路径 / 量程对账。
-    #[cfg(test)]
-    pub(crate) fn test_list_state(&self) -> ListState {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_list_state(&self) -> ListState {
         self.list_state.clone()
     }
 
     /// 固定窗口虚拟化：列表始终是就绪的固定窗口（无两段式中间态），恒 false。
-    #[cfg(test)]
-    pub(crate) fn test_list_is_deferred(&self) -> bool {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_list_is_deferred(&self) -> bool {
         false
     }
 
     /// 测试：ListState 固定窗口条数（= LIST_WINDOW_ROWS，与文档行数无关）。
-    #[cfg(test)]
-    pub(crate) fn test_list_window_len(&self) -> usize {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_list_window_len(&self) -> usize {
         self.list_state.item_count()
     }
 
@@ -980,14 +974,14 @@ impl CodeEditor {
     }
 
     /// 测试：当前固定窗口首行绝对行号。
-    #[cfg(test)]
-    pub(crate) fn test_window_base(&self) -> usize {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_window_base(&self) -> usize {
         self.window_base
     }
 
     /// 测试：文本区竖向滚动顶 `(绝对行号, offset_in_item)`。
-    #[cfg(test)]
-    pub(crate) fn test_text_scroll_top(&self) -> (usize, f32) {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_text_scroll_top(&self) -> (usize, f32) {
         self.abs_scroll_top()
     }
 
@@ -999,27 +993,27 @@ impl CodeEditor {
     }
 
     /// 测试:用户请求的竖向滚动目标（px，绝对坐标）。
-    #[cfg(test)]
-    pub(crate) fn test_desired_scroll_px(&self) -> f32 {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_desired_scroll_px(&self) -> f32 {
         self.desired_scroll.get()
     }
 
     /// 测试：纵向底部预留（px，已量化到行高整数倍）。
-    #[cfg(test)]
-    pub(crate) fn test_bottom_pad_px(&self) -> f32 {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_bottom_pad_px(&self) -> f32 {
         self.vscroll_bottom_pad_px()
     }
 
     /// 测试：列表条目总数（文档行数 + 底部预留空行）。增长完成后
     /// `test_list_state().item_count() == test_scroll_item_count()`。
-    #[cfg(test)]
-    pub(crate) fn test_scroll_item_count(&self) -> usize {
+    // cfg(test) 探针面：拆 crate 后被 markdown 测试跨 crate 消费，转无条件 pub。
+    pub fn test_scroll_item_count(&self) -> usize {
         self.scroll_item_count()
     }
 
     /// 测试：直接滚到「量程最大值（含底部预留空行）」——复现滚到底的真实渲染结果。
-    #[cfg(test)]
-    pub(crate) fn test_scroll_to_bottom(&mut self) {
+    // cfg(test) 探针面：拆 editor crate 后被 app 测试跨 crate 消费，转无条件 pub。
+    pub fn test_scroll_to_bottom(&mut self) {
         self.scroll_to_px(self.list_max_offset());
     }
 
@@ -1718,14 +1712,14 @@ impl CodeEditor {
 
     /// 视口顶部的**源码行**（0 基；绝对视觉行经折叠映射回逻辑行）。编辑区⇄预览
     /// 滚动同步用——同步单位 = 源码行，两侧都以它对齐。
-    pub(crate) fn viewport_top_line(&self) -> usize {
+    pub fn viewport_top_line(&self) -> usize {
         let (vis, _) = self.abs_scroll_top();
         self.folds.logical_row(vis)
     }
 
     /// 滚动到目标**源码行**置于视口顶部（统一行高模型；逻辑行经折叠映射成视觉行，
     /// 再换算像素交给 `scroll_to_px`——夹到量程内，底部预留让末行停在横向条上方）。
-    pub(crate) fn scroll_to_line(&mut self, line: usize) {
+    pub fn scroll_to_line(&mut self, line: usize) {
         let lh = self.line_height.as_f32().max(1.);
         let vis = self.folds.visual_row(line);
         self.scroll_to_px(vis as f32 * lh);
@@ -1991,10 +1985,10 @@ impl CodeEditor {
 // 交互：焦点 / 鼠标 / 键盘 / 编辑
 // -------------------------------------------------------------------------
 
-#[cfg(test)]
+// cfg(test) 探针面：拆 editor crate 后 markdown 测试跨 crate 消费，转无条件 pub。
 impl CodeEditor {
     /// 测试用度量：`(char_width, line_height, gutter_width)`（px 的 f32）。
-    pub(crate) fn test_metrics(&self) -> (f32, f32, f32) {
+    pub fn test_metrics(&self) -> (f32, f32, f32) {
         (
             self.char_width.as_f32(),
             self.line_height.as_f32(),
@@ -2003,33 +1997,33 @@ impl CodeEditor {
     }
 
     /// 测试用：折叠映射（只读）。
-    pub(crate) fn test_folds(&self) -> &FoldMap {
+    pub fn test_folds(&self) -> &FoldMap {
         &self.folds
     }
 
     /// 测试用：程序化添加折叠 `[start, end)`（半开逻辑行）。
-    pub(crate) fn test_set_fold(&mut self, start: usize, end: usize) {
+    pub fn test_set_fold(&mut self, start: usize, end: usize) {
         self.folds.toggle(start, end);
     }
 
     /// 测试用：自动探测的折叠候选（只读）。
-    pub(crate) fn test_fold_candidates(&self) -> &[Fold] {
+    pub fn test_fold_candidates(&self) -> &[Fold] {
         &self.fold_candidates
     }
 
     /// 测试用：括号标尺配对（只读）。
-    pub(crate) fn test_bracket_pairs(&self) -> &[BracketPair] {
+    pub fn test_bracket_pairs(&self) -> &[BracketPair] {
         &self.bracket_pairs
     }
 
     /// 测试用：清空折叠候选与括号配对（验证后台刷新会重新落地）。
-    pub(crate) fn test_clear_fold_brackets(&mut self) {
+    pub fn test_clear_fold_brackets(&mut self) {
         self.fold_candidates.clear();
         self.bracket_pairs.clear();
     }
 
     /// 测试用：括号标尺在当前视口的竖线段 `(x, y_rel, h)`（文本区本地坐标）。
-    pub(crate) fn test_bracket_guide_segments(
+    pub fn test_bracket_guide_segments(
         &self,
         top_vis: usize,
         off: f32,
@@ -2041,49 +2035,49 @@ impl CodeEditor {
     }
 
     /// 测试用：当前点亮的标尺块（`open_line`，`None` = 未点亮）。
-    pub(crate) fn test_active_guide(&self) -> Option<usize> {
+    pub fn test_active_guide(&self) -> Option<usize> {
         self.active_guide_open
     }
 
     /// 测试用：逻辑行 `logical` 应命中的最内层括号块（`open_line`）。
-    pub(crate) fn test_guide_for_logical_row(&self, logical: usize) -> Option<usize> {
+    pub fn test_guide_for_logical_row(&self, logical: usize) -> Option<usize> {
         self.guide_pair_for_logical_row(logical)
     }
 
     /// 测试用：`line` 是否起始一个可折叠候选/激活折叠（gutter 指示器口径）。
-    pub(crate) fn test_has_fold_or_candidate(&self, line: usize) -> bool {
+    pub fn test_has_fold_or_candidate(&self, line: usize) -> bool {
         self.has_fold_or_candidate(line)
     }
 
     /// 测试用：`line` 行的折叠箭头状态（与渲染同口径的单一权威，见 [`Self::fold_arrow_state`]）。
-    pub(crate) fn test_fold_arrow_state(&self, line: usize) -> Option<bool> {
+    pub fn test_fold_arrow_state(&self, line: usize) -> Option<bool> {
         self.fold_arrow_state(line)
     }
 
     /// 测试用：编辑器行底色快照 `(sel_bg, fold_bg, active_line_bg)`（`refresh_metrics`
     /// 里直读的三个 `colors.editor_*` token，锁「折叠/光标行比选区更贴背景」的回归）。
-    pub(crate) fn test_sel_and_fold_bg(&self) -> (Hsla, Hsla, Hsla) {
+    pub fn test_sel_and_fold_bg(&self) -> (Hsla, Hsla, Hsla) {
         (self.sel_bg, self.fold_bg, self.active_line_bg)
     }
 
     /// 测试用：光标行折叠切换（gutter 点击同路径）。
-    pub(crate) fn test_toggle_fold_at(&mut self, line: usize) {
+    pub fn test_toggle_fold_at(&mut self, line: usize) {
         self.toggle_fold_at(line);
     }
 
     /// 测试用：缩进启发式块的结束行（开区间）。
-    pub(crate) fn test_fold_block_end(&self, start: usize) -> Option<usize> {
+    pub fn test_fold_block_end(&self, start: usize) -> Option<usize> {
         self.fold_block_end(start)
     }
 
     /// 测试用：垂直标尺第 `col` 列在当前横向滚动下的本地 x（px；不可见为 `None`）。
-    pub(crate) fn test_ruler_x(&self, col: usize, avail_w: f32) -> Option<f32> {
+    pub fn test_ruler_x(&self, col: usize, avail_w: f32) -> Option<f32> {
         self.ruler_screen_x(col, avail_w)
     }
 
     /// 测试用：`row` 行内 `byte_col`（行内字节列）字符边界在文本本地的 x（px）。
     /// 与渲染/命中测试共用 `row_layout`，可用来构造"点到真实字符边界"的鼠标事件。
-    pub(crate) fn test_char_boundary_x(
+    pub fn test_char_boundary_x(
         &self,
         window: &mut Window,
         row: usize,
@@ -2096,32 +2090,32 @@ impl CodeEditor {
     }
 
     /// 测试用：当前横向滚动像素（断言横向滚动确实把内容推走了）。
-    pub(crate) fn test_hscroll_px(&self) -> f32 {
+    pub fn test_hscroll_px(&self) -> f32 {
         self.hscroll_px()
     }
 
     /// 测试用：当前横向内容宽度（px）。断言行宽估算不低估真实字形宽 → 不折行。
-    pub(crate) fn test_content_w_px(&self) -> f32 {
+    pub fn test_content_w_px(&self) -> f32 {
         self.content_w_px
     }
 
     /// 测试用：元素布局包围盒（`EditorElement::prepaint` 回写；未就绪 = 默认 0 大小）。
-    pub(crate) fn test_element_bounds(&self) -> Bounds<Pixels> {
+    pub fn test_element_bounds(&self) -> Bounds<Pixels> {
         self.element_bounds
     }
 
     /// 测试用：横向滚动容器最大可滚量（px）——底部横向滚动条量程的依据。
-    pub(crate) fn test_hscroll_max_px(&self) -> f32 {
+    pub fn test_hscroll_max_px(&self) -> f32 {
         self.h_handle.max_offset().x.as_f32()
     }
 
     /// 测试用：当前可视格（宽度单位）数。
-    pub(crate) fn test_visible_chars(&self) -> usize {
+    pub fn test_visible_chars(&self) -> usize {
         self.visible_chars
     }
 
     /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
-    pub(crate) fn test_caret_units(&self) -> usize {
+    pub fn test_caret_units(&self) -> usize {
         self.buffer.unit_column(self.selection.head().min(self.buffer.len()))
     }
 }
@@ -2266,7 +2260,7 @@ impl CodeEditor {
     /// z-order 裁掉被菜单遮挡的区间）置 `dragging=true`；对应的 MouseUp 又被菜单项
     /// `activate` 的 `stop_propagation` 截断派发、到不了 `on_mouse_up` → `dragging`
     /// 残留，切回后仅移动鼠标就从 anchor 自动扩选。
-    pub(crate) fn cancel_mouse_drag(&mut self) {
+    pub fn cancel_mouse_drag(&mut self) {
         self.dragging = false;
     }
 
@@ -2520,7 +2514,7 @@ impl CodeEditor {
     ///   重跑一轮；
     /// - 不阻塞 UI 线程：打开 160k 行文档的 ~280ms 全量扫描不再卡界面，输入含括号
     ///   字符也不再逐键整篇重扫（结构编辑事件的 O(全文) 双扫改 O(受影响段)）。
-    pub(crate) fn refresh_fold_brackets(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh_fold_brackets(&mut self, cx: &mut Context<Self>) {
         use crate::config::limits::FOLD_CANDIDATE_FULL_MAX_LINES as SCAN_LIMIT;
         self.scan_epoch = self.scan_epoch.wrapping_add(1);
         if self.scan_inflight {

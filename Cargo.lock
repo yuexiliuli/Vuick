@@ -2118,6 +2118,7 @@ dependencies = [
  "gpui",
  "gpui-editor-base",
  "gpui-editor-config",
+ "gpui-editor-editor",
  "gpui-editor-ime",
  "gpui-editor-syntax",
  "gpui-editor-ui",
@@ -2154,6 +2155,19 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "serde_json",
+]
+
+[[package]]
+name = "gpui-editor-editor"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-editor-base",
+ "gpui-editor-config",
+ "gpui-editor-ime",
+ "gpui-editor-ui",
+ "ropey",
+ "syntect",
 ]
 
 [[package]]

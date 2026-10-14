@@ -80,7 +80,7 @@ impl Edit {
 /// 宁可高估（横向多留白）也绝不低估：低估会让 `StyledText` 在行内折行，行号、
 /// 点击、光标全部错位并重叠（用户实测：中文长行自动"换行"、序号没对齐、点下一行
 /// 文本重叠）。
-pub(crate) fn char_width_units(c: char) -> usize {
+pub fn char_width_units(c: char) -> usize {
     match c {
         '\t' => 4,
         c if c.is_ascii() => 1,
@@ -90,7 +90,8 @@ pub(crate) fn char_width_units(c: char) -> usize {
 
 /// 行宽直方图（multiset）：宽度单位 → 拥有该宽度的行数（见 [`char_width_units`]，
 /// CJK/全角=2、ASCII=1、Tab=4）。最宽行 = `keys().next_back()`(O(1))。
-pub(crate) type LineWidthHistogram = BTreeMap<usize, usize>;
+/// 拆 editor crate 后被 app（file_ops/open_progress）跨 crate 消费 → 转 pub。
+pub type LineWidthHistogram = BTreeMap<usize, usize>;
 
 /// 按逻辑行号取只读 Rope 的行文本（无 `Buffer` 外壳；越界返回空）。
 /// 供后台线程的折叠候选 / 括号配对扫描使用（Rope 为 O(1) COW 快照）。
@@ -104,7 +105,8 @@ pub(crate) fn line_shared(rope: &Rope, line: usize) -> SharedString {
 /// 纯计函数（不依赖 `&mut Buffer`，可放后台线程）：统计全文的行宽直方图与
 /// 最长行字符数。与 [`Buffer::recompute_max_line`] 等价，但可以在后台算好后
 /// 经 [`Buffer::from_parts`] O(1) 装配，避免打开大文档时在 UI 线程全量重扫。
-pub(crate) fn compute_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
+/// 拆 editor crate 后被 app（file_ops/open_progress）跨 crate 消费 → 转 pub。
+pub fn compute_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
     let mut hist = LineWidthHistogram::new();
     let mut mx_chars = 0usize;
     for i in 0..rope.lines_len() {

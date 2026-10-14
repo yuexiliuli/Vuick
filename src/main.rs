@@ -16,7 +16,6 @@
 
 mod actions;
 mod app;
-mod editor;
 mod epub;
 mod image;
 mod markdown;
@@ -40,6 +39,9 @@ use gpui_editor_config as config;
 // P3a：自研 UI 组件库迁出为 `gpui-editor-ui` crate，以 crate 根别名保持
 // `crate::ui::` 短路径（editor/markdown/pdf/image/video/toc/app 现有引用零改动）。
 use gpui_editor_ui as ui;
+// P3b：自研文本/代码编辑器迁出为 `gpui-editor-editor` crate，以 crate 根别名保持
+// `crate::editor::` 短路径（app/markdown/main 现有引用零改动）。
+use gpui_editor_editor as editor;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 
