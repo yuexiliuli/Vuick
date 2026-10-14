@@ -2105,7 +2105,7 @@ dependencies = [
  "gpui_util",
  "heapless",
  "http_client",
- "image 0.25.10",
+ "image",
  "inventory",
  "itertools 0.14.0",
  "libc",
@@ -2183,7 +2183,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_util",
- "image 0.25.10",
+ "image",
  "libc",
  "log",
  "mach2",
@@ -2251,7 +2251,7 @@ dependencies = [
  "gpui",
  "gpui_apple",
  "gpui_util",
- "image 0.25.10",
+ "image",
  "itertools 0.14.0",
  "log",
  "objc",
@@ -2382,7 +2382,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_util",
- "image 0.25.10",
+ "image",
  "itertools 0.14.0",
  "log",
  "parking_lot",
@@ -2692,18 +2692,6 @@ dependencies = [
 
 [[package]]
 name = "image"
-version = "0.1.0"
-dependencies = [
- "config",
- "gpui",
- "image 0.25.10",
- "libjpeg-turbo-rs",
- "ui",
- "viewer",
-]
-
-[[package]]
-name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
@@ -2734,6 +2722,18 @@ checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
 dependencies = [
  "byteorder-lite",
  "quick-error 2.0.1",
+]
+
+[[package]]
+name = "image_viewer"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "gpui",
+ "image",
+ "libjpeg-turbo-rs",
+ "ui",
+ "viewer",
 ]
 
 [[package]]
@@ -3166,7 +3166,7 @@ dependencies = [
  "config",
  "editor",
  "gpui",
- "image 0.25.10",
+ "image",
  "ime",
  "ratex-layout",
  "ratex-parser",
@@ -4035,7 +4035,7 @@ dependencies = [
  "base",
  "config",
  "gpui",
- "image 0.25.10",
+ "image",
  "pdfium-render",
  "ui",
  "viewer",
@@ -4053,7 +4053,7 @@ dependencies = [
  "chrono",
  "console_error_panic_hook",
  "console_log",
- "image 0.25.10",
+ "image",
  "itertools 0.14.0",
  "js-sys",
  "libloading",
@@ -5302,7 +5302,7 @@ dependencies = [
  "epub",
  "futures",
  "gpui",
- "image 0.1.0",
+ "image_viewer",
  "markdown",
  "memchr",
  "pdf",
@@ -6198,7 +6198,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "gpui",
- "image 0.25.10",
+ "image",
  "libloading",
  "ui",
  "viewer",

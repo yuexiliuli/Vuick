@@ -41,7 +41,7 @@
 //! - `m`：静音切换；`-`/`=`：减/加音量（±[`VOLUME_STEP`]）；`[`/`]`：降/升倍速；
 //!   `s`：截图当前帧存 PNG。
 //!
-//! 对齐 [`crate::image::ImageViewer`] 的「自包含阅读器」姿势；上屏字节序 BGRA
+//! 对齐 [`::image_viewer::ImageViewer`] 的「自包含阅读器」姿势；上屏字节序 BGRA
 //! 同 PDF 模块 [`crate::pdf::render_image_from_bgra`]。
 
 use std::cell::Cell;

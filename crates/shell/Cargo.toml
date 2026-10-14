@@ -21,7 +21,7 @@ editor = { path = "../editor" }
 markdown = { path = "../markdown" }
 toc = { path = "../toc" }
 pdf = { path = "../pdf" }
-image = { path = "../image" }
+image_viewer = { path = "../image_viewer" }
 # 视频查看器随本 crate 的 `video` feature 开关（`cfg(feature = "video")`）。
 video = { path = "../video", optional = true }
 epub = { path = "../epub" }

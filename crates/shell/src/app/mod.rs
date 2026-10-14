@@ -106,7 +106,7 @@ struct EditorTab {
     /// PDF 阅读器（打开 .pdf 时创建）：整页原样显示；None = 非 PDF 选项卡。
     pdf_preview: Option<gpui::Entity<pdf::PdfViewer>>,
     /// 图片查看器（打开图片时创建）：None = 非图片选项卡。
-    image_viewer: Option<gpui::Entity<image::ImageViewer>>,
+    image_viewer: Option<gpui::Entity<image_viewer::ImageViewer>>,
     /// 视频查看器（打开视频时创建，M1 首帧静态阅读）：None = 非视频选项卡。
     #[cfg(feature = "video")]
     video_viewer: Option<gpui::Entity<video::VideoViewer>>,
@@ -183,7 +183,7 @@ pub(crate) struct DetachedTab {
     editor: gpui::Entity<editor::CodeEditor>,
     pdf_preview: Option<gpui::Entity<pdf::PdfViewer>>,
     /// 图片查看器实体（随选项卡跨窗口搬迁）。
-    image_viewer: Option<gpui::Entity<image::ImageViewer>>,
+    image_viewer: Option<gpui::Entity<image_viewer::ImageViewer>>,
     /// 视频查看器实体（随选项卡跨窗口搬迁）。
     #[cfg(feature = "video")]
     video_viewer: Option<gpui::Entity<video::VideoViewer>>,
@@ -507,7 +507,7 @@ impl WinCtrlKind {
 /// 一个选项卡只可能是其一（打开图片/视频时分别创建）。
 #[derive(Clone)]
 enum ActiveMedia {
-    Image(gpui::Entity<image::ImageViewer>),
+    Image(gpui::Entity<image_viewer::ImageViewer>),
     #[cfg(feature = "video")]
     Video(gpui::Entity<video::VideoViewer>),
 }

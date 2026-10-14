@@ -597,9 +597,9 @@ impl EditorApp {
             .unwrap_or(false)
     }
 
-    /// 是否图片文件（按扩展名识别；清单见 [`image::IMAGE_EXTENSIONS`]）。
+    /// 是否图片文件（按扩展名识别；清单见 [`image_viewer::IMAGE_EXTENSIONS`]）。
     pub(super) fn is_image_path(p: &Path) -> bool {
-        image::is_image_extension(p)
+        image_viewer::is_image_extension(p)
     }
 
     /// 是否视频文件（按扩展名识别；清单见 [`video::VIDEO_EXTENSIONS`]）。

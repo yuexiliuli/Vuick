@@ -760,7 +760,7 @@ impl EditorApp {
     }
 
     /// 把一个新图片查看器载入指定选项卡：编辑区置空、全屏只读预览。
-    /// 解码由 [`image::ImageViewer`] 自己在后台完成，窗口不阻塞。
+    /// 解码由 [`image_viewer::ImageViewer`] 自己在后台完成，窗口不阻塞。
     pub(super) fn load_image(
         &mut self,
         idx: usize,
@@ -780,7 +780,7 @@ impl EditorApp {
             ed.set_language(Some("markdown"));
         });
         // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
-        let viewer = cx.new(|cx| image::ImageViewer::new(p.to_path_buf(), cx));
+        let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
         viewer.update(cx, |view, _| view.set_background(canvas_bg));
         tab.image_viewer = Some(viewer);
         tab.file_path = Some(p.to_path_buf());

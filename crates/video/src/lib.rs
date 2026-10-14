@@ -1,13 +1,13 @@
 //! 视频查看器模块（src/video/ 独立文件夹）。
 //!
-//! 打开 / 拖入视频（mp4/mkv/webm/mov…）时以全屏阅读器展示 —— 与 [`crate::image`]
+//! 打开 / 拖入视频（mp4/mkv/webm/mov…）时以全屏阅读器展示 —— 与 [`::image_viewer`]
 //! 同款「自包含阅读器」姿势：实体自持状态、后台解码线程、主线程包 `RenderImage` 上屏。
 //!
 //! 分步路线（守每步 clippy 零新增纪律）：
 //! - **M0/M1**（已落地）：`decode` 核心（`VideoReader`：open/seek/逐帧 BGRA）+
 //!   `VideoViewer` 首帧静态阅读 + 扩展名路由；
 //! - **M2**（当前）：播放循环（帧钟 + 上屏 + play/pause/seek）+ 同文件夹切换；
-//! - **M3**：缩放/适配 + 音频 + 性能定标（decode-to-display、缓存预算），对齐 image V2。
+//! - **M3**：缩放/适配 + 音频 + 性能定标（decode-to-display、缓存预算），对齐 image_viewer V2。
 //!
 //! 上屏方式与 [`crate::pdf::render_image_from_bgra`] 同构：解码帧转 BGRA → `RenderImage`。
 //!
