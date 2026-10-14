@@ -7,12 +7,20 @@
 
 use super::*;
 use ui::input::Input;
-use editor::rope_ext::RopeExt;
 
 use config::limits::SEARCH_RESULT_CAP;
 use ui::motion::{hover_bg_fade, hover_spring};
 
 use std::rc::Rc;
+
+/// 侧边栏搜索输入防抖时长（ms）：输入停顿这么久才提交查询并执行一次扫描。
+/// 连续输入（间隔 < 本值）只更新待提交词，不触发每键全量重扫。
+pub(super) const SEARCH_DEBOUNCE_MS: u64 = 150;
+
+/// 归一化搜索查询词（与旧 `value().trim().to_lowercase()` 一致，作缓存键与渲染用词）。
+fn normalize_search_query(q: &str) -> String {
+    q.trim().to_lowercase()
+}
 
 /// 侧边栏视图。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -838,7 +846,7 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let muted = self.text_minor();
-        let query = self.search_state.read(cx).value().to_string();
+        let query = self.search_committed.clone();
         let search = self.search_state.clone();
         // Fluent 文本框：整圈细边框 + 内缩边距（背景随 chrome 保持透明）；
         // 聚焦时边框点亮为强调色。
@@ -862,7 +870,9 @@ impl EditorApp {
             .border_color(border_color)
             .child(Input::new(&search));
 
-        let q = query.trim().to_lowercase();
+        // 扫描用「防抖后已提交」的查询词（已归一化 trim+小写）；输入框实时文本在
+        // `search_state` —— 连续输入时这里沿用上次提交词的结果，防抖期满才重扫。
+        let q = query;
         let result_area: gpui::AnyElement = if q.is_empty() {
             div()
                 .px_3()
@@ -1370,6 +1380,33 @@ impl EditorApp {
         hit_rows
     }
 
+    /// 输入变化 → 登记防抖待提交词并重启防抖计时器（时序代号作废旧定时器）。
+    /// 每键只做 O(1) 更新 + 即时通知刷新输入框渲染；[`SEARCH_DEBOUNCE_MS`] 期满且无
+    /// 新输入才把 `search_pending` 提交为 `search_committed` 并通知（触发一次扫描）。
+    /// 连续输入（间隔 < 防抖窗）时扫描零触发——大文档不再每键全量重扫正文。
+    pub(super) fn schedule_search_debounce(&mut self, value: String, cx: &mut Context<Self>) {
+        let seq = self.search_debounce_seq.wrapping_add(1);
+        self.search_debounce_seq = seq;
+        self.search_pending = normalize_search_query(&value);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // 期间有新输入 → 序号已变，本定时器作废（防抖可重入）。
+                if this.search_debounce_seq == seq {
+                    let pending = std::mem::take(&mut this.search_pending);
+                    if this.search_committed != pending {
+                        this.search_committed = pending;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 侧边栏搜索「扫描并缓存」：查询词 + 活动文档未变时命中缓存（O(1) Rc 克隆，
     /// 渲染帧不重扫）；否则对文件名（跨全部打开文件）与活动文档行内容扫一次。
     /// 行内容直接借 `Rope`/`content`（`&str`），不做整份 `to_string()` 物化；
@@ -1419,27 +1456,26 @@ impl EditorApp {
                         doc_offset += line.len() + 1;
                     }
                 } else {
-                    let rope = tab.editor.read(cx).text();
-                    for (li, lineslice) in rope.iter_lines().enumerate() {
-                        // 常规行在单 chunk 内：`as_str()` 零拷贝借出，逐行扫描不做分配；
-                        // 罕见跨 chunk 的超长行才整行物化一次（`iter_lines` 的 RopeSlice
-                        // 无 Deref<str>，无法直接当 &str 用）。
-                        let found = if let Some(s) = lineslice.as_str() {
-                            find_ci(s, q).map(|r| (r, s.trim().to_string()))
-                        } else {
-                            let owned = lineslice.to_string();
-                            find_ci(&owned, q).map(|r| (r, owned.trim().to_string()))
-                        };
-                        let Some((r, snippet)) = found else { continue };
-                        let line_start = rope.line_start_offset(li);
-                        line_hits.push(SearchLineHit {
-                            line: li,
-                            range: (line_start + r.start)..(line_start + r.end),
-                            snippet,
-                        });
-                        if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
-                            break;
+                    // 可编辑正文：`value()` 一次性物化（LF 归一化，与预测/命中一致）。
+                    // 相比逐行迭代 Rope（`iter_lines` 每行 `slice_line` O(log N)/行 →
+                    // 139k 行 debug 实测超 1.7s；`lines(LF)` 虽 O(N) 但 debug 全遍历
+                    // 仍 ~0.7s），物化 6.4MB ≈ 5ms、一次换取 O(N) 纯 `&str` 扫描——
+                    // 防抖后每次只付一次，远快于逐行 Rope 迭代。
+                    let content: String = tab.editor.read(cx).value();
+                    let content = content.as_str();
+                    let mut doc_offset = 0usize;
+                    for (li, line) in content.split('\n').enumerate() {
+                        if let Some(r) = find_ci(line, q) {
+                            line_hits.push(SearchLineHit {
+                                line: li,
+                                range: (doc_offset + r.start)..(doc_offset + r.end),
+                                snippet: line.trim().to_string(),
+                            });
+                            if file_tabs.len() + line_hits.len() >= SEARCH_RESULT_CAP {
+                                break;
+                            }
                         }
+                        doc_offset += line.len() + 1;
                     }
                 }
             }
@@ -1520,16 +1556,41 @@ pub(super) fn find_ci(haystack: &str, needle: &str) -> Option<std::ops::Range<us
         }
         return None;
     }
-    // 非 ASCII needle：字符级大小写折叠比较
-    let needle_chars = needle.chars().count();
+    // 非 ASCII needle：字符级大小写折叠比较（零分配，语义与旧「取 n 字符 collect 为
+    // 整串再 to_lowercase() 与 needle 整串比较」一致：每个候选起点取 needle 同款
+    // 字符数，逐字符折叠后与 needle 字符流比对；折叠展开/长度不等即不命中）。
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let n_len = needle_chars.len();
+    if n_len == 0 {
+        return None;
+    }
     let mut i = 0usize;
     while i < haystack.len() {
-        let candidate: String = haystack[i..].chars().take(needle_chars).collect();
-        if !candidate.is_empty() && candidate.to_lowercase() == needle {
-            return Some(i..(i + candidate.len()));
+        let rest = &haystack[i..];
+        let mut ni: usize = 0; // 已比对上的 needle 字符数
+        let mut cand_bytes: usize = 0; // 候选在 haystack 中占用的字节数
+        let mut hit = true;
+        for hc in rest.chars().take(n_len) {
+            cand_bytes += hc.len_utf8();
+            let folded = hc.to_lowercase();
+            for f in folded {
+                if ni >= n_len || f != needle_chars[ni] {
+                    hit = false;
+                    break;
+                }
+                ni += 1;
+            }
+            if !hit {
+                break;
+            }
         }
-        let ch = haystack[i..].chars().next()?;
-        i += ch.len_utf8();
+        if hit && ni == n_len {
+            return Some(i..(i + cand_bytes));
+        }
+        match rest.chars().next() {
+            Some(ch) => i += ch.len_utf8(),
+            None => break,
+        }
     }
     None
 }

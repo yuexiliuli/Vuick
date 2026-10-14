@@ -392,6 +392,14 @@ pub struct EditorApp {
     /// 实际执行过的搜索扫描次数（每次命中缓存复用不改）。测试用：验证「查询未变
     /// 时反复渲染不重扫」这一优化真实生效。
     pub(crate) search_scan_count: usize,
+    /// 侧边栏搜索「防抖后提交生效」的查询词（已归一化：trim + to_lowercase）。
+    /// 渲染/扫描只看它；输入框实时文本仍在 `search_state`。连续输入在防抖窗内只
+    /// 更新 `search_pending`，期满才提交本字段并触发一次扫描（不再每键全量重扫）。
+    pub(crate) search_committed: String,
+    /// 防抖窗口内最新一次输入（未提交的归一化查询词）；到点写入 `search_committed`。
+    search_pending: String,
+    /// 防抖时序代号：每次输入 +1。旧防抖定时器到点比对不符即作废，防抖可重入。
+    search_debounce_seq: u64,
     /// 大文档「两段式打开」快段（`load_file_text` 延迟挂载编辑器）执行次数。
     /// 测试用：验证大文件先瞬时挂编辑器、再后台补齐统计/预览的完整流程两段都跑了。
     pub(crate) open_fast_count: usize,

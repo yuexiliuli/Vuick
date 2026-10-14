@@ -813,6 +813,10 @@
             let input = app.read(cx).search_state.clone();
             input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
         });
+        // 防抖期满提交查询（否则渲染不触发扫描）
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         for _ in 0..5 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -844,9 +848,10 @@
         let _ = std::fs::remove_file(&b);
     }
 
-    /// 验证侧边栏搜索的「扫描结果缓存」真实生效（优化回归，防负优化）：
+    /// 验证侧边栏搜索的「扫描结果缓存」与「输入防抖」真实生效（优化回归，防负优化）：
     /// - 查询词/活动文档未变时，反复渲染帧**不重扫**（`search_scan_count` 不增）；
-    /// - 查询词变化才重扫（计数 +1）；
+    /// - 防抖窗内（< SEARCH_DEBOUNCE_MS）连续输入**零扫描**，防抖期满才提交生效并扫描一次；
+    /// - 查询词变化（防抖后）才重扫（计数 +1）；
     /// - 内容命中（当前活动文档行）能出结果行。
     #[gpui::test]
     async fn sidebar_search_scan_is_cached_across_renders(cx: &mut TestAppContext) {
@@ -879,18 +884,34 @@
         let before = cx.update(|_w, cx| app.read(cx).search_scan_count);
         assert_eq!(before, 0, "查询为空时不应扫描");
 
-        // 第一次键入「shanghai」→ 扫描一次，命中第 1 行
+        // 第一次键入「shanghai」：防抖期内（<150ms）不扫描、不提交
         cx.update(|window, cx| {
             let input = app.read(cx).search_state.clone();
             input.update(cx, |s, cx| s.set_value("shanghai", window, cx));
         });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        let debounced = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(debounced, before, "防抖期内不应执行扫描");
+
+        // 时钟推进越过防抖 → 提交并扫描 1 次，命中第 1 行
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         for _ in 0..5 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
         }
         cx.run_until_parked();
         let after = cx.update(|_w, cx| app.read(cx).search_scan_count);
-        assert_eq!(after, 1, "首次搜索应精确扫描 1 次");
+        assert_eq!(after, before + 1, "防抖期满后应精确扫描 1 次");
+        assert_eq!(
+            cx.update(|_w, cx| app.read(cx).search_committed.clone()),
+            "shanghai",
+            "防抖提交词应等于最终输入（归一化）"
+        );
         let hit_row1 = Box::leak(format!("sidebar-search-line-{ti}-1").into_boxed_str());
         assert!(
             cx.debug_bounds(hit_row1).is_some(),
@@ -906,11 +927,14 @@
         let steady = cx.update(|_w, cx| app.read(cx).search_scan_count);
         assert_eq!(steady, after, "查询未变时重复渲染不应重扫");
 
-        // 换查询「beta」→ 再扫描一次，命中第 2 行
+        // 换查询「beta」→ 防抖后扫描一次，命中第 2 行
         cx.update(|window, cx| {
             let input = app.read(cx).search_state.clone();
             input.update(cx, |s, cx| s.set_value("beta", window, cx));
         });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         for _ in 0..5 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -924,6 +948,119 @@
             "换查询 beta 应命中第 2 行"
         );
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// 回归：快速连续键入（每次间隔 < 防抖窗）时**只扫描一次**——N 键不再 N 次
+    /// O(全文) 同步重扫（大文档卡顿根因），且结果显示的是最终提交词。
+    #[gpui::test]
+    async fn sidebar_search_debounce_collapses_rapid_typing(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let txt = std::env::temp_dir().join("gpui-sz-debounce.txt");
+        std::fs::write(&txt, "第一行 alpha\n预览 beta\n预览编辑 gamma\ndelta\n").unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(txt.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..5 {
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // 快速键入 6 个中间词（不给防抖窗到期机会）：期间应零扫描
+        for q in ["p", "pr", "pre", "prev", "previ", "预览编辑"] {
+            cx.update(|window, cx| {
+                let input = app.read(cx).search_state.clone();
+                input.update(cx, |s, cx| s.set_value(q, window, cx));
+            });
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(20));
+            for _ in 0..2 {
+                cx.run_until_parked();
+            }
+        }
+        let during = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(during, 0, "防抖窗外仅 20ms/键 → 全程零扫描");
+
+        // 最后停顿超过防抖 → 只提交最终词，恰好扫描 1 次
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        cx.run_until_parked();
+        let committed = cx.update(|_w, cx| app.read(cx).search_committed.clone());
+        assert_eq!(committed, "预览编辑", "防抖应提交最终输入词");
+        let scans = cx.update(|_w, cx| app.read(cx).search_scan_count);
+        assert_eq!(scans, 1, "6 键快速输入应只扫描 1 次（最终词）");
+        let _ = std::fs::remove_file(&txt);
+    }
+
+    /// 复现（shell 层整链）：侧边栏搜索框中文 IME 乱码——把 Windows 风格的 IME 事件
+    /// 序列（组合更新 `replace_and_mark(None,…)` + 提交 `replace_text_in_range(None,…)`，
+    /// 见 gpui_windows `handle_ime_composition_inner`）喂进 `search_state`，输入框
+    /// 文本与防抖提交词都必须是干净中文「编辑」，而非拼音历史拼接（用户报告：
+    /// 输「编辑」变「bbibi'abianbian'jbian'ji编辑」）。
+    #[gpui::test]
+    async fn sidebar_search_ime_composition_commits_clean_query(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler as _;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // Windows IME 组合更新序列：每键重发完整组合串（range=None）
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| {
+                s.replace_and_mark_text_in_range(None, "b", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi'a", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi'an", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bian'j", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bian'ji", None, window, cx);
+            });
+        });
+        // 确认：提交中文（range=None）
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| {
+                s.replace_text_in_range(None, "编辑", window, cx);
+            });
+        });
+        let box_value =
+            cx.update(|_w, cx| app.read(cx).search_state.read(cx).value().to_string());
+        assert_eq!(box_value, "编辑", "输入框文本应为干净中文（组合替换不追加）");
+        // 防抖期满提交 → 扫描查询词同样是干净中文
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+        let committed = cx.update(|_w, cx| app.read(cx).search_committed.clone());
+        assert_eq!(committed, "编辑", "防抖提交的扫描词应是干净中文而非拼音拼接");
     }
 
     /// 零选项卡欢迎页（回归 1）：正文区整屏渲染欢迎页——插图（160×120）、主/副文案、
@@ -1228,6 +1365,9 @@
             let input = app.read(cx).search_state.clone();
             input.update(cx, |s, cx| s.set_value("zzz-无匹配", window, cx));
         });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         for _ in 0..6 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -1242,6 +1382,9 @@
             let input = app.read(cx).search_state.clone();
             input.update(cx, |s, cx| s.set_value("hello", window, cx));
         });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
         for _ in 0..6 {
             cx.run_until_parked();
             let _ = cx.cx.refresh();
@@ -1252,6 +1395,104 @@
             "命中搜索仍应显示结果面板"
         );
         let _ = std::fs::remove_file(&txt);
+    }
+
+    /// 回归：侧边栏搜索「非 ASCII 查询」的零分配重写语义与旧「collect + to_lowercase
+    /// 整串比较」**逐例一致**（防抖用了防重扫、但扫描命中语义必须不变）。对一组含
+    /// 中文/混合大小写/Unicode 折叠边界的语料，逐 (haystack, needle) 比对命中区间。
+    #[test]
+    fn find_ci_non_ascii_semantics_match_old() {
+        use crate::app::sidebar::find_ci;
+        fn find_ci_old(haystack: &str, needle: &str) -> Option<std::ops::Range<usize>> {
+            if needle.is_empty() {
+                return None;
+            }
+            if needle.is_ascii() {
+                let h = haystack.as_bytes();
+                let n = needle.as_bytes();
+                if n.len() > h.len() {
+                    return None;
+                }
+                let first = n[0];
+                let first_alt = if first.is_ascii_alphabetic() {
+                    first ^ 0x20
+                } else {
+                    first
+                };
+                let mut pos = 0usize;
+                while let Some(rel) = memchr::memchr2(first, first_alt, &h[pos..]) {
+                    let at = pos + rel;
+                    if at + n.len() <= h.len() {
+                        let mut ok = true;
+                        for (j, &nb) in n.iter().enumerate().skip(1) {
+                            if h[at + j].to_ascii_lowercase() != nb {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            return Some(at..(at + n.len()));
+                        }
+                    }
+                    pos = at + 1;
+                }
+                return None;
+            }
+            let needle_chars = needle.chars().count();
+            let mut i = 0usize;
+            while i < haystack.len() {
+                let candidate: String = haystack[i..].chars().take(needle_chars).collect();
+                if !candidate.is_empty() && candidate.to_lowercase() == needle {
+                    return Some(i..(i + candidate.len()));
+                }
+                let ch = haystack[i..].chars().next().unwrap();
+                i += ch.len_utf8();
+            }
+            None
+        }
+        let corpus = [
+            "预览编辑测试 内容",
+            "先预览再编辑测试",
+            "编辑预览编辑",
+            "纯中文行：这是预览编辑的示例预览编辑文本",
+            "ABC 预览编辑 xyz",
+            "空行之后\n预览编辑在第二行",
+            "XvVl 大小写 MIXed 预览编辑 MID",
+            "不存在的词 䶮 和结尾 𝄞",
+            "İstanbul 有折叠展开字符的写法",
+            "ẞeta 大写锐 s 折叠为 ß",
+            "单字符行 预",
+            "预",
+            "",
+            "长 needle 超出文本：预览编辑测试无此词",
+            "尾部命中预览编辑",
+        ];
+        let needles = [
+            "预览编辑",
+            "预",
+            "览编",
+            "编辑",
+            "测试",
+            "ıstanbul",
+            "istanbul",
+            "ßeta",
+            "beta",
+            "vvvl",
+            "秀米",
+            "𝄞",
+            "无此词",
+            "alpha",
+        ];
+        for h in corpus {
+            for n in needles {
+                let got = find_ci(h, n);
+                let want = find_ci_old(h, n);
+                assert_eq!(
+                    got, want,
+                    "find_ci 语义回归：haystack={h:?} needle={n:?}（新 {got:?} vs 旧 {want:?}）"
+                );
+            }
+        }
     }
 
     /// 基准：侧边栏搜索「旧每帧全扫 vs 新缓存 + 无分配内核」的代价对比。

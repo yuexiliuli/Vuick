@@ -13,9 +13,10 @@
 //!   代理对内部偏移取字符起点、越界夹到边界；
 //! - 两侧仅通过宿主 trait 的小面差异承载行为差异（是否维护 marked / 组合内
 //!   光标、落地编辑的手段与 undo 意图、`selected_text_range.reversed`），
-//!   **不改变任何一侧的对外行为**：编辑器的合成/确认/编辑/候选、committed 文本
-//!   与 marked 区间语义、光标行为保持原样；单行输入框仍把 `replace_and_mark`
-//!   当普通替换处理。
+//!   **对外行为只在预期差异面变化**：编辑器的合成/确认/编辑/候选、committed 文本
+//!   与 marked 区间语义、光标行为保持原样；单行输入框跟踪 marked（`supports_marked =
+//!   true`）：Windows 组合更新 `None` 区间替换旧组合而非逐键追加（修中文 IME 乱码）、
+//!   提交整体落地，组合内偏移只摆光标、不画组合下划线（见 `crates/ui/src/input.rs`）。
 
 use std::ops::Range;
 
@@ -56,8 +57,9 @@ pub trait ImeTextHost: Sized {
     fn set_marked_bytes(&mut self, range: Option<Range<usize>>);
 
     /// 是否维护 marked（组合下划线 + 组合内光标 `new_selected_range`）。
-    /// 编辑器 = true；单行输入框 = false（不画下划线，`replace_and_mark` 按普通
-    /// 替换处理、忽略组合内光标）——与两侧现状一致。
+    /// 编辑器 = true；单行输入框（`ui::input::InputState`）也 = true（跟踪 marked
+    /// 让 `None` 区间组合更新替换旧组合——修中文 IME「逐键追加」乱码，见
+    /// `crates/ui/src/input.rs`），只是不画组合下划线。
     fn supports_marked(&self) -> bool {
         true
     }
@@ -145,8 +147,8 @@ fn byte_range<H: ImeTextHost>(host: &H, range_utf16: Option<Range<usize>>) -> Ra
 /// `mark = true` 表示组合更新/确认（编辑器侧走 Atomic、维护 marked 并按
 /// `new_selected_range` 摆组合内光标）；`mark = false` 表示直输/提交（编辑器侧
 /// 走 Typing、结束后清 marked，以免下一次组合把已提交文本当成旧 marked 覆盖）。
-/// 单行输入框（`supports_marked = false`）两种都只落地替换，光标由 `apply_edit`
-/// 放到新文本末尾——与现状一致。
+/// 单行输入框（`ui::input::InputState`）同样 `supports_marked = true`（跟踪 marked
+/// ≠ 画下划线），因此两种都正确替换当前组合/选区、提交后清 marked。
 pub fn replace<H: ImeTextHost>(
     host: &mut H,
     range_utf16: Option<Range<usize>>,

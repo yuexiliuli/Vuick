@@ -40,10 +40,11 @@ impl EditorApp {
                 .default_value("")
         });
         let search_state = search.clone();
-        let search_sub = cx.subscribe(&search, |_this, _emitter, ev: &InputEvent, cx| {
-            match ev {
-                InputEvent::Change => cx.notify(),
-            }
+        // 侧边栏搜索输入框：内容变化 → 更新「防抖待提交查询」并即时刷新输入框渲染；
+        // 防抖期满才提交给扫描（连续输入不再每键全量重扫大文档正文）。
+        let search_sub = cx.subscribe(&search, |this, _emitter, _ev: &InputEvent, cx| {
+            let value = this.search_state.read(cx).value().to_string();
+            this.schedule_search_debounce(value, cx);
         });
         // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
         let prefs = UserPrefs::load();
@@ -93,6 +94,9 @@ impl EditorApp {
             pdf_search: None,
             search_scan: None,
             search_scan_count: 0,
+            search_committed: String::new(),
+            search_pending: String::new(),
+            search_debounce_seq: 0,
             open_fast_count: 0,
             open_finish_count: 0,
             open_dialog_calls: 0,

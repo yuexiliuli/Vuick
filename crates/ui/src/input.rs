@@ -8,8 +8,11 @@
 //!
 //! IME 状态机本体已收敛到 `ime`（M2.5 双份合一）：本文件只实现
 //! [`ImeTextHost`] 适配层（byte 语义、`&str` 遍历的 UTF-16 换算、经 `edit_range`
-//! 落地 + 发 `Change`），并**不维护 marked**——单行输入框不画组合下划线，
-//! `replace_and_mark` 按普通替换处理、忽略组合内光标（与收敛前行为一致）。
+//! 落地 + 发 `Change`）。**维护 marked 区间**：Windows 组合更新以
+//! `replace_and_mark_text_in_range(None, …)` 下发（None = 替换当前 marked/选区），
+//! 不跟踪 marked 会把每键组合**追加**到光标后（中文 IME 乱码「拼音历史拼接」）——
+//! 跟踪后组合更新正确替换旧组合、提交整体落地。单行框仍不画组合下划线（Windows IME
+//! 自带组合窗口），组合内偏移只摆光标、不建选区。
 
 use std::ops::Range;
 
@@ -48,6 +51,9 @@ pub struct InputState {
     placeholder: SharedString,
     focus_handle: FocusHandle,
     selection: Range<usize>,
+    /// 组合中（marked）区间（字节）。Windows 组合更新 `range=None` = 替换它；
+    /// 提交/取消后由共享核心清空。单行框不画组合下划线，但必须跟踪以保证「替换不追加」。
+    marked: Option<Range<usize>>,
     element_bounds: Bounds<Pixels>,
 }
 
@@ -59,6 +65,7 @@ impl InputState {
             placeholder: SharedString::default(),
             focus_handle: cx.focus_handle(),
             selection: 0..0,
+            marked: None,
             element_bounds: Bounds::default(),
         }
     }
@@ -94,6 +101,7 @@ impl InputState {
         self.text = value.into();
         let len = self.text.len();
         self.selection = len..len;
+        self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -103,6 +111,7 @@ impl InputState {
         self.text = text.into();
         let len = self.text.len();
         self.selection = len..len;
+        self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -116,12 +125,15 @@ impl InputState {
     }
 
     /// 在指定字节区间替换文本并收敛光标（IME/编辑共用），发 `Change`。
+    /// 任何一次落地都清掉组合态（提交/删除/粘贴都结束组合；组合更新经
+    /// [`ime::replace`] 在 apply 之后重新写回 marked，不受影响）。
     fn edit_range(&mut self, range: Range<usize>, new_text: &str, cx: &mut Context<Self>) {
         let start = range.start.min(self.text.len());
         let end = range.end.min(self.text.len());
         self.text.replace_range(start..end, new_text);
         let caret = start + new_text.len();
         self.selection = caret..caret;
+        self.marked = None;
         cx.emit(InputEvent::Change);
         cx.notify();
     }
@@ -394,8 +406,10 @@ impl Focusable for InputState {
 
 /// 共享 IME 状态机的 byte 语义宿主适配层：内部坐标本来就是 byte，`&str` 遍历
 /// 做 UTF-16 换算（单行框文本小，无需 rope 索引），落地经 `edit_range`（发
-/// `Change`）；**不维护 marked**（`supports_marked = false` → 组合按普通替换、
-/// 忽略组合内光标，与收敛前一致）。
+/// `Change`）。**跟踪 marked**（`supports_marked = true`）：Windows 组合更新
+/// `range=None` 落当前 marked/选区，组合更新替换旧组合、提交整体落地（修中文
+/// IME「逐键追加」乱码）；组合内偏移只摆光标、不建选区（`set_composition_caret`
+/// 覆写），单行框仍不画组合下划线。
 impl ImeTextHost for InputState {
     fn len_utf16(&self) -> usize {
         ime::utf16_len(self.text.as_str())
@@ -422,13 +436,30 @@ impl ImeTextHost for InputState {
     }
 
     fn marked_bytes(&self) -> Option<Range<usize>> {
-        None
+        self.marked.clone()
     }
 
-    fn set_marked_bytes(&mut self, _range: Option<Range<usize>>) {}
+    fn set_marked_bytes(&mut self, range: Option<Range<usize>>) {
+        self.marked = range;
+    }
 
     fn supports_marked(&self) -> bool {
-        false
+        true
+    }
+
+    /// 组合内偏移只摆光标、不建选区（与 WYSIWYG 输入一致）：`None`（Windows）光标
+    /// 落组合末尾，`Some(sel)`（macOS）光标落 sel.start。单行框不显示组合选区。
+    fn set_composition_caret(
+        &mut self,
+        base_byte: usize,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+    ) {
+        let caret = match new_selected_range {
+            Some(sel) => base_byte + ime::utf16_to_byte(new_text, sel.start),
+            None => base_byte + new_text.len(),
+        };
+        self.selection = caret.min(self.text.len())..caret.min(self.text.len());
     }
 
     fn apply_edit(
@@ -500,8 +531,8 @@ impl EntityInputHandler for InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 搜索框不画组合下划线，与 `replace_text_in_range` 等价（共享核心经
-        // `supports_marked = false` 跳过 marked/组合内光标处理）。
+        // 组合更新：`None` 区间 = 替换当前 marked/选区（共享核心跟踪 marked——
+        // 不再逐键追加）；组合内光标经 `set_composition_caret` 只摆光标不建选区。
         ime::replace(self, range, new_text, new_selected_range, true, cx);
     }
 
@@ -845,11 +876,10 @@ mod tests {
         );
     }
 
-    /// IME 组合路径回归（M2.5 收敛护栏）：单行输入框不画组合下划线，
-    /// `replace_and_mark` 按普通替换处理——`None` 区间落到当前选区（框内不跟踪
-    /// marked，组合更新追加到光标后，这与编辑器路径 tracking-marked 不同，是
-    /// 单行输入框现状）；显式 UTF-16 区间精确替换；组合内光标被忽略、光标停在
-    /// 新文本末尾；提交（普通 `replace_text_in_range`）结束组合。
+    /// IME 组合路径回归（M2.5 收敛护栏 + 中文 IME 修复）：单行输入框跟踪 marked，
+    /// `None` 区间 = 替换当前 marked/选区——组合更新**替换旧组合不追加**（修中文
+    /// IME「逐键追加」乱码，与编辑器/WYSIWYG 一致）；显式 UTF-16 区间精确替换；
+    /// 组合内偏移只摆光标；提交（普通 `replace_text_in_range`）整体落地并结束组合。
     #[gpui::test]
     async fn input_ime_composition_treated_as_replace(cx: &mut TestAppContext) {
         let (input, wcx, changes) = add_input(cx, "ab");
@@ -857,12 +887,12 @@ mod tests {
             input.update(cx, |s, cx| {
                 // None 区间 = 当前 marked/选区：无 marked → 光标处插入
                 s.replace_and_mark_text_in_range(None, "中", None, window, cx);
-                // 第二次组合更新仍 None：框内不跟踪 marked → 追加到光标后
+                // 第二次组合更新仍 None：替换旧 marked（不追加！）
                 s.replace_and_mark_text_in_range(None, "文", None, window, cx);
                 // 显式 UTF-16 区间（macOS 风格 marked range）：精确替换 utf16[1..4]
-                // （=“b中文”，含代理对粒度换算，非字节偏移）
+                // （=“b文”，含代理对粒度换算，非字节偏移）
                 s.replace_and_mark_text_in_range(Some(1..4), "国", None, window, cx);
-                // 提交：普通置换成组合也结束（marked 清理在核心统一处理）
+                // 提交：普通替换落当前 marked 并结束组合（marked 清理在核心统一处理）
                 s.replace_text_in_range(None, "界", window, cx);
             });
         });
@@ -872,9 +902,46 @@ mod tests {
                 input.read(cx).selection.clone(),
             )
         });
-        // 轨迹：ab → ab中 → ab中文 → a国（utf16[1..4]=“b中文”被“国”替换）→ a国界
-        assert_eq!(value, "a国界");
-        assert_eq!(caret, "a国界".len().."a国界".len(), "光标停在提交文本末尾");
+        // 轨迹：ab → ab中（marked 替换）→ ab文 → a国（utf16[1..4]=“b文”被“国”替换）
+        // → a界（提交替换 marked）
+        assert_eq!(value, "a界");
+        assert_eq!(caret, "a界".len().."a界".len(), "光标停在提交文本末尾");
         assert_eq!(*changes.borrow(), 4, "组合每步与提交各发一次 Change");
+    }
+
+    /// 复现：侧边栏搜索框中文 IME「逐键追加乱码」——用户输「编辑」输入框出现
+    /// 「bbibi'abianbian'jbian'ji编辑」。Windows IME 组合更新走
+    /// `replace_and_mark_text_in_range(None, 组合串, …)`、提交走
+    /// `replace_text_in_range(None, 已提交中文)`（见 gpui_windows `handle_ime_composition_inner`）。
+    /// `None` 区间 = 当前 marked/选区：若输入框不跟踪 marked，每键组合**追加**到光标
+    /// 后而非替换旧组合，提交又拼一段中文。断言：组合替换不追加、提交后只剩中文。
+    #[gpui::test]
+    async fn input_ime_chinese_composition_does_not_stack(cx: &mut TestAppContext) {
+        let (input, wcx, changes) = add_input(cx, "");
+        wcx.update(|window, cx| {
+            input.update(cx, |s, cx| {
+                // Windows IME 组合更新序列：每键重发**完整**组合串（range=None）
+                s.replace_and_mark_text_in_range(None, "b", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi'a", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bi'an", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bian'j", None, window, cx);
+                s.replace_and_mark_text_in_range(None, "bian'ji", None, window, cx);
+                // 确认：提交中文（range=None），组合应被整体替换
+                s.replace_text_in_range(None, "编辑", window, cx);
+            });
+        });
+        let (value, caret) = wcx.update(|_w, cx| {
+            (
+                input.read(cx).value().to_string(),
+                input.read(cx).selection.clone(),
+            )
+        });
+        assert_eq!(
+            value, "编辑",
+            "组合应逐键替换不追加，提交后只剩中文（而非拼音历史拼接）"
+        );
+        assert_eq!(caret, "编辑".len().."编辑".len(), "光标停在提交文本末尾");
+        assert_eq!(*changes.borrow(), 7, "组合每步与提交各发一次 Change");
     }
 }
