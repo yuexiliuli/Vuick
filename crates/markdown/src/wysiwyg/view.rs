@@ -545,7 +545,9 @@ impl WyEditor {
         let shift = self.reading_col_shift(elem_w);
         gpui::point(origin.x + px(shift), origin.y)
     }
-    pub(crate) fn content_gen(&self) -> u64 {
+    /// 内容结构版本：任何内容变更（编辑/换源/整篇安装）递增，O(1)。
+    /// 侧边栏 TOC 缓存的失效依据（与条目缓存 `toc_cache` 同键，见 [`WyEditor::toc_entries`]）。
+    pub fn content_gen(&self) -> u64 {
         self.content_gen.get()
     }
     pub(crate) fn set_shape_band(&self, band: Option<(f32, f32)>) {

@@ -37,6 +37,17 @@ pub(crate) struct SidebarChromeState {
     pub(crate) toc_collapsed: std::collections::HashSet<usize>,
     /// 侧边栏目录折叠集合对应的选项卡下标（切换文档即失效清空）。
     pub(crate) toc_tab: Option<usize>,
+    /// 目录滚动句柄：`#sidebar-toc-scroll` 经 `track_scroll` 跟踪，虚拟化按偏移只物化可视带。
+    pub(crate) toc_vscroll: gpui::ScrollHandle,
+    /// 目录自适应宽缓存 `(选项卡下标, 编辑版本, WyEditor 内容代号, 宽)`：内容没变只算一次，
+    /// 禁逐帧 O(N) 全量测宽（大文档上万标题下每帧重扫 = 卡死热源之一）。
+    pub(crate) toc_width: Option<(usize, u64, u64, f32)>,
+    /// 目录条目缓存 `(选项卡下标, 编辑版本, WyEditor 内容代号, 条目, 可见条目下标, 跳转目标)`：
+    /// 宿主/内容/折叠没变逐帧 O(1) 复用（虚拟化只物化可视带，不再每帧全量物化万级条目）。
+    /// 内容代号 = `WyEditor::content_gen`：预览关/重装（换实体）与整篇换源（同实体 in-place
+    /// 喂料）都使其失效重建，避免渲染上一版条目。
+    pub(crate) toc_cache:
+        Option<(usize, u64, u64, markdown::wysiwyg::TocEntries, Vec<usize>, MdTocScroll)>,
     /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
     pub(crate) width: f32,
     /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。
@@ -46,6 +57,11 @@ pub(crate) struct SidebarChromeState {
     /// 侧边栏右缘是否被鼠标悬停（悬停时高亮提示可拖拽）。
     pub(crate) resize_hovered: bool,
 }
+
+/// 目录条目总数超过此值才启用列表虚拟化（普通小文档仍全量渲染，行为不变）。
+const TOC_VIRTUALIZE_MIN: usize = 200;
+/// 可视带外上下各缓冲的条目行数（提前物化，滚动不闪烁）。
+const TOC_BAND_BUFFER: usize = 8;
 
 impl SidebarChromeState {
     /// 切换视图：未在该面板 → 展开并切到；已在该面板再点 → 只收起面板。
@@ -421,6 +437,8 @@ impl EditorApp {
         if !self.sidebar.toc_collapsed.remove(&idx) {
             self.sidebar.toc_collapsed.insert(idx);
         }
+        // 折叠集变更 → 可见性缓存作废（下帧按新折叠重建可见条目表）。
+        self.sidebar.toc_cache = None;
         cx.notify();
     }
 
@@ -506,14 +524,32 @@ impl EditorApp {
             self.sidebar.toc_tab = Some(active);
             self.sidebar.toc_collapsed.clear();
             self.sidebar.width_auto = true;
+            self.sidebar.toc_width = None;
+            self.sidebar.toc_cache = None;
         }
 
-        // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）
-        if self.sidebar.width_auto
-            && let Some(w) = self.compute_sidebar_toc_width(cx) {
+        // 目录视图自适应宽：按当前文档最宽目录条目估算（未手动拖拽时）。
+        // 按 (选项卡, 编辑版本, WyEditor 内容代号) 缓存：内容没变只算一次，禁逐帧 O(N) 全量测宽。
+        if self.sidebar.width_auto {
+            let tab = self.tabs.get(active);
+            let ver = tab.map(|t| t.edit_version).unwrap_or(0);
+            let cg = tab
+                .and_then(|t| t.md_wy.as_ref())
+                .map(|wy| wy.read(cx).content_gen())
+                .unwrap_or(0);
+            let cached = self
+                .sidebar
+                .toc_width
+                .as_ref()
+                .is_some_and(|(ti, v, g, _)| *ti == active && *v == ver && *g == cg);
+            if !cached
+                && let Some(w) = self.compute_sidebar_toc_width(cx)
+            {
+                self.sidebar.toc_width = Some((active, ver, cg, w));
                 self.sidebar.width = (config::layout::SIDEBAR_ACTIVITY_W + w + 12.0)
                     .clamp(config::layout::SIDEBAR_WIDTH_MIN, config::layout::SIDEBAR_WIDTH_MAX);
             }
+        }
 
         let inner: gpui::AnyElement = match self.tabs.get(self.active_tab) {
             Some(tab) => {
@@ -537,13 +573,91 @@ impl EditorApp {
                     }
                 } else {
                     // Markdown 标题（P4-2：MD / EPUB 目录都来自统一 WyEditor 宿主）。
-                    match self.md_toc_source(cx) {
-                        Some((entries, scroll)) if !entries.is_empty() => {
+                    let tab = self.tabs.get(active);
+                    let ver = tab.map(|t| t.edit_version).unwrap_or(0);
+                    let wy = tab.and_then(|t| t.md_wy.as_ref());
+                    let cg = wy.map(|wy| wy.read(cx).content_gen()).unwrap_or(0);
+                    // 条目 + 可见性 + 跳转目标按 (选项卡, 编辑版本, WyEditor 宿主 + 内容代号)
+                    // 缓存：内容/折叠没变逐帧 O(1) 复用，大文档不再每帧全量克隆条目/重扫。
+                    // 命中需宿主同一 + 内容代号同一：预览关/重装（md_wy 换实体）与整篇换源
+                    //（同实体 in-place 喂料，edit_version 不变）都作废重建，不渲染上一版条目。
+                    let cache_ok = match &self.sidebar.toc_cache {
+                        Some((ti, v, g, _, _, scroll))
+                            if *ti == active && *v == ver && *g == cg =>
+                        {
+                            match scroll {
+                                MdTocScroll::Unified(cached_wy) => wy == Some(cached_wy),
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !cache_ok {
+                        // 内容变更/切换文档 → 重建条目 + 可见性表（一次性，逐帧 O(1) 复用）；
+                        // 无 wy / 空目录 → 显式清缓存落空态分支，避免渲染到上一版条目。
+                        match self.md_toc_source(cx) {
+                            Some((entries, scroll)) if !entries.is_empty() => {
+                                let levels: Vec<usize> =
+                                    entries.iter().map(|&(_, l, _)| l as usize).collect();
+                                let vis = toc::toc_visibility(&levels, &collapsed);
+                                let visible: Vec<usize> = vis
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(i, &v)| v.then_some(i))
+                                    .collect();
+                                self.sidebar.toc_cache =
+                                    Some((active, ver, cg, entries, visible, scroll));
+                            }
+                            _ => self.sidebar.toc_cache = None,
+                        }
+                    }
+                    match &self.sidebar.toc_cache {
+                        Some((_, _, _, entries, visible, scroll)) if !entries.is_empty() => {
+                            let total = visible.len();
+                            // 虚拟化：只物化可视带 + 上下 M 行缓冲；带外以等高 spacer 占位
+                            //（总高恒为 visible × 行高，滚动量程/命中稳定）。普通小文档全量。
+                            let (start, end) = if total <= TOC_VIRTUALIZE_MIN {
+                                (0usize, total)
+                            } else {
+                                let vhand = &self.sidebar.toc_vscroll;
+                                let offset = (-vhand.offset().y).max(px(0.)).as_f32();
+                                let viewport_h = vhand.bounds().size.height.as_f32();
+                                // 首帧容器尚未布局（高度 0）→ 退化为固定视口估计（只多物化几行）。
+                                let vh = if viewport_h > 0.0 {
+                                    viewport_h
+                                } else {
+                                    700.0
+                                };
+                                let first = (offset / toc::TOC_ROW_H) as usize;
+                                let last = ((offset + vh) / toc::TOC_ROW_H) as usize + 1;
+                                let start = first.saturating_sub(TOC_BAND_BUFFER);
+                                let end = (last + TOC_BAND_BUFFER).min(total);
+                                // 折叠后条目大减时偏移可能越界：钳制空带。
+                                (start.min(end), end.max(start))
+                            };
                             let rows = self.sidebar_toc_md_rows(
-                                window, &entries, &collapsed, fg, muted, active_bg, accent,
-                                scroll, cx,
+                                window, entries, &visible[start..end], &collapsed, fg, muted,
+                                active_bg, accent, scroll.clone(), cx,
                             );
-                            div().flex().flex_col().py_1().children(rows).into_any_element()
+                            let (top_h, bottom_h) = (
+                                start as f32 * toc::TOC_ROW_H,
+                                (total - end) as f32 * toc::TOC_ROW_H,
+                            );
+                            div()
+                                .flex()
+                                .flex_col()
+                                .py_1()
+                                .child(if top_h > 0.0 {
+                                    div().h(px(top_h)).into_any_element()
+                                } else {
+                                    div().into_any_element()
+                                })
+                                .children(rows)
+                                .child(if bottom_h > 0.0 {
+                                    div().h(px(bottom_h)).into_any_element()
+                                } else {
+                                    div().into_any_element()
+                                })
+                                .into_any_element()
                         }
                         _ => ui::empty_state::compact_empty_state(
                             "sidebar-toc-empty",
@@ -581,6 +695,8 @@ impl EditorApp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    // 虚拟化依据：`toc_vscroll` 跟踪本容器的滚动偏移/视口高（跨帧稳定）。
+                    .track_scroll(&self.sidebar.toc_vscroll)
                     .py_1()
                     .child(inner),
             )
@@ -655,6 +771,8 @@ impl EditorApp {
     }
 
     /// Markdown 标题目录条目（可折叠树；可见性按当前折叠集合过滤）。
+    /// **虚拟化**：`visible` = 调用方算好的「待物化条目下标」（可视带切片，非全量），
+    /// 只物化带内条目，大文档不再每帧全量实例化万级元素。
     /// P4-2：`scroll` 跳转目标 = 右栏 WyEditor 只读预览（源码行）`scroll_to_line`；
     ///（`MarkdownPreview` 的 `Legacy` 渲染行目标已随引擎删除。）
     #[allow(clippy::too_many_arguments)] // 四色 + 数据源 + 折叠集，与 toc_item_frame 同构
@@ -662,6 +780,7 @@ impl EditorApp {
         &self,
         window: &mut Window,
         entries: &[(usize, u8, SharedString)],
+        visible: &[usize],
         collapsed: &std::collections::HashSet<usize>,
         fg: gpui::Hsla,
         muted: gpui::Hsla,
@@ -671,12 +790,9 @@ impl EditorApp {
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let levels: Vec<usize> = entries.iter().map(|&(_, l, _)| l as usize).collect();
-        let visible = toc::toc_visibility(&levels, collapsed);
-        let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (i, &(tgt, lvl, ref text)) in entries.iter().enumerate() {
-            if !visible[i] {
-                continue;
-            }
+        let mut rows: Vec<gpui::AnyElement> = Vec::with_capacity(visible.len());
+        for &i in visible {
+            let (tgt, lvl, ref text) = entries[i];
             let sc = scroll.clone();
             let has_child = toc::toc_node_has_child(&levels, i);
             let is_collapsed = has_child && collapsed.contains(&i);

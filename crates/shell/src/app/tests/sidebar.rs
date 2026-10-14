@@ -452,7 +452,145 @@
         let _ = std::fs::remove_file(&p);
     }
 
-    /// 回归：侧边栏「目录」视图的条目应带 PDF 书签目录同款样式——
+    /// 大文档目录虚拟化回归：万级标题点「目录」不再整棵物化——
+    /// 1. 只物化可视带 + 缓冲（末尾条目在元素树中不存在）；
+    /// 2. 滚动后可视带随偏移迁移（顶部条目出带、中部条目入带）；
+    /// 3. 带内条目可折叠（折叠父项 → 后代隐藏、缓存失效重建）且可点击跳转。
+    /// 用合成大文档（1200 个标题 > 虚拟化阈值 200）走真实渲染路径。
+    #[gpui::test]
+    async fn sidebar_toc_many_headings_virtualized(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-toc-virt-{}.md", std::process::id()));
+        let mut doc = String::new();
+        for i in 0..600 {
+            doc.push_str(&format!("# 第{i}章\n## 小节{i}\n正文段落 {i}。\n\n"));
+        }
+        std::fs::write(&p, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+
+        // 顶部可见带已物化；第 1000 个条目（远在带外）不得出现在元素树中（虚拟化生效）。
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-0").is_some()
+                && cx.debug_bounds("sidebar-toc-md-5").is_some(),
+            "可视带顶部条目应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1000").is_none(),
+            "虚拟化：带外（第 1000 个）条目不应被物化"
+        );
+
+        // 滚动到中部（≈1000px）→ 可视带迁移：顶部条目出带、中部条目入带。
+        // （原生滚动位移在同帧 prepaint 落位，测试轮询至带稳定，防一帧竞态。）
+        let vhand = cx.update(|_, cx| app.read(cx).sidebar.toc_vscroll.clone());
+        cx.update(|_w, _cx| {
+            vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(-1000.)));
+        });
+        let mut moved = false;
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            if cx.debug_bounds("sidebar-toc-md-0").is_none()
+                && cx.debug_bounds("sidebar-toc-md-40").is_some()
+            {
+                moved = true;
+                break;
+            }
+        }
+        assert!(
+            moved,
+            "滚动后可视带应迁移：顶部条目出带、中部条目入带"
+        );
+
+        // 回到顶部：折叠第一章（有 ## 子节）→ 后代隐藏、可见性缓存重建；
+        // 再展开 → 恢复。
+        cx.update(|_w, _cx| {
+            vhand.set_offset(gpui::point(gpui::px(0.), gpui::px(0.)));
+        });
+        let mut at_top = false;
+        for _ in 0..12 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+            if cx.debug_bounds("sidebar-toc-md-0").is_some() {
+                at_top = true;
+                break;
+            }
+        }
+        assert!(at_top, "滚回顶部后顶部条目应回到可视带");
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| app.toggle_sidebar_toc_collapse(0, cx));
+        });
+        for _ in 0..4 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1").is_none()
+                && cx.debug_bounds("sidebar-toc-md-0").is_some()
+                && cx.debug_bounds("sidebar-toc-md-2").is_some(),
+            "折叠第一章后其 ## 小节隐藏、其余顶级条目不收影响"
+        );
+        cx.update(|_w, cx| {
+            app.update(cx, |app, cx| app.toggle_sidebar_toc_collapse(0, cx));
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1").is_some(),
+            "展开第一章后其 ## 小节恢复"
+        );
+
+        // 带内条目点击 → 右栏 WyEditor 预览滚动到对应标题（虚拟化带宽内命中可用）。
+        let vhand_wy = cx.update(|_, cx| {
+            let a = app.read(cx);
+            a.tabs[a.active_tab].md_wy_vscroll.clone()
+        });
+        let before = cx.update(|_w, _cx| (-vhand_wy.offset().y).as_f32());
+        let row = cx
+            .debug_bounds("sidebar-toc-md-2")
+            .expect("可视带内条目应可点击");
+        let pt = gpui::Point::new(row.left() + px(6.), row.top() + px(2.));
+        cx.simulate_click(pt, Default::default());
+        for _ in 0..8 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let after = cx.update(|_w, _cx| (-vhand_wy.offset().y).as_f32());
+        assert!(
+            after > before + 1.0,
+            "点击可视带条目应滚动右栏预览（{before:.0} → {after:.0}px）"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
     /// 有子级的条目渲染折叠箭头，点击折叠后隐藏其后代标题，再点恢复。
     #[gpui::test]
     async fn sidebar_toc_pdf_style_collapsible(cx: &mut TestAppContext) {

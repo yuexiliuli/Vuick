@@ -179,6 +179,76 @@
         println!("【C. 前 3 次 refresh 合计】 {} ms", tb.elapsed().as_millis());
     }
 
+    /// A4 基准（ignored）：大文档「目录」视图的卡顿拆解。
+    /// 真实 `fixtures/大文档测试2.md`（6.4MB / ~10 万行 / ~1.6 万标题）。等右栏 WY 就绪后：
+    /// 1. 点活动栏「目录」打开面板并重绘首帧耗时（用户报告「点目录卡死」的那一刻）；
+    /// 2. 目录常开时的逐帧 refresh 耗时（观察是否每帧全量物化上万条目）。
+    /// 运行：`cargo test -p shell -- --ignored bench_toc_open_large_md --nocapture`（debug）
+    #[gpui::test]
+    #[ignore]
+    async fn bench_toc_open_large_md(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = r"../../fixtures/大文档测试2.md";
+        assert!(std::path::Path::new(p).is_file(), "{p} 缺失");
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p, window, cx));
+        });
+        let mut wy_ready = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            wy_ready = cx.update(|_, cx| {
+                let a = app.read(cx);
+                let i = a.tabs.len().saturating_sub(1);
+                a.tabs[i]
+                    .md_wy
+                    .as_ref()
+                    .map(|w| w.read(cx).is_loaded())
+                    .unwrap_or(false)
+            });
+            if wy_ready {
+                break;
+            }
+        }
+        assert!(wy_ready, "右栏 WY 预览未就绪");
+        // 预热（编辑器/预览本体首帧布局，排除在 TOC 计时外）
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+        }
+        // 1) 点「目录」打开面板 + 首帧重绘
+        let t0 = std::time::Instant::now();
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        cx.run_until_parked();
+        let _ = cx.cx.refresh();
+        let open_ms = t0.elapsed().as_millis();
+        println!("【TOC 首帧开启】(debug) {open_ms} ms");
+        // 已物化/可命中的末尾条目抽样（第 15000 个标题：全量物化才存在）
+        let far = cx.debug_bounds("sidebar-toc-md-15000");
+        println!(
+            "【末尾条目 sidebar-toc-md-15000 已物化】 {}",
+            far.is_some()
+        );
+        // 2) 常开时逐帧成本
+        let mut per_frame: Vec<u128> = Vec::new();
+        for _ in 0..5 {
+            let tf = std::time::Instant::now();
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            per_frame.push(tf.elapsed().as_millis());
+        }
+        println!("【TOC 常开逐帧 refresh】(debug) {per_frame:?} ms");
+    }
+
     /// A3 基准（ignored，release）：大文档「增量桥」的真实成本拆解（真实 6.4MB / 139k 行）：
     /// 1. 桥模型成本 = 直接对装配好的 WyEditor 逐键 `preview_apply_edit`（= undo/redo 的
     ///    `apply_raw_edit` 增量管线：Doc::edit + Pass1 + derived + 单块作废），应亚毫秒；

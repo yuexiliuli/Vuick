@@ -16,6 +16,10 @@ use gpui::{
 use ui::icon::{Icon, IconName};
 use ui::motion::hover_spring;
 
+/// 单条目录行的固定高（px）：与条目自然布局高度一致（shell 侧边栏实测 31px），
+/// 侧边栏 TOC 虚拟化按此做等高滚动间距（可视带 + 上下 spacer 严格对齐）。
+pub const TOC_ROW_H: f32 = 31.0;
+
 /// 断言 pre-order 条目 `idx` 是否有下级（可折叠）：紧邻下一项层级更深即有子项。
 pub fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {
     levels
@@ -90,6 +94,7 @@ pub fn toc_item_frame(
         .pl(px(6. + level as f32 * 14.))
         .pr(px(8.))
         .py(px(5.))
+        .h(px(TOC_ROW_H))
         .w_full()
         .relative()
         .flex()
