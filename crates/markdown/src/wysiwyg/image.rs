@@ -1,5 +1,7 @@
 use super::*;
 
+use std::ops::Range;
+
 use gpui::{AppContext, Pixels};
 
 /// WyEditor 图片缓存 / 图片编辑卡片（M2.1 自 mod.rs 拆出）。
@@ -195,10 +197,18 @@ impl WyEditor {
     pub(crate) fn selected_image(&self) -> Option<usize> {
         self.selected_image.get()
     }
-    /// 图片编辑卡片当前锚定的图片行；`None` = 卡片未打开。（测试访问器）
+    /// 当前悬浮的**行内**图片（`Some(InlineImageRef)` 时该行内图右上角浮现编辑按钮）。
+    pub(crate) fn hover_inline_image(&self) -> Option<InlineImageRef> {
+        self.hover_inline_image.get()
+    }
+    /// 当前选中的**行内**图片（`Some(InlineImageRef)` 时该行内图画 accent 描边 + 按钮常显）。
+    pub(crate) fn selected_inline_image(&self) -> Option<InlineImageRef> {
+        self.selected_inline_image.get()
+    }
+    /// 图片编辑卡片当前锚定的图片**所在源码行**；`None` = 卡片未打开。（测试访问器）
     #[cfg(test)]
     pub(crate) fn image_edit_src_line(&self) -> Option<usize> {
-        self.image_edit.as_ref().map(|p| p.src_line)
+        self.image_edit.as_ref().map(|p| p.target.src_line())
     }
     /// 卡片是否打开。（测试访问器）
     #[cfg(test)]
@@ -226,11 +236,35 @@ impl WyEditor {
         crate::markdown::parse::parse_image_line(raw.trim())
     }
 
-    /// 打开 / 切换到 `src_line` 图片行的编辑卡片（仅可编辑模式）。输入框以当前
-    /// alt / src 预填，打开后焦点落在「链接」输入框。已在同一行 → 关闭。
+    /// 编辑卡目标的当前 `(alt, src)`：独立图片行反解整行 `![…](…)`；行内图解析该图
+    /// `![…](…)` 段（`refd.start` 起的源区间）。解析失败 → `None`。
+    fn image_target_alt_src(&self, target: ImageEditTarget) -> Option<(String, String)> {
+        match target {
+            ImageEditTarget::Block { src_line } => self.image_line_alt_src(src_line),
+            ImageEditTarget::Inline(refd) => {
+                let raw = self.line_text(refd.src_line);
+                if refd.start >= raw.len() || raw.as_bytes().get(refd.start) != Some(&b'!') {
+                    return None;
+                }
+                let tail = &raw[refd.start..];
+                let (_, srcr) =
+                    crate::markdown::parse::inline_style::inline_image_spans(tail)
+                        .into_iter()
+                        .next()?;
+                // alt 在 `![` 与 `]` 之间。
+                let rb = tail.as_bytes()[2..].iter().position(|&b| b == b']')?;
+                let alt = tail[2..2 + rb].to_string();
+                let src = tail[srcr].to_string();
+                Some((alt, src))
+            }
+        }
+    }
+
+    /// 打开 / 切换到目标图片的编辑卡片（仅可编辑模式；块图 / 行内图共用同一卡片表单）。
+    /// 输入框以当前 alt / src 预填，打开后焦点落在「链接」输入框。已同一目标 → 关闭。
     pub(crate) fn open_image_edit(
         &mut self,
-        src_line: usize,
+        target: ImageEditTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -240,16 +274,19 @@ impl WyEditor {
         if self
             .image_edit
             .as_ref()
-            .is_some_and(|cur| cur.src_line == src_line)
+            .is_some_and(|cur| cur.target == target)
         {
             self.close_image_edit(cx);
             return;
         }
-        let Some((alt, src)) = self.image_line_alt_src(src_line) else {
+        let Some((alt, src)) = self.image_target_alt_src(target) else {
             return;
         };
         // 打开编辑卡片也视为选中该图片（描边 + 按钮常显，与点图本体同效果）。
-        self.selected_image.set(Some(src_line));
+        match target {
+            ImageEditTarget::Block { src_line } => self.selected_image.set(Some(src_line)),
+            ImageEditTarget::Inline(refd) => self.selected_inline_image.set(Some(refd)),
+        }
         let link = cx.new(|cx| {
             ui::input::InputState::new(window, cx)
                 .placeholder("图片链接（URL / 本地相对路径）")
@@ -261,7 +298,7 @@ impl WyEditor {
                 .default_value(alt)
         });
         self.image_edit = Some(ImageEditPopup {
-            src_line,
+            target,
             link,
             text,
         });
@@ -296,15 +333,38 @@ impl WyEditor {
         let card_w = element::IMAGE_EDIT_CARD_W;
         let content_w = (f32::from(f.width) - f32::from(f.padding) * 2.).max(1.);
         let l = f32::from(f.padding) + ((content_w - card_w) / 2.).max(0.);
-        let row_top = f
-            .rows
-            .iter()
-            .find(|r| r.src_line == popup.src_line && r.kind == crate::markdown::ir::IrKind::Image)
-            .map(|r| f32::from(r.top))
-            .unwrap_or_else(|| {
-                let blk = f.block_index_for_src_line(popup.src_line).unwrap_or(0);
-                f.block_top(blk)
-            });
+        let src_line = popup.target.src_line();
+        // 行内目标：锚到该行内图的**实际顶部**（行内图可能在折行段落中部，用行顶会让
+        // 卡片远离图片）；块目标：锚到图片行顶。都带「块顶」兜底（带外/未物化行）。
+        let row_top = match popup.target {
+            ImageEditTarget::Block { .. } => f
+                .rows
+                .iter()
+                .find(|r| r.src_line == src_line && r.kind == crate::markdown::ir::IrKind::Image)
+                .map(|r| f32::from(r.top))
+                .unwrap_or_else(|| f.block_top(f.block_index_for_src_line(src_line).unwrap_or(0))),
+            ImageEditTarget::Inline(refd) => f
+                .rows
+                .iter()
+                // 行内图可能落在**折行续行**（同 `src_line` 多行）——必须精确到含该图的行，
+                // 否则 `.find` 只取首行会把卡片锚到段顶（远离图片）。
+                .find(|r| {
+                    r.src_line == src_line
+                        && r.extra
+                            .inline_images
+                            .iter()
+                            .any(|ii| ii.display_off == refd.display_off)
+                })
+                .and_then(|r| {
+                    r.extra
+                        .inline_images
+                        .iter()
+                        .find(|ii| ii.display_off == refd.display_off)
+                        .and_then(|ii| element::inline_image_box_local(f, r, ii))
+                        .map(|b| f32::from(b.top()))
+                })
+                .unwrap_or_else(|| f.block_top(f.block_index_for_src_line(src_line).unwrap_or(0))),
+        };
         Some(point(
             px(f32::from(origin.x) + l),
             px(f32::from(origin.y) + row_top),
@@ -356,23 +416,109 @@ impl WyEditor {
         }
     }
 
-    /// 保存图片编辑卡片：以输入框值改写 `![alt](src)` → `![新文本](新链接)`。
-    /// 写入走 `replace_range`（撤销栈统一），随后关闭卡片。
+    /// 保存图片编辑卡片：以输入框值改写 `![alt](src)` → `![新文本](新链接)`（块图整行 /
+    /// 行内图只改该段）。写入走 `replace_range`（撤销栈统一），随后关闭卡片。
     pub(crate) fn save_image_edit(&mut self, cx: &mut Context<Self>) {
         let Some(popup) = self.image_edit.as_ref() else {
             return;
         };
-        let src_line = popup.src_line;
+        let target = popup.target;
         let link_text = popup.link.read(cx).value().to_string();
         let text_text = popup.text.read(cx).value().to_string();
         let saved = !link_text.is_empty();
-        self.apply_image_line_edit(
-            src_line,
-            text_text,
-            if saved { link_text } else { "".into() },
-            cx,
-        );
+        match target {
+            ImageEditTarget::Block { src_line } => self.apply_image_line_edit(
+                src_line,
+                text_text.clone(),
+                if saved { link_text.clone() } else { "".into() },
+                cx,
+            ),
+            ImageEditTarget::Inline(refd) => self.apply_inline_image_edit(
+                refd,
+                text_text,
+                if saved { link_text } else { "".into() },
+                cx,
+            ),
+        }
         self.close_image_edit(cx);
+    }
+
+    /// 点击行内图片**本体** → 选中该图：清除文本选区/拖选，选中态独立于指针（移开后
+    /// 编辑按钮仍在，画 accent 描边）。再次点击同一图保持选中（不产生文本选区）。
+    /// 与 [`Self::select_image`]（块图）同语义。
+    pub(crate) fn select_inline_image(&mut self, refd: InlineImageRef, cx: &mut Context<Self>) {
+        self.selected_inline_image.set(Some(refd));
+        self.sel_anchor = None;
+        self.dragging = false;
+        *self.frame.borrow_mut() = None;
+        cx.notify();
+    }
+
+    /// 行内图 `![…](…)` 的**绝对源字节区间**（`!` 起、`)` 后一字节止）及旧 src。
+    /// 由 `refd.start` 从源码反解（源码系身份，无需帧；行已变/解析失败 → `None`）。
+    pub(crate) fn inline_image_source_range_of(
+        &self,
+        refd: InlineImageRef,
+    ) -> Option<(Range<usize>, String)> {
+        let raw = self.line_text(refd.src_line);
+        if refd.start >= raw.len() || raw.as_bytes().get(refd.start) != Some(&b'!') {
+            return None;
+        }
+        let tail = &raw[refd.start..];
+        let (full, srcr) = crate::markdown::parse::inline_style::inline_image_spans(tail)
+            .into_iter()
+            .next()?;
+        let span = refd.start + full.start..refd.start + full.end;
+        if span.end > raw.len() {
+            return None;
+        }
+        // `apply_edit`/`replace_range` 按**整篇源**字节操作（块图 `delete_selected_image`
+        // 用 `line_start` 归位同式）——这里把行内相对偏移落到**全局**字节（`refd.start`
+        // 是行内偏移；仅第 0 行两者相等，非首行会删错字节，M6 回归测试锁过）。
+        let ls = self.line_start(refd.src_line);
+        Some((ls + span.start..ls + span.end, tail[srcr].to_string()))
+    }
+
+    /// 删除选中的整段行内 `![…](…)`（保留行内其它文本，含换行归位；撤销栈统一）。
+    /// 删除后关闭编辑卡片、清除悬浮/选中态。
+    pub(crate) fn delete_selected_inline_image(
+        &mut self,
+        refd: InlineImageRef,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_inline_image.set(None);
+        self.image_edit = None;
+        self.hover_inline_image.set(None);
+        if let Some((span, _)) = self.inline_image_source_range_of(refd) {
+            self.apply_edit(span, "", cx);
+        } else {
+            self.sel_anchor = None;
+            *self.frame.borrow_mut() = None;
+            cx.notify();
+        }
+    }
+
+    /// 程序化改写行内 `![…](…)` 的 alt 与 src（**只覆盖该图段**，不碰行内其它文本）。
+    /// 空 `src` 视为保留原 src。供编辑卡片保存 / 程序化测试调用。
+    pub(crate) fn apply_inline_image_edit(
+        &mut self,
+        refd: InlineImageRef,
+        new_alt: String,
+        new_src: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((span, old_src)) = self.inline_image_source_range_of(refd) else {
+            return;
+        };
+        let src = if new_src.is_empty() { old_src } else { new_src };
+        let new_text = format!(
+            "![{}]({})",
+            new_alt.replace(']', "\\]").replace('\n', " "),
+            src.replace('(', "\\(")
+                .replace(')', "\\)")
+                .replace('\n', " ")
+        );
+        self.apply_edit(span, &new_text, cx);
     }
 
     /// 程序化改写第 `src_line` 行独立图片的 alt 与 src（`![alt](src)`）。

@@ -55,8 +55,9 @@ impl WyEditor {
             return;
         }
         // 任何点击都先清除旧图片选中（图片本体/编辑按钮分支随后重新置位）：
-        // 点文本/任务框/链接等 → 图片不再保持选中态。
+        // 点文本/任务框/链接等 → 图片不再保持选中态（块图 + 行内图同步清）。
         self.selected_image.set(None);
+        self.selected_inline_image.set(None);
         // **mermaid 卡点击 → 聚焦**：聚焦后滚轮才缩放该卡（交互见图文，未聚焦时滚轮
         // 一律正常滚动）。点击**任何其它地方**（含选中/链接/任务框）→ 清除聚焦。
         if let Some(mline) = element::mermaid_card_hit(self, f, ev.position) {
@@ -75,7 +76,7 @@ impl WyEditor {
                 && let Some(line) = element::image_edit_button_hit_at(self, f, ev.position)
             {
                 drop(marker);
-                self.open_image_edit(line, window, cx);
+                self.open_image_edit(ImageEditTarget::Block { src_line: line }, window, cx);
                 return;
             }
             // 图片调整条（右中边缘）：按住 → 开始拖拽改宽（保持宽高比、不改源码）。
@@ -111,6 +112,26 @@ impl WyEditor {
                 drop(marker);
                 self.focus.focus(window, cx);
                 self.select_image(line, cx);
+                return;
+            }
+            // 行内图片编辑按钮（右上角「⋮」）：仅可编辑模式——点击 → 打开/切换/关闭
+            // 编辑卡片（不落光标、不进入选区）。只读预览不响应。
+            if self.editable
+                && let Some(refd) = element::inline_image_edit_button_hit_at(self, f, ev.position)
+            {
+                drop(marker);
+                self.open_image_edit(ImageEditTarget::Inline(refd), window, cx);
+                return;
+            }
+            // 点击行内图片**本体**（alt 显示区）→ 选中该图：不落光标进 alt（修掉
+            // 「点行内图 → 闪烁光标落在图上」）；再点同一图保持选中（不产生文本选区）。
+            // 与块图「点击图片本体」同语义（顶部已清旧图片选中，这里重新置位）。
+            if self.editable
+                && let Some(refd) = element::inline_image_hit_at(self, f, ev.position)
+            {
+                drop(marker);
+                self.focus.focus(window, cx);
+                self.select_inline_image(refd, cx);
                 return;
             }
             // 表格横向滚动条（内容超宽的表格底部轨道）：点在**滑块**上 → 拖动；
@@ -339,16 +360,28 @@ impl WyEditor {
         *self.frame.borrow_mut() = None;
         cx.notify();
     }
-    /// 更新图片悬浮态（命中图片盒 → `hover_image`）。未命中（含指针移出元素）置 `None`。
+    /// 更新图片悬浮态（命中图片盒 → `hover_image`；命中行内图显示盒 → `hover_inline_image`）。
+    /// 行内图补一个按钮命中兜底：编辑按钮对**小图**会伸出显示盒外，悬在按钮上也必须
+    /// 亮起按钮（否则点不中）。未命中（含指针移出元素）置 `None`。
     fn update_hover(&mut self, pos: gpui::Point<Pixels>, cx: &mut Context<Self>) {
         let marker = self.frame.borrow();
         let Some(f) = marker.as_ref().map(|r| &**r) else {
             return;
         };
         let hovered = element::image_box_hit_at(self, f, pos);
+        let hovered_inline = element::inline_image_hit_at(self, f, pos)
+            .or_else(|| element::inline_image_edit_button_hit_at(self, f, pos));
         drop(marker);
+        let mut changed = false;
         if self.hover_image.get() != hovered {
             self.hover_image.set(hovered);
+            changed = true;
+        }
+        if self.hover_inline_image.get() != hovered_inline {
+            self.hover_inline_image.set(hovered_inline);
+            changed = true;
+        }
+        if changed {
             cx.notify();
         }
     }
@@ -418,8 +451,9 @@ impl WyEditor {
         let inside_image = b.contains(&ev.position);
         if inside_image {
             self.update_hover(ev.position, cx);
-        } else if self.hover_image.get().is_some() {
+        } else if self.hover_image.get().is_some() || self.hover_inline_image.get().is_some() {
             self.hover_image.set(None);
+            self.hover_inline_image.set(None);
             cx.notify();
         }
         // 注记悬浮（只读宿主）：窗口级 move 兜底——元素在宿主顶层叠层之下时元素级

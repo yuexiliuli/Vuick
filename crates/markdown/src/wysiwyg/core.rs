@@ -114,6 +114,8 @@ impl WyEditor {
             live_ops: None,
             hover_image: Cell::new(None),
             selected_image: Cell::new(None),
+            hover_inline_image: Cell::new(None),
+            selected_inline_image: Cell::new(None),
             image_edit: None,
             image_edit_anchor: Cell::new(None),
             math_edit: None,
@@ -188,11 +190,13 @@ impl WyEditor {
             self.marked = None;
             self.sel_anchor = None;
             self.dragging = false;
-            // 只读：无编辑能力 → 收起图片编辑卡片与悬浮按钮态、图片选中态。
+            // 只读：无编辑能力 → 收起图片编辑卡片与悬浮按钮态、图片选中态（含行内图）。
             self.image_edit = None;
             self.image_edit_anchor.set(None);
             self.hover_image.set(None);
             self.selected_image.set(None);
+            self.hover_inline_image.set(None);
+            self.selected_inline_image.set(None);
             // 只读：数学编辑卡（写回依赖可编辑）一并收起 + 订阅 drop + 拖拽态清空。
             self.math_edit = None;
             self.math_edit_anchor.set(None);
@@ -455,11 +459,13 @@ impl WyEditor {
             log.clear();
         }
         self.focused_mermaid = None;
-        // 换源：图片编辑卡片/悬浮态/选中态随行号失效 → 关闭。
+        // 换源：图片编辑卡片/悬浮态/选中态随行号失效 → 关闭（含行内图）。
         self.image_edit = None;
         self.image_edit_anchor.set(None);
         self.hover_image.set(None);
         self.selected_image.set(None);
+        self.hover_inline_image.set(None);
+        self.selected_inline_image.set(None);
         // 换源：数学编辑卡（锚定行号/正文随源失效）关闭 + 订阅 drop + 拖拽态清空。
         self.math_edit = None;
         self.math_edit_anchor.set(None);

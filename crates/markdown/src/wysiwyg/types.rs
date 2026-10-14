@@ -54,10 +54,42 @@ pub(crate) enum BlockRegion {
         dhi: usize,
     },
 }
+/// 行内 `![alt](src)` 的稳定标识（悬浮/选中态用）。`display_off` 是同帧内行内唯一键
+/// （paint/命中比较用）；`start` = 该图 `![…](…)` 起始 `!` 的**源字节**（源码系身份，
+/// 编辑/删除/保存时从源码反解区间，不依赖帧）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct InlineImageRef {
+    /// 所在源码行。
+    pub(crate) src_line: usize,
+    /// 显示偏移（`InlineImageHit.display_off`）。
+    pub(crate) display_off: usize,
+    /// `![…](…)` 起始 `!` 的源字节偏移。
+    pub(crate) start: usize,
+}
+
+/// 图片编辑卡片的目标：块级独立图片行 或 行内图片。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ImageEditTarget {
+    /// 独立图片行（整行 `![alt](src)`）。
+    Block { src_line: usize },
+    /// 行内 `![…](…)`（`InlineImageRef` 标识）。
+    Inline(InlineImageRef),
+}
+
+impl ImageEditTarget {
+    /// 目标图片所在源码行（块/行内统一取行）。
+    pub(crate) fn src_line(&self) -> usize {
+        match *self {
+            Self::Block { src_line }
+            | Self::Inline(InlineImageRef { src_line, .. }) => src_line,
+        }
+    }
+}
+
 /// 图片编辑卡片：两个单行输入框（链接 + 文本）锚定在目标图片旁。
 pub(crate) struct ImageEditPopup {
-    /// 目标图片行的源码行号。
-    pub(crate) src_line: usize,
+    /// 目标：独立图片行 或 行内图片。
+    pub(crate) target: ImageEditTarget,
     /// 图片链接（`![alt](src)` 的 src）输入框。
     pub(crate) link: gpui::Entity<ui::input::InputState>,
     /// 图片文本（alt / 题注）输入框。

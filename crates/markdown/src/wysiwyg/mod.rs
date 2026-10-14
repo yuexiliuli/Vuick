@@ -80,10 +80,10 @@ pub(crate) use self::theme::{CaretVis, caret_vis, math_color, set_caret_vis};
 /// 跨 crate 面（shell/app 预览目录/后台装载装配）：`TocEntries` 目录条目、`WyOpenResult` 后台装载结果。
 pub use self::types::{TocEntries, WyOpenResult};
 pub(crate) use self::types::{
-    BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageResizeDrag,
-    ImageSrcBlocks, MathEditDrag, MathEditPopup, MathSlot, PrebuildBlock, PrebuildPass1,
-    TocCacheEntry, UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived, inline_math_key,
-    is_plain_region_line, region_line_sig,
+    BlockLayoutRef, BlockMathPin, BlockRegion, EditKind, ImageEditPopup, ImageEditTarget,
+    ImageResizeDrag, ImageSrcBlocks, InlineImageRef, MathEditDrag, MathEditPopup, MathSlot,
+    PrebuildBlock, PrebuildPass1, TocCacheEntry, UNDO_GROUP_MS, UNDO_LIMIT, UndoUnit, WyDerived,
+    inline_math_key, is_plain_region_line, region_line_sig,
 };
 pub(crate) use self::warm::{warm_emoji_is_done, warm_emoji_rasterizer};
 
@@ -411,6 +411,14 @@ pub struct WyEditor {
     /// 指针，点击其它文本区 / 换源 / 只读 时清除；Backspace/Delete 删除整张图片行。
     /// 纯视图态，不进撤销栈。
     selected_image: Cell<Option<usize>>,
+    /// 当前悬浮的**行内**图片（`InlineImageRef`；`on_mouse_move` 更新）。非 `None` 时该
+    /// 行内图右上角浮现编辑按钮（仅可编辑模式绘制/响应）。纯视图态，不进撤销栈。
+    hover_inline_image: Cell<Option<InlineImageRef>>,
+    /// 点击行内图片**本体**时置位的选中行内图（`InlineImageRef`）。非 `None` 时该行内图
+    /// 画 accent 描边 + 编辑按钮常显（不依赖指针悬浮）。与 `hover_inline_image` 不同：
+    /// 选中态独立于指针，点击其它文本区 / 换源 / 只读 时清除；Backspace/Delete 删除
+    /// 整段 `![…](…)`。纯视图态，不进撤销栈。
+    selected_inline_image: Cell<Option<InlineImageRef>>,
     /// 图片编辑卡片（打开时在图片旁渲染悬浮表单：链接 + 文本两个输入框）。
     /// `None` = 未打开。打开期间输入框获得焦点（IME 走 `InputState`，与文档输入互不干扰）。
     image_edit: Option<ImageEditPopup>,

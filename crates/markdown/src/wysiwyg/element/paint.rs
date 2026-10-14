@@ -358,69 +358,19 @@ pub(crate) fn paint_image_row(
             None => paint_image_fallback(theme, bounds, window),
         }
     }
-    // 编辑按钮：可编辑模式且鼠标悬浮在这张图片上（或图片被选中）时，在图片**右上角**
-    // 浮现「⋮」选项按钮（命中/几何与 `hit.rs` 的 `image_edit_button_hit_at`/
-    // `image_edit_button_local` 共用）。样式：透明灰白圆角方框 + 竖向三个圆点（纯
-    // `paint_quad` 绘制，不依赖 SVG 光栅）。⚠️ 局部坐标 → 窗口坐标**必须加 `origin`**
-    //（与图片本体同式）——否则元素不在窗口原点时按钮会画到错误位置（修掉「悬浮不出现」）。
+    // 编辑按钮 + 图片调整条 + 选中态（可编辑模式；几何与 `hit.rs` 共用，见
+    // `paint_image_edit_button` / `paint_image_selection_outline`）。
     let hovered_or_selected = editor.read(cx).hover_image() == Some(row.src_line)
         || editor.read(cx).selected_image() == Some(row.src_line);
     if editor.read(cx).is_editable()
         && hovered_or_selected
         && let Some(bb) = super::image_box_local(f, row)
     {
-        let btn_local = super::image_edit_button_local(&bb);
-        let btn = Bounds::new(
-            point(origin.x + btn_local.left(), origin.y + btn_local.top()),
-            btn_local.size,
-        );
-        // 透明灰白底（无论明暗主题都压得住图片），浅白描边。
-        window.paint_quad(gpui::PaintQuad {
-            bounds: btn,
-            corner_radii: gpui::Corners::all(px(6.)),
-            background: gpui::hsla(0., 0., 0.9, 0.6).into(),
-            border_widths: gpui::Edges::all(px(1.)),
-            border_color: gpui::hsla(0., 0., 1., 0.55),
-            border_style: gpui::BorderStyle::Solid,
-        });
-        // ── ⋮ 三个圆点：可调参数（改这两处即可调视觉，其余由公式自动推导）──
-        //   DOT_N     圆点边长（px）：越小越细；默认 3。
-        //   DOT_GAP   相邻圆点的竖直间距（px）：越大越松散、越小越紧凑；默认 3。
-        // 布局公式（自动，不用改）：
-        //   三个圆点竖直排成一条线，整体在按钮盒内**垂直居中**：
-        //     总占用高 span = DOT_N*3 + DOT_GAP*(3−1)；
-        //     首点 y = 按钮顶 + (BTN − span)/2（上下留白各半，保证不偏出按钮）；
-        //     后续点依次下移 step = DOT_N + DOT_GAP。
-        //   水平居中：x = 按钮左 + (BTN − DOT_N)/2（左右留白各半）。
-        //   注意：DOT_N 改变了必须同步改 span/step 的推导（它们都以 DOT_N 为基准，
-        //   不要再用写死的旧值 4/8——那会让圆点在上方多偏半个圆点）。
-        let dot_size: f32 = 3.;
-        let dot_gap: f32 = 2.;
-        let dot_count: usize = 3;
-        let span = dot_count as f32 * dot_size + (dot_count - 1) as f32 * dot_gap;
-        let step = dot_size + dot_gap;
-        let dot = size(px(dot_size), px(dot_size));
-        let dot_x = btn.left() + px((super::IMAGE_EDIT_BTN_SIZE - dot_size) / 2.);
-        let dot_y0 = btn.top() + px((super::IMAGE_EDIT_BTN_SIZE - span) / 2.);
-        for k in 0..dot_count {
-            window.paint_quad(gpui::PaintQuad {
-                bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * step)), dot),
-                corner_radii: gpui::Corners::all(px(dot_size / 2.)),
-                background: gpui::hsla(0., 0., 0.22, 1.).into(),
-                border_widths: gpui::Edges::default(),
-                border_color: gpui::Hsla::default(),
-                border_style: gpui::BorderStyle::Solid,
-            });
-        }
-    }
-    // 图片调整条（**右中边缘内**：竖条、垂直居中）：可编辑且悬浮/选中时浮现。
-    // 按住 → 拖拽改宽（`hit.rs` 的 `image_resize_handle_hit_at`/`_window` 同几何）。
-    if editor.read(cx).is_editable()
-        && hovered_or_selected
-        && let Some(bb) = super::image_box_local(f, row)
-    {
+        // 编辑按钮（图片**右上角**「⋮」）。
+        paint_image_edit_button(origin, super::image_edit_button_local(&bb), window);
+        // 调整条（**右中边缘内**：竖条、垂直居中）：按住 → 拖拽改宽（`hit.rs` 的
+        // `image_resize_handle_hit_at`/`_window` 同几何）。
         let hb = super::image_resize_handle_window(origin, &bb);
-        // 透明灰白竖条 + 浅白描边（明暗主题都压得住图片）。
         window.paint_quad(gpui::PaintQuad {
             bounds: hb,
             corner_radii: gpui::Corners::all(px(3.)),
@@ -430,22 +380,91 @@ pub(crate) fn paint_image_row(
             border_style: gpui::BorderStyle::Solid,
         });
     }
-    // 选中态（点击图片本体）：accent 2px 圆角描边（与 mermaid 聚焦描边同色同宽）。
     if editor.read(cx).selected_image() == Some(row.src_line)
         && let Some(bb) = super::image_box_local(f, row)
     {
-        let sel_b = Bounds::new(point(origin.x + bb.left(), origin.y + bb.top()), bb.size);
-        window.paint_quad(gpui::PaintQuad {
-            bounds: sel_b,
-            corner_radii: gpui::Corners::all(px(4.)),
-            background: gpui::Hsla::default().into(),
-            border_widths: gpui::Edges::all(px(2.)),
-            border_color: theme.accent,
-            border_style: gpui::BorderStyle::Solid,
-        });
+        paint_image_selection_outline(origin, &bb, theme, window);
     }
     // 题注（可编辑 alt）绘制在图片之下，经 `x_off` 水平居中。
     paint_text_row(origin, theme, f, row, window, cx);
+}
+
+/// 画图片编辑按钮（「⋮」三点，图片右上角）：块图 `paint_image_row` 与行内图
+/// `paint_inline_images` 共用同一绘制（几何一律取 `hit.rs` 的 `image_edit_button_local`，
+/// 命中与 paint 不得分开改）。样式：透明灰白圆角方框 + 竖向三个圆点（纯 `paint_quad`
+/// 绘制，不依赖 SVG 光栅）。⚠️ `btn_local` 是元素局部坐标 → 窗口坐标**必须加 `origin`**
+///（与图片本体同式）——否则元素不在窗口原点时按钮会画到错误位置。
+fn paint_image_edit_button(
+    origin: Point<Pixels>,
+    btn_local: Bounds<Pixels>,
+    window: &mut Window,
+) {
+    let btn = Bounds::new(
+        point(origin.x + btn_local.left(), origin.y + btn_local.top()),
+        btn_local.size,
+    );
+    // 透明灰白底（无论明暗主题都压得住图片），浅白描边；圆角随按钮尺寸缩放。
+    window.paint_quad(gpui::PaintQuad {
+        bounds: btn,
+        corner_radii: gpui::Corners::all(px((f32::from(btn.size.width) * 0.25).min(6.))),
+        background: gpui::hsla(0., 0., 0.9, 0.6).into(),
+        border_widths: gpui::Edges::all(px(1.)),
+        border_color: gpui::hsla(0., 0., 1., 0.55),
+        border_style: gpui::BorderStyle::Solid,
+    });
+    // ── ⋮ 三个圆点：可调参数（改这两处即可调视觉，其余由公式自动推导）──
+    //   DOT_N     圆点边长（px）：越小越细；默认 3。
+    //   DOT_GAP   相邻圆点的竖直间距（px）：越大越松散、越小越紧凑；默认 3。
+    // 布局公式（自动，不用改）：
+    //   三个圆点竖直排成一条线，整体在按钮盒内**垂直居中**：
+    //     总占用高 span = DOT_N*3 + DOT_GAP*(3−1)；
+    //     首点 y = 按钮顶 + (BTN − span)/2（上下留白各半，保证不偏出按钮）；
+    //     后续点依次下移 step = DOT_N + DOT_GAP。
+    //   水平居中：x = 按钮左 + (BTN − DOT_N)/2（左右留白各半）。
+    //   注意：DOT_N 改变了必须同步改 span/step 的推导（它们都以 DOT_N 为基准，
+    //   不要再用写死的旧值 4/8——那会让圆点在上方多偏半个圆点）。
+    let dot_size: f32 = 3.;
+    let dot_gap: f32 = 2.;
+    let dot_count: usize = 3;
+    let span = dot_count as f32 * dot_size + (dot_count - 1) as f32 * dot_gap;
+    let step = dot_size + dot_gap;
+    let dot = size(px(dot_size), px(dot_size));
+    // 三点水平/垂直居中一律按**实际按钮盒**尺寸算（块图 24 / 行内图 16 双尺寸共用此绘制）。
+    let btn_size = f32::from(btn.size.width);
+    let dot_x = btn.left() + px((btn_size - dot_size) / 2.);
+    let dot_y0 = btn.top() + px((btn_size - span) / 2.);
+    for k in 0..dot_count {
+        window.paint_quad(gpui::PaintQuad {
+            bounds: Bounds::new(point(dot_x, dot_y0 + px(k as f32 * step)), dot),
+            corner_radii: gpui::Corners::all(px(dot_size / 2.)),
+            background: gpui::hsla(0., 0., 0.22, 1.).into(),
+            border_widths: gpui::Edges::default(),
+            border_color: gpui::Hsla::default(),
+            border_style: gpui::BorderStyle::Solid,
+        });
+    }
+}
+
+/// 画图片**选中描边**（accent 2px 圆角，与 mermaid 聚焦描边同色同宽）：块图与行内图
+/// 共用（几何用图片盒元素局部 bounds，加 `origin` 转窗口）。
+fn paint_image_selection_outline(
+    origin: Point<Pixels>,
+    bb_local: &Bounds<Pixels>,
+    theme: &WyTheme,
+    window: &mut Window,
+) {
+    let sel_b = Bounds::new(
+        point(origin.x + bb_local.left(), origin.y + bb_local.top()),
+        bb_local.size,
+    );
+    window.paint_quad(gpui::PaintQuad {
+        bounds: sel_b,
+        corner_radii: gpui::Corners::all(px(4.)),
+        background: gpui::Hsla::default().into(),
+        border_widths: gpui::Edges::all(px(2.)),
+        border_color: theme.accent,
+        border_style: gpui::BorderStyle::Solid,
+    });
 }
 
 /// 行内代码（反引号）圆角 pill 底：把 `row.code_ranges`（已扩展空白）区间按折行切成
@@ -883,10 +902,13 @@ pub(crate) fn paint_inline_maths(
 }
 
 /// 行内 `![alt](src)`：在 alt 文本（显示区）上方画等比缩小的缩略图（B1）。
-/// 加载中/失败保留 alt 文字（已被正文画过）。
+/// 加载中/失败保留 alt 文字（已被正文画过）。几何与 `hit.rs` 的 `inline_image_box_local`
+/// 共用同一显示盒「命中与 paint 不得分开改」；可编辑模式且悬浮/选中该行内图时，右上角
+/// 浮现编辑按钮 + accent 选中描边（与块图同款，见 `paint_image_edit_button`）。
 pub(crate) fn paint_inline_images(
     editor: &gpui::Entity<WyEditor>,
     origin: Point<Pixels>,
+    theme: &WyTheme,
     f: &Frame,
     row: &ShapedRow,
     window: &mut Window,
@@ -895,19 +917,13 @@ pub(crate) fn paint_inline_images(
     if row.extra.inline_images.is_empty() || row.wrapped.is_empty() {
         return;
     }
-    let w0 = &row.wrapped[0];
-    let tx = origin.x + f.padding + row.x_off;
-    let ty = origin.y + row.top;
     for ii in &row.extra.inline_images {
-        let (Some(p0), Some(p1)) = (
-            w0.position_for_index(ii.display_off, row.lh),
-            w0.position_for_index(ii.display_off + ii.len.max(1), row.lh),
-        ) else {
+        let Some(b) = super::inline_image_box_local(f, row, ii) else {
             continue;
         };
-        let x = tx + p0.x;
-        let y = ty + p0.y;
-        let show_w = (p1.x - p0.x).max(px(6.));
+        let x = origin.x + b.left();
+        let y = origin.y + b.top();
+        let show_w = b.size.width;
         // EPUB 内存图（`epubimg://…`）直接解码字节；普通路径照旧异步加载。
         let loaded: Option<std::sync::Arc<gpui::RenderImage>> = {
             let mem = editor.read(cx).memory_image(ii.src.as_ref());
@@ -933,6 +949,26 @@ pub(crate) fn paint_inline_images(
                 let b = Bounds::new(point(px(x2), px(y2)), size(px(w), px(h)));
                 let _ = window.paint_image(b, b, Corners::all(px(3.)), data, 0, false);
             }
+        }
+        // 编辑按钮：仅在可编辑模式 + 该行内图悬浮/选中时浮现（块图同款）。
+        let hovered_or_selected = {
+            let h = editor.read(cx).hover_inline_image();
+            let s = editor.read(cx).selected_inline_image();
+            let at = |r: &Option<InlineImageRef>| {
+                r.is_some_and(|r| r.src_line == row.src_line && r.display_off == ii.display_off)
+            };
+            at(&h) || at(&s)
+        };
+        if editor.read(cx).is_editable() && hovered_or_selected {
+            paint_image_edit_button(origin, super::inline_image_edit_button_local(&b), window);
+        }
+        // 选中态（点击行内图本体）：accent 2px 圆角描边（与块图同款）。
+        if editor
+            .read(cx)
+            .selected_inline_image()
+            .is_some_and(|r| r.src_line == row.src_line && r.display_off == ii.display_off)
+        {
+            paint_image_selection_outline(origin, &b, theme, window);
         }
     }
 }

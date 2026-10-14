@@ -35,7 +35,7 @@ pub(crate) use super::frame::{prewarm_band, warm_emoji_rasterizer};
 pub(crate) use super::math::*;
 pub(crate) use super::mermaid::*;
 pub(crate) use super::shape::*;
-use super::{CaretVis, WyEditor, WyTheme};
+use super::{CaretVis, InlineImageRef, WyEditor, WyTheme};
 use crate::markdown::ir::IrKind;
 use crate::markdown::parse::recognition::{AlertKind, LinkHit};
 use crate::markdown::parse::inline_style::MathAlign;
@@ -1446,7 +1446,7 @@ impl WyEditorElement {
             }
             // 行内数学 / 行内图片叠加（B1/B2）。
             paint_inline_maths(&self.editor, origin, theme, f, row, window, cx);
-            paint_inline_images(&self.editor, origin, f, row, window, cx);
+            paint_inline_images(&self.editor, origin, theme, f, row, window, cx);
         }
         crate::prof::end("wy.paint.rowloop", _t_row);
     }

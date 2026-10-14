@@ -8,6 +8,11 @@ use gpui::{Bounds, Pixels, Point, point, px, size};
 pub(crate) const IMAGE_EDIT_BTN_SIZE: f32 = 24.;
 /// 编辑按钮距图片右上角的边距（px）。
 pub(crate) const IMAGE_EDIT_BTN_MARGIN: f32 = 6.;
+/// 行内图编辑按钮边长（px）：行内缩略图高≈行高，块图 24px 按钮太大，用小号。
+/// 命中与 paint 共用（`inline_image_edit_button_local`），不得分开改。
+pub(crate) const INLINE_IMAGE_EDIT_BTN_SIZE: f32 = 16.;
+/// 行内图编辑按钮距图片右上角的边距（px）。
+pub(crate) const INLINE_IMAGE_EDIT_BTN_MARGIN: f32 = 2.;
 /// 图片编辑卡片的宽（px；卡片水平居中于内容区）。
 pub(crate) const IMAGE_EDIT_CARD_W: f32 = 320.;
 /// 数学编辑卡片的宽（px；卡片水平居中于内容区，锚定覆盖在目标公式卡顶部）。
@@ -253,12 +258,27 @@ pub(crate) fn image_box_local(f: &Frame, row: &ShapedRow) -> Option<Bounds<Pixel
 }
 
 /// 图片编辑按钮的元素局部矩形：钉在图片盒**右上角**（右缘内收、顶缘下移）。
+/// 尺寸参数化：块图 `image_edit_button_local`（24/6）、行内图 `inline_image_edit_button_local`
+///（16/2——行内缩略图高≈行高，块图按钮对行内图太大）。命中与 paint 高度共用，不得分开改。
+pub(crate) fn image_edit_button_local_with(
+    box_b: &Bounds<Pixels>,
+    btn_size: f32,
+    margin: f32,
+) -> Bounds<Pixels> {
+    let x = box_b.right() - px(btn_size + margin);
+    let y = box_b.top() + px(margin);
+    Bounds::new(point(x, y), size(px(btn_size), px(btn_size)))
+}
 pub(crate) fn image_edit_button_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> {
-    let x = box_b.right() - px(IMAGE_EDIT_BTN_SIZE + IMAGE_EDIT_BTN_MARGIN);
-    let y = box_b.top() + px(IMAGE_EDIT_BTN_MARGIN);
-    Bounds::new(
-        point(x, y),
-        size(px(IMAGE_EDIT_BTN_SIZE), px(IMAGE_EDIT_BTN_SIZE)),
+    image_edit_button_local_with(box_b, IMAGE_EDIT_BTN_SIZE, IMAGE_EDIT_BTN_MARGIN)
+}
+/// 行内图编辑按钮（小号）：命中（`inline_image_edit_button_hit_at`）与 paint
+///（`paint_inline_images`）共用同一几何，不得分开改。
+pub(crate) fn inline_image_edit_button_local(box_b: &Bounds<Pixels>) -> Bounds<Pixels> {
+    image_edit_button_local_with(
+        box_b,
+        INLINE_IMAGE_EDIT_BTN_SIZE,
+        INLINE_IMAGE_EDIT_BTN_MARGIN,
     )
 }
 
@@ -354,6 +374,102 @@ pub(crate) fn image_edit_button_hit_at(
         };
         if b.contains(&p) {
             return Some(r.src_line);
+        }
+    }
+    None
+}
+
+/// 行内 `![alt](src)` 的显示盒（**元素局部**坐标）：与 `paint_inline_images` 共用同一
+/// 几何（盒 = alt 显示区 bbox：宽取字形跨度、高取行高；缩略图在盒内居中绘制）。
+/// 越界（显示区间超出 shaped 行）返回 `None`，与 paint 跳过一致。
+pub(crate) fn inline_image_box_local(
+    f: &Frame,
+    row: &ShapedRow,
+    ii: &InlineImageHit,
+) -> Option<Bounds<Pixels>> {
+    let w0 = row.wrapped.first()?;
+    let p0 = w0.position_for_index(ii.display_off, row.lh)?;
+    let p1 = w0.position_for_index(ii.display_off + ii.len.max(1), row.lh)?;
+    let x = f.padding + row.x_off + p0.x;
+    let y = row.top + p0.y;
+    let show_w = (p1.x - p0.x).max(px(6.));
+    Some(Bounds::new(point(x, y), size(show_w, row.lh)))
+}
+
+/// 由行内图命中反解 `InlineImageRef`：`display_off` → 经 `byte_map` 定位 `[` 的源字节，
+/// 再退两位得 `!`（否则该显示偏移不是行内图起点，返回 `None`）。
+pub(crate) fn inline_image_ref_of(
+    row: &ShapedRow,
+    ii: &InlineImageHit,
+    raw: &str,
+) -> Option<InlineImageRef> {
+    let post = row.byte_map.as_slice();
+    let alt_src = *post.get(ii.display_off.min(post.len().saturating_sub(1)))?;
+    if alt_src < 2 || alt_src > raw.len() {
+        return None;
+    }
+    let start = alt_src - 2;
+    if raw.as_bytes().get(start) != Some(&b'!') || raw.as_bytes().get(start + 1) != Some(&b'[') {
+        return None;
+    }
+    Some(InlineImageRef {
+        src_line: row.src_line,
+        display_off: ii.display_off,
+        start,
+    })
+}
+
+/// 命中行内图片**本体**（显示盒，窗口坐标）→ `InlineImageRef`；未命中 `None`。
+pub(crate) fn inline_image_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<InlineImageRef> {
+    let p = to_local(editor, p);
+    for r in &frame.rows {
+        if r.extra.inline_images.is_empty() {
+            continue;
+        }
+        for ii in &r.extra.inline_images {
+            let Some(b) = inline_image_box_local(frame, r, ii) else {
+                continue;
+            };
+            if !b.contains(&p) {
+                continue;
+            }
+            let raw = editor.line_text(r.src_line);
+            if let Some(reff) = inline_image_ref_of(r, ii, &raw) {
+                return Some(reff);
+            }
+        }
+    }
+    None
+}
+
+/// 命中行内图片**编辑按钮**（窗口坐标）→ `InlineImageRef`；未命中 `None`。
+/// 几何与 `inline_image_box_local` 的右上角小号按钮一致（复用 `inline_image_edit_button_local`）。
+pub(crate) fn inline_image_edit_button_hit_at(
+    editor: &WyEditor,
+    frame: &Frame,
+    p: Point<Pixels>,
+) -> Option<InlineImageRef> {
+    let p = to_local(editor, p);
+    for r in &frame.rows {
+        if r.extra.inline_images.is_empty() {
+            continue;
+        }
+        for ii in &r.extra.inline_images {
+            let Some(bb) = inline_image_box_local(frame, r, ii) else {
+                continue;
+            };
+            let b = inline_image_edit_button_local(&bb);
+            if !b.contains(&p) {
+                continue;
+            }
+            let raw = editor.line_text(r.src_line);
+            if let Some(reff) = inline_image_ref_of(r, ii, &raw) {
+                return Some(reff);
+            }
         }
     }
     None

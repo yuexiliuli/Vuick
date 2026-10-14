@@ -235,7 +235,13 @@ fn image_edit_card_save_rewrites_source(cx: &mut TestAppContext) {
     let vcx: &mut VisualTestContext = vcx;
     let ed = host.read_with(vcx, |h, _| h.ed.clone());
     vcx.update(|window, cx| {
-        ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
     });
     assert!(
         ed.read_with(vcx, |e, _| e.image_edit_open()),
@@ -273,7 +279,13 @@ fn image_edit_save_with_empty_link_keeps_src(cx: &mut TestAppContext) {
     let vcx: &mut VisualTestContext = vcx;
     let ed = host.read_with(vcx, |h, _| h.ed.clone());
     vcx.update(|window, cx| {
-        ed.update(cx, |e, cx| e.open_image_edit(0, window, cx));
+        ed.update(cx, |e, cx| {
+            e.open_image_edit(
+                crate::markdown::wysiwyg::ImageEditTarget::Block { src_line: 0 },
+                window,
+                cx,
+            )
+        });
     });
     vcx.update(|window, cx| {
         let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
@@ -1438,5 +1450,414 @@ fn image_drag_multitick_sparse_converges(cx: &mut TestAppContext) {
         ed.read_with(vcx, |e, _| e.shape_rows_has(lead_b)),
         "无关前导段应保留在整形缓存（非整带重排）"
     );
+}
+
+/* ============================ 行内图片编辑（M6） ============================ */
+
+/// 行内图测试夹具：用**元素真实渲染同宽**（阅读栏宽 `reading_col_px(16.0)`）建帧并注入、
+/// `last_bounds` 置原点（宽=帧宽 → 阅读栏移位恒 0，元素局部==窗口坐标）。返回帧 `Rc`。
+/// ⚠️ 图片「选中/删除」等动作会清空帧（对齐 `select_image`/`replace_range` 语义）——
+/// 这类动作之后、再次命中前要**重调本夹具**重新注入，才能保证命中几何与当前帧一致。
+fn inline_image_harness(
+    vcx: &mut VisualTestContext,
+    ed: &gpui::Entity<WyEditor>,
+) -> std::rc::Rc<super::Frame> {
+    vcx.update(|window, cx| {
+        let w = px(config::markdown::reading_col_px(16.0));
+        let frame = build_frame(ed.read(cx), window, w, (0., 999_999.));
+        assert!(
+            frame
+                .rows
+                .iter()
+                .any(|r| !r.extra.inline_images.is_empty()),
+            "夹具应含行内图片行"
+        );
+        let bounds_h = f32::from(frame.total).max(600.);
+        ed.update(cx, |e, _| {
+            e.set_last_bounds(Some(Bounds::new(
+                point(px(0.), px(0.)),
+                size(w, px(bounds_h)),
+            )));
+        });
+        let rc = std::rc::Rc::new(frame);
+        ed.update(cx, |e, _| *e.frame.borrow_mut() = Some(rc.clone()));
+        rc
+    })
+}
+
+/// 第一幅行内图的**元素局部**显示盒（与 paint/命中共用同一几何）。
+fn first_inline_local(frame: &std::rc::Rc<super::Frame>) -> super::Bounds<gpui::Pixels> {
+    let para = frame
+        .rows
+        .iter()
+        .find(|r| !r.extra.inline_images.is_empty())
+        .expect("夹具应含行内图");
+    let ii = &para.extra.inline_images[0];
+    super::inline_image_box_local(frame, para, ii).expect("行内图显示盒")
+}
+
+/// 元素局部矩形 → **当下 live** 的窗口矩形（内容列屏幕原点 + 阅读栏移位）。
+/// ⚠️ 必须**与使用它的鼠标事件同一次 `vcx.update` 内**调用——元素 prepaint/重绘会随时
+/// 更新 `last_bounds`/帧（测试里真实渲染路径会刷新几何），隔一次 update 就可能是旧坐标。
+fn win_of(
+    ed: &gpui::Entity<WyEditor>,
+    cx: &mut gpui::App,
+    local: &super::Bounds<gpui::Pixels>,
+) -> super::Bounds<gpui::Pixels> {
+    let o = ed.read(cx).content_origin();
+    super::Bounds::new(
+        point(o.x + local.left(), o.y + local.top()),
+        local.size,
+    )
+}
+
+/// 行内图「本体」点击点：盒左缘内 3px、垂直居中——**避开右上角编辑按钮区**（小行内图
+/// 的 16px 按钮几乎盖住整盒，只剩左缘不带按钮），确保走「点图选中」分支而非「开卡」。
+fn body_click_pt(win_box: &super::Bounds<gpui::Pixels>) -> (f32, f32) {
+    (
+        f32::from(win_box.left()) + 3.,
+        f32::from(win_box.top()) + f32::from(win_box.size.height) / 2.,
+    )
+}
+
+/// 点击行内图**本体** → 选中（selected_inline_image = 该图、无文本选区、光标不落在图上）；
+/// 再点同一图保持选中；点图上文字外的文本区 → 清除选中并落光标到该文本。
+#[gpui::test]
+fn inline_image_body_click_selects_without_caret(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::InlineImageRef;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let text = "前文 ![内联蓝块](shot_blue.png) 后文\n";
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| WyEditor::new(window, cx).with_text(text));
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    let ii0_off = frame
+        .rows
+        .iter()
+        .find(|r| !r.extra.inline_images.is_empty())
+        .unwrap()
+        .extra
+        .inline_images[0]
+        .display_off;
+    // 点盒本体（避开右上角编辑按钮，左缘）→ 选中：无文本选区、光标不落图上。
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        let sel: InlineImageRef = ed.read(cx).selected_inline_image().expect("应选中行内图");
+        assert_eq!(sel.src_line, 0);
+        assert_eq!(sel.display_off, ii0_off);
+        assert_eq!(ed.read(cx).selection(), None, "选中图片不应产生文本选区");
+    });
+    let sel1 = ed
+        .read_with(vcx, |e, _| e.selected_inline_image())
+        .expect("选中态应保留");
+    let (set0, set1) = vcx.update(|_w, cx| {
+        let e = ed.read(cx);
+        (
+            e.inline_image_source_range_of(sel1).expect("应能反解源区间").0,
+            e.caret(),
+        )
+    });
+    assert_eq!(sel1.start, set0.start, "反解的源区间起点应即 `!` 位");
+    assert!(
+        set1 < set0.start || set1 >= set0.end,
+        "光标 {} 不得落在图源区间 {:?}（不产生落在图上的闪烁光标）",
+        set1,
+        set0
+    );
+    // 选中清帧 → 重注入（命中几何与当前帧一致）→ 再点同一图 → 保持选中（无文本选区）。
+    let _ = inline_image_harness(vcx, &ed);
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(ed.read(cx).selected_inline_image(), Some(sel1), "再点应保持选中");
+        assert_eq!(ed.read(cx).selection(), None, "再点不应产生文本选区");
+    });
+    // 点图上文字区（盒右缘之外）→ 清除图片选中，光标落回文本。
+    let _ = inline_image_harness(vcx, &ed);
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        ed.update(
+            cx,
+            |e, c| {
+                e.on_mouse_down(
+                    &img_down(
+                        f32::from(w.right()) + 40.,
+                        f32::from(w.top()) + f32::from(w.size.height) / 2.,
+                    ),
+                    window,
+                    c,
+                )
+            },
+        );
+        assert_eq!(ed.read(cx).selected_inline_image(), None, "点文本应清除图片选中");
+    });
+}
+
+/// 悬浮行内图 → 右上角编辑按钮亮显（hover_inline_image = 该图）；点按钮 → 打开编辑卡
+///（同块图表单、输入框预填 alt/src）；再点同按钮 → 关闭（toggle）。
+#[gpui::test]
+fn inline_image_hover_button_opens_card(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("前文 ![内联蓝块](shot_blue.png) 后文\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    let btn_local = super::inline_image_edit_button_local(&bb_local);
+    // 悬浮到盒内 → hover 记录该图（live 窗口坐标，与事件同一 update）。
+    vcx.update(|_window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let mv = img_move(f32::from(w.left()) + 4., f32::from(w.top()) + 4.);
+        ed.update(cx, |e, c| e.on_mouse_move(&mv, c));
+    });
+    let hov = ed
+        .read_with(vcx, |e, _| e.hover_inline_image())
+        .expect("悬浮应记录行内图");
+    assert_eq!(hov.src_line, 0);
+    // 点按钮中心（live 窗口坐标；与块图同几何）→ 打开编辑卡。
+    vcx.update(|window, cx| {
+        let b = win_of(&ed, cx, &btn_local);
+        let down = img_down(
+            f32::from(b.left()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+            f32::from(b.top()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+        );
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(ed.read(cx).image_edit_open(), "点行内图编辑按钮应打开卡片");
+        assert_eq!(ed.read(cx).image_edit_src_line(), Some(0));
+    });
+    // 输入框预填当前 alt / src。
+    vcx.update(|_, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        assert_eq!(link.read(cx).value().to_string(), "shot_blue.png");
+        assert_eq!(text.read(cx).value().to_string(), "内联蓝块");
+    });
+    // 再点同一按钮 → 关闭（toggle）。
+    vcx.update(|window, cx| {
+        let b = win_of(&ed, cx, &btn_local);
+        let down = img_down(
+            f32::from(b.left()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+            f32::from(b.top()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+        );
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(!ed.read(cx).image_edit_open(), "再点按钮应关闭卡片");
+    });
+}
+
+/// 卡片保存：改写行内 `![…](…)` 段（只改该图，周围文字原位保留），并关闭卡片。
+#[gpui::test]
+fn inline_image_card_save_rewrites_only_span(cx: &mut TestAppContext) {
+    use crate::markdown::wysiwyg::ImageEditTarget;
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("前文 ![内联蓝块](shot_blue.png) 后文\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    // 点图本体（避开编辑按钮）选中 → 拿到 refd → 程序化打开编辑卡（与点按钮同目标）。
+    let refd = vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        ed.read(cx).selected_inline_image().expect("点图应选中")
+    });
+    vcx.update(|window, cx| {
+        ed.update(cx, |e, c| {
+            e.open_image_edit(ImageEditTarget::Inline(refd), window, c)
+        });
+    });
+    assert!(ed.read_with(vcx, |e, _| e.image_edit_open()));
+    // 填新值：链接 + 文本。
+    vcx.update(|window, cx| {
+        let link = ed.read(cx).image_edit_link_input().expect("链接输入框");
+        link.update(cx, |s, cx| s.set_value("assets/new图.png", window, cx));
+        let text = ed.read(cx).image_edit_text_input().expect("文本输入框");
+        text.update(cx, |s, cx| s.set_value("新描述", window, cx));
+    });
+    vcx.update(|_window, cx| {
+        ed.update(cx, |e, c| e.save_image_edit(c));
+    });
+    let out = vcx.update(|_w, cx| ed.read(cx).content());
+    assert_eq!(out, "前文 ![新描述](assets/new图.png) 后文\n", "保存应只改行内图段");
+    assert!(
+        !ed.read_with(vcx, |e, _| e.image_edit_open()),
+        "保存后卡片应关闭"
+    );
+}
+
+/// 选中行内图后 Backspace → 删除整段 `![…](…)`（保留行内其它文本），清选中态。
+#[gpui::test]
+fn inline_image_selected_backspace_deletes_span(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("前文 ![内联蓝块](shot_blue.png) 后文\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(
+            ed.read(cx).selected_inline_image().is_some(),
+            "点行内图应选中"
+        );
+        ed.update(cx, |e, c| e.backspace(c));
+        assert_eq!(
+            ed.read(cx).content(),
+            "前文  后文\n",
+            "Backspace 应删除整段行内图（保留前后文字）"
+        );
+        assert!(ed.read(cx).selected_inline_image().is_none(), "删除后应清选中态");
+    });
+}
+
+/// 选中行内图后 Delete → 删除整段 `![…](…)`（与 Backspace 同一入口）。
+#[gpui::test]
+fn inline_image_selected_delete_deletes_span(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("甲 ![内联图块](a.png) 乙\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(ed.read(cx).selected_inline_image().is_some());
+        ed.update(cx, |e, c| e.delete(c));
+        assert_eq!(ed.read(cx).content(), "甲  乙\n", "Delete 应删除整段行内图");
+        assert!(ed.read(cx).selected_inline_image().is_none());
+    });
+}
+
+/// 只读预览：点行内图本体不选中、不打开卡片（对齐块图 `core.rs` 只读分支）。
+#[gpui::test]
+fn inline_image_readonly_no_select_no_card(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("前文 ![内联蓝块](shot_blue.png) 后文\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    let btn_local = super::inline_image_edit_button_local(&bb_local);
+    vcx.update(|_, cx| {
+        ed.update(cx, |e, _| e.set_editable(false));
+    });
+    // 点图本体 → 不选中、不打开卡片。
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert_eq!(ed.read(cx).selected_inline_image(), None, "只读点图不得选中");
+        assert!(!ed.read(cx).image_edit_open(), "只读不得打开编辑卡");
+    });
+    // 点编辑按钮位置（只读无论如何不响应）→ 不打开卡片。
+    vcx.update(|window, cx| {
+        let b = win_of(&ed, cx, &btn_local);
+        let down = img_down(
+            f32::from(b.left()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+            f32::from(b.top()) + super::INLINE_IMAGE_EDIT_BTN_SIZE / 2.,
+        );
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(!ed.read(cx).image_edit_open(), "只读点按钮不得打开编辑卡");
+    });
+}
+
+/// 回归（M6 修 bug）：行内图**不在第 0 行**时，`inline_image_source_range_of` 反解的
+/// `![…](…)` 源区间必须是**全局**字节偏移（`apply_edit`/`replace_range` 按整篇源操作；
+/// 块图 `delete_selected_image` 用 `line_start` 归位）。早先实现把**行内**相对偏移当
+/// 全局用——仅第 0 行测试碰巧通过（首行行内偏移 == 全局偏移），非首行 Backspace/保存
+/// 会删错字节。真实渲染路径：点图本体选中 → 校验源区间全局偏移 → Backspace 整段删。
+#[gpui::test]
+fn inline_image_later_line_backspace_deletes_span(cx: &mut TestAppContext) {
+    cx.update(crate::test_support::bind_local_keymaps);
+    let (host, vcx) = cx.add_window_view(|window, cx| {
+        let ed = cx.new(|cx| {
+            WyEditor::new(window, cx).with_text("上\n前文 ![内联蓝块](shot_blue.png) 后文\n")
+        });
+        WyHost { ed }
+    });
+    let vcx: &mut VisualTestContext = vcx;
+    let ed = host.read_with(vcx, |h, _| h.ed.clone());
+    let frame = inline_image_harness(vcx, &ed);
+    let bb_local = first_inline_local(&frame);
+    // 点图本体（避开右上角编辑按钮）选中 → 校验源区间为全局字节偏移。
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        let refd = ed.read(cx).selected_inline_image().expect("点图应选中");
+        assert_eq!(refd.src_line, 1, "行内图应在第 1 行（非首行回归场景）");
+        let global = ed
+            .read(cx)
+            .content()
+            .find("![内联蓝块]")
+            .expect("图段应在源中");
+        let (span, _) = ed
+            .read(cx)
+            .inline_image_source_range_of(refd)
+            .expect("应能反解源区间");
+        assert_eq!(
+            span.start, global,
+            "源区间起点必须是全局字节偏移（行内相对偏移会被 apply_edit 当全局用而删错字节）"
+        );
+    });
+    // 选中清帧 → 重注入 → 再点图选中 → Backspace 删除整段（保留前后文字）。
+    let _ = inline_image_harness(vcx, &ed);
+    vcx.update(|window, cx| {
+        let w = win_of(&ed, cx, &bb_local);
+        let (px_, py_) = body_click_pt(&w);
+        let down = img_down(px_, py_);
+        ed.update(cx, |e, c| e.on_mouse_down(&down, window, c));
+        assert!(ed.read(cx).selected_inline_image().is_some());
+        ed.update(cx, |e, c| e.backspace(c));
+        assert_eq!(
+            ed.read(cx).content(),
+            "上\n前文  后文\n",
+            "非首行行内图 Backspace 应删除整段（保留前后文字）"
+        );
+        assert!(ed.read(cx).selected_inline_image().is_none());
+    });
 }
 

@@ -1011,6 +1011,11 @@ impl WyEditor {
             self.delete_selected_image(line, cx);
             return;
         }
+        // 选中的**行内**图片：Backspace 删除整段 `![…](…)`（保留行内其它文本；记撤销栈）。
+        if let Some(refd) = self.selected_inline_image.get() {
+            self.delete_selected_inline_image(refd, cx);
+            return;
+        }
         crate::prof::op_start("backspace");
         // 有选区 → 直接删选区（等价退格删除选中文字）。
         if let Some(range) = self.selection() {
@@ -1053,6 +1058,11 @@ impl WyEditor {
         // 选中的图片对象：Delete 删除整张图片行（含换行；记撤销栈）。
         if let Some(line) = self.selected_image.get() {
             self.delete_selected_image(line, cx);
+            return;
+        }
+        // 选中的**行内**图片：Delete 删除整段 `![…](…)`（保留行内其它文本；记撤销栈）。
+        if let Some(refd) = self.selected_inline_image.get() {
+            self.delete_selected_inline_image(refd, cx);
             return;
         }
         crate::prof::op_start("delete");
