@@ -25,7 +25,8 @@ use crate::actions::{
     MoveLeft, MoveRight, MoveToEnd, MoveToNextWord, MoveToPreviousWord, MoveToStart, SelectAll,
 };
 use crate::config::layout::DEFAULT_FONT_SIZE;
-use crate::editor::EditIntent;
+// P3a 断环关键点：EditIntent 已下沉 base，本 crate 不再经 editor 引用（editor↔ui 环断开）。
+use gpui_editor_base::EditIntent;
 use crate::ime::{self, ImeTextHost};
 use crate::ui::theme::Theme;
 

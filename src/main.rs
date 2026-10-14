@@ -23,7 +23,6 @@ mod markdown;
 mod pdf;
 mod scrollbar;
 mod toc;
-mod ui;
 
 #[cfg(feature = "video")]
 mod video;
@@ -38,6 +37,9 @@ use gpui_editor_viewer as viewer;
 use gpui_editor_base::prof;
 use gpui_editor_base::util;
 use gpui_editor_config as config;
+// P3a：自研 UI 组件库迁出为 `gpui-editor-ui` crate，以 crate 根别名保持
+// `crate::ui::` 短路径（editor/markdown/pdf/image/video/toc/app 现有引用零改动）。
+use gpui_editor_ui as ui;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 

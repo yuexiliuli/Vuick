@@ -393,7 +393,7 @@ mod tests {
 
     #[gpui::test]
     fn pointer_click_fires_once(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let (cx, clicks, _) = harness(cx, false);
         cx.simulate_click(point(px(50.), px(20.)), Modifiers::default());
         assert_eq!(clicks.get(), 1, "点击按钮应触发一次 on_click");
@@ -402,7 +402,7 @@ mod tests {
 
     #[gpui::test]
     fn click_outside_hit_area_does_not_fire(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let (cx, clicks, _) = harness(cx, false);
         // 按钮只在 100x40 命中区内可点：点父级空白（右上角）不应触发按钮。
         cx.simulate_click(point(px(180.), px(10.)), Modifiers::default());
@@ -411,7 +411,7 @@ mod tests {
 
     #[gpui::test]
     fn disabled_button_is_inert_and_blocks_parent(cx: &mut TestAppContext) {
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let (cx, clicks, parent_clicks) = harness(cx, true);
         cx.simulate_click(point(px(50.), px(20.)), Modifiers::default());
         assert_eq!(clicks.get(), 0, "禁用按钮不应触发 on_click");

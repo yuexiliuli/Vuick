@@ -230,7 +230,7 @@ impl CommandPalette {
     }
 
     /// Esc / 点击面板外：关闭并把焦点还给此前控件。宿主 toggle 关闭也走此路径。
-    pub(crate) fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let focus_left = self.focus_left(window, cx);
         self.selected = None;
         cx.stop_propagation();
@@ -286,50 +286,50 @@ impl CommandPalette {
     }
 
     /// 查询输入框的焦点句柄（宿主打开时聚焦它）。
-    pub(crate) fn input_handle(&self, cx: &App) -> FocusHandle {
+    pub fn input_handle(&self, cx: &App) -> FocusHandle {
         self.input.read(cx).focus_handle(cx)
     }
 
     /// 查询输入框实体（测试驱动过滤用：`set_value` 发 `Change` → 本面板重算）。
     #[allow(dead_code)] // 测试驱动入口（app::tests 用）
-    pub(crate) fn input_entity(&self) -> Entity<InputState> {
+    pub fn input_entity(&self) -> Entity<InputState> {
         self.input.clone()
     }
 
     // -- 测试可见性 --
 
     #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn mode(&self) -> PaletteMode {
+    pub fn mode(&self) -> PaletteMode {
         self.mode
     }
 
     /// 列表滚动句柄（app::tests 断言「列表溢出可在容器内滚动」用，读 `max_offset()`）。
     #[allow(dead_code)] // 测试驱动入口（app::tests 用）
-    pub(crate) fn scroll_handle(&self) -> ScrollHandle {
+    pub fn scroll_handle(&self) -> ScrollHandle {
         self.scroll_handle.clone()
     }
 
     /// 当前查询词。
     #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn query(&self) -> &str {
+    pub fn query(&self) -> &str {
         &self.query
     }
 
     /// 可见条目数（过滤后）。
     #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn visible_len(&self) -> usize {
+    pub fn visible_len(&self) -> usize {
         self.filtered.len()
     }
 
     /// 选中行的（可见列表内）下标。
     #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn selected(&self) -> Option<usize> {
+    pub fn selected(&self) -> Option<usize> {
         self.selected
     }
 
     /// 可见行 `row` 的主文案（测试断言过滤结果用）。
     #[allow(dead_code)] // 测试断言用（app::tests）
-    pub(crate) fn visible_label(&self, row: usize) -> Option<&str> {
+    pub fn visible_label(&self, row: usize) -> Option<&str> {
         self.filtered
             .get(row)
             .and_then(|&i| self.items.get(i))

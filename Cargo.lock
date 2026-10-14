@@ -2120,6 +2120,7 @@ dependencies = [
  "gpui-editor-config",
  "gpui-editor-ime",
  "gpui-editor-syntax",
+ "gpui-editor-ui",
  "gpui-editor-viewer",
  "gpui_platform",
  "image",
@@ -2169,6 +2170,17 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "syntect",
+]
+
+[[package]]
+name = "gpui-editor-ui"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-editor-base",
+ "gpui-editor-config",
+ "gpui-editor-ime",
+ "regex",
 ]
 
 [[package]]

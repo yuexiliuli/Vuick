@@ -40,7 +40,7 @@ const TIP_LAYER_PRIORITY: usize = 60;
 
 /// 单个 tooltip 的跨帧状态（按宿主元素 id 键控，宿主消失即随元素状态回收）。
 #[derive(Default)]
-pub(crate) struct TooltipState {
+pub struct TooltipState {
     /// 是否已显示浮层（延迟到期且仍悬停才置 true）。
     visible: bool,
     /// 当前是否悬停在宿主上。
@@ -50,7 +50,7 @@ pub(crate) struct TooltipState {
 }
 
 /// 在 render 期取/建宿主的 tooltip 状态（按 `id` 键控，幂等）。
-pub(crate) fn tooltip_state(id: &str, window: &mut gpui::Window, cx: &mut App) -> Entity<TooltipState> {
+pub fn tooltip_state(id: &str, window: &mut gpui::Window, cx: &mut App) -> Entity<TooltipState> {
     window.use_keyed_state(format!("{id}-tooltip"), cx, |_, _| {
         TooltipState::default()
     })
@@ -58,7 +58,7 @@ pub(crate) fn tooltip_state(id: &str, window: &mut gpui::Window, cx: &mut App) -
 
 /// 悬停进入/移出统一入口（挂在宿主 `on_hover` 闭包内）：
 /// 进入 → 排队延迟显示；移出 → 立即隐藏并作废在途定时器。
-pub(crate) fn tooltip_hover(state: &Entity<TooltipState>, hovered: bool, cx: &mut App) {
+pub fn tooltip_hover(state: &Entity<TooltipState>, hovered: bool, cx: &mut App) {
     if hovered {
         tooltip_enter(state, cx);
     } else {
@@ -105,7 +105,7 @@ fn tooltip_exit(state: &Entity<TooltipState>, cx: &mut App) {
 }
 
 /// 当前是否显示浮层（render 期读取）。
-pub(crate) fn tooltip_visible(state: &Entity<TooltipState>, cx: &App) -> bool {
+pub fn tooltip_visible(state: &Entity<TooltipState>, cx: &App) -> bool {
     state.read(cx).visible
 }
 
@@ -115,7 +115,7 @@ pub(crate) fn tooltip_visible(state: &Entity<TooltipState>, cx: &App) -> bool {
 ///
 /// `host_w / host_h`：宿主（按钮）尺寸，用于「贴右缘水平居中」的偏移换算
 /// （活动栏按钮 40×38、PDF 导航按钮 28×24 等）。
-pub(crate) fn tooltip_layer(
+pub fn tooltip_layer(
     id: &str,
     text: &str,
     show: bool,

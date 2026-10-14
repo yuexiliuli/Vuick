@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn markup_is_wellformed_and_tintable() {
-        let mut names = vec![
+        let names = vec![
             IconName::PanelLeftClose,
             IconName::PanelLeftOpen,
             IconName::WindowMinimize,
@@ -231,17 +231,21 @@ mod tests {
             IconName::File,
             IconName::ChevronRight,
             IconName::ChevronDown,
-        ];
-        #[cfg(feature = "video")]
-        names.extend([
+            #[cfg(feature = "video")]
             IconName::Play,
+            #[cfg(feature = "video")]
             IconName::Pause,
+            #[cfg(feature = "video")]
             IconName::Volume,
+            #[cfg(feature = "video")]
             IconName::VolumeX,
+            #[cfg(feature = "video")]
             IconName::SkipBack,
+            #[cfg(feature = "video")]
             IconName::SkipForward,
+            #[cfg(feature = "video")]
             IconName::Camera,
-        ]);
+        ];
         for name in names {
             let m = name.svg_markup();
             assert!(m.contains("<svg"), "{:?} 应产出 svg 标记", name);

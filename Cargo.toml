@@ -50,11 +50,16 @@ gpui-editor-base = { path = "crates/gpui-editor-base" }
 gpui-editor-ime = { path = "crates/gpui-editor-ime" }
 gpui-editor-viewer = { path = "crates/gpui-editor-viewer" }
 gpui-editor-syntax = { path = "crates/gpui-editor-syntax" }
+# 拆分 workspace 后迁出的自研 UI 组件库 crate（P3a）：ui，依赖 {config, base, ime} 不再依赖 editor。
+gpui-editor-ui = { path = "crates/gpui-editor-ui" }
 
 [features]
 default = ["video"]
 test-support = ["gpui/test-support"]
-video = []
+# video：当前视频解码模块仍在根包，feature 转发到 ui crate 以同步开关其视频图标
+# 变体（IconName::Play/Pause/…，见 gpui-editor-ui/icon.rs）。P4 视频解耦为独立
+# crate 后再改为 `video = ["dep:gpui-editor-video"]`。
+video = ["gpui-editor-ui/video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 依赖叠加 test-support feature（features 与 workspace 定义相加；
@@ -63,7 +68,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax"]
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

@@ -16,7 +16,7 @@ pub(crate) const HOVER_STIFFNESS: f32 = 3200.0;
 pub(crate) const HOVER_EPSILON: f32 = 0.002;
 
 /// 0..1 hover 透明度弹簧（临界阻尼：damping=2√k，mass=1，无过冲）。
-pub(crate) fn hover_spring(target: f32) -> SpringAnimation<f32> {
+pub fn hover_spring(target: f32) -> SpringAnimation<f32> {
     SpringAnimation::new(SpringConfig::new(
         HOVER_STIFFNESS,
         2.0 * HOVER_STIFFNESS.sqrt(),
@@ -29,7 +29,7 @@ pub(crate) fn hover_spring(target: f32) -> SpringAnimation<f32> {
 /// 给元素包一层「hover 背景淡入」：悬停时把背景从透明淡入到 `fill`、
 /// 移出淡出。`fill` 自带目标 alpha（`opacity` 是乘性，v=1 时即为 `fill` 原色，
 /// 视觉语义不变），只动过渡时序。
-pub(crate) fn hover_bg_fade<E>(
+pub fn hover_bg_fade<E>(
     el: E,
     id: impl Into<ElementId>,
     fill: Hsla,

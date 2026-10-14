@@ -150,7 +150,7 @@ pub(crate) fn empty_illustration(cx: &mut App) -> gpui::AnyElement {
 ///   由旁路 `Entity::update` 驱动宿主状态，不应 `stop_propagation`（欢迎页是整屏
 ///   覆盖元素，单击/按钮互不干扰）。
 #[allow(clippy::type_complexity)] // 双击回调签名较长（宿主无关回调），拆别名反添一层
-pub(crate) fn empty_state_hero(
+pub fn empty_state_hero(
     main: &str,
     sub: &str,
     action: Option<gpui::AnyElement>,
@@ -217,7 +217,7 @@ pub(crate) fn empty_state_hero(
 
 /// 侧栏窄面板的空态占位：小号灰色图标 + 弱化文案（与正文区空态同款灰蓝视觉）。
 /// `id` 供测试与样式定位；图标复用 [`IconName`]（Fluent 1.5 线性描边，P2 统一风格）。
-pub(crate) fn compact_empty_state(
+pub fn compact_empty_state(
     id: &'static str,
     icon: IconName,
     text: &str,
