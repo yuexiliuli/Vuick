@@ -1550,3 +1550,89 @@
         );
     }
 
+    /// 回归：侧边栏「目录 / 搜索结果」面板的可见纵向滚动条——超长内容下面板渲染
+    /// 自绘滚动条叠层（`sidebar-toc-vscrollbar` / `sidebar-search-vscrollbar`，
+    /// 叠在滚动容器上、尺寸非零），且目录虚拟化不被滚动条破坏（带外条目仍不物化）。
+    #[gpui::test]
+    async fn sidebar_toc_and_search_show_vscrollbars(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let p = std::env::temp_dir().join(format!("gpui-sidebar-vs-{}.md", std::process::id()));
+        let mut doc = String::new();
+        for i in 0..600 {
+            doc.push_str(&format!("# 第{i}章\n## 小节{i}\n正文段落 {i}。\n\n"));
+        }
+        std::fs::write(&p, &doc).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(p.to_str().unwrap(), window, cx));
+        });
+        for _ in 0..10 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+
+        // 目录面板：滚动条叠层出现且尺寸非零；虚拟化依旧（第 1000 个条目不带外物化）
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Toc, cx),
+            );
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        let toc_bar = cx
+            .debug_bounds("sidebar-toc-vscrollbar")
+            .expect("目录超量应显示滚动条叠层 sidebar-toc-vscrollbar");
+        assert!(
+            toc_bar.size.height > px(0.),
+            "目录滚动条叠层应有非零高度，实际={toc_bar:?}"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-scroll").is_some(),
+            "目录滚动容器仍应渲染"
+        );
+        assert!(
+            cx.debug_bounds("sidebar-toc-md-1000").is_none(),
+            "虚拟化不受滚动条影响：带外条目不应物化"
+        );
+
+        // 搜索结果面板：命中多行大到可滚 → 滚动条叠层出现、滚动容器被跟踪仍渲染
+        cx.update(|_w, cx| {
+            app.update(
+                cx,
+                |app, cx| app.toggle_sidebar_view(crate::app::sidebar::SidebarView::Search, cx),
+            );
+        });
+        cx.update(|window, cx| {
+            let input = app.read(cx).search_state.clone();
+            input.update(cx, |s, cx| s.set_value("正文", window, cx));
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        for _ in 0..5 {
+            cx.run_until_parked();
+            let _ = cx.cx.refresh();
+            cx.run_until_parked();
+        }
+        assert!(
+            cx.debug_bounds("sidebar-search-results").is_some(),
+            "搜索结果滚动容器应渲染"
+        );
+        let search_bar = cx
+            .debug_bounds("sidebar-search-vscrollbar")
+            .expect("搜索结果超量应显示滚动条叠层 sidebar-search-vscrollbar");
+        assert!(
+            search_bar.size.height > px(0.),
+            "搜索滚动条叠层应有非零高度，实际={search_bar:?}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+

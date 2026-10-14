@@ -80,6 +80,7 @@ impl EditorApp {
                 toc_collapsed: Default::default(),
                 toc_tab: None,
                 toc_vscroll: gpui::ScrollHandle::new(),
+                search_vscroll: gpui::ScrollHandle::new(),
                 toc_width: None,
                 toc_cache: None,
                 // 有持久化宽度 → 恢复并固定为手动宽度；否则保持随内容自适应。

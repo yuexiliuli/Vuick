@@ -7,6 +7,7 @@
 
 use super::*;
 use ui::input::Input;
+use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use config::limits::SEARCH_RESULT_CAP;
 use ui::motion::{hover_bg_fade, hover_spring};
@@ -47,6 +48,9 @@ pub(crate) struct SidebarChromeState {
     pub(crate) toc_tab: Option<usize>,
     /// 目录滚动句柄：`#sidebar-toc-scroll` 经 `track_scroll` 跟踪，虚拟化按偏移只物化可视带。
     pub(crate) toc_vscroll: gpui::ScrollHandle,
+    /// 搜索结果滚动句柄：`#sidebar-search-results*` 经 `track_scroll` 跟踪，
+    /// 右侧自绘纵向滚动条跟随（与目录/编辑器一致）。
+    pub(crate) search_vscroll: gpui::ScrollHandle,
     /// 目录自适应宽缓存 `(选项卡下标, 编辑版本, WyEditor 内容代号, 宽)`：内容没变只算一次，
     /// 禁逐帧 O(N) 全量测宽（大文档上万标题下每帧重扫 = 卡死热源之一）。
     pub(crate) toc_width: Option<(usize, u64, u64, f32)>,
@@ -696,18 +700,47 @@ impl EditorApp {
             .flex()
             .flex_col()
             .child(self.render_sidebar_toc_header())
-            .child(
+            // 滚动条只覆盖面板内容区（不含头部），故把滚动容器 + 滚动条叠层包进
+            // `relative` 包装层（对齐 panes/editor：叠层为滚动容器的兄弟、`absolute inset_0`）。
+            .child({
+                let vscroll = self.sidebar.toc_vscroll.clone();
                 div()
-                    .id("sidebar-toc-scroll")
-                    .debug_selector(|| "sidebar-toc-scroll".into())
+                    .id("sidebar-toc-scroll-wrap")
+                    .debug_selector(|| "sidebar-toc-scroll-wrap".into())
+                    .relative()
+                    .flex()
+                    .flex_col()
                     .flex_1()
+                    .min_w(px(0.))
                     .min_h(px(0.))
-                    .overflow_y_scroll()
-                    // 虚拟化依据：`toc_vscroll` 跟踪本容器的滚动偏移/视口高（跨帧稳定）。
-                    .track_scroll(&self.sidebar.toc_vscroll)
-                    .py_1()
-                    .child(inner),
-            )
+                    .child(
+                        div()
+                            .id("sidebar-toc-scroll")
+                            .debug_selector(|| "sidebar-toc-scroll".into())
+                            .flex_1()
+                            // min-width:auto 会拒绝缩窄（拖窄面板后滚动容器不愿窄于最宽条目），
+                            // 显式 min_w(0) 保持原序——与搜索结果包装层内部容器一致。
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            // 虚拟化依据：`toc_vscroll` 跟踪本容器的滚动偏移/视口高（跨帧稳定）。
+                            .track_scroll(&vscroll)
+                            .py_1()
+                            .child(inner),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-toc-vscrollbar")
+                            .debug_selector(|| "sidebar-toc-vscrollbar".into())
+                            .absolute()
+                            .inset_0()
+                            .child(
+                                Scrollbar::vertical(&vscroll)
+                                    .mode(ScrollbarMode::Always)
+                                    .viewport_from_layout(),
+                            ),
+                    )
+            })
             // P2-10：面板开合轻淡入（宽度动画会让「自适应宽 + 布局断言」测试抖动，
             // 改为只动绘制、不碰布局的透明度淡入）。
             .with_spring(
@@ -935,26 +968,22 @@ impl EditorApp {
                 let qo = q.to_string();
                 pdf.update(cx, |v, cx| v.set_search(&qo, cx));
             }
-            return self.render_sidebar_pdf_search(window, &pdf, q, cx);
+            let pdf_results = self.render_sidebar_pdf_search(window, &pdf, q, cx);
+            return self.wrap_search_scroll("sidebar-search-results-pdf", pdf_results);
         }
         let scan = self.sidebar_search_scan(q, cx);
         let hits = scan.file_tabs.len() + scan.line_hits.len();
         // 无命中 → 居中「灰色搜索图标 + 文案」空态占位（与目录/正文区空态同款视觉）。
         if hits == 0 {
-            return div()
-                .id("sidebar-search-results")
-                .debug_selector(|| "sidebar-search-results".into())
-                .flex_1()
-                .min_w(px(0.))
-                .min_h(px(0.))
-                .overflow_y_scroll()
-                .child(ui::empty_state::compact_empty_state(
+            return self.wrap_search_scroll(
+                "sidebar-search-results",
+                ui::empty_state::compact_empty_state(
                     "sidebar-search-empty",
                     IconName::Search,
                     "未找到匹配内容",
                     cx,
-                ))
-                .into_any_element();
+                ),
+            );
         }
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         rows.extend(self.sidebar_search_file_rows(
@@ -967,15 +996,54 @@ impl EditorApp {
         ));
         rows.extend(self.sidebar_search_line_rows(window, &scan, muted, active_bg, cx));
 
+        let inner = div()
+            .child(self.sidebar_search_summary(hits, muted))
+            .child(div().flex().flex_col().py_1().children(rows));
+        self.wrap_search_scroll("sidebar-search-results", inner)
+    }
+
+    /// 搜索结果滚动容器包装：`overflow_y_scroll` 滚动容器外套 `relative` 包装层，
+    /// 叠一条常显（`Always`）纵向滚动条——与目录/编辑器/预览同一语义：内容超量可滚
+    /// 时随 [`Self::search_vscroll`] 显示 thumb，轨道点击跳转、thumb 可拖。
+    /// `container_id` 透传（普通搜索 `sidebar-search-results` / PDF 搜索 `-pdf`，测试沿用）。
+    fn wrap_search_scroll(
+        &self,
+        container_id: &'static str,
+        inner: impl IntoElement,
+    ) -> gpui::AnyElement {
+        let vhand = self.sidebar.search_vscroll.clone();
         div()
-            .id("sidebar-search-results")
-            .debug_selector(|| "sidebar-search-results".into())
+            .id("sidebar-search-results-wrap")
+            .debug_selector(|| "sidebar-search-results-wrap".into())
+            .relative()
+            .flex()
+            .flex_col()
             .flex_1()
             .min_w(px(0.))
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .child(self.sidebar_search_summary(hits, muted))
-            .child(div().flex().flex_col().py_1().children(rows))
+            .child(
+                div()
+                    .id(SharedString::from(container_id))
+                    .debug_selector(move || container_id.to_string())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .track_scroll(&vhand)
+                    .child(inner),
+            )
+            .child(
+                div()
+                    .id("sidebar-search-vscrollbar")
+                    .debug_selector(|| "sidebar-search-vscrollbar".into())
+                    .absolute()
+                    .inset_0()
+                    .child(
+                        Scrollbar::vertical(&vhand)
+                            .mode(ScrollbarMode::Always)
+                            .viewport_from_layout(),
+                    ),
+            )
             .into_any_element()
     }
 
