@@ -322,8 +322,7 @@ impl PdfViewer {
         self.scroll.set_offset(gpui::point(px(0.), px(-top)));
     }
 
-    /// 页数（仅测试消费；文档尚未加载完时为 0）。
-    #[cfg(test)]
+    /// 页数（文档尚未加载完时为 0）。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
     pub fn page_count(&self) -> usize {
         self.dims.len()
     }
@@ -342,10 +341,23 @@ impl PdfViewer {
         Some((first + 1, self.dims.len()))
     }
 
-    /// 是否已加载完成（仅测试消费）。
-    #[cfg(test)]
+    /// 是否已加载完成。P4 拆 crate 后根包 app::tests 亦消费，取消 `cfg(test)`。
     pub fn is_loaded(&self) -> bool {
         !self.loading && self.worker.is_some() && !self.dims.is_empty()
+    }
+
+    /// 无任何输入下「已调度渲染」进度快照（根包 app::tests 的 PDF 用例消费，验证
+    /// 「负载完成 → notify → 窗口重绘」链条会主动发起瓦片/封面调度）：
+    /// `(首槽已落瓦片数, 首槽封面是否已入, 在途瓦片请求数)`。
+    /// P4 拆 crate 后 app::tests 不能直接读 `slots`/`pending_tiles`（pdf crate 私有字段），
+    /// 经此只读访问器取数。
+    pub fn tiles_schedule_progress(&self) -> (usize, bool, usize) {
+        let s0 = self.slots.first();
+        (
+            s0.map(|s| s.tiles.len()).unwrap_or(0),
+            s0.map(|s| s.cover.is_some()).unwrap_or(false),
+            self.pending_tiles.len(),
+        )
     }
 
     /// 设置阅读画布背景色。
@@ -1367,7 +1379,7 @@ impl PdfViewer {
     }
 
     /// 书签目录访问器（侧边栏目录使用）。
-    pub(crate) fn outlines(&self) -> &[PdfOutlineEntry] {
+    pub fn outlines(&self) -> &[PdfOutlineEntry] {
         &self.outlines
     }
 
@@ -1565,7 +1577,7 @@ impl PdfViewer {
     // 渲染命中高亮，侧边栏展示计数与页列表。阅读器只负责检索执行、高亮与跳转。
 
     /// 注入新查询（侧边栏搜索框内容变化时调用）。空串立即清空命中；非空防抖后后台检索。
-    pub(crate) fn set_search(&mut self, query: &str, cx: &mut Context<Self>) {
+    pub fn set_search(&mut self, query: &str, cx: &mut Context<Self>) {
         let q = query.trim().to_string();
         if self.search_query == q {
             return;
@@ -1583,7 +1595,7 @@ impl PdfViewer {
     }
 
     /// 侧边栏读取检索状态：`(命中数, 是否截断, 当前激活命中序号)`。
-    pub(crate) fn search_summary(&self) -> (usize, bool, usize) {
+    pub fn search_summary(&self) -> (usize, bool, usize) {
         (
             self.search_matches.len(),
             self.search_truncated,
@@ -1593,7 +1605,7 @@ impl PdfViewer {
 
     /// 命中上下文片段（侧边栏逐行展示）：`(页号, 前5字+目标+后5字)`，封顶 60 行。
     /// 片段在 worker 搜到时就地生成（`PdfSearchHit::snippet`），不依赖阅读器文本缓存。
-    pub(crate) fn search_snippets(&self) -> Vec<(usize, String)> {
+    pub fn search_snippets(&self) -> Vec<(usize, String)> {
         self.search_matches
             .iter()
             .take(60)
@@ -1602,7 +1614,7 @@ impl PdfViewer {
     }
 
     /// 跳到某页上**第一个命中**（侧边栏点"第 N 页"）。
-    pub(crate) fn focus_match_on_page(&mut self, page: usize, cx: &mut Context<Self>) {
+    pub fn focus_match_on_page(&mut self, page: usize, cx: &mut Context<Self>) {
         let Some(pos) = self.search_matches.iter().position(|h| h.page == page) else {
             self.scroll_to_page(page);
             cx.notify();
@@ -1675,7 +1687,7 @@ impl PdfViewer {
 
     /// 前进/后退一个命中（循环），滚动到命中页并预取其文本层（高亮立即可用）。
     /// 侧边栏「上一处/下一处」按钮驱动。
-    pub(crate) fn move_match(&mut self, delta: i64, cx: &mut Context<Self>) {
+    pub fn move_match(&mut self, delta: i64, cx: &mut Context<Self>) {
         let Some(next) =
             advance_match_index(self.search_matches.len(), self.search_active, delta)
         else {

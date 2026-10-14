@@ -16,8 +16,11 @@ use gpui::{
 use crate::ui::icon::{Icon, IconName};
 use crate::ui::motion::hover_spring;
 
+// 拆 workspace 后 toc 独立为 crate：`crate::ui::` 短路径改为指向 gpui-editor-ui crate。
+use gpui_editor_ui as ui;
+
 /// 断言 pre-order 条目 `idx` 是否有下级（可折叠）：紧邻下一项层级更深即有子项。
-pub(crate) fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {
+pub fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {
     levels
         .get(idx + 1)
         .is_some_and(|&next| next > levels[idx])
@@ -32,7 +35,7 @@ pub(crate) fn toc_node_has_child(levels: &[usize], idx: usize) -> bool {
 ///   条目截断的那些条目；采用「层级递减栈」维护。任一祖先折叠 → 本条隐藏。
 ///
 /// 纯函数、无副作用，便于单测。
-pub(crate) fn toc_visibility(levels: &[usize], collapsed: &HashSet<usize>) -> Vec<bool> {
+pub fn toc_visibility(levels: &[usize], collapsed: &HashSet<usize>) -> Vec<bool> {
     let n = levels.len();
     let mut visible = vec![true; n];
     // 祖先栈：保存“截至当前位置仍处于祖先链上的条目下标”（层级严格递增）。
@@ -60,7 +63,7 @@ pub(crate) fn toc_visibility(levels: &[usize], collapsed: &HashSet<usize>) -> Ve
 /// `has_child` 时生效）。`top_accent`：顶级条目用强调色圆点；`page_label`：右侧页码
 /// 文本（PDF 用页+1，Markdown 无页传 `None`）。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn toc_item_frame(
+pub fn toc_item_frame(
     row_id: String,
     caret_id: String,
     level: usize,

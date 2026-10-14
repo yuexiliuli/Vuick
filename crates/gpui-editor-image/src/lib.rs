@@ -16,6 +16,13 @@ mod viewer;
 
 pub use viewer::ImageViewer;
 
+// 拆 workspace 后 image 独立为 crate：`crate::config::` / `crate::ui::` 短路径改为
+// 指向对应 crate；viewer 内原 `crate::viewer::folder/pan_zoom` / `crate::image::is_image_extension`
+// 自引用已改直书 `gpui_editor_viewer::` / `crate::is_image_extension`（本 crate 有本地
+// `mod viewer`，不能用 `use gpui_editor_viewer as viewer` 别名——会遮蔽本地模块）。
+use gpui_editor_config as config;
+use gpui_editor_ui as ui;
+
 /// 可识别的图片扩展名（小写；`image` crate 默认特性可解码的子集）。
 /// 供 `EditorApp::is_image_path`（打开路由）与查看器自身「同文件夹扫描」共用。
 pub const IMAGE_EXTENSIONS: &[&str] = &[

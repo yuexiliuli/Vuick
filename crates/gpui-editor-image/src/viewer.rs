@@ -80,8 +80,8 @@ use crate::config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
     MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
-use crate::viewer::folder::FolderNav;
-use crate::viewer::pan_zoom;
+use gpui_editor_viewer::folder::FolderNav;
+use gpui_editor_viewer::pan_zoom;
 
 /// 一张已解码可立即上屏的图片（LRU 缓存条目）。
 #[derive(Clone)]
@@ -228,7 +228,7 @@ impl ImageViewer {
         cx.spawn(async move |weak, cx| {
             let nav = cx
                 .background_executor()
-                .spawn(async move { FolderNav::scan(&scan_at, crate::image::is_image_extension) })
+                .spawn(async move { FolderNav::scan(&scan_at, crate::is_image_extension) })
                 .await;
             let _ = weak.update(cx, |this, cx| {
                 this.nav = nav;
@@ -1872,7 +1872,7 @@ mod tests {
         std::fs::write(dir.join("note.md"), "not an image").unwrap();
         std::fs::write(dir.join("logo.WEBP"), "fake webp bytes").unwrap();
         let current = dir.join("b.png");
-        let nav = FolderNav::scan(&current, crate::image::is_image_extension);
+        let nav = FolderNav::scan(&current, crate::is_image_extension);
         let names: Vec<String> = nav
             .items()
             .iter()
@@ -1888,7 +1888,7 @@ mod tests {
     #[test]
     fn scan_folder_empty_dir_falls_back_to_single_item() {
         let p = tmp_dir("orf").join("orphan.png");
-        let nav = FolderNav::scan(&p, crate::image::is_image_extension);
+        let nav = FolderNav::scan(&p, crate::is_image_extension);
         assert_eq!(nav.len(), 1);
         assert_eq!(nav.current(), 0);
         assert_eq!(nav.current_path(), p);
@@ -1909,7 +1909,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("读取目录失败 {dir}: {e}"))
             .flatten()
             .map(|e| e.path())
-            .filter(|p| crate::image::is_image_extension(p))
+            .filter(|p| crate::is_image_extension(p))
             .collect();
         files.sort();
         assert!(!files.is_empty(), "目录内无图片可测：{dir}");

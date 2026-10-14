@@ -57,14 +57,21 @@ gpui-editor-editor = { path = "crates/gpui-editor-editor" }
 # 拆分 workspace 后迁出的自研 Markdown 渲染 + WYSIWYG 编辑 crate（P3c）：markdown，
 # 依赖 {config, base, ime, ui, editor, syntax}；markdown → editor 合法单向（WYSIWYG 内嵌 CodeEditor）。
 gpui-editor-markdown = { path = "crates/gpui-editor-markdown" }
+# 拆分 workspace 后迁出的子阅读器 crate（P4）：toc / pdf / image / video / epub。
+gpui-editor-toc = { path = "crates/gpui-editor-toc" }
+gpui-editor-pdf = { path = "crates/gpui-editor-pdf" }
+gpui-editor-image = { path = "crates/gpui-editor-image" }
+# P4：视频解码内核已随 video crate 独立；作为可选依赖，由根 `video` feature 开关。
+gpui-editor-video = { path = "crates/gpui-editor-video", optional = true }
+gpui-editor-epub = { path = "crates/gpui-editor-epub" }
 
 [features]
 default = ["video"]
 test-support = ["gpui/test-support"]
-# video：当前视频解码模块仍在根包，feature 转发到 ui crate 以同步开关其视频图标
-# 变体（IconName::Play/Pause/…，见 gpui-editor-ui/icon.rs）。P4 视频解耦为独立
-# crate 后再改为 `video = ["dep:gpui-editor-video"]`。
-video = ["gpui-editor-ui/video"]
+# video：P4 已把视频模块拆为独立 `gpui-editor-video` crate。
+# 本 feature = 开启该可选依赖，并保留转发给 ui crate 以同步开关其视频图标变体
+# （IconName::Play/Pause/…，见 gpui-editor-ui/icon.rs；video crate 依赖 ui 亦开启之）。
+video = ["dep:gpui-editor-video", "gpui-editor-ui/video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 依赖叠加 test-support feature（features 与 workspace 定义相加；
@@ -73,7 +80,7 @@ gpui = { workspace = true, features = ["test-support"] }
 
 [workspace]
 resolver = "2"
-members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor", "crates/gpui-editor-markdown"]
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base", "crates/gpui-editor-ime", "crates/gpui-editor-viewer", "crates/gpui-editor-syntax", "crates/gpui-editor-ui", "crates/gpui-editor-editor", "crates/gpui-editor-markdown", "crates/gpui-editor-toc", "crates/gpui-editor-pdf", "crates/gpui-editor-image", "crates/gpui-editor-video", "crates/gpui-editor-epub"]
 # 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
 # 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
 # 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。

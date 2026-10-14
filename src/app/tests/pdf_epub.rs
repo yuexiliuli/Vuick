@@ -200,13 +200,9 @@
         let (loaded, tiles, cover, pending) = cx.update(|_w, cx| {
             let a = app.read(cx);
             let pv = a.tabs[a.active_tab].pdf_preview.as_ref().unwrap().read(cx);
-            let s0 = pv.slots.first();
-            (
-                pv.is_loaded(),
-                s0.map(|s| s.tiles.len()).unwrap_or(0),
-                s0.map(|s| s.cover.is_some()).unwrap_or(false),
-                pv.pending_tiles.len(),
-            )
+            // P4：pdf 已独立 crate，经只读访问器取内部调度状态（不再直接读 slots/pending_tiles）。
+            let (tiles, cover, pending) = pv.tiles_schedule_progress();
+            (pv.is_loaded(), tiles, cover, pending)
         });
         assert!(loaded, "应已加载");
         // 关键回归：无任何输入也必须在首帧布局就位后**发出瓦片/封面请求**（此前

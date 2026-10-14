@@ -68,8 +68,8 @@ use crate::ui::icon::{Icon, IconName};
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
 
-use crate::viewer::folder::FolderNav;
-use crate::viewer::pan_zoom;
+use gpui_editor_viewer::folder::FolderNav;
+use gpui_editor_viewer::pan_zoom;
 
 /// 解码通道槽位数（帧数）：回压 + 内存有界；播放/seek 时缓冲少量前跳。
 const DECODE_AHEAD_FRAMES: usize = 2;
@@ -1853,7 +1853,7 @@ mod tests {
 
     fn fixture() -> PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures")
+            .join("../../fixtures")
             .join("video测试.mp4")
     }
 
@@ -2417,7 +2417,7 @@ mod tests {
             // 用不存在的路径：start 快速落错误、不开真实解码 → 不占 FFmpeg 锁
             // （拖拽只依赖 intrinsic/zoom，毋需真实帧）
             VideoViewer::new(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-such-drag.mp4"),
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/no-such-drag.mp4"),
                 cx,
             )
         });
@@ -2512,8 +2512,8 @@ mod tests {
     /// 移开 1s 隐藏 → 切视频浮现。普通模式控制条常驻（`controls_visible` 不参与渲染判断）。
     #[gpui::test]
     async fn locked_controls_bar_floats_on_hover_and_auto_hides(cx: &mut TestAppContext) {
-        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-a-lock.mp4");
-        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-b-lock.mp4");
+        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/no-a-lock.mp4");
+        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/no-b-lock.mp4");
         let ent = cx.update(|app| app.new(|cx| {
             let mut v = blank(a.clone(), cx);
             v.nav = FolderNav::new(vec![a, b], 0);
@@ -2808,8 +2808,8 @@ mod tests {
     #[gpui::test]
     async fn tick_natural_end_respects_playback_mode(cx: &mut TestAppContext) {
         // 循环：撞结尾 → 自动切下一支
-        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-a-mode.mp4");
-        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/no-b-mode.mp4");
+        let a = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/no-a-mode.mp4");
+        let b = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/no-b-mode.mp4");
         let ent = cx.update(|app| app.new(|cx| {
             let mut v = blank(a.clone(), cx);
             v.playback_mode = PlaybackMode::Loop;

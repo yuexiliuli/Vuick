@@ -21,6 +21,12 @@ mod viewer;
 
 pub use viewer::VideoViewer;
 
+// 拆 workspace 后 video 独立为 crate：`crate::video::` / `crate::ui::` 短路径改为
+// 指向本 crate 根或 gpui-editor-ui；viewer 内原 `crate::viewer::folder/pan_zoom` 自引用
+// 已改直书 `gpui_editor_viewer::`（本 crate 有本地 `mod viewer`，不能用别名遮蔽）。
+use crate as video;
+use gpui_editor_ui as ui;
+
 /// 可识别的视频扩展名（小写；按文件头之外的扩展名路由，最终能否解出由 ffmpeg 决定）。
 /// 供 `EditorApp::is_video_path`（打开路由）与后续「同文件夹扫描」共用。
 pub const VIDEO_EXTENSIONS: &[&str] = &[

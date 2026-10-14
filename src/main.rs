@@ -16,21 +16,11 @@
 
 mod actions;
 mod app;
-mod epub;
-mod image;
-mod pdf;
 mod scrollbar;
-mod toc;
 
-#[cfg(feature = "video")]
-mod video;
-
-// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::ime::` /
-// `crate::viewer::` / `crate::syntax::` 短路径（后续各模块迁出时再逐段清理）。
+// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::syntax::` /
+// `crate::config::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
 use gpui_editor_syntax as syntax;
-use gpui_editor_viewer as viewer;
-// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::config::` /
-// `crate::util::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
 use gpui_editor_base::prof;
 use gpui_editor_config as config;
 // P3a：自研 UI 组件库迁出为 `gpui-editor-ui` crate，以 crate 根别名保持
@@ -42,6 +32,15 @@ use gpui_editor_editor as editor;
 // P3c：自研 Markdown 渲染 + WYSIWYG 编辑迁出为 `gpui-editor-markdown` crate，
 // 以 crate 根别名保持 `crate::markdown::` 短路径（app/epub/main 现有引用零改动）。
 use gpui_editor_markdown as markdown;
+// P4：子阅读器 toc/pdf/image/video/epub 迁出为独立 crate，以 crate 根别名保持
+// `crate::toc::` / `crate::pdf::` / `crate::image::` / `crate::video::` / `crate::epub::`
+// 短路径（app 现有引用零改动；video 随根 feature 开关）。
+use gpui_editor_epub as epub;
+use gpui_editor_image as image;
+use gpui_editor_pdf as pdf;
+use gpui_editor_toc as toc;
+#[cfg(feature = "video")]
+use gpui_editor_video as video;
 
 use gpui::{px, size, App, AppContext, Bounds, KeyBinding, WindowBounds, WindowOptions};
 

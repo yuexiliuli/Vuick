@@ -23,6 +23,11 @@ use gpui::{Image, ImageFormat};
 use crate::config::markdown::EPUB_IMG_SCHEME;
 use crate::markdown::RowAlign;
 
+// 拆 workspace 后 epub 独立为 crate：`crate::config::` / `crate::markdown::` 短路径
+// 改为指向对应 crate（epub 真实依赖 config + markdown）。
+use gpui_editor_config as config;
+use gpui_editor_markdown as markdown;
+
 /// 解析后的 EPUB 文档：元数据 + 按 spine 顺序的章节 Markdown 文本 + 内存图片。
 #[derive(Debug, Clone, Default)]
 pub struct EpubDocument {
@@ -665,7 +670,8 @@ mod tests {
     use super::*;
 
     fn test_epub_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/xy.epub")
+        // P4：本 crate 位于 crates/gpui-editor-epub，xy.epub 夹具在工作区根 fixtures/（上溯两级）。
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/xy.epub")
     }
 
     #[test]

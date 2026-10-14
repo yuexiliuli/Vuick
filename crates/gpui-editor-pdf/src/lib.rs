@@ -42,6 +42,21 @@ use anyhow::{Context as _, Result};
 use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 
+// 拆 workspace 后 pdf 独立为 crate：`crate::pdf::` / `crate::config::` /
+// `crate::ui::` / `crate::viewer::` 短路径改为指向本 crate 根或对应 crate。
+use crate as pdf;
+use gpui_editor_config as config;
+use gpui_editor_ui as ui;
+use gpui_editor_viewer as viewer;
+
+/// 测试键位助手：pdf 独立 crate 后其测试不能再调根包的 `crate::test_support::bind_local_keymaps`
+/// （组合函数含 `markdown::wysiwyg::bind_keys` 且定义在根包，会形成依赖反转）。
+/// 本助手 = `gpui_editor_base::actions::bind_input_keys`（Input 键上下文）+
+/// `gpui_editor_ui::root::bind_keys`（Root 键上下文），等价于原组合去掉 markdown 部分，
+/// 覆盖 pdf 测试真正用到的两套键上下文（PdfViewer 挂在窗口 Root 下，无 WyEditor/Input）。
+#[cfg(test)]
+pub mod test_support;
+
 /// 由 **紧凑 BGRA 像素字节** 直接重建 [`gpui::RenderImage`]（零像素循环，仅包一层缓冲）。
 /// pdfium 渲染结果经 [`parser`] 原样带回，主线程只做 `from_raw` 包裹。
 pub fn render_image_from_bgra(bgra: Vec<u8>, w: u32, h: u32) -> Result<Arc<RenderImage>> {
@@ -62,8 +77,9 @@ pub(crate) fn timing_ms() -> f64 {
         * 1e3
 }
 
-#[cfg(test)]
-pub(crate) mod test_util {
+/// 测试支撑（`pub` 非 `cfg(test)`：根包 `app::tests` 的 PDF 用例也要经
+/// [`missing_pdf_fixture`] / [`lock`] 做 SKIP 守卫与 pdfium 串行锁，跨 crate 需可见）。
+pub mod test_util {
     use std::sync::{Mutex, OnceLock};
 
     /// pdfium-test 全局串行锁：pdfium 是 native 库，多个 #[test] 线程并发触碰
@@ -79,8 +95,10 @@ pub(crate) mod test_util {
     /// 本机 Rust 进程内 pdfium 对 `fixtures/` 下的 PDF 报 FormatError（PDF Complete 之外
     /// 风格无法解析），fixtures/ 下文件一律不用；`target/` 下三个文件生产路径可解析。
     /// 保留两元素索引形状：0=基础文本型、1=长文（≥50 页）。
-    pub(crate) fn test_pdf_paths() -> Vec<std::path::PathBuf> {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    /// P4：本 crate 位于 `crates/gpui-editor-pdf`，`CARGO_MANIFEST_DIR/target` 已变，
+    /// 上溯两级回工作区根 `target/`（夹具仍在仓库根 target/ 下手动装配）。
+    pub fn test_pdf_paths() -> Vec<std::path::PathBuf> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
         vec![
             manifest.join("pdf测试.pdf"),
             manifest.join("pdf测试2.pdf"),
@@ -90,7 +108,7 @@ pub(crate) mod test_util {
     /// 缺夹具判定：`target/pdf测试*.pdf` 任一缺失即 true。CI/装好夹具的机器返回 false，
     /// 测试真跑；本机无夹具时所有依赖真 PDF 的测试用它做「缺夹具即 SKIP」守卫（夹具
     /// 超 1MB 不入库，只能本地手动装配，故 SKIP 是常态而非异常）。
-    pub(crate) fn missing_pdf_fixture() -> bool {
+    pub fn missing_pdf_fixture() -> bool {
         !test_pdf_paths().iter().all(|p| p.exists())
     }
 }
@@ -685,7 +703,7 @@ mod tests {
     fn configure_sheet_selection_pipeline() {
         skip_if_missing_pdf_fixture!();
         let _guard = pdf_lock().lock().unwrap();
-        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试.pdf");
         assert!(p.exists(), "测试文件应存在: {}", p.display());
         let bytes = std::fs::read(&p).expect("读取 PDF 应成功");
         let (worker, doc_id, dims) = PdfWorker::open_and_dims(bytes).expect("打开应成功");
@@ -1013,10 +1031,10 @@ mod tests {
         }
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
 
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("../../target/pdf测试.pdf");
         // 宽区（可完全容纳）与窄区（窄于页宽+边距）各验证一次
         for pane_w in [1200.0f32, 600.0] {
             let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
@@ -1099,9 +1117,9 @@ mod tests {
         }
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试.pdf");
+            .join("../../target/pdf测试.pdf");
         let holder: Rc<RefCell<Option<Entity<crate::pdf::PdfViewer>>>> = Rc::default();
         let (_root, cx) = cx.add_window_view(|_window, cx| {
             let pdf = cx.new(|cx| crate::pdf::PdfViewer::new(pdf_path.clone(), cx));
@@ -1235,9 +1253,9 @@ mod tests {
         use std::rc::Rc;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1451,9 +1469,9 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试2.pdf");
+            .join("../../target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1616,9 +1634,9 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试2.pdf");
+            .join("../../target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1829,9 +1847,9 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试2.pdf");
+            .join("../../target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {
@@ -1998,9 +2016,9 @@ mod tests {
         use std::time::Duration;
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/pdf测试2.pdf");
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/pdf测试2.pdf");
 
         struct PageProbe {
             pdf: Entity<crate::pdf::PdfViewer>,
@@ -2152,9 +2170,9 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let _guard = crate::pdf::test_util::lock().lock().unwrap();
-        cx.update(crate::actions::bind_local_keymaps);
+        cx.update(crate::test_support::bind_local_keymaps);
         let pdf_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/pdf测试2.pdf");
+            .join("../../target/pdf测试2.pdf");
         assert!(pdf_path.exists(), "测试 PDF 应存在");
 
         struct PageProbe {

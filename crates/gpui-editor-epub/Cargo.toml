@@ -1,0 +1,14 @@
+[package]
+name = "gpui-editor-epub"
+version = "0.1.0"
+edition = "2024"
+description = "gpui-editor EPUB 解析 crate（OCF 容器 → 平铺 XHTML 文本流 → Markdown + 内存图片）"
+
+[dependencies]
+gpui = { workspace = true }
+anyhow = { workspace = true }
+zip = { workspace = true }
+roxmltree = { workspace = true }
+gpui-editor-config = { path = "../gpui-editor-config" }
+# epub → markdown 真实依赖：RowAlign / wysiwyg 只读宿主与 EPUB_IMG_SCHEME 常量。
+gpui-editor-markdown = { path = "../gpui-editor-markdown" }

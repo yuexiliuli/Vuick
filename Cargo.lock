@@ -2119,10 +2119,15 @@ dependencies = [
  "gpui-editor-base",
  "gpui-editor-config",
  "gpui-editor-editor",
+ "gpui-editor-epub",
+ "gpui-editor-image",
  "gpui-editor-ime",
  "gpui-editor-markdown",
+ "gpui-editor-pdf",
  "gpui-editor-syntax",
+ "gpui-editor-toc",
  "gpui-editor-ui",
+ "gpui-editor-video",
  "gpui-editor-viewer",
  "gpui_platform",
  "image",
@@ -2172,6 +2177,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-editor-epub"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui-editor-config",
+ "gpui-editor-markdown",
+ "roxmltree 0.21.1",
+ "zip",
+]
+
+[[package]]
+name = "gpui-editor-image"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-editor-config",
+ "gpui-editor-ui",
+ "gpui-editor-viewer",
+ "image",
+ "libjpeg-turbo-rs",
+]
+
+[[package]]
 name = "gpui-editor-ime"
 version = "0.1.0"
 dependencies = [
@@ -2202,11 +2231,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-editor-pdf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "gpui-editor-base",
+ "gpui-editor-config",
+ "gpui-editor-ui",
+ "gpui-editor-viewer",
+ "image",
+ "pdfium-render",
+]
+
+[[package]]
 name = "gpui-editor-syntax"
 version = "0.1.0"
 dependencies = [
  "gpui",
  "syntect",
+]
+
+[[package]]
+name = "gpui-editor-toc"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "gpui-editor-ui",
 ]
 
 [[package]]
@@ -2218,6 +2269,19 @@ dependencies = [
  "gpui-editor-config",
  "gpui-editor-ime",
  "regex",
+]
+
+[[package]]
+name = "gpui-editor-video"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cpal",
+ "gpui",
+ "gpui-editor-ui",
+ "gpui-editor-viewer",
+ "image",
+ "libloading",
 ]
 
 [[package]]

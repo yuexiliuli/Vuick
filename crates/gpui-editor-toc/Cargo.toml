@@ -1,0 +1,9 @@
+[package]
+name = "gpui-editor-toc"
+version = "0.1.0"
+edition = "2024"
+description = "gpui-editor 通用文档目录 crate（树折叠/可见性纯函数 + 单条目录行渲染）"
+
+[dependencies]
+gpui = { workspace = true }
+gpui-editor-ui = { path = "../gpui-editor-ui" }
