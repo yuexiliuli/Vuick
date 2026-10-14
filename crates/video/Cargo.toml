@@ -6,7 +6,7 @@ description = "gpui-editor 视频查看器 crate（FFmpeg 经 libloading 运行�
 
 [dependencies]
 gpui = { workspace = true }
-raster = { workspace = true }
+image = { workspace = true }
 anyhow = { workspace = true }
 cpal = { workspace = true }
 libloading = { workspace = true }

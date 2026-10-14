@@ -8,7 +8,7 @@ build = "build.rs"
 [dependencies]
 gpui = { workspace = true }
 pdfium-render = { workspace = true }
-raster = { workspace = true }
+image = { workspace = true }
 anyhow = { workspace = true }
 config = { path = "../config" }
 base = { path = "../base" }

@@ -991,8 +991,8 @@ fn bench_per_key_math_completion(cx: &mut TestAppContext) {
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(
-        raster::RgbaImage::from_raw(200, 40, vec![0u8; 200 * 40 * 4]).unwrap(),
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+        image::RgbaImage::from_raw(200, 40, vec![0u8; 200 * 40 * 4]).unwrap(),
     )]));
     vcx.update(|window, cx: &mut App| {
             let ed = host.read(cx).ed.clone();

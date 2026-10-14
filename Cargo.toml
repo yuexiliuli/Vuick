@@ -76,7 +76,7 @@ ropey = { version = "=2.0.0-beta.1", features = [
 ] }
 # PDF 栅格化用 native pdfium
 pdfium-render = "0.9.3"
-raster = { package = "image", version = "0.25", features = ["webp"] }
+image = { version = "0.25", features = ["webp"] }
 # LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"

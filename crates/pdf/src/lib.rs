@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use gpui::RenderImage;
-use raster::{Frame, RgbaImage};
+use image::{Frame, RgbaImage};
 
 // 拆 workspace 后 pdf 独立为 crate：`crate::pdf::` / `config::` /
 // `ui::` / `viewer::` 短路径改为指向本 crate 根或对应 crate。

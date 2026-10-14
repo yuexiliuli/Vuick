@@ -15,8 +15,8 @@ fn long_inline_math_typed_after_single_value_within_box(cx: &mut TestAppContext)
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let buf = raster::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(buf)]));
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
     vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         // Ready 位图：4000×40（自然宽远超 400px 窗口内容盒的可复原场景）。
@@ -95,8 +95,8 @@ fn block_math_wide_has_hscroll_and_natural_width(cx: &mut TestAppContext) {
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let buf = raster::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(buf)]));
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
     vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         // 光标放块外 → 折叠成卡片（非 reveal）。
@@ -168,8 +168,8 @@ fn block_math_typing_geometry_stable_across_slot_flip(cx: &mut TestAppContext) {
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let buf = raster::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(buf)]));
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
     vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         // 光标在后续段（块折叠成卡）：模拟「每键一次换代」——帧内交替 Loading/Ready。
@@ -230,8 +230,8 @@ fn wide_block_math_followed_by_typing_stays_single_value(cx: &mut TestAppContext
         WyHost { ed }
     });
     let vcx: &mut VisualTestContext = vcx;
-    let buf = raster::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(buf)]));
+    let buf = image::RgbaImage::from_raw(100, 80, vec![0u8; 100 * 80 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
     vcx.update(|window, cx: &mut App| {
         let ed = host.read(cx).ed.clone();
         ed.read(cx).math_slots().borrow_mut().insert(
@@ -298,8 +298,8 @@ fn block_math_typing_representation_stable_across_threshold(cx: &mut TestAppCont
     });
     let vcx: &mut VisualTestContext = vcx;
     // 假位图（纯 CPU）：就绪的“新位图”逐键换新引用，尺寸同源（逻辑 260×60）。
-    let buf = raster::RgbaImage::from_raw(100, 60, vec![0u8; 100 * 60 * 4]).unwrap();
-    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![raster::Frame::new(buf)]));
+    let buf = image::RgbaImage::from_raw(100, 60, vec![0u8; 100 * 60 * 4]).unwrap();
+    let img = std::sync::Arc::new(gpui::RenderImage::new(vec![image::Frame::new(buf)]));
     let (pin_w, pin_h) = (260.0f32, 60.0f32);
 
     // —— 复现/回归主体（一次函数内完成「就绪 → 逐键 → 删回 → 重输»）——

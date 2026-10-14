@@ -60,7 +60,7 @@ use gpui::{
     RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
     Styled, StyledImage, Window,
 };
-use raster::{Frame, RgbaImage};
+use image::{Frame, RgbaImage};
 use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
 /// 缩放下限 / 上限 / 步进（语义同 PDF 阅读器 Ctrl+滚轮缩放，区间更宽以支持图片 1:1 微调）。
@@ -1339,7 +1339,7 @@ fn decode_jpeg_display(
 
 /// 非 JPEG 全解 → **BGRA**（`image` crate 默认特性支持 png/gif/bmp/webp/ico/tiff…）。
 fn decode_generic(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let img = raster::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
@@ -1407,7 +1407,7 @@ mod tests {
     /// 写一张真实 PNG（`image` 默认特性可编码；JPEG 不支持 RGBA 编码，故其它
     /// 扩展名用例直接用占位字节——扫描只看扩展名，不看内容）。
     fn write_png(path: &Path, w: u32, h: u32) {
-        let img = raster::RgbaImage::from_pixel(w, h, raster::Rgba([200_u8, 30, 10, 255]));
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200_u8, 30, 10, 255]));
         img.save(path).expect("本测试自产 PNG 应能写出");
     }
 
@@ -1434,12 +1434,12 @@ mod tests {
 
     /// 写一张有内容（渐变）的 JPEG：保存走 `image` 内置 jpeg 编码（default features 支持）。
     fn write_jpeg(path: &Path, w: u32, h: u32) {
-        let mut img = raster::RgbImage::new(w, h);
+        let mut img = image::RgbImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
             let r = ((x * 255) / w) as u8;
             let g = ((y * 255) / h) as u8;
             let b = ((x + y) * 60 / (w + h)) as u8;
-            *px = raster::Rgb([r, g, b]);
+            *px = image::Rgb([r, g, b]);
         }
         img.save(path).expect("写出渐变 JPEG 应成功");
     }
@@ -1985,12 +1985,12 @@ mod tests {
 
     /// 写一张有内容（渐变）的 PNG——纯色会压缩成接近 0 字节、解码快，测不出差距。
     fn write_pattern_png(path: &Path, w: u32, h: u32) {
-        let mut img = raster::RgbaImage::new(w, h);
+        let mut img = image::RgbaImage::new(w, h);
         for (x, y, px) in img.enumerate_pixels_mut() {
             let r = ((x * 255) / w) as u8;
             let g = ((y * 255) / h) as u8;
             let b = ((x + y) * 60 / (w + h)) as u8;
-            *px = raster::Rgba([r, g, b, 255]);
+            *px = image::Rgba([r, g, b, 255]);
         }
         img.save(path).expect("写出渐变 PNG 应成功");
     }
