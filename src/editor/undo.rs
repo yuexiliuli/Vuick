@@ -19,18 +19,9 @@ pub const MAX_UNDO_TXS: usize = 1000;
 /// （zed/VS Code 式分组直觉：持续打字合并、停顿后打断）。
 pub const UNDO_GROUP_MS: Duration = Duration::from_millis(300);
 
-/// 编辑意图（决定合并规则）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EditIntent {
-    /// 连续打字（纯插入、无换行、邻接 → 合并成一个撤销单元）。
-    Typing,
-    /// Backspace 退格（纯删除、首尾相接 → 合并）。
-    Backspace,
-    /// 正向删除（纯删除、同起点 → 延伸合并）。
-    Delete,
-    /// 原子编辑（Enter/Tab/粘贴/程序化写 → 永不合并，并制造断层）。
-    Atomic,
-}
+/// 编辑意图（决定合并规则）：自 `gpui_editor_base` 下沉（断 editor↔ui、editor↔ime
+/// 两个耦合环），此处 re-export 保持 `crate::editor::EditIntent` 兼容。
+pub use gpui_editor_base::EditIntent;
 
 /// 一个已提交的撤销/重做单元。
 #[derive(Clone, Debug)]

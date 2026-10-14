@@ -16,20 +16,23 @@
 
 mod actions;
 mod app;
-mod config;
 mod editor;
 mod epub;
 mod image;
 mod ime;
 mod markdown;
 mod pdf;
-mod prof;
 mod scrollbar;
 mod syntax;
 mod toc;
 mod ui;
-mod util;
 mod viewer;
+
+// 拆 workspace 后迁出的叶子 crate 以 crate 根别名保持 `crate::config::` /
+// `crate::util::` / `crate::prof::` 短路径（后续各模块迁出时再逐段清理）。
+use gpui_editor_base::prof;
+use gpui_editor_base::util;
+use gpui_editor_config as config;
 
 #[cfg(feature = "video")]
 mod video;

@@ -15,7 +15,7 @@ use std::ops::Range;
 /// 在非字符边界处切 run 会 panic（`text.rs` 的 `is_char_boundary` assert / shaping 崩）。
 /// 预览 `row::char_align_range`、WYSIWYG `shape::runs_to_text_runs`、源码编辑器
 /// `render::char_align_highlights` 三处统一收敛到它。
-pub(crate) fn char_align_byte(text: &str, mut p: usize) -> usize {
+pub fn char_align_byte(text: &str, mut p: usize) -> usize {
     let len = text.len();
     p = p.min(len);
     while p < len && !text.is_char_boundary(p) {
@@ -29,7 +29,7 @@ pub(crate) fn char_align_byte(text: &str, mut p: usize) -> usize {
 /// M5-B5 P4-2：预览 `row::char_align_range` 已删，本实现保留为共享工具（供测试与
 /// 后续消费；WYSIWYG 侧有同语义的 `src→显示` 防御）——`#[allow(dead_code)]` 挂起告警。
 #[allow(dead_code)]
-pub(crate) fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> {
+pub fn char_align_range(text: &str, range: Range<usize>) -> Range<usize> {
     char_align_byte(text, range.start)..char_align_byte(text, range.end)
 }
 

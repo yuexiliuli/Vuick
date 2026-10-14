@@ -2116,6 +2116,8 @@ dependencies = [
  "cpal",
  "futures",
  "gpui",
+ "gpui-editor-base",
+ "gpui-editor-config",
  "gpui_platform",
  "image",
  "libjpeg-turbo-rs",
@@ -2133,6 +2135,21 @@ dependencies = [
  "serde_json",
  "syntect",
  "zip",
+]
+
+[[package]]
+name = "gpui-editor-base"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+]
+
+[[package]]
+name = "gpui-editor-config"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "serde_json",
 ]
 
 [[package]]

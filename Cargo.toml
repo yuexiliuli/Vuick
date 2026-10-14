@@ -6,17 +6,80 @@ description = "基于 GPUI 的文本 / 代码 / Markdown 编辑器"
 edition = "2024"
 
 [dependencies]
+# gpui：钉死 zed 仓库提交（显式 rev，避免 cargo update 漂移；升级需同步改 workspace.dependencies 与 Cargo.lock）。
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+memchr = { workspace = true }
+# 快速非加密哈希（默认 SipHash 在 debug 下对 3000-9000 条容器重建慢 5-10×）：
+# fold_plan 重建的 math_start/math_body/fold_lines/dyn_map 全部换 Fx（无迭代序依赖）。
+rustc-hash = { workspace = true }
+# 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
+# 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
+futures = { workspace = true }
+rfd = { workspace = true }
+anyhow = { workspace = true }
+zip = { workspace = true }
+roxmltree = { workspace = true }
+# ropey：自研编辑器直接持有的文本存储类型（CodeEditor 缓冲区/语法缓存）。
+ropey = { workspace = true }
+# PDF 栅格化用 native pdfium
+# 容器无损往返，字节逐像素保真（文本层对齐精度不受影响）。
+pdfium-render = { workspace = true }
+image = { workspace = true }
+# LaTeX 数学排版（参考 zorite-main 的 ratex-gpui 方案）：parse → layout → render，
+# 用 KaTeX 字体（embed-fonts 内嵌、纯 CPU 光栅），把 `$$…$$` / `$…$` 排版成 RenderImage，
+# 取代原来的 Unicode 近似（`∫₋∞∞` 等上下标/分式/根号终于按真实排版显示）。
+ratex-parser = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-render = { workspace = true }
+# 编辑器代码高亮：syntect 解析默认语法集（features 对齐：parsing + default-syntaxes + regex-fancy）。
+syntect = { workspace = true }
+libjpeg-turbo-rs = { workspace = true }
+# FFmpeg 解码内核搬进独立 cdylib 工作区成员 `video-ffmpeg`（见下注释与 [workspace]）：
+# 主 exe 不再静态链接 FFmpeg → 缺 FFmpeg 运行库也能启动，只在用到视频时经 libloading
+# 运行时加载；加载失败（缺 video_ffmpeg.dll 或 FFmpeg dll）就在窗口内报错。
+# 无 FFmpeg 环境的源码构建：`cargo build --workspace --no-default-features --exclude video-ffmpeg`。
+libloading = { workspace = true }
+cpal = { workspace = true }
+# 拆分 workspace 后迁出的叶子 crate（P1）：config 常数 / base 基础件。
+gpui-editor-config = { path = "crates/gpui-editor-config" }
+gpui-editor-base = { path = "crates/gpui-editor-base" }
+
+[features]
+default = ["video"]
+test-support = ["gpui/test-support"]
+video = []
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 依赖叠加 test-support feature（features 与 workspace 定义相加；
+# 不能改用 `gpui-test-support` 别名——同一 crate 对同一包起两个名字会报「multiple times with different names」）。
+gpui = { workspace = true, features = ["test-support"] }
+
+[workspace]
+resolver = "2"
+members = ["video-ffmpeg", "crates/gpui-editor-config", "crates/gpui-editor-base"]
+# 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
+# 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
+# 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
+# 无 FFmpeg 环境的源码构建仍可用 `cargo build --workspace --no-default-features --exclude video-ffmpeg` 绕过。
+default-members = [".", "video-ffmpeg"]
+
+# ---------------------------------------------------------------------------
+# workspace 统一依赖：版本与拆 crate 前根 Cargo.toml 逐项完全一致，只重分配不升级。
+# 各成员 crate 用 `x.workspace = true` 引用；升级/换版本只在此处改一处。
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
 # gpui：钉死 zed 仓库提交（显式 rev，避免 cargo update 漂移；升级需同步改三处与 Cargo.lock）。
 gpui = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de" }
+# 测试支持：同一 gpui 包开启 test-support feature 的别名（带测试的 crate 放 dev-dependencies）。
+gpui-test-support = { package = "gpui", git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["test-support"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["font-kit"] }
 serde_json = "1"
 regex = "1"
 memchr = "2"
-# 快速非加密哈希（默认 SipHash 在 debug 下对 3000-9000 条容器重建慢 5-10×）：
-# fold_plan 重建的 math_start/math_body/fold_lines/dyn_map 全部换 Fx（无迭代序依赖）。
 rustc-hash = "1.1"
-# 大文档「分块读盘·渐进装配」的异步通道（生产端非阻塞发送 / 消费端可 await；
-# 与 gpui 自身使用的 futures 同版本，已在依赖树内，不新增下载）。
 futures = "0.3"
 rfd = "0.17"
 anyhow = "1.0"
@@ -29,12 +92,9 @@ ropey = { version = "=2.0.0-beta.1", features = [
     "metric_utf16",
 ] }
 # PDF 栅格化用 native pdfium
-# 容器无损往返，字节逐像素保真（文本层对齐精度不受影响）。
 pdfium-render = "0.9.3"
 image = { version = "0.25", features = ["webp"] }
-# LaTeX 数学排版（参考 zorite-main 的 ratex-gpui 方案）：parse → layout → render，
-# 用 KaTeX 字体（embed-fonts 内嵌、纯 CPU 光栅），把 `$$…$$` / `$…$` 排版成 RenderImage，
-# 取代原来的 Unicode 近似（`∫₋∞∞` 等上下标/分式/根号终于按真实排版显示）。
+# LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
 ratex-parser = "0.1"
 ratex-layout = "0.1"
 ratex-render = { version = "0.1", features = ["embed-fonts"] }
@@ -45,30 +105,8 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "regex-fancy",
 ] }
 libjpeg-turbo-rs = "0.8"
-# FFmpeg 解码内核搬进独立 cdylib 工作区成员 `video-ffmpeg`（见下注释与 [workspace]）：
-# 主 exe 不再静态链接 FFmpeg → 缺 FFmpeg 运行库也能启动，只在用到视频时经 libloading
-# 运行时加载；加载失败（缺 video_ffmpeg.dll 或 FFmpeg dll）就在窗口内报错。
-# 无 FFmpeg 环境的源码构建：`cargo build --workspace --no-default-features --exclude video-ffmpeg`。
 libloading = "0.8"
 cpal = "0.18.2"
-
-[features]
-default = ["video"]
-test-support = ["gpui/test-support"]
-video = []
-
-[dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "93d745668805029476e6d7fbb19652116fed51de", features = ["test-support"] }
-
-[workspace]
-resolver = "2"
-members = ["video-ffmpeg"]
-# 根包 + 视频解码内核成员同为默认成员：`cargo build` / `cargo run` / `cargo test`（不带 -p）
-# 默认同时覆盖两者——否则（根包子包工作区）普通 `cargo build` 只构建本包，`video_ffmpeg.dll`
-# 不产出（运行/测试/打包都找不到它），迁走的解码回归测试也被漏跑。
-# 无 FFmpeg 环境的源码构建仍可用 `cargo build --workspace --no-default-features --exclude video-ffmpeg` 绕过。
-default-members = [".", "video-ffmpeg"]
-
 
 [profile.release]
 opt-level = "z"        # 优化目标改为最小体积（而非速度）
