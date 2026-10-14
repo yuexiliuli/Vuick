@@ -1,7 +1,7 @@
 //! 动效：全套 hover 淡入/淡出与布局宽度过渡的统一弹簧参数与助手（P2-10）。
 //!
 //! 全站 hover 背景共用一个临界阻尼弹簧（无过冲——欠阻尼会让 alpha 冲过 1
-//! 视觉发白），收敛 100-150ms；需要动的地方用 [`hover_spring`] 包
+//! 视觉发白），收敛约 60-75ms；需要动的地方用 [`hover_spring`] 包
 //! `with_spring`，不要在调用点自行造参数。`reduce_motion` 由 gpui
 //! `with_spring` 自动尊重（直接落端点、不调度帧）。
 
@@ -10,8 +10,9 @@ use gpui::{
     SpringConfig, Styled,
 };
 
-/// hover 淡入刚度 k：omega≈56.6 rad/s，临界阻尼下 1% 以内约 120ms。
-pub(crate) const HOVER_STIFFNESS: f32 = 3200.0;
+/// hover 淡入刚度 k：omega≈89 rad/s，临界阻尼下 1% 以内约 75ms
+///（P4-2 复盘：原 3200 ≈ 120ms 收敛，侧边栏列表 hover 感知迟缓，提速 2.5×）。
+pub(crate) const HOVER_STIFFNESS: f32 = 8000.0;
 /// 0..1 透明度收敛容差（≈0.2%，肉眼不可辨）。
 pub(crate) const HOVER_EPSILON: f32 = 0.002;
 

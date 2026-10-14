@@ -1106,7 +1106,7 @@ impl EditorApp {
                         .child(nm),
                 );
             file_rows.push(
-                hover_bg_fade(r, format!("ss-file-{ti}-bg"), active_bg, hovered)
+                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
                     .into_any_element(),
             );
         }
@@ -1199,7 +1199,7 @@ impl EditorApp {
                         .child(format!("L{}  {}", li + 1, snippet)),
                 );
             line_rows.push(
-                hover_bg_fade(r, format!("ss-line-{ti}-{li}-bg"), active_bg, hovered)
+                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
                     .into_any_element(),
             );
         }
@@ -1441,7 +1441,7 @@ impl EditorApp {
                         .child(format!("L{}  {}", page + 1, snippet)),
                 );
             hit_rows.push(
-                hover_bg_fade(r, format!("ss-pdf-hit-{idx}-bg"), active_bg, hovered)
+                r.bg(if hovered { active_bg } else { active_bg.opacity(0.) })
                     .into_any_element(),
             );
         }

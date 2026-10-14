@@ -10,11 +10,10 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, px, App, AnimationExt, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, App, ClickEvent, CursorStyle, Hsla, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use ui::icon::{Icon, IconName};
-use ui::motion::hover_spring;
 
 /// 单条目录行的固定高（px）：与条目自然布局高度一致（shell 侧边栏实测 31px），
 /// 侧边栏 TOC 虚拟化按此做等高滚动间距（可视带 + 上下 spacer 严格对齐）。
@@ -114,7 +113,7 @@ pub fn toc_item_frame(
         })
         .active(|style| style.bg(hover_bg).opacity(0.85));
 
-    // 左侧当前项指示条（hover 时淡入，统一强调蓝）
+    // 左侧当前项指示条（hover 时瞬时亮起，统一强调蓝）
     let indicator = div()
         .absolute()
         .top(px(5.))
@@ -123,11 +122,7 @@ pub fn toc_item_frame(
         .w(px(2.))
         .rounded_full()
         .bg(accent)
-        .with_spring(
-            format!("toc-ind-{row_key}"),
-            hover_spring(if hovered { 1.0 } else { 0.0 }),
-            |this, v| this.opacity(v),
-        );
+        .opacity(if hovered { 1.0 } else { 0.0 });
     row = row.child(indicator);
 
     // 折叠箭头（有下级时）：点击只折叠/展开，不跳转
@@ -200,12 +195,8 @@ pub fn toc_item_frame(
     }
 
     row.on_click(on_select)
-        // P2-10：hover 背景淡入。
-        .with_spring(
-            format!("toc-bg-{row_key}"),
-            hover_spring(if hovered { 1.0 } else { 0.0 }),
-            move |this, v| this.bg(hover_bg.opacity(v)),
-        )
+        // P4-2：hover 瞬时高亮（原弹簧 60-75ms 淡入反馈迟缓 → 直接落端点）。
+        .bg(if hovered { hover_bg } else { hover_bg.opacity(0.) })
         .into_any_element()
 }
 
