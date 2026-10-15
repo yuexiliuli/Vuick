@@ -28,9 +28,11 @@ epub = { path = "../epub" }
 
 [features]
 default = ["video"]
-# video：与根包同名 feature 一致，开启 video crate 依赖并转发给 ui crate
-# （IconName::Play/Pause/… 视频图标变体，见 ui/icon.rs）。
-video = ["dep:video", "ui/video"]
+# video：与根包同名 feature 一致，开启 video crate 依赖（实际消费 VideoViewer 的层）。
+# ui 的 `video` 图标变体不在此转发：video crate 自身声明 `ui{features=["video"]}`
+# （见 crates/video/Cargo.toml），一经 `dep:video` 开启即随之启用；显式转发点统一在根包。
+# --no-default-features 时本 feature 关闭 → 视频整链关闭、不拉 FFmpeg 依赖。
+video = ["dep:video"]
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。

@@ -19,16 +19,18 @@ ui = { path = "crates/ui" }
 config = { path = "crates/config" }
 syntax = { path = "crates/syntax" }
 base = { path = "crates/base" }
-# P4：视频解码内核已随 video crate 独立；作为可选依赖，由根 `video` feature 开关
-# （实际视频功能在 shell crate，本依赖仅保留以维持 feature 语义与转发）。
+# P4：视频解码内核（FFmpeg 经 libloading 运行时加载）已随 video crate 独立；
+# 作为可选依赖由根 `video` feature 经 `dep:video` 开启——根包不直接消费 video crate，
+# 该可选依赖是整链的总开关（--no-default-features 即完全不拉 FFmpeg 相关代码）。
 video = { path = "crates/video", optional = true }
 
 [features]
 default = ["video"]
 test-support = ["gpui/test-support"]
-# video：P4 已把视频模块拆为独立 `video` crate。
-# 本 feature = 开启该可选依赖、转发给 ui crate（IconName::Play/Pause/… 视频图标变体，
-# 见 ui/icon.rs），并转发给 shell crate（实际消费 VideoViewer 的层）。
+# video：开启视频整链（单一转发层）。`dep:video` = 编译 video 解码内核 crate；
+# `ui/video` = ui 视频图标变体（IconName::Play/Pause/…，见 ui/icon.rs）——根是唯一显式转发点，
+# 另经 video crate 自身 `ui{features=["video"]}` 随 `dep:video` 启用；`shell/video` = shell 消费层
+# （shell 内 `video = ["dep:video"]`，不再向 ui 二次转发）。--no-default-features 时整链关闭。
 video = [
     "dep:video",
     "ui/video",

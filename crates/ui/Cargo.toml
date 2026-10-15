@@ -12,8 +12,9 @@ base = { path = "../base" }
 ime = { path = "../ime" }
 
 [features]
-# video 相关图标变体（IconName::Play/Pause/Volume/…）随根包 video feature 转发而开关；
-# 根 `gpui-editor` 的 `video = ["ui/video"]` 保持行为与拆 crate 前一致。
+# video 相关图标变体（IconName::Play/Pause/Volume/…）的开关；本 feature 无实际内容，纯 cfg 门。
+# 开启路径：根 `gpui-editor` 的 `video = ["ui/video"]`（唯一显式转发点），
+# 及 video crate 的 `ui{features=["video"]}` 随 `dep:video` 一并启用。
 video = []
 
 [dev-dependencies]

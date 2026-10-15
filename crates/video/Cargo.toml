@@ -15,11 +15,6 @@ config = { path = "../config" }
 ui = { path = "../ui", features = ["video"] }
 viewer = { path = "../viewer" }
 
-[features]
-# 语义与拆 crate 前一致：根包 `video` feature 经 `dep:video` 开启本 crate；
-# 本 feature 仅为 `cargo check -p video --features video` 的便捷开关，无 cfg 消费。
-video = []
-
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }
