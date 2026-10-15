@@ -11,9 +11,7 @@ impl WyEditor {
     /* ---------- 数学排版（LaTeX → RenderImage；参考 zorite 的 MathStore） ---------- */
 
     /// 公式排版槽（元素 build/paint 只读查询）。
-    pub(crate) fn math_slots(
-        &self,
-    ) -> Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>> {
+    pub(crate) fn math_slots(&self) -> Rc<RefCell<MathSlotCache>> {
         self.math_slots.clone()
     }
 
@@ -81,11 +79,12 @@ impl WyEditor {
     }
     /* ---------- 代码块高亮：后台 syntect 整块解析（把 debug 下 ~300ms/块移出主线程） ---------- */
 
-    /// 查代码块高亮解析缓存：就绪返回高亮 run，否则按 NotReady 处理。
+    /// 查代码块高亮解析缓存：就绪返回高亮 run，否则按 NotReady 处理。命中即 touch
+    /// （最近使用：shape 期对带内代码块调用，LRU 以此判定淘汰面）。
     pub(crate) fn code_parse_lookup(&self, lang: &str, code: &str) -> CodeParseLookup {
-        let m = self.code_parse.lock().unwrap();
-        let key = (lang.into(), code.into());
-        match m.get(&key) {
+        let mut m = self.code_parse.lock().unwrap();
+        let key: CodeParseKey = (lang.into(), code.into());
+        match m.lookup(&key) {
             Some(CodeParseState::Done(runs)) => CodeParseLookup::Ready(runs.clone()),
             _ => CodeParseLookup::NotReady,
         }
@@ -98,7 +97,8 @@ impl WyEditor {
         {
             let mut m = self.code_parse.lock().unwrap();
             if !m.contains_key(&key) {
-                m.insert(key.clone(), CodeParseState::Pending);
+                // 满容量且键不在场 → LRU 淘汰最久未用（runs 是纯 CPU 数据，直接弃）。
+                let _ = m.insert(key.clone(), CodeParseState::Pending);
             }
         }
         // 记录**每个**请求块的 src_line：同一内容键可被多个内容完全相同的代码块请求
@@ -131,6 +131,8 @@ impl WyEditor {
         }
         for ((lang, code), src_lines) in groups {
             let cache = self.code_parse.clone();
+            // 换源守卫代号：request 后若 `install_open` 换过源，本次解析结果即属旧文档。
+            let claim_epoch = self.code_epoch.get();
             cx.spawn(async move |this, cx| {
                 // 内层 async move 需要 'static 自有值：克隆一份进去，外层保留原值插缓存。
                 let lang2 = lang.clone();
@@ -141,9 +143,17 @@ impl WyEditor {
                         syntax::parse_code_lines(lang2.as_ref(), code2.as_ref())
                     })
                     .await;
+                // 换源守卫：跨了 `install_open`（epoch 变）的旧任务不写新文档缓存、也
+                // 不按旧 `src_line` 作废新文档的块（否则跨源斜错位作废）。
+                let fresh = this
+                    .update(cx, |e, _| e.code_epoch.get() == claim_epoch)
+                    .unwrap_or(false);
+                if !fresh {
+                    return;
+                }
                 {
                     let mut m = cache.lock().unwrap();
-                    m.insert((lang.clone(), code.clone()), CodeParseState::Done(result));
+                    let _ = m.insert((lang.clone(), code.clone()), CodeParseState::Done(result));
                 }
                 let _ = this.update(cx, |e, ecx| e.on_code_parse_ready(&src_lines, ecx));
             })
@@ -191,11 +201,26 @@ impl WyEditor {
     /// 幂等：已占用槽（含 Loading/Failed）不重复发起；主题色变化清缓存强制重排。
     /// 每次 paint 前调一次成本 = iterate `frame.rows`（≤ 带内行数）+ contains_key。
     pub(crate) fn sync_math(&mut self, cx: &mut Context<Self>, frame: &element::Frame) {
+        // 换源（`install_open`）清 `math_slots` 收拢的旧文档公式位图纹理：本帧统一
+        // `drop_image` 释放（install_open 无 cx，释放延迟到每帧这里；Arc 未 drop 前
+        // 字节仍在、可重传，不丢渲染）。
+        let pending = std::mem::take(&mut *self.pending_math_drop.borrow_mut());
+        for img in pending {
+            cx.drop_image(img, None);
+        }
         let color = math_color(&self.theme);
         let color_changed = self.math_color.borrow().as_ref() != Some(&color);
         if color_changed {
             self.math_color.borrow_mut().replace(color);
-            self.math_slots.borrow_mut().clear();
+            // 主题色变化：旧位图颜色失效 → 槽与钉一并清空重渲；位图纹理同步
+            // `drop_image` 释放（旧实现只 clear 槽、纹理留在 sprite atlas 只涨不降，
+            // 反复切主题累积内存）。
+            let old = self.math_slots.borrow_mut().drain_all();
+            for s in old {
+                if let MathSlot::Ready(img, _, _) = s {
+                    cx.drop_image(img, None);
+                }
+            }
             // 主题色变化：旧位图颜色失效 → 钉一并清空（否则 Loading 期会画旧色）。
             self.clear_math_pins();
         }
@@ -246,6 +271,9 @@ impl WyEditor {
                 drop(rows);
             }
             let mut slots = self.math_slots.borrow_mut();
+            // 带内公式统一 touch：带内 = 最近使用，LRU 不赶在途/正在显示的公式
+            // （Ready/Loading/Failed 一致；滚出带外久未回来的公式不再被 touch）。
+            slots.touch(key.as_ref());
             match slots.get(key.as_ref()) {
                 Some(MathSlot::Ready(img, w, h)) => {
                     // 已就绪（滚动回带/刷新帧）：同步录制该块「最近就绪位图」钉，
@@ -259,11 +287,18 @@ impl WyEditor {
                 Some(_) => continue,
                 None => {}
             }
-            slots.insert(key.clone(), MathSlot::Loading);
+            // claim Loading：容量满且键不在场 → LRU 淘汰最久未用条目，其 Ready 位图
+            // 纹理当场 `drop_image` 释放（防纹理只涨不降）。
+            let write = slots.insert(key.clone(), MathSlot::Loading);
+            if let Some(MathSlot::Ready(img, _, _)) = write.evicted {
+                cx.drop_image(img, None);
+            }
             drop(slots);
             // 离屏排版（纯 CPU；与 zorite `ensure_math_loaded` 同构）。
             let slots = self.math_slots.clone();
             let color2 = color;
+            // 换源守卫代号：claim 后若 `install_open` 换过源，本次光栅结果即属旧文档。
+            let claim_epoch = self.math_epoch.get();
             cx.spawn(async move |this, cx| {
                 let result = cx
                     .background_executor()
@@ -304,17 +339,43 @@ impl WyEditor {
                     Some((img, w, h)) => MathSlot::Ready(img, w, h),
                     None => MathSlot::Failed,
                 };
+                // 换源守卫：跨了 `install_open`（epoch 变）的旧任务不写新文档槽、不触发
+                // 就绪——新文档会自行 claim/重排；其 Ready 位图纹理登记待释放。
+                let fresh = this
+                    .update(cx, |e, _| e.math_epoch.get() == claim_epoch)
+                    .unwrap_or(false);
+                if !fresh {
+                    if let MathSlot::Ready(img, _, _) = &slot {
+                        let _ = this.update(cx, |e, _| {
+                            e.pending_math_drop.borrow_mut().push(img.clone())
+                        });
+                    }
+                    return;
+                }
                 let slots2 = slots.clone();
                 let key2 = key.clone();
-                // 完成时自增 `math_gen`（on_math_ready）使帧/折叠计划按**真实位图高**重建：
-                // 这里 key 必已以 `Loading` 占位 → `insert` 返回 `Some(Loading)`，用
-                // `map_or(false, …Loading)` 判定“排版完成”（旧的 `.is_none()` 恒假——
-                // 占位符永远在场，mgen 从不自增 → 卡片永远停在回退高 42px，68px 位图
-                // 越出灰底——本 bug 自 RaTeX 接入起即存在）。
-                let became_ready = slots2
-                    .borrow_mut()
-                    .insert(key.clone(), slot)
-                    .is_some_and(|old| matches!(old, MathSlot::Loading));
+                let became_ready = {
+                    let mut slots2 = slots2.borrow_mut();
+                    // 占位 `Loading` 已被 LRU 淘汰 / 换源清空（键不在场）→ 不复活已淘汰
+                    // 槽：结果弃置（旧任务不写入已淘汰槽），其 Ready 位图纹理登记待释放。
+                    if !matches!(slots2.get(key2.as_ref()), Some(MathSlot::Loading)) {
+                        if let MathSlot::Ready(img, _, _) = &slot {
+                            let _ = this.update(cx, |e, _| {
+                                e.pending_math_drop.borrow_mut().push(img.clone())
+                            });
+                        }
+                        return;
+                    }
+                    // 完成时自增 `math_gen`（on_math_ready）使帧/折叠计划按**真实位图高**
+                    // 重建：这里 key 必已以 `Loading` 占位 → `old = Some(Loading)` 即判定
+                    // “排版完成”（旧的 `.is_none()` 恒假——占位符永远在场，mgen 从不自增
+                    // → 卡片永远停在回退高 42px，68px 位图越出灰底——本 bug 自 RaTeX 接入
+                    // 起即存在）。
+                    slots2
+                        .insert(key2.clone(), slot)
+                        .old
+                        .is_some_and(|old| matches!(old, MathSlot::Loading))
+                };
                 if became_ready {
                     let _ = this.update(cx, |e, ecx| e.on_math_ready(&key2, ecx));
                 }

@@ -27,3 +27,4 @@ include!("tests/selection_highlight.rs");
 include!("tests/same_text_rows.rs");
 include!("tests/blank_line_hit.rs");
 include!("tests/caret_blink.rs");
+include!("tests/cache_cap.rs");

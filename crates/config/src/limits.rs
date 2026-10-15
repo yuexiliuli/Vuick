@@ -44,3 +44,13 @@ pub const SEARCH_RESULT_CAP: usize = 200;
 /// 表格），避免每档重建把可视带整批重 shape + 代码块重跑 syntect（对齐 `view` 的
 /// 行虚拟化复用与 `editor` 「只重排变更区」）。超出后按最近最少使用淘汰。
 pub const SHAPED_ROW_CACHE_CAP: usize = 16_384;
+/// WYSIWYG 数学排版槽缓存容量（按**公式源码键**计）：每唯一 LaTeX 公式一张位图
+/// （DPR2 下 ~10-100KB CPU 字节 + 1 个 GPU 纹理）。旧实现无上限 → 同一标签页持续
+/// 打开不同公式文档时位图与纹理只涨不降；上限 + LRU 后驻留数与「可视带公式数 × 数倍
+/// 余量」同阶（带内公式数 = 视口行数量级 ≤ 数十；1000 张对命中率与内存折中：1000×
+/// ~100KB ≈ 百 MB 级峰值，远超任何单篇文档可并存的公式量）。
+pub const MATH_SLOTS_CACHE_CAP: usize = 1000;
+/// WYSIWYG 代码块高亮解析缓存容量（按 **(语言, 代码全文)** 键计）：整块 syntect 高亮
+/// runs 缓存（纯 CPU 数据）。512 块覆盖常见文档交互面 + 长滚动窗口（大文档几十个
+/// 代码块已足够往复滚动复用），超出按最近最少使用淘汰（命中率与内存折中）。
+pub const CODE_PARSE_CACHE_CAP: usize = 512;

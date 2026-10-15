@@ -80,16 +80,21 @@ impl WyEditor {
             image_src_blocks: RefCell::new(None),
             pending_image_srcs: RefCell::new(std::collections::HashSet::new()),
             image_resize_drag: RefCell::new(None),
-            math_slots: Rc::new(RefCell::new(std::collections::HashMap::new())),
+            math_slots: Rc::new(RefCell::new(MathSlotCache::new(
+                config::limits::MATH_SLOTS_CACHE_CAP,
+            ))),
             math_color: RefCell::new(None),
             math_gen: Cell::new(0),
             mermaid_zoom: RefCell::new(std::collections::HashMap::new()),
             mermaid_zoom_gen: Cell::new(0),
             focused_mermaid: None,
-            code_parse: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            code_parse: std::sync::Arc::new(std::sync::Mutex::new(CodeParseCache::new(
+                config::limits::CODE_PARSE_CACHE_CAP,
+            ))),
             code_parse_need: RefCell::new(Vec::new()),
+            pending_math_drop: RefCell::new(Vec::new()),
+            math_epoch: Cell::new(0),
+            code_epoch: Cell::new(0),
             // 数学**显示行数**缓存（键=去定界符源）：`math_card_height` 回退分支按行数
             // 估高——`math_display_lines` 会对每个源做 LaTeX→Unicode 转换，3000 个数学
             // 块每次 fold_plan 重建重复转换 = ~38ms（B3）；缓存后 O(1) 复用。内容变更
@@ -496,6 +501,28 @@ impl WyEditor {
         self.inline_math_rows.borrow_mut().clear();
         // 换源：数学位图钉随行号作废（重新绘制/claim 时再录）。
         self.clear_math_pins();
+        // 换源：数学/代码缓存的旧文档产物整批作废——否则同一标签页持续打开不同公式/
+        // 代码文档时位图 + GPU 纹理只涨不降（内存 bug 根因）。
+        // `math_slots` 里 `Ready` 位图的纹理先收进 `pending_math_drop`，下一帧
+        // `sync_math` 用 `cx.drop_image` 统一释放（`install_open` 无 `cx`，释放延迟
+        // 一帧；Arc 未 drop 前字节仍在、可重传，不丢渲染）。同时 `math_epoch` 换代：
+        // 换源前已发起的后台光栅任务完成回来自检换代 → 不写新文档槽、不触发就绪。
+        let drained = self.math_slots.borrow_mut().drain_all();
+        if !drained.is_empty() {
+            let mut pending = self.pending_math_drop.borrow_mut();
+            for s in drained {
+                if let MathSlot::Ready(img, _, _) = s {
+                    pending.push(img);
+                }
+            }
+        }
+        self.math_epoch.set(self.math_epoch.get().wrapping_add(1));
+        // 换源：代码高亮解析缓存（旧文档 runs）与其待办队列一并作废——在途后台解析
+        // 任务完成回来自检 `code_epoch`（已换代 → 不写新文档缓存、不按旧 src_line
+        // 作废新文档的块）。
+        self.code_parse.lock().unwrap().clear();
+        self.code_epoch.set(self.code_epoch.get().wrapping_add(1));
+        self.code_parse_need.borrow_mut().clear();
         // 全新内容：派生/数学清单/基础布局全量失效（新代 → 下帧全篇重建）。
         *self.block_layout.borrow_mut() = None;
         self.shape_rows.borrow_mut().clear();

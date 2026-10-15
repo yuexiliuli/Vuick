@@ -71,8 +71,8 @@ pub use self::element::NoteMarkerHit;
 // —— M2.1 拆出的子模块项按原可见性扁平重导出（外部/兄弟对 `wysiwyg::…` 的引用不变）——
 pub use self::theme::WyTheme;
 pub(crate) use self::cache::{
-    NOTDEF_RETRY_ATTEMPTS, NotdefRetry, RowShapeCache, height_epoch, notdef_debug,
-    zoom_band_for_top,
+    CodeParseCache, MathSlotCache, NOTDEF_RETRY_ATTEMPTS, NotdefRetry, RowShapeCache,
+    height_epoch, notdef_debug, zoom_band_for_top,
 };
 pub(crate) use self::code_parse::{CodeParseKey, CodeParseLookup, CodeParseState};
 pub(crate) use self::prewarm::Prewarm;
@@ -305,7 +305,9 @@ pub struct WyEditor {
     image_resize_drag: RefCell<Option<ImageResizeDrag>>,
     /// LaTeX → 排版结果缓存（参考 zorite `<MathStore>` 按公式源码做键）。
     /// `Loading` 排版中 / `Ready` 就绪（位图 + 逻辑 px 尺寸）/ `Failed` 失败（回退 Unicode）。
-    math_slots: Rc<RefCell<std::collections::HashMap<SharedString, MathSlot>>>,
+    /// 容量上限 + LRU（见 [`MathSlotCache`]）：无界 HashMap 会让同一标签页反复换公式
+    /// 文档时位图/GPU 纹理只涨不降。
+    math_slots: Rc<RefCell<MathSlotCache>>,
     /// 排版文字色；主题切换 → 清缓存重排（同 zorite `MathStore::set_color`）。
     math_color: RefCell<Option<Hsla>>,
     /// 排版代数：任何公式 Loading→Ready/Failed 自增，纳入帧缓存键（同 `images_gen`）。
@@ -323,10 +325,21 @@ pub struct WyEditor {
     /// `on_code_parse_ready` **定向作废该代码块的行整形缓存条目**（非全局代数）→ 下帧
     /// 重建用高亮行替换占位纯文本行。
     code_parse:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<CodeParseKey, CodeParseState>>>,
+        std::sync::Arc<std::sync::Mutex<CodeParseCache>>,
     /// 本帧登记的待后台解析队列 `((语言, 代码), 块 src_line)`（`sync_code_parse` 每帧
     /// 清空消费）。`src_line` 用于完成时的**带内门控**（块还在带内才立即重建帧上色）。
     code_parse_need: RefCell<Vec<(CodeParseKey, usize)>>,
+    /// 换源（`install_open`）清 `math_slots` 时收拢的旧文档 Ready 位图纹理：
+    /// `install_open` 无 `cx`，纹理释放推迟到下一帧 `sync_math` 用 `cx.drop_image`
+    /// 统一释放（Arc 未 drop 前字节仍在、可重传，不丢渲染）。有界：每次换源一批、
+    /// 每帧清空。
+    pending_math_drop: RefCell<Vec<std::sync::Arc<gpui::RenderImage>>>,
+    /// 数学排版任务的「换源代」：`install_open` 换源自增。在途后台光栅完成时以此判定
+    /// 任务是否跨了换源——跨源旧任务不写新文档槽、不触发就绪（新文档会自行 claim）。
+    math_epoch: Cell<u64>,
+    /// 代码高亮解析任务的「换源代」：同 [`Self::math_epoch`]——旧文档解析完成后不写
+    /// 新文档缓存、不按旧 `src_line` 作废新文档的块。
+    code_epoch: Cell<u64>,
     /// 数学显示行数缓存（见字段声明）。
     math_line_map: RefCell<std::collections::HashMap<String, f32>>,
     /// 行内公式键（`"inline:…"`）→ 包含它的行 src_line（`sync_math` claim 时登记）。
