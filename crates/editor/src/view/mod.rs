@@ -353,6 +353,11 @@ pub struct CodeEditor {
     line_height: Pixels,
     char_width: Pixels,
     metrics_ready: bool,
+    /// 上一次字体度量重算时的依赖指纹 `(等宽字体族, 字号)`：`resolve_font` +
+    /// `ch_advance` 的唯一输入是二者，指纹未变即跳过昂贵重算。`None` = 尚未首算。
+    metric_fp: Option<(SharedString, Pixels)>,
+    /// 字体度量全量重算次数（含首帧）；测试断言「同主题连续帧不再重算」的可观察信号。
+    metric_compute_count: usize,
 
     // —— 布局状态 ——
     row_count: usize,
@@ -498,6 +503,8 @@ impl CodeEditor {
             line_height: px(0.),
             char_width: px(0.),
             metrics_ready: false,
+            metric_fp: None,
+            metric_compute_count: 0,
             row_count,
             hscroll_cols: 0,
             visible_chars: 80,
@@ -1137,11 +1144,24 @@ impl CodeEditor {
             ),
         };
 
-        let text_system = window.text_system();
-        let font = gpui::font(mono.clone());
-        let char_width = text_system
-            .ch_advance(text_system.resolve_font(&font), font_size)
-            .unwrap_or(px(font_size.as_f32() * 0.6));
+        // 昂贵字体度量指纹门控：`resolve_font`/`ch_advance` 的唯一输入是上文算出的
+        // `mono` 等宽字体族 + `font_size` 字号，二者未变则字符宽必不变——直接跳过
+        // 昂贵路径（颜色等便宜字段仍在下方逐帧无条件写，不被门控）。gpui 全局对象
+        // 没有变更通知（`Theme::global` 仅 TypeMap 查找，无 on_global 事件索引/版本），
+        // 主题切换只能由「下一帧读到的主题内容」体现：字体相关变化 → 指纹变 → 重算；
+        // 颜色变化 → 由无门控的字段写入兜底。首帧 `metrics_ready=false` / 指纹缺失
+        // 必算；`set_font_override` 置 `metrics_ready=false` 的旧语义保留（双保险）。
+        let metric_fp = (mono.clone(), font_size);
+        if !self.metrics_ready || self.metric_fp.as_ref() != Some(&metric_fp) {
+            let text_system = window.text_system();
+            let font = gpui::font(mono.clone());
+            self.char_width = text_system
+                .ch_advance(text_system.resolve_font(&font), font_size)
+                .unwrap_or(px(font_size.as_f32() * 0.6));
+            self.metric_fp = Some(metric_fp);
+            self.metrics_ready = true;
+            self.metric_compute_count += 1;
+        }
 
         // 字号缩放（Ctrl+滚轮 / Ctrl+=/-）会同比改变行高：把「用户滚动目标」按行高比
         // 换算，把视口顶部的内容点锚定住（同 PDF 的视口锚定）——否则放大/缩小的瞬间
@@ -1157,8 +1177,8 @@ impl CodeEditor {
         self.mono = mono;
         self.font_size = font_size;
         self.line_height = line_height;
-        self.char_width = char_width;
-        // 编辑区画布底色：暗色取 config `EDITOR_BG_DARK`（与欢迎页/预览同一内容底色）。
+        // 主题色/画布底色/行号列宽等便宜字段：每帧无条件写（主题切换后下一帧立即
+        // 生效，成本可忽略，不与昂贵字体度量共用门控）。
         self.bg = ui::shell::content_bg(dark, colors.bg.into());
         self.fg = colors.fg.into();
         self.gutter_fg = colors.fg_muted.into();
@@ -1181,14 +1201,13 @@ impl CodeEditor {
         // 光标所在行（持焦且 head 落行内）的整行高亮底色 = 主题 `editor_active_line_bg`
         // （与折叠行同色；稳定持焦高亮，不受光标闪烁影响）。
         self.active_line_bg = colors.editor_active_line_bg.into();
-        self.metrics_ready = true;
 
         let digits = self.buffer.line_count().max(1).to_string().len();
         self.gutter_chars = digits.max(3);
         // 总宽 = 数字格 + 左右内边距 + 固定箭头槽（槽替代旧 +4 缓冲：数字格因此
         // 恒 = gutter_chars×字宽，行号右缘锚点固定，不会被 overflow_hidden 裁槽）。
         self.gutter_width_px = px(
-            self.gutter_chars as f32 * char_width.as_f32()
+            self.gutter_chars as f32 * self.char_width.as_f32()
                 + GUTTER_LEFT_PAD_PX
                 + GUTTER_RIGHT_PAD_PX
                 + FOLD_ARROW_SLOT_PX,
@@ -1994,6 +2013,11 @@ impl CodeEditor {
             self.line_height.as_f32(),
             self.gutter_width_px.as_f32(),
         )
+    }
+
+    /// 测试用：字体度量全量重算次数（含首帧）。指纹未变即跳过，计数应保持不变。
+    pub fn test_metric_compute_count(&self) -> usize {
+        self.metric_compute_count
     }
 
     /// 测试用：折叠映射（只读）。

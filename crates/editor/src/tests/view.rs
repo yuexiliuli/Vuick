@@ -283,6 +283,29 @@ fn font_size_change_keeps_viewport_top_anchored(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn refresh_metrics_skips_unchanged_font_compute(cx: &mut TestAppContext) {
+    // 指纹门控：同样主题连续刷帧不再全量重算（跳过 resolve_font/ch_advance）；
+    // 首帧必算一次；用户改字号（指纹变）后下一帧重算一次。
+    let (host, cx) = open(cx, "foo\nbar");
+    let c1 = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metric_compute_count());
+    assert_eq!(c1, 1, "首帧后度量应只全量重算一次（{c1}）");
+    // 同样主题连续刷帧：指纹命中，不再走昂贵字体度量重算。
+    settle(cx);
+    let c2 = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metric_compute_count());
+    assert_eq!(c2, c1, "同样主题连续刷帧不应重算字体度量（{c1} → {c2}）");
+    // 用户改字号：指纹变 → 下一帧重新全量重算。
+    let f0 = cx.update(|_, cx| host.read(cx).ed.read(cx).font_size_px());
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    ed.update(cx, |ed, cx| {
+        ed.set_font_override(Some(f0 + 4.0));
+        cx.notify();
+    });
+    settle(cx);
+    let c3 = cx.update(|_, cx| host.read(cx).ed.read(cx).test_metric_compute_count());
+    assert_eq!(c3, c2 + 1, "字号变化后应再全量重算一次（{c2} → {c3}）");
+}
+
+#[gpui::test]
 fn editor_bottom_pad_quantized_to_line_height(cx: &mut TestAppContext) {
     // 回归（专家评审 P4）：底部预留（横向滚动条厚 16px + 额外行高）向上量化到
     // line_height 整数倍——否则滚到底视口停在「行间半格」上，最后一行加载/点击
