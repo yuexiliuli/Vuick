@@ -71,6 +71,7 @@ use super::decode::{AudioReader, VideoReader};
 use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
 use ::viewer::pan_zoom;
+use config::video::{ZOOM_MAX, ZOOM_MIN, ZOOM_STEP};
 
 /// 解码通道槽位数（帧数）：回压 + 内存有界；播放/seek 时缓冲少量前跳。
 const DECODE_AHEAD_FRAMES: usize = 2;
@@ -97,10 +98,6 @@ const VOLUME_STEP: f32 = 0.1;
 /// 底部控制条预留高度（px）：视频 contain 适配到「视口高 − 此值」，避免画面底部被
 /// 浮层控制条遮住。值略大于控制条实际高度（py 8×2 + 按钮 28 ≈ 44）。
 const CONTROL_BAR_H: f32 = 52.0;
-/// Ctrl+滚轮缩放区间 / 步进（语义同图片/PDF 阅读器）。
-const ZOOM_MIN: f32 = 0.25;
-const ZOOM_MAX: f32 = 8.0;
-const ZOOM_STEP: f32 = 0.12;
 /// 右上角瞬时状态浮层（截图结果提示等）的显示时长（ms），到期自动清除。
 const STATUS_MS: u64 = 2500;
 

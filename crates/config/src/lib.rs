@@ -19,3 +19,4 @@ pub mod math;
 pub mod pdf;
 pub mod timing;
 pub mod user;
+pub mod video;

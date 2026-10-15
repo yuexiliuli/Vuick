@@ -64,10 +64,11 @@ use gpui::{
 use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
-/// 缩放下限 / 上限 / 步进（语义同 PDF 阅读器 Ctrl+滚轮缩放，区间更宽以支持图片 1:1 微调）。
-const ZOOM_MIN: f32 = 0.2;
-const ZOOM_MAX: f32 = 8.0;
-const ZOOM_STEP: f32 = 0.12;
+use config::image::{
+    BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
+    MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST, ZOOM_MAX, ZOOM_MIN,
+    ZOOM_STEP,
+};
 /// 放大态滚轮平移每格的视口比例（Lines 滚轮：一下滚轮平移多少视口高；直接切图的
 /// 未放大态此值无意义）。
 const WHEEL_LINE_PAN_FRACTION: f32 = 0.15;
@@ -80,10 +81,6 @@ const DISPLAY_NEED_INIT: (f32, f32) = (1920.0, 1080.0);
 /// 把内存/上传预算打爆（超大文件另有 LRU 字节预算如实兜底）。
 const MAX_GIF_FRAMES: usize = 256;
 
-use config::image::{
-    BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
-    MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
-};
 use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
 use ::viewer::pan_zoom;

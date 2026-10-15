@@ -6196,6 +6196,7 @@ name = "video"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "config",
  "cpal",
  "gpui",
  "image",

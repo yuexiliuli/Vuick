@@ -48,3 +48,10 @@ pub const MAX_DECODE: usize = 8;
 /// 触控板「像素滚轮」的一格门限（px）：累计像素滚动超过该值才切一张——把高分辨率
 /// 手势的洪水事件合并成离散步进；普通鼠标的「行滚轮」仍是 1 事件 = 1 张，不受影响。
 pub const WHEEL_PIXEL_STEP: f32 = 24.0;
+/// 缩放倍数范围（Ctrl+滚轮可调；语义同 PDF 阅读器 [`crate::config::pdf::ZOOM_MIN`] 等，
+/// 区间更宽以支持图片 1:1 微调）：0.2×～8×。
+pub const ZOOM_MIN: f32 = 0.2;
+/// 缩放倍数上限（放大看细节 1:1 用）。
+pub const ZOOM_MAX: f32 = 8.0;
+/// 每格滚轮（≈1 行）的缩放倍率增幅（12%）。
+pub const ZOOM_STEP: f32 = 0.12;
