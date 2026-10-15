@@ -580,6 +580,140 @@ fn small_gap_scroll_stays_sync_path() {
     assert!(!rows[0].is_empty(), "同步扩展立即有颜色");
 }
 
+/// 回跳快照 LRU 半程续栈回归（主需求）：打开 → 远跳下滚 → 回看顶部 → 再回跳下滚。
+///
+/// - **修复前**：回看（`lo < base`）落到整段重解析——每次回跳 `full_reparse` +1
+///   （本测试「打开→下滚→回看」中回看那次会从 2 → 3，断言 `== 2` 修复前必失败）；
+/// - **修复后**：离开顶部窗口前（drain / 重锚）先沉降为快照，回看命中快照从中重建
+///   （零 syntect），且回跳时也把「当前窗口」沉降——往返再下滚同样命中快照，不再
+///   整段重解析。计数探针：`test_reparse_count`（整窗重解析）vs `test_snapshot_hit_count`
+///   （回跳命中快照半程续栈）。
+#[test]
+fn jump_back_hits_snapshot_no_full_reparse() {
+    let text: String = (0..20_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn foo{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\");\n"),
+            _ => format!("struct S{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+
+    // 打开顶部窗口：整段重解析 #1（离开前的沉降在首次无窗可沉 → 快照为空）。
+    let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(hl.test_reparse_count(), 1, "首窗建缓存恰一次整段重解析");
+    assert_eq!(hl.test_snapshot_hit_count(), 0);
+
+    // 远跳下滚到 [10000,10108]：容量自愈整窗 drain → 顶窗先沉降为快照 → 整段重解析 #2。
+    let rows2 = hl.highlight_window(&b, 10_000, 10_108, 16).to_vec();
+    assert_eq!(rows2.len(), 109);
+    assert_eq!(hl.test_reparse_count(), 2, "下滚远跳仍整段重解析（一次）");
+    assert_eq!(hl.test_snapshot_hit_count(), 0, "下滚无快照可命中");
+
+    // 回看顶部 [0,108]：命中刚才沉降的快照 → 不再整段重解析；颜色与首窗冷解析逐位一致。
+    let back = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(back.len(), 109);
+    assert_eq!(
+        hl.test_reparse_count(),
+        2,
+        "回看应命中快照半程续栈，不再整段重解析（修复前这里 = 3）"
+    );
+    assert_eq!(hl.test_snapshot_hit_count(), 1, "回看恰命中一次快照半程续栈");
+    assert_eq!(back, top, "回看（快照半程续栈）颜色应与首窗冷重解析逐位一致");
+
+    // 再回跳下滚到 [10000,10108]：回看时沉降的「旧主窗口」仍在 LRU → 再命中，仍零整段重解析。
+    let again = hl.highlight_window(&b, 10_000, 10_108, 16).to_vec();
+    assert_eq!(again.len(), 109);
+    assert_eq!(hl.test_reparse_count(), 2, "往返再跳也应命中快照，不整段重解析");
+    assert_eq!(hl.test_snapshot_hit_count(), 2, "第二次也命中快照半程续栈");
+    assert_eq!(again, rows2, "往返颜色应与首次冷解析逐位一致");
+}
+
+/// 快照半程续栈的**续解析正确性**：回跳窗口横跨快照上界（快照只覆盖前缀、窗口底伸到
+/// 快照之下）时，从快照最后保存点续解析——输出必须与「整窗冷重解析（全新 Highlighter）」
+/// 逐位一致。
+#[test]
+fn jump_back_resume_extends_beyond_snapshot_matches_cold() {
+    let text: String = (0..5_000)
+        .map(|i| match i % 4 {
+            0 => format!("fn a{i}() {{ // c{i}\n"),
+            1 => format!("let x: u32 = {i} + 1;\n"),
+            2 => format!("core::writeln!(\"fmt {i}\"); /* b{i} */\n"),
+            _ => format!("struct B{i} {{ a: u32, }}\n"),
+        })
+        .collect();
+    let b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+
+    // 上小窗 [0,20]（预热建 [0,~62] 缓存）→ 远跳 [400,450]（顶窗沉降为快照）。
+    let _ = hl.highlight_window(&b, 0, 20, 16).to_vec();
+    let _ = hl.highlight_window(&b, 400, 450, 16).to_vec();
+    assert_eq!(hl.test_reparse_count(), 2);
+
+    // 回跳窗口 [0,300]：快照只盖 [0,62]，窗口底（300）在快照之下 → 从快照最后保存点
+    // 续解析 63..=300。冷重解析对照（全新 Highlighter 同样从行 0 起锚）必须逐位一致。
+    let merged = hl.highlight_window(&b, 0, 300, 16).to_vec();
+    assert_eq!(merged.len(), 301);
+    assert_eq!(hl.test_reparse_count(), 2, "续栈不触发整段重解析");
+    assert_eq!(hl.test_snapshot_hit_count(), 1);
+
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 300, 16).to_vec();
+    assert_eq!(merged, truth_rows, "快照续栈输出应与冷整段重解析逐位一致");
+}
+
+/// 编辑 → 全部快照失效：内容变更后，回跳/重锚不得命中任何旧快照（否则把旧颜色当新
+/// 文档用）。编辑本身由既有编辑增量路径（`reparse_after_edit`）处理、不触发整段重解析；
+/// 但之后的大缺口下滚再重锚时，被编辑清空的快照不能再命中 → 必须整段重解析（修复前若
+/// 不失效会命中旧快照）。
+#[test]
+fn edit_clears_snapshots_next_reanchor_full_reparse() {
+    let text: String = (0..20_000)
+        .map(|i| format!("let v{i}: u32 = {i}; // c{i}\n"))
+        .collect();
+    let mut b = Buffer::new(&text);
+    let mut hl = Highlighter::new();
+    hl.set_language(Some("rust"));
+
+    // 打开 → 远跳下滚（快照沉降）→ 回看（命中快照）。至此快照里有一颗 [10000,10108]。
+    let _ = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    let _ = hl.highlight_window(&b, 10_000, 10_108, 16).to_vec();
+    let _ = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(hl.test_reparse_count(), 2);
+    assert_eq!(hl.test_snapshot_hit_count(), 1, "编辑前回看已命中快照");
+
+    // 编辑行 50 前插入一行（version 0→1），登记编辑 → 快照必须全部失效。
+    let off = b.line_start(50);
+    b.apply_edit(off..off, "X\n");
+    hl.set_dirty(Some((50, 51, 1)));
+
+    // 编辑增量路径就地改色（不整段重解析；改后颜色 = 全新解析）。
+    let after: Vec<_> = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    let mut truth = Highlighter::new();
+    truth.set_language(Some("rust"));
+    let truth_rows: Vec<_> = truth.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(hl.test_reparse_count(), 2, "编辑增量不应触发整段重解析");
+    assert_eq!(after, truth_rows, "编辑后窗口颜色应与全新解析一致");
+
+    // 再下滚 [10000,10108]：编辑清空了快照 → 命不中旧快照 → 必须整段重解析 #3。
+    let _ = hl.highlight_window(&b, 10_000, 10_108, 16).to_vec();
+    assert_eq!(
+        hl.test_reparse_count(),
+        3,
+        "编辑后回跳不得命中旧快照，须整段重解析"
+    );
+    assert_eq!(
+        hl.test_snapshot_hit_count(),
+        1,
+        "编辑后不得再命中快照（快照已失效）"
+    );
+}
+
 #[test]
 fn highlight_window_aligned_to_base_for_batched_indexing() {
     // 视图 `build_rows` 依赖 `highlight_window(lo, hi, lookback)` 返回**与请求

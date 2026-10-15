@@ -19,7 +19,16 @@
 //! 收敛判据是**充分且必要安全**的：仅在 `r+1 ≥ tail_new`（编辑新文本跨已全部重解析、
 //! 下方全是内容未变的「尾部」行）时允许提前退出；未达标前任何样式巧合命中都不会
 //! 早退，避免把编辑区间内的新行错当成未变而漏掉。`base` 之下、滚动上移等无法
-//! 增量的情况回落到整段重解析（与旧实现一致，只影响该路径的代价、不影响正确性）。
+//! 增量的情况原本回落到整段重解析（与旧实现一致，只影响该路径的代价、不影响正确性）。
+//!
+//! ![回跳快照层] 在上述「单一主窗口 + savepoints」之上再加一层**有界 LRU 快照缓存**：
+//! 主窗口每次被丢弃/收缩（容量前移 drain、整段重锚）前，先把整窗镜像（`base` + `lines`
+//! + `saves` + 版本 + 文档 id + 明暗）沉降为快照；回跳/回看（`lo < base`）时若命中最近
+//! 解析过的区域快照，直接从其中**半程续栈**（快照覆盖到请求窗底 → 整窗复用，零 syntect；
+//! 只覆盖一半 → 从快照最后保存点续解析，只付超出部分）重建主窗口，不再从空 `ParseState`
+//! 整段重解析——「打开→下滚→回看→再下滚」的典型往返不再整窗重解析。快照语义与主窗口
+//! 同款（`saves.len() == lines.len()` 不变量同样成立），只做「与主窗口同版本相同的解析」；
+//! 编辑/换 Buffer/切明暗 → 全部快照失效；任何不确定一律保守回落到整段重解析（宁慢勿错）。
 //!
 //! 与上层解耦：产出是**与主题无关的语义名**再映射为 gpui `Hsla`（GitHub 明/暗两套
 //! 内嵌色板），不依赖 gpui-component 的 `HighlightTheme`。
@@ -44,6 +53,22 @@ use crate::editor::buffer::Buffer;
 /// 百 ms 级（debug），是「中速拖动不跟手」的根因。**注意**：首屏（缓存为空）不走此延后
 /// 路径——打开/首帧同步上色（见 [`Self::accept_deferred`]），否则大文档先出纯文本再补色。
 const EXTEND_SYNC_BUDGET_ROWS: usize = 160;
+
+/// 回跳快照缓存预算（取舍）：`HL_SNAPSHOT_CAP` = 最多保留的快照份数；
+/// `HL_SNAPSHOT_MAX_ROWS` = 单份快照的行数上限。
+///
+/// 快照 = 历史解析窗口的完整镜像（base + lines + saves + 版本 + 文档 id + 明暗），
+/// 供「回跳/回看」半程续栈——主窗口被 drain / 重锚前沉降，回跳命中快照即可从保存点续栈
+/// 或整窗复用，不再从空 `ParseState` 整段重解析。**单窗口仍是主线**：快照只是回跳优化层，
+/// 不取代主缓存的命中/`extend_down`/编辑增量路径（滚动前进热路径零快照开销）。
+///
+/// CAP 取 4（连带行数上限）：滚轮/回跳通常只回最近 1-2 个窗口，4 个已覆盖「打开→下滚→
+/// 回看→再下滚」的典型往返，又不吞内存；行数上限兜底超大窗口（窗口 2k+ 行时单份快照即
+/// 超预算 → 拒绝快照，保守回落既有整窗重解析，宁慢勿错）。每次存快照 O(窗口) 复制，只在
+/// 「即将离开保护区」（drain / 重锚）时做，不随滚动频率放大。
+const HL_SNAPSHOT_CAP: usize = 4;
+/// 单份快照最大行数（见 [`HL_SNAPSHOT_CAP`] 的取舍注释）。
+const HL_SNAPSHOT_MAX_ROWS: usize = 2048;
 
 /// 共享语法集（默认语法集几 MB，进程级共享一次）。
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
@@ -159,6 +184,27 @@ fn name_color(name: &str, dark: bool) -> Option<Hsla> {
     Some(rgb(c).into())
 }
 
+/// 历史解析窗口快照：主窗口被丢弃/重锚前的一帧完整镜像（逐行样式 + 每行解析状态保存点）。
+/// 语义与主缓存同款：`saves[i]` = 解析完 `base + i` 行后的状态，`saves.len() == lines.len()`
+/// 不变量同样成立。`doc_id`/`version`/`dark` 记录建立时上下文，命中三要素都要对得上
+/// （换文档/编辑换版本/切明暗 → 快照不得复用，宁慢勿错）。
+struct HighlightSnapshot {
+    /// 所属文档 id（与 Buffer::id 对照，杜绝「换 Buffer 后 version 归零」命中上一份文档）。
+    doc_id: u64,
+    /// 建立时的 buffer 版本（编辑 → 版本跳变 → 该快照整体过期）。
+    version: u64,
+    /// 解析窗口锚点（逻辑行，`lines[0]` = 第 `base` 行）。
+    base: usize,
+    /// 建立时的明暗色板（快照存的 `Hsla` 依赖 `dark`，切明暗后不得复用）。
+    dark: bool,
+    /// 逐行样式（相对每行文本字节）。
+    lines: Vec<Vec<(Range<usize>, Hsla)>>,
+    /// 每行解析状态保存点（`saves[i]` = 解析完 `base + i` 行后的状态）。
+    saves: Vec<ParseState>,
+    /// LRU 最近使用钟（淘汰序，cap 小 → 线性扫够用）。
+    last_seen: u32,
+}
+
 /// 高亮器：持有语言语法 + 「增量解析缓存」。
 pub struct Highlighter {
     syntax: Option<&'static SyntaxReference>,
@@ -171,6 +217,15 @@ pub struct Highlighter {
     saves: Vec<ParseState>,
     /// 缓存建立时的 `buffer.version`；版本变 = 有编辑。
     gated_version: u64,
+    /// 缓存建立时的文档 id（与 `gated_version` 一起判别「是否同一份文档」：换 Buffer 后
+    /// version 可能归零，`gated_version` 撞车不能当作命中，须 `gated_id` 也一致——见
+    /// [`Buffer::id`] 与 `invalidate` 的 version-0 冲突回归）。
+    gated_id: u64,
+    /// 回跳快照 LRU（见 [`HighlightSnapshot`] / [`HL_SNAPSHOT_CAP`]）：主窗口被 drain/重锚
+    /// 前沉降当前窗口，回跳命中快照即半程续栈重建主窗口，不再从空 `ParseState` 整段重解析。
+    snapshots: Vec<HighlightSnapshot>,
+    /// 快照 LRU 访问钟（`HighlightSnapshot::last_seen`，淘汰最久未用）。
+    snapshot_clock: u32,
     /// 待消费的「最近编辑」登记（由 `set_dirty` 写入，仅消费一次）：
     /// `(min_row, tail_new, delta)` —— `min_row` 编辑前最小受影响逻辑行；
     /// `tail_new` 编辑后在**当前坐标**下首个内容未变的「尾部」行
@@ -193,6 +248,10 @@ pub struct Highlighter {
     /// （before/after 对比用；生产恒 `false`）。
     #[cfg(test)]
     test_append_gate_disabled: bool,
+    /// 测试探针（`cfg(test)`）：回跳「命中快照半程续栈」累计次数（恢复自快照而非整段
+    /// 重解析；「回跳命中快照次数 vs 整窗重解析次数」对比用）。
+    #[cfg(test)]
+    test_snapshot_hit_count: usize,
 }
 
 impl Highlighter {
@@ -204,6 +263,9 @@ impl Highlighter {
             lines: Vec::new(),
             saves: Vec::new(),
             gated_version: 0,
+            gated_id: 0,
+            snapshots: Vec::new(),
+            snapshot_clock: 0,
             dirty: None,
             force_full: true,
             pending: None,
@@ -211,6 +273,8 @@ impl Highlighter {
             test_reparse_count: 0,
             #[cfg(test)]
             test_append_gate_disabled: false,
+            #[cfg(test)]
+            test_snapshot_hit_count: 0,
         }
     }
 
@@ -224,6 +288,13 @@ impl Highlighter {
     #[cfg(test)]
     pub(crate) fn test_reparse_count(&self) -> usize {
         self.test_reparse_count
+    }
+
+    /// 测试探针：回跳「命中快照半程续栈」累计次数（与 [`Self::test_reparse_count`] 对照：
+    /// 回看命中快照 → 本计数 +1 而整段重解析计数不动）。
+    #[cfg(test)]
+    pub(crate) fn test_snapshot_hit_count(&self) -> usize {
+        self.test_snapshot_hit_count
     }
 
     /// 测试探针：当前缓存行数（自 `base` 起）；用于断言首屏预热**有界**（非全档 parse）。
@@ -278,6 +349,10 @@ impl Highlighter {
         self.saves.clear();
         self.dirty = None;
         self.pending = None;
+        // 整篇替换/换语言 → 历史窗口快照一并作废（换 Buffer 后 version 归零，残留快照
+        // 与「同 version 撞车」同危——快照携带 `gated_id`/`dark` 双保险，这里直接清空）。
+        self.snapshots.clear();
+        self.snapshot_clock = 0;
         self.force_full = true;
     }
 
@@ -295,10 +370,13 @@ impl Highlighter {
         }
     }
 
-    /// 切换明/暗色板（拖主题时调用）。
+    /// 切换明/暗色板（拖主题时调用）。快照存的 `Hsla` 依赖 `dark`，切色板一律作废
+    /// （`force_full` 之外再加 `dark` 身份校验双保险）。
     pub fn set_dark(&mut self, dark: bool) {
         if self.dark != dark {
             self.dark = dark;
+            self.snapshots.clear();
+            self.snapshot_clock = 0;
             self.force_full = true;
         }
     }
@@ -309,7 +387,172 @@ impl Highlighter {
     /// 下一个版本变更后的高亮请求消费一次；`None` 清除（整篇替换/打开/撤销重做走整段
     /// 重解析）。
     pub fn set_dirty(&mut self, dirty: Option<(usize, usize, i64)>) {
+        // 编辑（`dirty = Some` 即近期内容变更登记）→ 全部快照失效：历史解析窗口内容已变，
+        // 回跳不得复用旧颜色（主窗口仍走既有编辑增量路径）。整篇替换（`None`）由
+        // `invalidate` 统一清。
+        if dirty.is_some() {
+            self.snapshots.clear();
+            self.snapshot_clock = 0;
+        }
         self.dirty = dirty;
+    }
+
+    /// 沉降当前主窗口为快照（LRU）：只在「即将失去当前窗口」（容量前移 drain、整段重锚/
+    /// 恢复前）由调用方触发，每次 O(窗口)；滚动前进的命中/`extend_down` 路径零快照开销。
+    /// 只对「与当前文档同 id 同版本、未被强刷、行数有界」的有效窗口做快照——编辑后版本
+    /// 已跳变 / 换 Buffer / 超大窗口都拒绝（宁慢勿错，保守回落既有整段重解析）。
+    fn snapshot_current(&mut self, doc_id: u64, version: u64) {
+        if self.lines.is_empty()
+            || self.force_full
+            || self.gated_id != doc_id
+            || self.gated_version != version
+            || self.lines.len() > HL_SNAPSHOT_MAX_ROWS
+        {
+            return;
+        }
+        self.snapshots.push(HighlightSnapshot {
+            doc_id,
+            version,
+            base: self.base,
+            dark: self.dark,
+            lines: self.lines.clone(),
+            saves: self.saves.clone(),
+            last_seen: self.snapshot_clock,
+        });
+        self.snapshot_clock = self.snapshot_clock.wrapping_add(1);
+        self.evict_snapshots_overflow();
+    }
+
+    /// LRU 淘汰：快照数超过 `HL_SNAPSHOT_CAP` 时逐出最久未用（cap ≤ 4，线性扫 O(cap)）。
+    fn evict_snapshots_overflow(&mut self) {
+        while self.snapshots.len() > HL_SNAPSHOT_CAP {
+            let mut oldest = 0usize;
+            for i in 1..self.snapshots.len() {
+                if self.snapshots[i].last_seen < self.snapshots[oldest].last_seen {
+                    oldest = i;
+                }
+            }
+            self.snapshots.remove(oldest);
+        }
+    }
+
+    /// 回跳「半程续栈」：在整段重解析前先试最近解析过的快照——同文档同版本同明暗、且
+    /// `base ≤ lo` 的快照里取「对 [lo − lookback, hi] 覆盖最多」者，从其重建主窗口：
+    /// 快照覆盖到请求窗底 → 整窗复用（零 syntect）；只覆盖一半 → 从快照最后保存点续解析
+    /// （只有窗口超出快照的部分付 syntect，等于 `extend_down` 从快照世界续栈）。
+    ///
+    /// 正确性约束：
+    /// - 快照只做「与主窗口同版本相同的解析」：快照镜像取自真实解析，续栈的保存点起点
+    ///   精确（`saves.len() == lines.len()` 不变量在快照里同样成立），`base` 取快照锚点、
+    ///   `covered(lo, hi)` 由构造保证（`.base ≤ lo` 提前量 + 行数铺满）→ 返回切片起点不越界；
+    /// - 跨快照/主窗口拼接无歧义：只从**单个覆盖最优的快照**续栈，不拆多个快照拼接
+    ///   （跨边界有上下文断裂风险）；缓存上界之外统一续栈/整段重解析兜底；
+    /// - 任何不确定（无快照命中 / `force_full` / 版本/文档/明暗不符）一律返回 `false` 落到
+    ///   既有整段重解析（宁慢勿错）。
+    fn try_restore_from_snapshot(
+        &mut self,
+        buffer: &Buffer,
+        lo: usize,
+        hi: usize,
+        lookback: usize,
+        version: u64,
+    ) -> bool {
+        // 即将重锚（整段重解析或恢复）都会丢弃当前主窗口 → 先把它沉降为快照（LRU），
+        // 保证「回跳 → 再回跳」的往返各自命中、不打摆子。无效窗口由 `snapshot_current`
+        // 内部守卫拒绝。
+        self.snapshot_current(buffer.id(), version);
+        if self.force_full {
+            return false;
+        }
+        let need_start = lo.saturating_sub(lookback);
+        // 有限容量线性扫（cap ≤ 4）：选覆盖最多者；`base > lo` 的快照够不着本请求（起点
+        // 在请求窗之下），跳过。
+        let mut best: Option<(usize, usize)> = None;
+        for (idx, s) in self.snapshots.iter().enumerate() {
+            if s.doc_id != buffer.id() || s.version != version || s.dark != self.dark {
+                continue;
+            }
+            if s.base > lo {
+                continue;
+            }
+            let s_end = s.base + s.lines.len();
+            if s_end <= need_start {
+                continue;
+            }
+            let cov = s_end.min(hi + 1).saturating_sub(s.base.max(need_start));
+            if cov == 0 {
+                continue;
+            }
+            if best.map_or(true, |(_, c)| cov > c) {
+                best = Some((idx, cov));
+            }
+        }
+        let Some((best_idx, _)) = best else {
+            return false;
+        };
+        let mut snap = self.snapshots.remove(best_idx);
+        #[cfg(test)]
+        {
+            self.test_snapshot_hit_count += 1;
+        }
+        let s_end = snap.base + snap.lines.len();
+        let mut lines: Vec<Vec<(Range<usize>, Hsla)>> = Vec::with_capacity(hi + 1 - snap.base);
+        let mut saves: Vec<ParseState> = Vec::with_capacity(hi + 1 - snap.base);
+        // 1) 快照前缀直接复用（零 syntect；base 对齐到快照锚点，`covered` 提前量在其内）。
+        let copy_hi = s_end.min(hi + 1);
+        for i in 0..(copy_hi - snap.base) {
+            lines.push(snap.lines[i].clone());
+            saves.push(snap.saves[i].clone());
+        }
+        // 2) 快照末端 → 请求窗底：从快照最后保存点续解析（`cov > 0` ⇒ 快照非空 → `last()`
+        //    恒 Some；同快照世界连续续栈，输出与「回看时所见」+「冷整段重解析」逐位一致）。
+        if s_end <= hi {
+            let dark = self.dark;
+            let mut parser = snap
+                .saves
+                .last()
+                .cloned()
+                .unwrap_or_else(|| ParseState::new(SYNTAX_SET.find_syntax_plain_text()));
+            for r in s_end..=hi {
+                let text = buffer.line_text(r);
+                let mut style: Vec<(Range<usize>, Hsla)> = Vec::new();
+                self.parse_line(&mut parser, text.as_ref(), &mut style, dark);
+                lines.push(style);
+                saves.push(parser.clone());
+            }
+        }
+        self.lines = lines;
+        self.saves = saves;
+        self.base = snap.base;
+        self.gated_id = buffer.id();
+        self.gated_version = version;
+        self.dirty = None;
+        self.pending = None;
+        self.force_full = false;
+        // touch：置为最近使用后放回 LRU（回跳后又回跳仍命中，避免往返各整段重解析一次）。
+        snap.last_seen = self.snapshot_clock;
+        self.snapshot_clock = self.snapshot_clock.wrapping_add(1);
+        self.snapshots.push(snap);
+        self.evict_snapshots_overflow();
+        debug_assert!(self.covered(lo, hi));
+        true
+    }
+
+    /// 重锚入口：先试快照半程续栈（回跳/回看命中 → 零或少量 syntect），否则整段重解析
+    /// （旧行为）。替换 `full_reparse` 的调用点统一走这里，保证两路径不遗漏。
+    fn reparse_or_restore(
+        &mut self,
+        buffer: &Buffer,
+        lo: usize,
+        hi: usize,
+        lookback: usize,
+        version: u64,
+        line_count: usize,
+    ) {
+        if self.try_restore_from_snapshot(buffer, lo, hi, lookback, version) {
+            return;
+        }
+        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
     }
 
     /// 内部缓存起点行（含回看前缀；只用于命中判定，不对返回切片取行）。
@@ -367,7 +610,8 @@ impl Highlighter {
         };
         let version = buffer.version();
         let line_count = buffer.line_count();
-        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+        // 回跳 settle（上移出缓存）优先试快照半程续栈，命中则不用整段重解析。
+        self.reparse_or_restore(buffer, lo, hi, lookback, version, line_count);
         self.covered(lo, hi)
     }
 
@@ -444,6 +688,10 @@ impl Highlighter {
                     .min(self.lines.len())
                     .min(self.saves.len());
                 if drop > 0 {
+                    // 即将丢弃顶部旧行（离开保护区）→ 先把整窗沉降为快照，回跳回这片区域
+                    // 从快照半程续栈，不再整段重解析。无语法空样式窗口沉降快照无益但无害
+                    // （`snapshot_current` 按行数/版本/文档/明暗自检）。
+                    self.snapshot_current(buffer.id(), version);
                     self.lines.drain(..drop);
                     self.saves.drain(..drop);
                     self.base = new_base;
@@ -489,7 +737,9 @@ impl Highlighter {
                     //（滚轮/惯性微跳，作用域栈完整）。
                     let gap = hi.saturating_sub(cached_end).saturating_add(1);
                     if gap > EXTEND_SYNC_BUDGET_ROWS {
-                        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+                        // 有界重锚（O(窗口+回看)）：先试快照半程续栈（命中回跳区域则零/少
+                        // syntect），否则整段重解析——避免逐行解析整个缺口卡死 UI 线程。
+                        self.reparse_or_restore(buffer, lo, hi, lookback, version, line_count);
                         return;
                     }
                     self.extend_down(buffer, cached_end, hi);
@@ -533,9 +783,10 @@ impl Highlighter {
             // 未达成（语言未配置 / 切片仍不够）→ 落到整段重解析（D）；重解析会清空 dirty。
         }
 
-        // D) 整段重解析：从 lo - lookback 起建缓存（打开/整篇替换/滚动上移出缓存/
-        // 编辑在缓存起点之上等）。代价 O(窗口 + 回看)，与文档总大小无关。
-        self.full_reparse(buffer, lo, hi, lookback, version, line_count);
+        // D) 整段重解析（或回跳快照半程续栈）：从 lo - lookback 起建缓存（打开/整篇
+        // 替换/滚动上移出缓存/编辑在缓存起点之上等）。代价 O(窗口 + 回看)，与文档总大小
+        // 无关；回跳命中快照时降到零/少量 syntect。
+        self.reparse_or_restore(buffer, lo, hi, lookback, version, line_count);
     }
 
     /// 整段重解析建缓存：锚点 = `lo - lookback`，覆盖到请求窗口底 `hi`。
@@ -595,6 +846,7 @@ impl Highlighter {
             self.saves = saves;
             self.base = start;
             self.gated_version = version;
+            self.gated_id = buffer.id();
             self.dirty = None;
             self.force_full = false;
             return;
@@ -613,6 +865,7 @@ impl Highlighter {
         self.saves = saves;
         self.base = start;
         self.gated_version = version;
+        self.gated_id = buffer.id();
         self.dirty = None;
         self.pending = None;
         self.force_full = false;
