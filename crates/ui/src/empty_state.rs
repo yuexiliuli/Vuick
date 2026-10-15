@@ -170,7 +170,8 @@ pub fn empty_state_hero(
         .debug_selector(|| "empty-state".into())
         .size_full()
         .overflow_hidden()
-        // 欢迎页底色与编辑区同色（暗色 = config EDITOR_BG_DARK）。
+        // 欢迎页底色与编辑区同色（暗色 = theme `editor_bg` #121314，原 config
+        // EDITOR_BG_DARK 常量已删）。
         .bg(crate::ui::shell::content_bg(dark, c.bg.into()))
         .flex()
         .flex_col()

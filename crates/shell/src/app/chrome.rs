@@ -33,11 +33,11 @@ impl EditorApp {
             ui::theme::MICA_CHROME_ALPHA_LIGHT
         }
     }
-    /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 config
-    /// `CHROME_BG_DARK` 的不透明统一底色）。
+    /// 标题栏/选项卡栏/侧栏工具条背景（Mica 半透明版；暗色主题改用 theme `chrome_bg`
+    /// #191A1B（原 config `CHROME_BG_DARK`，常量已删）的不透明统一底色）。
     pub(super) fn mica_bar_bg(&self) -> gpui::Hsla {
         if self.dark_mode {
-            gpui::rgb(config::layout::CHROME_BG_DARK).into()
+            ui::theme::ChromeColors::for_mode(true).chrome_bg.into()
         } else {
             self.bar_bg().opacity(self.mica_alpha())
         }
@@ -91,7 +91,8 @@ impl EditorApp {
         self.chrome().hairline.into()
     }
 
-    /// 编辑器/预览面板背景（暗色主题用 config `EDITOR_BG_DARK` 统一底色）。
+    /// 编辑器/预览面板背景（暗色主题 = theme `editor_bg`（原 config `EDITOR_BG_DARK`
+    /// #121314，常量已删）统一底色）。
     pub(super) fn panel_bg(&self) -> gpui::Hsla {
         ui::shell::content_bg(self.dark_mode, self.chrome().panel_bg.into())
     }

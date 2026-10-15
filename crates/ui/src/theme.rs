@@ -266,6 +266,16 @@ pub struct ChromeColors {
     pub hairline: Rgba,
     /// 编辑器/预览面板背景
     pub panel_bg: Rgba,
+    /// **内容区真实渲染底**（编辑区/预览/欢迎页）：暗 #121314（收编自 `config::layout`
+    /// `EDITOR_BG_DARK`，常量已删）/ 亮 #FFFFFF。与 `panel_bg` **不同源、不互相替代**：
+    /// `panel_bg` 是外壳层「面板泛化底」（随 `colors.bg`，暗 #2B2B2B，
+    /// 供既有不变式原样保留）；`editor_bg` 才是屏幕上真正铺到编辑区/欢迎页的底色，
+    /// 统一经 [`crate::ui::shell::content_bg`] 取用。
+    pub editor_bg: Rgba,
+    /// **外壳 chrome 区域底色**（标题栏/选项卡栏/侧栏/状态栏）：暗 #191A1B（收编自
+    /// `config::layout` `CHROME_BG_DARK`，常量已删）/ 亮 #FFFFFF（= `surface` 亮档同值）。
+    /// Mica 半透明版（`mica_bar_bg` 亮档）仍按原公式 `bar_bg() * alpha` 合成，不用本字段。
+    pub chrome_bg: Rgba,
     /// 主要文字
     pub text_primary: Rgba,
     /// 次要/弱化文字
@@ -324,6 +334,10 @@ impl ChromeColors {
             // 区域分隔发丝线（不透明，亮浅灰 #D9D9D9，原 config SEPARATOR_LIGHT）
             hairline: rgb(0xd9d9d9),
             panel_bg: c.bg,
+            // 内容区真实底（亮 = panel_bg 亮档 #FFFFFF，同值）
+            editor_bg: rgb(0xffffff),
+            // 外壳 chrome 区域底（亮 = 原 card_surface 亮档 surface #FFFFFF，同值）
+            chrome_bg: rgb(0xffffff),
             text_primary: c.fg,
             text_minor: c.fg_muted,
             text_tertiary: rgb(0x8a8a8a),
@@ -356,6 +370,12 @@ impl ChromeColors {
             // 区域分隔发丝线（不透明，暗深灰 #2A2B2C，原 config SEPARATOR_DARK）
             hairline: rgb(0x2a2b2c),
             panel_bg: c.bg,
+            // 内容区真实底（暗 = #121314，原 config EDITOR_BG_DARK，此前散落
+            // ui::shell::content_bg 的裸 hex）
+            editor_bg: rgb(0x121314),
+            // 外壳 chrome 区域底（暗 = #191A1B，原 config CHROME_BG_DARK，此前散落
+            // card_surface / mica_bar_bg 的裸 hex）
+            chrome_bg: rgb(0x191a1b),
             text_primary: c.fg,
             text_minor: c.fg_muted,
             text_tertiary: rgb(0x6e6e6e),
@@ -719,6 +739,26 @@ mod tests {
         assert_eq!(light.drag_ghost_bg, ColorScheme::light().accent, "亮拖拽幽灵 = 亮强调色");
         assert_eq!(dark.drag_ghost_bg, ColorScheme::dark().accent, "暗拖拽幽灵 = 暗强调色");
         assert_ne!(light.drag_ghost_bg, dark.drag_ghost_bg, "拖拽幽灵随明暗");
+    }
+
+    #[gpui::test]
+    fn editor_chrome_bg_tokens_pinned_light_dark(_cx: &mut TestAppContext) {
+        // 颜色收编专项：内容区底 / 外壳 chrome 底收编为 theme 语义 token（删 config
+        // `EDITOR_BG_DARK` / `CHROME_BG_DARK`）。取值 = 原常量逐字节（暗 #121314 / #191A1B，
+        // 亮 #FFFFFF），钉死防回归；并与面板泛化底 `panel_bg`（随 colors.bg）语义区分，
+        // 两 token 不互相替代。
+        let light = ChromeColors::light();
+        let dark = ChromeColors::dark();
+        assert_eq!(light.editor_bg, rgb(0xffffff), "亮编辑区底=白");
+        assert_eq!(light.chrome_bg, rgb(0xffffff), "亮外壳底=白");
+        assert_eq!(dark.editor_bg, rgb(0x121314), "暗编辑区底=原 EDITOR_BG_DARK");
+        assert_eq!(dark.chrome_bg, rgb(0x191a1b), "暗外壳底=原 CHROME_BG_DARK");
+        assert_ne!(light.editor_bg, dark.editor_bg, "编辑区底随明暗");
+        assert_ne!(light.chrome_bg, dark.chrome_bg, "外壳底随明暗");
+        // 与保留的 panel_bg 分道：暗档 editor_bg(#121314) ≠ panel_bg(#2B2B2B)，
+        // panel_bg 及其不变式逐字节保留（不互相替代）。
+        assert_eq!(dark.panel_bg, rgb(0x2b2b2b), "暗 panel_bg 原样保留（随 colors.bg）");
+        assert_ne!(dark.editor_bg, dark.panel_bg, "暗编辑区底 ≠ 暗 panel_bg（语义分离）");
     }
 
     #[gpui::test]
