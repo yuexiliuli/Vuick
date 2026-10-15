@@ -91,6 +91,27 @@ impl EditorApp {
             .into_any_element()
     }
 
+    /// 统一 WyEditor 宿主驱动（live2 左面板 / 右栏预览 / 全屏预览共用）：渲染期注入
+    /// 宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = 滚动偏移 − 顶部
+    /// 内衬），再 `prepare_font_zoom`——字号变化时 WyEditor 在 render 期按新字号重建帧
+    /// 并把锚点块的精确位置写回宿主滚动句柄（prepaint 读偏移之前完成），
+    /// Ctrl+滚轮缩放**无缝**、不带动滚动位置（收敛自驱动在 WyEditor 元素 prepaint）。
+    fn drive_wy_host(
+        &self,
+        ed: &gpui::Entity<markdown::wysiwyg::WyEditor>,
+        vhand: &gpui::ScrollHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fs = self.font_size;
+        let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
+        ed.update(cx, |ed, _| {
+            ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
+            ed.set_viewport_top(local_top); // 用缩放前旧顶捕捉锚点
+            ed.prepare_font_zoom(gpui::px(fs), window);
+        });
+    }
+
     /// WYSIWYG（live2）左面板：宿主滚动容器 + 自绘纵向滚动条 + Ctrl+滚轮缩放。
     /// 渲染期把全局字号推进到 WYSIWYG，并做**缩放视口锚定**（对齐 view / editor）：
     /// 注入宿主滚动句柄 + 内容顶部内衬，推入当前视口顶部（元素局部 y = scroll 偏移 −
@@ -104,14 +125,8 @@ impl EditorApp {
         grow: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let fs = self.font_size;
         let vhand = self.tabs[self.active_tab].live_vscroll.clone();
-        let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
-        ed.update(cx, |ed, _| {
-            ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
-            ed.set_viewport_top(local_top); // 用缩放前旧顶捕捉锚点
-            ed.prepare_font_zoom(gpui::px(fs), window);
-        });
+        self.drive_wy_host(ed, &vhand, window, cx);
         let live_any = ed.clone().into_any_element();
         let text_color = self.text_primary();
         let fs = self.font_size;
@@ -370,14 +385,9 @@ impl EditorApp {
         if !ed.read(cx).is_loaded() {
             return self.md_wy_pending_placeholder(fullscreen, grow);
         }
-        let fs = self.font_size;
         let vhand = self.tabs[self.active_tab].md_wy_vscroll.clone();
-        let local_top = (-vhand.offset().y).max(gpui::px(0.)).as_f32() - LIVE_BODY_PAD_Y;
-        ed.update(cx, |ed, _| {
-            ed.set_host_scroll(Some(vhand.clone()), LIVE_BODY_PAD_Y);
-            ed.set_viewport_top(local_top);
-            ed.prepare_font_zoom(gpui::px(fs), window);
-        });
+        self.drive_wy_host(&ed, &vhand, window, cx);
+        let fs = self.font_size;
         let any = ed.clone().into_any_element();
         let text_color = self.text_primary();
         let scroll = div()
