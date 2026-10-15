@@ -12,12 +12,11 @@
 //! - 跨行只有一种状态：**代码围栏**（``` / ~~~）。窗口扫描维护围栏开闭，
 //!   围栏内容行整行套 `Code` 样式（不再识别行内记号），围栏标记行套 `Marker`。
 //!
-//! 缓存：与 [`crate::editor::highlight::Highlighter`] 同款「版本 × 文档指纹 × 行窗口」
+//! 缓存：与 [`crate::editor::highlight::Highlighter`] 同款「文档身份 × 版本 × 行窗口」
 //! 缓存，大文档只扫描可见窗口（+ `lookback` 回看恢复围栏状态），与文档总大小无关；
-//! 指纹维度兜住「新 Buffer 从 version=0 起撞上一份文档键」的替换场景。
+//! 身份维度 = `Buffer::id`（O(1)）：兜住「新 Buffer 从 version=0 起撞上一份文档键」
+//! 的替换场景，且命中帧零重哈希（早期用整窗文本指纹，每帧 O(窗口) 白白重算）。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hasher;
 use std::ops::Range;
 
 use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, StrikethroughStyle, UnderlineStyle, px};
@@ -492,39 +491,24 @@ fn resolve_runs(runs: &[(Range<usize>, Deco)], dark: bool) -> Vec<(Range<usize>,
     out
 }
 
-/// 把一行文本写入指纹累积器。`scan_window` 的 miss 重建与会话内校验共用这段，保证
-/// 两次哈希对同一片文本产出一致的指纹。
-fn hash_line(h: &mut DefaultHasher, text: &str) {
-    h.write(text.as_bytes());
-    h.write_u8(0xFF);
-}
-
-/// `buffer` 的 `[start, end]` 行文本指纹（O(窗口)）。
-///
-/// 装饰样式只是「扫描切片文本 + 明暗」的纯函数，因此指纹只需覆盖实际扫描的切片即可
-/// 区分不同文档（`set_text`/`reset_document` 换 Buffer 后 version 归零、会撞上一份文档
-/// 的键），又避免了给整份 Rope 做 O(n) 指纹——否则大文档每次编辑/滚动都整档重排的退化。
-fn row_window_fingerprint(buffer: &Buffer, start: usize, end: usize) -> u64 {
-    let mut h = DefaultHasher::new();
-    h.write_usize(start);
-    h.write_usize(end);
-    for row in start..=end {
-        hash_line(&mut h, buffer.line_text(row).as_ref());
-    }
-    h.finish()
-}
-
-/// Markdown「所见即所得」滤镜：按可见窗口扫描并缓存（版本 × 文档指纹 × 窗口 × 明暗）。
+/// Markdown「所见即所得」滤镜：按可见窗口扫描并缓存（文档 id × 版本 × 窗口 × 明暗）。
 pub(crate) struct MarkdownDecor {
     dark: bool,
-    /// 缓存键：`(buffer.version, 扫描切片文本指纹, 请求 lo, 请求 hi, dark)`。
-    /// 指纹维度 = 文档身份：`set_text`/`reset_document` 替换 Buffer 后 version 从 0 起，
-    /// 若无指纹会命中上一份文档的样式区间（撞键 → 崩在 `is_char_boundary`）。version
-    /// 仍保留，负责「同一文档内编辑」失效。
+    /// 缓存键：`(buffer.id(), buffer.version, 请求 lo, 请求 hi, dark)`。
+    /// 身份维度 = `Buffer::id`（O(1)）：`set_text`/`reset_document` 替换 Buffer 后
+    /// version 从 0 起、id 必新，换一份文档即身份不同 → 必 miss → 自愈重扫，不再
+    /// 依赖对整窗文本重哈希兜撞键（命中帧零重哈希；早期 `row_window_fingerprint` 每帧
+    /// O(窗口) 重算）。version 仍保留，负责「同一文档内编辑」失效（编辑必有版本跳变）。
     key: Option<(u64, u64, usize, usize, bool)>,
     /// 扫描起始行（含回看前缀）。
     base_row: usize,
     lines: Vec<Vec<(Range<usize>, HighlightStyle)>>,
+    /// 命中计数（测试探针：命中 = 静止帧直接复用缓存切片，零重扫零重哈希）。
+    #[cfg(test)]
+    pub(crate) hits: usize,
+    /// 重扫计数（测试探针：仅版本 / 文档身份 / 明暗变化或窗口越界才重扫）。
+    #[cfg(test)]
+    pub(crate) rescans: usize,
 }
 
 impl MarkdownDecor {
@@ -534,6 +518,10 @@ impl MarkdownDecor {
             key: None,
             base_row: 0,
             lines: Vec::new(),
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            rescans: 0,
         }
     }
 
@@ -566,33 +554,31 @@ impl MarkdownDecor {
         let hi = hi.min(line_count - 1);
         let version = buffer.version();
 
-        // 命中条件：版本同 + 明暗同 + 请求窗口落在已扫描切片内 + 该切片文本指纹未变。
-        // 指纹维度即文档身份：替换 Buffer 后 version 仍从 0 起（会撞上一份文档的键），
-        // 指纹不同 → 必 miss → 按新文档重扫，不再依赖调用方显式 `clear()` 兜底。
+        // 命中条件：同文档（id）+ 同版本 + 同明暗 + 请求窗口落在已扫描切片内。
+        // - `id` 判文档身份：换 Buffer 后 version 归零也撞不了上一份文档的键（O(1)）；
+        // - `version` 判同文档内编辑：`apply_edit/undo/redo/append_chunk` 均有版本跳变，
+        //   同版本 ⟹ 切片文本与原扫描完全一致 → 直接复用，零重哈希（早期实现此处对
+        //   整窗缓存切片重跑指纹 O(窗口)；`line_text` 逐行拷贝也不再发生）。
         // 越界守卫：新文档更短时 `hi_orig` 可能越过 `line_count`，必须当 miss 处理。
-        if let Some((v, f, _l, _h, d)) = self.key
-            && v == version && d == self.dark && lo >= self.base_row {
+        if let Some((id, v, _l, _h, d)) = self.key
+            && id == buffer.id() && v == version && d == self.dark && lo >= self.base_row {
                 let rel = lo - self.base_row;
                 let hi_orig = self.base_row + self.lines.len() - 1;
-                if rel + (hi - lo) < self.lines.len()
-                    && hi_orig < line_count
-                    && f == row_window_fingerprint(buffer, self.base_row, hi_orig) {
-                        return &self.lines[rel..rel + (hi - lo) + 1];
+                if rel + (hi - lo) < self.lines.len() && hi_orig < line_count {
+                    #[cfg(test)]
+                    {
+                        self.hits += 1;
                     }
+                    return &self.lines[rel..rel + (hi - lo) + 1];
+                }
             }
 
         let start = lo.saturating_sub(lookback);
-        // 指纹与扫描同趟累积：写入的起点/终点与每行文本顺序必须和
-        // [`row_window_fingerprint`] 完全一致，命中校验与 miss 重建才用同一哈希。
-        let mut fingerprint = DefaultHasher::new();
-        fingerprint.write_usize(start);
-        fingerprint.write_usize(hi);
         let mut fence: Option<Fence> = None;
         let mut lines: Vec<Vec<(Range<usize>, HighlightStyle)>> = Vec::with_capacity(hi - start + 1);
         for row in start..=hi {
             let bullet = buffer.line_text(row);
             let text = bullet.as_ref();
-            hash_line(&mut fingerprint, text);
             let core = core_len(text);
             let s = &text[..core];
 
@@ -622,7 +608,11 @@ impl MarkdownDecor {
 
         self.lines = lines;
         self.base_row = start;
-        self.key = Some((version, fingerprint.finish(), lo, hi, self.dark));
+        self.key = Some((buffer.id(), version, lo, hi, self.dark));
+        #[cfg(test)]
+        {
+            self.rescans += 1;
+        }
         &self.lines[lo - start..lo - start + (hi - lo) + 1]
     }
 }
@@ -821,8 +811,9 @@ mod tests {
         // 用 `Buffer::new` 替换文档后 version 归零（新 Buffer 从 version=0 起），旧实现
         // 靠 `reset_document` 显式 `clear()` 兜底防 `(version=0, lo, hi)` 命中上一份文档
         // 的样式区间——区间端越过新行长时 `StyledText::with_highlights` 崩在
-        // `is_char_boundary(run.end)`。M0.3 后缓存键含「扫描切片文本指纹」，替换文档后
-        // 指纹不同 → 必 miss → 按新文本重扫；本测试即验证**不调 clear() 也能自愈**。
+        // `is_char_boundary(run.end)`。M0.3 后缓存键含文档身份（`Buffer::id`，O(1)），
+        // 替换文档后 id 不同 → 必 miss → 按新文本重扫；本测试即验证**不调 clear() 也能
+        // 自愈**（早期「扫描切片文本指纹」每帧对窗口 O(窗口) 重哈希，已改为 id 判别）。
         let src = Buffer::new("# 标题\n");
         let mut dec = MarkdownDecor::new();
         let before = dec.scan_window(&src, 0, 0, 16).to_vec();
@@ -835,6 +826,7 @@ mod tests {
             "旧文档标题样式应落在 ` 标题`（7B）之外: {:?}",
             before[0]
         );
+        let rescans_first = dec.rescans;
 
         // 替换文档（模拟 `commit_live::set_text`）：新旧 Buffer 都从 version=0 起（撞键前提）。
         let dst = Buffer::new(" 标题\n");
@@ -844,8 +836,10 @@ mod tests {
             "新旧 Buffer 都从 version=0 起（缓存键碰撞前提）"
         );
 
-        // 不调 clear()：指纹兜住身份，扫描命中新文档、重扫出正确样式（区间全在行内、无标题）。
+        // 不调 clear()：id 兜住身份（版本同但 id 不同 → miss → 重扫），新文档重扫出
+        // 正确样式（区间全在行内、无标题）。命中帧不动，重扫计数必 +1。
         let fresh = dec.scan_window(&dst, 0, 0, 16).to_vec();
+        assert_eq!(dec.rescans, rescans_first + 1, "换 Buffer 必须重扫，不得命中旧样式");
         assert!(
             fresh[0].iter().all(|(r, _)| r.end <= " 标题".len()),
             "新文档应重扫，全部区间在行内: {:?}",
@@ -857,6 +851,50 @@ mod tests {
                 .any(|(_, s)| s.font_weight == Some(FontWeight::BOLD)),
             "「 标题」（无 `#`）不再是标题，不应有粗体样式: {:?}",
             fresh
+        );
+    }
+
+    #[test]
+    fn static_frame_hits_do_not_rescan_and_version_edit_does() {
+        // 优化验收：命中帧（纯滚动/悬停，同文档同版本）直接复用缓存切片，零重扫零
+        // 重哈希（早期 `row_window_fingerprint` 每帧对窗口 O(窗口) 重算）；仅编辑
+        // （版本跳变）才重扫。
+        let src = (0..60)
+            .map(|i| format!("line {i} **b{i}**"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut dec = MarkdownDecor::new();
+        let mut b = Buffer::new(&src);
+        dec.scan_window(&b, 4, 20, 16).to_vec();
+        let rescans_first = dec.rescans;
+        let hits_first = dec.hits;
+
+        // 同文档同版本连续 200 帧（滚动命中帧的真实路数）：全部命中，不重扫不重哈希。
+        for _ in 0..200 {
+            let rows = dec.scan_window(&b, 4, 20, 16).to_vec();
+            assert_eq!(rows.len(), 17, "命中切片长度 = hi - lo + 1");
+        }
+        assert_eq!(
+            dec.rescans,
+            rescans_first,
+            "静止帧不得重扫（命中路径零重哈希）: rescans={}",
+            dec.rescans
+        );
+        assert_eq!(dec.hits, hits_first + 200, "200 帧应全部命中");
+
+        // 同一文档内编辑（`apply_edit` → version +1，id 不变）：必须重扫刷出最新样式。
+        let range = b.line_start(4)..b.line_start(4) + b.line_len(4);
+        b.apply_edit(range.clone(), "# 标题4 **b4**");
+        let rows = dec.scan_window(&b, 4, 20, 16).to_vec();
+        assert_eq!(
+            dec.rescans,
+            rescans_first + 1,
+            "编辑（版本变）应重扫一次"
+        );
+        assert_eq!(dec.hits, hits_first + 200, "编辑那次是 miss，不再计命中");
+        assert!(
+            rows[0].iter().any(|(_, s)| s.font_weight == Some(FontWeight::BOLD)),
+            "编辑后重扫仍出加粗（内容没动粗体）"
         );
     }
 }

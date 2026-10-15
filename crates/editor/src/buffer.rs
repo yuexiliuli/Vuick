@@ -25,6 +25,14 @@ use ropey::LineType;
 
 use super::rope_ext::RopeExt;
 
+/// `Buffer` 实例唯一 id 发号器（1 起，永不回退）。
+///
+/// 目的：`set_text`/`set_rope_with_stats`（`reset_document` 级联）整篇替换 Buffer 后
+/// version 归零，会撞上上一份文档的缓存键；`id` 作「文档身份」维度 O(1) 判别，替换
+/// 后必为新 id → 旧缓存必 miss → 自愈重扫，无需调用方显式清缓存、也无需每帧对
+/// 窗口文本重哈希撞键防护（见 `crate::editor::markdown::MarkdownDecor::scan_window`）。
+static NEXT_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// 一条已应用的文本编辑（可逆），撤销/重做的原子单位。
 ///
 /// 语义：把 ``[`start`, `start+old_text.len()`)`` 替换为 `new_text`。
@@ -162,6 +170,9 @@ pub(crate) fn sample_line_stats(rope: &Rope) -> (usize, LineWidthHistogram) {
 pub struct Buffer {
     text: Rope,
     version: u64,
+    /// 实例唯一 id（文档身份，见 [`NEXT_BUFFER_ID`]）：`Clone` 沿用同 id（同文档），
+    /// `new/from_rope/from_parts` 各发新 id（新文档）。
+    id: u64,
     /// 全文最长（字符数，Unicode 标量）的行 —— 保留给等宽列近似/测试。
     /// 一致性：`Buffer::new/from_rope/set_text` 全量重算；编辑类操作**只增不减**
     /// （`refresh_max` 被增大的行更新），删除最长行后保持旧值（横向过度留白可接受，
@@ -187,6 +198,7 @@ impl Default for Buffer {
         Self {
             text: Rope::from(""),
             version: 0,
+            id: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             max_line_chars: 0,
             line_width_histogram: BTreeMap::new(),
             tail_append: None,
@@ -200,6 +212,7 @@ impl Buffer {
         let mut b = Self {
             text: Rope::from(source.as_ref()),
             version: 0,
+            id: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             max_line_chars: 0,
             line_width_histogram: BTreeMap::new(),
             tail_append: None,
@@ -213,6 +226,7 @@ impl Buffer {
         let mut b = Self {
             text,
             version: 0,
+            id: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             max_line_chars: 0,
             line_width_histogram: LineWidthHistogram::new(),
             tail_append: None,
@@ -231,6 +245,7 @@ impl Buffer {
         Self {
             text,
             version: 0,
+            id: NEXT_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             max_line_chars,
             line_width_histogram,
             tail_append: None,
@@ -370,6 +385,12 @@ impl Buffer {
     /// 缓存失效版本号：每次编辑 +1，高亮/布局缓存据此判定是否过期。
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// 实例唯一 id（文档身份）：换 Buffer 后 version 归零，`id` 用于判别「是否同一份
+    /// 文档」——O(1) 读，供 md 装饰等跨 Buffer 缓存区分文档（见 [`NEXT_BUFFER_ID`]）。
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// 总字节数。

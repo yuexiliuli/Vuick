@@ -643,9 +643,10 @@ impl CodeEditor {
         // 整篇替换：行级缓存同样显式清空（`Buffer::new` 后 version 归零，同防
         // 「新旧文档同 version=0」命中上一份文档的行静态内容）。
         self.row_cache.clear();
-        // Markdown「所见即所得」滤镜缓存无需作废：缓存键含文档身份指纹（+version），
-        // `Buffer::new` 后 version 归零也不会命中上一份文档的样式区间，`scan_window`
-        // 首扫即指纹 miss → 按新文档自愈（M0.3；勿再手加 `md_decor.clear()` 兜底）。
+        // Markdown「所见即所得」滤镜缓存无需作废：缓存键含文档身份（`Buffer::id`，
+        // O(1)）+ version，`Buffer::new` 后 version 归零、id 必新，也不会命中上一份
+        // 文档的样式区间，`scan_window` 首扫即身份 miss → 按新文档自愈（M0.3；勿再手加
+        // `md_decor.clear()` 兜底；命中帧零重哈希）。
         // 整篇替换：点亮标尺清除（内容已变，旧“所属块”提示无意义）。
         self.active_guide_open = None;
         // 滚动目标回零（新文档从头开始；分帧增长中的深跳占位也随之复位）。
