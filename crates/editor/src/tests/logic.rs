@@ -345,6 +345,54 @@ fn highlight_rust_keyword_comment_string() {
     assert_eq!(again.len(), 2);
 }
 
+/// 回归（已核实根因）：无语法（`syntax == None`，.txt 路径）时 `full_reparse` 只填
+/// `lines` 空样式、`saves` 保持空 → 之后深跳触发容量收缩 `saves.drain(..drop)` 越界
+/// panic。修复：None 分支逐行同步 push 纯文本解析器占位保存点恢复
+/// `saves.len() == lines.len()` 不变量；`prepare_window` 收缩再加 debug 断言 + `drop`
+/// 按 `saves.len()` 钳位双保险。
+#[test]
+fn no_syntax_deep_jump_shrink_keeps_saves_in_sync() {
+    // 大文档（深跳行数足够触发容量收缩）：顶部小窗预热（空缓存 + lo==0 → None 分支
+    // 只填 lines 空样式），再一次性深跳到文件深处 → 缓存上界远超请求窗口 → 收缩 drain。
+    let text: String = (0..200_000)
+        .map(|i| format!("no_syntax line {i:010}\n"))
+        .collect();
+    let b = Buffer::new(&text);
+
+    let mut hl = Highlighter::new(); // 默认 syntax = None（无语法 / .txt 路径）
+    // 顶部预热（空缓存 + lo==0 → full_reparse None 分支）。
+    let top = hl.highlight_window(&b, 0, 108, 16).to_vec();
+    assert_eq!(top.len(), 109, "预热窗口应与请求对齐");
+    assert!(top.iter().all(|r| r.is_empty()), "无语法行应全部为空样式");
+
+    // 深跳：一次性大步下移 → 容量收缩（base 前移 + 丢弃顶部旧行）。
+    let lo = 199_000usize;
+    let hi = lo + 108;
+    let rows = hl.highlight_window(&b, lo, hi, 16).to_vec();
+    assert_eq!(rows.len(), hi - lo + 1, "深跳返回切片应与请求窗口对齐");
+    assert!(rows.iter().all(|r| r.is_empty()), "深跳后无语法行仍全空样式");
+    // 关键断言：收缩后 lines/saves 仍同步（修复前这里 saves.drain 越界 panic）。
+    assert_eq!(
+        hl.test_cache_len(),
+        hl.test_saves_len(),
+        "容量收缩后 lines/saves 必须保持同步"
+    );
+    assert!(
+        hl.test_cache_len() > 0 && hl.test_cache_len() <= (hi - lo + 1) + 16,
+        "深跳重锚应是有界窗口（非整文档），实际 {}",
+        hl.test_cache_len()
+    );
+
+    // 深锚点继续向下小幅滚动 → extend_down/重锚路径，不 panic、切片仍对齐、不变量保持。
+    let more = hl.highlight_window(&b, lo + 30, hi + 30, 16).to_vec();
+    assert_eq!(more.len(), 109, "二次滚动窗口应仍对齐");
+    assert_eq!(
+        hl.test_cache_len(),
+        hl.test_saves_len(),
+        "多次滚动后 lines/saves 仍应同步"
+    );
+}
+
 #[test]
 fn far_down_jump_reanchors_bounded_not_full_prefix() {
     // 回归：大文档 `.rs` 拖滚动条时滑块极短，1 鼠标像素 ≈ 数千行，缺口（目标窗口底 −

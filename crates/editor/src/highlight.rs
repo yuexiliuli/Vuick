@@ -232,6 +232,13 @@ impl Highlighter {
         self.lines.len()
     }
 
+    /// 测试探针：当前解析状态保存点数（`lines`/`saves` 必须逐行同步，见
+    /// `full_reparse` 无语法分支与 `prepare_window` 容量收缩的防御断言）。
+    #[cfg(test)]
+    pub(crate) fn test_saves_len(&self) -> usize {
+        self.saves.len()
+    }
+
     /// 测试探针：逻辑行 `logical` 当前是否已在缓存里且带真颜色段（返回样式段数）。
     /// 分片补色回归用它断言「可见区顶部若干行已有非空颜色」——缓存里有段 = 该行
     /// 本帧被真正解析过（`0` = 未入缓存 / 空样式占位）。
@@ -427,8 +434,15 @@ impl Highlighter {
             let needed = (hi - lo + 1).saturating_add(lookback);
             let cap = needed.saturating_mul(2).max(needed.saturating_add(64));
             if self.lines.len() > cap {
+                // 防御：`lines`/`saves` 必须逐行同步（`full_reparse` 无语法分支曾只填
+                // lines 不填 saves，导致 `saves.drain(..drop)` 越界 panic）。debug 下
+                // 断言不变量；release 下 `drop` 同时按 `saves.len()` 钳位防越界再现。
+                debug_assert_eq!(self.lines.len(), self.saves.len());
                 let new_base = lo.saturating_sub(lookback).max(self.base);
-                let drop = new_base.saturating_sub(self.base).min(self.lines.len());
+                let drop = new_base
+                    .saturating_sub(self.base)
+                    .min(self.lines.len())
+                    .min(self.saves.len());
                 if drop > 0 {
                     self.lines.drain(..drop);
                     self.saves.drain(..drop);
@@ -567,8 +581,15 @@ impl Highlighter {
         let mut lines: Vec<Vec<(Range<usize>, Hsla)>> = Vec::with_capacity(hi - start + 1);
         let mut saves: Vec<ParseState> = Vec::with_capacity(hi - start + 1);
         let Some(syntax) = self.syntax else {
+            // 无语法（.txt 等）：每行填空样式即可，但必须同步 push 一个「纯文本解析器」
+            // 占位保存点，恢复 `saves.len() == lines.len()` 不变量——否则深跳触发容量
+            // 收缩 `saves.drain(..drop)` 会越界 panic（syntax 为 None 时 `extend_down`
+            // /`reparse_after_edit` 都早退，占位保存点只用于对齐、从不被读取）。
+            let plain = SYNTAX_SET.find_syntax_plain_text();
+            let fresh = ParseState::new(plain);
             for _ in start..=hi {
                 lines.push(Vec::new());
+                saves.push(fresh.clone());
             }
             self.lines = lines;
             self.saves = saves;
