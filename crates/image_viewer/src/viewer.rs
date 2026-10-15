@@ -51,6 +51,7 @@
 //! 是空操作），宿主 `EditorApp` 据此同步标签标题与状态栏。
 
 use std::collections::{HashSet, VecDeque};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,7 +61,7 @@ use gpui::{
     RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
     Styled, StyledImage, Window,
 };
-use image::{Frame, RgbaImage};
+use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
 use libjpeg_turbo_rs::{Decoder as LtjDecoder, PixelFormat as LtjPixelFormat, ScalingFactor};
 
 /// 缩放下限 / 上限 / 步进（语义同 PDF 阅读器 Ctrl+滚轮缩放，区间更宽以支持图片 1:1 微调）。
@@ -75,6 +76,9 @@ const WHEEL_PIXEL_PAN_MULT: f32 = 4.0;
 /// 展示像素需要初始值：窗口/视口数据未知（首个 render 前）时的合理猜测 ≈1080p，
 /// 保证首解就是「显示尺寸档」而非低清档；首个 render 立即用真实视口校正。
 const DISPLAY_NEED_INIT: (f32, f32) = (1920.0, 1080.0);
+/// GIF 动图最多保留的帧数：超出只取前 N 帧（动画仍循环），资源护栏防超大 GIF 用帧数
+/// 把内存/上传预算打爆（超大文件另有 LRU 字节预算如实兜底）。
+const MAX_GIF_FRAMES: usize = 256;
 
 use config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
@@ -93,6 +97,11 @@ struct CacheEntry {
     /// JPEG 实际解码降档分母（1/8/4/2/1；非 JPEG 恒 1）。用于「升档判定」：
     /// 展示分母 > 当前需要分母（= 解码比显示更粗）时按需重解更细档（放大时）。
     denom: u8,
+    /// 动图（GIF）逐帧切片：每帧一个**独立单帧** `RenderImage` + 各自时长；`None` = 静态图。
+    /// 采用「按帧切片」而非 gpui 多帧 `RenderImage`：gpui `img()` 元素的自动动画只在窗口
+    /// 聚焦（`window.is_window_active()`）时推进，失焦即冻结——改为本查看器用后台时钟
+    /// 逐帧推进 `self.image`（单帧 RenderImage），每次渲染直接画当前帧，与窗口焦点无关。
+    gif: Option<(Vec<Arc<RenderImage>>, Vec<std::time::Duration>)>,
 }
 
 /// 原始文件压缩字节（磁盘→RAM 预读层，LRU 字节预算缓存；解码从这里取字节免等磁盘）。
@@ -182,6 +191,14 @@ pub struct ImageViewer {
     info_seq: u64,
     /// 鼠标是否悬停在左下信息热区（悬停期间不隐藏）。
     info_hovering: bool,
+    /// 当前动图片段（帧切片 + 各帧时长）；`None` = 当前非动图。`install_current` 挂上，
+    /// 由 `spawn_anim_clock` 的后台时钟逐帧推进 `self.image`。
+    anim_clip: Option<(Vec<Arc<RenderImage>>, Vec<std::time::Duration>)>,
+    /// 动图时钟代序号：每次 `install_current`（换图/重装）递增，旧时钟任务据此自停，
+    /// 防止旧任务误推进新图帧。
+    anim_gen: u64,
+    /// 当前动图帧下标（0 = 首帧；配合 `self.image` 落盘当前帧切片）。
+    anim_index: usize,
 }
 
 impl ImageViewer {
@@ -223,6 +240,9 @@ impl ImageViewer {
             locked_info_visible: false,
             info_seq: 0,
             info_hovering: false,
+            anim_clip: None,
+            anim_gen: 0,
+            anim_index: 0,
         };
         let scan_at = path.clone();
         cx.spawn(async move |weak, cx| {
@@ -590,7 +610,9 @@ impl ImageViewer {
                 if let Some((bgra, w, h, den)) = thumb
                     && this.path == target
                     && this.loading
-                    && let Some(entry) = Self::build_entry(target.clone(), bgra, w, h, den)
+                    && let Some(frame) = bgra_single_frame(bgra, w, h)
+                    && let Some(entry) =
+                        Self::build_entry(target.clone(), vec![frame], w, h, den)
                 {
                     this.install_provisional(entry, cx);
                 }
@@ -729,9 +751,9 @@ impl ImageViewer {
                             },
                         );
                         match decoded {
-                            Ok((bgra, w, h, den)) => {
+                            Ok((frames, w, h, den)) => {
                                 if let Some(entry) =
-                                    Self::build_entry(decode_path.clone(), bgra, w, h, den)
+                                    Self::build_entry(decode_path.clone(), frames, w, h, den)
                                 {
                                     this.cache_put(decode_path.clone(), entry.clone());
                                     if this.path == decode_path {
@@ -805,15 +827,38 @@ impl ImageViewer {
         self.spawn_decode(path, false, cx);
     }
 
-    /// 从 BGRA 像素构建缓存条目（`denom` 记入条目：展示档位 / 升档判定用）。
-    fn build_entry(path: PathBuf, bgra: Vec<u8>, w: u32, h: u32, denom: u8) -> Option<CacheEntry> {
-        let buf = RgbaImage::from_raw(w, h, bgra)?;
+    /// 从 BGRA 帧序列构建缓存条目（`denom` 记入条目：展示档位 / 升档判定用）。帧序列
+    /// 必须横向统一尺寸（`w×h`）——GIF 解码已按逻辑屏画布统一；`bytes` 按
+    /// 「单帧字节 × 帧数」诚实记账：大 GIF 会如实算成块头、超 [`config::image::CACHE_MAX_BYTES`]
+    /// 预算时被 LRU 立刻淘汰——可接受（动画帧必须全量驻留才能播，口径如实反映）。
+    fn build_entry(
+        path: PathBuf,
+        frames: Vec<Frame>,
+        w: u32,
+        h: u32,
+        denom: u8,
+    ) -> Option<CacheEntry> {
+        if frames.is_empty() {
+            return None;
+        }
+        let bytes = (w as usize * h as usize * 4).checked_mul(frames.len())?;
+        // 逐帧切片成**独立单帧** RenderImage（详见 [`CacheEntry::gif`]：绕开 gpui `img()`
+        // 只在窗口聚焦时自动动画的限制，改由本查看器时钟驱动）。首帧同时作为 `render`
+        // （静态预览/占位）；帧 buffer 随 Frame 移入各自 RenderImage，不额外复制内存。
+        let mut per_frame: Vec<Arc<RenderImage>> = Vec::with_capacity(frames.len());
+        let mut delays: Vec<std::time::Duration> = Vec::with_capacity(frames.len());
+        for frame in frames {
+            delays.push(std::time::Duration::from(frame.delay()));
+            per_frame.push(Arc::new(RenderImage::new(vec![frame])));
+        }
+        let render = per_frame[0].clone();
         Some(CacheEntry {
             path,
-            render: Arc::new(RenderImage::new(vec![Frame::new(buf)])),
+            render,
             intrinsic: (w as f32, h as f32),
-            bytes: w as usize * h as usize * 4,
+            bytes,
             denom,
+            gif: (per_frame.len() > 1).then(|| (per_frame, delays)),
         })
     }
 
@@ -939,18 +984,72 @@ impl ImageViewer {
     /// 把缓存条目落盘为当前显示 + 通知宿主 + 重锚级联预取（窗口沿方向滑动更新）。
     fn install_current(&mut self, entry: CacheEntry, path: &Path, cx: &mut Context<Self>) {
         self.path = path.to_path_buf();
-        self.image = Some(entry.render);
+        self.image = Some(entry.render.clone());
         self.intrinsic = Some(entry.intrinsic);
         self.display_denom = entry.denom;
+        // 动图：挂上帧切片并启动后台时钟（详见 [`Self::spawn_anim_clock`]；reduce_motion
+        // 时保持静态首帧，尊重「减少动态效果」设置）。换图/重装必先递增代序号自停旧时钟。
+        self.anim_gen = self.anim_gen.wrapping_add(1);
+        let anim = entry
+            .gif
+            .as_ref()
+            .is_some_and(|(f, _)| f.len() > 1)
+            && !cx.reduce_motion();
+        self.anim_clip = if anim { entry.gif.clone() } else { None };
+        self.anim_index = 0;
         self.update_display_need();
         self.loading = false;
         self.load_error = None;
         cx.notify();
         cx.refresh_windows();
+        if anim {
+            self.spawn_anim_clock(cx);
+        }
         // 锚点移到当前位置：前向/反向窗口随位置滑动，继续沿方向补满
         self.prefetch_origin = self.nav.current() as i64;
         self.prefetch_pos = self.nav.current() as i64 + self.prefetch_dir as i64;
         self.pump_prefetch(cx);
+    }
+
+    /// 后台动画时钟：按各帧时长逐帧推进当前动图（`self.image` = 当前帧单帧 `RenderImage`），
+    /// 并 `notify`+`refresh_windows` 触发重绘——由本查看器驱动，**不依赖窗口焦点**（gpui
+    /// `img()` 自动动画只在窗口聚焦时推进，失焦即冻结，故绕开它）。
+    /// 以 `anim_gen` 代序号防旧任务误更新：换图/重装后 `install_current` 递增代序号，
+    /// 旧任务在下一轮更新时发现不匹配即自停；实体销毁后 `update` 失败自停。
+    fn spawn_anim_clock(&mut self, cx: &mut Context<Self>) {
+        let clock_gen = self.anim_gen;
+        let Some((frames, delays)) = self.anim_clip.clone() else {
+            return;
+        };
+        let n = frames.len();
+        if n <= 1 {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let mut idx = 0usize;
+            loop {
+                let wait = delays
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(std::time::Duration::from_millis(100));
+                cx.background_executor().timer(wait).await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.anim_gen != clock_gen {
+                        return false;
+                    }
+                    idx = (idx + 1) % n;
+                    this.anim_index = idx;
+                    this.image = Some(frames[idx].clone());
+                    cx.notify();
+                    cx.refresh_windows();
+                    true
+                });
+                if alive.map_or(true, |v| !v) {
+                    return; // 换图 / 实体销毁 → 自停
+                }
+            }
+        })
+        .detach();
     }
 
     /// 缓存查询并移到队尾（MRU）。命中返回克隆（Arc 浅拷贝），未中 `None`。
@@ -1082,6 +1181,8 @@ impl Render for ImageViewer {
             self.pan = Self::clamp_pan(self.pan, vw, vh, dw, dh);
             let ox = (vw - dw) * 0.5 + self.pan.0;
             let oy = (vh - dh) * 0.5 + self.pan.1;
+            // 动图由本查看器时钟逐帧切 `self.image`（单帧 RenderImage）驱动（见
+            // [`Self::spawn_anim_clock`]）；此处直接画当前帧，静态图同理，无需 element id。
             img(gpui::ImageSource::Render(render))
                 .object_fit(ObjectFit::Contain)
                 .absolute()
@@ -1178,6 +1279,12 @@ impl Render for ImageViewer {
 /// 以字节为准，比扩展名可信（伪装成 .jpg 的其它格式不会被误当 JPEG 硬解）。
 fn is_jpeg_magic(b: &[u8]) -> bool {
     b.starts_with(&[0xFF, 0xD8, 0xFF])
+}
+
+/// GIF 魔数（`GIF8`）检测：GIF 走全帧动图解码，其余格式单帧静态。以字节为准，
+/// 伪装成其它扩展名的 GIF 也会被识别。
+fn is_gif_magic(b: &[u8]) -> bool {
+    b.starts_with(b"GIF")
 }
 
 /// 路径扩展名是否 jpg/jpeg（升档路由的廉价判据；最终仍以魔数 + `probe` 为准）。
@@ -1337,52 +1444,131 @@ fn decode_jpeg_display(
     Ok((img.data, img.width as u32, img.height as u32, den))
 }
 
-/// 非 JPEG 全解 → **BGRA**（`image` crate 默认特性支持 png/gif/bmp/webp/ico/tiff…）。
-fn decode_generic(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut bgra = rgba.into_raw();
-    // RGBA → BGRA：每像素交换 R/B（GPUI 的 RenderImage 字节序为 BGRA，PDF 模块亦如此；
-    // 不交换会红蓝互换、颜色明显失真）。
-    for px in bgra.as_chunks_mut::<4>().0 {
+/// RGBA → BGRA（原地交换每像素 R/B；缓冲区按 w×h×4 的 RGBA 直排）。GPUI 的
+/// `RenderImage` 字节序为 BGRA（PDF 模块亦如此）；不交换会红蓝互换、颜色明显失真。
+fn swap_rb_in_place(rgba: &mut [u8]) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
-    Ok((bgra, w, h))
+}
+
+/// BGRA 像素包成单帧（JPEG 降档直出 / EXIF 缩略图等单帧路径复用入口）。
+fn bgra_single_frame(bgra: Vec<u8>, w: u32, h: u32) -> Option<Frame> {
+    Some(Frame::new(RgbaImage::from_raw(w, h, bgra)?))
+}
+
+/// 单帧静态解码：`image` 全解取首帧 → **BGRA** 帧序列（GIF 异常回退等独立路径用，
+/// 不递归 GifDecoder）。
+fn decode_static_first_frame(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("无法解码图片：{e}"))?;
+    let mut rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    swap_rb_in_place(rgba.as_mut());
+    Ok((vec![Frame::new(rgba)], w, h))
+}
+
+/// GIF 全帧解码失败 → 回退「首帧静态」（与改前 behaviour 一致，绝不硬失败）；静态
+/// 也解不动时返回原始 GIF 错误（顶层仍以加载错误呈现，不 panic）。
+fn decode_static_first_frame_or(
+    bytes: &[u8],
+    gif_err: image::ImageError,
+) -> Result<(Vec<Frame>, u32, u32), String> {
+    match decode_static_first_frame(bytes) {
+        Ok(out) => Ok(out),
+        Err(_) => Err(format!("无法解码图片：{gif_err}")),
+    }
+}
+
+/// GIF 全帧解码 → **BGRA** 帧序列：`GifDecoder::into_frames` 逐帧解出全部帧并保留每帧
+/// 自身 delay。image 0.25 的 GIF 解码器已把分块/局部帧按 (left,top) 合成到逻辑屏画布、
+/// 处理 disposal（Keep/Background/Previous），产出的帧**一律逻辑屏尺寸、统一大小**——
+/// `RenderImage` 的 frame_index 切换正好假设帧间同尺寸，无需自造合成。帧数超
+/// [`MAX_GIF_FRAMES`] 只保留前 N 帧（动画仍循环）。资源护栏：
+/// 1. 解码器套上 image 默认 `Limits`（max_alloc=512MB）——`GifDecoder::new` 内部是
+///    `Limits::no_limits()`，直接 `into_frames` 会在首个帧前就按逻辑屏画布预分配无上限
+///    的 RGBA 画布（荒谬超大逻辑屏描述符可瞬间吃爆内存）；limits 在 reserve 阶段用
+///    512MB 单分配预算拦下，超额以 `ImageResult` 报错，不 panic；
+/// 2. 帧尺寸与逻辑屏不一致（异常文件）→ 整体回退「首帧静态」；
+/// 3. 全帧解码失败 → [`decode_static_first_frame_or`] 回退「首帧静态」，绝不硬失败。
+fn decode_gif_frames(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
+    let mut decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes))
+        .map_err(|e| format!("无法解码图片：{e}"))?;
+    // 资源护栏①：套上 image 默认 Limits（max_alloc=512MB）——`GifDecoder::new` 内部是
+    // `Limits::no_limits()`，直接 `into_frames` 会在首个帧前就按逻辑屏画布预分配无上限
+    // 的 RGBA 画布（荒谬超大逻辑屏描述符可瞬间吃爆内存）；默认 limits 在 `reserve` 阶段
+    // 用 512MB 单分配预算拦下，超额以 `ImageResult` 报错，不 panic。
+    decoder
+        .set_limits(image::Limits::default())
+        .map_err(|e| format!("无法解码图片：{e}"))?;
+    let (w, h) = decoder.dimensions();
+    let frames = match decoder
+        .into_frames()
+        .take(MAX_GIF_FRAMES)
+        .collect::<image::ImageResult<Vec<_>>>()
+    {
+        Ok(frames) => frames,
+        Err(e) => return decode_static_first_frame_or(bytes, e),
+    };
+    if frames.is_empty() {
+        return Err("无法解码图片：GIF 无帧".into());
+    }
+    let mut out = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let (fw, fh) = frame.buffer().dimensions();
+        if fw != w || fh != h {
+            return decode_static_first_frame(bytes);
+        }
+        let delay = frame.delay();
+        let mut buf = frame.into_buffer();
+        swap_rb_in_place(buf.as_mut());
+        out.push(Frame::from_parts(buf, 0, 0, delay));
+    }
+    Ok((out, w, h))
+}
+
+/// 非 JPEG 全解 → **BGRA** 帧序列（`image` crate 默认特性支持 png/gif/bmp/webp/ico/tiff…）。
+/// GIF 走全帧动图（[`decode_gif_frames`]）；其余格式单帧静态（[`decode_static_first_frame`]）。
+/// 返回 (帧序列, 逻辑宽, 逻辑高)——所有帧统一为逻辑屏画布尺寸、BGRA 字节序。
+fn decode_generic(bytes: &[u8]) -> Result<(Vec<Frame>, u32, u32), String> {
+    if is_gif_magic(bytes) {
+        decode_gif_frames(bytes)
+    } else {
+        decode_static_first_frame(bytes)
+    }
 }
 
 /// 后台解码总入口：JPEG → libjpeg-turbo 按展示需要降档直出 BGRA（特殊 JPEG 如 CMYK / 12bit /
-/// lossless 解不动时回退 `image` 全解，绝不硬失败）；非 JPEG → `image` 全解。返回
-/// (BGRA 字节, 宽, 高, 降档分母)。
-fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<u8>, u32, u32, u8), String> {
+/// lossless 解不动时回退 `image` 全解，绝不硬失败）包成单帧；非 JPEG → `image` 全解
+/// （GIF 解全帧动图）。返回 (BGRA 帧序列, 宽, 高, 降档分母)。
+fn decode_background(bytes: &[u8], need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     if is_jpeg_magic(bytes) {
         match decode_jpeg_display(bytes, need) {
-            Ok(out) => Ok(out),
+            Ok((bgra, w, h, den)) => {
+                let frame = bgra_single_frame(bgra, w, h).ok_or("解码结果尺寸异常")?;
+                Ok((vec![frame], w, h, den))
+            }
             Err(_) => {
-                let (bgra, w, h) = decode_generic(bytes)?;
-                Ok((bgra, w, h, 1))
+                let (frames, w, h) = decode_generic(bytes)?;
+                Ok((frames, w, h, 1))
             }
         }
     } else {
-        let (bgra, w, h) = decode_generic(bytes)?;
-        Ok((bgra, w, h, 1))
+        let (frames, w, h) = decode_generic(bytes)?;
+        Ok((frames, w, h, 1))
     }
 }
 
 /// 读盘 + 全分辨率解码（旧链路；仅测试 / bench 对比「全解基准值」用，生产走
 /// [`decode_background`]）。
 #[cfg(test)]
-fn decode_image_at(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
+fn decode_image_at(path: &Path) -> Result<(Vec<Frame>, u32, u32), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     decode_generic(&bytes)
 }
 
 /// 读盘 + 按展示需要降档解码（bench / 测试验证「显示尺寸档」用）。
 #[cfg(test)]
-fn decode_display_at(
-    path: &Path,
-    need: (f32, f32),
-) -> Result<(Vec<u8>, u32, u32, u8), String> {
+fn decode_display_at(path: &Path, need: (f32, f32)) -> Result<(Vec<Frame>, u32, u32, u8), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     decode_background(&bytes, need)
 }
@@ -1416,8 +1602,10 @@ mod tests {
         let dir = tmp_dir("decode");
         let p = dir.join("red.png");
         write_png(&p, 40, 20);
-        let (bgra, w, h) = decode_image_at(&p).expect("自产 PNG 应能解码");
+        let (frames, w, h) = decode_image_at(&p).expect("自产 PNG 应能解码");
         assert_eq!((w, h), (40, 20));
+        assert_eq!(frames.len(), 1, "PNG 应为单帧");
+        let bgra = frames[0].buffer().as_raw();
         assert_eq!(bgra.len(), (40 * 20 * 4) as usize);
         // 写入色为 RGBA(200,30,10,255)；解码后必须输出 **BGRA**（GPUI 渲染格式）＝
         // [蓝10, 绿30, 红200, 255]。若这里仍是 RGBA 序，说明红蓝互换的修复回退。
@@ -1430,6 +1618,190 @@ mod tests {
     fn decode_missing_file_reports_error() {
         let p = tmp_dir("missing").join("没有的文件.png");
         assert!(decode_image_at(&p).is_err());
+    }
+
+    /// 编码一张 N 帧测试 GIF（每帧统一 4×3 逻辑屏全画布；(0,0) 像素为 `color`、帧 delay 为
+    /// `ms`）。用 `GifEncoder`（image 0.25 默认特性含 gif 编码）。GIF 编码 delay 精度
+    /// 10ms（写盘时除 10 取整），测试参数须用 10 的倍数才能精确往返。
+    fn encode_test_gif(frames: &[(image::Rgba<u8>, u32)]) -> Vec<u8> {
+        let (w, h) = (4u32, 3u32);
+        let mut out = Vec::new();
+        let mut enc = image::codecs::gif::GifEncoder::new(&mut out);
+        for (color, ms) in frames {
+            let mut buf = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 0]));
+            buf.put_pixel(0, 0, *color);
+            let frame = Frame::from_parts(
+                buf,
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(*ms, 1),
+            );
+            enc.encode_frame(frame).expect("测试自产 GIF 应能编码");
+        }
+        drop(enc);
+        out
+    }
+
+    #[test]
+    fn gif_anim_decodes_frames_preserves_delay_and_bgra() {
+        // 帧0：(0,0) 红 delay 100ms；帧1：(0,0) 蓝 delay 200ms
+        let bytes = encode_test_gif(&[
+            (image::Rgba([255, 0, 0, 255]), 100),
+            (image::Rgba([0, 0, 255, 255]), 200),
+        ]);
+        let (frames, w, h) = decode_generic(&bytes).expect("自产 GIF 应能解码全帧");
+        assert_eq!((w, h), (4, 3), "逻辑屏尺寸");
+        assert_eq!(frames.len(), 2, "应解出全部 2 帧");
+        for f in &frames {
+            assert_eq!(f.buffer().dimensions(), (4, 3), "每帧必须统一逻辑屏尺寸");
+        }
+        // delay 保留（10ms 精度下 100/200ms 精确往返）
+        assert_eq!(
+            std::time::Duration::from(frames[0].delay()),
+            std::time::Duration::from_millis(100)
+        );
+        assert_eq!(
+            std::time::Duration::from(frames[1].delay()),
+            std::time::Duration::from_millis(200)
+        );
+        // BGRA 字节序：(0,0) 帧0 红 → [蓝0,绿0,红255,255]；帧1 蓝 → [蓝255,绿0,红0,255]
+        let f0 = frames[0].buffer().as_raw();
+        assert_eq!([f0[0], f0[1], f0[2], f0[3]], [0, 0, 255, 255], "帧0 红像素应为 BGRA");
+        let f1 = frames[1].buffer().as_raw();
+        assert_eq!([f1[0], f1[1], f1[2], f1[3]], [255, 0, 0, 255], "帧1 蓝像素应为 BGRA");
+    }
+
+    #[test]
+    fn gif_single_frame_decodes_as_one_frame() {
+        let bytes = encode_test_gif(&[(image::Rgba([10, 20, 30, 255]), 0)]);
+        let (frames, w, h) = decode_generic(&bytes).expect("单帧 GIF 应能解码");
+        assert_eq!((w, h), (4, 3));
+        assert_eq!(frames.len(), 1, "单帧 GIF 只有一帧");
+    }
+
+    #[test]
+    fn gif_bad_bytes_never_panic_and_report_or_fallback() {
+        // GIF 魔数开头但内容损坏：整链路绝不 panic；落 `Err` 即算通过（坏文件回退由
+        // 上层「首帧静态」兜底，这里只保证解码入口本身不炸）。
+        let bytes = b"GIF89a this is definitely not a valid gif body.........";
+        let ok = match decode_generic(bytes) {
+            Ok((frames, _, _)) => !frames.is_empty(),
+            Err(_) => true,
+        };
+        assert!(ok, "坏 GIF 不得 panic、不得产出空帧");
+        // 完全非图片字节 → 明确报错
+        assert!(decode_generic(b"not an image, just plain text").is_err());
+    }
+
+    #[test]
+    fn gif_frame_cap_keeps_only_first_n_frames() {
+        let mut frames = Vec::new();
+        for i in 0..(MAX_GIF_FRAMES + 50) {
+            frames.push((image::Rgba([(i % 256) as u8, 0, 0, 255]), 10));
+        }
+        let bytes = encode_test_gif(&frames);
+        let (got, _, _) = decode_generic(&bytes).expect("超长 GIF 应能解码");
+        assert_eq!(
+            got.len(),
+            MAX_GIF_FRAMES,
+            "超 MAX_GIF_FRAMES 应截断到前 N 帧"
+        );
+    }
+
+    /// 动图时钟回归：安装后由本查看器后台时钟逐帧推进（[`ImageViewer::spawn_anim_clock`]）。
+    /// gpui `img()` 自动动画只在窗口聚焦时推进（失焦冻结）——本查看器改自驱时钟后不依赖
+    /// 窗口焦点，时钟推进即证明失焦也会继续播放。用 `advance_clock` 模拟时间流逝断言帧序。
+    #[gpui::test]
+    async fn gif_clock_advances_frames_after_install(cx: &mut TestAppContext) {
+        let dir = tmp_dir("gif_clock");
+        let p = dir.join("anim.gif");
+        let bytes = encode_test_gif(&[
+            (image::Rgba([10, 20, 30, 255]), 120),
+            (image::Rgba([200, 100, 50, 255]), 120),
+        ]);
+        std::fs::write(&p, &bytes).unwrap();
+        let viewer: gpui::Entity<ImageViewer> =
+            cx.update(|app| app.new(|cx| ImageViewer::new(p.clone(), cx)));
+        wait_until_ready(cx, &viewer);
+        cx.update(|app| {
+            let v = viewer.read(app);
+            assert!(v.anim_clip.is_some(), "动图应挂帧切片");
+            assert_eq!(v.anim_index, 0, "初始为第 0 帧");
+        });
+        // 越过第 0 帧时长（120ms）→ 自驱时钟应推进到第 1 帧（不依赖窗口焦点）
+        flush(cx);
+        cx.executor().advance_clock(std::time::Duration::from_millis(150));
+        flush(cx);
+        let idx = cx.update(|app| viewer.read(app).anim_index);
+        assert_eq!(idx, 1, "自驱时钟应推进到第 1 帧（失焦也继续播放）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真实 GIF 动图实测（`--ignored --nocapture` 运行；缺夹具 SKIP，同 pdf 夹具姿势）：
+    /// 对 [`MAX_GIF_FRAMES`] 内的全帧解码，验证（1）每帧都是逻辑屏全画布
+    /// （image 0.25 已按 disposal/偏移合成、统一尺寸）；（2）相邻采样帧字节内容确有差异
+    /// （动画在动，非全同帧）。
+    #[test]
+    #[ignore]
+    fn gif_real_animation_full_canvas() {
+        let path = std::path::Path::new(r"C:\Users\yuexi\Pictures\test\咕嘎可爱日常.gif");
+        if !path.exists() {
+            eprintln!("SKIP: missing {}", path.display());
+            return;
+        }
+        let bytes = std::fs::read(path).unwrap();
+        let (frames, w, h) = decode_generic(&bytes).expect("真实 GIF 应能解码全帧");
+        eprintln!(
+            "\n[GIF-REAL] {} | 逻辑屏 {w}×{h} | 帧数 {}",
+            path.display(),
+            frames.len()
+        );
+        assert!(frames.len() > 1, "动图应 >1 帧");
+        let mut any_differ = false;
+        let step = (frames.len() / 8).max(1);
+        for i in (0..frames.len()).step_by(step) {
+            let (fw, fh) = frames[i].buffer().dimensions();
+            assert_eq!((fw, fh), (w, h), "帧[{i}] 必须全画布（逻辑屏尺寸）");
+            let j = (i + 1).min(frames.len() - 1);
+            let a = frames[i].buffer().as_raw();
+            let b = frames[j].buffer().as_raw();
+            let diff = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+            any_differ |= diff > 0;
+            eprintln!(
+                "  帧[{i:>4}] → 帧[{j:>4}] 差异字节 {diff:>8} · delay {}ms",
+                frames[i].delay().numer_denom_ms().0
+            );
+        }
+        assert!(any_differ, "采样邻帧字节应有差异（合成在动）");
+        eprintln!("[GIF-REAL] 全画布 ✓ · 帧间确有内容差异 ✓（动画在动）");
+    }
+
+    /// 渲染路径冒烟（`--ignored --nocapture`；缺夹具 SKIP）：真实 GIF 走真实窗口
+    /// `add_window_view + 绘制一帧`——img 主图元素带了动态 element id，走 gpui stateful
+    /// 生命周期（global_id 判定 + 动画帧预检），必须不崩、窗口能完整画一帧。
+    #[gpui::test]
+    #[ignore]
+    async fn gif_real_open_paints_first_frame(cx: &mut TestAppContext) {
+        let path = std::path::Path::new(r"C:\Users\yuexi\Pictures\test\咕嘎可爱日常.gif");
+        if !path.exists() {
+            eprintln!("SKIP: missing {}", path.display());
+            return;
+        }
+        let (viewer, wcx) =
+            cx.add_window_view(|_window, cx| ImageViewer::new(path.to_path_buf(), cx));
+        let mut guard = 0;
+        loop {
+            wcx.run_until_parked();
+            if wcx.update(|_, cx| viewer.read(cx).is_loaded()) {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 2000, "等待 GIF 解码就绪超时");
+        }
+        // 绘制一帧（标记脏 + 排空执行器走到绘制）：带 id 的 img 元素不得崩
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        eprintln!("[GIF-REAL] 渲染冒烟 ✓（解码就绪 + 绘制一帧完成）");
     }
 
     /// 写一张有内容（渐变）的 JPEG：保存走 `image` 内置 jpeg 编码（default features 支持）。
@@ -1719,9 +2091,11 @@ mod tests {
         let p = dir.join("big.jpg");
         write_jpeg(&p, 400, 300);
         let bytes = std::fs::read(&p).unwrap();
-        // 展示需要 (200,150) → 1/2 档 200×150；BGRA 直出
-        let (bgra, w, h, den) = decode_background(&bytes, (200.0, 150.0)).expect("JPEG 降档应成功");
+        // 展示需要 (200,150) → 1/2 档 200×150；BGRA 直出（JPEG 恒单帧）
+        let (frames, w, h, den) = decode_background(&bytes, (200.0, 150.0)).expect("JPEG 降档应成功");
         assert_eq!((w, h, den), (200, 150, 2));
+        assert_eq!(frames.len(), 1, "JPEG 应为单帧");
+        let bgra = frames[0].buffer().as_raw();
         assert_eq!(bgra.len(), (200 * 150 * 4) as usize);
         // 左上角 (0,0) 黑色 → BGRA [0,0,0,255]；右下角 (399,299) 渐变近
         // B≈60,G≈254,R≈254 → BGRA [B,G,R,255]（libjpeg-turbo Bgra 直出 = GPUI 字节序）。
