@@ -1313,6 +1313,11 @@ fn image_drag_multitick_sparse_converges(cx: &mut TestAppContext) {
     use crate::markdown::ir::IrKind;
     cx.update(crate::test_support::bind_local_keymaps);
     let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/img测试.png").replace('\\', "/");
+    // 缺夹具即 SKIP（同 pdf 惯例：夹具不入库，本机无 PNG 时跳过真尺寸断言）。
+    if !std::path::Path::new(&fixture).exists() {
+        eprintln!("SKIP: missing fixtures/img测试.png（夹具不入库，本机无真 PNG）");
+        return;
+    }
     let (host, vcx) = cx.add_window_view(|window, cx| {
         let text = format!("para before.\n\n![alt]({fixture})\n\nafter para.\n");
         WyHost {
