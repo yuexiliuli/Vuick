@@ -84,6 +84,7 @@ use config::image::{
     BYTE_CACHE_BYTES, CACHE_MAX_BYTES, CACHE_MAX_ITEMS, FAST_SCROLL_STEP_MS, FAST_SCROLL_THRESHOLD,
     MAX_DECODE, PREFETCH_BACKWARD, PREFETCH_FORWARD, PREFETCH_FORWARD_FAST,
 };
+use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
 use ::viewer::pan_zoom;
 
@@ -185,12 +186,9 @@ pub struct ImageViewer {
     drag: Option<((f32, f32), (f32, f32))>,
     /// 「锁定」干净看图模式：隐藏全部非图片 UI、图片充满整个窗口（宿主读取决定外壳取舍）。
     locked: bool,
-    /// 锁定模式底部信息条是否可见（切图/悬停热区浮现，后 1s 自隐；普通模式信息条常驻）。
-    locked_info_visible: bool,
-    /// 信息条自隐定时器代序号（防旧定时器误清新浮现/新悬停）。
-    info_seq: u64,
-    /// 鼠标是否悬停在左下信息热区（悬停期间不隐藏）。
-    info_hovering: bool,
+    /// 底部信息条浮层时序：可见位 + 自隐代序号 + 悬停态 + 延时（收敛于
+    /// [`::viewer::auto_hide`]；切图/悬停浮现、1s 自隐、hover 抑制）。
+    info_auto: auto_hide::AutoHide,
     /// 当前动图片段（帧切片 + 各帧时长）；`None` = 当前非动图。`install_current` 挂上，
     /// 由 `spawn_anim_clock` 的后台时钟逐帧推进 `self.image`。
     anim_clip: Option<(Vec<Arc<RenderImage>>, Vec<std::time::Duration>)>,
@@ -237,9 +235,7 @@ impl ImageViewer {
             pan: (0.0, 0.0),
             drag: None,
             locked: false,
-            locked_info_visible: false,
-            info_seq: 0,
-            info_hovering: false,
+            info_auto: auto_hide::AutoHide::new(),
             anim_clip: None,
             anim_gen: 0,
             anim_index: 0,
@@ -303,27 +299,14 @@ impl ImageViewer {
     }
 
     /// 锁定模式：让底部信息条浮现（切图/悬停热区），并在 1 秒后（未悬停时）自隐。
-    /// 带代序号防旧定时器误清新浮现。普通模式（未锁）信息条常驻，此方法为空操作。
+    /// 普通模式（未锁）信息条常驻，此方法为空操作。时序逻辑收敛于
+    /// [`auto_hide::AutoHide::show_temporarily`]。
     fn show_locked_info(&mut self, cx: &mut Context<Self>) {
         if !self.locked {
             return;
         }
-        self.locked_info_visible = true;
-        cx.notify();
-        self.info_seq = self.info_seq.wrapping_add(1);
-        let seq = self.info_seq;
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(1))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.info_seq == seq && this.locked && !this.info_hovering {
-                    this.locked_info_visible = false;
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        self.info_auto
+            .show_temporarily(|v| v.locked, |v| &mut v.info_auto, cx);
     }
 
     /// 底部信息热区悬停（锁定模式，渲染在信息条之上的透明层）：
@@ -334,11 +317,11 @@ impl ImageViewer {
 
     /// 悬停态设置（独立于窗口，便于测试）：悬停期间不受自动隐藏影响。
     fn set_info_hover(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        self.info_hovering = hovered;
         if hovered {
-            self.locked_info_visible = true;
+            self.info_auto.hover_in();
             cx.notify();
         } else {
+            self.info_auto.hover_out();
             self.show_locked_info(cx);
         }
     }
@@ -1241,8 +1224,8 @@ impl Render for ImageViewer {
                     ),
             );
         // 底部信息条：第几张/共几张 · 缩放百分比。普通模式常驻；锁定模式按
-        // `locked_info_visible`（切图/悬停浮现，1s 自隐）。
-        if !self.locked || self.locked_info_visible {
+        // `info_auto.visible()`（切图/悬停浮现，1s 自隐）。
+        if !self.locked || self.info_auto.visible() {
             root = root.child(
                 div()
                     .id("image-info")
@@ -2054,32 +2037,32 @@ mod tests {
             })
         });
         // 初始：锁定未悬停 → 隐藏；切图 → 浮现
-        assert!(!cx.update(|app| viewer.read(app).locked_info_visible));
+        assert!(!cx.update(|app| viewer.read(app).info_auto.visible()));
         cx.update(|app| viewer.update(app, |v, cx| v.switch(1, cx)));
         assert!(
-            cx.update(|app| viewer.read(app).locked_info_visible),
+            cx.update(|app| viewer.read(app).info_auto.visible()),
             "锁定模式切图应立即浮现信息条"
         );
         // 1s 后自隐
         cx.executor().advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
         assert!(
-            !cx.update(|app| viewer.read(app).locked_info_visible),
+            !cx.update(|app| viewer.read(app).info_auto.visible()),
             "切图后 1s 应自隐"
         );
         // 悬停热区 → 浮现，且过了 2s 也不隐藏
         cx.update(|app| viewer.update(app, |v, cx| v.set_info_hover(true, cx)));
-        assert!(cx.update(|app| viewer.read(app).locked_info_visible));
+        assert!(cx.update(|app| viewer.read(app).info_auto.visible()));
         cx.executor().advance_clock(std::time::Duration::from_secs(2));
         cx.run_until_parked();
-        assert!(cx.update(|app| viewer.read(app).locked_info_visible), "悬停期间不隐藏");
+        assert!(cx.update(|app| viewer.read(app).info_auto.visible()), "悬停期间不隐藏");
         // 移开 → 短暂保留，1s 后自隐
         cx.update(|app| viewer.update(app, |v, cx| v.set_info_hover(false, cx)));
-        assert!(cx.update(|app| viewer.read(app).locked_info_visible), "移开后仍短暂保留");
+        assert!(cx.update(|app| viewer.read(app).info_auto.visible()), "移开后仍短暂保留");
         cx.executor().advance_clock(std::time::Duration::from_secs(1));
         cx.run_until_parked();
         assert!(
-            !cx.update(|app| viewer.read(app).locked_info_visible),
+            !cx.update(|app| viewer.read(app).info_auto.visible()),
             "移开 1s 后自隐"
         );
         let _ = std::fs::remove_dir_all(&dir);
