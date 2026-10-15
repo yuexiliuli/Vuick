@@ -3,6 +3,7 @@
 include!("tests/setup.rs");
 include!("tests/tabs_actions.rs");
 include!("tests/sidebar.rs");
+include!("tests/search_scan.rs");
 include!("tests/preview.rs");
 include!("tests/scroll_sync.rs");
 include!("tests/tab_bar.rs");

@@ -1073,4 +1073,102 @@
         }
     }
 
+    /// 当前扫描语义的匹配阶段（直接调生产 `scan_line_hits`——`sidebar_search_scan` 的
+    /// 可编辑分支正是 `value()` 物化后逐行复用它）。
+    fn new_style_scan(content: &str, q: &str) -> usize {
+        let mut out = Vec::new();
+        crate::app::sidebar::scan_line_hits(content, q, usize::MAX, &mut out);
+        out.len()
+    }
+
+    /// 旧式基准：每行 `to_lowercase()` 新分配小写串 + 朴素查找（物化/防抖优化前的每行分配路径）。
+    fn old_style_scan(content: &str, q: &str) -> usize {
+        let mut hits = 0;
+        for line in content.split('\n') {
+            if line.to_lowercase().find(q).is_some() {
+                hits += 1;
+            }
+        }
+        hits
+    }
+
+    /// 基准（ignored）：侧边栏搜索「一次扫描」端到端性能拆解——10k 行 × ~80 字符文本
+    /// （≈0.8MB，超 128KB 阈值 → 与真实使用一致走后台上/分块装配）。在真实 app 状态上
+    /// 测生产可编辑路径的两段：`value()` 一次物化 + `scan_line_hits` 零分配匹配，并对照
+    /// 旧式（每行 `to_lowercase()` 分配 + 朴素查找）；命中集须一致。
+    /// 运行：`cargo test -p shell -- --ignored bench_sidebar_search_scan --nocapture`
+    #[gpui::test]
+    #[ignore]
+    async fn bench_sidebar_search_scan(cx: &mut TestAppContext) {
+        use config::limits::SEARCH_RESULT_CAP;
+        use std::fmt::Write as _;
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(1280.), px(800.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        const LINES: usize = 10_000;
+        let dir = std::env::temp_dir().join("gpui-sz-bench-corpus.txt");
+        let mut sb = String::with_capacity(LINES * 84);
+        let body = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        for i in 0..LINES {
+            // 每 100 行埋一个大小写混合的目标词（命中 ~100 行，低于 CAP 走完整扫描）
+            let marker = if i % 100 == 5 { "NeedleMark target " } else { "" };
+            let _ = writeln!(sb, "{i:05} {marker}{body}");
+        }
+        std::fs::write(&dir, &sb).unwrap();
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| app.open_file(dir.to_str().unwrap(), window, cx));
+        });
+        // 后台分块装配完成判据：编辑区行数到位（与 bench_open_large_md 同型轮询）
+        let mut ready = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            let n = cx.update(|_w, cx| {
+                app.read(cx)
+                    .tabs
+                    .last()
+                    .map(|t| t.editor.read(cx).line_count())
+                    .unwrap_or(0)
+            });
+            if n >= LINES {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "corpus 后台装配超时");
+        let ti = cx.update(|_w, cx| app.read(cx).active_tab);
+        let q = "needlemark"; // 查询词（归一化后小写）
+
+        // 取正文（可编辑路径的一次 `value()` 整篇物化，内含物化耗时）
+        let value_t = std::time::Instant::now();
+        let content = cx.update(|_w, cx| app.read(cx).tabs[ti].editor.read(cx).value());
+        let value_ms = value_t.elapsed().as_millis();
+        // 多次取均（debug 单次抖动大；两者同轮同 jit/allocator 状态，比值才可信）
+        const RUNS: usize = 20;
+        let t = std::time::Instant::now();
+        let mut new_hits = 0usize;
+        for _ in 0..RUNS {
+            new_hits = new_style_scan(&content, q);
+        }
+        let new_match_ms = t.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        let t = std::time::Instant::now();
+        let mut old_hits = 0usize;
+        for _ in 0..RUNS {
+            old_hits = old_style_scan(&content, q);
+        }
+        let old_ms = t.elapsed().as_secs_f64() * 1000.0 / RUNS as f64;
+        // 命中集一致（防基准自身漂移）；命中数低于 CAP 保持语义等价（不触发截断）
+        assert_eq!(new_hits, old_hits, "新旧扫描命中集应一致");
+        assert!(new_hits < SEARCH_RESULT_CAP, "本基准应低于 CAP（否则触发截断）");
+        let new_total = value_ms as f64 + new_match_ms;
+        let old_total = value_ms as f64 + old_ms;
+        println!("【搜索扫描基准】正文 {} B / {} 行，查询词 {:?}，命中 {new_hits} 行（{} 次取均）", content.len(), LINES, q, RUNS);
+        println!("  新路径 · 单次搜索 ≈ value() 物化 {value_ms} ms + scan_line_hits 匹配（小写副本+str::find）{new_match_ms:.1} ms = {new_total:.1} ms");
+        println!("  旧式 · 每行 to_lowercase+朴素查找 = {old_ms:.1} ms（全流程 {old_total:.1} ms）");
+        println!("  （debug 数值约 release 的 ~10×，看相对量级）");
+        let _ = std::fs::remove_file(&dir);
+    }
+
 
