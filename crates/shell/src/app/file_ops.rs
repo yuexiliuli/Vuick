@@ -17,6 +17,19 @@ enum ChunkApply {
     Stale,
 }
 
+/// 自包含媒体阅读器类型（PDF / 图片 / 视频）——[`EditorApp::load_media`] 的装配参数；
+/// 解析/解码各由对应查看器在后台完成，窗口不阻塞。`pub(super)`（app 内，含测试）可见。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MediaKind {
+    /// PDF 阅读器（`PdfViewer`）：整页原样 + 侧边栏全文检索 + 页码。
+    Pdf,
+    /// 图片查看器（`ImageViewer`）：整图展示 + 同文件夹切换 + Ctrl+滚轮缩放。
+    Image,
+    /// 视频查看器（`VideoViewer`）：M1 首帧静态阅读 + 帧钟/控制键。
+    #[cfg(feature = "video")]
+    Video,
+}
+
 /// 测试探针（`cfg(test)`）：大文档渐进打开消费者的「统一 notify」次数（= 批数）与
 /// 收到/应用的块消息数。P1b 回归断言「批级装配确实把 per-chunk 重绘降为 per-batch」，
 /// 且块消息无一丢失（两者相等则每批只收到 1 块的极端时序下也不少于块数）。
@@ -661,7 +674,8 @@ impl EditorApp {
     }
 
     /// 把 EPUB 解析结果载入指定选项卡：纯展示（只读预览），编辑区置空。
-    fn load_epub(
+    /// `pub(super)`：装配回归测试（`app::tests`）直接驱动。
+    pub(super) fn load_epub(
         &mut self,
         idx: usize,
         p: &std::path::Path,
@@ -677,29 +691,17 @@ impl EditorApp {
         // 只读（禁编辑）、标题居中（set_epub）、`epubimg://` 内存图（set_memory_images）、
         // 注记浮卡/引文跳转正文（set_notes）。在 `tab` 可变借用之前调用（需 `&mut self`）。
         self.ensure_epub_wy(idx, _window, cx, &text, &doc.images, &doc.notes);
+        // 公共字段统一重置（编辑区置空 + markdown 语言 + 文件路径/正文/计数 + 预览全屏只读）。
+        if !self.reset_common_tab_fields(idx, p, SharedString::from(text), lines, chars, cx) {
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(idx) else {
             return;
         };
-        // 编辑区置为提示文本（EPUB 只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, _cx| {
-            ed.set_text("");
-            ed.set_language(Some("markdown"));
-        });
-        tab.file_path = Some(p.to_path_buf());
         // P4-1：EPUB 内存图随选项卡持有（供 WyEditor 只读宿主注入；随选项卡搬迁）。
         tab.epub_images = doc.images.clone();
         // P4-2：EPUB 注记正文表随选项卡持有（`ensure_epub_wy` → `WyEditor::set_notes`）。
         tab.epub_notes = doc.notes.clone();
-        tab.content = SharedString::from(text);
-        tab.line_count = lines;
-        tab.char_count = chars;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
-        tab.preview_on = true;
-        tab.preview_fullscreen = true;
-        // EPUB 正文只存在于预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
-        tab.readonly_preview = true;
         let author = if doc.author.is_empty() {
             String::new()
         } else {
@@ -713,136 +715,106 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 把一个新 PDF 阅读器载入指定选项卡：编辑区置空、全屏只读预览。
-    /// 解析由 [`pdf::PdfViewer`] 自己在后台完成，窗口不阻塞。
-    fn load_pdf(
+    /// 把一个新建媒体阅读器（PDF / 图片 / 视频）载入指定选项卡：编辑区置空、全屏
+    /// 只读预览。三项的**公共装配**（搜索缓存失效 / 画布底色 / 编辑区清空 + markdown
+    /// 语言 / 文件路径与计数 / 预览全屏只读 / 状态与通知）统一在此，差异（查看器实体
+    /// 创建 + PDF 订阅重绘 / 视频焦点 / 状态文案）按 `kind` 分支。解析/解码各由查看器
+    /// 自己在后台完成，窗口不阻塞。
+    pub(super) fn load_media(
         &mut self,
         idx: usize,
         p: &std::path::Path,
+        kind: MediaKind,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        self.pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
-        // 阅读画布用灰色系（非白面板），让页面“纸面”卡片与画布形成分隔
-        let canvas_bg = self.window_bg();
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
-        // 编辑区置为提示文本（PDF 只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, _cx| {
-            ed.set_text("");
-            ed.set_language(Some("markdown"));
-        });
-        // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
-        let viewer = cx.new(|cx| pdf::PdfViewer::new(p.to_path_buf(), cx));
-        viewer.update(cx, |view, _| view.set_background(canvas_bg));
-        tab.pdf_preview = Some(viewer);
-        // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/页列表更新）
-        let preview = tab.pdf_preview.clone().expect("上面刚写入");
-        self._pdf_observe = Some(cx.observe(&preview, |_this, _e, cx| {
-            cx.notify();
-        }));
-        tab.file_path = Some(p.to_path_buf());
-        tab.content = SharedString::default();
-        tab.line_count = 0;
-        tab.char_count = 0;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
-        tab.preview_on = true;
-        tab.preview_fullscreen = true;
-        // PDF 正文只存在于阅读器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
-        tab.readonly_preview = true;
-        self.status = SharedString::from(format!("已打开 PDF：{}（解析中…）", p.display()));
-        self.status_ok = true;
-        cx.notify();
-    }
-
-    /// 把一个新图片查看器载入指定选项卡：编辑区置空、全屏只读预览。
-    /// 解码由 [`image_viewer::ImageViewer`] 自己在后台完成，窗口不阻塞。
-    pub(super) fn load_image(
-        &mut self,
-        idx: usize,
-        p: &std::path::Path,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        // 阅读画布用灰色系（非白面板），让图片与画布形成分隔（同 PDF 阅读器）
-        let canvas_bg = self.window_bg();
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
-        // 编辑区置为提示文本（图片只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, _cx| {
-            ed.set_text("");
-            ed.set_language(Some("markdown"));
-        });
-        // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
-        let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
-        viewer.update(cx, |view, _| view.set_background(canvas_bg));
-        tab.image_viewer = Some(viewer);
-        tab.file_path = Some(p.to_path_buf());
-        tab.content = SharedString::default();
-        tab.line_count = 0;
-        tab.char_count = 0;
-        tab.cursor_row = 0;
-        tab.cursor_col = 0;
-        tab.dirty = false;
-        tab.preview_on = true;
-        tab.preview_fullscreen = true;
-        // 图片正文只存在于查看器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
-        tab.readonly_preview = true;
-        self.status = SharedString::from(format!("已打开图片：{}", p.display()));
-        self.status_ok = true;
-        cx.notify();
-    }
-
-    /// 把一个新视频查看器载入指定选项卡：编辑区置空、全屏只读预览。
-    /// 首帧解码由 [`video::VideoViewer`] 自己在后台完成，窗口不阻塞。
-    #[cfg(feature = "video")]
-    pub(super) fn load_video(
-        &mut self,
-        idx: usize,
-        p: &std::path::Path,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
-        // 阅读画布用灰色系（非白面板），让视频与画布形成分隔（同 PDF / 图片阅读器）
-        let canvas_bg = self.window_bg();
-        let Some(tab) = self.tabs.get_mut(idx) else {
-            return;
-        };
-        // 编辑区置为提示文本（视频只读，不参与文本编辑）
-        tab.editor.update(cx, |ed, _cx| {
-            ed.set_text("");
-            ed.set_language(Some("markdown"));
-        });
-        // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
-        let viewer = cx.new(|cx| video::VideoViewer::new(p.to_path_buf(), cx));
-        viewer.update(cx, |view, _| view.set_background(canvas_bg));
-        // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
-        {
-            let fh = viewer.read(cx).focus_handle();
-            window.focus(&fh, cx);
+        if matches!(kind, MediaKind::Pdf) {
+            self.pdf_search = None; // 新 PDF 阅读器 → 需重新推送查询
         }
-        tab.video_viewer = Some(viewer);
+        // 阅读画布用灰色系（非白面板），让阅读器与画布形成分隔（PDF / 图片 / 视频同源）
+        let canvas_bg = self.window_bg();
+        // 公共字段统一重置（编辑区置空 + markdown 语言 + 文件路径/计数 + 预览全屏只读）。
+        // 选项卡不存在 → 早退（与旧逐条 load_* 一致：不创建查看器实体）。
+        if !self.reset_common_tab_fields(idx, p, SharedString::default(), 0, 0, cx) {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return;
+        };
+        match kind {
+            MediaKind::Pdf => {
+                // PdfViewer：自包含阅读器（异步读文件+解析+页级按需栅格化，不解析为 Markdown）
+                let viewer = cx.new(|cx| pdf::PdfViewer::new(p.to_path_buf(), cx));
+                viewer.update(cx, |view, _| view.set_background(canvas_bg));
+                // 订阅阅读器 notify：检索结果/加载进度到达 → 重绘 app（侧边栏 PDF 命中计数/页列表更新）
+                self._pdf_observe = Some(cx.observe(&viewer, |_this, _e, cx| {
+                    cx.notify();
+                }));
+                tab.reader = MediaReader::Pdf(viewer);
+            }
+            MediaKind::Image => {
+                // ImageViewer：自包含图片查看器（后台解码 + 同文件夹切换 + Ctrl+滚轮缩放）
+                let viewer = cx.new(|cx| image_viewer::ImageViewer::new(p.to_path_buf(), cx));
+                viewer.update(cx, |view, _| view.set_background(canvas_bg));
+                tab.reader = MediaReader::Image(viewer);
+            }
+            #[cfg(feature = "video")]
+            MediaKind::Video => {
+                // VideoViewer：自包含视频播放器（后台解码 + 帧钟 + 控制）
+                let viewer = cx.new(|cx| video::VideoViewer::new(p.to_path_buf(), cx));
+                viewer.update(cx, |view, _| view.set_background(canvas_bg));
+                // 焦点落到查看器：Space/←/→/滚轮等控制键直达（按键监听挂在查看器焦点句柄上）
+                let fh = viewer.read(cx).focus_handle();
+                _window.focus(&fh, cx);
+                tab.reader = MediaReader::Video(viewer);
+            }
+        }
+        self.status = match kind {
+            MediaKind::Pdf => {
+                SharedString::from(format!("已打开 PDF：{}（解析中…）", p.display()))
+            }
+            MediaKind::Image => SharedString::from(format!("已打开图片：{}", p.display())),
+            #[cfg(feature = "video")]
+            MediaKind::Video => SharedString::from(format!("已打开视频：{}", p.display())),
+        };
+        self.status_ok = true;
+        cx.notify();
+    }
+
+    /// 把「只读阅读」选项卡的公共字段统一重置：编辑区置空并切到 markdown 语言、
+    /// 文件路径、内容/计数镜像、光标、脏标记与「全屏只读预览」标志（PDF / 图片 /
+    /// 视频 / EPUB 共用；媒体走空内容与零计数，EPUB 走真实正文与计数）。
+    /// 返回值 = 选项卡是否仍存在（不存在则未做任何写入，调用方应早退）。
+    fn reset_common_tab_fields(
+        &mut self,
+        idx: usize,
+        p: &std::path::Path,
+        content: SharedString,
+        line_count: usize,
+        char_count: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get_mut(idx) else {
+            return false;
+        };
+        // 编辑区置为提示文本（只读阅读，不参与文本编辑）
+        tab.editor.update(cx, |ed, _cx| {
+            ed.set_text("");
+            ed.set_language(Some("markdown"));
+        });
         tab.file_path = Some(p.to_path_buf());
-        tab.content = SharedString::default();
-        tab.line_count = 0;
-        tab.char_count = 0;
+        tab.content = content;
+        tab.line_count = line_count;
+        tab.char_count = char_count;
         tab.cursor_row = 0;
         tab.cursor_col = 0;
         tab.dirty = false;
         tab.preview_on = true;
         tab.preview_fullscreen = true;
-        // 视频正文只存在于查看器，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
+        // 正文只存在于查看器/预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
         tab.readonly_preview = true;
-        self.status = SharedString::from(format!("已打开视频：{}", p.display()));
-        self.status_ok = true;
-        cx.notify();
+        true
     }
 
     /// 打开 PDF：立即建标签页并创建自包含的 PdfViewer（在后台加载解析），
@@ -856,7 +828,7 @@ impl EditorApp {
     ) {
         self.status = SharedString::from(format!("正在打开 PDF：{}…", p.display()));
         self.status_ok = true;
-        self.load_pdf(idx, &p, window, cx);
+        self.load_media(idx, &p, MediaKind::Pdf, window, cx);
     }
 
     /// 打开文件：新建一个文件选项卡并在其中载入文件内容，随后把焦点移到新选项卡的编辑区。
@@ -893,7 +865,7 @@ impl EditorApp {
         if Self::is_image_path(&p) {
             // 先建标签页、立即返回：解码放到后台（ImageViewer 自包含）
             let idx = self.make_tab(window, cx);
-            self.load_image(idx, &p, window, cx);
+            self.load_media(idx, &p, MediaKind::Image, window, cx);
             let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
             return;
@@ -902,7 +874,7 @@ impl EditorApp {
         if Self::is_video_path(&p) {
             // 先建标签页、立即返回：解码放到后台（VideoViewer 自包含）
             let idx = self.make_tab(window, cx);
-            self.load_video(idx, &p, window, cx);
+            self.load_media(idx, &p, MediaKind::Video, window, cx);
             let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
             return;

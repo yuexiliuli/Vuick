@@ -13,16 +13,12 @@ impl EditorApp {
     ///（整页原样），其余（MD / EPUB）用统一 WyEditor 只读宿主（M5-B5 P4-2：
     /// `MarkdownPreview` 已删）。预览未创建 → 空元素兜底。
     fn preview_element(tab: &EditorTab) -> gpui::AnyElement {
-        if let Some(img) = &tab.image_viewer {
-            return img.clone().into_any_element();
-        }
-        #[cfg(feature = "video")]
-        if let Some(vid) = &tab.video_viewer {
-            return vid.clone().into_any_element();
-        }
-        match &tab.pdf_preview {
-            Some(pdf) => pdf.clone().into_any_element(),
-            None => tab
+        match &tab.reader {
+            MediaReader::Image(img) => img.clone().into_any_element(),
+            #[cfg(feature = "video")]
+            MediaReader::Video(vid) => vid.clone().into_any_element(),
+            MediaReader::Pdf(pdf) => pdf.clone().into_any_element(),
+            MediaReader::None => tab
                 .md_wy
                 .clone()
                 .map(|w| w.into_any_element())
@@ -509,14 +505,9 @@ impl EditorApp {
             // A2：Markdown 全屏预览同样切统一组件 WyEditor（宿主滚动；结构与右栏同源）。
             return self.md_wy_host_children(window, cx, true, 1.0);
         }
-        // 图片查看器：切换/解码完成后把标签标题与状态栏跟到当前图片（渲染期幂等同步，
-        // 无图片则跳过）。
-        if self.sync_active_image_meta(cx) {
-            cx.notify();
-        }
-        // 图片 / 视频查看器：同文件夹切换后标签标题/状态栏跟到当前媒体。
-        #[cfg(feature = "video")]
-        if self.sync_active_video_meta(cx) {
+        // 媒体查看器（图片/视频）：切换/解码完成后把标签标题与状态栏跟到当前媒体
+        //（渲染期幂等同步，无媒体/路径未变则跳过）。
+        if self.sync_active_media_meta(cx) {
             cx.notify();
         }
         // 全屏阅读（PDF / 图片 / 视频）：自包含阅读器自处理缩放，无需全局字号推进。
@@ -529,11 +520,12 @@ impl EditorApp {
             .bg(self.panel_bg())
             .child(Self::preview_element(tab));
         // 图片/视频查看器：自处理滚轮（图片：单滚切换 / Ctrl+滚轮缩放），不再挂全局
-        // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）。
+        // zoom_overlay（否则 Ctrl+滚轮会被全局字号缩放抢走，媒体缩放失效）；
+        // PDF / 其余（无自处理滚轮）继续挂 zoom_overlay。
         #[cfg(feature = "video")]
-        let media_self_wheel = tab.image_viewer.is_none() && tab.video_viewer.is_none();
+        let media_self_wheel = !matches!(&tab.reader, MediaReader::Image(_) | MediaReader::Video(_));
         #[cfg(not(feature = "video"))]
-        let media_self_wheel = tab.image_viewer.is_none();
+        let media_self_wheel = !matches!(&tab.reader, MediaReader::Image(_));
         if media_self_wheel {
             el = el.child(Self::zoom_overlay(cx));
         }

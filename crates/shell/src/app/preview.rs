@@ -105,14 +105,7 @@ impl EditorApp {
     pub(super) fn md_wy_preview(&self) -> Option<gpui::Entity<WyEditor>> {
         let tab = self.tabs.get(self.active_tab)?;
         // PDF/图片/视频用自带阅读器，绝不以 WyEditor 渲染。
-        if tab.pdf_preview.is_some() {
-            return None;
-        }
-        if tab.image_viewer.is_some() {
-            return None;
-        }
-        #[cfg(feature = "video")]
-        if tab.video_viewer.is_some() {
+        if tab.reader.is_reader() {
             return None;
         }
         tab.md_wy.clone()

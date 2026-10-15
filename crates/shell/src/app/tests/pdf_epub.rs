@@ -99,9 +99,7 @@
         for _ in 0..200 {
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
-                    .pdf_preview
-                    .as_ref()
+                tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -114,10 +112,7 @@
                 let a = app.read(cx);
                 let t = &a.tabs[a.active_tab];
                 (
-                    t.pdf_preview
-                        .as_ref()
-                        .map(|pv| pv.read(cx).page_count())
-                        .unwrap_or(0),
+                    tab_pdf(t).map(|pv| pv.read(cx).page_count()).unwrap_or(0),
                     a.tabs.len(),
                     a.status.to_string(),
                     a.status_ok,
@@ -174,9 +169,8 @@
         for _ in 0..400 {
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
-                    .pdf_preview
-                    .as_ref()
+                let a = app.read(cx);
+                tab_pdf(&a.tabs[a.active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -199,7 +193,7 @@
         }
         let (loaded, tiles, cover, pending) = cx.update(|_w, cx| {
             let a = app.read(cx);
-            let pv = a.tabs[a.active_tab].pdf_preview.as_ref().unwrap().read(cx);
+            let pv = tab_pdf(&a.tabs[a.active_tab]).expect("PDF 阅读器在场").read(cx);
             // P4：pdf 已独立 crate，经只读访问器取内部调度状态（不再直接读 slots/pending_tiles）。
             let (tiles, cover, pending) = pv.tiles_schedule_progress();
             (pv.is_loaded(), tiles, cover, pending)
@@ -245,9 +239,7 @@
         for _ in 0..400 {
             cx.run_until_parked();
             let loaded = cx.update(|_w, cx| {
-                app.read(cx).tabs[app.read(cx).active_tab]
-                    .pdf_preview
-                    .as_ref()
+                tab_pdf(&app.read(cx).tabs[app.read(cx).active_tab])
                     .map(|pv| pv.read(cx).is_loaded())
                     .unwrap_or(false)
             });
@@ -259,10 +251,7 @@
             let a = app.read(cx);
             let t = &a.tabs[a.active_tab];
             (
-                t.pdf_preview
-                    .as_ref()
-                    .map(|pv| pv.read(cx).page_count())
-                    .unwrap_or(0),
+                tab_pdf(t).map(|pv| pv.read(cx).page_count()).unwrap_or(0),
                 a.status_ok,
             )
         });
@@ -443,5 +432,163 @@
         });
         assert!(wrap3, "预览应保持换行");
         assert!(!pref3, "再切换后全局编辑区换行偏好应恢复关闭");
+    }
+
+    /// Reader 收敛回归（防样板）：picture / pdf / video / epub 四种装载路径（各自 `make_tab`
+    /// 新建选项卡，对齐 `open_file` 的真实装配路径）产生的「只读阅读」公共字段逐项一致
+    /// （preview 全屏 + 只读锁定 + 编辑区置空 + 文件路径 + 未脏 + 光标归零 + 计数口径）——
+    /// 媒体三态各挂对应 [`MediaReader`] 变体、EPUB 走真实正文/计数且不挂媒体阅读器。
+    /// 直接调 `load_media` / `load_epub`（不经 `open_file`，无需真文件可解析，仅断言装配
+    /// 字段；背景解码/解析失败不影响字段）。
+    #[gpui::test]
+    async fn media_loads_share_common_fields(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (app, cx) = add_app(cx);
+        cx.simulate_resize(gpui::size(px(980.), px(720.)));
+        for _ in 0..3 {
+            cx.run_until_parked();
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gpui-editor-app-reader-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_p = dir.join("a.pdf");
+        let img_p = dir.join("a.jpg");
+        std::fs::write(&pdf_p, b"not a real pdf").unwrap();
+        std::fs::write(&img_p, b"not a real jpeg").unwrap();
+        #[cfg(feature = "video")]
+        let vid_p = dir.join("a.mp4");
+        #[cfg(feature = "video")]
+        std::fs::write(&vid_p, b"not a real video").unwrap();
+        let epub_p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/xy.epub");
+        let epub_doc = epub::parse_epub_file(&epub_p).expect("测试 EPUB 应可解析");
+
+        // 新建选项卡并装载，返回新下标（对齐真实打开路径：load_* 总是在新 make_tab 上）。
+        let load_media_tab = |cx: &mut VisualTestContext,
+                              app: &gpui::Entity<EditorApp>,
+                              p: &std::path::Path,
+                              kind: MediaKind|
+         -> usize {
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    let idx = app.make_tab(window, cx);
+                    app.load_media(idx, p, kind, window, cx);
+                    idx
+                })
+            })
+        };
+
+        #[allow(clippy::type_complexity)]
+        type Common = (
+            bool,  // preview_on
+            bool,  // preview_fullscreen
+            bool,  // readonly_preview
+            bool,  // dirty
+            usize, // cursor_row
+            usize, // cursor_col
+            bool,  // content 为空
+            usize, // line_count
+            usize, // char_count
+            bool,  // 编辑区 value 为空
+            std::path::PathBuf, // 装配后的文件路径
+        );
+        // 采集指定选项卡的公共装配字段。
+        let read_common = |cx: &mut VisualTestContext,
+                           app: &gpui::Entity<EditorApp>,
+                           idx: usize|
+         -> Common {
+            cx.update(|_w, cx| {
+                let a = app.read(cx);
+                let t = &a.tabs[idx];
+                (
+                    t.preview_on,
+                    t.preview_fullscreen,
+                    t.readonly_preview,
+                    t.dirty,
+                    t.cursor_row,
+                    t.cursor_col,
+                    t.content.is_empty(),
+                    t.line_count,
+                    t.char_count,
+                    t.editor.read(cx).value().is_empty(),
+                    t.file_path.clone().expect("装配后应有文件路径"),
+                )
+            })
+        };
+        // 媒体三态的公共期望：全屏只读锁定、未脏、光标归零、空内容/零计数、编辑区空。
+        let media_expected: Common =
+            (true, true, true, false, 0, 0, true, 0, 0, true, std::path::PathBuf::new());
+
+        // PDF
+        let i_pdf = load_media_tab(cx, &app, &pdf_p, MediaKind::Pdf);
+        let c = read_common(cx, &app, i_pdf);
+        assert_eq!(
+            (c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8, c.9),
+            (media_expected.0, media_expected.1, media_expected.2, media_expected.3, media_expected.4, media_expected.5, media_expected.6, media_expected.7, media_expected.8, media_expected.9),
+            "PDF 装配公共字段应与媒体基准一致"
+        );
+        assert_eq!(c.10, pdf_p, "PDF 应装配文件路径");
+        assert!(
+            cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_pdf].reader, MediaReader::Pdf(_))),
+            "PDF 应挂 Pdf 阅读器"
+        );
+
+        // 图片
+        let i_img = load_media_tab(cx, &app, &img_p, MediaKind::Image);
+        let c = read_common(cx, &app, i_img);
+        assert_eq!(
+            (c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8, c.9),
+            (media_expected.0, media_expected.1, media_expected.2, media_expected.3, media_expected.4, media_expected.5, media_expected.6, media_expected.7, media_expected.8, media_expected.9),
+            "图片装配公共字段应与媒体基准一致"
+        );
+        assert_eq!(c.10, img_p, "图片应装配文件路径");
+        assert!(
+            cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_img].reader, MediaReader::Image(_))),
+            "图片应挂 Image 查看器"
+        );
+
+        // 视频（仅 video 特性）
+        #[cfg(feature = "video")]
+        {
+            let i_vid = load_media_tab(cx, &app, &vid_p, MediaKind::Video);
+            let c = read_common(cx, &app, i_vid);
+            assert_eq!(
+                (c.0, c.1, c.2, c.3, c.4, c.5, c.6, c.7, c.8, c.9),
+                (media_expected.0, media_expected.1, media_expected.2, media_expected.3, media_expected.4, media_expected.5, media_expected.6, media_expected.7, media_expected.8, media_expected.9),
+                "视频装配公共字段应与媒体基准一致"
+            );
+            assert_eq!(c.10, vid_p, "视频应装配文件路径");
+            assert!(
+                cx.update(|_w, cx| matches!(&app.read(cx).tabs[i_vid].reader, MediaReader::Video(_))),
+                "视频应挂 Video 查看器"
+            );
+        }
+
+        // EPUB：只读锁定/预览标志与媒体一致，但正文/计数走真实文档，且不挂媒体阅读器。
+        let i_epub = cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let idx = app.make_tab(window, cx);
+                app.load_epub(idx, &epub_p, epub_doc, window, cx);
+                idx
+            })
+        });
+        let c = read_common(cx, &app, i_epub);
+        assert!(
+            c.0 && c.1 && c.2 && !c.3 && c.4 == 0 && c.5 == 0 && c.9,
+            "EPUB 公共标志应与媒体基准一致（全屏只读预览、未脏、光标归零、编辑区空）"
+        );
+        assert_eq!(c.10, epub_p, "EPUB 应装配文件路径");
+        assert!(!c.6, "EPUB 应以真实正文为 content（非空）");
+        assert!(c.7 > 0 && c.8 > 0, "EPUB 应有真实行/字计数（实际 {}/{}）", c.7, c.8);
+        let (epub_status_ok, epub_reader_none) = cx.update(|_w, cx| {
+            let a = app.read(cx);
+            (a.status_ok, matches!(&a.tabs[i_epub].reader, MediaReader::None))
+        });
+        assert!(epub_status_ok, "EPUB 打开状态应成功");
+        assert!(epub_reader_none, "EPUB 不挂媒体阅读器（纯 WyEditor 宿主）");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 

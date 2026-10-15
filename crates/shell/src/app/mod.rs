@@ -103,13 +103,9 @@ struct EditorTab {
     cursor_row: usize,
     /// 光标列（0 基）
     cursor_col: usize,
-    /// PDF 阅读器（打开 .pdf 时创建）：整页原样显示；None = 非 PDF 选项卡。
-    pdf_preview: Option<gpui::Entity<pdf::PdfViewer>>,
-    /// 图片查看器（打开图片时创建）：None = 非图片选项卡。
-    image_viewer: Option<gpui::Entity<image_viewer::ImageViewer>>,
-    /// 视频查看器（打开视频时创建，M1 首帧静态阅读）：None = 非视频选项卡。
-    #[cfg(feature = "video")]
-    video_viewer: Option<gpui::Entity<video::VideoViewer>>,
+    /// 媒体阅读器（打开 .pdf / 图片 / 视频时创建，一次至多其一）：整页/整图/首帧只读
+    /// 展示；`None` = 非媒体选项卡（文本 / Markdown / EPUB）。
+    reader: MediaReader,
     /// 是否开启 Markdown 预览
     preview_on: bool,
     /// 预览是否占满整个内容区（EPUB 阅读等场景，不显示编辑区/分割线）
@@ -181,12 +177,8 @@ struct EditorTab {
 /// 拔掉时随源 `EditorTab` 一并丢弃，目标窗口重新建立订阅。
 pub(crate) struct DetachedTab {
     editor: gpui::Entity<editor::CodeEditor>,
-    pdf_preview: Option<gpui::Entity<pdf::PdfViewer>>,
-    /// 图片查看器实体（随选项卡跨窗口搬迁）。
-    image_viewer: Option<gpui::Entity<image_viewer::ImageViewer>>,
-    /// 视频查看器实体（随选项卡跨窗口搬迁）。
-    #[cfg(feature = "video")]
-    video_viewer: Option<gpui::Entity<video::VideoViewer>>,
+    /// 媒体阅读器（PDF / 图片 / 视频；与 [`EditorTab::reader`] 同型，跨窗口搬迁）。
+    reader: MediaReader,
     /// A2：右栏 WyEditor 预览实体与宿主滚动句柄随选项卡搬迁（与 `md_preview` 同；
     /// 实体与窗口无关，可直接跨窗口移动）。
     md_wy: Option<gpui::Entity<WyEditor>>,
@@ -511,13 +503,45 @@ impl WinCtrlKind {
     }
 }
 
-/// 当前激活选项卡的媒体查看器（图片 / 视频），供右键菜单锁定切换。
-/// 一个选项卡只可能是其一（打开图片/视频时分别创建）。
+/// 选项卡持有的媒体查看器（Reader 收敛，取代原先 pdf/image/video 三个独立
+/// `Option<Entity<_>>` 指针）：一个选项卡至多其一。enum + 每变体持有具体实体
+/// （不用 dyn / 不建 trait 抽象层），消费方 `match` 收敛即可；随选项卡搬迁
+/// （[`DetachedTab::reader`]）整体移动，无逐字段复制样板。
 #[derive(Clone)]
-enum ActiveMedia {
+enum MediaReader {
+    /// 非媒体选项卡（文本 / Markdown / EPUB）。
+    None,
+    /// PDF 阅读器：整页原样显示（打开 .pdf 时创建，解析/栅格化自包含后台）。
+    Pdf(gpui::Entity<pdf::PdfViewer>),
+    /// 图片查看器：整图展示 + 同文件夹切换 + Ctrl+滚轮缩放。
     Image(gpui::Entity<image_viewer::ImageViewer>),
+    /// 视频查看器：M1 首帧静态阅读 + 帧钟/控制键。
     #[cfg(feature = "video")]
     Video(gpui::Entity<video::VideoViewer>),
+}
+
+impl MediaReader {
+    /// 是否未挂任何媒体阅读器（文本 / Markdown / EPUB 选项卡）。
+    fn is_none(&self) -> bool {
+        matches!(self, MediaReader::None)
+    }
+
+    /// 是否挂有「自带阅读器」的媒体（PDF / 图片 / 视频）——预览绝不以 WyEditor 渲染。
+    fn is_reader(&self) -> bool {
+        !self.is_none()
+    }
+
+    /// 是否有「锁定」语义的媒体（图片 / 视频；PDF 无右键锁定菜单）。
+    fn is_lockable(&self) -> bool {
+        if matches!(self, MediaReader::Image(_)) {
+            return true;
+        }
+        #[cfg(feature = "video")]
+        if matches!(self, MediaReader::Video(_)) {
+            return true;
+        }
+        false
+    }
 }
 
 impl Focusable for EditorApp {

@@ -428,19 +428,21 @@ impl EditorApp {
     /// 折叠/展开某个目录父项（仅「有下级」的条目可折叠）。
     pub(super) fn toggle_sidebar_toc_collapse(&mut self, idx: usize, cx: &mut Context<Self>) {
         let has_child = match self.tabs.get(self.active_tab) {
-            Some(_t) if self.tabs[self.active_tab].pdf_preview.is_some() => {
-                let outlines = self.tabs[self.active_tab].pdf_preview.as_ref().unwrap().read(cx).outlines().to_vec();
-                let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
-                toc::toc_node_has_child(&levels, idx)
-            }
-            Some(_t) => {
-                // P4-2：MD / EPUB 目录都来自统一 WyEditor 只读宿主。
-                let levels: Vec<usize> = self
-                    .md_toc_source(cx)
-                    .map(|(entries, _)| entries.iter().map(|&(_, l, _)| l as usize).collect())
-                    .unwrap_or_default();
-                toc::toc_node_has_child(&levels, idx)
-            }
+            Some(tab) => match &tab.reader {
+                MediaReader::Pdf(pv) => {
+                    let outlines = pv.read(cx).outlines().to_vec();
+                    let levels: Vec<usize> = outlines.iter().map(|e| e.level).collect();
+                    toc::toc_node_has_child(&levels, idx)
+                }
+                _ => {
+                    // P4-2：MD / EPUB 目录都来自统一 WyEditor 只读宿主。
+                    let levels: Vec<usize> = self
+                        .md_toc_source(cx)
+                        .map(|(entries, _)| entries.iter().map(|&(_, l, _)| l as usize).collect())
+                        .unwrap_or_default();
+                    toc::toc_node_has_child(&levels, idx)
+                }
+            },
             None => false,
         };
         if !has_child {
@@ -477,7 +479,7 @@ impl EditorApp {
         let font_px = 13.0f32;
         // 右侧页码列宽（PDF 书签有页码，Markdown 无）：预留以免标题被截断
         let page_col_w = 34.0f32;
-        let max_row = if let Some(pdf) = &tab.pdf_preview {
+        let max_row = if let MediaReader::Pdf(pdf) = &tab.reader {
             let outlines = pdf.read(cx).outlines();
             outlines
                 .iter()
@@ -567,7 +569,7 @@ impl EditorApp {
             Some(tab) => {
                 let collapsed = self.sidebar.toc_collapsed.clone();
                 // PDF 书签目录
-                if let Some(pdf) = &tab.pdf_preview {
+                if let MediaReader::Pdf(pdf) = &tab.reader {
                     let outlines = pdf.read(cx).outlines().to_vec();
                     if outlines.is_empty() {
                         ui::empty_state::compact_empty_state(
@@ -957,7 +959,9 @@ impl EditorApp {
         // PDF 标签：全文检索由 PdfViewer 后台执行（文本在 pdfium 里，不在 tab.content）。
         // 查询按（标签, 词）键控、变化才推送（阅读器内部 250ms 防抖）；侧边栏只展示
         // 计数/页列表并驱动跳转。结果异步到达 → 经 `_pdf_observe` 重绘本面板。
-        if let Some(pdf) = self.tabs.get(self.active_tab).and_then(|t| t.pdf_preview.clone()) {
+        if let Some(MediaReader::Pdf(pdf)) =
+            self.tabs.get(self.active_tab).map(|t| t.reader.clone())
+        {
             let push = self
                 .pdf_search
                 .as_ref()

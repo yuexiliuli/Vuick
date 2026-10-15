@@ -1,58 +1,42 @@
-//! 图片 / 视频媒体查看器接线：活动选项卡的媒体判定与元数据同步（标签标题 /
-//! 状态栏跟随）、右键「锁定/解锁」上下文菜单及其浮层渲染。
+//! 媒体查看器（图片 / 视频 / PDF）接线：活动选项卡的媒体判定与元数据同步（标签标题 /
+//! 状态栏跟随）、右键「锁定/解锁」上下文菜单及其浮层渲染。图片/视频/PDF 三指针已收敛
+//! 成单一 [`MediaReader`]，此处读取经 [`MediaReader`] + `match` 去重。
 
 use super::*;
 
 impl EditorApp {
-    /// 图片查看器切换/加载后的标签标题与状态栏同步（**渲染期调用**，见
-    /// `render_fullscreen_preview`）：查看器切换图片后 `refresh_windows` 触发本窗口重绘，
-    /// 全屏预览渲染前据此把选项卡 `file_path` 与状态栏跟到当前图片（标签标题跟着图走，
-    /// 状态栏显示「图片 n/m：路径」）。仅在激活选项卡持有图片查看器时更新；
-    /// **幂等**：路径未变返回 false（调用方不 notify，无重绘循环）。
-    pub(super) fn sync_active_image_meta(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(handle) = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.image_viewer.clone())
-        else {
+    /// 媒体查看器切换/加载后的标签标题与状态栏同步（**渲染期调用**，见
+    /// `render_fullscreen_preview`）：查看器切换图片/视频后 `refresh_windows` 触发本窗口
+    /// 重绘，全屏预览渲染前据此把选项卡 `file_path` 与状态栏跟到当前媒体（标签标题跟着
+    /// 媒体走，状态栏显示「图片/视频 n/m：路径」）。仅在激活选项卡持有图片/视频查看器时
+    /// 更新；**幂等**：路径未变返回 false（调用方不 notify，无重绘循环）。
+    pub(super) fn sync_active_media_meta(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(reader) = self.tabs.get(self.active_tab).map(|t| t.reader.clone()) else {
             return false;
         };
-        let (cur, idx, total) = {
-            let v = handle.read(cx);
-            (v.current_path(), v.current_index(), v.folder_len())
-        };
-        let Some(cur) = cur else {
-            return false;
-        };
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return false;
-        };
-        if tab.file_path.as_deref() == Some(cur.as_path()) {
-            return false;
-        }
-        self.status = SharedString::from(format!("图片 {}/{}：{}", idx + 1, total, cur.display()));
-        self.status_ok = true;
-        tab.file_path = Some(cur);
-        true
-    }
-
-    /// 同 [`Self::sync_active_image_meta`]，视频版：查看器同文件夹切换后把选项卡
-    /// 标题/状态栏跟到新视频（渲染期幂等调用；路径未变返回 false）。
-    #[cfg(feature = "video")]
-    pub(super) fn sync_active_video_meta(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(handle) = self
-            .tabs
-            .get(self.active_tab)
-            .and_then(|t| t.video_viewer.clone())
-        else {
-            return false;
-        };
-        let (cur, idx, total) = {
-            let v = handle.read(cx);
-            (v.current_path(), v.current_index(), v.folder_len())
-        };
-        let Some(cur) = cur else {
-            return false;
+        let (label, cur) = match reader {
+            MediaReader::Image(v) => {
+                let (cur, idx, total) = {
+                    let view = v.read(cx);
+                    (view.current_path(), view.current_index(), view.folder_len())
+                };
+                let Some(cur) = cur else {
+                    return false;
+                };
+                (format!("图片 {}/{}：{}", idx + 1, total, cur.display()), cur)
+            }
+            #[cfg(feature = "video")]
+            MediaReader::Video(v) => {
+                let (cur, idx, total) = {
+                    let view = v.read(cx);
+                    (view.current_path(), view.current_index(), view.folder_len())
+                };
+                let Some(cur) = cur else {
+                    return false;
+                };
+                (format!("视频 {}/{}：{}", idx + 1, total, cur.display()), cur)
+            }
+            MediaReader::Pdf(_) | MediaReader::None => return false,
         };
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return false;
@@ -60,40 +44,27 @@ impl EditorApp {
         if tab.file_path.as_deref() == Some(cur.as_path()) {
             return false;
         }
-        self.status = SharedString::from(format!("视频 {}/{}：{}", idx + 1, total, cur.display()));
+        self.status = SharedString::from(label);
         self.status_ok = true;
         tab.file_path = Some(cur);
         true
     }
 
-    /// 当前激活选项卡是否在「锁定」干净看图模式（读图片查看器实体状态）。
-    pub(super) fn active_image_locked(&self, cx: &App) -> bool {
-        self.tabs
-            .get(self.active_tab)
-            .and_then(|t| t.image_viewer.as_ref())
-            .is_some_and(|v| v.read(cx).is_locked())
+    /// 当前激活选项卡是否在「锁定」干净阅读模式（图片/视频查看器实体状态）。
+    /// 与 `active_media_locked` 同口径：图片 / 视频任一锁定即 true，其余 false。
+    pub(super) fn active_media_locked(&self, cx: &App) -> bool {
+        match self.tabs.get(self.active_tab).map(|t| &t.reader) {
+            Some(MediaReader::Image(v)) => v.read(cx).is_locked(),
+            #[cfg(feature = "video")]
+            Some(MediaReader::Video(v)) => v.read(cx).is_locked(),
+            _ => false,
+        }
     }
 
-    /// 当前激活选项卡是否在「纯视频」干净播放模式（读视频查看器实体状态）。
-    #[cfg(feature = "video")]
-    pub(super) fn active_video_locked(&self, cx: &App) -> bool {
-        self.tabs
-            .get(self.active_tab)
-            .and_then(|t| t.video_viewer.as_ref())
-            .is_some_and(|v| v.read(cx).is_locked())
-    }
-
-    /// 当前激活选项卡的媒体查看器（图片或视频；均有则取图片）。无媒体 → None。
-    pub(super) fn active_media_viewer(&self) -> Option<ActiveMedia> {
-        let tab = self.tabs.get(self.active_tab)?;
-        if let Some(img) = &tab.image_viewer {
-            return Some(ActiveMedia::Image(img.clone()));
-        }
-        #[cfg(feature = "video")]
-        if let Some(vid) = &tab.video_viewer {
-            return Some(ActiveMedia::Video(vid.clone()));
-        }
-        None
+    /// 当前激活选项卡的「可锁定」媒体查看器（图片或视频；PDF 无锁定语义，置 None）。
+    pub(super) fn active_media_viewer(&self) -> Option<MediaReader> {
+        let reader = self.tabs.get(self.active_tab).map(|t| t.reader.clone())?;
+        reader.is_lockable().then_some(reader)
     }
 
     /// 图片/视频右键 → 在光标处弹「锁定/解锁」上下文菜单（仅活动选项卡是图片/视频时
@@ -117,7 +88,7 @@ impl EditorApp {
         self.media_lock_menu_sub = None;
         let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
             let item = match media.clone() {
-                ActiveMedia::Image(img) => {
+                MediaReader::Image(img) => {
                     let viewer_render = img.clone();
                     PopupMenuItem::element(move |_window, cx| {
                         let locked = viewer_render.read(cx).is_locked();
@@ -136,7 +107,7 @@ impl EditorApp {
                     })
                 }
                 #[cfg(feature = "video")]
-                ActiveMedia::Video(vid) => {
+                MediaReader::Video(vid) => {
                     let viewer_render = vid.clone();
                     PopupMenuItem::element(move |_window, cx| {
                         let locked = viewer_render.read(cx).is_locked();
@@ -153,6 +124,8 @@ impl EditorApp {
                         window.refresh();
                     })
                 }
+                // active_media_viewer 已按 is_lockable 过滤，PDF/无 不可达。
+                MediaReader::Pdf(_) | MediaReader::None => unreachable!(),
             };
             menu.item(item)
         });

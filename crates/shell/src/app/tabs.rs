@@ -30,10 +30,7 @@ impl EditorApp {
             char_count: 0,
             cursor_row: 0,
             cursor_col: 0,
-            pdf_preview: None,
-            image_viewer: None,
-            #[cfg(feature = "video")]
-            video_viewer: None,
+            reader: MediaReader::None,
             preview_on: false,
             preview_fullscreen: false,
             readonly_preview: false,
@@ -185,11 +182,18 @@ impl EditorApp {
         }
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         // 释放被移除选项卡持有的重资源（PDF 纹理 / 图片解码），实体随后随之释放。
-        if let Some(pdf) = self.tabs[idx].pdf_preview.take() {
-            pdf.update(cx, |view, cx| view.release(window, cx));
-        }
-        if let Some(img) = self.tabs[idx].image_viewer.take() {
-            img.update(cx, |view, cx| view.release(window, cx));
+        // 顺序保持旧行为：先 PDF、再图片；视频无显式 release（随选项卡直接释放）。
+        let reader = std::mem::replace(&mut self.tabs[idx].reader, MediaReader::None);
+        match reader {
+            MediaReader::Pdf(pdf) => {
+                pdf.update(cx, |view, cx| view.release(window, cx));
+            }
+            MediaReader::Image(img) => {
+                img.update(cx, |view, cx| view.release(window, cx));
+            }
+            MediaReader::None => {}
+            #[cfg(feature = "video")]
+            MediaReader::Video(_) => {}
         }
         self.tabs.remove(idx);
         if self.tabs.is_empty() {

@@ -176,7 +176,7 @@ impl EditorApp {
                 });
             }
             // PDF 阅读器同样刷新背景（主题色变化后与画布保持一致）
-            if let Some(pdf) = &tab.pdf_preview {
+            if let MediaReader::Pdf(pdf) = &tab.reader {
                 let pv = pdf.clone();
                 pv.update(cx, |view, cx| {
                     view.set_background(canvas_bg);

@@ -224,19 +224,9 @@ impl EditorApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let image_locked = self.active_image_locked(cx);
-        let video_locked = {
-            #[cfg(feature = "video")]
-            {
-                self.active_video_locked(cx)
-            }
-            #[cfg(not(feature = "video"))]
-            {
-                false
-            }
-        };
+        let media_locked = self.active_media_locked(cx);
         let mut out: Vec<gpui::AnyElement> = Vec::new();
-        if image_locked || video_locked {
+        if media_locked {
             // 锁定：正文（图片/视频查看器）直接铺满窗口，其余全藏 —— 媒体经重排后自动放大填满
             out.push(body);
         } else {

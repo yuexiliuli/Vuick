@@ -19,10 +19,7 @@ impl EditorApp {
         self.search_scan = None; // 选项卡集合变化 → 搜索缓存失效
         Some(DetachedTab {
             editor: tab.editor,
-            pdf_preview: tab.pdf_preview,
-            image_viewer: tab.image_viewer,
-            #[cfg(feature = "video")]
-            video_viewer: tab.video_viewer,
+            reader: tab.reader,
             md_wy: tab.md_wy,
             md_wy_vscroll: tab.md_wy_vscroll,
             md_wy_pending: tab.md_wy_pending,
@@ -72,10 +69,7 @@ impl EditorApp {
             char_count: payload.char_count,
             cursor_row: payload.cursor_row,
             cursor_col: payload.cursor_col,
-            pdf_preview: payload.pdf_preview,
-            image_viewer: payload.image_viewer,
-            #[cfg(feature = "video")]
-            video_viewer: payload.video_viewer,
+            reader: payload.reader,
             md_wy: payload.md_wy,
             md_wy_vscroll: payload.md_wy_vscroll,
             md_wy_pending: payload.md_wy_pending,
@@ -108,19 +102,21 @@ impl EditorApp {
         let canvas_bg = self.window_bg();
         // P4-2：MD / EPUB 预览都走统一 WyEditor 只读宿主——实体随选项卡搬迁已带内容，
         // 无需再喂 MarkdownPreview（该后端已删除）。
-        if let Some(pdf) = self.tabs[idx].pdf_preview.clone() {
-            let pv = pdf.clone();
-            pv.update(cx, |view, _| view.set_background(canvas_bg));
-            self._pdf_observe = Some(cx.observe(&pdf, |_this, _e, cx| {
-                cx.notify();
-            }));
-        }
-        if let Some(img) = self.tabs[idx].image_viewer.clone() {
-            img.update(cx, |view, _| view.set_background(canvas_bg));
-        }
-        #[cfg(feature = "video")]
-        if let Some(vid) = self.tabs[idx].video_viewer.clone() {
-            vid.update(cx, |view, _| view.set_background(canvas_bg));
+        match self.tabs[idx].reader.clone() {
+            MediaReader::Pdf(pdf) => {
+                pdf.update(cx, |view, _| view.set_background(canvas_bg));
+                self._pdf_observe = Some(cx.observe(&pdf, |_this, _e, cx| {
+                    cx.notify();
+                }));
+            }
+            MediaReader::Image(img) => {
+                img.update(cx, |view, _| view.set_background(canvas_bg));
+            }
+            #[cfg(feature = "video")]
+            MediaReader::Video(vid) => {
+                vid.update(cx, |view, _| view.set_background(canvas_bg));
+            }
+            MediaReader::None => {}
         }
         self.pdf_search = None; // 重新推送检索查询
         if let Some(window) = window.as_mut() {

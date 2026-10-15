@@ -1,5 +1,6 @@
 
     use super::*;
+    use crate::app::file_ops::MediaKind;
     use crate::actions::{
         MoveDown, NewFile, Paste, QuickOpenFile, Redo, SelectAll, ToggleCommandPalette, Undo,
     };
@@ -8,6 +9,31 @@
     /// 测试前必须初始化 gpui-component（主题、键盘映射等全局状态）。
     fn init_test(cx: &mut TestAppContext) {
         cx.update(crate::test_support::bind_local_keymaps);
+    }
+
+    /// 测试辅助：取选项卡的 PDF 阅读器实体（`MediaReader` 收敛后经 `MediaReader::Pdf` 取）。
+    fn tab_pdf(tab: &EditorTab) -> Option<&gpui::Entity<pdf::PdfViewer>> {
+        match &tab.reader {
+            MediaReader::Pdf(pv) => Some(pv),
+            _ => None,
+        }
+    }
+
+    /// 测试辅助：取选项卡的图片查看器实体（经 `MediaReader::Image` 取）。
+    fn tab_image(tab: &EditorTab) -> Option<&gpui::Entity<image_viewer::ImageViewer>> {
+        match &tab.reader {
+            MediaReader::Image(iv) => Some(iv),
+            _ => None,
+        }
+    }
+
+    /// 测试辅助：取选项卡的视频查看器实体（经 `MediaReader::Video` 取）。
+    #[cfg(feature = "video")]
+    fn tab_video(tab: &EditorTab) -> Option<&gpui::Entity<video::VideoViewer>> {
+        match &tab.reader {
+            MediaReader::Video(vv) => Some(vv),
+            _ => None,
+        }
     }
 
     /// 创建一个以 `ui::root::Root` 为窗口根视图的编辑应用，

@@ -55,7 +55,7 @@
         let p = dir.join("a.jpg");
         std::fs::write(&p, b"not really a jpeg").unwrap();
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.load_image(0, &p, window, cx));
+            app.update(cx, |app, cx| app.load_media(0, &p, MediaKind::Image, window, cx));
         });
         for _ in 0..4 {
             cx.run_until_parked();
@@ -100,11 +100,9 @@
         let state = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.active_image_locked(cx),
+                a.active_media_locked(cx),
                 a.media_lock_menu_pos.is_none(),
-                a.tabs[a.active_tab]
-                    .image_viewer
-                    .as_ref()
+                tab_image(&a.tabs[a.active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
             )
@@ -120,7 +118,7 @@
         }
         let unlocked = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.active_image_locked(cx), a.media_lock_menu_pos.is_none())
+            (a.active_media_locked(cx), a.media_lock_menu_pos.is_none())
         });
         assert!(unlocked.1, "再次点菜单后仍应关闭");
         assert!(!unlocked.0, "再次点「锁定」应解锁回归");
@@ -146,7 +144,7 @@
         let p = dir.join("a.mp4");
         std::fs::write(&p, b"not really a video").unwrap();
         cx.update(|window, cx| {
-            app.update(cx, |app, cx| app.load_video(0, &p, window, cx));
+            app.update(cx, |app, cx| app.load_media(0, &p, MediaKind::Video, window, cx));
         });
         for _ in 0..4 {
             cx.run_until_parked();
@@ -191,11 +189,9 @@
         let state = cx.update(|_w, cx| {
             let a = app.read(cx);
             (
-                a.active_video_locked(cx),
+                a.active_media_locked(cx),
                 a.media_lock_menu_pos.is_none(),
-                a.tabs[a.active_tab]
-                    .video_viewer
-                    .as_ref()
+                tab_video(&a.tabs[a.active_tab])
                     .map(|v| v.read(cx).is_locked())
                     .unwrap_or(false),
             )
@@ -211,7 +207,7 @@
         }
         let unlocked = cx.update(|_w, cx| {
             let a = app.read(cx);
-            (a.active_video_locked(cx), a.media_lock_menu_pos.is_none())
+            (a.active_media_locked(cx), a.media_lock_menu_pos.is_none())
         });
         assert!(unlocked.1, "再次点菜单后仍应关闭");
         assert!(!unlocked.0, "再次点「锁定」应解锁回归");

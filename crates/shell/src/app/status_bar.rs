@@ -57,8 +57,10 @@ impl EditorApp {
 
         // 中间区数据源（派生自激活选项卡，无新状态）：只读预览页码 / PDF 页码 / 光标行列。
         let epub_page = tab.map(|_| self.epub_page_bounds(window, cx)).unwrap_or(None);
-        let pdf_page = tab
-            .and_then(|t| t.pdf_preview.as_ref().and_then(|pv| pv.read(cx).current_page()));
+        let pdf_page = tab.and_then(|t| match &t.reader {
+            MediaReader::Pdf(pv) => pv.read(cx).current_page(),
+            _ => None,
+        });
         let cursor_pos = tab.and_then(|t| {
             // 只读预览（EPUB/PDF/图片/视频）编辑区为空，无光标位置可示（EPUB 的
             // `char_count` 是书目正文统计，不能当「有编辑内容」）。
