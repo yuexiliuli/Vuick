@@ -260,6 +260,10 @@ pub struct ChromeColors {
     pub bar_bg: Rgba,
     /// 工具条分隔边框
     pub bar_border: Rgba,
+    /// 区域分隔发丝线（**不透明**、全屏一致——半透明叠不同底色会混出各自的灰色；
+    /// 标题栏底 / 编辑区顶边 / 侧栏右缘 / 状态栏边框共用；原 `config::layout`
+    /// `SEPARATOR_LIGHT/DARK`，亮 #D9D9D9 / 暗 #2A2B2C）
+    pub hairline: Rgba,
     /// 编辑器/预览面板背景
     pub panel_bg: Rgba,
     /// 主要文字
@@ -296,6 +300,8 @@ pub struct ChromeColors {
     pub drag_ghost_bg: Rgba,
     /// 菜单项选中/悬停高亮（Win11 中性灰填充，替代强调蓝 tint）
     pub menu_highlight: Rgba,
+    /// 横向滚动条滑块底色（半透明中性灰，亮暗同值；原 shell 裸色 `rgba(0x6060604a)`）
+    pub scrollbar_thumb: Rgba,
 }
 
 /// 自绘玻璃材质 chrome 透明度：标题栏/选项卡栏/侧栏/状态栏/窗口底用
@@ -315,6 +321,8 @@ impl ChromeColors {
             material_bottom: rgb(0xedeff4),
             bar_bg: rgb(0xf5f5f5),
             bar_border: c.border,
+            // 区域分隔发丝线（不透明，亮浅灰 #D9D9D9，原 config SEPARATOR_LIGHT）
+            hairline: rgb(0xd9d9d9),
             panel_bg: c.bg,
             text_primary: c.fg,
             text_minor: c.fg_muted,
@@ -332,6 +340,8 @@ impl ChromeColors {
             close_pressed: rgb(0xa70d1a),
             drag_ghost_bg: c.accent,
             menu_highlight: rgba(0x00000014),
+            // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
+            scrollbar_thumb: rgba(0x6060604a),
         }
     }
 
@@ -343,6 +353,8 @@ impl ChromeColors {
             material_bottom: rgb(0x1b1d21),
             bar_bg: rgb(0x202020),
             bar_border: c.border,
+            // 区域分隔发丝线（不透明，暗深灰 #2A2B2C，原 config SEPARATOR_DARK）
+            hairline: rgb(0x2a2b2c),
             panel_bg: c.bg,
             text_primary: c.fg,
             text_minor: c.fg_muted,
@@ -360,6 +372,8 @@ impl ChromeColors {
             close_pressed: rgb(0xa70d1a),
             drag_ghost_bg: c.accent,
             menu_highlight: rgba(0xffffff1a),
+            // 滚动条滑块 = 半透明中性灰（亮暗同值，原 shell rgba(0x6060604a)）
+            scrollbar_thumb: rgba(0x6060604a),
         }
     }
 
@@ -665,6 +679,32 @@ mod tests {
         // 拖拽强调线 = 各档强调色同源。
         assert_eq!(lc.drag_hover_border, lc.accent, "亮拖拽线 = 亮强调色");
         assert_eq!(dc.drag_hover_border, dc.accent, "暗拖拽线 = 暗强调色");
+    }
+
+    #[gpui::test]
+    fn hairline_and_scrollbar_thumb_pinned_light_dark(_cx: &mut TestAppContext) {
+        // 收编 `config::layout` SEPARATOR_LIGHT/DARK（区域分隔发丝线）与 shell 滚动条
+        // 裸色 rgba(0x6060604a)：亮/暗各自值 = 收编前原值，行为零回归。
+        let light = ChromeColors::light();
+        let dark = ChromeColors::dark();
+        assert_eq!(light.hairline, rgb(0xd9d9d9), "亮发丝线=原 SEPARATOR_LIGHT #D9D9D9");
+        assert_eq!(dark.hairline, rgb(0x2a2b2c), "暗发丝线=原 SEPARATOR_DARK #2A2B2C");
+        assert_ne!(light.hairline, dark.hairline, "发丝线随明暗切换");
+        assert_eq!(
+            light.scrollbar_thumb,
+            rgba(0x6060604a),
+            "滚动条滑块=原 shell rgba(0x6060604a)"
+        );
+        assert_eq!(
+            dark.scrollbar_thumb,
+            rgba(0x6060604a),
+            "滚动条滑块亮暗同值"
+        );
+        assert_eq!(
+            light.scrollbar_thumb,
+            dark.scrollbar_thumb,
+            "滚动条滑块亮暗持同值（亮暗同值字段）"
+        );
     }
 
     #[gpui::test]

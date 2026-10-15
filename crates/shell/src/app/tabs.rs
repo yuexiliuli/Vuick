@@ -445,6 +445,8 @@ impl EditorApp {
         if self.tab_bar_hscroll.handle.max_offset().x > px(0.)
             && (*self.tab_bar_hscroll.visible.borrow() || hscroll_dragging)
         {
+            // 滑块底色取主题语义 token（ChromeColors::scrollbar_thumb，亮暗同值）。
+            let thumb = ChromeColors::for_mode(self.dark_mode).scrollbar_thumb;
             Some(
                 div()
                     .absolute()
@@ -456,6 +458,7 @@ impl EditorApp {
                     .child(horizontal_scrollbar(
                         &self.tab_bar_hscroll,
                         "tab-bar-hscroll",
+                        thumb,
                     ))
                     .into_any_element(),
             )

@@ -4,13 +4,13 @@
 //! ```ignore
 //! div().flex().flex_row().flex_1()
 //!     .child(scroll_container)      // .overflow_y_scroll().track_scroll(&handle)
-//!     .child(horizontal_scrollbar(&state, "scrollbar"))
+//!     .child(horizontal_scrollbar(&state, "scrollbar", thumb))
 //! ```
 //! 内容不超高/超宽时不显示；仅在可滚动时画一条淡轨道 + 圆角半透明滑块。
 
 use gpui::{
-    div, point, px, rgba, CursorStyle, ElementId, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, ScrollHandle, Styled,
+    div, point, px, CursorStyle, ElementId, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, Rgba, ScrollHandle, Styled,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -86,9 +86,11 @@ fn set_thumb_from_center(
 /// - 点击/拖动均可滑到对应位置（拖动用 `state.drag` 跨帧记录抓取点）。
 /// - 只画滑块、不画整条轨道：选项卡栏底边与编辑区交界处不要出现
 ///   “淡淡的灰色条状”（全宽半透明轨道），只用短滑块指示可滚/进度。
+/// - 滑块底色由调用方从 `ui::theme::ChromeColors::scrollbar_thumb` 传入（亮暗同值）。
 pub fn horizontal_scrollbar(
     state: &TableScrollState,
     id: impl Into<ElementId>,
+    thumb: Rgba,
 ) -> impl IntoElement {
     let handle = state.handle.clone();
     let drag = state.drag.clone();
@@ -111,7 +113,7 @@ pub fn horizontal_scrollbar(
                 .w(thumb_w)
                 .h(px(2.))
                 .rounded(px(1.))
-                .bg(rgba(0x6060604a)),
+                .bg(thumb),
         );
     }
 

@@ -84,16 +84,11 @@ impl EditorApp {
         self.chrome().bar_border.into()
     }
 
-    /// 区域分隔发丝线（config 配置、按明暗主题取色，**不透明** —— 半透明叠不同底色
-    /// 会混出各自的灰色，这里统一成全屏一致的发丝线；标题栏底 / 编辑区顶边 /
-    /// 侧栏右缘 / 状态栏边框共用）。
+    /// 区域分隔发丝线（`ChromeColors::hairline` 语义 token、按明暗主题取色，
+    /// **不透明** —— 半透明叠不同底色会混出各自的灰色，这里统一成全屏一致的发丝线；
+    /// 标题栏底 / 编辑区顶边 / 侧栏右缘 / 状态栏边框共用）。
     pub(super) fn hairline(&self) -> gpui::Hsla {
-        let hex = if self.dark_mode {
-            config::layout::SEPARATOR_DARK
-        } else {
-            config::layout::SEPARATOR_LIGHT
-        };
-        gpui::rgb(hex).into()
+        self.chrome().hairline.into()
     }
 
     /// 编辑器/预览面板背景（暗色主题用 config `EDITOR_BG_DARK` 统一底色）。
