@@ -69,6 +69,9 @@ impl Render for CodeEditor {
             fold_color: self.gutter_fg,
             fold_bg: self.fold_bg,
             active_line_bg: self.active_line_bg,
+            hscroll_px: self.hscroll_px(),
+            harea_w,
+            char_width: self.char_width.as_f32().max(1.),
         };
         let rv = std::rc::Rc::new(rv);
         let list_state = self.list_state.clone();
@@ -143,14 +146,14 @@ impl CodeEditor {
         let window_base = self.window_base;
         // 列表 item_ix 是窗口内**相对**下标：绝对行 = `window_base + ix`。行数据窗口
         // (`rv.lo..rv.rows`) 用绝对行，超出窗口/文档末尾（含底部预留区）渲染空行。
-        let content = list(list_state, move |ix, _window, _cx| {
+        let content = list(list_state, move |ix, window, _cx| {
             let abs = window_base + ix;
             let rd = if abs >= rv.lo && abs - rv.lo < rv.rows.len() {
                 &rv.rows[abs - rv.lo]
             } else {
                 &RowData::empty()
             };
-            row_element(rd, &rv).into_any_element()
+            row_element(rd, &rv, window).into_any_element()
         })
         // 关键：必须把 List 元素撑满容器（size_full → 视口=编辑器整块）。
         // 不加会走 List 的 Infer 测量——高度=内容高（一行 ~22px），视口≈0，
@@ -679,7 +682,11 @@ fn attach_input_actions(
 /// 折叠行/光标行的整行底色**不在本行**——已拆到独立背景叠层
 /// `CodeEditor::row_bg_overlay`（层级 = 标尺 < 行底色 < 括号竖线 < 文字/选区 < 行号，
 /// 否则不透明整行底色会把跨行括号竖线盖住，见 `bracket_guides_stay_visible_...`）。
-fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
+fn row_element(rd: &RowData, rv: &RowView, window: &mut Window) -> gpui::Div {
+    // 超长行窗口化的文本起点：短行 = 0（整行从行左缘开始）；超长行 = 裁剪子串在
+    // 行本地坐标的 x（真实前缀整形宽，见 `styled_row_text`）——横向滚动依赖该起点，
+    // 否则左缘被裁的内容会错误地顶到行首。
+    let (styled, text_x) = styled_row_text(rd, rv, window);
     div()
         .h(rv.line_height)
         .relative()
@@ -692,11 +699,11 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
             div()
                 .absolute()
                 .top(px(0.))
-                .left(px(0.))
+                .left(px(text_x))
                 .h(rv.line_height)
                 .font_family(rv.mono.clone())
                 .text_size(rv.font_size)
-                .child(styled_row_text(rd, rv)),
+                .child(styled),
         )
         .when(rd.caret.is_some(), |this| {
             this.child(
@@ -729,14 +736,199 @@ fn row_element(rd: &RowData, rv: &RowView) -> gpui::Div {
         })
 }
 
-fn styled_row_text(rd: &RowData, _rv: &RowView) -> StyledText {
+/// 超长行「横向窗口化」的触发下限（字节数）：短于它的行一律整行直送 `StyledText`，
+/// 不做窗口截取（避免为收益可忽略的行走「字符→宽度」换算与 `layout_width` 调用）。
+/// 有效触发阈值 = 行宽 > `可视窗宽 + 2×[`LONG_LINE_HVIEW_MARGIN_UNITS`] 余量`
+/// （见 [`styled_row_text`]：行在 `x_right` 内放得下即回落整行，None）。
+const LONG_LINE_HVIEW_MIN_CHARS: usize = 128;
+
+/// 超长行「横向窗口化」的可视窗两侧**过扫余量**（宽度单位，× 格宽 = px）：
+/// 裁剪左/右缘都取「可视窗 ± 余量」，再按**真实字形宽**（`layout_width`）落字符边界。
+/// 作用：①横滚时新字符提前入窗被整形（不出现“滚到边缘才突然出现”）；②Tab/emoji
+/// 等真实宽度大于单位估算的字符不会被边界截缺；③边界上的亚像素字形足够充裕。
+pub(crate) const LONG_LINE_HVIEW_MARGIN_UNITS: usize = 32;
+
+/// 超长行横滚窗口的截取结果（见 [`window_bytes_and_offset`]）。
+pub(crate) struct LongLineWindow {
+    /// 截取字节区间（行内，两端均落在 UTF-8 字符边界——绝不劈开多字节字符/emoji）。
+    pub(crate) bytes: Range<usize>,
+    /// 截取子串左侧在**行本地坐标**的 x（px）= 前缀字符的真实整形宽（`layout_width`
+    /// 逐字累加）——与 `row_layout`/光标 x 用的是同一真实字形宽口径：裁剪后文本与
+    /// 光标/命中坐标严格对齐（CJK 全角按真实字形宽而非 2× 格宽近似，深滚无累积漂移）。
+    pub(crate) offset_px: f32,
+}
+
+/// 超长行横向窗口化：行文本 + 合并后样式段 → 按「横向可视窗 ± 余量」截取子串进
+/// `StyledText`（左/右被裁部分**不参与 shape**），样式段同步平移收窄（首尾 run 被
+/// 截断则收窄范围、整体字节偏移减 `bytes.start`、裁剪边界外的 run 丢弃）。
+///
+/// - 仅对超过 [`LONG_LINE_HVIEW_MIN_CHARS`] **且**行宽超出可视窗（含余量）的行走
+///   窗口化：短行/未超窗行走 `window_bytes_and_offset` 返回 `None` → 原样整行直送，
+///   零额外开销（只多做一次长度判断与单位换算）。
+/// - 窗口按当前 `hscroll`（渲染期快照于 `RowView`）现算，每次横滚都随重绘更新；
+///   不给窗口/偏移加缓存层（任务约束），成本 = 一次「0 → 窗口右缘」的逐字宽累加
+///   （≤ 可视窗 + 2×余量字符数，与行总长无关的算术，远低于整行 shape）。
+/// - 返回 `(StyledText, 左偏移 px)`；`row_element` 用偏移定位子串，保持滚动几何。
+fn styled_row_text(rd: &RowData, rv: &RowView, window: &mut Window) -> (StyledText, f32) {
     // 咽喉点兜底：`rd.highlights()` 是行内字节区间（md 滤镜 / syntect 缓存 / 选区合并
     // 后），编辑→重析后行文本变短或区间按字节切进 CJK/emoji 多字节字符内部时，gpui
     // `StyledText::with_highlights` 的 `is_char_boundary(run.end)` debug_assert 会崩
     // （`elements/text.rs`，dev 构建 panic）。这里把每个段吸收到行文本的字符边界、
     // 钳入行尾、空段丢弃、段间不重叠——`StyledText` 永不看到坏区间。
-    let highlights = char_align_highlights(rd.content.text.as_ref(), rd.highlights());
-    StyledText::new(rd.content.text.clone()).with_highlights(highlights)
+    let text = rd.content.text.as_ref();
+    let highlights = char_align_highlights(text, rd.highlights());
+    if let Some(win) = long_line_window(
+        text,
+        rv.hscroll_px,
+        rv.harea_w,
+        rv.char_width,
+        &rv.mono,
+        rv.font_size,
+        window,
+    ) {
+        let LongLineWindow { bytes, offset_px } = win;
+        let cropped = SharedString::from(&text[bytes.clone()]);
+        let shifted = shift_highlights(&highlights, bytes.start, cropped.len());
+        let aligned = char_align_highlights(cropped.as_ref(), &shifted);
+        return (StyledText::new(cropped).with_highlights(aligned), offset_px);
+    }
+    (StyledText::new(rd.content.text.clone()).with_highlights(highlights), 0.)
+}
+
+/// 超长行横向窗口化的「计算侧」公共入口（`styled_row_text` 与测试探针共用，保证
+/// 测试走的就是生产同一条路径）：行文本 + 当前横滚/可视宽/格宽 + 字体 → 窗口子串。
+/// 阈值/余量/右缘判据集中于此（见 `window_bytes_and_offset`）。
+pub(crate) fn long_line_window(
+    text: &str,
+    hscroll_px: f32,
+    harea_w: f32,
+    char_width: f32,
+    mono: &SharedString,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Option<LongLineWindow> {
+    if text.len() <= LONG_LINE_HVIEW_MIN_CHARS
+        || harea_w <= 0.
+        || char_width <= 0.
+        || !char_width.is_finite()
+    {
+        return None;
+    }
+    let margin_px = LONG_LINE_HVIEW_MARGIN_UNITS as f32 * char_width;
+    let x_left = (hscroll_px - margin_px).max(0.);
+    let x_right = (hscroll_px + harea_w + margin_px).max(x_left + 1.);
+    let ts = window.text_system();
+    let font_id = ts.resolve_font(&gpui::font(mono.clone()));
+    // 逐字真实宽（TextSystem 单字整形缓存命中即 O(1)）；同字符连续段用备忘短路，
+    // 长同质行（minified "xxx…"）每帧只查一次字体。
+    let mut char_w = {
+        let mut last: Option<(char, f32)> = None;
+        move |ch: char| -> f32 {
+            if let Some((lc, lw)) = last
+                && lc == ch
+            {
+                return lw;
+            }
+            let w = ts.layout_width(font_id, font_size, ch).as_f32();
+            last = Some((ch, w));
+            w
+        }
+    };
+    window_bytes_and_offset(text, x_left, x_right, &mut char_w)
+}
+
+/// 纯函数（核心窗口算法）：给定「每字符渲染宽度」`char_w`，求横向窗口的字节区间与
+/// 左偏移。`x_left`/`x_right` = 行本地坐标的可见窗（含余量）。行程进入 `x_right`
+/// 内被完整放下 → 返回 `None`（整行直送）；否则返回覆盖 `[x_left, x_right)` 的
+/// 子串区间——起点取**第一个越过 `x_left` 右缘的字符**（部分可见的左缘字符整字
+/// 包含，不劈字），终点排他（**第一个起点 ≥ `x_right` 的字符**，其前的整字都含），
+/// 两端均落在 UTF-8 字符边界；`offset_px` = 前缀（`0..bytes.start`）真实宽累加。
+///
+/// 生产用 `text_system.layout_width` 真实字形宽；测试可用 `char_width_units` 等
+/// 宽度函数驱动，验证 CJK/emoji/短行/空行等边界（字符列↔字节换算沿用
+/// [`crate::buffer::char_width_units`] 同一宽度口径）。
+pub(crate) fn window_bytes_and_offset(
+    text: &str,
+    x_left: f32,
+    x_right: f32,
+    mut char_w: impl FnMut(char) -> f32,
+) -> Option<LongLineWindow> {
+    if text.is_empty() || x_right <= x_left {
+        return None;
+    }
+    let mut x = 0.0f32;
+    let mut byte = 0usize;
+    let mut start_byte = 0usize;
+    let mut start_x = 0.0f32;
+    let mut started = x_left <= 0.0;
+    for ch in text.chars() {
+        let ch_byte = byte;
+        byte += ch.len_utf8();
+        // 本字符起点已在窗右之外 → 其前内容即窗口，本字符（及其后）不参与。
+        if x >= x_right {
+            return if started {
+                Some(LongLineWindow {
+                    bytes: start_byte..ch_byte,
+                    offset_px: start_x,
+                })
+            } else {
+                // 防御：尚未锁定左缘却已到右缘（异常宽度输入），回落整行前缀。
+                Some(LongLineWindow {
+                    bytes: 0..ch_byte,
+                    offset_px: 0.0,
+                })
+            };
+        }
+        let w = char_w(ch);
+        if w <= 0.0 {
+            continue;
+        }
+        let x_after = x + w;
+        if !started && x_after > x_left {
+            start_byte = ch_byte;
+            start_x = x;
+            started = true;
+        }
+        if x_after > x_right {
+            // 本字符起点在窗内、宽度越过右缘（部分可见）→ 整字包含后收尾。
+            return if started {
+                Some(LongLineWindow {
+                    bytes: start_byte..byte,
+                    offset_px: start_x,
+                })
+            } else {
+                Some(LongLineWindow {
+                    bytes: 0..byte,
+                    offset_px: 0.0,
+                })
+            };
+        }
+        x = x_after;
+    }
+    None
+}
+
+/// 把整行（已对齐）样式段按窗口截取**平移收窄**：与 `[start, start+len)` 无关的段
+/// 丢弃；首/尾被截断的段把越界部分裁掉；剩余段字节偏移整体减 `start`（落在窗口
+/// 子串坐标系）。输出继续交给 [`char_align_highlights`] 做最终字符边界兜底。
+fn shift_highlights(
+    runs: &[(Range<usize>, HighlightStyle)],
+    crop_start: usize,
+    crop_len: usize,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let crop_end = crop_start + crop_len;
+    let mut out = Vec::with_capacity(runs.len());
+    for (r, style) in runs {
+        if r.end <= crop_start || r.start >= crop_end {
+            continue;
+        }
+        let rs = (r.start.max(crop_start) - crop_start).min(crop_len);
+        let re = (r.end.min(crop_end) - crop_start).min(crop_len);
+        if re > rs {
+            out.push((rs..re, *style));
+        }
+    }
+    out
 }
 
 /// 把「着色/滤镜段 +（可重叠的）选区底色」合并为**非重叠、总量不超订**的连续
@@ -1075,6 +1267,143 @@ impl Element for EditorElement {
         // 操作级实时计时结算：本帧若含未结算操作（ed_edit/ed_undo/ed_redo/ed_scroll…），
         // 在此以「开始→绘制完成」的墙钟 + 帧内阶段 breakdown 落地一行 OP 记录。
         crate::prof::op_finish_after_paint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::char_width_units;
+
+    /// 把 `char_width_units`（空格=1/Tab=4/CJK=2）转成「每字符 px」驱动窗口算法——
+    /// 与生产 `layout_width` 同一「字符→宽度」映射口径，纯算术、无需真实字体。
+    fn units_w(ch: char) -> f32 {
+        char_width_units(ch) as f32
+    }
+
+    #[test]
+    fn window_ascii_slices_by_columns() {
+        let text = "x".repeat(200);
+        // 窗 [50, 150)：逐字宽 1，起点 = 越过 50 右缘的首字符（x=50），终点排他 = 起点 ≥ 150。
+        let w = window_bytes_and_offset(&text, 50., 150., units_w).unwrap();
+        assert_eq!(w.bytes, 50..150, "ASCII 字宽 1 → 字节=列");
+        assert_eq!(w.offset_px, 50., "左偏移 = 前缀真实宽");
+        // 起点落在字符右缘上（x_after == x_left → 该字符整字在窗内，下个字符起点 = x_left）。
+        let w = window_bytes_and_offset(&text, 100., 140., units_w).unwrap();
+        assert_eq!(w.bytes, 100..140);
+        assert_eq!(w.offset_px, 100.);
+    }
+
+    #[test]
+    fn window_falls_back_when_line_fits() {
+        // 行短于/等于可视窗右缘 → None（整行直送，不窗口化）。
+        assert!(window_bytes_and_offset("abc", 0., 10., units_w).is_none());
+        assert!(window_bytes_and_offset("abc", 2., 5., units_w).is_none());
+        // 空行 / 空窗 → None。
+        assert!(window_bytes_and_offset("", 0., 10., units_w).is_none());
+        assert!(window_bytes_and_offset("abc", 5., 2., units_w).is_none());
+    }
+
+    #[test]
+    fn window_starts_at_line_head_for_left_edge() {
+        // x_left ≤ 0（没往右滚 / 滚回行首）→ 从字节 0 起，不丢行首内容。
+        let w = window_bytes_and_offset("abcdef", 0., 3., units_w).unwrap();
+        assert_eq!(w.bytes, 0..3);
+        assert_eq!(w.offset_px, 0.);
+        let w = window_bytes_and_offset("abcdef", -10., 4., units_w).unwrap();
+        assert_eq!(w.bytes, 0..4);
+        assert_eq!(w.offset_px, 0.);
+    }
+
+    #[test]
+    fn window_cjk_keeps_char_boundaries() {
+        // 中文每字 2 格（3 字节）。窗 [10, 30)：第 5 字（单位起点 10，越过 10 右缘）起、
+        // 下一字起点 ≥ 30（第 15 字）止 → 字节 5*3 .. 15*3，偏移 = 前缀真实宽 10。
+        let text = "中".repeat(30);
+        let w = window_bytes_and_offset(&text, 10., 30., units_w).unwrap();
+        assert_eq!(w.bytes, 15..45, "CJK 窗起点/终点都落在 UTF-8 字符边界");
+        assert_eq!(w.offset_px, 10.);
+        // 起始位置切在某个「中」中间（单位 11）→ 整字包含、起点抬到该字开头。
+        let w = window_bytes_and_offset(&text, 11., 31., units_w).unwrap();
+        assert_eq!(w.bytes, 15..48, "不劈开 CJK：起点落到包含 11 的首字（单位 10）");
+        // 结束位置落在字中间（29）→ 终点止于「起点 ≥ 29」的下一字（单位 30 起），
+        // 之前整字（第 14 字，单位 [28,30) 部分可见）全含 → 字节 0 .. 15*3。
+        let w = window_bytes_and_offset(&text, 0., 29., units_w).unwrap();
+        assert_eq!(w.bytes, 0..45, "不劈开 CJK：终点止于起点 ≥ 29 的首字前");
+    }
+
+    #[test]
+    fn window_emoji_survives_multibyte_utf8() {
+        // 🍎 4 字节/字、宽 2 格。窗 [6, 14)：起点 = 首字「终点 > 6」= 第 3 字（单位 [6,8)），
+        // 终点 = 首字「起点 ≥ 14」= 第 7 字（单位 [14,16)）→ 字节 3*4 .. 7*4。
+        let text = "🍎".repeat(20);
+        let w = window_bytes_and_offset(&text, 6., 14., units_w).unwrap();
+        assert_eq!(w.bytes, 12..28, "emoji 4 字节不被劈开");
+        assert_eq!(w.offset_px, 6.);
+        // 窗切进 emoji 字节内部（如 9）→ 起点抬到整字（第 4 字单位 [8,10)），
+        // 终点止于起点 ≥ 15 的首字（第 7 字单位 [14,16) 起 14<15，含；第 8 字不含）。
+        let w = window_bytes_and_offset(&text, 9., 15., units_w).unwrap();
+        assert_eq!(w.bytes, 16..32);
+        assert_eq!(w.offset_px, 8.);
+    }
+
+    #[test]
+    fn window_mixed_ascii_cjk_offset_is_prefix_width() {
+        // "a中b中c"：宽 1/2/1/2/1。窗 [2, 4)：`中`(1..3) 越过 2 → 起于 '中'；
+        // `中`(4..6) 起点 4 ≥ 4 → 止于其前 → 字节 1..5（"中b"），偏移 = 'a' 宽 1。
+        let w = window_bytes_and_offset("a中b中c", 2., 4., units_w).unwrap();
+        assert_eq!(w.bytes, 1..5);
+        assert_eq!(w.offset_px, 1.);
+    }
+
+    #[test]
+    fn window_zero_width_char_at_head_is_kept() {
+        // 组合字符（生产 `layout_width` 真实整形宽 ≈ 0）在行首：x_left≤0 → 从 0 起，
+        // 组合字符随首字一起入窗（不劈开序列、不把前缀组合字丢弃）。
+        let text = "e\u{301}x"; // e(1B) + 组合重音(2B、≈0 宽) + x(1B) = 4 字节
+        let w = window_bytes_and_offset(text, 0., 1.5, |ch| {
+            if ch == '\u{301}' {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .unwrap();
+        assert_eq!(w.bytes, 0..4, "行首组合字符随首字一起入窗");
+        assert_eq!(w.offset_px, 0.);
+    }
+
+    #[test]
+    fn shift_highlights_clips_and_translates_runs() {
+        // 整行 runs：跨窗/窗内/窗外（右）。
+        let s = HighlightStyle::default();
+        let runs = vec![(0..10, s), (8..20, s), (100..110, s)];
+        let out = shift_highlights(&runs, 5, 10); // 窗 [5, 15)
+        assert_eq!(out, vec![(0..5, s), (3..10, s)], "首段收窄+平移、窗内段平移、窗外段丢弃");
+        // 空窗不产出。
+        assert!(shift_highlights(&runs, 20, 0).is_empty());
+    }
+
+    /// 效果证据（纯算法层，真实字体路径见 `tests/view.rs` 同名集成测试）：200k 单行
+    /// 窗口化产出的文本长度 ≈ 可视窗口（远小于整行 200k）。
+    #[test]
+    fn window_200k_line_shapes_only_visible_span() {
+        let text = "x".repeat(200_000);
+        // 可视窗 ≈ 80 列（宽 80）+ 过扫余量：产物 ≈ 80 + 2×16 字 = 112 字量级。
+        let w = window_bytes_and_offset(&text, 0., 80., units_w).unwrap();
+        let len = w.bytes.end - w.bytes.start;
+        assert!(
+            len < 200 && len > 50,
+            "200k 行走窗口化后产出的文本应 ≈ 可视窗（len={len}）"
+        );
+        // 深滚到 ~100k 列：窗口仍只覆盖可视段，左/右被裁部分不入窗（不做整行整形）。
+        let w = window_bytes_and_offset(&text, 100_000., 100_080., units_w).unwrap();
+        let len = w.bytes.end - w.bytes.start;
+        assert!(
+            len < 200 && len > 50,
+            "深滚 100k 后窗口文本应仍 ≈ 可视窗（len={len}）"
+        );
+        assert_eq!(w.offset_px, 100_000., "深滚左偏移 = 前缀宽");
     }
 }
 

@@ -273,6 +273,14 @@ struct RowView {
     /// 光标所在行（持焦且 head 落行内）整行高亮底（=`colors.editor_active_line_bg`，
     /// 与折叠行同色，见 `refresh_metrics`）。
     active_line_bg: Hsla,
+    /// 当前横向滚动像素（内容被推向左的量，见 [`CodeEditor::hscroll_px`]）——
+    /// 超长行「横向窗口化」按它裁剪行文本（宽度限于可视窗 ± 余量，见
+    /// `render::styled_row_text`）。渲染期快照，不入行缓存。
+    hscroll_px: f32,
+    /// 文本区可视宽（px，= `compute_content_width` 的 `harea_w`）——窗口化右缘依据。
+    harea_w: f32,
+    /// 等宽格宽（px）——窗口化余量 px 换算用（`char_width_units` 同一格宽口径）。
+    char_width: f32,
 }
 
 /// 固定窗口虚拟化：ListState **不再持有全文 N 条目的 O(N) 树**（126MB / 3.2M 行/// 白占 ~300MB）。改为 ListState 恒持 [`LIST_WINDOW_ROWS`] 条「窗口」，滚动位置由
@@ -2142,6 +2150,36 @@ impl CodeEditor {
     /// 测试用：光标所在宽度单位列（与横向 reveal 相同口径）。
     pub fn test_caret_units(&self) -> usize {
         self.buffer.unit_column(self.selection.head().min(self.buffer.len()))
+    }
+
+    /// 测试用：逻辑行 `row` 在当前横滚/可视宽下走**生产同一条**超长行窗口化路径
+    /// （`render::long_line_window`，真实字体 `layout_width`）的截取结果
+    /// `(行内字节区间, 左偏移 px)`；短行/未超窗/空行 → `None`（整行直送）。
+    /// 供「超长行产出文本 ≈ 可视窗口（远小于整行）」的效果断言与横滚更新断言。
+    #[cfg(test)]
+    pub(crate) fn test_row_window_slice(
+        &self,
+        window: &mut Window,
+        row: usize,
+    ) -> Option<(Range<usize>, f32)> {
+        if row >= self.buffer.line_count() {
+            return None;
+        }
+        let text = self.buffer.line_text(row);
+        let harea_w = (self.element_bounds.size.width.as_f32()
+            - self.gutter_width_px.as_f32())
+        .max(0.);
+        let char_width = self.char_width.as_f32().max(1.);
+        render::long_line_window(
+            text.as_ref(),
+            self.hscroll_px(),
+            harea_w,
+            char_width,
+            &self.mono,
+            self.font_size,
+            window,
+        )
+        .map(|w| (w.bytes, w.offset_px))
     }
 }
 

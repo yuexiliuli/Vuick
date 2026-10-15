@@ -2557,3 +2557,108 @@ fn quick_scroll_progressive_fill_reaches_full_color(cx: &mut TestAppContext) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 超长行横向窗口化（见 `view::render::styled_row_text` / `long_line_window`）
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+fn long_line_windows_to_visible_span(cx: &mut TestAppContext) {
+    // 效果证据（真实渲染路径，`test_row_window_slice` 走生产同一 `long_line_window`）：
+    // 200k 单行走窗口化后产出的文本长度 ≈ 可视窗口（远小于整行 200k），且随横滚
+    // 左偏移跟随 hscroll（窗口更新不依赖新增缓存层，横滚即重绘）。
+    let text = "x".repeat(200_000);
+    let (host, cx) = open(cx, &text);
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    let (cw, _, _) = cx.update(|_, cx| ed.read(cx).test_metrics());
+    let visible = cx.update(|_, cx| ed.read(cx).test_visible_chars());
+
+    // 未横滚：窗口从行首起、文本长 ≈ 可视窗（+过扫余量），远小于整行 200k。
+    let w0 = cx
+        .update(|window, cx| ed.read(cx).test_row_window_slice(window, 0))
+        .expect("200k 行应触发窗口化");
+    let len0 = w0.0.end - w0.0.start;
+    assert_eq!(w0.0.start, 0, "未横滚时窗口应始于行首");
+    assert_eq!(w0.1, 0., "未横滚时左偏移应为 0");
+    assert!(
+        (20..2000).contains(&len0),
+        "窗口文本应 ≈ 可视窗且 ≪ 200k（len={len0}，可视≈{visible}）"
+    );
+    assert!(
+        len0 as f32 >= (visible as f32) * 0.5,
+        "窗口至少覆盖大半可视窗（len={len0} visible={visible}）"
+    );
+
+    // 横向滚 ~5000px → 窗口跟随，左偏移 ≈ 已滚像素（±可视窗/格），文本仍 ≈ 可视窗。
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + 50.),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(5_000.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(cx);
+    let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(hscroll > 1000., "应已横向滚动（hscroll={hscroll}）");
+    let w1 = cx
+        .update(|window, cx| ed.read(cx).test_row_window_slice(window, 0))
+        .expect("横滚后仍应窗口化");
+    let len1 = w1.0.end - w1.0.start;
+    assert!(
+        (20..2000).contains(&len1),
+        "横滚后窗口仍 ≈ 可视窗、≪ 行（len={len1}）"
+    );
+    assert!(w1.0.start > 0, "横滚后窗口应整体右移（start={}", w1.0.start);
+    assert!(
+        (w1.1 - hscroll).abs() <= (visible as f32) * cw,
+        "窗口左偏移应跟随 hscroll（offset={:.0} hscroll={hscroll:.0} 可视px≈{:.0}）",
+        w1.1,
+        (visible as f32) * cw
+    );
+}
+
+#[gpui::test]
+fn long_line_cjk_window_offset_matches_real_layout(cx: &mut TestAppContext) {
+    // 行为等价守卫：CJK 全角字真实字形宽 ≠ 2×格宽（Consolas 回退字形），窗口化若按
+    // 「格宽×列」估算左偏移会在深滚时产生累积漂移、光标与文字错位。断言窗口偏移与
+    // 整行真实整形宽（`row_layout` x_for_index，光标/命中同一口径）一致 → 裁剪文本
+    // 与光标坐标严格对齐；窗口字节区间两端落在字符边界（不劈开 UTF-8）。
+    let cjk = "一".repeat(4000); // 4000 全角 = 8000 单位 = 12000 字节（远超可视窗）
+    let (host, cx) = open(cx, &cjk);
+    settle(cx);
+    let ed = cx.update(|_, cx| host.read(cx).ed.clone());
+    // 滚到行中部（非量程尾，避免「整行已在可视窗内 → 回落整行」的退化分支）。
+    let ed_b = cx.debug_bounds("code-editor").expect("编辑区应渲染");
+    let pos = point(
+        px(ed_b.origin.x.as_f32() + 200.),
+        px(ed_b.origin.y.as_f32() + 50.),
+    );
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: pos,
+        delta: gpui::ScrollDelta::Pixels(point(px(2_000.), px(0.))),
+        modifiers: Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    settle(cx);
+    let hscroll = cx.update(|_, cx| ed.read(cx).test_hscroll_px());
+    assert!(hscroll > 500., "应已滚入行内（hscroll={hscroll}）");
+    let w = cx
+        .update(|window, cx| ed.read(cx).test_row_window_slice(window, 0))
+        .expect("中部滚动应触发窗口化");
+    assert!(w.0.start > 0, "窗口应始于行内（start={}", w.0.start);
+    let real_start_x = cx
+        .update(|window, cx| ed.read(cx).test_char_boundary_x(window, 0, w.0.start));
+    assert!(
+        (w.1 - real_start_x).abs() < 0.6,
+        "窗口左偏移应与整行真实整形宽一致（offset={:.2} real={real_start_x:.2}）",
+        w.1
+    );
+    // 裁剪两端均在字符边界（不劈开 CJK）→ 窗口末字节也应在边界上。
+    let line = cx.update(|_, cx| host.read(cx).ed.read(cx).text_string());
+    assert!(line.is_char_boundary(w.0.start) && line.is_char_boundary(w.0.end));
+}
+
