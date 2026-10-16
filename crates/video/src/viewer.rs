@@ -1058,7 +1058,16 @@ impl VideoViewer {
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
-        self.playing = !self.playing;
+        // 停在结尾（顺序模式自然播完：`playhead` 已 == `duration`）时点播放 → 立即 seek 0
+        // 重播（YouTube/mpv/VLC 标准行为）。若只翻 `playing` 不 seek，下一拍
+        // `advance_playhead` 会再次撞上结尾判定把 playhead 钉回结尾、`handle_end` 又停住，
+        // 点播放看起来无效。—— seek 走既有路径（playhead 归零 + 解码换代 + 重开音轨）。
+        if !self.playing && self.duration > 0.0 && self.playhead >= self.duration {
+            self.seek(-self.playhead, cx);
+            self.playing = true; // seek 时仍为暂停态（不提前出声），置播放后统一恢复
+        } else {
+            self.playing = !self.playing;
+        }
         if self.playing {
             self.last_tick = None; // 恢复播放不随暂停跳变
             self.ensure_pump(cx);
@@ -2830,6 +2839,94 @@ mod tests {
         assert_eq!(s.1, 0, "顺序播放不切文件");
         assert_eq!(s.2, 2.0, "playhead 停在结尾");
         cx.run_until_parked();
+    }
+
+    // ---- 结尾重播 ----
+
+    /// 停在结尾（顺序模式自然播完：playhead == duration、playing=false）点播放 →
+    /// 立即 seek 0 重播：playhead 归零、playing 转 true、pump 需要继续跑。
+    #[gpui::test]
+    async fn toggle_play_at_end_replays_from_zero(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 2.0;
+            v.playhead = 2.0; // 停在结尾（advance_playhead 会把它钉死在 duration）
+            v
+        }));
+        let s = ent.update(cx, |v, cx| {
+            v.toggle_play(cx);
+            (v.playhead, v.playing, v.pump_wanted())
+        });
+        assert_eq!(s.0, 0.0, "结尾重播应 seek 到 0（必须真归零，不只翻播放标志）");
+        assert!(s.1, "结尾重播后应处于播放状态");
+        assert!(s.2, "结尾重播后播放泵应持续运行（pump_wanted 为 true）");
+        cx.run_until_parked(); // 让 seek 起的解码 worker / 泵任务收尾（夹具路径解码在后台落错误占位）
+    }
+
+    /// 普通暂停/播放切换的行为不变：中途暂停后点播放 → 从当前位置续播，playhead 不归零。
+    /// 同时覆盖 `duration <= 0`（未知时长）时不触发重播分支、维持现状翻转。
+    #[gpui::test]
+    async fn toggle_play_midstream_resumes_without_replay(cx: &mut TestAppContext) {
+        // 中途暂停续播：不归零
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 2.0;
+            v.playhead = 1.0; // 中途
+            v.playing = false;
+            v
+        }));
+        let s = ent.update(cx, |v, cx| {
+            v.toggle_play(cx);
+            (v.playhead, v.playing)
+        });
+        assert_eq!(s.0, 1.0, "中途续播不应归零");
+        assert!(s.1, "中途续播应继续播放");
+        // duration <= 0（未知时长）：不触发重播分支（playhead 即使 >= duration 也不 seek）
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 0.0;
+            v.playhead = 1.0; // 假装远超 0 也没已知结尾
+            v.playing = false;
+            v
+        }));
+        let s = ent.update(cx, |v, cx| {
+            v.toggle_play(cx);
+            (v.playhead, v.playing)
+        });
+        assert_eq!(s.0, 1.0, "duration<=0 不应触发重播 seek");
+        assert!(s.1, "duration<=0 应走正常播放翻转");
+        cx.run_until_parked();
+    }
+
+    /// 端到端状态链，复现「播完点播放看起来无效」的完整 bug 过程：结尾前一拍 tick 自然
+    /// 播完（advance_playhead 把 playhead 钉在 duration、playing 转 false、handle_end 顺序
+    /// 模式停住）→ 此时点播放键 → 应立即 seek 到 0 并保持播放，而不是又被钉回结尾。
+    #[gpui::test]
+    async fn natural_end_then_toggle_play_replays(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 2.0;
+            v.playhead = 1.98; // 结尾前一拍
+            v.playing = true;
+            v.last_tick = Some(Instant::now() - Duration::from_millis(100)); // 下一拍 dt=100ms
+            v
+        }));
+        ent.update(cx, |v, cx| {
+            v.tick(cx);
+        });
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.playhead, v.playing)
+        });
+        assert_eq!(s.0, 2.0, "自然播完应停住且 playhead 钉在结尾");
+        assert!(!s.1, "自然播完后 playing 应为 false");
+        let s = ent.update(cx, |v, cx| {
+            v.toggle_play(cx);
+            (v.playhead, v.playing)
+        });
+        assert_eq!(s.0, 0.0, "停在结尾点播放应 seek 归零");
+        assert!(s.1, "停在结尾点播放后应自动重播");
+        cx.run_until_parked(); // 让 seek 起的解码 worker / 泵任务收尾
     }
 
     // ---- M6：截图当前帧存 PNG ----
