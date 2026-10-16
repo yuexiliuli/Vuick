@@ -13,7 +13,7 @@
 //! `LIBCLANG_PATH`（bindgen 用）。开发机一键装填见 `scripts/setup-ffmpeg.ps1`。
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use anyhow::{Context as _, Result, anyhow};
 
@@ -26,6 +26,17 @@ use ffmpeg::media::Type;
 /// 调用**（open / seek / next_frame / next_pcm）都过此互斥量串行；单次操作毫秒级，
 /// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
 static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
+
+/// FFmpeg 日志级别一次性收敛到 `Error`（进程内仅执行一次）：ffmpeg 默认 `Warning` 会把
+/// 大量良性抖动打到 stderr（如 mp4/mov 的 `udta` 盒布局异常 → `UDTA parsing failed
+/// retrying raw` 后仍能正常播放）。保留 `Error` 级让真正解码错误仍可见。用独立
+/// `Once` 保证幂等（早于首次 open 由播放线程触发）。
+static FFMPEG_LOG_QUIET: Once = Once::new();
+fn quiet_ffmpeg_log_once() {
+    FFMPEG_LOG_QUIET.call_once(|| {
+        ffmpeg::log::set_level(ffmpeg::log::Level::Error);
+    });
+}
 
 // ---------------- 硬件解码（D3D11VA / DXVA2）----------------
 
@@ -203,6 +214,7 @@ impl AudioReader {
 
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
+        quiet_ffmpeg_log_once();
         let ictx = ffmpeg::format::input(path)
             .with_context(|| format!("打开媒体失败: {}", path.display()))?;
         let stream = ictx
@@ -413,6 +425,7 @@ impl VideoReader {
     fn open_scaled_impl(path: &Path, max_dim: u32, hw_required: bool) -> Result<Self> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
+        quiet_ffmpeg_log_once();
 
         let ictx = ffmpeg::format::input(path)
             .with_context(|| format!("打开媒体失败: {}", path.display()))?;
