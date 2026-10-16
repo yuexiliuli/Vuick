@@ -53,17 +53,18 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle,
-    ScrollWheelEvent, StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div,
-    img, px, prelude::FluentBuilder as _,
+    AnimationExt, App, Bounds, Context, CursorStyle, DefiniteLength, Hsla, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement, Pixels, Point, Render, RenderImage, ScrollHandle, ScrollWheelEvent,
+    StatefulInteractiveElement, Styled, StyledImage, Window, canvas, div, img, px,
+    prelude::FluentBuilder as _,
 };
 use image::{Frame, RgbaImage};
 
 use ui::button::Button;
 use ui::button::ButtonVariants as _;
 use ui::icon::{Icon, IconName};
+use ui::motion::hover_spring;
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
@@ -98,6 +99,10 @@ const VOLUME_STEP: f32 = 0.1;
 /// 底部控制条预留高度（px）：视频 contain 适配到「视口高 − 此值」，避免画面底部被
 /// 浮层控制条遮住。值略大于控制条实际高度（py 8×2 + 按钮 28 ≈ 44）。
 const CONTROL_BAR_H: f32 = 52.0;
+/// 玻璃拟态浮层透明度（控制条 / toast / 占位卡共用；基于 theme `surface` token 派生
+/// alpha，亮/暗各自一档——半透明才能透出视频画面，同时保留文字对比）。
+const GLASS_PANEL_ALPHA_LIGHT: f32 = 0.80;
+const GLASS_PANEL_ALPHA_DARK: f32 = 0.72;
 /// 右上角瞬时状态浮层（截图结果提示等）的显示时长（ms），到期自动清除。
 const STATUS_MS: u64 = 2500;
 
@@ -1389,16 +1394,40 @@ impl VideoViewer {
         }
     }
 
-    /// 居中占位文本（加载中 / 加载失败共用）：铺满画布再 flex 居中。
-    fn placeholder(text: &str, color: Hsla) -> gpui::AnyElement {
+    /// 居中占位玻璃卡（加载中 / 加载失败共用）：铺满画布再 flex 居中，信息收敛在
+    /// 半透明圆角卡内（与 toast / 控制条同一套玻璃样式）。
+    fn placeholder(text: &str, color: Hsla, cx: &App) -> gpui::AnyElement {
+        let theme = ui::theme::Theme::global(cx);
+        let dark = theme.is_dark();
+        let surface: Hsla = theme.colors.surface.into();
+        let border: Hsla = theme.colors.border.into();
         div()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(14.))
-            .text_color(color)
-            .child(text.to_string())
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(surface.opacity(if dark {
+                        GLASS_PANEL_ALPHA_DARK
+                    } else {
+                        GLASS_PANEL_ALPHA_LIGHT
+                    }))
+                    .border_1()
+                    .border_color(border)
+                    .shadow(vec![
+                        gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.16))
+                            .blur_radius(px(12.)),
+                        gpui::BoxShadow::new(px(0.), px(1.), gpui::hsla(0., 0., 0., 0.12))
+                            .blur_radius(px(3.)),
+                    ])
+                    .text_size(px(14.))
+                    .text_color(color)
+                    .child(text.to_string()),
+            )
             .into_any_element()
     }
 
@@ -1456,7 +1485,7 @@ impl VideoViewer {
     /// `controls_auto.visible()` 时渲染整条，隐藏时是透明热区——hover **只挂在这根条带**上（进入即
     /// 浮现且不隐藏，离开 1s 后自隐；鼠标在条带之外的画面区域不触发，锁定的初始自隐不会被
     /// 画面内停留的鼠标打断）。
-    fn control_bar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn control_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let strip = div()
             .id("video-controls")
             .absolute()
@@ -1470,9 +1499,10 @@ impl VideoViewer {
             return strip.into_any_element();
         }
         let colors = ui::theme::Theme::global(cx).colors;
+        let dark = ui::theme::Theme::global(cx).is_dark();
         let fg: Hsla = colors.fg.into();
         let muted: Hsla = colors.fg_muted.into();
-        let surface: Hsla = colors.surface.into();
+        let border: Hsla = colors.border.into();
         let accent: Hsla = colors.accent.into();
         let entity = cx.entity();
 
@@ -1483,6 +1513,7 @@ impl VideoViewer {
             muted,
             accent,
             true,
+            window,
             cx,
         );
         let vol_strip = Self::strip_element(
@@ -1492,6 +1523,7 @@ impl VideoViewer {
             muted,
             accent,
             false,
+            window,
             cx,
         );
 
@@ -1518,8 +1550,25 @@ impl VideoViewer {
             IconName::Volume
         };
 
+        // 玻璃拟态：半透明面板（透出视频）+ 顶部直角 + 细边框 +
+        // 上抛柔和投影（矩阵浮层风格）。面板底色固定 #191a1b（用户指定，非 theme token），
+        // 仍保留半透明 alpha（亮/暗各一档）。纯视觉，不碰 seek/vol 坐标与交互路径。
+        let panel = gpui::hsla(210., 0.04, 0.102, 1.0).opacity(if dark {
+            GLASS_PANEL_ALPHA_DARK
+        } else {
+            GLASS_PANEL_ALPHA_LIGHT
+        });
         strip
-            .bg(surface)
+            .bg(panel)
+            .border_1()
+            .border_color(border)
+            .shadow(vec![
+                gpui::BoxShadow::new(px(0.), px(-6.), gpui::hsla(0., 0., 0., 0.18))
+                    .blur_radius(px(16.)),
+                gpui::BoxShadow::new(px(0.), px(-2.), gpui::hsla(0., 0., 0., 0.14))
+                    .spread_radius(px(-1.))
+                    .blur_radius(px(4.)),
+            ])
             .flex()
             .items_center()
             .gap_x(px(8.))
@@ -1566,6 +1615,7 @@ impl VideoViewer {
                 let entity = entity.clone();
                 Button::new("video-mode")
                     .ghost()
+                    .rounded_full()
                     .label(self.playback_mode.label())
                     .w(px(44.))
                     .h(px(28.))
@@ -1578,6 +1628,7 @@ impl VideoViewer {
                 let entity = entity.clone();
                 Button::new("video-speed")
                     .ghost()
+                    .rounded_full()
                     .label(format!("{:.2}×", self.speed))
                     .w(px(40.))
                     .h(px(28.))
@@ -1603,9 +1654,10 @@ impl VideoViewer {
             .into_any_element()
     }
 
-    /// 可交互横向条（seek 进度条 / 音量条共用）：轨道 + 填充（宽度=分数×父宽）+ 无绘制
-    /// canvas 记录**窗口坐标**盒到 `bounds`（渲染期写入；事件回调读）。`seek=true`
-    /// 时 `flex_1` 拉伸并走 seek 处理器，否则固定宽走音量处理器。
+    /// 可交互横向条（seek 进度条 / 音量条共用）：玻璃细轨 + 主色填充 + hover 放大 thumb。
+    /// 轨道视觉厚度从 16px 收到 4px（交互热区仍是 16px，`bounds` 盒不变），canvas 记录
+    /// **窗口坐标**盒到 `bounds`（渲染期写入；事件回调读）。`seek=true` 时 `flex_1`
+    /// 拉伸并走 seek 处理器，否则固定宽走音量处理器。
     fn strip_element(
         id: &'static str,
         bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -1613,30 +1665,76 @@ impl VideoViewer {
         track: Hsla,
         fill: Hsla,
         seek: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let f = fraction.clamp(0.0, 1.0);
+        // 元素级 hover 态：只驱动 thumb 放大/淡入（native 按钮同款姿势），不碰
+        // seek/vol 已有的 on_mouse_down/on_mouse_move 交互路径。
+        let hover_flag = window.use_keyed_state(format!("{id}-hover"), cx, |_, _| false);
+        let hovered = *hover_flag.read(cx);
+        let view_id = window.current_view();
         let mut el = div()
             .id(id)
             .h(px(16.))
             .relative()
             .cursor(CursorStyle::PointingHand)
+            .on_hover({
+                let flag = hover_flag.clone();
+                move |hovered, _w, cx| {
+                    flag.update(cx, |v, _| *v = *hovered);
+                    cx.notify(view_id);
+                }
+            })
             .child(
+                // 玻璃细轨（4px 半透明）+ 主色填充 + hover thumb：thumb 圆心始终对准
+                // 填充末端（= 播放位置）；大小/偏移/透明度共用同一 0..1 弹簧值，增大的
+                // 同时圆心不漂移（top/right 由尺寸反推）。
                 div()
                     .absolute()
                     .inset_0()
-                    .rounded_full()
-                    .bg(track),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(DefiniteLength::Fraction(f))
-                    .rounded_full()
-                    .bg(fill),
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .relative()
+                            .h(px(4.))
+                            .rounded_full()
+                            .bg(track.opacity(0.30))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(DefiniteLength::Fraction(f))
+                                    .rounded_full()
+                                    .bg(fill)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .with_spring(
+                                                format!("{id}-thumb"),
+                                                hover_spring(if hovered { 1.0 } else { 0.0 }),
+                                                {
+                                                    let fill = fill;
+                                                    move |this, v| {
+                                                        let s = 4.0 + 6.0 * v;
+                                                        this.w(px(s))
+                                                            .h(px(s))
+                                                            // 垂直居中：轨道半高 2px − 半径 s/2
+                                                            .top(px(2.0 - s / 2.0))
+                                                            // 圆心对准填充末端：右缘外扩 s/2
+                                                            .right(px(-s / 2.0))
+                                                            .opacity(0.15 + 0.85 * v)
+                                                            .bg(fill)
+                                                    }
+                                                },
+                                            ),
+                                    ),
+                            ),
+                    ),
             )
             .child(canvas(
                 move |b, _w, _app| {
@@ -1725,6 +1823,7 @@ impl Render for VideoViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let canvas = self.bg.unwrap_or_else(|| Self::default_canvas(cx));
         let theme = ui::theme::Theme::global(cx);
+        let is_dark = theme.is_dark();
         let muted: Hsla = theme.colors.fg_muted.into();
         // 状态浮层（右上角）配色：Copy 抽出，避免在 `control_bar(&mut cx)` 之后借用 theme
         let toast_surface: Hsla = theme.colors.surface.into();
@@ -1756,7 +1855,7 @@ impl Render for VideoViewer {
             }
         }
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
-            Self::placeholder(&format!("无法打开视频：{err}"), muted)
+            Self::placeholder(&format!("无法打开视频：{err}"), muted, cx)
         } else {
             match (self.frame.clone(), self.intrinsic) {
                 (Some(render), Some((iw, ih))) => {
@@ -1780,9 +1879,9 @@ impl Render for VideoViewer {
                         .into_any_element()
                 }
                 (_, _) if self.playing || self.loading => {
-                    Self::placeholder("正在打开视频…", muted)
+                    Self::placeholder("正在打开视频…", muted, cx)
                 }
-                _ => Self::placeholder("暂停", muted),
+                _ => Self::placeholder("暂停", muted, cx),
             }
         };
 
@@ -1822,17 +1921,34 @@ impl Render for VideoViewer {
             root = root.child(
                 div()
                     .absolute()
-                    .top_2()
-                    .right_2()
+                    .top_3()
+                    .right_3()
                     .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_lg()
                     .border_1()
                     .border_color(toast_border)
-                    .bg(toast_surface)
+                    // 玻璃卡片：半透明表面 + 圆角 + 高光内阴影；出现时短弹簧淡入（收敛即静止，
+                    // 无持续重绘）。消失仍由 `STATUS_MS` 到期卸载，不做离场动画。
+                    .bg(toast_surface.opacity(if is_dark {
+                        GLASS_PANEL_ALPHA_DARK
+                    } else {
+                        GLASS_PANEL_ALPHA_LIGHT
+                    }))
+                    .shadow(vec![
+                        gpui::BoxShadow::new(px(0.), px(4.), gpui::hsla(0., 0., 0., 0.18))
+                            .blur_radius(px(10.)),
+                        gpui::BoxShadow::new(px(0.), px(1.), gpui::hsla(0., 0., 0., 0.14))
+                            .blur_radius(px(2.)),
+                    ])
                     .text_size(px(12.))
                     .text_color(toast_fg)
-                    .child(text.clone()),
+                    .child(text.clone())
+                    .with_spring(
+                        "video-toast-fade",
+                        hover_spring(1.0).from(0.0),
+                        |this, v| this.opacity(v),
+                    ),
             );
         }
         root
@@ -1850,6 +1966,8 @@ fn control_icon_button(
 ) -> gpui::AnyElement {
     Button::new(id)
         .ghost()
+        // 圆形 hover 底：靠 `Button` 自带的选定/按压 backplate 弹簧打在圆内高亮
+        .rounded_full()
         .w(px(28.))
         .h(px(28.))
         .child(Icon::new(icon).size(px(16.)).text_color(tint))
