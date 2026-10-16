@@ -200,6 +200,10 @@ pub struct VideoViewer {
     focus_handle: gpui::FocusHandle,
     /// 当前上屏帧。
     frame: Option<Arc<RenderImage>>,
+    /// 测试探针：最近一次 `drop_image` 释放掉的旧帧 `ImageId.0`（仅 test 编译，供
+    /// 回归断言「替换只 drop 旧帧、当前帧留存」；运行态不占字段）。
+    #[cfg(test)]
+    dropped_frame: Option<usize>,
     /// 视频原始像素尺寸（Contain 显示比例依据）。
     intrinsic: Option<(f32, f32)>,
     /// 打开 / 解码初始化是否仍在进行。
@@ -304,6 +308,8 @@ impl VideoViewer {
             path: path.clone(),
             focus_handle: cx.focus_handle(),
             frame: None,
+            #[cfg(test)]
+            dropped_frame: None,
             intrinsic: None,
             loading: true,
             load_error: None,
@@ -750,7 +756,7 @@ impl VideoViewer {
             }
         }
         let new_frame = if let Some((_pts, w, h, bgra)) = latest {
-            self.install_bgra(w, h, bgra);
+            self.install_bgra(w, h, bgra, cx);
             self.pending_seek = None; // 落点已上屏（首个可用帧）
             true
         } else {
@@ -981,13 +987,40 @@ impl VideoViewer {
         .detach();
     }
 
+    /// 释放被替换下的旧帧图集 tile（只在 `frame` 替换点调用；`None` 直接返回零成本）。
+    ///
+    /// **必须延迟到本拍更新末尾再 `drop_image`**：gpui `App::drop_image(image, None)` 只遍历
+    /// `App.windows` 里**未被正在更新取走**的窗口——窗口自身的 key/button 回调都是在
+    /// `update_window_erased`（当前窗口被临时移出 `App.windows`）里跑的，当场 drop 会漏掉
+    /// **正在播放的那个窗口**（其 atlas tile 残留，每手动切一次漏一片）。`Effect::Defer`
+    /// 在本拍 `finish_update` flush，其时当前窗口已放回 `App.windows` → 所有入口（泵/自动切/
+    /// 按键/按钮）都命中断言窗口；帧字节在 Arc 未 drop 前仍在、可重传，不丢渲染
+    ///（同 markdown-wysiwyg `pending_math_drop` 的「延迟一帧释放」姿势）。
+    fn drop_old_frame(&mut self, old: Arc<RenderImage>, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.dropped_frame = Some(old.id.0);
+        }
+        cx.defer(move |app| app.drop_image(old, None));
+    }
+
     /// 把 BGRA 包成 `RenderImage` 上屏。`intrinsic` 优先保留打开期从 `params` 读到的
     /// **源尺寸**（decode-to-display 下采样后逐帧 w/h 是输出尺寸，宽高比一致即可）。
-    fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>) {
+    fn install_bgra(&mut self, w: u32, h: u32, bgra: Vec<u8>, cx: &mut Context<Self>) {
         let t0 = Instant::now();
         // 帧字节移入 RenderImage（零拷贝）即持有时；截图在点击时经 `frame.as_bytes` 取回
         let buf = RgbaImage::from_raw(w, h, bgra).expect("解码帧长度恒为 w*h*4");
-        self.frame = Some(Arc::new(RenderImage::new(vec![Frame::new(buf)])));
+        let new = Arc::new(RenderImage::new(vec![Frame::new(buf)]));
+        // 旧帧被新帧替换的唯一点：显式 `drop_image` 释放被换下的旧图集 tile（P0 资源
+        // 泄漏——视频每帧新建 `RenderImage` → 全局自增 `ImageId`，图集 key 必 miss →
+        // 新 tile 只进不出，长会话 VRAM/图集持续上涨；`ImageSource::Render` 源图只经
+        // `drop_image` 下线，同 pdf/markdown-wysiwyg 姿势。gpui 语义：删 sprite_atlas
+        // 键并卸载对应 backend tile；已在先前帧 present 的旧场景不含此键，安全。
+        // 释放经 `drop_old_frame` 延迟到本拍更新末尾（见其注释：窗口上下文下当前窗口
+        // 不在 `App.windows`，当场 drop 会漏掉正在播放的窗口）。
+        if let Some(old) = self.frame.replace(new) {
+            self.drop_old_frame(old, cx);
+        }
         self.intrinsic.get_or_insert((w as f32, h as f32));
         if vprof_enabled() {
             VPROF_PRESENT.with(|acc| {
@@ -1010,7 +1043,11 @@ impl VideoViewer {
             return;
         }
         self.path = self.nav.item(idx).expect("set_current 已校验越界");
-        self.frame = None;
+        // 切文件：旧媒体最后一帧的图集 tile 一并显式释放（与 install_bgra 同款 P0 姿势，
+        // 否则切换 Playlist 多支时每切一次漏一片 tile）。
+        if let Some(old) = self.frame.take() {
+            self.drop_old_frame(old, cx);
+        }
         self.intrinsic = None;
         self.loading = true;
         self.load_error = None;
@@ -1838,6 +1875,7 @@ mod tests {
     use super::*;
     use gpui::AppContext as _;
     use gpui::TestAppContext;
+    use gpui::VisualTestContext;
 
     fn fixture() -> PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1859,6 +1897,8 @@ mod tests {
             path,
             focus_handle: cx.focus_handle(),
             frame: None,
+            #[cfg(test)]
+            dropped_frame: None,
             intrinsic: None,
             loading: false,
             load_error: None,
@@ -1936,6 +1976,151 @@ mod tests {
         let o = cx.update(|app| ent.read(app).overflow.as_ref().map(|f| f.0));
         assert_eq!(o, Some(1.6), "越过旧 overflow 后新越线帧进位");
         cx.run_until_parked();
+    }
+
+    /// P0 回归：旧帧被新帧替换时显式 `drop_image` 释放被换下的旧图集 tile。视频每帧
+    /// 新建 `RenderImage`（`ImageId` 全局自增）→ 若只换 `self.frame` 不释放，sprite
+    /// atlas 键只增不减 → 长会话 VRAM 上涨。断言：首帧无旧帧不 drop；替换时只 drop
+    /// 旧帧 id、当前帧留存；旧帧 Arc 不再被查看器持有。
+    #[gpui::test]
+    async fn install_bgra_drops_old_frame(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        let (w, h) = (64u32, 48u32);
+        let bytes = |v: u8| vec![v; (w * h * 4) as usize];
+        ent.update(cx, |v, cx| v.install_bgra(w, h, bytes(1), cx));
+        let first = cx.update(|app| ent.read(app).frame.clone().expect("首帧已上屏"));
+        assert_eq!(
+            cx.update(|app| ent.read(app).dropped_frame),
+            None,
+            "首帧无旧帧可 drop"
+        );
+        ent.update(cx, |v, cx| v.install_bgra(w, h, bytes(2), cx));
+        let (dropped, current) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.dropped_frame, v.frame.as_ref().map(|f| f.id.0))
+        });
+        assert_eq!(dropped, Some(first.id.0), "替换时旧帧应被 drop");
+        assert_ne!(Some(first.id.0), current, "当前帧不被 drop");
+        assert_eq!(Arc::strong_count(&first), 1, "旧帧 Arc 不再被查看器持有");
+        cx.run_until_parked();
+    }
+
+    /// P0 补充：`frame` 被置空（切文件把旧媒体最后一帧换下）时同样显式释放旧帧图集
+    /// tile，否则切换 Playlist 多支每切一次漏一片。走 `drop_old_frame` 直接断言释放
+    /// 语义（不入 `open_folder_index`——那会触发真实解码，见真解码测试的 FFMPEG_LOCK）。
+    #[gpui::test]
+    async fn replacing_with_none_releases_old_frame(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        let (w, h) = (64u32, 48u32);
+        ent.update(cx, |v, cx| v.install_bgra(w, h, vec![1; (w * h * 4) as usize], cx));
+        let first = cx.update(|app| ent.read(app).frame.clone().expect("首帧已上屏"));
+        ent.update(cx, |v, cx| {
+            if let Some(old) = v.frame.take() {
+                v.drop_old_frame(old, cx);
+            }
+        });
+        let (dropped, current) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.dropped_frame, v.frame.as_ref().map(|f| f.id.0))
+        });
+        assert_eq!(dropped, Some(first.id.0), "置空替换应释放旧帧");
+        assert_eq!(current, None, "旧帧之后是空帧（加载占位前）");
+        assert_eq!(Arc::strong_count(&first), 1, "旧帧 Arc 不再被持有");
+        cx.run_until_parked();
+    }
+
+    // ---- 真实图集断言（评审新增）：tile 释放必须命中「正在播放的窗口」----
+    struct AtlasImg {
+        cur: std::rc::Rc<std::cell::RefCell<Option<Arc<RenderImage>>>>,
+    }
+    impl AtlasImg {
+        fn new(_: &mut gpui::Context<Self>) -> Self {
+            Self {
+                cur: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            }
+        }
+    }
+    impl gpui::Render for AtlasImg {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            if let Some(img) = self.cur.borrow().clone() {
+                return gpui::img(gpui::ImageSource::Render(img))
+                    .w(gpui::px(8.))
+                    .h(gpui::px(8.))
+                    .into_any_element();
+            }
+            gpui::div().into_any_element()
+        }
+    }
+    struct AtlasHost {
+        img: gpui::Entity<AtlasImg>,
+    }
+    impl gpui::Render for AtlasHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            self.img.clone()
+        }
+    }
+    fn atlas_render_image(w: u32, h: u32, v: u8) -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(vec![Frame::new(
+            RgbaImage::from_raw(w, h, vec![v; (w * h * 4) as usize]).unwrap(),
+        )]))
+    }
+    /// 真实图集回归（评审发现并修复）：`drop_image(_, None)` 必须释放**正在播放的窗口**
+    /// 的 tile——不管是在顶层 App 上下文（泵/自动切）还是窗口 update 上下文（Button/Key
+    /// 手动切）触发。复现：gpui `App::drop_image(image, None)` 只遍历 `App.windows` 里未被
+    /// 正在更新取走的窗口；窗口自己的回调在 `update_window_erased`（当前窗口被临时移出
+    /// `App.windows`）里跑，当场 drop 会漏掉当前窗口 → 每手动切一次漏一片 tile。修法：
+    /// `drop_old_frame` 把释放 `cx.defer` 到本拍更新末尾（当前窗口已放回）再 drop。
+    /// 断言①②：顶层/窗口两种上下文都不会在当前窗口残留 tile；当前帧进图集后又可出。
+    #[gpui::test]
+    fn drop_image_reaches_display_window_in_all_contexts(cx: &mut TestAppContext) {
+        let (view, mut vcx) = cx.add_window_view(|_window, cx| AtlasHost {
+            img: cx.new(AtlasImg::new),
+        });
+        let upload = |vcx: &mut VisualTestContext, render: &Arc<RenderImage>| {
+            vcx.update(|window, cx| {
+                let img = view.read(cx).img.clone();
+                img.update(cx, |p, _| *p.cur.borrow_mut() = Some(render.clone()));
+                window.refresh();
+                window.draw(cx).clear(cx);
+            });
+        };
+        let in_atlas = |vcx: &mut VisualTestContext, render: &Arc<RenderImage>| {
+            vcx.update(|window, _| window.has_image_atlas_entry(render))
+        };
+        // ① 顶层 App update（非窗口 update，= 泵/自动切路径）：drop_image(_, None) 命中当前窗口
+        let render = atlas_render_image(8, 8, 1);
+        upload(&mut vcx, &render);
+        assert!(in_atlas(&mut vcx, &render), "画过后应入图集");
+        vcx.cx.update(|app| app.drop_image(render.clone(), None));
+        assert!(
+            !in_atlas(&mut vcx, &render),
+            "顶层 App 上下文 drop_image(_, None) 应释放当前窗口 tile"
+        );
+        // ② 窗口 update 内 entity.update 的 drop（= Button/Key 手动切路径）：经 defer 也应落盘
+        let render = atlas_render_image(8, 8, 2);
+        upload(&mut vcx, &render);
+        assert!(in_atlas(&mut vcx, &render), "画过后应入图集");
+        vcx.update(|_window, cx| {
+            // 同 `drop_old_frame`：先把自己这条 `drop_image` defer 到本拍更新末尾（当前窗口
+            // 已放回 `App.windows`）再释放——窗口上下文下直接 drop 会漏掉当前窗口。
+            let img = view.read(cx).img.clone();
+            let r = render.clone();
+            img.update(cx, move |_p, cx| {
+                cx.defer(move |app| app.drop_image(r.clone(), None));
+            });
+        });
+        assert!(
+            !in_atlas(&mut vcx, &render),
+            "窗口更新上下文里 drop_image(_, None)（defer 后）也应释放当前窗口 tile"
+        );
     }
 
     /// 播放推进：playing 时 playhead 前进；暂停时不前进；到结尾自动停。
