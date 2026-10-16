@@ -71,9 +71,11 @@ impl EditorApp {
             wrap_enabled: false,
             // 会话恢复开关：None（未设置）= 默认开。
             session_restore: prefs.session_restore.unwrap_or(true),
-            // 会话持久化防抖时序代号 / 恢复期间抑制标记（见 session 模块）。
+            // 会话持久化防抖时序代号 / 恢复期间抑制标记 / 槽位指纹表（见 session 模块）。
             session_flush_seq: 0,
             session_restoring: false,
+            session_slot_hashes: std::collections::HashMap::new(),
+            session_last_manifest_digest: None,
             split_drag: None,
             splitter_hovered: false,
             sidebar: sidebar::SidebarChromeState {

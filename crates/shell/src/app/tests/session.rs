@@ -444,6 +444,245 @@
         assert!(!cx.has_pending_prompt(), "确认框已应答");
     }
 
+    /// 哈希跳过（正确性）：只改 t0 → 重存后盘上 t0 更新、t1 原样；关选项卡 → 指纹表
+    /// 只留 live 槽（不随建/关无限膨胀）。等价的「全量重写」行为不变（盘面正确），
+    /// 附指纹表规模断言。
+    #[gpui::test]
+    async fn hash_skip_rewrites_changed_slot_and_bounds_map(cx: &mut TestAppContext) {
+        init_test(cx);
+        let dir = session_temp_dir("hash_skip");
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let i0 = app.make_tab(window, cx);
+                app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲"));
+                let i1 = app.make_tab(window, cx);
+                app.tabs[i1].editor.update(cx, |ed, _| ed.set_text("乙"));
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_eq!(app.session_slot_hashes.len(), 2, "两未命名 → 两指纹");
+
+                // 只改 t0 内容：重存后盘上 t0 更新、t1 不变（盘点正确性不受跳过影响）。
+                app.tabs[i0].editor.update(cx, |ed, _| ed.set_text("甲改"));
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("甲改"), "变化槽位重写");
+                assert_eq!(session::read_slot(&dir, "t1").as_deref(), Some("乙"), "未变槽位盘面原样");
+
+                // 关掉 idx=1 → 重存：指纹淘汰 t1、只留 live 槽 t0（重编号后仍对应正确内容）。
+                app.remove_tab(i1, window, cx);
+                assert!(session::save_session_to(app, &dir, cx));
+                assert!(
+                    app.session_slot_hashes.len() == 1 && app.session_slot_hashes.contains_key("t0"),
+                    "指纹只留 live 槽（内存不膨胀）"
+                );
+                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("甲改"));
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：开关关（清盘面+清指纹）→ 重开 → 重存，槽位必须重新落盘——旧指纹不得让
+    /// 重开后的首次保存误判「内容未变」而跳过写槽位（否则恢复读到缺失槽位 → 空内容）。
+    #[gpui::test]
+    async fn switch_off_on_resave_rewrites_slots(cx: &mut TestAppContext) {
+        init_test(cx);
+        let dir = session_temp_dir("reoff_on_resave");
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let i = app.make_tab(window, cx);
+                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
+
+                // 开启态保存：槽位落盘 + 指纹记录。
+                app.session_restore = true;
+                assert!(session::save_session_to(app, &dir, cx));
+                assert!(session::read_slot(&dir, "t0").is_some(), "开启态槽位在盘");
+
+                // 关（只清不写）：盘面与指纹一并清空。
+                app.session_restore = false;
+                assert!(session::save_session_to(app, &dir, cx));
+                assert!(!dir.join("t0").exists(), "关闭态应清盘面");
+                assert!(app.session_slot_hashes.is_empty(), "关闭态应清指纹");
+
+                // 重开 → 重存：必须重新写槽位（不被旧指纹误跳过）。
+                app.session_restore = true;
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_eq!(
+                    session::read_slot(&dir, "t0").as_deref(),
+                    Some("内容"),
+                    "重开后槽位重新落盘"
+                );
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 性能量级探针：拆解底层文件原语成本（`#[ignore]`，仅人工驱动）。定位「跳过槽位写后
+    /// 每轮仍 ~25ms」的常数项（本机疑为防病毒每文件创建扫描）：隔离 清单原子写 / 纯 fs::write
+    /// / remove_file / rename / prune / 槽位写，各 300 次取均值（真实临时目录，不碰 %APPDATA%）。
+    #[test]
+    #[ignore]
+    fn bench_session_parts() {
+        use std::time::Instant;
+        let dir = session_temp_dir("bench-parts");
+        let body = serde_json::json!({ "version": 1, "active_tab": 0, "tabs": [] }).to_string();
+        let target = dir.join("session.json");
+        let tmp = dir.join("session.json.tmp");
+        let n = 300usize;
+        // 先预热（首文件触达含防病毒冷扫描，不测）。
+        std::fs::write(dir.join("warm"), "x").unwrap();
+
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = std::fs::write(&tmp, &body);
+            let _ = std::fs::remove_file(&target);
+            let _ = std::fs::rename(&tmp, &target);
+        }
+        eprintln!(
+            "[bench-parts] fs::write+remove+rename(模拟原子写): {:.1}us/次",
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = std::fs::write(&target, &body);
+        }
+        eprintln!(
+            "[bench-parts] fs::write 直接覆盖(1次文件打开): {:.1}us/次",
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+        let t = Instant::now();
+        for _ in 0..n {
+            let _ = std::fs::rename(&tmp, &target);
+        }
+        eprintln!(
+            "[bench-parts] fs::rename(已存在目标): {:.1}us/次",
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+        let t = Instant::now();
+        for _ in 0..n {
+            assert!(session::write_slot(&dir, "t0", ""));
+        }
+        eprintln!(
+            "[bench-parts] write_slot(空槽位原子写): {:.1}us/次",
+            t.elapsed().as_secs_f64() * 1e6 / n as f64
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 清单无变化重入跳过（白盒探针）：首存写清单并记指纹；同状态再存 → 指纹相等 →
+    /// 清单不再重写（盘面保持首次结果，零文件 IO）。真实变化（改内容后 active_tab 或
+    /// 槽位改变）→ 指纹变化 → 清单重写自愈。
+    #[gpui::test]
+    async fn manifest_skip_noop_resave_and_selfheal(cx: &mut TestAppContext) {
+        init_test(cx);
+        let dir = session_temp_dir("manifest_skip");
+        let (app, cx) = add_app_zero_tabs(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                let i = app.make_tab(window, cx);
+                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容"));
+                assert!(session::save_session_to(app, &dir, cx));
+                let body1 = std::fs::read_to_string(dir.join("session.json")).unwrap();
+                let digest1 = app.session_last_manifest_digest;
+                assert!(digest1.is_some(), "首存应记录清单指纹");
+
+                // 同状态重存 → 指纹未变 → 跳过清单写（清单文件保持原内容）。
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_eq!(app.session_last_manifest_digest, digest1, "无变化指纹不变");
+                assert_eq!(
+                    std::fs::read_to_string(dir.join("session.json")).unwrap(),
+                    body1,
+                    "无变化重存不应重写清单"
+                );
+
+                // 内容变化只重写槽位；清单不含正文 → 清单不重写（指纹不变）。
+                app.tabs[i].editor.update(cx, |ed, _| ed.set_text("内容2"));
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_eq!(session::read_slot(&dir, "t0").as_deref(), Some("内容2"), "内容变化重写槽位");
+                assert_eq!(app.session_last_manifest_digest, digest1, "内容不入清单 → 清单指纹不变");
+
+                // 结构变化（新建 + 激活新 tab → active_tab 变）→ 清单指纹变并重写。
+                let i2 = app.make_tab(window, cx);
+                app.tabs[i2].editor.update(cx, |ed, _| ed.set_text("新"));
+                assert!(session::save_session_to(app, &dir, cx));
+                assert_ne!(app.session_last_manifest_digest, digest1, "active_tab 变化 → 清单重写");
+                let body3 = std::fs::read_to_string(dir.join("session.json")).unwrap();
+                assert_ne!(body3, body1, "清单文件应随 active_tab 重写");
+            });
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 性能量级探针（`#[ignore]`，常规测试不跑，仅人工 `cargo test -- --ignored` 驱动）：
+    /// N 个未命名选项卡 × 内容分级，连续跑 R 轮 `save_session_to`（含「读有效文本 + 写
+    /// 槽位 + 写清单 + prune 目录扫描」），打印每轮平均毫秒——用于量化「切换选项卡/结构
+    /// 变化即镜像全量重写槽位」的主线程 IO 成本，及 hash 跳过优化后的相对收益。
+    /// 只打印、不断言；目录为进程独占临时会话目录，不触碰真实 %APPDATA%。
+    #[gpui::test]
+    #[ignore]
+    async fn bench_save_session_slots(cx: &mut TestAppContext) {
+        init_test(cx);
+        let big1k = "x".repeat(1024);
+        let big100k = "内容行甲\n".repeat(5000);
+        let cases: Vec<(&str, usize, &str)> = vec![
+            ("empty 8tabs", 8, ""),
+            ("1KB 8tabs", 8, &big1k),
+            ("100KB 4tabs", 4, &big100k),
+        ];
+        for (label, n_tabs, body) in cases {
+            let dir = session_temp_dir(&format!("bench-{label}"));
+            let (app, cx) = add_app_zero_tabs(cx);
+            let rounds = 40usize;
+            let t0 = std::time::Instant::now();
+            cx.update(|window, cx| {
+                app.update(cx, |app, cx| {
+                    for _ in 0..n_tabs {
+                        let idx = app.make_tab(window, cx);
+                        app.tabs[idx].editor.update(cx, |ed, _| ed.set_text(body));
+                    }
+                    for r in 0..rounds {
+                        let a = std::time::Instant::now();
+                        assert!(session::save_session_to(app, &dir, cx));
+                        if r == 0 {
+                            eprintln!(
+                                "[bench] slot={label}: 首轮 {}ms，指纹表 {} 项，目录项 {}",
+                                a.elapsed().as_secs_f64() * 1000.0,
+                                app.session_slot_hashes.len(),
+                                std::fs::read_dir(&dir).map(|it| it.count()).unwrap_or(0)
+                            );
+                        }
+                    }
+                    let t_first = t0.elapsed();
+                    let t_skip = std::time::Instant::now();
+                    for _ in 0..(rounds * 3) {
+                        assert!(session::save_session_to(app, &dir, cx));
+                    }
+                    let skip_ms = (t_skip.elapsed().as_secs_f64() * 1000.0) / (rounds * 3) as f64;
+                    eprintln!(
+                        "[bench] slot={label}: 建表+首轮= {:.1}ms；内容未变跳过轮均值 {:.4} ms/轮",
+                        t_first.as_secs_f64() * 1000.0,
+                        skip_ms
+                    );
+                    // 「切选项卡」等价场景：内容全不变，仅 active_tab 轮换 → 槽位全跳过、
+                    // 清单每次必写（active_tab 变了）。
+                    let t_sw = std::time::Instant::now();
+                    let sw_n = 24usize;
+                    for r in 0..sw_n {
+                        app.active_tab = r % n_tabs.max(1);
+                        assert!(session::save_session_to(app, &dir, cx));
+                    }
+                    let sw_ms = t_sw.elapsed().as_secs_f64() * 1000.0 / sw_n as f64;
+                    eprintln!(
+                        "[bench] slot={label}: 仅切 active_tab（清单每轮改写）{:.3} ms/轮",
+                        sw_ms
+                    );
+                });
+            });
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+            eprintln!("[bench] slot={label}: n_tabs={n_tabs} rounds={rounds} => {ms:.3} ms/轮");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// B 判定：命名文件选项卡干净（!dirty）→ 直通 remove_tab（不弹确认）。
     #[gpui::test]
     async fn close_clean_named_tab_directly_closes(cx: &mut TestAppContext) {

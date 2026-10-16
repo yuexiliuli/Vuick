@@ -234,7 +234,11 @@ impl EditorApp {
         // 与其它偏好同款落盘（persist_prefs 已纳入 session_restore 字段）。
         self.persist_prefs();
         if !self.session_restore {
-            // 测试构建不触碰真实会话目录（clear 走显式目录的纯逻辑，此处仅在非测试下清）。
+            // 清槽位指纹：重开时若沿用旧指纹会误跳过写槽位（盘面已被清，内容却判「未变」），
+            // 导致恢复读到缺失槽位 → 空内容。测试构建不触碰真实会话目录（clear 走显式目录的
+            // 纯逻辑），但指纹表在两种构建都清（save_session_to 关闭分支同样兜底）。
+            self.session_slot_hashes.clear();
+            self.session_last_manifest_digest = None;
             #[cfg(not(test))]
             {
                 let _ = clear_session(&UserPrefs::session_dir());
@@ -249,7 +253,7 @@ impl EditorApp {
     /// `#[allow(dead_code)]`：仅 `new_impl` 的 `#[cfg(not(test))]` 退出钩子调用，
     /// 测试构建下无调用点（测试直接驱动 `save_session_to` 纯逻辑）。
     #[allow(dead_code)]
-    pub(super) fn save_session(&self, cx: &Context<Self>) {
+    pub(super) fn save_session(&mut self, cx: &Context<Self>) {
         let _ = save_session_to(self, &UserPrefs::session_dir(), cx);
     }
 
@@ -307,14 +311,33 @@ impl EditorApp {
     }
 }
 
+/// 内容指纹：u64 哈希（`std` 默认 Hasher / SipHash-1-3，无新增依赖）。仅用于「内容未变
+/// 则跳过槽位重写」的判定；撞车率 ~2^-64，且被跳过时盘面恰是本次内容（此前自身写入的
+/// 产物），碰撞失真的风险可忽略。
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// 保存会话（纯逻辑，显式目录，可测试）：开关关闭 → 只清不做；否则先写槽位内容、
     /// 再原子写清单（清单是"本次会话可恢复"的原子信号）。文件选项卡只记路径，未命名
     /// 选项卡经 [`EditorApp::tab_effective_text`]（与手动保存同口径：live2/WYSIWYG 开启
     /// 时读 WyEditor 实时内容）取内容写槽位。
+    /// **跳过未变槽位**：以「槽位名 + 内容 hash」对照 [`EditorApp::session_slot_hashes`]，
+    /// 内容未变的槽位不重写整份文件——切换选项卡 / 结构变化（旧实现每次都全量重写全部
+    /// 未命名内容并在主线程同步磁盘 IO）摊薄到只剩一份清单写 + 目录扫描；仅真正变化的
+    /// 槽位才写。槽位名随未命名顺序位移时（关选项卡重编号）名不同 → 照写，旧槽位交给
+    /// [`prune_unreferenced_slots`] 清理。
     /// 写清单成功后顺带 [`prune_unreferenced_slots`] 清理不再被引用的陈旧槽位
     /// （`remove_tab` 后重编号产生的孤儿），保证「否→删除临时文件」真正落盘。
-    pub(crate) fn save_session_to(app: &EditorApp, dir: &Path, cx: &App) -> bool {
+    pub(crate) fn save_session_to(app: &mut EditorApp, dir: &Path, cx: &App) -> bool {
         if !app.session_restore {
+            // 开关关闭：清盘面 + 清指纹（重开时旧指纹会误判「盘上有同内容」而跳过写槽位
+            // → 恢复读到缺失槽位为空内容；此处一并清掉，杜绝该竞态）。
+            app.session_slot_hashes.clear();
+            app.session_last_manifest_digest = None;
             return clear_session(dir);
         }
         let mut tabs = Vec::new();
@@ -326,9 +349,15 @@ impl EditorApp {
                     let slot = format!("t{n_slots}");
                     n_slots += 1;
                     let text = app.tab_effective_text(idx, cx);
-                    // 槽位边写边丢、清单最后写：任一槽位失败 → 不写清单（无「半写可恢复」）。
-                    if !write_slot(dir, &slot, &text) {
-                        return false;
+                    let h = content_hash(&text);
+                    // 槽位名与指纹都未变 → 内容与盘面一致，跳过重写（消除切选项卡/结构
+                    // 变化时的全量同步磁盘写）。写失败仅当确实要写时返回（跳过不影响盘面）。
+                    let unchanged = app.session_slot_hashes.get(&slot).copied() == Some(h);
+                    if !unchanged {
+                        if !write_slot(dir, &slot, &text) {
+                            return false;
+                        }
+                        app.session_slot_hashes.insert(slot.clone(), h);
                     }
                     tabs.push(SessionTab::New {
                         slot,
@@ -337,15 +366,33 @@ impl EditorApp {
                 }
             }
         }
+        // 收敛指纹表规模：本次不再存在的旧槽位（选项卡被关/重编号后）直接淘汰，
+        // 避免 HashMap 随「反复新建/关闭未命名选项卡」长期累积（内存不放大）。
+        app.session_slot_hashes.retain(|slot, _| {
+            slot.strip_prefix('t')
+                .and_then(|s| s.parse::<usize>().ok())
+                .map_or(false, |n| n < n_slots)
+        });
         let manifest = SessionManifest {
             version: 1,
             active_tab: app.active_tab,
             tabs,
         };
-        write_manifest(dir, &manifest) && {
-            let _ = prune_unreferenced_slots(dir, &manifest);
-            true
+        // 清单是"本次会话可恢复"的原子信号，但写它恰是切选项卡/新建时最贵的原语
+        // （本机防病毒下原子写 ~5-25ms）。清单未变（`new_tab` 紧随 `make_tab` 的二次
+        // 即时落盘、内容防抖收敛后的等价重写等「无变化重入」）→ 字节级相同，盘面已最
+        // 新，直接跳过清单写 + prune（零文件 IO）；槽位已在上面写完。
+        let body = manifest.to_value().to_string();
+        let digest = content_hash(&body);
+        if app.session_last_manifest_digest == Some(digest) {
+            return true;
         }
+        if !write_manifest(dir, &manifest) {
+            return false;
+        }
+        app.session_last_manifest_digest = Some(digest);
+        let _ = prune_unreferenced_slots(dir, &manifest);
+        true
     }
 
 /// 恢复会话（纯逻辑，显式目录，可测试）：读清单 → 依次开文件 / 建未命名选项卡并
@@ -390,6 +437,10 @@ pub(crate) fn restore_session_from(
     // 恢复完成放行持久化，随后既有 `clear_session` 删除清单/槽位（避免重复恢复）。
     app.session_restoring = false;
     clear_session(dir);
+    // 盘面已被清（槽位/清单删除）：指纹表也必须清，否则此后首次持久化会拿「恢复前内容」
+    // 的旧指纹误判「未变」而跳过写槽位/清单 → 恢复出的选项卡内容不再落盘。
+    app.session_slot_hashes.clear();
+    app.session_last_manifest_digest = None;
     app.status = SharedString::from("已恢复上次会话");
     app.status_ok = true;
     cx.notify();

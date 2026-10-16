@@ -372,6 +372,18 @@ pub struct EditorApp {
     /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化（避免反复写盘 / 抵抗
     /// `clear_session` 清理）。
     session_restoring: bool,
+    /// 会话槽位「上次落盘内容」指纹：slot 名 → 内容 hash。`save_session_to` 据此跳过
+    /// 内容未变的槽位重写——切换选项卡/结构变化不再全量重写所有未命名内容（消除主线程
+    /// 同步磁盘 IO 热点），真正变化（防抖到期/编辑后）才重写该槽位。关开关/恢复完成时
+    /// 清空，杜绝「旧指纹误跳过 → 盘上槽位缺失」。每次落盘后只保留仍在引用的槽位
+    /// （内存随建/关选项卡不膨胀）。
+    session_slot_hashes: std::collections::HashMap<String, u64>,
+    /// 上次成功写盘时的清单指纹（清单序列化后 hash）。相等 → 本次保存是「无变化重入」
+    /// （如 `new_tab` 紧随 `make_tab` 的二次即时落盘、内容防抖收敛后的等价重写），
+    /// 清单与 prune 一并跳过——盘面已是最新，零文件 IO（本机防病毒下每次文件创建
+    /// 5~25ms，无谓清单写正是切选项卡/新建残留热点的最大项）。清空路径同
+    /// `session_slot_hashes`。
+    session_last_manifest_digest: Option<u64>,
     /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
     split_drag: Option<(f32, f32)>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）
