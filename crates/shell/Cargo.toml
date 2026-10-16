@@ -21,6 +21,8 @@ syntax = { path = "../syntax" }
 ui = { path = "../ui" }
 editor = { path = "../editor" }
 markdown = { path = "../markdown" }
+# WYSIWYG 编辑器：自 markdown 拆分独立的新 crate（shell 直接消费 markdown_wysiwyg::*）。
+markdown-wysiwyg = { path = "../markdown-wysiwyg" }
 toc = { path = "../toc" }
 pdf = { path = "../pdf" }
 image_viewer = { path = "../image_viewer" }

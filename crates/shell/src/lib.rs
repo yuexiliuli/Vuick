@@ -36,13 +36,13 @@ pub use base::actions;
 ///
 /// 原根包 `src/actions.rs::bind_local_keymaps` 是**组合根**，P5 随 shell（app）整体
 /// 上移至此：`bind_input_keys`（base，Input 键上下文）+ `ui::root::bind_keys`（Root 键
-/// 上下文）+ `markdown::wysiwyg::bind_keys`（wy-editor 键上下文）。供二进制壳
+/// 上下文）+ `markdown_wysiwyg::bind_keys`（wy-editor 键上下文）。供二进制壳
 /// `main.rs` 与测试初始化共用。调用方须在随后注册比 `Input` 上下文更高优先级的覆盖
 /// 绑定（如 `ctrl-v` → `PasteNormalized`），顺序＝优先级。
 pub fn bind_local_keymaps(cx: &mut gpui::App) {
     base::actions::bind_input_keys(cx);
     ui::root::bind_keys(cx);
-    markdown::wysiwyg::bind_keys(cx);
+    markdown_wysiwyg::bind_keys(cx);
 }
 
 /// 测试用键位助手：与生产版 [`bind_local_keymaps`] 完全一致（完整组合），供
@@ -53,6 +53,6 @@ pub mod test_support {
     pub fn bind_local_keymaps(cx: &mut gpui::App) {
         base::actions::bind_input_keys(cx);
         ui::root::bind_keys(cx);
-        markdown::wysiwyg::bind_keys(cx);
+        markdown_wysiwyg::bind_keys(cx);
     }
 }

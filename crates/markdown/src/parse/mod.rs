@@ -11,10 +11,12 @@ mod blocks;
 mod blocks_scan;
 pub(crate) mod cells;
 mod citations;
-pub(crate) mod inline_style;
+/// 行内样式识别（`MathAlign`/`MathRegion` 等，`markdown-wysiwyg` 跨 crate 消费 → pub）。
+pub mod inline_style;
 #[cfg(test)]
 pub(crate) mod parity;
-pub(crate) mod recognition;
+/// 构造识别（`AlertKind`/`LinkHit` 等，`markdown-wysiwyg` 跨 crate 消费 → pub）。
+pub mod recognition;
 mod rows;
 #[cfg(test)]
 mod tests;
@@ -23,10 +25,9 @@ pub use rows::{
     ImageInfo, Row, RowAlign, RowKind, RowPayload, RunKind, TableAlign, TableData, parse_to_rows,
 };
 #[allow(unused_imports)] // 兼容重导出：ImgRef/parse_ref 走类型推断；split_table_cells 供 markdown::parity 测试消费
-pub(crate) use rows::{
-    ImgRef, inline_style_mapped, parse_image_line, parse_ref, split_table_cells,
-    split_table_cells_mapped, text_segment,
-};
+pub use rows::{parse_image_line, parse_ref, split_table_cells_mapped, text_segment};
+#[allow(unused_imports)] // 兼容重导出：ImgRef/parse_ref 走类型推断、inline_style_mapped/split_table_cells 供 markdown 测试消费
+pub(crate) use rows::{ImgRef, inline_style_mapped, split_table_cells};
 #[allow(unused_imports)] // 兼容重导出：citation_index_from_rows 在 preview 迁移到 PreviewRow 后仅 parse 测试消费
 pub use citations::{CitationIndex, citation_index_from_rows, scan_citations};
 #[allow(unused_imports)] // 兼容重导出：BlocksIter 为公开类型但内部无人逐名引用；scan_blocks 供 markdown 级 #[cfg(test)] 重导出消费

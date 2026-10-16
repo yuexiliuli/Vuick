@@ -326,7 +326,7 @@
                 .clone();
             let s = cx.new(|cx| WyEditor::new(window, cx));
             s.update(cx, |w, _cx| {
-                w.install_open(markdown::wysiwyg::WyEditor::open_from_rope(rope))
+                w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
             });
             s
         });

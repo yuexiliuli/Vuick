@@ -3180,6 +3180,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "markdown-wysiwyg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base",
+ "config",
+ "editor",
+ "gpui",
+ "image",
+ "ime",
+ "markdown",
+ "ratex-layout",
+ "ratex-parser",
+ "ratex-render",
+ "ropey",
+ "rustc-hash 1.1.0",
+ "serde_json",
+ "syntax",
+ "ui",
+]
+
+[[package]]
 name = "maybe-owned"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5304,6 +5326,7 @@ dependencies = [
  "gpui",
  "image_viewer",
  "markdown",
+ "markdown-wysiwyg",
  "memchr",
  "pdf",
  "rfd",

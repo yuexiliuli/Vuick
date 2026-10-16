@@ -44,7 +44,7 @@ pub struct StyleParams {
 
 /// 由正文字号推导「正文行高/代码字号/代码行高」——**唯一**的缩放系数来源
 /// （`0.88/1.3/1.45` 只在这里出现一次），预览与 WYSIWYG 共用，避免两处各写一套。
-pub(crate) fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
+pub fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
     (px(fs * 1.45), px(fs * 0.88), px(fs * 1.3))
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn typography_for_size(fs: f32) -> (Pixels, Pixels, Pixels) {
 /// 行高系数在 `config::markdown::HEADING_LINE_RATIOS`（分级别）
 /// （正文 14px 参考字号下 h1=24 h2=20 h3=18 h4=16 h5/6=15），其余字号按
 /// `body_fs / HEADING_DESIGN_BASE` 等比缩放，标题相对正文的比例保持不变。
-pub(crate) fn heading_metrics_for_size(body_fs: f32, level: u8) -> (Pixels, Pixels) {
+pub fn heading_metrics_for_size(body_fs: f32, level: u8) -> (Pixels, Pixels) {
     let lv = match level {
         1..=6 => level as usize,
         _ => 6,
@@ -109,7 +109,7 @@ impl StyleParams {
     /// 随正文字号 **等比缩放**——编辑区/预览/WYSIWYG 的 Ctrl+滚轮/菜单调字号时标题一起
     /// 变大变小，保持标题相对正文的比例固定。WYSIWYG 的 `WyTheme::set_font_size` 也走
     /// [`heading_metrics_for_size`] 同步重算，两处标题永远一致。
-    pub(crate) fn heading_metrics(&self, level: u8) -> (Pixels, Pixels) {
+    pub fn heading_metrics(&self, level: u8) -> (Pixels, Pixels) {
         heading_metrics_for_size(self.para_size.as_f32(), level)
     }
 }

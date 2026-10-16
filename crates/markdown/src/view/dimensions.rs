@@ -14,12 +14,12 @@ fn be_u32(d: &[u8], at: usize) -> Option<u32> {
 
 /// 从本地图片文件头读取固有尺寸 (w, h)（不整图解码，快）。
 /// 仅解析常见格式；失败返回 None，渲染回退到固定高度。
-pub(crate) fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+pub fn image_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
     image_dimensions_bytes(&std::fs::read(path).ok()?)
 }
 
 /// 从图片字节头读取固有尺寸（不整图解码）。支持 PNG/JPEG/GIF/BMP。
-pub(crate) fn image_dimensions_bytes(d: &[u8]) -> Option<(u32, u32)> {
+pub fn image_dimensions_bytes(d: &[u8]) -> Option<(u32, u32)> {
     if d.len() < 8 {
         return None;
     }

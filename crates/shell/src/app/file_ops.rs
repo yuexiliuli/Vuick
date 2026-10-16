@@ -303,7 +303,7 @@ impl EditorApp {
         p: &std::path::Path,
         max_line_chars: usize,
         line_width_histogram: editor::buffer::LineWidthHistogram,
-        md_wy_open: Option<markdown::wysiwyg::WyOpenResult>,
+        md_wy_open: Option<markdown_wysiwyg::WyOpenResult>,
         resume_version: Option<u64>,
         cx: &mut Context<Self>,
     ) {
@@ -579,7 +579,7 @@ impl EditorApp {
                     let wy_open = cx
                         .background_executor()
                         .spawn(async move {
-                            let wy = markdown::wysiwyg::WyEditor::open_from_rope(snap);
+                            let wy = markdown_wysiwyg::WyEditor::open_from_rope(snap);
                             if std::env::var_os("MD_OPEN_DEBUG").is_some() {
                                 eprintln!(
                                     "[MD_OPEN_DEBUG] 后台 右栏WyEditor(Doc::open) 合计: {} ms",

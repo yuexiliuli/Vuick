@@ -13,7 +13,7 @@
 //! 其余预览引擎代码全部删除（含 `MarkdownPreview` / `PreviewSrc` / `TextCtx` /
 //! `NoteCtx` 等公共与测试面）。
 
-pub(crate) mod dimensions;
+pub mod dimensions;
 pub mod style;
 
 use std::ops::Range;
@@ -22,7 +22,7 @@ use gpui::{App, Hsla};
 
 /// 文本选择的背景色（半透明蓝，浅/暗主题各一版；与搜索高亮同法，非主题强调色）。
 /// WYSIWYG(`markdown/wysiwyg`) 共用同一款，保证「选区背景色」全局一致。
-pub(crate) fn selection_color(cx: &App) -> Hsla {
+pub fn selection_color(cx: &App) -> Hsla {
     if ui::theme::Theme::global(cx).is_dark() {
         gpui::rgba(0x4d6bfe61).into()
     } else {
@@ -34,7 +34,7 @@ pub(crate) fn selection_color(cx: &App) -> Hsla {
 /// 用于搜索跳转为命中**文本**着色（非整行）。
 /// `text` 内 `needle`（须已小写）**首次**出现的字节区间（逐字符取等长候选小写比较，
 /// 正确处理 UTF-8 多字节）。WYSIWYG 搜索跳转高亮（`WyEditor`）复用。
-pub(crate) fn find_text_range(text: &str, needle: &str) -> Option<Range<usize>> {
+pub fn find_text_range(text: &str, needle: &str) -> Option<Range<usize>> {
     let needle_chars = needle.chars().count();
     if needle_chars == 0 {
         return None;

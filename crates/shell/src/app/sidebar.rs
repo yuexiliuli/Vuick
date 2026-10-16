@@ -59,7 +59,7 @@ pub(crate) struct SidebarChromeState {
     /// 内容代号 = `WyEditor::content_gen`：预览关/重装（换实体）与整篇换源（同实体 in-place
     /// 喂料）都使其失效重建，避免渲染上一版条目。
     pub(crate) toc_cache:
-        Option<(usize, u64, u64, markdown::wysiwyg::TocEntries, Vec<usize>, MdTocScroll)>,
+        Option<(usize, u64, u64, markdown_wysiwyg::TocEntries, Vec<usize>, MdTocScroll)>,
     /// 侧边栏当前宽度（px）：目录视图随内容自适应，也可右缘拖拽手动调整。
     pub(crate) width: f32,
     /// 是否仍随目录内容自适应宽度（手动拖拽后关闭，切换文档重开）。

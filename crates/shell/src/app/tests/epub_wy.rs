@@ -53,7 +53,7 @@ async fn epub_opens_in_wy_readonly_host(cx: &mut TestAppContext) {
         let a = app.read(cx);
         let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
         let width = window.viewport_size().width.max(px(1.));
-        let frame = markdown::wysiwyg::build_frame(
+        let frame = markdown_wysiwyg::build_frame(
             wy.read(cx),
             window,
             width,
@@ -186,7 +186,7 @@ async fn md_wy_notes_citation_index_and_navigation_app_level(cx: &mut TestAppCon
     let (stl, mhl) = cx.update(|_w, cx| {
         let a = app.read(cx);
         let wy = a.tabs[a.active_tab].md_wy.clone().unwrap();
-        let hit = markdown::wysiwyg::NoteMarkerHit {
+        let hit = markdown_wysiwyg::NoteMarkerHit {
             src_line: 0,
             n: 1,
             is_def: false,
@@ -258,7 +258,7 @@ async fn wy_note_jump_far_lands_in_bounded_frames_app_level(cx: &mut TestAppCont
         best.expect("应有 ref→def 对")
     });
     // 触发注记跳转（同真实点击路径：navigate_marker → set_scroll_target）。
-    let hit = markdown::wysiwyg::NoteMarkerHit {
+    let hit = markdown_wysiwyg::NoteMarkerHit {
         src_line: ref_line,
         n,
         is_def: false,
@@ -388,7 +388,7 @@ async fn wy_note_jump_far_self_drives_without_input_events(cx: &mut TestAppConte
         best.expect("应有 ref→def 对")
     });
     // 触发注记跳转（同真实点击路径：navigate_marker → set_scroll_target）。
-    let hit = markdown::wysiwyg::NoteMarkerHit {
+    let hit = markdown_wysiwyg::NoteMarkerHit {
         src_line: ref_line,
         n,
         is_def: false,

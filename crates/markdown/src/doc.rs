@@ -31,7 +31,7 @@ use super::parse;
 /// Code/Table/Image 等块在预览侧重于 `Row.payload`（代码全部行 / 表格网格 / 图片源），
 /// WYSIWYG 也需要这些才画得出来——统一行把它们一并带过来，避免渲染分支丢数据。
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) enum DocPayload {
+pub enum DocPayload {
     #[default]
     Text,
     /// 代码围栏：全部代码行 + 语言标记（用于等宽排版/背景面板）。
@@ -48,7 +48,7 @@ pub(crate) enum DocPayload {
 /// 表格可编辑行的源码映射（逐可见行：表头 + 各数据行；分隔行不渲染不编辑）。
 /// 供元素层命中/光标/选区把「单元格渲染位置 ↔ 源字节」换算。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TableRowMap {
+pub struct TableRowMap {
     /// 该行源码行号。
     pub src_line: usize,
     /// 逐单元格。
@@ -57,7 +57,7 @@ pub(crate) struct TableRowMap {
 
 /// 单个表格单元格的编辑映射。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TableCellMap {
+pub struct TableCellMap {
     /// 源码内容区间（**相对该行行首**；`\|` 转义按源字节计入，哨兵指到内容物理尾）。
     pub src: Range<usize>,
     /// 渲染文本（与预览单元格同源，已解义/行内清理）。
@@ -68,17 +68,17 @@ pub(crate) struct TableCellMap {
 
 /// 统一渲染行（块粒度：Code/Table 等一个块 = 一个 DocRow，跨多行）。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DocRow {
+pub struct DocRow {
     /// 语义（IR 金标准）。
-    pub(crate) kind: IrKind,
+    pub kind: IrKind,
     /// 该块首个源码行（0 基）。
-    pub(crate) src_line: usize,
+    pub src_line: usize,
     /// 覆盖的源码行区间（多行块 = 块区间；单行块 = src_line..src_line+1）。
-    pub(crate) lines: Range<usize>,
+    pub lines: Range<usize>,
     /// 渲染文本（与预览 `parse_to_rows` 逐字节一致）。
-    pub(crate) text: SharedString,
+    pub text: SharedString,
     /// 行内样式段（与预览同源）。
-    pub(crate) runs: Vec<(Range<usize>, RunKind)>,
+    pub runs: Vec<(Range<usize>, RunKind)>,
     /// 编辑映射：渲染字节 → **源字节偏移**。
     /// - 文本行（段落/标题/列表/引述）：相对**该行**行首，长度 = `text.len()+1`，
     ///   末项为哨兵 = 源段尾；由 `parse::text_segment` + `parse::inline_style_mapped`
@@ -86,22 +86,22 @@ pub(crate) struct DocRow {
     /// - 代码块（围栏内内容行可编辑）：相对**块首**（`src_line` 围栏行起始），
     ///   渲染文本 = 各代码行以 `\n` 连接（围栏标记本身只读不渲染）。
     /// - 其它非文本行（表格/图片/规则/空行）为空。
-    pub(crate) byte_map: Vec<usize>,
+    pub byte_map: Vec<usize>,
     /// 块级渲染负载（非文本块的渲染数据）。
-    pub(crate) payload: DocPayload,
+    pub payload: DocPayload,
     /// 行对齐（EPUB 排版指令 `%%ALIGN:X%%`，来自 [`super::parse::Row::align`]；
     /// `None` = 跟随默认左对齐）。WYSIWYG 只读 EPUB 宿主用它做右/中对齐单源。
-    pub(crate) align: Option<RowAlign>,
+    pub align: Option<RowAlign>,
     /// 文内脚注引用标记 `[^n]`（显示区间 = **相对本行渲染文本**的字节范围，见
     /// [`super::parse::extract_notes`] 的 `[^n] → [n]` 剥记号语义；由 M5-B5 P4-2
     /// 「注记迁入 WYSIWYG」透传，A 侧 `MarkdownPreview` 删除后由 WyEditor 承载
     /// 悬浮卡/双向跳转）。
-    pub(crate) notes: Vec<(Range<usize>, usize)>,
+    pub notes: Vec<(Range<usize>, usize)>,
     /// 脚注**定义**标记 `[!n]`（同 `notes` 区间语义；`[!n] → [n]` 显示）。
-    pub(crate) note_defs: Vec<(Range<usize>, usize)>,
+    pub note_defs: Vec<(Range<usize>, usize)>,
     /// 表格块的逐行/单元格编辑映射（仅 [`IrKind::Table`] 行非 `Some`；代码块用
     /// `byte_map`，表格因单元格多列需要更细粒度）。`Rc` 压低克隆成本。
-    pub(crate) table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
+    pub table_rows: Option<std::rc::Rc<Vec<TableRowMap>>>,
 }
 
 /// 文档源：`Str`（小文档）或 `Rope`（大文档，COW，与编辑器共享底层树）。
@@ -143,7 +143,9 @@ impl DocLineView for Doc {
 /// 「前缀拷贝 + 尾部逐条平移」两个 O(n) 段（139k 行 ×2 索引实测 3.2~3.7ms/键），
 /// 分段后只需重扫变化区（通常极小），前后缀 O(1) 共享；段数超限合并且 amortize。
 #[derive(Clone, Debug)]
-pub(crate) struct LineStarts {
+/// 行起始表（`LineStarts`）——经 [`Doc::line_starts`] 跨 crate（markdown-wysiwyg）消费，
+/// `get`/`partition_point`/`len` 随拆 crate 放宽为 pub。
+pub struct LineStarts {
     segs: std::sync::Arc<Vec<LineSeg>>,
     len: usize,
 }
@@ -209,7 +211,7 @@ impl LineStarts {
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
@@ -234,7 +236,7 @@ impl LineStarts {
     }
 
     #[inline]
-    pub(crate) fn get(&self, i: usize) -> Option<usize> {
+    pub fn get(&self, i: usize) -> Option<usize> {
         if i >= self.len {
             return None;
         }
@@ -255,7 +257,7 @@ impl LineStarts {
 
     /// 二分定位：`[..n]` 中最后一个满足 `pred` 的下标 + 1（行起始升序、平移保持单调，
     /// 等价于原 `slice::partition_point`）。
-    pub(crate) fn partition_point<P: FnMut(&usize) -> bool>(&self, mut pred: P) -> usize {
+    pub fn partition_point<P: FnMut(&usize) -> bool>(&self, mut pred: P) -> usize {
         let mut lo = 0usize;
         let mut hi = self.len;
         while lo < hi {
@@ -364,9 +366,9 @@ pub struct Doc {
     edit_ver: u64,
     /// `text_shared` 的全文缓存（防漏网调用点重复 O(n) 拷贝；edit 后失效清空）。
     text_cache: RefCell<Option<(u64, SharedString)>>,
-    /// （仅测试）`text_shared` 被调次数——B 步断言 `EntityInputHandler` 不再物化全文。
-    #[cfg(test)]
-    text_shared_calls: std::cell::Cell<u64>,
+    /// `text_shared` 被调次数（跨 crate 测试探针，无条件存在）——B 步断言
+    /// `EntityInputHandler` 不再物化全文。markdown-wysiwyg 测试跨 crate 观测。
+    text_calls: std::cell::Cell<u64>,
 }
 
 /// `Doc` 的 **O(1) 共享克隆**：克隆即共享、编辑即 COW 分离。
@@ -376,7 +378,7 @@ pub struct Doc {
 /// 的 `Arc<[..]>` 段）、`rope`（ropey 拓扑 COW，与宿主编辑器共享底层树）——这里逐项
 /// `Arc` 克隆，不复制任何数据。唯一跳过分叉的是 `text_cache`：fork 缓存本就该空
 /// （`edit` 会失效它；同源共享下 fork 各自首读全文时各自物化一次并缓存，无正确性
-/// 影响）、`text_shared_calls` 归零（每份独立观测）。
+/// 影响）、`text_calls` 归零（每份独立观测）。
 ///
 /// 编辑分离语义：`Doc::edit` 只替换**自己**这份克隆的字段——rope remove/insert 出新树、
 /// 分段重建叠出「旧前缀 Arc + 新中段 + 旧后缀 Arc」——原 Doc 的字段逐字节不动（与
@@ -399,15 +401,14 @@ impl Clone for Doc {
             total_utf16: self.total_utf16,
             edit_ver: self.edit_ver,
             text_cache: RefCell::new(None),
-            #[cfg(test)]
-            text_shared_calls: std::cell::Cell::new(0),
+            text_calls: std::cell::Cell::new(0),
         }
     }
 }
 
 impl Doc {
     /// 打开小/中文档（`Str` 源）。
-    pub(crate) fn open(src: SharedString) -> Self {
+    pub fn open(src: SharedString) -> Self {
         let _t = crate::prof::begin();
         // 融合一趟字节扫描：行起始（u32）+ 行粒度 UTF-16 前缀 + 字符数 + 全文 UTF-16
         // 单元数，替代旧四趟独立 O(n)（`build_line_starts_u32` / `chars().count()` /
@@ -436,8 +437,7 @@ impl Doc {
             total_utf16,
             edit_ver: 0,
             text_cache: RefCell::new(None),
-            #[cfg(test)]
-            text_shared_calls: std::cell::Cell::new(0),
+            text_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -447,7 +447,7 @@ impl Doc {
     /// 四行统计一趟 chunk 融合扫描（[`build_line_stats_utf16_rope`]，与 Str 分支
     /// [`parse::build_line_stats_utf16`] 口径一致）。`DocSrc::Rope` 持 COW 快照，
     /// [`Self::edit`] 不污染宿主编辑区共享的 rope 原树（有回归测试锁）。
-    pub(crate) fn open_rope(rope: Rope) -> Self {
+    pub fn open_rope(rope: Rope) -> Self {
         let (ls32, ls16, char_count, total_utf16) = build_line_stats_utf16_rope(&rope);
         let n = ls32.len();
         let rope_len = rope.len();
@@ -503,8 +503,7 @@ impl Doc {
             total_utf16,
             edit_ver: 0,
             text_cache: RefCell::new(None),
-            #[cfg(test)]
-            text_shared_calls: std::cell::Cell::new(0),
+            text_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -512,7 +511,7 @@ impl Doc {
     /// 替代旧 `reopen`（需先拼好**全新整串**再全量索引）——编辑后 rope 为唯一增量源
     /// `src`，O(log n + 变化区)，删掉每键 O(n) 整串复制分配（6MB 文档每键省一次
     /// 6MB memcpy）。
-    pub(crate) fn edit(&mut self, range: Range<usize>, text: &str) {
+    pub fn edit(&mut self, range: Range<usize>, text: &str) {
         let _t_doc = crate::prof::begin();
         let old_len = self.len();
         let start = range.start.min(old_len);
@@ -665,13 +664,13 @@ impl Doc {
     }
 
     /// 块总数（虚拟化滚动条量程用，O(1)）。
-    pub(crate) fn block_count(&self) -> usize {
+    pub fn block_count(&self) -> usize {
         self.index.blocks.len()
     }
 
     /// 源码行 → 包含它的块下标（块按 `src_line` 升序连续覆盖；越界归到首/末块）。
     /// 编辑后块下标的稳定性判定（`pending_patch_blocks`）依赖它。
-    pub(crate) fn block_index_for_line(&self, line: usize) -> usize {
+    pub fn block_index_for_line(&self, line: usize) -> usize {
         let b = &self.index.blocks;
         if b.is_empty() {
             return 0;
@@ -683,14 +682,14 @@ impl Doc {
 
     /// 每行起始字节偏移（`split('\n')` 语义，长度 = 行数）——`row_col`/`line_start`/
     /// `line_end` 的 O(log n) 二分索引（替代每帧对整篇源文本的线性扫描）。
-    pub(crate) fn line_starts(&self) -> &LineStarts {
+    pub fn line_starts(&self) -> &LineStarts {
         &self.line_starts
     }
 
     /// 显示语义行数（`str::lines()` 口径，与状态栏一致）：`line_starts` 含**末尾换行符
     /// 产生的幻影尾行**（`split('\n')` 语义），`lines().count()` 不计它——去掉即一致。
     /// O(1)，不物化全文。
-    pub(crate) fn line_count(&self) -> usize {
+    pub fn line_count(&self) -> usize {
         let n = self.line_starts.len();
         if n > 0 && self.line_starts.get(n - 1) == Some(self.len()) {
             n - 1
@@ -700,12 +699,12 @@ impl Doc {
     }
 
     /// 标量字符数（`chars().count()` 口径），`edit` 增量维护，O(1)。
-    pub(crate) fn char_count(&self) -> usize {
+    pub fn char_count(&self) -> usize {
         self.char_count
     }
 
     /// 全文 UTF-16 单元总数（IME `text_length_utf16` 用），`edit` 增量维护，O(1)。
-    pub(crate) fn total_utf16(&self) -> usize {
+    pub fn total_utf16(&self) -> usize {
         self.total_utf16
     }
 
@@ -718,7 +717,7 @@ impl Doc {
 
     /// 字节偏移 → 前累计 UTF-16 单元数（IME 协议层换算；O(log n + 行长)：行表二分
     /// + 行内切片计数，不触碰全文）。
-    pub(crate) fn byte_to_utf16(&self, byte: usize) -> usize {
+    pub fn byte_to_utf16(&self, byte: usize) -> usize {
         let byte = byte.min(self.len());
         let i = self
             .line_starts
@@ -741,7 +740,7 @@ impl Doc {
     /// UTF-16 单元数 → 字节偏移（IME 协议层换算；O(log n + 行长)，越界钳到行尾/文末）。
     /// 与全量 `s.char_indices()` 版 `offset_from_utf16` 语义一致：返回「累计 ≥ 目标」的
     /// 第一个字符起始字节。
-    pub(crate) fn utf16_to_byte(&self, utf16: usize) -> usize {
+    pub fn utf16_to_byte(&self, utf16: usize) -> usize {
         let i = self
             .line_utf16_starts
             .partition_point(|&v| v <= utf16)
@@ -763,13 +762,13 @@ impl Doc {
 
     /// 第 `i` 块的轻量元数据（`BlockMeta`，≈20B，O(段数)）——窗口化 shaping 的
     /// 块高估算/带内判定只依赖它，**不物化行**。
-    pub(crate) fn block_meta(&self, i: usize) -> Option<BlockMeta> {
+    pub fn block_meta(&self, i: usize) -> Option<BlockMeta> {
         self.index.blocks.get(i)
     }
 
     /// 第 `ix` 源行的 `(字符数, 是否全 ASCII)`——窗口化 shaping 的块高估算用：
     /// 只读字节切片数 chars，不物化 `Row`、不 shape，O(行长)。
-    pub(crate) fn line_chars_ascii(&self, ix: usize) -> (usize, bool) {
+    pub fn line_chars_ascii(&self, ix: usize) -> (usize, bool) {
         let s = self.line_starts.get(ix).unwrap_or(0);
         let e = self
             .line_starts
@@ -825,7 +824,7 @@ impl Doc {
     }
 
     /// 按块窗口物化统一行（`[lo_block, hi_block]`，含两端）。
-    pub(crate) fn rows_in_block_window(&self, lo: usize, hi: usize) -> Vec<DocRow> {
+    pub fn rows_in_block_window(&self, lo: usize, hi: usize) -> Vec<DocRow> {
         let rows = match &self.src {
             DocSrc::Str(s) => parse_block_window(s.as_ref(), &self.index, lo, hi),
             DocSrc::Rope(r) => parse_block_window_rope(r, &self.index, lo, hi),
@@ -853,7 +852,7 @@ impl Doc {
     }
 
     /// 第 `ix` 行的源码文本（仅该行切片，O(行长)）。
-    pub(crate) fn line_str(&self, ix: usize) -> String {
+    pub fn line_str(&self, ix: usize) -> String {
         let s = self.line_starts.get(ix).unwrap_or(0);
         let e = self
             .line_starts
@@ -881,21 +880,21 @@ impl Doc {
     }
 
     /// 底层 rope（快照 / COW 编辑用）。
-    pub(crate) fn rope(&self) -> &Rope {
+    pub fn rope(&self) -> &Rope {
         &self.rope
     }
 
     /// 全文字节长（编辑/光标边界钳位用；rope 单真源，O(1)）。
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.rope.len()
     }
 
     /// 全文（宿主镜像/测试/派生全量扫描用）。Str 源（load 后）O(1) 克隆；rope 源
     /// 走**版本化缓存**（键 `edit_ver`，edit 后失效）——保底任何遗漏调用点不再重复
     /// O(n) 拷贝（输入热路径已改走 UTF-16 索引/切片，见 `EntityInputHandler`）。
-    pub(crate) fn text_shared(&self) -> SharedString {
-        #[cfg(test)]
-        self.text_shared_calls.set(self.text_shared_calls.get() + 1);
+    pub fn text_shared(&self) -> SharedString {
+        // 测试探针计数无条件自增（markdown-wysiwyg 测试跨 crate 观测；非热路径）。
+        self.text_calls.set(self.text_calls.get() + 1);
         if let Some((ver, s)) = &*self.text_cache.borrow()
             && *ver == self.edit_ver {
                 return s.clone();
@@ -908,14 +907,14 @@ impl Doc {
         s
     }
 
-    /// （仅测试）`text_shared` 被调次数——B 步断言 `EntityInputHandler` 不再物化全文。
-    #[cfg(test)]
-    pub(crate) fn text_shared_calls(&self) -> u64 {
-        self.text_shared_calls.get()
+    /// `text_shared` 被调次数（跨 crate 测试探针）——B 步断言
+    /// `EntityInputHandler` 不再物化全文。markdown-wysiwyg 测试跨 crate 消费 → 无条件 pub。
+    pub fn text_shared_calls(&self) -> u64 {
+        self.text_calls.get()
     }
 
     /// 字节区间切片（O(区间长)；边界钳到 [0, len]，rope 单切一次）。
-    pub(crate) fn slice_str(&self, range: Range<usize>) -> String {
+    pub fn slice_str(&self, range: Range<usize>) -> String {
         let r = range.start.min(self.len())..range.end.min(self.len());
         if r.end <= r.start {
             return String::new();
@@ -1125,7 +1124,7 @@ fn code_byte_map<V: DocLineView>(
 }
 
 /// 预览 `RowKind` → IR 语义（对齐子集上恒等；parity 保证二者一致）。
-pub(crate) fn row_kind(k: RowKind) -> IrKind {
+pub fn row_kind(k: RowKind) -> IrKind {
     match k {
         RowKind::Paragraph => IrKind::Paragraph,
         RowKind::Heading(n) => IrKind::Heading(n),
@@ -1426,4 +1425,3 @@ mod tests {
         }
     }
 }
-

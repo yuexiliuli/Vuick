@@ -1,0 +1,35 @@
+[package]
+name = "markdown-wysiwyg"
+version = "0.1.0"
+edition = "2024"
+description = "gpui-editor 自研 WYSIWYG 所见即所得编辑 crate（自 crates/markdown 的 wysiwyg 拆分独立，依赖 markdown 的 parse/doc/ir/view 共享层）"
+
+[dependencies]
+# 渲染/宿主：gpui 钉 zed 提交（workspace 统一版本）。
+gpui = { workspace = true }
+# 大文档「分块读盘·渐进装配」/ 解析报错上下文。
+anyhow = { workspace = true }
+# 位图（WebP/PNG 图片行、EPUB 内存图）栅格化。
+image = { workspace = true }
+# LaTeX 数学排版：parse → layout → render（embed-fonts 内嵌 KaTeX 字体）。
+ratex-parser = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-render = { workspace = true }
+# 文本存储 / WYSIWYG 缓冲区（与 editor 同版本 ropey，本 crate 自持一份）。
+ropey = { workspace = true }
+# 快速非加密哈希：fold_plan/shape 缓存容器重建。
+rustc-hash = { workspace = true }
+serde_json = { workspace = true }
+# 项目内叶子/核心 crate（沿 markdown 原依赖抄，仅含 wy 面实际消费的）。
+config = { path = "../config" }
+base = { path = "../base" }
+ime = { path = "../ime" }
+ui = { path = "../ui" }
+editor = { path = "../editor" }
+syntax = { path = "../syntax" }
+# 向上依赖：共享 parse/doc/ir/view 解析与文档层。
+markdown = { path = "../markdown" }
+
+[dev-dependencies]
+# zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
+gpui = { workspace = true, features = ["test-support"] }

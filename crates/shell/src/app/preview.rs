@@ -320,7 +320,7 @@ impl EditorApp {
     pub(super) fn md_toc_source(
         &self,
         cx: &gpui::App,
-    ) -> Option<(markdown::wysiwyg::TocEntries, MdTocScroll)> {
+    ) -> Option<(markdown_wysiwyg::TocEntries, MdTocScroll)> {
         let tab = self.tabs.get(self.active_tab)?;
         let wy = tab.md_wy.as_ref()?;
         Some((wy.read(cx).toc_entries(), MdTocScroll::Unified(wy.clone())))
@@ -906,7 +906,7 @@ impl EditorApp {
             // 同步小整篇（无「旧→新」等待；`open_from_str` 免 `set_source_text` 的一次
             // 字符串复制，直接共享这份 `content`）。
             wy.update(cx, |w, _| {
-                w.install_open(markdown::wysiwyg::WyEditor::open_from_str(content))
+                w.install_open(markdown_wysiwyg::WyEditor::open_from_str(content))
             });
             if let Some(t) = self.tabs.get_mut(idx) {
                 t.md_wy_pending = None;
@@ -1032,7 +1032,7 @@ impl EditorApp {
                         text.push_str(&chunk.text);
                     }
                     Ok::<_, std::io::Error>(
-                        markdown::wysiwyg::WyEditor::open_from_str(text.into()),
+                        markdown_wysiwyg::WyEditor::open_from_str(text.into()),
                     )
                 })
                 .await;
@@ -1098,7 +1098,7 @@ impl EditorApp {
         &mut self,
         idx: usize,
         wy: &gpui::Entity<WyEditor>,
-        result: markdown::wysiwyg::WyOpenResult,
+        result: markdown_wysiwyg::WyOpenResult,
         cx: &mut Context<Self>,
     ) {
         let anchor = wy.read(cx).top_source_line();
@@ -1144,7 +1144,7 @@ impl EditorApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { markdown::wysiwyg::WyEditor::open_from_rope(prefix) })
+                .spawn(async move { markdown_wysiwyg::WyEditor::open_from_rope(prefix) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 let Some(tab) = this.tabs.get_mut(idx) else {
@@ -1184,7 +1184,7 @@ impl EditorApp {
         if rope.len() < MD_WY_ASYNC_INSTALL_MIN_BYTES {
             // 同步小整篇：装好后预览 == 编辑区 → 解除在途标记。
             wy.update(cx, |w, _| {
-                w.install_open(markdown::wysiwyg::WyEditor::open_from_rope(rope))
+                w.install_open(markdown_wysiwyg::WyEditor::open_from_rope(rope))
             });
             if let Some(t) = self.tabs.get_mut(idx) {
                 t.md_wy_pending = None;
@@ -1211,7 +1211,7 @@ impl EditorApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    markdown::wysiwyg::WyEditor::open_from_rope(rope)
+                    markdown_wysiwyg::WyEditor::open_from_rope(rope)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1258,7 +1258,7 @@ impl EditorApp {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    markdown::wysiwyg::WyEditor::open_from_str(content)
+                    markdown_wysiwyg::WyEditor::open_from_str(content)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -1286,7 +1286,7 @@ impl EditorApp {
         .detach();
     }
 
-    /// 「预览编辑测试」开关：用本项目 `markdown::wysiwyg::WyEditor` 渲染左面板。
+    /// 「预览编辑测试」开关：用本项目 `markdown_wysiwyg::WyEditor` 渲染左面板。
     pub(super) fn toggle_live_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let idx = self.active_tab;
         if !self.is_markdown_tab(idx) {
@@ -1417,8 +1417,8 @@ impl EditorApp {
                             // （纯 doc 依赖量、无窗口/主题）——首帧经 `pass1_from_prebuild`
                             // 轻量物化 + arm 冷开保温（prebuild=Some），不丢冷开路径设施。
                             let prebuild =
-                                markdown::wysiwyg::frame::build_prebuild_pass1(&doc_clone);
-                            markdown::wysiwyg::WyEditor::open_result_from_doc(
+                                markdown_wysiwyg::frame::build_prebuild_pass1(&doc_clone);
+                            markdown_wysiwyg::WyEditor::open_result_from_doc(
                                 doc_clone,
                                 math_dollar,
                                 alert_marker,
@@ -1451,7 +1451,7 @@ impl EditorApp {
                     let result =
                         cx.background_executor()
                             .spawn(async move {
-                                markdown::wysiwyg::WyEditor::open_from_rope(rope)
+                                markdown_wysiwyg::WyEditor::open_from_rope(rope)
                             })
                             .await;
                     crate::prof::add_absolute(

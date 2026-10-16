@@ -98,7 +98,7 @@ impl EditorApp {
     /// Ctrl+滚轮缩放**无缝**、不带动滚动位置（收敛自驱动在 WyEditor 元素 prepaint）。
     fn drive_wy_host(
         &self,
-        ed: &gpui::Entity<markdown::wysiwyg::WyEditor>,
+        ed: &gpui::Entity<markdown_wysiwyg::WyEditor>,
         vhand: &gpui::ScrollHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -120,7 +120,7 @@ impl EditorApp {
     /// Ctrl+滚轮缩放**无缝**、不带动滚动位置。
     fn render_live_area(
         &mut self,
-        ed: &gpui::Entity<markdown::wysiwyg::WyEditor>,
+        ed: &gpui::Entity<markdown_wysiwyg::WyEditor>,
         window: &mut Window,
         grow: f32,
         cx: &mut Context<Self>,

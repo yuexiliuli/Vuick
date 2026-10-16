@@ -75,8 +75,8 @@ use ui::icon::{Icon, IconName};
 use ui::theme::ChromeColors;
 use ui::motion::hover_spring;
 
-// WYSIWYG 预览编辑——本项目 `markdown::wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
-use markdown::{WyEditor, WyEvent};
+// WYSIWYG 预览编辑——本项目 `markdown_wysiwyg::WyEditor`（已取代 zorite 移植的 `live`）。
+use markdown_wysiwyg::{WyEditor, WyEvent};
 
 use crate::actions::*;
 use config::layout::{
@@ -120,7 +120,7 @@ struct EditorTab {
     /// 是否处于「所见即所得预览编辑」模式：左面板用 `WyEditor` 代替源码编辑区；
     /// 退出时内容写回。
     live_edit: bool,
-    /// 「预览编辑测试」：本项目 `markdown::wysiwyg::WyEditor`（以 `Doc` 为数据源）。
+    /// 「预览编辑测试」：本项目 `markdown_wysiwyg::WyEditor`（以 `Doc` 为数据源）。
     /// None = 未启用。启用即 `live_edit = true`。
     live2: Option<gpui::Entity<WyEditor>>,
     /// 「预览编辑测试」本 live 会话里 WYSIWYG 内容是否被**编辑过**（`WyEvent::Changed`

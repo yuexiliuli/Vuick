@@ -215,7 +215,7 @@ impl EditorApp {
         ))
     }
 
-    /// "查看"菜单：「预览编辑测试」——本项目 `markdown::wysiwyg::WyEditor`
+    /// "查看"菜单：「预览编辑测试」——本项目 `markdown_wysiwyg::WyEditor`
     /// （以 `Doc` 为数据源、所见即所得编辑的 WYSIWYG；已取代 zorite 移植的 `live`）。
     fn live_test_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
         let weak2 = weak.clone();

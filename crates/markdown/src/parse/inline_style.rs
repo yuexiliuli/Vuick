@@ -26,7 +26,7 @@ pub(crate) fn heading_level(line: &str) -> Option<u8> {
 /// (`- ### Notes`, the outliner shape). Returns the depth plus the line's
 /// indent when it's a LIST heading (`None` = a top-level heading) — list
 /// headings fold by indent, not by heading boundaries.
-pub(crate) fn line_heading_level(line: &str) -> Option<(u8, Option<usize>)> {
+pub fn line_heading_level(line: &str) -> Option<(u8, Option<usize>)> {
     if let Some(l) = heading_level(line) {
         return Some((l, None));
     }
@@ -44,7 +44,7 @@ pub(crate) fn line_heading_level(line: &str) -> Option<(u8, Option<usize>)> {
 /// than the heading's own indent (blank lines included). Every line matching
 /// a folded key folds (duplicate headings fold together; the key is the line
 /// text).
-pub(crate) fn heading_fold_regions(
+pub fn heading_fold_regions(
     content: &str,
     folded: &std::collections::HashSet<String>,
 ) -> Vec<Range<usize>> {
@@ -115,7 +115,7 @@ pub(crate) fn thematic_break(line: &str) -> bool {
     }
     count >= 3
 }
-pub(crate) use super::recognition::{AlertKind, alert_prefix};
+pub use super::recognition::{AlertKind, alert_prefix};
 
 /// Each alert (callout) region in `content`: an alert marker line (with or
 /// without a fold char) plus its `>` continuation lines, ending at a blank /
@@ -123,7 +123,7 @@ pub(crate) use super::recognition::{AlertKind, alert_prefix};
 /// kind, and the fold state (`Some` only when the marker carries `-`/`+`).
 /// Marker recognition delegates to [`super::recognition::alert_prefix`] (single
 /// source); the two public queries below derive from here.
-pub(crate) fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> {
+pub fn alert_regions(content: &str) -> Vec<(Range<usize>, AlertKind, Option<bool>)> {
     fn marker(line: &str) -> Option<(AlertKind, Option<bool>)> {
         let p = blockquote_prefix(line)?;
         let (kind, _, fold) = alert_prefix(&line[p..])?;
@@ -166,8 +166,8 @@ pub(crate) fn alert_fold_regions(content: &str) -> Vec<(Range<usize>, bool)> {
 /// 供 WYSIWYG 把整段 callout 的左条统一画成警报色。键 = 源码行号；含/不含
 /// 折叠符的警报都覆盖（由 [`alert_regions`] 派生）。生产路径经
 /// `WyEditor::derived()` 消费；此薄壳仅测试用。
-#[cfg(test)]
-pub(crate) fn alert_region_kinds(content: &str) -> std::collections::HashMap<usize, AlertKind> {
+/// 供 markdown-wysiwyg 测试跨 crate 消费 → 转无条件 pub（纯派生，无 cfg(test) 依赖）。
+pub fn alert_region_kinds(content: &str) -> std::collections::HashMap<usize, AlertKind> {
     let mut out = std::collections::HashMap::new();
     for (r, kind, _) in alert_regions(content) {
         for l in r {
@@ -177,7 +177,7 @@ pub(crate) fn alert_region_kinds(content: &str) -> std::collections::HashMap<usi
     out
 }
 
-pub(crate) fn blockquote_prefix(line: &str) -> Option<usize> {
+pub fn blockquote_prefix(line: &str) -> Option<usize> {
     let b = line.as_bytes();
     if b.first() != Some(&b'>') {
         return None;
@@ -242,7 +242,7 @@ pub(crate) fn task_prefix(line: &str) -> Option<(usize, usize, bool)> {
 /// Toggle a GFM task item's checkbox in `line` — flip the char between the
 /// brackets (`[ ]`↔`[x]`). Returns the rewritten line, or `None` if `line` isn't
 /// a task item. The length is unchanged (one ASCII byte swapped).
-pub(crate) fn toggle_task_checkbox(line: &str) -> Option<String> {
+pub fn toggle_task_checkbox(line: &str) -> Option<String> {
     let (prefix_len, _indent, checked) = task_prefix(line)?;
     let box_byte = prefix_len - 3; // the char between `[` and `]`
     let mut out = line.to_string();
@@ -315,7 +315,7 @@ impl MathAlign {
 }
 
 /// Parse a `<!-- math:ALIGN -->` marker line. `None` if it isn't one.
-pub(crate) fn math_align_marker(line: &str) -> Option<MathAlign> {
+pub fn math_align_marker(line: &str) -> Option<MathAlign> {
     let inner = line
         .trim()
         .strip_prefix("<!--")?
@@ -327,13 +327,13 @@ pub(crate) fn math_align_marker(line: &str) -> Option<MathAlign> {
 /// A detected `$$…$$` block: its line range (both fences), the LaTeX between them, its
 /// alignment, and the optional `<!-- math:ALIGN -->` marker line directly above it.
 #[derive(Clone)]
-pub(crate) struct MathRegion {
+pub struct MathRegion {
     pub range: Range<usize>,
     pub source: String,
     pub align: MathAlign,
 }
 
-pub(crate) fn math_regions(content: &str) -> Vec<MathRegion> {
+pub fn math_regions(content: &str) -> Vec<MathRegion> {
     let lines: Vec<&str> = content.split('\n').collect();
     let mut out = Vec::new();
     let mut in_code = false;
@@ -389,7 +389,7 @@ pub(crate) fn math_regions(content: &str) -> Vec<MathRegion> {
 
 /// The inner LaTeX when the whole (trimmed) line is one `$$…$$` pair with
 /// non-empty content — the one-line display-math form.
-pub(crate) fn one_line_math(line: &str) -> Option<&str> {
+pub fn one_line_math(line: &str) -> Option<&str> {
     let t = line.trim();
     let inner = t.strip_prefix("$$")?.strip_suffix("$$")?;
     let inner = inner.trim();
@@ -410,7 +410,7 @@ pub(crate) fn one_line_math(line: &str) -> Option<&str> {
 /// A whole-line image is handled as a block widget (`image_row`) before a line
 /// reaches inline shaping, so these are the mixed-line (text + image) ones.
 /// Images inside inline code aren't matched.
-pub(crate) fn inline_image_spans(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
+pub fn inline_image_spans(line: &str) -> Vec<(Range<usize>, Range<usize>)> {
     let b = line.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -433,7 +433,7 @@ pub(crate) fn inline_image_spans(line: &str) -> Vec<(Range<usize>, Range<usize>)
 
 /// The LaTeX inside an inline-math `span` of `line` — strips one `$` per
 /// side, or two for a same-line `$$…$$` display pair.
-pub(crate) fn inline_math_latex<'a>(line: &'a str, span: &Range<usize>) -> &'a str {
+pub fn inline_math_latex<'a>(line: &'a str, span: &Range<usize>) -> &'a str {
     let d = if line[span.clone()].starts_with("$$") {
         2
     } else {
@@ -442,7 +442,7 @@ pub(crate) fn inline_math_latex<'a>(line: &'a str, span: &Range<usize>) -> &'a s
     &line[span.start + d..span.end - d]
 }
 
-pub(crate) fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
+pub fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
     let bytes = line.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -520,7 +520,7 @@ pub(crate) fn inline_math_spans(line: &str) -> Vec<Range<usize>> {
 /// string (to position the painted image) and the SOURCE byte range of the `$…$` span (to
 /// hit-test a click back to the formula and to target its edit/commit).
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct InlineMathPlace {
+pub struct InlineMathPlace {
     pub display_off: usize,
     /// Byte length of the spacer. Needed to place the raster on an RTL row,
     /// where `display_off` is the spacer's RIGHT edge, not its left.
@@ -555,7 +555,7 @@ fn clip_runs(runs: &[TextRun], lo: usize, hi: usize) -> Vec<TextRun> {
 /// color (its glyphs are spaces, so only the advance matters) and maps back to the span start,
 /// so a click on it lands the caret at the formula (which then reveals raw source / opens the
 /// editor).
-pub(crate) fn splice_inline_math(
+pub fn splice_inline_math(
     display: &str,
     runs: &[TextRun],
     map: &[usize],

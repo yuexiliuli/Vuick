@@ -100,7 +100,7 @@
             app.update(cx, |app, cx| {
                 let wy = app.tabs[app.active_tab].md_wy.clone().unwrap();
                 wy.update(cx, |ed, _cx| {
-                    ed.install_open(markdown::wysiwyg::WyEditor::open_from_str(
+                    ed.install_open(markdown_wysiwyg::WyEditor::open_from_str(
                         "# 就绪正文\n\n解析完成后的预览内容。\n".into(),
                     ));
                 });
@@ -2989,7 +2989,7 @@
             "滚动到标题 300 后顶行不应为 0（实际 {before}）"
         );
         // 整篇就绪 → 带守卫换入全文（同 `md_wy_spawn_early_install` 完成回调的落地）。
-        let wy_open = markdown::wysiwyg::WyEditor::open_from_str(full.clone().into());
+        let wy_open = markdown_wysiwyg::WyEditor::open_from_str(full.clone().into());
         cx.update(|_, cx| {
             app.update(cx, |app, cx| {
                 let idx = app.active_tab;
@@ -3161,7 +3161,7 @@
         cx.update(|window, cx| {
             app.update(cx, |app, cx| {
                 let idx = app.active_tab;
-                let ed = cx.new(|cx| markdown::wysiwyg::WyEditor::new(window, cx));
+                let ed = cx.new(|cx| markdown_wysiwyg::WyEditor::new(window, cx));
                 ed.update(cx, |ed, _| ed.capture_live_ops());
                 app.tabs[idx].live2 = Some(ed.clone());
                 app.tabs[idx]._live2_sub = None;
@@ -3193,7 +3193,7 @@
             app.update(cx, |app, cx| {
                 let live = app.tabs[app.active_tab].live2.clone().unwrap();
                 live.update(cx, |ed, _cx| {
-                    ed.install_open(markdown::wysiwyg::WyEditor::open_from_str(
+                    ed.install_open(markdown_wysiwyg::WyEditor::open_from_str(
                         "# 就绪正文\n\n装配完成后的 WYSIWYG 内容。\n".into(),
                     ));
                 });

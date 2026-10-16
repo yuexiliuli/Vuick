@@ -532,7 +532,7 @@ pub(crate) fn trim_paragraph(line: &str) -> &str {
 /// 逐类型镜像 [`parse_to_rows`] 的段派生（标题剥 `#`、列表剥前缀、引述剥 `>`、
 /// 段落剥行首空格/Tab），供底座 [`crate::markdown::doc`] 为统一行装配
 /// 「渲染字节 → 源字节」编辑映射。非文本行（代码/表格/图片/分隔线/空行）返回 `None`。
-pub(crate) fn text_segment(line: &str, kind: RowKind) -> Option<(usize, &str)> {
+pub fn text_segment(line: &str, kind: RowKind) -> Option<(usize, &str)> {
     let lead = line.len() - line.trim_start().len();
     let t = &line[lead..];
     match kind {
@@ -715,7 +715,7 @@ fn unescape_table_cell_mapped(s: &str) -> (String, Vec<usize>) {
 /// 返回逐单元格 `(源字节区间, 渲染文本, 渲染字节→源字节映射)`：
 /// - `源字节区间`相对**该行行首**（trim 掉空白后的内容，`src.end` 为哨兵能指到的尾）；
 /// - 映射长度 = `渲染文本.len()+1`，末项哨兵 = `src.end`（相对行首）。
-pub(crate) fn split_table_cells_mapped(
+pub fn split_table_cells_mapped(
     line: &str,
 ) -> Vec<(Range<usize>, SharedString, Vec<usize>)> {
     let base = line.as_ptr() as usize;
@@ -818,20 +818,20 @@ pub(crate) fn inline_strip(s: &str) -> SharedString {
 
 /// `![alt](src)` 前缀识别核心（原 `markdown::image` 模块，并入 `parser` 减少零散文件；
 /// 与 preview/wysiwyg 的识别语义由 `parity::image_construct_edges_are_documented` 钉死）。
-pub(crate) struct ImgRef<'a> {
+pub struct ImgRef<'a> {
     /// alt（原样，未 trim）。
-    pub(crate) alt: &'a str,
+    pub alt: &'a str,
     /// src（已 trim）。
-    pub(crate) src: &'a str,
+    pub src: &'a str,
     /// `)` 之后的尾部（未 trim）。
-    pub(crate) tail: &'a str,
+    pub tail: &'a str,
     /// `](` 中 `]` 相对 `![` 之后的偏移（供解析器精确复刻其「首个 `]`」历史规则）。
-    pub(crate) close_alt_rel: usize,
+    pub close_alt_rel: usize,
 }
 
 /// 从行首解析 `![alt](src)`：要求 `![` 后第一个 `](` 成对、`(` 后有 `)`、src 非空。
 /// 只做前缀匹配；整行 / `{width=N}` / 列表前缀等策略由各调用方决定。
-pub(crate) fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
+pub fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
     let rest = line.strip_prefix("![")?;
     let close_alt = rest.find("](")?;
     let alt = &rest[..close_alt];
@@ -850,7 +850,7 @@ pub(crate) fn parse_ref(line: &str) -> Option<ImgRef<'_>> {
 /// 识别独立图片行 `![alt](src)`（可带尾部空白）。返回 (alt, src)。
 /// 前缀识别复用共享核心 [`parse_ref`]，这里叠加「整行」策略：
 /// `]` 后必须紧跟 `(`，且 `)` 后只能剩空白。
-pub(crate) fn parse_image_line(t: &str) -> Option<(String, String)> {
+pub fn parse_image_line(t: &str) -> Option<(String, String)> {
     let r = parse_ref(t)?;
     // 历史语义：alt 由「第一个 `]`」界定且必须紧跟 `(`。`parse_ref` 取的是第一处
     // `](`；仅当 `]` 出现在 `](` 之前时二者不同（如 `![a]b](c)`）→ 既有实现返回 None。
