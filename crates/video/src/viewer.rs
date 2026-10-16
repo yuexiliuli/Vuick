@@ -279,6 +279,9 @@ pub struct VideoViewer {
     // --- 纯视频模式（参考纯图片锁定）：控制条为浮层，按需浮现 / 自隐 ---
     /// 是否「纯视频」干净播放模式（宿主据此隐藏全部非视频 UI，视频充满窗口）。
     locked: bool,
+    /// 进入全屏前的锁定态快照：双击进全屏时记录、双击退全屏时恢复原模式（进入前若已锁定
+    /// 则保持锁定；全屏期间手动切锁定会造成退出时按快照恢复的微偏——可接受）。
+    pre_fullscreen_locked: bool,
     /// 底部控制条浮层时序：可见位 + 自隐代序号 + 悬停态 + 延时（收敛于
     /// [`::viewer::auto_hide`]；进锁定默认可见、切视频/悬停浮现、离开 1s 自隐、
     /// hover 抑制）。
@@ -347,6 +350,7 @@ impl VideoViewer {
             pan: (0.0, 0.0),
             drag: None,
             locked: false,
+            pre_fullscreen_locked: false,
             controls_auto: auto_hide::AutoHide::new(),
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -1361,12 +1365,53 @@ impl VideoViewer {
     /// 切换纯视频模式：锁定 = 隐藏非视频 UI、视频充满窗口（宿主壳体重排后自动缩放填满）、
     /// 控制条浮层按需浮现；解锁回归。切换时平移/拖拽归零。
     pub fn toggle_lock(&mut self, cx: &mut Context<Self>) {
-        self.locked = !self.locked;
+        let locked = !self.locked;
+        self.set_locked(locked, cx);
+    }
+
+    /// 直接设置纯视频（锁定）模式（`toggle_lock` 翻转与双击全屏共用同一副作用，避免平行
+    /// 重写）：锁定 = 隐藏非视频 UI、视频充满窗口；解锁回归。切换时平移/拖拽归零。
+    fn set_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        self.locked = locked;
         self.pan = (0.0, 0.0);
         self.drag = None;
         // 进/出锁定都让控制条浮现一次（锁定态随即 1s 自隐）
         self.show_controls_temporarily(cx);
         cx.notify();
+    }
+
+    /// 双击画面区是否应**退出**全屏（纯函数，不读窗口，测试可注入 `is_fs` 确定性断言退出
+    /// 路径）：当前已全屏 → 退出；未全屏 → 进入（进入后自动进纯视频锁定，再双击退出并恢复
+    /// 进入前的模式）。
+    fn should_exit_fullscreen(is_fs: bool) -> bool {
+        is_fs
+    }
+
+    /// 视频画面区（`#video-main`）双击：进入 OS 窗口全屏 + 纯视频锁定；已全屏时再双击退出
+    /// 并恢复进入前的锁定模式（进入前已锁定则保持锁定）。控制条/进度条/状态浮层是画面上层
+    /// 覆盖子元素、优先消费其命中的双击，不会到达这里；纯事件驱动，不引入定时器/每帧工作。
+    fn on_video_surface_mouse_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 双击语义与欢迎页/编辑区同套（click_count >= 2；左键由 on_mouse_down(Left) 保证，
+        // 单击 = click_count 1 直接 return，不抢单击/拖拽语义）
+        if ev.click_count < 2 {
+            return;
+        }
+        if Self::should_exit_fullscreen(window.is_fullscreen()) {
+            // 退出全屏：恢复进入全屏前的模式（全屏期间手动切锁定会按进入前快照恢复——可接受微偏）
+            window.toggle_fullscreen();
+            let restore = self.pre_fullscreen_locked;
+            self.set_locked(restore, cx);
+        } else {
+            // 进入全屏：先记录进入前锁态，再进全屏并锁定（set_locked 内已归零平移/浮现控制条）
+            self.pre_fullscreen_locked = self.locked;
+            window.toggle_fullscreen();
+            self.set_locked(true, cx);
+        }
     }
 
     // ---- 控制条浮现 / 自隐（锁定模式浮层；普通模式常驻） ----
@@ -1391,6 +1436,21 @@ impl VideoViewer {
         } else {
             self.controls_auto.hover_out();
             self.show_controls_temporarily(cx);
+        }
+    }
+
+    /// 控制条 / 状态浮层命中**双击** → 终止向 `#video-main` 冒泡（与画面双击全屏互斥）：
+    /// seek/音量条等子元素先消费各自的 mousedown，轮到本处理器时只吞掉 `click_count>=2`，
+    /// 使双击进度条/按钮/空隙不再误触进入/退出全屏。单击透传不拦截——验收口径「单击/
+    /// 拖拽行为全不变」（拖拽起点仍按既有方式落到画面元素）。
+    fn on_controls_mouse_down(
+        &mut self,
+        ev: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ev.click_count >= 2 {
+            cx.stop_propagation();
         }
     }
 
@@ -1498,6 +1558,9 @@ impl VideoViewer {
             // 纯视频模式隐藏：透明热区（继续占底部、可接收 hover 触发浮现）
             return strip.into_any_element();
         }
+        // 可见控制条：双击不让其漏到画面区（与 `#video-main` 双击全屏互斥）；须挂在
+        // `if 隐藏早退` 之后——隐藏态透明热区下方就是视频画面，双击仍需命中画面元素。
+        let strip = strip.on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down));
         let colors = ui::theme::Theme::global(cx).colors;
         let dark = ui::theme::Theme::global(cx).is_dark();
         let fg: Hsla = colors.fg.into();
@@ -1906,6 +1969,11 @@ impl Render for VideoViewer {
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_pan_down))
+                    // 双击画面 → 全屏 + 锁定（单击/拖拽仍是 on_pan_down）。互斥不靠「上层覆盖
+                    // 元素优先消费」：gpui 鼠标事件在命中栈内冒泡，控制条/状态浮层/进度条命中
+                    // 的双击由各自 `on_controls_mouse_down` `stop_propagation` 拦截，到不了这里；
+                    // 隐藏态控制条透明热区不挂该拦截 → 双击仍是画面全屏。
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_video_surface_mouse_down))
                     .on_mouse_move(cx.listener(Self::on_pan_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_pan_up))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_pan_up))
@@ -1928,6 +1996,8 @@ impl Render for VideoViewer {
                     .rounded_lg()
                     .border_1()
                     .border_color(toast_border)
+                    // 状态浮层同样吞双击（归属 `on_controls_mouse_down` 互斥族：不向画面漏）。
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_controls_mouse_down))
                     // 玻璃卡片：半透明表面 + 圆角 + 高光内阴影；出现时短弹簧淡入（收敛即静止，
                     // 无持续重绘）。消失仍由 `STATUS_MS` 到期卸载，不做离场动画。
                     .bg(toast_surface.opacity(if is_dark {
@@ -2049,6 +2119,7 @@ mod tests {
             pan: (0.0, 0.0),
             drag: None,
             locked: false,
+            pre_fullscreen_locked: false,
             controls_auto: auto_hide::AutoHide::new(),
             seek_bounds: Rc::new(Cell::new(Bounds::default())),
             vol_bounds: Rc::new(Cell::new(Bounds::default())),
@@ -2794,6 +2865,189 @@ mod tests {
         );
         cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
         assert!(!cx.update(|app| ent.read(app).is_locked()));
+        cx.run_until_parked();
+    }
+
+    /// 向窗口派发一次**真实双击**（mousedown `click_count=2` + mouseup `click_count=2`）：
+    /// 走 `simulate_event` 完整分发路径，双击识别与欢迎页同套语义
+    /// （`MouseDownEvent.click_count >= 2`）；`simulate_click` 恒为单击，无法覆盖。
+    fn simulate_double_click(cx: &mut gpui::VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+        cx.simulate_event(gpui::MouseDownEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            button: gpui::MouseButton::Left,
+            position: at,
+            modifiers: gpui::Modifiers::default(),
+            click_count: 2,
+        });
+    }
+
+    /// 全屏退出方向纯函数：未全屏 → 进入；已全屏 → 退出。gpui 测试窗 `is_fullscreen` 从
+    /// `toggle_fullscreen` 反读，进出两路真跑；此处仍把方向判定钉死为可注入断言（防以后
+    /// 平台改行为只测到半条路）。
+    #[test]
+    fn should_exit_fullscreen_is_direction_by_current_fs() {
+        assert!(!VideoViewer::should_exit_fullscreen(false), "未全屏应进入全屏");
+        assert!(VideoViewer::should_exit_fullscreen(true), "已全屏应退出全屏");
+    }
+
+    /// 单击画面（click_count<2）不触发全屏/锁定：双击回调直接 return，单点击仍是
+    /// `on_pan_down` 的拖拽起点语义（drag 已建立）。不占 FFmpeg 锁（新开不存在路径，
+    /// 快速落错误占位）。
+    #[gpui::test]
+    async fn single_click_does_not_fullscreen(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-such-fullscreen.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let at = gpui::Point::new(px(120.), px(100.));
+        wcx.simulate_mouse_down(at, MouseButton::Left, Default::default());
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.drag.is_some())
+        });
+        assert!(!s.0, "单击不应进入锁定");
+        assert!(s.1, "单击仍是拖拽起点（drag 已建立），双击全屏未抢单击语义");
+        wcx.simulate_mouse_up(at, MouseButton::Left, Default::default());
+        cx.run_until_parked();
+    }
+
+    /// 控制条/进度条命中双击**不**触发全屏/锁定（回归：gpui 鼠标事件在命中栈内冒泡，
+    /// 双击进度条曾漏到 `#video-main` 误进全屏——现由控制条 `on_controls_mouse_down`
+    /// `stop_propagation` 拦截）。常驻模式与锁定浮层两态都验：seek 条中点双击后
+    /// `locked`/`pre_fullscreen_locked` 均不应出现「进入全屏」信号。
+    #[gpui::test]
+    async fn double_click_on_control_bar_does_not_fullscreen(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, mut wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-such-probe.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let seek = wcx.cx.read(|app| viewer.read(app).seek_bounds.get());
+        assert!(f32::from(seek.size.width) > 0.0, "seek 条应已布局");
+        let at = seek.center();
+        // 常驻（未锁定）模式：双击进度条不得进全屏
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.pre_fullscreen_locked)
+        });
+        assert!(!s.0, "常驻模式双击进度条不应进入锁定/全屏，实得 locked={}", s.0);
+        assert!(!s.1, "常驻模式双击进度条不应记录进入前锁态");
+        // 锁定浮层（可见）模式：双击进度条同样不得漏到画面
+        wcx.cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.set_locked(true, cx);
+                v.pre_fullscreen_locked = false; // 手动清零隔离信号
+            })
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        assert!(
+            wcx.cx.read(|app| viewer.read(app).controls_auto.visible()),
+            "锁定时控制条应可见（浮层）"
+        );
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.pre_fullscreen_locked)
+        });
+        assert!(s.0, "锁定浮层双击进度条应保持锁定");
+        assert!(!s.1, "锁定浮层双击进度条不应误进全屏（pre_fullscreen_locked 不应被写）");
+        cx.run_until_parked();
+    }
+
+    /// 双击画面 → 全屏 + 锁定（记录进入前锁态）；再双击 → 退出全屏并**恢复进入前的模式**
+    /// （默认未锁定进入 → 退出后回到未锁定）。真实事件分发走真 `toggle_fullscreen`（gpui
+    /// 测试平台反读 `is_fullscreen`），进出两路都真跑。
+    #[gpui::test]
+    async fn double_click_toggles_fullscreen_and_restores_prior_lock(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, mut wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-such-fullscreen.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let at = gpui::Point::new(px(120.), px(100.));
+        // 双击 1：未全屏 → 进入全屏 + 纯视频锁定，记录进入前锁态（false）
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.pre_fullscreen_locked)
+        });
+        assert!(s.0, "双击应进入纯视频锁定");
+        assert!(!s.1, "应记录进入前的锁态（默认未锁定）");
+        // 双击 2：已全屏 → 退出全屏，锁定恢复为进入前模式（未锁定）
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.pre_fullscreen_locked)
+        });
+        assert!(!s.0, "再双击应退出全屏并恢复进入前模式（未锁定）");
+        assert!(!s.1, "pre_fullscreen_locked 保持快照语义");
+        cx.run_until_parked();
+    }
+
+    /// 已锁定状态下双击进全屏 → 再双击退出 → **仍保持锁定**（恢复进入前模式 = 原锁定，
+    /// 验收口径「进入前若已锁定则保持锁定」）。
+    #[gpui::test]
+    async fn double_click_keeps_lock_when_was_locked_before(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            ui::theme::Theme::set(ui::theme::ThemeMode::Dark, cx);
+        });
+        let (viewer, mut wcx) = cx.add_window_view(|_window, cx| {
+            VideoViewer::new(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../fixtures/no-such-fullscreen.mp4"),
+                cx,
+            )
+        });
+        let _ = wcx.refresh();
+        wcx.run_until_parked();
+        let at = gpui::Point::new(px(120.), px(100.));
+        // 进入前已锁定（如锁按钮先锁定，再双击全屏）
+        wcx.cx.update(|app| viewer.update(app, |v, cx| v.set_locked(true, cx)));
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        simulate_double_click(&mut wcx, at);
+        wcx.run_until_parked();
+        let s = wcx.cx.read(|app| {
+            let v = viewer.read(app);
+            (v.is_locked(), v.pre_fullscreen_locked)
+        });
+        assert!(s.0, "进入前已锁定 → 退出全屏后应保持锁定");
+        assert!(s.1, "pre_fullscreen_locked 记录进入前的 true");
         cx.run_until_parked();
     }
 
