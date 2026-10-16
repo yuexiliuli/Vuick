@@ -5308,6 +5308,7 @@ dependencies = [
  "pdf",
  "rfd",
  "ropey",
+ "serde_json",
  "syntax",
  "toc",
  "ui",

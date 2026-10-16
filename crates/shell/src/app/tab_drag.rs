@@ -132,6 +132,8 @@ impl EditorApp {
             self.status = SharedString::from("已还原到主窗口");
         }
         self.status_ok = true;
+        // 收纳后选项卡集合变化 → 立即持久化（detached 窗口由 persist 内部早退）。
+        self.schedule_session_flush(cx, true);
         cx.notify();
     }
 

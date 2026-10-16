@@ -14,3 +14,4 @@ include!("tests/bench.rs");
 include!("tests/panes.rs");
 include!("tests/palette.rs");
 include!("tests/splitter.rs");
+include!("tests/session.rs");

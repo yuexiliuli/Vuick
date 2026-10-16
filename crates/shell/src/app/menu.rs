@@ -62,6 +62,8 @@ impl EditorApp {
             |this, window, cx| this.save_as(window, cx),
         ))
         .separator()
+        .item(Self::session_restore_menu_item(weak.clone()))
+        .separator()
         .item(Self::menu_action_item(
             "退出",
             "Ctrl+Q",
@@ -264,6 +266,28 @@ impl EditorApp {
         })
         .on_click(move |_, window, cx| {
             let _ = weak2.update(cx, |this, cx| this.toggle_wrap(window, cx));
+        })
+    }
+
+    /// "恢复上次会话"菜单项：动态显示当前开关状态（前导 ☑/☐），点击切换并立即持久化
+    /// （同 [`Self::wrap_menu_item`] 的 ☑/☐ 动态项模式）。
+    fn session_restore_menu_item(weak: gpui::WeakEntity<Self>) -> PopupMenuItem {
+        let weak2 = weak.clone();
+        PopupMenuItem::element(move |_, cx| {
+            let on = weak
+                .upgrade()
+                .map(|e| e.read(cx).session_restore)
+                .unwrap_or(true);
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(if on { "☑ 恢复上次会话" } else { "☐ 恢复上次会话" })
+        })
+        .on_click(move |_, window, cx| {
+            let _ = weak2.update(cx, |this, cx| this.toggle_session_restore(window, cx));
         })
     }
 

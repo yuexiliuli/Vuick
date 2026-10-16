@@ -1383,6 +1383,8 @@ impl EditorApp {
                                 tab.dirty = true;
                             }
                             cx.notify();
+                            // WYSIWYG 内容变更 → 防抖持久化（结构变化则即时，见 session 模块）。
+                            this.schedule_session_flush(cx, false);
                         }
                     }
                     WyEvent::OpenPage(p) => {

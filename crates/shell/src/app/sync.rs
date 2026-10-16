@@ -108,6 +108,8 @@ impl EditorApp {
         if !tab.dirty {
             tab.dirty = true;
         }
+        // 内容变更 → 防抖持久化（300ms 停顿后落盘一次；结构变化则即时，见 session 模块）。
+        self.schedule_session_flush(cx, false);
         // 不再 `cx.notify()`：编辑侧的 `notify` 已令窗口把**本视图及其祖先**
         // （含 app 根视图）标脏（gpui `mark_view_dirty`），下一帧必重渲染，
         // 状态栏/选项卡脏点/预览都在同一帧读到最新值——重复通知只是

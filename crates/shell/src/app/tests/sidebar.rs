@@ -1232,10 +1232,13 @@
         settle_frames(cx, 5);
         assert!(cx.debug_bounds("editor-area").is_some(), "有 tab 时应渲染编辑区");
         assert!(cx.debug_bounds("empty-state").is_none(), "有 tab 时绝不显示欢迎页");
-        // 未编辑不弹保存框：close_tab 直通 remove_tab（真实用户「关闭最后一个 tab」路径）
+        // 关闭空未命名选项卡 → 一律弹确认（新口径：未命名无论脏与否都问）；
+        // 选「不保存」→ 移除（回到欢迎页）。
         cx.update(|window, cx| {
             app.update(cx, |app, cx| app.close_tab(0, window, cx));
         });
+        assert!(cx.has_pending_prompt(), "空未命名关闭应弹确认");
+        cx.simulate_prompt_answer("不保存");
         settle_frames(cx, 5);
         assert!(
             cx.update(|_w, cx| app.read(cx).tabs.is_empty()),

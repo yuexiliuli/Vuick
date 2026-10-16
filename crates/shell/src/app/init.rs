@@ -69,6 +69,11 @@ impl EditorApp {
             split_ratio: 0.5,
             // 编辑区软换行默认关闭；仅 Markdown 文件的编辑区默认换行（load_file_text 显式开启）。
             wrap_enabled: false,
+            // 会话恢复开关：None（未设置）= 默认开。
+            session_restore: prefs.session_restore.unwrap_or(true),
+            // 会话持久化防抖时序代号 / 恢复期间抑制标记（见 session 模块）。
+            session_flush_seq: 0,
+            session_restoring: false,
             split_drag: None,
             splitter_hovered: false,
             sidebar: sidebar::SidebarChromeState {
@@ -159,20 +164,52 @@ impl EditorApp {
 
         // 命令行参数：第一个参数作为初始打开文件（`open_file` 新建一个选项卡载入；
         // 之前的「复用首个空选项卡」随零 tab 启动模型一并移除——效果等价，都是只留
-        // 打开的那个文件选项卡）。
+        // 打开的那个文件选项卡）。**显式打开文件时跳过会话恢复**（显式意图优先）。
         if !is_detached {
             let mut args = std::env::args_os();
             args.next(); // 跳过程序名
+            let mut opened_cli_file = false;
             if let Some(first) = args.next() {
                 let p = PathBuf::from(&first);
                 if p.is_file() {
                     app.open_file(&p.to_string_lossy(), window, cx);
+                    opened_cli_file = true;
                 }
             }
-            // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：打开文件后
-            // 立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
-            if std::env::var_os("WY_AUTOTEST").is_some() && app.is_markdown_tab(app.active_tab) {
+            // 无显式打开文件才尝试恢复上次会话（开关开启 + 清单存在且有效才恢复；
+            // 测试构建不触碰真实会话目录，见 session 模块）。
+            if !opened_cli_file {
+                #[cfg(not(test))]
+                {
+                    app.restore_session(window, cx);
+                }
+            }
+            // 自动化测试钩子（与 MD_OPEN_DEBUG 一类调试入口同款）：仅当显式用 CLI
+            // 打开文件后立即开启「本项目 WYSIWYG（预览编辑测试）」左面板，便于截图/识图验证。
+            if opened_cli_file
+                && std::env::var_os("WY_AUTOTEST").is_some()
+                && app.is_markdown_tab(app.active_tab)
+            {
                 app.toggle_live_test(window, cx);
+            }
+        }
+        // 退出钩子：仅**主窗口**（is_detached == false）实体注册——退出前把主窗口的
+        // 选项卡集合保存到会话目录，覆盖全部退出路径（菜单退出 / Ctrl+Q / 命令面板 /
+        // 点窗口关闭）。detach 拆分窗口不参与会话持久化/恢复（见 session 模块注释）。
+        // 已核实本平台/GPUI 版本下最后一个窗口关闭触发 quit 不走 `App::shutdown()` →
+        // `on_app_quit`（退出钩子在此是死路），故本钩子仅作**兜底**：万一某平台确实
+        // 触发仍做最终同步落盘（无害）。常态保存依赖「状态变化即持久化」的连续落盘。
+        if !is_detached {
+            #[cfg(not(test))]
+            {
+                cx.on_app_quit(|this, cx| {
+                    this.save_session(cx);
+                    async {}
+                })
+                .detach();
+                // 关窗默认保存：不再注册 `on_window_should_close` 询问钩子——临时文件
+                // 由「状态变化即持久化」的连续落盘常态写在盘上，点窗口 × 直接关闭，
+                // 下次启动原样恢复（见 session 模块注释）。
             }
         }
         app

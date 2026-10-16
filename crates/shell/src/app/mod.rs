@@ -50,6 +50,7 @@ mod init;
 mod layout;
 mod media;
 mod preview;
+mod session;
 mod sync;
 mod tab_drag;
 
@@ -362,6 +363,15 @@ pub struct EditorApp {
     /// 编辑区是否自动换行（默认换行）。开关只作用编辑区；Markdown 预览
     /// 始终自动换行，不随此偏好变化（预览换行由文件类型/全屏阅读模式决定）。
     wrap_enabled: bool,
+    /// 「恢复上次会话」开关（文件 → 菜单切换，随 [`UserPrefs`] 立即持久化；默认开）。
+    /// 关闭时退出不写会话清单并清理遗留清单/槽位，下次启动不恢复。
+    session_restore: bool,
+    /// 会话持久化防抖时序代号：每次安排 +1；旧防抖定时器到点比对不符即作废（仿
+    /// `search_debounce_seq`）。内容变化 300ms 停顿后才写盘一次，不逐键写盘。
+    session_flush_seq: u64,
+    /// 会话恢复进行中：恢复期间重建的选项卡不触发持久化（避免反复写盘 / 抵抗
+    /// `clear_session` 清理）。
+    session_restoring: bool,
     /// 正在拖拽分屏分割线：`Some((起始指针x, 起始比例))`
     split_drag: Option<(f32, f32)>,
     /// 分割线是否被鼠标悬停（悬停时高亮提示可拖拽）

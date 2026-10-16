@@ -53,6 +53,8 @@ impl EditorApp {
         });
         let idx = self.tabs.len() - 1;
         self.active_tab = idx;
+        // 新选项卡 → 结构变化立即持久化（恢复期间由 `session_restoring` 抑制）。
+        self.schedule_session_flush(cx, true);
         idx
     }
 
@@ -62,6 +64,8 @@ impl EditorApp {
         window.focus(&focus, cx);
         self.status = SharedString::from("新建文件");
         self.status_ok = true;
+        // make_tab 已即时持久化；此处再安排一次（幂等）以覆盖「新建即激活」语义。
+        self.schedule_session_flush(cx, true);
         cx.notify();
     }
 
@@ -70,6 +74,9 @@ impl EditorApp {
             return;
         }
         self.active_tab = idx;
+        // 活动选项卡变化（用户点击切换）→ 立即持久化（便宜；make_tab/remove_tab
+        // 等已自带，这里覆盖纯「切换激活」的用户操作）。
+        self.schedule_session_flush(cx, true);
         // PDF / EPUB 等只读预览文档没有可见编辑区，不把焦点给隐藏的编辑器，
         // 而是给 App 根（让窗口级快捷键仍可用）。
         let readonly = self.tabs[idx].readonly_preview;
@@ -87,11 +94,14 @@ impl EditorApp {
         if idx >= self.tabs.len() {
             return;
         }
-        if !self.tabs[idx].dirty {
+        // 未命名选项卡（无论脏与否：空内容同样在盘上有会话槽位）→ 一律弹确认
+        // （是=另存为转正、否=删除临时槽位、取消=留在应用）；命名文件仅当脏（有
+        // 未落盘修改）才询问，干净直通关闭。
+        if self.tabs[idx].file_path.is_some() && !self.tabs[idx].dirty {
             self.remove_tab(idx, window, cx);
             return;
         }
-        // 未保存 → 弹原生任务对话框，异步等待用户选择
+        // 未保存 / 未命名 → 弹原生任务对话框，异步等待用户选择
         let entity = cx.entity();
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -196,6 +206,8 @@ impl EditorApp {
             MediaReader::Video(_) => {}
         }
         self.tabs.remove(idx);
+        // 选项卡被移除 → 结构变化立即持久化（零 tab 与重排后都写）。
+        self.schedule_session_flush(cx, true);
         if self.tabs.is_empty() {
             // 关闭最后一个选项卡 → 零选项卡，回到欢迎页：不退出、不新建空选项卡、
             // 不 panic。此时没有编辑区可聚焦，焦点给应用根（窗口级快捷键照样可用）。

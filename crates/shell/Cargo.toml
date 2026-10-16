@@ -12,6 +12,8 @@ rfd = { workspace = true }
 futures = { workspace = true }
 memchr = { workspace = true }
 ropey = { workspace = true }
+# 会话清单 / 配置 JSON 读写（手写 serde_json::Value，不引入 serde derive；workspace 已有依赖）。
+serde_json = { workspace = true }
 # 迁入本 crate 后 app/scrollbar 内部经 crate-root 短别名消费的全部项目内 crate。
 config = { path = "../config" }
 base = { path = "../base" }

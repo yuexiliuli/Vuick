@@ -246,6 +246,49 @@ impl EditorApp {
         if is_md {
             self.ensure_md_wy(idx, window, cx, !defer_preview);
         }
+        // 文件路径就位（make_tab 时机为未命名）→ 立即持久化记成 File 型。
+        self.schedule_session_flush(cx, true);
+        cx.notify();
+    }
+
+    /// 把文本灌入**已建好**的选项卡（会话恢复的未命名选项卡用）：与
+    /// [`Self::load_file_text`] 走同一条 O(n) 装配管线（`prepare_text` → Rope +
+    /// 行宽统计 + 行/字计数），但不设 `file_path`（保持「未命名」语义）、不建
+    /// Markdown 预览（未命名选项卡 = 纯文本）。`make_tab` 已建空编辑器。
+    pub(super) fn set_tab_text(
+        &mut self,
+        idx: usize,
+        text: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.search_scan = None; // 同一选项卡内容被替换 → 搜索缓存失效
+        let PreparedText {
+            rope,
+            lines,
+            chars,
+            max_line_chars,
+            line_width_histogram,
+            src_len: _,
+        } = prepare_text(text);
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        tab.editor.update(cx, |ed, _cx| {
+            // O(1) 装配：与 load_file_text 同款（Rope 共享、统计就地算好）。
+            ed.set_rope_with_stats(rope, max_line_chars, line_width_histogram);
+            // 未命名选项卡无文件 → 不设语言（保持纯文本高亮缺省）。
+            ed.set_language(None);
+        });
+        tab.editor_pending = false;
+        // 未命名选项卡正文以编辑器 Rope 为准，不整份镜像到 content（同 load_file_text）。
+        tab.content = SharedString::default();
+        tab.line_count = lines;
+        tab.char_count = chars;
+        tab.cursor_row = 0;
+        tab.cursor_col = 0;
+        tab.dirty = false;
         cx.notify();
     }
 
@@ -814,6 +857,8 @@ impl EditorApp {
         tab.preview_fullscreen = true;
         // 正文只存在于查看器/预览，编辑区为空 → 预览锁定，toggle 不翻转也不显示空编辑区
         tab.readonly_preview = true;
+        // 媒体/EPUB 文件路径就位（make_tab 时机为未命名）→ 立即持久化记成 File 型。
+        self.schedule_session_flush(cx, true);
         true
     }
 
@@ -988,6 +1033,8 @@ impl EditorApp {
                 }
                 self.status = SharedString::from(format!("已保存：{}", path.display()));
                 self.status_ok = true;
+                // 未命名 → 有路径（save/save_as 成功落盘）：立即持久化纠正会话为 File 型。
+                self.schedule_session_flush(cx, true);
                 cx.notify();
                 true
             }

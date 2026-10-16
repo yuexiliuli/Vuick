@@ -69,6 +69,8 @@ pub struct UserPrefs {
     pub font_size: Option<f32>,
     /// 侧边栏宽度（px）。`None` = 从未手动拖拽过，保持随内容自适应。
     pub sidebar_width: Option<f32>,
+    /// 「恢复上次会话」开关。`None` = 未设置过，默认开启；`Some(false)` = 显式关闭。
+    pub session_restore: Option<bool>,
 }
 
 impl UserPrefs {
@@ -87,18 +89,22 @@ impl UserPrefs {
         PathBuf::from("gpui-editor-config.json")
     }
 
-    /// 加载用户偏好：缺失 / 损坏 / 字段缺省均回退默认。
-    pub fn load() -> Self {
-        if cfg!(test) {
-            return Self::default();
+    /// 会话临时文件目录 = 配置文件所在目录下的 `session/` 子目录
+    /// （如 `%APPDATA%\gpui-editor\session\`；GPUI_EDITOR_CONFIG 覆盖时随其路径）。
+    pub fn session_dir() -> PathBuf {
+        match Self::config_path().parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.join("session"),
+            _ => PathBuf::from("session"),
         }
-        let Ok(text) = fs::read_to_string(Self::config_path()) else {
-            return Self::default();
-        };
-        let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
-            return Self::default();
-        };
+    }
+
+    /// 从 JSON 对象解析（纯函数，供 `load` 与测试使用）：字段缺省 / 类型不符 /
+    /// 值非法一律回退默认，绝不 panic。
+    fn from_json_value(v: &Value) -> Self {
         let mut prefs = Self::default();
+        let Some(map) = v.as_object() else {
+            return prefs;
+        };
         if let Some(Value::String(s)) = map.get("theme") {
             prefs.theme = ThemePref::from_str(s);
         }
@@ -112,7 +118,34 @@ impl UserPrefs {
         {
             prefs.sidebar_width = Some(v as f32);
         }
+        if let Some(Value::Bool(b)) = map.get("session_restore") {
+            prefs.session_restore = Some(*b);
+        }
         prefs
+    }
+
+    /// 序列化成 JSON 对象（纯函数，供 `save` 与测试使用）。
+    fn to_json_value(&self) -> Value {
+        json!({
+            "theme": self.theme.as_str(),
+            "font_size": self.font_size,
+            "sidebar_width": self.sidebar_width,
+            "session_restore": self.session_restore,
+        })
+    }
+
+    /// 加载用户偏好：缺失 / 损坏 / 字段缺省均回退默认。
+    pub fn load() -> Self {
+        if cfg!(test) {
+            return Self::default();
+        }
+        let Ok(text) = fs::read_to_string(Self::config_path()) else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            return Self::default();
+        };
+        Self::from_json_value(&v)
     }
 
     /// 保存：临时文件 + rename 原子替换（Windows rename 不覆盖 → 先删旧文件）。
@@ -126,12 +159,7 @@ impl UserPrefs {
         {
             let _ = fs::create_dir_all(parent);
         }
-        let body = json!({
-            "theme": self.theme.as_str(),
-            "font_size": self.font_size,
-            "sidebar_width": self.sidebar_width,
-        })
-        .to_string();
+        let body = self.to_json_value().to_string();
         let tmp = path.with_extension("json.tmp");
         if fs::write(&tmp, body).is_err() {
             return;
@@ -157,5 +185,39 @@ mod tests {
         assert!(ThemePref::Dark.resolved_dark(WindowAppearance::Light));
         assert!(ThemePref::Follow.resolved_dark(WindowAppearance::VibrantDark));
         assert!(!ThemePref::Follow.resolved_dark(WindowAppearance::Light));
+    }
+
+    /// 「恢复上次会话」开关字段 roundtrip：None = 默认开；Some(false/true) 显式保留；
+    /// 缺字段 / 非法值回退默认。走纯函数（`to_json_value` / `from_json_value`），
+    /// 不触碰真实配置路径（cfg!(test) 下 load/save 为空操作）。
+    #[test]
+    fn session_restore_json_roundtrip() {
+        // None（从未设置）= 默认开：不写入 JSON、读回为 None。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["session_restore"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.session_restore, None);
+        assert_eq!(back.theme, ThemePref::Follow);
+
+        // Some(false/true) 显式持久化并读回。
+        let p = UserPrefs {
+            theme: ThemePref::Dark,
+            font_size: Some(15.0),
+            sidebar_width: None,
+            session_restore: Some(false),
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(back.session_restore, Some(false));
+        assert_eq!(back.theme, ThemePref::Dark);
+        assert_eq!(back.font_size, Some(15.0));
+        let p2 = UserPrefs { session_restore: Some(true), ..UserPrefs::default() };
+        assert_eq!(UserPrefs::from_json_value(&p2.to_json_value()).session_restore, Some(true));
+
+        // 非法值（非布尔）→ 回退 None。
+        let v = serde_json::json!({ "session_restore": "yes" });
+        assert_eq!(UserPrefs::from_json_value(&v).session_restore, None);
+        // 非对象 → 全默认。
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.session_restore, None);
     }
 }

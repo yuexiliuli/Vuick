@@ -199,6 +199,8 @@ impl EditorApp {
             } else {
                 Some(self.sidebar.width)
             },
+            // 会话恢复开关随其它偏好一并落盘（否则一次字号/主题保存就会把它重置回默认开）。
+            session_restore: Some(self.session_restore),
         }
         .save();
     }
