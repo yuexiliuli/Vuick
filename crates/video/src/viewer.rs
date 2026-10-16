@@ -1112,9 +1112,9 @@ impl VideoViewer {
             self.seek(-self.playhead, cx);
             self.playing = true; // seek 时仍为暂停态（不提前出声），置播放后统一恢复
         } else {
-            self.playing = !self.playing;
-        }
-        if self.playing {
+        self.playing = !self.playing;
+    }
+    if self.playing {
             self.last_tick = None; // 恢复播放不随暂停跳变
             self.ensure_pump(cx);
             if let Some(sink) = &self.audio {
@@ -1360,6 +1360,12 @@ impl VideoViewer {
     /// 是否「纯视频」干净播放模式（宿主据此隐藏菜单栏/选项卡栏/侧边栏/状态栏，视频充满窗口）。
     pub fn is_locked(&self) -> bool {
         self.locked
+    }
+
+    /// 暂停标志是否该显示（右上角玻璃徽标）：**有画面且未在播放**（暂停/自然结尾都算停）；
+    /// 加载中（无帧）与打开出错（占位）时不显示。纯函数，测试可注入三态确定性断言。
+    fn paused_badge_shown(playing: bool, has_frame: bool, load_error: bool) -> bool {
+        !playing && has_frame && !load_error
     }
 
     /// 切换纯视频模式：锁定 = 隐藏非视频 UI、视频充满窗口（宿主壳体重排后自动缩放填满）、
@@ -1917,6 +1923,9 @@ impl Render for VideoViewer {
                 self.start_decoder_at(t, None, false);
             }
         }
+        // 视频实际显示矩形（contain 等比+缩放+平移后的像素框，单位 f32）。暂停徽标以此为基准
+        // 挂右上角内边距，不随窗口/画布走——防止 contain 后有黑边时徽标飘出视频范围。
+        let mut vrect = (0.0, 0.0, vw, area_h);
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted, cx)
         } else {
@@ -1932,6 +1941,7 @@ impl Render for VideoViewer {
                     // 居中；中心锚定缩放），再把偏移并到像素框坐标。
                     self.pan = Self::clamp_pan(self.pan, vw, area_h, dw, dh);
                     let (ox, oy) = ((vw - dw) * 0.5 + self.pan.0, (area_h - dh) * 0.5 + self.pan.1);
+                    vrect = (ox, oy, dw, dh);
                     img(gpui::ImageSource::Render(render))
                         .object_fit(ObjectFit::Contain)
                         .absolute()
@@ -2016,6 +2026,27 @@ impl Render for VideoViewer {
                     .child(text.clone())
                     .with_spring(
                         "video-toast-fade",
+                        hover_spring(1.0).from(0.0),
+                        |this, v| this.opacity(v),
+                    ),
+            );
+        }
+        // 暂停标志（右上角）：仅放大 ❚❚ 双竖条图标，无圆底/边框/投影；暂停/停在结尾时
+        // 显示。以**视频实际矩形** `vrect` 为基准（右上角内 32px），不随窗口/画布走；纯视觉
+        // 无交互（不遮双击全屏）；仅在有画面且非播放、未出错时挂出。
+        let badge_shown = Self::paused_badge_shown(self.playing, self.frame.is_some(), self.load_error.is_some());
+        if badge_shown {
+            let badge_left = (vrect.0 + vrect.2 - 80.0).max(4.0);
+            let badge_top = (vrect.1 + 30.0).max(4.0);
+            root = root.child(
+                div()
+                    .id("video-paused-badge")
+                    .absolute()
+                    .left(px(badge_left))
+                    .top(px(badge_top))
+                    .child(Icon::new(IconName::Pause).size(px(60.)).text_color(toast_fg))
+                    .with_spring(
+                        "video-paused-fade",
                         hover_spring(1.0).from(0.0),
                         |this, v| this.opacity(v),
                     ),
@@ -2866,6 +2897,47 @@ mod tests {
         cx.update(|app| ent.update(app, |v, cx| v.toggle_lock(cx)));
         assert!(!cx.update(|app| ent.read(app).is_locked()));
         cx.run_until_parked();
+    }
+
+    /// 暂停标志可见性纯函数：有画面且非播放（暂停/自然结尾）→ 显示；播放中 / 无帧（加载中）/
+    /// 打开出错（占位）→ 不显示。
+    #[test]
+    fn paused_badge_shown_only_when_paused_with_frame() {
+        // (playing, has_frame, load_error)
+        let cases = [
+            // 播放中 → 不显示
+            (true, true, false),
+            (true, false, false),
+            // 暂停/结尾且有画面 → 显示
+            (false, true, false),
+            // 无帧（加载中）或出错 → 不显示
+            (false, false, false),
+            (false, true, true),
+        ];
+        for (playing, has_frame, load_error) in cases {
+            let want = !playing && has_frame && !load_error;
+            assert_eq!(
+                VideoViewer::paused_badge_shown(playing, has_frame, load_error),
+                want,
+                "playing={playing} has_frame={has_frame} load_error={load_error}"
+            );
+        }
+    }
+
+    /// 回归：render 调用点须按「有错 = true」的语义把 `load_error.is_some()` 传入（纯函数
+    /// 第三参是 `load_error`）。曾误传 `is_none()` 导致两次取反——无错时徽标永远不显
+    /// （真实复现：暂停/结尾有画面不显示）。用「无错/有错/播放中」三态断言调用点公式。
+    #[test]
+    fn paused_badge_render_uses_has_error_sense() {
+        fn shown(playing: bool, has_frame: bool, load_error: Option<()>) -> bool {
+            VideoViewer::paused_badge_shown(playing, has_frame, load_error.is_some())
+        }
+        // 无错 + 暂停 + 有帧 → 显示（若调用点误传 is_none()，这里会 fail）
+        assert!(shown(false, true, None));
+        // 出错 → 不显示
+        assert!(!shown(false, true, Some(())));
+        // 播放中 → 不显示
+        assert!(!shown(true, true, None));
     }
 
     /// 向窗口派发一次**真实双击**（mousedown `click_count=2` + mouseup `click_count=2`）：
