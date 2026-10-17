@@ -158,6 +158,47 @@ thread_local! {
     };
 }
 
+/// seek 全链路性能探针开关（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1`）：用户开 env 后自点
+/// 进度条，stderr 每个 seek 打一行 `[SEEK]` 聚合（total/reuse/regress/skipped/
+/// seek2first/frame2screen/target/firstpts）。默认关闭：`OnceLock` 缓存 env 判定，
+/// 关闭时每条 seek 命令只多一次 `result_tx.is_none()` 判断与一次 u64 槽位写，
+/// 不在逐帧热路径加分支。
+fn seek_diag_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GPUI_EDITOR_VIDEO_SEEK_DIAG").is_some())
+}
+
+/// 一次 seek 命令的解码/上屏阶段数据（worker ↔ tick 经全局槽汇总，首帧上屏打印一次）。
+#[derive(Default)]
+struct SeekDiag {
+    session: u64,
+    /// 目标落点（秒）。
+    target: f64,
+    /// seek 命令提交时刻（`start_decoder_at`）。
+    trigger: Option<Instant>,
+    /// worker 内 `reader.seek` 完成、开始解码时刻。
+    worker_start: Option<Instant>,
+    /// 首个 ≥ target 帧入队时刻。
+    t_sent: Option<Instant>,
+    /// reader 复用（true）或重开文件（false）。
+    reuse: bool,
+    /// 第一个被解码帧 pts − target（负 = 回退越早、预滚解码越重）。
+    regress: f64,
+    /// 预滚丢弃帧数（pts < target）。
+    skipped: u32,
+    /// 首个 ≥ target 帧 pts。
+    firstpts: f64,
+}
+
+static SEEK_DIAG_SLOT: std::sync::OnceLock<std::sync::Mutex<Option<SeekDiag>>> =
+    std::sync::OnceLock::new();
+fn seek_diag_slot() -> &'static std::sync::Mutex<Option<SeekDiag>> {
+    SEEK_DIAG_SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// seek 诊断会话号（每次 seek 命令递增，worker/tick 凭它对齐清理）。
+static SEEK_DIAG_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
 
@@ -171,6 +212,9 @@ struct DecodeCmd {
     cap: u32,
     tx: std::sync::mpsc::SyncSender<FrameItem>,
     result_tx: Option<std::sync::mpsc::Sender<Result<super::decode::VideoParams, String>>>,
+    /// 本命令对应的 seek 诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 worker
+    /// 据此把解码阶段数据写进共享槽，tick 首帧落地时聚合打印；普通运行只传递值）。
+    seek_session: u64,
 }
 
 /// 投递给常驻音频解码线程的命令（同视频；worker 持 sink 克隆、命令开头统一 flush）。
@@ -275,6 +319,9 @@ pub struct VideoViewer {
     audio_err: bool,
     /// 音频健康诊断节拍（每 ~60 tick ≈1s 打一行 stats；播放无音频时不用）。
     diag_ticks: u32,
+    /// 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick 据此
+    /// 匹配共享槽并聚合打印一条 `[SEEK]`；普通运行恒为递增 u64，不读不写槽）。
+    diag_session: u64,
     /// 常驻视频解码线程的命令通道。worker 一生一个，切换/seek 全投命令；新文件在
     /// **同一线程内**串行重开旧 reader —— 实测“新线程在上一解码器 teardown 后立刻
     /// `avformat_open_input`”会卡死（72.MP4 复现），单 worker 串行重开则稳定。
@@ -375,6 +422,9 @@ impl VideoViewer {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            // 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick
+            // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
+            diag_session: 0,
             decode_cmd: None,
             audio_cmd: None,
             audio_ready: Arc::new(AtomicBool::new(false)),
@@ -517,6 +567,18 @@ impl VideoViewer {
             drop(old);
         }
         self.pending_seek = Some(target);
+        // seek 全链路探针：会话号递增；仅「seek 型」命令（result_tx 空）开槽记触发时刻，
+        // 换媒体（挂握手通道）不算 seek、不打印。普通运行只多一次 u64 写。
+        let seek_session = SEEK_DIAG_SESSION.fetch_add(1, Ordering::Relaxed) + 1;
+        self.diag_session = seek_session;
+        if seek_diag_enabled() && result_tx.is_none() {
+            *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(SeekDiag {
+                session: seek_session,
+                target,
+                trigger: Some(Instant::now()),
+                ..Default::default()
+            });
+        }
         self.ensure_video_worker();
         let cmd = DecodeCmd {
             generation,
@@ -525,6 +587,7 @@ impl VideoViewer {
             cap: self.decode_cap,
             tx,
             result_tx,
+            seek_session,
         };
         if let Some(tx) = &self.decode_cmd {
             let _ = tx.send(cmd);
@@ -591,6 +654,15 @@ impl VideoViewer {
             }
             let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
             let _ = reader.seek(cmd.target);
+            // seek 全链路探针（GPUI_EDITOR_VIDEO_SEEK_DIAG=1，本命仅 seek 命令开）：
+            // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
+            // 解码量已定——预滚帧全在它之前），tick 首帧上屏时聚合打印一次。
+            let seek_diag_on = seek_diag_enabled() && cmd.result_tx.is_none();
+            let seek_worker_start = if seek_diag_on { Some(Instant::now()) } else { None };
+            let mut seek_first_decoded = true;
+            let mut seek_regress: f64 = 0.0;
+            let mut seek_skipped: u32 = 0;
+            let mut seek_first_sent: Option<Instant> = None;
             // seek 预滚过滤：ffmpeg seek 回拉到目标前关键帧（video-ffmpeg decode.rs 的
             // seek 文档注明「调用方须丢弃 pts < 目标的帧」）；不丢的话，keyframe→落点
             // 整段帧会被主线程排空当「迟到帧」快速连放 = seek 后视频加速/一闪而过。
@@ -628,14 +700,54 @@ impl VideoViewer {
                     Err(e) => Err(e),
                 };
                 let t1 = Instant::now();
+                // 回退量：第一个被解码的帧 pts − target（负值越大 = 从越早的关键帧预滚解起）
+                if seek_diag_on {
+                    if let Ok(Some((fp, ..))) = &item {
+                        if seek_first_decoded {
+                            seek_first_decoded = false;
+                            seek_regress = fp - cmd.target;
+                        }
+                    }
+                }
                 let keep = match item {
                     Ok(Some(frame)) if frame.0 >= cmd.target => {
                         if let Some(p) = pre_roll.take() {
                             let _ = cmd.tx.send(p); // 落点前一帧保底（排空先有帧可上屏）
                         }
+                        // seek 探针写槽（每个 seek 一次）：此刻预滚数/回退量已定，
+                        // 把解码阶段数据落进共享槽，供 tick 首帧落地时聚合打印。
+                        if seek_diag_on && seek_first_sent.is_none() {
+                            seek_first_sent = Some(Instant::now()); // 首帧 ≥ target 入队
+                            let mut sslot = seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner());
+                            let mine = sslot
+                                .as_ref()
+                                .map_or(true, |s| s.session == cmd.seek_session);
+                            if mine {
+                                let worker_start = seek_worker_start;
+                                *sslot = Some(SeekDiag {
+                                    session: cmd.seek_session,
+                                    target: cmd.target,
+                                    // 触发时刻沿用 start_decoder_at 预填（用户提交时刻）；
+                                    // 槽被清/换代时退回 worker 开始时刻兜底
+                                    trigger: sslot
+                                        .as_ref()
+                                        .and_then(|s| s.trigger)
+                                        .or(worker_start),
+                                    worker_start,
+                                    t_sent: seek_first_sent,
+                                    reuse: same,
+                                    regress: seek_regress,
+                                    skipped: seek_skipped,
+                                    firstpts: frame.0,
+                                });
+                            }
+                        }
                         cmd.tx.send(frame).is_ok()
                     }
                     Ok(Some(frame)) => {
+                        if seek_diag_on {
+                            seek_skipped += 1; // 预滚丢弃计数（pre_roll 分支只留最新一帧）
+                        }
                         pre_roll = Some(frame); // 预滚（pts<落点）：只记最新一帧，不送
                         true
                     }
@@ -918,6 +1030,49 @@ impl VideoViewer {
         } else {
             false
         };
+        // seek 全链路探针聚合（GPUI_EDITOR_VIDEO_SEEK_DIAG=1）：首帧上屏那刻打一条 [SEEK]。
+        // total = seek 提交 → 首帧上屏；seek2first = worker 内 seek→首帧≥target 入队；
+        // frame2screen = 入队 → tick install（泵一拍最坏等待）；打完清槽，不重复刷。
+        if new_frame && seek_diag_enabled() && self.diag_session != 0 {
+            let info = {
+                let slot = seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner());
+                slot.as_ref()
+                    .filter(|d| d.session == self.diag_session && d.t_sent.is_some())
+                    .map(|d| {
+                        let now = Instant::now();
+                        let total = now
+                            .duration_since(d.trigger.unwrap_or(now))
+                            .as_secs_f64()
+                            * 1000.0;
+                        let seek2first = d
+                            .t_sent
+                            .unwrap()
+                            .duration_since(d.worker_start.unwrap_or(now))
+                            .as_secs_f64()
+                            * 1000.0;
+                        let frame2screen =
+                            now.duration_since(d.t_sent.unwrap()).as_secs_f64() * 1000.0;
+                        (
+                            total,
+                            if d.reuse { 1u8 } else { 0u8 },
+                            d.regress,
+                            d.skipped,
+                            seek2first,
+                            frame2screen,
+                            d.target,
+                            d.firstpts,
+                        )
+                    })
+            };
+            if let Some((total, reuse, regress, skipped, s2f, f2s, target, firstpts)) = info {
+                eprintln!(
+                    "[SEEK] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s",
+                    total, reuse, regress, skipped, s2f, f2s, target, firstpts,
+                );
+                *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                self.diag_session = 0;
+            }
+        }
         // 自然播完的自动去向（顺序 = 停住；循环/随机 = 切换）在排空之后执行：先让结尾帧
         // 尽量上屏，再切换下一支（open_folder_index 内部换代 + 起新解码）。
         if hit_end {
@@ -2474,6 +2629,9 @@ mod tests {
             audio_gen: Arc::new(AtomicU64::new(0)),
             audio_err: false,
             diag_ticks: 0,
+            // 最近一次 seek 命令的诊断会话号（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 时 tick
+            // 据此匹配共享槽并聚合打印；普通运行恒 0/新值）。
+            diag_session: 0,
             decode_cmd: None,
             audio_cmd: None,
             audio_ready: Arc::new(AtomicBool::new(false)),
