@@ -239,6 +239,7 @@ impl EditorApp {
         // 右键菜单 Overlay（媒体锁定 + 选项卡栏）恒在最上层（通知层提升到外层根最后绘制，见 render_root）
         out.push(self.render_media_lock_menu(window, cx).into_any_element());
         out.push(self.render_tab_bar_menu(window, cx).into_any_element());
+        out.push(self.render_recent_panel(window, cx).into_any_element());
         out
     }
 
@@ -392,6 +393,19 @@ impl EditorApp {
             .child(self.render_notifications(window, cx))
             // 命令面板浮层（P2-8）：同样作为外层 relative 的直子挂载（合成层纪律同上）。
             .child(self.render_palette(window, cx))
+    }
+
+    /// 「打开最近」大面板浮层挂点：宿主持有面板实体时以根级直子渲染（面板自身包
+    /// `deferred` 全窗 occlude 居中卡）；关闭后为空 → 返回空元素（同 [`Self::render_palette`]）。
+    pub(super) fn render_recent_panel(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match self.recent_panel.clone() {
+            Some(p) => p.into_any_element(),
+            None => div().into_any_element(),
+        }
     }
 
     /// 命令面板浮层挂点：宿主持有面板实体时以根级直子渲染（面板自身包 `deferred`）；

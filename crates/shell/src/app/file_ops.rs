@@ -4,7 +4,7 @@ use super::*;
 use ui::notification::{Notification, NotificationKind};
 
 use crate::app::open_progress::TextChunk;
-use config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES};
+use config::limits::{EDITOR_WRAP_MAX_LINES, OPEN_ASYNC_MIN_BYTES, RECENT_MAX};
 use config::timing::OPEN_FAILURE_AUTOHIDE_SECS;
 
 /// [`EditorApp::apply_open_chunk`] 的结果：一块被如何处理（消费者据此决定继续/中止）。
@@ -153,6 +153,59 @@ impl EditorApp {
         let id_type = std::any::TypeId::of::<T>();
         self.notifications
             .retain(|n| !(n.id_type() == id_type && n.key() == &key));
+    }
+
+    /// 记录最近打开的文件：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化。
+    /// 「打开最近」副作用集中入口（K10/K11：一次调用内完成「列表更新 + 落盘」，
+    /// 消费点只调它，不散点直调 persist）。
+    pub(super) fn record_recent_file(&mut self, path: &std::path::Path) {
+        Self::push_recent(&mut self.recent_files, &path.to_string_lossy());
+        self.persist_prefs();
+    }
+
+    /// 记录最近打开的文件夹：去重置顶 + 截 [`RECENT_MAX`] + 立即持久化
+    /// （同 [`Self::record_recent_file`] 的副作用集中入口）。
+    pub(super) fn record_recent_folder(&mut self, path: &std::path::Path) {
+        Self::push_recent(&mut self.recent_folders, &path.to_string_lossy());
+        self.persist_prefs();
+    }
+
+    /// 从最近文件列表移除失效路径（点击失效项 → 命中同步路径外移除 + 落盘）：
+    /// 状态栏提示，不尝试打开。
+    pub(super) fn remove_recent_file(
+        &mut self,
+        path: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.recent_files.retain(|p| p != path);
+        self.persist_prefs();
+        self.status = SharedString::from(format!("{path} 不存在，已从最近列表移除"));
+        self.status_ok = false;
+        cx.notify();
+    }
+
+    /// 从最近文件夹列表移除失效路径（同 [`Self::remove_recent_file`]）。
+    pub(super) fn remove_recent_folder(
+        &mut self,
+        path: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.recent_folders.retain(|p| p != path);
+        self.persist_prefs();
+        self.status = SharedString::from(format!("{path} 不存在，已从最近列表移除"));
+        self.status_ok = false;
+        cx.notify();
+    }
+
+    /// 去重置顶 + 截断（每类 ≤[`RECENT_MAX`]）：相同路径先移除旧位再插到最前。
+    fn push_recent(list: &mut Vec<String>, path: &str) {
+        if let Some(i) = list.iter().position(|p| p == path) {
+            list.remove(i);
+        }
+        list.insert(0, path.to_string());
+        list.truncate(RECENT_MAX);
     }
 
     /// 把已读取并预处理好的 UTF-8 文本载入指定选项卡，并刷新文件信息与状态。
@@ -890,6 +943,8 @@ impl EditorApp {
                     self.load_epub(idx, &p, doc, window, cx);
                     let focus = self.tab_focus_handle(idx, cx);
                     window.focus(&focus, cx);
+                    // 打开成功才记录最近（失败早退分支不记录）。
+                    self.record_recent_file(&p);
                 }
                 Err(e) => {
                     self.status = SharedString::from(format!("打开失败：{e}"));
@@ -905,6 +960,7 @@ impl EditorApp {
             self.open_pdf_async(idx, p.clone(), window, cx);
             let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
+            self.record_recent_file(&p);
             return;
         }
         if Self::is_image_path(&p) {
@@ -913,6 +969,7 @@ impl EditorApp {
             self.load_media(idx, &p, MediaKind::Image, window, cx);
             let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
+            self.record_recent_file(&p);
             return;
         }
         #[cfg(feature = "video")]
@@ -922,6 +979,7 @@ impl EditorApp {
             self.load_media(idx, &p, MediaKind::Video, window, cx);
             let focus = self.focus_handle(cx);
             window.focus(&focus, cx);
+            self.record_recent_file(&p);
             return;
         }
         // 文本：大文件（按字节阈值判断，无需读盘）→ **后台打开**——先建标签页 +
@@ -932,6 +990,8 @@ impl EditorApp {
             self.spawn_progressive_open(idx, p.clone(), window, cx);
             let focus = self.tab_focus_handle(idx, cx);
             window.focus(&focus, cx);
+            // 大文件分支「建 tab 即成功」也记录（读取失败由 `report_open_failure` 呈现）。
+            self.record_recent_file(&p);
             return;
         }
         // 小文档：同步打开（读成功再建 tab；小而快，保持既有行为）
@@ -964,6 +1024,8 @@ impl EditorApp {
                 t_load.elapsed().as_millis()
             );
         }
+        // 小文档同步打开成功 → 记录最近（读盘失败已早退，不记录）。
+        self.record_recent_file(&p);
         if let Some(_tab) = self.tabs.get(idx) {
             let t_focus = std::time::Instant::now();
             let focus = self.tab_focus_handle(idx, cx);
@@ -1068,7 +1130,9 @@ impl EditorApp {
         self.sidebar.panel_open = true;
         self.status = SharedString::from(format!("已打开文件夹：{}", path.display()));
         self.status_ok = true;
-        self.persist_prefs();
+        // 成功设根：记录最近文件夹（内部已含 persist_prefs —— 同时把 opened_folder
+        // 根路径落盘，覆盖原末尾的 `persist_prefs()`；失败/无效路径分支不记录）。
+        self.record_recent_folder(&path);
         cx.notify();
     }
 

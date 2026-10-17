@@ -55,6 +55,21 @@ impl EditorApp {
             weak.clone(),
             |this, window, cx| this.open_folder_dialog(window, cx),
         ))
+        // 「打开最近…」：`.keep_open()` → 点击**不关闭**文件菜单（反馈 1：文件菜单
+        // 保持展开），打开居中大面板（`recent_panel::RecentPanel`，Ctrl+P 同款样式）。
+        .item({
+            let weak2 = weak.clone();
+            PopupMenuItem::element(move |_, _| {
+                div()
+                    .w_full()
+                    .debug_selector(|| "recent-menu-open".into())
+                    .child("打开最近…")
+            })
+            .keep_open()
+            .on_click(move |_click, window, cx| {
+                let _ = weak2.update(cx, |this, cx| this.open_recent_panel(window, cx));
+            })
+        })
         .item(Self::menu_action_item(
             "保存",
             "Ctrl+S",
@@ -335,5 +350,36 @@ impl EditorApp {
             .child(make("menu-btn-edit", "编辑", Self::edit_items, weak.clone()))
             .child(make("menu-btn-view", "查看", Self::view_items, weak.clone()))
             .child(make("menu-btn-help", "帮助", Self::help_items, weak))
+    }
+
+    /// 「打开最近」居中大面板入口（文件菜单「打开最近…」点击，反馈 2）：创建
+    /// [`recent_panel::RecentPanel`] 实体（Ctrl+P 命令面板同款 Acrylic 居中卡片）、
+    /// 聚焦面板、订阅 `DismissEvent`（择项/Esc/点击外 → 清引用释放实体）。
+    ///
+    /// 反馈 1：源菜单项 `.keep_open()` → 文件菜单**不 dismiss**（保持展开，面板 occlude
+    /// 盖在其上不穿透）；面板关闭（含择项打开文件后）也不动文件菜单——它留到自身
+    /// 下一次外部点击才收起（无 PopupMenu 句柄，不强行程序关菜单）。
+    pub(super) fn open_recent_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 最近列表快照：面板打开期间被别处更新 → 下次打开才反映最新（面板实体不
+        // 在渲染路径反读宿主演变状态，避免 re-entrant borrow；记录逻辑仍走 file_ops）。
+        let folders = self.recent_folders.clone();
+        let files = self.recent_files.clone();
+        // 打开前的焦点 = 仍展开的文件菜单句柄；面板关闭（动作未带走焦点）时归还它。
+        let previous_focus = window.focused(cx);
+        let host = cx.weak_entity();
+        let panel = cx.new(|cx| {
+            recent_panel::RecentPanel::new(host, folders, files, previous_focus, cx)
+        });
+        let sub = cx.subscribe(&panel, |this, _e, _: &DismissEvent, cx| {
+            this.recent_panel = None;
+            this._recent_panel_sub = None;
+            cx.notify();
+        });
+        // 打开即聚焦面板（↑↓/Enter/Esc 直达；源菜单无 dismiss 不再抢焦点）。
+        let handle = panel.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        self.recent_panel = Some(panel);
+        self._recent_panel_sub = Some(sub);
+        cx.notify();
     }
 }

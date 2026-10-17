@@ -14,7 +14,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use gpui::WindowAppearance;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+use crate::limits::RECENT_MAX;
 
 /// 主题三态（字符串标识写入 JSON，见 [`ThemePref::as_str`]）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -75,6 +77,10 @@ pub struct UserPrefs {
     pub session_restore: Option<bool>,
     /// 打开文件夹的根路径（侧边栏「文件」视图）。跨重启恢复文件树；`None` = 未打开过。
     pub opened_folder: Option<String>,
+    /// 最近打开的文件夹路径（新→旧，至多 [`RECENT_MAX`] 条）。
+    pub recent_folders: Vec<String>,
+    /// 最近打开的文件路径（新→旧，至多 [`RECENT_MAX`] 条）。
+    pub recent_files: Vec<String>,
 }
 
 impl UserPrefs {
@@ -130,7 +136,22 @@ impl UserPrefs {
                 prefs.opened_folder = Some(s.clone());
             }
         }
+        // 最近打开（文件夹 / 文件）：读取字符串数组，非数组 / 缺省 → 空；
+        // 元素非字符串跳过；截断至 RECENT_MAX（安全护栏，防手改配置超长）。
+        prefs.recent_folders = Self::read_string_array(map, "recent_folders");
+        prefs.recent_files = Self::read_string_array(map, "recent_files");
         prefs
+    }
+
+    /// 从 JSON 对象里读一个「字符串数组」字段（见 [`UserPrefs::from_json_value`]）。
+    fn read_string_array(map: &Map<String, Value>, key: &str) -> Vec<String> {
+        let Some(Value::Array(arr)) = map.get(key) else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .take(RECENT_MAX)
+            .collect()
     }
 
     /// 序列化成 JSON 对象（纯函数，供 `save` 与测试使用）。
@@ -141,6 +162,8 @@ impl UserPrefs {
             "sidebar_width": self.sidebar_width,
             "session_restore": self.session_restore,
             "opened_folder": self.opened_folder,
+            "recent_folders": self.recent_folders,
+            "recent_files": self.recent_files,
         })
     }
 
@@ -216,6 +239,8 @@ mod tests {
             sidebar_width: None,
             session_restore: Some(false),
             opened_folder: None,
+            recent_folders: Vec::new(),
+            recent_files: Vec::new(),
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -262,5 +287,68 @@ mod tests {
         assert_eq!(UserPrefs::from_json_value(&v).opened_folder, None);
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.opened_folder, None);
+    }
+
+    /// 「打开最近」两类数组字段 roundtrip：空 Vec → `[]`、非空读回一致；
+    /// 超过 [`RECENT_MAX`] 条截断到 50（安全护栏）；非数组 / 缺字段 → 空。
+    #[test]
+    fn recent_arrays_json_roundtrip() {
+        // 缺省 → 空数组。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["recent_folders"], serde_json::json!([]));
+        assert_eq!(v["recent_files"], serde_json::json!([]));
+        let back = UserPrefs::from_json_value(&v);
+        assert!(back.recent_folders.is_empty());
+        assert!(back.recent_files.is_empty());
+
+        // 非空数组 roundtrip（顺序保持新→旧）。
+        let p = UserPrefs {
+            recent_folders: vec![
+                "C:\\Data\\docs".to_string(),
+                "C:\\Data\\src".to_string(),
+            ],
+            recent_files: vec!["C:\\Data\\docs\\a.md".to_string()],
+            ..UserPrefs::default()
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(
+            back.recent_folders,
+            vec!["C:\\Data\\docs".to_string(), "C:\\Data\\src".to_string()],
+            "最近文件夹应 roundtrip 且保持顺序"
+        );
+        assert_eq!(back.recent_files, vec!["C:\\Data\\docs\\a.md".to_string()]);
+        assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
+
+        // 超 50 条 → 读回截断到 50（安全护栏）。
+        let long: Vec<String> = (0..80).map(|i| format!("C:\\Data\\f{i}")).collect();
+        let v = serde_json::json!({
+            "recent_files": long,
+        });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.recent_files.len(), RECENT_MAX, "超上限应截断到 50");
+        assert_eq!(back.recent_files[0], "C:\\Data\\f0", "截断保留前 50 条");
+
+        // 非法值：非数组（对象 / 字符串 / 数字）与缺字段 → 空。
+        for bad in [
+            serde_json::json!({ "recent_files": { "a": 1 } }),
+            serde_json::json!({ "recent_folders": "x" }),
+            serde_json::json!({ "recent_folders": 42 }),
+        ] {
+            let back = UserPrefs::from_json_value(&bad);
+            assert!(back.recent_folders.is_empty(), "非法值应回退空：{bad}");
+            assert!(back.recent_files.is_empty(), "非法值应回退空：{bad}");
+        }
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert!(back.recent_folders.is_empty());
+        assert!(back.recent_files.is_empty());
+
+        // 数组内含非字符串元素 → 跳过该元素。
+        let v = serde_json::json!({ "recent_files": ["a.txt", 42, null, "b.txt"] });
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(
+            back.recent_files,
+            vec!["a.txt".to_string(), "b.txt".to_string()],
+            "非字符串元素应跳过"
+        );
     }
 }

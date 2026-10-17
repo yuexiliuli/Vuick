@@ -50,6 +50,9 @@ impl EditorApp {
         let prefs = UserPrefs::load();
         // 打开文件夹根路径（启动恢复文件树；`prefs` 随后被逐字段消费，先取出）。
         let opened_folder = prefs.opened_folder.clone();
+        // 最近打开（文件夹 / 文件）：新→旧的路径列表，跨重启恢复「打开最近」面板。
+        let recent_folders = prefs.recent_folders.clone();
+        let recent_files = prefs.recent_files.clone();
         // 初始主题：按偏好解析（Follow → 当前系统明暗；Light/Dark → 强制）。
         let start_dark = prefs.theme.resolved_dark(cx.window_appearance());
         let start_font = prefs
@@ -122,6 +125,10 @@ impl EditorApp {
             tab_bar_menu_pos: None,
             tab_bar_menu_entity: None,
             tab_bar_menu_sub: None,
+            recent_folders,
+            recent_files,
+            recent_panel: None,
+            _recent_panel_sub: None,
             focus_handle,
             md_scroll_sync: MdScrollSync::default(),
             _appearance_sub: None,

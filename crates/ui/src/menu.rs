@@ -23,8 +23,8 @@ use gpui::{
     Anchor, AnyElement, AnimationExt, App, AppContext as _, ClickEvent, Context, DismissEvent,
     Edges, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
-    RenderOnce, StatefulInteractiveElement, Styled, Window, accesskit, anchored, deferred, div,
-    prelude::FluentBuilder as _, px,
+    RenderOnce, StatefulInteractiveElement, Styled, Window, accesskit, anchored,
+    deferred, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::ui::theme::{ChromeColors, Theme};
@@ -43,6 +43,9 @@ pub enum PopupMenuItem {
         render: ItemRenderer,
         disabled: bool,
         handler: Option<ItemHandler>,
+        /// 选中/点击后**不关闭菜单**（保留焦点同实体换内容用，如「打开最近」More/返回）；
+        /// 默认 false：保持既有「执行回调后关闭」语义。opt-in。
+        keep_open: bool,
     },
 }
 
@@ -57,6 +60,7 @@ impl PopupMenuItem {
             render: Box::new(move |window, cx| builder(window, cx).into_any_element()),
             disabled: false,
             handler: None,
+            keep_open: false,
         }
     }
 
@@ -85,6 +89,18 @@ impl PopupMenuItem {
         match &mut self {
             PopupMenuItem::ElementItem { disabled: d, .. } => {
                 *d = disabled;
+            }
+            PopupMenuItem::Separator => {}
+        }
+        self
+    }
+
+    /// 点击/选中后**不关闭菜单**（opt-in）：`PopupMenu::activate` 据此跳过 dismiss，
+    /// 焦点保留（「打开最近…」用它保持文件菜单展开）；其余项不调用 = 既有行为不变。
+    pub fn keep_open(mut self) -> Self {
+        match &mut self {
+            PopupMenuItem::ElementItem { keep_open, .. } => {
+                *keep_open = true;
             }
             PopupMenuItem::Separator => {}
         }
@@ -167,6 +183,7 @@ impl PopupMenu {
     }
 
     /// 确认选中项：执行回调并关闭菜单（点击项 or Enter）。
+    /// `keep_open` 项只执行回调、**不关闭**（如「打开最近…」保持文件菜单展开）。
     fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         window.prevent_default();
@@ -175,12 +192,18 @@ impl PopupMenu {
         };
         match item {
             PopupMenuItem::ElementItem { disabled: true, .. } => {}
-            PopupMenuItem::ElementItem { handler, .. } => {
+            PopupMenuItem::ElementItem {
+                handler,
+                keep_open,
+                ..
+            } => {
                 self.selected_index = Some(ix);
                 if let Some(handler) = handler {
                     handler(&ClickEvent::default(), window, cx);
                 }
-                self.dismiss(window, cx);
+                if !keep_open {
+                    self.dismiss(window, cx);
+                }
             }
             PopupMenuItem::Separator => {}
         }
@@ -355,6 +378,15 @@ impl Render for PopupMenu {
             })
             .collect::<Vec<_>>();
 
+        let items_column = div()
+            .id("items")
+            .flex()
+            .flex_col()
+            .p(PANEL_PADDING)
+            .gap_y(PANEL_PADDING)
+            .min_w(self.min_width.unwrap_or(px(160.)))
+            .children(items);
+
         div()
             .id("popup-menu")
             .role(accesskit::Role::Menu)
@@ -376,16 +408,7 @@ impl Render for PopupMenu {
             ])
             .rounded_lg()
             .text_color(fg)
-            .child(
-                div()
-                    .id("items")
-                    .flex()
-                    .flex_col()
-                    .p(PANEL_PADDING)
-                    .gap_y(PANEL_PADDING)
-                    .min_w(self.min_width.unwrap_or(px(160.)))
-                    .children(items),
-            )
+            .child(items_column)
     }
 }
 
@@ -543,6 +566,23 @@ mod tests {
         clicks: Rc<Cell<usize>>,
     }
 
+    /// 直接持有并渲染 `PopupMenu` 实体的宿主（`Dropdown` 也是把它挂进元素树，
+    /// 这里省去触发按钮，聚焦测试的滚动容器/滚动条结构）。
+    struct MenuHost {
+        menu: Entity<PopupMenu>,
+    }
+
+    impl Render for MenuHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("menu-host")
+                .debug_selector(|| "menu-host".into())
+                .w(px(400.))
+                .h(px(400.))
+                .child(self.menu.clone())
+        }
+    }
+
     impl Render for Harness {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let clicks = self.clicks.clone();
@@ -645,5 +685,49 @@ mod tests {
         cx.simulate_click(point(px(ITEM.0), px(ITEM.1)), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(clicks.get(), 0, "点空白关闭后点击不应触发回调");
+    }
+
+    /// `keep_open` 项点击后菜单**不关闭**（DismissEvent 不发、焦点保留）；普通项
+    /// 点击仍关闭（既有语义）。
+    #[gpui::test]
+    fn keep_open_item_does_not_dismiss(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let dismisses = Rc::new(Cell::new(0usize));
+        let (_, cx) = cx.add_window_view({
+            let dismisses = dismisses.clone();
+            move |window, cx| {
+                let menu = PopupMenu::build(window, cx, |menu, _w, _cx| {
+                    let keep = PopupMenuItem::element(|_, _| div().child("More"))
+                        .keep_open()
+                        .on_click(|_, _, _| {});
+                    let close = PopupMenuItem::element(|_, _| div().child("关闭项"))
+                        .on_click(|_, _, _| {});
+                    menu.item(keep).item(close)
+                });
+                // 订阅 DismissEvent 计数：keep_open 项不得触发、普通项应触发。
+                let d = dismisses.clone();
+                window
+                    .subscribe(&menu, cx, move |_, _: &DismissEvent, _, _| {
+                        d.set(d.get() + 1);
+                    })
+                    .detach();
+                MenuHost { menu }
+            }
+        });
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        // 首项（"More"，keep_open）：点击后菜单不关闭（dismiss 计数仍 0）。
+        cx.simulate_click(point(px(40.), px(17.)), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            dismisses.get(),
+            0,
+            "keep_open 项点击不应触发菜单关闭（dismiss）"
+        );
+        // 第二项（普通项）：点击应关闭菜单（dismiss 计数 1）。
+        cx.simulate_click(point(px(40.), px(47.)), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(dismisses.get(), 1, "普通项点击应关闭菜单（dismiss=1）");
     }
 }

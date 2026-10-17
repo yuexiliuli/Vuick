@@ -187,10 +187,19 @@ impl EditorApp {
         cx.notify();
     }
 
-    /// 把当前偏好（主题三态 / 字号 / 侧栏宽度）原子写盘。
+    /// 把当前偏好（主题三态 / 字号 / 侧栏宽度 / 最近打开）原子写盘。
     /// 侧栏宽度只在用户手动拖过（`width_auto == false`）时才持久化，
     /// 否则下次启动仍保持随内容自适应。
+    /// **测试构建不写盘**（config crate 是依赖编译、不受其自身 `cfg!(test)` 门控，
+    /// 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
     pub(super) fn persist_prefs(&self) {
+        // 用 `cfg!(test)` 而不是 `#[cfg(test)] return;`：后者在测试构建里把后续写成
+        // 不可达代码抛 `unreachable_code` 警告；cfg! 为运行时常量，不剪枝可达性。
+        // 测试构建不写盘（config crate 是依赖编译、不受其自身 cfg!(test) 门控，
+        // 若这里写盘会污染真实 `%APPDATA%\gpui-editor\config.json`，见 K8）。
+        if cfg!(test) {
+            return;
+        }
         UserPrefs {
             theme: self.theme_pref,
             font_size: Some(self.font_size),
@@ -209,6 +218,10 @@ impl EditorApp {
                 .root
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
+            // 最近打开（文件夹 / 文件）：随偏好落盘（空 → `[]`），跨重启恢复（K11：
+            // 只随打开/移除/清空这类状态变化写，不逐帧 / 不重复全量重写）。
+            recent_folders: self.recent_folders.clone(),
+            recent_files: self.recent_files.clone(),
         }
         .save();
     }

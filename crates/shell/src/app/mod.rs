@@ -37,6 +37,7 @@ mod open_progress;
 mod menu;
 mod palette;
 mod panes;
+mod recent_panel;
 mod sidebar;
 mod status_bar;
 mod tabs;
@@ -444,6 +445,18 @@ pub struct EditorApp {
     tab_bar_menu_entity: Option<gpui::Entity<PopupMenu>>,
     /// 选项卡栏右键菜单的关闭订阅（选择/Esc/点击外 → 清理位置与实体）。
     tab_bar_menu_sub: Option<Subscription>,
+    /// 最近打开的文件夹路径（新→旧，至多 [`config::limits::RECENT_MAX`] 条）。
+    /// 跨重启持久化（`UserPrefs::recent_folders`）；面板四区域模式只展示前 10。
+    pub(crate) recent_folders: Vec<String>,
+    /// 最近打开的文件路径（新→旧，至多 [`config::limits::RECENT_MAX`] 条）。
+    /// 跨重启持久化（`UserPrefs::recent_files`）；面板四区域模式只展示前 10。
+    pub(crate) recent_files: Vec<String>,
+    /// 「打开最近」居中大面板（反馈 2）：打开时为 `Some`，择项 / Esc / 点击外
+    /// （`DismissEvent`）关闭后清空。面板是独立 [`recent_panel::RecentPanel`] 实体
+    /// （mode/选中/最近列表快照自持；More/返回 单实体切模式）。
+    recent_panel: Option<gpui::Entity<recent_panel::RecentPanel>>,
+    /// 最近面板的关闭订阅（择项/Esc/点击外 → 清空引用并释放实体）。
+    _recent_panel_sub: Option<Subscription>,
     focus_handle: FocusHandle,
     /// 编辑区⇄预览（MD 统一组件 WyEditor）滚动同步基线：当前选项卡 + 上次已同步的
     /// 双方块起点键。每帧渲染开头比对、由「动了的那一侧」驱动对端；切换选项卡/换
