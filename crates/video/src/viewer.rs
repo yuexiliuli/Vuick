@@ -209,6 +209,10 @@ pub struct VideoViewer {
     /// 回归断言「替换只 drop 旧帧、当前帧留存」；运行态不占字段）。
     #[cfg(test)]
     dropped_frame: Option<usize>,
+    /// 测试探针：最近一次上屏帧的 pts（秒）——seek 回归断言「seek 后首帧上屏落在
+    /// 落点附近、不把落点前整段预滚当迟到帧快进」用（仅 test 编译，运行态不占字段）。
+    #[cfg(test)]
+    last_frame_pts: Option<f64>,
     /// 视频原始像素尺寸（Contain 显示比例依据）。
     intrinsic: Option<(f32, f32)>,
     /// 打开 / 解码初始化是否仍在进行。
@@ -318,6 +322,8 @@ impl VideoViewer {
             frame: None,
             #[cfg(test)]
             dropped_frame: None,
+            #[cfg(test)]
+            last_frame_pts: None,
             intrinsic: None,
             loading: true,
             load_error: None,
@@ -488,28 +494,51 @@ impl VideoViewer {
         self.decode_cmd = Some(tx);
     }
 
-    /// 常驻视频 worker 主循环：逐条执行命令（打开 → seek → 解码推帧，直到换代/EOF）。
+    /// 常驻视频 worker 主循环：逐条执行命令（打开/复用 reader → seek → 解码推帧，
+    /// 直到换代/EOF）。
     fn video_worker(
         rx: std::sync::mpsc::Receiver<DecodeCmd>,
         gen_arc: Arc<AtomicU64>,
     ) {
+        // 常驻 reader：同文件（path）+ 同显示 cap 的命令直接复用——seek 只做容器内定位
+        //（av_seek_frame + 解码器 flush），不重开文件；重开（avformat open + 解码器/sws
+        // 初始化）在一次 seek 命令里可能几十 ms，是「点击进度条后画面要等片刻」的主因
+        //（探针实测 open_scaled≈57ms、复用 seek≈0ms）。换文件或 cap 变化（窗口缩放）
+        // 才重开。同一线程内串行使用，无并发；reader 非 Send，仅在本 worker 线程持有。
+        let mut active: Option<(std::path::PathBuf, u32, VideoReader)> = None;
         while let Ok(cmd) = rx.recv() {
-            // decode-to-display：sws 输出长边封顶 `cmd.cap`（按显示尺寸自适应，省
-            // 内存带宽/上传；4K 源降载）；上一命令的 reader 在循环本轮开头已被 drop
-            //（同线程串行，无并发 FFmpeg）
-            let mut reader = match VideoReader::open_scaled(&cmd.path, cmd.cap) {
-                Ok(r) => r,
-                Err(e) => {
-                    if let Some(out) = &cmd.result_tx {
-                        let _ = out.send(Err(e.to_string()));
+            let same = matches!(&active, Some((p, c, _)) if *p == cmd.path && *c == cmd.cap);
+            if !same {
+                // decode-to-display：sws 输出长边封顶 `cmd.cap`（按显示尺寸自适应，省
+                // 内存带宽/上传；4K 源降载）；换文件/换 cap 才重开（同线程串行，无并发 FFmpeg）
+                let reader = match VideoReader::open_scaled(&cmd.path, cmd.cap) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if let Some(out) = &cmd.result_tx {
+                            let _ = out.send(Err(e.to_string()));
+                        }
+                        continue;
                     }
-                    continue;
+                };
+                if let Some(out) = &cmd.result_tx {
+                    let _ = out.send(Ok(reader.params()));
                 }
-            };
-            if let Some(out) = &cmd.result_tx {
-                let _ = out.send(Ok(reader.params()));
+                active = Some((cmd.path.clone(), cmd.cap, reader));
+            } else if let Some(out) = &cmd.result_tx {
+                // 复用分支同样完成「打开成功」握手：同文件 + 同 cap 的重复加载（快速切回
+                // 刚在解码的同一支）不重开文件，但参数直接取常驻 reader——同文件同 cap
+                // 下参数必然不变。否则 `start` 的 result 通道等满 8s 超时、时长/帧率/尺寸
+                // 不填（loading 只关参数缺失），切换窗口期对撞时即触发。
+                let _ = out.send(Ok(active.as_ref().expect("复用分支已有 reader").2.params()));
             }
+            let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
             let _ = reader.seek(cmd.target);
+            // seek 预滚过滤：ffmpeg seek 回拉到目标前关键帧（video-ffmpeg decode.rs 的
+            // seek 文档注明「调用方须丢弃 pts < 目标的帧」）；不丢的话，keyframe→落点
+            // 整段帧会被主线程排空当「迟到帧」快速连放 = seek 后视频加速/一闪而过。
+            // 规则：落点前的预滚帧只保留最新一帧（≈落点前一帧，保证排空先有帧可上屏、
+            // seek 到片尾有末帧回退），其余丢弃；越过落点的帧照常全送。
+            let mut pre_roll: Option<FrameItem> = None;
             // VPROF=1 拆账：解码（FFI 内 decode+sws+to_vec）与推帧背压（tx.send，bounded
             // 通道满=主线程没在及时消费）的每帧墙钟，每 ~2s 打一行忙核。
             let vp_on = vprof_enabled();
@@ -522,8 +551,24 @@ impl VideoViewer {
                 let item = reader.next_frame_bgra();
                 let t1 = Instant::now();
                 let keep = match item {
-                    Ok(Some(item)) => cmd.tx.send(item).is_ok(),
-                    _ => false, // EOF / 解码错误：本代结束
+                    Ok(Some(frame)) if frame.0 >= cmd.target => {
+                        if let Some(p) = pre_roll.take() {
+                            let _ = cmd.tx.send(p); // 落点前一帧保底（排空先有帧可上屏）
+                        }
+                        cmd.tx.send(frame).is_ok()
+                    }
+                    Ok(Some(frame)) => {
+                        pre_roll = Some(frame); // 预滚（pts<落点）：只记最新一帧，不送
+                        true
+                    }
+                    Ok(None) => {
+                        // EOF 且一帧未过落点（seek 到片尾外）：回退最后预滚帧，不黑屏/不挂泵
+                        if let Some(p) = pre_roll.take() {
+                            let _ = cmd.tx.send(p);
+                        }
+                        false
+                    }
+                    Err(_) => false, // 解码错误：本代结束
                 };
                 let t2 = Instant::now();
                 if vp_on {
@@ -615,13 +660,24 @@ impl VideoViewer {
     /// 重采样成 F32 立体声推入 sink（回压守 1s 缓冲）。`ready` 开成功置 true（无声轨/
     /// 开失败保持 false → 主线程走墙钟，画面照常前进）。
     fn audio_worker(rx: std::sync::mpsc::Receiver<AudioCmd>, gen_arc: Arc<AtomicU64>) {
+        // 常驻音频 reader：同文件 + 同 out_rate（倍速改变 out_rate 才需重开）的命令直接
+        // 复用——seek 只做容器定位 + 冲重采样器（dll 内核 `AudioReader::seek`），省每次
+        // seek 的全量 avformat 重开（~40-50ms），也免去与视频 worker 的 seek/解码抢
+        // FFMPEG_LOCK（重开期间长持锁会拖延视频落点帧 ——「点击进度条后画面要等片刻」
+        // 的残余主因）。换文件或倍速（out_rate 变）才重开。
+        let mut active: Option<(std::path::PathBuf, u32, AudioReader)> = None;
         while let Ok(cmd) = rx.recv() {
             cmd.sink.flush();
-            let mut reader = match AudioReader::open_pcm_f32(&cmd.path, cmd.out_rate) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let same = matches!(&active, Some((p, r, _)) if *p == cmd.path && *r == cmd.out_rate);
+            if !same {
+                let reader = match AudioReader::open_pcm_f32(&cmd.path, cmd.out_rate) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                active = Some((cmd.path.clone(), cmd.out_rate, reader));
+            }
             cmd.ready.store(true, Ordering::Relaxed);
+            let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
             let _ = reader.seek(cmd.target);
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
                 match reader.next_pcm_f32() {
@@ -766,6 +822,10 @@ impl VideoViewer {
         }
         let new_frame = if let Some((_pts, w, h, bgra)) = latest {
             self.install_bgra(w, h, bgra, cx);
+            #[cfg(test)]
+            {
+                self.last_frame_pts = Some(_pts);
+            }
             self.pending_seek = None; // 落点已上屏（首个可用帧）
             true
         } else {
@@ -1129,6 +1189,10 @@ impl VideoViewer {
     fn seek(&mut self, delta: f64, cx: &mut Context<Self>) {
         let target = (self.playhead + delta).clamp(0.0, self.duration.max(0.0));
             self.playhead = target;
+            // seek 重锚墙钟基准（同 toggle_play 恢复播放的姿势）：音频时钟期间 `last_tick`
+            // 不更新，seek 重开音频的窗口走墙钟时若沿用旧基准，第一拍 `dt = now - last_tick`
+            // 会把点击前累积的时长一口算进 playhead → 视频突然前跳数秒/加速。
+            self.last_tick = None;
             self.start_decoder_at(target, None, true);
         // seek 后如果仍在播放则恢复出声（pause 态保持静音、只预览画面）
         if self.playing
@@ -2118,6 +2182,8 @@ mod tests {
             frame: None,
             #[cfg(test)]
             dropped_frame: None,
+            #[cfg(test)]
+            last_frame_pts: None,
             intrinsic: None,
             loading: false,
             load_error: None,
@@ -2164,6 +2230,204 @@ mod tests {
 
     fn frame_of(pts: f64, v: u8) -> FrameItem {
         (pts, 320, 240, vec![v; (320 * 240 * 4) as usize])
+    }
+
+    /// delta 回归（音频 worker 复用）：常驻 `AudioReader` 连续 seek 回不同落点，每次重新
+    /// 起播首块 pts 落在目标附近（reuse 不重开文件、`AudioReader::seek` 冲掉 swr 残留）。
+    /// 真音频（`target\视频测试.mp4` 有音轨），缺夹具 SKIP（AGENTS.md §5）。
+    #[test]
+    fn audio_reader_reuses_across_seeks_on_realfile() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库，本机无真视频）");
+            return;
+        }
+        let _g = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut r = match crate::decode::AudioReader::open_pcm_f32(&path, 48_000) {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("SKIP: 音频打开失败（无声轨/运行库缺）");
+                return;
+            }
+        };
+        for target in [0.1, 6.0, 1.5, 9.9] {
+            r.seek(target).unwrap();
+            let (pts, samples) = match r.next_pcm_f32() {
+                Ok(Some(x)) => x,
+                Ok(None) => panic!("seek 后不应 EOF（target={target}）"),
+                Err(_) => panic!("音频复用 seek 解码失败（target={target}）"),
+            };
+            // 音频容器 seek 的包边界粒度本就有 ~0.5s 预滚（fresh 同样，实测 target=1.5→0.98）；
+            // 复用若损坏会从旧位置续解（偏差数秒）→ 1.0 容差仍能区分「复用正确」与「复用失效」。
+            assert!(
+                (pts - target).abs() < 1.0,
+                "音频复用 seek 首块落点偏离 target={target} pts={pts}"
+            );
+            assert!(
+                !samples.is_empty() && samples.iter().all(|s| s.is_finite()),
+                "首块样本应非空且有限"
+            );
+        }
+    }
+
+    /// delta 回归：seek 复用常驻 reader（同文件 + 同 cap 不再重开文件，省每次 seek 的
+    /// avformat 重开/初始化 →「点击进度条后画面立即切换」的关键）。连续多次 seek 回到
+    /// 不同落点，每次首帧上屏都落在落点附近：证明复用不残留旧状态、正向/反向回 seek、
+    /// 近结尾（EOF 回退）全正确。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn repeated_seeks_land_on_each_target(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库，本机无真视频）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待首帧/时长超时");
+        }
+        let duration = cx.update(|app| viewer.read(app).duration);
+        // A→B→A（反向回 seek）+ 近结尾（EOF 回退）四连 seek，全程复用同一 reader
+        let targets = [duration * 0.15, duration * 0.62, duration * 0.15, duration * 0.95];
+        let mut landed = Vec::new();
+        for &target in &targets {
+            viewer.update(cx, |v, cx| v.seek(target - v.playhead, cx));
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let pts: Option<f64> = loop {
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                assert!(
+                    Instant::now() < deadline,
+                    "复用 seek 落点帧上屏超时 target={target}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            landed.push((target, pts.expect("seek 后应有一帧上屏")));
+        }
+        for (target, pts) in landed {
+            assert!(
+                (pts - target).abs() < 0.2,
+                "复用 seek 后首帧上屏应在落点附近（帧级），target={target} 实得 pts={pts}"
+            );
+        }
+        cx.run_until_parked();
+    }
+
+    /// 回归：播放中 seek 不得把墙钟基准的滞留时间一次算进 playhead。音频时钟期间
+    /// `advance_playhead` 从不更新 `last_tick`（停留在音频上线前那拍）；seek 重开音频
+    /// 的窗口走墙钟时若不对 `last_tick` 重锚，第一拍 `dt = now - last_tick` 会把点击前
+    /// 累积的整段播放时长（本例 50s）一口吞进 playhead → 视频突然前跳数秒/加速（根因①）。
+    /// 断言：seek 后首拍只前进约一帧幅度，不出尖峰。
+    #[gpui::test]
+    async fn seek_does_not_jump_playhead_from_stale_last_tick(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.duration = 1000.0;
+            // 模拟音频时钟已运行良久：last_tick 停留在 50s 前（音频时钟期间不更新它）
+            v.last_tick = Some(Instant::now() - Duration::from_secs(50));
+            v
+        }));
+        ent.update(cx, |v, cx| {
+            v.seek_to_fraction(0.4, cx); // 点进度条 seek 到 40%（=400s）
+            assert!((v.playhead - 400.0).abs() < 0.01, "seek 落点先到位: {}", v.playhead);
+            v.tick(cx); // 音频重开窗口：第一拍走墙钟
+        });
+        let p = cx.update(|app| ent.read(app).playhead);
+        assert!(
+            (p - 400.0).abs() < 1.0,
+            "seek 后不得把 50s 滞留当一拍前进（落点后尖峰），实得 {p}"
+        );
+        cx.run_until_parked();
+    }
+
+    /// 回归：seek 后首帧上屏不得整段回放「落点前关键帧」的预滚帧。`VideoReader::seek`
+    /// 回拉到目标前关键帧，worker 若全数送帧，主线程排空会把 keyframe→落点整段当
+    /// 「迟到帧」快速连放 = seek 后一闪/加速（根因②）。断言：seek 后首个上屏帧的
+    /// pts 落在落点附近（≥ 落点 - 一帧），而不是落后整段预滚。真解码、需 `target\视频测试.mp4`。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)] // 持 FFMPEG 串行锁跨 await（同 loads_first_frame）
+    async fn seek_lands_on_target_without_preroll_fastforward(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库，本机无真视频）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        // 等首帧上屏且时长已知（真解码异步）
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待视频首帧/时长超时");
+        }
+        let target = cx.update(|app| viewer.read(app).duration * 0.62);
+        // 播放中 seek 到中部较远落点
+        viewer.update(cx, |v, cx| v.seek(target - v.playhead, cx));
+        // 持续 tick 直到 seek 落点帧上屏（pending_seek 清空）。worker 真解码重开文件
+        // 需真实时间，等待用墙钟 deadline（测试上下文 timer 几乎立即解析，不能作节拍）
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let landed: Option<f64> = loop {
+            let s = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.pending_seek, v.last_frame_pts)
+            });
+            if s.0.is_none() {
+                break s.1;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            assert!(
+                Instant::now() < deadline,
+                "等待 seek 落点帧上屏超时（pending_seek 未清）"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let pts = landed.expect("seek 后应有一帧上屏");
+        assert!(
+            pts + 0.05 >= target,
+            "seek 后首帧上屏应落在落点附近（≥ target-一帧），target={target} 实得 pts={pts}"
+        );
+        cx.run_until_parked();
     }
 
     /// 直接构造（不走真实解码）：pump 排空逻辑 —— 取「pts ≤ playhead」的最新帧上屏，
