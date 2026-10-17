@@ -189,3 +189,50 @@ where
     }
     result
 }
+
+/// NV12（BT.709 有限范围）→ BGRA 的纯 CPU 参考实现，作为 GPU 像素着色器
+/// （`external_yuv_fragment`）的对照基准。输入 Y/U/V（NV12 里 U=Cb、V=Cr），
+/// 输出 `(B, G, R)` 各 8bit。
+///
+/// 目前仅供 `#[cfg(test)]` 单测做向量校验；将来视频 crate 的软 BGRA 回退路径
+/// 需要时再取消该 cfg 门控导出。
+#[cfg(test)]
+pub fn yuv_nv12_to_bgra(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    let y = y as f32;
+    let u = u as f32;
+    let v = v as f32;
+    // BT.709 有限范围：Y ∈ [16,235]，Cb/Cr 零漂在 128
+    let y_ = y - 16.0;
+    let cb = u - 128.0;
+    let cr = v - 128.0;
+    let r = 1.164 * y_ + 1.596 * cr;
+    let g = 1.164 * y_ - 0.391 * cr - 0.813 * cb;
+    let b = 1.164 * y_ + 2.018 * cb;
+    (clamp_channel(b), clamp_channel(g), clamp_channel(r))
+}
+
+#[inline]
+#[cfg(test)]
+fn clamp_channel(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    // 注意：不能用 `use super::*` —— 父模块带 `Foundation::*`/`WindowsAndMessaging::*`
+    // 巨型 glob 导入，会撞 rustc（1.96 / edition 2024）`#[test]` 展开的递归限制。
+    use super::yuv_nv12_to_bgra;
+
+    #[test]
+    fn test_yuv_nv12_to_bgra_known_vectors() {
+        // BT.709 有限范围基准向量
+        // 黑：Y=16、U=V=128 → RGB 全 0
+        assert_eq!(yuv_nv12_to_bgra(16, 128, 128), (0, 0, 0));
+        // 白：Y=235、U=V=128 → RGB 全 255
+        assert_eq!(yuv_nv12_to_bgra(235, 128, 128), (255, 255, 255));
+        // 红（BT.709 红色条 Y=81、U=90、V=240）→ (B, G, R) ≈ (0, 63, 254)
+        assert_eq!(yuv_nv12_to_bgra(81, 90, 240), (0, 63, 254));
+        // 蓝（Y=41、U=240、V=110）→ (B, G, R) = (255, 0, 0)
+        assert_eq!(yuv_nv12_to_bgra(41, 240, 110), (255, 0, 0));
+    }
+}

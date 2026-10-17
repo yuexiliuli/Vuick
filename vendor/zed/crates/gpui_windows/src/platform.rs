@@ -39,6 +39,25 @@ use windows::{
 use crate::*;
 use gpui::*;
 
+/// 进程级 D3D11 设备/设备上下文裸指针 `(device, context)`，由 `attach_gpu` 发布、
+/// `detach_gpu` 置空、设备丢失重建后重新发布。供外部解码器（D3D11VA）拿到与主渲染
+/// 相同的 D3D11 设备来创建共享纹理，实现零 CPU 回读的 GPU 直通。
+static D3D11_DEVICE_CONTEXT: RwLock<Option<(usize, usize)>> = RwLock::new(None);
+
+/// 把当前 DirectX 设备/设备上下文的裸指针写入进程级全局量。
+fn publish_d3d11_device_context(devices: &DirectXDevices) {
+    *D3D11_DEVICE_CONTEXT.write() = Some((
+        devices.device.as_raw() as usize,
+        devices.device_context.as_raw() as usize,
+    ));
+}
+
+/// 返回当前进程 D3D11 设备与 Immediate 设备上下文的裸指针 `(device, context)`；
+/// 未初始化（headless / 尚未 `attach_gpu` / 已 detach）时返回 None。
+pub fn d3d11_device_context() -> Option<(usize, usize)> {
+    *D3D11_DEVICE_CONTEXT.read()
+}
+
 struct TrackedWindow {
     handle: SafeHwnd,
     frame_signal: Arc<PlatformFrameSignal>,
@@ -416,6 +435,7 @@ impl WindowsPlatform {
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.handle_gpu_lost(&devices)?;
         }
+        publish_d3d11_device_context(&devices);
         *self.inner.state.directx_devices.borrow_mut() = Some(devices);
         self.begin_vsync_thread();
         Ok(())
@@ -431,6 +451,7 @@ impl WindowsPlatform {
         if let Some(text_system) = &self.direct_write_text_system {
             text_system.release_gpu();
         }
+        *D3D11_DEVICE_CONTEXT.write() = None;
         self.inner.state.directx_devices.borrow_mut().take();
     }
 
@@ -1395,6 +1416,7 @@ impl WindowsPlatformInner {
         // The platform may have switched to headless while the device was being recovered.
         if current.is_some() {
             *current = Some(directx_devices.clone());
+            publish_d3d11_device_context(directx_devices);
         }
 
         Some(0)

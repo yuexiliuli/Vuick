@@ -16,6 +16,8 @@ cbuffer BatchParams: register(b1) {
 
 Texture2D<float4> t_sprite: register(t0);
 SamplerState s_sprite: register(s0);
+// 外部 NV12 纹理的 UV（CbCr）平面：R8G8，只被 external_yuv 片段着色器使用。
+Texture2D<float4> t_uv: register(t2);
 
 struct SubpixelSpriteFragmentOutput {
     float4 foreground : SV_Target0;
@@ -1263,6 +1265,81 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
+    color.a *= sprite.opacity * saturate(0.5 - distance);
+    return color;
+}
+
+/*
+**
+**              External YUV sprites
+**
+*/
+
+struct ExternalYuvSprite {
+    uint order;
+    uint pad;
+    float opacity;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    // 注意：不含 texture_size——GPU 端平面尺寸经 t_sprite/t_uv 各自的
+    // GetDimensions 获取（Y=宽×高，UV=宽/2×高/2），实例缓冲不必携带它。
+};
+
+struct ExternalYuvSpriteVertexOutput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct ExternalYuvSpriteFragmentInput {
+    nointerpolation uint sprite_id: TEXCOORD0;
+    float4 position: SV_Position;
+};
+
+StructuredBuffer<ExternalYuvSprite> external_yuv_sprites: register(t1);
+
+ExternalYuvSpriteVertexOutput external_yuv_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    uint sprite_id = batch_start_index + instance_id;
+    ExternalYuvSprite sprite = external_yuv_sprites[sprite_id];
+    float4 device_position = to_device_position(unit_vertex, sprite.bounds);
+    float4 clip_distance = distance_from_clip_rect(unit_vertex, sprite.bounds,
+                                                    sprite.content_mask);
+
+    ExternalYuvSpriteVertexOutput output;
+    output.position = device_position;
+    output.sprite_id = sprite_id;
+    output.clip_distance = clip_distance;
+    return output;
+}
+
+float4 external_yuv_fragment(ExternalYuvSpriteFragmentInput input): SV_Target {
+    ExternalYuvSprite sprite = external_yuv_sprites[input.sprite_id];
+
+    // 片段在纹理内的像素偏移（sprite.bounds 与 input.position 同处设备像素空间）
+    float2 pixel_offset = input.position.xy - sprite.bounds.origin;
+
+    // 平面尺寸直接从各自 SRV 的 GetDimensions 取：Y 平面 = 宽×高，UV 平面（NV12
+    // 半分辨率）视图自身即是 宽/2 × 高/2，按此归一化即得正确的 UV 采样坐标。
+    float2 y_size;
+    t_sprite.GetDimensions(y_size.x, y_size.y);
+    float Y = t_sprite.Sample(s_sprite, pixel_offset / y_size).r;
+
+    float2 uv_size;
+    t_uv.GetDimensions(uv_size.x, uv_size.y);
+    float2 uv = t_uv.Sample(s_sprite, pixel_offset / uv_size).rg;
+
+    // BT.709 有限范围（Y/U/V ∈ [0,1]，黑电平 16/255、色差零漂 128/255）
+    float y_ = Y - 16.0 / 255.0;
+    float cb = uv.x - 128.0 / 255.0; // U
+    float cr = uv.y - 128.0 / 255.0; // V
+    float r = 1.164 * y_ + 1.596 * cr;
+    float g = 1.164 * y_ - 0.391 * cr - 0.813 * cb;
+    float b = 1.164 * y_ + 2.018 * cb;
+
+    float distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    float4 color = float4(r, g, b, 1.0);
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }

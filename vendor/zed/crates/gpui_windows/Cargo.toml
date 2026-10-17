@@ -14,6 +14,13 @@ default = ["gpui/default"]
 test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
 
+# 让 `cargo test -p gpui_windows` 可编译：`PlatformWindow::render_to_image` 的 trait
+# 方法挂在 gpui 的 `any(test, feature="test-support")` 下，而本 crate 的对应 impl 只
+# 在 `cfg(test)` 下编译——不带 test-support 时两者对不上（E0407）。这里给测试构建
+# 叠上 gpui 的 test-support feature。
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [dependencies]
 gpui.workspace = true
 

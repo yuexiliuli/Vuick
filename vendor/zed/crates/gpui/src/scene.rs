@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub external_yuv_sprites: Vec<ExternalYuvSprite>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.external_yuv_sprites.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -129,6 +131,10 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
+            Primitive::ExternalYuv(sprite) => {
+                sprite.order = order;
+                self.external_yuv_sprites.push(sprite.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -160,6 +166,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.external_yuv_sprites.sort_by_key(|sprite| sprite.order);
     }
 
     #[cfg_attr(
@@ -185,6 +192,8 @@ impl Scene {
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            external_yuv_sprites_start: 0,
+            external_yuv_sprites_iter: self.external_yuv_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -208,6 +217,7 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
+    ExternalYuv,
     Surface,
 }
 
@@ -227,6 +237,7 @@ pub enum Primitive {
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
+    ExternalYuv(ExternalYuvSprite),
     Surface(PaintSurface),
 }
 
@@ -241,6 +252,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::ExternalYuv(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
     }
@@ -254,6 +266,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+            Primitive::ExternalYuv(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
@@ -281,6 +294,8 @@ struct BatchIterator<'a> {
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    external_yuv_sprites_start: usize,
+    external_yuv_sprites_iter: Peekable<slice::Iter<'a, ExternalYuvSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -311,6 +326,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.polychrome_sprites_iter.peek().map(|s| s.order),
                 PrimitiveKind::PolychromeSprite,
+            ),
+            (
+                self.external_yuv_sprites_iter.peek().map(|s| s.order),
+                PrimitiveKind::ExternalYuv,
             ),
             (
                 self.surfaces_iter.peek().map(|s| s.order),
@@ -447,6 +466,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            PrimitiveKind::ExternalYuv => {
+                let sprites_start = self.external_yuv_sprites_start;
+                let mut sprites_end = sprites_start + 1;
+                self.external_yuv_sprites_iter.next();
+                while self
+                    .external_yuv_sprites_iter
+                    .next_if(|sprite| (sprite.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    sprites_end += 1;
+                }
+                self.external_yuv_sprites_start = sprites_end;
+                Some(PrimitiveBatch::ExternalYuv(sprites_start..sprites_end))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -492,6 +525,7 @@ pub enum PrimitiveBatch {
         texture_id: AtlasTextureId,
         range: Range<usize>,
     },
+    ExternalYuv(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -524,6 +558,7 @@ impl PrimitiveBatch {
                     texture_id.index
                 )
             }
+            Self::ExternalYuv(range) => format!("external yuv sprites ({})", range.len()),
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
     }
@@ -776,6 +811,32 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// 一个引用**外部 D3D11 NV12 纹理**的精灵：纹理与主渲染属于同一 D3D11 设备，
+/// 由视频解码器（D3D11VA）持有，`tex` 为 `ID3D11Texture2D*` 裸指针，CPU 端零
+/// 回读，YUV→BGRA 由 `external_yuv` 像素着色器在 GPU 上完成。
+#[derive(Clone, Debug)]
+#[expect(missing_docs)]
+pub struct ExternalYuvSprite {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
+    /// 外部 `ID3D11Texture2D*` 裸指针（以 usize 携带，避免跨 FFI 边界）。
+    pub tex: usize,
+    /// 纹理数组下标（解码器多帧环形缓冲里的帧下标/槽位）。
+    pub array_index: u32,
+    /// 纹理的完整尺寸（宽×高）。目前仅作 CPU 侧记录（渲染器绘制时 GPU 端改从
+    /// SRV 的 `GetDimensions` 取平面尺寸），保留以备将来 CPU 侧换算/调试用。
+    pub texture_size: Size<ScaledPixels>,
+}
+
+impl From<ExternalYuvSprite> for Primitive {
+    fn from(sprite: ExternalYuvSprite) -> Self {
+        Primitive::ExternalYuv(sprite)
     }
 }
 

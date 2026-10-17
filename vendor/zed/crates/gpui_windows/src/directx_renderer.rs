@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -43,6 +44,9 @@ pub(crate) struct DirectXRenderer {
     resources: Option<DirectXResources>,
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
+    /// 外部 NV12 纹理 `(裸指针, array_index)` → 两个平面 SRV（Y@t0、UV@t2）的缓存，
+    /// 设备丢失重建时整表清空（旧 SRV 已随旧设备失效）。
+    external_textures: HashMap<(usize, u32), [Option<ID3D11ShaderResourceView>; 2]>,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
 
@@ -92,6 +96,7 @@ struct DirectXRenderPipelines {
     mono_sprites: PipelineState<MonochromeSprite>,
     subpixel_sprites: PipelineState<SubpixelSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    yuv_sprites: PipelineState<ExternalYuvInstance>,
 }
 
 struct DirectXGlobalElements {
@@ -189,6 +194,7 @@ impl DirectXRenderer {
             resources: Some(resources),
             globals,
             pipelines,
+            external_textures: HashMap::new(),
             direct_composition,
             font_info: Self::get_font_info(),
             width: 1,
@@ -261,6 +267,8 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        // 外部纹理 SRV 由旧设备创建，随旧设备一并失效，先整表清空
+        self.external_textures.clear();
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -383,6 +391,9 @@ impl DirectXRenderer {
                 }
                 PrimitiveBatch::PolychromeSprites { texture_id, range } => {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
+                }
+                PrimitiveBatch::ExternalYuv(range) => {
+                    self.draw_external_yuv(&scene.external_yuv_sprites[range])
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
             }
@@ -574,6 +585,27 @@ impl DirectXRenderer {
                 &devices.device,
                 &devices.device_context,
                 &scene.polychrome_sprites,
+            )?;
+        }
+
+        if !scene.external_yuv_sprites.is_empty() {
+            // 精灵→实例：tex/array_index 只进 SRV 注册表，不进实例缓冲（HLSL 无 usize）
+            let instances = scene
+                .external_yuv_sprites
+                .iter()
+                .map(|sprite| ExternalYuvInstance {
+                    order: sprite.order,
+                    pad: 0,
+                    opacity: sprite.opacity,
+                    bounds: sprite.bounds,
+                    content_mask: sprite.content_mask,
+                    corner_radii: sprite.corner_radii,
+                })
+                .collect::<Vec<_>>();
+            self.pipelines.yuv_sprites.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &instances,
             )?;
         }
 
@@ -820,6 +852,59 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// 绘制一批外部 NV12 精灵。当前约定一次只绘制一个视频纹理（解码器每帧同一块
+    /// NV12 纹理 + 单一下标）；不同纹理/下标应由 scene 的 batch 拆分保证。
+    fn draw_external_yuv(&mut self, sprites: &[ExternalYuvSprite]) -> Result<()> {
+        if sprites.is_empty() {
+            return Ok(());
+        }
+        let Some(first) = sprites.first() else {
+            return Ok(());
+        };
+        debug_assert!(sprites
+            .iter()
+            .all(|sprite| sprite.tex == first.tex && sprite.array_index == first.array_index));
+        let views = self.external_views(first.tex, first.array_index);
+        if views[0].is_none() || views[1].is_none() {
+            // 纹理/设备暂不可用（如设备丢失未重建），跳过本批
+            return Ok(());
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.pipelines.yuv_sprites.draw_range_with_external_yuv(
+            &devices.device_context,
+            &views,
+            self.globals
+                .batch_params_buffer
+                .as_ref()
+                .context("batch params buffer missing")?,
+            slice::from_ref(&self.globals.sampler),
+            0,
+            sprites.len() as u32,
+        )
+    }
+
+    /// 取（或构造并缓存）外部 NV12 纹理的两个平面 SRV：`[Y(R8), UV(R8G8)]`。
+    /// 从裸指针重建临时纹理包装用于创建 SRV，随后 forget 以免把解码器持有的
+    /// 纹理引用计数多扣一次。
+    fn external_views(
+        &mut self,
+        tex: usize,
+        array_index: u32,
+    ) -> [Option<ID3D11ShaderResourceView>; 2] {
+        if let Some(views) = self.external_textures.get(&(tex, array_index)) {
+            return views.clone();
+        }
+        let Some(devices) = &self.devices else {
+            return [None, None];
+        };
+        let texture = unsafe { ID3D11Texture2D::from_raw(tex as *mut core::ffi::c_void) };
+        let views =
+            create_external_yuv_views(&devices.device, &texture, array_index).unwrap_or([None, None]);
+        std::mem::forget(texture);
+        self.external_textures.insert((tex, array_index), views.clone());
+        views
+    }
+
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
         let desc = unsafe { devices.adapter.GetDesc1() }?;
@@ -997,6 +1082,13 @@ impl DirectXRenderPipelines {
             16,
             create_blend_state(device)?,
         )?;
+        let yuv_sprites = PipelineState::new(
+            device,
+            "external_yuv_sprite_pipeline",
+            ShaderModule::ExternalYuv,
+            16,
+            create_blend_state(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1007,6 +1099,7 @@ impl DirectXRenderPipelines {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            yuv_sprites,
         })
     }
 }
@@ -1264,6 +1357,43 @@ impl<T> PipelineState<T> {
         }
         Ok(())
     }
+
+    /// 绘制外部 YUV 精灵：`texture[0]` 绑定到 t0（Y 平面 R8）、`texture[1]` 绑定到
+    /// t2（UV 平面 R8G8）。**不能**复用 [`draw_range_with_texture`]——它会把纹理绑到
+    /// t0 的同时不走 t2；而实例 StructuredBuffer 被硬绑在 t1（`set_pipeline_state`），
+    /// 所以外部纹理只能占 t0/t2，绕开 t1。
+    fn draw_range_with_external_yuv(
+        &self,
+        device_context: &ID3D11DeviceContext,
+        texture: &[Option<ID3D11ShaderResourceView>; 2],
+        batch_params_buffer: &ID3D11Buffer,
+        sampler: &[Option<ID3D11SamplerState>],
+        first_instance: u32,
+        instance_count: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            first_instance as usize + instance_count as usize <= self.buffer_size,
+            "DirectX instance range exceeds the {} buffer",
+            self.label
+        );
+        update_batch_start(device_context, batch_params_buffer, first_instance)?;
+        set_pipeline_state(
+            device_context,
+            slice::from_ref(&self.view),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            &self.vertex,
+            &self.fragment,
+            &self.blend_state,
+        );
+        unsafe {
+            device_context.PSSetSamplers(0, Some(sampler));
+            // t0=Y（R8）、t2=UV（R8G8），t1 留给实例 StructuredBuffer 不动
+            device_context.PSSetShaderResources(0, Some(slice::from_ref(&texture[0])));
+            device_context.PSSetShaderResources(2, Some(slice::from_ref(&texture[1])));
+            device_context.DrawInstanced(4, instance_count, 0, 0);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1280,6 +1410,21 @@ struct PathRasterizationSprite {
 struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
+
+/// 外部 YUV 精灵的实例缓冲元素（与 HLSL `ExternalYuvSprite` 字节布局严格一致）。
+/// 不含 usize 字段（extern 纹理指针只进 SRV 注册表，不进 GPU 缓冲）。
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ExternalYuvInstance {
+    order: u32,
+    pad: u32, // 与 DrawOrder 对齐
+    opacity: f32,
+    bounds: Bounds<ScaledPixels>,
+    content_mask: ContentMask<ScaledPixels>,
+    corner_radii: Corners<ScaledPixels>,
+}
+
+const _: () = assert!(std::mem::size_of::<ExternalYuvInstance>() == 60);
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
@@ -1633,6 +1778,58 @@ fn create_buffer_view(
     Ok(view)
 }
 
+/// 为外部 NV12 纹理创建两个平面 SRV：Y（R8_UNORM、PlaneSlice 0）与 UV
+/// （R8G8_UNORM、PlaneSlice 1），均按 `array_index` 定位纹理数组里的单个切片。
+/// 用 `ID3D11Device3::CreateShaderResourceView1`（支持 PlaneSlice），随后把
+/// v1 视图降级为普通 `ID3D11ShaderResourceView` 供着色器取样。
+#[inline]
+fn create_external_yuv_views(
+    device: &ID3D11Device,
+    texture: &ID3D11Texture2D,
+    array_index: u32,
+) -> Option<[Option<ID3D11ShaderResourceView>; 2]> {
+    let device3: ID3D11Device3 = device.cast().ok()?;
+    let y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1 {
+        Format: DXGI_FORMAT_R8_UNORM,
+        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC1_0 {
+            Texture2DArray: D3D11_TEX2D_ARRAY_SRV1 {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                FirstArraySlice: array_index,
+                ArraySize: 1,
+                PlaneSlice: 0,
+            },
+        },
+    };
+    let uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1 {
+        Format: DXGI_FORMAT_R8G8_UNORM,
+        ViewDimension: D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+        Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC1_0 {
+            Texture2DArray: D3D11_TEX2D_ARRAY_SRV1 {
+                MostDetailedMip: 0,
+                MipLevels: 1,
+                FirstArraySlice: array_index,
+                ArraySize: 1,
+                PlaneSlice: 1,
+            },
+        },
+    };
+    let mut y_view1: Option<ID3D11ShaderResourceView1> = None;
+    let mut uv_view1: Option<ID3D11ShaderResourceView1> = None;
+    unsafe {
+        device3
+            .CreateShaderResourceView1(texture, Some(&y_desc), Some(&mut y_view1))
+            .ok()?;
+        device3
+            .CreateShaderResourceView1(texture, Some(&uv_desc), Some(&mut uv_view1))
+            .ok()?;
+    }
+    let y_view = y_view1.unwrap().cast::<ID3D11ShaderResourceView>().ok()?;
+    let uv_view = uv_view1.unwrap().cast::<ID3D11ShaderResourceView>().ok()?;
+    Some([Some(y_view), Some(uv_view)])
+}
+
 #[inline]
 fn update_buffer<T>(
     device_context: &ID3D11DeviceContext,
@@ -1716,6 +1913,7 @@ pub(crate) mod shader_resources {
         MonochromeSprite,
         SubpixelSprite,
         PolychromeSprite,
+        ExternalYuv,
         EmojiRasterization,
     }
 
@@ -1789,6 +1987,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => match target {
                     ShaderTarget::Vertex => POLYCHROME_SPRITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => POLYCHROME_SPRITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::ExternalYuv => match target {
+                    ShaderTarget::Vertex => EXTERNAL_YUV_VERTEX_BYTES,
+                    ShaderTarget::Fragment => EXTERNAL_YUV_FRAGMENT_BYTES,
                 },
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
@@ -1880,6 +2082,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
+                ShaderModule::ExternalYuv => "external_yuv",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
         }
@@ -2066,5 +2269,259 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // 不能用 `use super::*`：父模块带 `Direct3D11::*` 等巨型 glob 导入，会撞
+    // rustc（1.96 / edition 2024）`#[test]` 展开的递归限制，故全部显式导入。
+    use gpui::{
+        Bounds, ContentMask, Corners, ExternalYuvSprite, PrimitiveBatch, Quad, ScaledPixels, Scene,
+        Size, point, size,
+    };
+    use windows::Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
+            Direct3D11::{
+                D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_BIND_SHADER_RESOURCE,
+                D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC1, D3D11_TEXTURE2D_DESC,
+                D3D11_USAGE_DEFAULT, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView1,
+                ID3D11Texture2D,
+            },
+            Dxgi::Common::{
+                DXGI_FORMAT_NV12, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8_UNORM, DXGI_SAMPLE_DESC,
+            },
+        },
+    };
+    use windows_core::Interface;
+
+    /// 优先硬件适配器、失败退到 WARP 创建测试设备；两者都失败返回 None（无 D3D11）。
+    fn create_test_device() -> Option<(ID3D11Device, ID3D11DeviceContext)> {
+        [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP]
+            .iter()
+            .find_map(|&driver| {
+                let mut device: Option<ID3D11Device> = None;
+                let mut context: Option<ID3D11DeviceContext> = None;
+                unsafe {
+                    D3D11CreateDevice(
+                        None,
+                        driver,
+                        HMODULE::default(),
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                }
+                .ok()?;
+                Some((device?, context?))
+            })
+    }
+
+    fn create_nv12_texture(device: &ID3D11Device, array_size: u32) -> Option<ID3D11Texture2D> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 640,
+            Height: 360,
+            MipLevels: 1,
+            ArraySize: array_size,
+            Format: DXGI_FORMAT_NV12,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture: Option<ID3D11Texture2D> = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }.ok()?;
+        texture
+    }
+
+    /// 断言外部 NV12 纹理的两个平面 SRV 创建成功、格式/平面/数组下标正确。
+    #[test]
+    fn test_external_yuv_plane_srvs() {
+        let Some((device, _context)) = create_test_device() else {
+            return;
+        };
+        let Some(texture) = create_nv12_texture(&device, 2) else {
+            return;
+        };
+
+        let Some([y_view, uv_view]) = super::create_external_yuv_views(&device, &texture, 0) else {
+            panic!("CreateShaderResourceView1 失败（设备应支持 NV12 平面视图）");
+        };
+        let y_view = y_view.expect("Y 平面 SRV 缺失");
+        let uv_view = uv_view.expect("UV 平面 SRV 缺失");
+
+        // 反查 desc1，验证格式、PlaneSlice 与数组下标
+        let y1: ID3D11ShaderResourceView1 = y_view.cast().expect("应能还原 v1 视图");
+        let uv1: ID3D11ShaderResourceView1 = uv_view.cast().expect("应能还原 v1 视图");
+        let mut y_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
+        let mut uv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
+        unsafe {
+            y1.GetDesc1(&mut y_desc);
+            uv1.GetDesc1(&mut uv_desc);
+        }
+        assert_eq!(y_desc.Format, DXGI_FORMAT_R8_UNORM);
+        assert_eq!(uv_desc.Format, DXGI_FORMAT_R8G8_UNORM);
+        unsafe {
+            assert_eq!(y_desc.Anonymous.Texture2DArray.PlaneSlice, 0);
+            assert_eq!(uv_desc.Anonymous.Texture2DArray.PlaneSlice, 1);
+            assert_eq!(y_desc.Anonymous.Texture2DArray.FirstArraySlice, 0);
+            assert_eq!(uv_desc.Anonymous.Texture2DArray.FirstArraySlice, 0);
+            assert_eq!(y_desc.Anonymous.Texture2DArray.ArraySize, 1);
+        }
+
+        // 第二个数组下标应平移 FirstArraySlice
+        let Some([y_view_1, _]) = super::create_external_yuv_views(&device, &texture, 1) else {
+            panic!("array_index=1 的 CreateShaderResourceView1 失败");
+        };
+        let y1: ID3D11ShaderResourceView1 = y_view_1.expect("Y 平面 SRV 缺失").cast().expect("v1 视图");
+        let mut desc = D3D11_SHADER_RESOURCE_VIEW_DESC1::default();
+        unsafe { y1.GetDesc1(&mut desc) };
+        unsafe {
+            assert_eq!(desc.Anonymous.Texture2DArray.FirstArraySlice, 1);
+            assert_eq!(desc.Anonymous.Texture2DArray.PlaneSlice, 0);
+        }
+    }
+
+    /// 静态编译验证 `external_yuv_*` HLSL 入口（与 debug 运行时 / release fxc 同源的
+    /// D3DCompileFromFile 前端），无 GUI 也能兜住着色器语法错误（含 GetDimensions、
+    /// BT.709 换算与中文注释编码）。
+    #[test]
+    fn test_external_yuv_shader_compiles() {
+        use windows::Win32::Graphics::{
+            Direct3D::{
+                Fxc::{D3DCompileFromFile, D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION},
+                ID3DInclude,
+            },
+            Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        };
+        use windows::core::{HSTRING, PCSTR};
+
+        let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shaders.hlsl");
+        let include_handler = &unsafe {
+            std::mem::transmute::<usize, ID3DInclude>(D3D_COMPILE_STANDARD_FILE_INCLUDE as usize)
+        };
+        for (entry, target) in [("external_yuv_vertex", "vs_4_1"), ("external_yuv_fragment", "ps_4_1")] {
+            let entry = format!("{entry}\0");
+            let target = format!("{target}\0");
+            let mut compile_blob = None;
+            let mut error_blob = None;
+            let result = unsafe {
+                D3DCompileFromFile(
+                    &HSTRING::from(shader_path.to_str().unwrap()),
+                    None,
+                    include_handler,
+                    PCSTR::from_raw(entry.as_ptr()),
+                    PCSTR::from_raw(target.as_ptr()),
+                    D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                    0,
+                    &mut compile_blob,
+                    Some(&mut error_blob),
+                )
+            };
+            if let Err(e) = result {
+                let message = error_blob
+                    .map(|blob| {
+                        unsafe { std::ffi::CStr::from_ptr(blob.GetBufferPointer() as *const i8) }
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_default();
+                panic!("HLSL 编译 {entry:?} 失败：{e} {message}");
+            }
+        }
+    }
+
+    /// scene→batch 的接线验证（gpui 自身测试宿主因缺 test-support dev 依赖不可编译，
+    /// 改在本 crate 测试里覆盖）：`ExternalYuvSprite` 经 `finish()` 排序后进入
+    /// `PrimitiveBatch::ExternalYuv` 批次；同 order 在无其它图元插队时合批，不同
+    /// order 间若有其它图元（Quad）则被切成独立批次并按 z 序排列。
+    #[test]
+    fn test_scene_external_yuv_batch_wiring() {
+        // 场景 A：只有外部 YUV 精灵（同 order=1 ×3 + 异 order=0 ×1）。
+        // BatchIterator 对「同 kind 相邻」图元合批（无其它 kind 插队时跨 order 也合），
+        // 故整体 1 批，但 finish() 必须先按 order 排序（0 在最前）。
+        let mut scene = Scene::default();
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
+        scene.external_yuv_sprites.push(make_yuv_sprite(1, 0x1234, 1));
+        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x5678, 0));
+        scene.finish();
+
+        assert_eq!(scene.external_yuv_sprites[0].order, 0);
+        assert!(scene.external_yuv_sprites[1..].iter().all(|s| s.order == 1));
+        let batches: Vec<PrimitiveBatch> = scene.batches().collect();
+        assert_eq!(
+            batches.len(),
+            1,
+            "仅有外部 YUV 图元时应合并为 1 批：{batches:?}"
+        );
+        let PrimitiveBatch::ExternalYuv(r) = &batches[0] else {
+            panic!("期望 ExternalYuv 批次，实际 {batches:?}");
+        };
+        assert_eq!(r.len(), 4);
+
+        // 场景 B：order 0/2 外部 YUV + 中间 order 1 的 Quad → 切成 3 批且按 z 序
+        let mut scene = Scene::default();
+        scene.external_yuv_sprites.push(make_yuv_sprite(2, 0x1234, 1));
+        scene.external_yuv_sprites.push(make_yuv_sprite(0, 0x1234, 1));
+        scene.quads.push(Quad {
+            order: 1,
+            ..Default::default()
+        });
+        scene.finish();
+
+        let batches: Vec<PrimitiveBatch> = scene.batches().collect();
+        assert_eq!(batches.len(), 3, "应切成 ExternalYuv/Quad/ExternalYuv：{batches:?}");
+        assert!(matches!(&batches[0], PrimitiveBatch::ExternalYuv(_)));
+        assert!(matches!(&batches[1], PrimitiveBatch::Quads(_)));
+        assert!(matches!(&batches[2], PrimitiveBatch::ExternalYuv(_)));
+        // z 序：order0 批次先画、order2 批次后画
+        assert_eq!(scene.external_yuv_sprites[0].order, 0);
+        assert_eq!(scene.external_yuv_sprites[1].order, 2);
+
+        // 另验证 insert_primitive 的 From 转换路径可接受 ExternalYuvSprite（order 由
+        // BoundsTree 覆盖，BoundsTree::insert 首插返回 1，故这里只校验入队与字段透传）
+        let mut scene3 = Scene::default();
+        scene3.insert_primitive(make_yuv_sprite(99, 0x999, 2));
+        assert_eq!(scene3.external_yuv_sprites.len(), 1);
+        assert_eq!(scene3.external_yuv_sprites[0].tex, 0x999);
+        assert_eq!(scene3.external_yuv_sprites[0].array_index, 2);
+        scene3.finish();
+        let batches: Vec<PrimitiveBatch> = scene3.batches().collect();
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(&batches[0], PrimitiveBatch::ExternalYuv(_)));
+    }
+
+    fn make_yuv_sprite(order: u32, tex: usize, array_index: u32) -> ExternalYuvSprite {
+        ExternalYuvSprite {
+            order,
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(100.0), ScaledPixels(100.0)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(200.0), ScaledPixels(200.0)),
+                ),
+            },
+            corner_radii: Corners::default(),
+            opacity: 1.0,
+            tex,
+            array_index,
+            texture_size: Size {
+                width: ScaledPixels(640.0),
+                height: ScaledPixels(360.0),
+            },
+        }
     }
 }

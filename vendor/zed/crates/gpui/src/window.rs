@@ -9,7 +9,7 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+    EntityId, EventEmitter, ExternalYuvSprite, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
     Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
@@ -5168,6 +5168,40 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// 把一个「外部 NV12 D3D11 纹理」作为一帧绘制进场景（零 CPU 回读 GPU 直通）。
+    ///
+    /// `tex` 是外部解码器持有的 `ID3D11Texture2D*` 裸指针（必须与主渲染同一 D3D11
+    /// 设备，见 `gpui_windows::d3d11_device_context`），`array_index` 是纹理数组里的
+    /// 帧下标，`texture_size` 是纹理的完整像素尺寸；YUV→BGRA 由 `external_yuv`
+    /// 像素着色器在 GPU 上完成。
+    pub fn paint_external_yuv(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        tex: usize,
+        array_index: u32,
+        texture_size: Size<Pixels>,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.snapped_content_mask();
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.scale_factor());
+        let opacity = self.element_opacity();
+
+        self.next_frame.scene.insert_primitive(ExternalYuvSprite {
+            order: 0,
+            opacity,
+            bounds: self.snap_bounds(bounds),
+            content_mask,
+            corner_radii,
+            tex,
+            array_index,
+            texture_size: texture_size.scale(self.scale_factor()),
         });
     }
 

@@ -24,6 +24,20 @@ pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
 
+/// 获取当前进程 D3D11 设备与设备上下文裸指针 `(device, context)`（仅 Windows；
+/// 其它平台恒为 None）。供视频解码器与主渲染共享同一 D3D11 设备，实现
+/// 零 CPU 回读的 GPU 直通。
+#[cfg(target_os = "windows")]
+pub fn d3d11_device_context() -> Option<(usize, usize)> {
+    gpui_windows::d3d11_device_context()
+}
+
+/// 非 Windows 平台没有 D3D11，恒返回 None。
+#[cfg(not(target_os = "windows"))]
+pub fn d3d11_device_context() -> Option<(usize, usize)> {
+    None
+}
+
 /// Returns a Linux app that may switch among `allowed_modes`.
 ///
 /// It starts windowed in the process's own environment, or headless if that names no allowed
