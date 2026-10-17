@@ -23,6 +23,7 @@ fn main() {
         cx.bind_keys([
                 KeyBinding::new("ctrl-n", NewFile, None),
                 KeyBinding::new("ctrl-o", OpenFile, None),
+                KeyBinding::new("ctrl-shift-o", OpenFolder, None),
                 KeyBinding::new("ctrl-s", Save, None),
                 KeyBinding::new("shift-ctrl-s", SaveAs, None),
                 KeyBinding::new("ctrl-w", CloseTab, None),

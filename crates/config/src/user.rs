@@ -61,7 +61,9 @@ impl ThemePref {
 }
 
 /// 用户偏好（所有字段可缺省，`load` 时逐字段回退）。
-#[derive(Clone, Copy, Debug, Default)]
+/// 注意：不再派生 `Copy`——`opened_folder` 为 `Option<String>` 非 Copy 类型；
+/// 全仓已核对无代码依赖 `UserPrefs` 的复制语义（只有 `load`/构造/按字段读取）。
+#[derive(Clone, Debug, Default)]
 pub struct UserPrefs {
     /// 主题三态。
     pub theme: ThemePref,
@@ -71,6 +73,8 @@ pub struct UserPrefs {
     pub sidebar_width: Option<f32>,
     /// 「恢复上次会话」开关。`None` = 未设置过，默认开启；`Some(false)` = 显式关闭。
     pub session_restore: Option<bool>,
+    /// 打开文件夹的根路径（侧边栏「文件」视图）。跨重启恢复文件树；`None` = 未打开过。
+    pub opened_folder: Option<String>,
 }
 
 impl UserPrefs {
@@ -121,6 +125,11 @@ impl UserPrefs {
         if let Some(Value::Bool(b)) = map.get("session_restore") {
             prefs.session_restore = Some(*b);
         }
+        if let Some(Value::String(s)) = map.get("opened_folder") {
+            if !s.is_empty() {
+                prefs.opened_folder = Some(s.clone());
+            }
+        }
         prefs
     }
 
@@ -131,6 +140,7 @@ impl UserPrefs {
             "font_size": self.font_size,
             "sidebar_width": self.sidebar_width,
             "session_restore": self.session_restore,
+            "opened_folder": self.opened_folder,
         })
     }
 
@@ -205,6 +215,7 @@ mod tests {
             font_size: Some(15.0),
             sidebar_width: None,
             session_restore: Some(false),
+            opened_folder: None,
         };
         let back = UserPrefs::from_json_value(&p.to_json_value());
         assert_eq!(back.session_restore, Some(false));
@@ -219,5 +230,37 @@ mod tests {
         // 非对象 → 全默认。
         let back = UserPrefs::from_json_value(&Value::Null);
         assert_eq!(back.session_restore, None);
+    }
+
+    /// 「打开文件夹」根路径 roundtrip：None = 未打开（JSON 值为 null、读回 None）；
+    /// Some(路径) 写入并读回；空串 / 非字符串 / 缺字段一律回退 None。
+    #[test]
+    fn opened_folder_json_roundtrip() {
+        // None：不写入有效路径（null）、读回 None。
+        let v = UserPrefs::default().to_json_value();
+        assert_eq!(v["opened_folder"], Value::Null);
+        let back = UserPrefs::from_json_value(&v);
+        assert_eq!(back.opened_folder, None);
+
+        // Some(路径)：显式持久化并读回（连同用 `..UserPrefs::default()` 的结构体更新）。
+        let p = UserPrefs {
+            opened_folder: Some("C:\\Data\\docs".to_string()),
+            ..UserPrefs::default()
+        };
+        let back = UserPrefs::from_json_value(&p.to_json_value());
+        assert_eq!(
+            back.opened_folder.as_deref(),
+            Some("C:\\Data\\docs"),
+            "打开文件夹路径应 roundtrip"
+        );
+        assert_eq!(back.theme, ThemePref::Follow, "其余字段不受影响");
+
+        // 非法值：空串（读回 None）、非字符串（回退 None）、缺字段（None）。
+        let v = serde_json::json!({ "opened_folder": "" });
+        assert_eq!(UserPrefs::from_json_value(&v).opened_folder, None);
+        let v = serde_json::json!({ "opened_folder": 42 });
+        assert_eq!(UserPrefs::from_json_value(&v).opened_folder, None);
+        let back = UserPrefs::from_json_value(&Value::Null);
+        assert_eq!(back.opened_folder, None);
     }
 }

@@ -201,6 +201,14 @@ impl EditorApp {
             },
             // 会话恢复开关随其它偏好一并落盘（否则一次字号/主题保存就会把它重置回默认开）。
             session_restore: Some(self.session_restore),
+            // 打开文件夹的根路径随偏好落盘（首次写前为空；路径失效时 `files.root` 为
+            // None → 这里写 null，下次启动不再恢复该失效文件夹）。
+            opened_folder: self
+                .sidebar
+                .files
+                .root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
         }
         .save();
     }

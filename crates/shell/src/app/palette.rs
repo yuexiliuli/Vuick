@@ -90,6 +90,9 @@ impl EditorApp {
             command!("文件", "打开文件…", "Ctrl+O", |this, window, cx| {
                 this.open_dialog(window, cx)
             }),
+            command!("文件", "打开文件夹…", "Ctrl+Shift+O", |this, window, cx| {
+                this.open_folder_dialog(window, cx)
+            }),
             command!("文件", "保存", "Ctrl+S", |this, window, cx| {
                 this.save(window, cx)
             }),

@@ -48,6 +48,8 @@ impl EditorApp {
         });
         // 加载持久化用户偏好（主题三态 / 字号 / 侧边栏宽度；缺失或损坏 → 默认）。
         let prefs = UserPrefs::load();
+        // 打开文件夹根路径（启动恢复文件树；`prefs` 随后被逐字段消费，先取出）。
+        let opened_folder = prefs.opened_folder.clone();
         // 初始主题：按偏好解析（Follow → 当前系统明暗；Light/Dark → 强制）。
         let start_dark = prefs.theme.resolved_dark(cx.window_appearance());
         let start_font = prefs
@@ -88,6 +90,9 @@ impl EditorApp {
                 toc_tab: None,
                 toc_vscroll: gpui::ScrollHandle::new(),
                 search_vscroll: gpui::ScrollHandle::new(),
+                files: sidebar::FileTreeState::default(),
+                files_layout: None,
+                files_vscroll: gpui::ScrollHandle::new(),
                 toc_width: None,
                 toc_cache: None,
                 // 有持久化宽度 → 恢复并固定为手动宽度；否则保持随内容自适应。
@@ -126,6 +131,23 @@ impl EditorApp {
             retired_live2: Vec::new(),
         };
         app.register_window(window, cx);
+        // 打开文件夹持久化 → 启动恢复：prefs.opened_folder 存在且目录仍有效 → 设为
+        // 文件树根 + 展开根（后台读根直接子项）+ 侧边栏切到「文件」视图展开。
+        // 路径失效 / 不存在 → 不设根，首次 `persist_prefs` 时清掉（写 null）。
+        if let Some(folder) = opened_folder {
+            let p = PathBuf::from(&folder);
+            if p.is_dir() {
+                app.sidebar.files.set_root(Some(p.clone()));
+                app.sidebar.files.expanded.insert(p.clone());
+                app.spawn_file_tree_scan(p, window, cx);
+                app.sidebar.view = sidebar::SidebarView::Files;
+                app.sidebar.open = true;
+                app.sidebar.panel_open = true;
+            } else {
+                // 根失效：files.root 保持 None，persist_prefs 把 opened_folder 写回 null。
+                app.persist_prefs();
+            }
+        }
         // 把解析出的初始主题落地到全局 ui::theme（覆盖 main.rs 写死的基准主题，
         // 首帧前完成，避免「先亮后暗」闪一下）。
         ui::theme::Theme::set(

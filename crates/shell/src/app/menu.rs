@@ -50,6 +50,12 @@ impl EditorApp {
             |this, window, cx| this.open_dialog(window, cx),
         ))
         .item(Self::menu_action_item(
+            "打开文件夹…",
+            "Ctrl+Shift+O",
+            weak.clone(),
+            |this, window, cx| this.open_folder_dialog(window, cx),
+        ))
+        .item(Self::menu_action_item(
             "保存",
             "Ctrl+S",
             weak.clone(),

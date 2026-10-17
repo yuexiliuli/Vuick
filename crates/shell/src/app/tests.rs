@@ -8,6 +8,7 @@ include!("tests/preview.rs");
 include!("tests/scroll_sync.rs");
 include!("tests/tab_bar.rs");
 include!("tests/file_open.rs");
+include!("tests/file_tree.rs");
 include!("tests/pdf_epub.rs");
 include!("tests/epub_wy.rs");
 include!("tests/bench.rs");

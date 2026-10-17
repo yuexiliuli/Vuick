@@ -1018,6 +1018,60 @@ impl EditorApp {
         }
     }
 
+    /// 打开文件夹对话框（rfd `pick_folder`；同 [`Self::open_dialog`] 异步姿势）。
+    /// 取消 → 无操作。测试构建不真弹原生选择框（`#[cfg(not(test))]` 包裹）。
+    pub(super) fn open_folder_dialog(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(not(test))]
+        {
+            let entity = _cx.entity();
+            _window
+                .spawn(_cx, async move |cx| {
+                    let Some(folder) = rfd::AsyncFileDialog::new()
+                        .set_title("打开文件夹")
+                        .pick_folder()
+                        .await
+                    else {
+                        return; // 取消：无操作
+                    };
+                    let path = folder.path().to_path_buf();
+                    let _ = cx.update_window_entity(&entity, |this, window, cx| {
+                        this.open_folder_path(path, window, cx);
+                    });
+                })
+                .detach();
+        }
+    }
+
+    /// 把一个文件夹设为文件树根：路径无效 → 清空树（后续写 prefs 同步清掉）；
+    /// 有效 → 换根（清整棵树）→ 展开根 → 后台读根直接子项 → 切到「文件」视图 →
+    /// 持久化根路径跨重启恢复。
+    pub(super) fn open_folder_path(
+        &mut self,
+        path: std::path::PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !path.is_dir() {
+            self.sidebar.files.set_root(None);
+            self.status = SharedString::from(format!("文件夹无效：{}", path.display()));
+            self.status_ok = false;
+            self.persist_prefs();
+            cx.notify();
+            return;
+        }
+        // 换根：set_root 清理 expanded/children/pending（状态失效源①换根）。
+        self.sidebar.files.set_root(Some(path.clone()));
+        self.sidebar.files.expanded.insert(path.clone());
+        self.spawn_file_tree_scan(path.clone(), window, cx);
+        self.sidebar.view = sidebar::SidebarView::Files;
+        self.sidebar.open = true;
+        self.sidebar.panel_open = true;
+        self.status = SharedString::from(format!("已打开文件夹：{}", path.display()));
+        self.status_ok = true;
+        self.persist_prefs();
+        cx.notify();
+    }
+
     pub(super) fn write_to_path(
         &mut self,
         idx: usize,

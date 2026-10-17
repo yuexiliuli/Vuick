@@ -23,6 +23,10 @@ pub enum IconName {
     File,
     ChevronRight,
     ChevronDown,
+    /// 文件夹（文件树 / 打开文件夹空态 / 活动栏「文件」按钮）。
+    Folder,
+    /// 展开状态的文件夹（文件树中展开的目录行）。
+    FolderOpen,
     /// 播放（视频控制条）。
     #[cfg(feature = "video")]
     Play,
@@ -82,6 +86,13 @@ impl IconName {
             }
             IconName::ChevronRight => "<path d=\"m9 18 6-6-6-6\"/>",
             IconName::ChevronDown => "<path d=\"m6 9 6 6 6-6\"/>",
+            // 文件夹：licide 线性描边（顶部拉手带斜角），展开态多一条「开口 + 纸面」折线。
+            IconName::Folder => {
+                "<path d=\"M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z\"/>"
+            }
+            IconName::FolderOpen => {
+                "<path d=\"m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2\"/>"
+            }
             // 播放/暂停（Feather 风格实心多边形，stroke 描边统一）
             #[cfg(feature = "video")]
             IconName::Play => "<polygon points=\"6 3 20 12 6 21 6 3\"/>",
@@ -231,6 +242,8 @@ mod tests {
             IconName::File,
             IconName::ChevronRight,
             IconName::ChevronDown,
+            IconName::Folder,
+            IconName::FolderOpen,
             #[cfg(feature = "video")]
             IconName::Play,
             #[cfg(feature = "video")]

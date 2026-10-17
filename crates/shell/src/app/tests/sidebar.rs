@@ -46,7 +46,7 @@
         );
     }
 
-    /// 侧边栏「目录 / 搜索」竖列切换栏可调用出对应界面（已移除文件视图）。
+    /// 侧边栏「目录 / 搜索 / 文件」竖列切换栏可调用出对应界面。
     #[gpui::test]
     async fn sidebar_views_switch(cx: &mut TestAppContext) {
         init_test(cx);
@@ -65,7 +65,7 @@
         for _ in 0..3 {
             cx.run_until_parked();
         }
-        // 竖列切换栏有「目录/搜索」两个按钮（无「文件」）
+        // 竖列切换栏有「目录/搜索/文件」三个按钮
         assert!(
             cx.debug_bounds("sidebar-toc").is_some(),
             "默认应为目录视图"
@@ -83,15 +83,16 @@
             "应有搜索按钮"
         );
         assert!(
-            cx.debug_bounds("sidebar-btn-files").is_none(),
-            "已去掉文件按钮"
+            cx.debug_bounds("sidebar-btn-files").is_some(),
+            "应有文件按钮"
         );
-        // 目录按钮与搜索按钮上下竖列（搜索按钮位于目录按钮下方）
+        // 三个按钮上下竖列（目录最小 y、文件最大 y）
         let toc = cx.debug_bounds("sidebar-btn-toc").unwrap();
         let search = cx.debug_bounds("sidebar-btn-search").unwrap();
+        let files = cx.debug_bounds("sidebar-btn-files").unwrap();
         assert!(
-            search.origin.y > toc.origin.y,
-            "搜索按钮应在目录按钮之下（竖列），toc={toc:?} search={search:?}"
+            search.origin.y > toc.origin.y && files.origin.y > search.origin.y,
+            "按钮应按 目录→搜索→文件 自上而下竖列：toc={toc:?} search={search:?} files={files:?}"
         );
 
         // 切到搜索视图

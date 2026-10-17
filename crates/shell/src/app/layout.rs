@@ -324,6 +324,11 @@ impl EditorApp {
                 }),
             )
             .on_action(
+                cx.listener(|this: &mut EditorApp, _: &OpenFolder, window, cx| {
+                    this.open_folder_dialog(window, cx)
+                }),
+            )
+            .on_action(
                 cx.listener(|this: &mut EditorApp, _: &CloseTab, window, cx| {
                     this.close_tab(this.active_tab, window, cx);
                 }),

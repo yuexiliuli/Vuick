@@ -18,6 +18,7 @@ actions!(
     [
         NewFile,
         OpenFile,
+        OpenFolder,
         Save,
         SaveAs,
         CloseTab,
