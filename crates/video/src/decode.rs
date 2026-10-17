@@ -35,6 +35,7 @@ pub struct VideoParams {
 }
 
 /// 一帧解码结果：`(帧 pts 秒, 宽, 高, BGRA 像素)`（BGRA 字节序同 GPUI `RenderImage`）。
+#[allow(dead_code)] // 便捷壳 [`VideoReader::next_frame_bgra`] 用；播放 worker 走 `_into`（复用缓冲）
 pub type DecodedFrame = (f64, u32, u32, Vec<u8>);
 
 /// 音频顶层参数。
@@ -181,6 +182,9 @@ fn utf8_cstr(path: &Path) -> Result<std::ffi::CString> {
 /// 句柄只在解码线程本地创建/使用/释放（对齐旧版纪律）。
 pub struct VideoReader {
     handle: Handle,
+    /// 输出顶格容量（源 w×h×4；decode-to-display 输出 ≤ 源尺寸）：`_into` 缓冲预分配用，
+    /// 打开时算一次缓存（省掉逐帧 FFI 取参数做容量判断）。
+    cap: usize,
 }
 
 impl Drop for VideoReader {
@@ -209,7 +213,25 @@ impl VideoReader {
         if rc != 0 || handle.is_null() {
             return Err(anyhow::anyhow!("打开媒体失败: {}", path.display()));
         }
-        Ok(Self { handle })
+        // 直接读参数算顶格容量（不经 `VideoReader` 临时值——其 Drop 会 close 句柄，造成 UAF）
+        let mut ffi = ParamFFI {
+            width: 0,
+            height: 0,
+            duration: 0.0,
+            frame_rate_num: 0,
+            frame_rate_den: 0,
+            has_audio: 0,
+            sample_rate: 0,
+            channels: 0,
+        };
+        unsafe { (b.video_params)(handle, &mut ffi) }
+        Ok(Self {
+            handle,
+            cap: (ffi.width as usize)
+                .saturating_mul(ffi.height as usize)
+                .saturating_mul(4)
+                .max(1),
+        })
     }
 
     /// 已解析的顶层参数。
@@ -240,29 +262,46 @@ impl VideoReader {
         Ok(())
     }
 
+    /// 输出顶格容量（源 w×h×4，decode-to-display 输出 ≤ 源）：解码缓冲**上界**。
+    /// 调用方用它在「未知实际输出尺寸」时安全扩容（首帧前）；首帧后按实际 w×h×4 收窄复用。
+    pub fn source_cap(&self) -> usize {
+        self.cap
+    }
+
     /// 推进到**下一帧**并转成 BGRA。返回 [`DecodedFrame`]；
     /// `None` = 已到流末尾（之后可再 `seek` 复用）。
+    ///
+    /// 便捷壳：内部每调用分配一次（一次性调用/测试用；播放 worker 走 [`Self::next_frame_bgra_into`]
+    /// 复用持久缓冲，避免逐帧 3.69MB 全零初始化热点）。
+    #[allow(dead_code)] // 语义/一次性调用入口；播放 worker 走 `_into`（见 [`Self::next_frame_bgra_into`]）
     pub fn next_frame_bgra(&mut self) -> Result<Option<DecodedFrame>> {
-        let b = bridge().context("视频运行库不可用")?;
-        // decode-to-display 输出尺寸 ≤ 源尺寸（长边封顶/等比），故源 w×h×4 缓冲必然够用。
-        let params = self.params();
-        let cap = (params.width as usize)
-            .saturating_mul(params.height as usize)
-            .saturating_mul(4)
-            .max(1);
-        let mut buf = vec![0u8; cap];
-        let mut pts = 0.0f64;
-        let mut w = 0u32;
-        let mut h = 0u32;
-        let rc = unsafe {
-            (b.video_frame)(self.handle, buf.as_mut_ptr(), buf.len(), &mut pts, &mut w, &mut h)
-        };
-        match rc {
-            1 => {
+        let mut buf = vec![0u8; self.cap];
+        match self.next_frame_bgra_into(&mut buf)? {
+            Some((pts, w, h)) => {
                 let need = (w as usize) * (h as usize) * 4;
                 buf.truncate(need);
                 Ok(Some((pts, w, h, buf)))
             }
+            None => Ok(None),
+        }
+    }
+
+    /// 推进到**下一帧**并把 BGRA 直接写进调用方提供缓冲 `out`（须 ≥ 输出 w×h×4）。返回
+    /// `(pts 秒, 宽, 高)`；`None` = 流末尾（之后可再 `seek` 复用）。
+    ///
+    /// **消除逐帧全零初始化**：缓冲由调用方常驻复用，容量/尺寸管理交调用方（worker 用
+    /// [`Self::source_cap`] 兜底顶格、首帧后按实际输出收窄），本方法不做任何分配/清零；
+    /// 与 cdylib `vff_video_frame` 的「调用方预分配输出缓冲」约定对齐。
+    pub fn next_frame_bgra_into(&mut self, out: &mut [u8]) -> Result<Option<(f64, u32, u32)>> {
+        let b = bridge().context("视频运行库不可用")?;
+        let mut pts = 0.0f64;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let rc = unsafe {
+            (b.video_frame)(self.handle, out.as_mut_ptr(), out.len(), &mut pts, &mut w, &mut h)
+        };
+        match rc {
+            1 => Ok(Some((pts, w, h))),
             0 => Ok(None),
             _ => Err(anyhow::anyhow!("解码帧失败")),
         }
@@ -353,6 +392,104 @@ impl AudioReader {
             0 => Ok(None),
             _ => Err(anyhow::anyhow!("解码音频失败")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// 基准文件：`VFF_BENCH_VIDEO` 指定，缺省仓库 `target/视频测试.mp4`（1280x720 h264@30）。
+    fn bench_video() -> std::path::PathBuf {
+        std::env::var("VFF_BENCH_VIDEO")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/视频测试.mp4")
+            })
+    }
+
+    /// 走完 `frames` 帧并积累每帧墙钟（EOF 则 seek(0) 复跑凑数，同 video-ffmpeg 姿势）。
+    fn collect(r: &mut VideoReader, frames: usize) -> Vec<f64> {
+        let mut out: Vec<f64> = Vec::with_capacity(frames);
+        let cap = r.source_cap();
+        let mut buf = vec![0u8; cap];
+        while out.len() < frames {
+            let t = Instant::now();
+            match r.next_frame_bgra_into(&mut buf) {
+                Ok(Some(_)) => out.push(t.elapsed().as_secs_f64() * 1e3),
+                Ok(None) => r.seek(0.0).unwrap(),
+                Err(e) => panic!("帧解码失败: {e:#}"),
+            }
+        }
+        out
+    }
+
+    fn stat(v: &[f64]) -> (f64, f64, f64) {
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        (s[0], s[s.len() / 2], mean)
+    }
+
+    /// 主侧解码路径逐帧墙钟对照（`--ignored` 手动跑）：量化「每帧 alloc + 全零初始化」常量。
+    /// - `旧路径`：worker 逐帧 `next_frame_bgra()`（内部 `vec![0;N]`，3.69MB @720p 全零 memset）；
+    /// - `新路径`：常驻缓冲 `next_frame_bgra_into` 复用 + 一次 `to_vec` memcpy（现 worker 姿势）。
+    /// EOF→seek(0) 复跑凑数；前 20 帧预热剔除（scaler 惰性初始化）。
+    #[test]
+    #[ignore = "手动测量用"]
+    fn bench_frame_alloc_paths() {
+        if !available() {
+            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            return;
+        }
+        let path = bench_video();
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        const FRAMES: usize = 240;
+        const WARMUP: usize = 20;
+        let mut r = VideoReader::open_scaled(&path, 1920).expect("打开失败");
+        let p = r.params();
+        eprintln!(
+            "[BENCH] 文件={} 源={}x{} 输出顶格={} cap={}",
+            path.display(),
+            p.width,
+            p.height,
+            r.source_cap() / 4,
+            r.source_cap()
+        );
+
+        // 旧路径：每帧 `next_frame_bgra`（分配 + 全零初始化 + sws 写入）
+        let mut old: Vec<f64> = Vec::with_capacity(FRAMES);
+        while old.len() < FRAMES {
+            let t = Instant::now();
+            match r.next_frame_bgra() {
+                Ok(Some(_)) => old.push(t.elapsed().as_secs_f64() * 1e3),
+                Ok(None) => r.seek(0.0).unwrap(),
+                Err(e) => panic!("旧路径解码失败: {e:#}"),
+            }
+        }
+
+        // 新路径：常驻缓冲 `_into` 复用 + to_vec（与视频 worker 逐帧姿势一致）
+        let new = collect(&mut r, FRAMES);
+
+        let (omin, omed, ome) = stat(&old[WARMUP..]);
+        let (nmin, nmed, nme) = stat(&new[WARMUP..]);
+        eprintln!(
+            "[BENCH] 旧路径 next_frame_bgra（alloc+全零初始化）: min={omin:.3} 中位={omed:.3} 均值={ome:.3} ms/帧"
+        );
+        eprintln!(
+            "[BENCH] 新路径 _into+to_vec（常驻复用）         : min={nmin:.3} 中位={nmed:.3} 均值={nme:.3} ms/帧"
+        );
+        eprintln!(
+            "[BENCH] alloc/zero-init 常量差 ≈ {:.3} ms/帧（新路径省下）",
+            ome - nme
+        );
     }
 }
 

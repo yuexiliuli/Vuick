@@ -528,6 +528,12 @@ impl VideoViewer {
         //（探针实测 open_scaled≈57ms、复用 seek≈0ms）。换文件或 cap 变化（窗口缩放）
         // 才重开。同一线程内串行使用，无并发；reader 非 Send，仅在本 worker 线程持有。
         let mut active: Option<(std::path::PathBuf, u32, VideoReader)> = None;
+        // 常驻帧缓冲（worker 线程独占）：跨命令存活，零初始化只在扩容发生一次（按源顶格
+        // `source_cap`，任何解码输出 ≤ 源尺寸 → slice 上界恒安全），随后逐帧覆写复用——
+        // 消除每帧 `vec![0;N]` 的全零初始化热点（debug 3.69MB ≈ 5ms/帧，见
+        // crates/video/src/decode.rs `next_frame_bgra_into`）。送入通道的是其 `to_vec`
+        // 副本；换 reader（文件/解码尺寸变化）时缓冲会按新源顶格重新扩容。
+        let mut buf: Vec<u8> = Vec::new();
         while let Ok(cmd) = rx.recv() {
             let same = matches!(&active, Some((p, c, _)) if *p == cmd.path && *c == cmd.cap);
             if !same {
@@ -561,16 +567,36 @@ impl VideoViewer {
             // 规则：落点前的预滚帧只保留最新一帧（≈落点前一帧，保证排空先有帧可上屏、
             // seek 到片尾有末帧回退），其余丢弃；越过落点的帧照常全送。
             let mut pre_roll: Option<FrameItem> = None;
-            // VPROF=1 拆账：解码（FFI 内 decode+sws+to_vec）与推帧背压（tx.send，bounded
-            // 通道满=主线程没在及时消费）的每帧墙钟，每 ~2s 打一行忙核。
+            // VPROF=1 拆账：解码（`_into` 覆写复用缓冲 + 帧产物 to_vec memcpy）与推帧背压
+            //（tx.send，bounded 通道满=主线程没在及时消费）的每帧墙钟，每 ~2s 打一行忙核。
             let vp_on = vprof_enabled();
             let mut vp_decode = Duration::ZERO;
             let mut vp_send = Duration::ZERO;
             let mut vp_frames: u64 = 0;
             let mut vp_window = Instant::now();
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
+                // 扩容目标：始终按源顶格（source_cap）兜底——任何解码输出 ≤ 源尺寸，
+                // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
+                // 只在扩容瞬间发生一次，逐帧不重置。
+                if buf.len() < reader.source_cap() {
+                    buf.resize(reader.source_cap(), 0);
+                }
                 let t0 = Instant::now();
-                let item = reader.next_frame_bgra();
+                // 复用持久缓冲 `_into`（零初始化只在扩容时发生一次）；帧产物
+                // `buf[..need].to_vec()`（一次 memcpy、无逐帧 memset）计入 decode 窗——与旧版
+                // `next_frame_bgra` 的「内部 vec![0;N]+sws 写入」口径对齐，VPROF 才可比。
+                let item = match reader.next_frame_bgra_into(&mut buf[..]) {
+                    Ok(Some((pts, w, h))) => {
+                        let need = (w as usize) * (h as usize) * 4;
+                        // 不做 `truncate`：它只缩短 len、不释放容量（顶格内存照样驻留），
+                        // 反而把下次 `_into` 的上界从恒安全的 source_cap 缩成上一帧 need——
+                        // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
+                        // 断代）。保持 len=source_cap，need 只用于本帧 to_vec 切片。
+                        Ok(Some((pts, w, h, buf[..need].to_vec())))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                };
                 let t1 = Instant::now();
                 let keep = match item {
                     Ok(Some(frame)) if frame.0 >= cmd.target => {
@@ -1318,6 +1344,26 @@ impl VideoViewer {
         self.scrubbing = false;
         let target = target.clamp(0.0, self.duration.max(0.0));
         self.scrub_target = target;
+        // 单击合并（一次换代）：点按 down→up 未拖动且未落点时，`begin_scrub` 那代
+        // 同 target 的预览解码仍在飞（`pending_seek == Some(target)`）= 视频 worker 已
+        // 在解这一段、pump 只等它出帧上屏——此时松手**不必换代重解第二遍**（现状每次
+        // 单击 = begin 一遍 + end 一遍同 target 全量 pre-roll 解码，显示等的是第二遍，
+        // 长 GOP 中段 1.1~1.8s 延迟、CPU 翻倍）。本分支只补音频收尾，视频就地沿用
+        // begin 那代，上屏从点按起算一遍解码。
+        if self.pending_seek == Some(target) && (self.playhead - target).abs() < 1e-9 {
+            self.last_tick = None; // 同 seek 的墙钟重锚：音频时钟期不更新 last_tick
+            if self.audio.is_some() {
+                self.start_audio_at(target); // 音频 worker 复用 reader：只 seek + 喂送
+                if self.playing
+                    && let Some(sink) = &self.audio
+                {
+                    let _ = sink.play();
+                }
+            }
+            self.ensure_pump(cx); // pending_seek 仍 Some(target)：泵持续到 begin 代帧上屏
+            cx.notify();
+            return;
+        }
         self.seek(target - self.playhead, cx);
     }
 
@@ -2698,6 +2744,120 @@ mod tests {
             (p - 400.0).abs() < 1.0,
             "seek 后不得把 50s 滞留当一拍前进（落点后尖峰），实得 {p}"
         );
+        cx.run_until_parked();
+    }
+
+    /// 回归：**单击（down→up 同落点未拖动）合并为一次视频换代**——`begin_scrub` 那代同
+    /// target 的预览解码仍在飞（`pending_seek == Some(target)`）时松手不再换代重解第二遍
+    ///（现状每次单击 = begin 一遍 + end 一遍同 target 全量 pre-roll 解码，长 GOP 里
+    /// 解码量翻倍、显示等第二遍）。断言：begin 后松手 `generation` 不再上涨（一次换代），
+    /// `pending_seek` 仍指向该 target（泵等 begin 帧上屏），playhead 已到位。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn click_commit_reuses_inflight_begin_decode(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = true;
+                v.duration = 100.0; // 定位虚构时长，begin/end 同分数即可触发合并
+                v
+            })
+        });
+        // 单击：down=begin(0.5)、up=end(0.5)，两点同分数/同落点
+        ent.update(cx, |v, cx| v.begin_scrub(0.50, cx));
+        let (g0, p0, pend0) = cx.update(|app| {
+            let v = ent.read(app);
+            (
+                v.generation.load(Ordering::SeqCst),
+                v.playhead,
+                v.pending_seek,
+            )
+        });
+        assert!((p0 - 50.0).abs() < 1e-6, "begin 落点到 50s");
+        assert_eq!(pend0, Some(50.0), "begin 已投同 target 预览解码（pending）");
+        // 松手时 begin 代仍在飞（不落帧、不换代中间态）→ end 应走音频-only 收尾，不换代
+        ent.update(cx, |v, cx| v.end_scrub(0.50, cx));
+        let (g1, p1, pend1, scrub) = cx.update(|app| {
+            let v = ent.read(app);
+            (
+                v.generation.load(Ordering::SeqCst),
+                v.playhead,
+                v.pending_seek,
+                v.scrubbing,
+            )
+        });
+        assert_eq!(g1, g0, "单击松手不得第二次换代（复用 begin 那代）g={g0}");
+        assert!((p1 - 50.0).abs() < 1e-6, "playhead 仍为落点");
+        assert_eq!(pend1, Some(50.0), "pending 保留：pump 等 begin 帧上屏");
+        assert!(!scrub, "松手后退出拖拽态");
+        cx.run_until_parked();
+    }
+
+    /// 回归：HE-AAC + 字幕流的 MKV（`target\视频测试字幕.mkv`）反复点进度条（等价连续
+    /// seek）——每次 seek 后首帧上屏都落在落点附近、`pending_seek` 及时清空（不冻结/
+    /// 不越位）。该文件 MKV demux 落点常大幅回退（音频侧实测 -12s）+ HE-AAC SBR 断链
+    /// 坏帧是本次 `env_facs_q` 刷屏根因；解码内核已对 seek 后音频做「落点前包/坏帧
+    /// 丢弃」，此处端到端（真 worker + 真解码）验证视频侧同样干净落地。缺夹具 SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn repeated_seeks_on_he_aac_mkv_land_cleanly(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库，本机无 MKV 样例）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(8)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 MKV 首帧/时长超时");
+        }
+        let duration = cx.update(|app| viewer.read(app).duration);
+        let targets = [
+            duration * 0.05,
+            duration * 0.3,
+            duration * 0.62,
+            duration * 0.42,
+            duration * 0.85,
+        ];
+        for &target in &targets {
+            viewer.update(cx, |v, cx| v.seek(target - v.playhead, cx));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let pts: Option<f64> = loop {
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                assert!(Instant::now() < deadline, "MKV seek 落点帧上屏超时 target={target}");
+                std::thread::sleep(Duration::from_millis(3));
+            };
+            let pts = pts.expect("MKV seek 后应有一帧上屏");
+            assert!(
+                (pts - target).abs() < 0.25,
+                "MKV seek 后首帧应在落点附近（帧级），target={target} 实得 pts={pts}"
+            );
+        }
         cx.run_until_parked();
     }
 
