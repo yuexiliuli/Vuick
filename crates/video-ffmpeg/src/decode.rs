@@ -12,6 +12,8 @@
 //! `ffmpeg-sys-next` 需要 `FFMPEG_DIR`（指向含 include/ lib/ 的 FFmpeg 构建）与
 //! `LIBCLANG_PATH`（bindgen 用）。开发机一键装填见 `scripts/setup-ffmpeg.ps1`。
 
+use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
@@ -20,6 +22,8 @@ use anyhow::{Context as _, Result, anyhow};
 
 use ffmpeg_next as ffmpeg;
 use ffmpeg::media::Type;
+// windows-rs：IUnknown 的 vtable/from_raw/as_raw 是 `Interface` trait 的方法，须显式引 trait。
+use windows::core::Interface as _;
 
 /// 进程级 FFmpeg 闸：本构建（ffmpeg 9.0 gyan）里**并发的 FFmpeg 操作**会互相占死——
 /// 实测切 72.MP4：新视频线程 `avformat_open_input` 与音频线程解码/再打开并行时直接卡死
@@ -230,6 +234,263 @@ fn is_hw_frame(frame: &ffmpeg::frame::Video) -> bool {
         let desc = ffmpeg::ffi::av_pix_fmt_desc_get(fmt);
         !desc.is_null() && (*(desc)).flags & (ffmpeg::ffi::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0
     }
+}
+
+// ---------------- 外部 D3D11 设备注入（零回读 GPU 直通）----------------
+
+/// D3D11VA 设备上下文的进程级互斥桥（可重入）：[`ffmpeg::ffi::AVD3D11VADeviceContext`] 的
+/// `lock`/`unlock` 回调经此互斥量串行化对 `device_context`/`video_context` 的访问。
+///
+/// FFmpeg 头文件明确要求「底层锁必须可重入」——D3D11VA 解码/帧池操作同一线程内可能嵌套
+/// 加锁，而 `std::sync::Mutex` 本身**不可**重入，直接用会自我死锁。故用「线程局部深度计数」
+/// 包裹：深度 0→1 时才真正获取互斥量（同线程嵌套只递增深度），不同线程仍互斥
+///（进程内全部解码操作已被 [`FFMPEG_LOCK`] 串行化，实际单线程触碰设备，此处仅兜底）。
+static D3D11_LOCK: Mutex<()> = Mutex::new(());
+
+std::thread_local! {
+    /// 当前线程进入 D3D11 设备锁的嵌套深度（0 = 未持锁）。
+    static D3D11_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// 深度 0→1 时真正持有的互斥量守卫（Drop 即释放；仅持锁线程访问）。
+    static D3D11_LOCK_GUARD: RefCell<Option<std::sync::MutexGuard<'static, ()>>> =
+        const { RefCell::new(None) };
+}
+
+/// D3D11 设备锁回调（extern "C" 内禁止 panic —— unwind 跨 ABI 会 abort，一律取回中毒锁兜底）。
+unsafe extern "C" fn d3d11_lock_cb(_lock_ctx: *mut std::ffi::c_void) {
+    D3D11_LOCK_DEPTH.with(|depth| {
+        if depth.get() == 0 {
+            let guard = D3D11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            D3D11_LOCK_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+        }
+        depth.set(depth.get() + 1);
+    });
+}
+
+/// D3D11 设备解锁回调（与 [`d3d11_lock_cb`] 镜像：深度 1→0 时释放互斥量守卫）。
+unsafe extern "C" fn d3d11_unlock_cb(_lock_ctx: *mut std::ffi::c_void) {
+    D3D11_LOCK_DEPTH.with(|depth| {
+        let d = depth.get();
+        if d == 0 {
+            return; // 防御：不应出现 unlock 先于 lock
+        }
+        if d == 1 {
+            D3D11_LOCK_GUARD.with(|g| g.borrow_mut().take());
+        }
+        depth.set(d - 1);
+    });
+}
+
+/// 对调用方 D3D11 接口指针做一次「借用 AddRef」的 RAII：构造时 `IUnknown::AddRef`、Drop 时
+/// `Release`；[`Self::disarm`] 放弃 Drop 的 Release —— 成功注入 FFmpeg 后接口引用改由
+/// FFmpeg 的 uninit 回调统一 Release（`AVD3D11VADeviceContext` 释放语义：dealloc 时 release
+/// 用户分配的 device/device_context）。
+struct AddRefGuard {
+    unk: Option<windows::core::IUnknown>,
+}
+
+impl AddRefGuard {
+    /// 对 `raw` 调用一次 AddRef；`raw` 为空 → `None`（无引用需管理）。
+    fn new(raw: *mut std::ffi::c_void) -> Option<Self> {
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: 调用方保证 `raw` 是有效的 COM 接口指针（IUnknown vtable 打头）——
+        // FFI 契约（`vff_open_video_hw`）要求传 `ID3D11Device*`/`ID3D11DeviceContext*`。
+        let unk = unsafe { windows::core::IUnknown::from_raw(raw) };
+        unsafe {
+            (unk.vtable().AddRef)(unk.as_raw());
+        }
+        Some(Self { unk: Some(unk) })
+    }
+
+    /// 放弃 Drop 时的 Release：引用所有权移交他人（此处即 FFmpeg uninit 释放）。
+    fn disarm(&mut self) {
+        self.unk = None;
+    }
+}
+
+impl Drop for AddRefGuard {
+    fn drop(&mut self) {
+        if let Some(unk) = self.unk.take() {
+            unsafe { (unk.vtable().Release)(unk.as_raw()) };
+        }
+    }
+}
+
+/// 构造「注入外部 D3D11 设备」的设备上下文 `AVBufferRef`（`AVHWDeviceType::D3D11VA`）：
+/// `av_hwdevice_ctx_alloc` → 填 [`ffmpeg::ffi::AVD3D11VADeviceContext`]（device/device_context/
+/// `BindFlags`（`shader_resource` 控制是否 OR `D3D11_BIND_SHADER_RESOURCE`）/可重入
+/// lock/unlock 桥）→ `av_hwdevice_ctx_init`。
+///
+/// 引用纪律：init 前对调用方 `device`/`device_context` 各 AddRef 一次；`av_hwdevice_ctx_init`
+/// 成功或失败都让 FFmpeg 的 uninit 回调负责 Release（`av_buffer_unref` 触发；失败时先 disarm
+/// guard 防止双 Release）。`lock_ctx` 置空（全局桥，无需每设备状态）。
+///
+/// `shader_resource=true`（规范默认）时给帧纹理挂 `D3D11_BIND_SHADER_RESOURCE`，调用方
+/// 可直接把解码纹理绑 SRV 采样（零回读 GPU 直通的前提）；但实测部分驱动（Intel Arc
+/// 32.0.101.x 等）拒绝 `D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE` 的 NV12 数组
+/// 纹理（`CreateTexture2D` E_INVALIDARG），此时需 `shader_resource=false` 重开
+/// （解码照常，仅纹理不再可被直接采样——见 [`VideoReader::open_external_hw`] 的回退逻辑）。
+///
+/// 返回 `AvBuf` 已持有对设备上下文 `AVBufferRef` 的引用（含 uninit 时的接口释放），
+/// 调用方（[`VideoReader::open_external_hw`]）再 `av_buffer_ref` 一份挂给解码器。
+fn build_external_d3d11_device_ctx(
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+    shader_resource: bool,
+) -> Result<AvBuf> {
+    use ffmpeg::ffi::{
+        AVD3D11VADeviceContext, AVHWDeviceContext, AVHWDeviceType, av_buffer_unref,
+        av_hwdevice_ctx_alloc, av_hwdevice_ctx_init,
+    };
+
+    let mut dev_guard = AddRefGuard::new(device).ok_or_else(|| anyhow!("外部 D3D11 设备指针为空"))?;
+    let mut ctx_guard = AddRefGuard::new(device_context);
+
+    let mut device_buf: *mut ffmpeg::ffi::AVBufferRef =
+        unsafe { av_hwdevice_ctx_alloc(AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA) };
+    if device_buf.is_null() {
+        // guard Drop → Release（引用回滚，调用方自身引用不受影响）
+        return Err(anyhow!("av_hwdevice_ctx_alloc(D3D11VA) 返回空"));
+    }
+
+    unsafe {
+        let hwdev = (*device_buf).data as *mut AVHWDeviceContext;
+        if hwdev.is_null() {
+            av_buffer_unref(&mut device_buf);
+            return Err(anyhow!("AVHWDeviceContext 为空"));
+        }
+        let hwctx = (*hwdev).hwctx as *mut AVD3D11VADeviceContext;
+        if hwctx.is_null() {
+            av_buffer_unref(&mut device_buf);
+            return Err(anyhow!("D3D11VA 设备上下文 hwctx 为空"));
+        }
+        (*hwctx).device = device as *mut ffmpeg::ffi::ID3D11Device;
+        (*hwctx).device_context = device_context as *mut ffmpeg::ffi::ID3D11DeviceContext;
+        if shader_resource {
+            // `D3D11_BIND_SHADER_RESOURCE = 0x2`：帧纹理需可绑为 ShaderResource（调用方 GPU
+            // 直通着色器直接采样 YUV/NV12 纹理）——libavcodec 的 D3D11VA hwaccel 自行 OR
+            // `D3D11_BIND_DECODER`，此处只需保证可被调用方绑定采样。部分驱动不支持该组合
+            //（见函数注释），由 [`VideoReader::open_external_hw`] 探测后回退。
+            (*hwctx).BindFlags |= 0x2;
+        }
+        // 可重入互斥桥（字段类型为 `*mut libc::c_void`，与 std::ffi::c_void 布局一致，经
+        // transmute 贴合 bindgen 生成的函数指针签名；锁本身就是进程级全局静态量）。
+        (*hwctx).lock = Some(std::mem::transmute(
+            d3d11_lock_cb as unsafe extern "C" fn(*mut std::ffi::c_void),
+        ));
+        (*hwctx).unlock = Some(std::mem::transmute(
+            d3d11_unlock_cb as unsafe extern "C" fn(*mut std::ffi::c_void),
+        ));
+        (*hwctx).lock_ctx = std::ptr::null_mut();
+    }
+
+    let rc = unsafe { av_hwdevice_ctx_init(device_buf) };
+    if rc < 0 {
+        // FFmpeg 的 uninit 回调会 Release 我们 AddRef 的 device/device_context → 先移交再释放
+        dev_guard.disarm();
+        if let Some(g) = ctx_guard.as_mut() {
+            g.disarm();
+        }
+        unsafe { av_buffer_unref(&mut device_buf) };
+        return Err(anyhow!("av_hwdevice_ctx_init(D3D11VA) 失败 (err={rc})"));
+    }
+
+    // 成功：接口引用归 FFmpeg（uninit 统一 Release），本 guard 不再管理
+    dev_guard.disarm();
+    if let Some(g) = ctx_guard.as_mut() {
+        g.disarm();
+    }
+    Ok(AvBuf(device_buf))
+}
+
+/// 探测驱动是否支持「D3D11VA 解码数组纹理带 SHADER_RESOURCE」：用**带 SHR** 的设备上下文
+/// 建一个最小帧池（NV12 数组 ×4，BindFlags = `DECODER | SHADER_RESOURCE`，与 libavcodec
+/// D3D11VA frame_params 一致）跑 `av_hwframe_ctx_init`——成功 = 支持；失败
+///（`CreateTexture2D` E_INVALIDARG，实测 Intel Arc 32.0.101.x 等驱动拒绝该组合）=
+/// 不支持、需回退无 SHR 的设备上下文。
+///
+/// 纯 device/frames 上下文、**不开解码器** → 失败无副作用（表由 [`VideoReader::open_external_hw`]
+/// 在打开解码器前调用；只用 `AVHWFramesContext` 最小池探测，顺带验证帧池纹理可建）。
+fn d3d11_supports_shader_bound_textures(
+    device: *mut std::ffi::c_void,
+    device_context: *mut std::ffi::c_void,
+) -> bool {
+    use ffmpeg::ffi::{AVBufferRef, AVD3D11VAFramesContext, AVHWFramesContext};
+    let Ok(dev) = build_external_d3d11_device_ctx(device, device_context, true) else {
+        return false;
+    };
+    let ok = unsafe {
+        let frames =
+            ffmpeg::ffi::av_hwframe_ctx_alloc(ffmpeg::ffi::av_buffer_ref(dev.0));
+        if frames.is_null() {
+            false
+        } else {
+            let fc = (*frames).data as *mut AVHWFramesContext;
+            (*fc).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_D3D11;
+            (*fc).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*fc).width = 1280; // 尺寸无关紧要（创建失败与尺寸无关）
+            (*fc).height = 720;
+            (*fc).initial_pool_size = 4;
+            let fhw = (*fc).hwctx as *mut AVD3D11VAFramesContext;
+            (*fhw).BindFlags |= 0x20 | 0x2; // DECODER | SHADER_RESOURCE
+            let rc = ffmpeg::ffi::av_hwframe_ctx_init(frames);
+            ffmpeg::ffi::av_buffer_unref(&mut (frames as *mut AVBufferRef));
+            rc >= 0
+        }
+    };
+    drop(dev);
+    ok
+}
+
+/// 单帧 HW 帧的 `AVBufferRef` 引用钉：把解码帧的 AVBufferRef 引用复制一份私有持有，
+/// 帧池槽位（D3D11 数组纹理元素）在被引用期间不归还解码器；Drop 时 `av_frame_unref` +
+/// `av_frame_free` 释放该引用 → 槽位归还帧池复用（原子计数，任意线程可释放）。
+///
+/// `*mut AVFrame` 是 raw 指针（[`HwFramePin`] 显式 `unsafe impl Send`），整个结构因此可
+/// 跨线程 —— 与 [`HwFrame`] 一起从解码 worker 线程安全移动到渲染线程/FFI 释放侧。
+struct HwFramePin {
+    /// 私有帧（`av_frame_alloc` + `av_frame_ref` 结果的持有者）。
+    #[allow(dead_code)] // 仅 Drop 时经 unref/free 释放；字段本身不读
+    frame: *mut ffmpeg::ffi::AVFrame,
+}
+
+impl Drop for HwFramePin {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_frame_unref(self.frame);
+            ffmpeg::ffi::av_frame_free(&mut self.frame);
+        }
+    }
+}
+
+// SAFETY: `HwFramePin` 内的 `*mut AVFrame` 只能被「唯一持有者」经 `av_frame_unref/free`
+// 释放，不涉及并发读写同一帧（解码器在 `receive_frame` 写的是它自己的局部帧，与我们的
+// pin 引用相互独立）；AVBufferRef 引用计数本身是原子的 → 可安全跨线程传递/释放。
+unsafe impl Send for HwFramePin {}
+
+/// 一帧零回读 GPU 解码结果：`tex` = `ID3D11Texture2D*`（调用方直接作 D3D11 纹理采样，
+/// 不做 `av_hwframe_transfer_data` 回读、不做 sws）；`array_index` = 数组纹理元素下标
+/// （D3D11VA 池 = 单张 NV12 数组纹理）。`pin` 持有 AVBufferRef 引用钉住该槽位，直到
+/// 框架被 `drop`（或 FFI `vff_video_frame_release`）释放。
+///
+/// `Send`：解码 worker 线程产出后移交渲染线程持有/释放；释放只动 AVBufferRef 的原子引用计数，
+/// 不触解码器共享状态，故无需 [`FFMPEG_LOCK`]（与 ffmpeg-next `Frame` 的 Drop 同纪律——
+/// 否则持锁 drop 与同样持锁的解码循环互相死锁）。
+pub struct HwFrame {
+    /// 帧 pts（秒，流 time_base）。
+    pub pts_seconds: f64,
+    /// 显示宽。
+    pub width: u32,
+    /// 显示高。
+    pub height: u32,
+    /// `ID3D11Texture2D*`（转 usize 的透明句柄，指向帧池数组纹理基址）。
+    pub tex: usize,
+    /// 数组纹理元素下标（该帧在池中的槽位，∈ [0, ArraySize)）。
+    pub array_index: u32,
+    /// 钉住帧池槽位的 AVBufferRef 引用（Drop 即归还）。
+    #[allow(dead_code)] // 字段本身不读、仅做 RAII 保活（见类型注释）
+    pin: Box<dyn Any + Send>,
 }
 
 /// 视频顶层参数（打开即得，无需逐帧解码）。
@@ -665,6 +926,115 @@ impl VideoReader {
         self.params
     }
 
+    /// 外部设备硬件路径（零回读 GPU 直通）：与 [`Self::open_scaled`] 等价但解码器使用
+    /// **调用方提供的 D3D11 设备**（经 FFI 传入 `ID3D11Device*`），并用 [`Self::next_frame_hw`]
+    /// 逐帧吐出 GPU 纹理句柄——**不做** `av_hwframe_transfer_data` 回读、**不做** sws，是
+    /// 「零回读 GPU 视频」的地基：YUV/NV12 纹理直接绑着色器采样。无软件回退（显式走硬解）。
+    ///
+    /// 参数语义：`device` 必填（`*mut c_void` = `ID3D11Device*`）、`device_context` 可空
+    /// （`ID3D11DeviceContext*`，空则由 FFmpeg 自行 `GetImmediateContext`）。本函数对两个
+    /// 接口各 AddRef 一次，解码器关闭（`Drop`）时由 FFmpeg uninit 统一 Release；调用方
+    /// 只需自持它的那份引用即可（不夺引用、也不代还引用）。
+    ///
+    /// `BindFlags` 处理：默认按规范给设备挂 `D3D11_BIND_SHADER_RESOURCE`（帧纹理可被调用方
+    /// 直接 SRV 采样）——但**部分驱动（实测 Intel Arc 驱动）拒绝 `DECODER|SHADER_RESOURCE`
+    /// 的 NV12 解码数组纹理**，退化时自动「无 SHADER_RESOURCE」重开（解码照常，仅纹理不再
+    /// 可被调用方直接采样；返回的 reader 照常工作，见 [`build_external_d3d11_device_ctx`]）。
+    ///
+    /// **不缩放**：`max_dim` 仅作参数兼容保留——HW 帧不经 sws，输出即源尺寸（`HwFrame`
+    /// 自带实际宽高，不受本参数影响）。
+    pub fn open_external_hw(
+        path: &Path,
+        max_dim: u32,
+        device: *mut std::ffi::c_void,
+        device_context: *mut std::ffi::c_void,
+    ) -> Result<Self> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = max_dim; // HW 路径不缩放（无 sws），输出即源尺寸
+        if device.is_null() {
+            return Err(anyhow!("外部 D3D11 设备指针为空"));
+        }
+        ffmpeg::init().context("ffmpeg init 失败")?;
+        quiet_ffmpeg_log_once();
+
+        let ictx = ffmpeg::format::input(path)
+            .with_context(|| format!("打开媒体失败: {}", path.display()))?;
+        let stream = ictx
+            .streams()
+            .best(Type::Video)
+            .ok_or_else(|| anyhow!("媒体中没有视频流: {}", path.display()))?;
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+        let params_for_decoder = stream.parameters();
+
+        // 时长：优先容器总长（µs）；为 0/未知时退回视频流 stats 估算（与 open_scaled_impl 同款）
+        let container_us = ictx.duration();
+        let stream_dur = stream.duration();
+        let duration = if container_us > 0 {
+            container_us as f64 / 1e6
+        } else if stream_dur > 0 {
+            stream_dur as f64
+                * f64::from(time_base.numerator())
+                / f64::from(time_base.denominator())
+        } else {
+            0.0
+        };
+
+        // 注入外部 D3D11 设备：先测驱动是否支持「解码数组纹理带 SHADER_RESOURCE」——
+        // 支持 → 带 SHR（调用方可直接采样解码纹理）；不支持（Intel Arc 等驱动实测
+        // E_INVALIDARG）→ 无 SHR 设备上下文，解码照常（仅纹理不可再被调用方直接采样）。
+        // 探测用最小帧池（不开解码器），无副作用。
+        let use_shr = d3d11_supports_shader_bound_textures(device, device_context);
+        if !use_shr {
+            eprintln!(
+                "[video-ffmpeg] 驱动不支持 D3D11VA 解码纹理带 SHADER_RESOURCE（Intel Arc 等驱动实测），\
+                 已回退 DECODER-only——解码正常，但纹理不可直接做 SRV 采样"
+            );
+        }
+        let device_buf = build_external_d3d11_device_ctx(device, device_context, use_shr)?;
+
+        let context = ffmpeg::codec::context::Context::from_parameters(params_for_decoder)
+            .context("解析视频流参数失败")?;
+        let mut decoder = context.decoder();
+        unsafe {
+            (*decoder.as_mut_ptr()).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(device_buf.0);
+        }
+        if unsafe { (*decoder.as_ptr()).hw_device_ctx }.is_null() {
+            return Err(anyhow!("外部 D3D11VA 设备挂接解码器失败"));
+        }
+        // D3D11VA 硬解要求单线程（帧池/DecoderOutputView 按单线程假设）；显式钉死 1。
+        // 注：h264 D3D11VA 的 hwaccel 在**首帧**才协商启用（open 后 pix_fmt 仍为软件
+        // 格式、hw_frames_ctx 为空），故此处不校验、首帧由 hw_frame_from 判定。
+        decoder.set_threading(ffmpeg::codec::threading::Config {
+            kind: ffmpeg::codec::threading::Type::Frame,
+            count: 1,
+        });
+        let decoder = decoder.video().context("该流不是视频")?;
+
+        let (width, height) = (decoder.width(), decoder.height());
+        let frame_rate = decoder.frame_rate();
+        let has_audio = ictx.streams().best(Type::Audio).is_some();
+
+        Ok(Self {
+            ictx: std::mem::ManuallyDrop::new(ictx),
+            stream_index,
+            decoder: std::mem::ManuallyDrop::new(decoder),
+            scaler: None,
+            params: VideoParams {
+                width,
+                height,
+                duration: duration.max(0.0),
+                frame_rate: frame_rate.map(|r| (r.numerator() as u32, r.denominator() as u32)),
+                has_audio,
+            },
+            out_width: width,
+            out_height: height,
+            time_base,
+            drained: false,
+            hw: Some(HardwareDecode { device: device_buf }),
+        })
+    }
+
     /// 跳转到 `seconds`（µs 级、回拉关键帧）：解码器 flush 后从 keyframe 前继续解，
     /// 调用方应丢弃 `pts < 目标` 的帧直至越过目标（或直接取首个可用帧，容忍轻微回拉）。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
@@ -745,6 +1115,86 @@ impl VideoReader {
             }
         }
         None
+    }
+
+    /// 推进到**下一帧**并返回 GPU 纹理句柄（零回读）——[`HwFrame`]（pts/宽高/
+    /// `ID3D11Texture2D*`/数组下标），**不经过** `av_hwframe_transfer_data` 回读与 sws。
+    /// `None` = 已到流末尾（之后可再 [`Self::seek`] 复用）；EOF/错误语义与
+    /// [`Self::next_frame_bgra_into`] 完全一致（EOF = drain 后无帧）。
+    ///
+    /// 前置：[`Self::open_external_hw`] 打开。线程归属调用方（worker 拉帧）；返回的
+    /// `HwFrame` 为 `Send`，可跨线程持有/释放（槽位引用计数原子，见 [`HwFramePin`]）。
+    pub fn next_frame_hw(&mut self) -> Result<Option<HwFrame>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let packet = self.next_video_packet();
+            let packet = match packet {
+                Some(p) => p,
+                None => {
+                    // 流结束：drain 掉解码器缓冲的剩余帧
+                    if !self.drained {
+                        self.decoder.send_eof().ok();
+                        self.drained = true;
+                    }
+                    let mut f = ffmpeg::frame::Video::empty();
+                    while self.decoder.receive_frame(&mut f).is_ok() {
+                        if let Some(hw) = self.hw_frame_from(&f) {
+                            return Ok(Some(hw));
+                        }
+                    }
+                    return Ok(None);
+                }
+            };
+            self.decoder
+                .send_packet(&packet)
+                .context("decoder send_packet 失败")?;
+            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
+            let mut f = ffmpeg::frame::Video::empty();
+            while self.decoder.receive_frame(&mut f).is_ok() {
+                if let Some(hw) = self.hw_frame_from(&f) {
+                    return Ok(Some(hw));
+                }
+            }
+        }
+    }
+
+    /// 把解码出的一个 HW 帧复制为可独立存活的 [`HwFrame`]：无 pts 的帧跳过（`None`）；
+    /// 非 HW 帧防御性跳过（外部设备路径下不应发生）。`av_frame_ref` 把 AVBufferRef 引用
+    /// 复制进私有帧——帧池槽位被钉住（见 [`HwFramePin`]），局部 `f` 在下一拍被
+    /// `receive_frame` 覆写不影响本帧（我们持有的是引用拷贝而非 `f` 本体）。
+    fn hw_frame_from(&self, f: &ffmpeg::frame::Video) -> Option<HwFrame> {
+        let Some(pts) = f.pts() else {
+            return None;
+        };
+        if !is_hw_frame(f) {
+            return None; // 防御：外部设备路径下不应产出软件帧
+        }
+        unsafe {
+            let raw = f.as_ptr();
+            // D3D11 帧布局：data[0] = `ID3D11Texture2D*`；data[1] = 数组纹理元素下标（intptr_t）
+            let tex = (*raw).data[0] as usize;
+            let array_index = (*raw).data[1] as usize as u32;
+
+            let mut pin_frame = ffmpeg::ffi::av_frame_alloc();
+            if pin_frame.is_null() {
+                return None;
+            }
+            if ffmpeg::ffi::av_frame_ref(pin_frame, raw) < 0 {
+                ffmpeg::ffi::av_frame_free(&mut pin_frame);
+                return None;
+            }
+
+            let secs = pts as f64 * f64::from(self.time_base.numerator())
+                / f64::from(self.time_base.denominator());
+            Some(HwFrame {
+                pts_seconds: secs,
+                width: f.width(),
+                height: f.height(),
+                tex,
+                array_index,
+                pin: Box::new(HwFramePin { frame: pin_frame }),
+            })
+        }
     }
 
     /// 取（或惰性创建）sws 缩放器：输入 = `src_format` 的 `src_w×src_h`，输出 =

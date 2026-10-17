@@ -12,6 +12,17 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 # 构建期需 FFMPEG_DIR（头文件/导入库）+ LIBCLANG_PATH（bindgen），见仓库 scripts/setup-ffmpeg.ps1。
 ffmpeg-next = "9.0"
+# 外部 D3D11 设备注入（零回读 GPU 直通）：open_external_hw 用 windows::core::IUnknown 的
+# AddRef/Release 持有调用方设备引用；测试用 D3D11CreateDevice 建设备。features 仅取所需
+# 最小集（版本随 workspace 0.62）：Direct3D11 生成的类型内部引用 Direct3D（D3D_DRIVER_TYPE/
+# D3D_FEATURE_LEVEL）与 Dxgi（DXGI_FORMAT/IDXGIAdapter），三者必须同开才能编译。
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 # MSVC 链接 cdylib 时会打印「正在创建库 ... .lib 和对象 ... .exp」（信息性，非错误），压掉以守零告警纪律。
 [lints.rust]

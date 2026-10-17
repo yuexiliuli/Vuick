@@ -20,6 +20,9 @@
 
 mod decode;
 
+#[cfg(test)]
+mod hw_external_tests;
+
 use decode::{AudioReader, SubtitleReader, VideoReader};
 use std::ffi::{c_char, c_int, c_void, CStr};
 
@@ -132,6 +135,81 @@ pub unsafe extern "C" fn vff_video_frame(
 pub unsafe extern "C" fn vff_close_video(h: Handle) {
     if !h.is_null() {
         drop(unsafe { Box::from_raw(h as *mut VideoReader) });
+    }
+}
+
+/// 打开视频（**外部 D3D11 设备注入**，零回读 GPU 直通）：`device_ptr` = `ID3D11Device*`
+/// （必填）、`device_ctx_ptr` = `ID3D11DeviceContext*`（可空，null 由 FFmpeg 自行
+/// `GetImmediateContext`）。两接口都只借用引用（本库各自 AddRef，`vff_close_video` 时由
+/// FFmpeg 统一 Release）。`max_dim` 保留（HW 路径不做 sws，忽略）。成功写 `*out` 句柄
+/// 返回 0；-1 = 打开失败 / 设备指针为空 / 解码器不支持。
+///
+/// 取帧走 [`vff_video_frame_hw`]（返回 `ID3D11Texture2D*`，不回读、不 sws）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_open_video_hw(
+    path: *const c_char,
+    max_dim: u32,
+    device_ptr: *mut c_void,
+    device_ctx_ptr: *mut c_void,
+    out: *mut Handle,
+) -> c_int {
+    if out.is_null() || device_ptr.is_null() {
+        return -1;
+    }
+    let Some(p) = path_from(path) else {
+        return -1;
+    };
+    let r = match VideoReader::open_external_hw(p, max_dim, device_ptr, device_ctx_ptr) {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+    0
+}
+
+/// 取下一帧 GPU 纹理句柄（零回读）。状态由**返回值指针**编码（句柄本身非空即帧，无法用
+/// OutParam 表达 EOF/错误，故用保留地址作哨兵）：
+/// - **非空且 ≠ 两个哨兵**：`*mut decode::HwFrame` 帧句柄，字段已写入
+///   `*out_pts/*out_w/*out_h/*out_tex/*out_idx`；用完**必须** [`vff_video_frame_release`]
+///   释放（Drop 帧的 AVBufferRef 引用 → 帧池槽位回归解码器复用）。
+/// - `0x1 as *mut c_void`：**EOF**（流末尾，之后可再 `vff_video_seek` 复用）；未写输出。
+/// - `usize::MAX as *mut c_void`：**解码错误**；未写输出。
+///
+/// 说明：堆分配的帧句柄地址至少按 `usize` 对齐，绝不会是 `0x1` 或 `usize::MAX`，哨兵无歧义。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_video_frame_hw(
+    h: Handle,
+    out_pts: *mut f64,
+    out_w: *mut u32,
+    out_h: *mut u32,
+    out_tex: *mut usize,
+    out_idx: *mut u32,
+) -> *mut c_void {
+    let r = reader::<VideoReader>(h);
+    match r.next_frame_hw() {
+        Ok(Some(frame)) => {
+            unsafe {
+                *out_pts = frame.pts_seconds;
+                *out_w = frame.width;
+                *out_h = frame.height;
+                *out_tex = frame.tex;
+                *out_idx = frame.array_index;
+            }
+            Box::into_raw(Box::new(frame)) as *mut c_void
+        }
+        Ok(None) => 0x1 as *mut c_void,
+        Err(_) => usize::MAX as *mut c_void,
+    }
+}
+
+/// 释放 [`vff_video_frame_hw`] 返回的帧句柄（Drop AVBufferRef 引用 → 帧池槽位回归解码器
+/// 复用；**再解码不释放会导致帧池耗尽**）。对 null / EOF(`0x1`) / 错误(`usize::MAX`) 哨兵
+/// 调用是安全的 no-op；传其它任意非法/未对齐指针是未定义行为（与其余 FFI 句柄同契约）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_video_frame_release(frame_ptr: *mut c_void) {
+    let p = frame_ptr as usize;
+    if !frame_ptr.is_null() && p != 0x1 && p != usize::MAX {
+        drop(unsafe { Box::from_raw(frame_ptr as *mut decode::HwFrame) });
     }
 }
 
