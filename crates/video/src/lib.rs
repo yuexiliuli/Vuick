@@ -17,8 +17,10 @@
 
 mod audio;
 mod decode;
+mod subtitle;
 mod viewer;
 
+pub use subtitle::{SubtitleEntry, SubtitleStyle};
 pub use viewer::VideoViewer;
 
 // 拆 workspace 后 video 独立为 crate：`crate::video::` / `ui::` 短路径改为

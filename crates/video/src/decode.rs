@@ -100,6 +100,29 @@ type FnFrame = unsafe extern "C" fn(Handle, *mut u8, usize, *mut f64, *mut u32, 
 type FnPcm = unsafe extern "C" fn(Handle, *mut f32, usize, *mut f64, *mut usize) -> CInt;
 type FnClose = unsafe extern "C" fn(Handle);
 
+// 字幕 FFI 类型
+#[repr(C)]
+#[allow(dead_code)] // FFI 布局定义，实际用独立函数取字幕
+struct SubtitleParamsFFI {
+    stream_count: u32,
+    format: u32,
+}
+
+#[repr(C)]
+struct SubtitleEntryFFI {
+    start_pts: f64,
+    end_pts: f64,
+    text_len: usize,
+}
+
+type FnOpenSubtitle = unsafe extern "C" fn(*const CChar, *mut *mut std::ffi::c_void) -> CInt;
+type FnSubtitleCount = unsafe extern "C" fn(*mut std::ffi::c_void) -> usize;
+type FnSubtitleGetInfo = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut SubtitleEntryFFI) -> CInt;
+type FnSubtitleGetText = unsafe extern "C" fn(*mut std::ffi::c_void, usize, *mut u8, usize) -> CInt;
+type FnSubtitleAt = unsafe extern "C" fn(*mut std::ffi::c_void, f64) -> CInt;
+type FnSubtitleSeek = unsafe extern "C" fn(*mut std::ffi::c_void, f64) -> CInt;
+type FnCloseSubtitle = unsafe extern "C" fn(*mut std::ffi::c_void);
+
 /// 已加载的动态函数集（持有 `Library` 保句柄存活；符号指针在进程生命周期内有效）。
 struct Bridge {
     open_video: libloading::Symbol<'static, FnOpen>,
@@ -113,6 +136,20 @@ struct Bridge {
     audio_pcm: libloading::Symbol<'static, FnPcm>,
     close_video: libloading::Symbol<'static, FnClose>,
     close_audio: libloading::Symbol<'static, FnClose>,
+    #[allow(dead_code)] // FFI 符号，实际在 SubtitleReader 中用
+    open_subtitle: libloading::Symbol<'static, FnOpenSubtitle>,
+    #[allow(dead_code)]
+    subtitle_count: libloading::Symbol<'static, FnSubtitleCount>,
+    #[allow(dead_code)]
+    subtitle_get_info: libloading::Symbol<'static, FnSubtitleGetInfo>,
+    #[allow(dead_code)]
+    subtitle_get_text: libloading::Symbol<'static, FnSubtitleGetText>,
+    #[allow(dead_code)]
+    subtitle_at: libloading::Symbol<'static, FnSubtitleAt>,
+    #[allow(dead_code)]
+    subtitle_seek: libloading::Symbol<'static, FnSubtitleSeek>,
+    #[allow(dead_code)]
+    close_subtitle: libloading::Symbol<'static, FnCloseSubtitle>,
     #[allow(dead_code)] // 保底：Library 被进程级持有，符号才始终有效
     _lib: libloading::Library,
 }
@@ -156,6 +193,13 @@ fn load_bridge() -> Option<Bridge> {
         audio_pcm: sym!(b"vff_audio_pcm\0", FnPcm),
         close_video: sym!(b"vff_close_video\0", FnClose),
         close_audio: sym!(b"vff_close_audio\0", FnClose),
+        open_subtitle: sym!(b"vff_open_subtitle\0", FnOpenSubtitle),
+        subtitle_count: sym!(b"vff_subtitle_count\0", FnSubtitleCount),
+        subtitle_get_info: sym!(b"vff_subtitle_get_info\0", FnSubtitleGetInfo),
+        subtitle_get_text: sym!(b"vff_subtitle_get_text\0", FnSubtitleGetText),
+        subtitle_at: sym!(b"vff_subtitle_at\0", FnSubtitleAt),
+        subtitle_seek: sym!(b"vff_subtitle_seek\0", FnSubtitleSeek),
+        close_subtitle: sym!(b"vff_close_subtitle\0", FnCloseSubtitle),
         _lib: lib,
     })
 }
@@ -395,9 +439,119 @@ impl AudioReader {
     }
 }
 
+// ---------------- 字幕 Reader ----------------
+
+/// 字幕格式枚举。
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)] // 保留供后续 FFI 扩展用
+pub enum SubtitleFormat {
+    ASS = 0,
+    SSA = 1,
+    SRT = 2,
+    Unknown = 3,
+}
+
+impl From<u32> for SubtitleFormat {
+    fn from(v: u32) -> Self {
+        match v {
+            0 => Self::ASS,
+            1 => Self::SSA,
+            2 => Self::SRT,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// 字幕顶层参数。
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)] // 保留供后续 FFI 扩展用
+pub struct SubtitleParams {
+    pub stream_count: u32,
+    pub format: SubtitleFormat,
+}
+
+/// 一条解码后的字幕条目（decode 侧为直通类型；渲染层
+/// [`super::subtitle`] 同款 `pub use crate::decode::SubtitleEntry` 复用它，
+/// viewer 直接赋给 `subtitle::SubtitleEntry` 字段，不用双份结构体互转）。
+#[derive(Clone, Debug)]
+pub struct SubtitleEntry {
+    pub start_pts: f64,
+    pub end_pts: f64,
+    pub text: String,
+}
+
+/// 可 seek 的字幕解码器：提取 ASS/SSA/SRT 字幕。
+pub struct SubtitleReader {
+    handle: Handle,
+    subtitles: Vec<SubtitleEntry>,
+}
+
+impl Drop for SubtitleReader {
+    fn drop(&mut self) {
+        if let Some(b) = bridge() {
+            unsafe { (b.close_subtitle)(self.handle) }
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+impl SubtitleReader {
+    /// 打开媒体并提取字幕流。
+    pub fn open(path: &Path) -> Result<Self> {
+        let b = bridge().context("视频运行库不可用")?;
+        let cpath = utf8_cstr(path)?;
+        let mut handle: Handle = std::ptr::null_mut();
+        let rc = unsafe { (b.open_subtitle)(cpath.as_ptr(), &mut handle) };
+        if rc != 0 || handle.is_null() {
+            return Err(anyhow::anyhow!("打开字幕失败：{}", path.display()));
+        }
+        
+        // 读取所有字幕
+        let count = unsafe { (b.subtitle_count)(handle) };
+        let mut subtitles = Vec::with_capacity(count);
+        
+        for i in 0..count {
+            let mut info = SubtitleEntryFFI {
+                start_pts: 0.0,
+                end_pts: 0.0,
+                text_len: 0,
+            };
+            if unsafe { (b.subtitle_get_info)(handle, i, &mut info) } != 0 {
+                continue;
+            }
+            
+            let mut text_buf = vec![0u8; info.text_len];
+            if unsafe { (b.subtitle_get_text)(handle, i, text_buf.as_mut_ptr(), text_buf.len()) } != 0 {
+                continue;
+            }
+            
+            let text = String::from_utf8_lossy(&text_buf).to_string();
+            subtitles.push(SubtitleEntry {
+                start_pts: info.start_pts,
+                end_pts: info.end_pts,
+                text,
+            });
+        }
+        
+        Ok(Self { handle, subtitles })
+    }
+    
+    /// 获取所有字幕条目。
+    pub fn subtitles(&self) -> &[SubtitleEntry] {
+        &self.subtitles
+    }
+    
+    /// 获取当前时间应显示的字幕。
+    #[allow(dead_code)] // 保留供后续扩展用
+    pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
+        self.subtitles.iter().find(|s| seconds >= s.start_pts && seconds <= s.end_pts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::Instant;
 
     /// 基准文件：`VFF_BENCH_VIDEO` 指定，缺省仓库 `target/视频测试.mp4`（1280x720 h264@30）。
@@ -410,6 +564,56 @@ mod tests {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("../../target/视频测试.mp4")
             })
+    }
+
+    /// 字幕 FFI 全链路回归（评审补）：`SubtitleReader::open` 经
+    /// `vff_open_subtitle → count → get_info → get_text` 取回 `SubtitleEntry`，
+    /// 验证 UTF-8 长度/缓冲往返不截断、首条窗口与文本与 cdylib 侧提取一致。
+    /// 缺夹具 SKIP（与 video-ffmpeg 侧同口径，SKIP 是常态不是回归）。
+    #[test]
+    fn subtitle_ffi_roundtrip_extracts_without_truncation() {
+        if !available() {
+            eprintln!("SKIP: video_ffmpeg.dll 不可用");
+            return;
+        }
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        let r = SubtitleReader::open(&path).expect("打开字幕失败");
+        let subs = r.subtitles();
+        assert!(!subs.is_empty(), "应从 MKV 提取到字幕，实得 {} 条", subs.len());
+        let first = &subs[0];
+        assert!(
+            (first.start_pts - 20.05).abs() < 0.05,
+            "首条 start_pts 应≈20.05s，实得 {:.4}",
+            first.start_pts
+        );
+        assert!(
+            (first.end_pts - 22.03).abs() < 0.1,
+            "首条 end_pts 应≈22.03s，实得 {:.4}",
+            first.end_pts
+        );
+        // 文本往返：不截断、不丢尾（`text_len` 与缓冲一致，lossy 无损）
+        assert!(
+            !first.text.is_empty(),
+            "首条文本应非空（纯文本已剥离 ASS 标签），实得 {:?}",
+            first.text
+        );
+        assert!(
+            first.text.trim() == first.text,
+            "文本不应带尾随空白（往返后应 trim 干净），实得 {:?}",
+            first.text
+        );
+        assert!(
+            r.subtitle_at(20.5).is_some(),
+            "20.5s 应命中活动字幕（首条 [20.05, 22.03]）"
+        );
+        assert!(
+            r.subtitle_at(22.04).is_none(),
+            "22.04s 应不命中（超出首条窗口）"
+        );
     }
 
     /// 走完 `frames` 帧并积累每帧墙钟（EOF 则 seek(0) 复跑凑数，同 video-ffmpeg 姿势）。

@@ -68,6 +68,7 @@ use ui::motion::hover_spring;
 
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
+use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};
 
 use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
@@ -330,6 +331,13 @@ pub struct VideoViewer {
     status: Option<(String, Instant)>,
     /// 状态浮层清空任务的代序号（防旧定时器误清新浮层，同 [`::viewer::auto_hide`] 姿势）。
     status_seq: u32,
+    // --- 字幕 ---
+    /// 字幕清单（打开时一次性加载）。
+    subtitles: Vec<SubtitleEntry>,
+    /// 字幕是否可见（`v` 键切换）。
+    subtitle_visible: bool,
+    /// 字幕样式。
+    subtitle_style: SubtitleStyle,
 }
 
 impl VideoViewer {
@@ -387,6 +395,9 @@ impl VideoViewer {
             rng_state: seed_rng(),
             status: None,
             status_seq: 0,
+            subtitles: Vec::new(),
+            subtitle_visible: true,
+            subtitle_style: SubtitleStyle::default(),
         };
         this.start(cx);
         // 初始浮现控制条、无悬停 1s 后自隐（hover 会作废本次隐藏）
@@ -412,9 +423,10 @@ impl VideoViewer {
                 });
                 return;
             }
+            let scan_path = path.clone();
             let nav = cx
                 .background_executor()
-                .spawn(async move { FolderNav::scan(&path, crate::video::is_video_extension) })
+                .spawn(async move { FolderNav::scan(&scan_path, crate::video::is_video_extension) })
                 .await;
             // 不单独预开 VideoReader 取参数（实测同一文件稍后被 worker 再 open 会
             // 卡死在 avformat_open_input）——改为给首个命令挂 outcome 通道，由 worker
@@ -444,6 +456,24 @@ impl VideoViewer {
                         if let Some(sink) = &this.audio {
                             let _ = sink.play();
                         }
+                        // 加载字幕（后台线程）
+                        cx.spawn(async move |weak, cx| {
+                            let load_path = path.clone();
+                            let subtitles = cx.background_executor().spawn(async move {
+                                super::decode::SubtitleReader::open(&load_path)
+                                    .map(|r| r.subtitles().to_vec())
+                                    .unwrap_or_else(|_| Vec::new())
+                            }).await;
+                            let _ = weak.update(cx, |this, cx| {
+                                // 防陈旧覆盖：后台加载期间若已切到别的文件（`path` 不符），
+                                // 丢弃这次结果；字幕随当前文件走，不残留上一支。
+                                if this.path != path {
+                                    return;
+                                }
+                                this.subtitles = subtitles;
+                                cx.notify();
+                            });
+                        }).detach();
                         cx.notify();
                     });
                 }
@@ -1194,6 +1224,9 @@ impl VideoViewer {
         self.zoom = 1.0; // 切文件：缩放复位为适应视口
         self.pan = (0.0, 0.0); // 平移同步归零（拖拽中的惯性也清掉）
         self.drag = None;
+        // 切文件：立即清空旧字幕（新字幕由 `start` 后台加载覆盖；避免 switch 窗口期旧
+        // 字幕在时间 0 附近残留显示）
+        self.subtitles.clear();
         // —— 切换窗口期（`start` 的异步任务先 await scan_folder、再跑 start_decoder_at
         // 之前）立即切断旧媒体的时钟与输入：否则 pump 一拍可能仍按旧音频时钟把
         // playhead 带回旧位置、或把旧媒体残留帧重新上屏，而新媒体的音频 worker 已
@@ -1397,6 +1430,12 @@ impl VideoViewer {
         cx.notify();
     }
 
+    /// 字幕开关切换。
+    fn toggle_subtitle(&mut self, cx: &mut Context<Self>) {
+        self.subtitle_visible = !self.subtitle_visible;
+        cx.notify();
+    }
+
     /// 设置倍速：音频时钟进程不变（`audio_base` 保持当前进度），只换重采样速率
     /// 重启音频线程；视频帧按源秒时间轴照旧排空，A/V 同速。纯画面（无音频）只需
     /// 更新 `speed`（墙钟按 `dt×speed`）。
@@ -1457,6 +1496,7 @@ impl VideoViewer {
             "[" => self.speed_step(-1, cx),
             "]" => self.speed_step(1, cx),
             "s" => self.screenshot_png(cx),
+            "v" => self.toggle_subtitle(cx),
             _ => return, // 其余键不拦截
         }
         cx.stop_propagation();
@@ -2299,6 +2339,49 @@ impl Render for VideoViewer {
                     ),
             );
         }
+        // 字幕渲染层：有字幕、字幕可见、且当前时间有活跃字幕时叠加。
+        // 定位以**视频实际矩形** `vrect`（contain 适配后含缩放/平移的画面像素框，
+        // 本函数前段逐帧就绪时更新）为基准：画面底部居中、留安全边距，字幕不越出
+        // 画面、不遮控制条；无画面（占位/黑边）时退回画布视频区底部。gpui 没有文字
+        // 描边能力（styled/text_system 无 text_stroke），故退化为**半透明深色圆角
+        // 底条**保证可读性（颜色走 subtitle_style.outline_color，默认黑，即
+        // 「白字黑描边」的落底实现，零新依赖）。
+        if self.subtitle_visible && !self.subtitles.is_empty() {
+            if let Some(subtitle) = find_active_subtitle(&self.subtitles, self.playhead) {
+                let text = parse_ass_text(&subtitle.text);
+                if !text.trim().is_empty() {
+                    let (vx, vy, vdw, vdh) = vrect;
+                    // 随画面高度适度放大（参考高度 480，钳位 0.8x..=1.8x）
+                    let scale = (vdh / 480.0).clamp(0.8, 1.8);
+                    let font_size = self.subtitle_style.font_size * scale;
+                    let strip_bg = self.subtitle_style.outline_color.opacity(0.55);
+                    root = root.child(
+                        div()
+                            .absolute()
+                            .left(px(vx))
+                            .top(px(vy))
+                            .w(px(vdw))
+                            .h(px(vdh))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_end()
+                            .pb_4()
+                            .child(
+                                div()
+                                    .max_w_full()
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_lg()
+                                    .bg(strip_bg)
+                                    .text_size(px(font_size))
+                                    .text_color(self.subtitle_style.primary_color)
+                                    .child(text),
+                            ),
+                    );
+                }
+            }
+        }
         root
     }
 }
@@ -2411,6 +2494,9 @@ mod tests {
             rng_state: 42, // 固定种子：随机播放测试可预期
             status: None,
             status_seq: 0,
+            subtitles: Vec::new(),
+            subtitle_visible: true,
+            subtitle_style: SubtitleStyle::default(),
         }
     }
 

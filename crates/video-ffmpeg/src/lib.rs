@@ -20,7 +20,7 @@
 
 mod decode;
 
-use decode::{AudioReader, VideoReader};
+use decode::{AudioReader, SubtitleReader, VideoReader};
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 /// 跨 FFI 顶层参数（视频 + 音频并集；视频侧音频字段为 0，反之宽度/高度为 0）。
@@ -212,5 +212,151 @@ pub unsafe extern "C" fn vff_audio_pcm(
 pub unsafe extern "C" fn vff_close_audio(h: Handle) {
     if !h.is_null() {
         drop(unsafe { Box::from_raw(h as *mut AudioReader) });
+    }
+}
+
+// ---------------- 字幕 ----------------
+
+/// 字幕格式 FFI 枚举。
+#[repr(C)]
+pub enum SubtitleFormatFFI {
+    ASS = 0,
+    SSA = 1,
+    SRT = 2,
+    Unknown = 3,
+}
+
+/// 字幕参数 FFI 结构。
+#[repr(C)]
+pub struct SubtitleParamsFFI {
+    pub stream_count: u32,
+    pub format: SubtitleFormatFFI,
+}
+
+/// 打开字幕流：成功写 `*out` 句柄返回 0。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_open_subtitle(
+    path: *const c_char,
+    out: *mut *mut c_void,
+) -> c_int {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(p) = path_from(path) else {
+        return -1;
+    };
+    let r = match SubtitleReader::open(p) {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+    unsafe { *out = Box::into_raw(Box::new(r)) as *mut c_void }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_params(h: *mut c_void, out: *mut SubtitleParamsFFI) {
+    let r = reader::<SubtitleReader>(h);
+    let p = r.params();
+    let format_ffi = match p.format {
+        decode::SubtitleFormat::ASS => SubtitleFormatFFI::ASS,
+        decode::SubtitleFormat::SSA => SubtitleFormatFFI::SSA,
+        decode::SubtitleFormat::SRT => SubtitleFormatFFI::SRT,
+        decode::SubtitleFormat::Unknown => SubtitleFormatFFI::Unknown,
+    };
+    unsafe {
+        *out = SubtitleParamsFFI {
+            stream_count: p.stream_count,
+            format: format_ffi,
+        };
+    }
+}
+
+/// 字幕条目 FFI 结构（文本由调用方预分配缓冲）。
+#[repr(C)]
+pub struct SubtitleEntryFFI {
+    pub start_pts: f64,
+    pub end_pts: f64,
+    /// 文本长度（UTF-8 字节数）。
+    pub text_len: usize,
+}
+
+/// 获取字幕清单数量。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_count(h: *mut c_void) -> usize {
+    let r = reader::<SubtitleReader>(h);
+    r.subtitles().len()
+}
+
+/// 获取指定索引的字幕条目信息（返回文本长度，调用方据此分配缓冲）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_get_info(
+    h: *mut c_void,
+    index: usize,
+    out: *mut SubtitleEntryFFI,
+) -> c_int {
+    let r = reader::<SubtitleReader>(h);
+    let Some(entry) = r.subtitles().get(index) else {
+        return -1;
+    };
+    unsafe {
+        *out = SubtitleEntryFFI {
+            start_pts: entry.start_pts,
+            end_pts: entry.end_pts,
+            text_len: entry.text.len(),
+        };
+    }
+    0
+}
+
+/// 获取指定索引的字幕文本（调用方预分配 `text_buf`，容量≥`text_len`）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_get_text(
+    h: *mut c_void,
+    index: usize,
+    text_buf: *mut u8,
+    text_cap: usize,
+) -> c_int {
+    let r = reader::<SubtitleReader>(h);
+    let Some(entry) = r.subtitles().get(index) else {
+        return -1;
+    };
+    if text_buf.is_null() || entry.text.len() > text_cap {
+        return -1;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(entry.text.as_ptr(), text_buf, entry.text.len());
+    }
+    0
+}
+
+/// 获取当前时间应显示的字幕索引（-1 = 无）。
+///
+/// 直接按「窗口包含该秒」扫描返回**首个命中索引**，与视频端 `find_active_subtitle`
+/// 同口径（开区间逐条扫描、含端点）。**不可**用先取 entry 再按 `start_pts` 相等的
+/// `position` 回查：重叠字幕窗口可能出现相同 `start_pts`，position 会误配到非命中的
+/// 首条。字幕按 start 排序、窗口可重叠，线性是唯一可靠匹配。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_at(h: *mut c_void, seconds: f64) -> c_int {
+    let r = reader::<SubtitleReader>(h);
+    match r
+        .subtitles()
+        .iter()
+        .position(|s| seconds >= s.start_pts && seconds <= s.end_pts)
+    {
+        Some(i) => i as c_int,
+        None => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_subtitle_seek(h: *mut c_void, seconds: f64) -> c_int {
+    let r = reader::<SubtitleReader>(h);
+    r.seek(seconds) as c_int
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_close_subtitle(h: *mut c_void) {
+    if !h.is_null() {
+        drop(unsafe { Box::from_raw(h as *mut SubtitleReader) });
     }
 }

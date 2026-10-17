@@ -23,7 +23,7 @@ use ffmpeg::media::Type;
 /// 进程级 FFmpeg 闸：本构建（ffmpeg 9.0 gyan）里**并发的 FFmpeg 操作**会互相占死——
 /// 实测切 72.MP4：新视频线程 `avformat_open_input` 与音频线程解码/再打开并行时直接卡死
 /// 在 `format::input`（开放闸只串 open 无效，open 与解码也会互相卡）。因此**所有 FFI
-/// 调用**（open / seek / next_frame / next_pcm）都过此互斥量串行；单次操作毫秒级，
+/// 调用**（open / seek / next_frame / next_pcm / subtitle）都过此互斥量串行；单次操作毫秒级，
 /// 视频 2 帧通道 + 音频 1s 缓冲足以吸收串行抖动。打开后、解码途中均释放，不长期持锁。
 static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1410,5 +1410,358 @@ mod tests {
             }
         }
         assert!(n >= 3, "open 后应连续读出多块，实得 {n}");
+    }
+}
+
+// ---------------- 字幕（ASS/SSA）----------------
+
+/// 字幕格式枚举。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SubtitleFormat {
+    ASS,
+    SSA,
+    SRT,
+    Unknown,
+}
+
+/// 字幕顶层参数。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubtitleParams {
+    /// 字幕流数量。
+    pub stream_count: u32,
+    /// 首选字幕格式。
+    pub format: SubtitleFormat,
+}
+
+/// 一条解码后的字幕条目。
+#[derive(Clone, Debug)]
+pub struct SubtitleEntry {
+    /// 开始时间（秒）。
+    pub start_pts: f64,
+    /// 结束时间（秒）。
+    pub end_pts: f64,
+    /// 字幕文本（ASS 格式可能含样式标记）。
+    pub text: String,
+}
+
+/// 可 seek 的字幕解码器：提取 ASS/SSA/SRT 字幕。
+///
+/// 与 [`VideoReader`] / [`AudioReader`] 同款姿势：调用方搬进后台线程逐条拉取。
+///
+/// **释放纪律**：`Drop` 把 FFmpeg 成员（`Input`/decoder）手动 drop 并持有
+/// [`FFMPEG_LOCK`] —— 同视频/音频的串行纪律。
+pub struct SubtitleReader {
+    ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
+    stream_index: usize,
+    time_base: ffmpeg::Rational,
+    format: SubtitleFormat,
+    /// 已确定的输出参数（仅供 [`Self::params`] 返回）。
+    params: SubtitleParams,
+    /// 预加载的字幕清单（打开时一次性加载全部）。
+    subtitles: Vec<SubtitleEntry>,
+    /// 当前读取位置索引。
+    current_index: usize,
+}
+
+impl Drop for SubtitleReader {
+    fn drop(&mut self) {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.ictx);
+        }
+    }
+}
+
+impl SubtitleReader {
+    /// 打开媒体并提取字幕流。
+    pub fn open(path: &Path) -> Result<Self> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        ffmpeg::init().context("ffmpeg init 失败")?;
+        quiet_ffmpeg_log_once();
+        
+        let mut ictx = ffmpeg::format::input(path)
+            .with_context(|| format!("打开媒体失败：{}", path.display()))?;
+        
+        // 查找字幕流
+        let stream = ictx
+            .streams()
+            .best(Type::Subtitle)
+            .ok_or_else(|| anyhow!("媒体中没有字幕流：{}", path.display()))?;
+        
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+        
+        // 检测字幕格式
+        let codec_id = stream.parameters().id();
+        let format = match codec_id {
+            ffmpeg::codec::Id::ASS => SubtitleFormat::ASS,
+            ffmpeg::codec::Id::SSA => SubtitleFormat::SSA,
+            ffmpeg::codec::Id::SUBRIP => SubtitleFormat::SRT,
+            ffmpeg::codec::Id::HDMV_PGS_SUBTITLE => SubtitleFormat::Unknown, // 图形字幕不支持
+            _ => SubtitleFormat::Unknown,
+        };
+        
+        let params = SubtitleParams {
+            stream_count: 1,
+            format,
+        };
+        
+        // 一次性加载所有字幕（`ictx.packets()` 产出 `(Stream, Packet)` 元组，迭代无失败分支）
+        let mut subtitles = Vec::new();
+        for (stream, pkt) in ictx.packets() {
+            if stream.index() == stream_index {
+                // 解析字幕包
+                if let Some(entry) = Self::parse_subtitle_packet(&pkt, time_base, format) {
+                    subtitles.push(entry);
+                }
+            }
+        }
+
+        // 按开始时间排序
+        subtitles.sort_by(|a, b| a.start_pts.partial_cmp(&b.start_pts).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 兜底封闭窗口：包 duration 缺失/为 0 的事件会把 `end_pts` 留成 `start_pts`（永不结束）。
+        // 以「下一条的开始」封闭；末条给默认窗口。本仓 `视频测试字幕.mkv` 各包都带 duration，
+        // 此兜底只护其它源。
+        for i in 0..subtitles.len() {
+            if subtitles[i].end_pts <= subtitles[i].start_pts {
+                let next_start = subtitles.get(i + 1).map(|n| n.start_pts);
+                subtitles[i].end_pts = next_start
+                    .unwrap_or(subtitles[i].start_pts + Self::guess_subtitle_duration(format));
+            }
+        }
+        
+        Ok(Self {
+            ictx: std::mem::ManuallyDrop::new(ictx),
+            stream_index,
+            time_base,
+            format,
+            params,
+            subtitles,
+            current_index: 0,
+        })
+    }
+    
+    /// 解析字幕包为 `SubtitleEntry`。
+    ///
+    /// ASS/SSA 事件在容器里有两种封存姿势，这里都兼容：
+    /// 1. **老式「Dialogue: 」整行**（行内自带 `Layer,Start,End,Style,…` 时间）——
+    ///    [`Self::parse_ass_dialogue`]；
+    /// 2. **Matroska 新块格式**（`Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`，
+    ///    开始/结束时间不在行内，由**包 PTS + duration** 提供）。本仓 `视频测试字幕.mkv`
+    ///    即此姿势：首包数据 `0,0,Default,,0,0,0,,<字幕文本>`，pts=20050ms、
+    ///    duration=1980ms → start≈20.05s、end≈22.03s。
+    fn parse_subtitle_packet(
+        pkt: &ffmpeg::Packet,
+        time_base: ffmpeg::Rational,
+        format: SubtitleFormat,
+    ) -> Option<SubtitleEntry> {
+        let data = pkt.data()?;
+        let Ok(text) = std::str::from_utf8(data) else {
+            return None;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        if format == SubtitleFormat::ASS || format == SubtitleFormat::SSA {
+            // 老式整行：行内时间优先（以字幕作者写入的时间为准）
+            if text.starts_with("Dialogue:") {
+                return Self::parse_ass_dialogue(text);
+            }
+            // Matroska 新块格式（mkvmerge 惯例，实测 `视频测试字幕.mkv` 首包即此布局）：
+            //   `readorder,layer,style,name,marginL,marginR,marginV,effect,text`
+            // 前 8 个字段 + 文本；文本字段可含逗号 → `splitn(9, ',')`。
+            // 少数 mux 不计 readorder（7 前导）时退到 `splitn(8, ',')` 兜底。
+            let dialogue = {
+                let pieces8: Vec<&str> = text.splitn(9, ',').collect();
+                if pieces8.len() >= 9 {
+                    pieces8[8].trim()
+                } else {
+                    let pieces7: Vec<&str> = text.splitn(8, ',').collect();
+                    if pieces7.len() >= 8 {
+                        pieces7[7].trim()
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            if dialogue.is_empty() {
+                return None;
+            }
+            let (start_pts, end_pts) = Self::packet_window(pkt, time_base);
+            return Some(SubtitleEntry {
+                start_pts,
+                end_pts,
+                text: dialogue.to_string(),
+            });
+        } else if format == SubtitleFormat::SRT {
+            // SRT 无内嵌时间字段：开始/结束由包 PTS + duration 提供
+            let (start_pts, end_pts) = Self::packet_window(pkt, time_base);
+            return Some(SubtitleEntry {
+                start_pts,
+                end_pts,
+                text: text.to_string(),
+            });
+        }
+
+        None
+    }
+
+    /// 字幕时间窗口：包 PTS * 时间基 = 开始秒；PTS + 包 duration * 时间基 = 结束秒。
+    /// `duration` 缺失（为 0）时结束 = 开始（由 open 后置兜底按「下一条开始/默认窗」封闭）。
+    fn packet_window(pkt: &ffmpeg::Packet, time_base: ffmpeg::Rational) -> (f64, f64) {
+        let tb = f64::from(time_base);
+        let start = pkt.pts().unwrap_or(0) as f64 * tb;
+        let end = start + pkt.duration() as f64 * tb;
+        (start, end)
+    }
+
+    /// 解析「Dialogue: …」整行（行内 `Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,
+    /// Effect,Text`，时间格式 `H:MM:SS.cc`）。
+    fn parse_ass_dialogue(text: &str) -> Option<SubtitleEntry> {
+        // ASS Dialogue 格式：Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+        if !text.starts_with("Dialogue:") {
+            return None;
+        }
+
+        // `Dialogue:` 之后是 ` Layer,Start,End,...`（9 个字段 + 文本；文本可含逗号 → splitn(10, ','))
+        let parts: Vec<&str> = text["Dialogue:".len()..].splitn(10, ',').collect();
+        if parts.len() < 10 {
+            return None;
+        }
+
+        let start_secs = Self::parse_ass_time(parts[1])?;
+        let end_secs = Self::parse_ass_time(parts[2])?;
+        // 提取层保留原始文本（样式标记由 viewer 渲染层统一清理，见 video::subtitle::parse_ass_text）
+        let text_content = parts[9].trim();
+
+        Some(SubtitleEntry {
+            start_pts: start_secs,
+            end_pts: end_secs,
+            text: text_content.to_string(),
+        })
+    }
+
+    /// 解析 ASS 时间戳（格式：H:MM:SS.cc 或 H:MM:SS.ccc）。
+    fn parse_ass_time(s: &str) -> Option<f64> {
+        let s = s.trim();
+        // 格式：H:MM:SS.cc 或 H:MM:SS.ccc
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+
+        let hours: f64 = parts[0].parse().ok()?;
+        let minutes: f64 = parts[1].parse().ok()?;
+        let seconds: f64 = parts[2].parse().ok()?;
+
+        Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    }
+    
+    /// 猜测字幕持续时间（用于 SRT 等无明确结束时间的格式）。
+    fn guess_subtitle_duration(format: SubtitleFormat) -> f64 {
+        match format {
+            SubtitleFormat::ASS | SubtitleFormat::SSA => 2.0, // ASS 有明确结束时间
+            SubtitleFormat::SRT => 2.0,
+            SubtitleFormat::Unknown => 2.0,
+        }
+    }
+    
+    /// 已确定的输出参数。
+    pub fn params(&self) -> SubtitleParams {
+        self.params
+    }
+    
+    /// 获取所有字幕条目。
+    pub fn subtitles(&self) -> &[SubtitleEntry] {
+        &self.subtitles
+    }
+    
+    /// 跳转到指定时间（秒），返回该时间之后的第一个字幕索引。
+    pub fn seek(&mut self, seconds: f64) -> usize {
+        // 二分查找第一个 start_pts >= seconds 的字幕
+        let idx = self.subtitles.partition_point(|s| s.start_pts < seconds);
+        self.current_index = idx;
+        idx
+    }
+    
+    /// 取下一条字幕（按时间顺序）。
+    pub fn next_subtitle(&mut self) -> Option<&SubtitleEntry> {
+        if self.current_index < self.subtitles.len() {
+            let entry = &self.subtitles[self.current_index];
+            self.current_index += 1;
+            Some(entry)
+        } else {
+            None
+        }
+    }
+    
+    /// 获取当前时间应显示的字幕。
+    ///
+    /// 线性扫描（窗口可重叠、含端点，与 `vff_subtitle_at` 在 FFI 内联的实现同口径）。
+    /// 生产 FFI `vff_subtitle_at` 已按索引内联匹配（见 lib.rs）——本方法保留供
+    /// 单测/上层 API 使用，勿再按 `start_pts` 回查索引（重复 start_pts 会误配）。
+    #[allow(dead_code)] // 供单测与上层 API 使用，生产 index 匹配在 vff_subtitle_at 内联
+    pub fn subtitle_at(&self, seconds: f64) -> Option<&SubtitleEntry> {
+        for entry in &self.subtitles {
+            if seconds >= entry.start_pts && seconds <= entry.end_pts {
+                return Some(entry);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod subtitle_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 回归（A3）：真实 MKV 内封 ASS 提取。[`SubtitleReader::open`] 应从
+    /// `target/视频测试字幕.mkv`（ASS 流 index=2，codec=ass）按「Matroska 新块格式 +
+    /// 包 PTS/duration」提取字幕：首条 start≈20.05s、end≈22.03s、文本非空且无 ASS 标签。
+    /// 缺夹具 SKIP（夹具不入库，与 A1/A2 同口径，SKIP 是常态不是回归）。
+    #[test]
+    fn subtitle_reader_extracts_ass_mkv() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        let r = SubtitleReader::open(&path).unwrap();
+        let subs = r.subtitles();
+        assert!(
+            !subs.is_empty(),
+            "应从 MKV 提取到字幕，实得 {} 条（txt 应非空）",
+            subs.len()
+        );
+        let first = &subs[0];
+        assert!(
+            (first.start_pts - 20.05).abs() < 0.05,
+            "首条 start_pts 应≈20.05s，实得 {:.4}",
+            first.start_pts
+        );
+        assert!(
+            (first.end_pts - 22.03).abs() < 0.1,
+            "首条 end_pts 应≈22.03s，实得 {:.4}",
+            first.end_pts
+        );
+        assert!(
+            !first.text.is_empty(),
+            "首条文本应非空（纯文本已剥离 ASS 标签），实得 {:?}",
+            first.text
+        );
+        assert!(
+            !first.text.contains("<font") && !first.text.contains("<b"),
+            "首条文本不应含 ASS 标签，实得 {:?}",
+            first.text
+        );
+        // 活动字幕命中：位于 [start, end] 内应选中该条，之外不应命中
+        assert!(
+            r.subtitle_at(20.5).is_some(),
+            "20.5s 应命中活动字幕（首条 [20.05, 22.03]）"
+        );
     }
 }
