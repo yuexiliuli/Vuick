@@ -72,16 +72,27 @@ pub fn parse_ass_text(text: &str) -> String {
 
 /// 查找当前时间应显示的字幕。
 ///
-/// 线性扫描（字幕按 `start_pts` 排序、窗口可重叠——相同 `start_pts` 或互相包裹的窗口
-/// 使「二分按 start 找首个命中」不可靠，线性是唯一稳妥口径，与 ffmpeg 侧
-/// `vff_subtitle_at` 同款）。取首个命中窗口。千级字幕 × 每拍 render ≈ 微秒级，非热点；
-/// 且仅在**有字幕且当前有活动字幕**时才逐字解析文本，无事件时段零分配。
+/// 字幕按 `start_pts` 升序（[`SubtitleReader::open`](`crate::video::decode`) 已 sort）：
+/// **二分**定位最后一个 `start_pts ≤ seconds` 的条目，命中即返回 → 常规非重叠字幕
+/// O(log N)。窗口可重叠（相同 `start_pts` 或互相包裹）时 end 无序无法按 start 剪枝，
+/// 从该处**往前回扫**找命中——结果与线性同（返回一条活跃窗口）；回扫上限 = 全部，
+/// 511 条量级仍 ≈ 微秒，每拍 render 只在「有活动字幕」时走一次，非热点。
 pub fn find_active_subtitle<'a>(
     subtitles: &'a [SubtitleEntry],
     seconds: f64,
 ) -> Option<&'a SubtitleEntry> {
-    // 线性查找（字幕数量通常不多）
-    subtitles.iter().find(|s| s.is_active_at(seconds))
+    let i = match subtitles.partition_point(|s| s.start_pts <= seconds) {
+        0 => return None,
+        n => n - 1,
+    };
+    // 从最近的（start 最大）往前找：常规情况只有 i（或 i 自身结束后的极少数重叠邻居）
+    // 会出现，命中即回；未命中时回扫更早条目取「活跃」的那条。
+    for e in subtitles[..=i].iter().rev() {
+        if e.is_active_at(seconds) {
+            return Some(e);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -128,6 +139,27 @@ mod tests {
         assert_eq!(find_active_subtitle(&subs, 5.5).map(|s| s.text.as_str()), Some("b"));
         assert!(find_active_subtitle(&subs, 4.0).is_none());
         assert!(find_active_subtitle(&[], 1.0).is_none());
+    }
+
+    /// 重叠窗口（同一时间两条都活跃）二分取「最近开始」那条——显示最新对白；
+    /// 常规非重叠场景与线性结果一致。
+    #[test]
+    fn find_active_subtitle_overlap_prefers_latest_start() {
+        let ov = vec![
+            SubtitleEntry {
+                start_pts: 0.0,
+                end_pts: 3.0,
+                text: "early".into(),
+            },
+            SubtitleEntry {
+                start_pts: 2.0,
+                end_pts: 4.0,
+                text: "late".into(),
+            },
+        ];
+        assert_eq!(find_active_subtitle(&ov, 2.5).map(|s| s.text.as_str()), Some("late"));
+        assert_eq!(find_active_subtitle(&ov, 3.5).map(|s| s.text.as_str()), Some("late"));
+        assert!(find_active_subtitle(&ov, 4.5).is_none());
     }
 
     /// `is_active_at` 含端点（结束秒处仍显示，与实际播放时钟一致）。

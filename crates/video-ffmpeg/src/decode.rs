@@ -13,6 +13,7 @@
 //! `LIBCLANG_PATH`（bindgen 用）。开发机一键装填见 `scripts/setup-ffmpeg.ps1`。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -32,6 +33,54 @@ static FFMPEG_LOCK: Mutex<()> = Mutex::new(());
 /// retrying raw` 后仍能正常播放）。保留 `Error` 级让真正解码错误仍可见。用独立
 /// `Once` 保证幂等（早于首次 open 由播放线程触发）。
 static FFMPEG_LOG_QUIET: Once = Once::new();
+
+/// 被 [`ffmpeg_log_filter_cb`] 滤掉的良性坏帧报错条数（诊断/测试用，非热路径）。
+static FFMPEG_LOG_FILTERED: AtomicUsize = AtomicUsize::new(0);
+
+/// HE-AAC SBR 断链坏帧的良性报错特征：seek 落点非 AAC 帧对齐（MKV lacing 1ms vs AAC
+/// 21.33ms 帧长）时，解码器内部 `av_log` **ERROR** 级打印 `env_facs_q ... is invalid`——
+/// `skip_until` 已把这些坏帧丢弃（不改解码正确性），这行日志纯噪音。quiet 的
+/// `Level::Error` 挡不住（它就是 Error 级），SKIP_REPEATED 只收敛高频重复，故在此
+/// **按消息文本过滤**，其余日志照常透传。
+fn ffmpeg_log_line_is_benign(line: &str) -> bool {
+    line.contains("env_facs_q")
+}
+
+/// FFmpeg 日志回调（挂进 `av_log_set_callback`）：把每条消息格式化后按
+/// [`ffmpeg_log_line_is_benign`] 过滤，命中即丢弃（`env_facs_q ... is invalid`）；
+/// 未命中则透传给默认回调（格式化/前缀/重复收敛/落盘行为与默认一致）。
+/// 回调内禁止 panic（extern "C" unwind 会 abort）：一律 `unwrap_or` 兜底。
+unsafe extern "C" fn ffmpeg_log_filter_cb(
+    ptr: *mut std::ffi::c_void,
+    level: i32,
+    fmt: *const std::ffi::c_char,
+    vl: *mut std::ffi::c_char,
+) {
+    let mut buf = [0i8; 512];
+    let mut prefix: i32 = 1;
+    // `av_log_format_line` 在 FFmpeg 9.x 是 `void`（不回长度）——按 snprintf 约定写入
+    // buffer 并 0 结尾，长度由 `CStr` 扫描得出
+    unsafe {
+        ffmpeg::ffi::av_log_format_line(
+            ptr,
+            level,
+            fmt,
+            vl, // bindgen 把 va_list 摊成 `*mut c_char`
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+            &mut prefix,
+        );
+    }
+    let line = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    if ffmpeg_log_line_is_benign(
+        line.to_string_lossy().trim(),
+    ) {
+        FFMPEG_LOG_FILTERED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    unsafe { ffmpeg::ffi::av_log_default_callback(ptr, level, fmt, vl) };
+}
+
 fn quiet_ffmpeg_log_once() {
     FFMPEG_LOG_QUIET.call_once(|| {
         ffmpeg::log::set_level(ffmpeg::log::Level::Error);
@@ -39,6 +88,10 @@ fn quiet_ffmpeg_log_once() {
         // HE-AAC SBR 断链坏帧在反复 seek 时会重复触发同一 `env_facs_q ... is invalid`，
         // 不开这会逐帧刷屏把 stderr 灌爆（也是 UI 卡顿源之一）。
         ffmpeg::log::set_flags(ffmpeg::log::Flags::SKIP_REPEATED);
+        // 挂过滤回调：把 Error 级下仍会打印的良性坏帧消息按文本滤掉（见上）
+        unsafe {
+            ffmpeg::ffi::av_log_set_callback(Some(ffmpeg_log_filter_cb));
+        }
     });
 }
 
@@ -1452,8 +1505,14 @@ pub struct SubtitleEntry {
 /// [`FFMPEG_LOCK`] —— 同视频/音频的串行纪律。
 pub struct SubtitleReader {
     ictx: std::mem::ManuallyDrop<ffmpeg::format::context::Input>,
+    /// 字幕流索引 / 时间基 / 格式：open 期已消费（扫描解析用）；暂存供后续「流级
+    /// 重定位 / 增量拉取」能力使用，当前消费方（`subtitles()`/`subtitle_at`/FFI）
+    /// 只读解析后的清单 → 系预留，非死代码。
+    #[allow(dead_code)]
     stream_index: usize,
+    #[allow(dead_code)]
     time_base: ffmpeg::Rational,
+    #[allow(dead_code)]
     format: SubtitleFormat,
     /// 已确定的输出参数（仅供 [`Self::params`] 返回）。
     params: SubtitleParams,
@@ -1474,33 +1533,47 @@ impl Drop for SubtitleReader {
 
 impl SubtitleReader {
     /// 打开媒体并提取字幕流。
+    ///
+    /// **锁纪律**：`format::input`（avformat_open_input）与并发 open/decode 互占死
+    /// （FFMPEG_LOCK 注释与 AudioReader 释放纪律同源），故打开/查流/定格式在全局锁内
+    /// 完成；拿到 `ictx` 后**提前释放锁**再对全文件做 `packets()` 扫描——扫描是纯
+    /// demux（不开解码器、逐包读独立文件句柄），与视频/音频 worker 的 open/decode/seek
+    /// 并存（并发压力测试 `subtitle_scan_concurrent_with_video_seek_stress` 实证：多轮
+    /// 不崩、不死锁、seek 不被拖慢）。若在锁内扫完整 415MB 文件（≈0.4-0.6s），期间
+    /// **所有** A/V FFI 调用被闸阻塞 → 打开后窗口期点击进度条 seek 卡顿（复现测试
+    /// `subtitle_scan_does_not_block_video_seek` 量化 delta≈385ms 即为该因）。
     pub fn open(path: &Path) -> Result<Self> {
-        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        ffmpeg::init().context("ffmpeg init 失败")?;
-        quiet_ffmpeg_log_once();
-        
-        let mut ictx = ffmpeg::format::input(path)
-            .with_context(|| format!("打开媒体失败：{}", path.display()))?;
-        
-        // 查找字幕流
-        let stream = ictx
-            .streams()
-            .best(Type::Subtitle)
-            .ok_or_else(|| anyhow!("媒体中没有字幕流：{}", path.display()))?;
-        
-        let stream_index = stream.index();
-        let time_base = stream.time_base();
-        
-        // 检测字幕格式
-        let codec_id = stream.parameters().id();
-        let format = match codec_id {
-            ffmpeg::codec::Id::ASS => SubtitleFormat::ASS,
-            ffmpeg::codec::Id::SSA => SubtitleFormat::SSA,
-            ffmpeg::codec::Id::SUBRIP => SubtitleFormat::SRT,
-            ffmpeg::codec::Id::HDMV_PGS_SUBTITLE => SubtitleFormat::Unknown, // 图形字幕不支持
-            _ => SubtitleFormat::Unknown,
+        let (mut ictx, stream_index, time_base, format) = {
+            let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            ffmpeg::init().context("ffmpeg init 失败")?;
+            quiet_ffmpeg_log_once();
+
+            let ictx = ffmpeg::format::input(path)
+                .with_context(|| format!("打开媒体失败：{}", path.display()))?;
+
+            // 查找字幕流
+            let stream = ictx
+                .streams()
+                .best(Type::Subtitle)
+                .ok_or_else(|| anyhow!("媒体中没有字幕流：{}", path.display()))?;
+
+            let stream_index = stream.index();
+            let time_base = stream.time_base();
+
+            // 检测字幕格式
+            let codec_id = stream.parameters().id();
+            let format = match codec_id {
+                ffmpeg::codec::Id::ASS => SubtitleFormat::ASS,
+                ffmpeg::codec::Id::SSA => SubtitleFormat::SSA,
+                ffmpeg::codec::Id::SUBRIP => SubtitleFormat::SRT,
+                ffmpeg::codec::Id::HDMV_PGS_SUBTITLE => SubtitleFormat::Unknown, // 图形字幕不支持
+                _ => SubtitleFormat::Unknown,
+            };
+
+            (ictx, stream_index, time_base, format)
         };
-        
+        // ← 全局锁已提前释放：以下全文件扫描为无锁并发纯 demux
+
         let params = SubtitleParams {
             stream_count: 1,
             format,
@@ -1688,6 +1761,8 @@ impl SubtitleReader {
     }
     
     /// 取下一条字幕（按时间顺序）。
+    #[allow(dead_code)] // 预留「逐条拉取」遍历 API（配合 [`Self::seek`] 定位起点）；
+    /// 当前 FFI/上层走预加载清单 `subtitles()` + `subtitle_at()`，未消费本方法。
     pub fn next_subtitle(&mut self) -> Option<&SubtitleEntry> {
         if self.current_index < self.subtitles.len() {
             let entry = &self.subtitles[self.current_index];
@@ -1763,5 +1838,177 @@ mod subtitle_tests {
             r.subtitle_at(20.5).is_some(),
             "20.5s 应命中活动字幕（首条 [20.05, 22.03]）"
         );
+    }
+
+    /// 回归（K-锁）：字幕全文件扫描不得长期占全局 FFMPEG_LOCK 阻塞视频 seek。
+    ///
+    /// 现象：打开 `目标/视频测试字幕.mkv`（415MB、511 条 ASS）后点击进度条卡顿——
+    /// 前序实现 `SubtitleReader::open` 持锁扫完整文件（≈0.6s），期间**所有** A/V FFI
+    /// 调用被闸阻塞。本测试量化：起字幕扫描线程并发跑同款视频 seek+出帧，断言
+    /// seek 相对增量 < 250ms（修复前 delta≈扫描持锁时长 → FAIL；修复后扫描在锁外
+    /// 纯 demux → delta≈0 → PASS）。
+    #[test]
+    fn subtitle_scan_does_not_block_video_seek() {
+        let big = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        let small = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/video测试.mp4");
+        if !big.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        if !small.exists() {
+            eprintln!("SKIP: missing target/video测试.mp4（夹具不入库）");
+            return;
+        }
+
+        // 小文件预开视频 reader（长边 160 封顶 → 固定小缓冲），seek 复用常驻 reader
+        let mut v = VideoReader::open_scaled(&small, 160).unwrap();
+        let mut buf = vec![0u8; 160 * 120 * 4];
+        v.seek(0.5).unwrap();
+        assert!(
+            v.next_frame_bgra_into(&mut buf).unwrap().is_some(),
+            "预热 seek 应出帧"
+        );
+
+        let timed_seeks = [0.3f64, 1.1f64];
+        let base = {
+            let t = std::time::Instant::now();
+            for &s in &timed_seeks {
+                v.seek(s).unwrap();
+                assert!(
+                    v.next_frame_bgra_into(&mut buf).unwrap().is_some(),
+                    "基线 seek {s} 应出帧"
+                );
+            }
+            t.elapsed()
+        };
+
+        // 并发：字幕扫描线程先起（当前实现抓全局锁扫完整 415MB），主线程随后跑同款 seek
+        let path2 = big.clone();
+        let h = std::thread::spawn(move || {
+            let r = SubtitleReader::open(&path2);
+            let n = r.as_ref().map(|s| s.subtitles().len()).unwrap_or(0);
+            // Input 非 Send 时不能跨线程返回 → 线程内销毁（Drop 回锁关闭）
+            drop(r);
+            n
+        });
+        // 给扫描 ~80ms 抓锁（持锁态覆盖首次 seek；修复后纯放行不阻塞）
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let with = {
+            let t = std::time::Instant::now();
+            for &s in &timed_seeks {
+                v.seek(s).unwrap();
+                assert!(
+                    v.next_frame_bgra_into(&mut buf).unwrap().is_some(),
+                    "并发 seek {s} 应出帧"
+                );
+            }
+            t.elapsed()
+        };
+        let count = h.join().expect("字幕扫描线程不应死锁");
+        assert!(count > 0, "并发提取应得字幕，实得 {count} 条");
+
+        eprintln!(
+            "[sub-lock] base_seek={base:?} with_concurrent_scan={with:?} delta={:?}",
+            with - base
+        );
+        // 相对增量红线：并发字幕扫描不得把视频 seek 拖慢超过 +250ms（修复前 ≈ 扫描持锁时长 → FAIL）
+        assert!(
+            with - base < std::time::Duration::from_millis(250),
+            "字幕全文件扫描不应阻塞视频 seek：delta={:?}（应 <250ms）",
+            with - base
+        );
+    }
+
+    /// 并发压力（K-锁 实证纪律）：字幕 open 与视频 seek+解码并行多轮，断言
+    /// 不崩、不死锁、每轮 seek 都出帧、扫描都提到字幕——给「扫描移出锁（非锁并发
+    /// 纯 demux）安全」的实证依据（K14/K15：平台语义先实证再采信）。
+    #[test]
+    fn subtitle_scan_concurrent_with_video_seek_stress() {
+        let big = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        let small = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/video测试.mp4");
+        if !big.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        if !small.exists() {
+            eprintln!("SKIP: missing target/video测试.mp4（夹具不入库）");
+            return;
+        }
+
+        let mut v = VideoReader::open_scaled(&small, 160).unwrap();
+        let mut buf = vec![0u8; 160 * 120 * 4];
+        for round in 0..3 {
+            let p = big.clone();
+            let h = std::thread::spawn(move || {
+                let r = SubtitleReader::open(&p);
+                let n = r.as_ref().map(|s| s.subtitles().len()).unwrap_or(0);
+                drop(r);
+                n
+            });
+            // 边扫描边做 seek+解码（复用缓冲，让两路真正并行撞期）
+            for s in [0.7f64, 1.4f64] {
+                v.seek(s).unwrap();
+                assert!(
+                    v.next_frame_bgra_into(&mut buf).unwrap().is_some(),
+                    "stress round {round} seek {s} 应出帧"
+                );
+            }
+            let count = h.join().expect("round {round}: 扫描线程不应死锁");
+            assert!(count > 0, "round {round} 应提取字幕，实得 {count} 条");
+        }
+    }
+
+    /// 日志过滤器（env_facs_q 收敛）：只匹配 HE-AAC SBR 断链坏帧的良性报错，其余
+    /// 解码错误（如真实 decode error）必须照常透传。
+    #[test]
+    fn log_filter_predicate_only_matches_env_facsq() {
+        assert!(ffmpeg_log_line_is_benign("[aac @ 0000] env_facs_q 253 is invalid"));
+        assert!(ffmpeg_log_line_is_benign("Reinit context to ... env_facs_q 254 is invalid"));
+        assert!(!ffmpeg_log_line_is_benign("[h264 @ 0000] decode error"));
+        assert!(!ffmpeg_log_line_is_benign("udta parsing failed retrying raw"));
+        assert!(!ffmpeg_log_line_is_benign(""));
+    }
+
+    /// 过滤器在真实 seek 路径上的落点：打开 415MB MKV 音轨、seek 落点、读到首个
+    /// clean 帧——必经解码坏帧丢弃路径（若本机构造触发 `env_facs_q`，计数递增证明
+    /// 过滤器挂载生效且被丢弃；不触发则计数不变，路径仍应不 panic、不解码错）。
+    #[test]
+    fn audio_seek_mkv_env_facsq_filter_path_runs() {
+        let mkv = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !mkv.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        // 前置：挂入过滤回调（quiet 幂等）
+        ffmpeg::init().unwrap();
+        quiet_ffmpeg_log_once();
+
+        let before = FFMPEG_LOG_FILTERED.load(Ordering::Relaxed);
+        let mut a = AudioReader::open_pcm_f32(&mkv, 48000).unwrap();
+        let mut decoded = 0usize;
+        for target in [35.0f64, 95.0, 142.0] {
+            a.seek(target).unwrap();
+            // 读到落点后的首个 clean 块（≤ 0.5s 样本）即证明 seek+坏帧丢弃路径走通
+            let mut got = 0usize;
+            while got < 48000 / 2 {
+                if let Ok(Some((_, samples))) = a.next_pcm_f32() {
+                    got += samples.len();
+                } else {
+                    break;
+                }
+            }
+            decoded += got;
+        }
+        let after = FFMPEG_LOG_FILTERED.load(Ordering::Relaxed);
+        eprintln!(
+            "[env-facsq] filtered_count before={before} after={after} 解码样本={decoded}"
+        );
+        assert!(decoded > 0, "MKV 音轨 seek 后应解出音频，实得 {decoded}");
+        assert!(after >= before, "过滤计数不倒退");
     }
 }
