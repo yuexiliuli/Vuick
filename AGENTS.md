@@ -1,7 +1,7 @@
 <!--
 REFACTORED: 2026-10-17
 STYLE: LLM Protocol Body (v2)
-LAST_AUDIT_PATCH: 2026-10-17-001
+LAST_AUDIT_PATCH: 2026-10-17-002
 -->
 
 # AGENTS.md（LLM 执行协议 v2）
@@ -20,11 +20,13 @@ LAST_AUDIT_PATCH: 2026-10-17-001
 
 **任务归属**：实现 / 评审 / 性能对比 / 问题定位一律交由子 agent。
 
-**亲为例外**：根因已核实 + 改动小而精确时，主 agent 可直接改（依据 K1；涉及纯函数化/参数语义/调用点时仍须满足 §3「亲为不变式」）。
+**亲为例外**：根因已核实 + 改动小而精确时，主 agent 可直接改（依据 K1；涉及纯函数化/参数语义/调用点时仍须满足 §3「亲为不变式」）。纯视觉/布局微调（无逻辑变更、无参数语义改动，如去标题、改间距/线条）允许主 agent 亲为——但须先 grep 定点 + 最小窗口 read（≤~200 行）确认上下文，并 build + 定向测试复证后才准进提交。
 
 ## 1. 派活协议
 
 ### 1.1 派活前强制思考（<thinking> 内逐条作答后才写 brief）
+
+> A–L 逐条在消息正文作答亦视为满足本节（不强制 `<thinking>` 标签），但不得省略任何一条。
 
 ```
 <thinking>
@@ -112,17 +114,19 @@ L. 会话复用检查（**必填**，派活前完成，不得省略）：
 | 规则 | 触发条件 / 执行 |
 |---|---|
 | 构建一律 debug | 所有构建/测试/测量；禁止 release |
-| workspace 测试带 crate | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；pdf 加 `--test-threads=1` |
+| workspace 测试带 crate | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；串行测试须 `cargo test -p <crate> -- --test-threads=1`——**`--` 不可省**（缺了报 `unexpected argument '--test-threads'`） |
 | 改动完再编译 | 每组改动改完一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量 |
 | filter 用模块路径前缀 | 如 `cargo test -p shell app::tests::sidebar` 一次盖全模块；核心渲染改动也按模块前缀收最小集，仅共享核心/用户要求才放宽全模块 |
 | 验证范围 | 只做改动部分；全量仅当用户明确要求/特性定型 |
 | stash 基线 | 行为功能不跑（回归由评审兜底）；仅两类场景允许：① 性能对比子 agent before/after（pop 后逐文件核对还原）② 疑似预存失败硬定性（先存 diff 指纹精确还原） |
 | 边界测试先行 | 边界清单逐项打勾（非行 0、同行多元素、折行续行、文档结尾、空文档等），实现侧勾完才算完成 |
-| 视觉/渲染完成门槛 | 画面/UI 改动报「完成」前必须 `cargo build --bin gpui-editor` + 真机冒烟（截图/pixel 验证，复用 `feature-delivery`/`gpui-open-scroll` 探针）；做不到运行时验证 → 报告固定写「已实现+单测过、未冒烟」 |
+| 视觉/渲染完成门槛 | 画面/UI 改动报「完成」前必须 `cargo build --bin gpui-editor` + 真机冒烟（截图/pixel 验证，复用 `feature-delivery`/`gpui-open-scroll` 探针）；做不到运行时验证 → 报告固定写「已实现+单测过、未冒烟」。无可靠取证手段/人工不在场时 GUI 冒烟可降级为「单测覆盖交互 + 条件冒烟」，但报告须注明降级原因 |
 | 用户负面报告 | 用户报「没有看到 X / 行为不对 / 没生效」→ 第一回应先取证：exe 时间戳（`Get-Item target\debug\gpui-editor.exe` 比源文件新）、真机复现/探针/像素定位，再下结论 |
 | 亲为不变式 | 亲为改动涉及纯函数化/参数语义/调用点 → 逐参对照函数签名（形参语义「X=true 表示…」逐个写死）+ 一条运行断言；否则计入常规「实现+评审」流 |
 | 长命令后台化 | 预计 >2min（历史重写/长 build/大测试）→ `background_process start` + `schedule_wakeup` 轮询；logs 只取尾部 ≤20 行（禁整屏 `Rewrite i/N` 进度刷屏） |
 | 运行时冒烟采样 | 窗口生命周期/对话框/持久化类 brief 必含真机 GUI 冒烟项（复用 feature-delivery 探针，新探针沉淀回技能）；平台钩子（`on_app_quit`/`on_window_should_close` 等）先实测再采信 |
+| GUI 冒烟取证终止 | 真机取证（截图/像素/OCR 任一路）连续失败 2 次即停：交互已有单测兜底时报告固定写「已实现+单测过、未冒烟」并立即返回；OCR 仅人工辅助，禁止当作子 agent 自动验证通道 |
+| 被中止子 Agent 恢复 | 子 agent 任务现值 abort / 超时返回：主 agent 先 `cargo build --bin gpui-editor` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
 | 性能红线 | 用户动作同步路径不得引入大主线程 IO/大内容重读；持久化/派生状态写盘按复杂度上限评估（hash 跳过、粒度合并）；把 N ms 级主线程停顿当候选热点列明 |
 
 ## 4. 主 agent 上下文收敛
@@ -162,6 +166,9 @@ L. 会话复用检查（**必填**，派活前完成，不得省略）：
 | K15 | gpui 鼠标事件沿命中栈**冒泡**（无鼠标监听的覆盖浮层不 BlockMouse，不拦截事件）：双击全屏挂在 size_full 的 `#video-main` 时，控制条/进度条/toast 上的双击会一路漏下来误触——「上层覆盖元素优先消费」是错误直觉；互斥必须在专属层 `stop_propagation`（`click_count>=2` 才拦，单击放行），评审实测「seek 条中点双击 → locked=true」确诊 |
 | K16 | 中文文件编码事故：子 agent 用 bash/文件写操作改含中文注释的源码，PowerShell 重编码致**整文件 mojibake**，被迫 `git restore` 后重做（白耗一轮）；改中文源码一律只走 read/edit/write 工具；bash 回显中文乱码时改用 read 以 UTF-8 读 |
 | K17 | gpui 测试平台 `toggle_fullscreen`/`is_fullscreen` 是**真实翻转**（`platform/test/window.rs` 同步实现）→ 全屏进出相关单测两路都真跑，非假绿 |
+| K18 | GUI 冒烟取证自锁：子 agent 真机取证（截图→OCR）失败后反复重试白耗整段被用户中止（打开最近改版）→ 取证连续失败 2 次即停，走「单测兜底 + 报告未冒烟」；OCR 禁当自动验证通道 |
+| K19 | 性能先例复制：同文件已有虚拟化/行高/缓存先例（如 toc `TOC_VIRTUALIZE_MIN=200`）时新增列表类渲染必须按同阈值对齐；文件树首版逐帧全量物化万级目录、评审才补虚拟化 |
+| K20 | abort 恢复：子 agent 被中止后主 agent 须 build + 定向测试复证残余交付；改型/逻辑类必补独立评审再提交（打开最近改版曾跳过评审即失去回归兜底） |
 
 ## 7. 已踩坑速查（实现要点）
 
