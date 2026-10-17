@@ -273,7 +273,10 @@ impl AudioReader {
         self.params
     }
 
-    /// 跳转到 `seconds`：decode flush + drain 复位（与视频 reader 同款）。
+    /// 跳转到 `seconds`：decode flush + drain 复位，并**冲掉重采样器内部残留**。复用
+    /// 同一 reader 连续 seek（查看器音频 worker 常驻复用）时，swr 会把 seek 前未消耗的
+    /// 输入延迟带进新位置 → 新起播首音夹旧段；flush 把 delay/中间/输出缓冲全清
+    ///（对应 `next_pcm_f32` EOF 处 [`Self::flush_resampler`] 的收尾姿势）。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ts = (seconds.max(0.0) * 1e6) as i64;
@@ -282,7 +285,37 @@ impl AudioReader {
             .context("音频 seek 失败")?;
         self.decoder.flush();
         self.drained = false;
+        let _ = self.flush_resampler();
         Ok(())
+    }
+
+    /// 把重采样器内部残留全部排空并返回样本（调用方丢弃即「清残留」，如 seek；EOF 处
+    /// 则作为收尾块直接返回）。
+    ///
+    /// ffmpeg-next 的 `Context::flush` 对**全空** out 帧会因 `swr_convert_frame` 的
+    /// `config_changed` 检查（空帧 format=NONE/layout=0 ≠ 输出 F32/STEREO）直接报
+    /// `Output changed`、**一次都排不出**（探针实证：空帧 flush 恒 Err、`delay()` 原地
+    /// 不动）——须按输出规格预分配 out 帧，`av_frame_get_buffer` 才把 ch_layout 补齐、
+    /// 正常走下排。终止判据用「产出样本数」而非 `delay()`：排空后 `swr_get_delay`
+    /// 仍返回非零（引擎内插延迟），按它判会死循环（实证排空后 delay≈17 仍 `Some`）。
+    /// `plane()` 长度 = `linesize` 全容量并非实际样本数，须按 `samples()×channels`
+    /// 截到真实产出，否则返回 1 秒容量整段的未定尾。
+    fn flush_resampler(&mut self) -> Vec<f32> {
+        let d = self.resampler.output();
+        let mut out = ffmpeg::frame::Audio::new(d.format, d.rate as usize, d.channel_layout);
+        let mut all = Vec::new();
+        loop {
+            match self.resampler.flush(&mut out) {
+                Ok(Some(_)) if out.samples() > 0 => {
+                    let n = out.samples() * out.channels() as usize;
+                    let plane = Self::collect_f32(&out);
+                    let take = n.min(plane.len());
+                    all.extend_from_slice(&plane[..take]);
+                }
+                _ => break,
+            }
+        }
+        all
     }
 
     /// 把重采样输出帧读成 F32 样本（空/未分配帧返回空，避免读 plane 越界）。
@@ -306,20 +339,10 @@ impl AudioReader {
                         self.decoder.send_eof().ok();
                         self.drained = true;
                     }
-                    // 冲掉重采样器内部剩余样本
-                    loop {
-                        let mut out = ffmpeg::frame::Audio::empty();
-                        let no_more = match self.resampler.flush(&mut out) {
-                            Ok(Some(_)) => false, // 还有内部帧
-                            _ => true,
-                        };
-                        let samples = Self::collect_f32(&out);
-                        if !samples.is_empty() {
-                            return Ok(Some((self.last_pts, samples)));
-                        }
-                        if no_more {
-                            break;
-                        }
+                    // 冲掉重采样器内部剩余样本（同 seek 排残留的收尾姿势，见 flush_resampler）
+                    let samples = self.flush_resampler();
+                    if !samples.is_empty() {
+                        return Ok(Some((self.last_pts, samples)));
                     }
                     return Ok(None);
                 }
@@ -829,10 +852,97 @@ mod tests {
         assert!((pts - 1.0).abs() < 0.25, "音频 seek 落点偏差过大 pts={pts}");
     }
 
+    /// 音频 reader 常驻复用（查看器音频 worker 复用姿势）：open 一次后连续 seek 回不同
+    /// 落点，每次重新起播首块 pts 落在目标附近、不重开文件；`AudioReader::seek` 在
+    /// 复位 demux/decoder 的同时冲掉 swr 内部残留（不残留旧段）。缺夹具 SKIP（音频
+    /// 夹具不入库，同 viewer 约定）。
+    #[test]
+    fn audio_seek_reuses_reader_across_targets() {
+        let path = audio_fixture();
+        if !path.exists() {
+            eprintln!("SKIP: missing audio fixture（不入库，本机无真音频）");
+            return;
+        }
+        let mut r = AudioReader::open_pcm_f32(&path, 48000).unwrap();
+        for target in [0.1, 1.0, 0.35, 1.7] {
+            r.seek(target).unwrap();
+            let mut got: Option<(f64, Vec<f32>)> = None;
+            for _ in 0..200 {
+                match r.next_pcm_f32() {
+                    Ok(Some(x)) => {
+                        got = Some(x);
+                        break;
+                    }
+                    _ => break, // EOF / 错误
+                }
+            }
+            let (pts, samples) = got.expect("seek 后应出音频（复用不重开）");
+            assert!(
+                (pts - target).abs() < 0.30,
+                "音频复用 seek 首块落点偏离 target={target} pts={pts}"
+            );
+            assert!(!samples.is_empty(), "首块应有样本");
+        }
+    }
+
     #[test]
     fn audio_rejects_missing() {
         let bad = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("no-such.mp4");
         assert!(AudioReader::open_pcm_f32(&bad, 48000).is_err());
+    }
+
+    /// 回归：重采样器内部残留必须被**真实排空**（复用 reader seek 前不清残留会把旧段
+    /// 夹进新起播）。ffmpeg-next `Context::flush` 对全空 out 帧会因 `swr_convert_frame`
+    /// 的 `config_changed` 直接报 `Output changed`、一次都排不出——按输出规格预分配帧
+    /// 后（[`AudioReader::flush_resampler`]）才排出；终止判据用「产出样本数」，不能用
+    /// `delay()`（排空后 `swr_get_delay` 仍非零，按它判死循环）。用 out_rate≠源率强制
+    /// 真实重采样制造残留。缺夹具 SKIP（同 viewer 约定）。
+    #[test]
+    fn audio_drain_clears_resampler_residue() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        // 44100 ≠ 源率（48k）→ 重力采样，读几块必有内部残留
+        let mut r = AudioReader::open_pcm_f32(&path, 44100).unwrap();
+        let mut got_block = false;
+        for _ in 0..5 {
+            if r.next_pcm_f32().unwrap().is_none() {
+                break;
+            }
+            got_block = true;
+        }
+        assert!(got_block, "夹具应能解码出音频块");
+        let delay_before = r.resampler.delay();
+        assert!(delay_before.is_some(), "真实重采样必然积累内部残留 delay={delay_before:?}");
+        let drained = r.flush_resampler();
+        assert!(
+            !drained.is_empty(),
+            "残留应被真实排空（空帧 flush 会 Err 落空，drain 长度应为 0 之前）len={}",
+            drained.len()
+        );
+        assert!(
+            drained.len() <= 2 * 44100,
+            "返回长度应截到实际产出（planes 全容量未定段不得带出），len={}",
+            drained.len()
+        );
+        let delay_after = r.resampler.delay();
+        // 排空后不应再有余量可排（下一次 flush 产出 0）——以再排一次产出为判据
+        let mut out = ffmpeg::frame::Audio::new(
+            r.resampler.output().format,
+            r.resampler.output().rate as usize,
+            r.resampler.output().channel_layout,
+        );
+        let more = match r.resampler.flush(&mut out) {
+            Ok(Some(_)) if out.samples() > 0 => out.samples(),
+            _ => 0,
+        };
+        assert_eq!(more, 0, "排空后再 flush 不应有产出");
+        let _ = delay_after; // 提示值：排空后 delay 仍可能非零（引擎内插延迟），不作断言
+        // 排空后读取仍正常（不破坏后续解码）
+        assert!(r.next_pcm_f32().is_ok(), "排空后读取应当正常");
     }
 
     /// 双路径（硬件优先 / 软件回退）都必须产出尺寸正确、alpha 不透明的 BGRA 帧。
