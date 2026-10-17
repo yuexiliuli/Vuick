@@ -117,6 +117,10 @@ const STATUS_MS: u64 = 2500;
 /// 错误时送到（换代时旧接收端已被换走，送不进也非必需——画面留最近上屏帧），
 /// 预览跟手、松手精确落点完全由本节流保证。
 const SCRUB_RETARGET_MS: u64 = 60;
+// --- M0 hover 预解码 ---
+/// hover 缓存命中容差（秒）：预解码帧 pts 与点击落点距离 ≤ 此值（且 pts ≥ 落点）视为命中，
+/// 直接装屏不重解；更远判 stale（防止把「很久前悬停/过冲」的帧误当点击落点）。
+const HOVER_HIT_WINDOW_S: f64 = 0.35;
 
 /// 播放模式三态（控制条按钮循环切换；播完「自然结尾」时的去向）：
 /// - [`PlaybackMode::Sequential`]：顺序播放——播完当前自动停（默认，保持历史行为）；
@@ -258,6 +262,27 @@ pub(crate) fn take_seek_diag_test() -> Option<(f64, u8, f64, u32, f64, f64, f64,
 
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
+
+/// hover 预解码产出的单帧缓存（解码 worker 线程产出、主线程装屏后即弃）。
+struct HoverFrame {
+    /// 帧 pts（秒，恒 ≥ 落点——与正常 seek 同一「不展示早于落点帧」规则）。
+    pts: f64,
+    w: u32,
+    h: u32,
+    /// BGRA 像素（worker 线程 `to_vec` 拷贝；点击命中时整帧装屏，无需再解码）。
+    bgra: Vec<u8>,
+}
+
+/// 投递给常驻 hover 预解码 worker 的命令（独立线程 + 独立 `VideoReader`）：单帧解码，
+/// 结果经单次通道回传主线程；`generation` 供 worker 比对共享代序提前放弃被取代的旧命令。
+struct HoverCmd {
+    /// 本命令对应的 hover 代序号（主线程每新落点/换文件/真实 seek 递增）。
+    generation: u64,
+    path: PathBuf,
+    target: f64,
+    cap: u32,
+    tx: std::sync::mpsc::Sender<Result<HoverFrame, String>>,
+}
 
 /// 投递给常驻视频解码线程的命令（切换/seek）：内层循环以 `generation` 判定换代。
 /// `result_tx` 只在开媒体（非 seek）时挂：worker 开成功后回送 `Ok(params)` 或失败
@@ -426,6 +451,21 @@ pub struct VideoViewer {
     /// 当前视频解码输出的长边封顶（px）：按显示尺寸自适应（render 里窗口变化时经
     /// `start_decoder_at(…, restart_audio=false)` 重开解码器而不打断音频）。
     decode_cap: u32,
+    // --- M0 hover 预解码 ---
+    /// 进度条悬停位置（秒，钳位到 [0, duration]；未悬停 None，仅未拖拽的 `on_seek_move` 记录）。
+    hovered_target: Option<f64>,
+    /// hover 预解码 worker 命令通道（独立线程 + 独立 `VideoReader`，与播放 worker 彻底隔离，
+    /// 专做「悬停落点」单帧后台解码，永不阻塞/饿死播放 worker）。
+    hover_cmd: Option<std::sync::mpsc::Sender<HoverCmd>>,
+    /// hover 命令代序号：新落点 / 换文件 / cap 变化 / 任一真实 seek 时 +1；worker 回填结果时
+    /// 按它丢弃过期（不覆盖更新的落点缓存）。
+    hover_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// hover 预解码完成、待点击消费的单帧缓存（命中即「消费一次」取走）。
+    hover_cache: Option<HoverFrame>,
+    /// `begin_scrub` 已用 hover 缓存帧直接上屏的落点（秒；未命中 None）：`end_scrub_to` 凭它
+    /// 判定「松手仍在同一落点」→ 走音频-only 收尾、不再对同落点重新 seek；用户拖走后不匹配，
+    /// 照常落回正常 seek（防 60ms 内拖离仍端 Served 旧帧）。
+    served_hover_target: Option<f64>,
     // --- M6 播放模式 / 截图 ---
     /// 播放模式三态（播完去向；控制条按钮循环切换）。
     playback_mode: PlaybackMode,
@@ -464,6 +504,11 @@ impl VideoViewer {
             duration: 1.0,
             fps: None,
             decode_cap: DECODE_MAX_DIM,
+            hovered_target: None,
+            hover_cmd: None,
+            hover_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            hover_cache: None,
+            served_hover_target: None,
             last_tick: None,
             nav: FolderNav::new(vec![path.clone()], 0),
             rx: None,
@@ -617,6 +662,13 @@ impl VideoViewer {
     ) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.generation.store(generation, Ordering::SeqCst);
+        // M0 失效源（全部经此入口）：任一真实 seek（点按/拖拽/键盘/切文件/cap 重开）都让悬停
+        // 缓存与在途预解码作废——缓存只服务「静止悬停」，换代即不再可信；`hover_generation` 递增
+        // 使 worker 回填的过期结果被丢弃。缓存命中路径（begin_scrub 的 take_hover_cache_if_hit）
+        // 不调用本方法，故不会把它刚装屏的帧误清。
+        self.hover_cache = None;
+        self.served_hover_target = None;
+        self.hover_generation.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
         // 换掉旧接收端 → worker 若正阻塞在 send 会收到失联错误、本命令内层循环退出
         self.overflow = None;
@@ -664,6 +716,19 @@ impl VideoViewer {
         let gen_arc = self.generation.clone();
         std::thread::spawn(move || Self::video_worker(rx, gen_arc));
         self.decode_cmd = Some(tx);
+    }
+
+    /// 惰性启动常驻 hover 预解码 worker（一生一个；`hover_cmd` Sender 随 viewer Drop 弃、
+    /// worker `recv()` 返回 Err 即退；与 [`Self::video_worker`] 完全独立——独立线程 +
+    /// 独立 `VideoReader`，不会被播放/seek 换代影响）。
+    fn ensure_hover_worker(&mut self) {
+        if self.hover_cmd.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<HoverCmd>();
+        let hgen = self.hover_generation.clone();
+        std::thread::spawn(move || Self::hover_worker(rx, hgen));
+        self.hover_cmd = Some(tx);
     }
 
     /// 常驻视频 worker 主循环：逐条执行命令（打开/复用 reader → seek → 解码推帧，
@@ -846,6 +911,62 @@ impl VideoViewer {
                         let _ = cmd.tx.try_send(p);
                     }
                     break; // 接收端已被换代/弃用
+                }
+            }
+        }
+    }
+
+    /// 常驻 hover 预解码 worker 主循环（独立线程 + 独立 `VideoReader`，与播放 worker 彻底
+    /// 隔离）：复用同 path+cap 的 reader，`seek(target)` 后跳过全部 `pts<target` 的预滚帧、
+    /// 取第一帧 `≥target` 经单次通道回传主线程（与播放 worker 同一「不展示早于落点帧」规则）。
+    /// 每拍解码前比对共享 [`Self::hover_generation`]：已被更新的悬停/换文件/真实 seek 取代
+    /// 的命令立即放弃（帧间检查，省被跳过命令的剩余解码）；与播放 worker 只在 cdylib 内
+    /// FFMPEG_LOCK 上全局串行（FFmpeg 内核闸，属预期内竞争，不做额外锁）。
+    fn hover_worker(
+        rx: std::sync::mpsc::Receiver<HoverCmd>,
+        hgen: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let mut active: Option<(std::path::PathBuf, u32, VideoReader)> = None;
+        let mut buf: Vec<u8> = Vec::new();
+        while let Ok(cmd) = rx.recv() {
+            // 已在队列中被更新的 hover 命令取代（代序号已推进）→ 直接放弃：连 avformat 重开
+            // 都省掉；`cmd` drop 使结果通道断连，主线程按断连丢弃（不误覆盖新落点缓存）。
+            if hgen.load(Ordering::SeqCst) != cmd.generation {
+                continue;
+            }
+            let same = matches!(&active, Some((p, c, _)) if *p == cmd.path && *c == cmd.cap);
+            if !same {
+                match VideoReader::open_scaled(&cmd.path, cmd.cap) {
+                    Ok(r) => active = Some((cmd.path.clone(), cmd.cap, r)),
+                    Err(e) => {
+                        let _ = cmd.tx.send(Err(e.to_string()));
+                        continue;
+                    }
+                }
+            }
+            let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
+            let _ = reader.seek(cmd.target);
+            // 解码缓冲预分配：按源顶格扩容一次（同播放 worker 的持久缓冲姿势）
+            if buf.len() < reader.source_cap() {
+                buf.resize(reader.source_cap(), 0);
+            }
+            loop {
+                if hgen.load(Ordering::SeqCst) != cmd.generation {
+                    break; // 已被更新悬停/换文件/seek 取代：放弃（不送结果，主线程按断连丢弃）
+                }
+                match reader.next_frame_bgra_into(&mut buf[..]) {
+                    Ok(Some((pts, w, h))) if pts >= cmd.target => {
+                        let need = (w as usize) * (h as usize) * 4;
+                        let _ = cmd.tx.send(Ok(HoverFrame {
+                            pts,
+                            w,
+                            h,
+                            bgra: buf[..need].to_vec(),
+                        }));
+                        break;
+                    }
+                    Ok(Some(_)) => {} // 预滚帧（pts<落点）：继续解下一帧
+                    Ok(None) | Err(_) => break, // EOF / 解码错误：无可用帧，按失败丢弃
                 }
             }
         }
@@ -1480,6 +1601,12 @@ impl VideoViewer {
         // 换代 + 换全新空接收端：pump 无法再取到旧媒体的未消费帧（worker 的旧命令
         // 会因 generation 不匹配立即退出，随后由 start_decoder_at 的新命令接手）。
         self.generation.fetch_add(1, Ordering::SeqCst);
+        // M0 失效源（换文件）：悬停位置/缓存/在途预解码全作废（新文件的落点需重新解码）；
+        // `hover_generation` 同步递增，旧文件 worker 回填结果一律丢弃。
+        self.hovered_target = None;
+        self.hover_cache = None;
+        self.served_hover_target = None;
+        self.hover_generation.fetch_add(1, Ordering::SeqCst);
         let (_tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
         if let Some(old) = self.rx.replace(rx) {
             drop(old);
@@ -1562,6 +1689,91 @@ impl VideoViewer {
         f64::from(fraction.clamp(0.0, 1.0)) * self.duration.max(0.0)
     }
 
+    /// M0：记录进度条悬停位置；空闲（暂停且不在拖拽 / 不等待 seek 落点）时向独立后台 worker
+    /// 投一条「该落点单帧预解码」。机会式：拖拽/seek 期主 worker 正忙、落点随时变，播放期
+    /// hover 解码在 FFMPEG_LOCK 上会跟 playback worker 抢带宽 → stutter，均跳过并保留上一份
+    /// 缓存（「不能无干扰地跑就跳过」）；悬停位置仍记录，点击照常可走正常 seek 兜底。
+    fn update_hover_target(&mut self, target: f64, cx: &mut Context<Self>) {
+        self.hovered_target = Some(target);
+        if self.scrubbing || self.pending_seek.is_some() || self.playing {
+            return;
+        }
+        // 已缓存「离 target 足够近」的帧（命中窗内点击即可直接上屏）→ 不重复投（省解码带宽）
+        if let Some(f) = &self.hover_cache {
+            if f.pts >= target && f.pts - target <= HOVER_HIT_WINDOW_S {
+                return;
+            }
+        }
+        self.kick_hover_predecode(target, cx);
+    }
+
+    /// M0：向常驻 hover 预解码 worker 投一条单帧命令；结果异步回填 [`Self::hover_cache`]。
+    /// 换代（新落点 / 换文件 / 真实 seek / cap 变化）由 [`Self::hover_generation`] 把关：
+    /// 过期结果不落地。**主线程不碰任何解码 FFI**——只有独立 worker 线程解，UI 零阻塞。
+    fn kick_hover_predecode(&mut self, target: f64, cx: &mut Context<Self>) {
+        self.ensure_hover_worker();
+        let hgen = self.hover_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.hover_generation.store(hgen, Ordering::SeqCst);
+        // 新目标 → 旧缓存作废（悬停移到新位置后，旧帧不该在点击时误用；worker 回填时按代序覆盖）
+        self.hover_cache = None;
+        let (ftx, frx) = std::sync::mpsc::channel::<Result<HoverFrame, String>>();
+        let cmd = HoverCmd {
+            generation: hgen,
+            path: self.path.clone(),
+            target,
+            cap: self.decode_cap,
+            tx: ftx,
+        };
+        if let Some(tx) = &self.hover_cmd {
+            let _ = tx.send(cmd);
+        }
+        let path_check = self.path.clone();
+        let cap_check = self.decode_cap;
+        cx.spawn(async move |weak, cx| {
+            // 后台线程等 worker 单次回传（真解码耗时由 worker 占，不在主线程）
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { frx.recv_timeout(std::time::Duration::from_secs(15)) })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                // 只落地「仍是悬停的那个目标、仍在同文件同 cap」的最新代：过期/换文件丢弃
+                if this.hover_generation.load(Ordering::SeqCst) != hgen
+                    || this.path != path_check
+                    || this.decode_cap != cap_check
+                {
+                    return;
+                }
+                if let Ok(Ok(frame)) = outcome {
+                    this.hover_cache = Some(frame);
+                    cx.notify();
+                }
+                // 失败/超时/换代放弃：保持无缓存，点击走正常 seek 兜底
+            });
+        })
+        .detach();
+    }
+
+    /// M0：悬停缓存命中判定 + 消费一次。仅当缓存帧 `pts ≥ 落点`（不展示早于点击位置的帧）且
+    /// `pts − 落点 ≤ [HOVER_HIT_WINDOW_S]`（防陈旧/过冲误用）时命中：取走缓存帧整帧装屏（亚毫秒
+    /// 即现，不再换代解码），返回 true；否则不动缓存、返回 false（调用方走正常 seek 路径）。
+    fn take_hover_cache_if_hit(&mut self, target: f64, cx: &mut Context<Self>) -> bool {
+        let Some(hf) = &self.hover_cache else {
+            return false;
+        };
+        if hf.pts >= target && hf.pts - target <= HOVER_HIT_WINDOW_S {
+            let hf = self.hover_cache.take().expect("已判 Some");
+            self.install_bgra(hf.w, hf.h, hf.bgra, cx);
+            #[cfg(test)]
+            {
+                self.last_frame_pts = Some(hf.pts);
+            }
+            self.pending_seek = None; // 没有在途解码等待：帧已即时上屏
+            true
+        } else {
+            false
+        }
+    }
+
     /// 拖拽开始（进度条按下/k_begin）：锁定预览态——`playhead` 固定到落点、音频
     /// 临时静音（flush 清缓存 + pause 停输出）、视频立即向新落点重定位。**不重开**
     /// 音频线程：若随每次 move 都 `start_audio_at`，声音会反复从当点重放/越位（持续
@@ -1576,7 +1788,17 @@ impl VideoViewer {
             let _ = sink.pause();
         }
         self.last_scrub_retarget = Some(Instant::now());
-        self.start_decoder_at(self.scrub_target, None, false);
+        // M0：悬停预解码帧命中此落点 → 即时装屏（亚毫秒）+ 跳过本次换代重解（`served_hover_target`
+        // 记下已服务落点，供 end_scrub_to 收尾识别——用户拖走后不匹配即落回正常 seek）；未命中
+        // 保持原行为逐字不变（一次换代投解码）。
+        self.served_hover_target = if self.take_hover_cache_if_hit(self.scrub_target, cx) {
+            Some(self.scrub_target)
+        } else {
+            None
+        };
+        if self.served_hover_target.is_none() {
+            self.start_decoder_at(self.scrub_target, None, false);
+        }
         self.ensure_pump(cx);
         cx.notify();
     }
@@ -1620,6 +1842,23 @@ impl VideoViewer {
         self.scrubbing = false;
         let target = target.clamp(0.0, self.duration.max(0.0));
         self.scrub_target = target;
+        // M0：begin 已用 hover 缓存帧直接上屏（未投解码，`pending_seek` 恒 None）且松手仍在
+        // 同一落点 → 不再对同落点重新 seek，走「音频-only 收尾」（与下方单击合并收尾同姿势）。
+        if self.served_hover_target == Some(target) && (self.playhead - target).abs() < 1e-9 {
+            self.served_hover_target = None;
+            self.last_tick = None; // 同 seek 的墙钟重锚：音频时钟期不更新 last_tick
+            if self.audio.is_some() {
+                self.start_audio_at(target); // 音频 worker 复用 reader：只 seek + 喂送
+                if self.playing
+                    && let Some(sink) = &self.audio
+                {
+                    let _ = sink.play();
+                }
+            }
+            self.ensure_pump(cx); // 通知性重绘；无在途解码可等
+            cx.notify();
+            return;
+        }
         // 单击合并（一次换代）：点按 down→up 未拖动且未落点时，`begin_scrub` 那代
         // 同 target 的预览解码仍在飞（`pending_seek == Some(target)`）= 视频 worker 已
         // 在解这一段、pump 只等它出帧上屏——此时松手**不必换代重解第二遍**（现状每次
@@ -2353,6 +2592,11 @@ impl VideoViewer {
             // 已在拖拽但这一拍 dragging 变假（松开）而 mouse_up 未落在条上 → 按当前落点收尾
             if self.scrubbing {
                 self.end_scrub_at_current(cx);
+                return;
+            }
+            // M0：未拖拽的悬停 → 记录悬停位置并（空闲时）后台预解码该落点帧，点击即现。
+            if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
+                self.update_hover_target(self.clamped_scrub_target(f), cx);
             }
             return;
         }
@@ -2702,6 +2946,11 @@ mod tests {
             duration: 2.0,
             fps: None,
             decode_cap: DECODE_MAX_DIM,
+            hovered_target: None,
+            hover_cmd: None,
+            hover_generation: Arc::new(AtomicU64::new(0)),
+            hover_cache: None,
+            served_hover_target: None,
             last_tick: None,
             nav: FolderNav::new(vec![fixture()], 0),
             rx: None,
@@ -3126,6 +3375,142 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// M0 单元（无真解码，走 `blank`）：悬停缓存命中 = 消费一次 + 不换代投解码 —— begin_scrub
+    /// 命中取走缓存帧装屏（generation 不动、不挂 pending_seek），end_scrub 同落点走「音频-only
+    /// 收尾」不再对同落点重新 seek（第二次换代不发生）。
+    #[gpui::test]
+    async fn hover_cache_hit_serves_once_and_no_reseek(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 20.0;
+            // 预置一片「恰好命中 10.0s 落点」的悬停缓存（pts=10.04 ≥ 10.0 且差 0.04 ≤ 0.35）
+            v.hover_cache = Some(HoverFrame {
+                pts: 10.04,
+                w: 64,
+                h: 48,
+                bgra: vec![9u8; (64 * 48 * 4) as usize],
+            });
+            v
+        }));
+        let g0 = cx.update(|app| ent.read(app).generation.load(Ordering::SeqCst));
+        ent.update(cx, |v, cx| v.begin_scrub(0.50, cx)); // target = 10.0
+        let (served, cached, pend, pts) = cx.update(|app| {
+            let v = ent.read(app);
+            (
+                v.served_hover_target,
+                v.hover_cache.is_some(),
+                v.pending_seek,
+                v.last_frame_pts,
+            )
+        });
+        assert!(served == Some(10.0), "命中应服务缓存（记下 10.0s 落点）");
+        assert!(!cached, "缓存消费一次即清");
+        assert_eq!(pend, None, "缓存命中不应挂 pending seek");
+        assert!(
+            pts.is_some_and(|p| (p - 10.04).abs() < 1e-9),
+            "上屏帧即缓存帧 pts（不得早于落点），实得 {pts:?}"
+        );
+        let g1 = cx.update(|app| ent.read(app).generation.load(Ordering::SeqCst));
+        assert_eq!(g0, g1, "缓存命中不应换代投解码 g={g0}");
+        ent.update(cx, |v, cx| v.end_scrub(0.50, cx));
+        let (served2, g2, scrub2) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.served_hover_target, v.generation.load(Ordering::SeqCst), v.scrubbing)
+        });
+        assert_eq!(g1, g2, "end 同落点不应再 seek（无第二次换代）g={g1}");
+        assert_eq!(served2, None, "收尾后 served 标记复位");
+        assert!(!scrub2, "松手后退出拖拽态");
+        cx.run_until_parked();
+    }
+
+    /// M0 回归：悬停命中点击后再**拖离**（60ms 节流窗内，无换代发生）→ 松手落点 ≠ 已服务落点，
+    /// 必须落回正常 seek（真实解码新落点），不得停在旧缓存帧。
+    #[gpui::test]
+    async fn hover_cache_hit_then_drag_away_falls_back_to_seek(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 20.0;
+            v.hover_cache = Some(HoverFrame {
+                pts: 10.04,
+                w: 64,
+                h: 48,
+                bgra: vec![9u8; (64 * 48 * 4) as usize],
+            });
+            v
+        }));
+        let g0 = cx.update(|app| ent.read(app).generation.load(Ordering::SeqCst));
+        ent.update(cx, |v, cx| v.begin_scrub(0.50, cx)); // 命中 10.0s 缓存，未换代
+        let g1 = cx.update(|app| ent.read(app).generation.load(Ordering::SeqCst));
+        assert_eq!(g1, g0, "begin 命中缓存不换代");
+        // 60ms 内拖到 0.60（12.0s）：节流窗内不换代（画面仍是缓存帧，但没有新解码）
+        ent.update(cx, |v, _cx| v.last_scrub_retarget = Some(Instant::now()));
+        ent.update(cx, |v, cx| v.update_scrub(0.60, cx));
+        let (served_after_drag, g2, pend2) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.served_hover_target, v.generation.load(Ordering::SeqCst), v.pending_seek)
+        });
+        assert_eq!(served_after_drag, Some(10.0), "拖拽不换代、served 保持 10.0s");
+        assert_eq!(g2, g1, "拖拽节流窗内不换代");
+        assert_eq!(pend2, None, "拖拽节流窗内无在途解码");
+        // 松手在 12.0s：与已服务落点不匹配 → 必须走正常 seek（换代一次），不得停在 10.0s 帧
+        ent.update(cx, |v, cx| v.end_scrub(0.60, cx));
+        let (served3, g3, playhead3) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.served_hover_target, v.generation.load(Ordering::SeqCst), v.playhead)
+        });
+        assert_eq!(served3, None, "收尾后 served 复位");
+        assert_eq!(g3, g2 + 1, "拖离后松手应换代一次投新解码");
+        assert!((playhead3 - 12.0).abs() < 1e-6, "松手落点在拖拽位置");
+        cx.run_until_parked();
+    }
+
+    /// M0 单元（无真解码）：命中条件逐项 —— 陈旧（pts < 落点）、过冲/太远（pts − 落点 > 窗）
+    /// 一律不命中、缓存保留（点击走正常 seek）；仅在「pts ≥ 落点且差 ≤ 窗」时命中并消费一次。
+    #[gpui::test]
+    async fn hover_cache_condition_rejects_stale_or_overshoot(cx: &mut TestAppContext) {
+        let mk = |pts: f64, cx: &mut gpui::Context<VideoViewer>| {
+            let mut v = blank(fixture(), cx);
+            v.duration = 20.0;
+            v.hover_cache = Some(HoverFrame {
+                pts,
+                w: 64,
+                h: 48,
+                bgra: vec![1u8; (64 * 48 * 4) as usize],
+            });
+            v
+        };
+        // 陈旧：缓存帧早于点击落点 → 不命中（不得展示早于点击位置的帧）、缓存保留
+        let ent = cx.update(|app| app.new(|cx| mk(5.0, cx)));
+        let (hit, left) = ent.update(cx, |v, cx| {
+            let hit = v.take_hover_cache_if_hit(10.0, cx);
+            (hit, v.hover_cache.is_some())
+        });
+        assert!(!hit, "pts<落点陈旧缓存不命中");
+        assert!(left, "未命中不消费缓存");
+        // 过冲/太远：缓存帧远超前落点（差 > 0.35s 窗）→ 不命中、保留
+        let ent2 = cx.update(|app| app.new(|cx| mk(11.0, cx)));
+        let (hit2, left2) = ent2.update(cx, |v, cx| {
+            let hit = v.take_hover_cache_if_hit(10.0, cx);
+            (hit, v.hover_cache.is_some())
+        });
+        assert!(!hit2, "超窗缓存不命中");
+        assert!(left2, "超窗不消费");
+        // 窗内且 ≥ 落点 → 命中并消费
+        let ent3 = cx.update(|app| app.new(|cx| mk(10.04, cx)));
+        let (hit3, left3) = ent3.update(cx, |v, cx| {
+            let hit = v.take_hover_cache_if_hit(10.0, cx);
+            (hit, v.hover_cache.is_some())
+        });
+        assert!(hit3, "窗内命中");
+        assert!(!left3, "命中消费一次");
+        #[cfg(test)]
+        assert!(
+            ent3.update(cx, |v, _| v.frame.is_some()),
+            "命中后应有帧装屏"
+        );
+        cx.run_until_parked();
+    }
+
     /// 回归：HE-AAC + 字幕流的 MKV（`target\视频测试字幕.mkv`）反复点进度条（等价连续
     /// seek）——每次 seek 后首帧上屏都落在落点附近、`pending_seek` 及时清空（不冻结/
     /// 不越位）。该文件 MKV demux 落点常大幅回退（音频侧实测 -12s）+ HE-AAC SBR 断链
@@ -3363,8 +3748,143 @@ mod tests {
         cx.run_until_parked();
     }
 
-    /// 直接构造（不走真实解码）：pump 排空逻辑 —— 取「pts ≤ playhead」的最新帧上屏，
-    /// 越线的下一帧保留在 overflow。
+    /// 性能基准（纯代码、不开 GUI，真解码 + 真墙钟）：M0 hover 预解码 —— 对同一组（含深 GOP）
+    /// 落点先量「无悬停基线」（= 正常点击 seek 全量解码墙钟，同 `bench_click_seek_land_frame_wall`
+    /// 链路），再量「暂停 → 悬停该落点 → 等后台预解码缓存抵达 → 点击」的端到端墙钟。缓存命中时
+    /// 点击直接装屏、无 seek：断言 <80ms 即现且首帧 pts ≥ 落点、无名 pending。
+    /// [SEEKBENCHHOVER] 与 GUI [SEEK] 同 8 字段/同序/同单位布局；基线侧取 tick 沉淀快照，
+    /// 悬停侧（无 seek 无快照）按命中语义手工填该 8 字段（seek2first≈0、reuse=1、regress=pts−落点）。
+    /// 夹具 `target\视频测试字幕.mkv`（长 GOP）；缺夹具 SKIP（AGENTS.md §5）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bench_hover_click_land_frame_wall(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待首帧/时长超时");
+        }
+        let duration = cx.update(|app| viewer.read(app).duration);
+        // 目标秒：贴近既有 bench 实测深回退点（regress ≈ −5.3s / −9.9s / −10.2s / −3.0s），
+        // 覆盖浅/中/深 GOP；钳 [0.05, duration−2s] 避开近结尾 EOF。
+        let raw = [191.0f64, 354.0, 447.0, 1335.0];
+        let hi = (duration - 2.0).max(0.05);
+        let mut base_rows: Vec<(f64, f64, f64)> = Vec::new(); // (target, total_ms, regress)
+        let mut hover_rows: Vec<(f64, f64, f64)> = Vec::new(); // (target, hover_ms, regress)
+        for &sec in &raw {
+            let sec = sec.clamp(0.05, hi);
+            let fraction = (sec / duration).clamp(0.0, 1.0) as f32;
+            // (a) 无悬停基线：同既有 bench 单击链路（begin+end 一次换代全量解码）
+            let t0 = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let btarget = cx.update(|app| viewer.read(app).playhead);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "基线 seek 落点超时（target={btarget:.2}s）");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let bms = t0.elapsed().as_secs_f64() * 1e3;
+            let (btotal, bregress) = match take_seek_diag_test() {
+                Some((total, _, regress, _, _, _, _, _)) => (total, regress),
+                None => (bms, f64::NAN),
+            };
+            base_rows.push((sec, btotal, bregress));
+            eprintln!(
+                "[SEEKBENCHHOVER] base target={sec:.2}s total={btotal:.1}ms regress={bregress:+.2}s"
+            );
+            // (b) 暂停 → 悬停同一落点 → 等后台预解码缓存抵达 → 点击（begin+end）→ 量墙钟
+            viewer.update(cx, |v, _cx| {
+                v.playing = false; // 暂停：悬停预解码只在空闲态投（机会式）
+                v.pending_seek = None;
+            });
+            viewer.update(cx, |v, cx| v.update_hover_target(sec, cx));
+            let hdeadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                // 等交付任务跑 + worker 真解码（墙钟 deadline；fake timer 不作节拍）
+                cx.background_executor.timer(Duration::from_millis(5)).await;
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let got = cx.update(|app| viewer.read(app).hover_cache.is_some());
+                if got {
+                    break;
+                }
+                assert!(Instant::now() < hdeadline, "hover 预解码缓存超时（target={sec:.2}s）");
+            }
+            let hover_pts0 = cx
+                .update(|app| viewer.read(app).hover_cache.as_ref().map(|f| f.pts))
+                .expect("悬停缓存已抵达");
+            assert!(hover_pts0 >= sec, "预解码帧 pts 不得早于落点 target={sec} pts={hover_pts0}");
+            let th = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let hms = th.elapsed().as_secs_f64() * 1e3;
+            let (hover_pend, hover_pts) = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.pending_seek, v.last_frame_pts)
+            });
+            assert!(hover_pend.is_none(), "悬停命中点击后不应有待解 pending（target={sec}）");
+            let hp = hover_pts.expect("悬停命中点击后应即时有帧上屏");
+            assert!(
+                hp >= sec && hp - sec <= HOVER_HIT_WINDOW_S,
+                "悬停点击首帧应在命中窗内且不早于落点 target={sec} pts={hp}"
+            );
+            assert!(hms < 80.0, "悬停缓存命中点击应 <80ms 即现 target={sec} 实得 {hms:.1}ms");
+            hover_rows.push((sec, hms, hp - sec));
+            eprintln!(
+                "[SEEKBENCHHOVER] total={hms:.1}ms reuse=1 regress={:+.2}s skipped=0 seek2first=0.0ms frame2screen=0.0ms target={:.2}s firstpts={:.2}s（命中 hover 缓存，无 seek）",
+                hp - sec, sec, hp,
+            );
+        }
+        // 摘要：基线 vs 悬停（同为 total 口径）
+        let bms_all: Vec<f64> = base_rows.iter().map(|r| r.1).collect();
+        let hms_all: Vec<f64> = hover_rows.iter().map(|r| r.1).collect();
+        let (bmin, bmedian, bmax) = {
+            let mut s = bms_all.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (s[0], s[s.len() / 2], s[s.len() - 1])
+        };
+        let (hmin, hmedian, hmax) = {
+            let mut s = hms_all.clone();
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (s[0], s[s.len() / 2], s[s.len() - 1])
+        };
+        eprintln!(
+            "[SEEKBENCHHOVER] 摘要 基线 n={} min={bmin:.1}ms median={bmedian:.1}ms max={bmax:.1}ms ｜ 悬停命中 n={} min={hmin:.1}ms median={hmedian:.1}ms max={hmax:.1}ms",
+            bms_all.len(), hms_all.len(),
+        );
+        cx.run_until_parked();
+    }
     #[gpui::test]
     async fn pump_installs_latest_frame_in_window(cx: &mut TestAppContext) {
         let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
