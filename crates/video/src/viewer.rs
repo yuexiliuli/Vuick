@@ -105,6 +105,13 @@ const GLASS_PANEL_ALPHA_LIGHT: f32 = 0.80;
 const GLASS_PANEL_ALPHA_DARK: f32 = 0.72;
 /// 右上角瞬时状态浮层（截图结果提示等）的显示时长（ms），到期自动清除。
 const STATUS_MS: u64 = 2500;
+/// 拖拽（scrub）期间视频重定位的最小间隔（ms）：拖拽天然高频，若每次 mouse_move 都
+/// 换代重开解码（`start_decoder_at`），中间命令的 generation 在入队时就已被后续命令
+/// 超过 → worker 直接跳过、只跑最后一条 → 拖拽全程无中间帧上屏（画面冻结）。节流到
+/// 该间隔让 worker 有完整拍把最新落点的帧解出来；worker 的预滚保底帧只在 EOF/解码
+/// 错误时送到（换代时旧接收端已被换走，送不进也非必需——画面留最近上屏帧），
+/// 预览跟手、松手精确落点完全由本节流保证。
+const SCRUB_RETARGET_MS: u64 = 60;
 
 /// 播放模式三态（控制条按钮循环切换；播完「自然结尾」时的去向）：
 /// - [`PlaybackMode::Sequential`]：顺序播放——播完当前自动停（默认，保持历史行为）；
@@ -245,6 +252,18 @@ pub struct VideoViewer {
     pump_running: bool,
     /// seek 落点待定（秒）：暂停态 seek 后仍需泵直到落点帧上屏。
     pending_seek: Option<f64>,
+    /// 进度条拖拽（scrub）进行中：拖拽期音频静音、视频按节流重定位、`playhead`
+    /// 固定在手指落点不随时钟走；松手走一次完整提交 seek（换代 + 重开音频）恢复播放。
+    /// 前提是「每次 mouse_move 都换代重开」会饿死中间命令（generation 入队即推进，
+    /// worker 只跑最后一条）→ 拖拽中画面冻结；且每次 move 重开音频 → 声音越位/持续
+    /// 出声、HE-AAC(SBR) seek 落点的坏首帧被解码刷 `env_facs_q ... is invalid`。
+    scrubbing: bool,
+    /// 拖拽当前预览落点（秒）；`scrubbing` 期间 `advance_playhead` 直接短路，
+    /// `playhead` 恒等于它（不随音频/墙钟钟走）。
+    scrub_target: f64,
+    /// 拖拽视频重定位节流：距上次真实重定位不足 [`SCRUB_RETARGET_MS`] 只记落点，
+    /// 不换代（让 worker 有空把最新落点帧解出来上屏）。
+    last_scrub_retarget: Option<Instant>,
     /// 音频输出（有音轨且设备可用时 Some；否则纯画面 + 墙钟）。
     audio: Option<AudioSink>,
     /// 音频时钟基准：seek 落点（秒）。有音频播放时 `playhead = audio_base + 设备已播位置`。
@@ -340,6 +359,9 @@ impl VideoViewer {
             generation: Arc::new(AtomicU64::new(0)),
             pump_running: false,
             pending_seek: None,
+            scrubbing: false,
+            scrub_target: 0.0,
+            last_scrub_retarget: None,
             audio: None,
             audio_base: 0.0,
             audio_gen: Arc::new(AtomicU64::new(0)),
@@ -590,6 +612,14 @@ impl VideoViewer {
                     }
                 }
                 if !keep {
+                    // 本命以 EOF/解码错误结束（换代时不走此分支进入——换代已把旧接收端
+                    // 换走，`try_send` 连不上、帧被丢弃且非必需；画面保留最近上屏帧，跟手
+                    // 由 `SCRUB_RETARGET_MS` 节流保证，不依赖这里的保底）：把缓存的「落点
+                    // 前一帧」尽力送出，让 pump 在 EOF/出错时至少有一帧上屏。`try_send`：
+                    // 接收端已换走/通道满都立刻失败（=丢弃），不阻塞 worker。
+                    if let Some(p) = pre_roll.take() {
+                        let _ = cmd.tx.try_send(p);
+                    }
                     break; // 接收端已被换代/弃用
                 }
             }
@@ -699,9 +729,10 @@ impl VideoViewer {
         }
     }
 
-    /// 播放泵是否仍需运行。
+    /// 播放泵是否仍需运行（拖拽中也必须持续——暂停态拖拽时 `playing` 为假、落点帧
+    /// 上屏前 `pending_seek` 也可能短暂为空，但预览要跟着手指走）。
     fn pump_wanted(&self) -> bool {
-        self.playing || self.pending_seek.is_some()
+        self.playing || self.pending_seek.is_some() || self.scrubbing
     }
 
     /// 泵节拍：按内容帧率自适应（30fps→~33ms、60fps→16ms、25fps→40ms），下限
@@ -847,6 +878,13 @@ impl VideoViewer {
     /// 暂停不推进；到结尾自动停（有音频时顺带暂停输出）。返回是否「这一拍撞到结尾」，
     /// 供 [`Self::tick`] 决定是否执行 [`Self::handle_end`] 的自动切换。
     fn advance_playhead(&mut self, audio_pos: Option<f64>) -> bool {
+        // 拖拽（scrub）预览：进度由手指指定，不走任何时钟——音频已在 `begin_scrub`
+        // 暂停、位置冻结；音频时钟若照常算 `audio_base + 位置×speed` 会把刚暂停的
+        // 落点继续推进 → playhead 越位拖走、画面更对不上。
+        if self.scrubbing {
+            self.last_tick = None;
+            return false;
+        }
         if !self.playing {
             self.last_tick = None;
             return false;
@@ -1187,6 +1225,9 @@ impl VideoViewer {
     }
 
     fn seek(&mut self, delta: f64, cx: &mut Context<Self>) {
+        // 任何「提交式」seek（键盘步进等）都退出拖拽态：拖拽期 playhead 由手指指定，
+        // 一旦走完整换代 + 重开音频的提交路径就必须还时钟给它，否则永远冻结。
+        self.scrubbing = false;
         let target = (self.playhead + delta).clamp(0.0, self.duration.max(0.0));
             self.playhead = target;
             // seek 重锚墙钟基准（同 toggle_play 恢复播放的姿势）：音频时钟期间 `last_tick`
@@ -1206,8 +1247,77 @@ impl VideoViewer {
 
     /// 进度条/音量条共用：分数 → 秒数 seek（进度条比例 × 总时长）。
     /// 进度条把 `fraction` 夹到 [0, 1] 再换算；本方法对绝对值 cur 也做钳位。
+    /// 生产路径（点按/拖拽）已改走 [`Self::begin_scrub`]/[`Self::update_scrub`]/
+    /// [`Self::end_scrub`]（拖拽不逐 move 换代）；本方法仅测试直接驱动用。
+    #[cfg(test)]
     fn seek_to_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
         let target = f64::from(fraction.clamp(0.0, 1.0)) * self.duration.max(0.0);
+        self.seek(target - self.playhead, cx);
+    }
+
+    /// 分数 → 拖拽落点秒数（钳位到 [0, duration]；与 [`Self::seek_to_fraction`] 同一换算）。
+    fn clamped_scrub_target(&self, fraction: f32) -> f64 {
+        f64::from(fraction.clamp(0.0, 1.0)) * self.duration.max(0.0)
+    }
+
+    /// 拖拽开始（进度条按下/k_begin）：锁定预览态——`playhead` 固定到落点、音频
+    /// 临时静音（flush 清缓存 + pause 停输出）、视频立即向新落点重定位。**不重开**
+    /// 音频线程：若随每次 move 都 `start_audio_at`，声音会反复从当点重放/越位（持续
+    /// 出声），且 HE-AAC(SBR) 每次选中流 mid-frame 首包都会解码报 `env_facs_q` 坏帧。
+    fn begin_scrub(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        self.scrubbing = true;
+        self.scrub_target = self.clamped_scrub_target(fraction);
+        self.playhead = self.scrub_target;
+        self.last_tick = None;
+        if let Some(sink) = &self.audio {
+            sink.flush(); // 清掉暂停前已入队的旧段（即便 pause 未即时生效也无声）
+            let _ = sink.pause();
+        }
+        self.last_scrub_retarget = Some(Instant::now());
+        self.start_decoder_at(self.scrub_target, None, false);
+        self.ensure_pump(cx);
+        cx.notify();
+    }
+
+    /// 拖拽移动（进度条按住拖动）：只更新落点（`playhead` 跟手指）；距上一次真实
+    /// 重定位不足 [`SCRUB_RETARGET_MS`] 就不再换代——否则密集 move 的中间命令被
+    /// generation 入队即覆盖，worker 来不及解首帧 → 画面全拖全程冻结。
+    fn update_scrub(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let target = self.clamped_scrub_target(fraction);
+        self.scrub_target = target;
+        self.playhead = target;
+        self.last_tick = None;
+        let due = match self.last_scrub_retarget {
+            Some(t) => t.elapsed() >= Duration::from_millis(SCRUB_RETARGET_MS),
+            None => true,
+        };
+        if due {
+            self.last_scrub_retarget = Some(Instant::now());
+            self.start_decoder_at(target, None, false);
+        }
+        cx.notify();
+    }
+
+    /// 拖拽结束（进度条松开）：按最终落点走一次完整提交 seek（换代 + 重开音频；
+    /// 播放中恢复出声、暂停态保持静音预览）。音频 seek 从「每次 move 一次」降到
+    /// 「每次拖拽一次」，AAC(SBR) 坏帧不再高频触发。
+    fn end_scrub(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let target = self.clamped_scrub_target(fraction);
+        self.end_scrub_to(target, cx);
+    }
+
+    /// 拖拽结束到当前预览落点（鼠标在窗外松开、`fraction_at` 拿不到位置时兜底）。
+    fn end_scrub_at_current(&mut self, cx: &mut Context<Self>) {
+        self.end_scrub_to(self.scrub_target, cx);
+    }
+
+    fn end_scrub_to(&mut self, target: f64, cx: &mut Context<Self>) {
+        if !self.scrubbing {
+            return; // 幂等：`on_mouse_up` 与 `on_mouse_up_out` 可能都触发
+        }
+        self.scrubbing = false;
+        let target = target.clamp(0.0, self.duration.max(0.0));
+        self.scrub_target = target;
         self.seek(target - self.playhead, cx);
     }
 
@@ -1880,7 +1990,9 @@ impl VideoViewer {
         if seek {
             el = el
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_seek_down))
-                .on_mouse_move(cx.listener(Self::on_seek_move));
+                .on_mouse_move(cx.listener(Self::on_seek_move))
+                .on_mouse_up(MouseButton::Left, cx.listener(Self::on_seek_up))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_seek_up));
         } else {
             el = el
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_vol_down))
@@ -1889,7 +2001,7 @@ impl VideoViewer {
         el.into_any_element()
     }
 
-    /// seek 点按：屏 x → 分数 → seek。
+    /// seek 点按：进入拖拽预览（begin_scrub）——先落点预览、静音；松手提交。
     fn on_seek_down(
         &mut self,
         e: &MouseDownEvent,
@@ -1897,11 +2009,11 @@ impl VideoViewer {
         cx: &mut Context<Self>,
     ) {
         if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-            self.seek_to_fraction(f, cx);
+            self.begin_scrub(f, cx);
         }
     }
 
-    /// seek 拖拽（左键按住才推进；移出条后松开无后续）。
+    /// seek 拖拽（左键按住才推进；移出条到窗外松开由 `on_seek_up`/`on_mouse_up_out` 兜底）。
     fn on_seek_move(
         &mut self,
         e: &MouseMoveEvent,
@@ -1909,10 +2021,35 @@ impl VideoViewer {
         cx: &mut Context<Self>,
     ) {
         if !e.dragging() {
+            // 已在拖拽但这一拍 dragging 变假（松开）而 mouse_up 未落在条上 → 按当前落点收尾
+            if self.scrubbing {
+                self.end_scrub_at_current(cx);
+            }
             return;
         }
         if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
-            self.seek_to_fraction(f, cx);
+            if self.scrubbing {
+                self.update_scrub(f, cx);
+            } else {
+                self.begin_scrub(f, cx);
+            }
+        }
+    }
+
+    /// seek 拖拽结束（窗口内松开）：按松手位置最终提交。
+    fn on_seek_up(
+        &mut self,
+        e: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.scrubbing {
+            return;
+        }
+        if let Some(f) = fraction_at(&self.seek_bounds, e.position) {
+            self.end_scrub(f, cx);
+        } else {
+            self.end_scrub_at_current(cx);
         }
     }
 
@@ -2200,6 +2337,9 @@ mod tests {
             generation: Arc::new(AtomicU64::new(0)),
             pump_running: false,
             pending_seek: None,
+            scrubbing: false,
+            scrub_target: 0.0,
+            last_scrub_retarget: None,
             audio: None,
             audio_base: 0.0,
             audio_gen: Arc::new(AtomicU64::new(0)),
@@ -2335,6 +2475,201 @@ mod tests {
                 "复用 seek 后首帧上屏应在落点附近（帧级），target={target} 实得 pts={pts}"
             );
         }
+        cx.run_until_parked();
+    }
+
+    /// 回归：拖拽（scrub）不得逐 mouse_move 换代/重开音频——换代风暴会饿死中间命令
+    /// （generation 入队即推进，worker 只跑最后一条 → 拖拽全程画面冻结）；逐 move 重开
+    /// 音频则声音越位/持续出声 + HE-AAC(SBR) 选中流坏帧刷 `env_facs_q`。断言：密集拖拽
+    /// 期间视频 `generation` 只涨一次（节流重定位）；`playhead` 恒跟手指落点；松手
+    /// `end_scrub` 才走一次完整提交（视频 generation +1）。反向回归护栏：若有人把拖拽
+    /// 改回「每 move 一次提交 seek」，本节即红。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn scrub_throttles_video_and_defers_commit(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = true;
+                v.duration = 10.0;
+                v
+            })
+        });
+        ent.update(cx, |v, cx| v.begin_scrub(0.10, cx));
+        let (g0, a0, p0) = cx.update(|app| {
+            let v = ent.read(app);
+            (
+                v.generation.load(Ordering::SeqCst),
+                v.audio_gen.load(Ordering::SeqCst),
+                v.playhead,
+            )
+        });
+        assert!((p0 - 1.0).abs() < 1e-6, "begin_scrub 应先落点 playhead=1.0");
+        assert_eq!(a0, 0, "blank 无音频：begin 不重开音频（audio_gen 恒 0）");
+        // 密集拖拽 30 次 move（全部落在 SCRUB_RETARGET_MS 节流窗口内）
+        for i in 0..30u32 {
+            let f = (0.15f32 + i as f32 * 0.02).min(1.0);
+            ent.update(cx, |v, cx| v.update_scrub(f, cx));
+        }
+        let (g1, p1, scrub) = cx.update(|app| {
+            let v = ent.read(app);
+            (
+                v.generation.load(Ordering::SeqCst),
+                v.playhead,
+                v.scrubbing,
+            )
+        });
+        assert!(scrub, "拖拽态应持续到松手");
+        assert!(
+            g1 <= g0 + 1,
+            "密集 move 不得逐 move 换代（换代风暴饿死中间命令 → 画面冻结）g0={g0} g1={g1}"
+        );
+        let expected_p = f64::from((0.15f32 + 29.0 * 0.02).clamp(0.0, 1.0) * 10.0);
+        assert!(
+            (p1 - expected_p).abs() < 1e-6,
+            "playhead 应跟到最后一个落点 {p1} vs {expected_p}"
+        );
+        // 拖拽中 tick 也不应挪动 playhead（advance_playhead 对 scrubbing 短路 → 不越位）
+        ent.update(cx, |v, cx| {
+            let _ = v.tick(cx);
+        });
+        assert!(
+            (cx.update(|app| ent.read(app).playhead) - expected_p).abs() < 1e-6,
+            "拖拽中时钟不得推进 playhead（音频不越位）"
+        );
+        // 松手：一次完整提交 seek（视频换代）
+        ent.update(cx, |v, cx| v.end_scrub(0.80, cx));
+        let (g2, scrub2) = cx.update(|app| {
+            let v = ent.read(app);
+            (v.generation.load(Ordering::SeqCst), v.scrubbing)
+        });
+        assert!(
+            g2 > g1,
+            "松手才走一次完整提交 seek（换代）g1={g1} g2={g2}"
+        );
+        assert!(!scrub2, "松手后退出拖拽态");
+        cx.run_until_parked();
+    }
+
+    /// 回归/行为：真拖拽（begin → 密集若干 update → end）——画面随落点逐步跟随（跟手、
+    /// 不冻结：每次 move 后都有新帧上屏），松手精确落点并保持播放。旧实现逐 move 换代，
+    /// 密集拖拽里中间命令被 generation 入队即覆盖 → 拖拽全程无中间帧（冻结），本节即红。
+    /// 真解码 + 真音频设备，需 `target\视频测试.mp4`；缺夹具 SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn scrub_drag_follows_and_release_lands(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库，本机无真视频）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let ready = wait_ready(&viewer, cx).await;
+        let ready_err = ready.2.clone();
+        assert!(ready.0, "首帧应就绪 err={ready_err:?}");
+        let duration = cx.update(|app| viewer.read(app).duration);
+        viewer.update(cx, |v, cx| v.begin_scrub(0.10, cx));
+        // 密集拖拽：连续 move 不睡，模拟快速来回拖；每次 move 之后等新帧上屏（画面在动）
+        let mut seen: Vec<Option<f64>> = Vec::new();
+        for &f in &[0.22f32, 0.34, 0.46, 0.58, 0.30] {
+            viewer.update(cx, |v, cx| v.update_scrub(f, cx));
+            let before = cx.update(|app| viewer.read(app).last_frame_pts);
+            let deadline = Instant::now() + Duration::from_millis(600);
+            let landed: Option<f64> = loop {
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let now = cx.update(|app| viewer.read(app).last_frame_pts);
+                if now != before {
+                    break now;
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(4));
+            };
+            seen.push(landed);
+        }
+        let mut distinct: Vec<f64> = seen.iter().flatten().copied().collect();
+        distinct.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        distinct.dedup();
+        assert!(
+            distinct.len() >= 2,
+            "拖拽中画面应逐步跟随（跟手，非全程冻结），实得 {distinct:?}"
+        );
+        // 松手：精确落点 + 退出拖拽 + 保持播放
+        std::thread::sleep(Duration::from_millis(80));
+        viewer.update(cx, |v, cx| v.end_scrub(0.80, cx));
+        let target = duration * 0.8;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (landed, scrub_after) = loop {
+            let s = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.pending_seek, v.last_frame_pts, v.scrubbing)
+            });
+            if s.0.is_none() {
+                break (s.1, s.2);
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            assert!(Instant::now() < deadline, "松手后落点帧上屏超时");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(!scrub_after, "松手后应退出拖拽态");
+        let pts = landed.expect("松手后应有一帧上屏");
+        assert!(
+            (pts - target).abs() < 0.3 && pts <= target + 0.1,
+            "松手后应落在最终落点附近 target={target:.3} pts={pts:.3}"
+        );
+        assert!(
+            cx.update(|app| viewer.read(app).playing),
+            "松手后播放状态保持（提交 seek 不打断播放）"
+        );
+        cx.run_until_parked();
+    }
+
+    /// 边界：**暂停态拖拽**——`playing=false` 时拖拽预览也要工作：泵因 `scrubbing` 持续
+    /// 运行（落点帧上屏后 `pending_seek` 已空也不停）、`playhead` 不随时钟走、松手提交
+    /// 后按最终落点（暂停态保持静音预览）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn scrub_paused_drag_keeps_pump_alive(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let ent = cx.update(|app| {
+            app.new(|cx| {
+                let mut v = blank(fixture(), cx);
+                v.playing = false;
+                v.duration = 10.0;
+                v
+            })
+        });
+        ent.update(cx, |v, cx| v.begin_scrub(0.20, cx));
+        // 模拟首个拖拽落点帧已上屏：worker 已喂帧、pending_seek 被 tick 清空
+        ent.update(cx, |v, _| v.pending_seek = None);
+        assert!(
+            cx.update(|app| ent.read(app).pump_wanted()),
+            "暂停态拖拽中泵必须持续（scrubbing 真），否则画面不再更新"
+        );
+        ent.update(cx, |v, cx| v.update_scrub(0.40, cx));
+        ent.update(cx, |v, cx| {
+            let _ = v.tick(cx);
+        });
+        let (p, scrub) = cx.update(|app| (ent.read(app).playhead, ent.read(app).scrubbing));
+        assert!((p - 4.0).abs() < 1e-6, "暂停态拖拽 playhead 仍跟手指 {p}");
+        assert!(scrub, "拖拽态保持");
+        ent.update(cx, |v, cx| v.end_scrub(0.50, cx));
+        let (p2, scrub2) = cx.update(|app| (ent.read(app).playhead, ent.read(app).scrubbing));
+        assert!((p2 - 5.0).abs() < 1e-6, "松后提交到最终落点 {p2}");
+        assert!(!scrub2, "退出拖拽态");
+        assert!(
+            !cx.update(|app| ent.read(app).playing),
+            "暂停态拖拽松手不自动播放"
+        );
         cx.run_until_parked();
     }
 
