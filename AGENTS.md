@@ -8,7 +8,7 @@ LAST_AUDIT_PATCH: 2026-10-17-002
 
 ## 0. 项目与角色边界
 
-**项目**：Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo workspace：`src/main.rs` 只是薄二进制壳，功能全在各 crate（`crates/shell`=外壳/侧栏/EditorApp、`crates/editor`=编辑区、`crates/markdown`=Markdown 预览、`crates/pdf`=PDF 阅读、`crates/epub`、`crates/viewer`、`crates/image_viewer`、`crates/video`、`crates/syntax`、`crates/ui`、`crates/toc`、`crates/config`、`crates/base`、`crates/ime`）。
+**项目**：Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo workspace：`src/main.rs` 只是薄二进制壳，功能全在各 crate（`crates/shell`=外壳/侧栏/EditorApp、`crates/editor`=编辑区、`crates/markdown`=Markdown 预览、`crates/pdf`=PDF 阅读、`crates/epub`、`crates/viewer`、`crates/image_viewer`、`crates/video`、`crates/video-ffmpeg`=解码内核 cdylib、`crates/syntax`、`crates/ui`、`crates/toc`、`crates/config`、`crates/base`、`crates/ime`）。
 
 **角色职责表**：
 

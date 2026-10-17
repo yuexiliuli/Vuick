@@ -705,7 +705,7 @@ mod tests {
 
     fn fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../fixtures")
+            .join("../../fixtures")
             .join("video测试.mp4")
     }
 
@@ -797,7 +797,7 @@ mod tests {
 
     fn audio_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../fixtures")
+            .join("../../fixtures")
             .join("video测试有声.mp4")
     }
 
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn audio_drain_clears_resampler_residue() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../target/视频测试.mp4");
+            .join("../../target/视频测试.mp4");
         if !path.exists() {
             eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
             return;
