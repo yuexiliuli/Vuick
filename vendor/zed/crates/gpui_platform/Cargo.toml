@@ -1,0 +1,29 @@
+[package]
+name = "gpui_platform"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lib]
+path = "src/gpui_platform.rs"
+doctest = false
+
+# Vendored/trimmed for gpui-editor: Windows-only. Feature names kept so
+# consumer manifests (gpui-editor root: features=["font-kit"]) still parse.
+[features]
+default = []
+font-kit = []
+inspector = ["gpui/inspector"]
+test-support = ["gpui/test-support", "gpui_windows/test-support"]
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_windows.workspace = true
+gpui = { workspace = true, features = ["windows-manifest"] }
+
+[lints]
+workspace = true

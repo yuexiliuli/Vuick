@@ -6,6 +6,14 @@ LAST_AUDIT_PATCH: 2026-10-18-001
 
 # AGENTS.md（LLM 执行协议 v2）
 
+> **2026-10-18 夜间自主使命指令覆盖（用户当面授权，任务结束即失效）**
+> ① **vendor gpui 合法化**：`vendor/zed` 是本仓内的 gpui/gpui_platform/gpui_windows fork（Apache-2.0），
+>    修改它**不算**「改 gpui checkout」，用于视频零回读 GPU 直通（YUV 着色器/D3D11 设备暴露/外部纹理）可随意改。
+> ② **提交权**：本使命内用户明确授权「完成一项功能后自动提交 git」，主 agent 可自行提交（普通会话仍须用户口令）。
+> ③ 用户明示「权限全部交给你、不用经过确认、可查阅互联网」，使命内不再阻塞等确认；
+>    验收仍按 §3 协议（debug 构建、#[gpui::test] 真夹具墙钟、不开 GUI）。
+> ④ 收尾：完成全部目标后由主 agent 提交最终报告并执行睡眠命令。
+
 ## 0. 项目与角色边界
 
 **项目**：Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo workspace：`src/main.rs` 只是薄二进制壳，功能全在各 crate（`crates/shell`=外壳/侧栏/EditorApp、`crates/editor`=编辑区、`crates/markdown`=Markdown 预览、`crates/pdf`=PDF 阅读、`crates/epub`、`crates/viewer`、`crates/image_viewer`、`crates/video`、`crates/video-ffmpeg`=解码内核 cdylib、`crates/syntax`、`crates/ui`、`crates/toc`、`crates/config`、`crates/base`、`crates/ime`）。
