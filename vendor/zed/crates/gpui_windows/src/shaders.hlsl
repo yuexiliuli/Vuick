@@ -1317,18 +1317,15 @@ ExternalYuvSpriteVertexOutput external_yuv_vertex(uint vertex_id: SV_VertexID, u
 float4 external_yuv_fragment(ExternalYuvSpriteFragmentInput input): SV_Target {
     ExternalYuvSprite sprite = external_yuv_sprites[input.sprite_id];
 
-    // 片段在纹理内的像素偏移（sprite.bounds 与 input.position 同处设备像素空间）
-    float2 pixel_offset = input.position.xy - sprite.bounds.origin;
-
-    // 平面尺寸直接从各自 SRV 的 GetDimensions 取：Y 平面 = 宽×高，UV 平面（NV12
-    // 半分辨率）视图自身即是 宽/2 × 高/2，按此归一化即得正确的 UV 采样坐标。
-    float2 y_size;
-    t_sprite.GetDimensions(y_size.x, y_size.y);
-    float Y = t_sprite.Sample(s_sprite, pixel_offset / y_size).r;
-
-    float2 uv_size;
-    t_uv.GetDimensions(uv_size.x, uv_size.y);
-    float2 uv = t_uv.Sample(s_sprite, pixel_offset / uv_size).rg;
+    // 归一化取样坐标 = 片段相对显示矩形的偏移 / 显示尺寸（sprite.bounds 与
+    // input.position 同处设备像素空间）。必须按**显示尺寸**归一化：视频被 contain 等比
+    // 缩放到画布，bounds.size ≠ 纹理边数（源像素）；若按纹理边数（旧版 GetDimensions）
+    // 归一化，缩放≠1 时取样坐标越界/错位——M2e 硬解画面在真实 GUI 缩放/全屏时花屏。
+    // Y 与 UV 平面共用同一坐标（NV12 每个 UV texel 覆盖 2×2 像素，SRV 平面视图自身即
+    // 半分辨率）。
+    float2 unit = (input.position.xy - sprite.bounds.origin) / sprite.bounds.size;
+    float Y = t_sprite.Sample(s_sprite, unit).r;
+    float2 uv = t_uv.Sample(s_sprite, unit).rg;
 
     // BT.709 有限范围（Y/U/V ∈ [0,1]，黑电平 16/255、色差零漂 128/255）
     float y_ = Y - 16.0 / 255.0;

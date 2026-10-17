@@ -39,5 +39,7 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::{WindowsPlatform, d3d11_device_context};
+#[cfg(any(test, feature = "test-support"))]
+pub use platform::set_d3d11_device_context_for_test;
 
 pub(crate) use windows::Win32::Foundation::HWND;

@@ -6,6 +6,10 @@ description = "gpui-editor 视频查看器 crate（FFmpeg 经 libloading 运行�
 
 [dependencies]
 gpui = { workspace = true }
+# M2e：D3D11VA 硬件解码零回读 GPU 直通——worker 读进程级设备/上下文
+#（`gpui_platform::d3d11_device_context()`，真实 GUI 由 gpui_windows `attach_gpu` 发布，
+# 测试经 `set_d3d11_device_context_for_test` 注入）。
+gpui_platform = { workspace = true }
 image = { workspace = true }
 anyhow = { workspace = true }
 cpal = { workspace = true }
@@ -14,7 +18,20 @@ config = { path = "../config" }
 # video 图标变体（IconName::Play/Pause/Volume/…）由本 crate 的 ui 依赖开启其 `video` feature。
 ui = { path = "../ui", features = ["video"] }
 viewer = { path = "../viewer" }
+# M2e：D3D11VA 帧 → SRV-capable NV12 目标纹理的 GPU 侧拷贝（CopySubresourceRegion/Flush）+
+# 测试自建 D3D11 设备（D3D11CreateDevice）。features 取与 video-ffmpeg 同款最小集
+#（Direct3D11 生成的类型内部引用 Direct3D/Dxgi，三者必须同开才能编译）。
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
 
 [dev-dependencies]
 # zed 同款：dev 下给同一 gpui 叠加 test-support feature（不能用 gpui-test-support 别名，见根 Cargo.toml 注释）。
 gpui = { workspace = true, features = ["test-support"] }
+# M2e 测试：`bench_seek_hw_d3d11_wall` / HW 往返测试需 headless 注入自建 D3D11 设备——
+# 该 feature 让 gpui_platform/gpui_windows 编译 `set_d3d11_device_context_for_test`（正常构建不可见）。
+gpui_platform = { workspace = true, features = ["test-support"] }

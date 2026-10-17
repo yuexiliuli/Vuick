@@ -1,4 +1,4 @@
-//! 视频查看器视图：M2 = 无声播放器（首帧阅读 + 帧钟播放 + 播放/暂停/seek + 同文件夹切换）。
+﻿//! 视频查看器视图：M2 = 无声播放器（首帧阅读 + 帧钟播放 + 播放/暂停/seek + 同文件夹切换）。
 //!
 //! ## 播放模型（无音频，第一版）
 //! - **解码线程**：打开（或 seek 后重开）`VideoReader`，逐帧解码 BGRA 推入**有界**
@@ -69,6 +69,7 @@ use ui::motion::hover_spring;
 use super::audio::AudioSink;
 use super::decode::{AudioReader, VideoReader};
 use super::subtitle::{SubtitleEntry, SubtitleStyle, find_active_subtitle, parse_ass_text};
+use crate::hw::HwFrameCopier;
 
 use ::viewer::auto_hide;
 use ::viewer::folder::FolderNav;
@@ -220,6 +221,21 @@ fn seek_diag_slot() -> &'static std::sync::Mutex<Option<SeekDiag>> {
 /// seek 诊断会话号（每次 seek 命令递增，worker/tick 凭它对齐清理）。
 static SEEK_DIAG_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 测试探针：worker 最近一次打开读取器时硬解是否真正接管（无关 GUI/生产；bench 据此
+/// 区分「硬解命中」与「硬解打开失败回退软解」——后者打印 hw=0 便于对表）。
+#[cfg(test)]
+static HW_ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn hw_engaged() -> bool {
+    HW_ENGAGED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn hw_engaged_reset() {
+    HW_ENGAGED.store(false, Ordering::Relaxed);
+}
+
 /// 测试基准取数：tick 在「seek 首帧上屏」那刻把 8 字段快照（字段名/顺序/单位与 GUI [SEEK]
 /// 一行完全一致）沉淀到本测试线程槽，`bench_click_seek_land_frame_wall` 每次落点后取走即清。
 /// thread_local 避免全局槽跨测试线程竞争（每个 gpui::test 独立线程）；仅 cfg(test) 存在，
@@ -260,8 +276,56 @@ pub(crate) fn take_seek_diag_test() -> Option<(f64, u8, f64, u32, f64, f64, f64,
     })
 }
 
-/// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
-type FrameItem = (f64, u32, u32, Vec<u8>);
+/// 解码线程经通道传递的一帧：软解 BGRA 或 D3D11VA 硬件目标纹理（二选一）。
+enum FrameItem {
+    /// 软解 BGRA 帧（sws 转好、主线程包 `RenderImage` 上屏）。
+    Soft(SoftFrame),
+    /// D3D11VA 硬件帧（GPU 侧 NV12 拷贝后的 SRV-capable 目标纹理，零回读、无 sws；
+    /// `tex` 由主线程绘制，换帧后经 `hw_release_tx` 回 worker 回收复用）。
+    Hw(HwPayloadFrame),
+}
+
+/// 软解一帧。
+struct SoftFrame {
+    pts: f64,
+    w: u32,
+    h: u32,
+    bgra: Vec<u8>,
+}
+
+/// D3D11VA 硬件一帧（目标 NV12 纹理句柄 + 尺寸）。
+struct HwPayloadFrame {
+    pts: f64,
+    w: u32,
+    h: u32,
+    /// SRV-capable 目标纹理 `ID3D11Texture2D*`（转 usize；worker 池持有，主线程借用）。
+    tex: usize,
+}
+
+impl FrameItem {
+    fn pts(&self) -> f64 {
+        match self {
+            FrameItem::Soft(f) => f.pts,
+            FrameItem::Hw(f) => f.pts,
+        }
+    }
+}
+
+/// 主线程当前上屏的 D3D11VA 硬件帧（软解路径恒为 `None`）：`tex` 引用 worker 池里
+/// 的目标纹理，换帧/换媒体时须经 [`VideoViewer::release_hw_tex`] 送回 worker 回收。
+/// 尺寸/pts 不进结构：`intrinsic` 负责宽高比、`last_frame_pts`（test）负责回归断言。
+struct HwDisplayFrame {
+    tex: usize,
+}
+
+/// 常驻视频 worker 当前 reader 的解码模式（决定 open 路径与逐帧取帧路径）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ReaderMode {
+    /// 软解（sws 输出长边封顶 [`crate::decode::VideoReader`]）。
+    Soft(u32),
+    /// D3D11VA 硬件解码（零回读，无 sws）。
+    Hw,
+}
 
 /// hover 预解码产出的单帧缓存（解码 worker 线程产出、主线程装屏后即弃）。
 struct HoverFrame {
@@ -339,6 +403,14 @@ pub struct VideoViewer {
     focus_handle: gpui::FocusHandle,
     /// 当前上屏帧。
     frame: Option<Arc<RenderImage>>,
+    /// M2e：当前上屏的 D3D11VA 硬件帧（软解路径恒为 `None`；`render` 优先于软帧显示）。
+    hw_frame: Option<HwDisplayFrame>,
+    /// M2e：硬解目标纹理回收通道（主线程换帧时把旧 `tex` 发回 worker 池复用；软解纯会话
+    /// 恒不占用）。worker 一生一条，与解码命令通道同名同寿命。
+    hw_release_tx: Option<std::sync::mpsc::Sender<usize>>,
+    /// 测试探针：是否收到过（并装屏）D3D11VA 硬件帧（软解测试恒 false）。
+    #[cfg(test)]
+    hw_received: bool,
     /// 测试探针：最近一次 `drop_image` 释放掉的旧帧 `ImageId.0`（仅 test 编译，供
     /// 回归断言「替换只 drop 旧帧、当前帧留存」；运行态不占字段）。
     #[cfg(test)]
@@ -491,6 +563,10 @@ impl VideoViewer {
             path: path.clone(),
             focus_handle: cx.focus_handle(),
             frame: None,
+            hw_frame: None,
+            hw_release_tx: None,
+            #[cfg(test)]
+            hw_received: false,
             #[cfg(test)]
             dropped_frame: None,
             #[cfg(test)]
@@ -670,9 +746,17 @@ impl VideoViewer {
         self.served_hover_target = None;
         self.hover_generation.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
-        // 换掉旧接收端 → worker 若正阻塞在 send 会收到失联错误、本命令内层循环退出
-        self.overflow = None;
+        // 换掉旧接收端 → worker 若正阻塞在 send 会收到失联错误、本命令内层循环退出；
+        // 旧越线帧若是 HW 目标纹理一并释放回 worker 池（M2e）
+        self.clear_overflow();
         if let Some(old) = self.rx.replace(rx) {
+            // M2e 池回收：换代前吸干旧接收端里**尚未消费**的 HW 目标纹理发回 worker 池。
+            // 否则这些缓冲帧（≤DECODE_AHEAD_FRAMES）直接随 Receiver drop 丢失、池里永久
+            // in_use——同文件反复 seek 数次后池耗尽（"NV12 目标纹理池耗尽"），HW 解码中断。
+            // 主线程单线程执行，此刻无并行 tick，安全。
+            while let Ok(it) = old.try_recv() {
+                self.release_hw_tex_in(&it);
+            }
             drop(old);
         }
         self.pending_seek = Some(target);
@@ -714,8 +798,12 @@ impl VideoViewer {
         }
         let (tx, rx) = std::sync::mpsc::channel::<DecodeCmd>();
         let gen_arc = self.generation.clone();
-        std::thread::spawn(move || Self::video_worker(rx, gen_arc));
+        // M2e：硬解目标纹理回收通道（主线程换帧 → worker 池复用）。与解码命令通道同名同寿；
+        // 软解纯会话恒不产生消息，硬解会话 worker 每次拷贝前 `try_recv` 吸收。
+        let (hw_rel_tx, hw_rel_rx) = std::sync::mpsc::channel::<usize>();
+        std::thread::spawn(move || Self::video_worker(rx, gen_arc, hw_rel_rx));
         self.decode_cmd = Some(tx);
+        self.hw_release_tx = Some(hw_rel_tx);
     }
 
     /// 惰性启动常驻 hover 预解码 worker（一生一个；`hover_cmd` Sender 随 viewer Drop 弃、
@@ -733,48 +821,70 @@ impl VideoViewer {
 
     /// 常驻视频 worker 主循环：逐条执行命令（打开/复用 reader → seek → 解码推帧，
     /// 直到换代/EOF）。
+    ///
+    /// M2e：本机有 D3D11 设备（`gpui_platform::d3d11_device_context()`，真实 GUI 由
+    /// `attach_gpu` 发布、测试经 `set_d3d11_device_context_for_test` 注入）时**优先硬解**
+    ///（零回读 D3D11VA），硬解打开失败自动回落软解（绝不降级行为）；无设备恒软解。
     fn video_worker(
         rx: std::sync::mpsc::Receiver<DecodeCmd>,
         gen_arc: Arc<AtomicU64>,
+        hw_release_rx: std::sync::mpsc::Receiver<usize>,
     ) {
-        // 常驻 reader：同文件（path）+ 同显示 cap 的命令直接复用——seek 只做容器内定位
-        //（av_seek_frame + 解码器 flush），不重开文件；重开（avformat open + 解码器/sws
+        // 常驻 reader：同路径 + 同模式（软解 cap 或硬解）的命令直接复用——seek 只做容器内
+        // 定位（av_seek_frame + 解码器 flush），不重开文件；重开（avformat open + 解码器/sws
         // 初始化）在一次 seek 命令里可能几十 ms，是「点击进度条后画面要等片刻」的主因
-        //（探针实测 open_scaled≈57ms、复用 seek≈0ms）。换文件或 cap 变化（窗口缩放）
-        // 才重开。同一线程内串行使用，无并发；reader 非 Send，仅在本 worker 线程持有。
-        let mut active: Option<(std::path::PathBuf, u32, VideoReader)> = None;
-        // 常驻帧缓冲（worker 线程独占）：跨命令存活，零初始化只在扩容发生一次（按源顶格
-        // `source_cap`，任何解码输出 ≤ 源尺寸 → slice 上界恒安全），随后逐帧覆写复用——
-        // 消除每帧 `vec![0;N]` 的全零初始化热点（debug 3.69MB ≈ 5ms/帧，见
-        // crates/video/src/decode.rs `next_frame_bgra_into`）。送入通道的是其 `to_vec`
-        // 副本；换 reader（文件/解码尺寸变化）时缓冲会按新源顶格重新扩容。
+        //（探针实测 open_scaled≈57ms、复用 seek≈0ms）。换文件 / cap 变化（窗口缩放）/
+        // 硬软模式切换才重开。同一线程内串行使用，无并发；reader 非 Send，仅在本 worker
+        // 线程持有。
+        let mut active: Option<(std::path::PathBuf, ReaderMode, VideoReader, Option<HwFrameCopier>)> = None;
+        // 硬解打开失败过的路径记忆：同路径不再反复重试 HW open（直接回落软解、复用 reader），
+        // 换路径则重置再尝试——既保「硬解优先」，又不给软解降速（软解 seek 复用才跟手）。
+        let mut hw_failed_path: Option<std::path::PathBuf> = None;
+        // 常驻帧缓冲（worker 线程独占，仅软解用）：跨命令存活，零初始化只在扩容发生一次
+        //（按源顶格 `source_cap`），随后逐帧覆写复用；硬解不经回读缓冲，恒不触碰。
         let mut buf: Vec<u8> = Vec::new();
         while let Ok(cmd) = rx.recv() {
-            let same = matches!(&active, Some((p, c, _)) if *p == cmd.path && *c == cmd.cap);
+            // 模式：有 D3D11 设备 → 硬解优先；无，或该路径之前硬解打开失败 → 软解（cap 封顶）
+            if hw_failed_path.as_deref() != Some(&cmd.path) {
+                hw_failed_path = None; // 换文件：重新尝试硬解
+            }
+            let mode = if gpui_platform::d3d11_device_context().is_some()
+                && hw_failed_path.is_none()
+            {
+                ReaderMode::Hw
+            } else {
+                ReaderMode::Soft(cmd.cap)
+            };
+            let same = matches!(&active, Some((p, m, _, _)) if *p == cmd.path && *m == mode);
             if !same {
-                // decode-to-display：sws 输出长边封顶 `cmd.cap`（按显示尺寸自适应，省
-                // 内存带宽/上传；4K 源降载）；换文件/换 cap 才重开（同线程串行，无并发 FFmpeg）
-                let reader = match VideoReader::open_scaled(&cmd.path, cmd.cap) {
-                    Ok(r) => r,
+                // 打开（硬解优先、失败回落软解；两者都失败 → 报错跳过本命令）
+                match Self::open_reader_for_mode(&cmd.path, &mode, cmd.cap) {
+                    Ok((opened_mode, reader, copier)) => {
+                        // 硬解未遂回退软解：记住该路径，同路径后续直接软解复用 reader
+                        //（绝不反复重打包费 HW open）
+                        if opened_mode != mode {
+                            hw_failed_path = Some(cmd.path.clone());
+                        }
+                        if let Some(out) = &cmd.result_tx {
+                            let _ = out.send(Ok(reader.params()));
+                        }
+                        active = Some((cmd.path.clone(), opened_mode, reader, copier));
+                    }
                     Err(e) => {
                         if let Some(out) = &cmd.result_tx {
                             let _ = out.send(Err(e.to_string()));
                         }
                         continue;
                     }
-                };
-                if let Some(out) = &cmd.result_tx {
-                    let _ = out.send(Ok(reader.params()));
                 }
-                active = Some((cmd.path.clone(), cmd.cap, reader));
             } else if let Some(out) = &cmd.result_tx {
-                // 复用分支同样完成「打开成功」握手：同文件 + 同 cap 的重复加载（快速切回
-                // 刚在解码的同一支）不重开文件，但参数直接取常驻 reader——同文件同 cap
-                // 下参数必然不变。否则 `start` 的 result 通道等满 8s 超时、时长/帧率/尺寸
-                // 不填（loading 只关参数缺失），切换窗口期对撞时即触发。
+                // 复用分支同样完成「打开成功」握手：同文件+同模式（含同 cap）的重复加载
+                //（快速切回刚在解码的同一支）不重开文件，但参数直接取常驻 reader——同路径
+                // 同模式下参数必然不变。否则 `start` 的 result 通道等满 8s 超时、时长/帧率/
+                // 尺寸不填（loading 只关参数缺失），切换窗口期对撞时即触发。
                 let _ = out.send(Ok(active.as_ref().expect("复用分支已有 reader").2.params()));
             }
-            let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
+            let (_, _, reader, copier) = active.as_mut().expect("复用分支已确保有 reader");
             let _ = reader.seek(cmd.target);
             // seek 全链路探针（env 开或 test 构建采集，打印仍只按 env；本命仅 seek 命令开）：
             // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
@@ -791,50 +901,100 @@ impl VideoViewer {
             // 规则：落点前的预滚帧只保留最新一帧（≈落点前一帧，保证排空先有帧可上屏、
             // seek 到片尾有末帧回退），其余丢弃；越过落点的帧照常全送。
             let mut pre_roll: Option<FrameItem> = None;
-            // VPROF=1 拆账：解码（`_into` 覆写复用缓冲 + 帧产物 to_vec memcpy）与推帧背压
-            //（tx.send，bounded 通道满=主线程没在及时消费）的每帧墙钟，每 ~2s 打一行忙核。
+            // VPROF=1 拆账：解码（`_into` 覆写复用缓冲 + 帧产物 to_vec memcpy / 硬解
+            // GPU 拷贝）与推帧背压（tx.send，bounded 通道满=主线程没在及时消费）的每帧
+            // 墙钟，每 ~2s 打一行忙核。
             let vp_on = vprof_enabled();
             let mut vp_decode = Duration::ZERO;
             let mut vp_send = Duration::ZERO;
             let mut vp_frames: u64 = 0;
             let mut vp_window = Instant::now();
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
-                // 扩容目标：始终按源顶格（source_cap）兜底——任何解码输出 ≤ 源尺寸，
-                // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
-                // 只在扩容瞬间发生一次，逐帧不重置。
-                if buf.len() < reader.source_cap() {
-                    buf.resize(reader.source_cap(), 0);
-                }
                 let t0 = Instant::now();
-                // 复用持久缓冲 `_into`（零初始化只在扩容时发生一次）；帧产物
-                // `buf[..need].to_vec()`（一次 memcpy、无逐帧 memset）计入 decode 窗——与旧版
-                // `next_frame_bgra` 的「内部 vec![0;N]+sws 写入」口径对齐，VPROF 才可比。
-                let item = match reader.next_frame_bgra_into(&mut buf[..]) {
-                    Ok(Some((pts, w, h))) => {
-                        let need = (w as usize) * (h as usize) * 4;
-                        // 不做 `truncate`：它只缩短 len、不释放容量（顶格内存照样驻留），
-                        // 反而把下次 `_into` 的上界从恒安全的 source_cap 缩成上一帧 need——
-                        // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
-                        // 断代）。保持 len=source_cap，need 只用于本帧 to_vec 切片。
-                        Ok(Some((pts, w, h, buf[..need].to_vec())))
+                let item = if let Some(copier) = copier.as_mut() {
+                    // ---- M2e：D3D11VA 硬件路径（零回读 GPU 直通）----
+                    // 先把主线程换帧释放的目标纹理吸回池（本帧拷贝前再吸一次）
+                    while let Ok(tex) = hw_release_rx.try_recv() {
+                        copier.recycle(tex);
                     }
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(e),
+                    match reader.next_frame_hw() {
+                        Ok(Some(frame)) => {
+                            let (pts, w, h) = (frame.pts, frame.w, frame.h);
+                            // GPU 侧 NV12 拷贝（Y/UV 两平面）→ SRV-capable 目标纹理
+                            let copied = match copier.copy(w, h, frame.tex, frame.array_index) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    eprintln!("[video] GPU NV12 拷贝失败: {e:#}");
+                                    // 硬拷贝持续失败（如 10-bit P010 帧、设备异常）：记下该
+                                    // 路径 → 后续命令直接软解复用 reader，不再反复重打包贵 HW
+                                    // open；本代以错误结束（画面保留最近上屏帧，不花屏）。
+                                    hw_failed_path = Some(cmd.path.clone());
+                                    None
+                                }
+                            };
+                            // 无论拷贝成败：立即归还解码器帧池槽位（headroom ≈1-2 帧，
+                            // 不释放持续解码会耗尽帧池）
+                            crate::decode::VideoReader::release_hw_frame(frame.frame_ptr);
+                            match copied {
+                                Some(c) => Ok(Some(FrameItem::Hw(HwPayloadFrame {
+                                    pts,
+                                    w: c.w,
+                                    h: c.h,
+                                    tex: c.tex,
+                                }))),
+                                None => Err(anyhow::anyhow!("GPU NV12 拷贝失败")),
+                            }
+                        }
+                        Ok(None) => Ok(None), // EOF（之后可再 seek 复用）
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    // ---- 软解路径（与旧版逐帧同口径）----
+                    // 扩容目标：始终按源顶格（source_cap）兜底——任何解码输出 ≤ 源尺寸，
+                    // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
+                    // 只在扩容瞬间发生一次，逐帧不重置。
+                    if buf.len() < reader.source_cap() {
+                        buf.resize(reader.source_cap(), 0);
+                    }
+                    // 复用持久缓冲 `_into`（零初始化只在扩容时发生一次）；帧产物
+                    // `buf[..need].to_vec()`（一次 memcpy、无逐帧 memset）计入 decode 窗——
+                    // 与旧版 `next_frame_bgra` 的「内部 vec![0;N]+sws 写入」口径对齐，VPROF
+                    // 才可比。
+                    match reader.next_frame_bgra_into(&mut buf[..]) {
+                        Ok(Some((pts, w, h))) => {
+                            let need = (w as usize) * (h as usize) * 4;
+                            // 不做 `truncate`：它只缩短 len、不释放容量（顶格内存照样驻留），
+                            // 反而把下次 `_into` 的上界从恒安全的 source_cap 缩成上一帧 need——
+                            // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
+                            // 断代）。保持 len=source_cap，need 只用于本帧 to_vec 切片。
+                            Ok(Some(FrameItem::Soft(SoftFrame {
+                                pts,
+                                w,
+                                h,
+                                bgra: buf[..need].to_vec(),
+                            })))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(e),
+                    }
                 };
                 let t1 = Instant::now();
                 // 回退量：第一个被解码的帧 pts − target（负值越大 = 从越早的关键帧预滚解起）
                 if seek_diag_on {
-                    if let Ok(Some((fp, ..))) = &item {
+                    if let Ok(Some(frame)) = &item {
                         if seek_first_decoded {
                             seek_first_decoded = false;
-                            seek_regress = fp - cmd.target;
+                            seek_regress = frame.pts() - cmd.target;
                         }
                     }
                 }
                 let keep = match item {
-                    Ok(Some(frame)) if frame.0 >= cmd.target => {
+                    Ok(Some(frame)) if frame.pts() >= cmd.target => {
                         if let Some(p) = pre_roll.take() {
-                            let _ = cmd.tx.send(p); // 落点前一帧保底（排空先有帧可上屏）
+                            // 落点前一帧保底（排空先有帧可上屏）；HW 帧发送失败须回池
+                            if let Err(e) = cmd.tx.send(p) {
+                                Self::recycle_hw_item(copier, &e.0);
+                            }
                         }
                         // seek 探针写槽（每个 seek 一次）：此刻预滚数/回退量已定，
                         // 把解码阶段数据落进共享槽，供 tick 首帧落地时聚合打印。
@@ -860,23 +1020,37 @@ impl VideoViewer {
                                     reuse: same,
                                     regress: seek_regress,
                                     skipped: seek_skipped,
-                                    firstpts: frame.0,
+                                    firstpts: frame.pts(),
                                 });
                             }
                         }
-                        cmd.tx.send(frame).is_ok()
+                        // 发送成功（主线程接收）或换代（接收端已换走）：后者帧被丢弃，
+                        // HW 目标纹理须回池，否则池只进不出
+                        match cmd.tx.send(frame) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                Self::recycle_hw_item(copier, &e.0);
+                                false
+                            }
+                        }
                     }
                     Ok(Some(frame)) => {
                         if seek_diag_on {
                             seek_skipped += 1; // 预滚丢弃计数（pre_roll 分支只留最新一帧）
                         }
-                        pre_roll = Some(frame); // 预滚（pts<落点）：只记最新一帧，不送
+                        // 预滚（pts<落点）：只记最新一帧，不送；被替换的旧预滚若为 HW
+                        // 目标纹理须回收（否则池只进不出）
+                        if let Some(prev) = pre_roll.replace(frame) {
+                            Self::recycle_hw_item(copier, &prev);
+                        }
                         true
                     }
                     Ok(None) => {
                         // EOF 且一帧未过落点（seek 到片尾外）：回退最后预滚帧，不黑屏/不挂泵
                         if let Some(p) = pre_roll.take() {
-                            let _ = cmd.tx.send(p);
+                            if let Err(e) = cmd.tx.send(p) {
+                                Self::recycle_hw_item(copier, &e.0);
+                            }
                         }
                         false
                     }
@@ -908,11 +1082,66 @@ impl VideoViewer {
                     // 前一帧」尽力送出，让 pump 在 EOF/出错时至少有一帧上屏。`try_send`：
                     // 接收端已换走/通道满都立刻失败（=丢弃），不阻塞 worker。
                     if let Some(p) = pre_roll.take() {
-                        let _ = cmd.tx.try_send(p);
+                        match cmd.tx.try_send(p) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let item = match e {
+                                    std::sync::mpsc::TrySendError::Full(i)
+                                    | std::sync::mpsc::TrySendError::Disconnected(i) => i,
+                                };
+                                Self::recycle_hw_item(copier, &item);
+                            }
+                        }
                     }
                     break; // 接收端已被换代/弃用
                 }
             }
+        }
+    }
+
+    /// 按模式打开 reader（硬解优先、失败回落软解，绝不降级行为）：
+    /// 返回 `(实际模式, reader, 硬解拷贝引擎)`；`copier` 仅在硬解模式下为 `Some`。
+    /// 软解与硬解（含回落）都失败才 `Err`。
+    fn open_reader_for_mode(
+        path: &std::path::Path,
+        mode: &ReaderMode,
+        cap: u32,
+    ) -> anyhow::Result<(ReaderMode, VideoReader, Option<HwFrameCopier>)> {
+        match mode {
+            ReaderMode::Hw => {
+                // 命令排队期间设备可能消失（竞态）：退化为软解
+                let Some((device, ctx)) = gpui_platform::d3d11_device_context() else {
+                    return VideoReader::open_scaled(path, cap)
+                        .map(|r| (ReaderMode::Soft(cap), r, None));
+                };
+                match VideoReader::open_hw(path, device, ctx) {
+                    Ok(r) => {
+                        #[cfg(test)]
+                        HW_ENGAGED.store(true, Ordering::Relaxed);
+                        Ok((ReaderMode::Hw, r, Some(HwFrameCopier::new(device, ctx))))
+                    }
+                    Err(e) => {
+                        // 驱动不支持 / 解码器不支持硬解：回落软解（行为与旧版逐字一致）
+                        eprintln!("[video] D3D11VA 硬解打开失败，回退软解：{e:#}");
+                        #[cfg(test)]
+                        HW_ENGAGED.store(false, Ordering::Relaxed);
+                        VideoReader::open_scaled(path, cap)
+                            .map(|r| (ReaderMode::Soft(cap), r, None))
+                    }
+                }
+            }
+            ReaderMode::Soft(cap) => {
+                #[cfg(test)]
+                HW_ENGAGED.store(false, Ordering::Relaxed);
+                VideoReader::open_scaled(path, *cap).map(|r| (ReaderMode::Soft(*cap), r, None))
+            }
+        }
+    }
+
+    /// 丢弃一个未送达主线程的 HW `FrameItem`：把目标纹理回池（主线程从未拥有它）。
+    fn recycle_hw_item(copier: &mut Option<HwFrameCopier>, item: &FrameItem) {
+        if let (Some(c), FrameItem::Hw(h)) = (copier, item) {
+            c.recycle(h.tex);
         }
     }
 
@@ -1198,8 +1427,12 @@ impl VideoViewer {
                 }
             };
             match item {
-                Some((pts, w, h, bgra)) if pts <= self.playhead => {
-                    latest = Some((pts, w, h, bgra));
+                Some(item) if item.pts() <= self.playhead => {
+                    // 先到的帧被更新的帧顶掉：HW 目标纹理释放回 worker 池
+                    //（软帧为纯字节，`release_hw_tex_in` 对 Soft 是 no-op）
+                    if let Some(prev) = latest.replace(item) {
+                        self.release_hw_tex_in(&prev);
+                    }
                 }
                 Some(item) => {
                     self.overflow = Some(item);
@@ -1208,11 +1441,22 @@ impl VideoViewer {
                 None => break,
             }
         }
-        let new_frame = if let Some((_pts, w, h, bgra)) = latest {
-            self.install_bgra(w, h, bgra, cx);
-            #[cfg(test)]
-            {
-                self.last_frame_pts = Some(_pts);
+        let new_frame = if let Some(item) = latest {
+            match item {
+                FrameItem::Soft(f) => {
+                    self.install_bgra(f.w, f.h, f.bgra, cx);
+                    #[cfg(test)]
+                    {
+                        self.last_frame_pts = Some(f.pts);
+                    }
+                }
+                FrameItem::Hw(f) => {
+                    self.install_hw(f.pts, f.w, f.h, f.tex, cx);
+                    #[cfg(test)]
+                    {
+                        self.last_frame_pts = Some(f.pts);
+                    }
+                }
             }
             self.pending_seek = None; // 落点已上屏（首个可用帧）
             true
@@ -1548,6 +1792,11 @@ impl VideoViewer {
         if let Some(old) = self.frame.replace(new) {
             self.drop_old_frame(old, cx);
         }
+        // 模式切换安全网：硬解帧残留（上一代遗留）在新软帧装屏时一并清掉并回收纹理。
+        // 稳态软解会话此处恒 no-op。
+        if let Some(old) = self.hw_frame.take() {
+            self.release_hw_tex(old.tex);
+        }
         self.intrinsic.get_or_insert((w as f32, h as f32));
         if vprof_enabled() {
             VPROF_PRESENT.with(|acc| {
@@ -1564,6 +1813,47 @@ impl VideoViewer {
         }
     }
 
+    /// M2e：把 D3D11VA 硬件帧（worker 已 GPU 拷好的 SRV-capable 目标纹理）装屏。
+    /// 旧 HW 帧被替换后经 [`Self::release_hw_tex`] 发回 worker 池复用；软帧残留（跨模式
+    /// 切换）一并清掉并释放图集 tile。`intrinsic` 取目标纹理实际宽高（硬解无 sws，即源尺寸）。
+    fn install_hw(&mut self, _pts: f64, w: u32, h: u32, tex: usize, cx: &mut Context<Self>) {
+        let new = HwDisplayFrame { tex };
+        if let Some(old) = self.hw_frame.replace(new) {
+            self.release_hw_tex(old.tex);
+        }
+        // HW 与软帧互斥：软帧残留（模式切换）清掉并释放图集 tile（同 install_bgra 延迟姿势）
+        if let Some(old) = self.frame.take() {
+            self.drop_old_frame(old, cx);
+        }
+        self.intrinsic.get_or_insert((w as f32, h as f32));
+        #[cfg(test)]
+        {
+            self.hw_received = true;
+        }
+    }
+
+    /// 把主线程不再显示的目标纹理发回 worker 池复用（worker 每次硬解拷贝前吸收；
+    /// worker 已退出 / 纯软解会话时 Sender 已弃 → 静默 no-op，纹理随 worker 的池一起释放）。
+    fn release_hw_tex(&self, tex: usize) {
+        if let Some(tx) = &self.hw_release_tx {
+            let _ = tx.send(tex);
+        }
+    }
+
+    /// 清空 `overflow`（换代 / 切文件共用）：HW 越线帧的目标纹理一并释放回 pool。
+    fn clear_overflow(&mut self) {
+        if let Some(item) = self.overflow.take() {
+            self.release_hw_tex_in(&item);
+        }
+    }
+
+    /// 释放一个未装屏 FrameItem 里的 HW 目标纹理（软帧为纯字节，无资源要放）。
+    fn release_hw_tex_in(&self, item: &FrameItem) {
+        if let FrameItem::Hw(h) = item {
+            self.release_hw_tex(h.tex);
+        }
+    }
+
     /// 关闭当前媒体、打开 `nav[current]`（同文件夹切换共用）。
     fn open_folder_index(&mut self, idx: usize, cx: &mut Context<Self>) {
         if self.nav.set_current(idx).is_none() {
@@ -1571,9 +1861,13 @@ impl VideoViewer {
         }
         self.path = self.nav.item(idx).expect("set_current 已校验越界");
         // 切文件：旧媒体最后一帧的图集 tile 一并显式释放（与 install_bgra 同款 P0 姿势，
-        // 否则切换 Playlist 多支时每切一次漏一片 tile）。
+        // 否则切换 Playlist 多支时每切一次漏一片 tile）；M2e：HW 上屏帧的目标纹理同样
+        // 释放回 worker 池（worker 换文件会重开 reader/重建池，旧世代纹理随其释放）。
         if let Some(old) = self.frame.take() {
             self.drop_old_frame(old, cx);
+        }
+        if let Some(old) = self.hw_frame.take() {
+            self.release_hw_tex(old.tex);
         }
         self.intrinsic = None;
         self.loading = true;
@@ -1583,7 +1877,7 @@ impl VideoViewer {
         self.duration = 1.0;
         self.fps = None;
         self.last_tick = None;
-        self.overflow = None;
+        self.clear_overflow();
         self.pending_seek = None;
         self.zoom = 1.0; // 切文件：缩放复位为适应视口
         self.pan = (0.0, 0.0); // 平移同步归零（拖拽中的惯性也清掉）
@@ -2703,8 +2997,40 @@ impl Render for VideoViewer {
         let body: gpui::AnyElement = if let Some(err) = &self.load_error {
             Self::placeholder(&format!("无法打开视频：{err}"), muted, cx)
         } else {
-            match (self.frame.clone(), self.intrinsic) {
-                (Some(render), Some((iw, ih))) => {
+            match (self.hw_frame.as_ref(), self.frame.clone(), self.intrinsic) {
+                // M2e：D3D11VA 硬件帧——canvas paint 里调 `paint_external_yuv`（外部 NV12
+                // 纹理直接走 vendored YUV→BGRA 管线，CPU 零回读/零 sws）。bounds 取与软图
+                // 同款 contain×缩放×平移后的像素框。
+                (Some(hf), _, Some((iw, ih))) => {
+                    let (dw, dh) = Self::contain_fit(iw, ih, vw, area_h);
+                    let (dw, dh) = (dw * self.zoom, dh * self.zoom);
+                    self.pan = Self::clamp_pan(self.pan, vw, area_h, dw, dh);
+                    let (ox, oy) = ((vw - dw) * 0.5 + self.pan.0, (area_h - dh) * 0.5 + self.pan.1);
+                    vrect = (ox, oy, dw, dh);
+                    let tex = hf.tex;
+                    let tex_size = gpui::Size { width: px(iw.max(1.0)), height: px(ih.max(1.0)) };
+                    gpui::canvas(
+                        move |_, _, _| (),
+                        move |bounds, (), window, _cx| {
+                            // 测试探针：paint_external_yuv 真的收到本帧 tex（production 为 no-op）
+                            crate::hw::record_hw_paint(tex);
+                            window.paint_external_yuv(
+                                bounds,
+                                gpui::Corners::default(),
+                                tex,
+                                0,
+                                tex_size,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .left(px(ox))
+                    .top(px(oy))
+                    .w(px(dw))
+                    .h(px(dh))
+                    .into_any_element()
+                }
+                (_, Some(render), Some((iw, ih))) => {
                     // 手动 contain 适配 × 缩放（绝对定位 + 显式像素框，**不用 100% 尺寸**）：
                     // 竖屏/横屏都等比缩放居中，不会因 flex 子级百分比高度失效而按固有
                     // 尺寸放大只露局部（对齐 ImageViewer 的 display_size 姿势）。放大超出
@@ -2725,10 +3051,10 @@ impl Render for VideoViewer {
                         .h(px(dh))
                         .into_any_element()
                 }
-                (_, _) if self.playing || self.loading => {
+                (_, _, _) if self.playing || self.loading => {
                     Self::placeholder("正在打开视频…", muted, cx)
                 }
-                _ => Self::placeholder("暂停", muted, cx),
+                (_, _, _) => Self::placeholder("暂停", muted, cx),
             }
         };
 
@@ -2933,6 +3259,10 @@ mod tests {
             path,
             focus_handle: cx.focus_handle(),
             frame: None,
+            hw_frame: None,
+            hw_release_tx: None,
+            #[cfg(test)]
+            hw_received: false,
             #[cfg(test)]
             dropped_frame: None,
             #[cfg(test)]
@@ -2996,7 +3326,12 @@ mod tests {
     }
 
     fn frame_of(pts: f64, v: u8) -> FrameItem {
-        (pts, 320, 240, vec![v; (320 * 240 * 4) as usize])
+        FrameItem::Soft(SoftFrame {
+            pts,
+            w: 320,
+            h: 240,
+            bgra: vec![v; (320 * 240 * 4) as usize],
+        })
     }
 
     /// delta 回归（音频 worker 复用）：常驻 `AudioReader` 连续 seek 回不同落点，每次重新
@@ -3748,6 +4083,233 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// M2e：性能基准（纯代码、不开 GUI，真硬解 + 真墙钟）——D3D11VA 零回读 seek 延迟。
+    /// 自建 D3D11 设备（硬件优先 → WARP 兜底）经 `set_d3d11_device_context_for_test`
+    /// 注入 → worker 走硬解（GPU 侧 NV12 拷贝，**无回读/无 sws**）→ 跑与
+    /// `bench_click_seek_land_frame_wall` 同构的深 GOP 落点（含重回退 ≈−9s 与同点复用），
+    /// 墙钟从请求到首帧 ≥ 落点上屏，断言 `firstpts ≥ target`（decode-only、无 readback）。
+    /// [SEEKBENCHHW] 与 GUI [SEEK] 同 8 字段/同序/同单位 + `hw=` 标志（1=硬解接管、
+    /// 0=硬解打开失败回落软解——后者数字与其软解基准同量级，便于对表）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn bench_seek_hw_d3d11_wall(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = crate::hw::make_test_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用（无 GPU 环境跑不了硬解基准）");
+            return;
+        };
+        let (raw_dev, raw_ctx) = crate::hw::test_device_raw(&dev);
+        // 注入测试设备：模拟真实 GUI 的 attach_gpu（无窗口也能拿设备跑 D3D11VA）
+        gpui_platform::set_d3d11_device_context_for_test(Some((raw_dev, raw_ctx)));
+        // 复位守卫：任何返回路径（含 `?`/panic 中断的 await）都清掉注入，防污染后续软解测试
+        struct DeviceReset;
+        impl Drop for DeviceReset {
+            fn drop(&mut self) {
+                gpui_platform::set_d3d11_device_context_for_test(None);
+            }
+        }
+        let _reset = DeviceReset;
+        hw_engaged_reset();
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                (v.frame.is_some() || v.hw_frame.is_some())
+                    && v.duration > 1.0
+                    && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 HW 首帧/时长超时");
+        }
+        eprintln!(
+            "[SEEKBENCHHW] 设备={} 硬解接管={}",
+            dev.kind,
+            if hw_engaged() { 1 } else { 0 }
+        );
+        let duration = cx.update(|app| viewer.read(app).duration);
+        // 深 GOP 落点（hover 基准实测深回退 regress≈−5.3/−9.9/−10.2/−3.0s）+ 末位同点复用
+        let raw = [191.0f64, 354.0, 447.0, 1335.0, 354.0];
+        let hi = (duration - 2.0).max(0.05);
+        let mut rows: Vec<(f64, f64)> = Vec::with_capacity(raw.len());
+        for &sec in &raw {
+            let sec = sec.clamp(0.05, hi);
+            let fraction = (sec / duration).clamp(0.0, 1.0) as f32;
+            let t0 = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let target = cx.update(|app| viewer.read(app).playhead);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let landed = loop {
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "HW seek 落点帧上屏超时（target={target:.2}s）"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let firstpts = landed.expect("HW seek 首帧应上屏");
+            assert!(
+                firstpts >= target,
+                "HW seek 首帧不得早于落点 target={target:.2}s firstpts={firstpts:.2}s"
+            );
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            // 与 GUI [SEEK] 直接对表：取 tick 沉淀的 8 字段快照（seek2first ≈ 硬解解码段墙钟）
+            let (total, reuse, regress, skipped, s2f, f2s, tgt, fp) = match take_seek_diag_test() {
+                Some(x) => x,
+                None => (ms, 1u8, f64::NAN, 0u32, ms, 0.0, target, firstpts),
+            };
+            rows.push((target, total));
+            eprintln!(
+                "[SEEKBENCHHW] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s hw={}",
+                total, reuse, regress, skipped, s2f, f2s, tgt, fp, if hw_engaged() { 1 } else { 0 },
+            );
+        }
+        let mut sorted: Vec<f64> = rows.iter().map(|r| r.1).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[SEEKBENCHHW] 摘要 n={} min={:.1}ms median={:.1}ms max={:.1}ms（total 口径，hw={}）",
+            sorted.len(),
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+            if hw_engaged() { 1 } else { 0 },
+        );
+        cx.run_until_parked();
+    }
+
+    /// M2e：注入设备时 HW 帧往返进「场景」——无窗口实体打开长 GOP 夹具，等首 HW 帧上屏并
+    /// 步进 60 帧（0.5s/步，远超帧池容量 20）：断言 pts 单调、不崩——worker「拷贝后立即
+    /// release 槽位」→ 帧池循环复用，绝不触发 "Static surface pool size exceeded"。随后开
+    /// 测试窗口承载同一 viewer 并强制 draw：canvas paint 回调里 `paint_external_yuv` 收到
+    /// 当前 HW 目标纹理（探针断言 tex 相等、array_index 恒 0 = 单切片目标纹理）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn hw_frame_roundtrips_into_scene(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = crate::hw::make_test_d3d11_device() else {
+            eprintln!("SKIP: D3D11 硬件/WARP 设备均不可用");
+            return;
+        };
+        let (raw_dev, raw_ctx) = crate::hw::test_device_raw(&dev);
+        gpui_platform::set_d3d11_device_context_for_test(Some((raw_dev, raw_ctx)));
+        struct DeviceReset;
+        impl Drop for DeviceReset {
+            fn drop(&mut self) {
+                gpui_platform::set_d3d11_device_context_for_test(None);
+            }
+        }
+        let _reset = DeviceReset;
+        hw_engaged_reset();
+        // 无窗口实体打开（与既有基准同姿势；worker 真硬解）
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| viewer.read(app).hw_frame.is_some())
+                && cx.update(|app| viewer.read(app).duration > 1.0)
+                && cx.update(|app| viewer.read(app).pending_seek.is_none());
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 HW 首帧上屏超时");
+        }
+        assert!(hw_engaged(), "注入设备时 worker 应进入硬解");
+        // 解码器持续出帧：步进 60 帧（0.5s/步 → 远超 20 槽帧池）→ 拷贝后立即 release 保证
+        // 帧池循环复用（无 "Static surface pool size exceeded"）
+        let mut last_pts = -1.0f64;
+        let mut advanced = 0u32;
+        for _ in 0..60 {
+            viewer.update(cx, |v, cx| {
+                v.playhead += 0.5;
+                let _ = v.tick(cx);
+            });
+            // 让真解码线程有空逐帧出帧（fake 时钟只推进调度，worker 是真实线程）
+            cx.background_executor.timer(Duration::from_millis(8)).await;
+            let pts = cx
+                .update(|app| viewer.read(app).last_frame_pts)
+                .unwrap_or(last_pts);
+            assert!(
+                pts >= last_pts - 1e-6,
+                "HW 帧 pts 应单调: {pts:.2} < {last_pts:.2}"
+            );
+            last_pts = pts;
+            advanced += 1;
+        }
+        let current_tex = cx
+            .update(|app| viewer.read(app).hw_frame.as_ref().map(|f| f.tex))
+            .expect("HW 帧仍在屏，应有目标纹理");
+        // 开测试窗口承载同一 viewer 并强制 draw：canvas paint 回调调 paint_external_yuv 写探针
+        struct ViewerHost {
+            viewer: gpui::Entity<VideoViewer>,
+        }
+        impl gpui::Render for ViewerHost {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                self.viewer.clone()
+            }
+        }
+        let (_host, vcx) = cx.add_window_view(|_window, _cx| ViewerHost {
+            viewer: viewer.clone(),
+        });
+        vcx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        let probe_tex = crate::hw::take_hw_paint_probe();
+        assert_ne!(
+            probe_tex, 0,
+            "paint_external_yuv 应在 canvas paint 里被调用（探针记录 tex）"
+        );
+        assert_eq!(
+            probe_tex, current_tex,
+            "外部 YUV 精灵应使用当前 HW 上屏纹理（probe={probe_tex:#x} vs 当前 {current_tex:#x}）"
+        );
+        eprintln!(
+            "[HW roundtrip] 设备={} 探针 tex={probe_tex:#x} 步进 {advanced} 帧 pts 单调至 {last_pts:.2}s（帧池循环复用）",
+            dev.kind
+        );
+        cx.run_until_parked();
+    }
+
     /// 性能基准（纯代码、不开 GUI，真解码 + 真墙钟）：M0 hover 预解码 —— 对同一组（含深 GOP）
     /// 落点先量「无悬停基线」（= 正常点击 seek 全量解码墙钟，同 `bench_click_seek_land_frame_wall`
     /// 链路），再量「暂停 → 悬停该落点 → 等后台预解码缓存抵达 → 点击」的端到端墙钟。缓存命中时
@@ -3900,7 +4462,7 @@ mod tests {
         });
         let s = cx.update(|app| {
             let v = ent.read(app);
-            (v.frame.is_some(), v.overflow.as_ref().map(|f| f.0))
+            (v.frame.is_some(), v.overflow.as_ref().map(|f| f.pts()))
         });
         assert!(s.0, "应有帧上屏");
         assert_eq!(s.1, Some(1.5), "越线帧保留在 overflow");
@@ -3910,7 +4472,7 @@ mod tests {
             v.playhead = 1.55;
             v.tick(cx);
         });
-        let o = cx.update(|app| ent.read(app).overflow.as_ref().map(|f| f.0));
+        let o = cx.update(|app| ent.read(app).overflow.as_ref().map(|f| f.pts()));
         assert_eq!(o, Some(1.6), "越过旧 overflow 后新越线帧进位");
         cx.run_until_parked();
     }

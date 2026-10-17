@@ -58,6 +58,16 @@ pub fn d3d11_device_context() -> Option<(usize, usize)> {
     *D3D11_DEVICE_CONTEXT.read()
 }
 
+/// 测试注入：把外部（测试自建）D3D11 设备/设备上下文的裸指针写入进程级全局量，供
+/// headless 测试在无真实 GUI（`attach_gpu` 未执行，测试平台恒 None）时模拟
+/// `attach_gpu` 的发布，让 `crates/video` 的 D3D11VA 硬件解码路径可无窗口实测。
+/// 传 `None` 复位。仅供测试构建注入，正常构建该符号不存在（不污染生产 API 面）。
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_d3d11_device_context_for_test(v: Option<(usize, usize)>) {
+    *D3D11_DEVICE_CONTEXT.write() = v;
+}
+
 struct TrackedWindow {
     handle: SafeHwnd,
     frame_signal: Arc<PlatformFrameSignal>,

@@ -2391,6 +2391,25 @@ mod tests {
         }
     }
 
+    /// M2e 生产路径回归：M2e 拷贝引擎的目标纹理是 **ArraySize=1 非数组** NV12（解码器数组
+    /// 纹理的阵元被逐帧拷进单切片目标纹理），外部 YUV 渲染仍以 `Texture2DArray`（
+    /// FirstArraySlice=0 / ArraySize=1 / PlaneSlice）建平面 SRV。D3D11 对平面格式资源允许
+    /// 1 片数组视图——实测（WARP 可复现）该 `CreateShaderResourceView1` 成功；若失败则 M2e
+    /// 的 `external_views` 返回空视图、hardware 画面在真实 GUI 直接不渲染，本测兜底。
+    #[test]
+    fn test_external_yuv_plane_srvs_nonarray() {
+        let Some((device, _context)) = create_test_device() else {
+            return;
+        };
+        let Some(texture) = create_nv12_texture(&device, 1) else {
+            return;
+        };
+        let Some([y_view, uv_view]) = super::create_external_yuv_views(&device, &texture, 0) else {
+            panic!("CreateShaderResourceView1 对 ArraySize=1 非数组 NV12 失败（M2e 目标纹理路径不可用）");
+        };
+        assert!(y_view.is_some() && uv_view.is_some(), "两平面 SRV 都应创建成功");
+    }
+
     /// 静态编译验证 `external_yuv_*` HLSL 入口（与 debug 运行时 / release fxc 同源的
     /// D3DCompileFromFile 前端），无 GUI 也能兜住着色器语法错误（含 GetDimensions、
     /// BT.709 换算与中文注释编码）。
