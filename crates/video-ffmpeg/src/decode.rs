@@ -752,15 +752,29 @@ mod tests {
     use super::*;
     use anyhow::Context as _;
 
+    /// 视频夹具：§5 手动装配（不入库），320×240 / 2s@30fps / H.264(yuv420p)+AAC 2ch/48k，
+    /// 关键帧间隔 15 帧（seek(1.0) 贴近落点满足 `|pts-1.0|<0.15`）。
     fn fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures")
+            .join("../../target")
             .join("video测试.mp4")
+    }
+
+    /// 缺夹具时 SKIP 不 FAIL（媒体夹具不入库，同 viewer 约定）；返回已存在的路径。
+    macro_rules! fixture_or_skip {
+        () => {{
+            let p = fixture();
+            if !p.exists() {
+                eprintln!("SKIP: missing target/video测试.mp4（媒体夹具不入库，手动装配）");
+                return;
+            }
+            p
+        }};
     }
 
     #[test]
     fn open_reads_params() {
-        let r = VideoReader::open(&fixture()).unwrap();
+        let r = VideoReader::open(&fixture_or_skip!()).unwrap();
         let p = r.params();
         assert_eq!((p.width, p.height), (320, 240));
         assert!((1.9..=2.5).contains(&p.duration), "duration={}", p.duration);
@@ -771,7 +785,7 @@ mod tests {
     /// 逐帧输出与内存按输出尺寸走；`params()` 仍报源宽高供显示适配。
     #[test]
     fn open_scaled_caps_longest_side_and_keeps_source_params() {
-        let mut r = VideoReader::open_scaled(&fixture(), 160).unwrap();
+        let mut r = VideoReader::open_scaled(&fixture_or_skip!(), 160).unwrap();
         let p = r.params();
         assert_eq!((p.width, p.height), (320, 240), "params 保持源尺寸");
         let (pts, w, h, bgra) = r.next_frame_bgra().unwrap().expect("缩放后应出帧");
@@ -783,9 +797,9 @@ mod tests {
     /// 封顶 ≥ 源长边时与全尺寸一致（320×240 原样）。
     #[test]
     fn open_scaled_with_huge_cap_is_identity() {
-        let r = VideoReader::open_scaled(&fixture(), 4096).unwrap();
-        assert_eq!(r.params(), VideoReader::open(&fixture()).unwrap().params());
-        let mut r = VideoReader::open_scaled(&fixture(), 4096).unwrap();
+        let r = VideoReader::open_scaled(&fixture_or_skip!(), 4096).unwrap();
+        assert_eq!(r.params(), VideoReader::open(&fixture_or_skip!()).unwrap().params());
+        let mut r = VideoReader::open_scaled(&fixture_or_skip!(), 4096).unwrap();
         let (w, h) = { let f = r.next_frame_bgra().unwrap().unwrap(); (f.1, f.2) };
         assert_eq!((w, h), (320, 240), "封顶超源应按源尺寸输出");
     }
@@ -802,7 +816,7 @@ mod tests {
 
     #[test]
     fn next_frame_pts_are_monotonic() {
-        let mut r = VideoReader::open(&fixture()).unwrap();
+        let mut r = VideoReader::open(&fixture_or_skip!()).unwrap();
         let p = r.params();
         let mut last = -1.0f64;
         for i in 0..24 {
@@ -817,7 +831,7 @@ mod tests {
 
     #[test]
     fn seek_lands_near_target() {
-        let mut r = VideoReader::open(&fixture()).unwrap();
+        let mut r = VideoReader::open(&fixture_or_skip!()).unwrap();
         r.seek(1.0).unwrap();
         let (pts, ..) = r.next_frame_bgra().unwrap().expect("seek 后应出帧");
         // 回拉关键帧最多落后一点；testsrc 全 intraframe 应贴近
@@ -826,7 +840,7 @@ mod tests {
 
     #[test]
     fn reaches_eof_then_seek_reuses() {
-        let mut r = VideoReader::open(&fixture()).unwrap();
+        let mut r = VideoReader::open(&fixture_or_skip!()).unwrap();
         let mut n = 0;
         while r.next_frame_bgra().unwrap().is_some() {
             n += 1;
@@ -846,13 +860,25 @@ mod tests {
 
     fn audio_fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../fixtures")
+            .join("../../target")
             .join("video测试有声.mp4")
+    }
+
+    /// 缺音频夹具时 SKIP 不 FAIL（不入库，同 viewer 约定）；返回已存在的路径。
+    macro_rules! audio_fixture_or_skip {
+        () => {{
+            let p = audio_fixture();
+            if !p.exists() {
+                eprintln!("SKIP: missing target/video测试有声.mp4（音频夹具不入库，手动装配）");
+                return;
+            }
+            p
+        }};
     }
 
     #[test]
     fn audio_open_and_decode() {
-        let mut r = AudioReader::open_pcm_f32(&audio_fixture(), 48000).unwrap();
+        let mut r = AudioReader::open_pcm_f32(&audio_fixture_or_skip!(), 48000).unwrap();
         let p = r.params();
         assert_eq!(p.channels, 2);
         assert_eq!(p.sample_rate, 48000);
@@ -895,7 +921,7 @@ mod tests {
 
     #[test]
     fn audio_seek_lands_near_target() {
-        let mut r = AudioReader::open_pcm_f32(&audio_fixture(), 48000).unwrap();
+        let mut r = AudioReader::open_pcm_f32(&audio_fixture_or_skip!(), 48000).unwrap();
         r.seek(1.0).unwrap();
         let (pts, _) = r.next_pcm_f32().unwrap().expect("seek 后应出音频");
         assert!((pts - 1.0).abs() < 0.25, "音频 seek 落点偏差过大 pts={pts}");
@@ -907,11 +933,7 @@ mod tests {
     /// 夹具不入库，同 viewer 约定）。
     #[test]
     fn audio_seek_reuses_reader_across_targets() {
-        let path = audio_fixture();
-        if !path.exists() {
-            eprintln!("SKIP: missing audio fixture（不入库，本机无真音频）");
-            return;
-        }
+        let path = audio_fixture_or_skip!();
         let mut r = AudioReader::open_pcm_f32(&path, 48000).unwrap();
         for target in [0.1, 1.0, 0.35, 1.7] {
             r.seek(target).unwrap();
@@ -997,7 +1019,7 @@ mod tests {
     /// 双路径（硬件优先 / 软件回退）都必须产出尺寸正确、alpha 不透明的 BGRA 帧。
     #[test]
     fn hw_or_sw_path_both_output_valid_bgra() {
-        let mut r = VideoReader::open_scaled(&fixture(), 160).unwrap();
+        let mut r = VideoReader::open_scaled(&fixture_or_skip!(), 160).unwrap();
         eprintln!(
             "video-ffmpeg 解码路径: {}",
             if r.hw.is_some() { "硬件" } else { "软件回退" }
@@ -1016,7 +1038,7 @@ mod tests {
     /// 不支持（无 GPU / 驱动 / 编解码器）则打印跳过，避免 CI 误红。
     #[test]
     fn hw_only_path_decodes_when_available() {
-        match VideoReader::open_hw_only(&fixture(), u32::MAX) {
+        match VideoReader::open_hw_only(&fixture_or_skip!(), u32::MAX) {
             Ok(mut r) => {
                 assert!(r.hw.is_some(), "open_hw_only 必须启用硬件");
                 for _ in 0..16 {
