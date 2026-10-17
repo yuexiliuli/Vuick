@@ -35,6 +35,10 @@ static FFMPEG_LOG_QUIET: Once = Once::new();
 fn quiet_ffmpeg_log_once() {
     FFMPEG_LOG_QUIET.call_once(|| {
         ffmpeg::log::set_level(ffmpeg::log::Level::Error);
+        // 连续重复的同一错误只打一次（ffmpeg 自带「last message repeated N times」收敛）——
+        // HE-AAC SBR 断链坏帧在反复 seek 时会重复触发同一 `env_facs_q ... is invalid`，
+        // 不开这会逐帧刷屏把 stderr 灌爆（也是 UI 卡顿源之一）。
+        ffmpeg::log::set_flags(ffmpeg::log::Flags::SKIP_REPEATED);
     });
 }
 
@@ -193,6 +197,15 @@ pub struct AudioReader {
     time_base: ffmpeg::Rational,
     drained: bool,
     last_pts: f64,
+    /// seek 后的首个 clean 输出锚点（秒）：`seek(target)` 置 `target`；`next_pcm_f32`
+    /// 在输出第一个 pts ≥ 落点的 clean 帧前，跳过落点前的包/坏帧，随后复位 `-1`
+    ///（不再跳过，正常顺序读）。`-1` = 非 seek 窗口（初始打开/首次读不用跳）。
+    ///
+    /// 必要性：`avformat_seek_file` 对 MKV 的落点可能大幅回退（本仓 `视频测试字幕.mkv`
+    /// 实测首块可落后目标 ≈-12s），不跳过会整段播放落点前音频（越位/重起时错段）；
+    /// 且落点边界常落在 AAC 帧中间（MKV 1ms lacing vs AAC 21.33ms 帧长）→ HE-AAC SBR
+    /// 断链坏帧，解码报 `env_facs_q ... is invalid`。两者都靠本锚点截断。
+    skip_until: f64,
 }
 
 impl Drop for AudioReader {
@@ -264,6 +277,12 @@ impl AudioReader {
             time_base,
             drained: false,
             last_pts: 0.0,
+            // 打开即按「从起点播放」的 skip 口径（=seek 到 0）：普通打开/顺序播放也套用
+            // seek 的「落点前包/坏帧丢弃到首个 clean 帧」——流头若带 `pts<0` 的包（负
+            // 时间戳/夹头包）会先丢那个并且首个坏 AAC 帧在输出前被跳过，保证正常打开
+            // 从头播放 stderr 不刷 `env_facs_q ... invalid`；对 clean 头零影响（首帧
+            // pts≥0 直接返回）。真 seek 时 [`Self::seek`] 用精确 target 覆盖本值。
+            skip_until: 0.0,
         })
     }
 
@@ -277,6 +296,9 @@ impl AudioReader {
     /// 同一 reader 连续 seek（查看器音频 worker 常驻复用）时，swr 会把 seek 前未消耗的
     /// 输入延迟带进新位置 → 新起播首音夹旧段；flush 把 delay/中间/输出缓冲全清
     ///（对应 `next_pcm_f32` EOF 处 [`Self::flush_resampler`] 的收尾姿势）。
+    /// 同时置 [`Self::skip_until`]：seek 落点可能非 AAC 帧对齐（MKV lacing 1ms vs
+    /// AAC 21.33ms）+ 落点大幅回退 → 首包可能半帧/坏帧（SBR 断链刷 `env_facs_q`）、
+    /// 起播音整段落在落点前；`next_pcm_f32` 据此丢弃落点前包/坏帧、从首 clean 帧起播。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let ts = (seconds.max(0.0) * 1e6) as i64;
@@ -286,6 +308,7 @@ impl AudioReader {
         self.decoder.flush();
         self.drained = false;
         let _ = self.flush_resampler();
+        self.skip_until = seconds.max(0.0);
         Ok(())
     }
 
@@ -328,10 +351,25 @@ impl AudioReader {
 
     /// 推进到**下一块** F32 交错样本。`(pts 秒, 样本)`（样本数为偶数=立体声）；
     /// `None` = EOF（之后可再 `seek` 复用）。
+    ///
+    /// seek 窗口内（[`Self::skip_until`] ≥ 0）：跳过落点前的包（不喂解码器）与坏/残缺帧
+    ///（SBR 断链等解码错误不中止读取，让下个包重同步），直到第一个 pts ≥ 落点的 clean
+    /// 帧输出后复位——保证起播音精确从落点开始、不夹 SBR 断链坏帧的杂音/不出错断流。
     pub fn next_pcm_f32(&mut self) -> Result<Option<(f64, Vec<f32>)>> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let packet = self.next_audio_packet();
+            // 包级跳过（省解码 + 不产坏帧）：seek 落点前的 demux 包直接丢弃——MKV 落点
+            // 可回退长达 -12s，不丢则整段预滚音频被解码/进重采样/被设备播放（越位/错段）。
+            if self.skip_until >= 0.0
+                && let Some(p) = packet.as_ref().and_then(|p| p.pts())
+            {
+                let p_sec = p as f64 * f64::from(self.time_base.numerator())
+                    / f64::from(self.time_base.denominator());
+                if p_sec < self.skip_until {
+                    continue;
+                }
+            }
             let packet = match packet {
                 Some(p) => p,
                 None => {
@@ -347,15 +385,25 @@ impl AudioReader {
                     return Ok(None);
                 }
             };
-            self.decoder
-                .send_packet(&packet)
-                .context("音频 decoder send_packet 失败")?;
+            if let Err(e) = self.decoder.send_packet(&packet) {
+                if self.skip_until >= 0.0 {
+                    // seek 窗口内的坏/残缺包（SBR 断链提交失败）：跳过让下个包重同步，
+                    // 否则操作面一遇坏帧就断流 → 音频停滞/卡顿。
+                    continue;
+                }
+                return Err(anyhow!("音频 decoder send_packet 失败: {e}"));
+            }
             let mut decoded = ffmpeg::frame::Audio::empty();
             while self.decoder.receive_frame(&mut decoded).is_ok() {
                 let pts = decoded.pts().unwrap_or(0) as f64
                     * f64::from(self.time_base.numerator())
                     / f64::from(self.time_base.denominator());
                 self.last_pts = pts;
+                // 帧级 gate（包级跳过的兜底：时间戳缺失/落点偏差时仍保证不从落点前起播）
+                if self.skip_until >= 0.0 && pts < self.skip_until {
+                    continue;
+                }
+                self.skip_until = -1.0; // 首个 ≥ 落点帧已就绪：后续正常顺序读
                 let mut out = ffmpeg::frame::Audio::empty();
                 self.resampler.run(&decoded, &mut out).context("音频重采样失败")?;
                 let samples = Self::collect_f32(&out);
@@ -702,6 +750,7 @@ fn scaled_dims(width: u32, height: u32, max_dim: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
 
     fn fixture() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -987,49 +1036,357 @@ mod tests {
         }
     }
 
-    /// 解码吞吐测量（非回归，默认忽略手动跑）：`VFF_BENCH_VIDEO` 指定文件
-    /// （缺省 `%TEMP%\gpui-cpu\bench-1080p30.mp4`，再缺回落仓库 fixture），
-    /// `VFF_BENCH_FRAMES` 控制解码帧数（默认 1200，便于外部按进程 CPU 采样忙核）。
-    /// 硬件/软件对照：默认（`VFF_VIDEO_HW` 未关）= 硬件，`VFF_VIDEO_HW=0` = 软件。
-    #[test]
-    #[ignore = "手动测量用"]
-    fn bench_decode_throughput() {
-        let candidate = std::env::var("VFF_BENCH_VIDEO")
+    // ---------------- 解码吞吐 / 拆账基准（VFF_BENCH_* 环境, `--ignored` 手动跑） ----------------
+
+    const ST_DEMUX: usize = 0;
+    const ST_DECODE: usize = 1;
+    const ST_TRANSFER: usize = 2;
+    const ST_SWS: usize = 3;
+    const ST_COPY: usize = 4;
+
+    /// 基准文件：`VFF_BENCH_VIDEO` 指定，缺省仓库 `target/视频测试.mp4`（1280x720 h264@30）。
+    fn bench_candidate() -> std::path::PathBuf {
+        std::env::var("VFF_BENCH_VIDEO")
             .ok()
             .map(std::path::PathBuf::from)
-            .or_else(|| {
-                let p = std::path::PathBuf::from(std::env::var("TEMP").unwrap_or_default())
-                    .join("gpui-cpu")
-                    .join("bench-1080p30.mp4");
-                p.is_file().then_some(p)
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/视频测试.mp4")
             })
-            .unwrap_or_else(fixture);
+    }
+
+    /// 生产路径逐帧墙钟（`next_frame_bgra_into` 原样调用）：
+    /// 报 min / 中位 / 均值 / p95 ms·帧 + 统计窗口 fps + 「忙核@30fps」估算（均值 ms×30/1000）。
+    /// 前 `warmup` 帧剔除（scaler / 硬件设备预热）；文件短于目标帧数时 EOF→seek(0) 复跑凑数。
+    fn bench_leg_canonical(name: &str, mut r: VideoReader, frames: u32, warmup: u32) {
+        let cap = (r.out_width as usize) * (r.out_height as usize) * 4;
+        let mut out = vec![0u8; cap];
+        let mut times: Vec<f64> = Vec::with_capacity(frames as usize);
+        let mut n: u32 = 0;
+        let mut win_start: Option<std::time::Instant> = None;
+        while n < frames {
+            let t = std::time::Instant::now();
+            match r.next_frame_bgra_into(&mut out) {
+                Ok(Some(_)) => {
+                    let dt = t.elapsed().as_secs_f64() * 1e3;
+                    n += 1;
+                    if n > warmup {
+                        if win_start.is_none() {
+                            win_start = Some(std::time::Instant::now());
+                        }
+                        times.push(dt);
+                    }
+                }
+                Ok(None) => r.seek(0.0).unwrap(),
+                Err(e) => panic!("{name} 帧解码失败: {e:#}"),
+            }
+        }
+        match win_start {
+            Some(w0) => {
+                let win = (std::time::Instant::now().duration_since(w0).as_secs_f64()).max(1e-6);
+                let keep = times.len();
+                let mut sorted = times.clone();
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let (min, med, p95) = (sorted[0], sorted[keep / 2], sorted[(keep as f64 * 0.95) as usize]);
+                let mean = times.iter().sum::<f64>() / keep as f64;
+                eprintln!(
+                    "[BENCH] {name}: 采样={keep}帧 min={min:.3} 中位={med:.3} 均值={mean:.3} p95={p95:.3} ms/帧 | {:.0} fps | 忙核@30fps≈{:.2}",
+                    keep as f64 / win,
+                    mean * 30.0 / 1000.0
+                );
+            }
+            None => eprintln!("[BENCH] {name}: 采样帧数不足（frames={frames} warmup={warmup}）"),
+        }
+    }
+
+    /// 逐帧拆账：镜像 [`VideoReader::next_frame_bgra_into`]+[`VideoReader::convert_bgra_into`] 的
+    /// 主循环（测试模块可访问私有字段），把每帧 CPU 墙钟按 demux / decode / transfer / sws / copy
+    /// 累加后除以「产出帧数」报均值。软件路径 transfer 恒 0。
+    ///
+    /// ⚠️ 硬解 decode 墙钟常被 GPU 异步缓冲吸收（D3D11VA 提交即返回，真实成本滞后到回读
+    /// `av_hwframe_transfer_data` 的等待上）——故 decode/transfer 分开看，净值看 canonical 全帧。
+    fn bench_leg_breakdown(name: &str, mut r: VideoReader, frames: u32) -> anyhow::Result<()> {
+        let cap = (r.out_width as usize) * (r.out_height as usize) * 4;
+        let mut out = vec![0u8; cap];
+        let mut stage = [0.0f64; 5];
+        let mut n: u32 = 0;
+        while n < frames {
+            let t = std::time::Instant::now();
+            let packet = r.next_video_packet();
+            stage[ST_DEMUX] += t.elapsed().as_secs_f64();
+            let packet = match packet {
+                Some(p) => p,
+                None => {
+                    if !r.drained {
+                        r.decoder.send_eof().ok();
+                        r.drained = true;
+                    }
+                    let mut f = ffmpeg::frame::Video::empty();
+                    loop {
+                        let t = std::time::Instant::now();
+                        let ok = r.decoder.receive_frame(&mut f).is_ok();
+                        stage[ST_DECODE] += t.elapsed().as_secs_f64();
+                        if !ok {
+                            break;
+                        }
+                        if bench_convert_stage(&mut r, &f, &mut out, &mut stage)?.is_some() {
+                            n += 1;
+                        }
+                    }
+                    r.seek(0.0).unwrap();
+                    continue;
+                }
+            };
+            let t = std::time::Instant::now();
+            r.decoder
+                .send_packet(&packet)
+                .context("send_packet 失败")?;
+            stage[ST_DECODE] += t.elapsed().as_secs_f64();
+            let mut f = ffmpeg::frame::Video::empty();
+            loop {
+                let t = std::time::Instant::now();
+                let ok = r.decoder.receive_frame(&mut f).is_ok();
+                stage[ST_DECODE] += t.elapsed().as_secs_f64();
+                if !ok {
+                    break;
+                }
+                if bench_convert_stage(&mut r, &f, &mut out, &mut stage)?.is_some() {
+                    n += 1;
+                }
+            }
+        }
+        let per = |s: f64| s / n as f64 * 1e3;
+        eprintln!(
+            "[BENCH] {name} 拆账 ({n}帧): demux={:.3} decode={:.3} transfer={:.3} sws={:.3} copy={:.3} ms/帧",
+            per(stage[ST_DEMUX]),
+            per(stage[ST_DECODE]),
+            per(stage[ST_TRANSFER]),
+            per(stage[ST_SWS]),
+            per(stage[ST_COPY])
+        );
+        Ok(())
+    }
+
+    /// 拆账用的转换阶段（镜像 [`VideoReader::convert_bgra_into`] 计时）：HW opaque 帧先回读
+    /// （`av_hwframe_transfer_data`），再 sws 转 BGRA，再拷入输出缓冲。
+    fn bench_convert_stage(
+        r: &mut VideoReader,
+        f: &ffmpeg::frame::Video,
+        out: &mut [u8],
+        stage: &mut [f64; 5],
+    ) -> anyhow::Result<Option<(f64, u32, u32)>> {
+        let Some(pts) = f.pts() else {
+            return Ok(None);
+        };
+        let mut bgra = ffmpeg::frame::Video::empty();
+        if r.hw.is_some() && is_hw_frame(f) {
+            let mut sw = ffmpeg::frame::Video::empty();
+            let t = std::time::Instant::now();
+            let rc =
+                unsafe { ffmpeg::ffi::av_hwframe_transfer_data(sw.as_mut_ptr(), f.as_ptr(), 0) };
+            if rc < 0 {
+                return Err(anyhow!("硬件帧回读失败 (err={rc})"));
+            }
+            stage[ST_TRANSFER] += t.elapsed().as_secs_f64();
+            let fmt = sw.format();
+            let (w, h) = (sw.width(), sw.height());
+            let t = std::time::Instant::now();
+            r.scaler_for(fmt, w, h)?
+                .run(&sw, &mut bgra)
+                .context("sws 转换失败")?;
+            stage[ST_SWS] += t.elapsed().as_secs_f64();
+        } else {
+            let fmt = f.format();
+            let (w, h) = (f.width(), f.height());
+            let t = std::time::Instant::now();
+            r.scaler_for(fmt, w, h)?
+                .run(f, &mut bgra)
+                .context("sws 转换失败")?;
+            stage[ST_SWS] += t.elapsed().as_secs_f64();
+        }
+        let need = (r.out_width as usize) * (r.out_height as usize) * 4;
+        let t = std::time::Instant::now();
+        out[..need].copy_from_slice(&bgra.data(0)[..need]);
+        stage[ST_COPY] += t.elapsed().as_secs_f64();
+        let secs = pts as f64 * f64::from(r.time_base.numerator())
+            / f64::from(r.time_base.denominator());
+        Ok(Some((secs, r.out_width, r.out_height)))
+    }
+
+    /// 本机硬件解码设备可用性探针（`--ignored` 手动跑）：逐个尝试建 D3D11VA / DXVA2 设备上下文，
+    /// 打印哪个成功（打开媒体逻辑按此顺序优先启用）。输出即证据。
+    #[test]
+    #[ignore = "手动测量用"]
+    fn probe_hw_device() {
+        use ffmpeg::ffi::{
+            AVHWDeviceType, av_buffer_unref, av_hwdevice_ctx_create,
+        };
+        let names = [
+            (AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA, "D3D11VA"),
+            (AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2, "DXVA2"),
+        ];
+        for (t, name) in names {
+            let mut p: *mut ffmpeg::ffi::AVBufferRef = std::ptr::null_mut();
+            let rc = unsafe {
+                av_hwdevice_ctx_create(&mut p, t, std::ptr::null(), std::ptr::null_mut(), 0)
+            };
+            eprintln!("[HWPROBE] {name}: av_hwdevice_ctx_create rc={rc} ok={}", !p.is_null());
+            if !p.is_null() {
+                unsafe { av_buffer_unref(&mut p); }
+            }
+        }
+    }
+
+    /// 解码吞吐 / 拆账测量（非回归，默认忽略手动跑）。
+    ///
+    /// 软硬件对照：软路径强制软件（`open_scaled_impl(.., false)`，无视 `VFF_VIDEO_HW` 环境）；
+    /// 硬路径走 `open_hw_only`（force，无软回退，不可用即打印证据并跳过硬解对照）。
+    ///
+    /// 环境：
+    /// - `VFF_BENCH_VIDEO` 基准文件（缺省 `target/视频测试.mp4`）
+    /// - `VFF_BENCH_FRAMES` 采样帧数（默认 240，剔除前 20 帧预热；文件短→EOF seek 复跑）
+    /// - `VFF_BENCH_PATH=sw|hw` 限定单路径；缺省软硬都跑（软先硬后，按外部进程采样内存用）
+    #[test]
+    #[ignore = "手动测量用"]
+    fn bench_decode_throughput() -> anyhow::Result<()> {
+        let candidate = bench_candidate();
         let frames: u32 = std::env::var("VFF_BENCH_FRAMES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1200);
-        let mut r = VideoReader::open_scaled(&candidate, 1920).unwrap();
-        eprintln!(
-            "bench 路径={} 尺寸={}x{} 硬件={} 帧数={frames}",
-            candidate.display(),
-            r.params().width,
-            r.params().height,
-            r.hw.is_some()
-        );
-        let t0 = std::time::Instant::now();
-        let mut decoded = 0u32;
-        while decoded < frames {
-            if r.next_frame_bgra().unwrap().is_none() {
-                r.seek(0.0).unwrap();
-                continue;
-            }
-            decoded += 1;
+            .unwrap_or(240);
+        let warmup: u32 = 20.min(frames.saturating_sub(1));
+        let mode = std::env::var("VFF_BENCH_PATH").unwrap_or_default();
+        let info = |r: &VideoReader| {
+            eprintln!(
+                "[BENCH] 文件={} 源尺寸={}x{} 输出={}x{} 帧率={:?} 目标帧数={frames} warmup={warmup}",
+                candidate.display(),
+                r.params().width,
+                r.params().height,
+                r.out_width,
+                r.out_height,
+                r.params().frame_rate,
+            );
+        };
+        if mode.is_empty() || mode == "sw" {
+            let r = VideoReader::open_scaled_impl(&candidate, 1920, false)
+                .context("软路径打开失败")?;
+            assert!(r.hw.is_none(), "软路径必须无硬件（VFF_VIDEO_HW 混入环境）");
+            info(&r);
+            bench_leg_canonical("软解", r, frames, warmup);
+            let r2 = VideoReader::open_scaled_impl(&candidate, 1920, false)
+                .context("软路径拆账重开失败")?;
+            bench_leg_breakdown("软解", r2, frames)?;
         }
-        let el = t0.elapsed();
-        eprintln!(
-            "解码 {frames} 帧: {el:?} ({:.2} ms/帧, {:.0} fps)",
-            el.as_secs_f64() * 1000.0 / frames as f64,
-            frames as f64 / el.as_secs_f64()
-        );
+        if mode.is_empty() || mode == "hw" {
+            match VideoReader::open_hw_only(&candidate, 1920) {
+                Ok(r) => {
+                    assert!(r.hw.is_some(), "open_hw_only 必须启用硬件");
+                    info(&r);
+                    bench_leg_canonical("硬解", r, frames, warmup);
+                    match VideoReader::open_hw_only(&candidate, 1920) {
+                        Ok(r2) => bench_leg_breakdown("硬解", r2, frames)?,
+                        Err(e) => eprintln!("硬解拆账重开失败: {e:#}"),
+                    }
+                }
+                Err(e) => eprintln!(
+                    "本机硬件解码不可用，跳过硬解对照: {e:#}\n证据：open_hw_only(path,1920) 返回 Err"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// 回归：HE-AAC(MKV) 反复 seek（等价反复点进度条）——seek 落点非 AAC 帧对齐 + MKV
+    /// demux 落点可大幅回退（本夹具实测首块可落后目标 ≈-12s）+ HE-AAC SBR 断链坏帧
+    ///（`env_facs_q ... is invalid`）。修复前：起播音在落点前（预滚整段被播放/越位），
+    /// 边界坏帧刷屏且可能断流。断言：seek 后首块必须 ≥ 落点且落在落点后一帧内
+    ///（[`AudioReader::skip_until`] 丢弃落点前包/坏帧）、样本有限非空、逐块 pts 单调
+    /// 不回头。缺夹具 SKIP（`target\视频测试字幕.mkv` 不入库）。
+    #[test]
+    fn he_aac_mkv_seek_skips_preroll_and_starts_clean() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库，本机无 HE-AAC MKA 样例）");
+            return;
+        }
+        let mut r = AudioReader::open_pcm_f32(&path, 48000).unwrap();
+        // 覆盖：开头 / 中部 / 小数字 / 近结尾（避开 EOF 边缘），含来回跳
+        let targets = [5.0, 123.456, 500.0, 999.9, 1300.5, 1650.0];
+        for &t in &targets {
+            r.seek(t).unwrap();
+            let mut first: Option<f64> = None;
+            let mut last = -1.0f64;
+            let mut n = 0u32;
+            for _ in 0..60 {
+                match r.next_pcm_f32().unwrap_or_else(|e| panic!("seek {t} 读取失败: {e:#}")) {
+                    Some((pts, samples)) => {
+                        assert!(
+                            pts >= last - 1e-9,
+                            "seek {t} 后逐块 pts 应单调不回头: pts={pts} last={last}"
+                        );
+                        last = pts;
+                        if first.is_none() {
+                            first = Some(pts);
+                            assert!(
+                                pts >= t - 1e-6,
+                                "seek {t} 后首块必须 ≥ 落点（否则落点前预滚被播放/越位），实得 {pts}"
+                            );
+                            assert!(
+                                (pts - t).abs() < 0.1,
+                                "seek {t} 后首块应落在落点后一帧内（warm 起播），实得 {pts}"
+                            );
+                            assert!(
+                                !samples.is_empty() && samples.iter().all(|s| s.is_finite()),
+                                "seek {t} 后首块样本应非空且有限（clean 帧，非 SBR 坏帧）len={}",
+                                samples.len()
+                            );
+                        }
+                        n += 1;
+                        if n >= 6 {
+                            break;
+                        }
+                    }
+                    None => break, // 近结尾：落点后已无块，接受
+                }
+            }
+            assert!(n >= 3, "seek {t} 后应连续读出多块，实得 {n}");
+        }
+    }
+
+    /// 回归（A2）：**普通打开从头播放**（不经 seek）也套用 skip 口径——流头若带 `pts<0`
+    /// 包/首个坏 AAC 帧，须在输出前丢弃到第一个 clean 帧，正常打开 stderr 不刷
+    /// `env_facs_q`。断言：open 后首块 pts ≥ 0、样本有限非空、逐块 pts 单调。缺夹具 SKIP。
+    #[test]
+    fn open_from_start_skips_head_noise_first_frame_clean() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（夹具不入库）");
+            return;
+        }
+        let mut r = AudioReader::open_pcm_f32(&path, 48000).unwrap();
+        let mut last = -1.0f64;
+        let mut first: Option<f64> = None;
+        let mut n = 0u32;
+        for _ in 0..12 {
+            match r.next_pcm_f32().unwrap() {
+                Some((pts, samples)) => {
+                    assert!(pts >= last - 1e-9, "open 从头播放逐块 pts 应单调: pts={pts} last={last}");
+                    last = pts;
+                    if first.is_none() {
+                        first = Some(pts);
+                        assert!(pts >= -1e-6, "open 首块 pts 不应为负（负时间戳包被丢弃）: {pts}");
+                        assert!(
+                            !samples.is_empty() && samples.iter().all(|s| s.is_finite()),
+                            "open 首块样本应非空且有限（clean 帧）"
+                        );
+                    }
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        assert!(n >= 3, "open 后应连续读出多块，实得 {n}");
     }
 }
