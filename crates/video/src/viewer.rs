@@ -81,6 +81,10 @@ const DECODE_AHEAD_FRAMES: usize = 2;
 const SEEK_STEP_SEC: f64 = 5.0;
 /// 播放推进周期（≈60Hz，对齐 PDF 瓦片泵）。
 const PUMP_MS: u64 = 16;
+/// seek 首帧落地等待期的泵短拍（ms）：`pending_seek` 活跃时不再等帧率节拍（16-41ms），
+/// 用 ~2ms 轮询让 worker 首个 ≥ 落点帧「入队即 drain+上屏」——frame2screen 从 25-45ms
+/// 收敛到 ~2ms（消灭泵一拍白等）。短拍只在 seek 落点待定时生效，不改变播放节拍。
+const SEEK_WAKE_POLL_MS: u64 = 2;
 /// 无新帧的闲置拍最长重绘间隔（ms）：播放中帧暂缺（VFR / 解码卡顿）时仍低频刷新
 /// 进度条/控制条，不再每 16ms 强刷整窗（62Hz 全窗重绘是播放 CPU 大头之一）。
 const COARSE_REPAINT_MS: u64 = 200;
@@ -168,6 +172,19 @@ fn seek_diag_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("GPUI_EDITOR_VIDEO_SEEK_DIAG").is_some())
 }
 
+/// 探针「采集」是否开启：运行态只在 [`seek_diag_enabled`]（env）为真时采集，关态零热路径
+///（每条 seek 只多一次 bool 判断）；**test 构建无条件采集每次 seek 快照**——供
+/// `bench_click_seek_land_frame_wall` 与 GUI [SEEK] 同格式对表，打印仍只按 [`seek_diag_enabled`]。
+/// `cfg!(test)` 为编译期常量（test→true、非 test→false），非测试构建等价回 [`seek_diag_enabled`]，
+/// 非测试行为逐字节不变。
+fn seek_diag_collect() -> bool {
+    if cfg!(test) {
+        true
+    } else {
+        seek_diag_enabled()
+    }
+}
+
 /// 一次 seek 命令的解码/上屏阶段数据（worker ↔ tick 经全局槽汇总，首帧上屏打印一次）。
 #[derive(Default)]
 struct SeekDiag {
@@ -198,6 +215,46 @@ fn seek_diag_slot() -> &'static std::sync::Mutex<Option<SeekDiag>> {
 
 /// seek 诊断会话号（每次 seek 命令递增，worker/tick 凭它对齐清理）。
 static SEEK_DIAG_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 测试基准取数：tick 在「seek 首帧上屏」那刻把 8 字段快照（字段名/顺序/单位与 GUI [SEEK]
+/// 一行完全一致）沉淀到本测试线程槽，`bench_click_seek_land_frame_wall` 每次落点后取走即清。
+/// thread_local 避免全局槽跨测试线程竞争（每个 gpui::test 独立线程）；仅 cfg(test) 存在，
+/// 运行态零字段零开销。
+#[cfg(test)]
+struct SeekDiagTestRow {
+    total: f64,
+    reuse: u8,
+    regress: f64,
+    skipped: u32,
+    seek2first: f64,
+    frame2screen: f64,
+    target: f64,
+    firstpts: f64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEEK_DIAG_TEST_ROW: std::cell::RefCell<Option<SeekDiagTestRow>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 取走本测试线程「最近一次 seek 首帧上屏」的 8 字段快照（顺序与 GUI [SEEK] 对齐）：
+/// `(total_ms, reuse, regress_s, skipped, seek2first_ms, frame2screen_ms, target_s, firstpts_s)`。
+#[cfg(test)]
+pub(crate) fn take_seek_diag_test() -> Option<(f64, u8, f64, u32, f64, f64, f64, f64)> {
+    SEEK_DIAG_TEST_ROW.with(|s| s.borrow_mut().take()).map(|r| {
+        (
+            r.total,
+            r.reuse,
+            r.regress,
+            r.skipped,
+            r.seek2first,
+            r.frame2screen,
+            r.target,
+            r.firstpts,
+        )
+    })
+}
 
 /// 解码线程经通道传递的一帧：`(pts 秒, 宽, 高, BGRA)`。
 type FrameItem = (f64, u32, u32, Vec<u8>);
@@ -571,7 +628,7 @@ impl VideoViewer {
         // 换媒体（挂握手通道）不算 seek、不打印。普通运行只多一次 u64 写。
         let seek_session = SEEK_DIAG_SESSION.fetch_add(1, Ordering::Relaxed) + 1;
         self.diag_session = seek_session;
-        if seek_diag_enabled() && result_tx.is_none() {
+        if seek_diag_collect() && result_tx.is_none() {
             *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = Some(SeekDiag {
                 session: seek_session,
                 target,
@@ -654,10 +711,10 @@ impl VideoViewer {
             }
             let reader = &mut active.as_mut().expect("复用分支已确保有 reader").2;
             let _ = reader.seek(cmd.target);
-            // seek 全链路探针（GPUI_EDITOR_VIDEO_SEEK_DIAG=1，本命仅 seek 命令开）：
+            // seek 全链路探针（env 开或 test 构建采集，打印仍只按 env；本命仅 seek 命令开）：
             // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
             // 解码量已定——预滚帧全在它之前），tick 首帧上屏时聚合打印一次。
-            let seek_diag_on = seek_diag_enabled() && cmd.result_tx.is_none();
+            let seek_diag_on = seek_diag_collect() && cmd.result_tx.is_none();
             let seek_worker_start = if seek_diag_on { Some(Instant::now()) } else { None };
             let mut seek_first_decoded = true;
             let mut seek_regress: f64 = 0.0;
@@ -924,6 +981,17 @@ impl VideoViewer {
         snapped.clamp(DECODE_MIN_DIM, DECODE_MAX_DIM)
     }
 
+    /// 泵等待一拍的最长时长：seek 首帧落地等待期（`pending_seek` 活跃）用短拍——把
+    /// frame2screen 从「等一拍」（帧率节拍 16-41ms）收敛到 ~[`SEEK_WAKE_POLL_MS`]ms，
+    /// 消灭泵一拍白等；其余按帧率节拍（不改变播放节奏）。
+    fn pump_wait_interval(&self) -> Duration {
+        if self.pending_seek.is_some() {
+            Duration::from_millis(SEEK_WAKE_POLL_MS)
+        } else {
+            self.pump_interval()
+        }
+    }
+
     fn ensure_pump(&mut self, cx: &mut Context<Self>) {
         if self.pump_running || !self.pump_wanted() {
             return;
@@ -935,7 +1003,7 @@ impl VideoViewer {
             let mut last_paint: Option<Instant> = None;
             loop {
                 let interval = this
-                    .update(cx, |v, _| v.pump_interval())
+                    .update(cx, |v, _| v.pump_wait_interval())
                     .unwrap_or(Duration::from_millis(PUMP_MS));
                 cx.background_executor()
                     .timer(interval)
@@ -1030,10 +1098,11 @@ impl VideoViewer {
         } else {
             false
         };
-        // seek 全链路探针聚合（GPUI_EDITOR_VIDEO_SEEK_DIAG=1）：首帧上屏那刻打一条 [SEEK]。
+        // seek 全链路探针聚合（`GPUI_EDITOR_VIDEO_SEEK_DIAG=1` 打印；test 构建无条件把
+        // 8 字段快照沉淀给基准对表）：首帧上屏那刻打一条 [SEEK]。
         // total = seek 提交 → 首帧上屏；seek2first = worker 内 seek→首帧≥target 入队；
         // frame2screen = 入队 → tick install（泵一拍最坏等待）；打完清槽，不重复刷。
-        if new_frame && seek_diag_enabled() && self.diag_session != 0 {
+        if new_frame && seek_diag_collect() && self.diag_session != 0 {
             let info = {
                 let slot = seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner());
                 slot.as_ref()
@@ -1065,12 +1134,31 @@ impl VideoViewer {
                     })
             };
             if let Some((total, reuse, regress, skipped, s2f, f2s, target, firstpts)) = info {
-                eprintln!(
-                    "[SEEK] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s",
-                    total, reuse, regress, skipped, s2f, f2s, target, firstpts,
-                );
-                *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
-                self.diag_session = 0;
+                // test 构建：先沉淀 8 字段快照（bench 取走即清，对表 GUI [SEEK]）；运行态
+                // 该语句块 cfg(test) 折叠为零。
+                #[cfg(test)]
+                {
+                    SEEK_DIAG_TEST_ROW.with(|s| {
+                        *s.borrow_mut() = Some(SeekDiagTestRow {
+                            total,
+                            reuse,
+                            regress,
+                            skipped,
+                            seek2first: s2f,
+                            frame2screen: f2s,
+                            target,
+                            firstpts,
+                        })
+                    });
+                }
+                if seek_diag_enabled() {
+                    eprintln!(
+                        "[SEEK] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s",
+                        total, reuse, regress, skipped, s2f, f2s, target, firstpts,
+                    );
+                    *seek_diag_slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    self.diag_session = 0;
+                }
             }
         }
         // 自然播完的自动去向（顺序 = 停住；循环/随机 = 切换）在排空之后执行：先让结尾帧
@@ -3169,6 +3257,112 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// 性能基准（纯代码、不开 GUI，真解码 + 真墙钟）：模拟「点击进度条」seek——begin_scrub
+    /// 与 end_scrub 同分数 → 走单击合并路径（仅一次换代，正是用户真实点击链路）——量「点击那刻
+    /// → 首个新帧上屏（pending_seek 清空）」的端到端墙钟。测试上下文 timer 是 fake-clock
+    ///（几乎立即解析），泵拍不在测量里——恰好对应用户基线「瓶颈是解码（seek2first）不是上屏」
+    /// 的现状，数字 ≈ seek2first 主导段，供对标真机 [SEEK] 行 / 后续预解码/硬解 before/after。
+    /// 每落点打一行与 GUI [SEEK] **同字段/同序/同单位**的 8 字段行（前缀 [SEEKBENCH]），
+    /// 取自 `take_seek_diag_test`（tick 首帧上屏沉淀）；fake-clock 无泵拍 → frame2screen≈0。
+    /// 夹具 `target\视频测试字幕.mkv`（长 GOP）；缺夹具 SKIP（AGENTS.md §5）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bench_click_seek_land_frame_wall(cx: &mut TestAppContext) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return;
+        }
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path, cx)));
+        // 等首帧上屏 + 时长已知（真解码异步）；沿用既有姿势
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待首帧/时长超时");
+        }
+        let duration = cx.update(|app| viewer.read(app).duration);
+        // 目标秒（贴近真机点过的、覆盖短/中/长 GOP）；钳 [0.05, duration-2s] 避开近结尾 EOF
+        let raw = [0.11f64, 72.0, 191.0, 354.0, 447.0, 900.0, 1335.0, 1640.0];
+        let hi = (duration - 2.0).max(0.05);
+        let mut rows: Vec<(f64, f64)> = Vec::with_capacity(raw.len());
+        for &sec in &raw {
+            let sec = sec.clamp(0.05, hi);
+            // 用户单击：down=begin_scrub(f)、up=end_scrub(f)，同分数 → 合并路径（单次换代解码）
+            let fraction = (sec / duration).clamp(0.0, 1.0) as f32;
+            let t0 = Instant::now();
+            viewer.update(cx, |v, cx| v.begin_scrub(fraction, cx));
+            viewer.update(cx, |v, cx| v.end_scrub(fraction, cx));
+            let target = cx.update(|app| viewer.read(app).playhead);
+            // 等「首个新帧上屏」：pending_seek 只在 tick 内某帧上屏时清空 → 即落地信号。
+            // 测试 ctx 里 worker 真解码，等待用墙钟 deadline（fake timer 不能作节拍）。
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let landed = loop {
+                viewer.update(cx, |v, cx| {
+                    let _ = v.tick(cx);
+                });
+                let s = cx.update(|app| {
+                    let v = viewer.read(app);
+                    (v.pending_seek, v.last_frame_pts)
+                });
+                if s.0.is_none() {
+                    break s.1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "点击 seek 落点帧上屏超时（target={target:.2}s）"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            // 与 GUI [SEEK] 直接对表：取 tick 首帧上屏沉淀的 8 字段快照（slot 语义同 [SEEK]，
+            // total=点击→首帧上屏、seek2first=worker 解码段、frame2screen≈0 因无泵拍）。
+            // 缺快照（落点帧上屏瞬间槽尚未写入的罕见时序）回退兜底行，不 panic。
+            match take_seek_diag_test() {
+                Some((total, reuse, regress, skipped, s2f, f2s, target, firstpts)) => {
+                    rows.push((target, total));
+                    eprintln!(
+                        "[SEEKBENCH] total={:.1}ms reuse={} regress={:+.2}s skipped={} seek2first={:.1}ms frame2screen={:.1}ms target={:.2}s firstpts={:.2}s",
+                        total, reuse, regress, skipped, s2f, f2s, target, firstpts,
+                    );
+                }
+                None => {
+                    rows.push((target, ms));
+                    eprintln!(
+                        "[SEEKBENCH] target={target:.1}s click2frame={ms:.1}ms landed={:?}（无 diag 快照，兜底）",
+                        landed.map(|p| format!("{p:.2}s"))
+                    );
+                }
+            }
+        }
+        // 摘要：min / median / max（total 口径）。首目标也命中 reader 复用（文件在等待首帧
+        // 阶段已 open，同 path+cap）≡ 真机 [SEEK] reuse=1；含 ≤1ms 轮询粒度；frame2screen
+        // 假时钟≈0 故 total≈seek2first。性能基准不断言硬性指标。
+        let mut sorted: Vec<f64> = rows.iter().map(|r| r.1).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[SEEKBENCH] 摘要 n={} min={:.1}ms median={:.1}ms max={:.1}ms（total 口径，全 reuse=1；含 ≤1ms 轮询粒度）",
+            sorted.len(),
+            sorted[0],
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() - 1],
+        );
+        cx.run_until_parked();
+    }
+
     /// 直接构造（不走真实解码）：pump 排空逻辑 —— 取「pts ≤ playhead」的最新帧上屏，
     /// 越线的下一帧保留在 overflow。
     #[gpui::test]
@@ -3660,6 +3854,90 @@ mod tests {
             (cx.update(|app| ent.read(app).playhead) - (9.0 - 3.5 * 2.0 + 4.0 * 2.0)).abs() < 1e-6,
             "锚定后按音频时钟推进"
         );
+        cx.run_until_parked();
+    }
+
+    /// 回归（② 首帧落地即唤醒的机制本体）：`pending_seek` 活跃时泵用短拍轮询
+    ///（[`SEEK_WAKE_POLL_MS`]），不再等帧率节拍（fps=24 → 41ms）；平时保持帧率节拍。
+    #[gpui::test]
+    async fn pump_wait_interval_tightens_during_pending_seek(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.fps = Some((24, 1)); // pump_interval ≈ 41ms
+            v
+        }));
+        let normal = cx.update(|app| ent.read(app).pump_wait_interval());
+        assert_eq!(normal, Duration::from_millis(41), "无待定 seek = 帧率节拍");
+        ent.update(cx, |v, _| v.pending_seek = Some(5.0));
+        let short = cx.update(|app| ent.read(app).pump_wait_interval());
+        assert_eq!(
+            short,
+            Duration::from_millis(SEEK_WAKE_POLL_MS),
+            "pending_seek 活跃 = 短拍（frame2screen 不再白等一拍）"
+        );
+        cx.run_until_parked();
+    }
+
+    /// 回归（② 端到端）：seek 首帧就绪时，短拍泵在 ~[`SEEK_WAKE_POLL_MS`]ms 内即 drain+上屏，
+    /// 不等完整帧率节拍（fps=24 → 41ms）。fake clock 只推进短拍窗（2ms << 41ms）→ 帧应
+    /// 已上屏、`pending_seek` 清空；反向护栏：若泵退化成纯帧率节拍轮询，2ms 拍不会到，
+    /// 首帧不会上屏，断言即红。
+    #[gpui::test]
+    async fn pump_short_poll_lands_seek_first_frame_fast(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = true;
+            v.duration = 10.0;
+            v.fps = Some((24, 1)); // 正常节拍 41ms（>短拍，护栏判据）
+            v
+        }));
+        // 构造 seek 交付态：落点/帧通道就位，pending_seek 置位，再起泵
+        let (tx, rx) = sync_channel::<FrameItem>(DECODE_AHEAD_FRAMES);
+        ent.update(cx, |v, _| {
+            v.playhead = 5.0;
+            v.rx = Some(rx);
+            v.pending_seek = Some(5.0);
+        });
+        ent.update(cx, |v, cx| v.ensure_pump(cx));
+        // worker 行为：预滚最后一帧（≤ 落点，首帧即可上屏）+ 首个 ≥ 落点帧
+        tx.send(frame_of(4.96, 1)).ok();
+        tx.send(frame_of(5.1, 9)).ok();
+        // 只推进短拍窗：41ms 节拍远未到
+        cx.executor().advance_clock(Duration::from_millis(SEEK_WAKE_POLL_MS));
+        cx.run_until_parked();
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.frame.is_some(), v.pending_seek)
+        });
+        assert!(s.0, "短拍期内 pump 应立即上屏首帧（不待帧率节拍 41ms）");
+        assert_eq!(s.1, None, "首帧上屏后 pending_seek 应立即清空");
+        cx.run_until_parked();
+    }
+
+    /// 回归（② 暂停态）：暂停中 seek（pump 尚未跑）→ `seek()` 置 `pending_seek` 并起泵，
+    /// 泵以短拍续跑（等首帧上屏）；不因 `playing=false` 停泵。
+    #[gpui::test]
+    async fn paused_seek_keeps_short_poll_pump_alive(cx: &mut TestAppContext) {
+        let ent = cx.update(|app| app.new(|cx| {
+            let mut v = blank(fixture(), cx);
+            v.playing = false; // 暂停态：初始无 pump
+            v.duration = 10.0;
+            v
+        }));
+        ent.update(cx, |v, cx| v.seek(2.0, cx));
+        cx.run_until_parked();
+        let s = cx.update(|app| {
+            let v = ent.read(app);
+            (v.pending_seek, v.pump_running)
+        });
+        assert_eq!(s.0, Some(2.0), "暂停 seek 应保留 pending_seek（等首帧上屏）");
+        assert!(s.1, "暂停 seek 也应起泵（pending_seek 活跃 → 短拍续跑）");
+        // 短拍窗内泵仍活跃（不因 playing=false 停）
+        cx.executor().advance_clock(Duration::from_millis(SEEK_WAKE_POLL_MS));
+        cx.run_until_parked();
+        let running = cx.update(|app| ent.read(app).pump_running);
+        assert!(running, "pending_seek 未清前泵应持续短拍运行");
         cx.run_until_parked();
     }
 

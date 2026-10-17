@@ -119,17 +119,49 @@ struct HardwareDecode {
     device: AvBuf,
 }
 
-/// 硬件解码是否启用（**默认关**，软件为本机实测更优基线）：`VFF_VIDEO_HW=1|on|true` 显式开启。
-/// 硬件路径（D3D11VA/DXVA2）把解码搬上 GPU，但 GPUI 需 CPU 像素 → 每帧整帧回读，
-/// 在强 CPU 上收益被回读抵销（实测反略高）；弱 CPU / 4K / 高码率机器可显式开启。
+/// 硬件解码默认开关。2026-10 本机探针（`bench_seek_preroll_hw_vs_sw` / `bench_decode_throughput`，
+/// D3D11VA/DXVA2 设备均可建 rc=0、硬解输出帧能量与软解逐落点一致）结论：**硬解不更快，默认保持
+/// 软解**——GPU decode 0.50ms/帧 省掉软解 2.91ms/帧，但每帧整帧回读 `av_hwframe_transfer_data`
+/// ≈2.2ms + sws 更贵（1.66 vs 0.89ms/帧）把收益吃光：稳态 4.88 vs 4.59ms/帧、长 GOP seek 预滚
+/// 整体 2579 vs 2350ms；且预滚帧在 worker 判定 pts 前也逐帧读完回读，硬解只赔不赚。
+///
+/// ⚠️ 若要「硬解默认开 + 失败自动回退软解」：把下面 `HW_DEFAULT` 改为 `true` 即可——`open_scaled`
+/// 默认路径（`hw_required=false`→`try_open_hw_decoder` 按此开关）即「先试硬解、失败回软解」，
+/// `VFF_VIDEO_SW=1|on|true` 仍确定性强制软解。翻转前先在目标机器复跑上述两个 `--ignored` 探针
+/// 确认硬解净收益为正（本机为负，翻转会反而略慢 seek2first）。
+const HW_DEFAULT: bool = false;
+
+/// 硬件解码是否启用：默认见 [`HW_DEFAULT`]；`VFF_VIDEO_SW=1|on|true` 强制软解（优先级最高，
+/// 测试/诊断确定性回退）；`VFF_VIDEO_HW=1|on|true` 显式开启、`=0|off|false` 显式关闭。
 fn hw_enabled() -> bool {
-    matches!(
+    if matches!(
+        std::env::var("VFF_VIDEO_SW"),
+        Ok(v)
+            if v.eq_ignore_ascii_case("1")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("true")
+    ) {
+        return false;
+    }
+    if matches!(
         std::env::var("VFF_VIDEO_HW"),
         Ok(v)
             if v.eq_ignore_ascii_case("1")
                 || v.eq_ignore_ascii_case("on")
                 || v.eq_ignore_ascii_case("true")
-    )
+    ) {
+        return true;
+    }
+    if matches!(
+        std::env::var("VFF_VIDEO_HW"),
+        Ok(v)
+            if v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("false")
+    ) {
+        return false;
+    }
+    HW_DEFAULT
 }
 
 /// 尝试用硬件打开视频解码器：依次尝试 D3D11VA → DXVA2，任一环节失败（设备不可用 / 编解码器
@@ -534,8 +566,9 @@ impl VideoReader {
     /// 输出至少 1×1；`max_dim=u32::MAX` 即全尺寸）。`params()` 仍报告源宽高——上层
     /// 用它保持原始宽高比做显示适配；逐帧输出尺寸见 [`DecodedFrame`] 的 w/h。
     ///
-    /// 默认软件解码（本机实测更优）；设 `VFF_VIDEO_HW=1|on|true` 走硬件
-    /// （D3D11VA → DXVA2，见 [`try_open_hw_decoder`]），硬件不可用自动回退软件。
+    /// 默认软件解码（2026-10 探针结论与「硬解默认开」翻转开关见 [`HW_DEFAULT`] / [`hw_enabled`]）；
+    /// `VFF_VIDEO_HW=1|on|true` 走硬件（D3D11VA → DXVA2，见 [`try_open_hw_decoder`]），硬件
+    /// 不可用自动回退软件；`VFF_VIDEO_SW=1|on|true` 强制软解（测试/诊断确定性回退）。
     pub fn open_scaled(path: &Path, max_dim: u32) -> Result<Self> {
         Self::open_scaled_impl(path, max_dim, false)
     }
@@ -574,7 +607,8 @@ impl VideoReader {
             0.0
         };
 
-        // 解码器：默认软件（本机实测更优），`hw_required` 时强制硬件（测试路径，失败直接 Err）。
+        // 解码器：默认按 [`HW_DEFAULT`]（本机保持软解；改 `true` 即「硬解默认开 + 失败回退」），
+        // `hw_required` 时强制硬件（测试路径，失败直接 Err）。
         let (decoder, hw) = match try_open_hw_decoder(&params_for_decoder, hw_required) {
             Some((video, hw)) => (video, Some(hw)),
             None if hw_required => return Err(anyhow!("硬件解码不可用")),
@@ -1343,13 +1377,19 @@ mod tests {
             );
         };
         if mode.is_empty() || mode == "sw" {
+            // 软路径确定性强制软解（无视环境里可能残留的 VFF_VIDEO_HW；ignore 手动跑，进程内自控）
+            // SAFETY: `--ignored` 手动/串行诊断用，无并行测试竞争该 env。
+            unsafe { std::env::set_var("VFF_VIDEO_SW", "1") };
             let r = VideoReader::open_scaled_impl(&candidate, 1920, false)
                 .context("软路径打开失败")?;
-            assert!(r.hw.is_none(), "软路径必须无硬件（VFF_VIDEO_HW 混入环境）");
+            unsafe { std::env::remove_var("VFF_VIDEO_SW") };
+            assert!(r.hw.is_none(), "软路径必须无硬件（VFF_VIDEO_SW=1 强制软解）");
             info(&r);
             bench_leg_canonical("软解", r, frames, warmup);
+            unsafe { std::env::set_var("VFF_VIDEO_SW", "1") };
             let r2 = VideoReader::open_scaled_impl(&candidate, 1920, false)
                 .context("软路径拆账重开失败")?;
+            unsafe { std::env::remove_var("VFF_VIDEO_SW") };
             bench_leg_breakdown("软解", r2, frames)?;
         }
         if mode.is_empty() || mode == "hw" {
@@ -1369,6 +1409,133 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// seek 预滚成本对照（SW vs HW，`--ignored` 手动跑）：长 GOP 中段落点 seek 后解码到
+    /// 「首个 pts ≥ 落点」帧的 wall clock 与预滚帧数——即「点击进度条后 seek2first」的
+    /// 解码阶段子项。软路径经 `VFF_VIDEO_SW=1` 强制（默认硬解的机器上也确定性走软解）；
+    /// 硬路径走 `open_hw_only`（force，无软回退）。断言首个命中帧输出有效（非全黑/纯色，
+    /// 只测能量不写内容——夹具敏感）。缺夹具 SKIP（`target\视频测试字幕.mkv` 不入库）。
+    #[test]
+    #[ignore = "手动测量用"]
+    fn bench_seek_preroll_hw_vs_sw() -> anyhow::Result<()> {
+        use std::time::Instant;
+
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv（长 GOP 夹具不入库）");
+            return Ok(());
+        }
+        // 落点：开头近距 / 长 GOP 中段最坏档（≈停下 6-15s 长帧距）/ 两处中段 / 近结尾
+        let targets = [12.0, 90.0, 333.3, 601.7, 900.1, 1200.5, 1500.3, 1766.0];
+        // SAFETY: 探针为 `--ignored` 手动/串行诊断用，无并行测试竞争该 env；跑完还原。
+        unsafe { std::env::set_var("VFF_VIDEO_SW", "1") };
+        let t0 = Instant::now();
+        let sw = VideoReader::open_scaled_impl(&path, 1920, false)
+            .context("软路径打开失败")?;
+        let sw_open_ms = t0.elapsed().as_secs_f64() * 1e3;
+        unsafe { std::env::remove_var("VFF_VIDEO_SW") };
+        assert!(sw.hw.is_none(), "VFF_VIDEO_SW=1 软路径必须无硬件");
+
+        let hw = match VideoReader::open_hw_only(&path, 1920) {
+            Ok(r) => {
+                assert!(r.hw.is_some(), "open_hw_only 必须启用硬件");
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("[SEEKPREROLL] 硬解不可用，仅软解对照: {e:#}");
+                None
+            }
+        };
+
+        eprintln!(
+            "[SEEKPREROLL] 文件={} 硬解可用={}",
+            path.display(),
+            hw.is_some()
+        );
+
+        // 单腿测量：8 落点 seek→首帧 ≥ 落点。返回每个落点的 (首帧 pts, 预滚帧数, wall, energy)。
+        let measure = |mut r: VideoReader, name: &str| -> anyhow::Result<Vec<(f64, f64, f64, f64)>> {
+            let mut rows = Vec::with_capacity(targets.len());
+            for &t in &targets {
+                r.seek(t)?;
+                let cap = (r.out_width as usize) * (r.out_height as usize) * 4;
+                let mut out = vec![0u8; cap];
+                let t1 = Instant::now();
+                let mut n: u64 = 0;
+                let mut first: f64 = -1.0;
+                let mut energy = 0.0;
+                loop {
+                    n += 1;
+                    match r.next_frame_bgra_into(&mut out)? {
+                        Some((pts, ..)) if pts >= t => {
+                            first = pts;
+                            energy = frame_energy(&out, r.out_width, r.out_height);
+                            break;
+                        }
+                        Some(_) => continue, // 预滚帧只解不取
+                        None => break,       // 近结尾 EOF 且无 ≥ 落点帧：认首帧缺席
+                    }
+                }
+                let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "[SEEKPREROLL] {name} target={t:.1}s → 首帧 pts={first:.2}s 预滚帧={n} seek2first={wall_ms:.1}ms energy={energy:.1}",
+                );
+                rows.push((t, first, wall_ms, energy));
+            }
+            Ok(rows)
+        };
+
+        let t0 = Instant::now();
+        let sw_rows = measure(sw, "SW")?;
+        eprintln!(
+            "[SEEKPREROLL] SW 整体 wall={:.1}ms（open={sw_open_ms:.1}ms + 8 落点 seek+预滚）",
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        if let Some(hw) = hw {
+            let t0 = Instant::now();
+            let hw_rows = measure(hw, "HW")?;
+            eprintln!(
+                "[SEEKPREROLL] HW 整体 wall={:.1}ms（含 8 落点 seek+预滚）",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+            // 内容有效性用「软硬同落点 energy 对照」判：真实暗场两路都低（相互印证），
+            // 任一路独高另一路独低 → 可疑花屏/黑帧（GPU 回读垃圾）。
+            for (i, swt) in sw_rows.iter().enumerate() {
+                let (t, sw_e, hw_e) = (swt.0, swt.3, hw_rows[i].3);
+                let both_low = sw_e < 3.0 && hw_e < 3.0; // 双方都判暗场 → 一致，可信
+                if !both_low {
+                    assert!(
+                        (sw_e - hw_e).abs() < 30.0 || (sw_e > 3.0 && hw_e > 3.0),
+                        "target={t}s 软硬 energy 背离（SW={sw_e:.1} HW={hw_e:.1}）疑似花屏/黑帧"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// BGRA 帧内容能量（粗判非黑/非花屏）：等距抽样像素算平均绝对偏差；真实画面远高于
+    /// 纯黑/纯色的 ~0。只判「帧有效」，不含具体内容断言（夹具敏感）。
+    fn frame_energy(bgra: &[u8], w: u32, h: u32) -> f64 {
+        let px = w as usize * h as usize;
+        if px == 0 {
+            return 0.0;
+        }
+        const STEP: usize = 8;
+        let n = (px / STEP).max(1);
+        let mut samples: Vec<i64> = Vec::with_capacity(n);
+        for i in (0..px).step_by(STEP) {
+            let b = i * 4;
+            samples.push((bgra[b] as i64 + bgra[b + 1] as i64 + bgra[b + 2] as i64) / 3);
+        }
+        let mean = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
+        samples
+            .iter()
+            .map(|s| (*s as f64 - mean).abs())
+            .sum::<f64>()
+            / samples.len() as f64
     }
 
     /// 回归：HE-AAC(MKV) 反复 seek（等价反复点进度条）——seek 落点非 AAC 帧对齐 + MKV
