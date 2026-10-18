@@ -16,6 +16,7 @@
 //! - [`notification`]：通知（`Notification`/`NotificationKind`），替换 `gpui_component::notification`
 //! - [`palette`]：命令面板（`CommandPalette`/`PaletteMode`/`PaletteItem`），居中浮层，命令 + 文件快选两用
 //! - [`root`]：窗口根视图（每窗口第一层宿主），替换 `gpui_component::Root`
+//! - [`scroll_panel`]：滚动容器助手（relative 包装 + overflow_y_scroll + 常显滚动条）
 //! - [`input`]：单行文本输入框（搜索框），替换 `gpui_component::input::Input`/`InputState`
 //! - [`shell`]：外壳卡片化共享几何（卡间距/圆角）与「三点分隔手柄」（splitter/resize 复用）
 //!
@@ -51,6 +52,7 @@ pub mod motion;
 pub mod notification;
 pub mod palette;
 pub mod root;
+pub mod scroll_panel;
 pub mod scrollbar;
 pub mod shell;
 pub mod theme;

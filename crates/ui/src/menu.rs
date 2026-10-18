@@ -23,7 +23,7 @@ use gpui::{
     Anchor, AnyElement, AnimationExt, App, AppContext as _, ClickEvent, Context, DismissEvent,
     Edges, ElementId, Entity, EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
-    RenderOnce, StatefulInteractiveElement, Styled, Window, accesskit, anchored,
+    RenderOnce, StatefulInteractiveElement, Styled, Subscription, Window, accesskit, anchored,
     deferred, div, prelude::FluentBuilder as _, px,
 };
 
@@ -173,13 +173,6 @@ impl PopupMenu {
     /// 窗口直接挂右键菜单时用它显式设置。
     pub fn set_previous_focus(&mut self, handle: Option<FocusHandle>) {
         self.previous_focus = handle;
-    }
-
-    /// 菜单最小宽度（默认 160px，保证「标签……快捷键」两栏不挤）。
-    #[allow(dead_code)] // 公开 API，App 现用默认宽度
-    pub fn min_w(mut self, width: impl Into<Pixels>) -> Self {
-        self.min_width = Some(width.into());
-        self
     }
 
     /// 确认选中项：执行回调并关闭菜单（点击项 or Enter）。
@@ -412,6 +405,46 @@ impl Render for PopupMenu {
     }
 }
 
+/// 右键上下文菜单助手：一处收敛「建 `PopupMenu` + `set_previous_focus` + `focus` +
+/// `subscribe(DismissEvent)` + 宿主写好状态」近 30 行×2 同构样板（shell tab 栏右键 /
+/// 媒体锁定右键）。
+///
+/// 封装闭环：
+/// 1. `PopupMenu::build(window, cx, items)`——`items` 在菜单实体内运行（可 push 条目 /
+///    读动态状态）；
+/// 2. **焦点管理**：记下开菜单前的焦点（`PopupMenu` 关闭时归还）+ 聚焦菜单；
+/// 3. **dismiss 订阅**：`DismissEvent`（选择 / Esc / 点击外）→ 调 `on_dismiss`
+///    （宿主在里面对照 emitter 做**身份校验**后清自己的槽位 + `cx.notify()`），
+///    杜绝旧菜单的关闭误清新菜单。
+///
+/// 返回 `(menu, sub)` 句柄：宿主把 `menu` 与 `position` 存入自己的槽位（渲染时
+/// `deferred(anchored(Window)).position(pos)` 定位），`sub` 持住订阅；槽位字段存闭仍是
+/// 宿主职责（`Context<T>` 拿不到 `&mut T`，见 §2.6 派生状态副作用纪律）。
+pub fn spawn_context_menu<T>(
+    window: &mut Window,
+    cx: &mut Context<T>,
+    items: impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
+    on_dismiss: impl Fn(&mut T, &Entity<PopupMenu>, &mut Context<T>) + 'static,
+) -> (Entity<PopupMenu>, Subscription)
+where
+    T: 'static,
+{
+    let menu = PopupMenu::build(window, cx, items);
+
+    // 记下开菜单前的焦点（关闭归还）+ 聚焦菜单。
+    let previous_focus = window.focused(cx);
+    let focus_handle = menu.read(cx).focus_handle(cx);
+    menu.update(cx, |m, _| m.set_previous_focus(previous_focus));
+    window.focus(&focus_handle, cx);
+
+    // 关闭（选择/Esc/点击外）→ 宿主按 emitter 身份校验清理自己的菜单槽位。
+    let sub = cx.subscribe(&menu, move |this, emitter, _: &DismissEvent, cx| {
+        on_dismiss(this, &emitter, cx);
+    });
+
+    (menu, sub)
+}
+
 /// 菜单加载器：给定空菜单 + 宿主窗口，返回装配好的菜单。
 type MenuBuilder = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
 
@@ -559,7 +592,7 @@ impl DropdownMenu for crate::ui::button::Button {
 mod tests {
     use super::*;
     use crate::ui::button::{Button, ButtonVariants as _};
-    use gpui::{Context, Modifiers, Render, TestAppContext, VisualTestContext, point, px};
+    use gpui::{Context, Modifiers, Point, Render, TestAppContext, VisualTestContext, point, px};
     use std::{cell::Cell, rc::Rc};
 
     struct Harness {
@@ -729,5 +762,84 @@ mod tests {
         cx.simulate_click(point(px(40.), px(47.)), Modifiers::default());
         cx.run_until_parked();
         assert_eq!(dismisses.get(), 1, "普通项点击应关闭菜单（dismiss=1）");
+    }
+
+    // ---------------------------------------------------------------------
+    // `spawn_context_menu`：右键菜单生命周期闭环（焦点管理 + dismiss 身份校验清槽位）。
+    // ---------------------------------------------------------------------
+
+    /// 右键菜单宿主：放 mimic shell 的「entity / pos / sub」三槽位，作
+    /// `spawn_context_menu` 生命周期载体。
+    struct ContextMenuHost {
+        menu_entity: Option<Entity<PopupMenu>>,
+        menu_pos: Option<Point<Pixels>>,
+        menu_sub: Option<Subscription>,
+    }
+
+    impl Render for ContextMenuHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let content = match &self.menu_entity {
+                Some(menu) => div()
+                    .id("ctx-menu-host")
+                    .size_full()
+                    .child(menu.clone())
+                    .into_any_element(),
+                None => div().id("ctx-menu-host").size_full().into_any_element(),
+            };
+            content
+        }
+    }
+
+    /// 打开：`spawn_context_menu` 建菜单 + 记/归还焦点 + 订阅；Esc 关闭 → dismiss
+    /// 订阅按 emitter 身份校验命中当前槽位 → 清 entity/pos 槽位（宿主重绘）。
+    #[gpui::test]
+    fn context_menu_spawn_focuses_and_dismiss_cleans_slot(cx: &mut TestAppContext) {
+        cx.update(crate::test_support::bind_local_keymaps);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut host = ContextMenuHost {
+                menu_entity: None,
+                menu_pos: None,
+                menu_sub: None,
+            };
+            let (menu, sub) = spawn_context_menu(
+                window,
+                cx,
+                |menu, _, _| {
+                    menu.item(
+                        PopupMenuItem::element(|_, _| div().child("右键菜单项"))
+                            .on_click(|_, _, _| {}),
+                    )
+                },
+                // 宿主侧：emitter 身份校验命中当前槽位才清理（旧菜单关闭不会误清新菜单）。
+                |this: &mut ContextMenuHost,
+                 emitter: &Entity<PopupMenu>,
+                 cx: &mut Context<ContextMenuHost>| {
+                    if this.menu_entity.as_ref() == Some(&emitter) {
+                        this.menu_entity = None;
+                        this.menu_pos = None;
+                    }
+                    cx.notify();
+                },
+            );
+            host.menu_pos = Some(point(px(10.), px(10.)));
+            host.menu_entity = Some(menu);
+            host.menu_sub = Some(sub);
+            host
+        });
+        // 打开态：菜单已聚焦且槽位写满。
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (open_entity, open_pos) = cx.update(|_, cx| {
+            (view.read(cx).menu_entity.is_some(), view.read(cx).menu_pos.is_some())
+        });
+        assert!(open_entity, "打开后实体槽位应有菜单");
+        assert!(open_pos, "打开后位置槽位应有坐标");
+        // Esc 关闭菜单 → DismissEvent → 订阅按身份校验清理槽位。
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        let (gone_entity, gone_pos) = cx.update(|_, cx| {
+            (view.read(cx).menu_entity.is_none(), view.read(cx).menu_pos.is_none())
+        });
+        assert!(gone_entity, "dismiss 后实体槽位应被清理");
+        assert!(gone_pos, "dismiss 后位置槽位应被清理");
     }
 }

@@ -22,9 +22,6 @@ use crate::ui::theme::{ColorScheme, Theme};
 pub enum NotificationKind {
     /// 错误/失败。
     Error,
-    /// 普通信息。
-    #[allow(dead_code)] // 语义色出口预留：App 目前只用 Error
-    Info,
 }
 
 impl NotificationKind {
@@ -32,7 +29,6 @@ impl NotificationKind {
     fn accent(&self, colors: &ColorScheme) -> Hsla {
         match self {
             NotificationKind::Error => colors.error.into(),
-            NotificationKind::Info => colors.accent.into(),
         }
     }
 }
@@ -81,7 +77,6 @@ impl Notification {
     }
 
     /// App 自托管计时移除，故接受该项但忽略（保证必然消失）。
-    #[allow(dead_code)] // 与 gpui-component 的 API 对齐保留；App 走自托管计时
     pub fn autohide(self, _: bool) -> Self {
         self
     }
@@ -92,11 +87,6 @@ impl Notification {
 
     pub fn key(&self) -> &ElementId {
         &self.key
-    }
-
-    #[allow(dead_code)] // 公开读取器：测试用；App 现只关心 id_type/key
-    pub fn kind(&self) -> NotificationKind {
-        self.kind
     }
 
     /// 卡片外观：左侧类型色点 + 标题 +（可选）多行消息。
@@ -175,7 +165,7 @@ mod tests {
 
         assert_eq!(n.id_type(), TypeId::of::<Marker>());
         assert_eq!(n.key(), &key);
-        assert_eq!(n.kind(), NotificationKind::Error);
+        assert_eq!(n.kind, NotificationKind::Error);
         assert_eq!(n.title.as_ref(), "打开失败");
         assert_eq!(n.message.as_ref(), "无法读取文件");
     }

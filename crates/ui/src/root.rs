@@ -43,7 +43,7 @@ impl Root {
     }
 
     /// 根视图内承载的内容视图（如 `app::EditorApp`；测试里下转型取应用实体）。
-    #[allow(dead_code)]
+    /// 跨 crate 测试锚：`shell/src/app/tests/tabs_actions.rs` 经它下转型回 `EditorApp`。
     pub fn view(&self) -> &AnyView {
         &self.view
     }
