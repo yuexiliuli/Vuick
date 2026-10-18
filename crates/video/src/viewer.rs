@@ -587,6 +587,12 @@ pub struct VideoViewer {
     status: Option<(String, Instant)>,
     /// 状态浮层清空任务的代序号（防旧定时器误清新浮层，同 [`::viewer::auto_hide`] 姿势）。
     status_seq: u32,
+    // --- 解码偏好（控制条按钮循环：自动 ↔ 强制软解）---
+    /// 查看器解码偏好：`0` = 自动（硬解优先）、`1` = 强制软解。随控制条「解码偏好」按钮
+    /// 循环切换；变更时同步写进程级旋钮 [`crate::decode::set_decode_mode`]（worker 打开
+    /// reader 时按它选模式，模式在 reader 复用键里 → 切换即重开）并重开当前 reader @当前
+    /// 播放位置续播（同设备丢失自恢复的「重开 + seek 续播」姿势）。
+    decode_pref: u8,
     // --- 字幕 ---
     /// 字幕清单（打开时一次性加载）。
     subtitles: Vec<SubtitleEntry>,
@@ -659,6 +665,7 @@ impl VideoViewer {
             rng_state: seed_rng(),
             status: None,
             status_seq: 0,
+            decode_pref: 0,
             subtitles: Vec::new(),
             subtitle_visible: true,
             subtitle_style: SubtitleStyle::default(),
@@ -1702,6 +1709,24 @@ impl VideoViewer {
         cx.notify();
     }
 
+    /// 解码偏好循环切换（控制条「解码偏好」按钮）：自动（硬解优先）↔ 强制软解。变更后
+    /// 同步写进程级旋钮 [`crate::decode::set_decode_mode`]（worker 下一条命令按新模式选
+    /// Auto/Soft）并用 `start_decoder_at(playhead, None, false)` 重开当前 reader @当前播放
+    /// 位置续播——与设备丢失自恢复同款「重开 + seek(resume_pts)」机制：模式是 worker 常驻
+    /// reader 的复用键一部分（`path + cap + 模式`），模式一变即不复用、必然重开；不动音频
+    /// （`restart_audio=false`）→ 播放进度不中断、不从头跳。尚无活跃 reader（loading / 无帧/
+    /// 在途 seek）时只改偏好，下次打开即生效。
+    fn cycle_decode_pref(&mut self, cx: &mut Context<Self>) {
+        self.decode_pref = if self.decode_pref == 0 { 1 } else { 0 };
+        crate::decode::set_decode_mode(self.decode_pref);
+        // 活跃 reader：重开 @当前播放位置（软/硬解都以 seek(playhead) 接续，不跳帧不重头）
+        if self.frame.is_some() && !self.loading && self.pending_seek.is_none() {
+            let t = self.playhead;
+            self.start_decoder_at(t, None, false);
+        }
+        cx.notify();
+    }
+
     // ---- M6：截图当前帧存 PNG ----
 
     /// 把当前上屏帧转成 PNG 用的 RGBA 像素（**点截图这次才拷贝**——`self.frame` 的
@@ -2600,7 +2625,7 @@ impl VideoViewer {
     }
 
     /// 底部全屏控制条：上一支 / 播放·暂停 / 下一支 / 时间 / seek 进度条 /
-    /// 静音 + 音量条 / 倍速循环 / 清单位置。
+    /// 静音 + 音量条 / 解码偏好切换 / 播放模式 / 倍速循环 / 清单位置。
     ///
     /// 普通模式**常驻**显示。纯视频（锁定）模式为浮层：恒挂一根底部热区（`#video-controls`），
     /// `controls_auto.visible()` 时渲染整条，隐藏时是透明热区——hover **只挂在这根条带**上（进入即
@@ -2734,6 +2759,56 @@ impl VideoViewer {
                 |v, cx| v.toggle_mute(cx),
             ))
             .child(vol_strip)
+            .child({
+                // 解码偏好（自动硬解优先 ↔ 强制软解）：图标随状态换（芯片=自动/硬解优先、
+                // 滑杆=强制软解）+ 高亮区分（自动=accent、软解=fg）+ 悬停浮层说明当前状态。
+                // 点击循环并重开当前 reader @当前播放位置（见 `cycle_decode_pref`）。
+                // 悬停/tooltip 挂在包一层相对定位 div 上——Button 自带 hover 处理器（再用
+                // `.on_hover` 会撞 gpui「同元素重复挂 on_hover」断言）。
+                let entity = entity.clone();
+                let tip = ui::tooltip::tooltip_state("video-decode", window, cx);
+                let tip_on = ui::tooltip::tooltip_visible(&tip, cx);
+                let view_id = window.current_view();
+                let (icon, tint, title) = match self.decode_pref {
+                    1 => (
+                        IconName::DecodeSoft,
+                        fg,
+                        "强制软解：始终用 CPU 软件解码，时序恒定",
+                    ),
+                    _ => (
+                        IconName::DecodeAuto,
+                        accent,
+                        "自动（硬解优先）：GPU 硬解，失败自动回软解",
+                    ),
+                };
+                let btn = Button::new("video-decode")
+                    .ghost()
+                    .rounded_full()
+                    .w(px(28.))
+                    .h(px(28.))
+                    .child(Icon::new(icon).size(px(16.)).text_color(tint))
+                    .on_click(move |_, _w, app| {
+                        entity.update(app, |v, cx| v.cycle_decode_pref(cx));
+                    });
+                div()
+                    .id("video-decode-host")
+                    .relative()
+                    .w(px(28.))
+                    .h(px(28.))
+                    .on_hover(move |hovered, _w, cx| {
+                        ui::tooltip::tooltip_hover(&tip, *hovered, cx);
+                        cx.notify(view_id);
+                    })
+                    .child(btn)
+                    .child(ui::tooltip::tooltip_layer(
+                        "video-decode",
+                        title,
+                        tip_on,
+                        28.0,
+                        28.0,
+                        cx,
+                    ))
+            })
             .child({
                 // 模式按钮在 speed/clone 之外单独 clone：后文 camera 按钮仍需用 entity
                 let entity = entity.clone();
@@ -3304,6 +3379,7 @@ mod tests {
             rng_state: 42, // 固定种子：随机播放测试可预期
             status: None,
             status_seq: 0,
+            decode_pref: 0,
             subtitles: Vec::new(),
             subtitle_visible: true,
             subtitle_style: SubtitleStyle::default(),
@@ -4514,6 +4590,159 @@ mod tests {
             "切换到的另一文件应仍硬解（黑名单不外溢到其它路径）"
         );
         eprintln!("[device-lost] 另一文件仍硬解接管（hw_engaged={}）", hw_engaged());
+        cx.run_until_parked();
+    }
+
+    // ---- 解码偏好切换（控制条按钮：自动 ↔ 强制软解）----
+
+    /// (a) 状态循环：`cycle_decode_pref` 每点一次在「自动（0）↔ 强制软解（1）」间翻转，
+    /// 且进程级旋钮 `decode_mode()` 同步为 0/1/0；空 viewer（无活跃 reader）只改偏好、
+    /// 不误触重开（`frame.is_some()` 短路）。
+    #[gpui::test]
+    async fn decode_pref_cycle_toggles_mode_and_knob(cx: &mut TestAppContext) {
+        let _decode_mode = crate::decode::DecodeModeGuard::new(0);
+        crate::decode::set_decode_mode(0);
+        let ent = cx.update(|app| app.new(|cx| blank(fixture(), cx)));
+        let read = |cx: &mut TestAppContext| {
+            cx.update(|app| {
+                let v = ent.read(app);
+                (v.decode_pref, crate::decode::decode_mode())
+            })
+        };
+        assert_eq!(read(cx), (0u8, 0u8), "初始 auto / 旋钮 0");
+        ent.update(cx, |v, cx| v.cycle_decode_pref(cx));
+        assert_eq!(read(cx), (1u8, 1u8), "点击 → 强制软解 / 旋钮 1");
+        ent.update(cx, |v, cx| v.cycle_decode_pref(cx));
+        assert_eq!(read(cx), (0u8, 0u8), "再点 → 回自动 / 旋钮 0");
+        cx.run_until_parked();
+    }
+
+    /// (b) 重开-on-toggle：真实解码下（夹具 `target\视频测试.mp4`，缺夹具 SKIP），强制硬解
+    /// 起手 → 播放推进 → 点「解码偏好」切到强制软解：worker 重开为软解 reader
+    /// （`hw_engaged()==false`），续播新帧 pts ≥ 切换前最后上屏位置（@当前播放位置 seek 续播，
+    /// 不跳帧不重头）；再点回自动：worker 再重开为硬解 reader（`hw_engaged()==true`，新 reader）
+    /// 且播放继续。收尾守卫（DecodeModeGuard Drop 复位旋钮 0 + FaultAndBlGuard 清黑名单/撤
+    /// 注入）保证任何退出路径都不把模式/黑名单状态泄漏给后续测试（纯代码不开 GUI）。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn decode_toggle_reopens_reader_from_current_pts(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _cleanup = FaultAndBlGuard;
+        crate::decode::hw_blacklist_clear_for_test();
+        hw_fault_disable();
+        hw_engaged_reset();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() {
+            eprintln!("SKIP: missing target/视频测试.mp4（夹具不入库）");
+            return;
+        }
+        // 起手强制 hw（旋钮 2 → worker 走 open_scaled_hw）；`decode_pref` 仍 0（按钮态=自动）
+        let _decode_mode_guard = crate::decode::DecodeModeGuard::new(2);
+        // 确认本机确有硬解能力（内核含软回退；无能力整个场景不成立 → SKIP；顺带预热设备）
+        let cap_probe = crate::decode::VideoReader::open_scaled_hw(&path, 1920)
+            .expect("open_scaled_hw 应打开成功（内核含软回退）");
+        if !cap_probe.is_hw() {
+            eprintln!("SKIP: 本机无 D3D11VA/DXVA2 硬解能力（open_scaled_hw 回软解）");
+            return;
+        }
+        drop(cap_probe);
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 hw 首帧/时长超时");
+        }
+        assert!(hw_engaged(), "强制 hw 下 worker 打开应已硬解接管");
+        // 播放推进到 >0.3s（稳态逐帧解码，切换前有可比较的最新 pts）
+        let mut driving = 0;
+        loop {
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if p.is_some_and(|p| p >= 0.3) {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                v.playing = true;
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            driving += 1;
+            assert!(driving < 6000, "播放推进超时（last_frame_pts 未前进）");
+        }
+        let pts_before = cx
+            .update(|app| viewer.read(app).last_frame_pts)
+            .expect("切换前已有上屏帧");
+        // —— 切到强制软解：worker 重开软解 reader，续播不跳 ——
+        viewer.update(cx, |v, cx| {
+            v.cycle_decode_pref(cx);
+        });
+        // 等「软解重开完成且续播出新帧」：`hw_engaged()` 在 soft open 起点就拍 false（早于
+        // 真正接管），故必须等一个「严格大于切换前 pts 的新帧」落地——新帧只可能来自重开后的
+        // 软解 reader（旧 reader 最后一帧 pts = pts_before），同时说明 pending_seek 已清。
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let resume = loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if let Some(p) = p {
+                if !hw_engaged() && p > pts_before {
+                    break p;
+                }
+            }
+            assert!(Instant::now() < deadline, "切软解后应重开软解续播出新帧");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(
+            resume > pts_before,
+            "软解续播首新帧 pts 应 > 切换前 pts_before={pts_before:.2}s 实得={resume:.2}s（不跳回更早位置）"
+        );
+        // —— 切回自动（硬解优先）：worker 再重开为硬解 reader ——
+        viewer.update(cx, |v, cx| {
+            v.cycle_decode_pref(cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            if hw_engaged() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "切回自动应重开为硬解（hw_engaged 未恢复）");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // 硬解接管后播放继续（新帧 > 上次软解帧 pts：重开的 hw reader @当前播放位置续播）
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let hw_resume = loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if let Some(p) = p {
+                if p > resume {
+                    break p;
+                }
+            }
+            assert!(Instant::now() < deadline, "硬解续播未在期限内出新帧");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        eprintln!(
+            "[decode-toggle] 硬解接管：切软解前 pts={pts_before:.2}s 软解续播={resume:.2}s 回硬解续播={hw_resume:.2}s"
+        );
         cx.run_until_parked();
     }
 

@@ -48,6 +48,12 @@ pub enum IconName {
     /// 截图当前帧（视频控制条）。
     #[cfg(feature = "video")]
     Camera,
+    /// 解码偏好 = 自动（硬解优先）：「芯片」图标，视频控制条解码偏好按钮硬解态。
+    #[cfg(feature = "video")]
+    DecodeAuto,
+    /// 解码偏好 = 强制软解：「滑杆」图标，视频控制条解码偏好按钮软解态。
+    #[cfg(feature = "video")]
+    DecodeSoft,
 }
 
 impl IconName {
@@ -120,6 +126,16 @@ impl IconName {
             #[cfg(feature = "video")]
             IconName::Camera => {
                 "<path d=\"M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z\"/><circle cx=\"12\" cy=\"13\" r=\"4\"/>"
+            }
+            // 解码偏好按钮两态：自动（硬解优先）= 芯片（GPU 硬件解码的视觉隐喻）；
+            // 强制软解 = 滑杆（软件可调参数的隐喻）。两态图标不同，一眼可辨。
+            #[cfg(feature = "video")]
+            IconName::DecodeAuto => {
+                "<rect x=\"4\" y=\"4\" width=\"16\" height=\"16\" rx=\"2\"/><rect x=\"9\" y=\"9\" width=\"6\" height=\"6\"/><line x1=\"9\" y1=\"2\" x2=\"9\" y2=\"4\"/><line x1=\"15\" y1=\"2\" x2=\"15\" y2=\"4\"/><line x1=\"9\" y1=\"20\" x2=\"9\" y2=\"22\"/><line x1=\"15\" y1=\"20\" x2=\"15\" y2=\"22\"/><line x1=\"2\" y1=\"9\" x2=\"4\" y2=\"9\"/><line x1=\"2\" y1=\"15\" x2=\"4\" y2=\"15\"/><line x1=\"20\" y1=\"9\" x2=\"22\" y2=\"9\"/><line x1=\"20\" y1=\"15\" x2=\"22\" y2=\"15\"/>"
+            }
+            #[cfg(feature = "video")]
+            IconName::DecodeSoft => {
+                "<line x1=\"4\" y1=\"21\" x2=\"4\" y2=\"14\"/><line x1=\"4\" y1=\"10\" x2=\"4\" y2=\"3\"/><line x1=\"12\" y1=\"21\" x2=\"12\" y2=\"12\"/><line x1=\"12\" y1=\"8\" x2=\"12\" y2=\"3\"/><line x1=\"20\" y1=\"21\" x2=\"20\" y2=\"16\"/><line x1=\"20\" y1=\"12\" x2=\"20\" y2=\"3\"/><line x1=\"1\" y1=\"14\" x2=\"7\" y2=\"14\"/><line x1=\"9\" y1=\"8\" x2=\"15\" y2=\"8\"/><line x1=\"17\" y1=\"16\" x2=\"23\" y2=\"16\"/>"
             }
         };
         format!("{H}{inner}{T}")
@@ -258,6 +274,10 @@ mod tests {
             IconName::SkipForward,
             #[cfg(feature = "video")]
             IconName::Camera,
+            #[cfg(feature = "video")]
+            IconName::DecodeAuto,
+            #[cfg(feature = "video")]
+            IconName::DecodeSoft,
         ];
         for name in names {
             let m = name.svg_markup();

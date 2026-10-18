@@ -253,16 +253,26 @@ fn utf8_cstr(path: &Path) -> Result<std::ffi::CString> {
 ///   调用方设备/上下文——旧 M2e 设备注入已废除）。
 static VIDEO_DECODE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// 当前解码偏好（video worker 打开 reader 时读取；生产恒 `0`）。
+/// 当前解码偏好（video worker 打开 reader 时读取；经 [`set_decode_mode`] 设置，生产随控制条
+/// 按钮在 `0` auto / `1` 强制软解 间切换，默认 `0`）。
 pub(crate) fn decode_mode() -> u8 {
     VIDEO_DECODE_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 测试专用：覆盖解码偏好（取值见 [`VIDEO_DECODE_MODE`]）。配合 [`DecodeModeGuard`] 在
-/// 测试结束时复位——与既有设备注入测试的 `DeviceReset` 守卫同款姿势（panic 中断也复位）。
+/// 设置进程级解码偏好（取值见 [`VIDEO_DECODE_MODE`]）：对后续（重）打开的 reader 生效。
+/// 视频 worker 打开前读 [`decode_mode`] 选 Auto/Soft——模式是 worker 常驻 reader 的复用键
+/// 一部分（`path + cap + 模式`），模式一变即不复用、必然重开（见 viewer）。生产经控制条
+/// 「解码偏好」按钮调用；测试亦经此入口（见图 [`set_decode_mode_for_test`]）。
+pub(crate) fn set_decode_mode(m: u8) {
+    VIDEO_DECODE_MODE.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 测试专用：覆盖解码偏好（等价 [`set_decode_mode`]，命名保留测试显式表达）。配合
+/// [`DecodeModeGuard`] 在测试结束时复位——与既有设备注入测试的 `DeviceReset` 守卫同款姿势
+/// （panic 中断也复位）。
 #[cfg(test)]
 pub fn set_decode_mode_for_test(m: u8) {
-    VIDEO_DECODE_MODE.store(m, std::sync::atomic::Ordering::Relaxed);
+    set_decode_mode(m);
 }
 
 /// 测试专用 RAII 守卫：构造置偏好、Drop 恢复默认 auto（`0`），任何返回/panic 路径都不
