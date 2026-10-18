@@ -298,3 +298,44 @@ fn inline_image_hit_is_found_and_within_display_range(cx: &mut TestAppContext) {
     });
 }
 
+#[test]
+fn runs_gap_and_tail_carry_base_text_color() {
+    // 回归（评审后真机报告：WYSIWYG 文字不可见）：`runs_to_text_runs` 的间隙/尾段
+    // TextRun 必须显式带正文色——收敛到 `text_runs` 核心时曾漏设（`TextRun::default()`
+    // 的 color 是黑色），暗色主题下正文间隙/尾段被画成黑字 → 不可见。gpui 对每 run
+    // 颜色直接决定字形绘制色（`text_system::line.rs` 累积器初值 `black()`）。
+    use super::runs_to_text_runs;
+    use crate::markdown::parse::RunKind;
+    let base = gpui::font("Arial");
+    let mono = gpui::font("Consolas");
+    let accent = gpui::Hsla::default();
+    let link: gpui::Hsla = gpui::rgb(0x0b57d0).into();
+    let code_inline_fg = gpui::Hsla::default();
+    // 可辨识、非默认黑的正文色（旧实现间隙即用它）。
+    let fg: gpui::Hsla = gpui::rgb(0xabcdef).into();
+    // "ab**cd**ef"：Bold 占 [2..4)，前导间隙 [0..2)、尾段 [4..6)。
+    let text = "abcdef";
+    let out = runs_to_text_runs(
+        text,
+        &[(2..4, RunKind::Bold)],
+        &base,
+        fg,
+        &mono,
+        accent,
+        link,
+        code_inline_fg,
+    );
+    assert_eq!(out.len(), 3, "间隙 + 粗体 + 尾段三段");
+    assert_eq!(out[0].len, 2, "前导间隙 'ab'");
+    assert_eq!(out[0].color, fg, "前导间隙必须带正文色（不得回落默认黑）");
+    assert_eq!(out[1].len, 2, "粗体 'cd'");
+    assert_eq!(out[1].color, fg, "粗体 run 继承正文色");
+    assert_eq!(out[2].len, 2, "尾段 'ef'");
+    assert_eq!(out[2].color, fg, "尾段必须带正文色（不得回落默认黑）");
+    // 无 runs（整段纯文本）也应收满且带正文色。
+    let out = runs_to_text_runs(text, &[], &base, fg, &mono, accent, link, code_inline_fg);
+    assert_eq!(out.len(), 1, "纯文本段落单 run 铺满");
+    assert_eq!(out[0].len, text.len());
+    assert_eq!(out[0].color, fg, "纯文本 run 必须带正文色");
+}
+

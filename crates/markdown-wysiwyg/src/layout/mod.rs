@@ -257,13 +257,19 @@ fn text_gutter(kind: IrKind) -> f32 {
 ///   `wysiwyg::shape::runs_to_text_runs`** 逐行复刻；
 /// - `base`：run 之外的默认字体（当前 run 字体由 `deco` 派生）；未覆盖区间（两个 run
 ///   之间的空隙 / 尾段）一律 `base`、无装饰——与两份旧实现逐字段等值。
+/// - `base_color`：间隙/尾段默认 run 的文字色。**shape 侧必须传 `Some(正文色)`**——
+///   gpui 对 `color: None` 的 run 以黑色绘制（`text_system::line.rs` 累积器初值
+///   `black()`），否则暗色主题下间隙文字不可见（回归：重构早期把这里做成 None 致
+///   WYSIWYG 文字消失）。`font_runs`（字形几何）传 `None`，与旧实现一致。
 /// - `deco`：`RunKind → TextRunDeco`（字体 + 可选色/划线/下划线）。`wysiwyg::shape`
 ///   返回完整装饰；`layout::font_runs` 只取字形相关维度（加粗/斜体/等宽），色/划线恒
 ///   `None`（宽度/折行由字形决定，色不影响几何）。
+#[allow(clippy::too_many_arguments)] // run 构造公共基：字体 + 基色 + 装饰三路正交
 pub(crate) fn text_runs(
     text: &str,
     runs: &[(Range<usize>, RunKind)],
     base: &gpui::Font,
+    base_color: gpui::Hsla,
     deco: impl Fn(RunKind) -> TextRunDeco,
 ) -> Vec<TextRun> {
     let mut out = Vec::with_capacity(runs.len().saturating_add(1).max(1));
@@ -278,6 +284,7 @@ pub(crate) fn text_runs(
             out.push(TextRun {
                 len: s - i,
                 font: base.clone(),
+                color: base_color,
                 ..Default::default()
             });
         }
@@ -303,6 +310,7 @@ pub(crate) fn text_runs(
         out.push(TextRun {
             len: text.len() - i,
             font: base.clone(),
+            color: base_color,
             ..Default::default()
         });
     }
@@ -349,7 +357,9 @@ fn font_runs(
     base: &gpui::Font,
     mono: &gpui::Font,
 ) -> Vec<TextRun> {
-    text_runs(text, runs, base, kind_font_deco(base.clone(), mono.clone()))
+    // 颜色仅字形几何无关（与旧 font_runs 的 `..Default::default()` 同为默认色，
+    // 旧实现本就如此；shape 侧传真实正文色见 `runs_to_text_runs`）。
+    text_runs(text, runs, base, gpui::Hsla::default(), kind_font_deco(base.clone(), mono.clone()))
 }
 
 /// 按显示字节区间裁剪 runs / code_ranges（相对本条带文本的起点重定基）。

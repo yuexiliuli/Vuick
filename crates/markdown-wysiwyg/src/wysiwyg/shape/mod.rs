@@ -54,7 +54,7 @@ pub(crate) fn runs_to_text_runs(
     // 三处合一的共享基元（`crate::util::char_align_byte`，M1.1-P5）：可将 start/end
     // 分别向前进位吸收到最近字符边界、钳入 `text`，空区间丢弃。这使本渲染路径即便
     // 上游混入坏区间也永不 panic。
-    text_runs(text, runs, base, move |kind| {
+    text_runs(text, runs, base, color, move |kind| {
         let mut f = base.clone();
         let mut run_color = color;
         let mut strikethrough = None;
