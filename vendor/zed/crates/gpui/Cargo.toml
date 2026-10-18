@@ -25,7 +25,7 @@ test-support = [
     "dep:postage",
     "dep:web-time",
 ]
-bench-support = ["profiler", "dep:criterion", "dep:bench_metrics"]
+bench-support = ["profiler", "dep:criterion"]
 # Preserve the published feature name while consumers migrate to `bench-support`.
 bench = ["bench-support"]
 inspector = ["gpui_macros/inspector"]
@@ -55,7 +55,6 @@ backtrace.workspace = true
 bitflags.workspace = true
 
 collections.workspace = true
-bench_metrics = { workspace = true, optional = true }
 criterion = { workspace = true, optional = true }
 ctor.workspace = true
 derive_more = { workspace = true, features = ["add", "add_assign", "mul", "mul_assign", "not"] }
