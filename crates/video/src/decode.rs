@@ -93,24 +93,29 @@ type CChar = std::ffi::c_char;
 type CInt = std::ffi::c_int;
 
 type FnOpen = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
+// 安全硬解（FFmpeg 自有设备，无注入）：打开/取 IS/HW/seek 预滚免转换跳帧
+type FnOpenHwPrefer = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
+type FnVideoIsHw = unsafe extern "C" fn(Handle) -> CInt;
+type FnSkipToBgra = unsafe extern "C" fn(
+    Handle,
+    f64,
+    *mut u8,
+    usize,
+    *mut f64,
+    *mut u32,
+    *mut u32,
+    *mut u64,
+) -> CInt;
 type FnOpenAudio = unsafe extern "C" fn(*const CChar, u32, *mut Handle) -> CInt;
 type FnParams = unsafe extern "C" fn(Handle, *mut ParamFFI);
 type FnSeek = unsafe extern "C" fn(Handle, f64) -> CInt;
 type FnFrame = unsafe extern "C" fn(Handle, *mut u8, usize, *mut f64, *mut u32, *mut u32) -> CInt;
 type FnPcm = unsafe extern "C" fn(Handle, *mut f32, usize, *mut f64, *mut usize) -> CInt;
 type FnClose = unsafe extern "C" fn(Handle);
-// M2e：D3D11VA 硬件解码（零回读 GPU 直通）——`device`/`device_context` 为
-// `ID3D11Device*`/`ID3D11DeviceContext*` 的 usize 裸指针。
-type FnOpenVideoHw = unsafe extern "C" fn(*const CChar, u32, usize, usize, *mut Handle) -> CInt;
-type FnVideoFrameHw = unsafe extern "C" fn(
-    Handle,
-    *mut f64,
-    *mut u32,
-    *mut u32,
-    *mut usize,
-    *mut u32,
-) -> *mut std::ffi::c_void;
-type FnVideoFrameRelease = unsafe extern "C" fn(*mut std::ffi::c_void);
+// 旧 M2e 注入设备 API（`vff_open_video_hw` / `vff_video_frame_hw` / `vff_video_frame_release`）
+// 已废弃：渲染线程 immediate context 注入解码 worker 崩溃（exit 2173）；安全硬解改用
+// FFmpeg 自有设备（[`Self::open_scaled_hw`]）。cdylib 仍导出这些符号（kernel 自测用），
+// 主侧不再加载。
 
 // 字幕 FFI 类型
 #[repr(C)]
@@ -138,6 +143,9 @@ type FnCloseSubtitle = unsafe extern "C" fn(*mut std::ffi::c_void);
 /// 已加载的动态函数集（持有 `Library` 保句柄存活；符号指针在进程生命周期内有效）。
 struct Bridge {
     open_video: libloading::Symbol<'static, FnOpen>,
+    open_video_hw_prefer: libloading::Symbol<'static, FnOpenHwPrefer>,
+    video_is_hw: libloading::Symbol<'static, FnVideoIsHw>,
+    video_skip_to_bgra: libloading::Symbol<'static, FnSkipToBgra>,
     open_audio: libloading::Symbol<'static, FnOpenAudio>,
     video_params: libloading::Symbol<'static, FnParams>,
     #[allow(dead_code)] // 音轨时长由视频 params 带出；保留以对齐 cdylib 接口
@@ -148,10 +156,6 @@ struct Bridge {
     audio_pcm: libloading::Symbol<'static, FnPcm>,
     close_video: libloading::Symbol<'static, FnClose>,
     close_audio: libloading::Symbol<'static, FnClose>,
-    // M2e：D3D11VA 硬件解码符号（cdylib 已导出；与其余符号同生命周期）
-    open_video_hw: libloading::Symbol<'static, FnOpenVideoHw>,
-    video_frame_hw: libloading::Symbol<'static, FnVideoFrameHw>,
-    video_frame_release: libloading::Symbol<'static, FnVideoFrameRelease>,
     #[allow(dead_code)] // FFI 符号，实际在 SubtitleReader 中用
     open_subtitle: libloading::Symbol<'static, FnOpenSubtitle>,
     #[allow(dead_code)]
@@ -200,6 +204,9 @@ fn load_bridge() -> Option<Bridge> {
     }
     Some(Bridge {
         open_video: sym!(b"vff_open_video\0", FnOpen),
+        open_video_hw_prefer: sym!(b"vff_open_video_hw_prefer\0", FnOpenHwPrefer),
+        video_is_hw: sym!(b"vff_video_is_hw\0", FnVideoIsHw),
+        video_skip_to_bgra: sym!(b"vff_video_skip_to_bgra\0", FnSkipToBgra),
         open_audio: sym!(b"vff_open_audio\0", FnOpenAudio),
         video_params: sym!(b"vff_video_params\0", FnParams),
         audio_params: sym!(b"vff_audio_params\0", FnParams),
@@ -209,9 +216,6 @@ fn load_bridge() -> Option<Bridge> {
         audio_pcm: sym!(b"vff_audio_pcm\0", FnPcm),
         close_video: sym!(b"vff_close_video\0", FnClose),
         close_audio: sym!(b"vff_close_audio\0", FnClose),
-        open_video_hw: sym!(b"vff_open_video_hw\0", FnOpenVideoHw),
-        video_frame_hw: sym!(b"vff_video_frame_hw\0", FnVideoFrameHw),
-        video_frame_release: sym!(b"vff_video_frame_release\0", FnVideoFrameRelease),
         open_subtitle: sym!(b"vff_open_subtitle\0", FnOpenSubtitle),
         subtitle_count: sym!(b"vff_subtitle_count\0", FnSubtitleCount),
         subtitle_get_info: sym!(b"vff_subtitle_get_info\0", FnSubtitleGetInfo),
@@ -237,6 +241,48 @@ fn bridge() -> Option<&'static Bridge> {
 fn utf8_cstr(path: &Path) -> Result<std::ffi::CString> {
     let bytes = path.as_os_str().as_encoded_bytes();
     std::ffi::CString::new(bytes).context("路径含 NUL")
+}
+
+// ---------------- 解码偏好旋钮（测试隔离用） ----------------
+
+/// 进程级解码偏好（生产默认 `0` = auto）：
+/// - `0` auto：`open_scaled_hw`（硬件优先、FFmpeg 自有设备、不支持/失败自动回软解）；
+/// - `1` 强制软解：`open_scaled`（软解锚点基准与用户显式软解用——软解时序恒定可对表）；
+/// - `2` 强制硬件优先：`open_scaled_hw`（硬件 seek 基准用；内核仍自行软回退，仅避免再读
+///   调用方设备/上下文——旧 M2e 设备注入已废除）。
+static VIDEO_DECODE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// 当前解码偏好（video worker 打开 reader 时读取；生产恒 `0`）。
+pub(crate) fn decode_mode() -> u8 {
+    VIDEO_DECODE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 测试专用：覆盖解码偏好（取值见 [`VIDEO_DECODE_MODE`]）。配合 [`DecodeModeGuard`] 在
+/// 测试结束时复位——与既有设备注入测试的 `DeviceReset` 守卫同款姿势（panic 中断也复位）。
+#[cfg(test)]
+pub fn set_decode_mode_for_test(m: u8) {
+    VIDEO_DECODE_MODE.store(m, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 测试专用 RAII 守卫：构造置偏好、Drop 恢复默认 auto（`0`），任何返回/panic 路径都不
+/// 把硬解/软解偏好泄漏给后续测试。
+#[cfg(test)]
+pub struct DecodeModeGuard;
+
+#[cfg(test)]
+impl DecodeModeGuard {
+    /// 置解码偏好并在 Drop 时复位 `0`。
+    pub fn new(m: u8) -> Self {
+        set_decode_mode_for_test(m);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Drop for DecodeModeGuard {
+    fn drop(&mut self) {
+        set_decode_mode_for_test(0);
+    }
 }
 
 // ---------------- 视频 Reader ----------------
@@ -297,9 +343,80 @@ impl VideoReader {
         })
     }
 
-    /// 已解析的顶层参数。
-    pub fn params(&self) -> VideoParams {
+    /// 硬件优先打开（FFmpeg 自有 D3D11VA/DXVA2 设备，无调用方注入、无共享 immediate context
+    /// ——worker 线程独享，线程安全；设备/解码器不支持自动回软解；`VFF_VIDEO_SW=1` 强制软解）。
+    /// 与 [`Self::open_scaled`] 同 semantics（`max_dim` sws 封顶、params() 源尺寸）；seek 预滚
+    /// 用 [`Self::skip_to_bgra_into`] 跳帧免转换，是 seek 墙钟的主要加速。
+    pub fn open_scaled_hw(path: &Path, max_dim: u32) -> Result<Self> {
+        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
+        let cpath = utf8_cstr(path)?;
+        let mut handle: Handle = std::ptr::null_mut();
+        let rc = unsafe { (b.open_video_hw_prefer)(cpath.as_ptr(), max_dim, &mut handle) };
+        if rc != 0 || handle.is_null() {
+            return Err(anyhow::anyhow!("打开媒体失败: {}", path.display()));
+        }
+        let mut ffi = ParamFFI {
+            width: 0,
+            height: 0,
+            duration: 0.0,
+            frame_rate_num: 0,
+            frame_rate_den: 0,
+            has_audio: 0,
+            sample_rate: 0,
+            channels: 0,
+        };
+        unsafe { (b.video_params)(handle, &mut ffi) }
+        Ok(Self {
+            handle,
+            cap: (ffi.width as usize)
+                .saturating_mul(ffi.height as usize)
+                .saturating_mul(4)
+                .max(1),
+        })
+    }
+
+    /// 是否硬件解码（D3D11VA/DXVA2，FFmpeg 自有设备）：worker 据此决定预滚走
+    /// [`Self::skip_to_bgra_into`]（软解保持旧逐帧转换口径，硬解跳帧免转换）。
+    pub fn is_hw(&self) -> bool {
         let b = bridge().expect("reader 持有期桥必在");
+        unsafe { (b.video_is_hw)(self.handle) != 0 }
+    }
+
+    /// **seek 预滚**：`seek(target)` 后逐帧解码，落点前帧只解码不转换，第一个 `pts ≥ target`
+    /// 的帧一次性转 BGRA 写进 `out`（须 ≥ 输出 w×h×4）。返回 `(pts, 宽, 高, 已跳帧数)`；
+    /// `None` = EOF 仍未到 target。软解 reader 也适用（语义不变、耗时可略降：省每帧 sws）。
+    /// 与硬件路径共用同一个 FFI（cdylib 内按 reader 实际 HW/软状态执行）。
+    pub fn skip_to_bgra_into(
+        &mut self,
+        target: f64,
+        out: &mut [u8],
+    ) -> Result<Option<(f64, u32, u32, u64)>> {
+        let b = bridge().context("视频运行库不可用")?;
+        let mut pts = 0.0f64;
+        let mut w = 0u32;
+        let mut h = 0u32;
+        let mut skipped = 0u64;
+        let rc = unsafe {
+            (b.video_skip_to_bgra)(
+                self.handle,
+                target,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut pts,
+                &mut w,
+                &mut h,
+                &mut skipped,
+            )
+        };
+        match rc {
+            1 => Ok(Some((pts, w, h, skipped))),
+            0 => Ok(None),
+            _ => Err(anyhow::anyhow!("seek 预滚解码失败")),
+        }
+    }
+
+    /// 已解析的顶层参数。
+    pub fn params(&self) -> VideoParams {        let b = bridge().expect("reader 持有期桥必在");
         let mut ffi = ParamFFI {
             width: 0,
             height: 0,
@@ -369,98 +486,6 @@ impl VideoReader {
             _ => Err(anyhow::anyhow!("解码帧失败")),
         }
     }
-
-    // ---------------- M2e：D3D11VA 硬件解码（零回读 GPU 直通） ----------------
-
-    /// 打开**外部设备硬件解码**（不可用即 `Err`，上层据此回落软解）：`device`/`device_context`
-    /// 为调用方 `ID3D11Device*`/`ID3D11DeviceContext*` 的 usize 裸指针，须与主渲染同一
-    /// D3D11 设备（见 `gpui_platform::d3d11_device_context()`）。解码器按源全尺寸硬解，
-    /// **不做** sws —— 帧尺寸即源尺寸（`HwFrame` 自带实际宽高）。`cap` 参数无意义（仅
-    /// 接口对齐软解 `open_scaled`）；返回 reader 的 `source_cap()` 恒 1（HW 帧不走回读缓冲）。
-    pub fn open_hw(path: &Path, device: usize, device_context: usize) -> Result<Self> {
-        let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
-        let cpath = utf8_cstr(path)?;
-        let mut handle: Handle = std::ptr::null_mut();
-        let rc = unsafe {
-            (b.open_video_hw)(cpath.as_ptr(), u32::MAX, device, device_context, &mut handle)
-        };
-        if rc != 0 || handle.is_null() {
-            return Err(anyhow::anyhow!("硬件解码打开失败: {}", path.display()));
-        }
-        // 尺寸/时长经 `vff_video_params` 读取（与软解同姿势；HW 帧不经 sws，cap 不预分配）
-        let mut ffi = ParamFFI {
-            width: 0,
-            height: 0,
-            duration: 0.0,
-            frame_rate_num: 0,
-            frame_rate_den: 0,
-            has_audio: 0,
-            sample_rate: 0,
-            channels: 0,
-        };
-        unsafe { (b.video_params)(handle, &mut ffi) }
-        Ok(Self { handle, cap: 1 })
-    }
-
-    /// 把 HW 帧的释放句柄归还解码器（**必须**在拷贝完成后调用）：释放 AVBufferRef 引用，
-    /// 帧池槽位回归解码器复用——**不释放持续解码会耗尽帧池**（headroom ≈1-2 帧）。
-    /// 对 null / EOF(`0x1`) / 错误(`usize::MAX`) 哨兵是安全 no-op（cdylib 内已判空）。
-    pub fn release_hw_frame(frame_ptr: *mut std::ffi::c_void) {
-        if let Some(b) = bridge() {
-            unsafe { (b.video_frame_release)(frame_ptr) }
-        }
-    }
-
-    /// 推进到**下一帧**，返回 D3D11VA 硬件帧（零回读：不做 `av_hwframe_transfer_data`、不做
-    /// sws）。`Ok(None)` = 流末尾（之后可再 [`Self::seek`] 复用）；帧的 `frame_ptr` 用后
-    /// **必须**经 [`Self::release_hw_frame`] 释放。
-    pub fn next_frame_hw(&mut self) -> Result<Option<HwFrame>> {
-        let b = bridge().context("视频运行库不可用")?;
-        let mut pts = 0.0f64;
-        let mut w = 0u32;
-        let mut h = 0u32;
-        let mut tex = 0usize;
-        let mut idx = 0u32;
-        let fp = unsafe {
-            (b.video_frame_hw)(self.handle, &mut pts, &mut w, &mut h, &mut tex, &mut idx)
-        };
-        let p = fp as usize;
-        if fp.is_null() {
-            Err(anyhow::anyhow!("硬件解码返回空句柄"))
-        } else if p == 0x1 {
-            Ok(None) // EOF 哨兵
-        } else if p == usize::MAX {
-            Err(anyhow::anyhow!("硬件解码帧失败"))
-        } else {
-            Ok(Some(HwFrame {
-                frame_ptr: fp,
-                pts,
-                w,
-                h,
-                tex,
-                array_index: idx,
-            }))
-        }
-    }
-}
-
-/// 一帧 D3D11VA 硬件解码结果（零回读，透明句柄）：`tex` = 帧池 `ID3D11Texture2D*` 数组
-/// 纹理基址（转 usize）、`array_index` ∈ [0, 帧池容量)。`frame_ptr` 为释放句柄，用后必须
-/// 经 [`VideoReader::release_hw_frame`] 归还帧池槽位（headroom ≈1-2 帧，持久不释放会耗尽）。
-#[derive(Debug, Clone, Copy)]
-pub struct HwFrame {
-    /// 释放句柄（`vff_video_frame_hw` 的返回值）。
-    pub frame_ptr: *mut std::ffi::c_void,
-    /// 帧 pts（秒）。
-    pub pts: f64,
-    /// 显示宽。
-    pub w: u32,
-    /// 显示高。
-    pub h: u32,
-    /// `ID3D11Texture2D*`（转 usize；数组纹理基址）。
-    pub tex: usize,
-    /// 数组纹理元素下标（该帧在帧池中的槽位）。
-    pub array_index: u32,
 }
 
 // ---------------- 音频 Reader ----------------

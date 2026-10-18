@@ -346,3 +346,52 @@ fn hw_external_release_never_leaks_slot() {
     );
     drop(held);
 }
+
+/// 安全架构（FFmpeg 自有设备）seek 预滚回归：`open_scaled_hw` + `skip_to_bgra_into`
+/// （落点前帧只解码不转换、首个 ≥ target 帧一次性转 BGRA）。断言首帧 pts≥target、跳帧数>0、
+/// BGRA 缓冲有非零像素、随后 `next_frame_bgra_into` 续读 pts>target。墙钟供 [SEEKBENCH] 对表。
+#[test]
+fn hw_skip_to_bgra_fast_preroll() {
+    let path = fixture();
+    if !path.is_file() {
+        eprintln!("SKIP: missing target/视频测试字幕.mkv（媒体夹具不入库，手动装配）");
+        return;
+    }
+    let target = 354.0; // 深 GOP 落点（regress ≈ -9.86s，软解 seek2first ≈ 1800ms）
+    let mut r = match VideoReader::open_scaled_hw(&path, u32::MAX) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("SKIP: open_scaled_hw 失败（硬件不可用即回软解路径也覆盖）: {e:#}");
+            return;
+        }
+    };
+    eprintln!("[HW skip] is_hw={}", r.is_hw());
+    let cap = (r.params().width as usize) * (r.params().height as usize) * 4;
+    let mut buf = vec![0u8; cap];
+    let t0 = std::time::Instant::now();
+    let got = r
+        .skip_to_bgra_into(target, &mut buf)
+        .expect("skip_to_bgra_into 不应报错");
+    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+    let (pts, w, h, skipped) = got.expect("深度落点应有首帧 ≥ target");
+    assert!(pts >= target - 0.02, "首帧 pts={pts} 应 ≥ target={target}");
+    assert!(
+        (w as usize) * (h as usize) * 4 == buf.len()
+            && !buf[..buf.len() / 2].iter().all(|&b| b == 0),
+        "BGRA 缓冲应被非零像素填充（实际 w={w} h={h}）"
+    );
+    // 续读：下一帧应仍在 target 之后（preroll 已越过落点，顺序读不回头）
+    let next = r
+        .next_frame_bgra_into(&mut buf)
+        .expect("续读不应报错")
+        .expect("预滚后应能继续读");
+    assert!(next.0 > target - 0.3, "续读帧 pts={} 应在 target 之后", next.0);
+    eprintln!(
+        "[HW skip] target={target}s pts={pts:.2}s skipped={skipped} 墙钟={elapsed:.1}ms（is_hw={}；软解同落点 ≈1800ms）",
+        r.is_hw()
+    );
+    assert!(
+        skipped > 0,
+        "深 GOP 落点应跳过若干落点前帧（skipped={skipped}）"
+    );
+}

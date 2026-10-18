@@ -78,6 +78,72 @@ pub unsafe extern "C" fn vff_open_video(
     0
 }
 
+/// 打开视频（**硬件优先**：FFmpeg 自有 D3D11VA/DXVA2 设备，无调用方设备注入、无共享
+/// immediate context——worker 线程独享上下文，线程安全；设备/解码器不支持自动回软解）。
+/// `max_dim` 为 sws 长边封顶。成功写 `*out` 句柄返回 0；-1 = 打开失败。
+/// seek 预滚用 [`vff_video_skip_to_bgra`]（跳帧免转换，seek 墙钟主要加速）；逐帧播放仍走
+/// [`vff_video_frame`]（硬件路径由内核自行回读+sws，输出 BGRA 与软解逐字一致）。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_open_video_hw_prefer(
+    path: *const c_char,
+    max_dim: u32,
+    out: *mut Handle,
+) -> c_int {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(p) = path_from(path) else {
+        return -1;
+    };
+    let r = match VideoReader::open_scaled_hw(p, max_dim) {
+        Ok(r) => r,
+        Err(_) => return -1,
+    };
+    unsafe { *out = Box::into_raw(Box::new(r)) as Handle }
+    0
+}
+
+/// 当前 reader 是否为硬件解码（D3D11VA/DXVA2）。1 = HW；0 = 软解。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_video_is_hw(h: Handle) -> c_int {
+    reader::<VideoReader>(h).is_hw() as c_int
+}
+
+/// **seek 预滚**：`seek(target)` 后逐帧解码，落点前帧**只解码不转换**（硬件 ≈0.5ms/帧、
+/// 软解 ≈2.9ms/帧），第一个 `pts ≥ target` 的帧一次性转 BGRA 拷进 `out_buf`，并写出
+/// `*pts/*w/*hh/*skipped`（已跳帧数，含 demux 包级已越过的前帧计数口径同旧预滚）。
+/// 返回：1 = 命中（帧已拷入）；0 = EOF（末端仍无 ≥target 帧）；-1 = 错误/缓冲过小。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn vff_video_skip_to_bgra(
+    h: Handle,
+    target: f64,
+    out_buf: *mut u8,
+    out_cap: usize,
+    pts: *mut f64,
+    w: *mut u32,
+    hh: *mut u32,
+    skipped: *mut u64,
+) -> c_int {
+    if out_buf.is_null() {
+        return -1;
+    }
+    let r = reader::<VideoReader>(h);
+    let out = unsafe { std::slice::from_raw_parts_mut(out_buf, out_cap) };
+    match r.skip_to_bgra_into(target, out) {
+        Ok(Some((p, ww, hhh, sk))) => {
+            unsafe {
+                *pts = p;
+                *w = ww;
+                *hh = hhh;
+                *skipped = sk;
+            }
+            1
+        }
+        Ok(None) => 0,
+        Err(_) => -1,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vff_video_params(h: Handle, out: *mut ParamFFI) {
     let p = reader::<VideoReader>(h).params();

@@ -17,7 +17,6 @@
 
 mod audio;
 mod decode;
-mod hw;
 mod subtitle;
 mod viewer;
 

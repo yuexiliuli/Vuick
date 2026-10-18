@@ -840,6 +840,24 @@ impl VideoReader {
         Self::open_scaled_impl(path, max_dim, true)
     }
 
+    pub fn open_scaled_hw(path: &Path, max_dim: u32) -> Result<Self> {
+        if matches!(
+            std::env::var("VFF_VIDEO_SW"),
+            Ok(v)
+                if v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("on")
+                    || v.eq_ignore_ascii_case("true")
+        ) {
+            return Self::open_scaled_impl(path, max_dim, false);
+        }
+        // 硬件优先（FFmpeg 自有 D3D11VA/DXVA2 设备，worker 线程独享上下文——无调用方设备
+        // 注入、无共享 immediate context，线程安全）；设备/解码器不支持 → 自动回软解。
+        match Self::open_scaled_impl(path, max_dim, true) {
+            Ok(r) => Ok(r),
+            Err(_) => Self::open_scaled_impl(path, max_dim, false),
+        }
+    }
+
     fn open_scaled_impl(path: &Path, max_dim: u32, hw_required: bool) -> Result<Self> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         ffmpeg::init().context("ffmpeg init 失败")?;
@@ -1039,6 +1057,12 @@ impl VideoReader {
     /// 调用方应丢弃 `pts < 目标` 的帧直至越过目标（或直接取首个可用帧，容忍轻微回拉）。
     pub fn seek(&mut self, seconds: f64) -> Result<()> {
         let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.seek_inner(seconds)
+    }
+
+    /// 无锁版 `seek`（调用方须已持有 [`FFMPEG_LOCK`]）：`avformat_seek_file` + 解码器 flush。
+    /// 供 [`Self::skip_to_bgra_into`] 在自身持锁期间复用，避免 `std::Mutex` 不可重入自锁。
+    fn seek_inner(&mut self, seconds: f64) -> Result<()> {
         let ts = (seconds.max(0.0) * 1e6) as i64;
         self.ictx
             .seek(ts, i64::MIN..i64::MAX)
@@ -1046,6 +1070,83 @@ impl VideoReader {
         self.decoder.flush();
         self.drained = false;
         Ok(())
+    }
+
+    /// 是否硬件解码（D3D11VA/DXVA2，FFmpeg 自有设备）：供上层决定预滚是否走
+    /// [`Self::skip_to_bgra_into`]（硬件跳帧免转换、免回读）。
+    pub fn is_hw(&self) -> bool {
+        self.hw.is_some()
+    }
+
+    /// **seek 预滚专用**：`seek(target)` 后逐帧解码，**落点前帧只解码不转换**（不算 pts 的
+    /// sws/回读；硬件帧 ≈0.5ms/帧），直到第一个 `pts ≥ target` 的帧，再把该帧一次性转
+    /// BGRA 写进 `out`（须 ≥ 输出 w×h×4，一般用源尺寸预分配即可）。
+    ///
+    /// 返回 `Some((pts 秒, 宽, 高, 已跳帧数))`；`None` = 到达流末尾仍未到 target（EOF，
+    /// 之后可再 seek 复用）。无 pts 的帧一律跳过（不计 skipped）。相比逐帧 `next_frame_bgra_into`
+    /// + 上层过滤：省掉每帧 sws/回读（软解 4.6→2.9ms/帧；硬解 4.9→0.5ms/帧），是 seek 墙钟
+    /// 的主要加速来源（交接文档「seek2first 占 90%+」直指本路径）。
+    ///
+    /// 线程归属调用方（worker 拉帧），恒持 [`FFMPEG_LOCK`]；`seek_inner` 不再重复加锁。
+    pub fn skip_to_bgra_into(
+        &mut self,
+        target: f64,
+        out: &mut [u8],
+    ) -> Result<Option<(f64, u32, u32, u64)>> {
+        let _ffmpeg_guard = FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        self.seek_inner(target)?;
+        let mut skipped: u64 = 0;
+        loop {
+            let packet = self.next_video_packet();
+            let packet = match packet {
+                Some(p) => p,
+                None => {
+                    // 流结束：drain 掉解码器缓冲的剩余帧
+                    if !self.drained {
+                        self.decoder.send_eof().ok();
+                        self.drained = true;
+                    }
+                    let mut f = ffmpeg::frame::Video::empty();
+                    while self.decoder.receive_frame(&mut f).is_ok() {
+                        let Some(pts) = f.pts() else {
+                            continue;
+                        };
+                        if self.pts_seconds(pts) >= target {
+                            if let Some((p, w, h)) = self.convert_bgra_into(&f, out)? {
+                                return Ok(Some((p, w, h, skipped)));
+                            }
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    return Ok(None);
+                }
+            };
+            self.decoder
+                .send_packet(&packet)
+                .context("decoder send_packet 失败")?;
+            // 一个包可能产出 0~多帧（B 帧）；全部消耗到 EAGAIN 再喂下个包
+            let mut f = ffmpeg::frame::Video::empty();
+            while self.decoder.receive_frame(&mut f).is_ok() {
+                let Some(pts) = f.pts() else {
+                    continue;
+                };
+                if self.pts_seconds(pts) >= target {
+                    if let Some((p, w, h)) = self.convert_bgra_into(&f, out)? {
+                        return Ok(Some((p, w, h, skipped)));
+                    }
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+
+    /// 帧 pts（第纳秒）转秒（time_base 换算）。
+    #[inline]
+    fn pts_seconds(&self, pts: i64) -> f64 {
+        pts as f64 * f64::from(self.time_base.numerator())
+            / f64::from(self.time_base.denominator())
     }
 
     /// 推进到**下一帧**并转成 BGRA。返回 [`DecodedFrame`]；

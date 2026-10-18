@@ -181,6 +181,7 @@ L. 会话复用检查（**必填**，派活前完成，不得省略）：
 | K19 | 性能先例复制：同文件已有虚拟化/行高/缓存先例（如 toc `TOC_VIRTUALIZE_MIN=200`）时新增列表类渲染必须按同阈值对齐；文件树首版逐帧全量物化万级目录、评审才补虚拟化 |
 | K20 | abort 恢复：子 agent 被中止后主 agent 须 build + 定向测试复证残余交付；改型/逻辑类必补独立评审再提交（打开最近改版曾跳过评审即失去回归兜底） |
 | K21 | GUI 授权门槛：用户未明示要开 GUI 时子 agent 不得打开/截图；应改用 `#[gpui::test]` 真夹具基准（如 seek 墙钟 `bench_click_seek_land_frame_wall`）实现与验收——否则反复开 GUI 白耗/被中止（视频 seek 线实测教训） |
+| K22 | D3D11 immediate context 非线程安全：把渲染线程的 `ID3D11DeviceContext` 交给解码 worker 并发操作（含经 deferred context 的拷贝）在真机即崩（exit 2173），deferred 在 WARP/hardware 还有数据竞争与 AV——跨线程 GPU 处理须「各线程独享上下文」（FFmpeg 自有设备 + 内核 `skip_to_bgra` 预滚「只解码不转换、末帧回读」，seek ×6 且无共享；零回读渲染管线留待驱动/加固） |
 
 ## 7. 已踩坑速查（实现要点）
 
