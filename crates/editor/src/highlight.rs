@@ -975,6 +975,12 @@ mod tests {
     /// 单源色板对拍：编辑器 `name_color` 必须与 syntax GitHubTheme 同 scope 色完全一致
     /// （此前两套内嵌色板数值漂移，如 comment 浅色 0x6e7781 vs 官方 0x6a737d；
     /// 统一后 editor 碱色 == syntax 碱色锁死）。
+    ///
+    /// `variable`/`punctuation` 特意参与同一恒等式：GitHubTheme 对二者返回 **None**
+    /// （未设色 → 沿用外层文字色，见 syntax::resolve_line_styles_with 的 doctrine），
+    /// 编辑器放行 None 后 token 落在主题文字色（`colors.fg`）——与 WYSIWYG 代码块对
+    /// 无样式段的行为逐像素一致。若未来 syntax 给它们配了色，编辑器必须同步跟上，
+    /// 此断言即护栏。
     #[test]
     fn editor_colors_match_syntax_github_theme() {
         let names = [
@@ -992,6 +998,8 @@ mod tests {
             "property",
             "constant",
             "preproc",
+            "variable",
+            "punctuation",
         ];
         for dark in [false, true] {
             let theme = github_theme_cached(dark);
@@ -999,12 +1007,9 @@ mod tests {
                 assert_eq!(
                     name_color(name, dark),
                     theme.style(name).and_then(|s| s.color),
-                    "scope {name} dark={dark} 颜色应与 syntax GitHubTheme 一致"
+                    "scope {name} dark={dark} 颜色（含 None）应与 syntax GitHubTheme 完全一致"
                 );
             }
-            // 未设色 scope（variable/punctuation）→ 编辑器应放行（沿用外层文字色）。
-            assert_eq!(name_color("variable", dark), None, "dark={dark}");
-            assert_eq!(name_color("punctuation", dark), None, "dark={dark}");
         }
     }
 }
