@@ -235,6 +235,74 @@ pub(crate) fn hw_engaged_reset() {
     HW_ENGAGED.store(false, Ordering::Relaxed);
 }
 
+/// 测试专用故障注入（模拟硬解设备丢失 / 瞬时解码错误）——仅 `cfg(test)` 存在，生产零字段
+/// 零开销（编译期折叠）：视频 worker 在给**硬解** reader 发解码/预滚 FFI 前查 [`hw_fault_hook`]，
+/// 返回 true 即视为本次调用失败（走与真实 FFI 报错完全相同的恢复路径）。
+///
+/// 计数语义：`HW_FAULT_AFTER > 0` 的每一拍 = 放行一帧成功并 -1；归 0 后按 [`HW_FAULT_KIND`]
+/// 触发（1 = 一次性注入后自动撤销=瞬时错误场景；2 = 持续注入=设备丢失场景，直到 worker 重开
+/// 软解不再走硬解路径）。
+#[cfg(test)]
+static HW_FAULT_AFTER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+#[cfg(test)]
+static HW_FAULT_KIND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// 注入已实际触发过（测试等待把「错误已发生」与「重开已完成」解耦）。
+#[cfg(test)]
+static HW_FAULT_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 测试专用：置故障注入。`after` = 之前还要放过的**成功**硬解帧数（0 = 下一次硬解调用即注入）；
+/// `persistent` = true 持续失败（设备丢失），false 一次性失败后自动撤销（瞬时错误）。配合
+/// HwFaultGuard（Drop 复位）保证任何退出路径都不把注入泄漏给后续测试。
+#[cfg(test)]
+pub(crate) fn hw_fault_fail_after(after: i64, persistent: bool) {
+    HW_FAULT_AFTER.store(after, Ordering::Relaxed);
+    HW_FAULT_KIND.store(if persistent { 2 } else { 1 }, Ordering::Relaxed);
+    HW_FAULT_FIRED.store(false, Ordering::Relaxed);
+}
+
+/// 测试专用：撤销故障注入。
+#[cfg(test)]
+pub(crate) fn hw_fault_disable() {
+    HW_FAULT_AFTER.store(-1, Ordering::Relaxed);
+    HW_FAULT_KIND.store(0, Ordering::Relaxed);
+}
+
+/// 测试专用：注入是否已实际触发过至少一次。
+#[cfg(test)]
+pub(crate) fn hw_fault_fired() -> bool {
+    HW_FAULT_FIRED.load(Ordering::Relaxed)
+}
+
+/// 测试专用：worker 硬解调用前的故障钩子。返回 true = 本次调用模拟失败（`skip_to_bgra_into`
+/// 与 `next_frame_bgra_into` 两条 FFI 路径共用）。
+#[cfg(test)]
+fn hw_fault_hook() -> bool {
+    let after = HW_FAULT_AFTER.load(Ordering::Relaxed);
+    if after > 0 {
+        // 放行一帧成功（计数 -1），直到归 0 才触发注入
+        HW_FAULT_AFTER.fetch_sub(1, Ordering::Relaxed);
+        return false;
+    }
+    if after != 0 {
+        return false; // -1 = 未启用
+    }
+    match HW_FAULT_KIND.load(Ordering::Relaxed) {
+        1 => {
+            // 一次性：注入一次后自动撤销（瞬时错误场景——播放继续、不应触发重开）
+            HW_FAULT_KIND.store(0, Ordering::Relaxed);
+            HW_FAULT_AFTER.store(-1, Ordering::Relaxed);
+            HW_FAULT_FIRED.store(true, Ordering::Relaxed);
+            true
+        }
+        2 => {
+            // 持续失败（TDR / 设备丢失）：worker 重开软解前一直报错
+            HW_FAULT_FIRED.store(true, Ordering::Relaxed);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// 测试基准取数：tick 在「seek 首帧上屏」那刻把 8 字段快照（字段名/顺序/单位与 GUI [SEEK]
 /// 一行完全一致）沉淀到本测试线程槽，`bench_click_seek_land_frame_wall` 每次落点后取走即清。
 /// thread_local 避免全局槽跨测试线程竞争（每个 gpui::test 独立线程）；仅 cfg(test) 存在，
@@ -829,13 +897,22 @@ impl VideoViewer {
                 // 尺寸不填（loading 只关参数缺失），切换窗口期对撞时即触发。
                 let _ = out.send(Ok(active.as_ref().expect("复用分支已有 reader").2.params()));
             }
-            let (_, _, reader) = active.as_mut().expect("复用分支已确保有 reader");
             // 硬解 reader（FFmpeg 自有设备）：seek 预滚走 `skip_to_bgra_into`（一次调用完成
             // seek + 跳帧免转换 + 首帧 BGRA，seek 墙钟主要加速）；软解保持旧逐帧口径字节不动。
-            let hw_reader = reader.is_hw();
+            // 借用只在本拍即时消费、不跨内层循环持有——设备丢失自恢复要整体替换 active
+            // reader（见内层循环末尾），长借用会挡住重建。
+            let mut hw_reader = active
+                .as_ref()
+                .map(|(_, _, r)| r.is_hw())
+                .unwrap_or(false);
             if !hw_reader {
-                let _ = reader.seek(cmd.target);
+                let _ = active.as_mut().map(|(_, _, r)| r.seek(cmd.target));
             }
+            // 源顶格容量（同文件同 cap 在重开前后不变）：内层循环扩容判据，省逐帧取参
+            let src_cap = active
+                .as_ref()
+                .map(|(_, _, r)| r.source_cap())
+                .unwrap_or(1);
             // seek 全链路探针（env 开或 test 构建采集，打印仍只按 env；本命仅 seek 命令开）：
             // 收集「回退量 / 预滚数 / 首帧≥target 入队时刻」，首帧入队瞬间写槽（此时
             // 解码量已定——预滚帧全在它之前），tick 首帧上屏时聚合打印一次。
@@ -847,6 +924,14 @@ impl VideoViewer {
             let mut seek_first_sent: Option<Instant> = None;
             // 硬解首帧是否已由 skip_to_bgra 产出（软解恒 false → 走旧逐帧预滚过滤）
             let mut hw_primed = false;
+            // —— 设备丢失自恢复（本命令内状态）——
+            // 帧接纳阈值（pts ≥ 此值才送）：初始 = seek 落点；设备丢失重开软解后抬到「最后
+            // 成功解码 pts」，保证续播从该位置起、不把更早的预滚帧当新内容送出去。
+            let mut frame_target = cmd.target;
+            // 硬解 reader 连续解码/预滚失败计数（成功即清零；EOF 不计入）
+            let mut hw_fail_count: u32 = 0;
+            // 最近一次成功解码的帧 pts（重开软解时的续播位置；一帧未解过则 = seek 落点）
+            let mut resume_pts = cmd.target;
             // seek 预滚过滤：ffmpeg seek 回拉到目标前关键帧（video-ffmpeg decode.rs 的
             // seek 文档注明「调用方须丢弃 pts < 目标的帧」）；不丢的话，keyframe→落点
             // 整段帧会被主线程排空当「迟到帧」快速连放 = seek 后视频加速/一闪而过。
@@ -863,59 +948,76 @@ impl VideoViewer {
             let mut vp_window = Instant::now();
             while gen_arc.load(Ordering::SeqCst) == cmd.generation {
                 let t0 = Instant::now();
-                let item = if hw_reader && !hw_primed {
-                    hw_primed = true;
-                    // ---- 硬解 seek 预滚快路径：一次 `skip_to_bgra_into` 完成 seek + 跳帧
-                    //（免转换/免回读）+ 首帧 BGRA —— seek 墙钟主要加速 ----
-                    if buf.len() < reader.source_cap() {
-                        buf.resize(reader.source_cap(), 0);
+                // 设备丢失/瞬时错误注入（仅测试构建）：硬解 reader 下一次解码/预滚前查一次
+                let fault_now = {
+                    #[cfg(test)]
+                    {
+                        hw_reader && hw_fault_hook()
                     }
-                    match reader.skip_to_bgra_into(cmd.target, &mut buf[..]) {
-                        Ok(Some((pts, w, h, skipped))) => {
-                            // skip 计数由内核给出（旧预滚逐帧累加，口径同为「pts<target 已跳帧」；
-                            // 首帧 pts≥target 由内核保证）
-                            if seek_diag_on {
-                                seek_skipped = skipped.min(u32::MAX as u64) as u32;
+                    #[cfg(not(test))]
+                    {
+                        false
+                    }
+                };
+                let item = {
+                    // 本拍即时借用；块退出即释放，恢复分支可整块替换 active
+                    let reader = &mut active.as_mut().expect("打开成功必有 reader").2;
+                    if fault_now {
+                        Err(anyhow::anyhow!("测试注入：模拟硬解设备丢失/解码失败"))
+                    } else if hw_reader && !hw_primed {
+                        hw_primed = true;
+                        // ---- 硬解 seek 预滚快路径：一次 `skip_to_bgra_into` 完成 seek + 跳帧
+                        //（免转换/免回读）+ 首帧 BGRA —— seek 墙钟主要加速 ----
+                        if buf.len() < src_cap {
+                            buf.resize(src_cap, 0);
+                        }
+                        match reader.skip_to_bgra_into(frame_target, &mut buf[..]) {
+                            Ok(Some((pts, w, h, skipped))) => {
+                                // skip 计数由内核给出（旧预滚逐帧累加，口径同为「pts<target 已跳帧」；
+                                // 首帧 pts≥target 由内核保证）
+                                if seek_diag_on {
+                                    seek_skipped = skipped.min(u32::MAX as u64) as u32;
+                                }
+                                let need = (w as usize) * (h as usize) * 4;
+                                Ok(Some(FrameItem::Soft(SoftFrame {
+                                    pts,
+                                    w,
+                                    h,
+                                    bgra: buf[..need].to_vec(),
+                                })))
                             }
-                            let need = (w as usize) * (h as usize) * 4;
-                            Ok(Some(FrameItem::Soft(SoftFrame {
-                                pts,
-                                w,
-                                h,
-                                bgra: buf[..need].to_vec(),
-                            })))
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
                         }
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    // ---- 软解 / 硬解稳态逐帧路径（与旧版逐帧同口径）----
-                    // 扩容目标：始终按源顶格（source_cap）兜底——任何解码输出 ≤ 源尺寸，
-                    // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
-                    // 只在扩容瞬间发生一次，逐帧不重置。
-                    if buf.len() < reader.source_cap() {
-                        buf.resize(reader.source_cap(), 0);
-                    }
-                    // 复用持久缓冲 `_into`（零初始化只在扩容时发生一次）；帧产物
-                    // `buf[..need].to_vec()`（一次 memcpy、无逐帧 memset）计入 decode 窗——
-                    // 与旧版 `next_frame_bgra` 的「内部 vec![0;N]+sws 写入」口径对齐，VPROF
-                    // 才可比。
-                    match reader.next_frame_bgra_into(&mut buf[..]) {
-                        Ok(Some((pts, w, h))) => {
-                            let need = (w as usize) * (h as usize) * 4;
-                            // 不做 `truncate`：它只缩短 len、不释放容量（顶格内存照样驻留），
-                            // 反而把下次 `_into` 的上界从恒安全的 source_cap 缩成上一帧 need——
-                            // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
-                            // 断代）。保持 len=source_cap，need 只用于本帧 to_vec 切片。
-                            Ok(Some(FrameItem::Soft(SoftFrame {
-                                pts,
-                                w,
-                                h,
-                                bgra: buf[..need].to_vec(),
-                            })))
+                    } else {
+                        // ---- 软解 / 硬解稳态逐帧路径（与旧版逐帧同口径）----
+                        // 扩容目标：始终按源顶格（src_cap）兜底——任何解码输出 ≤ 源尺寸，
+                        // 缓冲永不小于未知的当前帧 need，`_into` 的 slice 上界恒安全。零初始化
+                        // 只在扩容瞬间发生一次，逐帧不重置。
+                        if buf.len() < src_cap {
+                            buf.resize(src_cap, 0);
                         }
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(e),
+                        // 复用持久缓冲 `_into`（零初始化只在扩容时发生一次）；帧产物
+                        // `buf[..need].to_vec()`（一次 memcpy、无逐帧 memset）计入 decode 窗——
+                        // 与旧版 `next_frame_bgra` 的「内部 vec![0;N]+sws 写入」口径对齐，VPROF
+                        // 才可比。
+                        match reader.next_frame_bgra_into(&mut buf[..]) {
+                            Ok(Some((pts, w, h))) => {
+                                let need = (w as usize) * (h as usize) * 4;
+                                // 不做 `truncate`：它只缩短 len、不释放容量（顶格内存照样驻留），
+                                // 反而把下次 `_into` 的上界从恒安全的 src_cap 缩成上一帧 need——
+                                // 若解码输出尺寸变化（未来/其它源）会拿到过小的 slice（cdylib 报错
+                                // 断代）。保持 len=src_cap，need 只用于本帧 to_vec 切片。
+                                Ok(Some(FrameItem::Soft(SoftFrame {
+                                    pts,
+                                    w,
+                                    h,
+                                    bgra: buf[..need].to_vec(),
+                                })))
+                            }
+                            Ok(None) => Ok(None),
+                            Err(e) => Err(e),
+                        }
                     }
                 };
                 let t1 = Instant::now();
@@ -928,8 +1030,24 @@ impl VideoViewer {
                         }
                     }
                 }
+                // —— 设备丢失/瞬时错误记账（仅硬解 reader；软解零分支零开销）——
+                // 成功帧 → 清失败计数 + 续播位置前移；错误帧 → 连续失败计数 +1（EOF 不算）。
+                let mut item_err = false;
+                if hw_reader {
+                    match &item {
+                        Ok(Some(f)) => {
+                            hw_fail_count = 0;
+                            resume_pts = resume_pts.max(f.pts());
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            item_err = true;
+                            hw_fail_count += 1;
+                        }
+                    }
+                }
                 let keep = match item {
-                    Ok(Some(frame)) if frame.pts() >= cmd.target => {
+                    Ok(Some(frame)) if frame.pts() >= frame_target => {
                         // 落点前一帧保底（排空先有帧可上屏）；软帧发送失败直接丢弃（无池资源）
                         if let Some(p) = pre_roll.take() {
                             let _ = cmd.tx.send(p);
@@ -1005,6 +1123,38 @@ impl VideoViewer {
                     }
                 }
                 if !keep {
+                    // —— 设备丢失自恢复：硬解 reader 连续解码/预滚失败 ≥2 次 → 判定「该
+                    // 文件硬解设备已丢」（TDR / driver reset / device-removed），静默重开软解
+                    // reader 从当前播放位置续播（一个定格可接受，不弹错、不冻结）；单次瞬时
+                    // 错误容忍（继续下一帧，不重开、不断代——若设备真丢，下一拍同样报错即进
+                    // 上面分支）——
+                    if hw_reader && item_err && hw_fail_count >= 2 {
+                        hw_fail_count = 0;
+                        // 本文件永久弃用硬解：后续 open 直接软解（其它文件仍可硬解）
+                        crate::decode::blacklist_hw_path(&cmd.path);
+                        let reopen_pos = resume_pts;
+                        match Self::open_reader_for_mode(&cmd.path, &ReaderMode::Soft(cmd.cap)) {
+                            Ok((soft_mode, soft_reader)) => {
+                                active = Some((cmd.path.clone(), soft_mode, soft_reader));
+                                hw_reader = false;
+                                hw_primed = true;
+                                // 续播接纳阈值抬到最后成功解码 pts：首个软帧 ≥ 此值才送
+                                frame_target = reopen_pos;
+                                pre_roll = None;
+                                let _ = active
+                                    .as_mut()
+                                    .map(|(_, _, rd)| rd.seek(reopen_pos));
+                                continue; // 下一拍起走软解逐帧路径，播放无感接续
+                            }
+                            Err(e) => {
+                                // 重开软解也失败：落断代（与既有错误断代一致，不弹错）
+                                let _ = e;
+                            }
+                        }
+                    } else if hw_reader && item_err {
+                        // 单次瞬时错误：容忍——不重开、不断代，继续解下一帧
+                        continue;
+                    }
                     // 本命以 EOF/解码错误结束（换代时不走此分支进入——换代已把旧接收端
                     // 换走，`try_send` 连不上、帧被丢弃且非必需；画面保留最近上屏帧，跟手
                     // 由 `SCRUB_RETARGET_MS` 节流保证，不依赖这里的保底）：把缓存的「落点
@@ -1028,6 +1178,14 @@ impl VideoViewer {
     ) -> anyhow::Result<(ReaderMode, VideoReader)> {
         match mode {
             ReaderMode::Auto(cap) => {
+                // 设备丢失黑名单路径：不再尝试 hw init，直接软解（返回 Soft 模式便于复用判据
+                // 对齐；其它文件不受影响，仍走硬解）
+                if crate::decode::hw_path_blacklisted(path) {
+                    #[cfg(test)]
+                    HW_ENGAGED.store(false, Ordering::Relaxed);
+                    return VideoReader::open_scaled(path, *cap)
+                        .map(|r| (ReaderMode::Soft(*cap), r));
+                }
                 let r = VideoReader::open_scaled_hw(path, *cap)?;
                 #[cfg(test)]
                 HW_ENGAGED.store(r.is_hw(), Ordering::Relaxed);
@@ -3161,6 +3319,16 @@ mod tests {
         })
     }
 
+    /// 设备丢失回归的测试卫生守卫：任何退出路径（含 panic unwind）都清空硬解黑名单并撤销
+    /// 故障注入，防进程级静态泄漏污染后续测试（黑名单/注入均为进程级持久状态）。
+    struct FaultAndBlGuard;
+    impl Drop for FaultAndBlGuard {
+        fn drop(&mut self) {
+            crate::decode::hw_blacklist_clear_for_test();
+            hw_fault_disable();
+        }
+    }
+
     /// delta 回归（音频 worker 复用）：常驻 `AudioReader` 连续 seek 回不同落点，每次重新
     /// 起播首块 pts 落在目标附近（reuse 不重开文件、`AudioReader::seek` 冲掉 swr 残留）。
     /// 真音频（`target\视频测试.mp4` 有音轨），缺夹具 SKIP（AGENTS.md §5）。
@@ -4144,6 +4312,208 @@ mod tests {
             "落点帧不得早于 target={target:.2}s future={landed:.2}s"
         );
         eprintln!("[HW paused seek] target={target:.2}s firstpts={landed:.2}s 落地");
+        cx.run_until_parked();
+    }
+
+    /// 回归：**硬解设备丢失（D3D11 TDR / driver reset / device-removed）播放中途自动回软解续播**
+    /// ——不再把帧解码错误当致命断代（冻结在最后一帧）。恢复策略（见 worker 内层循环）：
+    /// 硬解 reader 连续 2 次解码/预滚失败 → 判定「该文件硬解设备已丢」→ (a) 黑名单该路径 +
+    /// 静默重开**软解** reader @当前播放位置（最后成功解码 pts / seek 落点）续播（一个定格可接受，
+    /// 不弹错、不冻结）；单次瞬时错误容忍、不重开。
+    ///
+    /// 断言（故障由测试注入在 worker 硬解 FFI 前返回错误模拟，走与真实报错同一条恢复路径）：
+    /// (a) 重开后 soft reader 接管（`hw_engaged()==false`、reader is_hw()==false）；
+    /// (b) 续播帧 pts ≥ 丢失前最后上屏位置；(c) 该路径进硬解黑名单——再 `open_scaled_hw` 直接
+    /// 回软解；(d) 另一文件仍走硬解（黑名单路径级不外溢，worker 切文件再验一次）；另断言单次
+    /// 瞬时错误后仍是硬解且播放继续（不触发重开）。纯代码不开 GUI；缺夹具/无硬解能力 SKIP。
+    #[gpui::test]
+    #[allow(clippy::await_holding_lock)]
+    #[cfg(target_os = "windows")]
+    async fn device_lost_auto_soft_fallback(cx: &mut TestAppContext) {
+        let _ffmpeg_guard_test = ffmpeg_guard_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // 卫生：清黑名单 + 撤注入（`_cleanup` 在任意退出路径 Drop 复位；开始时也显式清一次，
+        // 兼容本测试进程内有遗留状态的情形）
+        let _cleanup = FaultAndBlGuard;
+        crate::decode::hw_blacklist_clear_for_test();
+        hw_fault_disable();
+        hw_engaged_reset();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试字幕.mkv");
+        let other = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/视频测试.mp4");
+        if !path.exists() || !other.exists() {
+            eprintln!("SKIP: missing target/视频测试字幕.mkv / 视频测试.mp4（夹具不入库）");
+            return;
+        }
+        // 强制硬解
+        let _decode_mode = crate::decode::DecodeModeGuard::new(2);
+        // 先确认本机确有硬解能力（open_scaled_hw 内核含软回退；无能力整个场景不成立 → SKIP；
+        // 顺带预热 D3D11 设备）
+        let cap_probe = crate::decode::VideoReader::open_scaled_hw(&path, 1920)
+            .expect("open_scaled_hw 应打开成功（内核含软回退）");
+        if !cap_probe.is_hw() {
+            eprintln!("SKIP: 本机无 D3D11VA/DXVA2 硬解能力（open_scaled_hw 回软解）");
+            return;
+        }
+        drop(cap_probe);
+        // 经 viewer → 常驻 worker 打开（真解码异步；等首帧 + 时长 + pending 清 → 硬解已接管）
+        let viewer: gpui::Entity<VideoViewer> =
+            cx.update(|app| app.new(|cx| VideoViewer::new(path.clone(), cx)));
+        let mut wait = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait += 1;
+            assert!(wait < 6000, "等待 HW 首帧/时长超时");
+        }
+        assert!(hw_engaged(), "强制 hw 下 worker 打开应已硬解接管");
+        // 开始播放（真实墙钟推进 playhead → pump 排空 → worker 持续解码），先推进一段保证
+        // 注入命中「稳态逐帧解码」而非打开/预滚路径
+        let mut driving = 0;
+        loop {
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if p.is_some_and(|p| p >= 0.3) {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                v.playing = true;
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            driving += 1;
+            assert!(driving < 6000, "播放推进超时（last_frame_pts 未前进）");
+        }
+
+        // —— 单次瞬时错误：容忍，不触发重开（仍硬解），且下一次解码成功、播放继续 ——
+        let pts_before_t = cx
+            .update(|app| viewer.read(app).last_frame_pts)
+            .expect("已有上屏帧");
+        hw_fault_fail_after(0, false); // 下一次硬解调用注入一次后自动撤销
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            if hw_fault_fired() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "瞬时错误未在期限内注入");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let after_t = loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if let Some(p) = p {
+                if p > pts_before_t + 0.1 {
+                    break p;
+                }
+            }
+            assert!(Instant::now() < deadline, "瞬时错误后播放应继续（未冻结）");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(hw_engaged(), "单次瞬时错误不应触发重开（仍应硬解接管）");
+        assert!(after_t > pts_before_t, "瞬时错误后应继续出帧");
+
+        // —— 设备丢失：持续失败 ≥2 次 → 黑名单 + 自动重开软解续播 ——
+        let pts_before_lost = cx
+            .update(|app| viewer.read(app).last_frame_pts)
+            .expect("已有上屏帧");
+        hw_fault_fail_after(0, true); // 持续注入（模拟 TDR / device-removed）
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            if !hw_engaged() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "硬解丢失后应自动重开软解（hw_engaged 未复位）"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // (b) 续播：软解新帧 pts ≥ 丢失前最后上屏位置（重开位置 = 最后成功解码 pts）
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let resume_pts = loop {
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            let p = cx.update(|app| viewer.read(app).last_frame_pts);
+            if let Some(p) = p {
+                if p + 0.05 >= pts_before_lost {
+                    break p;
+                }
+            }
+            assert!(Instant::now() < deadline, "软解续播未在期限内出帧");
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert!(
+            resume_pts + 0.05 >= pts_before_lost,
+            "续播帧 pts 应 ≥ 丢失前位置 pts_before_lost={pts_before_lost:.2}s 实得={resume_pts:.2}s"
+        );
+        eprintln!(
+            "[device-lost] 软解接管：丢失前 pts={pts_before_lost:.2}s 续播首新帧={resume_pts:.2}s blacklist={}",
+            crate::decode::hw_path_blacklisted(&path)
+        );
+        // (c) 该路径进黑名单：后续 open_scaled_hw 直接回软解（不重试已失效的 D3D11 设备）
+        assert!(
+            crate::decode::hw_path_blacklisted(&path),
+            "设备丢失路径应已列入硬解黑名单"
+        );
+        let r_black = crate::decode::VideoReader::open_scaled_hw(&path, 1920)
+            .expect("黑名单路径应能打开（回软解）");
+        assert!(
+            !r_black.is_hw(),
+            "黑名单路径再 open_scaled_hw 应为软解（不再重试失效硬件）"
+        );
+        drop(r_black);
+        // (d) 另一文件仍走硬解（黑名单是路径级，不扩散到其它文件）
+        hw_fault_disable(); // 撤注入：下一支/直开不应再被注入
+        let r_other = crate::decode::VideoReader::open_scaled_hw(&other, 1920)
+            .expect("另一文件应能打开");
+        assert!(r_other.is_hw(), "另一文件 open_scaled_hw 仍应硬解（黑名单不外溢）");
+        drop(r_other);
+        // (d-2) worker 切到另一文件：仍硬解（黑名单路径级在 worker 打开路径同样生效）
+        cx.update(|app| {
+            viewer.update(app, |v, cx| {
+                v.nav = FolderNav::new(vec![path, other], 0);
+                v.open_folder_index(1, cx);
+            })
+        });
+        let mut wait2 = 0;
+        loop {
+            let ready = cx.update(|app| {
+                let v = viewer.read(app);
+                v.frame.is_some() && v.duration > 1.0 && v.pending_seek.is_none()
+            });
+            if ready {
+                break;
+            }
+            viewer.update(cx, |v, cx| {
+                let _ = v.tick(cx);
+            });
+            cx.background_executor.timer(Duration::from_millis(5)).await;
+            wait2 += 1;
+            assert!(wait2 < 6000, "切换到另一文件等待首帧/时长超时");
+        }
+        assert!(
+            hw_engaged(),
+            "切换到的另一文件应仍硬解（黑名单不外溢到其它路径）"
+        );
+        eprintln!("[device-lost] 另一文件仍硬解接管（hw_engaged={}）", hw_engaged());
         cx.run_until_parked();
     }
 

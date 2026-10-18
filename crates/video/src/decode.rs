@@ -14,8 +14,9 @@
 //! 句柄只在解码线程内部创建/使用/释放（裸指针非 `Send`，对齐旧版的「不跨线程搬 reader」）。
 //! FFmpeg 并发闸（FFMPEG_LOCK）在 cdylib 内，跨操作的并发串行由它保证。
 
-use std::path::Path;
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context as _, Result};
 
@@ -285,6 +286,45 @@ impl std::ops::Drop for DecodeModeGuard {
     }
 }
 
+// ---------------- 硬解设备丢失黑名单（进程级，worker 自恢复用） ----------------
+
+/// 已被判定「硬解设备丢失」的路径集合（进程内运行时状态）：这些路径后续
+/// [`VideoReader::open_scaled_hw`] 一律直接回软解，避免在已失效的 D3D11VA/DXVA2 设备上
+/// 反复重试 hw init / 解码（TDR / driver reset / device-removed 后 D3D11 设备不可再信）；
+/// 其它路径不受影响、仍正常尝试硬解。生产者是视频 worker（单线程写），消费者是 worker
+/// 自身与测试线程（读），偶尔也有 hover worker 并发读——低频访问，用一个小互斥锁保护
+///（集合元素级即可，不锁解码路径）。
+static HW_BLACKLIST: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn hw_blacklist() -> &'static std::sync::Mutex<HashSet<PathBuf>> {
+    HW_BLACKLIST.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// 将 `path` 加入硬解黑名单（视频 worker 判定设备丢失后调用；进程内生效，仅内存态）。
+pub(crate) fn blacklist_hw_path(path: &Path) {
+    hw_blacklist()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+/// `path` 是否已被判「该文件硬解设备丢失」（打开前短路到软解）。
+pub(crate) fn hw_path_blacklisted(path: &Path) -> bool {
+    hw_blacklist()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(path)
+}
+
+/// 测试专用：清空硬解黑名单（测试卫生——黑名单进程级持久，防泄漏污染后续测试）。
+#[cfg(test)]
+pub fn hw_blacklist_clear_for_test() {
+    hw_blacklist()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 // ---------------- 视频 Reader ----------------
 
 /// 可 seek 的持久视频解码器（运行时桥接 `video_ffmpeg.dll`）。**非 `Send`**：
@@ -348,6 +388,11 @@ impl VideoReader {
     /// 与 [`Self::open_scaled`] 同 semantics（`max_dim` sws 封顶、params() 源尺寸）；seek 预滚
     /// 用 [`Self::skip_to_bgra_into`] 跳帧免转换，是 seek 墙钟的主要加速。
     pub fn open_scaled_hw(path: &Path, max_dim: u32) -> Result<Self> {
+        // 设备丢失黑名单路径：直接回软解（不重试已失效的 D3D11VA/DXVA2 设备；`max_dim`
+        // 封顶语义与软解 open 一致，params() 仍报源尺寸——与内核自动回软退同口径）。
+        if hw_path_blacklisted(path) {
+            return Self::open_scaled(path, max_dim);
+        }
         let b = bridge().context("视频运行库不可用（缺 video_ffmpeg.dll 或 FFmpeg 运行库）")?;
         let cpath = utf8_cstr(path)?;
         let mut handle: Handle = std::ptr::null_mut();
