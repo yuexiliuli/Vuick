@@ -1,156 +1,152 @@
 <!--
-REFACTORED: 2026-10-17
-STYLE: LLM Protocol Body (v2)
-LAST_AUDIT_PATCH: 2026-10-18-001
+REFACTORED: 2026-10-18
+STYLE: LLM Protocol Body (v3)
+LAST_AUDIT_PATCH: 2026-10-18-003
 -->
 
-# AGENTS.md（LLM 执行协议 v2）
+# AGENTS.md（LLM 执行协议 v3）
 
-> **2026-10-18 夜间自主使命指令覆盖（用户当面授权，任务结束即失效）**
-> ① **vendor gpui 合法化**：`vendor/zed` 是本仓内的 gpui/gpui_platform/gpui_windows fork（Apache-2.0），
->    修改它**不算**「改 gpui checkout」，用于视频零回读 GPU 直通（YUV 着色器/D3D11 设备暴露/外部纹理）可随意改。
-> ② **提交权**：本使命内用户明确授权「完成一项功能后自动提交 git」，主 agent 可自行提交（普通会话仍须用户口令）。
-> ③ 用户明示「权限全部交给你、不用经过确认、可查阅互联网」，使命内不再阻塞等确认；
->    验收仍按 §3 协议（debug 构建、#[gpui::test] 真夹具墙钟、不开 GUI）。
-> ④ 收尾：完成全部目标后由主 agent 提交最终报告并执行睡眠命令。
+> 本文是主 Agent 的调度执行协议。§1–§5 = **规则区**（短句/表格，遇场景即执行）；§6 = **经验知识库**（Rule↔Rationale 隔离，教训只在此处，K# 可被规则区引用）；§7 = 实现要点速查；§8 = 工具与技能调度；§9 = 多仓库依赖图定位。
+> 派活前必须先走 §1 强制思考；验收口径见 §5；提交权只在主 Agent、只在用户明确说「提交git」后执行。
 
-## 0. 项目与角色边界
+## 0. 调度路由（读到哪节）
 
-**项目**：Rust + GPUI 的编辑器/阅读器应用（`gpui-editor`）。P5 已拆 Cargo workspace：`src/main.rs` 只是薄二进制壳，功能全在各 crate（`crates/shell`=外壳/侧栏/EditorApp、`crates/editor`=编辑区、`crates/markdown`=Markdown 预览、`crates/pdf`=PDF 阅读、`crates/epub`、`crates/viewer`、`crates/image_viewer`、`crates/video`、`crates/video-ffmpeg`=解码内核 cdylib、`crates/syntax`、`crates/ui`、`crates/toc`、`crates/config`、`crates/base`、`crates/ime`）。
+| 当前想做 | 读本节 |
+|---|---|
+| 每次派活前 | §1 强制思考 → §2 派活协议 |
+| 写 brief | §2.1 八字段 |
+| 验证 / 编译 | §3 执行协议 |
+| 收报告后核对 | §4 上下文收敛 |
+| 子 agent 验收口径 | §5 |
+| 撞到坑 / 规则模糊 | §6 经验知识库 K1–K28 |
+| 调工具 / 加载 skill | §8 工具与技能调度 |
+| 定位 gpui/zed 依赖图 | §9 |
 
-**角色职责表**：
+## 1. 派活前置：强制思考协议（CoT）
 
-| 角色 | 职责 | 边界 |
-|---|---|---|
-| 主 agent | 派活 → 收报告 → 轻量核对 → 按用户指示提交/推送 | 不读大文件、不精读大 diff、不亲手写功能代码；提交仅当用户明确说"提交git" |
-| 子 agent `general` | 实现 / 评审 / 性能对比 / 问题定位（可动手） | 不提交 git |
-| 子 agent `explore` | 只读探索 | 不修改任何文件 |
-
-**任务归属**：实现 / 评审 / 性能对比 / 问题定位一律交由子 agent。
-
-**亲为例外**：根因已核实 + 改动小而精确时，主 agent 可直接改（依据 K1；涉及纯函数化/参数语义/调用点时仍须满足 §3「亲为不变式」）。纯视觉/布局微调（无逻辑变更、无参数语义改动，如去标题、改间距/线条）允许主 agent 亲为——但须先 grep 定点 + 最小窗口 read（≤~200 行）确认上下文，并 build + 定向测试复证后才准进提交。
-
-## 1. 派活协议
-
-### 1.1 派活前强制思考（<thinking> 内逐条作答后才写 brief）
-
-> A–L 逐条在消息正文作答亦视为满足本节（不强制 `<thinking>` 标签），但不得省略任何一条。
+> 每次写 brief **之前**，必须在 `<thinking>` 内按 A–L 逐条作答；任一条未答即停，不写 brief。
+> A–L 逐条在消息正文作答视同满足；不得省略任何一条。
 
 ```
 <thinking>
 A. 三问是否已用一次 question 对齐？用户答案是否逐字抄入 brief
    （构建模式 / 目标可观测行为 / 约束：许可 兼容 默认产物 不能改的语义）？
-B. 行为匹配类（排序/格式/交互/路由）brief 是否含「精确可观测期望 + 回归断言」？
-C. 性能/耗时类是否已立用户感知基线（如 debug 打开首帧墙钟）？
-   方案改变不了该指标 → 是否直接返回阻塞、不发货？
-D. 选型/许可类约束是否已确认（新依赖/许可接受度）？
-E. 评估类是否已在 brief 明说「ROI 不匹配可报维护现状」？
-F. 评估已判「低 ROI/维持现状/不建议」的方向，是否已再用一次 question 复核后才派实现？
-   （复核须在**写 brief 之前**完成——P1 教训：brief 写完才被中止，成本已付）
+B. 行为匹配类（排序/格式/交互/路由）：brief 是否含「精确可观测期望 + 回归断言」？
+C. 性能/耗时类：是否已立用户感知基线（如 debug 打开首帧墙钟）？
+   方案改变不了该指标 → 直接返回阻塞、不发货。
+D. 选型/许可类：新依赖/许可接受度是否已确认？
+E. 评估类：brief 是否明说「ROI 不匹配可报维护现状」？
+F. 已判「低 ROI/维持现状/不建议」的方向，是否已用一次 question 复核后才派实现？
+   （复核必须在写 brief 之前完成——P1 教训：brief 写完才被中止，成本已付）
 G. 并行性：是否已判定「谁会被别家未提交的中间编译/测试态污染」？
-   共享测试套件的 crate 家族 → 一律串行；只读分析 / 不同 crate 独立改 → 可并行。
+   共享测试套件的 crate 家族 → 串行；只读分析 / 不同 crate 独立改 → 可并行。
 H. 目标 + 已知落点是否给了 path:行号（附「行号可漂移、先 grep/read 精读再动」）？
 I. 需求清单是否逐条可验收？缓存/派生状态改动是否列全失效源？
    交互语义是否已给「各触发点行为表」并用一次 question 确认？
-J. 复用：功能/UI 派活前是否已查既有可复用组件？轻量组件要补现有能力是否先确认复用核心？
+J. 复用：功能/UI 派活前是否已查既有可复用组件？新能力是否先确认复用核心？
 K. 纪律是否已写入 brief：不改 gpui checkout、不加依赖、提交权在主 agent、
    颜色走 ui::theme、注释中文、先 get_minimal_context_tool(task=...)？
-L. 会话复用检查（**必填**，派活前完成，不得省略）：
+L. 会话复用检查（必填，派活前完成，不得省略）：
    1. 列出本次任务核心文件/区域
-   2. 检索前序活跃子 agent 会话中是否有「同文件 + 同区域 + 同角色（实现↔实现、探针↔追查）」者
-   3. 有 → brief 必须声明 `task_id: <id>` 且只写 delta；无 → 声明「task_id: 无（新建）」，并给一句理由
-   4. 实现↔评审跨角色不续跑（保持独立）→ 该情形不算"无复用"，不必续跑
-   > ⚠️ 声明"无"但实际存在同文件同角色可复用会话 → 视为违规
+   2. 检索前序活跃子 agent 会话是否有「同文件 + 同区域 + 同角色」者
+   3. 有 → brief 声明 task_id: <id> 且只写 delta；无 → 声明「task_id: 无（新建）」，给一句理由
+   4. 实现↔评审跨角色不续跑（保持独立）→ 该情形不算"无复用"
+   ⚠️ 声明"无"但实际存在同文件同角色可复用会话 → 视为违规
 </thinking>
 ```
 
-### 1.2 Brief 必含六字段
+## 2. 派活协议
 
-| 字段 | 要求 |
-|---|---|
-| 0 验收口径前置 | 三问答案逐字抄入；行为匹配写成回归断言；性能给用户感知基线 |
-| 1 目标 + 已知落点 | `path:行号` + 「行号可漂移，先 grep/read 精读再动」 |
-| 2 需求清单 | 逐条可勾选可验收；缓存/派生状态列全失效源（换文档/切预览/内容编辑/整篇换源/折叠/只读切换等）；交互语义给行为表后一次 `question` 确认 |
-| 3 纪律 | 不改 gpui checkout、不加依赖、提交权在主 agent、颜色走 `ui::theme`、注释中文、先 `get_minimal_context_tool`、复用既有组件 |
-| 4 验证 | 见 §3；GUI 默认不打开（§3「GUI 冒烟授权门槛」），窗口生命周期/对话框/持久化类用 `#[gpui::test]` 交互断言覆盖；仅用户明示要真机验证才含 GUI 冒烟项 |
-| 5 报告 | `path:line` → 机制 → 验证输出摘要 → 遗留风险 → 建议 commit message（几 KB 内，禁转贴源码）；**必须附「证据尾行」**：exe/源文件时间戳、测试计数、探针输出尾 ≤3 行——主 agent 核对只读这些字段 |
-| 6 复用或新建声明 | `task_id: <id>`（续跑只写 delta）或 `task_id: 无（新建，一句话理由）`；声明"无"但存在同文件同角色可复用会话 → 违规 |
-| 7 作废路径策略 | 本次改动若替换/作废旧代码路径，必须写明「保留 dormancy（源码+测试不动，新路径接管）」或「显式删除（理由 + 主 agent 确认）」；**默认 dormancy**，删除须主 agent 认可（K24） |
+### 2.1 Brief 八字段
 
-## 2. 流水线
+| # | 字段 | 必须内容 |
+|---|---|---|
+| 0 | 验收口径前置 | 三问答案逐字抄入；行为匹配写成回归断言；性能给用户感知基线 |
+| 1 | 目标 + 已知落点 | `path:行号` + 「行号可漂移，先 grep/read 精读再动」 |
+| 2 | 需求清单 | 逐条可勾选可验收；缓存/派生状态列全失效源；交互语义给行为表后一次 `question` 确认 |
+| 3 | 纪律 | 不改 gpui checkout、不加依赖、提交权在主 agent、颜色走 `ui::theme`、注释中文、先 `get_minimal_context_tool`、复用既有组件 |
+| 4 | 验证 | 见 §3；GUI 默认不打开（§3「GUI 冒烟授权门槛」）；窗口生命周期/对话框/持久化类用 `#[gpui::test]` 交互断言覆盖；仅用户明示要真机验证才含 GUI 冒烟项 |
+| 5 | 报告 | `path:line` → 机制 → 验证输出摘要 → 遗留风险 → 建议 commit message（几 KB 内，禁转贴源码）；**必须附「证据尾行」**：exe/源文件时间戳、测试计数、探针输出尾 ≤3 行——主 agent 核对只读这些字段 |
+| 6 | 复用或新建声明 | `task_id: <id>`（续跑只写 delta）或 `task_id: 无（新建，一句话理由）`；声明"无"但存在同文件同角色可复用会话 → 违规 |
+| 7 | 作废路径策略 | 本次改动替换/作废旧路径：写明「保留 dormancy（源码+测试不动，新路径接管）」或「显式删除（理由 + 主 agent 确认）」；**默认 dormancy**，删除须主 agent 认可（K24） |
+
+### 2.2 流水线与并包
 
 ```
 主 agent 轻侦察(grep 定落点) → 实现子agent(brief) → 评审子agent(发现缺陷直接修)
 → 主 agent 轻核对(git status --short && git diff --stat) → 用户说"提交git"才提交
 ```
 
-**并包规则**：凡属同一条「用户可见体验线」的连续小优化（如视频 seek 线：重播→seek 加速→seek 提速→拖拽），按体验目标**并包**派给同一续跑会话，一次实现+一次评审+一次提交收口；避免逐个 bug 拆派（每轮多付调度与冷启动）。**首访高频体验区先立「体验验收合同」**：本区定一份可观测基线（例：拖拽 ≤按 GOP 解码延迟跟手、seek→首新画面上屏 ≤150ms、拖拽不越位出声、暂停徽标可见），后续该区子 agent 直接对表验收，不经用户发现→主 agent 复核的飞轮。
+- **并包规则**：凡属同一条「用户可见体验线」的连续小优化，按体验目标并包给同一续跑会话，一次实现+一次评审+一次提交收口；首访高频体验区先立「体验验收合同」（可观测基线 + 后续对表验收）。
 
-### 2.1 修 bug 流程
+### 2.3 修 bug 流程
 
-- 复现测试先行：真实渲染断言，先 FAIL 修到 PASS。
-- 根因由实现子 agent 自证（引用代码证据）。
-- Brief 根因字段：只写已核实根因（主 agent read 确证过才给，直接省实现时间）；未核实猜测只作线索并标注「需子 agent 核实」。
-- bug 紧跟近期改动后报告 → 先定性「回归 or 既有」：首选 `git show <上一commit> -- <涉事文件>` 只读确认改动是否碰过相关行；仅当确需真跑旧行为才 `git stash`（先存 diff 指纹精确还原）再修。
+| 步骤 | 执行 |
+|---|---|
+| 复现测试先行 | 真实渲染断言，先 FAIL 修到 PASS |
+| 根因 | 实现子 agent 自证（引用代码证据）；brief 只写已核实根因，未核实猜测标「需子 agent 核实」 |
+| 回归 or 既有 | 首选 `git show <上一commit> -- <涉事文件>` 只读确认；仅确需真跑旧行为才 `git stash`（先存 diff 指纹精确还原） |
 
-### 2.2 评审规则
+### 2.4 评审规则
 
 | 场景 | 执行 |
 |---|---|
 | 逻辑 / 几何 / 命中 / 并发类 | 实现 + 评审双 agent |
-| 纯视觉 / 数值微调（k/曲率/间距等） | 实现侧自验即可，不派评审 |
-| 同文件连续微调 | 用 `task_id` 续跑同一子 agent 会话；续跑仅限**同角色**（实现↔实现、探针↔探针/追查），实现↔评审保持独立会话（防偏见）；续跑轮 brief 只写 delta |
-| 评审视角 | 正确性 + 性能双视角、与实现同轮收尾；评审子 agent 带性能眼（热路径/复杂度/磁盘 IO 量级/占用），发现热点先量化再改，说明「更快但破坏语义」方案的取舍理由 |
+| 纯视觉 / 数值微调 | 实现侧自验即可 |
+| 同文件连续微调 | `task_id` 续跑同一会话；续跑仅限同角色（实现↔实现、探针↔探针/追查）；实现↔评审保持独立会话（防偏见）；续跑轮 brief 只写 delta |
+| 评审视角 | 正确性 + 性能双视角；热点先量化再改；说明「更快但破坏语义」的取舍理由 |
 | 评审分级 | 高风险共享模块（editor/view/core/shell/公共组件）亲自重跑；低风险单模块只读 diff + 抽查关键断言 + 定向跑，与实现方共用同一份测试输出 |
-| 平台语义断言 | 实现方声称的「命中互斥成立 / 事件不穿透 / 资源释放遍历范围」等 gpui 平台语义默认作**待证项**：评审须读 gpui 源码或写探针实证后才通过（K14/K15 实证过，反例：双层覆盖"优先消费"、drop_image 漏当前窗口均靠评审实证推翻） |
+| 平台语义断言 | 实现方声称的「命中互斥成立 / 事件不穿透 / 资源释放遍历范围」等 gpui 平台语义默认**待证项**：评审须读 gpui 源码或写探针实证后才通过（K14/K15 实证过，反例：双层覆盖"优先消费"、drop_image 漏当前窗口均靠评审实证推翻） |
 | 提交前提 | 实现 + 双评审通过 → 先评审后提交；提交权在主 agent，须用户明确说"提交git" |
 
-### 2.3 并行规则
+### 2.5 并行与串行
 
 | 场景 | 执行 |
 |---|---|
-| 同文件改动 | 强制串行 |
-| 共享测试套件的 crate 家族（如 shell 测试吃 markdown/editor 编译态） | 一律串行 |
+| 同文件改动 | 串行 |
+| 共享测试套件的 crate 家族（shell 测试吃 markdown/editor 编译态） | 串行 |
 | 只读分析 / 不同 crate 独立改动 | 可并行 |
 
-- 并行前先判定「谁会被别家未提交的中间编译/测试态污染」（依据 K7）。
+- 并行前先判「谁会被别家未提交的中间编译/测试态污染」（依据 K7）。
 
-### 2.4 派生状态副作用
+### 2.6 派生状态副作用
 
-- 会话/缓存类状态更新埋点：采用「一处脏标记 + 统一 flush」，禁止散点直调（散点漏触发=丢状态、滥触发=热点）。
+- 会话/缓存类状态更新埋点：一处脏标记 + 统一 flush，禁止散点直调（散点漏触发=丢状态、滥触发=热点）。
 - 改动前明确列出全部失效源。
 
-## 3. 验证与编译协议
+## 3. 执行协议（验证与编译）
 
-| 规则 | 触发条件 / 执行 |
+| 场景 | 执行 |
 |---|---|
-| GUI 冒烟授权门槛 | **用户没说要"打开 GUI/真机验证" → 一律不打开 GUI、不截图取证**。功能/交互/性能验证默认用 test 代码实现并跑通：`#[gpui::test]` + 真夹具 + 真墙钟/渲染断言（金标准例：`bench_click_seek_land_frame_wall` 模拟点击 seek 量墙钟）；做不到或需用户感知 → 报告固定写「已实现+单测过、未冒烟（用户可自行开 GUI 验证）」。开 GUI 只发生在用户明确要求之后 |
-| GPU/渲染语义验证-启用三规则 | ① **能用 `#[gpui::test]` 验证**（真夹具/真 D3D/WARP/渲染断言）→ 以测试为验收；② **无法 headless 验证**的语义（真机光栅像素、D3D11 线程安全、驱动共享纹理等）→ 该路径**默认休眠**（cfg 关/回退护栏），且**必须由真机人工实操验证通过后才默认启用**；③ **禁止程序自动操作 GUI 代验**（不开 GUI、不脚本化驱动窗口/截图当验证）——验证只有两条路：测试代码 or 人工实操。符合②③时报告写「已实现+单测过、未冒烟（待人工实操后翻转默认）」 |
-| 构建一律 debug | 所有构建/测试/测量；禁止 release |
-| workspace 测试带 crate | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；串行测试须 `cargo test -p <crate> -- --test-threads=1`——**`--` 不可省**（缺了报 `unexpected argument '--test-threads'`） |
-| 改动完再编译 | 每组改动改完一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量 |
-| filter 用模块路径前缀 | 如 `cargo test -p shell app::tests::sidebar` 一次盖全模块；核心渲染改动也按模块前缀收最小集，仅共享核心/用户要求才放宽全模块 |
+| GUI 冒烟 | 用户没说"打开 GUI/真机验证" → 一律不打开 GUI、不截图取证；功能/交互/性能验证默认 `#[gpui::test]` + 真夹具 + 真墙钟/渲染断言（金标准 `bench_click_seek_land_frame_wall`）；做不到或需用户感知 → 报告固定写「已实现+单测过、未冒烟（用户可自行开 GUI 验证）」 |
+| 时序/并发/跨线程通知（泵/等待语义/事件唤醒/渲染时序） | **测试代理（fake 调度器无跨线程唤醒等）结果一律视为「疑似真值」**；验收闭环 = 测试绿 + 用户真机复验通过（提交须真机复验后才准）；评审发现「生产热路径 ≠ 测试路径」分叉必须标 BLOCK 挂起提交，不得降级软放行（K26） |
+| GPU/渲染语义 | ① 能用 `#[gpui::test]` 验证 → 以测试为验收；② 无法 headless（真机光栅像素/线程安全/驱动共享纹理）→ 该路径**默认休眠**（cfg 关/回退护栏）+ **必须真机人工实操验证通过后才默认启用**；③ 禁止程序自动操作 GUI 代验。符合②③ → 报告写「已实现+单测过、未冒烟（待人工实操后翻转默认）」 |
+| 构建 | 一律 debug；禁止 release |
+| 测试命令 | 一律 `cargo test -p <crate>`（根目录裸 `cargo test` 只盖根包+video-ffmpeg）；串行须 `-- --test-threads=1`——**`--` 不可省**（缺了报 `unexpected argument '--test-threads'`） |
+| 编译节奏 | 每组改动改完一次编译、复用产物连跑多组；`cargo check` 并入 `--tests` 或省略；实现侧压到 ~2 轮；大 crate（如 shell）一次改完再编、共享一次性能测量 |
+| 测试 filter | 用模块路径前缀（如 `cargo test -p shell app::tests::sidebar`）一次盖全模块；核心渲染改动也默认按模块前缀收最小集，仅共享核心/用户要求才放宽全模块 |
 | 验证范围 | 只做改动部分；全量仅当用户明确要求/特性定型 |
-| stash 基线 | 行为功能不跑（回归由评审兜底）；仅两类场景允许：① 性能对比子 agent before/after（pop 后逐文件核对还原）② 疑似预存失败硬定性（先存 diff 指纹精确还原） |
-| 边界测试先行 | 边界清单逐项打勾（非行 0、同行多元素、折行续行、文档结尾、空文档等），实现侧勾完才算完成 |
-| 视觉/渲染完成门槛 | 画面/UI 改动报「完成」前必须 `cargo build --bin gpui-editor` + **测试代码验证**（`#[gpui::test]` 交互/渲染断言；金标准：`bench_click_seek_land_frame_wall` 类真夹具墙钟基准）；**真机 GUI 冒烟仅在用户明示要开 GUI 时执行**（截图/pixel，复用 `feature-delivery`/`gpui-open-scroll` 探针）；未授权开 GUI / 未冒烟 → 报告固定写「已实现+单测过、未冒烟」。无可靠取证手段/人工不在场时 GUI 冒烟可降级为「单测覆盖交互」，报告注明降级原因 |
-| 用户负面报告 | 用户报「没有看到 X / 行为不对 / 没生效」→ 第一回应先取证：exe 时间戳（`Get-Item target\debug\gpui-editor.exe` 比源文件新）、真机复现/探针/像素定位，再下结论 |
+| stash 基线 | 行为功能不跑（回归由评审兜底）；仅两类允许：① 性能对比 becore/after（pop 后逐文件核对还原）② 疑似预存失败硬定性（先存 diff 指纹精确还原） |
+| 边界测试 | 边界清单逐项打勾（非行 0、同行多元素、折行续行、文档结尾、空文档等），实现侧勾完才算完成 |
+| 视觉/渲染完成 | `cargo build --bin gpui-editor` + 测试代码验证（`#[gpui::test]` 交互/渲染断言；金标准 `bench_click_seek_land_frame_wall` 类真夹具墙钟）；真机 GUI 冒烟仅在用户明示要开 GUI 时执行（截图/pixel，复用 `feature-delivery`/`gpui-open-scroll` 探针）；未授权开 GUI / 未冒烟 → 报告写「已实现+单测过、未冒烟」；无可靠取证/人工不在场时可降级为「单测覆盖交互」，报告注明降级原因 |
+| 用户负面报告 | 第一回应先取证：exe 时间戳（`Get-Item target\debug\gpui-editor.exe` 比源文件新）、真机复现/探针/像素定位，再下结论 |
 | 亲为不变式 | 亲为改动涉及纯函数化/参数语义/调用点 → 逐参对照函数签名（形参语义「X=true 表示…」逐个写死）+ 一条运行断言；否则计入常规「实现+评审」流 |
-| 长命令后台化 | 预计 >2min（历史重写/长 build/大测试）→ `background_process start` + `schedule_wakeup` 轮询；logs 只取尾部 ≤20 行（禁整屏 `Rewrite i/N` 进度刷屏） |
-| 运行时冒烟采样 | 窗口生命周期/对话框/持久化类 brief 必含测试代码验证项（`#[gpui::test]` 交互断言）；真机冒烟项仅用户明示要开 GUI 时含（复用 feature-delivery 探针，新探针沉淀回技能）；平台钩子（`on_app_quit`/`on_window_should_close` 等）先实测再采信 |
-| GUI 冒烟取证终止 | 真机取证（截图/像素/OCR 任一路）连续失败 2 次即停：交互已有单测兜底时报告固定写「已实现+单测过、未冒烟」并立即返回；OCR 仅人工辅助，禁止当作子 agent 自动验证通道 |
-| 被中止子 Agent 恢复 | 子 agent 任务现值 abort / 超时返回：主 agent 先 `cargo build --bin gpui-editor` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
+| 长命令后台化 | 预计 >2min → `background_process start` + `schedule_wakeup` 轮询；logs 只取尾部 ≤20 行 |
+| 运行时冒烟采样 | 窗口生命周期/对话框/持久化类 brief 必含测试代码验证项；真机冒烟项仅用户明示要开 GUI 时含（复用 feature-delivery 探针，新探针沉淀回技能）；平台钩子（`on_app_quit`/`on_window_should_close` 等）先实测再采信 |
+| GUI 冒烟取证终止 | 真机取证（截图/像素/OCR 任一路）连续失败 2 次即停：交互已有单测兜底 → 报告写「已实现+单测过、未冒烟」并立即返回；OCR 仅人工辅助，禁止当作子 agent 自动验证通道 |
+| 被中止子 Agent 恢复 | 子 agent 任务现值 abort/超时返回：主 agent 先 `cargo build --bin gpui-editor` + 定向测试复证残余交付立于可编译态；改型/逻辑类改动无论是否人工确认过，均补一次独立评审后才准提交 |
 | 性能红线 | 用户动作同步路径不得引入大主线程 IO/大内容重读；持久化/派生状态写盘按复杂度上限评估（hash 跳过、粒度合并）；把 N ms 级主线程停顿当候选热点列明 |
 
-## 4. 主 agent 上下文收敛
+## 4. 主 Agent 上下文收敛
 
 | 动作 | 执行 |
 |---|---|
 | 侦察下放 | 派活前只做 1-2 条 CRG 查询（`get_minimal_context_tool` / `query_graph` / `traverse_graph`）或 grep 定入口；不 read 实现细节、不跑多路 grep/采样替子 agent 摸底；派活只需「结构入口 + 参考实现」，不追 paint/hit 具体行号 |
+| 侦察禁读 | read 目标文件实现区 ≥200 行 → 先列理由（精确落点例外）归口；否则一律下放子 agent 精读 |
 | 核对极简 | 收报告后只跑一条 `git status --short && git diff --stat`；确需抽查至多 1 个 grep |
 | brief 收敛 | 只写需求+约束+已知落点；根因只写已核实、不写猜测；续跑轮只写 delta；歧义合并一次 `question`；bench/大表输出一律 `-Last N`/limit 截断 |
 
-## 5. 子 agent 验收口径（别当"回归"）
+## 5. 子 Agent 验收口径（别当"回归"）
 
 | 项 | 口径 |
 |---|---|
@@ -158,66 +154,78 @@ L. 会话复用检查（**必填**，派活前完成，不得省略）：
 | pdf/video 夹具 | 仓库根 `target/pdf测试.pdf` + `target/pdf测试2.pdf`、`target/视频测试.mp4`（不入库、手动装配；crate 经 `CARGO_MANIFEST_DIR/../../target` 定位）；缺夹具打 `SKIP: missing target/...` 后 return——SKIP 是常态不是回归 |
 | 测试环境 | 窗宽抖动；debug ≈ release 的 ~10×；看相对变化与 stable 子项，别看绝对值；数据处理用 python；rg 不一定在 PATH → 用 grep/glob |
 
-## 6. 经验知识库（原理与教训，正确做法 + 错误后果）
+## 6. 经验知识库（Rule ↔ Rationale 隔离；正确做法 + (错误后果)）
 
-| # | 知识条目 |
+> 规则区遇模糊时查本表；教训只在此处，规则区不再嵌套长括号故事。
+
+| # | 知识 |
 |---|---|
-| K1 | 亲为例外有效：排序「原始 CompareStringEx」与「GIF 失焦自驱时钟」主 agent 亲为一次成功；子 agent 曾「剥符号改乱顺序」「误读 syntect API」产生失真 → 亲为只在根因已核实 + 改动小而精确时采用，子 agent 失真成本比主上下文成本更贵 |
+| K1 | 亲为例外有效：排序（CompareStringEx）与 GIF 失焦时钟亲为一次成功；子 agent 曾「剥符号改乱顺序」「误读 syntect API」产生失真 → 亲为只在根因已核实 + 改动小而精确时采用（子 agent 失真成本 > 主上下文成本） |
 | K2 | 行为匹配要回归断言：子 agent 自作主张改 UX 语义（剥符号）导致整包撤销 → 精确可观测期望写死进 brief |
 | K3 | 性能方案：打开大图只降内存不降墙钟导致整包撤销 → 先立用户感知基线 |
 | K4 | 选型许可：AGPL zenavif 被要求放弃 → 新依赖先确认许可接受度 |
-| K5 | 视觉断言：徽标调用点 `is_none()` 传入有错参双重取反致永不挂出，被误判 stale exe 白耗一轮 → 完成前 build+冒烟、负面报告先取证 |
+| K5 | 视觉断言：徽标调用点 `is_none()` 双重取反致永不挂出、被误判 stale exe 白耗一轮 → 完成前 build+冒烟、负面报告先取证 |
 | K6 | 长命令：filter-branch 首跑 600s 超时被杀、换后台重跑白耗 ~10min → 后台化 + 进度截断 |
-| K7 | 并行测试污染：两个实现 agent 并行，shell 测试反复被「预存失败 + 中途编译态」污染，评审轮次全赔在洗白非回归上 |
-| K8 | 测试噪声：真实 `%APPDATA%\gpui-editor\config.json` 经 config crate 泄漏进 shell 测试（font/preview 断言失败）、`fixtures/测试.md` 工作区 CRLF——先 `git stash` 基线定性非回归，勿当新回归 |
-| K9 | 平台钩子：本平台最后一个窗口关闭退出不回调 `on_app_quit`（`App::quit → platform.quit` 直接结束进程）；退出/关闭类钩子先实测再采信 |
-| K10 | 副作用集中注入：会话/缓存更新散点直调曾造成逐次切换全量重读/重写槽位（27–58ms 热点） |
-| K11 | 磁盘 IO：持久化/日志类写盘用 hash 跳过 + 粒度合并，别每次全量重写 |
-| K12 | 大文档性能红线：不得引入持续逐帧重绘（弹簧收敛即静止）；状态栏等只读派生须 O(1) |
-| K13 | 6 个 shell 预存失败靠 stash 基线硬定性，省掉洗白非回归 → 实证比口头断言硬 |
-| K14 | gpui 窗口上下文资源释放：`App::drop_image(image, None)` 只遍历 `App.windows`，而窗口自身 key/button 回调在 `update_window_erased` 里把当前窗口**临时移出** `App.windows`（app.rs:3146 take/3190 放回）→ 窗口上下文内当场调用会漏当前窗口（每手动切一次漏一片）；须 `cx.defer` 延后到本拍更新末尾 flush（content_sync `pending_math_drop` 同款姿势） |
-| K15 | gpui 鼠标事件沿命中栈**冒泡**（无鼠标监听的覆盖浮层不 BlockMouse，不拦截事件）：双击全屏挂在 size_full 的 `#video-main` 时，控制条/进度条/toast 上的双击会一路漏下来误触——「上层覆盖元素优先消费」是错误直觉；互斥必须在专属层 `stop_propagation`（`click_count>=2` 才拦，单击放行），评审实测「seek 条中点双击 → locked=true」确诊 |
-| K16 | 中文文件编码事故：子 agent 用 bash/文件写操作改含中文注释的源码，PowerShell 重编码致**整文件 mojibake**，被迫 `git restore` 后重做（白耗一轮）；改中文源码一律只走 read/edit/write 工具；bash 回显中文乱码时改用 read 以 UTF-8 读 |
-| K17 | gpui 测试平台 `toggle_fullscreen`/`is_fullscreen` 是**真实翻转**（`platform/test/window.rs` 同步实现）→ 全屏进出相关单测两路都真跑，非假绿 |
-| K18 | GUI 冒烟取证自锁：子 agent 真机取证（截图→OCR）失败后反复重试白耗整段被用户中止（打开最近改版）→ 取证连续失败 2 次即停，走「单测兜底 + 报告未冒烟」；OCR 禁当自动验证通道 |
-| K19 | 性能先例复制：同文件已有虚拟化/行高/缓存先例（如 toc `TOC_VIRTUALIZE_MIN=200`）时新增列表类渲染必须按同阈值对齐；文件树首版逐帧全量物化万级目录、评审才补虚拟化 |
-| K20 | abort 恢复：子 agent 被中止后主 agent 须 build + 定向测试复证残余交付；改型/逻辑类必补独立评审再提交（打开最近改版曾跳过评审即失去回归兜底） |
-| K21 | GUI 授权门槛：用户未明示要开 GUI 时子 agent 不得打开/截图；应改用 `#[gpui::test]` 真夹具基准（如 seek 墙钟 `bench_click_seek_land_frame_wall`）实现与验收——否则反复开 GUI 白耗/被中止（视频 seek 线实测教训） |
+| K7 | 并行测试污染：两实现 agent 并行，shell 测试反复被「预存失败 + 中途编译态」污染 → 共享测试套件的 crate 家族一律串行 |
+| K8 | 测试噪声：真实 `%APPDATA%\gpui-editor\config.json` 与 `fixtures/测试.md` CRLF 泄漏进测试 → 先 stash 基线硬定性非回归，勿当新回归 |
+| K9 | 平台钩子：本平台最后一个窗口关闭退出不回调 `on_app_quit` → 退出/关闭类钩子先实测再采信 |
+| K10 | 副作用集中注入：会话/缓存更新散点直调 → 逐次切换全量重读/重写槽位（27–58ms 热点）→ 一处脏标记 + 统一 flush |
+| K11 | 磁盘 IO：持久化/日志写盘用 hash 跳过 + 粒度合并，别每次全量重写 |
+| K12 | 大文档性能红线：不引入持续逐帧重绘（弹簧收敛即静止）；状态栏等只读派生 O(1) |
+| K13 | 6 个 shell 预存失败靠 stash 基线硬定性，省洗白非回归 → 实证比口头断言硬 |
+| K14 | gpui 窗口上下文资源释放：`App::drop_image(image, None)` 只遍历 `App.windows`，窗口 key/button 回调在 `update_window_erased` 里把当前窗口**临时移出** `App.windows`（app.rs:3146 take/3190 放回）→ 窗口上下文内当场调用会漏当前窗口（每手动切一次漏一片），须 `cx.defer` 延后到本拍更新末尾 flush（content_sync `pending_math_drop` 同款姿势） |
+| K15 | gpui 鼠标事件沿命中栈冒泡：无鼠标监听的覆盖浮层不拦截事件；「上层覆盖优先消费」是错误直觉 → 互斥须在专属层 `stop_propagation`（`click_count>=2` 才拦、单击放行） |
+| K16 | 中文文件编码事故：bash/文件写操作改含中文源码被 PowerShell 重编码致整文件 mojibake → 改中文源码一律只走 read/edit/write；bash 回显中文乱码改 read UTF-8 读 |
+| K17 | gpui 测试平台 `toggle_fullscreen`/`is_fullscreen` 是真实翻转 → 全屏相关单测两路都真跑 |
+| K18 | GUI 冒烟取证自锁：真机取证失败反复重试白耗整段 → 取证连续失败 2 次即停，走「单测兜底 + 报告未冒烟」；OCR 禁当自动验证通道 |
+| K19 | 性能先例复制：同文件已有虚拟化/缓存先例（`TOC_VIRTUALIZE_MIN=200`）→ 新列表类渲染按同阈值对齐；文件树首版逐帧全量物化万级目录，评审才补虚拟化 |
+| K20 | abort 恢复：子 agent 被中止后主 agent 须 build + 定向测试复证残余交付；改型/逻辑类必补独立评审再提交 |
+| K21 | GUI 授权门槛：用户未明示要开 GUI 时子 agent 不得打开/截图 → 用 `#[gpui::test]` 真夹具基准（如 seek 墙钟）实现与验收 |
 | K22 | D3D11 immediate context 非线程安全：把渲染线程的 `ID3D11DeviceContext` 交给解码 worker 并发操作（含经 deferred context 的拷贝）在真机即崩（exit 2173），deferred 在 WARP/hardware 还有数据竞争与 AV——跨线程 GPU 处理须「各线程独享上下文」（FFmpeg 自有设备 + 内核 `skip_to_bgra` 预滚「只解码不转换、末帧回读」，seek ×6 且无共享；零回读渲染管线留待驱动/加固） |
-| K23 | GPU/渲染语义验证三规则（用户明示）：① 能用测试验证 → 测试为验收；② 无法 headless 验证的语义（真光栅/线程安全/驱动共享纹理）→ 该路径**默认休眠** + 必须真机人工实操验证后才默认启用；③ 禁止程序自动操作 GUI 代验（不开 GUI、不脚本化驱动窗口）——初始双设备直通即按 ② 待人工实操后翻转默认 |
-| K24 | 删除 vs 休眠：被替换代码路径默认「休眠」（保留源码+测试、注释 doc「已被 X 取代」）而非删除；显式删除须 brief「作废路径策略」写明理由。错误后果：safe-arch 删 M2e 桥/探针 → 双设备要从 git 历史恢复，重复劳动一轮 |
-| K25 | 基建快速失败预算：一次性基建（换依赖源/收编 workspace/改文件编码）先设探针预算（≤3 轮试错或明确耗时上界），超预算转向替代/询问；网络挂起与机制死磕不得长耗。错误后果：vendor 预检网络挂起 + 嵌套 workspace 继承反复试错共 ~5 轮 |
+| K23 | GPU/渲染语义验证三规则：① 能测试验证 → 测试为验收；② 无法 headless → 默认休眠 + 真机人工实操后翻转；③ 禁止程序自动操作 GUI 代验（初始双设备直通即按 ② 待人工实操后翻转） |
+| K24 | 删除 vs 休眠：被替换路径默认「休眠」（保留源码+测试、注释 doc「已被 X 取代」）；显式删除须 brief「作废路径策略」写明理由（错误后果：safe-arch 删 M2e 桥/探针 → 双设备要从 git 历史恢复） |
+| K25 | 基建快速失败预算：一次性基建先设探针预算（≤3 轮试错或明确耗时上界），超预算转向替代/询问（错误后果：vendor 预检网络挂起 + 嵌套 workspace 试错 ~5 轮） |
+| K26 | 时序/并发验收闭环：fake 调度器无跨线程唤醒 → 泵/事件唤醒类「无静默竞争」只有真机探针可证；凡「生产路径 ≠ 测试路径」改动静默放行 = 默认把回归交给用户抓（P1 批次经实现+评审全绿仍漏 200ms 静默尖峰，靠用户真机抓回，追加一整轮修复） |
+| K27 | 证据入仓：证明性实验必须沉淀为 `#[cfg(test)]` 或 `crates/*/tests/` 可复跑；放 Temp/未留痕 = 结论不可溯源、评审无法复核（seekrace 8000 次复刻实验留在 Temp，评审裁定无法仓内复跑） |
+| K28 | 并发/FFI 入口自检：新增 FFI 导出/共享锁/全局状态入口，先对照仓库串行不变式（FFMPEG_LOCK / K22 GPU 线程独占）再合入；评审把「缺锁」当默认候选（vff 能力导出漏 FFMPEG_LOCK，靠评审抓出） |
 
-## 7. 已踩坑速查（实现要点）
+## 7. 实现要点速查（正向指令）
 
-- 正文卡包装层必须是 flex 容器，否则 `flex_1` 高度坍缩毁滚动/命中。
-- `deferred(anchored(Window))` 定位用 `.position(窗口坐标)`，不用 `.offset(...)`（会顶到窗口底/沉底）。
+- 正文卡包装层：flex 容器（否则 `flex_1` 高度坍缩毁滚动/命中）。
+- `deferred(anchored(Window))` 定位：用 `.position(窗口坐标)`（`.offset(...)` 会顶到窗口底/沉底）。
 - 欢迎页/零 tab：`tabs` 允许为空，凡 `tabs[active_tab]` 消费一律 `tabs.get(...)` 兜底。
-- `with_spring`/`hover_spring`：临界阻尼免过冲；`reduce_motion` 由 gpui 自动尊重。
-- gpui 鼠标事件沿命中栈冒泡：无鼠标监听的覆盖浮层不拦截事件；需事件互斥（双击全屏 vs 控制条等）时在专属层 `stop_propagation`（按 `click_count>=2` 拦、单击放行）。（K15）
-- gpui 窗口上下文资源释放：`App::drop_image(_, None)` 在窗口回调内漏当前窗口，须 `cx.defer` 延后到本拍更新末尾；同款见 content_sync `pending_math_drop`。（K14）
-- 中文源码改动：只用 read/edit/write 工具写文件；禁止 bash/文件写操作（PowerShell 重编码致整文件 mojibake）；bash 回显中文乱码改用 read UTF-8 读。（K16）
+- 弹簧：`with_spring`/`hover_spring` 临界阻尼免过冲；`reduce_motion` 由 gpui 自动尊重。
+- 事件互斥：gpui 鼠标事件沿命中栈冒泡 → 需互斥（双击全屏 vs 控制条）时在专属层 `stop_propagation`（`click_count>=2` 拦、单击放行）（K15）。
+- 窗口上下文资源释放：`App::drop_image(_, None)` 在窗口回调内漏当前窗口 → `cx.defer` 延到本拍更新末尾（K14）。
+- 中文源码改动：只用 read/edit/write 写文件；bash 回显中文乱码改 read UTF-8 读（K16）。
 
 ## 8. 工具与技能调度
 
-### 8.1 CRG 工具链
+### 8.1 调度表（何时加载哪个 skill）
+
+| 任务类型 | 加载 skill | 说明 |
+|---|---|---|
+| 复杂任务 / 评审 / 重命名 / 架构体检 | `code-review-graph` | `.kilo/skills/`，按其已验证调用姿势执行 |
+| 功能交付 / 交互语义 / 运行时冒烟 | `feature-delivery` | 语义确认表、brief 模板、双评审、探针用法；`.kilo/skill/` |
+| 真机打开资产 + 滚动 / 截图取证 | `gpui-open-scroll` | 打开文档滚动前后截图 + stderr 取证 + Windows 三坑规避 |
+
+### 8.2 CRG 工具链（调用姿势 `[待迁移至 skill: code-review-graph]`）
 
 - 入口：每个任务开头先 `get_minimal_context_tool(task=...)`，拿风险分、相关 communities/flows、`head_matches_build`。
-- 查影响面：优先 `query_graph`/`traverse_graph`（带深度 + token 预算），不手工通读大文件。
-- 新鲜度：本机 `code-review-graph watch` 常驻自动增更（仓库根 `.code-review-graph/` 不入库）；图暂停过/换 checkout 后先 CLI `build` 拉新再查；`get_minimal_context`/搜索报 stale 且排查对象不在近期改动里 → 直接用单 token 搜索 + grep 寻路，不追更（`update` 报 0 常因增量基准未随 HEAD 推进；确需拉新用 `build`）。
-- 调度引用：复杂任务/评审/重命名/架构体检前先 `skill` 加载 `code-review-graph`（`.kilo/skills/`，自动发现），按其已验证调用姿势执行；功能交付/交互语义/运行时冒烟前先 `skill` 加载 `feature-delivery`（语义确认表、brief 模板、双评审、探针用法；`.kilo/skill/`，自动发现）。
+- 查影响面：`query_graph`/`traverse_graph`（带深度 + token 预算），不手工通读大文件。
+- 新鲜度：本机 `code-review-graph watch` 常驻自动增更（仓库根 `.code-review-graph/` 不入库）；图暂停/换 checkout 后先 CLI `build` 拉新再查；报 stale 且排查对象不在近期改动 → 单 token 搜索 + grep 寻路，不追更（`update` 报 0 常因增量基准未随 HEAD 推进；确需拉新用 `build`）。
 
-### 8.2 CRG 硬性纪律（违反会得到过期/错误结论）
+### 8.3 CRG 硬性纪律六条 `[待迁移至 skill: code-review-graph]`
 
-六条：① 新鲜度（`head_matches_build`≠dirty、增量 summary 不可信、`full_rebuild` 剔未跟踪）② 未提交评审必配 `base="HEAD"` + `changed_files` ③ 搜索用单 token、别 kind 过滤、函数体走 grep ④ `query_graph` target 用裸短名/qualified_name，点分名 not_found ⑤ `dead_code` 有假阳性（BracketPair），删前 grep 复核 ⑥ `get_flow`/`get_community` 别传 `detail_level`、flow 用 name 查。
+① 新鲜度（`head_matches_build`≠dirty、增量 summary 不可信、`full_rebuild` 剔未跟踪）② 未提交评审必配 `base="HEAD"` + `changed_files` ③ 搜索用单 token、别 kind 过滤、函数体走 grep ④ `query_graph` target 用裸短名/qualified_name，点分名 not_found ⑤ `dead_code` 有假阳性（BracketPair），删前 grep 复核 ⑥ `get_flow`/`get_community` 别传 `detail_level`、flow 用 name 查。
 
 完整姿势与「纪律↔技能节」对照表见 skill `code-review-graph`（§9 外部索引；坑速查 §7）。
 
-### 8.3 常规循环
+### 8.4 常规循环
 
 日常 探索/评审/重命名/架构体检 的调用序列见 skill `code-review-graph`「§8 推荐日常节奏」；落地改动与回归仍以 `read`/`grep` + `cargo test` 为准，图不替代码精读与编译验证。
 
-## 9. 多仓库依赖图（gpui zed）
+## 9. 多仓库依赖图（gpui zed）`[待迁移至 skill: code-review-graph §6.3]`
 
 gpui/zed 已注册建图（`~/.code-review-graph/registry.json`）；跨仓检索 `cross_repo_search_tool("<裸短名>")`、单仓 `query_graph`/`semantic_search_nodes` 传 `repo_root` 等完整姿势见 skill `code-review-graph` §6.3。gpui checkout 路径运行时解析（rev 从 `Cargo.lock` 读、目录用 7 位短 rev）：
 
