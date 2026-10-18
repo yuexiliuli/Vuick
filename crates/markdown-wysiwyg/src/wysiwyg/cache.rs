@@ -175,6 +175,7 @@ impl<K: LruKey, V: Clone> LruCache<K, V> {
         self.lru.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
