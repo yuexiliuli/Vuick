@@ -7,7 +7,6 @@
 
 use super::*;
 use ui::input::Input;
-use ui::scrollbar::{Scrollbar, ScrollbarMode};
 
 use config::limits::SEARCH_RESULT_CAP;
 use ui::motion::{hover_bg_fade, hover_spring};
@@ -786,45 +785,18 @@ impl EditorApp {
             .child(self.render_sidebar_toc_header())
             // 滚动条只覆盖面板内容区（不含头部），故把滚动容器 + 滚动条叠层包进
             // `relative` 包装层（对齐 panes/editor：叠层为滚动容器的兄弟、`absolute inset_0`）。
-            .child({
-                let vscroll = self.sidebar.toc_vscroll.clone();
-                div()
-                    .id("sidebar-toc-scroll-wrap")
-                    .debug_selector(|| "sidebar-toc-scroll-wrap".into())
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .min_h(px(0.))
-                    .child(
-                        div()
-                            .id("sidebar-toc-scroll")
-                            .debug_selector(|| "sidebar-toc-scroll".into())
-                            .flex_1()
-                            // min-width:auto 会拒绝缩窄（拖窄面板后滚动容器不愿窄于最宽条目），
-                            // 显式 min_w(0) 保持原序——与搜索结果包装层内部容器一致。
-                            .min_w(px(0.))
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            // 虚拟化依据：`toc_vscroll` 跟踪本容器的滚动偏移/视口高（跨帧稳定）。
-                            .track_scroll(&vscroll)
-                            .py_1()
-                            .child(inner),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-toc-vscrollbar")
-                            .debug_selector(|| "sidebar-toc-vscrollbar".into())
-                            .absolute()
-                            .inset_0()
-                            .child(
-                                Scrollbar::vertical(&vscroll)
-                                    .mode(ScrollbarMode::Always)
-                                    .viewport_from_layout(),
-                            ),
-                    )
-            })
+            // 结构/样式收敛到 ui::scroll_panel::ScrollPanelBuilder：三层 id 显式覆盖为
+            // sidebar 既有实测 id（派生 `{id}-vscrollbar` 与之不一致），目录容器沿用 `py_1`。
+            .child(
+                ui::scroll_panel::ScrollPanelBuilder::new(
+                    "sidebar-toc-scroll",
+                    self.sidebar.toc_vscroll.clone(),
+                )
+                .wrap_id("sidebar-toc-scroll-wrap")
+                .bar_id("sidebar-toc-vscrollbar")
+                .container_style(|d: gpui::Div| d.py_1())
+                .build(inner),
+            )
             // P2-10：面板开合轻淡入（宽度动画会让「自适应宽 + 布局断言」测试抖动，
             // 改为只动绘制、不碰布局的透明度淡入）。
             .with_spring(
@@ -1092,44 +1064,18 @@ impl EditorApp {
     /// 叠一条常显（`Always`）纵向滚动条——与目录/编辑器/预览同一语义：内容超量可滚
     /// 时随 [`Self::search_vscroll`] 显示 thumb，轨道点击跳转、thumb 可拖。
     /// `container_id` 透传（普通搜索 `sidebar-search-results` / PDF 搜索 `-pdf`，测试沿用）。
+    /// 结构/样式收敛到 `ui::scroll_panel::ScrollPanelBuilder`：滚动条覆盖层 id 显式覆盖为
+    /// `sidebar-search-vscrollbar`（派生 `{id}-vscrollbar` 与之不一致）。
     fn wrap_search_scroll(
         &self,
         container_id: &'static str,
         inner: impl IntoElement,
     ) -> gpui::AnyElement {
         let vhand = self.sidebar.search_vscroll.clone();
-        div()
-            .id("sidebar-search-results-wrap")
-            .debug_selector(|| "sidebar-search-results-wrap".into())
-            .relative()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .child(
-                div()
-                    .id(SharedString::from(container_id))
-                    .debug_selector(move || container_id.to_string())
-                    .flex_1()
-                    .min_w(px(0.))
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&vhand)
-                    .child(inner),
-            )
-            .child(
-                div()
-                    .id("sidebar-search-vscrollbar")
-                    .debug_selector(|| "sidebar-search-vscrollbar".into())
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        Scrollbar::vertical(&vhand)
-                            .mode(ScrollbarMode::Always)
-                            .viewport_from_layout(),
-                    ),
-            )
+        ui::scroll_panel::ScrollPanelBuilder::new(container_id, vhand)
+            .wrap_id("sidebar-search-results-wrap")
+            .bar_id("sidebar-search-vscrollbar")
+            .build(inner)
             .into_any_element()
     }
 
@@ -1795,41 +1741,15 @@ impl EditorApp {
 
     /// 文件树滚动容器包装：`relative` 包装层 + `overflow_y_scroll` 滚动容器 + 常显
     /// 纵向滚动条——与搜索/目录同款语义（内容超量可滚时随 [`Self::files_vscroll`]
-    /// 显示 thumb，轨道点击跳转、thumb 可拖）。
+    /// 显示 thumb，轨道点击跳转、thumb 可拖）。结构/样式收敛到
+    /// `ui::scroll_panel::ScrollPanelBuilder`：包装层 / 滚动条覆盖层 id 显式覆盖为
+    /// sidebar 既有 id（派生 `{id}-wrap` / `{id}-vscrollbar` 与之不一致）。
     fn wrap_files_scroll(&self, inner: impl IntoElement) -> gpui::AnyElement {
         let vhand = self.sidebar.files_vscroll.clone();
-        div()
-            .id("sidebar-files-wrap")
-            .debug_selector(|| "sidebar-files-wrap".into())
-            .relative()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w(px(0.))
-            .min_h(px(0.))
-            .child(
-                div()
-                    .id("sidebar-files-scroll")
-                    .debug_selector(|| "sidebar-files-scroll".into())
-                    .flex_1()
-                    .min_w(px(0.))
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&vhand)
-                    .child(inner),
-            )
-            .child(
-                div()
-                    .id("sidebar-files-vscrollbar")
-                    .debug_selector(|| "sidebar-files-vscrollbar".into())
-                    .absolute()
-                    .inset_0()
-                    .child(
-                        Scrollbar::vertical(&vhand)
-                            .mode(ScrollbarMode::Always)
-                            .viewport_from_layout(),
-                    ),
-            )
+        ui::scroll_panel::ScrollPanelBuilder::new("sidebar-files-scroll", vhand)
+            .wrap_id("sidebar-files-wrap")
+            .bar_id("sidebar-files-vscrollbar")
+            .build(inner)
             .into_any_element()
     }
 

@@ -18,11 +18,13 @@
 //!
 //! # 清理策略
 //! 状态用 `window.use_keyed_state` 按元素 id 键控：宿主移出元素树（侧栏收起 /
-//! 按钮消失）即随元素状态回收；延迟定时器持**弱引用**，且用代序号 `seq`
-//! 作废在途任务（移出即 +1），实体释放后任务更新自动空操作，不悬挂、不泄露。
+//! 按钮消失）即随元素状态回收；延迟排单收敛到 [`base::util::SeqAfter`]（可重入、
+//! 代序作废——新触发把在途旧单作废；移出不重排，但 `hanging` 转 false 后到点回调
+//! 自检即作废），回调持宿主**弱引用**，实体释放后任务更新自动空操作，不悬挂、不泄露。
 
 use std::time::Duration;
 
+use base::util::SeqAfter;
 use gpui::{
     Anchor, AnimationExt, AnyElement, App, Edges, Entity, Hsla, InteractiveElement, IntoElement,
     ParentElement, Styled, anchored, deferred, div, px,
@@ -45,8 +47,10 @@ pub struct TooltipState {
     visible: bool,
     /// 当前是否悬停在宿主上。
     hanging: bool,
-    /// 代序号：悬停进入/移出都 +1，作废在途延迟定时器（防旧定时器误显）。
-    seq: u32,
+    /// 延迟显示防抖：`base::SeqAfter` 代序作废在途定时器——悬停进入 `.after` 重排
+    /// 一单（新触发作废旧单）；移出不重排，但 `hanging` 转 false，到点回调自检即作废
+    /// （防旧定时器误显，无需手动 +1 代序）。
+    debounce: SeqAfter,
 }
 
 /// 在 render 期取/建宿主的 tooltip 状态（按 `id` 键控，幂等）。
@@ -66,41 +70,42 @@ pub fn tooltip_hover(state: &Entity<TooltipState>, hovered: bool, cx: &mut App) 
     }
 }
 
-/// 悬停进入：登记悬停并排一单延迟显示；已悬停中不重复排队。
+/// 悬停进入：登记悬停并排一单延迟显示；已悬停中不重复排队（[`base::util::SeqAfter`]
+/// 代序作废旧单，`hanging` 到点自检作废——语义与旧「spawn timer + seq 比对」一致）。
 fn tooltip_enter(state: &Entity<TooltipState>, cx: &mut App) {
-    let seq = state.update(cx, |s, _| {
+    let start = state.update(cx, |s, _| {
         if s.hanging {
-            return None;
+            return false;
         }
         s.hanging = true;
-        s.seq = s.seq.wrapping_add(1);
-        Some(s.seq)
+        true
     });
-    let Some(seq) = seq else { return };
+    if !start {
+        return;
+    }
     let weak = state.downgrade();
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .timer(Duration::from_millis(TOOLTIP_DELAY_MS))
-            .await;
-        // 到点仍悬停且代次未变才真正显示；移出已清 `hanging` / 代次 +1 → 自动作废。
-        cx.update(|app| {
-            let _ = weak.update(app, |s, cx| {
-                if s.seq == seq && s.hanging {
-                    s.visible = true;
-                    cx.notify();
-                }
-            });
-        });
-    })
-    .detach();
+    state.update(cx, |s, cx| {
+        s.debounce.after(
+            cx,
+            Duration::from_millis(TOOLTIP_DELAY_MS),
+            move |app| {
+                // 到点仍悬停才真正显示；移出已清 `hanging` → 自动作废不误显。
+                let _ = weak.update(app, |s, cx| {
+                    if s.hanging {
+                        s.visible = true;
+                        cx.notify();
+                    }
+                });
+            },
+        );
+    });
 }
 
-/// 悬停移出：立即隐藏并作废在途延迟定时器。
+/// 悬停移出：立即隐藏；在途延迟单由到点自检（`hanging` 已 false）作废，无需手动代序。
 fn tooltip_exit(state: &Entity<TooltipState>, cx: &mut App) {
     state.update(cx, |s, _| {
         s.hanging = false;
         s.visible = false;
-        s.seq = s.seq.wrapping_add(1);
     });
 }
 
